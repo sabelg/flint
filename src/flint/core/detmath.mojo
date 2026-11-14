@@ -22,6 +22,8 @@ asserts it (`gameplay/invariants.mojo`).
 """
 from std.math import floor, sqrt
 from std.sys import llvm_intrinsic
+from std.sys._assembly import inlined_assembly
+from std.sys.info import CompilationTarget
 
 comptime PI: Float32 = 3.14159265358979323846
 comptime HALF_PI: Float32 = 1.57079632679489661923
@@ -287,22 +289,50 @@ def det_pow(x: Float32, y: Float32) -> Float32:
 # ---------------------------------------------------------------------------
 # The floating-point mode of the thread
 # ---------------------------------------------------------------------------
+comptime FPCR_CONTROL_MASK: UInt64 = 0x07FF9F00
+
 
 def read_mxcsr() -> UInt32:
-    var value = UInt32(0)
-    llvm_intrinsic["llvm.x86.sse.stmxcsr", NoneType](Pointer(to=value))
-    return value
+    comptime if CompilationTarget.is_x86():
+        var value = UInt32(0)
+        llvm_intrinsic["llvm.x86.sse.stmxcsr", NoneType](Pointer(to=value))
+        return value
+    else:
+        var fpcr = inlined_assembly["mrs $0, fpcr", UInt64, constraints="=r"]()
+        var mxcsr = MXCSR_SIM
+        if (fpcr & (UInt64(1) << 24)) != 0:
+            mxcsr |= UInt32(1 << 15)  # FZ -> FTZ
+        var rmode = UInt32((fpcr >> 22) & 3)
+        mxcsr |= rmode << 13
+        return mxcsr
 
 
 def write_mxcsr(value: UInt32):
-    var copy = value
-    llvm_intrinsic["llvm.x86.sse.ldmxcsr", NoneType](Pointer(to=copy))
+    comptime if CompilationTarget.is_x86():
+        var copy = value
+        llvm_intrinsic["llvm.x86.sse.ldmxcsr", NoneType](Pointer(to=copy))
+    else:
+        var fpcr = inlined_assembly["mrs $0, fpcr", UInt64, constraints="=r"]()
+        fpcr &= ~FPCR_CONTROL_MASK
+        if (value & UInt32(1 << 15)) != 0:
+            fpcr |= UInt64(1) << 24
+        var rmode = UInt64((value >> 13) & 3)
+        fpcr |= rmode << 22
+        inlined_assembly["msr fpcr, $0", NoneType, constraints="r"](fpcr)
 
 
 def set_sim_float_mode():
     """Round to nearest, FTZ and DAZ off, exceptions masked; flags cleared."""
-    write_mxcsr(MXCSR_SIM)
+    comptime if CompilationTarget.is_x86():
+        write_mxcsr(MXCSR_SIM)
+    else:
+        var fpcr = inlined_assembly["mrs $0, fpcr", UInt64, constraints="=r"]()
+        inlined_assembly["msr fpcr, $0", NoneType, constraints="r"](fpcr & ~FPCR_CONTROL_MASK)
 
 
 def sim_float_mode_ok() -> Bool:
-    return (read_mxcsr() & MXCSR_CONTROL_MASK) == MXCSR_SIM
+    comptime if CompilationTarget.is_x86():
+        return (read_mxcsr() & MXCSR_CONTROL_MASK) == MXCSR_SIM
+    else:
+        var fpcr = inlined_assembly["mrs $0, fpcr", UInt64, constraints="=r"]()
+        return (fpcr & FPCR_CONTROL_MASK) == 0

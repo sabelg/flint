@@ -72,6 +72,8 @@ struct NativeMesh(Copyable, Movable):
     var weights: List[Float32]
     var texture: Int
     var base_color: UInt32
+    var roughness: Float32
+    var metallic: Float32
     var emissive_color: Vec3
     var emissive_strength: Float32
     var skin: Int
@@ -96,6 +98,8 @@ struct NativeMesh(Copyable, Movable):
         self.weights = List[Float32]()
         self.texture = -1
         self.base_color = 0xFFFFFFFF
+        self.roughness = 0.55
+        self.metallic = 0.0
         self.emissive_color = Vec3(1, 1, 1)
         self.emissive_strength = 0
         self.skin = -1

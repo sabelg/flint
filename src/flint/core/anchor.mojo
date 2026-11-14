@@ -22,6 +22,7 @@ Layout (byte offsets from ANCHOR):
 """
 from std.ffi import external_call
 from std.atomic import Atomic
+from std.sys.info import CompilationTarget
 from std.time import monotonic
 
 comptime ANCHOR: Int = 0x5D5D00000000
@@ -78,20 +79,22 @@ comptime STACKS: Int = 2 << 20
 comptime STACK_BYTES: Int = 64 << 10
 comptime STACK_SLOTS: Int = 32  # the main thread and up to 31 workers at once
 
-# System call numbers (x86-64).
-comptime SYS_READ: Int = 0
-comptime SYS_WRITE: Int = 1
-comptime SYS_CLOSE: Int = 3
-comptime SYS_MSYNC: Int = 26
-comptime SYS_GETPID: Int = 39
-comptime SYS_KILL: Int = 62
-comptime SYS_LINK: Int = 86
-comptime SYS_READLINK: Int = 89
-comptime SYS_MKDIR: Int = 83
-comptime SYS_GETTID: Int = 186
-comptime SYS_CLOCK_GETTIME: Int = 228
-comptime SYS_TGKILL: Int = 234
-comptime SYS_OPENAT: Int = 257
+# System call numbers (Linux x86-64 and aarch64).
+comptime IS_X86: Bool = CompilationTarget.is_x86()
+comptime SYS_READ: Int = 0 if IS_X86 else 63
+comptime SYS_WRITE: Int = 1 if IS_X86 else 64
+comptime SYS_CLOSE: Int = 3 if IS_X86 else 57
+comptime SYS_MSYNC: Int = 26 if IS_X86 else 227
+comptime SYS_NANOSLEEP: Int = 35 if IS_X86 else 101
+comptime SYS_GETPID: Int = 39 if IS_X86 else 172
+comptime SYS_KILL: Int = 62 if IS_X86 else 129
+comptime SYS_GETTID: Int = 186 if IS_X86 else 178
+comptime SYS_CLOCK_GETTIME: Int = 228 if IS_X86 else 113
+comptime SYS_TGKILL: Int = 234 if IS_X86 else 131
+comptime SYS_OPENAT: Int = 257 if IS_X86 else 56
+comptime SYS_MKDIRAT: Int = 258 if IS_X86 else 34
+comptime SYS_LINKAT: Int = 265 if IS_X86 else 37
+comptime SYS_READLINKAT: Int = 267 if IS_X86 else 78
 comptime AT_FDCWD: Int = -100
 comptime O_WRONLY_CREATE_TRUNC: Int = 1 | 64 | 512 | 0x80000  # and close-on-exec
 comptime O_WRONLY_CREATE_APPEND: Int = 1 | 64 | 1024 | 0x80000

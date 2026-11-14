@@ -138,7 +138,7 @@ name = "${app_name}"
 version = "0.1.0"
 description = "Pure-Mojo 1.2 game powered by Flint Engine"
 channels = ["https://conda.modular.com/max", "conda-forge"]
-platforms = ["linux-64"]
+platforms = ["linux-64", "linux-aarch64"]
 
 [dependencies]
 mojo = ">=1.2.0,<1.3"

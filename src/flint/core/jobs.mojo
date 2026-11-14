@@ -27,6 +27,7 @@ Workers spin a little, then sleep on a futex until a job is pushed.
 """
 from std.atomic import Atomic
 from std.ffi import external_call
+from std.sys.info import CompilationTarget
 from flint.core.crash import install_thread_stack
 from flint.core.detmath import set_sim_float_mode
 from flint.core.profiler import Profiler, ZONE_NONE
@@ -81,7 +82,7 @@ comptime TICKET_GENERATIONS: Int = 0x7FFFFF  # keeps the ticket word positive
 comptime SPINS_BEFORE_SLEEP: Int = 4000
 comptime WORKER_STACK_BYTES: Int = 8 << 20  # a simulation tick needs the main thread's stack
 
-comptime SYS_FUTEX: Int = 202
+comptime SYS_FUTEX: Int = 202 if CompilationTarget.is_x86() else 98
 comptime FUTEX_WAIT_PRIVATE: Int = 128
 comptime FUTEX_WAKE_PRIVATE: Int = 129
 comptime FUTEX_WAKE_EVERYONE: Int = 0x7FFFFFFF

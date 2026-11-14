@@ -20,10 +20,10 @@ bakes: a missing glyph is measured from the source's advance.
 This module only loads and measures; `Framebuffer` does the drawing.
 """
 from std.collections import Dict
-from flint.platform.os import read_bytes
+from flint.platform.os import read_bytes, write_bytes
 from flint.text.utf8 import decode_utf8 as text_decode_utf8
 from flint.text.ttf import TrueTypeFont
-from flint.text.sdf_bake import bake_glyph, ShelfPacker, invisible
+from flint.text.sdf_bake import bake_glyph, bake_font, dsf_bytes, ShelfPacker, invisible
 
 comptime DSF_MAGIC: Int = 0x31465344
 comptime GLYPH_TABLE: Int = 0x2700  # codepoints below this are looked up directly
@@ -115,8 +115,10 @@ struct SdfFont(Copyable, Movable):
         self.dynamic_baked = 0
 
     def load(mut self, path: String) -> Bool:
+        return self.load_bytes(read_bytes(path))
+
+    def load_bytes(mut self, data: List[UInt8]) -> Bool:
         self.valid = False
-        var data = read_bytes(path)
         if len(data) < 44 or read_i32(data, 0) != DSF_MAGIC or read_i32(data, 4) != 1:
             return False
         self.atlas_width = read_i32(data, 8)
@@ -168,6 +170,46 @@ struct SdfFont(Copyable, Movable):
         else:
             self.cap_height = self.ascent * 0.7
         self.valid = True
+        return True
+
+    def load_ttf(
+        mut self,
+        path: String,
+        bake_px: Int = 44,
+        spread: Int = 6,
+        weight: Float32 = 0,
+        cache_dsf: String = "",
+    ) -> Bool:
+        """Load a TrueType (.ttf) font directly, baking an anti-aliased SDF atlas
+        for ASCII 32..126 (with optional .dsf cache) and attaching the outline source
+        for on-demand Unicode glyphs."""
+        if cache_dsf.byte_length() > 0 and self.load(cache_dsf):
+            _ = self.attach_source(path, weight)
+            return True
+        var font = TrueTypeFont()
+        if not font.load(path):
+            return False
+        if weight > 0:
+            _ = font.set_variation("wght", weight)
+        var codes = List[Int]()
+        for c in range(32, 127):
+            codes.append(c)
+        try:
+            var baked = bake_font(font, codes, bake_px, spread, 512)
+            var bytes = dsf_bytes(baked)
+            if cache_dsf.byte_length() > 0:
+                _ = write_bytes(cache_dsf, bytes)
+            if not self.load_bytes(bytes):
+                return False
+        except:
+            return False
+        self.source = font^
+        self.has_source = True
+        self.baked_count = len(self.glyphs)
+        self.baked_height = self.atlas_height
+        self.atlas_height += DYNAMIC_ROWS
+        self.atlas.resize(self.atlas_width * self.atlas_height, 0)
+        self.packer = ShelfPacker(self.atlas_width, self.atlas_height, self.baked_height + 1)
         return True
 
     def glyph_index(self, code: Int) -> Int:

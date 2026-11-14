@@ -26,6 +26,14 @@ from flint.render.flip import flip_error_map, flip_mean
 from flint.physics.filter import CollisionFilter
 from flint.physics.broadphase import BroadphaseInput, find_pairs
 from flint.devtools.mcp_server import FlintMcpInfo, handle_flint_mcp_query
+from flint.core.transform import Mat4, Quat, trs
+from flint.assets.model import NativeModel, NativeMesh, NativeTexture
+from flint.assets.mesh_builder import MeshBuilder, append_node_meshes
+from flint.assets.glb_writer import encode_native_glb
+from flint.assets.glb_native import parse_native_glb
+from flint.render.font import SdfFont
+from flint.render.lighting import LightingProfile
+from flint.render.scene_renderer import GpuSceneRenderer, FX_SOFT
 
 
 @fieldwise_init
@@ -220,6 +228,115 @@ def test_broadphase_canvas_flip_and_mcp() raises:
     print("  [PASS] Broadphase Physics, SimdCanvas 3D, LDR-FLIP Perceptual Diff & Flint MCP")
 
 
+def test_glb_pbr_ttf_and_gpu_scene_renderer() raises:
+    # 1. Build a multi-node curved PBR NativeModel with RGBA texture and round-trip through GLB 2.0
+    var model = NativeModel()
+    var tex = NativeTexture()
+    tex.width = 16
+    tex.height = 16
+    tex.pixels = List[UInt32](length=256, fill=0xFFE8EEF6)
+    for y in range(16):
+        for x in range(16):
+            if (x + y) % 4 == 0:
+                tex.pixels[y * 16 + x] = 0xFFCC2828
+    model.textures.append(tex^)
+
+    var hull_b = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.22, metallic=0.65, texture=0)
+    hull_b.add_ellipsoid(Vec3(0.0, 0.0, 0.0), Vec3(1.6, 1.1, 2.2), 16, 12)
+    var hull_prims = List[NativeMesh]()
+    hull_prims.append(hull_b^.finish())
+    var root_idx = append_node_meshes(model, "hull_root", hull_prims)
+
+    var canopy_b = MeshBuilder(
+        base_color=0xC8FFB848,
+        roughness=0.10,
+        metallic=0.05,
+        emissive_color=Vec3(1.0, 0.7, 0.3),
+        emissive_strength=0.35,
+        alpha_mode=2,
+    )
+    canopy_b.add_ellipsoid(Vec3(0.0, 0.0, 0.0), Vec3(0.65, 0.50, 1.1), 12, 8)
+    var canopy_prims = List[NativeMesh]()
+    canopy_prims.append(canopy_b^.finish())
+    _ = append_node_meshes(model, "canopy", canopy_prims, translation=Vec3(0.0, 0.85, 0.55), parent=root_idx)
+
+    var glb_bytes = encode_native_glb(model)
+    assert_true(len(glb_bytes) > 512)
+    var reloaded = parse_native_glb(glb_bytes)
+    assert_equal(len(reloaded.textures), 1)
+    assert_equal(reloaded.textures[0].width, 16)
+    assert_equal(len(reloaded.meshes), 2)
+    assert_equal(len(reloaded.nodes), 2)
+    assert_true(abs(reloaded.meshes[0].roughness - 0.22) < 0.01)
+    assert_true(abs(reloaded.meshes[0].metallic - 0.65) < 0.01)
+    assert_equal(reloaded.meshes[1].alpha_mode, 2)
+
+    # 2. Direct TrueType SDF font baking
+    var font = SdfFont()
+    var font_ok = font.load_ttf("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 36, 5)
+    assert_true(font_ok and font.valid)
+    assert_true(font.measure("FLINT GPU", 24.0) > 40.0)
+
+    # 3. GpuSceneRenderer on active backend (Vulkan on GB10) + CPU fallback verification
+    var profile = LightingProfile()
+    profile.key_direction = Vec3(-0.45, -0.70, -0.55).normalized()
+    profile.key_color = Vec3(1.25, 1.20, 1.12)
+    profile.hemisphere_sky = Vec3(0.18, 0.24, 0.34)
+    profile.hemisphere_ground = Vec3(0.05, 0.06, 0.09)
+    profile.fog_color = Vec3(6, 10, 18)
+    profile.fog_start = 90.0
+    profile.fog_end = 260.0
+    profile.filmic = 1.0
+    profile.exposure = 1.15
+
+    var gpu_scene = GpuSceneRenderer(320, 180, prefer_gpu=True)
+    _ = gpu_scene.fb.load_fonts("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")
+    gpu_scene.begin_frame(Vec3(0.0, 1.4, -5.8), Vec3(0.0, 0.2, 0.0), 55.0, profile)
+    gpu_scene.add_point_light(Vec3(2.5, 1.8, -2.5), Vec3(0.35, 0.85, 1.0), 14.0, 1.6, priority=80, stable_id=1)
+    gpu_scene.add_shadow_sphere(Vec3(2.2, 3.0, 2.0), 0.75)
+    gpu_scene.commit_lighting()
+    gpu_scene.draw_model(reloaded, trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1, 1, 1)))
+    gpu_scene.draw_thruster_plume(Vec3(-1.8, -0.4, 0.2), Vec3(-1.0, -0.1, 0.2), 1.8, 0.35, 0xFFFFF4D0, 0xFF42B8FF)
+    var ribbon_pts = List[Vec3]()
+    ribbon_pts.append(Vec3(1.4, 0.8, -0.5))
+    ribbon_pts.append(Vec3(2.1, 1.1, 0.3))
+    ribbon_pts.append(Vec3(2.9, 1.3, 1.2))
+    gpu_scene.draw_ribbon_3d(ribbon_pts, 0.16, 0.42, 0xFFF2F6FF, 0xFF7088A8, 190, 20, emissive=0.4)
+    gpu_scene.draw_billboard(Vec3(-1.5, 1.1, -0.6), 0.45, FX_SOFT, 0xFFFF9838, 210, emissive=1.8)
+    gpu_scene.end_scene()
+    gpu_scene.fb.draw_text("FLINT PBR", 24, 24, 24, 120, 235, 255)
+    assert_true(gpu_scene.present_headless())
+
+    var lit_pixels_gpu = 0
+    for px in gpu_scene.fb.pixels:
+        var r = Int((px >> 16) & 255)
+        var g = Int((px >> 8) & 255)
+        var b = Int(px & 255)
+        if r + g + b > 60:
+            lit_pixels_gpu += 1
+    assert_true(lit_pixels_gpu > 1500)
+
+    # Verify CPU fallback PBR path produces lit pixels too
+    var cpu_scene = GpuSceneRenderer(160, 90, prefer_gpu=False)
+    assert_equal(cpu_scene.active_backend_name(), "cpu")
+    cpu_scene.begin_frame(Vec3(0.0, 1.4, -5.8), Vec3(0.0, 0.2, 0.0), 55.0, profile)
+    cpu_scene.add_point_light(Vec3(2.5, 1.8, -2.5), Vec3(0.35, 0.85, 1.0), 14.0, 1.6, priority=80, stable_id=1)
+    cpu_scene.commit_lighting()
+    cpu_scene.draw_model(reloaded, trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1, 1, 1)))
+    assert_true(cpu_scene.present_headless())
+    var lit_pixels_cpu = 0
+    for px in cpu_scene.fb.pixels:
+        if Int((px >> 16) & 255) + Int((px >> 8) & 255) + Int(px & 255) > 60:
+            lit_pixels_cpu += 1
+    assert_true(lit_pixels_cpu > 350)
+
+    print(
+        "  [PASS] GLB 2.0 PBR Round-Trip, TrueType SDF Bake & GpuSceneRenderer ("
+        + gpu_scene.active_backend_name()
+        + " + cpu fallback)"
+    )
+
+
 def main() raises:
     print("[Flint Test] Running Pure-Mojo 1.2 Engine Verification Suite...")
     test_ecs_simd_and_lz4_persistence()
@@ -227,4 +344,5 @@ def main() raises:
     test_offset_allocator_coalescing()
     test_write_once_dual_gpu_kernel_codegen()
     test_broadphase_canvas_flip_and_mcp()
-    print("[Flint Test] ALL 5 ENGINE SUBSYSTEM SUITES PASSED!")
+    test_glb_pbr_ttf_and_gpu_scene_renderer()
+    print("[Flint Test] ALL 6 ENGINE SUBSYSTEM SUITES PASSED!")

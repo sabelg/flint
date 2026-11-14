@@ -344,6 +344,8 @@ def trace_shadow(mut s: ShaderAssembler):
     s.s_add_co_u32(29, 29, src_int(16))
     s.s_branch(sphere_loop)
     s.bind(spheres_done)
+    s.s_cmp_eq_u32(S_WORLD_ROW, src_int(0))
+    s.s_cbranch_scc1(march_done)
     # Start just off the surface, then walk toward the light half a voxel at a time.
     for axis in range(3):
         var offset = UInt32(axis)
@@ -2221,6 +2223,7 @@ struct GpuRaster(Copyable, Movable):
         push.append(float_bits(Float32(bloom_height) / Float32(self.height)))
         push.append(UInt32(1) if bloom else UInt32(0))
         push.append(UInt32(self.bloom_offset * 2) if smooth else UInt32(0))
+        push.append(UInt32(bloom_height))
         return push^
 
     def record_vulkan_frame(mut self, clear_color: UInt32, bloom: Bool, bloom_width: Int, bloom_height: Int, bloom_strength: Int, smooth: Bool) -> Bool:

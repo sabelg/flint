@@ -13,6 +13,7 @@ comptime TEXTURED_FLAG: UInt32 = 256
 comptime PER_PIXEL_FLAG: UInt32 = 512
 # Package 3.2: an occluder triangle, screen-doored around Maroon (render/dither.mojo).
 comptime DITHER_FLAG: UInt32 = 1024
+comptime PBR_FLAG: UInt32 = 2048
 # Frame-wide effect switches, read by the raster shader from CONSTANT_EFFECTS.
 comptime EFFECT_BILINEAR: UInt32 = 1
 comptime EFFECT_SHADOWS: UInt32 = 2
@@ -56,6 +57,8 @@ comptime RECORD_TEXTURE_FLOAT_HEIGHT: Int = 34
 comptime RECORD_TEXTURE_WIDTH: Int = 35
 comptime RECORD_TEXTURE_MAX_X: Int = 36
 comptime RECORD_TEXTURE_MAX_Y: Int = 37
+comptime RECORD_ROUGHNESS: Int = 38
+comptime RECORD_METALLIC: Int = 39
 comptime RECORD_NORMAL: Int = 40
 comptime RECORD_AMBIENT_OCCLUSION: Int = 49
 

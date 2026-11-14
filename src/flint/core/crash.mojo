@@ -29,10 +29,10 @@ from std.atomic import Atomic
 from flint.core.anchor import (
     ANCHOR, A_CHECK_FAILURES, A_CRASHED, A_ENSURE_FAILURES, A_GPU_HANGS, A_HANDLER_INSTALLED, A_HOT_RELOADS,
     A_LOG_DROPPED, A_LOG_FD, A_LOG_HEAD, A_NEXT_STACK, A_REPLAY_ACTIVE, A_REPLAY_BUFFER, A_REPLAY_COMMITTED,
-    A_REPLAY_PENDING, A_REPLAY_TICKS, A_TICK, AT_FDCWD, FORMAT_BUFFER, FORMAT_BYTES, O_READ, O_WRONLY_CREATE_APPEND,
+    A_REPLAY_PENDING, A_REPLAY_TICKS, A_TICK, AT_FDCWD, FORMAT_BUFFER, FORMAT_BYTES, IS_X86, O_READ, O_WRONLY_CREATE_APPEND,
     O_WRONLY_CREATE_TRUNC, RawText, SCRATCH_FRAMES, SCRATCH_PATH, SCRATCH_SIGNAL, SCRATCH_PATH2, SCRATCH_READ, STACKS, STACK_BYTES,
-    STACK_SLOTS, SYS_CLOSE, SYS_GETPID, SYS_GETTID, SYS_LINK, SYS_MKDIR, SYS_OPENAT, SYS_READ, SYS_READLINK,
-    SYS_TGKILL, T_BUILD_ID, T_CVARS, T_EXE_PATH, T_REASON, T_REPLAY_PATH, T_STAMP, T_STATE_DIR, T_STATUS,
+    STACK_SLOTS, SYS_CLOSE, SYS_GETPID, SYS_GETTID, SYS_LINKAT, SYS_MKDIRAT, SYS_NANOSLEEP, SYS_OPENAT, SYS_READ, SYS_READLINKAT,
+    SYS_TGKILL, SYS_WRITE, T_BUILD_ID, T_CVARS, T_EXE_PATH, T_REASON, T_REPLAY_PATH, T_STAMP, T_STATE_DIR, T_STATUS,
     anchor_add, anchor_ready, atomic_word, c_string, load, set_text, store, sys, text_length, wall_seconds,
     write_utc,
 )
@@ -51,9 +51,9 @@ comptime SA_SIGINFO: Int = 4
 comptime SA_ONSTACK: Int = 0x08000000
 comptime TAIL_ENTRIES: Int = 64
 comptime CHECK_BYTES: Int = 64  # a tick record's checksums (core/replay.mojo: CHECK_SECTIONS * 8)
-comptime UCONTEXT_RSP: Int = 160  # uc_mcontext.gregs[REG_RSP]
-comptime UCONTEXT_RIP: Int = 168  # uc_mcontext.gregs[REG_RIP]
-comptime UCONTEXT_RBP: Int = 120  # uc_mcontext.gregs[REG_RBP]
+comptime UCONTEXT_RSP: Int = 160 if IS_X86 else 432
+comptime UCONTEXT_RIP: Int = 168 if IS_X86 else 440
+comptime UCONTEXT_RBP: Int = 120 if IS_X86 else 416
 
 
 def crash_signals() -> List[Int]:
@@ -119,7 +119,7 @@ def elf_build_id(data: List[UInt8]) -> String:
 def executable_path() -> String:
     var buffer = List[UInt8](length=1024, fill=0)
     var link = c_string("/proc/self/exe")
-    var count = sys(SYS_READLINK, Int(link.unsafe_ptr()), Int(buffer.unsafe_ptr()), 1023)
+    var count = sys(SYS_READLINKAT, AT_FDCWD, Int(link.unsafe_ptr()), Int(buffer.unsafe_ptr()), 1023)
     _ = link^
     if count <= 0:
         return String()
@@ -194,7 +194,7 @@ def set_crash_cvars(text: String):
 # ---------------------------------------------------------------------------
 
 def make_folder(path: RawText) -> Bool:
-    var result = sys(SYS_MKDIR, path.base, 0o755)
+    var result = sys(SYS_MKDIRAT, AT_FDCWD, path.base, 0o755)
     return result == 0 or result == -17  # EEXIST
 
 
@@ -257,7 +257,7 @@ def copy_file(source: Int, destination: Int) -> Bool:
             break
         var written = 0
         while written < count:
-            var step = sys(1, output, ANCHOR + SCRATCH_READ + written, count - written)
+            var step = sys(SYS_WRITE, output, ANCHOR + SCRATCH_READ + written, count - written)
             if step <= 0:
                 ok = False
                 break
@@ -295,7 +295,7 @@ def save_replay(mut out: RawText, mut path: RawText, folder_length: Int) -> Int:
     path.length = folder_length
     path.text("/replay.sdrp")
     _ = path.terminate()
-    if sys(SYS_LINK, source.base, path.base) != 0:
+    if sys(SYS_LINKAT, AT_FDCWD, source.base, AT_FDCWD, path.base, 0) != 0:
         _ = copy_file(source.base, path.base)
     return load(ANCHOR + A_REPLAY_TICKS)
 
@@ -303,7 +303,7 @@ def save_replay(mut out: RawText, mut path: RawText, folder_length: Int) -> Int:
 def write_all_raw(fd: Int, address: Int, count: Int) -> Bool:
     var offset = 0
     while offset < count:
-        var written = sys(1, fd, address + offset, count - offset)
+        var written = sys(SYS_WRITE, fd, address + offset, count - offset)
         if written <= 0:
             return False
         offset += written
@@ -323,7 +323,7 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
         if first != tid:
             store(ANCHOR + SCRATCH_SIGNAL + 256, 10)  # a timespec: ten seconds
             store(ANCHOR + SCRATCH_SIGNAL + 264, 0)
-            _ = sys(35, ANCHOR + SCRATCH_SIGNAL + 256, 0)  # nanosleep
+            _ = sys(SYS_NANOSLEEP, ANCHOR + SCRATCH_SIGNAL + 256, 0)
         restore_and_reraise(number, info)
         return
     var code = Int(Pointer[Int32, origin=MutAnyOrigin](unsafe_from_address=info + 8)[unsafe_offset=0])

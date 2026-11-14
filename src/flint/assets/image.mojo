@@ -260,8 +260,9 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     var bit_depth = Int(data[24])
     var color_type = Int(data[25])
     var interlace = Int(data[28])
-    if width <= 0 or height <= 0 or width * height > 40000000 or bit_depth != 8 or color_type != 2 or interlace != 0:
+    if width <= 0 or height <= 0 or width * height > 40000000 or bit_depth != 8 or (color_type != 2 and color_type != 6) or interlace != 0:
         return image^
+    var channels = 4 if color_type == 6 else 3
     var compressed = List[UInt8]()
     var offset = 8
     var finished = False
@@ -280,7 +281,7 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     if not finished:
         return image^
     var raw = inflate_zlib(compressed, 0)
-    var stride = width * 3
+    var stride = width * channels
     if len(raw) != (stride + 1) * height:
         return image^
     var scanlines = List[UInt8](length=stride * height, fill=0)
@@ -288,9 +289,9 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
         var filter = Int(raw[y * (stride + 1)])
         for x in range(stride):
             var encoded = Int(raw[y * (stride + 1) + 1 + x])
-            var left = Int(scanlines[y * stride + x - 3]) if x >= 3 else 0
+            var left = Int(scanlines[y * stride + x - channels]) if x >= channels else 0
             var above = Int(scanlines[(y - 1) * stride + x]) if y > 0 else 0
-            var diagonal = Int(scanlines[(y - 1) * stride + x - 3]) if y > 0 and x >= 3 else 0
+            var diagonal = Int(scanlines[(y - 1) * stride + x - channels]) if y > 0 and x >= channels else 0
             var predictor = 0
             if filter == 1:
                 predictor = left
@@ -311,8 +312,9 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     image.pixels = List[UInt32](length=image.width * image.height, fill=0xFFFFFFFF)
     for y in range(image.height):
         for x in range(image.width):
-            var source = min(height - 1, y * scale) * stride + min(width - 1, x * scale) * 3
-            image.pixels[y * image.width + x] = 0xFF000000 | UInt32(scanlines[source]) << 16 | UInt32(scanlines[source + 1]) << 8 | UInt32(scanlines[source + 2])
+            var source = min(height - 1, y * scale) * stride + min(width - 1, x * scale) * channels
+            var alpha = UInt32(scanlines[source + 3]) if channels == 4 else UInt32(255)
+            image.pixels[y * image.width + x] = (alpha << 24) | UInt32(scanlines[source]) << 16 | UInt32(scanlines[source + 1]) << 8 | UInt32(scanlines[source + 2])
     image.valid = True
     return image^
 
@@ -342,16 +344,17 @@ def append_chunk(mut data: List[UInt8], kind: Int, payload: List[UInt8]):
     append_be32(data, Int(crc32(data, start, len(data))))
 
 
-def encode_png(mut pixels: List[UInt32], width: Int, height: Int, software: String = "") -> List[UInt8]:
+def encode_png(mut pixels: List[UInt32], width: Int, height: Int, software: String = "", alpha: Bool = False) -> List[UInt8]:
     var output = List[UInt8]()
     var signature = [137, 80, 78, 71, 13, 10, 26, 10]
     for value in signature:
         output.append(UInt8(value))
+    var channels = 4 if alpha else 3
     var header = List[UInt8]()
     append_be32(header, width)
     append_be32(header, height)
     header.append(8)
-    header.append(2)
+    header.append(UInt8(6) if alpha else UInt8(2))
     header.append(0)
     header.append(0)
     header.append(0)
@@ -368,7 +371,8 @@ def encode_png(mut pixels: List[UInt32], width: Int, height: Int, software: Stri
     var zlib = List[UInt8]()
     zlib.append(0x78)
     zlib.append(0x01)
-    var raw_size = (width * 3 + 1) * height
+    var row_bytes = width * channels + 1
+    var raw_size = row_bytes * height
     var position = 0
     var adler_a = 1
     var adler_b = 0
@@ -383,11 +387,14 @@ def encode_png(mut pixels: List[UInt32], width: Int, height: Int, software: Stri
         zlib.append(UInt8((inverse >> 8) & 255))
         for _ in range(block):
             var value = UInt8(0)
-            if position % (width * 3 + 1) != 0:
-                var within = position % (width * 3 + 1) - 1
-                var pixel = pixels[position // (width * 3 + 1) * width + within // 3]
-                var channel = within % 3
-                value = UInt8((pixel >> UInt32(16 - channel * 8)) & 255)
+            if position % row_bytes != 0:
+                var within = position % row_bytes - 1
+                var pixel = pixels[position // row_bytes * width + within // channels]
+                var channel = within % channels
+                if channel == 3:
+                    value = UInt8((pixel >> 24) & 255)
+                else:
+                    value = UInt8((pixel >> UInt32(16 - channel * 8)) & 255)
             zlib.append(value)
             adler_a = (adler_a + Int(value)) % 65521
             adler_b = (adler_b + adler_a) % 65521

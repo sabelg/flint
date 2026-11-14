@@ -183,9 +183,9 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 var bytes = List[UInt8]()
                 for index in range(length):
                     bytes.append(binary[offset + index])
-                var decoded = decode_png(bytes, 512)
+                var decoded = decode_png(bytes, 1024)
                 if len(bytes) >= 2 and Int(bytes[0]) == 255 and Int(bytes[1]) == 216:
-                    decoded = decode_jpeg(bytes, 512)
+                    decoded = decode_jpeg(bytes, 1024)
                 if decoded.valid:
                     texture.width = decoded.width
                     texture.height = decoded.height
@@ -279,6 +279,8 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                     mesh.base_color = UInt32(alpha) << 24 | UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue)
                 var base_texture = document.object_get(pbr, "baseColorTexture")
                 mesh.texture = document.integer(document.object_get(base_texture, "index"), -1)
+                mesh.roughness = max(Float32(0.05), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "roughnessFactor"), 0.55))))
+                mesh.metallic = max(Float32(0.0), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "metallicFactor"), 0.0))))
                 var alpha_mode = document.text(document.object_get(material, "alphaMode"), "OPAQUE")
                 mesh.alpha_mode = 2 if alpha_mode == "BLEND" else (1 if alpha_mode == "MASK" else 0)
                 mesh.double_sided = document.boolean(document.object_get(material, "doubleSided"), False)

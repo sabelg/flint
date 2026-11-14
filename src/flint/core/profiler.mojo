@@ -32,6 +32,7 @@ each GPU pass. Lanes are named by `M` metadata events.
 """
 from std.atomic import Atomic
 from std.ffi import external_call
+from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
 from std.time import monotonic
 
@@ -159,7 +160,10 @@ def zone_color(zone: Int) -> Tuple[UInt8, UInt8, UInt8]:
 
 @always_inline
 def profile_ticks() -> UInt64:
-    return llvm_intrinsic["llvm.x86.rdtsc", UInt64]()
+    comptime if CompilationTarget.is_x86():
+        return llvm_intrinsic["llvm.x86.rdtsc", UInt64]()
+    else:
+        return llvm_intrinsic["llvm.readcyclecounter", UInt64]()
 
 
 struct ProfileScope(Movable):

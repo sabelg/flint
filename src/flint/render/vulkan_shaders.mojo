@@ -13,9 +13,9 @@ from flint.render.gpu_layout import (
     BIND_TARGET, BIND_TEXTURES, BIND_TILES, BIND_VOXELS, BLOOM_FINAL_OFFSET, BLOOM_SAMPLES_X,
     BLOOM_SAMPLES_Y, CONSTANT_BLOOM_DISTANCE, CONSTANT_CAMERA, CONSTANT_DITHER, CONSTANT_EFFECTS, CONSTANT_KEY,
     CONSTANT_LIGHTS, CONSTANT_SATURATION, CONSTANT_SPHERES, CONSTANT_WORLD, EFFECT_BILINEAR,
-    DITHER_FLAG, EFFECT_SHADOWS, GROUP_HEIGHT, GROUP_WIDTH, PER_PIXEL_FLAG, RECORD_AMBIENT_OCCLUSION,
-    RECORD_EMISSIVE, RECORD_FLAGS, RECORD_FOG, RECORD_INVERSE_Z, RECORD_LIGHT, RECORD_NORMAL,
-    RECORD_TEXTURE, RECORD_TEXTURE_FLOAT_HEIGHT, RECORD_TEXTURE_FLOAT_WIDTH, RECORD_TEXTURE_MAX_X,
+    DITHER_FLAG, EFFECT_SHADOWS, GROUP_HEIGHT, GROUP_WIDTH, PBR_FLAG, PER_PIXEL_FLAG, RECORD_AMBIENT_OCCLUSION,
+    RECORD_EMISSIVE, RECORD_FLAGS, RECORD_FOG, RECORD_INVERSE_Z, RECORD_LIGHT, RECORD_METALLIC, RECORD_NORMAL,
+    RECORD_ROUGHNESS, RECORD_TEXTURE, RECORD_TEXTURE_FLOAT_HEIGHT, RECORD_TEXTURE_FLOAT_WIDTH, RECORD_TEXTURE_MAX_X,
     RECORD_TEXTURE_MAX_Y, RECORD_TEXTURE_WIDTH, RECORD_TINT, RECORD_U, RECORD_V, RECORD_WEIGHT_A,
     RECORD_WEIGHT_B, SHADOW_COARSE_STEPS, SHADOW_FINE_STEPS, TEXTURED_FLAG, TILE_ENTRY_DWORDS,
 )
@@ -54,7 +54,8 @@ comptime COMPOSE_PUSH_SCALE_X: Int = 4
 comptime COMPOSE_PUSH_SCALE_Y: Int = 5
 comptime COMPOSE_PUSH_BLOOM: Int = 6
 comptime COMPOSE_PUSH_SCENE: Int = 7
-comptime COMPOSE_PUSH_WORDS: Int = 8
+comptime COMPOSE_PUSH_CELLS_Y: Int = 8
+comptime COMPOSE_PUSH_WORDS: Int = 9
 
 comptime SMOOTH_PUSH_ROW: Int = 0
 comptime SMOOTH_PUSH_WIDTH: Int = 1
@@ -212,7 +213,12 @@ def trace_shadow(mut s: SpirvModule, res: Resources, world: Vec3Ids, normal: Vec
     var discriminant = s.fadd(s.fsub(s.fmul(along, along), dot3(s, center, center)), radius_squared)
     var zero = s.float(0)
     s.begin_if(s.logical_and(s.flt(zero, along), s.flt(zero, discriminant)))
-    s.store(shadow, zero)
+    var penumbra = s.nclamp(
+        s.fdiv(s.fmul(discriminant, s.float(4.0)), s.fadd(radius_squared, s.float(0.0001))),
+        zero,
+        s.float(1.0),
+    )
+    s.store(shadow, s.nmin(s.load_f(shadow), s.fsub(s.float(1.0), penumbra)))
     s.end_if()
     s.end_loop()
 
@@ -228,7 +234,7 @@ def trace_shadow(mut s: SpirvModule, res: Resources, world: Vec3Ids, normal: Vec
     var step = s.uvar(s.uint(0))
     var fine = s.uint(UInt32(SHADOW_FINE_STEPS))
     var total = s.uint(UInt32(SHADOW_FINE_STEPS + SHADOW_COARSE_STEPS))
-    s.begin_if(s.fgt(s.load_f(shadow), s.float(0)))
+    s.begin_if(s.logical_and(s.fgt(s.load_f(shadow), s.float(0)), s.ine(row, s.uint(0))))
     s.begin_loop()
     var current = s.load_u(step)
     s.break_if(s.uge(current, total))
@@ -263,30 +269,150 @@ def light_float(mut s: SpirvModule, res: Resources, word: UInt32, member: Int) -
     return s.load_float(res.constants, s.iadd(word, s.uint(UInt32(member))))
 
 
-def per_pixel_light(mut s: SpirvModule, res: Resources, base: UInt32, x: UInt32, y: UInt32, depth: UInt32, ray: Vec3Ids, camera: Vec3Ids, to_key: Vec3Ids, key_color: Vec3Ids, effects: UInt32, tile_lights: UInt32, light_r: UInt32, light_g: UInt32, light_b: UInt32):
-    """Key and local lights per pixel, added to the record's interpolated ambient light."""
+def accumulate_ggx_specular(
+    mut s: SpirvModule,
+    normal: Vec3Ids,
+    view_dir: Vec3Ids,
+    light_dir: Vec3Ids,
+    light_color: Vec3Ids,
+    n_dot_v: UInt32,
+    n_dot_l: UInt32,
+    alpha2: UInt32,
+    k_smith: UInt32,
+    one_minus_k: UInt32,
+    f0_r: UInt32,
+    f0_g: UInt32,
+    f0_b: UInt32,
+    spec_r: UInt32,
+    spec_g: UInt32,
+    spec_b: UInt32,
+):
+    """Cook-Torrance GGX microfacet specular + Schlick Fresnel for one light direction."""
+    var hx = s.fadd(view_dir.x, light_dir.x)
+    var hy = s.fadd(view_dir.y, light_dir.y)
+    var hz = s.fadd(view_dir.z, light_dir.z)
+    var h_raw = Vec3Ids(hx, hy, hz)
+    var inv_h = s.inverse_sqrt(s.fadd(dot3(s, h_raw, h_raw), s.float(0.00001)))
+    var half_dir = Vec3Ids(s.fmul(hx, inv_h), s.fmul(hy, inv_h), s.fmul(hz, inv_h))
+    var n_dot_h = s.nmax(dot3(s, normal, half_dir), s.float(0.0))
+    var v_dot_h = s.nclamp(dot3(s, view_dir, half_dir), s.float(0.0), s.float(1.0))
+
+    # Trowbridge-Reitz GGX D(h) = alpha^2 / (pi * ((N.H)^2 * (alpha^2 - 1) + 1)^2)
+    var ndh2 = s.fmul(n_dot_h, n_dot_h)
+    var denom_d = s.fma(ndh2, s.fsub(alpha2, s.float(1.0)), s.float(1.0))
+    var d_ggx = s.fdiv(alpha2, s.fadd(s.fmul(s.float(3.14159265), s.fmul(denom_d, denom_d)), s.float(0.0001)))
+
+    # Schlick-Smith visibility V = 1 / (4 * ((N.V)*(1-k) + k) * ((N.L)*(1-k) + k))
+    var gv = s.fma(n_dot_v, one_minus_k, k_smith)
+    var gl = s.fma(n_dot_l, one_minus_k, k_smith)
+    var vis = s.fdiv(s.float(0.25), s.fadd(s.fmul(gv, gl), s.float(0.0001)))
+    var lobe = s.nmin(s.fmul(s.fmul(d_ggx, vis), n_dot_l), s.float(6.0))
+
+    # Schlick Fresnel in [0..255] byte scale: F = F0 + (255 - F0) * (1 - V.H)^5
+    var om = s.fsub(s.float(1.0), v_dot_h)
+    var om2 = s.fmul(om, om)
+    var om5 = s.fmul(s.fmul(om2, om2), om)
+    var fr = s.fma(s.fsub(s.float(255.0), f0_r), om5, f0_r)
+    var fg = s.fma(s.fsub(s.float(255.0), f0_g), om5, f0_g)
+    var fb = s.fma(s.fsub(s.float(255.0), f0_b), om5, f0_b)
+
+    s.store(spec_r, s.fma(s.fmul(lobe, light_color.x), fr, s.load_f(spec_r)))
+    s.store(spec_g, s.fma(s.fmul(lobe, light_color.y), fg, s.load_f(spec_g)))
+    s.store(spec_b, s.fma(s.fmul(lobe, light_color.z), fb, s.load_f(spec_b)))
+
+
+def per_pixel_light(
+    mut s: SpirvModule,
+    res: Resources,
+    base: UInt32,
+    flags: UInt32,
+    x: UInt32,
+    y: UInt32,
+    depth: UInt32,
+    ray: Vec3Ids,
+    camera: Vec3Ids,
+    to_key: Vec3Ids,
+    key_color: Vec3Ids,
+    effects: UInt32,
+    tile_lights: UInt32,
+    base_r: UInt32,
+    base_g: UInt32,
+    base_b: UInt32,
+    light_r: UInt32,
+    light_g: UInt32,
+    light_b: UInt32,
+    spec_r: UInt32,
+    spec_g: UInt32,
+    spec_b: UInt32,
+):
+    """Key and local lights per pixel, with Cook-Torrance GGX microfacet specular when PBR_FLAG is set."""
     var world = Vec3Ids(s.fma(ray.x, depth, camera.x), s.fma(ray.y, depth, camera.y), s.fma(ray.z, depth, camera.z))
     var raw_x = plane(s, res, base, RECORD_NORMAL, x, y)
     var raw_y = plane(s, res, base, RECORD_NORMAL + 3, x, y)
     var raw_z = plane(s, res, base, RECORD_NORMAL + 6, x, y)
     var occlusion = plane(s, res, base, RECORD_AMBIENT_OCCLUSION, x, y)
     var raw = Vec3Ids(raw_x, raw_y, raw_z)
-    var inverse_length = s.inverse_sqrt(dot3(s, raw, raw))
+    var inverse_length = s.inverse_sqrt(s.fadd(dot3(s, raw, raw), s.float(0.000001)))
     var normal = Vec3Ids(s.fmul(inverse_length, raw_x), s.fmul(inverse_length, raw_y), s.fmul(inverse_length, raw_z))
+
+    var has_pbr = s.ine(s.bit_and(flags, s.uint(PBR_FLAG)), s.uint(0))
+    var roughness = s.nclamp(s.bitcast_float(field(s, res, base, RECORD_ROUGHNESS)), s.float(0.07), s.float(1.0))
+    var metallic = s.nclamp(s.bitcast_float(field(s, res, base, RECORD_METALLIC)), s.float(0.0), s.float(1.0))
+    var kd = s.fvar(s.float(1.0))
+    s.begin_if(has_pbr)
+    s.store(kd, s.fsub(s.float(1.0), s.fmul(metallic, s.float(0.65))))
+    s.end_if()
+    var kd_val = s.load_f(kd)
+
+    var inv_ray = s.inverse_sqrt(s.fadd(dot3(s, ray, ray), s.float(0.000001)))
+    var neg_inv_ray = s.fsub(s.float(0.0), inv_ray)
+    var view_dir = Vec3Ids(s.fmul(ray.x, neg_inv_ray), s.fmul(ray.y, neg_inv_ray), s.fmul(ray.z, neg_inv_ray))
+    var n_dot_v = s.nmax(dot3(s, normal, view_dir), s.float(0.001))
+    var alpha_r = s.fmul(roughness, roughness)
+    var alpha2 = s.fmul(alpha_r, alpha_r)
+    var r_plus_1 = s.fadd(roughness, s.float(1.0))
+    var k_smith = s.fmul(s.fmul(r_plus_1, r_plus_1), s.float(0.125))
+    var one_minus_k = s.fsub(s.float(1.0), k_smith)
+    var dielec_f0 = s.float(11.5)  # 0.045 * 255
+    var f0_r = s.fma(metallic, s.fsub(base_r, dielec_f0), dielec_f0)
+    var f0_g = s.fma(metallic, s.fsub(base_g, dielec_f0), dielec_f0)
+    var f0_b = s.fma(metallic, s.fsub(base_b, dielec_f0), dielec_f0)
 
     # Key light: 0.78 + 0.22 * ambient occlusion matches the vertex formula.
     var facing = s.nmax(dot3(s, normal, to_key), s.float(0))
+    var key_shadow = s.fvar(s.float(1.0))
     var key = s.fvar(s.fmul(s.fadd(s.float(0.78), s.fmul(s.float(0.22), occlusion)), facing))
     var traced = s.ine(s.bit_and(effects, s.uint(EFFECT_SHADOWS)), s.uint(0))
     # Faces turned away from the key light are already dark and need no ray.
     s.begin_if(s.logical_and(traced, s.flt(s.float(0), s.load_f(key))))
     var shadow = trace_shadow(s, res, world, normal, to_key)
+    s.store(key_shadow, shadow)
     s.store(key, s.fmul(shadow, s.load_f(key)))
     s.end_if()
-    var key_light = s.load_f(key)
+    var key_light = s.fmul(s.load_f(key), kd_val)
     s.store(light_r, s.fmul(key_color.x, key_light))
     s.store(light_g, s.fmul(key_color.y, key_light))
     s.store(light_b, s.fmul(key_color.z, key_light))
+
+    # Key-light GGX specular + subtle grazing Fresnel sheen
+    s.begin_if(has_pbr)
+    var n_dot_l_key = s.fmul(facing, s.load_f(key_shadow))
+    s.begin_if(s.flt(s.float(0.0001), n_dot_l_key))
+    accumulate_ggx_specular(
+        s, normal, view_dir, to_key, key_color, n_dot_v, n_dot_l_key,
+        alpha2, k_smith, one_minus_k, f0_r, f0_g, f0_b, spec_r, spec_g, spec_b,
+    )
+    s.end_if()
+    # Grazing Fresnel atmospheric/canopy edge sheen
+    var nv_om = s.fsub(s.float(1.0), n_dot_v)
+    var nv_om2 = s.fmul(nv_om, nv_om)
+    var nv_om4 = s.fmul(nv_om2, nv_om2)
+    var gloss = s.fsub(s.float(1.0), s.fmul(roughness, s.float(0.82)))
+    var sheen = s.fmul(s.fmul(nv_om4, gloss), s.fmul(occlusion, s.float(22.0)))
+    s.store(spec_r, s.fma(sheen, key_color.x, s.load_f(spec_r)))
+    s.store(spec_g, s.fma(sheen, key_color.y, s.load_f(spec_g)))
+    s.store(spec_b, s.fma(sheen, s.fadd(key_color.z, s.float(0.25)), s.load_f(spec_b)))
+    s.end_if()
 
     # Local lights: the CPU marked which ones can reach this tile.
     var count = constant_word(s, res, CONSTANT_WORLD + 24)
@@ -307,12 +433,23 @@ def per_pixel_light(mut s: SpirvModule, res: Resources, base: UInt32, x: UInt32,
     var falloff = s.nmax(s.fsub(s.float(1.0), s.fmul(light_float(s, res, word, 7), distance_squared)), s.float(0))
     falloff = s.fmul(falloff, falloff)
     var inverse_distance = s.inverse_sqrt(distance_squared)
-    var wrapped = s.nmax(s.fmul(dot3(s, normal, to_light), inverse_distance), s.float(0))
-    wrapped = s.fadd(s.fmul(wrapped, s.float(0.76)), s.float(0.24))
-    var amount = s.fmul(s.fmul(falloff, wrapped), occlusion)
-    s.store(light_r, s.fma(light_float(s, res, word, 4), amount, s.load_f(light_r)))
-    s.store(light_g, s.fma(light_float(s, res, word, 5), amount, s.load_f(light_g)))
-    s.store(light_b, s.fma(light_float(s, res, word, 6), amount, s.load_f(light_b)))
+    var raw_ndl = s.nmax(s.fmul(dot3(s, normal, to_light), inverse_distance), s.float(0))
+    var wrapped = s.fadd(s.fmul(raw_ndl, s.float(0.76)), s.float(0.24))
+    var amount = s.fmul(s.fmul(s.fmul(falloff, wrapped), occlusion), kd_val)
+    var l_col_r = light_float(s, res, word, 4)
+    var l_col_g = light_float(s, res, word, 5)
+    var l_col_b = light_float(s, res, word, 6)
+    s.store(light_r, s.fma(l_col_r, amount, s.load_f(light_r)))
+    s.store(light_g, s.fma(l_col_g, amount, s.load_f(light_g)))
+    s.store(light_b, s.fma(l_col_b, amount, s.load_f(light_b)))
+    s.begin_if(s.logical_and(has_pbr, s.flt(s.float(0.001), s.fmul(falloff, raw_ndl))))
+    var l_dir = Vec3Ids(s.fmul(to_x, inverse_distance), s.fmul(to_y, inverse_distance), s.fmul(to_z, inverse_distance))
+    var atten_col = Vec3Ids(s.fmul(l_col_r, falloff), s.fmul(l_col_g, falloff), s.fmul(l_col_b, falloff))
+    accumulate_ggx_specular(
+        s, normal, view_dir, l_dir, atten_col, n_dot_v, raw_ndl,
+        alpha2, k_smith, one_minus_k, f0_r, f0_g, f0_b, spec_r, spec_g, spec_b,
+    )
+    s.end_if()
     s.end_loop()
 
 
@@ -387,6 +524,9 @@ def raster_shader() -> List[UInt32]:
     var light_r = s.fvar(s.float(0))
     var light_g = s.fvar(s.float(0))
     var light_b = s.fvar(s.float(0))
+    var spec_r = s.fvar(s.float(0))
+    var spec_g = s.fvar(s.float(0))
+    var spec_b = s.fvar(s.float(0))
     var sampled = s.uvar(s.uint(0xFFFFFFFF))
 
     var entry = s.uvar(s.uint(0))
@@ -428,32 +568,41 @@ def raster_shader() -> List[UInt32]:
     s.end_if()
     s.end_if()
 
+    var tint = field(s, res, base, RECORD_TINT)
+    var pixel = s.load_u(sampled)
+    var bases = List[UInt32]()
+    for which in range(3):
+        var shift = 16 - which * 8
+        var product = s.imul(channel(s, tint, shift), channel(s, pixel, shift))
+        bases.append(s.float_from_uint(divide_by_255(s, product)))
+
     s.store(light_r, s.float(0))
     s.store(light_g, s.float(0))
     s.store(light_b, s.float(0))
+    s.store(spec_r, s.float(0))
+    s.store(spec_g, s.float(0))
+    s.store(spec_b, s.float(0))
     s.begin_if(s.ine(s.bit_and(flags, s.uint(PER_PIXEL_FLAG)), s.uint(0)))
-    per_pixel_light(s, res, base, x, y, depth, ray, camera, to_key, key_color, effects, tile_lights, light_r, light_g, light_b)
+    per_pixel_light(
+        s, res, base, flags, x, y, depth, ray, camera, to_key, key_color, effects, tile_lights,
+        bases[0], bases[1], bases[2], light_r, light_g, light_b, spec_r, spec_g, spec_b,
+    )
     s.end_if()
 
     # Shared per-pixel inputs: emissive term, fog, and its inverse.
     var emissive = s.fmul(s.float(1.25), plane(s, res, base, RECORD_EMISSIVE, x, y))
     var fog = plane(s, res, base, RECORD_FOG, x, y)
     var clearness = s.fsub(s.float(1.0), fog)
-    var tint = field(s, res, base, RECORD_TINT)
-    var pixel = s.load_u(sampled)
 
-    # Texture * tint, lighting, fog, then the region's tone table.
+    # Texture * tint, lighting + PBR specular, fog, then the region's tone table.
     var shades = List[UInt32]()
-    var bases = List[UInt32]()
     for which in range(3):
-        var shift = 16 - which * 8
-        var product = s.imul(channel(s, tint, shift), channel(s, pixel, shift))
-        var base_color = s.float_from_uint(divide_by_255(s, product))
-        bases.append(base_color)
+        var base_color = bases[which]
         var fog_color = fog_r if which == 0 else (fog_g if which == 1 else fog_b)
         var pixel_light = s.load_f(light_r if which == 0 else (light_g if which == 1 else light_b))
+        var pixel_spec = s.load_f(spec_r if which == 0 else (spec_g if which == 1 else spec_b))
         var total = s.fadd(s.fadd(plane(s, res, base, RECORD_LIGHT + which * 3, x, y), emissive), pixel_light)
-        var lit = s.fmul(s.fmul(base_color, total), clearness)
+        var lit = s.fmul(s.fma(base_color, total, pixel_spec), clearness)
         var shaded = float_to_byte(s, s.fadd(lit, s.fmul(fog_color, fog)))
         var table_byte = s.iadd(shaded, s.uint(UInt32(which * 256)))
         var loaded = s.load_word(res.constants, s.shr(table_byte, s.uint(2)))
@@ -498,13 +647,19 @@ def raster_shader() -> List[UInt32]:
     s.store(nearest_depth, inverse_z)
     s.end_if()
 
-    # Bloom source: base colour * emissive * alpha for sufficiently bright pixels.
-    var bright = s.fge(emissive, s.float_bits(0x3E4CCCCD))  # 0.2: the CPU's 0.16 floor, times 1.25.
+    # Bloom source: base colour * emissive * alpha, plus hot PBR specular sun glints (> 145).
+    var spec_peak = s.nmax(s.load_f(spec_r), s.nmax(s.load_f(spec_g), s.load_f(spec_b)))
+    var bright = s.logical_or(
+        s.fge(emissive, s.float_bits(0x3E4CCCCD)),  # 0.2: the CPU's 0.16 floor, times 1.25.
+        s.fge(spec_peak, s.float(145.0)),
+    )
     s.begin_if(s.logical_and(bright, s.ult(s.uint(23), alpha)))
     var strength = s.fmul(opacity, s.fmul(s.float_bits(0x3F4CCCCD), emissive))  # 0.8 removes the gain.
     var glow = s.uvar(s.uint(0))
     for which in range(3):
-        var value = float_to_byte(s, s.fmul(strength, bases[which]))
+        var sp_c = s.load_f(spec_r if which == 0 else (spec_g if which == 1 else spec_b))
+        var sp_bloom = s.fmul(opacity, s.fmul(s.nmax(s.fsub(sp_c, s.float(130.0)), s.float(0.0)), s.float(0.55)))
+        var value = float_to_byte(s, s.fadd(s.fmul(strength, bases[which]), sp_bloom))
         s.store(glow, s.bit_or(s.load_u(glow), s.shl(value, s.uint(UInt32(16 - which * 8)))))
     s.store(bloom, s.load_u(glow))
     s.end_if()
@@ -569,7 +724,7 @@ def bloom_reduce_shader() -> List[UInt32]:
 
 
 def bloom_blur_shader(horizontal: Bool) -> List[UInt32]:
-    """One 0.24/0.52/0.24 axis of the bloom blur, in floating-point cells.
+    """One 5-tap [0.0625, 0.25, 0.375, 0.25, 0.0625] Gaussian axis of the bloom blur.
 
     The vertical pass is last, so it also applies the bloom strength and packs
     each cell into a byte per channel.
@@ -585,22 +740,30 @@ def bloom_blur_shader(horizontal: Bool) -> List[UInt32]:
     var source = s.push_word(BLUR_PUSH_SOURCE)
     var target = s.push_word(BLUR_PUSH_TARGET)
     var one = s.uint(1)
+    var two = s.uint(2)
     var three = s.uint(3)
     var moving = column if horizontal else line
     var last = s.isub(cell_columns if horizontal else cell_rows, one)
+    var before2 = s.smax(s.isub(moving, two), s.uint(0))
     var before = s.smax(s.isub(moving, one), s.uint(0))
     var after = s.smin(s.iadd(moving, one), last)
+    var after2 = s.smin(s.iadd(moving, two), last)
     var here = s.iadd(s.imul(line, cell_columns), column)
+    var before2_cell = s.iadd(s.imul(line, cell_columns), before2) if horizontal else s.iadd(s.imul(before2, cell_columns), column)
     var before_cell = s.iadd(s.imul(line, cell_columns), before) if horizontal else s.iadd(s.imul(before, cell_columns), column)
     var after_cell = s.iadd(s.imul(line, cell_columns), after) if horizontal else s.iadd(s.imul(after, cell_columns), column)
+    var after2_cell = s.iadd(s.imul(line, cell_columns), after2) if horizontal else s.iadd(s.imul(after2, cell_columns), column)
     var packed = s.uvar(s.uint(0xFF000000))
     var inverse_strength = s.push_float(BLUR_PUSH_INVERSE_STRENGTH)
     for which in range(3):
         var offset = s.uint(UInt32(which))
+        var a0 = s.load_float(cells, s.iadd(source, s.iadd(s.imul(before2_cell, three), offset)))
         var a = s.load_float(cells, s.iadd(source, s.iadd(s.imul(before_cell, three), offset)))
         var b = s.load_float(cells, s.iadd(source, s.iadd(s.imul(here, three), offset)))
         var c = s.load_float(cells, s.iadd(source, s.iadd(s.imul(after_cell, three), offset)))
-        var mixed = s.fadd(s.fmul(s.float(0.24), s.fadd(a, c)), s.fmul(s.float(0.52), b))
+        var c2 = s.load_float(cells, s.iadd(source, s.iadd(s.imul(after2_cell, three), offset)))
+        var inner = s.fma(s.float(0.25), s.fadd(a, c), s.fmul(s.float(0.375), b))
+        var mixed = s.fma(s.float(0.0625), s.fadd(a0, c2), inner)
         if horizontal:
             var bits = s.bitcast_uint(mixed)
             s.store_word(cells, s.iadd(target, s.iadd(s.imul(here, three), offset)), bits)
@@ -614,7 +777,7 @@ def bloom_blur_shader(horizontal: Bool) -> List[UInt32]:
 
 
 def compose_shader(capture: Bool) -> List[UInt32]:
-    """Scene + bloom, then the premultiplied HUD over it, into the shown image.
+    """Scene + bilinear-upsampled bloom, then the premultiplied HUD over it, into the shown image.
 
     The capture variant writes the backdrop instead, with nothing over the scene.
     """
@@ -633,11 +796,28 @@ def compose_shader(capture: Bool) -> List[UInt32]:
     var bloom = s.uvar(s.uint(0))
     s.begin_if(s.ine(s.push_word(COMPOSE_PUSH_BLOOM), s.uint(0)))
     var cell_columns = s.push_word(COMPOSE_PUSH_CELLS_X)
-    var cell_x = s.saturate_uint(s.fmul(s.push_float(COMPOSE_PUSH_SCALE_X), s.float_from_uint(column)))
-    cell_x = s.umin(cell_x, s.isub(cell_columns, s.uint(1)))
-    var cell_y = s.saturate_uint(s.fmul(s.push_float(COMPOSE_PUSH_SCALE_Y), s.float_from_uint(line)))
-    var cell = s.iadd(s.imul(cell_y, cell_columns), cell_x)
-    s.store(bloom, s.load_word(cells, s.iadd(s.uint(UInt32(BLOOM_FINAL_OFFSET // 4)), cell)))
+    var cell_rows = s.push_word(COMPOSE_PUSH_CELLS_Y)
+    var max_cx = s.isub(cell_columns, s.uint(1))
+    var max_cy = s.isub(cell_rows, s.uint(1))
+    var half = s.float(0.5)
+    var u = s.nmax(s.fsub(s.fmul(s.push_float(COMPOSE_PUSH_SCALE_X), s.fadd(s.float_from_uint(column), half)), half), s.float(0.0))
+    var v = s.nmax(s.fsub(s.fmul(s.push_float(COMPOSE_PUSH_SCALE_Y), s.fadd(s.float_from_uint(line), half)), half), s.float(0.0))
+    var x0 = s.umin(s.saturate_uint(u), max_cx)
+    var x1 = s.umin(s.iadd(x0, s.uint(1)), max_cx)
+    var y0 = s.umin(s.saturate_uint(v), max_cy)
+    var y1 = s.umin(s.iadd(y0, s.uint(1)), max_cy)
+    var fx = s.umin(s.saturate_uint(s.fmul(s.nmax(s.fsub(u, s.float_from_uint(x0)), s.float(0.0)), s.float(256.0))), s.uint(256))
+    var fy = s.umin(s.saturate_uint(s.fmul(s.nmax(s.fsub(v, s.float_from_uint(y0)), s.float(0.0)), s.float(256.0))), s.uint(256))
+    var base_off = s.uint(UInt32(BLOOM_FINAL_OFFSET // 4))
+    var row0 = s.iadd(base_off, s.imul(y0, cell_columns))
+    var row1 = s.iadd(base_off, s.imul(y1, cell_columns))
+    var c00 = s.load_word(cells, s.iadd(row0, x0))
+    var c10 = s.load_word(cells, s.iadd(row0, x1))
+    var c01 = s.load_word(cells, s.iadd(row1, x0))
+    var c11 = s.load_word(cells, s.iadd(row1, x1))
+    var top_mix = lerp_packed(s, c00, c10, fx)
+    var bot_mix = lerp_packed(s, c01, c11, fx)
+    s.store(bloom, lerp_packed(s, top_mix, bot_mix, fy))
     s.end_if()
     var glow = s.load_u(bloom)
     var through = s.isub(s.uint(255), s.shr(hud, s.uint(24)))

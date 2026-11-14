@@ -15,12 +15,40 @@ from flint.ui.button_glyphs import (
 )
 from flint.ui.layout import UiFrame, ui_frame, MAX_SAFE_MARGIN
 from flint.ui.nine_slice import NineSlice, slate_panel, focus_frame, slice_map
-from flint.render.pause_map import PauseMap
-from flint.render.minimap import MiniMap
-from flint.render.lighting import LightingProfile
+from flint.render.lighting import LightingProfile, LocalLight
 from flint.render.dither import DitherView, dither_view
-from flint.render.gpu_layout import RECORD_FLOATS, TEXTURED_FLAG, PER_PIXEL_FLAG, DITHER_FLAG, CONSTANT_DITHER, EFFECT_BILINEAR, EFFECT_SHADOWS, CONSTANT_CAMERA, CONSTANT_KEY, CONSTANT_WORLD, CONSTANT_LIGHTS, CONSTANT_SPHERES, MAX_SHADOW_SPHERES
+from flint.render.gpu_layout import RECORD_FLOATS, TEXTURED_FLAG, PER_PIXEL_FLAG, DITHER_FLAG, PBR_FLAG, RECORD_ROUGHNESS, RECORD_METALLIC, CONSTANT_DITHER, EFFECT_BILINEAR, EFFECT_SHADOWS, CONSTANT_CAMERA, CONSTANT_KEY, CONSTANT_WORLD, CONSTANT_LIGHTS, CONSTANT_SPHERES, MAX_SHADOW_SPHERES
 from flint.render.gpu_raster import BACKEND_AMDGPU, GpuRaster
+
+
+struct HudMapLayer(Copyable, Movable):
+    """Generic ARGB HUD overlay bitmap (used by pause map, radar, and minimap slots)."""
+    var valid: Bool
+    var width: Int
+    var height: Int
+    var generation: Int
+    var pixels: List[UInt32]
+
+    def __init__(out self):
+        self.valid = False
+        self.width = 0
+        self.height = 0
+        self.generation = 0
+        self.pixels = List[UInt32]()
+
+    def set_image(mut self, width: Int, height: Int, mut src_pixels: List[UInt32]):
+        if width <= 0 or height <= 0 or len(src_pixels) < width * height:
+            self.valid = False
+            return
+        self.width = width
+        self.height = height
+        self.pixels = src_pixels.copy()
+        self.valid = True
+        self.generation += 1
+
+
+comptime PauseMap = HudMapLayer
+comptime MiniMap = HudMapLayer
 
 
 comptime TEXT_SPRITE_LIMIT: Int = 512
@@ -60,6 +88,8 @@ struct RenderVertex(Copyable, ImplicitlyCopyable, Movable):
     var fog: Float32
     var emissive: Float32
     var occlusion: Float32
+    var roughness: Float32
+    var metallic: Float32
 
     def __init__(out self, position: Vec3 = Vec3(), normal: Vec3 = Vec3(0, 1, 0), u: Float32 = 0, v: Float32 = 0, color: UInt32 = 0xFFFFFFFF):
         self.position = position
@@ -71,6 +101,8 @@ struct RenderVertex(Copyable, ImplicitlyCopyable, Movable):
         self.fog = 0
         self.emissive = 0
         self.occlusion = -1
+        self.roughness = 0.55
+        self.metallic = 0.0
 
 
 struct CameraVertex(Copyable, ImplicitlyCopyable, Movable):
@@ -83,6 +115,8 @@ struct CameraVertex(Copyable, ImplicitlyCopyable, Movable):
     var fog: Float32
     var emissive: Float32
     var occlusion: Float32
+    var roughness: Float32
+    var metallic: Float32
 
     def __init__(out self, position: Vec3 = Vec3(), normal: Vec3 = Vec3(0, 1, 0), u: Float32 = 0, v: Float32 = 0, color: UInt32 = 0xFFFFFFFF):
         self.position = position
@@ -94,6 +128,8 @@ struct CameraVertex(Copyable, ImplicitlyCopyable, Movable):
         self.fog = 0
         self.emissive = 0
         self.occlusion = -1
+        self.roughness = 0.55
+        self.metallic = 0.0
 
     def interpolate(self, other: Self, amount: Float32) -> Self:
         var inverse = 1.0 - amount
@@ -108,6 +144,8 @@ struct CameraVertex(Copyable, ImplicitlyCopyable, Movable):
         result.fog = self.fog * inverse + other.fog * amount
         result.emissive = self.emissive * inverse + other.emissive * amount
         result.occlusion = self.occlusion * inverse + other.occlusion * amount
+        result.roughness = self.roughness * inverse + other.roughness * amount
+        result.metallic = self.metallic * inverse + other.metallic * amount
         return result^
 
 
@@ -123,6 +161,8 @@ struct ScreenVertex(Copyable, ImplicitlyCopyable, Movable):
     var fog: Float32
     var emissive: Float32
     var occlusion: Float32
+    var roughness: Float32
+    var metallic: Float32
 
     def __init__(out self):
         self.x = 0
@@ -136,6 +176,8 @@ struct ScreenVertex(Copyable, ImplicitlyCopyable, Movable):
         self.fog = 0
         self.emissive = 0
         self.occlusion = -1
+        self.roughness = 0.55
+        self.metallic = 0.0
 
 
 struct SoftwareFramebuffer(Copyable, Movable):
@@ -209,7 +251,14 @@ struct SoftwareFramebuffer(Copyable, Movable):
     var button_sony: Bool       # ... with PlayStation shapes
     var button_keys: List[String]  # package 3.15: keycap labels of remapped keys by glyph action ("" = default)
     var button_keys_generation: Int  # bumped when they change, so the recorded HUD redraws
-    var minimap: MiniMap        # package 3.18: the HUD's top-down map (render/minimap.mojo); last, to keep the older fields where they were
+    var minimap: MiniMap        # package 3.18: the HUD's top-down map; last, to keep the older fields where they were
+    var shadow_sphere_count: Int
+    var min_text_em: Float32
+    var cpu_to_key: Vec3
+    var cpu_key_color: Vec3
+    var cpu_lights: List[LocalLight]
+    var cpu_sphere_centers: List[Vec3]
+    var cpu_sphere_radii_sq: List[Float32]
 
     def __init__(out self, width: Int = 1280, height: Int = 720):
         self.width = width
@@ -281,18 +330,50 @@ struct SoftwareFramebuffer(Copyable, Movable):
         self.backdrop_generation = 0
         self.debug = DebugDraw()
         self.minimap = MiniMap()
-        _ = self.display_font.load("assets/deepsong/fonts/display.dsf")
-        _ = self.ui_font.load("assets/deepsong/fonts/ui.dsf")
-        # Package 3.12: the faces themselves, for the dynamic glyph cache
-        # (same weights as tools/run.sh bake-fonts).
-        _ = self.display_font.attach_source(DISPLAY_FONT_FILE)
-        _ = self.ui_font.attach_source(UI_FONT_FILE, UI_FONT_WEIGHT)
+        self.shadow_sphere_count = 0
+        self.min_text_em = 12.0
+        self.cpu_to_key = Vec3(0.42, 0.82, 0.38).normalized()
+        self.cpu_key_color = Vec3(0.75, 0.75, 0.75)
+        self.cpu_lights = List[LocalLight]()
+        self.cpu_sphere_centers = List[Vec3]()
+        self.cpu_sphere_radii_sq = List[Float32]()
         self.update_ui_transform()
         for index in range(256):
             self.tone_lut[index] = UInt8(index)
             self.tone_lut[index + 256] = UInt8(index)
             self.tone_lut[index + 512] = UInt8(index)
         self.set_camera(Vec3(0, 0, -5), Vec3(), 58)
+
+    def load_fonts(
+        mut self,
+        ui_path: String,
+        display_path: String = "",
+        ui_weight: Float32 = 0,
+        ui_cache_dsf: String = "",
+        display_cache_dsf: String = "",
+    ) -> Bool:
+        """Load UI and optional Display SDF fonts from either .ttf or .dsf files."""
+        var ok_ui = False
+        if ui_path.endswith(".dsf"):
+            ok_ui = self.ui_font.load(ui_path)
+        elif ui_path.byte_length() > 0:
+            ok_ui = self.ui_font.load_ttf(ui_path, 42, 6, ui_weight, ui_cache_dsf)
+
+        var disp = display_path if display_path.byte_length() > 0 else ui_path
+        var disp_cache = display_cache_dsf if display_path.byte_length() > 0 else ui_cache_dsf
+        var ok_disp = False
+        if disp.endswith(".dsf"):
+            ok_disp = self.display_font.load(disp)
+        elif disp.byte_length() > 0:
+            ok_disp = self.display_font.load_ttf(disp, 48, 6, ui_weight, disp_cache)
+
+        self.text_sprites.clear()
+        self.text_sprite_slots.clear()
+        self.hud_hash = 0
+        return ok_ui and ok_disp
+
+    def em_size(self, size: Int) -> Float32:
+        return max(Float32(size), self.min_text_em)
 
     def ui_frame(self, player: Int = 0) -> UiFrame:
         """The visible canvas and its safe area (package 3.12, ui/layout.mojo)."""
@@ -653,6 +734,8 @@ struct SoftwareFramebuffer(Copyable, Movable):
         result.fog = vertex.fog
         result.emissive = vertex.emissive
         result.occlusion = vertex.occlusion
+        result.roughness = vertex.roughness
+        result.metallic = vertex.metallic
         return result^
 
     def project(self, vertex: CameraVertex) -> ScreenVertex:
@@ -669,6 +752,8 @@ struct SoftwareFramebuffer(Copyable, Movable):
         result.fog = vertex.fog
         result.emissive = vertex.emissive
         result.occlusion = vertex.occlusion
+        result.roughness = vertex.roughness
+        result.metallic = vertex.metallic
         return result^
 
     def sample_texture(self, mut texture: List[UInt32], texture_width: Int, texture_height: Int, u: Float32, v: Float32) -> UInt32:
@@ -707,10 +792,10 @@ struct SoftwareFramebuffer(Copyable, Movable):
         var blue = Float32(color & 255) * amount + Float32(previous & 255) * inverse
         self.pixels[index] = rgb(clamp_byte(red), clamp_byte(green), clamp_byte(blue))
 
-    def shade(self, base: UInt32, light: Vec3, fog: Float32, emissive: Float32) -> UInt32:
-        var red = Float32((base >> 16) & 255) * (light.x + emissive * 1.25)
-        var green = Float32((base >> 8) & 255) * (light.y + emissive * 1.25)
-        var blue = Float32(base & 255) * (light.z + emissive * 1.25)
+    def shade(self, base: UInt32, light: Vec3, fog: Float32, emissive: Float32, spec_rgb: Vec3 = Vec3()) -> UInt32:
+        var red = Float32((base >> 16) & 255) * (light.x + emissive * 1.25) + spec_rgb.x
+        var green = Float32((base >> 8) & 255) * (light.y + emissive * 1.25) + spec_rgb.y
+        var blue = Float32(base & 255) * (light.z + emissive * 1.25) + spec_rgb.z
         red = red * (1.0 - fog) + Float32((self.fog_color >> 16) & 255) * fog
         green = green * (1.0 - fog) + Float32((self.fog_color >> 8) & 255) * fog
         blue = blue * (1.0 - fog) + Float32(self.fog_color & 255) * fog
@@ -834,7 +919,8 @@ struct SoftwareFramebuffer(Copyable, Movable):
             self.update_hud_layer()
         self.paint_debug()
         self.upload_dither()
-        if not self.gpu.submit(self.tone_lut, self.post_saturation_steps, self.fog_color, self.bloom_enabled, self.bloom_width, self.bloom_height, self.bloom_strength, self.gpu_effects if self.gpu.voxels_ready else self.gpu_effects & ~EFFECT_SHADOWS, self.gpu_smoothing):
+        var shadows_active = self.gpu.voxels_ready or self.shadow_sphere_count > 0
+        if not self.gpu.submit(self.tone_lut, self.post_saturation_steps, self.fog_color, self.bloom_enabled, self.bloom_width, self.bloom_height, self.bloom_strength, self.gpu_effects if shadows_active else self.gpu_effects & ~EFFECT_SHADOWS, self.gpu_smoothing):
             print("GPU raster stopped: " + self.gpu.error)
             log_error(LOG_GPU, "GPU raster stopped: " + self.gpu.error)
             return False
@@ -1026,13 +1112,33 @@ struct SoftwareFramebuffer(Copyable, Movable):
             plane(49, a.occlusion, b.occlusion, c.occlusion)
         var words = Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=address)
         words[unsafe_offset=15] = a.color
-        words[unsafe_offset=31] = UInt32(alpha) | (TEXTURED_FLAG if offset >= 0 else UInt32(0)) | (PER_PIXEL_FLAG if per_pixel else UInt32(0)) | (DITHER_FLAG if self.occluder_pass else UInt32(0))
+        words[unsafe_offset=31] = UInt32(alpha) | (TEXTURED_FLAG if offset >= 0 else UInt32(0)) | (PER_PIXEL_FLAG if per_pixel else UInt32(0)) | (PBR_FLAG if per_pixel else UInt32(0)) | (DITHER_FLAG if self.occluder_pass else UInt32(0))
         words[unsafe_offset=32] = UInt32(max(offset, 0))
         record[unsafe_offset=33] = Float32(texture_width)
         record[unsafe_offset=34] = Float32(texture_height)
         words[unsafe_offset=35] = UInt32(texture_width)
         words[unsafe_offset=36] = UInt32(max(texture_width - 1, 0))
         words[unsafe_offset=37] = UInt32(max(texture_height - 1, 0))
+        record[unsafe_offset=RECORD_ROUGHNESS] = max(Float32(0.05), min(Float32(1.0), (a.roughness + b.roughness + c.roughness) * 0.33333334))
+        record[unsafe_offset=RECORD_METALLIC] = max(Float32(0.0), min(Float32(1.0), (a.metallic + b.metallic + c.metallic) * 0.33333334))
+
+    def cpu_sphere_shadow(self, world_pos: Vec3, to_key: Vec3) -> Float32:
+        if len(self.cpu_sphere_centers) == 0:
+            return 1.0
+        var lit = Float32(1.0)
+        for i in range(len(self.cpu_sphere_centers)):
+            var rel = self.cpu_sphere_centers[i] - world_pos
+            var r2 = self.cpu_sphere_radii_sq[i]
+            if rel.length_squared() <= r2 * 1.15:
+                continue
+            var proj = dot(rel, to_key)
+            if proj <= 0.0:
+                continue
+            var miss2 = rel.length_squared() - proj * proj
+            if miss2 < r2 * 1.25:
+                var pen = max(Float32(0.0), min(Float32(1.0), (miss2 - r2 * 0.55) / max(Float32(0.0001), r2 * 0.70)))
+                lit = min(lit, 0.22 + 0.78 * pen)
+        return lit
 
     def raster_triangle(mut self, a: ScreenVertex, b: ScreenVertex, c: ScreenVertex, mut texture: List[UInt32], texture_width: Int, texture_height: Int, alpha: UInt8, double_sided: Bool = False):
         if self.gpu.active:
@@ -1058,6 +1164,9 @@ struct SoftwareFramebuffer(Copyable, Movable):
             return
         var inverse_area = 1.0 / area
         var textured = texture_width > 0 and texture_height > 0 and len(texture) >= texture_width * texture_height
+        var per_pixel = a.occlusion >= 0 and b.occlusion >= 0 and c.occlusion >= 0
+        var rough = max(Float32(0.05), min(Float32(1.0), (a.roughness + b.roughness + c.roughness) * 0.33333334))
+        var metal = max(Float32(0.0), min(Float32(1.0), (a.metallic + b.metallic + c.metallic) * 0.33333334))
         var start_x = Float32(minimum_x) + 0.5
         var start_y = Float32(minimum_y) + 0.5
         var row_a = ((b.x - start_x) * (c.y - start_y) - (b.y - start_y) * (c.x - start_x)) * inverse_area
@@ -1066,6 +1175,9 @@ struct SoftwareFramebuffer(Copyable, Movable):
         var step_b_x = (c.y - a.y) * inverse_area
         var step_a_y = (c.x - b.x) * inverse_area
         var step_b_y = (a.x - c.x) * inverse_area
+        var inv_focal = 1.0 / self.focal
+        var half_w = Float32(self.width) * 0.5
+        var half_h = Float32(self.height) * 0.5
         self.drawn_triangles += 1
         var dithered = self.occluder_pass and self.dither.active()
         for y in range(minimum_y, maximum_y + 1):
@@ -1095,13 +1207,78 @@ struct SoftwareFramebuffer(Copyable, Movable):
                             var green = Int((sampled >> 8) & 255) * Int((tint >> 8) & 255) // 255
                             var blue = Int(sampled & 255) * Int(tint & 255) // 255
                             base |= UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue)
-                            var shaded = self.shade(base, light, fog, emissive)
+                            var spec_rgb = Vec3()
+                            if per_pixel:
+                                var vx = (Float32(x) + 0.5 - half_w) * inv_focal * view_depth
+                                var vy = (half_h - (Float32(y) + 0.5)) * inv_focal * view_depth
+                                var world_pos = self.camera + self.right * vx + self.up * vy + self.forward * view_depth
+                                var n = (a.normal * weight_a + b.normal * weight_b + c.normal * weight_c).normalized()
+                                var ao = max(Float32(0.0), min(Float32(1.0), a.occlusion * weight_a + b.occlusion * weight_b + c.occlusion * weight_c))
+                                var view_dir = (self.camera - world_pos).normalized()
+                                var ndotv = max(Float32(0.02), dot(n, view_dir))
+                                var f0 = Vec3(0.04 + (Float32(red) - 0.04 * 255.0) / 255.0 * metal, 0.04 + (Float32(green) - 0.04 * 255.0) / 255.0 * metal, 0.04 + (Float32(blue) - 0.04 * 255.0) / 255.0 * metal)
+                                var kd = (1.0 - metal) * (1.0 - 0.04)
+                                light = light * (0.35 + 0.65 * kd)
+                                var a2 = rough * rough
+                                a2 = a2 * a2
+                                var k_ibl = (rough + 1.0) * (rough + 1.0) * 0.125
+                                var ndotl_key = dot(n, self.cpu_to_key)
+                                if ndotl_key > 0.0:
+                                    var shadow = self.cpu_sphere_shadow(world_pos + n * 0.08, self.cpu_to_key)
+                                    var direct_ao = 0.78 + ao * 0.22
+                                    light = light + self.cpu_key_color * (ndotl_key * direct_ao * shadow * kd)
+                                    var h = (view_dir + self.cpu_to_key).normalized()
+                                    var ndoth = max(Float32(0.0), dot(n, h))
+                                    var vdoth = max(Float32(0.0), dot(view_dir, h))
+                                    var denom = ndoth * ndoth * (a2 - 1.0) + 1.0
+                                    var d_ggx = a2 / max(Float32(0.0001), 3.14159265 * denom * denom)
+                                    var g_v = ndotv / (ndotv * (1.0 - k_ibl) + k_ibl)
+                                    var g_l = ndotl_key / (ndotl_key * (1.0 - k_ibl) + k_ibl)
+                                    var omv = 1.0 - vdoth
+                                    var omv2 = omv * omv
+                                    var fres = f0 + (Vec3(1, 1, 1) - f0) * (omv2 * omv2 * omv)
+                                    var brdf = d_ggx * g_v * g_l / max(Float32(0.05), 4.0 * ndotv * ndotl_key)
+                                    var spec_scale = brdf * ndotl_key * shadow * 255.0
+                                    spec_rgb = spec_rgb + Vec3(fres.x * self.cpu_key_color.x * spec_scale, fres.y * self.cpu_key_color.y * spec_scale, fres.z * self.cpu_key_color.z * spec_scale)
+                                var om_nv = 1.0 - ndotv
+                                var om_nv3 = om_nv * om_nv * om_nv
+                                var sheen = om_nv3 * (1.0 - rough * 0.72) * 34.0
+                                spec_rgb = spec_rgb + Vec3(f0.x * sheen + sheen * 0.16, f0.y * sheen + sheen * 0.22, f0.z * sheen + sheen * 0.30)
+                                for li in range(len(self.cpu_lights)):
+                                    var pl = self.cpu_lights[li]
+                                    var offset_l = pl.position - world_pos
+                                    var d2 = offset_l.length_squared()
+                                    var r2 = pl.radius * pl.radius
+                                    if d2 >= r2:
+                                        continue
+                                    var att = 1.0 - d2 / r2
+                                    att = att * att * pl.intensity
+                                    var ldir = offset_l.normalized()
+                                    var ndotl = max(Float32(0.0), dot(n, ldir))
+                                    var lambert = 0.20 + ndotl * 0.80
+                                    light = light + pl.color * (att * lambert * ao * kd)
+                                    if ndotl > 0.0:
+                                        var h_l = (view_dir + ldir).normalized()
+                                        var ndoth_l = max(Float32(0.0), dot(n, h_l))
+                                        var denom_l = ndoth_l * ndoth_l * (a2 - 1.0) + 1.0
+                                        var d_l = a2 / max(Float32(0.0001), 3.14159265 * denom_l * denom_l)
+                                        var brdf_l = min(Float32(6.0), d_l * 0.25) * ndotl * att * 255.0
+                                        spec_rgb = spec_rgb + Vec3(f0.x * pl.color.x * brdf_l, f0.y * pl.color.y * brdf_l, f0.z * pl.color.z * brdf_l)
+                            var shaded = self.shade(base, light, fog, emissive, spec_rgb)
                             var effective_alpha = Int(alpha) * Int((tint >> 24) & 255) // 255
                             effective_alpha = effective_alpha * Int((sampled >> 24) & 255) // 255
                             if effective_alpha > 0:
                                 self.pixels_shaded += 1
                                 self.blend_pixel(index, shaded, UInt8(effective_alpha))
-                                self.record_bloom(index % self.width, index // self.width, base, emissive, effective_alpha)
+                                var spec_peak = max(spec_rgb.x, max(spec_rgb.y, spec_rgb.z))
+                                var bloom_emissive = emissive
+                                var bloom_base = base
+                                if spec_peak > 145.0:
+                                    var spec_em = min(Float32(2.2), (spec_peak - 145.0) / 140.0)
+                                    if spec_em > bloom_emissive:
+                                        bloom_emissive = spec_em
+                                        bloom_base = rgb(clamp_byte(spec_rgb.x * 0.65), clamp_byte(spec_rgb.y * 0.65), clamp_byte(spec_rgb.z * 0.65))
+                                self.record_bloom(index % self.width, index // self.width, bloom_base, bloom_emissive, effective_alpha)
                                 if effective_alpha >= 128:
                                     self.depth[index] = view_depth
                         else:
@@ -1398,10 +1575,10 @@ struct SoftwareFramebuffer(Copyable, Movable):
         if not self.font_ready(font_index):
             self.draw_bitmap_text(text, ui_left, ui_top, size, red, green, blue, align)
             return
-        var px = text_em(size) * self.text_scale * self.ui_scale
+        var px = self.em_size(size) * self.text_scale * self.ui_scale
         var width = self.measure_font(font_index, text, px)
         if fit > 0 and width > Float32(fit) * self.ui_scale:
-            var floor_px = text_em(size) * self.ui_scale * 0.8
+            var floor_px = self.em_size(size) * self.ui_scale * 0.8
             px = max(floor_px, px * Float32(fit) * self.ui_scale / width)
             width = self.measure_font(font_index, text, px)
         var x = Float32(self.ux(ui_left))
@@ -1498,7 +1675,7 @@ struct SoftwareFramebuffer(Copyable, Movable):
         var font_index = 1 if size >= 30 else 0
         if not self.font_ready(font_index):
             return text.byte_length() * 6 * max(1, size // 8)
-        var em = text_em(size) * self.text_scale
+        var em = self.em_size(size) * self.text_scale
         return Int(self.measure_font(font_index, text, em) + 0.5)
 
     def font_ready(self, index: Int) -> Bool:
@@ -1606,7 +1783,7 @@ struct SoftwareFramebuffer(Copyable, Movable):
         """Package 3.22: how many lines `draw_rich_text` wraps `text` to at
         `max_width` canvas units (the caption box holds two)."""
         var base_face = 1 if size >= 30 else 0
-        var px = text_em(size) * self.text_scale * self.ui_scale
+        var px = self.em_size(size) * self.text_scale * self.ui_scale
         var layout = layout_rich(parse_rich(text), self.ui_font, self.display_font, px, base_face, Float32(max_width) * self.ui_scale, 1, self.button_pad, self.button_sony, self.button_keys)
         return max(1, layout.lines)
 
@@ -1617,7 +1794,7 @@ struct SoftwareFramebuffer(Copyable, Movable):
         capitals, as for `draw_text`; align 0 left, 1 centred on `ui_left`, 2
         right of it. Returns the height used on the canvas."""
         var base_face = 1 if size >= 30 else 0
-        var px = text_em(size) * self.text_scale * self.ui_scale
+        var px = self.em_size(size) * self.text_scale * self.ui_scale
         var spans = parse_rich(text)
         var layout = layout_rich(spans, self.ui_font, self.display_font, px, base_face, Float32(max_width) * self.ui_scale, align, self.button_pad, self.button_sony, self.button_keys)
         var height = Int(layout.height / self.ui_scale + 0.5)
@@ -1823,13 +2000,6 @@ def box_blur_pass(source: List[Float32], mut target: List[Float32], width: Int, 
             target[t + 2] = b * 0.2
 
 
-comptime UI_FONT_FILE = "assets/deepsong/fonts/AtkinsonHyperlegibleNext[wght].ttf"
-comptime UI_FONT_WEIGHT: Float32 = 600      # SemiBold
-comptime DISPLAY_FONT_FILE = "assets/deepsong/fonts/LilitaOne-Regular.ttf"
-
-
 def text_em(size: Int) -> Float32:
-    """Em size on the UI canvas for a `draw_text` size. Small sizes are raised
-    to 19 so body text (ascender to descender) is at least 26 px tall at
-    1080p (Xbox XAG 101)."""
-    return Float32(max(size, 19))
+    """Em size on the UI canvas for a `draw_text` size."""
+    return Float32(max(size, 12))
