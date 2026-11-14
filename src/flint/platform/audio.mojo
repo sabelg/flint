@@ -202,6 +202,7 @@ struct NativeAudio:
     var music_position: Float64
     var music_pitch: Float32
     var music_volume: Float32
+    var music_pitch_follow: Bool
     var fd: Int
     var ready: Bool
     var output_rate: Int
@@ -245,6 +246,7 @@ struct NativeAudio:
         self.music_position = 0
         self.music_pitch = 1
         self.music_volume = 0.24
+        self.music_pitch_follow = True
         self.fd = -1
         self.ready = False
         self.output_rate = 48000
@@ -409,6 +411,20 @@ struct NativeAudio:
     def play_speech(mut self, sound_id: Int, pitch: Float32 = 1, volume: Float32 = 1, priority: Int = 2):
         """A clip on the speech bus (package 3.15; the narrator's voice, 3.28)."""
         self.play_voice(sound_id, pitch, volume, priority, -1, 0, BUS_SPEECH)
+
+    def set_music_clip(
+        mut self,
+        var clip: WavClip,
+        volume: Float32 = 0.24,
+        pitch_follow: Bool = False,
+    ):
+        """Assigns an in-memory `WavClip` to the stereo looping `BUS_MUSIC` channel."""
+        self.music = clip^
+        self.music_loaded = self.music.valid
+        self.music_position = 0
+        self.music_pitch = 1.0
+        self.music_volume = max(Float32(0.0), min(Float32(1.0), volume))
+        self.music_pitch_follow = pitch_follow
 
     def set_bus_volumes(mut self, effects: Float32, speech: Float32, music: Float32):
         """The options' three volumes, each 0 to 1."""
@@ -662,8 +678,9 @@ struct NativeAudio:
         if not self.ready:
             return
         var amount = max(Float32(0), min(Float32(1), intensity))
-        self.music_pitch = 0.96 + amount * 0.10
-        self.music_volume = 0.20 + amount * 0.10
+        if self.music_pitch_follow:
+            self.music_pitch = 0.96 + amount * 0.10
+            self.music_volume = 0.20 + amount * 0.10
         if self.pulse.connected():
             self.update_pulse()
             return

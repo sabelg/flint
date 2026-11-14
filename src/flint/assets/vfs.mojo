@@ -32,7 +32,7 @@ from flint.assets.cooked_model import (
 from flint.assets.glb import GlbInfo, inspect_glb
 from flint.assets.glb_native import parse_native_glb
 from flint.assets.model import NativeModel
-from flint.platform.os import env_now, file_stamp, read_at, read_bytes
+from flint.platform.os import env_now, file_stamp, read_at, read_bytes, write_bytes
 
 comptime COOKED_ROOT = "build/cooked/"
 comptime PACK_PATH = "build/assets.flpk"
@@ -184,6 +184,27 @@ def put_u32(mut out: List[UInt8], value: Int):
         out.append(UInt8((value >> (shift * 8)) & 255))
 
 
+def write_flpk_pack(output_pack: String, asset_paths: List[String]) -> Int:
+    """Packs loose files at `asset_paths` into a single `.flpk` VFS archive at `output_pack`.
+
+    Returns the number of non-empty files written, or 0 on failure.
+    """
+    var names = List[String]()
+    var payloads = List[List[UInt8]]()
+    for i in range(len(asset_paths)):
+        var p = asset_paths[i]
+        var data = read_bytes(p)
+        if len(data) > 0:
+            names.append(p)
+            payloads.append(data^)
+    if len(names) == 0:
+        return 0
+    var archive = encode_pack(names, payloads)
+    if not write_bytes(output_pack, archive):
+        return 0
+    return len(names)
+
+
 # ---------------------------------------------------------------------------
 # Reading through the mounts
 # ---------------------------------------------------------------------------
@@ -243,11 +264,16 @@ def load_model_file(path: String) -> ModelFile:
         if take_cooked(out, pack_read(pack_path(), path), path, MOUNT_PACK):
             return out^
     var bytes = read_bytes(path)
-    if len(bytes) == 0:
+    if len(bytes) > 0:
+        out.info = inspect_glb(path)
+        out.model = parse_native_glb(bytes)
+        out.mount = MOUNT_LOOSE
         return out^
-    out.info = inspect_glb(path)
-    out.model = parse_native_glb(bytes)
-    out.mount = MOUNT_LOOSE
+    var packed_glb = pack_read(pack_path(), path)
+    if len(packed_glb) > 0:
+        out.model = parse_native_glb(packed_glb)
+        out.mount = MOUNT_PACK
+        return out^
     return out^
 
 

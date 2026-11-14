@@ -13,9 +13,11 @@ Every subsystem — from direct Wayland/XDG-shell sockets, PipeWire/PulseAudio &
   - **`SimdCanvas` (`flint.render.simd_canvas`)**: Sub-4 MiB 8-wide SIMD software rasterizer & depth-buffered sprite/3D mesh/beam compositor (`Camera3D` perspective + `blit_sprite_simd`) for instant startup, laptop efficiency, and deterministic headless CI screenshots.
 - **Dual-GPU Compute & PBR Raster (`flint.render.kernel`, `gpu_raster`, `vulkan_backend`, `amdgpu`, `scene_renderer`)**:
   - Write compute kernels once in Mojo (`Kernel`) and emit **both** native AMD RDNA GFX11/GFX12 ISA dwords and Vulkan SPIR-V 1.3 modules.
-  - Full `GpuSceneRenderer` parity across Vulkan SPIR-V, AMDGPU GFX11/GFX12 ISA, and CPU PBR: Cook-Torrance GGX microfacet specular, Schlick Fresnel, soft-penumbra sphere shadows, 48 tiled dynamic point lights, AgX filmic tonemapping, 5-tap Gaussian + 2x2 bilinear HDR bloom, 3D ribbons/plumes, `draw_colossal_beam_3d`, and volumetric `draw_cloud_deck`.
-- **Native GLB 2.0 Forge & LZ4 Checkpoints (`flint.assets`)**:
-  - Parametric curved `MeshBuilder`, binary glTF 2.0 `.glb` writer/loader (`glb_writer`, `glb_native`), `.flpk` mmap VFS, and single-call LZ4 + 64-bit hash binary state persistence (`checkpoint.mojo`).
+  - Full `GpuSceneRenderer` parity across Vulkan SPIR-V, AMDGPU GFX11/GFX12 ISA, and CPU PBR: Cook-Torrance GGX microfacet specular, Schlick Fresnel, soft-penumbra sphere shadows, GPU directional planar mesh/model shadows (`draw_planar_shadow_mesh` / `draw_planar_shadow_model`), 48 tiled dynamic point lights, AgX filmic tonemapping, 5-tap Gaussian + 2x2 bilinear HDR bloom, 3D ribbons/plumes, `draw_colossal_beam_3d`, and volumetric `draw_cloud_deck`.
+- **Native GLB 2.0 Forge, `.flpk` Asset Packager & `.flrp` Replay Streams (`flint.assets`)**:
+  - Parametric curved `MeshBuilder`, binary glTF 2.0 `.glb` writer/loader (`glb_writer`, `glb_native`), single-file `.flpk` VFS packager (`write_flpk_pack`, `tools/flint.sh pack`), LZ4 + FNV-64 binary state checkpoints (`checkpoint.mojo`), and deterministic per-tick input replay streams (`replay_stream.mojo`).
+- **Concert-Pitch Music + Procedural Audio Mixer (`flint.platform.audio`)**:
+  - Direct PipeWire/PulseAudio + ALSA `NativeAudio` mixer with `BUS_MUSIC` concert-pitch stereo loops (`set_music_clip`), velocity-following ambient bus, `BUS_SPEECH` radio/comms, and 8-voice priority SFX.
 - **First-Class DevTools & AI Agent LiveLink (`flint.devtools`)**:
   - Live drop-down `~` `DevConsole` (`ConsoleVars` tab-completion), `F2` frame/zone profiler HUD, `F3` `MemCharge` CPU/VRAM budget inspector, generic `inotify` `AssetWatcher`, `LDR-FLIP` perceptual regression testing, and a non-blocking `AF_UNIX` `FlintMcpLiveEndpoint` socket server.
 - **Continuous Upstream Harvesting (`tools/sync_from_deepsong.sh`)**:

@@ -422,6 +422,145 @@ struct GpuSceneRenderer(Movable):
                             no_fog=no_fog,
                         )
 
+    def draw_planar_shadow_mesh(
+        mut self,
+        mesh: NativeMesh,
+        transform: Mat4,
+        plane_point: Vec3,
+        plane_normal: Vec3 = Vec3(0.0, 1.0, 0.0),
+        shadow_color: UInt32 = 0xFF050A14,
+        max_alpha: UInt8 = 138,
+        max_height: Float32 = 70.0,
+        bias: Float32 = 0.06,
+    ):
+        """Projects `mesh` along the active key light onto `(plane_point, plane_normal)`."""
+        var vcount = mesh.vertex_count()
+        if vcount < 3 or max_alpha == 0:
+            return
+        if mesh.alpha_mode == 2 and mesh.emissive_strength > 0.8:
+            return
+        var n = plane_normal.normalized()
+        var light_dir = self.active_profile.key_direction.normalized()
+        var n_dot_l = dot(n, light_dir)
+        if n_dot_l > -0.12:
+            light_dir = Vec3(light_dir.x - n.x * 0.75, light_dir.y - n.y * 0.75, light_dir.z - n.z * 0.75).normalized()
+            n_dot_l = min(Float32(-0.18), dot(n, light_dir))
+        var inv_neg_ndl = Float32(1.0) / (-n_dot_l)
+        var col = 0xFF000000 | (shadow_color & 0x00FFFFFF)
+        var inv_max_h = Float32(1.0) / max(Float32(0.5), max_height)
+
+        var proj_verts = List[RenderVertex](capacity=vcount)
+        var dists = List[Float32](capacity=vcount)
+        for vi in range(vcount):
+            var lp = Vec3(mesh.positions[vi * 3], mesh.positions[vi * 3 + 1], mesh.positions[vi * 3 + 2])
+            var wp = transform.transform_point(lp)
+            var d = dot(wp - plane_point, n)
+            dists.append(d)
+            var ray_t = max(Float32(0.0), d) * inv_neg_ndl
+            var p_proj = wp + light_dir * ray_t + n * bias
+            proj_verts.append(
+                self.make_lit_vertex(
+                    p_proj,
+                    n,
+                    0.0,
+                    0.0,
+                    col,
+                    1.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    unlit=True,
+                    no_fog=False,
+                )
+            )
+
+        var tri_count = mesh.triangle_count()
+        var indexed = len(mesh.indices) >= tri_count * 3
+        for ti in range(tri_count):
+            var i0 = mesh.indices[ti * 3] if indexed else ti * 3
+            var i1 = mesh.indices[ti * 3 + 1] if indexed else ti * 3 + 1
+            var i2 = mesh.indices[ti * 3 + 2] if indexed else ti * 3 + 2
+            if i0 < 0 or i1 < 0 or i2 < 0 or i0 >= vcount or i1 >= vcount or i2 >= vcount:
+                continue
+            var d0 = dists[i0]
+            var d1 = dists[i1]
+            var d2 = dists[i2]
+            if max(d0, max(d1, d2)) < -0.5 or min(d0, min(d1, d2)) > max_height:
+                continue
+            var avg_d = max(Float32(0.0), (d0 + d1 + d2) * Float32(0.33333334))
+            var atten = max(Float32(0.0), min(Float32(1.0), Float32(1.0) - avg_d * inv_max_h))
+            var eff_a = UInt8(max(0, min(255, Int(Float32(max_alpha) * atten))))
+            if eff_a < 4:
+                continue
+            self.fb.draw_triangle(
+                proj_verts[i0],
+                proj_verts[i1],
+                proj_verts[i2],
+                self.empty_tex,
+                0,
+                0,
+                alpha=eff_a,
+                double_sided=True,
+            )
+
+    def draw_planar_shadow_model(
+        mut self,
+        mut model: NativeModel,
+        world_mat: Mat4,
+        plane_point: Vec3,
+        plane_normal: Vec3 = Vec3(0.0, 1.0, 0.0),
+        shadow_color: UInt32 = 0xFF050A14,
+        max_alpha: UInt8 = 138,
+        max_height: Float32 = 70.0,
+        bias: Float32 = 0.06,
+    ):
+        """Projects every articulated node of `model` onto a deck/ground shadow receiver plane."""
+        if len(model.meshes) == 0 or max_alpha == 0:
+            return
+        if len(model.nodes) == 0:
+            for mi in range(len(model.meshes)):
+                self.draw_planar_shadow_mesh(
+                    model.meshes[mi],
+                    world_mat,
+                    plane_point,
+                    plane_normal=plane_normal,
+                    shadow_color=shadow_color,
+                    max_alpha=max_alpha,
+                    max_height=max_height,
+                    bias=bias,
+                )
+            return
+
+        var globals = model.global_transforms()
+        for ni in range(len(model.nodes)):
+            var node_world = world_mat.multiply(globals[ni])
+            var count = len(model.nodes[ni].mesh_indices)
+            if count > 0:
+                for k in range(count):
+                    var mi = model.nodes[ni].mesh_indices[k]
+                    if mi >= 0 and mi < len(model.meshes):
+                        self.draw_planar_shadow_mesh(
+                            model.meshes[mi],
+                            node_world,
+                            plane_point,
+                            plane_normal=plane_normal,
+                            shadow_color=shadow_color,
+                            max_alpha=max_alpha,
+                            max_height=max_height,
+                            bias=bias,
+                        )
+            elif model.nodes[ni].mesh >= 0 and model.nodes[ni].mesh < len(model.meshes):
+                self.draw_planar_shadow_mesh(
+                    model.meshes[model.nodes[ni].mesh],
+                    node_world,
+                    plane_point,
+                    plane_normal=plane_normal,
+                    shadow_color=shadow_color,
+                    max_alpha=max_alpha,
+                    max_height=max_height,
+                    bias=bias,
+                )
+
     def draw_billboard(
         mut self,
         center: Vec3,

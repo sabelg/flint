@@ -80,11 +80,20 @@ cmd_build() {
         echo "[Flint] Building examples/minimal_spark/main.mojo -> build/flint-spark ..."
         compile_mojo "${ROOT}/examples/minimal_spark/main.mojo" "${ROOT}/build/flint-spark"
     fi
+    if [[ "$target" == "all" || "$target" == "pack" ]]; then
+        echo "[Flint] Building examples/pack_cli/main.mojo -> build/flint-pack ..."
+        compile_mojo "${ROOT}/examples/pack_cli/main.mojo" "${ROOT}/build/flint-pack"
+    fi
     if [[ "$target" == "all" || "$target" == "test" ]]; then
         echo "[Flint] Building tests/test_flint.mojo -> build/flint-test ..."
         compile_mojo "${ROOT}/tests/test_flint.mojo" "${ROOT}/build/flint-test"
     fi
     echo "[Flint] Build complete."
+}
+
+cmd_pack() {
+    cmd_build pack
+    "${ROOT}/build/flint-pack" "$@"
 }
 
 cmd_test() {
@@ -108,11 +117,7 @@ cmd_gate() {
     echo "============================================================"
     echo " FLINT ENGINE VERIFICATION GATE"
     echo "============================================================"
-    if [[ -d "/tmp/Deepsong/src" ]]; then
-        cmd_sync /tmp/Deepsong
-    elif [[ -n "${DEEPSONG_DIR:-}" && -d "${DEEPSONG_DIR}/src" ]]; then
-        cmd_sync "${DEEPSONG_DIR}"
-    fi
+    cmd_sync --verify
     cmd_build all
     "${ROOT}/build/flint-test"
     mkdir -p "${ROOT}/build/shots"
@@ -197,6 +202,7 @@ shift || true
 case "$subcmd" in
     sync)  cmd_sync "$@" ;;
     build) cmd_build "$@" ;;
+    pack)  cmd_pack "$@" ;;
     test)  cmd_test "$@" ;;
     play)  cmd_play "$@" ;;
     shot)  cmd_shot "$@" ;;
@@ -208,7 +214,8 @@ case "$subcmd" in
         echo ""
         echo "Commands:"
         echo "  sync [deepsong_dir]  Harvest latest pure-Mojo libraries from Deepsong & run Zero-Leak Gate"
-        echo "  build [all|spark|test] Compile Flint showcase & test binaries (-O3, contract=off)"
+        echo "  build [all|spark|pack|test] Compile Flint showcase, pack CLI & test binaries (-O3, contract=off)"
+        echo "  pack <out.flpk> <files...> Bundle loose assets into a single .flpk VFS archive"
         echo "  test                 Build and run Flint Engine verification suite"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
         echo "  shot                 Render deterministic headless PNG to build/shots/flint_spark.png"

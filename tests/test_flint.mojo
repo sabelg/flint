@@ -34,6 +34,18 @@ from flint.assets.mesh_builder import MeshBuilder, append_node_meshes
 from flint.assets.glb_writer import encode_native_glb
 from flint.assets.glb_native import parse_native_glb
 from flint.assets.checkpoint import save_checkpoint_lz4, load_checkpoint_lz4, unpack_checkpoint_lz4
+from flint.assets.replay_stream import FlintReplayStream
+from flint.assets.vfs import (
+    MOUNT_PACK,
+    encode_pack,
+    pack_directory,
+    pack_read,
+    write_flpk_pack,
+    load_model_file,
+)
+from flint.core.serial import fnv64
+from flint.platform.audio import NativeAudio, WavClip
+from flint.platform.os import write_bytes
 from flint.render.font import SdfFont
 from flint.render.lighting import LightingProfile
 from flint.render.scene_renderer import GpuSceneRenderer, FX_SOFT
@@ -400,6 +412,148 @@ def test_checkpoint_mcp_socket_and_amdgpu_shaders() raises:
     )
 
 
+def test_vfs_flpk_replay_shadows_and_bgm() raises:
+    # 1. Single-file .flpk VFS bundler + MOUNT_PACK raw .glb loading without loose files
+    var model = NativeModel()
+    var ship_b = MeshBuilder(base_color=0xFFE6ECF8, roughness=0.25, metallic=0.6)
+    ship_b.add_ellipsoid(Vec3(0.0, 0.0, 0.0), Vec3(1.5, 0.45, 2.2), 10, 12)
+    var prims = List[NativeMesh]()
+    prims.append(ship_b^.finish())
+    _ = append_node_meshes(model, "ship_hull", prims)
+    var glb_bytes = encode_native_glb(model)
+
+    var loose_path = "build/test_loose_ship.glb"
+    assert_true(write_bytes(loose_path, glb_bytes))
+    var pack_paths = List[String]()
+    pack_paths.append(loose_path)
+    assert_equal(write_flpk_pack("build/test_bundle.flpk", pack_paths), 1)
+    assert_equal(len(pack_directory("build/test_bundle.flpk")), 1)
+    var read_back = pack_read("build/test_bundle.flpk", loose_path)
+    assert_equal(len(read_back), len(glb_bytes))
+
+    # Also write a virtual-only path into default PACK_PATH ("build/assets.flpk") and verify MOUNT_PACK load
+    var virt_names = List[String]()
+    virt_names.append("assets/virtual_pack_only/ship_test.glb")
+    var virt_files = List[List[UInt8]]()
+    virt_files.append(glb_bytes.copy())
+    var virt_archive = encode_pack(virt_names, virt_files)
+    assert_true(write_bytes("build/assets.flpk", virt_archive))
+    var packed_mf = load_model_file("assets/virtual_pack_only/ship_test.glb")
+    assert_equal(packed_mf.mount, MOUNT_PACK)
+    assert_equal(len(packed_mf.model.meshes), 1)
+
+    # 2. Deterministic FlintReplayStream (.flrp) record, LZ4 save/load & bit-exact fnv64 replay
+    var init_w = BlobWriter()
+    init_w.begin(fourcc("INIT"), 1)
+    init_w.vec3(Vec3(0.0, 10.0, 0.0))
+    init_w.vec3(Vec3(0.0, 0.0, 20.0))
+    init_w.end()
+
+    var rec = FlintReplayStream()
+    rec.begin_recording("flint-replay-test", init_w)
+    var pos = Vec3(0.0, 10.0, 0.0)
+    var vel = Vec3(0.0, 0.0, 20.0)
+    for step in range(24):
+        var inp = List[UInt8]()
+        inp.append(UInt8((step * 7 + 3) & 255))
+        inp.append(UInt8(1 if step % 3 == 0 else 0))
+        var dt = Float32(1.0 / 60.0)
+        rec.record_tick(dt, inp)
+        var thrust = Float32(inp[0]) * Float32(0.05)
+        var climb = Float32(4.0) if inp[1] != 0 else Float32(-1.0)
+        vel = Vec3(vel.x + thrust * dt, vel.y + climb * dt, vel.z)
+        pos = pos + vel * dt
+
+    var fin_w = BlobWriter()
+    fin_w.begin(fourcc("INIT"), 1)
+    fin_w.vec3(pos)
+    fin_w.vec3(vel)
+    fin_w.end()
+    var expected_hash = rec.finish_recording(fin_w)
+    var replay_path = "build/test_flight.flrp"
+    assert_true(rec.save(replay_path))
+
+    var loaded_rec = FlintReplayStream.load(replay_path)
+    assert_equal(loaded_rec.app_name, "flint-replay-test")
+    assert_equal(loaded_rec.tick_count(), 24)
+    var init_r = loaded_rec.initial_reader()
+    _ = init_r.enter(fourcc("INIT"), 1)
+    var r_pos = init_r.vec3()
+    var r_vel = init_r.vec3()
+    init_r.leave()
+    for step in range(loaded_rec.tick_count()):
+        var dt = loaded_rec.tick_dts[step]
+        var inp = loaded_rec.tick_inputs[step].copy()
+        var thrust = Float32(inp[0]) * Float32(0.05)
+        var climb = Float32(4.0) if inp[1] != 0 else Float32(-1.0)
+        r_vel = Vec3(r_vel.x + thrust * dt, r_vel.y + climb * dt, r_vel.z)
+        r_pos = r_pos + r_vel * dt
+    var check_w = BlobWriter()
+    check_w.begin(fourcc("INIT"), 1)
+    check_w.vec3(r_pos)
+    check_w.vec3(r_vel)
+    check_w.end()
+    assert_equal(fnv64(check_w.data), expected_hash)
+    assert_equal(loaded_rec.final_hash, expected_hash)
+
+    # 3. GPU & CPU Directional Planar Mesh Shadow projection verification
+    var deck_b = MeshBuilder(base_color=0xFFE8EEF6, roughness=0.65, metallic=0.1)
+    deck_b.add_ellipsoid(Vec3(0.0, -0.35, 0.0), Vec3(9.0, 0.35, 9.0), 8, 16)
+    var deck_model = NativeModel()
+    deck_model.meshes.append(deck_b^.finish())
+    var ident_mat = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
+
+    var profile = LightingProfile()
+    profile.key_direction = Vec3(0.0, -1.0, 0.0)
+    profile.key_color = Vec3(1.2, 1.2, 1.2)
+    profile.hemisphere_sky = Vec3(0.45, 0.48, 0.52)
+    profile.hemisphere_ground = Vec3(0.20, 0.22, 0.25)
+
+    var sh_scene = GpuSceneRenderer(160, 120, prefer_gpu=True)
+    sh_scene.begin_frame(Vec3(0.0, 6.5, -8.5), Vec3(0.0, 0.0, 0.0), 55.0, profile)
+    sh_scene.commit_lighting()
+    sh_scene.draw_model(deck_model, ident_mat)
+    assert_true(sh_scene.present_headless())
+    var base_luma = Int(0)
+    for px in sh_scene.fb.pixels:
+        base_luma += Int((px >> 16) & 255) + Int((px >> 8) & 255) + Int(px & 255)
+
+    sh_scene.begin_frame(Vec3(0.0, 6.5, -8.5), Vec3(0.0, 0.0, 0.0), 55.0, profile)
+    sh_scene.commit_lighting()
+    sh_scene.draw_model(deck_model, ident_mat)
+    sh_scene.draw_planar_shadow_model(
+        model,
+        trs(Vec3(0.0, 3.2, 0.0), Quat(), Vec3(1.5, 1.5, 1.5)),
+        Vec3(0.0, 0.05, 0.0),
+        max_alpha=180,
+    )
+    assert_true(sh_scene.present_headless())
+    var shadowed_luma = Int(0)
+    for px in sh_scene.fb.pixels:
+        shadowed_luma += Int((px >> 16) & 255) + Int((px >> 8) & 255) + Int(px & 255)
+    assert_true(shadowed_luma < base_luma - 5000)
+
+    # 4. Concert-pitch BUS_MUSIC stereo loop mixing
+    var audio = NativeAudio()
+    var bgm = WavClip()
+    bgm.valid = True
+    bgm.channels = 2
+    bgm.sample_rate = 48000
+    for i in range(1024):
+        var s = Int16(12000 if (i % 64) < 32 else -12000)
+        bgm.samples.append(s)
+        bgm.samples.append(-s)
+    audio.set_music_clip(bgm^, volume=0.5, pitch_follow=False)
+    assert_true(audio.music_loaded and not audio.music_pitch_follow)
+    var mixed = audio.mix_stereo(256)
+    var energy = Int(0)
+    for sample in mixed:
+        energy += abs(Int(sample))
+    assert_true(energy > 50000)
+
+    print("  [PASS] .flpk VFS Pack Mount, Deterministic .flrp Replay Stream, Planar Shadows & Concert BGM")
+
+
 def main() raises:
     print("[Flint Test] Running Pure-Mojo 1.2 Engine Verification Suite...")
     test_ecs_simd_and_lz4_persistence()
@@ -409,4 +563,5 @@ def main() raises:
     test_broadphase_canvas_flip_and_mcp()
     test_glb_pbr_ttf_and_gpu_scene_renderer()
     test_checkpoint_mcp_socket_and_amdgpu_shaders()
-    print("[Flint Test] ALL 7 ENGINE SUBSYSTEM SUITES PASSED!")
+    test_vfs_flpk_replay_shadows_and_bgm()
+    print("[Flint Test] ALL 8 ENGINE SUBSYSTEM SUITES PASSED!")
