@@ -13,7 +13,11 @@ resolve_mojo() {
         return
     fi
     local candidate_prefix
-    for candidate_prefix in "${ROOT}/.pixi/envs/default" "${ROOT}/../.pixi/envs/default" "/home/user/rollercoaster/.pixi/envs/default"; do
+    for candidate_prefix in \
+        "${ROOT}/.pixi/envs/default" \
+        "${ROOT}/../.pixi/envs/default" \
+        "${ROOT}/../rollercoaster/.pixi/envs/default" \
+        "${HOME}/.pixi/envs/turbomojo"; do
         if [[ -x "${candidate_prefix}/bin/mojo" ]]; then
             export MOJO_PREFIX="${candidate_prefix}"
             export MODULAR_HOME="${candidate_prefix}/share/max"
