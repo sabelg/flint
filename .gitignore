@@ -1,0 +1,7 @@
+# Pixi & Mojo toolchain artifacts
+.pixi/
+*.egg-info
+build/
+saves/
+dist/
+src/flint/core/build_stamp.mojo
