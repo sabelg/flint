@@ -11,13 +11,13 @@ Every subsystem — from direct Wayland/XDG-shell sockets, PipeWire/PulseAudio &
 - **Pure Mojo 1.2, Zero Wrapper Libraries**: No GLFW, SDL, OpenGL, glslang, shaderc, miniaudio, freetype, or Box2D/Jolt C++ wrappers.
 - **Unified 2D + 3D Rendering**:
   - **`SimdCanvas` (`flint.render.simd_canvas`)**: Sub-4 MiB 8-wide SIMD software rasterizer & depth-buffered sprite/3D mesh/beam compositor (`Camera3D` perspective + `blit_sprite_simd`) for instant startup, laptop efficiency, and deterministic headless CI screenshots.
-  - **Dual-GPU Compute & Raster (`flint.render.kernel`, `gpu_raster`, `vulkan_backend`, `amdgpu`)**: Write compute kernels once in Mojo (`Kernel`) and emit **both** native AMD RDNA GFX11/GFX12 ISA dwords and Vulkan SPIR-V 1.3 modules.
-- **Data-Oriented Parallel ECS (`flint.core.ecs`)**:
-  - Generational 64-bit `EntityHandle`, dynamic `ArchetypeRegistry`, deterministic `ArchetypeSlots` with deferred tick-boundary commits, 8-lane SIMD-padded `SimdColumn[dtype]` with automatic `MemCharge` RAM accounting, `BlobWriter` + `LZ4` persistence, and Mojo-lifetime-safe `run_parallel_ctx` over `JobPool`.
-- **Full Physics & Animation Foundations (`flint.physics`, `flint.anim`)**:
-  - Parallel spatial-hash `Broadphase`, union-find sleeping `Islands`, GJK/EPA convex narrowphase, TGS velocity contact solver, XPBD cloth/rope constraints, skeletal TRS skinning, Two-Bone IK, and spring procedural motion.
-- **First-Class DevTools & AI Agent Introspection (`flint.devtools`)**:
-  - Live drop-down `~` `DevConsole` (`ConsoleVars` tab-completion), `F2` frame/zone profiler HUD, `F3` `MemCharge` CPU/VRAM budget inspector, generic `inotify` `AssetWatcher`, `LDR-FLIP` perceptual regression testing, and a game-agnostic `Flint MCP` JSON responder.
+- **Dual-GPU Compute & PBR Raster (`flint.render.kernel`, `gpu_raster`, `vulkan_backend`, `amdgpu`, `scene_renderer`)**:
+  - Write compute kernels once in Mojo (`Kernel`) and emit **both** native AMD RDNA GFX11/GFX12 ISA dwords and Vulkan SPIR-V 1.3 modules.
+  - Full `GpuSceneRenderer` parity across Vulkan SPIR-V, AMDGPU GFX11/GFX12 ISA, and CPU PBR: Cook-Torrance GGX microfacet specular, Schlick Fresnel, soft-penumbra sphere shadows, 48 tiled dynamic point lights, AgX filmic tonemapping, 5-tap Gaussian + 2x2 bilinear HDR bloom, 3D ribbons/plumes, `draw_colossal_beam_3d`, and volumetric `draw_cloud_deck`.
+- **Native GLB 2.0 Forge & LZ4 Checkpoints (`flint.assets`)**:
+  - Parametric curved `MeshBuilder`, binary glTF 2.0 `.glb` writer/loader (`glb_writer`, `glb_native`), `.flpk` mmap VFS, and single-call LZ4 + 64-bit hash binary state persistence (`checkpoint.mojo`).
+- **First-Class DevTools & AI Agent LiveLink (`flint.devtools`)**:
+  - Live drop-down `~` `DevConsole` (`ConsoleVars` tab-completion), `F2` frame/zone profiler HUD, `F3` `MemCharge` CPU/VRAM budget inspector, generic `inotify` `AssetWatcher`, `LDR-FLIP` perceptual regression testing, and a non-blocking `AF_UNIX` `FlintMcpLiveEndpoint` socket server.
 - **Continuous Upstream Harvesting (`tools/sync_from_deepsong.sh`)**:
   - Cleanly syncs battle-tested game-agnostic pure-Mojo primitives from `Deepsong`, rewrites namespaces to `flint.*`, applies Flint VFS/input/glyph enrichments, and enforces a strict **Zero-Game-Leak Gate** (`0` `gameplay.*` or `world.*` imports).
 

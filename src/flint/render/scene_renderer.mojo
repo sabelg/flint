@@ -613,6 +613,123 @@ struct GpuSceneRenderer(Movable):
             self.fb.draw_triangle(v0, v1, v2, self.fx.pixels[FX_RIBBON], sz, sz, alpha=a_seg, double_sided=True)
             self.fb.draw_triangle(v0, v2, v3, self.fx.pixels[FX_RIBBON], sz, sz, alpha=a_seg, double_sided=True)
 
+    def draw_colossal_beam_3d(
+        mut self,
+        start: Vec3,
+        end: Vec3,
+        radius: Float32,
+        core_color: UInt32,
+        sheath_color: UInt32,
+        scroll: Float32 = 0.0,
+        alpha: UInt8 = 245,
+        emissive: Float32 = 3.2,
+    ):
+        """Capital-ship mega-particle cannon beam: scrolling plasma sheath + blinding core + shockwave flares."""
+        if radius <= 0.01 or alpha == 0:
+            return
+        var axis = end - start
+        var beam_len = axis.length()
+        if beam_len < 0.05:
+            return
+        var dir_v = axis * (1.0 / beam_len)
+        var repeats = max(Float32(2.0), beam_len / max(Float32(1.0), radius * 6.0))
+        var u0 = -scroll
+        var u1 = repeats - scroll
+
+        # Outer wide atmospheric/plasma glow
+        self.draw_beam_3d(
+            start,
+            end,
+            radius * 2.15,
+            FX_STRIPES,
+            sheath_color,
+            UInt8(Int(alpha) * 5 // 8),
+            emissive=emissive * 0.78,
+            u0=u0,
+            u1=u1,
+        )
+        # Middle high-energy particle sheath
+        self.draw_beam_3d(
+            start,
+            end,
+            radius * 1.18,
+            FX_BOLT,
+            sheath_color,
+            UInt8(Int(alpha) * 7 // 8),
+            emissive=emissive,
+            u0=u0 * 1.4,
+            u1=u1 * 1.4,
+        )
+        # White-hot inner core
+        self.draw_beam_3d(
+            start,
+            end,
+            radius * 0.56,
+            FX_BOLT,
+            core_color,
+            alpha,
+            emissive=emissive * 1.35,
+        )
+        # Muzzle & terminal plasma flares + pulsing energy nodes along beam
+        self.draw_billboard(start, radius * 3.4, FX_SOFT, sheath_color, UInt8(Int(alpha) * 3 // 4), emissive=emissive)
+        self.draw_billboard(start, radius * 1.9, FX_SOFT, core_color, alpha, emissive=emissive * 1.4)
+        self.draw_billboard(end, radius * 3.8, FX_SOFT, sheath_color, UInt8(Int(alpha) * 3 // 4), emissive=emissive)
+        self.draw_billboard(end, radius * 2.1, FX_SOFT, core_color, alpha, emissive=emissive * 1.4)
+        for k in range(3):
+            var frac = Float32(((Float32(k) * 0.33 + scroll * 0.18) - Float32(Int(Float32(k) * 0.33 + scroll * 0.18))))
+            var node_p = start + dir_v * (beam_len * max(Float32(0.08), min(Float32(0.92), frac)))
+            self.draw_billboard(node_p, radius * 1.85, FX_SOFT, core_color, UInt8(Int(alpha) * 2 // 3), emissive=emissive * 1.15)
+
+    def draw_cloud_deck(
+        mut self,
+        center: Vec3,
+        altitude: Float32,
+        span: Float32,
+        count: Int,
+        sunlit_color: UInt32 = 0xFFF8FAFF,
+        shadow_color: UInt32 = 0xFF7D95B8,
+        alpha: UInt8 = 168,
+    ):
+        """Volumetric cumulus cloud deck tiled deterministically around `center` for atmospheric flight."""
+        if count <= 0 or span <= 1.0 or alpha == 0:
+            return
+        var half = span * 0.5
+        var cell = max(Float32(20.0), span)
+        var snap_x = Float32(Int(center.x / 64.0)) * 64.0
+        var snap_z = Float32(Int(center.z / 64.0)) * 64.0
+        for i in range(count):
+            var h1 = UInt32(i * 747796405 + 2891336453)
+            var h2 = UInt32(i * 1597334677 + 3812015801)
+            var h3 = UInt32(i * 2246822519 + 3266489917)
+            var ox = (Float32(h1 & 0xFFFF) / 65535.0) * cell - half
+            var oz = (Float32(h2 & 0xFFFF) / 65535.0) * cell - half
+            var oy = ((Float32(h3 & 0xFF) / 255.0) - 0.5) * 14.0
+            var wx = snap_x + ox
+            var wz = snap_z + oz
+            # Wrap into [-half, +half] around camera center
+            while wx - center.x > half:
+                wx -= cell
+            while wx - center.x < -half:
+                wx += cell
+            while wz - center.z > half:
+                wz -= cell
+            while wz - center.z < -half:
+                wz += cell
+            var base_r = Float32(13.0) + Float32((h3 >> 8) & 0xFF) / 255.0 * Float32(15.0)
+            var c_pos = Vec3(wx, altitude + oy, wz)
+            var dist_cam = (c_pos - self.fb.camera).length()
+            if dist_cam < 10.0:
+                continue
+            var fade = min(Float32(1.0), max(Float32(0.0), (half - max(abs(wx - center.x), abs(wz - center.z))) / (half * 0.35)))
+            var eff_a = UInt8(max(0, min(255, Int(Float32(alpha) * fade))))
+            if eff_a < 8:
+                continue
+            var sh_a = UInt8(Int(eff_a) * 3 // 4)
+            # Cool shadow underbelly + sunlit cumulus crown puffs
+            self.draw_billboard(c_pos - Vec3(0.0, base_r * 0.22, 0.0), base_r * 1.15, FX_SOFT, shadow_color, sh_a, emissive=0.05)
+            self.draw_billboard(c_pos + Vec3(-base_r * 0.28, base_r * 0.14, 0.0), base_r * 0.92, FX_SOFT, sunlit_color, eff_a, emissive=0.22)
+            self.draw_billboard(c_pos + Vec3(base_r * 0.30, base_r * 0.18, base_r * 0.12), base_r * 0.84, FX_SOFT, sunlit_color, eff_a, emissive=0.24)
+
     def end_scene(mut self):
         """Complete 3D scene pass so 2D HUD widgets drawn afterward are not blurred by CPU bloom."""
         if self.scene_ended:

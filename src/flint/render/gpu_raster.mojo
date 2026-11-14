@@ -26,9 +26,9 @@ from flint.render.gpu_layout import (
     BLOOM_BYTES, BLOOM_FINAL_OFFSET, BLOOM_SAMPLES_X, BLOOM_SAMPLES_Y, BLOOM_SOURCE_OFFSET,
     CONSTANT_BLOOM_DISTANCE, CONSTANT_CAMERA, CONSTANT_DITHER, CONSTANT_EFFECTS, CONSTANT_KEY, CONSTANT_LIGHTS,
     CONSTANT_SATURATION, CONSTANT_SPHERES, CONSTANT_WORLD, EFFECT_BILINEAR, EFFECT_SHADOWS,
-    DITHER_FLAG, GROUP_HEIGHT, GROUP_WIDTH, MAX_SHADOW_SPHERES, PER_PIXEL_FLAG, RECORD_AMBIENT_OCCLUSION,
+    DITHER_FLAG, GROUP_HEIGHT, GROUP_WIDTH, MAX_SHADOW_SPHERES, PBR_FLAG, PER_PIXEL_FLAG, RECORD_AMBIENT_OCCLUSION,
     RECORD_BYTES, RECORD_EMISSIVE, RECORD_FLAGS, RECORD_FLOATS, RECORD_FOG, RECORD_INVERSE_Z,
-    RECORD_LIGHT, RECORD_NORMAL, RECORD_TEXTURE, RECORD_TEXTURE_FLOAT_HEIGHT,
+    RECORD_LIGHT, RECORD_METALLIC, RECORD_NORMAL, RECORD_ROUGHNESS, RECORD_TEXTURE, RECORD_TEXTURE_FLOAT_HEIGHT,
     RECORD_TEXTURE_FLOAT_WIDTH, RECORD_TEXTURE_MAX_X, RECORD_TEXTURE_MAX_Y, RECORD_TEXTURE_WIDTH,
     RECORD_TINT, RECORD_U, RECORD_V, RECORD_WEIGHT_A, RECORD_WEIGHT_B, SHADER_BLOOM_REDUCE,
     SHADER_BLUR_HORIZONTAL, SHADER_BLUR_VERTICAL, SHADER_CAPTURE, SHADER_COMPOSE, SHADER_COUNT,
@@ -97,7 +97,7 @@ def fence_timeout_from_environment() -> UInt64:
         except:
             print("SD_GPU_FENCE_TIMEOUT_MS must be a whole number of milliseconds")
     return WAIT_TIMEOUT_NS
-comptime VGPR_COUNT: UInt32 = 96
+comptime VGPR_COUNT: UInt32 = 104
 # Shadow rays read one material byte per voxel in y, z, x order. Flat, because a
 # table or packed bits cost 10 to 25% of the raster pass (see docs/RESEARCH.md).
 comptime VOXEL_BYTES: Int = 128 * 1024 * 1024
@@ -125,6 +125,7 @@ comptime V_SHADOW: UInt32 = 69
 comptime V_DITHER: UInt32 = 87
 comptime V_DITHER_OFF: UInt32 = 92
 comptime V_DITHER_SCRATCH: UInt32 = 93
+comptime V_SPEC: UInt32 = 96
 # The screen holds one frame, the compositor may hold the next, and the CPU builds a third.
 comptime FRAME_SETS: Int = 3
 comptime SIDE_RING: Int = 1  # amdgpu scheduler entity for work beside the frames (GPU meshing)
@@ -334,12 +335,26 @@ def trace_shadow(mut s: ShaderAssembler):
     dot3(s, 75, 71, 71)
     s.v_mul_f32(76, src_vgpr(74), 74)
     s.v_sub_f32(76, src_vgpr(76), 75)
-    s.v_add_f32(76, 95, 76)  # b*b - (oc.oc - r*r)
+    s.v_add_f32(76, 95, 76)  # disc = b*b - (oc.oc - r*r)
+    # Soft-penumbra analytic sphere shadow: 1.0 - clamp(disc / (0.35 * r2 + 1e-4), 0, 1) * 0.88
+    s.v_mul_f32(78, SRC_LITERAL, 95)
+    s.literal(0x3EB33333)  # 0.35
+    s.v_add_f32(78, SRC_LITERAL, 78)
+    s.literal(0x38D1B717)  # 0.0001
+    s.v_rcp_f32(78, src_vgpr(78))
+    s.s_nop(4)
+    s.v_mul_f32(78, src_vgpr(76), 78)
+    s.v_max_num_f32(78, src_int(0), 78)
+    s.v_min_num_f32(78, SRC_FLOAT_ONE, 78)
+    s.v_mul_f32(78, SRC_LITERAL, 78)
+    s.literal(0x3F6147AE)  # 0.88
+    s.v_sub_f32(78, SRC_FLOAT_ONE, 78)
+    s.v_min_num_f32(78, src_vgpr(V_SHADOW), 78)
     s.v_cmp_lt_f32(src_int(0), 74)
     s.s_mov_b32(31, SRC_VCC_LO)
     s.v_cmp_lt_f32(src_int(0), 76)
     s.s_and_b32(SRC_VCC_LO, SRC_VCC_LO, 31)
-    s.v_cndmask_b32(V_SHADOW, src_vgpr(V_SHADOW), 77)
+    s.v_cndmask_b32(V_SHADOW, src_vgpr(V_SHADOW), 78)
     s.s_add_co_u32(28, 28, src_int(1))
     s.s_add_co_u32(29, 29, src_int(16))
     s.s_branch(sphere_loop)
@@ -441,15 +456,17 @@ def occluder_dither(mut s: ShaderAssembler, next_triangle: Int):
 
 
 def per_pixel_light(mut s: ShaderAssembler):
-    """Key and local lights per pixel, added to the record's interpolated ambient light."""
+    """Key and local lights per pixel + Cook-Torrance GGX PBR specular & Schlick Fresnel."""
     var done = s.new_label()
     var no_shadows = s.new_label()
     var shadow_done = s.new_label()
     var light_loop = s.new_label()
     var next_light = s.new_label()
     var lights_done = s.new_label()
+    var pbr_done = s.new_label()
     for channel in range(3):
         s.v_mov_b32(V_LIGHT + UInt32(channel), src_int(0))
+        s.v_mov_b32(V_SPEC + UInt32(channel), src_int(0))
     s.s_and_b32(26, record_sgpr(RECORD_FLAGS), SRC_LITERAL)
     s.literal(PER_PIXEL_FLAG)
     s.s_cbranch_scc0(done)
@@ -528,6 +545,91 @@ def per_pixel_light(mut s: ShaderAssembler):
     s.s_add_co_u32(29, 29, src_int(32))
     s.s_branch(light_loop)
     s.bind(lights_done)
+
+    # Cook-Torrance GGX specular + Schlick Fresnel + metallic diffuse attenuation (matching Vulkan SPIR-V).
+    s.s_and_b32(26, record_sgpr(RECORD_FLAGS), SRC_LITERAL)
+    s.literal(PBR_FLAG)
+    s.s_cbranch_scc0(pbr_done)
+    # View vector V = normalize(-ray) in v71..v73
+    dot3(s, 74, V_RAY, V_RAY)
+    s.v_rsq_f32(74, src_vgpr(74))
+    s.s_nop(4)
+    for axis in range(3):
+        s.v_sub_f32(71 + UInt32(axis), src_int(0), V_RAY + UInt32(axis))
+        s.v_mul_f32(71 + UInt32(axis), src_vgpr(74), 71 + UInt32(axis))
+    # Half vector H = normalize(V + to_key) in v74..v76
+    for axis in range(3):
+        s.v_add_f32(74 + UInt32(axis), src_vgpr(71 + UInt32(axis)), V_TO_KEY + UInt32(axis))
+    dot3(s, 77, 74, 74)
+    s.v_add_f32(77, SRC_LITERAL, 77)
+    s.literal(0x3727C5AC)  # 1e-5
+    s.v_rsq_f32(77, src_vgpr(77))
+    s.s_nop(4)
+    for axis in range(3):
+        s.v_mul_f32(74 + UInt32(axis), src_vgpr(77), 74 + UInt32(axis))
+    # v77 = ndotv, v78 = ndoth, v79 = vdoth
+    dot3(s, 77, V_NORMAL, 71)
+    s.v_max_num_f32(77, SRC_LITERAL, 77)
+    s.literal(0x3A83126F)  # 0.001
+    dot3(s, 78, V_NORMAL, 74)
+    s.v_max_num_f32(78, src_int(0), 78)
+    dot3(s, 79, 71, 74)
+    s.v_max_num_f32(79, src_int(0), 79)
+    # Roughness -> a2 in v80, D_ggx * G_approx / 4 * 255 * sun_lit(v70) in v80
+    s.v_mov_b32(80, record_sgpr(RECORD_ROUGHNESS))
+    s.v_max_num_f32(80, SRC_LITERAL, 80)
+    s.literal(0x3D75C28F)  # 0.06
+    s.v_min_num_f32(80, SRC_FLOAT_ONE, 80)
+    s.v_mul_f32(80, src_vgpr(80), 80)
+    s.v_mul_f32(80, src_vgpr(80), 80)  # a2
+    s.v_mul_f32(81, src_vgpr(78), 78)  # ndoth^2
+    s.v_sub_f32(82, src_vgpr(80), SRC_FLOAT_ONE)
+    s.v_fma_f32(81, src_vgpr(81), src_vgpr(82), SRC_FLOAT_ONE)
+    s.v_mul_f32(81, src_vgpr(81), 81)
+    s.v_mul_f32(81, SRC_LITERAL, 81)
+    s.literal(0x40490FDB)  # pi
+    s.v_add_f32(81, SRC_LITERAL, 81)
+    s.literal(0x3727C5AC)  # 1e-5
+    s.v_rcp_f32(81, src_vgpr(81))
+    s.s_nop(4)
+    s.v_mul_f32(80, src_vgpr(80), 81)  # D_ggx
+    s.v_mul_f32(80, SRC_LITERAL, 80)
+    s.literal(0x427F0000)  # 63.75 = 255 * 0.25
+    s.v_mul_f32(80, src_vgpr(70), 80)  # * sun_lit (NdotL * shadow * AO)
+    # Schlick (1 - vdoth)^5 in v79, grazing (1 - ndotv)^3 in v77
+    s.v_sub_f32(79, SRC_FLOAT_ONE, 79)
+    s.v_mul_f32(81, src_vgpr(79), 79)
+    s.v_mul_f32(81, src_vgpr(81), 81)
+    s.v_mul_f32(79, src_vgpr(81), 79)  # f_pow5
+    s.v_sub_f32(77, SRC_FLOAT_ONE, 77)
+    s.v_mul_f32(81, src_vgpr(77), 77)
+    s.v_mul_f32(77, src_vgpr(81), 77)  # rim_f^3
+    s.v_mov_b32(82, record_sgpr(RECORD_METALLIC))
+    s.v_max_num_f32(82, src_int(0), 82)
+    s.v_min_num_f32(82, SRC_FLOAT_ONE, 82)
+    # Attenuate diffuse light for metals: V_LIGHT *= (1 - metallic * 0.82)
+    s.v_mul_f32(83, SRC_LITERAL, 82)
+    s.literal(0x3F51EB85)  # 0.82
+    s.v_sub_f32(83, SRC_FLOAT_ONE, 83)
+    for channel in range(3):
+        var ch = UInt32(channel)
+        s.v_mul_f32(V_LIGHT + ch, src_vgpr(83), V_LIGHT + ch)
+        # F0 = mix(0.04, base/255, metallic)
+        s.v_mul_f32(81, SRC_LITERAL, 44 + ch)
+        s.literal(0x3B808081)  # 1/255
+        s.v_sub_f32(81, src_vgpr(81), SRC_LITERAL)
+        s.literal(0x3D23D70A)  # 0.04
+        s.v_fma_f32(81, src_vgpr(81), src_vgpr(82), SRC_LITERAL)
+        s.literal(0x3D23D70A)  # 0.04 -> F0
+        s.v_sub_f32(84, SRC_FLOAT_ONE, 81)
+        s.v_fma_f32(84, src_vgpr(84), src_vgpr(79), src_vgpr(81))  # F = F0 + (1 - F0) * f_pow5
+        s.v_mul_f32(84, src_vgpr(80), 84)
+        s.v_mul_f32(84, src_vgpr(V_KEY_COLOR + ch), 84)
+        # Grazing rim sheen
+        s.v_mul_f32(85, SRC_LITERAL, 81)
+        s.literal(0x41B00000)  # 22.0
+        s.v_fma_f32(V_SPEC + ch, src_vgpr(85), src_vgpr(77), src_vgpr(84))
+    s.bind(pbr_done)
     s.bind(done)
 
 
@@ -660,6 +762,16 @@ def raster_shader(isa: Int = ISA_GFX12) -> ShaderAssembler:
     s.v_mov_b32(15, SRC_LITERAL)
     s.literal(0xFFFFFFFF)
     s.bind(shade_ready)
+    for channel in range(3):
+        var shift = UInt32(16 - channel * 8)
+        s.s_lshr_b32(26, record_sgpr(RECORD_TINT), src_int(shift))
+        s.s_and_b32(26, 26, SRC_LITERAL)
+        s.literal(255)
+        s.v_lshrrev_b32(19, src_int(shift), 15)
+        s.v_and_b32(19, src_vgpr(38), 19)
+        s.v_mul_u32_u24(19, 26, 19)
+        divide_by_255(s, 19)
+        s.v_cvt_f32_u32(44 + UInt32(channel), src_vgpr(19))
     per_pixel_light(s)
 
     # Shared per-pixel inputs: emissive term, fog, and its inverse.
@@ -670,22 +782,13 @@ def raster_shader(isa: Int = ISA_GFX12) -> ShaderAssembler:
     s.v_sub_f32(26, SRC_FLOAT_ONE, 25)
     s.v_lshrrev_b32(16, src_int(24), 15)
 
-    # Texture * tint, lighting, fog, then the region's tone table.
+    # Texture * tint, lighting + PBR specular, fog, then the region's tone table.
     for channel in range(3):
-        var shift = UInt32(16 - channel * 8)
-        s.s_lshr_b32(26, record_sgpr(RECORD_TINT), src_int(shift))
-        s.s_and_b32(26, 26, SRC_LITERAL)
-        s.literal(255)
-        s.v_lshrrev_b32(19, src_int(shift), 15)
-        s.v_and_b32(19, src_vgpr(38), 19)
-        s.v_mul_u32_u24(19, 26, 19)
-        divide_by_255(s, 19)
-        s.v_cvt_f32_u32(22, src_vgpr(19))
-        s.v_mov_b32(44 + UInt32(channel), src_vgpr(22))
+        s.v_mov_b32(22, src_vgpr(44 + UInt32(channel)))
         evaluate_plane(s, 23, RECORD_LIGHT + channel * 3)
         s.v_add_f32(23, src_vgpr(24), 23)
         s.v_add_f32(23, src_vgpr(V_LIGHT + UInt32(channel)), 23)
-        s.v_mul_f32(22, src_vgpr(23), 22)
+        s.v_fma_f32(22, src_vgpr(22), src_vgpr(23), src_vgpr(V_SPEC + UInt32(channel)))
         s.v_mul_f32(22, src_vgpr(26), 22)
         s.v_mul_f32(23, src_vgpr(27 + UInt32(channel)), 25)
         s.v_add_f32(22, src_vgpr(23), 22)
@@ -882,7 +985,7 @@ def bloom_reduce_shader(isa: Int = ISA_GFX12) -> ShaderAssembler:
 
 
 def bloom_blur_shader(horizontal: Bool, isa: Int = ISA_GFX12) -> ShaderAssembler:
-    """One 0.24/0.52/0.24 axis of the bloom blur, in floating-point cells.
+    """One 5-tap [0.0625, 0.25, 0.375, 0.25, 0.0625] Gaussian axis of the bloom blur.
 
     The vertical pass is last, so it also applies the bloom strength and packs
     each cell into a byte per channel. User SGPRs: s0:1 source, s2:3 target,
@@ -901,34 +1004,50 @@ def bloom_blur_shader(horizontal: Bool, isa: Int = ISA_GFX12) -> ShaderAssembler
     s.v_max_i32(4, src_int(0), 4)
     s.v_add_nc_u32(5, src_int(1), moving)
     s.v_min_i32(5, limit, 5)
+    s.v_add_nc_u32(24, SRC_LITERAL, moving)
+    s.literal(0xFFFFFFFE)
+    s.v_max_i32(24, src_int(0), 24)
+    s.v_add_nc_u32(25, src_int(2), moving)
+    s.v_min_i32(25, limit, 25)
     if horizontal:
         s.v_mad_u32_u24(4, src_vgpr(2), 4, src_vgpr(4))
         s.v_mad_u32_u24(5, src_vgpr(2), 4, src_vgpr(5))
+        s.v_mad_u32_u24(24, src_vgpr(2), 4, src_vgpr(24))
+        s.v_mad_u32_u24(25, src_vgpr(2), 4, src_vgpr(25))
     else:
         s.v_mad_u32_u24(4, src_vgpr(4), 4, src_vgpr(1))
         s.v_mad_u32_u24(5, src_vgpr(5), 4, src_vgpr(1))
+        s.v_mad_u32_u24(24, src_vgpr(24), 4, src_vgpr(1))
+        s.v_mad_u32_u24(25, src_vgpr(25), 4, src_vgpr(1))
     s.v_mul_u32_u24(6, src_int(12), 3)
     s.v_mul_u32_u24(4, src_int(12), 4)
     s.v_mul_u32_u24(5, src_int(12), 5)
+    s.v_mul_u32_u24(24, src_int(12), 24)
+    s.v_mul_u32_u24(25, src_int(12), 25)
     for channel in range(3):
         var offset = UInt32(channel * 4)
-        var register = 9 + UInt32(channel) * 3
+        var register = 9 + UInt32(channel) * 5
         s.global_load_b32(register, 4, 0, offset)
         s.global_load_b32(register + 1, 6, 0, offset)
         s.global_load_b32(register + 2, 5, 0, offset)
+        s.global_load_b32(register + 3, 24, 0, offset)
+        s.global_load_b32(register + 4, 25, 0, offset)
     s.s_wait_loadcnt()
     if not horizontal:
         s.v_lshlrev_b32(3, src_int(2), 3)
         s.v_mov_b32(7, SRC_LITERAL)
         s.literal(0xFF000000)
     for channel in range(3):
-        var register = 9 + UInt32(channel) * 3
+        var register = 9 + UInt32(channel) * 5
         s.v_add_f32(register, src_vgpr(register + 2), register)
         s.v_mul_f32(register, SRC_LITERAL, register)
-        s.literal(0x3E75C28F)  # 0.24
+        s.literal(0x3E800000)  # 0.25
         s.v_mul_f32(register + 1, SRC_LITERAL, register + 1)
-        s.literal(0x3F051EB8)  # 0.52
+        s.literal(0x3EC00000)  # 0.375
         s.v_add_f32(register, src_vgpr(register + 1), register)
+        s.v_add_f32(register + 3, src_vgpr(register + 4), register + 3)
+        s.v_fma_f32(register, SRC_LITERAL, src_vgpr(register + 3), src_vgpr(register))
+        s.literal(0x3D800000)  # 0.0625
         if horizontal:
             s.global_store_b32(6, register, 2, UInt32(channel * 4))
         else:
@@ -946,15 +1065,15 @@ def bloom_blur_shader(horizontal: Bool, isa: Int = ISA_GFX12) -> ShaderAssembler
 
 
 def compose_shader(isa: Int = ISA_GFX12) -> ShaderAssembler:
-    """Scene + bloom, then the premultiplied HUD over it, into the shown image.
+    """Scene + bilinear-upsampled bloom, then the premultiplied HUD over it, into the shown image.
 
     User SGPRs: s0:1 scene, s2:3 shown image, s4:5 HUD, s6:7 packed bloom cells,
     s8 row pixels, s9 width, s10 cell columns, s11 and s12 cells per pixel as
-    floats, s13 bloom enabled, s14 last cell column.
+    floats, s13 bloom enabled, s14 last cell column, s15 last cell row.
     """
     var s = ShaderAssembler(isa)
     var bloom_ready = s.new_label()
-    pixel_position(s, 15)
+    pixel_position(s, 16)
     keep_columns_below(s, 9)
     s.v_mad_u32_u24(3, src_vgpr(2), 8, src_vgpr(1))
     s.v_lshlrev_b32(3, src_int(2), 3)
@@ -965,16 +1084,62 @@ def compose_shader(isa: Int = ISA_GFX12) -> ShaderAssembler:
     s.literal(255)
     s.s_cmp_eq_u32(13, src_int(0))
     s.s_cbranch_scc1(bloom_ready)
+    # Bilinear u = max(0, (x + 0.5) * scale_x - 0.5), v = max(0, (y + 0.5) * scale_y - 0.5)
     s.v_cvt_f32_u32(6, src_vgpr(1))
+    s.v_add_f32(6, SRC_FLOAT_HALF, 6)
     s.v_mul_f32(6, 11, 6)
-    s.v_cvt_u32_f32(6, src_vgpr(6))
-    s.v_min_u32(6, 14, 6)
+    s.v_add_f32(6, SRC_FLOAT_MINUS_HALF, 6)
+    s.v_max_num_f32(6, src_int(0), 6)
+    s.v_cvt_u32_f32(13, src_vgpr(6))
+    s.v_min_u32(13, 14, 13)  # x0
+    s.v_add_nc_u32(14, src_int(1), 13)
+    s.v_min_u32(14, 14, 14)  # x1
+    s.v_cvt_f32_u32(15, src_vgpr(13))
+    s.v_sub_f32(6, src_vgpr(6), 15)
+    s.v_max_num_f32(6, src_int(0), 6)
+    s.v_mul_f32(6, SRC_LITERAL, 6)
+    s.literal(0x43800000)  # 256.0
+    s.v_cvt_u32_f32(15, src_vgpr(6))
+    s.v_min_u32(15, SRC_LITERAL, 15)
+    s.literal(256)  # fx
+
     s.v_cvt_f32_u32(8, src_vgpr(2))
+    s.v_add_f32(8, SRC_FLOAT_HALF, 8)
     s.v_mul_f32(8, 12, 8)
-    s.v_cvt_u32_f32(8, src_vgpr(8))
-    s.v_mad_u32_u24(6, src_vgpr(8), 10, src_vgpr(6))
-    s.v_lshlrev_b32(6, src_int(2), 6)
-    s.global_load_b32(7, 6, 6)
+    s.v_add_f32(8, SRC_FLOAT_MINUS_HALF, 8)
+    s.v_max_num_f32(8, src_int(0), 8)
+    s.v_cvt_u32_f32(16, src_vgpr(8))
+    s.v_min_u32(16, 15, 16)  # y0
+    s.v_add_nc_u32(17, src_int(1), 16)
+    s.v_min_u32(17, 15, 17)  # y1
+    s.v_cvt_f32_u32(18, src_vgpr(16))
+    s.v_sub_f32(8, src_vgpr(8), 18)
+    s.v_max_num_f32(8, src_int(0), 8)
+    s.v_mul_f32(8, SRC_LITERAL, 8)
+    s.literal(0x43800000)  # 256.0
+    s.v_cvt_u32_f32(18, src_vgpr(8))
+    s.v_min_u32(18, SRC_LITERAL, 18)
+    s.literal(256)  # fy
+
+    s.v_mad_u32_u24(19, src_vgpr(16), 10, src_vgpr(13))
+    s.v_lshlrev_b32(19, src_int(2), 19)
+    s.global_load_b32(20, 19, 6)
+    s.v_mad_u32_u24(19, src_vgpr(16), 10, src_vgpr(14))
+    s.v_lshlrev_b32(19, src_int(2), 19)
+    s.global_load_b32(21, 19, 6)
+    s.v_mad_u32_u24(19, src_vgpr(17), 10, src_vgpr(13))
+    s.v_lshlrev_b32(19, src_int(2), 19)
+    s.global_load_b32(22, 19, 6)
+    s.v_mad_u32_u24(19, src_vgpr(17), 10, src_vgpr(14))
+    s.v_lshlrev_b32(19, src_int(2), 19)
+    s.global_load_b32(23, 19, 6)
+    s.s_wait_loadcnt()
+    s.v_mov_b32(86, SRC_LITERAL)
+    s.literal(0x00FF00FF)
+    lerp_packed(s, 20, 21, 15)
+    lerp_packed(s, 22, 23, 15)
+    lerp_packed(s, 20, 22, 18)
+    s.v_mov_b32(7, src_vgpr(20))
     s.bind(bloom_ready)
     s.s_wait_loadcnt()
     s.v_lshrrev_b32(12, src_int(24), 5)
@@ -1948,7 +2113,8 @@ struct GpuRaster(Copyable, Movable):
         user.append(float_bits(Float32(bloom_height) / Float32(self.height)))
         user.append(UInt32(1) if bloom else UInt32(0))
         user.append(UInt32(bloom_width - 1))
-        builder.compute_state(self.shader_address(SHADER_COMPOSE), UInt32(GROUP_WIDTH), UInt32(GROUP_HEIGHT), 1, 15, VGPR_COUNT, INPUT_GROUP_X | INPUT_GROUP_Y | INPUT_THREAD_XY)
+        user.append(UInt32(bloom_height - 1))
+        builder.compute_state(self.shader_address(SHADER_COMPOSE), UInt32(GROUP_WIDTH), UInt32(GROUP_HEIGHT), 1, 16, VGPR_COUNT, INPUT_GROUP_X | INPUT_GROUP_Y | INPUT_THREAD_XY)
         builder.user_values(0, user)
         builder.dispatch(UInt32((self.width + GROUP_WIDTH - 1) // GROUP_WIDTH), UInt32((self.height + GROUP_HEIGHT - 1) // GROUP_HEIGHT), 1)
         builder.wait_for_shaders()

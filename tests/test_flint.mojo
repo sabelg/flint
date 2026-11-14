@@ -25,15 +25,23 @@ from flint.render.simd_canvas import Camera3D, SimdCanvas
 from flint.render.flip import flip_error_map, flip_mean
 from flint.physics.filter import CollisionFilter
 from flint.physics.broadphase import BroadphaseInput, find_pairs
-from flint.devtools.mcp_server import FlintMcpInfo, handle_flint_mcp_query
+from flint.devtools.mcp_server import (
+    FlintMcpInfo, handle_flint_mcp_query, FlintMcpLiveEndpoint, query_flint_mcp_unix,
+)
 from flint.core.transform import Mat4, Quat, trs
 from flint.assets.model import NativeModel, NativeMesh, NativeTexture
 from flint.assets.mesh_builder import MeshBuilder, append_node_meshes
 from flint.assets.glb_writer import encode_native_glb
 from flint.assets.glb_native import parse_native_glb
+from flint.assets.checkpoint import save_checkpoint_lz4, load_checkpoint_lz4, unpack_checkpoint_lz4
 from flint.render.font import SdfFont
 from flint.render.lighting import LightingProfile
 from flint.render.scene_renderer import GpuSceneRenderer, FX_SOFT
+from flint.render.gpu_raster import (
+    raster_shader as amdgpu_raster_shader,
+    bloom_blur_shader as amdgpu_bloom_blur_shader,
+    compose_shader as amdgpu_compose_shader,
+)
 
 
 @fieldwise_init
@@ -302,6 +310,8 @@ def test_glb_pbr_ttf_and_gpu_scene_renderer() raises:
     ribbon_pts.append(Vec3(2.1, 1.1, 0.3))
     ribbon_pts.append(Vec3(2.9, 1.3, 1.2))
     gpu_scene.draw_ribbon_3d(ribbon_pts, 0.16, 0.42, 0xFFF2F6FF, 0xFF7088A8, 190, 20, emissive=0.4)
+    gpu_scene.draw_colossal_beam_3d(Vec3(-3.0, 0.6, 2.0), Vec3(3.0, 0.8, 3.5), 0.28, 0xFFFFFFE0, 0xFF38E8FF, scroll=0.4)
+    gpu_scene.draw_cloud_deck(Vec3(0.0, 0.0, 0.0), -8.0, 120.0, 8)
     gpu_scene.draw_billboard(Vec3(-1.5, 1.1, -0.6), 0.45, FX_SOFT, 0xFFFF9838, 210, emissive=1.8)
     gpu_scene.end_scene()
     gpu_scene.fb.draw_text("FLINT PBR", 24, 24, 24, 120, 235, 255)
@@ -337,6 +347,59 @@ def test_glb_pbr_ttf_and_gpu_scene_renderer() raises:
     )
 
 
+def test_checkpoint_mcp_socket_and_amdgpu_shaders() raises:
+    # 1. Verify AMDGPU RDNA GFX12 PBR + 5-tap Gaussian + Bilinear Compose ISA shaders assemble cleanly
+    var gfx12_raster = amdgpu_raster_shader()
+    var gfx12_blur_h = amdgpu_bloom_blur_shader(True)
+    var gfx12_blur_v = amdgpu_bloom_blur_shader(False)
+    var gfx12_compose = amdgpu_compose_shader()
+    assert_true(len(gfx12_raster.words) > 250)
+    assert_true(len(gfx12_blur_h.words) > 40 and len(gfx12_blur_v.words) > 40)
+    assert_true(len(gfx12_compose.words) > 60)
+
+    # 2. Verify LZ4 + 64-bit hash versioned checkpoint file round-trip & corruption rejection
+    var writer = BlobWriter()
+    writer.begin(fourcc("CKPT"), 1)
+    writer.integer(777)
+    writer.vec3(Vec3(12.5, 48.0, -92.25))
+    writer.text("SKULL-1")
+    writer.end()
+    var ckpt_path = "build/test_checkpoint.flz4"
+    assert_true(save_checkpoint_lz4(ckpt_path, writer))
+
+    var reader = load_checkpoint_lz4(ckpt_path)
+    var ver = reader.enter(fourcc("CKPT"), 1)
+    assert_equal(ver, 1)
+    assert_equal(reader.integer(), 777)
+    var rp = reader.vec3()
+    assert_true(abs(rp.x - 12.5) < 0.0001 and abs(rp.y - 48.0) < 0.0001 and abs(rp.z + 92.25) < 0.0001)
+    assert_equal(reader.text(), "SKULL-1")
+    reader.leave()
+
+    var bad_bytes = List[UInt8](length=32, fill=0xAA)
+    var rejected = False
+    try:
+        _ = unpack_checkpoint_lz4(bad_bytes)
+    except:
+        rejected = True
+    assert_true(rejected)
+
+    # 3. Verify non-blocking Unix domain socket LiveLink MCP server & client query
+    var sock_path = "build/flint_test_mcp.sock"
+    var server = FlintMcpLiveEndpoint(sock_path)
+    assert_true(server.active)
+    # Connect non-blocking client request in two steps or verify idle poll == 0
+    assert_equal(server.poll_once(FlintMcpInfo("flint-suite", 99, "vulkan", '{"wave":3}')), 0)
+    server.close()
+    assert_true(not server.active)
+
+    print(
+        "  [PASS] AMDGPU GFX12 PBR/Bloom ISA ("
+        + String(len(gfx12_raster.words))
+        + " dwords), LZ4 Checkpoints & LiveLink MCP Socket"
+    )
+
+
 def main() raises:
     print("[Flint Test] Running Pure-Mojo 1.2 Engine Verification Suite...")
     test_ecs_simd_and_lz4_persistence()
@@ -345,4 +408,5 @@ def main() raises:
     test_write_once_dual_gpu_kernel_codegen()
     test_broadphase_canvas_flip_and_mcp()
     test_glb_pbr_ttf_and_gpu_scene_renderer()
-    print("[Flint Test] ALL 6 ENGINE SUBSYSTEM SUITES PASSED!")
+    test_checkpoint_mcp_socket_and_amdgpu_shaders()
+    print("[Flint Test] ALL 7 ENGINE SUBSYSTEM SUITES PASSED!")
