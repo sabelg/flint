@@ -4,6 +4,7 @@ Only system calls and the C ABI exported by the host C runtime are touched here.
 No third-party compatibility library is linked into the game.
 """
 from std.ffi import external_call
+from std.sys.info import CompilationTarget
 from std.time import monotonic
 
 
@@ -122,8 +123,9 @@ def remove_file(path: String) -> Bool:
 
 def fsync_path(path: String, directory: Bool) -> Bool:
     """fsync(2) on a file or (O_DIRECTORY) a directory, so its entries are on disk."""
+    comptime O_DIRECTORY_FLAG: Int32 = 65536 if CompilationTarget.is_x86() else 16384
     var owned = path
-    var flags = Int32(65536) if directory else Int32(0)  # O_RDONLY | O_DIRECTORY
+    var flags = O_DIRECTORY_FLAG if directory else Int32(0)  # O_RDONLY | O_DIRECTORY
     var fd = Int(external_call["open", Int32](owned.as_c_string_span(), flags, Int32(0)))
     if fd < 0:
         return False
@@ -412,3 +414,695 @@ def process_rss_bytes() -> UInt64:
 def process_peak_rss_bytes() -> UInt64:
     """The most resident memory this process has had (VmHWM)."""
     return process_status_bytes("VmHWM")
+
+
+# ==============================================================================
+# D3: Non-Blocking POSIX IPv4 UDP Datagram Sockets & Deterministic Lockstep Peer
+# ==============================================================================
+
+comptime _AF_INET: Int32 = 2
+comptime _SOCK_DGRAM_NONBLOCK: Int32 = 2 | 2048  # SOCK_DGRAM (2) | SOCK_NONBLOCK (04000)
+
+
+def _fill_sockaddr_in(mut addr: List[UInt8], ip_a: Int, ip_b: Int, ip_c: Int, ip_d: Int, port: Int):
+    for i in range(16):
+        addr[i] = 0
+    addr[0] = UInt8(_AF_INET & 255)
+    addr[1] = UInt8((_AF_INET >> 8) & 255)
+    addr[2] = UInt8((port >> 8) & 255)
+    addr[3] = UInt8(port & 255)
+    addr[4] = UInt8(ip_a & 255)
+    addr[5] = UInt8(ip_b & 255)
+    addr[6] = UInt8(ip_c & 255)
+    addr[7] = UInt8(ip_d & 255)
+
+
+def udp_open_nonblocking(bind_port: Int = 0, loopback_only: Bool = False) -> Tuple[Int, Int]:
+    """Opens a non-blocking IPv4 UDP socket bound to `bind_port` (`0` = ephemeral).
+    Returns `(fd, bound_port)`, or `(-1, 0)` on failure."""
+    var fd = Int(external_call["socket", Int32](_AF_INET, _SOCK_DGRAM_NONBLOCK, Int32(0)))
+    if fd < 0:
+        return (-1, 0)
+    var opt_buf = List[Int32](length=1, fill=1)
+    _ = external_call["setsockopt", Int32](Int32(fd), Int32(1), Int32(2), opt_buf.unsafe_ptr(), UInt32(4))
+    _ = len(opt_buf)
+    var addr = List[UInt8](length=16, fill=0)
+    if loopback_only:
+        _fill_sockaddr_in(addr, 127, 0, 0, 1, bind_port)
+    else:
+        _fill_sockaddr_in(addr, 0, 0, 0, 0, bind_port)
+    var rc = external_call["bind", Int32](Int32(fd), addr.unsafe_ptr(), UInt32(16))
+    _ = len(addr)
+    if rc < 0:
+        close_fd(fd)
+        return (-1, 0)
+    var name_addr = List[UInt8](length=16, fill=0)
+    var addr_len_buf = List[UInt32](length=1, fill=16)
+    var grc = external_call["getsockname", Int32](Int32(fd), name_addr.unsafe_ptr(), addr_len_buf.unsafe_ptr())
+    _ = len(addr_len_buf)
+    var actual_port = bind_port
+    if grc == 0:
+        actual_port = (Int(name_addr[2]) << 8) | Int(name_addr[3])
+    _ = len(name_addr)
+    return (fd, actual_port)
+
+
+def udp_send_ipv4(fd: Int, ip_a: Int, ip_b: Int, ip_c: Int, ip_d: Int, port: Int, payload: List[UInt8]) -> Int:
+    """Sends a single non-blocking UDP datagram to `ip_a.ip_b.ip_c.ip_d:port`."""
+    if fd < 0 or port <= 0 or len(payload) == 0:
+        return -1
+    var addr = List[UInt8](length=16, fill=0)
+    _fill_sockaddr_in(addr, ip_a, ip_b, ip_c, ip_d, port)
+    var n_bytes = len(payload)
+    var sent = Int(
+        external_call["sendto", Int64](
+            Int32(fd),
+            payload.unsafe_ptr(),
+            Int64(n_bytes),
+            Int32(0x4000),  # MSG_NOSIGNAL
+            addr.unsafe_ptr(),
+            UInt32(16),
+        )
+    )
+    _ = len(payload)
+    _ = len(addr)
+    return sent
+
+
+def udp_recv_nonblocking(fd: Int, max_bytes: Int = 512) -> List[UInt8]:
+    """Polls `fd` for one incoming UDP datagram without blocking; returns empty list on `EAGAIN`."""
+    if fd < 0 or max_bytes <= 0:
+        return List[UInt8]()
+    var buf = List[UInt8](length=max_bytes, fill=0)
+    var src_addr = List[UInt8](length=16, fill=0)
+    var addr_len_buf = List[UInt32](length=1, fill=16)
+    var got = Int(
+        external_call["recvfrom", Int64](
+            Int32(fd),
+            buf.unsafe_ptr(),
+            Int64(max_bytes),
+            Int32(0x40),  # MSG_DONTWAIT
+            src_addr.unsafe_ptr(),
+            addr_len_buf.unsafe_ptr(),
+        )
+    )
+    _ = len(src_addr)
+    _ = len(addr_len_buf)
+    if got <= 0:
+        _ = len(buf)
+        return List[UInt8]()
+    var out = List[UInt8](capacity=got)
+    for i in range(got):
+        out.append(buf[i])
+    _ = len(buf)
+    return out^
+
+
+comptime LOCKSTEP_MAGIC: UInt32 = 0x50534B4C  # "LKSP"
+
+
+struct LockstepFrame(Copyable, Movable):
+    var tick: Int
+    var state_hash: UInt64
+    var input_bytes: List[UInt8]
+
+    def __init__(out self, tick: Int = -1, state_hash: UInt64 = 0):
+        self.tick = tick
+        self.state_hash = state_hash
+        self.input_bytes = List[UInt8]()
+
+
+struct LockstepPeer(Movable):
+    """Deterministic 2-player UDP lockstep transport exchanging `(tick, FNV-64 state_hash, input_bytes)`
+    frames with automatic per-tick state-hash desynchronization verification."""
+    var fd: Int
+    var local_port: Int
+    var peer_ip_a: Int
+    var peer_ip_b: Int
+    var peer_ip_c: Int
+    var peer_ip_d: Int
+    var peer_port: Int
+    var packets_sent: Int
+    var packets_received: Int
+    var desync_detected: Bool
+    var desync_tick: Int
+    var local_ticks: List[Int]
+    var local_hashes: List[UInt64]
+    var remote_frames: List[LockstepFrame]
+
+    def __init__(out self):
+        self.fd = -1
+        self.local_port = 0
+        self.peer_ip_a = 127
+        self.peer_ip_b = 0
+        self.peer_ip_c = 0
+        self.peer_ip_d = 1
+        self.peer_port = 0
+        self.packets_sent = 0
+        self.packets_received = 0
+        self.desync_detected = False
+        self.desync_tick = -1
+        self.local_ticks = List[Int]()
+        self.local_hashes = List[UInt64]()
+        self.remote_frames = List[LockstepFrame]()
+
+    def open(mut self, bind_port: Int = 0, loopback_only: Bool = False) -> Bool:
+        self.close()
+        var res = udp_open_nonblocking(bind_port, loopback_only)
+        self.fd = res[0]
+        self.local_port = res[1]
+        return self.fd >= 0
+
+    def set_peer(mut self, ip_a: Int, ip_b: Int, ip_c: Int, ip_d: Int, port: Int):
+        self.peer_ip_a = ip_a
+        self.peer_ip_b = ip_b
+        self.peer_ip_c = ip_c
+        self.peer_ip_d = ip_d
+        self.peer_port = port
+
+    def close(mut self):
+        if self.fd >= 0:
+            close_fd(self.fd)
+            self.fd = -1
+            self.local_port = 0
+
+    def _verify_tick_hash(mut self, tick: Int, local_h: UInt64, remote_h: UInt64):
+        if local_h != 0 and remote_h != 0 and local_h != remote_h:
+            self.desync_detected = True
+            if self.desync_tick < 0:
+                self.desync_tick = tick
+
+    def record_local_hash(mut self, tick: Int, state_hash: UInt64):
+        for i in range(len(self.local_ticks)):
+            if self.local_ticks[i] == tick:
+                self.local_hashes[i] = state_hash
+                for r in range(len(self.remote_frames)):
+                    if self.remote_frames[r].tick == tick:
+                        self._verify_tick_hash(tick, state_hash, self.remote_frames[r].state_hash)
+                return
+        if len(self.local_ticks) >= 256:
+            _ = self.local_ticks.pop(0)
+            _ = self.local_hashes.pop(0)
+        self.local_ticks.append(tick)
+        self.local_hashes.append(state_hash)
+        for r in range(len(self.remote_frames)):
+            if self.remote_frames[r].tick == tick:
+                self._verify_tick_hash(tick, state_hash, self.remote_frames[r].state_hash)
+
+    def send_tick(mut self, tick: Int, state_hash: UInt64, input_bytes: List[UInt8]) -> Bool:
+        if self.fd < 0 or self.peer_port <= 0:
+            return False
+        self.record_local_hash(tick, state_hash)
+        var pkt = List[UInt8](capacity=18 + len(input_bytes))
+        var m = LOCKSTEP_MAGIC
+        for s in range(4):
+            pkt.append(UInt8((m >> UInt32(s * 8)) & 255))
+        var t32 = UInt32(tick)
+        for s in range(4):
+            pkt.append(UInt8((t32 >> UInt32(s * 8)) & 255))
+        for s in range(8):
+            pkt.append(UInt8((state_hash >> UInt64(s * 8)) & 255))
+        var ilen = min(240, len(input_bytes))
+        pkt.append(UInt8(ilen & 255))
+        pkt.append(UInt8((ilen >> 8) & 255))
+        for i in range(ilen):
+            pkt.append(input_bytes[i])
+        var sent = udp_send_ipv4(
+            self.fd, self.peer_ip_a, self.peer_ip_b, self.peer_ip_c, self.peer_ip_d, self.peer_port, pkt
+        )
+        if sent == len(pkt):
+            self.packets_sent += 1
+            return True
+        return False
+
+    def poll_incoming(mut self) -> Int:
+        if self.fd < 0:
+            return 0
+        var count = 0
+        for _ in range(32):
+            var raw = udp_recv_nonblocking(self.fd, 512)
+            if len(raw) < 18:
+                break
+            var magic = (
+                UInt32(raw[0])
+                | (UInt32(raw[1]) << 8)
+                | (UInt32(raw[2]) << 16)
+                | (UInt32(raw[3]) << 24)
+            )
+            if magic != LOCKSTEP_MAGIC:
+                continue
+            var tick = Int(
+                UInt32(raw[4])
+                | (UInt32(raw[5]) << 8)
+                | (UInt32(raw[6]) << 16)
+                | (UInt32(raw[7]) << 24)
+            )
+            var r_hash = UInt64(0)
+            for s in range(8):
+                r_hash |= UInt64(raw[8 + s]) << UInt64(s * 8)
+            var ilen = Int(raw[16]) | (Int(raw[17]) << 8)
+            if 18 + ilen > len(raw):
+                continue
+            var frame = LockstepFrame(tick, r_hash)
+            frame.input_bytes.reserve(ilen)
+            for i in range(ilen):
+                frame.input_bytes.append(raw[18 + i])
+            self.packets_received += 1
+            count += 1
+            var replaced = False
+            for r in range(len(self.remote_frames)):
+                if self.remote_frames[r].tick == tick:
+                    self.remote_frames[r] = frame.copy()
+                    replaced = True
+                    break
+            if not replaced:
+                if len(self.remote_frames) >= 256:
+                    _ = self.remote_frames.pop(0)
+                self.remote_frames.append(frame^)
+            for l_i in range(len(self.local_ticks)):
+                if self.local_ticks[l_i] == tick:
+                    self._verify_tick_hash(tick, self.local_hashes[l_i], r_hash)
+                    break
+        return count
+
+    def try_consume_tick(mut self, tick: Int) -> Tuple[Bool, List[UInt8]]:
+        _ = self.poll_incoming()
+        for r in range(len(self.remote_frames)):
+            if self.remote_frames[r].tick == tick:
+                return (True, self.remote_frames[r].input_bytes.copy())
+        return (False, List[UInt8]())
+
+
+# ==============================================================================
+# V9 C3: Zero-Dependency Linux Joystick / HOTAS Polling (/dev/input/js0..js3)
+# ==============================================================================
+
+comptime JS_EVENT_BUTTON: UInt8 = 0x01
+comptime JS_EVENT_AXIS: UInt8 = 0x02
+comptime JS_EVENT_INIT: UInt8 = 0x80
+comptime GAMEPAD_MAX_AXES: Int = 16
+comptime GAMEPAD_MAX_BUTTONS: Int = 32
+
+
+struct LinuxGamepad(Movable):
+    """Polls standard Linux `/dev/input/js*` 8-byte `js_event` packets (`O_RDONLY | O_NONBLOCK`)
+    with configurable axial deadzone, response exponent, and synthetic packet injection for tests."""
+    var fd: Int
+    var device_index: Int
+    var connected: Bool
+    var deadzone: Float32
+    var curve_power: Float32
+    var axes: List[Float32]
+    var buttons: List[Bool]
+    var prev_buttons: List[Bool]
+    var events_processed: Int
+
+    def __init__(out self, deadzone: Float32 = 0.12, curve_power: Float32 = 1.55):
+        self.fd = -1
+        self.device_index = -1
+        self.connected = False
+        self.deadzone = max(Float32(0.0), min(Float32(0.65), deadzone))
+        self.curve_power = max(Float32(1.0), min(Float32(3.0), curve_power))
+        self.axes = List[Float32](length=GAMEPAD_MAX_AXES, fill=0.0)
+        self.buttons = List[Bool](length=GAMEPAD_MAX_BUTTONS, fill=False)
+        self.prev_buttons = List[Bool](length=GAMEPAD_MAX_BUTTONS, fill=False)
+        self.events_processed = 0
+
+    def open_first_available(mut self) -> Bool:
+        self.close()
+        for idx in range(4):
+            var path = "/dev/input/js" + String(idx)
+            var fd_try = Int(external_call["open", Int32](path.as_c_string_span(), Int32(2048), Int32(0)))
+            _ = path.byte_length()
+            if fd_try >= 0:
+                self.fd = fd_try
+                self.device_index = idx
+                self.connected = True
+                return True
+        return False
+
+    def close(mut self):
+        if self.fd >= 0:
+            close_fd(self.fd)
+            self.fd = -1
+        self.device_index = -1
+        self.connected = False
+
+    def begin_frame(mut self):
+        for b in range(GAMEPAD_MAX_BUTTONS):
+            self.prev_buttons[b] = self.buttons[b]
+
+    def apply_js_event(mut self, ev_type: UInt8, number: UInt8, raw_value: Int16):
+        var kind = ev_type & ~JS_EVENT_INIT
+        var idx = Int(number)
+        if kind == JS_EVENT_AXIS and idx >= 0 and idx < GAMEPAD_MAX_AXES:
+            var norm = Float32(raw_value) / Float32(32767.0)
+            self.axes[idx] = max(Float32(-1.0), min(Float32(1.0), norm))
+            self.events_processed += 1
+        elif kind == JS_EVENT_BUTTON and idx >= 0 and idx < GAMEPAD_MAX_BUTTONS:
+            self.buttons[idx] = raw_value != 0
+            self.events_processed += 1
+
+    def parse_js_packet(mut self, pkt8: List[UInt8]) -> Bool:
+        if len(pkt8) < 8:
+            return False
+        var raw_u16 = UInt16(pkt8[4]) | (UInt16(pkt8[5]) << 8)
+        var raw_i16 = Int16(raw_u16)
+        self.apply_js_event(pkt8[6], pkt8[7], raw_i16)
+        return True
+
+    def poll(mut self) -> Int:
+        self.begin_frame()
+        if self.fd < 0:
+            return 0
+        var buf = List[UInt8](length=64, fill=0)
+        var got_events = 0
+        for _ in range(16):
+            var n = Int(external_call["read", Int64](Int32(self.fd), buf.unsafe_ptr(), Int64(64)))
+            if n < 8:
+                if n < 0:
+                    var err = last_errno()
+                    if err != Int32(11) and err != EINTR:  # EAGAIN = 11
+                        self.close()
+                break
+            var off = 0
+            while off + 8 <= n:
+                var raw_u16 = UInt16(buf[off + 4]) | (UInt16(buf[off + 5]) << 8)
+                self.apply_js_event(buf[off + 6], buf[off + 7], Int16(raw_u16))
+                got_events += 1
+                off += 8
+        _ = len(buf)
+        return got_events
+
+    def axis_curved(self, axis_idx: Int) -> Float32:
+        if axis_idx < 0 or axis_idx >= GAMEPAD_MAX_AXES:
+            return 0.0
+        var v = self.axes[axis_idx]
+        var av = abs(v)
+        if av <= self.deadzone:
+            return 0.0
+        var t = min(Float32(1.0), (av - self.deadzone) / max(Float32(0.01), Float32(1.0) - self.deadzone))
+        # Fast smooth polynomial blend between linear (p=1) and quadratic/cubic stick precision
+        var t2 = t * t
+        var blend = max(Float32(0.0), min(Float32(1.0), (self.curve_power - Float32(1.0)) * Float32(0.5)))
+        var shaped = t * (Float32(1.0) - blend) + (t2 * (Float32(0.65) + Float32(0.35) * t)) * blend
+        return shaped if v >= Float32(0.0) else -shaped
+
+    def button_down(self, btn_idx: Int) -> Bool:
+        if btn_idx < 0 or btn_idx >= GAMEPAD_MAX_BUTTONS:
+            return False
+        return self.buttons[btn_idx]
+
+    def button_pressed(self, btn_idx: Int) -> Bool:
+        if btn_idx < 0 or btn_idx >= GAMEPAD_MAX_BUTTONS:
+            return False
+        return self.buttons[btn_idx] and not self.prev_buttons[btn_idx]
+
+
+# ==============================================================================
+# V9 D1: GGPO-Style 4-Player Deterministic Rollback Netcode (`RollbackPeer`)
+# ==============================================================================
+
+comptime ROLLBACK_MAGIC: UInt32 = 0x50424C52  # "RLBP"
+comptime MAX_ROLLBACK_PLAYERS: Int = 4
+comptime MAX_ROLLBACK_WINDOW: Int = 128
+
+
+struct RollbackEndpoint(Copyable, Movable, ImplicitlyCopyable):
+    var active: Bool
+    var ip_a: Int
+    var ip_b: Int
+    var ip_c: Int
+    var ip_d: Int
+    var port: Int
+
+    def __init__(out self, ip_a: Int = 127, ip_b: Int = 0, ip_c: Int = 0, ip_d: Int = 1, port: Int = 0, active: Bool = False):
+        self.active = active
+        self.ip_a = ip_a
+        self.ip_b = ip_b
+        self.ip_c = ip_c
+        self.ip_d = ip_d
+        self.port = port
+
+
+struct RollbackSnapshot(Copyable, Movable):
+    var tick: Int
+    var state_hash: UInt64
+    var state_bytes: List[UInt8]
+
+    def __init__(out self, tick: Int = -1, state_hash: UInt64 = 0):
+        self.tick = tick
+        self.state_hash = state_hash
+        self.state_bytes = List[UInt8]()
+
+
+struct RollbackInputSlot(Copyable, Movable):
+    var tick: Int
+    var confirmed: Bool
+    var state_hash: UInt64
+    var data: List[UInt8]
+
+    def __init__(out self, tick: Int = -1, confirmed: Bool = False, state_hash: UInt64 = 0):
+        self.tick = tick
+        self.confirmed = confirmed
+        self.state_hash = state_hash
+        self.data = List[UInt8]()
+
+
+struct RollbackPeer(Movable):
+    """GGPO-style up-to-4-player non-blocking UDP rollback peer:
+    - Zero-input-delay local execution using last-confirmed remote input prediction
+    - Automatic misprediction detection (`rollback_from_tick >= 0`) when late UDP packets arrive
+    - Ring-buffer authoritative state snapshots (`save_snapshot` / `restore_snapshot_at_or_before`)
+    - 4-way FNV-64 state-hash desync verification on confirmed ticks."""
+    var fd: Int
+    var local_port: Int
+    var local_slot: Int
+    var player_count: Int
+    var endpoints: List[RollbackEndpoint]
+    var history: List[List[RollbackInputSlot]]
+    var last_confirmed_input: List[List[UInt8]]
+    var snapshots: List[RollbackSnapshot]
+    var packets_sent: Int
+    var packets_received: Int
+    var rollbacks_triggered: Int
+    var rollback_from_tick: Int
+    var desync_detected: Bool
+    var desync_tick: Int
+
+    def __init__(out self, local_slot: Int = 0, player_count: Int = 2, default_input_len: Int = 12):
+        self.fd = -1
+        self.local_port = 0
+        self.local_slot = max(0, min(MAX_ROLLBACK_PLAYERS - 1, local_slot))
+        self.player_count = max(1, min(MAX_ROLLBACK_PLAYERS, player_count))
+        self.endpoints = List[RollbackEndpoint]()
+        self.history = List[List[RollbackInputSlot]]()
+        self.last_confirmed_input = List[List[UInt8]]()
+        for _ in range(MAX_ROLLBACK_PLAYERS):
+            self.endpoints.append(RollbackEndpoint())
+            self.history.append(List[RollbackInputSlot]())
+            self.last_confirmed_input.append(List[UInt8](length=max(1, default_input_len), fill=0))
+        self.snapshots = List[RollbackSnapshot]()
+        self.packets_sent = 0
+        self.packets_received = 0
+        self.rollbacks_triggered = 0
+        self.rollback_from_tick = -1
+        self.desync_detected = False
+        self.desync_tick = -1
+
+    def open(mut self, bind_port: Int = 0, loopback_only: Bool = False) -> Bool:
+        self.close()
+        var res = udp_open_nonblocking(bind_port, loopback_only)
+        self.fd = res[0]
+        self.local_port = res[1]
+        return self.fd >= 0
+
+    def close(mut self):
+        if self.fd >= 0:
+            close_fd(self.fd)
+            self.fd = -1
+            self.local_port = 0
+
+    def set_remote_endpoint(mut self, slot: Int, ip_a: Int, ip_b: Int, ip_c: Int, ip_d: Int, port: Int):
+        if slot < 0 or slot >= MAX_ROLLBACK_PLAYERS or slot == self.local_slot:
+            return
+        self.endpoints[slot] = RollbackEndpoint(ip_a, ip_b, ip_c, ip_d, port, port > 0)
+        if slot >= self.player_count:
+            self.player_count = slot + 1
+
+    @staticmethod
+    def _inputs_equal(a: List[UInt8], b: List[UInt8]) -> Bool:
+        if len(a) != len(b):
+            return False
+        for i in range(len(a)):
+            if a[i] != b[i]:
+                return False
+        return True
+
+    def _find_slot_entry(self, player: Int, tick: Int) -> Int:
+        for i in range(len(self.history[player])):
+            if self.history[player][i].tick == tick:
+                return i
+        return -1
+
+    def _upsert_slot_entry(mut self, player: Int, tick: Int, confirmed: Bool, state_hash: UInt64, data: List[UInt8]):
+        var idx = self._find_slot_entry(player, tick)
+        if idx >= 0:
+            self.history[player][idx].confirmed = confirmed
+            if state_hash != 0:
+                self.history[player][idx].state_hash = state_hash
+            self.history[player][idx].data = data.copy()
+            return
+        if len(self.history[player]) >= MAX_ROLLBACK_WINDOW * 2:
+            _ = self.history[player].pop(0)
+        var entry = RollbackInputSlot(tick, confirmed, state_hash)
+        entry.data = data.copy()
+        self.history[player].append(entry^)
+
+    def _verify_confirmed_hashes(mut self, tick: Int):
+        var local_idx = self._find_slot_entry(self.local_slot, tick)
+        if local_idx < 0:
+            return
+        var lh = self.history[self.local_slot][local_idx].state_hash
+        if lh == 0:
+            return
+        for p in range(self.player_count):
+            if p == self.local_slot:
+                continue
+            var r_idx = self._find_slot_entry(p, tick)
+            if r_idx >= 0 and self.history[p][r_idx].confirmed:
+                var rh = self.history[p][r_idx].state_hash
+                if rh != 0 and rh != lh:
+                    self.desync_detected = True
+                    if self.desync_tick < 0 or tick < self.desync_tick:
+                        self.desync_tick = tick
+
+    def save_snapshot(mut self, tick: Int, state_hash: UInt64, state_bytes: List[UInt8]):
+        var local_idx = self._find_slot_entry(self.local_slot, tick)
+        if local_idx >= 0 and state_hash != 0:
+            self.history[self.local_slot][local_idx].state_hash = state_hash
+            self._verify_confirmed_hashes(tick)
+        for i in range(len(self.snapshots)):
+            if self.snapshots[i].tick == tick:
+                self.snapshots[i].state_hash = state_hash
+                self.snapshots[i].state_bytes = state_bytes.copy()
+                return
+        if len(self.snapshots) >= MAX_ROLLBACK_WINDOW:
+            _ = self.snapshots.pop(0)
+        var snap = RollbackSnapshot(tick, state_hash)
+        snap.state_bytes = state_bytes.copy()
+        self.snapshots.append(snap^)
+
+    def restore_snapshot_at_or_before(self, target_tick: Int) -> Tuple[Int, List[UInt8]]:
+        var best_idx = -1
+        var best_tick = -1
+        for i in range(len(self.snapshots)):
+            var st = self.snapshots[i].tick
+            if st <= target_tick and st > best_tick:
+                best_tick = st
+                best_idx = i
+        if best_idx >= 0:
+            return (best_tick, self.snapshots[best_idx].state_bytes.copy())
+        return (-1, List[UInt8]())
+
+    def broadcast_local_input(mut self, tick: Int, state_hash: UInt64, local_input: List[UInt8]) -> Int:
+        self._upsert_slot_entry(self.local_slot, tick, True, state_hash, local_input)
+        self.last_confirmed_input[self.local_slot] = local_input.copy()
+        self._verify_confirmed_hashes(tick)
+        if self.fd < 0:
+            return 0
+        var ilen = min(220, len(local_input))
+        var pkt = List[UInt8](capacity=20 + ilen)
+        var m = ROLLBACK_MAGIC
+        for s in range(4):
+            pkt.append(UInt8((m >> UInt32(s * 8)) & 255))
+        pkt.append(UInt8(self.local_slot & 255))
+        pkt.append(UInt8(ilen & 255))
+        pkt.append(0)
+        pkt.append(0)
+        var t32 = UInt32(tick)
+        for s in range(4):
+            pkt.append(UInt8((t32 >> UInt32(s * 8)) & 255))
+        for s in range(8):
+            pkt.append(UInt8((state_hash >> UInt64(s * 8)) & 255))
+        for i in range(ilen):
+            pkt.append(local_input[i])
+        var sent_peers = 0
+        for p in range(self.player_count):
+            if p == self.local_slot or not self.endpoints[p].active:
+                continue
+            var ep = self.endpoints[p]
+            if udp_send_ipv4(self.fd, ep.ip_a, ep.ip_b, ep.ip_c, ep.ip_d, ep.port, pkt) == len(pkt):
+                self.packets_sent += 1
+                sent_peers += 1
+        return sent_peers
+
+    def poll_incoming(mut self) -> Int:
+        if self.fd < 0:
+            return 0
+        var count = 0
+        for _ in range(64):
+            var raw = udp_recv_nonblocking(self.fd, 512)
+            if len(raw) < 20:
+                break
+            var magic = (
+                UInt32(raw[0])
+                | (UInt32(raw[1]) << 8)
+                | (UInt32(raw[2]) << 16)
+                | (UInt32(raw[3]) << 24)
+            )
+            if magic != ROLLBACK_MAGIC:
+                continue
+            var sender = Int(raw[4])
+            var ilen = Int(raw[5])
+            if sender < 0 or sender >= self.player_count or sender == self.local_slot or 20 + ilen > len(raw):
+                continue
+            var tick = Int(
+                UInt32(raw[8])
+                | (UInt32(raw[9]) << 8)
+                | (UInt32(raw[10]) << 16)
+                | (UInt32(raw[11]) << 24)
+            )
+            var r_hash = UInt64(0)
+            for s in range(8):
+                r_hash |= UInt64(raw[12 + s]) << UInt64(s * 8)
+            var inp = List[UInt8](capacity=ilen)
+            for i in range(ilen):
+                inp.append(raw[20 + i])
+            self.packets_received += 1
+            count += 1
+            self.receive_authoritative_input(sender, tick, r_hash, inp)
+        return count
+
+    def receive_authoritative_input(mut self, sender: Int, tick: Int, r_hash: UInt64, inp: List[UInt8]):
+        if sender < 0 or sender >= self.player_count or sender == self.local_slot:
+            return
+        var existing_idx = self._find_slot_entry(sender, tick)
+        if existing_idx >= 0 and not self.history[sender][existing_idx].confirmed:
+            if not Self._inputs_equal(self.history[sender][existing_idx].data, inp):
+                if self.rollback_from_tick < 0 or tick < self.rollback_from_tick:
+                    self.rollback_from_tick = tick
+                self.rollbacks_triggered += 1
+        self._upsert_slot_entry(sender, tick, True, r_hash, inp)
+        self.last_confirmed_input[sender] = inp.copy()
+        self._verify_confirmed_hashes(tick)
+
+    def gather_tick_inputs(mut self, tick: Int) -> List[List[UInt8]]:
+        """Returns 1 input byte-vector per active player `[0 .. player_count-1]` for `tick`.
+        Remote slots without a confirmed packet for `tick` predict from `last_confirmed_input`."""
+        _ = self.poll_incoming()
+        var out = List[List[UInt8]]()
+        for p in range(self.player_count):
+            var idx = self._find_slot_entry(p, tick)
+            if idx >= 0:
+                out.append(self.history[p][idx].data.copy())
+            else:
+                var pred = self.last_confirmed_input[p].copy()
+                self._upsert_slot_entry(p, tick, p == self.local_slot, 0, pred)
+                out.append(pred^)
+        return out^
+
+    def consume_rollback_tick(mut self) -> Int:
+        var t = self.rollback_from_tick
+        self.rollback_from_tick = -1
+        return t

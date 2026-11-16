@@ -218,6 +218,8 @@ def encode_native_glb(mut model: NativeModel) -> List[UInt8]:
             + ', "alphaMode": ' + json_quote(alpha_str)
             + ', "doubleSided": ' + ("true" if mesh.double_sided else "false")
         )
+        if mesh.normal_orm_texture >= 0 and mesh.normal_orm_texture < len(textures_json):
+            mat_str += ', "normalTexture": {"index": ' + String(mesh.normal_orm_texture) + "}"
         if mesh.emissive_strength > 0.0001:
             var ef = mesh.emissive_color
             var em_max = max(Float32(0.0001), max(ef.x, max(ef.y, ef.z)))

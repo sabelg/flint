@@ -31,8 +31,9 @@ comptime Call10 = def(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) thin abi
 comptime Lookup = def(Int, Int) thin abi("C") -> Int
 comptime DebugCallback = def(UInt32, UInt32, Int, Int) thin abi("C") -> UInt32
 
-comptime ARENA_BYTES: Int = 256 * 1024
+comptime ARENA_BYTES: Int = 512 * 1024
 comptime API_VERSION_1_2: UInt32 = (1 << 22) | (2 << 12)
+comptime API_VERSION_1_3: UInt32 = (1 << 22) | (3 << 12)
 comptime SUCCESS: Int32 = 0
 comptime TIMEOUT: Int32 = 2
 comptime WAIT_TIMEOUT_NS: Int = 2000000000
@@ -136,6 +137,176 @@ comptime ACQUIRE_TIMEOUT_NS: Int = 34000000
 
 comptime GLOBAL_LOAD_LAZY: Int32 = 1
 comptime GLOBAL_LOAD_LOCAL: Int32 = 0
+
+# ============================================================================
+# Vulkan 1.3 AAA Graphics, Bindless BC7/BC5/BC6H, Sync2 & Ray-Query Constants
+# ============================================================================
+comptime TYPE_IMAGE_CREATE_INFO: UInt32 = 14
+comptime TYPE_IMAGE_VIEW_CREATE_INFO: UInt32 = 15
+comptime TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO: UInt32 = 19
+comptime TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO: UInt32 = 20
+comptime TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO: UInt32 = 22
+comptime TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO: UInt32 = 23
+comptime TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO: UInt32 = 24
+comptime TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO: UInt32 = 25
+comptime TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: UInt32 = 26
+comptime TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO: UInt32 = 27
+comptime TYPE_GRAPHICS_PIPELINE_CREATE_INFO: UInt32 = 28
+comptime TYPE_SAMPLER_CREATE_INFO: UInt32 = 31
+comptime TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: UInt32 = 51
+comptime TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: UInt32 = 53
+comptime TYPE_PHYSICAL_DEVICE_FEATURES_2: UInt32 = 1000059000
+comptime TYPE_MEMORY_ALLOCATE_FLAGS_INFO: UInt32 = 1000060000
+comptime TYPE_RENDERING_INFO: UInt32 = 1000044000
+comptime TYPE_RENDERING_ATTACHMENT_INFO: UInt32 = 1000044001
+comptime TYPE_PIPELINE_RENDERING_CREATE_INFO: UInt32 = 1000044002
+comptime TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO: UInt32 = 1000161000
+comptime TYPE_BUFFER_DEVICE_ADDRESS_INFO: UInt32 = 1000244001
+comptime TYPE_MEMORY_BARRIER_2: UInt32 = 1000314000
+comptime TYPE_IMAGE_MEMORY_BARRIER_2: UInt32 = 1000314002
+comptime TYPE_DEPENDENCY_INFO: UInt32 = 1000314003
+
+comptime TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR: UInt32 = 1000150000
+comptime TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR: UInt32 = 1000150002
+comptime TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR: UInt32 = 1000150004
+comptime TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR: UInt32 = 1000150005
+comptime TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR: UInt32 = 1000150006
+comptime TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR: UInt32 = 1000150007
+comptime TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR: UInt32 = 1000150013
+comptime TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR: UInt32 = 1000150017
+comptime TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR: UInt32 = 1000150020
+comptime TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR: UInt32 = 1000348013
+
+comptime FORMAT_R8G8B8A8_UNORM: UInt32 = 37
+comptime FORMAT_R16G16_SFLOAT: UInt32 = 83
+comptime FORMAT_R16G16B16A16_SFLOAT: UInt32 = 97
+comptime FORMAT_R32_UINT: UInt32 = 98
+comptime FORMAT_R32_SFLOAT: UInt32 = 100
+comptime FORMAT_R32G32_UINT: UInt32 = 101
+comptime FORMAT_R32G32B32_SFLOAT: UInt32 = 106
+comptime FORMAT_R32G32B32A32_UINT: UInt32 = 107
+comptime FORMAT_D32_SFLOAT: UInt32 = 126
+comptime FORMAT_BC5_UNORM: UInt32 = 141
+comptime FORMAT_BC6H_UFLOAT: UInt32 = 143
+comptime FORMAT_BC7_UNORM: UInt32 = 145
+comptime FORMAT_BC7_SRGB: UInt32 = 146
+
+comptime IMAGE_USAGE_TRANSFER_SRC: UInt32 = 1
+comptime IMAGE_USAGE_SAMPLED: UInt32 = 4
+comptime IMAGE_USAGE_STORAGE: UInt32 = 8
+comptime IMAGE_USAGE_COLOR_ATTACHMENT: UInt32 = 16
+comptime IMAGE_USAGE_DEPTH_ATTACHMENT: UInt32 = 32
+comptime IMAGE_CREATE_CUBE_COMPATIBLE: UInt32 = 16
+comptime IMAGE_VIEW_TYPE_2D: UInt32 = 1
+comptime IMAGE_VIEW_TYPE_CUBE: UInt32 = 3
+comptime ASPECT_DEPTH: UInt32 = 2
+
+comptime LAYOUT_GENERAL: UInt32 = 1
+comptime LAYOUT_COLOR_ATTACHMENT: UInt32 = 2
+comptime LAYOUT_DEPTH_ATTACHMENT: UInt32 = 3
+comptime LAYOUT_SHADER_READ_ONLY: UInt32 = 5
+comptime LAYOUT_TRANSFER_SRC: UInt32 = 6
+
+comptime STAGE_VERTEX_SHADER: UInt32 = 0x1
+comptime STAGE_FRAGMENT_SHADER: UInt32 = 0x10
+comptime STAGE_ALL_GRAPHICS: UInt32 = 0x1F
+comptime STAGE_ALL_SHADERS: UInt32 = 0x31
+comptime BIND_POINT_GRAPHICS: Int = 0
+
+comptime PIPELINE_COLOR_ATTACHMENT_OUTPUT: Int = 0x400
+comptime PIPELINE_EARLY_FRAGMENT_TESTS: Int = 0x100
+comptime PIPELINE_LATE_FRAGMENT_TESTS: Int = 0x200
+comptime PIPELINE_FRAGMENT_SHADER: Int = 0x80
+comptime PIPELINE_VERTEX_SHADER: Int = 0x8
+comptime PIPELINE_AS_BUILD_KHR: Int = 0x2000000
+
+comptime ACCESS_COLOR_ATTACHMENT_WRITE: UInt32 = 0x100
+comptime ACCESS_DEPTH_ATTACHMENT_READ: UInt32 = 0x200
+comptime ACCESS_DEPTH_ATTACHMENT_WRITE: UInt32 = 0x400
+comptime ACCESS_AS_READ_KHR: UInt32 = 0x200000
+comptime ACCESS_AS_WRITE_KHR: UInt32 = 0x400000
+
+comptime DESCRIPTOR_COMBINED_IMAGE_SAMPLER: UInt32 = 1
+comptime DESCRIPTOR_STORAGE_IMAGE: UInt32 = 3
+comptime DESCRIPTOR_ACCELERATION_STRUCTURE_KHR: UInt32 = 1000150000
+comptime DESCRIPTOR_BINDING_UPDATE_AFTER_BIND: UInt32 = 1
+comptime DESCRIPTOR_BINDING_PARTIALLY_BOUND: UInt32 = 4
+comptime DESCRIPTOR_LAYOUT_UPDATE_AFTER_BIND_POOL: UInt32 = 2
+comptime DESCRIPTOR_POOL_UPDATE_AFTER_BIND: UInt32 = 2
+
+comptime COMPARE_LESS_OR_EQUAL: UInt32 = 3
+comptime COMPARE_GREATER_OR_EQUAL: UInt32 = 6
+comptime COMPARE_ALWAYS: UInt32 = 7
+comptime LOAD_OP_LOAD: UInt32 = 0
+comptime LOAD_OP_CLEAR: UInt32 = 1
+comptime STORE_OP_STORE: UInt32 = 0
+comptime TOPOLOGY_TRIANGLE_LIST: UInt32 = 3
+comptime CULL_MODE_NONE: UInt32 = 0
+comptime CULL_MODE_BACK: UInt32 = 2
+comptime FRONT_FACE_CCW: UInt32 = 0
+comptime SAMPLE_COUNT_1: UInt32 = 1
+comptime FILTER_NEAREST: UInt32 = 0
+comptime FILTER_LINEAR: UInt32 = 1
+comptime SAMPLER_MIPMAP_LINEAR: UInt32 = 1
+comptime ADDRESS_MODE_REPEAT: UInt32 = 0
+comptime ADDRESS_MODE_CLAMP_TO_EDGE: UInt32 = 2
+comptime DYNAMIC_STATE_VIEWPORT: UInt32 = 0
+comptime DYNAMIC_STATE_SCISSOR: UInt32 = 1
+
+comptime MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT: UInt32 = 2
+comptime BUFFER_USAGE_INDEX: UInt32 = 64
+comptime BUFFER_USAGE_VERTEX: UInt32 = 128
+comptime BUFFER_USAGE_DEVICE_ADDRESS: UInt32 = 131072
+comptime BUFFER_USAGE_AS_BUILD_INPUT_KHR: UInt32 = 524288
+comptime BUFFER_USAGE_AS_STORAGE_KHR: UInt32 = 1048576
+
+comptime AS_TYPE_TOP_LEVEL_KHR: UInt32 = 0
+comptime AS_TYPE_BOTTOM_LEVEL_KHR: UInt32 = 1
+comptime GEOMETRY_TYPE_TRIANGLES_KHR: UInt32 = 0
+comptime GEOMETRY_TYPE_INSTANCES_KHR: UInt32 = 2
+comptime GEOMETRY_OPAQUE_BIT_KHR: UInt32 = 1
+comptime BUILD_AS_PREFER_FAST_TRACE_KHR: UInt32 = 4
+comptime BUILD_AS_MODE_BUILD_KHR: UInt32 = 0
+comptime BUILD_AS_TYPE_DEVICE_KHR: Int = 1
+comptime INDEX_TYPE_UINT32: UInt32 = 1
+
+
+def put_float(address: Int, value: Float32):
+    Pointer[Float32, origin=MutAnyOrigin](unsafe_from_address=address)[unsafe_offset=0] = value
+
+
+struct VulkanImage(Copyable, Movable):
+    var image: Int
+    var view: Int
+    var memory: Int
+    var format: UInt32
+    var width: Int
+    var height: Int
+    var mip_levels: Int
+    var layers: Int
+    var layout: UInt32
+
+    def __init__(out self):
+        self.image = 0
+        self.view = 0
+        self.memory = 0
+        self.format = 0
+        self.width = 0
+        self.height = 0
+        self.mip_levels = 1
+        self.layers = 1
+        self.layout = LAYOUT_UNDEFINED
+
+
+struct VulkanAccelStruct(Copyable, Movable):
+    var handle: Int
+    var buffer: GpuBuffer
+    var device_address: UInt64
+
+    def __init__(out self):
+        self.handle = 0
+        self.buffer = GpuBuffer()
+        self.device_address = 0
 
 
 def put32(address: Int, value: UInt32):
@@ -256,6 +427,14 @@ struct VulkanGpu(Copyable, Movable):
     var has_calibration: Bool
     var has_swapchain: Bool
     var has_wayland_surface: Bool
+    var api_version: UInt32
+    var has_vulkan_13: Bool
+    var has_dynamic_rendering: Bool
+    var has_descriptor_indexing: Bool
+    var has_sync2: Bool
+    var has_bda: Bool
+    var has_draw_indirect_count: Bool
+    var has_ray_query: Bool
     var timeline: Int
     # The side queue, for work beside the frames (GPU meshing): a compute-only
     # family if the driver has one, else a second queue of the main family, else
@@ -335,6 +514,14 @@ struct VulkanGpu(Copyable, Movable):
         self.has_calibration = False
         self.has_swapchain = False
         self.has_wayland_surface = False
+        self.api_version = API_VERSION_1_2
+        self.has_vulkan_13 = False
+        self.has_dynamic_rendering = False
+        self.has_descriptor_indexing = False
+        self.has_sync2 = False
+        self.has_bda = False
+        self.has_draw_indirect_count = False
+        self.has_ray_query = False
         self.timeline = 0
         self.side_family = 0
         self.side_index = -1
@@ -525,9 +712,9 @@ struct VulkanGpu(Copyable, Movable):
         self.rewind()
         var application = self.scratch(48)
         put32(application, TYPE_APPLICATION_INFO)
-        put64(application + 16, self.text("Sharddepth"))
-        put64(application + 32, self.text("Sharddepth"))
-        put32(application + 44, API_VERSION_1_2)
+        put64(application + 16, self.text("FlintEngine"))
+        put64(application + 32, self.text("FlintEngine"))
+        put32(application + 44, API_VERSION_1_3)
         var info = self.scratch(64)
         put32(info, TYPE_INSTANCE_CREATE_INFO)
         put64(info + 24, application)
@@ -573,19 +760,26 @@ struct VulkanGpu(Copyable, Movable):
         var devices = self.scratch(count * 8)
         if not self.check(call3(enumerate_devices, self.instance, count_slot, devices), "vkEnumeratePhysicalDevices"):
             return False
+        var force_cpu = env_flag("FLINT_VULKAN_LLVMPIPE")
         var properties = self.scratch(DEVICE_PROPERTIES_BYTES)
         var best_rank = 0
         for index in range(count):
             _ = call2(get_properties, get64(devices + index * 8), properties)
             var api = get32(properties)
             var kind = get32(properties + 16)
-            # Software rasterizers rank nothing: this game already has a better one.
-            var rank = 3 if kind == DEVICE_TYPE_DISCRETE else (2 if kind == DEVICE_TYPE_VIRTUAL else (1 if kind == DEVICE_TYPE_INTEGRATED else 0))
+            var rank = (
+                4
+                if kind == DEVICE_TYPE_DISCRETE
+                else (3 if kind == DEVICE_TYPE_VIRTUAL else (2 if kind == DEVICE_TYPE_INTEGRATED else 1))
+            )
+            if force_cpu and kind == 4:
+                rank = 10
             if api < API_VERSION_1_2:
                 rank = 0
             if rank > best_rank:
                 best_rank = rank
                 self.physical = get64(devices + index * 8)
+                self.api_version = api
                 self.device_type = kind
                 self.device_name = c_string(properties + 20)
                 self.timestamps = get32(properties + LIMIT_TIMESTAMP_COMPUTE) != 0
@@ -650,6 +844,16 @@ struct VulkanGpu(Copyable, Movable):
         if "VK_KHR_swapchain" in offered:
             extensions.append("VK_KHR_swapchain")
             self.has_swapchain = True
+        var want_rt = (
+            self.device_type != 4
+            and "VK_KHR_acceleration_structure" in offered
+            and "VK_KHR_ray_query" in offered
+            and "VK_KHR_deferred_host_operations" in offered
+        )
+        if want_rt:
+            extensions.append("VK_KHR_deferred_host_operations")
+            extensions.append("VK_KHR_acceleration_structure")
+            extensions.append("VK_KHR_ray_query")
         self.rewind()
         var priority = self.scratch(8)
         put32(priority, 0x3F800000)  # 1.0
@@ -665,12 +869,88 @@ struct VulkanGpu(Copyable, Movable):
             put32(queue_info + 60, self.side_family)
             put32(queue_info + 64, 1)
             put64(queue_info + 72, priority)
-        var timeline_feature = self.scratch(24)
-        put32(timeline_feature, TYPE_TIMELINE_SEMAPHORE_FEATURES)
-        put32(timeline_feature + 16, 1)
+
+        var pnext_head: Int
+        if self.api_version >= API_VERSION_1_3:
+            self.has_vulkan_13 = True
+            # Query exact supported Vulkan 1.0 + 1.2 + 1.3 + RayQuery features first
+            var q_feat2 = self.scratch(240)
+            var q_vk12 = self.scratch(208)
+            var q_vk13 = self.scratch(80)
+            var q_as = self.scratch(40)
+            var q_rq = self.scratch(24)
+            put32(q_feat2, TYPE_PHYSICAL_DEVICE_FEATURES_2)
+            put64(q_feat2 + 8, q_vk12)
+            put32(q_vk12, TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+            put64(q_vk12 + 8, q_vk13)
+            put32(q_vk13, TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
+            if want_rt:
+                put64(q_vk13 + 8, q_as)
+                put32(q_as, TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR)
+                put64(q_as + 8, q_rq)
+                put32(q_rq, TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR)
+            var get_feat2 = self.instance_call("vkGetPhysicalDeviceFeatures2")
+            if get_feat2 != 0:
+                _ = call2(get_feat2, self.physical, q_feat2)
+
+            # Build clean enabled-features chain containing only the exact AAA features supported
+            var feat2 = self.scratch(240)
+            var vk12 = self.scratch(208)
+            var vk13 = self.scratch(80)
+            put32(feat2, TYPE_PHYSICAL_DEVICE_FEATURES_2)
+            put64(feat2 + 8, vk12)
+            put32(vk12, TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+            put64(vk12 + 8, vk13)
+            put32(vk13, TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
+
+            # Core 1.0 features: multiDrawIndirect (16+36=52), samplerAnisotropy (16+76=92), fragmentStoresAndAtomics (16+104=120)
+            put32(feat2 + 16 + 36, get32(q_feat2 + 16 + 36))
+            put32(feat2 + 16 + 76, get32(q_feat2 + 16 + 76))
+            put32(feat2 + 16 + 104, get32(q_feat2 + 16 + 104))
+
+            # Vulkan 1.2 features
+            put32(vk12 + 20, get32(q_vk12 + 20))   # drawIndirectCount
+            put32(vk12 + 52, get32(q_vk12 + 52))   # descriptorIndexing
+            put32(vk12 + 72, get32(q_vk12 + 72))   # shaderSampledImageArrayNonUniformIndexing
+            put32(vk12 + 100, get32(q_vk12 + 100)) # descriptorBindingSampledImageUpdateAfterBind
+            put32(vk12 + 108, get32(q_vk12 + 108)) # descriptorBindingStorageBufferUpdateAfterBind
+            put32(vk12 + 124, get32(q_vk12 + 124)) # descriptorBindingPartiallyBound
+            put32(vk12 + 132, get32(q_vk12 + 132)) # runtimeDescriptorArray
+            put32(vk12 + 140, get32(q_vk12 + 140)) # scalarBlockLayout
+            put32(vk12 + 164, 1)                   # timelineSemaphore
+            put32(vk12 + 168, get32(q_vk12 + 168)) # bufferDeviceAddress
+
+            self.has_draw_indirect_count = get32(vk12 + 20) != 0
+            self.has_descriptor_indexing = get32(vk12 + 52) != 0 and get32(vk12 + 72) != 0
+            self.has_bda = get32(vk12 + 168) != 0
+
+            # Vulkan 1.3 features
+            put32(vk13 + 52, get32(q_vk13 + 52))   # synchronization2
+            put32(vk13 + 64, get32(q_vk13 + 64))   # dynamicRendering
+            put32(vk13 + 72, get32(q_vk13 + 72))   # maintenance4
+            self.has_sync2 = get32(vk13 + 52) != 0
+            self.has_dynamic_rendering = get32(vk13 + 64) != 0
+
+            if want_rt and get32(q_as + 16) != 0 and get32(q_rq + 16) != 0 and self.has_bda:
+                var as_f = self.scratch(40)
+                var rq_f = self.scratch(24)
+                put32(as_f, TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR)
+                put32(as_f + 16, 1)
+                put64(as_f + 8, rq_f)
+                put32(rq_f, TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR)
+                put32(rq_f + 16, 1)
+                put64(vk13 + 8, as_f)
+                self.has_ray_query = True
+            pnext_head = feat2
+        else:
+            var timeline_feature = self.scratch(24)
+            put32(timeline_feature, TYPE_TIMELINE_SEMAPHORE_FEATURES)
+            put32(timeline_feature + 16, 1)
+            pnext_head = timeline_feature
+
         var info = self.scratch(72)
         put32(info, TYPE_DEVICE_CREATE_INFO)
-        put64(info + 8, timeline_feature)
+        put64(info + 8, pnext_head)
         put32(info + 20, UInt32(2) if separate_side else UInt32(1))
         put64(info + 24, queue_info)
         put32(info + 48, UInt32(len(extensions)))
@@ -1489,3 +1769,1059 @@ struct VulkanGpu(Copyable, Movable):
             _ = call3(self.instance_call("vkDestroyDebugUtilsMessengerEXT"), self.instance, self.messenger, 0)
         _ = call2(self.instance_call("vkDestroyInstance"), self.instance, 0)
         self.instance = 0
+
+    # ========================================================================
+    # Vulkan 1.3 AAA Hardware Graphics, Bindless Images, Sync2 & Ray Tracing
+    # ========================================================================
+
+    def create_buffer_bda(
+        mut self,
+        size: Int,
+        extra_usage: UInt32 = 0,
+        host_visible: Bool = True,
+        cpu_reads: Bool = False,
+    ) -> GpuBuffer:
+        """Allocates a buffer with optional `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` + `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`."""
+        self.rewind()
+        var rounded = max(4096, (size + 4095) & ~4095)
+        var use_bda = self.has_bda and ((extra_usage & BUFFER_USAGE_DEVICE_ADDRESS) != 0)
+        var info = self.scratch(56)
+        put32(info, TYPE_BUFFER_CREATE_INFO)
+        put64(info + 24, rounded)
+        put32(info + 32, BUFFER_USAGE | extra_usage)
+        var slot = self.scratch(8)
+        if call4(self.fn_create_buffer, self.device, info, 0, slot) != SUCCESS:
+            _ = self.fail("vkCreateBuffer (BDA) failed")
+            return GpuBuffer()
+        var buffer = get64(slot)
+        var requirements = self.scratch(24)
+        _ = call3(self.fn_get_buffer_requirements, self.device, buffer, requirements)
+        var needed = get64(requirements)
+        var allowed = get32(requirements + 16)
+
+        var alloc_flags = 0
+        if use_bda:
+            alloc_flags = self.scratch(24)
+            put32(alloc_flags, TYPE_MEMORY_ALLOCATE_FLAGS_INFO)
+            put32(alloc_flags + 16, MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+
+        var memory = 0
+        var extras = ~(MEMORY_DEVICE_LOCAL | MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT | MEMORY_HOST_CACHED)
+        if not host_visible:
+            var dev_only = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, extras & ~MEMORY_HOST_VISIBLE & ~MEMORY_HOST_COHERENT)
+            if dev_only < 0:
+                dev_only = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, 0)
+            if dev_only >= 0:
+                memory = self.allocation(needed, dev_only, alloc_flags)
+        if memory == 0:
+            var host = MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT
+            var mt = self.memory_type(allowed, host | (MEMORY_HOST_CACHED if cpu_reads else MEMORY_DEVICE_LOCAL), extras)
+            if mt < 0:
+                mt = self.memory_type(allowed, host, extras)
+            if mt < 0:
+                mt = self.memory_type(allowed, host, 0)
+            if mt >= 0:
+                memory = self.allocation(needed, mt, alloc_flags)
+        if memory == 0:
+            _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
+            _ = self.fail("no memory for BDA buffer")
+            return GpuBuffer()
+        if call4(self.fn_bind_buffer_memory, self.device, buffer, memory, 0) != SUCCESS:
+            _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
+            _ = call3(self.fn_free_memory, self.device, memory, 0)
+            return GpuBuffer()
+        var cpu_addr = 0
+        if host_visible:
+            if call6(self.fn_map_memory, self.device, memory, 0, WHOLE_SIZE, 0, slot) == SUCCESS:
+                cpu_addr = get64(slot)
+        var out = GpuBuffer(0, rounded, 0, cpu_addr)
+        out.vk_buffer = buffer
+        out.vk_memory = memory
+        return out^
+
+    def buffer_device_address(mut self, buffer: GpuBuffer) -> UInt64:
+        if not self.has_bda or buffer.vk_buffer == 0:
+            return 0
+        self.rewind()
+        var info = self.scratch(24)
+        put32(info, TYPE_BUFFER_DEVICE_ADDRESS_INFO)
+        put64(info + 16, buffer.vk_buffer)
+        var fn_bda = self.device_call("vkGetBufferDeviceAddress")
+        if fn_bda == 0:
+            return 0
+        # vkGetBufferDeviceAddress returns uint64_t in x0/rax!
+        comptime CallBDA = def(Int, Int) thin abi("C") -> UInt64
+        var slot = fn_bda
+        return Pointer(to=slot).unsafe_bitcast[CallBDA]()[unsafe_offset=0](self.device, info)
+
+    def create_image_2d(
+        mut self,
+        width: Int,
+        height: Int,
+        format: UInt32,
+        usage: UInt32,
+        mip_levels: Int = 1,
+        cube: Bool = False,
+    ) -> VulkanImage:
+        """Creates an optimal-tiled 2D or 6-face Cubemap `VkImage` + `VkDeviceMemory` + `VkImageView`."""
+        var out = VulkanImage()
+        self.rewind()
+        var layers = 6 if cube else 1
+        var info = self.scratch(88)
+        put32(info, TYPE_IMAGE_CREATE_INFO)
+        if cube:
+            put32(info + 16, IMAGE_CREATE_CUBE_COMPATIBLE)
+        put32(info + 20, 1)  # VK_IMAGE_TYPE_2D
+        put32(info + 24, format)
+        put32(info + 28, UInt32(width))
+        put32(info + 32, UInt32(height))
+        put32(info + 36, 1)
+        put32(info + 40, UInt32(max(1, mip_levels)))
+        put32(info + 44, UInt32(layers))
+        put32(info + 48, SAMPLE_COUNT_1)
+        put32(info + 52, 0)  # VK_IMAGE_TILING_OPTIMAL
+        put32(info + 56, usage)
+        put32(info + 80, LAYOUT_UNDEFINED)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateImage"), self.device, info, 0, slot), "vkCreateImage"):
+            return out^
+        var img = get64(slot)
+        var req = self.scratch(24)
+        _ = call3(self.device_call("vkGetImageMemoryRequirements"), self.device, img, req)
+        var needed = get64(req)
+        var allowed = get32(req + 16)
+        var mt = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, 0)
+        if mt < 0:
+            mt = self.memory_type(allowed, 0, 0)
+        if mt < 0:
+            _ = call3(self.device_call("vkDestroyImage"), self.device, img, 0)
+            _ = self.fail("no memory type for VkImage")
+            return out^
+        var mem = self.allocation(needed, mt, 0)
+        if mem == 0 or call4(self.device_call("vkBindImageMemory"), self.device, img, mem, 0) != SUCCESS:
+            _ = call3(self.device_call("vkDestroyImage"), self.device, img, 0)
+            if mem != 0:
+                _ = call3(self.fn_free_memory, self.device, mem, 0)
+            _ = self.fail("VkImage allocation/bind failed")
+            return out^
+        var aspect = ASPECT_DEPTH if format == FORMAT_D32_SFLOAT else ASPECT_COLOR
+        var view_info = self.scratch(80)
+        put32(view_info, TYPE_IMAGE_VIEW_CREATE_INFO)
+        put64(view_info + 24, img)
+        put32(view_info + 32, IMAGE_VIEW_TYPE_CUBE if cube else IMAGE_VIEW_TYPE_2D)
+        put32(view_info + 36, format)
+        put32(view_info + 56, aspect)
+        put32(view_info + 60, 0)
+        put32(view_info + 64, UInt32(max(1, mip_levels)))
+        put32(view_info + 68, 0)
+        put32(view_info + 72, UInt32(layers))
+        if not self.check(call4(self.device_call("vkCreateImageView"), self.device, view_info, 0, slot), "vkCreateImageView"):
+            _ = call3(self.device_call("vkDestroyImage"), self.device, img, 0)
+            _ = call3(self.fn_free_memory, self.device, mem, 0)
+            return out^
+        out.image = img
+        out.view = get64(slot)
+        out.memory = mem
+        out.format = format
+        out.width = width
+        out.height = height
+        out.mip_levels = max(1, mip_levels)
+        out.layers = layers
+        out.layout = LAYOUT_UNDEFINED
+        return out^
+
+    def destroy_image(mut self, mut img: VulkanImage):
+        if img.view != 0:
+            self.rewind()
+            _ = call3(self.device_call("vkDestroyImageView"), self.device, img.view, 0)
+            img.view = 0
+        if img.image != 0:
+            self.rewind()
+            _ = call3(self.device_call("vkDestroyImage"), self.device, img.image, 0)
+            img.image = 0
+        if img.memory != 0:
+            _ = call3(self.fn_free_memory, self.device, img.memory, 0)
+            img.memory = 0
+
+    def create_sampler(
+        mut self,
+        linear: Bool = True,
+        max_anisotropy: Float32 = 16.0,
+        clamp_to_edge: Bool = False,
+        max_lod: Float32 = 16.0,
+    ) -> Int:
+        self.rewind()
+        var info = self.scratch(80)
+        put32(info, TYPE_SAMPLER_CREATE_INFO)
+        var flt = FILTER_LINEAR if linear else FILTER_NEAREST
+        put32(info + 20, flt)
+        put32(info + 24, flt)
+        put32(info + 28, SAMPLER_MIPMAP_LINEAR if linear else 0)
+        var addr = ADDRESS_MODE_CLAMP_TO_EDGE if clamp_to_edge else ADDRESS_MODE_REPEAT
+        put32(info + 32, addr)
+        put32(info + 36, addr)
+        put32(info + 40, addr)
+        if linear and max_anisotropy > Float32(1.0):
+            put32(info + 48, 1)
+            put_float(info + 52, max_anisotropy)
+        put_float(info + 64, Float32(0.0))
+        put_float(info + 68, max_lod)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateSampler"), self.device, info, 0, slot), "vkCreateSampler"):
+            return 0
+        return get64(slot)
+
+    def destroy_sampler(mut self, sampler: Int):
+        if sampler != 0:
+            self.rewind()
+            _ = call3(self.device_call("vkDestroySampler"), self.device, sampler, 0)
+
+    def transition_image(
+        mut self,
+        frame: Int,
+        mut img: VulkanImage,
+        new_layout: UInt32,
+        src_stage: Int,
+        src_access: UInt32,
+        dst_stage: Int,
+        dst_access: UInt32,
+    ):
+        var aspect = ASPECT_DEPTH if img.format == FORMAT_D32_SFLOAT else ASPECT_COLOR
+        self.rewind()
+        if self.has_sync2:
+            var imb2 = self.scratch(96)
+            put32(imb2, TYPE_IMAGE_MEMORY_BARRIER_2)
+            put64(imb2 + 16, src_stage)
+            put64(imb2 + 24, Int(src_access))
+            put64(imb2 + 32, dst_stage)
+            put64(imb2 + 40, Int(dst_access))
+            put32(imb2 + 48, img.layout)
+            put32(imb2 + 52, new_layout)
+            put32(imb2 + 56, 0xFFFFFFFF)
+            put32(imb2 + 60, 0xFFFFFFFF)
+            put64(imb2 + 64, img.image)
+            put32(imb2 + 72, aspect)
+            put32(imb2 + 76, 0)
+            put32(imb2 + 80, UInt32(img.mip_levels))
+            put32(imb2 + 84, 0)
+            put32(imb2 + 88, UInt32(img.layers))
+            var dep = self.scratch(64)
+            put32(dep, TYPE_DEPENDENCY_INFO)
+            put32(dep + 48, 1)
+            put64(dep + 56, imb2)
+            _ = call2(self.device_call("vkCmdPipelineBarrier2"), self.command_buffers[frame], dep)
+        else:
+            var barrier = self.scratch(72)
+            put32(barrier, TYPE_IMAGE_MEMORY_BARRIER)
+            put32(barrier + 16, src_access)
+            put32(barrier + 20, dst_access)
+            put32(barrier + 24, img.layout)
+            put32(barrier + 28, new_layout)
+            put32(barrier + 32, 0xFFFFFFFF)
+            put32(barrier + 36, 0xFFFFFFFF)
+            put64(barrier + 40, img.image)
+            put32(barrier + 48, aspect)
+            put32(barrier + 52, 0)
+            put32(barrier + 56, UInt32(img.mip_levels))
+            put32(barrier + 60, 0)
+            put32(barrier + 64, UInt32(img.layers))
+            _ = call10(self.fn_pipeline_barrier, self.command_buffers[frame], src_stage, dst_stage, 0, 0, 0, 0, 0, 1, barrier)
+        img.layout = new_layout
+
+    def memory_barrier2(mut self, frame: Int, src_stage: Int, src_access: Int, dst_stage: Int, dst_access: Int):
+        if self.has_sync2:
+            self.rewind()
+            var mb2 = self.scratch(48)
+            put32(mb2, TYPE_MEMORY_BARRIER_2)
+            put64(mb2 + 16, src_stage)
+            put64(mb2 + 24, src_access)
+            put64(mb2 + 32, dst_stage)
+            put64(mb2 + 40, dst_access)
+            var dep = self.scratch(64)
+            put32(dep, TYPE_DEPENDENCY_INFO)
+            put32(dep + 20, 1)
+            put64(dep + 24, mb2)
+            _ = call2(self.device_call("vkCmdPipelineBarrier2"), self.command_buffers[frame], dep)
+        else:
+            self.barrier(frame, src_stage, UInt32(src_access), dst_stage, UInt32(dst_access))
+
+    def upload_image_mip(
+        mut self,
+        frame: Int,
+        img: VulkanImage,
+        staging: GpuBuffer,
+        buf_offset: Int,
+        mip_level: Int,
+        mip_w: Int,
+        mip_h: Int,
+        base_layer: Int = 0,
+        layer_count: Int = 1,
+    ):
+        self.rewind()
+        var region = self.scratch(56)
+        put64(region, buf_offset)
+        put32(region + 16, ASPECT_COLOR)
+        put32(region + 20, UInt32(mip_level))
+        put32(region + 24, UInt32(base_layer))
+        put32(region + 28, UInt32(layer_count))
+        put32(region + 44, UInt32(max(1, mip_w)))
+        put32(region + 48, UInt32(max(1, mip_h)))
+        put32(region + 52, 1)
+        _ = call6(
+            self.device_call("vkCmdCopyBufferToImage"),
+            self.command_buffers[frame],
+            staging.vk_buffer,
+            img.image,
+            Int(LAYOUT_TRANSFER_TARGET),
+            1,
+            region,
+        )
+
+    def copy_image_to_buffer(
+        mut self,
+        frame: Int,
+        img: VulkanImage,
+        dst_buf: GpuBuffer,
+        width: Int,
+        height: Int,
+        dst_offset: Int = 0,
+    ):
+        var aspect = ASPECT_DEPTH if img.format == FORMAT_D32_SFLOAT else ASPECT_COLOR
+        self.rewind()
+        var region = self.scratch(56)
+        put64(region, dst_offset)
+        put32(region + 16, aspect)
+        put32(region + 20, 0)
+        put32(region + 24, 0)
+        put32(region + 28, 1)
+        put32(region + 44, UInt32(width))
+        put32(region + 48, UInt32(height))
+        put32(region + 52, 1)
+        _ = call6(
+            self.device_call("vkCmdCopyImageToBuffer"),
+            self.command_buffers[frame],
+            img.image,
+            Int(LAYOUT_TRANSFER_SRC),
+            dst_buf.vk_buffer,
+            1,
+            region,
+        )
+
+    def create_aaa_layouts(
+        mut self,
+        storage_count: Int,
+        single_sampler_count: Int,
+        max_bindless_textures: Int,
+        has_tlas: Bool,
+        push_bytes: Int,
+    ) -> Tuple[Int, Int]:
+        """Builds a unified DescriptorSetLayout + PipelineLayout for AAA Graphics, Bindless & Ray-Query passes:
+        - bindings `0 .. storage_count - 1`: Storage Buffers (`Vertex | Fragment | Compute`)
+        - bindings `storage_count .. storage_count + single_sampler_count - 1`: Combined Image Samplers (VisBuffer, Depth, VSM, Cubemap, LUT)
+        - binding `storage_count + single_sampler_count`: Bindless `sampler2D[max_bindless_textures]` (`PARTIALLY_BOUND | UPDATE_AFTER_BIND`)
+        - binding `storage_count + single_sampler_count + 1` (if `has_tlas`): `VkAccelerationStructureKHR`
+        """
+        self.rewind()
+        var total_bindings = storage_count + single_sampler_count + (1 if max_bindless_textures > 0 else 0) + (1 if has_tlas else 0)
+        var table = self.scratch(total_bindings * 24)
+        var flags_arr = self.scratch(total_bindings * 4)
+        var all_stages = STAGE_VERTEX_SHADER | STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER
+        var frag_comp = STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER
+
+        var b = 0
+        for _ in range(storage_count):
+            var e = table + b * 24
+            put32(e, UInt32(b))
+            put32(e + 4, DESCRIPTOR_STORAGE_BUFFER)
+            put32(e + 8, 1)
+            put32(e + 12, all_stages)
+            put32(flags_arr + b * 4, DESCRIPTOR_BINDING_PARTIALLY_BOUND)
+            b += 1
+
+        for _ in range(single_sampler_count):
+            var e = table + b * 24
+            put32(e, UInt32(b))
+            put32(e + 4, DESCRIPTOR_COMBINED_IMAGE_SAMPLER)
+            put32(e + 8, 1)
+            put32(e + 12, frag_comp)
+            put32(flags_arr + b * 4, DESCRIPTOR_BINDING_PARTIALLY_BOUND | DESCRIPTOR_BINDING_UPDATE_AFTER_BIND)
+            b += 1
+
+        if max_bindless_textures > 0:
+            var e = table + b * 24
+            put32(e, UInt32(b))
+            put32(e + 4, DESCRIPTOR_COMBINED_IMAGE_SAMPLER)
+            put32(e + 8, UInt32(max_bindless_textures))
+            put32(e + 12, frag_comp)
+            put32(flags_arr + b * 4, DESCRIPTOR_BINDING_PARTIALLY_BOUND | DESCRIPTOR_BINDING_UPDATE_AFTER_BIND)
+            b += 1
+
+        if has_tlas:
+            var e = table + b * 24
+            put32(e, UInt32(b))
+            put32(e + 4, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
+            put32(e + 8, 1)
+            put32(e + 12, frag_comp)
+            put32(flags_arr + b * 4, DESCRIPTOR_BINDING_PARTIALLY_BOUND)
+            b += 1
+
+        var bind_flags_info = self.scratch(32)
+        put32(bind_flags_info, TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO)
+        put32(bind_flags_info + 16, UInt32(total_bindings))
+        put64(bind_flags_info + 24, flags_arr)
+
+        var dsl_info = self.scratch(32)
+        put32(dsl_info, TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO)
+        put64(dsl_info + 8, bind_flags_info)
+        put32(dsl_info + 16, DESCRIPTOR_LAYOUT_UPDATE_AFTER_BIND_POOL)
+        put32(dsl_info + 20, UInt32(total_bindings))
+        put64(dsl_info + 24, table)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateDescriptorSetLayout"), self.device, dsl_info, 0, slot), "vkCreateDescriptorSetLayout(AAA)"):
+            return (0, 0)
+        var dsl = get64(slot)
+
+        var range_info = self.scratch(12)
+        put32(range_info, all_stages)
+        put32(range_info + 8, UInt32(push_bytes))
+        var layouts = self.scratch(8)
+        put64(layouts, dsl)
+        var pl_info = self.scratch(48)
+        put32(pl_info, TYPE_PIPELINE_LAYOUT_CREATE_INFO)
+        put32(pl_info + 20, 1)
+        put64(pl_info + 24, layouts)
+        put32(pl_info + 32, UInt32(1) if push_bytes > 0 else UInt32(0))
+        put64(pl_info + 40, range_info if push_bytes > 0 else 0)
+        if not self.check(call4(self.device_call("vkCreatePipelineLayout"), self.device, pl_info, 0, slot), "vkCreatePipelineLayout(AAA)"):
+            _ = call3(self.device_call("vkDestroyDescriptorSetLayout"), self.device, dsl, 0)
+            return (0, 0)
+        return (dsl, get64(slot))
+
+    def allocate_aaa_descriptor_set(
+        mut self,
+        dsl: Int,
+        storage_count: Int,
+        single_sampler_count: Int,
+        max_bindless_textures: Int,
+        has_tlas: Bool,
+    ) -> Tuple[Int, Int]:
+        self.rewind()
+        var pool_types = 2 + (1 if has_tlas else 0)
+        var sizes = self.scratch(pool_types * 8)
+        put32(sizes, DESCRIPTOR_STORAGE_BUFFER)
+        put32(sizes + 4, UInt32(max(1, storage_count)))
+        put32(sizes + 8, DESCRIPTOR_COMBINED_IMAGE_SAMPLER)
+        put32(sizes + 12, UInt32(max(1, single_sampler_count + max_bindless_textures)))
+        if has_tlas:
+            put32(sizes + 16, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
+            put32(sizes + 20, 1)
+
+        var pool_info = self.scratch(40)
+        put32(pool_info, TYPE_DESCRIPTOR_POOL_CREATE_INFO)
+        put32(pool_info + 16, DESCRIPTOR_POOL_UPDATE_AFTER_BIND)
+        put32(pool_info + 20, 1)
+        put32(pool_info + 24, UInt32(pool_types))
+        put64(pool_info + 32, sizes)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateDescriptorPool"), self.device, pool_info, 0, slot), "vkCreateDescriptorPool(AAA)"):
+            return (0, 0)
+        var pool = get64(slot)
+
+        var layouts = self.scratch(8)
+        put64(layouts, dsl)
+        var alloc_info = self.scratch(40)
+        put32(alloc_info, TYPE_DESCRIPTOR_SET_ALLOCATE_INFO)
+        put64(alloc_info + 16, pool)
+        put32(alloc_info + 24, 1)
+        put64(alloc_info + 32, layouts)
+        if not self.check(call3(self.device_call("vkAllocateDescriptorSets"), self.device, alloc_info, slot), "vkAllocateDescriptorSets(AAA)"):
+            _ = call3(self.device_call("vkDestroyDescriptorPool"), self.device, pool, 0)
+            return (0, 0)
+        return (pool, get64(slot))
+
+    def write_aaa_texture(
+        mut self,
+        descriptor_set: Int,
+        binding: Int,
+        array_element: Int,
+        sampler: Int,
+        image_view: Int,
+        image_layout: UInt32 = LAYOUT_SHADER_READ_ONLY,
+    ):
+        self.rewind()
+        var img_info = self.scratch(24)
+        put64(img_info, sampler)
+        put64(img_info + 8, image_view)
+        put32(img_info + 16, image_layout)
+        var write = self.scratch(64)
+        put32(write, TYPE_WRITE_DESCRIPTOR_SET)
+        put64(write + 16, descriptor_set)
+        put32(write + 24, UInt32(binding))
+        put32(write + 28, UInt32(array_element))
+        put32(write + 32, 1)
+        put32(write + 36, DESCRIPTOR_COMBINED_IMAGE_SAMPLER)
+        put64(write + 40, img_info)
+        _ = call5(self.fn_update_descriptors, self.device, 1, write, 0, 0)
+
+    def write_aaa_tlas(mut self, descriptor_set: Int, binding: Int, tlas_handle: Int):
+        self.rewind()
+        var handles = self.scratch(8)
+        put64(handles, tlas_handle)
+        var as_write = self.scratch(32)
+        put32(as_write, TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR)
+        put32(as_write + 16, 1)
+        put64(as_write + 24, handles)
+        var write = self.scratch(64)
+        put32(write, TYPE_WRITE_DESCRIPTOR_SET)
+        put64(write + 8, as_write)
+        put64(write + 16, descriptor_set)
+        put32(write + 24, UInt32(binding))
+        put32(write + 32, 1)
+        put32(write + 36, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
+        _ = call5(self.fn_update_descriptors, self.device, 1, write, 0, 0)
+
+    def create_aaa_compute_pipeline(mut self, pipeline_layout: Int, code: List[UInt32]) -> Int:
+        self.rewind()
+        var module_info = self.scratch(40)
+        put32(module_info, TYPE_SHADER_MODULE_CREATE_INFO)
+        put64(module_info + 24, len(code) * 4)
+        put64(module_info + 32, Int(code.unsafe_ptr()))
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateShaderModule"), self.device, module_info, 0, slot), "vkCreateShaderModule(AAA-Comp)"):
+            return 0
+        var module = get64(slot)
+        var info = self.scratch(96)
+        put32(info, TYPE_COMPUTE_PIPELINE_CREATE_INFO)
+        put32(info + 24, TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+        put32(info + 44, STAGE_COMPUTE_SHADER)
+        put64(info + 48, module)
+        put64(info + 56, self.text("main"))
+        put64(info + 72, pipeline_layout)
+        put32(info + 88, 0xFFFFFFFF)
+        var result = call6(self.device_call("vkCreateComputePipelines"), self.device, 0, 1, info, 0, slot)
+        var pipeline = get64(slot)
+        _ = call3(self.device_call("vkDestroyShaderModule"), self.device, module, 0)
+        if not self.check(result, "vkCreateComputePipelines(AAA)"):
+            return 0
+        return pipeline
+
+    def create_graphics_pipeline(
+        mut self,
+        pipeline_layout: Int,
+        vert_spv: List[UInt32],
+        frag_spv: List[UInt32],
+        has_color: Bool,
+        color_format: UInt32,
+        depth_format: UInt32,
+        depth_test: Bool = True,
+        depth_write: Bool = True,
+        depth_compare: UInt32 = COMPARE_GREATER_OR_EQUAL,
+        cull_mode: UInt32 = CULL_MODE_NONE,
+    ) -> Int:
+        """Creates a Vulkan 1.3 `VK_KHR_dynamic_rendering` hardware graphics pipeline (Vertex + optional Fragment)."""
+        self.rewind()
+        var slot = self.scratch(8)
+        var v_mod_info = self.scratch(40)
+        put32(v_mod_info, TYPE_SHADER_MODULE_CREATE_INFO)
+        put64(v_mod_info + 24, len(vert_spv) * 4)
+        put64(v_mod_info + 32, Int(vert_spv.unsafe_ptr()))
+        if not self.check(call4(self.device_call("vkCreateShaderModule"), self.device, v_mod_info, 0, slot), "vkCreateShaderModule(Vert)"):
+            return 0
+        var v_mod = get64(slot)
+
+        var f_mod = 0
+        var use_frag = len(frag_spv) > 0
+        if use_frag:
+            var f_mod_info = self.scratch(40)
+            put32(f_mod_info, TYPE_SHADER_MODULE_CREATE_INFO)
+            put64(f_mod_info + 24, len(frag_spv) * 4)
+            put64(f_mod_info + 32, Int(frag_spv.unsafe_ptr()))
+            if not self.check(call4(self.device_call("vkCreateShaderModule"), self.device, f_mod_info, 0, slot), "vkCreateShaderModule(Frag)"):
+                _ = call3(self.device_call("vkDestroyShaderModule"), self.device, v_mod, 0)
+                return 0
+            f_mod = get64(slot)
+
+        var entry_main = self.text("main")
+        var stage_count = 2 if use_frag else 1
+        var stages = self.scratch(stage_count * 48)
+        put32(stages, TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+        put32(stages + 20, STAGE_VERTEX_SHADER)
+        put64(stages + 24, v_mod)
+        put64(stages + 32, entry_main)
+        if use_frag:
+            put32(stages + 48, TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+            put32(stages + 48 + 20, STAGE_FRAGMENT_SHADER)
+            put64(stages + 48 + 24, f_mod)
+            put64(stages + 48 + 32, entry_main)
+
+        var vi = self.scratch(48)
+        put32(vi, TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO)
+
+        var ia = self.scratch(32)
+        put32(ia, TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO)
+        put32(ia + 20, TOPOLOGY_TRIANGLE_LIST)
+
+        var vp = self.scratch(48)
+        put32(vp, TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO)
+        put32(vp + 20, 1)
+        put32(vp + 32, 1)
+
+        var rs = self.scratch(64)
+        put32(rs, TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
+        put32(rs + 32, cull_mode)
+        put32(rs + 36, FRONT_FACE_CCW)
+        put_float(rs + 56, Float32(1.0))
+
+        var ms = self.scratch(48)
+        put32(ms, TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
+        put32(ms + 20, SAMPLE_COUNT_1)
+
+        var ds = self.scratch(104)
+        put32(ds, TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO)
+        put32(ds + 20, UInt32(1) if depth_test else UInt32(0))
+        put32(ds + 24, UInt32(1) if depth_write else UInt32(0))
+        put32(ds + 28, depth_compare)
+
+        var cb_att = self.scratch(32)
+        put32(cb_att + 28, 0xF)  # RGBA write mask
+
+        var cb = self.scratch(56)
+        put32(cb, TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO)
+        put32(cb + 28, UInt32(1) if has_color else UInt32(0))
+        put64(cb + 32, cb_att if has_color else 0)
+
+        var dyn_states = self.scratch(8)
+        put32(dyn_states, DYNAMIC_STATE_VIEWPORT)
+        put32(dyn_states + 4, DYNAMIC_STATE_SCISSOR)
+        var dyn = self.scratch(32)
+        put32(dyn, TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO)
+        put32(dyn + 20, 2)
+        put64(dyn + 24, dyn_states)
+
+        var color_fmt_ptr = self.scratch(8)
+        put32(color_fmt_ptr, color_format)
+        var pr_info = self.scratch(40)
+        put32(pr_info, TYPE_PIPELINE_RENDERING_CREATE_INFO)
+        put32(pr_info + 20, UInt32(1) if has_color else UInt32(0))
+        put64(pr_info + 24, color_fmt_ptr if has_color else 0)
+        put32(pr_info + 32, depth_format)
+
+        var gp = self.scratch(144)
+        put32(gp, TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
+        put64(gp + 8, pr_info)
+        put32(gp + 20, UInt32(stage_count))
+        put64(gp + 24, stages)
+        put64(gp + 32, vi)
+        put64(gp + 40, ia)
+        put64(gp + 56, vp)
+        put64(gp + 64, rs)
+        put64(gp + 72, ms)
+        put64(gp + 80, ds)
+        put64(gp + 88, cb)
+        put64(gp + 96, dyn)
+        put64(gp + 104, pipeline_layout)
+        put32(gp + 128, 0xFFFFFFFF)
+
+        var res = call6(self.device_call("vkCreateGraphicsPipelines"), self.device, 0, 1, gp, 0, slot)
+        var pipe = get64(slot)
+        _ = call3(self.device_call("vkDestroyShaderModule"), self.device, v_mod, 0)
+        if f_mod != 0:
+            _ = call3(self.device_call("vkDestroyShaderModule"), self.device, f_mod, 0)
+        if not self.check(res, "vkCreateGraphicsPipelines"):
+            return 0
+        return pipe
+
+    def destroy_pipeline(mut self, pipeline: Int):
+        if pipeline != 0:
+            self.rewind()
+            _ = call3(self.device_call("vkDestroyPipeline"), self.device, pipeline, 0)
+
+    def destroy_aaa_descriptors(mut self, pool: Int, dsl: Int, pipeline_layout: Int):
+        self.rewind()
+        if pool != 0:
+            _ = call3(self.device_call("vkDestroyDescriptorPool"), self.device, pool, 0)
+        if pipeline_layout != 0:
+            _ = call3(self.device_call("vkDestroyPipelineLayout"), self.device, pipeline_layout, 0)
+        if dsl != 0:
+            _ = call3(self.device_call("vkDestroyDescriptorSetLayout"), self.device, dsl, 0)
+
+    def begin_rendering(
+        mut self,
+        frame: Int,
+        rx: Int,
+        ry: Int,
+        rw: Int,
+        rh: Int,
+        has_color: Bool,
+        color_view: Int,
+        clear_color: Bool,
+        clear_u0: UInt32,
+        clear_u1: UInt32,
+        has_depth: Bool,
+        depth_view: Int,
+        clear_depth: Bool,
+        depth_clear_val: Float32 = 0.0,
+    ):
+        self.rewind()
+        var color_att = self.scratch(72)
+        if has_color:
+            put32(color_att, TYPE_RENDERING_ATTACHMENT_INFO)
+            put64(color_att + 16, color_view)
+            put32(color_att + 24, LAYOUT_COLOR_ATTACHMENT)
+            put32(color_att + 44, LOAD_OP_CLEAR if clear_color else LOAD_OP_LOAD)
+            put32(color_att + 48, STORE_OP_STORE)
+            put32(color_att + 52, clear_u0)
+            put32(color_att + 56, clear_u1)
+
+        var depth_att = self.scratch(72)
+        if has_depth:
+            put32(depth_att, TYPE_RENDERING_ATTACHMENT_INFO)
+            put64(depth_att + 16, depth_view)
+            put32(depth_att + 24, LAYOUT_DEPTH_ATTACHMENT)
+            put32(depth_att + 44, LOAD_OP_CLEAR if clear_depth else LOAD_OP_LOAD)
+            put32(depth_att + 48, STORE_OP_STORE)
+            put_float(depth_att + 52, depth_clear_val)
+
+        var r_info = self.scratch(72)
+        put32(r_info, TYPE_RENDERING_INFO)
+        put32(r_info + 20, UInt32(rx))
+        put32(r_info + 24, UInt32(ry))
+        put32(r_info + 28, UInt32(rw))
+        put32(r_info + 32, UInt32(rh))
+        put32(r_info + 36, 1)  # layerCount = 1
+        put32(r_info + 44, UInt32(1) if has_color else UInt32(0))
+        put64(r_info + 48, color_att if has_color else 0)
+        put64(r_info + 56, depth_att if has_depth else 0)
+        _ = call2(self.device_call("vkCmdBeginRendering"), self.command_buffers[frame], r_info)
+
+    def end_rendering(mut self, frame: Int):
+        self.rewind()
+        _ = call1(self.device_call("vkCmdEndRendering"), self.command_buffers[frame])
+
+    def set_viewport_and_scissor(mut self, frame: Int, x: Int, y: Int, w: Int, h: Int, flip_y: Bool = True):
+        self.rewind()
+        var vp = self.scratch(24)
+        put_float(vp + 0, Float32(x))
+        put_float(vp + 4, Float32(y + h) if flip_y else Float32(y))
+        put_float(vp + 8, Float32(w))
+        put_float(vp + 12, Float32(-h) if flip_y else Float32(h))
+        put_float(vp + 16, Float32(0.0))
+        put_float(vp + 20, Float32(1.0))
+        _ = call4(self.device_call("vkCmdSetViewport"), self.command_buffers[frame], 0, 1, vp)
+
+        var sc = self.scratch(16)
+        put32(sc + 0, UInt32(x))
+        put32(sc + 4, UInt32(y))
+        put32(sc + 8, UInt32(w))
+        put32(sc + 12, UInt32(h))
+        _ = call4(self.device_call("vkCmdSetScissor"), self.command_buffers[frame], 0, 1, sc)
+
+    def bind_graphics_pipeline(
+        mut self,
+        frame: Int,
+        pipeline: Int,
+        pipeline_layout: Int,
+        descriptor_set: Int,
+        push: List[UInt32],
+    ):
+        self.rewind()
+        var commands = self.command_buffers[frame]
+        var sets = self.scratch(8)
+        put64(sets, descriptor_set)
+        var all_stages = Int(STAGE_VERTEX_SHADER | STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER)
+        _ = call3(self.fn_bind_pipeline, commands, BIND_POINT_GRAPHICS, pipeline)
+        _ = call8(self.fn_bind_descriptor_sets, commands, BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, sets, 0, 0)
+        if len(push) > 0:
+            _ = call6(self.fn_push_constants, commands, pipeline_layout, all_stages, 0, len(push) * 4, Int(push.unsafe_ptr()))
+
+    def dispatch_aaa(
+        mut self,
+        frame: Int,
+        pipeline: Int,
+        pipeline_layout: Int,
+        descriptor_set: Int,
+        push: List[UInt32],
+        groups_x: Int,
+        groups_y: Int,
+        groups_z: Int = 1,
+    ):
+        self.rewind()
+        var commands = self.command_buffers[frame]
+        var sets = self.scratch(8)
+        put64(sets, descriptor_set)
+        var all_stages = Int(STAGE_VERTEX_SHADER | STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER)
+        _ = call3(self.fn_bind_pipeline, commands, BIND_POINT_COMPUTE, pipeline)
+        _ = call8(self.fn_bind_descriptor_sets, commands, BIND_POINT_COMPUTE, pipeline_layout, 0, 1, sets, 0, 0)
+        if len(push) > 0:
+            _ = call6(self.fn_push_constants, commands, pipeline_layout, all_stages, 0, len(push) * 4, Int(push.unsafe_ptr()))
+        _ = call4(self.fn_dispatch, commands, max(1, groups_x), max(1, groups_y), max(1, groups_z))
+
+    def draw(mut self, frame: Int, vertex_count: Int, instance_count: Int = 1, first_vertex: Int = 0, first_instance: Int = 0):
+        self.rewind()
+        _ = call5(
+            self.device_call("vkCmdDraw"),
+            self.command_buffers[frame],
+            vertex_count,
+            instance_count,
+            first_vertex,
+            first_instance,
+        )
+
+    def draw_indirect_count(
+        mut self,
+        frame: Int,
+        indirect_buf: GpuBuffer,
+        indirect_offset: Int,
+        count_buf: GpuBuffer,
+        count_offset: Int,
+        max_draw_count: Int,
+        stride: Int = 16,
+    ):
+        self.rewind()
+        if self.has_draw_indirect_count:
+            _ = call7(
+                self.device_call("vkCmdDrawIndirectCount"),
+                self.command_buffers[frame],
+                indirect_buf.vk_buffer,
+                indirect_offset,
+                count_buf.vk_buffer,
+                count_offset,
+                max_draw_count,
+                stride,
+            )
+        else:
+            _ = call5(
+                self.device_call("vkCmdDrawIndirect"),
+                self.command_buffers[frame],
+                indirect_buf.vk_buffer,
+                indirect_offset,
+                max_draw_count,
+                stride,
+            )
+
+    # Hardware Ray-Tracing Acceleration Structures (BLAS + TLAS)
+    def build_blas_triangles(
+        mut self,
+        frame: Int,
+        vertex_addr: UInt64,
+        vertex_stride: Int,
+        max_vertex: Int,
+        index_addr: UInt64,
+        triangle_count: Int,
+        mut scratch_out: GpuBuffer,
+    ) -> VulkanAccelStruct:
+        var out = VulkanAccelStruct()
+        if not self.has_ray_query or triangle_count <= 0:
+            return out^
+        self.rewind()
+        var geom = self.scratch(96)
+        put32(geom, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+        put32(geom + 16, GEOMETRY_TYPE_TRIANGLES_KHR)
+        # Embedded VkAccelerationStructureGeometryTrianglesDataKHR at geom + 24
+        put32(geom + 24 + 0, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR)
+        put32(geom + 24 + 16, FORMAT_R32G32B32_SFLOAT)
+        put64(geom + 24 + 24, Int(vertex_addr))
+        put64(geom + 24 + 32, vertex_stride)
+        put32(geom + 24 + 40, UInt32(max_vertex))
+        put32(geom + 24 + 44, INDEX_TYPE_UINT32)
+        put64(geom + 24 + 48, Int(index_addr))
+        put32(geom + 88, GEOMETRY_OPAQUE_BIT_KHR)
+
+        var build_info = self.scratch(80)
+        put32(build_info, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+        put32(build_info + 16, AS_TYPE_BOTTOM_LEVEL_KHR)
+        put32(build_info + 20, BUILD_AS_PREFER_FAST_TRACE_KHR)
+        put32(build_info + 24, BUILD_AS_MODE_BUILD_KHR)
+        put32(build_info + 48, 1)
+        put64(build_info + 56, geom)
+
+        var prim_cnt = self.scratch(8)
+        put32(prim_cnt, UInt32(triangle_count))
+        var sizes = self.scratch(40)
+        put32(sizes, TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR)
+        _ = call5(
+            self.device_call("vkGetAccelerationStructureBuildSizesKHR"),
+            self.device,
+            BUILD_AS_TYPE_DEVICE_KHR,
+            build_info,
+            prim_cnt,
+            sizes,
+        )
+        var as_bytes = max(4096, get64(sizes + 16))
+        var scratch_bytes = max(4096, get64(sizes + 32) + 256)
+
+        var as_buf = self.create_buffer_bda(
+            as_bytes,
+            extra_usage=BUFFER_USAGE_AS_STORAGE_KHR | BUFFER_USAGE_DEVICE_ADDRESS,
+            host_visible=False,
+        )
+        if scratch_out.size < scratch_bytes:
+            if scratch_out.size > 0:
+                self.destroy_buffer(scratch_out)
+            scratch_out = self.create_buffer_bda(
+                scratch_bytes,
+                extra_usage=BUFFER_USAGE_DEVICE_ADDRESS,
+                host_visible=False,
+            )
+        var scratch_addr = (self.buffer_device_address(scratch_out) + 255) & ~UInt64(255)
+
+        self.rewind()
+        var create_info = self.scratch(64)
+        put32(create_info, TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR)
+        put64(create_info + 24, as_buf.vk_buffer)
+        put64(create_info + 40, as_bytes)
+        put32(create_info + 48, AS_TYPE_BOTTOM_LEVEL_KHR)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateAccelerationStructureKHR"), self.device, create_info, 0, slot), "vkCreateAccelerationStructureKHR(BLAS)"):
+            self.destroy_buffer(as_buf)
+            return out^
+        var handle = get64(slot)
+
+        # Re-populate build_info after create_buffer_bda rewound scratch arena
+        self.rewind()
+        var geom2 = self.scratch(96)
+        put32(geom2, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+        put32(geom2 + 16, GEOMETRY_TYPE_TRIANGLES_KHR)
+        put32(geom2 + 24 + 0, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR)
+        put32(geom2 + 24 + 16, FORMAT_R32G32B32_SFLOAT)
+        put64(geom2 + 24 + 24, Int(vertex_addr))
+        put64(geom2 + 24 + 32, vertex_stride)
+        put32(geom2 + 24 + 40, UInt32(max_vertex))
+        put32(geom2 + 24 + 44, INDEX_TYPE_UINT32)
+        put64(geom2 + 24 + 48, Int(index_addr))
+        put32(geom2 + 88, GEOMETRY_OPAQUE_BIT_KHR)
+
+        var binfo2 = self.scratch(80)
+        put32(binfo2, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+        put32(binfo2 + 16, AS_TYPE_BOTTOM_LEVEL_KHR)
+        put32(binfo2 + 20, BUILD_AS_PREFER_FAST_TRACE_KHR)
+        put32(binfo2 + 24, BUILD_AS_MODE_BUILD_KHR)
+        put64(binfo2 + 40, handle)
+        put32(binfo2 + 48, 1)
+        put64(binfo2 + 56, geom2)
+        put64(binfo2 + 72, Int(scratch_addr))
+
+        var range_info = self.scratch(16)
+        put32(range_info, UInt32(triangle_count))
+        var pp_range = self.scratch(8)
+        put64(pp_range, range_info)
+        _ = call4(self.device_call("vkCmdBuildAccelerationStructuresKHR"), self.command_buffers[frame], 1, binfo2, pp_range)
+
+        self.rewind()
+        var addr_info = self.scratch(24)
+        put32(addr_info, TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR)
+        put64(addr_info + 16, handle)
+        comptime CallASDA = def(Int, Int) thin abi("C") -> UInt64
+        var fn_asda = self.device_call("vkGetAccelerationStructureDeviceAddressKHR")
+        var as_da = Pointer(to=fn_asda).unsafe_bitcast[CallASDA]()[unsafe_offset=0](self.device, addr_info)
+
+        out.handle = handle
+        out.buffer = as_buf^
+        out.device_address = as_da
+        return out^
+
+    def build_tlas_instances(
+        mut self,
+        frame: Int,
+        instances_addr: UInt64,
+        instance_count: Int,
+        mut scratch_out: GpuBuffer,
+    ) -> VulkanAccelStruct:
+        var out = VulkanAccelStruct()
+        if not self.has_ray_query or instance_count < 0:
+            return out^
+        self.rewind()
+        var geom = self.scratch(96)
+        put32(geom, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+        put32(geom + 16, GEOMETRY_TYPE_INSTANCES_KHR)
+        put32(geom + 24 + 0, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR)
+        put64(geom + 24 + 24, Int(instances_addr))
+        put32(geom + 88, GEOMETRY_OPAQUE_BIT_KHR)
+
+        var build_info = self.scratch(80)
+        put32(build_info, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+        put32(build_info + 16, AS_TYPE_TOP_LEVEL_KHR)
+        put32(build_info + 20, BUILD_AS_PREFER_FAST_TRACE_KHR)
+        put32(build_info + 24, BUILD_AS_MODE_BUILD_KHR)
+        put32(build_info + 48, 1)
+        put64(build_info + 56, geom)
+
+        var prim_cnt = self.scratch(8)
+        put32(prim_cnt, UInt32(instance_count))
+        var sizes = self.scratch(40)
+        put32(sizes, TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR)
+        _ = call5(
+            self.device_call("vkGetAccelerationStructureBuildSizesKHR"),
+            self.device,
+            BUILD_AS_TYPE_DEVICE_KHR,
+            build_info,
+            prim_cnt,
+            sizes,
+        )
+        var as_bytes = max(4096, get64(sizes + 16))
+        var scratch_bytes = max(4096, get64(sizes + 32) + 256)
+
+        var as_buf = self.create_buffer_bda(
+            as_bytes,
+            extra_usage=BUFFER_USAGE_AS_STORAGE_KHR | BUFFER_USAGE_DEVICE_ADDRESS,
+            host_visible=False,
+        )
+        if scratch_out.size < scratch_bytes:
+            if scratch_out.size > 0:
+                self.destroy_buffer(scratch_out)
+            scratch_out = self.create_buffer_bda(
+                scratch_bytes,
+                extra_usage=BUFFER_USAGE_DEVICE_ADDRESS,
+                host_visible=False,
+            )
+        var scratch_addr = (self.buffer_device_address(scratch_out) + 255) & ~UInt64(255)
+
+        self.rewind()
+        var create_info = self.scratch(64)
+        put32(create_info, TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR)
+        put64(create_info + 24, as_buf.vk_buffer)
+        put64(create_info + 40, as_bytes)
+        put32(create_info + 48, AS_TYPE_TOP_LEVEL_KHR)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateAccelerationStructureKHR"), self.device, create_info, 0, slot), "vkCreateAccelerationStructureKHR(TLAS)"):
+            self.destroy_buffer(as_buf)
+            return out^
+        var handle = get64(slot)
+
+        self.rewind()
+        var geom2 = self.scratch(96)
+        put32(geom2, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+        put32(geom2 + 16, GEOMETRY_TYPE_INSTANCES_KHR)
+        put32(geom2 + 24 + 0, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR)
+        put64(geom2 + 24 + 24, Int(instances_addr))
+        put32(geom2 + 88, GEOMETRY_OPAQUE_BIT_KHR)
+
+        var binfo2 = self.scratch(80)
+        put32(binfo2, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+        put32(binfo2 + 16, AS_TYPE_TOP_LEVEL_KHR)
+        put32(binfo2 + 20, BUILD_AS_PREFER_FAST_TRACE_KHR)
+        put32(binfo2 + 24, BUILD_AS_MODE_BUILD_KHR)
+        put64(binfo2 + 40, handle)
+        put32(binfo2 + 48, 1)
+        put64(binfo2 + 56, geom2)
+        put64(binfo2 + 72, Int(scratch_addr))
+
+        var range_info = self.scratch(16)
+        put32(range_info, UInt32(instance_count))
+        var pp_range = self.scratch(8)
+        put64(pp_range, range_info)
+        _ = call4(self.device_call("vkCmdBuildAccelerationStructuresKHR"), self.command_buffers[frame], 1, binfo2, pp_range)
+
+        out.handle = handle
+        out.buffer = as_buf^
+        return out^
+
+    def destroy_accel_struct(mut self, mut accel: VulkanAccelStruct):
+        if accel.handle != 0:
+            self.rewind()
+            _ = call3(self.device_call("vkDestroyAccelerationStructureKHR"), self.device, accel.handle, 0)
+            accel.handle = 0
+        if accel.buffer.size > 0:
+            self.destroy_buffer(accel.buffer)
+            accel.buffer = GpuBuffer()
+        accel.device_address = 0

@@ -438,6 +438,13 @@ def bitmap_glyph(code: Int) -> UInt64:
         case 35: return 0x15F55F54A
         case 36: return 0x11F4717C4
         case 39: return 0x000001084
+        case 34: return 0x00000014A
+        case 64: return 0x3A17ADEDE
         case 91: return 0x38421084E
         case 93: return 0x39084210E
+        case 94: return 0x000004544
+        case 96: return 0x000000082
+        case 123: return 0x30841908C
+        case 125: return 0x1884C1086
+        case 126: return 0x00006D800
         case _: return 0x1FFFFFF

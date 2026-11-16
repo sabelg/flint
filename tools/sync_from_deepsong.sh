@@ -8,12 +8,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 VERIFY_ONLY=0
+FORCE_OVERWRITE=0
 DEEPSONG_DIR="${DEEPSONG_DIR:-}"
 
 for arg in "$@"; do
     case "$arg" in
         --verify|--check)
             VERIFY_ONLY=1
+            ;;
+        --force-overwrite)
+            FORCE_OVERWRITE=1
             ;;
         *)
             DEEPSONG_DIR="$arg"
@@ -35,12 +39,42 @@ if [[ "$VERIFY_ONLY" -eq 0 ]]; then
 
     echo "[Flint Sync] Harvesting pure-Mojo libraries from: $DEEPSONG_DIR"
 
-    python3 - "$DEEPSONG_DIR/src" "$ROOT/src/flint" <<'PY'
+    python3 - "$DEEPSONG_DIR/src" "$ROOT/src/flint" "$FORCE_OVERWRITE" <<'PY'
 import os
 import re
 import sys
 
-src_root, dst_root = sys.argv[1], sys.argv[2]
+src_root, dst_root, force_flag = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+# Modules where Flint carries ahead-of-upstream capabilities (aarch64 syscalls,
+# Vulkan/AMDGPU GGX PBR + analytical IBL + AgX Inset, .flpk bundler, RGBA PNG,
+# xdg_toplevel resize/maximize, TTF SDF fonts, and concert BUS_MUSIC).
+# Protected by default unless --force-overwrite is explicitly passed.
+FLINT_ENHANCED = {
+    ("core", "anchor.mojo"),
+    ("core", "crash.mojo"),
+    ("core", "cvars.mojo"),
+    ("core", "detmath.mojo"),
+    ("core", "jobs.mojo"),
+    ("core", "perf_history.mojo"),
+    ("core", "profiler.mojo"),
+    ("platform", "audio.mojo"),
+    ("platform", "pulse.mojo"),
+    ("platform", "wayland.mojo"),
+    ("assets", "glb_native.mojo"),
+    ("assets", "image.mojo"),
+    ("assets", "model.mojo"),
+    ("assets", "vfs.mojo"),
+    ("render", "font.mojo"),
+    ("render", "fx_atlas.mojo"),
+    ("render", "gpu_layout.mojo"),
+    ("render", "gpu_raster.mojo"),
+    ("render", "grading.mojo"),
+    ("render", "lighting.mojo"),
+    ("render", "rasterizer.mojo"),
+    ("render", "spirv.mojo"),
+    ("render", "vulkan_shaders.mojo"),
+}
 
 MODULES = {
     "core": [
@@ -56,8 +90,8 @@ MODULES = {
         "os.mojo", "pulse.mojo", "vulkan.mojo", "wayland.mojo", "wayland_bridge.mojo",
     ],
     "assets": [
-        "clip_names.mojo", "cook.mojo", "cooked.mojo", "cooked_model.mojo",
-        "glb.mojo", "glb_native.mojo", "image.mojo", "jpeg.mojo", "json.mojo",
+        "asset_check.mojo", "clip_names.mojo", "cook.mojo", "cooked.mojo", "cooked_model.mojo",
+        "glb.mojo", "glb_native.mojo", "hot_reload.mojo", "image.mojo", "jpeg.mojo", "json.mojo",
         "json_write.mojo", "manifest.mojo", "model.mojo", "vfs.mojo",
     ],
     "text": [
@@ -162,6 +196,12 @@ for pkg, files in MODULES.items():
             text = text.replace('env_now("SD_COOKED")', 'env_now("FLINT_COOKED")')
             text = text.replace('env_now("SD_PACK")', 'env_now("FLINT_PACK")')
 
+        if pkg == "assets" and fname == "asset_check.mojo":
+            text = text.replace("re-export with bash tools/run.sh assets ", "re-export asset ")
+
+        if pkg == "assets" and fname == "hot_reload.mojo":
+            text = text.replace("assets/deepsong/layers/layer5.json", "assets/layers/layer5.json")
+
         # Enrich Wayland evdev key table with full US-QWERTY punctuation & Flint window title
         if pkg == "platform" and fname == "wayland.mojo":
             text = text.replace('"SHARDDEPTH"', '"FLINT ENGINE"')
@@ -197,11 +237,13 @@ for pkg, files in MODULES.items():
                 text = text.replace(target, extra)
 
         out_path = os.path.join(out_dir, fname)
+        if os.path.isfile(out_path) and (pkg, fname) in FLINT_ENHANCED and not force_flag:
+            continue
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(text)
         copied += 1
 
-print(f"[Flint Sync] Synced and namespaced {copied} pure-Mojo modules into src/flint/.")
+print(f"[Flint Sync] Synced and namespaced {copied} pure-Mojo modules into src/flint/ (protected {len(FLINT_ENHANCED)} Flint-enhanced modules).")
 PY
 fi
 

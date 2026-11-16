@@ -7,6 +7,7 @@ the walk in order preserves the CPU renderer's transparency behaviour.
 """
 from std.collections import Dict
 from std.ffi import external_call
+from std.math import floor
 from flint.platform.amdgpu import AmdGpu, GpuBuffer, DOMAIN_GTT, DOMAIN_VRAM, PAGE_EXECUTE, PAGE_READ, PAGE_WRITE, WAIT_TIMEOUT_NS
 from flint.core.anchor import A_GPU_HANGS, anchor_add, anchor_ready
 from flint.core.log import LOG_GPU, log_error, log_info
@@ -22,18 +23,32 @@ from flint.render.occupancy_layout import OccupancyLayout, OCC_BYTES, write_occu
 from flint.render.gpu_layout import (
     WIND_MIRROR_BYTES,
     BIND_BACKDROP, BIND_CELLS, BIND_CONSTANTS, BIND_COUNT, BIND_HUD, BIND_LISTS, BIND_RECORDS,
-    BIND_SHOWN, BIND_TARGET, BIND_TEXTURES, BIND_TILES, BIND_VOXELS, BLOOM_BLURRED_OFFSET,
-    BLOOM_BYTES, BLOOM_FINAL_OFFSET, BLOOM_SAMPLES_X, BLOOM_SAMPLES_Y, BLOOM_SOURCE_OFFSET,
-    CONSTANT_BLOOM_DISTANCE, CONSTANT_CAMERA, CONSTANT_DITHER, CONSTANT_EFFECTS, CONSTANT_KEY, CONSTANT_LIGHTS,
-    CONSTANT_SATURATION, CONSTANT_SPHERES, CONSTANT_WORLD, EFFECT_BILINEAR, EFFECT_SHADOWS,
-    DITHER_FLAG, GROUP_HEIGHT, GROUP_WIDTH, MAX_SHADOW_SPHERES, PBR_FLAG, PER_PIXEL_FLAG, RECORD_AMBIENT_OCCLUSION,
-    RECORD_BYTES, RECORD_EMISSIVE, RECORD_FLAGS, RECORD_FLOATS, RECORD_FOG, RECORD_INVERSE_Z,
-    RECORD_LIGHT, RECORD_METALLIC, RECORD_NORMAL, RECORD_ROUGHNESS, RECORD_TEXTURE, RECORD_TEXTURE_FLOAT_HEIGHT,
-    RECORD_TEXTURE_FLOAT_WIDTH, RECORD_TEXTURE_MAX_X, RECORD_TEXTURE_MAX_Y, RECORD_TEXTURE_WIDTH,
-    RECORD_TINT, RECORD_U, RECORD_V, RECORD_WEIGHT_A, RECORD_WEIGHT_B, SHADER_BLOOM_REDUCE,
-    SHADER_BLUR_HORIZONTAL, SHADER_BLUR_VERTICAL, SHADER_CAPTURE, SHADER_COMPOSE, SHADER_COUNT,
-    SHADER_RASTER, SHADER_SMOOTH, SHADOW_COARSE_STEPS, SHADOW_FINE_STEPS, TEXTURED_FLAG,
-    TILE_ENTRY_DWORDS, TILE_SIZE,
+    BIND_SHADOW_MAP, BIND_SHOWN, BIND_TARGET, BIND_TEXTURES, BIND_TILES, BIND_VOXELS,
+    BLOOM_BLURRED_OFFSET, BLOOM_BYTES, BLOOM_FINAL_OFFSET, BLOOM_MIP0_CRISP_OFFSET, BLOOM_MIP1_OFFSET,
+    BLOOM_MIP1_UP_OFFSET, BLOOM_MIP2_OFFSET, BLOOM_SAMPLES_X, BLOOM_SAMPLES_Y, BLOOM_SOURCE_OFFSET,
+    CLUSTER_WORDS_PER_SLICE, CLUSTER_WORDS_PER_TILE, CLUSTER_Z_SLICES,
+    CONSTANT_BLOOM_DISTANCE, CONSTANT_BYTES, CONSTANT_CAMERA, CONSTANT_DITHER, CONSTANT_EFFECTS,
+    CONSTANT_KEY, CONSTANT_LIGHTS, CONSTANT_SATURATION, CONSTANT_SPHERES, CONSTANT_WORLD,
+    CSM_BYTES, CSM_DEPTH_BYTES, CSM_DEPTH_WORDS, CSM_FRAME_SLICE_BYTES, CSM_ITEMS_REL_BYTES,
+    CSM_MAX_ITEMS, CSM_MAX_RECORDS, CSM_RECORD_DWORDS, CSM_RECORDS_REL_BYTES, CSM_RES, CSM_TILE_SIZE,
+    EFFECT_AUTO_EXPOSURE, EFFECT_BILINEAR, EFFECT_FROXEL_VOL, EFFECT_HIZ_CULL, EFFECT_PHYSICAL_SKY,
+    EFFECT_SHADOWS, EFFECT_VOLUMETRIC, DITHER_FLAG, FROXEL_INTEGRATED_OFFSET, FROXEL_SLICE_BYTES,
+    FROXEL_VOL_OFFSET, FROXEL_X, FROXEL_Y, GPU_CULL_IN_STRIDE_WORDS, GPU_CULL_MAX_INSTANCES,
+    GPU_CULL_REL_BYTES, GPU_PARTICLE_MAX, GPU_PARTICLE_REL_BYTES,
+    GPU_PARTICLE_STRIDE_WORDS, GPU_SKIN_MAX_JOINTS, GPU_SKIN_MAX_VERTS, GPU_SKIN_REL_BYTES,
+    GROUP_HEIGHT, GROUP_WIDTH, HIZ_BACKDROP_EXTRA_BYTES, HIZ_SLICE_WORDS, MAX_CLUSTER_LIGHTS,
+    MAX_SHADOW_SPHERES, MIPMAPPED_FLAG, PBR_FLAG, PER_PIXEL_FLAG,
+    RECORD_AMBIENT_OCCLUSION, RECORD_BYTES, RECORD_EMISSIVE, RECORD_FLAGS, RECORD_FLOATS, RECORD_FOG,
+    RECORD_INVERSE_Z, RECORD_LIGHT, RECORD_METALLIC, RECORD_NORMAL, RECORD_ROUGHNESS, RECORD_TEXTURE,
+    RECORD_TEXTURE_FLOAT_HEIGHT, RECORD_TEXTURE_FLOAT_WIDTH, RECORD_TEXTURE_MAX_X, RECORD_TEXTURE_MAX_Y,
+    RECORD_TEXTURE_WIDTH, RECORD_TINT, RECORD_U, RECORD_V, RECORD_WEIGHT_A, RECORD_WEIGHT_B,
+    SHADER_AUTO_EXPOSURE, SHADER_BLOOM_REDUCE, SHADER_BLUR_HORIZONTAL, SHADER_BLUR_VERTICAL,
+    SHADER_CAPTURE, SHADER_COMPOSE, SHADER_COUNT, SHADER_CSM_CLEAR, SHADER_CSM_RASTER,
+    SHADER_FROXEL_INTEGRATE, SHADER_GPU_CULL, SHADER_GPU_PARTICLES, SHADER_GPU_SKIN,
+    SHADER_HISTOGRAM, SHADER_HIZ_PYRAMID, SHADER_KAWASE_DOWN, SHADER_KAWASE_UP, SHADER_RASTER,
+    SHADER_SKY_LUT, SHADER_SMOOTH, SHADER_TAA_CAPTURE, SHADER_TAA_RESOLVE, SHADER_TSR_UPSCALE,
+    SHADOW_COARSE_STEPS, SHADOW_FINE_STEPS, SKY_LUT_H,
+    SKY_LUT_W, TEXTURED_FLAG, TILE_ENTRY_DWORDS, TILE_SIZE, TSR_SCRATCH_REL_BYTES,
 )
 from flint.render import vulkan_shaders
 from flint.render.frame_passes import FramePasses
@@ -799,14 +814,15 @@ def raster_shader(isa: Int = ISA_GFX12) -> ShaderAssembler:
         s.global_load_u8(30 + UInt32(channel), 22, 14)
     s.s_wait_loadcnt()
 
-    # Saturation about Rec. 709-style luminance.
+    # Saturation about perceptual luminance (66, 150, 40) matching Vulkan & CPU PBR.
     s.s_cmp_eq_u32(19, src_int(0))
     s.s_cbranch_scc1(no_saturation)
-    s.v_mul_u32_u24(36, src_int(54), 30)
+    s.v_mul_u32_u24(36, SRC_LITERAL, 30)
+    s.literal(66)
     s.v_mul_u32_u24(34, SRC_LITERAL, 31)
-    s.literal(183)
+    s.literal(150)
     s.v_add_nc_u32(36, src_vgpr(34), 36)
-    s.v_mul_u32_u24(34, src_int(19), 32)
+    s.v_mul_u32_u24(34, src_int(40), 32)
     s.v_add_nc_u32(36, src_vgpr(34), 36)
     s.v_lshrrev_b32(36, src_int(8), 36)
     s.s_add_co_u32(27, 19, src_int(64))
@@ -1370,6 +1386,8 @@ struct GpuRaster(Copyable, Movable):
     var occupancy_ready: Bool
     var width: Int
     var height: Int
+    var render_width: Int
+    var render_height: Int
     var row_pixels: Int
     var columns: Int
     var rows: Int
@@ -1381,6 +1399,7 @@ struct GpuRaster(Copyable, Movable):
     var live_triangles: Int
     var counts: List[UInt32]
     var tile_lights: List[UInt32]
+    var cluster_lights: List[UInt32]
     var cursors: List[UInt32]
     var texture_offsets: Dict[Int, Int]
     var texture_used: Int
@@ -1405,6 +1424,13 @@ struct GpuRaster(Copyable, Movable):
     var recoveries: Int
     var fault_gate: GpuBuffer  # fault injection: the dword a held frame waits on
     var wind: GpuBuffer        # the wind mirror (package 2.12), CPU-written each frame it changes
+    var shadow_map: GpuBuffer  # 2-cascade 1024x1024 shadow map + per-frame CSM records/tiles
+    var csm_record_count: Int
+    var csm_item_count: Int
+    var hiz_tiles_x: Int
+    var hiz_tiles_y: Int
+    var hiz_valid_mask: UInt32
+    var hiz_synced_slot: Int
     var wind_uploads: Int
     var fault_pending: Int
     var fault_generation: UInt32
@@ -1452,6 +1478,8 @@ struct GpuRaster(Copyable, Movable):
         self.occupancy_ready = False
         self.width = 0
         self.height = 0
+        self.render_width = 0
+        self.render_height = 0
         self.row_pixels = 0
         self.columns = 0
         self.rows = 0
@@ -1463,6 +1491,7 @@ struct GpuRaster(Copyable, Movable):
         self.live_triangles = 0
         self.counts = List[UInt32]()
         self.tile_lights = List[UInt32]()
+        self.cluster_lights = List[UInt32]()
         self.cursors = List[UInt32]()
         self.texture_offsets = Dict[Int, Int]()
         self.texture_used = 0
@@ -1487,6 +1516,13 @@ struct GpuRaster(Copyable, Movable):
         self.recoveries = 0
         self.fault_gate = GpuBuffer()
         self.wind = GpuBuffer()
+        self.shadow_map = GpuBuffer()
+        self.csm_record_count = 0
+        self.csm_item_count = 0
+        self.hiz_tiles_x = 0
+        self.hiz_tiles_y = 0
+        self.hiz_valid_mask = 0
+        self.hiz_synced_slot = -1
         self.wind_uploads = 0
         self.fault_pending = 0
         self.fault_generation = 0
@@ -1633,17 +1669,18 @@ struct GpuRaster(Copyable, Movable):
         self.bloom_cells = self.allocate(BLOOM_BYTES, self.local_domain, PAGE_READ | PAGE_WRITE, MEM_GPU_SHADERS)
         self.voxels = self.allocate(VOXEL_BYTES, self.local_domain, PAGE_READ, MEM_GPU_TERRAIN)
         self.occupancy = self.allocate(OCC_BYTES, self.local_domain, PAGE_READ, MEM_GPU_TERRAIN)
+        self.shadow_map = self.allocate(CSM_BYTES, self.local_domain, PAGE_READ | PAGE_WRITE, MEM_GPU_TARGETS)
         self.occupancy_layout = OccupancyLayout()
-        if self.occupancy.size == 0 or self.voxels.size == 0 or self.textures.size == 0 or self.bloom_cells.size == 0:
+        if self.occupancy.size == 0 or self.voxels.size == 0 or self.textures.size == 0 or self.bloom_cells.size == 0 or self.shadow_map.size == 0:
             self.error = self.vk.error
             return False
-        if not self.vk.create_layouts(BIND_COUNT, PUSH_BYTES) or not self.vk.allocate_command_buffers(FRAME_SETS):
+        if not self.vk.create_layouts(BIND_COUNT, PUSH_BYTES) or not self.vk.allocate_command_buffers(FRAME_SETS + 1):
             self.error = self.vk.error
             return False
         if self.vk.timestamps and not self.vk.create_query_pool(FRAME_SETS * QUERIES_PER_FRAME):
             self.error = self.vk.error
             return False
-        # In SHADER_ order, with the Vulkan-only capture variant of compose last.
+        # In SHADER_ order, with CSM + TAA + V8 Atmosphere/Froxel/Hi-Z/Skinning pipelines.
         var ok = self.vk.create_pipeline(vulkan_shaders.raster_shader())
         ok = ok and self.vk.create_pipeline(vulkan_shaders.bloom_reduce_shader())
         ok = ok and self.vk.create_pipeline(vulkan_shaders.bloom_blur_shader(True))
@@ -1651,6 +1688,21 @@ struct GpuRaster(Copyable, Movable):
         ok = ok and self.vk.create_pipeline(vulkan_shaders.compose_shader(False))
         ok = ok and self.vk.create_pipeline(vulkan_shaders.smooth_shader())
         ok = ok and self.vk.create_pipeline(vulkan_shaders.compose_shader(True))
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.kawase_down_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.kawase_up_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.csm_clear_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.csm_raster_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.taa_compose_shader(False))
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.taa_compose_shader(True))
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.histogram_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.auto_exposure_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.sky_lut_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.froxel_integrate_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.hiz_pyramid_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.gpu_skin_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.gpu_particles_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.tsr_upscale_shader())
+        ok = ok and self.vk.create_pipeline(vulkan_shaders.gpu_cull_shader())
         if not ok:
             self.error = self.vk.error
         return ok
@@ -1664,18 +1716,33 @@ struct GpuRaster(Copyable, Movable):
         """Create everything whose size depends on the render resolution."""
         self.width = width
         self.height = height
+        self.render_width = width
+        self.render_height = height
         self.row_pixels = ((width * 4 + 255) & ~255) // 4
         self.columns = (width + TILE_SIZE - 1) // TILE_SIZE
         self.rows = (height + TILE_SIZE - 1) // TILE_SIZE
+        self.hiz_tiles_x = (width + 15) // 16
+        self.hiz_tiles_y = (height + 15) // 16
+        self.hiz_valid_mask = 0
+        self.hiz_synced_slot = -1
         # Colour, bloom source, smoothed colour, inverse depth and a scratch
         # copy of the colour (the last two for 2.7's particles), all local to the GPU.
         self.bloom_offset = self.row_pixels * (height + GROUP_HEIGHT)
         self.target = self.allocate(self.bloom_offset * 4 * TARGET_PLANES, self.local_domain, PAGE_READ | PAGE_WRITE, MEM_GPU_TARGETS)
         self.hud = self.allocate(self.bloom_offset * 4, self.local_domain, PAGE_READ, MEM_GPU_TARGETS)
-        self.backdrop = self.allocate(self.bloom_offset * 8, DOMAIN_GTT, PAGE_READ | PAGE_WRITE, MEM_GPU_TARGETS, False, True)
+        self.backdrop = self.allocate(
+            self.bloom_offset * 8 + HIZ_BACKDROP_EXTRA_BYTES,
+            DOMAIN_GTT,
+            PAGE_READ | PAGE_WRITE,
+            MEM_GPU_TARGETS,
+            False,
+            True,
+        )
         if self.target.size == 0 or self.hud.size == 0 or self.backdrop.size == 0:
             self.error = self.backend_error()
             return False
+        if self.target.cpu_address != 0:
+            _ = external_call["memset", Int](self.target.cpu_address, Int32(0), self.target.size)
         _ = external_call["memset", Int](self.hud.cpu_address, Int32(0), self.hud.size)
         _ = external_call["memset", Int](self.backdrop.cpu_address, Int32(0), self.backdrop.size)
         self.forget_backdrop()
@@ -1685,8 +1752,13 @@ struct GpuRaster(Copyable, Movable):
                 frame.commands = self.allocate(16384, DOMAIN_GTT, PAGE_READ | PAGE_EXECUTE, MEM_GPU_FRAMES)
             frame.records = self.allocate(RECORD_BYTES * MAX_TRIANGLES, self.local_domain, PAGE_READ, MEM_GPU_FRAMES)
             frame.lists = self.allocate(LIST_BYTES, self.local_domain, PAGE_READ, MEM_GPU_FRAMES)
-            frame.tiles = self.allocate(self.columns * self.rows * TILE_ENTRY_DWORDS * 4, self.local_domain, PAGE_READ, MEM_GPU_FRAMES)
-            frame.constants = self.allocate(4096, self.local_domain, PAGE_READ, MEM_GPU_FRAMES)
+            frame.tiles = self.allocate(
+                self.columns * self.rows * (TILE_ENTRY_DWORDS + CLUSTER_WORDS_PER_TILE) * 4,
+                self.local_domain,
+                PAGE_READ,
+                MEM_GPU_FRAMES,
+            )
+            frame.constants = self.allocate(CONSTANT_BYTES, self.local_domain, PAGE_READ, MEM_GPU_FRAMES)
             # The shown image stays in shared memory so the display's GPU can read it.
             frame.shown = self.allocate(self.bloom_offset * 4, DOMAIN_GTT, PAGE_READ | PAGE_WRITE, MEM_GPU_FRAMES, True, True)
             frame.stamps = self.allocate(4096, DOMAIN_GTT, PAGE_READ | PAGE_WRITE, MEM_GPU_FRAMES)
@@ -1698,6 +1770,7 @@ struct GpuRaster(Copyable, Movable):
             return False
         self.counts = List[UInt32](length=self.columns * self.rows, fill=0)
         self.tile_lights = List[UInt32](length=self.columns * self.rows, fill=0)
+        self.cluster_lights = List[UInt32](length=self.columns * self.rows * CLUSTER_WORDS_PER_TILE, fill=0)
         self.cursors = List[UInt32](length=self.columns * self.rows, fill=0)
         self.current = 0
         self.last_submitted = -1
@@ -1723,6 +1796,7 @@ struct GpuRaster(Copyable, Movable):
             self.vk.write_descriptor(frame, BIND_HUD, self.hud)
             self.vk.write_descriptor(frame, BIND_SHOWN, self.sets[index].shown)
             self.vk.write_descriptor(frame, BIND_BACKDROP, self.backdrop)
+            self.vk.write_descriptor(frame, BIND_SHADOW_MAP, self.shadow_map)
         return True
 
     def resize(mut self, width: Int, height: Int) -> Bool:
@@ -1776,6 +1850,9 @@ struct GpuRaster(Copyable, Movable):
         self.release(self.bloom_cells.copy())
         self.release(self.voxels.copy())
         self.release(self.occupancy.copy())
+        if self.shadow_map.size > 0:
+            self.release(self.shadow_map.copy())
+            self.shadow_map = GpuBuffer()
         self.occupancy = GpuBuffer()
         self.occupancy_ready = False
         if self.wind.size > 0:
@@ -1866,6 +1943,8 @@ struct GpuRaster(Copyable, Movable):
                 self.active = False
                 return False
             self.sets[selected].fence = 0
+            if (self.hiz_valid_mask & (UInt32(1) << UInt32(selected))) != 0:
+                self.hiz_synced_slot = selected
             self.shader_seconds += get_time() - started
             self.profiler.record(ZONE_GPU_WAIT, wait_zone, self.profiler.now())
         self.collect_stamps(selected)
@@ -1877,21 +1956,150 @@ struct GpuRaster(Copyable, Movable):
         self.triangle_count = 0
         self.dropped_triangles = 0
         self.character_pass = False
+        self.csm_record_count = 0
+        self.csm_item_count = 0
         return True
 
+    @staticmethod
+    def is_mipmapped(width: Int, height: Int) -> Bool:
+        return width >= 16 and height >= 16 and (width & 15) == 0 and (height & 15) == 0
+
     def texture_offset(mut self, address: Int, width: Int, height: Int) -> Int:
-        """Upload a texture the first time it is seen. Returns -1 when it cannot fit."""
+        """Upload a texture the first time it is seen, appending a 5-level mip pyramid on Vulkan."""
         var known = self.texture_offsets.get(address)
         if known:
             return known.value()
-        var size = width * height * 4
+        var area0 = width * height
+        var has_mips = self.backend == BACKEND_VULKAN and Self.is_mipmapped(width, height)
+        var total_words = (
+            area0 + (area0 >> 2) + (area0 >> 4) + (area0 >> 6) + (area0 >> 8)
+            if has_mips
+            else area0
+        )
+        var size = total_words * 4
         if self.texture_used + size > self.textures.size:
             return -1
         var offset = self.texture_used
-        copy_bytes(self.textures.cpu_address + offset, address, size)
+        var base_addr = self.textures.cpu_address + offset
+        copy_bytes(base_addr, address, area0 * 4)
+        if has_mips:
+            var src_ptr = Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=base_addr)
+            var src_off = 0
+            var src_w = width
+            var src_h = height
+            for _ in range(4):
+                var dst_off = src_off + src_w * src_h
+                var dst_w = src_w >> 1
+                var dst_h = src_h >> 1
+                for my in range(dst_h):
+                    var r0 = src_off + (my * 2) * src_w
+                    var r1 = r0 + src_w
+                    var drow = dst_off + my * dst_w
+                    for mx in range(dst_w):
+                        var sx = mx * 2
+                        var p00 = src_ptr[unsafe_offset=r0 + sx]
+                        var p10 = src_ptr[unsafe_offset=r0 + sx + 1]
+                        var p01 = src_ptr[unsafe_offset=r1 + sx]
+                        var p11 = src_ptr[unsafe_offset=r1 + sx + 1]
+                        var rb = (
+                            ((p00 & 0x00FF00FF) + (p10 & 0x00FF00FF) + (p01 & 0x00FF00FF) + (p11 & 0x00FF00FF) + 0x00020002)
+                            >> 2
+                        ) & 0x00FF00FF
+                        var ag = (
+                            (((p00 >> 8) & 0x00FF00FF) + ((p10 >> 8) & 0x00FF00FF) + ((p01 >> 8) & 0x00FF00FF) + ((p11 >> 8) & 0x00FF00FF) + 0x00020002)
+                            >> 2
+                        ) & 0x00FF00FF
+                        src_ptr[unsafe_offset=drow + mx] = rb | (ag << 8)
+                src_off = dst_off
+                src_w = dst_w
+                src_h = dst_h
         self.texture_used += size
         self.texture_offsets[address] = offset
         return offset
+
+    def add_csm_triangle(
+        mut self,
+        cascade: Int,
+        ax: Float32,
+        ay: Float32,
+        az: Float32,
+        bx: Float32,
+        by: Float32,
+        bz: Float32,
+        cx: Float32,
+        cy: Float32,
+        cz: Float32,
+    ):
+        """Bin one shadow-casting triangle into 16x16 CSM tiles for Cascade 0 or 1."""
+        if self.backend != BACKEND_VULKAN or self.shadow_map.cpu_address == 0:
+            return
+        if self.csm_record_count >= CSM_MAX_RECORDS:
+            return
+        var area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if abs(area) <= 0.02:
+            return
+        var max_z = max(az, max(bz, cz))
+        var min_z = min(az, min(bz, cz))
+        if max_z <= 0.002 or min_z >= 0.998:
+            return
+        var min_px = max(0, Int(floor(min(ax, min(bx, cx)))))
+        var max_px = min(CSM_RES - 1, Int(floor(max(ax, max(bx, cx)))))
+        var min_py = max(0, Int(floor(min(ay, min(by, cy)))))
+        var max_py = min(CSM_RES - 1, Int(floor(max(ay, max(by, cy)))))
+        if min_px > max_px or min_py > max_py:
+            return
+        var tx0 = min_px >> 4
+        var tx1 = max_px >> 4
+        var ty0 = min_py >> 4
+        var ty1 = max_py >> 4
+        var num_tiles = (tx1 - tx0 + 1) * (ty1 - ty0 + 1)
+        if num_tiles > 1024 or self.csm_item_count + num_tiles > CSM_MAX_ITEMS:
+            return
+
+        var inv_area = Float32(1.0) / area
+        var wa_a = (by - cy) * inv_area
+        var wa_b = (cx - bx) * inv_area
+        var wa_c = (bx * cy - by * cx) * inv_area
+        var wb_a = (cy - ay) * inv_area
+        var wb_b = (ax - cx) * inv_area
+        var wb_c = (cx * ay - cy * ax) * inv_area
+        var dz_a = az - cz
+        var dz_b = bz - cz
+        var z_a = dz_a * wa_a + dz_b * wb_a
+        var z_b = dz_a * wa_b + dz_b * wb_b
+        var z_c = cz + dz_a * wa_c + dz_b * wb_c
+
+        var slice_base = self.shadow_map.cpu_address + CSM_DEPTH_BYTES + self.current * CSM_FRAME_SLICE_BYTES
+        var rec_idx = self.csm_record_count
+        self.csm_record_count += 1
+        var rec_ptr = Pointer[Float32, origin=MutAnyOrigin](
+            unsafe_from_address=slice_base + CSM_RECORDS_REL_BYTES + rec_idx * CSM_RECORD_DWORDS * 4
+        )
+        rec_ptr[unsafe_offset=0] = wa_a
+        rec_ptr[unsafe_offset=1] = wa_b
+        rec_ptr[unsafe_offset=2] = wa_c
+        rec_ptr[unsafe_offset=3] = wb_a
+        rec_ptr[unsafe_offset=4] = wb_b
+        rec_ptr[unsafe_offset=5] = wb_c
+        rec_ptr[unsafe_offset=6] = z_a
+        rec_ptr[unsafe_offset=7] = z_b
+        rec_ptr[unsafe_offset=8] = z_c
+        rec_ptr[unsafe_offset=9] = 0.0
+        rec_ptr[unsafe_offset=10] = 0.0
+        rec_ptr[unsafe_offset=11] = 0.0
+
+        var item_ptr = Pointer[UInt32, origin=MutAnyOrigin](
+            unsafe_from_address=slice_base + CSM_ITEMS_REL_BYTES + self.csm_item_count * 8
+        )
+        var casc_bits = UInt32(cascade & 1) << 16
+        var out_i = 0
+        for ty in range(ty0, ty1 + 1):
+            var ty_bits = casc_bits | (UInt32(ty) << 8)
+            for tx in range(tx0, tx1 + 1):
+                item_ptr[unsafe_offset=out_i * 2] = UInt32(rec_idx)
+                item_ptr[unsafe_offset=out_i * 2 + 1] = ty_bits | UInt32(tx)
+                out_i += 1
+        self.csm_item_count += num_tiles
 
     def forget_texture(mut self, address: Int):
         """The memory at address is going away; a later texture may reuse it."""
@@ -1948,6 +2156,8 @@ struct GpuRaster(Copyable, Movable):
         var wanted = 0
         for index in range(len(self.counts)):
             wanted += Int(self.counts[index])
+        var total_tiles = self.columns * self.rows
+        var tile_flag = UInt32(total_tiles) if self.backend == BACKEND_VULKAN else UInt32(0)
         var first = 0
         for index in range(len(self.counts)):
             # Past capacity every tile gives up the same share of its list, and its
@@ -1960,7 +2170,14 @@ struct GpuRaster(Copyable, Movable):
             self.tiles.write32(index * TILE_ENTRY_DWORDS, UInt32(first * 4))
             self.tiles.write32(index * TILE_ENTRY_DWORDS + 1, UInt32(count))
             self.tiles.write32(index * TILE_ENTRY_DWORDS + 2, self.tile_lights[index])
+            self.tiles.write32(index * TILE_ENTRY_DWORDS + 3, tile_flag)
             first += count
+        if len(self.cluster_lights) == total_tiles * CLUSTER_WORDS_PER_TILE and self.tiles.cpu_address != 0:
+            copy_bytes(
+                self.tiles.cpu_address + total_tiles * TILE_ENTRY_DWORDS * 4,
+                Int(self.cluster_lights.unsafe_ptr()),
+                total_tiles * CLUSTER_WORDS_PER_TILE * 4,
+            )
         self.list_entries = first
         self.truncated_entries += wanted - first
         for triangle in range(self.triangle_count):
@@ -2023,9 +2240,13 @@ struct GpuRaster(Copyable, Movable):
     def clear_tile_lights(mut self):
         for index in range(len(self.tile_lights)):
             self.tile_lights[index] = 0
+        for index in range(len(self.cluster_lights)):
+            self.cluster_lights[index] = 0
 
     def mark_tile_lights(mut self, light: Int, left: Int, top: Int, right: Int, bottom: Int):
         """Note that a light's bounds cover this pixel rectangle."""
+        if light < 0 or light >= 32:
+            return
         var first_column = max(0, left // TILE_SIZE)
         var last_column = min(self.columns - 1, right // TILE_SIZE)
         var first_row = max(0, top // TILE_SIZE)
@@ -2033,6 +2254,39 @@ struct GpuRaster(Copyable, Movable):
         for row in range(first_row, last_row + 1):
             for column in range(first_column, last_column + 1):
                 self.tile_lights[row * self.columns + column] |= UInt32(1) << UInt32(light)
+
+    def mark_cluster_light(
+        mut self,
+        light: Int,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int,
+        min_vz: Float32,
+        max_vz: Float32,
+    ):
+        """Mark a point or tube light in the 3D (tile_x, tile_y, z_slice) froxel bitmask."""
+        if light < 0 or light >= MAX_CLUSTER_LIGHTS or max_vz <= 0.05:
+            return
+        if len(self.cluster_lights) != self.columns * self.rows * CLUSTER_WORDS_PER_TILE:
+            return
+        var first_column = max(0, left // TILE_SIZE)
+        var last_column = min(self.columns - 1, right // TILE_SIZE)
+        var first_row = max(0, top // TILE_SIZE)
+        var last_row = min(self.rows - 1, bottom // TILE_SIZE)
+        if first_column > last_column or first_row > last_row:
+            return
+        var s0 = 0 if min_vz < 18.0 else (1 if min_vz < 55.0 else (2 if min_vz < 145.0 else 3))
+        var s1 = 0 if max_vz < 18.0 else (1 if max_vz < 55.0 else (2 if max_vz < 145.0 else 3))
+        var word_off = light >> 5
+        var bit = UInt32(1) << UInt32(light & 31)
+        for row in range(first_row, last_row + 1):
+            var row_base = row * self.columns
+            for column in range(first_column, last_column + 1):
+                var tile_idx = row_base + column
+                for sl in range(s0, s1 + 1):
+                    var froxel = (tile_idx * CLUSTER_Z_SLICES + sl) * CLUSTER_WORDS_PER_SLICE + word_off
+                    self.cluster_lights[froxel] |= bit
 
     def write_float(self, byte_offset: Int, value: Float32):
         self.constants.write32(byte_offset // 4, float_bits(value))
@@ -2379,21 +2633,42 @@ struct GpuRaster(Copyable, Movable):
         var frame = self.current
         self.vk.dispatch(frame, shader, self.sets[frame].descriptor, push, (width + GROUP_WIDTH - 1) // GROUP_WIDTH, (height + GROUP_HEIGHT - 1) // GROUP_HEIGHT)
 
-    def compose_push(self, bloom_width: Int, bloom_height: Int, bloom: Bool, smooth: Bool) -> List[UInt32]:
+    def compose_push(
+        self,
+        bloom_width: Int,
+        bloom_height: Int,
+        bloom: Bool,
+        clear_color: UInt32,
+        rw: Int = 0,
+        rh: Int = 0,
+    ) -> List[UInt32]:
+        var eff_w = rw if (rw > 0 and rw <= self.width) else self.width
+        var eff_h = rh if (rh > 0 and rh <= self.height) else self.height
+        var push = List[UInt32]()
+        push.append(UInt32(self.row_pixels))
+        push.append(UInt32(eff_w))
+        push.append(UInt32(eff_h))
+        push.append(UInt32(bloom_width))
+        push.append(float_bits(Float32(bloom_width) / Float32(max(1, eff_w))))
+        push.append(float_bits(Float32(bloom_height) / Float32(max(1, eff_h))))
+        push.append(UInt32(1) if bloom else UInt32(0))
+        push.append(clear_color)
+        push.append(UInt32(bloom_height))
+        push.append(UInt32(self.bloom_offset))
+        return push^
+
+    def taa_push(self, smooth: Bool) -> List[UInt32]:
         var push = List[UInt32]()
         push.append(UInt32(self.row_pixels))
         push.append(UInt32(self.width))
         push.append(UInt32(self.height))
-        push.append(UInt32(bloom_width))
-        push.append(float_bits(Float32(bloom_width) / Float32(self.width)))
-        push.append(float_bits(Float32(bloom_height) / Float32(self.height)))
-        push.append(UInt32(1) if bloom else UInt32(0))
         push.append(UInt32(self.bloom_offset * 2) if smooth else UInt32(0))
-        push.append(UInt32(bloom_height))
+        push.append(UInt32(self.bloom_offset))
         return push^
 
     def record_vulkan_frame(mut self, clear_color: UInt32, bloom: Bool, bloom_width: Int, bloom_height: Int, bloom_strength: Int, smooth: Bool) -> Bool:
-        """The same passes in the same order as the amdgpu command stream."""
+        """Record 2-Cascade CSM -> Linear HDR Raster -> Linear HDR Dual-Kawase Bloom ->
+        SSR + Volumetrics + SSAO + AgX Compose -> Optional FXAA -> YCoCg TAA + Motion Blur + HUD."""
         var frame = self.current
         var presenting = self.vk.swapchain != 0
         var image = self.vk.acquire_image(frame) if presenting else NO_IMAGE
@@ -2406,13 +2681,37 @@ struct GpuRaster(Copyable, Movable):
             self.sets[frame].stamp_frame = self.profiler.frame()
             self.vk.reset_queries(frame, frame * QUERIES_PER_FRAME, QUERIES_PER_FRAME)
             self.stamp_vulkan(ZONE_NONE)
+
+        # 1. 2-Cascade GPU Shadow Map Clear + Tile Rasterization
+        var csm_quads = CSM_DEPTH_WORDS // 4
+        var csm_clear_p = List[UInt32]()
+        csm_clear_p.append(UInt32(csm_quads))
+        self.vk.dispatch(frame, SHADER_CSM_CLEAR, self.sets[frame].descriptor, csm_clear_p, (csm_quads + 63) // 64, 1)
+        self.vk.pass_barrier(frame)
+        if self.csm_item_count > 0:
+            var slice_words = (CSM_DEPTH_BYTES + frame * CSM_FRAME_SLICE_BYTES) // 4
+            var rec_words = slice_words + CSM_RECORDS_REL_BYTES // 4
+            var item_words = slice_words + CSM_ITEMS_REL_BYTES // 4
+            var gx = min(self.csm_item_count, 4096)
+            var gy = (self.csm_item_count + 4095) // 4096
+            var csm_rast_p = List[UInt32]()
+            csm_rast_p.append(UInt32(rec_words))
+            csm_rast_p.append(UInt32(item_words))
+            csm_rast_p.append(UInt32(self.csm_item_count))
+            csm_rast_p.append(UInt32(gx))
+            self.vk.dispatch(frame, SHADER_CSM_RASTER, self.sets[frame].descriptor, csm_rast_p, gx, gy)
+            self.vk.pass_barrier(frame)
+
+        # 2. Linear Float32 HDR + G-buffer Tile Rasterization (at eff_rw x eff_rh for Sub-Native TSR!)
+        var eff_rw = self.render_width if (self.render_width > 0 and self.render_width <= self.width) else self.width
+        var eff_rh = self.render_height if (self.render_height > 0 and self.render_height <= self.height) else self.height
         var push = List[UInt32]()
         push.append(UInt32(self.row_pixels))
         push.append(UInt32(self.columns))
         push.append(clear_color)
-        push.append(UInt32(self.width))
-        push.append(UInt32(self.height))
-        self.dispatch_vulkan(SHADER_RASTER, push, self.width, self.height)
+        push.append(UInt32(eff_rw))
+        push.append(UInt32(eff_rh))
+        self.dispatch_vulkan(SHADER_RASTER, push, eff_rw, eff_rh)
         self.vk.pass_barrier(frame)
         if timed:
             self.stamp_vulkan(ZONE_GPU_RASTER)
@@ -2420,18 +2719,21 @@ struct GpuRaster(Copyable, Movable):
             self.record_extra_vulkan(frame)
             if timed:
                 self.stamp_vulkan(ZONE_GPU_PARTICLES)
+
+        # 3. Linear Float32 HDR Multi-Scale Dual-Kawase Bloom
         if bloom:
             var reduce = List[UInt32]()
             reduce.append(UInt32(self.row_pixels))
             reduce.append(UInt32(bloom_width))
             reduce.append(UInt32(bloom_height))
-            reduce.append(float_bits(Float32(self.width) / Float32(bloom_width)))
-            reduce.append(float_bits(Float32(self.height) / Float32(bloom_height)))
-            reduce.append(UInt32(self.width - 1))
-            reduce.append(UInt32(self.height - 1))
+            reduce.append(float_bits(Float32(eff_rw) / Float32(bloom_width)))
+            reduce.append(float_bits(Float32(eff_rh) / Float32(bloom_height)))
+            reduce.append(UInt32(eff_rw - 1))
+            reduce.append(UInt32(eff_rh - 1))
             reduce.append(UInt32(self.bloom_offset))
             self.dispatch_vulkan(SHADER_BLOOM_REDUCE, reduce, bloom_width, bloom_height)
             self.vk.pass_barrier(frame)
+            var multi_scale = bloom_width >= 16 and bloom_height >= 12
             for shader in [SHADER_BLUR_HORIZONTAL, SHADER_BLUR_VERTICAL]:
                 var horizontal = shader == SHADER_BLUR_HORIZONTAL
                 var blur = List[UInt32]()
@@ -2439,28 +2741,155 @@ struct GpuRaster(Copyable, Movable):
                 blur.append(UInt32(bloom_height))
                 blur.append(float_bits(1.0 / Float32(bloom_strength)))
                 blur.append(UInt32((BLOOM_SOURCE_OFFSET if horizontal else BLOOM_BLURRED_OFFSET) // 4))
-                blur.append(UInt32((BLOOM_BLURRED_OFFSET if horizontal else BLOOM_FINAL_OFFSET) // 4))
+                blur.append(
+                    UInt32(
+                        (
+                            BLOOM_BLURRED_OFFSET
+                            if horizontal
+                            else (BLOOM_MIP0_CRISP_OFFSET if multi_scale else BLOOM_FINAL_OFFSET)
+                        )
+                        // 4
+                    )
+                )
+                blur.append(UInt32(0) if (not horizontal and multi_scale) else UInt32(1))
                 self.dispatch_vulkan(shader, blur, bloom_width, bloom_height)
+                self.vk.pass_barrier(frame)
+            if multi_scale:
+                var w1 = max(2, bloom_width // 2)
+                var h1 = max(2, bloom_height // 2)
+                var w2 = max(2, w1 // 2)
+                var h2 = max(2, h1 // 2)
+                var down1 = List[UInt32]()
+                down1.append(UInt32(bloom_width))
+                down1.append(UInt32(bloom_height))
+                down1.append(UInt32(w1))
+                down1.append(UInt32(h1))
+                down1.append(UInt32(BLOOM_MIP0_CRISP_OFFSET // 4))
+                down1.append(UInt32(BLOOM_MIP1_OFFSET // 4))
+                self.dispatch_vulkan(SHADER_KAWASE_DOWN, down1, w1, h1)
+                self.vk.pass_barrier(frame)
+
+                var down2 = List[UInt32]()
+                down2.append(UInt32(w1))
+                down2.append(UInt32(h1))
+                down2.append(UInt32(w2))
+                down2.append(UInt32(h2))
+                down2.append(UInt32(BLOOM_MIP1_OFFSET // 4))
+                down2.append(UInt32(BLOOM_MIP2_OFFSET // 4))
+                self.dispatch_vulkan(SHADER_KAWASE_DOWN, down2, w2, h2)
+                self.vk.pass_barrier(frame)
+
+                var up1 = List[UInt32]()
+                up1.append(UInt32(w2))
+                up1.append(UInt32(h2))
+                up1.append(UInt32(w1))
+                up1.append(UInt32(h1))
+                up1.append(UInt32(BLOOM_MIP2_OFFSET // 4))
+                up1.append(UInt32(BLOOM_MIP1_OFFSET // 4))
+                up1.append(UInt32(BLOOM_MIP1_UP_OFFSET // 4))
+                up1.append(float_bits(Float32(0.0)))
+                self.dispatch_vulkan(SHADER_KAWASE_UP, up1, w1, h1)
+                self.vk.pass_barrier(frame)
+
+                var up0 = List[UInt32]()
+                up0.append(UInt32(w1))
+                up0.append(UInt32(h1))
+                up0.append(UInt32(bloom_width))
+                up0.append(UInt32(bloom_height))
+                up0.append(UInt32(BLOOM_MIP1_UP_OFFSET // 4))
+                up0.append(UInt32(BLOOM_MIP0_CRISP_OFFSET // 4))
+                up0.append(UInt32(BLOOM_FINAL_OFFSET // 4))
+                up0.append(float_bits(1.0 / Float32(bloom_strength)))
+                self.dispatch_vulkan(SHADER_KAWASE_UP, up0, bloom_width, bloom_height)
                 self.vk.pass_barrier(frame)
             if timed:
                 self.stamp_vulkan(ZONE_GPU_BLOOM)
+
+        # 3b. V8 Hillaire Sky-View LUT + Temporally Reprojected 3D Froxel Volumetrics + Coarse Hi-Z Pyramid + Auto-Exposure
+        var frame_effects = self.sets[frame].constants.read32(CONSTANT_EFFECTS // 4)
+        if (frame_effects & EFFECT_PHYSICAL_SKY) != 0:
+            var sky_p = List[UInt32]()
+            sky_p.append(UInt32(0))
+            self.vk.dispatch(frame, SHADER_SKY_LUT, self.sets[frame].descriptor, sky_p, (SKY_LUT_W + 7) // 8, (SKY_LUT_H + 7) // 8)
+            self.vk.pass_barrier(frame)
+        if (frame_effects & EFFECT_VOLUMETRIC) != 0 and (frame_effects & EFFECT_FROXEL_VOL) != 0:
+            var ping = self.frames & 1
+            var frox_p = List[UInt32]()
+            frox_p.append(UInt32((FROXEL_VOL_OFFSET + (1 - ping) * FROXEL_SLICE_BYTES) // 4))
+            frox_p.append(UInt32((FROXEL_VOL_OFFSET + ping * FROXEL_SLICE_BYTES) // 4))
+            frox_p.append(UInt32(FROXEL_INTEGRATED_OFFSET // 4))
+            frox_p.append(UInt32(self.frames))
+            self.vk.dispatch(
+                frame,
+                SHADER_FROXEL_INTEGRATE,
+                self.sets[frame].descriptor,
+                frox_p,
+                (FROXEL_X + 7) // 8,
+                (FROXEL_Y + 3) // 4,
+            )
+            self.vk.pass_barrier(frame)
+        if (frame_effects & EFFECT_HIZ_CULL) != 0 and eff_rw == self.width and eff_rh == self.height and self.hiz_tiles_x <= 256 and self.hiz_tiles_y <= 144:
+            var hiz_out_word = self.bloom_offset * 2 + frame * HIZ_SLICE_WORDS
+            var hiz_p = List[UInt32]()
+            hiz_p.append(UInt32(self.row_pixels))
+            hiz_p.append(UInt32(eff_rw))
+            hiz_p.append(UInt32(eff_rh))
+            hiz_p.append(UInt32(self.hiz_tiles_x))
+            hiz_p.append(UInt32(self.bloom_offset * 3))
+            hiz_p.append(UInt32(hiz_out_word))
+            self.vk.dispatch(
+                frame,
+                SHADER_HIZ_PYRAMID,
+                self.sets[frame].descriptor,
+                hiz_p,
+                (self.hiz_tiles_x + 7) // 8,
+                (self.hiz_tiles_y + 3) // 4,
+            )
+            self.vk.pass_barrier(frame)
+            self.hiz_valid_mask |= UInt32(1) << UInt32(frame)
+        else:
+            self.hiz_valid_mask &= ~(UInt32(1) << UInt32(frame))
+            if self.hiz_synced_slot == frame:
+                self.hiz_synced_slot = -1
+        if (frame_effects & EFFECT_AUTO_EXPOSURE) != 0:
+            var hist_p = List[UInt32]()
+            hist_p.append(UInt32(self.row_pixels))
+            hist_p.append(UInt32(eff_rw))
+            hist_p.append(UInt32(eff_rh))
+            hist_p.append(UInt32(self.bloom_offset))
+            var hist_w = (eff_rw + 3) // 4
+            var hist_h = (eff_rh + 3) // 4
+            self.vk.dispatch(frame, SHADER_HISTOGRAM, self.sets[frame].descriptor, hist_p, (hist_w + 15) // 16, (hist_h + 15) // 16)
+            self.vk.pass_barrier(frame)
+            var ae_p = List[UInt32]()
+            self.vk.dispatch(frame, SHADER_AUTO_EXPOSURE, self.sets[frame].descriptor, ae_p, 1, 1)
+            self.vk.pass_barrier(frame)
+
+        # 4. Linear HDR Post-Compose (Refraction + SSR + Volumetrics + GTAO/Contact Shadows + Bloom + Auto-Exp + AgX -> PLANE_COLOR)
+        var compose = self.compose_push(bloom_width, bloom_height, bloom, clear_color, eff_rw, eff_rh)
+        self.dispatch_vulkan(SHADER_COMPOSE, compose, eff_rw, eff_rh)
+        self.vk.pass_barrier(frame)
+
+        # 5. Optional FXAA Edge Smoothing (PLANE_COLOR -> PLANE_SMOOTH)
         if smooth:
             var soften = List[UInt32]()
             soften.append(UInt32(self.row_pixels))
-            soften.append(UInt32(self.width))
-            soften.append(UInt32(self.height))
+            soften.append(UInt32(eff_rw))
+            soften.append(UInt32(eff_rh))
             soften.append(UInt32(self.bloom_offset * 2))
-            self.dispatch_vulkan(SHADER_SMOOTH, soften, self.width, self.height)
+            self.dispatch_vulkan(SHADER_SMOOTH, soften, eff_rw, eff_rh)
             self.vk.pass_barrier(frame)
             if timed:
                 self.stamp_vulkan(ZONE_GPU_SMOOTH)
-        var compose = self.compose_push(bloom_width, bloom_height, bloom, smooth)
+
+        # 6. CAS + 3x3 YCoCg TAA + Supersonic Velocity Motion Blur + HUD Composite
+        var taa = self.taa_push(smooth)
         if self.backdrop_wanted:
-            self.dispatch_vulkan(SHADER_CAPTURE, compose, self.width, self.height)
+            self.dispatch_vulkan(SHADER_TAA_CAPTURE, taa, self.width, self.height)
             self.vk.pass_barrier(frame)
             if timed:
                 self.stamp_vulkan(ZONE_GPU_BACKDROP)
-        self.dispatch_vulkan(SHADER_COMPOSE, compose, self.width, self.height)
+        self.dispatch_vulkan(SHADER_TAA_RESOLVE, taa, self.width, self.height)
         self.vk.barrier(frame, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_HOST, ACCESS_HOST_READ)
         if timed:
             self.stamp_vulkan(ZONE_GPU_COMPOSE)
@@ -2483,8 +2912,356 @@ struct GpuRaster(Copyable, Movable):
             self.error = self.backend_error()
             self.active = False
             return False
+        self.sets[self.last_submitted].fence = 0
+        if (self.hiz_valid_mask & (UInt32(1) << UInt32(self.last_submitted))) != 0:
+            self.hiz_synced_slot = self.last_submitted
         self.copy_image(self.sets[self.last_submitted].shown.cpu_address, pixels)
         return True
+
+    def is_rect_occluded_hiz(
+        self,
+        min_px_x: Int,
+        min_px_y: Int,
+        max_px_x: Int,
+        max_px_y: Int,
+        nearest_iz: Float32,
+    ) -> Bool:
+        """Query the latest completed 16x16 Hi-Z pyramid: True iff every overlapping tile's
+        minimum inverse_z (farthest depth) is strictly closer than `nearest_iz`."""
+        if (
+            self.backend != BACKEND_VULKAN
+            or self.hiz_synced_slot < 0
+            or self.backdrop.cpu_address == 0
+            or self.hiz_tiles_x <= 0
+            or self.hiz_tiles_y <= 0
+        ):
+            return False
+        # Conservative 1-tile dilation to tolerate inter-frame camera/object motion.
+        var tx0 = max(0, (min_px_x // 16) - 1)
+        var ty0 = max(0, (min_px_y // 16) - 1)
+        var tx1 = min(self.hiz_tiles_x - 1, (max_px_x // 16) + 1)
+        var ty1 = min(self.hiz_tiles_y - 1, (max_px_y // 16) + 1)
+        if tx0 > tx1 or ty0 > ty1:
+            return False
+        var base_addr = (
+            self.backdrop.cpu_address
+            + (self.bloom_offset * 2 + self.hiz_synced_slot * HIZ_SLICE_WORDS) * 4
+        )
+        var ptr = Pointer[Float32, origin=MutAnyOrigin](unsafe_from_address=base_addr)
+        var biased_iz = nearest_iz * Float32(1.03)
+        for ty in range(ty0, ty1 + 1):
+            var row_off = ty * self.hiz_tiles_x
+            for tx in range(tx0, tx1 + 1):
+                if ptr[unsafe_offset=row_off + tx] <= biased_iz:
+                    return False
+        return True
+
+    def run_gpu_skin(
+        mut self,
+        joint_matrices_3x4: List[Float32],
+        in_packed_words: List[UInt32],
+        vert_count: Int,
+        mut out_pos_norm: List[Float32],
+    ) -> Bool:
+        """Dispatch SHADER_GPU_SKIN on Vulkan using auxiliary command buffer `FRAME_SETS`."""
+        if (
+            not self.active
+            or self.backend != BACKEND_VULKAN
+            or self.backdrop.cpu_address == 0
+            or len(self.sets) == 0
+            or vert_count <= 0
+        ):
+            return False
+        var joint_floats = min(len(joint_matrices_3x4), GPU_SKIN_MAX_JOINTS * 12)
+        if joint_floats < 12:
+            return False
+        out_pos_norm.resize(vert_count * 6, 0.0)
+        var skin_base_words = self.bloom_offset * 2 + GPU_SKIN_REL_BYTES // 4
+        var skin_base_addr = self.backdrop.cpu_address + skin_base_words * 4
+        copy_bytes(skin_base_addr, Int(joint_matrices_3x4.unsafe_ptr()), joint_floats * 4)
+
+        var aux_cmd = FRAME_SETS
+        var processed = 0
+        while processed < vert_count:
+            var batch = min(vert_count - processed, GPU_SKIN_MAX_VERTS)
+            var in_words_off = skin_base_words + GPU_SKIN_MAX_JOINTS * 12
+            var out_words_off = in_words_off + batch * 12
+            copy_bytes(
+                self.backdrop.cpu_address + in_words_off * 4,
+                Int(in_packed_words.unsafe_ptr()) + processed * 12 * 4,
+                batch * 12 * 4,
+            )
+            if not self.vk.begin_commands(aux_cmd):
+                return False
+            var push = List[UInt32]()
+            push.append(UInt32(skin_base_words))
+            push.append(UInt32(in_words_off))
+            push.append(UInt32(out_words_off))
+            push.append(UInt32(batch))
+            self.vk.dispatch(
+                aux_cmd,
+                SHADER_GPU_SKIN,
+                self.sets[0].descriptor,
+                push,
+                (batch + 63) // 64,
+                1,
+            )
+            self.vk.barrier(aux_cmd, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_HOST, ACCESS_HOST_READ)
+            var fence = self.vk.submit(aux_cmd)
+            if fence == 0 or not self.vk.wait(fence):
+                return False
+            copy_bytes(
+                Int(out_pos_norm.unsafe_ptr()) + processed * 6 * 4,
+                self.backdrop.cpu_address + out_words_off * 4,
+                batch * 6 * 4,
+            )
+            processed += batch
+        return True
+
+    def run_gpu_particles(
+        mut self,
+        mut packed_particles: List[UInt32],
+        count: Int,
+        dt: Float32,
+        gravity: Float32 = -9.8,
+        drag: Float32 = 0.85,
+        depth_bounce: Bool = True,
+        restitution: Float32 = 0.45,
+    ) -> Bool:
+        """Dispatch SHADER_GPU_PARTICLES (up to 65,536 particles) on Vulkan with screen-space depth bounce."""
+        var n = min(count, min(GPU_PARTICLE_MAX, len(packed_particles) // GPU_PARTICLE_STRIDE_WORDS))
+        if (
+            not self.active
+            or self.backend != BACKEND_VULKAN
+            or self.backdrop.cpu_address == 0
+            or len(self.sets) == 0
+            or n <= 0
+        ):
+            return False
+        if depth_bounce and self.last_submitted >= 0:
+            if not self.finish_frames():
+                return False
+        var in_words_off = self.bloom_offset * 2 + GPU_PARTICLE_REL_BYTES // 4
+        var out_words_off = in_words_off + GPU_PARTICLE_MAX * GPU_PARTICLE_STRIDE_WORDS
+        var byte_count = n * GPU_PARTICLE_STRIDE_WORDS * 4
+        copy_bytes(
+            self.backdrop.cpu_address + in_words_off * 4,
+            Int(packed_particles.unsafe_ptr()),
+            byte_count,
+        )
+        var aux_cmd = FRAME_SETS
+        if not self.vk.begin_commands(aux_cmd):
+            return False
+        var dt_cp = dt
+        var grav_cp = gravity
+        var drag_cp = drag
+        var dt_bits = Pointer(to=dt_cp).unsafe_bitcast[UInt32]()[unsafe_offset=0]
+        var grav_bits = Pointer(to=grav_cp).unsafe_bitcast[UInt32]()[unsafe_offset=0]
+        var drag_bits = Pointer(to=drag_cp).unsafe_bitcast[UInt32]()[unsafe_offset=0]
+        var depth_off = UInt32(self.bloom_offset * 3) if (depth_bounce and self.last_submitted >= 0) else UInt32(0)
+        var rest_q = UInt32(max(0, min(255, Int(restitution * Float32(255.0) + Float32(0.5)))))
+        var row_bounce = UInt32(self.row_pixels & 0xFFFF) | (rest_q << 16)
+        var push = List[UInt32]()
+        push.append(UInt32(in_words_off))
+        push.append(UInt32(out_words_off))
+        push.append(UInt32(n))
+        push.append(dt_bits)
+        push.append(grav_bits)
+        push.append(drag_bits)
+        push.append(depth_off)
+        push.append(row_bounce)
+        var set_idx = self.current if (self.current >= 0 and self.current < len(self.sets)) else 0
+        self.vk.dispatch(
+            aux_cmd,
+            SHADER_GPU_PARTICLES,
+            self.sets[set_idx].descriptor,
+            push,
+            (n + 63) // 64,
+            1,
+        )
+        self.vk.barrier(aux_cmd, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_HOST, ACCESS_HOST_READ)
+        var fence = self.vk.submit(aux_cmd)
+        if fence == 0 or not self.vk.wait(fence):
+            return False
+        copy_bytes(
+            Int(packed_particles.unsafe_ptr()),
+            self.backdrop.cpu_address + out_words_off * 4,
+            byte_count,
+        )
+        _ = len(packed_particles)
+        return True
+
+    def run_tsr_upscale(
+        mut self,
+        src_pixels: List[UInt32],
+        src_w: Int,
+        src_h: Int,
+        dst_w: Int,
+        dst_h: Int,
+        mut out_pixels: List[UInt32],
+        sharpness: Float32 = 0.42,
+        history_blend: Float32 = 0.0,
+        jitter_x: Float32 = 0.0,
+        jitter_y: Float32 = 0.0,
+        history_parity: Int = 0,
+    ) -> Bool:
+        """Dispatch V10 SHADER_TSR_UPSCALE (5-Tap Catmull-Rom + YCoCg history clamp) on Vulkan."""
+        if (
+            not self.active
+            or self.backend != BACKEND_VULKAN
+            or self.backdrop.cpu_address == 0
+            or len(self.sets) == 0
+            or src_w < 2
+            or src_h < 2
+            or dst_w < 2
+            or dst_h < 2
+            or len(src_pixels) < src_w * src_h
+        ):
+            return False
+        var src_words = src_w * src_h
+        var dst_words = dst_w * dst_h
+        var max_words = (HIZ_BACKDROP_EXTRA_BYTES - TSR_SCRATCH_REL_BYTES) // 4
+        if src_words + dst_words > max_words:
+            return False
+        if history_blend > Float32(0.005) and self.last_submitted >= 0:
+            if not self.finish_frames():
+                return False
+        out_pixels.resize(dst_words, 0)
+        var tsr_base_words = self.bloom_offset * 2 + TSR_SCRATCH_REL_BYTES // 4
+        var dst_words_off = tsr_base_words + src_words
+        copy_bytes(
+            self.backdrop.cpu_address + tsr_base_words * 4,
+            Int(src_pixels.unsafe_ptr()),
+            src_words * 4,
+        )
+        var aux_cmd = FRAME_SETS
+        if not self.vk.begin_commands(aux_cmd):
+            return False
+        var use_hist = history_blend > Float32(0.005) and dst_w == self.width and dst_h == self.height and self.last_submitted >= 0
+        var hist_plane = 9 if history_parity == 0 else 10
+        var hist_off = UInt32(self.bloom_offset * hist_plane) if use_hist else UInt32(0)
+        var vel_off = UInt32(self.bloom_offset * 11) if use_hist else UInt32(0)
+        var blend_q = UInt32(max(0, min(255, Int(history_blend * Float32(255.0) + Float32(0.5)))))
+        var row_blend = UInt32(self.row_pixels & 0xFFFF) | (blend_q << 16)
+        var sharp_q = UInt32(max(0, min(255, Int(sharpness * Float32(127.5) + Float32(0.5)))))
+        var jx_q = UInt32(max(0, min(255, Int(jitter_x * Float32(128.0) + Float32(128.5)))))
+        var jy_q = UInt32(max(0, min(255, Int(jitter_y * Float32(128.0) + Float32(128.5)))))
+        var sharp_jit = sharp_q | (jx_q << 8) | (jy_q << 16)
+        var push = List[UInt32]()
+        push.append(UInt32(tsr_base_words))
+        push.append(UInt32(dst_words_off))
+        push.append(hist_off)
+        push.append(vel_off)
+        push.append(UInt32(src_w & 0xFFFF) | (UInt32(src_h & 0xFFFF) << 16))
+        push.append(UInt32(dst_w & 0xFFFF) | (UInt32(dst_h & 0xFFFF) << 16))
+        push.append(row_blend)
+        push.append(sharp_jit)
+        var set_idx = self.last_submitted if (self.last_submitted >= 0 and self.last_submitted < len(self.sets)) else 0
+        self.vk.dispatch(
+            aux_cmd,
+            SHADER_TSR_UPSCALE,
+            self.sets[set_idx].descriptor,
+            push,
+            (dst_w + GROUP_WIDTH - 1) // GROUP_WIDTH,
+            (dst_h + GROUP_HEIGHT - 1) // GROUP_HEIGHT,
+        )
+        self.vk.barrier(aux_cmd, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_HOST, ACCESS_HOST_READ)
+        var fence = self.vk.submit(aux_cmd)
+        if fence == 0 or not self.vk.wait(fence):
+            return False
+        copy_bytes(
+            Int(out_pixels.unsafe_ptr()),
+            self.backdrop.cpu_address + dst_words_off * 4,
+            dst_words * 4,
+        )
+        _ = len(src_pixels)
+        _ = len(out_pixels)
+        return True
+
+    def run_gpu_cull(
+        mut self,
+        packed_instances: List[UInt32],
+        instance_count: Int,
+        mut out_visibility: List[UInt32],
+        mut out_indirect_cmds: List[UInt32],
+        use_hiz: Bool = True,
+    ) -> Int:
+        """Dispatch V10 SHADER_GPU_CULL (Frustum + 16x16 Hi-Z Occlusion -> Indirect Draw Buffer) on Vulkan.
+        Returns visible count (>= 0) on success, or -1 if GPU path unavailable."""
+        var n = min(instance_count, min(GPU_CULL_MAX_INSTANCES, len(packed_instances) // GPU_CULL_IN_STRIDE_WORDS))
+        if (
+            not self.active
+            or self.backend != BACKEND_VULKAN
+            or self.backdrop.cpu_address == 0
+            or len(self.sets) == 0
+            or n <= 0
+        ):
+            return -1
+        if use_hiz and self.last_submitted >= 0:
+            if self.finish_frames() and (self.hiz_valid_mask & (UInt32(1) << UInt32(self.last_submitted))) != 0:
+                self.hiz_synced_slot = self.last_submitted
+        var cull_base_words = self.bloom_offset * 2 + GPU_CULL_REL_BYTES // 4
+        var vis_words_off = cull_base_words + GPU_CULL_MAX_INSTANCES * GPU_CULL_IN_STRIDE_WORDS
+        var cnt_words_off = vis_words_off + GPU_CULL_MAX_INSTANCES
+        var ind_words_off = cnt_words_off + 16
+        copy_bytes(
+            self.backdrop.cpu_address + cull_base_words * 4,
+            Int(packed_instances.unsafe_ptr()),
+            n * GPU_CULL_IN_STRIDE_WORDS * 4,
+        )
+        Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=self.backdrop.cpu_address + cnt_words_off * 4)[unsafe_offset=0] = 0
+        var aux_cmd = FRAME_SETS
+        if not self.vk.begin_commands(aux_cmd):
+            return -1
+        var hiz_ready = use_hiz and self.hiz_synced_slot >= 0 and self.hiz_tiles_x > 0 and self.hiz_tiles_y > 0
+        var hiz_off = UInt32(self.bloom_offset * 2 + self.hiz_synced_slot * HIZ_SLICE_WORDS) if hiz_ready else UInt32(0)
+        var hiz_dims = (UInt32(self.hiz_tiles_x & 0xFFFF) | (UInt32(self.hiz_tiles_y & 0xFFFF) << 16)) if hiz_ready else UInt32(0)
+        var scr_wh = UInt32(self.width & 0xFFFF) | (UInt32(self.height & 0xFFFF) << 16)
+        var push = List[UInt32]()
+        push.append(UInt32(cull_base_words))
+        push.append(UInt32(vis_words_off))
+        push.append(UInt32(cnt_words_off))
+        push.append(UInt32(ind_words_off))
+        push.append(UInt32(n))
+        push.append(hiz_off)
+        push.append(hiz_dims)
+        push.append(scr_wh)
+        var set_idx = self.current if (self.current >= 0 and self.current < len(self.sets) and self.constants.cpu_address != 0) else (
+            self.last_submitted if (self.last_submitted >= 0 and self.last_submitted < len(self.sets)) else 0
+        )
+        self.vk.dispatch(
+            aux_cmd,
+            SHADER_GPU_CULL,
+            self.sets[set_idx].descriptor,
+            push,
+            (n + 63) // 64,
+            1,
+        )
+        self.vk.barrier(aux_cmd, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_HOST, ACCESS_HOST_READ)
+        var fence = self.vk.submit(aux_cmd)
+        if fence == 0 or not self.vk.wait(fence):
+            return -1
+        var vis_cnt = Int(
+            Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=self.backdrop.cpu_address + cnt_words_off * 4)[unsafe_offset=0]
+        )
+        vis_cnt = max(0, min(n, vis_cnt))
+        out_visibility.resize(n, 0)
+        copy_bytes(
+            Int(out_visibility.unsafe_ptr()),
+            self.backdrop.cpu_address + vis_words_off * 4,
+            n * 4,
+        )
+        out_indirect_cmds.resize(vis_cnt * 5, 0)
+        if vis_cnt > 0:
+            copy_bytes(
+                Int(out_indirect_cmds.unsafe_ptr()),
+                self.backdrop.cpu_address + ind_words_off * 4,
+                vis_cnt * 5 * 4,
+            )
+        _ = len(packed_instances)
+        _ = len(out_visibility)
+        _ = len(out_indirect_cmds)
+        return vis_cnt
 
     def read_back_backdrop(mut self, mut pixels: List[UInt32]) -> Bool:
         """Wait for the captured frame and copy its scene, without the HUD, to the CPU."""
@@ -2507,10 +3284,17 @@ struct GpuRaster(Copyable, Movable):
         ref frame = source.sets[source.last_submitted]
         copy_bytes(self.records.cpu_address, frame.records.cpu_address, source.triangle_count * RECORD_BYTES)
         copy_bytes(self.lists.cpu_address, frame.lists.cpu_address, source.list_entries * 4)
-        copy_bytes(self.tiles.cpu_address, frame.tiles.cpu_address, source.columns * source.rows * TILE_ENTRY_DWORDS * 4)
+        copy_bytes(self.tiles.cpu_address, frame.tiles.cpu_address, frame.tiles.size)
         copy_bytes(self.constants.cpu_address, frame.constants.cpu_address, frame.constants.size)
         copy_bytes(self.hud.cpu_address, source.hud.cpu_address, source.hud.size)
         copy_bytes(self.voxels.cpu_address, source.voxels.cpu_address, source.voxel_bytes_used)
+        if source.csm_item_count > 0 and source.shadow_map.cpu_address != 0 and self.shadow_map.cpu_address != 0:
+            var src_slice = source.shadow_map.cpu_address + CSM_DEPTH_BYTES + source.last_submitted * CSM_FRAME_SLICE_BYTES
+            var dst_slice = self.shadow_map.cpu_address + CSM_DEPTH_BYTES + self.current * CSM_FRAME_SLICE_BYTES
+            copy_bytes(dst_slice, src_slice, source.csm_record_count * CSM_RECORD_DWORDS * 4)
+            copy_bytes(dst_slice + CSM_ITEMS_REL_BYTES, src_slice + CSM_ITEMS_REL_BYTES, source.csm_item_count * 8)
+            self.csm_record_count = source.csm_record_count
+            self.csm_item_count = source.csm_item_count
         var new_texture_bytes = source.texture_used - self.mirrored_texture_bytes
         if new_texture_bytes > 0:
             copy_bytes(self.textures.cpu_address + self.mirrored_texture_bytes, source.textures.cpu_address + self.mirrored_texture_bytes, new_texture_bytes)

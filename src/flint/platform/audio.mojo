@@ -5,9 +5,16 @@ uses the documented ALSA kernel interface directly; no audio client library is
 loaded or linked. Failure to open or configure a device leaves the game silent.
 """
 from std.ffi import external_call
-from std.math import floor, cos
+from std.math import floor, cos, abs, sqrt
+from flint.core.math import Vec3
 from flint.platform.os import read_bytes, close_fd, env_value
 from flint.platform.pulse import PulseClient
+from flint.platform.dsp import (
+    StereoReverbFDN,
+    compute_spatial_3d,
+    equal_power_gains,
+    soft_clip_tanh,
+)
 
 
 def wav_u16(data: List[UInt8], offset: Int) -> Int:
@@ -177,10 +184,17 @@ struct AudioVoice:
     var position: Float64
     var pitch: Float32
     var volume: Float32
+    var pan: Float32
+    var lpf_coeff: Float32
+    var lp_l: Float32
+    var lp_r: Float32
+    var reverb_send: Float32
     var priority: Int
     var order: UInt64
     var bank: Int  # the 2.5 sound bank it plays for, or -1
     var bus: Int   # BUS_EFFECTS or BUS_SPEECH (package 3.15)
+    var elevation: Float32  # V10 Binaural HRTF pinna elevation (-1..+1)
+    var hull_conducted: Bool  # V10 True for internal airframe/cockpit vibration (bypasses vacuum exterior muffle)
 
     def __init__(out self):
         self.bus = BUS_EFFECTS
@@ -189,9 +203,16 @@ struct AudioVoice:
         self.position = 0
         self.pitch = 1
         self.volume = 1
+        self.pan = 0.0
+        self.lpf_coeff = 1.0
+        self.lp_l = 0.0
+        self.lp_r = 0.0
+        self.reverb_send = 0.08
         self.priority = 0
         self.order = 0
         self.bank = -1
+        self.elevation = 0.0
+        self.hull_conducted = False
 
 
 struct NativeAudio:
@@ -226,7 +247,13 @@ struct NativeAudio:
     var drone_level: Float32       # what the game asked for, 0 to 1
     var drone_gain: Float32        # the gain now, eased toward the level's
     var drone_phase: Float64       # where the first read head is in the loop, 0 to 1
-    var drone_low: Float32         # the low-pass filter's state
+    var drone_low: Float32         # the low-pass filter's state (L)
+    var drone_low_r: Float32       # the low-pass filter's state (R)
+    var reverb: StereoReverbFDN    # live 4x4 Householder FDN spatial reverb bus
+    var reverb_enabled: Bool
+    var speech_duck: Float32       # smooth sidechain auto-ducking multiplier while BUS_SPEECH is active
+    var hrtf_enabled: Bool         # V10 Woodworth ITD interaural delay + head-shadow + pinna elevation cue
+    var vacuum_mix: Float32        # V10 0.0 = atmosphere, 1.0 = orbital space vacuum muffling for external SFX
 
     def __init__(out self):
         self.drone_clip = DRONE_CLIP
@@ -234,6 +261,12 @@ struct NativeAudio:
         self.drone_gain = 0
         self.drone_phase = 0
         self.drone_low = 0
+        self.drone_low_r = 0
+        self.reverb = StereoReverbFDN(feedback=0.74, damp=0.36)
+        self.reverb_enabled = True
+        self.speech_duck = 1.0
+        self.hrtf_enabled = True
+        self.vacuum_mix = 0.0
         self.bus_volume = List[Float32](length=BUS_COUNT, fill=1)
         self.mono = False
         self.output_name = String()
@@ -412,6 +445,41 @@ struct NativeAudio:
         """A clip on the speech bus (package 3.15; the narrator's voice, 3.28)."""
         self.play_voice(sound_id, pitch, volume, priority, -1, 0, BUS_SPEECH)
 
+    def stop_speech(mut self):
+        """Cleanly stops any currently playing voice on `BUS_SPEECH` so new tactical guidance never overlaps."""
+        for index in range(len(self.voices)):
+            if self.voices[index].active and self.voices[index].bus == BUS_SPEECH:
+                self.voices[index].active = False
+
+    def is_speech_playing(self) -> Bool:
+        """True while any voice on `BUS_SPEECH` is actively playing."""
+        for index in range(len(self.voices)):
+            if self.voices[index].active and self.voices[index].bus == BUS_SPEECH:
+                return True
+        return False
+
+    def speech_rms_level(self) -> Float32:
+        """Returns real-time `[0.0, 1.0]` peak envelope at the active `BUS_SPEECH` read head for HUD voice oscilloscopes."""
+        var best = Float32(0.0)
+        for index in range(len(self.voices)):
+            if not self.voices[index].active or self.voices[index].bus != BUS_SPEECH:
+                continue
+            var cid = self.voices[index].clip
+            if cid < 0 or cid >= len(self.clips) or not self.clips[cid].valid:
+                continue
+            var pos = Int(floor(self.voices[index].position))
+            var n_frames = self.clips[cid].frame_count()
+            var ch = self.clips[cid].channels
+            var span = min(256, max(0, n_frames - pos))
+            var peak = Float32(0.0)
+            for k in range(0, span, 4):
+                var s = abs(Float32(self.clips[cid].samples[(pos + k) * ch]) / Float32(32768.0))
+                if s > peak:
+                    peak = s
+            if peak > best:
+                best = peak
+        return min(Float32(1.0), best * Float32(1.35))
+
     def set_music_clip(
         mut self,
         var clip: WavClip,
@@ -438,10 +506,11 @@ struct NativeAudio:
         self.drone_level = max(Float32(0), min(Float32(1), level))
 
     def mix_drone(mut self, mut mixed: List[Float32], count: Int):
-        """Adds the hum to a mixed block (both channels alike)."""
+        """Adds the stereo throttle-coupled turbine/ambient hum to a mixed block."""
         if self.drone_level <= 0 and self.drone_gain < 1.0e-5:
             self.drone_gain = 0
             self.drone_low = 0
+            self.drone_low_r = 0
             return
         if self.drone_clip < 0 or self.drone_clip >= len(self.clips) or not self.clips[self.drone_clip].valid:
             return
@@ -454,28 +523,34 @@ struct NativeAudio:
         var step = Float64(pitch) * Float64(self.clips[self.drone_clip].sample_rate) / Float64(self.output_rate) / span
         var ease = 1.0 / (DRONE_EASE_SECONDS * Float32(self.output_rate))
         var target = DRONE_GAIN * self.drone_level
-        var bus = self.bus_volume[BUS_EFFECTS]
+        var lp_coeff = min(Float32(0.55), DRONE_LOW_PASS + self.drone_level * Float32(0.28))
+        var bus = self.bus_volume[BUS_EFFECTS] * (Float32(0.45) + Float32(0.55) * self.speech_duck)
         var phase = self.drone_phase
         var gain = self.drone_gain
-        var low = self.drone_low
+        var low_l = self.drone_low
+        var low_r = self.drone_low_r
         for frame in range(count):
             var other = phase + 0.5
             if other >= 1:
                 other -= 1
             var w = Float32(0.5 - 0.5 * cos(phase * 6.283185307179586))
-            var a = clip_sample(self.clips[self.drone_clip], start + phase * span, 0)
-            var b = clip_sample(self.clips[self.drone_clip], start + other * span, 0)
-            low += (a * w + b * (1 - w) - low) * DRONE_LOW_PASS
+            var al = clip_sample(self.clips[self.drone_clip], start + phase * span, 0)
+            var bl = clip_sample(self.clips[self.drone_clip], start + other * span, 0)
+            var ar = clip_sample(self.clips[self.drone_clip], start + phase * span, 1)
+            var br = clip_sample(self.clips[self.drone_clip], start + other * span, 1)
+            low_l += (al * w + bl * (1 - w) - low_l) * lp_coeff
+            low_r += (ar * w + br * (1 - w) - low_r) * lp_coeff
             gain += (target - gain) * ease
-            var sample = low * gain * bus
-            mixed[frame * 2] += sample
-            mixed[frame * 2 + 1] += sample
+            var g = gain * bus
+            mixed[frame * 2] += low_l * g
+            mixed[frame * 2 + 1] += low_r * g
             phase += step
             if phase >= 1:
                 phase -= 1
         self.drone_phase = phase
         self.drone_gain = gain
-        self.drone_low = low
+        self.drone_low = low_l
+        self.drone_low_r = low_r
 
     def set_mono(mut self, on: Bool):
         self.mono = on
@@ -526,7 +601,29 @@ struct NativeAudio:
                 count += 1
         return count
 
-    def play_voice(mut self, sound_id: Int, pitch: Float32, volume: Float32, priority: Int, bank: Int, limit: Int, bus: Int = BUS_EFFECTS):
+    def set_hrtf(mut self, enabled: Bool):
+        """Enable or disable V10 Binaural HRTF (Woodworth ITD sample delay + head-shadow + pinna elevation)."""
+        self.hrtf_enabled = enabled
+
+    def set_vacuum_acoustics(mut self, mix: Float32):
+        """Set orbital vacuum acoustic muffling (0.0 = full atmosphere, 1.0 = deep space sub-bass conduction)."""
+        self.vacuum_mix = max(Float32(0.0), min(Float32(1.0), mix))
+
+    def play_voice(
+        mut self,
+        sound_id: Int,
+        pitch: Float32,
+        volume: Float32,
+        priority: Int,
+        bank: Int,
+        limit: Int,
+        bus: Int = BUS_EFFECTS,
+        pan: Float32 = 0.0,
+        lpf_coeff: Float32 = 1.0,
+        reverb_send: Float32 = 0.08,
+        elevation: Float32 = 0.0,
+        hull_conducted: Bool = False,
+    ):
         """Starts a clip. A bank play (bank >= 0) with `limit` of the bank's
         voices already sounding takes the bank's lowest-priority, oldest voice
         if that is of no higher priority, else it is dropped; otherwise a free
@@ -572,29 +669,130 @@ struct NativeAudio:
         self.voices[selected].clip = sound_id
         self.voices[selected].position = 0
         self.voices[selected].pitch = max(Float32(0.25), min(Float32(4), pitch))
-        self.voices[selected].volume = max(Float32(0), min(Float32(1), volume))
+        self.voices[selected].volume = max(Float32(0), min(Float32(1.25), volume))
+        self.voices[selected].pan = max(Float32(-1.0), min(Float32(1.0), pan))
+        self.voices[selected].lpf_coeff = max(Float32(0.04), min(Float32(1.0), lpf_coeff))
+        self.voices[selected].lp_l = 0.0
+        self.voices[selected].lp_r = 0.0
+        self.voices[selected].reverb_send = max(Float32(0.0), min(Float32(0.65), reverb_send))
         self.voices[selected].priority = priority
         self.voices[selected].order = self.next_order
         self.voices[selected].bank = bank
         self.voices[selected].bus = bus if bus == BUS_SPEECH else BUS_EFFECTS
+        self.voices[selected].elevation = max(Float32(-1.0), min(Float32(1.0), elevation))
+        self.voices[selected].hull_conducted = hull_conducted
         self.next_order += 1
         self.events_accepted += 1
+
+    def play_spatial(
+        mut self,
+        sound_id: Int,
+        pitch: Float32 = 1.0,
+        volume: Float32 = 0.75,
+        pan: Float32 = 0.0,
+        lpf_coeff: Float32 = 1.0,
+        reverb_send: Float32 = 0.14,
+        priority: Int = 2,
+        bank: Int = -1,
+        limit: Int = 0,
+        elevation: Float32 = 0.0,
+        hull_conducted: Bool = False,
+    ):
+        self.play_voice(
+            sound_id,
+            pitch,
+            volume,
+            priority,
+            bank,
+            limit,
+            BUS_EFFECTS,
+            pan,
+            lpf_coeff,
+            reverb_send,
+            elevation,
+            hull_conducted,
+        )
+
+    def play_sound_3d(
+        mut self,
+        sound_id: Int,
+        listener_pos: Vec3,
+        listener_vel: Vec3,
+        listener_right: Vec3,
+        source_pos: Vec3,
+        source_vel: Vec3 = Vec3(0.0, 0.0, 0.0),
+        base_pitch: Float32 = 1.0,
+        base_volume: Float32 = 0.85,
+        ref_dist: Float32 = 24.0,
+        max_dist: Float32 = 420.0,
+        doppler_scale: Float32 = 0.65,
+        priority: Int = 2,
+        bank: Int = -1,
+        limit: Int = 0,
+        listener_up: Vec3 = Vec3(0.0, 1.0, 0.0),
+        hull_conducted: Bool = False,
+    ):
+        """Plays a 3D spatialized sound with Binaural HRTF (ITD + pinna elevation), inverse-distance
+        rolloff, radial-velocity Doppler pitch shift, HF air/vacuum absorption, and FDN reverb send."""
+        var sp = compute_spatial_3d(
+            listener_pos,
+            listener_vel,
+            listener_right,
+            source_pos,
+            source_vel,
+            ref_dist,
+            max_dist,
+            doppler_scale,
+        )
+        var final_vol = base_volume * sp.gain
+        if final_vol < Float32(0.012):
+            return
+        var rel = source_pos - listener_pos
+        var dist = sqrt(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z)
+        var up_dot = rel.x * listener_up.x + rel.y * listener_up.y + rel.z * listener_up.z
+        var elev = max(Float32(-1.0), min(Float32(1.0), up_dot / max(Float32(0.5), dist)))
+        self.play_voice(
+            sound_id,
+            base_pitch * sp.doppler_pitch,
+            final_vol,
+            priority,
+            bank,
+            limit,
+            BUS_EFFECTS,
+            sp.pan,
+            sp.lpf_coeff,
+            sp.reverb_send,
+            elev,
+            hull_conducted,
+        )
 
     def mix_stereo(mut self, frames: Int) -> List[Int16]:
         var count = max(0, min(32768, frames))
         var mixed = List[Float32](length=count * 2, fill=0)
+        var rev_send_buf = List[Float32](length=count * 2, fill=0)
+        var has_rev_send = False
+        var speech_active = self.is_speech_playing()
+        var duck_goal = Float32(0.38) if speech_active else Float32(1.0)
+        var duck_rate = Float32(0.0012) if speech_active else Float32(0.00018)
         if self.music_loaded:
             var position = self.music_position
             var step = Float64(self.music_pitch) * Float64(self.music.sample_rate) / Float64(self.output_rate)
             var music_frames = self.music.frame_count()
-            var music_gain = self.music_volume * self.bus_volume[BUS_MUSIC]
+            var base_music_gain = self.music_volume * self.bus_volume[BUS_MUSIC]
+            var duck = self.speech_duck
             for frame in range(count):
+                duck += (duck_goal - duck) * duck_rate
+                var music_gain = base_music_gain * duck
                 for channel in range(2):
                     mixed[frame * 2 + channel] += clip_sample(self.music, position, channel, True) * music_gain
                 position += step
                 if position >= Float64(music_frames):
                     position -= Float64(music_frames)
             self.music_position = position
+            self.speech_duck = duck
+        else:
+            for _ in range(count):
+                self.speech_duck += (duck_goal - self.speech_duck) * duck_rate
         for voice_index in range(len(self.voices)):
             if not self.voices[voice_index].active:
                 continue
@@ -605,16 +803,85 @@ struct NativeAudio:
             var position = self.voices[voice_index].position
             var step = Float64(self.voices[voice_index].pitch) * Float64(self.clips[clip_index].sample_rate) / Float64(self.output_rate)
             var volume = self.voices[voice_index].volume * self.bus_volume[self.voices[voice_index].bus]
+            var pan = self.voices[voice_index].pan
+            var abs_pan = abs(pan)
+            var elev = self.voices[voice_index].elevation
+            var is_sfx = self.voices[voice_index].bus == BUS_EFFECTS
+            var hull_cond = self.voices[voice_index].hull_conducted
+            var vac = self.vacuum_mix if is_sfx else Float32(0.0)
+            var vac_gain = Float32(1.0)
+            var lpf = self.voices[voice_index].lpf_coeff
+            if vac > Float32(0.005):
+                if hull_cond:
+                    # Internal airframe/cockpit vibration resonates cleanly with warm low-mid body
+                    lpf = max(Float32(0.18), lpf * (Float32(1.0) - Float32(0.28) * vac))
+                else:
+                    # External space vacuum: air-borne HF vanishes, leaving deep shockwave sub-bass thump
+                    lpf = max(Float32(0.032), lpf * (Float32(1.0) - Float32(0.88) * vac))
+                    vac_gain = Float32(1.0) - Float32(0.56) * vac
+            if elev < Float32(-0.05) and is_sfx:
+                lpf = max(Float32(0.032), lpf * (Float32(1.0) + elev * Float32(0.24)))
+            var ep = equal_power_gains(pan)
+            var gain_l = ep[0] * Float32(1.41421356) * volume * vac_gain
+            var gain_r = ep[1] * Float32(1.41421356) * volume * vac_gain
+            var use_hrtf = self.hrtf_enabled and not self.mono and is_sfx and abs_pan > Float32(0.02)
+            var itd_clip_frames = (
+                Float64(abs_pan) * 0.00062 * Float64(self.voices[voice_index].pitch) * Float64(self.clips[clip_index].sample_rate)
+                if use_hrtf
+                else Float64(0.0)
+            )
+            var lpf_l = max(Float32(0.03), lpf * (Float32(1.0) - Float32(0.54) * pan)) if (use_hrtf and pan > Float32(0.0)) else lpf
+            var lpf_r = max(Float32(0.03), lpf * (Float32(1.0) + Float32(0.54) * pan)) if (use_hrtf and pan < Float32(0.0)) else lpf
+            var pinna_shelf = max(Float32(0.0), elev) * Float32(0.22) if (use_hrtf and vac < Float32(0.5)) else Float32(0.0)
+            var lp_l = self.voices[voice_index].lp_l
+            var lp_r = self.voices[voice_index].lp_r
+            var rsend = (
+                self.voices[voice_index].reverb_send * (Float32(1.0) - Float32(0.75) * vac)
+                if is_sfx
+                else Float32(0.03)
+            )
+            if rsend > Float32(0.005):
+                has_rev_send = True
+            var clip_ch = self.clips[clip_index].channels
             var clip_frames = self.clips[clip_index].frame_count()
             for frame in range(count):
                 if position >= Float64(clip_frames):
                     break
-                for channel in range(2):
-                    mixed[frame * 2 + channel] += clip_sample(self.clips[clip_index], position, channel) * volume
+                var pos_l = max(Float64(0.0), position - itd_clip_frames) if pan > Float32(0.02) else position
+                var pos_r = max(Float64(0.0), position - itd_clip_frames) if pan < Float32(-0.02) else position
+                var sl = clip_sample(self.clips[clip_index], pos_l, 0)
+                var sr = clip_sample(self.clips[clip_index], pos_r, 0 if clip_ch == 1 else 1)
+                # Fold opposite stereo energy slightly when panned hard so stereo SFX stay full
+                if clip_ch == 2 and pan < Float32(-0.05):
+                    sl += sr * (-pan) * Float32(0.35)
+                elif clip_ch == 2 and pan > Float32(0.05):
+                    sr += sl * pan * Float32(0.35)
+                var raw_l = sl
+                var raw_r = sr
+                if lpf_l < Float32(0.995) or pinna_shelf > Float32(0.001):
+                    lp_l += (sl - lp_l) * lpf_l
+                    sl = lp_l + (raw_l - lp_l) * pinna_shelf
+                if lpf_r < Float32(0.995) or pinna_shelf > Float32(0.001):
+                    lp_r += (sr - lp_r) * lpf_r
+                    sr = lp_r + (raw_r - lp_r) * pinna_shelf
+                var out_l = sl * gain_l
+                var out_r = sr * gain_r
+                mixed[frame * 2] += out_l
+                mixed[frame * 2 + 1] += out_r
+                if rsend > Float32(0.005):
+                    rev_send_buf[frame * 2] += out_l * rsend
+                    rev_send_buf[frame * 2 + 1] += out_r * rsend
                 position += step
             self.voices[voice_index].position = position
+            self.voices[voice_index].lp_l = lp_l
+            self.voices[voice_index].lp_r = lp_r
             if position >= Float64(clip_frames):
                 self.voices[voice_index].active = False
+        if self.reverb_enabled and has_rev_send:
+            for frame in range(count):
+                var wet = self.reverb.process_send(rev_send_buf[frame * 2], rev_send_buf[frame * 2 + 1])
+                mixed[frame * 2] += wet[0]
+                mixed[frame * 2 + 1] += wet[1]
         self.mix_drone(mixed, count)
         if self.mono:
             for frame in range(count):
@@ -623,8 +890,16 @@ struct NativeAudio:
                 mixed[frame * 2 + 1] = both
         var output = List[Int16](length=count * 2, fill=0)
         for index in range(len(output)):
-            var sample = max(Float32(-1), min(Float32(1), mixed[index]))
-            output[index] = Int16(Int(sample * 32767))
+            var x = mixed[index]
+            # Transparent below 0.72, smooth Padé tanh studio soft-knee ceiling above 0.72
+            var sample: Float32
+            if x > Float32(0.72):
+                sample = Float32(0.72) + Float32(0.28) * soft_clip_tanh((x - Float32(0.72)) * Float32(2.6))
+            elif x < Float32(-0.72):
+                sample = Float32(-0.72) + Float32(0.28) * soft_clip_tanh((x + Float32(0.72)) * Float32(2.6))
+            else:
+                sample = x
+            output[index] = Int16(Int(max(Float32(-1.0), min(Float32(1.0), sample)) * Float32(32767.0)))
         return output^
 
     def submit_pending(mut self):

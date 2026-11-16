@@ -138,13 +138,20 @@ struct MeshBuilder(Copyable, Movable):
                 var v = v0 + (v1 - v0) * tr
                 _ = self.add_vertex(pos, n, u, v, color)
         var stride = segments + 1
+        var has_north_pole = theta_start <= 0.0005
+        var has_south_pole = theta_end >= PI_F32 - 0.0005
         for r in range(rings):
             for s in range(segments):
                 var i0 = base_v + r * stride + s
                 var i1 = i0 + 1
                 var i2 = i0 + stride + 1
                 var i3 = i0 + stride
-                self.add_quad(i0, i1, i2, i3)
+                if r == 0 and has_north_pole:
+                    self.add_tri(i0, i2, i3)
+                elif r == rings - 1 and has_south_pole:
+                    self.add_tri(i0, i1, i3)
+                else:
+                    self.add_quad(i0, i1, i2, i3)
 
     def add_lathe_z(
         mut self,
@@ -382,13 +389,28 @@ struct MeshBuilder(Copyable, Movable):
                 var i3 = i0 + stride
                 self.add_quad(i0, i1, i2, i3)
 
-        # Tip cap
+        # Root and tip caps with clean planar chordwise UVs
+        var root_center = root_le + ch_n * (root_chord * 0.45)
+        var rc_idx = self.add_vertex(root_center, span_n * -1.0, u0, (v0 + v1) * 0.5, color)
+        for cp_i in range(profile_pts):
+            var a0 = Float32(cp_i) / Float32(profile_pts) * TAU_F32
+            var a1 = Float32(cp_i + 1) / Float32(profile_pts) * TAU_F32
+            var vc0 = v0 + (v1 - v0) * (0.5 * (1.0 + cos(a0)))
+            var vc1 = v0 + (v1 - v0) * (0.5 * (1.0 + cos(a1)))
+            var p0 = self.add_vertex(self.vertex_pos(base_v + cp_i), span_n * -1.0, u0, vc0, color)
+            var p1 = self.add_vertex(self.vertex_pos(base_v + cp_i + 1), span_n * -1.0, u0, vc1, color)
+            self.add_tri(rc_idx, p1, p0)
+
         var tip_ring = base_v + span_steps * stride
         var tip_center = tip_le + ch_n * (tip_chord * 0.45)
         var tc_idx = self.add_vertex(tip_center, span_n, u1, (v0 + v1) * 0.5, color)
         for cp_i in range(profile_pts):
-            var p0 = self.add_vertex(self.vertex_pos(tip_ring + cp_i), span_n, u1, v0, color)
-            var p1 = self.add_vertex(self.vertex_pos(tip_ring + cp_i + 1), span_n, u1, v1, color)
+            var a0 = Float32(cp_i) / Float32(profile_pts) * TAU_F32
+            var a1 = Float32(cp_i + 1) / Float32(profile_pts) * TAU_F32
+            var vc0 = v0 + (v1 - v0) * (0.5 * (1.0 + cos(a0)))
+            var vc1 = v0 + (v1 - v0) * (0.5 * (1.0 + cos(a1)))
+            var p0 = self.add_vertex(self.vertex_pos(tip_ring + cp_i), span_n, u1, vc0, color)
+            var p1 = self.add_vertex(self.vertex_pos(tip_ring + cp_i + 1), span_n, u1, vc1, color)
             self.add_tri(tc_idx, p0, p1)
 
     def add_beveled_box(
@@ -403,83 +425,172 @@ struct MeshBuilder(Copyable, Movable):
         v1: Float32 = 1.0,
         color: UInt32 = 0xFFFFFFFF,
     ):
-        """Chamfered 3D armor block with smooth-angled edge normals that catch specular highlights."""
+        """Watertight 24-vertex hard-surface chamfered prism: optically flat faces + Phong-rounded specular bevels."""
         var mat = trs(center, rot, Vec3(1, 1, 1))
         var hx = max(Float32(0.005), half_extents.x)
         var hy = max(Float32(0.005), half_extents.y)
         var hz = max(Float32(0.005), half_extents.z)
-        var b = min(bevel, min(hx, min(hy, hz)) * 0.45)
+        var b = min(max(Float32(0.0005), bevel), min(hx, min(hy, hz)) * Float32(0.38))
         var ix = hx - b
         var iy = hy - b
         var iz = hz - b
 
-        # 4x4 grid around Y for 4 vertical levels -> chamfered prism (all 6 faces + 12 bevels + 8 corners!)
-        var y_levels = List[Float32]()
-        y_levels.append(-hy)
-        y_levels.append(-iy)
-        y_levels.append(iy)
-        y_levels.append(hy)
+        # Index map: octant (sx_i, sy_i, sz_i) in {0,1}^3 -> idx8 = sx_i*4 + sy_i*2 + sz_i
+        var vx = List[Int](capacity=8)
+        var vy = List[Int](capacity=8)
+        var vz = List[Int](capacity=8)
+        for sx_i in range(2):
+            var sx = Float32(1.0) if sx_i == 1 else Float32(-1.0)
+            for sy_i in range(2):
+                var sy = Float32(1.0) if sy_i == 1 else Float32(-1.0)
+                for sz_i in range(2):
+                    var sz = Float32(1.0) if sz_i == 1 else Float32(-1.0)
+                    var ux = u0 + (u1 - u0) * (Float32(1 - sz_i) if sx_i == 1 else Float32(sz_i))
+                    var vx_uv = v0 + (v1 - v0) * Float32(1 - sy_i)
+                    vx.append(
+                        self.add_vertex(
+                            mat.transform_point(Vec3(sx * hx, sy * iy, sz * iz)),
+                            mat.transform_vector(Vec3(sx, 0.0, 0.0)).normalized(),
+                            ux,
+                            vx_uv,
+                            color,
+                        )
+                    )
+                    var uy = u0 + (u1 - u0) * Float32(sx_i)
+                    var vy_uv = v0 + (v1 - v0) * (Float32(1 - sz_i) if sy_i == 1 else Float32(sz_i))
+                    vy.append(
+                        self.add_vertex(
+                            mat.transform_point(Vec3(sx * ix, sy * hy, sz * iz)),
+                            mat.transform_vector(Vec3(0.0, sy, 0.0)).normalized(),
+                            uy,
+                            vy_uv,
+                            color,
+                        )
+                    )
+                    var uz = u0 + (u1 - u0) * (Float32(sx_i) if sz_i == 1 else Float32(1 - sx_i))
+                    var vz_uv = v0 + (v1 - v0) * Float32(1 - sy_i)
+                    vz.append(
+                        self.add_vertex(
+                            mat.transform_point(Vec3(sx * ix, sy * iy, sz * hz)),
+                            mat.transform_vector(Vec3(0.0, 0.0, sz)).normalized(),
+                            uz,
+                            vz_uv,
+                            color,
+                        )
+                    )
 
-        var s_scales = List[Float32]()
-        s_scales.append(Float32(0.72))
-        s_scales.append(Float32(1.0))
-        s_scales.append(Float32(1.0))
-        s_scales.append(Float32(0.72))
+        # 6 flat orthogonal armor faces (idx = sx_i*4 + sy_i*2 + sz_i)
+        self.add_quad(vx[4], vx[5], vx[7], vx[6])  # +X
+        self.add_quad(vx[1], vx[0], vx[2], vx[3])  # -X
+        self.add_quad(vy[2], vy[3], vy[7], vy[6])  # +Y
+        self.add_quad(vy[0], vy[4], vy[5], vy[1])  # -Y
+        self.add_quad(vz[1], vz[5], vz[7], vz[3])  # +Z
+        self.add_quad(vz[4], vz[0], vz[2], vz[6])  # -Z
 
-        # 8 perimeter points per ring (chamfered rectangle in XZ)
-        var px_ring = List[Float32]()
-        var pz_ring = List[Float32]()
-        px_ring.append(ix);  pz_ring.append(hz)
-        px_ring.append(-ix); pz_ring.append(hz)
-        px_ring.append(-hx); pz_ring.append(iz)
-        px_ring.append(-hx); pz_ring.append(-iz)
-        px_ring.append(-ix); pz_ring.append(-hz)
-        px_ring.append(ix);  pz_ring.append(-hz)
-        px_ring.append(hx);  pz_ring.append(-iz)
-        px_ring.append(hx);  pz_ring.append(iz)
+        # 12 smooth-interpolated specular edge chamfers
+        # 4 Y-parallel edges (sx_i, sz_i)
+        for sx_i in range(2):
+            for sz_i in range(2):
+                var lo = sx_i * 4 + 0 * 2 + sz_i
+                var hi = sx_i * 4 + 1 * 2 + sz_i
+                self.add_quad(vx[lo], vz[lo], vz[hi], vx[hi])
+        # 4 X-parallel edges (sy_i, sz_i)
+        for sy_i in range(2):
+            for sz_i in range(2):
+                var lo = 0 * 4 + sy_i * 2 + sz_i
+                var hi = 1 * 4 + sy_i * 2 + sz_i
+                self.add_quad(vy[lo], vz[lo], vz[hi], vy[hi])
+        # 4 Z-parallel edges (sx_i, sy_i)
+        for sx_i in range(2):
+            for sy_i in range(2):
+                var lo = sx_i * 4 + sy_i * 2 + 0
+                var hi = sx_i * 4 + sy_i * 2 + 1
+                self.add_quad(vx[lo], vy[lo], vy[hi], vx[hi])
+
+        # 8 smooth-interpolated corner bevel triangles
+        for oct in range(8):
+            self.add_tri(vx[oct], vy[oct], vz[oct])
+
+    def add_tapered_hull(
+        mut self,
+        p0: Vec3,
+        hx0: Float32,
+        hy0: Float32,
+        p1: Vec3,
+        hx1: Float32,
+        hy1: Float32,
+        bevel: Float32 = 0.04,
+        rot: Quat = Quat(),
+        u0: Float32 = 0.0,
+        v0: Float32 = 0.0,
+        u1: Float32 = 1.0,
+        v1: Float32 = 1.0,
+        color: UInt32 = 0xFFFFFFFF,
+        caps: Bool = True,
+    ):
+        """Chamfered 8-sided tapered prism from local p0 (half-extents hx0, hy0) to p1 (hx1, hy1)."""
+        var mat = trs(Vec3(), rot, Vec3(1, 1, 1))
+        var axis = p1 - p0
+        var length = axis.length()
+        if length < 0.0005:
+            return
+        var fwd = axis * (1.0 / length)
+        var up_ref = Vec3(0, 1, 0) if abs(fwd.y) < 0.94 else Vec3(0, 0, 1)
+        var right = up_ref.cross(fwd).normalized()
+        var up = fwd.cross(right).normalized()
 
         var base_v = self.mesh.vertex_count()
-        for lv in range(4):
-            var y = y_levels[lv]
-            var sc = s_scales[lv]
-            var tv = Float32(lv) / 3.0
+        for end_i in range(2):
+            var t = Float32(end_i)
+            var ctr = p0 + axis * t
+            var hx = max(Float32(0.004), hx0 if end_i == 0 else hx1)
+            var hy = max(Float32(0.004), hy0 if end_i == 0 else hy1)
+            var b = min(max(Float32(0.0005), bevel), min(hx, hy) * Float32(0.35))
+            var ix = hx - b
+            var iy = hy - b
+            var rx = [ix, -ix, -hx, -hx, -ix, ix, hx, hx]
+            var ry = [hy, hy, iy, -iy, -hy, -hy, -iy, iy]
+            var nx = [Float32(0.0), Float32(0.0), Float32(-1.0), Float32(-1.0), Float32(0.0), Float32(0.0), Float32(1.0), Float32(1.0)]
+            var ny = [Float32(1.0), Float32(1.0), Float32(0.0), Float32(0.0), Float32(-1.0), Float32(-1.0), Float32(0.0), Float32(0.0)]
+            var perim = Float32(4.0) * (ix + iy + b * Float32(1.41421356))
+            var acc = Float32(0.0)
             for k in range(9):
                 var idx8 = k % 8
-                var lx = px_ring[idx8] * sc
-                var lz = pz_ring[idx8] * sc
-                var local_p = Vec3(lx, y, lz)
-                var local_n = Vec3(lx / hx, y / hy * (Float32(0.35) if lv == 1 or lv == 2 else Float32(1.1)), lz / hz).normalized()
-                var world_p = mat.transform_point(local_p)
-                var world_n = mat.transform_vector(local_n).normalized()
-                var tu = Float32(k) / 8.0
-                _ = self.add_vertex(world_p, world_n, u0 + (u1 - u0) * tu, v0 + (v1 - v0) * tv, color)
+                if k > 0:
+                    var prev8 = (k - 1) % 8
+                    var dx = rx[idx8] - rx[prev8]
+                    var dy = ry[idx8] - ry[prev8]
+                    acc += sqrt(dx * dx + dy * dy)
+                var lp = ctr + right * rx[idx8] + up * ry[idx8]
+                var ln = (right * nx[idx8] + up * ny[idx8]).normalized()
+                var tu = acc / max(Float32(0.001), perim)
+                _ = self.add_vertex(
+                    mat.transform_point(lp),
+                    mat.transform_vector(ln).normalized(),
+                    u0 + (u1 - u0) * tu,
+                    v0 + (v1 - v0) * t,
+                    color,
+                )
 
-        for lv in range(3):
-            for k in range(8):
-                var i0 = base_v + lv * 9 + k
-                self.add_quad(i0, i0 + 1, i0 + 10, i0 + 9)
-
-        # Bottom and top caps
-        var bot_c = self.add_vertex(
-            mat.transform_point(Vec3(0, -hy, 0)),
-            mat.transform_vector(Vec3(0, -1, 0)).normalized(),
-            (u0 + u1) * 0.5,
-            (v0 + v1) * 0.5,
-            color,
-        )
         for k in range(8):
-            self.add_tri(bot_c, base_v + k + 1, base_v + k)
+            var i0 = base_v + k
+            self.add_quad(i0, i0 + 1, i0 + 10, i0 + 9)
 
-        var top_ring = base_v + 3 * 9
-        var top_c = self.add_vertex(
-            mat.transform_point(Vec3(0, hy, 0)),
-            mat.transform_vector(Vec3(0, 1, 0)).normalized(),
-            (u0 + u1) * 0.5,
-            (v0 + v1) * 0.5,
-            color,
-        )
-        for k in range(8):
-            self.add_tri(top_c, top_ring + k, top_ring + k + 1)
+        if caps:
+            for end_i in range(2):
+                var ctr = p0 if end_i == 0 else p1
+                var cn = mat.transform_vector(fwd * (Float32(-1.0) if end_i == 0 else Float32(1.0))).normalized()
+                var c_idx = self.add_vertex(mat.transform_point(ctr), cn, (u0 + u1) * 0.5, (v0 + v1) * 0.5, color)
+                var ring_base = base_v + end_i * 9
+                for k in range(8):
+                    var p_a = self.vertex_pos(ring_base + k)
+                    var p_b = self.vertex_pos(ring_base + k + 1)
+                    var q_a = self.add_vertex(p_a, cn, (u0 + u1) * 0.5, v0 if end_i == 0 else v1, color)
+                    var q_b = self.add_vertex(p_b, cn, (u0 + u1) * 0.5, v0 if end_i == 0 else v1, color)
+                    if end_i == 0:
+                        self.add_tri(c_idx, q_b, q_a)
+                    else:
+                        self.add_tri(c_idx, q_a, q_b)
 
 
 def append_node_meshes(

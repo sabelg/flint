@@ -6,8 +6,9 @@ resulting RGB light, fog, and emissive attributes; gameplay never reads them.
 from std.math import sin, sqrt
 from flint.core.math import Vec3
 
-comptime MAX_REGISTERED_LIGHTS: Int = 48
-comptime MAX_EVENT_LIGHTS: Int = 16
+comptime MAX_REGISTERED_LIGHTS: Int = 256
+comptime MAX_EVENT_LIGHTS: Int = 64
+comptime MAX_SELECTED_LIGHTS: Int = 128
 
 
 struct LightingProfile(Copyable, ImplicitlyCopyable, Movable):
@@ -118,6 +119,7 @@ def regional_profile(region: Int) -> LightingProfile:
 
 struct LocalLight(Copyable, ImplicitlyCopyable, Movable):
     var position: Vec3
+    var seg_delta: Vec3  # zero = point light; non-zero = tube/capsule from position to position + seg_delta
     var color: Vec3
     var radius: Float32
     var intensity: Float32
@@ -127,6 +129,7 @@ struct LocalLight(Copyable, ImplicitlyCopyable, Movable):
 
     def __init__(out self):
         self.position = Vec3()
+        self.seg_delta = Vec3()
         self.color = Vec3(1, 1, 1)
         self.radius = 1
         self.intensity = 0
@@ -158,6 +161,34 @@ struct EventLightPool(Copyable, Movable):
         self.emitted = 0
         self.recycled = 0
 
+    def renew(
+        mut self,
+        position: Vec3,
+        color: Vec3,
+        radius: Float32,
+        intensity: Float32,
+        duration: Float32,
+        stable_id: Int,
+        priority: Int,
+    ):
+        """Updates and keeps alive an existing event light matching `stable_id`
+        in-place (under its own `priority`) instead of allocating a new pool slot
+        every frame."""
+        for index in range(len(self.events)):
+            if self.events[index].remaining > 0 and self.events[index].light.stable_id == stable_id:
+                self.events[index].light.position = position
+                self.events[index].light.color = color
+                self.events[index].light.radius = max(Float32(0.1), radius)
+                self.events[index].light.intensity = max(Float32(0), intensity)
+                self.events[index].light.priority = priority
+                self.events[index].remaining = max(Float32(0.001), duration)
+                self.events[index].duration = self.events[index].remaining
+                return
+        self.emit(position, color, radius, intensity, duration, stable_id)
+        for index in range(len(self.events)):
+            if self.events[index].remaining > 0 and self.events[index].light.stable_id == stable_id:
+                self.events[index].light.priority = priority
+
     def emit(mut self, position: Vec3, color: Vec3, radius: Float32, intensity: Float32, duration: Float32, stable_id: Int = -1):
         var slot = -1
         var oldest = 0
@@ -175,6 +206,45 @@ struct EventLightPool(Copyable, Movable):
         var event = EventLight()
         event.light.active = True
         event.light.position = position
+        event.light.seg_delta = Vec3()
+        event.light.color = color
+        event.light.radius = max(Float32(0.1), radius)
+        event.light.intensity = max(Float32(0), intensity)
+        event.light.priority = 100
+        event.light.stable_id = self.next_id if stable_id < 0 else stable_id
+        event.remaining = max(Float32(0.001), duration)
+        event.duration = event.remaining
+        self.events[slot] = event
+        self.next_id += 1
+        self.emitted += 1
+
+    def emit_tube(
+        mut self,
+        start_pos: Vec3,
+        end_pos: Vec3,
+        color: Vec3,
+        radius: Float32,
+        intensity: Float32,
+        duration: Float32,
+        stable_id: Int = -1,
+    ):
+        var slot = -1
+        var oldest = 0
+        var oldest_remaining = Float32(1000000)
+        for index in range(len(self.events)):
+            if self.events[index].remaining <= 0:
+                slot = index
+                break
+            if self.events[index].remaining < oldest_remaining:
+                oldest_remaining = self.events[index].remaining
+                oldest = index
+        if slot < 0:
+            slot = oldest
+            self.recycled += 1
+        var event = EventLight()
+        event.light.active = True
+        event.light.position = start_pos
+        event.light.seg_delta = end_pos - start_pos
         event.light.color = color
         event.light.radius = max(Float32(0.1), radius)
         event.light.intensity = max(Float32(0), intensity)
@@ -212,7 +282,7 @@ struct LightingEnvironment(Copyable, Movable):
     def __init__(out self):
         self.profile = LightingProfile()
         self.registered = List[LocalLight](length=MAX_REGISTERED_LIGHTS, fill=LocalLight())
-        self.selected = List[LocalLight](length=12, fill=LocalLight())
+        self.selected = List[LocalLight](length=MAX_SELECTED_LIGHTS, fill=LocalLight())
         self.registered_count = 0
         self.selected_count = 0
         self.quality = 1
@@ -239,6 +309,12 @@ struct LightingEnvironment(Copyable, Movable):
         self.vertex_samples = 0
 
     def light_budget(self) -> Int:
+        if self.per_pixel:
+            if self.quality <= 0:
+                return 24
+            if self.quality >= 2:
+                return MAX_SELECTED_LIGHTS
+            return 64
         if self.quality <= 0:
             return 3
         if self.quality >= 2:
@@ -246,13 +322,26 @@ struct LightingEnvironment(Copyable, Movable):
         return 8
 
     def register(mut self, position: Vec3, color: Vec3, radius: Float32, intensity: Float32, priority: Int, stable_id: Int):
+        self.register_tube(position, position, color, radius, intensity, priority, stable_id)
+
+    def register_tube(
+        mut self,
+        start_pos: Vec3,
+        end_pos: Vec3,
+        color: Vec3,
+        radius: Float32,
+        intensity: Float32,
+        priority: Int,
+        stable_id: Int,
+    ):
         var registration_limit = len(self.registered) if priority >= 100 else len(self.registered) - MAX_EVENT_LIGHTS
         if self.registered_count >= registration_limit or radius <= 0 or intensity <= 0:
             self.rejected_lights += 1
             return
         var light = LocalLight()
         light.active = True
-        light.position = position
+        light.position = start_pos
+        light.seg_delta = end_pos - start_pos
         light.color = color
         light.radius = radius
         light.intensity = intensity * (Float32(0.55) if self.reduced_effects and priority >= 50 and priority < 100 else Float32(1.0))
@@ -269,24 +358,39 @@ struct LightingEnvironment(Copyable, Movable):
                 var light = event.light
                 var life = event.remaining / event.duration
                 light.intensity *= min(Float32(1), life * 3.0) * (Float32(0.45) if self.reduced_effects else Float32(1.0))
-                self.register(light.position, light.color, light.radius, light.intensity, light.priority, light.stable_id)
+                self.register_tube(
+                    light.position,
+                    light.position + light.seg_delta,
+                    light.color,
+                    light.radius,
+                    light.intensity,
+                    light.priority,
+                    light.stable_id,
+                )
         var budget = self.light_budget()
         self.selected_count = 0
+        var picked = List[Bool](length=self.registered_count, fill=False)
         # Selection sort over a fixed candidate array. Priority, then relative
         # camera influence, then stable numeric ID defines every tie.
         for _ in range(min(budget, self.registered_count)):
             var best = -1
             for candidate in range(self.registered_count):
-                var already_selected = False
-                for chosen in range(self.selected_count):
-                    if self.selected[chosen].stable_id == self.registered[candidate].stable_id:
-                        already_selected = True
-                        break
-                if already_selected:
+                if picked[candidate]:
                     continue
+                var cand_id = self.registered[candidate].stable_id
+                if cand_id != 0:
+                    var already_selected = False
+                    for chosen in range(self.selected_count):
+                        if self.selected[chosen].stable_id == cand_id:
+                            already_selected = True
+                            break
+                    if already_selected:
+                        picked[candidate] = True
+                        continue
                 if best < 0 or self.better(candidate, best):
                     best = candidate
             if best >= 0:
+                picked[best] = True
                 self.selected[self.selected_count] = self.registered[best]
                 self.selected_count += 1
         self.rejected_lights += max(0, self.registered_count - self.selected_count)
@@ -296,14 +400,40 @@ struct LightingEnvironment(Copyable, Movable):
         var b = self.registered[current]
         if a.priority != b.priority:
             return a.priority > b.priority
-        var a_influence = a.intensity * a.radius / max(Float32(0.25), a.position.distance_to(self.camera))
-        var b_influence = b.intensity * b.radius / max(Float32(0.25), b.position.distance_to(self.camera))
+        var a_mid = a.position + a.seg_delta * 0.5
+        var b_mid = b.position + b.seg_delta * 0.5
+        var a_influence = a.intensity * (a.radius + a.seg_delta.length() * 0.5) / max(Float32(0.25), a_mid.distance_to(self.camera))
+        var b_influence = b.intensity * (b.radius + b.seg_delta.length() * 0.5) / max(Float32(0.25), b_mid.distance_to(self.camera))
         if abs(a_influence - b_influence) > 0.00001:
             return a_influence > b_influence
         return a.stable_id < b.stable_id
 
     def emit_event(mut self, position: Vec3, color: Vec3, radius: Float32, intensity: Float32, duration: Float32, stable_id: Int = -1):
         self.events.emit(position, color, radius, intensity, duration, stable_id)
+
+    def emit_tube_event(
+        mut self,
+        start_pos: Vec3,
+        end_pos: Vec3,
+        color: Vec3,
+        radius: Float32,
+        intensity: Float32,
+        duration: Float32,
+        stable_id: Int = -1,
+    ):
+        self.events.emit_tube(start_pos, end_pos, color, radius, intensity, duration, stable_id)
+
+    def renew_event(
+        mut self,
+        position: Vec3,
+        color: Vec3,
+        radius: Float32,
+        intensity: Float32,
+        duration: Float32,
+        stable_id: Int,
+        priority: Int,
+    ):
+        self.events.renew(position, color, radius, intensity, duration, stable_id, priority)
 
     def update_events(mut self, dt: Float32):
         self.events.update(dt)

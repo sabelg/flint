@@ -7,7 +7,8 @@ for this window: see platform/wayland_bridge.mojo. All this code runs the same t
 from std.ffi import external_call
 from flint.platform.input import InputState
 from flint.platform.wayland_bridge import WaylandBridge
-from flint.platform.os import env_value, close_fd, get_time
+from flint.platform.x11 import X11Window
+from flint.platform.os import env_value, env_flag, close_fd, get_time
 
 # Held in the pending key and button queues: everything held is released here.
 comptime RELEASE_HELD: Int = -1
@@ -101,8 +102,16 @@ def evdev_key(key: Int) -> Int:
         return 46
     if key == 42:
         return 340
+    if key == 29:
+        return 341
+    if key == 56:
+        return 342
     if key == 54:
         return 344
+    if key == 97:
+        return 345
+    if key == 100:
+        return 346
     if key >= 59 and key <= 68:
         return 290 + key - 59
     if key == 87:
@@ -192,6 +201,11 @@ struct WaylandWindow(Copyable, Movable):
     var pending_wheel: Float32
     var pending_keys: List[Int]
     var pending_key_down: List[Bool]
+    var x11: X11Window
+    var using_x11: Bool
+    var window_title: String
+    var logical_width: Int
+    var logical_height: Int
 
     def __init__(out self):
         self.fd = -1
@@ -257,6 +271,27 @@ struct WaylandWindow(Copyable, Movable):
         self.pending_wheel = 0
         self.pending_keys = List[Int]()
         self.pending_key_down = List[Bool]()
+        self.x11 = X11Window()
+        self.using_x11 = False
+        self.window_title = "FLINT ENGINE"
+        self.logical_width = 1280
+        self.logical_height = 720
+
+    def set_title(mut self, title: String):
+        self.window_title = title
+        if self.using_x11:
+            self.x11.set_title(title)
+        elif self.fd >= 0 and self.toplevel > 0:
+            var body = List[UInt8]()
+            wl_append_string(body, title)
+            _ = self.request(self.toplevel, 2, body)
+
+    def backend_name(self) -> String:
+        if self.using_x11:
+            return "X11"
+        if self.fd >= 0:
+            return "Wayland"
+        return "Headless"
 
     def allocate_id(mut self) -> Int:
         if self.bridge.active():
@@ -619,8 +654,12 @@ struct WaylandWindow(Copyable, Movable):
                 break
 
     def initialize(mut self, width: Int, height: Int) -> Bool:
+        if env_flag("FLINT_HEADLESS"):
+            return False
         self.width = width
         self.height = height
+        self.logical_width = max(1, width)
+        self.logical_height = max(1, height)
         self.pending_mouse_x = 0
         self.pending_mouse_y = 0
         self.pending_buttons = List[Int]()
@@ -629,6 +668,11 @@ struct WaylandWindow(Copyable, Movable):
         self.pending_keys = List[Int]()
         self.pending_key_down = List[Bool]()
         if not self.connect_socket():
+            if self.x11.initialize(width, height, self.window_title):
+                self.using_x11 = True
+                self.configured = True
+                self.focused = True
+                return True
             return False
         if self.wants_bridge and not self.bridge.start(self.fd):
             # The window works without it, on the dmabuf and shared-memory paths.
@@ -663,7 +707,7 @@ struct WaylandWindow(Copyable, Movable):
         wl_append32(body, self.toplevel)
         _ = self.request(self.xdg_surface, 1, body)
         body = List[UInt8]()
-        wl_append_string(body, "FLINT ENGINE")
+        wl_append_string(body, self.window_title)
         _ = self.request(self.toplevel, 2, body)
         body = List[UInt8]()
         wl_append_string(body, "flint")
@@ -681,12 +725,26 @@ struct WaylandWindow(Copyable, Movable):
         return True
 
     def poll(mut self, mut input: InputState):
+        if self.using_x11:
+            self.x11.poll(input)
+            self.width = self.x11.width
+            self.height = self.x11.height
+            self.close_requested = self.x11.close_requested
+            self.focused = self.x11.focused
+            self.fullscreen = self.x11.fullscreen
+            return
         input.poll_gamepad()
         if self.fd < 0:
             return
         self.receive()
         if self.pending_mouse_x >= 0 and self.pending_mouse_y >= 0:
-            input.move_mouse(self.pending_mouse_x, self.pending_mouse_y)
+            var mx = self.pending_mouse_x
+            var my = self.pending_mouse_y
+            if self.width > 0 and self.width != self.logical_width:
+                mx = mx * Float32(self.logical_width) / Float32(self.width)
+            if self.height > 0 and self.height != self.logical_height:
+                my = my * Float32(self.logical_height) / Float32(self.height)
+            input.move_mouse(mx, my)
             self.pending_mouse_x = -1
             self.pending_mouse_y = -1
         for index in range(len(self.pending_buttons)):
@@ -785,6 +843,12 @@ struct WaylandWindow(Copyable, Movable):
         return True
 
     def present(mut self, mut pixels: List[UInt32], source_width: Int, source_height: Int):
+        if self.using_x11:
+            self.x11.present(pixels, source_width, source_height)
+            self.width = self.x11.width
+            self.height = self.x11.height
+            self.close_requested = self.x11.close_requested
+            return
         if self.fd < 0 or not self.configured or source_width <= 0 or source_height <= 0:
             return
         # A callback that arrived during this frame must count, or every second frame is dropped.
@@ -929,6 +993,10 @@ struct WaylandWindow(Copyable, Movable):
             self.pointer_locked = False
 
     def toggle_fullscreen(mut self):
+        if self.using_x11:
+            self.x11.toggle_fullscreen()
+            self.fullscreen = self.x11.fullscreen
+            return
         if self.toplevel == 0:
             return
         if self.fullscreen:
@@ -964,6 +1032,10 @@ struct WaylandWindow(Copyable, Movable):
         return True
 
     def close(mut self):
+        if self.using_x11:
+            self.x11.close()
+            self.using_x11 = False
+            return
         if self.fd >= 0:
             self.destroy_shared()
             if self.toplevel > 0:

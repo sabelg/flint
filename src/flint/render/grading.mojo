@@ -47,11 +47,14 @@ def agx_raw(linear: Float32) -> Float32:
 
 def filmic_curve(display: Float32) -> Float32:
     """Maps a display value in [0, 1] through the anchored AgX curve,
-    normalised so black stays black and white stays white."""
+    blended with a proportional shadow toe so weak primary channels are not
+    crushed into 'Notorious Six' primary hue twists."""
+    var d = max(Float32(0), min(Float32(1), display))
     var low = agx_raw(0)
     var high = agx_raw(1)
-    var mapped = (agx_raw(srgb_to_linear(max(Float32(0), min(Float32(1), display)))) - low) / (high - low)
-    return max(Float32(0), min(Float32(1), mapped))
+    var agx = max(Float32(0), min(Float32(1), (agx_raw(srgb_to_linear(d)) - low) / (high - low)))
+    var w = Float32(0.62) + Float32(0.34) * d
+    return max(Float32(0), min(Float32(1), agx * w + d * (Float32(1.0) - w)))
 
 
 def cdl(value: Float32, slope: Float32, offset: Float32, power: Float32) -> Float32:

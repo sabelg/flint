@@ -57,10 +57,12 @@ struct FlintDevOverlays(Movable):
         return False
 
     def render(self, mut canvas: SimdCanvas):
+        var top_off = 232 if self.console.open else 46
         if self.show_profiler:
             var px = 14
-            var py = 46
-            canvas.draw_panel(px, py, 372, 118, 0x101824, 0x4AD295)
+            var py = top_off
+            canvas.draw_panel(px, py, 372, 118, 0x0B121C, 0x4AD295)
+            canvas.draw_rect_dim(px + 2, py + 2, 368, 114, 0x0B121C)
             canvas.draw_text(px + 10, py + 10, "FLINT PROFILER [F2]", 0x4AD295, 2)
             canvas.draw_text(
                 px + 10, py + 34,
@@ -83,12 +85,13 @@ struct FlintDevOverlays(Movable):
 
         if self.show_memory:
             var mx = canvas.width - 364
-            var my = 46
+            var my = top_off
             var live_kib = mem_total(W_CPU_LIVE) // 1024
             var peak_kib = mem_total(W_CPU_PEAK) // 1024
             var vram_kib = mem_total(W_VRAM_LIVE) // 1024
             var rss_mib = process_rss_bytes() // (1024 * 1024)
-            canvas.draw_panel(mx, my, 350, 210, 0x121A26, 0x58B4FF)
+            canvas.draw_panel(mx, my, 350, 210, 0x0C1420, 0x58B4FF)
+            canvas.draw_rect_dim(mx + 2, my + 2, 346, 206, 0x0C1420)
             canvas.draw_text(mx + 10, my + 10, "FLINT MEMORY BUDGETS [F3]", 0x58B4FF, 2)
             canvas.draw_text(
                 mx + 10, my + 34,
@@ -115,7 +118,9 @@ struct FlintDevOverlays(Movable):
 
         if self.console.open:
             var ch = 224
-            canvas.draw_panel(0, 0, canvas.width, ch, 0x0A1018, 0xF49E38)
+            canvas.draw_rect(0, 0, canvas.width, ch, 0x0A1018)
+            canvas.draw_rect(0, 0, canvas.width, 2, 0xF49E38)
+            canvas.draw_rect(0, ch - 2, canvas.width, 2, 0xF49E38)
             canvas.draw_text(14, 10, "FLINT DEV CONSOLE [~ TO CLOSE]", 0xF49E38, 2)
             var ly = 36
             for i in range(len(self.console.log)):

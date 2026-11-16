@@ -1,4 +1,5 @@
 """Native PNG/DEFLATE decoder and PNG screenshot encoder."""
+from std.ffi import external_call
 from flint.core.build_info import build_stamp
 from flint.platform.os import write_bytes
 
@@ -23,69 +24,132 @@ def be32(data: List[UInt8], offset: Int) -> Int:
 
 
 struct BitReader(Copyable, Movable):
-    var data: List[UInt8]
+    var ptr: Int
+    var length: Int
     var position: Int
-    var bit: Int
+    var bit_buf: UInt64
+    var bit_count: Int
     var valid: Bool
 
-    def __init__(out self, data: List[UInt8], start: Int):
-        self.data = data.copy()
+    def __init__(out self, ref data: List[UInt8], start: Int):
+        self.ptr = Int(data.unsafe_ptr())
+        self.length = len(data)
         self.position = start
-        self.bit = 0
+        self.bit_buf = 0
+        self.bit_count = 0
         self.valid = True
 
-    def read_bit(mut self) -> Int:
-        if self.position >= len(self.data):
-            self.valid = False
-            return 0
-        var result = (Int(self.data[self.position]) >> self.bit) & 1
-        self.bit += 1
-        if self.bit == 8:
-            self.bit = 0
+    @always_inline
+    def refill(mut self):
+        var p = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=self.ptr)
+        while self.bit_count <= 48 and self.position < self.length:
+            self.bit_buf |= UInt64(p[unsafe_offset=self.position]) << UInt64(self.bit_count)
             self.position += 1
+            self.bit_count += 8
+
+    @always_inline
+    def read_bit(mut self) -> Int:
+        if self.bit_count == 0:
+            self.refill()
+            if self.bit_count == 0:
+                self.valid = False
+                return 0
+        var result = Int(self.bit_buf & 1)
+        self.bit_buf >>= 1
+        self.bit_count -= 1
         return result
 
+    @always_inline
     def read_bits(mut self, count: Int) -> Int:
-        var result = 0
-        for index in range(count):
-            result |= self.read_bit() << index
+        if count == 0:
+            return 0
+        if self.bit_count < count:
+            self.refill()
+            if self.bit_count < count:
+                var fallback = 0
+                for index in range(count):
+                    fallback |= self.read_bit() << index
+                return fallback
+        var mask = (UInt64(1) << UInt64(count)) - 1
+        var result = Int(self.bit_buf & mask)
+        self.bit_buf >>= UInt64(count)
+        self.bit_count -= count
         return result
 
     def align(mut self):
-        if self.bit != 0:
-            self.bit = 0
-            self.position += 1
+        var drop = self.bit_count & 7
+        if drop != 0:
+            self.bit_buf >>= UInt64(drop)
+            self.bit_count -= drop
+        var rewind = self.bit_count >> 3
+        self.position -= rewind
+        self.bit_buf = 0
+        self.bit_count = 0
 
 
 struct Huffman(Copyable, Movable):
-    var counts: List[Int]
+    var counts: Array[Int, 16]
     var symbols: List[Int]
+    var fast_sym: Array[Int16, 512]
+    var fast_len: Array[UInt8, 512]
     var valid: Bool
 
     def __init__(out self):
-        self.counts = List[Int](length=16, fill=0)
+        self.counts = Array[Int, 16](fill=0)
         self.symbols = List[Int]()
+        self.fast_sym = Array[Int16, 512](fill=-1)
+        self.fast_len = Array[UInt8, 512](fill=0)
         self.valid = True
 
     def build(mut self, lengths: List[UInt8]):
-        self.counts = List[Int](length=16, fill=0)
+        self.counts = Array[Int, 16](fill=0)
+        self.fast_sym = Array[Int16, 512](fill=-1)
+        self.fast_len = Array[UInt8, 512](fill=0)
         for length in lengths:
             if length > 15:
                 self.valid = False
                 return
             self.counts[Int(length)] += 1
         self.counts[0] = 0
-        var offsets = List[Int](length=17, fill=0)
+        var offsets = Array[Int, 17](fill=0)
+        var first_code = Array[Int, 16](fill=0)
+        var code_acc = 0
         for index in range(1, 16):
             offsets[index + 1] = offsets[index] + self.counts[index]
+            code_acc = (code_acc + self.counts[index - 1]) << 1
+            first_code[index] = code_acc
+        var next_code = first_code^
         self.symbols = List[Int](length=len(lengths), fill=0)
         for symbol in range(len(lengths)):
             var length = Int(lengths[symbol])
             if length > 0:
                 self.symbols[offsets[length]] = symbol
                 offsets[length] += 1
+                var c = next_code[length]
+                next_code[length] = c + 1
+                if length <= 9:
+                    # Bit-reverse `c` of `length` bits and replicate across upper (9 - length) bits
+                    var rev = 0
+                    for b in range(length):
+                        rev = (rev << 1) | ((c >> b) & 1)
+                    var span = 1 << length
+                    var entry = rev
+                    while entry < 512:
+                        self.fast_sym[entry] = Int16(symbol)
+                        self.fast_len[entry] = UInt8(length)
+                        entry += span
 
+    @always_inline
     def decode(self, mut reader: BitReader) -> Int:
+        if reader.bit_count < 15:
+            reader.refill()
+        if reader.bit_count >= 9:
+            var idx9 = Int(reader.bit_buf & 511)
+            var flen = Int(self.fast_len[idx9])
+            if flen > 0:
+                reader.bit_buf >>= UInt64(flen)
+                reader.bit_count -= flen
+                return Int(self.fast_sym[idx9])
         var code = 0
         var first = 0
         var index = 0
@@ -115,28 +179,32 @@ def fixed_tables() -> Tuple[Huffman, Huffman]:
     return (literal^, distance^)
 
 
+@always_inline
 def length_base(code: Int) -> Int:
     var values = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
     return values[max(0, min(28, code - 257))]
 
 
+@always_inline
 def length_extra(code: Int) -> Int:
     var values = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
     return values[max(0, min(28, code - 257))]
 
 
+@always_inline
 def distance_base(code: Int) -> Int:
     var values = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
     return values[max(0, min(29, code))]
 
 
+@always_inline
 def distance_extra(code: Int) -> Int:
     var values = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
     return values[max(0, min(29, code))]
 
 
-def inflate_zlib(data: List[UInt8], start: Int) -> List[UInt8]:
-    var output = List[UInt8]()
+def inflate_zlib(data: List[UInt8], start: Int, expected_bytes: Int = 0) -> List[UInt8]:
+    var output = List[UInt8](capacity=max(256, expected_bytes))
     if start + 6 > len(data):
         return output^
     var reader = BitReader(data, start + 2)
@@ -263,7 +331,7 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     if width <= 0 or height <= 0 or width * height > 40000000 or bit_depth != 8 or (color_type != 2 and color_type != 6) or interlace != 0:
         return image^
     var channels = 4 if color_type == 6 else 3
-    var compressed = List[UInt8]()
+    var compressed = List[UInt8](capacity=len(data))
     var offset = 8
     var finished = False
     while offset + 12 <= len(data):
@@ -272,16 +340,17 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
             return image^
         var kind = be32(data, offset + 4)
         if kind == 0x49444154:
-            for index in range(length):
-                compressed.append(data[offset + 8 + index])
+            var cur = len(compressed)
+            compressed.resize(cur + length, 0)
+            _ = external_call["memcpy", Int](Int(compressed.unsafe_ptr()) + cur, Int(data.unsafe_ptr()) + offset + 8, length)
         elif kind == 0x49454E44:
             finished = True
             break
         offset += length + 12
     if not finished:
         return image^
-    var raw = inflate_zlib(compressed, 0)
     var stride = width * channels
+    var raw = inflate_zlib(compressed, 0, (stride + 1) * height)
     if len(raw) != (stride + 1) * height:
         return image^
     var scanlines = List[UInt8](length=stride * height, fill=0)
@@ -320,11 +389,18 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
 
 
 def crc32(data: List[UInt8], start: Int, end: Int) -> UInt32:
+    var lut = [
+        UInt32(0x00000000), UInt32(0x1DB71064), UInt32(0x3B6E20C8), UInt32(0x26D930AC),
+        UInt32(0x76DC4190), UInt32(0x6B6B51F4), UInt32(0x4DB26158), UInt32(0x5005713C),
+        UInt32(0xEDB88320), UInt32(0xF00F9344), UInt32(0xD6D6A3E8), UInt32(0xCB61B38C),
+        UInt32(0x9B64C2B0), UInt32(0x86D3D2D4), UInt32(0xA00AE278), UInt32(0xBDBDF21C),
+    ]
     var crc = UInt32(0xFFFFFFFF)
+    var p = data.unsafe_ptr()
     for index in range(start, end):
-        crc = crc ^ UInt32(data[index])
-        for _ in range(8):
-            crc = (crc >> 1) ^ (UInt32(0xEDB88320) if (crc & 1) else UInt32(0))
+        var b = UInt32(p[unsafe_offset=index])
+        crc = lut[Int((crc ^ b) & 15)] ^ (crc >> 4)
+        crc = lut[Int((crc ^ (b >> 4)) & 15)] ^ (crc >> 4)
     return crc ^ 0xFFFFFFFF
 
 
@@ -410,7 +486,7 @@ def write_png(path: String, mut pixels: List[UInt32], width: Int, height: Int, s
     (tests/golden/shots) are written unstamped, so they change only with their pixels."""
     if width <= 0 or height <= 0 or len(pixels) < width * height:
         return False
-    var data = encode_png(pixels, width, height, ("Sharddepth " + build_stamp()) if stamped else String())
+    var data = encode_png(pixels, width, height, ("Flint " + build_stamp()) if stamped else String())
     return write_bytes(path, data)
 
 

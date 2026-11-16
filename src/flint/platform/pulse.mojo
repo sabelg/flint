@@ -5,7 +5,7 @@ desktop's chosen output and shares it with other programs. libpulse is not used.
 All protocol integers are big-endian. Version 13 fixes the stream request layout.
 """
 from std.ffi import external_call
-from flint.platform.os import close_fd, env_value, read_bytes
+from flint.platform.os import close_fd, env_now, env_value, read_bytes
 
 comptime PROTOCOL_VERSION: UInt32 = 13
 comptime COMMAND_CHANNEL: UInt32 = 0xFFFFFFFF
@@ -141,7 +141,7 @@ def create_stream_body(tag: UInt32, rate: UInt32, target_bytes: UInt32, prebuffe
         tag_bool(body, False)
     tag_bool(body, False)    # not muted
     tag_bool(body, True)     # latency follows target_bytes
-    tag_proplist(body, "media.name", "SHARDDEPTH")
+    tag_proplist(body, "media.name", "Flint Engine")
     return body^
 
 
@@ -323,11 +323,23 @@ struct PulseClient(Movable):
         return self.fd >= 0
 
     def open_socket(mut self) -> Bool:
-        var runtime = env_value("XDG_RUNTIME_DIR")
-        if runtime.byte_length() == 0:
-            self.error = "XDG_RUNTIME_DIR is not set"
-            return False
-        var path = runtime + "/pulse/native"
+        var path = String("")
+        var pulse_srv = env_now("PULSE_SERVER")
+        if pulse_srv.byte_length() == 0:
+            pulse_srv = env_value("PULSE_SERVER")
+        if pulse_srv.byte_length() > 0:
+            if pulse_srv.startswith("unix:"):
+                path = String(pulse_srv[byte=5:])
+            elif pulse_srv.startswith("/"):
+                path = pulse_srv
+        if path.byte_length() == 0:
+            var runtime = env_now("XDG_RUNTIME_DIR")
+            if runtime.byte_length() == 0:
+                runtime = env_value("XDG_RUNTIME_DIR")
+            if runtime.byte_length() == 0:
+                self.error = "XDG_RUNTIME_DIR is not set"
+                return False
+            path = runtime + "/pulse/native"
         if path.byte_length() > 107:
             self.error = "sound server path is too long"
             return False
@@ -478,7 +490,19 @@ struct PulseClient(Movable):
         """Socket, authentication and the client's name."""
         if not self.open_socket():
             return False
-        var cookie = read_bytes(env_value("HOME") + "/.config/pulse/cookie")
+        var cookie = List[UInt8]()
+        var cookie_env = env_now("PULSE_COOKIE")
+        if cookie_env.byte_length() == 0:
+            cookie_env = env_value("PULSE_COOKIE")
+        if cookie_env.byte_length() > 0:
+            cookie = read_bytes(cookie_env)
+        var home = env_now("HOME")
+        if home.byte_length() == 0:
+            home = env_value("HOME")
+        if len(cookie) != COOKIE_BYTES and home.byte_length() > 0:
+            cookie = read_bytes(home + "/.config/pulse/cookie")
+        if len(cookie) != COOKIE_BYTES and home.byte_length() > 0:
+            cookie = read_bytes(home + "/.pulse-cookie")
         if len(cookie) != COOKIE_BYTES:
             cookie = List[UInt8](length=COOKIE_BYTES, fill=0)
         var reply = List[UInt8]()
@@ -495,7 +519,7 @@ struct PulseClient(Movable):
         body = List[UInt8]()
         tag_u32(body, COMMAND_SET_CLIENT_NAME)
         tag_u32(body, tag)
-        tag_proplist(body, "application.name", "SHARDDEPTH")
+        tag_proplist(body, "application.name", "Flint Engine")
         return self.request(body^, tag, reply)
 
     def pump(mut self):

@@ -186,9 +186,17 @@ comptime SPLAT_SPAN: Float32 = 64.0
 # Target planes, after the raster's three (render/gpu_raster.mojo).
 comptime PLANE_COLOR: Int = 0
 comptime PLANE_BLOOM: Int = 1
+comptime PLANE_SMOOTH: Int = 2
 comptime PLANE_DEPTH: Int = 3
 comptime PLANE_SCRATCH: Int = 4
-comptime TARGET_PLANES: Int = 5
+comptime PLANE_HDR_R: Int = 5
+comptime PLANE_HDR_G: Int = 6
+comptime PLANE_HDR_B: Int = 7
+comptime PLANE_GBUF: Int = 8
+comptime PLANE_HISTORY_A: Int = 9
+comptime PLANE_HISTORY_B: Int = 10
+comptime PLANE_VELOCITY: Int = 11
+comptime TARGET_PLANES: Int = 12
 
 # Simulation steps.
 comptime MAX_STEP: Float32 = 0.05   # seconds a substep may cover

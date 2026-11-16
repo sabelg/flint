@@ -71,6 +71,7 @@ struct NativeMesh(Copyable, Movable):
     var joints: List[UInt16]
     var weights: List[Float32]
     var texture: Int
+    var normal_orm_texture: Int
     var base_color: UInt32
     var roughness: Float32
     var metallic: Float32
@@ -86,6 +87,9 @@ struct NativeMesh(Copyable, Movable):
     # Package 3.4: each vertex's center of rotation in bind space (three
     # floats; anim/skinning.mojo `compute_cor`). Empty on unskinned meshes.
     var centers: List[Float32]
+    var bounds_verts: Int
+    var bounds_center: Vec3
+    var bounds_radius: Float32
 
     def __init__(out self):
         self.positions = List[Float32]()
@@ -97,6 +101,7 @@ struct NativeMesh(Copyable, Movable):
         self.joints = List[UInt16]()
         self.weights = List[Float32]()
         self.texture = -1
+        self.normal_orm_texture = -1
         self.base_color = 0xFFFFFFFF
         self.roughness = 0.55
         self.metallic = 0.0
@@ -109,6 +114,57 @@ struct NativeMesh(Copyable, Movable):
         self.morph_positions = List[Float32]()
         self.morph_normals = List[Float32]()
         self.centers = List[Float32]()
+        self.bounds_verts = 0
+        self.bounds_center = Vec3()
+        self.bounds_radius = 0.0
+
+    def ensure_bounds(mut self):
+        """Lazily computes & caches the tight local-space bounding sphere for frustum culling."""
+        var n_floats = len(self.positions)
+        if n_floats == self.bounds_verts and n_floats > 0:
+            return
+        self.bounds_verts = n_floats
+        var vc = n_floats // 3
+        if vc <= 0:
+            self.bounds_center = Vec3()
+            self.bounds_radius = 0.0
+            return
+        var ptr = self.positions.unsafe_ptr()
+        var min_x = ptr[unsafe_offset=0]
+        var max_x = min_x
+        var min_y = ptr[unsafe_offset=1]
+        var max_y = min_y
+        var min_z = ptr[unsafe_offset=2]
+        var max_z = min_z
+        for i in range(1, vc):
+            var px = ptr[unsafe_offset=i * 3]
+            var py = ptr[unsafe_offset=i * 3 + 1]
+            var pz = ptr[unsafe_offset=i * 3 + 2]
+            if px < min_x:
+                min_x = px
+            elif px > max_x:
+                max_x = px
+            if py < min_y:
+                min_y = py
+            elif py > max_y:
+                max_y = py
+            if pz < min_z:
+                min_z = pz
+            elif pz > max_z:
+                max_z = pz
+        var cx = (min_x + max_x) * Float32(0.5)
+        var cy = (min_y + max_y) * Float32(0.5)
+        var cz = (min_z + max_z) * Float32(0.5)
+        self.bounds_center = Vec3(cx, cy, cz)
+        var max_r2 = Float32(0.0)
+        for i in range(vc):
+            var dx = ptr[unsafe_offset=i * 3] - cx
+            var dy = ptr[unsafe_offset=i * 3 + 1] - cy
+            var dz = ptr[unsafe_offset=i * 3 + 2] - cz
+            var r2 = dx * dx + dy * dy + dz * dz
+            if r2 > max_r2:
+                max_r2 = r2
+        self.bounds_radius = sqrt(max_r2) + Float32(0.01)
 
     def vertex_count(self) -> Int:
         return len(self.positions) // 3

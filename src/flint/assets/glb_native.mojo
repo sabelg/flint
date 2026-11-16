@@ -1,4 +1,5 @@
-"""Complete native GLB 2.0 runtime for the shipped SHARDDEPTH assets."""
+"""Complete native GLB 2.0 runtime for Flint Engine (`flint.*`)."""
+from std.ffi import external_call
 from flint.platform.os import read_bytes
 from flint.core.math import Vec3
 from flint.core.transform import Quat
@@ -153,9 +154,8 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
     var json_length = little_u32(file, 12)
     if json_length <= 0 or little_u32(file, 16) != 0x4E4F534A or 20 + json_length + 8 > len(file):
         return model^
-    var json_bytes = List[UInt8]()
-    for index in range(json_length):
-        json_bytes.append(file[20 + index])
+    var json_bytes = List[UInt8](length=json_length, fill=0)
+    _ = external_call["memcpy", Int](Int(json_bytes.unsafe_ptr()), Int(file.unsafe_ptr()) + 20, json_length)
     var document = parse_json(json_bytes)
     if not document.valid:
         return model^
@@ -163,9 +163,9 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
     var binary_length = little_u32(file, binary_header)
     if binary_length < 0 or little_u32(file, binary_header + 4) != 0x004E4942 or binary_header + 8 + binary_length > len(file):
         return model^
-    var binary = List[UInt8]()
-    for index in range(binary_length):
-        binary.append(file[binary_header + 8 + index])
+    var binary = List[UInt8](length=binary_length, fill=0)
+    if binary_length > 0:
+        _ = external_call["memcpy", Int](Int(binary.unsafe_ptr()), Int(file.unsafe_ptr()) + binary_header + 8, binary_length)
 
     var images = document.object_get(document.root, "images")
     var textures = document.object_get(document.root, "textures")
@@ -180,16 +180,17 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             var offset = document.integer(document.object_get(view, "byteOffset"), 0)
             var length = document.integer(document.object_get(view, "byteLength"), 0)
             if offset >= 0 and length > 0 and length <= len(binary) - offset:
-                var bytes = List[UInt8]()
-                for index in range(length):
-                    bytes.append(binary[offset + index])
-                var decoded = decode_png(bytes, 1024)
-                if len(bytes) >= 2 and Int(bytes[0]) == 255 and Int(bytes[1]) == 216:
-                    decoded = decode_jpeg(bytes, 1024)
+                var bytes = List[UInt8](length=length, fill=0)
+                _ = external_call["memcpy", Int](Int(bytes.unsafe_ptr()), Int(binary.unsafe_ptr()) + offset, length)
+                var decoded = (
+                    decode_jpeg(bytes, 4096)
+                    if (len(bytes) >= 2 and Int(bytes[0]) == 255 and Int(bytes[1]) == 216)
+                    else decode_png(bytes, 4096)
+                )
                 if decoded.valid:
                     texture.width = decoded.width
                     texture.height = decoded.height
-                    texture.pixels = decoded.pixels.copy()
+                    swap(texture.pixels, decoded.pixels)
         model.textures.append(texture^)
 
     var materials = document.object_get(document.root, "materials")
@@ -216,6 +217,10 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             var joints = load_accessor(document, document.integer(document.object_get(attributes, "JOINTS_0"), -1), len(binary))
             var weights = load_accessor(document, document.integer(document.object_get(attributes, "WEIGHTS_0"), -1), len(binary))
             var weights_extra = load_accessor(document, document.integer(document.object_get(attributes, "WEIGHTS_1"), -1), len(binary))
+            mesh.positions.reserve(positions.count * 3)
+            mesh.normals.reserve(positions.count * 3)
+            mesh.texcoords.reserve(positions.count * 2)
+            mesh.colors.reserve(positions.count * 4)
             for vertex in range(positions.count):
                 for axis in range(3):
                     mesh.positions.append(positions.float_value(binary, vertex, axis))
@@ -260,11 +265,13 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             var indices_node = document.object_get(primitive, "indices")
             var indices = load_accessor(document, document.integer(indices_node, -1), len(binary))
             if indices.valid:
+                mesh.indices.reserve(indices.count)
                 for index in range(indices.count):
                     mesh.indices.append(indices.unsigned_value(binary, index))
             elif indices_node >= 0:
                 return NativeModel()
             else:
+                mesh.indices.reserve(positions.count)
                 for index in range(positions.count):
                     mesh.indices.append(index)
             var material = document.at(materials, document.integer(document.object_get(primitive, "material"), -1))
@@ -279,6 +286,8 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                     mesh.base_color = UInt32(alpha) << 24 | UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue)
                 var base_texture = document.object_get(pbr, "baseColorTexture")
                 mesh.texture = document.integer(document.object_get(base_texture, "index"), -1)
+                var norm_texture = document.object_get(material, "normalTexture")
+                mesh.normal_orm_texture = document.integer(document.object_get(norm_texture, "index"), -1)
                 mesh.roughness = max(Float32(0.05), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "roughnessFactor"), 0.55))))
                 mesh.metallic = max(Float32(0.0), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "metallicFactor"), 0.0))))
                 var alpha_mode = document.text(document.object_get(material, "alphaMode"), "OPAQUE")
