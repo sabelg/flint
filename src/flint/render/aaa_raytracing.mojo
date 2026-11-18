@@ -53,6 +53,10 @@ comptime RAY_FLAG_NONE_KHR: UInt32 = 0
 comptime RAY_FLAG_OPAQUE_KHR: UInt32 = 1
 comptime RAY_FLAG_TERMINATE_ON_FIRST_HIT_KHR: UInt32 = 4
 comptime RAY_FLAG_SHADOW_OCCLUSION: UInt32 = 5  # OPAQUE | TERMINATE_ON_FIRST_HIT
+comptime AAA_RT_MASK_GLASS: UInt32 = 0x80   # TLAS instance mask of transparent (glass) instances
+comptime AAA_RT_MASK_OPAQUE: UInt32 = 0x7F  # ray cull mask that skips glass (shadow rays)
+comptime AAA_GLOBALS_GLASS_SHADOW_WORD: Int = 256  # float: sun transmittance through glass occluders (0..1)
+comptime AAA_GLOBALS_SHADOW_CONE_WORD: Int = 257  # float: tan(angular radius) of the RT sun-shadow cone
 
 # Cluster constants matching `aaa_clustered_lights.mojo` (kept local to preserve acyclic import DAG)
 comptime _RT_CLUSTER_X: UInt32 = 16
@@ -72,10 +76,12 @@ def write_vk_as_instance_64b(
     blas_device_address: UInt64,
     cull_disable: Bool = True,
     alpha_masked: Bool = False,
+    glass: Bool = False,
 ):
     """Writes one 64-byte `VkAccelerationStructureInstanceKHR` record with row-major `3x4` transform
     and `instanceCustomIndex = surfcache_base_tri` for `O(1)` Lumen Surface-Cache lookup on ray hit!
-    Sets `FORCE_NO_OPAQUE (0x8)` on alpha-masked foliage/fence instances and `FORCE_OPAQUE (0x4)` on opaque meshes."""
+    Sets `FORCE_NO_OPAQUE (0x8)` on alpha-masked foliage/fence instances and `FORCE_OPAQUE (0x4)` on opaque meshes.
+    Glass instances get instance mask `AAA_RT_MASK_GLASS` only, so shadow rays (`AAA_RT_MASK_OPAQUE`) pass through them."""
     # Row 0: (m0, m4, m8, m12)
     put_float(dst_addr + 0, world_mat.values[0])
     put_float(dst_addr + 4, world_mat.values[4])
@@ -93,7 +99,7 @@ def write_vk_as_instance_64b(
     put_float(dst_addr + 44, world_mat.values[14])
 
     var custom24 = UInt32(surfcache_base_tri & 0xFFFFFF)
-    var mask8 = UInt32(0xFF) << 24
+    var mask8 = (UInt32(AAA_RT_MASK_GLASS) if glass else UInt32(0xFF)) << 24
     put32(dst_addr + 48, custom24 | mask8)
 
     var cull_bit = UInt32(1) if (cull_disable or alpha_masked) else UInt32(0)
@@ -523,7 +529,7 @@ def emit_rt_shadow_query(
         rq,
         tlas_var,
         s.uint(rflags),
-        s.uint(0xFF),
+        s.uint(AAA_RT_MASK_OPAQUE),
         ro,
         s.float(0.002),
         rd,

@@ -80,6 +80,7 @@ comptime AAA_FLAG_FURNACE_WHITE_DOME: UInt32 = 16
 comptime AAA_FLAG_CLUSTERED_LIGHTS: UInt32 = 32
 comptime AAA_FLAG_AERIAL_PERSPECTIVE: UInt32 = 64
 comptime AAA_FLAG_RESTIR_DI: UInt32 = 128
+comptime AAA_FLAG_GLASS: UInt32 = 256  # some instance this frame uses a glass material (`aaa_glass.mojo`)
 
 
 @always_inline
@@ -1551,18 +1552,20 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var sun_rad_b = s.load_float(b_globals, s.uint(54))
     var ibl_int = s.load_float(b_globals, s.uint(55))
 
+    # With RT shadows the sun is an area light: `aaa_rt_shadow.mojo` traced its disc and denoised the
+    # visibility before this pass (Push[6] = filtered offset in `BIND_AAA_HISTORY`); the VSM PCSS path is
+    # the raster fallback. (`min(VSM, RT)` let the VSM's texel stair-steps show along every RT shadow edge.)
     var sun_vis = s.fvar(s.float(1.0))
-    s.begin_if(s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_VSM)), s.uint(0)))
+    var use_rt_sun = s.logical_and(
+        s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_RT_SHADOWS)), s.uint(0)), s.ine(s.push_word(6), s.uint(0))
+    ) if enable_ray_query else s.ieq(s.uint(1), s.uint(0))
+    s.begin_if(s.logical_and(s.logical_not(use_rt_sun), s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_VSM)), s.uint(0))))
     var vsm_v = emit_vsm_pcss_shadow(s, b_globals, b_vsm, vsm_samp, wx, wy, wz, nx, ny, nz, sun_ang_r)
     s.store(sun_vis, vsm_v)
     s.end_if()
     if enable_ray_query:
-        s.begin_if(s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_RT_SHADOWS)), s.uint(0)))
-        var rt_v = emit_rt_shadow_query(
-            s, tlas_var, wx, wy, wz, nx, ny, nz, sun_x, sun_y, sun_z, s.float(500.0),
-            b_verts=b_verts, b_indices=b_indices, b_instances=b_instances, b_materials=b_materials, bindless_arr=bindless_arr,
-        )
-        s.store(sun_vis, s.nmin(s.load_f(sun_vis), rt_v))
+        s.begin_if(use_rt_sun)
+        s.store(sun_vis, s.load_float(b_hist, s.iadd(s.push_word(6), pix_idx_u)))
         s.end_if()
 
     var direct = emit_direct_multilobe_bsdf(

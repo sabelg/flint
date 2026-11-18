@@ -167,6 +167,7 @@ from flint.render.aaa_ibl import (
     bake_split_sum_brdf_lut_rg16f,
 )
 from flint.render.aaa_raytracing import (
+    AAA_GLOBALS_SHADOW_CONE_WORD,
     build_blas_triangles_ex,
     ensure_tlas_capacity_mixed_opaque,
     record_build_tlas_mixed_opaque,
@@ -253,6 +254,13 @@ from flint.render.aaa_gpu_particles import (
     gpu_particles_total_oit_words,
 )
 from flint.render.aaa_water import aaa_water_refract_shader
+from flint.render.aaa_rt_shadow import (
+    rt_shadow_filtered_offset,
+    rt_shadow_raw_offset,
+    rt_shadow_total_words,
+    rt_sun_shadow_filter_shader,
+    rt_sun_shadow_trace_shader,
+)
 from flint.render.aaa_post_tsr import (
     AAA_DISPLAY_AGX_REC709,
     AAA_POST_ADAPTED_EXP_WORD,
@@ -506,6 +514,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var pipe_particle_sim: Int
     var pipe_particle_comp: Int
     var pipe_water_refract: Int
+    var pipe_rt_shadow_trace: Int
+    var pipe_rt_shadow_filter: Int
     var pipe_tsr_v3_resolve: Int
     var pipe_motion_blur: Int
     var pipe_display_tonemap: Int
@@ -593,6 +603,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var sun_dir: Vec3
     var sun_radiance: Vec3
     var sun_angular_radius: Float32
+    var sun_shadow_softness: Float32  # angular radius (rad) of the RT sun-shadow cone; < 0 = use `sun_angular_radius`
     var vsm_scene_center: Vec3
     var vsm_ortho_half_extent: Float32
     var ibl_intensity: Float32
@@ -716,6 +727,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_particle_sim = 0
         self.pipe_particle_comp = 0
         self.pipe_water_refract = 0
+        self.pipe_rt_shadow_trace = 0
+        self.pipe_rt_shadow_filter = 0
         self.pipe_tsr_v3_resolve = 0
         self.pipe_motion_blur = 0
         self.pipe_display_tonemap = 0
@@ -844,6 +857,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sun_dir = Vec3(0.38, 0.80, -0.46).normalized()
         self.sun_radiance = Vec3(3.2, 3.0, 2.75)
         self.sun_angular_radius = Float32(0.0035)
+        self.sun_shadow_softness = Float32(0.005)
         self.vsm_scene_center = Vec3(0.0, 0.0, 0.0)
         self.vsm_ortho_half_extent = Float32(16.0)
         self.ibl_intensity = Float32(1.0)
@@ -1107,6 +1121,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_particle_sim = self.vk.create_aaa_compute_pipeline(self.pipe_layout, gpu_particle_sim_and_bin_shader())
         self.pipe_particle_comp = self.vk.create_aaa_compute_pipeline(self.pipe_layout, gpu_particle_tile_composite_shader())
         self.pipe_water_refract = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_water_refract_shader(use_rt))
+        if use_rt:
+            self.pipe_rt_shadow_trace = self.vk.create_aaa_compute_pipeline(self.pipe_layout, rt_sun_shadow_trace_shader())
+            self.pipe_rt_shadow_filter = self.vk.create_aaa_compute_pipeline(self.pipe_layout, rt_sun_shadow_filter_shader())
         self.pipe_tsr_v3_resolve = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_tsr_v3_resolve_shader())
         self.pipe_motion_blur = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_motion_blur_shader())
         self.pipe_display_tonemap = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_display_tonemap_shader())
@@ -1211,7 +1228,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_materials = self.vk.create_buffer(1024 * AAA_MATERIAL_WORDS * 4, local=True)
         self.buf_vsm_indirect = self.vk.create_buffer(64 + self.max_draws * 16, local=True)
         self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
-        var hist_words = max_pix * 44 + AAA_FROXEL_GRID_WORDS * 3
+        var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
         self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
         self.buf_vsm_table = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True)
         self.buf_surfcache = self.vk.create_buffer((4096 + self.max_surfcache_tris * 4) * 4, local=True)
@@ -3094,6 +3111,8 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + 49 * 4, self.sun_dir.y)
         put_float(g_addr + 50 * 4, self.sun_dir.z)
         put_float(g_addr + 51 * 4, self.sun_angular_radius)
+        var shadow_cone = self.sun_shadow_softness if self.sun_shadow_softness >= Float32(0.0) else self.sun_angular_radius
+        put_float(g_addr + AAA_GLOBALS_SHADOW_CONE_WORD * 4, tan(min(Float32(0.2), shadow_cone)))
         put_float(g_addr + 52 * 4, Float32(0.0) if self.furnace_white_dome else self.sun_radiance.x)
         put_float(g_addr + 53 * 4, Float32(0.0) if self.furnace_white_dome else self.sun_radiance.y)
         put_float(g_addr + 54 * 4, Float32(0.0) if self.furnace_white_dome else self.sun_radiance.z)
@@ -3771,6 +3790,42 @@ struct FlintAaaVulkanRenderer(Movable):
         else:
             self.froxel_valid_frames = 0
 
+        # Soft RT sun shadows: area-sun trace + penumbra-sized edge-stopped denoise (`aaa_rt_shadow.mojo`)
+        var rt_sun_flt_off = 0
+        if (
+            self.enable_rt_shadows
+            and self.vk.has_ray_query
+            and n_inst > 0
+            and not self.furnace_white_dome
+            and self.pipe_rt_shadow_trace != 0
+            and self.pipe_rt_shadow_filter != 0
+        ):
+            var q_rs = next_q
+            if use_prof and q_rs + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_rs, PIPELINE_TOP)
+                next_q += 2
+                prof_pairs.append((String("RtSoftSunShadows"), q_rs))
+            rt_sun_flt_off = rt_shadow_filtered_offset(max_pix)
+            var push_rs = List[UInt32](length=16, fill=0)
+            push_rs[0] = UInt32(self.render_w)
+            push_rs[1] = UInt32(self.render_h)
+            push_rs[2] = UInt32(rt_shadow_raw_offset(max_pix))
+            push_rs[3] = UInt32(rt_sun_flt_off)
+            self.vk.dispatch_aaa(
+                cur_slot, self.pipe_rt_shadow_trace, self.pipe_layout, self.desc_set, push_rs, (self.render_w + 7) // 8, (self.render_h + 7) // 8
+            )
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            self.vk.dispatch_aaa(
+                cur_slot, self.pipe_rt_shadow_filter, self.pipe_layout, self.desc_set, push_rs, (self.render_w + 7) // 8, (self.render_h + 7) // 8
+            )
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            if use_prof and q_rs + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_rs + 1, PIPELINE_BOTTOM)
+
         # Full Deferred `VisBuffer` Multi-Lobe + VSM + `SPV_KHR_ray_query` Shading!
         var run_svgf = self.enable_rt_gi and self.svgf_passes > 0 and not self.furnace_white_dome
         var run_spec_reblur = (
@@ -3794,6 +3849,7 @@ struct FlintAaaVulkanRenderer(Movable):
         push_sh[3] = UInt32(1) if run_svgf else UInt32(0)
         push_sh[4] = UInt32(1) if run_spec_reblur else UInt32(0)
         push_sh[5] = UInt32(spec_in_off)
+        push_sh[6] = UInt32(rt_sun_flt_off)
         self.vk.dispatch_aaa(
             cur_slot,
             self.pipe_deferred_shade,
@@ -4736,6 +4792,10 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_particle_sim)
         self.vk.destroy_pipeline(self.pipe_particle_comp)
         self.vk.destroy_pipeline(self.pipe_water_refract)
+        if self.pipe_rt_shadow_trace != 0:
+            self.vk.destroy_pipeline(self.pipe_rt_shadow_trace)
+        if self.pipe_rt_shadow_filter != 0:
+            self.vk.destroy_pipeline(self.pipe_rt_shadow_filter)
         self.vk.destroy_pipeline(self.pipe_tsr_v3_resolve)
         self.vk.destroy_pipeline(self.pipe_motion_blur)
         self.vk.destroy_pipeline(self.pipe_display_tonemap)

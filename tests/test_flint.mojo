@@ -2625,6 +2625,7 @@ def test_v14_aaa_ray_query_tlas_bc6h_ibl_surface_cache_gi_and_cornell_flip() rai
     ren.enable_rt_shadows = True
     ren.enable_rt_reflections = False
     ren.enable_rt_gi = True
+    ren.sun_shadow_softness = Float32(0.0)  # the path-traced reference's sun is a point
     ren.gi_rays_per_pixel = 48
     ren.svgf_passes = 2
     ren.ibl_intensity = Float32(0.0)
