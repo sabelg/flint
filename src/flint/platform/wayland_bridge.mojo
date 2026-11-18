@@ -21,6 +21,7 @@ this client are wl_keyboard.keymap, which is ours and unused, so it is closed, a
 the dmabuf feedback table, which the driver reads. Others stay in order for libwayland.
 """
 from std.ffi import external_call
+from flint.platform.dynlib import dl_open, dl_sym
 from flint.platform.os import close_fd
 from flint.platform.vulkan import call1, get32, get64, put32, put64
 
@@ -297,7 +298,7 @@ struct WaylandBridge(Copyable, Movable):
         return self.state != 0
 
     def symbol(mut self, var name: String) -> Int:
-        var address = external_call["dlsym", Int](self.library, name.as_c_string_span())
+        var address = dl_sym(self.library, name)
         if address == 0:
             self.error = "libwayland-client has no " + name
         return address
@@ -305,7 +306,7 @@ struct WaylandBridge(Copyable, Movable):
     def start(mut self, real_fd: Int) -> Bool:
         """Take over a connected socket on which nothing has been said yet."""
         var library_name = "libwayland-client.so.0"
-        self.library = external_call["dlopen", Int](library_name.as_c_string_span(), Int32(2))
+        self.library = dl_open(library_name)
         if self.library == 0:
             self.error = "no libwayland-client on this system"
             return False

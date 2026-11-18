@@ -16,6 +16,7 @@ slot, so one family of call helpers taking Int fits all of them.
 """
 from std.collections import Dict
 from std.ffi import external_call
+from flint.platform.dynlib import dl_open, dl_sym
 from flint.platform.amdgpu import GpuBuffer
 from flint.platform.os import env_flag, env_value, read_bytes, write_bytes
 
@@ -748,11 +749,11 @@ struct VulkanGpu(Copyable, Movable):
         self.messages = external_call["calloc", Int](Int(2), Int(8))
         self.memory_properties = external_call["malloc", Int](520)
         var library_name = "libvulkan.so.1"
-        self.library = external_call["dlopen", Int](library_name.as_c_string_span(), GLOBAL_LOAD_LAZY | GLOBAL_LOAD_LOCAL)
+        self.library = dl_open(library_name, GLOBAL_LOAD_LAZY | GLOBAL_LOAD_LOCAL)
         if self.library == 0:
             return self.fail("no Vulkan loader on this system")
         var symbol = "vkGetInstanceProcAddr"
-        self.proc_instance = external_call["dlsym", Int](self.library, symbol.as_c_string_span())
+        self.proc_instance = dl_sym(self.library, symbol)
         if self.proc_instance == 0:
             return self.fail("the loader has no vkGetInstanceProcAddr")
         if not self.create_instance(validate):

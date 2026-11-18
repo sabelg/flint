@@ -15,6 +15,7 @@ Synthesizes intelligible spoken tactical guidance into 48 kHz Stereo `WavClip`s:
      and dark-titanium `StereoReverbFDN` cockpit spatialization.
 """
 from std.ffi import external_call
+from flint.platform.dynlib import dl_open, dl_sym
 from std.math import sin, cos, exp, floor, abs
 from flint.platform.os import env_value
 from flint.platform.vulkan import get64, put64
@@ -107,7 +108,7 @@ def _try_espeak_mono(
     var lib = 0
     for i in range(len(candidates)):
         var cname = candidates[i]
-        lib = external_call["dlopen", Int](cname.as_c_string_span(), Int32(2))
+        lib = dl_open(cname)
         _ = cname.byte_length()
         if lib != 0:
             break
@@ -121,12 +122,12 @@ def _try_espeak_mono(
     var s_synth = String("espeak_Synth")
     var s_sync = String("espeak_Synchronize")
 
-    var fn_init = external_call["dlsym", Int](lib, s_init.as_c_string_span())
-    var fn_cb = external_call["dlsym", Int](lib, s_cb.as_c_string_span())
-    var fn_voice = external_call["dlsym", Int](lib, s_voice.as_c_string_span())
-    var fn_param = external_call["dlsym", Int](lib, s_param.as_c_string_span())
-    var fn_synth = external_call["dlsym", Int](lib, s_synth.as_c_string_span())
-    var fn_sync = external_call["dlsym", Int](lib, s_sync.as_c_string_span())
+    var fn_init = dl_sym(lib, s_init)
+    var fn_cb = dl_sym(lib, s_cb)
+    var fn_voice = dl_sym(lib, s_voice)
+    var fn_param = dl_sym(lib, s_param)
+    var fn_synth = dl_sym(lib, s_synth)
+    var fn_sync = dl_sym(lib, s_sync)
     _ = s_init.byte_length()
     _ = s_cb.byte_length()
     _ = s_voice.byte_length()
