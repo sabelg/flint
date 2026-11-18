@@ -48,6 +48,10 @@ from flint.platform.kms import (
     kgets32, kput64, kget64, install_rescue, install_rescue_handlers, rstore, R_ACTIVE, R_STOP,
     kms_stop_requested,
 )
+from flint.platform.logind import (
+    dbus_method_call, dbus_message_length, dbus_parse, dbus_u32, dbus_align, dbus_header_field,
+    hex_ascii, device_numbers,
+)
 from flint.platform.os import (
     read_bytes,
     write_bytes,
@@ -3015,7 +3019,55 @@ def test_kms_ioctl_packing_modes_and_input_decoding() raises:
     assert_true(kms_stop_requested())
     rstore(R_STOP, 0)
     rstore(R_ACTIVE, 0)  # back to plain signal behaviour for the rest of the suite
-    print("  [OK] KMS: DRM ioctl packing, mode choice, canvas fit, MEDIUMRAW + evdev decoding, rescue signals")
+    # D-Bus framing for logind's TakeDevice: our call parses back, and a reply carrying
+    # an fd index ("hb") decodes its reply serial, fd count and body.
+    var call = dbus_method_call(7, "org.freedesktop.login1", "/org/freedesktop/login1/session/auto",
+        "org.freedesktop.login1.Session", "TakeDevice", "uu", [13, 0, 0, 0, 67, 0, 0, 0])
+    assert_equal(Int(call[0]), 108)
+    assert_equal(dbus_message_length(call), len(call))
+    assert_equal(dbus_message_length(List[UInt8](call[0:20])), 0)  # torn: wait for more
+    var parsed_call = dbus_parse(call, len(call))
+    assert_equal(parsed_call.kind, 1)
+    assert_equal(parsed_call.serial, 7)
+    assert_equal(len(parsed_call.body), 8)
+    assert_equal(Int(parsed_call.body[4]), 67)
+    var reply = List[UInt8]()
+    reply.append(108)
+    reply.append(2)
+    reply.append(1)
+    reply.append(1)
+    dbus_u32(reply, 8)
+    dbus_u32(reply, 99)
+    dbus_u32(reply, 0)
+    dbus_align(reply, 8)
+    reply.append(5)  # REPLY_SERIAL u
+    reply.append(1)
+    reply.append(117)
+    reply.append(0)
+    dbus_u32(reply, 7)
+    dbus_header_field(reply, 8, "g", "hb")
+    dbus_align(reply, 8)
+    reply.append(9)  # UNIX_FDS u
+    reply.append(1)
+    reply.append(117)
+    reply.append(0)
+    dbus_u32(reply, 1)
+    var fields = len(reply) - 16
+    reply[12] = UInt8(fields)
+    dbus_align(reply, 8)
+    dbus_u32(reply, 0)  # h: fd index 0
+    dbus_u32(reply, 0)  # b: inactive = false
+    reply.append(108)  # the start of a next message stays queued
+    assert_equal(dbus_message_length(reply), len(reply) - 1)
+    var parsed_reply = dbus_parse(reply, len(reply) - 1)
+    assert_equal(parsed_reply.kind, 2)
+    assert_equal(parsed_reply.reply_serial, 7)
+    assert_equal(parsed_reply.unix_fds, 1)
+    assert_equal(len(parsed_reply.body), 8)
+    assert_equal(hex_ascii("1000"), "31303030")
+    var missing = device_numbers("event-does-not-exist")
+    assert_equal(missing[0], -1)
+    print("  [OK] KMS: DRM ioctl packing, mode choice, canvas fit, MEDIUMRAW + evdev decoding, rescue signals, logind D-Bus framing")
 
 
 

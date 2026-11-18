@@ -12,9 +12,11 @@ Input, with no compositor to deliver it:
   * keyboard: the virtual terminal itself, in K_MEDIUMRAW mode (raw Linux key
     codes, no permissions beyond owning the TTY). When there is no VT, evdev
     keyboards from `/dev/input/event*` are used instead.
-  * mouse: evdev devices with REL_X/REL_Y (needs read access to
-    `/dev/input/event*`, usually the `input` group). A small software cursor is
-    drawn while the pointer is not locked.
+  * mouse: evdev devices with REL_X/REL_Y. Opened directly when readable (the
+    `input` group); otherwise systemd-logind hands them over (platform/logind.mojo,
+    `TakeControl` + `TakeDevice`), as it does for display servers. Then keys come
+    from evdev too, since logind turns the VT keyboard off. A small software cursor
+    is drawn while the pointer is not locked.
   * gamepads: `InputState.poll_gamepad()`, as on every backend.
 
 The console is always given back. The VT is put in KD_GRAPHICS so the text
@@ -36,6 +38,7 @@ from std.ffi import external_call
 from flint.platform.input import InputState
 from flint.platform.os import env_value, env_flag, close_fd, get_time, list_directory, last_errno
 from flint.platform.wayland import evdev_key
+from flint.platform.logind import LogindSession, device_numbers
 from flint.core.anchor import sys, IS_X86, SYS_GETPID, SYS_MSYNC
 
 comptime SYS_IOCTL: Int = 16 if IS_X86 else 29
@@ -681,6 +684,9 @@ struct KmsWindow(Copyable, Movable):
     var decoder: MediumRawDecoder
     var input_fds: List[Int]
     var input_is_keyboard: List[Bool]
+    var logind: LogindSession
+    var using_logind: Bool
+    var input_note: String
     var cursor_x: Float32
     var cursor_y: Float32
     var pending_rel_x: Float32
@@ -728,6 +734,9 @@ struct KmsWindow(Copyable, Movable):
         self.decoder = MediumRawDecoder()
         self.input_fds = List[Int]()
         self.input_is_keyboard = List[Bool]()
+        self.logind = LogindSession()
+        self.using_logind = False
+        self.input_note = ""
         self.cursor_x = 0
         self.cursor_y = 0
         self.pending_rel_x = 0
@@ -1009,18 +1018,28 @@ struct KmsWindow(Copyable, Movable):
 
     # -- console --------------------------------------------------------------
 
-    def claim_console(mut self):
-        """KD_GRAPHICS so the text console stops drawing, and raw key codes from the VT."""
+    def save_console(mut self):
+        """Remember the VT's display mode, keyboard mode and termios before anything changes them."""
         self.tty_fd = open_controlling_vt()
         rstore(R_TTY_FD, self.tty_fd)
         if self.tty_fd < 0:
             return
         rstore(R_OLD_KD_MODE, ioctl_read_int(self.tty_fd, KDGETMODE))
+        rstore(R_OLD_KB_MODE, ioctl_read_int(self.tty_fd, KDGKBMODE))
         var termios = List[UInt8](length=TERMIOS_BYTES, fill=0)
         if drm_ioctl(self.tty_fd, TCGETS, termios):
             for index in range(TERMIOS_BYTES):
                 rstore_byte(R_SAVED_TERMIOS + index, termios[index])
             rstore(R_TERMIOS_SAVED, 1)
+        rstore(R_ACTIVE, 1)
+
+    def claim_console(mut self):
+        """KD_GRAPHICS so the text console stops drawing; raw key codes from the VT unless
+        the keyboard comes from evdev (always the case under logind, which turns it off)."""
+        if self.tty_fd < 0:
+            return
+        var termios = List[UInt8](length=TERMIOS_BYTES, fill=0)
+        if drm_ioctl(self.tty_fd, TCGETS, termios):
             var raw = termios.copy()
             # cfmakeraw: no signals from Ctrl+C, no echo, no line editing, no CR mapping.
             kput32(raw, 0, kget32(raw, 0) & ~(0x1 | 0x2 | 0x8 | 0x20 | 0x40 | 0x80 | 0x100 | 0x400))
@@ -1029,37 +1048,70 @@ struct KmsWindow(Copyable, Movable):
             raw[17 + 5] = 0  # VTIME
             raw[17 + 6] = 0  # VMIN
             _ = drm_ioctl(self.tty_fd, TCSETS, raw)
-        rstore(R_ACTIVE, 1)
-        var old_kb = ioctl_read_int(self.tty_fd, KDGKBMODE)
-        rstore(R_OLD_KB_MODE, old_kb)
-        if old_kb >= 0 and ioctl_value(self.tty_fd, KDSKBMODE, K_MEDIUMRAW):
-            self.keyboard_from_tty = True
+        var has_evdev_keyboard = False
+        for index in range(len(self.input_fds)):
+            if self.input_is_keyboard[index]:
+                has_evdev_keyboard = True
+        if not self.using_logind and not has_evdev_keyboard:
+            if rload(R_OLD_KB_MODE) >= 0 and ioctl_value(self.tty_fd, KDSKBMODE, K_MEDIUMRAW):
+                self.keyboard_from_tty = True
+        elif not self.using_logind:
+            # evdev keyboards are readable: keep the VT from also turning them into text.
+            _ = ioctl_value(self.tty_fd, KDSKBMODE, 0x04)  # K_OFF
         _ = ioctl_value(self.tty_fd, KDSETMODE, KD_GRAPHICS)
 
+    def keep_input_device(mut self, fd: Int) -> Bool:
+        """Keep a mouse or keyboard; close anything else. True when kept."""
+        var types = List[UInt8](length=8, fill=0)
+        var keys = List[UInt8](length=96, fill=0)
+        var rels = List[UInt8](length=8, fill=0)
+        _ = sys(SYS_IOCTL, fd, eviocgbit(0, 8), Int(types.unsafe_ptr()))
+        if bit_set(types, EV_KEY):
+            _ = sys(SYS_IOCTL, fd, eviocgbit(EV_KEY, 96), Int(keys.unsafe_ptr()))
+        if bit_set(types, EV_REL):
+            _ = sys(SYS_IOCTL, fd, eviocgbit(EV_REL, 8), Int(rels.unsafe_ptr()))
+        var is_mouse = bit_set(rels, REL_X) and bit_set(rels, REL_Y) and bit_set(keys, BTN_LEFT)
+        var is_keyboard = bit_set(keys, LINUX_KEY_A) and bit_set(keys, LINUX_KEY_Z) and bit_set(keys, 57)
+        if is_mouse or is_keyboard:
+            self.input_fds.append(fd)
+            self.input_is_keyboard.append(is_keyboard and not is_mouse)
+            return True
+        close_fd(fd)
+        return False
+
     def open_input_devices(mut self):
+        """Mice and keyboards: opened directly when readable, else handed over by logind."""
         var names = list_directory("/dev/input")
+        var denied = List[String]()
         for name in names:
             if not name.startswith("event"):
                 continue
             var path = "/dev/input/" + name
             var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(O_RDONLY_NONBLOCK_CLOEXEC), Int32(0)))
             if fd < 0:
+                var error = Int(last_errno())
+                if error == 13 or error == 1:  # EACCES, EPERM
+                    denied.append(name)
                 continue
-            var types = List[UInt8](length=8, fill=0)
-            var keys = List[UInt8](length=96, fill=0)
-            var rels = List[UInt8](length=8, fill=0)
-            _ = sys(SYS_IOCTL, fd, eviocgbit(0, 8), Int(types.unsafe_ptr()))
-            if bit_set(types, EV_KEY):
-                _ = sys(SYS_IOCTL, fd, eviocgbit(EV_KEY, 96), Int(keys.unsafe_ptr()))
-            if bit_set(types, EV_REL):
-                _ = sys(SYS_IOCTL, fd, eviocgbit(EV_REL, 8), Int(rels.unsafe_ptr()))
-            var is_mouse = bit_set(rels, REL_X) and bit_set(rels, REL_Y) and bit_set(keys, BTN_LEFT)
-            var is_keyboard = bit_set(keys, LINUX_KEY_A) and bit_set(keys, LINUX_KEY_Z) and bit_set(keys, 57)
-            if is_mouse or (is_keyboard and not self.keyboard_from_tty):
-                self.input_fds.append(fd)
-                self.input_is_keyboard.append(is_keyboard and not self.keyboard_from_tty)
-            else:
-                close_fd(fd)
+            _ = self.keep_input_device(fd)
+        if len(denied) == 0 or env_flag("FLINT_KMS_NO_LOGIND"):
+            if len(denied) > 0:
+                self.input_note = "no access to " + String(len(denied)) + " input devices (FLINT_KMS_NO_LOGIND is set)"
+            return
+        if not self.logind.take_control():
+            self.input_note = "mouse unavailable: /dev/input is not readable and logind refused (" + self.logind.last_error + "); run from the text console you logged in on, or join the input group"
+            self.logind.close()
+            return
+        self.using_logind = True
+        var kept = 0
+        for name in denied:
+            var numbers = device_numbers(name)
+            if numbers[0] < 0:
+                continue
+            var fd = self.logind.take_device(numbers[0], numbers[1])
+            if fd >= 0 and self.keep_input_device(fd):
+                kept += 1
+        self.input_note = "input via logind: " + String(kept) + " devices"
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -1108,8 +1160,12 @@ struct KmsWindow(Copyable, Movable):
         rstore(R_STOP, 0)
         _ = install_rescue_handlers()
         self.save_crtc()
-        self.claim_console()
+        self.save_console()
         rstore(R_ACTIVE, 1)
+        self.open_input_devices()
+        self.claim_console()
+        if self.input_note.byte_length() > 0:
+            print("FLINT_KMS_INPUT " + self.input_note)
         if not self.create_buffers():
             self.close()
             return False
@@ -1119,7 +1175,6 @@ struct KmsWindow(Copyable, Movable):
             return False
         self.front = 0
         self.last_flip_at = get_time()
-        self.open_input_devices()
         return True
 
     def close(mut self):
@@ -1131,6 +1186,8 @@ struct KmsWindow(Copyable, Movable):
             close_fd(fd)
         self.input_fds.clear()
         self.input_is_keyboard.clear()
+        self.logind.close()  # logind also puts the VT back when control is released
+        self.using_logind = False
         close_fd(self.drm_fd)
         self.drm_fd = -1
         close_fd(self.tty_fd)
@@ -1326,7 +1383,7 @@ struct KmsWindow(Copyable, Movable):
                         if code >= BTN_LEFT and code <= BTN_MIDDLE:
                             self.pending_buttons.append(code - BTN_LEFT)
                             self.pending_button_down.append(value != 0)
-                        elif self.input_is_keyboard[device]:
+                        elif not self.keyboard_from_tty:
                             self.queue_key(code, value != 0)
 
     def poll(mut self, mut input: InputState):
@@ -1339,6 +1396,8 @@ struct KmsWindow(Copyable, Movable):
             self.read_drm_events()
         self.read_tty()
         self.read_evdev()
+        if self.using_logind:
+            self.logind.drain()
         if self.pending_moved:
             if self.pointer_locked:
                 input.add_mouse_delta(self.pending_rel_x, self.pending_rel_y)
