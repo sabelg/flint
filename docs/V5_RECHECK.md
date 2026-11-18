@@ -42,3 +42,28 @@ Every test passes, but at `exit()` ASAN reports a heap-use-after-free between tw
 
 ## Before committing
 Run `bash tools/flint.sh gate`. The gate order fix and the `integrate_velocities(0, ...)` e2e fix are already in the working tree; keep both.
+
+## Update 10:25: fixes are ready to take
+Items 1 and 4 are fixed and committed in flint-py's copy of Flint (`~/flint-py/vendor/flint`, branch `v5-flint-py`), on top of a snapshot of this working tree taken at 10:01:
+- `a083194` fix(ecs): restore_blob validates counts and entity tables before allocating (adds suite (h) to test_flint_v5_core_ecs_scene.mojo)
+- `6178774` fix(render): GpuSceneRenderer closes its Vulkan device when destroyed (`shutdown()` + `__deinit__`)
+
+The full gate passes on that copy. To take them: `git -C ~/flint-py/vendor/flint format-patch -2 6178774`, then `git am` the patches here once v5 is committed. They only touch `src/flint/ecs/world.mojo`, `src/flint/render/scene_renderer.mojo` and the ECS test.
+
+## Update 2026-11-18 evening: fixes and render features are applied to this working tree
+
+The commits from flint-py's engine copy are now applied here as **uncommitted** changes, on
+top of the v5 working tree (which had not changed since the 10:01 snapshot). Nothing was
+committed on `main`; you still own the v5 commit. The same work, as separate commits, is on
+the local branch `v5-flint-py` (8650aa9 snapshot, then 7 commits up to 671672b):
+
+- a083194 fix(ecs): restore_blob validates counts and entity tables before allocating
+- 6178774 fix(render): GpuSceneRenderer closes its Vulkan device when destroyed
+- 9ce7893 feat(render): soft, denoised ray-traced sun shadows (new aaa_rt_shadow.mojo)
+- 85b3eb1 feat(render): ray-traced refractive glass materials
+- 1410d15 feat(render): shaped, calm water surfaces (round ponds, wave and foam control)
+- 6cc3580 fix(render): glass is see-through even with every RT feature off
+- 671672b feat(render): generic GPU particles (color/size/alpha over life, additive or alpha blend)
+
+The engine tests gained ECS suite (h) and render Suite 7. If you edit these files, start
+from what is on disk now; the patch is `git diff 8650aa9 671672b`.
