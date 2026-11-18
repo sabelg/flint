@@ -33,6 +33,7 @@ from flint.net.channel import (
     seq_ge,
     seq_gt,
 )
+from flint.net.hub import NET_HUB_DEFAULT_MAX_CHANNELS, NetHub
 from flint.net.rollback import (
     ROLLBACK_INPUT_HISTORY_K,
     ROLLBACK_SNAPSHOT_RING,

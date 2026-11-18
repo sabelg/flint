@@ -14,6 +14,9 @@ Covers:
       10,000 ticks, `< 1.2 ms` 8-tick re-sim, Rift stall estimator, and tamper `desync_tick` trap).
   (e) 16-client `SnapshotReplicator` 2D/3D spatial interest + ACKed baseline delta compression
       bandwidth gate (`< 24 KB/s` for 256 active entities @ 20 Hz).
+  (h) `NetHub`: one transport, a channel per peer: a host accepts 3 clients over a lossy
+      `VirtualNetSim`, routes by sender, replies per channel, ignores strangers on a client,
+      respects `max_channels`, and re-accepts a dropped peer in the same slot.
   (f) `EngineBenchSuite` p50/p99 latency, determinism gate, Magma FLIP heatmap emission, and CSV export.
 """
 from std.collections import List
@@ -40,6 +43,7 @@ from flint.net import (
     IPV6_SAFE_MTU_BYTES,
     JITTER_TRIANGULAR,
     NetChannel,
+    NetHub,
     NetEndpoint,
     ROLLBACK_INPUT_HISTORY_K,
     RollbackInput,
@@ -840,6 +844,144 @@ def test_g_physics_world_rollback_and_spoof_auth() raises:
     )
 
 
+def _hub_msg(tag: Int, n: Int) -> List[UInt8]:
+    var m = List[UInt8](capacity=n)
+    for i in range(n):
+        m.append(UInt8((tag * 31 + i * 7) & 0xFF))
+    return m^
+
+
+def _hub_pump(
+    mut sim: VirtualNetSim,
+    mut host: NetHub[VirtualEndpoint],
+    mut clients: List[NetHub[VirtualEndpoint]],
+    steps: Int,
+):
+    for _ in range(steps):
+        var now = sim.now_ms()
+        host.poll(now)
+        for c in range(len(clients)):
+            clients[c].poll(now)
+        sim.advance_ms(10.0)
+
+
+def test_h_net_hub_routing_accept_drop() raises:
+    print("  [Test H] NetHub: host accepts 3 clients over 8% loss, routes by sender, drop + re-accept...")
+    var sim = VirtualNetSim(
+        seed=0x4855425F54455354,
+        one_way_latency_ms=30.0,
+        jitter_ms=10.0,
+        loss_rate=0.08,
+        dup_rate=0.02,
+        mtu_bytes=IPV6_SAFE_MTU_BYTES,
+        jitter_mode=JITTER_TRIANGULAR,
+    )
+    var host = NetHub[VirtualEndpoint](sim.create_ipv4_peer(0, 9300), True)
+    var host_ep = host.local_endpoint()
+    var clients = List[NetHub[VirtualEndpoint]]()
+    for c in range(3):
+        clients.append(NetHub[VirtualEndpoint](sim.create_ipv4_peer(c + 1, 9300), False))
+    for c in range(3):
+        var cid = clients[c].connect(host_ep)
+        assert_equal(cid, 0)
+        assert_equal(clients[c].connect(host_ep), 0)        # same address: same channel
+        assert_true(clients[c].send_reliable(cid, _hub_msg(c + 1, 300 + 2000 * c)))  # 3rd one fragments
+
+    var seen = List[Int](length=3, fill=-1)                  # host channel id per client
+    var accepted = 0
+    for _ in range(300):
+        var now = sim.now_ms()
+        host.poll(now)
+        accepted += len(host.accepted)
+        for cid in range(host.count):
+            while True:
+                var m = host.pop_reliable(cid)
+                if not m[0]:
+                    break
+                var tag = (len(m[1]) - 300) // 2000          # client c sent 300 + 2000 c bytes
+                assert_equal(hash_list(m[1]), hash_list(_hub_msg(tag + 1, len(m[1]))))
+                seen[tag] = cid
+                assert_true(host.send_reliable(cid, _hub_msg(100 + tag, 64)))
+        for c in range(3):
+            clients[c].poll(now)
+        sim.advance_ms(10.0)
+        if seen[0] >= 0 and seen[1] >= 0 and seen[2] >= 0:
+            break
+    assert_equal(accepted, 3)
+    assert_equal(host.open_count(), 3)
+    for c in range(3):
+        assert_true(seen[c] >= 0)
+        assert_true(host.chans[seen[c]].peer_endpoint == clients[c].local_endpoint())
+    assert_true(seen[0] != seen[1] and seen[1] != seen[2] and seen[0] != seen[2])
+
+    # replies reach the right client only
+    _hub_pump(sim, host, clients, 120)
+    for c in range(3):
+        var r = clients[c].pop_reliable(0)
+        assert_true(r[0])
+        assert_equal(hash_list(r[1]), hash_list(_hub_msg(100 + c, 64)))
+        assert_false(clients[c].pop_reliable(0)[0])
+
+    # unreliable latest-only datagrams route too
+    assert_true(clients[1].send_unreliable(0, _hub_msg(7, 40), sim.now_ms()))
+
+    # a client ignores a stranger (accept = False); another client sends to client 0 directly
+    var stranger = clients[2].connect(clients[0].local_endpoint())
+    assert_equal(stranger, 1)
+    assert_true(clients[2].send_reliable(stranger, _hub_msg(9, 20)))
+    _hub_pump(sim, host, clients, 40)
+    assert_equal(clients[0].open_count(), 1)
+    assert_true(clients[0].datagrams_ignored > 0)
+    clients[2].drop(stranger)
+    assert_false(clients[2].is_open(stranger))
+    assert_false(clients[2].send_reliable(stranger, _hub_msg(9, 20)))
+
+    # drop client 1 on the host: its next packet opens a fresh channel in the same slot
+    var slot = seen[1]
+    host.drop(slot)
+    assert_equal(host.open_count(), 2)
+    assert_false(host.pop_reliable(slot)[0])
+    clients[1].drop(0)
+    assert_equal(clients[1].connect(host_ep), 0)             # a fresh channel to the host
+    assert_true(clients[1].send_reliable(0, _hub_msg(42, 50)))
+    var reaccepted = False
+    var got = False
+    for _ in range(200):
+        var now = sim.now_ms()
+        host.poll(now)
+        for a in range(len(host.accepted)):
+            if host.accepted[a] == slot:
+                reaccepted = True
+        var m = host.pop_reliable(slot)
+        if m[0]:
+            assert_equal(hash_list(m[1]), hash_list(_hub_msg(42, 50)))
+            got = True
+        for c in range(3):
+            clients[c].poll(now)
+        sim.advance_ms(10.0)
+        if got:
+            break
+    assert_true(reaccepted and got)
+    assert_equal(host.open_count(), 3)
+
+    # max_channels: a host with room for one accepts the first sender only
+    var small = NetHub[VirtualEndpoint](sim.create_ipv4_peer(10, 9300), True, 1)
+    var small_ep = small.local_endpoint()
+    for c in range(2):
+        var cid = clients[c].connect(small_ep)
+        assert_true(clients[c].send_reliable(cid, _hub_msg(c, 10)))
+    for _ in range(60):
+        var now = sim.now_ms()
+        small.poll(now)
+        for c in range(3):
+            clients[c].poll(now)
+        sim.advance_ms(10.0)
+    assert_equal(small.open_count(), 1)
+    assert_equal(small.connect(clients[2].local_endpoint()), -1)
+    assert_true(small.datagrams_ignored > 0)
+    assert_true(host.datagrams_routed > 10)
+
+
 def main() raises:
     var t_start = monotonic()
     set_sim_float_mode()
@@ -853,6 +995,7 @@ def main() raises:
     test_e_replicator_16_clients_bandwidth_gate()
     test_f_lab_bench_suite_harness()
     test_g_physics_world_rollback_and_spoof_auth()
+    test_h_net_hub_routing_accept_drop()
     var total_ms = Float64(monotonic() - t_start) / 1.0e6
     print("============================================================")
     print(" [PASS] ALL FLINT V5 NET & ROLLBACK TESTS PASSED (" + String(Int(total_ms)) + " ms)")
