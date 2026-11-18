@@ -827,6 +827,21 @@ struct KmsWindow(Copyable, Movable):
         self.height = sc.height
         return sc^
 
+    def detach_vulkan(mut self, mut vk: VulkanGpu) -> Bool:
+        """Take the screen back from a swapchain made by attach_vulkan: close it, let Vulkan
+        release the display, and present CPU frames again at this window's KMS mode (for a
+        game switching to a CPU-drawn view). attach_vulkan may be called again later."""
+        vk.close_swapchain()
+        vk.release_display()
+        if self.drm_fd < 0:
+            return False
+        if len(self.fb_ids) == 2:
+            return True
+        self.width = self.mode.hdisplay
+        self.height = self.mode.vdisplay
+        self.for_vulkan = True  # start_cpu_present: make the buffers and set our mode
+        return self.start_cpu_present()
+
     def set_title(mut self, title: String):
         """No window title on a bare display."""
         pass

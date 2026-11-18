@@ -1,7 +1,8 @@
 """Feature 15: Tile-Binned GPU UI SDF Overlay Compute Pass.
 
 Compiles a 16x16 tile-binned compute shader evaluating analytic rounded rects,
-circles, and bindless R8_UNORM font glyphs with workgroup LDS coarse culling.
+circles, and bindless R8_UNORM font glyphs with workgroup LDS coarse culling,
+composited per tile in draw (painter's) order.
 """
 from std.collections import List
 from flint.render.spirv import (
@@ -17,6 +18,7 @@ from flint.render.aaa_visbuffer import (
 )
 
 comptime AAA_POST_UI_PRIMS_BASE_OFFSET: Int = 1024
+comptime TILE_PRIM_CAP: Int = 256  # prims one 16x16 tile can composite (one per invocation)
 
 
 def aaa_ui_overlay_shader() -> List[UInt32]:
@@ -58,9 +60,11 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
     var tile_x1 = s.fadd(tile_x0, s.float(16.0))
     var tile_y1 = s.fadd(tile_y0, s.float(16.0))
 
-    # Workgroup Shared Memory: 1 counter + 128 primitive indices
+    # Workgroup Shared Memory: 1 counter + up to 256 primitive indices (one per invocation),
+    # binned in arbitrary atomic order, then put back in draw order for painter's compositing.
     var shared_cnt = s.workgroup_array_u32(1)
-    var shared_prims = s.workgroup_array_u32(128)
+    var shared_prims = s.workgroup_array_u32(TILE_PRIM_CAP)
+    var ordered_prims = s.workgroup_array_u32(TILE_PRIM_CAP)
 
     s.begin_if(s.ieq(local_idx, s.uint(0)))
     s.store_workgroup_u32(shared_cnt[0], shared_cnt[1], s.uint(0), s.uint(0))
@@ -85,7 +89,7 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
     )
     s.begin_if(s.logical_not(outside))
     var slot = s.atomic_add_workgroup_u32(shared_cnt[0], shared_cnt[1], s.uint(0), s.uint(1))
-    s.begin_if(s.ult(slot, s.uint(128)))
+    s.begin_if(s.ult(slot, s.uint(UInt32(TILE_PRIM_CAP))))
     s.store_workgroup_u32(shared_prims[0], shared_prims[1], slot, p)
     s.end_if()
     s.end_if()
@@ -95,8 +99,29 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
     s.workgroup_barrier()
 
     # Early exit if tile is empty
-    var total_prims = s.umin(s.load_workgroup_u32(shared_cnt[0], shared_cnt[1], s.uint(0)), s.uint(128))
-    s.return_if(s.ieq(total_prims, s.uint(0)))
+    var total_prims = s.umin(s.load_workgroup_u32(shared_cnt[0], shared_cnt[1], s.uint(0)), s.uint(UInt32(TILE_PRIM_CAP)))
+    s.return_if(s.ieq(total_prims, s.uint(0)))  # uniform across the workgroup
+
+    # The atomic binning above lists a tile's prims in whatever order the invocations got
+    # there, and compositing is order-dependent (a button's text over its background). Rank
+    # sort back into draw order: invocation k places entry k at the count of smaller indices.
+    s.begin_if(s.ult(local_idx, total_prims))
+    var mine = s.load_workgroup_u32(shared_prims[0], shared_prims[1], local_idx)
+    var rank_var = s.uvar(s.uint(0))
+    var j_var = s.uvar(s.uint(0))
+    s.begin_loop()
+    var j = s.load_u(j_var)
+    s.break_if(s.uge(j, total_prims))
+    var other = s.load_workgroup_u32(shared_prims[0], shared_prims[1], j)
+    s.begin_if(s.ult(other, mine))
+    s.store(rank_var, s.iadd(s.load_u(rank_var), s.uint(1)))
+    s.end_if()
+    s.store(j_var, s.iadd(j, s.uint(1)))
+    s.end_loop()
+    s.store_workgroup_u32(ordered_prims[0], ordered_prims[1], s.load_u(rank_var), mine)
+    s.end_if()
+    s.workgroup_barrier()
+
     s.return_if(s.logical_or(s.uge(gx, out_w), s.uge(gy, out_h)))
 
     # Load 3D scene pixel from history buffer
@@ -118,7 +143,7 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
     var i = s.load_u(i_var)
     s.break_if(s.uge(i, total_prims))
 
-    var prim_idx = s.load_workgroup_u32(shared_prims[0], shared_prims[1], i)
+    var prim_idx = s.load_workgroup_u32(ordered_prims[0], ordered_prims[1], i)
     var pb = s.iadd(prims_off, s.imul(prim_idx, s.uint(16)))
 
     # Clip rect check

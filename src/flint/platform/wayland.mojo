@@ -8,7 +8,7 @@ from std.ffi import external_call
 from flint.platform.input import InputState
 from flint.platform.wayland_bridge import WaylandBridge
 from flint.platform.x11 import X11Window
-from flint.platform.kms import KmsWindow, on_virtual_console
+from flint.platform.kms import KmsWindow, on_virtual_console, fit_rect
 from flint.platform.vulkan import VulkanGpu, SwapchainHandle
 from flint.platform.os import env_value, env_flag, close_fd, get_time
 
@@ -209,6 +209,9 @@ struct WaylandWindow(Copyable, Movable):
     var kms: KmsWindow
     var using_kms: Bool
     var wants_kms_vulkan: Bool  # on KMS, leave the display to a Vulkan swapchain (KmsWindow GPU mode)
+    var wants_gpu_fullscreen: Bool  # a GPU game: Vulkan bridge + fullscreen, swapchain scaled by the compositor
+    var gpu_width: Int  # size of the swapchain attach_vulkan made on Wayland, 0 when none
+    var gpu_height: Int
     var window_title: String
     var logical_width: Int
     var logical_height: Int
@@ -283,6 +286,9 @@ struct WaylandWindow(Copyable, Movable):
         self.kms = KmsWindow()
         self.using_kms = False
         self.wants_kms_vulkan = False
+        self.wants_gpu_fullscreen = False
+        self.gpu_width = 0
+        self.gpu_height = 0
         self.window_title = "FLINT ENGINE"
         self.logical_width = 1280
         self.logical_height = 720
@@ -721,6 +727,8 @@ struct WaylandWindow(Copyable, Movable):
                 self.focused = True
                 return True
             return False
+        if self.wants_gpu_fullscreen:
+            self.wants_bridge = True
         if self.wants_bridge and not self.bridge.start(self.fd):
             # The window works without it, on the dmabuf and shared-memory paths.
             print("WAYLAND_BRIDGE_UNAVAILABLE " + self.bridge.error)
@@ -759,6 +767,11 @@ struct WaylandWindow(Copyable, Movable):
         body = List[UInt8]()
         wl_append_string(body, "flint")
         _ = self.request(self.toplevel, 3, body)
+        if self.wants_gpu_fullscreen and not env_flag("FLINT_WINDOWED"):
+            # Before the first commit, so the first configure is already the fullscreen size.
+            body = List[UInt8]()
+            wl_append32(body, 0)  # xdg_toplevel.set_fullscreen on any output
+            _ = self.request(self.toplevel, 11, body)
         _ = self.empty_request(self.surface, 6)
         body = List[UInt8]()
         wl_append32(body, 0)
@@ -774,8 +787,10 @@ struct WaylandWindow(Copyable, Movable):
     def attach_vulkan(mut self, mut vk: VulkanGpu, width: Int, height: Int, prefer_mailbox: Bool = True, prefer_hdr10: Bool = False) -> SwapchainHandle:
         """A swapchain on whatever this window is, so a game presents zero-copy without
         knowing the backend. width x height is the renderer's output size.
-        - Wayland: needs `wants_bridge = True` before initialize() (the Vulkan driver's own
-          connection to the compositor).
+        - Wayland: needs `wants_gpu_fullscreen` (or `wants_bridge`) set before initialize(),
+          for the Vulkan driver's own connection to the compositor. The swapchain keeps its
+          size; the compositor scales it to the window (wp_viewporter), aspect-fit when
+          fullscreen, so a fullscreen game can be scanned out with no copy at all.
         - KMS: Vulkan takes the display at a mode of exactly that size (KmsWindow.attach_vulkan).
         - X11: none, this X11 client has no XCB connection to give Vulkan.
         An empty handle (`swapchain == 0`) means keep presenting CPU frames with present(),
@@ -785,7 +800,7 @@ struct WaylandWindow(Copyable, Movable):
             return self.kms.attach_vulkan(vk, width, height, prefer_hdr10)
         if self.using_x11 or not self.bridge.active() or self.bridge.surface_proxy == 0:
             return SwapchainHandle()
-        return vk.attach_surface(
+        var sc = vk.attach_surface(
             wl_display=self.bridge.display,
             wl_surface=self.bridge.surface_proxy,
             width=width,
@@ -793,6 +808,21 @@ struct WaylandWindow(Copyable, Movable):
             prefer_mailbox=prefer_mailbox,
             prefer_hdr10=prefer_hdr10,
         )
+        if sc.swapchain != 0:
+            self.gpu_width = sc.width
+            self.gpu_height = sc.height
+            self.fit_swapchain_to_window()
+        return sc^
+
+    def detach_vulkan(mut self, mut vk: VulkanGpu) -> Bool:
+        """Undo attach_vulkan: close the swapchain and go back to present() with CPU frames
+        (on KMS this sets the window's own mode again). True when present() works again."""
+        if self.using_kms:
+            return self.kms.detach_vulkan(vk)
+        vk.close_swapchain()
+        self.gpu_width = 0
+        self.gpu_height = 0
+        return self.fd >= 0 or self.using_x11
 
     def presents_on_gpu(self) -> Bool:
         """True once a Vulkan swapchain owns the KMS display (present() is then a no-op)."""
@@ -849,13 +879,18 @@ struct WaylandWindow(Copyable, Movable):
         if self.fd < 0:
             return
         self.receive()
+        if self.gpu_width > 0:
+            self.fit_swapchain_to_window()
         if self.pending_mouse_x >= 0 and self.pending_mouse_y >= 0:
             var mx = self.pending_mouse_x
             var my = self.pending_mouse_y
-            if self.width > 0 and self.width != self.logical_width:
-                mx = mx * Float32(self.logical_width) / Float32(self.width)
-            if self.height > 0 and self.height != self.logical_height:
-                my = my * Float32(self.logical_height) / Float32(self.height)
+            # Pointer positions are surface-local: the viewport's size once one is set.
+            var surface_w = self.viewport_width if self.viewport_width > 0 else self.width
+            var surface_h = self.viewport_height if self.viewport_height > 0 else self.height
+            if surface_w > 0 and surface_w != self.logical_width:
+                mx = mx * Float32(self.logical_width) / Float32(surface_w)
+            if surface_h > 0 and surface_h != self.logical_height:
+                my = my * Float32(self.logical_height) / Float32(surface_h)
             if not self.pointer_locked:
                 input.move_mouse(mx, my)
             else:
@@ -1039,7 +1074,14 @@ struct WaylandWindow(Copyable, Movable):
 
     def scale_to_window(mut self):
         """Let the compositor stretch buffers of any size over the whole window."""
-        if self.viewporter == 0 or (self.viewport_width == self.width and self.viewport_height == self.height):
+        self.set_viewport_destination(self.width, self.height)
+
+    def set_viewport_destination(mut self, width: Int, height: Int):
+        """wp_viewport.set_destination: the surface's size on screen, whatever its buffers'
+        size (the compositor scales them on the GPU). Applies at the surface's next commit."""
+        if self.viewporter == 0 or width <= 0 or height <= 0:
+            return
+        if self.viewport_width == width and self.viewport_height == height:
             return
         var body = List[UInt8]()
         if self.viewport == 0:
@@ -1048,11 +1090,33 @@ struct WaylandWindow(Copyable, Movable):
             wl_append32(body, self.surface)
             _ = self.request(self.viewporter, 1, body)
             body = List[UInt8]()
-        wl_append32(body, self.width)
-        wl_append32(body, self.height)
+        wl_append32(body, width)
+        wl_append32(body, height)
         _ = self.request(self.viewport, 2, body)
-        self.viewport_width = self.width
-        self.viewport_height = self.height
+        self.viewport_width = width
+        self.viewport_height = height
+
+    def fit_swapchain_to_window(mut self):
+        """Show the attach_vulkan swapchain over the window: stretched to it when windowed,
+        aspect-fit when fullscreen (the compositor centres it on black). Vulkan's next
+        present commits it; no frame is copied or redrawn."""
+        if self.gpu_width <= 0 or self.gpu_height <= 0 or self.width <= 0 or self.height <= 0:
+            return
+        var before_w = self.viewport_width
+        var before_h = self.viewport_height
+        if self.fullscreen:
+            var rect = fit_rect(self.gpu_width, self.gpu_height, self.width, self.height)
+            self.set_viewport_destination(rect[2], rect[3])
+        else:
+            self.set_viewport_destination(self.width, self.height)
+        if env_flag("FLINT_DEBUG_PRESENT") and (before_w != self.viewport_width or before_h != self.viewport_height):
+            print(
+                "FLINT_WAYLAND_GPU_VIEWPORT swapchain " + String(self.gpu_width) + "x" + String(self.gpu_height)
+                + " -> " + String(self.viewport_width) + "x" + String(self.viewport_height)
+                + " in a " + String(self.width) + "x" + String(self.height)
+                + (" fullscreen" if self.fullscreen else " window")
+                + (" (no wp_viewporter)" if self.viewporter == 0 else "")
+            )
 
     def commit_buffer(mut self, selected: Int):
         """Attach a filled buffer, request the next frame callback, and commit."""
