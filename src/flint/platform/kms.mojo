@@ -33,6 +33,12 @@ restores the console and exits at once.
 
 Select it with FLINT_BACKEND=kms, or run from a text console (Ctrl+Alt+F3) with
 neither WAYLAND_DISPLAY nor DISPLAY set.
+
+GPU mode (`for_vulkan = True` before `initialize`, or `WaylandWindow.wants_kms_vulkan`):
+everything above except the CPU buffers and the first modeset, so Vulkan can take the
+connector for a swapchain (`VulkanGpu.create_drm_display_surface(drm_fd, connector, ...)`,
+VK_EXT_acquire_drm_display). `present()` then does nothing; `start_cpu_present()`
+falls back to the CPU path when Vulkan cannot have the display.
 """
 from std.ffi import external_call
 from flint.platform.input import InputState
@@ -698,6 +704,7 @@ struct KmsWindow(Copyable, Movable):
     var pending_buttons: List[Int]
     var pending_button_down: List[Bool]
     var ctrl_down: Bool
+    var for_vulkan: Bool
     var last_error: String
 
     def __init__(out self):
@@ -748,13 +755,36 @@ struct KmsWindow(Copyable, Movable):
         self.pending_buttons = List[Int]()
         self.pending_button_down = List[Bool]()
         self.ctrl_down = False
+        self.for_vulkan = False
         self.last_error = ""
 
     def active(self) -> Bool:
-        return self.drm_fd >= 0 and len(self.fb_ids) == 2
+        return self.drm_fd >= 0 and (self.for_vulkan or len(self.fb_ids) == 2)
 
     def backend_name(self) -> String:
-        return "KMS" if self.active() else "Headless"
+        if not self.active():
+            return "Headless"
+        return "KMS-Vulkan" if self.for_vulkan and len(self.fb_ids) == 0 else "KMS"
+
+    def refresh_mhz(self) -> Int:
+        """The mode's refresh rate in millihertz, as Vulkan display modes count it."""
+        return Int(self.mode.refresh_hz() * 1000.0 + 0.5)
+
+    def start_cpu_present(mut self) -> Bool:
+        """Leave GPU mode: make the CPU buffers and light the screen with them, for when
+        Vulkan could not take the display."""
+        if self.drm_fd < 0:
+            return False
+        if len(self.fb_ids) == 2:
+            self.for_vulkan = False
+            return True
+        if not self.create_buffers() or not self.set_crtc(0):
+            self.destroy_buffers()
+            return False
+        self.front = 0
+        self.last_flip_at = get_time()
+        self.for_vulkan = False
+        return True
 
     def set_title(mut self, title: String):
         """No window title on a bare display."""
@@ -1166,6 +1196,10 @@ struct KmsWindow(Copyable, Movable):
         self.claim_console()
         if self.input_note.byte_length() > 0:
             print("FLINT_KMS_INPUT " + self.input_note)
+        if self.for_vulkan:
+            # Vulkan takes the connector itself; the first modeset is its swapchain's.
+            self.last_flip_at = get_time()
+            return True
         if not self.create_buffers():
             self.close()
             return False
@@ -1294,6 +1328,10 @@ struct KmsWindow(Copyable, Movable):
                 Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=base + y * self.pitch + x * 4)[unsafe_offset=0] = UInt32(0x101010) if edge else UInt32(0xF2F5F8)
 
     def present(mut self, mut pixels: List[UInt32], source_width: Int, source_height: Int):
+        if len(self.fb_ids) != 2:
+            if kms_stop_requested():
+                self.close_requested = True
+            return  # GPU mode: the Vulkan swapchain presents
         if not self.active() or source_width <= 0 or source_height <= 0 or len(pixels) < source_width * source_height:
             return
         if kms_stop_requested():

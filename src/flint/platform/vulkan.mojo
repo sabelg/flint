@@ -116,6 +116,12 @@ comptime DEVICE_PROPERTIES_BYTES: Int = 824
 comptime MAX_REPORTED_MESSAGES: Int = 12
 
 comptime TYPE_WAYLAND_SURFACE_CREATE_INFO: UInt32 = 1000006000
+comptime TYPE_DISPLAY_SURFACE_CREATE_INFO: UInt32 = 1000002001
+comptime DISPLAY_ALPHA_OPAQUE: UInt32 = 1
+comptime DISPLAY_ALPHA_GLOBAL: UInt32 = 2
+comptime SURFACE_TRANSFORM_IDENTITY: UInt32 = 1
+comptime DISPLAY_MODE_PROPERTIES_BYTES: Int = 24  # VkDisplayModePropertiesKHR
+comptime DISPLAY_PLANE_PROPERTIES_BYTES: Int = 16  # VkDisplayPlanePropertiesKHR
 comptime TYPE_SWAPCHAIN_CREATE_INFO: UInt32 = 1000001000
 comptime TYPE_PRESENT_INFO: UInt32 = 1000001001
 comptime TYPE_IMAGE_MEMORY_BARRIER: UInt32 = 45
@@ -384,6 +390,23 @@ def lookup(f: Int, a: Int, b: Int) -> Int:
     return Pointer(to=slot).unsafe_bitcast[Lookup]()[unsafe_offset=0](a, b)
 
 
+def choose_display_mode(widths: List[Int], heights: List[Int], refresh_mhz: List[Int], want_width: Int, want_height: Int, want_mhz: Int) -> Int:
+    """The Vulkan display mode for a KMS mode: same size, closest refresh. Without
+    a size match, the largest. -1 when there are none."""
+    var best = -1
+    for index in range(len(widths)):
+        if widths[index] != want_width or heights[index] != want_height:
+            continue
+        if best < 0 or abs(refresh_mhz[index] - want_mhz) < abs(refresh_mhz[best] - want_mhz):
+            best = index
+    if best >= 0:
+        return best
+    for index in range(len(widths)):
+        if best < 0 or widths[index] * heights[index] > widths[best] * heights[best]:
+            best = index
+    return best
+
+
 def c_string(address: Int) -> String:
     if address == 0:
         return ""
@@ -427,6 +450,8 @@ struct VulkanGpu(Copyable, Movable):
     var has_calibration: Bool
     var has_swapchain: Bool
     var has_wayland_surface: Bool
+    var has_display_surface: Bool  # VK_KHR_display + VK_EXT_acquire_drm_display: present with no compositor
+    var display: Int  # the VkDisplayKHR taken from a KMS connector, released with the swapchain
     var api_version: UInt32
     var has_vulkan_13: Bool
     var has_dynamic_rendering: Bool
@@ -514,6 +539,8 @@ struct VulkanGpu(Copyable, Movable):
         self.has_calibration = False
         self.has_swapchain = False
         self.has_wayland_surface = False
+        self.has_display_surface = False
+        self.display = 0
         self.api_version = API_VERSION_1_2
         self.has_vulkan_13 = False
         self.has_dynamic_rendering = False
@@ -702,6 +729,14 @@ struct VulkanGpu(Copyable, Movable):
             if String(wanted) in offered:
                 extensions.append(String(wanted))
         self.has_wayland_surface = len(extensions) == 2
+        # Presenting straight to a KMS connector (platform/kms.mojo, GPU mode): all three or none.
+        if "VK_KHR_surface" in offered and "VK_KHR_display" in offered and "VK_EXT_direct_mode_display" in offered and "VK_EXT_acquire_drm_display" in offered:
+            if "VK_KHR_surface" not in extensions:
+                extensions.append("VK_KHR_surface")
+            extensions.append("VK_KHR_display")
+            extensions.append("VK_EXT_direct_mode_display")
+            extensions.append("VK_EXT_acquire_drm_display")
+            self.has_display_surface = True
         var layers = List[String]()
         var checked = validate or env_flag("SD_VULKAN_VALIDATION")
         if checked:
@@ -1529,6 +1564,104 @@ struct VulkanGpu(Copyable, Movable):
             self.acquire_semaphores.append(self.create_binary_semaphore())
         return True
 
+    def create_drm_display_surface(mut self, drm_fd: Int, connector: Int, width: Int, height: Int, refresh_mhz: Int, frames: Int = 2) -> Bool:
+        """Present straight to a KMS connector, no compositor: take the display through our
+        DRM master fd (VK_EXT_acquire_drm_display), match the KMS mode, pick a plane that can
+        show it, and make a display-plane surface. The swapchain is then the usual one."""
+        if not self.has_display_surface or not self.has_swapchain:
+            return self.fail("this driver cannot present to a display directly (VK_KHR_display / VK_EXT_acquire_drm_display)")
+        self.rewind()
+        var slot = self.scratch(8)
+        if not self.check(call4(self.instance_call("vkGetDrmDisplayEXT"), self.physical, drm_fd, connector, slot), "vkGetDrmDisplayEXT (is this the GPU behind the DRM card?)"):
+            return False
+        var display = get64(slot)
+        if not self.check(call3(self.instance_call("vkAcquireDrmDisplayEXT"), self.physical, drm_fd, display), "vkAcquireDrmDisplayEXT (needs DRM master)"):
+            return False
+        self.display = display
+        # The display's modes.
+        self.rewind()
+        var count_slot = self.scratch(8)
+        var list_modes = self.instance_call("vkGetDisplayModePropertiesKHR")
+        _ = call4(list_modes, self.physical, display, count_slot, 0)
+        var mode_count = Int(get32(count_slot))
+        var modes = self.scratch(max(1, mode_count) * DISPLAY_MODE_PROPERTIES_BYTES)
+        if not self.check(call4(list_modes, self.physical, display, count_slot, modes), "vkGetDisplayModePropertiesKHR"):
+            return False
+        mode_count = Int(get32(count_slot))
+        var widths = List[Int]()
+        var heights = List[Int]()
+        var rates = List[Int]()
+        for index in range(mode_count):
+            widths.append(Int(get32(modes + index * DISPLAY_MODE_PROPERTIES_BYTES + 8)))
+            heights.append(Int(get32(modes + index * DISPLAY_MODE_PROPERTIES_BYTES + 12)))
+            rates.append(Int(get32(modes + index * DISPLAY_MODE_PROPERTIES_BYTES + 16)))
+        var chosen = choose_display_mode(widths, heights, rates, width, height, refresh_mhz)
+        if chosen < 0:
+            return self.fail("the display offers no modes")
+        var mode = get64(modes + chosen * DISPLAY_MODE_PROPERTIES_BYTES)
+        var mode_w = widths[chosen]
+        var mode_h = heights[chosen]
+        # A plane that can show this display: unused or already on it.
+        var list_planes = self.instance_call("vkGetPhysicalDeviceDisplayPlanePropertiesKHR")
+        _ = call3(list_planes, self.physical, count_slot, 0)
+        var plane_count = Int(get32(count_slot))
+        var planes = self.scratch(max(1, plane_count) * DISPLAY_PLANE_PROPERTIES_BYTES)
+        if not self.check(call3(list_planes, self.physical, count_slot, planes), "vkGetPhysicalDeviceDisplayPlanePropertiesKHR"):
+            return False
+        var supported_list = self.instance_call("vkGetDisplayPlaneSupportedDisplaysKHR")
+        var plane = -1
+        var stack = 0
+        for index in range(Int(get32(count_slot))):
+            var current = get64(planes + index * DISPLAY_PLANE_PROPERTIES_BYTES)
+            if current != 0 and current != display:
+                continue
+            var display_count = self.scratch(8)
+            _ = call4(supported_list, self.physical, index, display_count, 0)
+            var displays = self.scratch(max(1, Int(get32(display_count))) * 8)
+            _ = call4(supported_list, self.physical, index, display_count, displays)
+            for d in range(Int(get32(display_count))):
+                if get64(displays + d * 8) == display:
+                    plane = index
+                    stack = Int(get32(planes + index * DISPLAY_PLANE_PROPERTIES_BYTES + 8))
+                    break
+            if plane >= 0:
+                break
+        if plane < 0:
+            return self.fail("no display plane can show this connector")
+        var capabilities = self.scratch(80)
+        _ = call4(self.instance_call("vkGetDisplayPlaneCapabilitiesKHR"), self.physical, mode, plane, capabilities)
+        var alphas = get32(capabilities)
+        var info = self.scratch(64)
+        put32(info, TYPE_DISPLAY_SURFACE_CREATE_INFO)
+        put64(info + 24, mode)
+        put32(info + 32, UInt32(plane))
+        put32(info + 36, UInt32(stack))
+        put32(info + 40, SURFACE_TRANSFORM_IDENTITY)
+        put_float(info + 44, 1.0)
+        put32(info + 48, DISPLAY_ALPHA_OPAQUE if (alphas & DISPLAY_ALPHA_OPAQUE) != 0 or alphas == 0 else (alphas & (~alphas + 1)))
+        put32(info + 52, UInt32(mode_w))
+        put32(info + 56, UInt32(mode_h))
+        var surface_slot = self.scratch(8)
+        if not self.check(call4(self.instance_call("vkCreateDisplayPlaneSurfaceKHR"), self.instance, info, 0, surface_slot), "vkCreateDisplayPlaneSurfaceKHR"):
+            return False
+        self.surface = get64(surface_slot)
+        var supported = self.scratch(8)
+        if not self.check(call4(self.instance_call("vkGetPhysicalDeviceSurfaceSupportKHR"), self.physical, Int(self.family), self.surface, supported), "vkGetPhysicalDeviceSurfaceSupportKHR"):
+            return False
+        if get32(supported) == 0:
+            return self.fail("this queue cannot present to the display")
+        self.rewind()
+        for _ in range(frames):
+            self.acquire_semaphores.append(self.create_binary_semaphore())
+        return True
+
+    def release_display(mut self):
+        """Hand the KMS connector back (VK_EXT_direct_mode_display)."""
+        if self.display != 0 and self.instance != 0:
+            self.rewind()
+            _ = call2(self.instance_call("vkReleaseDisplayEXT"), self.physical, self.display)
+        self.display = 0
+
     def create_swapchain(mut self, width: Int, height: Int) -> Bool:
         """FIFO always exists and paces to the display. Size is ours to choose on Wayland,
         and the compositor scales it, so it matches the render size, not the window."""
@@ -1716,6 +1849,7 @@ struct VulkanGpu(Copyable, Movable):
         self.images.clear()
         _ = call3(self.instance_call("vkDestroySurfaceKHR"), self.instance, self.surface, 0)
         self.surface = 0
+        self.release_display()
 
     def validation_errors(self) -> Int:
         return get64(self.messages)

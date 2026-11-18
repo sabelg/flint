@@ -206,6 +206,7 @@ struct WaylandWindow(Copyable, Movable):
     var using_x11: Bool
     var kms: KmsWindow
     var using_kms: Bool
+    var wants_kms_vulkan: Bool  # on KMS, leave the display to a Vulkan swapchain (KmsWindow GPU mode)
     var window_title: String
     var logical_width: Int
     var logical_height: Int
@@ -278,6 +279,7 @@ struct WaylandWindow(Copyable, Movable):
         self.using_x11 = False
         self.kms = KmsWindow()
         self.using_kms = False
+        self.wants_kms_vulkan = False
         self.window_title = "FLINT ENGINE"
         self.logical_width = 1280
         self.logical_height = 720
@@ -293,7 +295,7 @@ struct WaylandWindow(Copyable, Movable):
 
     def backend_name(self) -> String:
         if self.using_kms:
-            return "KMS"
+            return self.kms.backend_name()
         if self.using_x11:
             return "X11"
         if self.fd >= 0:
@@ -879,6 +881,7 @@ struct WaylandWindow(Copyable, Movable):
 
     def start_kms(mut self, width: Int, height: Int) -> Bool:
         """Draw straight to the display through DRM/KMS (platform/kms.mojo)."""
+        self.kms.for_vulkan = self.wants_kms_vulkan
         if not self.kms.initialize(width, height):
             return False
         self.using_kms = True

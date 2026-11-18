@@ -48,6 +48,7 @@ from flint.platform.kms import (
     kgets32, kput64, kget64, install_rescue, install_rescue_handlers, rstore, R_ACTIVE, R_STOP,
     kms_stop_requested,
 )
+from flint.platform.vulkan import choose_display_mode
 from flint.platform.logind import (
     dbus_method_call, dbus_message_length, dbus_parse, dbus_u32, dbus_align, dbus_header_field,
     hex_ascii, device_numbers,
@@ -3067,7 +3068,22 @@ def test_kms_ioctl_packing_modes_and_input_decoding() raises:
     assert_equal(hex_ascii("1000"), "31303030")
     var missing = device_numbers("event-does-not-exist")
     assert_equal(missing[0], -1)
-    print("  [OK] KMS: DRM ioctl packing, mode choice, canvas fit, MEDIUMRAW + evdev decoding, rescue signals, logind D-Bus framing")
+    # GPU mode: the Vulkan display mode for a KMS mode is the same size at the closest refresh.
+    var vw: List[Int] = [3840, 3840, 1920, 1920, 4096]
+    var vh: List[Int] = [2160, 2160, 1080, 1080, 2160]
+    var vr: List[Int] = [29970, 30000, 59940, 60000, 24000]
+    assert_equal(choose_display_mode(vw, vh, vr, 3840, 2160, 30000), 1)
+    assert_equal(choose_display_mode(vw, vh, vr, 1920, 1080, 60000), 3)
+    assert_equal(choose_display_mode(vw, vh, vr, 1920, 1080, 59940), 2)
+    assert_equal(choose_display_mode(vw, vh, vr, 2560, 1440, 60000), 4)  # no size match: the largest
+    assert_equal(choose_display_mode(List[Int](), List[Int](), List[Int](), 1920, 1080, 60000), -1)
+    var gpu_window = KmsWindow()
+    gpu_window.for_vulkan = True
+    assert_equal(gpu_window.backend_name(), "Headless")  # no DRM fd yet
+    gpu_window.mode = timed.copy()
+    assert_equal(gpu_window.refresh_mhz(), 60000)
+    assert_true(not gpu_window.start_cpu_present())
+    print("  [OK] KMS: DRM ioctl packing, mode choice, canvas fit, MEDIUMRAW + evdev decoding, rescue signals, logind D-Bus framing, Vulkan display mode")
 
 
 
