@@ -214,6 +214,16 @@ struct GpuSceneRenderer(Movable):
                 if not self.fb.enable_gpu(BACKEND_VULKAN):
                     _ = self.fb.enable_gpu(BACKEND_AMDGPU)
 
+
+    def shutdown(mut self):
+        """Release the GPU device now (safe to call more than once; the CPU path keeps working)."""
+        self.fb.gpu.shutdown()
+
+    def __deinit__(deinit self):
+        # Close the Vulkan device with its owner, so no VkDevice outlives the renderer
+        # and the driver's own exit handlers never see a half-torn-down device.
+        self.fb.gpu.shutdown()
+
     def active_backend_name(self) -> String:
         if self.fb.gpu.active:
             return backend_name(self.fb.gpu.backend)
