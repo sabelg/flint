@@ -80,6 +80,10 @@ cmd_build() {
         echo "[Flint] Building examples/minimal_spark/main.mojo -> build/flint-spark ..."
         compile_mojo "${ROOT}/examples/minimal_spark/main.mojo" "${ROOT}/build/flint-spark"
     fi
+    if [[ "$target" == "all" || "$target" == "kms" ]]; then
+        echo "[Flint] Building examples/kms_console/main.mojo -> build/flint-kms ..."
+        compile_mojo "${ROOT}/examples/kms_console/main.mojo" "${ROOT}/build/flint-kms"
+    fi
     if [[ "$target" == "all" || "$target" == "pack" ]]; then
         echo "[Flint] Building examples/pack_cli/main.mojo -> build/flint-pack ..."
         compile_mojo "${ROOT}/examples/pack_cli/main.mojo" "${ROOT}/build/flint-pack"
@@ -105,6 +109,11 @@ cmd_test() {
 cmd_play() {
     cmd_build spark
     exec "${ROOT}/build/flint-spark" "$@"
+}
+
+cmd_kms() {
+    cmd_build kms
+    FLINT_BACKEND="${FLINT_BACKEND:-kms}" exec "${ROOT}/build/flint-kms" "$@"
 }
 
 cmd_shot() {
@@ -205,6 +214,7 @@ case "$subcmd" in
     pack)  cmd_pack "$@" ;;
     test)  cmd_test "$@" ;;
     play)  cmd_play "$@" ;;
+    kms)   cmd_kms "$@" ;;
     shot)  cmd_shot "$@" ;;
     gate)  cmd_gate "$@" ;;
     new)   cmd_new "$@" ;;
@@ -214,10 +224,11 @@ case "$subcmd" in
         echo ""
         echo "Commands:"
         echo "  sync [deepsong_dir]  Harvest latest pure-Mojo libraries from Deepsong & run Zero-Leak Gate"
-        echo "  build [all|spark|pack|test] Compile Flint showcase, pack CLI & test binaries (-O3, contract=off)"
+        echo "  build [all|spark|kms|pack|test] Compile Flint showcase, pack CLI & test binaries (-O3, contract=off)"
         echo "  pack <out.flpk> <files...> Bundle loose assets into a single .flpk VFS archive"
         echo "  test                 Build and run Flint Engine verification suite"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
+        echo "  kms [--probe]        Run the bare-display DRM/KMS demo from a text console (no X11/Wayland)"
         echo "  shot                 Render deterministic headless PNG to build/shots/flint_spark.png"
         echo "  gate                 Run full verification gate (sync + build + test + headless shot)"
         echo "  new <dir>            Scaffold a standalone Flint game project"

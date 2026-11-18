@@ -10,6 +10,7 @@ Verifies:
   5. Parallel Physics `Broadphase` (`find_pairs`), `SimdCanvas` 3D/sprite depth composition,
      `LDR-FLIP` perceptual image diffing (`flip_error_map`/`flip_mean`), and `Flint MCP` responder.
 """
+from std.ffi import external_call
 from std.testing import assert_equal, assert_true
 from flint.core.math import Vec3
 from flint.core.ecs import (
@@ -38,6 +39,15 @@ from flint.assets.hot_reload import asset_stem, is_layer_stem, hot_reload_allowe
 from flint.assets.image import decode_png, encode_png, write_png, png_text
 from flint.assets.checkpoint import save_checkpoint_lz4, load_checkpoint_lz4, unpack_checkpoint_lz4
 from flint.platform.x11 import X11Window
+from flint.platform.kms import (
+    drm_ioctl_get_cap, drm_ioctl_get_resources, drm_ioctl_get_crtc, drm_ioctl_set_crtc,
+    drm_ioctl_get_encoder, drm_ioctl_get_connector, drm_ioctl_add_fb, drm_ioctl_rm_fb,
+    drm_ioctl_page_flip, drm_ioctl_create_dumb, drm_ioctl_map_dumb, drm_ioctl_destroy_dumb,
+    eviocgbit, EV_KEY, DRM_MODEINFO_BYTES, KmsMode, KmsWindow, parse_mode, pack_mode, pick_mode,
+    fit_rect, possible_crtc_ids, MediumRawDecoder, parse_input_events, kput16, kput32, kget32,
+    kgets32, kput64, kget64, install_rescue, install_rescue_handlers, rstore, R_ACTIVE, R_STOP,
+    kms_stop_requested,
+)
 from flint.platform.os import (
     read_bytes,
     write_bytes,
@@ -2873,6 +2883,142 @@ def test_v15_aaa_tsr_v2_oit_6way_smoke_rendergraph_furnace_and_macbeth_de2000() 
     )
 
 
+
+def test_kms_ioctl_packing_modes_and_input_decoding() raises:
+    """DRM/KMS backend pieces that need no display: uapi request numbers, mode
+    decoding and choice, canvas fitting, raw keyboard and evdev decoding, and the
+    console-rescue signal path."""
+    # _IOWR('d', nr, sizeof(struct ...)) as libdrm's headers spell them.
+    assert_equal(drm_ioctl_get_cap(), 0xC010640C)
+    assert_equal(drm_ioctl_get_resources(), 0xC04064A0)
+    assert_equal(drm_ioctl_get_crtc(), 0xC06864A1)
+    assert_equal(drm_ioctl_set_crtc(), 0xC06864A2)
+    assert_equal(drm_ioctl_get_encoder(), 0xC01464A6)
+    assert_equal(drm_ioctl_get_connector(), 0xC05064A7)
+    assert_equal(drm_ioctl_add_fb(), 0xC01C64AE)
+    assert_equal(drm_ioctl_rm_fb(), 0xC00464AF)
+    assert_equal(drm_ioctl_page_flip(), 0xC01864B0)
+    assert_equal(drm_ioctl_create_dumb(), 0xC02064B2)
+    assert_equal(drm_ioctl_map_dumb(), 0xC01064B3)
+    assert_equal(drm_ioctl_destroy_dumb(), 0xC00464B4)
+    assert_equal(eviocgbit(EV_KEY, 96), 0x80604521)
+
+    # Little-endian packing round trips, signed and 64-bit included.
+    var buf = List[UInt8](length=16, fill=0)
+    kput32(buf, 0, -5)
+    assert_equal(kgets32(buf, 0), -5)
+    kput64(buf, 8, 0x1122334455667788)
+    assert_equal(kget64(buf, 8), 0x1122334455667788)
+    assert_equal(Int(buf[8]), 0x88)
+
+    # drm_mode_modeinfo: two modes back to back, the second preferred.
+    var raw = List[UInt8](length=DRM_MODEINFO_BYTES * 3, fill=0)
+    pack_mode(raw, 0, 297000, 3840, 2160, 30, 0x40, "3840x2160")
+    pack_mode(raw, DRM_MODEINFO_BYTES, 148500, 1920, 1080, 60, 0x48, "1920x1080")
+    pack_mode(raw, DRM_MODEINFO_BYTES * 2, 74250, 1280, 720, 60, 0x40, "1280x720")
+    var modes = List[KmsMode]()
+    for index in range(3):
+        modes.append(parse_mode(raw, index * DRM_MODEINFO_BYTES))
+    assert_equal(modes[0].hdisplay, 3840)
+    assert_equal(modes[0].vdisplay, 2160)
+    assert_equal(modes[0].vrefresh, 30)
+    assert_equal(modes[1].name, "1920x1080")
+    assert_equal(modes[1].clock, 148500)
+    assert_equal(modes[1].htotal, 1920 + 160)
+    assert_true(modes[1].preferred())
+    assert_true(not modes[0].preferred())
+    assert_equal(len(modes[2].raw), DRM_MODEINFO_BYTES)
+    assert_equal(Int(modes[2].raw[4]), 1280 & 0xFF)
+    assert_equal(pick_mode(modes), 1)
+    _ = modes.pop(1)
+    assert_equal(pick_mode(modes), 0)  # no preferred: the largest
+    assert_equal(pick_mode(List[KmsMode]()), -1)
+    # A preferred 30 Hz mode loses to the same resolution at 60 Hz, not to a bigger one.
+    var tv = List[UInt8](length=DRM_MODEINFO_BYTES * 3, fill=0)
+    pack_mode(tv, 0, 594000, 4096, 2160, 60, 0x40, "4096x2160")
+    pack_mode(tv, DRM_MODEINFO_BYTES, 297000, 3840, 2160, 30, 0x48, "3840x2160")
+    pack_mode(tv, DRM_MODEINFO_BYTES * 2, 594000, 3840, 2160, 60, 0x40, "3840x2160")
+    var tv_modes = List[KmsMode]()
+    for index in range(3):
+        tv_modes.append(parse_mode(tv, index * DRM_MODEINFO_BYTES))
+    assert_equal(pick_mode(tv_modes), 2)
+    var timed = KmsMode()
+    timed.clock = 148500
+    timed.htotal = 2200
+    timed.vtotal = 1125
+    assert_true(abs(timed.refresh_hz() - 60.0) < 0.01)
+
+    # Canvas fit: letterbox, pillarbox, exact.
+    var r = fit_rect(960, 540, 1920, 1200)
+    assert_equal(r[0], 0)
+    assert_equal(r[1], 60)
+    assert_equal(r[2], 1920)
+    assert_equal(r[3], 1080)
+    r = fit_rect(960, 540, 1024, 768)
+    assert_equal(r[2], 1024)
+    assert_equal(r[3], 576)
+    assert_equal(r[1], 96)
+    r = fit_rect(800, 600, 1920, 1080)
+    assert_equal(r[0], 240)
+    assert_equal(r[2], 1440)
+    assert_equal(r[3], 1080)
+    r = fit_rect(1280, 720, 1280, 720)
+    assert_equal(r[0] + r[1], 0)
+    assert_equal(r[2] * r[3], 1280 * 720)
+
+    # possible_crtcs is a bitmask over the resources' CRTC list.
+    var options = possible_crtc_ids(0b101, [31, 45, 59])
+    assert_equal(len(options), 2)
+    assert_equal(options[0], 31)
+    assert_equal(options[1], 59)
+
+    # K_MEDIUMRAW: A down, A up, then key 132 (three bytes) down and up.
+    var decoder = MediumRawDecoder()
+    for byte in [0x1E, 0x9E, 0x00, 0x81, 0x84, 0x80, 0x81, 0x84]:
+        decoder.feed(byte)
+    assert_equal(len(decoder.codes), 4)
+    assert_equal(decoder.codes[0], 30)
+    assert_true(decoder.downs[0])
+    assert_equal(decoder.codes[1], 30)
+    assert_true(not decoder.downs[1])
+    assert_equal(decoder.codes[2], 132)
+    assert_true(decoder.downs[2])
+    assert_equal(decoder.codes[3], 132)
+    assert_true(not decoder.downs[3])
+
+    # struct input_event (24 bytes): REL_X -3, BTN_LEFT down; a torn tail is ignored.
+    var events = List[UInt8](length=24 * 2 + 10, fill=0)
+    kput16(events, 16, 2)
+    kput16(events, 18, 0)
+    kput32(events, 20, -3)
+    kput16(events, 24 + 16, 1)
+    kput16(events, 24 + 18, 0x110)
+    kput32(events, 24 + 20, 1)
+    var parsed = parse_input_events(events, len(events))
+    assert_equal(len(parsed), 6)
+    assert_equal(parsed[0], 2)
+    assert_equal(parsed[2], -3)
+    assert_equal(parsed[4], 0x110)
+    assert_equal(parsed[5], 1)
+
+    # A window that never opened reports itself headless and closes cleanly.
+    var idle = KmsWindow()
+    assert_equal(idle.backend_name(), "Headless")
+    idle.close()
+
+    # The rescue page: a first SIGTERM only asks the game to stop.
+    assert_true(install_rescue())
+    rstore(R_ACTIVE, 1)
+    rstore(R_STOP, 0)
+    assert_true(install_rescue_handlers())
+    _ = external_call["raise", Int32](Int32(15))
+    assert_true(kms_stop_requested())
+    rstore(R_STOP, 0)
+    rstore(R_ACTIVE, 0)  # back to plain signal behaviour for the rest of the suite
+    print("  [OK] KMS: DRM ioctl packing, mode choice, canvas fit, MEDIUMRAW + evdev decoding, rescue signals")
+
+
+
 def main() raises:
     print("[Flint Test] Running Pure-Mojo 1.2 Engine Verification Suite...")
     test_ecs_simd_and_lz4_persistence()
@@ -2894,4 +3040,5 @@ def main() raises:
     test_v13_aaa_multilobe_bsdf_and_16k_virtual_shadow_maps()
     test_v14_aaa_ray_query_tlas_bc6h_ibl_surface_cache_gi_and_cornell_flip()
     test_v15_aaa_tsr_v2_oit_6way_smoke_rendergraph_furnace_and_macbeth_de2000()
-    print("[Flint Test] ALL 19 ENGINE SUBSYSTEM & 100% AAA VULKAN SUITES PASSED!")
+    test_kms_ioctl_packing_modes_and_input_decoding()
+    print("[Flint Test] ALL 20 ENGINE SUBSYSTEM & 100% AAA VULKAN SUITES PASSED!")

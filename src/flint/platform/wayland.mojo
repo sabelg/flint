@@ -8,6 +8,7 @@ from std.ffi import external_call
 from flint.platform.input import InputState
 from flint.platform.wayland_bridge import WaylandBridge
 from flint.platform.x11 import X11Window
+from flint.platform.kms import KmsWindow, on_virtual_console
 from flint.platform.os import env_value, env_flag, close_fd, get_time
 
 # Held in the pending key and button queues: everything held is released here.
@@ -203,6 +204,8 @@ struct WaylandWindow(Copyable, Movable):
     var pending_key_down: List[Bool]
     var x11: X11Window
     var using_x11: Bool
+    var kms: KmsWindow
+    var using_kms: Bool
     var window_title: String
     var logical_width: Int
     var logical_height: Int
@@ -273,6 +276,8 @@ struct WaylandWindow(Copyable, Movable):
         self.pending_key_down = List[Bool]()
         self.x11 = X11Window()
         self.using_x11 = False
+        self.kms = KmsWindow()
+        self.using_kms = False
         self.window_title = "FLINT ENGINE"
         self.logical_width = 1280
         self.logical_height = 720
@@ -287,6 +292,8 @@ struct WaylandWindow(Copyable, Movable):
             _ = self.request(self.toplevel, 2, body)
 
     def backend_name(self) -> String:
+        if self.using_kms:
+            return "KMS"
         if self.using_x11:
             return "X11"
         if self.fd >= 0:
@@ -667,7 +674,31 @@ struct WaylandWindow(Copyable, Movable):
         self.pending_wheel = 0
         self.pending_keys = List[Int]()
         self.pending_key_down = List[Bool]()
+        # FLINT_BACKEND=kms|x11|wayland picks one; otherwise Wayland, then X11, and the bare
+        # display (DRM/KMS) when neither is advertised and we run on a text console.
+        var choice = env_value("FLINT_BACKEND")
+        var auto_kms = (
+            choice.byte_length() == 0
+            and env_value("WAYLAND_DISPLAY").byte_length() == 0
+            and env_value("DISPLAY").byte_length() == 0
+            and on_virtual_console()
+        )
+        if choice == "kms" or choice == "KMS" or auto_kms:
+            if self.start_kms(width, height):
+                return True
+            print("FLINT_KMS_UNAVAILABLE " + self.kms.last_error)
+            if not auto_kms:
+                return False
+        if choice == "x11" or choice == "X11":
+            if self.x11.initialize(width, height, self.window_title):
+                self.using_x11 = True
+                self.configured = True
+                self.focused = True
+                return True
+            return False
         if not self.connect_socket():
+            if choice == "wayland" or choice == "WAYLAND":
+                return False
             if self.x11.initialize(width, height, self.window_title):
                 self.using_x11 = True
                 self.configured = True
@@ -725,6 +756,10 @@ struct WaylandWindow(Copyable, Movable):
         return True
 
     def poll(mut self, mut input: InputState):
+        if self.using_kms:
+            self.kms.poll(input)
+            self.close_requested = self.kms.close_requested
+            return
         if self.using_x11:
             self.x11.poll(input)
             self.width = self.x11.width
@@ -842,7 +877,23 @@ struct WaylandWindow(Copyable, Movable):
             written += count
         return True
 
+    def start_kms(mut self, width: Int, height: Int) -> Bool:
+        """Draw straight to the display through DRM/KMS (platform/kms.mojo)."""
+        if not self.kms.initialize(width, height):
+            return False
+        self.using_kms = True
+        self.configured = True
+        self.focused = True
+        self.fullscreen = True
+        self.width = self.kms.width
+        self.height = self.kms.height
+        return True
+
     def present(mut self, mut pixels: List[UInt32], source_width: Int, source_height: Int):
+        if self.using_kms:
+            self.kms.present(pixels, source_width, source_height)
+            self.close_requested = self.kms.close_requested
+            return
         if self.using_x11:
             self.x11.present(pixels, source_width, source_height)
             self.width = self.x11.width
@@ -970,6 +1021,10 @@ struct WaylandWindow(Copyable, Movable):
         Without compositor support, or while a lock is refused, ordinary pointer
         motion keeps driving the camera.
         """
+        if self.using_kms:
+            self.kms.set_pointer_lock(active)
+            self.pointer_locked = active
+            return
         if self.fd < 0 or self.pointer == 0 or self.surface == 0 or self.pointer_constraints == 0 or self.relative_manager == 0:
             return
         if active and self.locked_pointer == 0:
@@ -993,6 +1048,8 @@ struct WaylandWindow(Copyable, Movable):
             self.pointer_locked = False
 
     def toggle_fullscreen(mut self):
+        if self.using_kms:
+            return  # a bare display is always fullscreen
         if self.using_x11:
             self.x11.toggle_fullscreen()
             self.fullscreen = self.x11.fullscreen
@@ -1032,6 +1089,10 @@ struct WaylandWindow(Copyable, Movable):
         return True
 
     def close(mut self):
+        if self.using_kms:
+            self.kms.close()
+            self.using_kms = False
+            return
         if self.using_x11:
             self.x11.close()
             self.using_x11 = False
