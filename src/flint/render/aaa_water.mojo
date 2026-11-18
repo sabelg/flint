@@ -40,6 +40,11 @@ from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.aaa_raytracing import emit_rt_textured_hit_shade
 from flint.render.aaa_oit_volumetrics import AAA_OIT_REACTIVE_BASE_WORDS
 
+# `BIND_AAA_GLOBALS` words of the water surface's look (written by `FlintAaaVulkanRenderer`):
+#   +0 shape (u32: 0 = the bounds rectangle, 1 = the ellipse inscribed in it), +1 wave amplitude scale
+#   (1 = open-water swell, ~0.3 = a calm pond), +2 shoreline foam band (m of depth), +3 foam amount
+comptime AAA_GLOBALS_WATER_SHAPE_WORD: Int = 600
+
 
 @always_inline
 def eval_dielectric_water_fresnel_cpu(ndotv: Float32) -> Float32:
@@ -212,6 +217,14 @@ def aaa_water_refract_shader(enable_ray_query: Bool) -> List[UInt32]:
         s.logical_or(s.flt(wz, bmin_z), s.fgt(wz, bmax_z)),
     )
     s.return_if(out_bounds)
+    # Elliptical pond (`b_globals[AAA_GLOBALS_WATER_SHAPE_WORD] == 1`): the ellipse inscribed in the bounds
+    var is_ellipse = s.ieq(s.load_word(b_globals, s.uint(UInt32(AAA_GLOBALS_WATER_SHAPE_WORD))), s.uint(1))
+    var ex_n = s.fdiv(s.fsub(wx, s.fmul(s.fadd(bmin_x, bmax_x), s.float(0.5))), s.nmax(s.float(1e-4), s.fmul(s.fsub(bmax_x, bmin_x), s.float(0.5))))
+    var ez_n = s.fdiv(s.fsub(wz, s.fmul(s.fadd(bmin_z, bmax_z), s.float(0.5))), s.nmax(s.float(1e-4), s.fmul(s.fsub(bmax_z, bmin_z), s.float(0.5))))
+    s.return_if(s.logical_and(is_ellipse, s.fgt(s.fma(ex_n, ex_n, s.fmul(ez_n, ez_n)), s.float(1.0))))
+    var wave_sc = s.nclamp(s.load_float(b_globals, s.uint(UInt32(AAA_GLOBALS_WATER_SHAPE_WORD + 1))), s.float(0.0), s.float(4.0))
+    var foam_band = s.nclamp(s.load_float(b_globals, s.uint(UInt32(AAA_GLOBALS_WATER_SHAPE_WORD + 2))), s.float(0.0), s.float(4.0))
+    var foam_amt = s.nclamp(s.load_float(b_globals, s.uint(UInt32(AAA_GLOBALS_WATER_SHAPE_WORD + 3))), s.float(0.0), s.float(2.0))
 
     # Underwater ray distance & vertical depth `d_perp` (`z_bed >= 1e5` = open-ocean deep water, no seabed hit)
     var is_sky_bed = s.fge(z_bed, s.float(1e5))
@@ -260,7 +273,7 @@ def aaa_water_refract_shader(enable_ray_query: Bool) -> List[UInt32]:
             s.float(1.0),
         )
         var w_nyq = s.fmul(s.fmul(t_nyq, t_nyq), s.fma(t_nyq, s.float(-2.0), s.float(3.0)))
-        var a_eff = s.fmul(s.float(af), shallow_damp)
+        var a_eff = s.fmul(s.fmul(s.float(af), shallow_damp), wave_sc)
         var a_res = s.fmul(a_eff, w_nyq)
         var ph = s.fma(wx, s.float(kx_f), s.fma(wz, s.float(kz_f), s.fmul(time_s, s.float(om_f))))
         var cs = s.fmul(s.fcos(ph), a_res)
@@ -519,13 +532,13 @@ def aaa_water_refract_shader(enable_ray_query: Bool) -> List[UInt32]:
     var wat_b = s.load_f(wat_b_v)
 
     # 6. Domain-Warped Cellular Lace Shoreline (`d_perp < 0.48m`) & Wave-Crest Whitecap Foam
-    var shore_t = s.nclamp(s.fmul(s.fsub(s.float(0.48), d_perp), s.float(1.0 / 0.45)), s.float(0.0), s.float(1.0))
+    var shore_t = s.nclamp(s.fdiv(s.fsub(foam_band, d_perp), s.nmax(s.float(1e-3), s.fmul(foam_band, s.float(0.94)))), s.float(0.0), s.float(1.0))
     var warp_x = s.fma(nw[0], s.float(0.65), s.fma(s.fsin(s.fma(wz, s.float(1.7), time_s)), s.float(0.28), wx))
     var warp_z = s.fma(nw[2], s.float(0.65), s.fma(s.fcos(s.fma(wx, s.float(1.5), s.fmul(time_s, s.float(0.85)))), s.float(0.28), wz))
     var cell_f1 = _emit_voronoi_caustics_spv(s, s.fmul(warp_x, s.float(1.35)), s.fmul(warp_z, s.float(1.35)), s.fmul(time_s, s.float(0.45)))
     var lace = s.nclamp(s.fma(cell_f1, s.float(0.75), s.float(0.22)), s.float(0.0), s.float(1.0))
     var crest_foam = s.nclamp(s.fmul(s.fsub(s.load_f(crest_h), s.float(0.068)), s.float(11.0)), s.float(0.0), s.float(0.42))
-    var foam_w = s.nclamp(s.fma(s.fmul(shore_t, shore_t), lace, s.fmul(crest_foam, lace)), s.float(0.0), s.float(0.88))
+    var foam_w = s.nclamp(s.fmul(s.fma(s.fmul(shore_t, shore_t), lace, s.fmul(crest_foam, lace)), foam_amt), s.float(0.0), s.float(0.88))
     var foam_lit_r = s.fmul(s.fma(sun_r, s.fmul(s.nmax(s.float(0.0), sun_y), s.fmul(s.load_f(sun_vis_w), s.float(0.3183))), s.fmul(sh_up[0], ibl_int)), s.float(0.90))
     var foam_lit_g = s.fmul(s.fma(sun_g, s.fmul(s.nmax(s.float(0.0), sun_y), s.fmul(s.load_f(sun_vis_w), s.float(0.3183))), s.fmul(sh_up[1], ibl_int)), s.float(0.92))
     var foam_lit_b = s.fmul(s.fma(sun_b, s.fmul(s.nmax(s.float(0.0), sun_y), s.fmul(s.load_f(sun_vis_w), s.float(0.3183))), s.fmul(sh_up[2], ibl_int)), s.float(0.95))

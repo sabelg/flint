@@ -255,7 +255,7 @@ from flint.render.aaa_gpu_particles import (
     gpu_particles_tile_counts_word_offset,
     gpu_particles_total_oit_words,
 )
-from flint.render.aaa_water import aaa_water_refract_shader
+from flint.render.aaa_water import AAA_GLOBALS_WATER_SHAPE_WORD, aaa_water_refract_shader
 from flint.render.aaa_glass import (
     AAA_GLASS_ENTRY_WORDS,
     AAA_GLOBALS_GLASS_COUNT_WORD,
@@ -676,6 +676,10 @@ struct FlintAaaVulkanRenderer(Movable):
     var water_absorption_rgb: Vec3
     var water_bounds_min_xz: Tuple[Float32, Float32]
     var water_bounds_max_xz: Tuple[Float32, Float32]
+    var water_elliptical: Bool  # True: the water is the ellipse inscribed in its bounds (a round pond)
+    var water_wave_scale: Float32  # wave amplitude (1 = open-water swell, ~0.3 = calm pond, 0 = mirror)
+    var water_foam_band: Float32  # depth (m) below which shoreline foam forms
+    var water_foam: Float32  # foam amount (0 = none, 1 = default)
     var enable_motion_blur: Bool
     var motion_blur_shutter: Float32
     var motion_blur_max_px: Float32
@@ -932,6 +936,10 @@ struct FlintAaaVulkanRenderer(Movable):
         self.water_absorption_rgb = Vec3(0.32, 0.075, 0.035)
         self.water_bounds_min_xz = (Float32(-1.0e5), Float32(-1.0e5))
         self.water_bounds_max_xz = (Float32(1.0e5), Float32(1.0e5))
+        self.water_elliptical = False
+        self.water_wave_scale = Float32(1.0)
+        self.water_foam_band = Float32(0.48)
+        self.water_foam = Float32(1.0)
         self.enable_motion_blur = False
         self.motion_blur_shutter = Float32(0.5)
         self.motion_blur_max_px = Float32(24.0)
@@ -3293,6 +3301,10 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + 145 * 4, self.water_bounds_min_xz[1])
         put_float(g_addr + 146 * 4, self.water_bounds_max_xz[0])
         put_float(g_addr + 147 * 4, self.water_bounds_max_xz[1])
+        put32(g_addr + AAA_GLOBALS_WATER_SHAPE_WORD * 4, UInt32(1) if self.water_elliptical else UInt32(0))
+        put_float(g_addr + (AAA_GLOBALS_WATER_SHAPE_WORD + 1) * 4, self.water_wave_scale)
+        put_float(g_addr + (AAA_GLOBALS_WATER_SHAPE_WORD + 2) * 4, self.water_foam_band)
+        put_float(g_addr + (AAA_GLOBALS_WATER_SHAPE_WORD + 3) * 4, self.water_foam)
         put_float(g_addr + 148 * 4, self.min_auto_exposure)
         put_float(g_addr + 149 * 4, self.max_auto_exposure)
         put_float(g_addr + 150 * 4, self.motion_blur_shutter)
