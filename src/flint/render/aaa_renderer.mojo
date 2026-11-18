@@ -167,6 +167,7 @@ from flint.render.aaa_ibl import (
     bake_split_sum_brdf_lut_rg16f,
 )
 from flint.render.aaa_raytracing import (
+    AAA_GLOBALS_GLASS_SHADOW_WORD,
     AAA_GLOBALS_SHADOW_CONE_WORD,
     build_blas_triangles_ex,
     ensure_tlas_capacity_mixed_opaque,
@@ -177,6 +178,7 @@ from flint.render.aaa_gi_svgf import (
     AAA_FLAG_AERIAL_PERSPECTIVE,
     AAA_FLAG_CLUSTERED_LIGHTS,
     AAA_FLAG_FURNACE_WHITE_DOME,
+    AAA_FLAG_GLASS,
     AAA_FLAG_RESTIR_DI,
     AAA_FLAG_RT_REFLECTIONS,
     AAA_FLAG_RT_SHADOWS,
@@ -254,6 +256,15 @@ from flint.render.aaa_gpu_particles import (
     gpu_particles_total_oit_words,
 )
 from flint.render.aaa_water import aaa_water_refract_shader
+from flint.render.aaa_glass import (
+    AAA_GLASS_ENTRY_WORDS,
+    AAA_GLOBALS_GLASS_COUNT_WORD,
+    AAA_GLOBALS_GLASS_TABLE_WORD,
+    AAA_INSTANCE_GLASS_BIT,
+    AAA_MAX_GLASS_MATERIALS,
+    AaaGlassParams,
+    aaa_glass_refract_shader,
+)
 from flint.render.aaa_rt_shadow import (
     rt_shadow_filtered_offset,
     rt_shadow_raw_offset,
@@ -516,6 +527,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var pipe_water_refract: Int
     var pipe_rt_shadow_trace: Int
     var pipe_rt_shadow_filter: Int
+    var pipe_glass_refract: Int
     var pipe_tsr_v3_resolve: Int
     var pipe_motion_blur: Int
     var pipe_display_tonemap: Int
@@ -565,6 +577,7 @@ struct FlintAaaVulkanRenderer(Movable):
     # CPU Scene & Subsystems
     var geom: AaaGeometryPool
     var materials: List[AaaMaterial]
+    var glass_materials: List[AaaGlassParams]  # optics of the transparent materials (`aaa_glass.mojo`)
     var frame_instances: List[AaaDrawInstance]
     var frame_plumes: List[AaaVolumetricPlume]
     var frame_particle_emitters: List[AaaParticleEmitter]
@@ -729,6 +742,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_water_refract = 0
         self.pipe_rt_shadow_trace = 0
         self.pipe_rt_shadow_filter = 0
+        self.pipe_glass_refract = 0
         self.pipe_tsr_v3_resolve = 0
         self.pipe_motion_blur = 0
         self.pipe_display_tonemap = 0
@@ -858,6 +872,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sun_radiance = Vec3(3.2, 3.0, 2.75)
         self.sun_angular_radius = Float32(0.0035)
         self.sun_shadow_softness = Float32(0.005)
+        self.glass_materials = List[AaaGlassParams]()
         self.vsm_scene_center = Vec3(0.0, 0.0, 0.0)
         self.vsm_ortho_half_extent = Float32(16.0)
         self.ibl_intensity = Float32(1.0)
@@ -1124,6 +1139,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if use_rt:
             self.pipe_rt_shadow_trace = self.vk.create_aaa_compute_pipeline(self.pipe_layout, rt_sun_shadow_trace_shader())
             self.pipe_rt_shadow_filter = self.vk.create_aaa_compute_pipeline(self.pipe_layout, rt_sun_shadow_filter_shader())
+            self.pipe_glass_refract = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_glass_refract_shader())
         self.pipe_tsr_v3_resolve = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_tsr_v3_resolve_shader())
         self.pipe_motion_blur = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_motion_blur_shader())
         self.pipe_display_tonemap = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_display_tonemap_shader())
@@ -1642,6 +1658,46 @@ struct FlintAaaVulkanRenderer(Movable):
             )
         _ = len(words)
         return id
+
+    def add_glass_material(mut self, glass: AaaGlassParams) -> Int:
+        """Adds a transparent, refractive material (`aaa_glass.mojo`): a smooth dielectric surface of base
+        color `tint * opacity` that the glass pass makes see-through. `glass.material_id` is ignored.
+        Returns the material id, or -1 when the material or glass table is full."""
+        if len(self.glass_materials) >= AAA_MAX_GLASS_MATERIALS:
+            return -1
+        var mat = AaaMaterial(
+            base_color=Vec3(glass.tint.x * glass.opacity, glass.tint.y * glass.opacity, glass.tint.z * glass.opacity),
+            roughness=glass.roughness,
+            metallic=0.0,
+        )
+        var id = self.add_material(mat)
+        if id < 0:
+            return -1
+        var g = glass.copy()
+        g.material_id = id
+        self.glass_materials.append(g^)
+        return id
+
+    def update_glass_material(mut self, mat_id: Int, glass: AaaGlassParams) -> Bool:
+        """Changes a glass material's optics (and its surface to match); False if `mat_id` is not glass."""
+        for i in range(len(self.glass_materials)):
+            if self.glass_materials[i].material_id == mat_id:
+                var g = glass.copy()
+                g.material_id = mat_id
+                var mat = self.materials[mat_id].copy()
+                mat.base_color = Vec3(g.tint.x * g.opacity, g.tint.y * g.opacity, g.tint.z * g.opacity)
+                mat.roughness = g.roughness
+                mat.metallic = Float32(0.0)
+                self.update_material(mat_id, mat)
+                self.glass_materials[i] = g^
+                return True
+        return False
+
+    def is_glass_material(self, mat_id: Int) -> Bool:
+        for g in self.glass_materials:
+            if g.material_id == mat_id:
+                return True
+        return False
 
     def update_material(mut self, mat_id: Int, mat: AaaMaterial):
         if mat_id < 0 or mat_id >= len(self.materials):
@@ -2767,6 +2823,8 @@ struct FlintAaaVulkanRenderer(Movable):
             if me.lod0_meshlet_count <= 0:
                 continue
             var mat_final_v = me.material_id if di.material_override < 0 else di.material_override
+            if len(self.glass_materials) > 0 and self.is_glass_material(mat_final_v):
+                continue  # glass casts no VSM shadow (RT shadows dim the sun through it instead)
             var is_am_v = self._is_instance_alpha_masked(di, mat_final_v)
             ref wm = di.world_mat.values
             var s0 = wm[0] * wm[0] + wm[1] * wm[1] + wm[2] * wm[2]
@@ -2978,6 +3036,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var sc_inst_count = min(1024, n_inst)
 
         # 1. Upload Instance SSBO + Surface-Cache Headers + TLAS Instance Records
+        var frame_has_glass = False
         for i in range(n_inst):
             ref di = self.frame_instances[i]
             ref me = self.geom.meshes[di.mesh_id]
@@ -3000,13 +3059,17 @@ struct FlintAaaVulkanRenderer(Movable):
 
             var mat_final = me.material_id if di.material_override < 0 else di.material_override
             var is_am_inst = self._is_instance_alpha_masked(di, mat_final)
+            var is_glass_inst = len(self.glass_materials) > 0 and self.is_glass_material(mat_final)
+            if is_glass_inst:
+                frame_has_glass = True
             var is_ds = (di.mesh_id < len(self.mesh_double_sided_flags) and self.mesh_double_sided_flags[di.mesh_id]) or is_am_inst
             put32(dst + 38 * 4, UInt32(me.first_index))
             put32(
                 dst + 39 * 4,
                 UInt32(mat_final & 0xFFFF)
                 | ((UInt32(1) if is_ds else UInt32(0)) << 16)
-                | ((UInt32(1) if is_am_inst else UInt32(0)) << 17),
+                | ((UInt32(1) if is_am_inst else UInt32(0)) << 17)
+                | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0)),
             )
             var my_sc_base = 0xFFFFFF
             if i < 1024:
@@ -3037,6 +3100,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     blas_da,
                     cull_disable=True,
                     alpha_masked=is_am_inst,
+                    glass=is_glass_inst,
                 )
 
         # Upload 6-Way OIT Volumetric Plumes
@@ -3113,6 +3177,16 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + 51 * 4, self.sun_angular_radius)
         var shadow_cone = self.sun_shadow_softness if self.sun_shadow_softness >= Float32(0.0) else self.sun_angular_radius
         put_float(g_addr + AAA_GLOBALS_SHADOW_CONE_WORD * 4, tan(min(Float32(0.2), shadow_cone)))
+        var n_glass = min(AAA_MAX_GLASS_MATERIALS, len(self.glass_materials))
+        put32(g_addr + AAA_GLOBALS_GLASS_COUNT_WORD * 4, UInt32(n_glass))
+        var glass_tr_sum = Float32(0.0)
+        for g_i in range(n_glass):
+            var g_words = List[UInt32](capacity=AAA_GLASS_ENTRY_WORDS)
+            self.glass_materials[g_i].append_words(g_words)
+            for g_w in range(AAA_GLASS_ENTRY_WORDS):
+                put32(g_addr + (AAA_GLOBALS_GLASS_TABLE_WORD + g_i * AAA_GLASS_ENTRY_WORDS + g_w) * 4, g_words[g_w])
+            glass_tr_sum += self.glass_materials[g_i].shadow_transmittance()
+        put_float(g_addr + AAA_GLOBALS_GLASS_SHADOW_WORD * 4, glass_tr_sum / Float32(max(1, n_glass)))
         put_float(g_addr + 52 * 4, Float32(0.0) if self.furnace_white_dome else self.sun_radiance.x)
         put_float(g_addr + 53 * 4, Float32(0.0) if self.furnace_white_dome else self.sun_radiance.y)
         put_float(g_addr + 54 * 4, Float32(0.0) if self.furnace_white_dome else self.sun_radiance.z)
@@ -3156,6 +3230,8 @@ struct FlintAaaVulkanRenderer(Movable):
                 r_flags |= AAA_FLAG_RT_SURFACE_GI
         if self.furnace_white_dome:
             r_flags |= AAA_FLAG_FURNACE_WHITE_DOME
+        if frame_has_glass:
+            r_flags |= AAA_FLAG_GLASS
         if n_cl_lights > 0 and not self.furnace_white_dome:
             r_flags |= AAA_FLAG_CLUSTERED_LIGHTS
         if self.enable_aerial_perspective and not self.furnace_white_dome:
@@ -3980,6 +4056,25 @@ struct FlintAaaVulkanRenderer(Movable):
         else:
             self.spec_reblur_valid_frames = 0
 
+        # Ray-traced refractive glass over the shaded, denoised frame (`aaa_glass.mojo`)
+        if frame_has_glass and use_rt_frame and self.pipe_glass_refract != 0 and not self.furnace_white_dome:
+            var q_gl = next_q
+            if use_prof and q_gl + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_gl, PIPELINE_TOP)
+                next_q += 2
+                prof_pairs.append((String("RtRefractiveGlass"), q_gl))
+            var push_gl = List[UInt32](length=16, fill=0)
+            push_gl[0] = UInt32(self.render_w)
+            push_gl[1] = UInt32(self.render_h)
+            self.vk.dispatch_aaa(
+                cur_slot, self.pipe_glass_refract, self.pipe_layout, self.desc_set, push_gl, (self.render_w + 7) // 8, (self.render_h + 7) // 8
+            )
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            if use_prof and q_gl + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_gl + 1, PIPELINE_BOTTOM)
+
         var run_water = self.enable_water_plane and not self.furnace_white_dome
 
         # When Water or GPU Rain will write partial reactive weights into `b_oit`, clear `b_oit[react]` first!
@@ -4796,6 +4891,8 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.destroy_pipeline(self.pipe_rt_shadow_trace)
         if self.pipe_rt_shadow_filter != 0:
             self.vk.destroy_pipeline(self.pipe_rt_shadow_filter)
+        if self.pipe_glass_refract != 0:
+            self.vk.destroy_pipeline(self.pipe_glass_refract)
         self.vk.destroy_pipeline(self.pipe_tsr_v3_resolve)
         self.vk.destroy_pipeline(self.pipe_motion_blur)
         self.vk.destroy_pipeline(self.pipe_display_tonemap)

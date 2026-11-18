@@ -920,6 +920,8 @@ def emit_rt_textured_hit_shade(
     miss_g: UInt32,
     miss_b: UInt32,
     trace_hit_sun_shadow: Bool = True,
+    cull_mask: UInt32 = 0xFF,
+    prefer_rt_sun_shadow: Bool = False,
 ) -> Tuple[UInt32, UInt32, UInt32, UInt32, UInt32]:
     """Zero-Limit `O(1)` Barycentric Textured + Froxel-Lit Ray-Hit Shader across all `32,768` instances!
     Interpolates `(u, v)` and world normal via `OpRayQueryGetIntersectionBarycentricsKHR`, computes
@@ -933,7 +935,7 @@ def emit_rt_textured_hit_shade(
         rq,
         tlas_var,
         s.uint(RAY_FLAG_NONE_KHR),
-        s.uint(0xFF),
+        s.uint(cull_mask),
         s.vec3(ox, oy, oz),
         t_min,
         s.vec3(dx, dy, dz),
@@ -1160,7 +1162,11 @@ def emit_rt_textured_hit_shade(
     var ndotl_s = s.nmax(s.float(0.0), emit_vec3_dot(s, hnx, hny, hnz, sun_x, sun_y, sun_z))
     var sun_vis_h = s.fvar(s.float(1.0))
     s.begin_if(s.fgt(ndotl_s, s.float(0.001)))
-    s.begin_if(s.ine(s.bit_and(r_flags, s.uint(1)), s.uint(0)))
+    # `prefer_rt_sun_shadow`: with RT shadows on, trace instead of the 1-tap VSM (no texel speckle; glass uses it)
+    var use_vsm_hit = s.ine(s.bit_and(r_flags, s.uint(1)), s.uint(0))
+    if prefer_rt_sun_shadow and trace_hit_sun_shadow:
+        use_vsm_hit = s.logical_and(use_vsm_hit, s.ieq(s.bit_and(r_flags, s.uint(2)), s.uint(0)))
+    s.begin_if(use_vsm_hit)
     var lclip = emit_mat4_mul_point(
         s, b_globals, s.uint(56),
         s.fma(hnx, s.float(0.02), hx),

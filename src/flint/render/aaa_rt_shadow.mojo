@@ -87,6 +87,93 @@ def _emit_ign(mut s: AaaSpirvModule, px: UInt32, py: UInt32, frame_idx: UInt32) 
     return s.fract(s.fmul(s.float(52.9829189), s.fract(s.fma(fx, s.float(0.06711056), s.fmul(fy, s.float(0.00583715))))))
 
 
+def emit_pixel_camera_ray(
+    mut s: AaaSpirvModule, b_globals: UInt32, px: UInt32, py: UInt32, fw: UInt32, fh: UInt32
+) -> Tuple[UInt32, UInt32, UInt32, UInt32, UInt32, UInt32]:
+    """Camera position and the unit ray through the TSR-jittered pixel center, exactly as the deferred
+    shade pass builds it. Returns `(cam_x, cam_y, cam_z, dir_x, dir_y, dir_z)`."""
+    var cam_x = s.load_float(b_globals, s.uint(32))
+    var cam_y = s.load_float(b_globals, s.uint(33))
+    var cam_z = s.load_float(b_globals, s.uint(34))
+    var fwd_x = s.load_float(b_globals, s.uint(36))
+    var fwd_y = s.load_float(b_globals, s.uint(37))
+    var fwd_z = s.load_float(b_globals, s.uint(38))
+    var tan_x = s.load_float(b_globals, s.uint(39))
+    var rgt_x = s.load_float(b_globals, s.uint(40))
+    var rgt_y = s.load_float(b_globals, s.uint(41))
+    var rgt_z = s.load_float(b_globals, s.uint(42))
+    var tan_y = s.load_float(b_globals, s.uint(43))
+    var up_x = s.load_float(b_globals, s.uint(44))
+    var up_y = s.load_float(b_globals, s.uint(45))
+    var up_z = s.load_float(b_globals, s.uint(46))
+    var jit_x = s.load_float(b_globals, s.uint(101))
+    var jit_y = s.load_float(b_globals, s.uint(102))
+    var fx0 = s.fsub(s.fadd(s.float_from_uint(px), s.float(0.5)), s.fmul(jit_x, s.fmul(fw, s.float(0.5))))
+    var fy0 = s.fadd(s.fadd(s.float_from_uint(py), s.float(0.5)), s.fmul(jit_y, s.fmul(fh, s.float(0.5))))
+    var ndc_x = s.fsub(s.fmul(s.fdiv(fx0, fw), s.float(2.0)), s.float(1.0))
+    var ndc_y = s.fsub(s.float(1.0), s.fmul(s.fdiv(fy0, fh), s.float(2.0)))
+    var rd = emit_vec3_normalize(
+        s,
+        s.fma(rgt_x, s.fmul(ndc_x, tan_x), s.fma(up_x, s.fmul(ndc_y, tan_y), fwd_x)),
+        s.fma(rgt_y, s.fmul(ndc_x, tan_x), s.fma(up_y, s.fmul(ndc_y, tan_y), fwd_y)),
+        s.fma(rgt_z, s.fmul(ndc_x, tan_x), s.fma(up_z, s.fmul(ndc_y, tan_y), fwd_z)),
+    )
+    return (cam_x, cam_y, cam_z, rd[0], rd[1], rd[2])
+
+
+def emit_visbuffer_surface(
+    mut s: AaaSpirvModule,
+    b_verts: UInt32,
+    b_indices: UInt32,
+    b_meshlets: UInt32,
+    b_instances: UInt32,
+    vis0: UInt32,
+    vis1: UInt32,
+    ox: UInt32,
+    oy: UInt32,
+    oz: UInt32,
+    dx: UInt32,
+    dy: UInt32,
+    dz: UInt32,
+) -> Tuple[UInt32, UInt32, UInt32, UInt32, UInt32, UInt32]:
+    """Decodes a (non-sky) VisBuffer texel, intersects its triangle with the ray `o + t d` (Moller-Trumbore)
+    and returns the world position and the interpolated vertex normal turned toward the ray origin:
+    `(wx, wy, wz, nx, ny, nz)`."""
+    var inst_id = s.shr(vis0, s.uint(17))
+    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
+    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
+    var first_tri = s.load_word(b_meshlets, s.iadd(s.imul(ml_id, s.uint(12)), s.uint(8)))
+    var idx_off = s.imul(s.iadd(first_tri, local_prim), s.uint(3))
+    var v0_off = s.imul(s.load_word(b_indices, idx_off), s.uint(12))
+    var v1_off = s.imul(s.load_word(b_indices, s.iadd(idx_off, s.uint(1))), s.uint(12))
+    var v2_off = s.imul(s.load_word(b_indices, s.iadd(idx_off, s.uint(2))), s.uint(12))
+    var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
+    var p0 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v0_off), s.load_float(b_verts, s.iadd(v0_off, s.uint(1))), s.load_float(b_verts, s.iadd(v0_off, s.uint(2))))
+    var p1 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v1_off), s.load_float(b_verts, s.iadd(v1_off, s.uint(1))), s.load_float(b_verts, s.iadd(v1_off, s.uint(2))))
+    var p2 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v2_off), s.load_float(b_verts, s.iadd(v2_off, s.uint(1))), s.load_float(b_verts, s.iadd(v2_off, s.uint(2))))
+    var e1 = (s.fsub(p1[0], p0[0]), s.fsub(p1[1], p0[1]), s.fsub(p1[2], p0[2]))
+    var e2 = (s.fsub(p2[0], p0[0]), s.fsub(p2[1], p0[1]), s.fsub(p2[2], p0[2]))
+    var tv = (s.fsub(ox, p0[0]), s.fsub(oy, p0[1]), s.fsub(oz, p0[2]))
+    var pvec = emit_vec3_cross(s, dx, dy, dz, e2[0], e2[1], e2[2])
+    var qvec = emit_vec3_cross(s, tv[0], tv[1], tv[2], e1[0], e1[1], e1[2])
+    var det = emit_vec3_dot(s, e1[0], e1[1], e1[2], pvec[0], pvec[1], pvec[2])
+    var inv_det = s.fdiv(s.float(1.0), s.select_f(s.fge(det, s.float(0.0)), s.nmax(det, s.float(1e-12)), s.nmin(det, s.float(-1e-12))))
+    var b1 = s.nclamp(s.fmul(emit_vec3_dot(s, tv[0], tv[1], tv[2], pvec[0], pvec[1], pvec[2]), inv_det), s.float(0.0), s.float(1.0))
+    var b2 = s.nclamp(s.fmul(emit_vec3_dot(s, dx, dy, dz, qvec[0], qvec[1], qvec[2]), inv_det), s.float(0.0), s.float(1.0))
+    var b0 = s.fsub(s.fsub(s.float(1.0), b1), b2)
+    var wx = s.fma(p0[0], b0, s.fma(p1[0], b1, s.fmul(p2[0], b2)))
+    var wy = s.fma(p0[1], b0, s.fma(p1[1], b1, s.fmul(p2[1], b2)))
+    var wz = s.fma(p0[2], b0, s.fma(p1[2], b1, s.fmul(p2[2], b2)))
+
+    var lnx = s.fma(s.load_float(b_verts, s.iadd(v0_off, s.uint(3))), b0, s.fma(s.load_float(b_verts, s.iadd(v1_off, s.uint(3))), b1, s.fmul(s.load_float(b_verts, s.iadd(v2_off, s.uint(3))), b2)))
+    var lny = s.fma(s.load_float(b_verts, s.iadd(v0_off, s.uint(4))), b0, s.fma(s.load_float(b_verts, s.iadd(v1_off, s.uint(4))), b1, s.fmul(s.load_float(b_verts, s.iadd(v2_off, s.uint(4))), b2)))
+    var lnz = s.fma(s.load_float(b_verts, s.iadd(v0_off, s.uint(5))), b0, s.fma(s.load_float(b_verts, s.iadd(v1_off, s.uint(5))), b1, s.fmul(s.load_float(b_verts, s.iadd(v2_off, s.uint(5))), b2)))
+    var wn_raw = emit_mat4_mul_dir(s, b_instances, inst_base, lnx, lny, lnz)
+    var wn = emit_vec3_normalize(s, wn_raw[0], wn_raw[1], wn_raw[2])
+    var flip = s.select_f(s.fgt(emit_vec3_dot(s, wn[0], wn[1], wn[2], dx, dy, dz), s.float(0.0)), s.float(-1.0), s.float(1.0))
+    return (wx, wy, wz, s.fmul(wn[0], flip), s.fmul(wn[1], flip), s.fmul(wn[2], flip))
+
+
 def rt_sun_shadow_trace_shader() -> List[UInt32]:
     """Per-pixel area-sun occlusion (`group = 8 x 8`). Push[0] = render_w, [1] = render_h, [2] = raw offset."""
     var s = AaaSpirvModule(
@@ -126,78 +213,24 @@ def rt_sun_shadow_trace_shader() -> List[UInt32]:
     s.store_float(b_hist, s.iadd(o, s.uint(1)), s.float(-1.0))
     s.begin_else()
 
-    # Camera ray through the (TSR-jittered) pixel center, as in the deferred shade pass
     var fw = s.float_from_uint(w_u)
     var fh = s.float_from_uint(h_u)
-    var cam_x = s.load_float(b_globals, s.uint(32))
-    var cam_y = s.load_float(b_globals, s.uint(33))
-    var cam_z = s.load_float(b_globals, s.uint(34))
-    var fwd_x = s.load_float(b_globals, s.uint(36))
-    var fwd_y = s.load_float(b_globals, s.uint(37))
-    var fwd_z = s.load_float(b_globals, s.uint(38))
-    var tan_x = s.load_float(b_globals, s.uint(39))
-    var rgt_x = s.load_float(b_globals, s.uint(40))
-    var rgt_y = s.load_float(b_globals, s.uint(41))
-    var rgt_z = s.load_float(b_globals, s.uint(42))
-    var tan_y = s.load_float(b_globals, s.uint(43))
-    var up_x = s.load_float(b_globals, s.uint(44))
-    var up_y = s.load_float(b_globals, s.uint(45))
-    var up_z = s.load_float(b_globals, s.uint(46))
+    var cam = emit_pixel_camera_ray(s, b_globals, px, py, fw, fh)
+    var cam_x = cam[0]
+    var cam_y = cam[1]
+    var cam_z = cam[2]
     var sun_x = s.load_float(b_globals, s.uint(48))
     var sun_y = s.load_float(b_globals, s.uint(49))
     var sun_z = s.load_float(b_globals, s.uint(50))
     var r_flags = s.load_word(b_globals, s.uint(99))
     var frame_idx = s.load_word(b_globals, s.uint(100))
-    var jit_x = s.load_float(b_globals, s.uint(101))
-    var jit_y = s.load_float(b_globals, s.uint(102))
-    var fx0 = s.fsub(s.fadd(s.float_from_uint(px), s.float(0.5)), s.fmul(jit_x, s.fmul(fw, s.float(0.5))))
-    var fy0 = s.fadd(s.fadd(s.float_from_uint(py), s.float(0.5)), s.fmul(jit_y, s.fmul(fh, s.float(0.5))))
-    var ndc_x = s.fsub(s.fmul(s.fdiv(fx0, fw), s.float(2.0)), s.float(1.0))
-    var ndc_y = s.fsub(s.float(1.0), s.fmul(s.fdiv(fy0, fh), s.float(2.0)))
-    var rd = emit_vec3_normalize(
-        s,
-        s.fma(rgt_x, s.fmul(ndc_x, tan_x), s.fma(up_x, s.fmul(ndc_y, tan_y), fwd_x)),
-        s.fma(rgt_y, s.fmul(ndc_x, tan_x), s.fma(up_y, s.fmul(ndc_y, tan_y), fwd_y)),
-        s.fma(rgt_z, s.fmul(ndc_x, tan_x), s.fma(up_z, s.fmul(ndc_y, tan_y), fwd_z)),
-    )
-
-    # Decode the VisBuffer triangle and intersect it (Moller-Trumbore) for position + smooth normal
-    var inst_id = s.shr(vis0, s.uint(17))
-    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
-    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
-    var first_tri = s.load_word(b_meshlets, s.iadd(s.imul(ml_id, s.uint(12)), s.uint(8)))
-    var idx_off = s.imul(s.iadd(first_tri, local_prim), s.uint(3))
-    var v0_off = s.imul(s.load_word(b_indices, idx_off), s.uint(12))
-    var v1_off = s.imul(s.load_word(b_indices, s.iadd(idx_off, s.uint(1))), s.uint(12))
-    var v2_off = s.imul(s.load_word(b_indices, s.iadd(idx_off, s.uint(2))), s.uint(12))
-    var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
-    var p0 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v0_off), s.load_float(b_verts, s.iadd(v0_off, s.uint(1))), s.load_float(b_verts, s.iadd(v0_off, s.uint(2))))
-    var p1 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v1_off), s.load_float(b_verts, s.iadd(v1_off, s.uint(1))), s.load_float(b_verts, s.iadd(v1_off, s.uint(2))))
-    var p2 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v2_off), s.load_float(b_verts, s.iadd(v2_off, s.uint(1))), s.load_float(b_verts, s.iadd(v2_off, s.uint(2))))
-    var e1 = (s.fsub(p1[0], p0[0]), s.fsub(p1[1], p0[1]), s.fsub(p1[2], p0[2]))
-    var e2 = (s.fsub(p2[0], p0[0]), s.fsub(p2[1], p0[1]), s.fsub(p2[2], p0[2]))
-    var tv = (s.fsub(cam_x, p0[0]), s.fsub(cam_y, p0[1]), s.fsub(cam_z, p0[2]))
-    var pvec = emit_vec3_cross(s, rd[0], rd[1], rd[2], e2[0], e2[1], e2[2])
-    var qvec = emit_vec3_cross(s, tv[0], tv[1], tv[2], e1[0], e1[1], e1[2])
-    var det = emit_vec3_dot(s, e1[0], e1[1], e1[2], pvec[0], pvec[1], pvec[2])
-    var inv_det = s.fdiv(s.float(1.0), s.select_f(s.fge(det, s.float(0.0)), s.nmax(det, s.float(1e-12)), s.nmin(det, s.float(-1e-12))))
-    var b1 = s.nclamp(s.fmul(emit_vec3_dot(s, tv[0], tv[1], tv[2], pvec[0], pvec[1], pvec[2]), inv_det), s.float(0.0), s.float(1.0))
-    var b2 = s.nclamp(s.fmul(emit_vec3_dot(s, rd[0], rd[1], rd[2], qvec[0], qvec[1], qvec[2]), inv_det), s.float(0.0), s.float(1.0))
-    var b0 = s.fsub(s.fsub(s.float(1.0), b1), b2)
-    var wx = s.fma(p0[0], b0, s.fma(p1[0], b1, s.fmul(p2[0], b2)))
-    var wy = s.fma(p0[1], b0, s.fma(p1[1], b1, s.fmul(p2[1], b2)))
-    var wz = s.fma(p0[2], b0, s.fma(p1[2], b1, s.fmul(p2[2], b2)))
-
-    var lnx = s.fma(s.load_float(b_verts, s.iadd(v0_off, s.uint(3))), b0, s.fma(s.load_float(b_verts, s.iadd(v1_off, s.uint(3))), b1, s.fmul(s.load_float(b_verts, s.iadd(v2_off, s.uint(3))), b2)))
-    var lny = s.fma(s.load_float(b_verts, s.iadd(v0_off, s.uint(4))), b0, s.fma(s.load_float(b_verts, s.iadd(v1_off, s.uint(4))), b1, s.fmul(s.load_float(b_verts, s.iadd(v2_off, s.uint(4))), b2)))
-    var lnz = s.fma(s.load_float(b_verts, s.iadd(v0_off, s.uint(5))), b0, s.fma(s.load_float(b_verts, s.iadd(v1_off, s.uint(5))), b1, s.fmul(s.load_float(b_verts, s.iadd(v2_off, s.uint(5))), b2)))
-    var wn_raw = emit_mat4_mul_dir(s, b_instances, inst_base, lnx, lny, lnz)
-    var wn = emit_vec3_normalize(s, wn_raw[0], wn_raw[1], wn_raw[2])
-    # Face the viewer (double-sided and mirrored instances)
-    var flip = s.select_f(s.fgt(emit_vec3_dot(s, wn[0], wn[1], wn[2], rd[0], rd[1], rd[2]), s.float(0.0)), s.float(-1.0), s.float(1.0))
-    var nx = s.fmul(wn[0], flip)
-    var ny = s.fmul(wn[1], flip)
-    var nz = s.fmul(wn[2], flip)
+    var surf = emit_visbuffer_surface(s, b_verts, b_indices, b_meshlets, b_instances, vis0, vis1, cam_x, cam_y, cam_z, cam[3], cam[4], cam[5])
+    var wx = surf[0]
+    var wy = surf[1]
+    var wz = surf[2]
+    var nx = surf[3]
+    var ny = surf[4]
+    var nz = surf[5]
 
     # Orthonormal basis (tb, bb) around the sun direction
     var h_up = s.flt(s.fabs(sun_y), s.float(0.95))
