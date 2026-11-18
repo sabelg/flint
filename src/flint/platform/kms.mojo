@@ -885,10 +885,13 @@ struct KmsWindow(Copyable, Movable):
             var chosen = pick_mode(modes)
             var override = env_value("FLINT_KMS_MODE")  # e.g. 1280x720
             if override.byte_length() > 0:
+                var matched = -1
                 for index in range(len(modes)):
                     if String(modes[index].hdisplay) + "x" + String(modes[index].vdisplay) == override:
-                        chosen = index
-                        break
+                        if matched < 0 or modes[index].refresh_hz() > modes[matched].refresh_hz() + 0.5:
+                            matched = index  # the fastest refresh at that size, not the first listed
+                if matched >= 0:
+                    chosen = matched
             # The encoder and CRTC already lit, then any free pairing.
             var crtc = 0
             var encoder = 0
@@ -1401,6 +1404,15 @@ def kms_probe() -> String:
             var status = "connected" if state[0] == DRM_MODE_CONNECTED else ("disconnected" if state[0] == 2 else "unknown")
             report += "  connector " + String(connector) + ": " + status + ", " + String(len(modes)) + " modes"
             var chosen = pick_mode(modes)
+            var override = env_value("FLINT_KMS_MODE")
+            if override.byte_length() > 0:
+                var matched = -1
+                for index in range(len(modes)):
+                    if String(modes[index].hdisplay) + "x" + String(modes[index].vdisplay) == override:
+                        if matched < 0 or modes[index].refresh_hz() > modes[matched].refresh_hz() + 0.5:
+                            matched = index
+                if matched >= 0:
+                    chosen = matched
             if chosen >= 0:
                 report += ", would use " + String(modes[chosen].hdisplay) + "x" + String(modes[chosen].vdisplay) + "@" + String(Int(modes[chosen].refresh_hz() + 0.5))
             report += "\n"
