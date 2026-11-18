@@ -3351,6 +3351,7 @@ struct FlintAaaVulkanRenderer(Movable):
             or self.enable_rt_reflections
             or self.enable_rt_gi
             or (self.enable_water_plane and not self.furnace_white_dome)
+            or frame_has_glass
         )
         var inst_da: UInt64 = 0
         if use_rt_frame:
