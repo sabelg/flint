@@ -290,6 +290,7 @@ def det_pow(x: Float32, y: Float32) -> Float32:
 # The floating-point mode of the thread
 # ---------------------------------------------------------------------------
 comptime FPCR_CONTROL_MASK: UInt64 = 0x07FF9F00
+comptime FPCR_DN_BIT: UInt64 = UInt64(1) << 25  # Canonical Quiet-NaN (Default NaN) on ARM64
 
 
 def read_mxcsr() -> UInt32:
@@ -302,6 +303,8 @@ def read_mxcsr() -> UInt32:
         var mxcsr = MXCSR_SIM
         if (fpcr & (UInt64(1) << 24)) != 0:
             mxcsr |= UInt32(1 << 15)  # FZ -> FTZ
+        if (fpcr & (UInt64(1) << 19)) != 0 or (fpcr & FPCR_DN_BIT) == 0:
+            mxcsr |= UInt32(1 << 6)  # FZ16 or missing DN -> DAZ flag
         var rmode = UInt32((fpcr >> 22) & 3)
         mxcsr |= rmode << 13
         return mxcsr
@@ -313,21 +316,23 @@ def write_mxcsr(value: UInt32):
         llvm_intrinsic["llvm.x86.sse.ldmxcsr", NoneType](Pointer(to=copy))
     else:
         var fpcr = inlined_assembly["mrs $0, fpcr", UInt64, constraints="=r"]()
-        fpcr &= ~FPCR_CONTROL_MASK
+        fpcr = (fpcr & ~FPCR_CONTROL_MASK) | FPCR_DN_BIT
         if (value & UInt32(1 << 15)) != 0:
             fpcr |= UInt64(1) << 24
+        if (value & UInt32(1 << 6)) != 0:
+            fpcr |= UInt64(1) << 19
         var rmode = UInt64((value >> 13) & 3)
         fpcr |= rmode << 22
         inlined_assembly["msr fpcr, $0", NoneType, constraints="r"](fpcr)
 
 
 def set_sim_float_mode():
-    """Round to nearest, FTZ and DAZ off, exceptions masked; flags cleared."""
+    """Round to nearest, FTZ and DAZ off, canonical Quiet-NaN on ARM64, exceptions masked."""
     comptime if CompilationTarget.is_x86():
         write_mxcsr(MXCSR_SIM)
     else:
         var fpcr = inlined_assembly["mrs $0, fpcr", UInt64, constraints="=r"]()
-        inlined_assembly["msr fpcr, $0", NoneType, constraints="r"](fpcr & ~FPCR_CONTROL_MASK)
+        inlined_assembly["msr fpcr, $0", NoneType, constraints="r"]((fpcr & ~FPCR_CONTROL_MASK) | FPCR_DN_BIT)
 
 
 def sim_float_mode_ok() -> Bool:
@@ -335,4 +340,4 @@ def sim_float_mode_ok() -> Bool:
         return (read_mxcsr() & MXCSR_CONTROL_MASK) == MXCSR_SIM
     else:
         var fpcr = inlined_assembly["mrs $0, fpcr", UInt64, constraints="=r"]()
-        return (fpcr & FPCR_CONTROL_MASK) == 0
+        return (fpcr & FPCR_CONTROL_MASK) == FPCR_DN_BIT

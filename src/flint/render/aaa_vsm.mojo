@@ -8,7 +8,7 @@ Architecture:
     uncovered or dirty pages via `VK_KHR_dynamic_rendering` per-tile `renderArea`.
   - Contact-Hardening `PCSS`: 8-tap Vogel-disk blocker search + 12-tap variable-penumbra PCF.
 """
-from std.math import cos, sin, sqrt
+from std.math import abs, cos, floor, max, min, sin, sqrt
 from flint.core.math import Vec3
 from flint.render.spirv import (
     AaaSpirvModule,
@@ -52,11 +52,44 @@ comptime VSM_CASCADE_PAGES_DIM: Int = 64
 comptime VSM_CASCADE_PAGE_COUNT: Int = 4096       # 64 x 64
 comptime VSM_TOTAL_CLIPMAP_PAGES: Int = 16384     # 4 * 4096 = exactly VSM_VIRTUAL_PAGE_COUNT!
 
-# Half-extents for the 4 concentric cascades:
-comptime VSM_CASCADE_0_EXTENT: Float32 = 8.0      # Near fine detail
-comptime VSM_CASCADE_1_EXTENT: Float32 = 32.0     # Mid-range
-comptime VSM_CASCADE_2_EXTENT: Float32 = 128.0    # Far environment
-comptime VSM_CASCADE_3_EXTENT: Float32 = 512.0    # Horizon / mountains
+# Half-extents for the 4 concentric cascades (±16m, ±64m, ±256m, ±1024m):
+comptime VSM_CASCADE_0_EXTENT: Float32 = 16.0     # Near fine detail (±16m)
+comptime VSM_CASCADE_1_EXTENT: Float32 = 64.0     # Mid-range (±64m)
+comptime VSM_CASCADE_2_EXTENT: Float32 = 256.0    # Far environment (±256m)
+comptime VSM_CASCADE_3_EXTENT: Float32 = 1024.0   # Horizon / mountains (±1024m)
+
+# `b_globals` word offsets for 4-Cascade VSM (`0..166` untouched; Cascade 0 stays at `56..71`):
+comptime VSM_GLOBALS_CASCADE_FLAG_WORD: Int = 167
+comptime VSM_GLOBALS_CASCADE_1_WORD: Int = 168    # 16 floats: [168..183]
+comptime VSM_GLOBALS_CASCADE_2_WORD: Int = 184    # 16 floats: [184..199]
+comptime VSM_GLOBALS_CASCADE_3_WORD: Int = 200    # 16 floats: [200..215]
+
+
+@always_inline
+def vsm_cascade_quadrant_origin(cascade: Int) -> Tuple[Int, Int]:
+    """Returns `(quad_x, quad_y)` (`0` or `64`) for cascade `0..3` inside the `128x128` VSM Page Table."""
+    var c = max(0, min(VSM_CASCADE_COUNT - 1, cascade))
+    return ((c & 1) * VSM_CASCADE_PAGES_DIM, (c >> 1) * VSM_CASCADE_PAGES_DIM)
+
+
+@always_inline
+def vsm_cascade_from_virtual_page(vx: Int, vy: Int) -> Int:
+    """Returns cascade `0..3` owning virtual page `(vx, vy)` in `0..127`."""
+    var qx = 1 if vx >= VSM_CASCADE_PAGES_DIM else 0
+    var qy = 1 if vy >= VSM_CASCADE_PAGES_DIM else 0
+    return qy * 2 + qx
+
+
+@always_inline
+def vsm_cascade_globals_word_offset(cascade: Int) -> Int:
+    """Returns the `b_globals` float/word offset of cascade `0..3`'s `light_view_proj` matrix."""
+    if cascade <= 0:
+        return 56
+    if cascade == 1:
+        return VSM_GLOBALS_CASCADE_1_WORD
+    if cascade == 2:
+        return VSM_GLOBALS_CASCADE_2_WORD
+    return VSM_GLOBALS_CASCADE_3_WORD
 
 
 def get_vsm_cascade_index(dist: Float32) -> Int:
@@ -71,10 +104,19 @@ def get_vsm_cascade_index(dist: Float32) -> Int:
 
 
 def compute_toroidal_page_index(cascade: Int, vx: Int, vy: Int) -> Int:
-    """Toroidal wrapping (vx mod 64, vy mod 64) eliminating CPU memory shifts and stalls."""
+    """Maps toroidal `(vx mod 64, vy mod 64)` into linear cascade slot `cascade * 4096 + ty * 64 + tx`."""
+    var c = max(0, min(VSM_CASCADE_COUNT - 1, cascade))
     var tx = (vx % VSM_CASCADE_PAGES_DIM + VSM_CASCADE_PAGES_DIM) % VSM_CASCADE_PAGES_DIM
     var ty = (vy % VSM_CASCADE_PAGES_DIM + VSM_CASCADE_PAGES_DIM) % VSM_CASCADE_PAGES_DIM
-    return cascade * VSM_CASCADE_PAGE_COUNT + (ty * VSM_CASCADE_PAGES_DIM + tx)
+    return c * VSM_CASCADE_PAGE_COUNT + ty * VSM_CASCADE_PAGES_DIM + tx
+
+
+def compute_quadrant_page_index(cascade: Int, vx: Int, vy: Int) -> Int:
+    """Maps toroidal `(vx mod 64, vy mod 64)` into cascade `cascade`'s `64x64` quadrant of the `128x128` VSM Page Table!"""
+    var tx = (vx % VSM_CASCADE_PAGES_DIM + VSM_CASCADE_PAGES_DIM) % VSM_CASCADE_PAGES_DIM
+    var ty = (vy % VSM_CASCADE_PAGES_DIM + VSM_CASCADE_PAGES_DIM) % VSM_CASCADE_PAGES_DIM
+    var q = vsm_cascade_quadrant_origin(cascade)
+    return (q[1] + ty) * VSM_VIRTUAL_PAGES_DIM + (q[0] + tx)
 
 
 
@@ -113,6 +155,14 @@ struct VsmPageManager(Movable):
     def invalidate_all(mut self):
         for i in range(VSM_VIRTUAL_PAGE_COUNT):
             self.virtual_valid[i] = False
+
+    def invalidate_cascade(mut self, cascade: Int):
+        """Invalidates only cascade `cascade`'s `64x64` quadrant inside the `128x128` VSM Page Table."""
+        var q = vsm_cascade_quadrant_origin(cascade)
+        for ly in range(VSM_CASCADE_PAGES_DIM):
+            var row = (q[1] + ly) * VSM_VIRTUAL_PAGES_DIM + q[0]
+            for lx in range(VSM_CASCADE_PAGES_DIM):
+                self.virtual_valid[row + lx] = False
 
     def invalidate_region(mut self, min_uv_x: Float32, min_uv_y: Float32, max_uv_x: Float32, max_uv_y: Float32):
         var x0 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(min_uv_x * Float32(VSM_VIRTUAL_PAGES_DIM))))
@@ -226,9 +276,191 @@ def make_ortho_directional_light_vp(
     return m^
 
 
+def compute_vsm_cascade_page_origins(
+    light_dir_toward_sun: Vec3,
+    camera_pos: Vec3,
+    base_half_extent: Float32 = 16.0,
+) -> List[Tuple[Int, Int]]:
+    """Computes integer light-space page origins `(page_x, page_y)` for each of the 4 toroidal VSM cascades
+    (`±16m, ±64m, ±256m, ±1024m`) so camera translation snaps cleanly to `128x128`-texel page boundaries!"""
+    var fwd = (Vec3(0.0, 0.0, 0.0) - light_dir_toward_sun).normalized()
+    var up_ref = Vec3(0.0, 0.0, 1.0) if abs(fwd.y) > Float32(0.92) else Vec3(0.0, 1.0, 0.0)
+    var right = up_ref.cross(fwd).normalized()
+    var up = fwd.cross(right).normalized()
+    var cam_lx = right.dot(camera_pos)
+    var cam_ly = up.dot(camera_pos)
+
+    var origins = List[Tuple[Int, Int]](capacity=VSM_CASCADE_COUNT)
+    for c in range(VSM_CASCADE_COUNT):
+        var half_ext = max(Float32(1.0), base_half_extent) * Float32(1 << (2 * c))
+        var page_world = (Float32(2.0) * half_ext) / Float32(VSM_CASCADE_PAGES_DIM)
+        var px = Int(floor(cam_lx / page_world + Float32(0.5)))
+        var py = Int(floor(cam_ly / page_world + Float32(0.5)))
+        origins.append((px, py))
+    return origins^
+
+
+def compute_vsm_cascade_matrices(
+    light_dir_toward_sun: Vec3,
+    camera_pos: Vec3,
+    base_half_extent: Float32 = 16.0,
+    min_depth_half_range: Float32 = 160.0,
+) -> List[List[Float32]]:
+    """Builds 4 concentric page-snapped column-major `[0..1]` Z orthographic `light_view_proj` matrices
+    covering `±16m, ±64m, ±256m, ±1024m` (`base_half_extent * 4^c`) around `camera_pos`."""
+    var fwd = (Vec3(0.0, 0.0, 0.0) - light_dir_toward_sun).normalized()
+    var up_ref = Vec3(0.0, 0.0, 1.0) if abs(fwd.y) > Float32(0.92) else Vec3(0.0, 1.0, 0.0)
+    var right = up_ref.cross(fwd).normalized()
+    var up = fwd.cross(right).normalized()
+    var cam_lx = right.dot(camera_pos)
+    var cam_ly = up.dot(camera_pos)
+    var cam_lz = fwd.dot(camera_pos)
+    var snap_lz = floor(cam_lz / Float32(32.0) + Float32(0.5)) * Float32(32.0)
+
+    var mats = List[List[Float32]](capacity=VSM_CASCADE_COUNT)
+    for c in range(VSM_CASCADE_COUNT):
+        var half_ext = max(Float32(1.0), base_half_extent) * Float32(1 << (2 * c))
+        var page_world = (Float32(2.0) * half_ext) / Float32(VSM_CASCADE_PAGES_DIM)
+        var snap_lx = floor(cam_lx / page_world + Float32(0.5)) * page_world
+        var snap_ly = floor(cam_ly / page_world + Float32(0.5)) * page_world
+        var snapped_center = right * snap_lx + up * snap_ly + fwd * snap_lz
+        var depth_half = max(min_depth_half_range, half_ext * Float32(1.5))
+        mats.append(make_ortho_directional_light_vp(light_dir_toward_sun, snapped_center, half_ext, depth_half))
+    return mats^
+
+
+def mark_toroidal_cascade_pages(
+    mut vsm: VsmPageManager,
+    mut table_words: List[UInt32],
+    prev_origins: List[Tuple[Int, Int]],
+    new_origins: List[Tuple[Int, Int]],
+    active_radius_pages: Int = 2,
+) -> Int:
+    """Invalidates only newly scrolled toroidal ring strips on camera translation and marks active
+    toroidal clipmap pages in `table_words[16384..32767]`, returning the number of marked pages."""
+    if len(table_words) < VSM_TABLE_WORDS or len(new_origins) < VSM_CASCADE_COUNT:
+        return 0
+    var half_dim = VSM_CASCADE_PAGES_DIM // 2
+    var has_prev = len(prev_origins) >= VSM_CASCADE_COUNT
+    var marked = 0
+    var rad = max(0, min(half_dim - 1, active_radius_pages))
+
+    for c in range(VSM_CASCADE_COUNT):
+        var nx = new_origins[c][0]
+        var ny = new_origins[c][1]
+        if has_prev:
+            var ox = prev_origins[c][0]
+            var oy = prev_origins[c][1]
+            var dx = nx - ox
+            var dy = ny - oy
+            if abs(dx) >= VSM_CASCADE_PAGES_DIM or abs(dy) >= VSM_CASCADE_PAGES_DIM:
+                vsm.invalidate_cascade(c)
+            else:
+                if dx > 0:
+                    for gx in range(ox + half_dim, nx + half_dim):
+                        for gy in range(ny - half_dim, ny + half_dim):
+                            vsm.virtual_valid[compute_quadrant_page_index(c, gx, gy)] = False
+                elif dx < 0:
+                    for gx in range(nx - half_dim, ox - half_dim):
+                        for gy in range(ny - half_dim, ny + half_dim):
+                            vsm.virtual_valid[compute_quadrant_page_index(c, gx, gy)] = False
+                if dy > 0:
+                    for gy in range(oy + half_dim, ny + half_dim):
+                        for gx in range(nx - half_dim, nx + half_dim):
+                            vsm.virtual_valid[compute_quadrant_page_index(c, gx, gy)] = False
+                elif dy < 0:
+                    for gy in range(ny - half_dim, oy - half_dim):
+                        for gx in range(nx - half_dim, nx + half_dim):
+                            vsm.virtual_valid[compute_quadrant_page_index(c, gx, gy)] = False
+
+        for oy_loc in range(-rad, rad + 1):
+            for ox_loc in range(-rad, rad + 1):
+                var t_idx = compute_quadrant_page_index(c, nx + ox_loc, ny + oy_loc)
+                table_words[VSM_VIRTUAL_PAGE_COUNT + t_idx] = 1
+                marked += 1
+
+    return marked
+
+
+def _emit_cascade_fits(
+    mut s: AaaSpirvModule,
+    lc: Tuple[UInt32, UInt32, UInt32, UInt32],
+    xy_limit: Float32 = 0.95,
+) -> UInt32:
+    """Returns `Bool` SSA true iff orthographic light-clip point `lc` lies inside `[-xy_limit..+xy_limit]^2 x [0.001..0.999]`."""
+    var in_xy = s.logical_and(
+        s.flt(s.fabs(lc[0]), s.float(xy_limit)),
+        s.flt(s.fabs(lc[1]), s.float(xy_limit)),
+    )
+    var in_z = s.logical_and(
+        s.fgt(lc[2], s.float(0.001)),
+        s.flt(lc[2], s.float(0.999)),
+    )
+    return s.logical_and(in_xy, in_z)
+
+
+def _emit_select_vsm_cascade(
+    mut s: AaaSpirvModule,
+    b_globals: UInt32,
+    wx: UInt32,
+    wy: UInt32,
+    wz: UInt32,
+) -> Tuple[UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32]:
+    """Projects `(wx, wy, wz)` across Cascades `0..3` (`±16m, ±64m, ±256m, ±1024m`) and selects the finest fitting cascade!
+    Returns `(valid_bool, casc_u32, mat_off_u32, lc_x, lc_y, lc_z, n_bias_f32)`.
+    """
+    var c0 = emit_mat4_mul_point(s, b_globals, s.uint(56), wx, wy, wz)
+    var c1 = emit_mat4_mul_point(s, b_globals, s.uint(UInt32(VSM_GLOBALS_CASCADE_1_WORD)), wx, wy, wz)
+    var c2 = emit_mat4_mul_point(s, b_globals, s.uint(UInt32(VSM_GLOBALS_CASCADE_2_WORD)), wx, wy, wz)
+    var c3 = emit_mat4_mul_point(s, b_globals, s.uint(UInt32(VSM_GLOBALS_CASCADE_3_WORD)), wx, wy, wz)
+
+    var fit0 = _emit_cascade_fits(s, c0, 0.95)
+    var fit1 = _emit_cascade_fits(s, c1, 0.95)
+    var fit2 = _emit_cascade_fits(s, c2, 0.95)
+    var fit3 = _emit_cascade_fits(s, c3, 0.99)
+
+    var casc = s.select_u(
+        fit0,
+        s.uint(0),
+        s.select_u(
+            fit1,
+            s.uint(1),
+            s.select_u(fit2, s.uint(2), s.uint(3)),
+        ),
+    )
+    var mat_off = s.select_u(
+        fit0,
+        s.uint(56),
+        s.select_u(
+            fit1,
+            s.uint(UInt32(VSM_GLOBALS_CASCADE_1_WORD)),
+            s.select_u(
+                fit2,
+                s.uint(UInt32(VSM_GLOBALS_CASCADE_2_WORD)),
+                s.uint(UInt32(VSM_GLOBALS_CASCADE_3_WORD)),
+            ),
+        ),
+    )
+    var lcx = s.select_f(fit0, c0[0], s.select_f(fit1, c1[0], s.select_f(fit2, c2[0], c3[0])))
+    var lcy = s.select_f(fit0, c0[1], s.select_f(fit1, c1[1], s.select_f(fit2, c2[1], c3[1])))
+    var lcz = s.select_f(fit0, c0[2], s.select_f(fit1, c1[2], s.select_f(fit2, c2[2], c3[2])))
+    var n_bias = s.select_f(
+        fit0,
+        s.float(0.012),
+        s.select_f(
+            fit1,
+            s.float(0.036),
+            s.select_f(fit2, s.float(0.11), s.float(0.35)),
+        ),
+    )
+    var any_fit = s.logical_or(s.logical_or(fit0, fit1), s.logical_or(fit2, fit3))
+    return (any_fit, casc, mat_off, lcx, lcy, lcz, n_bias)
+
+
 def vsm_mark_pages_shader() -> List[UInt32]:
     """Compute Pass: Reads Reverse-Z screen depth, reconstructs world position, projects into
-    `16,384 x 16,384` Virtual Shadow Map space, and marks visible `(vx, vy)` pages (+1 border)!
+    `16,384 x 16,384` Virtual Shadow Map space (4-Cascade `64x64` Quadrants `±16m..±1024m` when `b_globals[167] != 0`,
+    or single-cascade `128x128`), and marks visible `(vx, vy)` pages (+1 quadrant-clamped border)!
     Push[0] = width, Push[1] = height.
     """
     var s = AaaSpirvModule(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
@@ -243,7 +475,6 @@ def vsm_mark_pages_shader() -> List[UInt32]:
     var h_u = s.push_word(1)
     s.return_if(s.logical_or(s.uge(px, w_u), s.uge(py, h_u)))
 
-    # Sample every 2x2 pixel quad center for fast page marking
     var coord = s.uvec2(px, py)
     var vis_id = s.extract_u(s.texel_fetch_u2d(vis_samp, coord, s.uint(0)), 0)
     s.return_if(s.ieq(vis_id, s.uint(0)))
@@ -279,6 +510,34 @@ def vsm_mark_pages_shader() -> List[UInt32]:
     var wy = s.fma(rgt_y, vx_s, s.fma(up_y, vy_s, s.fma(fwd_y, z_view, cam_y)))
     var wz = s.fma(rgt_z, vx_s, s.fma(up_z, vy_s, s.fma(fwd_z, z_view, cam_z)))
 
+    var casc_flag = s.load_word(b_globals, s.uint(UInt32(VSM_GLOBALS_CASCADE_FLAG_WORD)))
+    var is_casc = s.ine(casc_flag, s.uint(0))
+
+    s.begin_if(is_casc)
+    var sel = _emit_select_vsm_cascade(s, b_globals, wx, wy, wz)
+    s.begin_if(sel[0])
+    var casc = sel[1]
+    var lu_c = s.fma(sel[3], s.float(0.5), s.float(0.5))
+    var lv_c = s.fma(s.fneg(sel[4]), s.float(0.5), s.float(0.5))
+    var qx = s.imul(s.bit_and(casc, s.uint(1)), s.uint(64))
+    var qy = s.imul(s.shr(casc, s.uint(1)), s.uint(64))
+    var lx_u = s.umin(s.uint(63), s.saturate_uint(s.fmul(lu_c, s.float(64.0))))
+    var ly_u = s.umin(s.uint(63), s.saturate_uint(s.fmul(lv_c, s.float(64.0))))
+    var pvx_c = s.iadd(qx, lx_u)
+    var pvy_c = s.iadd(qy, ly_u)
+    var lx_l = s.select_u(s.ieq(lx_u, s.uint(0)), s.uint(0), s.isub(lx_u, s.uint(1)))
+    var lx_r = s.umin(s.uint(63), s.iadd(lx_u, s.uint(1)))
+    var ly_u0 = s.select_u(s.ieq(ly_u, s.uint(0)), s.uint(0), s.isub(ly_u, s.uint(1)))
+    var ly_d0 = s.umin(s.uint(63), s.iadd(ly_u, s.uint(1)))
+    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy_c, s.uint(128)), pvx_c)), s.uint(1))
+    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy_c, s.uint(128)), s.iadd(qx, lx_l))), s.uint(1))
+    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy_c, s.uint(128)), s.iadd(qx, lx_r))), s.uint(1))
+    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(s.iadd(qy, ly_u0), s.uint(128)), pvx_c)), s.uint(1))
+    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(s.iadd(qy, ly_d0), s.uint(128)), pvx_c)), s.uint(1))
+    s.end_if()
+    s.end_if()
+
+    s.begin_if(s.ieq(casc_flag, s.uint(0)))
     var lclip = emit_mat4_mul_point(s, b_globals, s.uint(56), wx, wy, wz)
     var lu = s.fma(lclip[0], s.float(0.5), s.float(0.5))
     var lv = s.fma(s.fneg(lclip[1]), s.float(0.5), s.float(0.5))
@@ -300,6 +559,7 @@ def vsm_mark_pages_shader() -> List[UInt32]:
     s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy, s.uint(128)), pvx_r)), s.uint(1))
     s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy_u, s.uint(128)), pvx)), s.uint(1))
     s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy_d, s.uint(128)), pvx)), s.uint(1))
+    s.end_if()
     s.end_if()
 
     return s.finish()
@@ -335,7 +595,9 @@ def vsm_page_vertex_shader() -> List[UInt32]:
 
     var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
     var wp = emit_mat4_mul_point(s, b_instances, inst_base, lpx, lpy, lpz)
-    var lclip = emit_mat4_mul_point(s, b_globals, s.uint(56), wp[0], wp[1], wp[2])
+    var raw_mat_off = s.push_word(4)
+    var mat_off = s.select_u(s.ieq(raw_mat_off, s.uint(0)), s.uint(56), raw_mat_off)
+    var lclip = emit_mat4_mul_point(s, b_globals, mat_off, wp[0], wp[1], wp[2])
 
     # Zoom virtual page `(vx, vy)` into clip `[-1 .. +1]^2`
     var sc_x = s.push_float(0)
@@ -391,7 +653,9 @@ def vsm_alphamask_vertex_shader() -> List[UInt32]:
     var uv_v = s.load_float(b_verts, s.iadd(v_base, s.uint(10)))
 
     var wp = emit_mat4_mul_point(s, b_instances, inst_base, lpx, lpy, lpz)
-    var lclip = emit_mat4_mul_point(s, b_globals, s.uint(56), wp[0], wp[1], wp[2])
+    var raw_mat_off = s.push_word(4)
+    var mat_off = s.select_u(s.ieq(raw_mat_off, s.uint(0)), s.uint(56), raw_mat_off)
+    var lclip = emit_mat4_mul_point(s, b_globals, mat_off, wp[0], wp[1], wp[2])
 
     var sc_x = s.push_float(0)
     var sc_y = s.push_float(1)
@@ -496,36 +760,68 @@ def emit_vsm_pcss_shadow(
     nz: UInt32,
     sun_radius_uv: UInt32,
 ) -> UInt32:
-    """Blocker-Search `PCSS` over `16,384 x 16,384` Virtual Shadow Map!
-     Sharp `1/16384` contact shadows at `d_receiver -> d_blocker`, physically softening with occluder distance.
+    """Blocker-Search `PCSS` over `16,384 x 16,384` Virtual Shadow Map across all 4 Clipmap Cascades (`±16m..±1024m`)!
+    Automatically selects Cascade `0 -> 1 -> 2 -> 3` when `b_globals[167] != 0` and samples its `64x64` quadrant.
     """
-    var bx = s.fma(nx, s.float(0.012), wx)
-    var by = s.fma(ny, s.float(0.012), wy)
-    var bz = s.fma(nz, s.float(0.012), wz)
-    var lclip = emit_mat4_mul_point(s, b_globals, s.uint(56), bx, by, bz)
+    var casc_flag = s.load_word(b_globals, s.uint(UInt32(VSM_GLOBALS_CASCADE_FLAG_WORD)))
+    var is_casc = s.ine(casc_flag, s.uint(0))
+
+    var sel = _emit_select_vsm_cascade(s, b_globals, wx, wy, wz)
+    var casc_u = s.select_u(is_casc, sel[1], s.uint(0))
+    var mat_off = s.select_u(is_casc, sel[2], s.uint(56))
+    var n_bias = s.select_f(is_casc, sel[6], s.float(0.012))
+
+    var bx = s.fma(nx, n_bias, wx)
+    var by = s.fma(ny, n_bias, wy)
+    var bz = s.fma(nz, n_bias, wz)
+    var lclip = emit_mat4_mul_point(s, b_globals, mat_off, bx, by, bz)
     var lu = s.fma(lclip[0], s.float(0.5), s.float(0.5))
     var lv = s.fma(s.fneg(lclip[1]), s.float(0.5), s.float(0.5))
     var z_rec = lclip[2]
+
+    # Map cascade-local `lu, lv in [0..1]` into quadrant `(qx + lu_tap) * 0.5` (or `lu_tap * 1.0` in single-cascade mode)
+    var q_xf = s.select_f(is_casc, s.float_from_uint(s.bit_and(casc_u, s.uint(1))), s.float(0.0))
+    var q_yf = s.select_f(is_casc, s.float_from_uint(s.shr(casc_u, s.uint(1))), s.float(0.0))
+    var atlas_sc = s.select_f(is_casc, s.float(0.5), s.float(1.0))
+
+    # Scale penumbra UV radius by `1 / 4^cascade` so world-space penumbra width stays physically consistent across cascades!
+    var casc_uv_sc = s.select_f(
+        s.ieq(casc_u, s.uint(0)),
+        s.float(1.0),
+        s.select_f(
+            s.ieq(casc_u, s.uint(1)),
+            s.float(0.25),
+            s.select_f(s.ieq(casc_u, s.uint(2)), s.float(0.0625), s.float(0.015625)),
+        ),
+    )
 
     var shadow_vis = s.fvar(s.float(1.0))
     var in_map = s.logical_and(
         s.logical_and(s.fgt(lu, s.float(0.002)), s.flt(lu, s.float(0.998))),
         s.logical_and(s.fgt(lv, s.float(0.002)), s.flt(lv, s.float(0.998))),
     )
-    s.begin_if(s.logical_and(in_map, s.flt(z_rec, s.float(0.999))))
+    var casc_ok = s.logical_or(s.ieq(casc_flag, s.uint(0)), sel[0])
+    var valid_rec = s.logical_and(
+        casc_ok,
+        s.logical_and(in_map, s.logical_and(s.fgt(z_rec, s.float(0.001)), s.flt(z_rec, s.float(0.999)))),
+    )
+    s.begin_if(valid_rec)
     var z_bias = s.float(0.0015)
 
     # 1. 8-Tap Vogel-Disk Blocker Search
     var blk_sum = s.fvar(s.float(0.0))
     var blk_cnt = s.fvar(s.float(0.0))
-    var search_r = s.nclamp(sun_radius_uv, s.float(0.00025), s.float(0.012))
+    var base_search_r = s.nclamp(sun_radius_uv, s.float(0.00025), s.float(0.012))
+    var search_r = s.nmax(s.float(0.00015), s.fmul(base_search_r, casc_uv_sc))
 
     for tap in range(8):
         var r_norm = sqrt((Float32(tap) + Float32(0.5)) / Float32(8.0))
         var theta = Float32(tap) * Float32(2.39996323)
         var ox = s.fmul(search_r, s.float(r_norm * cos(theta)))
         var oy = s.fmul(search_r, s.float(r_norm * sin(theta)))
-        var dz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, s.fadd(lu, ox), s.fadd(lv, oy))
+        var tu = s.fmul(s.fadd(q_xf, s.nclamp(s.fadd(lu, ox), s.float(0.0002), s.float(0.9998))), atlas_sc)
+        var tv = s.fmul(s.fadd(q_yf, s.nclamp(s.fadd(lv, oy), s.float(0.0002), s.float(0.9998))), atlas_sc)
+        var dz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, tu, tv)
         s.begin_if(s.flt(dz, s.fsub(z_rec, z_bias)))
         s.store(blk_sum, s.fadd(s.load_f(blk_sum), dz))
         s.store(blk_cnt, s.fadd(s.load_f(blk_cnt), s.float(1.0)))
@@ -535,8 +831,8 @@ def emit_vsm_pcss_shadow(
     s.begin_if(s.fgt(bcnt, s.float(0.5)))
     var avg_blk = s.fdiv(s.load_f(blk_sum), bcnt)
     var penumbra_ratio = s.fdiv(s.nmax(s.float(0.0), s.fsub(z_rec, avg_blk)), s.nmax(s.float(0.04), avg_blk))
-    # Minimum 1.25 virtual texels (1.25 / 16384 = 0.000076) for crisp contact, scaling up with blocker distance!
-    var filter_r = s.nclamp(s.fmul(penumbra_ratio, search_r), s.float(0.000076), s.float(0.010))
+    var min_flt = s.select_f(is_casc, s.float(0.00015), s.float(0.000076))
+    var filter_r = s.nclamp(s.fmul(penumbra_ratio, search_r), min_flt, s.float(0.010))
 
     # 2. 12-Tap Golden-Angle Vogel-Disk PCF
     var lit_sum = s.fvar(s.float(0.0))
@@ -545,7 +841,9 @@ def emit_vsm_pcss_shadow(
         var pth = Float32(p_tap) * Float32(2.39996323) + Float32(0.62)
         var pox = s.fmul(filter_r, s.float(pr * cos(pth)))
         var poy = s.fmul(filter_r, s.float(pr * sin(pth)))
-        var pz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, s.fadd(lu, pox), s.fadd(lv, poy))
+        var ptu = s.fmul(s.fadd(q_xf, s.nclamp(s.fadd(lu, pox), s.float(0.0002), s.float(0.9998))), atlas_sc)
+        var ptv = s.fmul(s.fadd(q_yf, s.nclamp(s.fadd(lv, poy), s.float(0.0002), s.float(0.9998))), atlas_sc)
+        var pz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, ptu, ptv)
         var is_lit = s.select_f(s.flt(pz, s.fsub(z_rec, z_bias)), s.float(0.0), s.float(1.0))
         s.store(lit_sum, s.fadd(s.load_f(lit_sum), is_lit))
 

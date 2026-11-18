@@ -200,6 +200,14 @@ comptime FORMAT_R8G8B8A8_UNORM: UInt32 = 37
 comptime FORMAT_R16G16_SFLOAT: UInt32 = 83
 comptime FORMAT_R16G16B16A16_SFLOAT: UInt32 = 97
 comptime FORMAT_R32_UINT: UInt32 = 98
+
+
+@always_inline
+def swapchain_format_bytes_per_pixel(format: UInt32) -> Int:
+    """Returns exact texel byte stride for Vulkan swapchain formats (`8` for `R16G16B16A16_SFLOAT`, `4` for 32-bit SDR/HDR10)."""
+    if format == FORMAT_R16G16B16A16_SFLOAT:
+        return 8
+    return 4
 comptime FORMAT_R32_SFLOAT: UInt32 = 100
 comptime FORMAT_R32G32_UINT: UInt32 = 101
 comptime FORMAT_R32G32B32_SFLOAT: UInt32 = 106
@@ -334,6 +342,7 @@ struct VulkanAccelStruct(Copyable, Movable):
 struct SwapchainHandle(Copyable, Movable):
     var surface: Int
     var swapchain: Int
+    var vk_swapchain: Int
     var width: Int
     var height: Int
     var format: UInt32
@@ -345,6 +354,7 @@ struct SwapchainHandle(Copyable, Movable):
     def __init__(out self):
         self.surface = 0
         self.swapchain = 0
+        self.vk_swapchain = 0
         self.width = 0
         self.height = 0
         self.format = FORMAT_B8G8R8A8_UNORM
@@ -367,6 +377,7 @@ struct SwapchainHandle(Copyable, Movable):
     ):
         self.surface = surface
         self.swapchain = swapchain
+        self.vk_swapchain = swapchain
         self.width = width
         self.height = height
         self.format = format
@@ -515,6 +526,8 @@ struct VulkanGpu(Copyable, Movable):
     var has_swapchain: Bool
     var has_wayland_surface: Bool
     var has_xcb_surface: Bool
+    var has_xlib_surface: Bool
+    var has_swapchain_colorspace: Bool
     var has_display_surface: Bool  # VK_KHR_display + VK_EXT_acquire_drm_display: present with no compositor
     var display: Int  # the VkDisplayKHR taken from a KMS connector, released with the swapchain
     var api_version: UInt32
@@ -618,6 +631,8 @@ struct VulkanGpu(Copyable, Movable):
         self.display = 0
         self.has_wayland_surface = False
         self.has_xcb_surface = False
+        self.has_xlib_surface = False
+        self.has_swapchain_colorspace = False
         self.api_version = API_VERSION_1_2
         self.has_vulkan_13 = False
         self.has_dynamic_rendering = False
@@ -818,12 +833,20 @@ struct VulkanGpu(Copyable, Movable):
     def create_instance(mut self, validate: Bool) -> Bool:
         var offered = self.instance_extensions()
         var extensions = List[String]()
-        for wanted in ["VK_KHR_surface", "VK_KHR_wayland_surface", "VK_KHR_xcb_surface"]:
+        for wanted in [
+            "VK_KHR_surface",
+            "VK_KHR_wayland_surface",
+            "VK_KHR_xcb_surface",
+            "VK_KHR_xlib_surface",
+            "VK_EXT_swapchain_colorspace",
+        ]:
             if String(wanted) in offered:
                 extensions.append(String(wanted))
         var has_surf = False
         var has_wl = False
         var has_xcb = False
+        var has_xlib = False
+        var has_cs = False
         for ext in extensions:
             if ext == "VK_KHR_surface":
                 has_surf = True
@@ -831,8 +854,14 @@ struct VulkanGpu(Copyable, Movable):
                 has_wl = True
             elif ext == "VK_KHR_xcb_surface":
                 has_xcb = True
+            elif ext == "VK_KHR_xlib_surface":
+                has_xlib = True
+            elif ext == "VK_EXT_swapchain_colorspace":
+                has_cs = True
         self.has_wayland_surface = has_surf and has_wl
         self.has_xcb_surface = has_surf and has_xcb
+        self.has_xlib_surface = has_surf and has_xlib
+        self.has_swapchain_colorspace = has_surf and has_cs
         # Presenting straight to a KMS connector (platform/kms.mojo, GPU mode): all three or none.
         if has_surf and "VK_KHR_display" in offered and "VK_EXT_direct_mode_display" in offered and "VK_EXT_acquire_drm_display" in offered:
             extensions.append("VK_KHR_display")
@@ -1870,8 +1899,10 @@ struct VulkanGpu(Copyable, Movable):
         height: Int,
         prefer_mailbox: Bool = True,
         prefer_hdr10: Bool = False,
+        old_swapchain: UInt64 = 0,
+        prefer_immediate: Bool = False,
     ) -> Bool:
-        """Creates swapchain supporting FIFO/MAILBOX and SDR/HDR10 PQ."""
+        """Creates swapchain supporting FIFO/MAILBOX/IMMEDIATE and SDR/HDR10 PQ/Extended Linear sRGB."""
         self.rewind()
         var capabilities = self.scratch(52)
         if not self.check(call3(self.instance_call("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"), self.physical, self.surface, capabilities), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"):
@@ -1899,6 +1930,15 @@ struct VulkanGpu(Copyable, Movable):
                     chosen_color_space = cs
                     is_hdr = True
                     break
+            if not is_hdr:
+                for index in range(count):
+                    var fmt = get32(formats + index * 8)
+                    var cs = get32(formats + index * 8 + 4)
+                    if fmt == FORMAT_R16G16B16A16_SFLOAT and cs == COLOR_SPACE_EXTENDED_SRGB_LINEAR:
+                        chosen_format = fmt
+                        chosen_color_space = cs
+                        is_hdr = True
+                        break
 
         if not is_hdr:
             var found_sdr = False
@@ -1925,12 +1965,19 @@ struct VulkanGpu(Copyable, Movable):
         _ = call4(list_modes, self.physical, self.surface, count_slot, modes)
 
         var has_mailbox = False
+        var has_immediate = False
         for index in range(mode_count):
-            if get32(modes + index * 4) == PRESENT_MAILBOX:
+            var pm = get32(modes + index * 4)
+            if pm == PRESENT_MAILBOX:
                 has_mailbox = True
-                break
+            elif pm == PRESENT_IMMEDIATE:
+                has_immediate = True
 
-        var chosen_present_mode = PRESENT_MAILBOX if (prefer_mailbox and has_mailbox) else PRESENT_FIFO
+        var chosen_present_mode = PRESENT_FIFO
+        if prefer_immediate and has_immediate:
+            chosen_present_mode = PRESENT_IMMEDIATE
+        elif prefer_mailbox and has_mailbox:
+            chosen_present_mode = PRESENT_MAILBOX
         self.swapchain_present_mode = chosen_present_mode
 
         var minimum = get32(capabilities)
@@ -1950,6 +1997,7 @@ struct VulkanGpu(Copyable, Movable):
         if (sup_usages & IMAGE_USAGE_STORAGE) != 0:
             usage_flags |= IMAGE_USAGE_STORAGE
 
+        var prev_sc = Int(old_swapchain) if old_swapchain != 0 else self.swapchain
         var info = self.scratch(104)
         put32(info, TYPE_SWAPCHAIN_CREATE_INFO)
         put64(info + 24, self.surface)
@@ -1965,7 +2013,7 @@ struct VulkanGpu(Copyable, Movable):
         put32(info + 84, COMPOSITE_OPAQUE if (alphas & COMPOSITE_OPAQUE) != 0 else (alphas & (~alphas + 1)))
         put32(info + 88, chosen_present_mode)
         put32(info + 92, 1)
-        put64(info + 96, self.swapchain)
+        put64(info + 96, prev_sc)
         var slot = self.scratch(8)
         if not self.check(call4(self.device_call("vkCreateSwapchainKHR"), self.device, info, 0, slot), "vkCreateSwapchainKHR"):
             return False
@@ -1975,7 +2023,9 @@ struct VulkanGpu(Copyable, Movable):
             for v_idx in range(len(self.image_views)):
                 self.destroy_image_view(self.image_views[v_idx])
             self.image_views.clear()
-        if replaced != 0:
+        if prev_sc != 0 and prev_sc != self.swapchain:
+            _ = call3(self.device_call("vkDestroySwapchainKHR"), self.device, prev_sc, 0)
+        if replaced != 0 and replaced != prev_sc and replaced != self.swapchain:
             _ = call3(self.device_call("vkDestroySwapchainKHR"), self.device, replaced, 0)
         self.swapchain_width = Int(final_w)
         self.swapchain_height = Int(final_h)
@@ -2026,8 +2076,27 @@ struct VulkanGpu(Copyable, Movable):
         put32(barrier + 64, 1)
         _ = call10(self.fn_pipeline_barrier, self.command_buffers[frame], source_stage, target_stage, 0, 0, 0, 0, 0, 1, barrier)
 
-    def copy_to_image(mut self, frame: Int, source: GpuBuffer, row_pixels: Int, image: Int, buffer_offset: UInt64 = 0):
+    def copy_to_image(
+        mut self,
+        frame: Int,
+        source: GpuBuffer,
+        row_pixels: Int,
+        image: Int,
+        buffer_offset: UInt64 = 0,
+        copy_width: Int = 0,
+        copy_height: Int = 0,
+    ):
         """The finished frame, into the swapchain image, ready to present."""
+        var cw = min(copy_width, self.swapchain_width) if copy_width > 0 else self.swapchain_width
+        var ch = min(copy_height, self.swapchain_height) if copy_height > 0 else self.swapchain_height
+        cw = max(1, min(cw, row_pixels)) if row_pixels > 0 else max(1, cw)
+        ch = max(1, ch)
+        var bpp = swapchain_format_bytes_per_pixel(self.swapchain_format)
+        var stride_px = max(cw, row_pixels)
+        var needed_bytes = Int(buffer_offset) + ((ch - 1) * stride_px + cw) * bpp
+        if source.vk_buffer == 0 or source.size < needed_bytes:
+            self.error = "copy_to_image source buffer byte size is smaller than target swapchain format stride"
+            return
         self.barrier(frame, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_TRANSFER, ACCESS_TRANSFER_READ)
         self.image_barrier(frame, image, LAYOUT_UNDEFINED, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
         self.rewind()
@@ -2036,8 +2105,8 @@ struct VulkanGpu(Copyable, Movable):
         put32(region + 8, UInt32(row_pixels))
         put32(region + 16, ASPECT_COLOR)
         put32(region + 28, 1)
-        put32(region + 44, UInt32(self.swapchain_width))
-        put32(region + 48, UInt32(self.swapchain_height))
+        put32(region + 44, UInt32(cw))
+        put32(region + 48, UInt32(ch))
         put32(region + 52, 1)
         _ = call6(self.device_call("vkCmdCopyBufferToImage"), self.command_buffers[frame], source.vk_buffer, self.images[image], Int(LAYOUT_TRANSFER_TARGET), 1, region)
         self.image_barrier(frame, image, LAYOUT_TRANSFER_TARGET, LAYOUT_PRESENT, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_BOTTOM, 0)

@@ -1,0 +1,31 @@
+"""`flint.scene` — Flint v5 Transform Hierarchy, Nested Prefabs & `.flscn`/`.flscnb` Scene Graph."""
+from flint.scene.transform_hierarchy import (
+    INLINE_CHILD_CAP,
+    SerializableComponent,
+    LocalTransform,
+    GlobalTransform,
+    PrevGlobalTransform,
+    Parent,
+    Children,
+    HierarchyDepth,
+    register_transform_components,
+    set_parent,
+    clear_parent,
+    snapshot_prev_global_transforms,
+    propagate_transforms_parallel,
+    interpolate_global_transform,
+    interpolate_entity_transform,
+    TransformPlugin,
+)
+from flint.scene.scene import (
+    SCENE_BIN_MAGIC,
+    SCENE_SCHEMA_VERSION,
+    MAX_PREFAB_NEST_DEPTH,
+    ComponentCodecEntry,
+    ComponentRegistry,
+    PrefabOverride,
+    NestedPrefabRef,
+    PrefabNode,
+    Prefab,
+    Scene,
+)

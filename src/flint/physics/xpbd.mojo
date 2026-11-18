@@ -13,11 +13,16 @@ Upgrades in v4:
 from std.collections import List
 from std.math import sqrt, max, min, abs
 from flint.core.math import Vec3
+from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.physics.solver_bodies import SolverBodies, rotate_vec
 
 
 comptime LINK_EQUAL: Int = 0
 comptime LINK_MIN: Int = 1
+comptime XPBD_CHAIN_TAG: UInt32 = fourcc("XPBC")
+comptime XPBD_MESH_TAG: UInt32 = fourcc("XPBM")
+comptime XPBD_ATT_TAG: UInt32 = fourcc("XPBA")
+comptime XPBD_BLOB_VERSION: Int = 1
 
 
 struct ChainCollider(Copyable, ImplicitlyCopyable, Movable):
@@ -78,6 +83,26 @@ struct RigidAttachment(Copyable, ImplicitlyCopyable, Movable):
         self.rest_length = rest_length
         self.compliance = compliance
         self.lam = 0.0
+
+    def serialize(self, mut w: BlobWriter):
+        w.begin(XPBD_ATT_TAG, XPBD_BLOB_VERSION)
+        w.integer(self.particle)
+        w.integer(self.solver_body)
+        w.vec3(self.local_anchor)
+        w.f32(self.rest_length)
+        w.f32(self.compliance)
+        w.f32(self.lam)
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        _ = r.enter(XPBD_ATT_TAG, XPBD_BLOB_VERSION)
+        self.particle = r.integer()
+        self.solver_body = r.integer()
+        self.local_anchor = r.vec3()
+        self.rest_length = r.f32()
+        self.compliance = r.f32()
+        self.lam = r.f32()
+        r.leave()
 
 
 @always_inline
@@ -297,6 +322,63 @@ struct ParticleChain(Copyable, Movable):
                 if self.position[i].y < self.floor:
                     self.position[i].y = self.floor
                 self.velocity[i] = (self.position[i] - self.previous[i]) * (Float32(1.0) / h)
+
+    def serialize(self, mut w: BlobWriter):
+        """Bit-exact snapshot of XPBD `ParticleChain` including `lambdas`."""
+        w.begin(XPBD_CHAIN_TAG, XPBD_BLOB_VERSION)
+        var n_p = len(self.position)
+        w.integer(n_p)
+        for i in range(n_p):
+            w.vec3(self.position[i])
+            w.vec3(self.previous[i])
+            w.vec3(self.velocity[i])
+            w.f32(self.inv_mass[i])
+        var n_r = len(self.rest)
+        w.integer(n_r)
+        for i in range(n_r):
+            w.f32(self.rest[i])
+        var n_lam = len(self.lambdas)
+        w.integer(n_lam)
+        for i in range(n_lam):
+            w.f32(self.lambdas[i])
+        w.f32(self.compliance)
+        w.f32(self.damping)
+        w.f32(self.wind_drag)
+        w.f32(self.floor)
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        """Restores bit-exact `ParticleChain` state from `BlobReader`."""
+        _ = r.enter(XPBD_CHAIN_TAG, XPBD_BLOB_VERSION)
+        var n_p = r.integer()
+        if n_p < 0 or n_p > 1 << 20:
+            raise Error("xpbd chain blob: invalid particle count")
+        self.position.clear()
+        self.previous.clear()
+        self.velocity.clear()
+        self.inv_mass.clear()
+        for _ in range(n_p):
+            self.position.append(r.vec3())
+            self.previous.append(r.vec3())
+            self.velocity.append(r.vec3())
+            self.inv_mass.append(r.f32())
+        var n_r = r.integer()
+        if n_r < 0 or n_r > 1 << 20:
+            raise Error("xpbd chain blob: invalid link count")
+        self.rest.clear()
+        for _ in range(n_r):
+            self.rest.append(r.f32())
+        var n_lam = r.integer()
+        if n_lam < 0 or n_lam > 1 << 20:
+            raise Error("xpbd chain blob: invalid lambda count")
+        self.lambdas.clear()
+        for _ in range(n_lam):
+            self.lambdas.append(r.f32())
+        self.compliance = r.f32()
+        self.damping = r.f32()
+        self.wind_drag = r.f32()
+        self.floor = r.f32()
+        r.leave()
 
 
 struct ParticleMesh(Copyable, Movable):
@@ -536,3 +618,91 @@ struct ParticleMesh(Copyable, Movable):
                     if self.position[i].y < ground:
                         self.position[i].y = ground
                 self.velocity[i] = v
+
+    def serialize(self, mut w: BlobWriter):
+        """Bit-exact snapshot of XPBD `ParticleMesh` including `lambdas`."""
+        w.begin(XPBD_MESH_TAG, XPBD_BLOB_VERSION)
+        var n_p = len(self.position)
+        w.integer(n_p)
+        for i in range(n_p):
+            w.vec3(self.position[i])
+            w.vec3(self.previous[i])
+            w.vec3(self.velocity[i])
+            w.f32(self.inv_mass[i])
+            w.f32(self.radius[i])
+            w.f32(self.floor[i])
+            w.vec3(self.target[i])
+            w.f32(self.power[i])
+            w.vec3(self.accel[i])
+        var n_l = len(self.link_a)
+        w.integer(n_l)
+        for k in range(n_l):
+            w.integer(self.link_a[k])
+            w.integer(self.link_b[k])
+            w.f32(self.rest[k])
+            w.f32(self.link_compliance[k])
+            w.integer(self.link_kind[k])
+        var n_lam = len(self.lambdas)
+        w.integer(n_lam)
+        for k in range(n_lam):
+            w.f32(self.lambdas[k])
+        w.f32(self.damping)
+        w.f32(self.wind_drag)
+        w.f32(self.friction)
+        w.f32(self.gravity_scale)
+        w.integer(self.touching)
+        w.integer(self.steps_run)
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        """Restores bit-exact `ParticleMesh` state from `BlobReader`."""
+        _ = r.enter(XPBD_MESH_TAG, XPBD_BLOB_VERSION)
+        var n_p = r.integer()
+        if n_p < 0 or n_p > 1 << 20:
+            raise Error("xpbd mesh blob: invalid particle count")
+        self.position.clear()
+        self.previous.clear()
+        self.velocity.clear()
+        self.inv_mass.clear()
+        self.radius.clear()
+        self.floor.clear()
+        self.target.clear()
+        self.power.clear()
+        self.accel.clear()
+        for _ in range(n_p):
+            self.position.append(r.vec3())
+            self.previous.append(r.vec3())
+            self.velocity.append(r.vec3())
+            self.inv_mass.append(r.f32())
+            self.radius.append(r.f32())
+            self.floor.append(r.f32())
+            self.target.append(r.vec3())
+            self.power.append(r.f32())
+            self.accel.append(r.vec3())
+        var n_l = r.integer()
+        if n_l < 0 or n_l > 1 << 21:
+            raise Error("xpbd mesh blob: invalid link count")
+        self.link_a.clear()
+        self.link_b.clear()
+        self.rest.clear()
+        self.link_compliance.clear()
+        self.link_kind.clear()
+        for _ in range(n_l):
+            self.link_a.append(r.integer())
+            self.link_b.append(r.integer())
+            self.rest.append(r.f32())
+            self.link_compliance.append(r.f32())
+            self.link_kind.append(r.integer())
+        var n_lam = r.integer()
+        if n_lam < 0 or n_lam > 1 << 21:
+            raise Error("xpbd mesh blob: invalid lambda count")
+        self.lambdas.clear()
+        for _ in range(n_lam):
+            self.lambdas.append(r.f32())
+        self.damping = r.f32()
+        self.wind_drag = r.f32()
+        self.friction = r.f32()
+        self.gravity_scale = r.f32()
+        self.touching = r.integer()
+        self.steps_run = r.integer()
+        r.leave()

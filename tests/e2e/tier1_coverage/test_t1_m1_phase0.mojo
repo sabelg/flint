@@ -232,7 +232,7 @@ def test_f04_rt_custom_index_packing(mut ctx: TestContext) raises:
     var mat = Mat4()
     write_vk_as_instance_64b(addr, mat, 500, 0xCAFEBABE, cull_disable=True)
     var flags = get32(addr + 52)
-    ctx.assert_equal(Int(flags >> 24), 1, "cull_disable sets flag bit 1")
+    ctx.assert_equal(Int((flags >> 24) & 1), 1, "cull_disable sets flag bit 1")
     var blas_addr = get64(addr + 56)
     ctx.assert_equal(blas_addr, 0xCAFEBABE, "blas 64-bit device address matches")
     _ = external_call["free", NoneType](addr)

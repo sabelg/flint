@@ -210,6 +210,7 @@ struct WaylandWindow(Copyable, Movable):
     var using_kms: Bool
     var wants_kms_vulkan: Bool  # on KMS, leave the display to a Vulkan swapchain (KmsWindow GPU mode)
     var wants_gpu_fullscreen: Bool  # a GPU game: Vulkan bridge + fullscreen, swapchain scaled by the compositor
+    var swapchain: SwapchainHandle
     var gpu_width: Int  # size of the swapchain attach_vulkan made on Wayland, 0 when none
     var gpu_height: Int
     var window_title: String
@@ -287,6 +288,7 @@ struct WaylandWindow(Copyable, Movable):
         self.using_kms = False
         self.wants_kms_vulkan = False
         self.wants_gpu_fullscreen = False
+        self.swapchain = SwapchainHandle()
         self.gpu_width = 0
         self.gpu_height = 0
         self.window_title = "FLINT ENGINE"
@@ -784,21 +786,28 @@ struct WaylandWindow(Copyable, Movable):
             return False
         return True
 
+    def enable_vulkan_bridge(mut self):
+        """Enables `WaylandBridge` before `initialize()` so windowed Wayland sessions can attach zero-copy Vulkan swapchains."""
+        self.wants_bridge = True
+
     def attach_vulkan(mut self, mut vk: VulkanGpu, width: Int, height: Int, prefer_mailbox: Bool = True, prefer_hdr10: Bool = False) -> SwapchainHandle:
         """A swapchain on whatever this window is, so a game presents zero-copy without
         knowing the backend. width x height is the renderer's output size.
-        - Wayland: needs `wants_gpu_fullscreen` (or `wants_bridge`) set before initialize(),
+        - Wayland: needs `wants_gpu_fullscreen` (or `wants_bridge` / `enable_vulkan_bridge()`) set before initialize(),
           for the Vulkan driver's own connection to the compositor. The swapchain keeps its
           size; the compositor scales it to the window (wp_viewporter), aspect-fit when
           fullscreen, so a fullscreen game can be scanned out with no copy at all.
         - KMS: Vulkan takes the display at a mode of exactly that size (KmsWindow.attach_vulkan).
-        - X11: none, this X11 client has no XCB connection to give Vulkan.
+        - X11: none on bare X11Window (use `SwapchainSurface` with `X11VulkanBridge` for `VK_KHR_xcb_surface`).
         An empty handle (`swapchain == 0`) means keep presenting CPU frames with present(),
-        which still works. When it is not empty present() does nothing on KMS, so draw HUDs
+        which still works. When it is not empty present() does nothing, so draw HUDs
         on the GPU. Call `vk.close_swapchain()` before close()."""
         if self.using_kms:
-            return self.kms.attach_vulkan(vk, width, height, prefer_hdr10)
+            var sc_kms = self.kms.attach_vulkan(vk, width, height, prefer_hdr10)
+            self.swapchain = sc_kms.copy()
+            return sc_kms^
         if self.using_x11 or not self.bridge.active() or self.bridge.surface_proxy == 0:
+            self.swapchain = SwapchainHandle()
             return SwapchainHandle()
         var sc = vk.attach_surface(
             wl_display=self.bridge.display,
@@ -808,6 +817,7 @@ struct WaylandWindow(Copyable, Movable):
             prefer_mailbox=prefer_mailbox,
             prefer_hdr10=prefer_hdr10,
         )
+        self.swapchain = sc.copy()
         if sc.swapchain != 0:
             self.gpu_width = sc.width
             self.gpu_height = sc.height
@@ -817,6 +827,7 @@ struct WaylandWindow(Copyable, Movable):
     def detach_vulkan(mut self, mut vk: VulkanGpu) -> Bool:
         """Undo attach_vulkan: close the swapchain and go back to present() with CPU frames
         (on KMS this sets the window's own mode again). True when present() works again."""
+        self.swapchain = SwapchainHandle()
         if self.using_kms:
             return self.kms.detach_vulkan(vk)
         vk.close_swapchain()
@@ -825,8 +836,8 @@ struct WaylandWindow(Copyable, Movable):
         return self.fd >= 0 or self.using_x11
 
     def presents_on_gpu(self) -> Bool:
-        """True once a Vulkan swapchain owns the KMS display (present() is then a no-op)."""
-        return self.using_kms and self.kms.for_vulkan and len(self.kms.fb_ids) == 0
+        """True once a Vulkan swapchain owns presentation on KMS, Wayland, or X11 (present() is then a no-op)."""
+        return (self.using_kms and self.kms.for_vulkan and len(self.kms.fb_ids) == 0) or self.swapchain.vk_swapchain != 0
 
     def start_kms(mut self, width: Int, height: Int) -> Bool:
         """Draw straight to the display through DRM/KMS (platform/kms.mojo)."""
@@ -1017,6 +1028,8 @@ struct WaylandWindow(Copyable, Movable):
         source_height: Int,
         opaque_already_set: Bool = False,
     ):
+        if self.swapchain.vk_swapchain != 0:
+            return
         if self.using_kms:
             self.kms.present(pixels, source_width, source_height)
             self.close_requested = self.kms.close_requested
@@ -1264,6 +1277,9 @@ struct WaylandWindow(Copyable, Movable):
         return True
 
     def close(mut self):
+        self.swapchain = SwapchainHandle()
+        self.gpu_width = 0
+        self.gpu_height = 0
         if self.using_kms:
             self.kms.close()
             self.using_kms = False

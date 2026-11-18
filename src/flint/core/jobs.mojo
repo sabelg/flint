@@ -293,6 +293,7 @@ struct JobPool(Copyable, Movable):
         The job's own chunks come first, so a frame is not held up by unrelated
         work while what it is waiting for could be running here.
         """
+        set_sim_float_mode()
         if job == NO_JOB:
             return
         while not self.finished(job):
@@ -342,6 +343,7 @@ struct JobPool(Copyable, Movable):
         thread, so the job holds one ring cell however many threads work on it.
         Losing that push to a full ring costs parallelism, never work.
         """
+        set_sim_float_mode()
         var chunk = self.claim(job)
         if chunk < 0:
             return False
@@ -487,6 +489,7 @@ struct JobPool(Copyable, Movable):
         if chunks <= 0:
             return
         if not self.allocated() or self.workers <= 0 or chunks == 1:
+            set_sim_float_mode()
             for chunk in range(chunks):
                 body(context, chunk)
             return
@@ -579,6 +582,7 @@ def run_jobs(pool_address: Int, body: JobBody, context: Int, chunks: Int, zone: 
         if pool.allocated():
             pool.run(body, context, chunks, zone)
             return
+    set_sim_float_mode()
     for chunk in range(chunks):
         body(context, chunk)
 
@@ -592,5 +596,6 @@ def run_jobs_affine(pool_address: Int, body: JobBody, context: Int, chunks: Int,
         if pool.allocated():
             pool.run_affine(body, context, chunks, zone)
             return
+    set_sim_float_mode()
     for chunk in range(chunks):
         body(context, chunk)

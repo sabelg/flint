@@ -195,7 +195,7 @@ def test_b_f04_instance_index_large(mut ctx: TestContext) raises:
     var mat = trs(Vec3(0, 0, 0), Quat(), Vec3(1, 1, 1))
     write_vk_as_instance_64b(addr, mat, 0xFFFFFF, 0x55556666, cull_disable=False)
     var flags = get32(addr + 52)
-    ctx.assert_equal(Int(flags >> 24), 0, "cull_disable=False sets flag bit 0")
+    ctx.assert_equal(Int((flags >> 24) & 1), 0, "cull_disable=False sets flag bit 0")
     _ = external_call["free", NoneType](addr)
 
 def test_b_f04_custom24_mask_boundary(mut ctx: TestContext) raises:

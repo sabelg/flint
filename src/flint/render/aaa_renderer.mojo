@@ -59,6 +59,7 @@ from flint.platform.vulkan import (
     FORMAT_BC7_UNORM,
     FORMAT_D32_SFLOAT,
     FORMAT_R16G16_SFLOAT,
+    FORMAT_R16G16B16A16_SFLOAT,
     FORMAT_R32G32_UINT,
     IMAGE_USAGE_COLOR_ATTACHMENT,
     IMAGE_USAGE_DEPTH_ATTACHMENT,
@@ -92,10 +93,12 @@ from flint.platform.vulkan import (
 from flint.render.font import SdfFont
 from flint.ui.draw_list import UiDrawList, GpuUiPrim
 from flint.render.ui_overlay import aaa_ui_overlay_shader, AAA_POST_UI_PRIMS_BASE_OFFSET
+from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 from flint.render.aaa_visbuffer import (
     AAA_INSTANCE_WORDS,
     AAA_MAX_BINDLESS,
     AAA_PUSH_BYTES,
+    AAA_PUSH_WORDS,
     AAA_SINGLE_SAMPLERS,
     AAA_STORAGE_COUNT,
     BIND_AAA_BINDLESS_TEX,
@@ -130,14 +133,30 @@ from flint.render.aaa_visbuffer import (
     visbuffer_vertex_shader,
 )
 from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AaaMaterial
+from flint.render.material_graph import (
+    MaterialAsset,
+    SurfaceMaterialNode,
+    compile_surface_material_shader,
+)
 from flint.render.aaa_vsm import (
+    VSM_CASCADE_COUNT,
+    VSM_CASCADE_PAGES_DIM,
+    VSM_GLOBALS_CASCADE_FLAG_WORD,
+    VSM_GLOBALS_CASCADE_1_WORD,
+    VSM_GLOBALS_CASCADE_2_WORD,
+    VSM_GLOBALS_CASCADE_3_WORD,
     VSM_PAGE_TEXELS,
     VSM_PHYS_ATLAS_RES,
     VSM_TABLE_WORDS,
     VsmPageManager,
+    compute_vsm_cascade_matrices,
+    compute_vsm_cascade_page_origins,
     make_ortho_directional_light_vp,
     vsm_alphamask_fragment_shader,
     vsm_alphamask_vertex_shader,
+    vsm_cascade_from_virtual_page,
+    vsm_cascade_globals_word_offset,
+    vsm_cascade_quadrant_origin,
     vsm_mark_pages_shader,
     vsm_page_vertex_shader,
 )
@@ -270,6 +289,40 @@ from flint.render.aaa_render_graph import (
 )
 
 
+comptime AAA_DISPLAY_SCRGB_FP16: UInt32 = 3  # Extended Linear scRGB (`VK_FORMAT_R16G16B16A16_SFLOAT`, `1.0 = 80 nits`, `8` bytes/px)
+
+
+def aaa_pack_scrgb_rgba16f_shader() -> List[UInt32]:
+    """Packs resolved linear Rec.709 HDR (`BIND_AAA_HDR_OUT`) into `8`-byte/pixel `R16G16B16A16_SFLOAT` (`RGBA16F`)
+    Extended Linear scRGB (`1.0 = 80 nits`, `paper_white_nits / 80.0 = 2.5375`) inside `BIND_AAA_POST_SCRATCH`.
+    Push[0]=out_w, Push[1]=out_h, Push[2]=out_scrgb_word_off, Push[3]=scrgb_scale_f32.
+    """
+    var s = AaaSpirvModule(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
+    var b_hdr = s.buffer(BIND_AAA_HDR_OUT)
+    var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
+
+    var dx = s.invocation_axis(0)
+    var dy = s.invocation_axis(1)
+    var dst_w = s.push_word(0)
+    var dst_h = s.push_word(1)
+    var out_off = s.push_word(2)
+    var sc_scale = s.push_float(3)
+    s.return_if(s.logical_or(s.uge(dx, dst_w), s.uge(dy, dst_h)))
+
+    var dst_pix = s.iadd(s.imul(dy, dst_w), dx)
+    var h_base = s.imul(dst_pix, s.uint(8))
+    var r_lin = s.fmul(s.load_float(b_hdr, h_base), sc_scale)
+    var g_lin = s.fmul(s.load_float(b_hdr, s.iadd(h_base, s.uint(1))), sc_scale)
+    var b_lin = s.fmul(s.load_float(b_hdr, s.iadd(h_base, s.uint(2))), sc_scale)
+
+    var w0 = s.pack_f16x2(r_lin, g_lin)
+    var w1 = s.pack_f16x2(b_lin, s.float(1.0))
+    var dst_word = s.iadd(out_off, s.imul(dst_pix, s.uint(2)))
+    s.store_word(b_post, dst_word, w0)
+    s.store_word(b_post, s.iadd(dst_word, s.uint(1)), w1)
+    return s.finish()
+
+
 struct AaaDrawInstance(Copyable, Movable):
     var mesh_id: Int
     var world_mat: Mat4
@@ -351,7 +404,7 @@ comptime UploadedModelSlots = AaaUploadedModel
 
 
 comptime FRAMES_IN_FLIGHT: Int = 2
-comptime AAA_UI_PRIM_REGION_WORDS: Int = 4096 * 16  # 4096 GpuUiPrim (64 bytes) per frame in flight
+comptime AAA_UI_PRIM_REGION_WORDS: Int = 32768 * 16  # 32768 GpuUiPrim (64 bytes = 2 MiB) per frame in flight
 # Per-slot timestamp query range: 64 per-pass queries + 1 whole-frame TOP/BOTTOM pair.
 comptime AAA_QUERY_SLOT_STRIDE: Int = 66
 comptime AAA_QUERY_FRAME_PAIR: Int = 64
@@ -401,6 +454,10 @@ struct FlintAaaVulkanRenderer(Movable):
     # is attached, `render_frame()` submits without waiting; the next `render_frame()` waits on that fence,
     # so `readback_pixels_into()` returns the previous frame. `capture_readback=True` stays synchronous.
     var deferred_readback: Bool
+    var force_readback: Bool
+    var enable_vsm_clipmap_cascades: Bool
+    var vsm_cascade_matrices: List[List[Float32]]
+    var vsm_cascade_page_origins: List[Tuple[Int, Int]]
     var readback_extra: List[GpuBuffer]  # per-slot readback buffers for slots >= 1 (slot 0 = `buf_ldr_readback`)
     var readback_ready_slot: Int  # slot whose readback buffer holds the latest completed frame
     var pending_slot: Int  # slot of a submitted-but-not-yet-waited deferred frame (-1 = none)
@@ -410,6 +467,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
     # UI Overlay Pass (Feature 15)
     var pipe_ui_overlay: Int
+    var pipe_scrgb_pack: Int
     var ui_draw_list: UiDrawList
     var ui_font: SdfFont
     var ui_font_img: VulkanImage
@@ -716,6 +774,10 @@ struct FlintAaaVulkanRenderer(Movable):
         self.last_cpu_vsm_table_ms = 0.0
         self.last_cpu_vsm_requests_ms = 0.0
         self.deferred_readback = False
+        self.force_readback = False
+        self.enable_vsm_clipmap_cascades = True
+        self.vsm_cascade_matrices = List[List[Float32]]()
+        self.vsm_cascade_page_origins = List[Tuple[Int, Int]]()
         self.readback_extra = List[GpuBuffer]()
         self.readback_ready_slot = 0
         self.pending_slot = -1
@@ -724,6 +786,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pending_n_inst = 0
 
         self.pipe_ui_overlay = 0
+        self.pipe_scrgb_pack = 0
         self.ui_draw_list = UiDrawList()
         self.ui_font = SdfFont()
         self.ui_font_img = VulkanImage()
@@ -1048,6 +1111,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_motion_blur = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_motion_blur_shader())
         self.pipe_display_tonemap = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_display_tonemap_shader())
         self.pipe_ui_overlay = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_ui_overlay_shader())
+        self.pipe_scrgb_pack = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_pack_scrgb_rgba16f_shader())
 
         if (
             self.pipe_meshlet_cull == 0
@@ -1082,6 +1146,7 @@ struct FlintAaaVulkanRenderer(Movable):
             or self.pipe_motion_blur == 0
             or self.pipe_display_tonemap == 0
             or self.pipe_ui_overlay == 0
+            or self.pipe_scrgb_pack == 0
         ):
             return False
 
@@ -1571,6 +1636,110 @@ struct FlintAaaVulkanRenderer(Movable):
             "memcpy", Int
         ](self.buf_materials.cpu_address + mat_id * AAA_MATERIAL_WORDS * 4, Int(words.unsafe_ptr()), len(words) * 4)
         _ = len(words)
+
+    def add_material_asset(mut self, mat: MaterialAsset) -> Int:
+        """Uploads a unified `24`-word (`AAA_MATERIAL_WORDS`) `MaterialAsset` directly into `buf_materials` (`Binding 4`)."""
+        return self.add_material(mat.to_aaa_material())
+
+    def update_material_asset(mut self, mat_id: Int, mat: MaterialAsset):
+        """Updates an existing material slot in `buf_materials` (`Binding 4`) from a `MaterialAsset`."""
+        self.update_material(mat_id, mat.to_aaa_material())
+
+    def evaluate_material_graph_to_bindless[
+        NodeT: SurfaceMaterialNode
+    ](
+        mut self,
+        node: NodeT,
+        mat_id: Int,
+        dim: Int = 32,
+        time_sec: Float32 = 0.0,
+        world_y_scale: Float32 = 24.0,
+    ) -> Tuple[Int, Int]:
+        """Compiles & dispatches `node` (`SurfaceMaterialNode`) on Vulkan against live `buf_materials` (`Binding 4`, stride `24`)
+        and `BIND_AAA_BINDLESS_TEX`, bakes the GPU-evaluated surface response into bindless `BC7` Albedo + ORM textures,
+        and binds them onto `mat_id` for 3D VisBuffer + Hardware RT shading! Returns `(albedo_slot, orm_slot)`."""
+        if not self.active or mat_id < 0 or mat_id >= len(self.materials):
+            return (-1, -1)
+        var tex_dim = max(8, min(256, (dim + 3) & ~3))
+        var spv = compile_surface_material_shader(node)
+        var pipe = self.vk.create_aaa_compute_pipeline(self.pipe_layout, spv)
+        if pipe == 0:
+            return (-1, -1)
+
+        var out_word_off = AAA_POST_BLOOM_BASE
+        var out_words = tex_dim * tex_dim * 8
+        if (out_word_off + out_words) * 4 > self.buf_post_scratch.size:
+            self.vk.destroy_pipeline(pipe)
+            return (-1, -1)
+
+        if not self.vk.begin_commands(0):
+            self.vk.destroy_pipeline(pipe)
+            return (-1, -1)
+        var push_mg = List[UInt32](length=16, fill=0)
+        push_mg[0] = UInt32(tex_dim)
+        push_mg[1] = UInt32(tex_dim)
+        push_mg[2] = UInt32(mat_id)
+        push_mg[3] = bitcast[DType.uint32](time_sec)
+        push_mg[4] = UInt32(out_word_off)
+        push_mg[5] = bitcast[DType.uint32](world_y_scale)
+        self.vk.dispatch_aaa(
+            0,
+            pipe,
+            self.pipe_layout,
+            self.desc_sets[0],
+            push_mg,
+            (tex_dim + 7) // 8,
+            (tex_dim + 7) // 8,
+        )
+        self.vk.memory_barrier2(
+            0, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ)
+        )
+        var f_mg = self.vk.submit(0)
+        if f_mg != 0:
+            _ = self.vk.wait(f_mg)
+        self.vk.destroy_pipeline(pipe)
+        if f_mg == 0:
+            return (-1, -1)
+
+        var eval_f = List[Float32](length=out_words, fill=0.0)
+        _ = external_call[
+            "memcpy", Int
+        ](Int(eval_f.unsafe_ptr()), self.buf_post_scratch.cpu_address + out_word_off * 4, out_words * 4)
+
+        var alb_argb = List[UInt32](length=tex_dim * tex_dim, fill=0xFFFFFFFF)
+        var orm_argb = List[UInt32](length=tex_dim * tex_dim, fill=0xFFFFFFFF)
+        for p_i in range(tex_dim * tex_dim):
+            var b_off = p_i * 8
+            var rl = max(Float32(0.0), min(Float32(1.0), eval_f[b_off + 0]))
+            var gl = max(Float32(0.0), min(Float32(1.0), eval_f[b_off + 1]))
+            var bl = max(Float32(0.0), min(Float32(1.0), eval_f[b_off + 2]))
+            var rgh = max(Float32(0.04), min(Float32(1.0), eval_f[b_off + 3]))
+            var met = max(Float32(0.0), min(Float32(1.0), eval_f[b_off + 4]))
+            var opa = max(Float32(0.0), min(Float32(1.0), eval_f[b_off + 6]))
+
+            # Encode linear RGB -> sRGB 8-bit (`BC7_SRGB` hardware decode restores exact linear RGB!)
+            var rs = UInt32(min(255, max(0, Int(sqrt(rl) * Float32(255.0) + Float32(0.5)))))
+            var gs = UInt32(min(255, max(0, Int(sqrt(gl) * Float32(255.0) + Float32(0.5)))))
+            var bs = UInt32(min(255, max(0, Int(sqrt(bl) * Float32(255.0) + Float32(0.5)))))
+            var a8 = UInt32(min(255, max(0, Int(opa * Float32(255.0) + Float32(0.5)))))
+            alb_argb[p_i] = (a8 << 24) | (rs << 16) | (gs << 8) | bs
+
+            var rgh8 = UInt32(min(255, max(10, Int(rgh * Float32(255.0) + Float32(0.5)))))
+            var met8 = UInt32(min(255, max(0, Int(met * Float32(255.0) + Float32(0.5)))))
+            orm_argb[p_i] = UInt32(0xFF000000) | (UInt32(255) << 16) | (rgh8 << 8) | met8
+        _ = len(eval_f)
+
+        var alb_slot = self.upload_bc7_texture(alb_argb, tex_dim, tex_dim, srgb=True, generate_mips=True)
+        var orm_slot = self.upload_bc7_texture(orm_argb, tex_dim, tex_dim, srgb=False, generate_mips=True)
+        if alb_slot >= 0 and orm_slot >= 0:
+            var upd = self.materials[mat_id].copy()
+            upd.base_color = Vec3(1.0, 1.0, 1.0)
+            upd.roughness = Float32(1.0)
+            upd.metallic = Float32(1.0)
+            upd.albedo_tex = alb_slot
+            upd.orm_tex = orm_slot
+            self.update_material(mat_id, upd)
+        return (alb_slot, orm_slot)
 
     def add_mesh(mut self, mesh: NativeMesh, material_id: Int, build_lods: Bool = False) -> CookedMeshEntry:
         """Partitions `mesh` into 64v/124t GPU Meshlets (and optional `QEM` `LOD 0..3` DAG), uploads SSBOs, and builds `BLAS`!"""
@@ -2531,6 +2700,15 @@ struct FlintAaaVulkanRenderer(Movable):
         if n_pages == 0 or n_inst == 0:
             return (0, page_offsets^, page_counts^, page_am_offsets^, page_am_counts^)
 
+        var use_vsm_casc = self.enable_vsm_clipmap_cascades and len(self.vsm_cascade_matrices) >= VSM_CASCADE_COUNT
+        var base_vsm_ext = max(Float32(1.0), self.vsm_ortho_half_extent)
+
+        var casc_has_dirty = List[Bool](length=VSM_CASCADE_COUNT, fill=False)
+        var casc_min_vx = List[Int](length=VSM_CASCADE_COUNT, fill=127)
+        var casc_max_vx = List[Int](length=VSM_CASCADE_COUNT, fill=0)
+        var casc_min_vy = List[Int](length=VSM_CASCADE_COUNT, fill=127)
+        var casc_max_vy = List[Int](length=VSM_CASCADE_COUNT, fill=0)
+
         var page_slot = List[Int](length=16384, fill=-1)
         var min_pvx = 127; var max_pvx = 0
         var min_pvy = 127; var max_pvy = 0
@@ -2543,6 +2721,13 @@ struct FlintAaaVulkanRenderer(Movable):
                 if pvx > max_pvx: max_pvx = pvx
                 if pvy < min_pvy: min_pvy = pvy
                 if pvy > max_pvy: max_pvy = pvy
+                if use_vsm_casc:
+                    var c_idx = vsm_cascade_from_virtual_page(pvx, pvy)
+                    casc_has_dirty[c_idx] = True
+                    if pvx < casc_min_vx[c_idx]: casc_min_vx[c_idx] = pvx
+                    if pvx > casc_max_vx[c_idx]: casc_max_vx[c_idx] = pvx
+                    if pvy < casc_min_vy[c_idx]: casc_min_vy[c_idx] = pvy
+                    if pvy > casc_max_vy[c_idx]: casc_max_vy[c_idx] = pvy
 
         var per_page = List[List[Tuple[UInt32, UInt32]]]()
         var per_page_am = List[List[Tuple[UInt32, UInt32]]]()
@@ -2550,7 +2735,14 @@ struct FlintAaaVulkanRenderer(Movable):
             per_page.append(List[Tuple[UInt32, UInt32]]())
             per_page_am.append(List[Tuple[UInt32, UInt32]]())
 
-        var page_scale = Float32(64.0) / max(Float32(1.0), self.vsm_ortho_half_extent)
+        var page_scale_single = Float32(64.0) / base_vsm_ext
+        var n_casc_pass = VSM_CASCADE_COUNT if use_vsm_casc else 1
+        var pass_vps = List[List[Float32]](capacity=n_casc_pass)
+        if use_vsm_casc:
+            for c_p in range(VSM_CASCADE_COUNT):
+                pass_vps.append(self.vsm_cascade_matrices[c_p].copy())
+        else:
+            pass_vps.append(light_vp.copy())
 
         for i_idx in range(n_inst):
             ref di = self.frame_instances[i_idx]
@@ -2571,27 +2763,6 @@ struct FlintAaaVulkanRenderer(Movable):
             var wz = wm[2] * bc.x + wm[6] * bc.y + wm[10] * bc.z + wm[14]
             var wr = me.bounds_radius * max_sc
 
-            var lx = light_vp[0] * wx + light_vp[4] * wy + light_vp[8] * wz + light_vp[12]
-            var ly = light_vp[1] * wx + light_vp[5] * wy + light_vp[9] * wz + light_vp[13]
-            var fx = (lx * Float32(0.5) + Float32(0.5)) * Float32(128.0)
-            var fy = (-ly * Float32(0.5) + Float32(0.5)) * Float32(128.0)
-            var fr = wr * page_scale + Float32(0.35)
-
-            if (
-                fx + fr < Float32(min_pvx)
-                or fx - fr > Float32(max_pvx + 1)
-                or fy + fr < Float32(min_pvy)
-                or fy - fr > Float32(max_pvy + 1)
-            ):
-                continue
-
-            var vx0 = max(min_pvx, Int(fx - fr))
-            var vx1 = min(max_pvx, Int(fx + fr))
-            var vy0 = max(min_pvy, Int(fy - fr))
-            var vy1 = min(max_pvy, Int(fy + fr))
-            if vx0 > vx1 or vy0 > vy1:
-                continue
-
             # Select coarse QEM LOD for compact shadow casters (crowds, props, distant cars/trees)
             var lod_idx = 0
             if me.lod_count > 1 and wr < Float32(5.5):
@@ -2600,68 +2771,108 @@ struct FlintAaaVulkanRenderer(Movable):
             var first_ml = sl.first_meshlet if sl.meshlet_count > 0 else me.first_meshlet
             var ml_cnt = sl.meshlet_count if sl.meshlet_count > 0 else me.lod0_meshlet_count
 
-            if fr <= Float32(2.5):
-                var hit_pages = List[Int]()
-                for py_i in range(vy0, vy1 + 1):
-                    var row_off = py_i * 128
-                    for px_i in range(vx0, vx1 + 1):
-                        var ps = page_slot[row_off + px_i]
-                        if ps >= 0:
-                            hit_pages.append(ps)
-                if len(hit_pages) == 0:
+            for c_pass in range(n_casc_pass):
+                if use_vsm_casc and not casc_has_dirty[c_pass]:
                     continue
-                for m_loc in range(ml_cnt):
-                    var ml_id = first_ml + m_loc
-                    var v_cnt_u = UInt32(self.geom.meshlets[ml_id].tri_count * 3)
-                    var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
-                    for hp in hit_pages:
-                        if is_am_v:
-                            per_page_am[hp].append((v_cnt_u, pk_u))
-                        else:
-                            per_page[hp].append((v_cnt_u, pk_u))
-            else:
-                # Fine per-meshlet light-space sphere culling for large terrain chunks, tracks & megatowers
-                var any_dirty = False
-                for py_i in range(vy0, vy1 + 1):
-                    var row_off = py_i * 128
-                    for px_i in range(vx0, vx1 + 1):
-                        if page_slot[row_off + px_i] >= 0:
-                            any_dirty = True
-                            break
-                    if any_dirty:
-                        break
-                if not any_dirty:
+                ref cur_vp = pass_vps[c_pass]
+                var q_orig = vsm_cascade_quadrant_origin(c_pass) if use_vsm_casc else (0, 0)
+                var grid_f = Float32(VSM_CASCADE_PAGES_DIM) if use_vsm_casc else Float32(128.0)
+                var page_scale = (
+                    (Float32(32.0) / (base_vsm_ext * Float32(1 << (2 * c_pass))))
+                    if use_vsm_casc
+                    else page_scale_single
+                )
+                var b_min_vx = casc_min_vx[c_pass] if use_vsm_casc else min_pvx
+                var b_max_vx = casc_max_vx[c_pass] if use_vsm_casc else max_pvx
+                var b_min_vy = casc_min_vy[c_pass] if use_vsm_casc else min_pvy
+                var b_max_vy = casc_max_vy[c_pass] if use_vsm_casc else max_pvy
+
+                var lx = cur_vp[0] * wx + cur_vp[4] * wy + cur_vp[8] * wz + cur_vp[12]
+                var ly = cur_vp[1] * wx + cur_vp[5] * wy + cur_vp[9] * wz + cur_vp[13]
+                var lz = cur_vp[2] * wx + cur_vp[6] * wy + cur_vp[10] * wz + cur_vp[14]
+                if lz < Float32(-0.5) or lz > Float32(1.5):
                     continue
-                for m_loc in range(ml_cnt):
-                    var ml_id = first_ml + m_loc
-                    ref ml = self.geom.meshlets[ml_id]
-                    var mc = ml.center
-                    var mwx = wm[0] * mc.x + wm[4] * mc.y + wm[8] * mc.z + wm[12]
-                    var mwy = wm[1] * mc.x + wm[5] * mc.y + wm[9] * mc.z + wm[13]
-                    var mwz = wm[2] * mc.x + wm[6] * mc.y + wm[10] * mc.z + wm[14]
-                    var mwr = ml.radius * max_sc
-                    var mlx = light_vp[0] * mwx + light_vp[4] * mwy + light_vp[8] * mwz + light_vp[12]
-                    var mly = light_vp[1] * mwx + light_vp[5] * mwy + light_vp[9] * mwz + light_vp[13]
-                    var mfx = (mlx * Float32(0.5) + Float32(0.5)) * Float32(128.0)
-                    var mfy = (-mly * Float32(0.5) + Float32(0.5)) * Float32(128.0)
-                    var mfr = mwr * page_scale + Float32(0.30)
-                    var mvx0 = max(vx0, Int(mfx - mfr))
-                    var mvx1 = min(vx1, Int(mfx + mfr))
-                    var mvy0 = max(vy0, Int(mfy - mfr))
-                    var mvy1 = min(vy1, Int(mfy + mfr))
-                    if mvx0 > mvx1 or mvy0 > mvy1:
-                        continue
-                    var v_cnt_u = UInt32(ml.tri_count * 3)
-                    var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
-                    for py_i in range(mvy0, mvy1 + 1):
+                var fx = Float32(q_orig[0]) + (lx * Float32(0.5) + Float32(0.5)) * grid_f
+                var fy = Float32(q_orig[1]) + (-ly * Float32(0.5) + Float32(0.5)) * grid_f
+                var fr = wr * page_scale + Float32(0.35)
+
+                if (
+                    fx + fr < Float32(b_min_vx)
+                    or fx - fr > Float32(b_max_vx + 1)
+                    or fy + fr < Float32(b_min_vy)
+                    or fy - fr > Float32(b_max_vy + 1)
+                ):
+                    continue
+
+                var vx0 = max(b_min_vx, Int(fx - fr))
+                var vx1 = min(b_max_vx, Int(fx + fr))
+                var vy0 = max(b_min_vy, Int(fy - fr))
+                var vy1 = min(b_max_vy, Int(fy + fr))
+                if vx0 > vx1 or vy0 > vy1:
+                    continue
+
+                if fr <= Float32(2.5):
+                    var hit_pages = List[Int]()
+                    for py_i in range(vy0, vy1 + 1):
                         var row_off = py_i * 128
-                        for px_i in range(mvx0, mvx1 + 1):
+                        for px_i in range(vx0, vx1 + 1):
                             var ps = page_slot[row_off + px_i]
                             if ps >= 0:
-                                if is_am_v:
-                                    per_page_am[ps].append((v_cnt_u, pk_u))
-                                else:
-                                    per_page[ps].append((v_cnt_u, pk_u))
+                                hit_pages.append(ps)
+                    if len(hit_pages) == 0:
+                        continue
+                    for m_loc in range(ml_cnt):
+                        var ml_id = first_ml + m_loc
+                        var v_cnt_u = UInt32(self.geom.meshlets[ml_id].tri_count * 3)
+                        var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
+                        for hp in hit_pages:
+                            if is_am_v:
+                                per_page_am[hp].append((v_cnt_u, pk_u))
+                            else:
+                                per_page[hp].append((v_cnt_u, pk_u))
+                else:
+                    # Fine per-meshlet light-space sphere culling for large terrain chunks, tracks & megatowers
+                    var any_dirty = False
+                    for py_i in range(vy0, vy1 + 1):
+                        var row_off = py_i * 128
+                        for px_i in range(vx0, vx1 + 1):
+                            if page_slot[row_off + px_i] >= 0:
+                                any_dirty = True
+                                break
+                        if any_dirty:
+                            break
+                    if not any_dirty:
+                        continue
+                    for m_loc in range(ml_cnt):
+                        var ml_id = first_ml + m_loc
+                        ref ml = self.geom.meshlets[ml_id]
+                        var mc = ml.center
+                        var mwx = wm[0] * mc.x + wm[4] * mc.y + wm[8] * mc.z + wm[12]
+                        var mwy = wm[1] * mc.x + wm[5] * mc.y + wm[9] * mc.z + wm[13]
+                        var mwz = wm[2] * mc.x + wm[6] * mc.y + wm[10] * mc.z + wm[14]
+                        var mwr = ml.radius * max_sc
+                        var mlx = cur_vp[0] * mwx + cur_vp[4] * mwy + cur_vp[8] * mwz + cur_vp[12]
+                        var mly = cur_vp[1] * mwx + cur_vp[5] * mwy + cur_vp[9] * mwz + cur_vp[13]
+                        var mfx = Float32(q_orig[0]) + (mlx * Float32(0.5) + Float32(0.5)) * grid_f
+                        var mfy = Float32(q_orig[1]) + (-mly * Float32(0.5) + Float32(0.5)) * grid_f
+                        var mfr = mwr * page_scale + Float32(0.30)
+                        var mvx0 = max(vx0, Int(mfx - mfr))
+                        var mvx1 = min(vx1, Int(mfx + mfr))
+                        var mvy0 = max(vy0, Int(mfy - mfr))
+                        var mvy1 = min(vy1, Int(mfy + mfr))
+                        if mvx0 > mvx1 or mvy0 > mvy1:
+                            continue
+                        var v_cnt_u = UInt32(ml.tri_count * 3)
+                        var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
+                        for py_i in range(mvy0, mvy1 + 1):
+                            var row_off = py_i * 128
+                            for px_i in range(mvx0, mvx1 + 1):
+                                var ps = page_slot[row_off + px_i]
+                                if ps >= 0:
+                                    if is_am_v:
+                                        per_page_am[ps].append((v_cnt_u, pk_u))
+                                    else:
+                                        per_page[ps].append((v_cnt_u, pk_u))
 
         var cmd_cnt = 0
         var base_ptr = self.buf_vsm_indirect.cpu_address
@@ -2707,7 +2918,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
         return AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + (slot % FRAMES_IN_FLIGHT) * AAA_UI_PRIM_REGION_WORDS
 
-    def render_frame(mut self, capture_readback: Bool = False) -> Bool:
+    def render_frame(mut self, capture_readback: Bool = False, force_readback: Bool = False) -> Bool:
         if not self.active:
             return False
 
@@ -2831,9 +3042,18 @@ struct FlintAaaVulkanRenderer(Movable):
             self.prev_view_proj = vp_m.copy()
             self.has_prev_vp = True
 
+        var base_vsm_ext = max(Float32(1.0), self.vsm_ortho_half_extent)
         var light_vp = make_ortho_directional_light_vp(
-            self.sun_dir, self.vsm_scene_center, self.vsm_ortho_half_extent
+            self.sun_dir, self.vsm_scene_center, base_vsm_ext
         )
+        self.vsm_cascade_matrices = compute_vsm_cascade_matrices(
+            self.sun_dir, self.cam_pos, base_vsm_ext
+        )
+        var use_vsm_casc_frame = (
+            self.enable_vsm_clipmap_cascades and len(self.vsm_cascade_matrices) >= VSM_CASCADE_COUNT
+        )
+        if use_vsm_casc_frame:
+            light_vp = self.vsm_cascade_matrices[0].copy()
 
         # True 16-phase radical-inverse Halton (2, 3) sub-pixel TSR jitter across ALL `tsr_scale` values (including native 1.0x!)
         var jx_px_cur = Float32(0.0)
@@ -3000,6 +3220,14 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + 165 * 4, self.sky_horizon_clear.y)
         put_float(g_addr + 166 * 4, self.sky_horizon_clear.z)
 
+        # Extended v5 4-Cascade VSM Globals (`b_globals[167..215]` — `0..166` untouched!):
+        put32(g_addr + VSM_GLOBALS_CASCADE_FLAG_WORD * 4, UInt32(1) if use_vsm_casc_frame else UInt32(0))
+        if use_vsm_casc_frame:
+            for k in range(16):
+                put_float(g_addr + (VSM_GLOBALS_CASCADE_1_WORD + k) * 4, self.vsm_cascade_matrices[1][k])
+                put_float(g_addr + (VSM_GLOBALS_CASCADE_2_WORD + k) * 4, self.vsm_cascade_matrices[2][k])
+                put_float(g_addr + (VSM_GLOBALS_CASCADE_3_WORD + k) * 4, self.vsm_cascade_matrices[3][k])
+
         # Pack Bucket 2 alpha-masked VisBuffer draws (zero overhead when no alpha-masked meshes are submitted)
         var am_vis_draws = self._pack_alphamask_visbuffer_commands(n_inst, tan_x, tan_y)
 
@@ -3039,8 +3267,10 @@ struct FlintAaaVulkanRenderer(Movable):
                 if cur_slot < len(self.ring_tlas_cap) and self.frame_tlas.handle != 0:
                     self.ring_tlas_cap[cur_slot] = max(self.ring_tlas_cap[cur_slot], tlas_cap)
 
-        # Single-Command-Buffer Mode: asynchronous single-pass execution without CPU stalls (Feature 22)
+        # Single-Command-Buffer Mode: asynchronous single-pass execution without CPU stalls in steady-state,
+        # with automatic Frame-0 / camera-teleport warmup so multi-cascade VSM shadows are crisp on the very first frame!
         var vsm_active = (r_flags & AAA_FLAG_VSM) != 0 and n_inst > 0
+        var cam_teleported = self.has_prev_cam and (self.cam_pos - self.prev_cam_pos).length() > Float32(4.0)
         var single_cmd_buf = True
 
         var t_vsm0 = get_time()
@@ -3050,24 +3280,44 @@ struct FlintAaaVulkanRenderer(Movable):
         var vsm_page_counts = List[Int]()
         var vsm_page_am_offsets = List[Int]()
         var vsm_page_am_counts = List[Int]()
-        if single_cmd_buf and vsm_active:
+        if vsm_active:
+            var origin_shifted = False
+            if use_vsm_casc_frame:
+                var next_origins = compute_vsm_cascade_page_origins(self.sun_dir, self.cam_pos, base_vsm_ext)
+                if len(self.vsm_cascade_page_origins) >= VSM_CASCADE_COUNT:
+                    for c_i in range(VSM_CASCADE_COUNT):
+                        if (
+                            next_origins[c_i][0] != self.vsm_cascade_page_origins[c_i][0]
+                            or next_origins[c_i][1] != self.vsm_cascade_page_origins[c_i][1]
+                        ):
+                            self.vsm.invalidate_cascade(c_i)
+                            origin_shifted = True
+                self.vsm_cascade_page_origins = next_origins^
+
             var tbl = List[UInt32](length=VSM_TABLE_WORDS, fill=0)
             _ = external_call["memcpy", Int](Int(tbl.unsafe_ptr()), self.buf_vsm_table.cpu_address, VSM_TABLE_WORDS * 4)
-            var t_vsm_req0 = get_time()
-            var pages = self.vsm.process_requests(tbl)
-            var t_vsm_req1 = get_time()
-            _ = external_call["memcpy", Int](self.buf_vsm_table.cpu_address, Int(tbl.unsafe_ptr()), VSM_TABLE_WORDS * 4)
+            var has_gpu_reqs = False
+            for r_i in range(16384, VSM_TABLE_WORDS):
+                if tbl[r_i] != 0:
+                    has_gpu_reqs = True
+                    break
+            single_cmd_buf = has_gpu_reqs and not cam_teleported and not origin_shifted
+            if single_cmd_buf:
+                var t_vsm_req0 = get_time()
+                var pages = self.vsm.process_requests(tbl)
+                var t_vsm_req1 = get_time()
+                _ = external_call["memcpy", Int](self.buf_vsm_table.cpu_address, Int(tbl.unsafe_ptr()), VSM_TABLE_WORDS * 4)
+                self.last_cpu_vsm_requests_ms = (t_vsm_req1 - t_vsm_req0) * 1000.0
+                self.last_cpu_vsm_table_ms = (get_time() - t_vsm0) * 1000.0 - self.last_cpu_vsm_requests_ms
+                for pg in pages:
+                    vsm_allocs.append((pg.vx, pg.vy, pg.px, pg.py))
+                if len(vsm_allocs) > 0:
+                    var packed_vsm = self._pack_vsm_indirect_commands(n_inst, light_vp, vsm_allocs)
+                    vsm_page_offsets = packed_vsm[1].copy()
+                    vsm_page_counts = packed_vsm[2].copy()
+                    vsm_page_am_offsets = packed_vsm[3].copy()
+                    vsm_page_am_counts = packed_vsm[4].copy()
             _ = len(tbl)
-            self.last_cpu_vsm_requests_ms = (t_vsm_req1 - t_vsm_req0) * 1000.0
-            self.last_cpu_vsm_table_ms = (get_time() - t_vsm0) * 1000.0 - self.last_cpu_vsm_requests_ms
-            for pg in pages:
-                vsm_allocs.append((pg.vx, pg.vy, pg.px, pg.py))
-            if len(vsm_allocs) > 0:
-                var packed_vsm = self._pack_vsm_indirect_commands(n_inst, light_vp, vsm_allocs)
-                vsm_page_offsets = packed_vsm[1].copy()
-                vsm_page_counts = packed_vsm[2].copy()
-                vsm_page_am_offsets = packed_vsm[3].copy()
-                vsm_page_am_counts = packed_vsm[4].copy()
 
         # ====================================================================
         # PASS GROUP A: Deferred Skinning + Inline TLAS + GPU Meshlet Cull + VisBuffer + VSM
@@ -3084,7 +3334,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if not self.vk.begin_commands(cur_slot):
             return False
         if use_prof:
-            self.vk.reset_queries(cur_slot, q_base, AAA_QUERY_SLOT_STRIDE if single_cmd_buf else 8)
+            self.vk.reset_queries(cur_slot, q_base, AAA_QUERY_SLOT_STRIDE)
         if defer_this:
             # The CPU no longer waits between frames, so serialise this frame's GPU work behind the previous one
             # (single-instance buffers/images: history, post scratch, VSM atlas, surface cache, TLAS scratch...).
@@ -3122,7 +3372,7 @@ struct FlintAaaVulkanRenderer(Movable):
             push_cull[0] = UInt32(n_inst)
             push_cull[1] = UInt32(self.max_draws)
             push_cull[2] = UInt32(1) if self.enable_cone_cull else UInt32(0)
-            push_cull[3] = UInt32(1) if (self.enable_hiz_cull and self.frame_index > 0) else UInt32(0)
+            push_cull[3] = UInt32(1) if (self.enable_hiz_cull and self.frame_index > 0 and not cam_teleported) else UInt32(0)
             push_cull[4] = UInt32(self.render_w)
             push_cull[5] = UInt32(self.render_h)
             push_cull[6] = bitcast[DType.uint32](self.max_lod_error_px)
@@ -3293,7 +3543,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.vk.write_timestamp(cur_slot, q_vm + 1, PIPELINE_BOTTOM)
             self.vk.memory_barrier2(cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
 
-        # Synchronous Frame-0 / Test-Suite VSM Page Readback (skipped in warmed-up single-command-buffer gameplay!)
+        # Synchronous Frame-0 / Camera-Teleport VSM Page Readback (skipped in warmed-up single-command-buffer gameplay!)
         if not single_cmd_buf:
             self.vk.memory_barrier2(cur_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
             var f_group_a = self.vk.submit(cur_slot)
@@ -3304,7 +3554,14 @@ struct FlintAaaVulkanRenderer(Movable):
 
             var tbl = List[UInt32](length=VSM_TABLE_WORDS, fill=0)
             _ = external_call["memcpy", Int](Int(tbl.unsafe_ptr()), self.buf_vsm_table.cpu_address, VSM_TABLE_WORDS * 4)
+            var saved_reqs = List[Int]()
+            for v_i in range(16384):
+                if tbl[16384 + v_i] != 0:
+                    saved_reqs.append(v_i)
             var pages = self.vsm.process_requests(tbl)
+            # Preserve GPU-marked request flags in `buf_vsm_table` so the next static frame runs `single_cmd_buf = True` and hits cache!
+            for v_i in saved_reqs:
+                tbl[16384 + v_i] = 1
             _ = external_call["memcpy", Int](self.buf_vsm_table.cpu_address, Int(tbl.unsafe_ptr()), VSM_TABLE_WORDS * 4)
             _ = len(tbl)
             for pg in pages:
@@ -3318,9 +3575,6 @@ struct FlintAaaVulkanRenderer(Movable):
 
             if not self.vk.begin_commands(cur_slot):
                 return False
-            next_q = q_base + 8
-            if use_prof:
-                self.vk.reset_queries(cur_slot, q_base + 8, 24)
 
         # ====================================================================
         # PASS GROUP B: VSM Indirect Tile Raster + 2-Tier Lumen Surface-Cache +
@@ -3341,8 +3595,18 @@ struct FlintAaaVulkanRenderer(Movable):
                 var vx = pg[0]; var vy = pg[1]; var px = pg[2]; var py = pg[3]
                 var rx = px * VSM_PAGE_TEXELS
                 var ry = py * VSM_PAGE_TEXELS
+                var sc_f = Float32(128.0)
                 var bx_f = Float32(127 - 2 * vx)
                 var by_f = -Float32(127 - 2 * vy)
+                var mat_word_off = UInt32(56)
+                if use_vsm_casc_frame:
+                    var casc = vsm_cascade_from_virtual_page(vx, vy)
+                    var loc_vx = vx & (VSM_CASCADE_PAGES_DIM - 1)
+                    var loc_vy = vy & (VSM_CASCADE_PAGES_DIM - 1)
+                    sc_f = Float32(VSM_CASCADE_PAGES_DIM)
+                    bx_f = Float32((VSM_CASCADE_PAGES_DIM - 1) - 2 * loc_vx)
+                    by_f = -Float32((VSM_CASCADE_PAGES_DIM - 1) - 2 * loc_vy)
+                    mat_word_off = UInt32(vsm_cascade_globals_word_offset(casc))
                 self.vk.begin_rendering(
                     cur_slot, rx, ry, VSM_PAGE_TEXELS, VSM_PAGE_TEXELS, False, 0, False, 0, 0, True, self.vsm_img.view, True, 1.0
                 )
@@ -3351,10 +3615,11 @@ struct FlintAaaVulkanRenderer(Movable):
                 if p_cnt > 0 or p_am_cnt > 0:
                     self.vk.set_viewport_and_scissor(cur_slot, rx, ry, VSM_PAGE_TEXELS, VSM_PAGE_TEXELS, flip_y=True)
                     var push_vsm = List[UInt32](length=16, fill=0)
-                    push_vsm[0] = bitcast[DType.uint32](Float32(128.0))
-                    push_vsm[1] = bitcast[DType.uint32](Float32(128.0))
+                    push_vsm[0] = bitcast[DType.uint32](sc_f)
+                    push_vsm[1] = bitcast[DType.uint32](sc_f)
                     push_vsm[2] = bitcast[DType.uint32](bx_f)
                     push_vsm[3] = bitcast[DType.uint32](by_f)
+                    push_vsm[4] = mat_word_off
                     if p_cnt > 0:
                         var p_off = vsm_page_offsets[p_idx]
                         self.vk.bind_graphics_pipeline(cur_slot, self.pipe_vsm_gfx, self.pipe_layout, self.desc_set, push_vsm)
@@ -4104,11 +4369,12 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_timestamp(cur_slot, q_dt, PIPELINE_TOP)
             next_q += 2
             prof_pairs.append((String("CinemaDisplayTonemap"), q_dt))
+        var disp_tonemap_mode = UInt32(2) if self.display_mode == AAA_DISPLAY_SCRGB_FP16 else self.display_mode
         var push_dt = List[UInt32](length=16, fill=0)
         push_dt[0] = UInt32(self.output_w)
         push_dt[1] = UInt32(self.output_h)
         push_dt[2] = UInt32(out_ldr_off)
-        push_dt[3] = self.display_mode
+        push_dt[3] = disp_tonemap_mode
         push_dt[4] = UInt32(1) if has_saved_bloom_mip else UInt32(0)
         push_dt[5] = UInt32(saved_bm_w)
         push_dt[6] = UInt32(saved_bm_h)
@@ -4148,7 +4414,7 @@ struct FlintAaaVulkanRenderer(Movable):
             # Upload GpuUiPrim structs into buf_post_scratch at AAA_POST_UI_PRIMS_BASE_OFFSET
             var prims_word_offset = self.ui_prims_word_offset(cur_slot)
             var max_prims_fit = AAA_UI_PRIM_REGION_WORDS // 16
-            var prim_cnt = min(self.ui_draw_list.count(), min(4096, max_prims_fit))
+            var prim_cnt = min(self.ui_draw_list.count(), min(32768, max_prims_fit))
             var prim_bytes = prim_cnt * 64
             var prim_dst = self.buf_post_scratch.cpu_address + prims_word_offset * 4
             if prim_bytes > 0:
@@ -4168,7 +4434,7 @@ struct FlintAaaVulkanRenderer(Movable):
             push_ui[2] = UInt32(prim_cnt)
             push_ui[3] = UInt32(prims_word_offset)
             push_ui[4] = UInt32(out_ldr_off)
-            push_ui[5] = self.display_mode
+            push_ui[5] = disp_tonemap_mode
             self.vk.dispatch_aaa(
                 cur_slot,
                 self.pipe_ui_overlay,
@@ -4184,8 +4450,34 @@ struct FlintAaaVulkanRenderer(Movable):
             if use_prof and q_ui + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_ui + 1, PIPELINE_BOTTOM)
 
-        # Feature 13 & 14: Presentation & Ring Synchronization
-        var do_readback = capture_readback or (self.vk.swapchain == 0)
+        # Extended Linear scRGB `R16G16B16A16_SFLOAT` (`8` bytes/pixel `RGBA16F`, `1.0 = 80 nits`) Output Pack!
+        var scrgb_swapchain = self.vk.swapchain != 0 and self.vk.swapchain_format == FORMAT_R16G16B16A16_SFLOAT
+        var want_scrgb_fp16 = (self.display_mode == AAA_DISPLAY_SCRGB_FP16) or scrgb_swapchain
+        if want_scrgb_fp16:
+            var push_scrgb = List[UInt32](length=16, fill=0)
+            push_scrgb[0] = UInt32(self.output_w)
+            push_scrgb[1] = UInt32(self.output_h)
+            push_scrgb[2] = UInt32(AAA_POST_BLOOM_BASE)
+            push_scrgb[3] = bitcast[DType.uint32](self.exposure * Float32(203.0 / 80.0))
+            self.vk.dispatch_aaa(
+                cur_slot,
+                self.pipe_scrgb_pack,
+                self.pipe_layout,
+                self.desc_set,
+                push_scrgb,
+                (self.output_w + 7) // 8,
+                (self.output_h + 7) // 8,
+            )
+            self.vk.memory_barrier2(
+                cur_slot,
+                PIPELINE_COMPUTE,
+                Int(ACCESS_SHADER_WRITE),
+                PIPELINE_TRANSFER | PIPELINE_HOST,
+                Int(ACCESS_TRANSFER_READ | ACCESS_HOST_READ),
+            )
+
+        # Feature 13 & 14: Presentation & Ring Synchronization (skip PCIe DMA readback on live swapchain unless forced!)
+        var do_readback = capture_readback or force_readback or self.force_readback or (self.vk.swapchain == 0)
         if do_readback:
             # DMA-copy final LDR frame + adapted exposure from `DEVICE_LOCAL` VRAM into `HOST_CACHED` readback memory
             # (`buf_ldr_readback`, or this slot's ring buffer in deferred-readback mode).
@@ -4210,7 +4502,30 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.vk.swapchain != 0:
             var img_idx = self.vk.acquire_image(cur_slot)
             if img_idx != NO_IMAGE:
-                self.vk.copy_to_image(cur_slot, self.buf_history, self.output_w, img_idx, UInt64(out_ldr_off * 4))
+                var copy_w = min(self.output_w, self.vk.swapchain_width)
+                var copy_h = min(self.output_h, self.vk.swapchain_height)
+                if copy_w > 0 and copy_h > 0:
+                    if scrgb_swapchain:
+                        # Copy 8-byte/pixel `R16G16B16A16_SFLOAT` Extended Linear scRGB buffer (NEVER 4-byte PQ words!)
+                        self.vk.copy_to_image(
+                            cur_slot,
+                            self.buf_post_scratch,
+                            self.output_w,
+                            img_idx,
+                            UInt64(AAA_POST_BLOOM_BASE * 4),
+                            copy_w,
+                            copy_h,
+                        )
+                    else:
+                        self.vk.copy_to_image(
+                            cur_slot,
+                            self.buf_history,
+                            self.output_w,
+                            img_idx,
+                            UInt64(out_ldr_off * 4),
+                            copy_w,
+                            copy_h,
+                        )
                 var f = self.vk.submit_and_present(cur_slot, img_idx)
                 self.frame_fences[cur_slot] = f
                 if do_readback and f != 0:
@@ -4345,6 +4660,16 @@ struct FlintAaaVulkanRenderer(Movable):
         _ = len(raw_f)
         return out^
 
+    def readback_scrgb_rgba16f_words(self) -> List[UInt32]:
+        """Reads back `8`-byte/pixel `R16G16B16A16_SFLOAT` (`2 x UInt32` per pixel) Extended Linear scRGB words (`1.0 = 80 nits`)."""
+        var n_words = self.output_w * self.output_h * 2
+        var out = List[UInt32](length=n_words, fill=0)
+        if self.buf_post_scratch.cpu_address != 0 and (AAA_POST_BLOOM_BASE + n_words) * 4 <= self.buf_post_scratch.size:
+            _ = external_call[
+                "memcpy", Int
+            ](Int(out.unsafe_ptr()), self.buf_post_scratch.cpu_address + AAA_POST_BLOOM_BASE * 4, n_words * 4)
+        return out^
+
     def shutdown(mut self):
         if not self.active and self.vk.instance == 0:
             return
@@ -4417,6 +4742,9 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.pipe_ui_overlay != 0:
             self.vk.destroy_pipeline(self.pipe_ui_overlay)
             self.pipe_ui_overlay = 0
+        if self.pipe_scrgb_pack != 0:
+            self.vk.destroy_pipeline(self.pipe_scrgb_pack)
+            self.pipe_scrgb_pack = 0
         self.vk.destroy_aaa_descriptors(self.desc_pool, self.dsl, self.pipe_layout)
 
         for i in range(len(self.ring_globals)):
@@ -4475,6 +4803,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_buffer(self.buf_indirect_phase2)
         self.vk.destroy_buffer(self.buf_occluded_candidates)
 
-        _ = self.vk.save_pipeline_cache("build/vk_pso.cache")
+        if self.vk.pipeline_cache != 0:
+            _ = self.vk.save_pipeline_cache("build/vk_pso.cache")
         self.vk.close()
         self.active = False

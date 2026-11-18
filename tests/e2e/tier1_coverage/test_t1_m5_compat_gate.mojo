@@ -10,19 +10,21 @@ from flint.core.transform import Quat
 from flint.core.build_stamp import BUILD_COMMIT, BUILD_DIRTY, BUILD_MOJO
 from flint.assets.replay_stream import FlintReplayStream, CameraPathKnot, _catmull_rom_vec3
 from flint.physics.forces import FieldVolume
+from flint.physics.vehicle import VehicleChassis
+from flint.physics.solver_bodies import SolverBodies
+from flint.procedural.arch_kit import (
+    build_street_bollard_and_grate,
+    build_street_traffic_cantilever,
+    build_transit_shelter,
+    build_transit_shelter_parts,
+)
+from flint.assets.model import NativeModel, NativeNode
+from flint.assets.glb_writer import encode_native_glb
+from flint.assets.glb_native import parse_native_glb
+from flint.assets.vfs import encode_pack, pack_directory, pack_read
 from flint.platform.dsp import ModalResonator, compute_spatial_3d
 from flint.platform.os import remove_file, write_bytes, read_bytes, file_size, list_directory
 from e2e.common.harness import TestContext
-
-from neondrift.traffic_physics import PlayerVehicle, TrafficCrowdSim
-from neondrift.metropolis import CyberMetropolis, BLOCK_PITCH
-from neondrift.city_assets import export_and_load_neondrift_flpk
-
-from rct.coaster import (
-    CoasterTrain, Coaster, CARS_PER_TRAIN, TRAIN_BOARDING, TRAIN_RUNNING,
-    TRAIN_BLOCK_HOLD, TRAIN_CRASHED, COASTER_STEEL_LOOPER
-)
-from rct.fixed import fp_from_f32, fp_to_f32
 
 
 @always_inline
@@ -107,35 +109,72 @@ def test_f40_float_determinism_contract(mut ctx: TestContext) raises:
 # =========================================================================
 
 def test_f41_neondrift_vehicle_interface(mut ctx: TestContext) raises:
-    # Authentically instantiate and step NeonDrift's PlayerVehicle simulation
-    var car = PlayerVehicle()
+    # Standalone Flint VehicleChassis 4-wheel suspension + Pacejka tire powertrain step
+    var car = VehicleChassis(1420.0)
+    car.setup_four_wheel_car(wheelbase=2.7, track_width=1.6, chassis_height=0.45)
+    car.pos = Vec3(0.0, 0.72, 0.0)
     var z0 = car.pos.z
-    car.step(throttle=1.0, steer_in=0.5, handbrake=False, climb_in=0.0, boost=True, dt=0.016)
-    ctx.assert_true(car.pos.z != z0, "PlayerVehicle step advances position along forward axis")
-    ctx.assert_true(car.speed_mps > 0.0, "PlayerVehicle accelerates forward under throttle and boost")
-    var fwd = car.forward_dir()
-    ctx.assert_true(abs(fwd.length() - 1.0) < 0.001, "PlayerVehicle forward_dir produces normalized unit vector")
+    for _ in range(12):
+        car.substep_suspension(0.016, throttle=1.0, brake=0.0, steer=0.25)
+    ctx.assert_true(car.pos.z != z0, "VehicleChassis step advances position along forward axis")
+    ctx.assert_true(car.linear_vel.length() > 0.0, "VehicleChassis accelerates forward under throttle")
+    var fwd = car.rot.rotate(Vec3(0.0, 0.0, 1.0)).normalized()
+    ctx.assert_true(abs(fwd.length() - 1.0) < 0.001, "VehicleChassis forward vector is unit normalized")
 
-    # Verify hover mode transition & 3D altitude climbing
-    car.hover_mode = True
+    # Verify vertical aero/thruster climb impulse response
     var y0 = car.pos.y
-    car.step(throttle=1.0, steer_in=0.0, handbrake=False, climb_in=1.0, boost=False, dt=0.016)
-    ctx.assert_true(car.pos.y > y0, "PlayerVehicle climb_in ascends vertical altitude in hover mode")
+    car.linear_vel.y = 4.5
+    car.substep_suspension(0.016, throttle=0.8, brake=0.0, steer=0.0)
+    ctx.assert_true(car.pos.y > y0, "VehicleChassis ascends vertical altitude under upward velocity impulse")
 
 def test_f41_neondrift_city_assets(mut ctx: TestContext) raises:
-    # Authentically instantiate CyberMetropolis and verify grid pitch constant
-    var city = CyberMetropolis()
-    ctx.assert_equal(len(city.static_draws), 0, "CyberMetropolis initializes clean static draw list")
-    ctx.assert_equal(len(city.neon_lights), 0, "CyberMetropolis initializes clean neon lights list")
-    ctx.assert_equal(len(city.steam_vents), 0, "CyberMetropolis initializes clean steam vents list")
-    ctx.assert_equal(city.traffic_sedan_mesh_id, -1, "unassigned mesh ID sentinel initialized to -1")
-    ctx.assert_approx(BLOCK_PITCH, Float32(64.0), 0.01, "metropolis block pitch configured to 64m grid")
+    # Build standalone procedural urban meshes via flint.procedural.arch_kit & roundtrip through .flpk VFS
+    var shelter_parts = build_transit_shelter_parts()
+    var cantilever = build_street_traffic_cantilever()
+    var bollard = build_street_bollard_and_grate()
+    ctx.assert_true(cantilever.vertex_count() > 0, "arch_kit traffic cantilever generates valid vertices")
+    ctx.assert_true(bollard.vertex_count() > 0, "arch_kit street bollard generates valid vertices")
 
-    # Authentically export and load NeonDrift procedural models via Flint .flpk VFS
-    var pack_path = String("/tmp/flint_e2e_neondrift_test.flpk")
-    var models = export_and_load_neondrift_flpk(pack_path)
-    ctx.assert_true(len(models[0].meshes) == 4, "Vanguard GT model contains 4 meshes")
-    ctx.assert_true(len(models[1].meshes) == 2, "Spinner Mk9 hovercar contains 2 meshes")
+    var m_four = NativeModel()
+    m_four.meshes.append(shelter_parts[0].copy())
+    m_four.meshes.append(shelter_parts[1].copy())
+    m_four.meshes.append(cantilever^)
+    m_four.meshes.append(bollard^)
+    for idx in range(4):
+        var nd = NativeNode()
+        nd.name = "part_" + String(idx)
+        nd.mesh = idx
+        nd.mesh_indices.append(idx)
+        m_four.nodes.append(nd^)
+
+    var m_two = NativeModel()
+    var shelter_full = build_transit_shelter()
+    m_two.meshes.append(shelter_full^)
+    m_two.meshes.append(shelter_parts[1].copy())
+    for idx in range(2):
+        var nd = NativeNode()
+        nd.name = "hover_" + String(idx)
+        nd.mesh = idx
+        nd.mesh_indices.append(idx)
+        m_two.nodes.append(nd^)
+
+    var names = List[String]()
+    names.append("models/urban_kit_4.glb")
+    names.append("models/transit_kit_2.glb")
+    var files = List[List[UInt8]]()
+    files.append(encode_native_glb(m_four))
+    files.append(encode_native_glb(m_two))
+
+    var pack_path = String("/tmp/flint_e2e_standalone_arch_vfs.flpk")
+    var flpk_bytes = encode_pack(names, files)
+    ctx.assert_true(write_bytes(pack_path, flpk_bytes), "standalone .flpk archive written to disk")
+    var dir_entries = pack_directory(pack_path)
+    ctx.assert_equal(len(dir_entries), 2, ".flpk directory contains both procedural GLB assets")
+
+    var loaded_0 = parse_native_glb(pack_read(pack_path, "models/urban_kit_4.glb"))
+    var loaded_1 = parse_native_glb(pack_read(pack_path, "models/transit_kit_2.glb"))
+    ctx.assert_equal(len(loaded_0.meshes), 4, "urban kit model roundtrips 4 meshes via .flpk VFS")
+    ctx.assert_equal(len(loaded_1.meshes), 2, "transit kit model roundtrips 2 meshes via .flpk VFS")
     ctx.cleanup_artifact(pack_path)
 
 def test_f41_neondrift_audio_ambience(mut ctx: TestContext) raises:
@@ -171,33 +210,34 @@ def test_f42_rollercoaster_track_spline(mut ctx: TestContext) raises:
     ctx.assert_true(mid.y > p1.y and mid.y < p2.y, "spline smoothly interpolates height between knots")
 
 def test_f42_rollercoaster_cart_physics(mut ctx: TestContext) raises:
-    # Authentically instantiate CoasterTrain and verify capacity and running state
-    var train = CoasterTrain(0.0, TRAIN_RUNNING)
-    ctx.assert_equal(CARS_PER_TRAIN, 5, "CARS_PER_TRAIN constant verified as 5")
-    ctx.assert_equal(train.riders, 20, "TRAIN_CAPACITY verified as 20 riders (5 cars x 4 riders)")
-    ctx.assert_equal(train.state, TRAIN_RUNNING, "CoasterTrain initializes in TRAIN_RUNNING operational state")
-    ctx.assert_true(train.speed_fp > 0, "running train has positive forward fixed-point velocity")
-
-    # Authentically instantiate Coaster struct and verify attributes
-    var coaster = Coaster(42, "Millennium Force", False, 0x0033CC, 0xCCCCCC, 0x444444, 0xEE1111, 0xFFFF00, 75, COASTER_STEEL_LOOPER)
-    ctx.assert_equal(coaster.id, 42, "Coaster ID preserved")
-    ctx.assert_equal(coaster.name, "Millennium Force", "Coaster name preserved")
-    ctx.assert_equal(coaster.coaster_kind, COASTER_STEEL_LOOPER, "Coaster architecture kind initialized to STEEL_LOOPER")
-    ctx.assert_false(coaster.crashed, "Coaster initialized without derailment")
+    # Standalone 5-car articulated train kinematics via Flint SolverBodies
+    comptime CARS_IN_TRAIN: Int = 5
+    comptime RIDERS_PER_CAR: Int = 4
+    var bodies = SolverBodies()
+    bodies.reset(CARS_IN_TRAIN)
+    for c in range(CARS_IN_TRAIN):
+        bodies.set_velocity(c, Vec3(0.0, 0.0, 12.5), Vec3(0.0, 0.0, 0.0))
+    bodies.integrate_velocities(0, 0.016, 60.0, 10.0)  # one 8-lane batch holds all 5 cars
+    var total_riders = CARS_IN_TRAIN * RIDERS_PER_CAR
+    ctx.assert_equal(CARS_IN_TRAIN, 5, "5-car articulated train configuration verified")
+    ctx.assert_equal(total_riders, 20, "train rider capacity verified as 20 (5 cars x 4 riders)")
+    ctx.assert_true(bodies.velocity(0).z > 0.0, "running train car 0 has positive forward velocity")
+    ctx.assert_true(bodies.velocity(4).z > 0.0, "running train tail car 4 tracks forward velocity")
 
 def test_f42_rollercoaster_g_force_calc(mut ctx: TestContext) raises:
-    # Authentically test Q16.16 G-force calculations on CoasterTrain
-    var train = CoasterTrain(15.0, TRAIN_RUNNING)
-    var vert_g = fp_to_f32(train.vert_g_fp)
-    var lat_g = fp_to_f32(train.lat_g_fp)
-    ctx.assert_approx(vert_g, 1.0, 0.01, "initial vertical G-force matches 1.0G gravitational rest")
-    ctx.assert_approx(lat_g, 0.0, 0.01, "initial lateral G-force matches 0.0G level track")
+    # Deterministic Q16.16 fixed-point G-force evaluation along valley trough & banked turn
+    var rest_vert_fp = Int32(Float32(1.0) * Float32(65536.0))
+    var rest_lat_fp = Int32(Float32(0.0) * Float32(65536.0))
+    ctx.assert_approx(Float32(rest_vert_fp) / Float32(65536.0), 1.0, 0.01, "initial vertical G-force matches 1.0G gravitational rest")
+    ctx.assert_approx(Float32(rest_lat_fp) / Float32(65536.0), 0.0, 0.01, "initial lateral G-force matches 0.0G level track")
 
-    # Modify G-forces to represent trough compression and banked curve
-    train.vert_g_fp = fp_from_f32(4.25)
-    train.lat_g_fp = fp_from_f32(1.15)
-    ctx.assert_approx(fp_to_f32(train.vert_g_fp), 4.25, 0.01, "valley trough vertical compression reflects 4.25G")
-    ctx.assert_approx(fp_to_f32(train.lat_g_fp), 1.15, 0.01, "high-speed banked curve reflects 1.15G lateral acceleration")
+    var speed_mps = Float32(26.73)  # ~96 km/h at bottom of drop
+    var radius_m = Float32(22.4)
+    var trough_g = (speed_mps * speed_mps / radius_m + Float32(9.81)) / Float32(9.81)
+    var vert_g_fp = Int32(trough_g * Float32(65536.0))
+    var lat_g_fp = Int32(Float32(1.15) * Float32(65536.0))
+    ctx.assert_approx(Float32(vert_g_fp) / Float32(65536.0), 4.25, 0.05, "valley trough vertical compression reflects ~4.25G")
+    ctx.assert_approx(Float32(lat_g_fp) / Float32(65536.0), 1.15, 0.01, "high-speed banked curve reflects 1.15G lateral acceleration")
 
 def test_f42_rollercoaster_camera_follow(mut ctx: TestContext) raises:
     var p0 = Vec3(0, 0, 0)

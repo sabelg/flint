@@ -42,7 +42,12 @@ comptime OP_TYPE_RUNTIME_ARRAY: UInt32 = 29
 comptime OP_TYPE_STRUCT: UInt32 = 30
 comptime OP_TYPE_POINTER: UInt32 = 32
 comptime OP_TYPE_FUNCTION: UInt32 = 33
+comptime OP_CONSTANT_TRUE: UInt32 = 41
+comptime OP_CONSTANT_FALSE: UInt32 = 42
 comptime OP_CONSTANT: UInt32 = 43
+comptime OP_SPEC_CONSTANT_TRUE: UInt32 = 48
+comptime OP_SPEC_CONSTANT_FALSE: UInt32 = 49
+comptime OP_SPEC_CONSTANT: UInt32 = 50
 comptime OP_FUNCTION: UInt32 = 54
 comptime OP_FUNCTION_END: UInt32 = 56
 comptime OP_VARIABLE: UInt32 = 59
@@ -120,6 +125,8 @@ comptime STORAGE_FUNCTION: UInt32 = 7
 comptime STORAGE_PUSH_CONSTANT: UInt32 = 9
 comptime STORAGE_BUFFER: UInt32 = 12
 
+comptime DEC_SPEC_ID: UInt32 = 1
+comptime DECORATION_SPEC_ID: UInt32 = 1
 comptime DECORATION_BLOCK: UInt32 = 2
 comptime DECORATION_ARRAY_STRIDE: UInt32 = 6
 comptime DECORATION_BUILT_IN: UInt32 = 11
@@ -314,6 +321,30 @@ struct SpirvModule(Movable):
     def float(mut self, value: Float32) -> UInt32:
         var copy = value
         return self.float_bits(Pointer(to=copy).unsafe_bitcast[UInt32]()[unsafe_offset=0])
+
+    def spec_constant_u32(mut self, spec_id: Int, default_val: UInt32 = 0) -> UInt32:
+        """Emits `OpSpecConstant` (`UInt32`) decorated with `SpecId = spec_id`."""
+        var id = self.fresh()
+        emit(self.decorations, OP_DECORATE, id, DEC_SPEC_ID, UInt32(spec_id))
+        emit(self.globals, OP_SPEC_CONSTANT, self.type_uint, id, default_val)
+        return id
+
+    def spec_constant_bool(mut self, spec_id: Int, default_val: Bool = False) -> UInt32:
+        """Emits `OpSpecConstantTrue` / `OpSpecConstantFalse` decorated with `SpecId = spec_id`."""
+        var id = self.fresh()
+        var op = OP_SPEC_CONSTANT_TRUE if default_val else OP_SPEC_CONSTANT_FALSE
+        emit(self.decorations, OP_DECORATE, id, DEC_SPEC_ID, UInt32(spec_id))
+        emit(self.globals, op, self.type_bool, id)
+        return id
+
+    def spec_constant_f32(mut self, spec_id: Int, default_val: Float32 = 0.0) -> UInt32:
+        """Emits `OpSpecConstant` (`Float32`) decorated with `SpecId = spec_id`."""
+        var id = self.fresh()
+        var copy = default_val
+        var bits = Pointer(to=copy).unsafe_bitcast[UInt32]()[unsafe_offset=0]
+        emit(self.decorations, OP_DECORATE, id, DEC_SPEC_ID, UInt32(spec_id))
+        emit(self.globals, OP_SPEC_CONSTANT, self.type_float, id, bits)
+        return id
 
     # Resources.
 
@@ -703,6 +734,9 @@ struct SpirvModule(Movable):
         for index in range(2, len(self.code)):
             words.append(self.code[index])
         return words^
+
+
+comptime SpirvBuilder = SpirvModule
 
 
 # ============================================================================
@@ -1110,6 +1144,30 @@ struct AaaSpirvModule(Movable):
     def float(mut self, value: Float32) -> UInt32:
         var copy = value
         return self.float_bits(Pointer(to=copy).unsafe_bitcast[UInt32]()[unsafe_offset=0])
+
+    def spec_constant_u32(mut self, spec_id: Int, default_val: UInt32 = 0) -> UInt32:
+        """Emits `OpSpecConstant` (`UInt32`) decorated with `SpecId = spec_id`."""
+        var id = self.fresh()
+        emit(self.decorations, OP_DECORATE, id, DEC_SPEC_ID, UInt32(spec_id))
+        emit(self.globals, OP_SPEC_CONSTANT, self.type_uint, id, default_val)
+        return id
+
+    def spec_constant_bool(mut self, spec_id: Int, default_val: Bool = False) -> UInt32:
+        """Emits `OpSpecConstantTrue` / `OpSpecConstantFalse` decorated with `SpecId = spec_id`."""
+        var id = self.fresh()
+        var op = OP_SPEC_CONSTANT_TRUE if default_val else OP_SPEC_CONSTANT_FALSE
+        emit(self.decorations, OP_DECORATE, id, DEC_SPEC_ID, UInt32(spec_id))
+        emit(self.globals, op, self.type_bool, id)
+        return id
+
+    def spec_constant_f32(mut self, spec_id: Int, default_val: Float32 = 0.0) -> UInt32:
+        """Emits `OpSpecConstant` (`Float32`) decorated with `SpecId = spec_id`."""
+        var id = self.fresh()
+        var copy = default_val
+        var bits = Pointer(to=copy).unsafe_bitcast[UInt32]()[unsafe_offset=0]
+        emit(self.decorations, OP_DECORATE, id, DEC_SPEC_ID, UInt32(spec_id))
+        emit(self.globals, OP_SPEC_CONSTANT, self.type_float, id, bits)
+        return id
 
     def vec2(mut self, x: UInt32, y: UInt32) -> UInt32:
         var id = self.fresh()

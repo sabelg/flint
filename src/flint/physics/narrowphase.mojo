@@ -13,6 +13,7 @@ from std.collections import List
 from std.math import sqrt, min, max, abs
 from flint.core.math import Vec3
 from flint.core.transform import Quat
+from flint.physics.solver_bodies import Sym3
 
 
 struct ContactPoint(Copyable, ImplicitlyCopyable, Movable):
@@ -848,15 +849,271 @@ def collide_box_box(
 # 4. Convex Hull Narrowphase (GJK + EPA + Clipped 4-Point Manifold)
 # =========================================================================
 
+struct _QhFace(Copyable, Movable):
+    var i0: Int
+    var i1: Int
+    var i2: Int
+    var n: Vec3
+    var offset: Float32
+    var alive: Bool
+    var furthest_pt: Int
+    var furthest_dist: Float32
+    var outside: List[Int]
+
+    def __init__(out self, i0: Int, i1: Int, i2: Int, n: Vec3, offset: Float32):
+        self.i0 = i0
+        self.i1 = i1
+        self.i2 = i2
+        self.n = n
+        self.offset = offset
+        self.alive = True
+        self.furthest_pt = -1
+        self.furthest_dist = Float32(-1.0)
+        self.outside = List[Int]()
+
+    def assign_point(mut self, pt_idx: Int, dist: Float32):
+        self.outside.append(pt_idx)
+        if dist > self.furthest_dist:
+            self.furthest_dist = dist
+            self.furthest_pt = pt_idx
+
+
+def _make_qh_face(pts: List[Vec3], i0: Int, i1: Int, i2: Int, interior: Vec3) -> _QhFace:
+    var a = pts[i0]
+    var b = pts[i1]
+    var c = pts[i2]
+    var raw_n = (b - a).cross(c - a)
+    var l2 = raw_n.length_squared()
+    var n = raw_n * (Float32(1.0) / sqrt(l2)) if l2 > Float32(1.0e-16) else Vec3(0, 1, 0)
+    var b_idx = i1
+    var c_idx = i2
+    if n.dot(a - interior) < Float32(0.0):
+        n = -n
+        b_idx = i2
+        c_idx = i1
+    return _QhFace(i0, b_idx, c_idx, n, n.dot(a))
+
+
+def _quickhull_core(pts: List[Vec3], weld_eps: Float32) -> Tuple[List[Vec3], List[Int32]]:
+    """Builds outward-oriented 3D convex hull `(hull_vertices, tri_indices)` from welded points."""
+    var n_pts = len(pts)
+    var out_v = List[Vec3]()
+    var out_idx = List[Int32]()
+    if n_pts == 0:
+        return (out_v^, out_idx^)
+    if n_pts < 4:
+        for i in range(n_pts):
+            out_v.append(pts[i])
+        return (out_v^, out_idx^)
+
+    # Find bounding box diagonal & 6 axis extrema for stable initial simplex
+    var min_idx = [0, 0, 0]
+    var max_idx = [0, 0, 0]
+    var lo = pts[0]
+    var hi = pts[0]
+    for i in range(1, n_pts):
+        var p = pts[i]
+        if p.x < lo.x: lo.x = p.x; min_idx[0] = i
+        if p.x > hi.x: hi.x = p.x; max_idx[0] = i
+        if p.y < lo.y: lo.y = p.y; min_idx[1] = i
+        if p.y > hi.y: hi.y = p.y; max_idx[1] = i
+        if p.z < lo.z: lo.z = p.z; min_idx[2] = i
+        if p.z > hi.z: hi.z = p.z; max_idx[2] = i
+
+    var diag = (hi - lo).length()
+    var eps = max(weld_eps, diag * Float32(1.0e-5))
+
+    var extrema = [min_idx[0], max_idx[0], min_idx[1], max_idx[1], min_idx[2], max_idx[2]]
+    var i0 = extrema[0]
+    var i1 = extrema[1]
+    var best_seg2 = Float32(-1.0)
+    for a_i in range(6):
+        for b_i in range(a_i + 1, 6):
+            var d2 = (pts[extrema[b_i]] - pts[extrema[a_i]]).length_squared()
+            if d2 > best_seg2:
+                best_seg2 = d2
+                i0 = extrema[a_i]
+                i1 = extrema[b_i]
+    if best_seg2 <= eps * eps:
+        out_v.append(pts[0])
+        return (out_v^, out_idx^)
+
+    # Third vertex maximizing distance to line (i0, i1)
+    var line_d = (pts[i1] - pts[i0]).normalized()
+    var i2 = -1
+    var best_line_d2 = Float32(0.0)
+    for i in range(n_pts):
+        if i == i0 or i == i1:
+            continue
+        var d2 = (pts[i] - pts[i0]).cross(line_d).length_squared()
+        if d2 > best_line_d2:
+            best_line_d2 = d2
+            i2 = i
+    if i2 < 0 or best_line_d2 <= eps * eps:
+        out_v.append(pts[i0])
+        out_v.append(pts[i1])
+        return (out_v^, out_idx^)
+
+    # Fourth vertex maximizing distance to plane (i0, i1, i2)
+    var plane_n = (pts[i1] - pts[i0]).cross(pts[i2] - pts[i0]).normalized()
+    var i3 = -1
+    var best_plane_d = Float32(0.0)
+    for i in range(n_pts):
+        if i == i0 or i == i1 or i == i2:
+            continue
+        var dp = abs((pts[i] - pts[i0]).dot(plane_n))
+        if dp > best_plane_d:
+            best_plane_d = dp
+            i3 = i
+    if i3 < 0 or best_plane_d <= eps:
+        # Coplanar point cloud: return unique boundary vertices without 3D volume
+        for i in range(n_pts):
+            out_v.append(pts[i])
+        return (out_v^, out_idx^)
+
+    var interior = (pts[i0] + pts[i1] + pts[i2] + pts[i3]) * Float32(0.25)
+    var faces = List[_QhFace]()
+    faces.append(_make_qh_face(pts, i0, i1, i2, interior))
+    faces.append(_make_qh_face(pts, i0, i2, i3, interior))
+    faces.append(_make_qh_face(pts, i0, i3, i1, interior))
+    faces.append(_make_qh_face(pts, i1, i3, i2, interior))
+
+    var on_hull = List[Bool](length=n_pts, fill=False)
+    on_hull[i0] = True
+    on_hull[i1] = True
+    on_hull[i2] = True
+    on_hull[i3] = True
+
+    for p_i in range(n_pts):
+        if on_hull[p_i]:
+            continue
+        var best_f = -1
+        var max_sd = eps
+        for f_i in range(4):
+            var sd = faces[f_i].n.dot(pts[p_i]) - faces[f_i].offset
+            if sd > max_sd:
+                max_sd = sd
+                best_f = f_i
+        if best_f >= 0:
+            faces[best_f].assign_point(p_i, max_sd)
+
+    # Horizon-ridge expansion loop
+    var max_iters = n_pts * 2 + 8
+    for _ in range(max_iters):
+        var best_f = -1
+        var best_d = eps
+        for f_i in range(len(faces)):
+            if faces[f_i].alive and faces[f_i].furthest_pt >= 0 and faces[f_i].furthest_dist > best_d:
+                best_d = faces[f_i].furthest_dist
+                best_f = f_i
+        if best_f < 0:
+            break
+
+        var eye_idx = faces[best_f].furthest_pt
+        if on_hull[eye_idx]:
+            faces[best_f].furthest_pt = -1
+            faces[best_f].furthest_dist = Float32(-1.0)
+            continue
+        on_hull[eye_idx] = True
+        var eye = pts[eye_idx]
+
+        # Collect visible conflict faces and horizon ridge edges
+        var horizon_a = List[Int]()
+        var horizon_b = List[Int]()
+        var orphans = List[Int]()
+        var vis_eps = max(Float32(1.0e-6), eps * Float32(0.05))
+
+        for f_i in range(len(faces)):
+            if not faces[f_i].alive:
+                continue
+            var sd = faces[f_i].n.dot(eye) - faces[f_i].offset
+            if f_i == best_f or sd > vis_eps:
+                faces[f_i].alive = False
+                for oi in range(len(faces[f_i].outside)):
+                    var op = faces[f_i].outside[oi]
+                    if not on_hull[op]:
+                        orphans.append(op)
+                var fe = [
+                    (faces[f_i].i0, faces[f_i].i1),
+                    (faces[f_i].i1, faces[f_i].i2),
+                    (faces[f_i].i2, faces[f_i].i0),
+                ]
+                for ei in range(3):
+                    var ea = fe[ei][0]
+                    var eb = fe[ei][1]
+                    var cancel = -1
+                    for hk in range(len(horizon_a)):
+                        if horizon_a[hk] == eb and horizon_b[hk] == ea:
+                            cancel = hk
+                            break
+                    if cancel >= 0:
+                        horizon_a[cancel] = -1
+                        horizon_b[cancel] = -1
+                    else:
+                        horizon_a.append(ea)
+                        horizon_b.append(eb)
+
+        var new_face_start = len(faces)
+        for hk in range(len(horizon_a)):
+            if horizon_a[hk] >= 0:
+                faces.append(_make_qh_face(pts, horizon_a[hk], horizon_b[hk], eye_idx, interior))
+        var new_face_end = len(faces)
+        if new_face_end == new_face_start:
+            break
+
+        # Partition orphan points across newly constructed cone faces
+        for oi in range(len(orphans)):
+            var op = orphans[oi]
+            if on_hull[op]:
+                continue
+            var target_f = -1
+            var max_sd = eps
+            for nf in range(new_face_start, new_face_end):
+                var sd = faces[nf].n.dot(pts[op]) - faces[nf].offset
+                if sd > max_sd:
+                    max_sd = sd
+                    target_f = nf
+            if target_f >= 0:
+                faces[target_f].assign_point(op, max_sd)
+
+    # Remap alive face vertex indices into compact hull vertex array
+    var remap = List[Int](length=n_pts, fill=-1)
+    for f_i in range(len(faces)):
+        if not faces[f_i].alive:
+            continue
+        var tri_v = [faces[f_i].i0, faces[f_i].i1, faces[f_i].i2]
+        for k in range(3):
+            var orig = tri_v[k]
+            if remap[orig] < 0:
+                remap[orig] = len(out_v)
+                out_v.append(pts[orig])
+        var r0 = remap[faces[f_i].i0]
+        var r1 = remap[faces[f_i].i1]
+        var r2 = remap[faces[f_i].i2]
+        if r0 != r1 and r1 != r2 and r2 != r0:
+            out_idx.append(Int32(r0))
+            out_idx.append(Int32(r1))
+            out_idx.append(Int32(r2))
+
+    return (out_v^, out_idx^)
+
+
 struct ConvexHull(Copyable, Movable):
-    """Convex polyhedron defined by vertex cloud with support mapping."""
+    """Convex polyhedron defined by vertex cloud and optional outward CCW triangle faces."""
     var vertices: List[Vec3]
+    var indices: List[Int32]
 
     def __init__(out self):
         self.vertices = List[Vec3]()
+        self.indices = List[Int32]()
 
     def __init__(out self, vertices: List[Vec3]):
         self.vertices = vertices.copy()
+        self.indices = List[Int32]()
+
+    def __init__(out self, vertices: List[Vec3], indices: List[Int32]):
+        self.vertices = vertices.copy()
+        self.indices = indices.copy()
 
     def support(self, dir: Vec3, pos: Vec3, rot: Quat) -> Vec3:
         """Finds supporting vertex in direction dir (world space)."""
@@ -870,6 +1127,188 @@ struct ConvexHull(Copyable, Movable):
                 best_dot = d
                 best_v = self.vertices[i]
         return pos + rot.rotate(best_v)
+
+    @staticmethod
+    def build_quickhull(
+        points: List[Vec3],
+        max_verts: Int = 64,
+        weld_eps: Float32 = 1.0e-4,
+    ) -> ConvexHull:
+        """3D Quickhull with spatial vertex welding, horizon-ridge face expansion,
+        and deterministic farthest-point vertex capping (`<= max_verts`)."""
+        var welded = List[Vec3]()
+        var eps2 = max(Float32(0.0), weld_eps) * max(Float32(0.0), weld_eps)
+        for i in range(len(points)):
+            var p = points[i]
+            var dup = False
+            for j in range(len(welded)):
+                if (p - welded[j]).length_squared() <= eps2:
+                    dup = True
+                    break
+            if not dup:
+                welded.append(p)
+
+        var qh = _quickhull_core(welded, max(Float32(1.0e-6), weld_eps))
+        var hull_v = qh[0].copy()
+        var hull_i = qh[1].copy()
+
+        var cap = max(4, max_verts)
+        if len(hull_v) > cap:
+            # Farthest-point sampling seeded with 6-axis extrema to preserve bounding volume
+            var m_count = len(hull_v)
+            var picked = List[Bool](length=m_count, fill=False)
+            var capped = List[Vec3](capacity=cap)
+            var min_d2 = List[Float32](length=m_count, fill=Float32(1.0e30))
+
+            # Seed 0: minimum X (deterministic)
+            var seed0 = 0
+            for i in range(1, m_count):
+                if hull_v[i].x < hull_v[seed0].x:
+                    seed0 = i
+            picked[seed0] = True
+            capped.append(hull_v[seed0])
+            for i in range(m_count):
+                min_d2[i] = (hull_v[i] - hull_v[seed0]).length_squared()
+
+            # Add remaining 5 axis extrema first (if distinct and cap permits)
+            var axes = [
+                Vec3(1, 0, 0), Vec3(0, -1, 0), Vec3(0, 1, 0), Vec3(0, 0, -1), Vec3(0, 0, 1),
+            ]
+            for ax_i in range(5):
+                if len(capped) >= cap:
+                    break
+                var best_ext = -1
+                var best_proj = Float32(-1.0e30)
+                for i in range(m_count):
+                    var proj = hull_v[i].dot(axes[ax_i])
+                    if proj > best_proj:
+                        best_proj = proj
+                        best_ext = i
+                if best_ext >= 0 and not picked[best_ext]:
+                    picked[best_ext] = True
+                    var chosen = hull_v[best_ext]
+                    capped.append(chosen)
+                    for i in range(m_count):
+                        var d2 = (hull_v[i] - chosen).length_squared()
+                        if d2 < min_d2[i]:
+                            min_d2[i] = d2
+
+            while len(capped) < cap:
+                var best_k = -1
+                var best_dist2 = Float32(-1.0)
+                for i in range(m_count):
+                    if not picked[i] and min_d2[i] > best_dist2:
+                        best_dist2 = min_d2[i]
+                        best_k = i
+                if best_k < 0:
+                    break
+                picked[best_k] = True
+                var chosen = hull_v[best_k]
+                capped.append(chosen)
+                for i in range(m_count):
+                    var d2 = (hull_v[i] - chosen).length_squared()
+                    if d2 < min_d2[i]:
+                        min_d2[i] = d2
+
+            var qh_capped = _quickhull_core(capped, max(Float32(1.0e-6), weld_eps))
+            return ConvexHull(qh_capped[0], qh_capped[1])
+
+        return ConvexHull(hull_v, hull_i)
+
+    def compute_polyhedral_mass_properties(
+        self, density: Float32,
+    ) -> Tuple[Float32, Vec3, Sym3]:
+        """Computes exact `(mass, center_of_mass, inertia_tensor_about_com)` for uniform `density`
+        via Mirtich/Eberly signed-tetrahedron integration."""
+        var rho = max(Float32(1.0e-6), density)
+        if len(self.vertices) < 4:
+            return (Float32(0.0), Vec3(), Sym3())
+
+        var verts: List[Vec3]
+        var tris: List[Int32]
+        if len(self.indices) >= 12:
+            verts = self.vertices.copy()
+            tris = self.indices.copy()
+        else:
+            var built = ConvexHull.build_quickhull(
+                self.vertices, max_verts=max(64, len(self.vertices)), weld_eps=Float32(1.0e-5)
+            )
+            verts = built.vertices.copy()
+            tris = built.indices.copy()
+
+        var n_tris = len(tris) // 3
+        if n_tris < 4 or len(verts) < 4:
+            return (Float32(0.0), Vec3(), Sym3())
+
+        # Reference centroid to avoid floating-point cancellation far from origin
+        var p_ref = Vec3()
+        for i in range(len(verts)):
+            p_ref = p_ref + verts[i]
+        p_ref = p_ref * (Float32(1.0) / Float32(len(verts)))
+
+        # Pass 1: exact signed volume and Center of Mass
+        var det_sum = Float32(0.0)
+        var com_accum = Vec3()
+        for t in range(n_tris):
+            var a = verts[Int(tris[t * 3 + 0])] - p_ref
+            var b = verts[Int(tris[t * 3 + 1])] - p_ref
+            var c = verts[Int(tris[t * 3 + 2])] - p_ref
+            var det = a.dot(b.cross(c))
+            det_sum += det
+            com_accum = com_accum + (a + b + c) * det
+
+        var vol = det_sum * Float32(1.0 / 6.0)
+        if vol <= Float32(1.0e-12):
+            if vol < Float32(-1.0e-12):
+                vol = -vol
+                det_sum = -det_sum
+                com_accum = -com_accum
+            else:
+                return (Float32(0.0), p_ref, Sym3())
+
+        var com = p_ref + com_accum * (Float32(1.0) / (Float32(4.0) * det_sum))
+        var mass = rho * vol
+
+        # Pass 2: exact canonical tetrahedron second-moment covariance matrix about CoM
+        var cxx = Float32(0.0)
+        var cyy = Float32(0.0)
+        var czz = Float32(0.0)
+        var cxy = Float32(0.0)
+        var cxz = Float32(0.0)
+        var cyz = Float32(0.0)
+
+        var sign_fix = Float32(1.0) if (
+            (verts[Int(tris[0])] - com).dot(
+                (verts[Int(tris[1])] - com).cross(verts[Int(tris[2])] - com)
+            ) >= Float32(0.0)
+        ) else Float32(-1.0)
+
+        for t in range(n_tris):
+            var a = verts[Int(tris[t * 3 + 0])] - com
+            var b = verts[Int(tris[t * 3 + 1])] - com
+            var c = verts[Int(tris[t * 3 + 2])] - com
+            var det = a.dot(b.cross(c)) * sign_fix
+            var w = det * Float32(1.0 / 120.0)
+
+            var sx = a.x + b.x + c.x
+            var sy = a.y + b.y + c.y
+            var sz = a.z + b.z + c.z
+
+            cxx += w * (a.x * a.x + b.x * b.x + c.x * c.x + sx * sx)
+            cyy += w * (a.y * a.y + b.y * b.y + c.y * c.y + sy * sy)
+            czz += w * (a.z * a.z + b.z * b.z + c.z * c.z + sz * sz)
+
+            cxy += w * (Float32(2.0) * (a.x * a.y + b.x * b.y + c.x * c.y) + a.x * b.y + b.x * a.y + a.x * c.y + c.x * a.y + b.x * c.y + c.x * b.y)
+            cxz += w * (Float32(2.0) * (a.x * a.z + b.x * b.z + c.x * c.z) + a.x * b.z + b.x * a.z + a.x * c.z + c.x * a.z + b.x * c.z + c.x * b.z)
+            cyz += w * (Float32(2.0) * (a.y * a.z + b.y * b.z + c.y * c.z) + a.y * b.z + b.y * a.z + a.y * c.z + c.y * a.z + b.y * c.z + c.y * b.z)
+
+        var ixx = rho * (cyy + czz)
+        var iyy = rho * (cxx + czz)
+        var izz = rho * (cxx + cyy)
+        var ixy = -rho * cxy
+        var ixz = -rho * cxz
+        var iyz = -rho * cyz
+        return (mass, com, Sym3(ixx, iyy, izz, ixy, ixz, iyz))
 
 
 @fieldwise_init

@@ -15,8 +15,12 @@ from std.collections import List
 from std.math import sqrt, max, min, abs
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import det_sin, det_cos, det_atan2
-from flint.physics.tires import PacejkaTire
+from flint.core.serial import BlobWriter, BlobReader, fourcc
+from flint.physics.tires import PacejkaTire, PacejkaParams
 from flint.physics.bvh import Bvh8MeshCollider
+
+comptime VEHICLE_BLOB_TAG: UInt32 = fourcc("VHCL")
+comptime VEHICLE_BLOB_VERSION: Int = 1
 
 
 @fieldwise_init
@@ -640,3 +644,177 @@ struct VehicleChassis(Copyable, Movable):
         var wb_next = _implicit_gyro_step(wb_forced, self.inertia, dt)
         self.angular_vel = self.rot.rotate(wb_next)
         self.rot = (Quat.from_scaled_angle(self.angular_vel * dt) * self.rot).normalized()
+
+    def serialize(self, mut w: BlobWriter):
+        """Bit-exact snapshot of chassis, powertrain, tire parameters, and wheel elastoplastic bristle state."""
+        w.begin(VEHICLE_BLOB_TAG, VEHICLE_BLOB_VERSION)
+        w.f32(self.mass)
+        w.f32(self.inv_mass)
+        w.vec3(self.inertia)
+        w.vec3(self.inv_inertia)
+        w.vec3(self.pos)
+        w.quat(self.rot)
+        w.vec3(self.linear_vel)
+        w.vec3(self.angular_vel)
+        w.f32(self.anti_roll_bar_front)
+        w.f32(self.anti_roll_bar_rear)
+        w.f32(self.roll_center_blend)
+        w.f32(self.drag_coeff)
+        w.f32(self.downforce_coeff)
+        w.f32(self.engine_rpm)
+        w.f32(self.idle_rpm)
+        w.f32(self.redline_rpm)
+        w.integer(self.current_gear)
+        w.integer(len(self.gear_ratios))
+        for i in range(len(self.gear_ratios)):
+            w.f32(self.gear_ratios[i])
+        w.f32(self.final_drive)
+        w.f32(self.lsd_preload)
+        w.f32(self.lsd_power_lock)
+        w.f32(self.lsd_coast_lock)
+        w.f32(self.wheel_inertia)
+        w.f32(self.throttle_input)
+        w.f32(self.brake_input)
+        w.f32(self.steer_input)
+
+        var tp = self.tire_model.params
+        w.f32(tp.B)
+        w.f32(tp.C)
+        w.f32(tp.D)
+        w.f32(tp.E)
+        w.f32(tp.load_sensitivity)
+        w.f32(tp.nominal_load)
+        w.f32(tp.brush_stiffness)
+        w.f32(tp.pneumatic_trail_0)
+        w.f32(tp.kappa_peak)
+        w.f32(tp.alpha_peak)
+        w.f32(tp.relaxation_len_x)
+        w.f32(tp.relaxation_len_y)
+
+        w.integer(len(self.wheels))
+        for i in range(len(self.wheels)):
+            var wc = self.wheels[i]
+            w.vec3(wc.offset)
+            w.f32(wc.radius)
+            w.f32(wc.width)
+            w.f32(wc.spring_k)
+            w.f32(wc.damper_c_bump)
+            w.f32(wc.damper_c_rebound)
+            w.f32(wc.suspension_rest_len)
+            w.f32(wc.max_travel)
+            w.boolean(wc.steered)
+            w.boolean(wc.driven)
+            w.f32(wc.brake_factor)
+
+        w.integer(len(self.wheel_states))
+        for i in range(len(self.wheel_states)):
+            var ws = self.wheel_states[i]
+            w.f32(ws.compression)
+            w.f32(ws.compression_rate)
+            w.f32(ws.steer_angle)
+            w.f32(ws.angular_velocity)
+            w.f32(ws.normal_load)
+            w.f32(ws.slip_ratio)
+            w.f32(ws.slip_angle)
+            w.f32(ws.longitudinal_force)
+            w.f32(ws.lateral_force)
+            w.f32(ws.aligning_torque)
+            w.boolean(ws.grounded)
+            w.vec3(ws.contact_point)
+            w.vec3(ws.contact_normal)
+            w.f32(ws.bristle_x)
+            w.f32(ws.bristle_y)
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        """Restores bit-exact `VehicleChassis` state from `BlobReader`."""
+        _ = r.enter(VEHICLE_BLOB_TAG, VEHICLE_BLOB_VERSION)
+        self.mass = r.f32()
+        self.inv_mass = r.f32()
+        self.inertia = r.vec3()
+        self.inv_inertia = r.vec3()
+        self.pos = r.vec3()
+        self.rot = r.quat()
+        self.linear_vel = r.vec3()
+        self.angular_vel = r.vec3()
+        self.anti_roll_bar_front = r.f32()
+        self.anti_roll_bar_rear = r.f32()
+        self.roll_center_blend = r.f32()
+        self.drag_coeff = r.f32()
+        self.downforce_coeff = r.f32()
+        self.engine_rpm = r.f32()
+        self.idle_rpm = r.f32()
+        self.redline_rpm = r.f32()
+        self.current_gear = r.integer()
+        var n_gears = r.integer()
+        if n_gears < 0 or n_gears > 64:
+            raise Error("vehicle blob: invalid gear count")
+        self.gear_ratios.clear()
+        for _ in range(n_gears):
+            self.gear_ratios.append(r.f32())
+        self.final_drive = r.f32()
+        self.lsd_preload = r.f32()
+        self.lsd_power_lock = r.f32()
+        self.lsd_coast_lock = r.f32()
+        self.wheel_inertia = r.f32()
+        self.throttle_input = r.f32()
+        self.brake_input = r.f32()
+        self.steer_input = r.f32()
+
+        var tp = PacejkaParams()
+        tp.B = r.f32()
+        tp.C = r.f32()
+        tp.D = r.f32()
+        tp.E = r.f32()
+        tp.load_sensitivity = r.f32()
+        tp.nominal_load = r.f32()
+        tp.brush_stiffness = r.f32()
+        tp.pneumatic_trail_0 = r.f32()
+        tp.kappa_peak = r.f32()
+        tp.alpha_peak = r.f32()
+        tp.relaxation_len_x = r.f32()
+        tp.relaxation_len_y = r.f32()
+        self.tire_model = PacejkaTire(tp)
+
+        var n_wheels = r.integer()
+        if n_wheels < 0 or n_wheels > 64:
+            raise Error("vehicle blob: invalid wheel count")
+        self.wheels.clear()
+        for _ in range(n_wheels):
+            var wc = WheelConfig()
+            wc.offset = r.vec3()
+            wc.radius = r.f32()
+            wc.width = r.f32()
+            wc.spring_k = r.f32()
+            wc.damper_c_bump = r.f32()
+            wc.damper_c_rebound = r.f32()
+            wc.suspension_rest_len = r.f32()
+            wc.max_travel = r.f32()
+            wc.steered = r.boolean()
+            wc.driven = r.boolean()
+            wc.brake_factor = r.f32()
+            self.wheels.append(wc)
+
+        var n_states = r.integer()
+        if n_states < 0 or n_states > 64:
+            raise Error("vehicle blob: invalid wheel state count")
+        self.wheel_states.clear()
+        for _ in range(n_states):
+            var ws = WheelState()
+            ws.compression = r.f32()
+            ws.compression_rate = r.f32()
+            ws.steer_angle = r.f32()
+            ws.angular_velocity = r.f32()
+            ws.normal_load = r.f32()
+            ws.slip_ratio = r.f32()
+            ws.slip_angle = r.f32()
+            ws.longitudinal_force = r.f32()
+            ws.lateral_force = r.f32()
+            ws.aligning_torque = r.f32()
+            ws.grounded = r.boolean()
+            ws.contact_point = r.vec3()
+            ws.contact_normal = r.vec3()
+            ws.bristle_x = r.f32()
+            ws.bristle_y = r.f32()
+            self.wheel_states.append(ws)
+        r.leave()

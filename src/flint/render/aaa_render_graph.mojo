@@ -345,18 +345,32 @@ struct AaaRenderGraph(Movable):
         return out
 
 
+@fieldwise_init
+struct ResidencyUploadItem(Copyable, ImplicitlyCopyable, Movable):
+    """Queued byte-budgeted GPU mip or meshlet LOD upload request."""
+    var target_id: Int
+    var sub_level: Int
+    var byte_size: Int
+    var priority: Int
+    var is_mesh_lod: Bool
+
+
 struct AaaResidencyStreamer(Movable):
     """Zero-hitch GPU Mip-Tail & Meshlet Residency Feedback Streamer."""
     var resident_min_mip: List[Int]     # Current resident finest mip per bindless texture
     var requested_min_mip: List[Int]    # GPU feedback requested finest mip
     var streamed_bytes_total: Int
     var streamed_chunks_last_tick: Int
+    var upload_queue: List[ResidencyUploadItem]
+    var drained_bytes_last_tick: Int
 
     def __init__(out self, max_textures: Int = 256, initial_tail_mip: Int = 4):
         self.resident_min_mip = List[Int](length=max_textures, fill=initial_tail_mip)
         self.requested_min_mip = List[Int](length=max_textures, fill=initial_tail_mip)
         self.streamed_bytes_total = 0
         self.streamed_chunks_last_tick = 0
+        self.upload_queue = List[ResidencyUploadItem]()
+        self.drained_bytes_last_tick = 0
 
     def record_gpu_feedback(mut self, tex_id: Int, needed_mip: Int):
         if tex_id >= 0 and tex_id < len(self.requested_min_mip):
@@ -364,8 +378,74 @@ struct AaaResidencyStreamer(Movable):
             if clamped < self.requested_min_mip[tex_id]:
                 self.requested_min_mip[tex_id] = clamped
 
+    def record_feedback(mut self, tex_id: Int, needed_mip: Int):
+        self.record_gpu_feedback(tex_id, needed_mip)
+
+    def enqueue_mip_upload(
+        mut self,
+        tex_id: Int,
+        mip_level: Int,
+        byte_size: Int,
+        priority: Int = 0,
+        is_mesh_lod: Bool = False,
+    ):
+        """Enqueues a byte-budgeted mip or LOD upload ordered by `(priority DESC, coarse mip_level DESC)`."""
+        var clamped_bytes = max(1, byte_size)
+        var lvl = max(0, mip_level)
+        if (not is_mesh_lod) and tex_id >= 0 and tex_id < len(self.requested_min_mip):
+            if lvl < self.requested_min_mip[tex_id]:
+                self.requested_min_mip[tex_id] = lvl
+
+        for i in range(len(self.upload_queue)):
+            ref q = self.upload_queue[i]
+            if q.target_id == tex_id and q.sub_level == lvl and q.is_mesh_lod == is_mesh_lod:
+                if priority > q.priority:
+                    q.priority = priority
+                return
+
+        var item = ResidencyUploadItem(tex_id, lvl, clamped_bytes, priority, is_mesh_lod)
+        var ins = len(self.upload_queue)
+        for i in range(len(self.upload_queue)):
+            ref cur = self.upload_queue[i]
+            if item.priority > cur.priority or (item.priority == cur.priority and item.sub_level > cur.sub_level):
+                ins = i
+                break
+        self.upload_queue.insert(ins, item)
+
+    def drain_uploads_within_budget(mut self, max_bytes_per_tick: Int) -> List[ResidencyUploadItem]:
+        """Drains queued mip/LOD uploads in coarse-to-fine priority order within `max_bytes_per_tick`."""
+        var drained = List[ResidencyUploadItem]()
+        if max_bytes_per_tick <= 0 or len(self.upload_queue) == 0:
+            self.drained_bytes_last_tick = 0
+            return drained^
+
+        var used_bytes = 0
+        var idx = 0
+        while idx < len(self.upload_queue):
+            var cand = self.upload_queue[idx]
+            if used_bytes + cand.byte_size <= max_bytes_per_tick or (used_bytes == 0 and len(drained) == 0):
+                _ = self.upload_queue.pop(idx)
+                used_bytes += cand.byte_size
+                if (not cand.is_mesh_lod) and cand.target_id >= 0 and cand.target_id < len(self.resident_min_mip):
+                    if cand.sub_level < self.resident_min_mip[cand.target_id]:
+                        self.resident_min_mip[cand.target_id] = cand.sub_level
+                drained.append(cand)
+                if used_bytes >= max_bytes_per_tick:
+                    break
+            else:
+                idx += 1
+
+        self.drained_bytes_last_tick = used_bytes
+        self.streamed_bytes_total += used_bytes
+        self.streamed_chunks_last_tick = len(drained)
+        return drained^
+
     def tick_streaming_budget(mut self, base_tex_dim: Int = 1024, byte_budget: Int = 512 * 1024) -> Int:
         """Streams missing high-res BC7 mip levels within `byte_budget` so frame time never hitches!"""
+        if len(self.upload_queue) > 0:
+            var q_drained = self.drain_uploads_within_budget(byte_budget)
+            if len(q_drained) > 0:
+                return len(q_drained)
         var used_bytes = 0
         var chunks = 0
         for tid in range(len(self.resident_min_mip)):
@@ -383,3 +463,6 @@ struct AaaResidencyStreamer(Movable):
         self.streamed_chunks_last_tick = chunks
         self.streamed_bytes_total += used_bytes
         return chunks
+
+    def tick_streaming(mut self, base_tex_dim: Int = 1024, byte_budget: Int = 512 * 1024) -> Int:
+        return self.tick_streaming_budget(base_tex_dim, byte_budget)

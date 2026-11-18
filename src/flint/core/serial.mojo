@@ -14,6 +14,7 @@ appended, so a blob with fields added at the end still loads.
 Floats are written as their exact bit pattern; nothing is rounded or
 formatted, so a written-then-read value is the same value.
 """
+from std.ffi import external_call
 from flint.core.math import Vec3, Quat
 
 comptime BLOB_HEADER_BYTES: Int = 12
@@ -109,6 +110,16 @@ struct BlobWriter(Movable):
         self.u32(UInt32(len(bytes)))
         for byte in bytes:
             self.data.append(byte)
+
+    def write_bytes_raw(mut self, src_ptr: Int, byte_len: Int):
+        """Appends `byte_len` raw bytes from `src_ptr` in a single memcpy."""
+        if src_ptr == 0 or byte_len <= 0:
+            return
+        var old_len = len(self.data)
+        self.data.resize(unsafe_uninit_length=old_len + byte_len)
+        _ = external_call["memcpy", Int](
+            Int(self.data.unsafe_ptr()) + old_len, src_ptr, byte_len
+        )
 
 
 struct BlobReader(Movable):
@@ -220,6 +231,18 @@ struct BlobReader(Movable):
         self.offset += length
         return String(unsafe_from_utf8=bytes) if length > 0 else String()
 
+    def read_bytes_raw(mut self, dst_ptr: Int, byte_len: Int) -> Bool:
+        """Reads `byte_len` raw bytes into `dst_ptr` in a single memcpy."""
+        if byte_len < 0 or self.offset + byte_len > self.limit():
+            self.failed = True
+            return False
+        if byte_len > 0 and dst_ptr != 0:
+            _ = external_call["memcpy", Int](
+                dst_ptr, Int(self.data.unsafe_ptr()) + self.offset, byte_len
+            )
+        self.offset += byte_len
+        return True
+
 
 trait Serializable:
     """State that writes itself as one versioned blob and reads it back.
@@ -242,3 +265,34 @@ def fnv64(data: List[UInt8], start: Int = 0, end: Int = -1) -> UInt64:
     for index in range(start, stop):
         value = (value ^ UInt64(data[index])) * 0x100000001B3
     return value
+
+
+@always_inline
+def _fast_mix64(value: UInt64) -> UInt64:
+    var h = value * UInt64(0xBF58476D1CE4E5B9)
+    h ^= h >> 31
+    h = h * UInt64(0x94D049BB133111EB)
+    return h ^ (h >> 29)
+
+
+def fast_hash64(data_ptr: Int, byte_len: Int) -> UInt64:
+    """Fast 8-byte word-strided 64-bit hash over `[data_ptr, data_ptr + byte_len)`."""
+    if byte_len <= 0 or data_ptr == 0:
+        var empty_h = UInt64(0x9E3779B97F4A7C15)
+        return _fast_mix64(empty_h ^ (UInt64(0xA5) << 56))
+    var h = UInt64(0x9E3779B97F4A7C15) ^ UInt64(byte_len)
+    var at = 0
+    while at + 8 <= byte_len:
+        var word = Pointer[UInt64, origin=ImmutAnyOrigin](
+            unsafe_from_address=data_ptr + at
+        ).unsafe_load[alignment=1]()
+        h = _fast_mix64(h ^ word)
+        at += 8
+    var tail = UInt64(0)
+    var shift = UInt64(0)
+    var bytes = Pointer[UInt8, origin=ImmutAnyOrigin](unsafe_from_address=data_ptr)
+    while at < byte_len:
+        tail |= UInt64(bytes[unsafe_offset=at]) << shift
+        shift += 8
+        at += 1
+    return _fast_mix64(h ^ tail ^ (UInt64(0xA5) << 56))

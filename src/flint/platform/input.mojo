@@ -88,6 +88,12 @@ struct PadState(Copyable, Movable):
     var latched: List[Bool]   # logical controls a toggle holds down
     var mash_ticks: List[Int] # logical controls: ticks held since the last press
     var ff_effect_id: Int
+    var lt_axis_min: Int
+    var lt_axis_max: Int
+    var lt_bipolar: Bool
+    var rt_axis_min: Int
+    var rt_axis_max: Int
+    var rt_bipolar: Bool
 
     def __init__(out self):
         self.fd = -1
@@ -100,6 +106,22 @@ struct PadState(Copyable, Movable):
         self.physical = List[Bool](length=PAD_CONTROLS, fill=False)
         self.latched = List[Bool](length=PAD_CONTROLS, fill=False)
         self.mash_ticks = List[Int](length=PAD_CONTROLS, fill=0)
+        self.lt_axis_min = 0
+        self.lt_axis_max = 32767
+        self.lt_bipolar = False
+        self.rt_axis_min = 0
+        self.rt_axis_max = 32767
+        self.rt_bipolar = False
+
+    def configure_trigger_axis(mut self, axis: Int, min_val: Int, max_val: Int):
+        if axis == PAD_AXIS_LT:
+            self.lt_axis_min = min_val
+            self.lt_axis_max = max(min_val + 1, max_val)
+            self.lt_bipolar = min_val < 0
+        elif axis == PAD_AXIS_RT:
+            self.rt_axis_min = min_val
+            self.rt_axis_max = max(min_val + 1, max_val)
+            self.rt_bipolar = min_val < 0
 
     def set_control(mut self, control: Int, down: Bool):
         if down and not self.down[control]:
@@ -165,7 +187,29 @@ struct PadState(Copyable, Movable):
                 self.set_mapped(control, raw_value != 0, pad_map, toggle)
         elif kind == 2 and number < len(self.axes):
             if number == PAD_AXIS_LT or number == PAD_AXIS_RT:
-                var trig = max(Float32(0.0), min(Float32(1.0), (Float32(raw_value) + 32767.0) / 65534.0))
+                var trig: Float32
+                if number == PAD_AXIS_LT:
+                    if raw_value < 0 and not self.lt_bipolar:
+                        self.lt_bipolar = True
+                        self.lt_axis_min = -32767
+                        self.lt_axis_max = 32767
+                    if self.lt_bipolar:
+                        var span = Float32(max(1, self.lt_axis_max - self.lt_axis_min))
+                        trig = max(Float32(0.0), min(Float32(1.0), Float32(raw_value - self.lt_axis_min) / span))
+                    else:
+                        var span = Float32(max(1, self.lt_axis_max - self.lt_axis_min))
+                        trig = max(Float32(0.0), min(Float32(1.0), Float32(raw_value - self.lt_axis_min) / span))
+                else:
+                    if raw_value < 0 and not self.rt_bipolar:
+                        self.rt_bipolar = True
+                        self.rt_axis_min = -32767
+                        self.rt_axis_max = 32767
+                    if self.rt_bipolar:
+                        var span = Float32(max(1, self.rt_axis_max - self.rt_axis_min))
+                        trig = max(Float32(0.0), min(Float32(1.0), Float32(raw_value - self.rt_axis_min) / span))
+                    else:
+                        var span = Float32(max(1, self.rt_axis_max - self.rt_axis_min))
+                        trig = max(Float32(0.0), min(Float32(1.0), Float32(raw_value - self.rt_axis_min) / span))
                 self.axes[number] = trig
                 self.raw_axes[number] = trig
                 if number == PAD_AXIS_LT:
@@ -221,6 +265,12 @@ struct PadState(Copyable, Movable):
 
     def clear(mut self):
         self.ff_effect_id = -1
+        self.lt_axis_min = 0
+        self.lt_axis_max = 32767
+        self.lt_bipolar = False
+        self.rt_axis_min = 0
+        self.rt_axis_max = 32767
+        self.rt_bipolar = False
         for index in range(len(self.axes)):
             self.axes[index] = 0
             self.raw_axes[index] = 0
@@ -306,6 +356,8 @@ struct InputState(Copyable, Movable):
     var key_mash_ticks: List[Int] # logical keys: ticks held since the last press
     var deadzone_left: Float32
     var deadzone_right: Float32
+    var mouse_extra_down: Array[Bool, 8]
+    var text_input_utf8: String
 
     def __init__(out self):
         self.keys = List[Bool](length=512, fill=False)
@@ -334,6 +386,8 @@ struct InputState(Copyable, Movable):
         self.key_mash_ticks = List[Int](length=KEY_SLOTS, fill=0)
         self.deadzone_left = PAD_DEADZONE
         self.deadzone_right = PAD_DEADZONE
+        self.mouse_extra_down = Array[Bool, 8](fill=False)
+        self.text_input_utf8 = String()
 
     def begin_frame(mut self):
         for index in range(512):
@@ -348,6 +402,10 @@ struct InputState(Copyable, Movable):
         self.delta_x = 0
         self.delta_y = 0
         self.wheel = 0
+        self.text_input_utf8 = String()
+
+    def push_text_utf8(mut self, text: String):
+        self.text_input_utf8 += text
 
     def mute(mut self):
         """Nothing is held and nothing happened. The console does this every frame it
@@ -360,6 +418,8 @@ struct InputState(Copyable, Movable):
             self.key_mash_ticks[index] = 0
         for index in range(3):
             self.mouse[index] = False
+        for index in range(8):
+            self.mouse_extra_down[index] = False
         for pad in range(MAX_PADS):
             self.pads[pad].clear()
 
@@ -458,13 +518,15 @@ struct InputState(Copyable, Movable):
         self.keys[key] = down
 
     def set_mouse(mut self, button: Int, down: Bool):
-        if button < 0 or button >= 3:
+        if button < 0 or button >= 8:
             return
-        if down and not self.mouse[button]:
-            self.mouse_pressed_state[button] = True
-        if not down and self.mouse[button]:
-            self.mouse_released_state[button] = True
-        self.mouse[button] = down
+        self.mouse_extra_down[button] = down
+        if button < 3:
+            if down and not self.mouse[button]:
+                self.mouse_pressed_state[button] = True
+            if not down and self.mouse[button]:
+                self.mouse_released_state[button] = True
+            self.mouse[button] = down
 
     def move_mouse(mut self, x: Float32, y: Float32):
         if self.has_mouse_position:
@@ -489,7 +551,11 @@ struct InputState(Copyable, Movable):
         return key >= 0 and key < 512 and self.released[key]
 
     def mouse_down(self, button: Int) -> Bool:
-        return button >= 0 and button < 3 and self.mouse[button]
+        if button >= 0 and button < 3:
+            return self.mouse[button]
+        if button >= 3 and button < 8:
+            return self.mouse_extra_down[button]
+        return False
 
     def mouse_pressed(self, button: Int) -> Bool:
         return button >= 0 and button < 3 and self.mouse_pressed_state[button]

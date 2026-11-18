@@ -29,7 +29,12 @@ from flint.render.spirv import (
     OP_COMPOSITE_CONSTRUCT,
     OP_COMPOSITE_EXTRACT,
     OP_CONSTANT,
+    OP_CONSTANT_FALSE,
+    OP_CONSTANT_TRUE,
     OP_CONSTANT_COMPOSITE,
+    OP_SPEC_CONSTANT,
+    OP_SPEC_CONSTANT_FALSE,
+    OP_SPEC_CONSTANT_TRUE,
     OP_CONTROL_BARRIER,
     OP_CONVERT_F_TO_S,
     OP_CONVERT_F_TO_U,
@@ -435,9 +440,25 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                         rep.has_ray_query = True
                         if not has_cap_ray_query or not has_ext_ray_query:
                             rep.fail("RayQuery/AccelerationStructure type used without SPV_KHR_ray_query + RayQueryKHR capability")
-                elif op == OP_CONSTANT or op == OP_CONSTANT_COMPOSITE or op == OP_VARIABLE:
-                    if wc < 4 and op != OP_CONSTANT_COMPOSITE:
-                        rep.fail("global OpConstant/OpVariable truncated")
+                elif (
+                    op == OP_CONSTANT
+                    or op == OP_CONSTANT_TRUE
+                    or op == OP_CONSTANT_FALSE
+                    or op == OP_SPEC_CONSTANT
+                    or op == OP_SPEC_CONSTANT_TRUE
+                    or op == OP_SPEC_CONSTANT_FALSE
+                    or op == OP_CONSTANT_COMPOSITE
+                    or op == OP_VARIABLE
+                ):
+                    var min_wc = 3 if (
+                        op == OP_CONSTANT_COMPOSITE
+                        or op == OP_CONSTANT_TRUE
+                        or op == OP_CONSTANT_FALSE
+                        or op == OP_SPEC_CONSTANT_TRUE
+                        or op == OP_SPEC_CONSTANT_FALSE
+                    ) else 4
+                    if wc < min_wc:
+                        rep.fail("global OpConstant/OpSpecConstant/OpVariable truncated")
                     else:
                         var rtype = Int(words[pos + 1])
                         var rid = Int(words[pos + 2])

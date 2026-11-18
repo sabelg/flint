@@ -11,11 +11,13 @@ comptime PRIM_GLYPH: UInt32 = 1
 comptime PRIM_NINE_SLICE: UInt32 = 2
 comptime PRIM_CONTROLLER_SYMBOL: UInt32 = 3
 comptime PRIM_LINE: UInt32 = 4
+comptime PRIM_IMAGE: UInt32 = 5
 
 comptime UI_FLAG_DROP_SHADOW: UInt32 = 1 << 0
 comptime UI_FLAG_BORDER: UInt32 = 1 << 1
 comptime UI_FLAG_CIRCLE: UInt32 = 1 << 2
 comptime UI_FLAG_VERT_GRADIENT: UInt32 = 1 << 3
+comptime UI_FLAG_QUAD_BEZIER: UInt32 = 1 << 4
 
 
 @fieldwise_init
@@ -205,3 +207,181 @@ struct UiDrawList(Movable):
             tint_color, 0,
             0.0, 0.0, 1.0, hdr
         ))
+
+    def add_controller_symbol(
+        mut self,
+        symbol_id: Int,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        fill_color: UInt32,
+        secondary_color: UInt32 = 0xFF1A1E24,
+        corner_radius: Float32 = 4.0,
+    ):
+        var c = self.current_clip()
+        var hdr: UInt32 = (PRIM_CONTROLLER_SYMBOL & 0xF) | (UInt32(symbol_id & 0xFFF) << 4)
+        self.prims.append(GpuUiPrim(
+            x, y, x + w, y + h,
+            0.0, 0.0, 1.0, 1.0,
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            fill_color, secondary_color,
+            corner_radius, 1.0, 1.0, hdr
+        ))
+
+    def add_rect_styled(
+        mut self,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        fill_color: UInt32,
+        secondary_color: UInt32 = 0,
+        corner_radius: Float32 = 0.0,
+        border_width: Float32 = 0.0,
+        softness: Float32 = 1.0,
+        flags: UInt32 = 0,
+    ):
+        var c = self.current_clip()
+        var eff_flags = flags | (UI_FLAG_BORDER if border_width > 0.0 else 0)
+        var hdr: UInt32 = (PRIM_SHAPE & 0xF) | (eff_flags << 16)
+        self.prims.append(GpuUiPrim(
+            x, y, x + w, y + h,
+            0.0, 0.0, 1.0, 1.0,
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            fill_color, secondary_color,
+            corner_radius, border_width, softness, hdr
+        ))
+
+    def add_line(
+        mut self,
+        x0: Float32,
+        y0: Float32,
+        x1: Float32,
+        y1: Float32,
+        thickness: Float32,
+        color: UInt32,
+        softness: Float32 = 1.0,
+    ):
+        var half_t = max(Float32(0.5), thickness * Float32(0.5))
+        var pad = half_t + max(Float32(0.5), softness)
+        var bx0 = min(x0, x1) - pad
+        var by0 = min(y0, y1) - pad
+        var bx1 = max(x0, x1) + pad
+        var by1 = max(y0, y1) + pad
+        var c = self.current_clip()
+        var hdr: UInt32 = (PRIM_LINE & 0xF)
+        self.prims.append(GpuUiPrim(
+            bx0, by0, bx1, by1,
+            x0, y0, x1, y1,
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            color, 0,
+            half_t, 0.0, softness, hdr
+        ))
+
+    def add_quad_bezier(
+        mut self,
+        x0: Float32,
+        y0: Float32,
+        cx: Float32,
+        cy: Float32,
+        x1: Float32,
+        y1: Float32,
+        thickness: Float32,
+        color: UInt32,
+        softness: Float32 = 1.0,
+    ):
+        var min_x = min(x0, x1)
+        var max_x = max(x0, x1)
+        var min_y = min(y0, y1)
+        var max_y = max(y0, y1)
+
+        # Exact quadratic Bezier interior extrema: B'(t) = 0 => t = (p0 - c) / (p0 - 2c + p1)
+        var dx_den = x0 - Float32(2.0) * cx + x1
+        if abs(dx_den) > Float32(1.0e-6):
+            var tx = (x0 - cx) / dx_den
+            if tx > Float32(0.0) and tx < Float32(1.0):
+                var omt = Float32(1.0) - tx
+                var ex = omt * omt * x0 + Float32(2.0) * omt * tx * cx + tx * tx * x1
+                min_x = min(min_x, ex)
+                max_x = max(max_x, ex)
+
+        var dy_den = y0 - Float32(2.0) * cy + y1
+        if abs(dy_den) > Float32(1.0e-6):
+            var ty = (y0 - cy) / dy_den
+            if ty > Float32(0.0) and ty < Float32(1.0):
+                var omt = Float32(1.0) - ty
+                var ey = omt * omt * y0 + Float32(2.0) * omt * ty * cy + ty * ty * y1
+                min_y = min(min_y, ey)
+                max_y = max(max_y, ey)
+
+        var half_t = max(Float32(0.5), thickness * Float32(0.5))
+        var pad = half_t + max(Float32(0.5), softness)
+        var c = self.current_clip()
+        var hdr: UInt32 = (PRIM_LINE & 0xF) | (UI_FLAG_QUAD_BEZIER << 16)
+        self.prims.append(GpuUiPrim(
+            min_x - pad, min_y - pad, max_x + pad, max_y + pad,
+            x0, y0, x1, y1,
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            color, 0,
+            cx, cy, half_t, hdr
+        ))
+
+    def add_image(
+        mut self,
+        tex_slot: Int,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        u0: Float32 = 0.0,
+        v0: Float32 = 0.0,
+        u1: Float32 = 1.0,
+        v1: Float32 = 1.0,
+        tint_color: UInt32 = 0xFFFFFFFF,
+        corner_radius: Float32 = 0.0,
+        border_width: Float32 = 0.0,
+        border_color: UInt32 = 0,
+    ):
+        var c = self.current_clip()
+        var flags: UInt32 = (UI_FLAG_BORDER if border_width > 0.0 else 0)
+        var hdr: UInt32 = (PRIM_IMAGE & 0xF) | (UInt32(tex_slot & 0xFFF) << 4) | (flags << 16)
+        self.prims.append(GpuUiPrim(
+            x, y, x + w, y + h,
+            u0, v0, u1, v1,
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            tint_color, border_color,
+            corner_radius, border_width, 1.0, hdr
+        ))
+
+    def add_text_mut(
+        mut self,
+        font_slot: Int,
+        mut font: SdfFont,
+        text: String,
+        x: Float32,
+        y: Float32,
+        font_size: Float32,
+        color: UInt32,
+        outline: Float32 = 0.0,
+        outline_color: UInt32 = 0,
+        shadow: Float32 = 0.0,
+    ):
+        font.ensure_text(text)
+        self.add_text(
+            font_slot,
+            font,
+            text,
+            x,
+            y,
+            font_size,
+            color,
+            outline,
+            outline_color,
+            shadow,
+        )

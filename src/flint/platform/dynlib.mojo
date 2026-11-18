@@ -38,3 +38,26 @@ def dl_sym(library: Int, var name: String) -> Int:
     if library == 0:
         return 0
     return _address(external_call["dlsym", _Handle](_handle(library), name.as_c_string_span()))
+
+
+def dl_close(library: Int) -> Int32:
+    """Closes a loaded library handle; returns 0 on success."""
+    if library == 0:
+        return 0
+    return external_call["dlclose", Int32](_handle(library))
+
+
+def dl_error() -> String:
+    """Returns the latest human-readable dynamic loader error, or empty."""
+    var addr = _address(external_call["dlerror", _Handle]())
+    if addr == 0:
+        return String()
+    var bytes = List[UInt8]()
+    var at = addr
+    while True:
+        var b = Pointer[UInt8, origin=ImmutAnyOrigin](unsafe_from_address=at)[unsafe_offset=0]
+        if b == 0:
+            break
+        bytes.append(b)
+        at += 1
+    return String(unsafe_from_utf8=bytes) if len(bytes) > 0 else String()
