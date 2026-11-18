@@ -37,6 +37,7 @@ resolve_mojo() {
 compile_mojo() {
     local src="$1"
     local out="$2"
+    local opt="${3:--O3}"
     local tmp
     tmp="$(mktemp "/tmp/flint-link-$(basename "$out")-XXXXXX")"
     rm -f "$tmp" "$out"
@@ -45,7 +46,10 @@ compile_mojo() {
     local extra_inc=""
     if [[ -d "$nd_src" ]]; then extra_inc="$extra_inc -I $nd_src"; fi
     if [[ -d "$rct_src" ]]; then extra_inc="$extra_inc -I $rct_src"; fi
-    "$MOJO_BIN" build "$src" -o "$tmp" -I "${ROOT}/src" -I "${ROOT}/tests" $extra_inc -O3 --fp-mode contract=off
+    if ! "$MOJO_BIN" build "$src" -o "$tmp" -I "${ROOT}/src" -I "${ROOT}/tests" $extra_inc "$opt" --fp-mode contract=off; then
+        rm -f "$tmp"
+        return 1  # also when called from an `if`, where `set -e` does not stop us
+    fi
     rm -f "$out"
     cp "$tmp" "$out"
     chmod +x "$out"
@@ -161,6 +165,117 @@ cmd_kms() {
 cmd_kms3d() {
     cmd_build kms3d
     FLINT_BACKEND="${FLINT_BACKEND:-kms}" exec "${ROOT}/build/flint-kms3d" "$@"
+}
+
+# Live preview: keep a program's window open while you edit. Every save of a .mojo file
+# (the program's own tree and Flint's src/) rebuilds it in the background; a good build
+# replaces the window, a failed one prints the errors and leaves the old window running.
+preview_source() {
+    case "$1" in
+        spark|play) echo "${ROOT}/examples/minimal_spark/main.mojo" ;;
+        world)      echo "${ROOT}/examples/open_world/main.mojo" ;;
+        cycles)     echo "${ROOT}/examples/cycles/main.mojo" ;;
+        *)
+            if [[ -d "$1" && -f "$1/main.mojo" ]]; then echo "$(cd "$1" && pwd)/main.mojo"
+            elif [[ -d "$1" && -f "$1/src/main.mojo" ]]; then echo "$(cd "$1/src" && pwd)/main.mojo"
+            elif [[ -f "$1" ]]; then echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+            fi ;;
+    esac
+}
+
+cmd_preview() {
+    local target="${1:-}"
+    if [[ -z "$target" || "$target" == "-h" || "$target" == "--help" ]]; then
+        echo "Usage: bash tools/flint.sh preview <spark|world|cycles|program.mojo|project_dir> [--release] [-- program args...]"
+        echo "  Rebuilds on every .mojo save and swaps the window. -O1 builds; --release uses -O3."
+        echo "  Runs windowed (FLINT_WINDOWED=1); Ctrl+C stops the preview and its window."
+        return 1
+    fi
+    shift
+    local opt="-O1"
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --release) opt="-O3"; shift ;;
+            --) shift; args=("$@"); break ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    local src
+    src="$(preview_source "$target")"
+    if [[ -z "$src" || ! -f "$src" ]]; then
+        echo "[Preview] No program at '$target' (a target name, a .mojo file, or a directory with main.mojo / src/main.mojo)." >&2
+        return 1
+    fi
+    resolve_mojo
+    [[ -f "${ROOT}/src/flint/core/build_stamp.mojo" ]] || write_build_stamp "$MOJO_BIN"
+    # A program inside a project (.../src/...) runs from the project root, where its assets live.
+    local run_dir="$ROOT"
+    local watch_dirs=("${ROOT}/src" "$(dirname "$src")")
+    if [[ "$src" == */src/* ]]; then
+        run_dir="${src%%/src/*}"
+        watch_dirs+=("${run_dir}/src")
+    fi
+    local name
+    name="$(basename "$(dirname "$src")")"
+    [[ "$name" == "src" ]] && name="$(basename "$run_dir")"
+    mkdir -p "${ROOT}/build/preview"
+    local bin="${ROOT}/build/preview/${name}"
+    local stamp="${ROOT}/build/preview/.${name}.stamp"
+    local child=0
+
+    stop_child() {
+        if [[ $child -gt 0 ]] && kill -0 "$child" 2>/dev/null; then
+            kill -TERM "$child" 2>/dev/null || true
+            for _ in $(seq 30); do kill -0 "$child" 2>/dev/null || break; sleep 0.1; done
+            kill -KILL "$child" 2>/dev/null || true
+            wait "$child" 2>/dev/null || true
+        fi
+        child=0
+    }
+    launch_child() {
+        ( cd "$run_dir" && FLINT_WINDOWED="${FLINT_WINDOWED:-1}" exec "$bin" "${args[@]+"${args[@]}"}" ) &
+        child=$!
+        echo "[Preview] Running ${name} (pid ${child}). Edit and save; Ctrl+C stops."
+    }
+    rebuild() {
+        touch "$stamp"  # edits saved while compiling trigger the next rebuild
+        local started=$SECONDS
+        echo "[Preview] Building ${src#${run_dir}/} (${opt}) ..."
+        if compile_mojo "$src" "${bin}.next" "$opt"; then
+            echo "[Preview] Built in $((SECONDS - started)) s."
+            stop_child
+            if mv -f "${bin}.next" "$bin"; then
+                launch_child
+            fi
+        else
+            echo "[Preview] Build failed after $((SECONDS - started)) s; the previous window keeps running. Fix and save again."
+        fi
+    }
+    changed_file() {
+        find "${watch_dirs[@]}" -name '*.mojo' -newer "$stamp" \
+            ! -path '*/build/*' ! -name 'build_stamp.mojo' -print -quit 2>/dev/null
+    }
+
+    trap 'echo; echo "[Preview] Stopping."; stop_child; exit 0' INT TERM
+    trap 'stop_child' EXIT  # never leave a window behind, however the preview ends
+    echo "[Preview] Watching: ${watch_dirs[*]}"
+    rebuild
+    while true; do
+        sleep 0.5
+        if [[ $child -gt 0 ]] && ! kill -0 "$child" 2>/dev/null; then
+            wait "$child" 2>/dev/null || true
+            child=0
+            echo "[Preview] The window closed. Save a file to build and open it again (Ctrl+C to quit)."
+        fi
+        local hit
+        hit="$(changed_file)"
+        if [[ -n "$hit" ]]; then
+            sleep 0.3  # let an editor finish writing (and catch save-all)
+            echo "[Preview] Changed: ${hit#${run_dir}/}"
+            rebuild
+        fi
+    done
 }
 
 cmd_world() {
@@ -279,6 +394,7 @@ case "$subcmd" in
     world) cmd_world "$@" ;;
     kms)   cmd_kms "$@" ;;
     kms3d) cmd_kms3d "$@" ;;
+    preview) cmd_preview "$@" ;;
     cycles) cmd_cycles "$@" ;;
     shot)  cmd_shot "$@" ;;
     gate)  cmd_gate "$@" ;;
@@ -296,6 +412,7 @@ case "$subcmd" in
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
         echo "  kms [--probe]        Run the bare-display DRM/KMS demo from a text console (no X11/Wayland)"
         echo "  kms3d                GPU 3D on the bare display: AAA Vulkan renderer presenting via VK_KHR_display"
+        echo "  preview <program>    Live preview: rebuild on save and swap the window (spark|world|cycles|file.mojo|dir)"
         echo "  world [--shots]      Launch 512m x 512m AAA Vulkan Open-World sandbox (or render 3 720p vistas)"
         echo "  shot                 Render deterministic headless PNG to build/shots/flint_spark.png"
         echo "  gate                 Run full verification gate (sync + build + test + headless shot)"
