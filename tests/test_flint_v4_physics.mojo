@@ -142,6 +142,11 @@ def test_1_solver_delta_quat_nyquist_coupled_tangent_and_gyro() raises:
 
     # 1e. Implicit Newton-Raphson gyroscopic torque preserves rotational energy (Dzhanibekov intermediate axis)
     var gyro_bodies = SolverBodies()
+    # Batches are groups of 8 bodies; integrate_* take a batch index (checked), not a body index.
+    var batching = SolverBodies()
+    for pair in [(0, 0), (1, 1), (5, 1), (8, 1), (9, 2), (17, 3)]:
+        batching.reset(pair[0])
+        assert_equal(batching.batch_count(), pair[1])
     gyro_bodies.reset(1)
     gyro_bodies.inv_mass[0] = 1.0
     gyro_bodies.set_body_inertia(0, Vec3(1.0, 2.5, 4.0))  # Intermediate axis is Y (2.5)

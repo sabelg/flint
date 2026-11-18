@@ -13,6 +13,7 @@ v4 Upgrades:
    energy and capturing the Dzhanibekov intermediate-axis flip without energy blowup.
 """
 from std.math import sqrt, abs, max
+from std.os import abort
 from flint.core.math import Vec3, Quat
 
 comptime LANES: Int = 8
@@ -410,9 +411,25 @@ struct SolverBodies(Movable):
         """The centre of mass now."""
         return Vec3(self.px[i] + self.dpx[i], self.py[i] + self.dpy[i], self.pz[i] + self.dpz[i])
 
+    def batch_count(self) -> Int:
+        """How many 8-body batches `integrate_velocities` / `integrate_positions` take:
+        batch `b` holds bodies `b*8 .. b*8+7`, so 1..8 bodies are batch 0 alone."""
+        return self.padded // LANES
+
+    def _check_batch(self, batch: Int, caller: StaticString):
+        # The SIMD loads and stores below are unchecked; a batch past the end would read
+        # and overwrite whatever the allocator placed after each column.
+        if batch < 0 or batch >= self.batch_count():
+            abort(
+                String("SolverBodies.", caller, ": batch ", batch, " out of range (", self.count, " bodies = ",
+                       self.batch_count(), " batches of ", LANES, "; pass a batch index, not a body index)")
+            )
+
     def integrate_velocities(mut self, batch: Int, h: Float32, max_speed: Float32, max_turn: Float32):
         """Gravity, fields, damping, 1-step Implicit Newton-Raphson Gyroscopic Torque
-        (`I_b*(w_b^+ - w_b) + h*(w_b^+ x I_b*w_b^+) = 0`), and speed clamps in `F8` SIMD."""
+        (`I_b*(w_b^+ - w_b) + h*(w_b^+ x I_b*w_b^+) = 0`), and speed clamps in `F8` SIMD.
+        `batch` is an 8-body batch (`0 ..< batch_count()`), not a body index."""
+        self._check_batch(batch, "integrate_velocities")
         var at = batch * LANES
         var v = V8(ld(self.vx, at), ld(self.vy, at), ld(self.vz, at))
         var w = V8(ld(self.wx, at), ld(self.wy, at), ld(self.wz, at))
@@ -514,6 +531,7 @@ struct SolverBodies(Movable):
         st(self.wz, at, w.z)
 
     def integrate_positions(mut self, batch: Int, h: Float32):
+        self._check_batch(batch, "integrate_positions")
         var at = batch * LANES
         var hv = F8(h)
         var vx = ld(self.vx, at)
