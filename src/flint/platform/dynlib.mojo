@@ -30,7 +30,7 @@ def _address(handle: _Handle) -> Int:
 def dl_open(var name: String, flags: Int32 = RTLD_NOW) -> Int:
     """The library's handle, or 0 if it can't be loaded."""
     var c_name = name.as_c_string_span()
-    return _address(external_call["dlopen", _Handle](_handle(Int(c_name.unsafe_ptr())), flags))
+    return _address(external_call["dlopen", _Handle](_handle(Int(c_name.ptr())), flags))
 
 
 def dl_sym(library: Int, var name: String) -> Int:
