@@ -1352,6 +1352,19 @@ struct EntityRecord(Copyable, ImplicitlyCopyable, Movable):
     var sparse_mask: BitSet256
 
 
+def _blob_fits(reader: BlobReader, count: Int, elem_bytes: Int) -> Bool:
+    """True when `count` records of `elem_bytes` each can still be read from `reader`
+    (checked before allocating, so a corrupted count cannot request terabytes)."""
+    if count < 0:
+        return False
+    var left = reader.limit() - reader.offset
+    if left < 0:
+        return False
+    if elem_bytes <= 0:
+        return count <= left
+    return count <= left // elem_bytes
+
+
 @fieldwise_init
 struct _ParSlice1(Copyable, ImplicitlyCopyable, Movable):
     var entities_ptr: Int
@@ -2489,6 +2502,10 @@ struct World(Movable):
             or saved_comp_count > MAX_COMPONENTS
         ):
             raise Error("World.restore_blob: corrupted ECS2 header")
+        if not _blob_fits(reader, ent_len, size_of[EntityRecord]()) or not _blob_fits(
+            reader, free_len, size_of[UInt32]()
+        ):
+            raise Error("World.restore_blob: entity or free-list count exceeds blob size")
 
         # Validate & remap saved_i -> local_i BEFORE mutating self!
         var saved_to_local = Array[Int, MAX_COMPONENTS](fill=-1)
@@ -2522,12 +2539,23 @@ struct World(Movable):
                 Int(new_entities.unsafe_ptr()), ent_len * size_of[EntityRecord]()
             ):
                 raise Error("World.restore_blob: truncated ECS2 entity records")
-            for i in range(ent_len):
-                new_entities[i].sparse_mask = BitSet256()
-                if not new_entities[i].alive:
-                    new_entities[i].archetype_id = -1
-                    new_entities[i].chunk_idx = -1
-                    new_entities[i].row_in_chunk = -1
+        # Placement comes only from the chunk tables below, never from the raw records;
+        # `alive` is normalized from its raw byte (any non-zero byte means alive).
+        var alive_count = 0
+        var rec_base = Int(new_entities.unsafe_ptr())
+        for i in range(ent_len):
+            var alive_byte = Pointer[UInt8, ImmutAnyOrigin](
+                unsafe_from_address=rec_base + i * size_of[EntityRecord]() + 4
+            )[unsafe_offset=0]
+            new_entities[i].alive = alive_byte != 0
+            new_entities[i].sparse_mask = BitSet256()
+            new_entities[i].archetype_id = -1
+            new_entities[i].chunk_idx = -1
+            new_entities[i].row_in_chunk = -1
+            if new_entities[i].alive:
+                alive_count += 1
+        if alive_count != saved_live:
+            raise Error("World.restore_blob: live entity count does not match entity records")
 
         var new_free = List[UInt32](capacity=max(1, free_len))
         new_free.resize(unsafe_uninit_length=free_len)
@@ -2536,6 +2564,10 @@ struct World(Movable):
                 Int(new_free.unsafe_ptr()), free_len * size_of[UInt32]()
             ):
                 raise Error("World.restore_blob: truncated ECS2 free list")
+        for i in range(free_len):
+            var fidx = Int(new_free[i])
+            if fidx >= ent_len or new_entities[fidx].alive:
+                raise Error("World.restore_blob: free list names a live or out-of-range entity")
 
         # Header & entity tables validated: now safe to clear destination world
         self._drop_all_live_components()
@@ -2548,7 +2580,7 @@ struct World(Movable):
 
         var reader_addr = Int(Pointer(to=reader))
         var num_archs = reader.integer()
-        if num_archs < 0 or reader.failed:
+        if num_archs < 0 or reader.failed or not _blob_fits(reader, num_archs, 40):
             self.clear_entities()
             raise Error("World.restore_blob: corrupted archetype count")
 
@@ -2566,13 +2598,13 @@ struct World(Movable):
 
             var dst_arch = self._find_or_create_archetype(local_mask)
             var num_chunks = reader.integer()
-            if num_chunks < 0 or reader.failed:
+            if num_chunks < 0 or reader.failed or not _blob_fits(reader, num_chunks, 8):
                 self.clear_entities()
                 raise Error("World.restore_blob: corrupted chunk count")
 
             for _ in range(num_chunks):
                 var cnt = reader.integer()
-                if cnt < 0 or reader.failed:
+                if cnt < 0 or reader.failed or not _blob_fits(reader, cnt, size_of[Entity]()):
                     self.clear_entities()
                     raise Error("World.restore_blob: corrupted chunk row count")
                 var dst_ch = len(self.archetypes[dst_arch].chunks)
@@ -2594,11 +2626,19 @@ struct World(Movable):
                     for r in range(cnt):
                         var e = chunk.entities[r]
                         var eidx = Int(e.index)
-                        if eidx < 0 or eidx >= len(self.entities):
+                        if (
+                            eidx < 0
+                            or eidx >= len(self.entities)
+                            or not self.entities[eidx].alive
+                            or self.entities[eidx].generation != e.generation
+                            or self.entities[eidx].archetype_id != -1
+                        ):
                             chunk.count = 0
                             chunk.entities.clear()
                             self.clear_entities()
-                            raise Error("World.restore_blob: out-of-range entity index in chunk")
+                            raise Error(
+                                "World.restore_blob: chunk names a dead, stale, duplicate or out-of-range entity"
+                            )
                         self.entities[eidx].archetype_id = Int32(dst_arch)
                         self.entities[eidx].chunk_idx = Int32(dst_ch)
                         self.entities[eidx].row_in_chunk = Int32(r)
@@ -2670,8 +2710,13 @@ struct World(Movable):
                         col_ready[col_idx] = True
                 self.archetypes[dst_arch].chunks.append(chunk^)
 
+        for i in range(len(self.entities)):
+            if self.entities[i].alive and self.entities[i].archetype_id < 0:
+                self.clear_entities()
+                raise Error("World.restore_blob: live entity is missing from every archetype chunk")
+
         var num_sparse = reader.integer()
-        if num_sparse < 0 or reader.failed:
+        if num_sparse < 0 or reader.failed or not _blob_fits(reader, num_sparse, 16):
             self.clear_entities()
             raise Error("World.restore_blob: corrupted sparse set count")
 
@@ -2682,7 +2727,7 @@ struct World(Movable):
                 self.clear_entities()
                 raise Error("World.restore_blob: unregistered component ID " + String(chash))
             var scnt = reader.integer()
-            if scnt < 0 or reader.failed:
+            if scnt < 0 or reader.failed or not _blob_fits(reader, scnt, size_of[Entity]()):
                 self.clear_entities()
                 raise Error("World.restore_blob: corrupted sparse entity count")
             var sidx = self.comp_to_sparse[tid]
@@ -2739,9 +2784,15 @@ struct World(Movable):
             sset.changed_ticks = List[UInt32](length=scnt, fill=self.current_tick)
             for di in range(scnt):
                 var eidx = Int(sset.dense_entities[di].index)
-                if eidx < 0 or eidx >= len(self.entities):
+                if (
+                    eidx < 0
+                    or eidx >= len(self.entities)
+                    or not self.entities[eidx].alive
+                    or self.entities[eidx].generation != sset.dense_entities[di].generation
+                    or self.entities[eidx].sparse_mask.test(tid)
+                ):
                     self.clear_entities()
-                    raise Error("World.restore_blob: out-of-range sparse entity index")
+                    raise Error("World.restore_blob: sparse set names a dead, stale, duplicate or out-of-range entity")
                 var page = eidx >> SPARSE_PAGE_BITS
                 sset._ensure_page(page)
                 sset.pages[page][eidx & SPARSE_PAGE_MASK] = Int32(di)

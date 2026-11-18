@@ -1429,6 +1429,44 @@ def test_g_v5_review_regressions() raises:
     assert_true(Entity.from_entity_handle(prov_h) == prov_e)
 
 
+def test_h_restore_blob_rejects_hostile_counts() raises:
+    """A corrupted snapshot must raise, never allocate from an unchecked count or crash."""
+    var w = World()
+    _ = w.register_component[CompPos]()
+    _ = w.register_component[TagBurningSparse]()
+    for i in range(40):
+        var e = w.spawn_empty()
+        _ = w.insert[CompPos](e, CompPos(Float32(i), 0.0, 0.0))
+        if i % 4 == 0:
+            _ = w.insert[TagBurningSparse](e, TagBurningSparse(Float32(i)))
+    var snap = BlobWriter()
+    w.snapshot_blob(snap)
+    var rejected = 0
+    # Overwrite each 8-byte-aligned header word with a huge count.
+    for at in range(0, min(256, len(snap.data) - 8), 8):
+        var bad = snap.data.copy()
+        for k in range(8):
+            bad[at + k] = UInt8(0x7F) if k == 7 else UInt8(0xFF)
+        var t = World()
+        _ = t.register_component[CompPos]()
+        _ = t.register_component[TagBurningSparse]()
+        var rd = BlobReader(bad^)
+        try:
+            t.restore_blob(rd)
+        except:
+            rejected += 1
+        _ = t.state_checksum()
+    assert_true(rejected > 0)
+    # The untouched snapshot still restores exactly.
+    var t2 = World()
+    _ = t2.register_component[CompPos]()
+    _ = t2.register_component[TagBurningSparse]()
+    var rd2 = BlobReader(snap.data.copy())
+    t2.restore_blob(rd2)
+    assert_equal(t2.entity_count(), 40)
+    assert_equal(t2.state_checksum(), w.state_checksum())
+
+
 def main() raises:
     var t0 = get_time()
     print("[Flint v5 Track 1] Running Core, Hybrid ECS v2, Scene/Prefab & Hot-Reload Suite...")
@@ -1454,5 +1492,8 @@ def main() raises:
     test_g_v5_review_regressions()
     print("  [PASS] (g) v5 Review Regressions (hash remap, heap Clone Vault 100x, resource resize, implicit cmds, handles)")
 
+    test_h_restore_blob_rejects_hostile_counts()
+    print("  [PASS] (h) restore_blob rejects corrupted counts and entity tables without allocating")
+
     var elapsed = get_time() - t0
-    print("[Flint v5 Track 1] ALL 7 SUITES PASSED in " + String(elapsed) + " s")
+    print("[Flint v5 Track 1] ALL 8 SUITES PASSED in " + String(elapsed) + " s")
