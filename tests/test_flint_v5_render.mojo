@@ -159,6 +159,7 @@ from flint.ui.draw_list import (
     GpuUiPrim,
     PRIM_GLYPH,
     PRIM_LINE,
+    PRIM_POLY_DATA,
     UI_FLAG_BORDER,
     UI_FLAG_DROP_SHADOW,
     UI_FLAG_VERT_GRADIENT,
@@ -1101,6 +1102,59 @@ def test_multi_cascade_vsm_gpu_shading():
     ren.shutdown()
 
 
+def test_gpu_ui_polygons():
+    """PRIM_POLYGON: nonzero winding (holes, unions blended once), packing, AA edges."""
+    var dl = UiDrawList()
+    var sq = List[Float32]()
+    for v in [Float32(10), 10, 50, 10, 50, 50, 10, 50]:
+        sq.append(v)
+    var one = List[Int]()
+    one.append(4)
+    # 4 points + the closing repeat = 5 vertices -> 1 header + 1 data prim
+    _assert(dl.add_polygon(sq, one, 0xFFFFFFFF) == 2, "a quad packs into a header and one data prim")
+    _assert(dl.prims[0].u0 == 5.0 and dl.prims[1].header == PRIM_POLY_DATA, "polygon header holds the vertex count")
+    _assert(dl.add_polygon(sq, List[Int](), 0xFFFFFFFF) == 0, "no outlines draws nothing")
+
+    var W = 96
+    var H = 64
+    var renderer = ScalableRenderer(RENDER_TIER_2_AAA_VISBUFFER_RT, width=W, height=H, tsr_scale=1.0)
+    if not renderer.uses_vulkan():
+        print("[SKIP] Vulkan hardware unavailable; polygon packing verified")
+        renderer.shutdown()
+        return
+    ref gpu = renderer.gpu_slot[0]
+    gpu.display_mode = DISPLAY_SDR_SRGB
+    gpu.begin_frame(Vec3(0.0, 1.0, 4.0), Vec3(0.0, 1.0, 0.0))
+    gpu.ui_draw_list.add_rect(0.0, 0.0, Float32(W), Float32(H), 0xFF000000)
+    # A square ring: outer clockwise, inner counter-clockwise (a hole).
+    var ring = List[Float32]()
+    for v in [Float32(4), 4, 40, 4, 40, 40, 4, 40, 14, 14, 14, 30, 30, 30, 30, 14]:
+        ring.append(v)
+    var two = List[Int]()
+    two.append(4)
+    two.append(4)
+    _ = gpu.ui_draw_list.add_polygon(ring, two, 0xFFFFFFFF)
+    # Two overlapping half-transparent squares as ONE polygon: the overlap blends once.
+    var union = List[Float32]()
+    for v in [Float32(48.5), 8, 72, 8, 72, 32, 48.5, 32, 60, 20, 84, 20, 84, 44, 60, 44]:
+        union.append(v)
+    _ = gpu.ui_draw_list.add_polygon(union, two, 0x80FFFFFF)
+    _assert(gpu.render_frame(capture_readback=True), "polygon frame rendered")
+    var px = gpu.readback_pixels()
+    _assert(_unpack_argb(px[8 * W + 8])[0] > 250, "ring body is filled")
+    _assert(_unpack_argb(px[22 * W + 22])[0] < 5, "ring hole stays empty")
+    _assert(_unpack_argb(px[60 * W + 60])[0] < 5, "outside stays empty")
+    var single = _unpack_argb(px[12 * W + 52])[0]
+    var overlap = _unpack_argb(px[26 * W + 66])[0]
+    _assert(abs(single - 128) <= 3 and abs(overlap - single) <= 2, "the union blends once (" + String(single) + ", " + String(overlap) + ")")
+    var edge = _unpack_argb(px[12 * W + 48])[0]   # pixel centre (48.5, 12.5) sits on the edge x = 48.5
+    _assert(abs(edge - single // 2) <= 4, "edges are anti-aliased (" + String(edge) + ")")
+    var seam = _unpack_argb(px[20 * W + 60])[0]   # on an internal edge of the union
+    _assert(abs(seam - single) <= 2, "no seam on internal union edges (" + String(seam) + ")")
+    print("[PASS] Suite 4b: GPU UI PRIM_POLYGON nonzero winding (hole, union blended once, AA edge " + String(edge) + ", no seam)")
+    renderer.shutdown()
+
+
 def _validate_or_fail(words: List[UInt32], name: String):
     var rep = validate_spirv_module(words)
     if not rep.valid:
@@ -1217,6 +1271,7 @@ def main():
     test_material_graph_decals_terrain_and_vat()
     test_swapchain_render_world_and_tier0()
     test_gpu_ui_and_aaa_metropolis()
+    test_gpu_ui_polygons()
     test_multi_cascade_vsm_gpu_shading()
     test_render_features_glass_water_particles()
     var dt = get_time() - t0

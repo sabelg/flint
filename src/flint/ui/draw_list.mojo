@@ -4,6 +4,7 @@ Provides the CPU UI command accumulator `UiDrawList` streaming compact 64-byte
 primitives (`GpuUiPrim`) to the GPU for sub-0.04 ms tile-binned compute compositing.
 """
 from std.collections import List
+from std.memory import bitcast
 from flint.render.font import SdfFont, decode_utf8
 
 comptime PRIM_SHAPE: UInt32 = 0
@@ -12,6 +13,10 @@ comptime PRIM_NINE_SLICE: UInt32 = 2
 comptime PRIM_CONTROLLER_SYMBOL: UInt32 = 3
 comptime PRIM_LINE: UInt32 = 4
 comptime PRIM_IMAGE: UInt32 = 5
+comptime PRIM_POLYGON: UInt32 = 6      # header: bbox, u0 = vertex count; its data prims follow it
+comptime PRIM_POLY_DATA: UInt32 = 7    # 7 (x, y) vertices in words 0..13; never binned or drawn
+comptime POLY_VERTS_PER_PRIM: Int = 7
+comptime POLY_BREAK: Float32 = 3.0e38  # vertex x that separates two outlines
 
 comptime UI_FLAG_DROP_SHADOW: UInt32 = 1 << 0
 comptime UI_FLAG_BORDER: UInt32 = 1 << 1
@@ -358,6 +363,71 @@ struct UiDrawList(Movable):
             tint_color, border_color,
             corner_radius, border_width, 1.0, hdr
         ))
+
+    def add_polygon(mut self, xy: List[Float32], counts: List[Int], color: UInt32) -> Int:
+        """Anti-aliased filled polygon: one or more outlines (`counts[i]` points each, flat
+        `xy` = x0, y0, x1, y1, ...), filled by the nonzero winding rule, so holes (opposite
+        winding) and overlapping same-winding outlines (one union, blended once) both work.
+
+        Records one `PRIM_POLYGON` header (the bounding box) followed by its `PRIM_POLY_DATA`
+        prims: the outlines closed (first point repeated) and separated by a `POLY_BREAK`
+        vertex. Returns the number of prims added (0 for nothing to draw)."""
+        var verts = List[Float32]()
+        var bx0 = Float32(3.0e38)
+        var by0 = Float32(3.0e38)
+        var bx1 = Float32(-3.0e38)
+        var by1 = Float32(-3.0e38)
+        var start = 0
+        var n_pts = len(xy) // 2
+        for ci in range(len(counts)):
+            var n = counts[ci]
+            if n < 0 or start + n > n_pts:
+                break
+            if n >= 3:
+                if len(verts) > 0:
+                    verts.append(POLY_BREAK)
+                    verts.append(0.0)
+                for k in range(n + 1):
+                    var j = start + (k % n)
+                    var x = xy[2 * j]
+                    var y = xy[2 * j + 1]
+                    verts.append(x)
+                    verts.append(y)
+                    bx0 = min(bx0, x)
+                    by0 = min(by0, y)
+                    bx1 = max(bx1, x)
+                    by1 = max(by1, y)
+            start += n
+        var n_verts = len(verts) // 2
+        if n_verts < 4 or not (bx1 > bx0 and by1 > by0):
+            return 0
+        var c = self.current_clip()
+        var clip0 = UInt32(c[0]) | (UInt32(c[1]) << 16)
+        var clip1 = UInt32(c[2]) | (UInt32(c[3]) << 16)
+        self.prims.append(GpuUiPrim(
+            bx0, by0, bx1, by1,
+            Float32(n_verts), 0.0, 0.0, 0.0,
+            clip0, clip1,
+            color, 0,
+            0.0, 0.0, 0.0, PRIM_POLYGON & 0xF
+        ))
+        var n_data = (n_verts + POLY_VERTS_PER_PRIM - 1) // POLY_VERTS_PER_PRIM
+        for d in range(n_data):
+            var w = List[Float32](length=14, fill=0.0)
+            for k in range(POLY_VERTS_PER_PRIM):
+                var v = d * POLY_VERTS_PER_PRIM + k
+                if v < n_verts:
+                    w[2 * k] = verts[2 * v]
+                    w[2 * k + 1] = verts[2 * v + 1]
+            # Words 8..11 are integer fields in the layout: they carry vertex 4 and 5 as raw float bits.
+            self.prims.append(GpuUiPrim(
+                w[0], w[1], w[2], w[3],
+                w[4], w[5], w[6], w[7],
+                bitcast[DType.uint32](w[8]), bitcast[DType.uint32](w[9]),
+                bitcast[DType.uint32](w[10]), bitcast[DType.uint32](w[11]),
+                w[12], w[13], 0.0, PRIM_POLY_DATA & 0xF
+            ))
+        return 1 + n_data
 
     def add_text_mut(
         mut self,

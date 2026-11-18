@@ -473,8 +473,11 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
     var ay1 = s.fadd(s.nmax(ry0, ry1), eff_pad)
 
     var outside = s.logical_or(
-        s.logical_or(s.fge(tile_x0, ax1), s.fge(ax0, tile_x1)),
-        s.logical_or(s.fge(tile_y0, ay1), s.fge(ay0, tile_y1)),
+        s.logical_or(
+            s.logical_or(s.fge(tile_x0, ax1), s.fge(ax0, tile_x1)),
+            s.logical_or(s.fge(tile_y0, ay1), s.fge(ay0, tile_y1)),
+        ),
+        s.ieq(c_kind, s.uint(7)),  # PRIM_POLY_DATA: vertex storage of the polygon before it
     )
     s.begin_if(s.logical_not(outside))
     var slot = s.atomic_add_workgroup_u32(shared_cnt[0], shared_cnt[1], s.uint(0), s.uint(1))
@@ -928,6 +931,69 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
     var cov_line = s.nclamp(s.fsub(s.float(0.5), s.fdiv(sd_line, feather)), s.float(0.0), s.float(1.0))
     var wln = _emit_ui_srgb_to_working(s, is_hdr10, cr, cg, cb)
     _emit_blend_over(s, accum_r, accum_g, accum_b, wln[0], wln[1], wln[2], s.fmul(ca, cov_line))
+    s.end_if()
+
+    # ------------------------------------------------------------------------
+    # Kind 6 (`PRIM_POLYGON`): Nonzero-Winding Polygon (several outlines, holes, unions)
+    # u0 = vertex count; the vertices follow in PRIM_POLY_DATA prims (7 per prim, words
+    # 0..13), outlines closed and separated by a vertex with x > 1e37. Pass 1: the winding
+    # number at the pixel. Pass 2: the distance to the nearest *boundary* edge (one whose
+    # far side flips inside/outside), so internal edges of unions leave no seams.
+    # ------------------------------------------------------------------------
+    s.begin_if(s.ieq(kind, s.uint(6)))
+    var pg_first = s.iadd(prim_idx, s.uint(1))
+    var pg_avail = s.imul(s.isub(s.umax(prim_cnt, pg_first), pg_first), s.uint(7))
+    var pg_n = s.umin(s.uint_from_float(s.nmax(u0, s.float(0.0))), pg_avail)
+    var pg_base = s.iadd(prims_off, s.imul(pg_first, s.uint(16)))
+    # Inside/outside and edge sides are judged at a point nudged off the pixel centre, so a
+    # centre lying exactly on an edge (axis-aligned edges at .5) has a definite side.
+    var pg_px = s.fadd(fgx, s.float(1.3e-3))
+    var pg_py = s.fadd(fgy, s.float(0.7e-3))
+    var pg_wn = s.fvar(s.float(0.0))
+    var pg_dmin = s.fvar(s.float(1e6))
+    var pg_pass = s.uvar(s.uint(0))
+    s.begin_loop()
+    var pass_i = s.load_u(pg_pass)
+    s.break_if(s.uge(pass_i, s.uint(2)))
+    var wn_final = s.load_f(pg_wn)
+    var pg_ax = s.fvar(s.load_float(b_post, pg_base))
+    var pg_ay = s.fvar(s.load_float(b_post, s.iadd(pg_base, s.uint(1))))
+    var pg_k = s.uvar(s.uint(1))
+    s.begin_loop()
+    var vk = s.load_u(pg_k)
+    s.break_if(s.uge(vk, pg_n))
+    var vw = s.iadd(pg_base, s.iadd(s.imul(s.udiv(vk, s.uint(7)), s.uint(16)), s.imul(s.umod(vk, s.uint(7)), s.uint(2))))
+    var ebx = s.load_float(b_post, vw)
+    var eby = s.load_float(b_post, s.iadd(vw, s.uint(1)))
+    var eax = s.load_f(pg_ax)
+    var eay = s.load_f(pg_ay)
+    s.begin_if(s.logical_and(s.flt(eax, s.float(1e37)), s.flt(ebx, s.float(1e37))))
+    var is_left = s.fsub(s.fmul(s.fsub(ebx, eax), s.fsub(pg_py, eay)), s.fmul(s.fsub(pg_px, eax), s.fsub(eby, eay)))
+    s.begin_if(s.ieq(pass_i, s.uint(0)))
+    var e_up = s.logical_and(s.logical_and(s.fle(eay, pg_py), s.fgt(eby, pg_py)), s.fgt(is_left, s.float(0.0)))
+    var e_dn = s.logical_and(s.logical_and(s.fgt(eay, pg_py), s.fle(eby, pg_py)), s.flt(is_left, s.float(0.0)))
+    s.store(pg_wn, s.fadd(s.load_f(pg_wn), s.fsub(s.select_f(e_up, s.float(1.0), s.float(0.0)), s.select_f(e_dn, s.float(1.0), s.float(0.0)))))
+    s.begin_else()
+    # The winding one step across this edge: one less on its left side, one more on its right.
+    var wn_other = s.fadd(wn_final, s.select_f(s.fgt(is_left, s.float(0.0)), s.float(-1.0), s.float(1.0)))
+    var in_here = s.fgt(s.fabs(wn_final), s.float(0.5))
+    var in_there = s.fgt(s.fabs(wn_other), s.float(0.5))
+    s.begin_if(s.logical_or(s.logical_and(in_here, s.logical_not(in_there)), s.logical_and(in_there, s.logical_not(in_here))))
+    s.store(pg_dmin, s.nmin(s.load_f(pg_dmin), _emit_seg_dist(s, fgx, fgy, eax, eay, ebx, eby)))
+    s.end_if()
+    s.end_if()
+    s.end_if()
+    s.store(pg_ax, ebx)
+    s.store(pg_ay, eby)
+    s.store(pg_k, s.iadd(vk, s.uint(1)))
+    s.end_loop()
+    s.store(pg_pass, s.iadd(pass_i, s.uint(1)))
+    s.end_loop()
+    var pg_inside = s.fgt(s.fabs(s.load_f(pg_wn)), s.float(0.5))
+    var pg_sd = s.select_f(pg_inside, s.fneg(s.load_f(pg_dmin)), s.load_f(pg_dmin))
+    var cov_pg = s.nclamp(s.fsub(s.float(0.5), pg_sd), s.float(0.0), s.float(1.0))
+    var wpg = _emit_ui_srgb_to_working(s, is_hdr10, cr, cg, cb)
+    _emit_blend_over(s, accum_r, accum_g, accum_b, wpg[0], wpg[1], wpg[2], s.fmul(ca, cov_pg))
     s.end_if()
 
     # ------------------------------------------------------------------------
