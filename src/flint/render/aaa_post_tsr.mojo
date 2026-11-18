@@ -618,6 +618,36 @@ def eval_agx_tonemap_cpu(rgb: Vec3) -> Vec3:
     return Vec3(out[0], out[1], out[2])
 
 
+
+def _emit_display_grade(
+    mut s: AaaSpirvModule, r: UInt32, g: UInt32, b: UInt32, sat_delta: UInt32, contrast_delta: UInt32
+) -> Tuple[UInt32, UInt32, UInt32]:
+    """GPU twin of `eval_display_grade_cpu`: saturation then contrast on display-encoded [0, 1] color.
+
+    The deltas are (amount - 1), so an all-zero push block is the identity grade.
+    """
+    var sat = s.nmax(s.float(0.0), s.fadd(s.float(1.0), sat_delta))
+    var con = s.nmax(s.float(0.0), s.fadd(s.float(1.0), contrast_delta))
+    var luma = s.fma(r, s.float(0.2126), s.fma(g, s.float(0.7152), s.fmul(b, s.float(0.0722))))
+    var out = List[UInt32]()
+    for ch in [r, g, b]:
+        var sc = s.fma(s.fsub(ch, luma), sat, luma)
+        out.append(s.nclamp(s.fma(s.fsub(sc, s.float(0.5)), con, s.float(0.5)), s.float(0.0), s.float(1.0)))
+    return (out[0], out[1], out[2])
+
+
+def eval_display_grade_cpu(rgb: Vec3, saturation: Float32, contrast: Float32) -> Vec3:
+    """The display grade on display-encoded [0, 1] color: saturation around Rec.709 luma, then
+    contrast around mid-grey 0.5; 1.0 and 1.0 leave the color unchanged."""
+    var sat = max(Float32(0.0), saturation)
+    var con = max(Float32(0.0), contrast)
+    var luma = rgb.x * Float32(0.2126) + rgb.y * Float32(0.7152) + rgb.z * Float32(0.0722)
+    var ch = [rgb.x, rgb.y, rgb.z]
+    for k in range(3):
+        var sc = luma + (ch[k] - luma) * sat
+        ch[k] = max(Float32(0.0), min(Float32(1.0), Float32(0.5) + (sc - Float32(0.5)) * con))
+    return Vec3(ch[0], ch[1], ch[2])
+
 def tsr_v2_and_display_shader() -> List[UInt32]:
     """`FlintTSR v2` Disocclusion-Reactive Upscaler + Display Transform (`AgX` / `HDR10 PQ` / `Linear sRGB`).
     Push[0] = src_w, Push[1] = src_h, Push[2] = dst_w, Push[3] = dst_h,
@@ -1417,7 +1447,8 @@ def aaa_display_tonemap_shader() -> List[UInt32]:
       - Optional Cockpit Windshield Refractive Raindrops (`b_globals[126] > 0.001`)
       - Physical `EV100` / Bounded Auto-Exposure + `cos^4(theta)` Lens Vignette
       - `AgX Rec.709` (`+5.5 EV` shoulder + `t0=0.018` shadow toe + Purkinje desat) | `HDR10 PQ` | `Linear sRGB`
-    Push[0]=out_w, Push[1]=out_h, Push[2]=out_ldr_off, Push[3]=display_mode.
+    Push[0]=out_w, Push[1]=out_h, Push[2]=out_ldr_off, Push[3]=display_mode,
+    Push[4..7]=bloom mip, Push[8]=saturation - 1, Push[9]=contrast - 1 (display grade, SDR only).
     """
     var s = AaaSpirvModule(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
@@ -1435,6 +1466,8 @@ def aaa_display_tonemap_shader() -> List[UInt32]:
     var bm_w = s.push_word(5)
     var bm_h = s.push_word(6)
     var bm_off = s.push_word(7)
+    var grade_sat = s.push_float(8)
+    var grade_con = s.push_float(9)
     s.return_if(s.logical_or(s.uge(dx, dst_w), s.uge(dy, dst_h)))
 
     var f_dw = s.float_from_uint(dst_w)
@@ -1596,6 +1629,8 @@ def aaa_display_tonemap_shader() -> List[UInt32]:
     var agx = _emit_agx_tonemap(s, exp_r, exp_g, exp_b)
     s.store(dr, agx[0]); s.store(dg, agx[1]); s.store(db, agx[2])
     s.end_if()
+    var graded = _emit_display_grade(s, s.load_f(dr), s.load_f(dg), s.load_f(db), grade_sat, grade_con)
+    s.store(dr, graded[0]); s.store(dg, graded[1]); s.store(db, graded[2])
     var ur = s.umin(s.uint(255), s.saturate_uint(s.fma(s.load_f(dr), s.float(255.0), s.float(0.5))))
     var ug = s.umin(s.uint(255), s.saturate_uint(s.fma(s.load_f(dg), s.float(255.0), s.float(0.5))))
     var ub = s.umin(s.uint(255), s.saturate_uint(s.fma(s.load_f(db), s.float(255.0), s.float(0.5))))

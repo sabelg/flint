@@ -106,6 +106,7 @@ from flint.render.aaa_post_tsr import (
     aaa_motion_blur_shader,
     aaa_tsr_v3_resolve_shader,
     eval_agx_tonemap_cpu,
+    eval_display_grade_cpu,
     halton_2_3_jitter_px,
 )
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
@@ -243,6 +244,18 @@ def test_2_cpu_models_bsdf_ltc_reblur_halton_froxel_water_agx() raises:
     assert_true(agx_dark.z > Float32(0.0) and agx_dark.z < Float32(0.06))  # Smooth C2 rational toe: zero hard black clip!
     assert_true(agx_gunmetal.x > agx_dark.x * Float32(3.0))
     assert_true(agx_hi.x > Float32(0.85) and agx_hi.x <= Float32(1.0))
+    # Display grade: identity at (1, 1); saturation pushes channels apart; contrast pivots on 0.5; output stays in [0, 1].
+    var leaf = Vec3(0.30, 0.62, 0.20)
+    var same = eval_display_grade_cpu(leaf, 1.0, 1.0)
+    assert_true(abs(same.x - leaf.x) < 1e-6 and abs(same.y - leaf.y) < 1e-6 and abs(same.z - leaf.z) < 1e-6)
+    var vivid = eval_display_grade_cpu(leaf, 1.4, 1.0)
+    assert_true(vivid.y - vivid.z > (leaf.y - leaf.z) * Float32(1.35))
+    var grey = eval_display_grade_cpu(leaf, 0.0, 1.0)
+    assert_true(abs(grey.x - grey.y) < 1e-6 and abs(grey.y - grey.z) < 1e-6)
+    var punchy = eval_display_grade_cpu(Vec3(0.2, 0.5, 0.8), 1.0, 1.5)
+    assert_true(abs(punchy.x - 0.05) < 1e-5 and abs(punchy.y - 0.5) < 1e-5 and abs(punchy.z - 0.95) < 1e-5)
+    var clipped = eval_display_grade_cpu(Vec3(0.02, 0.98, 0.5), 2.0, 2.0)
+    assert_true(clipped.x == 0.0 and clipped.y == 1.0)
 
     # v3 Alpha-cutout material packing + LEAN water slope-variance transfer + Nubis 3D cumulus density
     var mat_am = AaaMaterial(base_color=Vec3(0.3, 0.6, 0.2), roughness=0.7, metallic=0.0)

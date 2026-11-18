@@ -561,6 +561,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var ev_compensation: Float32
     var bloom_intensity: Float32
     var bloom_threshold: Float32
+    var grade_saturation: Float32  # display grade after tone mapping: 1.0 = unchanged, >1 more vivid
+    var grade_contrast: Float32  # 1.0 = unchanged, >1 punchier around mid-grey
     var enable_bokeh_dof: Bool
     var enable_gpu_profiler: Bool
     var enable_async_vsm: Bool
@@ -805,6 +807,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.ev_compensation = Float32(0.0)
         self.bloom_intensity = Float32(0.0)
         self.bloom_threshold = Float32(0.0)
+        self.grade_saturation = Float32(1.0)
+        self.grade_contrast = Float32(1.0)
         self.enable_bokeh_dof = False
         self.enable_gpu_profiler = True
         self.enable_async_vsm = False
@@ -4109,6 +4113,8 @@ struct FlintAaaVulkanRenderer(Movable):
         push_dt[5] = UInt32(saved_bm_w)
         push_dt[6] = UInt32(saved_bm_h)
         push_dt[7] = UInt32(safe_bloom_mip_off)
+        push_dt[8] = bitcast[DType.uint32](self.grade_saturation - Float32(1.0))
+        push_dt[9] = bitcast[DType.uint32](self.grade_contrast - Float32(1.0))
         self.vk.dispatch_aaa(
             cur_slot,
             self.pipe_display_tonemap,
