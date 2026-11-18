@@ -12,6 +12,8 @@ Implements a zero-CPU-readback, two-pass `16 x 16` tile-binned GPU particle syst
      - `PARTICLE_WATER_SPRAY (1)`: FBM-eroded wet-tire rooster-tail mist lit live from the `160x90x64` Froxel Prefix-LUT
      - `PARTICLE_DRIFT_SMOKE (2)`: Billowing FBM tire/coaster smoke with soft depth & SH9/sun lighting
      - `PARTICLE_EXHAUST_PLASMA (3)`: Supersonic Mach shock-diamond exhaust plasma cones
+     - `PARTICLE_GENERIC (4)`: Soft round (or velocity-stretched) sprite whose color, size and alpha
+       blend from start to end over its life; additive or alpha blended, optionally sky/sun lit
      - Writes disocclusion-reactive weights to `b_oit` so `FlintTSR v3` never ghosts moving particles!
 """
 from std.math import max, min
@@ -32,9 +34,9 @@ from flint.render.aaa_froxel_volumetrics import emit_sample_froxel_prefix_lut_sp
 
 comptime AAA_MAX_PARTICLES: Int = 65536
 comptime MAX_PARTICLES: Int = 65536
-comptime AAA_PARTICLE_WORDS: Int = 12
+comptime AAA_PARTICLE_WORDS: Int = 16
 comptime AAA_MAX_PARTICLE_EMITTERS: Int = 64
-comptime AAA_EMITTER_WORDS: Int = 16
+comptime AAA_EMITTER_WORDS: Int = 24
 comptime AAA_PARTICLE_MAX_TILES: Int = 14400     # Up to 160 x 90 tiles (2560 x 1440 at 16x16)
 comptime AAA_MAX_PARTICLES_PER_TILE: Int = 48
 
@@ -43,11 +45,21 @@ comptime PARTICLE_SPARK_STREAK: UInt32 = 0
 comptime PARTICLE_WATER_SPRAY: UInt32 = 1
 comptime PARTICLE_DRIFT_SMOKE: UInt32 = 2
 comptime PARTICLE_EXHAUST_PLASMA: UInt32 = 3
+comptime PARTICLE_GENERIC: UInt32 = 4
 
 comptime ARCHETYPE_SPARK: UInt32 = 0
 comptime ARCHETYPE_WATER_SPRAY: UInt32 = 1
 comptime ARCHETYPE_DRIFT_SMOKE: UInt32 = 2
 comptime ARCHETYPE_EXHAUST_PLASMA: UInt32 = 3
+comptime ARCHETYPE_GENERIC: UInt32 = 4
+
+# `PARTICLE_GENERIC` flags (`AaaParticleEmitter.flags`)
+comptime PARTICLE_FLAG_ADDITIVE: UInt32 = 1  # add light (sparks, glows); otherwise alpha blend over the scene
+comptime PARTICLE_FLAG_LIT: UInt32 = 2  # alpha-blended particles take sky + sun light (dust, smoke); otherwise emissive
+comptime PARTICLE_FLAG_STRETCH: UInt32 = 4  # stretch along the velocity (streaks)
+# Low mantissa bits of the bounce height that carry the archetype (word 14 of an emitter, 11 of a particle)
+comptime _ARCH_MASK: UInt32 = 7
+comptime _BOUNCE_MASK: UInt32 = 0xFFFFFFF8
 
 
 @always_inline
@@ -95,6 +107,12 @@ struct AaaParticleEmitter(Copyable, Movable):
     var bounce_ground_y: Float32
     var spawn_count: Int
     var archetype: UInt32
+    # `PARTICLE_GENERIC` only: color, size and alpha blend from start to end over each particle's life
+    var end_color: Vec3
+    var end_size: Float32
+    var alpha: Float32
+    var end_alpha: Float32
+    var flags: UInt32
 
     def __init__(
         out self,
@@ -110,7 +128,13 @@ struct AaaParticleEmitter(Copyable, Movable):
         gravity_scale: Float32 = 1.0,
         drag: Float32 = 1.2,
         bounce_ground_y: Float32 = -1e6,
+        end_color: Vec3 = Vec3(-1.0, -1.0, -1.0),
+        end_size: Float32 = -1.0,
+        alpha: Float32 = 1.0,
+        end_alpha: Float32 = 1.0,
+        flags: UInt32 = 0,
     ):
+        """`end_color` / `end_size` below zero mean "same as the start"."""
         self.origin = origin
         self.spawn_radius = max(Float32(0.0), spawn_radius)
         self.velocity = velocity
@@ -122,7 +146,63 @@ struct AaaParticleEmitter(Copyable, Movable):
         self.drag = max(Float32(0.0), drag)
         self.bounce_ground_y = bounce_ground_y
         self.spawn_count = max(0, min(8191, spawn_count))
-        self.archetype = archetype & UInt32(3)
+        self.archetype = min(archetype, PARTICLE_GENERIC)
+        self.end_color = color if end_color.x < 0 or end_color.y < 0 or end_color.z < 0 else end_color
+        self.end_size = self.size if end_size < 0 else max(Float32(0.004), end_size)
+        self.alpha = max(Float32(0.0), min(Float32(1.0), alpha))
+        self.end_alpha = max(Float32(0.0), min(Float32(1.0), end_alpha))
+        self.flags = flags & UInt32(7)
+
+    @staticmethod
+    def generic(
+        origin: Vec3,
+        velocity: Vec3,
+        spawn_count: Int,
+        color: Vec3 = Vec3(1.0, 1.0, 1.0),
+        end_color: Vec3 = Vec3(-1.0, -1.0, -1.0),
+        size: Float32 = 0.05,
+        end_size: Float32 = -1.0,
+        alpha: Float32 = 1.0,
+        end_alpha: Float32 = 0.0,
+        lifetime: Float32 = 1.0,
+        spawn_radius: Float32 = 0.0,
+        velocity_spread: Float32 = 1.0,
+        gravity_scale: Float32 = 1.0,
+        drag: Float32 = 0.0,
+        additive: Bool = True,
+        lit: Bool = False,
+        stretch: Bool = False,
+        bounce_ground_y: Float32 = -1e6,
+    ) -> AaaParticleEmitter:
+        """A `PARTICLE_GENERIC` emitter: `spawn_count` particles this frame, each living about
+        `lifetime` s (+-20%), starting at `velocity` plus a random spherical kick of up to
+        `velocity_spread` m/s; `gravity_scale` 1 = Earth gravity, negative rises; `drag` 1/s."""
+        var fl = UInt32(0)
+        if additive:
+            fl |= PARTICLE_FLAG_ADDITIVE
+        if lit:
+            fl |= PARTICLE_FLAG_LIT
+        if stretch:
+            fl |= PARTICLE_FLAG_STRETCH
+        return AaaParticleEmitter(
+            origin=origin,
+            velocity=velocity,
+            color=color,
+            size=size,
+            lifetime=lifetime,
+            spawn_count=spawn_count,
+            archetype=PARTICLE_GENERIC,
+            spawn_radius=spawn_radius,
+            velocity_spread=velocity_spread,
+            gravity_scale=gravity_scale,
+            drag=drag,
+            bounce_ground_y=bounce_ground_y,
+            end_color=end_color,
+            end_size=end_size,
+            alpha=alpha,
+            end_alpha=end_alpha,
+            flags=fl,
+        )
 
     @staticmethod
     def spark_burst(
@@ -248,8 +328,8 @@ struct AaaParticleEmitter(Copyable, Movable):
         out.append(bitcast[DType.uint32](self.size))
         out.append(bitcast[DType.uint32](self.lifetime))
         out.append(bitcast[DType.uint32](self.gravity_scale))
-        var clean_by = bitcast[DType.uint32](self.bounce_ground_y) & UInt32(0xFFFFFFFC)
-        out.append(clean_by | (self.archetype & UInt32(3)))
+        var clean_by = bitcast[DType.uint32](self.bounce_ground_y) & _BOUNCE_MASK
+        out.append(clean_by | (self.archetype & _ARCH_MASK))
         var drag_cl = max(Float32(0.0), min(Float32(15.0), self.drag))
         var drag_u4 = UInt32(Int(drag_cl * Float32(16.0) + Float32(0.5))) & UInt32(0xFF)
         var cnt_u8 = UInt32(min(255, max(0, self.spawn_count)))
@@ -260,6 +340,15 @@ struct AaaParticleEmitter(Copyable, Movable):
         _ = cnt_u8
         var meta15 = ((UInt32(ring_start) & UInt32(0xFFFF)) << 16) | (cnt_u12 << 4) | drag_nib
         out.append(meta15)
+        # Words 16..23: end color, end size, start / end alpha, generic flags, (reserved)
+        out.append(bitcast[DType.uint32](self.end_color.x))
+        out.append(bitcast[DType.uint32](self.end_color.y))
+        out.append(bitcast[DType.uint32](self.end_color.z))
+        out.append(bitcast[DType.uint32](self.end_size))
+        out.append(bitcast[DType.uint32](self.alpha))
+        out.append(bitcast[DType.uint32](self.end_alpha))
+        out.append(self.flags)
+        out.append(UInt32(0))
 
 
 @always_inline
@@ -366,7 +455,8 @@ def gpu_particle_sim_and_bin_shader() -> List[UInt32]:
     var sp_vy = s.fma(dy_s, spd_j, vy0)
     var sp_vz = s.fma(dz_s, spd_j, vz0)
     var life_j = s.fmul(life_e, s.fma(r4[1], s.float(0.40), s.float(0.80)))
-    var sz_j = s.fmul(sz_e, s.fma(r5[1], s.float(0.36), s.float(0.82)))
+    var sz_jit = s.fma(r5[1], s.float(0.36), s.float(0.82))
+    var sz_j = s.fmul(sz_e, sz_jit)
     # Sub-frame staggered initial age `[0 .. 0.5*dt]` prevents discrete emission banding at high speed
     var init_age = s.fmul(r0[1], s.fmul(dt, s.float(0.5)))
 
@@ -382,6 +472,15 @@ def gpu_particle_sim_and_bin_shader() -> List[UInt32]:
     s.store_word(b_oit, s.iadd(p_off, s.uint(9)), s.pack_f16x2(cb_e, sz_j))
     s.store_word(b_oit, s.iadd(p_off, s.uint(10)), s.pack_f16x2(grav_e, drag_e))
     s.store_word(b_oit, s.iadd(p_off, s.uint(11)), w14_e)
+    # Generic over-life words: end color (12, 13), end size (13), start / end alpha (14), flags (15)
+    var ecr = s.load_float(b_oit, s.iadd(e_off, s.uint(16)))
+    var ecg = s.load_float(b_oit, s.iadd(e_off, s.uint(17)))
+    var ecb = s.load_float(b_oit, s.iadd(e_off, s.uint(18)))
+    var esz = s.fmul(s.load_float(b_oit, s.iadd(e_off, s.uint(19))), sz_jit)
+    s.store_word(b_oit, s.iadd(p_off, s.uint(12)), s.pack_f16x2(ecr, ecg))
+    s.store_word(b_oit, s.iadd(p_off, s.uint(13)), s.pack_f16x2(ecb, esz))
+    s.store_word(b_oit, s.iadd(p_off, s.uint(14)), s.pack_f16x2(s.load_float(b_oit, s.iadd(e_off, s.uint(20))), s.load_float(b_oit, s.iadd(e_off, s.uint(21)))))
+    s.store_word(b_oit, s.iadd(p_off, s.uint(15)), s.load_word(b_oit, s.iadd(e_off, s.uint(22))))
     s.end_if()
 
     s.store(ei_v, s.iadd(ei, s.uint(1)))
@@ -409,8 +508,10 @@ def gpu_particle_sim_and_bin_shader() -> List[UInt32]:
     var p_size = p9[1]
     var grav_sc = p10[0]
     var drag_k = p10[1]
-    var arch = s.bit_and(w11, s.uint(3))
-    var bounce_y = s.bitcast_float(s.bit_and(w11, s.uint(0xFFFFFFFC)))
+    var arch = s.bit_and(w11, s.uint(_ARCH_MASK))
+    var bounce_y = s.bitcast_float(s.bit_and(w11, s.uint(_BOUNCE_MASK)))
+    var is_gen = s.ieq(arch, s.uint(PARTICLE_GENERIC))
+    var gen_flags = s.load_word(b_oit, s.iadd(p_off, s.uint(15)))
 
     var damp = s.exp2(s.fmul(s.fmul(drag_k, dt), s.float(-1.442695)))
     var nvx = s.fvar(s.fmul(s.load_f(vx_w), damp))
@@ -445,8 +546,8 @@ def gpu_particle_sim_and_bin_shader() -> List[UInt32]:
     var npy = s.fvar(s.fma(s.load_f(nvy), dt, s.load_f(py_w)))
     var npz = s.fvar(s.fma(s.load_f(nvz), dt, s.load_f(pz_w)))
 
-    # Ground-plane restitution bounce for sparks (`arch == 0 && bounce_y > -1e5`)
-    s.begin_if(s.logical_and(s.ieq(arch, s.uint(0)), s.fgt(bounce_y, s.float(-1e5))))
+    # Ground-plane restitution bounce for sparks and generic particles (`bounce_y > -1e5`)
+    s.begin_if(s.logical_and(s.logical_or(s.ieq(arch, s.uint(0)), is_gen), s.fgt(bounce_y, s.float(-1e5))))
     var g_lim = s.fadd(bounce_y, s.float(0.02))
     s.begin_if(s.logical_and(s.flt(s.load_f(npy), g_lim), s.flt(s.load_f(nvy), s.float(0.0))))
     s.store(npy, g_lim)
@@ -521,7 +622,8 @@ def gpu_particle_sim_and_bin_shader() -> List[UInt32]:
 
     # Expand puff size slightly over lifetime for mist/smoke (`arch == 1 || arch == 2`)
     var life_t = s.nclamp(s.fdiv(age, s.nmax(s.float(1e-3), life)), s.float(0.0), s.float(1.0))
-    var eff_rad_m = s.select_f(is_mist, s.fmul(p_size, s.fma(life_t, s.float(1.15), s.float(0.65))), p_size)
+    var gen_rad = s.fma(s.fsub(s.unpack_f16x2(s.load_word(b_oit, s.iadd(p_off, s.uint(13))))[1], p_size), life_t, p_size)
+    var eff_rad_m = s.select_f(is_gen, gen_rad, s.select_f(is_mist, s.fmul(p_size, s.fma(life_t, s.float(1.15), s.float(0.65))), p_size))
     var px_per_m = s.fdiv(fh, s.nmax(s.float(0.05), s.fmul(s.float(2.0), s.fmul(vz_c, tan_y))))
     var rad_px = s.nclamp(s.fmul(eff_rad_m, px_per_m), s.float(1.5), s.float(30.0))
 
@@ -530,9 +632,10 @@ def gpu_particle_sim_and_bin_shader() -> List[UInt32]:
     var cy_px = s.fmul(v_sc, fh)
     var tx_px = s.fvar(cx_px)
     var ty_px = s.fvar(cy_px)
-    var is_streak = s.logical_or(s.ieq(arch, s.uint(0)), s.ieq(arch, s.uint(3)))
+    var gen_stretch = s.logical_and(is_gen, s.ine(s.bit_and(gen_flags, s.uint(PARTICLE_FLAG_STRETCH)), s.uint(0)))
+    var is_streak = s.logical_or(s.logical_or(s.ieq(arch, s.uint(0)), s.ieq(arch, s.uint(3))), gen_stretch)
     s.begin_if(is_streak)
-    var tail_dt = s.select_f(s.ieq(arch, s.uint(0)), s.float(0.036), s.float(0.024))
+    var tail_dt = s.select_f(s.ieq(arch, s.uint(3)), s.float(0.024), s.float(0.036))
     var tpx_w = s.fsub(s.load_f(npx), s.fmul(s.load_f(nvx), tail_dt))
     var tpy_w = s.fsub(s.load_f(npy), s.fmul(s.load_f(nvy), tail_dt))
     var tpz_w = s.fsub(s.load_f(npz), s.fmul(s.load_f(nvz), tail_dt))
@@ -614,7 +717,8 @@ def gpu_particle_tile_composite_shader() -> List[UInt32]:
     var b_hist = s.buffer(BIND_AAA_HISTORY)
     var b_oit = s.buffer(BIND_AAA_OIT_NODES)
 
-    # Cooperative LDS cache: 48 particles * 10 floats (`cx, cy, tx, ty, vz, rad_px, r, g, b, life_t`) + 48 meta words (`arch | pid<<2`)
+    # Cooperative LDS cache: 48 particles * 10 floats (`cx, cy, tx, ty, vz, rad_px, r, g, b, life_t`) + 48 meta words
+    # (`arch | flags<<3 | pid<<6`); a `PARTICLE_GENERIC` particle stores its over-life color and its alpha for `life_t`
     var lds_f = s.workgroup_array_f32(AAA_MAX_PARTICLES_PER_TILE * 10)
     var lds_u = s.workgroup_array_u32(AAA_MAX_PARTICLES_PER_TILE)
 
@@ -679,11 +783,22 @@ def gpu_particle_tile_composite_shader() -> List[UInt32]:
     var life = s.nmax(s.float(1e-3), s.load_float(b_oit, s.iadd(p_off, s.uint(7))))
     var c0 = s.unpack_f16x2(s.load_word(b_oit, s.iadd(p_off, s.uint(8))))
     var c1 = s.unpack_f16x2(s.load_word(b_oit, s.iadd(p_off, s.uint(9))))
-    var arch = s.bit_and(s.load_word(b_oit, s.iadd(p_off, s.uint(11))), s.uint(3))
+    var arch = s.bit_and(s.load_word(b_oit, s.iadd(p_off, s.uint(11))), s.uint(_ARCH_MASK))
+    var is_gen = s.ieq(arch, s.uint(PARTICLE_GENERIC))
+    var gen_flags = s.bit_and(s.load_word(b_oit, s.iadd(p_off, s.uint(15))), s.uint(7))
 
     var life_t = s.nclamp(s.fdiv(age, life), s.float(0.0), s.float(1.0))
     var is_mist = s.logical_or(s.ieq(arch, s.uint(1)), s.ieq(arch, s.uint(2)))
-    var eff_rad_m = s.select_f(is_mist, s.fmul(c1[1], s.fma(life_t, s.float(1.15), s.float(0.65))), c1[1])
+    # Generic: color, size and alpha from start to end over the particle's life
+    var e0 = s.unpack_f16x2(s.load_word(b_oit, s.iadd(p_off, s.uint(12))))
+    var e1 = s.unpack_f16x2(s.load_word(b_oit, s.iadd(p_off, s.uint(13))))
+    var al = s.unpack_f16x2(s.load_word(b_oit, s.iadd(p_off, s.uint(14))))
+    var gen_r = s.fma(s.fsub(e0[0], c0[0]), life_t, c0[0])
+    var gen_g = s.fma(s.fsub(e0[1], c0[1]), life_t, c0[1])
+    var gen_b = s.fma(s.fsub(e1[0], c1[0]), life_t, c1[0])
+    var gen_rad = s.fma(s.fsub(e1[1], c1[1]), life_t, c1[1])
+    var gen_a = s.fma(s.fsub(al[1], al[0]), life_t, al[0])
+    var eff_rad_m = s.select_f(is_gen, gen_rad, s.select_f(is_mist, s.fmul(c1[1], s.fma(life_t, s.float(1.15), s.float(0.65))), c1[1]))
 
     var rx_p = s.fsub(pwx, cam_x); var ry_p = s.fsub(pwy, cam_y); var rz_p = s.fsub(pwz, cam_z)
     var vz_p = s.nmax(near_z, emit_vec3_dot(s, rx_p, ry_p, rz_p, fwd_x, fwd_y, fwd_z))
@@ -697,9 +812,10 @@ def gpu_particle_tile_composite_shader() -> List[UInt32]:
 
     var tx_s = s.fvar(cx_s)
     var ty_s = s.fvar(cy_s)
-    var is_streak = s.logical_or(s.ieq(arch, s.uint(0)), s.ieq(arch, s.uint(3)))
+    var gen_stretch = s.logical_and(is_gen, s.ine(s.bit_and(gen_flags, s.uint(PARTICLE_FLAG_STRETCH)), s.uint(0)))
+    var is_streak = s.logical_or(s.logical_or(s.ieq(arch, s.uint(0)), s.ieq(arch, s.uint(3))), gen_stretch)
     s.begin_if(is_streak)
-    var tail_dt = s.select_f(s.ieq(arch, s.uint(0)), s.float(0.036), s.float(0.024))
+    var tail_dt = s.select_f(s.ieq(arch, s.uint(3)), s.float(0.024), s.float(0.036))
     var tpx = s.fsub(pwx, s.fmul(pvx, tail_dt))
     var tpy = s.fsub(pwy, s.fmul(pvy, tail_dt))
     var tpz = s.fsub(pwz, s.fmul(pvz, tail_dt))
@@ -722,11 +838,11 @@ def gpu_particle_tile_composite_shader() -> List[UInt32]:
     s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(3)), s.load_f(ty_s))
     s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(4)), vz_p)
     s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(5)), rad_px)
-    s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(6)), c0[0])
-    s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(7)), c0[1])
-    s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(8)), c1[0])
-    s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(9)), life_t)
-    s.store_workgroup_u32(lds_u[0], lds_u[1], local_tid, s.bit_or(arch, s.shl(pid, s.uint(2))))
+    s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(6)), s.select_f(is_gen, gen_r, c0[0]))
+    s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(7)), s.select_f(is_gen, gen_g, c0[1]))
+    s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(8)), s.select_f(is_gen, gen_b, c1[0]))
+    s.store_workgroup_f32(lds_f[0], lds_f[1], s.iadd(fb, s.uint(9)), s.select_f(is_gen, gen_a, life_t))
+    s.store_workgroup_u32(lds_u[0], lds_u[1], local_tid, s.bit_or(s.bit_or(arch, s.shl(gen_flags, s.uint(3))), s.shl(pid, s.uint(6))))
     s.end_if()
     s.workgroup_barrier()
 
@@ -789,12 +905,52 @@ def gpu_particle_tile_composite_shader() -> List[UInt32]:
     var cb_p = s.load_workgroup_f32(lds_f[0], lds_f[1], s.iadd(k_fb, s.uint(8)))
     var k_life_t = s.load_workgroup_f32(lds_f[0], lds_f[1], s.iadd(k_fb, s.uint(9)))
     var meta_u = s.load_workgroup_u32(lds_u[0], lds_u[1], ki)
-    var k_arch = s.bit_and(meta_u, s.uint(3))
-    var pid_f = s.float_from_uint(s.bit_and(s.shr(meta_u, s.uint(2)), s.uint(1023)))
+    var k_arch = s.bit_and(meta_u, s.uint(_ARCH_MASK))
+    var k_flags = s.bit_and(s.shr(meta_u, s.uint(3)), s.uint(7))
+    var pid_f = s.float_from_uint(s.bit_and(s.shr(meta_u, s.uint(6)), s.uint(1023)))
 
     s.begin_if(s.flt(k_vz, s.fadd(z_surf, s.float(0.20))))
     var soft_z = s.nclamp(s.fmul(s.fsub(s.fadd(z_surf, s.float(0.20)), k_vz), s.float(2.2)), s.float(0.0), s.float(1.0))
     var fade_age = s.fsub(s.float(1.0), s.fmul(k_life_t, k_life_t))
+
+    # Archetype 4 (`GENERIC`): soft round sprite (a capsule when stretched along its velocity)
+    s.begin_if(s.ieq(k_arch, s.uint(PARTICLE_GENERIC)))
+    var g_sx = s.fsub(k_tx, k_cx)
+    var g_sy = s.fsub(k_ty, k_cy)
+    var g_l2 = s.fma(g_sx, g_sx, s.fmul(g_sy, g_sy))
+    var g_qx = s.fsub(fpx, k_cx)
+    var g_qy = s.fsub(fpy, k_cy)
+    var g_h = s.select_f(
+        s.fgt(g_l2, s.float(0.01)),
+        s.nclamp(s.fdiv(s.fma(g_qx, g_sx, s.fmul(g_qy, g_sy)), g_l2), s.float(0.0), s.float(1.0)),
+        s.float(0.0),
+    )
+    var g_dx = s.fsub(g_qx, s.fmul(g_sx, g_h))
+    var g_dy = s.fsub(g_qy, s.fmul(g_sy, g_h))
+    var g_d2 = s.fdiv(s.fma(g_dx, g_dx, s.fmul(g_dy, g_dy)), s.nmax(s.float(0.25), s.fmul(k_rad, k_rad)))
+    s.begin_if(s.flt(g_d2, s.float(1.0)))
+    var g_fall = s.fsub(s.float(1.0), g_d2)
+    # `k_life_t` holds the particle's alpha; a stretched tail thins toward its end
+    var g_w = s.fmul(s.fmul(g_fall, g_fall), s.fmul(k_life_t, s.fmul(soft_z, s.fsub(s.float(1.0), s.fmul(g_h, s.float(0.6))))))
+    s.begin_if(s.ine(s.bit_and(k_flags, s.uint(PARTICLE_FLAG_ADDITIVE)), s.uint(0)))
+    s.store(cur_r, s.fma(cr_p, g_w, s.load_f(cur_r)))
+    s.store(cur_g, s.fma(cg_p, g_w, s.load_f(cur_g)))
+    s.store(cur_b, s.fma(cb_p, g_w, s.load_f(cur_b)))
+    s.store(react_acc, s.nmax(s.load_f(react_acc), s.nmin(s.float(0.85), g_w)))
+    s.begin_else()
+    var g_a = s.nmin(s.float(1.0), g_w)
+    var g_lit = s.ine(s.bit_and(k_flags, s.uint(PARTICLE_FLAG_LIT)), s.uint(0))
+    var g_lr = s.select_f(g_lit, s.fmul(cr_p, s.fadd(env_lit_r, s.load_f(frox_lr))), cr_p)
+    var g_lg = s.select_f(g_lit, s.fmul(cg_p, s.fadd(env_lit_g, s.load_f(frox_lg))), cg_p)
+    var g_lb = s.select_f(g_lit, s.fmul(cb_p, s.fadd(env_lit_b, s.load_f(frox_lb))), cb_p)
+    var g_om = s.fsub(s.float(1.0), g_a)
+    s.store(cur_r, s.fma(s.load_f(cur_r), g_om, s.fmul(g_lr, g_a)))
+    s.store(cur_g, s.fma(s.load_f(cur_g), g_om, s.fmul(g_lg, g_a)))
+    s.store(cur_b, s.fma(s.load_f(cur_b), g_om, s.fmul(g_lb, g_a)))
+    s.store(react_acc, s.nmax(s.load_f(react_acc), s.nmin(s.float(0.85), g_a)))
+    s.end_if()
+    s.end_if()
+    s.begin_else()
 
     # Archetype 0 (`SPARK_STREAK`) & Archetype 3 (`EXHAUST_PLASMA`): 2D Velocity Capsule SDF
     var k_is_streak = s.logical_or(s.ieq(k_arch, s.uint(0)), s.ieq(k_arch, s.uint(3)))
@@ -885,6 +1041,7 @@ def gpu_particle_tile_composite_shader() -> List[UInt32]:
     s.end_if()
     s.end_if()
     s.end_if()
+    s.end_if()  # generic / built-in archetypes
     s.end_if()
 
     s.store(ki_v, s.iadd(ki, s.uint(1)))

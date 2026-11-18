@@ -19,6 +19,10 @@ Zero external `.glb` / font / texture files. Executes end-to-end in `<2.0s` veri
      and `disp_mode = 1` `A2B10G10R10` HDR10 ST.2084 PQ @ 203 nits paper-white!
   6. Procedural White-Furnace energy conservation check + Cornell Box + 5x5 PBR/Clearcoat Sphere Matrix +
      4-Cascade Toroidal VSM (`±16m, ±64m, ±256m, ±1024m`) Sundial shadow contrast!
+  7. Render features: soft ray-traced sun shadows (penumbra filter radius), refractive glass (Fresnel,
+     Snell, total internal reflection, Beer-Lambert), shaped water and generic GPU particles (color / size /
+     alpha over life, additive and alpha blending): SPIR-V validation of their passes, and on the GPU,
+     additive particles light the frame and clear glass shows the wall behind it (with ray queries).
 """
 from std.collections import List
 from std.ffi import external_call
@@ -44,6 +48,25 @@ from flint.platform.vulkan import (
 from flint.platform.wayland import WaylandWindow
 from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AaaMaterial
 from flint.render.aaa_renderer import AAA_DISPLAY_SCRGB_FP16, FlintAaaVulkanRenderer, aaa_pack_scrgb_rgba16f_shader
+from flint.render.aaa_glass import (
+    AaaGlassParams,
+    aaa_glass_refract_shader,
+    glass_beer_lambert_cpu,
+    glass_f0_cpu,
+    glass_fresnel_cpu,
+    glass_refract_cpu,
+)
+from flint.render.aaa_gpu_particles import (
+    AAA_EMITTER_WORDS,
+    PARTICLE_FLAG_ADDITIVE,
+    PARTICLE_FLAG_STRETCH,
+    PARTICLE_GENERIC,
+    AaaParticleEmitter,
+    gpu_particle_sim_and_bin_shader,
+    gpu_particle_tile_composite_shader,
+)
+from flint.render.aaa_rt_shadow import penumbra_radius_px_cpu, rt_sun_shadow_filter_shader, rt_sun_shadow_trace_shader
+from flint.render.aaa_water import aaa_water_refract_shader
 from flint.render.aaa_vsm import (
     VSM_CASCADE_0_EXTENT,
     VSM_CASCADE_1_EXTENT,
@@ -1078,6 +1101,115 @@ def test_multi_cascade_vsm_gpu_shading():
     ren.shutdown()
 
 
+def _validate_or_fail(words: List[UInt32], name: String):
+    var rep = validate_spirv_module(words)
+    if not rep.valid:
+        _fail(name + " SPIR-V validation failed: " + rep.errors[0])
+
+
+def test_render_features_glass_water_particles():
+    """Suite 7: soft RT sun shadows, refractive glass, shaped water and generic GPU particles."""
+    # Glass optics on the CPU
+    _assert(abs(glass_f0_cpu(1.5) - Float32(0.04)) < 1e-4, "glass F0 at ior 1.5 is 4%")
+    _assert(glass_fresnel_cpu(1.0, 1.5) < 0.05 and glass_fresnel_cpu(0.05, 1.5) > 0.6, "Fresnel rises toward grazing")
+    var head_on = glass_refract_cpu(Vec3(0.0, 0.0, -1.0), Vec3(0.0, 0.0, 1.0), Float32(1.0 / 1.5))
+    _assert(head_on[1] and abs(head_on[0].z + 1.0) < 1e-5, "head-on light passes straight through")
+    var s45 = Float32(0.70710678)
+    var bent = glass_refract_cpu(Vec3(s45, 0.0, -s45), Vec3(0.0, 0.0, 1.0), Float32(1.0 / 1.5))
+    _assert(bent[1] and abs(bent[0].x - s45 / 1.5) < 1e-4, "Snell: sin(t) = sin(i) / 1.5")
+    var tir = glass_refract_cpu(Vec3(s45, 0.0, -s45), Vec3(0.0, 0.0, 1.0), Float32(1.5))
+    _assert(not tir[1] and tir[0].z > 0.0, "45 deg from inside glass is total internal reflection")
+    var bl = glass_beer_lambert_cpu(Vec3(0.5, 1.0, 1.0), 1.0, 2.0)
+    _assert(abs(bl.x - 0.25) < 1e-3 and abs(bl.y - 1.0) < 1e-4, "Beer-Lambert: tint^(density * path)")
+    var clear = AaaGlassParams(material_id=0, ior=1.5).shadow_transmittance()
+    var dark = AaaGlassParams(material_id=0, ior=1.5, tint=Vec3(0.3, 0.3, 0.3), opacity=0.5).shadow_transmittance()
+    _assert(clear > 0.9 and clear < 1.0 and dark < clear * 0.2, "glass shadow transmittance")
+
+    # Soft shadow filter radius: wider with occluder distance, capped
+    var r_near = penumbra_radius_px_cpu(0.1, 0.005, 5.0, 0.4, 720)
+    var r_far = penumbra_radius_px_cpu(2.0, 0.005, 5.0, 0.4, 720)
+    _assert(r_near < r_far and r_far <= 14.0, "penumbra radius grows with occluder distance")
+
+    # Generic particle emitter packing
+    var em = AaaParticleEmitter.generic(Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 0.0), 300, color=Vec3(0.0, 3.0, 0.0), stretch=True)
+    var ew = List[UInt32]()
+    em.append_words(ew, 0)
+    _assert(len(ew) == AAA_EMITTER_WORDS, "an emitter packs AAA_EMITTER_WORDS words")
+    _assert((ew[14] & 7) == PARTICLE_GENERIC, "generic archetype in the bounce word's low bits")
+    _assert(ew[22] == (PARTICLE_FLAG_ADDITIVE | PARTICLE_FLAG_STRETCH), "generic flags word")
+    _assert(em.end_color.y == Float32(3.0) and em.end_size == em.size, "end color / size default to the start")
+
+    _validate_or_fail(rt_sun_shadow_trace_shader(), "rt_sun_shadow_trace_shader")
+    _validate_or_fail(rt_sun_shadow_filter_shader(), "rt_sun_shadow_filter_shader")
+    _validate_or_fail(aaa_glass_refract_shader(), "aaa_glass_refract_shader")
+    _validate_or_fail(aaa_water_refract_shader(True), "aaa_water_refract_shader")
+    _validate_or_fail(gpu_particle_sim_and_bin_shader(), "gpu_particle_sim_and_bin_shader")
+    _validate_or_fail(gpu_particle_tile_composite_shader(), "gpu_particle_tile_composite_shader")
+
+    var W = 160
+    var H = 96
+    var ren = FlintAaaVulkanRenderer(width=W, height=H, tsr_scale=1.0, max_draws=1024, max_instances=256, env_cube_dim=32)
+    if not ren.active:
+        print("[SKIP] Vulkan unavailable for Suite 7 render-feature GPU checks")
+        ren.shutdown()
+        return
+    ren.tsr_history_weight = Float32(0.0)
+    ren.enable_auto_exposure = False
+    ren.bloom_intensity = Float32(0.0)
+    ren.camera_lens.vignette_strength = Float32(0.0)
+    var mat_floor = ren.add_material(AaaMaterial(base_color=Vec3(0.3, 0.3, 0.3), roughness=0.8, metallic=0.0))
+    var mat_wall = ren.add_material(AaaMaterial(base_color=Vec3(0.9, 0.06, 0.04), roughness=0.6, metallic=0.0))
+    var mat_glass = ren.add_glass_material(AaaGlassParams(material_id=0, ior=1.2, density=0.0))
+    _assert(mat_glass >= 0 and ren.is_glass_material(mat_glass), "glass material registered")
+    var mb_box = MeshBuilder()
+    mb_box.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(1.0, 1.0, 1.0), bevel=0.01)
+    var box_e = ren.add_mesh(mb_box^.finish(), mat_floor, build_lods=False)
+    var mb_ball = MeshBuilder()
+    mb_ball.add_ellipsoid(Vec3(0.0, 0.0, 0.0), Vec3(0.8, 0.8, 0.8), rings=16, segments=24)
+    var ball_e = ren.add_mesh(mb_ball^.finish(), mat_glass, build_lods=False)
+    var eye = Vec3(0.0, 1.0, 4.0)
+    var tgt = Vec3(0.0, 1.0, 0.0)
+    var cx = W // 2
+    var cy = H // 2
+
+    # Additive generic particles light the middle of the frame (green)
+    ren.begin_frame(eye, tgt, fov_y_deg=40.0)
+    ren.draw_instance(box_e.mesh_id, trs(Vec3(0.0, -0.1, 0.0), Quat(), Vec3(5.0, 0.1, 5.0)))
+    _assert(ren.render_frame(capture_readback=True), "particle baseline frame rendered")
+    var g0 = ren.readback_resolved_hdr()[cy * W + cx].y
+    ren.begin_frame(eye, tgt, fov_y_deg=40.0)
+    ren.draw_instance(box_e.mesh_id, trs(Vec3(0.0, -0.1, 0.0), Quat(), Vec3(5.0, 0.1, 5.0)))
+    ren.submit_particle_emitter(
+        AaaParticleEmitter.generic(Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 0.0), 400, color=Vec3(0.0, 3.0, 0.0), size=0.12,
+                                   alpha=1.0, end_alpha=1.0, spawn_radius=0.15, velocity_spread=0.0, gravity_scale=0.0)
+    )
+    _assert(ren.render_frame(capture_readback=True), "particle frame rendered")
+    var g1 = ren.readback_resolved_hdr()[cy * W + cx].y
+    _assert(g1 > g0 + 0.5, "additive particles brighten the frame (green " + String(g0) + " -> " + String(g1) + ")")
+
+    # Clear glass in front of a red wall shows the wall (needs hardware ray queries; no RT feature
+    # needs to be on: glass in the frame builds the TLAS by itself)
+    var glass_note = String("glass skipped (no ray queries)")
+    if ren.vk.has_ray_query:
+        ren.sun_dir = Vec3(0.3, 0.8, 0.6).normalized()  # the sun lights the wall's face
+        var red_seen = Float32(0.0)
+        var blue_seen = Float32(0.0)
+        for _ in range(3):
+            ren.begin_frame(eye, tgt, fov_y_deg=40.0)
+            ren.draw_instance(box_e.mesh_id, trs(Vec3(0.0, -0.1, 0.0), Quat(), Vec3(5.0, 0.1, 5.0)))
+            ren.draw_instance(box_e.mesh_id, trs(Vec3(0.0, 2.0, -2.0), Quat(), Vec3(3.0, 2.0, 0.1)), material_override=mat_wall)
+            ren.draw_instance(ball_e.mesh_id, trs(Vec3(0.0, 1.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+            _assert(ren.render_frame(capture_readback=True), "glass frame rendered")
+            var c = ren.readback_resolved_hdr()[cy * W + cx].copy()
+            red_seen = c.x
+            blue_seen = c.z
+        _assert(red_seen > blue_seen * 2.0, "the red wall shows through clear glass (r=" + String(red_seen) + " b=" + String(blue_seen) + ")")
+        glass_note = "glass r=" + String(red_seen) + " b=" + String(blue_seen)
+    print("[PASS] Suite 7: Soft RT Shadows + Refractive Glass + Shaped Water + Generic GPU Particles (green "
+          + String(g0) + " -> " + String(g1) + ", " + glass_note + ")")
+    ren.shutdown()
+
+
 def main():
     var t0 = get_time()
     print("=== Flint v5 Track 2 Render Pipeline & Metrology Suite ===")
@@ -1086,6 +1218,7 @@ def main():
     test_swapchain_render_world_and_tier0()
     test_gpu_ui_and_aaa_metropolis()
     test_multi_cascade_vsm_gpu_shading()
+    test_render_features_glass_water_particles()
     var dt = get_time() - t0
     print("=== ALL FLINT V5 TRACK 2 RENDER TESTS PASSED in " + String(dt) + "s (<2.0s target) ===")
     _assert(dt < 5.0, "Test suite exceeded runtime safety ceiling: " + String(dt) + "s")

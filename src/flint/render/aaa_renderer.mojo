@@ -244,6 +244,7 @@ from flint.render.aaa_froxel_volumetrics import (
 )
 from flint.render.aaa_gpu_particles import (
     AAA_MAX_PARTICLES,
+    AAA_EMITTER_WORDS,
     AAA_MAX_PARTICLE_EMITTERS,
     AaaParticleEmitter,
     gpu_particle_clear_tiles_shader,
@@ -583,6 +584,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var frame_particle_emitters: List[AaaParticleEmitter]
     var particle_ring_cursor: Int
     var particles_ever_active: Bool
+    var particle_dt_sec: Float32  # GPU particle simulation step per frame (set it to the game's frame time)
     var frame_cluster_lights: List[AaaClusterLight]
     var cluster_far_z: Float32
     var skinned_mesh_flags: List[Bool]
@@ -838,6 +840,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.frame_particle_emitters = List[AaaParticleEmitter]()
         self.particle_ring_cursor = 0
         self.particles_ever_active = False
+        self.particle_dt_sec = Float32(1.0 / 60.0)
         self.frame_cluster_lights = List[AaaClusterLight]()
         self.cluster_far_z = Float32(250.0)
         self.skinned_mesh_flags = List[Bool]()
@@ -2687,7 +2690,8 @@ struct FlintAaaVulkanRenderer(Movable):
             self.frame_plumes.append(plume.copy())
 
     def submit_particle_emitter(mut self, emitter: AaaParticleEmitter):
-        """Queues a GPU compute particle emitter burst/stream (`PARTICLE_SPARK_STREAK`, `WATER_SPRAY`, `DRIFT_SMOKE`, `EXHAUST_PLASMA`)."""
+        """Queues a GPU compute particle emitter burst/stream (`PARTICLE_SPARK_STREAK`, `WATER_SPRAY`, `DRIFT_SMOKE`,
+        `EXHAUST_PLASMA`, `GENERIC`) for this frame: it spawns `spawn_count` particles, which then live on their own."""
         if len(self.frame_particle_emitters) < AAA_MAX_PARTICLE_EMITTERS and emitter.spawn_count > 0:
             self.frame_particle_emitters.append(emitter.copy())
             self.particles_ever_active = True
@@ -4219,7 +4223,7 @@ struct FlintAaaVulkanRenderer(Movable):
             var t_bin_off = gpu_particles_tile_bins_word_offset(max_pix)
             var n_em = min(AAA_MAX_PARTICLE_EMITTERS, len(self.frame_particle_emitters))
             if n_em > 0:
-                var em_words = List[UInt32](capacity=n_em * 16)
+                var em_words = List[UInt32](capacity=n_em * AAA_EMITTER_WORDS)
                 for e_i in range(n_em):
                     var sc_e = max(0, min(4095, self.frame_particle_emitters[e_i].spawn_count))
                     self.frame_particle_emitters[e_i].append_words(em_words, self.particle_ring_cursor)
@@ -4246,7 +4250,7 @@ struct FlintAaaVulkanRenderer(Movable):
             var push_ps = List[UInt32](length=16, fill=0)
             push_ps[0] = UInt32(self.render_w)
             push_ps[1] = UInt32(self.render_h)
-            push_ps[2] = bitcast[DType.uint32](Float32(1.0 / 60.0))
+            push_ps[2] = bitcast[DType.uint32](max(Float32(0.0005), min(Float32(0.1), self.particle_dt_sec)))
             push_ps[3] = UInt32(n_em)
             push_ps[4] = UInt32(em_off)
             push_ps[5] = UInt32(pool_off)
