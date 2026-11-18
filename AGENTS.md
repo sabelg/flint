@@ -19,6 +19,7 @@ pixi install                              # Install Mojo 1.2 toolchain on a new 
 bash tools/flint.sh gate                  # Sync check + compile + 5 test suites + headless PNG
 bash tools/flint.sh play                  # Run interactive minimal_spark 2D+3D showcase
 bash tools/flint.sh kms [--probe]         # Bare-display DRM/KMS demo from a text console (no X11/Wayland)
+bash tools/flint.sh kms3d                 # GPU 3D on the bare display (Vulkan swapchain via VK_KHR_display)
 bash tools/flint.sh sync /path/to/Deepsong # Harvest latest game-agnostic pure-Mojo libraries
 bash tools/flint.sh new ../my-game        # Scaffold a standalone game repo
 ```

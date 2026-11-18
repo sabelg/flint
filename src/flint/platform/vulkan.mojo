@@ -14,9 +14,10 @@ to wait for, and 0 means none.
 On x86-64 Linux every Vulkan argument travels as a 64-bit register or stack
 slot, so one family of call helpers taking Int fits all of them.
 """
+from std.collections import Dict
 from std.ffi import external_call
 from flint.platform.amdgpu import GpuBuffer
-from flint.platform.os import env_flag, env_value
+from flint.platform.os import env_flag, env_value, read_bytes, write_bytes
 
 comptime Call1 = def(Int) thin abi("C") -> Int32
 comptime Call2 = def(Int, Int) thin abi("C") -> Int32
@@ -50,6 +51,7 @@ comptime TYPE_SEMAPHORE_CREATE_INFO: UInt32 = 9
 comptime TYPE_QUERY_POOL_CREATE_INFO: UInt32 = 11
 comptime TYPE_BUFFER_CREATE_INFO: UInt32 = 12
 comptime TYPE_SHADER_MODULE_CREATE_INFO: UInt32 = 16
+comptime TYPE_PIPELINE_CACHE_CREATE_INFO: UInt32 = 17
 comptime TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: UInt32 = 18
 comptime TYPE_COMPUTE_PIPELINE_CREATE_INFO: UInt32 = 29
 comptime TYPE_PIPELINE_LAYOUT_CREATE_INFO: UInt32 = 30
@@ -115,6 +117,7 @@ comptime LIMIT_TIMESTAMP_PERIOD: Int = LIMITS_OFFSET + 424
 comptime DEVICE_PROPERTIES_BYTES: Int = 824
 comptime MAX_REPORTED_MESSAGES: Int = 12
 
+comptime TYPE_XCB_SURFACE_CREATE_INFO: UInt32 = 1000005000
 comptime TYPE_WAYLAND_SURFACE_CREATE_INFO: UInt32 = 1000006000
 comptime TYPE_DISPLAY_SURFACE_CREATE_INFO: UInt32 = 1000002001
 comptime DISPLAY_ALPHA_OPAQUE: UInt32 = 1
@@ -125,8 +128,17 @@ comptime DISPLAY_PLANE_PROPERTIES_BYTES: Int = 16  # VkDisplayPlanePropertiesKHR
 comptime TYPE_SWAPCHAIN_CREATE_INFO: UInt32 = 1000001000
 comptime TYPE_PRESENT_INFO: UInt32 = 1000001001
 comptime TYPE_IMAGE_MEMORY_BARRIER: UInt32 = 45
-comptime FORMAT_B8G8R8A8_UNORM: UInt32 = 44
+comptime PRESENT_IMMEDIATE: UInt32 = 0
+comptime PRESENT_MAILBOX: UInt32 = 1
 comptime PRESENT_FIFO: UInt32 = 2
+comptime PRESENT_FIFO_RELAXED: UInt32 = 3
+comptime FORMAT_R8_UNORM: UInt32 = 9
+comptime FORMAT_B8G8R8A8_UNORM: UInt32 = 44
+comptime FORMAT_B8G8R8A8_SRGB: UInt32 = 50
+comptime FORMAT_A2B10G10R10_UNORM_PACK32: UInt32 = 64
+comptime COLOR_SPACE_SRGB_NONLINEAR: UInt32 = 0
+comptime COLOR_SPACE_HDR10_ST2084: UInt32 = 1000104008
+comptime COLOR_SPACE_EXTENDED_SRGB_LINEAR: UInt32 = 1000104002
 comptime IMAGE_USAGE_TRANSFER_TARGET: UInt32 = 2
 comptime COMPOSITE_OPAQUE: UInt32 = 1
 comptime LAYOUT_UNDEFINED: UInt32 = 0
@@ -250,6 +262,7 @@ comptime TOPOLOGY_TRIANGLE_LIST: UInt32 = 3
 comptime CULL_MODE_NONE: UInt32 = 0
 comptime CULL_MODE_BACK: UInt32 = 2
 comptime FRONT_FACE_CCW: UInt32 = 0
+comptime FRONT_FACE_CW: UInt32 = 1
 comptime SAMPLE_COUNT_1: UInt32 = 1
 comptime FILTER_NEAREST: UInt32 = 0
 comptime FILTER_LINEAR: UInt32 = 1
@@ -271,8 +284,10 @@ comptime AS_TYPE_BOTTOM_LEVEL_KHR: UInt32 = 1
 comptime GEOMETRY_TYPE_TRIANGLES_KHR: UInt32 = 0
 comptime GEOMETRY_TYPE_INSTANCES_KHR: UInt32 = 2
 comptime GEOMETRY_OPAQUE_BIT_KHR: UInt32 = 1
+comptime BUILD_AS_ALLOW_UPDATE_KHR: UInt32 = 1
 comptime BUILD_AS_PREFER_FAST_TRACE_KHR: UInt32 = 4
 comptime BUILD_AS_MODE_BUILD_KHR: UInt32 = 0
+comptime BUILD_AS_MODE_UPDATE_KHR: UInt32 = 1
 comptime BUILD_AS_TYPE_DEVICE_KHR: Int = 1
 comptime INDEX_TYPE_UINT32: UInt32 = 1
 
@@ -313,6 +328,54 @@ struct VulkanAccelStruct(Copyable, Movable):
         self.handle = 0
         self.buffer = GpuBuffer()
         self.device_address = 0
+
+
+struct SwapchainHandle(Copyable, Movable):
+    var surface: Int
+    var swapchain: Int
+    var width: Int
+    var height: Int
+    var format: UInt32
+    var color_space: UInt32
+    var present_mode: UInt32
+    var image_count: Int
+    var is_hdr: Bool
+
+    def __init__(out self):
+        self.surface = 0
+        self.swapchain = 0
+        self.width = 0
+        self.height = 0
+        self.format = FORMAT_B8G8R8A8_UNORM
+        self.color_space = COLOR_SPACE_SRGB_NONLINEAR
+        self.present_mode = PRESENT_FIFO
+        self.image_count = 0
+        self.is_hdr = False
+
+    def __init__(
+        out self,
+        surface: Int,
+        swapchain: Int,
+        width: Int,
+        height: Int,
+        format: UInt32,
+        color_space: UInt32,
+        present_mode: UInt32,
+        image_count: Int,
+        is_hdr: Bool,
+    ):
+        self.surface = surface
+        self.swapchain = swapchain
+        self.width = width
+        self.height = height
+        self.format = format
+        self.color_space = color_space
+        self.present_mode = present_mode
+        self.image_count = image_count
+        self.is_hdr = is_hdr
+
+    def active(self) -> Bool:
+        return self.swapchain != 0
 
 
 def put32(address: Int, value: UInt32):
@@ -450,6 +513,7 @@ struct VulkanGpu(Copyable, Movable):
     var has_calibration: Bool
     var has_swapchain: Bool
     var has_wayland_surface: Bool
+    var has_xcb_surface: Bool
     var has_display_surface: Bool  # VK_KHR_display + VK_EXT_acquire_drm_display: present with no compositor
     var display: Int  # the VkDisplayKHR taken from a KMS connector, released with the swapchain
     var api_version: UInt32
@@ -476,6 +540,7 @@ struct VulkanGpu(Copyable, Movable):
     var query_pool: Int
     var descriptor_layout: Int
     var pipeline_layout: Int
+    var pipeline_cache: Int
     var descriptor_pool: Int
     var side_pools: List[Int]  # descriptor pools of passes outside the frame (GPU meshing)
     var layout_bindings: Int
@@ -484,7 +549,12 @@ struct VulkanGpu(Copyable, Movable):
     var swapchain: Int
     var swapchain_width: Int
     var swapchain_height: Int
+    var swapchain_format: UInt32
+    var swapchain_color_space: UInt32
+    var swapchain_present_mode: UInt32
+    var is_hdr: Bool
     var images: List[Int]
+    var image_views: List[Int]
     var acquire_semaphores: List[Int]
     var finished_semaphores: List[Int]
     var presented: Int
@@ -517,8 +587,13 @@ struct VulkanGpu(Copyable, Movable):
     var fn_wait_semaphores: Int
     var fn_update_descriptors: Int
     var fn_calibrate: Int
+    # Per-device cache of `vkGetDeviceProcAddr` results (filled lazily by `device_call`; reset when the device closes).
+    var device_call_cache: Dict[String, Int]
+    var device_call_cache_device: Int
 
     def __init__(out self):
+        self.device_call_cache = Dict[String, Int]()
+        self.device_call_cache_device = 0
         self.library = 0
         self.instance = 0
         self.physical = 0
@@ -538,9 +613,10 @@ struct VulkanGpu(Copyable, Movable):
         self.has_dma_buf = False
         self.has_calibration = False
         self.has_swapchain = False
-        self.has_wayland_surface = False
         self.has_display_surface = False
         self.display = 0
+        self.has_wayland_surface = False
+        self.has_xcb_surface = False
         self.api_version = API_VERSION_1_2
         self.has_vulkan_13 = False
         self.has_dynamic_rendering = False
@@ -562,6 +638,7 @@ struct VulkanGpu(Copyable, Movable):
         self.query_pool = 0
         self.descriptor_layout = 0
         self.pipeline_layout = 0
+        self.pipeline_cache = 0
         self.descriptor_pool = 0
         self.side_pools = List[Int]()
         self.layout_bindings = 0
@@ -570,7 +647,12 @@ struct VulkanGpu(Copyable, Movable):
         self.swapchain = 0
         self.swapchain_width = 0
         self.swapchain_height = 0
+        self.swapchain_format = FORMAT_B8G8R8A8_UNORM
+        self.swapchain_color_space = COLOR_SPACE_SRGB_NONLINEAR
+        self.swapchain_present_mode = PRESENT_FIFO
+        self.is_hdr = False
         self.images = List[Int]()
+        self.image_views = List[Int]()
         self.acquire_semaphores = List[Int]()
         self.finished_semaphores = List[Int]()
         self.presented = 0
@@ -643,9 +725,19 @@ struct VulkanGpu(Copyable, Movable):
         return address
 
     def device_call(mut self, name: String) -> Int:
+        """`vkGetDeviceProcAddr`, memoised per device: the hot recording helpers (barriers, rendering, draws,
+        copies, AS builds) call this for every command, and a loader lookup costs a scratch memset + string copy."""
+        if self.device_call_cache_device != self.device:
+            self.device_call_cache.clear()
+            self.device_call_cache_device = self.device
+        var cached = self.device_call_cache.get(name)
+        if cached:
+            return cached.value()
         var address = lookup(self.proc_device, self.device, self.text(name))
         if address == 0:
             self.error = "the driver has no " + name
+        elif self.device != 0:
+            self.device_call_cache[name] = address
         return address
 
     # Bring-up.
@@ -725,14 +817,23 @@ struct VulkanGpu(Copyable, Movable):
     def create_instance(mut self, validate: Bool) -> Bool:
         var offered = self.instance_extensions()
         var extensions = List[String]()
-        for wanted in ["VK_KHR_surface", "VK_KHR_wayland_surface"]:
+        for wanted in ["VK_KHR_surface", "VK_KHR_wayland_surface", "VK_KHR_xcb_surface"]:
             if String(wanted) in offered:
                 extensions.append(String(wanted))
-        self.has_wayland_surface = len(extensions) == 2
+        var has_surf = False
+        var has_wl = False
+        var has_xcb = False
+        for ext in extensions:
+            if ext == "VK_KHR_surface":
+                has_surf = True
+            elif ext == "VK_KHR_wayland_surface":
+                has_wl = True
+            elif ext == "VK_KHR_xcb_surface":
+                has_xcb = True
+        self.has_wayland_surface = has_surf and has_wl
+        self.has_xcb_surface = has_surf and has_xcb
         # Presenting straight to a KMS connector (platform/kms.mojo, GPU mode): all three or none.
-        if "VK_KHR_surface" in offered and "VK_KHR_display" in offered and "VK_EXT_direct_mode_display" in offered and "VK_EXT_acquire_drm_display" in offered:
-            if "VK_KHR_surface" not in extensions:
-                extensions.append("VK_KHR_surface")
+        if has_surf and "VK_KHR_display" in offered and "VK_EXT_direct_mode_display" in offered and "VK_EXT_acquire_drm_display" in offered:
             extensions.append("VK_KHR_display")
             extensions.append("VK_EXT_direct_mode_display")
             extensions.append("VK_EXT_acquire_drm_display")
@@ -938,10 +1039,12 @@ struct VulkanGpu(Copyable, Movable):
             put64(vk12 + 8, vk13)
             put32(vk13, TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
 
-            # Core 1.0 features: multiDrawIndirect (16+36=52), samplerAnisotropy (16+76=92), fragmentStoresAndAtomics (16+104=120)
+            # Core 1.0 features: geometryShader (16+16=32), multiDrawIndirect (16+36=52), samplerAnisotropy (16+76=92), fragmentStoresAndAtomics (16+104=120)
+            put32(feat2 + 16 + 16, get32(q_feat2 + 16 + 16))   # geometryShader (for gl_PrimitiveID in fragment shaders)
             put32(feat2 + 16 + 36, get32(q_feat2 + 16 + 36))
             put32(feat2 + 16 + 76, get32(q_feat2 + 16 + 76))
             put32(feat2 + 16 + 104, get32(q_feat2 + 16 + 104))
+            put32(feat2 + 16 + 116, get32(q_feat2 + 16 + 116))  # shaderStorageImageExtendedFormats
 
             # Vulkan 1.2 features
             put32(vk12 + 20, get32(q_vk12 + 20))   # drawIndirectCount
@@ -1322,7 +1425,7 @@ struct VulkanGpu(Copyable, Movable):
         put64(info + 56, self.text("main"))
         put64(info + 72, self.pipeline_layout)
         put32(info + 88, 0xFFFFFFFF)
-        var result = call6(self.device_call("vkCreateComputePipelines"), self.device, 0, 1, info, 0, slot)
+        var result = call6(self.device_call("vkCreateComputePipelines"), self.device, self.pipeline_cache, 1, info, 0, slot)
         var pipeline = get64(slot)
         _ = call3(self.device_call("vkDestroyShaderModule"), self.device, module, 0)
         if not self.check(result, "vkCreateComputePipelines"):
@@ -1466,8 +1569,8 @@ struct VulkanGpu(Copyable, Movable):
     def reset_queries(mut self, frame: Int, first: Int, count: Int):
         _ = call4(self.fn_reset_query_pool, self.command_buffers[frame], self.query_pool, first, count)
 
-    def write_timestamp(mut self, frame: Int, query: Int):
-        _ = call4(self.fn_write_timestamp, self.command_buffers[frame], PIPELINE_BOTTOM, self.query_pool, query)
+    def write_timestamp(mut self, frame: Int, query: Int, stage: Int = PIPELINE_BOTTOM):
+        _ = call4(self.fn_write_timestamp, self.command_buffers[frame], stage, self.query_pool, query)
 
     def read_queries(mut self, first: Int, count: Int, target: Int) -> Bool:
         """Copy finished timestamps as 64-bit values. Unfinished ones stay as they were."""
@@ -1564,10 +1667,37 @@ struct VulkanGpu(Copyable, Movable):
             self.acquire_semaphores.append(self.create_binary_semaphore())
         return True
 
-    def create_drm_display_surface(mut self, drm_fd: Int, connector: Int, width: Int, height: Int, refresh_mhz: Int, frames: Int = 2) -> Bool:
+    def create_xcb_surface(mut self, connection: Int, window: Int, frames: Int = 2) -> Bool:
+        """Make a Vulkan surface of this X11 XCB connection/window, and check we can present to it."""
+        if not self.has_xcb_surface or not self.has_swapchain:
+            return self.fail("this driver has no XCB swapchain")
+        self.rewind()
+        var info = self.scratch(40)
+        put32(info, TYPE_XCB_SURFACE_CREATE_INFO)
+        put64(info + 8, 0)
+        put32(info + 16, 0)
+        put64(info + 24, connection)
+        put64(info + 32, window)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.instance_call("vkCreateXcbSurfaceKHR"), self.instance, info, 0, slot), "vkCreateXcbSurfaceKHR"):
+            return False
+        self.surface = get64(slot)
+        var supported = self.scratch(8)
+        if not self.check(call4(self.instance_call("vkGetPhysicalDeviceSurfaceSupportKHR"), self.physical, Int(self.family), self.surface, supported), "vkGetPhysicalDeviceSurfaceSupportKHR"):
+            return False
+        if get32(supported) == 0:
+            return self.fail("this queue cannot present to the X11 window")
+        self.rewind()
+        for _ in range(frames):
+            self.acquire_semaphores.append(self.create_binary_semaphore())
+        return True
+
+    def create_drm_display_surface(mut self, drm_fd: Int, connector: Int, width: Int, height: Int, refresh_mhz: Int, frames: Int = 2, exact_size: Bool = False) -> Bool:
         """Present straight to a KMS connector, no compositor: take the display through our
         DRM master fd (VK_EXT_acquire_drm_display), match the KMS mode, pick a plane that can
-        show it, and make a display-plane surface. The swapchain is then the usual one."""
+        show it, and make a display-plane surface. The swapchain is then the usual one.
+        With `exact_size`, fail instead of taking another size when the display has no
+        width x height mode (the swapchain must match a renderer that cannot scale)."""
         if not self.has_display_surface or not self.has_swapchain:
             return self.fail("this driver cannot present to a display directly (VK_KHR_display / VK_EXT_acquire_drm_display)")
         self.rewind()
@@ -1598,6 +1728,8 @@ struct VulkanGpu(Copyable, Movable):
         var chosen = choose_display_mode(widths, heights, rates, width, height, refresh_mhz)
         if chosen < 0:
             return self.fail("the display offers no modes")
+        if exact_size and (widths[chosen] != width or heights[chosen] != height):
+            return self.fail("the display has no " + String(width) + "x" + String(height) + " mode")
         var mode = get64(modes + chosen * DISPLAY_MODE_PROPERTIES_BYTES)
         var mode_w = widths[chosen]
         var mode_h = heights[chosen]
@@ -1662,14 +1794,89 @@ struct VulkanGpu(Copyable, Movable):
             _ = call2(self.instance_call("vkReleaseDisplayEXT"), self.physical, self.display)
         self.display = 0
 
-    def create_swapchain(mut self, width: Int, height: Int) -> Bool:
-        """FIFO always exists and paces to the display. Size is ours to choose on Wayland,
-        and the compositor scales it, so it matches the render size, not the window."""
+    def attach_surface(
+        mut self,
+        wl_display: Int = 0,
+        wl_surface: Int = 0,
+        xcb_conn: Int = 0,
+        xcb_win: Int = 0,
+        width: Int = 0,
+        height: Int = 0,
+        prefer_mailbox: Bool = True,
+        prefer_hdr10: Bool = False,
+        drm_fd: Int = -1,
+        drm_connector: Int = 0,
+        drm_refresh_mhz: Int = 60000,
+        drm_exact_size: Bool = False,
+    ) -> SwapchainHandle:
+        """Attaches a Wayland, XCB or KMS display surface and creates swapchain with FIFO/MAILBOX/HDR10.
+        For KMS pass the window's DRM fd and connector (`KmsWindow.drm_fd`, `.connector_id`),
+        its mode size as width/height, and `drm_refresh_mhz`."""
+        if wl_display != 0 and wl_surface != 0:
+            if not self.create_surface(wl_display, wl_surface, 2):
+                return SwapchainHandle()
+        elif xcb_conn != 0 and xcb_win != 0:
+            if not self.create_xcb_surface(xcb_conn, xcb_win, 2):
+                return SwapchainHandle()
+        elif drm_fd >= 0 and drm_connector != 0:
+            if not self.create_drm_display_surface(drm_fd, drm_connector, width, height, drm_refresh_mhz, 2, drm_exact_size):
+                self.release_display()
+                return SwapchainHandle()
+        else:
+            return SwapchainHandle()
+
+        var sw = width if width > 0 else 1280
+        var sh = height if height > 0 else 720
+        if not self.create_swapchain(sw, sh, prefer_mailbox=prefer_mailbox, prefer_hdr10=prefer_hdr10):
+            return SwapchainHandle()
+
+        return SwapchainHandle(
+            self.surface,
+            self.swapchain,
+            self.swapchain_width,
+            self.swapchain_height,
+            self.swapchain_format,
+            self.swapchain_color_space,
+            self.swapchain_present_mode,
+            len(self.images),
+            self.is_hdr,
+        )
+
+    def create_image_view(mut self, img: Int, format: UInt32, aspect: UInt32 = ASPECT_COLOR) -> Int:
+        self.rewind()
+        var view_info = self.scratch(80)
+        put32(view_info, TYPE_IMAGE_VIEW_CREATE_INFO)
+        put64(view_info + 24, img)
+        put32(view_info + 32, IMAGE_VIEW_TYPE_2D)
+        put32(view_info + 36, format)
+        put32(view_info + 56, aspect)
+        put32(view_info + 60, 0)
+        put32(view_info + 64, 1)
+        put32(view_info + 68, 0)
+        put32(view_info + 72, 1)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateImageView"), self.device, view_info, 0, slot), "vkCreateImageView"):
+            return 0
+        return get64(slot)
+
+    def destroy_image_view(mut self, view: Int):
+        if view != 0:
+            _ = call3(self.device_call("vkDestroyImageView"), self.device, view, 0)
+
+    def create_swapchain(
+        mut self,
+        width: Int,
+        height: Int,
+        prefer_mailbox: Bool = True,
+        prefer_hdr10: Bool = False,
+    ) -> Bool:
+        """Creates swapchain supporting FIFO/MAILBOX and SDR/HDR10 PQ."""
         self.rewind()
         var capabilities = self.scratch(52)
         if not self.check(call3(self.instance_call("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"), self.physical, self.surface, capabilities), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"):
             return False
-        if (get32(capabilities + 48) & IMAGE_USAGE_TRANSFER_TARGET) == 0:
+        var sup_usages = get32(capabilities + 48)
+        if (sup_usages & IMAGE_USAGE_TRANSFER_TARGET) == 0:
             return self.fail("swapchain images cannot be copied to")
         var list_formats = self.instance_call("vkGetPhysicalDeviceSurfaceFormatsKHR")
         var count_slot = self.scratch(8)
@@ -1677,29 +1884,85 @@ struct VulkanGpu(Copyable, Movable):
         var count = Int(get32(count_slot))
         var formats = self.scratch(max(count, 1) * 8)
         _ = call4(list_formats, self.physical, self.surface, count_slot, formats)
-        var color_space = UInt32(0xFFFFFFFF)
-        for index in range(count):
-            if get32(formats + index * 8) == FORMAT_B8G8R8A8_UNORM and color_space == 0xFFFFFFFF:
-                color_space = get32(formats + index * 8 + 4)
-        if color_space == 0xFFFFFFFF:
-            return self.fail("the window takes no B8G8R8A8_UNORM images")
+
+        var chosen_format = FORMAT_B8G8R8A8_UNORM
+        var chosen_color_space = COLOR_SPACE_SRGB_NONLINEAR
+        var is_hdr = False
+
+        if prefer_hdr10:
+            for index in range(count):
+                var fmt = get32(formats + index * 8)
+                var cs = get32(formats + index * 8 + 4)
+                if fmt == FORMAT_A2B10G10R10_UNORM_PACK32 and cs == COLOR_SPACE_HDR10_ST2084:
+                    chosen_format = fmt
+                    chosen_color_space = cs
+                    is_hdr = True
+                    break
+
+        if not is_hdr:
+            var found_sdr = False
+            for index in range(count):
+                var fmt = get32(formats + index * 8)
+                var cs = get32(formats + index * 8 + 4)
+                if (fmt == FORMAT_B8G8R8A8_UNORM or fmt == FORMAT_B8G8R8A8_SRGB or fmt == FORMAT_R8G8B8A8_UNORM) and cs == COLOR_SPACE_SRGB_NONLINEAR:
+                    chosen_format = fmt
+                    chosen_color_space = cs
+                    found_sdr = True
+                    break
+            if not found_sdr and count > 0:
+                chosen_format = get32(formats)
+                chosen_color_space = get32(formats + 4)
+
+        self.swapchain_format = chosen_format
+        self.swapchain_color_space = chosen_color_space
+        self.is_hdr = is_hdr
+
+        var list_modes = self.instance_call("vkGetPhysicalDeviceSurfacePresentModesKHR")
+        _ = call4(list_modes, self.physical, self.surface, count_slot, 0)
+        var mode_count = Int(get32(count_slot))
+        var modes = self.scratch(max(mode_count, 1) * 4)
+        _ = call4(list_modes, self.physical, self.surface, count_slot, modes)
+
+        var has_mailbox = False
+        for index in range(mode_count):
+            if get32(modes + index * 4) == PRESENT_MAILBOX:
+                has_mailbox = True
+                break
+
+        var chosen_present_mode = PRESENT_MAILBOX if (prefer_mailbox and has_mailbox) else PRESENT_FIFO
+        self.swapchain_present_mode = chosen_present_mode
+
         var minimum = get32(capabilities)
         var maximum = get32(capabilities + 4)
-        var wanted = max(minimum, UInt32(3))
+        var wanted = max(minimum, UInt32(3) if chosen_present_mode == PRESENT_MAILBOX else UInt32(2))
+        var eff_images = min(wanted, maximum) if maximum != 0 else wanted
+
+        var cur_w = get32(capabilities + 8)
+        var cur_h = get32(capabilities + 12)
+        var final_w = UInt32(width)
+        var final_h = UInt32(height)
+        if cur_w != 0xFFFFFFFF and cur_h != 0xFFFFFFFF:
+            final_w = cur_w
+            final_h = cur_h
+
+        var usage_flags = IMAGE_USAGE_TRANSFER_TARGET | (sup_usages & IMAGE_USAGE_COLOR_ATTACHMENT)
+        if (sup_usages & IMAGE_USAGE_STORAGE) != 0:
+            usage_flags |= IMAGE_USAGE_STORAGE
+
         var info = self.scratch(104)
         put32(info, TYPE_SWAPCHAIN_CREATE_INFO)
         put64(info + 24, self.surface)
-        put32(info + 32, min(wanted, maximum) if maximum != 0 else wanted)
-        put32(info + 36, FORMAT_B8G8R8A8_UNORM)
-        put32(info + 40, color_space)
-        put32(info + 44, UInt32(width))
-        put32(info + 48, UInt32(height))
+        put32(info + 32, eff_images)
+        put32(info + 36, chosen_format)
+        put32(info + 40, chosen_color_space)
+        put32(info + 44, final_w)
+        put32(info + 48, final_h)
         put32(info + 52, 1)
-        put32(info + 56, IMAGE_USAGE_TRANSFER_TARGET)
+        put32(info + 56, usage_flags)
         put32(info + 80, get32(capabilities + 40))
         var alphas = get32(capabilities + 44)
         put32(info + 84, COMPOSITE_OPAQUE if (alphas & COMPOSITE_OPAQUE) != 0 else (alphas & (~alphas + 1)))
-        put32(info + 88, PRESENT_FIFO)
+        put32(info + 88, chosen_present_mode)
         put32(info + 92, 1)
         put64(info + 96, self.swapchain)
         var slot = self.scratch(8)
@@ -1707,10 +1970,14 @@ struct VulkanGpu(Copyable, Movable):
             return False
         var replaced = self.swapchain
         self.swapchain = get64(slot)
+        if len(self.image_views) > 0:
+            for v_idx in range(len(self.image_views)):
+                self.destroy_image_view(self.image_views[v_idx])
+            self.image_views.clear()
         if replaced != 0:
             _ = call3(self.device_call("vkDestroySwapchainKHR"), self.device, replaced, 0)
-        self.swapchain_width = width
-        self.swapchain_height = height
+        self.swapchain_width = Int(final_w)
+        self.swapchain_height = Int(final_h)
         var list_images = self.device_call("vkGetSwapchainImagesKHR")
         _ = call4(list_images, self.device, self.swapchain, count_slot, 0)
         var image_count = Int(get32(count_slot))
@@ -1722,6 +1989,9 @@ struct VulkanGpu(Copyable, Movable):
             self.images.append(get64(images + index * 8))
         while len(self.finished_semaphores) < image_count:
             self.finished_semaphores.append(self.create_binary_semaphore())
+        for index in range(image_count):
+            var view = self.create_image_view(self.images[index], chosen_format, ASPECT_COLOR)
+            self.image_views.append(view)
         return True
 
     def acquire_image(mut self, frame: Int) -> Int:
@@ -1755,12 +2025,13 @@ struct VulkanGpu(Copyable, Movable):
         put32(barrier + 64, 1)
         _ = call10(self.fn_pipeline_barrier, self.command_buffers[frame], source_stage, target_stage, 0, 0, 0, 0, 0, 1, barrier)
 
-    def copy_to_image(mut self, frame: Int, source: GpuBuffer, row_pixels: Int, image: Int):
+    def copy_to_image(mut self, frame: Int, source: GpuBuffer, row_pixels: Int, image: Int, buffer_offset: UInt64 = 0):
         """The finished frame, into the swapchain image, ready to present."""
         self.barrier(frame, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_TRANSFER, ACCESS_TRANSFER_READ)
         self.image_barrier(frame, image, LAYOUT_UNDEFINED, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
         self.rewind()
         var region = self.scratch(56)
+        put64(region, Int(buffer_offset))
         put32(region + 8, UInt32(row_pixels))
         put32(region + 16, ASPECT_COLOR)
         put32(region + 28, 1)
@@ -1874,6 +2145,9 @@ struct VulkanGpu(Copyable, Movable):
             for index in range(len(self.pipelines)):
                 _ = call3(self.device_call("vkDestroyPipeline"), self.device, self.pipelines[index], 0)
             self.pipelines.clear()
+            if self.pipeline_cache != 0:
+                _ = call3(self.device_call("vkDestroyPipelineCache"), self.device, self.pipeline_cache, 0)
+                self.pipeline_cache = 0
             self.rewind()
             if self.descriptor_pool != 0:
                 _ = call3(self.device_call("vkDestroyDescriptorPool"), self.device, self.descriptor_pool, 0)
@@ -1898,6 +2172,8 @@ struct VulkanGpu(Copyable, Movable):
                 _ = call3(self.device_call("vkDestroySemaphore"), self.device, self.timeline, 0)
             _ = call2(self.device_call("vkDestroyDevice"), self.device, 0)
             self.device = 0
+            self.device_call_cache.clear()
+            self.device_call_cache_device = 0
         self.rewind()
         if self.messenger != 0:
             _ = call3(self.instance_call("vkDestroyDebugUtilsMessengerEXT"), self.instance, self.messenger, 0)
@@ -2211,6 +2487,45 @@ struct VulkanGpu(Copyable, Movable):
             region,
         )
 
+    def upload_image_subregion(
+        mut self,
+        frame: Int,
+        img: VulkanImage,
+        staging: GpuBuffer,
+        buf_offset: Int,
+        offset_x: Int,
+        offset_y: Int,
+        width: Int,
+        height: Int,
+        mip_level: Int = 0,
+        base_layer: Int = 0,
+        layer_count: Int = 1,
+    ):
+        self.rewind()
+        var region = self.scratch(56)
+        put64(region, buf_offset)
+        put32(region + 8, UInt32(width))
+        put32(region + 12, UInt32(height))
+        put32(region + 16, ASPECT_COLOR)
+        put32(region + 20, UInt32(mip_level))
+        put32(region + 24, UInt32(base_layer))
+        put32(region + 28, UInt32(layer_count))
+        put32(region + 32, UInt32(offset_x))
+        put32(region + 36, UInt32(offset_y))
+        put32(region + 40, 0)
+        put32(region + 44, UInt32(max(1, width)))
+        put32(region + 48, UInt32(max(1, height)))
+        put32(region + 52, 1)
+        _ = call6(
+            self.device_call("vkCmdCopyBufferToImage"),
+            self.command_buffers[frame],
+            staging.vk_buffer,
+            img.image,
+            Int(LAYOUT_TRANSFER_TARGET),
+            1,
+            region,
+        )
+
     def copy_image_to_buffer(
         mut self,
         frame: Int,
@@ -2373,6 +2688,55 @@ struct VulkanGpu(Copyable, Movable):
             return (0, 0)
         return (pool, get64(slot))
 
+    def allocate_aaa_descriptor_sets(
+        mut self,
+        dsl: Int,
+        count: Int,
+        storage_count: Int,
+        single_sampler_count: Int,
+        max_bindless_textures: Int,
+        has_tlas: Bool,
+    ) -> Tuple[Int, List[Int]]:
+        self.rewind()
+        var pool_types = 2 + (1 if has_tlas else 0)
+        var sizes = self.scratch(pool_types * 8)
+        put32(sizes, DESCRIPTOR_STORAGE_BUFFER)
+        put32(sizes + 4, UInt32(max(1, storage_count * count)))
+        put32(sizes + 8, DESCRIPTOR_COMBINED_IMAGE_SAMPLER)
+        put32(sizes + 12, UInt32(max(1, (single_sampler_count + max_bindless_textures) * count)))
+        if has_tlas:
+            put32(sizes + 16, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
+            put32(sizes + 20, UInt32(count))
+
+        var pool_info = self.scratch(40)
+        put32(pool_info, TYPE_DESCRIPTOR_POOL_CREATE_INFO)
+        put32(pool_info + 16, DESCRIPTOR_POOL_UPDATE_AFTER_BIND)
+        put32(pool_info + 20, UInt32(count))
+        put32(pool_info + 24, UInt32(pool_types))
+        put64(pool_info + 32, sizes)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateDescriptorPool"), self.device, pool_info, 0, slot), "vkCreateDescriptorPool(AAA)"):
+            return (0, List[Int]())
+        var pool = get64(slot)
+
+        var layouts = self.scratch(count * 8)
+        for i in range(count):
+            put64(layouts + i * 8, dsl)
+        var alloc_info = self.scratch(40)
+        put32(alloc_info, TYPE_DESCRIPTOR_SET_ALLOCATE_INFO)
+        put64(alloc_info + 16, pool)
+        put32(alloc_info + 24, UInt32(count))
+        put64(alloc_info + 32, layouts)
+        var set_slots = self.scratch(count * 8)
+        if not self.check(call3(self.device_call("vkAllocateDescriptorSets"), self.device, alloc_info, set_slots), "vkAllocateDescriptorSets(AAA)"):
+            _ = call3(self.device_call("vkDestroyDescriptorPool"), self.device, pool, 0)
+            return (0, List[Int]())
+
+        var out_sets = List[Int]()
+        for i in range(count):
+            out_sets.append(get64(set_slots + i * 8))
+        return (pool, out_sets^)
+
     def write_aaa_texture(
         mut self,
         descriptor_set: Int,
@@ -2432,7 +2796,7 @@ struct VulkanGpu(Copyable, Movable):
         put64(info + 56, self.text("main"))
         put64(info + 72, pipeline_layout)
         put32(info + 88, 0xFFFFFFFF)
-        var result = call6(self.device_call("vkCreateComputePipelines"), self.device, 0, 1, info, 0, slot)
+        var result = call6(self.device_call("vkCreateComputePipelines"), self.device, self.pipeline_cache, 1, info, 0, slot)
         var pipeline = get64(slot)
         _ = call3(self.device_call("vkDestroyShaderModule"), self.device, module, 0)
         if not self.check(result, "vkCreateComputePipelines(AAA)"):
@@ -2451,6 +2815,7 @@ struct VulkanGpu(Copyable, Movable):
         depth_write: Bool = True,
         depth_compare: UInt32 = COMPARE_GREATER_OR_EQUAL,
         cull_mode: UInt32 = CULL_MODE_NONE,
+        front_face: UInt32 = FRONT_FACE_CCW,
     ) -> Int:
         """Creates a Vulkan 1.3 `VK_KHR_dynamic_rendering` hardware graphics pipeline (Vertex + optional Fragment)."""
         self.rewind()
@@ -2503,7 +2868,7 @@ struct VulkanGpu(Copyable, Movable):
         var rs = self.scratch(64)
         put32(rs, TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
         put32(rs + 32, cull_mode)
-        put32(rs + 36, FRONT_FACE_CCW)
+        put32(rs + 36, front_face)
         put_float(rs + 56, Float32(1.0))
 
         var ms = self.scratch(48)
@@ -2556,7 +2921,7 @@ struct VulkanGpu(Copyable, Movable):
         put64(gp + 104, pipeline_layout)
         put32(gp + 128, 0xFFFFFFFF)
 
-        var res = call6(self.device_call("vkCreateGraphicsPipelines"), self.device, 0, 1, gp, 0, slot)
+        var res = call6(self.device_call("vkCreateGraphicsPipelines"), self.device, self.pipeline_cache, 1, gp, 0, slot)
         var pipe = get64(slot)
         _ = call3(self.device_call("vkDestroyShaderModule"), self.device, v_mod, 0)
         if f_mod != 0:
@@ -2569,6 +2934,51 @@ struct VulkanGpu(Copyable, Movable):
         if pipeline != 0:
             self.rewind()
             _ = call3(self.device_call("vkDestroyPipeline"), self.device, pipeline, 0)
+
+    def init_pipeline_cache(mut self, path: String = "") -> Bool:
+        if self.device == 0 or self.pipeline_cache != 0:
+            return False
+        self.rewind()
+        var info = self.scratch(40)
+        put32(info, TYPE_PIPELINE_CACHE_CREATE_INFO)
+        put64(info + 8, 0)
+        put32(info + 16, 0)
+        var has_data = False
+        var data = List[UInt8]()
+        if path.byte_length() > 0:
+            data = read_bytes(path)
+            if len(data) >= 32:
+                has_data = True
+        if has_data:
+            put64(info + 24, len(data))
+            put64(info + 32, Int(data.unsafe_ptr()))
+        else:
+            put64(info + 24, 0)
+            put64(info + 32, 0)
+        var slot = self.scratch(8)
+        var res = call4(self.device_call("vkCreatePipelineCache"), self.device, info, 0, slot)
+        if not self.check(res, "vkCreatePipelineCache"):
+            return False
+        self.pipeline_cache = get64(slot)
+        return True
+
+    def save_pipeline_cache(mut self, path: String) -> Bool:
+        if self.device == 0 or self.pipeline_cache == 0 or path.byte_length() == 0:
+            return False
+        self.rewind()
+        var size_slot = self.scratch(8)
+        put64(size_slot, 0)
+        var res = call4(self.device_call("vkGetPipelineCacheData"), self.device, self.pipeline_cache, size_slot, 0)
+        if not self.check(res, "vkGetPipelineCacheData(size)"):
+            return False
+        var sz = get64(size_slot)
+        if sz <= 0:
+            return False
+        var data = List[UInt8](length=sz, fill=0)
+        res = call4(self.device_call("vkGetPipelineCacheData"), self.device, self.pipeline_cache, size_slot, Int(data.unsafe_ptr()))
+        if not self.check(res, "vkGetPipelineCacheData(data)"):
+            return False
+        return write_bytes(path, data)
 
     def destroy_aaa_descriptors(mut self, pool: Int, dsl: Int, pipeline_layout: Int):
         self.rewind()
@@ -2701,6 +3111,122 @@ struct VulkanGpu(Copyable, Movable):
             first_instance,
         )
 
+    def draw_indirect(
+        mut self,
+        frame: Int,
+        indirect_buf: GpuBuffer,
+        indirect_offset: Int,
+        draw_count: Int,
+        stride: Int = 16,
+    ):
+        if draw_count <= 0:
+            return
+        self.rewind()
+        _ = call5(
+            self.device_call("vkCmdDrawIndirect"),
+            self.command_buffers[frame],
+            indirect_buf.vk_buffer,
+            indirect_offset,
+            draw_count,
+            stride,
+        )
+
+    def bind_index_buffer(
+        mut self,
+        frame: Int,
+        buffer: GpuBuffer,
+        offset: Int = 0,
+        index_type: UInt32 = INDEX_TYPE_UINT32,
+    ):
+        """Binds the GPU index buffer for hardware indexed rasterization."""
+        self.rewind()
+        _ = call4(
+            self.device_call("vkCmdBindIndexBuffer"),
+            self.command_buffers[frame],
+            buffer.vk_buffer,
+            offset,
+            Int(index_type),
+        )
+
+    def draw_indexed_indirect(
+        mut self,
+        frame: Int,
+        indirect_buf: GpuBuffer,
+        indirect_offset: Int,
+        draw_count: Int,
+        stride: Int = 20,
+    ):
+        """Issues vkCmdDrawIndexedIndirect with 20-byte VkDrawIndexedIndirectCommand records."""
+        if draw_count <= 0:
+            return
+        self.rewind()
+        _ = call5(
+            self.device_call("vkCmdDrawIndexedIndirect"),
+            self.command_buffers[frame],
+            indirect_buf.vk_buffer,
+            indirect_offset,
+            draw_count,
+            stride,
+        )
+
+    def draw_indexed_indirect_count(
+        mut self,
+        frame: Int,
+        indirect_buf: GpuBuffer,
+        indirect_offset: Int,
+        count_buf: GpuBuffer,
+        count_offset: Int,
+        max_draw_count: Int,
+        stride: Int = 20,
+    ):
+        """Issues vkCmdDrawIndexedIndirectCount with hardware count buffer, falling back to vkCmdDrawIndexedIndirect."""
+        self.rewind()
+        if self.has_draw_indirect_count:
+            _ = call7(
+                self.device_call("vkCmdDrawIndexedIndirectCount"),
+                self.command_buffers[frame],
+                indirect_buf.vk_buffer,
+                indirect_offset,
+                count_buf.vk_buffer,
+                count_offset,
+                max_draw_count,
+                stride,
+            )
+        else:
+            _ = call5(
+                self.device_call("vkCmdDrawIndexedIndirect"),
+                self.command_buffers[frame],
+                indirect_buf.vk_buffer,
+                indirect_offset,
+                max_draw_count,
+                stride,
+            )
+
+    def copy_buffer(
+        mut self,
+        frame: Int,
+        src: GpuBuffer,
+        src_offset: Int,
+        dst: GpuBuffer,
+        dst_offset: Int,
+        byte_count: Int,
+    ):
+        if byte_count <= 0 or src.vk_buffer == 0 or dst.vk_buffer == 0:
+            return
+        self.rewind()
+        var region = self.scratch(24)
+        put64(region + 0, src_offset)
+        put64(region + 8, dst_offset)
+        put64(region + 16, byte_count)
+        _ = call5(
+            self.device_call("vkCmdCopyBuffer"),
+            self.command_buffers[frame],
+            src.vk_buffer,
+            dst.vk_buffer,
+            1,
+            region,
+        )
+
     def draw_indirect_count(
         mut self,
         frame: Int,
@@ -2743,10 +3269,12 @@ struct VulkanGpu(Copyable, Movable):
         index_addr: UInt64,
         triangle_count: Int,
         mut scratch_out: GpuBuffer,
+        allow_update: Bool = False,
     ) -> VulkanAccelStruct:
         var out = VulkanAccelStruct()
         if not self.has_ray_query or triangle_count <= 0:
             return out^
+        var as_flags = BUILD_AS_PREFER_FAST_TRACE_KHR | (BUILD_AS_ALLOW_UPDATE_KHR if allow_update else UInt32(0))
         self.rewind()
         var geom = self.scratch(96)
         put32(geom, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
@@ -2764,7 +3292,7 @@ struct VulkanGpu(Copyable, Movable):
         var build_info = self.scratch(80)
         put32(build_info, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
         put32(build_info + 16, AS_TYPE_BOTTOM_LEVEL_KHR)
-        put32(build_info + 20, BUILD_AS_PREFER_FAST_TRACE_KHR)
+        put32(build_info + 20, as_flags)
         put32(build_info + 24, BUILD_AS_MODE_BUILD_KHR)
         put32(build_info + 48, 1)
         put64(build_info + 56, geom)
@@ -2782,7 +3310,7 @@ struct VulkanGpu(Copyable, Movable):
             sizes,
         )
         var as_bytes = max(4096, get64(sizes + 16))
-        var scratch_bytes = max(4096, get64(sizes + 32) + 256)
+        var scratch_bytes = max(4096, max(get64(sizes + 24), get64(sizes + 32)) + 256)
 
         var as_buf = self.create_buffer_bda(
             as_bytes,
@@ -2828,7 +3356,7 @@ struct VulkanGpu(Copyable, Movable):
         var binfo2 = self.scratch(80)
         put32(binfo2, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
         put32(binfo2 + 16, AS_TYPE_BOTTOM_LEVEL_KHR)
-        put32(binfo2 + 20, BUILD_AS_PREFER_FAST_TRACE_KHR)
+        put32(binfo2 + 20, as_flags)
         put32(binfo2 + 24, BUILD_AS_MODE_BUILD_KHR)
         put64(binfo2 + 40, handle)
         put32(binfo2 + 48, 1)
@@ -2853,6 +3381,52 @@ struct VulkanGpu(Copyable, Movable):
         out.buffer = as_buf^
         out.device_address = as_da
         return out^
+
+    def refit_blas_triangles(
+        mut self,
+        frame: Int,
+        accel: VulkanAccelStruct,
+        vertex_addr: UInt64,
+        vertex_stride: Int,
+        max_vertex: Int,
+        index_addr: UInt64,
+        triangle_count: Int,
+        scratch_buf: GpuBuffer,
+    ):
+        """Records an in-place `VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR` refit of `accel`
+        after GPU Dual-Quaternion skinning deforms `vertex_addr` (`0` host allocations)."""
+        if not self.has_ray_query or accel.handle == 0 or triangle_count <= 0 or scratch_buf.size == 0:
+            return
+        var scratch_addr = (self.buffer_device_address(scratch_buf) + 255) & ~UInt64(255)
+        self.rewind()
+        var geom = self.scratch(96)
+        put32(geom, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+        put32(geom + 16, GEOMETRY_TYPE_TRIANGLES_KHR)
+        put32(geom + 24 + 0, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR)
+        put32(geom + 24 + 16, FORMAT_R32G32B32_SFLOAT)
+        put64(geom + 24 + 24, Int(vertex_addr))
+        put64(geom + 24 + 32, vertex_stride)
+        put32(geom + 24 + 40, UInt32(max_vertex))
+        put32(geom + 24 + 44, INDEX_TYPE_UINT32)
+        put64(geom + 24 + 48, Int(index_addr))
+        put32(geom + 88, GEOMETRY_OPAQUE_BIT_KHR)
+
+        var binfo = self.scratch(80)
+        put32(binfo, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+        put32(binfo + 16, AS_TYPE_BOTTOM_LEVEL_KHR)
+        put32(binfo + 20, BUILD_AS_PREFER_FAST_TRACE_KHR | BUILD_AS_ALLOW_UPDATE_KHR)
+        put32(binfo + 24, BUILD_AS_MODE_UPDATE_KHR)
+        put64(binfo + 32, accel.handle)
+        put64(binfo + 40, accel.handle)
+        put32(binfo + 48, 1)
+        put64(binfo + 56, geom)
+        put64(binfo + 72, Int(scratch_addr))
+
+        var range_info = self.scratch(16)
+        put32(range_info, UInt32(triangle_count))
+        var pp_range = self.scratch(8)
+        put64(pp_range, range_info)
+        _ = call4(self.device_call("vkCmdBuildAccelerationStructuresKHR"), self.command_buffers[frame], 1, binfo, pp_range)
 
     def build_tlas_instances(
         mut self,
@@ -2949,6 +3523,118 @@ struct VulkanGpu(Copyable, Movable):
         out.handle = handle
         out.buffer = as_buf^
         return out^
+
+    def ensure_tlas_capacity(
+        mut self,
+        mut tlas: VulkanAccelStruct,
+        instances_addr: UInt64,
+        max_instances_cap: Int,
+        mut scratch_out: GpuBuffer,
+    ) -> Bool:
+        """Ensures `tlas` and `scratch_out` have sufficient capacity for up to `max_instances_cap` instances.
+        Returns `True` if a new `VkAccelerationStructureKHR` handle was allocated (requiring descriptor update)."""
+        if not self.has_ray_query or max_instances_cap <= 0:
+            return False
+        self.rewind()
+        var geom = self.scratch(96)
+        put32(geom, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+        put32(geom + 16, GEOMETRY_TYPE_INSTANCES_KHR)
+        put32(geom + 24 + 0, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR)
+        put64(geom + 24 + 24, Int(instances_addr))
+        put32(geom + 88, GEOMETRY_OPAQUE_BIT_KHR)
+
+        var build_info = self.scratch(80)
+        put32(build_info, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+        put32(build_info + 16, AS_TYPE_TOP_LEVEL_KHR)
+        put32(build_info + 20, BUILD_AS_PREFER_FAST_TRACE_KHR)
+        put32(build_info + 24, BUILD_AS_MODE_BUILD_KHR)
+        put32(build_info + 48, 1)
+        put64(build_info + 56, geom)
+
+        var prim_cnt = self.scratch(8)
+        put32(prim_cnt, UInt32(max_instances_cap))
+        var sizes = self.scratch(40)
+        put32(sizes, TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR)
+        _ = call5(
+            self.device_call("vkGetAccelerationStructureBuildSizesKHR"),
+            self.device,
+            BUILD_AS_TYPE_DEVICE_KHR,
+            build_info,
+            prim_cnt,
+            sizes,
+        )
+        var as_bytes = max(4096, get64(sizes + 16))
+        var scratch_bytes = max(4096, get64(sizes + 32) + 256)
+
+        if scratch_out.size < scratch_bytes:
+            if scratch_out.size > 0:
+                self.destroy_buffer(scratch_out)
+            scratch_out = self.create_buffer_bda(
+                scratch_bytes,
+                extra_usage=BUFFER_USAGE_DEVICE_ADDRESS,
+                host_visible=False,
+            )
+
+        if tlas.handle != 0 and tlas.buffer.size >= as_bytes:
+            return False
+
+        if tlas.handle != 0:
+            self.destroy_accel_struct(tlas)
+
+        var as_buf = self.create_buffer_bda(
+            as_bytes,
+            extra_usage=BUFFER_USAGE_AS_STORAGE_KHR | BUFFER_USAGE_DEVICE_ADDRESS,
+            host_visible=False,
+        )
+        self.rewind()
+        var create_info = self.scratch(64)
+        put32(create_info, TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR)
+        put64(create_info + 24, as_buf.vk_buffer)
+        put64(create_info + 40, as_bytes)
+        put32(create_info + 48, AS_TYPE_TOP_LEVEL_KHR)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateAccelerationStructureKHR"), self.device, create_info, 0, slot), "vkCreateAccelerationStructureKHR(TLAS)"):
+            self.destroy_buffer(as_buf)
+            return False
+        tlas.handle = get64(slot)
+        tlas.buffer = as_buf^
+        return True
+
+    def record_build_tlas(
+        mut self,
+        frame: Int,
+        tlas: VulkanAccelStruct,
+        instances_addr: UInt64,
+        instance_count: Int,
+        scratch_buf: GpuBuffer,
+    ):
+        """Records an inline `vkCmdBuildAccelerationStructuresKHR` into `tlas` (`0` host allocations, `0` extra submits!)."""
+        if not self.has_ray_query or tlas.handle == 0 or instance_count < 0 or scratch_buf.size == 0:
+            return
+        var scratch_addr = (self.buffer_device_address(scratch_buf) + 255) & ~UInt64(255)
+        self.rewind()
+        var geom = self.scratch(96)
+        put32(geom, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+        put32(geom + 16, GEOMETRY_TYPE_INSTANCES_KHR)
+        put32(geom + 24 + 0, TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR)
+        put64(geom + 24 + 24, Int(instances_addr))
+        put32(geom + 88, GEOMETRY_OPAQUE_BIT_KHR)
+
+        var binfo = self.scratch(80)
+        put32(binfo, TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+        put32(binfo + 16, AS_TYPE_TOP_LEVEL_KHR)
+        put32(binfo + 20, BUILD_AS_PREFER_FAST_TRACE_KHR)
+        put32(binfo + 24, BUILD_AS_MODE_BUILD_KHR)
+        put64(binfo + 40, tlas.handle)
+        put32(binfo + 48, 1)
+        put64(binfo + 56, geom)
+        put64(binfo + 72, Int(scratch_addr))
+
+        var range_info = self.scratch(16)
+        put32(range_info, UInt32(instance_count))
+        var pp_range = self.scratch(8)
+        put64(pp_range, range_info)
+        _ = call4(self.device_call("vkCmdBuildAccelerationStructuresKHR"), self.command_buffers[frame], 1, binfo, pp_range)
 
     def destroy_accel_struct(mut self, mut accel: VulkanAccelStruct):
         if accel.handle != 0:

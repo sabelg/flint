@@ -403,6 +403,11 @@ def joint_solve(mut joint: Joint, row: JointRow, mut bodies: SolverBodies, h: Fl
         var total = clamp_length(joint.linear_impulse + impulse, joint.max_force * h)
         impulse = total - joint.linear_impulse
     joint.linear_impulse = joint.linear_impulse + impulse
+    if use_bias:
+        if dot3(joint.linear_impulse, joint.linear_impulse) > dot3(joint.force_impulse, joint.force_impulse):
+            joint.force_impulse = joint.linear_impulse
+        if dot3(joint.angular_impulse, joint.angular_impulse) > dot3(joint.torque_impulse, joint.torque_impulse):
+            joint.torque_impulse = joint.angular_impulse
     va = va - impulse * ma
     wa = wa - ia.apply(cross3(ra, impulse))
     vb = vb + impulse * mb
@@ -412,13 +417,20 @@ def joint_solve(mut joint: Joint, row: JointRow, mut bodies: SolverBodies, h: Fl
 
 
 def joint_should_break(joint: Joint, inverse_h: Float32) -> Bool:
-    """A joint (not a motor) whose force or torque this substep passed its limit."""
+    """A joint (not a motor) whose peak solve force or torque passed its limit."""
     if joint.kind == JOINT_MOTOR or joint.broken:
         return False
-    var linear = joint.linear_impulse if joint.kind == JOINT_WELD else joint.force_impulse
-    var angular = joint.angular_impulse if joint.kind == JOINT_WELD else joint.torque_impulse
-    var force2 = dot3(linear, linear) * inverse_h * inverse_h
-    var torque2 = dot3(angular, angular) * inverse_h * inverse_h
+    var lin_sq = dot3(joint.force_impulse, joint.force_impulse)
+    var ang_sq = dot3(joint.torque_impulse, joint.torque_impulse)
+    if joint.kind == JOINT_WELD:
+        var cur_l = dot3(joint.linear_impulse, joint.linear_impulse)
+        var cur_a = dot3(joint.angular_impulse, joint.angular_impulse)
+        if cur_l > lin_sq:
+            lin_sq = cur_l
+        if cur_a > ang_sq:
+            ang_sq = cur_a
+    var force2 = lin_sq * inverse_h * inverse_h
+    var torque2 = ang_sq * inverse_h * inverse_h
     if joint.break_force > 0 and force2 > joint.break_force * joint.break_force:
         return True
     if joint.break_torque > 0 and torque2 > joint.break_torque * joint.break_torque:
@@ -818,8 +830,11 @@ def joint_solve_2_12(mut joint: Joint, row: JointRow, mut bodies: SolverBodies, 
         solve_point(joint, f, m, row.linear, use_bias)
         torque = torque + joint.angular_impulse + f.axis * (joint.lower_impulse - joint.upper_impulse)
         force = joint.linear_impulse
-    joint.force_impulse = force
-    joint.torque_impulse = torque
+    if use_bias:
+        if dot3(force, force) > dot3(joint.force_impulse, joint.force_impulse):
+            joint.force_impulse = force
+        if dot3(torque, torque) > dot3(joint.torque_impulse, joint.torque_impulse):
+            joint.torque_impulse = torque
     m.store(bodies, row.a, row.b)
 
 

@@ -79,7 +79,7 @@ comptime STATE_LIVE: Int = 2
 
 comptime MAX_CHUNKS: Int = 1048575
 comptime TICKET_GENERATIONS: Int = 0x7FFFFF  # keeps the ticket word positive
-comptime SPINS_BEFORE_SLEEP: Int = 4000
+comptime SPINS_BEFORE_SLEEP: Int = 64  # low-latency yielding before sleeping on futex
 comptime WORKER_STACK_BYTES: Int = 8 << 20  # a simulation tick needs the main thread's stack
 
 comptime SYS_FUTEX: Int = 202 if CompilationTarget.is_x86() else 98
@@ -228,7 +228,7 @@ struct JobPool(Copyable, Movable):
         var body = Pointer[JobBody, origin=MutAnyOrigin](unsafe_from_address=self.address + (SLOTS_WORD + slot * SLOT_WORDS + SLOT_BODY) * 8)
         body[unsafe_offset=0] = run
         self.slot_word(slot, SLOT_CONTEXT)[unsafe_offset=0].store(Int64(context))
-        self.slot_word(slot, SLOT_CHUNKS)[unsafe_offset=0].store(Int64(min(chunks, MAX_CHUNKS)))
+        self.slot_word(slot, SLOT_CHUNKS)[unsafe_offset=0].store(Int64(max(0, min(chunks, MAX_CHUNKS))))
         self.slot_word(slot, SLOT_ZONE)[unsafe_offset=0].store(Int64(zone))
         self.slot_word(slot, SLOT_FINISHED)[unsafe_offset=0].store(0)
         self.slot_word(slot, SLOT_DEPENDENT_COUNT)[unsafe_offset=0].store(0)
@@ -470,6 +470,95 @@ struct JobPool(Copyable, Movable):
     def futex_wake(self, count: Int):
         _ = external_call["syscall", Int](SYS_FUTEX, self.address + EPOCH_WORD * 8, FUTEX_WAKE_PRIVATE, count, Int(0), Int(0), Int(0))
 
+    def current_thread_index(self) -> Int:
+        """Returns 0 on the calling thread, or 1..workers for pool worker threads."""
+        if self.address == 0 or self.workers <= 0:
+            return 0
+        var self_tid = external_call["pthread_self", UInt64]()
+        for index in range(self.workers):
+            var handle = UInt64(self.word(THREADS_WORD + index)[unsafe_offset=0].load())
+            if handle == self_tid:
+                return index + 1
+        return 0
+
+    def run_affine(self, body: JobBody, context: Int, chunks: Int = 1, zone: Int = ZONE_NONE):
+        """Affine fan-out: assigns each worker a deterministic home chunk slice first
+        (keeping SoA lines L2-cache-hot across ticks), with lock-free work-stealing tail fallback."""
+        if chunks <= 0:
+            return
+        if not self.allocated() or self.workers <= 0 or chunks == 1:
+            for chunk in range(chunks):
+                body(context, chunk)
+            return
+        var t_count = min(chunks, min(MAX_WORKERS + 1, 1 + self.workers))
+        var disp = _AffineDispatch(Int(Pointer(to=self)), body, context, t_count, chunks)
+        self.rouse()
+        self.run(_run_affine_task, Int(Pointer(to=disp)), t_count, zone)
+        _ = disp.threads
+
+
+comptime _AFFINE_SLOTS: Int = MAX_WORKERS + 1
+comptime _AFFINE_WORDS: Int = _AFFINE_SLOTS * CACHE_LINE_WORDS
+
+
+struct _AffineDispatch:
+    var pool_addr: Int
+    var user_body: JobBody
+    var user_ctx: Int
+    var threads: Int
+    var words: Array[Int64, _AFFINE_WORDS]
+
+    def __init__(out self, pool_addr: Int, user_body: JobBody, user_ctx: Int, threads: Int, chunks: Int):
+        self.pool_addr = pool_addr
+        self.user_body = user_body
+        self.user_ctx = user_ctx
+        self.threads = threads
+        self.words = Array[Int64, _AFFINE_WORDS](fill=0)
+        for t in range(threads):
+            var start = (t * chunks) // threads
+            var end = ((t + 1) * chunks) // threads
+            self.words[t * CACHE_LINE_WORDS] = Int64(start)
+            self.words[t * CACHE_LINE_WORDS + 1] = Int64(end)
+
+    @always_inline
+    def cursor_ptr(self, slot: Int) -> Pointer[Atomic[Int64], origin=MutAnyOrigin]:
+        return Pointer[Atomic[Int64], origin=MutAnyOrigin](
+            unsafe_from_address=Int(Pointer(to=self.words)) + slot * CACHE_LINE_WORDS * 8
+        )
+
+    @always_inline
+    def end_of(self, slot: Int) -> Int:
+        return Int(self.words[slot * CACHE_LINE_WORDS + 1])
+
+
+def _run_affine_task(context: Int, chunk: Int):
+    ref disp = Pointer[_AffineDispatch, origin=MutAnyOrigin](unsafe_from_address=context)[unsafe_offset=0]
+    ref pool = Pointer[JobPool, origin=MutAnyOrigin](unsafe_from_address=disp.pool_addr)[unsafe_offset=0]
+    var t_count = disp.threads
+    var home = pool.current_thread_index()
+    if home < 0 or home >= t_count:
+        home = chunk % t_count
+    var body = disp.user_body
+    var uctx = disp.user_ctx
+
+    var own_cur = disp.cursor_ptr(home)
+    var own_end = disp.end_of(home)
+    while True:
+        var c = Int(own_cur[unsafe_offset=0].fetch_add(1))
+        if c >= own_end:
+            break
+        body(uctx, c)
+
+    for offset in range(1, t_count):
+        var victim = (home + offset) % t_count
+        var v_cur = disp.cursor_ptr(victim)
+        var v_end = disp.end_of(victim)
+        while True:
+            var c = Int(v_cur[unsafe_offset=0].fetch_add(1))
+            if c >= v_end:
+                break
+            body(uctx, c)
+
 
 def default_worker_count() -> Int:
     """One worker per physical core, leaving one for the main thread."""
@@ -489,6 +578,19 @@ def run_jobs(pool_address: Int, body: JobBody, context: Int, chunks: Int, zone: 
         ref pool = Pointer[JobPool, origin=MutAnyOrigin](unsafe_from_address=pool_address)[unsafe_offset=0]
         if pool.allocated():
             pool.run(body, context, chunks, zone)
+            return
+    for chunk in range(chunks):
+        body(context, chunk)
+
+
+def run_jobs_affine(pool_address: Int, body: JobBody, context: Int, chunks: Int, zone: Int = ZONE_NONE):
+    """Home-chunk L2-cache-affine dispatch per worker with work-stealing tail fallback."""
+    if chunks <= 0:
+        return
+    if pool_address != 0:
+        ref pool = Pointer[JobPool, origin=MutAnyOrigin](unsafe_from_address=pool_address)[unsafe_offset=0]
+        if pool.allocated():
+            pool.run_affine(body, context, chunks, zone)
             return
     for chunk in range(chunks):
         body(context, chunk)

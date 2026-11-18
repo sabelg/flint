@@ -97,6 +97,18 @@ struct RgBarrierRecord(Copyable, Movable):
         self.cross_queue_handoff = cross_queue_handoff
 
 
+struct AaaGpuPassTiming(Copyable, Movable):
+    """Hardware `VkQueryPool` GPU execution duration for a single `AaaRenderGraph` pass (`V19`)."""
+    var pass_name: String
+    var gpu_ns: UInt64
+    var gpu_ms: Float64
+
+    def __init__(out self, pass_name: String, gpu_ns: UInt64, gpu_ms: Float64):
+        self.pass_name = pass_name
+        self.gpu_ns = gpu_ns
+        self.gpu_ms = gpu_ms
+
+
 @always_inline
 def _usage_to_vk_stage_access(usage: Int) -> Tuple[Int, Int, Bool]:
     """Maps logical `RG_USAGE_*` to `(VkPipelineStageFlags2, VkAccessFlags2, is_write)`."""
@@ -118,11 +130,13 @@ def _usage_to_vk_stage_access(usage: Int) -> Tuple[Int, Int, Bool]:
 
 
 struct AaaRenderGraph(Movable):
-    """Compiled declarative frame graph with `VK_KHR_synchronization2` barrier synthesis
-    and `OffsetAllocator` transient VRAM aliasing."""
+    """Compiled declarative frame graph with `VK_KHR_synchronization2` barrier synthesis,
+    `OffsetAllocator` transient VRAM aliasing, and hardware `VkQueryPool` pass timings."""
     var resources: List[RgResourceDesc]
     var passes: List[RgPassNode]
     var barriers: List[RgBarrierRecord]
+    var pass_timings: List[AaaGpuPassTiming]
+    var total_gpu_ms: Float64
     var unaliased_transient_bytes: Int
     var aliased_peak_bytes: Int
     var async_compute_pass_count: Int
@@ -131,6 +145,8 @@ struct AaaRenderGraph(Movable):
         self.resources = List[RgResourceDesc]()
         self.passes = List[RgPassNode]()
         self.barriers = List[RgBarrierRecord]()
+        self.pass_timings = List[AaaGpuPassTiming]()
+        self.total_gpu_ms = 0.0
         self.unaliased_transient_bytes = 0
         self.aliased_peak_bytes = 0
         self.async_compute_pass_count = 0
@@ -171,14 +187,19 @@ struct AaaRenderGraph(Movable):
                     self.resources[rid].last_pass = p_idx
 
         # 1. Transient VRAM aliasing via OffsetAllocator
-        var heap_units = UInt32(max(1024, (heap_capacity_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES))
-        var oa = OffsetAllocator(heap_units, max_allocations=1024)
-        var live_allocs = List[OffsetAllocation](length=len(self.resources), fill=OffsetAllocation())
-
+        var has_active_transient = False
         for r in range(len(self.resources)):
             if self.resources[r].transient and self.resources[r].last_pass >= 0:
                 var aligned = ((self.resources[r].size_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES) * RG_UNIT_BYTES
                 self.unaliased_transient_bytes += aligned
+                has_active_transient = True
+
+        if heap_capacity_bytes <= 0:
+            if has_active_transient:
+                return False
+        var heap_units = UInt32(max(1, (heap_capacity_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES))
+        var oa = OffsetAllocator(heap_units, max_allocations=1024)
+        var live_allocs = List[OffsetAllocation](length=len(self.resources), fill=OffsetAllocation())
 
         for p_idx in range(len(self.passes)):
             # Allocate resources whose lifetime starts on `p_idx`
@@ -200,10 +221,13 @@ struct AaaRenderGraph(Movable):
         self.aliased_peak_bytes = Int(oa.peak_used) * RG_UNIT_BYTES
 
         # 2. Automatic `VK_KHR_synchronization2` RAW / WAR / WAW hazard barrier synthesis
-        var last_stage = List[Int](length=len(self.resources), fill=0)
-        var last_access = List[Int](length=len(self.resources), fill=0)
-        var last_was_write = List[Bool](length=len(self.resources), fill=False)
-        var last_queue = List[Int](length=len(self.resources), fill=RG_QUEUE_GRAPHICS)
+        var last_write_stage = List[Int](length=len(self.resources), fill=0)
+        var last_write_access = List[Int](length=len(self.resources), fill=0)
+        var last_write_queue = List[Int](length=len(self.resources), fill=RG_QUEUE_GRAPHICS)
+        var synced_stages_q0 = List[Int](length=len(self.resources), fill=0)
+        var synced_stages_q1 = List[Int](length=len(self.resources), fill=0)
+        var read_stages_q0 = List[Int](length=len(self.resources), fill=0)
+        var read_stages_q1 = List[Int](length=len(self.resources), fill=0)
 
         for p_idx in range(len(self.passes)):
             var cur_q = self.passes[p_idx].queue_kind
@@ -214,23 +238,78 @@ struct AaaRenderGraph(Movable):
                 var dst_ac = sa[1]
                 var is_wr = sa[2]
 
-                if last_stage[rid] != 0 and (last_was_write[rid] or is_wr):
-                    var cross_q = last_queue[rid] != cur_q
-                    self.barriers.append(
-                        RgBarrierRecord(
-                            p_idx,
-                            rid,
-                            last_stage[rid],
-                            last_access[rid],
-                            dst_st,
-                            dst_ac,
-                            cross_q,
+                if is_wr:
+                    if read_stages_q0[rid] != 0 or read_stages_q1[rid] != 0:
+                        if read_stages_q0[rid] != 0:
+                            self.barriers.append(
+                                RgBarrierRecord(
+                                    p_idx,
+                                    rid,
+                                    read_stages_q0[rid],
+                                    0,
+                                    dst_st,
+                                    dst_ac,
+                                    RG_QUEUE_GRAPHICS != cur_q,
+                                )
+                            )
+                        if read_stages_q1[rid] != 0:
+                            self.barriers.append(
+                                RgBarrierRecord(
+                                    p_idx,
+                                    rid,
+                                    read_stages_q1[rid],
+                                    0,
+                                    dst_st,
+                                    dst_ac,
+                                    RG_QUEUE_ASYNC_COMPUTE != cur_q,
+                                )
+                            )
+                    elif last_write_stage[rid] != 0:
+                        self.barriers.append(
+                            RgBarrierRecord(
+                                p_idx,
+                                rid,
+                                last_write_stage[rid],
+                                last_write_access[rid],
+                                dst_st,
+                                dst_ac,
+                                last_write_queue[rid] != cur_q,
+                            )
                         )
-                    )
-                last_stage[rid] = dst_st
-                last_access[rid] = dst_ac
-                last_was_write[rid] = is_wr
-                last_queue[rid] = cur_q
+                    last_write_stage[rid] = dst_st
+                    last_write_access[rid] = dst_ac
+                    last_write_queue[rid] = cur_q
+                    synced_stages_q0[rid] = 0
+                    synced_stages_q1[rid] = 0
+                    read_stages_q0[rid] = 0
+                    read_stages_q1[rid] = 0
+                else:
+                    if last_write_stage[rid] != 0:
+                        var need_barrier = False
+                        if cur_q == RG_QUEUE_GRAPHICS:
+                            if (synced_stages_q0[rid] & dst_st) != dst_st:
+                                need_barrier = True
+                                synced_stages_q0[rid] |= dst_st
+                        else:
+                            if (synced_stages_q1[rid] & dst_st) != dst_st:
+                                need_barrier = True
+                                synced_stages_q1[rid] |= dst_st
+                        if need_barrier:
+                            self.barriers.append(
+                                RgBarrierRecord(
+                                    p_idx,
+                                    rid,
+                                    last_write_stage[rid],
+                                    last_write_access[rid],
+                                    dst_st,
+                                    dst_ac,
+                                    last_write_queue[rid] != cur_q,
+                                )
+                            )
+                    if cur_q == RG_QUEUE_GRAPHICS:
+                        read_stages_q0[rid] |= dst_st
+                    else:
+                        read_stages_q1[rid] |= dst_st
 
         return True
 
@@ -255,6 +334,15 @@ struct AaaRenderGraph(Movable):
         if self.unaliased_transient_bytes <= 0:
             return Float32(0.0)
         return Float32(1.0) - Float32(self.aliased_peak_bytes) / Float32(self.unaliased_transient_bytes)
+
+    def format_gpu_profile_summary(self) -> String:
+        """Formats per-pass `VkQueryPool` GPU milliseconds & `OffsetAllocator` VRAM watermarks."""
+        var out = String("AaaRenderGraph GPU Profile (total=") + String(Int(self.total_gpu_ms * 1000.0)) + " us, aliased=" + String(self.aliased_peak_bytes // 1024) + " KiB / " + String(self.unaliased_transient_bytes // 1024) + " KiB): "
+        for i in range(len(self.pass_timings)):
+            if i > 0:
+                out += ", "
+            out += self.pass_timings[i].pass_name + "=" + String(Int(self.pass_timings[i].gpu_ns // 1000)) + "us"
+        return out
 
 
 struct AaaResidencyStreamer(Movable):

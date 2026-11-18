@@ -437,6 +437,7 @@ def compute_spatial_3d(
     ref_dist: Float32 = 22.0,
     max_dist: Float32 = 420.0,
     doppler_scale: Float32 = 0.65,
+    listener_fwd: Vec3 = Vec3(0, 0, 1),
 ) -> SpatialVoiceParams:
     """Computes 3D inverse-distance gain, equal-power stereo pan, radial-velocity Doppler
     pitch shift, atmospheric HF air-absorption LPF coefficient, and distance reverb send."""
@@ -478,4 +479,124 @@ def compute_spatial_3d(
     var dist_norm = max(Float32(0.0), min(Float32(1.0), (dist - rd) / (md - rd)))
     out.lpf_coeff = Float32(1.0) - dist_norm * Float32(0.76)
     out.reverb_send = Float32(0.10) + dist_norm * Float32(0.28)
+
+    # 5. Rear-cone pinna/head-shadow occlusion filtering when listener_fwd is provided
+    var fwd_dot = dir.x * listener_fwd.x + dir.y * listener_fwd.y + dir.z * listener_fwd.z
+    if fwd_dot < Float32(0.0):
+        out.lpf_coeff = max(Float32(0.12), out.lpf_coeff * (Float32(1.0) + fwd_dot * Float32(0.28)))
+
     return out^
+
+
+struct ItdDelayLine(Copyable, Movable):
+    """64-sample circular delay line with Hermite cubic fractional interpolation
+    for transient-preserving continuous Woodworth interaural time difference (ITD)."""
+    var buffer: List[Float32]
+    var write_idx: Int
+
+    def __init__(out self):
+        self.buffer = List[Float32]()
+        for _ in range(64):
+            self.buffer.append(0.0)
+        self.write_idx = 0
+
+    def push(mut self, sample: Float32):
+        self.buffer[self.write_idx] = sample
+        self.write_idx = (self.write_idx + 1) & 63
+
+    def read_delayed(self, delay_samples: Float32) -> Float32:
+        var d = max(Float32(0.0), min(Float32(60.0), delay_samples))
+        var idelay = Int(floor(d))
+        var frac = d - Float32(idelay)
+
+        var idx1 = (self.write_idx - 1 - idelay) & 63
+        var idx2 = (idx1 - 1) & 63
+        var idx3 = (idx1 - 2) & 63
+
+        var y1 = self.buffer[idx1]
+        var y2 = self.buffer[idx2]
+        var y3 = self.buffer[idx3]
+        var y0 = (Float32(2.0) * y1 - y2) if idelay == 0 else self.buffer[(idx1 + 1) & 63]
+
+        # Hermite cubic interpolation
+        var c0 = y1
+        var c1 = Float32(0.5) * (y2 - y0)
+        var c2 = y0 - Float32(2.5) * y1 + Float32(2.0) * y2 - Float32(0.5) * y3
+        var c3 = Float32(0.5) * (y3 - y0) + Float32(1.5) * (y1 - y2)
+        return ((c3 * frac + c2) * frac + c1) * frac + c0
+
+
+struct VehicleHarmonicSynth(Movable):
+    """Procedural multi-harmonic vehicle engine audio synthesizer using
+    band-limited PolyBLEP oscillators, dual resonant SVF formants, and tube saturation."""
+    var phase_cyl1: Float32
+    var phase_cyl2: Float32
+    var phase_cyl3: Float32
+    var phase_cyl4: Float32
+    var intake_svf: CytomicSVF
+    var exhaust_svf: CytomicSVF
+    var sample_rate: Float32
+
+    def __init__(out self, sample_rate: Float32 = 48000.0):
+        self.phase_cyl1 = 0.0
+        self.phase_cyl2 = 0.25
+        self.phase_cyl3 = 0.50
+        self.phase_cyl4 = 0.75
+        self.intake_svf = CytomicSVF(320.0, 1.4, sample_rate)
+        self.exhaust_svf = CytomicSVF(120.0, 1.8, sample_rate)
+        self.sample_rate = sample_rate
+
+    def step(mut self, rpm: Float32, load: Float32) -> Float32:
+        var clamped_rpm = max(Float32(650.0), min(Float32(9500.0), rpm))
+        var f0 = (clamped_rpm / Float32(60.0)) * Float32(2.0)
+        var dt = f0 / self.sample_rate
+
+        var s1 = poly_blep_saw(self.phase_cyl1, dt)
+        var s2 = poly_blep_saw(self.phase_cyl2, dt)
+        var s3 = poly_blep_saw(self.phase_cyl3, dt)
+        var s4 = poly_blep_saw(self.phase_cyl4, dt)
+
+        self.phase_cyl1 = wrap_phase01(self.phase_cyl1 + dt)
+        self.phase_cyl2 = wrap_phase01(self.phase_cyl2 + dt)
+        self.phase_cyl3 = wrap_phase01(self.phase_cyl3 + dt)
+        self.phase_cyl4 = wrap_phase01(self.phase_cyl4 + dt)
+
+        var engine_raw = (s1 + s2 * Float32(0.8) + s3 * Float32(0.6) + s4 * Float32(0.4)) * Float32(0.35)
+        var exh = self.exhaust_svf.process(engine_raw)
+        var intk = self.intake_svf.process(engine_raw) * (load * Float32(0.5))
+        var mixed = exh + intk
+        return tube_saturate(mixed, Float32(1.2) + load * Float32(0.8))
+
+
+struct GranularBiomeSynth(Movable):
+    """Dynamic procedural granular synthesizer for biome ambient environmental textures (wind, foliage, atmosphere)."""
+    var grain_phases: List[Float32]
+    var grain_freqs: List[Float32]
+    var grain_gains: List[Float32]
+    var sample_rate: Float32
+    var pink: PinkNoise
+
+    def __init__(out self, sample_rate: Float32 = 48000.0):
+        self.grain_phases = List[Float32]()
+        self.grain_freqs = List[Float32]()
+        self.grain_gains = List[Float32]()
+        for i in range(8):
+            self.grain_phases.append(Float32(i) * Float32(0.125))
+            self.grain_freqs.append(Float32(120.0) + Float32(i) * Float32(45.0))
+            self.grain_gains.append(Float32(0.12))
+        self.sample_rate = sample_rate
+        self.pink = PinkNoise()
+
+    def step(mut self, intensity: Float32) -> Float32:
+        var out_sample = Float32(0.0)
+        var p_noise = self.pink.next() * intensity
+        for i in range(len(self.grain_phases)):
+            var phase = self.grain_phases[i]
+            var hann = Float32(0.5) * (Float32(1.0) - cos(DSP_TAU * phase))
+            var osc = sin(DSP_TAU * phase * self.grain_freqs[i])
+            out_sample += (osc * hann) * self.grain_gains[i]
+
+            var dt = (Float32(2.0) + intensity * Float32(6.0)) / self.sample_rate
+            self.grain_phases[i] = wrap_phase01(phase + dt)
+
+        return soft_clip_tanh(out_sample * Float32(0.8) + p_noise * Float32(0.25))

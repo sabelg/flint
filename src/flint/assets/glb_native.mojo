@@ -1,11 +1,11 @@
 """Complete native GLB 2.0 runtime for Flint Engine (`flint.*`)."""
 from std.ffi import external_call
+from std.memory import bitcast
 from flint.platform.os import read_bytes
 from flint.core.math import Vec3
 from flint.core.transform import Quat
 from flint.assets.json import JsonDocument, parse_json
-from flint.assets.image import decode_png
-from flint.assets.jpeg import decode_jpeg
+from flint.assets.jpeg import decode_image_auto
 from flint.anim.skinning import compute_cor
 from flint.assets.model import NativeModel, NativeNode, NativeMesh, NativeTexture, NativeSkin, NativeAnimation, NativeChannel
 
@@ -62,7 +62,8 @@ struct NativeAccessor(Copyable, Movable):
         if offset < 0 or offset + self.component_size() > len(binary):
             return 0
         if self.component_type == 5126:
-            return binary.unsafe_ptr().unsafe_bitcast[Float32]()[unsafe_offset=offset // 4]
+            var u = little_u32(binary, offset)
+            return bitcast[DType.float32](UInt32(u))
         if self.component_type == 5121:
             var value = Float32(binary[offset])
             return value / 255.0 if self.normalized else value
@@ -182,11 +183,7 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             if offset >= 0 and length > 0 and length <= len(binary) - offset:
                 var bytes = List[UInt8](length=length, fill=0)
                 _ = external_call["memcpy", Int](Int(bytes.unsafe_ptr()), Int(binary.unsafe_ptr()) + offset, length)
-                var decoded = (
-                    decode_jpeg(bytes, 4096)
-                    if (len(bytes) >= 2 and Int(bytes[0]) == 255 and Int(bytes[1]) == 216)
-                    else decode_png(bytes, 4096)
-                )
+                var decoded = decode_image_auto(bytes, 4096)
                 if decoded.valid:
                     texture.width = decoded.width
                     texture.height = decoded.height
@@ -286,6 +283,8 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                     mesh.base_color = UInt32(alpha) << 24 | UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue)
                 var base_texture = document.object_get(pbr, "baseColorTexture")
                 mesh.texture = document.integer(document.object_get(base_texture, "index"), -1)
+                var mr_texture = document.object_get(pbr, "metallicRoughnessTexture")
+                mesh.orm_texture = document.integer(document.object_get(mr_texture, "index"), -1)
                 var norm_texture = document.object_get(material, "normalTexture")
                 mesh.normal_orm_texture = document.integer(document.object_get(norm_texture, "index"), -1)
                 mesh.roughness = max(Float32(0.05), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "roughnessFactor"), 0.55))))
@@ -293,6 +292,7 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 var alpha_mode = document.text(document.object_get(material, "alphaMode"), "OPAQUE")
                 mesh.alpha_mode = 2 if alpha_mode == "BLEND" else (1 if alpha_mode == "MASK" else 0)
                 mesh.double_sided = document.boolean(document.object_get(material, "doubleSided"), False)
+                var extensions = document.object_get(material, "extensions")
                 var emissive = document.object_get(material, "emissiveFactor")
                 if document.array_size(emissive) == 3:
                     mesh.emissive_color = Vec3(
@@ -300,10 +300,43 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                         Float32(document.number(document.at(emissive, 1), 0)),
                         Float32(document.number(document.at(emissive, 2), 0)),
                     )
-                    mesh.emissive_strength = max(mesh.emissive_color.x, max(mesh.emissive_color.y, mesh.emissive_color.z))
-                    var extensions = document.object_get(material, "extensions")
-                    var emissive_extension = document.object_get(extensions, "KHR_emissive_strength")
-                    mesh.emissive_strength *= Float32(document.number(document.object_get(emissive_extension, "emissiveStrength"), 1))
+                    var em_max = max(mesh.emissive_color.x, max(mesh.emissive_color.y, mesh.emissive_color.z))
+                    var strength: Float32 = 1.0
+                    if extensions != -1:
+                        var emissive_extension = document.object_get(extensions, "KHR_materials_emissive_strength")
+                        if emissive_extension == -1:
+                            emissive_extension = document.object_get(extensions, "KHR_emissive_strength")
+                        if emissive_extension != -1:
+                            strength = Float32(document.number(document.object_get(emissive_extension, "emissiveStrength"), 1.0))
+                    if em_max > 0.0001:
+                        mesh.emissive_strength = em_max * strength
+                        mesh.emissive_color = mesh.emissive_color * (Float32(1.0) / em_max)
+                    else:
+                        mesh.emissive_strength = 0.0
+
+                if extensions != -1:
+                    var cc_ext = document.object_get(extensions, "KHR_materials_clearcoat")
+                    if cc_ext != -1:
+                        mesh.clearcoat = Float32(document.number(document.object_get(cc_ext, "clearcoatFactor"), 0.0))
+                        mesh.clearcoat_roughness = Float32(document.number(document.object_get(cc_ext, "clearcoatRoughnessFactor"), 0.0))
+                    var spec_ext = document.object_get(extensions, "KHR_materials_specular")
+                    if spec_ext != -1:
+                        mesh.specular_factor = Float32(document.number(document.object_get(spec_ext, "specularFactor"), 1.0))
+                    var irid_ext = document.object_get(extensions, "KHR_materials_iridescence")
+                    if irid_ext != -1:
+                        mesh.iridescence = Float32(document.number(document.object_get(irid_ext, "iridescenceFactor"), 0.0))
+                        mesh.iridescence_ior = Float32(document.number(document.object_get(irid_ext, "iridescenceIor"), 1.3))
+                        mesh.iridescence_thickness_nm = Float32(document.number(document.object_get(irid_ext, "iridescenceThicknessMaximum"), 100.0))
+                    var sheen_ext = document.object_get(extensions, "KHR_materials_sheen")
+                    if sheen_ext != -1:
+                        var sc = document.object_get(sheen_ext, "sheenColorFactor")
+                        if document.array_size(sc) == 3:
+                            mesh.sheen_color = Vec3(
+                                Float32(document.number(document.at(sc, 0), 0.0)),
+                                Float32(document.number(document.at(sc, 1), 0.0)),
+                                Float32(document.number(document.at(sc, 2), 0.0)),
+                            )
+                        mesh.sheen_roughness = Float32(document.number(document.object_get(sheen_ext, "sheenRoughnessFactor"), 0.0))
             if len(mesh.weights) == mesh.vertex_count() * 4 and len(mesh.weights) > 0:
                 # Package 3.4: the centers of rotation, once, where the model is read.
                 mesh.centers = compute_cor(mesh.positions, mesh.indices, mesh.joints, mesh.weights)
@@ -382,7 +415,14 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             channel.path = 0 if path_name == "translation" else (1 if path_name == "rotation" else 2)
             if path_name != "translation" and path_name != "rotation" and path_name != "scale":
                 continue
-            channel.step = document.text(document.object_get(sampler, "interpolation"), "LINEAR") == "STEP"
+            var interp_name = document.text(document.object_get(sampler, "interpolation"), "LINEAR")
+            channel.step = interp_name == "STEP"
+            if interp_name == "STEP":
+                channel.interp_mode = 1
+            elif interp_name == "CUBICSPLINE":
+                channel.interp_mode = 2
+            else:
+                channel.interp_mode = 0
             var input = load_accessor(document, document.integer(document.object_get(sampler, "input"), -1), len(binary))
             var output = load_accessor(document, document.integer(document.object_get(sampler, "output"), -1), len(binary))
             if not input.valid or not output.valid:

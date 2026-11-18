@@ -29,7 +29,7 @@ from flint.assets.manifest import ENGINE_FORMAT
 from flint.assets.model import NativeAnimation, NativeChannel, NativeMesh, NativeModel, NativeNode, NativeSkin, NativeTexture
 
 comptime COOKED_MODEL: Int = 2  # the cooked header's kind
-comptime COOKED_MODEL_VERSION: Int = 2  # 2: centers of rotation per skinned mesh (package 3.4)
+comptime COOKED_MODEL_VERSION: Int = 4  # 4: glTF clearcoat, specular, iridescence, sheen fields included in material
 comptime MODEL_STAMP_BYTES: Int = 64
 comptime COOKED_MODEL_SUFFIX = ".sdmodel"
 
@@ -183,9 +183,21 @@ def model_bytes(model: NativeModel) -> List[UInt8]:
         w.halves(mesh.joints)
         w.floats(mesh.weights)
         w.i64(mesh.texture)
+        w.i64(mesh.normal_orm_texture)
+        w.i64(mesh.orm_texture)
         w.u32(mesh.base_color)
+        w.f32(mesh.roughness)
+        w.f32(mesh.metallic)
         w.vec3(mesh.emissive_color)
         w.f32(mesh.emissive_strength)
+        w.f32(mesh.clearcoat)
+        w.f32(mesh.clearcoat_roughness)
+        w.f32(mesh.specular_factor)
+        w.f32(mesh.iridescence)
+        w.f32(mesh.iridescence_thickness_nm)
+        w.f32(mesh.iridescence_ior)
+        w.vec3(mesh.sheen_color)
+        w.f32(mesh.sheen_roughness)
         w.i64(mesh.skin)
         w.i64(mesh.alpha_mode)
         w.i64(1 if mesh.double_sided else 0)
@@ -406,9 +418,21 @@ def read_model(raw: List[UInt8], mut error: String) -> NativeModel:
         mesh.joints = r.halves()
         mesh.weights = r.floats()
         mesh.texture = r.i64()
+        mesh.normal_orm_texture = r.i64()
+        mesh.orm_texture = r.i64()
         mesh.base_color = r.u32()
+        mesh.roughness = r.f32()
+        mesh.metallic = r.f32()
         mesh.emissive_color = r.vec3()
         mesh.emissive_strength = r.f32()
+        mesh.clearcoat = r.f32()
+        mesh.clearcoat_roughness = r.f32()
+        mesh.specular_factor = r.f32()
+        mesh.iridescence = r.f32()
+        mesh.iridescence_thickness_nm = r.f32()
+        mesh.iridescence_ior = r.f32()
+        mesh.sheen_color = r.vec3()
+        mesh.sheen_roughness = r.f32()
         mesh.skin = r.i64()
         mesh.alpha_mode = r.i64()
         mesh.double_sided = r.i64() != 0
@@ -624,7 +648,24 @@ def model_difference(a: NativeModel, b: NativeModel) -> String:
             return name + "joints"
         if not same_floats(x.weights, y.weights):
             return name + "weights"
-        if x.texture != y.texture or x.base_color != y.base_color or not same_vec(x.emissive_color, y.emissive_color) or not same_f(x.emissive_strength, y.emissive_strength):
+        if (
+            x.texture != y.texture
+            or x.normal_orm_texture != y.normal_orm_texture
+            or x.orm_texture != y.orm_texture
+            or x.base_color != y.base_color
+            or not same_f(x.roughness, y.roughness)
+            or not same_f(x.metallic, y.metallic)
+            or not same_vec(x.emissive_color, y.emissive_color)
+            or not same_f(x.emissive_strength, y.emissive_strength)
+            or not same_f(x.clearcoat, y.clearcoat)
+            or not same_f(x.clearcoat_roughness, y.clearcoat_roughness)
+            or not same_f(x.specular_factor, y.specular_factor)
+            or not same_f(x.iridescence, y.iridescence)
+            or not same_f(x.iridescence_thickness_nm, y.iridescence_thickness_nm)
+            or not same_f(x.iridescence_ior, y.iridescence_ior)
+            or not same_vec(x.sheen_color, y.sheen_color)
+            or not same_f(x.sheen_roughness, y.sheen_roughness)
+        ):
             return name + "material"
         if x.skin != y.skin or x.alpha_mode != y.alpha_mode or x.double_sided != y.double_sided:
             return name + "skin or alpha"

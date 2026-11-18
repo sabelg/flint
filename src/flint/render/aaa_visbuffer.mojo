@@ -31,7 +31,7 @@ from flint.render.spirv import (
 comptime BIND_AAA_VERTICES: Int = 0      # AAA_VERTEX_WORDS (12) per vertex
 comptime BIND_AAA_INDICES: Int = 1       # 3 UInt32s per triangle
 comptime BIND_AAA_MESHLETS: Int = 2      # AAA_MESHLET_WORDS (12) per meshlet
-comptime BIND_AAA_INSTANCES: Int = 3     # AAA_INSTANCE_WORDS (36) per instance (cur Mat4 + prev Mat4 + meshlet range)
+comptime BIND_AAA_INSTANCES: Int = 3     # AAA_INSTANCE_WORDS (40) per instance (cur Mat4 + prev Mat4 + meshlet/skin range)
 comptime BIND_AAA_MATERIALS: Int = 4     # AAA_MATERIAL_WORDS (24) per enterprise BSDF material
 comptime BIND_AAA_INDIRECT: Int = 5      # Word 0 = atomic draw count; Word 4+ = VkDrawIndirectCommand[N] (4 words each)
 comptime BIND_AAA_GLOBALS: Int = 6       # Camera basis, ViewProj, Light, VSM matrix, SH9 irradiance, flags
@@ -40,30 +40,38 @@ comptime BIND_AAA_HISTORY: Int = 8       # TSR v2 / SVGF history RGBA32F + lock 
 comptime BIND_AAA_VSM_TABLE: Int = 9     # 128x128 Virtual Shadow Map page table + request flags
 comptime BIND_AAA_SURFCACHE: Int = 10    # Direct-lit Lumen-style per-triangle/meshlet Surface Cache RGBE/Float3
 comptime BIND_AAA_OIT_NODES: Int = 11    # Per-pixel 4-layer exact short-stack OIT + 6-way volumetric plumes
-comptime AAA_STORAGE_COUNT: Int = 12
+comptime BIND_AAA_CLUSTERS: Int = 12     # 16x9x24 Log-Z Clustered Punctual & Heitz LTC Area Lights (V18)
+comptime BIND_AAA_SKINNING: Int = 13     # Dual-Quaternion Bone Palettes + Bind-Pose + Prev Skinned Verts (V18)
+comptime BIND_AAA_POST_SCRATCH: Int = 14 # Auto-Exposure Histogram + 5-Mip Dual-Kawase Bloom + Bokeh DoF (V19)
+comptime BIND_AAA_CANDIDATES: Int = 14   # Two-Phase Hi-Z Occluded Candidates Queue
+comptime AAA_STORAGE_COUNT: Int = 15
 
-comptime BIND_AAA_VIS_TEX: Int = 12      # usampler2D (VK_FORMAT_R32G32_UINT VisBuffer)
-comptime BIND_AAA_DEPTH_TEX: Int = 13    # sampler2D  (VK_FORMAT_D32_SFLOAT Reverse-Z Depth)
-comptime BIND_AAA_VSM_TEX: Int = 14      # sampler2D  (VK_FORMAT_R32_SFLOAT / D32_SFLOAT Physical VSM Page Pool)
-comptime BIND_AAA_ENV_CUBE: Int = 15     # samplerCube (VK_FORMAT_BC6H_UFLOAT 6-Mip Split-Sum GGX Cubemap)
-comptime BIND_AAA_BRDF_LUT: Int = 16     # sampler2D  (VK_FORMAT_R16G16_SFLOAT Split-Sum Multi-Scatter LUT)
-comptime AAA_SINGLE_SAMPLERS: Int = 5
+comptime BIND_AAA_VIS_TEX: Int = 15      # usampler2D (VK_FORMAT_R32G32_UINT VisBuffer)
+comptime BIND_AAA_DEPTH_TEX: Int = 16    # sampler2D  (VK_FORMAT_D32_SFLOAT Reverse-Z Depth)
+comptime BIND_AAA_VSM_TEX: Int = 17      # sampler2D  (VK_FORMAT_R32_SFLOAT / D32_SFLOAT Physical VSM Page Pool)
+comptime BIND_AAA_ENV_CUBE: Int = 18     # samplerCube (VK_FORMAT_BC6H_UFLOAT 6-Mip Split-Sum GGX Cubemap)
+comptime BIND_AAA_BRDF_LUT: Int = 19     # sampler2D  (VK_FORMAT_R16G16_SFLOAT Split-Sum Multi-Scatter LUT)
+comptime BIND_AAA_LTC_LUT: Int = 20      # sampler2D  (VK_FORMAT_R16G16_SFLOAT Heitz LTC 64x64 Inverse-Matrix LUT)
+comptime AAA_SINGLE_SAMPLERS: Int = 6
 
-comptime BIND_AAA_BINDLESS_TEX: Int = 17 # sampler2D[AAA_MAX_BINDLESS] (BC7_UNORM, BC7_SRGB, BC5_UNORM, BC6H_UFLOAT)
+comptime BIND_AAA_BINDLESS_TEX: Int = 21 # sampler2D[AAA_MAX_BINDLESS] (BC7_UNORM, BC7_SRGB, BC5_UNORM, BC6H_UFLOAT)
 comptime AAA_MAX_BINDLESS: Int = 256
-comptime BIND_AAA_TLAS: Int = 18         # accelerationStructureKHR (Hardware BLAS/TLAS for SPV_KHR_ray_query)
+comptime BIND_AAA_TLAS: Int = 22         # accelerationStructureKHR (Hardware BLAS/TLAS for SPV_KHR_ray_query)
 
 comptime AAA_PUSH_WORDS: Int = 16
 comptime AAA_PUSH_BYTES: Int = 64
 
-# Instance SSBO layout: 36 words (144 bytes) per instance
+# Instance SSBO layout: 40 words (160 bytes) per instance
 # [0..15]:  model_to_world Mat4 (column-major Float32[16])
 # [16..31]: prev_model_to_world Mat4 (column-major Float32[16], for 3D per-pixel TSR/SVGF motion vectors!)
 # [32]:     first_meshlet (UInt32)
 # [33]:     meshlet_count (UInt32)
-# [34]:     material_override (UInt32: 0xFFFFFFFF = use meshlet.material_id)
+# [34]:     flags_and_material_override (UInt32: bit16 = is_skinned, bits[0..15] = 0xFFFF or material_override)
 # [35]:     uniform_scale_bits (Float32: max axis scale for bounding sphere radius)
-comptime AAA_INSTANCE_WORDS: Int = 36
+# [36]:     skin_bind_first_slot (UInt32: base vertex slot in BIND_AAA_SKINNING, 0 if static)
+# [37]:     mesh_first_vertex (UInt32: CookedMeshEntry.first_vertex in BIND_AAA_VERTICES)
+# [38..39]: reserved (0)
+comptime AAA_INSTANCE_WORDS: Int = 40
 
 # Globals SSBO layout (`BIND_AAA_GLOBALS`, 128 words = 512 bytes):
 # [0..15]:  view_proj Mat4 (Reverse-Z column-major Float32[16])
@@ -185,11 +193,21 @@ def emit_mat4_mul_dir(
     return (rx, ry, rz)
 
 
+def _emit_uf16_to_f32(mut s: AaaSpirvModule, h_u16: UInt32) -> UInt32:
+    """Exact 5-instruction IEEE-754 unsigned `F16` (`0 .. 0x7BFF`) -> `Float32` decoder in SPIR-V."""
+    var is_sub = s.ult(h_u16, s.uint(0x0400))
+    var sub_f = s.fmul(s.float_from_uint(h_u16), s.float(5.96046448e-8))
+    var norm_bits = s.shl(s.iadd(h_u16, s.uint(0x1C000)), s.uint(13))
+    return s.select_f(is_sub, sub_f, s.bitcast_float(norm_bits))
+
+
 def meshlet_cull_shader() -> List[UInt32]:
-    """GPU Compute Meshlet Culler (`Frustum + Normal-Cone Backface + Reverse-Z Hi-Z` -> `VkDrawIndirectCommand`).
+    """GPU Compute Meshlet Culler (`QEM LOD 0..3 Screen-Error Cut + Frustum + Normal-Cone + Reverse-Z Hi-Z`
+    -> `VkDrawIndirectCommand`).
     Push[0] = instance_count, Push[1] = max_draws, Push[2] = enable_cone_cull (1/0), Push[3] = enable_hiz (1/0),
-    Push[4] = screen_w, Push[5] = screen_h.
-    Invocation X = instance_idx, Invocation Y = local_meshlet_idx!
+    Push[4] = screen_w, Push[5] = screen_h, Push[6] = max_lod_error_px_bits (Float32, e.g. 1.0 px),
+    Push[7] = cull_phase (0 = Phase 1: queue occluded candidates, 1 = Phase 2: test candidates against fresh Hi-Z).
+    Invocation X = instance_idx (or candidate workgroup thread in Phase 2), Invocation Y = local_meshlet_idx!
     """
     var s = AaaSpirvModule(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
     var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
@@ -197,24 +215,59 @@ def meshlet_cull_shader() -> List[UInt32]:
     var b_indirect = s.buffer(BIND_AAA_INDIRECT)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
     var depth_samp = s.sampled_image_2d(BIND_AAA_DEPTH_TEX)
+    var b_candidates = s.buffer(BIND_AAA_CANDIDATES)
 
-    var inst_idx = s.invocation_axis(0)
-    var local_ml = s.invocation_axis(1)
     var inst_count = s.push_word(0)
     var max_draws = s.push_word(1)
     var enable_cone = s.push_word(2)
     var enable_hiz = s.push_word(3)
     var scr_w = s.float_from_uint(s.push_word(4))
     var scr_h = s.float_from_uint(s.push_word(5))
+    var max_lod_px = s.push_float(6)
+    var cull_phase = s.push_word(7)
 
-    s.return_if(s.uge(inst_idx, inst_count))
+    var inst_idx_var = s.uvar(s.uint(0))
+    var ml_id_var = s.uvar(s.uint(0))
+    var valid_var = s.uvar(s.uint(0))
+
+    var is_p1 = s.ieq(cull_phase, s.uint(0))
+    s.begin_if(is_p1)
+    var p1_inst = s.invocation_axis(0)
+    var p1_local_ml = s.invocation_axis(1)
+    s.begin_if(s.ult(p1_inst, inst_count))
+    var inst_base_p1 = s.imul(p1_inst, s.uint(UInt32(AAA_INSTANCE_WORDS)))
+    var first_ml_p1 = s.load_word(b_instances, s.iadd(inst_base_p1, s.uint(32)))
+    var ml_count_p1 = s.load_word(b_instances, s.iadd(inst_base_p1, s.uint(33)))
+    s.begin_if(s.ult(p1_local_ml, ml_count_p1))
+    s.store(inst_idx_var, p1_inst)
+    s.store(ml_id_var, s.iadd(first_ml_p1, p1_local_ml))
+    s.store(valid_var, s.uint(1))
+    s.end_if()
+    s.end_if()
+    s.begin_else()
+    # Phase 2: process candidate meshlets queued in b_candidates
+    var cand_id = s.iadd(
+        s.imul(s.workgroup_axis(0), s.uint(64)),
+        s.iadd(s.imul(s.local_axis(1), s.uint(8)), s.local_axis(0)),
+    )
+    var cand_total = s.load_word(b_candidates, s.uint(0))
+    s.begin_if(s.logical_and(s.ult(cand_id, cand_total), s.ult(cand_id, max_draws)))
+    var cand_packed = s.load_word(b_candidates, s.iadd(s.uint(4), cand_id))
+    s.store(inst_idx_var, s.shr(cand_packed, s.uint(17)))
+    s.store(ml_id_var, s.bit_and(cand_packed, s.uint(0x1FFFF)))
+    s.store(valid_var, s.uint(1))
+    s.end_if()
+    s.end_if()
+
+    s.return_if(s.ieq(s.load_u(valid_var), s.uint(0)))
+
+    var inst_idx = s.load_u(inst_idx_var)
+    var ml_id = s.load_u(ml_id_var)
 
     var inst_base = s.imul(inst_idx, s.uint(UInt32(AAA_INSTANCE_WORDS)))
-    var first_ml = s.load_word(b_instances, s.iadd(inst_base, s.uint(32)))
-    var ml_count = s.load_word(b_instances, s.iadd(inst_base, s.uint(33)))
-    s.return_if(s.uge(local_ml, ml_count))
-
-    var ml_id = s.iadd(first_ml, local_ml)
+    # Skip alpha-masked instances (`bit 17` of `w39`); they draw in the dedicated Two-Bucket alpha-cutout pass!
+    var inst_w39 = s.load_word(b_instances, s.iadd(inst_base, s.uint(39)))
+    s.return_if(s.ine(s.bit_and(inst_w39, s.uint(0x00020000)), s.uint(0)))
     var ml_base = s.imul(ml_id, s.uint(12))
     var lcx = s.load_float(b_meshlets, ml_base)
     var lcy = s.load_float(b_meshlets, s.iadd(ml_base, s.uint(1)))
@@ -224,7 +277,9 @@ def meshlet_cull_shader() -> List[UInt32]:
     var lay = s.load_float(b_meshlets, s.iadd(ml_base, s.uint(5)))
     var laz = s.load_float(b_meshlets, s.iadd(ml_base, s.uint(6)))
     var cone_sin = s.load_float(b_meshlets, s.iadd(ml_base, s.uint(7)))
+    var first_tri = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(8)))
     var tri_cnt = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(9)))
+    var lod_err_pack = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(10)))
 
     var uscale = s.load_float(b_instances, s.iadd(inst_base, s.uint(35)))
     var wc = emit_mat4_mul_point(s, b_instances, inst_base, lcx, lcy, lcz)
@@ -250,6 +305,30 @@ def meshlet_cull_shader() -> List[UInt32]:
     var ry = s.fsub(wc[1], cam_y)
     var rz = s.fsub(wc[2], cam_z)
     var dist = s.fsqrt(s.nmax(s.float(1e-8), emit_vec3_dot(s, rx, ry, rz, rx, ry, rz)))
+    var vz = emit_vec3_dot(s, rx, ry, rz, fwd_x, fwd_y, fwd_z)
+
+    # 0. Continuous QEM Meshlet Hierarchy Cut & Cone/Frustum tests (Phase 1 only)
+    s.begin_if(is_p1)
+    var h_self = s.bit_and(lod_err_pack, s.uint(0xFFFF))
+    var h_parent = s.shr(lod_err_pack, s.uint(16))
+    var self_err = _emit_uf16_to_f32(s, h_self)
+    var parent_err = _emit_uf16_to_f32(s, h_parent)
+    var inst_ox = s.load_float(b_instances, s.iadd(inst_base, s.uint(12)))
+    var inst_oy = s.load_float(b_instances, s.iadd(inst_base, s.uint(13)))
+    var inst_oz = s.load_float(b_instances, s.iadd(inst_base, s.uint(14)))
+    var io_dx = s.fsub(inst_ox, cam_x)
+    var io_dy = s.fsub(inst_oy, cam_y)
+    var io_dz = s.fsub(inst_oz, cam_z)
+    var d_inst = s.nmax(near_z, s.fsqrt(s.nmax(s.float(1e-8), emit_vec3_dot(s, io_dx, io_dy, io_dz, io_dx, io_dy, io_dz))))
+    var px_per_m = s.fdiv(s.fmul(uscale, scr_h), s.nmax(s.float(1e-5), s.fmul(s.float(2.0), s.fmul(d_inst, tan_y))))
+    var e_max = s.select_f(
+        s.fgt(max_lod_px, s.float(0.0)),
+        s.fdiv(max_lod_px, s.nmax(s.float(1e-5), px_per_m)),
+        s.float(0.0),
+    )
+    var too_coarse = s.fgt(self_err, e_max)
+    var too_fine = s.logical_and(s.flt(parent_err, s.float(65000.0)), s.fge(e_max, parent_err))
+    s.return_if(s.logical_or(too_coarse, too_fine))
 
     # 1. Backface normal-cone cull
     s.begin_if(s.logical_and(s.ine(enable_cone, s.uint(0)), s.flt(cone_sin, s.float(1.5))))
@@ -261,7 +340,6 @@ def meshlet_cull_shader() -> List[UInt32]:
     s.end_if()
 
     # 2. View-frustum bounding-sphere test
-    var vz = emit_vec3_dot(s, rx, ry, rz, fwd_x, fwd_y, fwd_z)
     s.return_if(s.flt(s.fadd(vz, wrad), near_z))
 
     var vx = s.fabs(emit_vec3_dot(s, rx, ry, rz, rgt_x, rgt_y, rgt_z))
@@ -271,10 +349,16 @@ def meshlet_cull_shader() -> List[UInt32]:
     var vz_pos = s.nmax(s.float(0.0), vz)
     s.return_if(s.fgt(s.fsub(vx, s.fmul(wrad, sec_x)), s.fmul(vz_pos, tan_x)))
     s.return_if(s.fgt(s.fsub(vy, s.fmul(wrad, sec_y)), s.fmul(vz_pos, tan_y)))
+    s.end_if()
 
-    # 3. Optional Reverse-Z 5-Tap Depth Occlusion Test against previous pass/frame depth
+    # 3. Reverse-Z 5-Tap Depth Occlusion Test (Phase 1 vs prev depth, Phase 2 vs fresh depth)
     s.begin_if(s.logical_and(s.ine(enable_hiz, s.uint(0)), s.fgt(s.fsub(vz, wrad), near_z)))
-    var clip = emit_mat4_mul_point(s, b_globals, s.uint(0), wc[0], wc[1], wc[2])
+    var prev_wc = emit_mat4_mul_point(s, b_instances, s.iadd(inst_base, s.uint(16)), lcx, lcy, lcz)
+    var clip_mat_offset = s.select_u(is_p1, s.uint(16), s.uint(0))
+    var target_pt_x = s.select_f(is_p1, prev_wc[0], wc[0])
+    var target_pt_y = s.select_f(is_p1, prev_wc[1], wc[1])
+    var target_pt_z = s.select_f(is_p1, prev_wc[2], wc[2])
+    var clip = emit_mat4_mul_point(s, b_globals, clip_mat_offset, target_pt_x, target_pt_y, target_pt_z)
     s.begin_if(s.fgt(clip[3], near_z))
     var inv_w = s.fdiv(s.float(1.0), clip[3])
     var ndc_x = s.fmul(clip[0], inv_w)
@@ -290,30 +374,41 @@ def meshlet_cull_shader() -> List[UInt32]:
     var sphere_rev_z = s.fdiv(near_z, front_z)
     var uv_r_x = s.fdiv(wrad, s.nmax(s.float(0.001), s.fmul(vz, tan_x)))
     var uv_r_y = s.fdiv(wrad, s.nmax(s.float(0.001), s.fmul(vz, tan_y)))
-    var d0 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(u_c, v_c), s.float(0.0)), 0)
-    var d1 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fsub(u_c, uv_r_x), s.fsub(v_c, uv_r_y)), s.float(0.0)), 0)
-    var d2 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fadd(u_c, uv_r_x), s.fsub(v_c, uv_r_y)), s.float(0.0)), 0)
-    var d3 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fsub(u_c, uv_r_x), s.fadd(v_c, uv_r_y)), s.float(0.0)), 0)
-    var d4 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fadd(u_c, uv_r_x), s.fadd(v_c, uv_r_y)), s.float(0.0)), 0)
+    var footprint_px = s.fmul(s.nmax(s.fmul(uv_r_x, scr_w), s.fmul(uv_r_y, scr_h)), s.float(2.0))
+    var hiz_lod = s.nclamp(s.log2(s.nmax(footprint_px, s.float(1.0))), s.float(0.0), s.float(7.0))
+    var d0 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(u_c, v_c), hiz_lod), 0)
+    var d1 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fsub(u_c, uv_r_x), s.fsub(v_c, uv_r_y)), hiz_lod), 0)
+    var d2 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fadd(u_c, uv_r_x), s.fsub(v_c, uv_r_y)), hiz_lod), 0)
+    var d3 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fsub(u_c, uv_r_x), s.fadd(v_c, uv_r_y)), hiz_lod), 0)
+    var d4 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fadd(u_c, uv_r_x), s.fadd(v_c, uv_r_y)), hiz_lod), 0)
     # In Reverse-Z, a closer occluder has LARGER depth; meshlet is occluded iff ALL 5 taps > sphere_rev_z!
     var min_occ_z = s.nmin(d0, s.nmin(s.nmin(d1, d2), s.nmin(d3, d4)))
-    s.return_if(s.fgt(min_occ_z, s.fadd(sphere_rev_z, s.float(0.0005))))
+    var is_occluded = s.fgt(min_occ_z, s.fadd(sphere_rev_z, s.float(0.0005)))
+    # In Phase 1: append occluded candidate word into b_candidates
+    s.begin_if(s.logical_and(is_occluded, is_p1))
+    var cand_slot = s.atomic_add_word(b_candidates, s.uint(0), s.uint(1))
+    s.begin_if(s.ult(cand_slot, max_draws))
+    var packed_cand = s.bit_or(s.shl(inst_idx, s.uint(17)), s.bit_and(ml_id, s.uint(0x1FFFF)))
+    s.store_word(b_candidates, s.iadd(s.uint(4), cand_slot), packed_cand)
+    s.end_if()
+    s.end_if()
+    s.return_if(is_occluded)
     s.end_if()
     s.end_if()
     s.end_if()
-    _ = scr_w
-    _ = scr_h
 
-    # 4. Append `VkDrawIndirectCommand` (`vertexCount, instanceCount, firstVertex, firstInstance`)
+    # 4. Append `VkDrawIndexedIndirectCommand` (`indexCount, instanceCount, firstIndex, vertexOffset, firstInstance`)
     var slot = s.atomic_add_word(b_indirect, s.uint(0), s.uint(1))
     s.begin_if(s.ult(slot, max_draws))
-    var cmd_base = s.iadd(s.uint(4), s.imul(slot, s.uint(4)))
-    var vtx_cnt = s.imul(tri_cnt, s.uint(3))
-    var packed_first_inst = s.bit_or(s.shl(inst_idx, s.uint(16)), s.bit_and(ml_id, s.uint(0xFFFF)))
-    s.store_word(b_indirect, cmd_base, vtx_cnt)
+    var cmd_base = s.iadd(s.uint(4), s.imul(slot, s.uint(5)))
+    var idx_cnt = s.imul(tri_cnt, s.uint(3))
+    var first_idx = s.imul(first_tri, s.uint(3))
+    var packed_first_inst = s.bit_or(s.shl(inst_idx, s.uint(17)), s.bit_and(ml_id, s.uint(0x1FFFF)))
+    s.store_word(b_indirect, cmd_base, idx_cnt)
     s.store_word(b_indirect, s.iadd(cmd_base, s.uint(1)), s.uint(1))
-    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(2)), s.uint(0))
-    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(3)), packed_first_inst)
+    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(2)), first_idx)
+    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(3)), s.uint(0))
+    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(4)), packed_first_inst)
     s.end_if()
 
     return s.finish()
@@ -321,7 +416,7 @@ def meshlet_cull_shader() -> List[UInt32]:
 
 def visbuffer_vertex_shader() -> List[UInt32]:
     """Hardware Vertex Shader for 64-Bit Visibility Buffer (`VK_KHR_dynamic_rendering`).
-    Pulls triangle indices & 48-byte vertices directly from SSBOs and outputs flat `uvec2` payload!
+    Pulls hardware indexed vertices directly, reusing Forsyth post-transform cache!
     Push[0] = view_proj word offset in `BIND_AAA_GLOBALS` (0 = main camera, 56 = VSM light matrix!).
     """
     var s = AaaSpirvModule(MODEL_VERTEX, push_words=AAA_PUSH_WORDS)
@@ -330,27 +425,22 @@ def visbuffer_vertex_shader() -> List[UInt32]:
     var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
     var b_instances = s.buffer(BIND_AAA_INSTANCES)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    _ = b_indices
     var out_vis = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec2, location=0, flat=True)
 
-    var v_idx = s.vertex_index()
+    var real_vtx = s.vertex_index()
     var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(16))
-    var ml_id = s.bit_and(packed_inst, s.uint(0xFFFF))
-
-    var local_prim = s.udiv(v_idx, s.uint(3))
-    var corner = s.umod(v_idx, s.uint(3))
+    var inst_id = s.shr(packed_inst, s.uint(17))
+    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
 
     var ml_base = s.imul(ml_id, s.uint(12))
-    var first_tri = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(8)))
     var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
 
     var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
     var mat_override = s.load_word(b_instances, s.iadd(inst_base, s.uint(34)))
-    var final_mat = s.select_u(s.ieq(mat_override, s.uint(0xFFFFFFFF)), ml_mat, mat_override)
+    var mat_ov16 = s.bit_and(mat_override, s.uint(0xFFFF))
+    var final_mat = s.select_u(s.ieq(mat_ov16, s.uint(0xFFFF)), ml_mat, mat_ov16)
 
-    var global_tri = s.iadd(first_tri, local_prim)
-    var idx_word_off = s.iadd(s.imul(global_tri, s.uint(3)), corner)
-    var real_vtx = s.load_word(b_indices, idx_word_off)
     var v_base = s.imul(real_vtx, s.uint(12))
 
     var lpx = s.load_float(b_verts, v_base)
@@ -368,10 +458,10 @@ def visbuffer_vertex_shader() -> List[UInt32]:
     var cy_jit = s.fma(jy, clip[3], clip[1])
     s.write_clip_position(cx_jit, cy_jit, clip[2], clip[3])
 
-    # VisBuffer payload: word0 = (inst_id << 16) | (ml_id + 1), word1 = (final_mat << 16) | local_prim
-    var pay0 = s.bit_or(s.shl(inst_id, s.uint(16)), s.iadd(ml_id, s.uint(1)))
-    var pay1 = s.bit_or(s.shl(final_mat, s.uint(16)), local_prim)
-    emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1))
+    # VisBuffer payload: word0 = (inst_id << 17) | min(ml_id + 1, 0x1FFFF), word1_base = (final_mat << 16)
+    var pay0 = s.bit_or(s.shl(inst_id, s.uint(17)), s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x1FFFF)))
+    var pay1_base = s.shl(final_mat, s.uint(16))
+    emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
 
     return s.finish()
 
@@ -379,13 +469,132 @@ def visbuffer_vertex_shader() -> List[UInt32]:
 def visbuffer_fragment_shader() -> List[UInt32]:
     """Hardware Fragment Shader (`EarlyFragmentTests`) writing 64-bit `R32G32_UINT` VisBuffer IDs."""
     var s = AaaSpirvModule(MODEL_FRAGMENT, push_words=AAA_PUSH_WORDS, early_depth=True)
+    var prim_id = s.primitive_id()
     var in_vis = s.add_stage_io(STORAGE_INPUT, s.type_uvec2, location=0, flat=True)
     var out_col = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec4, location=0, flat=False)
 
     var vis_val = s.fresh()
     emit(s.code, OP_LOAD, s.type_uvec2, vis_val, in_vis[1])
     var w0 = s.extract_u(vis_val, 0)
-    var w1 = s.extract_u(vis_val, 1)
+    var w1_base = s.extract_u(vis_val, 1)
+    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFFFF)))
+    emit(s.code, OP_STORE, out_col[1], s.uvec4(w0, w1, s.uint(0), s.uint(1)))
+    return s.finish()
+
+
+def visbuffer_alphamask_vertex_shader() -> List[UInt32]:
+    """Two-Bucket Alpha-Masked Hardware Vertex Shader (`alpha_cutoff > 0.0`):
+    Passes `flat uvec2(pay0, pay1_base)` (`location=0`), smooth `vec2 uv` (`location=1`),
+    and `flat uint t_alb` (`location=2`) to `visbuffer_alphamask_fragment_shader`."""
+    var s = AaaSpirvModule(MODEL_VERTEX, push_words=AAA_PUSH_WORDS)
+    var b_verts = s.buffer(BIND_AAA_VERTICES)
+    var b_indices = s.buffer(BIND_AAA_INDICES)
+    var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
+    var b_instances = s.buffer(BIND_AAA_INSTANCES)
+    var b_materials = s.buffer(BIND_AAA_MATERIALS)
+    var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    _ = b_indices
+
+    var out_vis = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec2, location=0, flat=True)
+    var out_uv = s.add_stage_io(STORAGE_OUTPUT, s.type_vec2, location=1, flat=False)
+    var out_talb = s.add_stage_io(STORAGE_OUTPUT, s.type_uint, location=2, flat=True)
+
+    var real_vtx = s.vertex_index()
+    var packed_inst = s.instance_index()
+    var inst_id = s.shr(packed_inst, s.uint(17))
+    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+
+    var ml_base = s.imul(ml_id, s.uint(12))
+    var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
+
+    var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
+    var mat_override = s.load_word(b_instances, s.iadd(inst_base, s.uint(34)))
+    var mat_ov16 = s.bit_and(mat_override, s.uint(0xFFFF))
+    var final_mat = s.select_u(s.ieq(mat_ov16, s.uint(0xFFFF)), ml_mat, mat_ov16)
+
+    var m_base = s.imul(final_mat, s.uint(24))
+    var tex_pk = s.load_word(b_materials, s.iadd(m_base, s.uint(23)))
+    var t_alb = s.bit_and(tex_pk, s.uint(0xFF))
+
+    var v_base = s.imul(real_vtx, s.uint(12))
+    var lpx = s.load_float(b_verts, v_base)
+    var lpy = s.load_float(b_verts, s.iadd(v_base, s.uint(1)))
+    var lpz = s.load_float(b_verts, s.iadd(v_base, s.uint(2)))
+    var uv_u = s.load_float(b_verts, s.iadd(v_base, s.uint(9)))
+    var uv_v = s.load_float(b_verts, s.iadd(v_base, s.uint(10)))
+
+    var wp = emit_mat4_mul_point(s, b_instances, inst_base, lpx, lpy, lpz)
+    var vp_off = s.push_word(0)
+    var clip = emit_mat4_mul_point(s, b_globals, vp_off, wp[0], wp[1], wp[2])
+
+    var jx = s.push_float(1)
+    var jy = s.push_float(2)
+    var cx_jit = s.fma(jx, clip[3], clip[0])
+    var cy_jit = s.fma(jy, clip[3], clip[1])
+    s.write_clip_position(cx_jit, cy_jit, clip[2], clip[3])
+
+    var pay0 = s.bit_or(s.shl(inst_id, s.uint(17)), s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x1FFFF)))
+    var pay1_base = s.shl(final_mat, s.uint(16))
+    emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
+    emit(s.code, OP_STORE, out_uv[1], s.vec2(uv_u, uv_v))
+    emit(s.code, OP_STORE, out_talb[1], t_alb)
+    return s.finish()
+
+
+def visbuffer_alphamask_fragment_shader() -> List[UInt32]:
+    """Two-Bucket Alpha-Cutout Fragment Shader (`early_depth = False`, `enable_bindless = True`):
+    Samples `bindless_arr[t_alb]` alpha with mip-coverage preservation `a * (1.0 + 0.18 * mip_est)`
+    and discards (`OpKill`) when `alpha < 0.48`, keeping `pipe_visbuffer_gfx` (`early_depth=True`) 100% untouched!"""
+    var s = AaaSpirvModule(
+        MODEL_FRAGMENT,
+        push_words=AAA_PUSH_WORDS,
+        enable_bindless=True,
+        early_depth=False,
+    )
+    var bindless_arr = s.bindless_sampled_array_2d(BIND_AAA_BINDLESS_TEX, AAA_MAX_BINDLESS)
+    var prim_id = s.primitive_id()
+    var in_vis = s.add_stage_io(STORAGE_INPUT, s.type_uvec2, location=0, flat=True)
+    var in_uv = s.add_stage_io(STORAGE_INPUT, s.type_vec2, location=1, flat=False)
+    var in_talb = s.add_stage_io(STORAGE_INPUT, s.type_uint, location=2, flat=True)
+    var out_col = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec4, location=0, flat=False)
+
+    var uv_val = s.fresh()
+    emit(s.code, OP_LOAD, s.type_vec2, uv_val, in_uv[1])
+    var uv_x = s.extract_f(uv_val, 0)
+    var uv_y = s.extract_f(uv_val, 1)
+
+    # Compute screen-space UV derivatives in uniform quad control flow
+    var ddx_u = s.dpdx(uv_x)
+    var ddx_v = s.dpdx(uv_y)
+    var ddy_u = s.dpdy(uv_x)
+    var ddy_v = s.dpdy(uv_y)
+    var gx2 = s.fma(ddx_u, ddx_u, s.fmul(ddx_v, ddx_v))
+    var gy2 = s.fma(ddy_u, ddy_u, s.fmul(ddy_v, ddy_v))
+    var px_foot = s.fmul(s.fsqrt(s.nmax(s.float(1e-8), s.nmax(gx2, gy2))), s.float(512.0))
+    var mip_est = s.nclamp(s.log2(s.nmax(s.float(1.0), px_foot)), s.float(0.0), s.float(6.0))
+
+    var t_alb = s.fresh()
+    emit(s.code, OP_LOAD, s.type_uint, t_alb, in_talb[1])
+    var alpha_v = s.fvar(s.float(1.0))
+    s.begin_if(s.ult(t_alb, s.uint(0xFF)))
+    var rgba = s.sample_bindless_grad(
+        bindless_arr,
+        t_alb,
+        uv_val,
+        s.vec2(ddx_u, ddx_v),
+        s.vec2(ddy_u, ddy_v),
+    )
+    var raw_a = s.extract_f(rgba, 3)
+    s.store(alpha_v, s.fmul(raw_a, s.fma(mip_est, s.float(0.18), s.float(1.0))))
+    s.end_if()
+
+    s.discard_if(s.flt(s.load_f(alpha_v), s.float(0.48)))
+
+    var vis_val = s.fresh()
+    emit(s.code, OP_LOAD, s.type_uvec2, vis_val, in_vis[1])
+    var w0 = s.extract_u(vis_val, 0)
+    var w1_base = s.extract_u(vis_val, 1)
+    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFFFF)))
     emit(s.code, OP_STORE, out_col[1], s.uvec4(w0, w1, s.uint(0), s.uint(1)))
     return s.finish()
 

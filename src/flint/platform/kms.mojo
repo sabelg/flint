@@ -36,7 +36,7 @@ neither WAYLAND_DISPLAY nor DISPLAY set.
 
 GPU mode (`for_vulkan = True` before `initialize`, or `WaylandWindow.wants_kms_vulkan`):
 everything above except the CPU buffers and the first modeset, so Vulkan can take the
-connector for a swapchain (`VulkanGpu.create_drm_display_surface(drm_fd, connector, ...)`,
+connector for a swapchain (`VulkanGpu.attach_surface(drm_fd=..., drm_connector=...)`,
 VK_EXT_acquire_drm_display). `present()` then does nothing; `start_cpu_present()`
 falls back to the CPU path when Vulkan cannot have the display.
 """
@@ -45,6 +45,7 @@ from flint.platform.input import InputState
 from flint.platform.os import env_value, env_flag, close_fd, get_time, list_directory, last_errno
 from flint.platform.wayland import evdev_key
 from flint.platform.logind import LogindSession, device_numbers
+from flint.platform.vulkan import VulkanGpu, SwapchainHandle
 from flint.core.anchor import sys, IS_X86, SYS_GETPID, SYS_MSYNC
 
 comptime SYS_IOCTL: Int = 16 if IS_X86 else 29
@@ -785,6 +786,46 @@ struct KmsWindow(Copyable, Movable):
         self.last_flip_at = get_time()
         self.for_vulkan = False
         return True
+
+    def attach_vulkan(mut self, mut vk: VulkanGpu, width: Int, height: Int, prefer_hdr10: Bool = False) -> SwapchainHandle:
+        """Hand the screen to a Vulkan swapchain of width x height, the renderer's output
+        size: Vulkan sets a display mode of exactly that size (the monitor or TV scales it)
+        at the current refresh when the size is the current mode's, else the one closest to
+        60 Hz. The CPU buffers go once it has the screen, and present() becomes a no-op.
+        Without such a mode, or when Vulkan cannot take the display, the handle is empty
+        and the CPU path carries on. Close the swapchain (`vk.close_swapchain()`) before
+        close(): Vulkan gives the display back through our DRM fd."""
+        if self.drm_fd < 0 or width <= 0 or height <= 0:
+            return SwapchainHandle()
+        self.wait_flip(100)
+        var want_mhz = self.refresh_mhz() if width == self.width and height == self.height else 60000
+        var sc = vk.attach_surface(
+            width=width,
+            height=height,
+            prefer_mailbox=False,
+            prefer_hdr10=prefer_hdr10,
+            drm_fd=self.drm_fd,
+            drm_connector=self.connector_id,
+            drm_refresh_mhz=want_mhz,
+            drm_exact_size=True,
+        )
+        if sc.swapchain == 0 or sc.width != width or sc.height != height:
+            var why = vk.error
+            vk.close_swapchain()
+            vk.release_display()
+            self.last_error = "Vulkan could not take the display: " + why
+            # Light the screen again with our buffers, in case Vulkan touched the CRTC.
+            if len(self.fb_ids) == 2:
+                _ = self.set_crtc(self.front)
+            elif self.for_vulkan:
+                _ = self.start_cpu_present()
+            return SwapchainHandle()
+        self.destroy_buffers()
+        self.for_vulkan = True
+        self.flip_pending = False
+        self.width = sc.width
+        self.height = sc.height
+        return sc^
 
     def set_title(mut self, title: String):
         """No window title on a bare display."""

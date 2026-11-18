@@ -9,6 +9,7 @@ from flint.platform.input import InputState
 from flint.platform.wayland_bridge import WaylandBridge
 from flint.platform.x11 import X11Window
 from flint.platform.kms import KmsWindow, on_virtual_console
+from flint.platform.vulkan import VulkanGpu, SwapchainHandle
 from flint.platform.os import env_value, env_flag, close_fd, get_time
 
 # Held in the pending key and button queues: everything held is released here.
@@ -178,6 +179,7 @@ struct WaylandWindow(Copyable, Movable):
     var xdg_surface: Int
     var toplevel: Int
     var pointer: Int
+    var pointer_enter_serial: Int
     var keyboard: Int
     var incoming: List[UInt8]
     var awaiting_syncs: List[Int]
@@ -251,6 +253,7 @@ struct WaylandWindow(Copyable, Movable):
         self.xdg_surface = 0
         self.toplevel = 0
         self.pointer = 0
+        self.pointer_enter_serial = 0
         self.keyboard = 0
         self.incoming = List[UInt8]()
         self.awaiting_syncs = List[Int]()
@@ -470,8 +473,13 @@ struct WaylandWindow(Copyable, Movable):
             if len(self.incoming) < size:
                 break
             self.handle_event(object, opcode, size)
-            for _ in range(size):
-                _ = self.incoming.pop(0)
+            var rem = len(self.incoming) - size
+            if rem == 0:
+                self.incoming.clear()
+            else:
+                for i in range(rem):
+                    self.incoming[i] = self.incoming[size + i]
+                self.incoming.resize(rem, 0)
 
     def handle_event(mut self, object: Int, opcode: Int, size: Int):
         if object == 1 and opcode == 0:
@@ -568,15 +576,21 @@ struct WaylandWindow(Copyable, Movable):
             return
         if object == self.locked_pointer and self.locked_pointer != 0:
             self.pointer_locked = opcode == 0
+            if self.pointer_locked:
+                self.hide_cursor()
             return
         if object == self.relative_pointer and self.relative_pointer != 0:
-            # Fields: time high, time low, dx, dy, then unaccelerated dx and dy.
+            # Fields: time high, time low, dx, dy, then unaccelerated dx and dy at 24 and 28.
             if opcode == 0 and size >= 32 and self.pointer_locked:
-                self.pending_relative_x += wl_fixed(wl_gets32(self.incoming, 16))
-                self.pending_relative_y += wl_fixed(wl_gets32(self.incoming, 20))
+                self.pending_relative_x += wl_fixed(wl_gets32(self.incoming, 24))
+                self.pending_relative_y += wl_fixed(wl_gets32(self.incoming, 28))
             return
         if object == self.pointer:
-            if opcode == 1:
+            if opcode == 0 and size >= 16:
+                self.pointer_enter_serial = wl_get32(self.incoming, 8)
+                if self.pointer_locked:
+                    self.hide_cursor()
+            elif opcode == 1:
                 self.pending_buttons.append(RELEASE_HELD)
                 self.pending_button_down.append(False)
             elif opcode == 2 and size >= 20:
@@ -757,6 +771,67 @@ struct WaylandWindow(Copyable, Movable):
             return False
         return True
 
+    def attach_vulkan(mut self, mut vk: VulkanGpu, width: Int, height: Int, prefer_mailbox: Bool = True, prefer_hdr10: Bool = False) -> SwapchainHandle:
+        """A swapchain on whatever this window is, so a game presents zero-copy without
+        knowing the backend. width x height is the renderer's output size.
+        - Wayland: needs `wants_bridge = True` before initialize() (the Vulkan driver's own
+          connection to the compositor).
+        - KMS: Vulkan takes the display at a mode of exactly that size (KmsWindow.attach_vulkan).
+        - X11: none, this X11 client has no XCB connection to give Vulkan.
+        An empty handle (`swapchain == 0`) means keep presenting CPU frames with present(),
+        which still works. When it is not empty present() does nothing on KMS, so draw HUDs
+        on the GPU. Call `vk.close_swapchain()` before close()."""
+        if self.using_kms:
+            return self.kms.attach_vulkan(vk, width, height, prefer_hdr10)
+        if self.using_x11 or not self.bridge.active() or self.bridge.surface_proxy == 0:
+            return SwapchainHandle()
+        return vk.attach_surface(
+            wl_display=self.bridge.display,
+            wl_surface=self.bridge.surface_proxy,
+            width=width,
+            height=height,
+            prefer_mailbox=prefer_mailbox,
+            prefer_hdr10=prefer_hdr10,
+        )
+
+    def presents_on_gpu(self) -> Bool:
+        """True once a Vulkan swapchain owns the KMS display (present() is then a no-op)."""
+        return self.using_kms and self.kms.for_vulkan and len(self.kms.fb_ids) == 0
+
+    def start_kms(mut self, width: Int, height: Int) -> Bool:
+        """Draw straight to the display through DRM/KMS (platform/kms.mojo)."""
+        self.kms.for_vulkan = self.wants_kms_vulkan
+        if not self.kms.initialize(width, height):
+            return False
+        self.using_kms = True
+        self.configured = True
+        self.focused = True
+        self.fullscreen = True
+        self.width = self.kms.width
+        self.height = self.kms.height
+        return True
+
+    def wait_for_frame(mut self, max_wait_ms: Int = 20):
+        """Paces the render loop against a pending `wl_surface.frame` callback via `poll()`
+        so fast GPU renderers never busy-spin or discard frames between compositor VSyncs."""
+        if self.using_kms:
+            self.kms.wait_for_frame(max_wait_ms)
+            return
+        if self.using_x11 or self.fd < 0 or self.frame_callback == 0 or max_wait_ms <= 0:
+            return
+        self.receive()
+        if self.frame_callback == 0 or self.close_requested:
+            return
+        var deadline = get_time() + Float64(max_wait_ms) * 0.001
+        while self.frame_callback != 0 and not self.close_requested:
+            var rem_s = deadline - get_time()
+            if rem_s <= 0.0002:
+                break
+            var rem_ms = max(1, Int(rem_s * 1000.0))
+            if not self.wait_socket(rem_ms):
+                break
+            self.receive()
+
     def poll(mut self, mut input: InputState):
         if self.using_kms:
             self.kms.poll(input)
@@ -781,7 +856,12 @@ struct WaylandWindow(Copyable, Movable):
                 mx = mx * Float32(self.logical_width) / Float32(self.width)
             if self.height > 0 and self.height != self.logical_height:
                 my = my * Float32(self.logical_height) / Float32(self.height)
-            input.move_mouse(mx, my)
+            if not self.pointer_locked:
+                input.move_mouse(mx, my)
+            else:
+                input.last_mouse_x = mx
+                input.last_mouse_y = my
+                input.has_mouse_position = True
             self.pending_mouse_x = -1
             self.pending_mouse_y = -1
         for index in range(len(self.pending_buttons)):
@@ -865,13 +945,29 @@ struct WaylandWindow(Copyable, Movable):
         self.buffer_height = height
         return True
 
-    def shared_write(mut self, mut pixels: List[UInt32], offset: Int) -> Bool:
-        # Keep the unused XRGB byte opaque. Some compositor paths inspect it
-        # while importing or compositing an shm buffer.
-        for index in range(len(pixels)):
-            pixels[index] = pixels[index] | UInt32(0xff000000)
+    def shared_write(
+        mut self,
+        mut pixels: List[UInt32],
+        offset: Int,
+        opaque_already_set: Bool = False,
+        pixel_count: Int = -1,
+    ) -> Bool:
+        var n_px = len(pixels) if pixel_count < 0 else min(len(pixels), pixel_count)
+        if not opaque_already_set:
+            # Keep the unused XRGB byte opaque (8-wide SIMD!).
+            var base_addr = Int(pixels.unsafe_ptr())
+            var alpha_v = SIMD[DType.uint32, 8](0xff000000)
+            var idx = 0
+            while idx + 8 <= n_px:
+                var p_addr = base_addr + idx * 4
+                var v = Pointer[UInt32, ImmutAnyOrigin](unsafe_from_address=p_addr).unsafe_load[width=8, alignment=4]()
+                Pointer[UInt32, MutAnyOrigin](unsafe_from_address=p_addr).unsafe_store[alignment=4](v | alpha_v)
+                idx += 8
+            while idx < n_px:
+                pixels[idx] = pixels[idx] | UInt32(0xff000000)
+                idx += 1
         var written = 0
-        var size = len(pixels) * 4
+        var size = n_px * 4
         while written < size:
             var count = Int(external_call["pwrite", Int64](Int32(self.shared_fd), pixels.unsafe_ptr().unsafe_offset(written // 4), Int64(size - written), Int64(offset + written)))
             if count <= 0:
@@ -879,20 +975,13 @@ struct WaylandWindow(Copyable, Movable):
             written += count
         return True
 
-    def start_kms(mut self, width: Int, height: Int) -> Bool:
-        """Draw straight to the display through DRM/KMS (platform/kms.mojo)."""
-        self.kms.for_vulkan = self.wants_kms_vulkan
-        if not self.kms.initialize(width, height):
-            return False
-        self.using_kms = True
-        self.configured = True
-        self.focused = True
-        self.fullscreen = True
-        self.width = self.kms.width
-        self.height = self.kms.height
-        return True
-
-    def present(mut self, mut pixels: List[UInt32], source_width: Int, source_height: Int):
+    def present(
+        mut self,
+        mut pixels: List[UInt32],
+        source_width: Int,
+        source_height: Int,
+        opaque_already_set: Bool = False,
+    ):
         if self.using_kms:
             self.kms.present(pixels, source_width, source_height)
             self.close_requested = self.kms.close_requested
@@ -913,8 +1002,12 @@ struct WaylandWindow(Copyable, Movable):
             # A compositor may withhold callbacks for an occluded surface.
             # Permit a fresh frame rather than stalling presentation forever.
             self.frame_callback = 0
-        if self.shared_fd < 0 or self.buffer_width != self.width or self.buffer_height != self.height:
-            if not self.create_shared(self.width, self.height):
+        # When `wp_viewporter` is available, keep the shm pool at `source_width x source_height`
+        # so the Wayland compositor stretches it on the GPU in 0 ms instead of scaling on CPU!
+        var tgt_w = source_width if self.viewporter != 0 else self.width
+        var tgt_h = source_height if self.viewporter != 0 else self.height
+        if self.shared_fd < 0 or self.buffer_width != tgt_w or self.buffer_height != tgt_h:
+            if not self.create_shared(tgt_w, tgt_h):
                 self.protocol_errors += 1
                 self.last_error = "shared-memory allocation failed: " + self.last_error
                 return
@@ -926,18 +1019,18 @@ struct WaylandWindow(Copyable, Movable):
         if selected < 0:
             return
         # Populate the shared buffer before the commit that makes it visible.
-        var frame_size = self.width * self.height * 4
+        var frame_size = tgt_w * tgt_h * 4
         var write_ok: Bool
-        if source_width == self.width and source_height == self.height:
-            write_ok = self.shared_write(pixels, selected * frame_size)
+        if source_width == tgt_w and source_height == tgt_h:
+            write_ok = self.shared_write(pixels, selected * frame_size, opaque_already_set, tgt_w * tgt_h)
         else:
-            var scaled = List[UInt32](length=self.width * self.height, fill=0)
-            for y in range(self.height):
-                var source_y = min(source_height - 1, y * source_height // self.height)
-                for x in range(self.width):
-                    var source_x = min(source_width - 1, x * source_width // self.width)
-                    scaled[y * self.width + x] = pixels[source_y * source_width + source_x]
-            write_ok = self.shared_write(scaled, selected * frame_size)
+            var scaled = List[UInt32](length=tgt_w * tgt_h, fill=0)
+            for y in range(tgt_h):
+                var source_y = min(source_height - 1, y * source_height // tgt_h)
+                for x in range(tgt_w):
+                    var source_x = min(source_width - 1, x * source_width // tgt_w)
+                    scaled[y * tgt_w + x] = pixels[source_y * source_width + source_x]
+            write_ok = self.shared_write(scaled, selected * frame_size, opaque_already_set, tgt_w * tgt_h)
         if not write_ok:
             self.protocol_errors += 1
             self.last_error = "shared-memory pixel write failed"
@@ -1045,10 +1138,25 @@ struct WaylandWindow(Copyable, Movable):
             wl_append32(body, 0)  # no region: lock anywhere on the surface
             wl_append32(body, 2)  # persistent lifetime
             _ = self.request(self.pointer_constraints, 1, body)
+            self.pointer_locked = True
+            self.hide_cursor()
         elif not active and self.locked_pointer != 0:
             _ = self.empty_request(self.locked_pointer, 0)
             self.locked_pointer = 0
             self.pointer_locked = False
+
+    def hide_cursor(mut self):
+        if self.using_kms:
+            self.kms.hide_cursor()
+            return
+        if self.pointer == 0 or self.pointer_enter_serial == 0:
+            return
+        var body = List[UInt8]()
+        wl_append32(body, self.pointer_enter_serial)
+        wl_append32(body, 0)
+        wl_append32(body, 0)
+        wl_append32(body, 0)
+        _ = self.request(self.pointer, 0, body)
 
     def toggle_fullscreen(mut self):
         if self.using_kms:

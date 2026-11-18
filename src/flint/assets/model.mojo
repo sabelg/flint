@@ -72,11 +72,20 @@ struct NativeMesh(Copyable, Movable):
     var weights: List[Float32]
     var texture: Int
     var normal_orm_texture: Int
+    var orm_texture: Int
     var base_color: UInt32
     var roughness: Float32
     var metallic: Float32
     var emissive_color: Vec3
     var emissive_strength: Float32
+    var clearcoat: Float32
+    var clearcoat_roughness: Float32
+    var specular_factor: Float32
+    var iridescence: Float32
+    var iridescence_thickness_nm: Float32
+    var iridescence_ior: Float32
+    var sheen_color: Vec3
+    var sheen_roughness: Float32
     var skin: Int
     var alpha_mode: Int
     var double_sided: Bool
@@ -102,11 +111,20 @@ struct NativeMesh(Copyable, Movable):
         self.weights = List[Float32]()
         self.texture = -1
         self.normal_orm_texture = -1
+        self.orm_texture = -1
         self.base_color = 0xFFFFFFFF
         self.roughness = 0.55
         self.metallic = 0.0
         self.emissive_color = Vec3(1, 1, 1)
         self.emissive_strength = 0
+        self.clearcoat = 0.0
+        self.clearcoat_roughness = 0.08
+        self.specular_factor = 1.0
+        self.iridescence = 0.0
+        self.iridescence_thickness_nm = 380.0
+        self.iridescence_ior = 1.65
+        self.sheen_color = Vec3(0.0, 0.0, 0.0)
+        self.sheen_roughness = 0.5
         self.skin = -1
         self.alpha_mode = 0
         self.double_sided = False
@@ -175,12 +193,18 @@ struct NativeMesh(Copyable, Movable):
         return self.vertex_count() // 3
 
 
+comptime INTERP_LINEAR: UInt8 = 0
+comptime INTERP_STEP: UInt8 = 1
+comptime INTERP_CUBICSPLINE: UInt8 = 2
+
+
 struct NativeChannel(Copyable, Movable):
     var node: Int
     var path: Int
     var times: List[Float32]
     var values: List[Float32]
     var step: Bool
+    var interp_mode: UInt8
 
     def __init__(out self):
         self.node = -1
@@ -188,6 +212,7 @@ struct NativeChannel(Copyable, Movable):
         self.times = List[Float32]()
         self.values = List[Float32]()
         self.step = False
+        self.interp_mode = INTERP_LINEAR
 
 
 struct NativeAnimation(Copyable, Movable):
@@ -268,6 +293,7 @@ struct NativeModel(Copyable, Movable):
     var cached_revision: Int
     var anim: InertialState
     var parents: List[Int]
+    var topo_order: List[Int]
     var max_influences: Int
     var morph_names: List[String]
     # Package 3.4: how far each morph target is applied, by morph_names
@@ -294,6 +320,7 @@ struct NativeModel(Copyable, Movable):
         self.cached_revision = -1
         self.anim = InertialState()
         self.parents = List[Int]()
+        self.topo_order = List[Int]()
         self.max_influences = 0
         self.morph_names = List[String]()
         self.morph_weights = List[Float32]()
@@ -368,11 +395,19 @@ struct NativeModel(Copyable, Movable):
         comptime CLOSE: Float32 = 0.000001
         var components = 4 if channel.path == 1 else 3
         var keys = len(channel.times)
-        if keys == 0 or len(channel.values) < keys * components:
+        var cubic = channel.interp_mode == INTERP_CUBICSPLINE
+        var stride = components * 3 if cubic else components
+        if keys == 0 or len(channel.values) < keys * stride:
             return False
         ref rest = self.nodes[node]
         for key in range(keys):
-            var at = key * components
+            var at = key * stride + (components if cubic else 0)
+            if cubic:
+                var in_at = key * stride
+                var out_at = key * stride + components * 2
+                for c in range(components):
+                    if abs(channel.values[in_at + c]) > CLOSE or abs(channel.values[out_at + c]) > CLOSE:
+                        return False
             if channel.path == 0:
                 if abs(channel.values[at] - rest.base_translation.x) > CLOSE or abs(channel.values[at + 1] - rest.base_translation.y) > CLOSE or abs(channel.values[at + 2] - rest.base_translation.z) > CLOSE:
                     return False
@@ -600,13 +635,40 @@ struct NativeModel(Copyable, Movable):
         return -1
 
     def ensure_parents(mut self):
-        if len(self.parents) == len(self.nodes):
+        if len(self.parents) == len(self.nodes) and len(self.topo_order) == len(self.nodes):
             return
-        self.parents = List[Int](length=len(self.nodes), fill=-1)
-        for index in range(len(self.nodes)):
+        var n = len(self.nodes)
+        self.parents = List[Int](length=n, fill=-1)
+        for index in range(n):
             for child in self.nodes[index].children:
-                if child >= 0 and child < len(self.nodes):
+                if child >= 0 and child < n and child != index:
                     self.parents[child] = index
+        self.topo_order = List[Int](capacity=n)
+        var visited = List[Bool](length=n, fill=False)
+        for root in self.roots:
+            if root >= 0 and root < n and self.parents[root] < 0 and not visited[root]:
+                visited[root] = True
+                self.topo_order.append(root)
+        for index in range(n):
+            if self.parents[index] < 0 and not visited[index]:
+                visited[index] = True
+                self.topo_order.append(index)
+        var cursor = 0
+        while cursor < len(self.topo_order):
+            var u = self.topo_order[cursor]
+            cursor += 1
+            for child in self.nodes[u].children:
+                if child >= 0 and child < n and not visited[child]:
+                    visited[child] = True
+                    self.topo_order.append(child)
+        for index in range(n):
+            if not visited[index]:
+                visited[index] = True
+                self.topo_order.append(index)
+
+    def ensure_topology(mut self):
+        """Precomputes cached `parents` and parent-before-child `topo_order`."""
+        self.ensure_parents()
 
     def global_rotation(mut self, node: Int) -> Quat:
         self.ensure_parents()
@@ -702,23 +764,78 @@ struct NativeModel(Copyable, Movable):
         ref clip = self.animations[animation]
         var time = max(Float32(0), min(self.active_time, clip.duration))
         for channel in clip.channels:
-            if channel.node < 0 or channel.node >= len(self.nodes) or len(channel.times) == 0:
+            var key_count = len(channel.times)
+            if channel.node < 0 or channel.node >= len(self.nodes) or key_count == 0:
                 continue
-            var lower_bound = 0
-            var upper_bound = len(channel.times) - 1
-            while lower_bound + 1 < upper_bound:
-                var middle = (lower_bound + upper_bound) // 2
-                if channel.times[middle] < time:
-                    lower_bound = middle
+            var lower = 0
+            var next = 0
+            if key_count > 1:
+                if time <= channel.times[0]:
+                    lower = 0
+                    next = 0
+                elif time >= channel.times[key_count - 1]:
+                    lower = key_count - 1
+                    next = lower
                 else:
-                    upper_bound = middle
-            var upper = lower_bound
-            var lower = max(0, min(len(channel.times) - 1, upper))
-            var next = min(len(channel.times) - 1, lower + 1)
+                    var lower_bound = 0
+                    var upper_bound = key_count - 1
+                    while lower_bound + 1 < upper_bound:
+                        var middle = (lower_bound + upper_bound) // 2
+                        if channel.times[middle] <= time:
+                            lower_bound = middle
+                        else:
+                            upper_bound = middle
+                    lower = lower_bound
+                    next = upper_bound
+            var is_step = channel.step or channel.interp_mode == INTERP_STEP
+            var is_cubic = (not is_step) and channel.interp_mode == INTERP_CUBICSPLINE
+            var dt_seg = channel.times[next] - channel.times[lower]
             var amount = Float32(0)
-            if not channel.step and next != lower and channel.times[next] > channel.times[lower]:
-                amount = max(Float32(0), min(Float32(1), (time - channel.times[lower]) / (channel.times[next] - channel.times[lower])))
+            if not is_step and next != lower and dt_seg > Float32(0):
+                amount = max(Float32(0), min(Float32(1), (time - channel.times[lower]) / dt_seg))
             var components = 4 if channel.path == 1 else 3
+            if is_cubic:
+                var stride = components * 3
+                var v0_at = lower * stride + components
+                var out_tan0_at = lower * stride + components * 2
+                var in_tan1_at = next * stride
+                var v1_at = next * stride + components
+                if v0_at + components > len(channel.values) or v1_at + components > len(channel.values):
+                    continue
+                if next == lower or dt_seg <= Float32(0):
+                    if channel.path == 0:
+                        self.nodes[channel.node].translation = Vec3(channel.values[v0_at], channel.values[v0_at + 1], channel.values[v0_at + 2])
+                    elif channel.path == 1:
+                        self.nodes[channel.node].rotation = Quat(channel.values[v0_at], channel.values[v0_at + 1], channel.values[v0_at + 2], channel.values[v0_at + 3]).normalized()
+                    else:
+                        self.nodes[channel.node].scale = Vec3(channel.values[v0_at], channel.values[v0_at + 1], channel.values[v0_at + 2])
+                else:
+                    var s2 = amount * amount
+                    var s3 = s2 * amount
+                    var h00 = Float32(2.0) * s3 - Float32(3.0) * s2 + Float32(1.0)
+                    var h10 = (s3 - Float32(2.0) * s2 + amount) * dt_seg
+                    var h01 = Float32(-2.0) * s3 + Float32(3.0) * s2
+                    var h11 = (s3 - s2) * dt_seg
+                    if channel.path == 0:
+                        self.nodes[channel.node].translation = Vec3(
+                            h00 * channel.values[v0_at] + h10 * channel.values[out_tan0_at] + h01 * channel.values[v1_at] + h11 * channel.values[in_tan1_at],
+                            h00 * channel.values[v0_at + 1] + h10 * channel.values[out_tan0_at + 1] + h01 * channel.values[v1_at + 1] + h11 * channel.values[in_tan1_at + 1],
+                            h00 * channel.values[v0_at + 2] + h10 * channel.values[out_tan0_at + 2] + h01 * channel.values[v1_at + 2] + h11 * channel.values[in_tan1_at + 2],
+                        )
+                    elif channel.path == 1:
+                        self.nodes[channel.node].rotation = Quat(
+                            h00 * channel.values[v0_at] + h10 * channel.values[out_tan0_at] + h01 * channel.values[v1_at] + h11 * channel.values[in_tan1_at],
+                            h00 * channel.values[v0_at + 1] + h10 * channel.values[out_tan0_at + 1] + h01 * channel.values[v1_at + 1] + h11 * channel.values[in_tan1_at + 1],
+                            h00 * channel.values[v0_at + 2] + h10 * channel.values[out_tan0_at + 2] + h01 * channel.values[v1_at + 2] + h11 * channel.values[in_tan1_at + 2],
+                            h00 * channel.values[v0_at + 3] + h10 * channel.values[out_tan0_at + 3] + h01 * channel.values[v1_at + 3] + h11 * channel.values[in_tan1_at + 3],
+                        ).normalized()
+                    else:
+                        self.nodes[channel.node].scale = Vec3(
+                            h00 * channel.values[v0_at] + h10 * channel.values[out_tan0_at] + h01 * channel.values[v1_at] + h11 * channel.values[in_tan1_at],
+                            h00 * channel.values[v0_at + 1] + h10 * channel.values[out_tan0_at + 1] + h01 * channel.values[v1_at + 1] + h11 * channel.values[in_tan1_at + 1],
+                            h00 * channel.values[v0_at + 2] + h10 * channel.values[out_tan0_at + 2] + h01 * channel.values[v1_at + 2] + h11 * channel.values[in_tan1_at + 2],
+                        )
+                continue
             var first = lower * components
             var second = next * components
             if first + components > len(channel.values) or second + components > len(channel.values):
@@ -750,20 +867,27 @@ struct NativeModel(Copyable, Movable):
         for child in children:
             self.compute_node(child, transform, output, visited)
 
-    def global_transforms(mut self) -> List[Mat4]:
-        if self.cached_revision == self.transforms_revision and len(self.cached_transforms) == len(self.nodes):
-            return self.cached_transforms.copy()
-        var output = List[Mat4](length=len(self.nodes), fill=Mat4())
-        var visited = List[Bool](length=len(self.nodes), fill=False)
-        var identity = Mat4()
-        for root in self.roots:
-            self.compute_node(root, identity, output, visited)
-        for index in range(len(self.nodes)):
-            if not visited[index]:
-                self.compute_node(index, identity, output, visited)
-        self.cached_transforms = output.copy()
+    def update_cached_transforms(mut self):
+        """Zero-allocation topological forward kinematics update into `self.cached_transforms`."""
+        var n = len(self.nodes)
+        if self.cached_revision == self.transforms_revision and len(self.cached_transforms) == n:
+            return
+        self.ensure_topology()
+        if len(self.cached_transforms) != n:
+            self.cached_transforms = List[Mat4](length=n, fill=Mat4())
+        for idx in range(n):
+            var node = self.topo_order[idx]
+            var local = self.nodes[node].local_transform()
+            var p = self.parents[node]
+            if p >= 0:
+                self.cached_transforms[node] = self.cached_transforms[p].multiply(local)
+            else:
+                self.cached_transforms[node] = local^
         self.cached_revision = self.transforms_revision
-        return output^
+
+    def global_transforms(mut self) -> List[Mat4]:
+        self.update_cached_transforms()
+        return self.cached_transforms.copy()
 
     def mesh_bounds(self, mesh: Int) -> List[Float32]:
         if mesh < 0 or mesh >= len(self.meshes) or self.meshes[mesh].vertex_count() == 0:

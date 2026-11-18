@@ -1,5 +1,6 @@
-"""Native baseline sequential JPEG decoder for embedded SHARDDEPTH textures."""
-from flint.assets.image import NativeImage
+"""Native baseline sequential JPEG decoder/encoder & unified PNG/JPEG auto-decoder."""
+from std.math import cos, max, min, sqrt
+from flint.assets.image import NativeImage, decode_png
 
 
 def jpeg_be16(data: List[UInt8], offset: Int) -> Int:
@@ -466,3 +467,253 @@ def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
             return image^
         offset = end
     return image^
+
+
+def decode_image_auto(data: List[UInt8], maximum_size: Int = 4096) -> NativeImage:
+    """Automatically decodes either an embedded baseline JPEG (`0xFF 0xD8`) or PNG (`0x89 'P' 'N' 'G'`) byte stream."""
+    if len(data) >= 2 and Int(data[0]) == 0xFF and Int(data[1]) == 0xD8:
+        return decode_jpeg(data, maximum_size)
+    return decode_png(data, maximum_size)
+
+
+struct _JpegBitWriter(Movable):
+    var out: List[UInt8]
+    var buf: UInt32
+    var count: Int
+
+    def __init__(out self):
+        self.out = List[UInt8]()
+        self.buf = 0
+        self.count = 0
+
+    @always_inline
+    def write_bits(mut self, code: Int, nbits: Int):
+        self.buf = (self.buf << UInt32(nbits)) | UInt32(code & ((1 << nbits) - 1))
+        self.count += nbits
+        while self.count >= 8:
+            self.count -= 8
+            var b = UInt8((self.buf >> UInt32(self.count)) & 0xFF)
+            self.out.append(b)
+            if b == 0xFF:
+                self.out.append(0x00)
+
+    def flush(mut self):
+        if self.count > 0:
+            var pad = 8 - self.count
+            self.write_bits((1 << pad) - 1, pad)
+        self.count = 0
+        self.buf = 0
+
+
+@always_inline
+def _jpeg_bit_category(v: Int) -> Tuple[Int, Int]:
+    if v == 0:
+        return (0, 0)
+    var av = abs(v)
+    var cat = 0
+    var tmp = av
+    while tmp > 0:
+        cat += 1
+        tmp >>= 1
+    var mag = v if v > 0 else (v + (1 << cat) - 1)
+    return (cat, mag)
+
+
+def _build_huff_enc_codes[N_SYMS: Int](counts: Array[Int, 16], syms: Array[Int, N_SYMS]) -> Tuple[List[Int], List[Int]]:
+    var codes = List[Int](length=256, fill=0)
+    var lens = List[Int](length=256, fill=0)
+    var code = 0
+    var idx = 0
+    for length in range(1, 17):
+        var c = counts[length - 1]
+        for _ in range(c):
+            var sym = syms[idx]
+            codes[sym] = code
+            lens[sym] = length
+            code += 1
+            idx += 1
+        code <<= 1
+    return (codes^, lens^)
+
+
+def encode_jpeg_baseline(pixels: List[UInt32], width: Int, height: Int, quality: Int = 92) -> List[UInt8]:
+    """Pure-Mojo ITU-T.81 Baseline Sequential (`SOF0`, `4:4:4` YCbCr) JPEG encoder with Annex K Huffman tables."""
+    var res = List[UInt8]()
+    if width <= 0 or height <= 0 or len(pixels) < width * height:
+        return res^
+
+    var q_clamped = max(10, min(100, quality))
+    var q_scale = (5000 // q_clamped) if q_clamped < 50 else (200 - 2 * q_clamped)
+    var std_lum_q = [
+        16, 11, 10, 16, 24, 40, 51, 61,
+        12, 12, 14, 19, 26, 58, 60, 55,
+        14, 13, 16, 24, 40, 57, 69, 56,
+        14, 17, 22, 29, 51, 87, 80, 62,
+        18, 22, 37, 56, 68, 109, 103, 77,
+        24, 35, 55, 64, 81, 104, 113, 92,
+        49, 64, 78, 87, 103, 121, 120, 101,
+        72, 92, 95, 98, 112, 100, 103, 99,
+    ]
+    var qtbl_spatial = List[Float32](length=64, fill=1.0)
+    var qtbl_zz = List[UInt8](length=64, fill=1)
+    for k in range(64):
+        var sp = jpeg_zigzag(k)
+        var qv = max(1, min(255, (std_lum_q[sp] * q_scale + 50) // 100))
+        qtbl_spatial[sp] = Float32(qv)
+        qtbl_zz[k] = UInt8(qv)
+
+    # ITU-T.81 Annex K.3 Standard Luminance DC & AC Huffman tables
+    var dc_counts = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+    var dc_syms = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    var ac_counts = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125]
+    var ac_syms = [
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+        0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+        0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+        0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+        0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+        0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+        0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+        0xF9, 0xFA,
+    ]
+    var dc_enc = _build_huff_enc_codes(dc_counts, dc_syms)
+    var dc_codes = dc_enc[0].copy()
+    var dc_lens = dc_enc[1].copy()
+    var ac_enc = _build_huff_enc_codes(ac_counts, ac_syms)
+    var ac_codes = ac_enc[0].copy()
+    var ac_lens = ac_enc[1].copy()
+
+    # Precompute 8x8 separable FDCT cosine basis `C[u * 8 + x]`
+    var cos_tbl = List[Float32](length=64, fill=0.0)
+    var inv_sqrt2 = Float32(1.0) / sqrt(Float32(2.0))
+    for u in range(8):
+        var cu = inv_sqrt2 if u == 0 else Float32(1.0)
+        for x in range(8):
+            cos_tbl[u * 8 + x] = Float32(0.5) * cu * cos((Float32(2 * x + 1) * Float32(u) * Float32(3.1415926535)) / Float32(16.0))
+
+    # 1. SOI + JFIF APP0
+    res.append(0xFF); res.append(0xD8)
+    var app0 = [0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00]
+    for b in app0:
+        res.append(UInt8(b))
+
+    # 2. DQT (table 0 shared across Y, Cb, Cr)
+    res.append(0xFF); res.append(0xDB); res.append(0x00); res.append(67); res.append(0x00)
+    for k in range(64):
+        res.append(qtbl_zz[k])
+
+    # 3. SOF0 (Baseline 8-bit 4:4:4 3-component YCbCr)
+    res.append(0xFF); res.append(0xC0); res.append(0x00); res.append(17); res.append(8)
+    res.append(UInt8((height >> 8) & 0xFF)); res.append(UInt8(height & 0xFF))
+    res.append(UInt8((width >> 8) & 0xFF)); res.append(UInt8(width & 0xFF))
+    res.append(3)
+    res.append(1); res.append(0x11); res.append(0)
+    res.append(2); res.append(0x11); res.append(0)
+    res.append(3); res.append(0x11); res.append(0)
+
+    # 4. DHT (DC table 0 + AC table 0)
+    var dc_len = 2 + 1 + 16 + len(dc_syms)
+    res.append(0xFF); res.append(0xC4); res.append(UInt8((dc_len >> 8) & 0xFF)); res.append(UInt8(dc_len & 0xFF))
+    res.append(0x00)
+    for c in dc_counts: res.append(UInt8(c))
+    for s in dc_syms: res.append(UInt8(s))
+
+    var ac_len = 2 + 1 + 16 + len(ac_syms)
+    res.append(0xFF); res.append(0xC4); res.append(UInt8((ac_len >> 8) & 0xFF)); res.append(UInt8(ac_len & 0xFF))
+    res.append(0x10)
+    for c in ac_counts: res.append(UInt8(c))
+    for s in ac_syms: res.append(UInt8(s))
+
+    # 5. SOS
+    var sos = [0xFF, 0xDA, 0x00, 12, 3, 1, 0x00, 2, 0x00, 3, 0x00, 0, 63, 0]
+    for b in sos:
+        res.append(UInt8(b))
+
+    var bw = _JpegBitWriter()
+    var prev_dc = [0, 0, 0]
+    var blk = List[Float32](length=64, fill=0.0)
+    var tmp = List[Float32](length=64, fill=0.0)
+    var zz_q = List[Int](length=64, fill=0)
+
+    var mcu_w = (width + 7) // 8
+    var mcu_h = (height + 7) // 8
+
+    for my in range(mcu_h):
+        for mx in range(mcu_w):
+            for ch in range(3):
+                for py in range(8):
+                    var sy = min(height - 1, my * 8 + py)
+                    for px in range(8):
+                        var sx = min(width - 1, mx * 8 + px)
+                        var argb = pixels[sy * width + sx]
+                        var r = Float32((argb >> 16) & 0xFF)
+                        var g = Float32((argb >> 8) & 0xFF)
+                        var b = Float32(argb & 0xFF)
+                        var sample: Float32
+                        if ch == 0:
+                            sample = (Float32(0.299) * r + Float32(0.587) * g + Float32(0.114) * b) - Float32(128.0)
+                        elif ch == 1:
+                            sample = (Float32(-0.168736) * r - Float32(0.331264) * g + Float32(0.5) * b)
+                        else:
+                            sample = (Float32(0.5) * r - Float32(0.418688) * g - Float32(0.081312) * b)
+                        blk[py * 8 + px] = sample
+
+                # Separable 2D FDCT: rows then cols
+                for row in range(8):
+                    for u in range(8):
+                        var acc = Float32(0.0)
+                        for x in range(8):
+                            acc += blk[row * 8 + x] * cos_tbl[u * 8 + x]
+                        tmp[row * 8 + u] = acc
+
+                for col in range(8):
+                    for v in range(8):
+                        var acc = Float32(0.0)
+                        for y in range(8):
+                            acc += tmp[y * 8 + col] * cos_tbl[v * 8 + y]
+                        var sp = v * 8 + col
+                        var qf = acc / qtbl_spatial[sp]
+                        var qi = Int(qf + Float32(0.5)) if qf >= Float32(0.0) else -Int(-qf + Float32(0.5))
+                        blk[sp] = Float32(qi)
+
+                for k in range(64):
+                    zz_q[k] = max(-1023, min(1023, Int(blk[jpeg_zigzag(k)])))
+
+                # Encode DC diff
+                var diff = zz_q[0] - prev_dc[ch]
+                prev_dc[ch] = zz_q[0]
+                var dc_cm = _jpeg_bit_category(diff)
+                bw.write_bits(dc_codes[dc_cm[0]], dc_lens[dc_cm[0]])
+                if dc_cm[0] > 0:
+                    bw.write_bits(dc_cm[1], dc_cm[0])
+
+                # Encode AC RLE
+                var last_nz = 0
+                for k in range(1, 64):
+                    if zz_q[k] != 0:
+                        last_nz = k
+                var run = 0
+                for k in range(1, last_nz + 1):
+                    var val = zz_q[k]
+                    if val == 0:
+                        run += 1
+                    else:
+                        while run >= 16:
+                            bw.write_bits(ac_codes[0xF0], ac_lens[0xF0])
+                            run -= 16
+                        var ac_cm = _jpeg_bit_category(val)
+                        var rs = (run << 4) | ac_cm[0]
+                        bw.write_bits(ac_codes[rs], ac_lens[rs])
+                        bw.write_bits(ac_cm[1], ac_cm[0])
+                        run = 0
+                if last_nz < 63:
+                    bw.write_bits(ac_codes[0x00], ac_lens[0x00])  # EOB
+
+    bw.flush()
+    for b in bw.out:
+        res.append(b)
+    res.append(0xFF); res.append(0xD9)
+    return res^

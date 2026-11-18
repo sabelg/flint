@@ -6,7 +6,7 @@ missile smoke plumes intersect, and illuminates volumetric plumes directionally 
 all 6 cardinal axes (`+X, -X, +Y, -Y, +Z, -Z`) with Henyey-Greenstein phase scattering
 and Beer-Powder dark-edge self-shadowing.
 """
-from std.math import exp, max, min, sqrt
+from std.math import exp, max, min, sin, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
@@ -42,6 +42,7 @@ struct AaaVolumetricPlume(Copyable, Movable):
     var density: Float32
     var emission: Vec3
     var is_glass: Bool
+    var is_hologram: Bool
 
     def __init__(
         out self,
@@ -51,6 +52,7 @@ struct AaaVolumetricPlume(Copyable, Movable):
         density: Float32 = 0.75,
         emission: Vec3 = Vec3(0.0, 0.0, 0.0),
         is_glass: Bool = False,
+        is_hologram: Bool = False,
     ):
         self.center = center
         self.radius = radius
@@ -58,6 +60,25 @@ struct AaaVolumetricPlume(Copyable, Movable):
         self.density = density
         self.emission = emission
         self.is_glass = is_glass
+        self.is_hologram = is_hologram
+
+    @staticmethod
+    def hologram(
+        center: Vec3,
+        radius: Float32,
+        tint: Vec3 = Vec3(0.15, 0.85, 1.0),
+        density: Float32 = 0.55,
+        emission: Vec3 = Vec3(0.35, 1.40, 2.20),
+    ) -> AaaVolumetricPlume:
+        return AaaVolumetricPlume(
+            center=center,
+            radius=radius,
+            scatter_albedo=tint,
+            density=density,
+            emission=emission,
+            is_glass=True,
+            is_hologram=True,
+        )
 
     def append_words(self, mut out: List[UInt32]):
         out.append(bitcast[DType.uint32](self.center.x))
@@ -71,7 +92,21 @@ struct AaaVolumetricPlume(Copyable, Movable):
         out.append(bitcast[DType.uint32](self.emission.x))
         out.append(bitcast[DType.uint32](self.emission.y))
         out.append(bitcast[DType.uint32](self.emission.z))
-        out.append(UInt32(1) if self.is_glass else UInt32(0))
+        var kind_u = UInt32(2) if self.is_hologram else (UInt32(1) if self.is_glass else UInt32(0))
+        out.append(kind_u)
+
+
+def eval_hologram_fresnel_rim_cpu(chord_norm: Float32, world_y: Float32) -> Tuple[Float32, Float32]:
+    """CPU reference for Fresnel Rim Hologram Grazing Modulation (`(alpha_scale, emission_scale)`).
+    Translucent core (`chord_norm -> 1.0`) + glowing grazing Fresnel silhouette (`chord_norm -> 0.0`).
+    """
+    var cos_v = max(Float32(0.0), min(Float32(1.0), chord_norm))
+    var omc = Float32(1.0) - cos_v
+    var rim_pow = omc * omc * sqrt(max(Float32(1e-4), omc))
+    var scan = Float32(0.82) + Float32(0.18) * sin(world_y * Float32(42.0))
+    var alpha_scale = Float32(0.20) + Float32(0.80) * rim_pow
+    var em_scale = (Float32(0.14) + Float32(0.86) * rim_pow) * scan
+    return (alpha_scale, em_scale)
 
 
 def eval_6way_lightmap_plume_cpu(
@@ -136,12 +171,15 @@ def oit_and_6way_volumetric_shader() -> List[UInt32]:
     var w_u = s.push_word(0)
     var h_u = s.push_word(1)
     var prim_cnt = s.push_word(2)
+    var preserve_reactive = s.ine(s.push_word(3), s.uint(0))
     s.return_if(s.logical_or(s.uge(px, w_u), s.uge(py, h_u)))
 
     var pix_idx = s.iadd(s.imul(py, w_u), px)
     var react_off = s.iadd(s.uint(UInt32(AAA_OIT_REACTIVE_BASE_WORDS)), pix_idx)
     s.begin_if(s.ieq(prim_cnt, s.uint(0)))
+    s.begin_if(s.logical_not(preserve_reactive))
     s.store_float(b_oit, react_off, s.float(0.0))
+    s.end_if()
     s.end_if()
     s.return_if(s.ieq(prim_cnt, s.uint(0)))
 
@@ -167,6 +205,10 @@ def oit_and_6way_volumetric_shader() -> List[UInt32]:
     var sun_r = s.load_float(b_globals, s.uint(52))
     var sun_g = s.load_float(b_globals, s.uint(53))
     var sun_b = s.load_float(b_globals, s.uint(54))
+    var ibl_int = s.load_float(b_globals, s.uint(55))
+    var amb_sky_r = s.fmul(s.load_float(b_globals, s.uint(72)), s.fmul(ibl_int, s.float(0.35)))
+    var amb_sky_g = s.fmul(s.load_float(b_globals, s.uint(73)), s.fmul(ibl_int, s.float(0.35)))
+    var amb_sky_b = s.fmul(s.load_float(b_globals, s.uint(74)), s.fmul(ibl_int, s.float(0.35)))
 
     var ndc_x = s.fsub(s.fmul(s.fdiv(s.fadd(s.float_from_uint(px), s.float(0.5)), fw), s.float(2.0)), s.float(1.0))
     var ndc_y = s.fsub(s.float(1.0), s.fmul(s.fdiv(s.fadd(s.float_from_uint(py), s.float(0.5)), fh), s.float(2.0)))
@@ -221,18 +263,36 @@ def oit_and_6way_volumetric_shader() -> List[UInt32]:
     var em_b = s.load_float(b_oit, s.iadd(p_off, s.uint(10)))
 
     var chord_norm = s.fdiv(thc, s.nmax(s.float(1e-4), rad))
-    var tau = s.fmul(dens, s.fmul(chord_norm, s.float(2.2)))
+    var chord_smooth = s.fmul(chord_norm, s.fmul(chord_norm, chord_norm))
+    var tau = s.fmul(dens, s.fmul(chord_smooth, s.float(2.2)))
     var one_m_exp = s.fsub(s.float(1.0), s.exp2(s.fneg(s.fmul(tau, s.float(1.442695)))))
+    var is_sheet = s.uge(kind, s.uint(1))
+    var em_sum = s.fadd(em_r, s.fadd(em_g, em_b))
+    var is_holo = s.logical_or(s.ieq(kind, s.uint(2)), s.logical_and(s.ieq(kind, s.uint(1)), s.fgt(em_sum, s.float(0.20))))
+
+    var hit_wx = s.fma(rd[0], t_mid, cam_x)
+    var hit_wy = s.fma(rd[1], t_mid, cam_y)
+    var hit_wz = s.fma(rd[2], t_mid, cam_z)
+
+    # Fresnel Rim Hologram Grazing Modulation: translucent core + glowing silhouette rim + scanlines
+    var cos_v_h = s.nclamp(chord_norm, s.float(0.0), s.float(1.0))
+    var omc_h = s.fsub(s.float(1.0), cos_v_h)
+    var rim_pow = s.fmul(omc_h, s.fmul(omc_h, s.fsqrt(s.nmax(s.float(1e-4), omc_h))))
+    var scan_h = s.fma(s.float(0.18), s.fsin(s.fmul(hit_wy, s.float(42.0))), s.float(0.82))
+    var holo_a_mul = s.select_f(is_holo, s.fma(s.float(0.80), rim_pow, s.float(0.20)), s.float(1.0))
+    var holo_e_mul = s.select_f(is_holo, s.fmul(s.fma(s.float(0.86), rim_pow, s.float(0.14)), scan_h), s.float(1.0))
+
+    var base_frag_a = s.select_f(is_sheet, s.fmul(dens, soft_fade), s.fmul(one_m_exp, soft_fade))
     var frag_a = s.nclamp(
-        s.select_f(s.ieq(kind, s.uint(1)), s.fmul(dens, soft_fade), s.fmul(one_m_exp, soft_fade)),
+        s.fmul(base_frag_a, holo_a_mul),
         s.float(0.0),
         s.float(0.98),
     )
 
     # 6-Way Lightmap (`RLUDBF`) + Beer-Powder self-shadowing + Henyey-Greenstein phase!
-    var hit_x = s.fsub(s.fma(rd[0], t_mid, cam_x), cx)
-    var hit_y = s.fsub(s.fma(rd[1], t_mid, cam_y), cy)
-    var hit_z = s.fsub(s.fma(rd[2], t_mid, cam_z), cz)
+    var hit_x = s.fsub(hit_wx, cx)
+    var hit_y = s.fsub(hit_wy, cy)
+    var hit_z = s.fsub(hit_wz, cz)
     var inv_r = s.fdiv(s.float(1.0), s.nmax(s.float(1e-4), rad))
     var ux = s.fmul(hit_x, inv_r); var uy = s.fmul(hit_y, inv_r); var uz = s.fmul(hit_z, inv_r)
 
@@ -245,18 +305,117 @@ def oit_and_6way_volumetric_shader() -> List[UInt32]:
     )
     var beer = s.exp2(s.fneg(s.fmul(dir_tau, s.float(1.442695))))
     var powder = s.fsub(s.float(1.0), s.exp2(s.fneg(s.fmul(dir_tau, s.float(2.88539)))))
-    var bp_light = s.select_f(s.ieq(kind, s.uint(1)), s.float(1.0), s.fma(s.float(1.78), s.fmul(beer, powder), s.float(0.25)))
+    var bp_light = s.select_f(is_sheet, s.float(1.0), s.fma(s.float(1.78), s.fmul(beer, powder), s.float(0.25)))
 
     var cos_th = emit_vec3_dot(s, rd[0], rd[1], rd[2], sun_x, sun_y, sun_z)
     var hg_boost = s.fma(s.float(0.45), s.nmax(s.float(0.0), cos_th), s.float(0.75))
-    var lit_scale = s.fmul(bp_light, hg_boost)
+    var lit_scale = s.select_f(is_holo, s.float(0.18), s.fmul(bp_light, hg_boost))
 
-    var col_r = s.fma(sc_r, s.fmul(sun_r, lit_scale), em_r)
-    var col_g = s.fma(sc_g, s.fmul(sun_g, lit_scale), em_g)
-    var col_b = s.fma(sc_b, s.fmul(sun_b, lit_scale), em_b)
-    var pm_r = s.fmul(col_r, frag_a)
-    var pm_g = s.fmul(col_g, frag_a)
-    var pm_b = s.fmul(col_b, frag_a)
+    # Soft-knee highlight compression on hologram core emission so `.flrp` ghosts never blow out solid white
+    var em_peak = s.nmax(em_r, s.nmax(em_g, em_b))
+    var holo_knee = s.select_f(is_holo, s.fdiv(holo_e_mul, s.fma(em_peak, s.float(0.22), s.float(1.0))), s.float(1.0))
+    var eff_em_r = s.fmul(em_r, holo_knee)
+    var eff_em_g = s.fmul(em_g, holo_knee)
+    var eff_em_b = s.fmul(em_b, holo_knee)
+
+    var col_r = s.fma(sc_r, s.fmul(sun_r, lit_scale), eff_em_r)
+    var col_g = s.fma(sc_g, s.fmul(sun_g, lit_scale), eff_em_g)
+    var col_b = s.fma(sc_b, s.fmul(sun_b, lit_scale), eff_em_b)
+    var pm_r_v = s.fvar(s.fmul(col_r, frag_a))
+    var pm_g_v = s.fvar(s.fmul(col_g, frag_a))
+    var pm_b_v = s.fvar(s.fmul(col_b, frag_a))
+    var frag_a_v = s.fvar(frag_a)
+
+    # Pyroclastic 4-Step Stratified 3D Billow FBM Raymarch + Blackbody Core-to-Carbon-Soot (`kind == 0`)!
+    s.begin_if(s.logical_not(is_sheet))
+    var cos_fwd_p = s.nmax(s.float(0.05), emit_vec3_dot(s, rd[0], rd[1], rd[2], fwd_x, fwd_y, fwd_z))
+    var t_opaq = s.fdiv(opaque_z, cos_fwd_p)
+    var t_en = s.nmax(s.float(0.05), s.fsub(t_ca, thc))
+    var t_ex = s.nmin(t_opaq, s.fadd(t_ca, thc))
+    var seg_len = s.nmax(s.float(0.0), s.fsub(t_ex, t_en))
+    var ds_p = s.fmul(seg_len, s.float(0.25))
+    var ds_norm = s.fdiv(ds_p, s.nmax(s.float(1e-4), rad))
+    var is_fire = s.fgt(em_peak, s.float(0.25))
+
+    var tr_p = s.fvar(s.float(1.0))
+    var pr_acc = s.fvar(s.float(0.0))
+    var pg_acc = s.fvar(s.float(0.0))
+    var pb_acc = s.fvar(s.float(0.0))
+
+    for st_i in range(4):
+        var t_s = s.fma(s.float(Float32(st_i) * Float32(0.25) + Float32(0.125)), seg_len, t_en)
+        var sx_w = s.fma(rd[0], t_s, cam_x)
+        var sy_w = s.fma(rd[1], t_s, cam_y)
+        var sz_w = s.fma(rd[2], t_s, cam_z)
+        var lx_p = s.fmul(s.fsub(sx_w, cx), inv_r)
+        var ly_p = s.fmul(s.fsub(sy_w, cy), inv_r)
+        var lz_p = s.fmul(s.fsub(sz_w, cz), inv_r)
+        var r_p = s.fsqrt(s.nmax(s.float(0.0), s.fma(lx_p, lx_p, s.fma(ly_p, ly_p, s.fmul(lz_p, lz_p)))))
+
+        # Buoyant 3-octave 3D Billow FBM (`1 - |sin * cos|`) anchored deterministically to `(cx, cy, cz, rad)`!
+        var qx = s.fma(lx_p, s.float(2.95), s.fmul(cx, s.float(0.37)))
+        var qy = s.fsub(s.fma(ly_p, s.float(2.95), s.fmul(cy, s.float(0.37))), s.fmul(rad, s.float(1.35)))
+        var qz = s.fma(lz_p, s.float(2.95), s.fmul(cz, s.float(0.37)))
+        var bl1 = s.fsub(s.float(1.0), s.fabs(s.fmul(s.fsin(s.fadd(qx, s.fmul(qy, s.float(0.7)))), s.fcos(s.fsub(qz, s.fmul(qx, s.float(0.6)))))))
+        var bl2 = s.fsub(s.float(1.0), s.fabs(s.fmul(s.fsin(s.fma(qx, s.float(2.15), qz)), s.fcos(s.fma(qy, s.float(2.35), s.float(1.1))))))
+        var bl3 = s.fsub(s.float(1.0), s.fabs(s.fsin(s.fma(qx, s.float(4.6), s.fma(qy, s.float(4.3), s.fmul(qz, s.float(4.1)))))))
+        var billow = s.fma(bl1, s.float(0.54), s.fma(bl2, s.float(0.31), s.fmul(bl3, s.float(0.15))))
+
+        var shell = s.nmax(s.float(0.0), s.fsub(s.float(1.0), r_p))
+        var eroded = s.nmax(
+            s.float(0.0),
+            s.fsub(shell, s.fmul(s.fsub(s.float(1.0), billow), s.fma(r_p, s.float(0.34), s.float(0.14)))),
+        )
+        var step_sig = s.fmul(dens, s.fmul(eroded, s.select_f(is_fire, s.float(4.6), s.float(3.4))))
+        var step_tau = s.fmul(step_sig, ds_norm)
+        var step_tr = s.exp2(s.fmul(step_tau, s.float(-1.442695)))
+        var step_w = s.fmul(s.load_f(tr_p), s.fsub(s.float(1.0), step_tr))
+
+        # Directional 6-Way Beer-Powder self-shadowing at sample point
+        var sx6 = s.select_f(s.fge(sun_x, s.float(0.0)), s.fsub(s.float(1.0), lx_p), s.fadd(s.float(1.0), lx_p))
+        var sy6 = s.select_f(s.fge(sun_y, s.float(0.0)), s.fsub(s.float(1.0), ly_p), s.fadd(s.float(1.0), ly_p))
+        var sz6 = s.select_f(s.fge(sun_z, s.float(0.0)), s.fsub(s.float(1.0), lz_p), s.fadd(s.float(1.0), lz_p))
+        var dtau_s = s.fmul(
+            s.fma(s.fmul(sun_x, sun_x), sx6, s.fma(s.fmul(sun_y, sun_y), sy6, s.fmul(s.fmul(sun_z, sun_z), sz6))),
+            s.fmul(dens, s.float(1.35)),
+        )
+        var beer_s = s.exp2(s.fneg(s.fmul(dtau_s, s.float(1.442695))))
+        var powd_s = s.fsub(s.float(1.0), s.exp2(s.fneg(s.fmul(dtau_s, s.float(2.88539)))))
+        var bp_s = s.fmul(s.fma(s.float(1.78), s.fmul(beer_s, powd_s), s.float(0.24)), hg_boost)
+
+        # Fireball Planckian blackbody core (`white-gold -> orange-crimson`) cooling into dark `0.035` carbon oil-soot!
+        var temp = s.nclamp(s.fma(s.fsub(s.float(1.04), r_p), s.float(0.80), s.fma(billow, s.float(0.38), s.float(-0.12))), s.float(0.0), s.float(1.30))
+        var soot_t = s.nclamp(s.fmul(s.fsub(s.float(0.58), temp), s.float(2.5)), s.float(0.0), s.float(1.0))
+        var eff_sc_r = s.select_f(is_fire, s.fma(s.fsub(s.float(0.035), sc_r), soot_t, sc_r), sc_r)
+        var eff_sc_g = s.select_f(is_fire, s.fma(s.fsub(s.float(0.033), sc_g), soot_t, sc_g), sc_g)
+        var eff_sc_b = s.select_f(is_fire, s.fma(s.fsub(s.float(0.032), sc_b), soot_t, sc_b), sc_b)
+
+        var fire_t2 = s.fmul(temp, temp)
+        var fire_core = s.nmax(s.float(0.0), s.fsub(temp, s.float(0.75)))
+        var f_em_r = s.select_f(is_fire, s.fma(em_r, s.fmul(fire_t2, s.float(1.45)), s.fmul(fire_core, s.fmul(em_peak, s.float(1.4)))), em_r)
+        var f_em_g = s.select_f(is_fire, s.fma(em_g, s.fmul(s.fmul(fire_t2, temp), s.float(1.25)), s.fmul(fire_core, s.fmul(em_peak, s.float(1.1)))), em_g)
+        var f_em_b = s.select_f(is_fire, s.fma(em_b, s.fmul(s.fmul(fire_t2, fire_t2), s.float(0.85)), s.fmul(fire_core, s.fmul(em_peak, s.float(0.65)))), em_b)
+
+        var step_cr = s.fma(eff_sc_r, s.fma(sun_r, bp_s, amb_sky_r), f_em_r)
+        var step_cg = s.fma(eff_sc_g, s.fma(sun_g, bp_s, amb_sky_g), f_em_g)
+        var step_cb = s.fma(eff_sc_b, s.fma(sun_b, bp_s, amb_sky_b), f_em_b)
+
+        s.store(pr_acc, s.fma(step_cr, step_w, s.load_f(pr_acc)))
+        s.store(pg_acc, s.fma(step_cg, step_w, s.load_f(pg_acc)))
+        s.store(pb_acc, s.fma(step_cb, step_w, s.load_f(pb_acc)))
+        s.store(tr_p, s.fmul(s.load_f(tr_p), step_tr))
+
+    var ray_a = s.nclamp(s.fmul(s.fsub(s.float(1.0), s.load_f(tr_p)), soft_fade), s.float(0.0), s.float(0.98))
+    s.store(pm_r_v, s.fmul(s.load_f(pr_acc), soft_fade))
+    s.store(pm_g_v, s.fmul(s.load_f(pg_acc), soft_fade))
+    s.store(pm_b_v, s.fmul(s.load_f(pb_acc), soft_fade))
+    s.store(frag_a_v, ray_a)
+    s.end_if()
+
+    var pm_r = s.load_f(pm_r_v)
+    var pm_g = s.load_f(pm_g_v)
+    var pm_b = s.load_f(pm_b_v)
+    frag_a = s.load_f(frag_a_v)
 
     # Insertion-sort `(z_lin, pm_r, pm_g, pm_b, frag_a)` into the 4-node exact OIT stack!
     var iz = s.fvar(z_lin); var ir = s.fvar(pm_r); var ig = s.fvar(pm_g); var ib = s.fvar(pm_b); var ia = s.fvar(frag_a)
@@ -326,7 +485,9 @@ def oit_and_6way_volumetric_shader() -> List[UInt32]:
     s.store_float(b_hdr, s.iadd(hdr_base, s.uint(1)), s.fma(bg_g, final_trans, s.load_f(acc_g)))
     s.store_float(b_hdr, s.iadd(hdr_base, s.uint(2)), s.fma(bg_b, final_trans, s.load_f(acc_b)))
 
-    # Write reactive mask `1.0 - transmittance` for `FlintTSR v2`!
-    s.store_float(b_oit, react_off, s.fsub(s.float(1.0), final_trans))
+    # Write reactive mask `max(prev_reactive, 1.0 - transmittance)` for `FlintTSR v3`!
+    var oit_react = s.fsub(s.float(1.0), final_trans)
+    var prev_react = s.select_f(preserve_reactive, s.load_float(b_oit, react_off), s.float(0.0))
+    s.store_float(b_oit, react_off, s.nmax(prev_react, oit_react))
     _ = emit_vec3_cross
     return s.finish()

@@ -228,12 +228,18 @@ struct ConsoleVars(Copyable, Movable):
             self.values.append(cvar_entry(index).default)
 
     def get(self, index: Int) -> Float32:
+        if index < 0 or index >= CVAR_COUNT:
+            return Float32(0.0)
         return self.values[index]
 
     def on(self, index: Int) -> Bool:
+        if index < 0 or index >= CVAR_COUNT:
+            return False
         return self.values[index] != 0
 
     def set(mut self, index: Int, value: Float32):
+        if index < 0 or index >= CVAR_COUNT:
+            return
         self.values[index] = (Float32(1) if value != 0 else Float32(0)) if cvar_entry(index).flag else value
 
     def find(self, name: String) -> Int:
@@ -243,6 +249,8 @@ struct ConsoleVars(Copyable, Movable):
         return -1
 
     def describe(self, index: Int) -> String:
+        if index < 0 or index >= CVAR_COUNT:
+            return ""
         return cvar_entry(index).name + " = " + show_value(self.values[index])
 
     def text(self) -> String:

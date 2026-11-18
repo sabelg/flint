@@ -34,7 +34,7 @@ def typed_byte(key: Int) -> Int:
     with letters as capitals."""
     if key >= 65 and key <= 90:
         return key + 32
-    if (key >= 48 and key <= 57) or key == 32 or key == 45 or key == 46:
+    if (key >= 48 and key <= 57) or key == 32 or key == 45 or key == 46 or key == 95:
         return key
     return -1
 

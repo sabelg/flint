@@ -2,6 +2,7 @@
 from flint.platform.os import write_bytes
 from flint.core.math import Vec3
 from flint.assets.image import encode_png
+from flint.assets.jpeg import encode_jpeg_baseline
 from flint.assets.json_write import json_quote
 from flint.assets.model import NativeModel, NativeMesh, NativeNode
 
@@ -38,8 +39,8 @@ struct PrimExportIds(Copyable, ImplicitlyCopyable, Movable):
     var mat_idx: Int
 
 
-def encode_native_glb(mut model: NativeModel) -> List[UInt8]:
-    """Serialize a NativeModel (meshes, nodes, PBR materials, PNG textures) into a standard GLB 2.0 binary."""
+def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> List[UInt8]:
+    """Serialize a NativeModel (meshes, nodes, PBR materials, PNG/JPEG textures) into a standard GLB 2.0 binary."""
     var bin_data = List[UInt8]()
     var buffer_views = List[String]()
     var accessors = List[String]()
@@ -47,7 +48,7 @@ def encode_native_glb(mut model: NativeModel) -> List[UInt8]:
     var textures_json = List[String]()
     var materials_json = List[String]()
 
-    # 1. Embed textures as lossless RGBA PNG bufferViews
+    # 1. Embed textures as lossless RGBA PNG or baseline YCbCr JPEG bufferViews
     for tex_idx in range(len(model.textures)):
         var w = model.textures[tex_idx].width
         var h = model.textures[tex_idx].height
@@ -56,19 +57,21 @@ def encode_native_glb(mut model: NativeModel) -> List[UInt8]:
             w = 4
             h = 4
             pixels = List[UInt32](length=16, fill=0xFFFFFFFF)
-        var png_bytes = encode_png(pixels, w, h, "", True)
+        var as_jpeg = tex_idx < 64 and ((jpeg_texture_mask >> UInt64(tex_idx)) & 1) != 0
+        var img_bytes = encode_jpeg_baseline(pixels, w, h, 94) if as_jpeg else encode_png(pixels, w, h, "", True)
+        var mime_str = "image/jpeg" if as_jpeg else "image/png"
         pad4(bin_data, 0)
         var offset = len(bin_data)
-        for b in png_bytes:
+        for b in img_bytes:
             bin_data.append(b)
-        var length = len(png_bytes)
+        var length = len(img_bytes)
         pad4(bin_data, 0)
         var bv_idx = len(buffer_views)
         buffer_views.append(
             '{"buffer": 0, "byteOffset": ' + String(offset) + ', "byteLength": ' + String(length) + "}"
         )
         var img_idx = len(images_json)
-        images_json.append('{"bufferView": ' + String(bv_idx) + ', "mimeType": "image/png"}')
+        images_json.append('{"bufferView": ' + String(bv_idx) + ', "mimeType": "' + mime_str + '"}')
         textures_json.append('{"source": ' + String(img_idx) + "}")
 
     # 2. Serialize each NativeMesh's vertex attributes, indices, and PBR material
@@ -210,6 +213,8 @@ def encode_native_glb(mut model: NativeModel) -> List[UInt8]:
         )
         if mesh.texture >= 0 and mesh.texture < len(textures_json):
             pbr_str += ', "baseColorTexture": {"index": ' + String(mesh.texture) + "}"
+        if mesh.orm_texture >= 0 and mesh.orm_texture < len(textures_json):
+            pbr_str += ', "metallicRoughnessTexture": {"index": ' + String(mesh.orm_texture) + "}"
         pbr_str += "}"
 
         var alpha_str = "BLEND" if mesh.alpha_mode == 2 else ("MASK" if mesh.alpha_mode == 1 else "OPAQUE")
@@ -220,13 +225,40 @@ def encode_native_glb(mut model: NativeModel) -> List[UInt8]:
         )
         if mesh.normal_orm_texture >= 0 and mesh.normal_orm_texture < len(textures_json):
             mat_str += ', "normalTexture": {"index": ' + String(mesh.normal_orm_texture) + "}"
+        var ext_parts = List[String]()
         if mesh.emissive_strength > 0.0001:
             var ef = mesh.emissive_color
             var em_max = max(Float32(0.0001), max(ef.x, max(ef.y, ef.z)))
             var norm_ef = ef * (min(Float32(1.0), mesh.emissive_strength) / em_max)
             mat_str += ', "emissiveFactor": [' + fmt_f32(norm_ef.x) + ", " + fmt_f32(norm_ef.y) + ", " + fmt_f32(norm_ef.z) + "]"
             if mesh.emissive_strength > 1.0:
-                mat_str += ', "extensions": {"KHR_emissive_strength": {"emissiveStrength": ' + fmt_f32(mesh.emissive_strength) + "}}"
+                ext_parts.append('"KHR_materials_emissive_strength": {"emissiveStrength": ' + fmt_f32(mesh.emissive_strength) + "}")
+        if mesh.clearcoat > 0.0001 or abs(mesh.clearcoat_roughness - Float32(0.08)) > 0.0001:
+            ext_parts.append(
+                '"KHR_materials_clearcoat": {"clearcoatFactor": ' + fmt_f32(mesh.clearcoat)
+                + ', "clearcoatRoughnessFactor": ' + fmt_f32(mesh.clearcoat_roughness) + "}"
+            )
+        if abs(mesh.specular_factor - Float32(1.0)) > 0.0001:
+            ext_parts.append('"KHR_materials_specular": {"specularFactor": ' + fmt_f32(mesh.specular_factor) + "}")
+        if mesh.iridescence > 0.0001:
+            ext_parts.append(
+                '"KHR_materials_iridescence": {"iridescenceFactor": ' + fmt_f32(mesh.iridescence)
+                + ', "iridescenceIor": ' + fmt_f32(mesh.iridescence_ior)
+                + ', "iridescenceThicknessMaximum": ' + fmt_f32(mesh.iridescence_thickness_nm) + "}"
+            )
+        if mesh.sheen_color.x > 0.0001 or mesh.sheen_color.y > 0.0001 or mesh.sheen_color.z > 0.0001:
+            ext_parts.append(
+                '"KHR_materials_sheen": {"sheenColorFactor": ['
+                + fmt_f32(mesh.sheen_color.x) + ", " + fmt_f32(mesh.sheen_color.y) + ", " + fmt_f32(mesh.sheen_color.z)
+                + '], "sheenRoughnessFactor": ' + fmt_f32(mesh.sheen_roughness) + "}"
+            )
+        if len(ext_parts) > 0:
+            mat_str += ', "extensions": {'
+            for e_i in range(len(ext_parts)):
+                if e_i > 0:
+                    mat_str += ", "
+                mat_str += ext_parts[e_i]
+            mat_str += "}"
         mat_str += "}"
         var mat_idx = len(materials_json)
         materials_json.append(mat_str)
@@ -283,9 +315,17 @@ def encode_native_glb(mut model: NativeModel) -> List[UInt8]:
                 gltf_meshes_json.append('{"name": ' + json_quote(node.name) + ', "primitives": ' + prims_str + "}")
 
             var n_str = '{"name": ' + json_quote(node.name)
-            n_str += ', "translation": [' + fmt_f32(node.translation.x) + ", " + fmt_f32(node.translation.y) + ", " + fmt_f32(node.translation.z) + "]"
-            n_str += ', "rotation": [' + fmt_f32(node.rotation.x) + ", " + fmt_f32(node.rotation.y) + ", " + fmt_f32(node.rotation.z) + ", " + fmt_f32(node.rotation.w) + "]"
-            n_str += ', "scale": [' + fmt_f32(node.scale.x) + ", " + fmt_f32(node.scale.y) + ", " + fmt_f32(node.scale.z) + "]"
+            if node.has_matrix:
+                n_str += ', "matrix": ['
+                for m_i in range(16):
+                    if m_i > 0:
+                        n_str += ", "
+                    n_str += fmt_f32(node.matrix.values[m_i])
+                n_str += "]"
+            else:
+                n_str += ', "translation": [' + fmt_f32(node.translation.x) + ", " + fmt_f32(node.translation.y) + ", " + fmt_f32(node.translation.z) + "]"
+                n_str += ', "rotation": [' + fmt_f32(node.rotation.x) + ", " + fmt_f32(node.rotation.y) + ", " + fmt_f32(node.rotation.z) + ", " + fmt_f32(node.rotation.w) + "]"
+                n_str += ', "scale": [' + fmt_f32(node.scale.x) + ", " + fmt_f32(node.scale.y) + ", " + fmt_f32(node.scale.z) + "]"
             if gltf_mesh_id >= 0:
                 n_str += ', "mesh": ' + String(gltf_mesh_id)
             if len(node.children) > 0:

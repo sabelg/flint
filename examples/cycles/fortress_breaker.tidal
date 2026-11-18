@@ -1,0 +1,83 @@
+-- "Fortress Breaker" — an original mecha battle theme, inspired by the final
+-- battle of the One Year War at the space fortress A Baoa Qu (Mobile Suit
+-- Gundam). D minor, 150 BPM, 4/4. 32 bars (~51 s), loops without a seam.
+--
+--   bars  1-4   Sortie       the fortress in the dark: choir, timpani, newtype pings
+--   bars  5-12  Launch       catapult out: driving bass, power-chord riff, drums
+--   bars 13-20  Hero theme   the lead takes the melody over brass stabs
+--   bars 21-24  Rivals       half time, beam fire crosses, the pings come back
+--   bars 25-32  Last stand   everything at once, the theme an octave up, into bar 1
+--
+-- Listen live:  bash tools/flint.sh cycles live "$PWD/examples/cycles/fortress_breaker.tidal"
+-- Render:       bash tools/flint.sh cycles render-loop "$PWD/examples/cycles/fortress_breaker.tidal" fortress_breaker.wav 32
+
+setcps (150/60/4)
+
+let section a b p = whenmod 32 a (const (whenmod 32 b (const silence) p)) silence
+    chords = "<d'min bf'maj g'min a'maj d'min bf'maj c'maj d'min>"
+    roots  = "<d3 bf2 g2 a2 d3 bf2 c3 d3>"
+    tonic  = "<d5 bf4 g4 a4 d5 bf4 c5 d5>"
+    melody = 4 ~> "<[d6@3 e6 f6@2 e6 d6] [c6@3 d6 bf5@4] [c6@3 d6 e6@2 f6 g6] [a6@6 ~ a5] [d6@3 e6 f6@2 g6 a6] [bf6@3 a6 g6@2 f6 g6] [a6@3 g6 f6@2 e6 d6] [cs6@4 e6@4]>"
+    riff   = n "0 ~ 0 12 ~ 0 7 ~ 0 ~ 5 ~ 7 ~ 12 7" |+ n tonic
+    pings  = n "~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ a7 ~ ~ ~" # s "bell" # gain 0.55
+      # delay 0.5 # delaytime 0.24 # delayfeedback 0.55 # room 0.6 # size 0.8
+
+-- choir and newtype pings -------------------------------------------
+
+d1 $ stack [section 0 4 $ n chords # gain 0.5, section 20 32 $ n chords # gain 0.4]
+  # s "pad" # attack 0.4 # release 1.2 # cutoff 2200 # room 0.7 # size 0.85
+
+d2 $ stack [section 0 4 pings, section 20 24 pings # pan 0.3]
+
+d3 $ stack
+  [ section 0 3 $ s "timpani ~ ~ timpani" # n roots |+ n 24 # gain 0.7
+  , section 3 4 $ s "timpani*8" # n "a3" |+ n 24 # gain "0.4 0.5 0.6 0.7 0.75 0.8 0.9 1"
+  , section 20 24 $ s "timpani ~ ~ ~" # n roots |+ n 24 # gain 0.8
+  ] # room 0.5
+
+-- the war machine ---------------------------------------------------
+
+d4 $ section 4 32 $ n "0 0 12 0 0 12 0 12" |+ n roots # s "bass"
+  # cutoff 900 # resonance 0.25 # legato 0.7 # gain 0.85
+
+d5 $ stack [section 4 12 riff # gain 0.42, section 24 32 riff # gain 0.3]
+  # s "supersaw" # legato 0.5 # cutoff 2600 # pan 0.4 # room 0.2
+
+d6 $ stack [section 12 20 $ struct "t ~ ~ t ~ ~ t ~" $ n chords # gain 0.4,
+            section 24 32 $ struct "t ~ ~ t ~ ~ t t" $ n chords # gain 0.44]
+  # s "supersaw" # legato 0.35 # cutoff 3200 # pan 0.6 # room 0.25
+
+-- hero theme --------------------------------------------------------
+
+d7 $ stack [section 12 20 $ n melody # gain 0.62, section 24 32 $ n melody # gain 0.66]
+  # s "square" # legato 0.95 # attack 0.01 # cutoff 2800 # resonance 0.15
+  # delay 0.2 # delaytime 0.3 # delayfeedback 0.3 # room 0.3
+
+d8 $ section 24 32 $ n melody |+ n 12 # s "bell" # gain 0.32 # room 0.4 # pan 0.65
+
+-- beam rifle fire ---------------------------------------------------
+
+d9 $ section 20 24 $ n "~ ~ [c8 g7 d7 a6] ~ ~ ~ ~ [d8 a7 e7 b6]" # s "sine"
+  # legato 0.6 # shape 0.4 # gain 0.4 # pan "0.2 0.8"
+  # delay 0.3 # delaytime 0.12 # delayfeedback 0.35
+
+-- drums -------------------------------------------------------------
+
+d10 $ stack
+  [ section 4 20 $ s "bd*4" # gain 0.85
+  , section 20 24 $ s "bd ~ ~ ~ ~ ~ ~ ~ ~ ~ bd ~ ~ ~ ~ ~" # gain 0.9
+  , section 24 32 $ s "bd*4 [~ bd]" # gain 0.9
+  ] # cutoff 3000
+
+d11 $ stack
+  [ section 4 20 $ s "~ sn ~ sn" # gain 0.65
+  , section 20 23 $ s "~ ~ sn ~" # gain 0.7 # room 0.4
+  , section 23 24 $ s "sn*16" # gain (range 0.25 0.85 saw)
+  , section 24 31 $ s "~ sn ~ [sn sn]" # gain 0.7
+  , section 31 32 $ s "sn*8 sn*16" # gain (range 0.3 0.9 saw)
+  ]
+
+d12 $ stack [section 4 20 $ s "hh*8" # gain "0.3 0.42", section 24 32 $ s "hh*16" # gain "0.26 0.36"]
+  # pan 0.55
+
+d13 $ s "<~!4 cr ~!7 cr ~!7 cr ~!3 cr ~!7>" # gain 0.42 # room 0.5

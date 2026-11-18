@@ -34,9 +34,13 @@ from flint.render.aaa_visbuffer import emit_vec3_dot, emit_vec3_normalize
 #             bits 0..7   = albedo BC7 bindless index (0xFF = none)
 #             bits 8..15  = normal BC5 bindless index (0xFF = none)
 #             bits 16..23 = orm BC7 bindless index (0xFF = none)
-#             bits 24..30 = detail normal BC5 bindless index (0x7F = none)
-#             bit  31     = subsurface_enabled (1/0)
+#             bits 24..29 = detail normal BC5 / 4x4 interior room atlas bindless index (0x3F = none)
+#             bit  30     = interior_parallax_enabled (0x40000000 = AAA_MAT_INTERIOR_PARALLAX)
+#             bit  31     = subsurface_enabled (0x80000000)
 comptime AAA_MATERIAL_WORDS: Int = 24
+comptime AAA_MAT_DET_NONE: UInt32 = 0x3F
+comptime AAA_MAT_INTERIOR_PARALLAX: UInt32 = 0x40000000
+comptime AAA_MAT_SSS_BIT: UInt32 = 0x80000000
 
 
 struct AaaMaterial(Copyable, Movable):
@@ -61,6 +65,9 @@ struct AaaMaterial(Copyable, Movable):
     var normal_tex: Int
     var orm_tex: Int
     var detail_normal_tex: Int
+    var interior_parallax_enabled: Bool
+    var road_wetness_mode: Bool
+    var alpha_cutoff: Float32
 
     def __init__(
         out self,
@@ -89,19 +96,40 @@ struct AaaMaterial(Copyable, Movable):
         self.normal_tex = -1
         self.orm_tex = -1
         self.detail_normal_tex = -1
+        self.interior_parallax_enabled = False
+        self.road_wetness_mode = False
+        self.alpha_cutoff = Float32(0.0)
+
+    @always_inline
+    def is_alpha_masked(self) -> Bool:
+        return self.alpha_cutoff > Float32(0.01)
 
     def append_words(self, mut out: List[UInt32]):
         var t_alb = UInt32(self.albedo_tex & 0xFF) if self.albedo_tex >= 0 else UInt32(0xFF)
         var t_nrm = UInt32(self.normal_tex & 0xFF) if self.normal_tex >= 0 else UInt32(0xFF)
         var t_orm = UInt32(self.orm_tex & 0xFF) if self.orm_tex >= 0 else UInt32(0xFF)
-        var t_det = UInt32(self.detail_normal_tex & 0x7F) if self.detail_normal_tex >= 0 else UInt32(0x7F)
-        var sss_bit = UInt32(0x80000000) if self.subsurface_amount > Float32(0.001) else UInt32(0)
-        var packed_tex = t_alb | (t_nrm << 8) | (t_orm << 16) | (t_det << 24) | sss_bit
+        var t_det = (
+            UInt32(min(62, self.detail_normal_tex))
+            if self.detail_normal_tex >= 0
+            else AAA_MAT_DET_NONE
+        )
+        var int_bit = AAA_MAT_INTERIOR_PARALLAX if self.interior_parallax_enabled else UInt32(0)
+        var sss_bit = AAA_MAT_SSS_BIT if self.subsurface_amount > Float32(0.001) else UInt32(0)
+        var packed_tex = t_alb | (t_nrm << 8) | (t_orm << 16) | (t_det << 24) | int_bit | sss_bit
+
+        var abs_det_scale = max(Float32(0.001), abs(self.detail_uv_scale))
+        var encoded_det_scale = -abs_det_scale if (self.road_wetness_mode or self.detail_uv_scale < Float32(0.0)) else abs_det_scale
+        var abs_spec_fac = max(Float32(0.0), min(Float32(1.0), abs(self.specular_factor)))
+        var encoded_spec_fac = (
+            -max(Float32(1e-4), abs_spec_fac)
+            if (self.alpha_cutoff > Float32(0.01) or self.specular_factor < Float32(0.0))
+            else abs_spec_fac
+        )
 
         out.append(bitcast[DType.uint32](self.base_color.x))
         out.append(bitcast[DType.uint32](self.base_color.y))
         out.append(bitcast[DType.uint32](self.base_color.z))
-        out.append(bitcast[DType.uint32](max(Float32(0.0), min(Float32(1.0), self.specular_factor))))
+        out.append(bitcast[DType.uint32](encoded_spec_fac))
         out.append(bitcast[DType.uint32](max(Float32(0.04), min(Float32(1.0), self.roughness))))
         out.append(bitcast[DType.uint32](max(Float32(0.0), min(Float32(1.0), self.metallic))))
         out.append(bitcast[DType.uint32](max(Float32(0.0), min(Float32(1.0), self.clearcoat))))
@@ -109,7 +137,7 @@ struct AaaMaterial(Copyable, Movable):
         out.append(bitcast[DType.uint32](self.emissive.x))
         out.append(bitcast[DType.uint32](self.emissive.y))
         out.append(bitcast[DType.uint32](self.emissive.z))
-        out.append(bitcast[DType.uint32](self.detail_uv_scale))
+        out.append(bitcast[DType.uint32](encoded_det_scale))
         out.append(bitcast[DType.uint32](self.detail_normal_strength))
         out.append(bitcast[DType.uint32](self.iridescence))
         out.append(bitcast[DType.uint32](self.iridescence_thickness_nm))
@@ -314,3 +342,72 @@ def emit_direct_multilobe_bsdf(
         s.fma(base_g, atten, cc_spec),
         s.fma(base_b, atten, cc_spec),
     )
+
+
+def eval_kaplanyan_specular_aa_cpu(
+    n_c: Vec3,
+    n_dx: Vec3,
+    n_dy: Vec3,
+    roughness: Float32,
+    clearcoat_roughness: Float32,
+    det_uv_grad_sq: Float32 = 0.0,
+    det_strength: Float32 = 0.0,
+) -> Tuple[Float32, Float32]:
+    """Kaplanyan & Hill 2016 Geometric Curvature + Detail Footprint Specular Antialiasing.
+    Filters screen-space differential normal variance into BOTH substrate and clearcoat GGX roughness."""
+    var dx = n_dx - n_c
+    var dy = n_dy - n_c
+    var geom_var = dx.length_squared() + dy.length_squared()
+    var det_var = det_strength * det_strength * min(Float32(1.0), max(Float32(0.0), det_uv_grad_sq)) * Float32(0.25)
+    var kernel_r2 = min(Float32(0.18), Float32(0.5) * geom_var + det_var)
+
+    var a_sub = max(Float32(0.0016), roughness * roughness)
+    var a_sub_aa = sqrt(min(Float32(1.0), a_sub * a_sub + kernel_r2))
+    var out_sub = max(roughness, min(Float32(1.0), sqrt(a_sub_aa)))
+
+    var a_cc = max(Float32(0.0016), clearcoat_roughness * clearcoat_roughness)
+    var a_cc_aa = sqrt(min(Float32(1.0), a_cc * a_cc + kernel_r2))
+    var out_cc = max(clearcoat_roughness, min(Float32(1.0), sqrt(a_cc_aa)))
+    return (out_sub, out_cc)
+
+
+def emit_kaplanyan_specular_aa(
+    mut s: AaaSpirvModule,
+    nc_x: UInt32,
+    nc_y: UInt32,
+    nc_z: UInt32,
+    ndx_x: UInt32,
+    ndx_y: UInt32,
+    ndx_z: UInt32,
+    ndy_x: UInt32,
+    ndy_y: UInt32,
+    ndy_z: UInt32,
+    roughness: UInt32,
+    ccoat_rough: UInt32,
+    det_grad_sq: UInt32,
+    det_strength: UInt32,
+) -> Tuple[UInt32, UInt32]:
+    """SPIR-V Kaplanyan & Hill 2016 Geometric + Detail Normal Variance Specular AA
+    filtering curvature variance into BOTH `cur_rough` AND `ccoat_r` (`clearcoat_roughness`)."""
+    var dxx = s.fsub(ndx_x, nc_x)
+    var dxy = s.fsub(ndx_y, nc_y)
+    var dxz = s.fsub(ndx_z, nc_z)
+    var dyx = s.fsub(ndy_x, nc_x)
+    var dyy = s.fsub(ndy_y, nc_y)
+    var dyz = s.fsub(ndy_z, nc_z)
+    var g_dx2 = emit_vec3_dot(s, dxx, dxy, dxz, dxx, dxy, dxz)
+    var g_dy2 = emit_vec3_dot(s, dyx, dyy, dyz, dyx, dyy, dyz)
+    var geom_var = s.fadd(g_dx2, g_dy2)
+
+    var det_s2 = s.fmul(det_strength, det_strength)
+    var det_var = s.fmul(det_s2, s.fmul(s.nclamp(det_grad_sq, s.float(0.0), s.float(1.0)), s.float(0.25)))
+    var kernel_r2 = s.nmin(s.float(0.18), s.fma(s.float(0.5), geom_var, det_var))
+
+    var a_sub = s.nmax(s.float(0.0016), s.fmul(roughness, roughness))
+    var a_sub_aa = s.fsqrt(s.nmin(s.float(1.0), s.fma(a_sub, a_sub, kernel_r2)))
+    var out_sub = s.nclamp(s.nmax(roughness, s.fsqrt(a_sub_aa)), s.float(0.04), s.float(1.0))
+
+    var a_cc = s.nmax(s.float(0.0016), s.fmul(ccoat_rough, ccoat_rough))
+    var a_cc_aa = s.fsqrt(s.nmin(s.float(1.0), s.fma(a_cc, a_cc, kernel_r2)))
+    var out_cc = s.nclamp(s.nmax(ccoat_rough, s.fsqrt(a_cc_aa)), s.float(0.04), s.float(1.0))
+    return (out_sub, out_cc)

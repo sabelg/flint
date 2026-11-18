@@ -238,9 +238,22 @@ struct SkinDraw(Copyable, ImplicitlyCopyable, Movable):
         self.adopted = 0
 
 
+@always_inline
+def _cofactor_transform_normal(palette: Pointer[Float32, origin=MutAnyOrigin], m: Int, normal: Vec3) -> Vec3:
+    """Transforms `normal` by the 3x3 cofactor matrix `cof(M_j) = det(M_j) * M_j^-T`
+    whose rows are cross products of the 3x3 rows `(r1 x r2, r2 x r0, r0 x r1)`."""
+    var r0 = Vec3(palette[unsafe_offset=m], palette[unsafe_offset=m + 1], palette[unsafe_offset=m + 2])
+    var r1 = Vec3(palette[unsafe_offset=m + 4], palette[unsafe_offset=m + 5], palette[unsafe_offset=m + 6])
+    var r2 = Vec3(palette[unsafe_offset=m + 8], palette[unsafe_offset=m + 9], palette[unsafe_offset=m + 10])
+    var c0 = r1.cross(r2)
+    var c1 = r2.cross(r0)
+    var c2 = r0.cross(r1)
+    return Vec3(c0.dot(normal), c1.dot(normal), c2.dot(normal))
+
+
 def skin_vertex(draw: SkinDraw, position: Vec3, normal: Vec3, center: Vec3, joints_at: Int, weights_at: Int) -> Tuple[Vec3, Vec3]:
     """A bind-space position and normal in model space, in the draw's pose.
-    The normal comes back unnormalized for SKIN_LBS."""
+    Transforms normals via the 3x3 cofactor matrix `cof(M_j)` and normalizes."""
     var joints = Pointer[UInt16, origin=MutAnyOrigin](unsafe_from_address=joints_at)
     var weights = Pointer[Float32, origin=MutAnyOrigin](unsafe_from_address=weights_at)
     var palette = Pointer[Float32, origin=MutAnyOrigin](unsafe_from_address=draw.palette)
@@ -269,14 +282,12 @@ def skin_vertex(draw: SkinDraw, position: Vec3, normal: Vec3, center: Vec3, join
                 palette[unsafe_offset=m + 4] * position.x + palette[unsafe_offset=m + 5] * position.y + palette[unsafe_offset=m + 6] * position.z + palette[unsafe_offset=m + 7],
                 palette[unsafe_offset=m + 8] * position.x + palette[unsafe_offset=m + 9] * position.y + palette[unsafe_offset=m + 10] * position.z + palette[unsafe_offset=m + 11],
             )
-            var n = Vec3(
-                palette[unsafe_offset=m] * normal.x + palette[unsafe_offset=m + 1] * normal.y + palette[unsafe_offset=m + 2] * normal.z,
-                palette[unsafe_offset=m + 4] * normal.x + palette[unsafe_offset=m + 5] * normal.y + palette[unsafe_offset=m + 6] * normal.z,
-                palette[unsafe_offset=m + 8] * normal.x + palette[unsafe_offset=m + 9] * normal.y + palette[unsafe_offset=m + 10] * normal.z,
-            )
+            var n = _cofactor_transform_normal(palette, m, normal)
             sp = sp + p * w[i]
             sn = sn + n * w[i]
-        return (sp * inverse, sn * inverse)
+        var sn_len = sn.length()
+        var out_n = sn * (Float32(1.0) / sn_len) if sn_len > Float32(1.0e-6) else normal
+        return (sp * inverse, out_n)
     # Linear blend of the vertex too: what the result fades to where the
     # joints' rotations have no sensible average.
     var linear = Vec3()
@@ -291,11 +302,7 @@ def skin_vertex(draw: SkinDraw, position: Vec3, normal: Vec3, center: Vec3, join
             palette[unsafe_offset=m + 4] * position.x + palette[unsafe_offset=m + 5] * position.y + palette[unsafe_offset=m + 6] * position.z + palette[unsafe_offset=m + 7],
             palette[unsafe_offset=m + 8] * position.x + palette[unsafe_offset=m + 9] * position.y + palette[unsafe_offset=m + 10] * position.z + palette[unsafe_offset=m + 11],
         )
-        var n = Vec3(
-            palette[unsafe_offset=m] * normal.x + palette[unsafe_offset=m + 1] * normal.y + palette[unsafe_offset=m + 2] * normal.z,
-            palette[unsafe_offset=m + 4] * normal.x + palette[unsafe_offset=m + 5] * normal.y + palette[unsafe_offset=m + 6] * normal.z,
-            palette[unsafe_offset=m + 8] * normal.x + palette[unsafe_offset=m + 9] * normal.y + palette[unsafe_offset=m + 10] * normal.z,
-        )
+        var n = _cofactor_transform_normal(palette, m, normal)
         var c = Vec3(
             palette[unsafe_offset=m] * center.x + palette[unsafe_offset=m + 1] * center.y + palette[unsafe_offset=m + 2] * center.z + palette[unsafe_offset=m + 3],
             palette[unsafe_offset=m + 4] * center.x + palette[unsafe_offset=m + 5] * center.y + palette[unsafe_offset=m + 6] * center.z + palette[unsafe_offset=m + 7],
@@ -305,7 +312,8 @@ def skin_vertex(draw: SkinDraw, position: Vec3, normal: Vec3, center: Vec3, join
         linear_normal = linear_normal + n * w[i]
         moved = moved + c * w[i]
     linear = linear * inverse
-    linear_normal = linear_normal * inverse
+    var ln_len = linear_normal.length()
+    linear_normal = linear_normal * (Float32(1.0) / ln_len) if ln_len > Float32(1.0e-6) else normal
     moved = moved * inverse
     # The average rotation: the unit quaternion b that maximizes
     # sum w (q . b)^2, by power iteration from the heaviest influence's

@@ -229,6 +229,7 @@ struct X11Window(Copyable, Movable):
     var close_requested: Bool
     var focused: Bool
     var fullscreen: Bool
+    var pointer_locked: Bool
     var rid_base: Int
     var rid_mask: Int
     var next_rid: Int
@@ -257,6 +258,11 @@ struct X11Window(Copyable, Movable):
     var pending_mouse_x: Float32
     var pending_mouse_y: Float32
     var has_pending_mouse: Bool
+    var last_mouse_x: Float32
+    var last_mouse_y: Float32
+    var has_last_mouse: Bool
+    var pending_rel_x: Float32
+    var pending_rel_y: Float32
     var pending_buttons: List[Int]
     var pending_button_down: List[Bool]
     var pending_wheel: Float32
@@ -272,6 +278,7 @@ struct X11Window(Copyable, Movable):
         self.close_requested = False
         self.focused = True
         self.fullscreen = False
+        self.pointer_locked = False
         self.rid_base = 0
         self.rid_mask = 0
         self.next_rid = 1
@@ -300,6 +307,11 @@ struct X11Window(Copyable, Movable):
         self.pending_mouse_x = 0
         self.pending_mouse_y = 0
         self.has_pending_mouse = False
+        self.last_mouse_x = 0
+        self.last_mouse_y = 0
+        self.has_last_mouse = False
+        self.pending_rel_x = 0
+        self.pending_rel_y = 0
         self.pending_buttons = List[Int]()
         self.pending_button_down = List[Bool]()
         self.pending_wheel = 0
@@ -467,6 +479,11 @@ struct X11Window(Copyable, Movable):
         self.pending_mouse_x = 0
         self.pending_mouse_y = 0
         self.has_pending_mouse = False
+        self.last_mouse_x = 0
+        self.last_mouse_y = 0
+        self.has_last_mouse = False
+        self.pending_rel_x = 0
+        self.pending_rel_y = 0
         self.pending_buttons.clear()
         self.pending_button_down.clear()
         self.pending_wheel = 0
@@ -671,9 +688,19 @@ struct X11Window(Copyable, Movable):
                 elif detail == 5 and down:
                     self.pending_wheel -= 1.0
             elif code == 6:  # MotionNotify
-                self.pending_mouse_x = Float32(x11_gets16(self.incoming, pos + 24))
-                self.pending_mouse_y = Float32(x11_gets16(self.incoming, pos + 26))
-                self.has_pending_mouse = True
+                var mx = Float32(x11_gets16(self.incoming, pos + 24))
+                var my = Float32(x11_gets16(self.incoming, pos + 26))
+                if self.pointer_locked:
+                    if self.has_last_mouse:
+                        self.pending_rel_x += mx - self.last_mouse_x
+                        self.pending_rel_y += my - self.last_mouse_y
+                    self.last_mouse_x = mx
+                    self.last_mouse_y = my
+                    self.has_last_mouse = True
+                else:
+                    self.pending_mouse_x = mx
+                    self.pending_mouse_y = my
+                    self.has_pending_mouse = True
             elif code == 9:  # FocusIn
                 self.focused = True
             elif code == 10:  # FocusOut
@@ -753,6 +780,10 @@ struct X11Window(Copyable, Movable):
         if self.has_pending_mouse:
             input.move_mouse(self.map_mouse_x(self.pending_mouse_x), self.map_mouse_y(self.pending_mouse_y))
             self.has_pending_mouse = False
+        if self.pointer_locked and (self.pending_rel_x != 0.0 or self.pending_rel_y != 0.0):
+            input.add_mouse_delta(self.pending_rel_x, self.pending_rel_y)
+            self.pending_rel_x = 0
+            self.pending_rel_y = 0
         for i in range(len(self.pending_buttons)):
             if self.pending_buttons[i] == X11_RELEASE_HELD:
                 for b in range(X11_MOUSE_BUTTONS):
@@ -851,6 +882,36 @@ struct X11Window(Copyable, Movable):
         x11_put32(ev, 32, 0)
         x11_put32(ev, 36, 1)  # normal application source indication
         _ = self.write_all(ev, len(ev))
+
+    def set_pointer_lock(mut self, active: Bool):
+        """Toggles pointer lock / raw relative motion tracking with Wayland symmetry."""
+        self.pointer_locked = active
+        self.has_last_mouse = False
+        self.pending_rel_x = 0
+        self.pending_rel_y = 0
+        if not self.active():
+            return
+        if active:
+            # GrabPointer (opcode 26, len 6 words = 24 bytes)
+            var req = List[UInt8](length=24, fill=0)
+            req[0] = 26
+            req[1] = 1  # owner_events = True
+            x11_put16(req, 2, 6)
+            x11_put32(req, 4, self.window_id)
+            x11_put16(req, 8, 0x004C)  # ButtonPress | ButtonRelease | PointerMotion
+            req[10] = 1  # pointer_mode = Asynchronous
+            req[11] = 1  # keyboard_mode = Asynchronous
+            x11_put32(req, 12, self.window_id)  # confine_to
+            x11_put32(req, 16, 0)  # cursor
+            x11_put32(req, 20, 0)  # time = CurrentTime
+            _ = self.write_all(req, len(req))
+        else:
+            # UngrabPointer (opcode 27, len 2 words = 8 bytes)
+            var req = List[UInt8](length=8, fill=0)
+            req[0] = 27
+            x11_put16(req, 2, 2)
+            x11_put32(req, 4, 0)  # time = CurrentTime
+            _ = self.write_all(req, len(req))
 
     def close(mut self):
         if self.fd >= 0 and self.window_id != 0:

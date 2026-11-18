@@ -12,16 +12,25 @@ from std.math import cos, sin, sqrt
 from flint.core.math import Vec3
 from flint.render.spirv import (
     AaaSpirvModule,
+    MODEL_FRAGMENT,
     MODEL_GL_COMPUTE,
     MODEL_VERTEX,
+    OP_LOAD,
+    OP_STORE,
+    STORAGE_INPUT,
+    STORAGE_OUTPUT,
+    emit,
 )
 from flint.render.aaa_visbuffer import (
     AAA_INSTANCE_WORDS,
+    AAA_MAX_BINDLESS,
     AAA_PUSH_WORDS,
+    BIND_AAA_BINDLESS_TEX,
     BIND_AAA_DEPTH_TEX,
     BIND_AAA_GLOBALS,
     BIND_AAA_INDICES,
     BIND_AAA_INSTANCES,
+    BIND_AAA_MATERIALS,
     BIND_AAA_MESHLETS,
     BIND_AAA_VERTICES,
     BIND_AAA_VIS_TEX,
@@ -37,6 +46,36 @@ comptime VSM_PHYS_TILES_DIM: Int = 32             # 32 x 32 = 1,024 physical pag
 comptime VSM_PHYS_TILE_COUNT: Int = 1024
 comptime VSM_PHYS_ATLAS_RES: Int = 4096           # 32 * 128 = 4096 x 4096 physical D32_SFLOAT image
 comptime VSM_TABLE_WORDS: Int = 32768             # [0..16383] = page entries, [16384..32767] = request flags
+
+comptime VSM_CASCADE_COUNT: Int = 4
+comptime VSM_CASCADE_PAGES_DIM: Int = 64
+comptime VSM_CASCADE_PAGE_COUNT: Int = 4096       # 64 x 64
+comptime VSM_TOTAL_CLIPMAP_PAGES: Int = 16384     # 4 * 4096 = exactly VSM_VIRTUAL_PAGE_COUNT!
+
+# Half-extents for the 4 concentric cascades:
+comptime VSM_CASCADE_0_EXTENT: Float32 = 8.0      # Near fine detail
+comptime VSM_CASCADE_1_EXTENT: Float32 = 32.0     # Mid-range
+comptime VSM_CASCADE_2_EXTENT: Float32 = 128.0    # Far environment
+comptime VSM_CASCADE_3_EXTENT: Float32 = 512.0    # Horizon / mountains
+
+
+def get_vsm_cascade_index(dist: Float32) -> Int:
+    """Selects clipmap cascade 0..3 based on receiver distance from camera."""
+    if dist <= VSM_CASCADE_0_EXTENT:
+        return 0
+    elif dist <= VSM_CASCADE_1_EXTENT:
+        return 1
+    elif dist <= VSM_CASCADE_2_EXTENT:
+        return 2
+    return 3
+
+
+def compute_toroidal_page_index(cascade: Int, vx: Int, vy: Int) -> Int:
+    """Toroidal wrapping (vx mod 64, vy mod 64) eliminating CPU memory shifts and stalls."""
+    var tx = (vx % VSM_CASCADE_PAGES_DIM + VSM_CASCADE_PAGES_DIM) % VSM_CASCADE_PAGES_DIM
+    var ty = (vy % VSM_CASCADE_PAGES_DIM + VSM_CASCADE_PAGES_DIM) % VSM_CASCADE_PAGES_DIM
+    return cascade * VSM_CASCADE_PAGE_COUNT + (ty * VSM_CASCADE_PAGES_DIM + tx)
+
 
 
 struct VsmPageAllocation(Copyable, Movable):
@@ -93,6 +132,10 @@ struct VsmPageManager(Movable):
         self.current_epoch += 1
         self.cached_hits_last_frame = 0
         var to_render = List[VsmPageAllocation]()
+        # Once a scan finds no free / evictable tile, every tile has been touched this epoch and stays so for the
+        # rest of this call, so later scans would fail too: skip them (identical output, O(1) per extra request
+        # instead of O(VSM_PHYS_TILE_COUNT) when more pages are requested than the physical atlas holds).
+        var phys_exhausted = False
 
         for v_idx in range(VSM_VIRTUAL_PAGE_COUNT):
             var req = table_words[VSM_VIRTUAL_PAGE_COUNT + v_idx]
@@ -113,6 +156,9 @@ struct VsmPageManager(Movable):
 
             var chosen_p = existing_p
             if chosen_p < 0:
+                if phys_exhausted:
+                    table_words[v_idx] = 0
+                    continue
                 # Find free physical tile or LRU tile not touched this frame
                 var oldest_ep = self.current_epoch
                 var best_slot = -1
@@ -124,6 +170,7 @@ struct VsmPageManager(Movable):
                         oldest_ep = self.phys_last_used[pi]
                         best_slot = pi
                 if best_slot < 0:
+                    phys_exhausted = True
                     table_words[v_idx] = 0
                     continue
                 chosen_p = best_slot
@@ -271,8 +318,8 @@ def vsm_page_vertex_shader() -> List[UInt32]:
 
     var v_idx = s.vertex_index()
     var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(16))
-    var ml_id = s.bit_and(packed_inst, s.uint(0xFFFF))
+    var inst_id = s.shr(packed_inst, s.uint(17))
+    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
 
     var local_prim = s.udiv(v_idx, s.uint(3))
     var corner = s.umod(v_idx, s.uint(3))
@@ -300,6 +347,108 @@ def vsm_page_vertex_shader() -> List[UInt32]:
     var page_cz = s.nclamp(lclip[2], s.float(0.0), s.float(1.0))
     s.write_clip_position(page_cx, page_cy, page_cz, s.float(1.0))
 
+    return s.finish()
+
+
+def vsm_alphamask_vertex_shader() -> List[UInt32]:
+    """Two-Bucket Alpha-Masked VSM Page Vertex Shader (`128x128` tile zoom + `uv` & `t_alb` forwarding)."""
+    var s = AaaSpirvModule(MODEL_VERTEX, push_words=AAA_PUSH_WORDS)
+    var b_verts = s.buffer(BIND_AAA_VERTICES)
+    var b_indices = s.buffer(BIND_AAA_INDICES)
+    var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
+    var b_instances = s.buffer(BIND_AAA_INSTANCES)
+    var b_materials = s.buffer(BIND_AAA_MATERIALS)
+    var b_globals = s.buffer(BIND_AAA_GLOBALS)
+
+    var out_uv = s.add_stage_io(STORAGE_OUTPUT, s.type_vec2, location=0, flat=False)
+    var out_talb = s.add_stage_io(STORAGE_OUTPUT, s.type_uint, location=1, flat=True)
+
+    var v_idx = s.vertex_index()
+    var packed_inst = s.instance_index()
+    var inst_id = s.shr(packed_inst, s.uint(17))
+    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+
+    var local_prim = s.udiv(v_idx, s.uint(3))
+    var corner = s.umod(v_idx, s.uint(3))
+    var ml_base = s.imul(ml_id, s.uint(12))
+    var first_tri = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(8)))
+    var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
+
+    var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
+    var mat_ov = s.bit_and(s.load_word(b_instances, s.iadd(inst_base, s.uint(34))), s.uint(0xFFFF))
+    var final_mat = s.select_u(s.ieq(mat_ov, s.uint(0xFFFF)), ml_mat, mat_ov)
+    var tex_pk = s.load_word(b_materials, s.iadd(s.imul(final_mat, s.uint(24)), s.uint(23)))
+    var t_alb = s.bit_and(tex_pk, s.uint(0xFF))
+
+    var global_tri = s.iadd(first_tri, local_prim)
+    var real_vtx = s.load_word(b_indices, s.iadd(s.imul(global_tri, s.uint(3)), corner))
+    var v_base = s.imul(real_vtx, s.uint(12))
+
+    var lpx = s.load_float(b_verts, v_base)
+    var lpy = s.load_float(b_verts, s.iadd(v_base, s.uint(1)))
+    var lpz = s.load_float(b_verts, s.iadd(v_base, s.uint(2)))
+    var uv_u = s.load_float(b_verts, s.iadd(v_base, s.uint(9)))
+    var uv_v = s.load_float(b_verts, s.iadd(v_base, s.uint(10)))
+
+    var wp = emit_mat4_mul_point(s, b_instances, inst_base, lpx, lpy, lpz)
+    var lclip = emit_mat4_mul_point(s, b_globals, s.uint(56), wp[0], wp[1], wp[2])
+
+    var sc_x = s.push_float(0)
+    var sc_y = s.push_float(1)
+    var bi_x = s.push_float(2)
+    var bi_y = s.push_float(3)
+    var page_cx = s.fma(lclip[0], sc_x, bi_x)
+    var page_cy = s.fma(lclip[1], sc_y, bi_y)
+    var page_cz = s.nclamp(lclip[2], s.float(0.0), s.float(1.0))
+    s.write_clip_position(page_cx, page_cy, page_cz, s.float(1.0))
+    emit(s.code, OP_STORE, out_uv[1], s.vec2(uv_u, uv_v))
+    emit(s.code, OP_STORE, out_talb[1], t_alb)
+    return s.finish()
+
+
+def vsm_alphamask_fragment_shader() -> List[UInt32]:
+    """Depth-only Alpha-Cutout VSM Fragment Shader (`early_depth = False`, `enable_bindless = True`):
+    Casts crisp serrated oak-twig, conifer-needle & wrought-iron fence shadows into `16k` VSM tiles!"""
+    var s = AaaSpirvModule(
+        MODEL_FRAGMENT,
+        push_words=AAA_PUSH_WORDS,
+        enable_bindless=True,
+        early_depth=False,
+    )
+    var bindless_arr = s.bindless_sampled_array_2d(BIND_AAA_BINDLESS_TEX, AAA_MAX_BINDLESS)
+    var in_uv = s.add_stage_io(STORAGE_INPUT, s.type_vec2, location=0, flat=False)
+    var in_talb = s.add_stage_io(STORAGE_INPUT, s.type_uint, location=1, flat=True)
+
+    var uv_val = s.fresh()
+    emit(s.code, OP_LOAD, s.type_vec2, uv_val, in_uv[1])
+    var uv_x = s.extract_f(uv_val, 0)
+    var uv_y = s.extract_f(uv_val, 1)
+
+    var ddx_u = s.dpdx(uv_x)
+    var ddx_v = s.dpdx(uv_y)
+    var ddy_u = s.dpdy(uv_x)
+    var ddy_v = s.dpdy(uv_y)
+    var gx2 = s.fma(ddx_u, ddx_u, s.fmul(ddx_v, ddx_v))
+    var gy2 = s.fma(ddy_u, ddy_u, s.fmul(ddy_v, ddy_v))
+    var px_foot = s.fmul(s.fsqrt(s.nmax(s.float(1e-8), s.nmax(gx2, gy2))), s.float(512.0))
+    var mip_est = s.nclamp(s.log2(s.nmax(s.float(1.0), px_foot)), s.float(0.0), s.float(6.0))
+
+    var t_alb = s.fresh()
+    emit(s.code, OP_LOAD, s.type_uint, t_alb, in_talb[1])
+    var alpha_v = s.fvar(s.float(1.0))
+    s.begin_if(s.ult(t_alb, s.uint(0xFF)))
+    var rgba = s.sample_bindless_grad(
+        bindless_arr,
+        t_alb,
+        uv_val,
+        s.vec2(ddx_u, ddx_v),
+        s.vec2(ddy_u, ddy_v),
+    )
+    var raw_a = s.extract_f(rgba, 3)
+    s.store(alpha_v, s.fmul(raw_a, s.fma(mip_est, s.float(0.18), s.float(1.0))))
+    s.end_if()
+
+    s.discard_if(s.flt(s.load_f(alpha_v), s.float(0.48)))
     return s.finish()
 
 

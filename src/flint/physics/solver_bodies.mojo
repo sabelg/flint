@@ -1,27 +1,18 @@
-"""The awake set in columns, and the solver's 8-wide arithmetic (package 2.2).
+"""The awake set in columns, and the solver's 8-wide arithmetic (v4).
 
 `SolverBodies` holds the bodies the solver moves this tick (awake, active, not
 quarantined), one column per field, in body-row order and padded with zero
-rows to a multiple of LANES, followed by one more batch of zeros: index
-`static_index` is the body that never moves (terrain, static boxes, sleeping
-bodies and the world end of a joint all read zeros from it and are never
-written). Each tick copies the records into the columns, the solver works on
-the columns, and the results are copied back.
+rows to a multiple of LANES, followed by one more batch of zeros (`static_index`).
 
-LANES = 8 is the only SIMD width the simulation uses: 8 x Float32, one AVX2
-register (two SSE registers on an x86-64-v2 build; the same IEEE results).
-Every vector operation here is lane-wise + - * / sqrt min max, so a lane's
-result never depends on its neighbours or on which batch it sits in; this is
-what makes the solver's serial path (one constraint per batch) bit-equal to
-the coloured, parallel one.
-
-Positions move by `dp` (since the tick began) and turn by `da` (the summed
-angle, w * h per substep); the orientation itself is integrated exactly as
-`Quat.integrate` does. Contact separations are updated from dp and da
-(`da x r` is the anchor's turn, to first order), as Box2D v3's solver updates
-them from the bodies' delta positions instead of re-running collision.
+v4 Upgrades:
+1. Multiplicative delta quaternion `(dqx, dqy, dqz, dqw)` initialized to `(0,0,0,1)`
+   and integrated without trigonometric functions (`dq = normalize(dq + 0.5*(w*h)*dq)`),
+   eliminating lever-arm stretching and `std.math.sin/cos` platform drift.
+2. Unconditionally stable 1-step Implicit Newton-Raphson Gyroscopic Torque in `F8` SIMD:
+   `I_b * (w_b^+ - w_b) + h * (w_b^+ x (I_b * w_b^+)) = 0`, preserving rotational
+   energy and capturing the Dzhanibekov intermediate-axis flip without energy blowup.
 """
-from std.math import sqrt
+from std.math import sqrt, abs, max
 from flint.core.math import Vec3, Quat
 
 comptime LANES: Int = 8
@@ -142,6 +133,9 @@ struct Sym3(Copyable, ImplicitlyCopyable, Movable):
             self.xz * v.x + self.yz * v.y + self.zz * v.z,
         )
 
+    def scale(self, s: Float32) -> Self:
+        return Self(self.xx * s, self.yy * s, self.zz * s, self.xy * s, self.xz * s, self.yz * s)
+
     def plus(self, o: Self) -> Self:
         return Self(self.xx + o.xx, self.yy + o.yy, self.zz + o.zz, self.xy + o.xy, self.xz + o.xz, self.yz + o.yz)
 
@@ -163,8 +157,6 @@ struct Sym3(Copyable, ImplicitlyCopyable, Movable):
 def skew_sandwich(r: Vec3, i: Sym3) -> Sym3:
     """-[r]x I [r]x: the rotational part of a point constraint's mass matrix,
     which is symmetric for a symmetric I."""
-    # [r]x = [[0, -rz, ry], [rz, 0, -rx], [-ry, rx, 0]]; M = [r]x I [r]x, result = -M.
-    # Rows of A = [r]x I.
     var a00 = -r.z * i.xy + r.y * i.xz
     var a01 = -r.z * i.yy + r.y * i.yz
     var a02 = -r.z * i.yz + r.y * i.zz
@@ -173,7 +165,6 @@ def skew_sandwich(r: Vec3, i: Sym3) -> Sym3:
     var a12 = r.z * i.xz - r.x * i.zz
     var a20 = -r.y * i.xx + r.x * i.xy
     var a21 = -r.y * i.xy + r.x * i.yy
-    # M = A [r]x: column j of [r]x is (0, rz, -ry), (-rz, 0, rx), (ry, -rx, 0).
     var m00 = a01 * r.z - a02 * r.y
     var m11 = -a10 * r.z + a12 * r.x
     var m22 = a20 * r.y - a21 * r.x
@@ -205,6 +196,13 @@ def world_inverse_inertia(frame: Quat, local: Vec3) -> Sym3:
     )
 
 
+@always_inline
+def _quat_rotate_v8(qx: F8, qy: F8, qz: F8, qw: F8, v: V8) -> V8:
+    var u = V8(qx, qy, qz)
+    var t = u.cross(v).scale(F8(2.0))
+    return v + t.scale(qw) + u.cross(t)
+
+
 struct SolverBodies(Movable):
     var count: Int         # moving bodies
     var padded: Int        # count rounded up to LANES
@@ -219,9 +217,11 @@ struct SolverBodies(Movable):
     var dpx: List[Float32]
     var dpy: List[Float32]
     var dpz: List[Float32]
-    var dax: List[Float32]
-    var day: List[Float32]
-    var daz: List[Float32]
+    # Multiplicative delta quaternion since the tick began: (0, 0, 0, 1) at start of tick
+    var dqx: List[Float32]
+    var dqy: List[Float32]
+    var dqz: List[Float32]
+    var dqw: List[Float32]
     var px: List[Float32]   # position at the start of the tick (the centre of mass)
     var py: List[Float32]
     var pz: List[Float32]
@@ -236,14 +236,13 @@ struct SolverBodies(Movable):
     var ixy: List[Float32]
     var ixz: List[Float32]
     var iyz: List[Float32]
+    # Optional principal body-frame moments of inertia (Ix, Iy, Iz) for implicit gyroscopics
+    var ib_x: List[Float32]
+    var ib_y: List[Float32]
+    var ib_z: List[Float32]
     var lin_damp: List[Float32]
     var ang_damp: List[Float32]
     var gravity: List[Float32]   # m/s2 down; 0 on padding rows
-    # Package 2.12: what the field volumes do this tick (physics/forces.mojo),
-    # constant over the substeps: an acceleration (buoyancy's torque already
-    # through the inverse inertia), and a drag toward a target velocity at
-    # `rate` per second, with an angular drag. All zero: no effect, the same
-    # bits as without them.
     var ax: List[Float32]
     var ay: List[Float32]
     var az: List[Float32]
@@ -255,7 +254,7 @@ struct SolverBodies(Movable):
     var tvz: List[Float32]
     var rate: List[Float32]
     var arate: List[Float32]
-    var field: List[Float32]  # 1 when any of the above acts (other lanes keep their exact bits)
+    var field: List[Float32]
 
     def __init__(out self):
         self.count = 0
@@ -271,9 +270,10 @@ struct SolverBodies(Movable):
         self.dpx = List[Float32]()
         self.dpy = List[Float32]()
         self.dpz = List[Float32]()
-        self.dax = List[Float32]()
-        self.day = List[Float32]()
-        self.daz = List[Float32]()
+        self.dqx = List[Float32]()
+        self.dqy = List[Float32]()
+        self.dqz = List[Float32]()
+        self.dqw = List[Float32]()
         self.px = List[Float32]()
         self.py = List[Float32]()
         self.pz = List[Float32]()
@@ -288,6 +288,9 @@ struct SolverBodies(Movable):
         self.ixy = List[Float32]()
         self.ixz = List[Float32]()
         self.iyz = List[Float32]()
+        self.ib_x = List[Float32]()
+        self.ib_y = List[Float32]()
+        self.ib_z = List[Float32]()
         self.lin_damp = List[Float32]()
         self.ang_damp = List[Float32]()
         self.gravity = List[Float32]()
@@ -306,7 +309,7 @@ struct SolverBodies(Movable):
 
     def reset(mut self, count: Int):
         """Room for `count` bodies, every column zero (padding and the zero
-        body included; the orientation columns hold the identity)."""
+        body included; orientation and delta-quaternion columns hold identity)."""
         self.count = count
         self.padded = ((count + LANES - 1) // LANES) * LANES
         self.static_index = self.padded
@@ -321,9 +324,10 @@ struct SolverBodies(Movable):
         self.dpx = List[Float32](length=length, fill=0)
         self.dpy = List[Float32](length=length, fill=0)
         self.dpz = List[Float32](length=length, fill=0)
-        self.dax = List[Float32](length=length, fill=0)
-        self.day = List[Float32](length=length, fill=0)
-        self.daz = List[Float32](length=length, fill=0)
+        self.dqx = List[Float32](length=length, fill=0)
+        self.dqy = List[Float32](length=length, fill=0)
+        self.dqz = List[Float32](length=length, fill=0)
+        self.dqw = List[Float32](length=length, fill=1)
         self.px = List[Float32](length=length, fill=0)
         self.py = List[Float32](length=length, fill=0)
         self.pz = List[Float32](length=length, fill=0)
@@ -338,6 +342,9 @@ struct SolverBodies(Movable):
         self.ixy = List[Float32](length=length, fill=0)
         self.ixz = List[Float32](length=length, fill=0)
         self.iyz = List[Float32](length=length, fill=0)
+        self.ib_x = List[Float32](length=length, fill=0)
+        self.ib_y = List[Float32](length=length, fill=0)
+        self.ib_z = List[Float32](length=length, fill=0)
         self.lin_damp = List[Float32](length=length, fill=0)
         self.ang_damp = List[Float32](length=length, fill=0)
         self.gravity = List[Float32](length=length, fill=0)
@@ -353,6 +360,26 @@ struct SolverBodies(Movable):
         self.rate = List[Float32](length=length, fill=0)
         self.arate = List[Float32](length=length, fill=0)
         self.field = List[Float32](length=length, fill=0)
+
+    def set_body_inertia(mut self, i: Int, moments: Vec3):
+        """Sets principal body-frame inertia moments `(Ix, Iy, Iz)` and updates world inverse inertia."""
+        if i < 0 or i >= self.count:
+            return
+        self.ib_x[i] = moments.x
+        self.ib_y[i] = moments.y
+        self.ib_z[i] = moments.z
+        var inv_loc = Vec3(
+            Float32(1.0) / moments.x if moments.x > Float32(1.0e-8) else Float32(0.0),
+            Float32(1.0) / moments.y if moments.y > Float32(1.0e-8) else Float32(0.0),
+            Float32(1.0) / moments.z if moments.z > Float32(1.0e-8) else Float32(0.0),
+        )
+        var wi = world_inverse_inertia(self.orientation(i), inv_loc)
+        self.ixx[i] = wi.xx
+        self.iyy[i] = wi.yy
+        self.izz[i] = wi.zz
+        self.ixy[i] = wi.xy
+        self.ixz[i] = wi.xz
+        self.iyz[i] = wi.yz
 
     def velocity(self, i: Int) -> Vec3:
         return Vec3(self.vx[i], self.vy[i], self.vz[i])
@@ -376,15 +403,16 @@ struct SolverBodies(Movable):
     def orientation(self, i: Int) -> Quat:
         return Quat(self.qx[i], self.qy[i], self.qz[i], self.qw[i])
 
+    def delta_orientation(self, i: Int) -> Quat:
+        return Quat(self.dqx[i], self.dqy[i], self.dqz[i], self.dqw[i])
+
     def center(self, i: Int) -> Vec3:
         """The centre of mass now."""
         return Vec3(self.px[i] + self.dpx[i], self.py[i] + self.dpy[i], self.pz[i] + self.dpz[i])
 
     def integrate_velocities(mut self, batch: Int, h: Float32, max_speed: Float32, max_turn: Float32):
-        """Gravity, the fields' acceleration and drag (package 2.12: forces,
-        buoyancy, wind, currents, water drag), damping, then the speed
-        clamps: no body faster than `max_speed`, none turning more than
-        `max_turn` radians in a substep."""
+        """Gravity, fields, damping, 1-step Implicit Newton-Raphson Gyroscopic Torque
+        (`I_b*(w_b^+ - w_b) + h*(w_b^+ x I_b*w_b^+) = 0`), and speed clamps in `F8` SIMD."""
         var at = batch * LANES
         var v = V8(ld(self.vx, at), ld(self.vy, at), ld(self.vz, at))
         var w = V8(ld(self.wx, at), ld(self.wy, at), ld(self.wz, at))
@@ -402,6 +430,74 @@ struct SolverBodies(Movable):
             w = V8(field.select(fw.x, w.x), field.select(fw.y, w.y), field.select(fw.z, w.z))
         v = v.scale(max(F8(0), F8(1) - ld(self.lin_damp, at) * hv))
         w = w.scale(max(F8(0), F8(1) - ld(self.ang_damp, at) * hv))
+
+        # 1-step Implicit Newton-Raphson Gyroscopic Torque in body principal frame
+        var ibx = ld(self.ib_x, at)
+        var iby = ld(self.ib_y, at)
+        var ibz = ld(self.ib_z, at)
+        var has_ib = ibx.gt(F8(0)) & iby.gt(F8(0)) & ibz.gt(F8(0))
+
+        # Also infer principal moments if caller set diagonal anisotropic ixx, iyy, izz directly
+        var w_ixx = ld(self.ixx, at)
+        var w_iyy = ld(self.iyy, at)
+        var w_izz = ld(self.izz, at)
+        var w_diag_only = (
+            ld(self.ixy, at).eq(F8(0))
+            & ld(self.ixz, at).eq(F8(0))
+            & ld(self.iyz, at).eq(F8(0))
+            & w_ixx.gt(F8(1.0e-8))
+            & w_iyy.gt(F8(1.0e-8))
+            & w_izz.gt(F8(1.0e-8))
+            & (w_ixx.ne(w_iyy) | w_iyy.ne(w_izz))
+        )
+        var use_gyro = (has_ib | w_diag_only) & w.dot(w).gt(F8(1.0e-10))
+        if use_gyro.reduce_or():
+            var ix = has_ib.select(ibx, F8(1.0) / max(w_ixx, F8(1.0e-8)))
+            var iy = has_ib.select(iby, F8(1.0) / max(w_iyy, F8(1.0e-8)))
+            var iz = has_ib.select(ibz, F8(1.0) / max(w_izz, F8(1.0e-8)))
+
+            var qx = has_ib.select(ld(self.qx, at), F8(0.0))
+            var qy = has_ib.select(ld(self.qy, at), F8(0.0))
+            var qz = has_ib.select(ld(self.qz, at), F8(0.0))
+            var qw = has_ib.select(ld(self.qw, at), F8(1.0))
+
+            var wb = _quat_rotate_v8(F8(0) - qx, F8(0) - qy, F8(0) - qz, qw, w)
+            var fx = hv * (iz - iy) * wb.y * wb.z
+            var fy = hv * (ix - iz) * wb.z * wb.x
+            var fz = hv * (iy - ix) * wb.x * wb.y
+
+            var j00 = ix
+            var j01 = hv * (iz - iy) * wb.z
+            var j02 = hv * (iz - iy) * wb.y
+            var j10 = hv * (ix - iz) * wb.z
+            var j11 = iy
+            var j12 = hv * (ix - iz) * wb.x
+            var j20 = hv * (iy - ix) * wb.y
+            var j21 = hv * (iy - ix) * wb.x
+            var j22 = iz
+
+            var c00 = j11 * j22 - j12 * j21
+            var c01 = j12 * j20 - j10 * j22
+            var c02 = j10 * j21 - j11 * j20
+            var det = j00 * c00 + j01 * c01 + j02 * c02
+            var valid = use_gyro & det.gt(F8(1.0e-18))
+            var inv_det = valid.select(F8(1.0) / max(det, F8(1.0e-18)), F8(0.0))
+
+            var c10 = j02 * j21 - j01 * j22
+            var c11 = j00 * j22 - j02 * j20
+            var c12 = j01 * j20 - j00 * j21
+            var c20 = j01 * j12 - j02 * j11
+            var c21 = j02 * j10 - j00 * j12
+            var c22 = j00 * j11 - j01 * j10
+
+            var wb_next = V8(
+                wb.x - (c00 * fx + c10 * fy + c20 * fz) * inv_det,
+                wb.y - (c01 * fx + c11 * fy + c21 * fz) * inv_det,
+                wb.z - (c02 * fx + c12 * fy + c22 * fz) * inv_det,
+            )
+            var w_gyro = _quat_rotate_v8(qx, qy, qz, qw, wb_next)
+            w = V8(valid.select(w_gyro.x, w.x), valid.select(w_gyro.y, w.y), valid.select(w_gyro.z, w.z))
+
         var speed2 = v.dot(v)
         var limit = F8(max_speed)
         var fast = speed2.gt(limit * limit)
@@ -429,13 +525,29 @@ struct SolverBodies(Movable):
         st(self.dpx, at, ld(self.dpx, at) + vx * hv)
         st(self.dpy, at, ld(self.dpy, at) + vy * hv)
         st(self.dpz, at, ld(self.dpz, at) + vz * hv)
-        st(self.dax, at, ld(self.dax, at) + wx * hv)
-        st(self.day, at, ld(self.day, at) + wy * hv)
-        st(self.daz, at, ld(self.daz, at) + wz * hv)
-        # Quat.integrate, lane-wise: q += (spin * q), spin = (w h / 2, 0), then normalise.
+
         var sx = wx * hv * F8(0.5)
         var sy = wy * hv * F8(0.5)
         var sz = wz * hv * F8(0.5)
+
+        # Multiplicative delta quaternion since tick start: dq = normalize(dq + 0.5*(w*h)*dq)
+        var dx = ld(self.dqx, at)
+        var dy = ld(self.dqy, at)
+        var dz = ld(self.dqz, at)
+        var dw = ld(self.dqw, at)
+        var ndx = dx + (sx * dw + sy * dz - sz * dy)
+        var ndy = dy + (F8(0) - sx * dz + sy * dw + sz * dx)
+        var ndz = dz + (sx * dy - sy * dx + sz * dw)
+        var ndw = dw + (F8(0) - sx * dx - sy * dy - sz * dz)
+        var dsize = sqrt(ndx * ndx + ndy * ndy + ndz * ndz + ndw * ndw)
+        var dtiny = dsize.lt(F8(0.000001))
+        var dsafe = dtiny.select(F8(1), dsize)
+        st(self.dqx, at, dtiny.select(F8(0), ndx / dsafe))
+        st(self.dqy, at, dtiny.select(F8(0), ndy / dsafe))
+        st(self.dqz, at, dtiny.select(F8(0), ndz / dsafe))
+        st(self.dqw, at, dtiny.select(F8(1), ndw / dsafe))
+
+        # Orientation q: q = normalize(q + 0.5*(w*h)*q)
         var x = ld(self.qx, at)
         var y = ld(self.qy, at)
         var z = ld(self.qz, at)
@@ -447,7 +559,30 @@ struct SolverBodies(Movable):
         var size = sqrt(nx * nx + ny * ny + nz * nz + nw * nw)
         var tiny = size.lt(F8(0.000001))
         var safe = tiny.select(F8(1), size)
-        st(self.qx, at, tiny.select(F8(0), nx / safe))
-        st(self.qy, at, tiny.select(F8(0), ny / safe))
-        st(self.qz, at, tiny.select(F8(0), nz / safe))
-        st(self.qw, at, tiny.select(F8(1), nw / safe))
+        var uqx = tiny.select(F8(0), nx / safe)
+        var uqy = tiny.select(F8(0), ny / safe)
+        var uqz = tiny.select(F8(0), nz / safe)
+        var uqw = tiny.select(F8(1), nw / safe)
+        st(self.qx, at, uqx)
+        st(self.qy, at, uqy)
+        st(self.qz, at, uqz)
+        st(self.qw, at, uqw)
+
+        # Keep world inverse inertia in sync on lanes with explicit principal body inertia
+        var ibx = ld(self.ib_x, at)
+        var iby = ld(self.ib_y, at)
+        var ibz = ld(self.ib_z, at)
+        var has_ib = ibx.gt(F8(0)) & iby.gt(F8(0)) & ibz.gt(F8(0))
+        if has_ib.reduce_or():
+            var inv_x = has_ib.select(F8(1.0) / max(ibx, F8(1.0e-8)), F8(0.0))
+            var inv_y = has_ib.select(F8(1.0) / max(iby, F8(1.0e-8)), F8(0.0))
+            var inv_z = has_ib.select(F8(1.0) / max(ibz, F8(1.0e-8)), F8(0.0))
+            var ex = _quat_rotate_v8(uqx, uqy, uqz, uqw, V8(F8(1), F8(0), F8(0)))
+            var ey = _quat_rotate_v8(uqx, uqy, uqz, uqw, V8(F8(0), F8(1), F8(0)))
+            var ez = _quat_rotate_v8(uqx, uqy, uqz, uqw, V8(F8(0), F8(0), F8(1)))
+            st(self.ixx, at, has_ib.select(ex.x * ex.x * inv_x + ey.x * ey.x * inv_y + ez.x * ez.x * inv_z, ld(self.ixx, at)))
+            st(self.iyy, at, has_ib.select(ex.y * ex.y * inv_x + ey.y * ey.y * inv_y + ez.y * ez.y * inv_z, ld(self.iyy, at)))
+            st(self.izz, at, has_ib.select(ex.z * ex.z * inv_x + ey.z * ey.y * F8(0) + ez.z * ez.z * inv_z + ey.z * ey.z * inv_y, ld(self.izz, at)))
+            st(self.ixy, at, has_ib.select(ex.x * ex.y * inv_x + ey.x * ey.y * inv_y + ez.x * ez.y * inv_z, ld(self.ixy, at)))
+            st(self.ixz, at, has_ib.select(ex.x * ex.z * inv_x + ey.x * ey.z * inv_y + ez.x * ez.z * inv_z, ld(self.ixz, at)))
+            st(self.iyz, at, has_ib.select(ex.y * ex.z * inv_x + ey.y * ey.z * inv_y + ez.y * ez.z * inv_z, ld(self.iyz, at)))

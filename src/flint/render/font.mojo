@@ -88,6 +88,9 @@ struct SdfFont(Copyable, Movable):
     var packer: ShelfPacker
     var flushes: Int
     var dynamic_baked: Int
+    var dirty_y0: Int
+    var dirty_y1: Int
+    var atlas_version: UInt64
 
     def __init__(out self):
         self.valid = False
@@ -113,6 +116,9 @@ struct SdfFont(Copyable, Movable):
         self.packer = ShelfPacker(0, 0)
         self.flushes = 0
         self.dynamic_baked = 0
+        self.dirty_y0 = 0
+        self.dirty_y1 = 0
+        self.atlas_version = 0
 
     def load(mut self, path: String) -> Bool:
         return self.load_bytes(read_bytes(path))
@@ -169,6 +175,9 @@ struct SdfFont(Copyable, Movable):
             self.cap_height = -(self.glyphs[h_index].yoff + self.pad)
         else:
             self.cap_height = self.ascent * 0.7
+        self.dirty_y0 = 0
+        self.dirty_y1 = self.atlas_height
+        self.atlas_version = 1
         self.valid = True
         return True
 
@@ -210,6 +219,9 @@ struct SdfFont(Copyable, Movable):
         self.atlas_height += DYNAMIC_ROWS
         self.atlas.resize(self.atlas_width * self.atlas_height, 0)
         self.packer = ShelfPacker(self.atlas_width, self.atlas_height, self.baked_height + 1)
+        self.dirty_y0 = 0
+        self.dirty_y1 = self.atlas_height
+        self.atlas_version += 1
         return True
 
     def glyph_index(self, code: Int) -> Int:
@@ -291,6 +303,9 @@ struct SdfFont(Copyable, Movable):
         self.atlas_height += DYNAMIC_ROWS
         self.atlas.resize(self.atlas_width * self.atlas_height, 0)
         self.packer = ShelfPacker(self.atlas_width, self.atlas_height, self.baked_height + 1)
+        self.dirty_y0 = 0
+        self.dirty_y1 = self.atlas_height
+        self.atlas_version += 1
         return True
 
     def ensure(mut self, code: Int) -> Bool:
@@ -328,6 +343,10 @@ struct SdfFont(Copyable, Movable):
             self.extra[code] = len(self.glyphs) - 1
         self.dynamic_codes.append(code)
         self.dynamic_baked += 1
+        if spot[0] >= 0 and baked.w > 0:
+            self.dirty_y0 = min(self.dirty_y0, spot[1])
+            self.dirty_y1 = max(self.dirty_y1, spot[1] + baked.h)
+            self.atlas_version += 1
         return True
 
     def ensure_text(mut self, text: String):
@@ -351,6 +370,16 @@ struct SdfFont(Copyable, Movable):
             self.atlas[index] = 0
         self.packer.reset()
         self.flushes += 1
+        self.dirty_y0 = min(self.dirty_y0, self.baked_height)
+        self.dirty_y1 = max(self.dirty_y1, self.atlas_height)
+        self.atlas_version += 1
+
+    def is_dirty(self) -> Bool:
+        return self.dirty_y1 > self.dirty_y0 and self.atlas_width > 0
+
+    def mark_clean(mut self):
+        self.dirty_y0 = self.atlas_height
+        self.dirty_y1 = 0
 
     def sample(self, x: Float32, y: Float32) -> Float32:
         """Bilinear distance at atlas coordinates (texel centres at +0.5)."""

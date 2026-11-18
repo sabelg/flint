@@ -31,7 +31,9 @@ Sensors are volumes (a box or a sphere) with a filter: a body whose box
 overlaps one, and whose filter it accepts, is inside; entering and leaving
 are events. Sensors never push anything.
 """
+from std.math import min, max
 from flint.core.math import Vec3
+from flint.core.detsort import mix64
 from flint.core.serial import BlobWriter, BlobReader
 from flint.physics.filter import CollisionFilter, CAT_ALL, CAT_SENSOR
 
@@ -102,14 +104,53 @@ def event_before(x: PhysicsEvent, y: PhysicsEvent) -> Bool:
 
 
 def sort_events(mut events: List[PhysicsEvent]):
-    """Stable insertion sort by (kind, a, b): short lists, fixed order."""
-    for index in range(1, len(events)):
-        var item = events[index]
-        var at = index - 1
-        while at >= 0 and event_before(item, events[at]):
-            events[at + 1] = events[at]
-            at -= 1
-        events[at + 1] = item
+    """Deterministic stable sort by (kind, a, b): O(N log N) bottom-up merge sort."""
+    var count = len(events)
+    if count <= 32:
+        for index in range(1, count):
+            var item = events[index]
+            var at = index - 1
+            while at >= 0 and event_before(item, events[at]):
+                events[at + 1] = events[at]
+                at -= 1
+            events[at + 1] = item
+        return
+
+    var scratch = List[PhysicsEvent](length=count, fill=PhysicsEvent(0, 0, 0))
+    var width = 1
+    while width < count:
+        var start = 0
+        while start < count:
+            var mid = min(start + width, count)
+            var end = min(start + 2 * width, count)
+            var l = start
+            var r = mid
+            var o = start
+            while l < mid and r < end:
+                if not event_before(events[r], events[l]):
+                    scratch[o] = events[l]
+                    l += 1
+                else:
+                    scratch[o] = events[r]
+                    r += 1
+                o += 1
+            while l < middle_val(mid):
+                scratch[o] = events[l]
+                l += 1
+                o += 1
+            while r < end:
+                scratch[o] = events[r]
+                r += 1
+                o += 1
+            start = end
+        for i in range(count):
+            events[i] = scratch[i]
+        width *= 2
+
+
+@always_inline
+def middle_val(m: Int) -> Int:
+    return m
 
 
 struct CachedContact(Copyable, ImplicitlyCopyable, Movable):
@@ -331,17 +372,33 @@ struct ContactCache(Copyable, Movable):
             self.touching_b.append(pair.b)
 
     def keep_resting(mut self, sleeping: List[Int]):
-        """Sleeping bodies make no contacts, but they still touch: a contact
-        or pair whose body sleeps and whose other side is terrain, a static box
-        or another sleeper is kept as it was (no end event, then a begin when
-        it wakes). `sleeping` lists the ids of the bodies asleep."""
+        """Sleeping bodies make no contacts, but they still touch: O(C + S) hash-set lookup."""
+        if len(sleeping) == 0:
+            return
+        var hcap = 16
+        while hcap < len(sleeping) * 2 + 8:
+            hcap *= 2
+        var hmask = hcap - 1
+        var set_ids = List[Int](length=hcap, fill=-1)
+        var set_used = List[Bool](length=hcap, fill=False)
+        for sid in sleeping:
+            var s = Int(mix64(UInt64(sid))) & hmask
+            for _ in range(hcap):
+                if not set_used[s]:
+                    set_used[s] = True
+                    set_ids[s] = sid
+                    break
+                if set_ids[s] == sid:
+                    break
+                s = (s + 1) & hmask
+
         for index in range(len(self.entries)):
-            if not self.entries[index].seen and resting(self.entries[index].a, self.entries[index].b, sleeping):
+            if not self.entries[index].seen and _resting_fast(self.entries[index].a, self.entries[index].b, set_ids, set_used, hmask):
                 self.entries[index].seen = True
         for index in range(len(self.touching_a)):
             var a = self.touching_a[index]
             var b = self.touching_b[index]
-            if resting(a, b, sleeping):
+            if _resting_fast(a, b, set_ids, set_used, hmask):
                 self.touch(a, b, 0, 0, Vec3(), Vec3())
 
     def serialize(self, mut out: BlobWriter):
@@ -388,6 +445,25 @@ struct ContactCache(Copyable, Movable):
         for _ in range(pairs):
             self.touching_a.append(input.integer())
             self.touching_b.append(input.integer())
+
+
+@always_inline
+def _asleep_fast(id: Int, set_ids: List[Int], set_used: List[Bool], hmask: Int) -> Bool:
+    var s = Int(mix64(UInt64(id))) & hmask
+    for _ in range(len(set_used)):
+        if not set_used[s]:
+            return False
+        if set_ids[s] == id:
+            return True
+        s = (s + 1) & hmask
+    return False
+
+
+@always_inline
+def _resting_fast(a: Int, b: Int, set_ids: List[Int], set_used: List[Bool], hmask: Int) -> Bool:
+    if b <= 0:
+        return _asleep_fast(a, set_ids, set_used, hmask)
+    return _asleep_fast(a, set_ids, set_used, hmask) and _asleep_fast(b, set_ids, set_used, hmask)
 
 
 def asleep(id: Int, sleeping: List[Int]) -> Bool:

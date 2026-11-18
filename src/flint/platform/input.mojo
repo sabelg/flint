@@ -1,5 +1,6 @@
 """Explicit keyboard, mouse, and Linux joystick state."""
 from std.ffi import external_call
+from std.math import sqrt
 from flint.platform.os import close_fd
 
 # Named pad controls. The first eleven match the Linux xpad joystick layout, and the
@@ -42,6 +43,10 @@ comptime ENODEV: Int32 = 19
 comptime JSIOCGNAME_64: UInt64 = 0x80406A13
 comptime JSIOCGAXES: UInt64 = 0x80016A11
 comptime JSIOCGBUTTONS: UInt64 = 0x80016A12
+comptime EV_FF: Int = 0x15
+comptime FF_RUMBLE: Int = 0x50
+comptime EVIOCSFF: UInt64 = 0x40304580
+comptime EVIOCRMFF: UInt64 = 0x40044581
 comptime PAD_MIN_AXES: Int = 2
 comptime PAD_MIN_BUTTONS: Int = 4
 comptime PAD_MAX_BUTTONS: Int = 32  # keyboards and mice posing as joysticks report far more
@@ -76,16 +81,20 @@ struct PadState(Copyable, Movable):
     var fd: Int
     var sony_layout: Bool
     var axes: List[Float32]
+    var raw_axes: List[Float32]
     var down: List[Bool]
     var pressed: List[Bool]
     var physical: List[Bool]  # package 3.15: the physical controls held (before the pad map)
     var latched: List[Bool]   # logical controls a toggle holds down
     var mash_ticks: List[Int] # logical controls: ticks held since the last press
+    var ff_effect_id: Int
 
     def __init__(out self):
         self.fd = -1
+        self.ff_effect_id = -1
         self.sony_layout = False
         self.axes = List[Float32](length=8, fill=0)
+        self.raw_axes = List[Float32](length=8, fill=0)
         self.down = List[Bool](length=PAD_CONTROLS, fill=False)
         self.pressed = List[Bool](length=PAD_CONTROLS, fill=False)
         self.physical = List[Bool](length=PAD_CONTROLS, fill=False)
@@ -155,39 +164,116 @@ struct PadState(Copyable, Movable):
             if control >= 0:
                 self.set_mapped(control, raw_value != 0, pad_map, toggle)
         elif kind == 2 and number < len(self.axes):
-            var value = Float32(raw_value) / 32767.0
-            var deadzone = PAD_DEADZONE
-            if number == PAD_AXIS_LEFT_X or number == PAD_AXIS_LEFT_Y:
-                deadzone = deadzone_left
+            if number == PAD_AXIS_LT or number == PAD_AXIS_RT:
+                var trig = max(Float32(0.0), min(Float32(1.0), (Float32(raw_value) + 32767.0) / 65534.0))
+                self.axes[number] = trig
+                self.raw_axes[number] = trig
+                if number == PAD_AXIS_LT:
+                    self.set_mapped(PAD_LT, trig > 0.1, pad_map, toggle)
+                elif number == PAD_AXIS_RT:
+                    self.set_mapped(PAD_RT, trig > 0.1, pad_map, toggle)
+            elif number == PAD_AXIS_LEFT_X or number == PAD_AXIS_LEFT_Y:
+                var val = max(Float32(-1.0), min(Float32(1.0), Float32(raw_value) / 32767.0))
+                self.raw_axes[number] = val
+                var rx = self.raw_axes[PAD_AXIS_LEFT_X]
+                var ry = self.raw_axes[PAD_AXIS_LEFT_Y]
+                var r = sqrt(rx * rx + ry * ry)
+                if r < deadzone_left:
+                    self.axes[PAD_AXIS_LEFT_X] = 0.0
+                    self.axes[PAD_AXIS_LEFT_Y] = 0.0
+                else:
+                    var scale = min(Float32(1.0), (r - deadzone_left) / max(Float32(0.0001), Float32(1.0) - deadzone_left)) / max(r, Float32(1e-6))
+                    self.axes[PAD_AXIS_LEFT_X] = rx * scale
+                    self.axes[PAD_AXIS_LEFT_Y] = ry * scale
+                self.set_control(PAD_STICK_LEFT, self.axes[PAD_AXIS_LEFT_X] < -PAD_DIRECTION)
+                self.set_control(PAD_STICK_RIGHT, self.axes[PAD_AXIS_LEFT_X] > PAD_DIRECTION)
+                self.set_control(PAD_STICK_UP, self.axes[PAD_AXIS_LEFT_Y] < -PAD_DIRECTION)
+                self.set_control(PAD_STICK_DOWN, self.axes[PAD_AXIS_LEFT_Y] > PAD_DIRECTION)
             elif number == PAD_AXIS_RIGHT_X or number == PAD_AXIS_RIGHT_Y:
-                deadzone = deadzone_right
-            self.axes[number] = 0 if abs(value) < deadzone else value
-            if number == PAD_AXIS_DPAD_X:
+                var val = max(Float32(-1.0), min(Float32(1.0), Float32(raw_value) / 32767.0))
+                self.raw_axes[number] = val
+                var rx = self.raw_axes[PAD_AXIS_RIGHT_X]
+                var ry = self.raw_axes[PAD_AXIS_RIGHT_Y]
+                var r = sqrt(rx * rx + ry * ry)
+                if r < deadzone_right:
+                    self.axes[PAD_AXIS_RIGHT_X] = 0.0
+                    self.axes[PAD_AXIS_RIGHT_Y] = 0.0
+                else:
+                    var scale = min(Float32(1.0), (r - deadzone_right) / max(Float32(0.0001), Float32(1.0) - deadzone_right)) / max(r, Float32(1e-6))
+                    self.axes[PAD_AXIS_RIGHT_X] = rx * scale
+                    self.axes[PAD_AXIS_RIGHT_Y] = ry * scale
+            elif number == PAD_AXIS_DPAD_X:
+                var value = Float32(raw_value) / 32767.0
+                self.axes[number] = 0 if abs(value) < PAD_DEADZONE else value
+                self.raw_axes[number] = value
                 self.set_control(PAD_LEFT, value < -0.5)
                 self.set_control(PAD_RIGHT, value > 0.5)
             elif number == PAD_AXIS_DPAD_Y:
+                var value = Float32(raw_value) / 32767.0
+                self.axes[number] = 0 if abs(value) < PAD_DEADZONE else value
+                self.raw_axes[number] = value
                 self.set_control(PAD_UP, value < -0.5)
                 self.set_control(PAD_DOWN, value > 0.5)
-            elif number == PAD_AXIS_LEFT_X:
-                self.set_control(PAD_STICK_LEFT, value < -PAD_DIRECTION)
-                self.set_control(PAD_STICK_RIGHT, value > PAD_DIRECTION)
-            elif number == PAD_AXIS_LEFT_Y:
-                self.set_control(PAD_STICK_UP, value < -PAD_DIRECTION)
-                self.set_control(PAD_STICK_DOWN, value > PAD_DIRECTION)
-            elif number == PAD_AXIS_LT:
-                self.set_mapped(PAD_LT, value > 0, pad_map, toggle)
-            elif number == PAD_AXIS_RT:
-                self.set_mapped(PAD_RT, value > 0, pad_map, toggle)
+            else:
+                var value = Float32(raw_value) / 32767.0
+                self.axes[number] = value
+                self.raw_axes[number] = value
 
     def clear(mut self):
+        self.ff_effect_id = -1
         for index in range(len(self.axes)):
             self.axes[index] = 0
+            self.raw_axes[index] = 0
         for index in range(PAD_CONTROLS):
             self.down[index] = False
             self.physical[index] = False
             self.latched[index] = False
             self.mash_ticks[index] = 0
             self.pressed[index] = False
+
+    def set_rumble(mut self, weak_motor: Float32, strong_motor: Float32, duration_ms: Int = 1000):
+        if self.fd < 0:
+            return
+        var effect = List[UInt8](length=48, fill=0)
+        # type = FF_RUMBLE (0x0050)
+        effect[0] = 0x50
+        effect[1] = 0x00
+        # id
+        var id_val = Int16(self.ff_effect_id)
+        effect[2] = UInt8(id_val & 0xFF)
+        effect[3] = UInt8((id_val >> 8) & 0xFF)
+        # replay.length at offset 10 in Linux struct ff_effect
+        var len_val = UInt16(min(65535, max(0, duration_ms)))
+        effect[10] = UInt8(len_val & 0xFF)
+        effect[11] = UInt8((len_val >> 8) & 0xFF)
+        # strong magnitude
+        var strong_mag = UInt16(min(65535, max(0, Int(strong_motor * 65535.0))))
+        effect[16] = UInt8(strong_mag & 0xFF)
+        effect[17] = UInt8((strong_mag >> 8) & 0xFF)
+        # weak magnitude
+        var weak_mag = UInt16(min(65535, max(0, Int(weak_motor * 65535.0))))
+        effect[18] = UInt8(weak_mag & 0xFF)
+        effect[19] = UInt8((weak_mag >> 8) & 0xFF)
+
+        var ret = external_call["ioctl", Int32](Int32(self.fd), EVIOCSFF, effect.unsafe_ptr())
+        if ret == 0:
+            var new_id = Int(Int16(UInt16(effect[2]) | (UInt16(effect[3]) << 8)))
+            self.ff_effect_id = new_id
+            var play_ev = List[UInt8](length=24, fill=0)
+            play_ev[16] = 0x15
+            play_ev[18] = UInt8(new_id & 0xFF)
+            play_ev[19] = UInt8((new_id >> 8) & 0xFF)
+            play_ev[20] = 1
+            _ = external_call["write", Int64](Int32(self.fd), play_ev.unsafe_ptr(), Int64(24))
+
+    def stop_rumble(mut self):
+        if self.fd >= 0 and self.ff_effect_id >= 0:
+            var stop_ev = List[UInt8](length=24, fill=0)
+            stop_ev[16] = 0x15
+            stop_ev[18] = UInt8(self.ff_effect_id & 0xFF)
+            stop_ev[19] = UInt8((self.ff_effect_id >> 8) & 0xFF)
+            stop_ev[20] = 0
+            _ = external_call["write", Int64](Int32(self.fd), stop_ev.unsafe_ptr(), Int64(24))
 
 
 struct InputState(Copyable, Movable):
@@ -476,6 +562,10 @@ struct InputState(Copyable, Movable):
             if self.pads[slot].fd >= 0:
                 self.poll_pad(slot)
         self.promote_pads()
+
+    def set_pad_rumble(mut self, slot: Int, weak: Float32, strong: Float32, duration_ms: Int = 1000):
+        if slot >= 0 and slot < MAX_PADS:
+            self.pads[slot].set_rumble(weak, strong, duration_ms)
 
     def promote_pads(mut self):
         """Keep the first connected pad in slot 0, which is the one play reads,

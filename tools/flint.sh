@@ -40,7 +40,13 @@ compile_mojo() {
     local tmp
     tmp="$(mktemp "/tmp/flint-link-$(basename "$out")-XXXXXX")"
     rm -f "$tmp" "$out"
-    "$MOJO_BIN" build "$src" -o "$tmp" -I "${ROOT}/src" -O3 --fp-mode contract=off
+    local nd_src="${NEONDRIFT_ROOT:-/home/user/neondrift}/src"
+    local rct_src="${ROLLERCOASTER_ROOT:-/home/user/rollercoaster}/src"
+    local extra_inc=""
+    if [[ -d "$nd_src" ]]; then extra_inc="$extra_inc -I $nd_src"; fi
+    if [[ -d "$rct_src" ]]; then extra_inc="$extra_inc -I $rct_src"; fi
+    "$MOJO_BIN" build "$src" -o "$tmp" -I "${ROOT}/src" -I "${ROOT}/tests" $extra_inc -O3 --fp-mode contract=off
+    rm -f "$out"
     cp "$tmp" "$out"
     chmod +x "$out"
     rm -f "$tmp"
@@ -80,9 +86,23 @@ cmd_build() {
         echo "[Flint] Building examples/minimal_spark/main.mojo -> build/flint-spark ..."
         compile_mojo "${ROOT}/examples/minimal_spark/main.mojo" "${ROOT}/build/flint-spark"
     fi
+    if [[ "$target" == "all" || "$target" == "world" ]]; then
+        echo "[Flint] Building examples/open_world/main.mojo -> build/flint-world ..."
+        compile_mojo "${ROOT}/examples/open_world/main.mojo" "${ROOT}/build/flint-world"
+    fi
+    if [[ "$target" == "all" || "$target" == "cycles" ]]; then
+        echo "[Flint] Building examples/cycles/main.mojo -> build/flint-cycles ..."
+        compile_mojo "${ROOT}/examples/cycles/main.mojo" "${ROOT}/build/flint-cycles"
+        echo "[Flint] Building tests/test_cycles.mojo -> build/flint-cycles-test ..."
+        compile_mojo "${ROOT}/tests/test_cycles.mojo" "${ROOT}/build/flint-cycles-test"
+    fi
     if [[ "$target" == "all" || "$target" == "kms" ]]; then
         echo "[Flint] Building examples/kms_console/main.mojo -> build/flint-kms ..."
         compile_mojo "${ROOT}/examples/kms_console/main.mojo" "${ROOT}/build/flint-kms"
+    fi
+    if [[ "$target" == "all" || "$target" == "kms3d" ]]; then
+        echo "[Flint] Building examples/kms_3d/main.mojo -> build/flint-kms3d ..."
+        compile_mojo "${ROOT}/examples/kms_3d/main.mojo" "${ROOT}/build/flint-kms3d"
     fi
     if [[ "$target" == "all" || "$target" == "pack" ]]; then
         echo "[Flint] Building examples/pack_cli/main.mojo -> build/flint-pack ..."
@@ -91,6 +111,10 @@ cmd_build() {
     if [[ "$target" == "all" || "$target" == "test" ]]; then
         echo "[Flint] Building tests/test_flint.mojo -> build/flint-test ..."
         compile_mojo "${ROOT}/tests/test_flint.mojo" "${ROOT}/build/flint-test"
+    fi
+    if [[ "$target" == "all" || "$target" == "test" || "$target" == "e2e" ]]; then
+        echo "[Flint] Building tests/test_e2e.mojo -> build/flint-e2e ..."
+        compile_mojo "${ROOT}/tests/test_e2e.mojo" "${ROOT}/build/flint-e2e"
     fi
     echo "[Flint] Build complete."
 }
@@ -101,9 +125,27 @@ cmd_pack() {
 }
 
 cmd_test() {
-    cmd_build test
-    echo "[Flint] Running Flint Engine test suite..."
-    "${ROOT}/build/flint-test"
+    local sub="${1:-}"
+    if [[ "$sub" == "e2e" ]]; then
+        cmd_build e2e
+        echo "[Flint] Running Flint Engine E2E test suite..."
+        "${ROOT}/build/flint-e2e"
+    elif [[ "$sub" == "unit" ]]; then
+        cmd_build test
+        echo "[Flint] Running Flint Engine unit test suite..."
+        "${ROOT}/build/flint-test"
+    else
+        cmd_build test
+        echo "[Flint] Running Flint Engine test suite..."
+        "${ROOT}/build/flint-test"
+        echo "[Flint] Running Flint Engine E2E test suite..."
+        "${ROOT}/build/flint-e2e"
+    fi
+}
+
+cmd_cycles() {
+    cmd_build cycles
+    exec "${ROOT}/build/flint-cycles" "$@"
 }
 
 cmd_play() {
@@ -114,6 +156,17 @@ cmd_play() {
 cmd_kms() {
     cmd_build kms
     FLINT_BACKEND="${FLINT_BACKEND:-kms}" exec "${ROOT}/build/flint-kms" "$@"
+}
+
+cmd_kms3d() {
+    cmd_build kms3d
+    FLINT_BACKEND="${FLINT_BACKEND:-kms}" exec "${ROOT}/build/flint-kms3d" "$@"
+}
+
+cmd_world() {
+    cmd_build world
+    mkdir -p "${ROOT}/build/shots"
+    exec "${ROOT}/build/flint-world" "$@"
 }
 
 cmd_shot() {
@@ -129,10 +182,19 @@ cmd_gate() {
     cmd_sync --verify
     cmd_build all
     "${ROOT}/build/flint-test"
+    "${ROOT}/build/flint-e2e"
+    "${ROOT}/build/flint-cycles-test"
     mkdir -p "${ROOT}/build/shots"
     "${ROOT}/build/flint-spark" --shots
+
+    echo "[Flint Gate] Verifying Downstream NeonDrift 2099 Compatibility..."
+    (cd "${NEONDRIFT_ROOT:-/home/user/neondrift}" && bash tools/build.sh game && ./build/neondrift --pack)
+
+    echo "[Flint Gate] Verifying Downstream Rollercoaster Compatibility..."
+    (cd "${ROLLERCOASTER_ROOT:-/home/user/rollercoaster}" && bash tools/build.sh test)
+
     echo "============================================================"
-    echo " [PASS] FLINT GATE PASSED (Zero-Leak + Tests + Headless Shot)"
+    echo " [PASS] FLINT GATE PASSED (Zero-Leak + Tests + Games Verified)"
     echo "============================================================"
 }
 
@@ -214,7 +276,10 @@ case "$subcmd" in
     pack)  cmd_pack "$@" ;;
     test)  cmd_test "$@" ;;
     play)  cmd_play "$@" ;;
+    world) cmd_world "$@" ;;
     kms)   cmd_kms "$@" ;;
+    kms3d) cmd_kms3d "$@" ;;
+    cycles) cmd_cycles "$@" ;;
     shot)  cmd_shot "$@" ;;
     gate)  cmd_gate "$@" ;;
     new)   cmd_new "$@" ;;
@@ -224,11 +289,14 @@ case "$subcmd" in
         echo ""
         echo "Commands:"
         echo "  sync [deepsong_dir]  Harvest latest pure-Mojo libraries from Deepsong & run Zero-Leak Gate"
-        echo "  build [all|spark|kms|pack|test] Compile Flint showcase, pack CLI & test binaries (-O3, contract=off)"
+        echo "  cycles live|render|query ...  Pure-Mojo TidalCycles-style live coding (docs/CYCLES.md)"
+        echo "  build [all|spark|world|kms|kms3d|pack|test|cycles] Compile Flint showcase, open-world, pack CLI & test binaries (-O3)"
         echo "  pack <out.flpk> <files...> Bundle loose assets into a single .flpk VFS archive"
         echo "  test                 Build and run Flint Engine verification suite"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
         echo "  kms [--probe]        Run the bare-display DRM/KMS demo from a text console (no X11/Wayland)"
+        echo "  kms3d                GPU 3D on the bare display: AAA Vulkan renderer presenting via VK_KHR_display"
+        echo "  world [--shots]      Launch 512m x 512m AAA Vulkan Open-World sandbox (or render 3 720p vistas)"
         echo "  shot                 Render deterministic headless PNG to build/shots/flint_spark.png"
         echo "  gate                 Run full verification gate (sync + build + test + headless shot)"
         echo "  new <dir>            Scaffold a standalone Flint game project"

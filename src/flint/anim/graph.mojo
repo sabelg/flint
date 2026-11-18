@@ -18,6 +18,7 @@ may be a clip name, which stands for that clip's number in the game's clip
 order. Parameter names must be among `params`, and the code that drives
 the graph says which names it sets (`AnimGraphDef.missing_params`).
 """
+from flint.core.detmath import det_sin, det_cos
 from flint.assets.json import JsonDocument, parse_json
 from flint.platform.os import read_bytes
 
@@ -96,6 +97,131 @@ struct BlendSampleDef(Copyable, ImplicitlyCopyable, Movable):
         self.at = at
 
 
+struct BlendSample2DDef(Copyable, ImplicitlyCopyable, Movable):
+    """Sample in a 2D blend space (polar or Cartesian coordinates)."""
+    var clip: Int
+    var x: Float32
+    var y: Float32
+
+    def __init__(out self, clip: Int, x: Float32, y: Float32):
+        self.clip = clip
+        self.x = x
+        self.y = y
+
+
+struct BlendSpace2DDef(Copyable, Movable):
+    """A 2D blend space evaluated via Johansen (2009) Gradient-Band Interpolation
+    in either Freeform Cartesian (`is_polar = False`) or Freeform Polar/Directional
+    (`is_polar = True`, where `x` is angle in radians and `y` is speed/magnitude)."""
+    var name: String
+    var param_x: Int
+    var param_y: Int
+    var samples: List[BlendSample2DDef]
+    var is_polar: Bool
+    var sync: Bool
+    var ground_rate: Bool
+    var min_rate: Float32
+    var max_rate: Float32
+
+    def __init__(out self):
+        self.name = ""
+        self.param_x = -1
+        self.param_y = -1
+        self.samples = List[BlendSample2DDef]()
+        self.is_polar = False
+        self.sync = True
+        self.ground_rate = False
+        self.min_rate = 0.5
+        self.max_rate = 2.0
+
+    def weights(self, x: Float32, y: Float32) -> List[Float32]:
+        """Johansen (2009) Gradient-Band Interpolation weights summing to 1.0."""
+        var n = len(self.samples)
+        var out = List[Float32](length=n, fill=0)
+        if n == 0:
+            return out^
+        if n == 1:
+            out[0] = Float32(1.0)
+            return out^
+
+        var total_w = Float32(0.0)
+        if not self.is_polar:
+            for i in range(n):
+                var xi = self.samples[i].x
+                var yi = self.samples[i].y
+                var vip_x = x - xi
+                var vip_y = y - yi
+                var wi = Float32(1.0)
+                for j in range(n):
+                    if i == j:
+                        continue
+                    var vij_x = self.samples[j].x - xi
+                    var vij_y = self.samples[j].y - yi
+                    var denom = vij_x * vij_x + vij_y * vij_y
+                    if denom > Float32(1.0e-10):
+                        var hij = Float32(1.0) - (vip_x * vij_x + vip_y * vij_y) / denom
+                        hij = max(Float32(0.0), min(Float32(1.0), hij))
+                        if hij < wi:
+                            wi = hij
+                out[i] = wi
+                total_w += wi
+        else:
+            # Branch-cut-free polar gradient bands on S^1 x R (`x` = angle rad, `y` = magnitude)
+            var cx = det_cos(x)
+            var sx = det_sin(x)
+            for i in range(n):
+                var cxi = det_cos(self.samples[i].x)
+                var sxi = det_sin(self.samples[i].x)
+                var ri = self.samples[i].y
+                var wi = Float32(1.0)
+                for j in range(n):
+                    if i == j:
+                        continue
+                    var cxj = det_cos(self.samples[j].x)
+                    var sxj = det_sin(self.samples[j].x)
+                    var rj = self.samples[j].y
+                    var r_scale = max(Float32(0.5), Float32(0.5) * (abs(ri) + abs(rj)))
+                    var vij_0 = (cxj - cxi) * r_scale
+                    var vij_1 = (sxj - sxi) * r_scale
+                    var vij_2 = rj - ri
+                    var denom = vij_0 * vij_0 + vij_1 * vij_1 + vij_2 * vij_2
+                    if denom > Float32(1.0e-10):
+                        var vip_0 = (cx - cxi) * r_scale
+                        var vip_1 = (sx - sxi) * r_scale
+                        var vip_2 = y - ri
+                        var hij = Float32(1.0) - (vip_0 * vij_0 + vip_1 * vij_1 + vip_2 * vij_2) / denom
+                        hij = max(Float32(0.0), min(Float32(1.0), hij))
+                        if hij < wi:
+                            wi = hij
+                out[i] = wi
+                total_w += wi
+
+        if total_w > Float32(1.0e-6):
+            var inv_tot = Float32(1.0) / total_w
+            for i in range(n):
+                out[i] *= inv_tot
+        else:
+            # Degenerate exterior fallback: pick nearest sample
+            var best = 0
+            var best_d2 = Float32(1.0e30)
+            for i in range(n):
+                var d2: Float32
+                if self.is_polar:
+                    var dc = det_cos(x) - det_cos(self.samples[i].x)
+                    var ds = det_sin(x) - det_sin(self.samples[i].x)
+                    var dr = y - self.samples[i].y
+                    d2 = dc * dc + ds * ds + dr * dr
+                else:
+                    var dx = x - self.samples[i].x
+                    var dy = y - self.samples[i].y
+                    d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = i
+            out[best] = Float32(1.0)
+        return out^
+
+
 struct BlendSpaceDef(Copyable, Movable):
     """A 1D blend space: samples along one parameter, played at one sync
     phase. With `ground_rate`, playback runs at the ground speed over the
@@ -145,7 +271,8 @@ struct BlendSpaceDef(Copyable, Movable):
 struct StateDef(Copyable, Movable):
     var name: String
     var clip: Int          # -1 for a blend-space state
-    var blend: Int         # blend space index, or -1
+    var blend: Int         # 1D blend space index, or -1
+    var blend_2d: Int      # 2D blend space index, or -1
     var rate: Float32
     var time_param: Int    # -1: clock; else a param in [0, 1] is the clip's normalised time
     var rate_param: Int    # -1: none; else the clock runs at `rate` times this param (0 holds the pose, below 0 runs it backwards: package 3.7)
@@ -161,6 +288,7 @@ struct StateDef(Copyable, Movable):
         self.name = ""
         self.clip = -1
         self.blend = -1
+        self.blend_2d = -1
         self.rate = 1
         self.time_param = -1
         self.rate_param = -1
@@ -251,6 +379,7 @@ struct AnimGraphDef(Copyable, Movable):
     var params: List[String]
     var masks: List[MaskDef]
     var blend_spaces: List[BlendSpaceDef]
+    var blend_spaces_2d: List[BlendSpace2DDef]
     var states: List[StateDef]
     var layers: List[LayerDef]
     var transitions: List[TransitionDef]
@@ -264,6 +393,7 @@ struct AnimGraphDef(Copyable, Movable):
         self.params = List[String]()
         self.masks = List[MaskDef]()
         self.blend_spaces = List[BlendSpaceDef]()
+        self.blend_spaces_2d = List[BlendSpace2DDef]()
         self.states = List[StateDef]()
         self.layers = List[LayerDef]()
         self.transitions = List[TransitionDef]()
@@ -274,6 +404,12 @@ struct AnimGraphDef(Copyable, Movable):
 
     def valid(self) -> Bool:
         return len(self.states) > 0
+
+    def blend_space_2d(self, name: String) -> Int:
+        for index in range(len(self.blend_spaces_2d)):
+            if self.blend_spaces_2d[index].name == name:
+                return index
+        return -1
 
     def param(self, name: String) -> Int:
         for index in range(len(self.params)):
@@ -467,6 +603,35 @@ def parse_anim_graph(document: JsonDocument, clips: List[String]) raises -> Anim
             if len(space.samples) == 0:
                 raise Error(where + ": no samples")
             graph.blend_spaces.append(space^)
+    var spaces_2d = document.object_get(root, "blend_spaces_2d")
+    if spaces_2d >= 0:
+        ref node2d = document.nodes[spaces_2d]
+        for index in range(len(node2d.keys)):
+            var space2d = BlendSpace2DDef()
+            space2d.name = node2d.keys[index]
+            var body2d = node2d.children[index]
+            var where2d = "blend space 2d " + space2d.name
+            var px_name = document.text(document.object_get(body2d, "param_x"))
+            var py_name = document.text(document.object_get(body2d, "param_y"))
+            space2d.param_x = graph.param(px_name)
+            space2d.param_y = graph.param(py_name)
+            if space2d.param_x < 0 or space2d.param_y < 0:
+                raise Error(where2d + ": unknown param_x or param_y")
+            space2d.is_polar = document.boolean(document.object_get(body2d, "polar"), False)
+            space2d.sync = document.boolean(document.object_get(body2d, "sync"), True)
+            space2d.ground_rate = document.text(document.object_get(body2d, "rate")) == "ground"
+            space2d.min_rate = Float32(document.number(document.object_get(body2d, "min_rate"), 0.5))
+            space2d.max_rate = Float32(document.number(document.object_get(body2d, "max_rate"), 2.0))
+            var samples2d = document.object_get(body2d, "samples")
+            for s in range(document.array_size(samples2d)):
+                var sample2d = document.at(samples2d, s)
+                var clip2d = need_clip(clips, document.text(document.object_get(sample2d, "clip")), where2d)
+                var sx = Float32(document.number(document.object_get(sample2d, "x")))
+                var sy = Float32(document.number(document.object_get(sample2d, "y")))
+                space2d.samples.append(BlendSample2DDef(clip2d, sx, sy))
+            if len(space2d.samples) == 0:
+                raise Error(where2d + ": no samples")
+            graph.blend_spaces_2d.append(space2d^)
     var states = document.object_get(root, "states")
     # Names first, so layers and transitions can name any state.
     for index in range(document.array_size(states)):
@@ -480,13 +645,20 @@ def parse_anim_graph(document: JsonDocument, clips: List[String]) raises -> Anim
         var where = "state " + graph.states[index].name
         var clip_name = document.text(document.object_get(body, "clip"))
         var space_name = document.text(document.object_get(body, "blend"))
+        var space2d_name = document.text(document.object_get(body, "blend_2d"))
         if clip_name.byte_length() > 0:
             graph.states[index].clip = need_clip(clips, clip_name, where)
+        elif space2d_name.byte_length() > 0:
+            graph.states[index].blend_2d = graph.blend_space_2d(space2d_name)
+            if graph.states[index].blend_2d < 0:
+                raise Error(where + ": unknown 2d blend space " + space2d_name)
         elif space_name.byte_length() > 0:
             for s in range(len(graph.blend_spaces)):
                 if graph.blend_spaces[s].name == space_name:
                     graph.states[index].blend = s
             if graph.states[index].blend < 0:
+                graph.states[index].blend_2d = graph.blend_space_2d(space_name)
+            if graph.states[index].blend < 0 and graph.states[index].blend_2d < 0:
                 raise Error(where + ": unknown blend space " + space_name)
         else:
             raise Error(where + ": needs a clip or a blend space")

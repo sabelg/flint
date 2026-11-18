@@ -56,6 +56,8 @@ comptime OP_CONVERT_F_TO_S: UInt32 = 110
 comptime OP_CONVERT_S_TO_F: UInt32 = 111
 comptime OP_CONVERT_U_TO_F: UInt32 = 112
 comptime OP_BITCAST: UInt32 = 124
+comptime OP_CONTROL_BARRIER: UInt32 = 224
+comptime OP_MEMORY_BARRIER: UInt32 = 225
 comptime OP_ATOMIC_I_ADD: UInt32 = 234
 comptime OP_ATOMIC_U_MAX: UInt32 = 239
 comptime OP_I_ADD: UInt32 = 128
@@ -87,6 +89,7 @@ comptime OP_SELECTION_MERGE: UInt32 = 247
 comptime OP_LABEL: UInt32 = 248
 comptime OP_BRANCH: UInt32 = 249
 comptime OP_BRANCH_CONDITIONAL: UInt32 = 250
+comptime OP_KILL: UInt32 = 252
 comptime OP_RETURN: UInt32 = 253
 
 comptime GLSL_F_ABS: UInt32 = 4
@@ -186,6 +189,8 @@ struct SpirvModule(Movable):
     var glsl: UInt32
     var main: UInt32
     var invocation: UInt32
+    var local_invoc_var: UInt32
+    var workgroup_id_var: UInt32
     var push: UInt32
     var group_width: UInt32
     var group_height: UInt32
@@ -214,6 +219,8 @@ struct SpirvModule(Movable):
         self.glsl = 0
         self.main = 0
         self.invocation = 0
+        self.local_invoc_var = 0
+        self.workgroup_id_var = 0
         self.push = 0
         self.group_width = UInt32(group_width)
         self.group_height = UInt32(group_height)
@@ -652,6 +659,16 @@ struct SpirvModule(Movable):
         emit(self.code, OP_RETURN)
         self.label(carry_on)
 
+    def discard_if(mut self, condition: UInt32):
+        """Fragment-stage alpha-cutout discard (`OpKill`) inside structured selection merge."""
+        var kill_blk = self.fresh()
+        var carry_on = self.fresh()
+        emit(self.code, OP_SELECTION_MERGE, carry_on, 0)
+        emit(self.code, OP_BRANCH_CONDITIONAL, condition, kill_blk, carry_on)
+        self.label(kill_blk)
+        emit(self.code, OP_KILL)
+        self.label(carry_on)
+
     def finish(mut self) -> List[UInt32]:
         """Close the entry point and lay the module out in the order SPIR-V requires."""
         emit(self.code, OP_RETURN)
@@ -719,6 +736,7 @@ comptime OP_TYPE_RAY_QUERY_KHR: UInt32 = 4472
 comptime OP_RAY_QUERY_INITIALIZE_KHR: UInt32 = 4473
 comptime OP_RAY_QUERY_TERMINATE_KHR: UInt32 = 4474
 comptime OP_RAY_QUERY_PROCEED_KHR: UInt32 = 4477
+comptime OP_RAY_QUERY_CONFIRM_INTERSECTION_KHR: UInt32 = 4478
 comptime OP_RAY_QUERY_GET_INTERSECTION_TYPE_KHR: UInt32 = 4479
 comptime OP_RAY_QUERY_GET_INTERSECTION_T_KHR: UInt32 = 6018
 comptime OP_RAY_QUERY_GET_INTERSECTION_INSTANCE_CUSTOM_INDEX_KHR: UInt32 = 6019
@@ -733,6 +751,8 @@ comptime GLSL_SIN: UInt32 = 13
 comptime GLSL_COS: UInt32 = 14
 comptime GLSL_ATAN2: UInt32 = 25
 comptime GLSL_POW: UInt32 = 26
+comptime GLSL_PACK_HALF2X16: UInt32 = 58
+comptime GLSL_UNPACK_HALF2X16: UInt32 = 62
 
 comptime IMAGE_OPERANDS_LOD: UInt32 = 2
 comptime IMAGE_OPERANDS_GRAD: UInt32 = 4
@@ -759,6 +779,34 @@ comptime CAPABILITY_IMAGE_QUERY: UInt32 = 50
 comptime CAPABILITY_SHADER_NON_UNIFORM: UInt32 = 5301
 comptime CAPABILITY_SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING: UInt32 = 5307
 comptime CAPABILITY_RAY_QUERY_KHR: UInt32 = 4472
+comptime CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS: UInt32 = 49
+comptime CAPABILITY_GROUP_NON_UNIFORM_ARITHMETIC: UInt32 = 63
+comptime CAPABILITY_GROUP_NON_UNIFORM_BALLOT: UInt32 = 64
+comptime CAPABILITY_GEOMETRY: UInt32 = 6
+
+comptime STORAGE_WORKGROUP: UInt32 = 4
+
+comptime OP_GROUP_NON_UNIFORM_ELECT: UInt32 = 333
+comptime OP_GROUP_NON_UNIFORM_BALLOT: UInt32 = 339
+comptime OP_GROUP_NON_UNIFORM_BALLOT_BIT_COUNT: UInt32 = 344
+comptime OP_GROUP_NON_UNIFORM_I_ADD: UInt32 = 349
+comptime OP_GROUP_NON_UNIFORM_F_ADD: UInt32 = 350
+
+comptime GROUP_OP_REDUCE: UInt32 = 0
+comptime GROUP_OP_INCLUSIVE_SCAN: UInt32 = 1
+comptime GROUP_OP_EXCLUSIVE_SCAN: UInt32 = 2
+comptime GROUP_OP_CLUSTERED_REDUCE: UInt32 = 3
+
+comptime SCOPE_DEVICE: UInt32 = 1
+comptime SCOPE_WORKGROUP: UInt32 = 2
+comptime SCOPE_SUBGROUP: UInt32 = 3
+
+comptime IMAGE_FORMAT_RGBA16F: UInt32 = 2
+comptime IMAGE_FORMAT_R11F_G11F_B10F: UInt32 = 8
+
+comptime BUILT_IN_PRIMITIVE_ID: UInt32 = 7
+comptime BUILT_IN_WORKGROUP_ID: UInt32 = 26
+comptime BUILT_IN_LOCAL_INVOCATION_ID: UInt32 = 27
 
 comptime DIM_2D: UInt32 = 1
 comptime DIM_CUBE: UInt32 = 3
@@ -797,6 +845,9 @@ struct AaaSpirvModule(Movable):
     var type_sampled_u2d: UInt32
     var type_accel_khr: UInt32
     var type_ray_query_khr: UInt32
+    var type_storage_image_rgba16f: UInt32
+    var type_storage_image_r11g11b10f: UInt32
+    var primitive_id_var: UInt32
     var pointer_buffer_uint: UInt32
     var pointer_function_uint: UInt32
     var pointer_function_float: UInt32
@@ -806,6 +857,8 @@ struct AaaSpirvModule(Movable):
     var glsl: UInt32
     var main: UInt32
     var invocation: UInt32
+    var local_invoc_var: UInt32
+    var workgroup_id_var: UInt32
     var vert_index_var: UInt32
     var inst_index_var: UInt32
     var position_out_var: UInt32
@@ -824,6 +877,8 @@ struct AaaSpirvModule(Movable):
         enable_bindless: Bool = False,
         enable_ray_query: Bool = False,
         early_depth: Bool = True,
+        enable_subgroups: Bool = False,
+        enable_storage_image_formats: Bool = False,
     ):
         self.bound = 1
         self.exec_model = exec_model
@@ -836,6 +891,11 @@ struct AaaSpirvModule(Movable):
         if enable_ray_query:
             self.capabilities.append(CAPABILITY_RAY_QUERY_KHR)
             self.extensions.append("SPV_KHR_ray_query")
+        if enable_subgroups:
+            self.capabilities.append(CAPABILITY_GROUP_NON_UNIFORM_BALLOT)
+            self.capabilities.append(CAPABILITY_GROUP_NON_UNIFORM_ARITHMETIC)
+        if enable_storage_image_formats:
+            self.capabilities.append(CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS)
         self.interface_vars = List[UInt32]()
         self.decorations = List[UInt32]()
         self.globals = List[UInt32]()
@@ -863,6 +923,9 @@ struct AaaSpirvModule(Movable):
         self.type_sampled_u2d = 0
         self.type_accel_khr = 0
         self.type_ray_query_khr = 0
+        self.type_storage_image_rgba16f = 0
+        self.type_storage_image_r11g11b10f = 0
+        self.primitive_id_var = 0
         self.pointer_buffer_uint = 0
         self.pointer_function_uint = 0
         self.pointer_function_float = 0
@@ -872,6 +935,8 @@ struct AaaSpirvModule(Movable):
         self.glsl = 0
         self.main = 0
         self.invocation = 0
+        self.local_invoc_var = 0
+        self.workgroup_id_var = 0
         self.vert_index_var = 0
         self.inst_index_var = 0
         self.position_out_var = 0
@@ -930,6 +995,12 @@ struct AaaSpirvModule(Movable):
         emit(self.globals, OP_TYPE_IMAGE, self.type_uimage_2d, self.type_uint, DIM_2D, 0, 0, 0, 1, 0)
         emit(self.globals, OP_TYPE_SAMPLED_IMAGE, self.type_sampled_u2d, self.type_uimage_2d)
 
+        # Hardware 2D Storage Images (Rgba16f and R11fG11fB10f, Sampled=2)
+        self.type_storage_image_rgba16f = self.fresh()
+        emit(self.globals, OP_TYPE_IMAGE, self.type_storage_image_rgba16f, self.type_float, DIM_2D, 0, 0, 0, 2, IMAGE_FORMAT_RGBA16F)
+        self.type_storage_image_r11g11b10f = self.fresh()
+        emit(self.globals, OP_TYPE_IMAGE, self.type_storage_image_r11g11b10f, self.type_float, DIM_2D, 0, 0, 0, 2, IMAGE_FORMAT_R11F_G11F_B10F)
+
         if enable_ray_query:
             self.type_accel_khr = self.fresh()
             self.type_ray_query_khr = self.fresh()
@@ -963,6 +1034,16 @@ struct AaaSpirvModule(Movable):
             emit(self.globals, OP_VARIABLE, ptr_in_uvec3, self.invocation, STORAGE_INPUT)
             emit(self.decorations, OP_DECORATE, self.invocation, DECORATION_BUILT_IN, BUILT_IN_GLOBAL_INVOCATION_ID)
             self.interface_vars.append(self.invocation)
+
+            self.local_invoc_var = self.fresh()
+            emit(self.globals, OP_VARIABLE, ptr_in_uvec3, self.local_invoc_var, STORAGE_INPUT)
+            emit(self.decorations, OP_DECORATE, self.local_invoc_var, DECORATION_BUILT_IN, BUILT_IN_LOCAL_INVOCATION_ID)
+            self.interface_vars.append(self.local_invoc_var)
+
+            self.workgroup_id_var = self.fresh()
+            emit(self.globals, OP_VARIABLE, ptr_in_uvec3, self.workgroup_id_var, STORAGE_INPUT)
+            emit(self.decorations, OP_DECORATE, self.workgroup_id_var, DECORATION_BUILT_IN, BUILT_IN_WORKGROUP_ID)
+            self.interface_vars.append(self.workgroup_id_var)
         elif self.exec_model == MODEL_VERTEX:
             var ptr_in_uint = self.fresh()
             self.vert_index_var = self.fresh()
@@ -1285,6 +1366,45 @@ struct AaaSpirvModule(Movable):
         emit(self.code, OP_RAY_QUERY_GET_INTERSECTION_BARYCENTRICS_KHR, self.type_vec2, res, rq_var, committed)
         return res
 
+    def ray_query_committed_front_face(mut self, rq_var: UInt32) -> UInt32:
+        var res = self.fresh()
+        var committed = self.uint(1)
+        emit(self.code, OP_RAY_QUERY_GET_INTERSECTION_FRONT_FACE_KHR, self.type_bool, res, rq_var, committed)
+        return res
+
+    def ray_query_candidate_type(mut self, rq_var: UInt32) -> UInt32:
+        var res = self.fresh()
+        var candidate = self.uint(0)
+        emit(self.code, OP_RAY_QUERY_GET_INTERSECTION_TYPE_KHR, self.type_uint, res, rq_var, candidate)
+        return res
+
+    def ray_query_candidate_t(mut self, rq_var: UInt32) -> UInt32:
+        var res = self.fresh()
+        var candidate = self.uint(0)
+        emit(self.code, OP_RAY_QUERY_GET_INTERSECTION_T_KHR, self.type_float, res, rq_var, candidate)
+        return res
+
+    def ray_query_candidate_instance_id(mut self, rq_var: UInt32) -> UInt32:
+        var res = self.fresh()
+        var candidate = self.uint(0)
+        emit(self.code, OP_RAY_QUERY_GET_INTERSECTION_INSTANCE_ID_KHR, self.type_uint, res, rq_var, candidate)
+        return res
+
+    def ray_query_candidate_prim_index(mut self, rq_var: UInt32) -> UInt32:
+        var res = self.fresh()
+        var candidate = self.uint(0)
+        emit(self.code, OP_RAY_QUERY_GET_INTERSECTION_PRIMITIVE_INDEX_KHR, self.type_uint, res, rq_var, candidate)
+        return res
+
+    def ray_query_candidate_barycentrics(mut self, rq_var: UInt32) -> UInt32:
+        var res = self.fresh()
+        var candidate = self.uint(0)
+        emit(self.code, OP_RAY_QUERY_GET_INTERSECTION_BARYCENTRICS_KHR, self.type_vec2, res, rq_var, candidate)
+        return res
+
+    def ray_query_confirm_intersection(mut self, rq_var: UInt32):
+        emit(self.code, OP_RAY_QUERY_CONFIRM_INTERSECTION_KHR, rq_var)
+
     # Buffer & Push Ops
     def load_word(mut self, buffer: UInt32, index: UInt32) -> UInt32:
         var pointer = self.fresh()
@@ -1337,6 +1457,20 @@ struct AaaSpirvModule(Movable):
     def invocation_axis(mut self, axis: Int) -> UInt32:
         var vector = self.fresh()
         emit(self.code, OP_LOAD, self.type_uvec3, vector, self.invocation)
+        var id = self.fresh()
+        emit(self.code, OP_COMPOSITE_EXTRACT, self.type_uint, id, vector, UInt32(axis))
+        return id
+
+    def local_axis(mut self, axis: Int) -> UInt32:
+        var vector = self.fresh()
+        emit(self.code, OP_LOAD, self.type_uvec3, vector, self.local_invoc_var)
+        var id = self.fresh()
+        emit(self.code, OP_COMPOSITE_EXTRACT, self.type_uint, id, vector, UInt32(axis))
+        return id
+
+    def workgroup_axis(mut self, axis: Int) -> UInt32:
+        var vector = self.fresh()
+        emit(self.code, OP_LOAD, self.type_uvec3, vector, self.workgroup_id_var)
         var id = self.fresh()
         emit(self.code, OP_COMPOSITE_EXTRACT, self.type_uint, id, vector, UInt32(axis))
         return id
@@ -1465,8 +1599,28 @@ struct AaaSpirvModule(Movable):
     def fcos(mut self, a: UInt32) -> UInt32:
         return self.ext1(GLSL_COS, self.type_float, a)
 
+    def fatan2(mut self, y: UInt32, x: UInt32) -> UInt32:
+        return self.ext2(GLSL_ATAN2, self.type_float, y, x)
+
     def fpow(mut self, a: UInt32, b: UInt32) -> UInt32:
         return self.ext2(GLSL_POW, self.type_float, a, b)
+
+    def pack_half2x16(mut self, v2_id: UInt32) -> UInt32:
+        return self.ext1(GLSL_PACK_HALF2X16, self.type_uint, v2_id)
+
+    def unpack_half2x16(mut self, u32_id: UInt32) -> UInt32:
+        return self.ext1(GLSL_UNPACK_HALF2X16, self.type_vec2, u32_id)
+
+    @always_inline
+    def pack_f16x2(mut self, x_f32: UInt32, y_f32: UInt32) -> UInt32:
+        var cx = self.nclamp(x_f32, self.float(-65504.0), self.float(65504.0))
+        var cy = self.nclamp(y_f32, self.float(-65504.0), self.float(65504.0))
+        return self.pack_half2x16(self.vec2(cx, cy))
+
+    @always_inline
+    def unpack_f16x2(mut self, packed_u32: UInt32) -> Tuple[UInt32, UInt32]:
+        var v2 = self.unpack_half2x16(packed_u32)
+        return (self.extract_f(v2, 0), self.extract_f(v2, 1))
 
     def exp2(mut self, a: UInt32) -> UInt32:
         return self.ext1(GLSL_EXP2, self.type_float, a)
@@ -1554,6 +1708,35 @@ struct AaaSpirvModule(Movable):
     def logical_not(mut self, a: UInt32) -> UInt32:
         return self.unary(OP_LOGICAL_NOT, self.type_bool, a)
 
+    # Forwarders for alternative DSL conventions
+    @always_inline
+    def load_uint(mut self, buffer: UInt32, index: UInt32) -> UInt32:
+        return self.load_word(buffer, index)
+
+    @always_inline
+    def store_uint(mut self, buffer: UInt32, index: UInt32, value: UInt32):
+        self.store_word(buffer, index, value)
+
+    @always_inline
+    def iand(mut self, a: UInt32, b: UInt32) -> UInt32:
+        return self.bit_and(a, b)
+
+    @always_inline
+    def ior(mut self, a: UInt32, b: UInt32) -> UInt32:
+        return self.bit_or(a, b)
+
+    @always_inline
+    def ishr(mut self, a: UInt32, b: UInt32) -> UInt32:
+        return self.shr(a, b)
+
+    @always_inline
+    def ishl(mut self, a: UInt32, b: UInt32) -> UInt32:
+        return self.shl(a, b)
+
+    @always_inline
+    def fle(mut self, a: UInt32, b: UInt32) -> UInt32:
+        return self.fge(b, a)
+
     # Control Flow
     def label(mut self, id: UInt32):
         emit(self.code, OP_LABEL, id)
@@ -1620,6 +1803,168 @@ struct AaaSpirvModule(Movable):
         self.label(leave)
         emit(self.code, OP_RETURN)
         self.label(carry_on)
+
+    def discard_if(mut self, condition: UInt32):
+        """Fragment-stage alpha-cutout discard (`OpKill`) inside structured selection merge."""
+        var kill_blk = self.fresh()
+        var carry_on = self.fresh()
+        emit(self.code, OP_SELECTION_MERGE, carry_on, 0)
+        emit(self.code, OP_BRANCH_CONDITIONAL, condition, kill_blk, carry_on)
+        self.label(kill_blk)
+        emit(self.code, OP_KILL)
+        self.label(carry_on)
+
+    def primitive_id(mut self) -> UInt32:
+        """Loads the BuiltIn PrimitiveId (gl_PrimitiveID) for fragment stage primitive indexing."""
+        if self.primitive_id_var == 0:
+            var has_geom = False
+            for cap in self.capabilities:
+                if cap == CAPABILITY_GEOMETRY:
+                    has_geom = True
+            if not has_geom:
+                self.capabilities.append(CAPABILITY_GEOMETRY)
+            var ptr_in_uint = self.fresh()
+            self.primitive_id_var = self.fresh()
+            emit(self.globals, OP_TYPE_POINTER, ptr_in_uint, STORAGE_INPUT, self.type_uint)
+            emit(self.globals, OP_VARIABLE, ptr_in_uint, self.primitive_id_var, STORAGE_INPUT)
+            emit(self.decorations, OP_DECORATE, self.primitive_id_var, DECORATION_BUILT_IN, BUILT_IN_PRIMITIVE_ID)
+            self.interface_vars.append(self.primitive_id_var)
+        var id = self.fresh()
+        emit(self.code, OP_LOAD, self.type_uint, id, self.primitive_id_var)
+        return id
+
+    # Workgroup LDS arrays & operations
+    def workgroup_array_f32(mut self, size: Int) -> Tuple[UInt32, UInt32]:
+        var len_id = self.uint(UInt32(size))
+        var arr_t = self.fresh()
+        emit(self.globals, OP_TYPE_ARRAY, arr_t, self.type_float, len_id)
+        var ptr_arr_t = self.fresh()
+        emit(self.globals, OP_TYPE_POINTER, ptr_arr_t, STORAGE_WORKGROUP, arr_t)
+        var ptr_elem_t = self.fresh()
+        emit(self.globals, OP_TYPE_POINTER, ptr_elem_t, STORAGE_WORKGROUP, self.type_float)
+        var var_id = self.fresh()
+        emit(self.globals, OP_VARIABLE, ptr_arr_t, var_id, STORAGE_WORKGROUP)
+        self.interface_vars.append(var_id)
+        return (ptr_elem_t, var_id)
+
+    def workgroup_array_u32(mut self, size: Int) -> Tuple[UInt32, UInt32]:
+        var len_id = self.uint(UInt32(size))
+        var arr_t = self.fresh()
+        emit(self.globals, OP_TYPE_ARRAY, arr_t, self.type_uint, len_id)
+        var ptr_arr_t = self.fresh()
+        emit(self.globals, OP_TYPE_POINTER, ptr_arr_t, STORAGE_WORKGROUP, arr_t)
+        var ptr_elem_t = self.fresh()
+        emit(self.globals, OP_TYPE_POINTER, ptr_elem_t, STORAGE_WORKGROUP, self.type_uint)
+        var var_id = self.fresh()
+        emit(self.globals, OP_VARIABLE, ptr_arr_t, var_id, STORAGE_WORKGROUP)
+        self.interface_vars.append(var_id)
+        return (ptr_elem_t, var_id)
+
+    def load_workgroup_f32(mut self, ptr_elem_t: UInt32, var_id: UInt32, index: UInt32) -> UInt32:
+        var ptr = self.fresh()
+        emit(self.code, OP_ACCESS_CHAIN, ptr_elem_t, ptr, var_id, index)
+        var res = self.fresh()
+        emit(self.code, OP_LOAD, self.type_float, res, ptr)
+        return res
+
+    def store_workgroup_f32(mut self, ptr_elem_t: UInt32, var_id: UInt32, index: UInt32, value: UInt32):
+        var ptr = self.fresh()
+        emit(self.code, OP_ACCESS_CHAIN, ptr_elem_t, ptr, var_id, index)
+        emit(self.code, OP_STORE, ptr, value)
+
+    def load_workgroup_u32(mut self, ptr_elem_t: UInt32, var_id: UInt32, index: UInt32) -> UInt32:
+        var ptr = self.fresh()
+        emit(self.code, OP_ACCESS_CHAIN, ptr_elem_t, ptr, var_id, index)
+        var res = self.fresh()
+        emit(self.code, OP_LOAD, self.type_uint, res, ptr)
+        return res
+
+    def store_workgroup_u32(mut self, ptr_elem_t: UInt32, var_id: UInt32, index: UInt32, value: UInt32):
+        var ptr = self.fresh()
+        emit(self.code, OP_ACCESS_CHAIN, ptr_elem_t, ptr, var_id, index)
+        emit(self.code, OP_STORE, ptr, value)
+
+    def atomic_add_workgroup_u32(mut self, ptr_elem_t: UInt32, var_id: UInt32, index: UInt32, value: UInt32) -> UInt32:
+        var ptr = self.fresh()
+        emit(self.code, OP_ACCESS_CHAIN, ptr_elem_t, ptr, var_id, index)
+        var s_workgroup = self.uint(2)
+        var relaxed = self.uint(0)
+        var res = self.fresh()
+        emit(self.code, OP_ATOMIC_I_ADD, self.type_uint, res, ptr, s_workgroup, relaxed, value)
+        return res
+
+    def atomic_umax_workgroup_u32(mut self, ptr_elem_t: UInt32, var_id: UInt32, index: UInt32, value: UInt32) -> UInt32:
+        var ptr = self.fresh()
+        emit(self.code, OP_ACCESS_CHAIN, ptr_elem_t, ptr, var_id, index)
+        var s_workgroup = self.uint(2)
+        var relaxed = self.uint(0)
+        var res = self.fresh()
+        emit(self.code, OP_ATOMIC_U_MAX, self.type_uint, res, ptr, s_workgroup, relaxed, value)
+        return res
+
+    # Barriers
+    def control_barrier(mut self, exec_scope: UInt32, mem_scope: UInt32, mem_semantics: UInt32):
+        var s_exec = self.uint(exec_scope)
+        var s_mem = self.uint(mem_scope)
+        var sem = self.uint(mem_semantics)
+        emit(self.code, OP_CONTROL_BARRIER, s_exec, s_mem, sem)
+
+    def memory_barrier(mut self, mem_scope: UInt32, mem_semantics: UInt32):
+        var s_mem = self.uint(mem_scope)
+        var sem = self.uint(mem_semantics)
+        emit(self.code, OP_MEMORY_BARRIER, s_mem, sem)
+
+    def workgroup_barrier(mut self):
+        self.control_barrier(2, 2, 776)
+
+    # Subgroups
+    def subgroup_elect(mut self) -> UInt32:
+        var res = self.fresh()
+        var s_subgroup = self.uint(3)
+        emit(self.code, OP_GROUP_NON_UNIFORM_ELECT, self.type_bool, res, s_subgroup)
+        return res
+
+    def subgroup_ballot(mut self, predicate: UInt32) -> UInt32:
+        var res = self.fresh()
+        var s_subgroup = self.uint(3)
+        emit(self.code, OP_GROUP_NON_UNIFORM_BALLOT, self.type_uvec4, res, s_subgroup, predicate)
+        return res
+
+    def subgroup_fadd(mut self, value: UInt32, group_op: UInt32 = GROUP_OP_REDUCE) -> UInt32:
+        var res = self.fresh()
+        var s_subgroup = self.uint(3)
+        emit(self.code, OP_GROUP_NON_UNIFORM_F_ADD, self.type_float, res, s_subgroup, group_op, value)
+        return res
+
+    def subgroup_iadd(mut self, value: UInt32, group_op: UInt32 = GROUP_OP_REDUCE) -> UInt32:
+        var res = self.fresh()
+        var s_subgroup = self.uint(3)
+        emit(self.code, OP_GROUP_NON_UNIFORM_I_ADD, self.type_uint, res, s_subgroup, group_op, value)
+        return res
+
+    # Hardware 2D Storage Images
+    def storage_image_2d(mut self, binding: Int, set: Int = 0, format: UInt32 = IMAGE_FORMAT_RGBA16F) -> Tuple[UInt32, UInt32]:
+        var img_t = self.type_storage_image_rgba16f if format == IMAGE_FORMAT_RGBA16F else self.type_storage_image_r11g11b10f
+        var ptr_t = self.fresh()
+        var var_id = self.fresh()
+        emit(self.globals, OP_TYPE_POINTER, ptr_t, STORAGE_UNIFORM_CONSTANT, img_t)
+        emit(self.globals, OP_VARIABLE, ptr_t, var_id, STORAGE_UNIFORM_CONSTANT)
+        emit(self.decorations, OP_DECORATE, var_id, DECORATION_DESCRIPTOR_SET, UInt32(set))
+        emit(self.decorations, OP_DECORATE, var_id, DECORATION_BINDING, UInt32(binding))
+        self.interface_vars.append(var_id)
+        return (img_t, var_id)
+
+    def image_read(mut self, img_pair: Tuple[UInt32, UInt32], coord: UInt32) -> UInt32:
+        var img = self.fresh()
+        emit(self.code, OP_LOAD, img_pair[0], img, img_pair[1])
+        var res = self.fresh()
+        emit(self.code, OP_IMAGE_READ, self.type_vec4, res, img, coord)
+        return res
+
+    def image_write(mut self, img_pair: Tuple[UInt32, UInt32], coord: UInt32, texel: UInt32):
+        var img = self.fresh()
+        emit(self.code, OP_LOAD, img_pair[0], img, img_pair[1])
+        emit(self.code, OP_IMAGE_WRITE, img, coord, texel)
 
     def finish(mut self) -> List[UInt32]:
         emit(self.code, OP_RETURN)

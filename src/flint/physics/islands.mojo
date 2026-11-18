@@ -33,7 +33,8 @@ GRAPH_COLOURS goes to the overflow colour, which one worker solves alone, in
 order, before the coloured stages. "Pair" below means one manifold's key:
 the pair and the manifold's place among the pair's.
 """
-from flint.core.detsort import stable_order
+from std.math import min, max
+from flint.core.detsort import stable_order, mix64
 from flint.core.serial import BlobWriter, BlobReader
 
 comptime GRAPH_COLOURS: Int = 24
@@ -121,18 +122,22 @@ struct IslandSet(Copyable, Movable):
         self.pending.insert(at, label)
 
     def is_pending(self, label: Int) -> Bool:
-        for item in self.pending:
-            if item == label:
+        var lo = 0
+        var hi = len(self.pending)
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if self.pending[mid] < label:
+                lo = mid + 1
+            elif self.pending[mid] == label:
                 return True
-            if item > label:
-                return False
+            else:
+                hi = mid
         return False
 
     def relabel(mut self, old: Int, new: Int):
         for row in range(len(self.label)):
             if self.label[row] == old:
                 self.label[row] = new
-        # A pending mark follows the bodies.
         var was = False
         var kept = List[Int]()
         for item in self.pending:
@@ -146,8 +151,8 @@ struct IslandSet(Copyable, Movable):
 
     def update_links(mut self, now_a: List[Int], now_b: List[Int], now_row_a: List[Int], now_row_b: List[Int], ids: List[Int]):
         """This tick's links (body id pairs with a < b, in any order, and the
-        rows of their two ends) against last tick's: new links merge islands,
-        missing ones mark islands pending. `ids` maps a row to its body id."""
+        rows of their two ends) against last tick's: new links merge islands in O(N + M alpha(N)),
+        missing ones mark islands pending in O(1) per link. `ids` maps a row to its body id."""
         self.merges = 0
         var count = len(now_a)
         var keys = List[Int](capacity=count)
@@ -161,43 +166,152 @@ struct IslandSet(Copyable, Movable):
         var last = -1
         for k in order:
             if len(sorted_a) > 0 and keys[k] == last:
-                continue  # a pair seen twice (two manifolds, or a contact and a joint)
+                continue
             last = keys[k]
             sorted_a.append(now_a[k])
             sorted_b.append(now_b[k])
             rows_a.append(now_row_a[k])
             rows_b.append(now_row_b[k])
-        # Removed links: in last tick's list, not in this one.
+
+        # Build O(1) id -> row lookup hash table for removed-link marking
+        var n_rows = min(len(self.label), len(ids))
+        var hcap = 16
+        while hcap < n_rows * 2 + 8:
+            hcap *= 2
+        var hmask = hcap - 1
+        var h_keys = List[Int](length=hcap, fill=NO_ISLAND)
+        var h_rows = List[Int](length=hcap, fill=-1)
+        for r in range(n_rows):
+            if self.label[r] != NO_ISLAND and ids[r] != NO_ISLAND:
+                var s = Int(mix64(UInt64(ids[r]))) & hmask
+                for _ in range(hcap):
+                    if h_rows[s] < 0:
+                        h_keys[s] = ids[r]
+                        h_rows[s] = r
+                        break
+                    s = (s + 1) & hmask
+
         var old = 0
         for k in range(len(sorted_a)):
             var key = pair_key(sorted_a[k], sorted_b[k])
             while old < len(self.link_a) and pair_key(self.link_a[old], self.link_b[old]) < key:
-                self.removed_link(self.link_a[old], self.link_b[old], ids)
+                self._mark_removed_fast(self.link_a[old], self.link_b[old], h_keys, h_rows, hmask)
                 old += 1
             if old < len(self.link_a) and pair_key(self.link_a[old], self.link_b[old]) == key:
                 old += 1
         while old < len(self.link_a):
-            self.removed_link(self.link_a[old], self.link_b[old], ids)
+            self._mark_removed_fast(self.link_a[old], self.link_b[old], h_keys, h_rows, hmask)
             old += 1
-        # Merges, in sorted order.
-        for k in range(len(sorted_a)):
-            var la = self.label[rows_a[k]]
-            var lb = self.label[rows_b[k]]
-            if la != lb and la != NO_ISLAND and lb != NO_ISLAND:
-                self.relabel(max(la, lb), min(la, lb))
-                self.merges += 1
+
+        # O(N + M alpha(N)) Union-Find over active island labels (min label wins)
+        if len(sorted_a) > 0 and len(self.label) > 0:
+            var ucap = 16
+            var max_labels = len(self.label) + len(self.pending) + 4
+            while ucap < max_labels * 2:
+                ucap *= 2
+            var umask = ucap - 1
+            var u_key = List[Int](length=ucap, fill=NO_ISLAND)
+            var u_idx = List[Int](length=ucap, fill=-1)
+            var uf_label = List[Int]()
+            var uf_parent = List[Int]()
+
+            for r in range(len(self.label)):
+                var lbl = self.label[r]
+                if lbl != NO_ISLAND:
+                    _ = Self._uf_intern(lbl, u_key, u_idx, umask, uf_label, uf_parent)
+            for item in self.pending:
+                if item != NO_ISLAND:
+                    _ = Self._uf_intern(item, u_key, u_idx, umask, uf_label, uf_parent)
+
+            for k in range(len(sorted_a)):
+                var la = self.label[rows_a[k]]
+                var lb = self.label[rows_b[k]]
+                if la == NO_ISLAND or lb == NO_ISLAND or la == lb:
+                    continue
+                var ia = Self._uf_find(Self._uf_intern(la, u_key, u_idx, umask, uf_label, uf_parent), uf_parent)
+                var ib = Self._uf_find(Self._uf_intern(lb, u_key, u_idx, umask, uf_label, uf_parent), uf_parent)
+                if ia != ib:
+                    if uf_label[ia] < uf_label[ib]:
+                        uf_parent[ib] = ia
+                    else:
+                        uf_parent[ia] = ib
+                    self.merges += 1
+
+            if self.merges > 0:
+                for r in range(len(self.label)):
+                    var lbl = self.label[r]
+                    if lbl != NO_ISLAND:
+                        var ui = Self._uf_intern(lbl, u_key, u_idx, umask, uf_label, uf_parent)
+                        self.label[r] = uf_label[Self._uf_find(ui, uf_parent)]
+                var old_pending = self.pending.copy()
+                self.pending.clear()
+                for item in old_pending:
+                    if item != NO_ISLAND:
+                        var ui = Self._uf_intern(item, u_key, u_idx, umask, uf_label, uf_parent)
+                        self.mark_pending(uf_label[Self._uf_find(ui, uf_parent)])
+
         self.link_a = sorted_a^
         self.link_b = sorted_b^
 
+    @staticmethod
+    def _uf_intern(
+        lbl: Int,
+        mut u_key: List[Int],
+        mut u_idx: List[Int],
+        umask: Int,
+        mut uf_label: List[Int],
+        mut uf_parent: List[Int],
+    ) -> Int:
+        var s = Int(mix64(UInt64(lbl))) & umask
+        for _ in range(len(u_idx)):
+            var idx = u_idx[s]
+            if idx < 0:
+                var made = len(uf_label)
+                u_key[s] = lbl
+                u_idx[s] = made
+                uf_label.append(lbl)
+                uf_parent.append(made)
+                return made
+            if u_key[s] == lbl:
+                return idx
+            s = (s + 1) & umask
+        return 0
+
+    @staticmethod
+    def _uf_find(start: Int, mut uf_parent: List[Int]) -> Int:
+        var root = start
+        while uf_parent[root] != root:
+            root = uf_parent[root]
+        var cur = start
+        while uf_parent[cur] != root:
+            var nxt = uf_parent[cur]
+            uf_parent[cur] = root
+            cur = nxt
+        return root
+
+    def _mark_removed_fast(mut self, a: Int, b: Int, h_keys: List[Int], h_rows: List[Int], hmask: Int):
+        var endpoints = [a, b]
+        for ei in range(2):
+            var target = endpoints[ei]
+            var s = Int(mix64(UInt64(target))) & hmask
+            for _ in range(len(h_rows)):
+                var r = h_rows[s]
+                if r < 0:
+                    break
+                if h_keys[s] == target:
+                    if self.label[r] != NO_ISLAND:
+                        self.mark_pending(self.label[r])
+                    break
+                s = (s + 1) & hmask
+
     def removed_link(mut self, a: Int, b: Int, ids: List[Int]):
-        """A link went away: whichever island its ends are in now may have
-        come apart."""
+        """A link went away: whichever island its ends are in now may have come apart."""
         for row in range(len(self.label)):
             if row < len(ids) and (ids[row] == a or ids[row] == b) and self.label[row] != NO_ISLAND:
                 self.mark_pending(self.label[row])
 
     def split(mut self, label: Int, ids: List[Int]):
-        """Splits one island into its connected pieces over the current links;
+        """Splits one island into its connected pieces over the current links in O(V + E);
         each piece takes its lowest body id as its label."""
         var members = List[Int]()
         for row in range(len(self.label)):
@@ -208,11 +322,68 @@ struct IslandSet(Copyable, Movable):
             if item != label:
                 kept.append(item)
         self.pending = kept^
-        if len(members) <= 1:
+        var m_count = len(members)
+        if m_count <= 1:
             return
-        var piece = List[Int](length=len(members), fill=-1)
+
+        # O(V) id -> member index hash table
+        var hcap = 16
+        while hcap < m_count * 2 + 8:
+            hcap *= 2
+        var hmask = hcap - 1
+        var h_keys = List[Int](length=hcap, fill=NO_ISLAND)
+        var h_mem = List[Int](length=hcap, fill=-1)
+        for m in range(m_count):
+            var bid = ids[members[m]]
+            var s = Int(mix64(UInt64(bid))) & hmask
+            for _ in range(hcap):
+                if h_mem[s] < 0:
+                    h_keys[s] = bid
+                    h_mem[s] = m
+                    break
+                s = (s + 1) & hmask
+
+        # Build local adjacency list over members in O(E)
+        var head = List[Int](length=m_count, fill=-1)
+        var adj_to = List[Int]()
+        var adj_next = List[Int]()
+        for k in range(len(self.link_a)):
+            var id_a = self.link_a[k]
+            var id_b = self.link_b[k]
+            var ma = -1
+            var sa = Int(mix64(UInt64(id_a))) & hmask
+            for _ in range(hcap):
+                if h_mem[sa] < 0:
+                    break
+                if h_keys[sa] == id_a:
+                    ma = h_mem[sa]
+                    break
+                sa = (sa + 1) & hmask
+            if ma < 0:
+                continue
+            var mb = -1
+            var sb = Int(mix64(UInt64(id_b))) & hmask
+            for _ in range(hcap):
+                if h_mem[sb] < 0:
+                    break
+                if h_keys[sb] == id_b:
+                    mb = h_mem[sb]
+                    break
+                sb = (sb + 1) & hmask
+            if mb < 0:
+                continue
+            var e0 = len(adj_to)
+            adj_to.append(mb)
+            adj_next.append(head[ma])
+            head[ma] = e0
+            var e1 = len(adj_to)
+            adj_to.append(ma)
+            adj_next.append(head[mb])
+            head[mb] = e1
+
+        var piece = List[Int](length=m_count, fill=-1)
         var pieces = 0
-        for start in range(len(members)):
+        for start in range(m_count):
             if piece[start] >= 0:
                 continue
             piece[start] = pieces
@@ -220,30 +391,25 @@ struct IslandSet(Copyable, Movable):
             queue.append(start)
             var cursor = 0
             while cursor < len(queue):
-                var here = ids[members[queue[cursor]]]
+                var u = queue[cursor]
                 cursor += 1
-                for k in range(len(self.link_a)):
-                    var other = -1
-                    if self.link_a[k] == here:
-                        other = self.link_b[k]
-                    elif self.link_b[k] == here:
-                        other = self.link_a[k]
-                    if other < 0:
-                        continue
-                    for m in range(len(members)):
-                        if piece[m] < 0 and ids[members[m]] == other:
-                            piece[m] = pieces
-                            queue.append(m)
+                var edge = head[u]
+                while edge >= 0:
+                    var v = adj_to[edge]
+                    if piece[v] < 0:
+                        piece[v] = pieces
+                        queue.append(v)
+                    edge = adj_next[edge]
             pieces += 1
         if pieces <= 1:
             return
         self.splits += 1
         for p in range(pieces):
             var lowest = -1
-            for m in range(len(members)):
+            for m in range(m_count):
                 if piece[m] == p and (lowest < 0 or ids[members[m]] < lowest):
                     lowest = ids[members[m]]
-            for m in range(len(members)):
+            for m in range(m_count):
                 if piece[m] == p:
                     self.label[members[m]] = lowest
 

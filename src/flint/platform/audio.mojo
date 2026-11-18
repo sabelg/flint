@@ -4,6 +4,7 @@ The decoder handles uncompressed RIFF/WAVE PCM without external codecs. Playback
 uses the documented ALSA kernel interface directly; no audio client library is
 loaded or linked. Failure to open or configure a device leaves the game silent.
 """
+from std.atomic import Atomic
 from std.ffi import external_call
 from std.math import floor, cos, abs, sqrt
 from flint.core.math import Vec3
@@ -164,6 +165,110 @@ comptime BUS_SPEECH: Int = 1
 comptime BUS_MUSIC: Int = 2
 comptime BUS_COUNT: Int = 3
 
+comptime AUDIO_CMD_NONE: Int = 0
+comptime AUDIO_CMD_PLAY: Int = 1
+comptime AUDIO_CMD_STOP: Int = 2
+comptime AUDIO_CMD_SET_BUS: Int = 3
+comptime AUDIO_CMD_SET_LISTENER: Int = 4
+
+
+struct AudioCommand(Copyable, ImplicitlyCopyable, Movable):
+    var kind: Int
+    var sound_id: Int
+    var bus: Int
+    var volume: Float32
+    var pitch: Float32
+    var pan: Float32
+    var pos_x: Float32
+    var pos_y: Float32
+    var pos_z: Float32
+
+    def __init__(out self):
+        self.kind = AUDIO_CMD_NONE
+        self.sound_id = -1
+        self.bus = 0
+        self.volume = 1.0
+        self.pitch = 1.0
+        self.pan = 0.0
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.pos_z = 0.0
+
+    def __init__(
+        out self,
+        kind: Int,
+        sound_id: Int = -1,
+        bus: Int = 0,
+        volume: Float32 = 1.0,
+        pitch: Float32 = 1.0,
+        pan: Float32 = 0.0,
+        pos_x: Float32 = 0.0,
+        pos_y: Float32 = 0.0,
+        pos_z: Float32 = 0.0,
+    ):
+        self.kind = kind
+        self.sound_id = sound_id
+        self.bus = bus
+        self.volume = volume
+        self.pitch = pitch
+        self.pan = pan
+        self.pos_x = pos_x
+        self.pos_y = pos_y
+        self.pos_z = pos_z
+
+
+struct AudioSpscQueue(Movable):
+    """Lock-free single-producer single-consumer ring buffer transferring
+    audio commands from gameplay thread to dedicated audio mixing thread."""
+    var capacity: Int
+    var commands: List[AudioCommand]
+    var _indices: List[Int64]
+
+    def __init__(out self, capacity: Int = 1024):
+        var cap = max(2, capacity)
+        self.capacity = cap
+        self.commands = List[AudioCommand]()
+        for _ in range(cap):
+            self.commands.append(AudioCommand())
+        self._indices = List[Int64](length=2, fill=0)
+
+    @always_inline
+    def _head_ptr(self) -> Pointer[Atomic[Int64], MutAnyOrigin]:
+        return Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=Int(self._indices.unsafe_ptr()))
+
+    @always_inline
+    def _tail_ptr(self) -> Pointer[Atomic[Int64], MutAnyOrigin]:
+        return Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=Int(self._indices.unsafe_ptr()) + 8)
+
+    @always_inline
+    def is_empty(self) -> Bool:
+        return self._head_ptr()[unsafe_offset=0].load() == self._tail_ptr()[unsafe_offset=0].load()
+
+    @always_inline
+    def is_full(self) -> Bool:
+        var h = Int(self._head_ptr()[unsafe_offset=0].load())
+        var t = Int(self._tail_ptr()[unsafe_offset=0].load())
+        return ((h + 1) % self.capacity) == t
+
+    def push(mut self, cmd: AudioCommand) -> Bool:
+        var h = Int(self._head_ptr()[unsafe_offset=0].load())
+        var t = Int(self._tail_ptr()[unsafe_offset=0].load())
+        var next_head = (h + 1) % self.capacity
+        if next_head == t:
+            return False  # Queue full
+        self.commands[h] = cmd
+        self._head_ptr()[unsafe_offset=0].store(Int64(next_head))
+        return True
+
+    def pop(mut self, mut cmd: AudioCommand) -> Bool:
+        var h = Int(self._head_ptr()[unsafe_offset=0].load())
+        var t = Int(self._tail_ptr()[unsafe_offset=0].load())
+        if h == t:
+            return False  # Queue empty
+        cmd = self.commands[t]
+        self._tail_ptr()[unsafe_offset=0].store(Int64((t + 1) % self.capacity))
+        return True
+
 # Package 3.24: the low hum. The sonar ping (clip 3: a 501 Hz tone that rings
 # for a second) read slowly, so it sounds near 100 Hz, from the middle of its
 # ring, by two read heads half a loop apart, each under a raised-cosine
@@ -254,8 +359,16 @@ struct NativeAudio:
     var speech_duck: Float32       # smooth sidechain auto-ducking multiplier while BUS_SPEECH is active
     var hrtf_enabled: Bool         # V10 Woodworth ITD interaural delay + head-shadow + pinna elevation cue
     var vacuum_mix: Float32        # V10 0.0 = atmosphere, 1.0 = orbital space vacuum muffling for external SFX
+    var queue: AudioSpscQueue      # Lock-free SPSC command ring buffer
+    var listener_pos: Vec3         # Listener position updated via AUDIO_CMD_SET_LISTENER
+    var mix_buf: List[Float32]     # Reusable stereo mix scratch buffer (zero per-quantum alloc)
+    var rev_send_buf: List[Float32]  # Reusable stereo reverb send buffer (zero per-quantum alloc)
 
     def __init__(out self):
+        self.queue = AudioSpscQueue(1024)
+        self.listener_pos = Vec3()
+        self.mix_buf = List[Float32](length=4096 * 2, fill=0.0)
+        self.rev_send_buf = List[Float32](length=4096 * 2, fill=0.0)
         self.drone_clip = DRONE_CLIP
         self.drone_level = 0
         self.drone_gain = 0
@@ -324,6 +437,24 @@ struct NativeAudio:
         for path in paths:
             self.clips.append(load_wav(path))
         return first
+
+    def send_command(mut self, cmd: AudioCommand) -> Bool:
+        return self.queue.push(cmd)
+
+    def process_commands(mut self):
+        var cmd = AudioCommand()
+        while self.queue.pop(cmd):
+            if cmd.kind == AUDIO_CMD_PLAY:
+                if cmd.sound_id >= 0 and cmd.sound_id < len(self.clips):
+                    self.play_sound(cmd.sound_id, cmd.pitch, cmd.volume)
+            elif cmd.kind == AUDIO_CMD_STOP:
+                for i in range(len(self.voices)):
+                    self.voices[i].active = False
+            elif cmd.kind == AUDIO_CMD_SET_BUS:
+                if cmd.bus >= 0 and cmd.bus < len(self.bus_volume):
+                    self.bus_volume[cmd.bus] = cmd.volume
+            elif cmd.kind == AUDIO_CMD_SET_LISTENER:
+                self.listener_pos = Vec3(cmd.pos_x, cmd.pos_y, cmd.pos_z)
 
     def errno(self) -> Int:
         var pointer = external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()
@@ -768,8 +899,14 @@ struct NativeAudio:
 
     def mix_stereo(mut self, frames: Int) -> List[Int16]:
         var count = max(0, min(32768, frames))
-        var mixed = List[Float32](length=count * 2, fill=0)
-        var rev_send_buf = List[Float32](length=count * 2, fill=0)
+        var needed = count * 2
+        if len(self.mix_buf) < needed:
+            self.mix_buf.resize(needed, 0.0)
+        if len(self.rev_send_buf) < needed:
+            self.rev_send_buf.resize(needed, 0.0)
+        if needed > 0:
+            _ = external_call["memset", Int](Int(self.mix_buf.unsafe_ptr()), Int32(0), needed * 4)
+            _ = external_call["memset", Int](Int(self.rev_send_buf.unsafe_ptr()), Int32(0), needed * 4)
         var has_rev_send = False
         var speech_active = self.is_speech_playing()
         var duck_goal = Float32(0.38) if speech_active else Float32(1.0)
@@ -784,7 +921,7 @@ struct NativeAudio:
                 duck += (duck_goal - duck) * duck_rate
                 var music_gain = base_music_gain * duck
                 for channel in range(2):
-                    mixed[frame * 2 + channel] += clip_sample(self.music, position, channel, True) * music_gain
+                    self.mix_buf[frame * 2 + channel] += clip_sample(self.music, position, channel, True) * music_gain
                 position += step
                 if position >= Float64(music_frames):
                     position -= Float64(music_frames)
@@ -866,11 +1003,11 @@ struct NativeAudio:
                     sr = lp_r + (raw_r - lp_r) * pinna_shelf
                 var out_l = sl * gain_l
                 var out_r = sr * gain_r
-                mixed[frame * 2] += out_l
-                mixed[frame * 2 + 1] += out_r
+                self.mix_buf[frame * 2] += out_l
+                self.mix_buf[frame * 2 + 1] += out_r
                 if rsend > Float32(0.005):
-                    rev_send_buf[frame * 2] += out_l * rsend
-                    rev_send_buf[frame * 2 + 1] += out_r * rsend
+                    self.rev_send_buf[frame * 2] += out_l * rsend
+                    self.rev_send_buf[frame * 2 + 1] += out_r * rsend
                 position += step
             self.voices[voice_index].position = position
             self.voices[voice_index].lp_l = lp_l
@@ -879,18 +1016,21 @@ struct NativeAudio:
                 self.voices[voice_index].active = False
         if self.reverb_enabled and has_rev_send:
             for frame in range(count):
-                var wet = self.reverb.process_send(rev_send_buf[frame * 2], rev_send_buf[frame * 2 + 1])
-                mixed[frame * 2] += wet[0]
-                mixed[frame * 2 + 1] += wet[1]
-        self.mix_drone(mixed, count)
+                var wet = self.reverb.process_send(self.rev_send_buf[frame * 2], self.rev_send_buf[frame * 2 + 1])
+                self.mix_buf[frame * 2] += wet[0]
+                self.mix_buf[frame * 2 + 1] += wet[1]
+        var drone_buf = self.mix_buf^
+        self.mix_buf = List[Float32]()
+        self.mix_drone(drone_buf, count)
+        self.mix_buf = drone_buf^
         if self.mono:
             for frame in range(count):
-                var both = (mixed[frame * 2] + mixed[frame * 2 + 1]) * 0.5
-                mixed[frame * 2] = both
-                mixed[frame * 2 + 1] = both
-        var output = List[Int16](length=count * 2, fill=0)
-        for index in range(len(output)):
-            var x = mixed[index]
+                var both = (self.mix_buf[frame * 2] + self.mix_buf[frame * 2 + 1]) * 0.5
+                self.mix_buf[frame * 2] = both
+                self.mix_buf[frame * 2 + 1] = both
+        var output = List[Int16](length=needed, fill=0)
+        for index in range(needed):
+            var x = self.mix_buf[index]
             # Transparent below 0.72, smooth Padé tanh studio soft-knee ceiling above 0.72
             var sample: Float32
             if x > Float32(0.72):

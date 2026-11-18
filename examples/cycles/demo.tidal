@@ -1,0 +1,24 @@
+-- flint-cycles demo. Run:  bash tools/flint.sh cycles live examples/cycles/demo.tidal
+-- then edit this file and save: changes land on the next block, the clock keeps going.
+
+setcps (124/60/4)
+
+d1 $ s "bd*2 [~ bd] bd [~ bd:1]" # shape 0.25
+
+d2 $ s "~ cp ~ [cp sn]" # room 0.3 # size 0.6
+
+d3 $ swingBy (1/12) 4 $ chunk 4 (hurry 2)
+  $ s "hh*8" # gain "0.75 1" # pan (range 0.3 0.7 sine)
+
+d4 $ n "<0 0 3 -2>" # s "bass" # cutoff 1100 # resonance 0.35 # legato 0.8
+
+d5 $ jux rev $ every 2 (0.25 <~)
+  $ n (scale "minPent" "0 2 4 <7 9>") |+ n 12
+  # s "pluck" # delay 0.35 # delaytime 0.181 # delayfeedback 0.4
+
+d6 $ slow 4 $ n "<c'min e'maj'i>" # s "pad" # room 0.5 # gain 0.75
+
+d8 $ arp "<up updown>" $ n "<c'min7 a'maj7>" |+ n 12
+  # s "fm" # gain 0.55 # legato 0.6 # pan 0.6
+
+d7 $ sometimesBy 0.3 (# speed 2) $ s "bell(3,8,2)" # n "<12 7>" # gain 0.7 # room 0.4

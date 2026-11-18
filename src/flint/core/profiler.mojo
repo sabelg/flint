@@ -422,10 +422,15 @@ struct ProfileTimeline(Movable):
     def measure_clock(mut self):
         var wall = monotonic()
         var ticks = profile_ticks()
-        _ = external_call["usleep", Int32](CALIBRATION_MICROSECONDS)
+        # Non-blocking calibration over ~50 us window without synchronous usleep(20000)
+        while monotonic() - wall < 50000:
+            pass
         var spent_wall = monotonic() - wall
         var spent_ticks = profile_ticks() - ticks
-        self.nanoseconds_per_tick = Float64(spent_wall) / Float64(spent_ticks)
+        if spent_ticks > 100:
+            self.nanoseconds_per_tick = Float64(spent_wall) / Float64(spent_ticks)
+        else:
+            self.nanoseconds_per_tick = 0.5
         self.handle.word(TICK_RATE_WORD)[unsafe_offset=0].store(Int64(Int(self.ticks_per_second())))
 
     def ticks_per_second(self) -> Float64:

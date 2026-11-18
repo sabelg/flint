@@ -7,6 +7,8 @@ Provides:
 - `SimdColumn[dtype]`: 8-lane SIMD-padded Structure-of-Arrays column with `MemCharge` & `BlobWriter` I/O
 - `run_parallel_ctx`: lifetime-safe wrapper over `JobPool.run_jobs` preventing Mojo ASAP destruction
 """
+from std.atomic import Atomic
+from std.ffi import external_call
 from std.sys import size_of
 from flint.core.jobs import JobPool, JobBody, run_jobs
 from flint.core.memory import MemCharge, MEM_ENTITIES
@@ -20,6 +22,13 @@ comptime ROW_SPAWNING: UInt8 = 1
 comptime ROW_LIVE: UInt8 = 2
 comptime ROW_DESPAWNING: UInt8 = 3
 comptime GEN_MASK: UInt32 = 0x00FFFFFF
+comptime ECB_PROV_GEN: UInt32 = 0x00FFFFFF  # Reserved sentinel generation for EntityCommandBuffer provisional handles
+
+
+@always_inline
+def _next_slot_gen(g: UInt32) -> UInt32:
+    var ng = (g + 1) & GEN_MASK
+    return 0 if ng == ECB_PROV_GEN else ng
 
 
 @fieldwise_init
@@ -86,12 +95,39 @@ struct ArchetypeRegistry(Copyable, Movable):
         return "archetype_" + String(archetype)
 
 
+@always_inline
+def _trailing_zeros_64(val: UInt64) -> Int:
+    if val == 0:
+        return 64
+    var v = val
+    var count = 0
+    if (v & 0xFFFFFFFF) == 0:
+        count += 32
+        v >>= 32
+    if (v & 0xFFFF) == 0:
+        count += 16
+        v >>= 16
+    if (v & 0xFF) == 0:
+        count += 8
+        v >>= 8
+    if (v & 0xF) == 0:
+        count += 4
+        v >>= 4
+    if (v & 0x3) == 0:
+        count += 2
+        v >>= 2
+    if (v & 0x1) == 0:
+        count += 1
+    return count
+
+
 struct ArchetypeSlots(Copyable, Movable):
-    """Deterministic lowest-free row pool with deferred tick-boundary spawn/despawn commit."""
+    """Deterministic lowest-free row pool with chunked bitset O(1) allocation and deferred tick commit."""
     var archetype: Int
     var capacity: Int
     var state: List[UInt8]
     var generation: List[UInt32]
+    var free_mask: List[UInt64]
     var used: Int
     var pending: Int
     var live_count: Int
@@ -102,43 +138,71 @@ struct ArchetypeSlots(Copyable, Movable):
         self.capacity = cap
         self.state = List[UInt8](length=cap, fill=ROW_FREE)
         self.generation = List[UInt32](length=cap, fill=0)
+        var num_chunks = (cap + 63) // 64
+        self.free_mask = List[UInt64](length=num_chunks, fill=0xFFFFFFFFFFFFFFFF)
+        var rem = cap % 64
+        if rem != 0:
+            var valid_mask = (UInt64(1) << UInt64(rem)) - 1
+            self.free_mask[num_chunks - 1] = valid_mask
         self.used = 0
         self.pending = 0
         self.live_count = 0
 
     def spawn(mut self, deferred: Bool = False) -> EntityHandle:
-        for idx in range(self.capacity):
-            if self.state[idx] == ROW_FREE:
-                if deferred:
-                    self.state[idx] = ROW_SPAWNING
-                    self.pending += 1
-                else:
-                    self.state[idx] = ROW_LIVE
-                    self.live_count += 1
-                if idx >= self.used:
-                    self.used = idx + 1
-                return EntityHandle(self.archetype, idx, self.generation[idx])
+        for c in range(len(self.free_mask)):
+            var m = self.free_mask[c]
+            if m != 0:
+                var bit_idx = _trailing_zeros_64(m)
+                var idx = c * 64 + bit_idx
+                if idx < self.capacity:
+                    self.free_mask[c] = m & ~(UInt64(1) << UInt64(bit_idx))
+                    if deferred:
+                        self.state[idx] = ROW_SPAWNING
+                        self.pending += 1
+                    else:
+                        self.state[idx] = ROW_LIVE
+                        self.live_count += 1
+                    if idx >= self.used:
+                        self.used = idx + 1
+                    return EntityHandle(self.archetype, idx, self.generation[idx])
         return EntityHandle()
 
-    def resolve(self, handle: EntityHandle) -> Int:
+    def resolve(self, handle: EntityHandle, allow_spawning: Bool = False) -> Int:
         if handle.archetype != self.archetype or handle.row < 0 or handle.row >= self.used:
             return -1
         var st = self.state[handle.row]
         if st != ROW_LIVE and st != ROW_DESPAWNING:
-            return -1
+            if not (allow_spawning and st == ROW_SPAWNING):
+                return -1
         if self.generation[handle.row] != handle.generation:
             return -1
         return handle.row
 
     def despawn(mut self, handle: EntityHandle, deferred: Bool = False) -> Bool:
-        var row = self.resolve(handle)
+        var row = self.resolve(handle, allow_spawning=True)
         if row < 0:
             return False
+        if self.state[row] == ROW_SPAWNING:
+            self.state[row] = ROW_FREE
+            self.pending = max(0, self.pending - 1)
+            var c = row // 64
+            var b = row % 64
+            self.free_mask[c] |= (UInt64(1) << UInt64(b))
+            self.generation[row] = _next_slot_gen(self.generation[row])
+            while self.used > 0 and self.state[self.used - 1] == ROW_FREE:
+                self.used -= 1
+            return True
         if not deferred:
             if self.state[row] == ROW_LIVE:
                 self.live_count -= 1
+            elif self.state[row] == ROW_DESPAWNING:
+                self.live_count -= 1
+                self.pending = max(0, self.pending - 1)
             self.state[row] = ROW_FREE
-            self.generation[row] = (self.generation[row] + 1) & GEN_MASK
+            var c = row // 64
+            var b = row % 64
+            self.free_mask[c] |= (UInt64(1) << UInt64(b))
+            self.generation[row] = _next_slot_gen(self.generation[row])
             while self.used > 0 and self.state[self.used - 1] == ROW_FREE:
                 self.used -= 1
             return True
@@ -157,7 +221,10 @@ struct ArchetypeSlots(Copyable, Movable):
                 self.live_count += 1
             elif self.state[idx] == ROW_DESPAWNING:
                 self.state[idx] = ROW_FREE
-                self.generation[idx] = (self.generation[idx] + 1) & GEN_MASK
+                var c = idx // 64
+                var b = idx % 64
+                self.free_mask[c] |= (UInt64(1) << UInt64(b))
+                self.generation[idx] = _next_slot_gen(self.generation[idx])
                 self.live_count -= 1
         self.pending = 0
         while self.used > 0 and self.state[self.used - 1] == ROW_FREE:
@@ -197,10 +264,110 @@ struct ArchetypeSlots(Copyable, Movable):
         self.used = min(self.capacity, max(0, r.integer()))
         self.pending = max(0, r.integer())
         self.live_count = max(0, r.integer())
-        for i in range(self.used):
-            self.state[i] = r.u8()
-            self.generation[i] = r.u32()
+        var num_chunks = (self.capacity + 63) // 64
+        self.free_mask = List[UInt64](length=num_chunks, fill=0)
+        for i in range(self.capacity):
+            if i < self.used:
+                self.state[i] = r.u8()
+                self.generation[i] = r.u32()
+            else:
+                self.state[i] = ROW_FREE
+                self.generation[i] = 0
+            if self.state[i] == ROW_FREE:
+                self.free_mask[i // 64] |= (UInt64(1) << UInt64(i % 64))
         return not r.failed
+
+
+comptime ECB_OP_SPAWN: Int = 1
+comptime ECB_OP_DESPAWN: Int = 2
+
+
+struct EcbCommand(Copyable, Movable):
+    var op: Int
+    var archetype: Int
+    var handle: EntityHandle
+
+    def __init__(out self, op: Int, archetype: Int, handle: EntityHandle):
+        self.op = op
+        self.archetype = archetype
+        self.handle = handle
+
+
+struct EntityCommandBuffer(Movable):
+    """Thread-safe deferred command buffer for parallel worker entity mutation."""
+    var commands: List[EcbCommand]
+    var _lock_buf: List[Int64]
+    var next_seq: Int
+
+    def __init__(out self):
+        self.commands = List[EcbCommand]()
+        self._lock_buf = List[Int64](length=1, fill=0)
+        self.next_seq = 0
+
+    @always_inline
+    def _acquire(self):
+        var p = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=Int(self._lock_buf.unsafe_ptr()))
+        while True:
+            var expected = Int64(0)
+            if p[unsafe_offset=0].compare_exchange(expected, Int64(1)):
+                return
+            _ = external_call["sched_yield", Int32]()
+
+    @always_inline
+    def _release(self):
+        var p = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=Int(self._lock_buf.unsafe_ptr()))
+        p[unsafe_offset=0].store(Int64(0))
+
+    def spawn(mut self, archetype: Int) -> EntityHandle:
+        self._acquire()
+        var seq = self.next_seq
+        self.next_seq += 1
+        var h = EntityHandle(archetype, seq, ECB_PROV_GEN) if archetype > 0 else EntityHandle()
+        self.commands.append(EcbCommand(ECB_OP_SPAWN, archetype, h))
+        self._release()
+        return h
+
+    def despawn(mut self, handle: EntityHandle):
+        self._acquire()
+        self.commands.append(EcbCommand(ECB_OP_DESPAWN, handle.archetype, handle))
+        self._release()
+
+    def playback(mut self, mut slots: ArchetypeSlots):
+        self._acquire()
+        var prov_rows = List[Int]()
+        var real_handles = List[EntityHandle]()
+        for i in range(len(self.commands)):
+            var cmd = self.commands[i].copy()
+            if cmd.archetype == slots.archetype:
+                if cmd.op == ECB_OP_SPAWN:
+                    var real_h = slots.spawn(deferred=True)
+                    prov_rows.append(cmd.handle.row)
+                    real_handles.append(real_h)
+                elif cmd.op == ECB_OP_DESPAWN:
+                    var target_h = cmd.handle
+                    if target_h.generation == ECB_PROV_GEN and target_h.row >= 0:
+                        var mapped = False
+                        for j in range(len(prov_rows)):
+                            if prov_rows[j] == target_h.row:
+                                target_h = real_handles[j]
+                                mapped = True
+                                break
+                        if not mapped:
+                            continue
+                    _ = slots.despawn(target_h, deferred=True)
+        self._release()
+
+    def count(self) -> Int:
+        self._acquire()
+        var n = len(self.commands)
+        self._release()
+        return n
+
+    def clear(mut self):
+        self._acquire()
+        self.commands.clear()
+        self.next_seq = 0
+        self._release()
 
 
 struct SimdColumn[dtype: DType](Copyable, Movable):
@@ -236,12 +403,16 @@ struct SimdColumn[dtype: DType](Copyable, Movable):
 
     @always_inline
     def load8(self, idx: Int) -> SIMD[Self.dtype, 8]:
+        if idx < 0 or idx + 8 > self.capacity:
+            return SIMD[Self.dtype, 8](0)
         return Pointer[Scalar[Self.dtype], ImmutAnyOrigin](
             unsafe_from_address=Int(self.data.unsafe_ptr()) + idx * size_of[Scalar[Self.dtype]]()
         ).unsafe_load[width=8, alignment=4]()
 
     @always_inline
     def store8(mut self, idx: Int, val: SIMD[Self.dtype, 8]):
+        if idx < 0 or idx + 8 > self.capacity:
+            return
         Pointer[Scalar[Self.dtype], MutAnyOrigin](
             unsafe_from_address=Int(self.data.unsafe_ptr()) + idx * size_of[Scalar[Self.dtype]]()
         ).unsafe_store[alignment=4](val)
