@@ -91,6 +91,10 @@ struct NativeMesh(Copyable, Movable):
     var double_sided: Bool
     # Morph targets: morph_count blocks of vertex_count() * 3 deltas each.
     var morph_count: Int
+    # Index of this mesh's first target in NativeModel.morph_names /
+    # morph_weights: target t of this mesh is weighted by
+    # morph_weights[morph_first + t]. Primitives of one glTF mesh share it.
+    var morph_first: Int
     var morph_positions: List[Float32]
     var morph_normals: List[Float32]
     # Package 3.4: each vertex's center of rotation in bind space (three
@@ -129,6 +133,7 @@ struct NativeMesh(Copyable, Movable):
         self.alpha_mode = 0
         self.double_sided = False
         self.morph_count = 0
+        self.morph_first = 0
         self.morph_positions = List[Float32]()
         self.morph_normals = List[Float32]()
         self.centers = List[Float32]()
@@ -197,6 +202,12 @@ comptime INTERP_LINEAR: UInt8 = 0
 comptime INTERP_STEP: UInt8 = 1
 comptime INTERP_CUBICSPLINE: UInt8 = 2
 
+# NativeChannel.path: 0 translation, 1 rotation, 2 scale (in
+# NativeAnimation.channels) and CHANNEL_WEIGHTS for glTF morph weight tracks,
+# which live apart in NativeAnimation.weight_channels so pose samplers never
+# see them.
+comptime CHANNEL_WEIGHTS: Int = 3
+
 
 struct NativeChannel(Copyable, Movable):
     var node: Int
@@ -218,11 +229,16 @@ struct NativeChannel(Copyable, Movable):
 struct NativeAnimation(Copyable, Movable):
     var name: String
     var channels: List[NativeChannel]
+    # glTF `target.path == "weights"` tracks (path CHANNEL_WEIGHTS). `node` is
+    # the animated node; each key holds one weight per target of that node's
+    # mesh (three times that for CUBICSPLINE: in-tangent, value, out-tangent).
+    var weight_channels: List[NativeChannel]
     var duration: Float32
 
     def __init__(out self):
         self.name = ""
         self.channels = List[NativeChannel]()
+        self.weight_channels = List[NativeChannel]()
         self.duration = 0
 
     def frame_count(self) -> Int:
@@ -299,6 +315,9 @@ struct NativeModel(Copyable, Movable):
     # Package 3.4: how far each morph target is applied, by morph_names
     # (empty: none). Presentation sets it; skinning applies it.
     var morph_weights: List[Float32]
+    # The glTF defaults (mesh.weights, overridden by node.weights), by
+    # morph_names. The loader also starts morph_weights from them.
+    var morph_default_weights: List[Float32]
     # Package 3.4: how its skinned meshes deform (anim/skinning.mojo SKIN_*), from
     # the asset's manifest; -1 when nothing said, which is linear blend.
     var skin_method: Int
@@ -324,6 +343,7 @@ struct NativeModel(Copyable, Movable):
         self.max_influences = 0
         self.morph_names = List[String]()
         self.morph_weights = List[Float32]()
+        self.morph_default_weights = List[Float32]()
         self.skin_method = -1
 
     def set_morph_weight(mut self, morph: Int, weight: Float32):
@@ -333,6 +353,87 @@ struct NativeModel(Copyable, Movable):
         if len(self.morph_weights) != len(self.morph_names):
             self.morph_weights = List[Float32](length=len(self.morph_names), fill=0)
         self.morph_weights[morph] = weight
+
+    def mesh_morph_weights(self, mesh_index: Int) -> List[Float32]:
+        """Mesh `mesh_index`'s current target weights: morph_count floats,
+        target t at index t (zero where morph_weights does not reach)."""
+        var out = List[Float32]()
+        if mesh_index < 0 or mesh_index >= len(self.meshes):
+            return out^
+        ref mesh = self.meshes[mesh_index]
+        out = List[Float32](length=mesh.morph_count, fill=0)
+        for t in range(mesh.morph_count):
+            var at = mesh.morph_first + t
+            if at >= 0 and at < len(self.morph_weights):
+                out[t] = self.morph_weights[at]
+        return out^
+
+    def sample_morph_weights(self, animation: Int, time: Float32) -> List[Float32]:
+        """Every morph weight (by morph_names) of clip `animation` at `time`
+        seconds: the defaults, with each of the clip's weight tracks sampled
+        over its node's targets. Time is clamped to the keys (no wrap)."""
+        var out = self.morph_default_weights.copy()
+        if len(out) != len(self.morph_names):
+            out = List[Float32](length=len(self.morph_names), fill=0)
+        if animation < 0 or animation >= len(self.animations):
+            return out^
+        for channel in self.animations[animation].weight_channels:
+            if channel.node < 0 or channel.node >= len(self.nodes):
+                continue
+            var mesh = self.nodes[channel.node].mesh
+            if mesh < 0 or mesh >= len(self.meshes):
+                continue
+            var first = self.meshes[mesh].morph_first
+            var targets = self.meshes[mesh].morph_count
+            var keys = len(channel.times)
+            if targets <= 0 or keys == 0:
+                continue
+            var cubic = channel.interp_mode == INTERP_CUBICSPLINE
+            var stride = targets * 3 if cubic else targets
+            if len(channel.values) < keys * stride:
+                continue
+            var value_at = targets if cubic else 0
+            var k0 = 0
+            var u = Float32(0)
+            if time >= channel.times[keys - 1]:
+                k0 = keys - 1
+            elif time > channel.times[0]:
+                while k0 + 1 < keys and channel.times[k0 + 1] <= time:
+                    k0 += 1
+                var span = channel.times[k0 + 1] - channel.times[k0]
+                u = (time - channel.times[k0]) / span if span > 0 else Float32(0)
+            var k1 = min(k0 + 1, keys - 1) if u > 0 else k0
+            for t in range(targets):
+                if first + t < 0 or first + t >= len(out):
+                    continue
+                var a = channel.values[k0 * stride + value_at + t]
+                var b = channel.values[k1 * stride + value_at + t]
+                var w = a
+                if k0 != k1:
+                    if channel.interp_mode == INTERP_STEP:
+                        w = a
+                    elif cubic:
+                        # glTF cubic Hermite: tangents are scaled by the key span.
+                        var span = channel.times[k1] - channel.times[k0]
+                        var out_tan = channel.values[k0 * stride + targets * 2 + t] * span
+                        var in_tan = channel.values[k1 * stride + t] * span
+                        var u2 = u * u
+                        var u3 = u2 * u
+                        w = (2 * u3 - 3 * u2 + 1) * a + (u3 - 2 * u2 + u) * out_tan + (-2 * u3 + 3 * u2) * b + (u3 - u2) * in_tan
+                    else:
+                        w = a + (b - a) * u
+                out[first + t] = w
+        return out^
+
+    def animate_morph_weights(mut self, animation: Int, time: Float32):
+        """Sets morph_weights to clip `animation` at `time` (see sample_morph_weights)."""
+        self.morph_weights = self.sample_morph_weights(animation, time)
+
+    def has_morph_animation(self, animation: Int) -> Bool:
+        """True when clip `animation` has any morph weight track."""
+        if animation < 0 or animation >= len(self.animations):
+            return False
+        return len(self.animations[animation].weight_channels) > 0
 
     def bytes(self) -> Int:
         """Heap bytes this model holds (list capacities), for its memory tag."""
@@ -353,6 +454,9 @@ struct NativeModel(Copyable, Movable):
         for animation in self.animations:
             total += animation.channels.capacity() * size_of[NativeChannel]()
             for channel in animation.channels:
+                total += (channel.times.capacity() + channel.values.capacity()) * 4
+            total += animation.weight_channels.capacity() * size_of[NativeChannel]()
+            for channel in animation.weight_channels:
                 total += (channel.times.capacity() + channel.values.capacity()) * 4
         total += self.cached_transforms.capacity() * size_of[Mat4]() + (self.roots.capacity() + self.parents.capacity()) * 8
         return total
@@ -447,6 +551,17 @@ struct NativeModel(Copyable, Movable):
                 var kept = channel.copy()
                 kept.node = node
                 animation.channels.append(kept^)
+            for channel in source.animations[clip].weight_channels:
+                # Morph weight tracks follow their node by name; a node this
+                # model lacks just drops the track (it moves no bone).
+                if channel.node < 0 or channel.node >= len(source.nodes):
+                    continue
+                var node = self.find_node(source.nodes[channel.node].name)
+                if node < 0:
+                    continue
+                var kept = channel.copy()
+                kept.node = node
+                animation.weight_channels.append(kept^)
             bound.append(animation^)
         self.animations = bound^
         self.anim = InertialState()
@@ -475,6 +590,7 @@ struct NativeModel(Copyable, Movable):
                 if channel.node >= 0 and channel.node < len(self.nodes) and self.channel_rests(channel, channel.node):
                     continue
                 animation.channels.append(channel.copy())
+            animation.weight_channels = self.animations[clip].weight_channels.copy()
             kept.append(animation^)
         self.animations = kept^
         self.anim = InertialState()

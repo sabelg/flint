@@ -207,9 +207,19 @@ from flint.render.aaa_skinning_rt import (
     AAA_SKIN_MAX_VERTS,
     AAA_SKIN_PREV_BONES_BASE,
     AAA_SKIN_PREV_POS_BASE,
+    AAA_SKIN_MORPH_BASE,
+    AAA_SKIN_MORPH_ENTRY_WORDS,
+    AAA_SKIN_MORPH_MIN_WORDS,
+    AAA_SKIN_PUSH_MORPH_ROWS,
+    AAA_SKIN_PUSH_MORPH_ENTRIES,
+    AAA_SKIN_PUSH_MORPH_CUR_W,
+    AAA_SKIN_PUSH_MORPH_PREV_W,
+    AAA_SKIN_PUSH_MORPH_ON,
     DualQuat,
     FlintAaaSkinningArena,
+    MorphCsr,
     aaa_dq_skinning_shader,
+    build_morph_csr,
     normalize_and_sort_skin_weights_4,
 )
 from flint.render.aaa_sky_atmosphere import (
@@ -387,12 +397,54 @@ def _build_camera_view_col_major(eye: Vec3, fwd: Vec3, right: Vec3, up: Vec3) ->
     return m^
 
 
+def morphed_mesh(mesh: NativeMesh, weights: List[Float32]) -> NativeMesh:
+    """A copy of `mesh` with its morph targets applied at `weights` (one per target) on the CPU,
+    for meshes uploaded static. All-zero weights return a plain copy."""
+    var out = mesh.copy()
+    var n = mesh.vertex_count()
+    if mesh.morph_count <= 0 or len(mesh.morph_positions) != mesh.morph_count * n * 3:
+        return out^
+    var has_normals = len(mesh.morph_normals) == len(mesh.morph_positions) and len(mesh.normals) == n * 3
+    var moved = False
+    for t in range(mesh.morph_count):
+        var w = weights[t] if t < len(weights) else Float32(0)
+        if w == 0:
+            continue
+        moved = True
+        for i in range(n * 3):
+            out.positions[i] += mesh.morph_positions[t * n * 3 + i] * w
+            if has_normals:
+                out.normals[i] += mesh.morph_normals[t * n * 3 + i] * w
+    if moved and has_normals:
+        for v in range(n):
+            var nv = Vec3(out.normals[v * 3], out.normals[v * 3 + 1], out.normals[v * 3 + 2])
+            var l = nv.length()
+            if l > Float32(1e-12):
+                out.normals[v * 3] = nv.x / l
+                out.normals[v * 3 + 1] = nv.y / l
+                out.normals[v * 3 + 2] = nv.z / l
+    if moved:
+        out.bounds_verts = 0  # stale bounds
+    return out^
+
+
 struct AaaSkinnedMeshEntry(Copyable, Movable):
     var mesh_entry: CookedMeshEntry
     var skin_bind_first_slot: Int
     var vertex_count: Int
     var bone_count: Int
     var bone_palette_offset: Int
+    # Morph targets (0: none, and the kernel skips the morph loop). Word offsets are absolute
+    # in BIND_AAA_SKINNING: current weights at morph_weights_word, previous weights right after.
+    var morph_count: Int
+    var morph_rows_word: Int
+    var morph_entries_word: Int
+    var morph_weights_word: Int
+    # The NativeModel mesh this entry came from (`upload_native_model`), -1 otherwise.
+    var model_mesh: Int
+    # True when the mesh had no joints and rides the skinning path only for its morphs
+    # (one identity bone); its node transform still places it.
+    var morph_only: Bool
 
     def __init__(out self):
         self.mesh_entry = CookedMeshEntry()
@@ -400,6 +452,12 @@ struct AaaSkinnedMeshEntry(Copyable, Movable):
         self.vertex_count = 0
         self.bone_count = 0
         self.bone_palette_offset = 0
+        self.morph_count = 0
+        self.morph_rows_word = 0
+        self.morph_entries_word = 0
+        self.morph_weights_word = 0
+        self.model_mesh = -1
+        self.morph_only = False
 
 
 struct AaaUploadedModel(Movable):
@@ -593,6 +651,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var mesh_alpha_masked_flags: List[Bool]
     var skin_bind_cursor: Int
     var skin_bone_cursor: Int
+    var skin_morph_cursor: Int    # words used in the morph region (past AAA_SKIN_MORPH_BASE)
+    var skin_morph_capacity: Int  # words the morph region holds (0 until a morph mesh arrives)
     var skin_arena: FlintAaaSkinningArena
     var enable_aerial_perspective: Bool
     var aerial_sigma_ext: Vec3
@@ -849,6 +909,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.mesh_alpha_masked_flags = List[Bool]()
         self.skin_bind_cursor = 0
         self.skin_bone_cursor = 0
+        self.skin_morph_cursor = 0
+        self.skin_morph_capacity = 0
         self.skin_arena = FlintAaaSkinningArena()
         self.enable_aerial_perspective = False
         self.aerial_sigma_ext = Vec3()
@@ -2083,11 +2145,16 @@ struct FlintAaaVulkanRenderer(Movable):
         material_id: Int,
         bone_count: Int = 64,
         bone_palette_offset: Int = -1,
+        morph_weights: List[Float32] = List[Float32](),
     ) -> AaaSkinnedMeshEntry:
         """Uploads a 4-bone Dual-Quaternion skinned mesh into `BIND_AAA_SKINNING` (sorting each vertex's
         4 bone weights descending so `j0` is always the dominant hemisphere pivot and normalizing to `1.0`),
         auto-allocates a disjoint `bone_palette_offset` slice, widens meshlet culling spheres, and builds
-        an updatable `ALLOW_UPDATE_KHR` hardware `BLAS`!"""
+        an updatable `ALLOW_UPDATE_KHR` hardware `BLAS`!
+
+        A mesh with morph targets (`mesh.morph_count > 0`) also gets its targets in the morph region,
+        weighted by `morph_weights` (one per target, missing ones 0) until
+        `update_skinned_mesh_morph_weights` changes them."""
         var v_words_before = len(self.geom.vertex_words)
         var i_words_before = len(self.geom.index_words)
         var m_words_before = len(self.geom.meshlet_words)
@@ -2227,7 +2294,99 @@ struct FlintAaaVulkanRenderer(Movable):
         res.vertex_count = v_cnt
         res.bone_count = max(1, bone_count)
         res.bone_palette_offset = pal_off
+        if mesh.morph_count > 0 and v_cnt == mesh.vertex_count():
+            var csr = build_morph_csr(v_cnt, mesh.morph_count, mesh.morph_positions, mesh.morph_normals)
+            if csr.targets > 0:
+                self._upload_skin_morphs(res, csr, morph_weights)
         return res^
+
+    def _ensure_skin_morph_words(mut self, words: Int) -> Bool:
+        """Room for `words` more words in the morph region of `buf_skinning`, growing the buffer
+        (device idle, copy, rebind) when it is short. False leaves the buffer as it was."""
+        if self.skin_morph_cursor + words <= self.skin_morph_capacity:
+            return True
+        var capacity = max(AAA_SKIN_MORPH_MIN_WORDS, max(self.skin_morph_capacity * 2, self.skin_morph_cursor + words))
+        var grown = self.vk.create_buffer((AAA_SKIN_MORPH_BASE + capacity) * 4, local=True)
+        if grown.size == 0:
+            return False
+        # Frames in flight and any queued dispatch read the old buffer and its descriptors.
+        self.vk.wait_idle()
+        for slot in range(len(self.frame_fences)):
+            self.frame_fences[slot] = 0
+        var old_bytes = min(self.buf_skinning.size, grown.size)
+        _ = external_call["memcpy", Int](grown.cpu_address, self.buf_skinning.cpu_address, old_bytes)
+        if grown.size > old_bytes:
+            _ = external_call["memset", Int](grown.cpu_address + old_bytes, Int32(0), grown.size - old_bytes)
+        var old = self.buf_skinning.copy()
+        self.buf_skinning = grown^
+        for slot in range(len(self.desc_sets)):
+            self.vk.write_descriptor(self.desc_sets[slot], BIND_AAA_SKINNING, self.buf_skinning)
+        self.vk.destroy_buffer(old)
+        self.skin_morph_capacity = capacity
+        return True
+
+    def _upload_skin_morphs(mut self, mut res: AaaSkinnedMeshEntry, csr: MorphCsr, weights: List[Float32]):
+        """Writes a mesh's weights (current and previous), row offsets and entries into the morph
+        region. On no room the entry keeps `morph_count == 0` and skins without its targets."""
+        var targets = csr.targets
+        var words = targets * 2 + len(csr.rows) + len(csr.words)
+        if not self._ensure_skin_morph_words(words):
+            return
+        var base = AAA_SKIN_MORPH_BASE + self.skin_morph_cursor
+        self.skin_morph_cursor += words
+        res.morph_count = targets
+        res.morph_weights_word = base
+        res.morph_rows_word = base + targets * 2
+        res.morph_entries_word = res.morph_rows_word + len(csr.rows)
+        var addr = self.buf_skinning.cpu_address
+        for t in range(targets):
+            var w = weights[t] if t < len(weights) else Float32(0)
+            put_float(addr + (res.morph_weights_word + t) * 4, w)
+            put_float(addr + (res.morph_weights_word + targets + t) * 4, w)
+        for r in range(len(csr.rows)):
+            put32(addr + (res.morph_rows_word + r) * 4, csr.rows[r])
+        if len(csr.words) > 0:
+            _ = external_call["memcpy", Int](addr + res.morph_entries_word * 4, Int(csr.words.unsafe_ptr()), len(csr.words) * 4)
+
+    def _queue_skin_update(mut self, skin_entry: AaaSkinnedMeshEntry):
+        """One deferred dispatch per skinned mesh per frame, however many updates asked for it."""
+        for i in range(len(self.pending_skin_updates)):
+            if self.pending_skin_updates[i].skin_bind_first_slot == skin_entry.skin_bind_first_slot and self.pending_skin_updates[i].mesh_entry.mesh_id == skin_entry.mesh_entry.mesh_id:
+                return
+        self.pending_skin_updates.append(skin_entry.copy())
+
+    def update_skinned_mesh_morph_weights(
+        mut self,
+        skin_entry: AaaSkinnedMeshEntry,
+        cur_weights: List[Float32],
+        prev_weights: List[Float32] = List[Float32](),
+        defer_to_frame: Bool = True,
+    ) -> Float64:
+        """Sets a skinned mesh's morph target weights (one per target, missing ones 0) for the GPU
+        skinning pass, and the previous frame's for motion vectors (empty: the same as current).
+        The bones stay as last sent. With `defer_to_frame` the dispatch rides the next
+        `render_frame()`; otherwise it runs now and the time in ms is returned."""
+        if not self.active or skin_entry.vertex_count <= 0 or skin_entry.morph_count <= 0:
+            return 0.0
+        var addr = self.buf_skinning.cpu_address
+        var n = skin_entry.morph_count
+        var use_prev = len(prev_weights) > 0
+        for t in range(n):
+            var w = cur_weights[t] if t < len(cur_weights) else Float32(0)
+            var pw = (prev_weights[t] if t < len(prev_weights) else Float32(0)) if use_prev else w
+            put_float(addr + (skin_entry.morph_weights_word + t) * 4, w)
+            put_float(addr + (skin_entry.morph_weights_word + n + t) * 4, pw)
+        if defer_to_frame:
+            self._queue_skin_update(skin_entry)
+            return 0.0
+        var t0 = get_time()
+        if not self.vk.begin_commands(0):
+            return 0.0
+        self._record_skin_dispatch_and_blas_refit(0, skin_entry)
+        var f = self.vk.submit(0)
+        if f != 0:
+            _ = self.vk.wait(f)
+        return (get_time() - t0) * 1000.0
 
     def _record_skin_dispatch_and_blas_refit(mut self, frame: Int, skin_entry: AaaSkinnedMeshEntry):
         var push_sk = List[UInt32](length=16, fill=0)
@@ -2236,6 +2395,12 @@ struct FlintAaaVulkanRenderer(Movable):
         push_sk[2] = UInt32(skin_entry.mesh_entry.first_vertex)
         push_sk[3] = UInt32(AAA_SKIN_CUR_BONES_BASE + skin_entry.bone_palette_offset)
         push_sk[4] = UInt32(AAA_SKIN_PREV_BONES_BASE + skin_entry.bone_palette_offset)
+        if skin_entry.morph_count > 0:
+            push_sk[AAA_SKIN_PUSH_MORPH_ROWS] = UInt32(skin_entry.morph_rows_word)
+            push_sk[AAA_SKIN_PUSH_MORPH_ENTRIES] = UInt32(skin_entry.morph_entries_word)
+            push_sk[AAA_SKIN_PUSH_MORPH_CUR_W] = UInt32(skin_entry.morph_weights_word)
+            push_sk[AAA_SKIN_PUSH_MORPH_PREV_W] = UInt32(skin_entry.morph_weights_word + skin_entry.morph_count)
+            push_sk[AAA_SKIN_PUSH_MORPH_ON] = UInt32(1)
         self.vk.dispatch_aaa(
             frame,
             self.pipe_dq_skinning,
@@ -2332,7 +2497,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vsm.invalidate_all()
 
         if defer_to_frame:
-            self.pending_skin_updates.append(skin_entry.copy())
+            self._queue_skin_update(skin_entry)
             return 0.0
 
         var t0 = get_time()
@@ -2388,12 +2553,18 @@ struct FlintAaaVulkanRenderer(Movable):
         build_lods: Bool = True,
         max_tex_dim: Int = 2048,
         upload_skinned: Bool = False,
+        upload_morph_only: Bool = False,
     ) -> AaaUploadedModel:
         """Turnkey glTF 2.0 / `.glb` `NativeModel` -> GPU AAA Asset Uploader (`V19`):
         - Deduplicates & block-compresses embedded textures (`sRGB BC7` for `baseColorTexture`,
           `BC5` tangent normals for `normalTexture`, `UNORM BC7` linear ORM for `metallicRoughnessTexture`).
         - Registers `AaaMaterial` descriptors with exact IEC sRGB -> linear `baseColorFactor` & HDR emissive.
         - Partitions every `NativeMesh` into Forsyth-optimized `64v/124t` Meshlets + `QEM` `LOD 0..3` DAG + `BLAS`!
+        - glTF morph targets: a skinned mesh (`upload_skinned`) carries its targets to the GPU skinning
+          pass, starting at `model.mesh_morph_weights`; with `upload_morph_only` too, a mesh with
+          targets but no joints rides that pass with one identity bone (an `AaaSkinnedMeshEntry` with
+          `morph_only`). Any other mesh with targets is uploaded static, at its current weights.
+          Drive weights with `update_skinned_mesh_morph_weights` (see `model.animate_morph_weights`).
         """
         var out = AaaUploadedModel()
         var n_tex = len(model.textures)
@@ -2495,16 +2666,36 @@ struct FlintAaaVulkanRenderer(Movable):
                 mat.alpha_cutoff = Float32(0.48)
             var mat_id = self.add_material(mat)
             var mv_cnt = m.vertex_count()
+            var has_morphs = m.morph_count > 0 and len(m.morph_positions) == m.morph_count * mv_cnt * 3
+            var morph_w = model.mesh_morph_weights(m_idx)
             if upload_skinned and mv_cnt > 0 and len(m.joints) >= mv_cnt * 4 and len(m.weights) >= mv_cnt * 4:
                 var b_cnt = 64
                 if m.skin >= 0 and m.skin < len(model.skins) and len(model.skins[m.skin].joints) > 0:
                     b_cnt = len(model.skins[m.skin].joints)
                 var empty_jp = List[UInt32]()
                 var empty_jw = List[Vec3]()
-                var sk_entry = self.add_skinned_mesh(m, empty_jp, empty_jw, mat_id, bone_count=b_cnt)
+                var sk_entry = self.add_skinned_mesh(m, empty_jp, empty_jw, mat_id, bone_count=b_cnt, morph_weights=morph_w)
+                sk_entry.model_mesh = m_idx
                 out.material_ids.append(mat_id)
                 out.mesh_entries.append(sk_entry.mesh_entry.copy())
                 out.skinned_entries.append(sk_entry^)
+            elif upload_skinned and upload_morph_only and has_morphs:
+                var empty_jp = List[UInt32]()
+                var empty_jw = List[Vec3]()
+                var sk_entry = self.add_skinned_mesh(m, empty_jp, empty_jw, mat_id, bone_count=1, morph_weights=morph_w)
+                sk_entry.model_mesh = m_idx
+                sk_entry.morph_only = True
+                # Its one bone is the identity (now and for the previous frame): only the morphs move it.
+                var ident = List[DualQuat](length=1, fill=DualQuat())
+                _ = self.update_skinned_mesh_bones(sk_entry, ident, ident, defer_to_frame=True)
+                out.material_ids.append(mat_id)
+                out.mesh_entries.append(sk_entry.mesh_entry.copy())
+                out.skinned_entries.append(sk_entry^)
+            elif has_morphs:
+                var baked = morphed_mesh(m, morph_w)
+                var entry = self.add_mesh(baked, mat_id, build_lods=build_lods)
+                out.material_ids.append(mat_id)
+                out.mesh_entries.append(entry^)
             else:
                 var entry = self.add_mesh(m, mat_id, build_lods=build_lods)
                 out.material_ids.append(mat_id)

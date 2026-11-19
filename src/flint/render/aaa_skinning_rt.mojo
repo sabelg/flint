@@ -9,6 +9,11 @@ Implements:
      `48`-byte bind-pose `(pos, normal, tangent)` directly into `BIND_AAA_VERTICES` (`BDA` buffer
      shared by `VisBuffer` AND `VK_KHR_acceleration_structure` `BLAS`!) while simultaneously writing
      previous-frame deformed positions for exact 3D `FlintTSR v2` skeletal motion vectors.
+  3. glTF morph targets (blend shapes) applied in the same kernel before the bone blend: a
+     compressed sparse row of (target, position delta, normal delta) per vertex in a morph
+     region past `AAA_SKIN_BUFFER_WORDS`, weighted by the current and previous weights of the
+     mesh. A mesh without targets dispatches with `push[9] == 0` and skips the loop; a renderer
+     that never uploads one never allocates the region.
 """
 from std.math import abs, max, min, sqrt
 from std.memory import bitcast
@@ -37,6 +42,98 @@ comptime AAA_SKIN_BIND_STRIDE_WORDS: Int = 16
 comptime AAA_SKIN_MAX_VERTS: Int = 98304
 comptime AAA_SKIN_PREV_POS_BASE: Int = AAA_SKIN_BIND_VERTS_BASE + AAA_SKIN_MAX_VERTS * AAA_SKIN_BIND_STRIDE_WORDS  # 1,605,632
 comptime AAA_SKIN_BUFFER_WORDS: Int = AAA_SKIN_PREV_POS_BASE + AAA_SKIN_MAX_VERTS * 3                              # 1,900,544 (~7.25 MiB)
+
+# Morph region: `BIND_AAA_SKINNING` grows past `AAA_SKIN_BUFFER_WORDS` when the first mesh with
+# morph targets is uploaded. Per morph mesh: `2 * targets` weights (current, then previous),
+# `vertices + 1` row offsets (relative to the mesh's first entry) and one entry per moving
+# (vertex, target): target index, position delta xyz, normal delta xyz.
+comptime AAA_SKIN_MORPH_BASE: Int = AAA_SKIN_BUFFER_WORDS
+comptime AAA_SKIN_MORPH_ENTRY_WORDS: Int = 7
+comptime AAA_SKIN_MORPH_MIN_WORDS: Int = 1 << 20        # 4 MiB, the region's first size
+comptime AAA_SKIN_MAX_MORPH_TARGETS: Int = 256           # per mesh
+# Push words of `aaa_dq_skinning_shader` for morphs (all absolute word offsets in BIND_AAA_SKINNING).
+comptime AAA_SKIN_PUSH_MORPH_ROWS: Int = 5
+comptime AAA_SKIN_PUSH_MORPH_ENTRIES: Int = 6
+comptime AAA_SKIN_PUSH_MORPH_CUR_W: Int = 7
+comptime AAA_SKIN_PUSH_MORPH_PREV_W: Int = 8
+comptime AAA_SKIN_PUSH_MORPH_ON: Int = 9
+
+
+struct MorphCsr(Movable):
+    """A mesh's morph targets as the GPU reads them: `rows[v] .. rows[v + 1]` index `words`
+    in entries of `AAA_SKIN_MORPH_ENTRY_WORDS` (target, dpos xyz, dnrm xyz as float bits)."""
+    var rows: List[UInt32]
+    var words: List[UInt32]
+    var targets: Int
+
+    def __init__(out self):
+        self.rows = List[UInt32]()
+        self.words = List[UInt32]()
+        self.targets = 0
+
+    def entries(self) -> Int:
+        return len(self.words) // AAA_SKIN_MORPH_ENTRY_WORDS
+
+
+def build_morph_csr(
+    vertex_count: Int,
+    morph_count: Int,
+    morph_positions: List[Float32],
+    morph_normals: List[Float32],
+) -> MorphCsr:
+    """Packs dense glTF target deltas (`morph_count` blocks of `vertex_count * 3`) into rows of
+    the (vertex, target) pairs that move. Empty (`targets == 0`) when the deltas do not match."""
+    var csr = MorphCsr()
+    if morph_count <= 0 or vertex_count <= 0 or len(morph_positions) != morph_count * vertex_count * 3:
+        return csr^
+    var targets = min(morph_count, AAA_SKIN_MAX_MORPH_TARGETS)
+    var has_normals = len(morph_normals) == len(morph_positions)
+    csr.targets = targets
+    csr.rows = List[UInt32](capacity=vertex_count + 1)
+    csr.rows.append(0)
+    for v in range(vertex_count):
+        for t in range(targets):
+            var at = (t * vertex_count + v) * 3
+            var px = morph_positions[at]
+            var py = morph_positions[at + 1]
+            var pz = morph_positions[at + 2]
+            var nx = morph_normals[at] if has_normals else Float32(0)
+            var ny = morph_normals[at + 1] if has_normals else Float32(0)
+            var nz = morph_normals[at + 2] if has_normals else Float32(0)
+            if px == 0 and py == 0 and pz == 0 and nx == 0 and ny == 0 and nz == 0:
+                continue
+            csr.words.append(UInt32(t))
+            csr.words.append(bitcast[DType.uint32](px))
+            csr.words.append(bitcast[DType.uint32](py))
+            csr.words.append(bitcast[DType.uint32](pz))
+            csr.words.append(bitcast[DType.uint32](nx))
+            csr.words.append(bitcast[DType.uint32](ny))
+            csr.words.append(bitcast[DType.uint32](nz))
+        csr.rows.append(UInt32(len(csr.words) // AAA_SKIN_MORPH_ENTRY_WORDS))
+    return csr^
+
+
+def morph_vertex_cpu(csr: MorphCsr, vertex: Int, weights: List[Float32], bind_pos: Vec3, bind_nrm: Vec3) -> Tuple[Vec3, Vec3]:
+    """CPU reference of the kernel's morph loop: bind + sum(weight[t] * delta[t])."""
+    var p = bind_pos
+    var n = bind_nrm
+    if csr.targets == 0 or vertex < 0 or vertex + 1 >= len(csr.rows):
+        return (p, n)
+    for e in range(Int(csr.rows[vertex]), Int(csr.rows[vertex + 1])):
+        var at = e * AAA_SKIN_MORPH_ENTRY_WORDS
+        var t = Int(csr.words[at])
+        var w = weights[t] if t < len(weights) else Float32(0)
+        p = p + Vec3(
+            bitcast[DType.float32](csr.words[at + 1]),
+            bitcast[DType.float32](csr.words[at + 2]),
+            bitcast[DType.float32](csr.words[at + 3]),
+        ) * w
+        n = n + Vec3(
+            bitcast[DType.float32](csr.words[at + 4]),
+            bitcast[DType.float32](csr.words[at + 5]),
+            bitcast[DType.float32](csr.words[at + 6]),
+        ) * w
+    return (p, n)
 
 
 struct FlintAaaSkinningArena(Copyable, ImplicitlyCopyable, Movable):
@@ -418,7 +515,9 @@ def _emit_dq_blend_and_transform_dsl(
 
 def aaa_dq_skinning_shader(bind_vertices: Int, bind_skinning: Int) -> List[UInt32]:
     """GPU Compute 4-Bone Dual-Quaternion Skinning Shader (`group = 64 x 1`):
-    Push[0] = skinned_vertex_count, Push[1] = skin_bind_first_slot, Push[2] = dst_first_vertex_in_buf_vertices.
+    Push[0] = skinned_vertex_count, Push[1] = skin_bind_first_slot, Push[2] = dst_first_vertex_in_buf_vertices,
+    Push[3] / Push[4] = current / previous bone palette, Push[5..9] = morph rows, entries, current
+    weights, previous weights, morphs on (see `AAA_SKIN_PUSH_MORPH_*`).
     Deforms `(pos, nrm, tan)` in-place inside `buf_vertices` (ready for `VisBuffer` AND `BLAS` `UPDATE_KHR` refit!)
     and writes previous-frame deformed vertex positions into `BIND_AAA_SKINNING` for exact 3D `FlintTSR v2` motion vectors!
     """
@@ -455,15 +554,46 @@ def aaa_dq_skinning_shader(bind_vertices: Int, bind_skinning: Int) -> List[UInt3
     var w2 = b_skin.load_f32(src_base + UInt32(15))
     var w3 = max_f(dsl.f32(1.0) - (w0 + w1 + w2), 0.0)
 
+    # Morph targets move the bind position and normal first (current and previous weights, so
+    # motion vectors see the shape change too). Uniform branch: meshes without targets skip it.
+    var morph_on = dsl.push_u32(AAA_SKIN_PUSH_MORPH_ON)
+    var cur_pos = dsl.var_vec3(bind_pos)
+    var cur_nrm = dsl.var_vec3(bind_nrm)
+    var prev_pos = dsl.var_vec3(bind_pos)
+    var prev_nrm = dsl.var_vec3(bind_nrm)
+    dsl.if_then(morph_on.ne(UInt32(0)))
+    var rows = dsl.push_u32(AAA_SKIN_PUSH_MORPH_ROWS)
+    var entries = dsl.push_u32(AAA_SKIN_PUSH_MORPH_ENTRIES)
+    var cur_w = dsl.push_u32(AAA_SKIN_PUSH_MORPH_CUR_W)
+    var prev_w = dsl.push_u32(AAA_SKIN_PUSH_MORPH_PREV_W)
+    var row_end = b_skin.load_u32(rows + local_v + UInt32(1))
+    var cursor = dsl.var_u32(b_skin.load_u32(rows + local_v))
+    dsl.begin_loop()
+    var e = cursor.get()
+    dsl.break_if(e.ge(row_end))
+    var at = entries + e * UInt32(AAA_SKIN_MORPH_ENTRY_WORDS)
+    var target = b_skin.load_u32(at)
+    var d_pos = b_skin.load_vec3(at + UInt32(1))
+    var d_nrm = b_skin.load_vec3(at + UInt32(4))
+    var wc = b_skin.load_f32(cur_w + target)
+    var wp = b_skin.load_f32(prev_w + target)
+    cur_pos.set(cur_pos.get() + d_pos * wc)
+    cur_nrm.set(cur_nrm.get() + d_nrm * wc)
+    prev_pos.set(prev_pos.get() + d_pos * wp)
+    prev_nrm.set(prev_nrm.get() + d_nrm * wp)
+    cursor.set(e + UInt32(1))
+    dsl.end_loop()
+    dsl.end_if()
+
     var cur_def = _emit_dq_blend_and_transform_dsl(
         dsl, b_skin.buf_id, cur_bones_base,
         j0, j1, j2, j3, w0, w1, w2, w3,
-        bind_pos, bind_nrm, bind_tan,
+        cur_pos.get(), cur_nrm.get(), bind_tan,
     )
     var prev_def = _emit_dq_blend_and_transform_dsl(
         dsl, b_skin.buf_id, eff_prev_bones,
         j0, j1, j2, j3, w0, w1, w2, w3,
-        bind_pos, bind_nrm, bind_tan,
+        prev_pos.get(), prev_nrm.get(), bind_tan,
     )
 
     var dst_v = dst_first + local_v

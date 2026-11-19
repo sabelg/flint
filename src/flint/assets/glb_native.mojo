@@ -7,7 +7,7 @@ from flint.core.transform import Quat
 from flint.assets.json import JsonDocument, parse_json
 from flint.assets.jpeg import decode_image_auto
 from flint.anim.skinning import compute_cor
-from flint.assets.model import NativeModel, NativeNode, NativeMesh, NativeTexture, NativeSkin, NativeAnimation, NativeChannel
+from flint.assets.model import NativeModel, NativeNode, NativeMesh, NativeTexture, NativeSkin, NativeAnimation, NativeChannel, CHANNEL_WEIGHTS
 
 
 def little_u32(data: List[UInt8], offset: Int) -> Int:
@@ -193,12 +193,29 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
     var materials = document.object_get(document.root, "materials")
     var meshes = document.object_get(document.root, "meshes")
     var primitive_counts = List[Int]()
+    var mesh_morph_first = List[Int]()   # per glTF mesh: its first target in morph_names
     for mesh_index in range(document.array_size(meshes)):
-        var primitives = document.object_get(document.at(meshes, mesh_index), "primitives")
+        var mesh_node = document.at(meshes, mesh_index)
+        var primitives = document.object_get(mesh_node, "primitives")
         primitive_counts.append(document.array_size(primitives))
-        var target_names = document.object_get(document.object_get(document.at(meshes, mesh_index), "extras"), "targetNames")
-        for index in range(document.array_size(target_names)):
-            model.morph_names.append(document.text(document.at(target_names, index)))
+        # Morph targets: every primitive of a glTF mesh has the same targets,
+        # weighted together. Each target gets one slot in morph_names (its
+        # extras.targetNames name, else "<mesh>.morph<t>") and morph_weights.
+        var target_names = document.object_get(document.object_get(mesh_node, "extras"), "targetNames")
+        var target_count = document.array_size(target_names)
+        if document.array_size(primitives) > 0:
+            target_count = max(target_count, document.array_size(document.object_get(document.at(primitives, 0), "targets")))
+        var morph_first = len(model.morph_names)
+        mesh_morph_first.append(morph_first)
+        var mesh_name = document.text(document.object_get(mesh_node, "name"), "mesh" + String(mesh_index))
+        for index in range(target_count):
+            if index < document.array_size(target_names):
+                model.morph_names.append(document.text(document.at(target_names, index)))
+            else:
+                model.morph_names.append(mesh_name + ".morph" + String(index))
+        var default_weights = document.object_get(mesh_node, "weights")
+        for index in range(target_count):
+            model.morph_default_weights.append(Float32(document.number(document.at(default_weights, index), 0)) if index < document.array_size(default_weights) else Float32(0))
         for primitive_index in range(document.array_size(primitives)):
             var primitive = document.at(primitives, primitive_index)
             if document.integer(document.object_get(primitive, "mode"), 4) != 4:
@@ -259,6 +276,7 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                     mesh.morph_positions.append(delta.float_value(binary, index // 3, index % 3))
                     mesh.morph_normals.append(normal.float_value(binary, index // 3, index % 3) if normal.valid else 0)
                 mesh.morph_count += 1
+            mesh.morph_first = morph_first
             var indices_node = document.object_get(primitive, "indices")
             var indices = load_accessor(document, document.integer(indices_node, -1), len(binary))
             if indices.valid:
@@ -370,6 +388,13 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 node.mesh = first
                 for primitive in range(primitive_counts[mesh_index]):
                     node.mesh_indices.append(first + primitive)
+            # node.weights overrides its mesh's default morph weights.
+            var node_weights = document.object_get(source, "weights")
+            if document.array_size(node_weights) > 0 and mesh_index < len(mesh_morph_first):
+                var first_target = mesh_morph_first[mesh_index]
+                for index in range(document.array_size(node_weights)):
+                    if first_target + index < len(model.morph_default_weights) and (mesh_index + 1 >= len(mesh_morph_first) or first_target + index < mesh_morph_first[mesh_index + 1]):
+                        model.morph_default_weights[first_target + index] = Float32(document.number(document.at(node_weights, index), 0))
             var skin = document.integer(document.object_get(source, "skin"), -1)
             if skin >= 0 and node.mesh >= 0:
                 for primitive in range(primitive_counts[mesh_index]):
@@ -412,8 +437,15 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             var channel = NativeChannel()
             channel.node = document.integer(document.object_get(target, "node"), -1)
             var path_name = document.text(document.object_get(target, "path"))
-            channel.path = 0 if path_name == "translation" else (1 if path_name == "rotation" else 2)
-            if path_name != "translation" and path_name != "rotation" and path_name != "scale":
+            if path_name == "translation":
+                channel.path = 0
+            elif path_name == "rotation":
+                channel.path = 1
+            elif path_name == "scale":
+                channel.path = 2
+            elif path_name == "weights":
+                channel.path = CHANNEL_WEIGHTS
+            else:
                 continue
             var interp_name = document.text(document.object_get(sampler, "interpolation"), "LINEAR")
             channel.step = interp_name == "STEP"
@@ -432,6 +464,10 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 animation.duration = max(animation.duration, input.float_value(binary, index))
             for index in range(output.count * output.components):
                 channel.values.append(output.float_value(binary, index // output.components, index % output.components))
-            animation.channels.append(channel^)
+            if channel.path == CHANNEL_WEIGHTS:
+                animation.weight_channels.append(channel^)
+            else:
+                animation.channels.append(channel^)
         model.animations.append(animation^)
+    model.morph_weights = model.morph_default_weights.copy()
     return model^

@@ -724,7 +724,7 @@ def skin_mesh(mut model: NativeModel, mesh_index: Int, method: Int) -> List[Floa
     var rigid = fill_palette(draw.palette, model.skins[skin_index], transforms)
     var has_centers = len(model.meshes[mesh_index].centers) == count * 3
     draw.method = effective_method(method, rigid, has_centers)
-    var weights = model.morph_weights.copy()
+    var weights = model.mesh_morph_weights(mesh_index)
     var morphs = model.meshes[mesh_index].morph_count
     if morphs > 0 and len(weights) >= morphs and len(model.meshes[mesh_index].morph_normals) == morphs * count * 3:
         draw.morph_count = morphs
