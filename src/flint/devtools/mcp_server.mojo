@@ -20,6 +20,7 @@ from flint.core.transform import Quat, Mat4, trs
 from flint.platform.os import read_bytes, close_fd, last_errno
 from flint.render.aaa_clustered_lights import AAA_LIGHT_SPOT, AAA_MAX_CLUSTERED_LIGHTS, AaaClusterLight
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
+from flint.render.camera_basis import view_right
 from flint.render.flip import flip_error_map, flip_mean
 
 comptime AF_UNIX: Int32 = 1
@@ -814,8 +815,7 @@ def apply_mcp_scene_mutations(mut ren: FlintAaaVulkanRenderer) -> Int:
             if (m.mask & SMASK_V1) != 0:
                 var fwd = (m.v1 - ren.cam_pos).normalized()
                 if fwd.length() > Float32(1e-5):
-                    var up_ref = Vec3(0.0, 0.0, 1.0) if abs(fwd.y) > Float32(0.95) else Vec3(0.0, 1.0, 0.0)
-                    var right = up_ref.cross(fwd).normalized()
+                    var right = view_right(fwd)
                     var up = fwd.cross(right).normalized()
                     ren.cam_fwd = fwd
                     ren.cam_right = right

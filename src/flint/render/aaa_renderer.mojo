@@ -18,6 +18,7 @@ from std.math import cos, exp2, log2, max, min, sin, sqrt, tan
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.core.transform import Mat4
+from flint.render.camera_basis import view_right
 from flint.platform.os import get_time
 from flint.assets.model import NativeMesh, NativeModel
 from flint.assets.bc_compress import (
@@ -3134,8 +3135,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         self.cam_pos = cam_pos
         var fwd = (cam_target - cam_pos).normalized()
-        var up_ref = Vec3(0.0, 0.0, 1.0) if abs(fwd.y) > Float32(0.95) else Vec3(0.0, 1.0, 0.0)
-        var r0 = up_ref.cross(fwd).normalized()
+        var r0 = view_right(fwd)
         var u0 = fwd.cross(r0).normalized()
         var right = r0
         var up = u0
