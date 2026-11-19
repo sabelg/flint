@@ -36,6 +36,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_VIS_TEX,
     BIND_AAA_VSM_TABLE,
     emit_mat4_mul_point,
+    emit_instance_point,
 )
 
 comptime VSM_VIRTUAL_PAGES_DIM: Int = 128         # 128 x 128 = 16,384 virtual pages
@@ -594,7 +595,7 @@ def vsm_page_vertex_shader() -> List[UInt32]:
     var lpz = s.load_float(b_verts, s.iadd(v_base, s.uint(2)))
 
     var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
-    var wp = emit_mat4_mul_point(s, b_instances, inst_base, lpx, lpy, lpz)
+    var wp = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v_base, lpx, lpy, lpz)
     var raw_mat_off = s.push_word(4)
     var mat_off = s.select_u(s.ieq(raw_mat_off, s.uint(0)), s.uint(56), raw_mat_off)
     var lclip = emit_mat4_mul_point(s, b_globals, mat_off, wp[0], wp[1], wp[2])
@@ -652,7 +653,7 @@ def vsm_alphamask_vertex_shader() -> List[UInt32]:
     var uv_u = s.load_float(b_verts, s.iadd(v_base, s.uint(9)))
     var uv_v = s.load_float(b_verts, s.iadd(v_base, s.uint(10)))
 
-    var wp = emit_mat4_mul_point(s, b_instances, inst_base, lpx, lpy, lpz)
+    var wp = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v_base, lpx, lpy, lpz)
     var raw_mat_off = s.push_word(4)
     var mat_off = s.select_u(s.ieq(raw_mat_off, s.uint(0)), s.uint(56), raw_mat_off)
     var lclip = emit_mat4_mul_point(s, b_globals, mat_off, wp[0], wp[1], wp[2])

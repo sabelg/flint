@@ -1364,6 +1364,24 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
 # 4. Unified `AaaGeometryPool` with Continuous `LOD 0..3` Meshlet Hierarchy
 # ============================================================================
 
+@fieldwise_init
+struct GeomSlot(Copyable, ImplicitlyCopyable, Movable):
+    """Where one mesh's geometry lives in the pool (and how much room it has there): vertices,
+    index words and meshlets. Freed slots become holes that later meshes reuse."""
+    var first_vertex: Int
+    var vertex_cap: Int
+    var first_index: Int
+    var index_cap: Int
+    var first_meshlet: Int
+    var meshlet_cap: Int
+
+    def fits(self, vertices: Int, index_words: Int, meshlets: Int) -> Bool:
+        return vertices <= self.vertex_cap and index_words <= self.index_cap and meshlets <= self.meshlet_cap
+
+    def empty(self) -> Bool:
+        return self.vertex_cap == 0 and self.index_cap == 0 and self.meshlet_cap == 0
+
+
 struct AaaGeometryPool(Movable):
     """Unified CPU-side staging pool for GPU Vertex, Triangle Index & Meshlet SSBOs + BLAS inputs."""
     var vertex_words: List[UInt32]
@@ -1371,6 +1389,8 @@ struct AaaGeometryPool(Movable):
     var meshlet_words: List[UInt32]
     var meshlets: List[MeshletCluster]
     var meshes: List[CookedMeshEntry]
+    var slots: List[GeomSlot]       # per mesh: its room in the pool
+    var holes: List[GeomSlot]       # room freed by free_mesh / a replace that moved
 
     def __init__(out self):
         self.vertex_words = List[UInt32]()
@@ -1378,6 +1398,8 @@ struct AaaGeometryPool(Movable):
         self.meshlet_words = List[UInt32]()
         self.meshlets = List[MeshletCluster]()
         self.meshes = List[CookedMeshEntry]()
+        self.slots = List[GeomSlot]()
+        self.holes = List[GeomSlot]()
 
     def total_vertices(self) -> Int:
         return len(self.vertex_words) // AAA_VERTEX_WORDS
@@ -1615,6 +1637,9 @@ struct AaaGeometryPool(Movable):
             return entry^
 
         var mesh_id = len(self.meshes)
+        var slot_v = self.total_vertices()
+        var slot_i = len(self.index_words)
+        var slot_m = len(self.meshlets)
 
         if not build_lods or raw_tris < 32:
             var s0 = self._append_single_lod_geometry_ex(
@@ -1634,6 +1659,7 @@ struct AaaGeometryPool(Movable):
             entry.bounds_center = s0[6]
             entry.bounds_radius = s0[7]
             self.meshes.append(entry.copy())
+            self._record_slot(slot_v, slot_i, slot_m)
             return entry^
 
         # Build continuous QEM `LOD 0..3` chain (`100% -> 50% -> 25% -> 12.5%`) with strictly monotonic errors!
@@ -1707,7 +1733,152 @@ struct AaaGeometryPool(Movable):
         entry.meshlet_count = len(self.meshlets) - first_ml_all
         entry.lod_count = n_lods
         self.meshes.append(entry.copy())
+        self._record_slot(slot_v, slot_i, slot_m)
         return entry^
+
+    # -- freeing and replacing meshes ------------------------------------------------------------
+    def _record_slot(mut self, first_v: Int, first_i: Int, first_m: Int):
+        while len(self.slots) < len(self.meshes) - 1:
+            self.slots.append(GeomSlot(0, 0, 0, 0, 0, 0))
+        self.slots.append(
+            GeomSlot(
+                first_v, self.total_vertices() - first_v,
+                first_i, len(self.index_words) - first_i,
+                first_m, len(self.meshlets) - first_m,
+            )
+        )
+
+    def mesh_slot(self, mesh_id: Int) -> GeomSlot:
+        if mesh_id < 0 or mesh_id >= len(self.slots):
+            return GeomSlot(0, 0, 0, 0, 0, 0)
+        return self.slots[mesh_id]
+
+    def reserve_mesh_id(mut self) -> Int:
+        """A new mesh id that draws nothing yet: fill it with `replace_mesh` (which reuses holes)."""
+        var e = CookedMeshEntry()
+        e.mesh_id = len(self.meshes)
+        self.meshes.append(e^)
+        while len(self.slots) < len(self.meshes):
+            self.slots.append(GeomSlot(0, 0, 0, 0, 0, 0))
+        return len(self.meshes) - 1
+
+    def free_mesh(mut self, mesh_id: Int) -> GeomSlot:
+        """Give a mesh's room back to the pool; the mesh then draws nothing. Returns the freed room."""
+        if mesh_id < 0 or mesh_id >= len(self.meshes):
+            return GeomSlot(0, 0, 0, 0, 0, 0)
+        var sl = self.mesh_slot(mesh_id)
+        if sl.empty():
+            return sl
+        for k in range(sl.meshlet_cap):                    # stale meshlets cover no triangles
+            self.meshlet_words[(sl.first_meshlet + k) * AAA_MESHLET_WORDS + 9] = 0
+            self.meshlets[sl.first_meshlet + k].tri_count = 0
+        self._add_hole(sl)
+        self.slots[mesh_id] = GeomSlot(0, 0, 0, 0, 0, 0)
+        ref e = self.meshes[mesh_id]
+        e.vertex_count = 0
+        e.triangle_count = 0
+        e.meshlet_count = 0
+        e.lod0_meshlet_count = 0
+        e.lod_count = 1
+        e.lods[0] = MeshLodSlice(e.first_meshlet, 0, 0, Float32(0.0))
+        return sl
+
+    def _add_hole(mut self, sl: GeomSlot):
+        # Merge with a hole that ends where this one starts in all three arenas (common when
+        # meshes were added in a row and are freed in a row).
+        for i in range(len(self.holes)):
+            var h = self.holes[i]
+            if (h.first_vertex + h.vertex_cap == sl.first_vertex and h.first_index + h.index_cap == sl.first_index
+                    and h.first_meshlet + h.meshlet_cap == sl.first_meshlet):
+                self.holes[i] = GeomSlot(h.first_vertex, h.vertex_cap + sl.vertex_cap, h.first_index,
+                                         h.index_cap + sl.index_cap, h.first_meshlet, h.meshlet_cap + sl.meshlet_cap)
+                return
+            if (sl.first_vertex + sl.vertex_cap == h.first_vertex and sl.first_index + sl.index_cap == h.first_index
+                    and sl.first_meshlet + sl.meshlet_cap == h.first_meshlet):
+                self.holes[i] = GeomSlot(sl.first_vertex, h.vertex_cap + sl.vertex_cap, sl.first_index,
+                                         h.index_cap + sl.index_cap, sl.first_meshlet, h.meshlet_cap + sl.meshlet_cap)
+                return
+        self.holes.append(sl)
+
+    def _alloc(mut self, nv: Int, ni: Int, nm: Int) -> GeomSlot:
+        """Room for nv vertices, ni index words and nm meshlets: the first hole that fits (its
+        remainder stays a hole), else new room at the end of the pool."""
+        for i in range(len(self.holes)):
+            var h = self.holes[i]
+            if h.fits(nv, ni, nm):
+                var rest = GeomSlot(h.first_vertex + nv, h.vertex_cap - nv, h.first_index + ni,
+                                    h.index_cap - ni, h.first_meshlet + nm, h.meshlet_cap - nm)
+                if rest.vertex_cap > 0 and rest.index_cap > 0 and rest.meshlet_cap > 0:
+                    self.holes[i] = rest
+                else:
+                    _ = self.holes.pop(i)
+                return GeomSlot(h.first_vertex, nv, h.first_index, ni, h.first_meshlet, nm)
+        var at = GeomSlot(self.total_vertices(), nv, len(self.index_words), ni, len(self.meshlets), nm)
+        for _ in range(nv * AAA_VERTEX_WORDS):
+            self.vertex_words.append(0)
+        for _ in range(ni):
+            self.index_words.append(0)
+        for _ in range(nm):
+            self.meshlets.append(MeshletCluster())
+            for _ in range(AAA_MESHLET_WORDS):
+                self.meshlet_words.append(0)
+        return at
+
+    def replace_mesh(
+        mut self, mesh_id: Int, mesh: NativeMesh, material_id: Int, build_lods: Bool = False
+    ) -> Tuple[CookedMeshEntry, GeomSlot]:
+        """Swap a mesh's geometry for `mesh`, keeping its id: in its own room when the new mesh fits
+        there, else in a hole or at the end (its old room then becomes a hole). Returns the new
+        entry and the room written (empty room = nothing to draw)."""
+        var tmp = AaaGeometryPool()
+        var empty_splat = List[UInt32]()
+        var cooked = tmp._append_mesh_internal(mesh, material_id, build_lods, False, empty_splat)
+        var nv = tmp.total_vertices()
+        var ni = len(tmp.index_words)
+        var nm = len(tmp.meshlets)
+        if nv == 0 or nm == 0:
+            _ = self.free_mesh(mesh_id)
+            return (self.meshes[mesh_id].copy(), GeomSlot(0, 0, 0, 0, 0, 0))
+        var cur = self.mesh_slot(mesh_id)
+        var dest: GeomSlot
+        if cur.fits(nv, ni, nm):
+            dest = cur
+            for k in range(nm, cur.meshlet_cap):              # meshlets past the new ones draw nothing
+                self.meshlet_words[(cur.first_meshlet + k) * AAA_MESHLET_WORDS + 9] = 0
+                self.meshlets[cur.first_meshlet + k].tri_count = 0
+        else:
+            if not cur.empty():
+                _ = self.free_mesh(mesh_id)
+            dest = self._alloc(nv, ni, nm)
+        var bv = dest.first_vertex
+        var bi = dest.first_index
+        var bm = dest.first_meshlet
+        var bt = bi // 3
+        var vb = bv * AAA_VERTEX_WORDS
+        for k in range(len(tmp.vertex_words)):
+            self.vertex_words[vb + k] = tmp.vertex_words[k]
+        for k in range(ni):
+            self.index_words[bi + k] = tmp.index_words[k] + UInt32(bv)
+        for k in range(nm):
+            var ml = tmp.meshlets[k].copy()
+            ml.first_tri += bt
+            ml.mesh_id = mesh_id
+            self.meshlets[bm + k] = ml^
+            var mw = (bm + k) * AAA_MESHLET_WORDS
+            for w in range(AAA_MESHLET_WORDS):
+                self.meshlet_words[mw + w] = tmp.meshlet_words[k * AAA_MESHLET_WORDS + w]
+            self.meshlet_words[mw + 8] = tmp.meshlet_words[k * AAA_MESHLET_WORDS + 8] + UInt32(bt)
+        var e = cooked.copy()
+        e.mesh_id = mesh_id
+        e.first_vertex += bv
+        e.first_index += bi
+        e.first_meshlet += bm
+        for l in range(e.lod_count):
+            var sl = e.lods[l]
+            e.lods[l] = MeshLodSlice(sl.first_meshlet + bm, sl.meshlet_count, sl.triangle_count, sl.object_error)
+        self.meshes[mesh_id] = e.copy()
+        self.slots[mesh_id] = dest
+        return (e^, dest)
 
     def _emit_meshlet(
         mut self,

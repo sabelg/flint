@@ -28,7 +28,7 @@ from flint.assets.bc_compress import (
     encode_bc6h_hdr,
     encode_bc7_rgba,
 )
-from flint.assets.meshlet import AAA_VERTEX_BYTES, AAA_MESHLET_WORDS, AaaGeometryPool, CookedMeshEntry
+from flint.assets.meshlet import AAA_VERTEX_BYTES, AAA_MESHLET_WORDS, AAA_VERTEX_WORDS, AaaGeometryPool, CookedMeshEntry, GeomSlot
 from flint.platform.amdgpu import GpuBuffer
 from flint.platform.vulkan import (
     ACCESS_AS_READ_KHR,
@@ -265,6 +265,7 @@ from flint.render.aaa_gpu_particles import (
     gpu_particles_total_oit_words,
 )
 from flint.render.aaa_water import AAA_GLOBALS_WATER_SHAPE_WORD, aaa_water_refract_shader
+from flint.render.aaa_visbuffer import AAA_GLOBALS_WIND_WORD, AAA_INSTANCE_WIND_SHIFT
 from flint.render.aaa_glass import (
     AAA_GLASS_ENTRY_WORDS,
     AAA_GLOBALS_GLASS_COUNT_WORD,
@@ -385,6 +386,7 @@ struct AaaDrawInstance(Copyable, Movable):
     var prev_world_mat: Mat4
     var material_override: Int
     var uniform_scale: Float32
+    var wind: Float32             # 0..1: how much the global wind sways this draw (see set_wind)
 
     def __init__(
         out self,
@@ -394,12 +396,14 @@ struct AaaDrawInstance(Copyable, Movable):
         material_override: Int = -1,
         uniform_scale: Float32 = 1.0,
         has_prev: Bool = False,
+        wind: Float32 = 0.0,
     ):
         self.mesh_id = mesh_id
         self.world_mat = world_mat.copy()
         self.prev_world_mat = prev_world_mat.copy() if has_prev else world_mat.copy()
         self.material_override = material_override
         self.uniform_scale = max(Float32(0.001), uniform_scale)
+        self.wind = min(Float32(1.0), max(Float32(0.0), wind))
 
 
 def _mat4_mul_col_major(a: List[Float32], b: List[Float32]) -> List[Float32]:
@@ -691,6 +695,12 @@ struct FlintAaaVulkanRenderer(Movable):
     var tsr_history_weight: Float32
     var tsr_sharpness: Float32
     var max_lod_error_px: Float32
+    var wind_dir_x: Float32       # the global wind (set_wind): unit direction in xz,
+    var wind_dir_z: Float32
+    var wind_sway: Float32        # how far a fully swaying tip moves (m),
+    var wind_hz: Float32          # how fast (Hz),
+    var wind_gust: Float32        # and how gusty (0..1)
+    var wind_t0: Float64
     var camera_lens: AaaPhysicalCamera
     var enable_auto_exposure: Bool
     var auto_exposure_speed: Float32
@@ -963,6 +973,12 @@ struct FlintAaaVulkanRenderer(Movable):
         self.tsr_history_weight = Float32(0.82)
         self.tsr_sharpness = Float32(0.22)
         self.max_lod_error_px = Float32(1.0)
+        self.wind_dir_x = Float32(1.0)
+        self.wind_dir_z = Float32(0.0)
+        self.wind_sway = Float32(0.0)
+        self.wind_hz = Float32(0.6)
+        self.wind_gust = Float32(0.3)
+        self.wind_t0 = get_time()
         self.camera_lens = AaaPhysicalCamera()
         self.enable_auto_exposure = False
         self.auto_exposure_speed = Float32(0.45)
@@ -2005,7 +2021,10 @@ struct FlintAaaVulkanRenderer(Movable):
         return (alb_slot, orm_slot)
 
     def add_mesh(mut self, mesh: NativeMesh, material_id: Int, build_lods: Bool = False) -> CookedMeshEntry:
-        """Partitions `mesh` into 64v/124t GPU Meshlets (and optional `QEM` `LOD 0..3` DAG), uploads SSBOs, and builds `BLAS`!"""
+        """Partitions `mesh` into 64v/124t GPU Meshlets (and optional `QEM` `LOD 0..3` DAG), uploads SSBOs, and builds `BLAS`!
+        Reuses room freed by `free_mesh` when there is any. `entry.mesh_id < 0`: the geometry buffers are full."""
+        if len(self.geom.holes) > 0:
+            return self.new_mesh(mesh, material_id, build_lods)
         var v_words_before = len(self.geom.vertex_words)
         var i_words_before = len(self.geom.index_words)
         var m_words_before = len(self.geom.meshlet_words)
@@ -2080,7 +2099,117 @@ struct FlintAaaVulkanRenderer(Movable):
         self.mesh_double_sided_flags.append(mesh.double_sided or is_am_mesh)
         self.mesh_alpha_masked_flags.append(is_am_mesh)
         self.vsm.invalidate_all()
+        if (len(self.geom.vertex_words) * 4 > self.buf_vertices.size or len(self.geom.index_words) * 4 > self.buf_indices.size
+                or len(self.geom.meshlet_words) * 4 > self.buf_meshlets.size):
+            entry.mesh_id = -1            # did not fit on the GPU: never draw it
         return entry^
+
+    def set_wind(mut self, dir_x: Float32, dir_z: Float32, sway_m: Float32, hz: Float32 = 0.6, gust: Float32 = 0.3):
+        """The global wind for draws with wind > 0: direction (xz), how far tips sway (m), how fast
+        (Hz), how gusty (0..1). Vertices sway by their uv.y (0 at the root .. 1 at the tip)."""
+        var L = sqrt(dir_x * dir_x + dir_z * dir_z)
+        self.wind_dir_x = dir_x / L if L > Float32(1e-6) else Float32(1.0)
+        self.wind_dir_z = dir_z / L if L > Float32(1e-6) else Float32(0.0)
+        self.wind_sway = max(Float32(0.0), sway_m)
+        self.wind_hz = max(Float32(0.0), hz)
+        self.wind_gust = min(Float32(1.0), max(Float32(0.0), gust))
+
+    # -- freeing, replacing and streaming meshes ---------------------------------------------------------
+    def _upload_slot(mut self, sl: GeomSlot) -> Bool:
+        """Copy one mesh's room (vertices, index words, meshlets) from the CPU pool to the GPU buffers."""
+        var vb = sl.first_vertex * AAA_VERTEX_WORDS * 4
+        var vn = sl.vertex_cap * AAA_VERTEX_WORDS * 4
+        var ib = sl.first_index * 4
+        var in_ = sl.index_cap * 4
+        var mb = sl.first_meshlet * AAA_MESHLET_WORDS * 4
+        var mn = sl.meshlet_cap * AAA_MESHLET_WORDS * 4
+        if vb + vn > self.buf_vertices.size or ib + in_ > self.buf_indices.size or mb + mn > self.buf_meshlets.size:
+            return False
+        if vn > 0:
+            _ = external_call["memcpy", Int](self.buf_vertices.cpu_address + vb, Int(self.geom.vertex_words.unsafe_ptr()) + vb, vn)
+        if in_ > 0:
+            _ = external_call["memcpy", Int](self.buf_indices.cpu_address + ib, Int(self.geom.index_words.unsafe_ptr()) + ib, in_)
+        if mn > 0:
+            _ = external_call["memcpy", Int](self.buf_meshlets.cpu_address + mb, Int(self.geom.meshlet_words.unsafe_ptr()) + mb, mn)
+        return True
+
+    def _rebuild_blas(mut self, mesh_id: Int, opaque: Bool):
+        if mesh_id < 0 or mesh_id >= len(self.mesh_blas):
+            return
+        self.vk.destroy_accel_struct(self.mesh_blas[mesh_id])
+        self.mesh_blas[mesh_id] = VulkanAccelStruct()
+        ref entry = self.geom.meshes[mesh_id]
+        if not self.vk.has_ray_query or entry.triangle_count <= 0 or entry.vertex_count <= 0:
+            return
+        var v_addr = self.vk.buffer_device_address(self.buf_vertices)
+        var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
+        var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
+        if self.vk.begin_commands(0):
+            var blas = build_blas_triangles_ex(
+                self.vk, 0, v_addr, AAA_VERTEX_BYTES, max_v, i_addr, entry.triangle_count, self.buf_as_scratch, opaque=opaque
+            )
+            self.vk.memory_barrier2(
+                0,
+                PIPELINE_AS_BUILD_KHR,
+                Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR),
+                PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
+                Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
+            )
+            var f = self.vk.submit(0)
+            if f != 0:
+                _ = self.vk.wait(f)
+            self.mesh_blas[mesh_id] = blas^
+
+    def replace_mesh(
+        mut self, mesh_id: Int, mesh: NativeMesh, material_id: Int, build_lods: Bool = False
+    ) -> CookedMeshEntry:
+        """Swap mesh `mesh_id`'s geometry for `mesh` (same id, so draws keep working): in place when
+        it fits, else in room another mesh freed, else at the end. For streamed terrain tiles, edited
+        level geometry, trails. Waits for the GPU first. `mesh_id < 0` in the result: no room."""
+        var bad = CookedMeshEntry()
+        bad.mesh_id = -1
+        if mesh_id < 0 or mesh_id >= len(self.geom.meshes) or (mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[mesh_id]):
+            return bad^
+        self.vk.wait_idle()
+        var res = self.geom.replace_mesh(mesh_id, mesh, material_id, build_lods)
+        var sl = res[1]
+        if not sl.empty() and not self._upload_slot(sl):
+            _ = self.geom.free_mesh(mesh_id)          # no room on the GPU: leave it empty
+            self._rebuild_blas(mesh_id, True)
+            return bad^
+        for h in self.geom.holes:                       # freed room holds meshlets that cover nothing
+            _ = self._upload_slot(GeomSlot(h.first_vertex, 0, h.first_index, 0, h.first_meshlet, h.meshlet_cap))
+        var is_am = (mesh.alpha_mode == 1) or (
+            material_id >= 0 and material_id < len(self.materials) and self.materials[material_id].is_alpha_masked()
+        )
+        self.mesh_double_sided_flags[mesh_id] = mesh.double_sided or is_am
+        self.mesh_alpha_masked_flags[mesh_id] = is_am
+        self._rebuild_blas(mesh_id, not is_am)
+        self.vsm.invalidate_all()
+        return res[0].copy()
+
+    def free_mesh(mut self, mesh_id: Int) -> Bool:
+        """Give mesh `mesh_id`'s GPU room back for later meshes; it draws nothing until replaced."""
+        if mesh_id < 0 or mesh_id >= len(self.geom.meshes):
+            return False
+        self.vk.wait_idle()
+        var sl = self.geom.free_mesh(mesh_id)
+        if sl.empty():
+            return False
+        _ = self._upload_slot(GeomSlot(sl.first_vertex, 0, sl.first_index, 0, sl.first_meshlet, sl.meshlet_cap))
+        self._rebuild_blas(mesh_id, True)
+        self.vsm.invalidate_all()
+        return True
+
+    def new_mesh(mut self, mesh: NativeMesh, material_id: Int, build_lods: Bool = False) -> CookedMeshEntry:
+        """A new mesh id, its geometry put in freed room when some fits."""
+        var mesh_id = self.geom.reserve_mesh_id()
+        self.mesh_blas.append(VulkanAccelStruct())
+        self.skinned_mesh_flags.append(False)
+        self.skinned_mesh_bind_slots.append(0)
+        self.mesh_double_sided_flags.append(False)
+        self.mesh_alpha_masked_flags.append(False)
+        return self.replace_mesh(mesh_id, mesh, material_id, build_lods)
 
     def add_splat_mesh(
         mut self,
@@ -3042,10 +3171,12 @@ struct FlintAaaVulkanRenderer(Movable):
         material_override: Int = -1,
         uniform_scale: Float32 = 1.0,
         has_prev: Bool = False,
+        wind: Float32 = 0.0,
     ):
-        if len(self.frame_instances) < self.max_instances and mesh_id >= 0 and mesh_id < len(self.geom.meshes):
+        if (len(self.frame_instances) < self.max_instances and mesh_id >= 0 and mesh_id < len(self.geom.meshes)
+                and self.geom.meshes[mesh_id].meshlet_count > 0):          # a freed / empty mesh draws nothing
             self.frame_instances.append(
-                AaaDrawInstance(mesh_id, world_mat, prev_world_mat, material_override, uniform_scale, has_prev)
+                AaaDrawInstance(mesh_id, world_mat, prev_world_mat, material_override, uniform_scale, has_prev, wind)
             )
 
     def draw_volumetric_plume(mut self, plume: AaaVolumetricPlume):
@@ -3493,7 +3624,8 @@ struct FlintAaaVulkanRenderer(Movable):
             var is_sk = di.mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[di.mesh_id]
             var inst_fl = UInt32(0x00010000) if is_sk else UInt32(0)
             var mat_ov = UInt32(0xFFFF) if di.material_override < 0 else UInt32(di.material_override & 0xFFFF)
-            put32(dst + 34 * 4, inst_fl | mat_ov)
+            var wind8 = UInt32(Int(di.wind * Float32(255.0) + Float32(0.5))) << UInt32(AAA_INSTANCE_WIND_SHIFT)
+            put32(dst + 34 * 4, inst_fl | mat_ov | wind8)
             put_float(dst + 35 * 4, di.uniform_scale)
             var sk_slot = self.skinned_mesh_bind_slots[di.mesh_id] if (is_sk and di.mesh_id < len(self.skinned_mesh_bind_slots)) else 0
             put32(dst + 36 * 4, UInt32(sk_slot))
@@ -3739,6 +3871,12 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + (AAA_GLOBALS_WATER_SHAPE_WORD + 1) * 4, self.water_wave_scale)
         put_float(g_addr + (AAA_GLOBALS_WATER_SHAPE_WORD + 2) * 4, self.water_foam_band)
         put_float(g_addr + (AAA_GLOBALS_WATER_SHAPE_WORD + 3) * 4, self.water_foam)
+        put_float(g_addr + AAA_GLOBALS_WIND_WORD * 4, Float32(get_time() - self.wind_t0))   # wall clock: sway speed does not follow the frame rate
+        put_float(g_addr + (AAA_GLOBALS_WIND_WORD + 1) * 4, self.wind_dir_x)
+        put_float(g_addr + (AAA_GLOBALS_WIND_WORD + 2) * 4, self.wind_dir_z)
+        put_float(g_addr + (AAA_GLOBALS_WIND_WORD + 3) * 4, self.wind_sway)
+        put_float(g_addr + (AAA_GLOBALS_WIND_WORD + 4) * 4, self.wind_hz)
+        put_float(g_addr + (AAA_GLOBALS_WIND_WORD + 5) * 4, self.wind_gust)
         put_float(g_addr + 148 * 4, self.min_auto_exposure)
         put_float(g_addr + 149 * 4, self.max_auto_exposure)
         put_float(g_addr + 150 * 4, self.motion_blur_shutter)

@@ -1122,6 +1122,14 @@ struct PhysicsWorld(Movable):
         self.bodies[slot].awake = False
         if bid >= 0 and bid < len(self.id_to_slot) and self.id_to_slot[bid] == slot:
             self.id_to_slot[bid] = -1
+        # Its joints go with it: a joint whose body A vanished would otherwise read as a joint to
+        # the world at A's local anchor (a point near the origin).
+        for ji in range(len(self.joints)):
+            if self.joints[ji].body_a == bid or self.joints[ji].body_b == bid:
+                self.joints[ji].broken = True
+        for si in range(len(self.six_dof_joints)):
+            if self.six_dof_joints[si].body_a == bid or self.six_dof_joints[si].body_b == bid:
+                self.six_dof_joints[si].broken = True
         self.islands.drop(slot)
         self.rebuild_broadphase()
 

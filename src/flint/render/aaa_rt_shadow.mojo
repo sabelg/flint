@@ -34,6 +34,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_VIS_TEX,
     emit_mat4_mul_dir,
     emit_mat4_mul_point,
+    emit_instance_point,
     emit_vec3_cross,
     emit_vec3_dot,
     emit_vec3_normalize,
@@ -127,6 +128,7 @@ def emit_visbuffer_surface(
     b_indices: UInt32,
     b_meshlets: UInt32,
     b_instances: UInt32,
+    b_globals: UInt32,
     vis0: UInt32,
     vis1: UInt32,
     ox: UInt32,
@@ -148,9 +150,9 @@ def emit_visbuffer_surface(
     var v1_off = s.imul(s.load_word(b_indices, s.iadd(idx_off, s.uint(1))), s.uint(12))
     var v2_off = s.imul(s.load_word(b_indices, s.iadd(idx_off, s.uint(2))), s.uint(12))
     var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
-    var p0 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v0_off), s.load_float(b_verts, s.iadd(v0_off, s.uint(1))), s.load_float(b_verts, s.iadd(v0_off, s.uint(2))))
-    var p1 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v1_off), s.load_float(b_verts, s.iadd(v1_off, s.uint(1))), s.load_float(b_verts, s.iadd(v1_off, s.uint(2))))
-    var p2 = emit_mat4_mul_point(s, b_instances, inst_base, s.load_float(b_verts, v2_off), s.load_float(b_verts, s.iadd(v2_off, s.uint(1))), s.load_float(b_verts, s.iadd(v2_off, s.uint(2))))
+    var p0 = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v0_off, s.load_float(b_verts, v0_off), s.load_float(b_verts, s.iadd(v0_off, s.uint(1))), s.load_float(b_verts, s.iadd(v0_off, s.uint(2))))
+    var p1 = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v1_off, s.load_float(b_verts, v1_off), s.load_float(b_verts, s.iadd(v1_off, s.uint(1))), s.load_float(b_verts, s.iadd(v1_off, s.uint(2))))
+    var p2 = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v2_off, s.load_float(b_verts, v2_off), s.load_float(b_verts, s.iadd(v2_off, s.uint(1))), s.load_float(b_verts, s.iadd(v2_off, s.uint(2))))
     var e1 = (s.fsub(p1[0], p0[0]), s.fsub(p1[1], p0[1]), s.fsub(p1[2], p0[2]))
     var e2 = (s.fsub(p2[0], p0[0]), s.fsub(p2[1], p0[1]), s.fsub(p2[2], p0[2]))
     var tv = (s.fsub(ox, p0[0]), s.fsub(oy, p0[1]), s.fsub(oz, p0[2]))
@@ -224,7 +226,7 @@ def rt_sun_shadow_trace_shader() -> List[UInt32]:
     var sun_z = s.load_float(b_globals, s.uint(50))
     var r_flags = s.load_word(b_globals, s.uint(99))
     var frame_idx = s.load_word(b_globals, s.uint(100))
-    var surf = emit_visbuffer_surface(s, b_verts, b_indices, b_meshlets, b_instances, vis0, vis1, cam_x, cam_y, cam_z, cam[3], cam[4], cam[5])
+    var surf = emit_visbuffer_surface(s, b_verts, b_indices, b_meshlets, b_instances, b_globals, vis0, vis1, cam_x, cam_y, cam_z, cam[3], cam[4], cam[5])
     var wx = surf[0]
     var wy = surf[1]
     var wz = surf[2]

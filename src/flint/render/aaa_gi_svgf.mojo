@@ -33,6 +33,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_VSM_TEX,
     emit_mat4_mul_dir,
     emit_mat4_mul_point,
+    emit_instance_point,
     emit_ray_barycentrics,
     emit_vec3_cross,
     emit_vec3_dot,
@@ -1074,9 +1075,9 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var l1x = s.load_float(b_verts, v1_off); var l1y = s.load_float(b_verts, s.iadd(v1_off, s.uint(1))); var l1z = s.load_float(b_verts, s.iadd(v1_off, s.uint(2)))
     var l2x = s.load_float(b_verts, v2_off); var l2y = s.load_float(b_verts, s.iadd(v2_off, s.uint(1))); var l2z = s.load_float(b_verts, s.iadd(v2_off, s.uint(2)))
 
-    var p0 = emit_mat4_mul_point(s, b_instances, inst_base, l0x, l0y, l0z)
-    var p1 = emit_mat4_mul_point(s, b_instances, inst_base, l1x, l1y, l1z)
-    var p2 = emit_mat4_mul_point(s, b_instances, inst_base, l2x, l2y, l2z)
+    var p0 = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v0_off, l0x, l0y, l0z)
+    var p1 = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v1_off, l1x, l1y, l1z)
+    var p2 = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v2_off, l2x, l2y, l2z)
 
     # Analytic 3-Ray Möller-Trumbore Differential Barycentrics
     var bary = emit_ray_barycentrics(

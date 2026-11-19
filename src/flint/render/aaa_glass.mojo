@@ -243,7 +243,7 @@ def aaa_glass_refract_shader() -> List[UInt32]:
     var dx = cam[3]
     var dy = cam[4]
     var dz = cam[5]
-    var surf = emit_visbuffer_surface(s, b_verts, b_indices, b_meshlets, b_instances, vis0, vis1, cam[0], cam[1], cam[2], dx, dy, dz)
+    var surf = emit_visbuffer_surface(s, b_verts, b_indices, b_meshlets, b_instances, b_globals, vis0, vis1, cam[0], cam[1], cam[2], dx, dy, dz)
     var wx = surf[0]
     var wy = surf[1]
     var wz = surf[2]

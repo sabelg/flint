@@ -168,6 +168,48 @@ def emit_mat4_mul_point(
     return (rx, ry, rz, rw)
 
 
+comptime AAA_GLOBALS_WIND_WORD: Int = 610   # [610] time s, [611..612] wind dir x/z, [613] sway m, [614] Hz, [615] gust 0..1
+comptime AAA_INSTANCE_WIND_SHIFT: Int = 24  # instance word 34 bits 24..31: this draw's wind strength (0..255)
+
+
+def emit_instance_point(
+    mut s: AaaSpirvModule,
+    b_instances: UInt32,
+    b_globals: UInt32,
+    b_verts: UInt32,
+    inst_base: UInt32,
+    v_base: UInt32,
+    px: UInt32,
+    py: UInt32,
+    pz: UInt32,
+) -> Tuple[UInt32, UInt32, UInt32, UInt32]:
+    """A vertex in world space: the instance's matrix, then wind sway. Every pass that rebuilds a
+    triangle calls this, so swaying grass rasterizes, shades and casts shadows in the same place.
+    Sway = the draw's wind strength x the vertex's weight (its uv.y, 0 at the root .. 1 at the tip)
+    x the global wind (direction, metres, Hz), phased by world position so a meadow ripples."""
+    var wp = emit_mat4_mul_point(s, b_instances, inst_base, px, py, pz)
+    var w8 = s.bit_and(s.shr(s.load_word(b_instances, s.iadd(inst_base, s.uint(34))), s.uint(UInt32(AAA_INSTANCE_WIND_SHIFT))), s.uint(0xFF))
+    var weight = s.nclamp(s.load_float(b_verts, s.iadd(v_base, s.uint(10))), s.float(0.0), s.float(1.0))
+    var k = s.fmul(s.fmul(s.float_from_uint(w8), s.float(1.0 / 255.0)), weight)
+    var g = UInt32(AAA_GLOBALS_WIND_WORD)
+    var t = s.load_float(b_globals, s.uint(g))
+    var dx = s.load_float(b_globals, s.uint(g + 1))
+    var dz = s.load_float(b_globals, s.uint(g + 2))
+    var amp = s.load_float(b_globals, s.uint(g + 3))
+    var hz = s.load_float(b_globals, s.uint(g + 4))
+    var gust = s.load_float(b_globals, s.uint(g + 5))
+    # phase travels along the wind: gusts roll across the field
+    var along = s.fma(wp[0], dx, s.fmul(wp[2], dz))
+    var ph = s.fsub(s.fmul(t, s.fmul(hz, s.float(6.2831853))), s.fmul(along, s.float(0.35)))
+    var wave = s.fma(s.fsin(ph), s.float(0.55), s.fmul(s.fsin(s.fadd(s.fmul(ph, s.float(2.37)), s.fmul(wp[0], s.float(0.9)))), s.float(0.2)))
+    var gust_w = s.fmul(gust, s.fma(s.fsin(s.fsub(s.fmul(t, s.float(0.7)), s.fmul(along, s.float(0.05)))), s.float(0.5), s.float(0.5)))
+    var off = s.fmul(s.fmul(amp, k), s.fadd(s.fadd(wave, s.float(0.35)), gust_w))
+    var nx = s.fma(dx, off, wp[0])
+    var nz = s.fma(dz, off, wp[2])
+    var ny = s.fsub(wp[1], s.fmul(s.fmul(off, off), s.fmul(k, s.float(0.3))))   # tips dip as they bend
+    return (nx, ny, nz, wp[3])
+
+
 def emit_mat4_mul_dir(
     mut s: AaaSpirvModule,
     buf: UInt32,
@@ -447,7 +489,7 @@ def visbuffer_vertex_shader() -> List[UInt32]:
     var lpy = s.load_float(b_verts, s.iadd(v_base, s.uint(1)))
     var lpz = s.load_float(b_verts, s.iadd(v_base, s.uint(2)))
 
-    var wp = emit_mat4_mul_point(s, b_instances, inst_base, lpx, lpy, lpz)
+    var wp = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v_base, lpx, lpy, lpz)
     var vp_off = s.push_word(0)
     var clip = emit_mat4_mul_point(s, b_globals, vp_off, wp[0], wp[1], wp[2])
 
@@ -523,7 +565,7 @@ def visbuffer_alphamask_vertex_shader() -> List[UInt32]:
     var uv_u = s.load_float(b_verts, s.iadd(v_base, s.uint(9)))
     var uv_v = s.load_float(b_verts, s.iadd(v_base, s.uint(10)))
 
-    var wp = emit_mat4_mul_point(s, b_instances, inst_base, lpx, lpy, lpz)
+    var wp = emit_instance_point(s, b_instances, b_globals, b_verts, inst_base, v_base, lpx, lpy, lpz)
     var vp_off = s.push_word(0)
     var clip = emit_mat4_mul_point(s, b_globals, vp_off, wp[0], wp[1], wp[2])
 
