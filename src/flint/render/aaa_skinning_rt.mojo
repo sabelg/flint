@@ -36,21 +36,34 @@ comptime AAA_SKIN_BIND_VERTS_BASE: Int = AAA_MAX_SKIN_BONES * 16               #
 comptime AAA_SKIN_BIND_STRIDE_WORDS: Int = 16
 comptime AAA_SKIN_MAX_VERTS: Int = 98304
 comptime AAA_SKIN_PREV_POS_BASE: Int = AAA_SKIN_BIND_VERTS_BASE + AAA_SKIN_MAX_VERTS * AAA_SKIN_BIND_STRIDE_WORDS  # 1,605,632
-comptime AAA_SKIN_BUFFER_WORDS: Int = AAA_SKIN_PREV_POS_BASE + AAA_SKIN_MAX_VERTS * 3                              # 1,900,544 (~7.25 MiB)
+comptime AAA_SKIN_CUR_SMEAR_BASE: Int = AAA_SKIN_PREV_POS_BASE + AAA_SKIN_MAX_VERTS * 3                            # 1,900,544 (2048 * 8 floats)
+comptime AAA_SKIN_PREV_SMEAR_BASE: Int = AAA_SKIN_CUR_SMEAR_BASE + AAA_MAX_SKIN_BONES * 8                          # 1,916,928 (2048 * 8 floats)
+comptime AAA_SKIN_MAX_MORPH_SLOTS: Int = 256
+comptime AAA_SKIN_MAX_MORPH_DELTAS: Int = 262144                                                                   # 6 floats (dx,dy,dz,dnx,dny,dnz) per (morph, vtx)
+comptime AAA_SKIN_CUR_MORPH_WEIGHTS_BASE: Int = AAA_SKIN_PREV_SMEAR_BASE + AAA_MAX_SKIN_BONES * 8                  # 1,933,312
+comptime AAA_SKIN_PREV_MORPH_WEIGHTS_BASE: Int = AAA_SKIN_CUR_MORPH_WEIGHTS_BASE + AAA_SKIN_MAX_MORPH_SLOTS        # 1,933,568
+comptime AAA_SKIN_MORPH_DELTAS_BASE: Int = AAA_SKIN_PREV_MORPH_WEIGHTS_BASE + AAA_SKIN_MAX_MORPH_SLOTS             # 1,933,824
+comptime AAA_SKIN_BUFFER_WORDS: Int = AAA_SKIN_MORPH_DELTAS_BASE + AAA_SKIN_MAX_MORPH_DELTAS * 6                   # 3,506,688 (~13.38 MiB)
 
 
 struct FlintAaaSkinningArena(Copyable, ImplicitlyCopyable, Movable):
-    """Tracks disjoint GPU bone-palette (`2,048` bones) & bind-vertex (`98,304` verts) sub-allocations."""
+    """Tracks disjoint GPU bone-palette (`2,048` bones), bind-vertex (`98,304` verts) & morph-target sub-allocations."""
     var bone_cursor: Int
     var vertex_cursor: Int
+    var morph_weight_cursor: Int
+    var morph_delta_cursor: Int
 
     def __init__(out self):
         self.bone_cursor = 0
         self.vertex_cursor = 0
+        self.morph_weight_cursor = 0
+        self.morph_delta_cursor = 0
 
     def reset(mut self):
         self.bone_cursor = 0
         self.vertex_cursor = 0
+        self.morph_weight_cursor = 0
+        self.morph_delta_cursor = 0
 
     def alloc_bone_palette(mut self, bone_count: Int = 64, explicit_word_offset: Int = -1) -> Int:
         """Returns `bone_palette_offset` in `UInt32` words (`bone_slot * 8`) without overwriting slot `0`."""
@@ -72,6 +85,20 @@ struct FlintAaaSkinningArena(Copyable, ImplicitlyCopyable, Movable):
         var v_cnt = max(0, min(vertex_count, AAA_SKIN_MAX_VERTS - first_slot))
         self.vertex_cursor += v_cnt
         return (first_slot, v_cnt)
+
+    def alloc_morph_targets(mut self, morph_count: Int, vertex_count: Int) -> Tuple[Int, Int, Int]:
+        """Allocates `(first_weight_slot, first_delta_slot, effective_morph_count)` clamped within
+        `AAA_SKIN_MAX_MORPH_SLOTS` and `AAA_SKIN_MAX_MORPH_DELTAS`."""
+        var first_w = self.morph_weight_cursor
+        var first_d = self.morph_delta_cursor
+        if morph_count <= 0 or vertex_count <= 0:
+            return (first_w, first_d, 0)
+        var avail_w = max(0, AAA_SKIN_MAX_MORPH_SLOTS - first_w)
+        var avail_d_morphs = max(0, (AAA_SKIN_MAX_MORPH_DELTAS - first_d) // vertex_count)
+        var eff_m = max(0, min(morph_count, min(avail_w, avail_d_morphs)))
+        self.morph_weight_cursor += eff_m
+        self.morph_delta_cursor += eff_m * vertex_count
+        return (first_w, first_d, eff_m)
 
 
 @fieldwise_init
@@ -339,10 +366,140 @@ def skin_vertex_dq_cpu(
     return (dq.transform_point(bind_pos), dq.transform_dir(bind_nrm))
 
 
+struct BoneSmear(Copyable, ImplicitlyCopyable, Movable):
+    """Non-uniform 3D affine smear-frame bone stretch, squash, and directional shear around `pivot_bind`.
+    Stored in `BIND_AAA_SKINNING` as `(scale - 1.0, shear_xy, pivot_bind, shear_xz)` so zeroed memory is exact identity!
+    """
+    var scale: Vec3
+    var shear_xy: Float32
+    var pivot_bind: Vec3
+    var shear_xz: Float32
+
+    def __init__(
+        out self,
+        scale: Vec3 = Vec3(1.0, 1.0, 1.0),
+        shear_xy: Float32 = 0.0,
+        pivot_bind: Vec3 = Vec3(0.0, 0.0, 0.0),
+        shear_xz: Float32 = 0.0,
+    ):
+        self.scale = Vec3(
+            max(Float32(0.05), scale.x),
+            max(Float32(0.05), scale.y),
+            max(Float32(0.05), scale.z),
+        )
+        self.shear_xy = shear_xy
+        self.pivot_bind = pivot_bind
+        self.shear_xz = shear_xz
+
+    def write_words(self, mut out: List[UInt32], offset_words: Int):
+        out[offset_words + 0] = bitcast[DType.uint32](self.scale.x - Float32(1.0))
+        out[offset_words + 1] = bitcast[DType.uint32](self.scale.y - Float32(1.0))
+        out[offset_words + 2] = bitcast[DType.uint32](self.scale.z - Float32(1.0))
+        out[offset_words + 3] = bitcast[DType.uint32](self.shear_xy)
+        out[offset_words + 4] = bitcast[DType.uint32](self.pivot_bind.x)
+        out[offset_words + 5] = bitcast[DType.uint32](self.pivot_bind.y)
+        out[offset_words + 6] = bitcast[DType.uint32](self.pivot_bind.z)
+        out[offset_words + 7] = bitcast[DType.uint32](self.shear_xz)
+
+
+def skin_vertex_dq_smear_cpu(
+    bones: List[DualQuat],
+    smears: List[BoneSmear],
+    j0: Int,
+    j1: Int,
+    j2: Int,
+    j3: Int,
+    w0: Float32,
+    w1: Float32,
+    w2: Float32,
+    w3: Float32,
+    bind_pos: Vec3,
+    bind_nrm: Vec3 = Vec3(0.0, 1.0, 0.0),
+) -> Tuple[Vec3, Vec3]:
+    """CPU reference matching `aaa_dq_skinning_shader` with non-uniform `BoneSmear` deformation + `J^{-T}` normals."""
+    var ns = normalize_and_sort_skin_weights_4(j0, j1, j2, j3, w0, w1, w2, w3)
+    var jp = ns[0]
+    var sj = [
+        Int(jp & UInt32(0xFF)),
+        Int((jp >> UInt32(8)) & UInt32(0xFF)),
+        Int((jp >> UInt32(16)) & UInt32(0xFF)),
+        Int((jp >> UInt32(24)) & UInt32(0xFF)),
+    ]
+    var sw3 = max(Float32(0.0), Float32(1.0) - (ns[1] + ns[2] + ns[3]))
+    var sw = [ns[1], ns[2], ns[3], sw3]
+
+    var ds = Vec3(0.0, 0.0, 0.0)
+    var sh_xy = Float32(0.0)
+    var sh_xz = Float32(0.0)
+    var piv = Vec3(0.0, 0.0, 0.0)
+    for k in range(4):
+        var wk = sw[k]
+        if wk > Float32(0.0) and sj[k] < len(smears):
+            var sm = smears[sj[k]]
+            ds = ds + (sm.scale - Vec3(1.0, 1.0, 1.0)) * wk
+            sh_xy += sm.shear_xy * wk
+            sh_xz += sm.shear_xz * wk
+            piv = piv + sm.pivot_bind * wk
+
+    var sx = max(Float32(0.05), Float32(1.0) + ds.x)
+    var sy = max(Float32(0.05), Float32(1.0) + ds.y)
+    var sz = max(Float32(0.05), Float32(1.0) + ds.z)
+    var rel = bind_pos - piv
+    var sm_pos = piv + Vec3(
+        rel.x * sx + sh_xy * rel.y + sh_xz * rel.z,
+        rel.y * sy,
+        rel.z * sz,
+    )
+
+    var inv_sx = Float32(1.0) / sx
+    var inv_sy = Float32(1.0) / sy
+    var inv_sz = Float32(1.0) / sz
+    var nx_s = bind_nrm.x * inv_sx
+    var ny_s = (bind_nrm.y - sh_xy * nx_s) * inv_sy
+    var nz_s = (bind_nrm.z - sh_xz * nx_s) * inv_sz
+    var sm_nrm = Vec3(nx_s, ny_s, nz_s).normalized()
+
+    var dq = blend_dual_quats_cpu(bones, sj[0], sj[1], sj[2], sj[3], sw[0], sw[1], sw[2], sw[3])
+    return (dq.transform_point(sm_pos), dq.transform_dir(sm_nrm))
+
+
+def skin_vertex_morph_dq_smear_cpu(
+    bones: List[DualQuat],
+    smears: List[BoneSmear],
+    morph_weights: List[Float32],
+    morph_pos_deltas: List[Vec3],
+    morph_nrm_deltas: List[Vec3],
+    j0: Int,
+    j1: Int,
+    j2: Int,
+    j3: Int,
+    w0: Float32,
+    w1: Float32,
+    w2: Float32,
+    w3: Float32,
+    bind_pos: Vec3,
+    bind_nrm: Vec3 = Vec3(0.0, 1.0, 0.0),
+) -> Tuple[Vec3, Vec3]:
+    """CPU reference matching `aaa_dq_skinning_shader` with pre-skinning `BlendShape` morph targets + `BoneSmear` + `DualQuat`."""
+    var m_cnt = min(len(morph_weights), len(morph_pos_deltas))
+    var mp = bind_pos
+    var mn = bind_nrm
+    if m_cnt > 0:
+        for m in range(m_cnt):
+            var mw = morph_weights[m]
+            mp = mp + morph_pos_deltas[m] * mw
+            if m < len(morph_nrm_deltas):
+                mn = mn + morph_nrm_deltas[m] * mw
+        var mn_l2 = max(Float32(1e-12), mn.length_squared())
+        mn = mn * (Float32(1.0) / sqrt(mn_l2))
+    return skin_vertex_dq_smear_cpu(bones, smears, j0, j1, j2, j3, w0, w1, w2, w3, mp, mn)
+
+
 def _emit_dq_blend_and_transform_dsl(
     mut dsl: ShaderDsl,
     b_skin_buf_id: UInt32,
     palette_base: GpuU32,
+    smear_base: GpuU32,
     j0: GpuU32,
     j1: GpuU32,
     j2: GpuU32,
@@ -355,10 +512,17 @@ def _emit_dq_blend_and_transform_dsl(
     bind_nrm: GpuVec3,
     bind_tan: GpuVec3,
 ) -> Tuple[GpuVec3, GpuVec3, GpuVec3]:
-    """Blends 4 scale-aware bone Dual Quaternions around dominant pivot `j0` in `ShaderDsl` and transforms `(pos, nrm, tan)`."""
+    """Blends 4 scale-aware bone Dual Quaternions + non-uniform `BoneSmear` affine deformations in `ShaderDsl`."""
     from flint.render.shader_dsl import BufferRef
     var b_skin = BufferRef[1](dsl.mod_addr, b_skin_buf_id)
     var pal = palette_base
+
+    # Blend 4-bone non-uniform `BoneSmear` (`(scale - 1, shear_xy, pivot_bind, shear_xz)` -> 0 = exact identity)
+    var sm0 = smear_base + j0 * UInt32(8)
+    var acc_ds = b_skin.load_vec3(sm0) * w0
+    var acc_sh_xy = b_skin.load_f32(sm0 + UInt32(3)) * w0
+    var acc_piv = b_skin.load_vec3(sm0 + UInt32(4)) * w0
+    var acc_sh_xz = b_skin.load_f32(sm0 + UInt32(7)) * w0
 
     var o0 = pal + j0 * UInt32(8)
     var r0_raw = b_skin.load_vec3(o0)
@@ -382,6 +546,13 @@ def _emit_dq_blend_and_transform_dsl(
     var j_arr = [j1, j2, j3]
     var w_arr = [w1, w2, w3]
     for k in range(3):
+        var wk = w_arr[k]
+        var smk = smear_base + j_arr[k] * UInt32(8)
+        acc_ds = acc_ds + b_skin.load_vec3(smk) * wk
+        acc_sh_xy = fma_f(b_skin.load_f32(smk + UInt32(3)), wk, acc_sh_xy)
+        acc_piv = acc_piv + b_skin.load_vec3(smk + UInt32(4)) * wk
+        acc_sh_xz = fma_f(b_skin.load_f32(smk + UInt32(7)), wk, acc_sh_xz)
+
         var ok = pal + j_arr[k] * UInt32(8)
         var rk_raw = b_skin.load_vec3(ok)
         var rwk_raw = b_skin.load_f32(ok + UInt32(3))
@@ -395,12 +566,35 @@ def _emit_dq_blend_and_transform_dsl(
         var dk = dk_raw * inv_sk
         var dwk = dwk_raw * inv_sk
         var qdot = fma_f(rw0, rwk, dot(r0, rk))
-        var sw = select_f(qdot.lt(0.0), -w_arr[k], w_arr[k])
+        var sw = select_f(qdot.lt(0.0), -wk, wk)
         acc_r = acc_r + rk * sw
         acc_rw = acc_rw + rwk * sw
         acc_d = acc_d + dk * sw
         acc_dw = acc_dw + dwk * sw
-        s_blend = fma_f(sk, w_arr[k], s_blend)
+        s_blend = fma_f(sk, wk, s_blend)
+
+    var sx = max_f(acc_ds.x() + Float32(1.0), 0.05)
+    var sy = max_f(acc_ds.y() + Float32(1.0), 0.05)
+    var sz = max_f(acc_ds.z() + Float32(1.0), 0.05)
+    var rel_p = bind_pos - acc_piv
+    var sm_pos = acc_piv + GpuVec3(
+        fma_f(acc_sh_xz, rel_p.z(), fma_f(acc_sh_xy, rel_p.y(), rel_p.x() * sx)),
+        rel_p.y() * sy,
+        rel_p.z() * sz,
+    )
+
+    var inv_sx = Float32(1.0) / sx
+    var inv_sy = Float32(1.0) / sy
+    var inv_sz = Float32(1.0) / sz
+    var nx_s = bind_nrm.x() * inv_sx
+    var ny_s = (bind_nrm.y() - acc_sh_xy * nx_s) * inv_sy
+    var nz_s = (bind_nrm.z() - acc_sh_xz * nx_s) * inv_sz
+    var sm_nrm = GpuVec3(nx_s, ny_s, nz_s).normalized()
+    var sm_tan = GpuVec3(
+        fma_f(acc_sh_xz, bind_tan.z(), fma_f(acc_sh_xy, bind_tan.y(), bind_tan.x() * sx)),
+        bind_tan.y() * sy,
+        bind_tan.z() * sz,
+    ).normalized()
 
     var inv_l = rsqrt_f(max_f(fma_f(acc_rw, acc_rw, dot(acc_r, acc_r)), 1e-12))
     var rv = acc_r * inv_l
@@ -409,18 +603,21 @@ def _emit_dq_blend_and_transform_dsl(
     var dw = acc_dw * inv_l
 
     var trans = (dv * rw - rv * dw + cross(rv, dv)) * Float32(2.0)
-    var scaled_pos = bind_pos * s_blend
+    var scaled_pos = sm_pos * s_blend
     var out_pos = scaled_pos + cross(rv, cross(rv, scaled_pos) + scaled_pos * rw) * Float32(2.0) + trans
-    var out_nrm = (bind_nrm + cross(rv, cross(rv, bind_nrm) + bind_nrm * rw) * Float32(2.0)).normalized()
-    var out_tan = (bind_tan + cross(rv, cross(rv, bind_tan) + bind_tan * rw) * Float32(2.0)).normalized()
+    var out_nrm = (sm_nrm + cross(rv, cross(rv, sm_nrm) + sm_nrm * rw) * Float32(2.0)).normalized()
+    var out_tan = (sm_tan + cross(rv, cross(rv, sm_tan) + sm_tan * rw) * Float32(2.0)).normalized()
     return (out_pos, out_nrm, out_tan)
 
 
 def aaa_dq_skinning_shader(bind_vertices: Int, bind_skinning: Int) -> List[UInt32]:
-    """GPU Compute 4-Bone Dual-Quaternion Skinning Shader (`group = 64 x 1`):
-    Push[0] = skinned_vertex_count, Push[1] = skin_bind_first_slot, Push[2] = dst_first_vertex_in_buf_vertices.
-    Deforms `(pos, nrm, tan)` in-place inside `buf_vertices` (ready for `VisBuffer` AND `BLAS` `UPDATE_KHR` refit!)
-    and writes previous-frame deformed vertex positions into `BIND_AAA_SKINNING` for exact 3D `FlintTSR v2` motion vectors!
+    """GPU Compute 4-Bone Dual-Quaternion + Morph-Target (`BlendShape`) + Smear-Frame Skinning Shader (`group = 64 x 1`):
+    Push[0] = skinned_vertex_count, Push[1] = skin_bind_first_slot, Push[2] = dst_first_vertex_in_buf_vertices,
+    Push[3] = cur_bones_base, Push[4] = prev_bones_base, Push[5] = cur_smear_base (0 -> default),
+    Push[6] = prev_smear_base (0 -> default), Push[7] = morph_count, Push[8] = morph_weight_first_slot,
+    Push[9] = morph_delta_first_slot.
+    Deforms `(pos, nrm, tan)` in-place inside `buf_vertices` (ready for `VisBuffer`, outlines, AND `BLAS` `UPDATE_KHR` refit!)
+    and writes previous-frame deformed vertex positions into `BIND_AAA_SKINNING` for exact 3D `FlintTSR` motion vectors!
     """
     var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=64, group_height=1, push_words=16)
     var b_verts = dsl.buffer[12](bind_vertices)
@@ -432,9 +629,16 @@ def aaa_dq_skinning_shader(bind_vertices: Int, bind_skinning: Int) -> List[UInt3
     var dst_first = dsl.push_u32(2)
     var cur_bones_base = dsl.push_u32(3)
     var prev_bones_base = dsl.push_u32(4)
+    var cur_smear_in = dsl.push_u32(5)
+    var prev_smear_in = dsl.push_u32(6)
+    var morph_cnt = dsl.push_u32(7)
+    var morph_w_slot = dsl.push_u32(8)
+    var morph_d_slot = dsl.push_u32(9)
     dsl.return_if(local_v.ge(v_cnt))
 
     var eff_prev_bones = select_u(prev_bones_base.eq(dsl.u32(0)), dsl.u32(UInt32(AAA_SKIN_PREV_BONES_BASE)), prev_bones_base)
+    var eff_cur_smear = select_u(cur_smear_in.eq(dsl.u32(0)), dsl.u32(UInt32(AAA_SKIN_CUR_SMEAR_BASE)), cur_smear_in)
+    var eff_prev_smear = select_u(prev_smear_in.eq(dsl.u32(0)), dsl.u32(UInt32(AAA_SKIN_PREV_SMEAR_BASE)), prev_smear_in)
 
     var src_base = dsl.u32(UInt32(AAA_SKIN_BIND_VERTS_BASE)) + (bind_first + local_v) * UInt32(AAA_SKIN_BIND_STRIDE_WORDS)
     var bind_pos = b_skin.load_vec3(src_base)
@@ -455,15 +659,41 @@ def aaa_dq_skinning_shader(bind_vertices: Int, bind_skinning: Int) -> List[UInt3
     var w2 = b_skin.load_f32(src_base + UInt32(15))
     var w3 = max_f(dsl.f32(1.0) - (w0 + w1 + w2), 0.0)
 
+    var cur_bp = dsl.var_vec3(bind_pos)
+    var cur_bn = dsl.var_vec3(bind_nrm)
+    var prev_bp = dsl.var_vec3(bind_pos)
+    var prev_bn = dsl.var_vec3(bind_nrm)
+    var m_var = dsl.var_u32(dsl.u32(0))
+
+    dsl.if_then(dsl.u32(0).lt(morph_cnt))
+    dsl.begin_loop()
+    var m_idx = m_var.get()
+    dsl.break_if(m_idx.ge(morph_cnt))
+    var w_off = morph_w_slot + m_idx
+    var cw = b_skin.load_f32(dsl.u32(UInt32(AAA_SKIN_CUR_MORPH_WEIGHTS_BASE)) + w_off)
+    var pw = b_skin.load_f32(dsl.u32(UInt32(AAA_SKIN_PREV_MORPH_WEIGHTS_BASE)) + w_off)
+    var d_off = dsl.u32(UInt32(AAA_SKIN_MORPH_DELTAS_BASE)) + (morph_d_slot + m_idx * v_cnt + local_v) * UInt32(6)
+    var dp = b_skin.load_vec3(d_off)
+    var dn = b_skin.load_vec3(d_off + UInt32(3))
+    cur_bp.set(cur_bp.get() + dp * cw)
+    cur_bn.set(cur_bn.get() + dn * cw)
+    prev_bp.set(prev_bp.get() + dp * pw)
+    prev_bn.set(prev_bn.get() + dn * pw)
+    m_var.set(m_idx + UInt32(1))
+    dsl.end_loop()
+    cur_bn.set(cur_bn.get().normalized())
+    prev_bn.set(prev_bn.get().normalized())
+    dsl.end_if()
+
     var cur_def = _emit_dq_blend_and_transform_dsl(
-        dsl, b_skin.buf_id, cur_bones_base,
+        dsl, b_skin.buf_id, cur_bones_base, eff_cur_smear,
         j0, j1, j2, j3, w0, w1, w2, w3,
-        bind_pos, bind_nrm, bind_tan,
+        cur_bp.get(), cur_bn.get(), bind_tan,
     )
     var prev_def = _emit_dq_blend_and_transform_dsl(
-        dsl, b_skin.buf_id, eff_prev_bones,
+        dsl, b_skin.buf_id, eff_prev_bones, eff_prev_smear,
         j0, j1, j2, j3, w0, w1, w2, w3,
-        bind_pos, bind_nrm, bind_tan,
+        prev_bp.get(), prev_bn.get(), bind_tan,
     )
 
     var dst_v = dst_first + local_v

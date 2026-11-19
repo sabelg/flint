@@ -20,6 +20,7 @@ from flint.core.detmath import PI, det_atan2, set_sim_float_mode
 from flint.core.math import Quat, Vec3
 from flint.core.serial import BlobReader, BlobWriter, Serializable, fnv64, fourcc
 from flint.core.transform import Mat4, trs
+from flint.anim.flanim_ecs import SteppedAnimClock
 from flint.assets.checkpoint import pack_checkpoint_lz4, unpack_checkpoint_lz4
 from flint.assets.flpk_v3 import UntypedHandle
 from flint.assets.glb_writer import encode_native_glb, write_native_glb
@@ -68,6 +69,10 @@ comptime COLLIDER_SPHERE: Int = 1
 comptime COLLIDER_BOX: Int = 2
 comptime COLLIDER_CAPSULE: Int = 3
 comptime COLLIDER_STATIC_MESH: Int = 4
+
+comptime SHADING_PBR: Int = 0
+comptime SHADING_NPR_CEL: Int = 1
+comptime SHADING_STYLIZED_VFX: Int = 2
 
 comptime PIE_STOPPED: Int = 0
 comptime PIE_PLAYING: Int = 1
@@ -227,6 +232,18 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
     var friction: Float32
     var visible: Bool
     var locked: Bool
+    var shading_mode: Int
+    var cel_shadow_tint: Vec3
+    var cel_outline_width_px: Float32
+    var cel_outline_color: Vec3
+    var cel_rim_color: Vec3
+    var cel_hair_halo: Float32
+    var vfx_erosion: Float32
+    var vfx_scroll_speed: Float32
+    var vfx_core_color: Vec3
+    var vfx_edge_color: Vec3
+    var anim_step_hz: Float32
+    var smear_stretch: Float32
 
     def __init__(out self, entity_id: Int = 0, name: String = "Entity"):
         self.entity_id = entity_id
@@ -253,6 +270,18 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
         self.friction = Float32(0.55)
         self.visible = True
         self.locked = False
+        self.shading_mode = SHADING_PBR
+        self.cel_shadow_tint = Vec3(0.55, 0.38, 0.44)
+        self.cel_outline_width_px = Float32(2.0)
+        self.cel_outline_color = Vec3(0.015, 0.012, 0.018)
+        self.cel_rim_color = Vec3(0.45, 0.52, 0.68)
+        self.cel_hair_halo = Float32(0.0)
+        self.vfx_erosion = Float32(0.35)
+        self.vfx_scroll_speed = Float32(3.2)
+        self.vfx_core_color = Vec3(8.5, 6.2, 2.2)
+        self.vfx_edge_color = Vec3(4.2, 0.30, 0.04)
+        self.anim_step_hz = Float32(0.0)
+        self.smear_stretch = Float32(1.0)
 
     def local_matrix(self) -> Mat4:
         return trs(self.translation, self.rotation, self.scale)
@@ -272,9 +301,24 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
         visitor.visit_f32("mass", self.mass)
         visitor.visit_bool("visible", self.visible)
         visitor.visit_bool("locked", self.locked)
+        visitor.visit_int("shading_mode", self.shading_mode)
+        visitor.visit_vec3("cel_shadow_tint", self.cel_shadow_tint, is_color=True)
+        visitor.visit_f32("cel_outline_width_px", self.cel_outline_width_px)
+        visitor.visit_vec3("cel_outline_color", self.cel_outline_color, is_color=True)
+        visitor.visit_vec3("cel_rim_color", self.cel_rim_color, is_color=True)
+        visitor.visit_f32("cel_hair_halo", self.cel_hair_halo)
+        visitor.visit_f32("vfx_erosion", self.vfx_erosion)
+        visitor.visit_f32("vfx_scroll_speed", self.vfx_scroll_speed)
+        visitor.visit_vec3("vfx_core_color", self.vfx_core_color, is_color=True)
+        visitor.visit_vec3("vfx_edge_color", self.vfx_edge_color, is_color=True)
+        visitor.visit_f32("anim_step_hz", self.anim_step_hz)
+        visitor.visit_f32("smear_stretch", self.smear_stretch)
+
+    def inspect(mut self, mut v: FieldVisitor):
+        self.inspect_fields(v)
 
     def serialize(self, mut out: BlobWriter):
-        out.begin(fourcc("SENT"), 1)
+        out.begin(fourcc("SENT"), 2)
         out.integer(self.entity_id)
         out.boolean(self.alive)
         out.text(self.name)
@@ -299,10 +343,22 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
         out.f32(self.friction)
         out.boolean(self.visible)
         out.boolean(self.locked)
+        out.integer(self.shading_mode)
+        out.vec3(self.cel_shadow_tint)
+        out.f32(self.cel_outline_width_px)
+        out.vec3(self.cel_outline_color)
+        out.vec3(self.cel_rim_color)
+        out.f32(self.cel_hair_halo)
+        out.f32(self.vfx_erosion)
+        out.f32(self.vfx_scroll_speed)
+        out.vec3(self.vfx_core_color)
+        out.vec3(self.vfx_edge_color)
+        out.f32(self.anim_step_hz)
+        out.f32(self.smear_stretch)
         out.end()
 
     def deserialize(mut self, mut input: BlobReader) raises:
-        _ = input.enter(fourcc("SENT"), 1)
+        var ver = input.enter(fourcc("SENT"), 2)
         self.entity_id = input.integer()
         self.alive = input.boolean()
         self.name = input.text()
@@ -327,6 +383,19 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
         self.friction = input.f32()
         self.visible = input.boolean()
         self.locked = input.boolean()
+        if ver >= 2:
+            self.shading_mode = input.integer()
+            self.cel_shadow_tint = input.vec3()
+            self.cel_outline_width_px = input.f32()
+            self.cel_outline_color = input.vec3()
+            self.cel_rim_color = input.vec3()
+            self.cel_hair_halo = input.f32()
+            self.vfx_erosion = input.f32()
+            self.vfx_scroll_speed = input.f32()
+            self.vfx_core_color = input.vec3()
+            self.vfx_edge_color = input.vec3()
+            self.anim_step_hz = input.f32()
+            self.smear_stretch = input.f32()
         input.leave()
 
 
@@ -456,6 +525,13 @@ struct FlintStudioState(Movable, Serializable):
     var redo_stack: List[EditorTransaction]
     var pie: PieSession
 
+    # Studio-level Stepped Animation Clock & Preview NPR Post-FX State
+    var stepped_clock: SteppedAnimClock
+    var preview_impact_blend: Float32
+    var preview_impact_invert: Bool
+    var preview_shockwave_active: Bool
+    var preview_shockwave_radius: Float32
+
     # Integrated v5 Subsystems: `DockSpace`, `UiContext`, `CameraRig`, and `InputMap`
     var dock: DockSpace
     var ui_ctx: UiContext
@@ -491,6 +567,12 @@ struct FlintStudioState(Movable, Serializable):
         self.undo_stack = List[EditorTransaction]()
         self.redo_stack = List[EditorTransaction]()
         self.pie = PieSession()
+
+        self.stepped_clock = SteppedAnimClock()
+        self.preview_impact_blend = Float32(0.0)
+        self.preview_impact_invert = False
+        self.preview_shockwave_active = False
+        self.preview_shockwave_radius = Float32(0.22)
 
         self.dock = _create_studio_dockspace()
         self.ui_ctx = UiContext(preset_hud=False)
@@ -614,7 +696,7 @@ struct FlintStudioState(Movable, Serializable):
     # ---- Authoritative Binary Serialization & `fnv64` State Hash ----
 
     def serialize(self, mut out: BlobWriter):
-        out.begin(fourcc("FSTD"), 1)
+        out.begin(fourcc("FSTD"), 2)
         out.integer(self.selected_entity_id)
         out.integer(self.sim_tick)
         out.vec3(self.gravity)
@@ -623,10 +705,19 @@ struct FlintStudioState(Movable, Serializable):
         out.u32(UInt32(len(self.entities)))
         for i in range(len(self.entities)):
             self.entities[i].serialize(out)
+        out.f32(self.stepped_clock.raw_time_sec)
+        out.f32(self.stepped_clock.stepped_time_sec)
+        out.f32(self.stepped_clock.step_hz)
+        out.f32(self.stepped_clock.hitstop_remaining_sec)
+        out.boolean(self.stepped_clock.pose_changed_this_tick)
+        out.f32(self.preview_impact_blend)
+        out.boolean(self.preview_impact_invert)
+        out.boolean(self.preview_shockwave_active)
+        out.f32(self.preview_shockwave_radius)
         out.end()
 
     def deserialize(mut self, mut input: BlobReader) raises:
-        _ = input.enter(fourcc("FSTD"), 1)
+        var ver = input.enter(fourcc("FSTD"), 2)
         self.selected_entity_id = input.integer()
         self.sim_tick = input.integer()
         self.gravity = input.vec3()
@@ -638,6 +729,16 @@ struct FlintStudioState(Movable, Serializable):
             var nd = StudioEntityNode()
             nd.deserialize(input)
             loaded.append(nd^)
+        if ver >= 2:
+            self.stepped_clock.raw_time_sec = input.f32()
+            self.stepped_clock.stepped_time_sec = input.f32()
+            self.stepped_clock.step_hz = input.f32()
+            self.stepped_clock.hitstop_remaining_sec = input.f32()
+            self.stepped_clock.pose_changed_this_tick = input.boolean()
+            self.preview_impact_blend = input.f32()
+            self.preview_impact_invert = input.boolean()
+            self.preview_shockwave_active = input.boolean()
+            self.preview_shockwave_radius = input.f32()
         input.leave()
         self.entities = loaded^
         while len(self.entity_bvh_slot) < len(self.entities):
@@ -794,6 +895,70 @@ struct FlintStudioState(Movable, Serializable):
         nd.rotation = rotation.normalized()
         nd.scale = scale
         return self.commit_node_edit(entity_id, nd^, "Transform", coalesce_key)
+
+    def patch_entity_field(
+        mut self,
+        entity_id: Int,
+        field_name: String,
+        new_val: InspectedField,
+        coalesce_key: UInt64 = 0,
+    ) -> Bool:
+        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+            return False
+        var nd = self.entities[entity_id].copy()
+        var vis = FieldVisitor.for_patch(field_name, new_val)
+        nd.inspect_fields(vis)
+        if not vis.mutated:
+            return False
+        return self.commit_node_edit(entity_id, nd^, "Patch " + field_name, coalesce_key)
+
+    def configure_entity_npr_cel(
+        mut self,
+        entity_id: Int,
+        cel_shadow_tint: Vec3 = Vec3(0.55, 0.38, 0.44),
+        cel_outline_width_px: Float32 = 2.0,
+        cel_outline_color: Vec3 = Vec3(0.015, 0.012, 0.018),
+        cel_rim_color: Vec3 = Vec3(0.45, 0.52, 0.68),
+        cel_hair_halo: Float32 = 0.0,
+        anim_step_hz: Float32 = 0.0,
+        smear_stretch: Float32 = 1.0,
+        coalesce_key: UInt64 = 0,
+    ) -> Bool:
+        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+            return False
+        var nd = self.entities[entity_id].copy()
+        nd.shading_mode = SHADING_NPR_CEL
+        nd.cel_shadow_tint = cel_shadow_tint
+        nd.cel_outline_width_px = max(Float32(0.0), min(Float32(24.0), cel_outline_width_px))
+        nd.cel_outline_color = cel_outline_color
+        nd.cel_rim_color = cel_rim_color
+        nd.cel_hair_halo = max(Float32(0.0), cel_hair_halo)
+        nd.anim_step_hz = max(Float32(0.0), anim_step_hz)
+        nd.smear_stretch = max(Float32(0.55), min(Float32(3.2), smear_stretch))
+        return self.commit_node_edit(entity_id, nd^, "Configure NPR Cel", coalesce_key)
+
+    def configure_entity_stylized_vfx(
+        mut self,
+        entity_id: Int,
+        vfx_erosion: Float32 = 0.35,
+        vfx_scroll_speed: Float32 = 3.2,
+        vfx_core_color: Vec3 = Vec3(8.5, 6.2, 2.2),
+        vfx_edge_color: Vec3 = Vec3(4.2, 0.30, 0.04),
+        anim_step_hz: Float32 = 0.0,
+        smear_stretch: Float32 = 1.0,
+        coalesce_key: UInt64 = 0,
+    ) -> Bool:
+        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+            return False
+        var nd = self.entities[entity_id].copy()
+        nd.shading_mode = SHADING_STYLIZED_VFX
+        nd.vfx_erosion = max(Float32(0.0), min(Float32(1.0), vfx_erosion))
+        nd.vfx_scroll_speed = vfx_scroll_speed
+        nd.vfx_core_color = vfx_core_color
+        nd.vfx_edge_color = vfx_edge_color
+        nd.anim_step_hz = max(Float32(0.0), anim_step_hz)
+        nd.smear_stretch = max(Float32(0.55), min(Float32(3.2), smear_stretch))
+        return self.commit_node_edit(entity_id, nd^, "Configure Stylized VFX", coalesce_key)
 
     def attach_static_bvh_collider(mut self, entity_id: Int, var bvh: Bvh8MeshCollider):
         if entity_id < 0 or entity_id >= len(self.entities):
@@ -966,7 +1131,16 @@ struct FlintStudioState(Movable, Serializable):
             if not self.pie_play():
                 return 0
             self.pie.mode = PIE_PAUSED
+        if (
+            self.selected_entity_id >= 0
+            and self.selected_entity_id < len(self.entities)
+            and self.entities[self.selected_entity_id].alive
+            and self.entities[self.selected_entity_id].anim_step_hz > Float32(0.0)
+        ):
+            self.stepped_clock.step_hz = self.entities[self.selected_entity_id].anim_step_hz
         var done = self.step_physics_deterministic(ticks, dt)
+        for _ in range(done):
+            _ = self.stepped_clock.advance(dt)
         self.pie.ticks_simulated += done
         return done
 
@@ -1439,8 +1613,32 @@ def emit_studio_ui_draw_list(
             var cur = studio.entities[eid].copy()
             var changed = False
 
+            var shd_lbl = (
+                "NPR Cel"
+                if cur.shading_mode == SHADING_NPR_CEL
+                else ("Stylized VFX" if cur.shading_mode == SHADING_STYLIZED_VFX else "PBR")
+            )
             studio.ui_ctx.label("Entity #" + String(eid) + ": " + cur.name, studio.ui_ctx.theme.accent)
-            studio.ui_ctx.label("Reflected Fields: " + String(len(vis.fields)), studio.ui_ctx.theme.text_muted)
+            studio.ui_ctx.label(
+                "Shading: " + shd_lbl + "  |  Reflected Fields: " + String(len(vis.fields)),
+                studio.ui_ctx.theme.accent if cur.shading_mode != SHADING_PBR else studio.ui_ctx.theme.text_muted,
+            )
+            if (
+                cur.shading_mode != SHADING_PBR
+                or cur.anim_step_hz > Float32(0.0)
+                or studio.stepped_clock.hitstop_remaining_sec > Float32(0.0)
+            ):
+                var eff_hz = cur.anim_step_hz if cur.anim_step_hz > Float32(0.0) else studio.stepped_clock.step_hz
+                studio.ui_ctx.label(
+                    "SteppedClock: "
+                    + _fmt_f32_2dp(studio.stepped_clock.stepped_time_sec)
+                    + "s @ "
+                    + _fmt_f32_2dp(eff_hz)
+                    + " Hz | Hitstop "
+                    + _fmt_f32_2dp(studio.stepped_clock.hitstop_remaining_sec)
+                    + "s",
+                    studio.ui_ctx.theme.accent,
+                )
 
             if studio.ui_ctx.tree_node("insp_trs", "Transform", default_open=True):
                 var tr_w = max(Float32(160.0), panel_w - Float32(20.0))
@@ -1461,6 +1659,38 @@ def emit_studio_ui_draw_list(
                 if studio.ui_ctx.slider_float("phy_mass", "Mass", cur.mass, Float32(0.0), Float32(100.0), w=mat_w):
                     changed = True
                 if studio.ui_ctx.checkbox("ent_vis", "Visible", cur.visible):
+                    changed = True
+                studio.ui_ctx.tree_pop()
+
+            var npr_open = cur.shading_mode != SHADING_PBR or cur.anim_step_hz > Float32(0.0)
+            if studio.ui_ctx.tree_node("insp_npr", "NPR Cel / Stylized VFX & Timeline", default_open=npr_open):
+                var npr_w = max(Float32(160.0), panel_w - Float32(20.0))
+                studio.ui_ctx.begin_box("npr_mode_row", FlexStyle.row(gap=4.0, pad=0.0))
+                if studio.ui_ctx.button("shd_pbr", "PBR", 58.0, 20.0):
+                    cur.shading_mode = SHADING_PBR
+                    changed = True
+                if studio.ui_ctx.button("shd_cel", "NPR Cel", 74.0, 20.0):
+                    cur.shading_mode = SHADING_NPR_CEL
+                    changed = True
+                if studio.ui_ctx.button("shd_vfx", "Stylized VFX", 94.0, 20.0):
+                    cur.shading_mode = SHADING_STYLIZED_VFX
+                    changed = True
+                studio.ui_ctx.end_box()
+                if cur.shading_mode == SHADING_NPR_CEL:
+                    if studio.ui_ctx.slider_float("cel_out_w", "Outline px", cur.cel_outline_width_px, Float32(0.0), Float32(8.0), w=npr_w):
+                        changed = True
+                    if studio.ui_ctx.slider_float("cel_halo", "Hair Halo", cur.cel_hair_halo, Float32(0.0), Float32(1.5), w=npr_w):
+                        changed = True
+                    if studio.ui_ctx.drag_float3("cel_shd", "SSS Tint", cur.cel_shadow_tint, speed=0.01, min_val=0.0, max_val=1.5, w=npr_w):
+                        changed = True
+                elif cur.shading_mode == SHADING_STYLIZED_VFX:
+                    if studio.ui_ctx.slider_float("vfx_ero", "Erosion", cur.vfx_erosion, Float32(0.0), Float32(1.0), w=npr_w):
+                        changed = True
+                    if studio.ui_ctx.slider_float("vfx_scr", "Scroll", cur.vfx_scroll_speed, Float32(0.0), Float32(12.0), w=npr_w):
+                        changed = True
+                if studio.ui_ctx.slider_float("anm_hz", "Step Hz", cur.anim_step_hz, Float32(0.0), Float32(30.0), w=npr_w):
+                    changed = True
+                if studio.ui_ctx.slider_float("anm_smr", "Smear X", cur.smear_stretch, Float32(0.55), Float32(3.2), w=npr_w):
                     changed = True
                 studio.ui_ctx.tree_pop()
 

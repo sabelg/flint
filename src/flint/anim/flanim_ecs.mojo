@@ -15,7 +15,7 @@ Implements:
    and re-rooting settled poses with `0.0 mm` world pelvis snap via `Inertializer`.
 """
 from std.collections import List
-from std.math import abs, min, max
+from std.math import abs, floor, max, min, sqrt
 from flint.core.math import Vec3
 from flint.core.transform import Quat, Mat4, trs
 from flint.core.serial import BlobWriter, BlobReader, fourcc
@@ -884,3 +884,74 @@ struct RagdollStateMachine(Copyable, Movable):
                 self.scratch_ahead.assign(anim_pose)
                 self.inertial.apply(self.scratch_pose, self.scratch_ahead, True, self.getup_halflife, max(Float32(0.001), dt))
             self.state = RAGDOLL_SM_ANIMATED
+
+
+# =========================================================================
+# 5. Stepped Limited-Animation Timing (`12/20/24 Hz`) & Smear-Pose Helpers
+# =========================================================================
+
+@always_inline
+def quantize_stepped_anim_time(time_sec: Float32, step_hz: Float32) -> Float32:
+    """Snaps continuous `time_sec` onto discrete limited-animation keyframes (`step_hz > 0`, e.g. `12.0` or `24.0` Hz)
+    so character poses hold crisp anime key drawings while cameras & VFX continue running at smooth 60–240 Hz!
+    When `step_hz <= 0.0`, returns `time_sec` unquantized."""
+    if step_hz <= Float32(0.0):
+        return time_sec
+    return floor(max(Float32(0.0), time_sec) * step_hz + Float32(1e-5)) / step_hz
+
+
+struct SteppedAnimClock(Copyable, ImplicitlyCopyable, Movable):
+    """Frame-accurate anime limited-animation clock with hitstop freeze frames and `step_hz` quantization."""
+    var raw_time_sec: Float32
+    var stepped_time_sec: Float32
+    var step_hz: Float32
+    var hitstop_remaining_sec: Float32
+    var pose_changed_this_tick: Bool
+
+    def __init__(out self, step_hz: Float32 = 20.0):
+        self.raw_time_sec = Float32(0.0)
+        self.stepped_time_sec = Float32(0.0)
+        self.step_hz = max(Float32(0.0), step_hz)
+        self.hitstop_remaining_sec = Float32(0.0)
+        self.pose_changed_this_tick = True
+
+    def trigger_hitstop(mut self, duration_sec: Float32):
+        if duration_sec > self.hitstop_remaining_sec:
+            self.hitstop_remaining_sec = duration_sec
+
+    def advance(mut self, dt_sec: Float32) -> Float32:
+        var dt = max(Float32(0.0), dt_sec)
+        if self.hitstop_remaining_sec > Float32(0.0):
+            self.hitstop_remaining_sec = max(Float32(0.0), self.hitstop_remaining_sec - dt)
+            self.pose_changed_this_tick = False
+            return self.stepped_time_sec
+
+        self.raw_time_sec += dt
+        var next_stepped = quantize_stepped_anim_time(self.raw_time_sec, self.step_hz)
+        self.pose_changed_this_tick = abs(next_stepped - self.stepped_time_sec) > Float32(1e-5)
+        self.stepped_time_sec = next_stepped
+        return self.stepped_time_sec
+
+
+def sample_pose_stepped(
+    model: NativeModel,
+    clip_index: Int,
+    time_sec: Float32,
+    step_hz: Float32,
+    mut out_pose: Pose,
+):
+    """Samples `clip_index` at quantized limited-animation keyframe time `quantize_stepped_anim_time(time_sec, step_hz)`."""
+    var q_time = quantize_stepped_anim_time(time_sec, step_hz)
+    sample_pose(model, clip_index, q_time, out_pose)
+
+
+def compute_volume_preserving_smear_scale(
+    stretch_x: Float32,
+    min_squash: Float32 = 0.55,
+    max_stretch: Float32 = 3.2,
+) -> Vec3:
+    """Computes volume-preserving `(sx, 1/sqrt(sx), 1/sqrt(sx))` stretch/squash along a bone's primary axis."""
+    var sx = max(min_squash, min(max_stretch, stretch_x))
+    var inv_perp = max(min_squash, Float32(1.0) / sqrt(max(Float32(0.05), sx)))
+    return Vec3(sx, inv_perp, inv_perp)
+

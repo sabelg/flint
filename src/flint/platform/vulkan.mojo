@@ -269,6 +269,7 @@ comptime LOAD_OP_CLEAR: UInt32 = 1
 comptime STORE_OP_STORE: UInt32 = 0
 comptime TOPOLOGY_TRIANGLE_LIST: UInt32 = 3
 comptime CULL_MODE_NONE: UInt32 = 0
+comptime CULL_MODE_FRONT: UInt32 = 1
 comptime CULL_MODE_BACK: UInt32 = 2
 comptime FRONT_FACE_CCW: UInt32 = 0
 comptime FRONT_FACE_CW: UInt32 = 1

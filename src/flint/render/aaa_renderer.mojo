@@ -47,6 +47,7 @@ from flint.platform.vulkan import (
     COMPARE_GREATER_OR_EQUAL,
     COMPARE_LESS_OR_EQUAL,
     CULL_MODE_NONE,
+    CULL_MODE_FRONT,
     CULL_MODE_BACK,
     FRONT_FACE_CW,
     FRONT_FACE_CCW,
@@ -127,7 +128,6 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_VSM_TEX,
     make_reverse_z_perspective,
     meshlet_cull_shader,
-    visbuffer_alphamask_fragment_shader,
     visbuffer_alphamask_vertex_shader,
     visbuffer_fragment_shader,
     visbuffer_vertex_shader,
@@ -204,9 +204,17 @@ from flint.render.aaa_skinning_rt import (
     AAA_SKIN_BIND_VERTS_BASE,
     AAA_SKIN_BUFFER_WORDS,
     AAA_SKIN_CUR_BONES_BASE,
+    AAA_SKIN_CUR_MORPH_WEIGHTS_BASE,
+    AAA_SKIN_CUR_SMEAR_BASE,
+    AAA_SKIN_MAX_MORPH_DELTAS,
+    AAA_SKIN_MAX_MORPH_SLOTS,
     AAA_SKIN_MAX_VERTS,
+    AAA_SKIN_MORPH_DELTAS_BASE,
     AAA_SKIN_PREV_BONES_BASE,
+    AAA_SKIN_PREV_MORPH_WEIGHTS_BASE,
     AAA_SKIN_PREV_POS_BASE,
+    AAA_SKIN_PREV_SMEAR_BASE,
+    BoneSmear,
     DualQuat,
     FlintAaaSkinningArena,
     aaa_dq_skinning_shader,
@@ -265,6 +273,34 @@ from flint.render.aaa_glass import (
     AAA_MAX_GLASS_MATERIALS,
     AaaGlassParams,
     aaa_glass_refract_shader,
+)
+from flint.render.aaa_npr_cel import (
+    AAA_CEL_ENTRY_WORDS,
+    AAA_CEL_NO_OUTLINE_MAT,
+    AAA_GLOBALS_CEL_COUNT_WORD,
+    AAA_GLOBALS_CEL_TABLE_WORD,
+    AAA_MAX_CEL_MATERIALS,
+    AaaCelParams,
+    aaa_npr_cel_shade_shader,
+    npr_outline_fragment_shader,
+    npr_outline_vertex_shader,
+)
+from flint.render.aaa_npr_vfx import (
+    AAA_GLOBALS_IMPACT_FRAME_WORD,
+    AAA_GLOBALS_IMPACT_PAPER_GAIN_WORD,
+    AAA_GLOBALS_SHOCKWAVE_COUNT_WORD,
+    AAA_GLOBALS_SHOCKWAVE_TABLE_WORD,
+    AAA_GLOBALS_VFX_COUNT_WORD,
+    AAA_GLOBALS_VFX_TABLE_WORD,
+    AAA_MAX_SHOCKWAVES,
+    AAA_MAX_VFX_MATERIALS,
+    AAA_SHOCKWAVE_WORDS,
+    AAA_VFX_ENTRY_WORDS,
+    AaaImpactFrameParams,
+    AaaShockwaveRing,
+    AaaStylizedVfxParams,
+    aaa_npr_post_fx_shader,
+    visbuffer_alphamask_vfx_fragment_shader,
 )
 from flint.render.aaa_rt_shadow import (
     rt_shadow_filtered_offset,
@@ -393,6 +429,9 @@ struct AaaSkinnedMeshEntry(Copyable, Movable):
     var vertex_count: Int
     var bone_count: Int
     var bone_palette_offset: Int
+    var morph_count: Int
+    var morph_weight_first_slot: Int
+    var morph_delta_first_slot: Int
 
     def __init__(out self):
         self.mesh_entry = CookedMeshEntry()
@@ -400,6 +439,9 @@ struct AaaSkinnedMeshEntry(Copyable, Movable):
         self.vertex_count = 0
         self.bone_count = 0
         self.bone_palette_offset = 0
+        self.morph_count = 0
+        self.morph_weight_first_slot = 0
+        self.morph_delta_first_slot = 0
 
 
 struct AaaUploadedModel(Movable):
@@ -451,6 +493,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var ring_as_instances: List[GpuBuffer]
     var ring_indirect: List[GpuBuffer]
     var ring_alphamask_indirect: List[GpuBuffer]
+    var ring_outline_indirect: List[GpuBuffer]
     var ring_clusters: List[GpuBuffer]
     var ring_tlas: List[VulkanAccelStruct]
     var ring_tlas_cap: List[Int]  # instance capacity each slot's TLAS + shared scratch were sized for
@@ -532,6 +575,9 @@ struct FlintAaaVulkanRenderer(Movable):
     var pipe_tsr_v3_resolve: Int
     var pipe_motion_blur: Int
     var pipe_display_tonemap: Int
+    var pipe_npr_outline_gfx: Int
+    var pipe_npr_cel_shade: Int
+    var pipe_npr_post_fx: Int
 
     # Samplers & Images
     var samp_aniso16: Int
@@ -572,6 +618,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var buf_ldr_readback: GpuBuffer
     var buf_indirect_phase2: GpuBuffer
     var buf_alphamask_indirect: GpuBuffer
+    var buf_outline_indirect: GpuBuffer
     var buf_occluded_candidates: GpuBuffer
     var pending_skin_updates: List[AaaSkinnedMeshEntry]
 
@@ -579,6 +626,10 @@ struct FlintAaaVulkanRenderer(Movable):
     var geom: AaaGeometryPool
     var materials: List[AaaMaterial]
     var glass_materials: List[AaaGlassParams]  # optics of the transparent materials (`aaa_glass.mojo`)
+    var cel_materials: List[AaaCelParams]
+    var vfx_materials: List[AaaStylizedVfxParams]
+    var frame_shockwaves: List[AaaShockwaveRing]
+    var impact_frame: AaaImpactFrameParams
     var frame_instances: List[AaaDrawInstance]
     var frame_plumes: List[AaaVolumetricPlume]
     var frame_particle_emitters: List[AaaParticleEmitter]
@@ -593,6 +644,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var mesh_alpha_masked_flags: List[Bool]
     var skin_bind_cursor: Int
     var skin_bone_cursor: Int
+    var skin_morph_weight_cursor: Int
+    var skin_morph_delta_cursor: Int
     var skin_arena: FlintAaaSkinningArena
     var enable_aerial_perspective: Bool
     var aerial_sigma_ext: Vec3
@@ -752,6 +805,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_tsr_v3_resolve = 0
         self.pipe_motion_blur = 0
         self.pipe_display_tonemap = 0
+        self.pipe_npr_outline_gfx = 0
+        self.pipe_npr_cel_shade = 0
+        self.pipe_npr_post_fx = 0
 
         self.samp_aniso16 = 0
         self.samp_linear_clamp = 0
@@ -782,6 +838,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_staging = GpuBuffer()
         self.buf_indirect_phase2 = GpuBuffer()
         self.buf_alphamask_indirect = GpuBuffer()
+        self.buf_outline_indirect = GpuBuffer()
         self.buf_occluded_candidates = GpuBuffer()
 
         self.ring_globals = List[GpuBuffer]()
@@ -789,6 +846,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.ring_as_instances = List[GpuBuffer]()
         self.ring_indirect = List[GpuBuffer]()
         self.ring_alphamask_indirect = List[GpuBuffer]()
+        self.ring_outline_indirect = List[GpuBuffer]()
         self.ring_clusters = List[GpuBuffer]()
         self.ring_tlas = List[VulkanAccelStruct]()
         self.ring_tlas_cap = List[Int]()
@@ -849,6 +907,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.mesh_alpha_masked_flags = List[Bool]()
         self.skin_bind_cursor = 0
         self.skin_bone_cursor = 0
+        self.skin_morph_weight_cursor = 0
+        self.skin_morph_delta_cursor = 0
         self.skin_arena = FlintAaaSkinningArena()
         self.enable_aerial_perspective = False
         self.aerial_sigma_ext = Vec3()
@@ -880,6 +940,10 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sun_angular_radius = Float32(0.0035)
         self.sun_shadow_softness = Float32(0.005)
         self.glass_materials = List[AaaGlassParams]()
+        self.cel_materials = List[AaaCelParams]()
+        self.vfx_materials = List[AaaStylizedVfxParams]()
+        self.frame_shockwaves = List[AaaShockwaveRing]()
+        self.impact_frame = AaaImpactFrameParams()
         self.vsm_scene_center = Vec3(0.0, 0.0, 0.0)
         self.vsm_ortho_half_extent = Float32(16.0)
         self.ibl_intensity = Float32(1.0)
@@ -1074,7 +1138,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_visbuffer_alphamask_gfx = self.vk.create_graphics_pipeline(
             self.pipe_layout,
             visbuffer_alphamask_vertex_shader(),
-            visbuffer_alphamask_fragment_shader(),
+            visbuffer_alphamask_vfx_fragment_shader(),
             has_color=True,
             color_format=FORMAT_R32G32_UINT,
             depth_format=FORMAT_D32_SFLOAT,
@@ -1082,6 +1146,19 @@ struct FlintAaaVulkanRenderer(Movable):
             depth_write=True,
             depth_compare=COMPARE_GREATER_OR_EQUAL,
             cull_mode=CULL_MODE_NONE,
+            front_face=FRONT_FACE_CW,
+        )
+        self.pipe_npr_outline_gfx = self.vk.create_graphics_pipeline(
+            self.pipe_layout,
+            npr_outline_vertex_shader(),
+            npr_outline_fragment_shader(),
+            has_color=True,
+            color_format=FORMAT_R32G32_UINT,
+            depth_format=FORMAT_D32_SFLOAT,
+            depth_test=True,
+            depth_write=True,
+            depth_compare=COMPARE_GREATER_OR_EQUAL,
+            cull_mode=CULL_MODE_FRONT,
             front_face=FRONT_FACE_CW,
         )
         self.pipe_vsm_mark = self.vk.create_aaa_compute_pipeline(self.pipe_layout, vsm_mark_pages_shader())
@@ -1154,6 +1231,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_tsr_v3_resolve = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_tsr_v3_resolve_shader())
         self.pipe_motion_blur = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_motion_blur_shader())
         self.pipe_display_tonemap = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_display_tonemap_shader())
+        self.pipe_npr_cel_shade = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_cel_shade_shader())
+        self.pipe_npr_post_fx = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_post_fx_shader())
         self.pipe_ui_overlay = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_ui_overlay_shader())
         self.pipe_scrgb_pack = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_pack_scrgb_rgba16f_shader())
 
@@ -1161,6 +1240,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.pipe_meshlet_cull == 0
             or self.pipe_visbuffer_gfx == 0
             or self.pipe_visbuffer_alphamask_gfx == 0
+            or self.pipe_npr_outline_gfx == 0
             or self.pipe_vsm_mark == 0
             or self.pipe_vsm_gfx == 0
             or self.pipe_vsm_alphamask_gfx == 0
@@ -1189,6 +1269,8 @@ struct FlintAaaVulkanRenderer(Movable):
             or self.pipe_tsr_v3_resolve == 0
             or self.pipe_motion_blur == 0
             or self.pipe_display_tonemap == 0
+            or self.pipe_npr_cel_shade == 0
+            or self.pipe_npr_post_fx == 0
             or self.pipe_ui_overlay == 0
             or self.pipe_scrgb_pack == 0
         ):
@@ -1271,16 +1353,19 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Ring-Buffered CPU-to-GPU Dynamic Buffers (Feature 14: FRAMES_IN_FLIGHT = 2)
         for _ in range(FRAMES_IN_FLIGHT):
-            var b_glob = self.vk.create_buffer(4096, local=True)
+            var b_glob = self.vk.create_buffer(16384, local=True)
+            _ = external_call["memset", Int](b_glob.cpu_address, Int32(0), b_glob.size)
             var b_inst = self.vk.create_buffer(self.max_instances * AAA_INSTANCE_WORDS * 4, local=True)
             var b_ind = self.vk.create_buffer(64 + self.max_draws * 20, local=True)
             var b_am_ind = self.vk.create_buffer(64 + 16384 * 20, local=True)
+            var b_out_ind = self.vk.create_buffer(64 + 16384 * 20, local=True)
             var b_clust = self.vk.create_buffer(AAA_CLUSTER_BUFFER_WORDS * 4, local=True)
             _ = external_call["memset", Int](b_clust.cpu_address, Int32(0), b_clust.size)
             self.ring_globals.append(b_glob^)
             self.ring_instances.append(b_inst^)
             self.ring_indirect.append(b_ind^)
             self.ring_alphamask_indirect.append(b_am_ind^)
+            self.ring_outline_indirect.append(b_out_ind^)
             self.ring_clusters.append(b_clust^)
             if self.vk.has_ray_query:
                 var b_as = self.vk.create_buffer_bda(self.max_instances * 64, extra_usage=bda_flags, host_visible=True)
@@ -1295,6 +1380,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_instances = self.ring_instances[0].copy()
         self.buf_indirect = self.ring_indirect[0].copy()
         self.buf_alphamask_indirect = self.ring_alphamask_indirect[0].copy()
+        self.buf_outline_indirect = self.ring_outline_indirect[0].copy()
         self.buf_clusters = self.ring_clusters[0].copy()
         if self.vk.has_ray_query and len(self.ring_as_instances) > 0:
             self.buf_as_instances = self.ring_as_instances[0].copy()
@@ -1709,6 +1795,99 @@ struct FlintAaaVulkanRenderer(Movable):
             if g.material_id == mat_id:
                 return True
         return False
+
+    def add_cel_material(mut self, mat: AaaMaterial, cel: AaaCelParams) -> Int:
+        """Registers an `AaaMaterial` paired with `AaaCelParams` (`ILM`, `SSS`, `Inner-Ink`, `Hair-Halo`, `Rim`,
+        and automatic hardware `CULL_MODE_FRONT` clip-space outline material allocation when `outline_width_px > 0`)."""
+        if len(self.cel_materials) >= AAA_MAX_CEL_MATERIALS:
+            return -1
+        var id = self.add_material(mat)
+        if id < 0:
+            return -1
+        var c = cel.copy()
+        c.material_id = id
+        if c.outline_width_px > Float32(0.001):
+            var out_mat = AaaMaterial(
+                base_color=c.outline_color,
+                roughness=1.0,
+                metallic=0.0,
+            )
+            out_mat.specular_factor = Float32(0.0)
+            var out_id = self.add_material(out_mat)
+            c.outline_material_id = out_id if out_id >= 0 else AAA_CEL_NO_OUTLINE_MAT
+        else:
+            c.outline_material_id = AAA_CEL_NO_OUTLINE_MAT
+        self.cel_materials.append(c^)
+        return id
+
+    def update_cel_material(mut self, mat_id: Int, cel: AaaCelParams) -> Bool:
+        """Updates an existing `AaaCelParams` entry in-place (preserving or allocating its `outline_material_id`)."""
+        for i in range(len(self.cel_materials)):
+            if self.cel_materials[i].material_id == mat_id:
+                var c = cel.copy()
+                c.material_id = mat_id
+                var prev_out = self.cel_materials[i].outline_material_id
+                if c.outline_width_px > Float32(0.001):
+                    if prev_out >= 0 and prev_out < AAA_CEL_NO_OUTLINE_MAT:
+                        var om = self.materials[prev_out].copy()
+                        om.base_color = c.outline_color
+                        self.update_material(prev_out, om)
+                        c.outline_material_id = prev_out
+                    else:
+                        var om = AaaMaterial(base_color=c.outline_color, roughness=1.0, metallic=0.0)
+                        om.specular_factor = Float32(0.0)
+                        var out_id = self.add_material(om)
+                        c.outline_material_id = out_id if out_id >= 0 else AAA_CEL_NO_OUTLINE_MAT
+                else:
+                    c.outline_material_id = AAA_CEL_NO_OUTLINE_MAT
+                self.cel_materials[i] = c^
+                return True
+        return False
+
+    def is_cel_outlined_material(self, mat_id: Int) -> Bool:
+        for i in range(len(self.cel_materials)):
+            ref c = self.cel_materials[i]
+            if c.material_id == mat_id and c.outline_width_px > Float32(0.001) and c.outline_material_id < AAA_CEL_NO_OUTLINE_MAT:
+                return True
+        return False
+
+    def add_vfx_material(mut self, mat: AaaMaterial, vfx: AaaStylizedVfxParams) -> Int:
+        """Registers an eroding, UV-scrolling 3D anime VFX material (`AaaStylizedVfxParams`).
+        Automatically enables Bucket-2 hardware alpha-cutout (`alpha_cutoff = 0.48`) so eroded holes
+        cut out geometry silhouettes cleanly in `VisBuffer`!"""
+        if len(self.vfx_materials) >= AAA_MAX_VFX_MATERIALS:
+            return -1
+        var m = mat.copy()
+        if m.alpha_cutoff <= Float32(0.001):
+            m.alpha_cutoff = Float32(0.48)
+        var id = self.add_material(m)
+        if id < 0:
+            return -1
+        var v = vfx.copy()
+        v.material_id = id
+        self.vfx_materials.append(v^)
+        return id
+
+    def update_vfx_material(mut self, mat_id: Int, vfx: AaaStylizedVfxParams) -> Bool:
+        for i in range(len(self.vfx_materials)):
+            if self.vfx_materials[i].material_id == mat_id:
+                var v = vfx.copy()
+                v.material_id = mat_id
+                self.vfx_materials[i] = v^
+                return True
+        return False
+
+    def submit_shockwave(mut self, ring: AaaShockwaveRing):
+        """Submits a screen-space R/G/B chromatic-dispersion radial shockwave ring for this frame (`<= 4`)."""
+        if len(self.frame_shockwaves) < AAA_MAX_SHOCKWAVES:
+            self.frame_shockwaves.append(ring.copy())
+
+    def set_impact_frame(mut self, params: AaaImpactFrameParams):
+        """Configures high-contrast radial-streak anime **Manga Impact Frame** post-processing (`blend = 0` disables)."""
+        self.impact_frame = params.copy()
+
+    def clear_impact_frame(mut self):
+        self.impact_frame = AaaImpactFrameParams()
 
     def update_material(mut self, mat_id: Int, mat: AaaMaterial):
         if mat_id < 0 or mat_id >= len(self.materials):
@@ -2138,6 +2317,71 @@ struct FlintAaaVulkanRenderer(Movable):
         var pal_off = self.skin_arena.alloc_bone_palette(bone_count, bone_palette_offset)
         self.skin_bone_cursor = self.skin_arena.bone_cursor
 
+        # Initialize any unpopulated bone slots in `CUR_BONES` & `PREV_BONES` to exact identity `DualQuat(0,0,0,1, 0,0,0,0)`
+        var eff_bones_init = min(max(1, bone_count), max(0, AAA_MAX_SKIN_BONES - (pal_off // 8)))
+        for b in range(eff_bones_init):
+            var c_off = (AAA_SKIN_CUR_BONES_BASE + pal_off + b * 8) * 4
+            if (
+                get32(self.buf_skinning.cpu_address + c_off + 0) == UInt32(0)
+                and get32(self.buf_skinning.cpu_address + c_off + 4) == UInt32(0)
+                and get32(self.buf_skinning.cpu_address + c_off + 8) == UInt32(0)
+                and get32(self.buf_skinning.cpu_address + c_off + 12) == UInt32(0)
+            ):
+                put_float(self.buf_skinning.cpu_address + c_off + 12, Float32(1.0))
+            var p_off = (AAA_SKIN_PREV_BONES_BASE + pal_off + b * 8) * 4
+            if (
+                get32(self.buf_skinning.cpu_address + p_off + 0) == UInt32(0)
+                and get32(self.buf_skinning.cpu_address + p_off + 4) == UInt32(0)
+                and get32(self.buf_skinning.cpu_address + p_off + 8) == UInt32(0)
+                and get32(self.buf_skinning.cpu_address + p_off + 12) == UInt32(0)
+            ):
+                put_float(self.buf_skinning.cpu_address + p_off + 12, Float32(1.0))
+
+        var m_w_first = 0
+        var m_d_first = 0
+        var eff_morph_cnt = 0
+        var mesh_v_cnt = max(v_cnt, mesh.vertex_count())
+        if v_cnt > 0 and mesh.morph_count > 0 and len(mesh.morph_positions) >= mesh.morph_count * v_cnt * 3:
+            self.skin_arena.morph_weight_cursor = self.skin_morph_weight_cursor
+            self.skin_arena.morph_delta_cursor = self.skin_morph_delta_cursor
+            var m_alloc = self.skin_arena.alloc_morph_targets(mesh.morph_count, v_cnt)
+            m_w_first = m_alloc[0]
+            m_d_first = m_alloc[1]
+            eff_morph_cnt = m_alloc[2]
+            self.skin_morph_weight_cursor = self.skin_arena.morph_weight_cursor
+            self.skin_morph_delta_cursor = self.skin_arena.morph_delta_cursor
+
+            if eff_morph_cnt > 0:
+                _ = external_call[
+                    "memset", Int
+                ](
+                    self.buf_skinning.cpu_address + (AAA_SKIN_CUR_MORPH_WEIGHTS_BASE + m_w_first) * 4,
+                    Int32(0),
+                    eff_morph_cnt * 4,
+                )
+                _ = external_call[
+                    "memset", Int
+                ](
+                    self.buf_skinning.cpu_address + (AAA_SKIN_PREV_MORPH_WEIGHTS_BASE + m_w_first) * 4,
+                    Int32(0),
+                    eff_morph_cnt * 4,
+                )
+                var src_stride_v = mesh_v_cnt if len(mesh.morph_positions) >= mesh.morph_count * mesh_v_cnt * 3 else v_cnt
+                var has_morph_nrm = len(mesh.morph_normals) >= mesh.morph_count * src_stride_v * 3
+                for m_i in range(eff_morph_cnt):
+                    for v in range(v_cnt):
+                        var src_m3 = (m_i * src_stride_v + v) * 3
+                        var dst_dw = AAA_SKIN_MORPH_DELTAS_BASE + (m_d_first + m_i * v_cnt + v) * 6
+                        put_float(self.buf_skinning.cpu_address + (dst_dw + 0) * 4, mesh.morph_positions[src_m3 + 0])
+                        put_float(self.buf_skinning.cpu_address + (dst_dw + 1) * 4, mesh.morph_positions[src_m3 + 1])
+                        put_float(self.buf_skinning.cpu_address + (dst_dw + 2) * 4, mesh.morph_positions[src_m3 + 2])
+                        var dnx = mesh.morph_normals[src_m3 + 0] if has_morph_nrm else Float32(0.0)
+                        var dny = mesh.morph_normals[src_m3 + 1] if has_morph_nrm else Float32(0.0)
+                        var dnz = mesh.morph_normals[src_m3 + 2] if has_morph_nrm else Float32(0.0)
+                        put_float(self.buf_skinning.cpu_address + (dst_dw + 3) * 4, dnx)
+                        put_float(self.buf_skinning.cpu_address + (dst_dw + 4) * 4, dny)
+                        put_float(self.buf_skinning.cpu_address + (dst_dw + 5) * 4, dnz)
+
         var has_mesh_jw = len(mesh.joints) >= v_cnt * 4 and len(mesh.weights) >= v_cnt * 4
 
         for v in range(v_cnt):
@@ -2227,7 +2471,31 @@ struct FlintAaaVulkanRenderer(Movable):
         res.vertex_count = v_cnt
         res.bone_count = max(1, bone_count)
         res.bone_palette_offset = pal_off
+        res.morph_count = eff_morph_cnt
+        res.morph_weight_first_slot = m_w_first
+        res.morph_delta_first_slot = m_d_first
         return res^
+
+    def _enqueue_pending_skin_update(mut self, skin_entry: AaaSkinnedMeshEntry):
+        for k in range(len(self.pending_skin_updates)):
+            if (
+                self.pending_skin_updates[k].mesh_entry.mesh_id == skin_entry.mesh_entry.mesh_id
+                and self.pending_skin_updates[k].skin_bind_first_slot == skin_entry.skin_bind_first_slot
+            ):
+                self.pending_skin_updates[k] = skin_entry.copy()
+                return
+        self.pending_skin_updates.append(skin_entry.copy())
+
+    def _remove_pending_skin_update(mut self, skin_entry: AaaSkinnedMeshEntry):
+        var i = 0
+        while i < len(self.pending_skin_updates):
+            if (
+                self.pending_skin_updates[i].mesh_entry.mesh_id == skin_entry.mesh_entry.mesh_id
+                and self.pending_skin_updates[i].skin_bind_first_slot == skin_entry.skin_bind_first_slot
+            ):
+                _ = self.pending_skin_updates.pop(i)
+            else:
+                i += 1
 
     def _record_skin_dispatch_and_blas_refit(mut self, frame: Int, skin_entry: AaaSkinnedMeshEntry):
         var push_sk = List[UInt32](length=16, fill=0)
@@ -2236,6 +2504,11 @@ struct FlintAaaVulkanRenderer(Movable):
         push_sk[2] = UInt32(skin_entry.mesh_entry.first_vertex)
         push_sk[3] = UInt32(AAA_SKIN_CUR_BONES_BASE + skin_entry.bone_palette_offset)
         push_sk[4] = UInt32(AAA_SKIN_PREV_BONES_BASE + skin_entry.bone_palette_offset)
+        push_sk[5] = UInt32(AAA_SKIN_CUR_SMEAR_BASE + skin_entry.bone_palette_offset)
+        push_sk[6] = UInt32(AAA_SKIN_PREV_SMEAR_BASE + skin_entry.bone_palette_offset)
+        push_sk[7] = UInt32(max(0, skin_entry.morph_count))
+        push_sk[8] = UInt32(max(0, skin_entry.morph_weight_first_slot))
+        push_sk[9] = UInt32(max(0, skin_entry.morph_delta_first_slot))
         self.vk.dispatch_aaa(
             frame,
             self.pipe_dq_skinning,
@@ -2291,6 +2564,7 @@ struct FlintAaaVulkanRenderer(Movable):
         prev_bones: List[DualQuat],
         invalidate_vsm: Bool = False,
         defer_to_frame: Bool = False,
+        reset_smears: Bool = True,
     ) -> Float64:
         """Dispatches 4-bone GPU Dual-Quaternion compute skinning into `buf_vertices` + `buf_skinning`
         and performs a zero-allocation in-place `VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR` `BLAS` refit!
@@ -2328,13 +2602,24 @@ struct FlintAaaVulkanRenderer(Movable):
             put_float(self.buf_skinning.cpu_address + off + 24, dq.dz)
             put_float(self.buf_skinning.cpu_address + off + 28, dq.dw)
 
+        if reset_smears:
+            var n_clr = max(n_cur, n_prev)
+            if n_clr > 0:
+                _ = external_call[
+                    "memset", Int
+                ](self.buf_skinning.cpu_address + (AAA_SKIN_CUR_SMEAR_BASE + pal_off) * 4, Int32(0), n_clr * 32)
+                _ = external_call[
+                    "memset", Int
+                ](self.buf_skinning.cpu_address + (AAA_SKIN_PREV_SMEAR_BASE + pal_off) * 4, Int32(0), n_clr * 32)
+
         if invalidate_vsm:
             self.vsm.invalidate_all()
 
         if defer_to_frame:
-            self.pending_skin_updates.append(skin_entry.copy())
+            self._enqueue_pending_skin_update(skin_entry)
             return 0.0
 
+        self._remove_pending_skin_update(skin_entry)
         var t0 = get_time()
         if not self.vk.begin_commands(0):
             return 0.0
@@ -2343,6 +2628,82 @@ struct FlintAaaVulkanRenderer(Movable):
         if f != 0:
             _ = self.vk.wait(f)
         return (get_time() - t0) * 1000.0
+
+    def update_skinned_mesh_morphs(
+        mut self,
+        skin_entry: AaaSkinnedMeshEntry,
+        cur_weights: List[Float32],
+        prev_weights: List[Float32] = List[Float32](),
+    ):
+        """Uploads `BlendShape` morph-target weights (`cur_weights` and `prev_weights`, defaulting `prev_weights`
+        to `cur_weights` when empty) into `buf_skinning` and queues an inline GPU skinning + `BLAS` refit pass!"""
+        if not self.active or skin_entry.vertex_count <= 0 or skin_entry.morph_count <= 0:
+            return
+        var m_first = max(0, skin_entry.morph_weight_first_slot)
+        var max_m = min(skin_entry.morph_count, max(0, AAA_SKIN_MAX_MORPH_SLOTS - m_first))
+        if max_m <= 0:
+            return
+        var has_prev = len(prev_weights) > 0
+        for m in range(max_m):
+            var cw = cur_weights[m] if m < len(cur_weights) else Float32(0.0)
+            var pw = (prev_weights[m] if m < len(prev_weights) else Float32(0.0)) if has_prev else cw
+            put_float(self.buf_skinning.cpu_address + (AAA_SKIN_CUR_MORPH_WEIGHTS_BASE + m_first + m) * 4, cw)
+            put_float(self.buf_skinning.cpu_address + (AAA_SKIN_PREV_MORPH_WEIGHTS_BASE + m_first + m) * 4, pw)
+        self._enqueue_pending_skin_update(skin_entry)
+
+    def update_skinned_mesh_smear(
+        mut self,
+        skin_entry: AaaSkinnedMeshEntry,
+        cur_bones: List[DualQuat],
+        prev_bones: List[DualQuat],
+        cur_smears: List[BoneSmear],
+        prev_smears: List[BoneSmear] = List[BoneSmear](),
+        invalidate_vsm: Bool = False,
+        defer_to_frame: Bool = False,
+    ) -> Float64:
+        """Uploads Dual-Quaternion bones + non-uniform 3D affine `BoneSmear` stretch/squash/shear frames,
+        deforms `buf_vertices` in-place with `J^{-T}` normals, and refits the mesh's hardware `BLAS`!"""
+        if not self.active or skin_entry.vertex_count <= 0:
+            return 0.0
+        var pal_off = max(0, skin_entry.bone_palette_offset)
+        var max_avail = max(0, AAA_MAX_SKIN_BONES - (pal_off // 8))
+        var cur_sm_base = AAA_SKIN_CUR_SMEAR_BASE + pal_off
+        var prev_sm_base = AAA_SKIN_PREV_SMEAR_BASE + pal_off
+        var n_clear = min(max_avail, max(len(cur_bones), max(len(cur_smears), len(prev_smears))))
+        if n_clear > 0:
+            _ = external_call["memset", Int](self.buf_skinning.cpu_address + cur_sm_base * 4, Int32(0), n_clear * 32)
+            _ = external_call["memset", Int](self.buf_skinning.cpu_address + prev_sm_base * 4, Int32(0), n_clear * 32)
+
+        var n_cs = min(max_avail, len(cur_smears))
+        for b in range(n_cs):
+            var sm = cur_smears[b]
+            var off = (cur_sm_base + b * 8) * 4
+            put_float(self.buf_skinning.cpu_address + off + 0, sm.scale.x - Float32(1.0))
+            put_float(self.buf_skinning.cpu_address + off + 4, sm.scale.y - Float32(1.0))
+            put_float(self.buf_skinning.cpu_address + off + 8, sm.scale.z - Float32(1.0))
+            put_float(self.buf_skinning.cpu_address + off + 12, sm.shear_xy)
+            put_float(self.buf_skinning.cpu_address + off + 16, sm.pivot_bind.x)
+            put_float(self.buf_skinning.cpu_address + off + 20, sm.pivot_bind.y)
+            put_float(self.buf_skinning.cpu_address + off + 24, sm.pivot_bind.z)
+            put_float(self.buf_skinning.cpu_address + off + 28, sm.shear_xz)
+
+        var has_ps = len(prev_smears) > 0
+        var n_ps = min(max_avail, len(prev_smears) if has_ps else len(cur_smears))
+        for b in range(n_ps):
+            var sm = prev_smears[b] if has_ps else cur_smears[b]
+            var off = (prev_sm_base + b * 8) * 4
+            put_float(self.buf_skinning.cpu_address + off + 0, sm.scale.x - Float32(1.0))
+            put_float(self.buf_skinning.cpu_address + off + 4, sm.scale.y - Float32(1.0))
+            put_float(self.buf_skinning.cpu_address + off + 8, sm.scale.z - Float32(1.0))
+            put_float(self.buf_skinning.cpu_address + off + 12, sm.shear_xy)
+            put_float(self.buf_skinning.cpu_address + off + 16, sm.pivot_bind.x)
+            put_float(self.buf_skinning.cpu_address + off + 20, sm.pivot_bind.y)
+            put_float(self.buf_skinning.cpu_address + off + 24, sm.pivot_bind.z)
+            put_float(self.buf_skinning.cpu_address + off + 28, sm.shear_xz)
+
+        return self.update_skinned_mesh_bones(
+            skin_entry, cur_bones, prev_bones, invalidate_vsm=invalidate_vsm, defer_to_frame=defer_to_frame, reset_smears=False
+        )
 
     def set_bruneton_atmosphere(
         mut self,
@@ -2635,6 +2996,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_instances = self.ring_instances[cur_slot].copy()
         self.buf_indirect = self.ring_indirect[cur_slot].copy()
         self.buf_alphamask_indirect = self.ring_alphamask_indirect[cur_slot].copy()
+        self.buf_outline_indirect = self.ring_outline_indirect[cur_slot].copy()
         self.buf_clusters = self.ring_clusters[cur_slot].copy()
         self.desc_set = self.desc_sets[cur_slot]
         if self.vk.has_ray_query and len(self.ring_as_instances) > cur_slot:
@@ -2662,6 +3024,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.frame_plumes.clear()
         self.frame_particle_emitters.clear()
         self.frame_cluster_lights.clear()
+        self.frame_shockwaves.clear()
         self.ui_draw_list.clear()
 
     def begin_frame(mut self, slot: Int):
@@ -2743,6 +3106,72 @@ struct FlintAaaVulkanRenderer(Movable):
                 continue
 
             # QEM LOD selection matching GPU meshlet culler
+            var lod_idx = 0
+            if me.lod_count > 1 and vz > Float32(1.0):
+                var px_per_unit = f_h / (Float32(2.0) * vz * max(Float32(0.05), tan_y))
+                for l_cand in range(1, me.lod_count):
+                    if me.lods[l_cand].object_error * di.uniform_scale * px_per_unit <= self.max_lod_error_px:
+                        lod_idx = l_cand
+            var sl = me.lods[lod_idx]
+            var first_ml = sl.first_meshlet if sl.meshlet_count > 0 else me.first_meshlet
+            var ml_cnt = sl.meshlet_count if sl.meshlet_count > 0 else me.lod0_meshlet_count
+
+            for m_loc in range(ml_cnt):
+                if cmd_cnt >= 16384:
+                    break
+                var ml_id = first_ml + m_loc
+                ref ml = self.geom.meshlets[ml_id]
+                var dst = base_ptr + 16 + cmd_cnt * 20
+                put32(dst + 0, UInt32(ml.tri_count * 3))
+                put32(dst + 4, UInt32(1))
+                put32(dst + 8, UInt32(ml.first_tri * 3))
+                put32(dst + 12, UInt32(0))
+                put32(dst + 16, UInt32((i_idx << 17) | (ml_id & 0x1FFFF)))
+                cmd_cnt += 1
+
+        put32(base_ptr, UInt32(cmd_cnt))
+        return cmd_cnt
+
+    def _pack_outline_visbuffer_commands(mut self, n_inst: Int, tan_x: Float32, tan_y: Float32) -> Int:
+        """Packs frustum-visible cel-outlined meshlets (`VkDrawIndexedIndirectCommand`, stride 20) into
+        `buf_outline_indirect` for `pipe_npr_outline_gfx` (`CULL_MODE_FRONT`). Zero overhead when `len(cel_materials) == 0`!"""
+        if len(self.cel_materials) == 0 or n_inst <= 0:
+            return 0
+        var base_ptr = self.buf_outline_indirect.cpu_address
+        if base_ptr == 0:
+            return 0
+        var cmd_cnt = 0
+        var sec_x = sqrt(Float32(1.0) + tan_x * tan_x)
+        var sec_y = sqrt(Float32(1.0) + tan_y * tan_y)
+        var f_h = Float32(self.render_h)
+
+        for i_idx in range(n_inst):
+            ref di = self.frame_instances[i_idx]
+            ref me = self.geom.meshes[di.mesh_id]
+            var mat_final = me.material_id if di.material_override < 0 else di.material_override
+            if not self.is_cel_outlined_material(mat_final) or me.lod0_meshlet_count <= 0:
+                continue
+
+            ref wm = di.world_mat.values
+            var bc = me.bounds_center
+            var wx = wm[0] * bc.x + wm[4] * bc.y + wm[8] * bc.z + wm[12]
+            var wy = wm[1] * bc.x + wm[5] * bc.y + wm[9] * bc.z + wm[13]
+            var wz = wm[2] * bc.x + wm[6] * bc.y + wm[10] * bc.z + wm[14]
+            var wr = me.bounds_radius * di.uniform_scale
+            if di.mesh_id >= 0 and di.mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[di.mesh_id]:
+                wr = wr * Float32(4.0) + Float32(4.0)
+
+            var rcx = wx - self.cam_pos.x
+            var rcy = wy - self.cam_pos.y
+            var rcz = wz - self.cam_pos.z
+            var vz = rcx * self.cam_fwd.x + rcy * self.cam_fwd.y + rcz * self.cam_fwd.z
+            if vz + wr < self.near_z:
+                continue
+            var vx_c = abs(rcx * self.cam_right.x + rcy * self.cam_right.y + rcz * self.cam_right.z)
+            var vy_c = abs(rcx * self.cam_up.x + rcy * self.cam_up.y + rcz * self.cam_up.z)
+            if vx_c - wr * sec_x > max(Float32(0.0), vz) * tan_x or vy_c - wr * sec_y > max(Float32(0.0), vz) * tan_y:
+                continue
+
             var lod_idx = 0
             if me.lod_count > 1 and vz > Float32(1.0):
                 var px_per_unit = f_h / (Float32(2.0) * vz * max(Float32(0.05), tan_y))
@@ -3034,6 +3463,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_instances = self.ring_instances[cur_slot].copy()
         self.buf_indirect = self.ring_indirect[cur_slot].copy()
         self.buf_alphamask_indirect = self.ring_alphamask_indirect[cur_slot].copy()
+        self.buf_outline_indirect = self.ring_outline_indirect[cur_slot].copy()
         self.buf_clusters = self.ring_clusters[cur_slot].copy()
         self.desc_set = self.desc_sets[cur_slot]
         if self.vk.has_ray_query and len(self.ring_as_instances) > cur_slot:
@@ -3339,8 +3769,50 @@ struct FlintAaaVulkanRenderer(Movable):
                 put_float(g_addr + (VSM_GLOBALS_CASCADE_2_WORD + k) * 4, self.vsm_cascade_matrices[2][k])
                 put_float(g_addr + (VSM_GLOBALS_CASCADE_3_WORD + k) * 4, self.vsm_cascade_matrices[3][k])
 
-        # Pack Bucket 2 alpha-masked VisBuffer draws (zero overhead when no alpha-masked meshes are submitted)
+        # Extended v5.1 Anime NPR Cel, Stylized 3D Mesh VFX, Chromatic Shockwaves & Manga Impact Frame Globals
+        var n_cel = 0 if self.furnace_white_dome else min(AAA_MAX_CEL_MATERIALS, len(self.cel_materials))
+        put32(g_addr + AAA_GLOBALS_CEL_COUNT_WORD * 4, UInt32(n_cel))
+        for c_i in range(n_cel):
+            var c_words = List[UInt32](capacity=AAA_CEL_ENTRY_WORDS)
+            self.cel_materials[c_i].append_words(c_words)
+            for c_w in range(AAA_CEL_ENTRY_WORDS):
+                put32(g_addr + (AAA_GLOBALS_CEL_TABLE_WORD + c_i * AAA_CEL_ENTRY_WORDS + c_w) * 4, c_words[c_w])
+
+        var n_vfx = 0 if self.furnace_white_dome else min(AAA_MAX_VFX_MATERIALS, len(self.vfx_materials))
+        put32(g_addr + AAA_GLOBALS_VFX_COUNT_WORD * 4, UInt32(n_vfx))
+        for v_i in range(n_vfx):
+            var v_words = List[UInt32](capacity=AAA_VFX_ENTRY_WORDS)
+            self.vfx_materials[v_i].append_words(v_words)
+            for v_w in range(AAA_VFX_ENTRY_WORDS):
+                put32(g_addr + (AAA_GLOBALS_VFX_TABLE_WORD + v_i * AAA_VFX_ENTRY_WORDS + v_w) * 4, v_words[v_w])
+
+        var n_sw = 0 if self.furnace_white_dome else min(AAA_MAX_SHOCKWAVES, len(self.frame_shockwaves))
+        put32(g_addr + AAA_GLOBALS_SHOCKWAVE_COUNT_WORD * 4, UInt32(n_sw))
+        for s_i in range(n_sw):
+            var s_words = List[UInt32](capacity=AAA_SHOCKWAVE_WORDS)
+            self.frame_shockwaves[s_i].append_words(s_words)
+            for s_w in range(AAA_SHOCKWAVE_WORDS):
+                put32(g_addr + (AAA_GLOBALS_SHOCKWAVE_TABLE_WORD + s_i * AAA_SHOCKWAVE_WORDS + s_w) * 4, s_words[s_w])
+
+        var imp_blend = Float32(0.0) if self.furnace_white_dome else self.impact_frame.blend
+        put_float(g_addr + AAA_GLOBALS_IMPACT_PAPER_GAIN_WORD * 4, self.impact_frame.paper_gain)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 0) * 4, imp_blend)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 1) * 4, self.impact_frame.center_u)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 2) * 4, self.impact_frame.center_v)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 3) * 4, self.impact_frame.luma_threshold)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 4) * 4, self.impact_frame.streak_strength)
+        var signed_acc = -self.impact_frame.accent_width if self.impact_frame.invert_polarity else self.impact_frame.accent_width
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 5) * 4, signed_acc)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 6) * 4, self.impact_frame.ink_color.x)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 7) * 4, self.impact_frame.ink_color.y)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 8) * 4, self.impact_frame.ink_color.z)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 9) * 4, self.impact_frame.accent_color.x)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 10) * 4, self.impact_frame.accent_color.y)
+        put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 11) * 4, self.impact_frame.accent_color.z)
+
+        # Pack Bucket 2 alpha-masked VisBuffer draws & hardware `CULL_MODE_FRONT` clip-space outline draws
         var am_vis_draws = self._pack_alphamask_visbuffer_commands(n_inst, tan_x, tan_y)
+        var outline_vis_draws = 0 if self.furnace_white_dome else self._pack_outline_visbuffer_commands(n_inst, tan_x, tan_y)
 
         # Reset indirect draw counters and candidate queue = 0
         put32(self.buf_indirect.cpu_address, 0)
@@ -3625,6 +4097,36 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.buf_alphamask_indirect,
                 16,
                 am_vis_draws,
+                stride=20,
+            )
+            self.vk.end_rendering(cur_slot)
+
+        # Hardware Clip-Space Variable-Width Per-Vertex Outline Pass (`pipe_npr_outline_gfx`, `CULL_MODE_FRONT`, Reverse-Z)
+        if outline_vis_draws > 0 and self.pipe_npr_outline_gfx != 0:
+            self.vk.memory_barrier2(
+                cur_slot,
+                PIPELINE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_LATE_FRAGMENT_TESTS,
+                Int(ACCESS_COLOR_ATTACHMENT_WRITE | ACCESS_DEPTH_ATTACHMENT_WRITE),
+                PIPELINE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_EARLY_FRAGMENT_TESTS | PIPELINE_LATE_FRAGMENT_TESTS,
+                Int(ACCESS_COLOR_ATTACHMENT_WRITE | ACCESS_DEPTH_ATTACHMENT_READ | ACCESS_DEPTH_ATTACHMENT_WRITE),
+            )
+            self.vk.begin_rendering(
+                cur_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, False, 0, 0, True, self.depth_img.view, False, 0.0
+            )
+            self.vk.set_viewport_and_scissor(cur_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
+            var push_out = List[UInt32](length=16, fill=0)
+            push_out[0] = 0
+            push_out[1] = bitcast[DType.uint32](jx_clip)
+            push_out[2] = bitcast[DType.uint32](jy_clip)
+            push_out[3] = UInt32(self.render_w)
+            push_out[4] = UInt32(self.render_h)
+            self.vk.bind_graphics_pipeline(cur_slot, self.pipe_npr_outline_gfx, self.pipe_layout, self.desc_set, push_out)
+            self.vk.bind_index_buffer(cur_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
+            self.vk.draw_indexed_indirect(
+                cur_slot,
+                self.buf_outline_indirect,
+                16,
+                outline_vis_draws,
                 stride=20,
             )
             self.vk.end_rendering(cur_slot)
@@ -4073,6 +4575,32 @@ struct FlintAaaVulkanRenderer(Movable):
         else:
             self.spec_reblur_valid_frames = 0
 
+        # Stylized Anime NPR Cel, Outline & Eroding 3D Mesh VFX Resolve (`aaa_npr_cel.mojo`, `aaa_npr_vfx.mojo`)
+        if (n_cel > 0 or n_vfx > 0) and self.pipe_npr_cel_shade != 0:
+            var q_cel = next_q
+            if use_prof and q_cel + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_cel, PIPELINE_TOP)
+                next_q += 2
+                prof_pairs.append((String("NprCelAndStylizedVfxShade"), q_cel))
+            var push_cel = List[UInt32](length=16, fill=0)
+            push_cel[0] = UInt32(self.render_w)
+            push_cel[1] = UInt32(self.render_h)
+            push_cel[2] = UInt32(rt_sun_flt_off)
+            self.vk.dispatch_aaa(
+                cur_slot,
+                self.pipe_npr_cel_shade,
+                self.pipe_layout,
+                self.desc_set,
+                push_cel,
+                (self.render_w + 7) // 8,
+                (self.render_h + 7) // 8,
+            )
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            if use_prof and q_cel + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_cel + 1, PIPELINE_BOTTOM)
+
         # Ray-traced refractive glass over the shaded, denoised frame (`aaa_glass.mojo`)
         if frame_has_glass and use_rt_frame and self.pipe_glass_refract != 0 and not self.furnace_white_dome:
             var q_gl = next_q
@@ -4362,6 +4890,46 @@ struct FlintAaaVulkanRenderer(Movable):
                 )
             if use_prof and q_dof + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_dof + 1, PIPELINE_BOTTOM)
+
+        # Screen-Space Chromatic-Dispersion Shockwaves & Manga Impact Frame (`aaa_npr_vfx.mojo`)
+        if (n_sw > 0 or imp_blend > Float32(0.001)) and self.pipe_npr_post_fx != 0:
+            var q_npf = next_q
+            if use_prof and q_npf + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_npf, PIPELINE_TOP)
+                next_q += 2
+                prof_pairs.append((String("NprShockwaveAndImpactPostFx"), q_npf))
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_READ)
+            )
+            self.vk.copy_buffer(
+                cur_slot,
+                self.buf_hdr_out,
+                0,
+                self.buf_post_scratch,
+                AAA_POST_BLOOM_BASE * 4,
+                self.output_w * self.output_h * 8 * 4,
+            )
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            var push_npf = List[UInt32](length=16, fill=0)
+            push_npf[0] = UInt32(self.output_w)
+            push_npf[1] = UInt32(self.output_h)
+            push_npf[2] = UInt32(AAA_POST_BLOOM_BASE)
+            self.vk.dispatch_aaa(
+                cur_slot,
+                self.pipe_npr_post_fx,
+                self.pipe_layout,
+                self.desc_set,
+                push_npf,
+                (self.output_w + 7) // 8,
+                (self.output_h + 7) // 8,
+            )
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            if use_prof and q_npf + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_npf + 1, PIPELINE_BOTTOM)
 
         # Energy-Conserving 5-Mip Dual-Kawase + Starburst/Anamorphic HDR Bloom at Native `output_w x output_h`!
         var has_saved_bloom_mip = False
@@ -4884,6 +5452,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_meshlet_cull)
         self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
         self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)
+        if self.pipe_npr_outline_gfx != 0:
+            self.vk.destroy_pipeline(self.pipe_npr_outline_gfx)
+            self.pipe_npr_outline_gfx = 0
         self.vk.destroy_pipeline(self.pipe_vsm_mark)
         self.vk.destroy_pipeline(self.pipe_vsm_gfx)
         self.vk.destroy_pipeline(self.pipe_vsm_alphamask_gfx)
@@ -4918,6 +5489,12 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_tsr_v3_resolve)
         self.vk.destroy_pipeline(self.pipe_motion_blur)
         self.vk.destroy_pipeline(self.pipe_display_tonemap)
+        if self.pipe_npr_cel_shade != 0:
+            self.vk.destroy_pipeline(self.pipe_npr_cel_shade)
+            self.pipe_npr_cel_shade = 0
+        if self.pipe_npr_post_fx != 0:
+            self.vk.destroy_pipeline(self.pipe_npr_post_fx)
+            self.pipe_npr_post_fx = 0
         if self.pipe_ui_overlay != 0:
             self.vk.destroy_pipeline(self.pipe_ui_overlay)
             self.pipe_ui_overlay = 0
@@ -4949,6 +5526,12 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.vk.destroy_buffer(self.ring_alphamask_indirect[i])
         self.ring_alphamask_indirect.clear()
         self.buf_alphamask_indirect = GpuBuffer()
+
+        for i in range(len(self.ring_outline_indirect)):
+            if self.ring_outline_indirect[i].size > 0:
+                self.vk.destroy_buffer(self.ring_outline_indirect[i])
+        self.ring_outline_indirect.clear()
+        self.buf_outline_indirect = GpuBuffer()
 
         for i in range(len(self.ring_clusters)):
             if self.ring_clusters[i].size > 0:

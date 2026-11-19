@@ -5,7 +5,7 @@ Spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 server support
   - **Persistent Non-Blocking Unix Domain Sockets (`FlintMcpUnixListener`)**: Dynamic per-client stream buffers
     with multi-request session persistence and **zero** fixed `mmap` address collisions!
   - **Core Protocol**: `initialize`, `ping`, `notifications/initialized`, `tools/list`, and `tools/call`.
-  - **All 12 Engine / Studio / Asset / Physics / Render AI Tools**:
+  - **All 14 Engine / Studio / Asset / Physics / Render AI Tools**:
     1. `ecs.query_entities`
     2. `ecs.spawn_entity`
     3. `ecs.patch_components`
@@ -18,6 +18,8 @@ Spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 server support
     10. `physics.raycast_query`
     11. `studio.pie_control`
     12. `studio.undo_redo`
+    13. `render.configure_npr_cel`
+    14. `render.trigger_post_fx`
 """
 from std.ffi import external_call
 from std.math import abs, cos, max, min, sin
@@ -44,6 +46,7 @@ from flint.platform.os import (
     read_bytes,
     write_bytes,
 )
+from flint.render.aaa_npr_vfx import AaaImpactFrameParams, AaaShockwaveRing
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.render.flip import flip_error_map, flip_mean
 from flint.render.simd_canvas import Camera3D, SimdCanvas, pack_argb
@@ -56,6 +59,9 @@ from flint.studio.studio_app import (
     PIE_PAUSED,
     PIE_PLAYING,
     PIE_STOPPED,
+    SHADING_NPR_CEL,
+    SHADING_PBR,
+    SHADING_STYLIZED_VFX,
     FlintStudioState,
     bake_procedural_to_glb,
 )
@@ -525,6 +531,24 @@ def _collider_to_string(k: Int) -> String:
     return "box"
 
 
+def _shading_mode_to_string(mode: Int) -> String:
+    if mode == SHADING_NPR_CEL:
+        return "npr_cel"
+    if mode == SHADING_STYLIZED_VFX:
+        return "stylized_vfx"
+    return "pbr"
+
+
+def _shading_mode_from_string(s: String) -> Tuple[Bool, Int]:
+    if s == "pbr":
+        return (True, SHADING_PBR)
+    if s == "npr_cel" or s == "cel":
+        return (True, SHADING_NPR_CEL)
+    if s == "stylized_vfx" or s == "vfx":
+        return (True, SHADING_STYLIZED_VFX)
+    return (False, SHADING_PBR)
+
+
 def encode_mcp_frame(json_payload: String, use_content_length: Bool = False) -> List[UInt8]:
     """Frames `json_payload` as either `Content-Length: <N>\\r\\n\\r\\n<body` or `<body\\n`."""
     var out = List[UInt8]()
@@ -759,7 +783,7 @@ def extract_next_mcp_frame(mut buf: List[UInt8]) -> Tuple[Bool, Bool, List[UInt8
 
 
 # ============================================================================
-# 2. Tool Schema Catalog (`tools/list` — All 12 Tools)
+# 2. Tool Schema Catalog (`tools/list` — All 14 Tools)
 # ============================================================================
 
 def _mcp_tools_list_json() -> String:
@@ -776,7 +800,9 @@ def _mcp_tools_list_json() -> String:
         + '{"name":"physics.step_deterministic","description":"Advances deterministic IEEE-754 rigid-body physics for N fixed ticks (optional sandboxed output_path checkpoint).","inputSchema":{"type":"object","properties":{"ticks":{"type":"integer"},"dt":{"type":"number"},"output_path":{"type":"string"}}}},'
         + '{"name":"physics.raycast_query","description":"Casts a 3D analytical ray against scene colliders (Sphere, OBB Box, Capsule, Bvh8MeshCollider).","inputSchema":{"type":"object","required":["origin","direction"],"properties":{"origin":{"type":"array"},"direction":{"type":"array"},"max_distance":{"type":"number"}}}},'
         + '{"name":"studio.pie_control","description":"Controls 1-Click Play-In-Editor (play, pause, step, stop) backed by LZ4 checkpoint restoration.","inputSchema":{"type":"object","required":["action"],"properties":{"action":{"type":"string"},"ticks":{"type":"integer"}}}},'
-        + '{"name":"studio.undo_redo","description":"Executes algebraic undo or redo transactions on FlintStudioState.","inputSchema":{"type":"object","required":["action"],"properties":{"action":{"type":"string"},"steps":{"type":"integer"}}}}'
+        + '{"name":"studio.undo_redo","description":"Executes algebraic undo or redo transactions on FlintStudioState.","inputSchema":{"type":"object","required":["action"],"properties":{"action":{"type":"string"},"steps":{"type":"integer"}}}},'
+        + '{"name":"render.configure_npr_cel","description":"Configures PBR / NPR Cel / Stylized VFX shading, outlines, rim/SSS/hair-halo, UV-scroll erosion, stepped anime Hz, and volume-preserving smear stretch on an entity with reversible Undo/Redo recording.","inputSchema":{"type":"object","required":["entity_id"],"properties":{"entity_id":{"type":"integer"},"shading_mode":{"type":"string"},"cel_shadow_tint":{"type":"array"},"cel_outline_width_px":{"type":"number"},"cel_outline_color":{"type":"array"},"cel_rim_color":{"type":"array"},"cel_hair_halo":{"type":"number"},"vfx_erosion":{"type":"number"},"vfx_scroll_speed":{"type":"number"},"vfx_core_color":{"type":"array"},"vfx_edge_color":{"type":"array"},"anim_step_hz":{"type":"number"},"smear_stretch":{"type":"number"},"coalesce_key":{"type":"integer"}}}},'
+        + '{"name":"render.trigger_post_fx","description":"Sets or clears Manga Impact Frame blend/invert, chromatic-dispersion shockwave ring, and limited-animation SteppedAnimClock hitstop freeze on Studio.","inputSchema":{"type":"object","properties":{"impact_blend":{"type":"number"},"impact_invert":{"type":"boolean"},"shockwave_active":{"type":"boolean"},"shockwave_radius":{"type":"number"},"hitstop_sec":{"type":"number"},"clear":{"type":"boolean"}}}}'
         + "]}"
     )
 
@@ -926,6 +952,7 @@ struct McpServerV2(Movable):
                     + ',"rotation":' + _fmt_quat_json(e.rotation)
                     + ',"scale":' + _fmt_vec3_json(e.scale)
                     + ',"collider":' + json_quote(_collider_to_string(e.collider_kind))
+                    + ',"shading_mode":' + json_quote(_shading_mode_to_string(e.shading_mode))
                     + ',"mass":' + String(Float64(e.mass))
                     + ',"visible":' + ("true" if e.visible else "false")
                     + "}"
@@ -1321,6 +1348,181 @@ struct McpServerV2(Movable):
                 + ',"applied_steps":' + String(applied)
                 + ',"undo_depth":' + String(len(studio.undo_stack))
                 + ',"redo_depth":' + String(len(studio.redo_stack))
+                + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}",
+            )
+
+        # 13. render.configure_npr_cel
+        if tool_name == "render.configure_npr_cel":
+            var eid = doc.integer(doc.object_get(args_node, "entity_id"), -1)
+            if eid < 0 or eid >= len(studio.entities) or not studio.entities[eid].alive:
+                return (True, '{"ok":false,"error":"invalid or non-existent entity_id"}')
+            var nd = studio.entities[eid].copy()
+
+            var mode_node = doc.object_get(args_node, "shading_mode")
+            if mode_node >= 0:
+                if doc.nodes[mode_node].kind == 3:
+                    var m_parsed = _shading_mode_from_string(doc.text(mode_node))
+                    if not m_parsed[0]:
+                        return (True, '{"ok":false,"error":"shading_mode must be pbr, npr_cel, or stylized_vfx"}')
+                    nd.shading_mode = m_parsed[1]
+                elif doc.nodes[mode_node].kind == 2:
+                    var mi = doc.integer(mode_node, -1)
+                    if mi < SHADING_PBR or mi > SHADING_STYLIZED_VFX:
+                        return (True, '{"ok":false,"error":"shading_mode integer must be 0, 1, or 2"}')
+                    nd.shading_mode = mi
+                else:
+                    return (True, '{"ok":false,"error":"invalid shading_mode type"}')
+            elif nd.shading_mode == SHADING_PBR:
+                var has_vfx_arg = (
+                    doc.object_get(args_node, "vfx_erosion") >= 0
+                    or doc.object_get(args_node, "vfx_scroll_speed") >= 0
+                    or doc.object_get(args_node, "vfx_core_color") >= 0
+                    or doc.object_get(args_node, "vfx_edge_color") >= 0
+                )
+                var has_cel_arg = (
+                    doc.object_get(args_node, "cel_shadow_tint") >= 0
+                    or doc.object_get(args_node, "cel_outline_width_px") >= 0
+                    or doc.object_get(args_node, "cel_outline_color") >= 0
+                    or doc.object_get(args_node, "cel_rim_color") >= 0
+                    or doc.object_get(args_node, "cel_hair_halo") >= 0
+                )
+                nd.shading_mode = SHADING_STYLIZED_VFX if (has_vfx_arg and not has_cel_arg) else SHADING_NPR_CEL
+
+            var cst_node = doc.object_get(args_node, "cel_shadow_tint")
+            if cst_node >= 0:
+                var r_cst = _parse_vec3_arg(doc, cst_node, nd.cel_shadow_tint)
+                if not r_cst[0]:
+                    return (True, '{"ok":false,"error":"invalid cel_shadow_tint"}')
+                nd.cel_shadow_tint = r_cst[1]
+
+            var cow_node = doc.object_get(args_node, "cel_outline_width_px")
+            if cow_node >= 0 and doc.nodes[cow_node].kind == 2:
+                nd.cel_outline_width_px = max(Float32(0.0), min(Float32(24.0), Float32(doc.number(cow_node))))
+
+            var coc_node = doc.object_get(args_node, "cel_outline_color")
+            if coc_node >= 0:
+                var r_coc = _parse_vec3_arg(doc, coc_node, nd.cel_outline_color)
+                if not r_coc[0]:
+                    return (True, '{"ok":false,"error":"invalid cel_outline_color"}')
+                nd.cel_outline_color = r_coc[1]
+
+            var crc_node = doc.object_get(args_node, "cel_rim_color")
+            if crc_node >= 0:
+                var r_crc = _parse_vec3_arg(doc, crc_node, nd.cel_rim_color)
+                if not r_crc[0]:
+                    return (True, '{"ok":false,"error":"invalid cel_rim_color"}')
+                nd.cel_rim_color = r_crc[1]
+
+            var chh_node = doc.object_get(args_node, "cel_hair_halo")
+            if chh_node >= 0 and doc.nodes[chh_node].kind == 2:
+                nd.cel_hair_halo = max(Float32(0.0), Float32(doc.number(chh_node)))
+
+            var ver_node = doc.object_get(args_node, "vfx_erosion")
+            if ver_node >= 0 and doc.nodes[ver_node].kind == 2:
+                nd.vfx_erosion = max(Float32(0.0), min(Float32(1.0), Float32(doc.number(ver_node))))
+
+            var vss_node = doc.object_get(args_node, "vfx_scroll_speed")
+            if vss_node >= 0 and doc.nodes[vss_node].kind == 2:
+                nd.vfx_scroll_speed = Float32(doc.number(vss_node))
+
+            var vcc_node = doc.object_get(args_node, "vfx_core_color")
+            if vcc_node >= 0:
+                var r_vcc = _parse_vec3_arg(doc, vcc_node, nd.vfx_core_color)
+                if not r_vcc[0]:
+                    return (True, '{"ok":false,"error":"invalid vfx_core_color"}')
+                nd.vfx_core_color = r_vcc[1]
+
+            var vec_node = doc.object_get(args_node, "vfx_edge_color")
+            if vec_node >= 0:
+                var r_vec = _parse_vec3_arg(doc, vec_node, nd.vfx_edge_color)
+                if not r_vec[0]:
+                    return (True, '{"ok":false,"error":"invalid vfx_edge_color"}')
+                nd.vfx_edge_color = r_vec[1]
+
+            var ash_node = doc.object_get(args_node, "anim_step_hz")
+            if ash_node >= 0 and doc.nodes[ash_node].kind == 2:
+                nd.anim_step_hz = max(Float32(0.0), Float32(doc.number(ash_node)))
+
+            var sms_node = doc.object_get(args_node, "smear_stretch")
+            if sms_node >= 0 and doc.nodes[sms_node].kind == 2:
+                nd.smear_stretch = max(Float32(0.55), min(Float32(3.2), Float32(doc.number(sms_node))))
+
+            var ckey = UInt64(max(0, doc.integer(doc.object_get(args_node, "coalesce_key"), 0)))
+            _ = studio.commit_node_edit(eid, nd^, "MCP Configure NPR/VFX", ckey)
+            ref ent_after = studio.entities[eid]
+            return (
+                False,
+                '{"ok":true,"entity_id":' + String(eid)
+                + ',"shading_mode":' + json_quote(_shading_mode_to_string(ent_after.shading_mode))
+                + ',"shading_mode_id":' + String(ent_after.shading_mode)
+                + ',"cel_outline_width_px":' + String(Float64(ent_after.cel_outline_width_px))
+                + ',"vfx_erosion":' + String(Float64(ent_after.vfx_erosion))
+                + ',"anim_step_hz":' + String(Float64(ent_after.anim_step_hz))
+                + ',"smear_stretch":' + String(Float64(ent_after.smear_stretch))
+                + ',"undo_depth":' + String(len(studio.undo_stack))
+                + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}",
+            )
+
+        # 14. render.trigger_post_fx
+        if tool_name == "render.trigger_post_fx":
+            if doc.boolean(doc.object_get(args_node, "clear"), False):
+                studio.preview_impact_blend = Float32(0.0)
+                studio.preview_impact_invert = False
+                studio.preview_shockwave_active = False
+                studio.preview_shockwave_radius = Float32(0.22)
+                studio.stepped_clock.hitstop_remaining_sec = Float32(0.0)
+
+            var ib_node = doc.object_get(args_node, "impact_blend")
+            if ib_node >= 0 and doc.nodes[ib_node].kind == 2:
+                studio.preview_impact_blend = max(Float32(0.0), min(Float32(1.0), Float32(doc.number(ib_node))))
+
+            var ii_node = doc.object_get(args_node, "impact_invert")
+            if ii_node >= 0 and doc.nodes[ii_node].kind == 1:
+                studio.preview_impact_invert = doc.boolean(ii_node)
+
+            var sa_node = doc.object_get(args_node, "shockwave_active")
+            if sa_node >= 0 and doc.nodes[sa_node].kind == 1:
+                studio.preview_shockwave_active = doc.boolean(sa_node)
+
+            var sr_node = doc.object_get(args_node, "shockwave_radius")
+            if sr_node >= 0 and doc.nodes[sr_node].kind == 2:
+                studio.preview_shockwave_radius = max(Float32(0.002), min(Float32(2.0), Float32(doc.number(sr_node))))
+
+            var hs_node = doc.object_get(args_node, "hitstop_sec")
+            if hs_node >= 0 and doc.nodes[hs_node].kind == 2:
+                var hs_val = Float32(doc.number(hs_node))
+                if hs_val <= Float32(0.0):
+                    studio.stepped_clock.hitstop_remaining_sec = Float32(0.0)
+                else:
+                    studio.stepped_clock.trigger_hitstop(hs_val)
+
+            if has_renderer and ren_ptr != 0:
+                ref ren = Pointer[FlintAaaVulkanRenderer, MutAnyOrigin](unsafe_from_address=ren_ptr)[unsafe_offset=0]
+                if studio.preview_impact_blend > Float32(0.0):
+                    ren.set_impact_frame(
+                        AaaImpactFrameParams(
+                            blend=studio.preview_impact_blend,
+                            invert_polarity=studio.preview_impact_invert,
+                        )
+                    )
+                else:
+                    ren.clear_impact_frame()
+                if studio.preview_shockwave_active:
+                    ren.submit_shockwave(
+                        AaaShockwaveRing(
+                            center_u=Float32(0.5),
+                            center_v=Float32(0.5),
+                            radius_uv=studio.preview_shockwave_radius,
+                        )
+                    )
+
+            return (
+                False,
+                '{"ok":true,"impact_blend":' + String(Float64(studio.preview_impact_blend))
+                + ',"impact_invert":' + ("true" if studio.preview_impact_invert else "false")
+                + ',"shockwave_active":' + ("true" if studio.preview_shockwave_active else "false")
+                + ',"shockwave_radius":' + String(Float64(studio.preview_shockwave_radius))
+                + ',"hitstop_remaining_sec":' + String(Float64(studio.stepped_clock.hitstop_remaining_sec))
                 + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}",
             )
 

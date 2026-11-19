@@ -14,12 +14,14 @@ Standalone AAA Visual Scene Editor, Procedural Kit & AI-Native MCP v2 Host:
   - **`--mcp-stdio`**:
     Runs `McpServerV2` in spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 `stdio` mode.
 """
-from std.math import cos, max, min, sin
+from std.math import abs, cos, max, min, sin
 from std.sys import argv
+from flint.anim.flanim_ecs import compute_volume_preserving_smear_scale
 from flint.assets.image import write_png
 from flint.assets.server import AssetServer
 from flint.core.jobs import JobPool, default_worker_count
 from flint.core.math import Quat, Vec3
+from flint.core.transform import trs
 from flint.devtools.mcp_v2 import FlintMcpUnixListener, McpServerV2, default_mcp_socket_path
 from flint.platform.input import InputState
 from flint.platform.os import get_time, make_dirs, parent_directory
@@ -29,6 +31,8 @@ from flint.procedural.arch_kit import build_colonnade_arcade_bay
 from flint.procedural.foliage import build_botanical_pine
 from flint.render.aaa_bsdf import AaaMaterial
 from flint.render.aaa_clustered_lights import AaaClusterLight
+from flint.render.aaa_npr_cel import AaaCelParams
+from flint.render.aaa_npr_vfx import AaaImpactFrameParams, AaaShockwaveRing, AaaStylizedVfxParams
 from flint.render.aaa_post_tsr import AAA_DISPLAY_AGX_REC709
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.render.aaa_sky_atmosphere import BrunetonAtmosphereParams
@@ -46,6 +50,9 @@ from flint.studio import (
     GIZMO_PLANE_XZ,
     GIZMO_PLANE_YZ,
     PIE_PLAYING,
+    SHADING_NPR_CEL,
+    SHADING_PBR,
+    SHADING_STYLIZED_VFX,
     FlintStudioState,
     ViewportRay,
     VisBufferGpuPicker,
@@ -146,6 +153,9 @@ struct _StudioGpuMeshes(Movable):
     var foliage_canopy_id: Int
     var mat_trunk_id: Int
     var mat_foliage_id: Int
+    var entity_pbr_mat_ids: List[Int]
+    var entity_cel_mat_ids: List[Int]
+    var entity_vfx_mat_ids: List[Int]
 
     def __init__(out self):
         self.grid_mesh_id = 0
@@ -156,6 +166,9 @@ struct _StudioGpuMeshes(Movable):
         self.foliage_canopy_id = 0
         self.mat_trunk_id = 0
         self.mat_foliage_id = 0
+        self.entity_pbr_mat_ids = List[Int]()
+        self.entity_cel_mat_ids = List[Int]()
+        self.entity_vfx_mat_ids = List[Int]()
 
 
 def _upload_studio_gpu_assets(mut ren: FlintAaaVulkanRenderer, studio: FlintStudioState) -> _StudioGpuMeshes:
@@ -165,10 +178,13 @@ def _upload_studio_gpu_assets(mut ren: FlintAaaVulkanRenderer, studio: FlintStud
     for i in range(len(studio.entities)):
         ref e = studio.entities[i]
         var mat = AaaMaterial(base_color=e.base_color, roughness=e.roughness, metallic=e.metallic)
+        mat.emissive = e.emissive
         if i == 1:
             mat.clearcoat = Float32(0.88)
             mat.clearcoat_roughness = Float32(0.05)
-        _ = ren.add_material(mat)
+        gm.entity_pbr_mat_ids.append(ren.add_material(mat))
+        gm.entity_cel_mat_ids.append(-1)
+        gm.entity_vfx_mat_ids.append(-1)
 
     var mat_trunk = AaaMaterial(base_color=Vec3(0.34, 0.23, 0.14), roughness=0.84, metallic=0.0)
     gm.mat_trunk_id = ren.add_material(mat_trunk)
@@ -206,30 +222,93 @@ def _upload_studio_gpu_assets(mut ren: FlintAaaVulkanRenderer, studio: FlintStud
 def _submit_studio_frame_draws(
     mut ren: FlintAaaVulkanRenderer,
     studio: FlintStudioState,
-    gm: _StudioGpuMeshes,
+    mut gm: _StudioGpuMeshes,
     mut out_inst_to_entity: List[Int],
 ):
     out_inst_to_entity.clear()
     ren.add_cluster_light(AaaClusterLight.point(Vec3(-2.8, 3.8, -2.5), Vec3(18.0, 14.0, 10.0), Float32(14.0)))
     ren.add_cluster_light(AaaClusterLight.point(Vec3(4.8, 4.2, 0.5), Vec3(8.0, 14.0, 24.0), Float32(14.0)))
 
+    if studio.preview_shockwave_active:
+        ren.submit_shockwave(
+            AaaShockwaveRing(
+                center_u=Float32(0.5),
+                center_v=Float32(0.5),
+                radius_uv=studio.preview_shockwave_radius,
+            )
+        )
+    if studio.preview_impact_blend > Float32(0.0):
+        ren.set_impact_frame(
+            AaaImpactFrameParams(
+                blend=studio.preview_impact_blend,
+                invert_polarity=studio.preview_impact_invert,
+            )
+        )
+    else:
+        ren.clear_impact_frame()
+
+    while len(gm.entity_pbr_mat_ids) < len(studio.entities):
+        gm.entity_pbr_mat_ids.append(-1)
+        gm.entity_cel_mat_ids.append(-1)
+        gm.entity_vfx_mat_ids.append(-1)
+
     for i in range(len(studio.entities)):
         ref e = studio.entities[i]
         if not e.alive or not e.visible:
             continue
-        if i < 5:
-            var mat = AaaMaterial(base_color=e.base_color, roughness=e.roughness, metallic=e.metallic)
-            if i == 1:
-                mat.clearcoat = Float32(0.88)
-                mat.clearcoat_roughness = Float32(0.05)
-            ren.update_material(i, mat)
+
+        var mat = AaaMaterial(base_color=e.base_color, roughness=e.roughness, metallic=e.metallic)
+        mat.emissive = e.emissive
+        if i == 1 and e.shading_mode == SHADING_PBR:
+            mat.clearcoat = Float32(0.88)
+            mat.clearcoat_roughness = Float32(0.05)
+
+        var mat_ov: Int
+        if e.shading_mode == SHADING_NPR_CEL:
+            var cel = AaaCelParams(
+                sss_shadow_tint=e.cel_shadow_tint,
+                rim_color=e.cel_rim_color,
+                hair_halo_strength=e.cel_hair_halo,
+                outline_width_px=e.cel_outline_width_px,
+                outline_color=e.cel_outline_color,
+            )
+            if gm.entity_cel_mat_ids[i] < 0:
+                gm.entity_cel_mat_ids[i] = ren.add_cel_material(mat, cel)
+            else:
+                ren.update_material(gm.entity_cel_mat_ids[i], mat)
+                _ = ren.update_cel_material(gm.entity_cel_mat_ids[i], cel)
+            mat_ov = gm.entity_cel_mat_ids[i] if gm.entity_cel_mat_ids[i] >= 0 else 0
+        elif e.shading_mode == SHADING_STYLIZED_VFX:
+            var vfx = AaaStylizedVfxParams.anime_flame(
+                core_color=e.vfx_core_color,
+                edge_color=e.vfx_edge_color,
+                erosion=e.vfx_erosion,
+                scroll_speed=e.vfx_scroll_speed,
+            )
+            if gm.entity_vfx_mat_ids[i] < 0:
+                gm.entity_vfx_mat_ids[i] = ren.add_vfx_material(mat, vfx)
+            else:
+                var vfx_mat = mat.copy()
+                vfx_mat.alpha_cutoff = Float32(0.48)
+                ren.update_material(gm.entity_vfx_mat_ids[i], vfx_mat)
+                _ = ren.update_vfx_material(gm.entity_vfx_mat_ids[i], vfx)
+            mat_ov = gm.entity_vfx_mat_ids[i] if gm.entity_vfx_mat_ids[i] >= 0 else 0
+        else:
+            if gm.entity_pbr_mat_ids[i] < 0:
+                gm.entity_pbr_mat_ids[i] = ren.add_material(mat)
+            else:
+                ren.update_material(gm.entity_pbr_mat_ids[i], mat)
+            mat_ov = gm.entity_pbr_mat_ids[i] if gm.entity_pbr_mat_ids[i] >= 0 else 0
 
         var wm = studio.world_matrix(i)
         var us = max(e.scale.x, max(e.scale.y, e.scale.z))
-        var mat_ov = i if i < 5 else 1
+        if e.smear_stretch != Float32(1.0):
+            var sm = compute_volume_preserving_smear_scale(e.smear_stretch)
+            wm = wm.multiply(trs(Vec3(0.0, 0.0, 0.0), Quat(0.0, 0.0, 0.0, 1.0), sm))
+            us = max(e.scale.x * sm.x, max(e.scale.y * sm.y, e.scale.z * sm.z))
 
         if e.mesh_id == 0 and i == 0:
-            ren.draw_instance(gm.grid_mesh_id, wm, material_override=0, uniform_scale=us)
+            ren.draw_instance(gm.grid_mesh_id, wm, material_override=(0 if e.shading_mode == SHADING_PBR else mat_ov), uniform_scale=us)
             out_inst_to_entity.append(i)
         elif e.mesh_id == 1:
             ren.draw_instance(gm.orb_mesh_id, wm, material_override=mat_ov, uniform_scale=us)
@@ -241,9 +320,11 @@ def _submit_studio_frame_draws(
             ren.draw_instance(gm.colonnade_mesh_id, wm, material_override=mat_ov, uniform_scale=us)
             out_inst_to_entity.append(i)
         elif e.mesh_id == 4:
-            ren.draw_instance(gm.foliage_trunk_id, wm, material_override=gm.mat_trunk_id, uniform_scale=us)
+            var trunk_ov = gm.mat_trunk_id if e.shading_mode == SHADING_PBR else mat_ov
+            var fol_ov = gm.mat_foliage_id if e.shading_mode == SHADING_PBR else mat_ov
+            ren.draw_instance(gm.foliage_trunk_id, wm, material_override=trunk_ov, uniform_scale=us)
             out_inst_to_entity.append(i)
-            ren.draw_instance(gm.foliage_canopy_id, wm, material_override=gm.mat_foliage_id, uniform_scale=us)
+            ren.draw_instance(gm.foliage_canopy_id, wm, material_override=fol_ov, uniform_scale=us)
             out_inst_to_entity.append(i)
         else:
             ren.draw_instance(gm.orb_mesh_id, wm, material_override=mat_ov, uniform_scale=us)

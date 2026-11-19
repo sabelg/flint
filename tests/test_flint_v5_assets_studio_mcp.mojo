@@ -62,6 +62,7 @@ from flint.render.font import SdfFont
 from flint.studio import (
     COLLIDER_BOX,
     COLLIDER_SPHERE,
+    FIELD_F32,
     GIZMO_AXIS_X,
     GIZMO_AXIS_Y,
     GIZMO_MODE_ROTATE,
@@ -71,8 +72,12 @@ from flint.studio import (
     GIZMO_SCALE_UNIFORM,
     PIE_PLAYING,
     PIE_STOPPED,
+    SHADING_NPR_CEL,
+    SHADING_PBR,
+    SHADING_STYLIZED_VFX,
     FieldVisitor,
     FlintStudioState,
+    InspectedField,
     ViewportRay,
     bake_procedural_to_glb,
     decode_visbuffer_pick,
@@ -703,7 +708,7 @@ def test_e_undo_redo_50_and_pie_120_ticks() raises:
             "Redo fnv64 mismatch at step " + String(r_idx),
         )
 
-    # Verify Inspectable + FieldVisitor reflection
+    # Verify Inspectable + FieldVisitor reflection (including NPR/VFX/Stepped-Anim fields)
     var drop_id = studio.spawn_entity(
         "DynamicSphere",
         position=Vec3(0.0, 5.0, 0.0),
@@ -712,20 +717,58 @@ def test_e_undo_redo_50_and_pie_120_ticks() raises:
         mass=8.0,
     )
     var fvis = FieldVisitor()
-    studio.entities[drop_id].inspect_fields(fvis)
-    _assert(len(fvis.fields) >= 12, "FieldVisitor must reflect all StudioEntityNode properties")
+    studio.entities[drop_id].inspect(fvis)
+    _assert(len(fvis.fields) == 26, "FieldVisitor must reflect all 26 StudioEntityNode properties")
 
-    # 1-Click Play-In-Editor: 120-tick physics run -> pie_stop() bit-for-bit identical restoration!
+    # Verify configure_entity_npr_cel, configure_entity_stylized_vfx & patch_entity_field Undo/Redo fnv64 invertibility
+    var h_npr_base = studio.state_hash()
+    _assert(
+        studio.configure_entity_npr_cel(
+            drop_id,
+            cel_shadow_tint=Vec3(0.62, 0.40, 0.46),
+            cel_outline_width_px=2.4,
+            cel_hair_halo=0.55,
+            anim_step_hz=12.0,
+            smear_stretch=1.35,
+        ),
+        "configure_entity_npr_cel failed",
+    )
+    var h_npr_cel = studio.state_hash()
+    _assert(studio.entities[drop_id].shading_mode == SHADING_NPR_CEL and h_npr_cel != h_npr_base, "NPR Cel must mutate hash")
+    _assert(
+        studio.configure_entity_stylized_vfx(drop_id, vfx_erosion=0.42, vfx_scroll_speed=4.5, anim_step_hz=24.0),
+        "configure_entity_stylized_vfx failed",
+    )
+    var h_npr_vfx = studio.state_hash()
+    _assert(studio.entities[drop_id].shading_mode == SHADING_STYLIZED_VFX and h_npr_vfx != h_npr_cel, "Stylized VFX must mutate hash")
+    var sm_patch = InspectedField("smear_stretch", FIELD_F32)
+    sm_patch.f_val = Float32(1.75)
+    _assert(studio.patch_entity_field(drop_id, "smear_stretch", sm_patch), "patch_entity_field(smear_stretch) failed")
+    var h_npr_patched = studio.state_hash()
+    _assert(studio.undo() and studio.state_hash() == h_npr_vfx, "undo patch_entity_field hash mismatch")
+    _assert(studio.undo() and studio.state_hash() == h_npr_cel, "undo configure_entity_stylized_vfx hash mismatch")
+    _assert(studio.undo() and studio.state_hash() == h_npr_base, "undo configure_entity_npr_cel hash mismatch")
+    _assert(studio.redo() and studio.state_hash() == h_npr_cel, "redo configure_entity_npr_cel hash mismatch")
+    _assert(studio.redo() and studio.state_hash() == h_npr_vfx, "redo configure_entity_stylized_vfx hash mismatch")
+    _assert(studio.redo() and studio.state_hash() == h_npr_patched, "redo patch_entity_field hash mismatch")
+    _ = studio.undo()
+    _ = studio.undo()
+    _ = studio.undo()
+    _assert(studio.state_hash() == h_npr_base, "3x undo back to h_npr_base failed")
+
+    # 1-Click Play-In-Editor: 120-tick physics & SteppedAnimClock run -> pie_stop() bit-for-bit identical restoration!
     var pre_pie_hash = studio.state_hash()
     var pre_pie_y = studio.entities[drop_id].translation.y
     _assert(studio.pie_play(), "pie_play() failed")
     var stepped = studio.pie_step(120)
     _assert(stepped == 120, "pie_step(120) must simulate 120 ticks")
+    _assert(studio.stepped_clock.stepped_time_sec > Float32(1.5), "stepped_clock must advance during PIE")
     _assert(studio.entities[drop_id].translation.y < Float32(1.5), "dynamic sphere must fall under gravity during PIE")
     _assert(studio.state_hash() != pre_pie_hash, "world hash must change during 120-tick PIE simulation")
 
     _assert(studio.pie_stop(), "pie_stop() failed")
     _assert(studio.state_hash() == pre_pie_hash, "pie_stop() MUST restore bit-for-bit identical fnv64 world hash!")
+    _assert(studio.stepped_clock.raw_time_sec == Float32(0.0), "pie_stop() must restore stepped_clock")
     _assert(abs(studio.entities[drop_id].translation.y - pre_pie_y) == Float32(0.0), "restored Y position must be bit-identical")
 
     # Verify Studio `InputMap` (`W/E/R`, `Ctrl+Z`, `Ctrl+Y`, `F5` PIE), `CameraRig` & `DockSpace` + `UiContext`!
@@ -776,7 +819,13 @@ def test_e_undo_redo_50_and_pie_120_ticks() raises:
 
     var studio_ui = UiDrawList()
     emit_studio_ui_draw_list(studio_ui, studio, -1, SdfFont(), 1280, 720)
-    _assert(studio_ui.count() > 60 and len(studio.dock.nodes) >= 5, "Studio UiContext + DockSpace failed to emit UI primitives")
+    var pbr_ui_cnt = studio_ui.count()
+    _assert(pbr_ui_cnt > 60 and len(studio.dock.nodes) >= 5, "Studio UiContext + DockSpace failed to emit UI primitives")
+    _ = studio.configure_entity_npr_cel(drop_id, anim_step_hz=12.0)
+    var studio_npr_ui = UiDrawList()
+    emit_studio_ui_draw_list(studio_npr_ui, studio, -1, SdfFont(), 1280, 720)
+    _assert(studio_npr_ui.count() > pbr_ui_cnt, "NPR Cel + SteppedClock Inspector readout must emit additional UI primitives")
+    _ = studio.undo()
 
     # Verify neutral Studio procedural presets
     var orb_b = bake_procedural_to_glb("material_orb", "", seed=1)
@@ -856,11 +905,15 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     var r_notif = mcp.handle_jsonrpc('{"jsonrpc":"2.0","method":"notifications/initialized"}', studio, assets, pool)
     _assert(r_notif.byte_length() == 0, "JSON-RPC notification without id must produce empty response")
 
-    # 2. tools/list -> all 12 tools present
+    # 2. tools/list -> all 14 tools present (including render.configure_npr_cel & render.trigger_post_fx)
     var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}', studio, assets, pool)
     var d_list = parse_json(_str_bytes(r_list))
     var tools_arr = d_list.object_get(d_list.object_get(d_list.root, "result"), "tools")
-    _assert(d_list.valid and d_list.array_size(tools_arr) == 12, "tools/list must expose all 12 MCP tools")
+    _assert(d_list.valid and d_list.array_size(tools_arr) == 14, "tools/list must expose all 14 MCP tools")
+    _assert(
+        r_list.find('"render.configure_npr_cel"') >= 0 and r_list.find('"render.trigger_post_fx"') >= 0,
+        "tools/list must include render.configure_npr_cel and render.trigger_post_fx",
+    )
 
     # 3. ecs.spawn_entity
     var h0 = studio.state_hash()
@@ -921,6 +974,117 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
         d_cap.boolean(d_cap.object_get(sc_cap, "has_flip_diff"))
         and d_cap.number(d_cap.object_get(sc_cap, "flip_mean"), 1.0) < 1.0e-5,
         "render.capture_viewport FLIP self-diff must be ~0.0",
+    )
+
+    # 7b. Verify Tools 13 & 14: `render.configure_npr_cel` (with bit-exact fnv64 Undo/Redo!) & `render.trigger_post_fx`
+    var h_before_npr = studio.state_hash()
+    _assert(studio.entities[0].shading_mode == SHADING_PBR, "entity 0 must start in SHADING_PBR")
+    var r_cel = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":901,"method":"tools/call","params":{"name":"render.configure_npr_cel","arguments":{"entity_id":0,"shading_mode":"npr_cel","cel_shadow_tint":[0.60,0.42,0.48],"cel_outline_width_px":2.75,"cel_outline_color":[0.02,0.01,0.02],"cel_rim_color":[0.50,0.58,0.74],"cel_hair_halo":0.65,"anim_step_hz":12.0,"smear_stretch":1.45}}}',
+        studio, assets, pool,
+    )
+    var d_cel = parse_json(_str_bytes(r_cel))
+    var sc_cel = d_cel.object_get(d_cel.object_get(d_cel.root, "result"), "structuredContent")
+    _assert(
+        d_cel.valid
+        and d_cel.boolean(d_cel.object_get(sc_cel, "ok"))
+        and studio.entities[0].shading_mode == SHADING_NPR_CEL
+        and abs(studio.entities[0].cel_outline_width_px - Float32(2.75)) < Float32(1e-5)
+        and abs(studio.entities[0].anim_step_hz - Float32(12.0)) < Float32(1e-5)
+        and abs(studio.entities[0].smear_stretch - Float32(1.45)) < Float32(1e-5),
+        "render.configure_npr_cel (npr_cel) failed",
+    )
+    var h_after_cel = studio.state_hash()
+    _assert(h_after_cel != h_before_npr, "render.configure_npr_cel must mutate studio.state_hash()")
+
+    var r_vfx = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":902,"method":"tools/call","params":{"name":"render.configure_npr_cel","arguments":{"entity_id":0,"shading_mode":"stylized_vfx","vfx_erosion":0.44,"vfx_scroll_speed":4.8,"vfx_core_color":[9.0,6.5,2.4],"vfx_edge_color":[4.4,0.35,0.06]}}}',
+        studio, assets, pool,
+    )
+    var d_vfx = parse_json(_str_bytes(r_vfx))
+    var sc_vfx = d_vfx.object_get(d_vfx.object_get(d_vfx.root, "result"), "structuredContent")
+    _assert(
+        d_vfx.valid
+        and d_vfx.boolean(d_vfx.object_get(sc_vfx, "ok"))
+        and studio.entities[0].shading_mode == SHADING_STYLIZED_VFX
+        and abs(studio.entities[0].vfx_erosion - Float32(0.44)) < Float32(1e-5),
+        "render.configure_npr_cel (stylized_vfx) failed",
+    )
+    var h_after_vfx = studio.state_hash()
+    _assert(h_after_vfx != h_after_cel and h_after_vfx != h_before_npr, "stylized_vfx must mutate studio.state_hash()")
+
+    # Undo stylized_vfx -> npr_cel -> pbr, verifying bit-for-bit fnv64 restoration at each step!
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":903,"method":"tools/call","params":{"name":"studio.undo_redo","arguments":{"action":"undo","steps":1}}}',
+        studio, assets, pool,
+    )
+    _assert(
+        studio.entities[0].shading_mode == SHADING_NPR_CEL and studio.state_hash() == h_after_cel,
+        "studio.undo_redo undo (vfx -> cel) fnv64 mismatch",
+    )
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":904,"method":"tools/call","params":{"name":"studio.undo_redo","arguments":{"action":"undo","steps":1}}}',
+        studio, assets, pool,
+    )
+    _assert(
+        studio.entities[0].shading_mode == SHADING_PBR and studio.state_hash() == h_before_npr,
+        "studio.undo_redo undo (cel -> pbr) fnv64 mismatch",
+    )
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":905,"method":"tools/call","params":{"name":"studio.undo_redo","arguments":{"action":"redo","steps":2}}}',
+        studio, assets, pool,
+    )
+    _assert(
+        studio.entities[0].shading_mode == SHADING_STYLIZED_VFX and studio.state_hash() == h_after_vfx,
+        "studio.undo_redo redo (pbr -> vfx) fnv64 mismatch",
+    )
+
+    # Trigger post-FX + hitstop and verify SteppedAnimClock freezes during hitstop!
+    var t_before_hs = studio.stepped_clock.advance(Float32(0.10))
+    _assert(t_before_hs > Float32(0.04), "SteppedAnimClock must advance prior to hitstop")
+    var r_pfx = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":906,"method":"tools/call","params":{"name":"render.trigger_post_fx","arguments":{"impact_blend":0.85,"impact_invert":true,"shockwave_active":true,"shockwave_radius":0.31,"hitstop_sec":0.10}}}',
+        studio, assets, pool,
+    )
+    var d_pfx = parse_json(_str_bytes(r_pfx))
+    var sc_pfx = d_pfx.object_get(d_pfx.object_get(d_pfx.root, "result"), "structuredContent")
+    _assert(
+        d_pfx.valid
+        and d_pfx.boolean(d_pfx.object_get(sc_pfx, "ok"))
+        and abs(studio.preview_impact_blend - Float32(0.85)) < Float32(1e-5)
+        and studio.preview_impact_invert
+        and studio.preview_shockwave_active
+        and abs(studio.preview_shockwave_radius - Float32(0.31)) < Float32(1e-5)
+        and abs(studio.stepped_clock.hitstop_remaining_sec - Float32(0.10)) < Float32(1e-5),
+        "render.trigger_post_fx state assignment failed",
+    )
+    var t_frozen_1 = studio.stepped_clock.advance(Float32(0.04))
+    _assert(
+        abs(t_frozen_1 - t_before_hs) == Float32(0.0)
+        and not studio.stepped_clock.pose_changed_this_tick
+        and studio.stepped_clock.hitstop_remaining_sec > Float32(0.05),
+        "SteppedAnimClock MUST freeze stepped_time_sec during hitstop!",
+    )
+    var t_frozen_2 = studio.stepped_clock.advance(Float32(0.04))
+    _assert(
+        abs(t_frozen_2 - t_before_hs) == Float32(0.0) and not studio.stepped_clock.pose_changed_this_tick,
+        "SteppedAnimClock MUST stay frozen until hitstop_remaining_sec reaches 0!",
+    )
+    _ = studio.stepped_clock.advance(Float32(0.04))  # Drains remaining 0.02s hitstop
+    var t_resumed = studio.stepped_clock.advance(Float32(0.10))
+    _assert(t_resumed > t_before_hs, "SteppedAnimClock must resume advancing once hitstop finishes")
+
+    var r_pfx_clr = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":907,"method":"tools/call","params":{"name":"render.trigger_post_fx","arguments":{"clear":true}}}',
+        studio, assets, pool,
+    )
+    var d_pfx_clr = parse_json(_str_bytes(r_pfx_clr))
+    _assert(
+        d_pfx_clr.valid
+        and studio.preview_impact_blend == Float32(0.0)
+        and not studio.preview_shockwave_active
+        and studio.stepped_clock.hitstop_remaining_sec == Float32(0.0),
+        "render.trigger_post_fx clear failed",
     )
 
     # 8. Workspace Path Sandbox: reject `../../etc/passwd`, `/tmp/outside.png`, NUL bytes, and symlinks (`S_ISLNK`)!
