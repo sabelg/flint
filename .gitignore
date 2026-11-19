@@ -1,5 +1,6 @@
 # Pixi & Mojo toolchain artifacts
 .pixi/
+.gemini/
 pixi.lock
 *.egg-info
 build/

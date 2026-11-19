@@ -4840,6 +4840,11 @@ struct FlintAaaVulkanRenderer(Movable):
 
     def shutdown(mut self):
         if not self.active and self.vk.instance == 0:
+            self.vk._free_host_scratch()
+            return
+        if self.vk.device == 0:
+            self.vk.close()
+            self.active = False
             return
         self.vk.wait_idle()
         for i in range(len(self.mesh_blas)):
@@ -4981,3 +4986,6 @@ struct FlintAaaVulkanRenderer(Movable):
             _ = self.vk.save_pipeline_cache("build/vk_pso.cache")
         self.vk.close()
         self.active = False
+
+    def __deinit__(deinit self):
+        self.shutdown()

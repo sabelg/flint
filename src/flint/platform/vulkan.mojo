@@ -758,26 +758,49 @@ struct VulkanGpu(Copyable, Movable):
 
     # Bring-up.
 
+    def _free_host_scratch(mut self):
+        if self.arena != 0:
+            external_call["free", NoneType](self.arena)
+            self.arena = 0
+            self.arena_used = 0
+        if self.messages != 0:
+            external_call["free", NoneType](self.messages)
+            self.messages = 0
+        if self.memory_properties != 0:
+            external_call["free", NoneType](self.memory_properties)
+            self.memory_properties = 0
+
+    def _fail_init(mut self) -> Bool:
+        var saved_err = self.error
+        self.close()
+        self.error = saved_err
+        return False
+
     def initialize(mut self, validate: Bool = False, need_discrete: Bool = False) -> Bool:
         """Open the loader and the best GPU. False leaves `error` and nothing to close."""
+        self._free_host_scratch()
         self.arena = external_call["malloc", Int](ARENA_BYTES)
         self.messages = external_call["calloc", Int](Int(2), Int(8))
         self.memory_properties = external_call["malloc", Int](520)
         var library_name = "libvulkan.so.1"
         self.library = dl_open(library_name, GLOBAL_LOAD_LAZY | GLOBAL_LOAD_LOCAL)
         if self.library == 0:
-            return self.fail("no Vulkan loader on this system")
+            _ = self.fail("no Vulkan loader on this system")
+            return self._fail_init()
         var symbol = "vkGetInstanceProcAddr"
         self.proc_instance = dl_sym(self.library, symbol)
         if self.proc_instance == 0:
-            return self.fail("the loader has no vkGetInstanceProcAddr")
+            _ = self.fail("the loader has no vkGetInstanceProcAddr")
+            return self._fail_init()
         if not self.create_instance(validate):
-            return False
+            return self._fail_init()
         if not self.choose_device(need_discrete):
-            return False
+            return self._fail_init()
         if not self.create_device():
-            return False
-        return self.load_device_calls() and self.create_queue_objects()
+            return self._fail_init()
+        if not (self.load_device_calls() and self.create_queue_objects()):
+            return self._fail_init()
+        return True
 
     def layer_available(mut self, wanted: String) -> Bool:
         self.rewind()
@@ -2207,6 +2230,7 @@ struct VulkanGpu(Copyable, Movable):
         """Destroy everything but the buffers, which belong to their owner and must be
         gone by now. The validation layers report anything left over here."""
         if self.instance == 0:
+            self._free_host_scratch()
             return
         self.close_swapchain()
         self.rewind()
@@ -2249,6 +2273,7 @@ struct VulkanGpu(Copyable, Movable):
             _ = call3(self.instance_call("vkDestroyDebugUtilsMessengerEXT"), self.instance, self.messenger, 0)
         _ = call2(self.instance_call("vkDestroyInstance"), self.instance, 0)
         self.instance = 0
+        self._free_host_scratch()
 
     # ========================================================================
     # Vulkan 1.3 AAA Hardware Graphics, Bindless Images, Sync2 & Ray Tracing

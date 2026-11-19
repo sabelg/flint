@@ -573,10 +573,10 @@ struct CrowdSimulator(Copyable, Movable):
 
         var raw_side_p = (px - ea_x) * nw_x + (pz - ea_z) * nw_z
         var raw_side_g = (gx - ea_x) * nw_x + (gz - ea_z) * nw_z
+        var g_side_x = nw_x if raw_side_g >= Float32(0.0) else -nw_x
+        var g_side_z = nw_z if raw_side_g >= Float32(0.0) else -nw_z
         if raw_side_p * raw_side_g > Float32(0.0) and abs(raw_side_p) > ri:
             # Both P and G lie strictly on the same side of this wall: steer wide on G's side without crossing
-            var g_side_x = nw_x if raw_side_g >= Float32(0.0) else -nw_x
-            var g_side_z = nw_z if raw_side_g >= Float32(0.0) else -nw_z
             return (gx + g_side_x * (ri + Float32(0.20)), gz + g_side_z * (ri + Float32(0.20)))
 
         var side_p = raw_side_p
@@ -620,7 +620,8 @@ struct CrowdSimulator(Copyable, Movable):
         var s_along = (px - ex) * (-tout_x) + (pz - ez) * (-tout_z)
         if s_along > Float32(0.05):
             return (gap_x + n_side_x * (ri + Float32(0.35)), gap_z + n_side_z * (ri + Float32(0.35)))
-        return (gap_x - n_side_x * (ri + Float32(0.45)), gap_z - n_side_z * (ri + Float32(0.45)))
+        # Once in the doorway opening, always pull onto GOAL's side (`g_side`), never `-n_side`!
+        return (gap_x + g_side_x * (ri + Float32(0.55)), gap_z + g_side_z * (ri + Float32(0.55)))
 
     def _project_agent_walls_swept(
         mut self,

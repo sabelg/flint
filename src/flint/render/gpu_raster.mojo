@@ -1623,8 +1623,14 @@ struct GpuRaster(Copyable, Movable):
                 return False
         elif not self.initialize_amdgpu():
             return False
+        if self.bounds_address != 0:
+            external_call["free", NoneType](self.bounds_address)
+            self.bounds_address = 0
         self.bounds_address = external_call["malloc", Int](MAX_TRIANGLES * 8)
         if not self.allocate_images(width, height):
+            if self.bounds_address != 0:
+                external_call["free", NoneType](self.bounds_address)
+                self.bounds_address = 0
             return False
         self.active = True
         return True
@@ -1841,7 +1847,14 @@ struct GpuRaster(Copyable, Movable):
     def shutdown(mut self):
         """Close the Vulkan device, so the validation layers can report any leak.
         The amdgpu backend's objects die with the file descriptor."""
-        if not self.active or self.backend != BACKEND_VULKAN:
+        if self.bounds_address != 0:
+            external_call["free", NoneType](self.bounds_address)
+            self.bounds_address = 0
+        if not self.active:
+            return
+        if self.backend != BACKEND_VULKAN:
+            self.active = False
+            self.gpu.close()
             return
         self.active = False
         _ = self.finish_frames()
