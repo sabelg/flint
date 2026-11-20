@@ -16,8 +16,11 @@ from std.math import sqrt, abs, min, max, floor
 from flint.core.math import Vec3
 from flint.core.detsort import mix64
 from flint.physics.solver_bodies import F8, LANES
+from flint.nav.navmesh import NavMesh, NavPath
 
 comptime _ORCA_HASH_BUCKETS: Int = 512
+comptime _ORCA_WALL_BUCKETS: Int = 512
+comptime _ORCA_WALL_CELL_SIZE: Float32 = 4.0
 comptime _ORCA_EPS: Float32 = 1.0e-5
 
 
@@ -342,6 +345,13 @@ struct CrowdSimulator(Copyable, Movable):
     var neighbor_dist: Float32
     var max_neighbors: Int
     var personal_space_margin: Float32
+    var agent_height: Float32
+
+    # Spatial hash grid over `walls` to eliminate O(N*W) scans
+    var _wall_head: List[Int]
+    var _wall_next: List[Int]
+    var _wall_seg_idx: List[Int]
+    var _wall_grid_dirty: Bool
 
     def __init__(
         out self,
@@ -372,6 +382,11 @@ struct CrowdSimulator(Copyable, Movable):
         self.neighbor_dist = max(Float32(0.5), neighbor_dist)
         self.max_neighbors = max(4, max_neighbors)
         self.personal_space_margin = Float32(0.025)
+        self.agent_height = Float32(2.0)
+        self._wall_head = List[Int]()
+        self._wall_next = List[Int]()
+        self._wall_seg_idx = List[Int]()
+        self._wall_grid_dirty = True
 
     def _pad_columns(mut self):
         var req = ((self.count + LANES - 1) // LANES) * LANES
@@ -438,6 +453,73 @@ struct CrowdSimulator(Copyable, Movable):
 
     def add_wall_segment(mut self, a: Vec3, b: Vec3):
         self.walls.append(CrowdWallSegment(a.x, a.z, b.x, b.z))
+        self._wall_grid_dirty = True
+
+    def clear_walls(mut self):
+        self.walls.clear()
+        self._wall_head.clear()
+        self._wall_next.clear()
+        self._wall_seg_idx.clear()
+        self._wall_grid_dirty = True
+
+    def _ensure_wall_grid(mut self):
+        if not self._wall_grid_dirty:
+            return
+        self._wall_grid_dirty = False
+        var n_walls = len(self.walls)
+        self._wall_next.clear()
+        self._wall_seg_idx.clear()
+        if n_walls == 0:
+            self._wall_head.clear()
+            return
+        self._wall_head = List[Int](length=_ORCA_WALL_BUCKETS, fill=-1)
+        var inv_wcs = Float32(1.0) / _ORCA_WALL_CELL_SIZE
+        for wi in range(n_walls):
+            var w = self.walls[wi]
+            var cx0 = Int(floor(min(w.ax, w.bx) * inv_wcs))
+            var cx1 = Int(floor(max(w.ax, w.bx) * inv_wcs))
+            var cz0 = Int(floor(min(w.az, w.bz) * inv_wcs))
+            var cz1 = Int(floor(max(w.az, w.bz) * inv_wcs))
+            # Cap extreme span to avoid degenerate cell explosion
+            if (cx1 - cx0 + 1) * (cz1 - cz0 + 1) > 4096:
+                cx1 = min(cx1, cx0 + 63)
+                cz1 = min(cz1, cz0 + 63)
+            for cz in range(cz0, cz1 + 1):
+                for cx in range(cx0, cx1 + 1):
+                    var bkt = Self._cell_bucket(cx, cz)
+                    var node = len(self._wall_seg_idx)
+                    self._wall_seg_idx.append(wi)
+                    self._wall_next.append(self._wall_head[bkt])
+                    self._wall_head[bkt] = node
+
+    def _query_wall_candidates(
+        self,
+        lo_x: Float32,
+        lo_z: Float32,
+        hi_x: Float32,
+        hi_z: Float32,
+        mut out_walls: List[Int],
+        mut stamp: List[Int],
+        cur_stamp: Int,
+    ):
+        out_walls.clear()
+        if len(self._wall_head) == 0:
+            return
+        var inv_wcs = Float32(1.0) / _ORCA_WALL_CELL_SIZE
+        var cx0 = Int(floor(lo_x * inv_wcs))
+        var cx1 = Int(floor(hi_x * inv_wcs))
+        var cz0 = Int(floor(lo_z * inv_wcs))
+        var cz1 = Int(floor(hi_z * inv_wcs))
+        for cz in range(cz0, cz1 + 1):
+            for cx in range(cx0, cx1 + 1):
+                var bkt = Self._cell_bucket(cx, cz)
+                var node = self._wall_head[bkt]
+                while node >= 0:
+                    var wi = self._wall_seg_idx[node]
+                    if stamp[wi] != cur_stamp:
+                        stamp[wi] = cur_stamp
+                        out_walls.append(wi)
+                    node = self._wall_next[node]
 
     def agent_position(self, idx: Int) -> Vec3:
         return Vec3(self.px[idx], self.py[idx], self.pz[idx])
@@ -446,13 +528,16 @@ struct CrowdSimulator(Copyable, Movable):
         return Vec3(self.vx[idx], self.vy[idx], self.vz[idx])
 
     def count_overlaps(self, tol: Float32 = 1.0e-4) -> Int:
-        """Counts pairs `(i, j)` with `i < j` whose 2D XZ distance is strictly below `r_i + r_j - tol`."""
+        """Counts pairs `(i, j)` with `i < j` within the same Y-band (`|py_j - py_i| < agent_height`)
+        whose 2D XZ distance is strictly below `r_i + r_j - tol`."""
         var overlaps = 0
         for i in range(self.count):
             if not self.active[i]:
                 continue
             for j in range(i + 1, self.count):
                 if not self.active[j]:
+                    continue
+                if abs(self.py[j] - self.py[i]) >= self.agent_height:
                     continue
                 var dx = self.px[j] - self.px[i]
                 var dz = self.pz[j] - self.pz[i]
@@ -467,8 +552,31 @@ struct CrowdSimulator(Copyable, Movable):
         var h = mix64(UInt64(cx + 65536) ^ (UInt64(cz + 65536) * 0x9E3779B97F4A7C15))
         return Int(h) & (_ORCA_HASH_BUCKETS - 1)
 
-    def _is_point_wall_clear(self, x: Float32, z: Float32, skip_w: Int, min_r: Float32) -> Bool:
+    def _is_point_wall_clear(
+        self,
+        x: Float32,
+        z: Float32,
+        skip_w: Int,
+        min_r: Float32,
+        mut cand_walls: List[Int],
+        mut stamp: List[Int],
+        mut cur_stamp: Int,
+    ) -> Bool:
         var r2 = min_r * min_r
+        if len(self._wall_head) > 0:
+            cur_stamp += 1
+            self._query_wall_candidates(x - min_r, z - min_r, x + min_r, z + min_r, cand_walls, stamp, cur_stamp)
+            for ci in range(len(cand_walls)):
+                var wi = cand_walls[ci]
+                if wi == skip_w:
+                    continue
+                var w = self.walls[wi]
+                var cp = _pt_seg_closest_xz(x, z, w.ax, w.az, w.bx, w.bz)
+                var dx = x - cp[0]
+                var dz = z - cp[1]
+                if dx * dx + dz * dz < r2:
+                    return False
+            return True
         for wi in range(len(self.walls)):
             if wi == skip_w:
                 continue
@@ -487,6 +595,9 @@ struct CrowdSimulator(Copyable, Movable):
         gx: Float32,
         gz: Float32,
         ri: Float32,
+        mut cand_walls: List[Int],
+        mut stamp: List[Int],
+        mut cur_stamp: Int,
     ) -> Tuple[Float32, Float32]:
         """When straight segment `P -> G` intersects or clips within `ri` of a wall segment,
         deflects the local steering target around the nearest open wall/doorway endpoint."""
@@ -505,7 +616,18 @@ struct CrowdSimulator(Copyable, Movable):
         var hit_wi = -1
         var best_t = Float32(2.0)
 
-        for wi in range(n_walls):
+        cur_stamp += 1
+        self._query_wall_candidates(
+            min(px, gx) - r_clear,
+            min(pz, gz) - r_clear,
+            max(px, gx) + r_clear,
+            max(pz, gz) + r_clear,
+            cand_walls,
+            stamp,
+            cur_stamp,
+        )
+        for ci in range(len(cand_walls)):
+            var wi = cand_walls[ci]
             var w = self.walls[wi]
             var dt_res = _seg_seg_dist2_and_t_xz(px, pz, gx, gz, w.ax, w.az, w.bx, w.bz)
             if dt_res[0] < r_clear2 and dt_res[1] < best_t:
@@ -591,8 +713,8 @@ struct CrowdSimulator(Copyable, Movable):
         var gap_b_x = eb_x + uw_x * gap_off
         var gap_b_z = eb_z + uw_z * gap_off
 
-        var ok_a = self._is_point_wall_clear(gap_a_x, gap_a_z, hit_wi, ri + Float32(0.05))
-        var ok_b = self._is_point_wall_clear(gap_b_x, gap_b_z, hit_wi, ri + Float32(0.05))
+        var ok_a = self._is_point_wall_clear(gap_a_x, gap_a_z, hit_wi, ri + Float32(0.05), cand_walls, stamp, cur_stamp)
+        var ok_b = self._is_point_wall_clear(gap_b_x, gap_b_z, hit_wi, ri + Float32(0.05), cand_walls, stamp, cur_stamp)
 
         var cost_a = sqrt((px - gap_a_x) * (px - gap_a_x) + (pz - gap_a_z) * (pz - gap_a_z)) + sqrt(
             (gx - gap_a_x) * (gx - gap_a_x) + (gz - gap_a_z) * (gz - gap_a_z)
@@ -629,13 +751,27 @@ struct CrowdSimulator(Copyable, Movable):
         prev_x: Float32,
         prev_z: Float32,
         margin: Float32,
+        mut cand_walls: List[Int],
+        mut stamp: List[Int],
+        mut cur_stamp: Int,
     ) -> Bool:
         """Enforces both swept non-crossing (`prev -> cur` vs wall segment) and capsule clearance `r_i + margin`."""
         var changed = False
         var ri = self.radius[i] + margin
         var ri2 = ri * ri
 
-        for wi in range(len(self.walls)):
+        cur_stamp += 1
+        self._query_wall_candidates(
+            min(prev_x, self.px[i]) - ri,
+            min(prev_z, self.pz[i]) - ri,
+            max(prev_x, self.px[i]) + ri,
+            max(prev_z, self.pz[i]) + ri,
+            cand_walls,
+            stamp,
+            cur_stamp,
+        )
+        for ci in range(len(cand_walls)):
+            var wi = cand_walls[ci]
             var w = self.walls[wi]
             var wx = w.bx - w.ax
             var wz = w.bz - w.az
@@ -695,11 +831,17 @@ struct CrowdSimulator(Copyable, Movable):
         var steer_x = List[Float32](length=self.padded, fill=Float32(1.0e6))
         var steer_z = List[Float32](length=self.padded, fill=Float32(1.0e6))
         var has_walls = len(self.walls) > 0
+        if has_walls:
+            self._ensure_wall_grid()
+        var wall_cands = List[Int]()
+        var wall_stamp = List[Int](length=len(self.walls), fill=0)
+        var cur_wall_stamp = 0
         for i in range(self.count):
             if self.active[i] and self.has_goal[i]:
                 if has_walls:
                     var tgt = self._steer_target_around_walls(
-                        self.px[i], self.pz[i], self.goal_x[i], self.goal_z[i], self.radius[i]
+                        self.px[i], self.pz[i], self.goal_x[i], self.goal_z[i], self.radius[i],
+                        wall_cands, wall_stamp, cur_wall_stamp,
                     )
                     steer_x[i] = tgt[0]
                     steer_z[i] = tgt[1]
@@ -783,25 +925,44 @@ struct CrowdSimulator(Copyable, Movable):
             var ri = self.radius[i]
             var mspd_i = self.max_speed[i]
 
-            var lines = List[OrcaLine](capacity=self.max_neighbors + len(self.walls))
-            for wi in range(len(self.walls)):
-                _add_wall_orca_line(
-                    aix, aiz, ri, mspd_i, self.walls[wi],
-                    self.time_horizon_obst, inv_tau_obst, inv_dt, lines,
+            var lines = List[OrcaLine](capacity=self.max_neighbors + 8)
+            if has_walls:
+                var wall_hdist = ri + Float32(0.025) + mspd_i * self.time_horizon_obst + Float32(0.25)
+                cur_wall_stamp += 1
+                self._query_wall_candidates(
+                    aix - wall_hdist,
+                    aiz - wall_hdist,
+                    aix + wall_hdist,
+                    aiz + wall_hdist,
+                    wall_cands,
+                    wall_stamp,
+                    cur_wall_stamp,
                 )
+                for ci in range(len(wall_cands)):
+                    var wi = wall_cands[ci]
+                    _add_wall_orca_line(
+                        aix, aiz, ri, mspd_i, self.walls[wi],
+                        self.time_horizon_obst, inv_tau_obst, inv_dt, lines,
+                    )
             var num_obst_lines = len(lines)
 
-            # Gather up to `max_neighbors` closest active agents from 3x3 cells
+            # Gather up to `max_neighbors` closest active agents from 3x3 cells within the same Y-band
             nb_indices.clear()
             nb_d2.clear()
             var icx = agent_cx[i]
             var icz = agent_cz[i]
+            var aiy = self.py[i]
             for dz_c in range(-1, 2):
                 for dx_c in range(-1, 2):
                     var bkt = Self._cell_bucket(icx + dx_c, icz + dz_c)
                     var j = head[bkt]
                     while j >= 0:
-                        if j != i and abs(agent_cx[j] - icx) <= 1 and abs(agent_cz[j] - icz) <= 1:
+                        if (
+                            j != i
+                            and abs(agent_cx[j] - icx) <= 1
+                            and abs(agent_cz[j] - icz) <= 1
+                            and abs(self.py[j] - aiy) < self.agent_height
+                        ):
                             var rx = self.px[j] - aix
                             var rz = self.pz[j] - aiz
                             var d2 = rx * rx + rz * rz
@@ -965,7 +1126,10 @@ struct CrowdSimulator(Copyable, Movable):
             var any_wall_fix = False
             if has_walls:
                 for i in range(self.count):
-                    if self.active[i] and self._project_agent_walls_swept(i, prev_px[i], prev_pz[i], Float32(3.5e-4)):
+                    if self.active[i] and self._project_agent_walls_swept(
+                        i, prev_px[i], prev_pz[i], Float32(3.5e-4),
+                        wall_cands, wall_stamp, cur_wall_stamp,
+                    ):
                         any_wall_fix = True
                         moved_by_proj[i] = True
 
@@ -990,12 +1154,13 @@ struct CrowdSimulator(Copyable, Movable):
                     continue
                 var icx = Int(floor(self.px[i] * dep_inv_cs))
                 var icz = Int(floor(self.pz[i] * dep_inv_cs))
+                var aiy = self.py[i]
                 for dz_c in range(-1, 2):
                     for dx_c in range(-1, 2):
                         var bkt = Self._cell_bucket(icx + dx_c, icz + dz_c)
                         var j = dep_head[bkt]
                         while j >= 0:
-                            if j > i:
+                            if j > i and abs(self.py[j] - aiy) < self.agent_height:
                                 var dx = self.px[j] - self.px[i]
                                 var dz = self.pz[j] - self.pz[i]
                                 var min_r = self.radius[i] + self.radius[j]
@@ -1022,7 +1187,10 @@ struct CrowdSimulator(Copyable, Movable):
 
             if has_walls and any_pair_fix:
                 for i in range(self.count):
-                    if self.active[i] and self._project_agent_walls_swept(i, prev_px[i], prev_pz[i], Float32(3.5e-4)):
+                    if self.active[i] and self._project_agent_walls_swept(
+                        i, prev_px[i], prev_pz[i], Float32(3.5e-4),
+                        wall_cands, wall_stamp, cur_wall_stamp,
+                    ):
                         any_wall_fix = True
                         moved_by_proj[i] = True
 
@@ -1042,3 +1210,145 @@ struct CrowdSimulator(Copyable, Movable):
                     evz *= sc
                 self.vx[i] = evx
                 self.vz[i] = evz
+
+
+# =========================================================================
+# NavMesh <-> ORCA Crowd Corridor Bridge (`NavCrowdAgent`, `CrowdNavBridge`)
+# =========================================================================
+
+struct NavCrowdAgent(Copyable, Movable):
+    """Links one `CrowdSimulator` agent to a `NavMesh` A*/SSFA waypoint corridor."""
+    var agent_id: Int
+    var path: NavPath
+    var waypoint_idx: Int
+    var goal: Vec3
+    var arrival_radius: Float32
+    var waypoint_radius: Float32
+    var repath_needed: Bool
+
+    def __init__(
+        out self,
+        agent_id: Int = -1,
+        goal: Vec3 = Vec3(),
+        arrival_radius: Float32 = 0.45,
+        waypoint_radius: Float32 = 0.65,
+    ):
+        self.agent_id = agent_id
+        self.path = NavPath()
+        self.waypoint_idx = 0
+        self.goal = goal
+        self.arrival_radius = max(Float32(0.05), arrival_radius)
+        self.waypoint_radius = max(Float32(0.10), waypoint_radius)
+        self.repath_needed = True
+
+
+struct CrowdNavBridge(Copyable, Movable):
+    """Connects `NavMesh` A*/SSFA paths directly to `CrowdSimulator` preferred velocities
+    and projects agent elevation `py` onto the walkable navmesh surface each tick."""
+    var agents: List[NavCrowdAgent]
+
+    def __init__(out self):
+        self.agents = List[NavCrowdAgent]()
+
+    def add_agent(
+        mut self,
+        mut crowd: CrowdSimulator,
+        nav: NavMesh,
+        start: Vec3,
+        goal: Vec3,
+        radius: Float32 = 0.35,
+        max_speed: Float32 = 3.5,
+        arrival_radius: Float32 = 0.45,
+        waypoint_radius: Float32 = 0.65,
+    ) -> Int:
+        var snap_start = nav.find_nearest_poly(start, Float32(4.0))
+        var pos0 = snap_start[1] if snap_start[0] >= 0 else start
+        var aid = crowd.add_agent(pos0, radius, max_speed)
+        var ag = NavCrowdAgent(aid, goal, arrival_radius, waypoint_radius)
+        ag.path = nav.find_path(pos0, goal)
+        ag.waypoint_idx = 1 if len(ag.path.waypoints) > 1 else 0
+        ag.repath_needed = not ag.path.found
+        var b_idx = len(self.agents)
+        self.agents.append(ag^)
+        return b_idx
+
+    def set_goal(mut self, bridge_idx: Int, crowd: CrowdSimulator, nav: NavMesh, goal: Vec3):
+        if bridge_idx < 0 or bridge_idx >= len(self.agents):
+            return
+        ref ag = self.agents[bridge_idx]
+        ag.goal = goal
+        var pos = crowd.agent_position(ag.agent_id)
+        ag.path = nav.find_path(pos, goal)
+        ag.waypoint_idx = 1 if len(ag.path.waypoints) > 1 else 0
+        ag.repath_needed = not ag.path.found
+
+    def mark_all_repath(mut self):
+        """Triggers path recomputation on next update (e.g. after dynamic `NavObstacle` carve)."""
+        for i in range(len(self.agents)):
+            self.agents[i].repath_needed = True
+
+    def is_arrived(self, bridge_idx: Int, crowd: CrowdSimulator) -> Bool:
+        if bridge_idx < 0 or bridge_idx >= len(self.agents):
+            return True
+        ref ag = self.agents[bridge_idx]
+        var pos = crowd.agent_position(ag.agent_id)
+        var dx = ag.goal.x - pos.x
+        var dz = ag.goal.z - pos.z
+        return dx * dx + dz * dz <= ag.arrival_radius * ag.arrival_radius
+
+    def update_preferred_velocities(mut self, mut crowd: CrowdSimulator, nav: NavMesh):
+        """Computes per-agent ORCA preferred velocities along each agent's `NavMesh` corridor."""
+        for i in range(len(self.agents)):
+            ref ag = self.agents[i]
+            var aid = ag.agent_id
+            if aid < 0 or aid >= crowd.count or not crowd.active[aid]:
+                continue
+            var pos = crowd.agent_position(aid)
+            if ag.repath_needed:
+                ag.path = nav.find_path(pos, ag.goal)
+                ag.waypoint_idx = 1 if len(ag.path.waypoints) > 1 else 0
+                ag.repath_needed = False
+
+            var n_wp = len(ag.path.waypoints)
+            if not ag.path.found or n_wp == 0:
+                crowd.set_preferred_velocity(aid, Vec3())
+                continue
+
+            # Advance through reached intermediate waypoints
+            var wp_r2 = ag.waypoint_radius * ag.waypoint_radius
+            while ag.waypoint_idx < n_wp - 1:
+                var wp = ag.path.waypoints[ag.waypoint_idx]
+                var ddx = wp.x - pos.x
+                var ddz = wp.z - pos.z
+                if ddx * ddx + ddz * ddz <= wp_r2:
+                    ag.waypoint_idx += 1
+                else:
+                    break
+
+            var target = ag.path.waypoints[min(ag.waypoint_idx, n_wp - 1)]
+            var dx = target.x - pos.x
+            var dz = target.z - pos.z
+            var d2 = dx * dx + dz * dz
+            var at_final = ag.waypoint_idx >= n_wp - 1
+            if at_final and d2 <= ag.arrival_radius * ag.arrival_radius:
+                crowd.set_preferred_velocity(aid, Vec3())
+                continue
+
+            var d = sqrt(max(Float32(1.0e-12), d2))
+            var mspd = crowd.max_speed[aid]
+            var spd = min(mspd, d * Float32(3.0)) if at_final else mspd
+            crowd.set_preferred_velocity(aid, Vec3((dx / d) * spd, Float32(0.0), (dz / d) * spd))
+
+    def update_and_step(mut self, mut crowd: CrowdSimulator, nav: NavMesh, dt: Float32):
+        """Updates preferred velocities from `NavMesh` corridors, steps ORCA SIMD8,
+        and snaps agent elevations `py` to the walkable navmesh surface."""
+        self.update_preferred_velocities(crowd, nav)
+        crowd.step_orca_simd8(dt)
+        for i in range(len(self.agents)):
+            var aid = self.agents[i].agent_id
+            if aid < 0 or aid >= crowd.count or not crowd.active[aid]:
+                continue
+            var pos = crowd.agent_position(aid)
+            var near = nav.find_nearest_poly(pos, Float32(2.0))
+            if near[0] >= 0:
+                crowd.py[aid] = near[1].y

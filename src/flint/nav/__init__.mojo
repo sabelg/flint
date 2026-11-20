@@ -19,4 +19,6 @@ from flint.nav.orca import (
     OrcaLine,
     CrowdWallSegment,
     CrowdSimulator,
+    NavCrowdAgent,
+    CrowdNavBridge,
 )

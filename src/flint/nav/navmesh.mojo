@@ -20,7 +20,7 @@ from std.math import sqrt, abs, min, max, floor
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import det_cos
 from flint.core.detsort import MinHeap
-from flint.core.serial import float32_bits
+from flint.core.serial import float32_bits, BlobWriter, BlobReader, fourcc
 from flint.physics.narrowphase import get_box_axes
 from flint.physics.shapes_v5 import (
     COMPOUND_CHILD_BOX,
@@ -37,6 +37,8 @@ from flint.physics.world import (
 )
 
 comptime NAV_DEG_TO_RAD: Float32 = 0.01745329252
+comptime NAVMESH_BLOB_TAG: UInt32 = fourcc("NAVM")
+comptime NAVMESH_BLOB_VERSION: Int = 1
 
 comptime OFFMESH_JUMP: UInt8 = 0
 comptime OFFMESH_DROP: UInt8 = 1
@@ -2023,3 +2025,259 @@ struct NavMesh(Copyable, Movable):
         res.total_length = dist_sum
         res.found = True
         return res^
+
+    # =========================================================================
+    # Binary Serialization (`NAVM` versioned blob)
+    # =========================================================================
+
+    def serialize(self, mut w: BlobWriter):
+        """Writes complete tiled `NavMesh` (config, compact heightfield, tiles, polygons,
+        portals, obstacles, and off-mesh links) as a bit-exact versioned `'NAVM'` blob."""
+        w.begin(NAVMESH_BLOB_TAG, NAVMESH_BLOB_VERSION)
+
+        # 1. Config
+        w.f32(self.cfg.cell_size)
+        w.f32(self.cfg.cell_height)
+        w.f32(self.cfg.walkable_slope_deg)
+        w.f32(self.cfg.walkable_height)
+        w.f32(self.cfg.walkable_climb)
+        w.f32(self.cfg.walkable_radius)
+        w.f32(self.cfg.max_edge_len)
+        w.f32(self.cfg.max_simplification_error)
+        w.integer(self.cfg.min_region_cells)
+        w.integer(self.cfg.tile_size)
+        w.integer(self.cfg.max_verts_per_poly)
+
+        # 2. CompactHeightfield
+        w.integer(self.chf.width)
+        w.integer(self.chf.depth)
+        w.vec3(self.chf.origin)
+        w.f32(self.chf.cell_size)
+        w.f32(self.chf.cell_height)
+        w.integer(len(self.chf.col_first))
+        for i in range(len(self.chf.col_first)):
+            w.integer(Int(self.chf.col_first[i]))
+            w.integer(Int(self.chf.col_count[i]))
+        w.integer(len(self.chf.spans))
+        for i in range(len(self.chf.spans)):
+            ref sp = self.chf.spans[i]
+            w.integer(Int(sp.x))
+            w.integer(Int(sp.z))
+            w.integer(Int(sp.y))
+            w.integer(Int(sp.ceiling))
+            w.u8(sp.base_area)
+            w.u8(sp.area)
+            w.integer(Int(sp.dist))
+            w.integer(Int(sp.reg))
+            w.integer(Int(sp.n0))
+            w.integer(Int(sp.n1))
+            w.integer(Int(sp.n2))
+            w.integer(Int(sp.n3))
+
+        # 3. Tile grid
+        w.integer(self.tiles_x)
+        w.integer(self.tiles_z)
+        w.integer(self.tile_size)
+        w.integer(len(self.tiles))
+        for ti in range(len(self.tiles)):
+            ref t = self.tiles[ti]
+            w.integer(t.tx)
+            w.integer(t.tz)
+            w.integer(t.x0)
+            w.integer(t.x1)
+            w.integer(t.z0)
+            w.integer(t.z1)
+            w.integer(len(t.span_indices))
+            for k in range(len(t.span_indices)):
+                w.integer(Int(t.span_indices[k]))
+            w.integer(len(t.poly_ids))
+            for k in range(len(t.poly_ids)):
+                w.integer(t.poly_ids[k])
+
+        # 4. Polygons & portals
+        w.integer(len(self.polys))
+        for pi in range(len(self.polys)):
+            ref p = self.polys[pi]
+            w.integer(len(p.verts))
+            for k in range(len(p.verts)):
+                w.vec3(p.verts[k])
+            w.vec3(p.center)
+            w.vec3(p.plane_n)
+            w.f32(p.plane_d)
+            w.integer(len(p.neighbors))
+            for k in range(len(p.neighbors)):
+                w.integer(p.neighbors[k])
+                w.vec3(p.portal_left[k])
+                w.vec3(p.portal_right[k])
+            w.f32(p.area_cost)
+            w.integer(Int(p.region_id))
+
+        w.integer(len(self.poly_owner_tile))
+        for i in range(len(self.poly_owner_tile)):
+            w.integer(self.poly_owner_tile[i])
+        w.integer(Int(self.next_region_id))
+
+        # 5. Obstacles
+        w.integer(len(self.obstacles))
+        for i in range(len(self.obstacles)):
+            ref obs = self.obstacles[i]
+            w.integer(obs.id)
+            w.u8(obs.shape)
+            w.vec3(obs.pos)
+            w.f32(obs.rot.x); w.f32(obs.rot.y); w.f32(obs.rot.z); w.f32(obs.rot.w)
+            w.vec3(obs.half_extents)
+            w.f32(obs.radius)
+            w.f32(obs.half_height)
+            w.boolean(obs.active)
+
+        # 6. Off-mesh links
+        w.integer(len(self.off_mesh_links))
+        for i in range(len(self.off_mesh_links)):
+            ref lnk = self.off_mesh_links[i]
+            w.integer(lnk.id)
+            w.vec3(lnk.start_pos)
+            w.vec3(lnk.end_pos)
+            w.f32(lnk.radius)
+            w.u8(lnk.kind)
+            w.boolean(lnk.bidirectional)
+            w.f32(lnk.cost_scale)
+            w.boolean(lnk.enabled)
+            w.integer(lnk.start_poly)
+            w.integer(lnk.end_poly)
+
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        """Restores a `NavMesh` from a `'NAVM'` binary blob."""
+        var ver = r.enter(NAVMESH_BLOB_TAG, NAVMESH_BLOB_VERSION)
+        _ = ver
+
+        # 1. Config
+        self.cfg = NavMeshConfig()
+        self.cfg.cell_size = r.f32()
+        self.cfg.cell_height = r.f32()
+        self.cfg.walkable_slope_deg = r.f32()
+        self.cfg.walkable_height = r.f32()
+        self.cfg.walkable_climb = r.f32()
+        self.cfg.walkable_radius = r.f32()
+        self.cfg.max_edge_len = r.f32()
+        self.cfg.max_simplification_error = r.f32()
+        self.cfg.min_region_cells = r.integer()
+        self.cfg.tile_size = r.integer()
+        self.cfg.max_verts_per_poly = r.integer()
+
+        # 2. CompactHeightfield
+        self.chf = CompactHeightfield()
+        self.chf.width = r.integer()
+        self.chf.depth = r.integer()
+        self.chf.origin = r.vec3()
+        self.chf.cell_size = r.f32()
+        self.chf.cell_height = r.f32()
+        var n_cols = r.integer()
+        self.chf.col_first = List[Int32](capacity=n_cols)
+        self.chf.col_count = List[UInt16](capacity=n_cols)
+        for _ in range(n_cols):
+            self.chf.col_first.append(Int32(r.integer()))
+            self.chf.col_count.append(UInt16(r.integer()))
+        var n_spans = r.integer()
+        self.chf.spans = List[CompactSpan](capacity=n_spans)
+        for _ in range(n_spans):
+            var sx = Int32(r.integer())
+            var sz = Int32(r.integer())
+            var sy = UInt16(r.integer())
+            var scei = UInt16(r.integer())
+            var ba = r.u8()
+            var ar = r.u8()
+            var dist = UInt16(r.integer())
+            var reg = Int32(r.integer())
+            var n0 = Int32(r.integer())
+            var n1 = Int32(r.integer())
+            var n2 = Int32(r.integer())
+            var n3 = Int32(r.integer())
+            self.chf.spans.append(CompactSpan(sx, sz, sy, scei, ba, ar, dist, reg, n0, n1, n2, n3))
+
+        # 3. Tile grid
+        self.tiles_x = r.integer()
+        self.tiles_z = r.integer()
+        self.tile_size = r.integer()
+        var n_tiles = r.integer()
+        self.tiles = List[NavTile](capacity=n_tiles)
+        for _ in range(n_tiles):
+            var tx = r.integer()
+            var tz = r.integer()
+            var x0 = r.integer()
+            var x1 = r.integer()
+            var z0 = r.integer()
+            var z1 = r.integer()
+            var t = NavTile(tx, tz, x0, x1, z0, z1)
+            var n_sp = r.integer()
+            t.span_indices = List[Int32](capacity=n_sp)
+            for _ in range(n_sp):
+                t.span_indices.append(Int32(r.integer()))
+            var n_p = r.integer()
+            t.poly_ids = List[Int](capacity=n_p)
+            for _ in range(n_p):
+                t.poly_ids.append(r.integer())
+            self.tiles.append(t^)
+
+        # 4. Polygons & portals
+        var n_polys = r.integer()
+        self.polys = List[NavPoly](capacity=n_polys)
+        for _ in range(n_polys):
+            var p = NavPoly()
+            var nv = r.integer()
+            p.verts = List[Vec3](capacity=nv)
+            for _ in range(nv):
+                p.verts.append(r.vec3())
+            p.center = r.vec3()
+            p.plane_n = r.vec3()
+            p.plane_d = r.f32()
+            var nn = r.integer()
+            p.neighbors = List[Int](capacity=nn)
+            p.portal_left = List[Vec3](capacity=nn)
+            p.portal_right = List[Vec3](capacity=nn)
+            for _ in range(nn):
+                p.neighbors.append(r.integer())
+                p.portal_left.append(r.vec3())
+                p.portal_right.append(r.vec3())
+            p.area_cost = r.f32()
+            p.region_id = Int32(r.integer())
+            self.polys.append(p^)
+
+        var n_own = r.integer()
+        self.poly_owner_tile = List[Int](capacity=n_own)
+        for _ in range(n_own):
+            self.poly_owner_tile.append(r.integer())
+        self.next_region_id = Int32(r.integer())
+
+        # 5. Obstacles
+        var n_obs = r.integer()
+        self.obstacles = List[NavObstacle](capacity=n_obs)
+        for _ in range(n_obs):
+            var oid = r.integer()
+            var osh = r.u8()
+            var opos = r.vec3()
+            var qx = r.f32(); var qy = r.f32(); var qz = r.f32(); var qw = r.f32()
+            var ohe = r.vec3()
+            var orad = r.f32()
+            var ohh = r.f32()
+            var oact = r.boolean()
+            self.obstacles.append(NavObstacle(oid, osh, opos, Quat(qx, qy, qz, qw), ohe, orad, ohh, oact))
+
+        # 6. Off-mesh links
+        var n_lnk = r.integer()
+        self.off_mesh_links = List[OffMeshLink](capacity=n_lnk)
+        for _ in range(n_lnk):
+            var lid = r.integer()
+            var sp = r.vec3()
+            var ep = r.vec3()
+            var lrad = r.f32()
+            var lkind = r.u8()
+            var lbi = r.boolean()
+            var lcs = r.f32()
+            var lenb = r.boolean()
+            var lstart = r.integer()
+            var lend = r.integer()
+            self.off_mesh_links.append(OffMeshLink(lid, sp, ep, lrad, lkind, lbi, lcs, lenb, lstart, lend))
+
+        r.leave()
