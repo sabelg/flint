@@ -39,12 +39,16 @@ from flint.net.rollback import (
 from flint.net import (
     BitReader,
     BitWriter,
+    CHAN_ACK_HEARTBEAT,
+    CHAN_RELIABLE_ORDERED,
     DatagramView,
     IPV6_SAFE_MTU_BYTES,
     JITTER_TRIANGULAR,
+    MAX_RELIABLE_FRAG_COUNT,
     NetChannel,
     NetHub,
     NetEndpoint,
+    PacketWireHeader,
     ROLLBACK_INPUT_HISTORY_K,
     RollbackInput,
     RollbackSession,
@@ -56,6 +60,7 @@ from flint.net import (
     VirtualEndpoint,
     VirtualNetSim,
     VisualSmoother,
+    WIRE_HEADER_BYTES,
     quat_angular_error_deg,
     seq_diff,
     seq_gt,
@@ -704,10 +709,11 @@ def _forge_rollback_wire_packet(
     w.write_u8(UInt8(claimed_sender & 0xFF))
     w.write_u16(UInt16((tick + 500) & 0xFFFF))
     w.write_u16(UInt16(0))
+    w.write_u32(UInt32(max(0, tick)))
+    w.write_u32(UInt32(max(0, tick)))
+    w.write_u32(UInt32(0))
+    w.write_u8(UInt8(1))
     w.write_bool(False)
-    w.write_u32(UInt32(max(0, tick)))
-    w.write_u32(UInt32(max(0, tick)))
-    w.write_int_bounded(1, 1, ROLLBACK_INPUT_HISTORY_K)
     w.write_bool(True)
     w.write_u32(UInt32(max(0, forged_ck_tick)))
     w.write_u64(forged_ck_hash)
@@ -982,6 +988,229 @@ def test_h_net_hub_routing_accept_drop() raises:
     assert_true(host.datagrams_routed > 10)
 
 
+def _put_u16_le(mut buf: List[UInt8], v: UInt16):
+    buf.append(UInt8(v & 0xFF))
+    buf.append(UInt8((v >> 8) & 0xFF))
+
+
+def _put_u64_le(mut buf: List[UInt8], v: UInt64):
+    for s in range(8):
+        buf.append(UInt8((v >> UInt64(s * 8)) & 0xFF))
+
+
+def test_i_security_dos_and_wraparound_regressions() raises:
+    print("  [Test I] Security DoS guards, 0xFFFF wraparound, >8-pkt burst rollback recovery & BitReader/NetHub/Physics guards...")
+
+    # (a) Spoofed future cum_rel_ack DoS guard in NetChannel._process_rel_sack
+    var peer = NetEndpoint.ipv4_loopback(9901)
+    var ch = NetChannel(peer, IPV6_SAFE_MTU_BYTES)
+    var ack_pkt = List[UInt8]()
+    var ack_hdr = PacketWireHeader(0x56, CHAN_ACK_HEARTBEAT, 1, 0, 0)
+    ack_hdr.write_into(ack_pkt)
+    _put_u16_le(ack_pkt, UInt16(500))  # spoofed future cum_rel_ack when next_send_rel_seq == 0
+    _put_u64_le(ack_pkt, UInt64(0xFFFFFFFFFFFFFFFF))
+    var ack_view = DatagramView(peer, Int(ack_pkt.unsafe_ptr()), len(ack_pkt))
+    assert_true(ch.ingest_datagram(ack_view, 100.0))
+    _ = len(ack_pkt)
+    assert_equal(Int(ch.oldest_unacked_rel_seq), 0)
+    assert_equal(Int(ch.next_send_rel_seq), 0)
+
+    # Also test with 2 fragments in flight and spoofed cum_rel_ack == 500
+    var small_msg = List[UInt8](length=64, fill=0x42)
+    assert_true(ch.send_reliable(small_msg))
+    assert_equal(Int(ch.next_send_rel_seq), 1)
+    var ack_pkt2 = List[UInt8]()
+    var ack_hdr2 = PacketWireHeader(0x56, CHAN_ACK_HEARTBEAT, 2, 0, 0)
+    ack_hdr2.write_into(ack_pkt2)
+    _put_u16_le(ack_pkt2, UInt16(500))
+    _put_u64_le(ack_pkt2, UInt64(0xFFFF))
+    var ack_view2 = DatagramView(peer, Int(ack_pkt2.unsafe_ptr()), len(ack_pkt2))
+    assert_true(ch.ingest_datagram(ack_view2, 110.0))
+    _ = len(ack_pkt2)
+    assert_equal(Int(ch.oldest_unacked_rel_seq), 0)  # must remain 0 (spoofed future ACK ignored)
+
+    # (b) frag_cnt > 4096 rejection in NetChannel.ingest_datagram
+    var bad_frag_pkt = List[UInt8]()
+    var rel_hdr = PacketWireHeader(0x56, CHAN_RELIABLE_ORDERED, 3, 0, 0)
+    rel_hdr.write_into(bad_frag_pkt)
+    _put_u16_le(bad_frag_pkt, UInt16(0))  # cum_ack
+    _put_u64_le(bad_frag_pkt, UInt64(0))  # sack_bits
+    _put_u16_le(bad_frag_pkt, UInt16(0))  # rseq
+    _put_u16_le(bad_frag_pkt, UInt16(1))  # msg_id
+    _put_u16_le(bad_frag_pkt, UInt16(0))  # frag_idx
+    _put_u16_le(bad_frag_pkt, UInt16(MAX_RELIABLE_FRAG_COUNT + 1))  # frag_cnt == 4097
+    _put_u16_le(bad_frag_pkt, UInt16(4))  # plen
+    for _ in range(4):
+        bad_frag_pkt.append(UInt8(0xAA))
+    var bad_frag_view = DatagramView(
+        peer, Int(bad_frag_pkt.unsafe_ptr()), len(bad_frag_pkt)
+    )
+    assert_false(
+        ch.ingest_datagram(bad_frag_view, 120.0),
+        "frag_cnt > 4096 must be rejected",
+    )
+    _ = len(bad_frag_pkt)
+    assert_false(ch.assembling_active)
+    assert_equal(len(ch.incoming_reliable), 0)
+
+    # (c) snap_seq == 0xFFFF wraparound baseline preservation + truncated packet & monotonic guard
+    var rep = SnapshotReplicator(
+        max_entities=16,
+        max_clients=1,
+        max_packet_bytes=1000,
+        interest_radius=200.0,
+        world_bounds=256.0,
+    )
+    var cli = SnapshotClientReceiver(16, 256.0)
+    rep.set_client_view(0, Vec3(0.0, 0.0, 0.0), 200.0)
+    rep.clients[0].next_snap_seq = UInt16(0xFFFE)
+
+    # Tick 0xFFFE: spawn entity 0 and stationary entity 1
+    rep.set_entity(0, Vec3(10.0, 1.0, 0.0), Quat.identity(), Vec3(), UInt32(1))
+    rep.set_entity(1, Vec3(20.0, 2.0, 5.0), Quat.identity(), Vec3(), UInt32(7))
+    rep.prepare_tick()
+    var p_fffe = rep.build_client_packet(0)
+    assert_equal(Int(p_fffe[0]), 0xFFFE)
+    var r_fffe = cli.apply_packet(p_fffe[1])
+    assert_true(r_fffe[0])
+    assert_equal(Int(r_fffe[1]), 0xFFFE)
+    rep.notify_client_ack(0, r_fffe[1])
+
+    # Tick 0xFFFF: move entity 0 only; entity 1 stays stationary (not re-sent in delta)
+    rep.set_entity(0, Vec3(11.0, 1.0, 0.0), Quat.identity(), Vec3(), UInt32(1))
+    rep.prepare_tick()
+    var p_ffff = rep.build_client_packet(0)
+    assert_equal(Int(p_ffff[0]), 0xFFFF)
+    var r_ffff = cli.apply_packet(p_ffff[1])
+    assert_true(r_ffff[0])
+    assert_equal(Int(r_ffff[1]), 0xFFFF)
+    rep.notify_client_ack(0, r_ffff[1])
+
+    # Tick 0x0000: delta against base_seq == 0xFFFF! Must preserve entity 1 in baseline!
+    rep.set_entity(0, Vec3(12.0, 1.0, 0.0), Quat.identity(), Vec3(), UInt32(2))
+    rep.prepare_tick()
+    var p_0000 = rep.build_client_packet(0)
+    assert_equal(Int(p_0000[0]), 0x0000)
+    var r_0000 = cli.apply_packet(p_0000[1])
+    assert_true(r_0000[0], "delta against base_seq == 0xFFFF must decode cleanly")
+    assert_equal(Int(r_0000[1]), 0x0000)
+    assert_true(
+        cli.baselines[0].entities[1].known,
+        "stationary entity 1 must remain known in baseline across 0xFFFF -> 0x0000 wraparound",
+    )
+    assert_equal(Int(cli.baselines[0].entities[1].state_flags), 7)
+    assert_true(abs(cli.entities[0].pos.x - Float32(12.0)) < Float32(0.05))
+    assert_equal(Int(cli.entities[0].state_flags), 2)
+    rep.notify_client_ack(0, r_0000[1])
+
+    # Monotonic guard: stale packet 0xFFFF after 0x0000 must be rejected
+    assert_false(
+        cli.apply_packet(p_ffff[1])[0],
+        "stale out-of-order snapshot must be rejected by seq_gt guard",
+    )
+    # Truncated future packet must fail without destroying valid baseline
+    rep.set_entity(0, Vec3(15.0, 1.0, 0.0), Quat.identity(), Vec3(), UInt32(3))
+    rep.prepare_tick()
+    var p_0001 = rep.build_client_packet(0)
+    var trunc_pkt = List[UInt8]()
+    for i in range(min(10, len(p_0001[1]) - 1)):
+        trunc_pkt.append(p_0001[1][i])
+    assert_false(cli.apply_packet(trunc_pkt)[0], "truncated snapshot must fail")
+    assert_equal(Int(cli.last_decoded_seq), 0x0000)
+    assert_true(abs(cli.entities[0].pos.x - Float32(12.0)) < Float32(0.05))
+    # Valid packet 0x0001 still decodes cleanly after truncated attempt
+    assert_true(cli.apply_packet(p_0001[1])[0])
+    assert_equal(Int(cli.last_decoded_seq), 0x0001)
+
+    # (d) >8-packet burst loss rollback recovery without deadlock (14 consecutive drops!)
+    var sim14 = VirtualNetSim.from_rtt(rtt_ms=20.0, jitter_ms=0.0, loss_rate=0.0, seed=1414)
+    var ep0 = sim14.create_ipv4_peer(0, 9910)
+    var ep1 = sim14.create_ipv4_peer(1, 9910)
+    var addrs = List[NetEndpoint]()
+    addrs.append(ep0.local_endpoint())
+    addrs.append(ep1.local_endpoint())
+
+    var w0 = ChaosArenaWorld(4)
+    var w1 = ChaosArenaWorld(4)
+    var s0 = RollbackSession[TestCmdInput](0, addrs, input_delay_ticks=2, max_rollback_ticks=8)
+    var s1 = RollbackSession[TestCmdInput](1, addrs, input_delay_ticks=2, max_rollback_ticks=8)
+    s0.enable_rift_pacing = False
+    s1.enable_rift_pacing = False
+    s0.bind_world(w0)
+    s1.bind_world(w1)
+
+    for f in range(150):
+        if f == 20:
+            # Drop 14 consecutive outbound packets from peer 0 (far exceeding old K=8 limit!)
+            sim14.drop_next_outbound_packets(0, 14)
+        var now = sim14.now_ms()
+        var c0 = _make_cmd(0, s0.current_tick)
+        var c1 = _make_cmd(1, s1.current_tick)
+        _ = s0.step_frame(c0, w0, ep0, now)
+        _ = s1.step_frame(c1, w1, ep1, now)
+        sim14.advance_ms(1000.0 / 60.0)
+
+    assert_false(s0.desync_detected, "peer 0 must recover from 14-pkt burst loss with 0 desyncs")
+    assert_false(s1.desync_detected, "peer 1 must recover from 14-pkt burst loss with 0 desyncs")
+    assert_true(
+        s0.confirmed_tick >= 100 and s1.confirmed_tick >= 100,
+        "14-pkt burst loss must NOT deadlock rollback session",
+    )
+    for t in range(100):
+        assert_equal(s0.confirmed_hash_history[t], s1.confirmed_hash_history[t])
+
+    # (e) NetHub idle peer eviction, BitReader/BitWriter safety, and PhysicsRollbackAdapter error surfacing
+    var sim_hub = VirtualNetSim(seed=777, one_way_latency_ms=5.0, jitter_ms=0.0, loss_rate=0.0)
+    var hub_host = NetHub[VirtualEndpoint](
+        sim_hub.create_ipv4_peer(0, 9920), True, max_channels=1, idle_timeout_ms=200.0
+    )
+    var hub_c0 = NetHub[VirtualEndpoint](sim_hub.create_ipv4_peer(1, 9920), False)
+    var hub_c1 = NetHub[VirtualEndpoint](sim_hub.create_ipv4_peer(2, 9920), False)
+    _ = hub_c0.connect(hub_host.local_endpoint())
+    _ = hub_c1.connect(hub_host.local_endpoint())
+    assert_true(hub_c0.send_unreliable(0, _hub_msg(1, 16), sim_hub.now_ms()))
+    for _ in range(5):
+        hub_host.poll(sim_hub.now_ms())
+        sim_hub.advance_ms(10.0)
+    assert_equal(hub_host.open_count(), 1)
+    # Advance past 200ms idle timeout without traffic from c0 -> c0 must be evicted
+    sim_hub.advance_ms(250.0)
+    hub_host.poll(sim_hub.now_ms())
+    assert_equal(len(hub_host.evicted), 1)
+    assert_equal(hub_host.open_count(), 0)
+    # Now c1 can be accepted into the freed slot
+    assert_true(hub_c1.send_unreliable(0, _hub_msg(2, 16), sim_hub.now_ms()))
+    for _ in range(5):
+        hub_host.poll(sim_hub.now_ms())
+        sim_hub.advance_ms(10.0)
+    assert_equal(hub_host.open_count(), 1)
+
+    # BitReader null ptr & read_bytes_aligned overflow & write_f32_quantized NaN guards
+    var null_r = BitReader.from_raw_ptr(0, 16)
+    assert_true(null_r.overflowed)
+    assert_equal(Int(null_r.read_u32()), 0)
+    var small_buf = List[UInt8](length=4, fill=0x11)
+    var ov_r = BitReader(small_buf)
+    var ov_bytes = ov_r.read_bytes_aligned(1 << 60)
+    assert_true(ov_r.overflowed)
+    assert_equal(len(ov_bytes), 0)
+    var nan_w = BitWriter(16)
+    var zero_f = Float32(0.0)
+    var nan_val = zero_f / zero_f
+    nan_w.write_f32_quantized(nan_val, -1.0, 1.0, 10)
+    var nan_r = BitReader(nan_w.finish())
+    var decoded_nan = nan_r.read_f32_quantized(-1.0, 1.0, 10)
+    assert_true(decoded_nan == decoded_nan and decoded_nan >= Float32(-1.0) and decoded_nan <= Float32(1.0))
+
+    # PhysicsRollbackAdapter.load_snapshot surfaces corrupt deserialize failure instead of swallowing
+    var bad_pw = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var corrupt = List[UInt8](length=8, fill=0xFF)
+    bad_pw.load_snapshot(Int(corrupt.unsafe_ptr()), len(corrupt))
+    _ = len(corrupt)
+    assert_true(bad_pw.snapshot_load_failed)
+    assert_equal(bad_pw.snapshot_load_failures, 1)
+
+
 def main() raises:
     var t_start = monotonic()
     set_sim_float_mode()
@@ -996,6 +1225,7 @@ def main() raises:
     test_f_lab_bench_suite_harness()
     test_g_physics_world_rollback_and_spoof_auth()
     test_h_net_hub_routing_accept_drop()
+    test_i_security_dos_and_wraparound_regressions()
     var total_ms = Float64(monotonic() - t_start) / 1.0e6
     print("============================================================")
     print(" [PASS] ALL FLINT V5 NET & ROLLBACK TESTS PASSED (" + String(Int(total_ms)) + " ms)")

@@ -27,6 +27,7 @@ comptime _IPV6_V6ONLY: Int32 = 26
 comptime _MSG_DONTWAIT: Int32 = 0x40
 comptime _MSG_NOSIGNAL: Int32 = 0x4000
 comptime _EAGAIN: Int32 = 11
+comptime _ENOBUFS: Int32 = 105
 
 comptime _SOCKADDR_IN6_LEN: Int = 28
 comptime _SOCKADDR_STRIDE: Int = 32
@@ -476,6 +477,7 @@ struct UdpSocket(NetTransport):
             _store_u64_le(m_slot, 16, UInt64(v_slot))
 
         var sent_total = 0
+        var should_retain = True
         while sent_total < count:
             var mmsg_ptr = Pointer[UInt8, MutAnyOrigin](
                 unsafe_from_address=base_mmsg + sent_total * _MMSGHDR_STRIDE
@@ -491,14 +493,40 @@ struct UdpSocket(NetTransport):
             )
             self.sendmmsg_calls += 1
             if rc < 0:
-                if last_errno() == EINTR:
+                var err = last_errno()
+                if err == EINTR:
                     continue
+                if err != _EAGAIN and err != _ENOBUFS:
+                    should_retain = False
                 break
             if rc == 0:
                 break
             sent_total += rc
 
-        self.tx_queued = 0
+        var remaining = (count - sent_total) if should_retain else 0
+        if remaining > 0 and sent_total > 0:
+            # Compact unsent datagrams [sent_total .. count - 1] to [0 .. remaining - 1]
+            _ = external_call["memmove", Int](
+                base_payload,
+                base_payload + sent_total * UDP_MAX_DATAGRAM_BYTES,
+                Int64(remaining * UDP_MAX_DATAGRAM_BYTES),
+            )
+            _ = external_call["memmove", Int](
+                base_addr,
+                base_addr + sent_total * _SOCKADDR_STRIDE,
+                Int64(remaining * _SOCKADDR_STRIDE),
+            )
+            _ = external_call["memmove", Int](
+                base_iov,
+                base_iov + sent_total * _IOVEC_STRIDE,
+                Int64(remaining * _IOVEC_STRIDE),
+            )
+            _ = external_call["memmove", Int](
+                base_mmsg,
+                base_mmsg + sent_total * _MMSGHDR_STRIDE,
+                Int64(remaining * _MMSGHDR_STRIDE),
+            )
+        self.tx_queued = remaining
         self.total_sent_packets += sent_total
         return sent_total
 
@@ -507,7 +535,9 @@ struct UdpSocket(NetTransport):
     ) -> Bool:
         if not self.queue_send_raw(dst, data_ptr, length):
             return False
-        return self.flush_sends() == 1
+        var expected = self.tx_queued
+        var sent = self.flush_sends()
+        return sent >= expected and self.tx_queued == 0
 
     def send_to(mut self, dst: NetEndpoint, payload: List[UInt8]) -> Bool:
         if len(payload) == 0:

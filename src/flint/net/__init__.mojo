@@ -2,7 +2,9 @@
 from flint.net.bitpack import (
     BitReader,
     BitWriter,
+    BitWriterMark,
     bits_required,
+    pack_quat_smallest_three,
     quat_angular_error_deg,
 )
 from flint.net.socket_udp import (
@@ -26,6 +28,7 @@ from flint.net.channel import (
     CHAN_UNRELIABLE_SEQUENCED,
     IPV6_SAFE_MTU_BYTES,
     MAX_FRAGMENT_PAYLOAD_BYTES,
+    MAX_RELIABLE_FRAG_COUNT,
     NetChannel,
     PacketWireHeader,
     WIRE_HEADER_BYTES,
@@ -33,9 +36,14 @@ from flint.net.channel import (
     seq_ge,
     seq_gt,
 )
-from flint.net.hub import NET_HUB_DEFAULT_MAX_CHANNELS, NetHub
+from flint.net.hub import (
+    NET_HUB_DEFAULT_IDLE_TIMEOUT_MS,
+    NET_HUB_DEFAULT_MAX_CHANNELS,
+    NetHub,
+)
 from flint.net.rollback import (
     ROLLBACK_INPUT_HISTORY_K,
+    ROLLBACK_MAX_INPUTS_PER_PACKET,
     ROLLBACK_SNAPSHOT_RING,
     RollbackInput,
     RollbackSession,

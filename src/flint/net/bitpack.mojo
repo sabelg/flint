@@ -113,6 +113,141 @@ def _reconstruct_quat_from_three(
     return Quat(c0, c1, c2, cm).normalized()
 
 
+@fieldwise_init
+struct BitWriterMark(Copyable, ImplicitlyCopyable, Movable):
+    """Saved cursor state for zero-allocation `BitWriter` rollback on budget overflow."""
+    var data_len: Int
+    var scratch: UInt64
+    var scratch_bits: Int
+    var total_bits: Int
+
+
+def pack_quat_smallest_three(q_in: Quat) -> UInt32:
+    """Packs a quaternion into a 32-bit Smallest-Three codeword (`2` index bits + `30`-bit BCC lattice).
+
+    Maps the exact Smallest-Three Voronoi cell bijectively onto `[-1, 1]^3` with zero wasted
+    codewords and quantizes onto a Body-Centered Cubic (`2 * 812^3 < 2^30`) lattice using
+    16-candidate geodesic search (`< 0.10 deg` worst-case SO(3) error, ~0.04 deg typical).
+    """
+    var q = q_in.normalized()
+    var ax = abs(q.x)
+    var ay = abs(q.y)
+    var az = abs(q.z)
+    var aw = abs(q.w)
+
+    var max_idx = 0
+    var max_val = ax
+    if ay > max_val:
+        max_idx = 1
+        max_val = ay
+    if az > max_val:
+        max_idx = 2
+        max_val = az
+    if aw > max_val:
+        max_idx = 3
+
+    var sign = Float32(1.0)
+    if (
+        (max_idx == 0 and q.x < Float32(0.0))
+        or (max_idx == 1 and q.y < Float32(0.0))
+        or (max_idx == 2 and q.z < Float32(0.0))
+        or (max_idx == 3 and q.w < Float32(0.0))
+    ):
+        sign = Float32(-1.0)
+
+    var qpos = Quat(q.x * sign, q.y * sign, q.z * sign, q.w * sign)
+    var c0: Float32
+    var c1: Float32
+    var c2: Float32
+    var cm: Float32
+    if max_idx == 0:
+        cm = qpos.x
+        c0 = qpos.y
+        c1 = qpos.z
+        c2 = qpos.w
+    elif max_idx == 1:
+        c0 = qpos.x
+        cm = qpos.y
+        c1 = qpos.z
+        c2 = qpos.w
+    elif max_idx == 2:
+        c0 = qpos.x
+        c1 = qpos.y
+        cm = qpos.z
+        c2 = qpos.w
+    else:
+        c0 = qpos.x
+        c1 = qpos.y
+        c2 = qpos.z
+        cm = qpos.w
+
+    var inv_cm = Float32(1.0) / max(Float32(0.49), cm)
+    var u0 = _gnomonic_unwarp(max(Float32(-1.0), min(Float32(1.0), c0 * inv_cm)))
+    var u1 = _gnomonic_unwarp(max(Float32(-1.0), min(Float32(1.0), c1 * inv_cm)))
+    var u2 = _gnomonic_unwarp(max(Float32(-1.0), min(Float32(1.0), c2 * inv_cm)))
+
+    var best_p = 0
+    var best_i0 = 405
+    var best_i1 = 405
+    var best_i2 = 405
+    var best_err_sq = Float32(1.0e30)
+
+    for parity in range(2):
+        var max_coord = 810 if parity == 1 else 811
+        var shift = Float32(0.5) if parity == 1 else Float32(0.0)
+        var f0 = max(
+            Float32(0.0),
+            min(
+                Float32(max_coord),
+                (u0 + Float32(1.0)) * Float32(405.5) - shift,
+            ),
+        )
+        var f1 = max(
+            Float32(0.0),
+            min(
+                Float32(max_coord),
+                (u1 + Float32(1.0)) * Float32(405.5) - shift,
+            ),
+        )
+        var f2 = max(
+            Float32(0.0),
+            min(
+                Float32(max_coord),
+                (u2 + Float32(1.0)) * Float32(405.5) - shift,
+            ),
+        )
+        var lo0 = min(max_coord, max(0, Int(f0)))
+        var lo1 = min(max_coord, max(0, Int(f1)))
+        var lo2 = min(max_coord, max(0, Int(f2)))
+        var hi0 = min(max_coord, lo0 + 1)
+        var hi1 = min(max_coord, lo1 + 1)
+        var hi2 = min(max_coord, lo2 + 1)
+
+        for corner in range(8):
+            var i0 = hi0 if (corner & 1) != 0 else lo0
+            var i1 = hi1 if (corner & 2) != 0 else lo1
+            var i2 = hi2 if (corner & 4) != 0 else lo2
+            var cand = _decode_bcc_quat32(max_idx, parity, i0, i1, i2)
+            if qpos.dot(cand) < Float32(0.0):
+                cand = Quat(-cand.x, -cand.y, -cand.z, -cand.w)
+            var dx = qpos.x - cand.x
+            var dy = qpos.y - cand.y
+            var dz = qpos.z - cand.z
+            var dw = qpos.w - cand.w
+            var err_sq = dx * dx + dy * dy + dz * dz + dw * dw
+            if err_sq < best_err_sq:
+                best_err_sq = err_sq
+                best_p = parity
+                best_i0 = i0
+                best_i1 = i1
+                best_i2 = i2
+
+    comptime SUBLATTICE_SIZE: UInt32 = 812 * 812 * 812
+    var idx3d = UInt32((best_i0 * 812 + best_i1) * 812 + best_i2)
+    var code30 = UInt32(best_p) * SUBLATTICE_SIZE + idx3d
+    return UInt32(max_idx & 3) | (code30 << 2)
+
+
 struct BitWriter(Copyable, Movable):
     """Packs arbitrary-width bitfields LSB-first into a reusable byte buffer."""
     var data: List[UInt8]
@@ -140,6 +275,22 @@ struct BitWriter(Copyable, Movable):
     @always_inline
     def byte_length(self) -> Int:
         return len(self.data) + ((self.scratch_bits + 7) >> 3)
+
+    @always_inline
+    def mark(self) -> BitWriterMark:
+        """Captures current cursor state for O(1) rollback via `restore()`."""
+        return BitWriterMark(
+            len(self.data), self.scratch, self.scratch_bits, self.total_bits
+        )
+
+    @always_inline
+    def restore(mut self, m: BitWriterMark):
+        """Rolls back cursor state to a previously captured `BitWriterMark` without reallocating."""
+        while len(self.data) > m.data_len:
+            _ = self.data.pop()
+        self.scratch = m.scratch
+        self.scratch_bits = m.scratch_bits
+        self.total_bits = m.total_bits
 
     @always_inline
     def _write_bits_small(mut self, value: UInt64, num_bits: Int):
@@ -233,9 +384,12 @@ struct BitWriter(Copyable, Movable):
         var b = max(1, min(31, num_bits))
         var levels = (1 << b) - 1
         var span = max(Float32(1.0e-9), max_val - min_val)
+        var safe_val = value if value == value else min_val
         var norm = max(
-            Float32(0.0), min(Float32(1.0), (value - min_val) / span)
+            Float32(0.0), min(Float32(1.0), (safe_val - min_val) / span)
         )
+        if norm != norm:
+            norm = Float32(0.0)
         var q = Int(norm * Float32(levels) + Float32(0.5))
         q = max(0, min(levels, q))
         self._write_bits_small(UInt64(q), b)
@@ -252,130 +406,8 @@ struct BitWriter(Copyable, Movable):
         self.write_f32_quantized(v.z, min_val, max_val, bits_per_axis)
 
     def write_quat_smallest_three(mut self, q_in: Quat):
-        """32-bit Smallest-Three quaternion (`2` index bits + `30`-bit BCC cube-mapped lattice).
-
-        Maps the exact Smallest-Three Voronoi cell bijectively onto `[-1, 1]^3` with zero wasted
-        codewords and quantizes onto a Body-Centered Cubic (`2 * 812^3 < 2^30`) lattice using
-        16-candidate geodesic search (`< 0.10 deg` worst-case SO(3) error, ~0.04 deg typical).
-        """
-        var q = q_in.normalized()
-        var ax = abs(q.x)
-        var ay = abs(q.y)
-        var az = abs(q.z)
-        var aw = abs(q.w)
-
-        var max_idx = 0
-        var max_val = ax
-        if ay > max_val:
-            max_idx = 1
-            max_val = ay
-        if az > max_val:
-            max_idx = 2
-            max_val = az
-        if aw > max_val:
-            max_idx = 3
-
-        var sign = Float32(1.0)
-        if (
-            (max_idx == 0 and q.x < Float32(0.0))
-            or (max_idx == 1 and q.y < Float32(0.0))
-            or (max_idx == 2 and q.z < Float32(0.0))
-            or (max_idx == 3 and q.w < Float32(0.0))
-        ):
-            sign = Float32(-1.0)
-
-        var qpos = Quat(q.x * sign, q.y * sign, q.z * sign, q.w * sign)
-        var c0: Float32
-        var c1: Float32
-        var c2: Float32
-        var cm: Float32
-        if max_idx == 0:
-            cm = qpos.x
-            c0 = qpos.y
-            c1 = qpos.z
-            c2 = qpos.w
-        elif max_idx == 1:
-            c0 = qpos.x
-            cm = qpos.y
-            c1 = qpos.z
-            c2 = qpos.w
-        elif max_idx == 2:
-            c0 = qpos.x
-            c1 = qpos.y
-            cm = qpos.z
-            c2 = qpos.w
-        else:
-            c0 = qpos.x
-            c1 = qpos.y
-            c2 = qpos.z
-            cm = qpos.w
-
-        var inv_cm = Float32(1.0) / max(Float32(0.49), cm)
-        var u0 = _gnomonic_unwarp(max(Float32(-1.0), min(Float32(1.0), c0 * inv_cm)))
-        var u1 = _gnomonic_unwarp(max(Float32(-1.0), min(Float32(1.0), c1 * inv_cm)))
-        var u2 = _gnomonic_unwarp(max(Float32(-1.0), min(Float32(1.0), c2 * inv_cm)))
-
-        var best_p = 0
-        var best_i0 = 405
-        var best_i1 = 405
-        var best_i2 = 405
-        var best_err_sq = Float32(1.0e30)
-
-        for parity in range(2):
-            var max_coord = 810 if parity == 1 else 811
-            var shift = Float32(0.5) if parity == 1 else Float32(0.0)
-            var f0 = max(
-                Float32(0.0),
-                min(
-                    Float32(max_coord),
-                    (u0 + Float32(1.0)) * Float32(405.5) - shift,
-                ),
-            )
-            var f1 = max(
-                Float32(0.0),
-                min(
-                    Float32(max_coord),
-                    (u1 + Float32(1.0)) * Float32(405.5) - shift,
-                ),
-            )
-            var f2 = max(
-                Float32(0.0),
-                min(
-                    Float32(max_coord),
-                    (u2 + Float32(1.0)) * Float32(405.5) - shift,
-                ),
-            )
-            var lo0 = min(max_coord, max(0, Int(f0)))
-            var lo1 = min(max_coord, max(0, Int(f1)))
-            var lo2 = min(max_coord, max(0, Int(f2)))
-            var hi0 = min(max_coord, lo0 + 1)
-            var hi1 = min(max_coord, lo1 + 1)
-            var hi2 = min(max_coord, lo2 + 1)
-
-            for corner in range(8):
-                var i0 = hi0 if (corner & 1) != 0 else lo0
-                var i1 = hi1 if (corner & 2) != 0 else lo1
-                var i2 = hi2 if (corner & 4) != 0 else lo2
-                var cand = _decode_bcc_quat32(max_idx, parity, i0, i1, i2)
-                if qpos.dot(cand) < Float32(0.0):
-                    cand = Quat(-cand.x, -cand.y, -cand.z, -cand.w)
-                var dx = qpos.x - cand.x
-                var dy = qpos.y - cand.y
-                var dz = qpos.z - cand.z
-                var dw = qpos.w - cand.w
-                var err_sq = dx * dx + dy * dy + dz * dz + dw * dw
-                if err_sq < best_err_sq:
-                    best_err_sq = err_sq
-                    best_p = parity
-                    best_i0 = i0
-                    best_i1 = i1
-                    best_i2 = i2
-
-        comptime SUBLATTICE_SIZE: UInt32 = 812 * 812 * 812
-        var idx3d = UInt32((best_i0 * 812 + best_i1) * 812 + best_i2)
-        var code30 = UInt32(best_p) * SUBLATTICE_SIZE + idx3d
-        var packed = UInt32(max_idx & 3) | (code30 << 2)
-        self._write_bits_small(UInt64(packed), 32)
+        """32-bit Smallest-Three quaternion (`2` index bits + `30`-bit BCC cube-mapped lattice)."""
+        self._write_bits_small(UInt64(pack_quat_smallest_three(q_in)), 32)
 
     @always_inline
     def write_quat32(mut self, q_in: Quat):
@@ -488,9 +520,15 @@ struct BitReader(Copyable, Movable):
     def from_raw_ptr(addr: Int, byte_len: Int) -> Self:
         """Zero-copy view over a live datagram buffer `(addr, byte_len)`."""
         var r = Self(List[UInt8](), 0)
+        if addr == 0 or byte_len <= 0:
+            r.raw_addr = 0
+            r.bit_pos = 0
+            r.bit_len = 0
+            r.overflowed = addr == 0 and byte_len > 0
+            return r^
         r.raw_addr = addr
         r.bit_pos = 0
-        r.bit_len = max(0, byte_len) * 8
+        r.bit_len = byte_len * 8
         r.overflowed = False
         return r^
 
@@ -584,7 +622,11 @@ struct BitReader(Copyable, Movable):
 
     def read_bytes_aligned(mut self, byte_count: Int) -> List[UInt8]:
         self.align_to_byte()
-        if byte_count < 0 or self.overflowed or self.bit_pos + byte_count * 8 > self.bit_len:
+        if (
+            byte_count < 0
+            or self.overflowed
+            or byte_count > ((self.bit_len - self.bit_pos) >> 3)
+        ):
             self.overflowed = True
             self.bit_pos = self.bit_len
             return List[UInt8]()

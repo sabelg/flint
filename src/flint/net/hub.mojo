@@ -20,6 +20,7 @@ from flint.net.socket_udp import DatagramView, NetEndpoint, NetTransport, UDP_RI
 from flint.net.channel import IPV6_SAFE_MTU_BYTES, NetChannel, WIRE_HEADER_BYTES, WIRE_MAGIC_VER
 
 comptime NET_HUB_DEFAULT_MAX_CHANNELS: Int = 256
+comptime NET_HUB_DEFAULT_IDLE_TIMEOUT_MS: Float64 = 30000.0
 
 
 struct NetHub[T: NetTransport & Deinitable](Movable):
@@ -27,11 +28,14 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
     var transport: Self.T
     var chans: List[NetChannel]
     var alive: List[Bool]
+    var last_rx_ms: List[Float64]
     var count: Int
     var accept: Bool
     var max_channels: Int
     var mtu_bytes: Int
+    var idle_timeout_ms: Float64
     var accepted: List[Int]
+    var evicted: List[Int]
     var datagrams_routed: Int
     var datagrams_ignored: Int
     var _views: List[DatagramView]
@@ -42,15 +46,19 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
         accept: Bool,
         max_channels: Int = NET_HUB_DEFAULT_MAX_CHANNELS,
         mtu_bytes: Int = IPV6_SAFE_MTU_BYTES,
+        idle_timeout_ms: Float64 = NET_HUB_DEFAULT_IDLE_TIMEOUT_MS,
     ):
         self.transport = transport^
         self.chans = List[NetChannel]()
         self.alive = List[Bool]()
+        self.last_rx_ms = List[Float64]()
         self.count = 0
         self.accept = accept
         self.max_channels = max(1, max_channels)
         self.mtu_bytes = mtu_bytes
+        self.idle_timeout_ms = idle_timeout_ms
         self.accepted = List[Int]()
+        self.evicted = List[Int]()
         self.datagrams_routed = 0
         self.datagrams_ignored = 0
         self._views = List[DatagramView](capacity=UDP_RING_CAPACITY)
@@ -85,11 +93,13 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
             if not self.alive[i]:
                 self.chans[i] = NetChannel(e, self.mtu_bytes)
                 self.alive[i] = True
+                self.last_rx_ms[i] = -1.0
                 return i
         if self.count >= self.max_channels:
             return -1
         self.chans.append(NetChannel(e, self.mtu_bytes))
         self.alive.append(True)
+        self.last_rx_ms.append(-1.0)
         self.count += 1
         return self.count - 1
 
@@ -97,10 +107,25 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
         """Forget a channel (its queued messages too)."""
         if self.is_open(cid):
             self.alive[cid] = False
+            self.last_rx_ms[cid] = -1.0
+
+    def _evict_idle_channels(mut self, now_ms: Float64):
+        if self.idle_timeout_ms <= 0.0:
+            return
+        for i in range(self.count):
+            if (
+                self.alive[i]
+                and self.last_rx_ms[i] >= 0.0
+                and (now_ms - self.last_rx_ms[i]) >= self.idle_timeout_ms
+            ):
+                self.alive[i] = False
+                self.last_rx_ms[i] = -1.0
+                self.evicted.append(i)
 
     def poll(mut self, now_ms: Float64):
-        """Receive and route everything waiting, then resend, ack and flush on every channel."""
+        """Receive and route everything waiting, evict idle peers, then resend/ack/flush."""
         self.accepted.clear()
+        self.evicted.clear()
         while True:
             var n = self.transport.recv_batch(self._views)
             if n <= 0:
@@ -116,12 +141,20 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
                         self.datagrams_ignored += 1
                         continue
                     cid = self.connect(v.sender)
+                    if cid < 0 and self.idle_timeout_ms > 0.0:
+                        self._evict_idle_channels(now_ms)
+                        cid = self.connect(v.sender)
                     if cid < 0:
                         self.datagrams_ignored += 1
                         continue
                     self.accepted.append(cid)
+                self.last_rx_ms[cid] = now_ms
                 _ = self.chans[cid].ingest_datagram(v, now_ms)
                 self.datagrams_routed += 1
+        for i in range(self.count):
+            if self.alive[i] and self.last_rx_ms[i] < 0.0:
+                self.last_rx_ms[i] = now_ms
+        self._evict_idle_channels(now_ms)
         for i in range(self.count):
             if self.alive[i]:
                 self.chans[i].poll(self.transport, now_ms, False)

@@ -17,6 +17,11 @@ comptime WIRE_MAGIC_VER: UInt8 = 0x56  # 'V' (Flint v5 wire protocol v1)
 comptime WIRE_HEADER_BYTES: Int = 14
 comptime IPV6_SAFE_MTU_BYTES: Int = 1180
 comptime MAX_FRAGMENT_PAYLOAD_BYTES: Int = 1024
+comptime MAX_RELIABLE_FRAG_COUNT: Int = 4096
+comptime MAX_RELIABLE_MESSAGE_BYTES: Int = 4 * 1024 * 1024
+comptime MAX_INCOMING_RELIABLE_MESSAGES: Int = 256
+comptime MAX_INCOMING_RELIABLE_BYTES: Int = 8 * 1024 * 1024
+comptime MAX_INCOMING_UNRELIABLE_MESSAGES: Int = 256
 
 comptime CHAN_UNRELIABLE_RAW: UInt8 = 0
 comptime CHAN_UNRELIABLE_SEQUENCED: UInt8 = 1
@@ -204,6 +209,7 @@ struct NetChannel(Movable):
     var next_expected_rel_seq: UInt16
     var in_frags: List[_ReliableInFrag]
     var incoming_reliable: List[List[UInt8]]
+    var incoming_reliable_bytes: Int
     var needs_ack_flush: Bool
 
     # Reassembly staging for current head message
@@ -262,6 +268,7 @@ struct NetChannel(Movable):
         for _ in range(_RELIABLE_WINDOW):
             self.in_frags.append(_ReliableInFrag())
         self.incoming_reliable = List[List[UInt8]]()
+        self.incoming_reliable_bytes = 0
         self.needs_ack_flush = False
 
         self.assembling_active = False
@@ -414,14 +421,30 @@ struct NetChannel(Movable):
         return bits
 
     def _process_rel_sack(mut self, cum_rel_ack: UInt16, rel_sack_bits: UInt64):
+        # Reject spoofed future cumulative ACKs beyond what we have actually sent.
+        if seq_gt(cum_rel_ack, self.next_send_rel_seq):
+            return
         # Cumulative reliable ACK: every rel_seq strictly before `cum_rel_ack` was delivered!
-        while seq_gt(cum_rel_ack, self.oldest_unacked_rel_seq):
-            self._mark_rel_seq_acked(self.oldest_unacked_rel_seq)
+        while (
+            seq_gt(cum_rel_ack, self.oldest_unacked_rel_seq)
+            and seq_gt(self.next_send_rel_seq, self.oldest_unacked_rel_seq)
+        ):
+            var prev = self.oldest_unacked_rel_seq
+            var head_idx = Int(prev) & (_RELIABLE_WINDOW - 1)
+            if (
+                not self.out_frags[head_idx].active
+                or self.out_frags[head_idx].rel_seq != prev
+            ):
+                break
+            self._mark_rel_seq_acked(prev)
+            if self.oldest_unacked_rel_seq == prev:
+                break
         # Selective ACK bits for `cum_rel_ack + 1 + k`
         for k in range(64):
             if ((rel_sack_bits >> UInt64(k)) & UInt64(1)) != 0:
                 var rseq = UInt16((Int(cum_rel_ack) + 1 + k) & 0xFFFF)
-                self._mark_rel_seq_acked(rseq)
+                if seq_gt(self.next_send_rel_seq, rseq):
+                    self._mark_rel_seq_acked(rseq)
 
     def _promote_pending_frags(mut self):
         while len(self.pending_out_queue) > 0:
@@ -486,7 +509,7 @@ struct NetChannel(Movable):
             return False
         var total = len(message)
         var frag_count = max(1, (total + max_chunk - 1) // max_chunk)
-        if frag_count > 4096:
+        if frag_count > MAX_RELIABLE_FRAG_COUNT or total > MAX_RELIABLE_MESSAGE_BYTES:
             return False
 
         var msg_id = self.next_msg_id
@@ -573,26 +596,48 @@ struct NetChannel(Movable):
             var f_cnt = self.in_frags[slot].frag_count
 
             if f_idx == 0:
-                self.assembling_active = True
-                self.assembling_msg_id = f_msg
-                self.assembling_expected_idx = 0
-                self.assembling_frag_count = f_cnt
-                self.assembling_bytes.clear()
+                if f_cnt > 0 and Int(f_cnt) <= MAX_RELIABLE_FRAG_COUNT:
+                    self.assembling_active = True
+                    self.assembling_msg_id = f_msg
+                    self.assembling_expected_idx = 0
+                    self.assembling_frag_count = f_cnt
+                    self.assembling_bytes.clear()
+                else:
+                    self.assembling_active = False
+                    self.assembling_bytes.clear()
 
             if (
                 self.assembling_active
                 and self.assembling_msg_id == f_msg
                 and self.assembling_expected_idx == f_idx
             ):
-                for b in range(len(self.in_frags[slot].payload)):
-                    self.assembling_bytes.append(
-                        self.in_frags[slot].payload[b]
-                    )
-                self.assembling_expected_idx += 1
-                if self.assembling_expected_idx >= self.assembling_frag_count:
-                    self.incoming_reliable.append(self.assembling_bytes.copy())
+                var frag_len = len(self.in_frags[slot].payload)
+                if (
+                    len(self.assembling_bytes) + frag_len
+                    > MAX_RELIABLE_MESSAGE_BYTES
+                ):
                     self.assembling_bytes.clear()
                     self.assembling_active = False
+                else:
+                    for b in range(frag_len):
+                        self.assembling_bytes.append(
+                            self.in_frags[slot].payload[b]
+                        )
+                    self.assembling_expected_idx += 1
+                    if self.assembling_expected_idx >= self.assembling_frag_count:
+                        var msg_bytes = len(self.assembling_bytes)
+                        if (
+                            len(self.incoming_reliable)
+                            < MAX_INCOMING_RELIABLE_MESSAGES
+                            and self.incoming_reliable_bytes + msg_bytes
+                            <= MAX_INCOMING_RELIABLE_BYTES
+                        ):
+                            self.incoming_reliable.append(
+                                self.assembling_bytes.copy()
+                            )
+                            self.incoming_reliable_bytes += msg_bytes
+                        self.assembling_bytes.clear()
+                        self.assembling_active = False
 
             self.in_frags[slot].received = False
             self.in_frags[slot].payload.clear()
@@ -634,6 +679,13 @@ struct NetChannel(Movable):
                     _ = external_call["memcpy", Int](
                         Int(out.unsafe_ptr()), body_ptr + 2, Int64(msg_len)
                     )
+                if len(self.incoming_unreliable) >= MAX_INCOMING_UNRELIABLE_MESSAGES:
+                    var rem_u = len(self.incoming_unreliable) - 1
+                    for u_i in range(rem_u):
+                        self.incoming_unreliable[u_i] = (
+                            self.incoming_unreliable[u_i + 1].copy()
+                        )
+                    _ = self.incoming_unreliable.pop()
                 self.incoming_unreliable.append(out^)
             return True
 
@@ -647,17 +699,22 @@ struct NetChannel(Movable):
         if kind == CHAN_RELIABLE_ORDERED:
             if body_len < 20:
                 return False
-            var cum_ack = _get_u16_ptr(body_ptr, 0)
-            var sack_bits = _get_u64_ptr(body_ptr, 2)
-            self._process_rel_sack(cum_ack, sack_bits)
-
             var rseq = _get_u16_ptr(body_ptr, 10)
             var msg_id = _get_u16_ptr(body_ptr, 12)
             var frag_idx = _get_u16_ptr(body_ptr, 14)
             var frag_cnt = _get_u16_ptr(body_ptr, 16)
             var plen = Int(_get_u16_ptr(body_ptr, 18))
-            if 20 + plen > body_len or frag_cnt == 0 or frag_idx >= frag_cnt:
+            if (
+                20 + plen > body_len
+                or frag_cnt == 0
+                or Int(frag_cnt) > MAX_RELIABLE_FRAG_COUNT
+                or frag_idx >= frag_cnt
+            ):
                 return False
+
+            var cum_ack = _get_u16_ptr(body_ptr, 0)
+            var sack_bits = _get_u64_ptr(body_ptr, 2)
+            self._process_rel_sack(cum_ack, sack_bits)
 
             self.needs_ack_flush = True
             # Ignore already-delivered or far-future fragments outside window
@@ -752,6 +809,9 @@ struct NetChannel(Movable):
         for i in range(rem):
             self.incoming_reliable[i] = self.incoming_reliable[i + 1].copy()
         _ = self.incoming_reliable.pop()
+        self.incoming_reliable_bytes = max(
+            0, self.incoming_reliable_bytes - len(msg)
+        )
         return (True, msg^)
 
     def pop_unreliable_message(mut self) -> Tuple[Bool, List[UInt8]]:

@@ -11,7 +11,13 @@ from std.collections import List
 from std.math import abs, floor, max, min
 from flint.core.detsort import mix64, stable_order
 from flint.core.math import Quat, Vec3
-from flint.net.bitpack import BitReader, BitWriter, quat_angular_error_deg
+from flint.net.bitpack import (
+    BitReader,
+    BitWriter,
+    pack_quat_smallest_three,
+    quat_angular_error_deg,
+)
+from flint.net.channel import seq_gt
 
 comptime DIRTY_NONE: UInt8 = 0
 comptime DIRTY_POS: UInt8 = 1 << 0
@@ -53,6 +59,7 @@ struct _QuantizedEntitySnap(Copyable, ImplicitlyCopyable, Movable):
     var qy: Int
     var qz: Int
     var rot: Quat
+    var packed_rot: UInt32
     var vx: Int
     var vy: Int
     var vz: Int
@@ -64,6 +71,7 @@ struct _QuantizedEntitySnap(Copyable, ImplicitlyCopyable, Movable):
         self.qy = 0
         self.qz = 0
         self.rot = Quat.identity()
+        self.packed_rot = 0
         self.vx = 0
         self.vy = 0
         self.vz = 0
@@ -247,7 +255,6 @@ struct SnapshotReplicator(Movable):
     var candidate_masks: List[UInt8]
     var sort_keys: List[Int]
     var writer: BitWriter
-    var entity_scratch: BitWriter
 
     def __init__(
         out self,
@@ -289,7 +296,6 @@ struct SnapshotReplicator(Movable):
         )
         self.sort_keys = List[Int](capacity=self.max_entities)
         self.writer = BitWriter(1200)
-        self.entity_scratch = BitWriter(64)
 
     @always_inline
     def _quant_pos(self, v: Float32) -> Int:
@@ -357,6 +363,11 @@ struct SnapshotReplicator(Movable):
         """Records that `client_id` received and reconstructed `acked_snap_seq`."""
         if client_id < 0 or client_id >= self.max_clients:
             return
+        if (
+            self.clients[client_id].has_acked_seq
+            and not seq_gt(acked_snap_seq, self.clients[client_id].last_acked_seq)
+        ):
+            return
         var slot = Int(acked_snap_seq) & _BASELINE_MASK
         if (
             self.clients[client_id].baselines[slot].valid
@@ -366,7 +377,7 @@ struct SnapshotReplicator(Movable):
             self.clients[client_id].last_acked_seq = acked_snap_seq
 
     def prepare_tick(mut self):
-        """Quantizes current world state once and rebuilds the 2D/3D spatial interest grid."""
+        """Quantizes current world state once (including 32-bit rotations) and rebuilds the spatial grid."""
         for i in range(self.max_entities):
             if not self.entities[i].active:
                 self.quantized_now[i].known = False
@@ -377,6 +388,7 @@ struct SnapshotReplicator(Movable):
             q.qy = self._quant_pos(self.entities[i].pos.y)
             q.qz = self._quant_pos(self.entities[i].pos.z)
             q.rot = self.entities[i].rot
+            q.packed_rot = pack_quat_smallest_three(self.entities[i].rot)
             q.vx = self._quant_vel(self.entities[i].vel.x)
             q.vy = self._quant_vel(self.entities[i].vel.y)
             q.vz = self._quant_vel(self.entities[i].vel.z)
@@ -392,7 +404,10 @@ struct SnapshotReplicator(Movable):
         var mask = DIRTY_NONE
         if cur.qx != base.qx or cur.qy != base.qy or cur.qz != base.qz:
             mask |= DIRTY_POS
-        if quat_angular_error_deg(cur.rot, base.rot) > Float32(0.12):
+        if (
+            cur.packed_rot != base.packed_rot
+            and quat_angular_error_deg(cur.rot, base.rot) > Float32(0.12)
+        ):
             mask |= DIRTY_ROT
         if cur.vx != base.vx or cur.vy != base.vy or cur.vz != base.vz:
             mask |= DIRTY_VEL
@@ -412,14 +427,16 @@ struct SnapshotReplicator(Movable):
             (Int(snap_seq) + 1) & 0xFFFF
         )
 
+        var new_slot = Int(snap_seq) & _BASELINE_MASK
         var has_base = False
-        var base_seq = UInt16(0xFFFF)
+        var base_seq = UInt16(0)
         var base_slot = 0
         if self.clients[client_id].has_acked_seq:
             var try_seq = self.clients[client_id].last_acked_seq
             var try_slot = Int(try_seq) & _BASELINE_MASK
             if (
-                self.clients[client_id].baselines[try_slot].valid
+                try_slot != new_slot
+                and self.clients[client_id].baselines[try_slot].valid
                 and self.clients[client_id].baselines[try_slot].seq == try_seq
             ):
                 has_base = True
@@ -470,7 +487,6 @@ struct SnapshotReplicator(Movable):
         var order = stable_order(self.sort_keys)
 
         # Prepare new baseline slot copied from ACKed baseline (or clean if full snapshot)
-        var new_slot = Int(snap_seq) & _BASELINE_MASK
         self.clients[client_id].baselines[new_slot].valid = True
         self.clients[client_id].baselines[new_slot].seq = snap_seq
         for e in range(self.max_entities):
@@ -480,12 +496,14 @@ struct SnapshotReplicator(Movable):
                 else _QuantizedEntitySnap()
             )
 
-        # Encode header (`8` bytes: magic u16, snap_seq u16, base_seq u16, count_placeholder u16)
+        # Encode header (`8` bytes + 1-bit `has_base` flag):
+        # magic u16, snap_seq u16, base_seq u16, count_placeholder u16, has_base bool
         self.writer.clear()
         self.writer.write_u16(_REPL_MAGIC)
         self.writer.write_u16(snap_seq)
         self.writer.write_u16(base_seq)
         self.writer.write_u16(0)  # patched after packing budgeted entities
+        self.writer.write_bool(has_base)
 
         var packed_entities = 0
         for ord_i in range(len(order)):
@@ -498,9 +516,10 @@ struct SnapshotReplicator(Movable):
                 else _QuantizedEntitySnap()
             )
 
-            self.entity_scratch.clear()
-            self.entity_scratch.write_int_bounded(eid, 0, self.max_entities - 1)
-            self.entity_scratch.write_bits(UInt64(mask & 0x0F), 4)
+            # Write directly to `self.writer` with zero-alloc rollback on budget overflow
+            var saved_mark = self.writer.mark()
+            self.writer.write_int_bounded(eid, 0, self.max_entities - 1)
+            self.writer.write_bits(UInt64(mask & 0x0F), 4)
 
             if (mask & DIRTY_POS) != 0:
                 var dx = cur_q.qx - base_q.qx
@@ -512,44 +531,31 @@ struct SnapshotReplicator(Movable):
                     and abs(dy) <= 127
                     and abs(dz) <= 127
                 )
-                self.entity_scratch.write_bool(use_small_delta)
+                self.writer.write_bool(use_small_delta)
                 if use_small_delta:
-                    self.entity_scratch.write_int_bounded(dx, -127, 127)
-                    self.entity_scratch.write_int_bounded(dy, -127, 127)
-                    self.entity_scratch.write_int_bounded(dz, -127, 127)
+                    self.writer.write_int_bounded(dx, -127, 127)
+                    self.writer.write_int_bounded(dy, -127, 127)
+                    self.writer.write_int_bounded(dz, -127, 127)
                 else:
-                    self.entity_scratch.write_bits(UInt64(cur_q.qx), 16)
-                    self.entity_scratch.write_bits(UInt64(cur_q.qy), 16)
-                    self.entity_scratch.write_bits(UInt64(cur_q.qz), 16)
+                    self.writer.write_bits(UInt64(cur_q.qx), 16)
+                    self.writer.write_bits(UInt64(cur_q.qy), 16)
+                    self.writer.write_bits(UInt64(cur_q.qz), 16)
 
             if (mask & DIRTY_ROT) != 0:
-                self.entity_scratch.write_quat_smallest_three(cur_q.rot)
+                self.writer.write_u32(cur_q.packed_rot)
 
             if (mask & DIRTY_VEL) != 0:
-                self.entity_scratch.write_bits(UInt64(cur_q.vx), 12)
-                self.entity_scratch.write_bits(UInt64(cur_q.vy), 12)
-                self.entity_scratch.write_bits(UInt64(cur_q.vz), 12)
+                self.writer.write_bits(UInt64(cur_q.vx), 12)
+                self.writer.write_bits(UInt64(cur_q.vy), 12)
+                self.writer.write_bits(UInt64(cur_q.vz), 12)
 
             if (mask & DIRTY_STATE) != 0:
-                self.entity_scratch.write_u32(cur_q.state_flags)
+                self.writer.write_u32(cur_q.state_flags)
 
-            var projected_bits = (
-                self.writer.bit_length() + self.entity_scratch.bit_length()
-            )
-            var projected_bytes = (projected_bits + 7) >> 3
-            if projected_bytes > self.max_packet_bytes:
+            if self.writer.byte_length() > self.max_packet_bytes:
+                self.writer.restore(saved_mark)
                 # Entity stays accumulated for priority promotion on the very next snapshot!
                 continue
-
-            # Append `entity_scratch` bits into `self.writer` (capture exact bit count before finish() pads!)
-            var entity_bits = self.entity_scratch.bit_length()
-            var entity_bytes = self.entity_scratch.finish()
-            var e_reader = BitReader(entity_bytes, entity_bits)
-            var rem_b = entity_bits
-            while rem_b > 0:
-                var chunk = min(32, rem_b)
-                self.writer.write_bits(e_reader.read_bits(chunk), chunk)
-                rem_b -= chunk
 
             # Commit updated quantized fields into this snapshot's baseline record
             var updated_b = base_q
@@ -560,6 +566,7 @@ struct SnapshotReplicator(Movable):
                 updated_b.qz = cur_q.qz
             if (mask & DIRTY_ROT) != 0:
                 updated_b.rot = cur_q.rot
+                updated_b.packed_rot = cur_q.packed_rot
             if (mask & DIRTY_VEL) != 0:
                 updated_b.vx = cur_q.vx
                 updated_b.vy = cur_q.vy
@@ -597,6 +604,9 @@ struct SnapshotClientReceiver(Movable):
     var vel_limit: Float32
     var entities: List[ReplicatedEntity]
     var baselines: List[_ClientBaselineSlot]
+    var _staging_baseline: List[_QuantizedEntitySnap]
+    var _decoded_eids: List[Int]
+    var has_decoded_seq: Bool
     var last_decoded_seq: UInt16
     var decoded_packets: Int
 
@@ -616,11 +626,16 @@ struct SnapshotClientReceiver(Movable):
         self.baselines = List[_ClientBaselineSlot](capacity=_BASELINE_RING)
         for _ in range(_BASELINE_RING):
             self.baselines.append(_ClientBaselineSlot(self.max_entities))
+        self._staging_baseline = List[_QuantizedEntitySnap](
+            length=self.max_entities, fill=_QuantizedEntitySnap()
+        )
+        self._decoded_eids = List[Int](capacity=self.max_entities)
+        self.has_decoded_seq = False
         self.last_decoded_seq = 0
         self.decoded_packets = 0
 
     def apply_packet(mut self, pkt: List[UInt8]) -> Tuple[Bool, UInt16]:
-        if len(pkt) < 8:
+        if len(pkt) < 9:
             return (False, UInt16(0))
         var r = BitReader(pkt)
         var magic = r.read_u16()
@@ -629,8 +644,14 @@ struct SnapshotClientReceiver(Movable):
         var snap_seq = r.read_u16()
         var base_seq = r.read_u16()
         var count = Int(r.read_u16())
+        var has_base = r.read_bool()
+        if r.overflowed:
+            return (False, UInt16(0))
 
-        var has_base = base_seq != UInt16(0xFFFF)
+        # Monotonic RFC-1982 sequence guard: reject stale or duplicate snapshots
+        if self.has_decoded_seq and not seq_gt(snap_seq, self.last_decoded_seq):
+            return (False, UInt16(0))
+
         var base_slot = Int(base_seq) & _BASELINE_MASK
         if has_base and (
             not self.baselines[base_slot].valid
@@ -638,27 +659,22 @@ struct SnapshotClientReceiver(Movable):
         ):
             return (False, UInt16(0))
 
-        var new_slot = Int(snap_seq) & _BASELINE_MASK
-        self.baselines[new_slot].valid = True
-        self.baselines[new_slot].seq = snap_seq
+        # Stage into scratch baseline so truncated/malformed packets never destroy valid baselines
         for e in range(self.max_entities):
-            self.baselines[new_slot].entities[e] = (
+            self._staging_baseline[e] = (
                 self.baselines[base_slot].entities[e]
                 if has_base
                 else _QuantizedEntitySnap()
             )
-
-        var span_pos = self.world_max - self.world_min
-        var span_vel = Float32(2.0) * self.vel_limit
+        self._decoded_eids.clear()
 
         for _ in range(count):
             var eid = r.read_int_bounded(0, self.max_entities - 1)
             var mask = UInt8(r.read_bits(4))
-            if r.overflowed:
-                self.baselines[new_slot].valid = False
+            if r.overflowed or eid < 0 or eid >= self.max_entities:
                 return (False, UInt16(0))
 
-            var q = self.baselines[new_slot].entities[eid]
+            var q = self._staging_baseline[eid]
             q.known = True
 
             if (mask & DIRTY_POS) != 0:
@@ -684,10 +700,23 @@ struct SnapshotClientReceiver(Movable):
                 q.state_flags = r.read_u32()
 
             if r.overflowed:
-                self.baselines[new_slot].valid = False
                 return (False, UInt16(0))
 
-            self.baselines[new_slot].entities[eid] = q
+            self._staging_baseline[eid] = q
+            self._decoded_eids.append(eid)
+
+        # Atomic commit: packet decoded cleanly with zero overflow
+        var new_slot = Int(snap_seq) & _BASELINE_MASK
+        self.baselines[new_slot].valid = True
+        self.baselines[new_slot].seq = snap_seq
+        for e in range(self.max_entities):
+            self.baselines[new_slot].entities[e] = self._staging_baseline[e]
+
+        var span_pos = self.world_max - self.world_min
+        var span_vel = Float32(2.0) * self.vel_limit
+        for i in range(len(self._decoded_eids)):
+            var eid = self._decoded_eids[i]
+            var q = self._staging_baseline[eid]
             self.entities[eid].active = True
             self.entities[eid].pos = Vec3(
                 self.world_min + (Float32(q.qx) / Float32(65535.0)) * span_pos,
@@ -702,6 +731,7 @@ struct SnapshotClientReceiver(Movable):
             )
             self.entities[eid].state_flags = q.state_flags
 
+        self.has_decoded_seq = True
         self.last_decoded_seq = snap_seq
         self.decoded_packets += 1
         return (True, snap_seq)

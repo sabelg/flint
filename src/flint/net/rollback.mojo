@@ -35,6 +35,8 @@ from flint.physics.world import PhysicsWorld
 comptime ROLLBACK_SNAPSHOT_RING: Int = 64
 comptime ROLLBACK_SNAPSHOT_MASK: Int = 63
 comptime ROLLBACK_INPUT_HISTORY_K: Int = 8
+comptime ROLLBACK_MAX_INPUTS_PER_PACKET: Int = 64
+comptime ROLLBACK_PACKET_MTU_BYTES: Int = 1160
 comptime _INPUT_RING_CAP: Int = 256
 comptime _INPUT_RING_MASK: Int = 255
 comptime _CHECKSUM_RING_CAP: Int = 256
@@ -212,6 +214,7 @@ struct RollbackSession[InputT: RollbackInput](Movable):
     var used_inputs: List[Self.InputT]
     var used_input_tick: List[Int]
     var peer_confirmed_tick: List[Int]
+    var peer_acked_local_tick: List[Int]
     var step_inputs_scratch: List[Self.InputT]
 
     # Sequence & RTT / Rift tracking per peer
@@ -302,6 +305,9 @@ struct RollbackSession[InputT: RollbackInput](Movable):
         )
         self.used_input_tick = List[Int](length=total_in_slots, fill=-1)
         self.peer_confirmed_tick = List[Int](
+            length=self.num_peers, fill=self.input_delay_ticks - 1
+        )
+        self.peer_acked_local_tick = List[Int](
             length=self.num_peers, fill=self.input_delay_ticks - 1
         )
         self.step_inputs_scratch = List[Self.InputT](
@@ -529,8 +535,7 @@ struct RollbackSession[InputT: RollbackInput](Movable):
             return
 
         var head_t = self.local_scheduled_tick
-        var first_t = max(0, head_t - (ROLLBACK_INPUT_HISTORY_K - 1))
-        var count = head_t - first_t + 1
+        var min_in_ring = max(0, head_t - (_INPUT_RING_CAP - 1))
 
         var pkt_seq = self.local_pkt_seq
         self.local_pkt_seq = UInt16((Int(self.local_pkt_seq) + 1) & 0xFFFF)
@@ -550,29 +555,55 @@ struct RollbackSession[InputT: RollbackInput](Movable):
         for dst_p in range(self.num_peers):
             if dst_p == self.local_peer_id:
                 continue
+
+            # ACK-driven retransmission: start from peer's acked tick + 1 (or at least K redundant ticks)
+            var need_t = max(0, self.peer_acked_local_tick[dst_p] + 1)
+            var want_first = min(
+                need_t, max(0, head_t - (ROLLBACK_INPUT_HISTORY_K - 1))
+            )
+            var first_t = max(want_first, min_in_ring)
+            while first_t < head_t and not self._has_auth_input(
+                self.local_peer_id, first_t
+            ):
+                first_t += 1
+            var max_count = min(
+                ROLLBACK_MAX_INPUTS_PER_PACKET, max(1, head_t - first_t + 1)
+            )
+            var peer_next_needed = max(0, self.peer_confirmed_tick[dst_p] + 1)
+
             self.tx_bit_writer.clear()
             self.tx_bit_writer.write_u32(_RB_WIRE_MAGIC)
             self.tx_bit_writer.write_u64(self.session_token)
             self.tx_bit_writer.write_u8(UInt8(self.local_peer_id & 0xFF))
             self.tx_bit_writer.write_u16(pkt_seq)
             self.tx_bit_writer.write_u16(self.peer_last_seq[dst_p])
-            self.tx_bit_writer.write_bool(self.peer_has_seq[dst_p])
             self.tx_bit_writer.write_u32(UInt32(self.current_tick))
             self.tx_bit_writer.write_u32(UInt32(first_t))
-            self.tx_bit_writer.write_int_bounded(
-                count, 1, ROLLBACK_INPUT_HISTORY_K
-            )
+            self.tx_bit_writer.write_u32(UInt32(peer_next_needed))
+            self.tx_bit_writer.write_u8(0)  # byte 29: patched with actual_count
+            self.tx_bit_writer.write_bool(self.peer_has_seq[dst_p])
             var has_ck = send_ck_tick >= 0 and send_ck_hash != 0
             self.tx_bit_writer.write_bool(has_ck)
             if has_ck:
                 self.tx_bit_writer.write_u32(UInt32(send_ck_tick))
                 self.tx_bit_writer.write_u64(send_ck_hash)
 
-            for k in range(count):
+            var actual_count = 0
+            for k in range(max_count):
+                var saved_mark = self.tx_bit_writer.mark()
                 var inp = self._get_auth_input(self.local_peer_id, first_t + k)
                 inp.encode_bits(self.tx_bit_writer)
+                if (
+                    k > 0
+                    and self.tx_bit_writer.byte_length()
+                    > ROLLBACK_PACKET_MTU_BYTES
+                ):
+                    self.tx_bit_writer.restore(saved_mark)
+                    break
+                actual_count += 1
 
             self.tx_bit_writer.flush_align()
+            self.tx_bit_writer.data[29] = UInt8(actual_count & 0xFF)
             if transport.queue_send_raw(
                 self.peer_endpoints[dst_p],
                 Int(self.tx_bit_writer.data.unsafe_ptr()),
@@ -615,22 +646,29 @@ struct RollbackSession[InputT: RollbackInput](Movable):
 
                 var pkt_seq = reader.read_u16()
                 var echo_seq = reader.read_u16()
-                var has_echo = reader.read_bool()
                 var remote_sim_tick = Int(reader.read_u32())
                 var first_t = Int(reader.read_u32())
-                var count = reader.read_int_bounded(
-                    1, ROLLBACK_INPUT_HISTORY_K
-                )
+                var peer_next_needed = Int(reader.read_u32())
+                var count = Int(reader.read_u8())
+                var has_echo = reader.read_bool()
                 var has_ck = reader.read_bool()
                 var ck_tick = -1
                 var ck_hash = UInt64(0)
                 if has_ck:
                     ck_tick = Int(reader.read_u32())
                     ck_hash = reader.read_u64()
-                if reader.overflowed:
+                if (
+                    reader.overflowed
+                    or count < 1
+                    or count > ROLLBACK_MAX_INPUTS_PER_PACKET
+                ):
                     continue
 
                 self.packets_received += 1
+
+                var acked_local = peer_next_needed - 1
+                if acked_local > self.peer_acked_local_tick[sender_id]:
+                    self.peer_acked_local_tick[sender_id] = acked_local
 
                 if (
                     not self.peer_has_seq[sender_id]
@@ -837,6 +875,9 @@ struct PhysicsRollbackAdapter(RollbackWorld):
     var world: PhysicsWorld
     var player_body_ids: List[Int]
     var fixed_dt: Float32
+    var snapshot_load_failed: Bool
+    var snapshot_load_failures: Int
+    var snapshot_load_error: String
 
     def __init__(
         out self,
@@ -848,6 +889,9 @@ struct PhysicsRollbackAdapter(RollbackWorld):
         self.world.settings.force_serial = True
         self.player_body_ids = player_body_ids.copy()
         self.fixed_dt = fixed_dt
+        self.snapshot_load_failed = False
+        self.snapshot_load_failures = 0
+        self.snapshot_load_error = String("")
 
     @staticmethod
     def create_arena(
@@ -946,6 +990,9 @@ struct PhysicsRollbackAdapter(RollbackWorld):
 
     def load_snapshot(mut self, addr: Int, length: Int):
         if addr == 0 or length <= 0:
+            self.snapshot_load_failed = True
+            self.snapshot_load_failures += 1
+            self.snapshot_load_error = String("empty or null snapshot buffer")
             return
         var bytes = List[UInt8](unsafe_uninit_length=length)
         _ = external_call["memcpy", Int](
@@ -955,8 +1002,13 @@ struct PhysicsRollbackAdapter(RollbackWorld):
         try:
             self.world.deserialize(reader)
             self.world.settings.force_serial = True
-        except:
-            pass
+            self.snapshot_load_failed = False
+            self.snapshot_load_error = String("")
+        except e:
+            self.snapshot_load_failed = True
+            self.snapshot_load_failures += 1
+            self.snapshot_load_error = String(e)
+            print("PhysicsRollbackAdapter.load_snapshot failed:", e)
 
     def step_rollback_tick(
         mut self, inputs_addr: Int, peer_count: Int, tick: Int
