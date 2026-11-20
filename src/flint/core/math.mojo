@@ -96,14 +96,33 @@ struct Mat4(Copyable, Movable):
     def set(mut self, row: Int, column: Int, value: Float32):
         self.values[column * 4 + row] = value
 
+    @always_inline
     def multiply(self, other: Self) -> Self:
         var result = Self()
-        for column in range(4):
-            for row in range(4):
-                var value = Float32(0)
-                for index in range(4):
-                    value += self.at(row, index) * other.at(index, column)
-                result.set(row, column, value)
+        var c0 = SIMD[DType.float32, 4](
+            self.values[0], self.values[1], self.values[2], self.values[3]
+        )
+        var c1 = SIMD[DType.float32, 4](
+            self.values[4], self.values[5], self.values[6], self.values[7]
+        )
+        var c2 = SIMD[DType.float32, 4](
+            self.values[8], self.values[9], self.values[10], self.values[11]
+        )
+        var c3 = SIMD[DType.float32, 4](
+            self.values[12], self.values[13], self.values[14], self.values[15]
+        )
+        comptime for column in range(4):
+            comptime b = column * 4
+            var col_vec = (
+                c0 * other.values[b]
+                + c1 * other.values[b + 1]
+                + c2 * other.values[b + 2]
+                + c3 * other.values[b + 3]
+            )
+            result.values[b] = col_vec[0]
+            result.values[b + 1] = col_vec[1]
+            result.values[b + 2] = col_vec[2]
+            result.values[b + 3] = col_vec[3]
         return result^
 
     def transform_point(self, value: Vec3) -> Vec3:

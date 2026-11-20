@@ -346,6 +346,7 @@ struct ProfileTimeline(Movable):
     var file_full: Bool
     var first_event: Bool
     var zone_text: List[String]
+    var custom_zone_names: List[String]
 
     def __init__(out self):
         self.handle = Profiler()
@@ -384,6 +385,7 @@ struct ProfileTimeline(Movable):
         self.file_full = False
         self.first_event = True
         self.zone_text = List[String]()
+        self.custom_zone_names = List[String]()
 
     def __deinit__(deinit self):
         if self.fd >= 0:
@@ -392,6 +394,38 @@ struct ProfileTimeline(Movable):
             external_call["free", NoneType](self.buffer)
         if self.raw_block != 0:
             external_call["free", NoneType](self.raw_block)
+
+    def zone_count(self) -> Int:
+        return ZONE_COUNT + len(self.custom_zone_names)
+
+    def zone_label(self, zone: Int) -> String:
+        if zone < 0:
+            return "?"
+        if zone < ZONE_COUNT:
+            return zone_name(zone)
+        var cidx = zone - ZONE_COUNT
+        if cidx < len(self.custom_zone_names):
+            return self.custom_zone_names[cidx]
+        return "?"
+
+    def register_zone(mut self, name: String) -> Int:
+        """Dynamically registers a custom profiler zone name and returns its dense zone ID.
+        Idempotent: returns the existing ID if `name` matches a built-in or previously registered zone."""
+        for z in range(ZONE_COUNT):
+            if zone_name(z) == name:
+                return z
+        for i in range(len(self.custom_zone_names)):
+            if self.custom_zone_names[i] == name:
+                return ZONE_COUNT + i
+        var zid = ZONE_COUNT + len(self.custom_zone_names)
+        self.custom_zone_names.append(name)
+        if self.active:
+            self.zone_ticks.append(UInt64(0))
+            for _ in range(HISTORY_FRAMES):
+                self.history.append(Float32(0))
+            if len(self.zone_text) > 0:
+                self.zone_text.append("\"name\":\"" + name + "\"")
+        return zid
 
     def start(mut self, path: String, overlay: Bool = True) -> Bool:
         """Allocate everything, measure the clock, open the file.
@@ -412,12 +446,13 @@ struct ProfileTimeline(Movable):
         self.lane_threads.append(UInt64(external_call["pthread_self", Int]()))
         self.lane_threads.append(GPU_THREAD_TAG)
         self.lane_cursor = MAIN_LANE
-        self.zone_ticks = List[UInt64](length=ZONE_COUNT, fill=0)
-        self.history = List[Float32](length=ZONE_COUNT * HISTORY_FRAMES, fill=0)
+        var zcount = self.zone_count()
+        self.zone_ticks = List[UInt64](length=zcount, fill=0)
+        self.history = List[Float32](length=zcount * HISTORY_FRAMES, fill=0)
         self.frame_events = List[ProfileEvent](capacity=EVENT_CAPACITY)
         self.display = List[DisplayEvent](capacity=MAX_DISPLAY_EVENTS)
         self.candidate = List[DisplayEvent](capacity=MAX_DISPLAY_EVENTS)
-        self.display_rows = List[ZoneRow](capacity=ZONE_COUNT)
+        self.display_rows = List[ZoneRow](capacity=zcount)
         self.recent_frames_ms = List[Float32](length=RECENT_FRAMES * 2, fill=0)
         self.display_history = List[Float32](length=RECENT_FRAMES * 2, fill=0)
         self.frame_starts = List[UInt64](length=START_RING_FRAMES, fill=0)
@@ -469,7 +504,8 @@ struct ProfileTimeline(Movable):
         self.handle.record(ZONE_FRAME, self.frame_started, ended)
         self.take_events(self.frame)
         var total_ms = self.to_ms(ended - self.frame_started)
-        for zone in range(ZONE_COUNT):
+        var zcount = min(self.zone_count(), len(self.zone_ticks))
+        for zone in range(zcount):
             self.history[zone * HISTORY_FRAMES + self.frame % HISTORY_FRAMES] = self.to_ms(self.zone_ticks[zone])
             self.zone_ticks[zone] = 0
         self.recent_frames_ms[self.frame % len(self.recent_frames_ms)] = total_ms
@@ -509,7 +545,8 @@ struct ProfileTimeline(Movable):
         else:
             lane = self.lane_of(thread)
             self.frame_events.append(ProfileEvent(zone, lane, started, ended))
-        self.zone_ticks[zone] += ended - started
+        if zone >= 0 and zone < len(self.zone_ticks):
+            self.zone_ticks[zone] += ended - started
         if self.fd >= 0:
             self.write_event(zone, lane, started, ended, event_frame)
 
@@ -578,7 +615,8 @@ struct ProfileTimeline(Movable):
         for back in range(min(self.frame + 1, len(self.display_history))):
             self.display_history[back] = self.recent_frames_ms[(self.frame - back) % len(self.recent_frames_ms)]
         var frames = min(self.frame + 1, RECENT_FRAMES)
-        for zone in range(1, ZONE_COUNT):
+        var zcount = self.zone_count()
+        for zone in range(1, zcount):
             var total = Float32(0)
             var worst = Float32(0)
             for back in range(frames):
@@ -636,7 +674,8 @@ struct ProfileTimeline(Movable):
         if self.path.byte_length() > 0:
             print("profile_file=" + self.path + " bytes=" + String(self.file_bytes) + (" FULL" if self.file_full else ""))
         var frames = min(self.frame, HISTORY_FRAMES)
-        for zone in range(ZONE_COUNT):
+        var zcount = self.zone_count()
+        for zone in range(zcount):
             var values = List[Float32](capacity=frames)
             var worst = Float32(0)
             for index in range(frames):
@@ -647,7 +686,7 @@ struct ProfileTimeline(Movable):
                 continue
             sort(values)
             print(
-                "profile_zone_" + zone_name(zone)
+                "profile_zone_" + self.zone_label(zone)
                 + " p50=" + report_ms(percentile_of(values, 0.50))
                 + " p95=" + report_ms(percentile_of(values, 0.95))
                 + " p99=" + report_ms(percentile_of(values, 0.99))
@@ -681,9 +720,10 @@ struct ProfileTimeline(Movable):
             self.fd = -1
             self.path = String()
             return
-        self.zone_text = List[String](capacity=ZONE_COUNT)
-        for zone in range(ZONE_COUNT):
-            self.zone_text.append("\"name\":\"" + zone_name(zone) + "\"")
+        var zcount = self.zone_count()
+        self.zone_text = List[String](capacity=zcount)
+        for zone in range(zcount):
+            self.zone_text.append("\"name\":\"" + self.zone_label(zone) + "\"")
         self.append_text("[")
         for lane in range(len(self.lane_threads)):
             self.write_lane_name(lane)
@@ -738,6 +778,9 @@ struct ProfileTimeline(Movable):
         self.buffer_used += size
 
     def append_string(mut self, zone: Int):
+        if zone < 0 or zone >= len(self.zone_text):
+            self.append_text("\"name\":\"?\"")
+            return
         ref text = self.zone_text[zone]
         var size = text.byte_length()
         _ = external_call["memcpy", Int](self.buffer + self.buffer_used, Int(text.as_bytes().unsafe_ptr()), size)

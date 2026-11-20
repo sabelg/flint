@@ -14,6 +14,7 @@ from flint.app.engine_app import (
     FixedTime,
     FrameTime,
     SystemFn,
+    EventSwapFn,
     SystemDescriptor,
     Schedule,
     AppConfig,

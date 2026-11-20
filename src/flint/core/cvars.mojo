@@ -221,42 +221,71 @@ def parse_value(text: String) -> Optional[Float32]:
 
 struct ConsoleVars(Copyable, Movable):
     var values: List[Float32]
+    var dynamic_entries: List[CVarEntry]
 
     def __init__(out self):
         self.values = List[Float32](capacity=CVAR_COUNT)
+        self.dynamic_entries = List[CVarEntry]()
         for index in range(CVAR_COUNT):
             self.values.append(cvar_entry(index).default)
 
+    def count(self) -> Int:
+        return len(self.values)
+
+    def entry(self, index: Int) -> CVarEntry:
+        if index < 0 or index >= len(self.values):
+            return CVarEntry("", 0, False, "")
+        if index < CVAR_COUNT:
+            return cvar_entry(index)
+        return self.dynamic_entries[index - CVAR_COUNT].copy()
+
+    def register_cvar(
+        mut self,
+        name: String,
+        default: Float32 = 0.0,
+        flag: Bool = False,
+        help: String = "",
+    ) -> Int:
+        """Dynamically registers a game- or plugin-defined CVar and returns its dense index.
+        Idempotent: if `name` already exists, returns its existing index."""
+        var existing = self.find(name)
+        if existing >= 0:
+            return existing
+        var idx = len(self.values)
+        self.dynamic_entries.append(CVarEntry(name, default, flag, help))
+        self.values.append((Float32(1) if default != 0 else Float32(0)) if flag else default)
+        return idx
+
     def get(self, index: Int) -> Float32:
-        if index < 0 or index >= CVAR_COUNT:
+        if index < 0 or index >= len(self.values):
             return Float32(0.0)
         return self.values[index]
 
     def on(self, index: Int) -> Bool:
-        if index < 0 or index >= CVAR_COUNT:
+        if index < 0 or index >= len(self.values):
             return False
         return self.values[index] != 0
 
     def set(mut self, index: Int, value: Float32):
-        if index < 0 or index >= CVAR_COUNT:
+        if index < 0 or index >= len(self.values):
             return
-        self.values[index] = (Float32(1) if value != 0 else Float32(0)) if cvar_entry(index).flag else value
+        self.values[index] = (Float32(1) if value != 0 else Float32(0)) if self.entry(index).flag else value
 
     def find(self, name: String) -> Int:
-        for index in range(CVAR_COUNT):
-            if cvar_entry(index).name == name:
+        for index in range(len(self.values)):
+            if self.entry(index).name == name:
                 return index
         return -1
 
     def describe(self, index: Int) -> String:
-        if index < 0 or index >= CVAR_COUNT:
+        if index < 0 or index >= len(self.values):
             return ""
-        return cvar_entry(index).name + " = " + show_value(self.values[index])
+        return self.entry(index).name + " = " + show_value(self.values[index])
 
     def text(self) -> String:
         """Every variable, one `name = value` line each, as a crash report lists them."""
         var out = String()
-        for index in range(CVAR_COUNT):
+        for index in range(len(self.values)):
             out += self.describe(index) + "\n"
         return out^
 
@@ -275,7 +304,7 @@ struct ConsoleVars(Copyable, Movable):
                 print("CVAR_UNKNOWN " + String(name))
                 continue
             if len(pieces) == 1:
-                if not cvar_entry(index).flag:
+                if not self.entry(index).flag:
                     print("CVAR_NEEDS_VALUE " + String(name))
                     continue
                 self.set(index, 1)

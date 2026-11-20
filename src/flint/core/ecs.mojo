@@ -10,7 +10,7 @@ Provides:
 from std.atomic import Atomic
 from std.ffi import external_call
 from std.sys import size_of
-from flint.core.jobs import JobPool, JobBody, run_jobs
+from flint.core.jobs import JobPool, JobBody, run_jobs_affine
 from flint.core.memory import MemCharge, MEM_ENTITIES
 from flint.core.serial import BlobWriter, BlobReader, fourcc
 
@@ -449,6 +449,6 @@ def run_parallel_ctx[CtxType: Movable](
     before worker threads finish reading `ctx_addr`.
     """
     var ctx_addr = Int(Pointer(to=ctx))
-    run_jobs(Int(Pointer(to=pool)), worker_fn, ctx_addr, job_count)
+    run_jobs_affine(Int(Pointer(to=pool)), worker_fn, ctx_addr, job_count)
     var keep_alive_anchor = Int(Pointer(to=ctx))
     _ = keep_alive_anchor

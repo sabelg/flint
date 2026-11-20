@@ -13,8 +13,11 @@ from std.collections import List
 from std.ffi import external_call
 from std.math import min, max
 from std.sys import size_of
+from std.time import monotonic
+from flint.core.crash import install_crash_handler
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool, MAX_DEPENDENTS, NO_JOB, default_worker_count
+from flint.core.profiler import ProfileTimeline
 from flint.ecs.world import (
     World,
     Component,
@@ -624,6 +627,9 @@ struct Schedule(Movable):
 # EnginePlugin, AppConfig, and EngineApp
 # ---------------------------------------------------------------------------
 
+comptime EventSwapFn = def(Pointer[Resources, MutAnyOrigin]) thin -> None
+
+
 struct AppConfig(Copyable, Movable):
     var title: String
     var headless: Bool
@@ -631,6 +637,10 @@ struct AppConfig(Copyable, Movable):
     var fixed_hz: Float32
     var max_fixed_steps_per_frame: Int
     var default_frame_dt: Float32
+    var max_frame_dt: Float32
+    var enable_profiler: Bool
+    var profile_path: String
+    var enable_crash_handler: Bool
 
     def __init__(
         out self,
@@ -640,6 +650,10 @@ struct AppConfig(Copyable, Movable):
         fixed_hz: Float32 = 60.0,
         max_fixed_steps_per_frame: Int = 8,
         default_frame_dt: Float32 = Float32(1.0 / 60.0),
+        max_frame_dt: Float32 = Float32(0.1),
+        enable_profiler: Bool = False,
+        profile_path: String = "",
+        enable_crash_handler: Bool = False,
     ):
         self.title = title
         self.headless = headless
@@ -647,6 +661,10 @@ struct AppConfig(Copyable, Movable):
         self.fixed_hz = fixed_hz
         self.max_fixed_steps_per_frame = max_fixed_steps_per_frame
         self.default_frame_dt = default_frame_dt
+        self.max_frame_dt = max(Float32(0.001), max_frame_dt)
+        self.enable_profiler = enable_profiler
+        self.profile_path = profile_path
+        self.enable_crash_handler = enable_crash_handler
 
 
 trait EnginePlugin:
@@ -663,6 +681,9 @@ struct EngineApp(Movable):
     var schedule: Schedule
     var pool: JobPool
     var commands: ParallelCommands
+    var event_swap_hooks: List[EventSwapFn]
+    var profiler: ProfileTimeline
+    var crash_handler_installed: Bool
     var started: Bool
     var shut_down: Bool
 
@@ -675,12 +696,17 @@ struct EngineApp(Movable):
         self.schedule = Schedule()
         self.pool = JobPool()
         self.commands = ParallelCommands()
+        self.event_swap_hooks = List[EventSwapFn]()
+        self.profiler = ProfileTimeline()
+        self.crash_handler_installed = False
         self.started = False
         self.shut_down = False
         self.resources.insert[FixedTime](FixedTime(fixed_hz, max_steps))
         self.resources.insert[FrameTime](FrameTime())
 
     def __deinit__(deinit self):
+        if self.profiler.active:
+            self.profiler.finish()
         self.pool.stop()
 
     def add_plugin[P: EnginePlugin](mut self, plugin: P):
@@ -691,6 +717,14 @@ struct EngineApp(Movable):
 
     def register_component[C: Component](mut self) -> Int:
         return self.world.register_component[C]()
+
+    def add_event_swap_hook(mut self, hook: EventSwapFn):
+        """Registers an automatic per-frame `Events` buffer swap callback invoked after `STAGE_LAST`."""
+        self.event_swap_hooks.append(hook)
+
+    def register_profiler_zone(mut self, name: String) -> Int:
+        """Dynamically registers a custom profiler zone on this app's `ProfileTimeline`."""
+        return self.profiler.register_zone(name)
 
     def add_system(
         mut self,
@@ -710,6 +744,10 @@ struct EngineApp(Movable):
     def startup(mut self):
         if self.started:
             return
+        if self.config.enable_crash_handler and not self.crash_handler_installed:
+            self.crash_handler_installed = install_crash_handler(self.config.title)
+        if self.config.enable_profiler and not self.profiler.active:
+            _ = self.profiler.start(self.config.profile_path, overlay=not self.config.headless)
         _ = self.pool.allocate()
         if self.config.worker_threads > 0:
             _ = self.pool.start(self.config.worker_threads)
@@ -722,11 +760,15 @@ struct EngineApp(Movable):
         if not self.started:
             self.startup()
 
+        if self.profiler.active:
+            self.profiler.begin_frame()
+
+        var clamped_dt = max(Float32(0.0), min(self.config.max_frame_dt, frame_dt))
         var ft_opt = self.resources.get_ptr_mut[FrameTime]()
         if ft_opt:
             var ft_ptr = ft_opt.value()
-            ft_ptr[unsafe_offset=0].delta_seconds = frame_dt
-            ft_ptr[unsafe_offset=0].elapsed_seconds += Float64(frame_dt)
+            ft_ptr[unsafe_offset=0].delta_seconds = clamped_dt
+            ft_ptr[unsafe_offset=0].elapsed_seconds += Float64(clamped_dt)
             ft_ptr[unsafe_offset=0].frame_index += 1
 
         self.schedule.run_stage(STAGE_FIRST, self.world, self.resources, self.pool, self.commands)
@@ -738,7 +780,7 @@ struct EngineApp(Movable):
         var due_steps = 0
         var fix_opt = self.resources.get_ptr_mut[FixedTime]()
         if fix_opt:
-            due_steps = fix_opt.value()[unsafe_offset=0].advance_frame(frame_dt)
+            due_steps = fix_opt.value()[unsafe_offset=0].advance_frame(clamped_dt)
 
         for _ in range(due_steps):
             _ = self.world.advance_tick()
@@ -757,12 +799,22 @@ struct EngineApp(Movable):
         self.schedule.run_stage(STAGE_LAST, self.world, self.resources, self.pool, self.commands)
         self.world.flush_commands(self.commands)
 
+        var res_ptr = Pointer[Resources, MutAnyOrigin](unsafe_from_address=Int(Pointer(to=self.resources)))
+        for i in range(len(self.event_swap_hooks)):
+            var hook = self.event_swap_hooks[i]
+            hook(res_ptr)
+
+        if self.profiler.active:
+            self.profiler.end_frame()
+
     def shutdown(mut self):
         if self.shut_down:
             return
         if self.started:
             self.schedule.run_stage(STAGE_SHUTDOWN, self.world, self.resources, self.pool, self.commands)
             self.world.flush_commands(self.commands)
+        if self.profiler.active:
+            self.profiler.finish()
         self.pool.stop()
         self.shut_down = True
 
@@ -771,4 +823,23 @@ struct EngineApp(Movable):
         self.startup()
         for _ in range(max(0, max_frames)):
             self.step_one_frame(self.config.default_frame_dt)
+        self.shutdown()
+
+    def run_realtime(mut self, max_frames: Int = 0, max_seconds: Float64 = 0.0):
+        """Wall-clock `monotonic()` frame loop with automatic `max_frame_dt` clamping."""
+        self.startup()
+        var start_ns = monotonic()
+        var last_ns = start_ns
+        var frame = 0
+        while True:
+            if max_frames > 0 and frame >= max_frames:
+                break
+            var now_ns = monotonic()
+            if max_seconds > 0.0 and Float64(now_ns - start_ns) * 1e-9 >= max_seconds:
+                break
+            var raw_dt = Float32(Float64(now_ns - last_ns) * 1e-9)
+            last_ns = now_ns
+            var dt = min(self.config.max_frame_dt, max(Float32(0.0), raw_dt))
+            self.step_one_frame(dt)
+            frame += 1
         self.shutdown()

@@ -22,6 +22,7 @@ from flint.ecs.world import (
     clear_component_clone_vault,
     Entity,
     Component,
+    Changed,
     BitSet256,
     ComponentInfo,
     ArchetypeChunk,

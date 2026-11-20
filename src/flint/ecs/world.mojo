@@ -797,6 +797,25 @@ struct ArchetypeChunk(Movable):
             return 0
         return self.changed_ticks[col_idx * self.simd_groups + simd_group]
 
+    @always_inline
+    def row_changed_since(self, col_idx: Int, row: Int, since_tick: UInt32) -> Bool:
+        if since_tick == 0:
+            return True
+        return self.group_changed_tick(col_idx, row >> 3) > since_tick
+
+    @always_inline
+    def any_group_changed_since(self, col_idx: Int, since_tick: UInt32) -> Bool:
+        if since_tick == 0:
+            return True
+        if col_idx < 0 or col_idx >= len(self.comp_type_ids) or self.count <= 0:
+            return False
+        var active_groups = (self.count + (SIMD_LANES - 1)) >> 3
+        var base = col_idx * self.simd_groups
+        for g in range(active_groups):
+            if self.changed_ticks[base + g] > since_tick:
+                return True
+        return False
+
     def push_uninit_row(mut self, entity: Entity, tick: UInt32) -> Int:
         var row = self.count
         self.entities.append(entity)
@@ -1535,6 +1554,125 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
         order_slot[unsafe_offset=0].store(Int64(prev_imp))
 
 
+@fieldwise_init
+struct Changed[C: Component](Copyable, ImplicitlyCopyable, Movable):
+    """Query filter marker matching entities whose `C` component changed after `since_tick`."""
+    comptime COMPONENT_ID: UInt64 = Self.C.COMPONENT_ID
+    var since_tick: UInt32
+
+
+@fieldwise_init
+struct _ParSlice3(Copyable, ImplicitlyCopyable, Movable):
+    var entities_ptr: Int
+    var col0_ptr: Int
+    var elem0_size: Int
+    var col1_ptr: Int
+    var elem1_size: Int
+    var col2_ptr: Int
+    var elem2_size: Int
+    var row_start: Int
+    var row_count: Int
+    var global_order_base: Int
+    var is_sparse0: Bool
+    var is_sparse1: Bool
+    var is_sparse2: Bool
+
+
+@fieldwise_init
+struct _ParDispatch3[C0: Component, C1: Component, C2: Component](Copyable, ImplicitlyCopyable, Movable):
+    var world_addr: Int
+    var pool_addr: Int
+    var slices_ptr: Int
+    var kernel: def(
+        Int,
+        Int,
+        Entity,
+        Pointer[Self.C0, MutAnyOrigin],
+        Pointer[Self.C1, MutAnyOrigin],
+        Pointer[Self.C2, MutAnyOrigin],
+        Int,
+    ) thin -> None
+    var user_ctx: Int
+    var tid0: Int
+    var tid1: Int
+    var tid2: Int
+    var ex_sparse: BitSet256
+    var has_ex_sparse: Bool
+    var runtime_ready: Bool
+
+
+def _par_worker3[C0: Component, C1: Component, C2: Component](ctx_addr: Int, slice_idx: Int):
+    ref disp = Pointer[_ParDispatch3[C0, C1, C2], ImmutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    var lane = 0
+    if disp.pool_addr != 0:
+        ref pool = Pointer[JobPool, ImmutAnyOrigin](unsafe_from_address=disp.pool_addr)[unsafe_offset=0]
+        lane = pool.current_thread_index()
+    var order_slot = _lane_order_slot(lane)
+    var prev_imp = UInt64(order_slot[unsafe_offset=0].load()) if disp.runtime_ready else UInt64(0)
+    var sl = Pointer[_ParSlice3, ImmutAnyOrigin](unsafe_from_address=disp.slices_ptr)[unsafe_offset=slice_idx]
+    var kfn = disp.kernel
+    var ents = Pointer[Entity, ImmutAnyOrigin](unsafe_from_address=sl.entities_ptr)
+    if not sl.is_sparse0 and not sl.is_sparse1 and not sl.is_sparse2 and not disp.has_ex_sparse:
+        for i in range(sl.row_count):
+            var r = sl.row_start + i
+            var ord = sl.global_order_base + i
+            var e = ents[unsafe_offset=r]
+            var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sl.col0_ptr + r * sl.elem0_size)
+            var p1 = Pointer[C1, MutAnyOrigin](unsafe_from_address=sl.col1_ptr + r * sl.elem1_size)
+            var p2 = Pointer[C2, MutAnyOrigin](unsafe_from_address=sl.col2_ptr + r * sl.elem2_size)
+            if disp.runtime_ready:
+                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            kfn(lane, ord, e, p0, p1, p2, disp.user_ctx)
+    else:
+        ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=disp.world_addr)[unsafe_offset=0]
+        for i in range(sl.row_count):
+            var r = sl.row_start + i
+            var ord = sl.global_order_base + i
+            var e = ents[unsafe_offset=r]
+            if disp.has_ex_sparse and world.entities[Int(e.index)].sparse_mask.intersects(disp.ex_sparse):
+                continue
+            var a0: Int
+            if not sl.is_sparse0:
+                a0 = sl.col0_ptr + r * sl.elem0_size
+            else:
+                ref s0 = world.sparse_sets[world.comp_to_sparse[disp.tid0]]
+                var d0 = s0.dense_index_of(e.index)
+                if d0 < 0:
+                    continue
+                a0 = s0.value_ptr(d0)
+            var a1: Int
+            if not sl.is_sparse1:
+                a1 = sl.col1_ptr + r * sl.elem1_size
+            else:
+                ref s1 = world.sparse_sets[world.comp_to_sparse[disp.tid1]]
+                var d1 = s1.dense_index_of(e.index)
+                if d1 < 0:
+                    continue
+                a1 = s1.value_ptr(d1)
+            var a2: Int
+            if not sl.is_sparse2:
+                a2 = sl.col2_ptr + r * sl.elem2_size
+            else:
+                ref s2 = world.sparse_sets[world.comp_to_sparse[disp.tid2]]
+                var d2 = s2.dense_index_of(e.index)
+                if d2 < 0:
+                    continue
+                a2 = s2.value_ptr(d2)
+            if disp.runtime_ready:
+                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            kfn(
+                lane,
+                ord,
+                e,
+                Pointer[C0, MutAnyOrigin](unsafe_from_address=a0),
+                Pointer[C1, MutAnyOrigin](unsafe_from_address=a1),
+                Pointer[C2, MutAnyOrigin](unsafe_from_address=a2),
+                disp.user_ctx,
+            )
+    if disp.runtime_ready:
+        order_slot[unsafe_offset=0].store(Int64(prev_imp))
+
+
 # ---------------------------------------------------------------------------
 # World — Hybrid Archetype + SparseSet ECS Runtime
 # ---------------------------------------------------------------------------
@@ -1618,6 +1756,28 @@ struct World(Movable):
     @always_inline
     def archetype_count(self) -> Int:
         return len(self.archetypes)
+
+    def total_chunk_count(self) -> Int:
+        var n = 0
+        for a in range(len(self.archetypes)):
+            n += len(self.archetypes[a].chunks)
+        return n
+
+    def _reclaim_empty_chunk(mut self, arch_id: Int, ch_idx: Int):
+        """Reclaims an empty `ArchetypeChunk` via swap-pop so slab memory does not leak on despawn."""
+        if ch_idx < 0 or ch_idx >= len(self.archetypes[arch_id].chunks):
+            return
+        if self.archetypes[arch_id].chunks[ch_idx].count != 0:
+            return
+        var last_ch = len(self.archetypes[arch_id].chunks) - 1
+        if ch_idx < last_ch:
+            var moved_chunk = self.archetypes[arch_id].chunks.pop()
+            for r in range(moved_chunk.count):
+                var e = moved_chunk.entities[r]
+                self.entities[Int(e.index)].chunk_idx = Int32(ch_idx)
+            self.archetypes[arch_id].chunks[ch_idx] = moved_chunk^
+        else:
+            _ = self.archetypes[arch_id].chunks.pop()
 
     @always_inline
     def to_entity_handle(self, entity: Entity) -> EntityHandle:
@@ -1902,6 +2062,7 @@ struct World(Movable):
         )
         if moved.valid():
             self.entities[Int(moved.index)].row_in_chunk = Int32(row)
+        self._reclaim_empty_chunk(arch_id, ch_idx)
 
         # Remove any sparse components attached to this entity
         var smask = rec.sparse_mask
@@ -1994,6 +2155,7 @@ struct World(Movable):
         self.entities[idx].archetype_id = Int32(dst_arch)
         self.entities[idx].chunk_idx = Int32(dst_ch)
         self.entities[idx].row_in_chunk = Int32(dst_row)
+        self._reclaim_empty_chunk(src_arch, src_ch)
         return (dst_ch, dst_row)
 
     # ---- Component Insert / Remove / Has / Get / GetPtrMut ----
@@ -2138,15 +2300,83 @@ struct World(Movable):
                     out.append(e)
         return out^
 
+    def query_changed_entities[C: Component](
+        self,
+        since_tick: UInt32,
+        with_mask: BitSet256 = BitSet256(),
+        without_mask: BitSet256 = BitSet256(),
+    ) -> List[Entity]:
+        """Collects all live entities with `C` (plus `with_mask`, excluding `without_mask`)
+        whose `C` changed after `since_tick`, skipping unchanged chunks and 8-row SIMD groups."""
+        var out = List[Entity]()
+        var tid = self.find_component_by_hash(C.COMPONENT_ID)
+        if tid < 0:
+            return out^
+        var full_with = with_mask.with_bit(tid)
+        var req_table = full_with.intersection(self.table_comp_mask)
+        var req_sparse = full_with.intersection(self.sparse_comp_mask)
+        var ex_table = without_mask.intersection(self.table_comp_mask)
+        var ex_sparse = without_mask.intersection(self.sparse_comp_mask)
+        var known = self.table_comp_mask.union(self.sparse_comp_mask)
+        if not known.contains_all(full_with):
+            return out^
+
+        var is_sparse = (C.STORAGE_MODE == STORAGE_SPARSE)
+        var check_sparse = (not req_sparse.is_empty()) or (not ex_sparse.is_empty())
+        for a in range(len(self.archetypes)):
+            ref arch = self.archetypes[a]
+            if not arch.table_mask.contains_all(req_table):
+                continue
+            if arch.table_mask.intersects(ex_table):
+                continue
+            var col_c = -1 if is_sparse else arch.col_index(tid)
+            for ch in range(len(arch.chunks)):
+                ref chunk = arch.chunks[ch]
+                if chunk.count <= 0:
+                    continue
+                if not is_sparse and since_tick > 0 and not chunk.any_group_changed_since(col_c, since_tick):
+                    continue
+                if not is_sparse and since_tick > 0:
+                    var active_groups = (chunk.count + (SIMD_LANES - 1)) >> 3
+                    for g in range(active_groups):
+                        if chunk.group_changed_tick(col_c, g) <= since_tick:
+                            continue
+                        var r_start = g << 3
+                        var r_end = min(chunk.count, r_start + SIMD_LANES)
+                        for r in range(r_start, r_end):
+                            var e = chunk.entities[r]
+                            if check_sparse:
+                                var sm = self.entities[Int(e.index)].sparse_mask
+                                if not sm.contains_all(req_sparse) or sm.intersects(ex_sparse):
+                                    continue
+                            out.append(e)
+                else:
+                    for r in range(chunk.count):
+                        var e = chunk.entities[r]
+                        if check_sparse:
+                            var sm = self.entities[Int(e.index)].sparse_mask
+                            if not sm.contains_all(req_sparse) or sm.intersects(ex_sparse):
+                                continue
+                        if is_sparse and since_tick > 0:
+                            ref sset = self.sparse_sets[self.comp_to_sparse[tid]]
+                            var di = sset.dense_index_of(e.index)
+                            if di < 0 or sset.changed_ticks[di] <= since_tick:
+                                continue
+                        out.append(e)
+        return out^
+
     def par_for_each1[C0: Component](
         mut self,
         mut pool: JobPool,
         kernel: def(Int, Int, Entity, Pointer[C0, MutAnyOrigin], Int) thin -> None,
         user_ctx: Int = 0,
         without_mask: BitSet256 = BitSet256(),
+        read_only: Bool = False,
+        changed_since: UInt32 = 0,
     ):
         """Lifetime-safe parallel iteration over all entities with `C0` across `JobPool`.
-        Automatically anchors `self` and slice descriptors past the worker barrier."""
+        Set `read_only=True` to avoid dirtying `changed_ticks`; set `changed_since > 0`
+        to skip unchanged chunks/SIMD groups."""
         var tid0 = self.find_component_by_hash(C0.COMPONENT_ID)
         if tid0 < 0:
             return
@@ -2171,12 +2401,28 @@ struct World(Movable):
                 var cnt = self.archetypes[a].chunks[ch].count
                 if cnt <= 0:
                     continue
-                if not is_sp0:
-                    self.archetypes[a].chunks[ch].mark_all_groups_changed(col0, self.current_tick)
-                var ents_ptr = Int(self.archetypes[a].chunks[ch].entities.unsafe_ptr())
-                var c0_ptr = 0 if is_sp0 else self.archetypes[a].chunks[ch].column_ptr(col0)
-                slices.append(_ParSlice1(ents_ptr, c0_ptr, esz0, 0, cnt, global_base, is_sp0))
-                global_base += cnt
+                if changed_since > 0 and not is_sp0:
+                    if not self.archetypes[a].chunks[ch].any_group_changed_since(col0, changed_since):
+                        continue
+                    var ents_ptr = Int(self.archetypes[a].chunks[ch].entities.unsafe_ptr())
+                    var c0_ptr = self.archetypes[a].chunks[ch].column_ptr(col0)
+                    var active_groups = (cnt + (SIMD_LANES - 1)) >> 3
+                    for g in range(active_groups):
+                        if self.archetypes[a].chunks[ch].group_changed_tick(col0, g) <= changed_since:
+                            continue
+                        var rs = g << 3
+                        var rc = min(cnt - rs, SIMD_LANES)
+                        if not read_only:
+                            self.archetypes[a].chunks[ch].mark_changed(col0, rs, self.current_tick)
+                        slices.append(_ParSlice1(ents_ptr, c0_ptr, esz0, rs, rc, global_base, False))
+                        global_base += rc
+                else:
+                    if not is_sp0 and not read_only:
+                        self.archetypes[a].chunks[ch].mark_all_groups_changed(col0, self.current_tick)
+                    var ents_ptr = Int(self.archetypes[a].chunks[ch].entities.unsafe_ptr())
+                    var c0_ptr = 0 if is_sp0 else self.archetypes[a].chunks[ch].column_ptr(col0)
+                    slices.append(_ParSlice1(ents_ptr, c0_ptr, esz0, 0, cnt, global_base, is_sp0))
+                    global_base += cnt
 
         if len(slices) > 0:
             var disp = _ParDispatch1[C0](
@@ -2206,9 +2452,12 @@ struct World(Movable):
         kernel: def(Int, Int, Entity, Pointer[C0, MutAnyOrigin], Pointer[C1, MutAnyOrigin], Int) thin -> None,
         user_ctx: Int = 0,
         without_mask: BitSet256 = BitSet256(),
+        read_only: Bool = False,
+        changed_since: UInt32 = 0,
     ):
         """Lifetime-safe parallel iteration over all entities with `(C0, C1)` across `JobPool`.
-        Automatically anchors `self`, `pool`, and slice buffers past the worker barrier."""
+        Set `read_only=True` to avoid dirtying `changed_ticks`; set `changed_since > 0`
+        to skip unchanged chunks/SIMD groups."""
         var tid0 = self.find_component_by_hash(C0.COMPONENT_ID)
         var tid1 = self.find_component_by_hash(C1.COMPONENT_ID)
         if tid0 < 0 or tid1 < 0:
@@ -2237,17 +2486,42 @@ struct World(Movable):
                 var cnt = self.archetypes[a].chunks[ch].count
                 if cnt <= 0:
                     continue
-                if not is_sp0:
-                    self.archetypes[a].chunks[ch].mark_all_groups_changed(col0, self.current_tick)
-                if not is_sp1:
-                    self.archetypes[a].chunks[ch].mark_all_groups_changed(col1, self.current_tick)
-                var ents_ptr = Int(self.archetypes[a].chunks[ch].entities.unsafe_ptr())
-                var c0_ptr = 0 if is_sp0 else self.archetypes[a].chunks[ch].column_ptr(col0)
-                var c1_ptr = 0 if is_sp1 else self.archetypes[a].chunks[ch].column_ptr(col1)
-                slices.append(
-                    _ParSlice2(ents_ptr, c0_ptr, esz0, c1_ptr, esz1, 0, cnt, global_base, is_sp0, is_sp1)
-                )
-                global_base += cnt
+                if changed_since > 0 and not is_sp0 and not is_sp1:
+                    var c0_chg = self.archetypes[a].chunks[ch].any_group_changed_since(col0, changed_since)
+                    var c1_chg = self.archetypes[a].chunks[ch].any_group_changed_since(col1, changed_since)
+                    if not c0_chg and not c1_chg:
+                        continue
+                    var ents_ptr = Int(self.archetypes[a].chunks[ch].entities.unsafe_ptr())
+                    var c0_ptr = self.archetypes[a].chunks[ch].column_ptr(col0)
+                    var c1_ptr = self.archetypes[a].chunks[ch].column_ptr(col1)
+                    var active_groups = (cnt + (SIMD_LANES - 1)) >> 3
+                    for g in range(active_groups):
+                        if (
+                            self.archetypes[a].chunks[ch].group_changed_tick(col0, g) <= changed_since
+                            and self.archetypes[a].chunks[ch].group_changed_tick(col1, g) <= changed_since
+                        ):
+                            continue
+                        var rs = g << 3
+                        var rc = min(cnt - rs, SIMD_LANES)
+                        if not read_only:
+                            self.archetypes[a].chunks[ch].mark_changed(col0, rs, self.current_tick)
+                            self.archetypes[a].chunks[ch].mark_changed(col1, rs, self.current_tick)
+                        slices.append(
+                            _ParSlice2(ents_ptr, c0_ptr, esz0, c1_ptr, esz1, rs, rc, global_base, False, False)
+                        )
+                        global_base += rc
+                else:
+                    if not is_sp0 and not read_only:
+                        self.archetypes[a].chunks[ch].mark_all_groups_changed(col0, self.current_tick)
+                    if not is_sp1 and not read_only:
+                        self.archetypes[a].chunks[ch].mark_all_groups_changed(col1, self.current_tick)
+                    var ents_ptr = Int(self.archetypes[a].chunks[ch].entities.unsafe_ptr())
+                    var c0_ptr = 0 if is_sp0 else self.archetypes[a].chunks[ch].column_ptr(col0)
+                    var c1_ptr = 0 if is_sp1 else self.archetypes[a].chunks[ch].column_ptr(col1)
+                    slices.append(
+                        _ParSlice2(ents_ptr, c0_ptr, esz0, c1_ptr, esz1, 0, cnt, global_base, is_sp0, is_sp1)
+                    )
+                    global_base += cnt
 
         if len(slices) > 0:
             var disp = _ParDispatch2[C0, C1](
@@ -2263,6 +2537,132 @@ struct World(Movable):
                 rt_ready,
             )
             run_parallel_ctx(pool, len(slices), disp, _par_worker2[C0, C1])
+        for a in range(len(self.archetypes)):
+            for ch in range(len(self.archetypes[a].chunks)):
+                self.archetypes[a].chunks[ch].keep_alive()
+        for s in range(len(self.sparse_sets)):
+            self.sparse_sets[s].keep_alive()
+        self.keep_alive()
+        var anchor_slices = len(slices)
+        _ = anchor_slices
+
+    def par_for_each3[C0: Component, C1: Component, C2: Component](
+        mut self,
+        mut pool: JobPool,
+        kernel: def(
+            Int,
+            Int,
+            Entity,
+            Pointer[C0, MutAnyOrigin],
+            Pointer[C1, MutAnyOrigin],
+            Pointer[C2, MutAnyOrigin],
+            Int,
+        ) thin -> None,
+        user_ctx: Int = 0,
+        without_mask: BitSet256 = BitSet256(),
+        read_only: Bool = False,
+        changed_since: UInt32 = 0,
+    ):
+        """Lifetime-safe parallel iteration over all entities with `(C0, C1, C2)` across `JobPool`.
+        Set `read_only=True` to avoid dirtying `changed_ticks`; set `changed_since > 0`
+        to skip unchanged chunks/SIMD groups."""
+        var tid0 = self.find_component_by_hash(C0.COMPONENT_ID)
+        var tid1 = self.find_component_by_hash(C1.COMPONENT_ID)
+        var tid2 = self.find_component_by_hash(C2.COMPONENT_ID)
+        if tid0 < 0 or tid1 < 0 or tid2 < 0:
+            return
+        var rt_ready = _ecs_runtime_ensure()
+        var req_mask = BitSet256().with_bit(tid0).with_bit(tid1).with_bit(tid2)
+        var req_table = req_mask.intersection(self.table_comp_mask)
+        var ex_table = without_mask.intersection(self.table_comp_mask)
+        var ex_sparse = without_mask.intersection(self.sparse_comp_mask)
+        var has_ex_sparse = not ex_sparse.is_empty()
+        var is_sp0 = (C0.STORAGE_MODE == STORAGE_SPARSE)
+        var is_sp1 = (C1.STORAGE_MODE == STORAGE_SPARSE)
+        var is_sp2 = (C2.STORAGE_MODE == STORAGE_SPARSE)
+        var esz0 = self.components[tid0].byte_size
+        var esz1 = self.components[tid1].byte_size
+        var esz2 = self.components[tid2].byte_size
+
+        var slices = List[_ParSlice3]()
+        var global_base = 0
+        for a in range(len(self.archetypes)):
+            if not self.archetypes[a].table_mask.contains_all(req_table):
+                continue
+            if self.archetypes[a].table_mask.intersects(ex_table):
+                continue
+            var col0 = -1 if is_sp0 else self.archetypes[a].col_index(tid0)
+            var col1 = -1 if is_sp1 else self.archetypes[a].col_index(tid1)
+            var col2 = -1 if is_sp2 else self.archetypes[a].col_index(tid2)
+            for ch in range(len(self.archetypes[a].chunks)):
+                var cnt = self.archetypes[a].chunks[ch].count
+                if cnt <= 0:
+                    continue
+                if changed_since > 0 and not is_sp0 and not is_sp1 and not is_sp2:
+                    var any_chg = (
+                        self.archetypes[a].chunks[ch].any_group_changed_since(col0, changed_since)
+                        or self.archetypes[a].chunks[ch].any_group_changed_since(col1, changed_since)
+                        or self.archetypes[a].chunks[ch].any_group_changed_since(col2, changed_since)
+                    )
+                    if not any_chg:
+                        continue
+                    var ents_ptr = Int(self.archetypes[a].chunks[ch].entities.unsafe_ptr())
+                    var c0_ptr = self.archetypes[a].chunks[ch].column_ptr(col0)
+                    var c1_ptr = self.archetypes[a].chunks[ch].column_ptr(col1)
+                    var c2_ptr = self.archetypes[a].chunks[ch].column_ptr(col2)
+                    var active_groups = (cnt + (SIMD_LANES - 1)) >> 3
+                    for g in range(active_groups):
+                        if (
+                            self.archetypes[a].chunks[ch].group_changed_tick(col0, g) <= changed_since
+                            and self.archetypes[a].chunks[ch].group_changed_tick(col1, g) <= changed_since
+                            and self.archetypes[a].chunks[ch].group_changed_tick(col2, g) <= changed_since
+                        ):
+                            continue
+                        var rs = g << 3
+                        var rc = min(cnt - rs, SIMD_LANES)
+                        if not read_only:
+                            self.archetypes[a].chunks[ch].mark_changed(col0, rs, self.current_tick)
+                            self.archetypes[a].chunks[ch].mark_changed(col1, rs, self.current_tick)
+                            self.archetypes[a].chunks[ch].mark_changed(col2, rs, self.current_tick)
+                        slices.append(
+                            _ParSlice3(
+                                ents_ptr, c0_ptr, esz0, c1_ptr, esz1, c2_ptr, esz2, rs, rc, global_base, False, False, False
+                            )
+                        )
+                        global_base += rc
+                else:
+                    if not is_sp0 and not read_only:
+                        self.archetypes[a].chunks[ch].mark_all_groups_changed(col0, self.current_tick)
+                    if not is_sp1 and not read_only:
+                        self.archetypes[a].chunks[ch].mark_all_groups_changed(col1, self.current_tick)
+                    if not is_sp2 and not read_only:
+                        self.archetypes[a].chunks[ch].mark_all_groups_changed(col2, self.current_tick)
+                    var ents_ptr = Int(self.archetypes[a].chunks[ch].entities.unsafe_ptr())
+                    var c0_ptr = 0 if is_sp0 else self.archetypes[a].chunks[ch].column_ptr(col0)
+                    var c1_ptr = 0 if is_sp1 else self.archetypes[a].chunks[ch].column_ptr(col1)
+                    var c2_ptr = 0 if is_sp2 else self.archetypes[a].chunks[ch].column_ptr(col2)
+                    slices.append(
+                        _ParSlice3(
+                            ents_ptr, c0_ptr, esz0, c1_ptr, esz1, c2_ptr, esz2, 0, cnt, global_base, is_sp0, is_sp1, is_sp2
+                        )
+                    )
+                    global_base += cnt
+
+        if len(slices) > 0:
+            var disp = _ParDispatch3[C0, C1, C2](
+                Int(Pointer(to=self)),
+                Int(Pointer(to=pool)),
+                Int(slices.unsafe_ptr()),
+                kernel,
+                user_ctx,
+                tid0,
+                tid1,
+                tid2,
+                ex_sparse,
+                has_ex_sparse,
+                rt_ready,
+            )
+            run_parallel_ctx(pool, len(slices), disp, _par_worker3[C0, C1, C2])
         for a in range(len(self.archetypes)):
             for ch in range(len(self.archetypes[a].chunks)):
                 self.archetypes[a].chunks[ch].keep_alive()

@@ -12,6 +12,7 @@ Provides:
 - `TransformPlugin` (`EnginePlugin` wiring `PrevGlobalTransform` capture and `STAGE_POST_UPDATE` propagation).
 """
 from std.collections import List
+from std.ffi import external_call
 from std.math import max, min
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool
@@ -32,6 +33,7 @@ from flint.ecs.world import (
 from flint.app.engine_app import (
     EnginePlugin,
     EngineApp,
+    Resource,
     Resources,
     STAGE_FIXED_UPDATE,
     STAGE_POST_UPDATE,
@@ -528,6 +530,30 @@ struct _PropNodeItem(Copyable, ImplicitlyCopyable, Movable):
     var parent_gt_addr: Int
     var dst_gt_addr: Int
     var prev_gt_addr: Int
+    var entity_idx: Int32
+    var parent_idx: Int32
+    var self_dirty: Bool
+
+
+struct TransformPropagationCache(Resource):
+    """Persistent depth buckets and change-tracking state for zero-realloc parallel transform propagation."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.scene.TransformPropagationCache")
+    var buckets: List[List[_PropNodeItem]]
+    var dirty_flags: List[UInt8]
+    var last_propagated_tick: UInt32
+    var last_propagated_count: Int
+    var last_skipped_count: Int
+
+    def __init__(out self):
+        self.buckets = List[List[_PropNodeItem]]()
+        self.dirty_flags = List[UInt8]()
+        self.last_propagated_tick = 0
+        self.last_propagated_count = 0
+        self.last_skipped_count = 0
+
+    def invalidate(mut self):
+        """Forces the next propagation pass to recompute all entities."""
+        self.last_propagated_tick = 0
 
 
 @fieldwise_init
@@ -572,15 +598,20 @@ def _copy_gt_to_prev_kernel(
     prev[unsafe_offset=0].value = gt[unsafe_offset=0].copy()
 
 
-def propagate_transforms_parallel(
+def propagate_transforms_parallel_cached(
     mut world: World,
     mut pool: JobPool,
+    mut cache: TransformPropagationCache,
     copy_to_prev: Bool = False,
+    allow_insert_missing: Bool = True,
+    cmds_addr: Int = 0,
 ):
-    """Level-synchronous depth-bucketed parallel `GlobalTransform` propagation across `JobPool`.
-    Ensures every `LocalTransform` entity has `GlobalTransform`, then dispatches each hierarchy
-    depth `0 .. max_depth` across worker threads with a strict level barrier between depths."""
-    register_transform_components(world)
+    """Dirty-tracked, depth-bucketed level-synchronous parallel `GlobalTransform` propagation.
+    Reuses `cache.buckets` across frames (zero per-tick bucket reallocation) and skips static
+    root chunks and static subtrees whose `LocalTransform` / `Parent` / `HierarchyDepth`
+    `changed_ticks` have not advanced since `cache.last_propagated_tick`."""
+    if allow_insert_missing:
+        register_transform_components(world)
     var tid_local = world.component_id[LocalTransform]()
     var tid_global = world.component_id[GlobalTransform]()
     var tid_prev = world.component_id[PrevGlobalTransform]()
@@ -589,18 +620,39 @@ def propagate_transforms_parallel(
     if tid_local < 0 or tid_global < 0:
         return
 
-    # Auto-attach missing GlobalTransform on any newly spawned LocalTransform entities
+    # Auto-attach missing GlobalTransform on any newly spawned LocalTransform entities.
+    # In non-exclusive scheduled mode (`allow_insert_missing=False`), defer via ParallelCommands.
     var missing_gt = world.query_entities(
         BitSet256().with_bit(tid_local),
         BitSet256().with_bit(tid_global),
     )
-    for i in range(len(missing_gt)):
-        var e = missing_gt[i]
-        var loc = world.get[LocalTransform](e)
-        _ = world.insert[GlobalTransform](e, GlobalTransform.from_local(loc))
+    if len(missing_gt) > 0:
+        if allow_insert_missing:
+            for i in range(len(missing_gt)):
+                var e = missing_gt[i]
+                var loc = world.get[LocalTransform](e)
+                _ = world.insert[GlobalTransform](e, GlobalTransform.from_local(loc))
+        elif cmds_addr != 0:
+            ref cmds = Pointer[ParallelCommands, MutAnyOrigin](unsafe_from_address=cmds_addr)[unsafe_offset=0]
+            for i in range(len(missing_gt)):
+                var e = missing_gt[i]
+                var loc = world.get[LocalTransform](e)
+                cmds.insert[GlobalTransform](0, e, GlobalTransform.from_local(loc))
 
-    # Bucket all entities with (LocalTransform, GlobalTransform) by hierarchy depth
-    var buckets = List[List[_PropNodeItem]]()
+    # Clear persistent depth buckets without freeing their backing allocations
+    for d in range(len(cache.buckets)):
+        cache.buckets[d].clear()
+
+    var ent_cap = len(world.entities)
+    if len(cache.dirty_flags) < ent_cap:
+        cache.dirty_flags.resize(ent_cap, UInt8(0))
+    if ent_cap > 0:
+        _ = external_call["memset", Int](Int(cache.dirty_flags.unsafe_ptr()), Int32(0), ent_cap)
+
+    var last_tick = cache.last_propagated_tick
+    var force_all = (last_tick == 0) or copy_to_prev
+    var skipped = 0
+    var propagated = 0
     var with_lt_gt = BitSet256().with_bit(tid_local).with_bit(tid_global)
 
     for a in range(len(world.archetypes)):
@@ -616,22 +668,41 @@ def propagate_transforms_parallel(
             var cnt = world.archetypes[a].chunks[ch].count
             if cnt <= 0:
                 continue
-            world.archetypes[a].chunks[ch].mark_all_groups_changed(col_gt, world.current_tick)
-            if copy_to_prev and col_prev >= 0:
-                world.archetypes[a].chunks[ch].mark_all_groups_changed(col_prev, world.current_tick)
 
+            # Root-only chunk fast skip: no Parent component and no LocalTransform/HierarchyDepth changes
+            if not force_all and col_par < 0:
+                var loc_chg = world.archetypes[a].chunks[ch].any_group_changed_since(col_loc, last_tick)
+                var dep_chg = (
+                    col_dep >= 0
+                    and world.archetypes[a].chunks[ch].any_group_changed_since(col_dep, last_tick)
+                )
+                if not loc_chg and not dep_chg:
+                    skipped += cnt
+                    continue
+
+            var chunk_any_dirty = False
             for r in range(cnt):
-                var loc_addr = world.archetypes[a].chunks[ch].cell_ptr(col_loc, r)
-                var gt_addr = world.archetypes[a].chunks[ch].cell_ptr(col_gt, r)
-                var prev_addr = world.archetypes[a].chunks[ch].cell_ptr(col_prev, r) if col_prev >= 0 else 0
+                var e = world.archetypes[a].chunks[ch].entities[r]
+                var e_idx = Int(e.index)
+                var self_dirty = force_all
+                if not self_dirty:
+                    if world.archetypes[a].chunks[ch].row_changed_since(col_loc, r, last_tick):
+                        self_dirty = True
+                    elif col_par >= 0 and world.archetypes[a].chunks[ch].row_changed_since(col_par, r, last_tick):
+                        self_dirty = True
+                    elif col_dep >= 0 and world.archetypes[a].chunks[ch].row_changed_since(col_dep, r, last_tick):
+                        self_dirty = True
+
                 var depth = 0
                 var parent_gt_addr = 0
+                var parent_idx = Int32(-1)
                 if col_par >= 0:
                     var par_e = Pointer[Parent, ImmutAnyOrigin](
                         unsafe_from_address=world.archetypes[a].chunks[ch].cell_ptr(col_par, r)
                     )[unsafe_offset=0].entity
                     if world.is_alive(par_e):
                         parent_gt_addr = world.get_raw_ptr(par_e, tid_global)
+                        parent_idx = Int32(par_e.index)
                         if col_dep >= 0:
                             depth = max(
                                 1,
@@ -643,27 +714,105 @@ def propagate_transforms_parallel(
                             )
                         else:
                             depth = 1
-                while len(buckets) <= depth:
-                    buckets.append(List[_PropNodeItem]())
-                buckets[depth].append(_PropNodeItem(loc_addr, parent_gt_addr, gt_addr, prev_addr))
 
-    # Execute level-by-level across JobPool with strict barrier between depth d and d + 1
-    for d in range(len(buckets)):
-        var count_d = len(buckets[d])
+                if depth == 0 and not self_dirty:
+                    skipped += 1
+                    continue
+
+                if self_dirty:
+                    chunk_any_dirty = True
+                    if e_idx >= 0 and e_idx < len(cache.dirty_flags):
+                        cache.dirty_flags[e_idx] = UInt8(1)
+
+                var loc_addr = world.archetypes[a].chunks[ch].cell_ptr(col_loc, r)
+                var gt_addr = world.archetypes[a].chunks[ch].cell_ptr(col_gt, r)
+                var prev_addr = world.archetypes[a].chunks[ch].cell_ptr(col_prev, r) if col_prev >= 0 else 0
+                while len(cache.buckets) <= depth:
+                    cache.buckets.append(List[_PropNodeItem]())
+                cache.buckets[depth].append(
+                    _PropNodeItem(loc_addr, parent_gt_addr, gt_addr, prev_addr, Int32(e_idx), parent_idx, self_dirty)
+                )
+
+            if chunk_any_dirty or col_par >= 0:
+                if copy_to_prev and col_prev >= 0:
+                    world.archetypes[a].chunks[ch].mark_all_groups_changed(col_prev, world.current_tick)
+
+    # Execute level-by-level across JobPool with strict barrier between depth d and d + 1.
+    # For depth >= 1, filter in-place to entities that are self-dirty or have a dirty parent.
+    for d in range(len(cache.buckets)):
+        var count_d = len(cache.buckets[d])
         if count_d <= 0:
             continue
-        var batches = (count_d + _PROP_BATCH_SIZE - 1) // _PROP_BATCH_SIZE
-        var level_ctx = _PropLevelCtx(Int(buckets[d].unsafe_ptr()), count_d, copy_to_prev)
+        var active_d = count_d
+        if d > 0 and not force_all:
+            var write_i = 0
+            for i in range(count_d):
+                var it = cache.buckets[d][i]
+                var parent_dirty = (
+                    it.parent_idx >= 0
+                    and Int(it.parent_idx) < len(cache.dirty_flags)
+                    and cache.dirty_flags[Int(it.parent_idx)] != 0
+                )
+                if it.self_dirty or parent_dirty:
+                    if it.entity_idx >= 0 and Int(it.entity_idx) < len(cache.dirty_flags):
+                        cache.dirty_flags[Int(it.entity_idx)] = UInt8(1)
+                    if write_i != i:
+                        cache.buckets[d][write_i] = it
+                    write_i += 1
+                else:
+                    skipped += 1
+            active_d = write_i
+        else:
+            for i in range(count_d):
+                var e_idx = Int(cache.buckets[d][i].entity_idx)
+                if e_idx >= 0 and e_idx < len(cache.dirty_flags):
+                    cache.dirty_flags[e_idx] = UInt8(1)
+
+        if active_d <= 0:
+            continue
+        propagated += active_d
+        var batches = (active_d + _PROP_BATCH_SIZE - 1) // _PROP_BATCH_SIZE
+        var level_ctx = _PropLevelCtx(Int(cache.buckets[d].unsafe_ptr()), active_d, copy_to_prev)
         run_parallel_ctx(pool, batches, level_ctx, _prop_level_worker)
-        var anchor_b = len(buckets[d])
+        var anchor_b = len(cache.buckets[d])
         _ = anchor_b
+
+    if propagated > 0:
+        for a in range(len(world.archetypes)):
+            if not world.archetypes[a].table_mask.contains_all(with_lt_gt):
+                continue
+            var col_gt = world.archetypes[a].col_index(tid_global)
+            for ch in range(len(world.archetypes[a].chunks)):
+                var cnt = world.archetypes[a].chunks[ch].count
+                for r in range(cnt):
+                    var e_idx = Int(world.archetypes[a].chunks[ch].entities[r].index)
+                    if e_idx >= 0 and e_idx < len(cache.dirty_flags) and cache.dirty_flags[e_idx] != 0:
+                        world.archetypes[a].chunks[ch].mark_changed(col_gt, r, world.current_tick)
+
+    cache.last_propagated_tick = world.current_tick
+    cache.last_propagated_count = propagated
+    cache.last_skipped_count = skipped
 
     for a in range(len(world.archetypes)):
         for ch in range(len(world.archetypes[a].chunks)):
             world.archetypes[a].chunks[ch].keep_alive()
     world.keep_alive()
-    var anchor_buckets = len(buckets)
+    var anchor_buckets = len(cache.buckets)
     _ = anchor_buckets
+
+
+def propagate_transforms_parallel(
+    mut world: World,
+    mut pool: JobPool,
+    copy_to_prev: Bool = False,
+):
+    """Level-synchronous depth-bucketed parallel `GlobalTransform` propagation across `JobPool`.
+    Ensures every `LocalTransform` entity has `GlobalTransform`, then dispatches each hierarchy
+    depth `0 .. max_depth` across worker threads with a strict level barrier between depths."""
+    var local_cache = TransformPropagationCache()
+    propagate_transforms_parallel_cached(
+        world, pool, local_cache, copy_to_prev=copy_to_prev, allow_insert_missing=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -714,12 +863,31 @@ def _sys_snapshot_prev_transforms(
 
 def _sys_propagate_transforms(
     world_ptr: Pointer[World, MutAnyOrigin],
-    _res_ptr: Pointer[Resources, MutAnyOrigin],
+    res_ptr: Pointer[Resources, MutAnyOrigin],
     pool_ptr: Pointer[JobPool, MutAnyOrigin],
-    _cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
+    cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
     _ctx: Int,
 ):
-    propagate_transforms_parallel(world_ptr[unsafe_offset=0], pool_ptr[unsafe_offset=0], copy_to_prev=False)
+    var cache_opt = res_ptr[unsafe_offset=0].get_ptr_mut[TransformPropagationCache]()
+    if cache_opt:
+        propagate_transforms_parallel_cached(
+            world_ptr[unsafe_offset=0],
+            pool_ptr[unsafe_offset=0],
+            cache_opt.value()[unsafe_offset=0],
+            copy_to_prev=False,
+            allow_insert_missing=False,
+            cmds_addr=Int(cmds_ptr),
+        )
+    else:
+        var local_cache = TransformPropagationCache()
+        propagate_transforms_parallel_cached(
+            world_ptr[unsafe_offset=0],
+            pool_ptr[unsafe_offset=0],
+            local_cache,
+            copy_to_prev=False,
+            allow_insert_missing=False,
+            cmds_addr=Int(cmds_ptr),
+        )
 
 
 struct TransformPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
@@ -731,6 +899,8 @@ struct TransformPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
 
     def build(self, mut app: EngineApp):
         register_transform_components(app.world)
+        if not app.resources.has[TransformPropagationCache]():
+            app.insert_resource[TransformPropagationCache](TransformPropagationCache())
         var b_loc = app.world.bit_for[LocalTransform]()
         var b_gt = app.world.bit_for[GlobalTransform]()
         var b_prev = app.world.bit_for[PrevGlobalTransform]()
@@ -747,13 +917,13 @@ struct TransformPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
                 exclusive=False,
             )
 
-        # Propagation may auto-insert GlobalTransform on newly spawned LocalTransform entities,
-        # so mark exclusive=True at the end of STAGE_POST_UPDATE while internally fanning out across JobPool.
+        # Non-exclusive parallel propagation: defers missing GlobalTransform insertion via
+        # ParallelCommands so unrelated STAGE_POST_UPDATE systems can run concurrently.
         _ = app.add_system(
             STAGE_POST_UPDATE,
             "flint.scene.propagate_transforms",
             _sys_propagate_transforms,
             reads=b_loc.union(b_par).union(b_dep),
             writes=b_gt,
-            exclusive=True,
+            exclusive=False,
         )

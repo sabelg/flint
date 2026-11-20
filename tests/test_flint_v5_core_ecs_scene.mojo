@@ -33,6 +33,7 @@ from flint.core.anchor import (
     install_anchor,
     load,
 )
+from flint.core.cvars import ConsoleVars, CVAR_COUNT
 from flint.core.detmath import (
     MXCSR_SIM,
     f32_from_bits,
@@ -47,7 +48,7 @@ from flint.core.ecs import EntityHandle, ArchetypeSlots, ECB_PROV_GEN
 from flint.core.jobs import JobPool, run_jobs, run_jobs_affine
 from flint.core.math import Vec3, Quat, Mat4
 from flint.core.memory import Arena, MEM_FRAME
-from flint.core.profiler import ProfileTimeline
+from flint.core.profiler import ProfileTimeline, ZONE_COUNT, profile_ticks
 from flint.core.serial import BlobWriter, BlobReader, fourcc, fast_hash64
 from flint.core.session_replay import SessionRecorder, FLUSH_AT
 from flint.assets.json import JsonDocument
@@ -77,8 +78,10 @@ from flint.scene import (
     Children,
     HierarchyDepth,
     TransformPlugin,
+    TransformPropagationCache,
     set_parent,
     propagate_transforms_parallel,
+    propagate_transforms_parallel_cached,
     interpolate_global_transform,
     interpolate_entity_transform,
     ComponentRegistry,
@@ -90,9 +93,11 @@ from flint.scene import (
 from flint.app import (
     STAGE_UPDATE,
     STAGE_FIXED_UPDATE,
+    STAGE_POST_UPDATE,
     Resource,
     Resources,
     FixedTime,
+    FrameTime,
     Schedule,
     AppConfig,
     EngineApp,
@@ -1632,6 +1637,228 @@ def test_i_audit_regressions() raises:
     assert_equal(res.count(), 40)
 
 
+def _par3_ro_count_kernel(
+    _lane: Int,
+    _ord: Int,
+    _e: Entity,
+    pos: Pointer[CompPos, MutAnyOrigin],
+    vel: Pointer[CompVel, MutAnyOrigin],
+    mass: Pointer[CompMass, MutAnyOrigin],
+    ctx: Int,
+):
+    _ = pos[unsafe_offset=0].x + vel[unsafe_offset=0].vx + mass[unsafe_offset=0].inv_mass
+    _ = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=ctx)[unsafe_offset=0].fetch_add(1)
+
+
+def _par3_integrate_kernel(
+    _lane: Int,
+    _ord: Int,
+    _e: Entity,
+    pos: Pointer[CompPos, MutAnyOrigin],
+    vel: Pointer[CompVel, MutAnyOrigin],
+    mass: Pointer[CompMass, MutAnyOrigin],
+    ctx: Int,
+):
+    pos[unsafe_offset=0].x += vel[unsafe_offset=0].vx * mass[unsafe_offset=0].inv_mass
+    _ = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=ctx)[unsafe_offset=0].fetch_add(1)
+
+
+@fieldwise_init
+struct _TestEventCounterRes(Resource, Copyable, ImplicitlyCopyable):
+    comptime RESOURCE_ID: UInt64 = comp_hash64("test.Wave2EventCounterRes")
+    var swaps: Int
+
+
+def _test_event_swap_hook(res_ptr: Pointer[Resources, MutAnyOrigin]):
+    var opt = res_ptr[unsafe_offset=0].get_ptr_mut[_TestEventCounterRes]()
+    if opt:
+        opt.value()[unsafe_offset=0].swaps += 1
+
+
+def test_j_wave2_powerhouse_upgrades() raises:
+    """Wave 2 regressions: par_for_each3 + read_only + Changed[C] skip, chunk reclamation on
+    despawn, dirty-tracked TransformPropagationCache + non-exclusive TransformPlugin, dynamic
+    CVars & profiler zones, and EngineApp realtime/event-swap/profiler lifecycle."""
+    # 1. par_for_each3 + read_only=True + Changed[C] / changed_since skip
+    var w = World()
+    _ = w.register_component[CompPos]()
+    _ = w.register_component[CompVel]()
+    _ = w.register_component[CompMass]()
+    var ents = List[Entity]()
+    for i in range(128):  # 2 full 64-row chunks
+        var e = w.spawn_empty()
+        _ = w.insert[CompPos](e, CompPos(Float32(i), 0.0, 0.0))
+        _ = w.insert[CompVel](e, CompVel(Float32(2.0), 0.0, 0.0))
+        _ = w.insert[CompMass](e, CompMass(Float32(0.5)))
+        ents.append(e)
+
+    var pool = JobPool()
+    assert_true(pool.start(4), "JobPool(4) must start")
+
+    var tick_before_ro = w.current_tick
+    _ = w.advance_tick()
+    var ro_cnt = List[Int64](length=1, fill=0)
+    w.par_for_each3[CompPos, CompVel, CompMass](
+        pool, _par3_ro_count_kernel, Int(ro_cnt.unsafe_ptr()), read_only=True
+    )
+    assert_equal(Int(ro_cnt[0]), 128)
+    # read_only=True must NOT have dirtied changed_ticks!
+    var chg_none = w.query_changed_entities[CompPos](tick_before_ro)
+    assert_equal(len(chg_none), 0)
+
+    # Mutate ONLY entity 0 (chunk 0, SIMD group 0) and verify changed_since skips the other 15 groups
+    w.get_ptr_mut[CompPos](ents[0]).value()[unsafe_offset=0].y = Float32(7.0)
+    var chg_one_grp = w.query_changed_entities[CompPos](tick_before_ro)
+    assert_true(len(chg_one_grp) > 0 and len(chg_one_grp) <= 8)
+
+    var par_chg_cnt = List[Int64](length=1, fill=0)
+    w.par_for_each3[CompPos, CompVel, CompMass](
+        pool,
+        _par3_integrate_kernel,
+        Int(par_chg_cnt.unsafe_ptr()),
+        read_only=False,
+        changed_since=tick_before_ro,
+    )
+    assert_equal(Int(par_chg_cnt[0]), 8)
+    assert_equal(w.get_ptr[CompPos](ents[0]).value()[unsafe_offset=0].x, Float32(1.0))
+    assert_equal(w.get_ptr[CompPos](ents[64]).value()[unsafe_offset=0].x, Float32(64.0))
+
+    # 2. ArchetypeChunk reclamation on despawn (including swap-popping non-last empty chunk)
+    var w2 = World()
+    _ = w2.register_component[CompPos]()
+    var e2 = List[Entity]()
+    for i in range(200):
+        var e = w2.spawn_empty()
+        _ = w2.insert[CompPos](e, CompPos(Float32(i), 0.0, 0.0))
+        e2.append(e)
+    assert_true(w2.total_chunk_count() >= 4, "200 entities must span >= 4 chunks")
+    for i in range(200):
+        assert_true(w2.despawn(e2[i]))
+    assert_equal(w2.entity_count(), 0)
+    assert_equal(w2.total_chunk_count(), 0)
+
+    var e3 = List[Entity]()
+    for i in range(100):
+        var e = w2.spawn_empty()
+        _ = w2.insert[CompPos](e, CompPos(Float32(i + 1000), 0.0, 0.0))
+        e3.append(e)
+    assert_equal(w2.total_chunk_count(), 2)
+    # Despawn all 64 entities in chunk 0 -> chunk 0 is reclaimed via swap-pop of chunk 1
+    for i in range(64):
+        assert_true(w2.despawn(e3[i]))
+    assert_equal(w2.total_chunk_count(), 1)
+    assert_equal(w2.entity_count(), 36)
+    for i in range(64, 100):
+        assert_true(w2.is_alive(e3[i]))
+        assert_equal(w2.get_ptr[CompPos](e3[i]).value()[unsafe_offset=0].x, Float32(i + 1000))
+
+    # 3. Dirty-tracked TransformPropagationCache & non-exclusive TransformPlugin
+    var wt = World()
+    var rA = wt.spawn_empty()
+    var cA = wt.spawn_empty()
+    var gA = wt.spawn_empty()
+    var rB = wt.spawn_empty()
+    var cB = wt.spawn_empty()
+    var gB = wt.spawn_empty()
+    _ = wt.insert[LocalTransform](rA, LocalTransform(Vec3(1.0, 0.0, 0.0)))
+    _ = wt.insert[LocalTransform](cA, LocalTransform(Vec3(2.0, 0.0, 0.0)))
+    _ = wt.insert[LocalTransform](gA, LocalTransform(Vec3(3.0, 0.0, 0.0)))
+    _ = wt.insert[LocalTransform](rB, LocalTransform(Vec3(10.0, 0.0, 0.0)))
+    _ = wt.insert[LocalTransform](cB, LocalTransform(Vec3(20.0, 0.0, 0.0)))
+    _ = wt.insert[LocalTransform](gB, LocalTransform(Vec3(30.0, 0.0, 0.0)))
+    assert_true(set_parent(wt, cA, rA))
+    assert_true(set_parent(wt, gA, cA))
+    assert_true(set_parent(wt, cB, rB))
+    assert_true(set_parent(wt, gB, cB))
+
+    var cache = TransformPropagationCache()
+    propagate_transforms_parallel_cached(wt, pool, cache)
+    assert_equal(cache.last_propagated_count, 6)
+    assert_equal(cache.last_skipped_count, 0)
+    assert_true(abs(wt.get_ptr[GlobalTransform](gA).value()[unsafe_offset=0].translation.x - 6.0) < 1e-4)
+    assert_true(abs(wt.get_ptr[GlobalTransform](gB).value()[unsafe_offset=0].translation.x - 60.0) < 1e-4)
+
+    # Next tick with NO changes -> all 6 static nodes skipped
+    _ = wt.advance_tick()
+    propagate_transforms_parallel_cached(wt, pool, cache)
+    assert_equal(cache.last_propagated_count, 0)
+    assert_equal(cache.last_skipped_count, 6)
+
+    # Next tick: move ONLY rA -> gA updates to 105.0, while rB subtree stays untouched
+    _ = wt.advance_tick()
+    wt.get_ptr_mut[LocalTransform](rA).value()[unsafe_offset=0].translation.x = Float32(100.0)
+    propagate_transforms_parallel_cached(wt, pool, cache)
+    assert_true(abs(wt.get_ptr[GlobalTransform](gA).value()[unsafe_offset=0].translation.x - 105.0) < 1e-4)
+    assert_true(abs(wt.get_ptr[GlobalTransform](gB).value()[unsafe_offset=0].translation.x - 60.0) < 1e-4)
+    assert_true(cache.last_propagated_count >= 3)
+    pool.stop()
+
+    # 4. Dynamic CVar & dynamic Profiler zone registration
+    var cv = ConsoleVars()
+    var base_cnt = cv.count()
+    assert_equal(base_cnt, CVAR_COUNT)
+    var g_idx = cv.register_cvar("game.gravity", Float32(9.81), False, "world gravity")
+    var f_idx = cv.register_cvar("game.godmode", Float32(0.0), True, "invincibility flag")
+    assert_equal(cv.register_cvar("game.gravity", Float32(1.0)), g_idx)  # idempotent
+    assert_equal(cv.count(), CVAR_COUNT + 2)
+    assert_equal(cv.find("game.gravity"), g_idx)
+    assert_equal(cv.apply("game.gravity=20,game.godmode"), 2)
+    assert_equal(cv.get(g_idx), Float32(20.0))
+    assert_true(cv.on(f_idx))
+
+    var tl = ProfileTimeline()
+    var z_pre = tl.register_zone("game.ai_think")
+    assert_equal(z_pre, ZONE_COUNT)
+    assert_equal(tl.zone_label(z_pre), "game.ai_think")
+    assert_true(tl.start(String("")))
+    var z_post = tl.register_zone("game.net_sync")
+    assert_equal(z_post, ZONE_COUNT + 1)
+    assert_equal(tl.zone_label(z_post), "game.net_sync")
+    assert_equal(tl.register_zone("game.net_sync"), z_post)  # idempotent
+    tl.begin_frame()
+    var t_start = profile_ticks()
+    tl.handle.record(z_post, t_start, t_start + UInt64(1000))
+    tl.end_frame()
+    tl.finish()
+
+    # 5. Non-exclusive TransformPlugin + EngineApp realtime + event swap hook + profiler lifecycle
+    var app = EngineApp(
+        AppConfig(
+            title="Wave2Test",
+            headless=True,
+            worker_threads=2,
+            enable_profiler=True,
+        )
+    )
+    app.add_plugin(TransformPlugin())
+    var found_prop = False
+    for i in range(len(app.schedule.stages[STAGE_POST_UPDATE].systems)):
+        ref sd = app.schedule.stages[STAGE_POST_UPDATE].systems[i]
+        if sd.name == "flint.scene.propagate_transforms":
+            found_prop = True
+            assert_true(not sd.exclusive, "TransformPlugin propagate_transforms must be non-exclusive")
+    assert_true(found_prop, "TransformPlugin must register propagate_transforms")
+    app.insert_resource[_TestEventCounterRes](_TestEventCounterRes(0))
+    app.add_event_swap_hook(_test_event_swap_hook)
+    _ = app.register_profiler_zone("game.custom_stage")
+    app.run_realtime(max_frames=3)
+    assert_equal(app.resources.get_ptr[FrameTime]().value()[unsafe_offset=0].frame_index, UInt64(3))
+    assert_equal(app.resources.get_ptr[_TestEventCounterRes]().value()[unsafe_offset=0].swaps, 3)
+    assert_equal(app.profiler.frame, 3)
+
+    # 6. SIMD Mat4.multiply analytical check
+    var mA = Mat4()
+    mA.set(0, 3, Float32(3.0))
+    mA.set(1, 3, Float32(4.0))
+    var mB = Mat4()
+    mB.set(0, 0, Float32(2.0))
+    mB.set(0, 3, Float32(5.0))
+    var mC = mA.multiply(mB)
+    assert_equal(mC.at(0, 0), Float32(2.0))
+    assert_equal(mC.at(0, 3), Float32(8.0))
+    assert_equal(mC.at(1, 3), Float32(4.0))
+
+
 def main() raises:
     var t0 = get_time()
     print("[Flint v5 Track 1] Running Core, Hybrid ECS v2, Scene/Prefab & Hot-Reload Suite...")
@@ -1663,5 +1890,8 @@ def main() raises:
     test_i_audit_regressions()
     print("  [PASS] (i) Phase 0+1 audit regressions (par_for_each sparse excl, write_dev safety, anchor, Arena, Resources)")
 
+    test_j_wave2_powerhouse_upgrades()
+    print("  [PASS] (j) Wave 2 upgrades (par_for_each3/read_only/Changed, chunk reclaim, dirty transforms, dynamic CVars/zones)")
+
     var elapsed = get_time() - t0
-    print("[Flint v5 Track 1] ALL 9 SUITES PASSED in " + String(elapsed) + " s")
+    print("[Flint v5 Track 1] ALL 10 SUITES PASSED in " + String(elapsed) + " s")

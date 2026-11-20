@@ -12,6 +12,8 @@ from flint.scene.transform_hierarchy import (
     set_parent,
     clear_parent,
     snapshot_prev_global_transforms,
+    TransformPropagationCache,
+    propagate_transforms_parallel_cached,
     propagate_transforms_parallel,
     interpolate_global_transform,
     interpolate_entity_transform,
