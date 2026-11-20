@@ -20,6 +20,7 @@ from flint.net.bitpack import (
 from flint.net.channel import seq_gt
 
 comptime DIRTY_NONE: UInt8 = 0
+comptime DIRTY_DESTROY: UInt8 = 0  # 4-bit opcode 0 in wire stream = despawn / out-of-AOI removal
 comptime DIRTY_POS: UInt8 = 1 << 0
 comptime DIRTY_ROT: UInt8 = 1 << 1
 comptime DIRTY_VEL: UInt8 = 1 << 2
@@ -82,6 +83,7 @@ struct _ClientBaselineSlot(Movable):
     var valid: Bool
     var seq: UInt16
     var entities: List[_QuantizedEntitySnap]
+    var known_eids: List[Int]
 
     def __init__(out self, max_entities: Int):
         self.valid = False
@@ -89,6 +91,13 @@ struct _ClientBaselineSlot(Movable):
         self.entities = List[_QuantizedEntitySnap](
             length=max_entities, fill=_QuantizedEntitySnap()
         )
+        self.known_eids = List[Int](capacity=min(64, max_entities))
+
+    def clear_sparse(mut self):
+        for i in range(len(self.known_eids)):
+            var eid = self.known_eids[i]
+            self.entities[eid] = _QuantizedEntitySnap()
+        self.known_eids.clear()
 
 
 struct _ClientRepState(Movable):
@@ -253,6 +262,9 @@ struct SnapshotReplicator(Movable):
 
     var candidate_indices: List[Int]
     var candidate_masks: List[UInt8]
+    var in_aoi_stamp: List[Int]
+    var aoi_query_stamp: Int
+    var remove_candidates: List[Int]
     var sort_keys: List[Int]
     var writer: BitWriter
 
@@ -294,6 +306,9 @@ struct SnapshotReplicator(Movable):
         self.candidate_masks = List[UInt8](
             length=self.max_entities, fill=DIRTY_NONE
         )
+        self.in_aoi_stamp = List[Int](length=self.max_entities, fill=0)
+        self.aoi_query_stamp = 0
+        self.remove_candidates = List[Int](capacity=64)
         self.sort_keys = List[Int](capacity=self.max_entities)
         self.writer = BitWriter(1200)
 
@@ -345,6 +360,13 @@ struct SnapshotReplicator(Movable):
         self.entities[entity_id].base_priority = max(
             Float32(0.05), base_priority
         )
+
+    def destroy_entity(mut self, entity_id: Int):
+        """Marks an entity inactive/despawned so interested clients receive a removal opcode."""
+        if entity_id < 0 or entity_id >= self.max_entities:
+            return
+        self.entities[entity_id].active = False
+        self.quantized_now[entity_id].known = False
 
     def set_client_view(
         mut self,
@@ -450,6 +472,20 @@ struct SnapshotReplicator(Movable):
         # Ensure ascending entity index order before stable priority sort so ties are 100% deterministic
         stable_sort_entity_ids(self.candidate_indices)
 
+        # Stamp active AOI entities in O(candidates) to detect despawns & out-of-AOI exits
+        self.aoi_query_stamp += 1
+        var stamp = self.aoi_query_stamp
+        for k in range(len(self.candidate_indices)):
+            self.in_aoi_stamp[self.candidate_indices[k]] = stamp
+
+        self.remove_candidates.clear()
+        if has_base:
+            var n_known = len(self.clients[client_id].baselines[base_slot].known_eids)
+            for k in range(n_known):
+                var eid = self.clients[client_id].baselines[base_slot].known_eids[k]
+                if self.in_aoi_stamp[eid] != stamp:
+                    self.remove_candidates.append(eid)
+
         var dirty_candidates = List[Int](capacity=len(self.candidate_indices))
         self.sort_keys.clear()
         var inv_rad = Float32(1.0) / max(Float32(1.0), rad)
@@ -486,15 +522,18 @@ struct SnapshotReplicator(Movable):
 
         var order = stable_order(self.sort_keys)
 
-        # Prepare new baseline slot copied from ACKed baseline (or clean if full snapshot)
+        # Sparse O(known_in_aoi) baseline copy into `new_slot` (instead of O(max_entities))
+        self.clients[client_id].baselines[new_slot].clear_sparse()
         self.clients[client_id].baselines[new_slot].valid = True
         self.clients[client_id].baselines[new_slot].seq = snap_seq
-        for e in range(self.max_entities):
-            self.clients[client_id].baselines[new_slot].entities[e] = (
-                self.clients[client_id].baselines[base_slot].entities[e]
-                if has_base
-                else _QuantizedEntitySnap()
-            )
+        if has_base:
+            var n_known = len(self.clients[client_id].baselines[base_slot].known_eids)
+            for k in range(n_known):
+                var eid = self.clients[client_id].baselines[base_slot].known_eids[k]
+                self.clients[client_id].baselines[new_slot].entities[eid] = (
+                    self.clients[client_id].baselines[base_slot].entities[eid]
+                )
+                self.clients[client_id].baselines[new_slot].known_eids.append(eid)
 
         # Encode header (`8` bytes + 1-bit `has_base` flag):
         # magic u16, snap_seq u16, base_seq u16, count_placeholder u16, has_base bool
@@ -506,6 +545,23 @@ struct SnapshotReplicator(Movable):
         self.writer.write_bool(has_base)
 
         var packed_entities = 0
+        var any_removed = False
+        # Pack despawn / out-of-AOI removals first (high priority, tiny 4-bit mask == 0 opcode)
+        for r_i in range(len(self.remove_candidates)):
+            var eid = self.remove_candidates[r_i]
+            var saved_mark = self.writer.mark()
+            self.writer.write_int_bounded(eid, 0, self.max_entities - 1)
+            self.writer.write_bits(UInt64(DIRTY_DESTROY), 4)
+            if self.writer.byte_length() > self.max_packet_bytes:
+                self.writer.restore(saved_mark)
+                break
+            self.clients[client_id].baselines[new_slot].entities[
+                eid
+            ] = _QuantizedEntitySnap()
+            self.clients[client_id].priority_accum[eid] = 0.0
+            any_removed = True
+            packed_entities += 1
+
         for ord_i in range(len(order)):
             var eid = dirty_candidates[order[ord_i]]
             var mask = self.candidate_masks[eid]
@@ -558,6 +614,9 @@ struct SnapshotReplicator(Movable):
                 continue
 
             # Commit updated quantized fields into this snapshot's baseline record
+            var was_known = self.clients[client_id].baselines[new_slot].entities[
+                eid
+            ].known
             var updated_b = base_q
             updated_b.known = True
             if (mask & DIRTY_POS) != 0:
@@ -576,8 +635,27 @@ struct SnapshotReplicator(Movable):
             self.clients[client_id].baselines[new_slot].entities[
                 eid
             ] = updated_b
+            if not was_known:
+                self.clients[client_id].baselines[new_slot].known_eids.append(eid)
             self.clients[client_id].priority_accum[eid] = 0.0
             packed_entities += 1
+
+        if any_removed:
+            # Compact `known_eids` in O(known) to drop removed entities
+            var write_idx = 0
+            var n_k = len(self.clients[client_id].baselines[new_slot].known_eids)
+            for k in range(n_k):
+                var eid = self.clients[client_id].baselines[new_slot].known_eids[k]
+                if self.clients[client_id].baselines[new_slot].entities[eid].known:
+                    self.clients[client_id].baselines[new_slot].known_eids[
+                        write_idx
+                    ] = eid
+                    write_idx += 1
+            while (
+                len(self.clients[client_id].baselines[new_slot].known_eids)
+                > write_idx
+            ):
+                _ = self.clients[client_id].baselines[new_slot].known_eids.pop()
 
         var out_bytes = self.writer.finish()
         out_bytes[6] = UInt8(packed_entities & 0xFF)
@@ -597,7 +675,7 @@ def stable_sort_entity_ids(mut ids: List[Int]):
 
 
 struct SnapshotClientReceiver(Movable):
-    """Client-side delta snapshot decoder maintaining the matching 32-slot baseline ring."""
+    """Client-side delta snapshot decoder maintaining the matching 32-slot sparse baseline ring."""
     var max_entities: Int
     var world_min: Float32
     var world_max: Float32
@@ -605,7 +683,9 @@ struct SnapshotClientReceiver(Movable):
     var entities: List[ReplicatedEntity]
     var baselines: List[_ClientBaselineSlot]
     var _staging_baseline: List[_QuantizedEntitySnap]
+    var _staging_known_eids: List[Int]
     var _decoded_eids: List[Int]
+    var _removed_eids: List[Int]
     var has_decoded_seq: Bool
     var last_decoded_seq: UInt16
     var decoded_packets: Int
@@ -629,10 +709,18 @@ struct SnapshotClientReceiver(Movable):
         self._staging_baseline = List[_QuantizedEntitySnap](
             length=self.max_entities, fill=_QuantizedEntitySnap()
         )
+        self._staging_known_eids = List[Int](capacity=min(64, self.max_entities))
         self._decoded_eids = List[Int](capacity=self.max_entities)
+        self._removed_eids = List[Int](capacity=64)
         self.has_decoded_seq = False
         self.last_decoded_seq = 0
         self.decoded_packets = 0
+
+    def _clear_staging_sparse(mut self):
+        for i in range(len(self._staging_known_eids)):
+            var eid = self._staging_known_eids[i]
+            self._staging_baseline[eid] = _QuantizedEntitySnap()
+        self._staging_known_eids.clear()
 
     def apply_packet(mut self, pkt: List[UInt8]) -> Tuple[Bool, UInt16]:
         if len(pkt) < 9:
@@ -659,14 +747,16 @@ struct SnapshotClientReceiver(Movable):
         ):
             return (False, UInt16(0))
 
-        # Stage into scratch baseline so truncated/malformed packets never destroy valid baselines
-        for e in range(self.max_entities):
-            self._staging_baseline[e] = (
-                self.baselines[base_slot].entities[e]
-                if has_base
-                else _QuantizedEntitySnap()
-            )
+        # Sparse O(known) staging so truncated/malformed packets never destroy valid baselines
+        self._clear_staging_sparse()
+        if has_base:
+            var n_known = len(self.baselines[base_slot].known_eids)
+            for k in range(n_known):
+                var eid = self.baselines[base_slot].known_eids[k]
+                self._staging_baseline[eid] = self.baselines[base_slot].entities[eid]
+                self._staging_known_eids.append(eid)
         self._decoded_eids.clear()
+        self._removed_eids.clear()
 
         for _ in range(count):
             var eid = r.read_int_bounded(0, self.max_entities - 1)
@@ -674,6 +764,12 @@ struct SnapshotClientReceiver(Movable):
             if r.overflowed or eid < 0 or eid >= self.max_entities:
                 return (False, UInt16(0))
 
+            if mask == DIRTY_DESTROY:
+                self._staging_baseline[eid] = _QuantizedEntitySnap()
+                self._removed_eids.append(eid)
+                continue
+
+            var was_known = self._staging_baseline[eid].known
             var q = self._staging_baseline[eid]
             q.known = True
 
@@ -703,14 +799,24 @@ struct SnapshotClientReceiver(Movable):
                 return (False, UInt16(0))
 
             self._staging_baseline[eid] = q
+            if not was_known:
+                self._staging_known_eids.append(eid)
             self._decoded_eids.append(eid)
 
-        # Atomic commit: packet decoded cleanly with zero overflow
+        # Atomic sparse commit: packet decoded cleanly with zero overflow
         var new_slot = Int(snap_seq) & _BASELINE_MASK
+        self.baselines[new_slot].clear_sparse()
         self.baselines[new_slot].valid = True
         self.baselines[new_slot].seq = snap_seq
-        for e in range(self.max_entities):
-            self.baselines[new_slot].entities[e] = self._staging_baseline[e]
+        for i in range(len(self._staging_known_eids)):
+            var eid = self._staging_known_eids[i]
+            if self._staging_baseline[eid].known:
+                self.baselines[new_slot].entities[eid] = self._staging_baseline[eid]
+                self.baselines[new_slot].known_eids.append(eid)
+
+        for i in range(len(self._removed_eids)):
+            var eid = self._removed_eids[i]
+            self.entities[eid].active = False
 
         var span_pos = self.world_max - self.world_min
         var span_vel = Float32(2.0) * self.vel_limit
@@ -735,3 +841,123 @@ struct SnapshotClientReceiver(Movable):
         self.last_decoded_seq = snap_seq
         self.decoded_packets += 1
         return (True, snap_seq)
+
+
+struct _InterpFrame(Movable):
+    var valid: Bool
+    var time_ms: Float64
+    var entities: List[ReplicatedEntity]
+
+    def __init__(out self, max_entities: Int):
+        self.valid = False
+        self.time_ms = 0.0
+        self.entities = List[ReplicatedEntity](capacity=max_entities)
+        for i in range(max_entities):
+            self.entities.append(ReplicatedEntity(i))
+
+
+struct SnapshotInterpolationBuffer(Movable):
+    """Client-side jitter-delay snapshot interpolation buffer (linear pos/vel + quaternion slerp)."""
+    var max_entities: Int
+    var capacity: Int
+    var interp_delay_ms: Float64
+    var frames: List[_InterpFrame]
+    var count: Int
+    var write_idx: Int
+
+    def __init__(
+        out self,
+        max_entities: Int = 512,
+        interp_delay_ms: Float64 = 100.0,
+        ring_capacity: Int = 16,
+    ):
+        self.max_entities = max(1, max_entities)
+        self.capacity = max(2, ring_capacity)
+        self.interp_delay_ms = max(0.0, interp_delay_ms)
+        self.frames = List[_InterpFrame](capacity=self.capacity)
+        for _ in range(self.capacity):
+            self.frames.append(_InterpFrame(self.max_entities))
+        self.count = 0
+        self.write_idx = 0
+
+    def push_snapshot(
+        mut self, server_time_ms: Float64, entities: List[ReplicatedEntity]
+    ):
+        """Records an authoritative decoded snapshot at `server_time_ms`."""
+        var slot = self.write_idx
+        self.frames[slot].valid = True
+        self.frames[slot].time_ms = server_time_ms
+        var n = min(self.max_entities, len(entities))
+        for i in range(n):
+            self.frames[slot].entities[i] = entities[i]
+        for i in range(n, self.max_entities):
+            self.frames[slot].entities[i].active = False
+        self.write_idx = (self.write_idx + 1) % self.capacity
+        if self.count < self.capacity:
+            self.count += 1
+
+    def sample(
+        self, render_time_ms: Float64, mut out_entities: List[ReplicatedEntity]
+    ) -> Bool:
+        """Samples interpolated entity transforms at `render_time_ms - interp_delay_ms`."""
+        if self.count == 0:
+            return False
+        if len(out_entities) < self.max_entities:
+            out_entities.clear()
+            for i in range(self.max_entities):
+                out_entities.append(ReplicatedEntity(i))
+
+        var target_t = render_time_ms - self.interp_delay_ms
+        var oldest_idx = (
+            (self.write_idx - self.count + self.capacity) % self.capacity
+        )
+        var newest_idx = (self.write_idx - 1 + self.capacity) % self.capacity
+
+        if self.count == 1 or target_t <= self.frames[oldest_idx].time_ms:
+            for i in range(self.max_entities):
+                out_entities[i] = self.frames[oldest_idx].entities[i]
+            return True
+
+        if target_t >= self.frames[newest_idx].time_ms:
+            for i in range(self.max_entities):
+                out_entities[i] = self.frames[newest_idx].entities[i]
+            return True
+
+        # Find bracketing pair (idx0, idx1) with time0 <= target_t <= time1
+        var idx0 = oldest_idx
+        var idx1 = oldest_idx
+        for k in range(self.count - 1):
+            var a = (oldest_idx + k) % self.capacity
+            var b = (oldest_idx + k + 1) % self.capacity
+            if (
+                self.frames[a].time_ms <= target_t
+                and target_t <= self.frames[b].time_ms
+            ):
+                idx0 = a
+                idx1 = b
+                break
+
+        var dt = self.frames[idx1].time_ms - self.frames[idx0].time_ms
+        var alpha = Float32(0.0)
+        if dt > 1.0e-6:
+            alpha = max(
+                Float32(0.0),
+                min(Float32(1.0), Float32((target_t - self.frames[idx0].time_ms) / dt)),
+            )
+        var inv_a = Float32(1.0) - alpha
+
+        for i in range(self.max_entities):
+            var e0 = self.frames[idx0].entities[i]
+            var e1 = self.frames[idx1].entities[i]
+            if e0.active and e1.active:
+                var dst = e1
+                dst.pos = e0.pos * inv_a + e1.pos * alpha
+                dst.vel = e0.vel * inv_a + e1.vel * alpha
+                dst.rot = e0.rot.slerp(e1.rot, alpha)
+                dst.state_flags = e0.state_flags if alpha < Float32(0.5) else e1.state_flags
+                out_entities[i] = dst
+            elif e1.active:
+                out_entities[i] = e1
+            else:
+                out_entities[i].active = False
+        return True

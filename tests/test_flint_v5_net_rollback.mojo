@@ -37,10 +37,13 @@ from flint.net.rollback import (
     _RB_WIRE_MAGIC,
 )
 from flint.net import (
+    AeadKey,
     BitReader,
     BitWriter,
     CHAN_ACK_HEARTBEAT,
     CHAN_RELIABLE_ORDERED,
+    CHAN_RELIABLE_UNORDERED,
+    CHAN_UNRELIABLE_RAW,
     DatagramView,
     IPV6_SAFE_MTU_BYTES,
     JITTER_TRIANGULAR,
@@ -50,10 +53,12 @@ from flint.net import (
     NetEndpoint,
     PacketWireHeader,
     ROLLBACK_INPUT_HISTORY_K,
+    ReplicatedEntity,
     RollbackInput,
     RollbackSession,
     RollbackWorld,
     SnapshotClientReceiver,
+    SnapshotInterpolationBuffer,
     SnapshotReader,
     SnapshotReplicator,
     UdpSocket,
@@ -61,6 +66,8 @@ from flint.net import (
     VirtualNetSim,
     VisualSmoother,
     WIRE_HEADER_BYTES,
+    aead_open,
+    aead_seal,
     quat_angular_error_deg,
     seq_diff,
     seq_gt,
@@ -1011,7 +1018,7 @@ def test_i_security_dos_and_wraparound_regressions() raises:
     _put_u64_le(ack_pkt, UInt64(0xFFFFFFFFFFFFFFFF))
     var ack_view = DatagramView(peer, Int(ack_pkt.unsafe_ptr()), len(ack_pkt))
     assert_true(ch.ingest_datagram(ack_view, 100.0))
-    _ = len(ack_pkt)
+    assert_equal(Int(ack_pkt[0]), 0x56)
     assert_equal(Int(ch.oldest_unacked_rel_seq), 0)
     assert_equal(Int(ch.next_send_rel_seq), 0)
 
@@ -1026,7 +1033,7 @@ def test_i_security_dos_and_wraparound_regressions() raises:
     _put_u64_le(ack_pkt2, UInt64(0xFFFF))
     var ack_view2 = DatagramView(peer, Int(ack_pkt2.unsafe_ptr()), len(ack_pkt2))
     assert_true(ch.ingest_datagram(ack_view2, 110.0))
-    _ = len(ack_pkt2)
+    assert_equal(Int(ack_pkt2[0]), 0x56)
     assert_equal(Int(ch.oldest_unacked_rel_seq), 0)  # must remain 0 (spoofed future ACK ignored)
 
     # (b) frag_cnt > 4096 rejection in NetChannel.ingest_datagram
@@ -1049,7 +1056,7 @@ def test_i_security_dos_and_wraparound_regressions() raises:
         ch.ingest_datagram(bad_frag_view, 120.0),
         "frag_cnt > 4096 must be rejected",
     )
-    _ = len(bad_frag_pkt)
+    assert_equal(Int(bad_frag_pkt[0]), 0x56)
     assert_false(ch.assembling_active)
     assert_equal(len(ch.incoming_reliable), 0)
 
@@ -1211,6 +1218,243 @@ def test_i_security_dos_and_wraparound_regressions() raises:
     assert_equal(bad_pw.snapshot_load_failures, 1)
 
 
+def test_j_wave2_aead_cookie_channels_despawn_interp() raises:
+    print("  [Test J] Wave 2: ChaCha20-Poly1305 AEAD, Replay/Tamper, Cookie Handshake, Despawn/AOI, Interp, Unordered/Raw & RTO Backoff...")
+
+    # 1. ChaCha20-Poly1305 AEAD encrypt/decrypt + tamper rejection
+    var key = AeadKey.from_u64x4(
+        0x0706050403020100,
+        0x0F0E0D0C0B0A0908,
+        0x1716151413121110,
+        0x1F1E1D1C1B1A1918,
+    )
+    var aad = _hub_msg(11, 22)
+    var pt = _hub_msg(33, 197)
+    var ct_tag = List[UInt8]()
+    aead_seal(key, UInt64(42), aad, pt, ct_tag)
+    assert_equal(len(ct_tag), len(pt) + 16)
+
+    var dec = List[UInt8]()
+    assert_true(aead_open(key, UInt64(42), aad, ct_tag, dec))
+    assert_equal(hash_list(dec), hash_list(pt))
+
+    # 1-bit ciphertext tamper must fail authentication
+    var bad_ct = ct_tag.copy()
+    bad_ct[10] ^= UInt8(0x01)
+    assert_false(aead_open(key, UInt64(42), aad, bad_ct, dec))
+    # 1-bit AAD tamper must fail authentication
+    var bad_aad = aad.copy()
+    bad_aad[3] ^= UInt8(0x80)
+    assert_false(aead_open(key, UInt64(42), bad_aad, ct_tag, dec))
+    # Wrong nonce must fail authentication
+    assert_false(aead_open(key, UInt64(43), aad, ct_tag, dec))
+
+    # 2. Encrypted NetChannel over lossy VirtualNetSim + direct replay & tamper defense
+    var sim_enc = VirtualNetSim(
+        seed=0xAEAD2026,
+        one_way_latency_ms=15.0,
+        jitter_ms=5.0,
+        loss_rate=0.08,
+        dup_rate=0.05,
+        mtu_bytes=IPV6_SAFE_MTU_BYTES,
+    )
+    var e0 = sim_enc.create_ipv4_peer(0, 9930)
+    var e1 = sim_enc.create_ipv4_peer(1, 9930)
+    var ch_a = NetChannel(e1.local_endpoint(), IPV6_SAFE_MTU_BYTES)
+    var ch_b = NetChannel(e0.local_endpoint(), IPV6_SAFE_MTU_BYTES)
+    ch_a.enable_encryption(key)
+    ch_b.enable_encryption(key)
+
+    var secret_msg = _hub_msg(77, 4096)
+    assert_true(ch_a.send_reliable(secret_msg))
+    var got_secret = False
+    for _ in range(300):
+        var now = sim_enc.now_ms()
+        ch_a.poll(e0, now)
+        ch_b.poll(e1, now)
+        var r = ch_b.pop_reliable_message()
+        if r[0]:
+            assert_equal(hash_list(r[1]), hash_list(secret_msg))
+            got_secret = True
+        if got_secret and ch_a.is_all_reliable_acked():
+            break
+        sim_enc.advance_ms(10.0)
+    assert_true(got_secret, "encrypted 4 KiB reliable message must deliver cleanly")
+    assert_equal(ch_b.crypto_auth_failures, 0)
+
+    # Capture an encrypted unreliable-raw packet on a clean 0%-loss sim, test tamper, valid ingest & replay!
+    var sim_rep = VirtualNetSim(seed=0xAEAD99, one_way_latency_ms=10.0, jitter_ms=0.0, loss_rate=0.0)
+    var er0 = sim_rep.create_ipv4_peer(0, 9935)
+    var er1 = sim_rep.create_ipv4_peer(1, 9935)
+    var chr_a = NetChannel(er1.local_endpoint(), IPV6_SAFE_MTU_BYTES)
+    var chr_b = NetChannel(er0.local_endpoint(), IPV6_SAFE_MTU_BYTES)
+    chr_a.enable_encryption(key)
+    chr_b.enable_encryption(key)
+
+    var raw_p = _hub_msg(55, 24)
+    assert_true(chr_a.send_unreliable_raw(raw_p, er0, sim_rep.now_ms())[0])
+    sim_rep.advance_ms(20.0)
+    var cap_views = List[DatagramView](capacity=16)
+    var n_cap = er1.recv_batch(cap_views)
+    assert_equal(n_cap, 1)
+    var captured = cap_views[0].to_bytes()
+    assert_true(er1.local_endpoint().port > 0)  # keep er1.rx_ring_buf alive across to_bytes()
+
+    # Tamper 1 bit of tag BEFORE valid ingest -> must fail Poly1305 & NOT pollute ReplayWindow64!
+    var tampered = captured.copy()
+    tampered[len(tampered) - 1] ^= UInt8(0x04)
+    var v_bad = DatagramView(
+        er0.local_endpoint(), Int(tampered.unsafe_ptr()), len(tampered)
+    )
+    assert_false(chr_b.ingest_datagram(v_bad, sim_rep.now_ms()))
+    assert_equal(Int(tampered[0]), 0x56)
+    assert_equal(chr_b.crypto_auth_failures, 1)
+
+    # Original untampered packet must still authenticate and deliver cleanly!
+    var v_good = DatagramView(
+        er0.local_endpoint(), Int(captured.unsafe_ptr()), len(captured)
+    )
+    assert_true(chr_b.ingest_datagram(v_good, sim_rep.now_ms()))
+    var pop_r = chr_b.pop_unreliable_raw_message()
+    assert_true(pop_r[0] and hash_list(pop_r[1]) == hash_list(raw_p))
+
+    # Replay the exact same authenticated packet -> must be rejected by ReplayWindow64!
+    assert_false(chr_b.ingest_datagram(v_good, sim_rep.now_ms()))
+    assert_equal(Int(captured[0]), 0x56)
+    assert_equal(chr_b.crypto_replay_drops, 1)
+
+    # 3. Stateless cookie handshake + encrypted NetHub
+    var sim_ck = VirtualNetSim(seed=0xC00C1E, one_way_latency_ms=10.0, jitter_ms=0.0, loss_rate=0.0)
+    var srv_hub = NetHub[VirtualEndpoint](sim_ck.create_ipv4_peer(0, 9940), True)
+    var cli_hub = NetHub[VirtualEndpoint](sim_ck.create_ipv4_peer(1, 9940), False)
+    var cookie_secret = AeadKey.from_u64x4(0x1111, 0x2222, 0x3333, 0x4444)
+    srv_hub.enable_cookie_handshake(cookie_secret, bucket_ms=10000.0)
+    srv_hub.enable_channel_encryption(key)
+    cli_hub.enable_channel_encryption(key)
+
+    assert_true(cli_hub.send_handshake_init(srv_hub.local_endpoint()))
+    var accepted_after_cookie = False
+    for _ in range(20):
+        var now = sim_ck.now_ms()
+        srv_hub.poll(now)
+        if len(srv_hub.accepted) > 0:
+            accepted_after_cookie = True
+        cli_hub.poll(now)
+        sim_ck.advance_ms(10.0)
+        if accepted_after_cookie:
+            break
+    assert_true(accepted_after_cookie, "client must be accepted after stateless cookie echo")
+    assert_true(srv_hub.cookies_sent >= 1)
+    assert_equal(srv_hub.open_count(), 1)
+    var c_cid = cli_hub.connect(srv_hub.local_endpoint())
+    assert_true(cli_hub.send_reliable(c_cid, _hub_msg(88, 128)))
+    var got_hub_enc = False
+    for _ in range(30):
+        var now = sim_ck.now_ms()
+        cli_hub.poll(now)
+        srv_hub.poll(now)
+        var m = srv_hub.pop_reliable(0)
+        if m[0]:
+            assert_equal(hash_list(m[1]), hash_list(_hub_msg(88, 128)))
+            got_hub_enc = True
+            break
+        sim_ck.advance_ms(10.0)
+    assert_true(got_hub_enc, "encrypted message over cookie-authenticated NetHub must deliver")
+
+    # 4. CHAN_RELIABLE_UNORDERED bypasses HoL blocking behind missing ordered rel_seq
+    var sim_u = VirtualNetSim(seed=0x554E4F, one_way_latency_ms=10.0, jitter_ms=0.0, loss_rate=0.0)
+    var u0 = sim_u.create_ipv4_peer(0, 9950)
+    var u1 = sim_u.create_ipv4_peer(1, 9950)
+    var chu0 = NetChannel(u1.local_endpoint(), IPV6_SAFE_MTU_BYTES)
+    var chu1 = NetChannel(u0.local_endpoint(), IPV6_SAFE_MTU_BYTES)
+    assert_true(chu0.send_reliable(_hub_msg(1, 32)))  # rel_seq = 0 (will be dropped!)
+    assert_true(chu0.send_reliable_unordered(_hub_msg(2, 48)))  # rel_seq = 1 (unordered!)
+    sim_u.drop_next_outbound_packets(0, 1)  # drop rel_seq = 0 only
+    chu0.poll(u0, sim_u.now_ms())
+    sim_u.advance_ms(20.0)
+    chu1.poll(u1, sim_u.now_ms())
+    assert_true(sim_u.now_ms() >= 0.0)  # keep sim_u alive across chu1.poll
+    # Ordered queue is still blocked waiting for rel_seq = 0, but unordered msg delivered immediately!
+    assert_false(chu1.pop_reliable_message()[0])
+    var u_pop = chu1.pop_reliable_unordered_message()
+    assert_true(u_pop[0], "CHAN_RELIABLE_UNORDERED must deliver without HoL blocking")
+    assert_equal(hash_list(u_pop[1]), hash_list(_hub_msg(2, 48)))
+
+    # 5. Exponential RTO backoff & AIMD cwnd halving under 100% loss
+    var sim_rto = VirtualNetSim(seed=0x270, one_way_latency_ms=10.0, jitter_ms=0.0, loss_rate=1.0)
+    var r0 = sim_rto.create_ipv4_peer(0, 9960)
+    var r1 = sim_rto.create_ipv4_peer(1, 9960)
+    var chr0 = NetChannel(r1.local_endpoint(), IPV6_SAFE_MTU_BYTES)
+    chr0.rto_ms = 100.0
+    var init_cwnd = chr0.cwnd
+    assert_true(chr0.send_reliable(_hub_msg(9, 64)))
+    chr0.poll(r0, 0.0)  # initial transmit (send_count = 1)
+    assert_equal(chr0.retransmissions, 0)
+    chr0.poll(r0, 100.0)  # 1st retx after 1*rto = 100ms (send_count = 2, cwnd halves!)
+    assert_equal(chr0.retransmissions, 1)
+    assert_true(chr0.cwnd < init_cwnd, "AIMD must halve cwnd on RTO loss")
+    chr0.poll(r0, 200.0)  # +100ms later: MUST NOT retx yet (backoff requires 2*rto = 200ms!)
+    assert_equal(chr0.retransmissions, 1)
+    chr0.poll(r0, 305.0)  # +205ms after 1st retx: 2nd retx fires!
+    assert_equal(chr0.retransmissions, 2)
+    assert_true(sim_rto.now_ms() >= 0.0)  # keep sim_rto alive across r0 polls
+
+    # 6. Entity despawn (`destroy_entity`) + out-of-AOI removal + SnapshotInterpolationBuffer
+    var rep = SnapshotReplicator(
+        max_entities=16,
+        max_clients=1,
+        max_packet_bytes=1000,
+        interest_radius=50.0,
+        world_bounds=256.0,
+    )
+    var cli = SnapshotClientReceiver(16, 256.0)
+    rep.set_client_view(0, Vec3(0.0, 0.0, 0.0), 50.0)
+    rep.set_entity(0, Vec3(5.0, 0.0, 0.0), Quat.identity(), Vec3(), UInt32(1))
+    rep.set_entity(1, Vec3(10.0, 0.0, 0.0), Quat.identity(), Vec3(), UInt32(2))
+    rep.set_entity(2, Vec3(15.0, 0.0, 0.0), Quat.identity(), Vec3(), UInt32(3))
+    rep.prepare_tick()
+    var p0 = rep.build_client_packet(0)
+    var res0 = cli.apply_packet(p0[1])
+    assert_true(res0[0])
+    rep.notify_client_ack(0, res0[1])
+    assert_true(cli.entities[0].active and cli.entities[1].active and cli.entities[2].active)
+
+    # Despawn entity 1 and move entity 2 outside client's 50m AOI radius
+    rep.destroy_entity(1)
+    rep.set_entity(2, Vec3(120.0, 0.0, 0.0), Quat.identity(), Vec3(), UInt32(3))
+    rep.prepare_tick()
+    var p1 = rep.build_client_packet(0)
+    var res1 = cli.apply_packet(p1[1])
+    assert_true(res1[0])
+    assert_true(cli.entities[0].active, "in-AOI active entity must remain active")
+    assert_false(cli.entities[1].active, "despawned entity must be cleaned up on client")
+    assert_false(cli.entities[2].active, "out-of-AOI entity must be cleaned up on client")
+
+    # SnapshotInterpolationBuffer linear pos + quaternion slerp interpolation
+    var interp = SnapshotInterpolationBuffer(max_entities=4, interp_delay_ms=100.0)
+    var snap_a = List[ReplicatedEntity]()
+    var snap_b = List[ReplicatedEntity]()
+    for i in range(4):
+        snap_a.append(ReplicatedEntity(i))
+        snap_b.append(ReplicatedEntity(i))
+    snap_a[0].active = True
+    snap_a[0].pos = Vec3(0.0, 0.0, 0.0)
+    snap_a[0].rot = Quat.from_euler(0.0, 0.0, 0.0)
+    snap_b[0].active = True
+    snap_b[0].pos = Vec3(10.0, 4.0, -6.0)
+    snap_b[0].rot = Quat.from_euler(0.0, Float32(1.5707963), 0.0)
+    interp.push_snapshot(100.0, snap_a)
+    interp.push_snapshot(200.0, snap_b)
+    var sampled = List[ReplicatedEntity]()
+    assert_true(interp.sample(250.0, sampled))  # target_t = 250 - 100 = 150 => alpha = 0.5
+    assert_true(sampled[0].active)
+    assert_true(abs(sampled[0].pos.x - Float32(5.0)) < Float32(0.01))
+    assert_true(abs(sampled[0].pos.y - Float32(2.0)) < Float32(0.01))
+    assert_true(abs(sampled[0].pos.z - Float32(-3.0)) < Float32(0.01))
+    var expected_mid_rot = Quat.from_euler(0.0, Float32(0.78539816), 0.0)
+    assert_true(quat_angular_error_deg(sampled[0].rot, expected_mid_rot) < Float32(0.2))
+
+
 def main() raises:
     var t_start = monotonic()
     set_sim_float_mode()
@@ -1226,6 +1470,7 @@ def main() raises:
     test_g_physics_world_rollback_and_spoof_auth()
     test_h_net_hub_routing_accept_drop()
     test_i_security_dos_and_wraparound_regressions()
+    test_j_wave2_aead_cookie_channels_despawn_interp()
     var total_ms = Float64(monotonic() - t_start) / 1.0e6
     print("============================================================")
     print(" [PASS] ALL FLINT V5 NET & ROLLBACK TESTS PASSED (" + String(Int(total_ms)) + " ms)")
