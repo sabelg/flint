@@ -141,6 +141,143 @@ def load_wav(path: String) -> WavClip:
     return decode_wav(read_bytes(path))
 
 
+# ==============================================================================
+# Direct Linux ALSA Kernel PCM Helpers (`/dev/snd/pcmC*D*p`, zero libasound)
+# ==============================================================================
+
+comptime SNDRV_PCM_IOCTL_HW_REFINE: UInt64 = 0xC2604110
+comptime SNDRV_PCM_IOCTL_HW_PARAMS: UInt64 = 0xC2604111
+comptime SNDRV_PCM_IOCTL_SW_PARAMS: UInt64 = 0xC0884113
+comptime SNDRV_PCM_IOCTL_PREPARE: UInt64 = 0x4140
+comptime SNDRV_PCM_IOCTL_DROP: UInt64 = 0x4143
+comptime SNDRV_PCM_IOCTL_WRITEI_FRAMES: UInt64 = 0x40184150
+
+
+def _alsa_configure_fd(fd: Int, rate: Int, preferred_period: Int, mut out_period: Int, mut out_buffer: Int) -> Bool:
+    """Configures an open ALSA playback fd for stereo S16_LE RW_INTERLEAVED at `rate` Hz."""
+    var params = List[UInt8](length=608, fill=0)
+    for mask in range(3):
+        for word in range(8):
+            audio_put32(params, 4 + mask * 32 + word * 4, Int(0xFFFFFFFF))
+    for interval in range(12):
+        var at = 260 + interval * 12
+        audio_put32(params, at, 0)
+        audio_put32(params, at + 4, Int(0xFFFFFFFF))
+    # RW interleaved (1 << 3), S16_LE (1 << 2), standard subformat (1)
+    for mask in range(3):
+        for word in range(8):
+            audio_put32(params, 4 + mask * 32 + word * 4, 0)
+    audio_put32(params, 4, 1 << 3)
+    audio_put32(params, 4 + 32, 1 << 2)
+    audio_put32(params, 4 + 64, 1)
+
+    var p_min = max(64, preferred_period)
+    var p_max = max(p_min, 1024)
+    var b_min = p_min * 4
+    var b_max = p_max * 4
+    # Parameter 10: channels = 2
+    var at_ch = 260 + (10 - 8) * 12
+    audio_put32(params, at_ch, 2)
+    audio_put32(params, at_ch + 4, 2)
+    audio_put32(params, at_ch + 8, 4)
+    # Parameter 11: sample rate = rate
+    var at_sr = 260 + (11 - 8) * 12
+    audio_put32(params, at_sr, rate)
+    audio_put32(params, at_sr + 4, rate)
+    audio_put32(params, at_sr + 8, 4)
+    # Parameter 13: period_size in [p_min, p_max]
+    var at_ps = 260 + (13 - 8) * 12
+    audio_put32(params, at_ps, p_min)
+    audio_put32(params, at_ps + 4, p_max)
+    audio_put32(params, at_ps + 8, 4)
+    # Parameter 17: buffer_size in [b_min, b_max]
+    var at_bs = 260 + (17 - 8) * 12
+    audio_put32(params, at_bs, b_min)
+    audio_put32(params, at_bs + 4, b_max)
+    audio_put32(params, at_bs + 8, 4)
+
+    audio_put32(params, 512, 0x000FFFFF)
+    if external_call["ioctl", Int32](Int32(fd), SNDRV_PCM_IOCTL_HW_REFINE, params.unsafe_ptr()) != 0:
+        return False
+    if external_call["ioctl", Int32](Int32(fd), SNDRV_PCM_IOCTL_HW_PARAMS, params.unsafe_ptr()) != 0:
+        return False
+    var pf = wav_u32(params, at_ps)
+    var bf = wav_u32(params, at_bs)
+    if pf < 64 or pf > 32768 or bf < pf:
+        return False
+
+    var software = List[UInt8](length=136, fill=0)
+    audio_put32(software, 4, 1)  # period_step
+    audio_put64(software, 16, UInt64(pf))  # avail_min
+    audio_put64(software, 24, 1)  # xfer_align
+    audio_put64(software, 32, UInt64(pf))  # start_threshold
+    audio_put64(software, 40, UInt64(bf))  # stop_threshold
+    audio_put64(software, 64, UInt64(0x4000000000000000))  # boundary
+    if external_call["ioctl", Int32](Int32(fd), SNDRV_PCM_IOCTL_SW_PARAMS, software.unsafe_ptr()) != 0:
+        return False
+    if external_call["ioctl", Int32](Int32(fd), SNDRV_PCM_IOCTL_PREPARE, params.unsafe_ptr()) != 0:
+        return False
+    out_period = pf
+    out_buffer = bf
+    return True
+
+
+def alsa_open_pcm(rate: Int, preferred_period: Int, mut out_period: Int, mut out_buffer: Int) -> Int:
+    """Opens and configures the first available Linux ALSA playback node (`/dev/snd/pcmC*D*p`),
+    or returns `-1` when no hardware PCM device is available."""
+    var requested = env_value("FLINT_AUDIO_DEVICE")
+    if requested.byte_length() == 0:
+        requested = env_value("SD_AUDIO_DEVICE")
+    if requested.byte_length() > 0:
+        var owned = requested
+        var fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 2048 | 0x80000), Int32(0)))
+        if fd >= 0:
+            if _alsa_configure_fd(fd, rate, preferred_period, out_period, out_buffer):
+                return fd
+            close_fd(fd)
+        return -1
+
+    for card in range(4):
+        for dev in range(4):
+            var path = "/dev/snd/pcmC" + String(card) + "D" + String(dev) + "p"
+            var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(1 | 2048 | 0x80000), Int32(0)))
+            if fd < 0:
+                continue
+            if _alsa_configure_fd(fd, rate, preferred_period, out_period, out_buffer):
+                return fd
+            close_fd(fd)
+    return -1
+
+
+def alsa_write_interleaved(fd: Int, pcm_ptr: Int, frames: Int, mut xruns: Int) -> Int:
+    """Non-blocking `SNDRV_PCM_IOCTL_WRITEI_FRAMES` write.
+    Returns frames written (>0), 0 on EAGAIN/EPIPE-recovered, or -1 on fatal error."""
+    if fd < 0 or frames <= 0:
+        return -1
+    var transfer = Array[UInt64, 3](fill=0)
+    transfer[1] = UInt64(pcm_ptr)
+    transfer[2] = UInt64(frames)
+    var rc = external_call["ioctl", Int32](Int32(fd), SNDRV_PCM_IOCTL_WRITEI_FRAMES, Pointer(to=transfer))
+    var written = Int(transfer[0])
+    if rc == 0 and written > 0:
+        return min(frames, written)
+    var err = Int(external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()[unsafe_offset=0])
+    if err == 11 or err == 4:  # EAGAIN / EINTR
+        return 0
+    if err == 32:  # EPIPE underrun -> prepare and retry
+        xruns += 1
+        _ = external_call["ioctl", Int32](Int32(fd), SNDRV_PCM_IOCTL_PREPARE, Pointer(to=transfer))
+        return 0
+    return -1
+
+
+def alsa_close_pcm(fd: Int):
+    if fd >= 0:
+        var dummy = UInt8(0)
+        _ = external_call["ioctl", Int32](Int32(fd), SNDRV_PCM_IOCTL_DROP, Pointer(to=dummy))
+        close_fd(fd)
+
+
 def clip_sample(clip: WavClip, position: Float64, channel: Int, looping: Bool = False) -> Float32:
     var frames = clip.frame_count()
     if not clip.valid or frames == 0:
@@ -541,7 +678,9 @@ struct NativeAudio:
 
     def initialize(mut self) -> Bool:
         self.load_assets()
-        var requested = env_value("SD_AUDIO_DEVICE")
+        var requested = env_value("FLINT_AUDIO_DEVICE")
+        if requested.byte_length() == 0:
+            requested = env_value("SD_AUDIO_DEVICE")
         if requested.byte_length() > 0:
             return self.open_device(requested)
         # The desktop's sound server comes first: it shares the output with other

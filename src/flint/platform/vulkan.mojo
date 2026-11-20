@@ -16,6 +16,8 @@ slot, so one family of call helpers taking Int fits all of them.
 """
 from std.collections import Dict
 from std.ffi import external_call
+from std.sys.info import size_of
+from flint.core.offset_allocator import OffsetAllocator, OffsetAllocation, OA_UNUSED
 from flint.platform.dynlib import dl_open, dl_sym, dl_close
 from flint.platform.amdgpu import GpuBuffer
 from flint.platform.os import env_flag, env_value, read_bytes, write_bytes
@@ -34,6 +36,10 @@ comptime Lookup = def(Int, Int) thin abi("C") -> Int
 comptime DebugCallback = def(UInt32, UInt32, Int, Int) thin abi("C") -> UInt32
 
 comptime ARENA_BYTES: Int = 512 * 1024
+comptime VK_SUBALLOC_UNIT_BYTES: Int = 4096
+comptime VK_SUBALLOC_BLOCK_BYTES: Int = 64 * 1024 * 1024
+comptime VK_SUBALLOC_FALLBACK_BLOCK_BYTES: Int = 16 * 1024 * 1024
+comptime VK_SUBALLOC_DEDICATED_THRESHOLD: Int = 32 * 1024 * 1024
 comptime API_VERSION_1_2: UInt32 = (1 << 22) | (2 << 12)
 comptime API_VERSION_1_3: UInt32 = (1 << 22) | (3 << 12)
 comptime SUCCESS: Int32 = 0
@@ -306,10 +312,45 @@ def put_float(address: Int, value: Float32):
     Pointer[Float32, origin=MutAnyOrigin](unsafe_from_address=address)[unsafe_offset=0] = value
 
 
+struct VulkanMemBlock(Movable):
+    """64 MiB `VkDeviceMemory` slab sub-allocated via `OffsetAllocator` (4 KiB units)."""
+    var memory: Int
+    var memory_type_index: Int
+    var size_bytes: Int
+    var mapped_ptr: Int
+    var bda: Bool
+    var allocator: OffsetAllocator
+    var live_allocs: Int
+
+    def __init__(
+        out self,
+        memory: Int,
+        memory_type_index: Int,
+        size_bytes: Int,
+        mapped_ptr: Int,
+        bda: Bool,
+    ):
+        self.memory = memory
+        self.memory_type_index = memory_type_index
+        self.size_bytes = size_bytes
+        self.mapped_ptr = mapped_ptr
+        self.bda = bda
+        self.allocator = OffsetAllocator(UInt32(size_bytes // VK_SUBALLOC_UNIT_BYTES), 8192)
+        self.live_allocs = 0
+
+
+@always_inline
+def _vk_block_ptr(addr: Int) -> Pointer[VulkanMemBlock, MutAnyOrigin]:
+    return Pointer[VulkanMemBlock, MutAnyOrigin](unsafe_from_address=addr)
+
+
 struct VulkanImage(Copyable, Movable):
     var image: Int
     var view: Int
     var memory: Int
+    var memory_offset: Int
+    var suballoc_block: Int
+    var suballoc_meta: UInt32
     var format: UInt32
     var width: Int
     var height: Int
@@ -321,6 +362,9 @@ struct VulkanImage(Copyable, Movable):
         self.image = 0
         self.view = 0
         self.memory = 0
+        self.memory_offset = 0
+        self.suballoc_block = -1
+        self.suballoc_meta = OA_UNUSED
         self.format = 0
         self.width = 0
         self.height = 0
@@ -606,11 +650,13 @@ struct VulkanGpu(Copyable, Movable):
     var device_call_cache: Dict[String, Int]
     var device_call_cache_device: Int
     var overflow_slabs: List[Int]
+    var mem_blocks: List[Int]
 
     def __init__(out self):
         self.device_call_cache = Dict[String, Int]()
         self.device_call_cache_device = 0
         self.overflow_slabs = List[Int]()
+        self.mem_blocks = List[Int]()
         self.library = 0
         self.instance = 0
         self.physical = 0
@@ -903,7 +949,7 @@ struct VulkanGpu(Copyable, Movable):
             extensions.append("VK_EXT_acquire_drm_display")
             self.has_display_surface = True
         var layers = List[String]()
-        var checked = validate or env_flag("SD_VULKAN_VALIDATION")
+        var checked = validate or env_flag("FLINT_VULKAN_VALIDATION") or env_flag("SD_VULKAN_VALIDATION")
         if checked:
             if not self.layer_available(VALIDATION_LAYER):
                 return self.fail("the validation layers are not installed: sudo apt install vulkan-validationlayers")
@@ -1349,6 +1395,129 @@ struct VulkanGpu(Copyable, Movable):
             return 0
         return get64(slot)
 
+    def suballoc_block_count(self) -> Int:
+        return len(self.mem_blocks)
+
+    def suballoc_live_count(self) -> Int:
+        var total = 0
+        for addr in self.mem_blocks:
+            if addr != 0:
+                total += _vk_block_ptr(addr)[unsafe_offset=0].live_allocs
+        return total
+
+    def _is_memory_type_host_visible(self, type_index: Int) -> Bool:
+        if type_index < 0 or self.memory_properties == 0:
+            return False
+        var flags = get32(self.memory_properties + 4 + type_index * 8)
+        return (flags & MEMORY_HOST_VISIBLE) != 0
+
+    def _suballoc_memory(
+        mut self,
+        size: Int,
+        alignment: Int,
+        type_index: Int,
+        map_host: Bool,
+        bda: Bool,
+        next_struct: Int,
+    ) -> Tuple[Int, Int, Int, Int, UInt32]:
+        """Sub-allocates from 64 MiB per-(memoryTypeIndex, bda) `OffsetAllocator` slabs,
+        falling back to dedicated `vkAllocateMemory` for >32 MiB or special-flag allocations.
+        Returns `(vk_memory, byte_offset, cpu_mapped_addr, block_idx, oa_meta)`."""
+        var can_suballoc = (
+            size <= VK_SUBALLOC_DEDICATED_THRESHOLD
+            and alignment <= VK_SUBALLOC_UNIT_BYTES
+            and (next_struct == 0 or bda)
+        )
+        if can_suballoc:
+            var units = UInt32(max(1, (size + VK_SUBALLOC_UNIT_BYTES - 1) // VK_SUBALLOC_UNIT_BYTES))
+            for bi in range(len(self.mem_blocks)):
+                var addr = self.mem_blocks[bi]
+                if addr == 0:
+                    continue
+                ref blk = _vk_block_ptr(addr)[unsafe_offset=0]
+                if blk.memory_type_index != type_index or blk.bda != bda:
+                    continue
+                if map_host and blk.mapped_ptr == 0:
+                    continue
+                var alloc = blk.allocator.allocate(units)
+                if alloc.ok():
+                    blk.live_allocs += 1
+                    var byte_off = Int(alloc.offset) * VK_SUBALLOC_UNIT_BYTES
+                    var cpu_ptr = (blk.mapped_ptr + byte_off) if (map_host and blk.mapped_ptr != 0) else 0
+                    return (blk.memory, byte_off, cpu_ptr, bi, alloc.metadata)
+
+            # Allocate a new 64 MiB (or 16 MiB fallback) slab for this memoryTypeIndex
+            var blk_next = 0
+            if bda:
+                blk_next = self.scratch(24)
+                put32(blk_next, TYPE_MEMORY_ALLOCATE_FLAGS_INFO)
+                put32(blk_next + 16, MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+            var blk_size = VK_SUBALLOC_BLOCK_BYTES
+            var blk_mem = self.allocation(blk_size, type_index, blk_next)
+            if blk_mem == 0 and size <= VK_SUBALLOC_FALLBACK_BLOCK_BYTES:
+                blk_size = VK_SUBALLOC_FALLBACK_BLOCK_BYTES
+                blk_mem = self.allocation(blk_size, type_index, blk_next)
+            if blk_mem != 0:
+                var mapped = 0
+                if map_host or self._is_memory_type_host_visible(type_index):
+                    var map_slot = self.scratch(8)
+                    if call6(self.fn_map_memory, self.device, blk_mem, 0, WHOLE_SIZE, 0, map_slot) == SUCCESS:
+                        mapped = get64(map_slot)
+                    elif map_host:
+                        _ = call3(self.fn_free_memory, self.device, blk_mem, 0)
+                        blk_mem = 0
+                if blk_mem != 0:
+                    var raw = external_call["calloc", Int](Int(1), max(64, size_of[VulkanMemBlock]()))
+                    var p = _vk_block_ptr(raw)
+                    __get_address_as_uninit_lvalue(p._mlir_value) = VulkanMemBlock(
+                        blk_mem, type_index, blk_size, mapped, bda
+                    )
+                    var bi = len(self.mem_blocks)
+                    self.mem_blocks.append(raw)
+                    ref blk = _vk_block_ptr(raw)[unsafe_offset=0]
+                    var alloc = blk.allocator.allocate(units)
+                    if alloc.ok():
+                        blk.live_allocs += 1
+                        var byte_off = Int(alloc.offset) * VK_SUBALLOC_UNIT_BYTES
+                        var cpu_ptr = (blk.mapped_ptr + byte_off) if (map_host and blk.mapped_ptr != 0) else 0
+                        return (blk.memory, byte_off, cpu_ptr, bi, alloc.metadata)
+
+        # Dedicated fallback (>32 MiB, external/export, large alignment, or slab OOM)
+        var ded_mem = self.allocation(size, type_index, next_struct)
+        if ded_mem == 0:
+            return (0, 0, 0, -1, OA_UNUSED)
+        var ded_cpu = 0
+        if map_host:
+            var map_slot = self.scratch(8)
+            if call6(self.fn_map_memory, self.device, ded_mem, 0, WHOLE_SIZE, 0, map_slot) != SUCCESS:
+                _ = call3(self.fn_free_memory, self.device, ded_mem, 0)
+                return (0, 0, 0, -1, OA_UNUSED)
+            ded_cpu = get64(map_slot)
+        return (ded_mem, 0, ded_cpu, -1, OA_UNUSED)
+
+    def _subfree_memory(mut self, vk_memory: Int, block_idx: Int, byte_offset: Int, oa_meta: UInt32):
+        if block_idx >= 0 and block_idx < len(self.mem_blocks):
+            var addr = self.mem_blocks[block_idx]
+            if addr != 0:
+                ref blk = _vk_block_ptr(addr)[unsafe_offset=0]
+                blk.allocator.free(OffsetAllocation(UInt32(byte_offset // VK_SUBALLOC_UNIT_BYTES), oa_meta))
+                if blk.live_allocs > 0:
+                    blk.live_allocs -= 1
+            return
+        if vk_memory != 0 and self.device != 0:
+            _ = call3(self.fn_free_memory, self.device, vk_memory, 0)
+
+    def _destroy_mem_blocks(mut self):
+        for addr in self.mem_blocks:
+            if addr != 0:
+                var p = _vk_block_ptr(addr)
+                var blk = __get_address_as_owned_value(p._mlir_value)
+                if blk.memory != 0 and self.device != 0:
+                    _ = call3(self.fn_free_memory, self.device, blk.memory, 0)
+                _ = blk^
+                external_call["free", NoneType](addr)
+        self.mem_blocks.clear()
+
     def create_buffer(mut self, size: Int, local: Bool, shared: Bool = False, cpu_reads: Bool = False) -> GpuBuffer:
         """A mapped storage buffer. Local memory is the GPU's own, reachable by the CPU
         through a resizable BAR; where that is too small, or `local` is False, it is
@@ -1378,14 +1547,24 @@ struct VulkanGpu(Copyable, Movable):
         var requirements = self.scratch(24)
         _ = call3(self.fn_get_buffer_requirements, self.device, buffer, requirements)
         var needed = get64(requirements)
+        var align = get64(requirements + 8)
         var allowed = get32(requirements + 16)
         var host = MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT
         var extras = ~(MEMORY_DEVICE_LOCAL | MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT | MEMORY_HOST_CACHED)
         var memory = 0
+        var mem_offset = 0
+        var cpu_addr = 0
+        var blk_idx = -1
+        var oa_meta = OA_UNUSED
         if local:
             var bar = self.memory_type(allowed, host | MEMORY_DEVICE_LOCAL, extras)
             if bar >= 0:
-                memory = self.allocation(needed, bar, export)
+                var res = self._suballoc_memory(needed, align, bar, True, False, export)
+                memory = res[0]
+                mem_offset = res[1]
+                cpu_addr = res[2]
+                blk_idx = res[3]
+                oa_meta = res[4]
         if memory == 0:
             # Write-combined where the CPU only writes, which is the faster way to do that.
             var system = -1
@@ -1396,19 +1575,27 @@ struct VulkanGpu(Copyable, Movable):
             if system < 0:
                 system = self.memory_type(allowed, host, extras)
             if system >= 0:
-                memory = self.allocation(needed, system, export)
+                var res = self._suballoc_memory(needed, align, system, True, False, export)
+                memory = res[0]
+                mem_offset = res[1]
+                cpu_addr = res[2]
+                blk_idx = res[3]
+                oa_meta = res[4]
         if memory == 0:
             _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
             _ = self.fail("no memory for a buffer of " + String(rounded) + " bytes")
             return GpuBuffer()
-        if call4(self.fn_bind_buffer_memory, self.device, buffer, memory, 0) != SUCCESS or call6(self.fn_map_memory, self.device, memory, 0, WHOLE_SIZE, 0, slot) != SUCCESS:
+        if call4(self.fn_bind_buffer_memory, self.device, buffer, memory, mem_offset) != SUCCESS:
             _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
-            _ = call3(self.fn_free_memory, self.device, memory, 0)
-            _ = self.fail("buffer binding or mapping failed")
+            self._subfree_memory(memory, blk_idx, mem_offset, oa_meta)
+            _ = self.fail("buffer binding failed")
             return GpuBuffer()
-        var mapped = GpuBuffer(0, rounded, 0, get64(slot))
+        var mapped = GpuBuffer(0, rounded, 0, cpu_addr)
         mapped.vk_buffer = buffer
         mapped.vk_memory = memory
+        mapped.vk_memory_offset = mem_offset
+        mapped.vk_suballoc_block = blk_idx
+        mapped.vk_suballoc_meta = oa_meta
         return mapped^
 
     def destroy_buffer(mut self, buffer: GpuBuffer):
@@ -1416,7 +1603,7 @@ struct VulkanGpu(Copyable, Movable):
         if buffer.size == 0:
             return
         _ = call3(self.fn_destroy_buffer, self.device, buffer.vk_buffer, 0)
-        _ = call3(self.fn_free_memory, self.device, buffer.vk_memory, 0)
+        self._subfree_memory(buffer.vk_memory, buffer.vk_suballoc_block, buffer.vk_memory_offset, buffer.vk_suballoc_meta)
 
     def export_buffer(mut self, buffer: GpuBuffer) -> Int:
         """Share a buffer as a dmabuf file descriptor. Returns -1 on failure."""
@@ -2284,6 +2471,7 @@ struct VulkanGpu(Copyable, Movable):
                 _ = call3(self.device_call("vkDestroyCommandPool"), self.device, self.command_pool, 0)
             if self.timeline != 0:
                 _ = call3(self.device_call("vkDestroySemaphore"), self.device, self.timeline, 0)
+            self._destroy_mem_blocks()
             _ = call2(self.device_call("vkDestroyDevice"), self.device, 0)
             self.device = 0
             self.device_call_cache.clear()
@@ -2327,6 +2515,7 @@ struct VulkanGpu(Copyable, Movable):
         var requirements = self.scratch(24)
         _ = call3(self.fn_get_buffer_requirements, self.device, buffer, requirements)
         var needed = get64(requirements)
+        var align = get64(requirements + 8)
         var allowed = get32(requirements + 16)
 
         var alloc_flags = 0
@@ -2336,13 +2525,22 @@ struct VulkanGpu(Copyable, Movable):
             put32(alloc_flags + 16, MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
 
         var memory = 0
+        var mem_offset = 0
+        var cpu_addr = 0
+        var blk_idx = -1
+        var oa_meta = OA_UNUSED
         var extras = ~(MEMORY_DEVICE_LOCAL | MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT | MEMORY_HOST_CACHED)
         if not host_visible:
             var dev_only = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, extras & ~MEMORY_HOST_VISIBLE & ~MEMORY_HOST_COHERENT)
             if dev_only < 0:
                 dev_only = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, 0)
             if dev_only >= 0:
-                memory = self.allocation(needed, dev_only, alloc_flags)
+                var res = self._suballoc_memory(needed, align, dev_only, False, use_bda, alloc_flags)
+                memory = res[0]
+                mem_offset = res[1]
+                cpu_addr = res[2]
+                blk_idx = res[3]
+                oa_meta = res[4]
         if memory == 0:
             var host = MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT
             var mt = self.memory_type(allowed, host | (MEMORY_HOST_CACHED if cpu_reads else MEMORY_DEVICE_LOCAL), extras)
@@ -2351,22 +2549,26 @@ struct VulkanGpu(Copyable, Movable):
             if mt < 0:
                 mt = self.memory_type(allowed, host, 0)
             if mt >= 0:
-                memory = self.allocation(needed, mt, alloc_flags)
+                var res = self._suballoc_memory(needed, align, mt, host_visible, use_bda, alloc_flags)
+                memory = res[0]
+                mem_offset = res[1]
+                cpu_addr = res[2]
+                blk_idx = res[3]
+                oa_meta = res[4]
         if memory == 0:
             _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
             _ = self.fail("no memory for BDA buffer")
             return GpuBuffer()
-        if call4(self.fn_bind_buffer_memory, self.device, buffer, memory, 0) != SUCCESS:
+        if call4(self.fn_bind_buffer_memory, self.device, buffer, memory, mem_offset) != SUCCESS:
             _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
-            _ = call3(self.fn_free_memory, self.device, memory, 0)
+            self._subfree_memory(memory, blk_idx, mem_offset, oa_meta)
             return GpuBuffer()
-        var cpu_addr = 0
-        if host_visible:
-            if call6(self.fn_map_memory, self.device, memory, 0, WHOLE_SIZE, 0, slot) == SUCCESS:
-                cpu_addr = get64(slot)
         var out = GpuBuffer(0, rounded, 0, cpu_addr)
         out.vk_buffer = buffer
         out.vk_memory = memory
+        out.vk_memory_offset = mem_offset
+        out.vk_suballoc_block = blk_idx
+        out.vk_suballoc_meta = oa_meta
         return out^
 
     def buffer_device_address(mut self, buffer: GpuBuffer) -> UInt64:
@@ -2419,6 +2621,7 @@ struct VulkanGpu(Copyable, Movable):
         var req = self.scratch(24)
         _ = call3(self.device_call("vkGetImageMemoryRequirements"), self.device, img, req)
         var needed = get64(req)
+        var align = get64(req + 8)
         var allowed = get32(req + 16)
         var mt = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, 0)
         if mt < 0:
@@ -2427,11 +2630,15 @@ struct VulkanGpu(Copyable, Movable):
             _ = call3(self.device_call("vkDestroyImage"), self.device, img, 0)
             _ = self.fail("no memory type for VkImage")
             return out^
-        var mem = self.allocation(needed, mt, 0)
-        if mem == 0 or call4(self.device_call("vkBindImageMemory"), self.device, img, mem, 0) != SUCCESS:
+        var mem_res = self._suballoc_memory(needed, align, mt, False, False, 0)
+        var mem = mem_res[0]
+        var mem_off = mem_res[1]
+        var blk_idx = mem_res[3]
+        var oa_meta = mem_res[4]
+        if mem == 0 or call4(self.device_call("vkBindImageMemory"), self.device, img, mem, mem_off) != SUCCESS:
             _ = call3(self.device_call("vkDestroyImage"), self.device, img, 0)
             if mem != 0:
-                _ = call3(self.fn_free_memory, self.device, mem, 0)
+                self._subfree_memory(mem, blk_idx, mem_off, oa_meta)
             _ = self.fail("VkImage allocation/bind failed")
             return out^
         var aspect = ASPECT_DEPTH if format == FORMAT_D32_SFLOAT else ASPECT_COLOR
@@ -2447,11 +2654,14 @@ struct VulkanGpu(Copyable, Movable):
         put32(view_info + 72, UInt32(layers))
         if not self.check(call4(self.device_call("vkCreateImageView"), self.device, view_info, 0, slot), "vkCreateImageView"):
             _ = call3(self.device_call("vkDestroyImage"), self.device, img, 0)
-            _ = call3(self.fn_free_memory, self.device, mem, 0)
+            self._subfree_memory(mem, blk_idx, mem_off, oa_meta)
             return out^
         out.image = img
         out.view = get64(slot)
         out.memory = mem
+        out.memory_offset = mem_off
+        out.suballoc_block = blk_idx
+        out.suballoc_meta = oa_meta
         out.format = format
         out.width = width
         out.height = height
@@ -2470,8 +2680,11 @@ struct VulkanGpu(Copyable, Movable):
             _ = call3(self.device_call("vkDestroyImage"), self.device, img.image, 0)
             img.image = 0
         if img.memory != 0:
-            _ = call3(self.fn_free_memory, self.device, img.memory, 0)
+            self._subfree_memory(img.memory, img.suballoc_block, img.memory_offset, img.suballoc_meta)
             img.memory = 0
+            img.memory_offset = 0
+            img.suballoc_block = -1
+            img.suballoc_meta = OA_UNUSED
 
     def create_sampler(
         mut self,
