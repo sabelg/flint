@@ -10,6 +10,7 @@ Implements:
 """
 from std.collections import List
 from std.ffi import external_call
+from std.hash import Hasher
 from flint.platform.os import EINTR, close_fd, last_errno
 
 comptime UDP_RING_CAPACITY: Int = 64
@@ -70,7 +71,7 @@ def _store_u64_le(base: Int, off: Int, val: UInt64):
 
 
 @fieldwise_init
-struct NetEndpoint(Copyable, ImplicitlyCopyable, Movable, Equatable):
+struct NetEndpoint(Copyable, ImplicitlyCopyable, Movable, Equatable, Hashable):
     """Dual-stack 128-bit IPv6 / IPv4-mapped (`::ffff:a.b.c.d`) network endpoint."""
     var addr_hi: UInt64
     var addr_lo: UInt64
@@ -82,6 +83,12 @@ struct NetEndpoint(Copyable, ImplicitlyCopyable, Movable, Equatable):
         self.addr_lo = 0
         self.port = 0
         self.scope_id = 0
+
+    def __hash__[H: Hasher](self, mut hasher: H):
+        self.addr_hi.__hash__(hasher)
+        self.addr_lo.__hash__(hasher)
+        self.port.__hash__(hasher)
+        self.scope_id.__hash__(hasher)
 
     def __eq__(self, other: Self) -> Bool:
         return (
