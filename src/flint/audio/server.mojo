@@ -26,7 +26,7 @@ from std.sys import size_of
 from flint.core.math import Vec3
 from flint.platform.os import close_fd
 from flint.platform.pulse import PulseClient
-from flint.platform.audio import WavClip
+from flint.platform.audio import WavClip, alsa_open_pcm, alsa_write_interleaved, alsa_close_pcm
 from flint.platform.dsp import (
     CytomicSVF,
     StereoReverbFDN,
@@ -1221,6 +1221,11 @@ struct AudioRtEngine(Movable):
 
     var pulse: PulseClient
     var alsa_fd: Int
+    var alsa_period_frames: Int
+    var alsa_pending_frames: Int
+    var alsa_pending_offset: Int
+    var alsa_xruns: Int
+    var alsa_poll_buf: List[UInt8]
     var headless_rt_mode: Bool
     var rt_pcm_i16: List[Int16]
     var rt_float_lr: List[Float32]
@@ -1301,6 +1306,11 @@ struct AudioRtEngine(Movable):
 
         self.pulse = PulseClient()
         self.alsa_fd = -1
+        self.alsa_period_frames = self.quantum_frames
+        self.alsa_pending_frames = 0
+        self.alsa_pending_offset = 0
+        self.alsa_xruns = 0
+        self.alsa_poll_buf = List[UInt8](length=8, fill=0)
         self.headless_rt_mode = False
         self.rt_pcm_i16 = List[Int16](length=MAX_QUANTUM_FRAMES * 2, fill=0)
         self.rt_float_lr = List[Float32](
@@ -2488,23 +2498,60 @@ struct AudioRtEngine(Movable):
                 _ = ts_h[1]
                 continue
 
-            self.pulse.pump()
-            if not self.pulse.connected():
-                break
-            if self.pulse.has_pending_write():
-                if not self.pulse.flush_pending():
+            if self.pulse.connected():
+                self.pulse.pump()
+                if not self.pulse.connected():
                     break
-            var frame_bytes = qf * 4
-            if not self.pulse.has_pending_write() and self.pulse.requested_bytes >= frame_bytes:
-                self.render_quantum(float_lr, qf)
-                for i in range(qf * 2):
-                    var s = max(
-                        Float32(-1.0), min(Float32(1.0), float_lr[i])
-                    )
-                    self.rt_pcm_i16[i] = Int16(Int(s * Float32(32767.0)))
-                _ = self.pulse.write_samples(self.rt_pcm_i16)
+                if self.pulse.has_pending_write():
+                    if not self.pulse.flush_pending():
+                        break
+                var frame_bytes = qf * 4
+                if not self.pulse.has_pending_write() and self.pulse.requested_bytes >= frame_bytes:
+                    self.render_quantum(float_lr, qf)
+                    for i in range(qf * 2):
+                        var s = max(
+                            Float32(-1.0), min(Float32(1.0), float_lr[i])
+                        )
+                        self.rt_pcm_i16[i] = Int16(Int(s * Float32(32767.0)))
+                    _ = self.pulse.write_samples(self.rt_pcm_i16)
+                else:
+                    _ = self.pulse.wait_io(10)
+            elif self.alsa_fd >= 0:
+                if self.alsa_pending_frames <= 0:
+                    self.render_quantum(float_lr, qf)
+                    for i in range(qf * 2):
+                        var s = max(
+                            Float32(-1.0), min(Float32(1.0), float_lr[i])
+                        )
+                        self.rt_pcm_i16[i] = Int16(Int(s * Float32(32767.0)))
+                    self.alsa_pending_frames = qf
+                    self.alsa_pending_offset = 0
+                var written = alsa_write_interleaved(
+                    self.alsa_fd,
+                    Int(self.rt_pcm_i16.unsafe_ptr().unsafe_offset(self.alsa_pending_offset * 2)),
+                    self.alsa_pending_frames,
+                    self.alsa_xruns,
+                )
+                if written > 0:
+                    self.alsa_pending_offset += written
+                    self.alsa_pending_frames -= written
+                elif written == 0:
+                    var fd32 = UInt32(self.alsa_fd)
+                    self.alsa_poll_buf[0] = UInt8(fd32 & 0xFF)
+                    self.alsa_poll_buf[1] = UInt8((fd32 >> 8) & 0xFF)
+                    self.alsa_poll_buf[2] = UInt8((fd32 >> 16) & 0xFF)
+                    self.alsa_poll_buf[3] = UInt8((fd32 >> 24) & 0xFF)
+                    self.alsa_poll_buf[4] = 0x04  # POLLOUT
+                    self.alsa_poll_buf[5] = 0
+                    self.alsa_poll_buf[6] = 0
+                    self.alsa_poll_buf[7] = 0
+                    _ = external_call["poll", Int32](self.alsa_poll_buf.unsafe_ptr(), UInt64(1), Int32(10))
+                else:
+                    alsa_close_pcm(self.alsa_fd)
+                    self.alsa_fd = -1
+                    break
             else:
-                _ = self.pulse.wait_io(10)
+                break
 
 
 struct AudioServer(Movable):
@@ -3071,8 +3118,20 @@ struct AudioServer(Movable):
 
     # ---- Dedicated RT Thread Lifecycle (PulseAudio / PipeWire / Headless RT Pthread) ----
 
+    def audio_backend_name(self) -> String:
+        """Returns the active RT output backend: `'headless'`, `'pulse'`, `'alsa'`, or `'none'`."""
+        if self.rt_core_addr == 0 or not self.rt_running:
+            return "none"
+        if self._rt_core()[].headless_rt_mode:
+            return "headless"
+        if self._rt_core()[].pulse.connected():
+            return "pulse"
+        if self._rt_core()[].alsa_fd >= 0:
+            return "alsa"
+        return "none"
+
     def start_realtime_thread(mut self) -> Bool:
-        """Connects to `PulseClient` and spawns the dedicated RT mixing pthread against heap-pinned `AudioRtEngine`."""
+        """Connects to `PulseClient` (or falls back to Linux ALSA `/dev/snd/pcmC*D*p`) and spawns the dedicated RT mixing pthread."""
         if (
             self.rt_running
             or self.rt_core_addr == 0
@@ -3080,8 +3139,17 @@ struct AudioServer(Movable):
         ):
             return self.rt_running
         var block_bytes = self.quantum_frames * 4
-        if not self._rt_core()[].pulse.connect(self.sample_rate, block_bytes):
-            return False
+        var connected = self._rt_core()[].pulse.connect(self.sample_rate, block_bytes)
+        if not connected:
+            var out_period = self.quantum_frames
+            var out_buffer = self.quantum_frames * 4
+            var alsa_fd = alsa_open_pcm(self.sample_rate, self.quantum_frames, out_period, out_buffer)
+            if alsa_fd < 0:
+                return False
+            self._rt_core()[].alsa_fd = alsa_fd
+            self._rt_core()[].alsa_period_frames = out_period
+            self._rt_core()[].alsa_pending_frames = 0
+            self._rt_core()[].alsa_pending_offset = 0
         self._rt_core()[].headless_rt_mode = False
         self._rt_core()[]._running_ptr()[unsafe_offset=0].store(1)
         var tid = UInt64(0)
@@ -3094,7 +3162,9 @@ struct AudioServer(Movable):
         if rc != 0:
             self._rt_core()[]._running_ptr()[unsafe_offset=0].store(0)
             self._rt_core()[].pulse.close()
-        _ = self.drain_retired()
+            if self._rt_core()[].alsa_fd >= 0:
+                alsa_close_pcm(self._rt_core()[].alsa_fd)
+                self._rt_core()[].alsa_fd = -1
             return False
         self.rt_thread_handle = tid
         self.rt_running = True
@@ -3137,7 +3207,7 @@ struct AudioServer(Movable):
         self._rt_core()[].pulse.close()
         _ = self.drain_retired()
         if self._rt_core()[].alsa_fd >= 0:
-            close_fd(self._rt_core()[].alsa_fd)
+            alsa_close_pcm(self._rt_core()[].alsa_fd)
             self._rt_core()[].alsa_fd = -1
 
     def stop(mut self):

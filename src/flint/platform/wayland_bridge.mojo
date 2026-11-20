@@ -45,7 +45,11 @@ comptime WORD_OUT_FDS: Int = 15
 comptime WORD_OUT_FD_COUNT: Int = 16
 comptime WORD_THREAD: Int = 17
 comptime WORD_FAILED: Int = 18
+comptime WORD_IO_SCRATCH: Int = 19
+comptime WORD_POLL_SCRATCH: Int = 20
+comptime WORD_WAIT_SCRATCH: Int = 21
 comptime STATE_WORDS: Int = 24
+comptime IO_SCRATCH_BYTES: Int = 16 + 56 + CONTROL_BYTES
 
 comptime STREAM_BYTES: Int = 256 * 1024
 comptime GAME_BYTES: Int = 1024 * 1024
@@ -104,12 +108,12 @@ def unlock(state: Int):
     _ = external_call["pthread_mutex_unlock", Int32](word(state, WORD_MUTEX))
 
 
-def receive_some(fd: Int, buffer: Int, capacity: Int, fds: Int, mut fd_count: Int) -> Int:
-    """recvmsg without waiting. Passed descriptors join the end of `fds`."""
-    var iov = external_call["malloc", Int](16 + 56 + CONTROL_BYTES)
+def receive_some(fd: Int, buffer: Int, capacity: Int, fds: Int, mut fd_count: Int, scratch: Int) -> Int:
+    """recvmsg without waiting using pre-allocated `scratch`. Passed descriptors join the end of `fds`."""
+    var iov = scratch
     var message = iov + 16
     var control = message + 56
-    _ = external_call["memset", Int](iov, Int32(0), 16 + 56 + CONTROL_BYTES)
+    _ = external_call["memset", Int](iov, Int32(0), IO_SCRATCH_BYTES)
     put64(iov, buffer)
     put64(iov + 8, capacity)
     put64(message + 16, iov)
@@ -126,16 +130,15 @@ def receive_some(fd: Int, buffer: Int, capacity: Int, fds: Int, mut fd_count: In
                 fd_count += 1
             else:
                 close_fd(descriptor)
-    external_call["free", NoneType](iov)
     return count
 
 
-def send_some(fd: Int, buffer: Int, size: Int, fds: Int, fd_count: Int) -> Bool:
-    """sendmsg all of `size`, with the descriptors on its first byte."""
-    var iov = external_call["malloc", Int](16 + 56 + CONTROL_BYTES)
+def send_some(fd: Int, buffer: Int, size: Int, fds: Int, fd_count: Int, scratch: Int) -> Bool:
+    """sendmsg all of `size` using pre-allocated `scratch`, with the descriptors on its first byte."""
+    var iov = scratch
     var message = iov + 16
     var control = message + 56
-    _ = external_call["memset", Int](iov, Int32(0), 16 + 56 + CONTROL_BYTES)
+    _ = external_call["memset", Int](iov, Int32(0), IO_SCRATCH_BYTES)
     var sent = 0
     var ok = True
     while sent < size and ok:
@@ -163,7 +166,6 @@ def send_some(fd: Int, buffer: Int, size: Int, fds: Int, fd_count: Int) -> Bool:
             ok = False
         else:
             sent += count
-    external_call["free", NoneType](iov)
     return ok
 
 
@@ -173,7 +175,8 @@ def take_incoming(state: Int) -> Bool:
     var buffer = word(state, WORD_IN)
     var fds = word(state, WORD_IN_FDS)
     var fd_count = word(state, WORD_IN_FD_COUNT)
-    var count = receive_some(word(state, WORD_REAL), buffer + used, STREAM_BYTES - used, fds, fd_count)
+    var io_scratch = word(state, WORD_IO_SCRATCH)
+    var count = receive_some(word(state, WORD_REAL), buffer + used, STREAM_BYTES - used, fds, fd_count, io_scratch)
     if count == 0:
         set_word(state, WORD_FAILED, 1)
     used += max(count, 0)
@@ -202,7 +205,7 @@ def take_incoming(state: Int) -> Bool:
                 fd_count -= 1
                 _ = external_call["memmove", Int](fds, fds + 8, fd_count * 8)
         if for_library:
-            if not send_some(word(state, WORD_LIBRARY), buffer + offset, size, fds, fd_count):
+            if not send_some(word(state, WORD_LIBRARY), buffer + offset, size, fds, fd_count, io_scratch):
                 set_word(state, WORD_FAILED, 1)
             for index in range(fd_count):
                 close_fd(get64(fds + index * 8))  # the kernel holds copies now
@@ -219,10 +222,11 @@ def take_outgoing(state: Int):
     """libwayland to the compositor: every whole request, in order, descriptors with it."""
     var buffer = word(state, WORD_OUT)
     var fds = word(state, WORD_OUT_FDS)
+    var io_scratch = word(state, WORD_IO_SCRATCH)
     while True:
         var used = word(state, WORD_OUT_USED)
         var fd_count = word(state, WORD_OUT_FD_COUNT)
-        var count = receive_some(word(state, WORD_LIBRARY), buffer + used, STREAM_BYTES - used, fds, fd_count)
+        var count = receive_some(word(state, WORD_LIBRARY), buffer + used, STREAM_BYTES - used, fds, fd_count, io_scratch)
         set_word(state, WORD_OUT_FD_COUNT, fd_count)
         if count <= 0:
             return
@@ -234,7 +238,7 @@ def take_outgoing(state: Int):
                 break
             whole += size
         if whole > 0:
-            if not send_some(word(state, WORD_REAL), buffer, whole, fds, fd_count):
+            if not send_some(word(state, WORD_REAL), buffer, whole, fds, fd_count, io_scratch):
                 set_word(state, WORD_FAILED, 1)
             for index in range(fd_count):
                 close_fd(get64(fds + index * 8))
@@ -244,7 +248,9 @@ def take_outgoing(state: Int):
 
 
 def bridge_thread(state: Int) abi("C") -> Int:
-    var descriptors = external_call["malloc", Int](16)
+    var descriptors = word(state, WORD_POLL_SCRATCH)
+    var notify_one = descriptors + 16
+    put64(notify_one, 1)
     put32(descriptors, UInt32(word(state, WORD_REAL)))
     put32(descriptors + 4, POLL_IN)
     put32(descriptors + 8, UInt32(word(state, WORD_LIBRARY)))
@@ -263,11 +269,7 @@ def bridge_thread(state: Int) abi("C") -> Int:
             game_got = take_incoming(state)
         unlock(state)
         if game_got:
-            var one = external_call["malloc", Int](8)
-            put64(one, 1)
-            _ = external_call["write", Int64](Int32(word(state, WORD_NOTIFY)), raw(one), Int64(8))
-            external_call["free", NoneType](one)
-    external_call["free", NoneType](descriptors)
+            _ = external_call["write", Int64](Int32(word(state, WORD_NOTIFY)), raw(notify_one), Int64(8))
     return 0
 
 
@@ -357,6 +359,9 @@ struct WaylandBridge(Copyable, Movable):
         set_word(state, WORD_MUTEX, mutex_ptr)
         set_word(state, WORD_IN_FDS, external_call["malloc", Int](MAX_FDS * 8))
         set_word(state, WORD_OUT_FDS, external_call["malloc", Int](MAX_FDS * 8))
+        set_word(state, WORD_IO_SCRATCH, external_call["calloc", Int](Int(1), IO_SCRATCH_BYTES))
+        set_word(state, WORD_POLL_SCRATCH, external_call["calloc", Int](Int(1), Int(32)))
+        set_word(state, WORD_WAIT_SCRATCH, external_call["calloc", Int](Int(1), Int(24)))
         set_owned(state, WL_DISPLAY_ID)
         var thread = 0
         if external_call["pthread_create", Int32](Pointer(to=thread), Int(0), bridge_thread, state) != 0:
@@ -434,18 +439,17 @@ struct WaylandBridge(Copyable, Movable):
     def write_all(self, address: Int, size: Int) -> Bool:
         self.push_out()
         lock(self.state)
-        var ok = send_some(word(self.state, WORD_REAL), address, size, 0, 0)
+        var ok = send_some(word(self.state, WORD_REAL), address, size, 0, 0, word(self.state, WORD_IO_SCRATCH))
         unlock(self.state)
         return ok
 
     def write_with_fd(self, address: Int, size: Int, fd: Int) -> Bool:
         self.push_out()
-        var fds = external_call["malloc", Int](8)
+        var fds = word(self.state, WORD_WAIT_SCRATCH) + 16
         put64(fds, fd)
         lock(self.state)
-        var ok = send_some(word(self.state, WORD_REAL), address, size, fds, 1)
+        var ok = send_some(word(self.state, WORD_REAL), address, size, fds, 1, word(self.state, WORD_IO_SCRATCH))
         unlock(self.state)
-        external_call["free", NoneType](fds)
         return ok
 
     def read_into(self, mut incoming: List[UInt8]):
@@ -459,13 +463,12 @@ struct WaylandBridge(Copyable, Movable):
 
     def wait(self, timeout_ms: Int) -> Bool:
         """True once the game has events to read."""
-        var descriptor = external_call["malloc", Int](16)
+        var descriptor = word(self.state, WORD_WAIT_SCRATCH)
         put32(descriptor, UInt32(word(self.state, WORD_NOTIFY)))
         put32(descriptor + 4, POLL_IN)
         var ready = external_call["poll", Int32](raw(descriptor), UInt64(1), Int32(timeout_ms)) > 0
         if ready:
             _ = external_call["read", Int64](Int32(word(self.state, WORD_NOTIFY)), raw(descriptor + 8), Int64(8))
-        external_call["free", NoneType](descriptor)
         return ready
 
     def failed(self) -> Bool:
@@ -502,6 +505,9 @@ struct WaylandBridge(Copyable, Movable):
             external_call["free", NoneType](word(self.state, WORD_OWNED))
             external_call["free", NoneType](in_fds)
             external_call["free", NoneType](out_fds)
+            external_call["free", NoneType](word(self.state, WORD_IO_SCRATCH))
+            external_call["free", NoneType](word(self.state, WORD_POLL_SCRATCH))
+            external_call["free", NoneType](word(self.state, WORD_WAIT_SCRATCH))
             external_call["free", NoneType](self.state)
             self.state = 0
         if self.library != 0:

@@ -176,14 +176,16 @@ def write_file_durable(path: String, mut data: List[UInt8], fault: Int = FAULT_N
 
 
 def player_save_directory() -> String:
-    """SD_SAVE_DIR, then $XDG_DATA_HOME/sharddepth, then ~/.local/share/sharddepth."""
-    var chosen = env_value("SD_SAVE_DIR")
+    """FLINT_SAVE_DIR (with legacy SD_SAVE_DIR fallback), then $XDG_DATA_HOME/flint, then ~/.local/share/flint."""
+    var chosen = env_value("FLINT_SAVE_DIR")
+    if chosen.byte_length() == 0:
+        chosen = env_value("SD_SAVE_DIR")
     if chosen.byte_length() > 0:
         return chosen
     var data_home = env_value("XDG_DATA_HOME")
     if data_home.byte_length() > 0:
-        return data_home + "/sharddepth"
-    return env_value("HOME") + "/.local/share/sharddepth"
+        return data_home + "/flint"
+    return env_value("HOME") + "/.local/share/flint"
 
 
 def close_fd(fd: Int):

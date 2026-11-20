@@ -24,6 +24,9 @@ from std.testing import assert_true, assert_equal
 from flint.core.math import Vec3
 from flint.core.jobs import JobPool
 from flint.platform.os import get_time
+from flint.platform.audio import alsa_open_pcm, alsa_close_pcm
+from flint.platform.vulkan import VulkanGpu
+from flint.platform.amdgpu import GpuBuffer
 from flint.platform.input import (
     InputState,
     PAD_A,
@@ -1050,6 +1053,55 @@ def test_evdev_and_declarative_input_map() raises:
     pad_in.set_pad_rumble(0, 0.5, 0.8, 200)
 
 
+def test_vulkan_suballocator_and_alsa_fallback() raises:
+    # 1. AudioServer backend introspection & ALSA fallback resilience
+    var srv_fb = AudioServer(48000, 256)
+    assert_equal(srv_fb.audio_backend_name(), "none")
+    assert_true(srv_fb.start_headless_rt_thread())
+    assert_equal(srv_fb.audio_backend_name(), "headless")
+    srv_fb.stop()
+    assert_equal(srv_fb.audio_backend_name(), "none")
+
+    # Direct ALSA probe must either open a valid fd or return -1 cleanly without crashing
+    var alsa_period = 256
+    var alsa_buf = 1024
+    var alsa_fd = alsa_open_pcm(48000, 256, alsa_period, alsa_buf)
+    if alsa_fd >= 0:
+        assert_true(alsa_period >= 64)
+        alsa_close_pcm(alsa_fd)
+
+    # 2. Vulkan GPU Memory Sub-Allocator: 64 small buffers share 1 VkDeviceMemory slab & reuse cleanly
+    var vk = VulkanGpu()
+    if vk.initialize():
+        var bufs = List[GpuBuffer](capacity=64)
+        for i in range(64):
+            var b = vk.create_buffer(4096, False)
+            assert_true(b.vk_buffer != 0 and b.cpu_address != 0)
+            b.write32(0, UInt32(0xCAFE0000 + i))
+            bufs.append(b^)
+        assert_equal(vk.suballoc_block_count(), 1)
+        assert_equal(vk.suballoc_live_count(), 64)
+        for i in range(64):
+            assert_equal(bufs[i].read32(0), UInt32(0xCAFE0000 + i))
+            vk.destroy_buffer(bufs[i])
+        bufs.clear()
+        assert_equal(vk.suballoc_live_count(), 0)
+
+        # Second wave of 64 small buffers must reuse the exact same slab (no new VkDeviceMemory)
+        for _ in range(64):
+            var b = vk.create_buffer(4096, False)
+            assert_true(b.vk_buffer != 0 and b.cpu_address != 0)
+            bufs.append(b^)
+        assert_equal(vk.suballoc_block_count(), 1)
+        assert_equal(vk.suballoc_live_count(), 64)
+        for i in range(64):
+            vk.destroy_buffer(bufs[i])
+        vk.close()
+        assert_equal(vk.suballoc_block_count(), 0)
+    else:
+        vk.close()
+
+
 def main() raises:
     var t_start = get_time()
     test_audio_server_mastering_and_virtualizer()
@@ -1062,6 +1114,8 @@ def main() raises:
     print("[PASS] (d) 1,000 Flexbox Fuzz, 5-Panel DockSpace, <0.1ms 100k Outliner, UTF-8 TextInput & Modal Trap")
     test_evdev_and_declarative_input_map()
     print("[PASS] (e) Evdev EVIOCGABS (0.0 Trigger), 48B ff_effect Rumble & Declarative InputMap")
+    test_vulkan_suballocator_and_alsa_fallback()
+    print("[PASS] (f) Vulkan OffsetAllocator 64MiB Sub-Allocator Block Reuse & ALSA/AudioServer Fallback")
     var elapsed = get_time() - t_start
     print("ALL FLINT V5 TRACK 4 TESTS PASSED in", elapsed, "s")
     assert_true(elapsed < 10.0)

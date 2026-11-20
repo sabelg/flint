@@ -10,6 +10,7 @@ from flint.platform.wayland_bridge import WaylandBridge
 from flint.platform.x11 import X11Window
 from flint.platform.kms import KmsWindow, on_virtual_console, fit_rect
 from flint.platform.vulkan import VulkanGpu, SwapchainHandle
+from flint.platform.dynlib import dl_open, dl_sym, dl_close
 from flint.platform.os import env_value, env_flag, close_fd, get_time
 
 # Held in the pending key and button queues: everything held is released here.
@@ -216,6 +217,9 @@ struct WaylandWindow(Copyable, Movable):
     var window_title: String
     var logical_width: Int
     var logical_height: Int
+    var x11_xcb_lib: Int
+    var x11_xcb_conn: Int
+    var x11_xcb_disconnect: Int
 
     def __init__(out self):
         self.fd = -1
@@ -294,6 +298,9 @@ struct WaylandWindow(Copyable, Movable):
         self.window_title = "FLINT ENGINE"
         self.logical_width = 1280
         self.logical_height = 720
+        self.x11_xcb_lib = 0
+        self.x11_xcb_conn = 0
+        self.x11_xcb_disconnect = 0
 
     def set_title(mut self, title: String):
         self.window_title = title
@@ -793,6 +800,47 @@ struct WaylandWindow(Copyable, Movable):
         """Enables `WaylandBridge` before `initialize()` so windowed Wayland sessions can attach zero-copy Vulkan swapchains."""
         self.wants_bridge = True
 
+    def _ensure_xcb_connection(mut self) -> Bool:
+        """Lazily opens `libxcb.so.1` and connects an `xcb_connection_t*` for `VK_KHR_xcb_surface`."""
+        if self.x11_xcb_conn != 0:
+            return True
+        if self.x11_xcb_lib == 0:
+            self.x11_xcb_lib = dl_open("libxcb.so.1")
+        if self.x11_xcb_lib == 0:
+            return False
+        var fn_connect = dl_sym(self.x11_xcb_lib, "xcb_connect")
+        var fn_has_err = dl_sym(self.x11_xcb_lib, "xcb_connection_has_error")
+        self.x11_xcb_disconnect = dl_sym(self.x11_xcb_lib, "xcb_disconnect")
+        if fn_connect == 0 or fn_has_err == 0 or self.x11_xcb_disconnect == 0:
+            _ = dl_close(self.x11_xcb_lib)
+            self.x11_xcb_lib = 0
+            self.x11_xcb_disconnect = 0
+            return False
+        comptime XcbConnect = def(Int, Int) thin abi("C") -> Int
+        comptime XcbHasError = def(Int) thin abi("C") -> Int32
+        var conn = Pointer(to=fn_connect).unsafe_bitcast[XcbConnect]()[unsafe_offset=0](0, 0)
+        if conn == 0:
+            return False
+        var err = Pointer(to=fn_has_err).unsafe_bitcast[XcbHasError]()[unsafe_offset=0](conn)
+        if err != 0:
+            comptime XcbDisconnect = def(Int) thin abi("C") -> None
+            var fn_disc = self.x11_xcb_disconnect
+            Pointer(to=fn_disc).unsafe_bitcast[XcbDisconnect]()[unsafe_offset=0](conn)
+            return False
+        self.x11_xcb_conn = conn
+        return True
+
+    def _close_xcb_connection(mut self):
+        if self.x11_xcb_conn != 0 and self.x11_xcb_disconnect != 0:
+            comptime XcbDisconnect = def(Int) thin abi("C") -> None
+            var fn_disc = self.x11_xcb_disconnect
+            Pointer(to=fn_disc).unsafe_bitcast[XcbDisconnect]()[unsafe_offset=0](self.x11_xcb_conn)
+        self.x11_xcb_conn = 0
+        self.x11_xcb_disconnect = 0
+        if self.x11_xcb_lib != 0:
+            _ = dl_close(self.x11_xcb_lib)
+            self.x11_xcb_lib = 0
+
     def attach_vulkan(mut self, mut vk: VulkanGpu, width: Int, height: Int, prefer_mailbox: Bool = True, prefer_hdr10: Bool = False) -> SwapchainHandle:
         """A swapchain on whatever this window is, so a game presents zero-copy without
         knowing the backend. width x height is the renderer's output size.
@@ -801,7 +849,7 @@ struct WaylandWindow(Copyable, Movable):
           size; the compositor scales it to the window (wp_viewporter), aspect-fit when
           fullscreen, so a fullscreen game can be scanned out with no copy at all.
         - KMS: Vulkan takes the display at a mode of exactly that size (KmsWindow.attach_vulkan).
-        - X11: none on bare X11Window (use `SwapchainSurface` with `X11VulkanBridge` for `VK_KHR_xcb_surface`).
+        - X11: opens a `libxcb.so.1` connection and attaches `VK_KHR_xcb_surface` against `self.x11.window_id`.
         An empty handle (`swapchain == 0`) means keep presenting CPU frames with present(),
         which still works. When it is not empty present() does nothing, so draw HUDs
         on the GPU. Call `vk.close_swapchain()` before close()."""
@@ -809,7 +857,24 @@ struct WaylandWindow(Copyable, Movable):
             var sc_kms = self.kms.attach_vulkan(vk, width, height, prefer_hdr10)
             self.swapchain = sc_kms.copy()
             return sc_kms^
-        if self.using_x11 or not self.bridge.active() or self.bridge.surface_proxy == 0:
+        if self.using_x11:
+            if not self.x11.active() or not self._ensure_xcb_connection():
+                self.swapchain = SwapchainHandle()
+                return SwapchainHandle()
+            var sc_x11 = vk.attach_surface(
+                xcb_conn=self.x11_xcb_conn,
+                xcb_win=self.x11.window_id,
+                width=width,
+                height=height,
+                prefer_mailbox=prefer_mailbox,
+                prefer_hdr10=prefer_hdr10,
+            )
+            self.swapchain = sc_x11.copy()
+            if sc_x11.swapchain != 0:
+                self.gpu_width = sc_x11.width
+                self.gpu_height = sc_x11.height
+            return sc_x11^
+        if not self.bridge.active() or self.bridge.surface_proxy == 0:
             self.swapchain = SwapchainHandle()
             return SwapchainHandle()
         var sc = vk.attach_surface(
@@ -834,6 +899,8 @@ struct WaylandWindow(Copyable, Movable):
         if self.using_kms:
             return self.kms.detach_vulkan(vk)
         vk.close_swapchain()
+        if self.using_x11:
+            self._close_xcb_connection()
         self.gpu_width = 0
         self.gpu_height = 0
         return self.fd >= 0 or self.using_x11
@@ -1288,6 +1355,7 @@ struct WaylandWindow(Copyable, Movable):
             self.using_kms = False
             return
         if self.using_x11:
+            self._close_xcb_connection()
             self.x11.close()
             self.using_x11 = False
             return

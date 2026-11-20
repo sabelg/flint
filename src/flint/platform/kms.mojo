@@ -451,7 +451,11 @@ def bit_set(bits: List[UInt8], index: Int) -> Bool:
 # The rescue page: what a signal handler or atexit needs to give the console back
 # ---------------------------------------------------------------------------
 
-comptime KMS_RESCUE: Int = 0x5D5A00000000
+# 38-bit ARM64-safe candidate slots (< 2^38 = 256 GiB, valid on both 39-bit ARM64 VA and 48-bit x86-64 VA).
+comptime KMS_RESCUE_SLOT0: Int = 0x0000003D5A000000
+comptime KMS_RESCUE_SLOT1: Int = 0x0000002D5A000000
+comptime KMS_RESCUE_SLOT2: Int = 0x0000001D5A000000
+comptime KMS_RESCUE: Int = KMS_RESCUE_SLOT0
 comptime KMS_RESCUE_BYTES: Int = 4096
 comptime KMS_MAGIC: Int = 0x31534D4B544C46  # "FLTKMS1"
 comptime R_MAGIC: Int = 0
@@ -478,16 +482,46 @@ comptime KmsSignalHandler = def(Int32, Int, Int) abi("C") thin -> None
 comptime KmsExitHandler = def() abi("C") thin -> None
 
 
+def _rescue_slot_addr(index: Int) -> Int:
+    if index == 0:
+        return KMS_RESCUE_SLOT0
+    if index == 1:
+        return KMS_RESCUE_SLOT1
+    return KMS_RESCUE_SLOT2
+
+
+def _rescue_base() -> Int:
+    """Async-signal-safe lookup of the active rescue page among 38-bit ARM64-safe slots."""
+    var pid = Int(sys(SYS_GETPID))
+    for i in range(3):
+        var addr = _rescue_slot_addr(i)
+        if sys(SYS_MSYNC, addr, KMS_RESCUE_BYTES, 1) == 0:
+            var magic = Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=addr + R_MAGIC)[unsafe_offset=0]
+            var owner = Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=addr + R_PID)[unsafe_offset=0]
+            if magic == KMS_MAGIC and owner == pid:
+                return addr
+    return 0
+
+
 def rload(offset: Int) -> Int:
-    return Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=KMS_RESCUE + offset)[unsafe_offset=0]
+    var base = _rescue_base()
+    if base == 0:
+        return 0
+    return Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + offset)[unsafe_offset=0]
 
 
 def rstore(offset: Int, value: Int):
-    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=KMS_RESCUE + offset)[unsafe_offset=0] = value
+    var base = _rescue_base()
+    if base == 0:
+        return
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + offset)[unsafe_offset=0] = value
 
 
 def rstore_byte(offset: Int, value: UInt8):
-    Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=KMS_RESCUE + offset)[unsafe_offset=0] = value
+    var base = _rescue_base()
+    if base == 0:
+        return
+    Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=base + offset)[unsafe_offset=0] = value
 
 
 def rescue_signals() -> List[Int]:
@@ -525,72 +559,82 @@ def is_stop_signal(signal: Int) -> Bool:
 
 
 def rescue_mapped() -> Bool:
-    # msync on an unmapped address fails with ENOMEM: a safe probe.
-    return sys(SYS_MSYNC, KMS_RESCUE, KMS_RESCUE_BYTES, 1) == 0
+    return _rescue_base() != 0
 
 
 def rescue_ready() -> Bool:
-    if not rescue_mapped():
-        return False
-    return rload(R_MAGIC) == KMS_MAGIC and rload(R_PID) == Int(sys(SYS_GETPID))
+    return _rescue_base() != 0
 
 
 def install_rescue() -> Bool:
     if rescue_ready():
         return True
-    # MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE
-    var mapped = external_call["mmap", Int](KMS_RESCUE, KMS_RESCUE_BYTES, Int32(3), Int32(0x22 | 0x100000), Int32(-1), Int(0))
-    if mapped != KMS_RESCUE:
-        if not rescue_mapped():
-            return False
-        # A fork of a process that had it.
+    var pid = Int(sys(SYS_GETPID))
+    var chosen = 0
+    for i in range(3):
+        var candidate = _rescue_slot_addr(i)
+        # MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE (38-bit ARM64-safe)
+        var mapped = external_call["mmap", Int](candidate, KMS_RESCUE_BYTES, Int32(3), Int32(0x22 | 0x100000), Int32(-1), Int(0))
+        if mapped == candidate:
+            chosen = candidate
+            break
+        # Handle fork of a process that already mapped this slot with KMS_MAGIC
+        if sys(SYS_MSYNC, candidate, KMS_RESCUE_BYTES, 1) == 0:
+            var magic = Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=candidate + R_MAGIC)[unsafe_offset=0]
+            if magic == KMS_MAGIC:
+                chosen = candidate
+                break
+    if chosen == 0:
+        return False
     for offset in range(0, KMS_RESCUE_BYTES, 8):
-        rstore(offset, 0)
-    rstore(R_TTY_FD, -1)
-    rstore(R_DRM_FD, -1)
-    rstore(R_OLD_KD_MODE, -1)
-    rstore(R_OLD_KB_MODE, -1)
-    rstore(R_PID, Int(sys(SYS_GETPID)))
-    rstore(R_MAGIC, KMS_MAGIC)
+        Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=chosen + offset)[unsafe_offset=0] = 0
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=chosen + R_TTY_FD)[unsafe_offset=0] = -1
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=chosen + R_DRM_FD)[unsafe_offset=0] = -1
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=chosen + R_OLD_KD_MODE)[unsafe_offset=0] = -1
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=chosen + R_OLD_KB_MODE)[unsafe_offset=0] = -1
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=chosen + R_PID)[unsafe_offset=0] = pid
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=chosen + R_MAGIC)[unsafe_offset=0] = KMS_MAGIC
     return True
 
 
 def kms_restore_console():
     """Give the screen and the keyboard back. Async-signal-safe: plain ioctls on saved
     bytes, no allocation. Runs once; later calls do nothing."""
-    if not rescue_ready() or rload(R_ACTIVE) == 0:
+    var base = _rescue_base()
+    if base == 0 or Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_ACTIVE)[unsafe_offset=0] == 0:
         return
-    rstore(R_ACTIVE, 0)
-    var drm = rload(R_DRM_FD)
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_ACTIVE)[unsafe_offset=0] = 0
+    var drm = Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_DRM_FD)[unsafe_offset=0]
     if drm >= 0:
-        if rload(R_CRTC_SAVED) == 1:
+        if Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_CRTC_SAVED)[unsafe_offset=0] == 1:
             # The CRTC as it was (usually the text console's framebuffer).
-            _ = sys(SYS_IOCTL, drm, drm_ioctl_set_crtc(), KMS_RESCUE + R_SAVED_CRTC)
+            _ = sys(SYS_IOCTL, drm, drm_ioctl_set_crtc(), base + R_SAVED_CRTC)
         _ = sys(SYS_IOCTL, drm, DRM_IOCTL_DROP_MASTER, Int(0))
-    var tty = rload(R_TTY_FD)
+    var tty = Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_TTY_FD)[unsafe_offset=0]
     if tty >= 0:
-        if rload(R_TERMIOS_SAVED) == 1:
-            _ = sys(SYS_IOCTL, tty, TCSETS, KMS_RESCUE + R_SAVED_TERMIOS)
-        var kb = rload(R_OLD_KB_MODE)
+        if Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_TERMIOS_SAVED)[unsafe_offset=0] == 1:
+            _ = sys(SYS_IOCTL, tty, TCSETS, base + R_SAVED_TERMIOS)
+        var kb = Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_OLD_KB_MODE)[unsafe_offset=0]
         if kb >= 0:
             _ = sys(SYS_IOCTL, tty, KDSKBMODE, Int(kb))
-        var kd = rload(R_OLD_KD_MODE)
+        var kd = Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_OLD_KD_MODE)[unsafe_offset=0]
         _ = sys(SYS_IOCTL, tty, KDSETMODE, Int(kd if kd >= 0 else KD_TEXT))
 
 
 def kms_on_signal(signal: Int32, info: Int, context: Int) abi("C"):
     var number = Int(signal)
-    if is_stop_signal(number) and rescue_ready() and rload(R_ACTIVE) == 1 and rload(R_STOP) == 0:
+    var base = _rescue_base()
+    if is_stop_signal(number) and base != 0 and Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_ACTIVE)[unsafe_offset=0] == 1 and Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_STOP)[unsafe_offset=0] == 0:
         # First request: let the game leave its loop and close the window itself.
-        rstore(R_STOP, 1)
+        Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_STOP)[unsafe_offset=0] = 1
         return
     kms_restore_console()
     # Put back whatever handled this signal before (the crash reporter, or SIG_DFL).
     var slot = rescue_slot(number)
-    if slot >= 0 and rescue_ready():
-        _ = external_call["sigaction", Int32](signal, KMS_RESCUE + R_OLD_ACTIONS + slot * SIGACTION_BYTES, Int(0))
-    elif rescue_ready():
-        _ = external_call["sigaction", Int32](signal, KMS_RESCUE + R_ZERO_ACTION, Int(0))
+    if slot >= 0 and base != 0:
+        _ = external_call["sigaction", Int32](signal, base + R_OLD_ACTIONS + slot * SIGACTION_BYTES, Int(0))
+    elif base != 0:
+        _ = external_call["sigaction", Int32](signal, base + R_ZERO_ACTION, Int(0))
     var code = Int(Pointer[Int32, origin=MutAnyOrigin](unsafe_from_address=info + 8)[unsafe_offset=0]) if info != 0 else 0
     if code <= 0 or is_stop_signal(number) or number == 6:
         # Sent, not a fault: send it again so the earlier action runs.
@@ -603,7 +647,10 @@ def kms_at_exit() abi("C"):
 
 
 def install_rescue_handlers() -> Bool:
-    if rload(R_HANDLERS) == 1:
+    var base = _rescue_base()
+    if base == 0:
+        return False
+    if Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_HANDLERS)[unsafe_offset=0] == 1:
         return True
     var action = List[Int](length=19, fill=0)
     Pointer[KmsSignalHandler, origin=MutAnyOrigin](unsafe_from_address=Int(action.unsafe_ptr()))[unsafe_offset=0] = kms_on_signal
@@ -611,14 +658,14 @@ def install_rescue_handlers() -> Bool:
     var signals = rescue_signals()
     var ok = True
     for slot in range(len(signals)):
-        if external_call["sigaction", Int32](Int32(signals[slot]), Int(action.unsafe_ptr()), KMS_RESCUE + R_OLD_ACTIONS + slot * SIGACTION_BYTES) != 0:
+        if external_call["sigaction", Int32](Int32(signals[slot]), Int(action.unsafe_ptr()), base + R_OLD_ACTIONS + slot * SIGACTION_BYTES) != 0:
             ok = False
     _ = action^
     var exit_slot = List[Int](length=1, fill=0)
     Pointer[KmsExitHandler, origin=MutAnyOrigin](unsafe_from_address=Int(exit_slot.unsafe_ptr()))[unsafe_offset=0] = kms_at_exit
     _ = external_call["atexit", Int32](exit_slot[0])
     _ = exit_slot^
-    rstore(R_HANDLERS, 1)
+    Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=base + R_HANDLERS)[unsafe_offset=0] = 1
     return ok
 
 
@@ -1095,8 +1142,11 @@ struct KmsWindow(Copyable, Movable):
             return
         if kget32(crtc, 16) == 0 or kget32(crtc, 32) == 0:
             return  # nothing was shown; dropping master lets the fbdev console restore itself
-        Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=KMS_RESCUE + R_CONNECTOR)[unsafe_offset=0] = UInt32(self.connector_id)
-        kput64(crtc, 0, KMS_RESCUE + R_CONNECTOR)
+        var base = _rescue_base()
+        if base == 0:
+            return
+        Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=base + R_CONNECTOR)[unsafe_offset=0] = UInt32(self.connector_id)
+        kput64(crtc, 0, base + R_CONNECTOR)
         kput32(crtc, 8, 1)
         for index in range(DRM_CRTC_BYTES):
             rstore_byte(R_SAVED_CRTC + index, crtc[index])

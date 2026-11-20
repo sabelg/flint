@@ -105,6 +105,9 @@ struct GpuBuffer(Copyable, Movable):
     var cpu_address: Int
     var vk_buffer: Int  # the Vulkan backend's two objects, which have no GPU address
     var vk_memory: Int
+    var vk_memory_offset: Int
+    var vk_suballoc_block: Int
+    var vk_suballoc_meta: UInt32
     var tag: Int  # the memory tag it is charged to (core/memory.mojo), -1 when not charged
     var vram: Bool
 
@@ -115,6 +118,9 @@ struct GpuBuffer(Copyable, Movable):
         self.cpu_address = cpu_address
         self.vk_buffer = 0
         self.vk_memory = 0
+        self.vk_memory_offset = 0
+        self.vk_suballoc_block = -1
+        self.vk_suballoc_meta = 0xFFFFFFFF
         self.tag = -1
         self.vram = False
 
