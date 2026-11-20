@@ -14,19 +14,16 @@ and bit-exact `serialize` / `deserialize` snapshots for rollback & PIE.
 """
 from std.collections import List
 from std.math import sqrt, abs, min, max
-from std.ffi import external_call
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import set_sim_float_mode
 from flint.core.detsort import stable_order, mix64
 from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
-from flint.physics.defaults import JOINT_HERTZ, JOINT_DAMPING_RATIO
 from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC, CAT_SENSOR, CAT_ALL
 from flint.physics.broadphase import (
     BroadphaseInput,
     BroadphaseNode8,
-    find_pairs,
     find_pairs_into_bvh8,
     boxes_overlap,
     _BpBinNode,
@@ -70,28 +67,9 @@ from flint.physics.solver import (
     Manifold,
     ContactPoint as SolverContactPoint,
     SolveResult,
-    WideContacts,
-    SolverStage,
-    SolverRun,
     SPECULATIVE_DISTANCE,
-    BODY_BATCHES_PER_BLOCK,
-    CONTACT_BATCHES_PER_BLOCK,
-    PARALLEL_MIN_BATCHES,
-    SOLVER_WORD_STRIDE,
-    STAGE_DONE,
-    STAGE_INTEGRATE_VELOCITIES,
-    STAGE_WARM,
-    STAGE_SOLVE,
-    STAGE_INTEGRATE_POSITIONS,
-    STAGE_RELAX,
-    STAGE_RESTITUTION,
-    solver_softness,
-    _condition_supported_mass_ratios,
-    _restore_supported_mass_ratios,
-    execute_block,
-    pool_workers,
-    count_cpus,
     solve,
+    solve_with_six_dof,
     ccd_cpus,
 )
 from flint.physics.joints import (
@@ -99,7 +77,6 @@ from flint.physics.joints import (
     JointDef,
     JointRow,
     Softness,
-    make_soft,
     JOINT_WELD,
     JOINT_DISTANCE,
     JOINT_WORLD,
@@ -659,281 +636,52 @@ def _negate_manifold_normals(mut m: ContactManifold):
         m.p3.normal = -m.p3.normal
 
 
-struct _S6SolverCtx(Movable):
-    """Sub-stepped solver context interleaving `SixDofMotorJoint` warm/solve/relax inside every substep."""
-    var base: SolverRun
-    var s6_ptr: Int
-    var s6_indices: List[Int]
-    var s6_sa: List[Int]
-    var s6_sb: List[Int]
-    var broken_s6_ptr: Int
-
-    def __init__(out self):
-        self.base = SolverRun()
-        self.s6_ptr = 0
-        self.s6_indices = List[Int]()
-        self.s6_sa = List[Int]()
-        self.s6_sb = List[Int]()
-        self.broken_s6_ptr = 0
+comptime _NARROWPHASE_PAIRS_PER_JOB: Int = 32
+comptime _NARROWPHASE_PARALLEL_MIN: Int = 64
 
 
-def _execute_s6_block(ctx: _S6SolverCtx, stage: SolverStage, block: Int):
-    execute_block(ctx.base, stage, block)
-    if stage.joints_only and ctx.s6_ptr != 0:
-        ref s6_list = Pointer[List[SixDofMotorJoint], origin=MutAnyOrigin](unsafe_from_address=ctx.s6_ptr)[unsafe_offset=0]
-        ref bodies = Pointer[SolverBodies, origin=MutAnyOrigin](unsafe_from_address=ctx.base.bodies)[unsafe_offset=0]
-        for k in range(len(ctx.s6_indices)):
-            var ji = ctx.s6_indices[k]
-            if s6_list[ji].broken:
-                continue
-            var sa = ctx.s6_sa[k]
-            var sb = ctx.s6_sb[k]
-            if stage.kind == STAGE_WARM:
-                s6_list[ji].warm_start(sa, sb, bodies)
-            elif stage.kind == STAGE_SOLVE:
-                s6_list[ji].solve_step(sa, sb, bodies, ctx.base.h, True)
-                if s6_list[ji].broken and ctx.broken_s6_ptr != 0:
-                    Pointer[List[Int], origin=MutAnyOrigin](unsafe_from_address=ctx.broken_s6_ptr)[unsafe_offset=0].append(ji)
-            elif stage.kind == STAGE_RELAX:
-                s6_list[ji].solve_step(sa, sb, bodies, ctx.base.h, False)
+struct _NarrowphaseJobShared(Movable):
+    var world_addr: Int
+    var pairs_addr: Int
+    var out_lists_addr: Int
+    var n_pairs: Int
+    var n_rows: Int
+    var speculative_dist: Float32
+
+    def __init__(
+        out self,
+        world_addr: Int,
+        pairs_addr: Int,
+        out_lists_addr: Int,
+        n_pairs: Int,
+        n_rows: Int,
+        speculative_dist: Float32,
+    ):
+        self.world_addr = world_addr
+        self.pairs_addr = pairs_addr
+        self.out_lists_addr = out_lists_addr
+        self.n_pairs = n_pairs
+        self.n_rows = n_rows
+        self.speculative_dist = speculative_dist
 
 
-def _work_s6_stage(ctx: _S6SolverCtx, index: Int):
-    var stage = ctx.base.stages[index]
-    var claimed = ctx.base.word(1 + index * 2)
-    var done = ctx.base.word(2 + index * 2)
-    while True:
-        var block = Int(claimed[unsafe_offset=0].fetch_add(1))
-        if block >= stage.blocks:
-            return
-        _execute_s6_block(ctx, stage, block)
-        _ = done[unsafe_offset=0].fetch_add(1)
-
-
-def _lead_s6(ctx: _S6SolverCtx):
-    for index in range(len(ctx.base.stages)):
-        ctx.base.word(0)[unsafe_offset=0].store(Int64(index + 1))
-        _work_s6_stage(ctx, index)
-        var done = ctx.base.word(2 + index * 2)
-        var blocks = Int64(ctx.base.stages[index].blocks)
-        var spins = 0
-        while done[unsafe_offset=0].load() < blocks:
-            spins += 1
-            if spins > 2000:
-                _ = external_call["sched_yield", Int32]()
-    ctx.base.word(0)[unsafe_offset=0].store(Int64(STAGE_DONE))
-
-
-def _help_s6(ctx: _S6SolverCtx):
-    var cpu = Int(external_call["sched_getcpu", Int32]())
-    if cpu >= 0 and cpu < len(ctx.base.cpus) and not ctx.base.cpus[cpu]:
-        return
-    var seen = Int64(0)
-    var spins = 0
-    while True:
-        var current = ctx.base.word(0)[unsafe_offset=0].load()
-        if current >= Int64(STAGE_DONE):
-            return
-        if current != seen and current > 0:
-            seen = current
-            _work_s6_stage(ctx, Int(current) - 1)
-            spins = 0
+def _run_narrowphase_job(context: Int, chunk: Int):
+    ref sh = Pointer[_NarrowphaseJobShared, origin=MutAnyOrigin](unsafe_from_address=context)[unsafe_offset=0]
+    ref world = Pointer[PhysicsWorld, origin=MutAnyOrigin](unsafe_from_address=sh.world_addr)[unsafe_offset=0]
+    ref pairs = Pointer[List[Int], origin=MutAnyOrigin](unsafe_from_address=sh.pairs_addr)[unsafe_offset=0]
+    ref out_lists = Pointer[List[List[ContactManifold]], origin=MutAnyOrigin](unsafe_from_address=sh.out_lists_addr)[unsafe_offset=0]
+    ref out_buf = out_lists[chunk]
+    var first = chunk * _NARROWPHASE_PAIRS_PER_JOB
+    var end = min(sh.n_pairs, first + _NARROWPHASE_PAIRS_PER_JOB)
+    var n_rows = sh.n_rows
+    var spec = sh.speculative_dist
+    for pk in range(first, end):
+        var code = pairs[pk]
+        var row_a = code // n_rows
+        var row_b = code % n_rows
+        if world.bodies[row_a].is_static and world.bodies[row_b].is_static:
             continue
-        spins += 1
-        if spins > 2000:
-            _ = external_call["sched_yield", Int32]()
-        if spins > 200000:
-            return
-
-
-def _run_s6_solver_task(context: Int, chunk: Int):
-    ref ctx = Pointer[_S6SolverCtx, origin=MutAnyOrigin](unsafe_from_address=context)[unsafe_offset=0]
-    if chunk == 0:
-        _lead_s6(ctx)
-    else:
-        _help_s6(ctx)
-
-
-def _solve_with_six_dof(
-    mut bodies: SolverBodies,
-    mut manifolds: List[Manifold],
-    mut joints: List[Joint],
-    joint_rows: List[JointRow],
-    mut six_dof_joints: List[SixDofMotorJoint],
-    s6_indices: List[Int],
-    s6_sa: List[Int],
-    s6_sb: List[Int],
-    mut broken_s6_out: List[Int],
-    settings: SolverSettings,
-    dt: Float32,
-    pool_address: Int,
-    cpus: List[Bool],
-) -> SolveResult:
-    """Executes the full Soft-Step solver with `SixDofMotorJoint`s solved inside every `h = dt / substeps` substep."""
-    set_sim_float_mode()
-    var result = SolveResult()
-    var substeps = max(1, settings.substeps)
-    var h = dt / Float32(substeps)
-    var inv_h = Float32(1.0) / h
-    var soft = solver_softness(settings, h)
-
-    var saved_masses = _condition_supported_mass_ratios(bodies, manifolds)
-
-    var serial_list = List[Int]()
-    var colour_lists = List[List[Int]]()
-    for _ in range(GRAPH_COLOURS):
-        colour_lists.append(List[Int]())
-    for index in range(len(manifolds)):
-        var colour = manifolds[index].colour
-        if colour >= GRAPH_COLOURS or colour < 0:
-            serial_list.append(index)
-            result.overflow += 1
-        else:
-            colour_lists[colour].append(index)
-    if settings.force_serial:
-        for colour in range(GRAPH_COLOURS):
-            for index in colour_lists[colour]:
-                serial_list.append(index)
-            colour_lists[colour].clear()
-
-    var total = len(serial_list)
-    for colour in range(GRAPH_COLOURS):
-        total += (len(colour_lists[colour]) + LANES - 1) // LANES
-    var contacts = WideContacts()
-    contacts.reset(total, bodies.static_index)
-    var batch = 0
-    for index in serial_list:
-        contacts.put(
-            batch, 0, index, manifolds[index], manifolds[index].ia, manifolds[index].ib,
-            bodies, soft[0], soft[1], settings.warm_starting, settings.rolling_resistance,
-        )
-        batch += 1
-    var serial_batches = batch
-    var colour_first = List[Int](length=GRAPH_COLOURS, fill=0)
-    var colour_batches = List[Int](length=GRAPH_COLOURS, fill=0)
-    for colour in range(GRAPH_COLOURS):
-        colour_first[colour] = batch
-        var lane = 0
-        for index in colour_lists[colour]:
-            contacts.put(
-                batch, lane, index, manifolds[index], manifolds[index].ia, manifolds[index].ib,
-                bodies, soft[0], soft[1], settings.warm_starting, settings.rolling_resistance,
-            )
-            lane += 1
-            if lane == LANES:
-                lane = 0
-                batch += 1
-        if lane > 0:
-            batch += 1
-        colour_batches[colour] = batch - colour_first[colour]
-    result.batches = batch
-
-    var rows = List[JointRow]()
-    var nyquist = Float32(0.25) / h
-    for row in joint_rows:
-        if row.joint < 0 or row.joint >= len(joints):
-            continue
-        if joints[row.joint].broken:
-            continue
-        var j = joints[row.joint]
-        var linear_hertz = min(j.linear_hertz if j.linear_hertz > 0 else JOINT_HERTZ, nyquist)
-        var angular_hertz = min(j.angular_hertz if j.angular_hertz > 0 else JOINT_HERTZ, nyquist)
-        var damping = j.damping if j.damping > 0 else JOINT_DAMPING_RATIO
-        rows.append(
-            JointRow(
-                row.joint, row.a, row.b,
-                make_soft(linear_hertz, damping, h),
-                make_soft(angular_hertz, damping, h),
-            )
-        )
-        joints[row.joint].force_impulse = Vec3()
-        joints[row.joint].torque_impulse = Vec3()
-        if not settings.warm_starting:
-            joints[row.joint].linear_impulse = Vec3()
-            joints[row.joint].angular_impulse = Vec3()
-            joints[row.joint].axial_impulse = 0
-            joints[row.joint].motor_impulse = 0
-            joints[row.joint].lower_impulse = 0
-            joints[row.joint].upper_impulse = 0
-            joints[row.joint].swing_impulse = 0
-
-    if not settings.warm_starting:
-        for k in range(len(s6_indices)):
-            six_dof_joints[s6_indices[k]].reset_warm_impulses()
-
-    var broken_indices = List[Int]()
-    var ctx = _S6SolverCtx()
-    ctx.base.bodies = Int(Pointer(to=bodies))
-    ctx.base.contacts = Int(Pointer(to=contacts))
-    ctx.base.joints = Int(Pointer(to=joints)) if len(rows) > 0 else 0
-    ctx.base.joint_rows = Int(Pointer(to=rows))
-    ctx.base.broken_out = Int(Pointer(to=broken_indices))
-    ctx.base.h = h
-    ctx.base.inv_h = inv_h
-    ctx.base.settings = settings
-    ctx.base.cpus = cpus.copy()
-    ctx.s6_ptr = Int(Pointer(to=six_dof_joints))
-    ctx.s6_indices = s6_indices.copy()
-    ctx.s6_sa = s6_sa.copy()
-    ctx.s6_sb = s6_sb.copy()
-    ctx.broken_s6_ptr = Int(Pointer(to=broken_s6_out))
-
-    var body_batches = bodies.padded // LANES
-    var body_blocks = (body_batches + BODY_BATCHES_PER_BLOCK - 1) // BODY_BATCHES_PER_BLOCK
-    var has_any_joints = len(rows) > 0 or len(s6_indices) > 0
-    var kinds = [STAGE_WARM, STAGE_SOLVE, STAGE_RELAX]
-    for _ in range(substeps):
-        if body_batches > 0:
-            ctx.base.stages.append(SolverStage(STAGE_INTEGRATE_VELOCITIES, 0, body_batches, body_blocks, False, False))
-        for pass_index in range(3):
-            var kind = kinds[pass_index]
-            if kind == STAGE_RELAX:
-                if body_batches > 0:
-                    ctx.base.stages.append(SolverStage(STAGE_INTEGRATE_POSITIONS, 0, body_batches, body_blocks, False, False))
-                if not settings.relax:
-                    continue
-            if serial_batches > 0:
-                ctx.base.stages.append(SolverStage(kind, 0, serial_batches, 1, True, False))
-            for colour in range(GRAPH_COLOURS):
-                if colour_batches[colour] > 0:
-                    var blocks = (colour_batches[colour] + CONTACT_BATCHES_PER_BLOCK - 1) // CONTACT_BATCHES_PER_BLOCK
-                    ctx.base.stages.append(SolverStage(kind, colour_first[colour], colour_batches[colour], blocks, False, False))
-            if has_any_joints:
-                ctx.base.stages.append(SolverStage(kind, 0, 0, 1, True, True))
-
-    if serial_batches > 0:
-        ctx.base.stages.append(SolverStage(STAGE_RESTITUTION, 0, serial_batches, 1, True, False))
-    for colour in range(GRAPH_COLOURS):
-        if colour_batches[colour] > 0:
-            var blocks = (colour_batches[colour] + CONTACT_BATCHES_PER_BLOCK - 1) // CONTACT_BATCHES_PER_BLOCK
-            ctx.base.stages.append(SolverStage(STAGE_RESTITUTION, colour_first[colour], colour_batches[colour], blocks, False, False))
-
-    ctx.base.words = List[Int64](length=(1 + 2 * len(ctx.base.stages)) * SOLVER_WORD_STRIDE, fill=0)
-    result.stages = len(ctx.base.stages)
-
-    var tasks = 1
-    var work = result.batches + body_batches
-    if work >= PARALLEL_MIN_BATCHES and pool_address != 0:
-        tasks = min(1 + pool_workers(pool_address), max(1, count_cpus(cpus) // 2))
-        tasks = max(1, min(tasks, work // 4))
-    result.tasks = tasks
-    if tasks <= 1:
-        _lead_s6(ctx)
-    else:
-        ref pool = Pointer[JobPool, origin=MutAnyOrigin](unsafe_from_address=pool_address)[unsafe_offset=0]
-        run_parallel_ctx(pool, tasks, ctx, _run_s6_solver_task)
-    _ = ctx.base.tasks_run
-
-    for b in range(contacts.batches):
-        for lane in range(LANES):
-            var index = contacts.manifold[b * LANES + lane]
-            if index >= 0:
-                contacts.take(b, lane, manifolds[index])
-
-    _restore_supported_mass_ratios(bodies, saved_masses)
-    result.broken_joints = broken_indices^
-    _ = len(rows)
-    return result^
+        world._collide_pair_into(row_a, row_b, out_buf, spec)
 
 
 struct PhysicsWorld(Movable):
@@ -3352,21 +3100,56 @@ struct PhysicsWorld(Movable):
 
         var bp_res = find_pairs_into_bvh8(bp_in, self.broadphase_nodes, pool_address)
 
-        # 4. Discrete + Speculative Narrowphase & wake sleeping dynamic bodies hit by awake/moving bodies
+        # 4. Discrete + Speculative Narrowphase (parallel over JobPool with deterministic chunk-order merge)
         var raw_manifolds = List[ContactManifold]()
-        for pk in range(len(bp_res.pairs)):
-            var code = bp_res.pairs[pk]
-            var row_a = code // n_rows
-            var row_b = code % n_rows
-            if self.bodies[row_a].is_static and self.bodies[row_b].is_static:
-                continue
-            var before_m = len(raw_manifolds)
-            self._collide_pair_into(row_a, row_b, raw_manifolds, SPECULATIVE_DISTANCE)
-            if len(raw_manifolds) > before_m:
-                if not self.bodies[row_a].is_static and not self.bodies[row_a].awake:
-                    self.wake(row_a)
-                if not self.bodies[row_b].is_static and not self.bodies[row_b].awake:
-                    self.wake(row_b)
+        var n_pairs = len(bp_res.pairs)
+        if pool_address != 0 and n_pairs >= _NARROWPHASE_PARALLEL_MIN:
+            var job_count = (n_pairs + _NARROWPHASE_PAIRS_PER_JOB - 1) // _NARROWPHASE_PAIRS_PER_JOB
+            var chunk_manifolds = List[List[ContactManifold]](capacity=job_count)
+            for _ in range(job_count):
+                chunk_manifolds.append(List[ContactManifold]())
+            var np_shared = _NarrowphaseJobShared(
+                Int(Pointer(to=self)),
+                Int(Pointer(to=bp_res.pairs)),
+                Int(Pointer(to=chunk_manifolds)),
+                n_pairs,
+                n_rows,
+                SPECULATIVE_DISTANCE,
+            )
+            ref pool = Pointer[JobPool, origin=MutAnyOrigin](unsafe_from_address=pool_address)[unsafe_offset=0]
+            run_parallel_ctx(pool, job_count, np_shared, _run_narrowphase_job)
+            _ = np_shared.n_pairs
+            _ = len(bp_res.pairs)
+            var total_m = 0
+            for j in range(job_count):
+                total_m += len(chunk_manifolds[j])
+            if total_m > 0:
+                raw_manifolds.reserve(total_m)
+                for j in range(job_count):
+                    ref sub = chunk_manifolds[j]
+                    for k in range(len(sub)):
+                        var ra = sub[k].body_a
+                        var rb = sub[k].body_b
+                        if not self.bodies[ra].is_static and not self.bodies[ra].awake:
+                            self.wake(ra)
+                        if not self.bodies[rb].is_static and not self.bodies[rb].awake:
+                            self.wake(rb)
+                        raw_manifolds.append(sub[k].copy())
+            _ = len(chunk_manifolds)
+        else:
+            for pk in range(n_pairs):
+                var code = bp_res.pairs[pk]
+                var row_a = code // n_rows
+                var row_b = code % n_rows
+                if self.bodies[row_a].is_static and self.bodies[row_b].is_static:
+                    continue
+                var before_m = len(raw_manifolds)
+                self._collide_pair_into(row_a, row_b, raw_manifolds, SPECULATIVE_DISTANCE)
+                if len(raw_manifolds) > before_m:
+                    if not self.bodies[row_a].is_static and not self.bodies[row_a].awake:
+                        self.wake(row_a)
+                    if not self.bodies[row_b].is_static and not self.bodies[row_b].awake:
+                        self.wake(row_b)
 
         # Wake bodies linked to awake/moving bodies via unbroken joints & SixDofMotorJoints
         for ji in range(len(self.joints)):
@@ -3754,7 +3537,7 @@ struct PhysicsWorld(Movable):
                 self.cpus,
             )
         else:
-            solve_res = _solve_with_six_dof(
+            solve_res = solve_with_six_dof(
                 sbodies,
                 solver_manifolds,
                 self.joints,

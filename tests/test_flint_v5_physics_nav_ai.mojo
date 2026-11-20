@@ -23,8 +23,10 @@ from std.time import monotonic
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import det_sin, det_cos, PI
 from flint.core.serial import BlobWriter, BlobReader, fnv64, float32_bits
+from flint.core.jobs import JobPool
 from flint.core.ik import angle_axis
 from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC, CAT_PROP_PIECE, CAT_ALL
+from flint.physics.water import eval_box_buoyancy_drag
 from flint.physics.bvh import Bvh8MeshCollider
 from flint.physics.narrowphase import ConvexHull, ContactManifold
 from flint.physics.shapes_v5 import (
@@ -52,6 +54,7 @@ from flint.nav import (
     NavObstacle,
     OffMeshLink,
     CrowdSimulator,
+    CrowdNavBridge,
     OFFMESH_JUMP,
 )
 from flint.ai import (
@@ -1187,6 +1190,133 @@ def test_f_phase0_phase1_regressions() raises:
     assert_equal(st.running_node, -1)
 
 
+def test_g_wave2_unification_and_parallel_regressions() raises:
+    var dt = Float32(1.0 / 60.0)
+    var pool = JobPool()
+    _ = pool.start(4)
+    var pool_addr = Int(Pointer(to=pool))
+
+    # 1. Unified SixDofMotorJoint solver determinism (serial vs JobPool)
+    var ws6_a = PhysicsWorld(gravity=-9.81)
+    var ws6_b = PhysicsWorld(gravity=-9.81)
+    for k in range(2):
+        ref w = ws6_a if k == 0 else ws6_b
+        _ = w.add_box(Vec3(0.0, -0.5, 0.0), Vec3(10.0, 0.5, 10.0), mass=0.0)
+        _ = w.add_box(Vec3(0.0, 3.0, 0.0), Vec3(0.3, 0.3, 0.3), mass=0.0)
+        var arm_s = w.add_box(Vec3(1.0, 3.0, 0.0), Vec3(0.5, 0.15, 0.15), mass=2.0)
+        var j6 = SixDofMotorJoint()
+        j6.body_b = w.bodies[arm_s].id
+        j6.local_anchor_a = Vec3(0.5, 3.0, 0.0)
+        j6.local_anchor_b = Vec3(-0.5, 0.0, 0.0)
+        j6.enable_linear_limit = True
+        j6.linear_lower = Vec3(-0.02, -0.02, -0.02)
+        j6.linear_upper = Vec3(0.02, 0.02, 0.02)
+        j6.linear_hertz = 12.0
+        j6.linear_damping = 1.0
+        j6.enable_angular_drive = True
+        j6.angular_target = angle_axis(0.6, Vec3(0.0, 0.0, 1.0))
+        j6.angular_hertz = 6.0
+        j6.angular_damping = 1.0
+        _ = w.add_six_dof_joint(j6^)
+        w.rebuild_broadphase()
+    for _ in range(40):
+        ws6_a.step(dt, 0)
+        ws6_b.step(dt, pool_addr)
+    var bw_s6a = BlobWriter(); ws6_a.serialize(bw_s6a)
+    var bw_s6b = BlobWriter(); ws6_b.serialize(bw_s6b)
+    assert_equal(fnv64(bw_s6a.data), fnv64(bw_s6b.data))
+    assert_true(ws6_a.bodies[2].pos.y > Float32(1.8))
+
+    # 2. Parallel narrowphase determinism (>= 64 broadphase pairs, serial vs 4-worker JobPool)
+    var wp_ser = PhysicsWorld(gravity=-9.81)
+    var wp_par = PhysicsWorld(gravity=-9.81)
+    for k in range(2):
+        ref w = wp_ser if k == 0 else wp_par
+        _ = w.add_box(Vec3(0.0, -0.5, 0.0), Vec3(12.0, 0.5, 12.0), mass=0.0)
+        for ix in range(4):
+            for iy in range(4):
+                for iz in range(4):
+                    var px = (Float32(ix) - Float32(1.5)) * Float32(0.85)
+                    var py = Float32(0.55) + Float32(iy) * Float32(0.85)
+                    var pz = (Float32(iz) - Float32(1.5)) * Float32(0.85)
+                    if ((ix + iy + iz) & 1) == 0:
+                        _ = w.add_box(Vec3(px, py, pz), Vec3(0.38, 0.38, 0.38), mass=1.0)
+                    else:
+                        _ = w.add_sphere(Vec3(px, py, pz), 0.38, mass=1.0)
+        w.rebuild_broadphase()
+    for _ in range(30):
+        wp_ser.step(dt, 0)
+        wp_par.step(dt, pool_addr)
+    var bw_ser = BlobWriter(); wp_ser.serialize(bw_ser)
+    var bw_par = BlobWriter(); wp_par.serialize(bw_par)
+    assert_equal(fnv64(bw_ser.data), fnv64(bw_par.data))
+
+    pool.stop()
+
+    # 3. Water buoyancy AABB early-out for dry bodies vs submerged buoyancy
+    var dry_w = eval_box_buoyancy_drag(
+        Vec3(0.0, 5.0, 0.0), Quat(), Vec3(0.5, 0.5, 0.5),
+        Vec3(1.0, 0.0, 0.0), Vec3(), Float32(1.23), water_y=0.0, use_waves=True,
+    )
+    assert_equal(dry_w.submerged_fraction, Float32(0.0))
+    assert_equal(dry_w.force.length_squared(), Float32(0.0))
+    var wet_w = eval_box_buoyancy_drag(
+        Vec3(0.0, -0.5, 0.0), Quat(), Vec3(0.5, 0.5, 0.5),
+        Vec3(), Vec3(), Float32(1.23), water_y=0.0, use_waves=True,
+    )
+    assert_true(wet_w.submerged_fraction > Float32(0.5) and wet_w.force.y > Float32(1000.0))
+
+    # 4. NavMesh binary serialize / deserialize bit-exact round-trip
+    var wn = PhysicsWorld(gravity=0.0)
+    _ = wn.add_box(Vec3(0.0, -0.25, 0.0), Vec3(10.0, 0.25, 10.0), mass=0.0)
+    _ = wn.add_box(Vec3(0.0, 1.0, 0.0), Vec3(1.0, 1.0, 3.0), mass=0.0)  # central divider wall
+    wn.rebuild_broadphase()
+    var ncfg = NavMeshConfig()
+    ncfg.cell_size = 0.5
+    ncfg.tile_size = 8
+    var nav1 = NavMesh.build_from_physics(wn, ncfg)
+    _ = nav1.add_off_mesh_link(OffMeshLink(77, Vec3(-4.0, 0.0, 0.0), Vec3(4.0, 0.0, 0.0), 0.6, OFFMESH_JUMP))
+    var nav_bw1 = BlobWriter()
+    nav1.serialize(nav_bw1)
+    var nav_br = BlobReader(nav_bw1.data.copy())
+    var nav2 = NavMesh()
+    nav2.deserialize(nav_br)
+    var nav_bw2 = BlobWriter()
+    nav2.serialize(nav_bw2)
+    assert_equal(fnv64(nav_bw1.data), fnv64(nav_bw2.data))
+    assert_equal(len(nav2.polys), len(nav1.polys))
+    assert_equal(len(nav2.tiles), len(nav1.tiles))
+    var p1 = nav1.find_path(Vec3(-6.0, 0.0, -5.0), Vec3(6.0, 0.0, 5.0))
+    var p2 = nav2.find_path(Vec3(-6.0, 0.0, -5.0), Vec3(6.0, 0.0, 5.0))
+    assert_true(p1.found and p2.found)
+    assert_equal(len(p1.waypoints), len(p2.waypoints))
+    assert_true(abs(p1.total_length - p2.total_length) < Float32(1.0e-4))
+
+    # 5a. Multi-level ORCA Y-band vertical separation (stacked floors do not collide)
+    var crowd_y = CrowdSimulator()
+    crowd_y.agent_height = 2.0
+    var a_low = crowd_y.add_agent(Vec3(-3.0, 0.0, 0.0), 0.4, 3.0, Vec3(3.0, 0.0, 0.0))
+    var a_high = crowd_y.add_agent(Vec3(3.0, 3.0, 0.0), 0.4, 3.0, Vec3(-3.0, 3.0, 0.0))
+    for _ in range(120):
+        crowd_y.step_orca_simd8(dt)
+    assert_equal(crowd_y.count_overlaps(), 0)
+    # Agents on different floors must cross straight past each other with near-zero Z deflection!
+    assert_true(crowd_y.agent_position(a_low).x > Float32(2.0))
+    assert_true(crowd_y.agent_position(a_high).x < Float32(-2.0))
+    assert_true(abs(crowd_y.agent_position(a_low).z) < Float32(0.25))
+    assert_true(abs(crowd_y.agent_position(a_high).z) < Float32(0.25))
+
+    # 5b. NavMesh -> ORCA CrowdNavBridge corridor following around central wall
+    var crowd_nav = CrowdSimulator()
+    var bridge = CrowdNavBridge()
+    var b0 = bridge.add_agent(crowd_nav, nav2, Vec3(-6.0, 0.0, 0.0), Vec3(6.0, 0.0, 0.0), 0.35, 4.0)
+    var b1 = bridge.add_agent(crowd_nav, nav2, Vec3(-6.0, 0.0, 1.5), Vec3(6.0, 0.0, -1.5), 0.35, 4.0)
+    for _ in range(360):
+        bridge.update_and_step(crowd_nav, nav2, dt)
+    assert_equal(crowd_nav.count_overlaps(), 0)
+    assert_true(bridge.is_arrived(b0, crowd_nav) and bridge.is_arrived(b1, crowd_nav))
+
+
 def main() raises:
     var t0 = monotonic()
     test_a_snapshot_determinism_queries_triggers_ccd()
@@ -1201,5 +1331,7 @@ def main() raises:
     print("[PASS] (e) BehaviorTree reactive abort + UtilityAI + SpatialPerception + CameraRig + .flanim + Socket + FootIK + RagdollSM")
     test_f_phase0_phase1_regressions()
     print("[PASS] (f) Phase 0+1 regressions: Compound multi-normal, KCC vs Compound, CCD bilateral momentum, Socket no double-step, Tile-indexed NavMesh, Camera shake wall clamp, BT_NODE_PARALLEL")
+    test_g_wave2_unification_and_parallel_regressions()
+    print("[PASS] (g) Wave 2 regressions: Unified SixDofMotorJoint determinism, Parallel narrowphase determinism, Water early-out, NavMesh binary round-trip, Multi-level ORCA Y-band & CrowdNavBridge")
     var ms = Float64(monotonic() - t0) / 1.0e6
     print("ALL FLINT V5 PHYSICS / KCC / NAVMESH / ORCA / AI / CAMERA / FLANIM_ECS TESTS PASSED in", ms, "ms!")

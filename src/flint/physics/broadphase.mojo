@@ -13,8 +13,8 @@ packets:
 from std.collections import List
 from std.math import floor, min, max, abs
 from flint.core.math import Vec3
-from flint.core.jobs import run_jobs_affine
-from flint.core.profiler import ZONE_BROADPHASE
+from flint.core.jobs import JobPool
+from flint.core.ecs import run_parallel_ctx
 from flint.physics.filter import CollisionFilter
 
 comptime CELL_SIZE: Int = 8               # preserved for legacy spatial-hash callers
@@ -382,7 +382,7 @@ def _collapse_bp_bvh8(bin_nodes: List[_BpBinNode], bin_idx: Int, mut out8: List[
     return out_idx
 
 
-struct _BpQueryShared:
+struct _BpQueryShared(Movable):
     var input_addr: Int
     var nodes_addr: Int
     var awake_addr: Int
@@ -577,6 +577,14 @@ def find_pairs_into_bvh8(
     _ = bin_nodes^
 
     var job_count = (awake_count + ROWS_PER_JOB - 1) // ROWS_PER_JOB
+    if jobs == 0 or job_count <= 1:
+        _query_awake_chunk(input, out_nodes8, awake_rows, 0, awake_count, rows, result.pairs)
+        _sort_and_dedup_pairs(result.pairs)
+        result.cells = len(out_nodes8)
+        result.wide = 0
+        result.jobs = 1
+        return result^
+
     var out_lists = List[List[Int]](capacity=job_count)
     for _ in range(job_count):
         out_lists.append(List[Int]())
@@ -589,7 +597,8 @@ def find_pairs_into_bvh8(
         rows,
         awake_count,
     )
-    run_jobs_affine(jobs, _run_bp_query_job, Int(Pointer(to=shared)), job_count, ZONE_BROADPHASE)
+    ref pool = Pointer[JobPool, origin=MutAnyOrigin](unsafe_from_address=jobs)[unsafe_offset=0]
+    run_parallel_ctx(pool, job_count, shared, _run_bp_query_job)
     _ = shared.rows
     _ = len(awake_rows)
     _ = input.rows()

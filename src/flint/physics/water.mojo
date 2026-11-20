@@ -14,6 +14,8 @@ comptime WATER_DENSITY: Float32 = 1.6
 comptime WATER_DRAG: Float32 = 2.4
 comptime RHO_SEAWATER_SI: Float32 = 1025.0
 comptime RHO_FRESHWATER_SI: Float32 = 1000.0
+# Strict upper bound on sum of the 8 Beaufort wave amplitudes (0.1594 m)
+comptime MAX_BEAUFORT_WAVE_AMP: Float32 = 0.165
 
 
 def floats(material_density: Float32) -> Bool:
@@ -122,6 +124,9 @@ def eval_sphere_buoyancy_drag(
 ) -> BuoyancyWrench:
     """Computes exact spherical-cap Archimedes buoyancy and quadratic drag in Beaufort waves."""
     var r = max(Float32(1.0e-4), radius)
+    var max_surface = water_y + (MAX_BEAUFORT_WAVE_AMP if use_waves else Float32(0.0))
+    if center.y - r >= max_surface:
+        return BuoyancyWrench(Vec3(), Vec3(), Float32(0.0), Float32(0.0), water_y)
     var eta = water_y
     var orb_vel = Vec3()
     if use_waves:
@@ -169,14 +174,16 @@ def eval_box_buoyancy_drag(
     var v_full = Float32(8.0) * hx * hy * hz
     var v_cell = v_full * Float32(1.0 / 27.0)
 
-    # Vertical span of a rotated 1/3 subcell
+    # Vertical span of the rotated box and of a 1/3 subcell
     var u0 = rot.rotate(Vec3(1, 0, 0))
     var u1 = rot.rotate(Vec3(0, 1, 0))
     var u2 = rot.rotate(Vec3(0, 0, 1))
-    var cell_hy = max(
-        Float32(1.0e-4),
-        (abs(u0.y) * hx + abs(u1.y) * hy + abs(u2.y) * hz) * Float32(2.0 / 3.0),
-    )
+    var box_hy = abs(u0.y) * hx + abs(u1.y) * hy + abs(u2.y) * hz
+    var max_surface = water_y + (MAX_BEAUFORT_WAVE_AMP if use_waves else Float32(0.0))
+    if center.y - box_hy >= max_surface:
+        return BuoyancyWrench(Vec3(), Vec3(), Float32(0.0), Float32(0.0), water_y)
+
+    var cell_hy = max(Float32(1.0e-4), box_hy * Float32(2.0 / 3.0))
     var cell_area = (Float32(4.0) * (hx * hy + hy * hz + hz * hx) * Float32(1.0 / 3.0)) * Float32(1.0 / 9.0)
 
     var center_eta = water_y

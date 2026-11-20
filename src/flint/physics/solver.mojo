@@ -41,6 +41,7 @@ from flint.physics.solver_bodies import (
 from flint.physics.joints import (
     Joint, JointRow, Softness, make_soft, joint_warm, joint_solve, joint_should_break,
 )
+from flint.physics.shapes_v5 import SixDofMotorJoint
 from flint.physics.islands import GRAPH_COLOURS, OVERFLOW_COLOUR
 from flint.physics.defaults import (
     PHYSICS_SUBSTEPS, CONTACT_HERTZ, CONTACT_DAMPING_RATIO, CONTACT_PUSH_MAX_SPEED, RESTITUTION_THRESHOLD,
@@ -724,6 +725,11 @@ struct SolverRun(Movable):
     var joints: Int
     var joint_rows: Int
     var broken_out: Int
+    var s6_joints: Int
+    var s6_indices: Int
+    var s6_sa: Int
+    var s6_sb: Int
+    var broken_s6_out: Int
     var stages: List[SolverStage]
     var words: List[Int64]   # each logical slot padded by SOLVER_WORD_STRIDE (8 x Int64 = 64 B)
     var h: Float32
@@ -738,6 +744,11 @@ struct SolverRun(Movable):
         self.joints = 0
         self.joint_rows = 0
         self.broken_out = 0
+        self.s6_joints = 0
+        self.s6_indices = 0
+        self.s6_sa = 0
+        self.s6_sb = 0
+        self.broken_s6_out = 0
         self.stages = List[SolverStage]()
         self.words = List[Int64]()
         self.h = 0
@@ -794,6 +805,25 @@ def execute_block(run: SolverRun, stage: SolverStage, block: Int):
                             broken.append(row.joint)
                 else:
                     joint_solve(joints[row.joint], row, bodies, run.h, False)
+        if run.s6_joints != 0:
+            ref s6_list = Pointer[List[SixDofMotorJoint], origin=MutAnyOrigin](unsafe_from_address=run.s6_joints)[unsafe_offset=0]
+            ref s6_idx = Pointer[List[Int], origin=MutAnyOrigin](unsafe_from_address=run.s6_indices)[unsafe_offset=0]
+            ref s6_sa = Pointer[List[Int], origin=MutAnyOrigin](unsafe_from_address=run.s6_sa)[unsafe_offset=0]
+            ref s6_sb = Pointer[List[Int], origin=MutAnyOrigin](unsafe_from_address=run.s6_sb)[unsafe_offset=0]
+            for k in range(len(s6_idx)):
+                var ji = s6_idx[k]
+                if s6_list[ji].broken:
+                    continue
+                var sa = s6_sa[k]
+                var sb = s6_sb[k]
+                if stage.kind == STAGE_WARM:
+                    s6_list[ji].warm_start(sa, sb, bodies)
+                elif stage.kind == STAGE_SOLVE:
+                    s6_list[ji].solve_step(sa, sb, bodies, run.h, True)
+                    if s6_list[ji].broken and run.broken_s6_out != 0:
+                        Pointer[List[Int], origin=MutAnyOrigin](unsafe_from_address=run.broken_s6_out)[unsafe_offset=0].append(ji)
+                elif stage.kind == STAGE_RELAX:
+                    s6_list[ji].solve_step(sa, sb, bodies, run.h, False)
         return
 
     var first = stage.first
@@ -1103,17 +1133,24 @@ struct SolveResult(Copyable, Movable):
         self.broken_joints = List[Int]()
 
 
-def solve(
+def _solve_impl(
     mut bodies: SolverBodies,
     mut manifolds: List[Manifold],
     mut joints: List[Joint],
     joint_rows: List[JointRow],
+    s6_joints_ptr: Int,
+    s6_indices_ptr: Int,
+    s6_sa_ptr: Int,
+    s6_sb_ptr: Int,
+    broken_s6_out_ptr: Int,
+    has_s6: Bool,
     settings: SolverSettings,
     dt: Float32,
     pool_address: Int,
     cpus: List[Bool],
 ) -> SolveResult:
-    """One tick of the Soft Step over the loaded bodies, coloured manifolds, and joints."""
+    """Unified Soft-Step solver over loaded bodies, coloured manifolds, standard `Joint`s,
+    and optional `SixDofMotorJoint`s solved inside every `h = dt / substeps` substep."""
     set_sim_float_mode()
     var result = SolveResult()
     var substeps = max(1, settings.substeps)
@@ -1210,6 +1247,11 @@ def solve(
     run.joints = Int(Pointer(to=joints)) if len(rows) > 0 else 0
     run.joint_rows = Int(Pointer(to=rows))
     run.broken_out = Int(Pointer(to=broken_indices))
+    run.s6_joints = s6_joints_ptr if has_s6 else 0
+    run.s6_indices = s6_indices_ptr
+    run.s6_sa = s6_sa_ptr
+    run.s6_sb = s6_sb_ptr
+    run.broken_s6_out = broken_s6_out_ptr
     run.h = h
     run.inv_h = inv_h
     run.settings = settings
@@ -1217,7 +1259,7 @@ def solve(
 
     var body_batches = bodies.padded // LANES
     var body_blocks = (body_batches + BODY_BATCHES_PER_BLOCK - 1) // BODY_BATCHES_PER_BLOCK
-    var has_joints = len(rows) > 0
+    var has_joints = len(rows) > 0 or has_s6
     var kinds = [STAGE_WARM, STAGE_SOLVE, STAGE_RELAX]
     for _ in range(substeps):
         if body_batches > 0:
@@ -1250,7 +1292,7 @@ def solve(
 
     var tasks = 1
     var work = result.batches + body_batches
-    if work >= PARALLEL_MIN_BATCHES:
+    if work >= PARALLEL_MIN_BATCHES and pool_address != 0:
         tasks = min(1 + pool_workers(pool_address), max(1, count_cpus(cpus) // 2))
         tasks = max(1, min(tasks, work // 4))
     result.tasks = tasks
@@ -1270,3 +1312,56 @@ def solve(
     result.broken_joints = broken_indices^
     _ = len(rows)
     return result^
+
+
+def solve(
+    mut bodies: SolverBodies,
+    mut manifolds: List[Manifold],
+    mut joints: List[Joint],
+    joint_rows: List[JointRow],
+    settings: SolverSettings,
+    dt: Float32,
+    pool_address: Int,
+    cpus: List[Bool],
+) -> SolveResult:
+    """One tick of the Soft Step over the loaded bodies, coloured manifolds, and joints."""
+    return _solve_impl(
+        bodies, manifolds, joints, joint_rows,
+        0, 0, 0, 0, 0, False,
+        settings, dt, pool_address, cpus,
+    )
+
+
+def solve_with_six_dof(
+    mut bodies: SolverBodies,
+    mut manifolds: List[Manifold],
+    mut joints: List[Joint],
+    joint_rows: List[JointRow],
+    mut six_dof_joints: List[SixDofMotorJoint],
+    s6_indices: List[Int],
+    s6_sa: List[Int],
+    s6_sb: List[Int],
+    mut broken_s6_out: List[Int],
+    settings: SolverSettings,
+    dt: Float32,
+    pool_address: Int,
+    cpus: List[Bool],
+) -> SolveResult:
+    """One tick of the Soft Step with `SixDofMotorJoint`s solved natively inside every substep."""
+    if not settings.warm_starting:
+        for k in range(len(s6_indices)):
+            six_dof_joints[s6_indices[k]].reset_warm_impulses()
+    var res = _solve_impl(
+        bodies, manifolds, joints, joint_rows,
+        Int(Pointer(to=six_dof_joints)),
+        Int(Pointer(to=s6_indices)),
+        Int(Pointer(to=s6_sa)),
+        Int(Pointer(to=s6_sb)),
+        Int(Pointer(to=broken_s6_out)),
+        len(s6_indices) > 0,
+        settings, dt, pool_address, cpus,
+    )
+    _ = len(s6_indices)
+    _ = len(s6_sa)
+    _ = len(s6_sb)
+    return res^
