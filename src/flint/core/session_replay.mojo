@@ -90,10 +90,24 @@ struct SessionRecorder(Movable):
         workbench changed before the next tick. Not ticks, so not counted."""
         if not self.active or len(records) == 0:
             return
+        var cap = self.buffer.capacity()
+        if len(self.buffer) > 0 and (
+            len(self.buffer) + len(records) >= FLUSH_AT
+            or len(self.buffer) + len(records) > cap
+        ):
+            self.flush()
+        if len(records) >= FLUSH_AT or len(records) > cap:
+            var owned = records.copy()
+            if not append_bytes(self.path, owned):
+                print("RECORDING_WRITE_FAILED " + self.path)
+            return
         self.buffer.extend(records.copy())
         if self.published:
+            store(ANCHOR + A_REPLAY_BUFFER, Int(self.buffer.unsafe_ptr()))
             store(ANCHOR + A_REPLAY_COMMITTED, len(self.buffer))
             store(ANCHOR + A_REPLAY_PENDING, len(self.buffer))
+        if len(self.buffer) >= FLUSH_AT:
+            self.flush()
 
     def flush(mut self):
         if not self.active or len(self.buffer) == 0:

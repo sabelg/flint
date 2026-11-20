@@ -26,7 +26,7 @@ from std.sys.info import CompilationTarget
 from std.time import monotonic
 
 comptime ANCHOR: Int = 0x5D5D00000000
-comptime ANCHOR_BYTES: Int = 4 << 20
+comptime ANCHOR_BYTES: Int = STACKS + STACK_SLOTS * STACK_BYTES
 comptime ANCHOR_MAGIC: Int = 0x31454641534453  # "SDSAFE1"
 
 # Words.
@@ -77,7 +77,7 @@ comptime FORMAT_BYTES: Int = 65536  # the log's flush buffer (core/log.mojo) fol
 comptime LOG_RING: Int = 131072
 comptime STACKS: Int = 2 << 20
 comptime STACK_BYTES: Int = 64 << 10
-comptime STACK_SLOTS: Int = 32  # the main thread and up to 31 workers at once
+comptime STACK_SLOTS: Int = 33  # the main thread and up to 32 workers (MAX_WORKERS + 1) at once
 
 # System call numbers (Linux x86-64 and aarch64).
 comptime IS_X86: Bool = CompilationTarget.is_x86()

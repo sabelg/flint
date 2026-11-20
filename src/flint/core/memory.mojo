@@ -393,15 +393,20 @@ struct Arena(Copyable, Movable):
     @always_inline
     def alloc(mut self, bytes: Int, align: Int = 16) -> Int:
         """The address of `bytes` bytes aligned to `align` (a power of two), or 0."""
-        var start = (self.used + align - 1) & ~(align - 1)
-        if bytes < 0 or start + bytes > self.capacity:
+        if bytes < 0 or self.base == 0:
+            self.overflows += 1
+            return 0
+        var a = align if align > 1 else 1
+        var aligned_addr = (self.base + self.used + a - 1) & ~(a - 1)
+        var start = aligned_addr - self.base
+        if start + bytes > self.capacity:
             self.overflows += 1
             return 0
         self.used = start + bytes
         if self.used > self.peak:
             self.peak = self.used
         self.allocations += 1
-        return self.base + start
+        return aligned_addr
 
     def reset(mut self):
         self.used = 0

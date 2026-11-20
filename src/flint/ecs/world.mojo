@@ -26,6 +26,8 @@ from flint.core.memory import MemCharge, MEM_ENTITIES
 from flint.core.serial import BlobWriter, BlobReader, fourcc, fast_hash64
 
 comptime MAX_COMPONENTS: Int = 256
+comptime _COMP_HASH_CAP: Int = 512
+comptime _COMP_HASH_MASK: Int = _COMP_HASH_CAP - 1
 comptime STORAGE_TABLE: Int = 0
 comptime STORAGE_SPARSE: Int = 1
 
@@ -543,22 +545,26 @@ def _rt_unlock():
 
 
 @always_inline
+def _lane_order_slot(lane: Int) -> Pointer[Atomic[Int64], MutAnyOrigin]:
+    var slot = lane & (_WORKER_ORDER_SLOTS - 1)
+    return _rt_word(_RT_WORKER_ORDER_OFF + slot * 64)
+
+
+@always_inline
 def _set_lane_implicit_order(lane: Int, implicit_order: UInt64):
     """Stores 1-based implicit entity order (`UInt64(order) + 1`, or `0` when inactive) in a
     dedicated 64-byte cache-line-padded slot for `lane`."""
     if not _ecs_runtime_ready():
         if not _ecs_runtime_ensure():
             return
-    var slot = lane & (_WORKER_ORDER_SLOTS - 1)
-    _rt_word(_RT_WORKER_ORDER_OFF + slot * 64)[unsafe_offset=0].store(Int64(implicit_order))
+    _lane_order_slot(lane)[unsafe_offset=0].store(Int64(implicit_order))
 
 
 @always_inline
 def _get_lane_implicit_order(lane: Int) -> UInt64:
     if not _ecs_runtime_ready():
         return 0
-    var slot = lane & (_WORKER_ORDER_SLOTS - 1)
-    return UInt64(_rt_word(_RT_WORKER_ORDER_OFF + slot * 64)[unsafe_offset=0].load())
+    return UInt64(_lane_order_slot(lane)[unsafe_offset=0].load())
 
 
 def _vault_store_clone(info: ComponentInfo, src_addr: Int) -> UInt64:
@@ -1398,6 +1404,9 @@ struct _ParDispatch1[C0: Component](Copyable, ImplicitlyCopyable, Movable):
     var kernel: def(Int, Int, Entity, Pointer[Self.C0, MutAnyOrigin], Int) thin -> None
     var user_ctx: Int
     var tid0: Int
+    var ex_sparse: BitSet256
+    var has_ex_sparse: Bool
+    var runtime_ready: Bool
 
 
 @fieldwise_init
@@ -1409,6 +1418,9 @@ struct _ParDispatch2[C0: Component, C1: Component](Copyable, ImplicitlyCopyable,
     var user_ctx: Int
     var tid0: Int
     var tid1: Int
+    var ex_sparse: BitSet256
+    var has_ex_sparse: Bool
+    var runtime_ready: Bool
 
 
 def _par_worker1[C0: Component](ctx_addr: Int, slice_idx: Int):
@@ -1417,17 +1429,31 @@ def _par_worker1[C0: Component](ctx_addr: Int, slice_idx: Int):
     if disp.pool_addr != 0:
         ref pool = Pointer[JobPool, ImmutAnyOrigin](unsafe_from_address=disp.pool_addr)[unsafe_offset=0]
         lane = pool.current_thread_index()
-    var prev_imp = _get_lane_implicit_order(lane)
+    var order_slot = _lane_order_slot(lane)
+    var prev_imp = UInt64(order_slot[unsafe_offset=0].load()) if disp.runtime_ready else UInt64(0)
     var sl = Pointer[_ParSlice1, ImmutAnyOrigin](unsafe_from_address=disp.slices_ptr)[unsafe_offset=slice_idx]
     var kfn = disp.kernel
     var ents = Pointer[Entity, ImmutAnyOrigin](unsafe_from_address=sl.entities_ptr)
-    if not sl.is_sparse0:
+    if not sl.is_sparse0 and not disp.has_ex_sparse:
         for i in range(sl.row_count):
             var r = sl.row_start + i
             var ord = sl.global_order_base + i
             var e = ents[unsafe_offset=r]
             var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sl.col0_ptr + r * sl.elem0_size)
-            _set_lane_implicit_order(lane, UInt64(ord) + 1)
+            if disp.runtime_ready:
+                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            kfn(lane, ord, e, p0, disp.user_ctx)
+    elif not sl.is_sparse0:
+        ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=disp.world_addr)[unsafe_offset=0]
+        for i in range(sl.row_count):
+            var r = sl.row_start + i
+            var ord = sl.global_order_base + i
+            var e = ents[unsafe_offset=r]
+            if world.entities[Int(e.index)].sparse_mask.intersects(disp.ex_sparse):
+                continue
+            var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sl.col0_ptr + r * sl.elem0_size)
+            if disp.runtime_ready:
+                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
             kfn(lane, ord, e, p0, disp.user_ctx)
     else:
         ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=disp.world_addr)[unsafe_offset=0]
@@ -1436,12 +1462,16 @@ def _par_worker1[C0: Component](ctx_addr: Int, slice_idx: Int):
             var r = sl.row_start + i
             var ord = sl.global_order_base + i
             var e = ents[unsafe_offset=r]
+            if disp.has_ex_sparse and world.entities[Int(e.index)].sparse_mask.intersects(disp.ex_sparse):
+                continue
             var di = sset.dense_index_of(e.index)
             if di >= 0:
                 var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sset.value_ptr(di))
-                _set_lane_implicit_order(lane, UInt64(ord) + 1)
+                if disp.runtime_ready:
+                    order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
                 kfn(lane, ord, e, p0, disp.user_ctx)
-    _set_lane_implicit_order(lane, prev_imp)
+    if disp.runtime_ready:
+        order_slot[unsafe_offset=0].store(Int64(prev_imp))
 
 
 def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
@@ -1450,18 +1480,20 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
     if disp.pool_addr != 0:
         ref pool = Pointer[JobPool, ImmutAnyOrigin](unsafe_from_address=disp.pool_addr)[unsafe_offset=0]
         lane = pool.current_thread_index()
-    var prev_imp = _get_lane_implicit_order(lane)
+    var order_slot = _lane_order_slot(lane)
+    var prev_imp = UInt64(order_slot[unsafe_offset=0].load()) if disp.runtime_ready else UInt64(0)
     var sl = Pointer[_ParSlice2, ImmutAnyOrigin](unsafe_from_address=disp.slices_ptr)[unsafe_offset=slice_idx]
     var kfn = disp.kernel
     var ents = Pointer[Entity, ImmutAnyOrigin](unsafe_from_address=sl.entities_ptr)
-    if not sl.is_sparse0 and not sl.is_sparse1:
+    if not sl.is_sparse0 and not sl.is_sparse1 and not disp.has_ex_sparse:
         for i in range(sl.row_count):
             var r = sl.row_start + i
             var ord = sl.global_order_base + i
             var e = ents[unsafe_offset=r]
             var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sl.col0_ptr + r * sl.elem0_size)
             var p1 = Pointer[C1, MutAnyOrigin](unsafe_from_address=sl.col1_ptr + r * sl.elem1_size)
-            _set_lane_implicit_order(lane, UInt64(ord) + 1)
+            if disp.runtime_ready:
+                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
             kfn(lane, ord, e, p0, p1, disp.user_ctx)
     else:
         ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=disp.world_addr)[unsafe_offset=0]
@@ -1469,6 +1501,8 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
             var r = sl.row_start + i
             var ord = sl.global_order_base + i
             var e = ents[unsafe_offset=r]
+            if disp.has_ex_sparse and world.entities[Int(e.index)].sparse_mask.intersects(disp.ex_sparse):
+                continue
             var a0: Int
             if not sl.is_sparse0:
                 a0 = sl.col0_ptr + r * sl.elem0_size
@@ -1487,7 +1521,8 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
                 if d1 < 0:
                     continue
                 a1 = s1.value_ptr(d1)
-            _set_lane_implicit_order(lane, UInt64(ord) + 1)
+            if disp.runtime_ready:
+                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
             kfn(
                 lane,
                 ord,
@@ -1496,7 +1531,8 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
                 Pointer[C1, MutAnyOrigin](unsafe_from_address=a1),
                 disp.user_ctx,
             )
-    _set_lane_implicit_order(lane, prev_imp)
+    if disp.runtime_ready:
+        order_slot[unsafe_offset=0].store(Int64(prev_imp))
 
 
 # ---------------------------------------------------------------------------
@@ -1511,6 +1547,8 @@ struct World(Movable):
     var live_entities: Int
     var current_tick: UInt32
     var components: List[ComponentInfo]
+    var comp_hash_keys: Array[UInt64, _COMP_HASH_CAP]
+    var comp_hash_vals: Array[Int16, _COMP_HASH_CAP]
     var table_comp_mask: BitSet256
     var sparse_comp_mask: BitSet256
     var comp_to_sparse: Array[Int, MAX_COMPONENTS]
@@ -1524,6 +1562,8 @@ struct World(Movable):
         self.live_entities = 0
         self.current_tick = 1
         self.components = List[ComponentInfo]()
+        self.comp_hash_keys = Array[UInt64, _COMP_HASH_CAP](fill=0)
+        self.comp_hash_vals = Array[Int16, _COMP_HASH_CAP](fill=-1)
         self.table_comp_mask = BitSet256()
         self.sparse_comp_mask = BitSet256()
         self.comp_to_sparse = Array[Int, MAX_COMPONENTS](fill=-1)
@@ -1594,11 +1634,26 @@ struct World(Movable):
             self.current_tick = 1
         return self.current_tick
 
+    @always_inline
     def find_component_by_hash(self, comp_hash: UInt64) -> Int:
-        for i in range(len(self.components)):
-            if self.components[i].component_hash == comp_hash:
-                return i
+        var slot = Int(comp_hash ^ (comp_hash >> 33)) & _COMP_HASH_MASK
+        for _ in range(_COMP_HASH_CAP):
+            var tid = Int(self.comp_hash_vals[slot])
+            if tid < 0:
+                return -1
+            if self.comp_hash_keys[slot] == comp_hash:
+                return tid
+            slot = (slot + 1) & _COMP_HASH_MASK
         return -1
+
+    def _index_component_hash(mut self, comp_hash: UInt64, tid: Int):
+        var slot = Int(comp_hash ^ (comp_hash >> 33)) & _COMP_HASH_MASK
+        for _ in range(_COMP_HASH_CAP):
+            if self.comp_hash_vals[slot] < 0 or self.comp_hash_keys[slot] == comp_hash:
+                self.comp_hash_keys[slot] = comp_hash
+                self.comp_hash_vals[slot] = Int16(tid)
+                return
+            slot = (slot + 1) & _COMP_HASH_MASK
 
     def register_component[C: Component](mut self) -> Int:
         """Idempotently registers `C` and returns its dense `0..255` component type ID."""
@@ -1642,6 +1697,7 @@ struct World(Movable):
             self.sparse_sets.append(SparseSet(tid, bsz))
         else:
             self.table_comp_mask.set(tid)
+        self._index_component_hash(C.COMPONENT_ID, tid)
         return tid
 
     def set_component_binary_hooks(mut self, type_id: Int, write_fn: _BinWriteFn, read_fn: _BinReadFn):
@@ -1695,6 +1751,7 @@ struct World(Movable):
             self.sparse_sets.append(SparseSet(tid, bsz))
         else:
             self.table_comp_mask.set(tid)
+        self._index_component_hash(comp_hash, tid)
         return tid
 
     def insert_raw_pod(mut self, entity: Entity, tid: Int, src_ptr: Int) -> Bool:
@@ -2093,10 +2150,12 @@ struct World(Movable):
         var tid0 = self.find_component_by_hash(C0.COMPONENT_ID)
         if tid0 < 0:
             return
-        _ = _ecs_runtime_ensure()
+        var rt_ready = _ecs_runtime_ensure()
         var req_mask = BitSet256().with_bit(tid0)
         var req_table = req_mask.intersection(self.table_comp_mask)
         var ex_table = without_mask.intersection(self.table_comp_mask)
+        var ex_sparse = without_mask.intersection(self.sparse_comp_mask)
+        var has_ex_sparse = not ex_sparse.is_empty()
         var is_sp0 = (C0.STORAGE_MODE == STORAGE_SPARSE)
         var esz0 = self.components[tid0].byte_size
 
@@ -2127,6 +2186,9 @@ struct World(Movable):
                 kernel,
                 user_ctx,
                 tid0,
+                ex_sparse,
+                has_ex_sparse,
+                rt_ready,
             )
             run_parallel_ctx(pool, len(slices), disp, _par_worker1[C0])
         for a in range(len(self.archetypes)):
@@ -2151,10 +2213,12 @@ struct World(Movable):
         var tid1 = self.find_component_by_hash(C1.COMPONENT_ID)
         if tid0 < 0 or tid1 < 0:
             return
-        _ = _ecs_runtime_ensure()
+        var rt_ready = _ecs_runtime_ensure()
         var req_mask = BitSet256().with_bit(tid0).with_bit(tid1)
         var req_table = req_mask.intersection(self.table_comp_mask)
         var ex_table = without_mask.intersection(self.table_comp_mask)
+        var ex_sparse = without_mask.intersection(self.sparse_comp_mask)
+        var has_ex_sparse = not ex_sparse.is_empty()
         var is_sp0 = (C0.STORAGE_MODE == STORAGE_SPARSE)
         var is_sp1 = (C1.STORAGE_MODE == STORAGE_SPARSE)
         var esz0 = self.components[tid0].byte_size
@@ -2194,6 +2258,9 @@ struct World(Movable):
                 user_ctx,
                 tid0,
                 tid1,
+                ex_sparse,
+                has_ex_sparse,
+                rt_ready,
             )
             run_parallel_ctx(pool, len(slices), disp, _par_worker2[C0, C1])
         for a in range(len(self.archetypes)):
@@ -2542,10 +2609,9 @@ struct World(Movable):
         # Placement comes only from the chunk tables below, never from the raw records;
         # `alive` is normalized from its raw byte (any non-zero byte means alive).
         var alive_count = 0
-        var rec_base = Int(new_entities.unsafe_ptr())
         for i in range(ent_len):
             var alive_byte = Pointer[UInt8, ImmutAnyOrigin](
-                unsafe_from_address=rec_base + i * size_of[EntityRecord]() + 4
+                unsafe_from_address=Int(Pointer(to=new_entities[i].alive))
             )[unsafe_offset=0]
             new_entities[i].alive = alive_byte != 0
             new_entities[i].sparse_mask = BitSet256()

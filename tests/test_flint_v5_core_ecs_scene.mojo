@@ -21,6 +21,18 @@ from std.math import abs
 from std.sys import size_of
 from std.testing import assert_true, assert_equal
 
+from flint.core.anchor import (
+    ANCHOR,
+    ANCHOR_BYTES,
+    STACKS,
+    STACK_BYTES,
+    STACK_SLOTS,
+    A_REPLAY_BUFFER,
+    A_REPLAY_COMMITTED,
+    A_REPLAY_PENDING,
+    install_anchor,
+    load,
+)
 from flint.core.detmath import (
     MXCSR_SIM,
     f32_from_bits,
@@ -34,7 +46,10 @@ from flint.core.detmath import (
 from flint.core.ecs import EntityHandle, ArchetypeSlots, ECB_PROV_GEN
 from flint.core.jobs import JobPool, run_jobs, run_jobs_affine
 from flint.core.math import Vec3, Quat, Mat4
+from flint.core.memory import Arena, MEM_FRAME
+from flint.core.profiler import ProfileTimeline
 from flint.core.serial import BlobWriter, BlobReader, fourcc, fast_hash64
+from flint.core.session_replay import SessionRecorder, FLUSH_AT
 from flint.assets.json import JsonDocument
 from flint.platform.dynlib import dl_open, dl_close, dl_error
 from flint.platform.os import get_time, write_bytes, remove_file, file_size, env_now
@@ -1467,6 +1482,156 @@ def test_h_restore_blob_rejects_hostile_counts() raises:
     assert_equal(t2.state_checksum(), w.state_checksum())
 
 
+def _par1_count_and_mark(
+    _lane: Int, _ord: Int, _e: Entity, pos: Pointer[CompPos, MutAnyOrigin], ctx: Int
+):
+    pos[unsafe_offset=0].z = Float32(99.0)
+    _ = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=ctx)[unsafe_offset=0].fetch_add(1)
+
+
+def _par2_count_and_mark(
+    _lane: Int,
+    _ord: Int,
+    _e: Entity,
+    pos: Pointer[CompPos, MutAnyOrigin],
+    vel: Pointer[CompVel, MutAnyOrigin],
+    ctx: Int,
+):
+    pos[unsafe_offset=0].z = vel[unsafe_offset=0].vx
+    _ = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=ctx)[unsafe_offset=0].fetch_add(1)
+
+
+def test_i_audit_regressions() raises:
+    """Phase 0+1 audit regressions: sparse exclusion in par_for_each1/2, SessionRecorder.write_dev
+    safety, anchor STACK_SLOTS, Arena align > 64, and Resources O(1) lookup."""
+    # 1. Sparse exclusion in par_for_each1 and par_for_each2
+    var w = World()
+    var tid_pos = w.register_component[CompPos]()
+    var tid_vel = w.register_component[CompVel]()
+    var tid_burn = w.register_component[TagBurningSparse]()
+    var ents = List[Entity]()
+    for i in range(120):
+        var e = w.spawn_empty()
+        _ = w.insert[CompPos](e, CompPos(Float32(i), Float32(0.0), Float32(-1.0)))
+        _ = w.insert[CompVel](e, CompVel(Float32(42.0), Float32(0.0), Float32(0.0)))
+        if i % 3 == 0:
+            _ = w.insert[TagBurningSparse](e, TagBurningSparse(Float32(5.0)))
+        ents.append(e)
+
+    var without_burn = BitSet256().with_bit(tid_burn)
+    var expected = w.query_entities(BitSet256().with_bit(tid_pos).with_bit(tid_vel), without_burn)
+    assert_equal(len(expected), 80)
+
+    var pool = JobPool()
+    assert_true(pool.start(4), "JobPool(4) must start")
+
+    var cnt1 = List[Int64](length=1, fill=0)
+    w.par_for_each1[CompPos](pool, _par1_count_and_mark, Int(cnt1.unsafe_ptr()), without_burn)
+    assert_equal(Int(cnt1[0]), 80)
+    for i in range(len(ents)):
+        var p = w.get_ptr[CompPos](ents[i]).value()[unsafe_offset=0]
+        if i % 3 == 0:
+            assert_equal(p.z, Float32(-1.0))
+        else:
+            assert_equal(p.z, Float32(99.0))
+            w.get_ptr_mut[CompPos](ents[i]).value()[unsafe_offset=0].z = Float32(-1.0)
+
+    var cnt2 = List[Int64](length=1, fill=0)
+    w.par_for_each2[CompPos, CompVel](pool, _par2_count_and_mark, Int(cnt2.unsafe_ptr()), without_burn)
+    assert_equal(Int(cnt2[0]), 80)
+    for i in range(len(ents)):
+        var p = w.get_ptr[CompPos](ents[i]).value()[unsafe_offset=0]
+        if i % 3 == 0:
+            assert_equal(p.z, Float32(-1.0))
+        else:
+            assert_equal(p.z, Float32(42.0))
+    pool.stop()
+
+    # 2. SessionRecorder.write_dev safety (no dangling A_REPLAY_BUFFER across flush/oversized writes)
+    var anchor_ok = install_anchor()
+    var rec = SessionRecorder()
+    var rec_path = String("/tmp/flint-test-session-replay-write-dev.sdrp")
+    var hdr = List[UInt8](length=16, fill=UInt8(0xAA))
+    assert_true(rec.start(rec_path, hdr^, for_crashes=True), "SessionRecorder.start must succeed")
+    var initial_ptr = Int(rec.buffer.unsafe_ptr())
+    var initial_cap = rec.buffer.capacity()
+
+    var small = List[UInt8](length=1024, fill=UInt8(0x11))
+    rec.write_dev(small)
+    assert_equal(Int(rec.buffer.unsafe_ptr()), initial_ptr)
+    if anchor_ok:
+        assert_equal(load(ANCHOR + A_REPLAY_BUFFER), Int(rec.buffer.unsafe_ptr()))
+        assert_equal(load(ANCHOR + A_REPLAY_COMMITTED), len(rec.buffer))
+        assert_equal(load(ANCHOR + A_REPLAY_PENDING), len(rec.buffer))
+
+    # Cross FLUSH_AT via two 600 KiB chunks: must flush before extending, never reallocating buffer
+    var chunk_600k = List[UInt8](length=600 * 1024, fill=UInt8(0x22))
+    rec.write_dev(chunk_600k)
+    rec.write_dev(chunk_600k)
+    assert_equal(Int(rec.buffer.unsafe_ptr()), initial_ptr)
+    assert_equal(rec.buffer.capacity(), initial_cap)
+    if anchor_ok:
+        assert_equal(load(ANCHOR + A_REPLAY_BUFFER), Int(rec.buffer.unsafe_ptr()))
+        assert_equal(load(ANCHOR + A_REPLAY_COMMITTED), len(rec.buffer))
+
+    # Oversized single dev payload (> FLUSH_AT): must write directly without reallocating buffer
+    var huge = List[UInt8](length=FLUSH_AT + 4096, fill=UInt8(0x33))
+    rec.write_dev(huge)
+    assert_equal(Int(rec.buffer.unsafe_ptr()), initial_ptr)
+    assert_equal(rec.buffer.capacity(), initial_cap)
+    assert_equal(len(rec.buffer), 0)
+    if anchor_ok:
+        assert_equal(load(ANCHOR + A_REPLAY_BUFFER), initial_ptr)
+        assert_equal(load(ANCHOR + A_REPLAY_COMMITTED), 0)
+        assert_equal(load(ANCHOR + A_REPLAY_PENDING), 0)
+
+    rec.finish()
+    var expected_bytes = 16 + 1024 + 2 * (600 * 1024) + (FLUSH_AT + 4096)
+    assert_equal(file_size(rec_path), expected_bytes)
+    _ = remove_file(rec_path)
+
+    # 3. Anchor STACK_SLOTS == 33 and fits inside ANCHOR_BYTES
+    assert_equal(STACK_SLOTS, 33)
+    assert_true(STACKS + STACK_SLOTS * STACK_BYTES <= ANCHOR_BYTES)
+
+    # 4. Arena.alloc alignment for align > 64
+    var arena = Arena(MEM_FRAME, 16384)
+    _ = arena.alloc(13, 1)  # intentionally misalign used offset
+    var a128 = arena.alloc(32, 128)
+    assert_true(a128 != 0 and (a128 & 127) == 0, "Arena.alloc(align=128) must be 128-byte aligned")
+    var a256 = arena.alloc(32, 256)
+    assert_true(a256 != 0 and (a256 & 255) == 0, "Arena.alloc(align=256) must be 256-byte aligned")
+    var a4096 = arena.alloc(64, 4096)
+    assert_true(a4096 != 0 and (a4096 & 4095) == 0, "Arena.alloc(align=4096) must be 4096-byte aligned")
+
+    # 4b. ProfileTimeline start/finish/deinit smoke
+    var pt = ProfileTimeline()
+    assert_true(pt.start(String("")), "ProfileTimeline.start must succeed")
+    pt.finish()
+
+    # 5. Resources O(1) lookup, overwrite, and remove
+    var res = Resources()
+    var vals = List[Int64](capacity=40)
+    for i in range(40):
+        vals.append(Int64(i * 100 + 7))
+    for i in range(40):
+        var rid = UInt64(1000 + i)
+        _ = res.insert_pod_raw(rid, size_of[Int64](), Int(vals.unsafe_ptr()) + i * size_of[Int64]())
+    _ = len(vals)
+    assert_equal(res.count(), 40)
+    for i in range(40):
+        var rid = UInt64(1000 + i)
+        var p = res.get_raw_ptr(rid)
+        assert_true(p != 0)
+        assert_equal(Pointer[Int64, ImmutAnyOrigin](unsafe_from_address=p)[unsafe_offset=0], Int64(i * 100 + 7))
+    assert_equal(res.find_index(UInt64(999999)), -1)
+    res.insert[FixedTime](FixedTime(60.0))
+    assert_true(res.has[FixedTime]())
+    assert_true(res.remove[FixedTime]())
+    assert_true(not res.has[FixedTime]())
+    assert_equal(res.count(), 40)
+
+
 def main() raises:
     var t0 = get_time()
     print("[Flint v5 Track 1] Running Core, Hybrid ECS v2, Scene/Prefab & Hot-Reload Suite...")
@@ -1495,5 +1660,8 @@ def main() raises:
     test_h_restore_blob_rejects_hostile_counts()
     print("  [PASS] (h) restore_blob rejects corrupted counts and entity tables without allocating")
 
+    test_i_audit_regressions()
+    print("  [PASS] (i) Phase 0+1 audit regressions (par_for_each sparse excl, write_dev safety, anchor, Arena, Resources)")
+
     var elapsed = get_time() - t0
-    print("[Flint v5 Track 1] ALL 8 SUITES PASSED in " + String(elapsed) + " s")
+    print("[Flint v5 Track 1] ALL 9 SUITES PASSED in " + String(elapsed) + " s")

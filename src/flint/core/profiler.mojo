@@ -307,6 +307,7 @@ def percentile_of(mut values: List[Float32], fraction: Float64) -> Float32:
 struct ProfileTimeline(Movable):
     """The main thread's side: turns cells into history, a file and a held frame."""
     var handle: Profiler
+    var raw_block: Int
     var active: Bool
     var overlay_visible: Bool
     var frame: Int
@@ -348,6 +349,7 @@ struct ProfileTimeline(Movable):
 
     def __init__(out self):
         self.handle = Profiler()
+        self.raw_block = 0
         self.active = False
         self.overlay_visible = False
         self.frame = 0
@@ -383,19 +385,28 @@ struct ProfileTimeline(Movable):
         self.first_event = True
         self.zone_text = List[String]()
 
+    def __deinit__(deinit self):
+        if self.fd >= 0:
+            _ = external_call["close", Int32](Int32(self.fd))
+        if self.buffer != 0:
+            external_call["free", NoneType](self.buffer)
+        if self.raw_block != 0:
+            external_call["free", NoneType](self.raw_block)
+
     def start(mut self, path: String, overlay: Bool = True) -> Bool:
         """Allocate everything, measure the clock, open the file.
 
         An empty path, or one that cannot be opened, still profiles: the
-        overlay and the summary work with no file. The block stays until the
-        process exits, because handles to it live in many places.
+        overlay and the summary work with no file.
         """
         if self.active:
             return True
-        var memory = external_call["calloc", Int](Int(1), BLOCK_WORDS * 8 + 64)
-        if memory == 0:
-            return False
-        self.handle = Profiler((memory + 63) & ~63)
+        if self.raw_block == 0:
+            var memory = external_call["calloc", Int](Int(1), BLOCK_WORDS * 8 + 64)
+            if memory == 0:
+                return False
+            self.raw_block = memory
+            self.handle = Profiler((memory + 63) & ~63)
         self.overlay_visible = overlay
         self.lane_threads = List[UInt64](capacity=MAX_LANES)
         self.lane_threads.append(UInt64(external_call["pthread_self", Int]()))
@@ -646,6 +657,13 @@ struct ProfileTimeline(Movable):
     # ---- the file ----
 
     def open_file(mut self, path: String):
+        if self.fd >= 0:
+            _ = external_call["close", Int32](Int32(self.fd))
+            self.fd = -1
+        if self.buffer != 0:
+            external_call["free", NoneType](self.buffer)
+            self.buffer = 0
+        self.buffer_used = 0
         self.path = path
         if path.byte_length() == 0:
             return
@@ -657,6 +675,12 @@ struct ProfileTimeline(Movable):
             self.path = String()
             return
         self.buffer = external_call["malloc", Int](FILE_BUFFER_BYTES)
+        if self.buffer == 0:
+            print("PROFILE_FILE_FAILED " + path)
+            _ = external_call["close", Int32](Int32(self.fd))
+            self.fd = -1
+            self.path = String()
+            return
         self.zone_text = List[String](capacity=ZONE_COUNT)
         for zone in range(ZONE_COUNT):
             self.zone_text.append("\"name\":\"" + zone_name(zone) + "\"")

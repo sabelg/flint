@@ -80,9 +80,13 @@ struct _ResourceSlot(Copyable, ImplicitlyCopyable, Movable):
 struct Resources(Movable):
     """Type-erased singleton resource container with stable 64-byte aligned pointers."""
     var slots: List[_ResourceSlot]
+    var index_keys: List[UInt64]
+    var index_vals: List[Int]
 
     def __init__(out self):
         self.slots = List[_ResourceSlot]()
+        self.index_keys = List[UInt64]()
+        self.index_vals = List[Int]()
 
     def __deinit__(deinit self):
         for i in range(len(self.slots)):
@@ -90,11 +94,49 @@ struct Resources(Movable):
             if self.slots[i].ptr != 0:
                 external_call["free", NoneType](self.slots[i].ptr)
 
+    @always_inline
     def find_index(self, res_id: UInt64) -> Int:
-        for i in range(len(self.slots)):
-            if self.slots[i].resource_id == res_id:
-                return i
+        var cap = len(self.index_vals)
+        if cap == 0:
+            return -1
+        var mask = cap - 1
+        var slot = Int(res_id ^ (res_id >> 33)) & mask
+        for _ in range(cap):
+            var idx = self.index_vals[slot]
+            if idx < 0:
+                return -1
+            if self.index_keys[slot] == res_id:
+                return idx
+            slot = (slot + 1) & mask
         return -1
+
+    def _rebuild_index(mut self, min_cap: Int = 0):
+        var cap = max(32, min_cap)
+        var needed = len(self.slots) * 2
+        while cap < needed:
+            cap *= 2
+        self.index_keys = List[UInt64](length=cap, fill=0)
+        self.index_vals = List[Int](length=cap, fill=-1)
+        var mask = cap - 1
+        for i in range(len(self.slots)):
+            var rid = self.slots[i].resource_id
+            var slot = Int(rid ^ (rid >> 33)) & mask
+            while self.index_vals[slot] >= 0:
+                slot = (slot + 1) & mask
+            self.index_keys[slot] = rid
+            self.index_vals[slot] = i
+
+    def _index_insert(mut self, res_id: UInt64, slot_idx: Int):
+        var cap = len(self.index_vals)
+        if cap == 0 or (len(self.slots) * 2) > cap:
+            self._rebuild_index(cap * 2 if cap > 0 else 32)
+            return
+        var mask = cap - 1
+        var slot = Int(res_id ^ (res_id >> 33)) & mask
+        while self.index_vals[slot] >= 0 and self.index_keys[slot] != res_id:
+            slot = (slot + 1) & mask
+        self.index_keys[slot] = res_id
+        self.index_vals[slot] = slot_idx
 
     def insert[R: Resource](mut self, var resource: R):
         comptime has_nontriv_drop = not R.__del__is_trivial
@@ -122,7 +164,9 @@ struct Resources(Movable):
             self.slots[idx].has_drop = has_nontriv_drop
             self.slots[idx].drop_fn = dfn
             return
+        var new_idx = len(self.slots)
         self.slots.append(_ResourceSlot(R.RESOURCE_ID, mem, bsz, has_nontriv_drop, dfn))
+        self._index_insert(R.RESOURCE_ID, new_idx)
 
     def insert_pod_raw(mut self, res_id: UInt64, byte_size: Int, src_ptr: Int) -> Int:
         """Inserts or overwrites a host-resident POD resource (reallocating cleanly across `.so` reloads)."""
@@ -143,7 +187,9 @@ struct Resources(Movable):
             self.slots[idx].has_drop = False
             self.slots[idx].drop_fn = _noop_res_drop
             return mem
+        var new_idx = len(self.slots)
         self.slots.append(_ResourceSlot(res_id, mem, safe_size, False, _noop_res_drop))
+        self._index_insert(res_id, new_idx)
         return mem
 
     def byte_size_of(self, res_id: UInt64) -> Int:
@@ -180,6 +226,7 @@ struct Resources(Movable):
         if idx < last:
             self.slots[idx] = self.slots[last]
         _ = self.slots.pop()
+        self._rebuild_index()
         return True
 
     def count(self) -> Int:
