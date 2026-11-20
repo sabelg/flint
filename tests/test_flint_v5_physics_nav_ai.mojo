@@ -26,7 +26,7 @@ from flint.core.serial import BlobWriter, BlobReader, fnv64, float32_bits
 from flint.core.ik import angle_axis
 from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC, CAT_PROP_PIECE, CAT_ALL
 from flint.physics.bvh import Bvh8MeshCollider
-from flint.physics.narrowphase import ConvexHull
+from flint.physics.narrowphase import ConvexHull, ContactManifold
 from flint.physics.shapes_v5 import (
     CompoundChild,
     CompoundShape,
@@ -1036,6 +1036,157 @@ def test_e_ai_perception_camera_flanim_and_ragdoll_sm() raises:
     assert_true(rsm.last_pelvis_snap_m < Float32(1.0e-4))
 
 
+def test_f_phase0_phase1_regressions() raises:
+    var dt = Float32(1.0 / 60.0)
+
+    # 1. CompoundShape multi-normal per-child manifolds (no normal corruption!)
+    var wc = PhysicsWorld(gravity=-9.81)
+    var l_cmp = CompoundShape()
+    l_cmp.add_child(CompoundChild.box(Vec3(0.0, -0.25, 0.0), Quat(), Vec3(2.0, 0.25, 2.0)))  # floor top at y = 0.0
+    l_cmp.add_child(CompoundChild.box(Vec3(1.5, 1.0, 0.0), Quat(), Vec3(0.25, 1.25, 2.0)))   # wall inner face at x = 1.25
+    var cmp_slot = wc.add_compound(Vec3(0.0, 0.0, 0.0), l_cmp, mass=0.0)
+    # Box overlapping both floor (y < 0.0) and wall (x > 1.25) simultaneously
+    var probe_slot = wc.add_box(Vec3(1.0, 0.20, 0.0), Vec3(0.35, 0.30, 0.35), mass=1.0)
+    wc.rebuild_broadphase()
+
+    var ms = List[ContactManifold]()
+    wc._collide_pair_into(cmp_slot, probe_slot, ms)
+    assert_true(len(ms) >= 2)
+    var saw_y_normal = False
+    var saw_x_normal = False
+    for mi in range(len(ms)):
+        if abs(ms[mi].normal.y) > Float32(0.8):
+            saw_y_normal = True
+        if abs(ms[mi].normal.x) > Float32(0.8):
+            saw_x_normal = True
+    assert_true(saw_y_normal and saw_x_normal)
+    for _ in range(15):
+        wc.step(dt)
+    assert_true(wc.bodies[probe_slot].pos.y > Float32(0.25))
+    assert_true(wc.bodies[probe_slot].pos.x < Float32(1.0))
+
+    # 2. KCC vs CompoundShape: stands cleanly inside concave L-pocket AND depenetrates from wall child
+    var kcc_cfg = CharacterControllerConfig()
+    kcc_cfg.radius = 0.35
+    kcc_cfg.half_height = 0.55
+    var kcc = CharacterController(Vec3(0.0, 1.05, 0.0), kcc_cfg)
+    for _ in range(20):
+        _ = kcc.move_and_slide(wc, Vec3(0.0, 0.0, 0.0), dt)
+    # Must rest on the floor inside the concave pocket (x ~= 0, foot_y ~= 0.0)
+    assert_true(abs(kcc.pos.x) < Float32(0.15))
+    assert_true(abs(kcc.foot_position().y) < Float32(0.12))
+    # Now place KCC overlapping the vertical wall child (wall inner face x = 1.25) and verify depenetration pushes it out
+    kcc.pos = Vec3(1.05, 1.05, 0.0)
+    _ = kcc.move_and_slide(wc, Vec3(0.0, 0.0, 0.0), dt)
+    assert_true(kcc.pos.x <= Float32(0.92))
+
+    # 3. CCD bilateral momentum conservation against a dynamic body
+    var wccd = PhysicsWorld(gravity=0.0)
+    var proj = wccd.add_sphere(Vec3(0.0, 0.0, 0.0), 0.25, mass=1.0, restitution=1.0)
+    var targ = wccd.add_sphere(Vec3(1.5, 0.0, 0.0), 0.25, mass=1.0, restitution=1.0)
+    wccd.bodies[proj].enable_ccd = True
+    wccd.set_velocity(proj, Vec3(120.0, 0.0, 0.0))  # 2.0 m/tick -> hits target at toi = 0.5
+    wccd.rebuild_broadphase()
+    wccd.step(dt)
+    # Target dynamic sphere must wake and receive forward momentum; total momentum conserved (~120 kg*m/s)
+    assert_true(wccd.bodies[targ].linear_vel.x > Float32(90.0))
+    var p_total = wccd.bodies[proj].linear_vel.x + wccd.bodies[targ].linear_vel.x
+    assert_true(abs(p_total - Float32(120.0)) < Float32(5.0))
+
+    # 4. BoneSocketAttachment.sync_to_physics does not double-advance kinematic body during world.step(dt)
+    var ws = PhysicsWorld(gravity=0.0)
+    var sh_slot = ws.add_kinematic_box(Vec3(), Vec3(0.2, 0.3, 0.05))
+    var sh_id = ws.bodies[sh_slot].id
+    var biped = _make_test_biped()
+    var skel = SkeletonInstance()
+    skel.reset_to_rest(biped)
+    var place = Placement(Vec3(0.0, 0.0, 0.0), Vec3(1, 1, 1), 0.0)
+    var sock = BoneSocketAttachment("Shield", 4, 50, Vec3(0.05, 0.0, 0.1), Quat(), Vec3(1, 1, 1), sh_id)
+    sock.sync_to_physics(skel, place, ws, dt)
+    ws.step(dt)
+    skel.pose.r[3] = angle_axis(0.5, Vec3(0, 1, 0))
+    skel.update_matrices(biped)
+    sock.sync_to_physics(skel, place, ws, dt)
+    var target_pos = sock.world_pos
+    ws.step(dt)
+    assert_true((ws.bodies[sh_slot].pos - target_pos).length() < Float32(0.01))
+
+    # 5. Tile-indexed NavMesh find_nearest_poly & _find_poly_containing_probe
+    var wn = PhysicsWorld(gravity=0.0)
+    _ = wn.add_box(Vec3(0.0, -0.25, 0.0), Vec3(12.0, 0.25, 12.0), mass=0.0)
+    wn.rebuild_broadphase()
+    var ncfg = NavMeshConfig()
+    ncfg.cell_size = 0.5
+    ncfg.tile_size = 8  # 4 m tiles -> 6x6 tile grid
+    var nm = NavMesh.build_from_physics(wn, ncfg)
+    assert_true(nm.tiles_x >= 4 and nm.tiles_z >= 4)
+    var q_pts: List[Vec3] = [Vec3(0.0, 0.0, 0.0), Vec3(5.5, 0.0, -4.5), Vec3(-6.0, 0.0, 6.0)]
+    for qi in range(len(q_pts)):
+        var qp = q_pts[qi]
+        var res = nm.find_nearest_poly(qp, 4.0)
+        assert_true(res[0] >= 0)
+        assert_true((res[1] - qp).length() < Float32(0.6))
+        var probe_pid = nm._find_poly_containing_probe(res[1], res[1].y, Float32(1.0))
+        assert_true(probe_pid >= 0)
+
+    # 6. CameraRig trauma^2 shake clamped against walls (never clips through wall!)
+    var wcam = PhysicsWorld(gravity=0.0)
+    # Thick static wall behind target (face at z = -1.5)
+    _ = wcam.add_box(Vec3(0.0, 2.0, -2.0), Vec3(8.0, 4.0, 0.5), mass=0.0, filter=CollisionFilter(CAT_STATIC, CAT_ALL, 0))
+    wcam.rebuild_broadphase()
+    var rig = CameraRig(CAM_MODE_ORBIT_FOLLOW)
+    rig.yaw_deg = 0.0
+    rig.pitch_deg = 0.0
+    rig.spring_arm.target_length = 4.0
+    rig.spring_arm.probe_radius = 0.20
+    rig.spring_arm.wall_margin = 0.05
+    rig.max_shake_offset = Vec3(0.4, 0.4, 0.4)
+    rig.add_trauma(1.0)
+    for _ in range(30):
+        rig.update(wcam, Vec3(0.0, 0.0, 0.0), dt)
+        # Wall surface is at z = -1.5; camera center must NEVER penetrate closer than -1.5 + probe_radius!
+        assert_true(rig.world_pos.z >= Float32(-1.5) + rig.spring_arm.probe_radius - Float32(0.01))
+
+    # 7. BT_NODE_PARALLEL preserves independent per-node running state without clobbering
+    var bt = BehaviorTree()
+    _ = bt.begin_parallel(2)
+    _ = bt.begin_sequence()
+    _ = bt.add_action(0)
+    _ = bt.add_action(1)
+    bt.end_composite()
+    _ = bt.begin_sequence()
+    _ = bt.add_action(2)
+    _ = bt.add_action(3)
+    bt.end_composite()
+    bt.end_composite()
+
+    var bb = Blackboard()
+    var st = BtExecutionState(8)
+    st.set_action_status(0, BT_SUCCESS)
+    st.set_action_status(1, BT_RUNNING)
+    st.set_action_status(2, BT_SUCCESS)
+    st.set_action_status(3, BT_RUNNING)
+
+    assert_equal(bt.tick(bb, st, dt), BT_RUNNING)
+    assert_equal(st.action_exec_counts[0], 1)
+    assert_equal(st.action_exec_counts[1], 1)
+    assert_equal(st.action_exec_counts[2], 1)
+    assert_equal(st.action_exec_counts[3], 1)
+
+    # Tick 2: both child Sequences MUST resume at their running actions (1 and 3) without re-running 0 or 2!
+    assert_equal(bt.tick(bb, st, dt), BT_RUNNING)
+    assert_equal(st.action_exec_counts[0], 1)
+    assert_equal(st.action_exec_counts[1], 2)
+    assert_equal(st.action_exec_counts[2], 1)
+    assert_equal(st.action_exec_counts[3], 2)
+
+    # Complete both running actions -> Parallel succeeds and clears running state
+    st.set_action_status(1, BT_SUCCESS)
+    st.set_action_status(3, BT_SUCCESS)
+    assert_equal(bt.tick(bb, st, dt), BT_SUCCESS)
+    assert_equal(st.running_node, -1)
+
+
 def main() raises:
     var t0 = monotonic()
     test_a_snapshot_determinism_queries_triggers_ccd()
@@ -1048,5 +1199,7 @@ def main() raises:
     print("[PASS] (d) Recast NavMesh + dynamic obstacle carve + OffMeshLink + SSFA + 256-agent SIMD8 ORCA (0 overlaps)")
     test_e_ai_perception_camera_flanim_and_ragdoll_sm()
     print("[PASS] (e) BehaviorTree reactive abort + UtilityAI + SpatialPerception + CameraRig + .flanim + Socket + FootIK + RagdollSM")
+    test_f_phase0_phase1_regressions()
+    print("[PASS] (f) Phase 0+1 regressions: Compound multi-normal, KCC vs Compound, CCD bilateral momentum, Socket no double-step, Tile-indexed NavMesh, Camera shake wall clamp, BT_NODE_PARALLEL")
     var ms = Float64(monotonic() - t0) / 1.0e6
     print("ALL FLINT V5 PHYSICS / KCC / NAVMESH / ORCA / AI / CAMERA / FLANIM_ECS TESTS PASSED in", ms, "ms!")

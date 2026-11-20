@@ -448,8 +448,6 @@ struct BoneSocketAttachment(Copyable, Movable):
         """Updates world transform and drives any attached kinematic `RigidBody` (`kinematic_body_id`)
         with exact `(pos, rot, linear_vel, angular_vel)`."""
         var had_prev = self.has_prev
-        var old_pos = self.world_pos
-        var old_rot = self.world_rot
         self.update(skel, placement)
 
         if self.kinematic_body_id < 0:
@@ -457,14 +455,18 @@ struct BoneSocketAttachment(Copyable, Movable):
         var slot = world.find_slot_by_id(self.kinematic_body_id)
         if slot < 0 or slot >= len(world.bodies):
             return
-        world.bodies[slot].pos = self.world_pos
-        world.bodies[slot].rot = self.world_rot
         if had_prev and dt > Float32(1.0e-6):
+            # Drive kinematic collider via velocity from its current physics pose to `self.world_pos/rot`
+            # so `world.step(dt)` integrates it smoothly to the exact target without double-advancing.
             var inv_dt = Float32(1.0) / dt
-            world.bodies[slot].linear_vel = (self.world_pos - old_pos) * inv_dt
-            var dq = self.world_rot.multiply(old_rot.conjugate()).normalized()
+            var cur_pos = world.bodies[slot].pos
+            var cur_rot = world.bodies[slot].rot
+            world.bodies[slot].linear_vel = (self.world_pos - cur_pos) * inv_dt
+            var dq = self.world_rot.multiply(cur_rot.conjugate()).normalized()
             world.bodies[slot].angular_vel = det_quat_to_scaled_angle(dq) * inv_dt
         else:
+            world.bodies[slot].pos = self.world_pos
+            world.bodies[slot].rot = self.world_rot
             world.bodies[slot].linear_vel = Vec3()
             world.bodies[slot].angular_vel = Vec3()
         world.bodies[slot].awake = True

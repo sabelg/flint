@@ -209,14 +209,125 @@ struct PairTouch(Copyable, ImplicitlyCopyable, Movable):
         self.normal = Vec3()
 
 
+@always_inline
+def _contact_hash(a: Int, b: Int, feature: Int) -> UInt64:
+    var h = UInt64(a) * 0x9E3779B97F4A7C15
+    h ^= UInt64(b) * 0xBF58476D1CE4E5B9
+    h ^= UInt64(feature) * 0x94D049BB133111EB
+    return mix64(h)
+
+
+@always_inline
+def _pair_hash(a: Int, b: Int) -> UInt64:
+    return mix64((UInt64(a) * 0x9E3779B97F4A7C15) ^ (UInt64(b) * 0xBF58476D1CE4E5B9))
+
+
+def _sort_cached_contacts(mut items: List[CachedContact]):
+    """Deterministic O(N log N) bottom-up merge sort by (a, b, feature)."""
+    var count = len(items)
+    if count <= 1:
+        return
+    if count <= 32:
+        for i in range(1, count):
+            var item = items[i]
+            var at = i - 1
+            while at >= 0 and key_before(item.a, item.b, item.feature, items[at]):
+                items[at + 1] = items[at]
+                at -= 1
+            items[at + 1] = item
+        return
+    var scratch = List[CachedContact](
+        length=count,
+        fill=CachedContact(0, 0, 0, 0, Vec3(), Vec3(), Float32(0)),
+    )
+    var width = 1
+    while width < count:
+        var start = 0
+        while start < count:
+            var mid = min(start + width, count)
+            var end = min(start + 2 * width, count)
+            var l = start
+            var r = mid
+            var o = start
+            while l < mid and r < end:
+                if not key_before(items[r].a, items[r].b, items[r].feature, items[l]):
+                    scratch[o] = items[l]
+                    l += 1
+                else:
+                    scratch[o] = items[r]
+                    r += 1
+                o += 1
+            while l < mid:
+                scratch[o] = items[l]
+                l += 1
+                o += 1
+            while r < end:
+                scratch[o] = items[r]
+                r += 1
+                o += 1
+            start = end
+        for i in range(count):
+            items[i] = scratch[i]
+        width *= 2
+
+
+def _sort_pair_touches(mut items: List[PairTouch]):
+    """Deterministic O(N log N) bottom-up merge sort by (a, b)."""
+    var count = len(items)
+    if count <= 1:
+        return
+    if count <= 32:
+        for i in range(1, count):
+            var item = items[i]
+            var at = i - 1
+            while at >= 0 and pair_key_before(item.a, item.b, items[at].a, items[at].b):
+                items[at + 1] = items[at]
+                at -= 1
+            items[at + 1] = item
+        return
+    var scratch = List[PairTouch](length=count, fill=PairTouch(0, 0))
+    var width = 1
+    while width < count:
+        var start = 0
+        while start < count:
+            var mid = min(start + width, count)
+            var end = min(start + 2 * width, count)
+            var l = start
+            var r = mid
+            var o = start
+            while l < mid and r < end:
+                if not pair_key_before(items[r].a, items[r].b, items[l].a, items[l].b):
+                    scratch[o] = items[l]
+                    l += 1
+                else:
+                    scratch[o] = items[r]
+                    r += 1
+                o += 1
+            while l < mid:
+                scratch[o] = items[l]
+                l += 1
+                o += 1
+            while r < end:
+                scratch[o] = items[r]
+                r += 1
+                o += 1
+            start = end
+        for i in range(count):
+            items[i] = scratch[i]
+        width *= 2
+
+
 struct ContactCache(Copyable, Movable):
-    var entries: List[CachedContact]  # sorted by (a, b, feature)
+    var entries: List[CachedContact]  # sorted by (a, b, feature) after end_tick / deserialize
     var next_id: Int
     var touching_a: List[Int]         # pairs touching at the end of the last tick, sorted
     var touching_b: List[Int]
-    var tick_pairs: List[PairTouch]   # this tick so far, sorted by (a, b); not state between ticks
+    var tick_pairs: List[PairTouch]   # this tick so far; sorted by (a, b) in end_tick
     var recycled: Int                 # diagnostics: contacts recycled this tick
     var persisted: Int                # and kept
+    var _entry_slots: List[Int]       # open-addressed hash table -> index into entries (-1 empty)
+    var _pair_slots: List[Int]        # open-addressed hash table -> index into tick_pairs (-1 empty)
+    var _entries_dirty: Bool
 
     def __init__(out self):
         self.entries = List[CachedContact]()
@@ -226,6 +337,9 @@ struct ContactCache(Copyable, Movable):
         self.tick_pairs = List[PairTouch]()
         self.recycled = 0
         self.persisted = 0
+        self._entry_slots = List[Int]()
+        self._pair_slots = List[Int]()
+        self._entries_dirty = False
 
     def clear(mut self):
         self.entries.clear()
@@ -233,30 +347,70 @@ struct ContactCache(Copyable, Movable):
         self.touching_a.clear()
         self.touching_b.clear()
         self.tick_pairs.clear()
+        self._entry_slots.clear()
+        self._pair_slots.clear()
+        self._entries_dirty = False
 
     def is_default(self) -> Bool:
         return len(self.entries) == 0 and len(self.touching_a) == 0 and self.next_id == 0
+
+    def _rebuild_entry_index(mut self, min_cap: Int = 16):
+        var n = len(self.entries)
+        if n == 0 and min_cap == 0:
+            self._entry_slots.clear()
+            return
+        var cap = 16
+        var target = max(min_cap, n * 2 + 8)
+        while cap < target:
+            cap *= 2
+        var mask = cap - 1
+        self._entry_slots = List[Int](length=cap, fill=-1)
+        for i in range(n):
+            ref e = self.entries[i]
+            var s = Int(_contact_hash(e.a, e.b, e.feature)) & mask
+            while self._entry_slots[s] >= 0:
+                s = (s + 1) & mask
+            self._entry_slots[s] = i
+
+    def _rebuild_pair_index(mut self, min_cap: Int = 16):
+        var n = len(self.tick_pairs)
+        var cap = 16
+        var target = max(min_cap, n * 2 + 8)
+        while cap < target:
+            cap *= 2
+        var mask = cap - 1
+        self._pair_slots = List[Int](length=cap, fill=-1)
+        for i in range(n):
+            ref p = self.tick_pairs[i]
+            var s = Int(_pair_hash(p.a, p.b)) & mask
+            while self._pair_slots[s] >= 0:
+                s = (s + 1) & mask
+            self._pair_slots[s] = i
 
     def begin_tick(mut self):
         for index in range(len(self.entries)):
             self.entries[index].seen = False
         self.tick_pairs.clear()
+        self._pair_slots.clear()
         self.recycled = 0
         self.persisted = 0
 
     def find(self, a: Int, b: Int, feature: Int) -> Int:
-        """Index of the key, or -(insert position) - 1."""
-        var lo = 0
-        var hi = len(self.entries)
-        while lo < hi:
-            var mid = (lo + hi) // 2
-            if key_before(a, b, feature, self.entries[mid]):
-                hi = mid
-            elif self.entries[mid].a == a and self.entries[mid].b == b and self.entries[mid].feature == feature:
-                return mid
-            else:
-                lo = mid + 1
-        return -lo - 1
+        """O(1) hash lookup returning index of the key, or -1 if absent."""
+        var cap = len(self._entry_slots)
+        if cap == 0:
+            return -1
+        var mask = cap - 1
+        var s = Int(_contact_hash(a, b, feature)) & mask
+        for _ in range(cap):
+            var idx = self._entry_slots[s]
+            if idx < 0:
+                return -1
+            ref e = self.entries[idx]
+            if e.a == a and e.b == b and e.feature == feature:
+                return idx
+            s = (s + 1) & mask
+        return -1
 
     def refresh(mut self, a: Int, b: Int, feature: Int, normal: Vec3, anchor: Vec3, impulse: Float32) -> Int:
         """A contact seen in a substep; returns its persistent id."""
@@ -278,10 +432,19 @@ struct ContactCache(Copyable, Movable):
             entry.seen = True
             self.entries[at] = entry
             return entry.id
-        var position = -at - 1
         var made = CachedContact(a, b, feature, self.next_id, normal, anchor, impulse)
         self.next_id += 1
-        self.entries.insert(position, made)
+        var new_idx = len(self.entries)
+        self.entries.append(made)
+        self._entries_dirty = True
+        if len(self._entry_slots) == 0 or (new_idx + 1) * 2 >= len(self._entry_slots):
+            self._rebuild_entry_index((new_idx + 1) * 2 + 8)
+        else:
+            var mask = len(self._entry_slots) - 1
+            var s = Int(_contact_hash(a, b, feature)) & mask
+            while self._entry_slots[s] >= 0:
+                s = (s + 1) & mask
+            self._entry_slots[s] = new_idx
         return made.id
 
     def warm(mut self, a: Int, b: Int, feature: Int, normal: Vec3, anchor: Vec3) -> CachedContact:
@@ -314,33 +477,43 @@ struct ContactCache(Copyable, Movable):
             self.entries[at].tangent = tangent
 
     def touch(mut self, a: Int, b: Int, speed: Float32, impulse: Float32, point: Vec3, normal: Vec3):
-        """Pair (a, b) touched in a substep."""
-        var lo = 0
-        var hi = len(self.tick_pairs)
-        while lo < hi:
-            var mid = (lo + hi) // 2
-            if pair_key_before(a, b, self.tick_pairs[mid].a, self.tick_pairs[mid].b):
-                hi = mid
-            elif self.tick_pairs[mid].a == a and self.tick_pairs[mid].b == b:
-                var pair = self.tick_pairs[mid]
-                pair.impulse += impulse
-                if speed > pair.speed:
-                    pair.speed = speed
-                    pair.point = point
-                    pair.normal = normal
-                self.tick_pairs[mid] = pair
-                return
-            else:
-                lo = mid + 1
+        """Pair (a, b) touched in a substep (O(1) hash lookup + batch sort in end_tick)."""
+        var cap = len(self._pair_slots)
+        if cap > 0:
+            var mask = cap - 1
+            var s = Int(_pair_hash(a, b)) & mask
+            for _ in range(cap):
+                var idx = self._pair_slots[s]
+                if idx < 0:
+                    break
+                if self.tick_pairs[idx].a == a and self.tick_pairs[idx].b == b:
+                    var pair = self.tick_pairs[idx]
+                    pair.impulse += impulse
+                    if speed > pair.speed:
+                        pair.speed = speed
+                        pair.point = point
+                        pair.normal = normal
+                    self.tick_pairs[idx] = pair
+                    return
+                s = (s + 1) & mask
         var made = PairTouch(a, b)
         made.speed = speed
         made.impulse = impulse
         made.point = point
         made.normal = normal
-        self.tick_pairs.insert(lo, made)
+        var new_idx = len(self.tick_pairs)
+        self.tick_pairs.append(made)
+        if len(self._pair_slots) == 0 or (new_idx + 1) * 2 >= len(self._pair_slots):
+            self._rebuild_pair_index((new_idx + 1) * 2 + 8)
+        else:
+            var mask = len(self._pair_slots) - 1
+            var s = Int(_pair_hash(a, b)) & mask
+            while self._pair_slots[s] >= 0:
+                s = (s + 1) & mask
+            self._pair_slots[s] = new_idx
 
     def end_tick(mut self, mut events: List[PhysicsEvent]):
-        """Drop unseen contacts, age the rest, and add the begin, end and hit
+        """Drop unseen contacts, age the rest, sort deterministically, and add the begin, end and hit
         events (already in (a, b) order within each kind)."""
         var kept = List[CachedContact](capacity=len(self.entries))
         for entry in self.entries:
@@ -348,7 +521,12 @@ struct ContactCache(Copyable, Movable):
                 var aged = entry
                 aged.ticks += 1
                 kept.append(aged)
+        _sort_cached_contacts(kept)
         self.entries = kept^
+        self._entries_dirty = False
+        self._rebuild_entry_index(0)
+
+        _sort_pair_touches(self.tick_pairs)
         # Begin: in this tick's pairs, not in last tick's. End: the other way.
         var old = 0
         for pair in self.tick_pairs:
@@ -403,17 +581,32 @@ struct ContactCache(Copyable, Movable):
 
     def serialize(self, mut out: BlobWriter):
         out.integer(self.next_id)
-        out.integer(len(self.entries))
-        for entry in self.entries:
-            out.integer(entry.a)
-            out.integer(entry.b)
-            out.integer(entry.feature)
-            out.integer(entry.id)
-            out.integer(entry.ticks)
-            out.vec3(entry.normal)
-            out.vec3(entry.anchor)
-            out.f32(entry.impulse)
-            out.vec3(entry.tangent)
+        if self._entries_dirty:
+            var sorted_entries = self.entries.copy()
+            _sort_cached_contacts(sorted_entries)
+            out.integer(len(sorted_entries))
+            for entry in sorted_entries:
+                out.integer(entry.a)
+                out.integer(entry.b)
+                out.integer(entry.feature)
+                out.integer(entry.id)
+                out.integer(entry.ticks)
+                out.vec3(entry.normal)
+                out.vec3(entry.anchor)
+                out.f32(entry.impulse)
+                out.vec3(entry.tangent)
+        else:
+            out.integer(len(self.entries))
+            for entry in self.entries:
+                out.integer(entry.a)
+                out.integer(entry.b)
+                out.integer(entry.feature)
+                out.integer(entry.id)
+                out.integer(entry.ticks)
+                out.vec3(entry.normal)
+                out.vec3(entry.anchor)
+                out.f32(entry.impulse)
+                out.vec3(entry.tangent)
         out.integer(len(self.touching_a))
         for index in range(len(self.touching_a)):
             out.integer(self.touching_a[index])
@@ -439,6 +632,8 @@ struct ContactCache(Copyable, Movable):
                 entry.tangent = input.vec3()
             entry.ticks = ticks
             self.entries.append(entry)
+        self._entries_dirty = False
+        self._rebuild_entry_index(0)
         var pairs = input.integer()
         if pairs < 0 or pairs > 1 << 20:
             raise Error("contact cache blob lists " + String(pairs) + " touching pairs")

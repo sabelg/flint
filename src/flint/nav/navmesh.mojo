@@ -1547,6 +1547,65 @@ struct NavMesh(Copyable, Movable):
         var best_idx = -1
         var best_pt = p
         var best_d2 = max_search_dist * max_search_dist
+
+        if len(self.tiles) > 0 and self.tiles_x > 0 and self.tiles_z > 0 and self.tile_size > 0:
+            var tile_w = Float32(self.tile_size) * self.chf.cell_size
+            var inv_tw = Float32(1.0) / max(Float32(1.0e-5), tile_w)
+            var orig = self.chf.origin
+            var tx0 = max(0, Int(floor((p.x - max_search_dist - orig.x) * inv_tw)))
+            var tx1 = min(self.tiles_x - 1, Int(floor((p.x + max_search_dist - orig.x) * inv_tw)))
+            var tz0 = max(0, Int(floor((p.z - max_search_dist - orig.z) * inv_tw)))
+            var tz1 = min(self.tiles_z - 1, Int(floor((p.z + max_search_dist - orig.z) * inv_tw)))
+            if tx0 > tx1 or tz0 > tz1:
+                return (-1, p)
+
+            # Check the tile containing `p` first to tighten `best_d2` before scanning neighbors
+            var ctx = max(tx0, min(tx1, Int(floor((p.x - orig.x) * inv_tw))))
+            var ctz = max(tz0, min(tz1, Int(floor((p.z - orig.z) * inv_tw))))
+            ref c_pids = self.tiles[ctz * self.tiles_x + ctx].poly_ids
+            for k in range(len(c_pids)):
+                var pid = c_pids[k]
+                var cp = self.polys[pid].closest_point_xz(p)
+                var d2 = (cp - p).length_squared()
+                if d2 < best_d2 or (d2 == best_d2 and (best_idx < 0 or pid < best_idx)):
+                    best_d2 = d2
+                    best_idx = pid
+                    best_pt = cp
+
+            for tz in range(tz0, tz1 + 1):
+                var tile_z0 = orig.z + Float32(tz) * tile_w
+                var tile_z1 = tile_z0 + tile_w
+                var dz = Float32(0.0)
+                if p.z < tile_z0:
+                    dz = tile_z0 - p.z
+                elif p.z > tile_z1:
+                    dz = p.z - tile_z1
+                var dz2 = dz * dz
+                if dz2 > best_d2:
+                    continue
+                for tx in range(tx0, tx1 + 1):
+                    if tx == ctx and tz == ctz:
+                        continue
+                    var tile_x0 = orig.x + Float32(tx) * tile_w
+                    var tile_x1 = tile_x0 + tile_w
+                    var dx = Float32(0.0)
+                    if p.x < tile_x0:
+                        dx = tile_x0 - p.x
+                    elif p.x > tile_x1:
+                        dx = p.x - tile_x1
+                    if dx * dx + dz2 > best_d2:
+                        continue
+                    ref pids = self.tiles[tz * self.tiles_x + tx].poly_ids
+                    for k in range(len(pids)):
+                        var pid = pids[k]
+                        var cp = self.polys[pid].closest_point_xz(p)
+                        var d2 = (cp - p).length_squared()
+                        if d2 < best_d2 or (d2 == best_d2 and (best_idx < 0 or pid < best_idx)):
+                            best_d2 = d2
+                            best_idx = pid
+                            best_pt = cp
+            return (best_idx, best_pt)
+
         for i in range(len(self.polys)):
             var cp = self.polys[i].closest_point_xz(p)
             var d2 = (cp - p).length_squared()
@@ -1573,6 +1632,25 @@ struct NavMesh(Copyable, Movable):
         return idx
 
     def _find_poly_containing_probe(self, p: Vec3, ref_y: Float32, max_dy: Float32) -> Int:
+        if len(self.tiles) > 0 and self.tiles_x > 0 and self.tiles_z > 0 and self.tile_size > 0:
+            var tile_w = Float32(self.tile_size) * self.chf.cell_size
+            var inv_tw = Float32(1.0) / max(Float32(1.0e-5), tile_w)
+            var orig = self.chf.origin
+            var pad = Float32(2.0e-3)
+            var tx0 = max(0, Int(floor((p.x - pad - orig.x) * inv_tw)))
+            var tx1 = min(self.tiles_x - 1, Int(floor((p.x + pad - orig.x) * inv_tw)))
+            var tz0 = max(0, Int(floor((p.z - pad - orig.z) * inv_tw)))
+            var tz1 = min(self.tiles_z - 1, Int(floor((p.z + pad - orig.z) * inv_tw)))
+            for tz in range(tz0, tz1 + 1):
+                for tx in range(tx0, tx1 + 1):
+                    ref pids = self.tiles[tz * self.tiles_x + tx].poly_ids
+                    for k in range(len(pids)):
+                        var pid = pids[k]
+                        if self.polys[pid].contains_xz(p, Float32(1.5e-3)):
+                            if abs(self.polys[pid].sample_y(p.x, p.z) - ref_y) <= max_dy:
+                                return pid
+            return -1
+
         for i in range(len(self.polys)):
             if self.polys[i].contains_xz(p, Float32(1.5e-3)):
                 if abs(self.polys[i].sample_y(p.x, p.z) - ref_y) <= max_dy:

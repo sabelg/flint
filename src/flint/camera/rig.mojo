@@ -351,7 +351,21 @@ struct CameraRig(Copyable, Movable):
             var ar = _det_perlin_1d(self.shake_seed ^ 0x6666, phase + Float32(83.5)) * self.max_shake_deg.z * _CAM_DEG_TO_RAD * shake
 
             var q_shake = Quat.from_euler(ap, ay, ar)
-            self.world_pos = base_pos + base_rot.rotate(Vec3(ox, oy, oz))
+            var shake_delta = base_rot.rotate(Vec3(ox, oy, oz))
+            if shake_delta.length_squared() > Float32(1.0e-10):
+                var sh_shake = world.shapecast_sphere(
+                    base_pos,
+                    self.spring_arm.probe_radius,
+                    shake_delta,
+                    self.spring_arm.collision_filter,
+                    self.ignore_body_id,
+                )
+                if sh_shake.hit:
+                    var max_d = max(Float32(0.0), sh_shake.distance - self.spring_arm.wall_margin)
+                    var s_len = shake_delta.length()
+                    if s_len > max_d:
+                        shake_delta = shake_delta * (max_d / s_len)
+            self.world_pos = base_pos + shake_delta
             self.world_rot = (base_rot * q_shake).normalized()
             self.trauma = max(Float32(0.0), self.trauma - self.trauma_decay * dt)
         else:

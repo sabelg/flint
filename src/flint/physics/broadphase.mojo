@@ -528,6 +528,17 @@ struct PairResult(Movable):
 def find_pairs(input: BroadphaseInput, jobs: Int = 0) -> PairResult:
     """Every candidate pair, sorted by (a, b). `jobs` is the job pool's
     address (0: this thread); the result is bit-identical across worker counts."""
+    var nodes8 = List[BroadphaseNode8]()
+    return find_pairs_into_bvh8(input, nodes8, jobs)
+
+
+def find_pairs_into_bvh8(
+    input: BroadphaseInput,
+    mut out_nodes8: List[BroadphaseNode8],
+    jobs: Int = 0,
+) -> PairResult:
+    """Same as `find_pairs`, but writes the built 8-wide SAH BVH into `out_nodes8`
+    so the caller can retain and refit it without rebuilding a second BVH8 per tick."""
     var result = PairResult()
     var rows = input.rows()
     if rows < 2:
@@ -560,8 +571,9 @@ def find_pairs(input: BroadphaseInput, jobs: Int = 0) -> PairResult:
 
     var bin_nodes = List[_BpBinNode](capacity=2 * live_count)
     var bin_root = _build_bp_bvh2(input, live_rows, cx, cy, cz, 0, live_count, bin_nodes)
-    var nodes8 = List[BroadphaseNode8](capacity=(live_count + _BP_LANES - 1) // _BP_LANES + 4)
-    _ = _collapse_bp_bvh8(bin_nodes, bin_root, nodes8)
+    out_nodes8.clear()
+    out_nodes8.reserve((live_count + _BP_LANES - 1) // _BP_LANES + 4)
+    _ = _collapse_bp_bvh8(bin_nodes, bin_root, out_nodes8)
     _ = bin_nodes^
 
     var job_count = (awake_count + ROWS_PER_JOB - 1) // ROWS_PER_JOB
@@ -571,7 +583,7 @@ def find_pairs(input: BroadphaseInput, jobs: Int = 0) -> PairResult:
 
     var shared = _BpQueryShared(
         Int(Pointer(to=input)),
-        Int(Pointer(to=nodes8)),
+        Int(Pointer(to=out_nodes8)),
         Int(Pointer(to=awake_rows)),
         Int(Pointer(to=out_lists)),
         rows,
@@ -594,7 +606,7 @@ def find_pairs(input: BroadphaseInput, jobs: Int = 0) -> PairResult:
                 result.pairs.append(sub[k])
         _sort_and_dedup_pairs(result.pairs)
 
-    result.cells = len(nodes8)
+    result.cells = len(out_nodes8)
     result.wide = 0
     result.jobs = job_count
     return result^

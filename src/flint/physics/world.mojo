@@ -17,7 +17,7 @@ from std.math import sqrt, abs, min, max
 from std.ffi import external_call
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import set_sim_float_mode
-from flint.core.detsort import stable_order
+from flint.core.detsort import stable_order, mix64
 from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
@@ -27,6 +27,7 @@ from flint.physics.broadphase import (
     BroadphaseInput,
     BroadphaseNode8,
     find_pairs,
+    find_pairs_into_bvh8,
     boxes_overlap,
     _BpBinNode,
     _build_bp_bvh2,
@@ -1062,6 +1063,47 @@ struct PhysicsWorld(Movable):
         var bin_root = _build_bp_bvh2(bp_in, live_rows, cx, cy, cz, 0, live_count, bin_nodes)
         self.broadphase_nodes.reserve((live_count + 7) // 8 + 4)
         _ = _collapse_bp_bvh8(bin_nodes, bin_root, self.broadphase_nodes)
+
+    def _refit_broadphase(mut self):
+        """O(N) bottom-up refit of persisted `broadphase_nodes` to post-integration tight bounds,
+        avoiding a redundant second 16-bin SAH BVH8 rebuild per tick."""
+        var n_nodes = len(self.broadphase_nodes)
+        if n_nodes == 0:
+            return
+        for ni in range(n_nodes - 1, -1, -1):
+            var node = self.broadphase_nodes[ni]
+            for c in range(8):
+                var ch = Int(node.child[c])
+                if ch == 0:
+                    continue
+                if ch < 0:
+                    var slot = -(ch + 1)
+                    if slot >= 0 and slot < len(self.bodies) and self.bodies[slot].active:
+                        var tb = self.bodies[slot].tight_aabb_full(
+                            self.hulls, self.meshes, self.heightfields, self.compounds
+                        )
+                        node.min_x[c] = tb[0].x
+                        node.min_y[c] = tb[0].y
+                        node.min_z[c] = tb[0].z
+                        node.max_x[c] = tb[1].x
+                        node.max_y[c] = tb[1].y
+                        node.max_z[c] = tb[1].z
+                    else:
+                        node.min_x[c] = Float32(1.0e30)
+                        node.min_y[c] = Float32(1.0e30)
+                        node.min_z[c] = Float32(1.0e30)
+                        node.max_x[c] = Float32(-1.0e30)
+                        node.max_y[c] = Float32(-1.0e30)
+                        node.max_z[c] = Float32(-1.0e30)
+                else:
+                    ref cn = self.broadphase_nodes[ch]
+                    node.min_x[c] = cn.min_x.reduce_min()
+                    node.min_y[c] = cn.min_y.reduce_min()
+                    node.min_z[c] = cn.min_z.reduce_min()
+                    node.max_x[c] = cn.max_x.reduce_max()
+                    node.max_y[c] = cn.max_y.reduce_max()
+                    node.max_z[c] = cn.max_z.reduce_max()
+            self.broadphase_nodes[ni] = node
 
     def _insert_broadphase_leaf_fast(mut self, slot: Int):
         """Incrementally inserts `slot` into `broadphase_nodes` when root has a free lane,
@@ -2718,7 +2760,121 @@ struct PhysicsWorld(Movable):
             return _make_capsule_hull(ch.radius, ch.half_height)
         return _make_capsule_hull(ch.radius, Float32(0.0))
 
-    def _collide_pair(self, row_a: Int, row_b: Int) -> ContactManifold:
+    def _stamp_manifold_feature_prefix(self, mut m: ContactManifold, prefix: UInt32):
+        if m.count >= 1:
+            m.p0.id = prefix | (m.p0.id & UInt32(15))
+        if m.count >= 2:
+            m.p1.id = prefix | (m.p1.id & UInt32(15))
+        if m.count >= 3:
+            m.p2.id = prefix | (m.p2.id & UInt32(15))
+        if m.count >= 4:
+            m.p3.id = prefix | (m.p3.id & UInt32(15))
+
+    def _collide_pair_into(
+        self,
+        row_a: Int,
+        row_b: Int,
+        mut out_manifolds: List[ContactManifold],
+        speculative_dist: Float32 = 0.0,
+    ):
+        """Generates one or more narrowphase contact manifolds for `(row_a, row_b)`.
+        Compound shapes emit per-child manifolds (with child AABB culling) so distinct
+        child face normals are never merged or corrupted into a single normal."""
+        ref a = self.bodies[row_a]
+        ref b = self.bodies[row_b]
+        var sa = a.shape
+        var sb = b.shape
+
+        if sa == BODY_SHAPE_COMPOUND or sb == BODY_SHAPE_COMPOUND:
+            if (
+                sa == BODY_SHAPE_MESH_BVH8 or sa == BODY_SHAPE_HEIGHTFIELD
+                or sb == BODY_SHAPE_MESH_BVH8 or sb == BODY_SHAPE_HEIGHTFIELD
+            ):
+                var m = self._collide_pair(row_a, row_b, speculative_dist)
+                if m.has_collision and m.count > 0:
+                    out_manifolds.append(m^)
+                return
+
+            var pad = Vec3(speculative_dist + Float32(1.0e-3), speculative_dist + Float32(1.0e-3), speculative_dist + Float32(1.0e-3))
+            if sa == BODY_SHAPE_COMPOUND and sb == BODY_SHAPE_COMPOUND:
+                ref ca_cmp = self.compounds[a.shape_index]
+                ref cb_cmp = self.compounds[b.shape_index]
+                var nb = len(cb_cmp.children)
+                var b_lo = List[Vec3](capacity=nb)
+                var b_hi = List[Vec3](capacity=nb)
+                for ib in range(nb):
+                    var bb = cb_cmp.children[ib].tight_aabb(b.pos, b.rot)
+                    b_lo.append(bb[0] - pad)
+                    b_hi.append(bb[1] + pad)
+                for ia in range(len(ca_cmp.children)):
+                    var ab = ca_cmp.children[ia].tight_aabb(a.pos, a.rot)
+                    var alo = ab[0] - pad
+                    var ahi = ab[1] + pad
+                    var has_ha = False
+                    var wa = (Vec3(), Quat())
+                    var ha = ConvexHull()
+                    for ib in range(nb):
+                        if not boxes_overlap(alo, ahi, b_lo[ib], b_hi[ib]):
+                            continue
+                        if not has_ha:
+                            wa = ca_cmp.children[ia].world_pose(a.pos, a.rot)
+                            ha = self._child_as_hull(ca_cmp.children[ia])
+                            has_ha = True
+                        var wb = cb_cmp.children[ib].world_pose(b.pos, b.rot)
+                        var hb = self._child_as_hull(cb_cmp.children[ib])
+                        var cm = collide_convex_convex(ha, wa[0], wa[1], hb, wb[0], wb[1], row_a, row_b)
+                        if cm.has_collision and cm.count > 0:
+                            self._stamp_manifold_feature_prefix(cm, UInt32((ia * 32 + ib) << 4))
+                            out_manifolds.append(cm^)
+                return
+            elif sa == BODY_SHAPE_COMPOUND:
+                ref ca_cmp = self.compounds[a.shape_index]
+                var bb = b.tight_aabb_full(self.hulls, self.meshes, self.heightfields, self.compounds)
+                var blo = bb[0] - pad
+                var bhi = bb[1] + pad
+                var has_hb = False
+                var hb = ConvexHull()
+                for ia in range(len(ca_cmp.children)):
+                    var ab = ca_cmp.children[ia].tight_aabb(a.pos, a.rot)
+                    if not boxes_overlap(ab[0] - pad, ab[1] + pad, blo, bhi):
+                        continue
+                    if not has_hb:
+                        hb = self._body_as_hull(row_b)
+                        has_hb = True
+                    var wa = ca_cmp.children[ia].world_pose(a.pos, a.rot)
+                    var ha = self._child_as_hull(ca_cmp.children[ia])
+                    var cm = collide_convex_convex(ha, wa[0], wa[1], hb, b.pos, b.rot, row_a, row_b)
+                    if cm.has_collision and cm.count > 0:
+                        self._stamp_manifold_feature_prefix(cm, UInt32(ia << 4))
+                        out_manifolds.append(cm^)
+                return
+            else:
+                ref cb_cmp = self.compounds[b.shape_index]
+                var ab = a.tight_aabb_full(self.hulls, self.meshes, self.heightfields, self.compounds)
+                var alo = ab[0] - pad
+                var ahi = ab[1] + pad
+                var has_ha = False
+                var ha = ConvexHull()
+                for ib in range(len(cb_cmp.children)):
+                    var bb = cb_cmp.children[ib].tight_aabb(b.pos, b.rot)
+                    if not boxes_overlap(alo, ahi, bb[0] - pad, bb[1] + pad):
+                        continue
+                    if not has_ha:
+                        ha = self._body_as_hull(row_a)
+                        has_ha = True
+                    var wb = cb_cmp.children[ib].world_pose(b.pos, b.rot)
+                    var hb = self._child_as_hull(cb_cmp.children[ib])
+                    var cm = collide_convex_convex(ha, a.pos, a.rot, hb, wb[0], wb[1], row_a, row_b)
+                    if cm.has_collision and cm.count > 0:
+                        self._stamp_manifold_feature_prefix(cm, UInt32(ib << 4))
+                        out_manifolds.append(cm^)
+                return
+
+        var m = self._collide_pair(row_a, row_b, speculative_dist)
+        if m.has_collision and m.count > 0:
+            out_manifolds.append(m^)
+
+    def _collide_pair(self, row_a: Int, row_b: Int, speculative_dist: Float32 = 0.0) -> ContactManifold:
         """Discrete narrowphase between `row_a` and `row_b`.
         Invariant: returned `normal` ALWAYS points from `row_a` toward `row_b` (`A -> B`)."""
         ref a = self.bodies[row_a]
@@ -2754,61 +2910,29 @@ struct PhysicsWorld(Movable):
             return m^
 
         if sa == BODY_SHAPE_COMPOUND or sb == BODY_SHAPE_COMPOUND:
-            var m = ContactManifold(row_a, row_b)
-            var cands = List[NarrowContactPoint]()
-            if sa == BODY_SHAPE_COMPOUND and sb == BODY_SHAPE_COMPOUND:
-                ref ca_cmp = self.compounds[a.shape_index]
-                ref cb_cmp = self.compounds[b.shape_index]
-                for ia in range(len(ca_cmp.children)):
-                    var wa = ca_cmp.children[ia].world_pose(a.pos, a.rot)
-                    var ha = self._child_as_hull(ca_cmp.children[ia])
-                    for ib in range(len(cb_cmp.children)):
-                        var wb = cb_cmp.children[ib].world_pose(b.pos, b.rot)
-                        var hb = self._child_as_hull(cb_cmp.children[ib])
-                        var cm = collide_convex_convex(ha, wa[0], wa[1], hb, wb[0], wb[1], row_a, row_b)
-                        for pi in range(cm.count):
-                            var cp = cm.get_point(pi)
-                            cands.append(NarrowContactPoint(cp.point, cp.normal, cp.depth, UInt32((ia * 32 + ib) * 8 + pi)))
-            elif sa == BODY_SHAPE_COMPOUND:
-                ref ca_cmp = self.compounds[a.shape_index]
-                var hb = self._body_as_hull(row_b)
-                for ia in range(len(ca_cmp.children)):
-                    var wa = ca_cmp.children[ia].world_pose(a.pos, a.rot)
-                    var ha = self._child_as_hull(ca_cmp.children[ia])
-                    var cm = collide_convex_convex(ha, wa[0], wa[1], hb, b.pos, b.rot, row_a, row_b)
-                    for pi in range(cm.count):
-                        var cp = cm.get_point(pi)
-                        cands.append(NarrowContactPoint(cp.point, cp.normal, cp.depth, UInt32(ia * 16 + pi)))
-            else:
-                var ha = self._body_as_hull(row_a)
-                ref cb_cmp = self.compounds[b.shape_index]
-                for ib in range(len(cb_cmp.children)):
-                    var wb = cb_cmp.children[ib].world_pose(b.pos, b.rot)
-                    var hb = self._child_as_hull(cb_cmp.children[ib])
-                    var cm = collide_convex_convex(ha, a.pos, a.rot, hb, wb[0], wb[1], row_a, row_b)
-                    for pi in range(cm.count):
-                        var cp = cm.get_point(pi)
-                        cands.append(NarrowContactPoint(cp.point, cp.normal, cp.depth, UInt32(ib * 16 + pi)))
-            reduce_manifold_candidates(m, cands)
-            return m^
+            var ms = List[ContactManifold]()
+            self._collide_pair_into(row_a, row_b, ms, speculative_dist)
+            if len(ms) > 0:
+                return ms[0].copy()
+            return ContactManifold(row_a, row_b)
 
         if sa == BODY_SHAPE_SPHERE and sb == BODY_SHAPE_SPHERE:
-            return collide_sphere_sphere(a.pos, a.radius, b.pos, b.radius, row_a, row_b)
+            return collide_sphere_sphere(a.pos, a.radius, b.pos, b.radius, row_a, row_b, speculative_dist)
 
         if sa == BODY_SHAPE_SPHERE and sb == BODY_SHAPE_CAPSULE:
             var eb = b.capsule_endpoints()
-            return collide_sphere_capsule(a.pos, a.radius, eb[0], eb[1], b.radius, row_a, row_b)
+            return collide_sphere_capsule(a.pos, a.radius, eb[0], eb[1], b.radius, row_a, row_b, speculative_dist)
         if sa == BODY_SHAPE_CAPSULE and sb == BODY_SHAPE_SPHERE:
             var ea = a.capsule_endpoints()
-            var m = collide_sphere_capsule(b.pos, b.radius, ea[0], ea[1], a.radius, row_a, row_b)
+            var m = collide_sphere_capsule(b.pos, b.radius, ea[0], ea[1], a.radius, row_a, row_b, speculative_dist)
             if m.has_collision:
                 _negate_manifold_normals(m)
             return m^
 
         if sa == BODY_SHAPE_SPHERE and sb == BODY_SHAPE_BOX:
-            return collide_sphere_box(a.pos, a.radius, b.pos, b.rot, b.half_extents, row_a, row_b)
+            return collide_sphere_box(a.pos, a.radius, b.pos, b.rot, b.half_extents, row_a, row_b, speculative_dist)
         if sa == BODY_SHAPE_BOX and sb == BODY_SHAPE_SPHERE:
-            var m = collide_sphere_box(b.pos, b.radius, a.pos, a.rot, a.half_extents, row_a, row_b)
+            var m = collide_sphere_box(b.pos, b.radius, a.pos, a.rot, a.half_extents, row_a, row_b, speculative_dist)
             if m.has_collision:
                 _negate_manifold_normals(m)
             return m^
@@ -2816,7 +2940,7 @@ struct PhysicsWorld(Movable):
         if sa == BODY_SHAPE_CAPSULE and sb == BODY_SHAPE_CAPSULE:
             var ea = a.capsule_endpoints()
             var eb = b.capsule_endpoints()
-            return collide_capsule_capsule(ea[0], ea[1], a.radius, eb[0], eb[1], b.radius, row_a, row_b)
+            return collide_capsule_capsule(ea[0], ea[1], a.radius, eb[0], eb[1], b.radius, row_a, row_b, speculative_dist)
 
         if sa == BODY_SHAPE_CAPSULE and sb == BODY_SHAPE_BOX:
             var ea = a.capsule_endpoints()
@@ -2860,9 +2984,17 @@ struct PhysicsWorld(Movable):
             elif b.motion_mode == BODY_MOTION_STATIC and (not b.is_static) and b.inv_mass > Float32(0.0):
                 b.motion_mode = BODY_MOTION_DYNAMIC
 
-    def _run_ccd_clamp(mut self, dt: Float32):
+    def _run_ccd_clamp(
+        mut self,
+        dt: Float32,
+        mut clamped_slots: List[Int],
+        mut clamped_vpost: List[Vec3],
+        mut clamped_rem: List[Float32],
+    ):
         """Swept anti-tunneling clamp for bodies with `enable_ccd = True` against all collider shapes
-        (`Sphere`, `Box`, `Capsule`, `ConvexHull`, `Bvh8MeshCollider`, `HeightfieldCollider`, `CompoundShape`)."""
+        (`Sphere`, `Box`, `Capsule`, `ConvexHull`, `Bvh8MeshCollider`, `HeightfieldCollider`, `CompoundShape`).
+        Applies a momentum-conserving bilateral impulse to any hit dynamic body and scales the
+        remaining-tick solver velocity by `(1 - toi)` to prevent double-integration."""
         for i in range(len(self.bodies)):
             if not self.bodies[i].active or self.bodies[i].is_static or not self.bodies[i].awake or not self.bodies[i].enable_ccd:
                 continue
@@ -2885,6 +3017,7 @@ struct PhysicsWorld(Movable):
 
             var best_toi = Float32(1.0)
             var best_normal = Vec3(0.0, 1.0, 0.0)
+            var best_slot = -1
             var hit_any = False
             var proj_hull = self._body_as_hull(i)
             var proj_rot = self.bodies[i].rot
@@ -2903,6 +3036,7 @@ struct PhysicsWorld(Movable):
                     if sh.hit and sh.toi < best_toi:
                         best_toi = sh.toi
                         best_normal = sh.normal
+                        best_slot = m_slot
                         hit_any = True
                 elif mb.shape == BODY_SHAPE_HEIGHTFIELD and mb.shape_index >= 0 and mb.shape_index < len(self.heightfields):
                     var inv_mr = mb.rot.conjugate()
@@ -2912,12 +3046,14 @@ struct PhysicsWorld(Movable):
                     if sh.hit and sh.toi < best_toi:
                         best_toi = sh.toi
                         best_normal = mb.rot.rotate(sh.normal).normalized()
+                        best_slot = m_slot
                         hit_any = True
                 elif mb.shape == BODY_SHAPE_SPHERE:
                     var sh = swept_sphere_moving_sphere(p0, p1, r_core, mb_p0, mb_p1, mb.radius)
                     if sh.hit and sh.toi < best_toi:
                         best_toi = sh.toi
                         best_normal = sh.normal
+                        best_slot = m_slot
                         hit_any = True
                 elif mb.shape == BODY_SHAPE_BOX:
                     var rel_p1 = p0 + (step_vec - (mb_p1 - mb_p0))
@@ -2927,6 +3063,7 @@ struct PhysicsWorld(Movable):
                     if sh.hit and sh.toi < best_toi:
                         best_toi = sh.toi
                         best_normal = sh.normal
+                        best_slot = m_slot
                         hit_any = True
                 elif mb.shape == BODY_SHAPE_CAPSULE or mb.shape == BODY_SHAPE_CONVEX_HULL:
                     var thull = self._body_as_hull(m_slot)
@@ -2934,6 +3071,7 @@ struct PhysicsWorld(Movable):
                     if sh.hit and sh.toi < best_toi:
                         best_toi = sh.toi
                         best_normal = sh.normal
+                        best_slot = m_slot
                         hit_any = True
                 elif mb.shape == BODY_SHAPE_COMPOUND and mb.shape_index >= 0 and mb.shape_index < len(self.compounds):
                     ref cmp = self.compounds[mb.shape_index]
@@ -2945,15 +3083,36 @@ struct PhysicsWorld(Movable):
                         if sh.hit and sh.toi < best_toi:
                             best_toi = sh.toi
                             best_normal = sh.normal
+                            best_slot = m_slot
                             hit_any = True
 
             if hit_any and best_toi < Float32(1.0):
-                self.bodies[i].pos = p0 + step_vec * best_toi - best_normal * Float32(0.001)
-                var vn = self.bodies[i].linear_vel.dot(best_normal)
-                if vn < Float32(0.0):
-                    var v_tan = self.bodies[i].linear_vel - best_normal * vn
-                    var v_reb = -vn * self.bodies[i].restitution
-                    self.bodies[i].linear_vel = v_tan * max(Float32(0.0), Float32(1.0) - best_toi) + best_normal * v_reb
+                var n = best_normal.normalized()
+                var v_a = self.bodies[i].linear_vel
+                var other_dyn = best_slot >= 0 and not self.bodies[best_slot].is_static
+                var v_b = self.bodies[best_slot].linear_vel if best_slot >= 0 else Vec3()
+                var inv_m_a = self.bodies[i].inv_mass
+                var inv_m_b = self.bodies[best_slot].inv_mass if other_dyn else Float32(0.0)
+
+                # Advance body i to exact impact point with 1 mm clearance along outward normal
+                self.bodies[i].pos = p0 + step_vec * best_toi + n * Float32(0.001)
+
+                var vn = (v_a - v_b).dot(n)
+                var v_a_post = v_a
+                if vn < Float32(0.0) and (inv_m_a + inv_m_b) > Float32(1.0e-10):
+                    var e = max(self.bodies[i].restitution, self.bodies[best_slot].restitution) if best_slot >= 0 else self.bodies[i].restitution
+                    var j_n = -(Float32(1.0) + e) * vn / (inv_m_a + inv_m_b)
+                    v_a_post = v_a + n * (j_n * inv_m_a)
+                    if other_dyn:
+                        if not self.bodies[best_slot].awake:
+                            self.wake(best_slot)
+                        self.bodies[best_slot].linear_vel = v_b - n * (j_n * inv_m_b)
+
+                var rem_frac = max(Float32(0.0), Float32(1.0) - best_toi)
+                self.bodies[i].linear_vel = v_a_post * rem_frac
+                clamped_slots.append(i)
+                clamped_vpost.append(v_a_post)
+                clamped_rem.append(rem_frac)
 
     def _update_sensors(mut self):
         if len(self.sensors) == 0:
@@ -3137,6 +3296,7 @@ struct PhysicsWorld(Movable):
         # 1. Sensors, Triggers & Kill volumes
         self._update_sensors()
         self._update_triggers()
+        var killed_any = False
         for i in range(len(self.bodies)):
             if not self.bodies[i].active or self.bodies[i].is_static:
                 continue
@@ -3148,6 +3308,7 @@ struct PhysicsWorld(Movable):
                     killed = True
                     break
             if killed:
+                killed_any = True
                 var ev = PhysicsEvent(EVENT_KILL, self.bodies[i].id, 0, p)
                 ev.material = self.bodies[i].material
                 self.events.append(ev)
@@ -3157,9 +3318,12 @@ struct PhysicsWorld(Movable):
                 self.islands.drop(i)
 
         # 2. Optional anti-tunneling CCD clamp across all collider types
-        self._run_ccd_clamp(dt)
+        var ccd_slots = List[Int]()
+        var ccd_vpost = List[Vec3]()
+        var ccd_rem = List[Float32]()
+        self._run_ccd_clamp(dt, ccd_slots, ccd_vpost, ccd_rem)
 
-        # 3. Broadphase over all active bodies
+        # 3. Broadphase over all active bodies (retained into `self.broadphase_nodes` to avoid double rebuild)
         var n_rows = len(self.bodies)
         var bp_in = BroadphaseInput()
         var spec = Vec3(SPECULATIVE_DISTANCE, SPECULATIVE_DISTANCE, SPECULATIVE_DISTANCE)
@@ -3186,9 +3350,9 @@ struct PhysicsWorld(Movable):
                     hi = hi + rp
             bp_in.add(lo, hi, True, is_moving, b.filter)
 
-        var bp_res = find_pairs(bp_in, pool_address)
+        var bp_res = find_pairs_into_bvh8(bp_in, self.broadphase_nodes, pool_address)
 
-        # 4. Discrete Narrowphase & wake sleeping dynamic bodies hit by awake/moving bodies
+        # 4. Discrete + Speculative Narrowphase & wake sleeping dynamic bodies hit by awake/moving bodies
         var raw_manifolds = List[ContactManifold]()
         for pk in range(len(bp_res.pairs)):
             var code = bp_res.pairs[pk]
@@ -3196,13 +3360,13 @@ struct PhysicsWorld(Movable):
             var row_b = code % n_rows
             if self.bodies[row_a].is_static and self.bodies[row_b].is_static:
                 continue
-            var nm = self._collide_pair(row_a, row_b)
-            if nm.has_collision and nm.count > 0:
+            var before_m = len(raw_manifolds)
+            self._collide_pair_into(row_a, row_b, raw_manifolds, SPECULATIVE_DISTANCE)
+            if len(raw_manifolds) > before_m:
                 if not self.bodies[row_a].is_static and not self.bodies[row_a].awake:
                     self.wake(row_a)
                 if not self.bodies[row_b].is_static and not self.bodies[row_b].awake:
                     self.wake(row_b)
-                raw_manifolds.append(nm)
 
         # Wake bodies linked to awake/moving bodies via unbroken joints & SixDofMotorJoints
         for ji in range(len(self.joints)):
@@ -3617,22 +3781,37 @@ struct PhysicsWorld(Movable):
             self.bodies[r].force_accum = Vec3()
             self.bodies[r].torque_accum = Vec3()
 
+        # Restore unscaled post-impact velocity for CCD-clamped bodies (preserving any solver delta)
+        for ci in range(len(ccd_slots)):
+            var cs = ccd_slots[ci]
+            var vp = ccd_vpost[ci]
+            var rf = ccd_rem[ci]
+            if rf < Float32(0.999) and self.bodies[cs].active and not self.bodies[cs].is_static:
+                var dv_solver = self.bodies[cs].linear_vel - vp * rf
+                self.bodies[cs].linear_vel = vp + dv_solver
+
         # 10. Persist solved impulses to ContactCache and record PairTouch for events
+        var manifold_touched = List[Bool](length=len(solver_manifolds), fill=False)
         for mi in range(len(solver_manifolds)):
             ref sm = solver_manifolds[mi]
             var cache_a = min(self.bodies[sm.a].id, sm.other) if sm.b_moves else self.bodies[sm.a].id
             var cache_b = max(self.bodies[sm.a].id, sm.other) if sm.b_moves else sm.other
             var max_spd = Float32(0.0)
             var sum_imp = Float32(0.0)
+            var has_pen = False
             var best_pt = sm.points[0].point if len(sm.points) > 0 else self.bodies[sm.a].pos
             for pi in range(len(sm.points)):
                 ref scp = sm.points[pi]
                 self.cache.store(cache_a, cache_b, scp.feature, scp.normal_impulse, scp.tangent_impulse)
                 sum_imp += scp.total_impulse
+                if scp.depth >= Float32(0.0):
+                    has_pen = True
                 if scp.speed >= max_spd:
                     max_spd = scp.speed
                     best_pt = scp.point
-            self.cache.touch(cache_a, cache_b, max_spd, sum_imp, best_pt, sm.normal)
+            if has_pen or sum_imp > Float32(0.0):
+                manifold_touched[mi] = True
+                self.cache.touch(cache_a, cache_b, max_spd, sum_imp, best_pt, sm.normal)
 
         var sleeping_ids = List[Int]()
         for i in range(n_rows):
@@ -3682,6 +3861,8 @@ struct PhysicsWorld(Movable):
         var link_ra = List[Int]()
         var link_rb = List[Int]()
         for mi in range(len(solver_manifolds)):
+            if not manifold_touched[mi]:
+                continue
             ref sm = solver_manifolds[mi]
             if sm.b_moves and sm.b >= 0 and not self.bodies[sm.a].is_static and not self.bodies[sm.b].is_static:
                 var id0 = self.bodies[sm.a].id
@@ -3739,53 +3920,76 @@ struct PhysicsWorld(Movable):
             self.islands.split(lbl, body_ids)
             splits_done += 1
 
-        # 12. Island sleep evaluation
-        if self.enable_sleeping:
-            for i in range(n_rows):
-                if not self.bodies[i].active or self.bodies[i].is_static or not self.bodies[i].awake:
-                    continue
-                if not self.bodies[i].can_sleep:
-                    self.bodies[i].sleep_ticks = 0
-                    continue
-                var v2 = self.bodies[i].linear_vel.length_squared()
-                var w2 = self.bodies[i].angular_vel.length_squared()
-                if v2 <= SLEEP_LIN_SPEED * SLEEP_LIN_SPEED and w2 <= SLEEP_ANG_SPEED * SLEEP_ANG_SPEED:
-                    self.bodies[i].sleep_ticks += 1
-                else:
-                    self.bodies[i].sleep_ticks = 0
+        # 12. O(N) Island sleep evaluation via per-island open-addressed hash accumulators
+        if self.enable_sleeping and n_rows > 0:
+            var hcap = 16
+            var htarget = (n_rows + len(self.islands.pending)) * 2 + 8
+            while hcap < htarget:
+                hcap *= 2
+            var hmask = hcap - 1
+            var isl_keys = List[Int](length=hcap, fill=NO_ISLAND)
+            var isl_has_awake = List[Bool](length=hcap, fill=False)
+            var isl_ready = List[Bool](length=hcap, fill=True)
 
-            var checked = List[Int]()
+            # Pending islands cannot sleep this tick
+            for pi in range(len(self.islands.pending)):
+                var plbl = self.islands.pending[pi]
+                if plbl == NO_ISLAND:
+                    continue
+                var s = Int(mix64(UInt64(plbl))) & hmask
+                while isl_keys[s] != NO_ISLAND and isl_keys[s] != plbl:
+                    s = (s + 1) & hmask
+                isl_keys[s] = plbl
+                isl_ready[s] = False
+
+            var lin_thresh2 = SLEEP_LIN_SPEED * SLEEP_LIN_SPEED
+            var ang_thresh2 = SLEEP_ANG_SPEED * SLEEP_ANG_SPEED
             for i in range(n_rows):
-                if not self.bodies[i].active or self.bodies[i].is_static or not self.bodies[i].awake:
+                if not self.bodies[i].active or self.bodies[i].is_static:
+                    continue
+                if self.bodies[i].awake:
+                    if not self.bodies[i].can_sleep:
+                        self.bodies[i].sleep_ticks = 0
+                    else:
+                        var v2 = self.bodies[i].linear_vel.length_squared()
+                        var w2 = self.bodies[i].angular_vel.length_squared()
+                        if v2 <= lin_thresh2 and w2 <= ang_thresh2:
+                            self.bodies[i].sleep_ticks += 1
+                        else:
+                            self.bodies[i].sleep_ticks = 0
+                var lbl = self.islands.label[i]
+                if lbl == NO_ISLAND:
+                    continue
+                var s = Int(mix64(UInt64(lbl))) & hmask
+                while isl_keys[s] != NO_ISLAND and isl_keys[s] != lbl:
+                    s = (s + 1) & hmask
+                isl_keys[s] = lbl
+                if self.bodies[i].awake:
+                    isl_has_awake[s] = True
+                if not self.bodies[i].can_sleep or self.bodies[i].sleep_ticks < self.sleep_threshold_ticks:
+                    isl_ready[s] = False
+
+            for i in range(n_rows):
+                if not self.bodies[i].active or self.bodies[i].is_static:
                     continue
                 var lbl = self.islands.label[i]
-                if lbl == NO_ISLAND or self.islands.is_pending(lbl):
+                if lbl == NO_ISLAND:
                     continue
-                var seen_lbl = False
-                for c_lbl in checked:
-                    if c_lbl == lbl:
-                        seen_lbl = True
-                        break
-                if seen_lbl:
-                    continue
-                checked.append(lbl)
-
-                var ready_to_sleep = True
-                for j in range(n_rows):
-                    if self.bodies[j].active and not self.bodies[j].is_static and self.islands.label[j] == lbl:
-                        if not self.bodies[j].can_sleep or self.bodies[j].sleep_ticks < self.sleep_threshold_ticks:
-                            ready_to_sleep = False
-                            break
-                if ready_to_sleep:
-                    for j in range(n_rows):
-                        if self.bodies[j].active and not self.bodies[j].is_static and self.islands.label[j] == lbl:
-                            self.bodies[j].awake = False
-                            self.bodies[j].linear_vel = Vec3()
-                            self.bodies[j].angular_vel = Vec3()
-                            self.events.append(PhysicsEvent(EVENT_SLEEP, self.bodies[j].id, 0))
+                var s = Int(mix64(UInt64(lbl))) & hmask
+                while isl_keys[s] != NO_ISLAND and isl_keys[s] != lbl:
+                    s = (s + 1) & hmask
+                if isl_keys[s] == lbl and isl_has_awake[s] and isl_ready[s]:
+                    self.bodies[i].awake = False
+                    self.bodies[i].linear_vel = Vec3()
+                    self.bodies[i].angular_vel = Vec3()
+                    self.events.append(PhysicsEvent(EVENT_SLEEP, self.bodies[i].id, 0))
 
         # 13. Refresh persisted `broadphase_nodes` to post-integration tight bounds for scene queries
-        self.rebuild_broadphase()
+        #     O(N) bottom-up refit reuses the BVH8 built in step 3 instead of rebuilding a second SAH BVH8.
+        if bp_res.cells > 0:
+            self._refit_broadphase()
+        elif killed_any or len(awake_slots) > 0 or len(self.broadphase_nodes) == 0:
+            self.rebuild_broadphase()
         sort_events(self.events)
 
     # =========================================================================

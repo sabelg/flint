@@ -26,6 +26,13 @@ from flint.physics.narrowphase import (
     collide_capsule_box,
     collide_convex_convex,
 )
+from flint.physics.broadphase import boxes_overlap
+from flint.physics.shapes_v5 import (
+    COMPOUND_CHILD_SPHERE,
+    COMPOUND_CHILD_CAPSULE,
+    COMPOUND_CHILD_BOX,
+    COMPOUND_CHILD_CONVEX,
+)
 from flint.physics.world import (
     PhysicsWorld,
     SceneCastHit,
@@ -34,6 +41,7 @@ from flint.physics.world import (
     BODY_SHAPE_BOX,
     BODY_SHAPE_MESH_BVH8,
     BODY_SHAPE_HEIGHTFIELD,
+    BODY_SHAPE_COMPOUND,
     BODY_MOTION_DYNAMIC,
     _make_capsule_hull,
 )
@@ -210,6 +218,47 @@ struct CharacterController(Copyable, Movable):
                 var cp = lm.get_point(pi)
                 wm.add_point(b.pos + b.rot.rotate(cp.point), b.rot.rotate(cp.normal).normalized(), cp.depth, cp.id)
             return wm^
+        if b.shape == BODY_SHAPE_COMPOUND and b.shape_index >= 0 and b.shape_index < len(world.compounds):
+            ref cmp = world.compounds[b.shape_index]
+            var rv = Vec3(r_eff, r_eff, r_eff)
+            var cap_lo = Vec3(min(cap_a.x, cap_b.x), min(cap_a.y, cap_b.y), min(cap_a.z, cap_b.z)) - rv
+            var cap_hi = Vec3(max(cap_a.x, cap_b.x), max(cap_a.y, cap_b.y), max(cap_a.z, cap_b.z)) + rv
+            var best_m = ContactManifold()
+            var best_depth = Float32(-1.0e30)
+            var has_kcc_h = False
+            var kcc_h = _make_capsule_hull(r_eff, self.cfg.half_height)
+            for ci in range(len(cmp.children)):
+                ref ch = cmp.children[ci]
+                var cbb = ch.tight_aabb(b.pos, b.rot)
+                if not boxes_overlap(cap_lo, cap_hi, cbb[0], cbb[1]):
+                    continue
+                var wp_wr = ch.world_pose(b.pos, b.rot)
+                var wp = wp_wr[0]
+                var wr = wp_wr[1]
+                var cm: ContactManifold
+                if ch.shape == COMPOUND_CHILD_SPHERE:
+                    cm = collide_sphere_capsule(wp, ch.radius, cap_a, cap_b, r_eff, slot, -1)
+                elif ch.shape == COMPOUND_CHILD_CAPSULE:
+                    var cax = wr.rotate(Vec3(0.0, ch.half_height, 0.0))
+                    cm = collide_capsule_capsule(wp - cax, wp + cax, ch.radius, cap_a, cap_b, r_eff, slot, -1)
+                elif ch.shape == COMPOUND_CHILD_BOX:
+                    cm = collide_capsule_box(cap_a, cap_b, r_eff, wp, wr, ch.half_extents, -1, slot)
+                    if cm.has_collision:
+                        cm.normal = -cm.normal
+                        if cm.count >= 1: cm.p0.normal = -cm.p0.normal
+                        if cm.count >= 2: cm.p1.normal = -cm.p1.normal
+                        if cm.count >= 3: cm.p2.normal = -cm.p2.normal
+                        if cm.count >= 4: cm.p3.normal = -cm.p3.normal
+                else:
+                    if not has_kcc_h:
+                        kcc_h = _make_capsule_hull(r_eff, self.cfg.half_height)
+                        has_kcc_h = True
+                    var ch_h = ch.hull.copy() if ch.shape == COMPOUND_CHILD_CONVEX and len(ch.hull.vertices) >= 4 else world._child_as_hull(ch)
+                    cm = collide_convex_convex(ch_h, wp, wr, kcc_h, center, Quat(), slot, -1)
+                if cm.has_collision and cm.count > 0 and cm.p0.depth > best_depth:
+                    best_depth = cm.p0.depth
+                    best_m = cm^
+            return best_m^
 
         var kcc_h = _make_capsule_hull(r_eff, self.cfg.half_height)
         var bh = world._body_as_hull(slot)

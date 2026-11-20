@@ -276,6 +276,7 @@ struct BtNode(Copyable, ImplicitlyCopyable, Movable):
 struct BtExecutionState(Copyable, Movable):
     var time_s: Float32
     var running_node: Int
+    var node_running: List[Bool]
     var active_action_id: Int
     var last_aborted_node: Int
     var last_aborted_action_id: Int
@@ -287,6 +288,7 @@ struct BtExecutionState(Copyable, Movable):
     def __init__(out self, max_actions: Int = 32):
         self.time_s = 0.0
         self.running_node = -1
+        self.node_running = List[Bool]()
         self.active_action_id = -1
         self.last_aborted_node = -1
         self.last_aborted_action_id = -1
@@ -303,6 +305,50 @@ struct BtExecutionState(Copyable, Movable):
             self.action_statuses.resize(new_len, BT_SUCCESS)
             self.action_exec_counts.resize(new_len, 0)
         self.action_statuses[action_id] = status
+
+    def is_node_running(self, idx: Int) -> Bool:
+        if idx >= 0 and idx < len(self.node_running):
+            return self.node_running[idx]
+        return self.running_node == idx
+
+    def first_running_in_range(self, lo: Int, hi: Int) -> Int:
+        var hi_clamped = min(hi, len(self.node_running))
+        var lo_clamped = max(0, lo)
+        for k in range(lo_clamped, hi_clamped):
+            if self.node_running[k]:
+                return k
+        if self.running_node >= lo and self.running_node < hi:
+            return self.running_node
+        return -1
+
+    def has_running_in_range(self, lo: Int, hi: Int) -> Bool:
+        return self.first_running_in_range(lo, hi) >= 0
+
+    def _sync_running_node(mut self):
+        for k in range(len(self.node_running)):
+            if self.node_running[k]:
+                self.running_node = k
+                return
+        self.running_node = -1
+
+    def set_node_running(mut self, idx: Int, running: Bool):
+        if idx < 0:
+            return
+        if idx >= len(self.node_running):
+            self.node_running.resize(idx + 1, False)
+        self.node_running[idx] = running
+        if running:
+            self.running_node = idx
+        elif self.running_node == idx:
+            self._sync_running_node()
+
+    def clear_running_in_range(mut self, lo: Int, hi: Int):
+        var hi_clamped = min(hi, len(self.node_running))
+        var lo_clamped = max(0, lo)
+        for k in range(lo_clamped, hi_clamped):
+            self.node_running[k] = False
+        if self.running_node >= lo and self.running_node < hi:
+            self._sync_running_node()
 
 
 struct BehaviorTree(Copyable, Movable):
@@ -400,7 +446,6 @@ struct BehaviorTree(Copyable, Movable):
     def _check_reactive_aborts(self, bb: Blackboard, mut state: BtExecutionState):
         if state.running_node < 0 or state.running_node >= len(self.nodes):
             return
-        var r_node = state.running_node
 
         for i in range(len(self.nodes)):
             ref nd = self.nodes[i]
@@ -411,24 +456,30 @@ struct BehaviorTree(Copyable, Movable):
             # 1. BT_ABORT_LOWER_PRIORITY / BT_ABORT_BOTH: condition became TRUE while a lower-priority sibling branch is running!
             if (nd.abort_mode == BT_ABORT_LOWER_PRIORITY or nd.abort_mode == BT_ABORT_BOTH) and cond_ok:
                 var scope = self._find_enclosing_selector_branch(i)
-                if scope[0] >= 0 and r_node >= scope[0] and r_node < scope[1]:
-                    state.aborts_triggered += 1
-                    state.last_aborted_node = r_node
-                    state.last_aborted_action_id = Int(self.nodes[r_node].action_id)
-                    state.running_node = -1
-                    state.active_action_id = -1
-                    return
+                if scope[0] >= 0:
+                    var r_node = state.first_running_in_range(scope[0], scope[1])
+                    if r_node >= 0:
+                        state.aborts_triggered += 1
+                        state.last_aborted_node = r_node
+                        state.last_aborted_action_id = Int(self.nodes[r_node].action_id)
+                        state.clear_running_in_range(scope[0], scope[1])
+                        if state.running_node < 0:
+                            state.active_action_id = -1
+                        return
 
             # 2. BT_ABORT_SELF / BT_ABORT_BOTH: condition became FALSE while its own guarded Sequence is running!
             if (nd.abort_mode == BT_ABORT_SELF or nd.abort_mode == BT_ABORT_BOTH) and (not cond_ok):
                 var p = Int(nd.parent_idx)
-                if p >= 0 and r_node > i and r_node < Int(self.nodes[p].subtree_skip):
-                    state.aborts_triggered += 1
-                    state.last_aborted_node = r_node
-                    state.last_aborted_action_id = Int(self.nodes[r_node].action_id)
-                    state.running_node = -1
-                    state.active_action_id = -1
-                    return
+                if p >= 0:
+                    var r_node = state.first_running_in_range(i + 1, Int(self.nodes[p].subtree_skip))
+                    if r_node >= 0:
+                        state.aborts_triggered += 1
+                        state.last_aborted_node = r_node
+                        state.last_aborted_action_id = Int(self.nodes[r_node].action_id)
+                        state.clear_running_in_range(i + 1, Int(self.nodes[p].subtree_skip))
+                        if state.running_node < 0:
+                            state.active_action_id = -1
+                        return
 
     def _eval_node(self, idx: Int, bb: Blackboard, mut state: BtExecutionState) -> UInt8:
         ref nd = self.nodes[idx]
@@ -443,12 +494,10 @@ struct BehaviorTree(Copyable, Movable):
             if aid >= 0 and aid < len(state.action_exec_counts):
                 state.action_exec_counts[aid] += 1
             if st == BT_RUNNING:
-                state.running_node = idx
-                state.active_action_id = aid
-            elif state.running_node == idx:
-                state.running_node = -1
+                state.set_node_running(idx, True)
                 state.active_action_id = aid
             else:
+                state.set_node_running(idx, False)
                 state.active_action_id = aid
             return st
 
@@ -475,7 +524,7 @@ struct BehaviorTree(Copyable, Movable):
             while child < end_sub:
                 var next_sib = Int(self.nodes[child].subtree_skip)
                 # Memory resume: if a later child in this Sequence is already running, skip completed earlier children
-                if state.running_node >= next_sib and state.running_node < end_sub:
+                if state.has_running_in_range(next_sib, end_sub):
                     child = next_sib
                     continue
                 var cs = self._eval_node(child, bb, state)
@@ -490,7 +539,7 @@ struct BehaviorTree(Copyable, Movable):
                 var next_sib = Int(self.nodes[child].subtree_skip)
                 # Memory selector: if a lower-priority child is currently BT_RUNNING (and was NOT aborted by _check_reactive_aborts!),
                 # jump directly to the running child in O(1) using subtree_skip!
-                if state.running_node >= next_sib and state.running_node < end_sub:
+                if state.has_running_in_range(next_sib, end_sub):
                     child = next_sib
                     continue
                 var cs = self._eval_node(child, bb, state)
@@ -512,9 +561,11 @@ struct BehaviorTree(Copyable, Movable):
                     run_cnt += 1
                 child = Int(self.nodes[child].subtree_skip)
             if succ_cnt >= req_succ:
+                state.clear_running_in_range(idx + 1, end_sub)
                 return BT_SUCCESS
             if run_cnt > 0:
                 return BT_RUNNING
+            state.clear_running_in_range(idx + 1, end_sub)
             return BT_FAILURE
 
         if nd.kind == BT_NODE_UTILITY_SELECT:
@@ -561,6 +612,8 @@ struct BehaviorTree(Copyable, Movable):
         state.time_s += max(Float32(0.0), dt)
         if len(state.cooldown_ready_at) < len(self.nodes):
             state.cooldown_ready_at.resize(len(self.nodes), Float32(0.0))
+        if len(state.node_running) < len(self.nodes):
+            state.node_running.resize(len(self.nodes), False)
 
         # 1. Reactive observer pass (`BT_ABORT_LOWER_PRIORITY` / `BT_ABORT_SELF`)
         self._check_reactive_aborts(bb, state)

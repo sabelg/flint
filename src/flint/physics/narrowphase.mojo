@@ -164,12 +164,14 @@ def collide_sphere_sphere(
     r_b: Float32,
     body_a: Int = 0,
     body_b: Int = 1,
+    speculative_dist: Float32 = 0.0,
 ) -> ContactManifold:
     var m = ContactManifold(body_a, body_b)
     var diff = pos_b - pos_a
     var dist2 = diff.length_squared()
     var total_r = r_a + r_b
-    if dist2 <= total_r * total_r:
+    var max_d = total_r + speculative_dist
+    if dist2 <= max_d * max_d:
         var dist = sqrt(dist2)
         var normal = diff * (Float32(1.0) / dist) if dist > Float32(1.0e-6) else Vec3(0, 1, 0)
         var depth = total_r - dist
@@ -186,6 +188,7 @@ def collide_sphere_capsule(
     cap_radius: Float32,
     body_a: Int = 0,
     body_b: Int = 1,
+    speculative_dist: Float32 = 0.0,
 ) -> ContactManifold:
     var m = ContactManifold(body_a, body_b)
     var ab = cap_b - cap_a
@@ -198,8 +201,9 @@ def collide_sphere_capsule(
     var diff = seg_pt - s_center
     var dist2 = diff.length_squared()
     var total_r = s_radius + cap_radius
+    var max_d = total_r + speculative_dist
 
-    if dist2 <= total_r * total_r:
+    if dist2 <= max_d * max_d:
         var dist = sqrt(dist2)
         var normal = diff * (Float32(1.0) / dist) if dist > 1.0e-6 else Vec3(0, 1, 0)
         var depth = total_r - dist
@@ -217,6 +221,7 @@ def _sphere_local_aabb_contact(
     b_half: Vec3,
     id: UInt32,
     mut m: ContactManifold,
+    speculative_dist: Float32 = 0.0,
 ):
     var cx = max(-b_half.x, min(b_half.x, lp.x))
     var cy = max(-b_half.y, min(b_half.y, lp.y))
@@ -225,7 +230,8 @@ def _sphere_local_aabb_contact(
     var diff = cl - lp  # A (sphere) -> B (box)
     var d2 = diff.length_squared()
     if d2 > Float32(1.0e-8):
-        if d2 <= s_radius * s_radius:
+        var max_d = s_radius + speculative_dist
+        if d2 <= max_d * max_d:
             var dist = sqrt(d2)
             var ln = diff * (Float32(1.0) / dist)
             var wn = b_rot.rotate(ln).normalized()
@@ -269,10 +275,11 @@ def collide_sphere_box(
     b_half: Vec3,
     body_a: Int = 0,
     body_b: Int = 1,
+    speculative_dist: Float32 = 0.0,
 ) -> ContactManifold:
     var m = ContactManifold(body_a, body_b)
     var lp = b_rot.conjugate().rotate(s_pos - b_pos)
-    _sphere_local_aabb_contact(lp, s_radius, b_pos, b_rot, b_half, 0, m)
+    _sphere_local_aabb_contact(lp, s_radius, b_pos, b_rot, b_half, 0, m, speculative_dist)
     return m^
 
 
@@ -333,9 +340,11 @@ def collide_capsule_capsule(
     r2: Float32,
     body_a: Int = 0,
     body_b: Int = 1,
+    speculative_dist: Float32 = 0.0,
 ) -> ContactManifold:
     var m = ContactManifold(body_a, body_b)
     var total_r = r1 + r2
+    var max_d = total_r + speculative_dist
     var d1 = c1_b - c1_a
     var d2 = c2_b - c2_a
     var l1_sq = d1.length_squared()
@@ -360,7 +369,7 @@ def collide_capsule_capsule(
                     var p2 = c2_a + d2 * t_proj
                     var diff = p2 - p1
                     var dist2 = diff.length_squared()
-                    if dist2 <= total_r * total_r:
+                    if dist2 <= max_d * max_d:
                         var dist = sqrt(dist2)
                         var normal = diff * (Float32(1.0) / dist) if dist > Float32(1.0e-6) else Vec3(0, 1, 0)
                         var depth = total_r - dist
@@ -375,7 +384,7 @@ def collide_capsule_capsule(
     var diff = pt2 - pt1
     var dist2 = diff.length_squared()
 
-    if dist2 <= total_r * total_r:
+    if dist2 <= max_d * max_d:
         var dist = sqrt(dist2)
         var normal = diff * (Float32(1.0) / dist) if dist > 1.0e-6 else Vec3(0, 1, 0)
         var depth = total_r - dist
