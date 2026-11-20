@@ -13,6 +13,7 @@
   - `anim`, `ai` & `camera`: `.flanim` state machines, bone sockets, `RagdollStateMachine`, foot-plant IK, `BehaviorTree`, `UtilityAiScorer`, and spring-arm `CameraRig`.
   - `audio` & `cycles`: Pure-Mojo QOA 5:1 codec, BVH8 raycast acoustics/Sabine RT60, multithreaded `AudioServer` with Woodworth HRTF & BS.1770 LUFS limiter, and `cycles` live pattern synth.
   - `assets`, `procedural`, `ui`, `studio` & `devtools`: Incremental `AssetServer`, `.flpk` mmap VFS, SubD/ArchKit procedural kits, Flexbox `DockSpace`, `Flint Studio` visual editor, and MCP v2 server.
+  - `ml`: Pure-Mojo ONNX loader/interpreter (mmapped zero-copy weights, SIMD + `JobPool` CPU kernels) with MAX `max.gpu` matrix products on the GPU, and the MotionBricks SOMA motion-inbetweening runtime (`flint.ml.motionbricks`; models and clips stay outside the repo, see `licenses/`).
   - `net` & `lab`: Dual-stack IPv6/IPv4-mapped non-blocking `UdpSocket`, `BitWriter`/`BitReader` (32-bit Smallest-Three `Quat`), deterministic `VirtualNetSim`, reliable-ordered `NetChannel` (`1180 B` MTU fragmentation), 4-peer GGPO `RollbackSession`, AOI `SnapshotReplicator`, and `EngineBenchSuite` (`flint.lab`).
 
 ## 2. Mojo 1.2 Syntax & Lifetime Rules
