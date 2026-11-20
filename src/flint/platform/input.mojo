@@ -1,7 +1,7 @@
 """Explicit keyboard, mouse, and Linux joystick state."""
 from std.ffi import external_call
 from std.math import sqrt
-from flint.platform.os import close_fd
+from flint.platform.os import close_fd, list_directory
 
 # Named pad controls. The first eleven match the Linux xpad joystick layout, and the
 # rest are built from axes so menus and actions can treat them as plain buttons.
@@ -38,7 +38,7 @@ comptime PAD_AXIS_DPAD_Y: Int = 7
 comptime PAD_DEADZONE: Float32 = 0.12
 comptime PAD_DIRECTION: Float32 = 0.6
 comptime PAD_RETRY_POLLS: Int = 120
-comptime MAX_PADS: Int = 2
+comptime MAX_PADS: Int = 4
 comptime ENODEV: Int32 = 19
 comptime JSIOCGNAME_64: UInt64 = 0x80406A13
 comptime JSIOCGAXES: UInt64 = 0x80016A11
@@ -79,6 +79,10 @@ def is_gamepad(name: String, axes: Int, buttons: Int) -> Bool:
 
 struct PadState(Copyable, Movable):
     var fd: Int
+    var connected: Bool
+    var ff_fd: Int
+    var ff_writable: Bool
+    var owns_ff_fd: Bool
     var sony_layout: Bool
     var axes: List[Float32]
     var raw_axes: List[Float32]
@@ -97,6 +101,10 @@ struct PadState(Copyable, Movable):
 
     def __init__(out self):
         self.fd = -1
+        self.connected = False
+        self.ff_fd = -1
+        self.ff_writable = False
+        self.owns_ff_fd = False
         self.ff_effect_id = -1
         self.sony_layout = False
         self.axes = List[Float32](length=8, fill=0)
@@ -282,7 +290,7 @@ struct PadState(Copyable, Movable):
             self.pressed[index] = False
 
     def set_rumble(mut self, weak_motor: Float32, strong_motor: Float32, duration_ms: Int = 1000):
-        if self.fd < 0:
+        if self.ff_fd < 0 or not self.ff_writable:
             return
         var effect = List[UInt8](length=48, fill=0)
         # type = FF_RUMBLE (0x0050)
@@ -305,7 +313,7 @@ struct PadState(Copyable, Movable):
         effect[18] = UInt8(weak_mag & 0xFF)
         effect[19] = UInt8((weak_mag >> 8) & 0xFF)
 
-        var ret = external_call["ioctl", Int32](Int32(self.fd), EVIOCSFF, effect.unsafe_ptr())
+        var ret = external_call["ioctl", Int32](Int32(self.ff_fd), EVIOCSFF, effect.unsafe_ptr())
         if ret == 0:
             var new_id = Int(Int16(UInt16(effect[2]) | (UInt16(effect[3]) << 8)))
             self.ff_effect_id = new_id
@@ -314,16 +322,16 @@ struct PadState(Copyable, Movable):
             play_ev[18] = UInt8(new_id & 0xFF)
             play_ev[19] = UInt8((new_id >> 8) & 0xFF)
             play_ev[20] = 1
-            _ = external_call["write", Int64](Int32(self.fd), play_ev.unsafe_ptr(), Int64(24))
+            _ = external_call["write", Int64](Int32(self.ff_fd), play_ev.unsafe_ptr(), Int64(24))
 
     def stop_rumble(mut self):
-        if self.fd >= 0 and self.ff_effect_id >= 0:
+        if self.ff_fd >= 0 and self.ff_writable and self.ff_effect_id >= 0:
             var stop_ev = List[UInt8](length=24, fill=0)
             stop_ev[16] = 0x15
             stop_ev[18] = UInt8(self.ff_effect_id & 0xFF)
             stop_ev[19] = UInt8((self.ff_effect_id >> 8) & 0xFF)
             stop_ev[20] = 0
-            _ = external_call["write", Int64](Int32(self.fd), stop_ev.unsafe_ptr(), Int64(24))
+            _ = external_call["write", Int64](Int32(self.ff_fd), stop_ev.unsafe_ptr(), Int64(24))
 
 
 struct InputState(Copyable, Movable):
@@ -572,9 +580,9 @@ struct InputState(Copyable, Movable):
     def open_pads(mut self):
         """Claim joystick nodes for empty pad slots, so a controller can arrive at any time."""
         for slot in range(MAX_PADS):
-            if self.pads[slot].fd >= 0:
+            if self.pads[slot].fd >= 0 or self.pads[slot].connected:
                 continue
-            for number in range(4):
+            for number in range(8):
                 var path = "/dev/input/js" + String(number)
                 var taken = False
                 for other in range(MAX_PADS):
@@ -600,8 +608,20 @@ struct InputState(Copyable, Movable):
                     close_fd(fd)
                     continue
                 self.pads[slot].fd = fd
+                self.pads[slot].connected = True
                 self.pad_paths[slot] = path
                 self.pads[slot].sony_layout = "Sony" in text or "DualSense" in text or "DualShock" in text or "Wireless Controller" in text
+                # Open sibling /dev/input/event* O_RDWR for EV_FF rumble (jsN is read-only and lacks EVIOCSFF)
+                var sys_entries = list_directory("/sys/class/input/js" + String(number) + "/device")
+                for entry in sys_entries:
+                    if entry.startswith("event"):
+                        var ev_path = "/dev/input/" + entry
+                        var ev_fd = Int(external_call["open", Int32](ev_path.as_c_string_span(), Int32(2 | 2048 | 0x80000), Int32(0)))
+                        if ev_fd >= 0:
+                            self.pads[slot].ff_fd = ev_fd
+                            self.pads[slot].ff_writable = True
+                            self.pads[slot].owns_ff_fd = True
+                            break
                 break
 
     def poll_pad(mut self, slot: Int):
@@ -614,6 +634,12 @@ struct InputState(Copyable, Movable):
                 if count < 0 and error[unsafe_offset=0] == ENODEV:
                     close_fd(self.pads[slot].fd)
                     self.pads[slot].fd = -1
+                    self.pads[slot].connected = False
+                    if self.pads[slot].owns_ff_fd and self.pads[slot].ff_fd >= 0:
+                        close_fd(self.pads[slot].ff_fd)
+                    self.pads[slot].ff_fd = -1
+                    self.pads[slot].ff_writable = False
+                    self.pads[slot].owns_ff_fd = False
                     self.pads[slot].clear()
                 return
             var raw_value = Int16(UInt16(event[4]) | (UInt16(event[5]) << 8))
@@ -635,16 +661,19 @@ struct InputState(Copyable, Movable):
 
     def promote_pads(mut self):
         """Keep the first connected pad in slot 0, which is the one play reads,
-        so unplugging the first controller hands play to the second."""
-        if self.pads[0].fd >= 0 or self.pads[1].fd < 0:
+        so unplugging the first controller hands play to the next connected pad."""
+        if self.pads[0].fd >= 0 or self.pads[0].connected:
             return
-        self.pads[0] = self.pads[1].copy()
-        self.pad_paths[0] = self.pad_paths[1]
-        self.pads[1] = PadState()
-        self.pad_paths[1] = ""
+        for s in range(1, MAX_PADS):
+            if self.pads[s].fd >= 0 or self.pads[s].connected:
+                self.pads[0] = self.pads[s].copy()
+                self.pad_paths[0] = self.pad_paths[s]
+                self.pads[s] = PadState()
+                self.pad_paths[s] = ""
+                return
 
     def gamepad_available(self, pad: Int = 0) -> Bool:
-        return pad >= 0 and pad < MAX_PADS and self.pads[pad].fd >= 0
+        return pad >= 0 and pad < MAX_PADS and (self.pads[pad].fd >= 0 or self.pads[pad].connected)
 
     def gamepad_axis(self, pad: Int, axis: Int) -> Float32:
         if pad < 0 or pad >= MAX_PADS or axis < 0 or axis >= len(self.pads[pad].axes):

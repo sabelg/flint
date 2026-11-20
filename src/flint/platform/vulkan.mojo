@@ -16,7 +16,7 @@ slot, so one family of call helpers taking Int fits all of them.
 """
 from std.collections import Dict
 from std.ffi import external_call
-from flint.platform.dynlib import dl_open, dl_sym
+from flint.platform.dynlib import dl_open, dl_sym, dl_close
 from flint.platform.amdgpu import GpuBuffer
 from flint.platform.os import env_flag, env_value, read_bytes, write_bytes
 
@@ -605,10 +605,12 @@ struct VulkanGpu(Copyable, Movable):
     # Per-device cache of `vkGetDeviceProcAddr` results (filled lazily by `device_call`; reset when the device closes).
     var device_call_cache: Dict[String, Int]
     var device_call_cache_device: Int
+    var overflow_slabs: List[Int]
 
     def __init__(out self):
         self.device_call_cache = Dict[String, Int]()
         self.device_call_cache_device = 0
+        self.overflow_slabs = List[Int]()
         self.library = 0
         self.instance = 0
         self.physical = 0
@@ -715,9 +717,11 @@ struct VulkanGpu(Copyable, Movable):
 
     def scratch(mut self, size: Int) -> Int:
         """Zeroed bytes, good until the next `rewind`."""
-        var rounded = (size + 15) & ~15
-        if self.arena_used + rounded > ARENA_BYTES:
-            self.arena_used = 0  # only a bug gets here: every caller rewinds first
+        var rounded = (max(1, size) + 15) & ~15
+        if self.arena == 0 or self.arena_used + rounded > ARENA_BYTES:
+            var slab = external_call["calloc", Int](Int(1), rounded)
+            self.overflow_slabs.append(slab)
+            return slab
         var address = self.arena + self.arena_used
         self.arena_used += rounded
         _ = external_call["memset", Int](address, Int32(0), rounded)
@@ -725,6 +729,11 @@ struct VulkanGpu(Copyable, Movable):
 
     def rewind(mut self):
         self.arena_used = 0
+        if len(self.overflow_slabs) > 0:
+            for slab in self.overflow_slabs:
+                if slab != 0:
+                    external_call["free", NoneType](slab)
+            self.overflow_slabs.clear()
 
     def text(mut self, value: String) -> Int:
         var address = self.scratch(value.byte_length() + 1)
@@ -760,6 +769,7 @@ struct VulkanGpu(Copyable, Movable):
     # Bring-up.
 
     def _free_host_scratch(mut self):
+        self.rewind()
         if self.arena != 0:
             external_call["free", NoneType](self.arena)
             self.arena = 0
@@ -1388,11 +1398,11 @@ struct VulkanGpu(Copyable, Movable):
             if system >= 0:
                 memory = self.allocation(needed, system, export)
         if memory == 0:
-            _ = call4(self.fn_destroy_buffer, self.device, buffer, 0, 0)
+            _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
             _ = self.fail("no memory for a buffer of " + String(rounded) + " bytes")
             return GpuBuffer()
         if call4(self.fn_bind_buffer_memory, self.device, buffer, memory, 0) != SUCCESS or call6(self.fn_map_memory, self.device, memory, 0, WHOLE_SIZE, 0, slot) != SUCCESS:
-            _ = call4(self.fn_destroy_buffer, self.device, buffer, 0, 0)
+            _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
             _ = call3(self.fn_free_memory, self.device, memory, 0)
             _ = self.fail("buffer binding or mapping failed")
             return GpuBuffer()
@@ -2073,7 +2083,7 @@ struct VulkanGpu(Copyable, Movable):
         """The next image to fill, or NO_IMAGE to skip presenting this frame."""
         self.rewind()
         var slot = self.scratch(8)
-        var result = call7(self.device_call("vkAcquireNextImageKHR"), self.device, self.swapchain, ACQUIRE_TIMEOUT_NS, self.acquire_semaphores[frame], 0, slot, 0)
+        var result = call6(self.device_call("vkAcquireNextImageKHR"), self.device, self.swapchain, ACQUIRE_TIMEOUT_NS, self.acquire_semaphores[frame], 0, slot)
         if result == SUCCESS or result == SUBOPTIMAL:
             return Int(get32(slot))
         self.skipped += 1
@@ -2200,6 +2210,10 @@ struct VulkanGpu(Copyable, Movable):
             return
         self.wait_idle()
         self.rewind()
+        if len(self.image_views) > 0:
+            for v_idx in range(len(self.image_views)):
+                self.destroy_image_view(self.image_views[v_idx])
+            self.image_views.clear()
         if self.swapchain != 0:
             _ = call3(self.device_call("vkDestroySwapchainKHR"), self.device, self.swapchain, 0)
             self.swapchain = 0
@@ -2232,6 +2246,11 @@ struct VulkanGpu(Copyable, Movable):
         gone by now. The validation layers report anything left over here."""
         if self.instance == 0:
             self._free_host_scratch()
+            if self.library != 0:
+                _ = dl_close(self.library)
+                self.library = 0
+                self.proc_instance = 0
+                self.proc_device = 0
             return
         self.close_swapchain()
         self.rewind()
@@ -2275,6 +2294,11 @@ struct VulkanGpu(Copyable, Movable):
         _ = call2(self.instance_call("vkDestroyInstance"), self.instance, 0)
         self.instance = 0
         self._free_host_scratch()
+        if self.library != 0:
+            _ = dl_close(self.library)
+            self.library = 0
+            self.proc_instance = 0
+            self.proc_device = 0
 
     # ========================================================================
     # Vulkan 1.3 AAA Hardware Graphics, Bindless Images, Sync2 & Ray Tracing

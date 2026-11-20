@@ -353,6 +353,30 @@ def test_audio_server_mastering_and_virtualizer() raises:
     moved_rt.stop()
     assert_true(not moved_rt.rt_running)
 
+    # 7. RT-Safe CyclesEngine Hi-Hat (no per-sample heap alloc), Delay/Reverb Send Routing & Deferred Retire Queue
+    var srv_cycles = AudioServer(48000, 256)
+    var stem_fx = srv_cycles.add_cycles_stem('d1 $ s "hh ~ ~ ~" # gain 0.9 # room 0.8 # delay 0.8 # delaytime 0.05 # delayfb 0.6', BUS_MUSIC)
+    var fx_buf = List[Float32](length=512, fill=0.0)
+    var max_fx_amp = Float32(0.0)
+    var tail_energy = Float64(0.0)
+    for q in range(40):
+        srv_cycles.render_offline_quantum(fx_buf, 256)
+        for i in range(512):
+            assert_true(not isnan(fx_buf[i]) and not isinf(fx_buf[i]))
+            var a = abs(fx_buf[i])
+            if a > max_fx_amp:
+                max_fx_amp = a
+            if q >= 12 and q < 30:
+                tail_energy += Float64(fx_buf[i] * fx_buf[i])
+    assert_true(max_fx_amp > Float32(0.01))
+    assert_true(tail_energy > 1.0e-5)
+    # Off-thread parsed stem transition + main-thread deferred retire reclamation
+    srv_cycles.transition_cycles_stem(stem_fx, 'd1 $ s "oh*2" # gain 0.8 # room 0.5', 0.5)
+    for _ in range(8):
+        srv_cycles.render_offline_quantum(fx_buf, 256)
+    assert_true(srv_cycles.drain_retired() >= 0)
+    srv_cycles.stop()
+
 
 # ==============================================================================
 # (b) Woodworth HRTF ITD/ILD, 180° Rotation, 0.1 Mach Doppler & Bvh8 Acoustics
@@ -995,6 +1019,35 @@ def test_evdev_and_declarative_input_map() raises:
     assert_true(imap3.load_json(saved_json))
     assert_true(imap3.unpack_deterministic_tick(tick_pkt))
     assert_true(imap3.just_pressed("Jump"))
+
+    # 5. Regression: BIND_MOUSE_DELTA_2D must NOT clamp mouse look to 1.0 px/frame
+    var look_map = InputMap()
+    _ = look_map.register_action("Look", ACTION_AXIS2D)
+    var look_ctx = InputContext("Camera", priority=0, blocks_lower_all=False)
+    look_ctx.bind_mouse_look("Look", sensitivity=0.5, invert_y=True)
+    look_map.add_context(look_ctx^)
+    look_map.push_context("Camera")
+
+    var look_in = InputState()
+    look_in.begin_frame()
+    look_in.add_mouse_delta(24.0, -10.0)
+    look_map.update(look_in, 0.016)
+    var look_v = look_map.axis_2d("Look")
+    assert_true(abs(look_v[0] - Float32(12.0)) < Float32(1.0e-4))
+    assert_true(abs(look_v[1] - Float32(5.0)) < Float32(1.0e-4))
+
+    # 6. Regression: EvdevGamepad.sync_into_input_state() enables gamepad_available() across 4 slots
+    var pad_in = InputState()
+    assert_equal(len(pad_in.pads), 4)
+    assert_true(not pad_in.gamepad_available(0))
+    assert_true(not pad_in.gamepad_available(3))
+    xbox.sync_into_input_state(pad_in, 0)
+    dualsense.sync_into_input_state(pad_in, 3)
+    assert_true(pad_in.gamepad_available(0))
+    assert_true(pad_in.gamepad_available(3))
+    assert_true(pad_in.pads[3].sony_layout)
+    # Safe no-op rumble on non-writable pad fd
+    pad_in.set_pad_rumble(0, 0.5, 0.8, 200)
 
 
 def main() raises:

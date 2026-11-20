@@ -459,7 +459,10 @@ struct WaylandWindow(Copyable, Movable):
         var buffer = List[UInt8](length=16384, fill=0)
         while True:
             var count = Int(external_call["recv", Int64](Int32(self.fd), buffer.unsafe_ptr(), Int64(len(buffer)), Int32(64)))
-            if count <= 0:
+            if count == 0:
+                self.close_requested = True
+                break
+            if count < 0:
                 break
             for index in range(count):
                 self.incoming.append(buffer[index])

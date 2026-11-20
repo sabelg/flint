@@ -5,7 +5,7 @@ desktop's chosen output and shares it with other programs. libpulse is not used.
 All protocol integers are big-endian. Version 13 fixes the stream request layout.
 """
 from std.ffi import external_call
-from flint.platform.os import close_fd, env_now, env_value, read_bytes
+from flint.platform.os import close_fd, env_now, env_value, read_bytes, EINTR
 
 comptime PROTOCOL_VERSION: UInt32 = 13
 comptime COMMAND_CHANNEL: UInt32 = 0xFFFFFFFF
@@ -31,6 +31,8 @@ comptime NO_INDEX: UInt32 = 0xFFFFFFFF
 comptime MSG_DONTWAIT: Int32 = 0x40
 comptime MSG_NOSIGNAL: Int32 = 0x4000
 comptime EAGAIN: Int32 = 11
+comptime POLLIN_MASK: UInt8 = 0x01
+comptime POLLOUT_MASK: UInt8 = 0x04
 
 
 def put_be32(mut data: List[UInt8], value: UInt32):
@@ -298,6 +300,12 @@ struct PulseClient(Movable):
     var requested_bytes: Int
     var next_tag: UInt32
     var incoming: List[UInt8]
+    var incoming_head: Int
+    var recv_buf: List[UInt8]
+    var frame_payload: List[UInt8]
+    var pending_out: List[UInt8]
+    var pending_out_head: Int
+    var poll_fd_buf: List[UInt8]
     var underflows: Int
     var error: String
 
@@ -306,7 +314,13 @@ struct PulseClient(Movable):
         self.channel = 0
         self.requested_bytes = 0
         self.next_tag = 0
-        self.incoming = List[UInt8]()
+        self.incoming = List[UInt8](capacity=8192)
+        self.incoming_head = 0
+        self.recv_buf = List[UInt8](length=4096, fill=0)
+        self.frame_payload = List[UInt8](capacity=512)
+        self.pending_out = List[UInt8](capacity=16384)
+        self.pending_out_head = 0
+        self.poll_fd_buf = List[UInt8](length=8, fill=0)
         self.underflows = 0
         self.error = ""
 
@@ -318,6 +332,10 @@ struct PulseClient(Movable):
     def close(mut self):
         close_fd(self.fd)
         self.fd = -1
+        self.incoming.clear()
+        self.incoming_head = 0
+        self.pending_out.clear()
+        self.pending_out_head = 0
 
     def connected(self) -> Bool:
         return self.fd >= 0
@@ -363,6 +381,8 @@ struct PulseClient(Movable):
             var count = Int(external_call["send", Int64](Int32(self.fd), data.unsafe_ptr().unsafe_offset(sent), Int64(len(data) - sent), flags))
             if count <= 0:
                 var error = external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()[unsafe_offset=0]
+                if error == EINTR:
+                    continue
                 if error == EAGAIN and sent == 0:
                     return 0
                 if error != EAGAIN:
@@ -379,32 +399,49 @@ struct PulseClient(Movable):
         return self.send_all(frame, MSG_NOSIGNAL) == len(frame)
 
     def receive(mut self):
-        var buffer = List[UInt8](length=4096, fill=0)
         while self.fd >= 0:
-            var count = Int(external_call["recv", Int64](Int32(self.fd), buffer.unsafe_ptr(), Int64(len(buffer)), MSG_DONTWAIT))
+            var count = Int(external_call["recv", Int64](Int32(self.fd), self.recv_buf.unsafe_ptr(), Int64(len(self.recv_buf)), MSG_DONTWAIT))
             if count == 0:
                 _ = self.fail("sound server disconnected")
                 return
             if count < 0:
+                var error = external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()[unsafe_offset=0]
+                if error == EINTR:
+                    continue
                 return
             for index in range(count):
-                self.incoming.append(buffer[index])
+                self.incoming.append(self.recv_buf[index])
 
     def next_frame(mut self, mut channel: UInt32, mut payload: List[UInt8]) -> Bool:
-        """Remove one complete frame from the received bytes."""
-        if len(self.incoming) < DESCRIPTOR_BYTES:
+        """Remove one complete frame from the received bytes without per-frame heap churn."""
+        var avail = len(self.incoming) - self.incoming_head
+        if avail < DESCRIPTOR_BYTES:
             return False
-        var length = Int(get_be32(self.incoming, 0))
-        if len(self.incoming) < DESCRIPTOR_BYTES + length:
+        var length = Int(get_be32(self.incoming, self.incoming_head))
+        if avail < DESCRIPTOR_BYTES + length:
             return False
-        channel = get_be32(self.incoming, 4)
-        payload = List[UInt8](length=length, fill=0)
-        for index in range(length):
-            payload[index] = self.incoming[DESCRIPTOR_BYTES + index]
-        var remaining = List[UInt8]()
-        for index in range(DESCRIPTOR_BYTES + length, len(self.incoming)):
-            remaining.append(self.incoming[index])
-        self.incoming = remaining^
+        channel = get_be32(self.incoming, self.incoming_head + 4)
+        payload.clear()
+        payload.resize(length, 0)
+        if length > 0:
+            _ = external_call["memcpy", Int](
+                Int(payload.unsafe_ptr()),
+                Int(self.incoming.unsafe_ptr().unsafe_offset(self.incoming_head + DESCRIPTOR_BYTES)),
+                length,
+            )
+        self.incoming_head += DESCRIPTOR_BYTES + length
+        if self.incoming_head >= len(self.incoming):
+            self.incoming.clear()
+            self.incoming_head = 0
+        elif self.incoming_head >= 4096:
+            var rem = len(self.incoming) - self.incoming_head
+            _ = external_call["memmove", Int](
+                Int(self.incoming.unsafe_ptr()),
+                Int(self.incoming.unsafe_ptr().unsafe_offset(self.incoming_head)),
+                rem,
+            )
+            self.incoming.resize(rem, 0)
+            self.incoming_head = 0
         return True
 
     def handle_event(mut self, payload: List[UInt8]):
@@ -522,26 +559,128 @@ struct PulseClient(Movable):
         tag_proplist(body, "application.name", "Flint Engine")
         return self.request(body^, tag, reply)
 
+    def _next_frame_scratch(mut self, mut channel: UInt32) -> Bool:
+        """Removes one complete frame into `self.frame_payload` with zero per-frame heap alloc."""
+        var avail = len(self.incoming) - self.incoming_head
+        if avail < DESCRIPTOR_BYTES:
+            return False
+        var length = Int(get_be32(self.incoming, self.incoming_head))
+        if avail < DESCRIPTOR_BYTES + length:
+            return False
+        channel = get_be32(self.incoming, self.incoming_head + 4)
+        self.frame_payload.clear()
+        self.frame_payload.resize(length, 0)
+        if length > 0:
+            _ = external_call["memcpy", Int](
+                Int(self.frame_payload.unsafe_ptr()),
+                Int(self.incoming.unsafe_ptr().unsafe_offset(self.incoming_head + DESCRIPTOR_BYTES)),
+                length,
+            )
+        self.incoming_head += DESCRIPTOR_BYTES + length
+        if self.incoming_head >= len(self.incoming):
+            self.incoming.clear()
+            self.incoming_head = 0
+        elif self.incoming_head >= 4096:
+            var rem = len(self.incoming) - self.incoming_head
+            _ = external_call["memmove", Int](
+                Int(self.incoming.unsafe_ptr()),
+                Int(self.incoming.unsafe_ptr().unsafe_offset(self.incoming_head)),
+                rem,
+            )
+            self.incoming.resize(rem, 0)
+            self.incoming_head = 0
+        return True
+
+    def _handle_event_scratch(mut self):
+        if len(self.frame_payload) < 10:
+            return
+        var command = get_be32(self.frame_payload, 1)
+        if command == COMMAND_REQUEST and len(self.frame_payload) >= 20 and get_be32(self.frame_payload, 11) == self.channel:
+            self.requested_bytes += Int(get_be32(self.frame_payload, 16))
+        elif command == COMMAND_UNDERFLOW:
+            self.underflows += 1
+        elif command == COMMAND_STREAM_KILLED:
+            _ = self.fail("sound server closed the stream")
+
     def pump(mut self):
         """Collect buffer requests from the sound server."""
         self.receive()
         var channel = UInt32(0)
-        var payload = List[UInt8]()
-        while self.fd >= 0 and self.next_frame(channel, payload):
+        while self.fd >= 0 and self._next_frame_scratch(channel):
             if channel == COMMAND_CHANNEL:
-                self.handle_event(payload)
+                self._handle_event_scratch()
+
+    def has_pending_write(self) -> Bool:
+        return self.pending_out_head < len(self.pending_out)
+
+    def flush_pending(mut self) -> Bool:
+        """Flushes any buffered partial PCM frame without blocking. Returns False on fatal socket error."""
+        if self.fd < 0:
+            return False
+        while self.pending_out_head < len(self.pending_out):
+            var rem = len(self.pending_out) - self.pending_out_head
+            var count = Int(external_call["send", Int64](
+                Int32(self.fd),
+                self.pending_out.unsafe_ptr().unsafe_offset(self.pending_out_head),
+                Int64(rem),
+                MSG_DONTWAIT | MSG_NOSIGNAL,
+            ))
+            if count > 0:
+                self.pending_out_head += count
+            else:
+                var error = external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()[unsafe_offset=0]
+                if error == EINTR:
+                    continue
+                if error == EAGAIN:
+                    break
+                return self.fail("sound server write failed")
+        if self.pending_out_head >= len(self.pending_out):
+            self.pending_out.clear()
+            self.pending_out_head = 0
+        return True
+
+    def wait_io(mut self, timeout_ms: Int32 = 10) -> Bool:
+        """Sleeps in `poll(2)` on the PulseAudio socket until readable (or writable if a partial write is pending)."""
+        if self.fd < 0:
+            return False
+        var fd32 = UInt32(self.fd)
+        self.poll_fd_buf[0] = UInt8(fd32 & 0xFF)
+        self.poll_fd_buf[1] = UInt8((fd32 >> 8) & 0xFF)
+        self.poll_fd_buf[2] = UInt8((fd32 >> 16) & 0xFF)
+        self.poll_fd_buf[3] = UInt8((fd32 >> 24) & 0xFF)
+        self.poll_fd_buf[4] = POLLIN_MASK | (POLLOUT_MASK if self.has_pending_write() else UInt8(0))
+        self.poll_fd_buf[5] = 0
+        self.poll_fd_buf[6] = 0
+        self.poll_fd_buf[7] = 0
+        return external_call["poll", Int32](self.poll_fd_buf.unsafe_ptr(), UInt64(1), timeout_ms) > 0
 
     def write_samples(mut self, samples: List[Int16]) -> Bool:
-        """Send one block. False means the socket is full and nothing was sent."""
+        """Queues and flushes one PCM block using pre-allocated buffers. Partial writes on EAGAIN
+        remain buffered in `pending_out` and are drained by `flush_pending()`."""
+        if not self.flush_pending():
+            return False
+        if self.has_pending_write():
+            return False
         var bytes = len(samples) * 2
-        var frame = frame_descriptor(bytes, self.channel)
-        frame.resize(DESCRIPTOR_BYTES + bytes, 0)
-        _ = external_call["memcpy", Int](Int(frame.unsafe_ptr()) + DESCRIPTOR_BYTES, Int(samples.unsafe_ptr()), bytes)
-        var sent = self.send_all(frame, MSG_DONTWAIT | MSG_NOSIGNAL)
-        if sent < 0:
-            _ = self.fail("sound server write failed")
-            return False
-        if sent == 0:
-            return False
+        var total = DESCRIPTOR_BYTES + bytes
+        self.pending_out.clear()
+        self.pending_out.resize(total, 0)
+        var len_u32 = UInt32(bytes)
+        self.pending_out[0] = UInt8((len_u32 >> 24) & 0xFF)
+        self.pending_out[1] = UInt8((len_u32 >> 16) & 0xFF)
+        self.pending_out[2] = UInt8((len_u32 >> 8) & 0xFF)
+        self.pending_out[3] = UInt8(len_u32 & 0xFF)
+        self.pending_out[4] = UInt8((self.channel >> 24) & 0xFF)
+        self.pending_out[5] = UInt8((self.channel >> 16) & 0xFF)
+        self.pending_out[6] = UInt8((self.channel >> 8) & 0xFF)
+        self.pending_out[7] = UInt8(self.channel & 0xFF)
+        # Bytes 8..19 are offset (0) and flags (0), already zeroed by resize.
+        if bytes > 0:
+            _ = external_call["memcpy", Int](
+                Int(self.pending_out.unsafe_ptr().unsafe_offset(DESCRIPTOR_BYTES)),
+                Int(samples.unsafe_ptr()),
+                bytes,
+            )
+        self.pending_out_head = 0
         self.requested_bytes -= bytes
-        return True
+        return self.flush_pending()

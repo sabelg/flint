@@ -13,25 +13,7 @@ def get_time() -> Float64:
 
 
 def env_value(name: String) -> String:
-    var data = read_stream("/proc/self/environ")
-    var start = 0
-    while start < len(data):
-        var end = start
-        while end < len(data) and data[end] != 0:
-            end += 1
-        if end > start + name.byte_length() and data[start + name.byte_length()] == 61:
-            var matches = True
-            for index in range(name.byte_length()):
-                if data[start + index] != name.as_bytes()[index]:
-                    matches = False
-                    break
-            if matches:
-                var result = List[UInt8]()
-                for index in range(start + name.byte_length() + 1, end):
-                    result.append(data[index])
-                return String(unsafe_from_utf8=result)
-        start = end + 1
-    return ""
+    return env_now(name)
 
 
 def env_now(name: String) -> String:

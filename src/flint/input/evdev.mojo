@@ -566,9 +566,21 @@ struct EvdevGamepad(Copyable, Movable):
 
     def sync_into_input_state(self, mut input: InputState, slot: Int = 0):
         """Copies calibrated evdev axes & buttons into `InputState.pads[slot]`."""
-        if slot < 0 or slot >= len(input.pads) or not self.connected:
+        if slot < 0 or slot >= len(input.pads):
             return
+        if not self.connected:
+            if input.pads[slot].fd < 0 and input.pads[slot].connected:
+                input.pads[slot].connected = False
+                input.pads[slot].ff_fd = -1
+                input.pads[slot].ff_writable = False
+                input.pads[slot].owns_ff_fd = False
+                input.pads[slot].clear()
+            return
+        input.pads[slot].connected = True
         input.pads[slot].sony_layout = self.is_sony
+        input.pads[slot].ff_fd = self.fd
+        input.pads[slot].ff_writable = self.writable
+        input.pads[slot].owns_ff_fd = False
         for a in range(8):
             input.pads[slot].axes[a] = self.axes[a]
             input.pads[slot].raw_axes[a] = self.axes[a]
@@ -662,3 +674,11 @@ struct EvdevHub(Movable):
                 if self.pads[s].connected and out_slot < len(input.pads):
                     self.pads[s].sync_into_input_state(input, out_slot)
                     out_slot += 1
+        while out_slot < len(input.pads):
+            if input.pads[out_slot].fd < 0 and input.pads[out_slot].connected:
+                input.pads[out_slot].connected = False
+                input.pads[out_slot].ff_fd = -1
+                input.pads[out_slot].ff_writable = False
+                input.pads[out_slot].owns_ff_fd = False
+                input.pads[out_slot].clear()
+            out_slot += 1

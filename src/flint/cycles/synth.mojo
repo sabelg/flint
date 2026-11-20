@@ -329,6 +329,15 @@ struct CyclesEngine(Movable):
         self.cps = cps
         self.cps_frac = Frac.from_float(cps)
 
+    def load_program(mut self, var prog: Program) -> Bool:
+        """Install an already-parsed `Program` (for RT-safe off-thread parsing)."""
+        if len(prog.errors) > 0:
+            return False
+        if prog.cps_set:
+            self.set_cps(prog.cps)
+        self.program = prog^
+        return True
+
     def load(mut self, text: String) -> List[String]:
         """Evaluate a whole Tidal file. On any error the previous program keeps
         playing (keep-last-good); the errors are returned either way."""
@@ -336,9 +345,7 @@ struct CyclesEngine(Movable):
         var errs = prog.errors.copy()
         if len(errs) > 0:
             return errs^
-        if prog.cps_set:
-            self.set_cps(prog.cps)
-        self.program = prog^
+        _ = self.load_program(prog^)
         return errs^
 
     # ---- scheduling
@@ -568,7 +575,14 @@ struct CyclesEngine(Movable):
         elif k == VK_HH or k == VK_OH or k == VK_CRASH:
             # metallic: six square partials (808 ratios) plus noise, high-passed
             var metal = Float32(0)
-            var hz: List[Float32] = [205.3, 304.4, 369.6, 522.7, 540.0, 800.0]
+            var hz: Array[Float32, 6] = [
+                Float32(205.3),
+                Float32(304.4),
+                Float32(369.6),
+                Float32(522.7),
+                Float32(540.0),
+                Float32(800.0),
+            ]
             for i in range(6):
                 var ph = (Float32(v.t) * hz[i] * v.freq * 2.0 / sr)
                 metal += Float32(1.0) if ph - floor(ph) < 0.5 else Float32(-1.0)

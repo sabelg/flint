@@ -37,6 +37,7 @@ from flint.platform.dsp import (
     SPEED_OF_SOUND,
 )
 from flint.cycles.synth import CyclesEngine
+from flint.cycles.script import Program, run_program
 from flint.audio.qoa import QoaAsset, QoaStreamCursor
 from flint.audio.acoustics import CLEAR_CUTOFF_HZ
 
@@ -909,6 +910,10 @@ struct CyclesStemNode(Movable):
     var crossfade_frames_done: Int
     var scratch_a: List[Float32]
     var scratch_b: List[Float32]
+    var send_l: List[Float32]
+    var send_r: List[Float32]
+    var dsend_l: List[Float32]
+    var dsend_r: List[Float32]
 
     def __init__(out self, sample_rate: Int = 48000, bus_id: Int = BUS_MUSIC):
         self.active = False
@@ -923,6 +928,10 @@ struct CyclesStemNode(Movable):
         self.crossfade_frames_done = 0
         self.scratch_a = List[Float32](length=MAX_QUANTUM_FRAMES * 2, fill=0.0)
         self.scratch_b = List[Float32](length=MAX_QUANTUM_FRAMES * 2, fill=0.0)
+        self.send_l = List[Float32](length=MAX_QUANTUM_FRAMES, fill=0.0)
+        self.send_r = List[Float32](length=MAX_QUANTUM_FRAMES, fill=0.0)
+        self.dsend_l = List[Float32](length=MAX_QUANTUM_FRAMES, fill=0.0)
+        self.dsend_r = List[Float32](length=MAX_QUANTUM_FRAMES, fill=0.0)
 
     def load_pattern(mut self, code: String) -> Bool:
         var errs = self.engine_a.load(code)
@@ -933,16 +942,21 @@ struct CyclesStemNode(Movable):
         self.crossfading = False
         return True
 
-    def queue_quantized_transition(mut self, code: String, crossfade_cycles: Float32 = 1.0) -> Bool:
-        """Queues `code` on `engine_b` to begin crossfading strictly on the next integer cycle boundary."""
-        var errs = self.engine_b.load(code)
-        if len(errs) > 0:
+    def queue_quantized_transition_program(
+        mut self, var prog: Program, crossfade_cycles: Float32 = 1.0
+    ) -> Bool:
+        """Queues a pre-parsed `Program` on `engine_b` to crossfade strictly on the next integer cycle boundary."""
+        if len(prog.errors) > 0:
             return False
         if not self.active:
-            self.engine_a = CyclesEngine(self.engine_a.sample_rate)
-            _ = self.engine_a.load(code)
+            if not self.engine_a.load_program(prog^):
+                return False
             self.active = True
+            self.has_pending_transition = False
+            self.crossfading = False
             return True
+        if not self.engine_b.load_program(prog^):
+            return False
         var now_f = self.engine_a.now().to_float()
         self.transition_start_cycle = Int(floor(now_f)) + 1
         var sec_per_cycle = Float32(1.0 / max(0.05, self.engine_a.cps))
@@ -952,11 +966,28 @@ struct CyclesStemNode(Movable):
         self.crossfading = False
         return True
 
+    def queue_quantized_transition(mut self, code: String, crossfade_cycles: Float32 = 1.0) -> Bool:
+        """Parses and queues `code` on `engine_b` (call from non-RT thread)."""
+        return self.queue_quantized_transition_program(run_program(code), crossfade_cycles)
+
     @staticmethod
-    def _render_engine_noalloc(mut eng: CyclesEngine, mut out_lr: List[Float32], frames: Int):
-        """Steps `CyclesEngine` directly into pre-allocated `out_lr` (`frames * 2` floats)."""
+    def _render_engine_noalloc(
+        mut eng: CyclesEngine,
+        mut out_lr: List[Float32],
+        mut send_l: List[Float32],
+        mut send_r: List[Float32],
+        mut dsend_l: List[Float32],
+        mut dsend_r: List[Float32],
+        frames: Int,
+    ):
+        """Steps `CyclesEngine` directly into pre-allocated `out_lr` (`frames * 2` floats) with reverb & delay routing."""
         for i in range(frames * 2):
             out_lr[i] = 0.0
+        for f in range(frames):
+            send_l[f] = 0.0
+            send_r[f] = 0.0
+            dsend_l[f] = 0.0
+            dsend_r[f] = 0.0
         var begin = eng.now()
         var end = eng.cycle_at(eng.frames_since + frames)
         var span = (end - begin).to_float()
@@ -980,8 +1011,16 @@ struct CyclesStemNode(Movable):
                     break
                 var x = eng._sample(v)
                 v.t += 1
-                out_lr[f * 2] += x * v.gain_l
-                out_lr[f * 2 + 1] += x * v.gain_r
+                var l = x * v.gain_l
+                var r = x * v.gain_r
+                out_lr[f * 2] += l
+                out_lr[f * 2 + 1] += r
+                if v.room > Float32(0.0):
+                    send_l[f] += l * v.room
+                    send_r[f] += r * v.room
+                if v.delay_send > Float32(0.0):
+                    dsend_l[f] += l * v.delay_send
+                    dsend_r[f] += r * v.delay_send
             v.wait = 0
             if v.t >= v.life:
                 _ = eng.voices.pop(vi)
@@ -990,14 +1029,15 @@ struct CyclesStemNode(Movable):
                 vi += 1
 
         for f in range(frames):
+            var wet = eng.reverb.process_send(send_l[f], send_r[f])
             var read = (eng.delay_idx - dframes + dlen) % dlen
             var dl = eng.delay_l[read]
             var dr = eng.delay_r[read]
-            eng.delay_l[eng.delay_idx] = dr * eng.delay_fb
-            eng.delay_r[eng.delay_idx] = dl * eng.delay_fb
+            eng.delay_l[eng.delay_idx] = dsend_l[f] + dr * eng.delay_fb
+            eng.delay_r[eng.delay_idx] = dsend_r[f] + dl * eng.delay_fb
             eng.delay_idx = (eng.delay_idx + 1) % dlen
-            out_lr[f * 2] = soft_clip_tanh((out_lr[f * 2] + dl) * eng.master)
-            out_lr[f * 2 + 1] = soft_clip_tanh((out_lr[f * 2 + 1] + dr) * eng.master)
+            out_lr[f * 2] = soft_clip_tanh((out_lr[f * 2] + wet[0] * Float32(1.4) + dl) * eng.master)
+            out_lr[f * 2 + 1] = soft_clip_tanh((out_lr[f * 2 + 1] + wet[1] * Float32(1.4) + dr) * eng.master)
 
         eng.frames_since += frames
 
@@ -1013,7 +1053,9 @@ struct CyclesStemNode(Movable):
                 self.has_pending_transition = False
                 self.crossfade_frames_done = 0
 
-        Self._render_engine_noalloc(self.engine_a, self.scratch_a, frames)
+        Self._render_engine_noalloc(
+            self.engine_a, self.scratch_a, self.send_l, self.send_r, self.dsend_l, self.dsend_r, frames
+        )
         if not self.crossfading:
             var g = self.gain
             for f in range(frames):
@@ -1021,7 +1063,9 @@ struct CyclesStemNode(Movable):
                 bus_lr[f * 2 + 1] += self.scratch_a[f * 2 + 1] * g
             return
 
-        Self._render_engine_noalloc(self.engine_b, self.scratch_b, frames)
+        Self._render_engine_noalloc(
+            self.engine_b, self.scratch_b, self.send_l, self.send_r, self.dsend_l, self.dsend_r, frames
+        )
         var total = max(1, self.crossfade_frames_total)
         var g = self.gain
         for f in range(frames):
@@ -1057,13 +1101,23 @@ comptime _TELEM_MUSIC_DUCK_ENV: Int = 48
 comptime _TELEM_SLAB_BYTES: Int = 128
 
 
+comptime _RETIRE_RAW_PTR: UInt32 = 1
+comptime _RETIRE_BOX_CLIP: UInt32 = 2
+comptime _RETIRE_BOX_BUS: UInt32 = 3
+comptime _RETIRE_BOX_STEM: UInt32 = 4
+comptime _RETIRE_BOX_TRANSITION: UInt32 = 5
+
+
 struct _StemTransitionPayload(Movable):
-    var code: String
+    var program: Program
     var crossfade_cycles: Float32
 
-    def __init__(out self, code: String, crossfade_cycles: Float32):
-        self.code = code
+    def __init__(out self, var program: Program, crossfade_cycles: Float32):
+        self.program = program^
         self.crossfade_cycles = crossfade_cycles
+
+    def take_program(deinit self) -> Program:
+        return self.program^
 
 
 def _heap_box_alloc[
@@ -1076,13 +1130,19 @@ def _heap_box_alloc[
     return p
 
 
-def _heap_box_take[T: Movable & Deinitable](
+def _heap_box_take_nofree[T: Movable & Deinitable](
     p: Pointer[T, MutAnyOrigin]
 ) -> T:
-    var addr = Int(p)
+    """Moves `T` out of a heap box WITHOUT calling `free()`; caller must retire `Int(p)` to main thread."""
     var owned = __get_address_as_owned_value(p._mlir_value)
-    external_call["free", NoneType](addr)
     return owned^
+
+
+def _heap_box_put[T: Movable & Deinitable](
+    p: Pointer[T, MutAnyOrigin], var val: T
+):
+    """Places a retired `T` into an already-emptied heap box for main-thread destruction + `free()`."""
+    __get_address_as_uninit_lvalue(p._mlir_value) = val^
 
 
 def _heap_box_free[T: Movable & Deinitable](p: Pointer[T, MutAnyOrigin]):
@@ -1124,6 +1184,7 @@ struct AudioRtEngine(Movable):
     var quantum_frames: Int
 
     var cmd_ring: AudioMpscRing
+    var retire_ring: AudioMpscRing
     var rt_clips: List[AudioAssetSlot]
     var rt_qoa: List[QoaAsset]
     var emitters: List[SpatialEmitter]
@@ -1175,6 +1236,7 @@ struct AudioRtEngine(Movable):
         self.quantum_frames = max(32, min(MAX_QUANTUM_FRAMES, quantum_frames))
 
         self.cmd_ring = AudioMpscRing.create(ring_capacity)
+        self.retire_ring = AudioMpscRing.create(max(512, ring_capacity))
         self.rt_clips = List[AudioAssetSlot]()
         self.rt_qoa = List[QoaAsset]()
 
@@ -1334,6 +1396,53 @@ struct AudioRtEngine(Movable):
                         state[b] = 2
                         self.post_order.append(b)
 
+    @always_inline
+    def _retire_ptr(mut self, kind: UInt32, addr: Int):
+        """Queues a raw pointer or boxed payload for main-thread reclamation (zero `free()` on RT thread)."""
+        if addr == 0:
+            return
+        var rcmd = AudioCmd()
+        rcmd.kind = kind
+        _pack_ptr_into_cmd(rcmd, addr)
+        _ = self.retire_ring.push(rcmd)
+
+    def drain_retired_main_thread(mut self) -> Int:
+        """Called ONLY from the main/caller thread (or after RT thread joins) to free retired payloads."""
+        var freed = 0
+        var rcmd = AudioCmd()
+        while self.retire_ring.pop(rcmd):
+            var ptr_addr = _unpack_ptr_from_cmd(rcmd)
+            if ptr_addr == 0:
+                continue
+            if rcmd.kind == _RETIRE_RAW_PTR:
+                external_call["free", NoneType](ptr_addr)
+            elif rcmd.kind == _RETIRE_BOX_CLIP:
+                _heap_box_free[AudioAssetSlot](
+                    Pointer[AudioAssetSlot, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
+                    )
+                )
+            elif rcmd.kind == _RETIRE_BOX_BUS:
+                _heap_box_free[AudioBus](
+                    Pointer[AudioBus, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
+                    )
+                )
+            elif rcmd.kind == _RETIRE_BOX_STEM:
+                _heap_box_free[CyclesStemNode](
+                    Pointer[CyclesStemNode, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
+                    )
+                )
+            elif rcmd.kind == _RETIRE_BOX_TRANSITION:
+                _heap_box_free[_StemTransitionPayload](
+                    Pointer[_StemTransitionPayload, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
+                    )
+                )
+            freed += 1
+        return freed
+
     def _drain_commands(mut self):
         var cmd = AudioCmd()
         while self.cmd_ring.pop(cmd):
@@ -1341,11 +1450,10 @@ struct AudioRtEngine(Movable):
             if k == CMD_INSTALL_CLIP:
                 var ptr_addr = _unpack_ptr_from_cmd(cmd)
                 if ptr_addr != 0:
-                    var slot = _heap_box_take[AudioAssetSlot](
-                        Pointer[AudioAssetSlot, MutAnyOrigin](
-                            unsafe_from_address=ptr_addr
-                        )
+                    var p = Pointer[AudioAssetSlot, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
                     )
+                    var slot = _heap_box_take_nofree[AudioAssetSlot](p)
                     var aid = max(0, Int(cmd.asset_id))
                     while len(self.rt_clips) <= aid:
                         self.rt_clips.append(AudioAssetSlot())
@@ -1354,15 +1462,21 @@ struct AudioRtEngine(Movable):
                         self.rt_qoa.append(slot.qoa^)
                         slot.qoa = QoaAsset()
                         slot.qoa_index = q_idx
-                    self.rt_clips[aid] = slot^
+                    if self.rt_clips[aid].valid:
+                        var old_slot = self.rt_clips[aid].copy()
+                        _heap_box_put[AudioAssetSlot](p, old_slot^)
+                        self.rt_clips[aid] = slot^
+                        self._retire_ptr(_RETIRE_BOX_CLIP, ptr_addr)
+                    else:
+                        self.rt_clips[aid] = slot^
+                        self._retire_ptr(_RETIRE_RAW_PTR, ptr_addr)
             elif k == CMD_ADD_BUS:
                 var ptr_addr = _unpack_ptr_from_cmd(cmd)
                 if ptr_addr != 0:
-                    var new_bus = _heap_box_take[AudioBus](
-                        Pointer[AudioBus, MutAnyOrigin](
-                            unsafe_from_address=ptr_addr
-                        )
+                    var p = Pointer[AudioBus, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
                     )
+                    var new_bus = _heap_box_take_nofree[AudioBus](p)
                     var bid = max(0, Int(cmd.bus_id))
                     while len(self.buses) < bid:
                         var pad_id = len(self.buses)
@@ -1373,6 +1487,7 @@ struct AudioRtEngine(Movable):
                         self.buses.append(new_bus^)
                     else:
                         self.buses[bid] = new_bus^
+                    self._retire_ptr(_RETIRE_RAW_PTR, ptr_addr)
                     self.rebuild_topology()
             elif k == CMD_CONFIG_BUS:
                 var b = Int(cmd.bus_id)
@@ -1416,11 +1531,10 @@ struct AudioRtEngine(Movable):
             elif k == CMD_ADD_STEM:
                 var ptr_addr = _unpack_ptr_from_cmd(cmd)
                 if ptr_addr != 0:
-                    var node = _heap_box_take[CyclesStemNode](
-                        Pointer[CyclesStemNode, MutAnyOrigin](
-                            unsafe_from_address=ptr_addr
-                        )
+                    var p = Pointer[CyclesStemNode, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
                     )
+                    var node = _heap_box_take_nofree[CyclesStemNode](p)
                     var sid = max(0, Int(cmd.slot))
                     while len(self.cycles_stem) < sid:
                         self.cycles_stem.append(
@@ -1430,19 +1544,23 @@ struct AudioRtEngine(Movable):
                         self.cycles_stem.append(node^)
                     else:
                         self.cycles_stem[sid] = node^
+                    self._retire_ptr(_RETIRE_RAW_PTR, ptr_addr)
             elif k == CMD_TRANSITION_STEM:
                 var ptr_addr = _unpack_ptr_from_cmd(cmd)
                 if ptr_addr != 0:
-                    var tr = _heap_box_take[_StemTransitionPayload](
-                        Pointer[_StemTransitionPayload, MutAnyOrigin](
-                            unsafe_from_address=ptr_addr
-                        )
-                    )
                     var sid = Int(cmd.slot)
                     if sid >= 0 and sid < len(self.cycles_stem):
-                        _ = self.cycles_stem[sid].queue_quantized_transition(
-                            tr.code, tr.crossfade_cycles
+                        var p = Pointer[_StemTransitionPayload, MutAnyOrigin](
+                            unsafe_from_address=ptr_addr
                         )
+                        var tr = _heap_box_take_nofree[_StemTransitionPayload](p)
+                        var xfade = tr.crossfade_cycles
+                        _ = self.cycles_stem[sid].queue_quantized_transition_program(
+                            tr^.take_program(), xfade
+                        )
+                        self._retire_ptr(_RETIRE_RAW_PTR, ptr_addr)
+                    else:
+                        self._retire_ptr(_RETIRE_BOX_TRANSITION, ptr_addr)
             elif k == ACMD_PLAY:
                 var s = Int(cmd.slot)
                 if (
@@ -1587,7 +1705,9 @@ struct AudioRtEngine(Movable):
 
     def destroy_engine_allocations(mut self):
         self._free_unconsumed_ring_payloads()
+        _ = self.drain_retired_main_thread()
         self.cmd_ring.destroy()
+        self.retire_ring.destroy()
         if self.telemetry_atomic != 0:
             external_call["free", NoneType](self.telemetry_atomic)
             self.telemetry_atomic = 0
@@ -2371,8 +2491,11 @@ struct AudioRtEngine(Movable):
             self.pulse.pump()
             if not self.pulse.connected():
                 break
+            if self.pulse.has_pending_write():
+                if not self.pulse.flush_pending():
+                    break
             var frame_bytes = qf * 4
-            if self.pulse.requested_bytes >= frame_bytes:
+            if not self.pulse.has_pending_write() and self.pulse.requested_bytes >= frame_bytes:
                 self.render_quantum(float_lr, qf)
                 for i in range(qf * 2):
                     var s = max(
@@ -2381,10 +2504,7 @@ struct AudioRtEngine(Movable):
                     self.rt_pcm_i16[i] = Int16(Int(s * Float32(32767.0)))
                 _ = self.pulse.write_samples(self.rt_pcm_i16)
             else:
-                var ts = Array[Int64, 2](fill=0)
-                ts[1] = 1_500_000
-                _ = external_call["nanosleep", Int32](Pointer(to=ts), Int(0))
-                _ = ts[1]
+                _ = self.pulse.wait_io(10)
 
 
 struct AudioServer(Movable):
@@ -2465,15 +2585,23 @@ struct AudioServer(Movable):
     def rt_engine_address(self) -> Int:
         return self.rt_core_addr
 
+    def drain_retired(mut self) -> Int:
+        """Reclaims payloads retired by the RT thread on the caller/main thread."""
+        if self.rt_core_addr == 0:
+            return 0
+        return self._rt_core()[].drain_retired_main_thread()
+
     def _enqueue_guaranteed(mut self, cmd: AudioCmd):
         """Enqueues a command (including heap-owned payloads) without loss."""
         if self.rt_core_addr == 0:
             return
+        _ = self.drain_retired()
         while not self._rt_core()[].cmd_ring.push(cmd):
             if self.rt_running:
                 _ = external_call["sched_yield", Int32]()
             else:
                 self._rt_core()[]._drain_commands()
+                _ = self.drain_retired()
 
     # ---- Lock-Free Atomic Telemetry Getters ----
 
@@ -2760,8 +2888,11 @@ struct AudioServer(Movable):
         code: String,
         crossfade_cycles: Float32 = 1.0,
     ):
+        var prog = run_program(code)
+        if len(prog.errors) > 0:
+            return
         var boxed = _heap_box_alloc[_StemTransitionPayload](
-            _StemTransitionPayload(code, crossfade_cycles)
+            _StemTransitionPayload(prog^, crossfade_cycles)
         )
         var cmd = AudioCmd()
         cmd.kind = CMD_TRANSITION_STEM
@@ -2936,6 +3067,7 @@ struct AudioServer(Movable):
         if self.rt_core_addr == 0 or self.rt_running:
             return
         self._rt_core()[].render_quantum(out_lr, frames)
+        _ = self.drain_retired()
 
     # ---- Dedicated RT Thread Lifecycle (PulseAudio / PipeWire / Headless RT Pthread) ----
 
@@ -2962,6 +3094,7 @@ struct AudioServer(Movable):
         if rc != 0:
             self._rt_core()[]._running_ptr()[unsafe_offset=0].store(0)
             self._rt_core()[].pulse.close()
+        _ = self.drain_retired()
             return False
         self.rt_thread_handle = tid
         self.rt_running = True
@@ -3002,6 +3135,7 @@ struct AudioServer(Movable):
             self.rt_thread_handle = 0
             self.rt_running = False
         self._rt_core()[].pulse.close()
+        _ = self.drain_retired()
         if self._rt_core()[].alsa_fd >= 0:
             close_fd(self._rt_core()[].alsa_fd)
             self._rt_core()[].alsa_fd = -1

@@ -20,9 +20,10 @@ File descriptors come with no marker for their message. The only ones that reach
 this client are wl_keyboard.keymap, which is ours and unused, so it is closed, and
 the dmabuf feedback table, which the driver reads. Others stay in order for libwayland.
 """
+from std.atomic import Atomic
 from std.ffi import external_call
-from flint.platform.dynlib import dl_open, dl_sym
-from flint.platform.os import close_fd
+from flint.platform.dynlib import dl_open, dl_sym, dl_close
+from flint.platform.os import close_fd, last_errno, EINTR
 from flint.platform.vulkan import call1, get32, get64, put32, put64
 
 comptime WORD_REAL: Int = 0
@@ -53,6 +54,7 @@ comptime MAX_FDS: Int = 64
 comptime CONTROL_BYTES: Int = 16 + MAX_FDS * 4
 comptime POLL_MS: Int32 = 100
 comptime DONT_WAIT: Int32 = 64
+comptime MSG_NOSIGNAL: Int32 = 0x4000
 comptime SOCKET_LEVEL: UInt32 = 1
 comptime SCM_RIGHTS: UInt32 = 1
 comptime POLL_IN: UInt32 = 1
@@ -74,6 +76,11 @@ def word(state: Int, index: Int) -> Int:
 
 def set_word(state: Int, index: Int, value: Int):
     put64(state + index * 8, value)
+
+
+@always_inline
+def _stop_ptr(state: Int) -> Pointer[Atomic[Int64], MutAnyOrigin]:
+    return Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=state + WORD_STOP * 8)
 
 
 def is_owned(state: Int, id: Int) -> Bool:
@@ -147,8 +154,12 @@ def send_some(fd: Int, buffer: Int, size: Int, fds: Int, fd_count: Int) -> Bool:
         else:
             put64(message + 32, 0)
             put64(message + 40, 0)
-        var count = Int(external_call["sendmsg", Int64](Int32(fd), raw(message), Int32(0)))
-        if count <= 0:
+        var count = Int(external_call["sendmsg", Int64](Int32(fd), raw(message), MSG_NOSIGNAL))
+        if count < 0:
+            if last_errno() == EINTR:
+                continue
+            ok = False
+        elif count == 0:
             ok = False
         else:
             sent += count
@@ -238,7 +249,7 @@ def bridge_thread(state: Int) abi("C") -> Int:
     put32(descriptors + 4, POLL_IN)
     put32(descriptors + 8, UInt32(word(state, WORD_LIBRARY)))
     put32(descriptors + 12, POLL_IN)
-    while word(state, WORD_STOP) == 0:
+    while _stop_ptr(state)[unsafe_offset=0].load() == 0:
         var ready = external_call["poll", Int32](raw(descriptors), UInt64(2), POLL_MS)
         if ready <= 0:
             continue
@@ -341,7 +352,9 @@ struct WaylandBridge(Copyable, Movable):
         set_word(state, WORD_OUT, external_call["malloc", Int](STREAM_BYTES))
         set_word(state, WORD_GAME, external_call["malloc", Int](GAME_BYTES))
         set_word(state, WORD_OWNED, external_call["calloc", Int](Int(MAX_OWNED_ID // 8), Int(1)))
-        set_word(state, WORD_MUTEX, external_call["calloc", Int](Int(1), Int(64)))
+        var mutex_ptr = external_call["calloc", Int](Int(1), Int(64))
+        _ = external_call["pthread_mutex_init", Int32](mutex_ptr, Int(0))
+        set_word(state, WORD_MUTEX, mutex_ptr)
         set_word(state, WORD_IN_FDS, external_call["malloc", Int](MAX_FDS * 8))
         set_word(state, WORD_OUT_FDS, external_call["malloc", Int](MAX_FDS * 8))
         set_owned(state, WL_DISPLAY_ID)
@@ -383,7 +396,9 @@ struct WaylandBridge(Copyable, Movable):
     def allocate_id(self) -> Int:
         self.push_out()
         var id = self.proxy_id(self.create_proxy(self.callback_interface))
+        lock(self.state)
         set_owned(self.state, id)
+        unlock(self.state)
         return id
 
     def reserve_compositor(mut self) -> Int:
@@ -391,7 +406,9 @@ struct WaylandBridge(Copyable, Movable):
         self.push_out()
         self.compositor_proxy = self.create_proxy(self.compositor_interface)
         var id = self.proxy_id(self.compositor_proxy)
+        lock(self.state)
         set_owned(self.state, id)
+        unlock(self.state)
         return id
 
     def create_surface(mut self) -> Int:
@@ -403,7 +420,9 @@ struct WaylandBridge(Copyable, Movable):
             self.error = "wl_compositor.create_surface failed"
             return 0
         var id = self.proxy_id(self.surface_proxy)
+        lock(self.state)
         set_owned(self.state, id)
+        unlock(self.state)
         self.push_out()
         return id
 
@@ -454,12 +473,37 @@ struct WaylandBridge(Copyable, Movable):
 
     def stop(mut self):
         """Stop the thread and let go of the library's connection. The socket stays ours."""
-        if self.state == 0:
-            return
-        self.push_out()
-        set_word(self.state, WORD_STOP, 1)
-        _ = external_call["pthread_join", Int32](word(self.state, WORD_THREAD), Int(0))
-        _ = call1(self.fn_disconnect, self.display)
-        close_fd(word(self.state, WORD_LIBRARY))
-        close_fd(word(self.state, WORD_NOTIFY))
-        self.state = 0
+        if self.state != 0:
+            self.push_out()
+            _stop_ptr(self.state)[unsafe_offset=0].store(1)
+            _ = external_call["pthread_join", Int32](word(self.state, WORD_THREAD), Int(0))
+            if self.display != 0 and self.fn_disconnect != 0:
+                _ = call1(self.fn_disconnect, self.display)
+            self.display = 0
+            self.surface_proxy = 0
+            self.compositor_proxy = 0
+            close_fd(word(self.state, WORD_LIBRARY))
+            close_fd(word(self.state, WORD_NOTIFY))
+            var in_fds = word(self.state, WORD_IN_FDS)
+            var in_fd_count = word(self.state, WORD_IN_FD_COUNT)
+            for idx in range(in_fd_count):
+                close_fd(get64(in_fds + idx * 8))
+            var out_fds = word(self.state, WORD_OUT_FDS)
+            var out_fd_count = word(self.state, WORD_OUT_FD_COUNT)
+            for idx in range(out_fd_count):
+                close_fd(get64(out_fds + idx * 8))
+            var mutex_ptr = word(self.state, WORD_MUTEX)
+            if mutex_ptr != 0:
+                _ = external_call["pthread_mutex_destroy", Int32](mutex_ptr)
+                external_call["free", NoneType](mutex_ptr)
+            external_call["free", NoneType](word(self.state, WORD_IN))
+            external_call["free", NoneType](word(self.state, WORD_OUT))
+            external_call["free", NoneType](word(self.state, WORD_GAME))
+            external_call["free", NoneType](word(self.state, WORD_OWNED))
+            external_call["free", NoneType](in_fds)
+            external_call["free", NoneType](out_fds)
+            external_call["free", NoneType](self.state)
+            self.state = 0
+        if self.library != 0:
+            _ = dl_close(self.library)
+            self.library = 0

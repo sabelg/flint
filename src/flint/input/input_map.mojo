@@ -166,6 +166,7 @@ struct AxisCurve(Copyable, ImplicitlyCopyable, Movable):
 struct InputBinding(Copyable, ImplicitlyCopyable, Movable):
     """Maps a physical key/chord/button/axis to a named action within an `InputContext`."""
     var action_name: String
+    var action_index: Int
     var source_kind: Int
     var code: Int          # keycode, mouse button, pad button, pad axis, or stick index (0=L, 1=R, 2=DPad)
     var modifiers: Int     # MOD_CTRL | MOD_SHIFT | MOD_ALT (for BIND_KEY)
@@ -184,8 +185,10 @@ struct InputBinding(Copyable, ImplicitlyCopyable, Movable):
         scale_y: Float32 = 0.0,
         consume_input: Bool = True,
         curve: AxisCurve = AxisCurve(),
+        action_index: Int = -1,
     ):
         self.action_name = action_name
+        self.action_index = action_index
         self.source_kind = source_kind
         self.code = code
         self.modifiers = modifiers
@@ -355,8 +358,13 @@ struct InputMap(Copyable, Movable):
             if self.actions[i].name == name:
                 self.actions[i].kind = kind
                 return i
+        var idx = len(self.actions)
         self.actions.append(ActionState(name, kind))
-        return len(self.actions) - 1
+        for ci in range(len(self.contexts)):
+            for bi in range(len(self.contexts[ci].bindings)):
+                if self.contexts[ci].bindings[bi].action_name == name:
+                    self.contexts[ci].bindings[bi].action_index = idx
+        return idx
 
     def _action_index(self, name: String) -> Int:
         for i in range(len(self.actions)):
@@ -364,7 +372,12 @@ struct InputMap(Copyable, Movable):
                 return i
         return -1
 
+    def _resolve_context_bindings(self, mut ctx: InputContext):
+        for bi in range(len(ctx.bindings)):
+            ctx.bindings[bi].action_index = self._action_index(ctx.bindings[bi].action_name)
+
     def add_context(mut self, var ctx: InputContext):
+        self._resolve_context_bindings(ctx)
         for i in range(len(self.contexts)):
             if self.contexts[i].name == ctx.name:
                 self.contexts[i] = ctx^
@@ -408,6 +421,8 @@ struct InputMap(Copyable, Movable):
                 self.contexts[ci].bindings[bi].modifiers = new_modifiers
                 return True
         self.contexts[ci].bind_key(action_name, new_key, new_modifiers)
+        var last_bi = len(self.contexts[ci].bindings) - 1
+        self.contexts[ci].bindings[last_bi].action_index = self._action_index(action_name)
         return True
 
     def rebind_pad_button(mut self, context_name: String, action_name: String, new_pad_btn: Int) -> Bool:
@@ -419,6 +434,8 @@ struct InputMap(Copyable, Movable):
                 self.contexts[ci].bindings[bi].code = new_pad_btn
                 return True
         self.contexts[ci].bind_pad_button(action_name, new_pad_btn)
+        var last_bi = len(self.contexts[ci].bindings) - 1
+        self.contexts[ci].bindings[last_bi].action_index = self._action_index(action_name)
         return True
 
     # ---- Evaluation ----
@@ -444,6 +461,7 @@ struct InputMap(Copyable, Movable):
 
         # Snapshot previous Bool states & clear frame accumulators
         var prev_down = List[Bool](length=len(self.actions), fill=False)
+        var unbounded_axis = List[Bool](length=len(self.actions), fill=False)
         for i in range(len(self.actions)):
             prev_down[i] = self.actions[i].down
             self.actions[i].down = False
@@ -497,9 +515,11 @@ struct InputMap(Copyable, Movable):
                     if (pass_mod == 0 and not is_chord) or (pass_mod == 1 and is_chord):
                         continue
 
-                    var ai = self._action_index(b.action_name)
-                    if ai < 0:
-                        continue
+                    var ai = b.action_index
+                    if ai < 0 or ai >= len(self.actions):
+                        ai = self._action_index(b.action_name)
+                        if ai < 0:
+                            continue
 
                     if b.source_kind == BIND_KEY:
                         var k = b.code
@@ -525,9 +545,14 @@ struct InputMap(Copyable, Movable):
                                 consumed_mouse[mb] = True
 
                     elif b.source_kind == BIND_MOUSE_DELTA_2D:
-                        var mv = b.curve.eval_2d(input.mouse_delta_x(), input.mouse_delta_y())
-                        self.actions[ai].value_x += mv[0]
-                        self.actions[ai].value_y += mv[1]
+                        var dx = -input.mouse_delta_x() if b.curve.invert_x else input.mouse_delta_x()
+                        var dy = -input.mouse_delta_y() if b.curve.invert_y else input.mouse_delta_y()
+                        var mx = dx * b.curve.sensitivity * b.scale_x
+                        var my = dy * b.curve.sensitivity * b.scale_y
+                        self.actions[ai].value_x += mx
+                        self.actions[ai].value_y += my
+                        if abs(mx) + abs(my) > Float32(0.0):
+                            unbounded_axis[ai] = True
 
                     elif b.source_kind == BIND_MOUSE_WHEEL_1D:
                         self.actions[ai].value_x += b.curve.eval_1d(input.mouse_wheel())
@@ -591,15 +616,17 @@ struct InputMap(Copyable, Movable):
                     self.actions[i].released = True
                 self.actions[i].value_x = Float32(1.0) if now_d else Float32(0.0)
             elif k == ACTION_AXIS1D:
-                self.actions[i].value_x = max(Float32(-1.0), min(Float32(1.0), self.actions[i].value_x))
+                if not unbounded_axis[i]:
+                    self.actions[i].value_x = max(Float32(-1.0), min(Float32(1.0), self.actions[i].value_x))
             elif k == ACTION_AXIS2D:
-                var vx = self.actions[i].value_x
-                var vy = self.actions[i].value_y
-                var mag = sqrt(vx * vx + vy * vy)
-                if mag > Float32(1.0):
-                    var inv = Float32(1.0) / mag
-                    self.actions[i].value_x = vx * inv
-                    self.actions[i].value_y = vy * inv
+                if not unbounded_axis[i]:
+                    var vx = self.actions[i].value_x
+                    var vy = self.actions[i].value_y
+                    var mag = sqrt(vx * vx + vy * vy)
+                    if mag > Float32(1.0):
+                        var inv = Float32(1.0) / mag
+                        self.actions[i].value_x = vx * inv
+                        self.actions[i].value_y = vy * inv
 
     # ---- Queries, Jump Buffer (`120 ms`) & Coyote Time (`100 ms`) ----
 
