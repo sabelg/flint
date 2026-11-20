@@ -48,6 +48,14 @@ from flint.platform.vulkan import (
 from flint.platform.wayland import WaylandWindow
 from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AaaMaterial
 from flint.render.aaa_renderer import AAA_DISPLAY_SCRGB_FP16, FlintAaaVulkanRenderer, aaa_pack_scrgb_rgba16f_shader
+from flint.render.aaa_visbuffer import (
+    AAA_MAX_BINDLESS,
+    AAA_MAX_PACKED_INSTANCES,
+    AAA_MAX_PACKED_MESHLET_ID,
+    compute_hiz_mip_levels,
+    hiz_depth_downsample_shader,
+    meshlet_cull_shader,
+)
 from flint.render.aaa_glass import (
     AaaGlassParams,
     aaa_glass_refract_shader,
@@ -292,6 +300,18 @@ def test_spirv_spec_constants_and_shaders():
     var rep_vsm_av = validate_spirv_module(vsm_alphamask_vertex_shader())
     if not rep_vsm_av.valid:
         _fail("vsm_alphamask_vertex_shader SPIR-V validation failed: " + rep_vsm_av.errors[0])
+    var rep_hiz = validate_spirv_module(hiz_depth_downsample_shader())
+    if not rep_hiz.valid:
+        _fail("hiz_depth_downsample_shader SPIR-V validation failed: " + rep_hiz.errors[0])
+    var rep_mc = validate_spirv_module(meshlet_cull_shader())
+    if not rep_mc.valid:
+        _fail("meshlet_cull_shader SPIR-V validation failed: " + rep_mc.errors[0])
+    var max_bindless_rt = AAA_MAX_BINDLESS
+    var max_ml_rt = AAA_MAX_PACKED_MESHLET_ID
+    var max_inst_rt = AAA_MAX_PACKED_INSTANCES
+    _assert(max_bindless_rt >= 4096, "AAA_MAX_BINDLESS raised to >= 4096")
+    _assert(max_ml_rt == 0x1FFFE and max_inst_rt == 0x7FFF, "17-bit ml_id / 15-bit inst_id packing limits")
+    _assert(compute_hiz_mip_levels(320, 180) == 8 and compute_hiz_mip_levels(16, 16) == 5, "Hi-Z mip level computation")
 
     print("[PASS] Suite 1: SPIR-V OpSpecConstant & Track 2 Shader Validation (" + String(len(ui_spv)) + " UI words)")
 
@@ -1151,6 +1171,17 @@ def test_gpu_ui_polygons():
     _assert(abs(edge - single // 2) <= 4, "edges are anti-aliased (" + String(edge) + ")")
     var seam = _unpack_argb(px[20 * W + 60])[0]   # on an internal edge of the union
     _assert(abs(seam - single) <= 2, "no seam on internal union edges (" + String(seam) + ")")
+    # Verify ScalableRenderer Tier 2 resize() recreates targets & updates SwapchainSurface
+    var prev_gen = renderer.surface.resize_generations
+    _assert(renderer.resize(128, 80), "ScalableRenderer Tier 2 resize(128, 80) succeeded")
+    _assert(
+        renderer.width == 128
+        and renderer.height == 80
+        and renderer.gpu_slot[0].output_w == 128
+        and renderer.gpu_slot[0].output_h == 80
+        and renderer.surface.resize_generations == prev_gen + 1,
+        "ScalableRenderer Tier 2 resize synced dimensions and surface generation",
+    )
     print("[PASS] Suite 4b: GPU UI PRIM_POLYGON nonzero winding (hole, union blended once, AA edge " + String(edge) + ", no seam)")
     renderer.shutdown()
 
@@ -1259,6 +1290,38 @@ def test_render_features_glass_water_particles():
             blue_seen = c.z
         _assert(red_seen > blue_seen * 2.0, "the red wall shows through clear glass (r=" + String(red_seen) + " b=" + String(blue_seen) + ")")
         glass_note = "glass r=" + String(red_seen) + " b=" + String(blue_seen)
+    # Verify Phase 0+2 ring-buffering, multi-mip Hi-Z pyramid, async VSM boundary crossing, and live resize()
+    _assert(
+        len(ren.ring_surfcache) == 2
+        and len(ren.ring_vsm_table) == 2
+        and len(ren.ring_oit_staging) == 2
+        and ren.ring_surfcache[0].vk_buffer != ren.ring_surfcache[1].vk_buffer
+        and ren.ring_vsm_table[0].vk_buffer != ren.ring_vsm_table[1].vk_buffer
+        and ren.ring_oit_staging[0].vk_buffer != ren.ring_oit_staging[1].vk_buffer,
+        "Per-slot ring-buffered surfcache, vsm_table, and oit_staging buffers are distinct",
+    )
+    _assert(
+        ren.hiz_img.image != 0 and ren.hiz_mip_levels == compute_hiz_mip_levels(W, H) and ren.hiz_valid,
+        "Multi-mip Hi-Z depth pyramid created and populated",
+    )
+    # VSM camera boundary crossing (async 1-frame readback without mid-frame stall)
+    ren.enable_vsm = True
+    ren.begin_frame(Vec3(12.0, 2.0, 4.0), Vec3(12.0, 1.0, 0.0), fov_y_deg=40.0)
+    ren.draw_instance(box_e.mesh_id, trs(Vec3(12.0, -0.1, 0.0), Quat(), Vec3(5.0, 0.1, 5.0)))
+    _assert(ren.render_frame(capture_readback=False), "VSM boundary-crossing async frame rendered")
+
+    # Live FlintAaaVulkanRenderer.resize() + post-resize render & readback
+    _assert(ren.resize(192, 128), "FlintAaaVulkanRenderer.resize(192, 128) succeeded")
+    _assert(
+        ren.output_w == 192 and ren.output_h == 128 and ren.hiz_mip_levels == compute_hiz_mip_levels(192, 128),
+        "FlintAaaVulkanRenderer.resize updated output dimensions and Hi-Z mip count",
+    )
+    ren.begin_frame(eye, tgt, fov_y_deg=40.0)
+    ren.draw_instance(box_e.mesh_id, trs(Vec3(0.0, -0.1, 0.0), Quat(), Vec3(5.0, 0.1, 5.0)))
+    _assert(ren.render_frame(capture_readback=True), "Post-resize frame rendered")
+    var resized_px = ren.readback_pixels()
+    _assert(len(resized_px) == 192 * 128, "Post-resize readback matches new 192x128 dimensions")
+
     print("[PASS] Suite 7: Soft RT Shadows + Refractive Glass + Shaped Water + Generic GPU Particles (green "
           + String(g0) + " -> " + String(g1) + ", " + glass_note + ")")
     ren.shutdown()

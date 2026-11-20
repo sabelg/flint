@@ -1005,6 +1005,28 @@ struct ScalableRenderer(Movable):
 
         return True
 
+    def resize(mut self, width: Int, height: Int) -> Bool:
+        """Resizes the active tier (`Tier 0` CPU canvas or `Tier 1/2` Vulkan `SwapchainSurface` + render targets)."""
+        var nw = max(16, width)
+        var nh = max(16, height)
+        if not self.uses_vulkan():
+            self.width = nw
+            self.height = nh
+            self.cpu_canvas = SimdCanvas(nw, nh)
+            _ = self.surface.initialize_headless(nw, nh, self.surface.display_mode, self.surface.present_mode)
+            self.surface.resize_generations += 1
+            return True
+
+        var ok_sc = self.surface.recreate(self.gpu_slot[0].vk, nw, nh)
+        var target_w = self.surface.width if self.surface.width > 0 else nw
+        var target_h = self.surface.height if self.surface.height > 0 else nh
+        var ok_ren = self.gpu_slot[0].resize(target_w, target_h)
+        self.width = self.gpu_slot[0].output_w
+        self.height = self.gpu_slot[0].output_h
+        self.gpu_slot[0].display_mode = self.surface.display_mode
+        self.gpu_slot[0].swapchain_out_of_date = False
+        return ok_sc and ok_ren
+
     def render_world(
         mut self,
         world: RenderWorld,
@@ -1015,6 +1037,15 @@ struct ScalableRenderer(Movable):
         """Renders `world` + 3D `DebugLineBatch` + `ui` through the active tier (`Tier 0`, `Tier 1`, or `Tier 2`)."""
         if not self.uses_vulkan():
             return self._render_tier0_simd(world, ui)
+
+        if (
+            self.gpu_slot[0].swapchain_out_of_date
+            or (
+                self.surface.is_zero_copy_gpu()
+                and (self.gpu_slot[0].output_w != self.width or self.gpu_slot[0].output_h != self.height)
+            )
+        ):
+            _ = self.resize(self.width, self.height)
 
         ref gpu = self.gpu_slot[0]
         gpu.sun_dir = world.sun_dir.normalized()
@@ -1054,7 +1085,12 @@ struct ScalableRenderer(Movable):
             self.height,
             world.camera.up,
         )
-        return gpu.render_frame(capture_readback=capture_readback, force_readback=force_readback)
+        var ok = gpu.render_frame(capture_readback=capture_readback, force_readback=force_readback)
+        if self.gpu_slot[0].swapchain_out_of_date:
+            var rw = self.gpu_slot[0].vk.swapchain_width if self.gpu_slot[0].vk.swapchain_width > 0 else self.width
+            var rh = self.gpu_slot[0].vk.swapchain_height if self.gpu_slot[0].vk.swapchain_height > 0 else self.height
+            _ = self.resize(rw, rh)
+        return ok
 
     def readback_pixels(self) -> List[UInt32]:
         if self.uses_vulkan():

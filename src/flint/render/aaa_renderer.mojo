@@ -59,6 +59,7 @@ from flint.platform.vulkan import (
     FORMAT_BC7_SRGB,
     FORMAT_BC7_UNORM,
     FORMAT_D32_SFLOAT,
+    FORMAT_R32_SFLOAT,
     FORMAT_R16G16_SFLOAT,
     FORMAT_R16G16B16A16_SFLOAT,
     FORMAT_R32G32_UINT,
@@ -98,6 +99,8 @@ from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 from flint.render.aaa_visbuffer import (
     AAA_INSTANCE_WORDS,
     AAA_MAX_BINDLESS,
+    AAA_MAX_PACKED_INSTANCES,
+    AAA_MAX_PACKED_MESHLET_ID,
     AAA_PUSH_BYTES,
     AAA_PUSH_WORDS,
     AAA_SINGLE_SAMPLERS,
@@ -126,6 +129,8 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_VIS_TEX,
     BIND_AAA_VSM_TABLE,
     BIND_AAA_VSM_TEX,
+    compute_hiz_mip_levels,
+    hiz_depth_downsample_shader,
     make_reverse_z_perspective,
     meshlet_cull_shader,
     visbuffer_alphamask_vertex_shader,
@@ -495,12 +500,19 @@ struct FlintAaaVulkanRenderer(Movable):
     var ring_alphamask_indirect: List[GpuBuffer]
     var ring_outline_indirect: List[GpuBuffer]
     var ring_clusters: List[GpuBuffer]
+    var ring_surfcache: List[GpuBuffer]
+    var ring_vsm_table: List[GpuBuffer]
+    var ring_oit_staging: List[GpuBuffer]
     var ring_tlas: List[VulkanAccelStruct]
     var ring_tlas_cap: List[Int]  # instance capacity each slot's TLAS + shared scratch were sized for
     var desc_sets: List[Int]
     var desc_sets_cull_p1: List[Int]
     var desc_sets_cull_p2: List[Int]
     var frame_fences: List[UInt64]
+    var slot_prof_pairs: List[List[Tuple[String, Int]]]
+    var slot_frame_q: List[Int]
+    var slot_has_pending_queries: List[Bool]
+    var swapchain_out_of_date: Bool
 
     # Frame-time instrumentation (refreshed by every `render_frame`; read-only for callers)
     var last_cpu_prev_wait_ms: Float64  # deferred mode: wait on the previous frame's fence
@@ -542,6 +554,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var desc_pool: Int
     var desc_set: Int
     var pipe_meshlet_cull: Int
+    var pipe_hiz_downsample: Int
     var pipe_visbuffer_gfx: Int
     var pipe_visbuffer_alphamask_gfx: Int
     var pipe_vsm_mark: Int
@@ -585,6 +598,9 @@ struct FlintAaaVulkanRenderer(Movable):
     var samp_nearest: Int
     var vis_img: VulkanImage
     var depth_img: VulkanImage
+    var hiz_img: VulkanImage
+    var hiz_mip_levels: Int
+    var hiz_valid: Bool
     var vsm_img: VulkanImage
     var brdf_lut_img: VulkanImage
     var ltc_lut_img: VulkanImage
@@ -772,6 +788,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.desc_pool = 0
         self.desc_set = 0
         self.pipe_meshlet_cull = 0
+        self.pipe_hiz_downsample = 0
         self.pipe_visbuffer_gfx = 0
         self.pipe_visbuffer_alphamask_gfx = 0
         self.pipe_vsm_mark = 0
@@ -814,6 +831,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.samp_nearest = 0
         self.vis_img = VulkanImage()
         self.depth_img = VulkanImage()
+        self.hiz_img = VulkanImage()
+        self.hiz_mip_levels = 1
+        self.hiz_valid = False
         self.vsm_img = VulkanImage()
         self.brdf_lut_img = VulkanImage()
         self.ltc_lut_img = VulkanImage()
@@ -848,12 +868,19 @@ struct FlintAaaVulkanRenderer(Movable):
         self.ring_alphamask_indirect = List[GpuBuffer]()
         self.ring_outline_indirect = List[GpuBuffer]()
         self.ring_clusters = List[GpuBuffer]()
+        self.ring_surfcache = List[GpuBuffer]()
+        self.ring_vsm_table = List[GpuBuffer]()
+        self.ring_oit_staging = List[GpuBuffer]()
         self.ring_tlas = List[VulkanAccelStruct]()
         self.ring_tlas_cap = List[Int]()
         self.desc_sets = List[Int]()
         self.desc_sets_cull_p1 = List[Int]()
         self.desc_sets_cull_p2 = List[Int]()
         self.frame_fences = List[UInt64]()
+        self.slot_prof_pairs = List[List[Tuple[String, Int]]]()
+        self.slot_frame_q = List[Int]()
+        self.slot_has_pending_queries = List[Bool]()
+        self.swapchain_out_of_date = False
 
         self.last_cpu_prev_wait_ms = 0.0
         self.last_cpu_pack_ms = 0.0
@@ -1122,6 +1149,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Compile all 10 AAA Hardware Graphics & Compute SPIR-V 1.5 Pipelines!
         self.pipe_meshlet_cull = self.vk.create_aaa_compute_pipeline(self.pipe_layout, meshlet_cull_shader())
+        self.pipe_hiz_downsample = self.vk.create_aaa_compute_pipeline(self.pipe_layout, hiz_depth_downsample_shader())
         self.pipe_visbuffer_gfx = self.vk.create_graphics_pipeline(
             self.pipe_layout,
             visbuffer_vertex_shader(),
@@ -1238,6 +1266,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         if (
             self.pipe_meshlet_cull == 0
+            or self.pipe_hiz_downsample == 0
             or self.pipe_visbuffer_gfx == 0
             or self.pipe_visbuffer_alphamask_gfx == 0
             or self.pipe_npr_outline_gfx == 0
@@ -1291,6 +1320,14 @@ struct FlintAaaVulkanRenderer(Movable):
         self.depth_img = self.vk.create_image_2d(
             self.render_w, self.render_h, FORMAT_D32_SFLOAT, IMAGE_USAGE_DEPTH_ATTACHMENT | IMAGE_USAGE_SAMPLED
         )
+        self.hiz_mip_levels = compute_hiz_mip_levels(self.render_w, self.render_h)
+        self.hiz_img = self.vk.create_image_2d(
+            self.render_w,
+            self.render_h,
+            FORMAT_R32_SFLOAT,
+            IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED,
+            mip_levels=self.hiz_mip_levels,
+        )
         self.vsm_img = self.vk.create_image_2d(
             VSM_PHYS_ATLAS_RES, VSM_PHYS_ATLAS_RES, FORMAT_D32_SFLOAT, IMAGE_USAGE_DEPTH_ATTACHMENT | IMAGE_USAGE_SAMPLED
         )
@@ -1311,6 +1348,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if (
             self.vis_img.image == 0
             or self.depth_img.image == 0
+            or self.hiz_img.image == 0
             or self.vsm_img.image == 0
             or self.brdf_lut_img.image == 0
             or self.ltc_lut_img.image == 0
@@ -1339,8 +1377,6 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
         var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
         self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
-        self.buf_vsm_table = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True)
-        self.buf_surfcache = self.vk.create_buffer((4096 + self.max_surfcache_tris * 4) * 4, local=True)
         self.buf_oit_nodes = self.vk.create_buffer(gpu_particles_total_oit_words(max_pix) * 4, local=True)
         self.buf_skinning = self.vk.create_buffer(AAA_SKIN_BUFFER_WORDS * 4, local=True)
         # Per-pixel post regions end below word 1024 + max_pix * 10; the UI prims of each frame in flight follow.
@@ -1352,6 +1388,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_occluded_candidates = self.vk.create_buffer(64 + self.max_draws * 4, local=True)
 
         # Ring-Buffered CPU-to-GPU Dynamic Buffers (Feature 14: FRAMES_IN_FLIGHT = 2)
+        var oit_stage_bytes = (AAA_MAX_OIT_PRIMS * 16 + AAA_MAX_PARTICLE_EMITTERS * AAA_EMITTER_WORDS + 64) * 4
         for _ in range(FRAMES_IN_FLIGHT):
             var b_glob = self.vk.create_buffer(16384, local=True)
             _ = external_call["memset", Int](b_glob.cpu_address, Int32(0), b_glob.size)
@@ -1361,12 +1398,21 @@ struct FlintAaaVulkanRenderer(Movable):
             var b_out_ind = self.vk.create_buffer(64 + 16384 * 20, local=True)
             var b_clust = self.vk.create_buffer(AAA_CLUSTER_BUFFER_WORDS * 4, local=True)
             _ = external_call["memset", Int](b_clust.cpu_address, Int32(0), b_clust.size)
+            var b_sc = self.vk.create_buffer((4096 + self.max_surfcache_tris * 4) * 4, local=True)
+            _ = external_call["memset", Int](b_sc.cpu_address, Int32(0), b_sc.size)
+            var b_vsm = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True)
+            _ = external_call["memset", Int](b_vsm.cpu_address, Int32(0), b_vsm.size)
+            var b_oit_st = self.vk.create_buffer(oit_stage_bytes, local=False)
+            _ = external_call["memset", Int](b_oit_st.cpu_address, Int32(0), b_oit_st.size)
             self.ring_globals.append(b_glob^)
             self.ring_instances.append(b_inst^)
             self.ring_indirect.append(b_ind^)
             self.ring_alphamask_indirect.append(b_am_ind^)
             self.ring_outline_indirect.append(b_out_ind^)
             self.ring_clusters.append(b_clust^)
+            self.ring_surfcache.append(b_sc^)
+            self.ring_vsm_table.append(b_vsm^)
+            self.ring_oit_staging.append(b_oit_st^)
             if self.vk.has_ray_query:
                 var b_as = self.vk.create_buffer_bda(self.max_instances * 64, extra_usage=bda_flags, host_visible=True)
                 var tlas = VulkanAccelStruct()
@@ -1375,6 +1421,9 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.ring_as_instances.append(b_as^)
                 self.ring_tlas.append(tlas^)
             self.frame_fences.append(0)
+            self.slot_prof_pairs.append(List[Tuple[String, Int]]())
+            self.slot_frame_q.append(-1)
+            self.slot_has_pending_queries.append(False)
 
         self.buf_globals = self.ring_globals[0].copy()
         self.buf_instances = self.ring_instances[0].copy()
@@ -1382,13 +1431,13 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_alphamask_indirect = self.ring_alphamask_indirect[0].copy()
         self.buf_outline_indirect = self.ring_outline_indirect[0].copy()
         self.buf_clusters = self.ring_clusters[0].copy()
+        self.buf_surfcache = self.ring_surfcache[0].copy()
+        self.buf_vsm_table = self.ring_vsm_table[0].copy()
         if self.vk.has_ray_query and len(self.ring_as_instances) > 0:
             self.buf_as_instances = self.ring_as_instances[0].copy()
             self.frame_tlas = self.ring_tlas[0].copy()
 
         _ = external_call["memset", Int](self.buf_history.cpu_address, Int32(0), self.buf_history.size)
-        _ = external_call["memset", Int](self.buf_vsm_table.cpu_address, Int32(0), self.buf_vsm_table.size)
-        _ = external_call["memset", Int](self.buf_surfcache.cpu_address, Int32(0), self.buf_surfcache.size)
         _ = external_call["memset", Int](self.buf_oit_nodes.cpu_address, Int32(0), self.buf_oit_nodes.size)
         _ = external_call["memset", Int](self.buf_skinning.cpu_address, Int32(0), self.buf_skinning.size)
         _ = external_call["memset", Int](self.buf_post_scratch.cpu_address, Int32(0), self.buf_post_scratch.size)
@@ -1406,8 +1455,8 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds, BIND_AAA_GLOBALS, self.ring_globals[slot])
             self.vk.write_descriptor(ds, BIND_AAA_HDR_OUT, self.buf_hdr_out)
             self.vk.write_descriptor(ds, BIND_AAA_HISTORY, self.buf_history)
-            self.vk.write_descriptor(ds, BIND_AAA_VSM_TABLE, self.buf_vsm_table)
-            self.vk.write_descriptor(ds, BIND_AAA_SURFCACHE, self.buf_surfcache)
+            self.vk.write_descriptor(ds, BIND_AAA_VSM_TABLE, self.ring_vsm_table[slot])
+            self.vk.write_descriptor(ds, BIND_AAA_SURFCACHE, self.ring_surfcache[slot])
             self.vk.write_descriptor(ds, BIND_AAA_OIT_NODES, self.buf_oit_nodes)
             self.vk.write_descriptor(ds, BIND_AAA_CLUSTERS, self.ring_clusters[slot])
             self.vk.write_descriptor(ds, BIND_AAA_SKINNING, self.buf_skinning)
@@ -1420,7 +1469,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_aaa_texture(ds, BIND_AAA_BRDF_LUT, 0, self.samp_linear_clamp, self.brdf_lut_img.view)
             self.vk.write_aaa_texture(ds, BIND_AAA_LTC_LUT, 0, self.samp_linear_clamp, self.ltc_lut_img.view)
 
-            # Phase 1 Cull Descriptor Set
+            # Phase 1 Cull Descriptor Set: BIND_AAA_DEPTH_TEX -> multi-mip R32_SFLOAT Hi-Z pyramid (`hiz_img`)!
             var ds_p1 = self.desc_sets_cull_p1[slot]
             self.vk.write_descriptor(ds_p1, BIND_AAA_VERTICES, self.buf_vertices)
             self.vk.write_descriptor(ds_p1, BIND_AAA_INDICES, self.buf_indices)
@@ -1430,9 +1479,9 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds_p1, BIND_AAA_INDIRECT, self.ring_indirect[slot])
             self.vk.write_descriptor(ds_p1, BIND_AAA_GLOBALS, self.ring_globals[slot])
             self.vk.write_descriptor(ds_p1, BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
-            self.vk.write_aaa_texture(ds_p1, BIND_AAA_DEPTH_TEX, 0, self.samp_linear_clamp, self.depth_img.view)
+            self.vk.write_aaa_texture(ds_p1, BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
 
-            # Phase 2 Cull Descriptor Set: BIND_AAA_INDIRECT -> buf_indirect_phase2, BIND_AAA_CANDIDATES -> buf_occluded_candidates
+            # Phase 2 Cull Descriptor Set: BIND_AAA_INDIRECT -> buf_indirect_phase2, BIND_AAA_DEPTH_TEX -> multi-mip Hi-Z pyramid!
             var ds_p2 = self.desc_sets_cull_p2[slot]
             self.vk.write_descriptor(ds_p2, BIND_AAA_VERTICES, self.buf_vertices)
             self.vk.write_descriptor(ds_p2, BIND_AAA_INDICES, self.buf_indices)
@@ -1442,7 +1491,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds_p2, BIND_AAA_INDIRECT, self.buf_indirect_phase2)
             self.vk.write_descriptor(ds_p2, BIND_AAA_GLOBALS, self.ring_globals[slot])
             self.vk.write_descriptor(ds_p2, BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
-            self.vk.write_aaa_texture(ds_p2, BIND_AAA_DEPTH_TEX, 0, self.samp_linear_clamp, self.depth_img.view)
+            self.vk.write_aaa_texture(ds_p2, BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_ENV_CUBE, 0, self.samp_linear_clamp, self.env_cube_img.view)
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_BRDF_LUT, 0, self.samp_linear_clamp, self.brdf_lut_img.view)
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_LTC_LUT, 0, self.samp_linear_clamp, self.ltc_lut_img.view)
@@ -1473,6 +1522,15 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.end_rendering(0)
         self.vk.transition_image(0, self.vis_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
         self.vk.transition_image(0, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
+        self.vk.transition_image(0, self.hiz_img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
+        var hz_w = self.render_w
+        var hz_h = self.render_h
+        for m in range(self.hiz_mip_levels):
+            self.vk.upload_image_mip(0, self.hiz_img, self.buf_post_scratch, AAA_POST_BLOOM_BASE * 4, m, hz_w, hz_h)
+            hz_w = max(1, hz_w >> 1)
+            hz_h = max(1, hz_h >> 1)
+        self.vk.transition_image(0, self.hiz_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
+        self.hiz_valid = False
 
         self.vk.transition_image(0, self.vsm_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_TOP, 0, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE)
         self.vk.begin_rendering(0, 0, 0, VSM_PHYS_ATLAS_RES, VSM_PHYS_ATLAS_RES, False, 0, False, 0, 0, True, self.vsm_img.view, True, 1.0)
@@ -1542,12 +1600,186 @@ struct FlintAaaVulkanRenderer(Movable):
                         self.samp_aniso16,
                         fallback_view,
                     )
-            for s_idx in range(len(self.bindless_images), AAA_MAX_BINDLESS):
+            var prefill_end = min(256, AAA_MAX_BINDLESS)
+            for s_idx in range(len(self.bindless_images), prefill_end):
                 for ds_i in range(len(self.desc_sets)):
                     self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, s_idx, self.samp_aniso16, fallback_view)
 
         self._build_default_render_graph()
         return True
+
+    def resize(mut self, width: Int, height: Int) -> Bool:
+        """Recreates all resolution-dependent render targets, Hi-Z pyramid, and storage buffers cleanly."""
+        if not self.active or self.vk.device == 0:
+            return False
+        var new_out_w = max(16, width)
+        var new_out_h = max(16, height)
+        var new_ren_w = max(8, Int(Float32(new_out_w) * self.tsr_scale + Float32(0.5)))
+        var new_ren_h = max(8, Int(Float32(new_out_h) * self.tsr_scale + Float32(0.5)))
+        if (
+            new_out_w == self.output_w
+            and new_out_h == self.output_h
+            and new_ren_w == self.render_w
+            and new_ren_h == self.render_h
+        ):
+            self.swapchain_out_of_date = False
+            return True
+
+        self.vk.wait_idle()
+        for i in range(len(self.frame_fences)):
+            self.frame_fences[i] = 0
+        for i in range(len(self.slot_has_pending_queries)):
+            self.slot_has_pending_queries[i] = False
+            self.slot_prof_pairs[i].clear()
+            self.slot_frame_q[i] = -1
+        self.pending_slot = -1
+        self.pending_prof_pairs.clear()
+        self.pending_frame_q = -1
+        self.readback_ready_slot = 0
+
+        self.vk.destroy_image(self.vis_img)
+        self.vk.destroy_image(self.depth_img)
+        self.vk.destroy_image(self.hiz_img)
+        self.vk.destroy_buffer(self.buf_hdr_out)
+        self.vk.destroy_buffer(self.buf_history)
+        self.vk.destroy_buffer(self.buf_oit_nodes)
+        self.vk.destroy_buffer(self.buf_post_scratch)
+        self.vk.destroy_buffer(self.buf_ldr_readback)
+        for i in range(len(self.readback_extra)):
+            self.vk.destroy_buffer(self.readback_extra[i])
+        self.readback_extra.clear()
+
+        self.output_w = new_out_w
+        self.output_h = new_out_h
+        self.render_w = new_ren_w
+        self.render_h = new_ren_h
+        var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
+
+        self.vis_img = self.vk.create_image_2d(
+            self.render_w, self.render_h, FORMAT_R32G32_UINT, IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_SAMPLED
+        )
+        self.depth_img = self.vk.create_image_2d(
+            self.render_w, self.render_h, FORMAT_D32_SFLOAT, IMAGE_USAGE_DEPTH_ATTACHMENT | IMAGE_USAGE_SAMPLED
+        )
+        self.hiz_mip_levels = compute_hiz_mip_levels(self.render_w, self.render_h)
+        self.hiz_img = self.vk.create_image_2d(
+            self.render_w,
+            self.render_h,
+            FORMAT_R32_SFLOAT,
+            IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED,
+            mip_levels=self.hiz_mip_levels,
+        )
+        if self.vis_img.image == 0 or self.depth_img.image == 0 or self.hiz_img.image == 0:
+            return False
+
+        self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
+        var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
+        self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
+        self.buf_oit_nodes = self.vk.create_buffer(gpu_particles_total_oit_words(max_pix) * 4, local=True)
+        var scratch_words = AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + FRAMES_IN_FLIGHT * AAA_UI_PRIM_REGION_WORDS
+        self.buf_post_scratch = self.vk.create_buffer(scratch_words * 4, local=True)
+        self.buf_ldr_readback = self.vk.create_buffer(64 + self.output_w * self.output_h * 4, local=False, cpu_reads=True)
+
+        _ = external_call["memset", Int](self.buf_history.cpu_address, Int32(0), self.buf_history.size)
+        _ = external_call["memset", Int](self.buf_oit_nodes.cpu_address, Int32(0), self.buf_oit_nodes.size)
+        _ = external_call["memset", Int](self.buf_post_scratch.cpu_address, Int32(0), self.buf_post_scratch.size)
+        _ = external_call["memset", Int](self.buf_ldr_readback.cpu_address, Int32(0), self.buf_ldr_readback.size)
+
+        for slot in range(FRAMES_IN_FLIGHT):
+            var ds = self.desc_sets[slot]
+            self.vk.write_descriptor(ds, BIND_AAA_HDR_OUT, self.buf_hdr_out)
+            self.vk.write_descriptor(ds, BIND_AAA_HISTORY, self.buf_history)
+            self.vk.write_descriptor(ds, BIND_AAA_OIT_NODES, self.buf_oit_nodes)
+            self.vk.write_descriptor(ds, BIND_AAA_POST_SCRATCH, self.buf_post_scratch)
+            self.vk.write_aaa_texture(ds, BIND_AAA_VIS_TEX, 0, self.samp_nearest, self.vis_img.view)
+            self.vk.write_aaa_texture(ds, BIND_AAA_DEPTH_TEX, 0, self.samp_linear_clamp, self.depth_img.view)
+            self.vk.write_aaa_texture(self.desc_sets_cull_p1[slot], BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
+            self.vk.write_aaa_texture(self.desc_sets_cull_p2[slot], BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
+
+        if not self.vk.begin_commands(0):
+            return False
+        self.vk.transition_image(0, self.vis_img, LAYOUT_COLOR_ATTACHMENT, PIPELINE_TOP, 0, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE)
+        self.vk.transition_image(0, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_TOP, 0, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE)
+        self.vk.begin_rendering(0, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, True, 0, 0, True, self.depth_img.view, True, 0.0)
+        self.vk.end_rendering(0)
+        self.vk.transition_image(0, self.vis_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
+        self.vk.transition_image(0, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
+        self.vk.transition_image(0, self.hiz_img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
+        var hz_w = self.render_w
+        var hz_h = self.render_h
+        for m in range(self.hiz_mip_levels):
+            self.vk.upload_image_mip(0, self.hiz_img, self.buf_post_scratch, AAA_POST_BLOOM_BASE * 4, m, hz_w, hz_h)
+            hz_w = max(1, hz_w >> 1)
+            hz_h = max(1, hz_h >> 1)
+        self.vk.transition_image(0, self.hiz_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
+        var rf = self.vk.submit(0)
+        if rf == 0 or not self.vk.wait(rf):
+            return False
+
+        self.has_prev_vp = False
+        self.spec_reblur_valid_frames = 0
+        self.froxel_valid_frames = 0
+        self.hiz_valid = False
+        self.swapchain_out_of_date = False
+        return True
+
+    def _record_hiz_downsample(mut self, cur_slot: Int):
+        """Builds the multi-mip conservative Reverse-Z min-reduction Hi-Z pyramid (`hiz_img`) from `depth_img`
+        (which must already be in `LAYOUT_SHADER_READ_ONLY`), using `buf_post_scratch[AAA_POST_BLOOM_BASE..]`."""
+        if self.pipe_hiz_downsample == 0 or self.hiz_img.image == 0 or self.hiz_mip_levels <= 0:
+            return
+        var mip_offsets = List[Int](capacity=self.hiz_mip_levels)
+        var mip_ws = List[Int](capacity=self.hiz_mip_levels)
+        var mip_hs = List[Int](capacity=self.hiz_mip_levels)
+        var cur_off = AAA_POST_BLOOM_BASE
+        var mw = self.render_w
+        var mh = self.render_h
+        for m in range(self.hiz_mip_levels):
+            mip_offsets.append(cur_off)
+            mip_ws.append(mw)
+            mip_hs.append(mh)
+            var prev_w = mw if m == 0 else mip_ws[m - 1]
+            var prev_h = mh if m == 0 else mip_hs[m - 1]
+            var prev_off = cur_off if m == 0 else mip_offsets[m - 1]
+            var push_hz = List[UInt32](length=16, fill=0)
+            push_hz[0] = UInt32(mw)
+            push_hz[1] = UInt32(mh)
+            push_hz[2] = UInt32(prev_w)
+            push_hz[3] = UInt32(prev_h)
+            push_hz[4] = UInt32(prev_off)
+            push_hz[5] = UInt32(cur_off)
+            push_hz[6] = UInt32(m)
+            self.vk.dispatch_aaa(
+                cur_slot,
+                self.pipe_hiz_downsample,
+                self.pipe_layout,
+                self.desc_set,
+                push_hz,
+                (mw + 7) // 8,
+                (mh + 7) // 8,
+            )
+            if m + 1 < self.hiz_mip_levels:
+                self.vk.memory_barrier2(
+                    cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ)
+                )
+            cur_off += mw * mh
+            mw = max(1, mw >> 1)
+            mh = max(1, mh >> 1)
+
+        self.vk.memory_barrier2(
+            cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_READ)
+        )
+        self.vk.transition_image(
+            cur_slot, self.hiz_img, LAYOUT_TRANSFER_TARGET, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE
+        )
+        for m in range(self.hiz_mip_levels):
+            self.vk.upload_image_mip(
+                cur_slot, self.hiz_img, self.buf_post_scratch, mip_offsets[m] * 4, m, mip_ws[m], mip_hs[m]
+            )
+        self.vk.transition_image(
+            cur_slot, self.hiz_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+        )
+        self.hiz_valid = True
 
     # ========================================================================
     # Asset Registration: Bindless BC7 / BC5 / BC6H Textures, Meshes & BLAS
@@ -2991,6 +3223,13 @@ struct FlintAaaVulkanRenderer(Movable):
         if cur_slot < len(self.frame_fences) and self.frame_fences[cur_slot] != 0:
             _ = self.vk.wait(self.frame_fences[cur_slot])
             self.frame_fences[cur_slot] = 0
+        if cur_slot < len(self.slot_has_pending_queries) and self.slot_has_pending_queries[cur_slot]:
+            self.slot_has_pending_queries[cur_slot] = False
+            var q_pairs = self.slot_prof_pairs[cur_slot].copy()
+            var q_frame = self.slot_frame_q[cur_slot]
+            self.slot_prof_pairs[cur_slot].clear()
+            self.slot_frame_q[cur_slot] = -1
+            self._read_gpu_timings(q_pairs, q_frame)
 
         self.buf_globals = self.ring_globals[cur_slot].copy()
         self.buf_instances = self.ring_instances[cur_slot].copy()
@@ -2998,6 +3237,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_alphamask_indirect = self.ring_alphamask_indirect[cur_slot].copy()
         self.buf_outline_indirect = self.ring_outline_indirect[cur_slot].copy()
         self.buf_clusters = self.ring_clusters[cur_slot].copy()
+        self.buf_surfcache = self.ring_surfcache[cur_slot].copy()
+        self.buf_vsm_table = self.ring_vsm_table[cur_slot].copy()
         self.desc_set = self.desc_sets[cur_slot]
         if self.vk.has_ray_query and len(self.ring_as_instances) > cur_slot:
             self.buf_as_instances = self.ring_as_instances[cur_slot].copy()
@@ -3120,6 +3361,8 @@ struct FlintAaaVulkanRenderer(Movable):
                 if cmd_cnt >= 16384:
                     break
                 var ml_id = first_ml + m_loc
+                if i_idx > Int(AAA_MAX_PACKED_INSTANCES) or ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
+                    continue
                 ref ml = self.geom.meshlets[ml_id]
                 var dst = base_ptr + 16 + cmd_cnt * 20
                 put32(dst + 0, UInt32(ml.tri_count * 3))
@@ -3186,6 +3429,8 @@ struct FlintAaaVulkanRenderer(Movable):
                 if cmd_cnt >= 16384:
                     break
                 var ml_id = first_ml + m_loc
+                if i_idx > Int(AAA_MAX_PACKED_INSTANCES) or ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
+                    continue
                 ref ml = self.geom.meshlets[ml_id]
                 var dst = base_ptr + 16 + cmd_cnt * 20
                 put32(dst + 0, UInt32(ml.tri_count * 3))
@@ -3339,6 +3584,8 @@ struct FlintAaaVulkanRenderer(Movable):
                         continue
                     for m_loc in range(ml_cnt):
                         var ml_id = first_ml + m_loc
+                        if i_idx > Int(AAA_MAX_PACKED_INSTANCES) or ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
+                            continue
                         var v_cnt_u = UInt32(self.geom.meshlets[ml_id].tri_count * 3)
                         var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
                         for hp in hit_pages:
@@ -3361,6 +3608,8 @@ struct FlintAaaVulkanRenderer(Movable):
                         continue
                     for m_loc in range(ml_cnt):
                         var ml_id = first_ml + m_loc
+                        if i_idx > Int(AAA_MAX_PACKED_INSTANCES) or ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
+                            continue
                         ref ml = self.geom.meshlets[ml_id]
                         var mc = ml.center
                         var mwx = wm[0] * mc.x + wm[4] * mc.y + wm[8] * mc.z + wm[12]
@@ -3448,6 +3697,16 @@ struct FlintAaaVulkanRenderer(Movable):
         _ = self.streamer.tick_streaming_budget()
 
         var cur_slot = self.frame_index % FRAMES_IN_FLIGHT
+        if cur_slot < len(self.frame_fences) and self.frame_fences[cur_slot] != 0:
+            _ = self.vk.wait(self.frame_fences[cur_slot])
+            self.frame_fences[cur_slot] = 0
+        if cur_slot < len(self.slot_has_pending_queries) and self.slot_has_pending_queries[cur_slot]:
+            self.slot_has_pending_queries[cur_slot] = False
+            var q_pairs = self.slot_prof_pairs[cur_slot].copy()
+            var q_frame = self.slot_frame_q[cur_slot]
+            self.slot_prof_pairs[cur_slot].clear()
+            self.slot_frame_q[cur_slot] = -1
+            self._read_gpu_timings(q_pairs, q_frame)
         var defer_this = self.deferred_readback and (not capture_readback) and self.vk.swapchain == 0
         if defer_this and cur_slot > 0 and len(self.readback_extra) < cur_slot:
             while len(self.readback_extra) < FRAMES_IN_FLIGHT - 1:
@@ -3465,6 +3724,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_alphamask_indirect = self.ring_alphamask_indirect[cur_slot].copy()
         self.buf_outline_indirect = self.ring_outline_indirect[cur_slot].copy()
         self.buf_clusters = self.ring_clusters[cur_slot].copy()
+        self.buf_surfcache = self.ring_surfcache[cur_slot].copy()
+        self.buf_vsm_table = self.ring_vsm_table[cur_slot].copy()
         self.desc_set = self.desc_sets[cur_slot]
         if self.vk.has_ray_query and len(self.ring_as_instances) > cur_slot:
             self.buf_as_instances = self.ring_as_instances[cur_slot].copy()
@@ -3545,12 +3806,17 @@ struct FlintAaaVulkanRenderer(Movable):
                     glass=is_glass_inst,
                 )
 
-        # Upload 6-Way OIT Volumetric Plumes
+        # Stage 6-Way OIT Volumetric Plumes into per-frame staging buffer (copied on GPU timeline to avoid CPU-GPU race!)
+        var oit_plume_copy_bytes = 0
         if len(self.frame_plumes) > 0:
             var oit_w = List[UInt32]()
             for pl in self.frame_plumes:
                 pl.append_words(oit_w)
-            _ = external_call["memcpy", Int](self.buf_oit_nodes.cpu_address, Int(oit_w.unsafe_ptr()), len(oit_w) * 4)
+            oit_plume_copy_bytes = min(len(oit_w) * 4, AAA_MAX_OIT_PRIMS * 16 * 4)
+            if oit_plume_copy_bytes > 0:
+                _ = external_call["memcpy", Int](
+                    self.ring_oit_staging[cur_slot].cpu_address, Int(oit_w.unsafe_ptr()), oit_plume_copy_bytes
+                )
             _ = len(oit_w)
 
         # 2. Upload Camera + Light + VSM + SH9 Globals SSBO
@@ -3865,7 +4131,6 @@ struct FlintAaaVulkanRenderer(Movable):
         var vsm_page_am_offsets = List[Int]()
         var vsm_page_am_counts = List[Int]()
         if vsm_active:
-            var origin_shifted = False
             if use_vsm_casc_frame:
                 var next_origins = compute_vsm_cascade_page_origins(self.sun_dir, self.cam_pos, base_vsm_ext)
                 if len(self.vsm_cascade_page_origins) >= VSM_CASCADE_COUNT:
@@ -3875,22 +4140,38 @@ struct FlintAaaVulkanRenderer(Movable):
                             or next_origins[c_i][1] != self.vsm_cascade_page_origins[c_i][1]
                         ):
                             self.vsm.invalidate_cascade(c_i)
-                            origin_shifted = True
                 self.vsm_cascade_page_origins = next_origins^
 
+            # Ring-buffered 1-frame-latency async readback of `ring_vsm_table`:
+            # Read from the most recently completed slot (`prev_slot` if its fence already retired, else `cur_slot`
+            # which was just waited in `begin_frame`). Never stall mid-frame on camera boundary crossings (`origin_shifted`)!
+            var prev_slot = (cur_slot + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT
+            var vsm_read_slot = cur_slot
+            if self.frame_index > 0 and prev_slot < len(self.frame_fences) and self.frame_fences[prev_slot] == 0:
+                vsm_read_slot = prev_slot
+
             var tbl = List[UInt32](length=VSM_TABLE_WORDS, fill=0)
-            _ = external_call["memcpy", Int](Int(tbl.unsafe_ptr()), self.buf_vsm_table.cpu_address, VSM_TABLE_WORDS * 4)
+            _ = external_call["memcpy", Int](
+                Int(tbl.unsafe_ptr()), self.ring_vsm_table[vsm_read_slot].cpu_address, VSM_TABLE_WORDS * 4
+            )
             var has_gpu_reqs = False
             for r_i in range(16384, VSM_TABLE_WORDS):
                 if tbl[r_i] != 0:
                     has_gpu_reqs = True
                     break
-            single_cmd_buf = has_gpu_reqs and not cam_teleported and not origin_shifted
+            # Only do a one-time Frame-0 synchronous warmup when capturing an immediate single-frame readback
+            # before any GPU VSM requests exist; steady-state & VSM camera boundary crossings ALWAYS stay single_cmd_buf!
+            var need_sync_vsm_warmup = capture_readback and not self.vsm_warmed_up and not has_gpu_reqs
+            single_cmd_buf = not need_sync_vsm_warmup
             if single_cmd_buf:
                 var t_vsm_req0 = get_time()
                 var pages = self.vsm.process_requests(tbl)
                 var t_vsm_req1 = get_time()
-                _ = external_call["memcpy", Int](self.buf_vsm_table.cpu_address, Int(tbl.unsafe_ptr()), VSM_TABLE_WORDS * 4)
+                _ = external_call["memcpy", Int](
+                    self.ring_vsm_table[cur_slot].cpu_address, Int(tbl.unsafe_ptr()), VSM_TABLE_WORDS * 4
+                )
+                if has_gpu_reqs:
+                    self.vsm_warmed_up = True
                 self.last_cpu_vsm_requests_ms = (t_vsm_req1 - t_vsm_req0) * 1000.0
                 self.last_cpu_vsm_table_ms = (get_time() - t_vsm0) * 1000.0 - self.last_cpu_vsm_requests_ms
                 for pg in pages:
@@ -3956,11 +4237,12 @@ struct FlintAaaVulkanRenderer(Movable):
             push_cull[0] = UInt32(n_inst)
             push_cull[1] = UInt32(self.max_draws)
             push_cull[2] = UInt32(1) if self.enable_cone_cull else UInt32(0)
-            push_cull[3] = UInt32(1) if (self.enable_hiz_cull and self.frame_index > 0 and not cam_teleported) else UInt32(0)
+            push_cull[3] = UInt32(1) if (self.enable_hiz_cull and self.hiz_valid and self.frame_index > 0 and not cam_teleported) else UInt32(0)
             push_cull[4] = UInt32(self.render_w)
             push_cull[5] = UInt32(self.render_h)
             push_cull[6] = bitcast[DType.uint32](self.max_lod_error_px)
             push_cull[7] = 0  # Phase 1: cull_phase = 0
+            push_cull[8] = UInt32(self.hiz_mip_levels)
             self.vk.dispatch_aaa(
                 cur_slot,
                 self.pipe_meshlet_cull,
@@ -4012,15 +4294,13 @@ struct FlintAaaVulkanRenderer(Movable):
             )
         self.vk.end_rendering(cur_slot)
 
-        # Phase 2: Test occluded candidates against fresh current-frame depth and draw disocclusions
-        if n_inst > 0 and self.enable_hiz_cull and self.frame_index > 0:
-            # Construct / downsample current frame Hi-Z depth pyramid with barrier
+        # Phase 2: Test occluded candidates against fresh current-frame multi-mip Hi-Z pyramid and draw disocclusions
+        if n_inst > 0 and self.enable_hiz_cull and self.hiz_valid and self.frame_index > 0 and not cam_teleported:
+            # Construct / downsample current frame Hi-Z depth pyramid (`D32_SFLOAT` -> multi-mip `R32_SFLOAT` min-reduction)
             self.vk.transition_image(
                 cur_slot, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
             )
-            self.vk.memory_barrier2(
-                cur_slot, PIPELINE_LATE_FRAGMENT_TESTS, Int(ACCESS_DEPTH_ATTACHMENT_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ)
-            )
+            self._record_hiz_downsample(cur_slot)
 
             # Phase 2 cull over candidates in self.buf_occluded_candidates
             var push_cull_p2 = List[UInt32](length=16, fill=0)
@@ -4032,6 +4312,7 @@ struct FlintAaaVulkanRenderer(Movable):
             push_cull_p2[5] = UInt32(self.render_h)
             push_cull_p2[6] = bitcast[DType.uint32](self.max_lod_error_px)
             push_cull_p2[7] = 1  # Phase 2: cull_phase = 1
+            push_cull_p2[8] = UInt32(self.hiz_mip_levels)
             self.vk.dispatch_aaa(
                 cur_slot,
                 self.pipe_meshlet_cull,
@@ -4046,8 +4327,13 @@ struct FlintAaaVulkanRenderer(Movable):
             )
 
             # Phase 2 Disocclusion Draw (LOAD existing VisBuffer & Depth, append newly visible meshlets)
-            self.vk.transition_image(
-                cur_slot, self.vis_img, LAYOUT_COLOR_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE
+            # Note: `vis_img` stayed in `LAYOUT_COLOR_ATTACHMENT` since Phase 1; emit a color-attachment barrier (no duplicate transition).
+            self.vk.memory_barrier2(
+                cur_slot,
+                PIPELINE_COLOR_ATTACHMENT_OUTPUT,
+                Int(ACCESS_COLOR_ATTACHMENT_WRITE),
+                PIPELINE_COLOR_ATTACHMENT_OUTPUT,
+                Int(ACCESS_COLOR_ATTACHMENT_WRITE),
             )
             self.vk.transition_image(
                 cur_slot, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE
@@ -4137,6 +4423,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.transition_image(
             cur_slot, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
         )
+        # Refresh multi-mip Hi-Z pyramid from the final frame depth for next frame's Phase 1 occlusion cull
+        if n_inst > 0 and self.enable_hiz_cull:
+            self._record_hiz_downsample(cur_slot)
         if use_prof:
             self.vk.write_timestamp(cur_slot, q_vb + 1, PIPELINE_BOTTOM)
 
@@ -4713,6 +5002,13 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Per-Pixel 4-Node Exact `OIT` + 6-Way Lightmapped Volumetric Plumes + Fresnel Rim Holograms!
         if len(self.frame_plumes) > 0 or not (run_water or run_rain):
+            if oit_plume_copy_bytes > 0:
+                self.vk.copy_buffer(
+                    cur_slot, self.ring_oit_staging[cur_slot], 0, self.buf_oit_nodes, 0, oit_plume_copy_bytes
+                )
+                self.vk.memory_barrier2(
+                    cur_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ)
+                )
             var q_oit = next_q
             if use_prof and q_oit + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_oit, PIPELINE_TOP)
@@ -4756,9 +5052,21 @@ struct FlintAaaVulkanRenderer(Movable):
                     var sc_e = max(0, min(4095, self.frame_particle_emitters[e_i].spawn_count))
                     self.frame_particle_emitters[e_i].append_words(em_words, self.particle_ring_cursor)
                     self.particle_ring_cursor = (self.particle_ring_cursor + sc_e) & 0xFFFF
-                _ = external_call[
-                    "memcpy", Int
-                ](self.buf_oit_nodes.cpu_address + em_off * 4, Int(em_words.unsafe_ptr()), len(em_words) * 4)
+                var em_stage_off = AAA_MAX_OIT_PRIMS * 16 * 4
+                var em_bytes = len(em_words) * 4
+                _ = external_call["memcpy", Int](
+                    self.ring_oit_staging[cur_slot].cpu_address + em_stage_off, Int(em_words.unsafe_ptr()), em_bytes
+                )
+                self.vk.copy_buffer(
+                    cur_slot, self.ring_oit_staging[cur_slot], em_stage_off, self.buf_oit_nodes, em_off * 4, em_bytes
+                )
+                self.vk.memory_barrier2(
+                    cur_slot,
+                    PIPELINE_TRANSFER,
+                    Int(ACCESS_TRANSFER_WRITE),
+                    PIPELINE_COMPUTE,
+                    Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE),
+                )
                 _ = len(em_words)
 
             var tiles_x = (self.render_w + 15) // 16
@@ -5235,7 +5543,9 @@ struct FlintAaaVulkanRenderer(Movable):
 
         var t_submit0 = get_time()
         self.last_cpu_record_ms = (t_submit0 - t_record0) * 1000.0
+        var async_swapchain_submit = False
         if self.vk.swapchain != 0:
+            var skipped_before = self.vk.skipped
             var img_idx = self.vk.acquire_image(cur_slot)
             if img_idx != NO_IMAGE:
                 var copy_w = min(self.output_w, self.vk.swapchain_width)
@@ -5264,15 +5574,28 @@ struct FlintAaaVulkanRenderer(Movable):
                         )
                 var f = self.vk.submit_and_present(cur_slot, img_idx)
                 self.frame_fences[cur_slot] = f
+                if self.vk.skipped > skipped_before:
+                    # `vkQueuePresentKHR` returned `VK_ERROR_OUT_OF_DATE_KHR`: flag swapchain recreation.
+                    self.swapchain_out_of_date = True
                 if do_readback and f != 0:
                     _ = self.vk.wait(f)
                     self.frame_fences[cur_slot] = 0
+                elif f != 0:
+                    async_swapchain_submit = True
             else:
+                # `NO_IMAGE` / `VK_ERROR_OUT_OF_DATE_KHR`: finish command buffer, flag swapchain resize, and sync targets!
                 var f = self.vk.submit(cur_slot)
                 self.frame_fences[cur_slot] = f
-                if do_readback and f != 0:
+                if f != 0:
                     _ = self.vk.wait(f)
                     self.frame_fences[cur_slot] = 0
+                self.swapchain_out_of_date = True
+                if (
+                    self.vk.swapchain_width > 0
+                    and self.vk.swapchain_height > 0
+                    and (self.vk.swapchain_width != self.output_w or self.vk.swapchain_height != self.output_h)
+                ):
+                    _ = self.resize(self.vk.swapchain_width, self.vk.swapchain_height)
         else:
             var f = self.vk.submit(cur_slot)
             self.frame_fences[cur_slot] = f
@@ -5287,7 +5610,14 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.frame_fences[cur_slot] = 0
         self.last_cpu_submit_wait_ms = (get_time() - t_submit0) * 1000.0
 
-        if self.pending_slot < 0:
+        if async_swapchain_submit:
+            # Defer `VkQueryPool` timestamp readback by `FRAMES_IN_FLIGHT` frames until `vk.wait(frame_fences[cur_slot])`
+            # completes in `begin_frame()` — never read unwritten queries right after async swapchain submit!
+            if cur_slot < len(self.slot_has_pending_queries):
+                self.slot_prof_pairs[cur_slot] = prof_pairs^
+                self.slot_frame_q[cur_slot] = frame_q
+                self.slot_has_pending_queries[cur_slot] = True
+        elif self.pending_slot < 0:
             if single_cmd_buf and do_readback:
                 self.last_culled_meshlet_draws = Int(get32(self.buf_ldr_readback.cpu_address)) if n_inst > 0 else 0
                 self.readback_ready_slot = 0
@@ -5440,6 +5770,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.bindless_images.clear()
         self.vk.destroy_image(self.vis_img)
         self.vk.destroy_image(self.depth_img)
+        self.vk.destroy_image(self.hiz_img)
         self.vk.destroy_image(self.vsm_img)
         self.vk.destroy_image(self.brdf_lut_img)
         self.vk.destroy_image(self.ltc_lut_img)
@@ -5450,6 +5781,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_sampler(self.samp_nearest)
 
         self.vk.destroy_pipeline(self.pipe_meshlet_cull)
+        if self.pipe_hiz_downsample != 0:
+            self.vk.destroy_pipeline(self.pipe_hiz_downsample)
+            self.pipe_hiz_downsample = 0
         self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
         self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)
         if self.pipe_npr_outline_gfx != 0:
@@ -5538,6 +5872,27 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.vk.destroy_buffer(self.ring_clusters[i])
         self.ring_clusters.clear()
         self.buf_clusters = GpuBuffer()
+
+        for i in range(len(self.ring_surfcache)):
+            if self.ring_surfcache[i].size > 0:
+                self.vk.destroy_buffer(self.ring_surfcache[i])
+        self.ring_surfcache.clear()
+        self.buf_surfcache = GpuBuffer()
+
+        for i in range(len(self.ring_vsm_table)):
+            if self.ring_vsm_table[i].size > 0:
+                self.vk.destroy_buffer(self.ring_vsm_table[i])
+        self.ring_vsm_table.clear()
+        self.buf_vsm_table = GpuBuffer()
+
+        for i in range(len(self.ring_oit_staging)):
+            if self.ring_oit_staging[i].size > 0:
+                self.vk.destroy_buffer(self.ring_oit_staging[i])
+        self.ring_oit_staging.clear()
+
+        self.slot_prof_pairs.clear()
+        self.slot_frame_q.clear()
+        self.slot_has_pending_queries.clear()
 
         self.vk.destroy_buffer(self.buf_vertices)
         self.vk.destroy_buffer(self.buf_indices)

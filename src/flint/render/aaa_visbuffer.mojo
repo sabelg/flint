@@ -55,8 +55,12 @@ comptime BIND_AAA_LTC_LUT: Int = 20      # sampler2D  (VK_FORMAT_R16G16_SFLOAT H
 comptime AAA_SINGLE_SAMPLERS: Int = 6
 
 comptime BIND_AAA_BINDLESS_TEX: Int = 21 # sampler2D[AAA_MAX_BINDLESS] (BC7_UNORM, BC7_SRGB, BC5_UNORM, BC6H_UFLOAT)
-comptime AAA_MAX_BINDLESS: Int = 256
+comptime AAA_MAX_BINDLESS: Int = 4096
 comptime BIND_AAA_TLAS: Int = 22         # accelerationStructureKHR (Hardware BLAS/TLAS for SPV_KHR_ray_query)
+
+comptime AAA_MAX_PACKED_MESHLET_ID: UInt32 = 0x1FFFE  # 17-bit VisBuffer payload: 0 = sky, 1..0x1FFFF = ml_id + 1
+comptime AAA_MAX_PACKED_INSTANCES: UInt32 = 0x7FFF    # 15-bit VisBuffer payload: inst_id in 0..32767
+comptime AAA_HIZ_MAX_MIPS: Int = 8                    # Multi-mip Reverse-Z min-reduction Hi-Z pyramid (mips 0..7)
 
 comptime AAA_PUSH_WORDS: Int = 16
 comptime AAA_PUSH_BYTES: Int = 64
@@ -263,6 +267,13 @@ def meshlet_cull_shader() -> List[UInt32]:
 
     var inst_idx = s.load_u(inst_idx_var)
     var ml_id = s.load_u(ml_id_var)
+    # Guard against silent 17-bit ml_id (0..0x1FFFE) and 15-bit inst_idx (0..0x7FFF) packing wraparound
+    s.return_if(
+        s.logical_or(
+            s.ult(s.uint(AAA_MAX_PACKED_MESHLET_ID), ml_id),
+            s.ult(s.uint(AAA_MAX_PACKED_INSTANCES), inst_idx),
+        )
+    )
 
     var inst_base = s.imul(inst_idx, s.uint(UInt32(AAA_INSTANCE_WORDS)))
     # Skip alpha-masked instances (`bit 17` of `w39`); they draw in the dedicated Two-Bucket alpha-cutout pass!
@@ -375,7 +386,13 @@ def meshlet_cull_shader() -> List[UInt32]:
     var uv_r_x = s.fdiv(wrad, s.nmax(s.float(0.001), s.fmul(vz, tan_x)))
     var uv_r_y = s.fdiv(wrad, s.nmax(s.float(0.001), s.fmul(vz, tan_y)))
     var footprint_px = s.fmul(s.nmax(s.fmul(uv_r_x, scr_w), s.fmul(uv_r_y, scr_h)), s.float(2.0))
-    var hiz_lod = s.nclamp(s.log2(s.nmax(footprint_px, s.float(1.0))), s.float(0.0), s.float(7.0))
+    var hiz_mips_u = s.push_word(8)
+    var max_hiz_lod = s.select_f(
+        s.ult(s.uint(1), hiz_mips_u),
+        s.nmin(s.float(Float32(AAA_HIZ_MAX_MIPS - 1)), s.float_from_uint(s.isub(hiz_mips_u, s.uint(1)))),
+        s.float(0.0),
+    )
+    var hiz_lod = s.nclamp(s.log2(s.nmax(footprint_px, s.float(1.0))), s.float(0.0), max_hiz_lod)
     var d0 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(u_c, v_c), hiz_lod), 0)
     var d1 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fsub(u_c, uv_r_x), s.fsub(v_c, uv_r_y)), hiz_lod), 0)
     var d2 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(s.fadd(u_c, uv_r_x), s.fsub(v_c, uv_r_y)), hiz_lod), 0)
@@ -691,3 +708,90 @@ def make_reverse_z_perspective(
     m[11] = Float32(1.0)     # w_clip = +z_view (left-handed forward +Z in view space!)
     m[14] = near_z           # z_clip = near_z -> z_ndc = near_z / z_view (1.0 at near_z, -> 0.0 at infinity!)
     return m^
+
+
+def compute_hiz_mip_levels(width: Int, height: Int) -> Int:
+    """Computes the number of Hi-Z pyramid mip levels (clamped to `1..AAA_HIZ_MAX_MIPS`)."""
+    var dim = width if width > height else height
+    var mips = 1
+    while dim > 1 and mips < AAA_HIZ_MAX_MIPS:
+        dim = dim >> 1
+        mips += 1
+    return mips
+
+
+def hiz_depth_downsample_shader() -> List[UInt32]:
+    """Compute Shader (`8x8x1`) building a conservative Reverse-Z min-reduction Hi-Z pyramid (`R32_SFLOAT`).
+    Uses the unified AAA descriptor set:
+      - `BIND_AAA_DEPTH_TEX` (`D32_SFLOAT` depth buffer) for `mip_level == 0`
+      - `BIND_AAA_POST_SCRATCH` (contiguous `R32_SFLOAT` mip chain starting at `dst_off`)
+    Push constants:
+      - `push[0]`: `dst_w`
+      - `push[1]`: `dst_h`
+      - `push[2]`: `src_w`
+      - `push[3]`: `src_h`
+      - `push[4]`: `src_word_offset` (unused when `mip_level == 0`)
+      - `push[5]`: `dst_word_offset`
+      - `push[6]`: `mip_level` (`0` = copy/sample depth -> mip 0; `> 0` = 2x2 conservative min-reduction)
+    """
+    var s = AaaSpirvModule(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
+    var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
+    var depth_samp = s.sampled_image_2d(BIND_AAA_DEPTH_TEX)
+
+    var px = s.invocation_axis(0)
+    var py = s.invocation_axis(1)
+    var dst_w = s.push_word(0)
+    var dst_h = s.push_word(1)
+    var src_w = s.push_word(2)
+    var src_h = s.push_word(3)
+    var src_off = s.push_word(4)
+    var dst_off = s.push_word(5)
+    var mip_level = s.push_word(6)
+
+    s.return_if(s.logical_or(s.uge(px, dst_w), s.uge(py, dst_h)))
+    var dst_idx = s.iadd(dst_off, s.iadd(s.imul(py, dst_w), px))
+
+    s.begin_if(s.ieq(mip_level, s.uint(0)))
+    var u = s.fdiv(s.fadd(s.float_from_uint(px), s.float(0.5)), s.float_from_uint(dst_w))
+    var v = s.fdiv(s.fadd(s.float_from_uint(py), s.float(0.5)), s.float_from_uint(dst_h))
+    var d0 = s.extract_f(s.sample_2d_lod(depth_samp, s.vec2(u, v), s.float(0.0)), 0)
+    s.store_float(b_post, dst_idx, d0)
+    s.begin_else()
+    var max_sx = s.isub(src_w, s.uint(1))
+    var max_sy = s.isub(src_h, s.uint(1))
+    var sx0 = s.imul(px, s.uint(2))
+    var sy0 = s.imul(py, s.uint(2))
+    var sx1 = s.umin(s.iadd(sx0, s.uint(1)), max_sx)
+    var sy1 = s.umin(s.iadd(sy0, s.uint(1)), max_sy)
+
+    var row0 = s.iadd(src_off, s.imul(sy0, src_w))
+    var row1 = s.iadd(src_off, s.imul(sy1, src_w))
+    var t00 = s.load_float(b_post, s.iadd(row0, sx0))
+    var t10 = s.load_float(b_post, s.iadd(row0, sx1))
+    var t01 = s.load_float(b_post, s.iadd(row1, sx0))
+    var t11 = s.load_float(b_post, s.iadd(row1, sx1))
+    var min_d = s.fvar(s.nmin(s.nmin(t00, t10), s.nmin(t01, t11)))
+
+    # Conservative odd-width / odd-height edge reduction for non-power-of-two resolutions
+    var odd_w = s.logical_and(s.ine(s.bit_and(src_w, s.uint(1)), s.uint(0)), s.ieq(px, s.isub(dst_w, s.uint(1))))
+    var odd_h = s.logical_and(s.ine(s.bit_and(src_h, s.uint(1)), s.uint(0)), s.ieq(py, s.isub(dst_h, s.uint(1))))
+    s.begin_if(odd_w)
+    var t20 = s.load_float(b_post, s.iadd(row0, max_sx))
+    var t21 = s.load_float(b_post, s.iadd(row1, max_sx))
+    s.store(min_d, s.nmin(s.load_f(min_d), s.nmin(t20, t21)))
+    s.end_if()
+    s.begin_if(odd_h)
+    var row2 = s.iadd(src_off, s.imul(max_sy, src_w))
+    var t02 = s.load_float(b_post, s.iadd(row2, sx0))
+    var t12 = s.load_float(b_post, s.iadd(row2, sx1))
+    s.store(min_d, s.nmin(s.load_f(min_d), s.nmin(t02, t12)))
+    s.begin_if(odd_w)
+    var t22 = s.load_float(b_post, s.iadd(row2, max_sx))
+    s.store(min_d, s.nmin(s.load_f(min_d), t22))
+    s.end_if()
+    s.end_if()
+
+    s.store_float(b_post, dst_idx, s.load_f(min_d))
+    s.end_if()
+
+    return s.finish()
