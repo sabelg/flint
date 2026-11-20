@@ -8,13 +8,17 @@ struct NativeImage(Copyable, Movable):
     var valid: Bool
     var width: Int
     var height: Int
+    var bit_depth: Int
     var pixels: List[UInt32]
+    var pixels_u16: List[UInt16]
 
     def __init__(out self):
         self.valid = False
         self.width = 0
         self.height = 0
+        self.bit_depth = 8
         self.pixels = List[UInt32]()
+        self.pixels_u16 = List[UInt16]()
 
 
 def be32(data: List[UInt8], offset: Int) -> Int:
@@ -315,7 +319,34 @@ def paeth(a: Int, b: Int, c: Int) -> Int:
     return b if db <= dc else c
 
 
+@always_inline
+def _png_unpack_subbyte(row_ptr: Pointer[UInt8, ImmutAnyOrigin], x: Int, bit_depth: Int) -> Int:
+    """Unpacks 1-, 2-, or 4-bit MSB-first PNG sample at pixel index `x`."""
+    if bit_depth == 8:
+        return Int(row_ptr[unsafe_offset=x])
+    var ppb = 8 // bit_depth
+    var byte_val = Int(row_ptr[unsafe_offset=x // ppb])
+    var shift = (ppb - 1 - (x % ppb)) * bit_depth
+    var mask = (1 << bit_depth) - 1
+    return (byte_val >> shift) & mask
+
+
+@always_inline
+def _png_scale_gray_to_u8(val: Int, bit_depth: Int) -> Int:
+    if bit_depth == 8:
+        return val
+    if bit_depth == 1:
+        return 255 if val != 0 else 0
+    if bit_depth == 2:
+        return val * 85
+    if bit_depth == 4:
+        return val * 17
+    return (val + 128) >> 8 if val < 65408 else 255
+
+
 def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
+    """Decodes PNG images supporting Grayscale (0), RGB (2), Indexed/Palette (3 + PLTE/tRNS),
+    Grayscale+Alpha (4), and RGBA (6) at 1/2/4/8/16-bit depths, with box-filter downscaling."""
     var image = NativeImage()
     if len(data) < 45:
         return image^
@@ -328,10 +359,37 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     var bit_depth = Int(data[24])
     var color_type = Int(data[25])
     var interlace = Int(data[28])
-    if width <= 0 or height <= 0 or width * height > 40000000 or bit_depth != 8 or (color_type != 2 and color_type != 6) or interlace != 0:
+    if width <= 0 or height <= 0 or width * height > 40000000 or interlace != 0:
         return image^
-    var channels = 4 if color_type == 6 else 3
+
+    # Validate PNG spec (color_type, bit_depth) combinations
+    var samples_per_pixel: Int
+    if color_type == 0:
+        if bit_depth != 1 and bit_depth != 2 and bit_depth != 4 and bit_depth != 8 and bit_depth != 16:
+            return image^
+        samples_per_pixel = 1
+    elif color_type == 2:
+        if bit_depth != 8 and bit_depth != 16:
+            return image^
+        samples_per_pixel = 3
+    elif color_type == 3:
+        if bit_depth != 1 and bit_depth != 2 and bit_depth != 4 and bit_depth != 8:
+            return image^
+        samples_per_pixel = 1
+    elif color_type == 4:
+        if bit_depth != 8 and bit_depth != 16:
+            return image^
+        samples_per_pixel = 2
+    elif color_type == 6:
+        if bit_depth != 8 and bit_depth != 16:
+            return image^
+        samples_per_pixel = 4
+    else:
+        return image^
+
     var compressed = List[UInt8](capacity=len(data))
+    var palette = List[UInt8]()
+    var trns = List[UInt8]()
     var offset = 8
     var finished = False
     while offset + 12 <= len(data):
@@ -339,28 +397,44 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
         if length < 0 or offset + length + 12 > len(data):
             return image^
         var kind = be32(data, offset + 4)
-        if kind == 0x49444154:
+        if kind == 0x49444154:  # IDAT
             var cur = len(compressed)
             compressed.resize(cur + length, 0)
             _ = external_call["memcpy", Int](Int(compressed.unsafe_ptr()) + cur, Int(data.unsafe_ptr()) + offset + 8, length)
-        elif kind == 0x49454E44:
+        elif kind == 0x504C5445:  # PLTE
+            palette.resize(length, 0)
+            if length > 0:
+                _ = external_call["memcpy", Int](Int(palette.unsafe_ptr()), Int(data.unsafe_ptr()) + offset + 8, length)
+        elif kind == 0x74524E53:  # tRNS
+            trns.resize(length, 0)
+            if length > 0:
+                _ = external_call["memcpy", Int](Int(trns.unsafe_ptr()), Int(data.unsafe_ptr()) + offset + 8, length)
+        elif kind == 0x49454E44:  # IEND
             finished = True
             break
         offset += length + 12
     if not finished:
         return image^
-    var stride = width * channels
+    if color_type == 3 and (len(palette) < 3 or (len(palette) % 3) != 0):
+        return image^
+
+    var bits_per_pixel = samples_per_pixel * bit_depth
+    var stride = (width * bits_per_pixel + 7) // 8
+    var bpp = max(1, (bits_per_pixel + 7) // 8)
     var raw = inflate_zlib(compressed, 0, (stride + 1) * height)
     if len(raw) != (stride + 1) * height:
         return image^
+
     var scanlines = List[UInt8](length=stride * height, fill=0)
     for y in range(height):
         var filter = Int(raw[y * (stride + 1)])
+        var row_off = y * stride
+        var raw_off = y * (stride + 1) + 1
         for x in range(stride):
-            var encoded = Int(raw[y * (stride + 1) + 1 + x])
-            var left = Int(scanlines[y * stride + x - channels]) if x >= channels else 0
+            var encoded = Int(raw[raw_off + x])
+            var left = Int(scanlines[row_off + x - bpp]) if x >= bpp else 0
             var above = Int(scanlines[(y - 1) * stride + x]) if y > 0 else 0
-            var diagonal = Int(scanlines[(y - 1) * stride + x - channels]) if y > 0 and x >= channels else 0
+            var diagonal = Int(scanlines[(y - 1) * stride + x - bpp]) if y > 0 and x >= bpp else 0
             var predictor = 0
             if filter == 1:
                 predictor = left
@@ -372,18 +446,157 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
                 predictor = paeth(left, above, diagonal)
             elif filter != 0:
                 return image^
-            scanlines[y * stride + x] = UInt8((encoded + predictor) & 255)
+            scanlines[row_off + x] = UInt8((encoded + predictor) & 255)
+
+    # Decode full-resolution ARGB8888 pixels (+ 16-bit channel preservation for 16-bit PNGs)
+    var full_pixels = List[UInt32](length=width * height, fill=0xFFFFFFFF)
+    var full_u16 = List[UInt16]()
+    var keep_u16 = bit_depth == 16
+    if keep_u16:
+        full_u16 = List[UInt16](length=width * height, fill=UInt16(0))
+
+    var has_trns_gray = color_type == 0 and len(trns) >= 2
+    var trns_gray_val = ((Int(trns[0]) << 8) | Int(trns[1])) if has_trns_gray else -1
+    var has_trns_rgb = color_type == 2 and len(trns) >= 6
+    var trns_r = ((Int(trns[0]) << 8) | Int(trns[1])) if has_trns_rgb else -1
+    var trns_g = ((Int(trns[2]) << 8) | Int(trns[3])) if has_trns_rgb else -1
+    var trns_b = ((Int(trns[4]) << 8) | Int(trns[5])) if has_trns_rgb else -1
+    var pal_count = len(palette) // 3
+
+    var scan_base = Int(scanlines.unsafe_ptr())
+    for y in range(height):
+        var row_ptr = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=scan_base + y * stride)
+        var dst_row = y * width
+        if color_type == 6 and bit_depth == 8:
+            for x in range(width):
+                var s = x * 4
+                var r = UInt32(row_ptr[unsafe_offset=s])
+                var g = UInt32(row_ptr[unsafe_offset=s + 1])
+                var b = UInt32(row_ptr[unsafe_offset=s + 2])
+                var a = UInt32(row_ptr[unsafe_offset=s + 3])
+                full_pixels[dst_row + x] = (a << 24) | (r << 16) | (g << 8) | b
+        elif color_type == 2 and bit_depth == 8:
+            for x in range(width):
+                var s = x * 3
+                var r = Int(row_ptr[unsafe_offset=s])
+                var g = Int(row_ptr[unsafe_offset=s + 1])
+                var b = Int(row_ptr[unsafe_offset=s + 2])
+                var a = 0 if (has_trns_rgb and r == trns_r and g == trns_g and b == trns_b) else 255
+                full_pixels[dst_row + x] = (UInt32(a) << 24) | (UInt32(r) << 16) | (UInt32(g) << 8) | UInt32(b)
+        elif color_type == 0:
+            if bit_depth == 16:
+                for x in range(width):
+                    var s = x * 2
+                    var g16 = (Int(row_ptr[unsafe_offset=s]) << 8) | Int(row_ptr[unsafe_offset=s + 1])
+                    var g8 = _png_scale_gray_to_u8(g16, 16)
+                    var a = 0 if (has_trns_gray and g16 == trns_gray_val) else 255
+                    full_pixels[dst_row + x] = (UInt32(a) << 24) | (UInt32(g8) << 16) | (UInt32(g8) << 8) | UInt32(g8)
+                    full_u16[dst_row + x] = UInt16(g16)
+            else:
+                for x in range(width):
+                    var gv = _png_unpack_subbyte(row_ptr, x, bit_depth)
+                    var g8 = _png_scale_gray_to_u8(gv, bit_depth)
+                    var a = 0 if (has_trns_gray and gv == trns_gray_val) else 255
+                    full_pixels[dst_row + x] = (UInt32(a) << 24) | (UInt32(g8) << 16) | (UInt32(g8) << 8) | UInt32(g8)
+        elif color_type == 3:
+            for x in range(width):
+                var idx = _png_unpack_subbyte(row_ptr, x, bit_depth)
+                if idx >= pal_count:
+                    idx = max(0, pal_count - 1)
+                var r = UInt32(palette[idx * 3])
+                var g = UInt32(palette[idx * 3 + 1])
+                var b = UInt32(palette[idx * 3 + 2])
+                var a = UInt32(trns[idx]) if idx < len(trns) else UInt32(255)
+                full_pixels[dst_row + x] = (a << 24) | (r << 16) | (g << 8) | b
+        elif color_type == 4:
+            if bit_depth == 16:
+                for x in range(width):
+                    var s = x * 4
+                    var g16 = (Int(row_ptr[unsafe_offset=s]) << 8) | Int(row_ptr[unsafe_offset=s + 1])
+                    var a16 = (Int(row_ptr[unsafe_offset=s + 2]) << 8) | Int(row_ptr[unsafe_offset=s + 3])
+                    var g8 = _png_scale_gray_to_u8(g16, 16)
+                    var a8 = _png_scale_gray_to_u8(a16, 16)
+                    full_pixels[dst_row + x] = (UInt32(a8) << 24) | (UInt32(g8) << 16) | (UInt32(g8) << 8) | UInt32(g8)
+                    full_u16[dst_row + x] = UInt16(g16)
+            else:
+                for x in range(width):
+                    var s = x * 2
+                    var g8 = UInt32(row_ptr[unsafe_offset=s])
+                    var a8 = UInt32(row_ptr[unsafe_offset=s + 1])
+                    full_pixels[dst_row + x] = (a8 << 24) | (g8 << 16) | (g8 << 8) | g8
+        elif color_type == 2 and bit_depth == 16:
+            for x in range(width):
+                var s = x * 6
+                var r16 = (Int(row_ptr[unsafe_offset=s]) << 8) | Int(row_ptr[unsafe_offset=s + 1])
+                var g16 = (Int(row_ptr[unsafe_offset=s + 2]) << 8) | Int(row_ptr[unsafe_offset=s + 3])
+                var b16 = (Int(row_ptr[unsafe_offset=s + 4]) << 8) | Int(row_ptr[unsafe_offset=s + 5])
+                var r8 = _png_scale_gray_to_u8(r16, 16)
+                var g8 = _png_scale_gray_to_u8(g16, 16)
+                var b8 = _png_scale_gray_to_u8(b16, 16)
+                var a8 = 0 if (has_trns_rgb and r16 == trns_r and g16 == trns_g and b16 == trns_b) else 255
+                full_pixels[dst_row + x] = (UInt32(a8) << 24) | (UInt32(r8) << 16) | (UInt32(g8) << 8) | UInt32(b8)
+                full_u16[dst_row + x] = UInt16(r16)
+        elif color_type == 6 and bit_depth == 16:
+            for x in range(width):
+                var s = x * 8
+                var r16 = (Int(row_ptr[unsafe_offset=s]) << 8) | Int(row_ptr[unsafe_offset=s + 1])
+                var g16 = (Int(row_ptr[unsafe_offset=s + 2]) << 8) | Int(row_ptr[unsafe_offset=s + 3])
+                var b16 = (Int(row_ptr[unsafe_offset=s + 4]) << 8) | Int(row_ptr[unsafe_offset=s + 5])
+                var a16 = (Int(row_ptr[unsafe_offset=s + 6]) << 8) | Int(row_ptr[unsafe_offset=s + 7])
+                var r8 = _png_scale_gray_to_u8(r16, 16)
+                var g8 = _png_scale_gray_to_u8(g16, 16)
+                var b8 = _png_scale_gray_to_u8(b16, 16)
+                var a8 = _png_scale_gray_to_u8(a16, 16)
+                full_pixels[dst_row + x] = (UInt32(a8) << 24) | (UInt32(r8) << 16) | (UInt32(g8) << 8) | UInt32(b8)
+                full_u16[dst_row + x] = UInt16(r16)
+    _ = len(scanlines)
+
+    # Box-filter downscaling when image exceeds `maximum_size`
     var scale = 1
     while (width + scale - 1) // scale > maximum_size or (height + scale - 1) // scale > maximum_size:
         scale *= 2
     image.width = (width + scale - 1) // scale
     image.height = (height + scale - 1) // scale
-    image.pixels = List[UInt32](length=image.width * image.height, fill=0xFFFFFFFF)
-    for y in range(image.height):
-        for x in range(image.width):
-            var source = min(height - 1, y * scale) * stride + min(width - 1, x * scale) * channels
-            var alpha = UInt32(scanlines[source + 3]) if channels == 4 else UInt32(255)
-            image.pixels[y * image.width + x] = (alpha << 24) | UInt32(scanlines[source]) << 16 | UInt32(scanlines[source + 1]) << 8 | UInt32(scanlines[source + 2])
+    image.bit_depth = bit_depth
+    if scale == 1:
+        image.pixels = full_pixels^
+        if keep_u16:
+            image.pixels_u16 = full_u16^
+    else:
+        image.pixels = List[UInt32](length=image.width * image.height, fill=0xFFFFFFFF)
+        if keep_u16:
+            image.pixels_u16 = List[UInt16](length=image.width * image.height, fill=UInt16(0))
+        for y in range(image.height):
+            var sy0 = y * scale
+            var sy1 = min(height, sy0 + scale)
+            for x in range(image.width):
+                var sx0 = x * scale
+                var sx1 = min(width, sx0 + scale)
+                var sa = 0
+                var sr = 0
+                var sg = 0
+                var sb = 0
+                var su16 = 0
+                var cnt = 0
+                for sy in range(sy0, sy1):
+                    var srow = sy * width
+                    for sx in range(sx0, sx1):
+                        var px = full_pixels[srow + sx]
+                        sa += Int((px >> 24) & 0xFF)
+                        sr += Int((px >> 16) & 0xFF)
+                        sg += Int((px >> 8) & 0xFF)
+                        sb += Int(px & 0xFF)
+                        if keep_u16:
+                            su16 += Int(full_u16[srow + sx])
+                        cnt += 1
+                var half = cnt >> 1
+                var da = UInt32((sa + half) // cnt)
+                var dr = UInt32((sr + half) // cnt)
+                var dg = UInt32((sg + half) // cnt)
+                var db = UInt32((sb + half) // cnt)
+                image.pixels[y * image.width + x] = (da << 24) | (dr << 16) | (dg << 8) | db
+                if keep_u16:
+                    image.pixels_u16[y * image.width + x] = UInt16((su16 + half) // cnt)
     image.valid = True
     return image^
 

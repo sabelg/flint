@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+CALLER_PWD="$(pwd)"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 MOJO_BIN=""
+FLINT_FORCE_BUILD="${FLINT_FORCE_BUILD:-0}"
+FLINT_BUILD_JOBS="${FLINT_BUILD_JOBS:-1}"
 
 # Resolve Mojo 1.2 toolchain in current shell (never inside $(...) so exports persist)
 resolve_mojo() {
@@ -33,11 +36,56 @@ resolve_mojo() {
     exit 1
 }
 
+read_flint_toml_value() {
+    local file="$1"
+    local section="$2"
+    local key="$3"
+    [[ -f "$file" ]] || return 1
+    awk -v sec="[$section]" -v k="$key" '
+        /^[[:space:]]*\[/ { in_sec = ($0 ~ "^[[:space:]]*" sec "[[:space:]]*$"); next }
+        in_sec {
+            line = $0
+            sub(/#.*$/, "", line)
+            if (line ~ "^[[:space:]]*" k "[[:space:]]*=") {
+                sub(/^[^=]*=[[:space:]]*/, "", line)
+                sub(/[[:space:]]*$/, "", line)
+                gsub(/^"|"$/, "", line)
+                print line
+                exit 0
+            }
+        }
+    ' "$file"
+}
+
+is_binary_fresh() {
+    local src="$1"
+    local out="$2"
+    local extra_inc="${3-__DEFAULT_TESTS__}"
+    [[ "${FLINT_FORCE_BUILD:-0}" == "1" ]] && return 1
+    [[ -x "$out" ]] || return 1
+    [[ "$src" -nt "$out" ]] && return 1
+    local hit
+    hit="$(find "${ROOT}/src" -name '*.mojo' ! -name 'build_stamp.mojo' -newer "$out" -print -quit 2>/dev/null || true)"
+    [[ -n "$hit" ]] && return 1
+    if [[ "$extra_inc" == "__DEFAULT_TESTS__" && "$src" == "${ROOT}/tests/"* ]]; then
+        hit="$(find "${ROOT}/tests" -name '*.mojo' -newer "$out" -print -quit 2>/dev/null || true)"
+        [[ -n "$hit" ]] && return 1
+    elif [[ -n "$extra_inc" && "$extra_inc" != "__DEFAULT_TESTS__" && -d "$extra_inc" ]]; then
+        hit="$(find "$extra_inc" -name '*.mojo' -newer "$out" -print -quit 2>/dev/null || true)"
+        [[ -n "$hit" ]] && return 1
+    fi
+    return 0
+}
+
 compile_mojo() {
     local src="$1"
     local out="$2"
     local opt="${3:--O3}"
     local extra_inc="${4-__DEFAULT_TESTS__}"
+    if is_binary_fresh "$src" "$out" "$extra_inc"; then
+        echo "[Flint] Up-to-date: ${out#${ROOT}/}"
+        return 0
+    fi
     local tmp
     tmp="$(mktemp "/tmp/flint-link-$(basename "$out")-XXXXXX")"
     rm -f "$tmp" "$out"
@@ -99,46 +147,86 @@ cmd_build() {
     write_build_stamp "$MOJO_BIN"
     mkdir -p "${ROOT}/build" "${ROOT}/build/v5"
 
-    local target="${1:-all}"
+    local target=""
+    local jobs="${FLINT_BUILD_JOBS:-1}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) FLINT_FORCE_BUILD=1; shift ;;
+            -j|--jobs) jobs="${2:-1}"; shift 2 ;;
+            -j*) jobs="${1#-j}"; shift ;;
+            *)
+                if [[ -z "$target" ]]; then
+                    target="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # If invoked inside a scaffolded game repo containing flint.toml and no engine target was given, build that project!
+    if [[ -z "$target" && "$CALLER_PWD" != "$ROOT" && -f "${CALLER_PWD}/flint.toml" ]]; then
+        local proj_name proj_entry
+        proj_name="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "name" || basename "$CALLER_PWD")"
+        proj_entry="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "entry" || echo "src/main.mojo")"
+        [[ -z "$proj_name" ]] && proj_name="$(basename "$CALLER_PWD")"
+        [[ -z "$proj_entry" ]] && proj_entry="src/main.mojo"
+        echo "[Flint] Building ${proj_name} (${proj_entry}) -> ${CALLER_PWD}/build/${proj_name} ..."
+        compile_mojo "${CALLER_PWD}/${proj_entry}" "${CALLER_PWD}/build/${proj_name}" "-O3" "${CALLER_PWD}/src"
+        echo "[Flint] Build complete."
+        return 0
+    fi
+
+    target="${target:-all}"
+    local build_srcs=()
+    local build_outs=()
+    local build_labels=()
+
     if [[ "$target" == "all" || "$target" == "spark" ]]; then
-        echo "[Flint] Building examples/minimal_spark/main.mojo -> build/flint-spark ..."
-        compile_mojo "${ROOT}/examples/minimal_spark/main.mojo" "${ROOT}/build/flint-spark"
+        build_srcs+=("${ROOT}/examples/minimal_spark/main.mojo")
+        build_outs+=("${ROOT}/build/flint-spark")
+        build_labels+=("examples/minimal_spark/main.mojo -> build/flint-spark")
     fi
     if [[ "$target" == "all" || "$target" == "world" ]]; then
-        echo "[Flint] Building examples/open_world/main.mojo -> build/flint-world ..."
-        compile_mojo "${ROOT}/examples/open_world/main.mojo" "${ROOT}/build/flint-world"
+        build_srcs+=("${ROOT}/examples/open_world/main.mojo")
+        build_outs+=("${ROOT}/build/flint-world")
+        build_labels+=("examples/open_world/main.mojo -> build/flint-world")
     fi
     if [[ "$target" == "all" || "$target" == "studio" ]]; then
         if [[ -f "${ROOT}/examples/studio/main.mojo" ]]; then
-            echo "[Flint] Building examples/studio/main.mojo -> build/flint-studio ..."
-            compile_mojo "${ROOT}/examples/studio/main.mojo" "${ROOT}/build/flint-studio"
+            build_srcs+=("${ROOT}/examples/studio/main.mojo")
+            build_outs+=("${ROOT}/build/flint-studio")
+            build_labels+=("examples/studio/main.mojo -> build/flint-studio")
         fi
     fi
     if [[ "$target" == "all" || "$target" == "cycles" ]]; then
-        echo "[Flint] Building examples/cycles/main.mojo -> build/flint-cycles ..."
-        compile_mojo "${ROOT}/examples/cycles/main.mojo" "${ROOT}/build/flint-cycles"
-        echo "[Flint] Building tests/test_cycles.mojo -> build/flint-cycles-test ..."
-        compile_mojo "${ROOT}/tests/test_cycles.mojo" "${ROOT}/build/flint-cycles-test"
+        build_srcs+=("${ROOT}/examples/cycles/main.mojo" "${ROOT}/tests/test_cycles.mojo")
+        build_outs+=("${ROOT}/build/flint-cycles" "${ROOT}/build/flint-cycles-test")
+        build_labels+=("examples/cycles/main.mojo -> build/flint-cycles" "tests/test_cycles.mojo -> build/flint-cycles-test")
     fi
     if [[ "$target" == "all" || "$target" == "kms" ]]; then
-        echo "[Flint] Building examples/kms_console/main.mojo -> build/flint-kms ..."
-        compile_mojo "${ROOT}/examples/kms_console/main.mojo" "${ROOT}/build/flint-kms"
+        build_srcs+=("${ROOT}/examples/kms_console/main.mojo")
+        build_outs+=("${ROOT}/build/flint-kms")
+        build_labels+=("examples/kms_console/main.mojo -> build/flint-kms")
     fi
     if [[ "$target" == "all" || "$target" == "kms3d" ]]; then
-        echo "[Flint] Building examples/kms_3d/main.mojo -> build/flint-kms3d ..."
-        compile_mojo "${ROOT}/examples/kms_3d/main.mojo" "${ROOT}/build/flint-kms3d"
+        build_srcs+=("${ROOT}/examples/kms_3d/main.mojo")
+        build_outs+=("${ROOT}/build/flint-kms3d")
+        build_labels+=("examples/kms_3d/main.mojo -> build/flint-kms3d")
     fi
     if [[ "$target" == "all" || "$target" == "pack" ]]; then
-        echo "[Flint] Building examples/pack_cli/main.mojo -> build/flint-pack ..."
-        compile_mojo "${ROOT}/examples/pack_cli/main.mojo" "${ROOT}/build/flint-pack"
+        build_srcs+=("${ROOT}/examples/pack_cli/main.mojo")
+        build_outs+=("${ROOT}/build/flint-pack")
+        build_labels+=("examples/pack_cli/main.mojo -> build/flint-pack")
     fi
     if [[ "$target" == "all" || "$target" == "test" || "$target" == "unit" ]]; then
-        echo "[Flint] Building tests/test_flint.mojo -> build/flint-test ..."
-        compile_mojo "${ROOT}/tests/test_flint.mojo" "${ROOT}/build/flint-test"
+        build_srcs+=("${ROOT}/tests/test_flint.mojo")
+        build_outs+=("${ROOT}/build/flint-test")
+        build_labels+=("tests/test_flint.mojo -> build/flint-test")
     fi
     if [[ "$target" == "all" || "$target" == "test" || "$target" == "e2e" ]]; then
-        echo "[Flint] Building tests/test_e2e.mojo -> build/flint-e2e ..."
-        compile_mojo "${ROOT}/tests/test_e2e.mojo" "${ROOT}/build/flint-e2e"
+        build_srcs+=("${ROOT}/tests/test_e2e.mojo")
+        build_outs+=("${ROOT}/build/flint-e2e")
+        build_labels+=("tests/test_e2e.mojo -> build/flint-e2e")
     fi
     if [[ "$target" == "all" || "$target" == "test" || "$target" == "v5" ]]; then
         local v5_src
@@ -146,11 +234,59 @@ cmd_build() {
             [[ -f "$v5_src" ]] || continue
             local v5_base
             v5_base="$(basename "$v5_src" .mojo)"
-            echo "[Flint] Building tests/${v5_base}.mojo -> build/v5/${v5_base} ..."
-            compile_mojo "$v5_src" "${ROOT}/build/v5/${v5_base}"
+            build_srcs+=("$v5_src")
+            build_outs+=("${ROOT}/build/v5/${v5_base}")
+            build_labels+=("tests/${v5_base}.mojo -> build/v5/${v5_base}")
         done
     fi
+
+    if [[ "$jobs" -le 1 || "${#build_srcs[@]}" -le 1 ]]; then
+        local i
+        for ((i = 0; i < ${#build_srcs[@]}; i++)); do
+            echo "[Flint] Building ${build_labels[$i]} ..."
+            compile_mojo "${build_srcs[$i]}" "${build_outs[$i]}"
+        done
+    else
+        echo "[Flint] Building ${#build_srcs[@]} targets with ${jobs} parallel jobs..."
+        local pids=()
+        local i fail=0
+        for ((i = 0; i < ${#build_srcs[@]}; i++)); do
+            echo "[Flint] Building ${build_labels[$i]} ..."
+            compile_mojo "${build_srcs[$i]}" "${build_outs[$i]}" &
+            pids+=($!)
+            if [[ "${#pids[@]}" -ge "$jobs" ]]; then
+                wait "${pids[0]}" || fail=1
+                pids=("${pids[@]:1}")
+            fi
+        done
+        local p
+        for p in "${pids[@]}"; do
+            wait "$p" || fail=1
+        done
+        if [[ "$fail" -ne 0 ]]; then
+            return 1
+        fi
+    fi
     echo "[Flint] Build complete."
+}
+
+cmd_run() {
+    if [[ ! -f "${CALLER_PWD}/flint.toml" ]]; then
+        echo "[Flint] ERROR: No flint.toml found in ${CALLER_PWD}. Run from a scaffolded Flint game directory or use 'play'/'world'/'studio'." >&2
+        return 1
+    fi
+    resolve_mojo
+    write_build_stamp "$MOJO_BIN"
+    local proj_name proj_entry
+    proj_name="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "name" || basename "$CALLER_PWD")"
+    proj_entry="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "entry" || echo "src/main.mojo")"
+    [[ -z "$proj_name" ]] && proj_name="$(basename "$CALLER_PWD")"
+    [[ -z "$proj_entry" ]] && proj_entry="src/main.mojo"
+    local bin="${CALLER_PWD}/build/${proj_name}"
+    echo "[Flint] Building ${proj_name} (${proj_entry}) -> ${bin} ..."
+    compile_mojo "${CALLER_PWD}/${proj_entry}" "$bin" "-O3" "${CALLER_PWD}/src"
+    cd "$CALLER_PWD"
+    exec "$bin" "$@"
 }
 
 cmd_pack() {
@@ -604,7 +740,19 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 APP_ROOT="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
-FLINT_ROOT="\${FLINT_ROOT:-${ROOT}}"
+FLINT_ROOT="\${FLINT_ROOT:-}"
+if [[ -z "\$FLINT_ROOT" ]]; then
+    for cand in "\${APP_ROOT}/../flint" "\${HOME}/flint"; do
+        if [[ -d "\${cand}/src/flint" ]]; then
+            FLINT_ROOT="\$cand"
+            break
+        fi
+    done
+fi
+if [[ -z "\$FLINT_ROOT" || ! -d "\${FLINT_ROOT}/src/flint" ]]; then
+    echo "[Flint] ERROR: Set FLINT_ROOT=/path/to/flint before running." >&2
+    exit 1
+fi
 mkdir -p "\${APP_ROOT}/build"
 
 MOJO_BIN="\${MOJO:-}"
@@ -680,6 +828,7 @@ shift || true
 case "$subcmd" in
     sync)    cmd_sync "$@" ;;
     build)   cmd_build "$@" ;;
+    run)     cmd_run "$@" ;;
     pack)    cmd_pack "$@" ;;
     test)    cmd_test "$@" ;;
     lab)     cmd_lab "$@" ;;
@@ -704,7 +853,8 @@ case "$subcmd" in
         echo "  lab <name|all> [--fast] Compile & run subsystem lab (physics|anim|render|audio_ui|net|all)"
         echo "  studio [...]         Build and launch Flint Studio visual editor / MCP v2 host"
         echo "  mcp [...]            Build and launch Flint Studio headless MCP v2 stdio server"
-        echo "  build [all|spark|world|studio|kms|kms3d|pack|test|v5|cycles] Compile standalone targets (-O3 --Werror)"
+        echo "  build [target] [--force] [-j N] Compile standalone targets (or flint.toml project) with incremental skip"
+        echo "  run [...]            Build and run a scaffolded game project using flint.toml [project] entry"
         echo "  test [unit|e2e|v5]   Build and run standalone Flint Engine verification suites"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
         echo "  preview <program>    Live preview: rebuild on save and swap window (spark|world|studio|cycles|file|dir)"

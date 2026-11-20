@@ -12,6 +12,8 @@ Architecture:
     while bumping `reload_epoch++`.
 """
 from std.collections import Dict, Optional
+from flint.core.ecs import run_parallel_ctx
+from flint.core.jobs import JobPool
 from flint.assets.cooker_v2 import (
     cook_hdr_texture_bundle,
     cook_png_texture_bundle,
@@ -47,6 +49,12 @@ from flint.physics.bvh import Bvh8MeshCollider
 from flint.platform.os import read_bytes
 from flint.render.aaa_render_graph import AaaResidencyStreamer
 from flint.render.font import SdfFont
+
+
+comptime ASSET_STATE_UNLOADED: Int = 0
+comptime ASSET_STATE_LOADING: Int = 1
+comptime ASSET_STATE_READY: Int = 2
+comptime ASSET_STATE_FAILED: Int = 3
 
 
 # ============================================================================
@@ -203,6 +211,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
     strong ref-counts, immediate payload deinit on LRU eviction/unload, and hot-reload epochs."""
     var payloads: List[Optional[Self.T]]
     var occupied: List[Bool]
+    var states: List[Int]
     var generations: List[UInt32]
     var ref_counts: List[Int]
     var reload_epochs: List[UInt64]
@@ -222,6 +231,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
     def __init__(out self):
         self.payloads = List[Optional[Self.T]]()
         self.occupied = List[Bool]()
+        self.states = List[Int]()
         self.generations = List[UInt32]()
         self.ref_counts = List[Int]()
         self.reload_epochs = List[UInt64]()
@@ -273,6 +283,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
             var gen = self.generations[slot]
             self.payloads[slot] = None
             self.occupied[slot] = True
+            self.states[slot] = ASSET_STATE_LOADING
             self.ref_counts[slot] = 1
             self.reload_epochs[slot] = 0
             self.last_used_tick[slot] = tick
@@ -291,6 +302,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         var gen = UInt32(1)
         self.payloads.append(Optional[Self.T](None))
         self.occupied.append(True)
+        self.states.append(ASSET_STATE_LOADING)
         self.generations.append(gen)
         self.ref_counts.append(1)
         self.reload_epochs.append(0)
@@ -322,6 +334,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         var next_cpu = max(0, payload.byte_footprint())
         var next_vram = max(0, vram_bytes)
         self.payloads[s] = Optional[Self.T](payload^)
+        self.states[s] = ASSET_STATE_READY
         self.slot_cpu_bytes[s] = next_cpu
         self.slot_vram_bytes[s] = next_vram
         self.reload_epochs[s] += 1
@@ -330,6 +343,19 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         self.vram_live_bytes = max(0, self.vram_live_bytes - prev_vram + next_vram)
         self.live_bytes = self.cpu_live_bytes + self.vram_live_bytes
         return True
+
+    def set_failed(mut self, handle: Handle[Self.T]) -> Bool:
+        """Marks an allocated slot as `ASSET_STATE_FAILED` when async loading/decoding fails."""
+        var s = self.valid_slot(handle)
+        if s < 0:
+            return False
+        self.payloads[s] = None
+        self.states[s] = ASSET_STATE_FAILED
+        return True
+
+    def asset_state(self, handle: Handle[Self.T]) -> Int:
+        var s = self.valid_slot(handle)
+        return self.states[s] if s >= 0 else ASSET_STATE_UNLOADED
 
     def insert(
         mut self,
@@ -459,6 +485,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         self.slot_cpu_bytes[s] = 0
         self.slot_vram_bytes[s] = 0
         self.occupied[s] = False
+        self.states[s] = ASSET_STATE_UNLOADED
         self.ref_counts[s] = 0
         var next_gen = (self.generations[s] + 1) & 0xFFFFFF
         if next_gen == 0:
@@ -503,7 +530,170 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
 
 
 # ============================================================================
-# 3. Async `AssetServer`
+# 3. `JobPool`-Backed Async Asset Load Jobs
+# ============================================================================
+
+struct _PendingMeshLoad(Movable):
+    var handle: Handle[CookedMeshAsset]
+    var rel_path: String
+    var full_path: String
+    var is_cooked_slab: Bool
+    var slab_bytes: List[UInt8]
+    var collider_bytes: List[UInt8]
+    var has_source: Bool
+    var ok: Bool
+    var asset: CookedMeshAsset
+
+    def __init__(out self, handle: Handle[CookedMeshAsset], rel_path: String):
+        self.handle = handle
+        self.rel_path = rel_path
+        self.full_path = String()
+        self.is_cooked_slab = False
+        self.slab_bytes = List[UInt8]()
+        self.collider_bytes = List[UInt8]()
+        self.has_source = False
+        self.ok = False
+        self.asset = CookedMeshAsset()
+
+
+struct _MeshAsyncBatchCtx(Movable):
+    var jobs: List[_PendingMeshLoad]
+
+    def __init__(out self, var jobs: List[_PendingMeshLoad]):
+        self.jobs = jobs^
+
+    @always_inline
+    def keep_alive(self):
+        var anchor = Int(self.jobs.unsafe_ptr())
+        _ = anchor
+
+
+def _mesh_async_worker(ctx_addr: Int, idx: Int):
+    ref ctx = Pointer[_MeshAsyncBatchCtx, MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    ref job = ctx.jobs[idx]
+    if not job.has_source:
+        job.ok = False
+        return
+    if job.is_cooked_slab:
+        var dec = decode_cooked_mesh_slab_into(job.slab_bytes, job.asset.geom)
+        if not dec[0]:
+            job.ok = False
+            return
+        if len(job.collider_bytes) > 0:
+            var cdec = decode_bvh8_collider_slab(job.collider_bytes)
+            if cdec[0]:
+                job.asset.has_collider = True
+                job.asset.collider = cdec[1].copy()
+        job.ok = True
+        return
+    var raw = read_bytes(job.full_path)
+    if len(raw) == 0:
+        job.ok = False
+        return
+    var meta = load_or_init_flmeta(job.full_path, job.rel_path, ASSET_KIND_MESH, persist_if_missing=False)
+    var b = cook_single_source_bytes(raw, meta, job.rel_path)
+    if not b.valid or len(b.chunks) == 0:
+        job.ok = False
+        return
+    var dec = decode_cooked_mesh_slab_into(b.chunks[0].raw_payload, job.asset.geom)
+    if not dec[0]:
+        job.ok = False
+        return
+    if len(b.chunks) > 1 and b.chunks[1].sub_id == SUB_ID_BVH8_COLLIDER:
+        var cdec = decode_bvh8_collider_slab(b.chunks[1].raw_payload)
+        job.asset.has_collider = cdec[0]
+        job.asset.collider = cdec[1].copy()
+    job.ok = True
+
+
+struct _PendingTextureLoad(Movable):
+    var handle: Handle[CookedTextureAsset]
+    var rel_path: String
+    var full_path: String
+    var is_cooked_tail: Bool
+    var progressive: Bool
+    var tail_bytes: List[UInt8]
+    var has_source: Bool
+    var ok: Bool
+    var asset: CookedTextureAsset
+
+    def __init__(out self, handle: Handle[CookedTextureAsset], rel_path: String, progressive: Bool):
+        self.handle = handle
+        self.rel_path = rel_path
+        self.full_path = String()
+        self.is_cooked_tail = False
+        self.progressive = progressive
+        self.tail_bytes = List[UInt8]()
+        self.has_source = False
+        self.ok = False
+        self.asset = CookedTextureAsset()
+
+
+struct _TexAsyncBatchCtx(Movable):
+    var jobs: List[_PendingTextureLoad]
+
+    def __init__(out self, var jobs: List[_PendingTextureLoad]):
+        self.jobs = jobs^
+
+    @always_inline
+    def keep_alive(self):
+        var anchor = Int(self.jobs.unsafe_ptr())
+        _ = anchor
+
+
+def _tex_async_worker(ctx_addr: Int, idx: Int):
+    ref ctx = Pointer[_TexAsyncBatchCtx, MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    ref job = ctx.jobs[idx]
+    if not job.has_source:
+        job.ok = False
+        return
+    if job.is_cooked_tail:
+        var dec = decode_texture_tail_slab(job.tail_bytes)
+        if not dec[0]:
+            job.ok = False
+            return
+        var hdr = dec[1].copy()
+        job.asset.width = Int(hdr.width)
+        job.asset.height = Int(hdr.height)
+        job.asset.mip_count = Int(hdr.mip_count)
+        job.asset.tail_first_mip = Int(hdr.tail_first_mip)
+        job.asset.resident_min_mip = Int(hdr.tail_first_mip)
+        job.asset.tex_format = hdr.tex_format
+        job.asset.mip_sizes = hdr.mip_sizes.copy()
+        job.asset.mips = dec[2].copy()
+        job.ok = True
+        return
+    var raw = read_bytes(job.full_path)
+    if len(raw) == 0:
+        job.ok = False
+        return
+    var meta = load_or_init_flmeta(job.full_path, job.rel_path, ASSET_KIND_TEXTURE, persist_if_missing=False)
+    var cooked = cook_png_texture_bundle(raw, meta, job.rel_path)
+    if not cooked.valid or len(cooked.chunks) == 0:
+        job.ok = False
+        return
+    var dec = decode_texture_tail_slab(cooked.chunks[0].raw_payload)
+    if not dec[0]:
+        job.ok = False
+        return
+    var hdr = dec[1].copy()
+    job.asset.width = Int(hdr.width)
+    job.asset.height = Int(hdr.height)
+    job.asset.mip_count = Int(hdr.mip_count)
+    job.asset.tail_first_mip = Int(hdr.tail_first_mip)
+    job.asset.resident_min_mip = 0
+    job.asset.tex_format = hdr.tex_format
+    job.asset.mip_sizes = hdr.mip_sizes.copy()
+    job.asset.mips = dec[2].copy()
+    for ci in range(1, len(cooked.chunks)):
+        var sub_m = Int(cooked.chunks[ci].sub_id) - 1
+        if sub_m >= 0 and sub_m < len(job.asset.mips):
+            job.asset.mips[sub_m] = cooked.chunks[ci].raw_payload.copy()
+    job.ok = True
+
+
+# ============================================================================
+# 4. Async `AssetServer`
 # ============================================================================
 
 struct AssetServer(Movable):
@@ -524,6 +714,9 @@ struct AssetServer(Movable):
     var fonts: TypedAssetStorage[CookedFontAsset]
     var audios: TypedAssetStorage[CookedAudioAsset]
     var raws: TypedAssetStorage[RawBytesAsset]
+
+    var pending_mesh_loads: List[_PendingMeshLoad]
+    var pending_texture_loads: List[_PendingTextureLoad]
 
     def __init__(
         out self,
@@ -546,6 +739,9 @@ struct AssetServer(Movable):
         self.fonts = TypedAssetStorage[CookedFontAsset]()
         self.audios = TypedAssetStorage[CookedAudioAsset]()
         self.raws = TypedAssetStorage[RawBytesAsset]()
+
+        self.pending_mesh_loads = List[_PendingMeshLoad]()
+        self.pending_texture_loads = List[_PendingTextureLoad]()
 
     def close(mut self):
         for i in range(len(self.mounts)):
@@ -901,6 +1097,146 @@ struct AssetServer(Movable):
             if len(raw) > 0:
                 return self.raws.insert(RawBytesAsset(raw^), AssetUuid.from_path(rel_path), rel_path, self.current_tick)
         return Handle[RawBytesAsset]()
+
+    # ---- Async `JobPool`-Backed Loading API ----
+
+    def mesh_state(self, handle: Handle[CookedMeshAsset]) -> Int:
+        return self.meshes.asset_state(handle)
+
+    def texture_state(self, handle: Handle[CookedTextureAsset]) -> Int:
+        return self.textures.asset_state(handle)
+
+    def pending_async_count(self) -> Int:
+        return len(self.pending_mesh_loads) + len(self.pending_texture_loads)
+
+    def load_mesh_async(mut self, rel_path: String) -> Handle[CookedMeshAsset]:
+        """Queues a mesh for `JobPool`-backed async decoding, immediately returning a handle in `ASSET_STATE_LOADING`."""
+        var s = self.meshes.find_slot_by_path(rel_path)
+        if s >= 0:
+            var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
+            _ = self.meshes.retain(h)
+            self.meshes.last_used_tick[s] = self.current_tick
+            return h
+
+        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        if loc[0] >= 0:
+            var entry = self.mounts[loc[0]].toc_entry(loc[1])
+            var h = self.meshes.allocate_queued(entry.uuid, rel_path, self.current_tick)
+            var job = _PendingMeshLoad(h, rel_path)
+            var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
+            if pay[0]:
+                job.is_cooked_slab = True
+                job.slab_bytes = pay[1].copy()
+                job.has_source = True
+                var col_loc = self._find_in_mounts_by_uuid(entry.uuid, SUB_ID_BVH8_COLLIDER)
+                if col_loc[0] >= 0:
+                    var cpay = self.mounts[col_loc[0]].read_payload_by_toc(col_loc[1], verify_crc=True)
+                    if cpay[0]:
+                        job.collider_bytes = cpay[1].copy()
+            self.pending_mesh_loads.append(job^)
+            return h
+
+        var h = self.meshes.allocate_queued(AssetUuid.from_path(rel_path), rel_path, self.current_tick)
+        var job = _PendingMeshLoad(h, rel_path)
+        if self.loose_root.byte_length() > 0:
+            job.full_path = self.loose_root + "/" + rel_path
+            job.has_source = True
+        self.pending_mesh_loads.append(job^)
+        return h
+
+    def load_texture_async(mut self, rel_path: String, progressive: Bool = True) -> Handle[CookedTextureAsset]:
+        """Queues a texture for `JobPool`-backed async cooking/decoding, immediately returning a handle in `ASSET_STATE_LOADING`."""
+        var s = self.textures.find_slot_by_path(rel_path)
+        if s >= 0:
+            var h = Handle[CookedTextureAsset](UInt32(s), self.textures.generations[s])
+            _ = self.textures.retain(h)
+            self.textures.last_used_tick[s] = self.current_tick
+            return h
+
+        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        if loc[0] >= 0:
+            var entry = self.mounts[loc[0]].toc_entry(loc[1])
+            var h = self.textures.allocate_queued(entry.uuid, rel_path, self.current_tick)
+            var job = _PendingTextureLoad(h, rel_path, progressive)
+            var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
+            if pay[0]:
+                job.is_cooked_tail = True
+                job.tail_bytes = pay[1].copy()
+                job.has_source = True
+            self.pending_texture_loads.append(job^)
+            return h
+
+        var h = self.textures.allocate_queued(AssetUuid.from_path(rel_path), rel_path, self.current_tick)
+        var job = _PendingTextureLoad(h, rel_path, progressive)
+        if self.loose_root.byte_length() > 0:
+            job.full_path = self.loose_root + "/" + rel_path
+            job.has_source = True
+        self.pending_texture_loads.append(job^)
+        return h
+
+    def poll_async_loads(mut self, mut pool: JobPool) -> Int:
+        """Executes all queued async mesh & texture loads across `pool` worker threads and commits
+        each handle to `ASSET_STATE_READY` or `ASSET_STATE_FAILED`. Returns completed job count."""
+        var completed = 0
+
+        if len(self.pending_mesh_loads) > 0:
+            var batch = List[_PendingMeshLoad]()
+            while len(self.pending_mesh_loads) > 0:
+                batch.append(self.pending_mesh_loads.pop())
+            var mctx = _MeshAsyncBatchCtx(batch^)
+            var n_m = len(mctx.jobs)
+            if pool.allocated() and pool.workers > 0 and n_m > 1:
+                run_parallel_ctx(pool, n_m, mctx, _mesh_async_worker)
+                mctx.keep_alive()
+            else:
+                for i in range(n_m):
+                    _mesh_async_worker(Int(Pointer(to=mctx)), i)
+                mctx.keep_alive()
+            for i in range(n_m):
+                var h = mctx.jobs[i].handle
+                if mctx.jobs[i].ok:
+                    var a = mctx.jobs[i].asset.copy()
+                    _ = self.meshes.set_loaded(h, a^, self.current_tick)
+                else:
+                    _ = self.meshes.set_failed(h)
+                completed += 1
+
+        if len(self.pending_texture_loads) > 0:
+            var tbatch = List[_PendingTextureLoad]()
+            while len(self.pending_texture_loads) > 0:
+                tbatch.append(self.pending_texture_loads.pop())
+            var tctx = _TexAsyncBatchCtx(tbatch^)
+            var n_t = len(tctx.jobs)
+            if pool.allocated() and pool.workers > 0 and n_t > 1:
+                run_parallel_ctx(pool, n_t, tctx, _tex_async_worker)
+                tctx.keep_alive()
+            else:
+                for i in range(n_t):
+                    _tex_async_worker(Int(Pointer(to=tctx)), i)
+                tctx.keep_alive()
+            for i in range(n_t):
+                var h = tctx.jobs[i].handle
+                if tctx.jobs[i].ok:
+                    var tail_mip = tctx.jobs[i].asset.tail_first_mip
+                    var is_cooked = tctx.jobs[i].is_cooked_tail
+                    var prog = tctx.jobs[i].progressive
+                    var a = tctx.jobs[i].asset.copy()
+                    _ = self.textures.set_loaded(h, a^, self.current_tick)
+                    if is_cooked:
+                        var slot_i = Int(h.slot())
+                        if slot_i >= 0 and slot_i < len(self.streamer.resident_min_mip):
+                            self.streamer.resident_min_mip[slot_i] = tail_mip
+                            self.streamer.requested_min_mip[slot_i] = tail_mip
+                        if prog and tail_mip > 0:
+                            self.request_texture_mips(h, target_min_mip=0)
+                        else:
+                            for m in range(tail_mip - 1, -1, -1):
+                                _ = self._stream_single_texture_mip(slot_i, m)
+                else:
+                    _ = self.textures.set_failed(h)
+                completed += 1
+
+        return completed
 
     # ---- Per-Frame Tick: Progressive Mip Streaming + Live `inotify` Hot-Reload ----
 

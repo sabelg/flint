@@ -38,10 +38,13 @@ from flint.assets.flpk_v3 import (
     write_flmeta,
 )
 from flint.assets.hdr_image import encode_radiance_hdr
-from flint.assets.image import write_png
+from flint.assets.image import append_be32, append_chunk, decode_png, write_png
 from flint.assets.json import parse_json
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.server import (
+    ASSET_STATE_FAILED,
+    ASSET_STATE_LOADING,
+    ASSET_STATE_READY,
     AssetServer,
     CookedHdrAsset,
     CookedTextureAsset,
@@ -1400,6 +1403,153 @@ def test_g_audit_regressions() raises:
     print("    [OK] drag_float3 formatting, UiContext GC, despawn reparenting, cross-pool LRU & watcher zero-len resilience passed!")
 
 
+def _build_uncompressed_png(
+    width: Int,
+    height: Int,
+    bit_depth: Int,
+    color_type: Int,
+    raw_scanlines: List[UInt8],
+    plte: List[UInt8] = List[UInt8](),
+    trns: List[UInt8] = List[UInt8](),
+) -> List[UInt8]:
+    """Builds a spec-compliant uncompressed PNG byte stream for arbitrary color types & bit depths."""
+    var out = List[UInt8]()
+    var sig = [137, 80, 78, 71, 13, 10, 26, 10]
+    for v in sig:
+        out.append(UInt8(v))
+    var ihdr = List[UInt8]()
+    append_be32(ihdr, width)
+    append_be32(ihdr, height)
+    ihdr.append(UInt8(bit_depth))
+    ihdr.append(UInt8(color_type))
+    ihdr.append(UInt8(0))
+    ihdr.append(UInt8(0))
+    ihdr.append(UInt8(0))
+    append_chunk(out, 0x49484452, ihdr)
+    if len(plte) > 0:
+        append_chunk(out, 0x504C5445, plte)
+    if len(trns) > 0:
+        append_chunk(out, 0x74524E53, trns)
+    # Stored-block zlib stream
+    var z = List[UInt8]()
+    z.append(UInt8(0x78))
+    z.append(UInt8(0x01))
+    var n = len(raw_scanlines)
+    z.append(UInt8(1))  # BFINAL=1, BTYPE=00
+    z.append(UInt8(n & 0xFF))
+    z.append(UInt8((n >> 8) & 0xFF))
+    var inv = n ^ 0xFFFF
+    z.append(UInt8(inv & 0xFF))
+    z.append(UInt8((inv >> 8) & 0xFF))
+    var a = 1
+    var b = 0
+    for byte in raw_scanlines:
+        z.append(byte)
+        a = (a + Int(byte)) % 65521
+        b = (b + a) % 65521
+    append_be32(z, (b << 16) | a)
+    append_chunk(out, 0x49444154, z)
+    append_chunk(out, 0x49454E44, List[UInt8]())
+    return out^
+
+
+def test_h_wave2_png_async_studio_scene(tmp_root: String, pack_path: String, mut pool: JobPool) raises:
+    print("  [h] Testing hardened PNG decoder (gray/palette/gray+alpha/16-bit/box-filter), async AssetServer & Studio .flscene...")
+
+    # 1a. Grayscale 8-bit PNG (color_type=0)
+    var raw_g8 = List[UInt8]()
+    raw_g8.append(UInt8(0)); raw_g8.append(UInt8(0)); raw_g8.append(UInt8(64))
+    raw_g8.append(UInt8(0)); raw_g8.append(UInt8(128)); raw_g8.append(UInt8(255))
+    var png_g8 = _build_uncompressed_png(2, 2, 8, 0, raw_g8)
+    var img_g8 = decode_png(png_g8)
+    _assert(img_g8.valid and img_g8.width == 2 and img_g8.height == 2, "grayscale 8-bit PNG decode failed")
+    _assert(img_g8.pixels[0] == UInt32(0xFF000000) and img_g8.pixels[1] == UInt32(0xFF404040), "gray8 row0 mismatch")
+    _assert(img_g8.pixels[2] == UInt32(0xFF808080) and img_g8.pixels[3] == UInt32(0xFFFFFFFF), "gray8 row1 mismatch")
+
+    # 1b. Indexed/Palette PNG (color_type=3 + PLTE + tRNS)
+    var plte = List[UInt8]()
+    plte.append(UInt8(255)); plte.append(UInt8(0)); plte.append(UInt8(0))
+    plte.append(UInt8(0)); plte.append(UInt8(255)); plte.append(UInt8(0))
+    var trns = List[UInt8]()
+    trns.append(UInt8(128))
+    var raw_pal = List[UInt8]()
+    raw_pal.append(UInt8(0)); raw_pal.append(UInt8(0)); raw_pal.append(UInt8(1))
+    var png_pal = _build_uncompressed_png(2, 1, 8, 3, raw_pal, plte, trns)
+    var img_pal = decode_png(png_pal)
+    _assert(img_pal.valid and img_pal.width == 2 and img_pal.height == 1, "palette PNG decode failed")
+    _assert(img_pal.pixels[0] == UInt32(0x80FF0000), "palette+tRNS pixel 0 mismatch")
+    _assert(img_pal.pixels[1] == UInt32(0xFF00FF00), "palette pixel 1 mismatch")
+
+    # 1c. Grayscale+Alpha 8-bit PNG (color_type=4)
+    var raw_ga = List[UInt8]()
+    raw_ga.append(UInt8(0)); raw_ga.append(UInt8(100)); raw_ga.append(UInt8(50)); raw_ga.append(UInt8(200)); raw_ga.append(UInt8(255))
+    var png_ga = _build_uncompressed_png(2, 1, 8, 4, raw_ga)
+    var img_ga = decode_png(png_ga)
+    _assert(img_ga.valid and img_ga.pixels[0] == UInt32(0x32646464) and img_ga.pixels[1] == UInt32(0xFFC8C8C8), "gray+alpha PNG mismatch")
+
+    # 1d. 16-bit Grayscale PNG (color_type=0, bit_depth=16)
+    var raw_g16 = List[UInt8]()
+    raw_g16.append(UInt8(0))
+    raw_g16.append(UInt8(0x00)); raw_g16.append(UInt8(0x00))
+    raw_g16.append(UInt8(0x80)); raw_g16.append(UInt8(0x00))
+    var png_g16 = _build_uncompressed_png(2, 1, 16, 0, raw_g16)
+    var img_g16 = decode_png(png_g16)
+    _assert(img_g16.valid and img_g16.bit_depth == 16 and len(img_g16.pixels_u16) == 2, "16-bit PNG decode failed")
+    _assert(img_g16.pixels_u16[0] == UInt16(0) and img_g16.pixels_u16[1] == UInt16(0x8000), "16-bit heightmap values mismatch")
+    _assert((img_g16.pixels[1] & UInt32(0xFF)) == UInt32(128), "16-bit -> 8-bit downscale mismatch")
+
+    # 1e. Box-filter downscaling (4x4 checkerboard 0/255 -> 2x2 averages to ~128, NOT 0!)
+    var raw_chk = List[UInt8]()
+    for y in range(4):
+        raw_chk.append(UInt8(0))
+        for x in range(4):
+            raw_chk.append(UInt8(255) if ((x + y) & 1) == 1 else UInt8(0))
+    var png_chk = _build_uncompressed_png(4, 4, 8, 0, raw_chk)
+    var img_chk = decode_png(png_chk, maximum_size=2)
+    _assert(img_chk.valid and img_chk.width == 2 and img_chk.height == 2, "box-filter downscale dimensions mismatch")
+    var ch0 = Int(img_chk.pixels[0] & UInt32(0xFF))
+    _assert(ch0 >= 126 and ch0 <= 129, "box-filter downscale must average checkerboard to ~128, got " + String(ch0))
+
+    # 2. Async JobPool-backed AssetServer state transitions (LOADING -> READY / FAILED)
+    var asrv = AssetServer(stream_budget_bytes_per_tick=4096, lru_max_bytes=16 * 1024 * 1024, enable_watcher=False)
+    _assert(asrv.mount_flpk(pack_path), "mount_flpk failed for async test")
+    var h_m = asrv.load_mesh_async("meshes/forge_box.glb")
+    var h_t = asrv.load_texture_async("textures/albedo_256.png", progressive=True)
+    var h_bad = asrv.load_mesh_async("meshes/nonexistent_asset.glb")
+    _assert(asrv.mesh_state(h_m) == ASSET_STATE_LOADING, "async mesh handle must start in ASSET_STATE_LOADING")
+    _assert(asrv.texture_state(h_t) == ASSET_STATE_LOADING, "async texture handle must start in ASSET_STATE_LOADING")
+    _assert(asrv.mesh_state(h_bad) == ASSET_STATE_LOADING, "missing async handle must start in ASSET_STATE_LOADING")
+    _assert(asrv.pending_async_count() == 3, "expected 3 pending async jobs")
+
+    var done = asrv.poll_async_loads(pool)
+    _assert(done == 3 and asrv.pending_async_count() == 0, "poll_async_loads must complete all 3 jobs")
+    _assert(asrv.mesh_state(h_m) == ASSET_STATE_READY and asrv.meshes.is_loaded(h_m), "async mesh must reach ASSET_STATE_READY")
+    _assert(asrv.texture_state(h_t) == ASSET_STATE_READY and asrv.textures.is_loaded(h_t), "async texture must reach ASSET_STATE_READY")
+    _assert(asrv.mesh_state(h_bad) == ASSET_STATE_FAILED and not asrv.meshes.is_loaded(h_bad), "missing async mesh must reach ASSET_STATE_FAILED")
+    asrv.close()
+
+    # 3. Studio .flscene disk Save & Load round-trip + Duplicate Undo/Redo + Asset Browser scan
+    var st = FlintStudioState()
+    var e1 = st.spawn_entity("HeroMesh", position=Vec3(1.5, 2.0, -3.0), mass=4.5, mesh_id=1)
+    _ = st.configure_entity_npr_cel(e1, cel_outline_width_px=2.5, anim_step_hz=12.0)
+    var h_pre_dup = st.state_hash()
+    var e2 = st.duplicate_entity(e1, record_undo=True)
+    _assert(e2 >= 0 and st.entities[e2].name == "HeroMesh_Copy", "duplicate_entity failed")
+    _assert(st.undo() and st.state_hash() == h_pre_dup, "undo duplicate_entity mismatch")
+    _assert(st.redo() and st.entities[e2].alive, "redo duplicate_entity mismatch")
+
+    var scene_path = tmp_root + "/roundtrip.flscene"
+    var h_saved = st.state_hash()
+    _assert(st.save_scene_file(scene_path), "save_scene_file failed")
+
+    var st_loaded = FlintStudioState()
+    _assert(st_loaded.load_scene_file(scene_path), "load_scene_file failed")
+    _assert(st_loaded.state_hash() == h_saved, "loaded .flscene state_hash must match saved scene bit-for-bit")
+    var scanned = st_loaded.scan_asset_browser(dir_path=tmp_root, pack_path=pack_path)
+    _assert(scanned >= 2, "scan_asset_browser must discover pack & workspace entries")
+    print("    [OK] Hardened PNG decoder, async AssetServer & Studio .flscene round-trip passed!")
+
+
 def main() raises:
     var t0 = get_time()
     var pid = Int(external_call["getpid", Int32]())
@@ -1418,9 +1568,10 @@ def main() raises:
     test_e_undo_redo_50_and_pie_120_ticks()
     test_f_mcp_v2_end_to_end(tmp_root, pool)
     test_g_audit_regressions()
+    test_h_wave2_png_async_studio_scene(tmp_root, pack_path, pool)
 
     pool.stop()
     _rm_rf_tmp(tmp_root)
 
     var elapsed_ms = (get_time() - t0) * 1000.0
-    print("[Flint v5 Track 5] ALL 7 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")
+    print("[Flint v5 Track 5] ALL 8 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")
