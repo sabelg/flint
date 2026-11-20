@@ -37,6 +37,7 @@ compile_mojo() {
     local src="$1"
     local out="$2"
     local opt="${3:--O3}"
+    local extra_inc="${4-__DEFAULT_TESTS__}"
     local tmp
     tmp="$(mktemp "/tmp/flint-link-$(basename "$out")-XXXXXX")"
     rm -f "$tmp" "$out"
@@ -44,7 +45,13 @@ compile_mojo() {
     if [[ "${FLINT_WERROR:-1}" != "0" ]]; then
         werror_args=("--Werror")
     fi
-    if ! "$MOJO_BIN" build "$src" -o "$tmp" -I "${ROOT}/src" -I "${ROOT}/tests" "$opt" --fp-mode contract=off "${werror_args[@]}"; then
+    local inc_args=("-I" "${ROOT}/src")
+    if [[ "$extra_inc" == "__DEFAULT_TESTS__" ]]; then
+        inc_args+=("-I" "${ROOT}/tests")
+    elif [[ -n "$extra_inc" ]]; then
+        inc_args+=("-I" "$extra_inc")
+    fi
+    if ! "$MOJO_BIN" build "$src" -o "$tmp" "${inc_args[@]}" "$opt" --fp-mode contract=off "${werror_args[@]}"; then
         rm -f "$tmp"
         return 1  # also when called from an `if`, where `set -e` does not stop us
     fi
@@ -125,7 +132,7 @@ cmd_build() {
         echo "[Flint] Building examples/pack_cli/main.mojo -> build/flint-pack ..."
         compile_mojo "${ROOT}/examples/pack_cli/main.mojo" "${ROOT}/build/flint-pack"
     fi
-    if [[ "$target" == "all" || "$target" == "test" ]]; then
+    if [[ "$target" == "all" || "$target" == "test" || "$target" == "unit" ]]; then
         echo "[Flint] Building tests/test_flint.mojo -> build/flint-test ..."
         compile_mojo "${ROOT}/tests/test_flint.mojo" "${ROOT}/build/flint-test"
     fi
@@ -167,7 +174,7 @@ cmd_test() {
         echo "[Flint] Running Flint Engine E2E test suite..."
         "${ROOT}/build/flint-e2e"
     elif [[ "$sub" == "unit" ]]; then
-        cmd_build test
+        cmd_build unit
         echo "[Flint] Running Flint Engine unit test suite..."
         "${ROOT}/build/flint-test"
     elif [[ "$sub" == "v5" ]]; then
@@ -253,6 +260,10 @@ cmd_studio() {
     fi
     cmd_build studio
     exec "${ROOT}/build/flint-studio" "$@"
+}
+
+cmd_mcp() {
+    cmd_studio --mcp-stdio "$@"
 }
 
 cmd_doctor() {
@@ -463,8 +474,12 @@ cmd_preview() {
     rebuild() {
         touch "$stamp"  # edits saved while compiling trigger the next rebuild
         local started=$SECONDS
+        local preview_inc=""
+        if [[ "$run_dir" != "$ROOT" && -d "${run_dir}/src" ]]; then
+            preview_inc="${run_dir}/src"
+        fi
         echo "[Preview] Building ${src#${run_dir}/} (${opt}) ..."
-        if compile_mojo "$src" "${bin}.next" "$opt"; then
+        if compile_mojo "$src" "${bin}.next" "$opt" "$preview_inc"; then
             echo "[Preview] Built in $((SECONDS - started)) s."
             stop_child
             if mv -f "${bin}.next" "$bin"; then
@@ -669,6 +684,7 @@ case "$subcmd" in
     test)    cmd_test "$@" ;;
     lab)     cmd_lab "$@" ;;
     studio)  cmd_studio "$@" ;;
+    mcp)     cmd_mcp "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     play)    cmd_play "$@" ;;
     world)   cmd_world "$@" ;;
@@ -687,6 +703,7 @@ case "$subcmd" in
         echo "  doctor               Check Mojo 1.2 toolchain, Vulkan ICD, Wayland/X11/KMS, Audio, evdev & inotify"
         echo "  lab <name|all> [--fast] Compile & run subsystem lab (physics|anim|render|audio_ui|net|all)"
         echo "  studio [...]         Build and launch Flint Studio visual editor / MCP v2 host"
+        echo "  mcp [...]            Build and launch Flint Studio headless MCP v2 stdio server"
         echo "  build [all|spark|world|studio|kms|kms3d|pack|test|v5|cycles] Compile standalone targets (-O3 --Werror)"
         echo "  test [unit|e2e|v5]   Build and run standalone Flint Engine verification suites"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"

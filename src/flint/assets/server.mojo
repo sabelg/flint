@@ -11,7 +11,7 @@ Architecture:
     and reloads modified `.png` / `.glb` / `.hdr` / `.ttf` / `.wav` / raw assets in-place under the exact same `Handle[T]`
     while bumping `reload_epoch++`.
 """
-from std.collections import Optional
+from std.collections import Dict, Optional
 from flint.assets.cooker_v2 import (
     cook_hdr_texture_bundle,
     cook_png_texture_bundle,
@@ -35,8 +35,8 @@ from flint.assets.flpk_v3 import (
     clone_geometry_pool,
     decode_audio_pcm_slab,
     decode_bvh8_collider_slab,
-    decode_cooked_mesh_slab,
-    decode_cooked_mesh_slab_ptr,
+    decode_cooked_mesh_slab_into,
+    decode_cooked_mesh_slab_ptr_into,
     decode_texture_tail_slab,
     load_or_init_flmeta,
     mip_to_sub_id,
@@ -212,6 +212,8 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
     var slot_cpu_bytes: List[Int]
     var slot_vram_bytes: List[Int]
     var free_slots: List[UInt32]
+    var path_to_slot: Dict[String, Int]
+    var uuid_to_slot: Dict[String, Int]
     var live_count: Int
     var cpu_live_bytes: Int
     var vram_live_bytes: Int
@@ -229,10 +231,35 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         self.slot_cpu_bytes = List[Int]()
         self.slot_vram_bytes = List[Int]()
         self.free_slots = List[UInt32]()
+        self.path_to_slot = Dict[String, Int]()
+        self.uuid_to_slot = Dict[String, Int]()
         self.live_count = 0
         self.cpu_live_bytes = 0
         self.vram_live_bytes = 0
         self.live_bytes = 0
+
+    @staticmethod
+    @always_inline
+    def _uuid_key(uuid: AssetUuid) -> String:
+        return String(uuid.hi) + ":" + String(uuid.lo)
+
+    def find_slot_by_path(self, rel_path: String) -> Int:
+        var found = self.path_to_slot.get(rel_path)
+        if found:
+            var s = found.value()
+            if s >= 0 and s < len(self.occupied) and self.occupied[s] and self.rel_paths[s] == rel_path:
+                return s
+        return -1
+
+    def find_slot_by_uuid(self, uuid: AssetUuid) -> Int:
+        if uuid.hi == 0 and uuid.lo == 0:
+            return -1
+        var found = self.uuid_to_slot.get(Self._uuid_key(uuid))
+        if found:
+            var s = found.value()
+            if s >= 0 and s < len(self.occupied) and self.occupied[s] and self.uuids[s] == uuid:
+                return s
+        return -1
 
     def allocate_queued(
         mut self,
@@ -253,6 +280,10 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
             self.rel_paths[slot] = rel_path
             self.slot_cpu_bytes[slot] = 0
             self.slot_vram_bytes[slot] = 0
+            if rel_path.byte_length() > 0:
+                self.path_to_slot[rel_path] = slot
+            if uuid.hi != 0 or uuid.lo != 0:
+                self.uuid_to_slot[Self._uuid_key(uuid)] = slot
             self.live_count += 1
             return Handle[Self.T](UInt32(slot), gen)
 
@@ -268,6 +299,10 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         self.rel_paths.append(rel_path)
         self.slot_cpu_bytes.append(0)
         self.slot_vram_bytes.append(0)
+        if rel_path.byte_length() > 0:
+            self.path_to_slot[rel_path] = slot
+        if uuid.hi != 0 or uuid.lo != 0:
+            self.uuid_to_slot[Self._uuid_key(uuid)] = slot
         self.live_count += 1
         return Handle[Self.T](UInt32(slot), gen)
 
@@ -402,6 +437,23 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
     def _evict_slot_index(mut self, s: Int):
         var cpu_b = self.slot_cpu_bytes[s]
         var vram_b = self.slot_vram_bytes[s]
+        var old_path = self.rel_paths[s]
+        var old_uuid = self.uuids[s]
+        if old_path.byte_length() > 0:
+            var p_hit = self.path_to_slot.get(old_path)
+            if p_hit and p_hit.value() == s:
+                try:
+                    _ = self.path_to_slot.pop(old_path)
+                except:
+                    pass
+        if old_uuid.hi != 0 or old_uuid.lo != 0:
+            var uk = Self._uuid_key(old_uuid)
+            var u_hit = self.uuid_to_slot.get(uk)
+            if u_hit and u_hit.value() == s:
+                try:
+                    _ = self.uuid_to_slot.pop(uk)
+                except:
+                    pass
         # Assigning None runs `T.__deinit__` immediately, freeing all underlying payload buffers!
         self.payloads[s] = None
         self.slot_cpu_bytes[s] = 0
@@ -420,21 +472,33 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         self.vram_live_bytes = max(0, self.vram_live_bytes - vram_b)
         self.live_bytes = self.cpu_live_bytes + self.vram_live_bytes
 
+    def oldest_unreferenced(self) -> Tuple[Int, UInt64]:
+        """Returns `(slot_idx, last_used_tick)` of the oldest occupied unreferenced slot, or `(-1, UINT64_MAX)`."""
+        var oldest_s = -1
+        var oldest_tick = UInt64(0xFFFFFFFFFFFFFFFF)
+        for s in range(len(self.occupied)):
+            if self.occupied[s] and self.ref_counts[s] <= 0:
+                if self.last_used_tick[s] < oldest_tick:
+                    oldest_tick = self.last_used_tick[s]
+                    oldest_s = s
+        return (oldest_s, oldest_tick)
+
+    def evict_slot(mut self, s: Int) -> Int:
+        if s < 0 or s >= len(self.occupied) or not self.occupied[s]:
+            return 0
+        var freed = self.slot_cpu_bytes[s] + self.slot_vram_bytes[s]
+        self._evict_slot_index(s)
+        return freed
+
     def evict_lru_unreferenced(mut self, target_max_bytes: Int) -> List[AssetUuid]:
         """Evicts `ref_count == 0` slots in LRU (`oldest last_used_tick`) order until `live_bytes <= target_max_bytes`."""
         var evicted = List[AssetUuid]()
         while self.live_bytes > target_max_bytes:
-            var oldest_s = -1
-            var oldest_tick = UInt64(0xFFFFFFFFFFFFFFFF)
-            for s in range(len(self.occupied)):
-                if self.occupied[s] and self.ref_counts[s] <= 0:
-                    if self.last_used_tick[s] < oldest_tick:
-                        oldest_tick = self.last_used_tick[s]
-                        oldest_s = s
-            if oldest_s < 0:
+            var cand = self.oldest_unreferenced()
+            if cand[0] < 0:
                 break
-            evicted.append(self.uuids[oldest_s])
-            self._evict_slot_index(oldest_s)
+            evicted.append(self.uuids[cand[0]])
+            self._evict_slot_index(cand[0])
         return evicted^
 
 
@@ -529,24 +593,24 @@ struct AssetServer(Movable):
     # ---- Mesh Loading ----
 
     def load_mesh_by_uuid(mut self, uuid: AssetUuid) -> Handle[CookedMeshAsset]:
-        for s in range(len(self.meshes.occupied)):
-            if self.meshes.occupied[s] and self.meshes.uuids[s] == uuid:
-                var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
-                _ = self.meshes.retain(h)
-                self.meshes.last_used_tick[s] = self.current_tick
-                return h
+        var s = self.meshes.find_slot_by_uuid(uuid)
+        if s >= 0:
+            var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
+            _ = self.meshes.retain(h)
+            self.meshes.last_used_tick[s] = self.current_tick
+            return h
         var loc = self._find_in_mounts_by_uuid(uuid, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] < 0:
             return Handle[CookedMeshAsset]()
         return self._decode_and_store_mesh_from_mount(loc[0], loc[1])
 
     def load_mesh(mut self, rel_path: String) -> Handle[CookedMeshAsset]:
-        for s in range(len(self.meshes.occupied)):
-            if self.meshes.occupied[s] and self.meshes.rel_paths[s] == rel_path:
-                var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
-                _ = self.meshes.retain(h)
-                self.meshes.last_used_tick[s] = self.current_tick
-                return h
+        var s = self.meshes.find_slot_by_path(rel_path)
+        if s >= 0:
+            var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
+            _ = self.meshes.retain(h)
+            self.meshes.last_used_tick[s] = self.current_tick
+            return h
 
         var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
@@ -559,10 +623,9 @@ struct AssetServer(Movable):
                 var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_MESH)
                 var b = cook_single_source_bytes(raw, meta, rel_path)
                 if b.valid and len(b.chunks) > 0:
-                    var dec = decode_cooked_mesh_slab(b.chunks[0].raw_payload)
+                    var asset = CookedMeshAsset()
+                    var dec = decode_cooked_mesh_slab_into(b.chunks[0].raw_payload, asset.geom)
                     if dec[0]:
-                        var asset = CookedMeshAsset()
-                        asset.geom = clone_geometry_pool(dec[2])
                         if len(b.chunks) > 1 and b.chunks[1].sub_id == SUB_ID_BVH8_COLLIDER:
                             var cdec = decode_bvh8_collider_slab(b.chunks[1].raw_payload)
                             asset.has_collider = cdec[0]
@@ -575,21 +638,19 @@ struct AssetServer(Movable):
         var rpath = self.mounts[mount_idx].entry_path(toc_idx)
         var asset = CookedMeshAsset()
 
-        # Zero-copy mmap decode when CHUNK_COMP_NONE!
+        # Zero-copy mmap decode directly into `asset.geom` (zero `clone_geometry_pool` overhead!)
         var zc = self.mounts[mount_idx].mmap_slice_by_toc(toc_idx, verify_crc=True)
         if zc.valid:
-            var dec_z = decode_cooked_mesh_slab_ptr(zc.addr, zc.size)
+            var dec_z = decode_cooked_mesh_slab_ptr_into(zc.addr, zc.size, asset.geom)
             if not dec_z[0]:
                 return Handle[CookedMeshAsset]()
-            asset.geom = clone_geometry_pool(dec_z[2])
         else:
             var pay = self.mounts[mount_idx].read_payload_by_toc(toc_idx, verify_crc=True)
             if not pay[0]:
                 return Handle[CookedMeshAsset]()
-            var dec = decode_cooked_mesh_slab(pay[1])
+            var dec = decode_cooked_mesh_slab_into(pay[1], asset.geom)
             if not dec[0]:
                 return Handle[CookedMeshAsset]()
-            asset.geom = clone_geometry_pool(dec[2])
 
         var col_loc = self._find_in_mounts_by_uuid(entry.uuid, SUB_ID_BVH8_COLLIDER)
         if col_loc[0] >= 0:
@@ -605,12 +666,12 @@ struct AssetServer(Movable):
     # ---- Texture Loading & Progressive Mip Streaming ----
 
     def load_texture(mut self, rel_path: String, progressive: Bool = True) -> Handle[CookedTextureAsset]:
-        for s in range(len(self.textures.occupied)):
-            if self.textures.occupied[s] and self.textures.rel_paths[s] == rel_path:
-                var h = Handle[CookedTextureAsset](UInt32(s), self.textures.generations[s])
-                _ = self.textures.retain(h)
-                self.textures.last_used_tick[s] = self.current_tick
-                return h
+        var s = self.textures.find_slot_by_path(rel_path)
+        if s >= 0:
+            var h = Handle[CookedTextureAsset](UInt32(s), self.textures.generations[s])
+            _ = self.textures.retain(h)
+            self.textures.last_used_tick[s] = self.current_tick
+            return h
 
         var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
@@ -718,12 +779,77 @@ struct AssetServer(Movable):
 
     # ---- Font, Audio, HDR & Raw Loading ----
 
+    def load_hdr(mut self, rel_path: String) -> Handle[CookedHdrAsset]:
+        var s = self.hdrs.find_slot_by_path(rel_path)
+        if s >= 0:
+            var h = Handle[CookedHdrAsset](UInt32(s), self.hdrs.generations[s])
+            _ = self.hdrs.retain(h)
+            self.hdrs.last_used_tick[s] = self.current_tick
+            return h
+
+        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        if loc[0] >= 0:
+            var entry = self.mounts[loc[0]].toc_entry(loc[1])
+            var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
+            if not pay[0]:
+                return Handle[CookedHdrAsset]()
+            var dec = decode_texture_tail_slab(pay[1])
+            if not dec[0]:
+                return Handle[CookedHdrAsset]()
+            var hdr = dec[1].copy()
+            var asset = CookedHdrAsset()
+            asset.width = Int(hdr.width)
+            asset.height = Int(hdr.height)
+            asset.mip_count = Int(hdr.mip_count)
+            asset.tail_first_mip = Int(hdr.tail_first_mip)
+            asset.resident_min_mip = Int(hdr.tail_first_mip)
+            asset.mip_sizes = hdr.mip_sizes.copy()
+            asset.mips = dec[2].copy()
+            var m = Int(hdr.tail_first_mip) - 1
+            while m >= 0:
+                var mloc = self._find_in_mounts_by_uuid(entry.uuid, mip_to_sub_id(m))
+                if mloc[0] < 0:
+                    mloc = self._find_in_mounts_by_path(rel_path, mip_to_sub_id(m))
+                if mloc[0] >= 0:
+                    var mpay = self.mounts[mloc[0]].read_payload_by_toc(mloc[1], verify_crc=True)
+                    if mpay[0] and m < len(asset.mips):
+                        asset.mips[m] = mpay[1].copy()
+                        asset.resident_min_mip = m
+                m -= 1
+            return self.hdrs.insert(asset^, entry.uuid, rel_path, self.current_tick)
+
+        if self.loose_root.byte_length() > 0:
+            var full = self.loose_root + "/" + rel_path
+            var raw = read_bytes(full)
+            if len(raw) > 0:
+                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_HDR)
+                var cooked = cook_hdr_texture_bundle(raw, meta, rel_path)
+                if cooked.valid and len(cooked.chunks) > 0:
+                    var dec = decode_texture_tail_slab(cooked.chunks[0].raw_payload)
+                    if dec[0]:
+                        var hdr = dec[1].copy()
+                        var asset = CookedHdrAsset()
+                        asset.width = Int(hdr.width)
+                        asset.height = Int(hdr.height)
+                        asset.mip_count = Int(hdr.mip_count)
+                        asset.tail_first_mip = Int(hdr.tail_first_mip)
+                        asset.resident_min_mip = 0
+                        asset.mip_sizes = hdr.mip_sizes.copy()
+                        asset.mips = dec[2].copy()
+                        for ci in range(1, len(cooked.chunks)):
+                            var sub_m = Int(cooked.chunks[ci].sub_id) - 1
+                            if sub_m >= 0 and sub_m < len(asset.mips):
+                                asset.mips[sub_m] = cooked.chunks[ci].raw_payload.copy()
+                        return self.hdrs.insert(asset^, meta.uuid, rel_path, self.current_tick)
+        return Handle[CookedHdrAsset]()
+
     def load_font(mut self, rel_path: String) -> Handle[CookedFontAsset]:
-        for s in range(len(self.fonts.occupied)):
-            if self.fonts.occupied[s] and self.fonts.rel_paths[s] == rel_path:
-                var h = Handle[CookedFontAsset](UInt32(s), self.fonts.generations[s])
-                _ = self.fonts.retain(h)
-                return h
+        var s = self.fonts.find_slot_by_path(rel_path)
+        if s >= 0:
+            var h = Handle[CookedFontAsset](UInt32(s), self.fonts.generations[s])
+            _ = self.fonts.retain(h)
+            self.fonts.last_used_tick[s] = self.current_tick
+            return h
         var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
             var e = self.mounts[loc[0]].toc_entry(loc[1])
@@ -736,11 +862,12 @@ struct AssetServer(Movable):
         return Handle[CookedFontAsset]()
 
     def load_audio(mut self, rel_path: String) -> Handle[CookedAudioAsset]:
-        for s in range(len(self.audios.occupied)):
-            if self.audios.occupied[s] and self.audios.rel_paths[s] == rel_path:
-                var h = Handle[CookedAudioAsset](UInt32(s), self.audios.generations[s])
-                _ = self.audios.retain(h)
-                return h
+        var s = self.audios.find_slot_by_path(rel_path)
+        if s >= 0:
+            var h = Handle[CookedAudioAsset](UInt32(s), self.audios.generations[s])
+            _ = self.audios.retain(h)
+            self.audios.last_used_tick[s] = self.current_tick
+            return h
         var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
             var e = self.mounts[loc[0]].toc_entry(loc[1])
@@ -756,12 +883,12 @@ struct AssetServer(Movable):
         return Handle[CookedAudioAsset]()
 
     def load_raw(mut self, rel_path: String) -> Handle[RawBytesAsset]:
-        for s in range(len(self.raws.occupied)):
-            if self.raws.occupied[s] and self.raws.rel_paths[s] == rel_path:
-                var h = Handle[RawBytesAsset](UInt32(s), self.raws.generations[s])
-                _ = self.raws.retain(h)
-                self.raws.last_used_tick[s] = self.current_tick
-                return h
+        var s = self.raws.find_slot_by_path(rel_path)
+        if s >= 0:
+            var h = Handle[RawBytesAsset](UInt32(s), self.raws.generations[s])
+            _ = self.raws.retain(h)
+            self.raws.last_used_tick[s] = self.current_tick
+            return h
         var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
             var e = self.mounts[loc[0]].toc_entry(loc[1])
@@ -785,65 +912,135 @@ struct AssetServer(Movable):
         if len(raw) == 0:
             return False
 
-        # Check textures
-        for s in range(len(self.textures.occupied)):
-            if self.textures.occupied[s] and self.textures.rel_paths[s] == rel_path:
-                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_TEXTURE)
-                var cooked = cook_png_texture_bundle(raw, meta, rel_path)
-                if cooked.valid and len(cooked.chunks) > 0:
-                    var dec = decode_texture_tail_slab(cooked.chunks[0].raw_payload)
-                    if dec[0]:
-                        var hdr = dec[1].copy()
-                        var asset = CookedTextureAsset()
-                        asset.width = Int(hdr.width)
-                        asset.height = Int(hdr.height)
-                        asset.mip_count = Int(hdr.mip_count)
-                        asset.tail_first_mip = Int(hdr.tail_first_mip)
-                        asset.resident_min_mip = 0
-                        asset.tex_format = hdr.tex_format
-                        asset.mip_sizes = hdr.mip_sizes.copy()
-                        asset.mips = dec[2].copy()
-                        for ci in range(1, len(cooked.chunks)):
-                            var sm = Int(cooked.chunks[ci].sub_id) - 1
-                            if sm >= 0 and sm < len(asset.mips):
-                                asset.mips[sm] = cooked.chunks[ci].raw_payload.copy()
-                        var h = Handle[CookedTextureAsset](UInt32(s), self.textures.generations[s])
-                        if self.textures.replace_in_place(h, asset^, self.current_tick):
-                            self.hot_reloads_applied += 1
-                            return True
+        # Check textures (O(1) lookup)
+        var ts = self.textures.find_slot_by_path(rel_path)
+        if ts >= 0:
+            var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_TEXTURE)
+            var cooked = cook_png_texture_bundle(raw, meta, rel_path)
+            if cooked.valid and len(cooked.chunks) > 0:
+                var dec = decode_texture_tail_slab(cooked.chunks[0].raw_payload)
+                if dec[0]:
+                    var hdr = dec[1].copy()
+                    var asset = CookedTextureAsset()
+                    asset.width = Int(hdr.width)
+                    asset.height = Int(hdr.height)
+                    asset.mip_count = Int(hdr.mip_count)
+                    asset.tail_first_mip = Int(hdr.tail_first_mip)
+                    asset.resident_min_mip = 0
+                    asset.tex_format = hdr.tex_format
+                    asset.mip_sizes = hdr.mip_sizes.copy()
+                    asset.mips = dec[2].copy()
+                    for ci in range(1, len(cooked.chunks)):
+                        var sm = Int(cooked.chunks[ci].sub_id) - 1
+                        if sm >= 0 and sm < len(asset.mips):
+                            asset.mips[sm] = cooked.chunks[ci].raw_payload.copy()
+                    var h = Handle[CookedTextureAsset](UInt32(ts), self.textures.generations[ts])
+                    if self.textures.replace_in_place(h, asset^, self.current_tick):
+                        self.hot_reloads_applied += 1
+                        return True
 
-        # Check meshes
-        for s in range(len(self.meshes.occupied)):
-            if self.meshes.occupied[s] and self.meshes.rel_paths[s] == rel_path:
-                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_MESH)
-                var b = cook_single_source_bytes(raw, meta, rel_path)
-                if b.valid and len(b.chunks) > 0:
-                    var dec = decode_cooked_mesh_slab(b.chunks[0].raw_payload)
-                    if dec[0]:
-                        var asset = CookedMeshAsset()
-                        asset.geom = clone_geometry_pool(dec[2])
-                        if len(b.chunks) > 1 and b.chunks[1].sub_id == SUB_ID_BVH8_COLLIDER:
-                            var cdec = decode_bvh8_collider_slab(b.chunks[1].raw_payload)
-                            asset.has_collider = cdec[0]
-                            asset.collider = cdec[1].copy()
-                        var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
-                        if self.meshes.replace_in_place(h, asset^, self.current_tick):
-                            self.hot_reloads_applied += 1
-                            return True
+        # Check meshes (O(1) lookup)
+        var ms = self.meshes.find_slot_by_path(rel_path)
+        if ms >= 0:
+            var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_MESH)
+            var b = cook_single_source_bytes(raw, meta, rel_path)
+            if b.valid and len(b.chunks) > 0:
+                var asset = CookedMeshAsset()
+                var dec = decode_cooked_mesh_slab_into(b.chunks[0].raw_payload, asset.geom)
+                if dec[0]:
+                    if len(b.chunks) > 1 and b.chunks[1].sub_id == SUB_ID_BVH8_COLLIDER:
+                        var cdec = decode_bvh8_collider_slab(b.chunks[1].raw_payload)
+                        asset.has_collider = cdec[0]
+                        asset.collider = cdec[1].copy()
+                    var h = Handle[CookedMeshAsset](UInt32(ms), self.meshes.generations[ms])
+                    if self.meshes.replace_in_place(h, asset^, self.current_tick):
+                        self.hot_reloads_applied += 1
+                        return True
 
-        # Check raw bytes
-        for s in range(len(self.raws.occupied)):
-            if self.raws.occupied[s] and self.raws.rel_paths[s] == rel_path:
-                var h = Handle[RawBytesAsset](UInt32(s), self.raws.generations[s])
-                if self.raws.replace_in_place(h, RawBytesAsset(raw.copy()), self.current_tick):
-                    self.hot_reloads_applied += 1
-                    return True
+        # Check HDRs (O(1) lookup)
+        var hs = self.hdrs.find_slot_by_path(rel_path)
+        if hs >= 0:
+            var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_HDR)
+            var cooked = cook_hdr_texture_bundle(raw, meta, rel_path)
+            if cooked.valid and len(cooked.chunks) > 0:
+                var dec = decode_texture_tail_slab(cooked.chunks[0].raw_payload)
+                if dec[0]:
+                    var hdr = dec[1].copy()
+                    var asset = CookedHdrAsset()
+                    asset.width = Int(hdr.width)
+                    asset.height = Int(hdr.height)
+                    asset.mip_count = Int(hdr.mip_count)
+                    asset.tail_first_mip = Int(hdr.tail_first_mip)
+                    asset.resident_min_mip = 0
+                    asset.mip_sizes = hdr.mip_sizes.copy()
+                    asset.mips = dec[2].copy()
+                    for ci in range(1, len(cooked.chunks)):
+                        var sm = Int(cooked.chunks[ci].sub_id) - 1
+                        if sm >= 0 and sm < len(asset.mips):
+                            asset.mips[sm] = cooked.chunks[ci].raw_payload.copy()
+                    var h = Handle[CookedHdrAsset](UInt32(hs), self.hdrs.generations[hs])
+                    if self.hdrs.replace_in_place(h, asset^, self.current_tick):
+                        self.hot_reloads_applied += 1
+                        return True
+
+        # Check raw bytes (O(1) lookup)
+        var rs = self.raws.find_slot_by_path(rel_path)
+        if rs >= 0:
+            var h = Handle[RawBytesAsset](UInt32(rs), self.raws.generations[rs])
+            if self.raws.replace_in_place(h, RawBytesAsset(raw.copy()), self.current_tick):
+                self.hot_reloads_applied += 1
+                return True
 
         return False
 
+    def enforce_lru_budget(mut self) -> Int:
+        """Evicts globally oldest unreferenced (`ref_count == 0`) assets across ALL 6 pools
+        until `total_resident_bytes() <= lru_max_bytes`. Returns count of evicted assets."""
+        var evicted_count = 0
+        while self.total_resident_bytes() > self.lru_max_bytes:
+            var best_pool = -1
+            var best_slot = -1
+            var best_tick = UInt64(0xFFFFFFFFFFFFFFFF)
+
+            var c0 = self.meshes.oldest_unreferenced()
+            if c0[0] >= 0 and c0[1] < best_tick:
+                best_pool = 0; best_slot = c0[0]; best_tick = c0[1]
+            var c1 = self.textures.oldest_unreferenced()
+            if c1[0] >= 0 and c1[1] < best_tick:
+                best_pool = 1; best_slot = c1[0]; best_tick = c1[1]
+            var c2 = self.hdrs.oldest_unreferenced()
+            if c2[0] >= 0 and c2[1] < best_tick:
+                best_pool = 2; best_slot = c2[0]; best_tick = c2[1]
+            var c3 = self.fonts.oldest_unreferenced()
+            if c3[0] >= 0 and c3[1] < best_tick:
+                best_pool = 3; best_slot = c3[0]; best_tick = c3[1]
+            var c4 = self.audios.oldest_unreferenced()
+            if c4[0] >= 0 and c4[1] < best_tick:
+                best_pool = 4; best_slot = c4[0]; best_tick = c4[1]
+            var c5 = self.raws.oldest_unreferenced()
+            if c5[0] >= 0 and c5[1] < best_tick:
+                best_pool = 5; best_slot = c5[0]
+
+            if best_pool < 0:
+                break
+            if best_pool == 0:
+                _ = self.meshes.evict_slot(best_slot)
+            elif best_pool == 1:
+                _ = self.textures.evict_slot(best_slot)
+            elif best_pool == 2:
+                _ = self.hdrs.evict_slot(best_slot)
+            elif best_pool == 3:
+                _ = self.fonts.evict_slot(best_slot)
+            elif best_pool == 4:
+                _ = self.audios.evict_slot(best_slot)
+            else:
+                _ = self.raws.evict_slot(best_slot)
+            evicted_count += 1
+        return evicted_count
+
     def tick(mut self, now: Float64 = -1.0) -> Int:
         """Advances progressive mip/LOD streaming within `stream_budget_bytes_per_tick`, polls
-        `AssetWatcher` for live hot-reloads, and enforces LRU memory budget. Returns chunks/reloads processed."""
+        `AssetWatcher` for live hot-reloads, and enforces global cross-pool LRU memory budget."""
         self.current_tick += 1
         var work_done = 0
 
@@ -861,19 +1058,8 @@ struct AssetServer(Movable):
             if self._hot_reload_path(rel_p):
                 work_done += 1
 
-        # 3. Enforce LRU memory ceiling across unreferenced assets
-        var total_live = (
-            self.meshes.live_bytes
-            + self.textures.live_bytes
-            + self.hdrs.live_bytes
-            + self.fonts.live_bytes
-            + self.audios.live_bytes
-            + self.raws.live_bytes
-        )
-        if total_live > self.lru_max_bytes:
-            _ = self.textures.evict_lru_unreferenced(self.lru_max_bytes // 2)
-            _ = self.meshes.evict_lru_unreferenced(self.lru_max_bytes // 2)
-            _ = self.raws.evict_lru_unreferenced(self.lru_max_bytes // 2)
+        # 3. Enforce global cross-pool LRU memory ceiling across all 6 pools
+        _ = self.enforce_lru_budget()
 
         return work_done
 

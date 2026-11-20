@@ -10,6 +10,7 @@ Implements:
      and `sweep_catenary_cable`.
 """
 from std.math import acos, cos, max, min, sin, sqrt
+from flint.core.detmath import det_atan2
 from flint.core.math import Vec2, Vec3
 from flint.assets.model import NativeMesh
 from flint.assets.mesh_builder import MeshBuilder
@@ -608,6 +609,39 @@ def compute_rmf_frames(
         ri1 = ui1.cross(ti1).normalized()
         rights[i + 1] = ri1
         ups[i + 1] = ui1
+
+    # Distribute closed-loop holonomy twist error uniformly around the loop to eliminate seam discontinuity
+    if closed_loop and n >= 3:
+        var v1 = path_pts[0] - path_pts[n - 1]
+        var c1 = v1.length_squared()
+        var ti = tangs[n - 1]
+        var ti1 = tangs[0]
+        var ri = rights[n - 1]
+        var r_end: Vec3
+        if c1 < Float32(1e-12):
+            r_end = ri
+        else:
+            var r_l = ri - v1 * ((Float32(2.0) / c1) * v1.dot(ri))
+            var t_l = ti - v1 * ((Float32(2.0) / c1) * v1.dot(ti))
+            var v2 = ti1 - t_l
+            var c2 = v2.length_squared()
+            var r_tmp = r_l - v2 * ((Float32(2.0) / c2) * v2.dot(r_l)) if c2 > Float32(1e-12) else r_l
+            var u_tmp = ti1.cross(r_tmp).normalized()
+            r_end = u_tmp.cross(ti1).normalized()
+        var cos_a = r_end.dot(rights[0])
+        var sin_a = r_end.dot(ups[0])
+        var twist_err = det_atan2(sin_a, cos_a)
+        if abs(twist_err) > Float32(1e-6):
+            var inv_n = Float32(1.0) / Float32(n)
+            for i in range(1, n):
+                var ang = -twist_err * (Float32(i) * inv_n)
+                var ca = cos(ang)
+                var sa = sin(ang)
+                var ri_new = (rights[i] * ca + ups[i] * sa).normalized()
+                var ui_new = tangs[i].cross(ri_new).normalized()
+                ri_new = ui_new.cross(tangs[i]).normalized()
+                rights[i] = ri_new
+                ups[i] = ui_new
 
     return (rights^, ups^, tangs^)
 

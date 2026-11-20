@@ -41,7 +41,14 @@ from flint.assets.hdr_image import encode_radiance_hdr
 from flint.assets.image import write_png
 from flint.assets.json import parse_json
 from flint.assets.mesh_builder import MeshBuilder
-from flint.assets.server import AssetServer, RawBytesAsset, TypedAssetStorage
+from flint.assets.server import (
+    AssetServer,
+    CookedHdrAsset,
+    CookedTextureAsset,
+    RawBytesAsset,
+    TypedAssetStorage,
+)
+from flint.assets.watcher import AssetWatcher, IN_CLOSE_WRITE, IN_IGNORED, IN_Q_OVERFLOW
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool
 from flint.core.lz4 import address_of
@@ -94,6 +101,7 @@ from flint.studio import (
     snap_angle_deg,
     snap_translation,
 )
+from flint.ui.context import UiContext, format_float2, pack_rgba8
 from flint.ui.draw_list import UiDrawList
 
 
@@ -1291,6 +1299,107 @@ def _run_large_mcp_pair(
     xfer.keep_alive()
 
 
+def _append_u32_le(mut buf: List[UInt8], v: UInt32):
+    buf.append(UInt8(v & UInt32(0xFF)))
+    buf.append(UInt8((v >> UInt32(8)) & UInt32(0xFF)))
+    buf.append(UInt8((v >> UInt32(16)) & UInt32(0xFF)))
+    buf.append(UInt8((v >> UInt32(24)) & UInt32(0xFF)))
+
+
+def test_g_audit_regressions() raises:
+    print("  [g] Testing drag_float3 formatting, UiContext GC, despawn reparenting, cross-pool LRU & watcher zero-len resilience...")
+
+    # 1. drag_float3 / format_float2 formatting regressions
+    _assert(format_float2(Float32(0.05)) == "0.05", "format_float2(0.05) must be '0.05', got: " + format_float2(Float32(0.05)))
+    _assert(format_float2(Float32(-0.5)) == "-0.50", "format_float2(-0.5) must be '-0.50', got: " + format_float2(Float32(-0.5)))
+    _assert(format_float2(Float32(-0.001)) == "0.00", "format_float2(-0.001) must be '0.00'")
+    _assert(format_float2(Float32(-1.05)) == "-1.05", "format_float2(-1.05) must be '-1.05'")
+    _assert(format_float2(Float32(12.34)) == "12.34", "format_float2(12.34) must be '12.34'")
+
+    # 2. Unified 0xAARRGGBB color packing
+    _assert(pack_rgba8(255, 32, 64, 255) == UInt32(0xFFFF2040), "pack_rgba8 must pack 0xAARRGGBB")
+
+    # 3. UiContext frame-epoch GC evicts stale cached_rects & state_map entries
+    var uctx = UiContext()
+    uctx.gc_stale_frames = 2
+    var inp = InputState()
+    uctx.begin_frame(inp, 800.0, 600.0, 1.0 / 60.0)
+    var s_tmp = String("temp")
+    _ = uctx.text_input("ephemeral_input", s_tmp, 120.0)
+    uctx.end_frame()
+    _assert(len(uctx.cached_rects) >= 1 and len(uctx.state_map) >= 1, "ephemeral widget must populate caches")
+    for _ in range(5):
+        uctx.begin_frame(inp, 800.0, 600.0, 1.0 / 60.0)
+        uctx.end_frame()
+    _assert(len(uctx.cached_rects) == 0 and len(uctx.state_map) == 0, "UiContext frame-epoch GC must evict stale entries")
+
+    # 4. Studio despawn_entity detaches child parent_ids & undo/redo restores cleanly
+    var st = FlintStudioState()
+    var pid = st.spawn_entity("ParentNode", record_undo=True)
+    var cid = st.spawn_entity("ChildNode", parent_id=pid, record_undo=True)
+    var h_before = st.state_hash()
+    _assert(st.despawn_entity(pid, record_undo=True), "despawn parent failed")
+    _assert(st.entities[cid].parent_id == -1, "despawn_entity must detach live children to parent_id == -1")
+    _assert(st.undo() and st.entities[cid].parent_id == pid and st.state_hash() == h_before, "undo despawn must restore child parent_id")
+    _assert(st.redo() and st.entities[cid].parent_id == -1, "redo despawn must re-detach child parent_id")
+
+    # 5. Cross-pool LRU eviction (40% + 40% + 30% = 110% > 100%, each pool < 50%!)
+    var srv = AssetServer(stream_budget_bytes_per_tick=4096, lru_max_bytes=100000, enable_watcher=False)
+    var tex_a = CookedTextureAsset()
+    tex_a.mips.append(List[UInt8](length=40000, fill=UInt8(1)))
+    var h_tex = srv.textures.insert(tex_a^, AssetUuid.from_path("lru_tex.png"), "lru_tex.png", tick=1)
+    _ = srv.textures.release(h_tex)
+
+    var hdr_a = CookedHdrAsset()
+    hdr_a.mips.append(List[UInt8](length=40000, fill=UInt8(2)))
+    var h_hdr = srv.hdrs.insert(hdr_a^, AssetUuid.from_path("lru_sky.hdr"), "lru_sky.hdr", tick=2)
+    _ = srv.hdrs.release(h_hdr)
+
+    var h_raw = srv.raws.insert(RawBytesAsset(List[UInt8](length=30000, fill=UInt8(3))), AssetUuid.from_path("lru_blob.bin"), "lru_blob.bin", tick=3)
+    _ = srv.raws.release(h_raw)
+
+    _assert(srv.total_resident_bytes() == 110000, "pre-eviction resident bytes must be 110000")
+    _ = srv.tick(now=1.0)
+    _assert(
+        srv.total_resident_bytes() <= srv.lru_max_bytes,
+        "cross-pool LRU eviction must bring total_resident_bytes <= lru_max_bytes (got " + String(srv.total_resident_bytes()) + ")",
+    )
+    _assert(not srv.textures.is_alive(h_tex), "oldest unreferenced asset (tick=1 texture) must be evicted first")
+    _assert(srv.hdrs.is_alive(h_hdr) and srv.raws.is_alive(h_raw), "newer unreferenced assets should remain within budget")
+
+    # 6. AssetWatcher zero-length inotify event resilience (IN_Q_OVERFLOW + IN_IGNORED before valid file event)
+    var w = AssetWatcher(enabled=False)
+    w.watch_descriptors.append(Int32(7))
+    w.watch_folders.append("/tmp/fake_root")
+    w.watch_roots.append("/tmp/fake_root")
+    var ev_buf = List[UInt8]()
+    # Event 1: IN_Q_OVERFLOW (wd = -1, len = 0)
+    _append_u32_le(ev_buf, UInt32(0xFFFFFFFF))
+    _append_u32_le(ev_buf, IN_Q_OVERFLOW)
+    _append_u32_le(ev_buf, UInt32(0))
+    _append_u32_le(ev_buf, UInt32(0))
+    # Event 2: IN_IGNORED (wd = 7, len = 0)
+    _append_u32_le(ev_buf, UInt32(7))
+    _append_u32_le(ev_buf, IN_IGNORED)
+    _append_u32_le(ev_buf, UInt32(0))
+    _append_u32_le(ev_buf, UInt32(0))
+    # Event 3: Valid IN_CLOSE_WRITE for "hero.png" (wd = 7, len = 16 padded with NULs)
+    _append_u32_le(ev_buf, UInt32(7))
+    _append_u32_le(ev_buf, IN_CLOSE_WRITE)
+    _append_u32_le(ev_buf, UInt32(0))
+    _append_u32_le(ev_buf, UInt32(16))
+    var fname = String("hero.png")
+    for b in fname.as_bytes():
+        ev_buf.append(b)
+    for _ in range(16 - fname.byte_length()):
+        ev_buf.append(UInt8(0))
+
+    var parsed = w.process_inotify_buffer(ev_buf, len(ev_buf), 10.0)
+    _assert(parsed == 3, "must parse all 3 inotify events without breaking on zero-length events")
+    _assert(len(w.pending_paths) == 1 and w.pending_paths[0] == "hero.png", "hero.png must survive preceding IN_Q_OVERFLOW/IN_IGNORED events")
+    print("    [OK] drag_float3 formatting, UiContext GC, despawn reparenting, cross-pool LRU & watcher zero-len resilience passed!")
+
+
 def main() raises:
     var t0 = get_time()
     var pid = Int(external_call["getpid", Int32]())
@@ -1308,9 +1417,10 @@ def main() raises:
     test_d_analytical_3d_gizmos()
     test_e_undo_redo_50_and_pie_120_ticks()
     test_f_mcp_v2_end_to_end(tmp_root, pool)
+    test_g_audit_regressions()
 
     pool.stop()
     _rm_rf_tmp(tmp_root)
 
     var elapsed_ms = (get_time() - t0) * 1000.0
-    print("[Flint v5 Track 5] ALL 6 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")
+    print("[Flint v5 Track 5] ALL 7 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")

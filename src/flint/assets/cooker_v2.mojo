@@ -10,6 +10,8 @@ import settings + cooker version) and packs them into zero-parse `.flpk` v3 arch
   - SDF TrueType `.dsf` font atlases & RIFF/WAVE PCM slabs (`CHUNK_COMP_LZ4`).
 """
 from std.ffi import external_call
+from std.math import pow
+from std.memory import bitcast
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool
 from flint.core.math import Vec3
@@ -50,7 +52,7 @@ from flint.assets.flpk_v3 import (
 )
 from flint.assets.glb_native import parse_native_glb
 from flint.assets.hdr_image import decode_hdr_or_exr
-from flint.assets.image import decode_png
+from flint.assets.jpeg import decode_image_auto
 from flint.assets.meshlet import AaaGeometryPool
 from flint.assets.model import NativeModel
 from flint.physics.bvh import Bvh8MeshCollider
@@ -330,23 +332,86 @@ def _downsample_hdr_2x(hdr: List[Vec3], w: Int, h: Int) -> Tuple[List[Vec3], Int
     return (out^, nw, nh)
 
 
+@always_inline
+def _srgb_u8_to_linear(v: Int) -> Float32:
+    var s = Float32(max(0, min(255, v))) / Float32(255.0)
+    if s <= Float32(0.04045):
+        return s / Float32(12.92)
+    return pow((s + Float32(0.055)) / Float32(1.055), Float32(2.4))
+
+
+@always_inline
+def _linear_to_srgb_u8(v: Float32) -> Int:
+    var c = max(Float32(0.0), min(Float32(1.0), v))
+    var s = c * Float32(12.92) if c <= Float32(0.0031308) else (Float32(1.055) * pow(c, Float32(1.0 / 2.4)) - Float32(0.055))
+    return max(0, min(255, Int(s * Float32(255.0) + Float32(0.5))))
+
+
+def _downsample_argb_2x_srgb(pixels: List[UInt32], w: Int, h: Int) -> Tuple[List[UInt32], Int, Int]:
+    """2x box filter for sRGB `0xAARRGGBB` textures in physically-correct linear RGB space."""
+    var nw = max(1, w >> 1)
+    var nh = max(1, h >> 1)
+    var out = List[UInt32](length=nw * nh, fill=UInt32(0))
+    for y in range(nh):
+        var y0 = min(h - 1, y * 2)
+        var y1 = min(h - 1, y * 2 + 1)
+        for x in range(nw):
+            var x0 = min(w - 1, x * 2)
+            var x1 = min(w - 1, x * 2 + 1)
+            var p0 = pixels[y0 * w + x0]
+            var p1 = pixels[y0 * w + x1]
+            var p2 = pixels[y1 * w + x0]
+            var p3 = pixels[y1 * w + x1]
+            var a = (Int((p0 >> 24) & 0xFF) + Int((p1 >> 24) & 0xFF) + Int((p2 >> 24) & 0xFF) + Int((p3 >> 24) & 0xFF) + 2) >> 2
+            var r_lin = (
+                _srgb_u8_to_linear(Int((p0 >> 16) & 0xFF))
+                + _srgb_u8_to_linear(Int((p1 >> 16) & 0xFF))
+                + _srgb_u8_to_linear(Int((p2 >> 16) & 0xFF))
+                + _srgb_u8_to_linear(Int((p3 >> 16) & 0xFF))
+            ) * Float32(0.25)
+            var g_lin = (
+                _srgb_u8_to_linear(Int((p0 >> 8) & 0xFF))
+                + _srgb_u8_to_linear(Int((p1 >> 8) & 0xFF))
+                + _srgb_u8_to_linear(Int((p2 >> 8) & 0xFF))
+                + _srgb_u8_to_linear(Int((p3 >> 8) & 0xFF))
+            ) * Float32(0.25)
+            var b_lin = (
+                _srgb_u8_to_linear(Int(p0 & 0xFF))
+                + _srgb_u8_to_linear(Int(p1 & 0xFF))
+                + _srgb_u8_to_linear(Int(p2 & 0xFF))
+                + _srgb_u8_to_linear(Int(p3 & 0xFF))
+            ) * Float32(0.25)
+            var r = _linear_to_srgb_u8(r_lin)
+            var g = _linear_to_srgb_u8(g_lin)
+            var b = _linear_to_srgb_u8(b_lin)
+            out[y * nw + x] = (UInt32(a) << 24) | (UInt32(r) << 16) | (UInt32(g) << 8) | UInt32(b)
+    return (out^, nw, nh)
+
+
 def cook_png_texture_bundle(
     png_bytes: List[UInt8],
     meta: AssetMeta,
     rel_path: String,
 ) -> CookedAssetBundle:
-    """Cooks a `.png` into streamable `BC7` (or `BC5` normal) mip sub-chunks (`sub_id = 0` tail + `1..15` high-res mips)."""
+    """Cooks a `.png` / `.jpg` / `.jpeg` into streamable `BC7` (or `BC5` normal) mip sub-chunks (`sub_id = 0` tail + `1..15` high-res mips)."""
     var bundle = CookedAssetBundle()
     bundle.uuid = meta.uuid
     bundle.rel_path = rel_path
     bundle.asset_kind = ASSET_KIND_TEXTURE
 
-    var img = decode_png(png_bytes, max(256, meta.max_tex_dim))
+    var img = decode_image_auto(png_bytes, max(256, meta.max_tex_dim))
     if not img.valid or img.width <= 0 or img.height <= 0:
-        bundle.error = "failed to decode PNG: " + rel_path
+        bundle.error = "failed to decode image: " + rel_path
         return bundle^
 
-    var is_normal = rel_path.endswith("_normal.png") or rel_path.endswith("_nrm.png")
+    var is_normal = (
+        rel_path.endswith("_normal.png")
+        or rel_path.endswith("_nrm.png")
+        or rel_path.endswith("_normal.jpg")
+        or rel_path.endswith("_nrm.jpg")
+        or rel_path.endswith("_normal.jpeg")
+        or rel_path.endswith("_nrm.jpeg")
+    )
     var mips = List[List[UInt8]]()
     var cw = img.width
     var ch = img.height
@@ -379,7 +444,7 @@ def cook_png_texture_bundle(
             mips.append(encode_bc7_rgba(cur_px, cw, ch, multi_mode=True))
             if (not meta.generate_mips) or (cw <= 4 and ch <= 4):
                 break
-            var ds = downsample_argb_2x(cur_px, cw, ch)
+            var ds = _downsample_argb_2x_srgb(cur_px, cw, ch) if meta.srgb else downsample_argb_2x(cur_px, cw, ch)
             cur_px = ds[0].copy()
             cw = ds[1]
             ch = ds[2]
@@ -496,7 +561,12 @@ def cook_single_source_bytes(
             bad.error = "invalid GLB: " + rel_path
             return bad^
         return cook_native_model_bundle(mdl, meta, rel_path)
-    if meta.asset_kind == ASSET_KIND_TEXTURE or rel_path.endswith(".png"):
+    if (
+        meta.asset_kind == ASSET_KIND_TEXTURE
+        or rel_path.endswith(".png")
+        or rel_path.endswith(".jpg")
+        or rel_path.endswith(".jpeg")
+    ):
         return cook_png_texture_bundle(source_bytes, meta, rel_path)
     if meta.asset_kind == ASSET_KIND_HDR or rel_path.endswith(".hdr") or rel_path.endswith(".exr"):
         return cook_hdr_texture_bundle(source_bytes, meta, rel_path)
@@ -598,16 +668,47 @@ def _cook_worker_body(ctx_addr: Int, task_idx: Int):
         meta.build_collider = slot.proc_collider
         meta.source_path = slot.rel_path
 
-        # Deterministic content key over procedural mesh vertex/index counts & positions
-        var sig_bytes = List[UInt8]()
+        # Deterministic content key over FULL procedural mesh geometry (all positions, normals, UVs, indices)
+        var geom_h = UInt64(0xCBF29CE484222325)
+        var prime = UInt64(0x100000001B3)
+        var total_pos = 0
+        var total_idx = 0
         for mi in range(len(slot.proc_model.meshes)):
             ref m = slot.proc_model.meshes[mi]
-            var vc = len(m.positions)
-            for pi in range(min(64, vc)):
-                var bits = Int(m.positions[pi] * Float32(1024.0))
-                sig_bytes.append(UInt8(bits & 0xFF))
-                sig_bytes.append(UInt8((bits >> 8) & 0xFF))
-            sig_bytes.append(UInt8(len(m.indices) & 0xFF))
+            total_pos += len(m.positions)
+            total_idx += len(m.indices)
+            geom_h ^= UInt64(len(m.positions))
+            geom_h *= prime
+            for pi in range(len(m.positions)):
+                var bits = UInt64(bitcast[DType.uint32, 1](m.positions[pi]))
+                geom_h ^= bits
+                geom_h *= prime
+            geom_h ^= UInt64(len(m.normals))
+            geom_h *= prime
+            for ni in range(len(m.normals)):
+                var bits = UInt64(bitcast[DType.uint32, 1](m.normals[ni]))
+                geom_h ^= bits
+                geom_h *= prime
+            geom_h ^= UInt64(len(m.texcoords))
+            geom_h *= prime
+            for ui in range(len(m.texcoords)):
+                var bits = UInt64(bitcast[DType.uint32, 1](m.texcoords[ui]))
+                geom_h ^= bits
+                geom_h *= prime
+            geom_h ^= UInt64(len(m.indices))
+            geom_h *= prime
+            for ii in range(len(m.indices)):
+                geom_h ^= UInt64(m.indices[ii])
+                geom_h *= prime
+        var sig_bytes = List[UInt8](capacity=20)
+        for sh in range(8):
+            sig_bytes.append(UInt8((geom_h >> UInt64(sh * 8)) & UInt64(0xFF)))
+        for sh in range(4):
+            sig_bytes.append(UInt8((total_pos >> (sh * 8)) & 0xFF))
+        for sh in range(4):
+            sig_bytes.append(UInt8((total_idx >> (sh * 8)) & 0xFF))
+        for sh in range(4):
+            sig_bytes.append(UInt8((len(slot.proc_model.meshes) >> (sh * 8)) & 0xFF))
         var key = compute_cook_cache_key(sig_bytes, meta)
         var cache_file = slot.cache_dir + "/" + key + ".flcook"
         if not slot.force_recook:
@@ -647,7 +748,7 @@ def _classify_asset_ext(name: String) -> Tuple[Bool, UInt8]:
         return (False, ASSET_KIND_RAW)
     if name.endswith(".glb"):
         return (True, ASSET_KIND_MESH)
-    if name.endswith(".png"):
+    if name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg"):
         return (True, ASSET_KIND_TEXTURE)
     if name.endswith(".hdr") or name.endswith(".exr"):
         return (True, ASSET_KIND_HDR)
@@ -773,7 +874,8 @@ def cook_workspace(
         return rep^
 
     # Fast-path stamp index check (`< 1 ms` 100% cache hit when workspace & output archive are untouched!)
-    var index_path = cache_dir + "/workspace_stamp.bin"
+    var out_u = AssetUuid.from_path(output_flpk)
+    var index_path = cache_dir + "/workspace_stamp_" + String(out_u.hi) + "_" + String(out_u.lo) + ".bin"
     var cur_sig = _compute_workspace_fast_signature(output_flpk, full_paths, len(procedural_items))
     var out_stamp = file_stamp(output_flpk)
     if (not force_recook) and len(procedural_items) == 0 and out_stamp[0] >= 64:

@@ -68,12 +68,26 @@ comptime UI_KEY_RIGHT_CTRL: Int = 345
 
 @always_inline
 def pack_rgba8(r: Int, g: Int, b: Int, a: Int = 255) -> UInt32:
-    """Packs `[0..255]` channels into `0xAABBGGRR` matching `aaa_ui_overlay_shader`."""
+    """Packs `[0..255]` channels into `0xAARRGGBB` matching `aaa_ui_overlay_shader`."""
     var cr = UInt32(max(0, min(255, r)))
     var cg = UInt32(max(0, min(255, g)))
     var cb = UInt32(max(0, min(255, b)))
     var ca = UInt32(max(0, min(255, a)))
-    return cr | (cg << 8) | (cb << 16) | (ca << 24)
+    return cb | (cg << 8) | (cr << 16) | (ca << 24)
+
+
+def format_float2(v: Float32) -> String:
+    """Formats a `Float32` with 2 fixed decimal places (`0.05` -> `"0.05"`, `-0.5` -> `"-0.50"`)."""
+    var neg = v < Float32(0.0)
+    var mag = -v if neg else v
+    var scaled = Int(mag * Float32(100.0) + Float32(0.5))
+    if scaled == 0:
+        neg = False
+    var whole = scaled // 100
+    var frac = scaled % 100
+    var sign = "-" if neg else ""
+    var fstr = ("0" + String(frac)) if frac < 10 else String(frac)
+    return sign + String(whole) + "." + fstr
 
 
 @always_inline
@@ -223,14 +237,20 @@ struct UiContext(Movable):
     # Retain-cached two-pass Flexbox layout
     var flex: FlexTree
     var cached_rects: Dict[UInt64, RectF]
+    var cached_rect_epochs: Dict[UInt64, UInt64]
     var next_frame_ids: List[UInt64]
     var next_frame_flex_idxs: List[Int]
+    var dock_flex_root_idxs: List[Int]
+    var dock_flex_root_rects: List[RectF]
     var box_stack: List[_BoxScope]
     var id_stack: List[UInt64]
     var scroll_stack: List[_ScrollScope]
     # Retained per-widget state
     var state_map: Dict[UInt64, RetainedWidgetState]
+    var state_epochs: Dict[UInt64, UInt64]
     var open_tree_rows: Dict[Int, Bool]  # Fast int-keyed open set for 100k virtualized outliners
+    var frame_epoch: UInt64
+    var gc_stale_frames: UInt64
     # Pointer, keyboard & gamepad frame snapshot
     var screen_w: Float32
     var screen_h: Float32
@@ -287,13 +307,19 @@ struct UiContext(Movable):
         self.theme = UiTheme.game_hud() if preset_hud else UiTheme.dark_studio()
         self.flex = FlexTree()
         self.cached_rects = Dict[UInt64, RectF]()
+        self.cached_rect_epochs = Dict[UInt64, UInt64]()
         self.next_frame_ids = List[UInt64]()
         self.next_frame_flex_idxs = List[Int]()
+        self.dock_flex_root_idxs = List[Int]()
+        self.dock_flex_root_rects = List[RectF]()
         self.box_stack = List[_BoxScope]()
         self.id_stack = List[UInt64]()
         self.scroll_stack = List[_ScrollScope]()
         self.state_map = Dict[UInt64, RetainedWidgetState]()
+        self.state_epochs = Dict[UInt64, UInt64]()
         self.open_tree_rows = Dict[Int, Bool]()
+        self.frame_epoch = 0
+        self.gc_stale_frames = 120
         self.screen_w = 1280.0
         self.screen_h = 720.0
         self.dt = 1.0 / 60.0
@@ -349,10 +375,13 @@ struct UiContext(Movable):
         screen_h: Float32 = 720.0,
         dt: Float32 = 1.0 / 60.0,
     ):
+        self.frame_epoch += 1
         self.draw_list.clear()
         self.flex.clear()
         self.next_frame_ids.clear()
         self.next_frame_flex_idxs.clear()
+        self.dock_flex_root_idxs.clear()
+        self.dock_flex_root_rects.clear()
         self.box_stack.clear()
         self.id_stack.clear()
         self.scroll_stack.clear()
@@ -417,14 +446,49 @@ struct UiContext(Movable):
         self.id_stack.append(UInt64(0xCBF29CE484222325))
 
     def end_frame(mut self):
-        # Solve full FlexTree and retain-cache all solved RectFs for next frame
+        # Solve full FlexTree (+ detached DockSpace panel roots) and retain-cache all solved RectFs for next frame
         if len(self.flex.nodes) > 0:
             self.flex.solve(RectF(0.0, 0.0, self.screen_w, self.screen_h), 0)
+            for d_i in range(len(self.dock_flex_root_idxs)):
+                self.flex.solve(self.dock_flex_root_rects[d_i], self.dock_flex_root_idxs[d_i])
             for i in range(len(self.next_frame_ids)):
                 var wid = self.next_frame_ids[i]
                 var fi = self.next_frame_flex_idxs[i]
                 if fi >= 0 and fi < len(self.flex.nodes):
                     self.cached_rects[wid] = self.flex.nodes[fi].rect
+                    self.cached_rect_epochs[wid] = self.frame_epoch
+
+        # Frame-epoch GC for unused `cached_rects` and `state_map` entries
+        var sweep_stride = max(UInt64(1), min(UInt64(30), self.gc_stale_frames))
+        if self.frame_epoch > self.gc_stale_frames and (self.frame_epoch % sweep_stride) == 0:
+            var cutoff = self.frame_epoch - self.gc_stale_frames
+            var stale_rects = List[UInt64]()
+            for item in self.cached_rect_epochs.items():
+                if item.value < cutoff:
+                    stale_rects.append(item.key)
+            for k in stale_rects:
+                try:
+                    _ = self.cached_rects.pop(k)
+                except:
+                    pass
+                try:
+                    _ = self.cached_rect_epochs.pop(k)
+                except:
+                    pass
+
+            var stale_states = List[UInt64]()
+            for item in self.state_epochs.items():
+                if item.value < cutoff:
+                    stale_states.append(item.key)
+            for k in stale_states:
+                try:
+                    _ = self.state_map.pop(k)
+                except:
+                    pass
+                try:
+                    _ = self.state_epochs.pop(k)
+                except:
+                    pass
 
         # Focus navigation (strictly trapped inside modal_focusables whenever a modal was active this frame!)
         var modal_was_open = len(self.modal_focusables) > 0 or self.active_modal_id != 0
@@ -508,6 +572,7 @@ struct UiContext(Movable):
             self.focused_id = wid
 
     def _get_state(mut self, wid: UInt64) -> RetainedWidgetState:
+        self.state_epochs[wid] = self.frame_epoch
         var found = self.state_map.get(wid)
         if found:
             return found.value()
@@ -669,7 +734,9 @@ struct UiContext(Movable):
         var st = FlexStyle.col(gap=4.0, pad=6.0)
         st.fixed_w = content.w
         st.fixed_h = content.h
-        var f_idx = self.flex.add_node(0, st, content.w, content.h)
+        var f_idx = self.flex.add_node(-1, st, content.w, content.h)
+        self.dock_flex_root_idxs.append(f_idx)
+        self.dock_flex_root_rects.append(content)
         self.box_stack.append(
             _BoxScope(
                 wid,
@@ -988,8 +1055,7 @@ struct UiContext(Movable):
                 changed = True
             self.draw_list.add_rect(cr.x, cr.y, cr.w, cr.h, self.theme.bg_widget, 3.0, 1.0, self.theme.border)
             self.draw_list.add_rect(cr.x, cr.y, 3.0, cr.h, axis_cols[c], 1.5)
-            var iv = Int(vals[c] * Float32(100.0))
-            var txt = String(iv // 100) + "." + String(abs(iv % 100))
+            var txt = format_float2(vals[c])
             self._draw_text(txt, cr.x + Float32(6.0), cr.y + Float32(2.0), self.theme.font_size * Float32(0.88), self.theme.text_primary)
 
         if changed:

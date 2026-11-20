@@ -1366,15 +1366,17 @@ def encode_cooked_mesh_slab(pool: AaaGeometryPool) -> List[UInt8]:
     return out^
 
 
-def decode_cooked_mesh_slab_ptr(addr: Int, size: Int) -> Tuple[Bool, CookedMeshSlabHeader, AaaGeometryPool]:
+def decode_cooked_mesh_slab_ptr_into(
+    addr: Int, size: Int, mut pool: AaaGeometryPool
+) -> Tuple[Bool, CookedMeshSlabHeader]:
+    """Decodes a cooked mesh slab directly into `pool` with zero intermediate `clone_geometry_pool` copies."""
     var hdr = CookedMeshSlabHeader()
-    var pool = AaaGeometryPool()
     if addr == 0 or size < 64:
-        return (False, hdr, pool^)
+        return (False, hdr)
     hdr.magic = _ptr_u32(addr, 0)
     hdr.version = _ptr_u32(addr, 4)
     if hdr.magic != COOKED_MESH_SLAB_MAGIC or hdr.version != 1:
-        return (False, hdr, pool^)
+        return (False, hdr)
     hdr.mesh_count = _ptr_u32(addr, 8)
     hdr.meshlet_cluster_count = _ptr_u32(addr, 12)
     hdr.vertex_word_count = _ptr_u32(addr, 16)
@@ -1399,10 +1401,10 @@ def decode_cooked_mesh_slab_ptr(addr: Int, size: Int) -> Tuple[Bool, CookedMeshS
         or mwc_u64 > 268_435_456
         or mwc_u64 != mlc_u64 * UInt64(AAA_MESHLET_WORDS)
     ):
-        return (False, hdr, pool^)
+        return (False, hdr)
     var needed_u64 = UInt64(64) + mc_u64 * 120 + mlc_u64 * 60 + (vwc_u64 + iwc_u64 + mwc_u64) * 4
     if needed_u64 > UInt64(size):
-        return (False, hdr, pool^)
+        return (False, hdr)
     var mc = Int(mc_u64)
     var mlc = Int(mlc_u64)
     var vwc = Int(vwc_u64)
@@ -1410,6 +1412,7 @@ def decode_cooked_mesh_slab_ptr(addr: Int, size: Int) -> Tuple[Bool, CookedMeshS
     var mwc = Int(mwc_u64)
 
     var cur = 64
+    pool.meshes.clear()
     pool.meshes.reserve(mc)
     for _ in range(mc):
         var m = CookedMeshEntry()
@@ -1436,6 +1439,7 @@ def decode_cooked_mesh_slab_ptr(addr: Int, size: Int) -> Tuple[Bool, CookedMeshS
             m.lods[l] = MeshLodSlice(fm, mc_l, tc_l, oe)
         pool.meshes.append(m^)
 
+    pool.meshlets.clear()
     pool.meshlets.reserve(mlc)
     for _ in range(mlc):
         var ml = MeshletCluster()
@@ -1458,19 +1462,36 @@ def decode_cooked_mesh_slab_ptr(addr: Int, size: Int) -> Tuple[Bool, CookedMeshS
         ml.parent_error = float32_from_bits(_ptr_u32(addr, cur)); cur += 4
         pool.meshlets.append(ml^)
 
+    pool.vertex_words.clear()
     if vwc > 0:
         pool.vertex_words.resize(unsafe_uninit_length=vwc)
         _ = external_call["memcpy", Int](Int(pool.vertex_words.unsafe_ptr()), addr + cur, Int64(vwc * 4))
         cur += vwc * 4
+    pool.index_words.clear()
     if iwc > 0:
         pool.index_words.resize(unsafe_uninit_length=iwc)
         _ = external_call["memcpy", Int](Int(pool.index_words.unsafe_ptr()), addr + cur, Int64(iwc * 4))
         cur += iwc * 4
+    pool.meshlet_words.clear()
     if mwc > 0:
         pool.meshlet_words.resize(unsafe_uninit_length=mwc)
         _ = external_call["memcpy", Int](Int(pool.meshlet_words.unsafe_ptr()), addr + cur, Int64(mwc * 4))
         cur += mwc * 4
-    return (True, hdr, pool^)
+    return (True, hdr)
+
+
+def decode_cooked_mesh_slab_ptr(addr: Int, size: Int) -> Tuple[Bool, CookedMeshSlabHeader, AaaGeometryPool]:
+    var pool = AaaGeometryPool()
+    var res = decode_cooked_mesh_slab_ptr_into(addr, size, pool)
+    return (res[0], res[1], pool^)
+
+
+def decode_cooked_mesh_slab_into(data: List[UInt8], mut pool: AaaGeometryPool) -> Tuple[Bool, CookedMeshSlabHeader]:
+    if len(data) == 0:
+        return (False, CookedMeshSlabHeader())
+    var res = decode_cooked_mesh_slab_ptr_into(address_of(data), len(data), pool)
+    _ = len(data)
+    return res
 
 
 def clone_geometry_pool(src: AaaGeometryPool) -> AaaGeometryPool:
@@ -1484,11 +1505,9 @@ def clone_geometry_pool(src: AaaGeometryPool) -> AaaGeometryPool:
 
 
 def decode_cooked_mesh_slab(data: List[UInt8]) -> Tuple[Bool, CookedMeshSlabHeader, AaaGeometryPool]:
-    if len(data) == 0:
-        return (False, CookedMeshSlabHeader(), AaaGeometryPool())
-    var res = decode_cooked_mesh_slab_ptr(address_of(data), len(data))
-    _ = len(data)
-    return (res[0], res[1], clone_geometry_pool(res[2]))
+    var pool = AaaGeometryPool()
+    var res = decode_cooked_mesh_slab_into(data, pool)
+    return (res[0], res[1], pool^)
 
 
 @fieldwise_init

@@ -403,6 +403,9 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
 # 3. Reversible Coalesced `EditorTransaction` & `PieSession`
 # ============================================================================
 
+comptime MAX_UNDO_STACK: Int = 512
+
+
 struct EditorTransaction(Copyable, Movable):
     var op: Int
     var entity_id: Int
@@ -413,6 +416,7 @@ struct EditorTransaction(Copyable, Movable):
     var next_selected_id: Int
     var coalesce_key: UInt64
     var label: String
+    var reparented_child_ids: List[Int]
 
     def __init__(out self, op: Int = TX_PATCH_ENTITY, entity_id: Int = 0, label: String = "Edit"):
         self.op = op
@@ -424,6 +428,7 @@ struct EditorTransaction(Copyable, Movable):
         self.next_selected_id = -1
         self.coalesce_key = 0
         self.label = label
+        self.reparented_child_ids = List[Int]()
 
 
 struct PieSession(Copyable, Movable):
@@ -764,6 +769,8 @@ struct FlintStudioState(Movable, Serializable):
         var pid = self.entities[entity_id].parent_id
         var depth = 0
         while pid >= 0 and pid < len(self.entities) and depth < 16:
+            if not self.entities[pid].alive:
+                break
             var pm = self.entities[pid].local_matrix()
             local_m = pm.multiply(local_m)
             pid = self.entities[pid].parent_id
@@ -771,6 +778,15 @@ struct FlintStudioState(Movable, Serializable):
         return local_m^
 
     # ---- Reversible Coalesced Transaction Stack ----
+
+    def _push_undo(mut self, var tx: EditorTransaction):
+        self.undo_stack.append(tx^)
+        if len(self.undo_stack) > MAX_UNDO_STACK:
+            var excess = len(self.undo_stack) - MAX_UNDO_STACK
+            var trimmed = List[EditorTransaction](capacity=MAX_UNDO_STACK)
+            for i in range(excess, len(self.undo_stack)):
+                trimmed.append(self.undo_stack[i].copy())
+            self.undo_stack = trimmed^
 
     def spawn_entity(
         mut self,
@@ -827,7 +843,7 @@ struct FlintStudioState(Movable, Serializable):
 
         self.selected_entity_id = eid
         if record_undo:
-            self.undo_stack.append(tx^)
+            self._push_undo(tx^)
             self.redo_stack.clear()
         return eid
 
@@ -838,6 +854,11 @@ struct FlintStudioState(Movable, Serializable):
         tx.before_node = self.entities[entity_id].copy()
         tx.prev_selected_id = self.selected_entity_id
         self.entities[entity_id].alive = False
+        # Detach any live children so they are not orphaned with a dangling/reused parent_id
+        for i in range(len(self.entities)):
+            if self.entities[i].alive and self.entities[i].parent_id == entity_id:
+                self.entities[i].parent_id = -1
+                tx.reparented_child_ids.append(i)
         if self.selected_entity_id == entity_id:
             self.selected_entity_id = -1
             for i in range(len(self.entities)):
@@ -847,7 +868,7 @@ struct FlintStudioState(Movable, Serializable):
         tx.next_selected_id = self.selected_entity_id
         tx.after_node = self.entities[entity_id].copy()
         if record_undo:
-            self.undo_stack.append(tx^)
+            self._push_undo(tx^)
             self.redo_stack.clear()
         return True
 
@@ -876,7 +897,7 @@ struct FlintStudioState(Movable, Serializable):
         tx.next_selected_id = self.selected_entity_id
         tx.coalesce_key = coalesce_key
         self.entities[entity_id] = updated_node^
-        self.undo_stack.append(tx^)
+        self._push_undo(tx^)
         self.redo_stack.clear()
         return True
 
@@ -991,6 +1012,11 @@ struct FlintStudioState(Movable, Serializable):
         elif tx.op == TX_DESPAWN_ENTITY or tx.op == TX_PATCH_ENTITY:
             if tx.entity_id >= 0 and tx.entity_id < len(self.entities):
                 self.entities[tx.entity_id] = tx.before_node.copy()
+            if tx.op == TX_DESPAWN_ENTITY:
+                for ci in range(len(tx.reparented_child_ids)):
+                    var cid = tx.reparented_child_ids[ci]
+                    if cid >= 0 and cid < len(self.entities):
+                        self.entities[cid].parent_id = tx.entity_id
             self.selected_entity_id = tx.prev_selected_id
         self.redo_stack.append(tx^)
         return True
@@ -1009,8 +1035,13 @@ struct FlintStudioState(Movable, Serializable):
         elif tx.op == TX_DESPAWN_ENTITY or tx.op == TX_PATCH_ENTITY:
             if tx.entity_id >= 0 and tx.entity_id < len(self.entities):
                 self.entities[tx.entity_id] = tx.after_node.copy()
+            if tx.op == TX_DESPAWN_ENTITY:
+                for ci in range(len(tx.reparented_child_ids)):
+                    var cid = tx.reparented_child_ids[ci]
+                    if cid >= 0 and cid < len(self.entities):
+                        self.entities[cid].parent_id = -1
             self.selected_entity_id = tx.next_selected_id
-        self.undo_stack.append(tx^)
+        self._push_undo(tx^)
         return True
 
     # ---- Deterministic Physics Step & Analytical Raycast ----
@@ -1454,12 +1485,6 @@ def _fmt_f32_2dp(v: Float32) -> String:
     return sign + String(whole) + "." + fstr
 
 
-@always_inline
-def _abgr_to_argb(c: UInt32) -> UInt32:
-    """Converts `UiContext` `pack_rgba8` (`0xAABBGGRR`) to `FlintAaaVulkanRenderer` `0xAARRGGBB`."""
-    return (c & UInt32(0xFF00FF00)) | ((c & UInt32(0x000000FF)) << 16) | ((c >> 16) & UInt32(0x000000FF))
-
-
 def emit_studio_ui_draw_list(
     mut ui: UiDrawList,
     mut studio: FlintStudioState,
@@ -1479,12 +1504,11 @@ def emit_studio_ui_draw_list(
     var sw = Float32(max(320, screen_w))
     var sh = Float32(max(240, screen_h))
 
-    studio.ui_ctx.font = font.copy()
+    if (not studio.ui_ctx.font.valid) and font.valid:
+        studio.ui_ctx.font = font.copy()
     studio.ui_ctx.font_slot = font_slot
     studio.ui_ctx.theme.font_size = Float32(13.0)
     studio.ui_ctx.theme.row_height = Float32(22.0)
-    # Clear root-relative Flexbox cache so `DockSpace` panel coordinates govern every widget!
-    studio.ui_ctx.cached_rects.clear()
 
     studio.ui_ctx.begin_frame(input, sw, sh, dt)
     studio.ui_ctx.update_dock_space(studio.dock, RectF(0.0, 0.0, sw, sh))
@@ -1747,11 +1771,9 @@ def emit_studio_ui_draw_list(
 
     studio.ui_ctx.end_frame()
 
-    # Transfer `UiContext` GPU primitives to `ui`, converting `0xAABBGGRR` -> `0xAARRGGBB` & SDF gain!
+    # Transfer `UiContext` GPU primitives to `ui` (unified `0xAARRGGBB` packing; apply SDF glyph gain)
     for i in range(len(studio.ui_ctx.draw_list.prims)):
         var p = studio.ui_ctx.draw_list.prims[i]
-        p.fill_rgba8 = _abgr_to_argb(p.fill_rgba8)
-        p.secondary_rgba8 = _abgr_to_argb(p.secondary_rgba8)
         if (p.header & 0xF) == PRIM_GLYPH and p.param0 < Float32(0.5):
             p.param0 = max(Float32(1.5), p.param0 * Float32(255.0))
         ui.prims.append(p)

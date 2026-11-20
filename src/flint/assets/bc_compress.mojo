@@ -20,7 +20,15 @@ from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
-from flint.assets.vfs import encode_pack, pack_read
+from flint.assets.flpk_v3 import (
+    ASSET_KIND_TEXTURE,
+    CHUNK_COMP_NONE,
+    AssetUuid,
+    FlpkBuildChunk,
+    FlpkV3MappedArchive,
+    encode_flpk_v3,
+    mip_to_sub_id,
+)
 from flint.platform.os import write_bytes
 
 
@@ -1663,9 +1671,9 @@ def write_cooked_bc7_flpk(
     height: Int,
     mut pool: JobPool,
 ) -> Int:
-    """Cooks all `BC7` mip levels in parallel via `SIMD` + `JobPool` and packs each mip as a streamable `.flpk` chunk."""
-    var names = List[String]()
-    var chunks = List[List[UInt8]]()
+    """Cooks all `BC7` mip levels in parallel via `SIMD` + `JobPool` and packs each mip as a streamable `.flpk` v3 chunk."""
+    var chunks = List[FlpkBuildChunk]()
+    var uuid = AssetUuid.from_path(asset_key)
     var cur_px = pixels_argb.copy()
     var cw = width
     var ch = height
@@ -1673,8 +1681,9 @@ def write_cooked_bc7_flpk(
 
     while True:
         var bc7 = encode_bc7_rgba_simd(cur_px, cw, ch, pool, multi_mode=True)
-        names.append(asset_key + ".mip" + String(mip) + ".bc7")
-        chunks.append(bc7^)
+        chunks.append(
+            FlpkBuildChunk(uuid, asset_key, mip_to_sub_id(mip), ASSET_KIND_TEXTURE, bc7^, CHUNK_COMP_NONE)
+        )
         mip += 1
         if cw <= 4 and ch <= 4:
             break
@@ -1683,12 +1692,23 @@ def write_cooked_bc7_flpk(
         cw = ds[1]
         ch = ds[2]
 
-    var archive = encode_pack(names, chunks)
+    var archive = encode_flpk_v3(chunks, page_align=True)
     if not write_bytes(pack_file, archive):
         return 0
     return mip
 
 
 def stream_bc7_mip_from_flpk(pack_file: String, asset_key: String, mip_level: Int) -> List[UInt8]:
-    """Streams a single pre-cooked `BC7` mip chunk directly from `.flpk` with zero runtime re-compression."""
-    return pack_read(pack_file, asset_key + ".mip" + String(mip_level) + ".bc7")
+    """Streams a single pre-cooked `BC7` mip chunk directly from `.flpk` v3 with zero runtime re-compression."""
+    var arch = FlpkV3MappedArchive.open(pack_file)
+    if not arch.valid:
+        return List[UInt8]()
+    var toc = arch.find_by_path(asset_key, mip_to_sub_id(mip_level))
+    if toc < 0:
+        arch.close()
+        return List[UInt8]()
+    var pay = arch.read_payload_by_toc(toc, verify_crc=True)
+    arch.close()
+    if not pay[0]:
+        return List[UInt8]()
+    return pay[1].copy()
