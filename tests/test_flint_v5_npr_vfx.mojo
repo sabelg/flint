@@ -304,6 +304,15 @@ def test_gpu_cel_outlines_smear_and_vfx():
         "use_custom_light_dir lights front hemisphere despite backlit world sun (" + String(c_backlit.x) + " -> " + String(c_herolit.x) + ")",
     )
     ren.sun_dir = saved_sun
+
+    # A plain (e.g. glTF-uploaded, textured) material joins the toon look through update_cel_material.
+    var n_cel_before = len(ren.cel_materials)
+    var plain_id = ren.add_material(AaaMaterial(base_color=Vec3(0.6, 0.2, 0.2), roughness=0.6, metallic=0.0))
+    _assert(ren.update_cel_material(plain_id, cel_vc), "update_cel_material pairs a plain material with cel params")
+    _assert(len(ren.cel_materials) == n_cel_before + 1, "the plain material gained one cel entry")
+    _assert(ren.update_cel_material(plain_id, cel_vc), "updating it again edits that entry")
+    _assert(len(ren.cel_materials) == n_cel_before + 1, "a second update adds no entry")
+    _assert(not ren.update_cel_material(len(ren.materials) + 5, cel_vc), "an unknown material id is refused")
     print("  [PASS] Suite 3: GPU Cel (ILM + SSS + Custom Hero Light) & Variable-Width Outlines verified")
 
     # ------------------------------------------------------------------------

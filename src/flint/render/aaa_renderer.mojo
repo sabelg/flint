@@ -1859,7 +1859,21 @@ struct FlintAaaVulkanRenderer(Movable):
                     c.outline_material_id = AAA_CEL_NO_OUTLINE_MAT
                 self.cel_materials[i] = c^
                 return True
-        return False
+        # Not cel-shaded yet (an uploaded glTF material, textures and all): pair it with these
+        # params, so a loaded model can join a toon scene.
+        if mat_id < 0 or mat_id >= len(self.materials) or len(self.cel_materials) >= AAA_MAX_CEL_MATERIALS:
+            return False
+        var c = cel.copy()
+        c.material_id = mat_id
+        if c.outline_width_px > Float32(0.001):
+            var om = AaaMaterial(base_color=c.outline_color, roughness=1.0, metallic=0.0)
+            om.specular_factor = Float32(0.0)
+            var out_id = self.add_material(om)
+            c.outline_material_id = out_id if out_id >= 0 else AAA_CEL_NO_OUTLINE_MAT
+        else:
+            c.outline_material_id = AAA_CEL_NO_OUTLINE_MAT
+        self.cel_materials.append(c^)
+        return True
 
     def is_cel_outlined_material(self, mat_id: Int) -> Bool:
         for i in range(len(self.cel_materials)):
