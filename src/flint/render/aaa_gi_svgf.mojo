@@ -42,6 +42,7 @@ from flint.render.aaa_bsdf import (
     AAA_MATERIAL_WORDS,
     AAA_MAT_DET_NONE,
     AAA_MAT_INTERIOR_PARALLAX,
+    AAA_MAT_SSS_BIT,
     emit_direct_multilobe_bsdf,
     emit_iridescence_f0,
     emit_kaplanyan_specular_aa,
@@ -51,12 +52,15 @@ from flint.render.aaa_vsm import emit_vsm_pcss_shadow
 from flint.render.material_graph import (
     AAA_GLOBALS_DECAL_COUNT_WORD,
     AAA_GLOBALS_DECAL_TABLE_WORD,
+    AAA_GLOBALS_TERRAIN_CLIPMAP_WORD,
+    AAA_GLOBALS_TERRAIN_META_WORD,
     AAA_MAX_DECALS,
     DECAL_BLEND_ALBEDO,
     DECAL_BLEND_ROUGHNESS,
     DECAL_BLEND_STAIN_MULTIPLY,
     GPU_DECAL_VOLUME_WORDS,
 )
+from flint.render.aaa_post_tsr import AAA_POST_BLOOM_BASE
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.aaa_raytracing import (
     RAY_FLAG_OPAQUE_KHR,
@@ -903,15 +907,606 @@ def surface_cache_update_shader(enable_ray_query: Bool) -> List[UInt32]:
     return s.finish()
 
 
-def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
-    """Unified AAA Deferred `VisBuffer` Compute Material & Lighting Shader:
-    - Analytic 3-Ray Möller-Trumbore perspective-correct barycentrics + `ddx/ddy` UV gradients
-    - Bindless `16x` anisotropic `BC7` Albedo/ORM + `BC5` Macro & Micro-Detail `RNM` Normals
-    - Multi-Scatter Energy-Conserving GGX + Clearcoat + Thin-Film Iridescence + Sheen + SSS
-    - `16k` Virtual Shadow Maps (`PCSS`) + `SPV_KHR_ray_query` Contact Shadows, Reflections &
-      12-Ray Cosine-Hemisphere Lumen Surface-Cache Global Illumination!
-    Push[0] = render_w, Push[1] = render_h, Push[2] = gi_ray_count (e.g. 8 or 16).
+comptime AAA_SHADE_CLASS_SKY: Int = 0
+comptime AAA_SHADE_CLASS_UNLIT: Int = 1
+comptime AAA_SHADE_CLASS_STANDARD_PBR: Int = 2
+comptime AAA_SHADE_CLASS_FOLIAGE_SSS: Int = 3
+comptime AAA_SHADE_CLASS_COMPLEX: Int = 4
+comptime AAA_SHADE_CLASS_COUNT: Int = 5
+comptime AAA_SHADE_CLASS_ALL: Int = -1
+
+
+@always_inline
+def tile_classify_word_offset(max_pix: Int) -> Int:
+    return AAA_POST_BLOOM_BASE + max_pix * 8
+
+
+def _emit_classify_material_spv(
+    mut s: AaaSpirvModule,
+    b_materials: UInt32,
+    mat_id: UInt32,
+    n_mats: UInt32,
+) -> UInt32:
+    """Mutually exclusive material shade-class classifier matching `aaa_tile_classify_shader` and
+    `aaa_deferred_shade_class_shader` 100% identically:
+      1 = UNLIT (`word[19] < 0`)
+      4 = COMPLEX (`clearcoat > 0.001 || iridescence > 0.001 || max(sheen_color) > 0.001 || word[11] < 0 || interior_parallax`)
+      3 = FOLIAGE_SSS (`word[3] < 0 || word[7] < 0 || AAA_MAT_SSS_BIT`)
+      2 = STANDARD_PBR (default opaque PBR + terrain splat).
     """
+    var has_n = s.ine(n_mats, s.uint(0))
+    var eff_mat = s.select_u(has_n, s.umin(mat_id, s.isub(s.umax(n_mats, s.uint(1)), s.uint(1))), mat_id)
+    var m_base = s.imul(eff_mat, s.uint(UInt32(AAA_MATERIAL_WORDS)))
+
+    var w3 = s.load_float(b_materials, s.iadd(m_base, s.uint(3)))
+    var w6 = s.load_float(b_materials, s.iadd(m_base, s.uint(6)))
+    var w7 = s.load_float(b_materials, s.iadd(m_base, s.uint(7)))
+    var w11 = s.load_float(b_materials, s.iadd(m_base, s.uint(11)))
+    var w13 = s.load_float(b_materials, s.iadd(m_base, s.uint(13)))
+    var w16 = s.load_float(b_materials, s.iadd(m_base, s.uint(16)))
+    var w17 = s.load_float(b_materials, s.iadd(m_base, s.uint(17)))
+    var w18 = s.load_float(b_materials, s.iadd(m_base, s.uint(18)))
+    var w19 = s.load_float(b_materials, s.iadd(m_base, s.uint(19)))
+    var w23 = s.load_word(b_materials, s.iadd(m_base, s.uint(23)))
+
+    var is_unlit = s.flt(w19, s.float(0.0))
+    var max_sheen = s.nmax(w16, s.nmax(w17, w18))
+    var has_cc = s.fgt(w6, s.float(0.001))
+    var has_irid = s.fgt(w13, s.float(0.001))
+    var has_sheen = s.fgt(max_sheen, s.float(0.001))
+    var has_wet = s.flt(w11, s.float(0.0))
+    var has_par = s.ine(s.bit_and(w23, s.uint(AAA_MAT_INTERIOR_PARALLAX)), s.uint(0))
+    var is_complex = s.logical_or(
+        s.logical_or(has_cc, has_irid),
+        s.logical_or(has_sheen, s.logical_or(has_wet, has_par)),
+    )
+    var has_am = s.flt(w3, s.float(0.0))
+    var has_fol = s.flt(w7, s.float(0.0))
+    var has_sss = s.ine(s.bit_and(w23, s.uint(AAA_MAT_SSS_BIT)), s.uint(0))
+    var is_foliage = s.logical_or(has_am, s.logical_or(has_fol, has_sss))
+
+    return s.select_u(
+        is_unlit,
+        s.uint(UInt32(AAA_SHADE_CLASS_UNLIT)),
+        s.select_u(
+            is_complex,
+            s.uint(UInt32(AAA_SHADE_CLASS_COMPLEX)),
+            s.select_u(
+                is_foliage,
+                s.uint(UInt32(AAA_SHADE_CLASS_FOLIAGE_SSS)),
+                s.uint(UInt32(AAA_SHADE_CLASS_STANDARD_PBR)),
+            ),
+        ),
+    )
+
+
+def aaa_tile_classify_shader() -> List[UInt32]:
+    """8x8 LDS-reduced VisBuffer Material-ID Tile Classifier (`BIND_AAA_POST_SCRATCH`).
+    Push[0]=render_w, Push[1]=render_h, Push[2]=n_mats, Push[7]=tile_base, Push[8]=num_tiles.
+    """
+    var s = AaaSpirvModule(
+        MODEL_GL_COMPUTE,
+        group_width=8,
+        group_height=8,
+        push_words=AAA_PUSH_WORDS,
+        enable_bindless=False,
+        enable_ray_query=False,
+    )
+    var b_materials = s.buffer(BIND_AAA_MATERIALS)
+    var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
+    var vis_samp = s.sampled_image_2d(BIND_AAA_VIS_TEX, is_uint=True)
+
+    var px = s.invocation_axis(0)
+    var py = s.invocation_axis(1)
+    var lx = s.local_axis(0)
+    var ly = s.local_axis(1)
+    var lid = s.iadd(s.imul(ly, s.uint(8)), lx)
+    var wg_x = s.workgroup_axis(0)
+    var wg_y = s.workgroup_axis(1)
+
+    var w_u = s.push_word(0)
+    var h_u = s.push_word(1)
+    var n_mats = s.push_word(2)
+    var tile_base = s.push_word(7)
+    var num_tiles = s.push_word(8)
+
+    var my_mask = s.uvar(s.uint(0))
+    var in_bounds = s.logical_and(s.ult(px, w_u), s.ult(py, h_u))
+    s.begin_if(in_bounds)
+    var vis_uv4 = s.texel_fetch_u2d(vis_samp, s.uvec2(px, py), s.uint(0))
+    var vis0 = s.extract_u(vis_uv4, 0)
+    var vis1 = s.extract_u(vis_uv4, 1)
+    var mat_id = s.shr(vis1, s.uint(16))
+    var cls_surf = _emit_classify_material_spv(s, b_materials, mat_id, n_mats)
+    var cls = s.select_u(s.ieq(vis0, s.uint(0)), s.uint(UInt32(AAA_SHADE_CLASS_SKY)), cls_surf)
+    s.store(my_mask, s.shl(s.uint(1), cls))
+    s.end_if()
+
+    var lds_mask = s.workgroup_array_u32(64)
+    s.store_workgroup_u32(lds_mask[0], lds_mask[1], lid, s.load_u(my_mask))
+    s.workgroup_barrier()
+
+    for stride in [32, 16, 8, 4, 2, 1]:
+        s.begin_if(s.ult(lid, s.uint(UInt32(stride))))
+        var a_m = s.load_workgroup_u32(lds_mask[0], lds_mask[1], lid)
+        var b_m = s.load_workgroup_u32(lds_mask[0], lds_mask[1], s.iadd(lid, s.uint(UInt32(stride))))
+        s.store_workgroup_u32(lds_mask[0], lds_mask[1], lid, s.bit_or(a_m, b_m))
+        s.end_if()
+        s.workgroup_barrier()
+
+    var tile_mask = s.load_workgroup_u32(lds_mask[0], lds_mask[1], s.uint(0))
+    var tile_coord = s.bit_or(s.bit_and(wg_x, s.uint(0xFFFF)), s.shl(s.bit_and(wg_y, s.uint(0xFFFF)), s.uint(16)))
+    s.begin_if(s.ult(lid, s.uint(UInt32(AAA_SHADE_CLASS_COUNT))))
+    s.begin_if(s.logical_and(s.ieq(wg_x, s.uint(0)), s.ieq(wg_y, s.uint(0))))
+    var cmd_base = s.iadd(tile_base, s.imul(lid, s.uint(4)))
+    s.store_word(b_post, s.iadd(cmd_base, s.uint(1)), s.uint(1))
+    s.store_word(b_post, s.iadd(cmd_base, s.uint(2)), s.uint(1))
+    s.end_if()
+    s.begin_if(s.ine(s.bit_and(s.shr(tile_mask, lid), s.uint(1)), s.uint(0)))
+    var slot_idx = s.atomic_add_word(b_post, s.iadd(tile_base, s.imul(lid, s.uint(4))), s.uint(1))
+    var list_idx = s.iadd(
+        s.iadd(tile_base, s.uint(UInt32(AAA_SHADE_CLASS_COUNT * 4))),
+        s.iadd(s.imul(lid, num_tiles), slot_idx),
+    )
+    s.store_word(b_post, list_idx, tile_coord)
+    s.end_if()
+    s.end_if()
+    return s.finish()
+
+
+def _emit_shade_pixel_coords(
+    mut s: AaaSpirvModule,
+    b_post: UInt32,
+    use_tile_list: Bool,
+) -> Tuple[UInt32, UInt32]:
+    if not use_tile_list:
+        return (s.invocation_axis(0), s.invocation_axis(1))
+    var tile_list_base = s.push_word(7)
+    var wg_x = s.workgroup_axis(0)
+    var tile_coord = s.load_word(b_post, s.iadd(tile_list_base, wg_x))
+    var tx = s.bit_and(tile_coord, s.uint(0xFFFF))
+    var ty = s.shr(tile_coord, s.uint(16))
+    var px = s.iadd(s.imul(tx, s.uint(8)), s.local_axis(0))
+    var py = s.iadd(s.imul(ty, s.uint(8)), s.local_axis(1))
+    return (px, py)
+
+
+def aaa_shade_sky_shader(use_tile_list: Bool = True) -> List[UInt32]:
+    """Specialized Sky & Nubis Cloud/Celestial Pass (`vis0 == 0`, zero geometry/BSDF/RT overhead)."""
+    var s = AaaSpirvModule(
+        MODEL_GL_COMPUTE,
+        group_width=8,
+        group_height=8,
+        push_words=AAA_PUSH_WORDS,
+        enable_bindless=False,
+        enable_ray_query=False,
+    )
+    var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_hdr = s.buffer(BIND_AAA_HDR_OUT)
+    var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
+    var b_hist = s.buffer(BIND_AAA_HISTORY)
+    var vis_samp = s.sampled_image_2d(BIND_AAA_VIS_TEX, is_uint=True)
+    var env_cube = s.sampled_image_2d(BIND_AAA_ENV_CUBE, is_cube=True)
+
+    var w_u = s.push_word(0)
+    var h_u = s.push_word(1)
+    var demod_gi = s.ine(s.push_word(3), s.uint(0))
+    var demod_spec = s.ine(s.push_word(4), s.uint(0))
+    var spec_in_off = s.push_word(5)
+
+    var pxy = _emit_shade_pixel_coords(s, b_post, use_tile_list)
+    var px = pxy[0]
+    var py = pxy[1]
+    s.return_if(s.logical_or(s.uge(px, w_u), s.uge(py, h_u)))
+
+    var vis_uv4 = s.texel_fetch_u2d(vis_samp, s.uvec2(px, py), s.uint(0))
+    var vis0 = s.extract_u(vis_uv4, 0)
+    s.return_if(s.ine(vis0, s.uint(0)))
+
+    var fw = s.float_from_uint(w_u)
+    var fh = s.float_from_uint(h_u)
+    var fwd_x = s.load_float(b_globals, s.uint(36))
+    var fwd_y = s.load_float(b_globals, s.uint(37))
+    var fwd_z = s.load_float(b_globals, s.uint(38))
+    var tan_x = s.load_float(b_globals, s.uint(39))
+    var rgt_x = s.load_float(b_globals, s.uint(40))
+    var rgt_y = s.load_float(b_globals, s.uint(41))
+    var rgt_z = s.load_float(b_globals, s.uint(42))
+    var tan_y = s.load_float(b_globals, s.uint(43))
+    var up_x = s.load_float(b_globals, s.uint(44))
+    var up_y = s.load_float(b_globals, s.uint(45))
+    var up_z = s.load_float(b_globals, s.uint(46))
+    var r_flags = s.load_word(b_globals, s.uint(99))
+    var jit_x = s.load_float(b_globals, s.uint(101))
+    var jit_y = s.load_float(b_globals, s.uint(102))
+
+    var fx0 = s.fsub(s.fadd(s.float_from_uint(px), s.float(0.5)), s.fmul(jit_x, s.fmul(fw, s.float(0.5))))
+    var fy0 = s.fadd(s.fadd(s.float_from_uint(py), s.float(0.5)), s.fmul(jit_y, s.fmul(fh, s.float(0.5))))
+    var ndc_x = s.fsub(s.fmul(s.fdiv(fx0, fw), s.float(2.0)), s.float(1.0))
+    var ndc_y = s.fsub(s.float(1.0), s.fmul(s.fdiv(fy0, fh), s.float(2.0)))
+    var ray_c = emit_vec3_normalize(
+        s,
+        s.fma(rgt_x, s.fmul(ndc_x, tan_x), s.fma(up_x, s.fmul(ndc_y, tan_y), fwd_x)),
+        s.fma(rgt_y, s.fmul(ndc_x, tan_x), s.fma(up_y, s.fmul(ndc_y, tan_y), fwd_y)),
+        s.fma(rgt_z, s.fmul(ndc_x, tan_x), s.fma(up_z, s.fmul(ndc_y, tan_y), fwd_z)),
+    )
+
+    var pix_idx_u = s.iadd(s.imul(py, w_u), px)
+    var out_pix_base = s.imul(pix_idx_u, s.uint(8))
+    var post_pix_base = s.iadd(s.uint(1024), out_pix_base)
+    var spec_pix_base = s.iadd(spec_in_off, s.imul(pix_idx_u, s.uint(4)))
+    var is_furnace = s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_FURNACE_WHITE_DOME)), s.uint(0))
+
+    var env_bg = s.sample_cube_lod(env_cube, s.vec3(ray_c[0], ray_c[1], ray_c[2]), s.float(0.0))
+    var bg_r_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 0)))
+    var bg_g_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 1)))
+    var bg_b_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 2)))
+    s.begin_if(s.logical_not(is_furnace))
+    var nubis_bg = emit_nubis_sky_clouds_and_celestial_spv(
+        s, b_globals, env_cube,
+        ray_c[0], ray_c[1], ray_c[2], fh,
+        s.load_f(bg_r_v), s.load_f(bg_g_v), s.load_f(bg_b_v),
+    )
+    s.store(bg_r_v, nubis_bg[0])
+    s.store(bg_g_v, nubis_bg[1])
+    s.store(bg_b_v, nubis_bg[2])
+    s.end_if()
+    var bg_r = s.load_f(bg_r_v)
+    var bg_g = s.load_f(bg_g_v)
+    var bg_b = s.load_f(bg_b_v)
+
+    s.begin_if(demod_gi)
+    s.store_float(b_post, post_pix_base, bg_r)
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(1)), bg_g)
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(2)), bg_b)
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(3)), s.float(0.0))
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(4)), s.float(0.0))
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(5)), s.float(0.0))
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(6)), s.float(0.0))
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(7)), s.float(0.0))
+    s.end_if()
+    s.begin_if(demod_spec)
+    var zero_f16 = s.pack_f16x2(s.float(0.0), s.float(0.0))
+    var sky_r_f16 = s.pack_f16x2(s.float(0.0), s.float(1.0))
+    var sky_t_f16 = s.pack_f16x2(s.float(0.0), s.float(32768.0))
+    s.store_word(b_hist, spec_pix_base, zero_f16)
+    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(1)), sky_r_f16)
+    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(2)), zero_f16)
+    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(3)), sky_t_f16)
+    s.end_if()
+    s.store_float(b_hdr, out_pix_base, s.select_f(demod_gi, s.float(0.0), bg_r))
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(1)), s.select_f(demod_gi, s.float(0.0), bg_g))
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(2)), s.select_f(demod_gi, s.float(0.0), bg_b))
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(3)), s.float(1e6))
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(4)), s.float(0.0))
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(5)), s.float(0.0))
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(6)), s.float(0.0))
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(7)), s.float(0.0))
+    return s.finish()
+
+
+def aaa_shade_unlit_shader(use_tile_list: Bool = True) -> List[UInt32]:
+    """Specialized Unlit / UI-In-World VisBuffer Pass (`MAT_DOMAIN_UNLIT_UI`, zero VSM/BSDF/RT overhead)."""
+    var s = AaaSpirvModule(
+        MODEL_GL_COMPUTE,
+        group_width=8,
+        group_height=8,
+        push_words=AAA_PUSH_WORDS,
+        enable_bindless=True,
+        enable_ray_query=False,
+    )
+    var b_verts = s.buffer(BIND_AAA_VERTICES)
+    var b_indices = s.buffer(BIND_AAA_INDICES)
+    var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
+    var b_instances = s.buffer(BIND_AAA_INSTANCES)
+    var b_materials = s.buffer(BIND_AAA_MATERIALS)
+    var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_hdr = s.buffer(BIND_AAA_HDR_OUT)
+    var b_skinning = s.buffer(BIND_AAA_SKINNING)
+    var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
+    var b_hist = s.buffer(BIND_AAA_HISTORY)
+    var vis_samp = s.sampled_image_2d(BIND_AAA_VIS_TEX, is_uint=True)
+    var bindless_arr = s.bindless_sampled_array_2d(BIND_AAA_BINDLESS_TEX, AAA_MAX_BINDLESS)
+
+    var w_u = s.push_word(0)
+    var h_u = s.push_word(1)
+    var demod_gi = s.ine(s.push_word(3), s.uint(0))
+    var demod_spec = s.ine(s.push_word(4), s.uint(0))
+    var spec_in_off = s.push_word(5)
+    var n_mats_u = s.push_word(8)
+
+    var pxy = _emit_shade_pixel_coords(s, b_post, use_tile_list)
+    var px = pxy[0]
+    var py = pxy[1]
+    s.return_if(s.logical_or(s.uge(px, w_u), s.uge(py, h_u)))
+
+    var vis_uv4 = s.texel_fetch_u2d(vis_samp, s.uvec2(px, py), s.uint(0))
+    var vis0 = s.extract_u(vis_uv4, 0)
+    var vis1 = s.extract_u(vis_uv4, 1)
+    s.return_if(s.ieq(vis0, s.uint(0)))
+
+    var mat_id = s.shr(vis1, s.uint(16))
+    var pix_cls = _emit_classify_material_spv(s, b_materials, mat_id, n_mats_u)
+    s.return_if(s.ine(pix_cls, s.uint(UInt32(AAA_SHADE_CLASS_UNLIT))))
+
+    var fw = s.float_from_uint(w_u)
+    var fh = s.float_from_uint(h_u)
+    var cam_x = s.load_float(b_globals, s.uint(32))
+    var cam_y = s.load_float(b_globals, s.uint(33))
+    var cam_z = s.load_float(b_globals, s.uint(34))
+    var fwd_x = s.load_float(b_globals, s.uint(36))
+    var fwd_y = s.load_float(b_globals, s.uint(37))
+    var fwd_z = s.load_float(b_globals, s.uint(38))
+    var tan_x = s.load_float(b_globals, s.uint(39))
+    var rgt_x = s.load_float(b_globals, s.uint(40))
+    var rgt_y = s.load_float(b_globals, s.uint(41))
+    var rgt_z = s.load_float(b_globals, s.uint(42))
+    var tan_y = s.load_float(b_globals, s.uint(43))
+    var up_x = s.load_float(b_globals, s.uint(44))
+    var up_y = s.load_float(b_globals, s.uint(45))
+    var up_z = s.load_float(b_globals, s.uint(46))
+    var r_flags = s.load_word(b_globals, s.uint(99))
+    var jit_x = s.load_float(b_globals, s.uint(101))
+    var jit_y = s.load_float(b_globals, s.uint(102))
+
+    var fx0 = s.fsub(s.fadd(s.float_from_uint(px), s.float(0.5)), s.fmul(jit_x, s.fmul(fw, s.float(0.5))))
+    var fy0 = s.fadd(s.fadd(s.float_from_uint(py), s.float(0.5)), s.fmul(jit_y, s.fmul(fh, s.float(0.5))))
+    var ndc_x = s.fsub(s.fmul(s.fdiv(fx0, fw), s.float(2.0)), s.float(1.0))
+    var ndc_y = s.fsub(s.float(1.0), s.fmul(s.fdiv(fy0, fh), s.float(2.0)))
+    var step_nx = s.fdiv(s.float(2.0), fw)
+    var step_ny = s.fneg(s.fdiv(s.float(2.0), fh))
+
+    var ray_c = emit_vec3_normalize(
+        s,
+        s.fma(rgt_x, s.fmul(ndc_x, tan_x), s.fma(up_x, s.fmul(ndc_y, tan_y), fwd_x)),
+        s.fma(rgt_y, s.fmul(ndc_x, tan_x), s.fma(up_y, s.fmul(ndc_y, tan_y), fwd_y)),
+        s.fma(rgt_z, s.fmul(ndc_x, tan_x), s.fma(up_z, s.fmul(ndc_y, tan_y), fwd_z)),
+    )
+    var ray_dx = emit_vec3_normalize(
+        s,
+        s.fma(rgt_x, s.fmul(s.fadd(ndc_x, step_nx), tan_x), s.fma(up_x, s.fmul(ndc_y, tan_y), fwd_x)),
+        s.fma(rgt_y, s.fmul(s.fadd(ndc_x, step_nx), tan_x), s.fma(up_y, s.fmul(ndc_y, tan_y), fwd_y)),
+        s.fma(rgt_z, s.fmul(s.fadd(ndc_x, step_nx), tan_x), s.fma(up_z, s.fmul(ndc_y, tan_y), fwd_z)),
+    )
+    var ray_dy = emit_vec3_normalize(
+        s,
+        s.fma(rgt_x, s.fmul(ndc_x, tan_x), s.fma(up_x, s.fmul(s.fadd(ndc_y, step_ny), tan_y), fwd_x)),
+        s.fma(rgt_y, s.fmul(ndc_x, tan_x), s.fma(up_y, s.fmul(s.fadd(ndc_y, step_ny), tan_y), fwd_y)),
+        s.fma(rgt_z, s.fmul(ndc_x, tan_x), s.fma(up_z, s.fmul(s.fadd(ndc_y, step_ny), tan_y), fwd_z)),
+    )
+
+    var pix_idx_u = s.iadd(s.imul(py, w_u), px)
+    var out_pix_base = s.imul(pix_idx_u, s.uint(8))
+    var post_pix_base = s.iadd(s.uint(1024), out_pix_base)
+    var spec_pix_base = s.iadd(spec_in_off, s.imul(pix_idx_u, s.uint(4)))
+    var is_furnace = s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_FURNACE_WHITE_DOME)), s.uint(0))
+
+    var inst_id = s.bit_or(
+        s.shr(vis0, s.uint(22)),
+        s.shl(s.bit_and(s.shr(vis1, s.uint(8)), s.uint(0xFF)), s.uint(10)),
+    )
+    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x3FFFFF)), s.uint(1))
+    var local_prim = s.bit_and(vis1, s.uint(0xFF))
+
+    var ml_base = s.imul(ml_id, s.uint(12))
+    var first_tri = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(8)))
+    var global_tri = s.iadd(first_tri, local_prim)
+    var idx_off = s.imul(global_tri, s.uint(3))
+    var vi0 = s.load_word(b_indices, idx_off)
+    var vi1 = s.load_word(b_indices, s.iadd(idx_off, s.uint(1)))
+    var vi2 = s.load_word(b_indices, s.iadd(idx_off, s.uint(2)))
+    var v0_off = s.imul(vi0, s.uint(12))
+    var v1_off = s.imul(vi1, s.uint(12))
+    var v2_off = s.imul(vi2, s.uint(12))
+
+    var inst_base = s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS)))
+    var l0x = s.load_float(b_verts, v0_off); var l0y = s.load_float(b_verts, s.iadd(v0_off, s.uint(1))); var l0z = s.load_float(b_verts, s.iadd(v0_off, s.uint(2)))
+    var l1x = s.load_float(b_verts, v1_off); var l1y = s.load_float(b_verts, s.iadd(v1_off, s.uint(1))); var l1z = s.load_float(b_verts, s.iadd(v1_off, s.uint(2)))
+    var l2x = s.load_float(b_verts, v2_off); var l2y = s.load_float(b_verts, s.iadd(v2_off, s.uint(1))); var l2z = s.load_float(b_verts, s.iadd(v2_off, s.uint(2)))
+
+    var p0 = emit_mat4_mul_point(s, b_instances, inst_base, l0x, l0y, l0z)
+    var p1 = emit_mat4_mul_point(s, b_instances, inst_base, l1x, l1y, l1z)
+    var p2 = emit_mat4_mul_point(s, b_instances, inst_base, l2x, l2y, l2z)
+
+    var bary = emit_ray_barycentrics(
+        s,
+        cam_x, cam_y, cam_z,
+        ray_c[0], ray_c[1], ray_c[2],
+        ray_dx[0], ray_dx[1], ray_dx[2],
+        ray_dy[0], ray_dy[1], ray_dy[2],
+        p0[0], p0[1], p0[2],
+        p1[0], p1[1], p1[2],
+        p2[0], p2[1], p2[2],
+    )
+    var b1 = bary[0]
+    var b2 = bary[1]
+    var b0 = s.fsub(s.fsub(s.float(1.0), b1), b2)
+
+    var wx = s.fma(p0[0], b0, s.fma(p1[0], b1, s.fmul(p2[0], b2)))
+    var wy = s.fma(p0[1], b0, s.fma(p1[1], b1, s.fmul(p2[1], b2)))
+    var wz = s.fma(p0[2], b0, s.fma(p1[2], b1, s.fmul(p2[2], b2)))
+    var loc_x = s.fvar(s.fma(l0x, b0, s.fma(l1x, b1, s.fmul(l2x, b2))))
+    var loc_y = s.fvar(s.fma(l0y, b0, s.fma(l1y, b1, s.fmul(l2y, b2))))
+    var loc_z = s.fvar(s.fma(l0z, b0, s.fma(l1z, b1, s.fmul(l2z, b2))))
+
+    var inst_flags_u = s.bit_and(s.shr(s.load_word(b_instances, s.iadd(inst_base, s.uint(34))), s.uint(16)), s.uint(1))
+    s.begin_if(s.ieq(inst_flags_u, s.uint(1)))
+    var skin_first_slot = s.load_word(b_instances, s.iadd(inst_base, s.uint(36)))
+    var mesh_first_vtx = s.load_word(b_instances, s.iadd(inst_base, s.uint(37)))
+    var lvi0 = s.iadd(skin_first_slot, s.isub(vi0, mesh_first_vtx))
+    var lvi1 = s.iadd(skin_first_slot, s.isub(vi1, mesh_first_vtx))
+    var lvi2 = s.iadd(skin_first_slot, s.isub(vi2, mesh_first_vtx))
+    var sp0 = s.iadd(s.uint(UInt32(AAA_SKIN_PREV_POS_BASE)), s.imul(lvi0, s.uint(3)))
+    var sp1 = s.iadd(s.uint(UInt32(AAA_SKIN_PREV_POS_BASE)), s.imul(lvi1, s.uint(3)))
+    var sp2 = s.iadd(s.uint(UInt32(AAA_SKIN_PREV_POS_BASE)), s.imul(lvi2, s.uint(3)))
+    s.store(loc_x, s.fma(s.load_float(b_skinning, sp0), b0, s.fma(s.load_float(b_skinning, sp1), b1, s.fmul(s.load_float(b_skinning, sp2), b2))))
+    s.store(loc_y, s.fma(s.load_float(b_skinning, s.iadd(sp0, s.uint(1))), b0, s.fma(s.load_float(b_skinning, s.iadd(sp1, s.uint(1))), b1, s.fmul(s.load_float(b_skinning, s.iadd(sp2, s.uint(1))), b2))))
+    s.store(loc_z, s.fma(s.load_float(b_skinning, s.iadd(sp0, s.uint(2))), b0, s.fma(s.load_float(b_skinning, s.iadd(sp1, s.uint(2))), b1, s.fmul(s.load_float(b_skinning, s.iadd(sp2, s.uint(2))), b2))))
+    s.end_if()
+
+    var prev_wp = emit_mat4_mul_point(s, b_instances, s.iadd(inst_base, s.uint(16)), s.load_f(loc_x), s.load_f(loc_y), s.load_f(loc_z))
+    var prev_clip = emit_mat4_mul_point(s, b_globals, s.uint(16), prev_wp[0], prev_wp[1], prev_wp[2])
+    var prev_inv_w = s.fdiv(s.float(1.0), s.nmax(s.float(1e-4), prev_clip[3]))
+    var prev_u = s.fma(s.fmul(prev_clip[0], prev_inv_w), s.float(0.5), s.float(0.5))
+    var prev_v = s.fma(s.fneg(s.fmul(prev_clip[1], prev_inv_w)), s.float(0.5), s.float(0.5))
+    var vel_u = s.fsub(s.fdiv(fx0, fw), prev_u)
+    var vel_v = s.fsub(s.fdiv(fy0, fh), prev_v)
+
+    var c0x = s.load_float(b_instances, inst_base)
+    var c0y = s.load_float(b_instances, s.iadd(inst_base, s.uint(1)))
+    var c0z = s.load_float(b_instances, s.iadd(inst_base, s.uint(2)))
+    var c1x = s.load_float(b_instances, s.iadd(inst_base, s.uint(4)))
+    var c1y = s.load_float(b_instances, s.iadd(inst_base, s.uint(5)))
+    var c1z = s.load_float(b_instances, s.iadd(inst_base, s.uint(6)))
+    var c2x = s.load_float(b_instances, s.iadd(inst_base, s.uint(8)))
+    var c2y = s.load_float(b_instances, s.iadd(inst_base, s.uint(9)))
+    var c2z = s.load_float(b_instances, s.iadd(inst_base, s.uint(10)))
+    var cof0 = emit_vec3_cross(s, c1x, c1y, c1z, c2x, c2y, c2z)
+    var cof1 = emit_vec3_cross(s, c2x, c2y, c2z, c0x, c0y, c0z)
+    var cof2 = emit_vec3_cross(s, c0x, c0y, c0z, c1x, c1y, c1z)
+    var det_sign = s.select_f(s.flt(emit_vec3_dot(s, c0x, c0y, c0z, cof0[0], cof0[1], cof0[2]), s.float(0.0)), s.float(-1.0), s.float(1.0))
+
+    var n0x = s.load_float(b_verts, s.iadd(v0_off, s.uint(3))); var n0y = s.load_float(b_verts, s.iadd(v0_off, s.uint(4))); var n0z = s.load_float(b_verts, s.iadd(v0_off, s.uint(5)))
+    var n1x = s.load_float(b_verts, s.iadd(v1_off, s.uint(3))); var n1y = s.load_float(b_verts, s.iadd(v1_off, s.uint(4))); var n1z = s.load_float(b_verts, s.iadd(v1_off, s.uint(5)))
+    var n2x = s.load_float(b_verts, s.iadd(v2_off, s.uint(3))); var n2y = s.load_float(b_verts, s.iadd(v2_off, s.uint(4))); var n2z = s.load_float(b_verts, s.iadd(v2_off, s.uint(5)))
+    var ln_x = s.fma(n0x, b0, s.fma(n1x, b1, s.fmul(n2x, b2)))
+    var ln_y = s.fma(n0y, b0, s.fma(n1y, b1, s.fmul(n2y, b2)))
+    var ln_z = s.fma(n0z, b0, s.fma(n1z, b1, s.fmul(n2z, b2)))
+    var wn_geom = emit_vec3_normalize(
+        s,
+        s.fmul(s.fma(cof0[0], ln_x, s.fma(cof1[0], ln_y, s.fmul(cof2[0], ln_z))), det_sign),
+        s.fmul(s.fma(cof0[1], ln_x, s.fma(cof1[1], ln_y, s.fmul(cof2[1], ln_z))), det_sign),
+        s.fmul(s.fma(cof0[2], ln_x, s.fma(cof1[2], ln_y, s.fmul(cof2[2], ln_z))), det_sign),
+    )
+
+    var u0 = s.load_float(b_verts, s.iadd(v0_off, s.uint(9))); var v0_t = s.load_float(b_verts, s.iadd(v0_off, s.uint(10)))
+    var u1 = s.load_float(b_verts, s.iadd(v1_off, s.uint(9))); var v1_t = s.load_float(b_verts, s.iadd(v1_off, s.uint(10)))
+    var u2 = s.load_float(b_verts, s.iadd(v2_off, s.uint(9))); var v2_t = s.load_float(b_verts, s.iadd(v2_off, s.uint(10)))
+    var uv_u = s.fma(u0, b0, s.fma(u1, b1, s.fmul(u2, b2)))
+    var uv_v = s.fma(v0_t, b0, s.fma(v1_t, b1, s.fmul(v2_t, b2)))
+    var b0_dx = s.fsub(s.fsub(s.float(1.0), bary[2]), bary[3])
+    var b0_dy = s.fsub(s.fsub(s.float(1.0), bary[4]), bary[5])
+    var grad_bias_scale = s.exp2(s.load_float(b_globals, s.uint(127)))
+    var ddx_u = s.fmul(s.fsub(s.fma(u0, b0_dx, s.fma(u1, bary[2], s.fmul(u2, bary[3]))), uv_u), grad_bias_scale)
+    var ddx_v = s.fmul(s.fsub(s.fma(v0_t, b0_dx, s.fma(v1_t, bary[2], s.fmul(v2_t, bary[3]))), uv_v), grad_bias_scale)
+    var ddy_u = s.fmul(s.fsub(s.fma(u0, b0_dy, s.fma(u1, bary[4], s.fmul(u2, bary[5]))), uv_u), grad_bias_scale)
+    var ddy_v = s.fmul(s.fsub(s.fma(v0_t, b0_dy, s.fma(v1_t, bary[4], s.fmul(v2_t, bary[5]))), uv_v), grad_bias_scale)
+
+    var rel_cam_x = s.fsub(wx, cam_x)
+    var rel_cam_y = s.fsub(wy, cam_y)
+    var rel_cam_z = s.fsub(wz, cam_z)
+    var z_lin = s.nmax(s.float(0.01), emit_vec3_dot(s, rel_cam_x, rel_cam_y, rel_cam_z, fwd_x, fwd_y, fwd_z))
+    var cam_dist = s.fsqrt(s.nmax(s.float(1e-6), emit_vec3_dot(s, rel_cam_x, rel_cam_y, rel_cam_z, rel_cam_x, rel_cam_y, rel_cam_z)))
+
+    var m_base = s.imul(mat_id, s.uint(UInt32(AAA_MATERIAL_WORDS)))
+    var alb_r = s.fvar(s.load_float(b_materials, m_base))
+    var alb_g = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(1))))
+    var alb_b = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(2))))
+    var em_r_v = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(8))))
+    var em_g_v = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(9))))
+    var em_b_v = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(10))))
+    var tex_pack = s.load_word(b_materials, s.iadd(m_base, s.uint(23)))
+    var t_alb = s.bit_and(tex_pack, s.uint(0xFF))
+
+    s.begin_if(s.ult(t_alb, s.uint(0xFF)))
+    var s_alb = s.sample_bindless_grad(bindless_arr, t_alb, s.vec2(uv_u, uv_v), s.vec2(ddx_u, ddx_v), s.vec2(ddy_u, ddy_v))
+    var sa_r = s.extract_f(s_alb, 0)
+    var sa_g = s.extract_f(s_alb, 1)
+    var sa_b = s.extract_f(s_alb, 2)
+    s.store(alb_r, s.fmul(s.load_f(alb_r), sa_r))
+    s.store(alb_g, s.fmul(s.load_f(alb_g), sa_g))
+    s.store(alb_b, s.fmul(s.load_f(alb_b), sa_b))
+    s.store(em_r_v, s.fmul(s.load_f(em_r_v), sa_r))
+    s.store(em_g_v, s.fmul(s.load_f(em_g_v), sa_g))
+    s.store(em_b_v, s.fmul(s.load_f(em_b_v), sa_b))
+    s.end_if()
+
+    var meta0 = s.load_word(b_verts, s.iadd(v0_off, s.uint(11)))
+    var meta1 = s.load_word(b_verts, s.iadd(v1_off, s.uint(11)))
+    var meta2 = s.load_word(b_verts, s.iadd(v2_off, s.uint(11)))
+    var vc0 = emit_decode_vertex_color_rgb_spv(s, meta0, is_furnace)
+    var vc1 = emit_decode_vertex_color_rgb_spv(s, meta1, is_furnace)
+    var vc2 = emit_decode_vertex_color_rgb_spv(s, meta2, is_furnace)
+    var vcr = s.fma(vc0[0], b0, s.fma(vc1[0], b1, s.fmul(vc2[0], b2)))
+    var vcg = s.fma(vc0[1], b0, s.fma(vc1[1], b1, s.fmul(vc2[1], b2)))
+    var vcb = s.fma(vc0[2], b0, s.fma(vc1[2], b1, s.fmul(vc2[2], b2)))
+
+    var out_r = s.fvar(s.fmul(s.fadd(s.load_f(alb_r), s.load_f(em_r_v)), vcr))
+    var out_g = s.fvar(s.fmul(s.fadd(s.load_f(alb_g), s.load_f(em_g_v)), vcg))
+    var out_b = s.fvar(s.fmul(s.fadd(s.load_f(alb_b), s.load_f(em_b_v)), vcb))
+
+    s.begin_if(s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_AERIAL_PERSPECTIVE)), s.uint(0)))
+    var frox_far_z = s.load_float(b_globals, s.uint(131))
+    var frox_fog_d = s.load_float(b_globals, s.uint(132))
+    var ap_dist = s.select_f(s.fgt(frox_fog_d, s.float(1e-6)), s.nmax(s.float(0.0), s.fsub(cam_dist, frox_far_z)), cam_dist)
+    var sun_x = s.load_float(b_globals, s.uint(48))
+    var sun_y = s.load_float(b_globals, s.uint(49))
+    var sun_z = s.load_float(b_globals, s.uint(50))
+    var ap_rgb = emit_aerial_perspective_spv(
+        s, b_globals,
+        s.load_f(out_r), s.load_f(out_g), s.load_f(out_b),
+        ray_c[0], ray_c[1], ray_c[2], ap_dist,
+        sun_x, sun_y, sun_z,
+    )
+    s.store(out_r, ap_rgb[0])
+    s.store(out_g, ap_rgb[1])
+    s.store(out_b, ap_rgb[2])
+    s.end_if()
+
+    var ur = s.load_f(out_r)
+    var ug = s.load_f(out_g)
+    var ub = s.load_f(out_b)
+    s.begin_if(demod_spec)
+    var zero_f16 = s.pack_f16x2(s.float(0.0), s.float(0.0))
+    var rough_f16 = s.pack_f16x2(s.float(0.0), s.float(1.0))
+    var dist_f16 = s.pack_f16x2(s.float(0.0), s.float(32768.0))
+    s.store_word(b_hist, spec_pix_base, zero_f16)
+    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(1)), rough_f16)
+    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(2)), zero_f16)
+    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(3)), dist_f16)
+    s.end_if()
+    s.begin_if(demod_gi)
+    s.store_float(b_post, post_pix_base, ur)
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(1)), ug)
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(2)), ub)
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(3)), s.float(0.0))
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(4)), s.float(0.0))
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(5)), s.float(0.0))
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(6)), vel_u)
+    s.store_float(b_post, s.iadd(post_pix_base, s.uint(7)), vel_v)
+    s.end_if()
+    s.store_float(b_hdr, out_pix_base, ur)
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(1)), ug)
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(2)), ub)
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(3)), z_lin)
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(4)), vel_u)
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(5)), vel_v)
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(6)), wn_geom[0])
+    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(7)), wn_geom[1])
+    return s.finish()
+
+
+def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
+    """Legacy monolithic wrapper preserved for existing SPIR-V validation tests."""
+    return aaa_deferred_shade_class_shader(enable_ray_query, AAA_SHADE_CLASS_ALL, use_tile_list=False)
+
+
+def aaa_deferred_shade_class_shader(
+    enable_ray_query: Bool,
+    shade_class: Int,
+    use_tile_list: Bool = True,
+) -> List[UInt32]:
+    """Specialized AAA Deferred `VisBuffer` Compute Material & Lighting Shader for `shade_class`
+    (`STANDARD_PBR`, `FOLIAGE_SSS`, `COMPLEX`, or `ALL`)."""
+    var is_all = shade_class == AAA_SHADE_CLASS_ALL
+    var emit_terrain = is_all or (shade_class == AAA_SHADE_CLASS_STANDARD_PBR)
+    var emit_clearcoat = is_all or (shade_class == AAA_SHADE_CLASS_COMPLEX)
+    var emit_iridescence = is_all or (shade_class == AAA_SHADE_CLASS_COMPLEX)
+    var emit_sheen = is_all or (shade_class == AAA_SHADE_CLASS_COMPLEX)
+    var emit_sss = is_all or (shade_class == AAA_SHADE_CLASS_FOLIAGE_SSS) or (shade_class == AAA_SHADE_CLASS_COMPLEX)
+    var emit_wetness = is_all or (shade_class == AAA_SHADE_CLASS_COMPLEX)
+    var emit_parallax = is_all or (shade_class == AAA_SHADE_CLASS_COMPLEX)
+
     var s = AaaSpirvModule(
         MODEL_GL_COMPUTE,
         group_width=8,
@@ -945,15 +1540,27 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     if enable_ray_query:
         tlas_var = s.acceleration_structure(BIND_AAA_TLAS)
 
-    var px = s.invocation_axis(0)
-    var py = s.invocation_axis(1)
     var w_u = s.push_word(0)
     var h_u = s.push_word(1)
     var gi_rays_u = s.push_word(2)
     var demod_gi = s.ine(s.push_word(3), s.uint(0))
     var demod_spec = s.ine(s.push_word(4), s.uint(0))
     var spec_in_off = s.push_word(5)
+    var n_mats_u = s.push_word(8)
+
+    var pxy = _emit_shade_pixel_coords(s, b_post, use_tile_list)
+    var px = pxy[0]
+    var py = pxy[1]
     s.return_if(s.logical_or(s.uge(px, w_u), s.uge(py, h_u)))
+
+    var vis_uv4 = s.texel_fetch_u2d(vis_samp, s.uvec2(px, py), s.uint(0))
+    var vis0 = s.extract_u(vis_uv4, 0)
+    var vis1 = s.extract_u(vis_uv4, 1)
+    if not is_all:
+        s.return_if(s.ieq(vis0, s.uint(0)))
+        var mat_id_cls = s.shr(vis1, s.uint(16))
+        var pix_cls = _emit_classify_material_spv(s, b_materials, mat_id_cls, n_mats_u)
+        s.return_if(s.ine(pix_cls, s.uint(UInt32(shade_class))))
 
     var fw = s.float_from_uint(w_u)
     var fh = s.float_from_uint(h_u)
@@ -1004,68 +1611,69 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         s.fma(rgt_z, s.fmul(ndc_x, tan_x), s.fma(up_z, s.fmul(s.fadd(ndc_y, step_ny), tan_y), fwd_z)),
     )
 
-    var vis_uv4 = s.texel_fetch_u2d(vis_samp, s.uvec2(px, py), s.uint(0))
-    var vis0 = s.extract_u(vis_uv4, 0)
-    var vis1 = s.extract_u(vis_uv4, 1)
     var pix_idx_u = s.iadd(s.imul(py, w_u), px)
     var out_pix_base = s.imul(pix_idx_u, s.uint(8))
     var post_pix_base = s.iadd(s.uint(1024), out_pix_base)
     var spec_pix_base = s.iadd(spec_in_off, s.imul(pix_idx_u, s.uint(4)))
     var is_furnace = s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_FURNACE_WHITE_DOME)), s.uint(0))
 
-    # Sky background pixel (`vis0 == 0`)
-    s.begin_if(s.ieq(vis0, s.uint(0)))
-    var env_bg = s.sample_cube_lod(env_cube, s.vec3(ray_c[0], ray_c[1], ray_c[2]), s.float(0.0))
-    var bg_r_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 0)))
-    var bg_g_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 1)))
-    var bg_b_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 2)))
-    s.begin_if(s.logical_not(is_furnace))
-    var nubis_bg = emit_nubis_sky_clouds_and_celestial_spv(
-        s, b_globals, env_cube,
-        ray_c[0], ray_c[1], ray_c[2], fh,
-        s.load_f(bg_r_v), s.load_f(bg_g_v), s.load_f(bg_b_v),
-    )
-    s.store(bg_r_v, nubis_bg[0])
-    s.store(bg_g_v, nubis_bg[1])
-    s.store(bg_b_v, nubis_bg[2])
-    s.end_if()
-    var bg_r = s.load_f(bg_r_v)
-    var bg_g = s.load_f(bg_g_v)
-    var bg_b = s.load_f(bg_b_v)
-    s.begin_if(demod_gi)
-    s.store_float(b_post, post_pix_base, bg_r)
-    s.store_float(b_post, s.iadd(post_pix_base, s.uint(1)), bg_g)
-    s.store_float(b_post, s.iadd(post_pix_base, s.uint(2)), bg_b)
-    s.store_float(b_post, s.iadd(post_pix_base, s.uint(3)), s.float(0.0))
-    s.store_float(b_post, s.iadd(post_pix_base, s.uint(4)), s.float(0.0))
-    s.store_float(b_post, s.iadd(post_pix_base, s.uint(5)), s.float(0.0))
-    s.store_float(b_post, s.iadd(post_pix_base, s.uint(6)), s.float(0.0))
-    s.store_float(b_post, s.iadd(post_pix_base, s.uint(7)), s.float(0.0))
-    s.end_if()
-    s.begin_if(demod_spec)
-    var zero_f16 = s.pack_f16x2(s.float(0.0), s.float(0.0))
-    var sky_r_f16 = s.pack_f16x2(s.float(0.0), s.float(1.0))
-    var sky_t_f16 = s.pack_f16x2(s.float(0.0), s.float(32768.0))
-    s.store_word(b_hist, spec_pix_base, zero_f16)
-    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(1)), sky_r_f16)
-    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(2)), zero_f16)
-    s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(3)), sky_t_f16)
-    s.end_if()
-    s.store_float(b_hdr, out_pix_base, s.select_f(demod_gi, s.float(0.0), bg_r))
-    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(1)), s.select_f(demod_gi, s.float(0.0), bg_g))
-    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(2)), s.select_f(demod_gi, s.float(0.0), bg_b))
-    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(3)), s.float(1e6))
-    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(4)), s.float(0.0))
-    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(5)), s.float(0.0))
-    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(6)), s.float(0.0))
-    s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(7)), s.float(0.0))
-    s.begin_else()
+    if is_all:
+        # Sky background pixel (`vis0 == 0`)
+        s.begin_if(s.ieq(vis0, s.uint(0)))
+        var env_bg = s.sample_cube_lod(env_cube, s.vec3(ray_c[0], ray_c[1], ray_c[2]), s.float(0.0))
+        var bg_r_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 0)))
+        var bg_g_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 1)))
+        var bg_b_v = s.fvar(s.select_f(is_furnace, s.float(1.0), s.extract_f(env_bg, 2)))
+        s.begin_if(s.logical_not(is_furnace))
+        var nubis_bg = emit_nubis_sky_clouds_and_celestial_spv(
+            s, b_globals, env_cube,
+            ray_c[0], ray_c[1], ray_c[2], fh,
+            s.load_f(bg_r_v), s.load_f(bg_g_v), s.load_f(bg_b_v),
+        )
+        s.store(bg_r_v, nubis_bg[0])
+        s.store(bg_g_v, nubis_bg[1])
+        s.store(bg_b_v, nubis_bg[2])
+        s.end_if()
+        var bg_r = s.load_f(bg_r_v)
+        var bg_g = s.load_f(bg_g_v)
+        var bg_b = s.load_f(bg_b_v)
+        s.begin_if(demod_gi)
+        s.store_float(b_post, post_pix_base, bg_r)
+        s.store_float(b_post, s.iadd(post_pix_base, s.uint(1)), bg_g)
+        s.store_float(b_post, s.iadd(post_pix_base, s.uint(2)), bg_b)
+        s.store_float(b_post, s.iadd(post_pix_base, s.uint(3)), s.float(0.0))
+        s.store_float(b_post, s.iadd(post_pix_base, s.uint(4)), s.float(0.0))
+        s.store_float(b_post, s.iadd(post_pix_base, s.uint(5)), s.float(0.0))
+        s.store_float(b_post, s.iadd(post_pix_base, s.uint(6)), s.float(0.0))
+        s.store_float(b_post, s.iadd(post_pix_base, s.uint(7)), s.float(0.0))
+        s.end_if()
+        s.begin_if(demod_spec)
+        var zero_f16 = s.pack_f16x2(s.float(0.0), s.float(0.0))
+        var sky_r_f16 = s.pack_f16x2(s.float(0.0), s.float(1.0))
+        var sky_t_f16 = s.pack_f16x2(s.float(0.0), s.float(32768.0))
+        s.store_word(b_hist, spec_pix_base, zero_f16)
+        s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(1)), sky_r_f16)
+        s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(2)), zero_f16)
+        s.store_word(b_hist, s.iadd(spec_pix_base, s.uint(3)), sky_t_f16)
+        s.end_if()
+        s.store_float(b_hdr, out_pix_base, s.select_f(demod_gi, s.float(0.0), bg_r))
+        s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(1)), s.select_f(demod_gi, s.float(0.0), bg_g))
+        s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(2)), s.select_f(demod_gi, s.float(0.0), bg_b))
+        s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(3)), s.float(1e6))
+        s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(4)), s.float(0.0))
+        s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(5)), s.float(0.0))
+        s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(6)), s.float(0.0))
+        s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(7)), s.float(0.0))
+        s.begin_else()
 
-    # Decode 64-bit VisBuffer payload
-    var inst_id = s.shr(vis0, s.uint(17))
-    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
+    # Decode 40-bit VisBuffer payload (22-bit ml_id, 18-bit inst_id, 16-bit mat_id, 8-bit prim_id)
+    var inst_id = s.bit_or(
+        s.shr(vis0, s.uint(22)),
+        s.shl(s.bit_and(s.shr(vis1, s.uint(8)), s.uint(0xFF)), s.uint(10)),
+    )
+    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x3FFFFF)), s.uint(1))
     var mat_id = s.shr(vis1, s.uint(16))
-    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
+    var local_prim = s.bit_and(vis1, s.uint(0xFF))
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var first_tri = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(8)))
@@ -1246,7 +1854,7 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var rough = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(4))))
     var metal = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(5))))
     var ccoat = s.load_float(b_materials, s.iadd(m_base, s.uint(6)))
-    var ccoat_r_v = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(7))))
+    var ccoat_r_v = s.fvar(s.fabs(s.load_float(b_materials, s.iadd(m_base, s.uint(7)))))
     var em_r_v = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(8))))
     var em_g_v = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(9))))
     var em_b_v = s.fvar(s.load_float(b_materials, s.iadd(m_base, s.uint(10))))
@@ -1260,7 +1868,7 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var sh_r = s.load_float(b_materials, s.iadd(m_base, s.uint(16)))
     var sh_g = s.load_float(b_materials, s.iadd(m_base, s.uint(17)))
     var sh_b = s.load_float(b_materials, s.iadd(m_base, s.uint(18)))
-    var sh_rough = s.load_float(b_materials, s.iadd(m_base, s.uint(19)))
+    var sh_rough = s.fabs(s.load_float(b_materials, s.iadd(m_base, s.uint(19))))
     var sss_r = s.load_float(b_materials, s.iadd(m_base, s.uint(20)))
     var sss_g = s.load_float(b_materials, s.iadd(m_base, s.uint(21)))
     var sss_b = s.load_float(b_materials, s.iadd(m_base, s.uint(22)))
@@ -1289,84 +1897,115 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var road_paint_orm_v = s.fvar(s.float(-1.0))
 
     # 4-Layer Frostbite Height-Modulated Terrain Splatting (`(meta0 & 2) != 0`) vs Standard Mesh
-    var is_terrain_splat = s.ine(s.bit_and(meta0, s.uint(2)), s.uint(0))
-    s.begin_if(s.logical_and(is_terrain_splat, s.ult(t_alb, s.uint(250))))
-    var inv255 = s.float(1.0 / 255.0)
-    var w_sand = s.fmul(s.fma(s.float_from_uint(s.bit_and(s.shr(meta0, s.uint(8)), s.uint(0xFF))), b0, s.fma(s.float_from_uint(s.bit_and(s.shr(meta1, s.uint(8)), s.uint(0xFF))), b1, s.fmul(s.float_from_uint(s.bit_and(s.shr(meta2, s.uint(8)), s.uint(0xFF))), b2))), inv255)
-    var w_rock = s.fmul(s.fma(s.float_from_uint(s.bit_and(s.shr(meta0, s.uint(16)), s.uint(0xFF))), b0, s.fma(s.float_from_uint(s.bit_and(s.shr(meta1, s.uint(16)), s.uint(0xFF))), b1, s.fmul(s.float_from_uint(s.bit_and(s.shr(meta2, s.uint(16)), s.uint(0xFF))), b2))), inv255)
-    var w_cobb = s.fmul(s.fma(s.float_from_uint(s.shr(meta0, s.uint(24))), b0, s.fma(s.float_from_uint(s.shr(meta1, s.uint(24))), b1, s.fmul(s.float_from_uint(s.shr(meta2, s.uint(24))), b2))), inv255)
-    var w_gras = s.nmax(s.float(0.0), s.fsub(s.float(1.0), s.fadd(w_sand, s.fadd(w_rock, w_cobb))))
+    if emit_terrain:
+        var is_terrain_splat = s.ine(s.bit_and(meta0, s.uint(2)), s.uint(0))
+        var tc_active = s.ine(
+            s.bit_and(s.load_word(b_globals, s.uint(UInt32(AAA_GLOBALS_TERRAIN_META_WORD))), s.uint(1)),
+            s.uint(0),
+        )
+        s.begin_if(s.logical_and(is_terrain_splat, s.logical_or(s.ult(t_alb, s.uint(250)), tc_active)))
+        var inv255 = s.float(1.0 / 255.0)
+        var w_sand = s.fmul(s.fma(s.float_from_uint(s.bit_and(s.shr(meta0, s.uint(8)), s.uint(0xFF))), b0, s.fma(s.float_from_uint(s.bit_and(s.shr(meta1, s.uint(8)), s.uint(0xFF))), b1, s.fmul(s.float_from_uint(s.bit_and(s.shr(meta2, s.uint(8)), s.uint(0xFF))), b2))), inv255)
+        var w_rock = s.fmul(s.fma(s.float_from_uint(s.bit_and(s.shr(meta0, s.uint(16)), s.uint(0xFF))), b0, s.fma(s.float_from_uint(s.bit_and(s.shr(meta1, s.uint(16)), s.uint(0xFF))), b1, s.fmul(s.float_from_uint(s.bit_and(s.shr(meta2, s.uint(16)), s.uint(0xFF))), b2))), inv255)
+        var w_cobb = s.fmul(s.fma(s.float_from_uint(s.shr(meta0, s.uint(24))), b0, s.fma(s.float_from_uint(s.shr(meta1, s.uint(24))), b1, s.fmul(s.float_from_uint(s.shr(meta2, s.uint(24))), b2))), inv255)
+        var w_gras = s.nmax(s.float(0.0), s.fsub(s.float(1.0), s.fadd(w_sand, s.fadd(w_rock, w_cobb))))
 
-    var w_arr = [w_gras, w_sand, w_rock, w_cobb]
-    var r_arr = [s.float(0.82), s.float(0.64), s.float(0.74), s.float(0.48)]
-    var ar_k = List[UInt32]()
-    var ag_k = List[UInt32]()
-    var ab_k = List[UInt32]()
-    var hk_arr = List[UInt32]()
-    for k_sp in range(4):
-        var slot_a = s.umin(s.uint(255), s.iadd(t_alb, s.uint(UInt32(k_sp * 2))))
-        var s_sp = s.sample_bindless_grad(bindless_arr, slot_a, uv_vec, ddx_vec, ddy_vec)
-        var lr_k = s.extract_f(s_sp, 0)
-        var lg_k = s.extract_f(s_sp, 1)
-        var lb_k = s.extract_f(s_sp, 2)
-        if k_sp == 0:
-            # Macro park lawn-mower stripes + 26m/68m chlorophyll FBM (zero grass tiling repetition!)
-            var mow = s.fmul(s.fsin(s.fmul(s.fma(wx, s.float(0.78), s.fmul(wz, s.float(0.62))), s.float(1.95))), s.float(0.055))
-            var ch_a = s.fmul(s.fsin(s.fma(wx, s.float(0.095), s.fmul(wz, s.float(0.072)))), s.fcos(s.fma(wx, s.float(-0.061), s.fmul(wz, s.float(0.108)))))
-            var ch_b = s.fmul(s.fsin(s.fma(wx, s.float(0.240), s.fmul(wz, s.float(-0.195)))), s.float(0.45))
-            var ch_m = s.nclamp(s.fma(ch_a, s.float(0.65), ch_b), s.float(-1.0), s.float(1.0))
-            var gr_mr = s.select_f(is_furnace, s.float(1.0), s.fma(ch_m, s.float(-0.07), s.fadd(s.float(1.0), mow)))
-            var gr_mg = s.select_f(is_furnace, s.float(1.0), s.fma(ch_m, s.float(0.09), s.fadd(s.float(1.0), mow)))
-            var gr_mb = s.select_f(is_furnace, s.float(1.0), s.fma(ch_m, s.float(0.03), s.fadd(s.float(1.0), s.fmul(mow, s.float(0.7)))))
-            lr_k = s.fmul(lr_k, gr_mr)
-            lg_k = s.fmul(lg_k, gr_mg)
-            lb_k = s.fmul(lb_k, gr_mb)
-        ar_k.append(lr_k)
-        ag_k.append(lg_k)
-        ab_k.append(lb_k)
-        var h_raw = s.fadd(w_arr[k_sp], s.extract_f(s_sp, 3))
-        hk_arr.append(s.select_f(s.fgt(w_arr[k_sp], s.float(0.002)), h_raw, s.float(-10.0)))
+        var w_arr = [w_gras, w_sand, w_rock, w_cobb]
+        var r_arr = [s.float(0.82), s.float(0.64), s.float(0.74), s.float(0.48)]
+        var proc_r = [Float32(0.18), Float32(0.52), Float32(0.32), Float32(0.74)]
+        var proc_g = [Float32(0.34), Float32(0.45), Float32(0.31), Float32(0.77)]
+        var proc_b = [Float32(0.11), Float32(0.28), Float32(0.30), Float32(0.82)]
+        var ar_k = List[UInt32]()
+        var ag_k = List[UInt32]()
+        var ab_k = List[UInt32]()
+        var hk_arr = List[UInt32]()
+        for k_sp in range(4):
+            var clip_alb_pk = s.load_word(b_globals, s.uint(UInt32(AAA_GLOBALS_TERRAIN_CLIPMAP_WORD + 8 + (k_sp >> 1))))
+            var clip_alb_slot = s.bit_and(s.shr(clip_alb_pk, s.uint(UInt32((k_sp & 1) * 16))), s.uint(0xFFFF))
+            var has_clip_alb = s.logical_and(tc_active, s.ult(clip_alb_slot, s.uint(UInt32(AAA_MAX_BINDLESS))))
+            var has_legacy_alb = s.ult(t_alb, s.uint(250))
+            var lr_k_v = s.fvar(s.float(proc_r[k_sp]))
+            var lg_k_v = s.fvar(s.float(proc_g[k_sp]))
+            var lb_k_v = s.fvar(s.float(proc_b[k_sp]))
+            var h_bias_v = s.fvar(s.float(0.0))
+            s.begin_if(s.logical_or(has_clip_alb, has_legacy_alb))
+            var legacy_slot_a = s.umin(s.uint(255), s.iadd(t_alb, s.uint(UInt32(k_sp * 2))))
+            var slot_a = s.select_u(has_clip_alb, clip_alb_slot, legacy_slot_a)
+            var s_sp = s.sample_bindless_grad(bindless_arr, slot_a, uv_vec, ddx_vec, ddy_vec)
+            s.store(lr_k_v, s.extract_f(s_sp, 0))
+            s.store(lg_k_v, s.extract_f(s_sp, 1))
+            s.store(lb_k_v, s.extract_f(s_sp, 2))
+            s.store(h_bias_v, s.extract_f(s_sp, 3))
+            s.end_if()
+            var lr_k = s.load_f(lr_k_v)
+            var lg_k = s.load_f(lg_k_v)
+            var lb_k = s.load_f(lb_k_v)
+            if k_sp == 0:
+                # Macro park lawn-mower stripes + 26m/68m chlorophyll FBM (zero grass tiling repetition!)
+                var mow = s.fmul(s.fsin(s.fmul(s.fma(wx, s.float(0.78), s.fmul(wz, s.float(0.62))), s.float(1.95))), s.float(0.055))
+                var ch_a = s.fmul(s.fsin(s.fma(wx, s.float(0.095), s.fmul(wz, s.float(0.072)))), s.fcos(s.fma(wx, s.float(-0.061), s.fmul(wz, s.float(0.108)))))
+                var ch_b = s.fmul(s.fsin(s.fma(wx, s.float(0.240), s.fmul(wz, s.float(-0.195)))), s.float(0.45))
+                var ch_m = s.nclamp(s.fma(ch_a, s.float(0.65), ch_b), s.float(-1.0), s.float(1.0))
+                var gr_mr = s.select_f(is_furnace, s.float(1.0), s.fma(ch_m, s.float(-0.07), s.fadd(s.float(1.0), mow)))
+                var gr_mg = s.select_f(is_furnace, s.float(1.0), s.fma(ch_m, s.float(0.09), s.fadd(s.float(1.0), mow)))
+                var gr_mb = s.select_f(is_furnace, s.float(1.0), s.fma(ch_m, s.float(0.03), s.fadd(s.float(1.0), s.fmul(mow, s.float(0.7)))))
+                lr_k = s.fmul(lr_k, gr_mr)
+                lg_k = s.fmul(lg_k, gr_mg)
+                lb_k = s.fmul(lb_k, gr_mb)
+            ar_k.append(lr_k)
+            ag_k.append(lg_k)
+            ab_k.append(lb_k)
+            var h_raw = s.fadd(w_arr[k_sp], s.load_f(h_bias_v))
+            hk_arr.append(s.select_f(s.fgt(w_arr[k_sp], s.float(0.002)), h_raw, s.float(-10.0)))
 
-    var h_max = s.nmax(s.nmax(hk_arr[0], hk_arr[1]), s.nmax(hk_arr[2], hk_arr[3]))
-    var tw_arr = List[UInt32]()
-    for k_sp in range(4):
-        var dh = s.nmax(s.float(0.0), s.fadd(s.fsub(hk_arr[k_sp], h_max), s.float(0.16)))
-        var tw = s.select_f(s.fgt(w_arr[k_sp], s.float(0.002)), s.fmul(dh, dh), s.float(0.0))
-        tw_arr.append(tw)
-    var inv_tw = s.fdiv(s.float(1.0), s.nmax(s.float(1e-5), s.fadd(s.fadd(tw_arr[0], tw_arr[1]), s.fadd(tw_arr[2], tw_arr[3]))))
-    var nw0 = s.fmul(tw_arr[0], inv_tw); var nw1 = s.fmul(tw_arr[1], inv_tw)
-    var nw2 = s.fmul(tw_arr[2], inv_tw); var nw3 = s.fmul(tw_arr[3], inv_tw)
-    var nw_list = [nw0, nw1, nw2, nw3]
+        var h_max = s.nmax(s.nmax(hk_arr[0], hk_arr[1]), s.nmax(hk_arr[2], hk_arr[3]))
+        var tw_arr = List[UInt32]()
+        for k_sp in range(4):
+            var dh = s.nmax(s.float(0.0), s.fadd(s.fsub(hk_arr[k_sp], h_max), s.float(0.16)))
+            var tw = s.select_f(s.fgt(w_arr[k_sp], s.float(0.002)), s.fmul(dh, dh), s.float(0.0))
+            tw_arr.append(tw)
+        var inv_tw = s.fdiv(s.float(1.0), s.nmax(s.float(1e-5), s.fadd(s.fadd(tw_arr[0], tw_arr[1]), s.fadd(tw_arr[2], tw_arr[3]))))
+        var nw0 = s.fmul(tw_arr[0], inv_tw); var nw1 = s.fmul(tw_arr[1], inv_tw)
+        var nw2 = s.fmul(tw_arr[2], inv_tw); var nw3 = s.fmul(tw_arr[3], inv_tw)
+        var nw_list = [nw0, nw1, nw2, nw3]
 
-    var sp_ar = s.fma(ar_k[0], nw0, s.fma(ar_k[1], nw1, s.fma(ar_k[2], nw2, s.fmul(ar_k[3], nw3))))
-    var sp_ag = s.fma(ag_k[0], nw0, s.fma(ag_k[1], nw1, s.fma(ag_k[2], nw2, s.fmul(ag_k[3], nw3))))
-    var sp_ab = s.fma(ab_k[0], nw0, s.fma(ab_k[1], nw1, s.fma(ab_k[2], nw2, s.fmul(ab_k[3], nw3))))
-    var sp_rg = s.fma(r_arr[0], nw0, s.fma(r_arr[1], nw1, s.fma(r_arr[2], nw2, s.fmul(r_arr[3], nw3))))
-    s.store(alb_r, s.fmul(s.load_f(alb_r), sp_ar))
-    s.store(alb_g, s.fmul(s.load_f(alb_g), sp_ag))
-    s.store(alb_b, s.fmul(s.load_f(alb_b), sp_ab))
-    s.store(rough, s.nclamp(sp_rg, s.float(0.04), s.float(1.0)))
+        var sp_ar = s.fma(ar_k[0], nw0, s.fma(ar_k[1], nw1, s.fma(ar_k[2], nw2, s.fmul(ar_k[3], nw3))))
+        var sp_ag = s.fma(ag_k[0], nw0, s.fma(ag_k[1], nw1, s.fma(ag_k[2], nw2, s.fmul(ag_k[3], nw3))))
+        var sp_ab = s.fma(ab_k[0], nw0, s.fma(ab_k[1], nw1, s.fma(ab_k[2], nw2, s.fmul(ab_k[3], nw3))))
+        var sp_rg = s.fma(r_arr[0], nw0, s.fma(r_arr[1], nw1, s.fma(r_arr[2], nw2, s.fmul(r_arr[3], nw3))))
+        s.store(alb_r, s.fmul(s.load_f(alb_r), sp_ar))
+        s.store(alb_g, s.fmul(s.load_f(alb_g), sp_ag))
+        s.store(alb_b, s.fmul(s.load_f(alb_b), sp_ab))
+        s.store(rough, s.nclamp(sp_rg, s.float(0.04), s.float(1.0)))
 
-    s.begin_if(s.ult(t_nrm, s.uint(250)))
-    var acc_nx = s.fvar(s.float(0.0))
-    var acc_ny = s.fvar(s.float(0.0))
-    var acc_nz = s.fvar(s.float(0.0))
-    for k_sp in range(4):
-        s.begin_if(s.fgt(nw_list[k_sp], s.float(0.01)))
-        var slot_n = s.umin(s.uint(255), s.iadd(t_nrm, s.uint(UInt32(k_sp * 2))))
-        var sn_sp = s.sample_bindless_grad(bindless_arr, slot_n, uv_vec, ddx_vec, ddy_vec)
-        var snx = s.fma(s.extract_f(sn_sp, 0), s.float(2.0), s.float(-1.0))
-        var sny = s.fma(s.extract_f(sn_sp, 1), s.float(2.0), s.float(-1.0))
-        var snz = s.fsqrt(s.nmax(s.float(0.0), s.fsub(s.float(1.0), s.fma(snx, snx, s.fmul(sny, sny)))))
-        s.store(acc_nx, s.fma(snx, nw_list[k_sp], s.load_f(acc_nx)))
-        s.store(acc_ny, s.fma(sny, nw_list[k_sp], s.load_f(acc_ny)))
-        s.store(acc_nz, s.fma(snz, nw_list[k_sp], s.load_f(acc_nz)))
+        s.begin_if(s.logical_or(s.ult(t_nrm, s.uint(250)), tc_active))
+        var acc_nx = s.fvar(s.float(0.0))
+        var acc_ny = s.fvar(s.float(0.0))
+        var acc_nz = s.fvar(s.float(0.0))
+        for k_sp in range(4):
+            var clip_nrm_pk = s.load_word(b_globals, s.uint(UInt32(AAA_GLOBALS_TERRAIN_CLIPMAP_WORD + 10 + (k_sp >> 1))))
+            var clip_nrm_slot = s.bit_and(s.shr(clip_nrm_pk, s.uint(UInt32((k_sp & 1) * 16))), s.uint(0xFFFF))
+            var has_clip_nrm = s.logical_and(tc_active, s.ult(clip_nrm_slot, s.uint(UInt32(AAA_MAX_BINDLESS))))
+            var has_legacy_nrm = s.ult(t_nrm, s.uint(250))
+            s.begin_if(s.logical_and(s.fgt(nw_list[k_sp], s.float(0.01)), s.logical_or(has_clip_nrm, has_legacy_nrm)))
+            var legacy_slot_n = s.umin(s.uint(255), s.iadd(t_nrm, s.uint(UInt32(k_sp * 2))))
+            var slot_n = s.select_u(has_clip_nrm, clip_nrm_slot, legacy_slot_n)
+            var sn_sp = s.sample_bindless_grad(bindless_arr, slot_n, uv_vec, ddx_vec, ddy_vec)
+            var snx = s.fma(s.extract_f(sn_sp, 0), s.float(2.0), s.float(-1.0))
+            var sny = s.fma(s.extract_f(sn_sp, 1), s.float(2.0), s.float(-1.0))
+            var snz = s.fsqrt(s.nmax(s.float(0.0), s.fsub(s.float(1.0), s.fma(snx, snx, s.fmul(sny, sny)))))
+            s.store(acc_nx, s.fma(snx, nw_list[k_sp], s.load_f(acc_nx)))
+            s.store(acc_ny, s.fma(sny, nw_list[k_sp], s.load_f(acc_ny)))
+            s.store(acc_nz, s.fma(snz, nw_list[k_sp], s.load_f(acc_nz)))
+            s.begin_else()
+            s.store(acc_nz, s.fadd(s.load_f(acc_nz), nw_list[k_sp]))
+            s.end_if()
+        var sp_tn = emit_vec3_normalize(s, s.load_f(acc_nx), s.load_f(acc_ny), s.nmax(s.float(0.05), s.load_f(acc_nz)))
+        s.store(tn_x, sp_tn[0]); s.store(tn_y, sp_tn[1]); s.store(tn_z, sp_tn[2])
         s.end_if()
-    var sp_tn = emit_vec3_normalize(s, s.load_f(acc_nx), s.load_f(acc_ny), s.nmax(s.float(0.05), s.load_f(acc_nz)))
-    s.store(tn_x, sp_tn[0]); s.store(tn_y, sp_tn[1]); s.store(tn_z, sp_tn[2])
-    s.end_if()
 
-    s.begin_else()
+        s.begin_else()
+
     s.begin_if(s.ult(t_alb, s.uint(0xFF)))
     var s_alb = s.sample_bindless_grad(bindless_arr, t_alb, uv_vec, ddx_vec, ddy_vec)
     var sa_r = s.extract_f(s_alb, 0)
@@ -1399,13 +2038,16 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(mat_ao, s.fmul(s.load_f(mat_ao), s.extract_f(s_orm, 0)))
     s.store(rough, s.nclamp(s.fmul(s.load_f(rough), s.extract_f(s_orm, 1)), s.float(0.04), s.float(1.0)))
     var orm_b = s.extract_f(s_orm, 2)
-    s.begin_if(is_wet_road_mat)
-    # On road materials, `ORM.b` carries explicit thermoplastic lane-paint mask (`metal = 0.0`)!
-    s.store(road_paint_orm_v, orm_b)
-    s.store(metal, s.float(0.0))
-    s.begin_else()
-    s.store(metal, s.nclamp(s.fmul(s.load_f(metal), orm_b), s.float(0.0), s.float(1.0)))
-    s.end_if()
+    if emit_wetness:
+        s.begin_if(is_wet_road_mat)
+        # On road materials, `ORM.b` carries explicit thermoplastic lane-paint mask (`metal = 0.0`)!
+        s.store(road_paint_orm_v, orm_b)
+        s.store(metal, s.float(0.0))
+        s.begin_else()
+        s.store(metal, s.nclamp(s.fmul(s.load_f(metal), orm_b), s.float(0.0), s.float(1.0)))
+        s.end_if()
+    else:
+        s.store(metal, s.nclamp(s.fmul(s.load_f(metal), orm_b), s.float(0.0), s.float(1.0)))
     s.end_if()
 
     # Macro + Micro-Detail BC5 Tangent Normal Mapping (`RNM`)
@@ -1417,9 +2059,13 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(tn_x, mx); s.store(tn_y, my); s.store(tn_z, mz)
     s.end_if()
 
-    var has_det_nrm = s.logical_and(
-        s.logical_not(has_int_parallax),
-        s.logical_and(s.ult(t_det, s.uint(AAA_MAT_DET_NONE)), s.fgt(det_str, s.float(0.001))),
+    var has_det_nrm = (
+        s.logical_and(
+            s.logical_not(has_int_parallax),
+            s.logical_and(s.ult(t_det, s.uint(AAA_MAT_DET_NONE)), s.fgt(det_str, s.float(0.001))),
+        )
+        if emit_parallax
+        else s.logical_and(s.ult(t_det, s.uint(AAA_MAT_DET_NONE)), s.fgt(det_str, s.float(0.001)))
     )
     s.begin_if(has_det_nrm)
     var det_uv = s.vec2(s.fmul(uv_u, det_scale), s.fmul(uv_v, det_scale))
@@ -1432,7 +2078,8 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var rnm = emit_rnm_blend(s, s.load_f(tn_x), s.load_f(tn_y), s.load_f(tn_z), dx_n, dy_n, dz_n, det_str)
     s.store(tn_x, rnm[0]); s.store(tn_y, rnm[1]); s.store(tn_z, rnm[2])
     s.end_if()
-    s.end_if()
+    if emit_terrain:
+        s.end_if()
 
     var lx_n = s.load_f(tn_x); var ly_n = s.load_f(tn_y); var lz_n = s.load_f(tn_z)
     var wn = emit_vec3_normalize(
@@ -1550,53 +2197,55 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.end_if()
 
     # ForzaTech Physical Road Wetness (`is_wet_road_mat && weather_wetness > 0.001`)
-    var weather_wetness = s.load_float(b_globals, s.uint(124))
     var wet_retro_v = s.fvar(s.float(0.0))
-    s.begin_if(s.logical_and(s.logical_not(is_furnace), s.logical_and(is_wet_road_mat, s.fgt(weather_wetness, s.float(0.001)))))
-    var rain_int_g = s.load_float(b_globals, s.uint(125))
-    var time_sec_g = s.load_float(b_globals, s.uint(123))
-    var damp_unsub = _emit_forzatech_road_wetness_spv(
-        s,
-        weather_wetness,
-        rain_int_g,
-        time_sec_g,
-        wx,
-        wz,
-        uv_u,
-        cam_dist,
-        s.load_f(road_paint_orm_v),
-        alb_r,
-        alb_g,
-        alb_b,
-        rough,
-        metal,
-        spec_fac_v,
-        nx_v,
-        ny_v,
-        nz_v,
-    )
-    s.store(wet_retro_v, damp_unsub)
-    s.end_if()
+    if emit_wetness:
+        var weather_wetness = s.load_float(b_globals, s.uint(124))
+        s.begin_if(s.logical_and(s.logical_not(is_furnace), s.logical_and(is_wet_road_mat, s.fgt(weather_wetness, s.float(0.001)))))
+        var rain_int_g = s.load_float(b_globals, s.uint(125))
+        var time_sec_g = s.load_float(b_globals, s.uint(123))
+        var damp_unsub = _emit_forzatech_road_wetness_spv(
+            s,
+            weather_wetness,
+            rain_int_g,
+            time_sec_g,
+            wx,
+            wz,
+            uv_u,
+            cam_dist,
+            s.load_f(road_paint_orm_v),
+            alb_r,
+            alb_g,
+            alb_b,
+            rough,
+            metal,
+            spec_fac_v,
+            nx_v,
+            ny_v,
+            nz_v,
+        )
+        s.store(wet_retro_v, damp_unsub)
+        s.end_if()
 
     # GPU Tangent-Space 3D Ray-Box Parallax Interior Mapping (`AAA_MAT_INTERIOR_PARALLAX` && `metal < 0.45`)
-    s.begin_if(s.logical_and(s.logical_not(is_furnace), s.logical_and(has_int_parallax, s.flt(s.load_f(metal), s.float(0.45)))))
-    var win_rgb = _emit_parallax_windowbox_spv(
-        s,
-        bindless_arr,
-        t_det,
-        inst_id,
-        uv_u,
-        uv_v,
-        cam_dist,
-        ray_c[0], ray_c[1], ray_c[2],
-        wt_u[0], wt_u[1], wt_u[2],
-        wb_u[0], wb_u[1], wb_u[2],
-        nx_v, ny_v, nz_v,
-    )
-    s.store(em_r_v, s.fadd(s.load_f(em_r_v), win_rgb[0]))
-    s.store(em_g_v, s.fadd(s.load_f(em_g_v), win_rgb[1]))
-    s.store(em_b_v, s.fadd(s.load_f(em_b_v), win_rgb[2]))
-    s.end_if()
+    if emit_parallax:
+        s.begin_if(s.logical_and(s.logical_not(is_furnace), s.logical_and(has_int_parallax, s.flt(s.load_f(metal), s.float(0.45)))))
+        var win_rgb = _emit_parallax_windowbox_spv(
+            s,
+            bindless_arr,
+            t_det,
+            inst_id,
+            uv_u,
+            uv_v,
+            cam_dist,
+            ray_c[0], ray_c[1], ray_c[2],
+            wt_u[0], wt_u[1], wt_u[2],
+            wb_u[0], wb_u[1], wb_u[2],
+            nx_v, ny_v, nz_v,
+        )
+        s.store(em_r_v, s.fadd(s.load_f(em_r_v), win_rgb[0]))
+        s.store(em_g_v, s.fadd(s.load_f(em_g_v), win_rgb[1]))
+        s.store(em_b_v, s.fadd(s.load_f(em_b_v), win_rgb[2]))
+        s.end_if()
 
     var nx = s.load_f(nx_v)
     var ny = s.load_f(ny_v)
@@ -1621,7 +2270,11 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var base_f0_r = s.fma(diel_f0, one_m_met, s.fmul(cur_alb_r, cur_metal))
     var base_f0_g = s.fma(diel_f0, one_m_met, s.fmul(cur_alb_g, cur_metal))
     var base_f0_b = s.fma(diel_f0, one_m_met, s.fmul(cur_alb_b, cur_metal))
-    var f0 = emit_iridescence_f0(s, base_f0_r, base_f0_g, base_f0_b, ndotv, irid_w, irid_nm, irid_ior)
+    var f0 = (
+        emit_iridescence_f0(s, base_f0_r, base_f0_g, base_f0_b, ndotv, irid_w, irid_nm, irid_ior)
+        if emit_iridescence
+        else (base_f0_r, base_f0_g, base_f0_b)
+    )
 
     # Sample Split-Sum `RG16F` BRDF Integration LUT for Substrate & Clearcoat!
     var lut_uv = s.vec2(s.nclamp(ndotv, s.float(0.01), s.float(0.99)), s.nclamp(cur_rough, s.float(0.01), s.float(0.99)))
@@ -1629,10 +2282,13 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var lut_a = s.extract_f(lut_s, 0)
     var lut_b = s.extract_f(lut_s, 1)
 
-    var lut_cc_uv = s.vec2(s.nclamp(ndotv, s.float(0.01), s.float(0.99)), s.nclamp(ccoat_r, s.float(0.01), s.float(0.99)))
-    var lut_cc = s.sample_2d_lod(brdf_lut, lut_cc_uv, s.float(0.0))
-    var cc_a = s.extract_f(lut_cc, 0)
-    var cc_b = s.extract_f(lut_cc, 1)
+    var cc_a = s.float(0.0)
+    var cc_b = s.float(0.0)
+    if emit_clearcoat:
+        var lut_cc_uv = s.vec2(s.nclamp(ndotv, s.float(0.01), s.float(0.99)), s.nclamp(ccoat_r, s.float(0.01), s.float(0.99)))
+        var lut_cc = s.sample_2d_lod(brdf_lut, lut_cc_uv, s.float(0.0))
+        cc_a = s.extract_f(lut_cc, 0)
+        cc_b = s.extract_f(lut_cc, 1)
 
     # 1. Direct Sun Shadowing (`16k VSM + PCSS` AND/OR `SPV_KHR_ray_query` Contact Shadows!)
     var sun_x = s.load_float(b_globals, s.uint(48))
@@ -1672,6 +2328,9 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         sh_r, sh_g, sh_b, sh_rough,
         sss_r, sss_g, sss_b,
         lut_a, lut_b,
+        enable_clearcoat=emit_clearcoat,
+        enable_sheen=emit_sheen,
+        enable_sss=emit_sss,
     )
     var sv = s.load_f(sun_vis)
     var dir_r = s.fvar(s.fmul(direct[0], s.fmul(sun_rad_r, sv)))
@@ -1918,7 +2577,6 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     # 3. Specular Reflections (`BC6H` Split-Sum Cubemap Occluded by `GTSO` + Bounded `VNDF` Textured RT!)
     var spec_ao = s.select_f(is_furnace, s.float(1.0), s.fmul(s.load_f(mat_ao), s.load_f(rt_ao_v)))
     var gtso_sub = _emit_gtso_spec_occlusion_spv(s, ndotv, spec_ao, cur_rough)
-    var gtso_cc = _emit_gtso_spec_occlusion_spv(s, ndotv, spec_ao, ccoat_r)
 
     var two_nv = s.fmul(s.float(2.0), emit_vec3_dot(s, nx, ny, nz, vx, vy, vz))
     var rx = s.fsub(s.fmul(nx, two_nv), vx)
@@ -1930,7 +2588,6 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var r_dot_bn = s.nclamp(emit_vec3_dot(s, rx, ry, rz, bnx, bny, bnz), s.float(0.0), s.float(1.0))
     var overpass_guard = s.select_f(is_furnace, s.float(1.0), s.fma(s.fsub(s.float(1.0), spec_ao), s.fma(r_dot_bn, s.float(0.75), s.float(0.25)), spec_ao))
     var env_occ_sub = s.fmul(gtso_sub, s.nmin(s.float(1.0), s.fadd(overpass_guard, s.fmul(cur_rough, s.float(0.35)))))
-    var env_occ_cc = s.fmul(gtso_cc, overpass_guard)
 
     var spec_mip = s.fmul(cur_rough, max_env_mip)
     var env_sp = s.sample_cube_lod(env_cube, s.vec3(rx, ry, rz), spec_mip)
@@ -1938,15 +2595,22 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var refl_g = s.fvar(s.select_f(is_furnace, s.float(1.0), s.fmul(s.extract_f(env_sp, 1), s.fmul(ibl_int, env_occ_sub))))
     var refl_b = s.fvar(s.select_f(is_furnace, s.float(1.0), s.fmul(s.extract_f(env_sp, 2), s.fmul(ibl_int, env_occ_sub))))
 
-    var cc_mip = s.fmul(ccoat_r, max_env_mip)
-    var env_cc = s.sample_cube_lod(env_cube, s.vec3(rx, ry, rz), cc_mip)
-    var ccoat_env_r = s.fvar(s.select_f(is_furnace, s.float(1.0), s.fmul(s.extract_f(env_cc, 0), s.fmul(ibl_int, env_occ_cc))))
-    var ccoat_env_g = s.fvar(s.select_f(is_furnace, s.float(1.0), s.fmul(s.extract_f(env_cc, 1), s.fmul(ibl_int, env_occ_cc))))
-    var ccoat_env_b = s.fvar(s.select_f(is_furnace, s.float(1.0), s.fmul(s.extract_f(env_cc, 2), s.fmul(ibl_int, env_occ_cc))))
+    var ccoat_env_r = s.uint(0)
+    var ccoat_env_g = s.uint(0)
+    var ccoat_env_b = s.uint(0)
+    var eff_rt_rough = cur_rough
+    if emit_clearcoat:
+        var gtso_cc = _emit_gtso_spec_occlusion_spv(s, ndotv, spec_ao, ccoat_r)
+        var env_occ_cc = s.fmul(gtso_cc, overpass_guard)
+        var cc_mip = s.fmul(ccoat_r, max_env_mip)
+        var env_cc = s.sample_cube_lod(env_cube, s.vec3(rx, ry, rz), cc_mip)
+        ccoat_env_r = s.fvar(s.select_f(is_furnace, s.float(1.0), s.fmul(s.extract_f(env_cc, 0), s.fmul(ibl_int, env_occ_cc))))
+        ccoat_env_g = s.fvar(s.select_f(is_furnace, s.float(1.0), s.fmul(s.extract_f(env_cc, 1), s.fmul(ibl_int, env_occ_cc))))
+        ccoat_env_b = s.fvar(s.select_f(is_furnace, s.float(1.0), s.fmul(s.extract_f(env_cc, 2), s.fmul(ibl_int, env_occ_cc))))
 
-    # Effective dual-lobe RT roughness: `min(cur_rough, mix(1.0, ccoat_r, ccoat))` so clearcoat cars & rails get true RT!
-    var ccoat_eff_r = s.fma(s.fsub(ccoat_r, s.float(1.0)), ccoat, s.float(1.0))
-    var eff_rt_rough = s.nmin(cur_rough, ccoat_eff_r)
+        # Effective dual-lobe RT roughness: `min(cur_rough, mix(1.0, ccoat_r, ccoat))` so clearcoat cars & rails get true RT!
+        var ccoat_eff_r = s.fma(s.fsub(ccoat_r, s.float(1.0)), ccoat, s.float(1.0))
+        eff_rt_rough = s.nmin(cur_rough, ccoat_eff_r)
     var spec_hit_t = s.fvar(s.float(32768.0))
 
     if enable_ray_query:
@@ -2031,13 +2695,14 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         s.store(refl_b, s.fma(hb_c, sub_bw, s.fmul(s.load_f(refl_b), om_sbw)))
 
         # 3b. Route RT reflection into top Clearcoat `ccoat_env_rgb` (`Vanguard GT-R` paint & `MojoCoaster` rails!)
-        s.begin_if(s.fgt(ccoat, s.float(0.001)))
-        var cc_fade = s.nclamp(s.fdiv(s.fsub(s.float(0.58), ccoat_r), s.float(0.24)), s.float(0.0), s.float(1.0))
-        var om_ccw = s.fsub(s.float(1.0), cc_fade)
-        s.store(ccoat_env_r, s.fma(hr_c, cc_fade, s.fmul(s.load_f(ccoat_env_r), om_ccw)))
-        s.store(ccoat_env_g, s.fma(hg_c, cc_fade, s.fmul(s.load_f(ccoat_env_g), om_ccw)))
-        s.store(ccoat_env_b, s.fma(hb_c, cc_fade, s.fmul(s.load_f(ccoat_env_b), om_ccw)))
-        s.end_if()
+        if emit_clearcoat:
+            s.begin_if(s.fgt(ccoat, s.float(0.001)))
+            var cc_fade = s.nclamp(s.fdiv(s.fsub(s.float(0.58), ccoat_r), s.float(0.24)), s.float(0.0), s.float(1.0))
+            var om_ccw = s.fsub(s.float(1.0), cc_fade)
+            s.store(ccoat_env_r, s.fma(hr_c, cc_fade, s.fmul(s.load_f(ccoat_env_r), om_ccw)))
+            s.store(ccoat_env_g, s.fma(hg_c, cc_fade, s.fmul(s.load_f(ccoat_env_g), om_ccw)))
+            s.store(ccoat_env_b, s.fma(hb_c, cc_fade, s.fmul(s.load_f(ccoat_env_b), om_ccw)))
+            s.end_if()
         s.end_if()
         s.end_if()
 
@@ -2066,32 +2731,44 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var raw_dao = s.select_f(is_furnace, s.float(1.0), s.load_f(diff_ao_v))
     var mb_ao = _emit_jimenez_multibounce_ao_spv(s, raw_dao, cur_alb_r, cur_alb_g, cur_alb_b)
 
-    var r_coat = s.fmul(ccoat, s.fadd(s.fmul(s.float(0.04), cc_a), cc_b))
-    var om_rc = s.fsub(s.float(1.0), r_coat)
+    var r_coat = s.fmul(ccoat, s.fadd(s.fmul(s.float(0.04), cc_a), cc_b)) if emit_clearcoat else s.float(0.0)
+    var om_rc = s.fsub(s.float(1.0), r_coat) if emit_clearcoat else s.float(1.0)
 
     # Combined substrate + clearcoat specular outgoing radiance & demodulation factor `mod_rgb`
-    var spec_out_r = s.fma(r_coat, s.load_f(ccoat_env_r), s.fmul(om_rc, s.fmul(spec_tot_r, s.load_f(refl_r))))
-    var spec_out_g = s.fma(r_coat, s.load_f(ccoat_env_g), s.fmul(om_rc, s.fmul(spec_tot_g, s.load_f(refl_g))))
-    var spec_out_b = s.fma(r_coat, s.load_f(ccoat_env_b), s.fmul(om_rc, s.fmul(spec_tot_b, s.load_f(refl_b))))
+    var spec_out_r = (
+        s.fma(r_coat, s.load_f(ccoat_env_r), s.fmul(om_rc, s.fmul(spec_tot_r, s.load_f(refl_r))))
+        if emit_clearcoat
+        else s.fmul(spec_tot_r, s.load_f(refl_r))
+    )
+    var spec_out_g = (
+        s.fma(r_coat, s.load_f(ccoat_env_g), s.fmul(om_rc, s.fmul(spec_tot_g, s.load_f(refl_g))))
+        if emit_clearcoat
+        else s.fmul(spec_tot_g, s.load_f(refl_g))
+    )
+    var spec_out_b = (
+        s.fma(r_coat, s.load_f(ccoat_env_b), s.fmul(om_rc, s.fmul(spec_tot_b, s.load_f(refl_b))))
+        if emit_clearcoat
+        else s.fmul(spec_tot_b, s.load_f(refl_b))
+    )
 
-    var mod_r_v = s.fvar(s.nmax(s.float(1e-4), s.fma(om_rc, spec_tot_r, r_coat)))
-    var mod_g_v = s.fvar(s.nmax(s.float(1e-4), s.fma(om_rc, spec_tot_g, r_coat)))
-    var mod_b_v = s.fvar(s.nmax(s.float(1e-4), s.fma(om_rc, spec_tot_b, r_coat)))
+    var mod_r_v = s.fvar(s.nmax(s.float(1e-4), s.fma(om_rc, spec_tot_r, r_coat) if emit_clearcoat else spec_tot_r))
+    var mod_g_v = s.fvar(s.nmax(s.float(1e-4), s.fma(om_rc, spec_tot_g, r_coat) if emit_clearcoat else spec_tot_g))
+    var mod_b_v = s.fvar(s.nmax(s.float(1e-4), s.fma(om_rc, spec_tot_b, r_coat) if emit_clearcoat else spec_tot_b))
     var demod_sr = s.fdiv(spec_out_r, s.load_f(mod_r_v))
     var demod_sg = s.fdiv(spec_out_g, s.load_f(mod_g_v))
     var demod_sb = s.fdiv(spec_out_b, s.load_f(mod_b_v))
 
-    var non_spec_r = s.fmul(om_rc, s.fadd(s.load_f(dir_r), em_r))
-    var non_spec_g = s.fmul(om_rc, s.fadd(s.load_f(dir_g), em_g))
-    var non_spec_b = s.fmul(om_rc, s.fadd(s.load_f(dir_b), em_b))
+    var non_spec_r = s.fmul(om_rc, s.fadd(s.load_f(dir_r), em_r)) if emit_clearcoat else s.fadd(s.load_f(dir_r), em_r)
+    var non_spec_g = s.fmul(om_rc, s.fadd(s.load_f(dir_g), em_g)) if emit_clearcoat else s.fadd(s.load_f(dir_g), em_g)
+    var non_spec_b = s.fmul(om_rc, s.fadd(s.load_f(dir_b), em_b)) if emit_clearcoat else s.fadd(s.load_f(dir_b), em_b)
 
     var crisp_r = s.fvar(s.select_f(demod_spec, non_spec_r, s.fadd(non_spec_r, spec_out_r)))
     var crisp_g = s.fvar(s.select_f(demod_spec, non_spec_g, s.fadd(non_spec_g, spec_out_g)))
     var crisp_b = s.fvar(s.select_f(demod_spec, non_spec_b, s.fadd(non_spec_b, spec_out_b)))
 
-    var dw_r = s.fvar(s.fmul(s.fmul(kd_gi_r, cur_alb_r), s.fmul(om_rc, mb_ao[0])))
-    var dw_g = s.fvar(s.fmul(s.fmul(kd_gi_g, cur_alb_g), s.fmul(om_rc, mb_ao[1])))
-    var dw_b = s.fvar(s.fmul(s.fmul(kd_gi_b, cur_alb_b), s.fmul(om_rc, mb_ao[2])))
+    var dw_r = s.fvar(s.fmul(s.fmul(kd_gi_r, cur_alb_r), s.fmul(om_rc, mb_ao[0]) if emit_clearcoat else mb_ao[0]))
+    var dw_g = s.fvar(s.fmul(s.fmul(kd_gi_g, cur_alb_g), s.fmul(om_rc, mb_ao[1]) if emit_clearcoat else mb_ao[1]))
+    var dw_b = s.fvar(s.fmul(s.fmul(kd_gi_b, cur_alb_b), s.fmul(om_rc, mb_ao[2]) if emit_clearcoat else mb_ao[2]))
 
     # 5. Bruneton / Hillaire Distance Aerial Perspective (`V18`, evaluated ONLY beyond `froxel_far_z` when Froxels are active!)
     s.begin_if(s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_AERIAL_PERSPECTIVE)), s.uint(0)))
@@ -2169,7 +2846,8 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(5)), vel_v)
     s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(6)), nx)
     s.store_float(b_hdr, s.iadd(out_pix_base, s.uint(7)), ny)
-    s.end_if()
+    if is_all:
+        s.end_if()
 
     return s.finish()
 

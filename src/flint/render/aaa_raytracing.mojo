@@ -29,6 +29,7 @@ from flint.platform.vulkan import (
     TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
     VulkanAccelStruct,
     VulkanGpu,
+    _vk_ctrl_ptr,
     call4,
     call5,
     get64,
@@ -245,6 +246,9 @@ def build_blas_triangles_ex(
     out.handle = handle
     out.buffer = as_buf^
     out.device_address = as_da
+    if vk.ctrl_ptr != 0:
+        _vk_ctrl_ptr(vk.ctrl_ptr)[unsafe_offset=0].ref_count += 1
+        out.ctrl_ptr = vk.ctrl_ptr
     return out^
 
 
@@ -321,6 +325,9 @@ def ensure_tlas_capacity_mixed_opaque(
         return False
     tlas.handle = get64(slot)
     tlas.buffer = as_buf^
+    if vk.ctrl_ptr != 0 and tlas.ctrl_ptr == 0:
+        _vk_ctrl_ptr(vk.ctrl_ptr)[unsafe_offset=0].ref_count += 1
+        tlas.ctrl_ptr = vk.ctrl_ptr
     return True
 
 

@@ -15,12 +15,14 @@ and bit-exact `serialize` / `deserialize` snapshots for rollback & PIE.
 from std.collections import List
 from std.math import sqrt, abs, min, max
 from flint.core.math import Vec3, Quat
-from flint.core.detmath import set_sim_float_mode
+from flint.core.detmath import set_sim_float_mode, det_acos, PI
 from flint.core.detsort import stable_order, mix64
 from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
-from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC, CAT_SENSOR, CAT_ALL
+from flint.app.engine_app import Resource
+from flint.ecs.world import comp_hash64
+from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC, CAT_PROP_PIECE, CAT_SENSOR, CAT_ALL
 from flint.physics.broadphase import (
     BroadphaseInput,
     BroadphaseNode8,
@@ -44,7 +46,7 @@ from flint.physics.narrowphase import (
     ContactPoint as NarrowContactPoint,
     get_box_axes,
 )
-from flint.physics.bvh import Bvh8MeshCollider, MeshTriangle, EDGE_ACTIVE_ALL
+from flint.physics.bvh import Bvh8MeshCollider, MeshTriangle, SweepHit, EDGE_ACTIVE_ALL
 from flint.physics.ccd import (
     CcdHit,
     gjk_closest_points,
@@ -123,6 +125,20 @@ from flint.physics.forces import (
     TARGET_WATER,
     MAX_FIELD_RATE,
 )
+from flint.physics.vehicle import VehicleChassis
+from flint.physics.aero6dof import (
+    Aero6DofConfig,
+    Aero6DofControls,
+    Aero6DofState,
+    eval_aero6dof_forces,
+)
+from flint.physics.xpbd import (
+    ParticleChain,
+    ParticleMesh,
+    ChainCollider,
+    RigidAttachment,
+)
+from flint.anim.ragdoll import ArticulatedRagdoll, SETTLE_SPEED
 
 comptime BODY_SHAPE_SPHERE: Int = 0
 comptime BODY_SHAPE_CAPSULE: Int = 1
@@ -149,7 +165,7 @@ comptime SLEEP_LIN_SPEED: Float32 = 0.05
 comptime SLEEP_ANG_SPEED: Float32 = 0.08
 
 comptime WORLD_BLOB_TAG: UInt32 = fourcc("PHYW")
-comptime WORLD_BLOB_VERSION: Int = 1
+comptime WORLD_BLOB_VERSION: Int = 2
 
 
 @always_inline
@@ -684,7 +700,148 @@ def _run_narrowphase_job(context: Int, chunk: Int):
         world._collide_pair_into(row_a, row_b, out_buf, spec)
 
 
-struct PhysicsWorld(Movable):
+def _shortest_arc_quat(a: Vec3, b: Vec3) -> Quat:
+    var na = a.normalized()
+    var nb = b.normalized()
+    if na.length_squared() < Float32(1.0e-8) or nb.length_squared() < Float32(1.0e-8):
+        return Quat()
+    var d = na.dot(nb)
+    if d > Float32(0.999999):
+        return Quat()
+    if d < Float32(-0.999999):
+        var ortho = Vec3(1, 0, 0).cross(na)
+        if ortho.length_squared() < Float32(1.0e-6):
+            ortho = Vec3(0, 1, 0).cross(na)
+        ortho = ortho.normalized()
+        return Quat(ortho.x, ortho.y, ortho.z, Float32(0.0)).normalized()
+    var c = na.cross(nb)
+    return Quat(c.x, c.y, c.z, Float32(1.0) + d).normalized()
+
+
+def _quat_to_scaled_angle_w(q_in: Quat) -> Vec3:
+    var q = q_in.normalized().shortest()
+    var l = sqrt(q.x * q.x + q.y * q.y + q.z * q.z)
+    if l < Float32(1.0e-5):
+        return Vec3(q.x * Float32(2.0), q.y * Float32(2.0), q.z * Float32(2.0))
+    var half = det_acos(max(Float32(-1.0), min(Float32(1.0), q.w)))
+    var s = Float32(2.0) * half / l
+    return Vec3(q.x * s, q.y * s, q.z * s)
+
+
+struct WorldVehicle(Copyable, Movable):
+    var chassis: VehicleChassis
+    var body_id: Int
+    var wheel_filter: CollisionFilter
+    var active: Bool
+
+    def __init__(
+        out self,
+        var chassis: VehicleChassis,
+        body_id: Int = -1,
+        wheel_filter: CollisionFilter = CollisionFilter(CAT_ALL, CAT_ALL, 0),
+        active: Bool = True,
+    ):
+        self.chassis = chassis^
+        self.body_id = body_id
+        self.wheel_filter = wheel_filter
+        self.active = active
+
+
+struct AeroBodyEntry(Copyable, ImplicitlyCopyable, Movable):
+    var body_id: Int
+    var state: Aero6DofState
+    var config: Aero6DofConfig
+    var controls: Aero6DofControls
+    var active: Bool
+
+    def __init__(
+        out self,
+        body_id: Int = -1,
+        state: Aero6DofState = Aero6DofState(),
+        config: Aero6DofConfig = Aero6DofConfig(),
+        controls: Aero6DofControls = Aero6DofControls(),
+        active: Bool = True,
+    ):
+        self.body_id = body_id
+        self.state = state
+        self.config = config
+        self.controls = controls
+        self.active = active
+
+
+struct XpbdChainEntry(Copyable, Movable):
+    var chain: ParticleChain
+    var attachments: List[RigidAttachment]
+    var wind: List[Vec3]
+    var substeps: Int
+    var iterations: Int
+    var filter: CollisionFilter
+    var active: Bool
+
+    def __init__(
+        out self,
+        var chain: ParticleChain,
+        var attachments: List[RigidAttachment],
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+        active: Bool = True,
+    ):
+        self.chain = chain^
+        self.attachments = attachments^
+        self.wind = List[Vec3]()
+        self.substeps = max(1, substeps)
+        self.iterations = max(1, iterations)
+        self.filter = filter
+        self.active = active
+
+
+struct XpbdMeshEntry(Copyable, Movable):
+    var mesh: ParticleMesh
+    var attachments: List[RigidAttachment]
+    var wind: List[Vec3]
+    var substeps: Int
+    var iterations: Int
+    var filter: CollisionFilter
+    var active: Bool
+
+    def __init__(
+        out self,
+        var mesh: ParticleMesh,
+        var attachments: List[RigidAttachment],
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+        active: Bool = True,
+    ):
+        self.mesh = mesh^
+        self.attachments = attachments^
+        self.wind = List[Vec3]()
+        self.substeps = max(1, substeps)
+        self.iterations = max(1, iterations)
+        self.filter = filter
+        self.active = active
+
+
+struct _HostedRagdoll(Copyable, Movable):
+    var rag: ArticulatedRagdoll
+    var limb_body_ids: List[Int]
+    var limb_align_quats: List[Quat]
+    var joint_indices: List[Int]
+    var axis_align_quats: List[Quat]
+    var filter_group: Int
+
+    def __init__(out self, var rag: ArticulatedRagdoll, filter_group: Int = -10000):
+        self.rag = rag^
+        self.limb_body_ids = List[Int]()
+        self.limb_align_quats = List[Quat]()
+        self.joint_indices = List[Int]()
+        self.axis_align_quats = List[Quat]()
+        self.filter_group = filter_group
+
+
+struct PhysicsWorld(Resource, Movable):
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.physics.PhysicsWorld")
     var bodies: List[RigidBody]
     var id_to_slot: List[Int]
     var broadphase_nodes: List[BroadphaseNode8]
@@ -720,6 +877,11 @@ struct PhysicsWorld(Movable):
     var next_joint_id: Int
     var next_trigger_id: Int
     var cpus: List[Bool]
+    var vehicles: List[WorldVehicle]
+    var aero_bodies: List[AeroBodyEntry]
+    var xpbd_chains: List[XpbdChainEntry]
+    var xpbd_meshes: List[XpbdMeshEntry]
+    var ragdolls: List[_HostedRagdoll]
 
     def __init__(out self, gravity: Float32 = 9.81):
         self.bodies = List[RigidBody]()
@@ -757,6 +919,11 @@ struct PhysicsWorld(Movable):
         self.next_joint_id = 1
         self.next_trigger_id = 1
         self.cpus = ccd_cpus()
+        self.vehicles = List[WorldVehicle]()
+        self.aero_bodies = List[AeroBodyEntry]()
+        self.xpbd_chains = List[XpbdChainEntry]()
+        self.xpbd_meshes = List[XpbdMeshEntry]()
+        self.ragdolls = List[_HostedRagdoll]()
 
     @always_inline
     def _set_id_slot(mut self, id: Int, slot: Int):
@@ -774,7 +941,7 @@ struct PhysicsWorld(Movable):
         self.id_to_slot = List[Int](length=max(16, max_id + 1), fill=-1)
         for i in range(len(self.bodies)):
             var bid = self.bodies[i].id
-            if bid >= 0 and self.bodies[i].active:
+            if bid >= 0:
                 self.id_to_slot[bid] = i
 
     def rebuild_broadphase(mut self):
@@ -904,14 +1071,11 @@ struct PhysicsWorld(Movable):
         return slot
 
     def remove_body(mut self, slot: Int):
-        """Deactivates `slot` in O(1) and removes its ID mapping."""
+        """Deactivates `slot` in O(1); `find_slot_by_id` returns `-1` while `find_slot_by_id_any` resolves the resident slot until `swap_remove_body`."""
         if slot < 0 or slot >= len(self.bodies):
             return
-        var bid = self.bodies[slot].id
         self.bodies[slot].active = False
         self.bodies[slot].awake = False
-        if bid >= 0 and bid < len(self.id_to_slot) and self.id_to_slot[bid] == slot:
-            self.id_to_slot[bid] = -1
         self.islands.drop(slot)
         self.rebuild_broadphase()
 
@@ -1276,6 +1440,1319 @@ struct PhysicsWorld(Movable):
         self.water_use_waves = use_waves
         self.fluid_density = fluid_density
 
+    # =========================================================================
+    # F10: Two-Way VehicleChassis Integration
+    # =========================================================================
+
+    def add_vehicle(
+        mut self,
+        var chassis: VehicleChassis,
+        chassis_half_extents: Vec3 = Vec3(),
+        wheel_filter: CollisionFilter = CollisionFilter(CAT_ALL, CAT_ALL, 0),
+        body_filter: CollisionFilter = CollisionFilter(),
+        friction: Float32 = 0.4,
+        restitution: Float32 = 0.1,
+    ) -> Int:
+        var he = chassis_half_extents
+        if he.length_squared() <= Float32(1.0e-8):
+            if len(chassis.wheels) > 0:
+                var max_x = Float32(0.5)
+                var max_z = Float32(1.0)
+                var min_hub_y = Float32(0.0)
+                for wi in range(len(chassis.wheels)):
+                    ref w = chassis.wheels[wi]
+                    max_x = max(max_x, abs(w.offset.x) + w.width * Float32(0.5))
+                    max_z = max(max_z, abs(w.offset.z) + w.radius)
+                    if wi == 0 or w.offset.y < min_hub_y:
+                        min_hub_y = w.offset.y
+                he = Vec3(
+                    max(Float32(0.5), max_x),
+                    max(Float32(0.25), min(Float32(0.45), abs(min_hub_y) * Float32(0.75))),
+                    max(Float32(1.0), max_z + Float32(0.05)),
+                )
+            else:
+                he = Vec3(0.92, 0.34, 1.73)
+
+        var b = RigidBody(self.next_body_id)
+        self.next_body_id += 1
+        b.shape = BODY_SHAPE_BOX
+        b.half_extents = Vec3(
+            max(Float32(0.05), he.x),
+            max(Float32(0.05), he.y),
+            max(Float32(0.05), he.z),
+        )
+        b.radius = b.half_extents.length()
+        b.pos = chassis.pos
+        b.rot = chassis.rot.normalized()
+        b.linear_vel = chassis.linear_vel
+        b.angular_vel = chassis.angular_vel
+        b.mass = max(Float32(1.0), chassis.mass)
+        b.inv_mass = Float32(1.0) / b.mass
+        b.local_inertia = Vec3(
+            max(Float32(1.0), chassis.inertia.x),
+            max(Float32(1.0), chassis.inertia.y),
+            max(Float32(1.0), chassis.inertia.z),
+        )
+        b.motion_mode = BODY_MOTION_DYNAMIC
+        b.is_static = False
+        b.friction = friction
+        b.restitution = restitution
+        b.linear_damping = Float32(0.0)
+        b.angular_damping = Float32(0.0)
+        b.gravity_scale = Float32(1.0)
+        b.wind_area_over_mass = Float32(0.0)
+        b.filter = body_filter
+        b.can_sleep = False
+        b.awake = True
+        var body_slot = self._register_body(b^)
+        var bid = self.bodies[body_slot].id
+        var v_slot = len(self.vehicles)
+        self.vehicles.append(WorldVehicle(chassis^, bid, wheel_filter, True))
+        return v_slot
+
+    def vehicle_state(self, vehicle_slot: Int) -> VehicleChassis:
+        if vehicle_slot < 0 or vehicle_slot >= len(self.vehicles):
+            return VehicleChassis()
+        return self.vehicles[vehicle_slot].chassis.copy()
+
+    def set_vehicle_controls(mut self, vehicle_slot: Int, throttle: Float32, brake: Float32, steer: Float32):
+        if vehicle_slot < 0 or vehicle_slot >= len(self.vehicles):
+            return
+        self.vehicles[vehicle_slot].chassis.set_controls(throttle, brake, steer)
+        if throttle != Float32(0.0) or brake != Float32(0.0) or steer != Float32(0.0):
+            var slot = self.find_slot_by_id(self.vehicles[vehicle_slot].body_id)
+            if slot >= 0:
+                self.wake(slot)
+
+    def vehicle_body_slot(self, vehicle_slot: Int) -> Int:
+        if vehicle_slot < 0 or vehicle_slot >= len(self.vehicles):
+            return -1
+        return self.find_slot_by_id(self.vehicles[vehicle_slot].body_id)
+
+    def vehicle_body_id(self, vehicle_slot: Int) -> Int:
+        if vehicle_slot < 0 or vehicle_slot >= len(self.vehicles):
+            return -1
+        return self.vehicles[vehicle_slot].body_id
+
+    def remove_vehicle(mut self, vehicle_slot: Int, remove_body: Bool = True):
+        if vehicle_slot < 0 or vehicle_slot >= len(self.vehicles):
+            return
+        self.vehicles[vehicle_slot].active = False
+        if remove_body:
+            var slot = self.find_slot_by_id(self.vehicles[vehicle_slot].body_id)
+            if slot >= 0:
+                self.remove_body(slot)
+
+    def _step_vehicles_pre_solve(
+        mut self,
+        dt: Float32,
+        mut is_veh: List[Bool],
+        mut veh_dv: List[Vec3],
+        mut veh_dw: List[Vec3],
+    ):
+        var sub_hz = Float32(240.0)
+        var target_sub_dt = Float32(1.0) / sub_hz
+        var steps = max(1, Int(dt / target_sub_dt + Float32(0.5)))
+        var sub_dt = dt / Float32(steps)
+
+        for vi in range(len(self.vehicles)):
+            if not self.vehicles[vi].active:
+                continue
+            var bid = self.vehicles[vi].body_id
+            var slot = self.find_slot_by_id(bid)
+            if slot < 0 or slot >= len(self.bodies):
+                self.vehicles[vi].active = False
+                continue
+            var v0 = self.bodies[slot].linear_vel
+            var w0 = self.bodies[slot].angular_vel
+            var grav_y = self.gravity * self.bodies[slot].gravity_scale
+            var body_awake = self.bodies[slot].awake
+            if not self.bodies[slot].active or self.bodies[slot].is_static or self.bodies[slot].motion_mode != BODY_MOTION_DYNAMIC:
+                continue
+
+            self.vehicles[vi].chassis.pos = self.bodies[slot].pos
+            self.vehicles[vi].chassis.rot = self.bodies[slot].rot
+            self.vehicles[vi].chassis.linear_vel = v0
+            self.vehicles[vi].chassis.angular_vel = w0
+
+            var has_input = (
+                self.vehicles[vi].chassis.throttle_input != Float32(0.0)
+                or self.vehicles[vi].chassis.brake_input != Float32(0.0)
+                or self.vehicles[vi].chassis.steer_input != Float32(0.0)
+            )
+            if not body_awake and has_input:
+                self.wake(slot)
+
+            var num_wheels = len(self.vehicles[vi].chassis.wheels)
+            if num_wheels < 4:
+                continue
+            var hit_slots = List[Int](length=num_wheels, fill=-1)
+            var ground_vels = List[Vec3](length=num_wheels, fill=Vec3())
+            var wheel_forces = List[Vec3]()
+
+            for _ in range(steps):
+                var up = self.vehicles[vi].chassis.rot.rotate(Vec3(0, 1, 0)).normalized()
+                var down = -up
+                for wi in range(num_wheels):
+                    var cfg = self.vehicles[vi].chassis.wheels[wi]
+                    var hub_r = self.vehicles[vi].chassis.rot.rotate(cfg.offset)
+                    var world_hub = self.vehicles[vi].chassis.pos + hub_r
+                    var sweep_start = world_hub + up * cfg.max_travel
+                    var sweep_len = cfg.max_travel + cfg.suspension_rest_len
+                    var sh = self.shapecast_sphere(
+                        sweep_start,
+                        cfg.radius,
+                        down * sweep_len,
+                        self.vehicles[vi].wheel_filter,
+                        ignore_body_id=bid,
+                    )
+                    if sh.hit and sh.fraction < Float32(1.0):
+                        var n = sh.normal
+                        if n.dot(up) < Float32(0.0):
+                            n = -n
+                        var was_grounded = self.vehicles[vi].chassis.wheel_states[wi].grounded
+                        var old_comp = self.vehicles[vi].chassis.wheel_states[wi].compression
+                        var raw_comp = (Float32(1.0) - sh.fraction) * sweep_len
+                        var new_comp = min(cfg.max_travel, max(Float32(0.0), raw_comp))
+
+                        var gv = Vec3()
+                        if sh.body_slot >= 0 and sh.body_slot < len(self.bodies):
+                            ref hb = self.bodies[sh.body_slot]
+                            if not hb.is_static or hb.motion_mode == BODY_MOTION_KINEMATIC:
+                                gv = hb.linear_vel + hb.angular_vel.cross(sh.point - hb.pos)
+
+                        if was_grounded:
+                            self.vehicles[vi].chassis.wheel_states[wi].compression_rate = (new_comp - old_comp) / sub_dt
+                        else:
+                            var hub_vel = (
+                                self.vehicles[vi].chassis.linear_vel + self.vehicles[vi].chassis.angular_vel.cross(hub_r)
+                            ) - gv
+                            self.vehicles[vi].chassis.wheel_states[wi].compression_rate = -hub_vel.dot(n)
+
+                        self.vehicles[vi].chassis.wheel_states[wi].grounded = True
+                        self.vehicles[vi].chassis.wheel_states[wi].compression = new_comp
+                        self.vehicles[vi].chassis.wheel_states[wi].contact_point = sh.point
+                        self.vehicles[vi].chassis.wheel_states[wi].contact_normal = n
+                        hit_slots[wi] = sh.body_slot
+                        ground_vels[wi] = gv
+                    else:
+                        self.vehicles[vi].chassis.wheel_states[wi].grounded = False
+                        self.vehicles[vi].chassis.wheel_states[wi].compression = Float32(0.0)
+                        self.vehicles[vi].chassis.wheel_states[wi].compression_rate = Float32(0.0)
+                        self.vehicles[vi].chassis.wheel_states[wi].bristle_x = Float32(0.0)
+                        self.vehicles[vi].chassis.wheel_states[wi].bristle_y = Float32(0.0)
+                        hit_slots[wi] = -1
+                        ground_vels[wi] = Vec3()
+
+                var th = self.vehicles[vi].chassis.throttle_input
+                var br = self.vehicles[vi].chassis.brake_input
+                var st = self.vehicles[vi].chassis.steer_input
+                self.vehicles[vi].chassis.step_world_substep(
+                    sub_dt, th, br, st, grav_y, ground_vels, wheel_forces, apply_gyro=False
+                )
+
+                for wi in range(num_wheels):
+                    var hs = hit_slots[wi]
+                    if hs >= 0 and hs < len(self.bodies) and wi < len(wheel_forces):
+                        if self.bodies[hs].active and not self.bodies[hs].is_static and self.bodies[hs].motion_mode == BODY_MOTION_DYNAMIC:
+                            var f_w = wheel_forces[wi]
+                            if f_w.length_squared() > Float32(1.0e-8):
+                                var cp_w = self.vehicles[vi].chassis.wheel_states[wi].contact_point
+                                self.apply_impulse_at(hs, -f_w * sub_dt, cp_w)
+
+            if not self.bodies[slot].awake:
+                self.wake(slot)
+            is_veh[slot] = True
+            veh_dv[slot] = self.vehicles[vi].chassis.linear_vel - v0
+            veh_dw[slot] = self.vehicles[vi].chassis.angular_vel - w0
+
+    # =========================================================================
+    # F11: Two-Way Aero6DofState Integration
+    # =========================================================================
+
+    def add_aero_body(
+        mut self,
+        state: Aero6DofState,
+        cfg: Aero6DofConfig = Aero6DofConfig(),
+        ctrl: Aero6DofControls = Aero6DofControls(),
+        half_extents: Vec3 = Vec3(-1.0, -1.0, -1.0),
+        friction: Float32 = 0.3,
+        restitution: Float32 = 0.15,
+        filter: CollisionFilter = CollisionFilter(),
+        enable_ccd: Bool = True,
+    ) -> Int:
+        var he = half_extents
+        if he.x <= Float32(0.0) or he.y <= Float32(0.0) or he.z <= Float32(0.0):
+            he = Vec3(
+                max(Float32(0.8), cfg.wingspan_0 * Float32(0.15)),
+                Float32(0.75),
+                max(Float32(2.0), abs(cfg.tvc_arm_z) * Float32(0.55)),
+            )
+
+        var u = max(Float32(0.0), min(Float32(1.0), state.morph_u))
+        var om_u = Float32(1.0) - u
+        var init_mass = max(
+            Float32(10.0),
+            om_u * cfg.mass_0 + u * cfg.mass_1 + max(Float32(0.0), state.fuel_mass),
+        )
+        var init_i = Vec3(
+            max(Float32(1.0), om_u * cfg.inertia_0.x + u * cfg.inertia_1.x),
+            max(Float32(1.0), om_u * cfg.inertia_0.y + u * cfg.inertia_1.y),
+            max(Float32(1.0), om_u * cfg.inertia_0.z + u * cfg.inertia_1.z),
+        )
+
+        var st = state
+        st.current_mass = init_mass
+        st.current_inertia = init_i
+
+        var b = RigidBody(self.next_body_id)
+        self.next_body_id += 1
+        b.shape = BODY_SHAPE_BOX
+        b.half_extents = he
+        b.radius = he.length()
+        b.pos = st.pos
+        b.rot = st.rot.normalized()
+        b.linear_vel = st.linear_vel
+        b.angular_vel = st.angular_vel
+        b.mass = init_mass
+        b.inv_mass = Float32(1.0) / init_mass
+        b.local_inertia = init_i
+        b.motion_mode = BODY_MOTION_DYNAMIC
+        b.is_static = False
+        b.friction = friction
+        b.restitution = restitution
+        b.linear_damping = Float32(0.0)
+        b.angular_damping = Float32(0.0)
+        b.gravity_scale = Float32(0.0)
+        b.wind_area_over_mass = Float32(0.0)
+        b.filter = filter
+        b.can_sleep = False
+        b.awake = True
+        b.enable_ccd = enable_ccd
+
+        var body_slot = self._register_body(b^)
+        var bid = self.bodies[body_slot].id
+        var aero_slot = len(self.aero_bodies)
+        self.aero_bodies.append(AeroBodyEntry(bid, st, cfg, ctrl, True))
+        return aero_slot
+
+    def aero_state(self, aero_slot: Int) -> Aero6DofState:
+        if aero_slot < 0 or aero_slot >= len(self.aero_bodies):
+            return Aero6DofState()
+        return self.aero_bodies[aero_slot].state
+
+    def aero_config(self, aero_slot: Int) -> Aero6DofConfig:
+        if aero_slot < 0 or aero_slot >= len(self.aero_bodies):
+            return Aero6DofConfig()
+        return self.aero_bodies[aero_slot].config
+
+    def aero_controls(self, aero_slot: Int) -> Aero6DofControls:
+        if aero_slot < 0 or aero_slot >= len(self.aero_bodies):
+            return Aero6DofControls()
+        return self.aero_bodies[aero_slot].controls
+
+    def set_aero_controls(mut self, aero_slot: Int, ctrl: Aero6DofControls):
+        if aero_slot < 0 or aero_slot >= len(self.aero_bodies):
+            return
+        self.aero_bodies[aero_slot].controls = ctrl
+        var slot = self.find_slot_by_id(self.aero_bodies[aero_slot].body_id)
+        if slot >= 0:
+            self.wake(slot)
+
+    def set_aero_config(mut self, aero_slot: Int, cfg: Aero6DofConfig):
+        if aero_slot < 0 or aero_slot >= len(self.aero_bodies):
+            return
+        self.aero_bodies[aero_slot].config = cfg
+
+    def set_aero_state(mut self, aero_slot: Int, state: Aero6DofState):
+        if aero_slot < 0 or aero_slot >= len(self.aero_bodies):
+            return
+        self.aero_bodies[aero_slot].state = state
+        var slot = self.find_slot_by_id(self.aero_bodies[aero_slot].body_id)
+        if slot >= 0:
+            ref b = self.bodies[slot]
+            b.pos = state.pos
+            b.rot = state.rot.normalized()
+            b.linear_vel = state.linear_vel
+            b.angular_vel = state.angular_vel
+            if state.current_mass > Float32(0.0):
+                b.mass = state.current_mass
+                b.inv_mass = Float32(1.0) / state.current_mass
+            if state.current_inertia.x > Float32(0.0) and state.current_inertia.y > Float32(0.0) and state.current_inertia.z > Float32(0.0):
+                b.local_inertia = state.current_inertia
+            self.wake(slot)
+
+    def aero_body_slot(self, aero_slot: Int) -> Int:
+        if aero_slot < 0 or aero_slot >= len(self.aero_bodies):
+            return -1
+        return self.find_slot_by_id(self.aero_bodies[aero_slot].body_id)
+
+    def remove_aero_body(mut self, aero_slot: Int, remove_body: Bool = True):
+        if aero_slot < 0 or aero_slot >= len(self.aero_bodies):
+            return
+        self.aero_bodies[aero_slot].active = False
+        if remove_body:
+            var slot = self.find_slot_by_id(self.aero_bodies[aero_slot].body_id)
+            if slot >= 0:
+                self.remove_body(slot)
+
+    def _step_aero_bodies_pre_solve(mut self, dt: Float32):
+        var has_wind = len(self.force_world.wind.sources) > 0 or len(self.force_world.wind.vorticles) > 0
+        for ai in range(len(self.aero_bodies)):
+            if not self.aero_bodies[ai].active:
+                continue
+            var bid = self.aero_bodies[ai].body_id
+            var slot = self.find_slot_by_id(bid)
+            if slot < 0 or not self.bodies[slot].active:
+                self.aero_bodies[ai].active = False
+                continue
+
+            ref b = self.bodies[slot]
+            if b.is_static or b.motion_mode != BODY_MOTION_DYNAMIC:
+                continue
+
+            ref entry = self.aero_bodies[ai]
+            entry.state.pos = b.pos
+            entry.state.rot = b.rot
+            entry.state.linear_vel = b.linear_vel
+            entry.state.angular_vel = b.angular_vel
+
+            var eff_ctrl = entry.controls
+            var u = entry.state.morph_u
+            var span = (Float32(1.0) - u) * entry.config.wingspan_0 + u * entry.config.wingspan_1
+            var ray_dist = max(Float32(50.0), span * Float32(2.0))
+            var ghit = self.raycast(
+                b.pos,
+                Vec3(0.0, -1.0, 0.0),
+                ray_dist,
+                CollisionFilter(CAT_ALL, CAT_TERRAIN | CAT_STATIC, 0),
+                ignore_body_id=bid,
+            )
+            if ghit.hit:
+                eff_ctrl.ground_y = ghit.point.y
+
+            if has_wind:
+                eff_ctrl.wind_vel = eff_ctrl.wind_vel + self.force_world.wind_at(b.pos)
+
+            var ft = eval_aero6dof_forces(entry.state, entry.config, eff_ctrl, dt)
+            var m = max(Float32(10.0), entry.state.current_mass)
+            b.mass = m
+            b.inv_mass = Float32(1.0) / m
+            b.local_inertia = Vec3(
+                max(Float32(1.0), entry.state.current_inertia.x),
+                max(Float32(1.0), entry.state.current_inertia.y),
+                max(Float32(1.0), entry.state.current_inertia.z),
+            )
+            b.force_accum = b.force_accum + ft[0] + Vec3(0.0, -eff_ctrl.gravity * m, 0.0)
+            b.torque_accum = b.torque_accum + b.rot.rotate(ft[1])
+            if not b.awake:
+                self.wake(slot)
+
+    # =========================================================================
+    # F12: Two-Way XPBD Cloth/Chain Integration
+    # =========================================================================
+
+    def _normalize_xpbd_attachments(self, attachments: List[RigidAttachment]) -> List[RigidAttachment]:
+        var out = List[RigidAttachment](capacity=len(attachments))
+        for i in range(len(attachments)):
+            var att = attachments[i]
+            if att.body_id < 0 and att.solver_body >= 0 and att.solver_body < len(self.bodies):
+                att.body_id = self.bodies[att.solver_body].id
+            out.append(att)
+        return out^
+
+    def add_xpbd_chain(
+        mut self,
+        var chain: ParticleChain,
+        attachments: List[RigidAttachment] = List[RigidAttachment](),
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+    ) -> Int:
+        var atts = self._normalize_xpbd_attachments(attachments)
+        var slot = len(self.xpbd_chains)
+        self.xpbd_chains.append(XpbdChainEntry(chain^, atts^, substeps, iterations, filter, True))
+        return slot
+
+    def add_xpbd_chain(
+        mut self,
+        var chain: ParticleChain,
+        att: RigidAttachment,
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+    ) -> Int:
+        var list_att = List[RigidAttachment](capacity=1)
+        list_att.append(att)
+        return self.add_xpbd_chain(chain^, list_att, substeps, iterations, filter)
+
+    def add_cloth_chain(
+        mut self,
+        var chain: ParticleChain,
+        attachments: List[RigidAttachment] = List[RigidAttachment](),
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+    ) -> Int:
+        return self.add_xpbd_chain(chain^, attachments, substeps, iterations, filter)
+
+    def add_cloth_chain(
+        mut self,
+        var chain: ParticleChain,
+        att: RigidAttachment,
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+    ) -> Int:
+        return self.add_xpbd_chain(chain^, att, substeps, iterations, filter)
+
+    def add_xpbd_mesh(
+        mut self,
+        var mesh: ParticleMesh,
+        attachments: List[RigidAttachment] = List[RigidAttachment](),
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+    ) -> Int:
+        var atts = self._normalize_xpbd_attachments(attachments)
+        var slot = len(self.xpbd_meshes)
+        self.xpbd_meshes.append(XpbdMeshEntry(mesh^, atts^, substeps, iterations, filter, True))
+        return slot
+
+    def add_xpbd_mesh(
+        mut self,
+        var mesh: ParticleMesh,
+        att: RigidAttachment,
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+    ) -> Int:
+        var list_att = List[RigidAttachment](capacity=1)
+        list_att.append(att)
+        return self.add_xpbd_mesh(mesh^, list_att, substeps, iterations, filter)
+
+    def add_cloth_mesh(
+        mut self,
+        var mesh: ParticleMesh,
+        attachments: List[RigidAttachment] = List[RigidAttachment](),
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+    ) -> Int:
+        return self.add_xpbd_mesh(mesh^, attachments, substeps, iterations, filter)
+
+    def add_cloth_mesh(
+        mut self,
+        var mesh: ParticleMesh,
+        att: RigidAttachment,
+        substeps: Int = 4,
+        iterations: Int = 2,
+        filter: CollisionFilter = CollisionFilter(),
+    ) -> Int:
+        return self.add_xpbd_mesh(mesh^, att, substeps, iterations, filter)
+
+    def xpbd_chain(self, slot: Int) -> ParticleChain:
+        if slot < 0 or slot >= len(self.xpbd_chains):
+            return ParticleChain()
+        return self.xpbd_chains[slot].chain.copy()
+
+    def cloth_chain(self, slot: Int) -> ParticleChain:
+        return self.xpbd_chain(slot)
+
+    def xpbd_mesh(self, slot: Int) -> ParticleMesh:
+        if slot < 0 or slot >= len(self.xpbd_meshes):
+            return ParticleMesh()
+        return self.xpbd_meshes[slot].mesh.copy()
+
+    def cloth_mesh(self, slot: Int) -> ParticleMesh:
+        return self.xpbd_mesh(slot)
+
+    def set_xpbd_chain_wind(mut self, slot: Int, wind: List[Vec3]):
+        if slot >= 0 and slot < len(self.xpbd_chains):
+            self.xpbd_chains[slot].wind = wind.copy()
+
+    def set_xpbd_mesh_wind(mut self, slot: Int, wind: List[Vec3]):
+        if slot >= 0 and slot < len(self.xpbd_meshes):
+            self.xpbd_meshes[slot].wind = wind.copy()
+
+    def add_xpbd_chain_attachment(mut self, slot: Int, att: RigidAttachment):
+        if slot < 0 or slot >= len(self.xpbd_chains):
+            return
+        var a = att
+        if a.body_id < 0 and a.solver_body >= 0 and a.solver_body < len(self.bodies):
+            a.body_id = self.bodies[a.solver_body].id
+        self.xpbd_chains[slot].attachments.append(a)
+
+    def add_xpbd_mesh_attachment(mut self, slot: Int, att: RigidAttachment):
+        if slot < 0 or slot >= len(self.xpbd_meshes):
+            return
+        var a = att
+        if a.body_id < 0 and a.solver_body >= 0 and a.solver_body < len(self.bodies):
+            a.body_id = self.bodies[a.solver_body].id
+        self.xpbd_meshes[slot].attachments.append(a)
+
+    def _gather_xpbd_colliders(
+        self,
+        positions: List[Vec3],
+        velocities: List[Vec3],
+        dt: Float32,
+        filter: CollisionFilter,
+        row_to_solver: List[Int],
+        mut out_colliders: List[ChainCollider],
+        mut out_env_slots: List[Int],
+    ):
+        out_colliders.clear()
+        out_env_slots.clear()
+        if len(positions) == 0:
+            return
+        var lo = positions[0]
+        var hi = positions[0]
+        for i in range(len(positions)):
+            var p = positions[i]
+            lo = Vec3(min(lo.x, p.x), min(lo.y, p.y), min(lo.z, p.z))
+            hi = Vec3(max(hi.x, p.x), max(hi.y, p.y), max(hi.z, p.z))
+            if i < len(velocities):
+                var p_pred = p + velocities[i] * dt + Vec3(0.0, -Float32(0.5) * self.gravity * dt * dt, 0.0)
+                lo = Vec3(min(lo.x, p_pred.x), min(lo.y, p_pred.y), min(lo.z, p_pred.z))
+                hi = Vec3(max(hi.x, p_pred.x), max(hi.y, p_pred.y), max(hi.z, p_pred.z))
+        var pad = Vec3(0.75, 0.75, 0.75)
+        var cands = List[Int]()
+        self._query_bvh8_aabb_candidates(lo - pad, hi + pad, filter, -1, cands)
+        for ci in range(len(cands)):
+            var cs = cands[ci]
+            if cs < 0 or cs >= len(self.bodies):
+                continue
+            ref cb = self.bodies[cs]
+            if not cb.active:
+                continue
+            var s_idx = row_to_solver[cs]
+            if cb.shape == BODY_SHAPE_SPHERE:
+                out_colliders.append(ChainCollider.sphere(cb.pos, cb.radius, s_idx, cb.id))
+            elif cb.shape == BODY_SHAPE_CAPSULE:
+                var ends = cb.capsule_endpoints()
+                out_colliders.append(ChainCollider.capsule(ends[0], ends[1], cb.radius, s_idx, cb.id))
+            elif cb.shape == BODY_SHAPE_BOX or cb.shape == BODY_SHAPE_CONVEX_HULL:
+                out_colliders.append(ChainCollider.box(cb.pos, cb.rot, cb.half_extents, s_idx, cb.id))
+            elif cb.shape == BODY_SHAPE_COMPOUND and cb.shape_index >= 0 and cb.shape_index < len(self.compounds):
+                ref cmp = self.compounds[cb.shape_index]
+                for k in range(len(cmp.children)):
+                    ref ch = cmp.children[k]
+                    var wp_wr = ch.world_pose(cb.pos, cb.rot)
+                    if ch.shape == COMPOUND_CHILD_SPHERE:
+                        out_colliders.append(ChainCollider.sphere(wp_wr[0], ch.radius, s_idx, cb.id))
+                    elif ch.shape == COMPOUND_CHILD_CAPSULE:
+                        var ax = wp_wr[1].rotate(Vec3(0, ch.half_height, 0))
+                        out_colliders.append(ChainCollider.capsule(wp_wr[0] - ax, wp_wr[0] + ax, ch.radius, s_idx, cb.id))
+                    else:
+                        out_colliders.append(ChainCollider.box(wp_wr[0], wp_wr[1], ch.half_extents, s_idx, cb.id))
+            elif cb.shape == BODY_SHAPE_MESH_BVH8 or cb.shape == BODY_SHAPE_HEIGHTFIELD:
+                out_env_slots.append(cs)
+
+    def _resolve_xpbd_env_contacts_chain(
+        mut self,
+        ci: Int,
+        dt: Float32,
+        env_slots: List[Int],
+    ):
+        if len(env_slots) == 0 or dt <= Float32(1.0e-7):
+            return
+        var pr = Float32(0.02)
+        var pr2 = pr * pr
+        for si in range(len(env_slots)):
+            var cs = env_slots[si]
+            var eb_pos = self.bodies[cs].pos
+            var eb_rot = self.bodies[cs].rot
+            var eb_shape = self.bodies[cs].shape
+            var eb_si = self.bodies[cs].shape_index
+            var inv_r = eb_rot.conjugate()
+            var n_p = len(self.xpbd_chains[ci].chain.position)
+            for pi in range(n_p):
+                if self.xpbd_chains[ci].chain.inv_mass[pi] <= Float32(0.0):
+                    continue
+                var p0 = self.xpbd_chains[ci].chain.previous[pi]
+                var p1 = self.xpbd_chains[ci].chain.position[pi]
+                var lp0 = inv_r.rotate(p0 - eb_pos)
+                var lp1 = inv_r.rotate(p1 - eb_pos)
+                var ldisp = lp1 - lp0
+                var vel = self.xpbd_chains[ci].chain.velocity[pi]
+                var moved = False
+
+                if ldisp.length_squared() > Float32(1.0e-10):
+                    var sh = SweepHit()
+                    if eb_shape == BODY_SHAPE_MESH_BVH8 and eb_si >= 0 and eb_si < len(self.meshes):
+                        sh = self.meshes[eb_si].sweep_sphere(lp0, ldisp, pr, Float32(1.0))
+                    elif eb_shape == BODY_SHAPE_HEIGHTFIELD and eb_si >= 0 and eb_si < len(self.heightfields):
+                        sh = self.heightfields[eb_si].sweep_sphere(lp0, ldisp, pr, Float32(1.0))
+                    if sh.hit:
+                        var n_hit = sh.normal.normalized()
+                        if (
+                            eb_shape == BODY_SHAPE_MESH_BVH8
+                            and eb_si >= 0
+                            and eb_si < len(self.meshes)
+                            and sh.triangle_index >= 0
+                            and sh.triangle_index < len(self.meshes[eb_si].triangles)
+                        ):
+                            ref tri_s = self.meshes[eb_si].triangles[sh.triangle_index]
+                            if (lp0 - tri_s.v0).dot(tri_s.normal) >= -Float32(1.0e-3) and n_hit.dot(tri_s.normal) < Float32(0.0):
+                                n_hit = -n_hit
+                        var pen_sw = (
+                            pr - (lp1 - sh.point).dot(n_hit)
+                        ) if sh.toi <= Float32(1.0e-5) else ((lp0 + ldisp * sh.toi) - lp1).dot(n_hit)
+                        if pen_sw > Float32(0.0):
+                            lp1 = lp1 + n_hit * pen_sw
+                            moved = True
+                        var wn_sw = eb_rot.rotate(n_hit).normalized()
+                        var vn_sw = vel.dot(wn_sw)
+                        if vn_sw < Float32(0.0):
+                            vel = vel - wn_sw * vn_sw
+                            moved = True
+
+                var m = ContactManifold()
+                if eb_shape == BODY_SHAPE_MESH_BVH8 and eb_si >= 0 and eb_si < len(self.meshes):
+                    m = self.meshes[eb_si].collide_sphere(lp1, pr)
+                elif eb_shape == BODY_SHAPE_HEIGHTFIELD and eb_si >= 0 and eb_si < len(self.heightfields):
+                    m = self.heightfields[eb_si].collide_sphere(lp1, pr)
+                if m.has_collision and m.count > 0:
+                    for k in range(m.count):
+                        var cp = m.get_point(k)
+                        var ln = cp.normal.normalized()
+                        var flipped = False
+                        if eb_shape == BODY_SHAPE_MESH_BVH8 and eb_si >= 0 and eb_si < len(self.meshes):
+                            var tidx = Int(cp.id)
+                            if tidx >= 0 and tidx < len(self.meshes[eb_si].triangles):
+                                ref tri_d = self.meshes[eb_si].triangles[tidx]
+                                if (lp0 - tri_d.v0).dot(tri_d.normal) >= -Float32(1.0e-3) and ln.dot(tri_d.normal) < Float32(0.0):
+                                    ln = tri_d.normal
+                                    flipped = True
+                        var depth = Float32(0.0)
+                        if flipped:
+                            depth = pr - (lp1 - cp.point).dot(ln)
+                        elif (lp1 - cp.point).length_squared() < pr2:
+                            depth = pr - (lp1 - cp.point).dot(ln)
+                        if depth > Float32(0.0):
+                            lp1 = lp1 + ln * depth
+                            moved = True
+                            var wn = eb_rot.rotate(ln).normalized()
+                            var vn = vel.dot(wn)
+                            if vn < Float32(0.0):
+                                vel = vel - wn * vn
+
+                if eb_shape == BODY_SHAPE_HEIGHTFIELD and eb_si >= 0 and eb_si < len(self.heightfields):
+                    ref hf = self.heightfields[eb_si]
+                    var hf_b = hf.bounds()
+                    if lp1.x >= hf_b[0].x and lp1.x <= hf_b[1].x and lp1.z >= hf_b[0].z and lp1.z <= hf_b[1].z:
+                        var h0_n0 = hf.sample_height_and_normal(lp0.x, lp0.z)
+                        if lp0.y >= h0_n0[0] - pr:
+                            var h1_n1 = hf.sample_height_and_normal(lp1.x, lp1.z)
+                            var pen_hf = pr - (lp1.y - h1_n1[0]) * h1_n1[1].y
+                            if pen_hf > Float32(0.0):
+                                lp1 = lp1 + h1_n1[1] * pen_hf
+                                moved = True
+                                var wn_hf = eb_rot.rotate(h1_n1[1]).normalized()
+                                var vn_hf = vel.dot(wn_hf)
+                                if vn_hf < Float32(0.0):
+                                    vel = vel - wn_hf * vn_hf
+
+                if moved:
+                    self.xpbd_chains[ci].chain.position[pi] = eb_pos + eb_rot.rotate(lp1)
+                    self.xpbd_chains[ci].chain.velocity[pi] = vel
+
+    def _resolve_xpbd_env_contacts_mesh(
+        mut self,
+        mi: Int,
+        dt: Float32,
+        env_slots: List[Int],
+    ):
+        if len(env_slots) == 0 or dt <= Float32(1.0e-7):
+            return
+        for si in range(len(env_slots)):
+            var cs = env_slots[si]
+            var eb_pos = self.bodies[cs].pos
+            var eb_rot = self.bodies[cs].rot
+            var eb_shape = self.bodies[cs].shape
+            var eb_si = self.bodies[cs].shape_index
+            var inv_r = eb_rot.conjugate()
+            var n_p = len(self.xpbd_meshes[mi].mesh.position)
+            for pi in range(n_p):
+                if self.xpbd_meshes[mi].mesh.inv_mass[pi] <= Float32(0.0):
+                    continue
+                var pr = max(Float32(0.01), self.xpbd_meshes[mi].mesh.radius[pi])
+                var pr2 = pr * pr
+                var p0 = self.xpbd_meshes[mi].mesh.previous[pi]
+                var p1 = self.xpbd_meshes[mi].mesh.position[pi]
+                var lp0 = inv_r.rotate(p0 - eb_pos)
+                var lp1 = inv_r.rotate(p1 - eb_pos)
+                var ldisp = lp1 - lp0
+                var vel = self.xpbd_meshes[mi].mesh.velocity[pi]
+                var moved = False
+
+                if ldisp.length_squared() > Float32(1.0e-10):
+                    var sh = SweepHit()
+                    if eb_shape == BODY_SHAPE_MESH_BVH8 and eb_si >= 0 and eb_si < len(self.meshes):
+                        sh = self.meshes[eb_si].sweep_sphere(lp0, ldisp, pr, Float32(1.0))
+                    elif eb_shape == BODY_SHAPE_HEIGHTFIELD and eb_si >= 0 and eb_si < len(self.heightfields):
+                        sh = self.heightfields[eb_si].sweep_sphere(lp0, ldisp, pr, Float32(1.0))
+                    if sh.hit:
+                        var n_hit = sh.normal.normalized()
+                        if (
+                            eb_shape == BODY_SHAPE_MESH_BVH8
+                            and eb_si >= 0
+                            and eb_si < len(self.meshes)
+                            and sh.triangle_index >= 0
+                            and sh.triangle_index < len(self.meshes[eb_si].triangles)
+                        ):
+                            ref tri_s = self.meshes[eb_si].triangles[sh.triangle_index]
+                            if (lp0 - tri_s.v0).dot(tri_s.normal) >= -Float32(1.0e-3) and n_hit.dot(tri_s.normal) < Float32(0.0):
+                                n_hit = -n_hit
+                        var pen_sw = (
+                            pr - (lp1 - sh.point).dot(n_hit)
+                        ) if sh.toi <= Float32(1.0e-5) else ((lp0 + ldisp * sh.toi) - lp1).dot(n_hit)
+                        if pen_sw > Float32(0.0):
+                            lp1 = lp1 + n_hit * pen_sw
+                            moved = True
+                        var wn_sw = eb_rot.rotate(n_hit).normalized()
+                        var vn_sw = vel.dot(wn_sw)
+                        if vn_sw < Float32(0.0):
+                            vel = vel - wn_sw * vn_sw
+                            moved = True
+
+                var m = ContactManifold()
+                if eb_shape == BODY_SHAPE_MESH_BVH8 and eb_si >= 0 and eb_si < len(self.meshes):
+                    m = self.meshes[eb_si].collide_sphere(lp1, pr)
+                elif eb_shape == BODY_SHAPE_HEIGHTFIELD and eb_si >= 0 and eb_si < len(self.heightfields):
+                    m = self.heightfields[eb_si].collide_sphere(lp1, pr)
+                if m.has_collision and m.count > 0:
+                    for k in range(m.count):
+                        var cp = m.get_point(k)
+                        var ln = cp.normal.normalized()
+                        var flipped = False
+                        if eb_shape == BODY_SHAPE_MESH_BVH8 and eb_si >= 0 and eb_si < len(self.meshes):
+                            var tidx = Int(cp.id)
+                            if tidx >= 0 and tidx < len(self.meshes[eb_si].triangles):
+                                ref tri_d = self.meshes[eb_si].triangles[tidx]
+                                if (lp0 - tri_d.v0).dot(tri_d.normal) >= -Float32(1.0e-3) and ln.dot(tri_d.normal) < Float32(0.0):
+                                    ln = tri_d.normal
+                                    flipped = True
+                        var depth = Float32(0.0)
+                        if flipped:
+                            depth = pr - (lp1 - cp.point).dot(ln)
+                        elif (lp1 - cp.point).length_squared() < pr2:
+                            depth = pr - (lp1 - cp.point).dot(ln)
+                        if depth > Float32(0.0):
+                            lp1 = lp1 + ln * depth
+                            moved = True
+                            var wn = eb_rot.rotate(ln).normalized()
+                            var vn = vel.dot(wn)
+                            if vn < Float32(0.0):
+                                vel = vel - wn * vn
+
+                if eb_shape == BODY_SHAPE_HEIGHTFIELD and eb_si >= 0 and eb_si < len(self.heightfields):
+                    ref hf = self.heightfields[eb_si]
+                    var hf_b = hf.bounds()
+                    if lp1.x >= hf_b[0].x and lp1.x <= hf_b[1].x and lp1.z >= hf_b[0].z and lp1.z <= hf_b[1].z:
+                        var h0_n0 = hf.sample_height_and_normal(lp0.x, lp0.z)
+                        if lp0.y >= h0_n0[0] - pr:
+                            var h1_n1 = hf.sample_height_and_normal(lp1.x, lp1.z)
+                            var pen_hf = pr - (lp1.y - h1_n1[0]) * h1_n1[1].y
+                            if pen_hf > Float32(0.0):
+                                lp1 = lp1 + h1_n1[1] * pen_hf
+                                moved = True
+                                var wn_hf = eb_rot.rotate(h1_n1[1]).normalized()
+                                var vn_hf = vel.dot(wn_hf)
+                                if vn_hf < Float32(0.0):
+                                    vel = vel - wn_hf * vn_hf
+
+                if moved:
+                    self.xpbd_meshes[mi].mesh.position[pi] = eb_pos + eb_rot.rotate(lp1)
+                    self.xpbd_meshes[mi].mesh.velocity[pi] = vel
+
+    def _step_xpbd_post_sbodies(mut self, dt: Float32, row_to_solver: List[Int], mut sbodies: SolverBodies):
+        if dt <= Float32(1.0e-8):
+            return
+        var has_wind = len(self.force_world.wind.sources) > 0 or len(self.force_world.wind.vorticles) > 0
+        var colliders = List[ChainCollider]()
+        var env_slots = List[Int]()
+        var world_grav = self.gravity
+
+        for ci in range(len(self.xpbd_chains)):
+            if not self.xpbd_chains[ci].active:
+                continue
+            var n_atts = len(self.xpbd_chains[ci].attachments)
+            var step_atts = List[RigidAttachment](capacity=n_atts)
+            var att_src_idx = List[Int](capacity=n_atts)
+            for ai in range(n_atts):
+                var att = self.xpbd_chains[ci].attachments[ai]
+                if att.body_id >= 0:
+                    var slot = self.find_slot_by_id(att.body_id)
+                    if slot < 0 or not self.bodies[slot].active:
+                        continue
+                    var s_idx = row_to_solver[slot]
+                    if s_idx >= 0:
+                        att.solver_body = s_idx
+                    else:
+                        att.local_anchor = self.bodies[slot].pos + rotate_vec(self.bodies[slot].rot, att.local_anchor)
+                        att.solver_body = -1
+                else:
+                    att.solver_body = -1
+                step_atts.append(att)
+                att_src_idx.append(ai)
+
+            self._gather_xpbd_colliders(
+                self.xpbd_chains[ci].chain.position,
+                self.xpbd_chains[ci].chain.velocity,
+                dt,
+                self.xpbd_chains[ci].filter,
+                row_to_solver,
+                colliders,
+                env_slots,
+            )
+            var eff_wind = List[Vec3]()
+            if len(self.xpbd_chains[ci].wind) > 0:
+                eff_wind = self.xpbd_chains[ci].wind.copy()
+            elif has_wind:
+                var np = len(self.xpbd_chains[ci].chain.position)
+                eff_wind.reserve(np)
+                for pi in range(np):
+                    eff_wind.append(self.force_world.wind_at(self.xpbd_chains[ci].chain.position[pi]))
+
+            var sub_n = max(1, self.xpbd_chains[ci].substeps)
+            var iters = self.xpbd_chains[ci].iterations
+            var h = dt / Float32(sub_n)
+            for sub in range(sub_n):
+                self.xpbd_chains[ci].chain.step_substep_coupled(
+                    h, Float32(sub) * h, world_grav, eff_wind, colliders, step_atts, sbodies, iters
+                )
+                self._resolve_xpbd_env_contacts_chain(ci, h, env_slots)
+            for k in range(len(step_atts)):
+                self.xpbd_chains[ci].attachments[att_src_idx[k]].lam = step_atts[k].lam
+
+        for mi in range(len(self.xpbd_meshes)):
+            if not self.xpbd_meshes[mi].active:
+                continue
+            var n_atts = len(self.xpbd_meshes[mi].attachments)
+            var step_atts = List[RigidAttachment](capacity=n_atts)
+            var att_src_idx = List[Int](capacity=n_atts)
+            for ai in range(n_atts):
+                var att = self.xpbd_meshes[mi].attachments[ai]
+                if att.body_id >= 0:
+                    var slot = self.find_slot_by_id(att.body_id)
+                    if slot < 0 or not self.bodies[slot].active:
+                        continue
+                    var s_idx = row_to_solver[slot]
+                    if s_idx >= 0:
+                        att.solver_body = s_idx
+                    else:
+                        att.local_anchor = self.bodies[slot].pos + rotate_vec(self.bodies[slot].rot, att.local_anchor)
+                        att.solver_body = -1
+                else:
+                    att.solver_body = -1
+                step_atts.append(att)
+                att_src_idx.append(ai)
+
+            self._gather_xpbd_colliders(
+                self.xpbd_meshes[mi].mesh.position,
+                self.xpbd_meshes[mi].mesh.velocity,
+                dt,
+                self.xpbd_meshes[mi].filter,
+                row_to_solver,
+                colliders,
+                env_slots,
+            )
+            var eff_wind = List[Vec3]()
+            if len(self.xpbd_meshes[mi].wind) > 0:
+                eff_wind = self.xpbd_meshes[mi].wind.copy()
+            elif has_wind:
+                var np = len(self.xpbd_meshes[mi].mesh.position)
+                eff_wind.reserve(np)
+                for pi in range(np):
+                    eff_wind.append(self.force_world.wind_at(self.xpbd_meshes[mi].mesh.position[pi]))
+
+            var sub_n = max(1, self.xpbd_meshes[mi].substeps)
+            var iters = self.xpbd_meshes[mi].iterations
+            var h = dt / Float32(sub_n)
+            self.xpbd_meshes[mi].mesh.steps_run += 1
+            for sub in range(sub_n):
+                self.xpbd_meshes[mi].mesh.step_substep_coupled(
+                    h, Float32(sub) * h, world_grav, eff_wind, colliders, step_atts, sbodies, iters
+                )
+                self._resolve_xpbd_env_contacts_mesh(mi, h, env_slots)
+            for k in range(len(step_atts)):
+                self.xpbd_meshes[mi].attachments[att_src_idx[k]].lam = step_atts[k].lam
+
+    # =========================================================================
+    # F13: Two-Way ArticulatedRagdoll Hosting
+    # =========================================================================
+
+    def _sync_ragdoll_joint_params(mut self, r_slot: Int):
+        ref hr = self.ragdolls[r_slot]
+        var n = len(hr.rag.limbs)
+        for i in range(n):
+            var ji = hr.joint_indices[i]
+            if ji < 0 or ji >= len(self.six_dof_joints):
+                continue
+            ref def_i = hr.rag.limbs[i]
+            var p = def_i.parent_limb
+            if p < 0 or p >= n:
+                continue
+            ref st_i = hr.rag.states[i]
+            ref st_p = hr.rag.states[p]
+            var q_ax = hr.axis_align_quats[i]
+            ref j6 = self.six_dof_joints[ji]
+            var i_eff = Float32(1.0) / max(Float32(1.0e-5), st_i.inv_inertia_trans + st_p.inv_inertia_trans)
+            var kp = def_i.active_stiffness * hr.rag.motor_scale
+            var kd = def_i.active_damping * hr.rag.motor_scale
+            var omega = sqrt(max(Float32(0.0), kp / i_eff))
+            var hz = omega / (Float32(2.0) * PI)
+            var zeta = kd / (Float32(2.0) * max(Float32(1.0e-4), i_eff * omega)) if omega > Float32(1.0e-4) else Float32(1.0)
+            j6.enable_angular_drive = (not hr.rag.is_limp) and (hr.rag.motor_scale > Float32(1.0e-5)) and (hz > Float32(1.0e-5))
+            j6.angular_hertz = hz
+            j6.angular_damping = max(Float32(0.1), min(Float32(4.0), zeta))
+            j6.max_angular_torque = def_i.max_torque * hr.rag.motor_scale
+            j6.angular_target = ((def_i.rest_local_rot * q_ax).conjugate() * st_i.target_local_rot * q_ax).normalized()
+
+    def add_ragdoll(mut self, var rag: ArticulatedRagdoll) -> Int:
+        var r_slot = len(self.ragdolls)
+        var group = -(10000 + r_slot)
+        rag.is_active = True
+        var hr = _HostedRagdoll(rag^, group)
+        var n = len(hr.rag.limbs)
+        var filt = CollisionFilter(CAT_PROP_PIECE, CAT_ALL, group)
+        var g_scale = Float32(1.0) if hr.rag.gravity.length_squared() > Float32(1.0e-6) else Float32(0.0)
+
+        for i in range(n):
+            ref def_i = hr.rag.limbs[i]
+            ref st_i = hr.rag.states[i]
+            var q_align = _shortest_arc_quat(Vec3(0.0, 1.0, 0.0), def_i.local_axis)
+            var b_slot = self.add_capsule(
+                st_i.com_pos,
+                def_i.radius * hr.rag.scale,
+                Float32(0.5) * def_i.length * hr.rag.scale,
+                def_i.mass,
+                rot=(st_i.rotation * q_align).normalized(),
+                friction=hr.rag.floor_friction,
+                restitution=Float32(0.05),
+                filter=filt,
+            )
+            ref b = self.bodies[b_slot]
+            var i_trans = Float32(1.0) / max(Float32(1.0e-6), st_i.inv_inertia_trans)
+            var i_axial = Float32(1.0) / max(Float32(1.0e-6), st_i.inv_inertia_axial)
+            b.local_inertia = Vec3(i_trans, i_axial, i_trans)
+            b.linear_vel = st_i.linear_vel
+            b.angular_vel = st_i.angular_vel
+            b.linear_damping = hr.rag.linear_damping
+            b.angular_damping = hr.rag.angular_damping
+            b.gravity_scale = g_scale
+            b.can_sleep = False
+            b.active = True
+            b.awake = True
+            hr.limb_body_ids.append(b.id)
+            hr.limb_align_quats.append(q_align)
+            var ax_src = def_i.hinge_axis_local if def_i.is_hinge else def_i.local_axis
+            hr.axis_align_quats.append(_shortest_arc_quat(Vec3(1.0, 0.0, 0.0), ax_src))
+            hr.joint_indices.append(-1)
+
+        for i in range(n):
+            ref def_i = hr.rag.limbs[i]
+            var p = def_i.parent_limb
+            if p < 0 or p >= n:
+                continue
+            ref def_p = hr.rag.limbs[p]
+            var q_align_p = hr.limb_align_quats[p]
+            var q_align_i = hr.limb_align_quats[i]
+            var q_ax = hr.axis_align_quats[i]
+
+            var j6 = SixDofMotorJoint()
+            j6.body_a = hr.limb_body_ids[p]
+            j6.body_b = hr.limb_body_ids[i]
+            j6.local_anchor_a = q_align_p.conjugate().rotate((def_i.parent_anchor_local - def_p.local_com_offset) * hr.rag.scale)
+            j6.local_anchor_b = q_align_i.conjugate().rotate((-def_i.local_com_offset) * hr.rag.scale)
+            j6.enable_linear_limit = True
+            j6.linear_lower = Vec3()
+            j6.linear_upper = Vec3()
+            j6.linear_hertz = Float32(30.0)
+            j6.linear_damping = Float32(1.0)
+            j6.local_frame_a = (q_align_p.conjugate() * def_i.rest_local_rot * q_ax).normalized()
+            j6.local_frame_b = (q_align_i.conjugate() * q_ax).normalized()
+            j6.enable_angular_limit = True
+            if def_i.is_hinge:
+                j6.twist_lower = def_i.hinge_min_rad
+                j6.twist_upper = def_i.hinge_max_rad
+                var lat = min(def_i.swing_cone_rad, Float32(0.02))
+                j6.swing_y_limit = lat
+                j6.swing_z_limit = lat
+            else:
+                j6.twist_lower = def_i.twist_min_rad
+                j6.twist_upper = def_i.twist_max_rad
+                j6.swing_y_limit = def_i.swing_cone_rad
+                j6.swing_z_limit = def_i.swing_cone_rad
+            hr.joint_indices[i] = self.add_six_dof_joint(j6^)
+
+        self.ragdolls.append(hr^)
+        self._sync_ragdoll_joint_params(r_slot)
+        return r_slot
+
+    def ragdoll_state(self, slot: Int) -> ArticulatedRagdoll:
+        if slot < 0 or slot >= len(self.ragdolls):
+            return ArticulatedRagdoll()
+        return self.ragdolls[slot].rag.copy()
+
+    def set_ragdoll_active(mut self, slot: Int, active: Bool):
+        if slot < 0 or slot >= len(self.ragdolls):
+            return
+        if self.ragdolls[slot].rag.is_active == active:
+            return
+        self.ragdolls[slot].rag.is_active = active
+        for i in range(len(self.ragdolls[slot].limb_body_ids)):
+            var bid = self.ragdolls[slot].limb_body_ids[i]
+            var b_slot = -1
+            if bid >= 0 and bid < len(self.id_to_slot):
+                b_slot = self.id_to_slot[bid]
+            if b_slot < 0 or b_slot >= len(self.bodies) or self.bodies[b_slot].id != bid:
+                for k in range(len(self.bodies)):
+                    if self.bodies[k].id == bid:
+                        b_slot = k
+                        break
+            if b_slot >= 0 and b_slot < len(self.bodies):
+                self.bodies[b_slot].active = active
+                self.bodies[b_slot].awake = active
+                self.bodies[b_slot].sleep_ticks = 0
+                self._set_id_slot(bid, b_slot)
+                if active:
+                    self.islands.set_single(b_slot, bid)
+                else:
+                    self.islands.drop(b_slot)
+        for i in range(len(self.ragdolls[slot].joint_indices)):
+            var ji = self.ragdolls[slot].joint_indices[i]
+            if ji >= 0 and ji < len(self.six_dof_joints):
+                if active:
+                    self.six_dof_joints[ji].broken = False
+                    self.six_dof_joints[ji].reset_warm_impulses()
+                else:
+                    self.six_dof_joints[ji].broken = True
+        self.rebuild_broadphase()
+
+    def remove_ragdoll(mut self, slot: Int, remove_bodies: Bool = True):
+        if slot < 0 or slot >= len(self.ragdolls):
+            return
+        self.ragdolls[slot].rag.is_active = False
+        for i in range(len(self.ragdolls[slot].joint_indices)):
+            var ji = self.ragdolls[slot].joint_indices[i]
+            if ji >= 0 and ji < len(self.six_dof_joints):
+                self.six_dof_joints[ji].broken = True
+        if remove_bodies:
+            for i in range(len(self.ragdolls[slot].limb_body_ids)):
+                var bid = self.ragdolls[slot].limb_body_ids[i]
+                var b_slot = self.find_slot_by_id(bid)
+                if b_slot >= 0:
+                    self.bodies[b_slot].active = False
+                    self.bodies[b_slot].awake = False
+                    self.islands.drop(b_slot)
+            self.rebuild_broadphase()
+
+    def sync_ragdoll_from_state(mut self, slot: Int, rag: ArticulatedRagdoll):
+        if slot < 0 or slot >= len(self.ragdolls):
+            return
+        var was_active = self.ragdolls[slot].rag.is_active
+        self.ragdolls[slot].rag = rag.copy()
+        var g_scale = Float32(1.0) if rag.gravity.length_squared() > Float32(1.0e-6) else Float32(0.0)
+        var n_limbs = len(self.ragdolls[slot].limb_body_ids)
+        var n_states = len(rag.states)
+        var any_bp_changed = (was_active != rag.is_active) or (n_states > 0)
+        for i in range(n_limbs):
+            var bid = self.ragdolls[slot].limb_body_ids[i]
+            var b_slot = -1
+            if bid >= 0 and bid < len(self.id_to_slot):
+                b_slot = self.id_to_slot[bid]
+            if b_slot < 0 or b_slot >= len(self.bodies) or self.bodies[b_slot].id != bid:
+                for k in range(len(self.bodies)):
+                    if self.bodies[k].id == bid:
+                        b_slot = k
+                        break
+            if b_slot >= 0 and b_slot < len(self.bodies):
+                ref b = self.bodies[b_slot]
+                if b.active != rag.is_active:
+                    any_bp_changed = True
+                if i < n_states:
+                    var q_align = self.ragdolls[slot].limb_align_quats[i]
+                    ref st_i = rag.states[i]
+                    b.pos = st_i.com_pos
+                    b.rot = (st_i.rotation * q_align).normalized()
+                    b.linear_vel = st_i.linear_vel
+                    b.angular_vel = st_i.angular_vel
+                b.gravity_scale = g_scale
+                b.active = rag.is_active
+                b.awake = rag.is_active
+                b.sleep_ticks = 0
+                self._set_id_slot(bid, b_slot)
+                if rag.is_active:
+                    if (not was_active) or b_slot >= len(self.islands.label) or self.islands.label[b_slot] == NO_ISLAND:
+                        self.islands.set_single(b_slot, bid)
+                else:
+                    self.islands.drop(b_slot)
+        for i in range(len(self.ragdolls[slot].joint_indices)):
+            var ji = self.ragdolls[slot].joint_indices[i]
+            if ji >= 0 and ji < len(self.six_dof_joints):
+                if rag.is_active:
+                    self.six_dof_joints[ji].broken = False
+                    self.six_dof_joints[ji].reset_warm_impulses()
+                else:
+                    self.six_dof_joints[ji].broken = True
+        self._sync_ragdoll_joint_params(slot)
+        if any_bp_changed:
+            self.rebuild_broadphase()
+
+    def set_ragdoll_targets(
+        mut self,
+        slot: Int,
+        target_local_rots: List[Quat],
+        target_root_rot: Quat,
+        motor_scale: Float32,
+        is_limp: Bool,
+    ):
+        if slot < 0 or slot >= len(self.ragdolls):
+            return
+        ref hr = self.ragdolls[slot]
+        hr.rag.target_root_world_rot = target_root_rot
+        hr.rag.motor_scale = motor_scale
+        hr.rag.is_limp = is_limp
+        for i in range(min(len(hr.rag.states), len(target_local_rots))):
+            hr.rag.states[i].target_local_rot = target_local_rots[i]
+        self._sync_ragdoll_joint_params(slot)
+
+    def apply_ragdoll_impulse(
+        mut self,
+        slot: Int,
+        limb_idx: Int,
+        world_impulse: Vec3,
+        world_point: Vec3,
+    ):
+        if slot < 0 or slot >= len(self.ragdolls):
+            return
+        if limb_idx < 0 or limb_idx >= len(self.ragdolls[slot].limb_body_ids):
+            return
+        self.ragdolls[slot].rag.still_seconds = Float32(0.0)
+        var b_slot = self.find_slot_by_id(self.ragdolls[slot].limb_body_ids[limb_idx])
+        if b_slot >= 0:
+            self.apply_impulse_at(b_slot, world_impulse, world_point)
+
+    def _prepare_xpbd_and_ragdolls_pre_solve(mut self):
+        var pad = Vec3(0.5, 0.5, 0.5)
+        for ci in range(len(self.xpbd_chains)):
+            if not self.xpbd_chains[ci].active:
+                continue
+            for ai in range(len(self.xpbd_chains[ci].attachments)):
+                var bid = self.xpbd_chains[ci].attachments[ai].body_id
+                if bid >= 0:
+                    var slot = self.find_slot_by_id(bid)
+                    if slot >= 0:
+                        self.wake(slot)
+            if len(self.xpbd_chains[ci].chain.position) > 0:
+                var lo = self.xpbd_chains[ci].chain.position[0]
+                var hi = self.xpbd_chains[ci].chain.position[0]
+                for pi in range(1, len(self.xpbd_chains[ci].chain.position)):
+                    var p = self.xpbd_chains[ci].chain.position[pi]
+                    lo = Vec3(min(lo.x, p.x), min(lo.y, p.y), min(lo.z, p.z))
+                    hi = Vec3(max(hi.x, p.x), max(hi.y, p.y), max(hi.z, p.z))
+                var filt = self.xpbd_chains[ci].filter
+                var cands = List[Int]()
+                self._query_bvh8_aabb_candidates(lo - pad, hi + pad, filt, -1, cands)
+                for k in range(len(cands)):
+                    var cs = cands[k]
+                    if cs >= 0 and not self.bodies[cs].is_static and not self.bodies[cs].awake:
+                        self.wake(cs)
+
+        for mi in range(len(self.xpbd_meshes)):
+            if not self.xpbd_meshes[mi].active:
+                continue
+            for ai in range(len(self.xpbd_meshes[mi].attachments)):
+                var bid = self.xpbd_meshes[mi].attachments[ai].body_id
+                if bid >= 0:
+                    var slot = self.find_slot_by_id(bid)
+                    if slot >= 0:
+                        self.wake(slot)
+            if len(self.xpbd_meshes[mi].mesh.position) > 0:
+                var lo = self.xpbd_meshes[mi].mesh.position[0]
+                var hi = self.xpbd_meshes[mi].mesh.position[0]
+                for pi in range(1, len(self.xpbd_meshes[mi].mesh.position)):
+                    var p = self.xpbd_meshes[mi].mesh.position[pi]
+                    lo = Vec3(min(lo.x, p.x), min(lo.y, p.y), min(lo.z, p.z))
+                    hi = Vec3(max(hi.x, p.x), max(hi.y, p.y), max(hi.z, p.z))
+                var filt = self.xpbd_meshes[mi].filter
+                var cands = List[Int]()
+                self._query_bvh8_aabb_candidates(lo - pad, hi + pad, filt, -1, cands)
+                for k in range(len(cands)):
+                    var cs = cands[k]
+                    if cs >= 0 and not self.bodies[cs].is_static and not self.bodies[cs].awake:
+                        self.wake(cs)
+
+        for ri in range(len(self.ragdolls)):
+            if not self.ragdolls[ri].rag.is_active:
+                continue
+            self._sync_ragdoll_joint_params(ri)
+            ref hr = self.ragdolls[ri]
+            if (
+                not hr.rag.is_limp
+                and hr.rag.motor_scale > Float32(1.0e-5)
+                and hr.rag.root_attitude_stiffness > Float32(0.0)
+                and len(hr.limb_body_ids) > 0
+            ):
+                var s0 = self.find_slot_by_id(hr.limb_body_ids[0])
+                if s0 >= 0 and not self.bodies[s0].is_static:
+                    ref b0 = self.bodies[s0]
+                    var q_limb0 = (b0.rot * hr.limb_align_quats[0].conjugate()).normalized()
+                    var err_r = _quat_to_scaled_angle_w(hr.rag.target_root_world_rot * q_limb0.conjugate())
+                    var kp_r = hr.rag.root_attitude_stiffness * hr.rag.motor_scale
+                    var kd_r = hr.rag.root_attitude_damping * hr.rag.motor_scale
+                    var max_tau_r = hr.rag.root_attitude_max_torque * hr.rag.motor_scale
+                    var tau_r = err_r * kp_r - b0.angular_vel * kd_r
+                    var tlen = tau_r.length()
+                    if tlen > max_tau_r and tlen > Float32(1.0e-6):
+                        tau_r = tau_r * (max_tau_r / tlen)
+                    b0.torque_accum = b0.torque_accum + tau_r
+                    self.wake(s0)
+
+    def _sync_m2_post_solve(mut self, dt: Float32):
+        for vi in range(len(self.vehicles)):
+            if not self.vehicles[vi].active:
+                continue
+            var slot = self.find_slot_by_id(self.vehicles[vi].body_id)
+            if slot >= 0:
+                ref b = self.bodies[slot]
+                self.vehicles[vi].chassis.pos = b.pos
+                self.vehicles[vi].chassis.rot = b.rot
+                self.vehicles[vi].chassis.linear_vel = b.linear_vel
+                self.vehicles[vi].chassis.angular_vel = b.angular_vel
+
+        for ai in range(len(self.aero_bodies)):
+            if not self.aero_bodies[ai].active:
+                continue
+            var slot = self.find_slot_by_id(self.aero_bodies[ai].body_id)
+            if slot >= 0:
+                ref b = self.bodies[slot]
+                self.aero_bodies[ai].state.pos = b.pos
+                self.aero_bodies[ai].state.rot = b.rot
+                self.aero_bodies[ai].state.linear_vel = b.linear_vel
+                self.aero_bodies[ai].state.angular_vel = b.angular_vel
+
+        for ri in range(len(self.ragdolls)):
+            if not self.ragdolls[ri].rag.is_active:
+                continue
+            ref hr = self.ragdolls[ri]
+            var n = min(len(hr.limb_body_ids), len(hr.rag.states))
+            for i in range(n):
+                var b_slot = self.find_slot_by_id(hr.limb_body_ids[i])
+                if b_slot >= 0:
+                    ref b = self.bodies[b_slot]
+                    hr.rag.states[i].com_pos = b.pos
+                    hr.rag.states[i].rotation = (b.rot * hr.limb_align_quats[i].conjugate()).normalized()
+                    hr.rag.states[i].linear_vel = b.linear_vel
+                    hr.rag.states[i].angular_vel = b.angular_vel
+            hr.rag.steps_taken += 1
+            if hr.rag.mean_speed() < SETTLE_SPEED * hr.rag.scale:
+                hr.rag.still_seconds += dt
+            else:
+                hr.rag.still_seconds = Float32(0.0)
+
     def body_id(self, slot: Int) -> Int:
         if slot < 0 or slot >= len(self.bodies):
             return -1
@@ -1288,6 +2765,16 @@ struct PhysicsWorld(Movable):
             return -1
         var slot = self.id_to_slot[id]
         if slot >= 0 and slot < len(self.bodies) and self.bodies[slot].active and self.bodies[slot].id == id:
+            return slot
+        return -1
+
+    @always_inline
+    def find_slot_by_id_any(self, id: Int) -> Int:
+        """O(1) direct table lookup from `body.id` to any (active or inactive) `bodies` slot."""
+        if id < 0 or id >= len(self.id_to_slot):
+            return -1
+        var slot = self.id_to_slot[id]
+        if slot >= 0 and slot < len(self.bodies) and self.bodies[slot].id == id:
             return slot
         return -1
 
@@ -1464,10 +2951,7 @@ struct PhysicsWorld(Movable):
         b.in_water = False
         b.water_volume_id = -1
         var bid = b.id
-        if active:
-            self._set_id_slot(bid, slot)
-        elif bid >= 0 and bid < len(self.id_to_slot) and self.id_to_slot[bid] == slot:
-            self.id_to_slot[bid] = -1
+        self._set_id_slot(bid, slot)
         self.islands.ensure_rows(len(self.bodies))
         if active and (not self.bodies[slot].is_static):
             self.islands.set_single(slot, bid)
@@ -3061,9 +4545,19 @@ struct PhysicsWorld(Movable):
                 ev.material = self.bodies[i].material
                 self.events.append(ev)
                 self.bodies[i].active = False
-                if self.bodies[i].id >= 0 and self.bodies[i].id < len(self.id_to_slot):
-                    self.id_to_slot[self.bodies[i].id] = -1
                 self.islands.drop(i)
+
+        # 1b. M2a pre-solve hooks (VehicleChassis 240 Hz, Aero6DofState, XPBD wakes, Ragdoll root PD)
+        var n_rows = len(self.bodies)
+        var is_veh = List[Bool](length=n_rows, fill=False)
+        var veh_dv = List[Vec3](length=n_rows, fill=Vec3())
+        var veh_dw = List[Vec3](length=n_rows, fill=Vec3())
+        if len(self.vehicles) > 0:
+            self._step_vehicles_pre_solve(dt, is_veh, veh_dv, veh_dw)
+        if len(self.aero_bodies) > 0:
+            self._step_aero_bodies_pre_solve(dt)
+        if len(self.xpbd_chains) > 0 or len(self.xpbd_meshes) > 0 or len(self.ragdolls) > 0:
+            self._prepare_xpbd_and_ragdolls_pre_solve()
 
         # 2. Optional anti-tunneling CCD clamp across all collider types
         var ccd_slots = List[Int]()
@@ -3072,7 +4566,6 @@ struct PhysicsWorld(Movable):
         self._run_ccd_clamp(dt, ccd_slots, ccd_vpost, ccd_rem)
 
         # 3. Broadphase over all active bodies (retained into `self.broadphase_nodes` to avoid double rebuild)
-        var n_rows = len(self.bodies)
         var bp_in = BroadphaseInput()
         var spec = Vec3(SPECULATIVE_DISTANCE, SPECULATIVE_DISTANCE, SPECULATIVE_DISTANCE)
         for i in range(n_rows):
@@ -3156,6 +4649,8 @@ struct PhysicsWorld(Movable):
             if self.joints[ji].broken:
                 continue
             var sa = self.find_slot_by_id(self.joints[ji].body_a) if self.joints[ji].body_a != JOINT_WORLD else -1
+            if self.joints[ji].body_a != JOINT_WORLD and sa < 0:
+                continue
             var sb = self.find_slot_by_id(self.joints[ji].body_b)
             if sb < 0:
                 continue
@@ -3168,6 +4663,8 @@ struct PhysicsWorld(Movable):
             if self.six_dof_joints[s6i].broken:
                 continue
             var sa = self.find_slot_by_id(self.six_dof_joints[s6i].body_a) if self.six_dof_joints[s6i].body_a != JOINT_WORLD else -1
+            if self.six_dof_joints[s6i].body_a != JOINT_WORLD and sa < 0:
+                continue
             var sb = self.find_slot_by_id(self.six_dof_joints[s6i].body_b)
             if sb < 0:
                 continue
@@ -3181,7 +4678,67 @@ struct PhysicsWorld(Movable):
             elif sa >= 0 and self.bodies[sb].awake and not self.bodies[sa].awake:
                 self.wake(sa)
 
-        # 5. Build SolverBodies for all active, awake dynamic bodies AND moving kinematic bodies
+        # 5. Build SolverBodies for all active, awake dynamic bodies, moving kinematic bodies,
+        #    and active static/stationary-kinematic bodies serving as joint anchors
+        var joint_anchor_needed = List[Bool](length=n_rows, fill=False)
+        for ji in range(len(self.joints)):
+            if self.joints[ji].broken:
+                continue
+            var sa = -1
+            if self.joints[ji].body_a != JOINT_WORLD:
+                sa = self.find_slot_by_id(self.joints[ji].body_a)
+                if sa < 0 or not self.bodies[sa].active:
+                    continue
+            var sb = self.find_slot_by_id(self.joints[ji].body_b)
+            if sb < 0 or not self.bodies[sb].active:
+                continue
+            var a_mov = (sa >= 0) and (
+                (not self.bodies[sa].is_static and self.bodies[sa].awake)
+                or (
+                    self.bodies[sa].motion_mode == BODY_MOTION_KINEMATIC
+                    and (self.bodies[sa].linear_vel.length_squared() > Float32(0.0) or self.bodies[sa].angular_vel.length_squared() > Float32(0.0))
+                )
+            )
+            var b_mov = (not self.bodies[sb].is_static and self.bodies[sb].awake) or (
+                self.bodies[sb].motion_mode == BODY_MOTION_KINEMATIC
+                and (self.bodies[sb].linear_vel.length_squared() > Float32(0.0) or self.bodies[sb].angular_vel.length_squared() > Float32(0.0))
+            )
+            if not a_mov and not b_mov:
+                continue
+            if sa >= 0 and self.bodies[sa].is_static:
+                joint_anchor_needed[sa] = True
+            if self.bodies[sb].is_static:
+                joint_anchor_needed[sb] = True
+
+        for s6i in range(len(self.six_dof_joints)):
+            if self.six_dof_joints[s6i].broken:
+                continue
+            var sa = -1
+            if self.six_dof_joints[s6i].body_a != JOINT_WORLD:
+                sa = self.find_slot_by_id(self.six_dof_joints[s6i].body_a)
+                if sa < 0 or not self.bodies[sa].active:
+                    continue
+            var sb = self.find_slot_by_id(self.six_dof_joints[s6i].body_b)
+            if sb < 0 or not self.bodies[sb].active:
+                continue
+            var a_mov = (sa >= 0) and (
+                (not self.bodies[sa].is_static and self.bodies[sa].awake)
+                or (
+                    self.bodies[sa].motion_mode == BODY_MOTION_KINEMATIC
+                    and (self.bodies[sa].linear_vel.length_squared() > Float32(0.0) or self.bodies[sa].angular_vel.length_squared() > Float32(0.0))
+                )
+            )
+            var b_mov = (not self.bodies[sb].is_static and self.bodies[sb].awake) or (
+                self.bodies[sb].motion_mode == BODY_MOTION_KINEMATIC
+                and (self.bodies[sb].linear_vel.length_squared() > Float32(0.0) or self.bodies[sb].angular_vel.length_squared() > Float32(0.0))
+            )
+            if not a_mov and not b_mov:
+                continue
+            if sa >= 0 and self.bodies[sa].is_static:
+                joint_anchor_needed[sa] = True
+            if self.bodies[sb].is_static:
+                joint_anchor_needed[sb] = True
+
         var row_to_solver = List[Int](length=n_rows, fill=-1)
         var awake_slots = List[Int]()
         for i in range(n_rows):
@@ -3191,7 +4748,7 @@ struct PhysicsWorld(Movable):
             var kin_moving = b.motion_mode == BODY_MOTION_KINEMATIC and (
                 b.linear_vel.length_squared() > Float32(0.0) or b.angular_vel.length_squared() > Float32(0.0)
             )
-            if (not b.is_static and b.awake) or kin_moving:
+            if (not b.is_static and b.awake) or kin_moving or joint_anchor_needed[i]:
                 row_to_solver[i] = len(awake_slots)
                 awake_slots.append(i)
 
@@ -3227,7 +4784,7 @@ struct PhysicsWorld(Movable):
             sbodies.inv_mass[si] = b.inv_mass
             sbodies.lin_damp[si] = b.linear_damping
             sbodies.ang_damp[si] = b.angular_damping
-            sbodies.gravity[si] = self.gravity * b.gravity_scale
+            sbodies.gravity[si] = Float32(0.0) if is_veh[r] else (self.gravity * b.gravity_scale)
             sbodies.set_body_inertia(si, b.local_inertia)
 
             # Evaluate external forces, Beaufort water buoyancy/drag, and ForceWorld wind/fields
@@ -3236,7 +4793,7 @@ struct PhysicsWorld(Movable):
             var drag_target_sum = Vec3()
             var drag_rate = Float32(0.0)
             var ang_drag_rate = Float32(0.0)
-            var has_field = ext_f.length_squared() > Float32(0.0) or ext_tau.length_squared() > Float32(0.0)
+            var has_field = ext_f.length_squared() > Float32(0.0) or ext_tau.length_squared() > Float32(0.0) or is_veh[r]
 
             var cur_submerged = Float32(0.0)
             var cur_water_id = -1
@@ -3359,6 +4916,14 @@ struct PhysicsWorld(Movable):
                 sbodies.aax[si] = alpha_w.x
                 sbodies.aay[si] = alpha_w.y
                 sbodies.aaz[si] = alpha_w.z
+                if is_veh[r]:
+                    var inv_dt = Float32(1.0) / dt
+                    sbodies.ax[si] += veh_dv[r].x * inv_dt
+                    sbodies.ay[si] += veh_dv[r].y * inv_dt
+                    sbodies.az[si] += veh_dv[r].z * inv_dt
+                    sbodies.aax[si] += veh_dw[r].x * inv_dt
+                    sbodies.aay[si] += veh_dw[r].y * inv_dt
+                    sbodies.aaz[si] += veh_dw[r].z * inv_dt
                 var capped_rate = min(MAX_FIELD_RATE, drag_rate)
                 sbodies.rate[si] = capped_rate
                 if drag_rate > Float32(1.0e-8):
@@ -3367,6 +4932,10 @@ struct PhysicsWorld(Movable):
                     sbodies.tvy[si] = tv.y
                     sbodies.tvz[si] = tv.z
                 sbodies.arate[si] = min(MAX_FIELD_RATE, ang_drag_rate)
+
+        # 5b. Two-way XPBD chains & cloth meshes (pre-solve so velocity impulses integrate on this tick)
+        if len(self.xpbd_chains) > 0 or len(self.xpbd_meshes) > 0:
+            self._step_xpbd_post_sbodies(dt, row_to_solver, sbodies)
 
         # 6. Convert narrowphase ContactManifolds into solver Manifolds (explicit A->B to B->A normal negation!)
         var solver_manifolds = List[Manifold]()
@@ -3383,8 +4952,14 @@ struct PhysicsWorld(Movable):
             if not a_dyn and not b_dyn:
                 continue
 
-            var a_solv = row_to_solver[ra] >= 0
-            var b_solv = row_to_solver[rb] >= 0
+            var a_kin_mov = self.bodies[ra].motion_mode == BODY_MOTION_KINEMATIC and (
+                self.bodies[ra].linear_vel.length_squared() > Float32(0.0) or self.bodies[ra].angular_vel.length_squared() > Float32(0.0)
+            )
+            var b_kin_mov = self.bodies[rb].motion_mode == BODY_MOTION_KINEMATIC and (
+                self.bodies[rb].linear_vel.length_squared() > Float32(0.0) or self.bodies[rb].angular_vel.length_squared() > Float32(0.0)
+            )
+            var a_solv = row_to_solver[ra] >= 0 and (not self.bodies[ra].is_static or a_kin_mov)
+            var b_solv = row_to_solver[rb] >= 0 and (not self.bodies[rb].is_static or b_kin_mov)
 
             var m_a: Int
             var m_b: Int
@@ -3495,12 +5070,35 @@ struct PhysicsWorld(Movable):
         for ji in range(len(self.joints)):
             if self.joints[ji].broken:
                 continue
-            var slot_a = self.find_slot_by_id(self.joints[ji].body_a) if self.joints[ji].body_a != JOINT_WORLD else -1
+            var slot_a = -1
+            if self.joints[ji].body_a != JOINT_WORLD:
+                slot_a = self.find_slot_by_id(self.joints[ji].body_a)
+                if slot_a < 0 or not self.bodies[slot_a].active:
+                    continue
             var slot_b = self.find_slot_by_id(self.joints[ji].body_b)
             if slot_b < 0 or not self.bodies[slot_b].active:
                 continue
-            var sa_idx = row_to_solver[slot_a] if (slot_a >= 0 and row_to_solver[slot_a] >= 0) else sbodies.static_index
-            var sb_idx = row_to_solver[slot_b] if row_to_solver[slot_b] >= 0 else sbodies.static_index
+            var a_mov = (slot_a >= 0) and (
+                (not self.bodies[slot_a].is_static)
+                or (
+                    self.bodies[slot_a].motion_mode == BODY_MOTION_KINEMATIC
+                    and (self.bodies[slot_a].linear_vel.length_squared() > Float32(0.0) or self.bodies[slot_a].angular_vel.length_squared() > Float32(0.0))
+                )
+            )
+            var b_mov = (not self.bodies[slot_b].is_static) or (
+                self.bodies[slot_b].motion_mode == BODY_MOTION_KINEMATIC
+                and (self.bodies[slot_b].linear_vel.length_squared() > Float32(0.0) or self.bodies[slot_b].angular_vel.length_squared() > Float32(0.0))
+            )
+            if not a_mov and not b_mov:
+                continue
+            var sa_idx = sbodies.static_index
+            if slot_a >= 0:
+                if row_to_solver[slot_a] < 0:
+                    continue
+                sa_idx = row_to_solver[slot_a]
+            if row_to_solver[slot_b] < 0:
+                continue
+            var sb_idx = row_to_solver[slot_b]
             if sa_idx == sbodies.static_index and sb_idx == sbodies.static_index:
                 continue
             j_rows.append(JointRow(ji, sa_idx, sb_idx, self.graph_soft_placeholder(), self.graph_soft_placeholder()))
@@ -3512,12 +5110,35 @@ struct PhysicsWorld(Movable):
         for s6i in range(len(self.six_dof_joints)):
             if self.six_dof_joints[s6i].broken:
                 continue
-            var slot_a = self.find_slot_by_id(self.six_dof_joints[s6i].body_a) if self.six_dof_joints[s6i].body_a != JOINT_WORLD else -1
+            var slot_a = -1
+            if self.six_dof_joints[s6i].body_a != JOINT_WORLD:
+                slot_a = self.find_slot_by_id(self.six_dof_joints[s6i].body_a)
+                if slot_a < 0 or not self.bodies[slot_a].active:
+                    continue
             var slot_b = self.find_slot_by_id(self.six_dof_joints[s6i].body_b)
             if slot_b < 0 or not self.bodies[slot_b].active:
                 continue
-            var sa_idx = row_to_solver[slot_a] if (slot_a >= 0 and row_to_solver[slot_a] >= 0) else sbodies.static_index
-            var sb_idx = row_to_solver[slot_b] if row_to_solver[slot_b] >= 0 else sbodies.static_index
+            var a_mov = (slot_a >= 0) and (
+                (not self.bodies[slot_a].is_static)
+                or (
+                    self.bodies[slot_a].motion_mode == BODY_MOTION_KINEMATIC
+                    and (self.bodies[slot_a].linear_vel.length_squared() > Float32(0.0) or self.bodies[slot_a].angular_vel.length_squared() > Float32(0.0))
+                )
+            )
+            var b_mov = (not self.bodies[slot_b].is_static) or (
+                self.bodies[slot_b].motion_mode == BODY_MOTION_KINEMATIC
+                and (self.bodies[slot_b].linear_vel.length_squared() > Float32(0.0) or self.bodies[slot_b].angular_vel.length_squared() > Float32(0.0))
+            )
+            if not a_mov and not b_mov:
+                continue
+            var sa_idx = sbodies.static_index
+            if slot_a >= 0:
+                if row_to_solver[slot_a] < 0:
+                    continue
+                sa_idx = row_to_solver[slot_a]
+            if row_to_solver[slot_b] < 0:
+                continue
+            var sb_idx = row_to_solver[slot_b]
             if sa_idx != sbodies.static_index or sb_idx != sbodies.static_index:
                 s6_indices.append(s6i)
                 s6_sa.append(sa_idx)
@@ -3556,8 +5177,12 @@ struct PhysicsWorld(Movable):
         # 9. Write back integrated poses & velocities to bodies
         for si in range(len(awake_slots)):
             var r = awake_slots[si]
-            self.bodies[r].pos = sbodies.center(si)
-            self.bodies[r].rot = sbodies.orientation(si)
+            var kin_moving = self.bodies[r].motion_mode == BODY_MOTION_KINEMATIC and (
+                self.bodies[r].linear_vel.length_squared() > Float32(0.0) or self.bodies[r].angular_vel.length_squared() > Float32(0.0)
+            )
+            if not self.bodies[r].is_static or kin_moving:
+                self.bodies[r].pos = sbodies.center(si)
+                self.bodies[r].rot = sbodies.orientation(si)
             if not self.bodies[r].is_static:
                 self.bodies[r].linear_vel = sbodies.velocity(si)
                 self.bodies[r].angular_vel = sbodies.angular(si)
@@ -3572,6 +5197,10 @@ struct PhysicsWorld(Movable):
             if rf < Float32(0.999) and self.bodies[cs].active and not self.bodies[cs].is_static:
                 var dv_solver = self.bodies[cs].linear_vel - vp * rf
                 self.bodies[cs].linear_vel = vp + dv_solver
+
+        # 9b. Sync post-solve body poses & velocities back to M2a subsystems
+        if len(self.vehicles) > 0 or len(self.aero_bodies) > 0 or len(self.ragdolls) > 0:
+            self._sync_m2_post_solve(dt)
 
         # 10. Persist solved impulses to ContactCache and record PairTouch for events
         var manifold_touched = List[Bool](length=len(solver_manifolds), fill=False)
@@ -3919,11 +5548,83 @@ struct PhysicsWorld(Movable):
         w.integer(self.graph.used)
         self.force_world.write(w)
 
+        # 7. M2a unified tables (WORLD_BLOB_VERSION >= 2): vehicles, aero_bodies, xpbd_chains, xpbd_meshes, ragdolls
+        w.integer(len(self.vehicles))
+        for vi in range(len(self.vehicles)):
+            ref wv = self.vehicles[vi]
+            w.integer(wv.body_id)
+            w.u32(wv.wheel_filter.category)
+            w.u32(wv.wheel_filter.mask)
+            w.integer(wv.wheel_filter.group)
+            w.boolean(wv.active)
+            wv.chassis.serialize(w)
+
+        w.integer(len(self.aero_bodies))
+        for ai in range(len(self.aero_bodies)):
+            ref ae = self.aero_bodies[ai]
+            w.integer(ae.body_id)
+            w.boolean(ae.active)
+            ae.state.serialize(w)
+            ae.config.serialize(w)
+            ae.controls.serialize(w)
+
+        w.integer(len(self.xpbd_chains))
+        for ci in range(len(self.xpbd_chains)):
+            ref xc = self.xpbd_chains[ci]
+            xc.chain.serialize(w)
+            w.integer(len(xc.attachments))
+            for k in range(len(xc.attachments)):
+                xc.attachments[k].serialize(w)
+            w.integer(len(xc.wind))
+            for k in range(len(xc.wind)):
+                w.vec3(xc.wind[k])
+            w.integer(xc.substeps)
+            w.integer(xc.iterations)
+            w.u32(xc.filter.category)
+            w.u32(xc.filter.mask)
+            w.integer(xc.filter.group)
+            w.boolean(xc.active)
+
+        w.integer(len(self.xpbd_meshes))
+        for mi in range(len(self.xpbd_meshes)):
+            ref xm = self.xpbd_meshes[mi]
+            xm.mesh.serialize(w)
+            w.integer(len(xm.attachments))
+            for k in range(len(xm.attachments)):
+                xm.attachments[k].serialize(w)
+            w.integer(len(xm.wind))
+            for k in range(len(xm.wind)):
+                w.vec3(xm.wind[k])
+            w.integer(xm.substeps)
+            w.integer(xm.iterations)
+            w.u32(xm.filter.category)
+            w.u32(xm.filter.mask)
+            w.integer(xm.filter.group)
+            w.boolean(xm.active)
+
+        w.integer(len(self.ragdolls))
+        for ri in range(len(self.ragdolls)):
+            ref hr = self.ragdolls[ri]
+            hr.rag.serialize(w)
+            w.integer(len(hr.limb_body_ids))
+            for k in range(len(hr.limb_body_ids)):
+                w.integer(hr.limb_body_ids[k])
+            w.integer(len(hr.limb_align_quats))
+            for k in range(len(hr.limb_align_quats)):
+                w.quat(hr.limb_align_quats[k])
+            w.integer(len(hr.joint_indices))
+            for k in range(len(hr.joint_indices)):
+                w.integer(hr.joint_indices[k])
+            w.integer(len(hr.axis_align_quats))
+            for k in range(len(hr.axis_align_quats)):
+                w.quat(hr.axis_align_quats[k])
+            w.integer(hr.filter_group)
+
         w.end()
 
     def deserialize(mut self, mut r: BlobReader) raises:
         """Restores 100% of dynamic `PhysicsWorld` state from a `'PHYW'` snapshot blob."""
-        _ = r.enter(WORLD_BLOB_TAG, WORLD_BLOB_VERSION)
+        var ver = r.enter(WORLD_BLOB_TAG, WORLD_BLOB_VERSION)
 
         self.gravity = r.f32()
         self.water_enabled = r.boolean()
@@ -4089,6 +5790,132 @@ struct PhysicsWorld(Movable):
         self.graph.used = r.integer()
         self.force_world.read(r)
         self.force_world.tick = self.tick
+
+        self.vehicles.clear()
+        self.aero_bodies.clear()
+        self.xpbd_chains.clear()
+        self.xpbd_meshes.clear()
+        self.ragdolls.clear()
+
+        if ver >= 2:
+            var n_veh = r.integer()
+            if n_veh < 0 or n_veh > 1 << 16:
+                raise Error("physics world blob: invalid vehicle count")
+            for _ in range(n_veh):
+                var v_bid = r.integer()
+                var wf_cat = r.u32()
+                var wf_mask = r.u32()
+                var wf_grp = r.integer()
+                var v_act = r.boolean()
+                var ch = VehicleChassis()
+                ch.deserialize(r)
+                self.vehicles.append(
+                    WorldVehicle(ch^, v_bid, CollisionFilter(wf_cat, wf_mask, wf_grp), v_act)
+                )
+
+            var n_aero = r.integer()
+            if n_aero < 0 or n_aero > 1 << 16:
+                raise Error("physics world blob: invalid aero count")
+            for _ in range(n_aero):
+                var a_bid = r.integer()
+                var a_act = r.boolean()
+                var a_st = Aero6DofState()
+                var a_cfg = Aero6DofConfig()
+                var a_ctrl = Aero6DofControls()
+                a_st.deserialize(r)
+                a_cfg.deserialize(r)
+                a_ctrl.deserialize(r)
+                self.aero_bodies.append(AeroBodyEntry(a_bid, a_st, a_cfg, a_ctrl, a_act))
+
+            var n_xc = r.integer()
+            if n_xc < 0 or n_xc > 1 << 16:
+                raise Error("physics world blob: invalid xpbd chain count")
+            for _ in range(n_xc):
+                var ch = ParticleChain()
+                ch.deserialize(r)
+                var n_atts = r.integer()
+                if n_atts < 0 or n_atts > 1 << 16:
+                    raise Error("physics world blob: invalid xpbd chain attachment count")
+                var atts = List[RigidAttachment](capacity=n_atts)
+                for _ in range(n_atts):
+                    var att = RigidAttachment(0, -1, Vec3())
+                    att.deserialize(r)
+                    atts.append(att)
+                var n_w = r.integer()
+                if n_w < 0 or n_w > 1 << 20:
+                    raise Error("physics world blob: invalid xpbd chain wind count")
+                var wind = List[Vec3](capacity=n_w)
+                for _ in range(n_w):
+                    wind.append(r.vec3())
+                var sub = r.integer()
+                var iters = r.integer()
+                var fc = r.u32()
+                var fm = r.u32()
+                var fg = r.integer()
+                var act = r.boolean()
+                var entry = XpbdChainEntry(ch^, atts^, sub, iters, CollisionFilter(fc, fm, fg), act)
+                entry.wind = wind^
+                self.xpbd_chains.append(entry^)
+
+            var n_xm = r.integer()
+            if n_xm < 0 or n_xm > 1 << 16:
+                raise Error("physics world blob: invalid xpbd mesh count")
+            for _ in range(n_xm):
+                var pm = ParticleMesh()
+                pm.deserialize(r)
+                var n_atts = r.integer()
+                if n_atts < 0 or n_atts > 1 << 16:
+                    raise Error("physics world blob: invalid xpbd mesh attachment count")
+                var atts = List[RigidAttachment](capacity=n_atts)
+                for _ in range(n_atts):
+                    var att = RigidAttachment(0, -1, Vec3())
+                    att.deserialize(r)
+                    atts.append(att)
+                var n_w = r.integer()
+                if n_w < 0 or n_w > 1 << 20:
+                    raise Error("physics world blob: invalid xpbd mesh wind count")
+                var wind = List[Vec3](capacity=n_w)
+                for _ in range(n_w):
+                    wind.append(r.vec3())
+                var sub = r.integer()
+                var iters = r.integer()
+                var fc = r.u32()
+                var fm = r.u32()
+                var fg = r.integer()
+                var act = r.boolean()
+                var entry = XpbdMeshEntry(pm^, atts^, sub, iters, CollisionFilter(fc, fm, fg), act)
+                entry.wind = wind^
+                self.xpbd_meshes.append(entry^)
+
+            var n_rag = r.integer()
+            if n_rag < 0 or n_rag > 1 << 16:
+                raise Error("physics world blob: invalid ragdoll count")
+            for _ in range(n_rag):
+                var rag = ArticulatedRagdoll()
+                rag.deserialize(r)
+                var hr = _HostedRagdoll(rag^)
+                var n_bids = r.integer()
+                if n_bids < 0 or n_bids > 4096:
+                    raise Error("physics world blob: invalid ragdoll limb_body_ids count")
+                for _ in range(n_bids):
+                    hr.limb_body_ids.append(r.integer())
+                var n_lq = r.integer()
+                if n_lq < 0 or n_lq > 4096:
+                    raise Error("physics world blob: invalid ragdoll limb_align_quats count")
+                for _ in range(n_lq):
+                    hr.limb_align_quats.append(r.quat())
+                var n_ji = r.integer()
+                if n_ji < 0 or n_ji > 4096:
+                    raise Error("physics world blob: invalid ragdoll joint_indices count")
+                for _ in range(n_ji):
+                    hr.joint_indices.append(r.integer())
+                var n_aq = r.integer()
+                if n_aq < 0 or n_aq > 4096:
+                    raise Error("physics world blob: invalid ragdoll axis_align_quats count")
+                for _ in range(n_aq):
+                    hr.axis_align_quats.append(r.quat())
+                hr.filter_group = r.integer()
+                self.ragdolls.append(hr^)
 
         r.leave()
 

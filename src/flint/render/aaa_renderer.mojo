@@ -14,7 +14,7 @@ Integrates all 4 Milestones of the Flint Vulkan-Only 100% AAA Plan:
     with `OffsetAllocator` Aliasing, Async Compute Side-Queue Support & `AgX / HDR10 PQ / Metrology` Output.
 """
 from std.ffi import external_call
-from std.math import cos, exp2, log2, max, min, sin, sqrt, tan
+from std.math import cos, exp2, floor, log2, max, min, sin, sqrt, tan
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.core.transform import Mat4
@@ -38,12 +38,16 @@ from flint.platform.vulkan import (
     ACCESS_DEPTH_ATTACHMENT_WRITE,
     ACCESS_HOST_READ,
     ACCESS_INDIRECT_READ,
+    ACCESS_MEMORY_READ,
+    ACCESS_MEMORY_WRITE,
     ACCESS_SHADER_READ,
     ACCESS_SHADER_WRITE,
     ACCESS_TRANSFER_READ,
     ACCESS_TRANSFER_WRITE,
+    BUFFER_USAGE,
     BUFFER_USAGE_AS_BUILD_INPUT_KHR,
     BUFFER_USAGE_DEVICE_ADDRESS,
+    BUFFER_USAGE_INDEX,
     COMPARE_GREATER_OR_EQUAL,
     COMPARE_LESS_OR_EQUAL,
     CULL_MODE_NONE,
@@ -53,7 +57,9 @@ from flint.platform.vulkan import (
     FRONT_FACE_CCW,
     INDEX_TYPE_UINT32,
     NO_IMAGE,
+    FORMAT_B8G8R8A8_SRGB,
     FORMAT_R8_UNORM,
+    FORMAT_R8G8B8A8_UNORM,
     FORMAT_BC5_UNORM,
     FORMAT_BC6H_UFLOAT,
     FORMAT_BC7_SRGB,
@@ -66,11 +72,17 @@ from flint.platform.vulkan import (
     IMAGE_USAGE_COLOR_ATTACHMENT,
     IMAGE_USAGE_DEPTH_ATTACHMENT,
     IMAGE_USAGE_SAMPLED,
+    IMAGE_USAGE_STORAGE,
+    IMAGE_USAGE_TRANSFER_SRC,
     IMAGE_USAGE_TRANSFER_TARGET,
     LAYOUT_COLOR_ATTACHMENT,
     LAYOUT_DEPTH_ATTACHMENT,
+    LAYOUT_GENERAL,
+    LAYOUT_PRESENT,
     LAYOUT_SHADER_READ_ONLY,
     LAYOUT_TRANSFER_TARGET,
+    LAYOUT_UNDEFINED,
+    PIPELINE_ALL_COMMANDS,
     PIPELINE_AS_BUILD_KHR,
     PIPELINE_BOTTOM,
     PIPELINE_COLOR_ATTACHMENT_OUTPUT,
@@ -84,6 +96,7 @@ from flint.platform.vulkan import (
     PIPELINE_TRANSFER,
     PIPELINE_VERTEX_SHADER,
     SwapchainHandle,
+    VkMemReq,
     VulkanAccelStruct,
     VulkanGpu,
     VulkanImage,
@@ -94,7 +107,12 @@ from flint.platform.vulkan import (
 )
 from flint.render.font import SdfFont
 from flint.ui.draw_list import UiDrawList, GpuUiPrim
-from flint.render.ui_overlay import aaa_ui_overlay_shader, AAA_POST_UI_PRIMS_BASE_OFFSET
+from flint.render.ui_overlay import (
+    aaa_ui_overlay_direct_shader,
+    aaa_ui_overlay_shader,
+    aaa_ui_present_fragment_shader,
+    AAA_POST_UI_PRIMS_BASE_OFFSET,
+)
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 from flint.render.aaa_visbuffer import (
     AAA_INSTANCE_WORDS,
@@ -110,6 +128,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_CANDIDATES,
     BIND_AAA_CLUSTERS,
     BIND_AAA_DEPTH_TEX,
+    BIND_AAA_DRAW_PAIRS,
     BIND_AAA_ENV_CUBE,
     BIND_AAA_GLOBALS,
     BIND_AAA_HDR_OUT,
@@ -124,6 +143,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_POST_SCRATCH,
     BIND_AAA_SKINNING,
     BIND_AAA_SURFCACHE,
+    BIND_AAA_SWAPCHAIN_IMG,
     BIND_AAA_TLAS,
     BIND_AAA_VERTICES,
     BIND_AAA_VIS_TEX,
@@ -142,12 +162,21 @@ from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AaaMaterial
 from flint.render.material_graph import (
     AAA_GLOBALS_DECAL_COUNT_WORD,
     AAA_GLOBALS_DECAL_TABLE_WORD,
+    AAA_GLOBALS_TERRAIN_CLIPMAP_WORD,
+    AAA_GLOBALS_TERRAIN_META_WORD,
+    AAA_GLOBALS_TERRAIN_ORIGINS_WORD,
     AAA_MAX_DECALS,
+    BakedVatCrowdClip,
     GPU_DECAL_VOLUME_WORDS,
     GpuDecalVolume,
     MaterialAsset,
     SurfaceMaterialNode,
+    TerrainClipmapDesc,
+    VatCrowdClipDesc,
     compile_surface_material_shader,
+    f32_to_f16_bits,
+    terrain_clipmap_eval_shader,
+    vat_crowd_eval_shader,
 )
 from flint.render.aaa_vsm import (
     VSM_CASCADE_COUNT,
@@ -195,10 +224,20 @@ from flint.render.aaa_gi_svgf import (
     AAA_FLAG_RT_SHADOWS,
     AAA_FLAG_RT_SURFACE_GI,
     AAA_FLAG_VSM,
-    aaa_deferred_shade_shader,
+    AAA_SHADE_CLASS_COMPLEX,
+    AAA_SHADE_CLASS_COUNT,
+    AAA_SHADE_CLASS_FOLIAGE_SSS,
+    AAA_SHADE_CLASS_SKY,
+    AAA_SHADE_CLASS_STANDARD_PBR,
+    AAA_SHADE_CLASS_UNLIT,
+    aaa_deferred_shade_class_shader,
+    aaa_shade_sky_shader,
+    aaa_shade_unlit_shader,
+    aaa_tile_classify_shader,
     surface_cache_update_shader,
     svgf_atrous_shader,
     svgf_temporal_reproject_shader,
+    tile_classify_word_offset,
 )
 from flint.render.aaa_clustered_lights import (
     AAA_CLUSTER_BUFFER_WORDS,
@@ -331,6 +370,9 @@ from flint.render.aaa_post_tsr import (
     aaa_bloom_downsample_shader,
     aaa_bloom_upsample_shader,
     aaa_bokeh_dof_shader,
+    aaa_display_present_fragment_shader,
+    aaa_display_present_vertex_shader,
+    aaa_display_tonemap_direct_shader,
     aaa_display_tonemap_shader,
     aaa_luminance_histogram_shader,
     aaa_motion_blur_shader,
@@ -464,6 +506,7 @@ struct AaaUploadedModel(Movable):
     var albedo_bindless_slots: List[Int]
     var normal_bindless_slots: List[Int]
     var orm_bindless_slots: List[Int]
+    var emissive_bindless_slots: List[Int]
 
     def __init__(out self):
         self.mesh_entries = List[CookedMeshEntry]()
@@ -472,9 +515,50 @@ struct AaaUploadedModel(Movable):
         self.albedo_bindless_slots = List[Int]()
         self.normal_bindless_slots = List[Int]()
         self.orm_bindless_slots = List[Int]()
+        self.emissive_bindless_slots = List[Int]()
 
 
 comptime UploadedModelSlots = AaaUploadedModel
+
+
+@fieldwise_init
+struct _VatRegisteredClip(Copyable, Movable):
+    var desc: VatCrowdClipDesc
+    var material_id: Int
+    var slot_mesh_entries: List[CookedMeshEntry]
+    var slot_skin_bases: List[Int]
+    var slot_last_norm_phase: List[Float32]
+
+    def __init__(out self):
+        self.desc = VatCrowdClipDesc()
+        self.material_id = 0
+        self.slot_mesh_entries = List[CookedMeshEntry]()
+        self.slot_skin_bases = List[Int]()
+        self.slot_last_norm_phase = List[Float32]()
+
+
+@fieldwise_init
+struct _VatDrawRequest(Copyable, Movable):
+    var clip_id: Int
+    var phase_sec: Float32
+    var prev_phase_sec: Float32
+    var world_mat: Mat4
+    var prev_world_mat: Mat4
+    var material_override: Int
+    var uniform_scale: Float32
+    var has_prev: Bool
+
+
+@fieldwise_init
+struct _VatEvalDispatch(Copyable, Movable):
+    var clip_id: Int
+    var mesh_id: Int
+    var first_vertex: Int
+    var vertex_count: Int
+    var prev_pos_base_word: Int
+    var cur_norm_time: Float32
+    var prev_norm_time: Float32
+
 
 
 comptime FRAMES_IN_FLIGHT: Int = 2
@@ -484,6 +568,166 @@ comptime AAA_QUERY_SLOT_STRIDE: Int = 66
 comptime AAA_QUERY_FRAME_PAIR: Int = 64
 comptime _AAA_STAGE_ALL_COMMANDS: Int = 0x10000
 comptime _AAA_ACCESS_MEMORY_READ_WRITE: Int = 0x18000
+
+
+@fieldwise_init
+struct StagingSlice(Copyable, ImplicitlyCopyable, Movable):
+    var slab_idx: Int  # -1 = primary slot buffer, >= 0 = overflow_slabs[slot][slab_idx]
+    var offset: Int
+    var cpu_address: Int
+    var size: Int
+
+    def __init__(out self):
+        self.slab_idx = -1
+        self.offset = 0
+        self.cpu_address = 0
+        self.size = 0
+
+
+struct LinearStagingRing(Movable):
+    """Per-frame fence-synced host-visible linear upload ring with overflow slabs (zero memcpy of prior slices)."""
+    var slot_buffers: List[GpuBuffer]
+    var slot_offsets: List[Int]
+    var overflow_slabs: List[List[GpuBuffer]]
+    var slot_capacity: Int
+
+    def __init__(out self):
+        self.slot_buffers = List[GpuBuffer]()
+        self.slot_offsets = List[Int]()
+        self.overflow_slabs = List[List[GpuBuffer]]()
+        self.slot_capacity = 0
+
+    def init(mut self, mut vk: VulkanGpu, initial_slot_bytes: Int = 8 * 1024 * 1024) -> Bool:
+        self.shutdown(vk)
+        self.slot_capacity = max(65536, (initial_slot_bytes + 4095) & ~4095)
+        for _ in range(FRAMES_IN_FLIGHT):
+            var sb = vk.create_buffer(self.slot_capacity, local=True)
+            if sb.vk_buffer == 0 or sb.cpu_address == 0:
+                self.shutdown(vk)
+                return False
+            self.slot_buffers.append(sb^)
+            self.slot_offsets.append(0)
+            self.overflow_slabs.append(List[GpuBuffer]())
+        return True
+
+    def reset_slot(mut self, mut vk: VulkanGpu, slot: Int):
+        """Reclaims `slot` after caller waits on `frame_fences[slot]`."""
+        if slot < 0 or slot >= len(self.slot_offsets):
+            return
+        self.slot_offsets[slot] = 0
+        ref slabs = self.overflow_slabs[slot]
+        for i in range(len(slabs)):
+            if slabs[i].size > 0:
+                vk.destroy_buffer(slabs[i])
+        slabs.clear()
+
+    def alloc(mut self, mut vk: VulkanGpu, slot: Int, byte_size: Int, align: Int = 256) -> StagingSlice:
+        """Allocates `byte_size` in `slot`'s staging ring (or a fresh overflow slab; never reallocates/memcpy prior slices)."""
+        if byte_size <= 0 or slot < 0 or slot >= len(self.slot_buffers):
+            return StagingSlice()
+        var eff_align = max(16, align)
+        var cur = (self.slot_offsets[slot] + eff_align - 1) & ~(eff_align - 1)
+        if cur + byte_size <= self.slot_buffers[slot].size:
+            self.slot_offsets[slot] = cur + byte_size
+            return StagingSlice(-1, cur, self.slot_buffers[slot].cpu_address + cur, byte_size)
+        var slab_bytes = max(self.slot_capacity, (byte_size + 4095) & ~4095)
+        var ov = vk.create_buffer(slab_bytes, local=True)
+        if ov.vk_buffer == 0 or ov.cpu_address == 0:
+            return StagingSlice()
+        var s_idx = len(self.overflow_slabs[slot])
+        var addr = ov.cpu_address
+        self.overflow_slabs[slot].append(ov^)
+        return StagingSlice(s_idx, 0, addr, byte_size)
+
+    def stage_bytes(mut self, mut vk: VulkanGpu, slot: Int, src_ptr: Int, byte_size: Int, align: Int = 256) -> StagingSlice:
+        var sl = self.alloc(vk, slot, byte_size, align)
+        if sl.cpu_address != 0 and src_ptr != 0 and byte_size > 0:
+            _ = external_call["memcpy", Int](sl.cpu_address, src_ptr, byte_size)
+        return sl
+
+    def record_copy(
+        self,
+        mut vk: VulkanGpu,
+        cmd_slot: Int,
+        ring_slot: Int,
+        slice: StagingSlice,
+        dst: GpuBuffer,
+        dst_offset: Int,
+        byte_size: Int = -1,
+    ):
+        var sz = byte_size if byte_size >= 0 else slice.size
+        if sz <= 0 or slice.cpu_address == 0:
+            return
+        if slice.slab_idx < 0:
+            vk.copy_buffer(cmd_slot, self.slot_buffers[ring_slot], slice.offset, dst, dst_offset, sz)
+        else:
+            vk.copy_buffer(cmd_slot, self.overflow_slabs[ring_slot][slice.slab_idx], slice.offset, dst, dst_offset, sz)
+
+    def upload_to_image_mip(
+        self,
+        mut vk: VulkanGpu,
+        cmd_slot: Int,
+        ring_slot: Int,
+        slice: StagingSlice,
+        img: VulkanImage,
+        mip_level: Int,
+        mip_w: Int,
+        mip_h: Int,
+    ):
+        if slice.size <= 0 or slice.cpu_address == 0:
+            return
+        if slice.slab_idx < 0:
+            vk.upload_image_mip(cmd_slot, img, self.slot_buffers[ring_slot], slice.offset, mip_level, mip_w, mip_h)
+        else:
+            vk.upload_image_mip(
+                cmd_slot, img, self.overflow_slabs[ring_slot][slice.slab_idx], slice.offset, mip_level, mip_w, mip_h
+            )
+
+    def upload_to_image_subregion(
+        self,
+        mut vk: VulkanGpu,
+        cmd_slot: Int,
+        ring_slot: Int,
+        slice: StagingSlice,
+        img: VulkanImage,
+        offset_x: Int,
+        offset_y: Int,
+        width: Int,
+        height: Int,
+        mip_level: Int = 0,
+    ):
+        if slice.size <= 0 or slice.cpu_address == 0:
+            return
+        if slice.slab_idx < 0:
+            vk.upload_image_subregion(
+                cmd_slot, img, self.slot_buffers[ring_slot], slice.offset, offset_x, offset_y, width, height, mip_level
+            )
+        else:
+            vk.upload_image_subregion(
+                cmd_slot,
+                img,
+                self.overflow_slabs[ring_slot][slice.slab_idx],
+                slice.offset,
+                offset_x,
+                offset_y,
+                width,
+                height,
+                mip_level,
+            )
+
+    def shutdown(mut self, mut vk: VulkanGpu):
+        for i in range(len(self.overflow_slabs)):
+            for j in range(len(self.overflow_slabs[i])):
+                if self.overflow_slabs[i][j].size > 0:
+                    vk.destroy_buffer(self.overflow_slabs[i][j])
+            self.overflow_slabs[i].clear()
+        self.overflow_slabs.clear()
+        for i in range(len(self.slot_buffers)):
+            if self.slot_buffers[i].size > 0:
+                vk.destroy_buffer(self.slot_buffers[i])
+        self.slot_buffers.clear()
+        self.slot_offsets.clear()
+        self.slot_capacity = 0
 
 
 struct FlintAaaVulkanRenderer(Movable):
@@ -511,8 +755,15 @@ struct FlintAaaVulkanRenderer(Movable):
     var ring_vsm_table: List[GpuBuffer]
     var ring_oit_staging: List[GpuBuffer]
     var ring_meshlet_worklist: List[GpuBuffer]
+    var ring_draw_pairs: List[GpuBuffer]
+    var draw_pairs_cap: Int
+    var staging_ring: LinearStagingRing
     var meshlet_worklist_cap: Int
     var last_worklist_meshlets: Int
+    var side_cmd_base: Int
+    var last_async_compute_submits: Int
+    var prev_submitted_fence: UInt64
+    var swapchain_img_binding: Int
     var ring_tlas: List[VulkanAccelStruct]
     var ring_tlas_cap: List[Int]  # instance capacity each slot's TLAS + shared scratch were sized for
     var desc_sets: List[Int]
@@ -573,7 +824,14 @@ struct FlintAaaVulkanRenderer(Movable):
     var pipe_surfcache: Int
     var pipe_cluster_cull: Int
     var pipe_dq_skinning: Int
-    var pipe_deferred_shade: Int
+    var pipe_tile_classify: Int
+    var pipe_shade_sky: Int
+    var pipe_shade_unlit: Int
+    var pipe_shade_pbr: Int
+    var pipe_shade_foliage_sss: Int
+    var pipe_shade_complex: Int
+    var pipe_vat_crowd_eval: Int
+    var pipe_terrain_clipmap_eval: Int
     var pipe_svgf_reproject: Int
     var pipe_svgf_atrous: Int
     var pipe_oit_vol: Int
@@ -598,16 +856,32 @@ struct FlintAaaVulkanRenderer(Movable):
     var pipe_tsr_v3_resolve: Int
     var pipe_motion_blur: Int
     var pipe_display_tonemap: Int
+    var pipe_display_tonemap_direct: Int
+    var pipe_ui_overlay_direct: Int
+    var pipe_display_present_gfx: Int
+    var pipe_ui_present_gfx: Int
+    var present_gfx_format: UInt32
     var pipe_npr_outline_gfx: Int
     var pipe_npr_cel_shade: Int
     var pipe_npr_post_fx: Int
 
     # Samplers & Images
     var samp_aniso16: Int
+    var samp_aniso16_min_lod: List[Int]
     var samp_linear_clamp: Int
     var samp_nearest: Int
+    var pending_bindless_desc_writes: List[List[Tuple[Int, Int, Int]]]
+    var deferred_destroy_images: List[List[VulkanImage]]
+    var bindless_free_slots: List[Int]
+    var bindless_resident_min_mip: List[Int]
+    var bindless_vram_bytes: List[Int]
+    var bindless_layouts_init: List[Bool]
+    var fallback_white_slot: Int
     var vis_img: VulkanImage
     var depth_img: VulkanImage
+    var post_alias_img: VulkanImage
+    var aliased_buf_heap: Int
+    var aliased_img_heap: Int
     var hiz_img: VulkanImage
     var hiz_mip_levels: Int
     var hiz_valid: Bool
@@ -647,6 +921,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var buf_outline_indirect: GpuBuffer
     var buf_occluded_candidates: GpuBuffer
     var pending_skin_updates: List[AaaSkinnedMeshEntry]
+    var pending_skin_copies: List[Tuple[Int, List[UInt32]]]
+    var skin_bones_initialized: List[Bool]
 
     # CPU Scene & Subsystems
     var geom: AaaGeometryPool
@@ -683,10 +959,30 @@ struct FlintAaaVulkanRenderer(Movable):
     var render_graph: AaaRenderGraph
     var rg_res_vis: Int
     var rg_res_depth: Int
+    var rg_res_indirect: Int
+    var rg_res_indirect_p2: Int
+    var rg_res_candidates: Int
+    var rg_res_vsm_req: Int
+    var rg_res_hdr: Int
+    var rg_res_oit: Int
+    var rg_res_post_img: Int
+    var rg_res_svgf: Int
+    var rg_res_tsr: Int
     var streamer: AaaResidencyStreamer
     var sh9_irradiance: List[Vec3]
     var env_cube_dim: Int
     var env_mip_levels: Int
+    var last_tile_classify_counts: List[Int]
+
+    # F18 VAT Crowd & Terrain Clipmap Runtime State
+    var vat_clips: List[_VatRegisteredClip]
+    var frame_vat_draws: List[_VatDrawRequest]
+    var terrain_clipmap_active: Bool
+    var terrain_clipmap_desc: TerrainClipmapDesc
+    var terrain_material_id: Int
+    var terrain_ring_meshes: List[CookedMeshEntry]
+    var terrain_ring_origins: List[Tuple[Float32, Float32]]
+    var terrain_clipmap_dirty: Bool
 
     # Camera, Light & Frame State
     var cam_pos: Vec3
@@ -793,7 +1089,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.render_w = max(8, Int(Float32(self.output_w) * self.tsr_scale + Float32(0.5)))
         self.render_h = max(8, Int(Float32(self.output_h) * self.tsr_scale + Float32(0.5)))
         self.max_draws = max(256, max_draws)
-        self.max_instances = min(32768, max(256, max_instances))
+        self.max_instances = min(Int(AAA_MAX_PACKED_INSTANCES), max(256, max_instances))
         self.max_surfcache_tris = 262144
 
         self.dsl = 0
@@ -810,7 +1106,14 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_surfcache = 0
         self.pipe_cluster_cull = 0
         self.pipe_dq_skinning = 0
-        self.pipe_deferred_shade = 0
+        self.pipe_tile_classify = 0
+        self.pipe_shade_sky = 0
+        self.pipe_shade_unlit = 0
+        self.pipe_shade_pbr = 0
+        self.pipe_shade_foliage_sss = 0
+        self.pipe_shade_complex = 0
+        self.pipe_vat_crowd_eval = 0
+        self.pipe_terrain_clipmap_eval = 0
         self.pipe_svgf_reproject = 0
         self.pipe_svgf_atrous = 0
         self.pipe_oit_vol = 0
@@ -835,15 +1138,34 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_tsr_v3_resolve = 0
         self.pipe_motion_blur = 0
         self.pipe_display_tonemap = 0
+        self.pipe_display_tonemap_direct = 0
+        self.pipe_ui_overlay_direct = 0
+        self.pipe_display_present_gfx = 0
+        self.pipe_ui_present_gfx = 0
+        self.present_gfx_format = 0
         self.pipe_npr_outline_gfx = 0
         self.pipe_npr_cel_shade = 0
         self.pipe_npr_post_fx = 0
 
         self.samp_aniso16 = 0
+        self.samp_aniso16_min_lod = List[Int]()
         self.samp_linear_clamp = 0
         self.samp_nearest = 0
+        self.pending_bindless_desc_writes = List[List[Tuple[Int, Int, Int]]]()
+        self.deferred_destroy_images = List[List[VulkanImage]]()
+        for _ in range(FRAMES_IN_FLIGHT):
+            self.pending_bindless_desc_writes.append(List[Tuple[Int, Int, Int]]())
+            self.deferred_destroy_images.append(List[VulkanImage]())
+        self.bindless_free_slots = List[Int]()
+        self.bindless_resident_min_mip = List[Int]()
+        self.bindless_vram_bytes = List[Int]()
+        self.bindless_layouts_init = List[Bool]()
+        self.fallback_white_slot = -1
         self.vis_img = VulkanImage()
         self.depth_img = VulkanImage()
+        self.post_alias_img = VulkanImage()
+        self.aliased_buf_heap = 0
+        self.aliased_img_heap = 0
         self.hiz_img = VulkanImage()
         self.hiz_mip_levels = 1
         self.hiz_valid = False
@@ -885,8 +1207,15 @@ struct FlintAaaVulkanRenderer(Movable):
         self.ring_vsm_table = List[GpuBuffer]()
         self.ring_oit_staging = List[GpuBuffer]()
         self.ring_meshlet_worklist = List[GpuBuffer]()
+        self.ring_draw_pairs = List[GpuBuffer]()
+        self.draw_pairs_cap = max(16384, self.max_draws) * 5
+        self.staging_ring = LinearStagingRing()
         self.meshlet_worklist_cap = max(self.max_draws * 2, 262144)
         self.last_worklist_meshlets = 0
+        self.side_cmd_base = -1
+        self.last_async_compute_submits = 0
+        self.prev_submitted_fence = 0
+        self.swapchain_img_binding = BIND_AAA_SWAPCHAIN_IMG
         self.ring_tlas = List[VulkanAccelStruct]()
         self.ring_tlas_cap = List[Int]()
         self.desc_sets = List[Int]()
@@ -933,6 +1262,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_vsm_indirect = GpuBuffer()
         self.buf_ldr_readback = GpuBuffer()
         self.pending_skin_updates = List[AaaSkinnedMeshEntry]()
+        self.pending_skin_copies = List[Tuple[Int, List[UInt32]]]()
+        self.skin_bones_initialized = List[Bool](length=AAA_MAX_SKIN_BONES, fill=False)
 
         self.geom = AaaGeometryPool()
         self.materials = List[AaaMaterial]()
@@ -963,6 +1294,15 @@ struct FlintAaaVulkanRenderer(Movable):
         self.render_graph = AaaRenderGraph()
         self.rg_res_vis = -1
         self.rg_res_depth = -1
+        self.rg_res_indirect = -1
+        self.rg_res_indirect_p2 = -1
+        self.rg_res_candidates = -1
+        self.rg_res_vsm_req = -1
+        self.rg_res_hdr = -1
+        self.rg_res_oit = -1
+        self.rg_res_post_img = -1
+        self.rg_res_svgf = -1
+        self.rg_res_tsr = -1
         self.streamer = AaaResidencyStreamer()
         self.sh9_irradiance = List[Vec3](length=9, fill=Vec3(0.0, 0.0, 0.0))
         self.env_cube_dim = max(16, env_cube_dim)
@@ -972,6 +1312,16 @@ struct FlintAaaVulkanRenderer(Movable):
             tmp_d >>= 1
             m_cnt += 1
         self.env_mip_levels = m_cnt
+        self.last_tile_classify_counts = List[Int](length=AAA_SHADE_CLASS_COUNT, fill=0)
+
+        self.vat_clips = List[_VatRegisteredClip]()
+        self.frame_vat_draws = List[_VatDrawRequest]()
+        self.terrain_clipmap_active = False
+        self.terrain_clipmap_desc = TerrainClipmapDesc()
+        self.terrain_material_id = 0
+        self.terrain_ring_meshes = List[CookedMeshEntry]()
+        self.terrain_ring_origins = List[Tuple[Float32, Float32]]()
+        self.terrain_clipmap_dirty = False
 
         self.cam_pos = Vec3(0.0, 1.5, -5.0)
         self.cam_fwd = Vec3(0.0, 0.0, 1.0)
@@ -1020,7 +1370,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.grade_contrast = Float32(1.0)
         self.enable_bokeh_dof = False
         self.enable_gpu_profiler = True
-        self.enable_async_vsm = False
+        self.enable_async_vsm = True
         self.vsm_warmed_up = False
         self.gi_bounces = 2
         self.frame_index = 0
@@ -1067,78 +1417,410 @@ struct FlintAaaVulkanRenderer(Movable):
 
         self.active = self._init_vulkan_pipeline()
 
-    def _build_default_render_graph(mut self):
+    def _free_aliased_targets(mut self):
+        if self.vis_img.image != 0:
+            self.vk.destroy_image(self.vis_img)
+        if self.depth_img.image != 0:
+            self.vk.destroy_image(self.depth_img)
+        if self.post_alias_img.image != 0:
+            self.vk.destroy_image(self.post_alias_img)
+        if self.aliased_img_heap != 0:
+            self.vk.destroy_aliased_heap(self.aliased_img_heap)
+            self.aliased_img_heap = 0
+        if self.buf_indirect_phase2.vk_buffer != 0:
+            self.vk.destroy_buffer(self.buf_indirect_phase2)
+            self.buf_indirect_phase2 = GpuBuffer()
+        if self.buf_occluded_candidates.vk_buffer != 0:
+            self.vk.destroy_buffer(self.buf_occluded_candidates)
+            self.buf_occluded_candidates = GpuBuffer()
+        if self.buf_hdr_out.vk_buffer != 0:
+            self.vk.destroy_buffer(self.buf_hdr_out)
+            self.buf_hdr_out = GpuBuffer()
+        if self.aliased_buf_heap != 0:
+            self.vk.destroy_aliased_heap(self.aliased_buf_heap)
+            self.aliased_buf_heap = 0
+
+    def _build_default_render_graph(
+        mut self,
+        req_p2: VkMemReq = VkMemReq(),
+        req_cand: VkMemReq = VkMemReq(),
+        req_hdr: VkMemReq = VkMemReq(),
+        req_vis: VkMemReq = VkMemReq(),
+        req_depth: VkMemReq = VkMemReq(),
+        req_post_img: VkMemReq = VkMemReq(),
+    ):
         self.render_graph = AaaRenderGraph()
         var pix_r = self.render_w * self.render_h
         var pix_o = self.output_w * self.output_h
-        var est_draws = min(self.max_draws, max(2048, pix_r // 2))
-        var r_indirect = self.render_graph.add_resource("IndirectDrawCmds", est_draws * 16, transient=True, is_image=False)
-        var r_hiz = self.render_graph.add_resource("ReverseZHiZPyramid", pix_r * 4, transient=True, is_image=True)
+        var r_indirect = self.render_graph.add_resource("IndirectDrawCmds", 64 + self.max_draws * 20, transient=False, is_image=False)
+        var r_indirect_p2 = self.render_graph.add_resource("IndirectDrawCmdsP2", 64 + self.max_draws * 20, transient=True, is_image=False)
+        var r_candidates = self.render_graph.add_resource("OccludedCandidates", 64 + self.max_draws * 8, transient=True, is_image=False)
+        var r_hiz = self.render_graph.add_resource("ReverseZDepth", pix_r * 4, transient=True, is_image=True)
         var r_vis = self.render_graph.add_resource("VisBuffer64", pix_r * 8, transient=True, is_image=True)
-        var r_vsm_req = self.render_graph.add_resource("VsmPageRequests", VSM_TABLE_WORDS * 4, transient=True, is_image=False)
+        var r_post_img = self.render_graph.add_resource("PostTransientImg", pix_r * 8, transient=True, is_image=True)
+        var r_vsm_req = self.render_graph.add_resource("VsmPageRequests", VSM_TABLE_WORDS * 4, transient=False, is_image=False)
         var r_hdr = self.render_graph.add_resource("LinearHdrScratch", pix_r * 32, transient=True, is_image=False)
-        var r_svgf = self.render_graph.add_resource("SvgfPingPong", pix_r * 32, transient=True, is_image=False)
-        var r_oit = self.render_graph.add_resource("Oit4NodePool", pix_r * 32, transient=True, is_image=False)
-        var r_tsr = self.render_graph.add_resource("TsrUpscaleScratch", pix_o * 16, transient=True, is_image=False)
+        var r_svgf = self.render_graph.add_resource("SvgfPingPong", pix_r * 32, transient=False, is_image=False)
+        var r_oit = self.render_graph.add_resource("Oit4NodePool", max(4096, pix_r * 32), transient=False, is_image=False)
+        var r_tsr = self.render_graph.add_resource("TsrUpscaleScratch", pix_o * 16, transient=False, is_image=False)
+        if req_p2.size > 0:
+            self.render_graph.set_resource_requirements(r_indirect_p2, req_p2)
+        if req_cand.size > 0:
+            self.render_graph.set_resource_requirements(r_candidates, req_cand)
+        if req_hdr.size > 0:
+            self.render_graph.set_resource_requirements(r_hdr, req_hdr)
+        if req_vis.size > 0:
+            self.render_graph.set_resource_requirements(r_vis, req_vis)
+        if req_depth.size > 0:
+            self.render_graph.set_resource_requirements(r_hiz, req_depth)
+        if req_post_img.size > 0:
+            self.render_graph.set_resource_requirements(r_post_img, req_post_img)
+
         self.rg_res_vis = r_vis
         self.rg_res_depth = r_hiz
+        self.rg_res_indirect = r_indirect
+        self.rg_res_indirect_p2 = r_indirect_p2
+        self.rg_res_candidates = r_candidates
+        self.rg_res_vsm_req = r_vsm_req
+        self.rg_res_hdr = r_hdr
+        self.rg_res_oit = r_oit
+        self.rg_res_post_img = r_post_img
+        self.rg_res_svgf = r_svgf
+        self.rg_res_tsr = r_tsr
 
         var p0 = List[RgResourceAccess]()
         p0.append(RgResourceAccess(r_indirect, RG_USAGE_COMPUTE_WRITE))
-        p0.append(RgResourceAccess(r_hiz, RG_USAGE_COMPUTE_READ))
+        p0.append(RgResourceAccess(r_indirect_p2, RG_USAGE_COMPUTE_WRITE))
+        p0.append(RgResourceAccess(r_candidates, RG_USAGE_COMPUTE_WRITE))
         _ = self.render_graph.add_pass("MeshletCull", p0, RG_QUEUE_GRAPHICS)
 
         var p1 = List[RgResourceAccess]()
         p1.append(RgResourceAccess(r_indirect, RG_USAGE_INDIRECT_ARGS))
+        p1.append(RgResourceAccess(r_indirect_p2, RG_USAGE_INDIRECT_ARGS))
+        p1.append(RgResourceAccess(r_candidates, RG_USAGE_COMPUTE_READ))
         p1.append(RgResourceAccess(r_vis, RG_USAGE_COLOR_ATT_WRITE))
         p1.append(RgResourceAccess(r_hiz, RG_USAGE_DEPTH_ATT_WRITE))
         _ = self.render_graph.add_pass("VisBufferHwRaster", p1, RG_QUEUE_GRAPHICS)
 
         var p2 = List[RgResourceAccess]()
         p2.append(RgResourceAccess(r_vis, RG_USAGE_COMPUTE_READ))
+        p2.append(RgResourceAccess(r_hiz, RG_USAGE_COMPUTE_READ))
         p2.append(RgResourceAccess(r_vsm_req, RG_USAGE_COMPUTE_WRITE))
         _ = self.render_graph.add_pass("VsmMarkPages", p2, RG_QUEUE_ASYNC_COMPUTE)
 
         var p3 = List[RgResourceAccess]()
         p3.append(RgResourceAccess(r_vis, RG_USAGE_COMPUTE_READ))
+        p3.append(RgResourceAccess(r_hiz, RG_USAGE_COMPUTE_READ))
         p3.append(RgResourceAccess(r_vsm_req, RG_USAGE_COMPUTE_READ))
         p3.append(RgResourceAccess(r_hdr, RG_USAGE_COMPUTE_WRITE))
         _ = self.render_graph.add_pass("DeferredMultiLobeRtShade", p3, RG_QUEUE_GRAPHICS)
 
         var p4 = List[RgResourceAccess]()
+        p4.append(RgResourceAccess(r_vis, RG_USAGE_COMPUTE_READ))
+        p4.append(RgResourceAccess(r_hiz, RG_USAGE_COMPUTE_READ))
         p4.append(RgResourceAccess(r_hdr, RG_USAGE_COMPUTE_READ))
         p4.append(RgResourceAccess(r_svgf, RG_USAGE_COMPUTE_WRITE))
         _ = self.render_graph.add_pass("SvgfAtrousWavelet", p4, RG_QUEUE_GRAPHICS)
 
         var p5 = List[RgResourceAccess]()
+        p5.append(RgResourceAccess(r_hiz, RG_USAGE_COMPUTE_READ))
         p5.append(RgResourceAccess(r_svgf, RG_USAGE_COMPUTE_READ))
+        p5.append(RgResourceAccess(r_hdr, RG_USAGE_COMPUTE_WRITE))
         p5.append(RgResourceAccess(r_oit, RG_USAGE_COMPUTE_WRITE))
+        p5.append(RgResourceAccess(r_post_img, RG_USAGE_COLOR_ATT_WRITE))
         _ = self.render_graph.add_pass("Oit6WayVolumetrics", p5, RG_QUEUE_GRAPHICS)
 
         var p6 = List[RgResourceAccess]()
+        p6.append(RgResourceAccess(r_hiz, RG_USAGE_COMPUTE_READ))
         p6.append(RgResourceAccess(r_svgf, RG_USAGE_COMPUTE_READ))
+        p6.append(RgResourceAccess(r_hdr, RG_USAGE_COMPUTE_READ))
+        p6.append(RgResourceAccess(r_oit, RG_USAGE_COMPUTE_READ))
+        p6.append(RgResourceAccess(r_post_img, RG_USAGE_COMPUTE_READ))
         p6.append(RgResourceAccess(r_tsr, RG_USAGE_COMPUTE_WRITE))
         _ = self.render_graph.add_pass("TsrV2AndDisplayOetf", p6, RG_QUEUE_GRAPHICS)
 
         _ = self.render_graph.compile()
+
+    def _allocate_and_bind_aliased_targets(mut self) -> Bool:
+        self._free_aliased_targets()
+        var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
+        var img_conc = self.vk.has_side_queue()
+        var vis_req = VkMemReq()
+        var dep_req = VkMemReq()
+        var post_img_req = VkMemReq()
+        var p2_req = VkMemReq()
+        var cand_req = VkMemReq()
+        var hdr_req = VkMemReq()
+
+        self.vis_img = self.vk.create_image_2d_unbound(
+            self.render_w,
+            self.render_h,
+            FORMAT_R32G32_UINT,
+            IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_SAMPLED | IMAGE_USAGE_TRANSFER_SRC,
+            vis_req,
+            concurrent=img_conc,
+        )
+        self.depth_img = self.vk.create_image_2d_unbound(
+            self.render_w,
+            self.render_h,
+            FORMAT_D32_SFLOAT,
+            IMAGE_USAGE_DEPTH_ATTACHMENT | IMAGE_USAGE_SAMPLED,
+            dep_req,
+            concurrent=img_conc,
+        )
+        self.post_alias_img = self.vk.create_image_2d_unbound(
+            self.render_w,
+            self.render_h,
+            FORMAT_R16G16B16A16_SFLOAT,
+            IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_SAMPLED | IMAGE_USAGE_TRANSFER_TARGET,
+            post_img_req,
+            concurrent=False,
+        )
+        self.buf_indirect_phase2 = self.vk.create_buffer_unbound(64 + self.max_draws * 20, p2_req, concurrent=False)
+        self.buf_occluded_candidates = self.vk.create_buffer_unbound(64 + self.max_draws * 8, cand_req, concurrent=False)
+        self.buf_hdr_out = self.vk.create_buffer_unbound(max_pix * 8 * 4, hdr_req, concurrent=False)
+
+        if (
+            self.vis_img.image == 0
+            or self.depth_img.image == 0
+            or self.post_alias_img.image == 0
+            or self.buf_indirect_phase2.vk_buffer == 0
+            or self.buf_occluded_candidates.vk_buffer == 0
+            or self.buf_hdr_out.vk_buffer == 0
+        ):
+            self._free_aliased_targets()
+            return False
+
+        self._build_default_render_graph(
+            p2_req, cand_req, hdr_req, vis_req, dep_req, post_img_req
+        )
+
+        self.aliased_img_heap = self.vk.create_aliased_heap(
+            max(4096, self.render_graph.aliased_img_peak_bytes),
+            self.render_graph.image_memory_type_bits,
+            local=True,
+        )
+        self.aliased_buf_heap = self.vk.create_aliased_heap(
+            max(4096, self.render_graph.aliased_buf_peak_bytes),
+            self.render_graph.buffer_memory_type_bits,
+            local=True,
+        )
+        if self.aliased_img_heap == 0 or self.aliased_buf_heap == 0:
+            self._free_aliased_targets()
+            return False
+
+        var ok_bind = (
+            self.vk.bind_image_aliased(
+                self.vis_img, self.aliased_img_heap, self.render_graph.resources[self.rg_res_vis].aliased_offset_bytes
+            )
+            and self.vk.bind_image_aliased(
+                self.depth_img, self.aliased_img_heap, self.render_graph.resources[self.rg_res_depth].aliased_offset_bytes
+            )
+            and self.vk.bind_image_aliased(
+                self.post_alias_img,
+                self.aliased_img_heap,
+                self.render_graph.resources[self.rg_res_post_img].aliased_offset_bytes,
+            )
+            and self.vk.bind_buffer_aliased(
+                self.buf_indirect_phase2,
+                self.aliased_buf_heap,
+                self.render_graph.resources[self.rg_res_indirect_p2].aliased_offset_bytes,
+            )
+            and self.vk.bind_buffer_aliased(
+                self.buf_occluded_candidates,
+                self.aliased_buf_heap,
+                self.render_graph.resources[self.rg_res_candidates].aliased_offset_bytes,
+            )
+            and self.vk.bind_buffer_aliased(
+                self.buf_hdr_out,
+                self.aliased_buf_heap,
+                self.render_graph.resources[self.rg_res_hdr].aliased_offset_bytes,
+            )
+        )
+        if not ok_bind:
+            self._free_aliased_targets()
+            return False
+
+        self.render_graph.bind_resource_buffer(self.rg_res_indirect_p2, self.buf_indirect_phase2.vk_buffer, 0, self.buf_indirect_phase2.size)
+        self.render_graph.bind_resource_buffer(self.rg_res_candidates, self.buf_occluded_candidates.vk_buffer, 0, self.buf_occluded_candidates.size)
+        self.render_graph.bind_resource_buffer(self.rg_res_hdr, self.buf_hdr_out.vk_buffer, 0, self.buf_hdr_out.size)
+        return True
+
+    def _bind_render_graph_persistent_buffers(mut self, slot: Int):
+        if slot < len(self.ring_indirect):
+            self.render_graph.bind_resource_buffer(self.rg_res_indirect, self.ring_indirect[slot].vk_buffer, 0, self.ring_indirect[slot].size)
+        if slot < len(self.ring_vsm_table):
+            self.render_graph.bind_resource_buffer(self.rg_res_vsm_req, self.ring_vsm_table[slot].vk_buffer, 0, self.ring_vsm_table[slot].size)
+        if self.buf_oit_nodes.vk_buffer != 0:
+            self.render_graph.bind_resource_buffer(self.rg_res_oit, self.buf_oit_nodes.vk_buffer, 0, self.buf_oit_nodes.size)
+        if self.buf_post_scratch.vk_buffer != 0:
+            self.render_graph.bind_resource_buffer(self.rg_res_svgf, self.buf_post_scratch.vk_buffer, 0, self.buf_post_scratch.size)
+        if self.buf_history.vk_buffer != 0:
+            self.render_graph.bind_resource_buffer(self.rg_res_tsr, self.buf_history.vk_buffer, 0, self.buf_history.size)
+
+    def _wait_cmd_slot0(mut self):
+        """Waits on `frame_fences[0]` if still in flight, resets its staging slice, and flushes retirements."""
+        if len(self.frame_fences) > 0 and self.frame_fences[0] != 0:
+            _ = self.vk.wait(self.frame_fences[0])
+            if self.prev_submitted_fence <= self.frame_fences[0]:
+                self.prev_submitted_fence = 0
+            self.frame_fences[0] = 0
+            self.staging_ring.reset_slot(self.vk, 0)
+            self._flush_slot_retirements(0)
+
+    def _wait_all_in_flight(mut self):
+        """Waits for all in-flight frame slots, resets staging ring slices, and flushes retirements."""
+        var any_in_flight = False
+        for i in range(len(self.frame_fences)):
+            if self.frame_fences[i] != 0:
+                any_in_flight = True
+                break
+        if not any_in_flight:
+            return
+        self.vk.wait_idle()
+        self.prev_submitted_fence = 0
+        for i in range(len(self.frame_fences)):
+            self.frame_fences[i] = 0
+        for i in range(len(self.staging_ring.slot_buffers)):
+            self.staging_ring.reset_slot(self.vk, i)
+        var max_retire = max(len(self.pending_bindless_desc_writes), len(self.deferred_destroy_images))
+        for i in range(max_retire):
+            self._flush_slot_retirements(i)
+
+    def _upload_to_device_local_sync(mut self, src_ptr: Int, byte_len: Int, dst_binding: Int, dst_offset: Int = 0):
+        if byte_len <= 0 or src_ptr == 0:
+            return
+        var dst_ok = (
+            (dst_binding == BIND_AAA_MATERIALS and self.buf_materials.vk_buffer != 0)
+            or (dst_binding == BIND_AAA_SKINNING and self.buf_skinning.vk_buffer != 0)
+        )
+        if not dst_ok:
+            return
+        self._wait_cmd_slot0()
+        self.ensure_staging_capacity(byte_len)
+        if self.buf_staging.cpu_address == 0:
+            return
+        _ = external_call["memcpy", Int](self.buf_staging.cpu_address, src_ptr, byte_len)
+        if not self.vk.begin_commands(0):
+            return
+        if dst_binding == BIND_AAA_MATERIALS:
+            self.vk.copy_buffer(0, self.buf_staging, 0, self.buf_materials, dst_offset, byte_len)
+        elif dst_binding == BIND_AAA_SKINNING:
+            self.vk.copy_buffer(0, self.buf_staging, 0, self.buf_skinning, dst_offset, byte_len)
+        self.vk.memory_barrier2(
+            0,
+            PIPELINE_TRANSFER,
+            Int(ACCESS_TRANSFER_WRITE),
+            PIPELINE_ALL_COMMANDS,
+            Int(ACCESS_MEMORY_READ | ACCESS_SHADER_READ | ACCESS_INDIRECT_READ | ACCESS_AS_READ_KHR),
+        )
+        var f = self.vk.submit(0)
+        if f != 0:
+            _ = self.vk.wait(f)
+
+    def _grow_storage_buffer(
+        mut self,
+        needed_bytes: Int,
+        binding: Int,
+        extra_usage: UInt32,
+        bda: Bool,
+        update_cull_sets: Bool,
+    ) -> Bool:
+        var old_size: Int
+        var old_valid: Bool
+        if binding == BIND_AAA_VERTICES:
+            old_size = self.buf_vertices.size
+            old_valid = self.buf_vertices.vk_buffer != 0
+        elif binding == BIND_AAA_INDICES:
+            old_size = self.buf_indices.size
+            old_valid = self.buf_indices.vk_buffer != 0
+        elif binding == BIND_AAA_MESHLETS:
+            old_size = self.buf_meshlets.size
+            old_valid = self.buf_meshlets.vk_buffer != 0
+        elif binding == BIND_AAA_MATERIALS:
+            old_size = self.buf_materials.size
+            old_valid = self.buf_materials.vk_buffer != 0
+        else:
+            return False
+        if needed_bytes <= old_size:
+            return True
+        self.vk.wait_idle()
+        for i in range(len(self.frame_fences)):
+            self.frame_fences[i] = 0
+            self._flush_slot_retirements(i)
+        self.prev_submitted_fence = 0
+        var new_cap = max(max(65536, old_size * 2), needed_bytes)
+        new_cap = (new_cap + 65535) & ~65535
+        var new_buf = self.vk.create_buffer_device_local(new_cap, usage=BUFFER_USAGE | extra_usage, bda=bda)
+        if new_buf.vk_buffer == 0:
+            return False
+        if old_valid and old_size > 0:
+            if not self.vk.begin_commands(0):
+                self.vk.destroy_buffer(new_buf)
+                return False
+            if binding == BIND_AAA_VERTICES:
+                self.vk.copy_buffer(0, self.buf_vertices, 0, new_buf, 0, old_size)
+            elif binding == BIND_AAA_INDICES:
+                self.vk.copy_buffer(0, self.buf_indices, 0, new_buf, 0, old_size)
+            elif binding == BIND_AAA_MESHLETS:
+                self.vk.copy_buffer(0, self.buf_meshlets, 0, new_buf, 0, old_size)
+            elif binding == BIND_AAA_MATERIALS:
+                self.vk.copy_buffer(0, self.buf_materials, 0, new_buf, 0, old_size)
+            self.vk.memory_barrier2(
+                0,
+                PIPELINE_TRANSFER,
+                Int(ACCESS_TRANSFER_WRITE),
+                PIPELINE_ALL_COMMANDS,
+                Int(ACCESS_MEMORY_READ | ACCESS_SHADER_READ | ACCESS_INDIRECT_READ | ACCESS_AS_READ_KHR),
+            )
+            var f = self.vk.submit(0)
+            if f == 0 or not self.vk.wait(f):
+                self.vk.destroy_buffer(new_buf)
+                return False
+            if binding == BIND_AAA_VERTICES:
+                self.vk.destroy_buffer(self.buf_vertices)
+            elif binding == BIND_AAA_INDICES:
+                self.vk.destroy_buffer(self.buf_indices)
+            elif binding == BIND_AAA_MESHLETS:
+                self.vk.destroy_buffer(self.buf_meshlets)
+            elif binding == BIND_AAA_MATERIALS:
+                self.vk.destroy_buffer(self.buf_materials)
+        for slot in range(len(self.desc_sets)):
+            self.vk.write_descriptor(self.desc_sets[slot], binding, new_buf)
+            if update_cull_sets:
+                if slot < len(self.desc_sets_cull_p1):
+                    self.vk.write_descriptor(self.desc_sets_cull_p1[slot], binding, new_buf)
+                if slot < len(self.desc_sets_cull_p2):
+                    self.vk.write_descriptor(self.desc_sets_cull_p2[slot], binding, new_buf)
+        if binding == BIND_AAA_VERTICES:
+            self.buf_vertices = new_buf^
+        elif binding == BIND_AAA_INDICES:
+            self.buf_indices = new_buf^
+        elif binding == BIND_AAA_MESHLETS:
+            self.buf_meshlets = new_buf^
+        elif binding == BIND_AAA_MATERIALS:
+            self.buf_materials = new_buf^
+        return True
 
     def _init_vulkan_pipeline(mut self) -> Bool:
         if not self.vk.initialize(validate=False, need_discrete=False):
             return False
         if not self.vk.has_dynamic_rendering or not self.vk.has_descriptor_indexing:
             return False
-        if not self.vk.allocate_command_buffers(2):
+        if not self.vk.allocate_command_buffers(FRAMES_IN_FLIGHT * 2):
             return False
         if self.vk.has_side_queue():
-            _ = self.vk.allocate_side_command_buffers(1)
+            self.side_cmd_base = self.vk.allocate_side_command_buffers(FRAMES_IN_FLIGHT)
 
         var use_rt = self.vk.has_ray_query
+        self.swapchain_img_binding = AAA_STORAGE_COUNT + AAA_SINGLE_SAMPLERS + 1 + (1 if use_rt else 0)
         var layouts = self.vk.create_aaa_layouts(
             AAA_STORAGE_COUNT,
             AAA_SINGLE_SAMPLERS,
             AAA_MAX_BINDLESS,
             use_rt,
             AAA_PUSH_BYTES,
+            storage_image_count=1,
         )
         self.dsl = layouts[0]
         self.pipe_layout = layouts[1]
@@ -1152,6 +1834,7 @@ struct FlintAaaVulkanRenderer(Movable):
             AAA_SINGLE_SAMPLERS,
             AAA_MAX_BINDLESS,
             use_rt,
+            storage_image_count=1,
         )
         self.desc_pool = pool_sets[0]
         var all_sets = pool_sets[1].copy()
@@ -1168,9 +1851,9 @@ struct FlintAaaVulkanRenderer(Movable):
 
         _ = self.vk.init_pipeline_cache("build/vk_pso.cache")
 
-        # Compile all 10 AAA Hardware Graphics & Compute SPIR-V 1.5 Pipelines!
+        # Compile core hardware Graphics & Compute SPIR-V 1.5 Pipelines eagerly;
+        # optional feature pipelines & specialized shade classes compile lazily on first use.
         self.pipe_meshlet_cull = self.vk.create_aaa_compute_pipeline(self.pipe_layout, meshlet_cull_shader())
-        self.pipe_hiz_downsample = self.vk.create_aaa_compute_pipeline(self.pipe_layout, hiz_depth_downsample_shader())
         self.pipe_visbuffer_gfx = self.vk.create_graphics_pipeline(
             self.pipe_layout,
             visbuffer_vertex_shader(),
@@ -1182,32 +1865,6 @@ struct FlintAaaVulkanRenderer(Movable):
             depth_write=True,
             depth_compare=COMPARE_GREATER_OR_EQUAL,
             cull_mode=CULL_MODE_BACK,
-            front_face=FRONT_FACE_CW,
-        )
-        self.pipe_visbuffer_alphamask_gfx = self.vk.create_graphics_pipeline(
-            self.pipe_layout,
-            visbuffer_alphamask_vertex_shader(),
-            visbuffer_alphamask_vfx_fragment_shader(),
-            has_color=True,
-            color_format=FORMAT_R32G32_UINT,
-            depth_format=FORMAT_D32_SFLOAT,
-            depth_test=True,
-            depth_write=True,
-            depth_compare=COMPARE_GREATER_OR_EQUAL,
-            cull_mode=CULL_MODE_NONE,
-            front_face=FRONT_FACE_CW,
-        )
-        self.pipe_npr_outline_gfx = self.vk.create_graphics_pipeline(
-            self.pipe_layout,
-            npr_outline_vertex_shader(),
-            npr_outline_fragment_shader(),
-            has_color=True,
-            color_format=FORMAT_R32G32_UINT,
-            depth_format=FORMAT_D32_SFLOAT,
-            depth_test=True,
-            depth_write=True,
-            depth_compare=COMPARE_GREATER_OR_EQUAL,
-            cull_mode=CULL_MODE_FRONT,
             front_face=FRONT_FACE_CW,
         )
         self.pipe_vsm_mark = self.vk.create_aaa_compute_pipeline(self.pipe_layout, vsm_mark_pages_shader())
@@ -1224,123 +1881,36 @@ struct FlintAaaVulkanRenderer(Movable):
             cull_mode=CULL_MODE_BACK,
             front_face=FRONT_FACE_CW,
         )
-        self.pipe_vsm_alphamask_gfx = self.vk.create_graphics_pipeline(
-            self.pipe_layout,
-            vsm_alphamask_vertex_shader(),
-            vsm_alphamask_fragment_shader(),
-            has_color=False,
-            color_format=0,
-            depth_format=FORMAT_D32_SFLOAT,
-            depth_test=True,
-            depth_write=True,
-            depth_compare=COMPARE_LESS_OR_EQUAL,
-            cull_mode=CULL_MODE_NONE,
-            front_face=FRONT_FACE_CW,
+        self.pipe_tile_classify = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_tile_classify_shader())
+        self.pipe_shade_sky = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_shade_sky_shader(True))
+        self.pipe_shade_pbr = self.vk.create_aaa_compute_pipeline(
+            self.pipe_layout, aaa_deferred_shade_class_shader(use_rt, AAA_SHADE_CLASS_STANDARD_PBR, True)
         )
-        self.pipe_surfcache = self.vk.create_aaa_compute_pipeline(self.pipe_layout, surface_cache_update_shader(use_rt))
-        self.pipe_cluster_cull = self.vk.create_aaa_compute_pipeline(
-            self.pipe_layout, aaa_cluster_cull_shader(BIND_AAA_CLUSTERS, BIND_AAA_GLOBALS)
-        )
-        self.pipe_dq_skinning = self.vk.create_aaa_compute_pipeline(
-            self.pipe_layout, aaa_dq_skinning_shader(BIND_AAA_VERTICES, BIND_AAA_SKINNING)
-        )
-        self.pipe_deferred_shade = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_deferred_shade_shader(use_rt))
-        self.pipe_svgf_reproject = self.vk.create_aaa_compute_pipeline(self.pipe_layout, svgf_temporal_reproject_shader())
-        self.pipe_svgf_atrous = self.vk.create_aaa_compute_pipeline(self.pipe_layout, svgf_atrous_shader())
-        self.pipe_oit_vol = self.vk.create_aaa_compute_pipeline(self.pipe_layout, oit_and_6way_volumetric_shader())
-        self.pipe_luma_hist = self.vk.create_aaa_compute_pipeline(
-            self.pipe_layout, aaa_luminance_histogram_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
-        )
-        self.pipe_adapt_exp = self.vk.create_aaa_compute_pipeline(
-            self.pipe_layout, aaa_adapt_exposure_shader(BIND_AAA_POST_SCRATCH)
-        )
-        self.pipe_bloom_down = self.vk.create_aaa_compute_pipeline(
-            self.pipe_layout, aaa_bloom_downsample_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
-        )
-        self.pipe_bloom_up = self.vk.create_aaa_compute_pipeline(
-            self.pipe_layout, aaa_bloom_upsample_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
-        )
-        self.pipe_bokeh_dof = self.vk.create_aaa_compute_pipeline(
-            self.pipe_layout, aaa_bokeh_dof_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
-        )
-        self.pipe_tsr_display = self.vk.create_aaa_compute_pipeline(self.pipe_layout, tsr_v2_and_display_shader())
-        self.pipe_spec_reblur_temp = self.vk.create_aaa_compute_pipeline(self.pipe_layout, spec_reblur_temporal_shader())
-        self.pipe_spec_reblur_atrous = self.vk.create_aaa_compute_pipeline(self.pipe_layout, spec_reblur_atrous_shader())
-        self.pipe_froxel_inject = self.vk.create_aaa_compute_pipeline(self.pipe_layout, froxel_inject_and_reproject_shader())
-        self.pipe_froxel_prefix = self.vk.create_aaa_compute_pipeline(self.pipe_layout, froxel_prefix_integrate_shader())
-        self.pipe_froxel_march = self.vk.create_aaa_compute_pipeline(self.pipe_layout, froxel_raymarch_integrate_shader())
-        self.pipe_particle_clear = self.vk.create_aaa_compute_pipeline(self.pipe_layout, gpu_particle_clear_tiles_shader())
-        self.pipe_particle_sim = self.vk.create_aaa_compute_pipeline(self.pipe_layout, gpu_particle_sim_and_bin_shader())
-        self.pipe_particle_comp = self.vk.create_aaa_compute_pipeline(self.pipe_layout, gpu_particle_tile_composite_shader())
-        self.pipe_water_refract = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_water_refract_shader(use_rt))
-        if use_rt:
-            self.pipe_rt_shadow_trace = self.vk.create_aaa_compute_pipeline(self.pipe_layout, rt_sun_shadow_trace_shader())
-            self.pipe_rt_shadow_filter = self.vk.create_aaa_compute_pipeline(self.pipe_layout, rt_sun_shadow_filter_shader())
-            self.pipe_glass_refract = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_glass_refract_shader())
         self.pipe_tsr_v3_resolve = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_tsr_v3_resolve_shader())
-        self.pipe_motion_blur = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_motion_blur_shader())
         self.pipe_display_tonemap = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_display_tonemap_shader())
-        self.pipe_npr_cel_shade = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_cel_shade_shader())
-        self.pipe_npr_post_fx = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_post_fx_shader())
         self.pipe_ui_overlay = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_ui_overlay_shader())
-        self.pipe_scrgb_pack = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_pack_scrgb_rgba16f_shader())
 
         if (
             self.pipe_meshlet_cull == 0
-            or self.pipe_hiz_downsample == 0
             or self.pipe_visbuffer_gfx == 0
-            or self.pipe_visbuffer_alphamask_gfx == 0
-            or self.pipe_npr_outline_gfx == 0
             or self.pipe_vsm_mark == 0
             or self.pipe_vsm_gfx == 0
-            or self.pipe_vsm_alphamask_gfx == 0
-            or self.pipe_surfcache == 0
-            or self.pipe_cluster_cull == 0
-            or self.pipe_dq_skinning == 0
-            or self.pipe_deferred_shade == 0
-            or self.pipe_svgf_reproject == 0
-            or self.pipe_svgf_atrous == 0
-            or self.pipe_oit_vol == 0
-            or self.pipe_luma_hist == 0
-            or self.pipe_adapt_exp == 0
-            or self.pipe_bloom_down == 0
-            or self.pipe_bloom_up == 0
-            or self.pipe_bokeh_dof == 0
-            or self.pipe_tsr_display == 0
-            or self.pipe_spec_reblur_temp == 0
-            or self.pipe_spec_reblur_atrous == 0
-            or self.pipe_froxel_inject == 0
-            or self.pipe_froxel_prefix == 0
-            or self.pipe_froxel_march == 0
-            or self.pipe_particle_clear == 0
-            or self.pipe_particle_sim == 0
-            or self.pipe_particle_comp == 0
-            or self.pipe_water_refract == 0
+            or self.pipe_tile_classify == 0
+            or self.pipe_shade_sky == 0
+            or self.pipe_shade_pbr == 0
             or self.pipe_tsr_v3_resolve == 0
-            or self.pipe_motion_blur == 0
             or self.pipe_display_tonemap == 0
-            or self.pipe_npr_cel_shade == 0
-            or self.pipe_npr_post_fx == 0
             or self.pipe_ui_overlay == 0
-            or self.pipe_scrgb_pack == 0
         ):
             return False
 
-        if self.vk.timestamps:
-            _ = self.vk.create_query_pool(AAA_QUERY_SLOT_STRIDE * FRAMES_IN_FLIGHT)
+        if not self.staging_ring.init(self.vk, 8 * 1024 * 1024):
+            return False
 
-        # Samplers
-        self.samp_aniso16 = self.vk.create_sampler(linear=True, max_anisotropy=16.0, clamp_to_edge=False)
-        self.samp_linear_clamp = self.vk.create_sampler(linear=True, max_anisotropy=1.0, clamp_to_edge=True)
-        self.samp_nearest = self.vk.create_sampler(linear=False, max_anisotropy=1.0, clamp_to_edge=True)
+        # Aliased transient Render Targets & Buffers (`aliased_img_heap` + `aliased_buf_heap`)
+        if not self._allocate_and_bind_aliased_targets():
+            return False
 
-        # Render Targets & LUTs
-        self.vis_img = self.vk.create_image_2d(
-            self.render_w, self.render_h, FORMAT_R32G32_UINT, IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_SAMPLED
-        )
-        self.depth_img = self.vk.create_image_2d(
-            self.render_w, self.render_h, FORMAT_D32_SFLOAT, IMAGE_USAGE_DEPTH_ATTACHMENT | IMAGE_USAGE_SAMPLED
-        )
         self.hiz_mip_levels = compute_hiz_mip_levels(self.render_w, self.render_h)
         self.hiz_img = self.vk.create_image_2d(
             self.render_w,
@@ -1377,55 +1947,71 @@ struct FlintAaaVulkanRenderer(Movable):
         ):
             return False
 
-        # UI Font atlas (Feature 15)
+        self.samp_aniso16 = self.vk.create_sampler(linear=True, max_anisotropy=16.0, clamp_to_edge=False, max_lod=16.0)
+        self.samp_aniso16_min_lod.clear()
+        for m_lod in range(16):
+            var ms = self.vk.create_sampler(
+                linear=True,
+                max_anisotropy=16.0,
+                clamp_to_edge=False,
+                max_lod=16.0,
+                min_lod=Float32(m_lod),
+            )
+            self.samp_aniso16_min_lod.append(ms)
+        self.samp_linear_clamp = self.vk.create_sampler(linear=True, max_anisotropy=1.0, clamp_to_edge=True, max_lod=16.0)
+        self.samp_nearest = self.vk.create_sampler(linear=False, max_anisotropy=1.0, clamp_to_edge=True, max_lod=16.0)
+        if self.samp_aniso16 == 0 or self.samp_linear_clamp == 0 or self.samp_nearest == 0:
+            return False
+
+        # UI Font atlas (Feature 15, owned directly in bindless_images without .copy())
         _ = self.ui_font.load_ttf("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 36, 5)
         var fw = self.ui_font.atlas_width if self.ui_font.atlas_width > 0 else 512
         var fh = self.ui_font.atlas_height if self.ui_font.atlas_height > 0 else 512
-        self.ui_font_img = self.vk.create_image_2d(
+        var font_img = self.vk.create_image_2d(
             fw, fh, FORMAT_R8_UNORM, IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED
         )
         self.ui_font_atlas_slot = len(self.bindless_images)
-        self.bindless_images.append(self.ui_font_img.copy())
+        self.bindless_images.append(font_img^)
 
-        # Allocate Storage Buffers (`local=True` places GPU SSBOs in `DEVICE_LOCAL` Resizable BAR VRAM!)
+        # Allocate true DEVICE_LOCAL Storage Buffers (`cpu_address == 0` where VRAM-only exists)
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
         var bda_flags = BUFFER_USAGE_DEVICE_ADDRESS | BUFFER_USAGE_AS_BUILD_INPUT_KHR
-        self.buf_vertices = self.vk.create_buffer_bda(32 * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
-        self.buf_indices = self.vk.create_buffer_bda(32 * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
-        self.buf_meshlets = self.vk.create_buffer(8 * 1024 * 1024, local=True)
-        self.buf_materials = self.vk.create_buffer(1024 * AAA_MATERIAL_WORDS * 4, local=True)
-        self.buf_vsm_indirect = self.vk.create_buffer(64 + self.max_draws * 16, local=True)
-        self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
+        self.buf_vertices = self.vk.create_buffer_device_local(2 * 1024 * 1024, usage=BUFFER_USAGE | BUFFER_USAGE_AS_BUILD_INPUT_KHR, bda=True)
+        self.buf_indices = self.vk.create_buffer_device_local(2 * 1024 * 1024, usage=BUFFER_USAGE | BUFFER_USAGE_INDEX | BUFFER_USAGE_AS_BUILD_INPUT_KHR, bda=True)
+        self.buf_meshlets = self.vk.create_buffer_device_local(1 * 1024 * 1024)
+        self.buf_materials = self.vk.create_buffer_device_local(256 * AAA_MATERIAL_WORDS * 4)
+        self.buf_vsm_indirect = self.vk.create_buffer_device_local(64 + self.max_draws * 16)
         var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
-        self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
-        self.buf_oit_nodes = self.vk.create_buffer(gpu_particles_total_oit_words(max_pix) * 4, local=True)
-        self.buf_skinning = self.vk.create_buffer(AAA_SKIN_BUFFER_WORDS * 4, local=True)
-        # Per-pixel post regions end below word 1024 + max_pix * 10; the UI prims of each frame in flight follow.
+        self.buf_history = self.vk.create_buffer_device_local(hist_words * 4)
+        self.buf_oit_nodes = self.vk.create_buffer_device_local(gpu_particles_total_oit_words(max_pix) * 4)
+        self.buf_skinning = self.vk.create_buffer_device_local(AAA_SKIN_BUFFER_WORDS * 4)
         var scratch_words = AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + FRAMES_IN_FLIGHT * AAA_UI_PRIM_REGION_WORDS
-        self.buf_post_scratch = self.vk.create_buffer(scratch_words * 4, local=True)
+        self.buf_post_scratch = self.vk.create_buffer_device_local(scratch_words * 4)
         self.buf_ldr_readback = self.vk.create_buffer(64 + self.output_w * self.output_h * 4, local=False, cpu_reads=True)
         self.buf_staging = self.vk.create_buffer(8 * 1024 * 1024, local=False)
-        self.buf_indirect_phase2 = self.vk.create_buffer(64 + self.max_draws * 20, local=True)
-        self.buf_occluded_candidates = self.vk.create_buffer(64 + self.max_draws * 4, local=True)
+        self.buf_globals = self.vk.create_buffer(4096, local=False)
+        if self.buf_globals.cpu_address != 0:
+            _ = external_call["memset", Int](self.buf_globals.cpu_address, Int32(0), self.buf_globals.size)
 
-        # Ring-Buffered CPU-to-GPU Dynamic Buffers (Feature 14: FRAMES_IN_FLIGHT = 2)
+        # Ring-Buffered CPU-to-GPU Dynamic Buffers (DEVICE_LOCAL, staged through LinearStagingRing)
         var oit_stage_bytes = (AAA_MAX_OIT_PRIMS * 16 + AAA_MAX_PARTICLE_EMITTERS * AAA_EMITTER_WORDS + 64) * 4
+        var vsm_conc = self.vk.has_side_queue()
         for _ in range(FRAMES_IN_FLIGHT):
-            var b_glob = self.vk.create_buffer(16384, local=True)
-            _ = external_call["memset", Int](b_glob.cpu_address, Int32(0), b_glob.size)
-            var b_inst = self.vk.create_buffer(self.max_instances * AAA_INSTANCE_WORDS * 4, local=True)
-            var b_ind = self.vk.create_buffer(64 + self.max_draws * 20, local=True)
-            var b_am_ind = self.vk.create_buffer(64 + 16384 * 20, local=True)
-            var b_out_ind = self.vk.create_buffer(64 + 16384 * 20, local=True)
-            var b_clust = self.vk.create_buffer(AAA_CLUSTER_BUFFER_WORDS * 4, local=True)
-            _ = external_call["memset", Int](b_clust.cpu_address, Int32(0), b_clust.size)
-            var b_sc = self.vk.create_buffer((4096 + self.max_surfcache_tris * 4) * 4, local=True)
-            _ = external_call["memset", Int](b_sc.cpu_address, Int32(0), b_sc.size)
-            var b_vsm = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True)
-            _ = external_call["memset", Int](b_vsm.cpu_address, Int32(0), b_vsm.size)
+            var b_glob = self.vk.create_buffer_device_local(16384, concurrent=vsm_conc)
+            var b_inst = self.vk.create_buffer_device_local(self.max_instances * AAA_INSTANCE_WORDS * 4)
+            var b_ind = self.vk.create_buffer_device_local(64 + self.max_draws * 20)
+            var b_am_ind = self.vk.create_buffer_device_local(64 + 16384 * 20)
+            var b_out_ind = self.vk.create_buffer_device_local(64 + 16384 * 20)
+            var b_clust = self.vk.create_buffer_device_local(AAA_CLUSTER_BUFFER_WORDS * 4)
+            var b_sc = self.vk.create_buffer_device_local((4096 + self.max_surfcache_tris * 4) * 4)
+            var b_vsm = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True, concurrent=vsm_conc)
+            if b_vsm.cpu_address != 0:
+                _ = external_call["memset", Int](b_vsm.cpu_address, Int32(0), b_vsm.size)
             var b_oit_st = self.vk.create_buffer(oit_stage_bytes, local=False)
-            _ = external_call["memset", Int](b_oit_st.cpu_address, Int32(0), b_oit_st.size)
-            var b_wl = self.vk.create_buffer(self.meshlet_worklist_cap * 4, local=True)
+            if b_oit_st.cpu_address != 0:
+                _ = external_call["memset", Int](b_oit_st.cpu_address, Int32(0), b_oit_st.size)
+            var b_wl = self.vk.create_buffer_device_local(self.meshlet_worklist_cap * 8)
+            var b_dp = self.vk.create_buffer_device_local(self.draw_pairs_cap * 8)
             self.ring_globals.append(b_glob^)
             self.ring_instances.append(b_inst^)
             self.ring_indirect.append(b_ind^)
@@ -1436,8 +2022,9 @@ struct FlintAaaVulkanRenderer(Movable):
             self.ring_vsm_table.append(b_vsm^)
             self.ring_oit_staging.append(b_oit_st^)
             self.ring_meshlet_worklist.append(b_wl^)
+            self.ring_draw_pairs.append(b_dp^)
             if self.vk.has_ray_query:
-                var b_as = self.vk.create_buffer_bda(self.max_instances * 64, extra_usage=bda_flags, host_visible=True)
+                var b_as = self.vk.create_buffer_device_local(self.max_instances * 64, usage=BUFFER_USAGE | bda_flags, bda=True)
                 var tlas = VulkanAccelStruct()
                 var init_inst_da = self.vk.buffer_device_address(b_as)
                 _ = ensure_tlas_capacity_mixed_opaque(self.vk, tlas, init_inst_da, self.max_instances, self.buf_as_scratch)
@@ -1448,23 +2035,18 @@ struct FlintAaaVulkanRenderer(Movable):
             self.slot_frame_q.append(-1)
             self.slot_has_pending_queries.append(False)
 
-        self.buf_globals = self.ring_globals[0].copy()
-        self.buf_instances = self.ring_instances[0].copy()
-        self.buf_indirect = self.ring_indirect[0].copy()
-        self.buf_alphamask_indirect = self.ring_alphamask_indirect[0].copy()
-        self.buf_outline_indirect = self.ring_outline_indirect[0].copy()
-        self.buf_clusters = self.ring_clusters[0].copy()
-        self.buf_surfcache = self.ring_surfcache[0].copy()
-        self.buf_vsm_table = self.ring_vsm_table[0].copy()
-        if self.vk.has_ray_query and len(self.ring_as_instances) > 0:
-            self.buf_as_instances = self.ring_as_instances[0].copy()
-            self.frame_tlas = self.ring_tlas[0].copy()
+        self.buf_instances = GpuBuffer(0, self.ring_instances[0].size, 0, 0)
+        self.buf_indirect = GpuBuffer(0, self.ring_indirect[0].size, 0, 0)
+        self.buf_alphamask_indirect = GpuBuffer(0, self.ring_alphamask_indirect[0].size, 0, 0)
+        self.buf_outline_indirect = GpuBuffer(0, self.ring_outline_indirect[0].size, 0, 0)
+        self.buf_clusters = GpuBuffer(0, self.ring_clusters[0].size, 0, 0)
+        self.buf_surfcache = GpuBuffer(0, self.ring_surfcache[0].size, 0, 0)
+        self.buf_vsm_table = GpuBuffer(0, self.ring_vsm_table[0].size, 0, 0)
+        if self.vk.has_ray_query and len(self.ring_tlas) > 0:
+            self.frame_tlas.handle = self.ring_tlas[0].handle
 
-        _ = external_call["memset", Int](self.buf_history.cpu_address, Int32(0), self.buf_history.size)
-        _ = external_call["memset", Int](self.buf_oit_nodes.cpu_address, Int32(0), self.buf_oit_nodes.size)
-        _ = external_call["memset", Int](self.buf_skinning.cpu_address, Int32(0), self.buf_skinning.size)
-        _ = external_call["memset", Int](self.buf_post_scratch.cpu_address, Int32(0), self.buf_post_scratch.size)
-        _ = external_call["memset", Int](self.buf_ldr_readback.cpu_address, Int32(0), self.buf_ldr_readback.size)
+        if self.buf_ldr_readback.cpu_address != 0:
+            _ = external_call["memset", Int](self.buf_ldr_readback.cpu_address, Int32(0), self.buf_ldr_readback.size)
 
         # Bind Storage Buffers and Samplers across all descriptor sets
         for slot in range(FRAMES_IN_FLIGHT):
@@ -1484,6 +2066,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds, BIND_AAA_CLUSTERS, self.ring_clusters[slot])
             self.vk.write_descriptor(ds, BIND_AAA_SKINNING, self.buf_skinning)
             self.vk.write_descriptor(ds, BIND_AAA_POST_SCRATCH, self.buf_post_scratch)
+            self.vk.write_descriptor(ds, BIND_AAA_DRAW_PAIRS, self.ring_draw_pairs[slot])
 
             self.vk.write_aaa_texture(ds, BIND_AAA_VIS_TEX, 0, self.samp_nearest, self.vis_img.view)
             self.vk.write_aaa_texture(ds, BIND_AAA_DEPTH_TEX, 0, self.samp_linear_clamp, self.depth_img.view)
@@ -1492,7 +2075,6 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_aaa_texture(ds, BIND_AAA_BRDF_LUT, 0, self.samp_linear_clamp, self.brdf_lut_img.view)
             self.vk.write_aaa_texture(ds, BIND_AAA_LTC_LUT, 0, self.samp_linear_clamp, self.ltc_lut_img.view)
 
-            # Phase 1 Cull Descriptor Set: BIND_AAA_DEPTH_TEX -> multi-mip R32_SFLOAT Hi-Z pyramid (`hiz_img`)!
             var ds_p1 = self.desc_sets_cull_p1[slot]
             self.vk.write_descriptor(ds_p1, BIND_AAA_VERTICES, self.buf_vertices)
             self.vk.write_descriptor(ds_p1, BIND_AAA_INDICES, self.buf_indices)
@@ -1503,9 +2085,9 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds_p1, BIND_AAA_GLOBALS, self.ring_globals[slot])
             self.vk.write_descriptor(ds_p1, BIND_AAA_WORKLIST, self.ring_meshlet_worklist[slot])
             self.vk.write_descriptor(ds_p1, BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
+            self.vk.write_descriptor(ds_p1, BIND_AAA_DRAW_PAIRS, self.ring_draw_pairs[slot])
             self.vk.write_aaa_texture(ds_p1, BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
 
-            # Phase 2 Cull Descriptor Set: BIND_AAA_INDIRECT -> buf_indirect_phase2, BIND_AAA_DEPTH_TEX -> multi-mip Hi-Z pyramid!
             var ds_p2 = self.desc_sets_cull_p2[slot]
             self.vk.write_descriptor(ds_p2, BIND_AAA_VERTICES, self.buf_vertices)
             self.vk.write_descriptor(ds_p2, BIND_AAA_INDICES, self.buf_indices)
@@ -1516,6 +2098,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds_p2, BIND_AAA_GLOBALS, self.ring_globals[slot])
             self.vk.write_descriptor(ds_p2, BIND_AAA_WORKLIST, self.ring_meshlet_worklist[slot])
             self.vk.write_descriptor(ds_p2, BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
+            self.vk.write_descriptor(ds_p2, BIND_AAA_DRAW_PAIRS, self.ring_draw_pairs[slot])
             self.vk.write_aaa_texture(ds_p2, BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_ENV_CUBE, 0, self.samp_linear_clamp, self.env_cube_img.view)
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_BRDF_LUT, 0, self.samp_linear_clamp, self.brdf_lut_img.view)
@@ -1530,8 +2113,22 @@ struct FlintAaaVulkanRenderer(Movable):
         _ = len(lut_bytes)
         _ = len(ltc_bytes)
 
+        self._wait_cmd_slot0()
         if not self.vk.begin_commands(0):
             return False
+        # Zero-initialize DEVICE_LOCAL persistent SSBOs on GPU timeline
+        self.vk.fill_buffer(0, self.buf_history, 0, self.buf_history.size, 0)
+        self.vk.fill_buffer(0, self.buf_oit_nodes, 0, self.buf_oit_nodes.size, 0)
+        self.vk.fill_buffer(0, self.buf_skinning, 0, self.buf_skinning.size, 0)
+        self.vk.fill_buffer(0, self.buf_post_scratch, 0, self.buf_post_scratch.size, 0)
+        for slot in range(FRAMES_IN_FLIGHT):
+            self.vk.fill_buffer(0, self.ring_globals[slot], 0, self.ring_globals[slot].size, 0)
+            self.vk.fill_buffer(0, self.ring_clusters[slot], 0, self.ring_clusters[slot].size, 0)
+            self.vk.fill_buffer(0, self.ring_surfcache[slot], 0, self.ring_surfcache[slot].size, 0)
+        self.vk.memory_barrier2(
+            0, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_TRANSFER | PIPELINE_COMPUTE, Int(ACCESS_TRANSFER_READ | ACCESS_SHADER_READ)
+        )
+
         self.vk.transition_image(0, self.brdf_lut_img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
         self.vk.upload_image_mip(0, self.brdf_lut_img, self.buf_staging, 0, 0, 64, 64)
         self.vk.transition_image(0, self.brdf_lut_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
@@ -1563,14 +2160,14 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.transition_image(0, self.vsm_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
 
         # Upload initial UI font atlas if valid
-        if self.ui_font.valid and self.ui_font_img.image != 0:
+        if self.ui_font.valid and self.ui_font_atlas_slot >= 0 and self.bindless_images[self.ui_font_atlas_slot].image != 0:
             var atlas_bytes = len(self.ui_font.atlas)
             var font_st_off = (ltc_st_off + len(ltc_bytes) + 63) & ~63
             self.ensure_staging_capacity(font_st_off + atlas_bytes)
             _ = external_call["memcpy", Int](self.buf_staging.cpu_address + font_st_off, Int(self.ui_font.atlas.unsafe_ptr()), atlas_bytes)
-            self.vk.transition_image(0, self.ui_font_img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
-            self.vk.upload_image_subregion(0, self.ui_font_img, self.buf_staging, font_st_off, 0, 0, self.ui_font.atlas_width, self.ui_font.atlas_height)
-            self.vk.transition_image(0, self.ui_font_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
+            self.vk.transition_image(0, self.bindless_images[self.ui_font_atlas_slot], LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
+            self.vk.upload_image_subregion(0, self.bindless_images[self.ui_font_atlas_slot], self.buf_staging, font_st_off, 0, 0, self.ui_font.atlas_width, self.ui_font.atlas_height)
+            self.vk.transition_image(0, self.bindless_images[self.ui_font_atlas_slot], LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
             self.ui_font.mark_clean()
 
         if self.vk.has_ray_query and len(self.ring_tlas) > 0:
@@ -1595,7 +2192,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 if self.ring_tlas[slot].handle != 0:
                     self.vk.write_aaa_tlas(self.desc_sets[slot], BIND_AAA_TLAS, self.ring_tlas[slot].handle)
 
-        # Upload default BC6H Golden-Hour / Sky IBL + White dummy BC7 texture at bindless[0]
+        # Upload default BC6H Golden-Hour / Sky IBL + White dummy BC7 texture at bindless[1]
         self.upload_ibl_environment(
             bake_bc6h_ibl_cubemap_and_sh9(
                 SkyDomeParams(uniform_furnace=False),
@@ -1603,20 +2200,22 @@ struct FlintAaaVulkanRenderer(Movable):
                 mip_levels=self.env_mip_levels,
             )
         )
-        if self.ui_font_img.view != 0:
+        var font_view = self.bindless_images[self.ui_font_atlas_slot].view if self.ui_font_atlas_slot >= 0 else 0
+        if font_view != 0:
             for ds_i in range(len(self.desc_sets)):
                 self.vk.write_aaa_texture(
                     self.desc_sets[ds_i],
                     BIND_AAA_BINDLESS_TEX,
                     self.ui_font_atlas_slot,
                     self.samp_linear_clamp,
-                    self.ui_font_img.view,
+                    font_view,
                 )
         var white_px = List[UInt32](length=16, fill=0xFFFFFFFF)
         var white_slot = self.upload_bc7_texture(white_px, 4, 4, srgb=False, generate_mips=False)
+        self.fallback_white_slot = white_slot
         if white_slot >= 0 and white_slot < len(self.bindless_images):
             var fallback_view = self.bindless_images[white_slot].view
-            if self.ui_font_img.view == 0:
+            if font_view == 0 and self.ui_font_atlas_slot >= 0:
                 for ds_i in range(len(self.desc_sets)):
                     self.vk.write_aaa_texture(
                         self.desc_sets[ds_i],
@@ -1630,11 +2229,11 @@ struct FlintAaaVulkanRenderer(Movable):
                 for ds_i in range(len(self.desc_sets)):
                     self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, s_idx, self.samp_aniso16, fallback_view)
 
-        self._build_default_render_graph()
+        self._bind_render_graph_persistent_buffers(0)
         return True
 
     def resize(mut self, width: Int, height: Int) -> Bool:
-        """Recreates all resolution-dependent render targets, Hi-Z pyramid, and storage buffers cleanly."""
+        """Recreates all resolution-dependent render targets, aliased heaps, Hi-Z pyramid, and storage buffers cleanly."""
         if not self.active or self.vk.device == 0:
             return False
         var new_out_w = max(16, width)
@@ -1653,6 +2252,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.wait_idle()
         for i in range(len(self.frame_fences)):
             self.frame_fences[i] = 0
+            self._flush_slot_retirements(i)
+        self.prev_submitted_fence = 0
         for i in range(len(self.slot_has_pending_queries)):
             self.slot_has_pending_queries[i] = False
             self.slot_prof_pairs[i].clear()
@@ -1662,10 +2263,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pending_frame_q = -1
         self.readback_ready_slot = 0
 
-        self.vk.destroy_image(self.vis_img)
-        self.vk.destroy_image(self.depth_img)
+        self._free_aliased_targets()
         self.vk.destroy_image(self.hiz_img)
-        self.vk.destroy_buffer(self.buf_hdr_out)
         self.vk.destroy_buffer(self.buf_history)
         self.vk.destroy_buffer(self.buf_oit_nodes)
         self.vk.destroy_buffer(self.buf_post_scratch)
@@ -1680,12 +2279,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.render_h = new_ren_h
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
 
-        self.vis_img = self.vk.create_image_2d(
-            self.render_w, self.render_h, FORMAT_R32G32_UINT, IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_SAMPLED
-        )
-        self.depth_img = self.vk.create_image_2d(
-            self.render_w, self.render_h, FORMAT_D32_SFLOAT, IMAGE_USAGE_DEPTH_ATTACHMENT | IMAGE_USAGE_SAMPLED
-        )
+        if not self._allocate_and_bind_aliased_targets():
+            return False
         self.hiz_mip_levels = compute_hiz_mip_levels(self.render_w, self.render_h)
         self.hiz_img = self.vk.create_image_2d(
             self.render_w,
@@ -1697,18 +2292,15 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.vis_img.image == 0 or self.depth_img.image == 0 or self.hiz_img.image == 0:
             return False
 
-        self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
         var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
-        self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
-        self.buf_oit_nodes = self.vk.create_buffer(gpu_particles_total_oit_words(max_pix) * 4, local=True)
+        self.buf_history = self.vk.create_buffer_device_local(hist_words * 4)
+        self.buf_oit_nodes = self.vk.create_buffer_device_local(gpu_particles_total_oit_words(max_pix) * 4)
         var scratch_words = AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + FRAMES_IN_FLIGHT * AAA_UI_PRIM_REGION_WORDS
-        self.buf_post_scratch = self.vk.create_buffer(scratch_words * 4, local=True)
+        self.buf_post_scratch = self.vk.create_buffer_device_local(scratch_words * 4)
         self.buf_ldr_readback = self.vk.create_buffer(64 + self.output_w * self.output_h * 4, local=False, cpu_reads=True)
 
-        _ = external_call["memset", Int](self.buf_history.cpu_address, Int32(0), self.buf_history.size)
-        _ = external_call["memset", Int](self.buf_oit_nodes.cpu_address, Int32(0), self.buf_oit_nodes.size)
-        _ = external_call["memset", Int](self.buf_post_scratch.cpu_address, Int32(0), self.buf_post_scratch.size)
-        _ = external_call["memset", Int](self.buf_ldr_readback.cpu_address, Int32(0), self.buf_ldr_readback.size)
+        if self.buf_ldr_readback.cpu_address != 0:
+            _ = external_call["memset", Int](self.buf_ldr_readback.cpu_address, Int32(0), self.buf_ldr_readback.size)
 
         for slot in range(FRAMES_IN_FLIGHT):
             var ds = self.desc_sets[slot]
@@ -1718,11 +2310,21 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds, BIND_AAA_POST_SCRATCH, self.buf_post_scratch)
             self.vk.write_aaa_texture(ds, BIND_AAA_VIS_TEX, 0, self.samp_nearest, self.vis_img.view)
             self.vk.write_aaa_texture(ds, BIND_AAA_DEPTH_TEX, 0, self.samp_linear_clamp, self.depth_img.view)
+            self.vk.write_descriptor(self.desc_sets_cull_p1[slot], BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
+            self.vk.write_descriptor(self.desc_sets_cull_p2[slot], BIND_AAA_INDIRECT, self.buf_indirect_phase2)
+            self.vk.write_descriptor(self.desc_sets_cull_p2[slot], BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
             self.vk.write_aaa_texture(self.desc_sets_cull_p1[slot], BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
             self.vk.write_aaa_texture(self.desc_sets_cull_p2[slot], BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
 
+        self._wait_cmd_slot0()
         if not self.vk.begin_commands(0):
             return False
+        self.vk.fill_buffer(0, self.buf_history, 0, self.buf_history.size, 0)
+        self.vk.fill_buffer(0, self.buf_oit_nodes, 0, self.buf_oit_nodes.size, 0)
+        self.vk.fill_buffer(0, self.buf_post_scratch, 0, self.buf_post_scratch.size, 0)
+        self.vk.memory_barrier2(
+            0, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_TRANSFER | PIPELINE_COMPUTE, Int(ACCESS_TRANSFER_READ | ACCESS_SHADER_READ)
+        )
         self.vk.transition_image(0, self.vis_img, LAYOUT_COLOR_ATTACHMENT, PIPELINE_TOP, 0, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE)
         self.vk.transition_image(0, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_TOP, 0, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE)
         self.vk.begin_rendering(0, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, True, 0, 0, True, self.depth_img.view, True, 0.0)
@@ -1746,12 +2348,13 @@ struct FlintAaaVulkanRenderer(Movable):
         self.froxel_valid_frames = 0
         self.hiz_valid = False
         self.swapchain_out_of_date = False
-        self._build_default_render_graph()
+        self._bind_render_graph_persistent_buffers(0)
         return True
 
     def _record_hiz_downsample(mut self, cur_slot: Int):
         """Builds the multi-mip conservative Reverse-Z min-reduction Hi-Z pyramid (`hiz_img`) from `depth_img`
         (which must already be in `LAYOUT_SHADER_READ_ONLY`), using `buf_post_scratch[AAA_POST_BLOOM_BASE..]`."""
+        _ = self._ensure_hiz_pipeline()
         if self.pipe_hiz_downsample == 0 or self.hiz_img.image == 0 or self.hiz_mip_levels <= 0:
             return
         var mip_offsets = List[Int](capacity=self.hiz_mip_levels)
@@ -1831,6 +2434,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var total_staging = 0
         for b_arr in ibl.mip_face_bytes:
             total_staging += (len(b_arr) + 15) & ~15
+        self._wait_all_in_flight()
         self.ensure_staging_capacity(total_staging)
         var staging_off = 0
         for b_arr in ibl.mip_face_bytes:
@@ -1851,6 +2455,249 @@ struct FlintAaaVulkanRenderer(Movable):
         var f = self.vk.submit(0)
         if f != 0:
             _ = self.vk.wait(f)
+
+    def _ensure_bindless_meta(mut self, slot: Int):
+        while len(self.bindless_resident_min_mip) <= slot:
+            self.bindless_resident_min_mip.append(16)
+            self.bindless_vram_bytes.append(0)
+            self.bindless_layouts_init.append(False)
+
+    def _flush_slot_retirements(mut self, slot: Int):
+        if slot < 0:
+            return
+        if slot < len(self.pending_bindless_desc_writes) and slot < len(self.desc_sets):
+            for wi in range(len(self.pending_bindless_desc_writes[slot])):
+                var w = self.pending_bindless_desc_writes[slot][wi]
+                if w[1] != 0 and w[2] != 0:
+                    self.vk.write_aaa_texture(self.desc_sets[slot], BIND_AAA_BINDLESS_TEX, w[0], w[1], w[2])
+            self.pending_bindless_desc_writes[slot].clear()
+        if slot < len(self.deferred_destroy_images):
+            for di in range(len(self.deferred_destroy_images[slot])):
+                self.vk.destroy_image(self.deferred_destroy_images[slot][di])
+            self.deferred_destroy_images[slot].clear()
+
+    def _write_or_queue_bindless(mut self, bindless_slot: Int, sampler: Int, view: Int, cur_slot: Int = -1):
+        _ = cur_slot
+        if view == 0 or sampler == 0:
+            return
+        for ds_i in range(len(self.desc_sets)):
+            var in_flight = ds_i < len(self.frame_fences) and self.frame_fences[ds_i] != 0
+            if in_flight and ds_i < len(self.pending_bindless_desc_writes):
+                var replaced = False
+                for wi in range(len(self.pending_bindless_desc_writes[ds_i])):
+                    if self.pending_bindless_desc_writes[ds_i][wi][0] == bindless_slot:
+                        self.pending_bindless_desc_writes[ds_i][wi] = (bindless_slot, sampler, view)
+                        replaced = True
+                        break
+                if not replaced:
+                    self.pending_bindless_desc_writes[ds_i].append((bindless_slot, sampler, view))
+            else:
+                if ds_i < len(self.pending_bindless_desc_writes):
+                    var wi = len(self.pending_bindless_desc_writes[ds_i]) - 1
+                    while wi >= 0:
+                        if self.pending_bindless_desc_writes[ds_i][wi][0] == bindless_slot:
+                            var last = self.pending_bindless_desc_writes[ds_i].pop()
+                            if wi < len(self.pending_bindless_desc_writes[ds_i]):
+                                self.pending_bindless_desc_writes[ds_i][wi] = last
+                        wi -= 1
+                self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, bindless_slot, sampler, view)
+
+    def allocate_bindless_texture_slot(
+        mut self,
+        width: Int,
+        height: Int,
+        mip_count: Int,
+        vk_format: UInt32,
+    ) -> Int:
+        """Allocates a `VulkanImage` in `bindless_images` (reusing `bindless_free_slots`) for staged mip streaming."""
+        if self.vk.device == 0:
+            return -1
+        var eff_w = max(1, width)
+        var eff_h = max(1, height)
+        var eff_mips = max(1, min(16, mip_count))
+        var img = self.vk.create_image_2d(
+            eff_w,
+            eff_h,
+            vk_format,
+            IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED,
+            mip_levels=eff_mips,
+        )
+        if img.image == 0:
+            return -1
+        var vram_sz = img.memory_bytes
+        var slot: Int
+        if len(self.bindless_free_slots) > 0:
+            slot = self.bindless_free_slots.pop()
+            self.bindless_images[slot] = img^
+        else:
+            if len(self.bindless_images) >= AAA_MAX_BINDLESS:
+                self.vk.destroy_image(img)
+                return -1
+            slot = len(self.bindless_images)
+            self.bindless_images.append(img^)
+        self._ensure_bindless_meta(slot)
+        self.bindless_resident_min_mip[slot] = eff_mips
+        self.bindless_vram_bytes[slot] = vram_sz
+        self.bindless_layouts_init[slot] = False
+        return slot
+
+    def upload_bindless_mip_staged(
+        mut self,
+        bindless_slot: Int,
+        mip_level: Int,
+        mip_w: Int,
+        mip_h: Int,
+        data_ptr: Int,
+        data_bytes: Int,
+        cur_slot: Int = -1,
+        cmd_slot: Int = -1,
+    ) -> Int:
+        """Stages a single mip into `bindless_images[bindless_slot]` via `LinearStagingRing`, updates `minLod` sampler & descriptors."""
+        if self.vk.device == 0 or bindless_slot < 0 or bindless_slot >= len(self.bindless_images):
+            return 0
+        if self.bindless_images[bindless_slot].image == 0:
+            return 0
+        self._ensure_bindless_meta(bindless_slot)
+
+        var eff_slot = cur_slot if (cur_slot >= 0 and cur_slot < FRAMES_IN_FLIGHT) else (self.frame_index % FRAMES_IN_FLIGHT)
+        var sync_submit = cmd_slot < 0
+        if sync_submit and len(self.vk.command_buffers) == 0:
+            if not self.vk.allocate_command_buffers(FRAMES_IN_FLIGHT):
+                return 0
+        var eff_cmd = (eff_slot if eff_slot < len(self.vk.command_buffers) else 0) if sync_submit else cmd_slot
+        if sync_submit:
+            if eff_slot < len(self.frame_fences) and self.frame_fences[eff_slot] != 0:
+                _ = self.vk.wait(self.frame_fences[eff_slot])
+                if self.prev_submitted_fence <= self.frame_fences[eff_slot]:
+                    self.prev_submitted_fence = 0
+                self.frame_fences[eff_slot] = 0
+                self.staging_ring.reset_slot(self.vk, eff_slot)
+                self._flush_slot_retirements(eff_slot)
+            if eff_cmd == 0 and eff_slot != 0:
+                self._wait_cmd_slot0()
+            if not self.vk.begin_commands(eff_cmd):
+                return 0
+
+        var eff_mips = max(1, self.bindless_images[bindless_slot].mip_levels)
+        var eff_mip = max(0, min(eff_mips - 1, mip_level))
+        var stage_bytes = max(16, data_bytes)
+        var sl = self.staging_ring.alloc(self.vk, eff_slot, stage_bytes, 256)
+        if sl.size <= 0 or sl.cpu_address == 0:
+            if sync_submit:
+                var f_abort = self.vk.submit(eff_cmd)
+                if f_abort != 0:
+                    _ = self.vk.wait(f_abort)
+            return 0
+        if data_ptr != 0 and data_bytes > 0:
+            var copy_len = min(stage_bytes, data_bytes)
+            _ = external_call["memcpy", Int](sl.cpu_address, data_ptr, copy_len)
+            if copy_len < stage_bytes:
+                _ = external_call["memset", Int](sl.cpu_address + copy_len, Int32(0), stage_bytes - copy_len)
+        else:
+            _ = external_call["memset", Int](sl.cpu_address, Int32(0x7F), stage_bytes)
+
+        if not self.bindless_layouts_init[bindless_slot]:
+            self.vk.transition_image_mip_range(
+                eff_cmd,
+                self.bindless_images[bindless_slot],
+                0,
+                eff_mips,
+                LAYOUT_UNDEFINED,
+                LAYOUT_SHADER_READ_ONLY,
+                PIPELINE_TOP,
+                0,
+                PIPELINE_COMPUTE,
+                ACCESS_SHADER_READ,
+            )
+            self.bindless_layouts_init[bindless_slot] = True
+            self.bindless_images[bindless_slot].layout = LAYOUT_SHADER_READ_ONLY
+
+        self.vk.transition_image_mip_range(
+            eff_cmd,
+            self.bindless_images[bindless_slot],
+            eff_mip,
+            1,
+            LAYOUT_SHADER_READ_ONLY,
+            LAYOUT_TRANSFER_TARGET,
+            PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER,
+            ACCESS_SHADER_READ,
+            PIPELINE_TRANSFER,
+            ACCESS_TRANSFER_WRITE,
+        )
+        self.staging_ring.upload_to_image_mip(
+            self.vk,
+            eff_cmd,
+            eff_slot,
+            sl,
+            self.bindless_images[bindless_slot],
+            eff_mip,
+            max(1, mip_w),
+            max(1, mip_h),
+        )
+        self.vk.transition_image_mip_range(
+            eff_cmd,
+            self.bindless_images[bindless_slot],
+            eff_mip,
+            1,
+            LAYOUT_TRANSFER_TARGET,
+            LAYOUT_SHADER_READ_ONLY,
+            PIPELINE_TRANSFER,
+            ACCESS_TRANSFER_WRITE,
+            PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER,
+            ACCESS_SHADER_READ,
+        )
+
+        if sync_submit:
+            var f = self.vk.submit(eff_cmd)
+            if f != 0:
+                _ = self.vk.wait(f)
+
+        if eff_mip < self.bindless_resident_min_mip[bindless_slot]:
+            self.bindless_resident_min_mip[bindless_slot] = eff_mip
+        var min_mip = max(0, min(15, self.bindless_resident_min_mip[bindless_slot]))
+        var samp = self.samp_aniso16
+        if min_mip < len(self.samp_aniso16_min_lod) and self.samp_aniso16_min_lod[min_mip] != 0:
+            samp = self.samp_aniso16_min_lod[min_mip]
+        var view = self.bindless_images[bindless_slot].view
+        self._write_or_queue_bindless(bindless_slot, samp, view, eff_slot)
+
+        var vram_sz = max(stage_bytes, self.bindless_images[bindless_slot].memory_bytes)
+        self.bindless_vram_bytes[bindless_slot] = vram_sz
+        return vram_sz
+
+    def evict_bindless_texture_slot(mut self, bindless_slot: Int):
+        """Rebinds `bindless_slot` to fallback white and destroys/retires the `VulkanImage` safely across frames in flight."""
+        if bindless_slot < 0 or bindless_slot >= len(self.bindless_images):
+            return
+        if self.bindless_images[bindless_slot].image == 0:
+            return
+        self._ensure_bindless_meta(bindless_slot)
+        var cur_slot = self.frame_index % FRAMES_IN_FLIGHT
+        var fb_view = 0
+        if self.fallback_white_slot >= 0 and self.fallback_white_slot < len(self.bindless_images):
+            fb_view = self.bindless_images[self.fallback_white_slot].view
+        if fb_view != 0 and self.samp_aniso16 != 0:
+            self._write_or_queue_bindless(bindless_slot, self.samp_aniso16, fb_view, cur_slot)
+
+        var retire_slot = -1
+        var max_f: UInt64 = 0
+        for i in range(len(self.frame_fences)):
+            if self.frame_fences[i] != 0 and self.frame_fences[i] >= max_f:
+                max_f = self.frame_fences[i]
+                retire_slot = i
+        if retire_slot >= 0 and retire_slot < len(self.deferred_destroy_images):
+            var retired = VulkanImage()
+            swap(retired, self.bindless_images[bindless_slot])
+            self.deferred_destroy_images[retire_slot].append(retired^)
+        elif self.vk.device != 0:
+            self.vk.destroy_image(self.bindless_images[bindless_slot])
+        else:
+            self.bindless_images[bindless_slot] = VulkanImage()
+
+        self.bindless_resident_min_mip[bindless_slot] = 16
+        self.bindless_vram_bytes[bindless_slot] = 0
+        self.bindless_layouts_init[bindless_slot] = False
+        self.bindless_free_slots.append(bindless_slot)
 
     def upload_bc7_texture(
         mut self,
@@ -1882,6 +2729,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var mip_dims = List[Tuple[Int, Int]]()
         var st_off = 0
 
+        self._wait_cmd_slot0()
         for m in range(mips):
             var bc7 = encode_bc7_rgba(cur_px, cw, ch)
             self.ensure_staging_capacity(st_off + len(bc7))
@@ -1908,9 +2756,14 @@ struct FlintAaaVulkanRenderer(Movable):
             _ = self.vk.wait(f)
 
         var slot = len(self.bindless_images)
-        for ds_i in range(len(self.desc_sets)):
-            self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, slot, self.samp_aniso16, img.view)
+        var view = img.view
+        var vram_sz = img.memory_bytes
         self.bindless_images.append(img^)
+        self._ensure_bindless_meta(slot)
+        self.bindless_resident_min_mip[slot] = 0
+        self.bindless_vram_bytes[slot] = vram_sz
+        self.bindless_layouts_init[slot] = True
+        self._write_or_queue_bindless(slot, self.samp_aniso16, view)
         return slot
 
     def upload_bc5_normal_texture(
@@ -1941,6 +2794,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var mip_dims = List[Tuple[Int, Int]]()
         var st_off = 0
 
+        self._wait_cmd_slot0()
         for m in range(mips):
             var bc5 = encode_bc5_normals(cur_n, cw, ch)
             self.ensure_staging_capacity(st_off + len(bc5))
@@ -1967,9 +2821,14 @@ struct FlintAaaVulkanRenderer(Movable):
             _ = self.vk.wait(f)
 
         var slot = len(self.bindless_images)
-        for ds_i in range(len(self.desc_sets)):
-            self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, slot, self.samp_aniso16, img.view)
+        var view = img.view
+        var vram_sz = img.memory_bytes
         self.bindless_images.append(img^)
+        self._ensure_bindless_meta(slot)
+        self.bindless_resident_min_mip[slot] = 0
+        self.bindless_vram_bytes[slot] = vram_sz
+        self.bindless_layouts_init[slot] = True
+        self._write_or_queue_bindless(slot, self.samp_aniso16, view)
         return slot
 
     def upload_bc6h_texture(mut self, hdr_pixels: List[Vec3], width: Int, height: Int) -> Int:
@@ -1979,6 +2838,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if img.image == 0:
             return -1
         var bc6 = encode_bc6h_hdr(hdr_pixels, width, height)
+        self._wait_cmd_slot0()
         self.ensure_staging_capacity(len(bc6))
         _ = external_call["memcpy", Int](self.buf_staging.cpu_address, Int(bc6.unsafe_ptr()), len(bc6))
         _ = len(bc6)
@@ -1992,25 +2852,119 @@ struct FlintAaaVulkanRenderer(Movable):
         if f != 0:
             _ = self.vk.wait(f)
         var slot = len(self.bindless_images)
-        for ds_i in range(len(self.desc_sets)):
-            self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, slot, self.samp_linear_clamp, img.view)
+        var view = img.view
+        var vram_sz = img.memory_bytes
         self.bindless_images.append(img^)
+        self._ensure_bindless_meta(slot)
+        self.bindless_resident_min_mip[slot] = 0
+        self.bindless_vram_bytes[slot] = vram_sz
+        self.bindless_layouts_init[slot] = True
+        self._write_or_queue_bindless(slot, self.samp_linear_clamp, view)
         return slot
 
-    def add_material(mut self, mat: AaaMaterial) -> Int:
-        var max_mats = self.buf_materials.size // (AAA_MATERIAL_WORDS * 4)
-        if len(self.materials) >= max_mats:
+    def upload_rgba16f_texture(mut self, rgba16f: List[UInt16], width: Int, height: Int) -> Int:
+        """Uploads raw packed `RGBA16F` texels (`len >= width * height * 4` `UInt16` half-floats)
+        into `BIND_AAA_BINDLESS_TEX` (`FORMAT_R16G16B16A16_SFLOAT` + `samp_linear_clamp`)."""
+        if len(self.bindless_images) >= AAA_MAX_BINDLESS or width <= 0 or height <= 0:
             return -1
+        var need_u16 = width * height * 4
+        if len(rgba16f) < need_u16:
+            return -1
+        var img = self.vk.create_image_2d(
+            width, height, FORMAT_R16G16B16A16_SFLOAT, IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED, mip_levels=1
+        )
+        if img.image == 0:
+            return -1
+        var byte_sz = need_u16 * 2
+        self._wait_cmd_slot0()
+        self.ensure_staging_capacity(byte_sz)
+        _ = external_call["memcpy", Int](self.buf_staging.cpu_address, Int(rgba16f.unsafe_ptr()), byte_sz)
+        _ = len(rgba16f)
+        if not self.vk.begin_commands(0):
+            self.vk.destroy_image(img)
+            return -1
+        self.vk.transition_image(0, img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
+        self.vk.upload_image_mip(0, img, self.buf_staging, 0, 0, width, height)
+        self.vk.transition_image(
+            0, img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+        )
+        var f = self.vk.submit(0)
+        if f != 0:
+            _ = self.vk.wait(f)
+        var slot = len(self.bindless_images)
+        var view = img.view
+        var vram_sz = img.memory_bytes
+        self.bindless_images.append(img^)
+        self._ensure_bindless_meta(slot)
+        self.bindless_resident_min_mip[slot] = 0
+        self.bindless_vram_bytes[slot] = vram_sz
+        self.bindless_layouts_init[slot] = True
+        self._write_or_queue_bindless(slot, self.samp_linear_clamp, view)
+        return slot
+
+    def upload_rgba8_texture(mut self, rgba8: List[UInt8], width: Int, height: Int) -> Int:
+        """Uploads raw `RGBA8_UNORM` texels (`len >= width * height * 4`) into `BIND_AAA_BINDLESS_TEX`."""
+        if len(self.bindless_images) >= AAA_MAX_BINDLESS or width <= 0 or height <= 0:
+            return -1
+        var need_u8 = width * height * 4
+        if len(rgba8) < need_u8:
+            return -1
+        var img = self.vk.create_image_2d(
+            width, height, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED, mip_levels=1
+        )
+        if img.image == 0:
+            return -1
+        self._wait_cmd_slot0()
+        self.ensure_staging_capacity(need_u8)
+        _ = external_call["memcpy", Int](self.buf_staging.cpu_address, Int(rgba8.unsafe_ptr()), need_u8)
+        _ = len(rgba8)
+        if not self.vk.begin_commands(0):
+            self.vk.destroy_image(img)
+            return -1
+        self.vk.transition_image(0, img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
+        self.vk.upload_image_mip(0, img, self.buf_staging, 0, 0, width, height)
+        self.vk.transition_image(
+            0, img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+        )
+        var f = self.vk.submit(0)
+        if f != 0:
+            _ = self.vk.wait(f)
+        var slot = len(self.bindless_images)
+        var view = img.view
+        var vram_sz = img.memory_bytes
+        self.bindless_images.append(img^)
+        self._ensure_bindless_meta(slot)
+        self.bindless_resident_min_mip[slot] = 0
+        self.bindless_vram_bytes[slot] = vram_sz
+        self.bindless_layouts_init[slot] = True
+        self._write_or_queue_bindless(slot, self.samp_linear_clamp, view)
+        return slot
+
+    def upload_terrain_heightmap_rgba16f(mut self, heights: List[Float32], width: Int, height: Int) -> Int:
+        """Packs scalar `[0..1]` (or normalized) terrain height samples into `RGBA16F` `(h, 0.5, 0.5, 1.0)`
+        and uploads to `BIND_AAA_BINDLESS_TEX` (`samp_linear_clamp`)."""
+        if width <= 0 or height <= 0 or len(heights) < width * height:
+            return -1
+        var texels = width * height
+        var packed = List[UInt16](length=texels * 4, fill=0)
+        var half_h = f32_to_f16_bits(Float32(0.5))
+        var one_h = f32_to_f16_bits(Float32(1.0))
+        for i in range(texels):
+            packed[i * 4 + 0] = f32_to_f16_bits(heights[i])
+            packed[i * 4 + 1] = half_h
+            packed[i * 4 + 2] = half_h
+            packed[i * 4 + 3] = one_h
+        return self.upload_rgba16f_texture(packed, width, height)
+
+    def add_material(mut self, mat: AaaMaterial) -> Int:
         var id = len(self.materials)
+        var needed_bytes = (id + 1) * AAA_MATERIAL_WORDS * 4
+        if not self._grow_storage_buffer(needed_bytes, BIND_AAA_MATERIALS, 0, False, True):
+            return -1
         self.materials.append(mat.copy())
         var words = List[UInt32]()
         mat.append_words(words)
-        if self.buf_materials.cpu_address != 0:
-            _ = external_call["memcpy", Int](
-                self.buf_materials.cpu_address + id * AAA_MATERIAL_WORDS * 4,
-                Int(words.unsafe_ptr()),
-                len(words) * 4,
-            )
+        self._upload_to_device_local_sync(Int(words.unsafe_ptr()), len(words) * 4, BIND_AAA_MATERIALS, id * AAA_MATERIAL_WORDS * 4)
         _ = len(words)
         return id
 
@@ -2153,9 +3107,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.materials[mat_id] = mat.copy()
         var words = List[UInt32]()
         mat.append_words(words)
-        _ = external_call[
-            "memcpy", Int
-        ](self.buf_materials.cpu_address + mat_id * AAA_MATERIAL_WORDS * 4, Int(words.unsafe_ptr()), len(words) * 4)
+        self._wait_all_in_flight()
+        self._upload_to_device_local_sync(Int(words.unsafe_ptr()), len(words) * 4, BIND_AAA_MATERIALS, mat_id * AAA_MATERIAL_WORDS * 4)
         _ = len(words)
 
     def add_material_asset(mut self, mat: MaterialAsset) -> Int:
@@ -2193,7 +3146,16 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.destroy_pipeline(pipe)
             return (-1, -1)
 
+        var rb_mg = self.vk.create_buffer(out_words * 4, local=False, cpu_reads=True)
+        if rb_mg.vk_buffer == 0 or rb_mg.cpu_address == 0:
+            if rb_mg.size > 0:
+                self.vk.destroy_buffer(rb_mg)
+            self.vk.destroy_pipeline(pipe)
+            return (-1, -1)
+
+        self._wait_all_in_flight()
         if not self.vk.begin_commands(0):
+            self.vk.destroy_buffer(rb_mg)
             self.vk.destroy_pipeline(pipe)
             return (-1, -1)
         var push_mg = List[UInt32](length=16, fill=0)
@@ -2213,19 +3175,25 @@ struct FlintAaaVulkanRenderer(Movable):
             (tex_dim + 7) // 8,
         )
         self.vk.memory_barrier2(
-            0, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ)
+            0, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_READ)
+        )
+        self.vk.copy_buffer(0, self.buf_post_scratch, out_word_off * 4, rb_mg, 0, out_words * 4)
+        self.vk.memory_barrier2(
+            0, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ)
         )
         var f_mg = self.vk.submit(0)
         if f_mg != 0:
             _ = self.vk.wait(f_mg)
         self.vk.destroy_pipeline(pipe)
         if f_mg == 0:
+            self.vk.destroy_buffer(rb_mg)
             return (-1, -1)
 
         var eval_f = List[Float32](length=out_words, fill=0.0)
         _ = external_call[
             "memcpy", Int
-        ](Int(eval_f.unsafe_ptr()), self.buf_post_scratch.cpu_address + out_word_off * 4, out_words * 4)
+        ](Int(eval_f.unsafe_ptr()), rb_mg.cpu_address, out_words * 4)
+        self.vk.destroy_buffer(rb_mg)
 
         var alb_argb = List[UInt32](length=tex_dim * tex_dim, fill=0xFFFFFFFF)
         var orm_argb = List[UInt32](length=tex_dim * tex_dim, fill=0xFFFFFFFF)
@@ -2262,50 +3230,80 @@ struct FlintAaaVulkanRenderer(Movable):
             self.update_material(mat_id, upd)
         return (alb_slot, orm_slot)
 
-    def add_mesh(mut self, mesh: NativeMesh, material_id: Int, build_lods: Bool = False) -> CookedMeshEntry:
+    def add_mesh(
+        mut self,
+        mesh: NativeMesh,
+        material_id: Int,
+        build_lods: Bool = False,
+        allow_update: Bool = False,
+        expand_bounds: Float32 = 0.0,
+    ) -> CookedMeshEntry:
         """Partitions `mesh` into 64v/124t GPU Meshlets (and optional `QEM` `LOD 0..3` DAG), uploads SSBOs, and builds `BLAS`!"""
         var v_words_before = len(self.geom.vertex_words)
         var i_words_before = len(self.geom.index_words)
         var m_words_before = len(self.geom.meshlet_words)
 
         var entry = self.geom.append_mesh(mesh, material_id, build_lods=build_lods)
+        if expand_bounds > Float32(0.0):
+            for m_idx in range(entry.first_meshlet, entry.first_meshlet + entry.meshlet_count):
+                var w_rad = self.geom.meshlets[m_idx].radius + expand_bounds
+                self.geom.meshlets[m_idx].radius = w_rad
+                self.geom.meshlets[m_idx].cone_sin = Float32(2.0)
+                self.geom.meshlet_words[m_idx * 12 + 3] = bitcast[DType.uint32](w_rad)
+                self.geom.meshlet_words[m_idx * 12 + 7] = bitcast[DType.uint32](Float32(2.0))
 
         var vb_start = v_words_before * 4
         var vb_len = (len(self.geom.vertex_words) - v_words_before) * 4
-        if vb_start + vb_len <= self.buf_vertices.size and vb_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_vertices.cpu_address + vb_start,
-                Int(self.geom.vertex_words.unsafe_ptr()) + vb_start,
-                vb_len,
-            )
-
         var ib_start = i_words_before * 4
         var ib_len = (len(self.geom.index_words) - i_words_before) * 4
-        if ib_start + ib_len <= self.buf_indices.size and ib_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_indices.cpu_address + ib_start,
-                Int(self.geom.index_words.unsafe_ptr()) + ib_start,
-                ib_len,
-            )
-
         var mb_start = m_words_before * 4
         var mb_len = (len(self.geom.meshlet_words) - m_words_before) * 4
-        if mb_start + mb_len <= self.buf_meshlets.size and mb_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_meshlets.cpu_address + mb_start,
-                Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start,
-                mb_len,
-            )
+        var ok_vb = self._grow_storage_buffer(vb_start + vb_len, BIND_AAA_VERTICES, BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
+        var ok_ib = self._grow_storage_buffer(ib_start + ib_len, BIND_AAA_INDICES, BUFFER_USAGE_INDEX | BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
+        var ok_mb = self._grow_storage_buffer(mb_start + mb_len, BIND_AAA_MESHLETS, 0, False, True)
+        var grow_ok = ok_vb and ok_ib and ok_mb
 
+        var st_vb = 0
+        var st_ib = (vb_len + 15) & ~15
+        var st_mb = st_ib + ((ib_len + 15) & ~15)
+        var total_st = st_mb + ((mb_len + 15) & ~15)
         var is_am_mesh = (mesh.alpha_mode == 1) or (
             material_id >= 0 and material_id < len(self.materials) and self.materials[material_id].is_alpha_masked()
         )
-        if self.vk.has_ray_query and entry.triangle_count > 0 and entry.vertex_count > 0:
-            # Note: `buf_indices` stores global vertex indices (`entry.first_vertex + local_v`) with `firstVertex = 0`.
-            var v_addr = self.vk.buffer_device_address(self.buf_vertices)
-            var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
-            var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
-            if self.vk.begin_commands(0):
+        var need_blas = self.vk.has_ray_query and entry.triangle_count > 0 and entry.vertex_count > 0
+        if grow_ok and (total_st > 0 or need_blas):
+            if need_blas:
+                self._wait_all_in_flight()
+            else:
+                self._wait_cmd_slot0()
+        if grow_ok and total_st > 0:
+            self.ensure_staging_capacity(total_st)
+            if vb_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_vb, Int(self.geom.vertex_words.unsafe_ptr()) + vb_start, vb_len)
+            if ib_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_ib, Int(self.geom.index_words.unsafe_ptr()) + ib_start, ib_len)
+            if mb_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_mb, Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start, mb_len)
+
+        if grow_ok and (total_st > 0 or need_blas) and self.vk.begin_commands(0):
+            if vb_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_vb, self.buf_vertices, vb_start, vb_len)
+            if ib_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_ib, self.buf_indices, ib_start, ib_len)
+            if mb_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_mb, self.buf_meshlets, mb_start, mb_len)
+            if total_st > 0:
+                self.vk.memory_barrier2(
+                    0,
+                    PIPELINE_TRANSFER,
+                    Int(ACCESS_TRANSFER_WRITE),
+                    PIPELINE_ALL_COMMANDS,
+                    Int(ACCESS_MEMORY_READ | ACCESS_SHADER_READ | ACCESS_INDIRECT_READ | ACCESS_AS_READ_KHR),
+                )
+            if need_blas:
+                var v_addr = self.vk.buffer_device_address(self.buf_vertices)
+                var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
+                var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
                 var blas = build_blas_triangles_ex(
                     self.vk,
                     0,
@@ -2315,6 +3313,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     i_addr,
                     entry.triangle_count,
                     self.buf_as_scratch,
+                    allow_update=allow_update,
                     opaque=not is_am_mesh,
                 )
                 self.vk.memory_barrier2(
@@ -2324,12 +3323,12 @@ struct FlintAaaVulkanRenderer(Movable):
                     PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
                     Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
                 )
-                var f = self.vk.submit(0)
-                if f != 0:
-                    _ = self.vk.wait(f)
                 self.mesh_blas.append(blas^)
             else:
                 self.mesh_blas.append(VulkanAccelStruct())
+            var f = self.vk.submit(0)
+            if f != 0:
+                _ = self.vk.wait(f)
         else:
             self.mesh_blas.append(VulkanAccelStruct())
 
@@ -2346,6 +3345,8 @@ struct FlintAaaVulkanRenderer(Movable):
         material_id: Int,
         splat_weights_u24: List[UInt32] = List[UInt32](),
         build_lods: Bool = False,
+        allow_update: Bool = False,
+        expand_bounds: Float32 = 0.0,
     ) -> CookedMeshEntry:
         """Cooks a 4-layer height-modulated PBR terrain splat mesh (`vertex_words[11]` bit 1 = 1 + 24-bit weights),
         uploads GPU Meshlet/Vertex/Index SSBOs, and builds its hardware `BLAS`!"""
@@ -2354,43 +3355,66 @@ struct FlintAaaVulkanRenderer(Movable):
         var m_words_before = len(self.geom.meshlet_words)
 
         var entry = self.geom.append_splat_mesh(mesh, material_id, splat_weights_u24, build_lods=build_lods)
+        if expand_bounds > Float32(0.0):
+            for m_idx in range(entry.first_meshlet, entry.first_meshlet + entry.meshlet_count):
+                var w_rad = self.geom.meshlets[m_idx].radius + expand_bounds
+                self.geom.meshlets[m_idx].radius = w_rad
+                self.geom.meshlets[m_idx].cone_sin = Float32(2.0)
+                self.geom.meshlet_words[m_idx * 12 + 3] = bitcast[DType.uint32](w_rad)
+                self.geom.meshlet_words[m_idx * 12 + 7] = bitcast[DType.uint32](Float32(2.0))
 
         var vb_start = v_words_before * 4
         var vb_len = (len(self.geom.vertex_words) - v_words_before) * 4
-        if vb_start + vb_len <= self.buf_vertices.size and vb_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_vertices.cpu_address + vb_start,
-                Int(self.geom.vertex_words.unsafe_ptr()) + vb_start,
-                vb_len,
-            )
-
         var ib_start = i_words_before * 4
         var ib_len = (len(self.geom.index_words) - i_words_before) * 4
-        if ib_start + ib_len <= self.buf_indices.size and ib_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_indices.cpu_address + ib_start,
-                Int(self.geom.index_words.unsafe_ptr()) + ib_start,
-                ib_len,
-            )
-
         var mb_start = m_words_before * 4
         var mb_len = (len(self.geom.meshlet_words) - m_words_before) * 4
-        if mb_start + mb_len <= self.buf_meshlets.size and mb_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_meshlets.cpu_address + mb_start,
-                Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start,
-                mb_len,
-            )
+        var ok_vb = self._grow_storage_buffer(vb_start + vb_len, BIND_AAA_VERTICES, BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
+        var ok_ib = self._grow_storage_buffer(ib_start + ib_len, BIND_AAA_INDICES, BUFFER_USAGE_INDEX | BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
+        var ok_mb = self._grow_storage_buffer(mb_start + mb_len, BIND_AAA_MESHLETS, 0, False, True)
+        var grow_ok = ok_vb and ok_ib and ok_mb
 
+        var st_vb = 0
+        var st_ib = (vb_len + 15) & ~15
+        var st_mb = st_ib + ((ib_len + 15) & ~15)
+        var total_st = st_mb + ((mb_len + 15) & ~15)
         var is_am_mesh = (mesh.alpha_mode == 1) or (
             material_id >= 0 and material_id < len(self.materials) and self.materials[material_id].is_alpha_masked()
         )
-        if self.vk.has_ray_query and entry.triangle_count > 0 and entry.vertex_count > 0:
-            # Note: `buf_indices` stores global vertex indices (`entry.first_vertex + local_v`) with `firstVertex = 0`.
-            var v_addr = self.vk.buffer_device_address(self.buf_vertices)
-            var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
-            var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
-            if self.vk.begin_commands(0):
+        var need_blas = self.vk.has_ray_query and entry.triangle_count > 0 and entry.vertex_count > 0
+        if grow_ok and (total_st > 0 or need_blas):
+            if need_blas:
+                self._wait_all_in_flight()
+            else:
+                self._wait_cmd_slot0()
+        if grow_ok and total_st > 0:
+            self.ensure_staging_capacity(total_st)
+            if vb_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_vb, Int(self.geom.vertex_words.unsafe_ptr()) + vb_start, vb_len)
+            if ib_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_ib, Int(self.geom.index_words.unsafe_ptr()) + ib_start, ib_len)
+            if mb_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_mb, Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start, mb_len)
+
+        if grow_ok and (total_st > 0 or need_blas) and self.vk.begin_commands(0):
+            if vb_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_vb, self.buf_vertices, vb_start, vb_len)
+            if ib_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_ib, self.buf_indices, ib_start, ib_len)
+            if mb_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_mb, self.buf_meshlets, mb_start, mb_len)
+            if total_st > 0:
+                self.vk.memory_barrier2(
+                    0,
+                    PIPELINE_TRANSFER,
+                    Int(ACCESS_TRANSFER_WRITE),
+                    PIPELINE_ALL_COMMANDS,
+                    Int(ACCESS_MEMORY_READ | ACCESS_SHADER_READ | ACCESS_INDIRECT_READ | ACCESS_AS_READ_KHR),
+                )
+            if need_blas:
+                var v_addr = self.vk.buffer_device_address(self.buf_vertices)
+                var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
+                var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
                 var blas = build_blas_triangles_ex(
                     self.vk,
                     0,
@@ -2400,6 +3424,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     i_addr,
                     entry.triangle_count,
                     self.buf_as_scratch,
+                    allow_update=allow_update,
                     opaque=not is_am_mesh,
                 )
                 self.vk.memory_barrier2(
@@ -2409,12 +3434,12 @@ struct FlintAaaVulkanRenderer(Movable):
                     PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
                     Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
                 )
-                var f = self.vk.submit(0)
-                if f != 0:
-                    _ = self.vk.wait(f)
                 self.mesh_blas.append(blas^)
             else:
                 self.mesh_blas.append(VulkanAccelStruct())
+            var f = self.vk.submit(0)
+            if f != 0:
+                _ = self.vk.wait(f)
         else:
             self.mesh_blas.append(VulkanAccelStruct())
 
@@ -2467,6 +3492,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var nrm_offs = List[Int]()
         var orm_offs = List[Int]()
         var st_off = 0
+        self._wait_cmd_slot0()
         for m in range(mips):
             var mw = pyr[2][m]
             var mh = pyr[3][m]
@@ -2502,14 +3528,24 @@ struct FlintAaaVulkanRenderer(Movable):
             _ = self.vk.wait(f)
 
         var nrm_slot = len(self.bindless_images)
-        for ds_i in range(len(self.desc_sets)):
-            self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, nrm_slot, self.samp_aniso16, nrm_img.view)
+        var nrm_view = nrm_img.view
+        var nrm_vram = nrm_img.memory_bytes
         self.bindless_images.append(nrm_img^)
+        self._ensure_bindless_meta(nrm_slot)
+        self.bindless_resident_min_mip[nrm_slot] = 0
+        self.bindless_vram_bytes[nrm_slot] = nrm_vram
+        self.bindless_layouts_init[nrm_slot] = True
+        self._write_or_queue_bindless(nrm_slot, self.samp_aniso16, nrm_view)
 
         var orm_slot = len(self.bindless_images)
-        for ds_i in range(len(self.desc_sets)):
-            self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, orm_slot, self.samp_aniso16, orm_img.view)
+        var orm_view = orm_img.view
+        var orm_vram = orm_img.memory_bytes
         self.bindless_images.append(orm_img^)
+        self._ensure_bindless_meta(orm_slot)
+        self.bindless_resident_min_mip[orm_slot] = 0
+        self.bindless_vram_bytes[orm_slot] = orm_vram
+        self.bindless_layouts_init[orm_slot] = True
+        self._write_or_queue_bindless(orm_slot, self.samp_aniso16, orm_view)
         return (nrm_slot, orm_slot)
 
     def add_skinned_mesh(
@@ -2540,30 +3576,14 @@ struct FlintAaaVulkanRenderer(Movable):
 
         var vb_start = v_words_before * 4
         var vb_len = (len(self.geom.vertex_words) - v_words_before) * 4
-        if vb_start + vb_len <= self.buf_vertices.size and vb_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_vertices.cpu_address + vb_start,
-                Int(self.geom.vertex_words.unsafe_ptr()) + vb_start,
-                vb_len,
-            )
-
         var ib_start = i_words_before * 4
         var ib_len = (len(self.geom.index_words) - i_words_before) * 4
-        if ib_start + ib_len <= self.buf_indices.size and ib_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_indices.cpu_address + ib_start,
-                Int(self.geom.index_words.unsafe_ptr()) + ib_start,
-                ib_len,
-            )
-
         var mb_start = m_words_before * 4
         var mb_len = (len(self.geom.meshlet_words) - m_words_before) * 4
-        if mb_start + mb_len <= self.buf_meshlets.size and mb_len > 0:
-            _ = external_call["memcpy", Int](
-                self.buf_meshlets.cpu_address + mb_start,
-                Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start,
-                mb_len,
-            )
+        var ok_vb = self._grow_storage_buffer(vb_start + vb_len, BIND_AAA_VERTICES, BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
+        var ok_ib = self._grow_storage_buffer(ib_start + ib_len, BIND_AAA_INDICES, BUFFER_USAGE_INDEX | BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
+        var ok_mb = self._grow_storage_buffer(mb_start + mb_len, BIND_AAA_MESHLETS, 0, False, True)
+        var grow_ok = ok_vb and ok_ib and ok_mb
 
         self.skin_arena.vertex_cursor = self.skin_bind_cursor
         var v_alloc = self.skin_arena.alloc_vertices(entry.vertex_count)
@@ -2575,30 +3595,29 @@ struct FlintAaaVulkanRenderer(Movable):
         var pal_off = self.skin_arena.alloc_bone_palette(bone_count, bone_palette_offset)
         self.skin_bone_cursor = self.skin_arena.bone_cursor
 
-        # Initialize any unpopulated bone slots in `CUR_BONES` & `PREV_BONES` to exact identity `DualQuat(0,0,0,1, 0,0,0,0)`
+        # Initialize unpopulated bone slots in `CUR_BONES` & `PREV_BONES` to identity DualQuat
         var eff_bones_init = min(max(1, bone_count), max(0, AAA_MAX_SKIN_BONES - (pal_off // 8)))
+        var pal_slot_base = pal_off // 8
+        var id_dq_words = List[UInt32](length=8, fill=0)
+        id_dq_words[3] = bitcast[DType.uint32](Float32(1.0))
+        var bone_copy_offsets = List[Int]()
+        var bone_copy_words = List[UInt32]()
         for b in range(eff_bones_init):
-            var c_off = (AAA_SKIN_CUR_BONES_BASE + pal_off + b * 8) * 4
-            if (
-                get32(self.buf_skinning.cpu_address + c_off + 0) == UInt32(0)
-                and get32(self.buf_skinning.cpu_address + c_off + 4) == UInt32(0)
-                and get32(self.buf_skinning.cpu_address + c_off + 8) == UInt32(0)
-                and get32(self.buf_skinning.cpu_address + c_off + 12) == UInt32(0)
-            ):
-                put_float(self.buf_skinning.cpu_address + c_off + 12, Float32(1.0))
-            var p_off = (AAA_SKIN_PREV_BONES_BASE + pal_off + b * 8) * 4
-            if (
-                get32(self.buf_skinning.cpu_address + p_off + 0) == UInt32(0)
-                and get32(self.buf_skinning.cpu_address + p_off + 4) == UInt32(0)
-                and get32(self.buf_skinning.cpu_address + p_off + 8) == UInt32(0)
-                and get32(self.buf_skinning.cpu_address + p_off + 12) == UInt32(0)
-            ):
-                put_float(self.buf_skinning.cpu_address + p_off + 12, Float32(1.0))
+            var bs = pal_slot_base + b
+            if bs >= 0 and bs < len(self.skin_bones_initialized) and not self.skin_bones_initialized[bs]:
+                self.skin_bones_initialized[bs] = True
+                bone_copy_offsets.append(AAA_SKIN_CUR_BONES_BASE + pal_off + b * 8)
+                for k in range(8):
+                    bone_copy_words.append(id_dq_words[k])
+                bone_copy_offsets.append(AAA_SKIN_PREV_BONES_BASE + pal_off + b * 8)
+                for k in range(8):
+                    bone_copy_words.append(id_dq_words[k])
 
         var m_w_first = 0
         var m_d_first = 0
         var eff_morph_cnt = 0
         var mesh_v_cnt = max(v_cnt, mesh.vertex_count())
+        var morph_deltas_words = List[UInt32]()
         if v_cnt > 0 and mesh.morph_count > 0 and len(mesh.morph_positions) >= mesh.morph_count * v_cnt * 3:
             self.skin_arena.morph_weight_cursor = self.skin_morph_weight_cursor
             self.skin_arena.morph_delta_cursor = self.skin_morph_delta_cursor
@@ -2610,44 +3629,33 @@ struct FlintAaaVulkanRenderer(Movable):
             self.skin_morph_delta_cursor = self.skin_arena.morph_delta_cursor
 
             if eff_morph_cnt > 0:
-                _ = external_call[
-                    "memset", Int
-                ](
-                    self.buf_skinning.cpu_address + (AAA_SKIN_CUR_MORPH_WEIGHTS_BASE + m_w_first) * 4,
-                    Int32(0),
-                    eff_morph_cnt * 4,
-                )
-                _ = external_call[
-                    "memset", Int
-                ](
-                    self.buf_skinning.cpu_address + (AAA_SKIN_PREV_MORPH_WEIGHTS_BASE + m_w_first) * 4,
-                    Int32(0),
-                    eff_morph_cnt * 4,
-                )
                 var src_stride_v = mesh_v_cnt if len(mesh.morph_positions) >= mesh.morph_count * mesh_v_cnt * 3 else v_cnt
                 var has_morph_nrm = len(mesh.morph_normals) >= mesh.morph_count * src_stride_v * 3
+                morph_deltas_words.resize(eff_morph_cnt * v_cnt * 6, 0)
                 for m_i in range(eff_morph_cnt):
                     for v in range(v_cnt):
                         var src_m3 = (m_i * src_stride_v + v) * 3
-                        var dst_dw = AAA_SKIN_MORPH_DELTAS_BASE + (m_d_first + m_i * v_cnt + v) * 6
-                        put_float(self.buf_skinning.cpu_address + (dst_dw + 0) * 4, mesh.morph_positions[src_m3 + 0])
-                        put_float(self.buf_skinning.cpu_address + (dst_dw + 1) * 4, mesh.morph_positions[src_m3 + 1])
-                        put_float(self.buf_skinning.cpu_address + (dst_dw + 2) * 4, mesh.morph_positions[src_m3 + 2])
+                        var dst_dw = (m_i * v_cnt + v) * 6
+                        morph_deltas_words[dst_dw + 0] = bitcast[DType.uint32](mesh.morph_positions[src_m3 + 0])
+                        morph_deltas_words[dst_dw + 1] = bitcast[DType.uint32](mesh.morph_positions[src_m3 + 1])
+                        morph_deltas_words[dst_dw + 2] = bitcast[DType.uint32](mesh.morph_positions[src_m3 + 2])
                         var dnx = mesh.morph_normals[src_m3 + 0] if has_morph_nrm else Float32(0.0)
                         var dny = mesh.morph_normals[src_m3 + 1] if has_morph_nrm else Float32(0.0)
                         var dnz = mesh.morph_normals[src_m3 + 2] if has_morph_nrm else Float32(0.0)
-                        put_float(self.buf_skinning.cpu_address + (dst_dw + 3) * 4, dnx)
-                        put_float(self.buf_skinning.cpu_address + (dst_dw + 4) * 4, dny)
-                        put_float(self.buf_skinning.cpu_address + (dst_dw + 5) * 4, dnz)
+                        morph_deltas_words[dst_dw + 3] = bitcast[DType.uint32](dnx)
+                        morph_deltas_words[dst_dw + 4] = bitcast[DType.uint32](dny)
+                        morph_deltas_words[dst_dw + 5] = bitcast[DType.uint32](dnz)
 
         var has_mesh_jw = len(mesh.joints) >= v_cnt * 4 and len(mesh.weights) >= v_cnt * 4
+        var bind_verts_words = List[UInt32](length=v_cnt * AAA_SKIN_BIND_STRIDE_WORDS, fill=0)
+        var prev_pos_words = List[UInt32](length=v_cnt * 3, fill=0)
 
         for v in range(v_cnt):
             var gv = entry.first_vertex + v
             var src_vw = gv * 12
-            var dst_sw = AAA_SKIN_BIND_VERTS_BASE + (first_slot + v) * AAA_SKIN_BIND_STRIDE_WORDS
+            var dst_sw = v * AAA_SKIN_BIND_STRIDE_WORDS
             for k in range(12):
-                put32(self.buf_skinning.cpu_address + (dst_sw + k) * 4, self.geom.vertex_words[src_vw + k])
+                bind_verts_words[dst_sw + k] = self.geom.vertex_words[src_vw + k]
 
             var j0_r = 0; var j1_r = 0; var j2_r = 0; var j3_r = 0
             var w0_r = Float32(1.0); var w1_r = Float32(0.0); var w2_r = Float32(0.0); var w3_r = Float32(0.0)
@@ -2676,21 +3684,81 @@ struct FlintAaaVulkanRenderer(Movable):
                 w3_r = max(Float32(0.0), mesh.weights[v * 4 + 3])
 
             var ns = normalize_and_sort_skin_weights_4(j0_r, j1_r, j2_r, j3_r, w0_r, w1_r, w2_r, w3_r)
-            put32(self.buf_skinning.cpu_address + (dst_sw + 12) * 4, ns[0])
-            put_float(self.buf_skinning.cpu_address + (dst_sw + 13) * 4, ns[1])
-            put_float(self.buf_skinning.cpu_address + (dst_sw + 14) * 4, ns[2])
-            put_float(self.buf_skinning.cpu_address + (dst_sw + 15) * 4, ns[3])
+            bind_verts_words[dst_sw + 12] = ns[0]
+            bind_verts_words[dst_sw + 13] = bitcast[DType.uint32](ns[1])
+            bind_verts_words[dst_sw + 14] = bitcast[DType.uint32](ns[2])
+            bind_verts_words[dst_sw + 15] = bitcast[DType.uint32](ns[3])
 
-            var prev_off = AAA_SKIN_PREV_POS_BASE + (first_slot + v) * 3
-            put32(self.buf_skinning.cpu_address + (prev_off + 0) * 4, self.geom.vertex_words[src_vw + 0])
-            put32(self.buf_skinning.cpu_address + (prev_off + 1) * 4, self.geom.vertex_words[src_vw + 1])
-            put32(self.buf_skinning.cpu_address + (prev_off + 2) * 4, self.geom.vertex_words[src_vw + 2])
+            var prev_off = v * 3
+            prev_pos_words[prev_off + 0] = self.geom.vertex_words[src_vw + 0]
+            prev_pos_words[prev_off + 1] = self.geom.vertex_words[src_vw + 1]
+            prev_pos_words[prev_off + 2] = self.geom.vertex_words[src_vw + 2]
 
-        if self.vk.has_ray_query and entry.triangle_count > 0 and entry.vertex_count > 0:
-            var v_addr = self.vk.buffer_device_address(self.buf_vertices)
-            var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
-            var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
-            if self.vk.begin_commands(0):
+        var st_vb = 0
+        var st_ib = (vb_len + 15) & ~15
+        var st_mb = st_ib + ((ib_len + 15) & ~15)
+        var st_bones = st_mb + ((mb_len + 15) & ~15)
+        var bone_bytes = len(bone_copy_words) * 4
+        var st_md = st_bones + ((bone_bytes + 15) & ~15)
+        var md_bytes = len(morph_deltas_words) * 4
+        var st_bv = st_md + ((md_bytes + 15) & ~15)
+        var bv_bytes = len(bind_verts_words) * 4
+        var st_pp = st_bv + ((bv_bytes + 15) & ~15)
+        var pp_bytes = len(prev_pos_words) * 4
+        var total_st = st_pp + ((pp_bytes + 15) & ~15)
+        var need_blas = self.vk.has_ray_query and entry.triangle_count > 0 and entry.vertex_count > 0
+        if grow_ok and (total_st > 0 or eff_morph_cnt > 0 or need_blas):
+            if need_blas:
+                self._wait_all_in_flight()
+            else:
+                self._wait_cmd_slot0()
+        if grow_ok and total_st > 0:
+            self.ensure_staging_capacity(total_st)
+            if vb_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_vb, Int(self.geom.vertex_words.unsafe_ptr()) + vb_start, vb_len)
+            if ib_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_ib, Int(self.geom.index_words.unsafe_ptr()) + ib_start, ib_len)
+            if mb_len > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_mb, Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start, mb_len)
+            if bone_bytes > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_bones, Int(bone_copy_words.unsafe_ptr()), bone_bytes)
+            if md_bytes > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_md, Int(morph_deltas_words.unsafe_ptr()), md_bytes)
+            if bv_bytes > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_bv, Int(bind_verts_words.unsafe_ptr()), bv_bytes)
+            if pp_bytes > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_pp, Int(prev_pos_words.unsafe_ptr()), pp_bytes)
+        _ = len(bone_copy_words) + len(morph_deltas_words) + len(bind_verts_words) + len(prev_pos_words)
+
+        if grow_ok and (total_st > 0 or eff_morph_cnt > 0 or need_blas) and self.vk.begin_commands(0):
+            if vb_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_vb, self.buf_vertices, vb_start, vb_len)
+            if ib_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_ib, self.buf_indices, ib_start, ib_len)
+            if mb_len > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_mb, self.buf_meshlets, mb_start, mb_len)
+            for bi in range(len(bone_copy_offsets)):
+                self.vk.copy_buffer(0, self.buf_staging, st_bones + bi * 32, self.buf_skinning, bone_copy_offsets[bi] * 4, 32)
+            if eff_morph_cnt > 0:
+                self.vk.fill_buffer(0, self.buf_skinning, (AAA_SKIN_CUR_MORPH_WEIGHTS_BASE + m_w_first) * 4, eff_morph_cnt * 4, 0)
+                self.vk.fill_buffer(0, self.buf_skinning, (AAA_SKIN_PREV_MORPH_WEIGHTS_BASE + m_w_first) * 4, eff_morph_cnt * 4, 0)
+            if md_bytes > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_md, self.buf_skinning, (AAA_SKIN_MORPH_DELTAS_BASE + m_d_first * 6) * 4, md_bytes)
+            if bv_bytes > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_bv, self.buf_skinning, (AAA_SKIN_BIND_VERTS_BASE + first_slot * AAA_SKIN_BIND_STRIDE_WORDS) * 4, bv_bytes)
+            if pp_bytes > 0:
+                self.vk.copy_buffer(0, self.buf_staging, st_pp, self.buf_skinning, (AAA_SKIN_PREV_POS_BASE + first_slot * 3) * 4, pp_bytes)
+            self.vk.memory_barrier2(
+                0,
+                PIPELINE_TRANSFER,
+                Int(ACCESS_TRANSFER_WRITE),
+                PIPELINE_ALL_COMMANDS,
+                Int(ACCESS_MEMORY_READ | ACCESS_SHADER_READ | ACCESS_INDIRECT_READ | ACCESS_AS_READ_KHR),
+            )
+            if need_blas:
+                var v_addr = self.vk.buffer_device_address(self.buf_vertices)
+                var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
+                var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
                 var blas = self.vk.build_blas_triangles(
                     0,
                     v_addr,
@@ -2708,12 +3776,12 @@ struct FlintAaaVulkanRenderer(Movable):
                     PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
                     Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
                 )
-                var f = self.vk.submit(0)
-                if f != 0:
-                    _ = self.vk.wait(f)
                 self.mesh_blas.append(blas^)
             else:
                 self.mesh_blas.append(VulkanAccelStruct())
+            var f = self.vk.submit(0)
+            if f != 0:
+                _ = self.vk.wait(f)
         else:
             self.mesh_blas.append(VulkanAccelStruct())
 
@@ -2767,11 +3835,13 @@ struct FlintAaaVulkanRenderer(Movable):
         push_sk[7] = UInt32(max(0, skin_entry.morph_count))
         push_sk[8] = UInt32(max(0, skin_entry.morph_weight_first_slot))
         push_sk[9] = UInt32(max(0, skin_entry.morph_delta_first_slot))
+        _ = self._ensure_dq_skinning_pipeline()
+        var ds_skin = self.desc_sets[frame] if (frame >= 0 and frame < len(self.desc_sets)) else self.desc_set
         self.vk.dispatch_aaa(
             frame,
             self.pipe_dq_skinning,
             self.pipe_layout,
-            self.desc_set,
+            ds_skin,
             push_sk,
             (skin_entry.vertex_count + 63) // 64,
             1,
@@ -2835,52 +3905,76 @@ struct FlintAaaVulkanRenderer(Movable):
         var cur_base = AAA_SKIN_CUR_BONES_BASE + pal_off
         var prev_base = AAA_SKIN_PREV_BONES_BASE + pal_off
         var n_cur = min(max_avail, len(cur_bones))
+        var cur_w = List[UInt32](length=n_cur * 8, fill=0)
         for b in range(n_cur):
             var dq = cur_bones[b]
-            var off = (cur_base + b * 8) * 4
-            put_float(self.buf_skinning.cpu_address + off + 0, dq.rx)
-            put_float(self.buf_skinning.cpu_address + off + 4, dq.ry)
-            put_float(self.buf_skinning.cpu_address + off + 8, dq.rz)
-            put_float(self.buf_skinning.cpu_address + off + 12, dq.rw)
-            put_float(self.buf_skinning.cpu_address + off + 16, dq.dx)
-            put_float(self.buf_skinning.cpu_address + off + 20, dq.dy)
-            put_float(self.buf_skinning.cpu_address + off + 24, dq.dz)
-            put_float(self.buf_skinning.cpu_address + off + 28, dq.dw)
+            var off = b * 8
+            cur_w[off + 0] = bitcast[DType.uint32](dq.rx)
+            cur_w[off + 1] = bitcast[DType.uint32](dq.ry)
+            cur_w[off + 2] = bitcast[DType.uint32](dq.rz)
+            cur_w[off + 3] = bitcast[DType.uint32](dq.rw)
+            cur_w[off + 4] = bitcast[DType.uint32](dq.dx)
+            cur_w[off + 5] = bitcast[DType.uint32](dq.dy)
+            cur_w[off + 6] = bitcast[DType.uint32](dq.dz)
+            cur_w[off + 7] = bitcast[DType.uint32](dq.dw)
 
         var n_prev = min(max_avail, len(prev_bones))
+        var prev_w = List[UInt32](length=n_prev * 8, fill=0)
         for b in range(n_prev):
             var dq = prev_bones[b]
-            var off = (prev_base + b * 8) * 4
-            put_float(self.buf_skinning.cpu_address + off + 0, dq.rx)
-            put_float(self.buf_skinning.cpu_address + off + 4, dq.ry)
-            put_float(self.buf_skinning.cpu_address + off + 8, dq.rz)
-            put_float(self.buf_skinning.cpu_address + off + 12, dq.rw)
-            put_float(self.buf_skinning.cpu_address + off + 16, dq.dx)
-            put_float(self.buf_skinning.cpu_address + off + 20, dq.dy)
-            put_float(self.buf_skinning.cpu_address + off + 24, dq.dz)
-            put_float(self.buf_skinning.cpu_address + off + 28, dq.dw)
+            var off = b * 8
+            prev_w[off + 0] = bitcast[DType.uint32](dq.rx)
+            prev_w[off + 1] = bitcast[DType.uint32](dq.ry)
+            prev_w[off + 2] = bitcast[DType.uint32](dq.rz)
+            prev_w[off + 3] = bitcast[DType.uint32](dq.rw)
+            prev_w[off + 4] = bitcast[DType.uint32](dq.dx)
+            prev_w[off + 5] = bitcast[DType.uint32](dq.dy)
+            prev_w[off + 6] = bitcast[DType.uint32](dq.dz)
+            prev_w[off + 7] = bitcast[DType.uint32](dq.dw)
 
-        if reset_smears:
-            var n_clr = max(n_cur, n_prev)
-            if n_clr > 0:
-                _ = external_call[
-                    "memset", Int
-                ](self.buf_skinning.cpu_address + (AAA_SKIN_CUR_SMEAR_BASE + pal_off) * 4, Int32(0), n_clr * 32)
-                _ = external_call[
-                    "memset", Int
-                ](self.buf_skinning.cpu_address + (AAA_SKIN_PREV_SMEAR_BASE + pal_off) * 4, Int32(0), n_clr * 32)
+        var n_clr = max(n_cur, n_prev) if reset_smears else 0
 
         if invalidate_vsm:
             self.vsm.invalidate_all()
 
         if defer_to_frame:
+            if n_cur > 0:
+                self.pending_skin_copies.append((cur_base, cur_w^))
+            if n_prev > 0:
+                self.pending_skin_copies.append((prev_base, prev_w^))
+            if n_clr > 0:
+                self.pending_skin_copies.append((AAA_SKIN_CUR_SMEAR_BASE + pal_off, List[UInt32](length=n_clr * 8, fill=0)))
+                self.pending_skin_copies.append((AAA_SKIN_PREV_SMEAR_BASE + pal_off, List[UInt32](length=n_clr * 8, fill=0)))
             self._enqueue_pending_skin_update(skin_entry)
             return 0.0
 
         self._remove_pending_skin_update(skin_entry)
         var t0 = get_time()
+        var cur_bytes = len(cur_w) * 4
+        var prev_bytes = len(prev_w) * 4
+        var st_p = (cur_bytes + 15) & ~15
+        var total_b = st_p + ((prev_bytes + 15) & ~15)
+        self._wait_all_in_flight()
+        if total_b > 0:
+            self.ensure_staging_capacity(total_b)
+            if cur_bytes > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address, Int(cur_w.unsafe_ptr()), cur_bytes)
+            if prev_bytes > 0:
+                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_p, Int(prev_w.unsafe_ptr()), prev_bytes)
+        _ = len(cur_w) + len(prev_w)
         if not self.vk.begin_commands(0):
             return 0.0
+        if cur_bytes > 0:
+            self.vk.copy_buffer(0, self.buf_staging, 0, self.buf_skinning, cur_base * 4, cur_bytes)
+        if prev_bytes > 0:
+            self.vk.copy_buffer(0, self.buf_staging, st_p, self.buf_skinning, prev_base * 4, prev_bytes)
+        if n_clr > 0:
+            self.vk.fill_buffer(0, self.buf_skinning, (AAA_SKIN_CUR_SMEAR_BASE + pal_off) * 4, n_clr * 32, 0)
+            self.vk.fill_buffer(0, self.buf_skinning, (AAA_SKIN_PREV_SMEAR_BASE + pal_off) * 4, n_clr * 32, 0)
+        if total_b > 0 or n_clr > 0:
+            self.vk.memory_barrier2(
+                0, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ)
+            )
         self._record_skin_dispatch_and_blas_refit(0, skin_entry)
         var f = self.vk.submit(0)
         if f != 0:
@@ -2902,11 +3996,15 @@ struct FlintAaaVulkanRenderer(Movable):
         if max_m <= 0:
             return
         var has_prev = len(prev_weights) > 0
+        var cw_words = List[UInt32](length=max_m, fill=0)
+        var pw_words = List[UInt32](length=max_m, fill=0)
         for m in range(max_m):
             var cw = cur_weights[m] if m < len(cur_weights) else Float32(0.0)
             var pw = (prev_weights[m] if m < len(prev_weights) else Float32(0.0)) if has_prev else cw
-            put_float(self.buf_skinning.cpu_address + (AAA_SKIN_CUR_MORPH_WEIGHTS_BASE + m_first + m) * 4, cw)
-            put_float(self.buf_skinning.cpu_address + (AAA_SKIN_PREV_MORPH_WEIGHTS_BASE + m_first + m) * 4, pw)
+            cw_words[m] = bitcast[DType.uint32](cw)
+            pw_words[m] = bitcast[DType.uint32](pw)
+        self.pending_skin_copies.append((AAA_SKIN_CUR_MORPH_WEIGHTS_BASE + m_first, cw_words^))
+        self.pending_skin_copies.append((AAA_SKIN_PREV_MORPH_WEIGHTS_BASE + m_first, pw_words^))
         self._enqueue_pending_skin_update(skin_entry)
 
     def update_skinned_mesh_smear(
@@ -2928,36 +4026,45 @@ struct FlintAaaVulkanRenderer(Movable):
         var cur_sm_base = AAA_SKIN_CUR_SMEAR_BASE + pal_off
         var prev_sm_base = AAA_SKIN_PREV_SMEAR_BASE + pal_off
         var n_clear = min(max_avail, max(len(cur_bones), max(len(cur_smears), len(prev_smears))))
-        if n_clear > 0:
-            _ = external_call["memset", Int](self.buf_skinning.cpu_address + cur_sm_base * 4, Int32(0), n_clear * 32)
-            _ = external_call["memset", Int](self.buf_skinning.cpu_address + prev_sm_base * 4, Int32(0), n_clear * 32)
-
         var n_cs = min(max_avail, len(cur_smears))
-        for b in range(n_cs):
-            var sm = cur_smears[b]
-            var off = (cur_sm_base + b * 8) * 4
-            put_float(self.buf_skinning.cpu_address + off + 0, sm.scale.x - Float32(1.0))
-            put_float(self.buf_skinning.cpu_address + off + 4, sm.scale.y - Float32(1.0))
-            put_float(self.buf_skinning.cpu_address + off + 8, sm.scale.z - Float32(1.0))
-            put_float(self.buf_skinning.cpu_address + off + 12, sm.shear_xy)
-            put_float(self.buf_skinning.cpu_address + off + 16, sm.pivot_bind.x)
-            put_float(self.buf_skinning.cpu_address + off + 20, sm.pivot_bind.y)
-            put_float(self.buf_skinning.cpu_address + off + 24, sm.pivot_bind.z)
-            put_float(self.buf_skinning.cpu_address + off + 28, sm.shear_xz)
-
         var has_ps = len(prev_smears) > 0
         var n_ps = min(max_avail, len(prev_smears) if has_ps else len(cur_smears))
+        var nw_sm = max(n_clear, max(n_cs, n_ps)) * 8
+        var cur_sm_w = List[UInt32](length=max(1, nw_sm), fill=0)
+        var prev_sm_w = List[UInt32](length=max(1, nw_sm), fill=0)
+
+        for b in range(n_cs):
+            var sm = cur_smears[b]
+            var off = b * 8
+            cur_sm_w[off + 0] = bitcast[DType.uint32](sm.scale.x - Float32(1.0))
+            cur_sm_w[off + 1] = bitcast[DType.uint32](sm.scale.y - Float32(1.0))
+            cur_sm_w[off + 2] = bitcast[DType.uint32](sm.scale.z - Float32(1.0))
+            cur_sm_w[off + 3] = bitcast[DType.uint32](sm.shear_xy)
+            cur_sm_w[off + 4] = bitcast[DType.uint32](sm.pivot_bind.x)
+            cur_sm_w[off + 5] = bitcast[DType.uint32](sm.pivot_bind.y)
+            cur_sm_w[off + 6] = bitcast[DType.uint32](sm.pivot_bind.z)
+            cur_sm_w[off + 7] = bitcast[DType.uint32](sm.shear_xz)
+
         for b in range(n_ps):
             var sm = prev_smears[b] if has_ps else cur_smears[b]
-            var off = (prev_sm_base + b * 8) * 4
-            put_float(self.buf_skinning.cpu_address + off + 0, sm.scale.x - Float32(1.0))
-            put_float(self.buf_skinning.cpu_address + off + 4, sm.scale.y - Float32(1.0))
-            put_float(self.buf_skinning.cpu_address + off + 8, sm.scale.z - Float32(1.0))
-            put_float(self.buf_skinning.cpu_address + off + 12, sm.shear_xy)
-            put_float(self.buf_skinning.cpu_address + off + 16, sm.pivot_bind.x)
-            put_float(self.buf_skinning.cpu_address + off + 20, sm.pivot_bind.y)
-            put_float(self.buf_skinning.cpu_address + off + 24, sm.pivot_bind.z)
-            put_float(self.buf_skinning.cpu_address + off + 28, sm.shear_xz)
+            var off = b * 8
+            prev_sm_w[off + 0] = bitcast[DType.uint32](sm.scale.x - Float32(1.0))
+            prev_sm_w[off + 1] = bitcast[DType.uint32](sm.scale.y - Float32(1.0))
+            prev_sm_w[off + 2] = bitcast[DType.uint32](sm.scale.z - Float32(1.0))
+            prev_sm_w[off + 3] = bitcast[DType.uint32](sm.shear_xy)
+            prev_sm_w[off + 4] = bitcast[DType.uint32](sm.pivot_bind.x)
+            prev_sm_w[off + 5] = bitcast[DType.uint32](sm.pivot_bind.y)
+            prev_sm_w[off + 6] = bitcast[DType.uint32](sm.pivot_bind.z)
+            prev_sm_w[off + 7] = bitcast[DType.uint32](sm.shear_xz)
+
+        if nw_sm > 0:
+            if defer_to_frame:
+                self.pending_skin_copies.append((cur_sm_base, cur_sm_w^))
+                self.pending_skin_copies.append((prev_sm_base, prev_sm_w^))
+            else:
+                self._upload_to_device_local_sync(Int(cur_sm_w.unsafe_ptr()), nw_sm * 4, BIND_AAA_SKINNING, cur_sm_base * 4)
+                self._upload_to_device_local_sync(Int(prev_sm_w.unsafe_ptr()), nw_sm * 4, BIND_AAA_SKINNING, prev_sm_base * 4)
+                _ = len(cur_sm_w) + len(prev_sm_w)
 
         return self.update_skinned_mesh_bones(
             skin_entry, cur_bones, prev_bones, invalidate_vsm=invalidate_vsm, defer_to_frame=defer_to_frame, reset_smears=False
@@ -3020,6 +4127,7 @@ struct FlintAaaVulkanRenderer(Movable):
         out.albedo_bindless_slots = List[Int](length=n_tex, fill=-1)
         out.normal_bindless_slots = List[Int](length=n_tex, fill=-1)
         out.orm_bindless_slots = List[Int](length=n_tex, fill=-1)
+        out.emissive_bindless_slots = List[Int](length=n_tex, fill=-1)
 
         for m_idx in range(len(model.meshes)):
             ref m = model.meshes[m_idx]
@@ -3065,8 +4173,18 @@ struct FlintAaaVulkanRenderer(Movable):
 
             var orm_slot = -1
             if m.orm_texture >= 0 and m.orm_texture < n_tex:
-                if out.orm_bindless_slots[m.orm_texture] < 0:
+                var has_sep_occ = (
+                    m.occlusion_texture >= 0
+                    and m.occlusion_texture < n_tex
+                    and m.occlusion_texture != m.orm_texture
+                    and model.textures[m.occlusion_texture].width > 0
+                    and model.textures[m.occlusion_texture].height > 0
+                    and len(model.textures[m.occlusion_texture].pixels)
+                    >= model.textures[m.occlusion_texture].width * model.textures[m.occlusion_texture].height
+                )
+                if has_sep_occ:
                     ref otx = model.textures[m.orm_texture]
+                    ref octx = model.textures[m.occlusion_texture]
                     if otx.width > 0 and otx.height > 0 and len(otx.pixels) >= otx.width * otx.height:
                         var cur_op = otx.pixels.copy()
                         var ow = otx.width
@@ -3074,17 +4192,77 @@ struct FlintAaaVulkanRenderer(Movable):
                         while (ow > cap_dim or oh > cap_dim) and ow >= 8 and oh >= 8:
                             var ds = downsample_argb_2x(cur_op, ow, oh)
                             cur_op = ds[0].copy(); ow = ds[1]; oh = ds[2]
-                        # Ensure AO defaults to 255 (R channel) if glTF only populated G=Roughness, B=Metallic
+                        var orm_px = List[UInt32](capacity=ow * oh)
+                        for py in range(oh):
+                            var sy = min(octx.height - 1, (py * octx.height) // oh)
+                            for px in range(ow):
+                                var p = cur_op[py * ow + px]
+                                var sx = min(octx.width - 1, (px * octx.width) // ow)
+                                var r_ao = Float32((octx.pixels[sy * octx.width + sx] >> 16) & 0xFF)
+                                var scaled_ao = UInt32(max(0, min(255, Int(Float32(255.0) * (Float32(1.0) - m.occlusion_strength) + r_ao * m.occlusion_strength + Float32(0.5)))))
+                                orm_px.append(UInt32(0xFF000000) | (scaled_ao << 16) | (p & 0x0000FFFF))
+                        orm_slot = self.upload_bc7_texture(orm_px, ow, oh, srgb=False, generate_mips=True)
+                else:
+                    if out.orm_bindless_slots[m.orm_texture] < 0:
+                        ref otx = model.textures[m.orm_texture]
+                        if otx.width > 0 and otx.height > 0 and len(otx.pixels) >= otx.width * otx.height:
+                            var cur_op = otx.pixels.copy()
+                            var ow = otx.width
+                            var oh = otx.height
+                            while (ow > cap_dim or oh > cap_dim) and ow >= 8 and oh >= 8:
+                                var ds = downsample_argb_2x(cur_op, ow, oh)
+                                cur_op = ds[0].copy(); ow = ds[1]; oh = ds[2]
+                            # Ensure AO defaults to 255 (R channel) if glTF only populated G=Roughness, B=Metallic
+                            var orm_px = List[UInt32](capacity=ow * oh)
+                            for p in cur_op:
+                                var r_ao = (p >> 16) & 0xFF
+                                var use_ao: UInt32
+                                if m.occlusion_texture == m.orm_texture:
+                                    use_ao = UInt32(max(0, min(255, Int(Float32(255.0) * (Float32(1.0) - m.occlusion_strength) + Float32(r_ao) * m.occlusion_strength + Float32(0.5)))))
+                                else:
+                                    use_ao = UInt32(255) if r_ao == 0 else r_ao
+                                orm_px.append(UInt32(0xFF000000) | (use_ao << 16) | (p & 0x0000FFFF))
+                            out.orm_bindless_slots[m.orm_texture] = self.upload_bc7_texture(
+                                orm_px, ow, oh, srgb=False, generate_mips=True
+                            )
+                    if out.orm_bindless_slots[m.orm_texture] >= 0:
+                        orm_slot = out.orm_bindless_slots[m.orm_texture]
+            elif m.occlusion_texture >= 0 and m.occlusion_texture < n_tex:
+                if out.orm_bindless_slots[m.occlusion_texture] < 0:
+                    ref octx = model.textures[m.occlusion_texture]
+                    if octx.width > 0 and octx.height > 0 and len(octx.pixels) >= octx.width * octx.height:
+                        var cur_op = octx.pixels.copy()
+                        var ow = octx.width
+                        var oh = octx.height
+                        while (ow > cap_dim or oh > cap_dim) and ow >= 8 and oh >= 8:
+                            var ds = downsample_argb_2x(cur_op, ow, oh)
+                            cur_op = ds[0].copy(); ow = ds[1]; oh = ds[2]
+                        var rough_u8 = UInt32(max(12, min(255, Int(m.roughness * Float32(255.0) + Float32(0.5)))))
+                        var metal_u8 = UInt32(max(0, min(255, Int(m.metallic * Float32(255.0) + Float32(0.5)))))
                         var orm_px = List[UInt32](capacity=ow * oh)
                         for p in cur_op:
-                            var r_ao = (p >> 16) & 0xFF
-                            var use_ao = UInt32(255) if r_ao == 0 else r_ao
-                            orm_px.append(UInt32(0xFF000000) | (use_ao << 16) | (p & 0x0000FFFF))
-                        out.orm_bindless_slots[m.orm_texture] = self.upload_bc7_texture(
+                            var r_ao = Float32((p >> 16) & 0xFF)
+                            var scaled_ao = UInt32(max(0, min(255, Int(Float32(255.0) * (Float32(1.0) - m.occlusion_strength) + r_ao * m.occlusion_strength + Float32(0.5)))))
+                            orm_px.append(UInt32(0xFF000000) | (scaled_ao << 16) | (rough_u8 << 8) | metal_u8)
+                        out.orm_bindless_slots[m.occlusion_texture] = self.upload_bc7_texture(
                             orm_px, ow, oh, srgb=False, generate_mips=True
                         )
-                if out.orm_bindless_slots[m.orm_texture] >= 0:
-                    orm_slot = out.orm_bindless_slots[m.orm_texture]
+                if out.orm_bindless_slots[m.occlusion_texture] >= 0:
+                    orm_slot = out.orm_bindless_slots[m.occlusion_texture]
+
+            if m.emissive_texture >= 0 and m.emissive_texture < n_tex:
+                if out.emissive_bindless_slots[m.emissive_texture] < 0:
+                    ref etx = model.textures[m.emissive_texture]
+                    if etx.width > 0 and etx.height > 0 and len(etx.pixels) >= etx.width * etx.height:
+                        var cur_ep = etx.pixels.copy()
+                        var ew = etx.width
+                        var eh = etx.height
+                        while (ew > cap_dim or eh > cap_dim) and ew >= 8 and eh >= 8:
+                            var ds = downsample_argb_2x(cur_ep, ew, eh)
+                            cur_ep = ds[0].copy(); ew = ds[1]; eh = ds[2]
+                        out.emissive_bindless_slots[m.emissive_texture] = self.upload_bc7_texture(
+                            cur_ep, ew, eh, srgb=True, generate_mips=True
+                        )
 
             var bc = m.base_color
             var lin_bc = Vec3(
@@ -3232,6 +4410,524 @@ struct FlintAaaVulkanRenderer(Movable):
                     has_prev,
                 )
 
+    def _material_shade_class(self, mat: AaaMaterial) -> Int:
+        if mat.unlit:
+            return AAA_SHADE_CLASS_UNLIT
+        var has_sheen = max(mat.sheen_color.x, max(mat.sheen_color.y, mat.sheen_color.z)) > Float32(0.001)
+        if (
+            mat.clearcoat > Float32(0.001)
+            or mat.iridescence > Float32(0.001)
+            or has_sheen
+            or mat.road_wetness_mode
+            or mat.interior_parallax_enabled
+        ):
+            return AAA_SHADE_CLASS_COMPLEX
+        if mat.two_sided_foliage or mat.subsurface_amount > Float32(0.001) or mat.is_alpha_masked():
+            return AAA_SHADE_CLASS_FOLIAGE_SSS
+        return AAA_SHADE_CLASS_STANDARD_PBR
+
+    def _has_material_class(self, cls: Int) -> Bool:
+        if cls == AAA_SHADE_CLASS_SKY or cls == AAA_SHADE_CLASS_STANDARD_PBR:
+            return True
+        if cls == AAA_SHADE_CLASS_UNLIT and self.pipe_shade_unlit != 0:
+            return True
+        if cls == AAA_SHADE_CLASS_FOLIAGE_SSS and self.pipe_shade_foliage_sss != 0:
+            return True
+        if cls == AAA_SHADE_CLASS_COMPLEX and self.pipe_shade_complex != 0:
+            return True
+        for i in range(len(self.materials)):
+            if self._material_shade_class(self.materials[i]) == cls:
+                return True
+        return False
+
+    def _ensure_shade_class_pipeline(mut self, cls: Int) -> Int:
+        var use_rt = self.vk.has_ray_query
+        if cls == AAA_SHADE_CLASS_SKY:
+            if self.pipe_shade_sky == 0:
+                self.pipe_shade_sky = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_shade_sky_shader(True))
+            return self.pipe_shade_sky
+        if cls == AAA_SHADE_CLASS_UNLIT:
+            if self.pipe_shade_unlit == 0:
+                self.pipe_shade_unlit = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_shade_unlit_shader(True))
+            return self.pipe_shade_unlit
+        if cls == AAA_SHADE_CLASS_STANDARD_PBR:
+            if self.pipe_shade_pbr == 0:
+                self.pipe_shade_pbr = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, aaa_deferred_shade_class_shader(use_rt, AAA_SHADE_CLASS_STANDARD_PBR, True)
+                )
+            return self.pipe_shade_pbr
+        if cls == AAA_SHADE_CLASS_FOLIAGE_SSS:
+            if self.pipe_shade_foliage_sss == 0:
+                self.pipe_shade_foliage_sss = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, aaa_deferred_shade_class_shader(use_rt, AAA_SHADE_CLASS_FOLIAGE_SSS, True)
+                )
+            return self.pipe_shade_foliage_sss
+        if cls == AAA_SHADE_CLASS_COMPLEX:
+            if self.pipe_shade_complex == 0:
+                self.pipe_shade_complex = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, aaa_deferred_shade_class_shader(use_rt, AAA_SHADE_CLASS_COMPLEX, True)
+                )
+            return self.pipe_shade_complex
+        return 0
+
+    def _ensure_vat_crowd_eval_pipeline(mut self) -> Int:
+        if self.pipe_vat_crowd_eval == 0:
+            self.pipe_vat_crowd_eval = self.vk.create_aaa_compute_pipeline(self.pipe_layout, vat_crowd_eval_shader())
+        return self.pipe_vat_crowd_eval
+
+    def _ensure_terrain_clipmap_eval_pipeline(mut self) -> Int:
+        if self.pipe_terrain_clipmap_eval == 0:
+            self.pipe_terrain_clipmap_eval = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, terrain_clipmap_eval_shader()
+            )
+        return self.pipe_terrain_clipmap_eval
+
+    def _ensure_hiz_pipeline(mut self) -> Int:
+        if self.pipe_hiz_downsample == 0:
+            self.pipe_hiz_downsample = self.vk.create_aaa_compute_pipeline(self.pipe_layout, hiz_depth_downsample_shader())
+        return self.pipe_hiz_downsample
+
+    def _ensure_visbuffer_alphamask_pipeline(mut self) -> Int:
+        if self.pipe_visbuffer_alphamask_gfx == 0:
+            self.pipe_visbuffer_alphamask_gfx = self.vk.create_graphics_pipeline(
+                self.pipe_layout,
+                visbuffer_alphamask_vertex_shader(),
+                visbuffer_alphamask_vfx_fragment_shader(),
+                has_color=True,
+                color_format=FORMAT_R32G32_UINT,
+                depth_format=FORMAT_D32_SFLOAT,
+                depth_test=True,
+                depth_write=True,
+                depth_compare=COMPARE_GREATER_OR_EQUAL,
+                cull_mode=CULL_MODE_NONE,
+                front_face=FRONT_FACE_CW,
+            )
+        return self.pipe_visbuffer_alphamask_gfx
+
+    def _ensure_vsm_alphamask_pipeline(mut self) -> Int:
+        if self.pipe_vsm_alphamask_gfx == 0:
+            self.pipe_vsm_alphamask_gfx = self.vk.create_graphics_pipeline(
+                self.pipe_layout,
+                vsm_alphamask_vertex_shader(),
+                vsm_alphamask_fragment_shader(),
+                has_color=False,
+                color_format=0,
+                depth_format=FORMAT_D32_SFLOAT,
+                depth_test=True,
+                depth_write=True,
+                depth_compare=COMPARE_LESS_OR_EQUAL,
+                cull_mode=CULL_MODE_NONE,
+                front_face=FRONT_FACE_CW,
+            )
+        return self.pipe_vsm_alphamask_gfx
+
+    def _ensure_oit_vol_pipeline(mut self) -> Int:
+        if self.pipe_oit_vol == 0:
+            self.pipe_oit_vol = self.vk.create_aaa_compute_pipeline(self.pipe_layout, oit_and_6way_volumetric_shader())
+        return self.pipe_oit_vol
+
+    def _ensure_npr_outline_pipeline(mut self) -> Int:
+        if self.pipe_npr_outline_gfx == 0:
+            self.pipe_npr_outline_gfx = self.vk.create_graphics_pipeline(
+                self.pipe_layout,
+                npr_outline_vertex_shader(),
+                npr_outline_fragment_shader(),
+                has_color=True,
+                color_format=FORMAT_R32G32_UINT,
+                depth_format=FORMAT_D32_SFLOAT,
+                depth_test=True,
+                depth_write=True,
+                depth_compare=COMPARE_GREATER_OR_EQUAL,
+                cull_mode=CULL_MODE_FRONT,
+                front_face=FRONT_FACE_CW,
+            )
+        return self.pipe_npr_outline_gfx
+
+    def _ensure_surfcache_pipeline(mut self) -> Int:
+        if self.pipe_surfcache == 0:
+            self.pipe_surfcache = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, surface_cache_update_shader(self.vk.has_ray_query)
+            )
+        return self.pipe_surfcache
+
+    def _ensure_cluster_cull_pipeline(mut self) -> Int:
+        if self.pipe_cluster_cull == 0:
+            self.pipe_cluster_cull = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_cluster_cull_shader(BIND_AAA_CLUSTERS, BIND_AAA_GLOBALS)
+            )
+        return self.pipe_cluster_cull
+
+    def _ensure_dq_skinning_pipeline(mut self) -> Int:
+        if self.pipe_dq_skinning == 0:
+            self.pipe_dq_skinning = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_dq_skinning_shader(BIND_AAA_VERTICES, BIND_AAA_SKINNING)
+            )
+        return self.pipe_dq_skinning
+
+    def _ensure_svgf_pipelines(mut self):
+        if self.pipe_svgf_reproject == 0:
+            self.pipe_svgf_reproject = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, svgf_temporal_reproject_shader()
+            )
+        if self.pipe_svgf_atrous == 0:
+            self.pipe_svgf_atrous = self.vk.create_aaa_compute_pipeline(self.pipe_layout, svgf_atrous_shader())
+
+    def _ensure_spec_reblur_pipelines(mut self):
+        if self.pipe_spec_reblur_temp == 0:
+            self.pipe_spec_reblur_temp = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, spec_reblur_temporal_shader()
+            )
+        if self.pipe_spec_reblur_atrous == 0:
+            self.pipe_spec_reblur_atrous = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, spec_reblur_atrous_shader()
+            )
+
+    def _ensure_rt_shadow_pipelines(mut self):
+        if self.vk.has_ray_query:
+            if self.pipe_rt_shadow_trace == 0:
+                self.pipe_rt_shadow_trace = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, rt_sun_shadow_trace_shader()
+                )
+            if self.pipe_rt_shadow_filter == 0:
+                self.pipe_rt_shadow_filter = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, rt_sun_shadow_filter_shader()
+                )
+
+    def _ensure_glass_refract_pipeline(mut self) -> Int:
+        if self.vk.has_ray_query and self.pipe_glass_refract == 0:
+            self.pipe_glass_refract = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_glass_refract_shader()
+            )
+        return self.pipe_glass_refract
+
+    def _ensure_froxel_pipelines(mut self):
+        if self.pipe_froxel_inject == 0:
+            self.pipe_froxel_inject = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, froxel_inject_and_reproject_shader()
+            )
+        if self.pipe_froxel_prefix == 0:
+            self.pipe_froxel_prefix = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, froxel_prefix_integrate_shader()
+            )
+        if self.pipe_froxel_march == 0:
+            self.pipe_froxel_march = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, froxel_raymarch_integrate_shader()
+            )
+
+    def _ensure_particle_pipelines(mut self):
+        if self.pipe_particle_clear == 0:
+            self.pipe_particle_clear = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, gpu_particle_clear_tiles_shader()
+            )
+        if self.pipe_particle_sim == 0:
+            self.pipe_particle_sim = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, gpu_particle_sim_and_bin_shader()
+            )
+        if self.pipe_particle_comp == 0:
+            self.pipe_particle_comp = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, gpu_particle_tile_composite_shader()
+            )
+
+    def _ensure_water_refract_pipeline(mut self) -> Int:
+        if self.pipe_water_refract == 0:
+            self.pipe_water_refract = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_water_refract_shader(self.vk.has_ray_query)
+            )
+        return self.pipe_water_refract
+
+    def _ensure_npr_cel_pipeline(mut self) -> Int:
+        if self.pipe_npr_cel_shade == 0:
+            self.pipe_npr_cel_shade = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_npr_cel_shade_shader()
+            )
+        return self.pipe_npr_cel_shade
+
+    def _ensure_npr_post_fx_pipeline(mut self) -> Int:
+        if self.pipe_npr_post_fx == 0:
+            self.pipe_npr_post_fx = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_npr_post_fx_shader()
+            )
+        return self.pipe_npr_post_fx
+
+    def _ensure_bokeh_dof_pipeline(mut self) -> Int:
+        if self.pipe_bokeh_dof == 0:
+            self.pipe_bokeh_dof = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_bokeh_dof_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
+            )
+        return self.pipe_bokeh_dof
+
+    def _ensure_bloom_pipelines(mut self):
+        if self.pipe_bloom_down == 0:
+            self.pipe_bloom_down = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_bloom_downsample_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
+            )
+        if self.pipe_bloom_up == 0:
+            self.pipe_bloom_up = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_bloom_upsample_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
+            )
+
+    def _ensure_motion_blur_pipeline(mut self) -> Int:
+        if self.pipe_motion_blur == 0:
+            self.pipe_motion_blur = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_motion_blur_shader())
+        return self.pipe_motion_blur
+
+    def _ensure_auto_exposure_pipelines(mut self):
+        if self.pipe_luma_hist == 0:
+            self.pipe_luma_hist = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_luminance_histogram_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
+            )
+        if self.pipe_adapt_exp == 0:
+            self.pipe_adapt_exp = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_adapt_exposure_shader(BIND_AAA_POST_SCRATCH)
+            )
+
+    def _ensure_direct_present_compute_pipelines(mut self):
+        if self.vk.has_storage_write_without_format and self.pipe_display_tonemap_direct == 0:
+            self.pipe_display_tonemap_direct = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_display_tonemap_direct_shader(self.swapchain_img_binding)
+            )
+        if (
+            self.vk.has_storage_write_without_format
+            and self.vk.has_storage_read_without_format
+            and self.pipe_ui_overlay_direct == 0
+        ):
+            self.pipe_ui_overlay_direct = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_ui_overlay_direct_shader(self.swapchain_img_binding)
+            )
+
+    def _ensure_scrgb_pack_pipeline(mut self) -> Int:
+        if self.pipe_scrgb_pack == 0:
+            self.pipe_scrgb_pack = self.vk.create_aaa_compute_pipeline(
+                self.pipe_layout, aaa_pack_scrgb_rgba16f_shader()
+            )
+        return self.pipe_scrgb_pack
+
+    def readback_tile_classify_counts(self) -> List[Int]:
+        """Returns the 5 per-class 8x8 tile counts (`[SKY, UNLIT, STANDARD_PBR, FOLIAGE_SSS, COMPLEX]`)
+        populated on GPU by `aaa_tile_classify_shader` during the last readback frame."""
+        var out = List[Int](length=AAA_SHADE_CLASS_COUNT, fill=0)
+        for i in range(min(AAA_SHADE_CLASS_COUNT, len(self.last_tile_classify_counts))):
+            out[i] = self.last_tile_classify_counts[i]
+        return out^
+
+    def register_vat_crowd_clip(
+        mut self,
+        clip: BakedVatCrowdClip,
+        template_mesh: NativeMesh,
+        material_id: Int,
+        max_phase_slots: Int = 8,
+    ) -> Int:
+        """Uploads a `BakedVatCrowdClip` (`pos_rgba16f` + `nrm_rgba16f`) and pre-allocates `max_phase_slots`
+        disjoint deformable vertex/BLAS slots for GPU `vat_crowd_eval_shader` crowd evaluation."""
+        if not self.active or clip.desc.vertex_count <= 0 or clip.desc.frame_count <= 0:
+            return -1
+        var v_need = template_mesh.vertex_count()
+        if v_need <= 0 or self.skin_bind_cursor + v_need > AAA_SKIN_MAX_VERTS:
+            return -1
+
+        var pos_slot = self.upload_rgba16f_texture(
+            clip.pos_rgba16f, clip.desc.vertex_count, clip.desc.frame_count
+        )
+        var nrm_slot = self.upload_rgba16f_texture(
+            clip.nrm_rgba16f, clip.desc.vertex_count, clip.desc.frame_count
+        )
+        if pos_slot < 0 or nrm_slot < 0:
+            return -1
+
+        var reg = _VatRegisteredClip()
+        reg.desc = clip.desc
+        reg.desc.pos_tex_slot = UInt16(pos_slot)
+        reg.desc.nrm_tex_slot = UInt16(nrm_slot)
+        reg.material_id = max(0, material_id)
+        var n_slots = max(1, min(32, max_phase_slots))
+        var bmin = clip.bounds_min
+        var bmax = clip.bounds_max
+        var ext_r = max(Float32(4.0), (bmax - bmin).length() * Float32(1.5))
+        for _ in range(n_slots):
+            self.skin_arena.vertex_cursor = self.skin_bind_cursor
+            var v_alloc = self.skin_arena.alloc_vertices(v_need)
+            var first_slot = v_alloc[0]
+            if v_alloc[1] != v_need or first_slot + v_need > AAA_SKIN_MAX_VERTS:
+                self.skin_arena.vertex_cursor = self.skin_bind_cursor
+                break
+            self.skin_bind_cursor = self.skin_arena.vertex_cursor
+            var entry = self.add_mesh(
+                template_mesh, reg.material_id, build_lods=False, allow_update=True, expand_bounds=ext_r
+            )
+            if entry.mesh_id >= 0 and entry.mesh_id < len(self.skinned_mesh_flags):
+                self.skinned_mesh_flags[entry.mesh_id] = True
+                self.skinned_mesh_bind_slots[entry.mesh_id] = first_slot
+            reg.slot_mesh_entries.append(entry^)
+            reg.slot_skin_bases.append(first_slot)
+            reg.slot_last_norm_phase.append(Float32(0.0))
+
+        if len(reg.slot_mesh_entries) == 0:
+            return -1
+
+        var cid = len(self.vat_clips)
+        self.vat_clips.append(reg^)
+        return cid
+
+    def draw_vat_crowd_instance(
+        mut self,
+        clip_id: Int,
+        phase_sec: Float32,
+        prev_phase_sec: Float32,
+        world_mat: Mat4,
+        prev_world_mat: Mat4 = Mat4(),
+        material_override: Int = -1,
+        uniform_scale: Float32 = 1.0,
+        has_prev: Bool = False,
+    ):
+        """Queues a GPU VAT-deformed crowd instance for the current frame."""
+        if clip_id < 0 or clip_id >= len(self.vat_clips):
+            return
+        self.frame_vat_draws.append(
+            _VatDrawRequest(
+                clip_id,
+                phase_sec,
+                prev_phase_sec,
+                world_mat.copy(),
+                prev_world_mat.copy(),
+                material_override,
+                uniform_scale,
+                has_prev,
+            )
+        )
+
+    def _build_terrain_clipmap_ring_mesh(self, ring_idx: Int, desc: TerrainClipmapDesc) -> NativeMesh:
+        var n = max(16, (desc.grid_dim_per_ring // 2) * 2)
+        var cs = desc.ring_cell_size(ring_idx)
+        var half_n = Float32(n) * Float32(0.5)
+        var mesh = NativeMesh()
+        mesh.double_sided = False
+        var stride = n + 1
+        for iz in range(stride):
+            var lz = (Float32(iz) - half_n) * cs
+            for ix in range(stride):
+                var lx = (Float32(ix) - half_n) * cs
+                mesh.positions.append(lx); mesh.positions.append(Float32(0.0)); mesh.positions.append(lz)
+                mesh.normals.append(Float32(0.0)); mesh.normals.append(Float32(1.0)); mesh.normals.append(Float32(0.0))
+                mesh.texcoords.append(lx * Float32(0.25)); mesh.texcoords.append(lz * Float32(0.25))
+                mesh.ao.append(UInt8(255))  # bit 2 = 1 -> interior vertex
+
+        var cut_min = (n // 4) + 1
+        var cut_max = (3 * n) // 4 - 2
+        for iz in range(n):
+            for ix in range(n):
+                if ring_idx > 0 and ix >= cut_min and ix <= cut_max and iz >= cut_min and iz <= cut_max:
+                    continue
+                var i00 = iz * stride + ix
+                var i10 = iz * stride + ix + 1
+                var i01 = (iz + 1) * stride + ix
+                var i11 = (iz + 1) * stride + ix + 1
+                mesh.indices.append(i00); mesh.indices.append(i01); mesh.indices.append(i11)
+                mesh.indices.append(i00); mesh.indices.append(i11); mesh.indices.append(i10)
+
+        # Add perimeter skirt vertices (`ao = 251`, bit 2 = 0) along outer boundary so cracks between LODs never leak sky
+        var skirt_base = mesh.vertex_count()
+        for ix in range(stride):
+            mesh.positions.append(mesh.positions[ix * 3 + 0])
+            mesh.positions.append(mesh.positions[ix * 3 + 1])
+            mesh.positions.append(mesh.positions[ix * 3 + 2])
+            mesh.normals.append(Float32(0.0)); mesh.normals.append(Float32(1.0)); mesh.normals.append(Float32(0.0))
+            mesh.texcoords.append(mesh.texcoords[ix * 2 + 0]); mesh.texcoords.append(mesh.texcoords[ix * 2 + 1])
+            mesh.ao.append(UInt8(251))
+        for ix in range(n):
+            var top0 = ix
+            var top1 = ix + 1
+            var bot0 = skirt_base + ix
+            var bot1 = skirt_base + ix + 1
+            mesh.indices.append(top0); mesh.indices.append(top1); mesh.indices.append(bot1)
+            mesh.indices.append(top0); mesh.indices.append(bot1); mesh.indices.append(bot0)
+
+        skirt_base = mesh.vertex_count()
+        for ix in range(stride):
+            var vi = n * stride + ix
+            mesh.positions.append(mesh.positions[vi * 3 + 0])
+            mesh.positions.append(mesh.positions[vi * 3 + 1])
+            mesh.positions.append(mesh.positions[vi * 3 + 2])
+            mesh.normals.append(Float32(0.0)); mesh.normals.append(Float32(1.0)); mesh.normals.append(Float32(0.0))
+            mesh.texcoords.append(mesh.texcoords[vi * 2 + 0]); mesh.texcoords.append(mesh.texcoords[vi * 2 + 1])
+            mesh.ao.append(UInt8(251))
+        for ix in range(n):
+            var top0 = n * stride + ix
+            var top1 = n * stride + ix + 1
+            var bot0 = skirt_base + ix
+            var bot1 = skirt_base + ix + 1
+            mesh.indices.append(top0); mesh.indices.append(bot1); mesh.indices.append(top1)
+            mesh.indices.append(top0); mesh.indices.append(bot0); mesh.indices.append(bot1)
+
+        skirt_base = mesh.vertex_count()
+        for iz in range(stride):
+            var vi = iz * stride
+            mesh.positions.append(mesh.positions[vi * 3 + 0])
+            mesh.positions.append(mesh.positions[vi * 3 + 1])
+            mesh.positions.append(mesh.positions[vi * 3 + 2])
+            mesh.normals.append(Float32(0.0)); mesh.normals.append(Float32(1.0)); mesh.normals.append(Float32(0.0))
+            mesh.texcoords.append(mesh.texcoords[vi * 2 + 0]); mesh.texcoords.append(mesh.texcoords[vi * 2 + 1])
+            mesh.ao.append(UInt8(251))
+        for iz in range(n):
+            var top0 = iz * stride
+            var top1 = (iz + 1) * stride
+            var bot0 = skirt_base + iz
+            var bot1 = skirt_base + iz + 1
+            mesh.indices.append(top0); mesh.indices.append(bot1); mesh.indices.append(top1)
+            mesh.indices.append(top0); mesh.indices.append(bot0); mesh.indices.append(bot1)
+
+        skirt_base = mesh.vertex_count()
+        for iz in range(stride):
+            var vi = iz * stride + n
+            mesh.positions.append(mesh.positions[vi * 3 + 0])
+            mesh.positions.append(mesh.positions[vi * 3 + 1])
+            mesh.positions.append(mesh.positions[vi * 3 + 2])
+            mesh.normals.append(Float32(0.0)); mesh.normals.append(Float32(1.0)); mesh.normals.append(Float32(0.0))
+            mesh.texcoords.append(mesh.texcoords[vi * 2 + 0]); mesh.texcoords.append(mesh.texcoords[vi * 2 + 1])
+            mesh.ao.append(UInt8(251))
+        for iz in range(n):
+            var top0 = iz * stride + n
+            var top1 = (iz + 1) * stride + n
+            var bot0 = skirt_base + iz
+            var bot1 = skirt_base + iz + 1
+            mesh.indices.append(top0); mesh.indices.append(top1); mesh.indices.append(bot1)
+            mesh.indices.append(top0); mesh.indices.append(bot1); mesh.indices.append(bot0)
+
+        return mesh^
+
+    def set_terrain_clipmap(mut self, desc: TerrainClipmapDesc, material_id: Int = -1):
+        """Activates concentric GPU terrain clipmap rings evaluated per-frame by `terrain_clipmap_eval_shader`."""
+        var mat_id = material_id
+        if mat_id < 0 or mat_id >= len(self.materials):
+            var tm = AaaMaterial(Vec3(1.0, 1.0, 1.0), Float32(0.75), Float32(0.0))
+            mat_id = self.add_material(tm)
+            if mat_id < 0:
+                mat_id = 0
+        self.terrain_clipmap_desc = desc.copy()
+        self.terrain_clipmap_desc.ring_count = max(1, min(8, desc.ring_count))
+        self.terrain_material_id = mat_id
+        self.terrain_ring_meshes.clear()
+        self.terrain_ring_origins.clear()
+        var expand_h = abs(desc.height_scale_m) + abs(desc.height_offset_m) + Float32(32.0)
+        for r in range(self.terrain_clipmap_desc.ring_count):
+            var ring_mesh = self._build_terrain_clipmap_ring_mesh(r, self.terrain_clipmap_desc)
+            var splat_w = List[UInt32](length=ring_mesh.vertex_count(), fill=0)
+            var entry = self.add_splat_mesh(
+                ring_mesh, mat_id, splat_w, build_lods=False, allow_update=True, expand_bounds=expand_h
+            )
+            self.terrain_ring_meshes.append(entry^)
+            var orig = self.terrain_clipmap_desc.snapped_ring_origin_xz(self.cam_pos, r)
+            self.terrain_ring_origins.append(orig)
+        self.terrain_clipmap_active = True
+        self.terrain_clipmap_dirty = True
+        self.vsm.invalidate_all()
+
+    def clear_terrain_clipmap(mut self):
+        self.terrain_clipmap_active = False
+        self.terrain_ring_meshes.clear()
+        self.terrain_ring_origins.clear()
+        self.terrain_clipmap_dirty = False
+        self.vsm.invalidate_all()
+
     # ========================================================================
     # Frame Submission & Execution
     # ========================================================================
@@ -3248,7 +4944,11 @@ struct FlintAaaVulkanRenderer(Movable):
         var cur_slot = slot if (slot >= 0 and slot < len(self.ring_globals)) else (self.frame_index % FRAMES_IN_FLIGHT)
         if cur_slot < len(self.frame_fences) and self.frame_fences[cur_slot] != 0:
             _ = self.vk.wait(self.frame_fences[cur_slot])
+            if self.prev_submitted_fence <= self.frame_fences[cur_slot]:
+                self.prev_submitted_fence = 0
             self.frame_fences[cur_slot] = 0
+        self.staging_ring.reset_slot(self.vk, cur_slot)
+        self._flush_slot_retirements(cur_slot)
         if cur_slot < len(self.slot_has_pending_queries) and self.slot_has_pending_queries[cur_slot]:
             self.slot_has_pending_queries[cur_slot] = False
             var q_pairs = self.slot_prof_pairs[cur_slot].copy()
@@ -3257,18 +4957,9 @@ struct FlintAaaVulkanRenderer(Movable):
             self.slot_frame_q[cur_slot] = -1
             self._read_gpu_timings(q_pairs, q_frame)
 
-        self.buf_globals = self.ring_globals[cur_slot].copy()
-        self.buf_instances = self.ring_instances[cur_slot].copy()
-        self.buf_indirect = self.ring_indirect[cur_slot].copy()
-        self.buf_alphamask_indirect = self.ring_alphamask_indirect[cur_slot].copy()
-        self.buf_outline_indirect = self.ring_outline_indirect[cur_slot].copy()
-        self.buf_clusters = self.ring_clusters[cur_slot].copy()
-        self.buf_surfcache = self.ring_surfcache[cur_slot].copy()
-        self.buf_vsm_table = self.ring_vsm_table[cur_slot].copy()
         self.desc_set = self.desc_sets[cur_slot]
-        if self.vk.has_ray_query and len(self.ring_as_instances) > cur_slot:
-            self.buf_as_instances = self.ring_as_instances[cur_slot].copy()
-            self.frame_tlas = self.ring_tlas[cur_slot].copy()
+        if self.vk.has_ray_query and len(self.ring_tlas) > cur_slot:
+            self.frame_tlas.handle = self.ring_tlas[cur_slot].handle
 
         self.cam_pos = cam_pos
         var fwd = (cam_target - cam_pos).normalized()
@@ -3288,6 +4979,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.fov_y_deg = fov_y_deg
         self.near_z = near_z
         self.frame_instances.clear()
+        self.frame_vat_draws.clear()
         self.frame_decals.clear()
         self.frame_plumes.clear()
         self.frame_particle_emitters.clear()
@@ -3346,13 +5038,19 @@ struct FlintAaaVulkanRenderer(Movable):
             return True
         return False
 
-    def _pack_alphamask_visbuffer_commands(mut self, n_inst: Int, tan_x: Float32, tan_y: Float32) -> Int:
-        """Packs frustum-visible alpha-masked meshlets (`VkDrawIndexedIndirectCommand`, stride 20) into `buf_alphamask_indirect`
-        for Bucket 2 (`pipe_visbuffer_alphamask_gfx`), keeping Bucket 1 (`pipe_visbuffer_gfx`, `EarlyFragmentTests`) 100% pure!"""
+    def _pack_alphamask_visbuffer_commands(
+        mut self, cur_slot: Int, n_inst: Int, tan_x: Float32, tan_y: Float32
+    ) -> Tuple[Int, StagingSlice, StagingSlice]:
+        """Packs frustum-visible alpha-masked meshlets (`VkDrawIndexedIndirectCommand`, stride 20) +
+        `(inst_id, ml_id)` draw pairs into `LinearStagingRing`, keeping `DEVICE_LOCAL` targets host-free."""
         var cmd_cnt = 0
-        var base_ptr = self.buf_alphamask_indirect.cpu_address
-        if base_ptr == 0 or n_inst <= 0:
-            return 0
+        if n_inst <= 0:
+            return (0, StagingSlice(), StagingSlice())
+        var max_cmds = min(16384, self.max_draws)
+        var draw_pairs_base = 2 * self.max_draws
+        var cmds_host = List[UInt32]()
+        cmds_host.resize(4, 0)
+        var pairs_host = List[UInt32]()
         var sec_x = sqrt(Float32(1.0) + tan_x * tan_x)
         var sec_y = sqrt(Float32(1.0) + tan_y * tan_y)
         var f_h = Float32(self.render_h)
@@ -3382,7 +5080,6 @@ struct FlintAaaVulkanRenderer(Movable):
             if vx_c - wr * sec_x > max(Float32(0.0), vz) * tan_x or vy_c - wr * sec_y > max(Float32(0.0), vz) * tan_y:
                 continue
 
-            # QEM LOD selection matching GPU meshlet culler
             var lod_idx = 0
             if me.lod_count > 1 and vz > Float32(1.0):
                 var px_per_unit = f_h / (Float32(2.0) * vz * max(Float32(0.05), tan_y))
@@ -3394,32 +5091,43 @@ struct FlintAaaVulkanRenderer(Movable):
             var ml_cnt = sl.meshlet_count if sl.meshlet_count > 0 else me.lod0_meshlet_count
 
             for m_loc in range(ml_cnt):
-                if cmd_cnt >= 16384:
+                if cmd_cnt >= max_cmds:
                     break
                 var ml_id = first_ml + m_loc
                 if i_idx > Int(AAA_MAX_PACKED_INSTANCES) or ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
                     continue
                 ref ml = self.geom.meshlets[ml_id]
-                var dst = base_ptr + 16 + cmd_cnt * 20
-                put32(dst + 0, UInt32(ml.tri_count * 3))
-                put32(dst + 4, UInt32(1))
-                put32(dst + 8, UInt32(ml.first_tri * 3))
-                put32(dst + 12, UInt32(0))
-                put32(dst + 16, UInt32((i_idx << 17) | (ml_id & 0x1FFFF)))
+                cmds_host.append(UInt32(ml.tri_count * 3))
+                cmds_host.append(UInt32(1))
+                cmds_host.append(UInt32(ml.first_tri * 3))
+                cmds_host.append(UInt32(0))
+                cmds_host.append(UInt32(draw_pairs_base + cmd_cnt))
+                pairs_host.append(UInt32(i_idx))
+                pairs_host.append(UInt32(ml_id))
                 cmd_cnt += 1
 
-        put32(base_ptr, UInt32(cmd_cnt))
-        return cmd_cnt
+        if cmd_cnt <= 0:
+            return (0, StagingSlice(), StagingSlice())
+        cmds_host[0] = UInt32(cmd_cnt)
+        var sl_ind = self.staging_ring.stage_bytes(self.vk, cur_slot, Int(cmds_host.unsafe_ptr()), len(cmds_host) * 4)
+        var sl_pairs = self.staging_ring.stage_bytes(self.vk, cur_slot, Int(pairs_host.unsafe_ptr()), len(pairs_host) * 4)
+        _ = len(cmds_host)
+        _ = len(pairs_host)
+        return (cmd_cnt, sl_ind, sl_pairs)
 
-    def _pack_outline_visbuffer_commands(mut self, n_inst: Int, tan_x: Float32, tan_y: Float32) -> Int:
-        """Packs frustum-visible cel-outlined meshlets (`VkDrawIndexedIndirectCommand`, stride 20) into
-        `buf_outline_indirect` for `pipe_npr_outline_gfx` (`CULL_MODE_FRONT`). Zero overhead when `len(cel_materials) == 0`!"""
+    def _pack_outline_visbuffer_commands(
+        mut self, cur_slot: Int, n_inst: Int, tan_x: Float32, tan_y: Float32
+    ) -> Tuple[Int, StagingSlice, StagingSlice]:
+        """Packs frustum-visible cel-outlined meshlets (`VkDrawIndexedIndirectCommand`, stride 20) +
+        `(inst_id, ml_id)` pairs into `LinearStagingRing`."""
         if len(self.cel_materials) == 0 or n_inst <= 0:
-            return 0
-        var base_ptr = self.buf_outline_indirect.cpu_address
-        if base_ptr == 0:
-            return 0
+            return (0, StagingSlice(), StagingSlice())
         var cmd_cnt = 0
+        var max_cmds = min(16384, self.max_draws)
+        var draw_pairs_base = 3 * self.max_draws
+        var cmds_host = List[UInt32]()
+        cmds_host.resize(4, 0)
+        var pairs_host = List[UInt32]()
         var sec_x = sqrt(Float32(1.0) + tan_x * tan_x)
         var sec_y = sqrt(Float32(1.0) + tan_y * tan_y)
         var f_h = Float32(self.render_h)
@@ -3462,38 +5170,45 @@ struct FlintAaaVulkanRenderer(Movable):
             var ml_cnt = sl.meshlet_count if sl.meshlet_count > 0 else me.lod0_meshlet_count
 
             for m_loc in range(ml_cnt):
-                if cmd_cnt >= 16384:
+                if cmd_cnt >= max_cmds:
                     break
                 var ml_id = first_ml + m_loc
                 if i_idx > Int(AAA_MAX_PACKED_INSTANCES) or ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
                     continue
                 ref ml = self.geom.meshlets[ml_id]
-                var dst = base_ptr + 16 + cmd_cnt * 20
-                put32(dst + 0, UInt32(ml.tri_count * 3))
-                put32(dst + 4, UInt32(1))
-                put32(dst + 8, UInt32(ml.first_tri * 3))
-                put32(dst + 12, UInt32(0))
-                put32(dst + 16, UInt32((i_idx << 17) | (ml_id & 0x1FFFF)))
+                cmds_host.append(UInt32(ml.tri_count * 3))
+                cmds_host.append(UInt32(1))
+                cmds_host.append(UInt32(ml.first_tri * 3))
+                cmds_host.append(UInt32(0))
+                cmds_host.append(UInt32(draw_pairs_base + cmd_cnt))
+                pairs_host.append(UInt32(i_idx))
+                pairs_host.append(UInt32(ml_id))
                 cmd_cnt += 1
 
-        put32(base_ptr, UInt32(cmd_cnt))
-        return cmd_cnt
+        if cmd_cnt <= 0:
+            return (0, StagingSlice(), StagingSlice())
+        cmds_host[0] = UInt32(cmd_cnt)
+        var sl_ind = self.staging_ring.stage_bytes(self.vk, cur_slot, Int(cmds_host.unsafe_ptr()), len(cmds_host) * 4)
+        var sl_pairs = self.staging_ring.stage_bytes(self.vk, cur_slot, Int(pairs_host.unsafe_ptr()), len(pairs_host) * 4)
+        _ = len(cmds_host)
+        _ = len(pairs_host)
+        return (cmd_cnt, sl_ind, sl_pairs)
 
     def _pack_vsm_indirect_commands(
         mut self,
+        cur_slot: Int,
         n_inst: Int,
         light_vp: List[Float32],
         vsm_allocs: List[Tuple[Int, Int, Int, Int]],
-    ) -> Tuple[Int, List[Int], List[Int], List[Int], List[Int]]:
-        """Per-page light-space bounding-sphere culler + QEM coarse shadow LOD packer into `buf_vsm_indirect`.
-        Separates Opaque (`pipe_vsm_gfx`) vs Alpha-Masked (`pipe_vsm_alphamask_gfx`) commands per dirty `128x128` VSM page!"""
+    ) -> Tuple[Int, List[Int], List[Int], List[Int], List[Int], StagingSlice, StagingSlice]:
+        """Per-page light-space bounding-sphere culler + QEM coarse shadow LOD packer staged into `LinearStagingRing`."""
         var n_pages = len(vsm_allocs)
         var page_offsets = List[Int](length=n_pages, fill=0)
         var page_counts = List[Int](length=n_pages, fill=0)
         var page_am_offsets = List[Int](length=n_pages, fill=0)
         var page_am_counts = List[Int](length=n_pages, fill=0)
         if n_pages == 0 or n_inst == 0:
-            return (0, page_offsets^, page_counts^, page_am_offsets^, page_am_counts^)
+            return (0, page_offsets^, page_counts^, page_am_offsets^, page_am_counts^, StagingSlice(), StagingSlice())
 
         var use_vsm_casc = self.enable_vsm_clipmap_cascades and len(self.vsm_cascade_matrices) >= VSM_CASCADE_COUNT
         var base_vsm_ext = max(Float32(1.0), self.vsm_ortho_half_extent)
@@ -3524,11 +5239,11 @@ struct FlintAaaVulkanRenderer(Movable):
                     if pvy < casc_min_vy[c_idx]: casc_min_vy[c_idx] = pvy
                     if pvy > casc_max_vy[c_idx]: casc_max_vy[c_idx] = pvy
 
-        var per_page = List[List[Tuple[UInt32, UInt32]]]()
-        var per_page_am = List[List[Tuple[UInt32, UInt32]]]()
+        var per_page = List[List[Tuple[UInt32, UInt32, UInt32]]]()
+        var per_page_am = List[List[Tuple[UInt32, UInt32, UInt32]]]()
         for _ in range(n_pages):
-            per_page.append(List[Tuple[UInt32, UInt32]]())
-            per_page_am.append(List[Tuple[UInt32, UInt32]]())
+            per_page.append(List[Tuple[UInt32, UInt32, UInt32]]())
+            per_page_am.append(List[Tuple[UInt32, UInt32, UInt32]]())
 
         var page_scale_single = Float32(64.0) / base_vsm_ext
         var n_casc_pass = VSM_CASCADE_COUNT if use_vsm_casc else 1
@@ -3623,12 +5338,11 @@ struct FlintAaaVulkanRenderer(Movable):
                         if i_idx > Int(AAA_MAX_PACKED_INSTANCES) or ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
                             continue
                         var v_cnt_u = UInt32(self.geom.meshlets[ml_id].tri_count * 3)
-                        var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
                         for hp in hit_pages:
                             if is_am_v:
-                                per_page_am[hp].append((v_cnt_u, pk_u))
+                                per_page_am[hp].append((v_cnt_u, UInt32(i_idx), UInt32(ml_id)))
                             else:
-                                per_page[hp].append((v_cnt_u, pk_u))
+                                per_page[hp].append((v_cnt_u, UInt32(i_idx), UInt32(ml_id)))
                 else:
                     # Fine per-meshlet light-space sphere culling for large terrain chunks, tracks & megatowers
                     var any_dirty = False
@@ -3664,19 +5378,20 @@ struct FlintAaaVulkanRenderer(Movable):
                         if mvx0 > mvx1 or mvy0 > mvy1:
                             continue
                         var v_cnt_u = UInt32(ml.tri_count * 3)
-                        var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
                         for py_i in range(mvy0, mvy1 + 1):
                             var row_off = py_i * 128
                             for px_i in range(mvx0, mvx1 + 1):
                                 var ps = page_slot[row_off + px_i]
                                 if ps >= 0:
                                     if is_am_v:
-                                        per_page_am[ps].append((v_cnt_u, pk_u))
+                                        per_page_am[ps].append((v_cnt_u, UInt32(i_idx), UInt32(ml_id)))
                                     else:
-                                        per_page[ps].append((v_cnt_u, pk_u))
+                                        per_page[ps].append((v_cnt_u, UInt32(i_idx), UInt32(ml_id)))
 
         var cmd_cnt = 0
-        var base_ptr = self.buf_vsm_indirect.cpu_address
+        var draw_pairs_base = 4 * self.max_draws
+        var vsm_cmds = List[UInt32]()
+        var vsm_pairs = List[UInt32]()
         for p_i in range(n_pages):
             page_offsets[p_i] = cmd_cnt
             ref plist = per_page[p_i]
@@ -3684,11 +5399,12 @@ struct FlintAaaVulkanRenderer(Movable):
             for cmd in plist:
                 if cmd_cnt >= self.max_draws:
                     break
-                var dst = base_ptr + cmd_cnt * 16
-                put32(dst + 0, cmd[0])
-                put32(dst + 4, UInt32(1))
-                put32(dst + 8, UInt32(0))
-                put32(dst + 12, cmd[1])
+                vsm_cmds.append(cmd[0])
+                vsm_cmds.append(UInt32(1))
+                vsm_cmds.append(UInt32(0))
+                vsm_cmds.append(UInt32(draw_pairs_base + cmd_cnt))
+                vsm_pairs.append(cmd[1])
+                vsm_pairs.append(cmd[2])
                 cmd_cnt += 1
                 written += 1
             page_counts[p_i] = written
@@ -3699,16 +5415,24 @@ struct FlintAaaVulkanRenderer(Movable):
             for cmd in am_list:
                 if cmd_cnt >= self.max_draws:
                     break
-                var dst = base_ptr + cmd_cnt * 16
-                put32(dst + 0, cmd[0])
-                put32(dst + 4, UInt32(1))
-                put32(dst + 8, UInt32(0))
-                put32(dst + 12, cmd[1])
+                vsm_cmds.append(cmd[0])
+                vsm_cmds.append(UInt32(1))
+                vsm_cmds.append(UInt32(0))
+                vsm_cmds.append(UInt32(draw_pairs_base + cmd_cnt))
+                vsm_pairs.append(cmd[1])
+                vsm_pairs.append(cmd[2])
                 cmd_cnt += 1
                 written_am += 1
             page_am_counts[p_i] = written_am
 
-        return (cmd_cnt, page_offsets^, page_counts^, page_am_offsets^, page_am_counts^)
+        var sl_ind = StagingSlice()
+        var sl_pairs = StagingSlice()
+        if cmd_cnt > 0:
+            sl_ind = self.staging_ring.stage_bytes(self.vk, cur_slot, Int(vsm_cmds.unsafe_ptr()), len(vsm_cmds) * 4)
+            sl_pairs = self.staging_ring.stage_bytes(self.vk, cur_slot, Int(vsm_pairs.unsafe_ptr()), len(vsm_pairs) * 4)
+        _ = len(vsm_cmds)
+        _ = len(vsm_pairs)
+        return (cmd_cnt, page_offsets^, page_counts^, page_am_offsets^, page_am_counts^, sl_ind, sl_pairs)
 
     def ui_prims_word_offset(self, slot: Int) -> Int:
         """Where a frame slot's GPU UI prims live in `buf_post_scratch`: past every per-pixel post
@@ -3718,6 +5442,47 @@ struct FlintAaaVulkanRenderer(Movable):
         frame never rewrites prims the GPU is still drawing."""
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
         return AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + (slot % FRAMES_IN_FLIGHT) * AAA_UI_PRIM_REGION_WORDS
+
+    def _ensure_direct_present_pipelines(mut self, color_fmt: UInt32) -> Bool:
+        if color_fmt == 0:
+            return False
+        if self.present_gfx_format != color_fmt:
+            if self.pipe_display_present_gfx != 0:
+                self.vk.destroy_pipeline(self.pipe_display_present_gfx)
+                self.pipe_display_present_gfx = 0
+            if self.pipe_ui_present_gfx != 0:
+                self.vk.destroy_pipeline(self.pipe_ui_present_gfx)
+                self.pipe_ui_present_gfx = 0
+            self.present_gfx_format = color_fmt
+        if self.pipe_display_present_gfx == 0:
+            self.pipe_display_present_gfx = self.vk.create_graphics_pipeline(
+                self.pipe_layout,
+                aaa_display_present_vertex_shader(),
+                aaa_display_present_fragment_shader(),
+                has_color=True,
+                color_format=color_fmt,
+                depth_format=0,
+                depth_test=False,
+                depth_write=False,
+                cull_mode=CULL_MODE_NONE,
+                front_face=FRONT_FACE_CW,
+                alpha_blend=False,
+            )
+        if self.pipe_ui_present_gfx == 0:
+            self.pipe_ui_present_gfx = self.vk.create_graphics_pipeline(
+                self.pipe_layout,
+                aaa_display_present_vertex_shader(),
+                aaa_ui_present_fragment_shader(),
+                has_color=True,
+                color_format=color_fmt,
+                depth_format=0,
+                depth_test=False,
+                depth_write=False,
+                cull_mode=CULL_MODE_NONE,
+                front_face=FRONT_FACE_CW,
+                alpha_blend=True,
+            )
+        return self.pipe_display_present_gfx != 0 and self.pipe_ui_present_gfx != 0
 
     def render_frame(mut self, capture_readback: Bool = False, force_readback: Bool = False) -> Bool:
         if not self.active:
@@ -3735,7 +5500,13 @@ struct FlintAaaVulkanRenderer(Movable):
         var cur_slot = self.frame_index % FRAMES_IN_FLIGHT
         if cur_slot < len(self.frame_fences) and self.frame_fences[cur_slot] != 0:
             _ = self.vk.wait(self.frame_fences[cur_slot])
+            if self.prev_submitted_fence <= self.frame_fences[cur_slot]:
+                self.prev_submitted_fence = 0
             self.frame_fences[cur_slot] = 0
+        self.staging_ring.reset_slot(self.vk, cur_slot)
+        self._flush_slot_retirements(cur_slot)
+        self.last_async_compute_submits = 0
+        self._bind_render_graph_persistent_buffers(cur_slot)
         if cur_slot < len(self.slot_has_pending_queries) and self.slot_has_pending_queries[cur_slot]:
             self.slot_has_pending_queries[cur_slot] = False
             var q_pairs = self.slot_prof_pairs[cur_slot].copy()
@@ -3753,19 +5524,125 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.readback_extra.append(rb^)
             if len(self.readback_extra) < cur_slot:
                 defer_this = False
-        var rb_buf = self._readback_buffer(cur_slot) if defer_this else self.buf_ldr_readback.copy()
-        self.buf_globals = self.ring_globals[cur_slot].copy()
-        self.buf_instances = self.ring_instances[cur_slot].copy()
-        self.buf_indirect = self.ring_indirect[cur_slot].copy()
-        self.buf_alphamask_indirect = self.ring_alphamask_indirect[cur_slot].copy()
-        self.buf_outline_indirect = self.ring_outline_indirect[cur_slot].copy()
-        self.buf_clusters = self.ring_clusters[cur_slot].copy()
-        self.buf_surfcache = self.ring_surfcache[cur_slot].copy()
-        self.buf_vsm_table = self.ring_vsm_table[cur_slot].copy()
+        var rb_slot = cur_slot if defer_this else 0
         self.desc_set = self.desc_sets[cur_slot]
-        if self.vk.has_ray_query and len(self.ring_as_instances) > cur_slot:
-            self.buf_as_instances = self.ring_as_instances[cur_slot].copy()
-            self.frame_tlas = self.ring_tlas[cur_slot].copy()
+        if self.vk.has_ray_query and len(self.ring_tlas) > cur_slot:
+            self.frame_tlas.handle = self.ring_tlas[cur_slot].handle
+
+        var do_readback = capture_readback or force_readback or self.force_readback or (self.vk.swapchain == 0)
+
+        # F18 Pre-Resolve: VAT Crowd phase quantization + Terrain Clipmap ring origin snapping
+        var vat_eval_tasks = List[_VatEvalDispatch]()
+        if len(self.frame_vat_draws) > 0:
+            var vat_slot_used = List[List[Int]]()
+            var vat_slot_phase = List[List[Float32]]()
+            var vat_slot_prev_phase = List[List[Float32]]()
+            for c_i in range(len(self.vat_clips)):
+                var ns = len(self.vat_clips[c_i].slot_mesh_entries)
+                vat_slot_used.append(List[Int](length=ns, fill=0))
+                vat_slot_phase.append(List[Float32](length=ns, fill=Float32(-1.0)))
+                vat_slot_prev_phase.append(List[Float32](length=ns, fill=Float32(-1.0)))
+
+            for v_i in range(len(self.frame_vat_draws)):
+                ref vd = self.frame_vat_draws[v_i]
+                var cid = vd.clip_id
+                if cid < 0 or cid >= len(self.vat_clips):
+                    continue
+                ref vc = self.vat_clips[cid]
+                var n_slots = len(vc.slot_mesh_entries)
+                if n_slots <= 0:
+                    continue
+                var dur = max(Float32(1e-4), vc.desc.duration_sec)
+                var norm_c: Float32
+                var norm_p: Float32
+                if vc.desc.looping:
+                    var tc = vd.phase_sec - floor(vd.phase_sec / dur) * dur
+                    var tp = vd.prev_phase_sec - floor(vd.prev_phase_sec / dur) * dur
+                    norm_c = min(Float32(1.0), max(Float32(0.0), tc / dur))
+                    norm_p = min(Float32(1.0), max(Float32(0.0), tp / dur))
+                else:
+                    norm_c = min(Float32(1.0), max(Float32(0.0), vd.phase_sec / dur))
+                    norm_p = min(Float32(1.0), max(Float32(0.0), vd.prev_phase_sec / dur))
+                var base_slot = min(n_slots - 1, Int(floor(norm_c * Float32(n_slots))))
+                var chosen = base_slot
+                for probe in range(n_slots):
+                    var cand = (base_slot + probe) % n_slots
+                    if (
+                        vat_slot_used[cid][cand] == 0
+                        or (
+                            abs(vat_slot_phase[cid][cand] - norm_c) < Float32(1e-4)
+                            and abs(vat_slot_prev_phase[cid][cand] - norm_p) < Float32(1e-4)
+                        )
+                    ):
+                        chosen = cand
+                        break
+                if vat_slot_used[cid][chosen] == 0:
+                    vat_slot_used[cid][chosen] = 1
+                    vat_slot_phase[cid][chosen] = norm_c
+                    vat_slot_prev_phase[cid][chosen] = norm_p
+                    var me_v = vc.slot_mesh_entries[chosen].copy()
+                    var prev_b = AAA_SKIN_PREV_POS_BASE + vc.slot_skin_bases[chosen] * 3
+                    vat_eval_tasks.append(
+                        _VatEvalDispatch(
+                            cid,
+                            me_v.mesh_id,
+                            me_v.first_vertex,
+                            min(vc.desc.vertex_count, me_v.vertex_count),
+                            prev_b,
+                            norm_c,
+                            norm_p,
+                        )
+                    )
+                var draw_mid = vc.slot_mesh_entries[chosen].mesh_id
+                var vd_wm = vd.world_mat.copy()
+                var vd_pwm = vd.prev_world_mat.copy()
+                var vd_mo = vd.material_override
+                var vd_us = vd.uniform_scale
+                var vd_hp = vd.has_prev
+                self.draw_instance(
+                    draw_mid,
+                    vd_wm,
+                    vd_pwm,
+                    vd_mo,
+                    vd_us,
+                    vd_hp,
+                )
+
+        var terrain_eval_rings = List[Tuple[Int, Int, Int, Int, Float32, Float32, Float32]]()
+        if self.terrain_clipmap_active and len(self.terrain_ring_meshes) > 0:
+            var r_lim = min(len(self.terrain_ring_meshes), self.terrain_clipmap_desc.ring_count)
+            var any_ring_shifted = False
+            for r in range(r_lim):
+                var orig = self.terrain_clipmap_desc.snapped_ring_origin_xz(self.cam_pos, r)
+                var prev_orig = orig
+                if r < len(self.terrain_ring_origins):
+                    prev_orig = self.terrain_ring_origins[r]
+                else:
+                    while len(self.terrain_ring_origins) <= r:
+                        self.terrain_ring_origins.append(orig)
+                var shifted = (
+                    abs(orig[0] - prev_orig[0]) > Float32(1e-4)
+                    or abs(orig[1] - prev_orig[1]) > Float32(1e-4)
+                    or self.terrain_clipmap_dirty
+                )
+                if shifted:
+                    self.terrain_ring_origins[r] = orig
+                    any_ring_shifted = True
+                ref re = self.terrain_ring_meshes[r]
+                if shifted:
+                    terrain_eval_rings.append(
+                        (r, re.mesh_id, re.first_vertex, re.vertex_count, self.terrain_clipmap_desc.ring_cell_size(r), orig[0], orig[1])
+                    )
+                var cur_m = Mat4()
+                cur_m.values[12] = orig[0]
+                cur_m.values[14] = orig[1]
+                var prv_m = cur_m.copy()
+                self.draw_instance(
+                    re.mesh_id, cur_m, prv_m, self.terrain_material_id, Float32(1.0), True
+                )
+            if any_ring_shifted:
+                self.vsm.invalidate_all()
+            self.terrain_clipmap_dirty = False
 
         var n_inst = len(self.frame_instances)
         var last_large_sc_inst = -1
@@ -3773,78 +5650,91 @@ struct FlintAaaVulkanRenderer(Movable):
         var sc_cursor = 1024  # Leave words [0..4095] for up to 1,024 instance headers!
         var sc_inst_count = min(1024, n_inst)
 
-        # 1. Upload Instance SSBO + 1D Compacted Meshlet Worklist + Surface-Cache Headers + TLAS Instance Records
-        var wl_ptr = self.ring_meshlet_worklist[cur_slot].cpu_address
+        # 1. Stage Instance SSBO + 1D 2-Word Meshlet Worklist + Surface-Cache Headers + TLAS Instance Records
+        var sl_inst = StagingSlice()
+        if n_inst > 0:
+            sl_inst = self.staging_ring.alloc(self.vk, cur_slot, n_inst * AAA_INSTANCE_WORDS * 4)
+        var sl_sc = StagingSlice()
+        var sc_hdr_cnt = min(1024, n_inst)
+        if sc_hdr_cnt > 0:
+            sl_sc = self.staging_ring.alloc(self.vk, cur_slot, sc_hdr_cnt * 16)
+        var sl_as = StagingSlice()
+        if self.vk.has_ray_query and n_inst > 0:
+            sl_as = self.staging_ring.alloc(self.vk, cur_slot, n_inst * 64)
+
+        var host_worklist = List[UInt32]()
         var worklist_count = 0
         var frame_has_glass = False
         for i in range(n_inst):
             ref di = self.frame_instances[i]
             ref me = self.geom.meshes[di.mesh_id]
-            var dst = self.buf_instances.cpu_address + i * AAA_INSTANCE_WORDS * 4
-            for k in range(16):
-                put_float(dst + k * 4, di.world_mat.values[k])
-                put_float(dst + (16 + k) * 4, di.prev_world_mat.values[k])
-            put32(dst + 32 * 4, UInt32(me.first_meshlet))
-            put32(dst + 33 * 4, UInt32(me.meshlet_count))
-            var is_sk = di.mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[di.mesh_id]
-            var inst_fl = UInt32(0x00010000) if is_sk else UInt32(0)
-            var mat_ov = UInt32(0xFFFF) if di.material_override < 0 else UInt32(di.material_override & 0xFFFF)
-            put32(dst + 34 * 4, inst_fl | mat_ov)
-            put_float(dst + 35 * 4, di.uniform_scale)
-            var sk_slot = self.skinned_mesh_bind_slots[di.mesh_id] if (is_sk and di.mesh_id < len(self.skinned_mesh_bind_slots)) else 0
-            put32(dst + 36 * 4, UInt32(sk_slot))
-            put32(dst + 37 * 4, UInt32(me.first_vertex))
-
             var mat_final = me.material_id if di.material_override < 0 else di.material_override
             var is_am_inst = self._is_instance_alpha_masked(di, mat_final)
             var is_glass_inst = len(self.glass_materials) > 0 and self.is_glass_material(mat_final)
             if is_glass_inst:
                 frame_has_glass = True
             var is_ds = (di.mesh_id < len(self.mesh_double_sided_flags) and self.mesh_double_sided_flags[di.mesh_id]) or is_am_inst
-            put32(dst + 38 * 4, UInt32(me.first_index))
-            put32(
-                dst + 39 * 4,
-                UInt32(mat_final & 0xFFFF)
-                | ((UInt32(1) if is_ds else UInt32(0)) << 16)
-                | ((UInt32(1) if is_am_inst else UInt32(0)) << 17)
-                | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0)),
-            )
-            # Compact opaque `(inst_idx, ml_id)` pairs into flat 1D meshlet cull worklist (zero wasted threads!)
-            if not is_am_inst and i <= Int(AAA_MAX_PACKED_INSTANCES) and wl_ptr != 0:
+            if sl_inst.cpu_address != 0:
+                var dst = sl_inst.cpu_address + i * AAA_INSTANCE_WORDS * 4
+                for k in range(16):
+                    put_float(dst + k * 4, di.world_mat.values[k])
+                    put_float(dst + (16 + k) * 4, di.prev_world_mat.values[k])
+                put32(dst + 32 * 4, UInt32(me.first_meshlet))
+                put32(dst + 33 * 4, UInt32(me.meshlet_count))
+                var is_sk = di.mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[di.mesh_id]
+                var inst_fl = UInt32(0x00010000) if is_sk else UInt32(0)
+                var mat_ov = UInt32(0xFFFF) if di.material_override < 0 else UInt32(di.material_override & 0xFFFF)
+                put32(dst + 34 * 4, inst_fl | mat_ov)
+                put_float(dst + 35 * 4, di.uniform_scale)
+                var sk_slot = self.skinned_mesh_bind_slots[di.mesh_id] if (is_sk and di.mesh_id < len(self.skinned_mesh_bind_slots)) else 0
+                put32(dst + 36 * 4, UInt32(sk_slot))
+                put32(dst + 37 * 4, UInt32(me.first_vertex))
+                put32(dst + 38 * 4, UInt32(me.first_index))
+                put32(
+                    dst + 39 * 4,
+                    UInt32(mat_final & 0xFFFF)
+                    | ((UInt32(1) if is_ds else UInt32(0)) << 16)
+                    | ((UInt32(1) if is_am_inst else UInt32(0)) << 17)
+                    | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0)),
+                )
+            # Compact opaque `(inst_idx, ml_id)` pairs into flat 2-word 1D meshlet cull worklist
+            if not is_am_inst and i <= Int(AAA_MAX_PACKED_INSTANCES):
                 var first_ml = me.first_meshlet
                 var ml_cnt = me.meshlet_count
                 for m_loc in range(ml_cnt):
-                    if worklist_count >= self.meshlet_worklist_cap:
-                        break
                     var ml_id = first_ml + m_loc
                     if ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
                         break
-                    put32(wl_ptr + worklist_count * 4, UInt32((i << 17) | (ml_id & 0x1FFFF)))
+                    host_worklist.append(UInt32(i))
+                    host_worklist.append(UInt32(ml_id))
                     worklist_count += 1
             var my_sc_base = 0xFFFFFF
             if i < 1024:
-                var sc_hdr = self.buf_surfcache.cpu_address + i * 16
                 if me.triangle_count <= 4096 and sc_cursor + me.triangle_count < self.max_surfcache_tris:
                     my_sc_base = sc_cursor
                     sc_cursor += me.triangle_count
                     sc_tri_counts.append(me.triangle_count)
                     if me.triangle_count > 2048:
                         last_large_sc_inst = i
-                    put32(sc_hdr + 0, UInt32(my_sc_base))
-                    put32(sc_hdr + 4, UInt32(me.first_index))
-                    put32(sc_hdr + 8, UInt32(me.triangle_count))
-                    put32(sc_hdr + 12, UInt32(mat_final))
+                    if sl_sc.cpu_address != 0:
+                        var sc_hdr = sl_sc.cpu_address + i * 16
+                        put32(sc_hdr + 0, UInt32(my_sc_base))
+                        put32(sc_hdr + 4, UInt32(me.first_index))
+                        put32(sc_hdr + 8, UInt32(me.triangle_count))
+                        put32(sc_hdr + 12, UInt32(mat_final))
                 else:
                     sc_tri_counts.append(0)
-                    put32(sc_hdr + 0, UInt32(0xFFFFFF))
-                    put32(sc_hdr + 4, UInt32(0))
-                    put32(sc_hdr + 8, UInt32(0))
-                    put32(sc_hdr + 12, UInt32(0))
+                    if sl_sc.cpu_address != 0:
+                        var sc_hdr = sl_sc.cpu_address + i * 16
+                        put32(sc_hdr + 0, UInt32(0xFFFFFF))
+                        put32(sc_hdr + 4, UInt32(0))
+                        put32(sc_hdr + 8, UInt32(0))
+                        put32(sc_hdr + 12, UInt32(0))
 
-            if self.vk.has_ray_query and di.mesh_id < len(self.mesh_blas):
+            if self.vk.has_ray_query and sl_as.cpu_address != 0 and di.mesh_id < len(self.mesh_blas):
                 var blas_da = self.mesh_blas[di.mesh_id].device_address
                 write_vk_as_instance_64b(
-                    self.buf_as_instances.cpu_address + i * 64,
+                    sl_as.cpu_address + i * 64,
                     di.world_mat,
                     my_sc_base,
                     blas_da,
@@ -3852,6 +5742,27 @@ struct FlintAaaVulkanRenderer(Movable):
                     alpha_masked=is_am_inst,
                     glass=is_glass_inst,
                 )
+        var sl_worklist = StagingSlice()
+        if worklist_count > 0:
+            var wl_bytes = len(host_worklist) * 4
+            if wl_bytes > self.ring_meshlet_worklist[cur_slot].size:
+                self.vk.wait_idle()
+                for fi in range(len(self.frame_fences)):
+                    self.frame_fences[fi] = 0
+                    self._flush_slot_retirements(fi)
+                self.prev_submitted_fence = 0
+                var new_wl_cap = max(self.ring_meshlet_worklist[cur_slot].size * 2, (wl_bytes + 65535) & ~65535)
+                var new_wl = self.vk.create_buffer_device_local(new_wl_cap)
+                if new_wl.vk_buffer != 0:
+                    self.vk.destroy_buffer(self.ring_meshlet_worklist[cur_slot])
+                    self.ring_meshlet_worklist[cur_slot] = new_wl^
+                    self.vk.write_descriptor(self.desc_sets[cur_slot], BIND_AAA_WORKLIST, self.ring_meshlet_worklist[cur_slot])
+                    self.vk.write_descriptor(self.desc_sets_cull_p1[cur_slot], BIND_AAA_WORKLIST, self.ring_meshlet_worklist[cur_slot])
+                    self.vk.write_descriptor(self.desc_sets_cull_p2[cur_slot], BIND_AAA_WORKLIST, self.ring_meshlet_worklist[cur_slot])
+                    self.meshlet_worklist_cap = max(self.meshlet_worklist_cap, new_wl_cap // 8)
+            worklist_count = min(worklist_count, self.ring_meshlet_worklist[cur_slot].size // 8)
+            sl_worklist = self.staging_ring.stage_bytes(self.vk, cur_slot, Int(host_worklist.unsafe_ptr()), worklist_count * 8)
+        _ = len(host_worklist)
 
         # Stage 6-Way OIT Volumetric Plumes into per-frame staging buffer (copied on GPU timeline to avoid CPU-GPU race!)
         var oit_plume_copy_bytes = 0
@@ -3905,7 +5816,11 @@ struct FlintAaaVulkanRenderer(Movable):
             jy_clip = (jy_px_cur * Float32(2.0)) / Float32(self.render_h)
             mip_bias = Float32(-0.42)
 
-        var g_addr = self.buf_globals.cpu_address
+        var sl_glob = self.staging_ring.alloc(self.vk, cur_slot, 16384)
+        var g_addr = sl_glob.cpu_address
+        if g_addr == 0:
+            return False
+        _ = external_call["memset", Int](g_addr, Int32(0), sl_glob.size)
         for k in range(16):
             put_float(g_addr + k * 4, vp_m[k])
             put_float(g_addr + (16 + k) * 4, self.prev_view_proj[k])
@@ -3952,24 +5867,26 @@ struct FlintAaaVulkanRenderer(Movable):
             put_float(g_addr + (72 + k * 3 + 2) * 4, self.sh9_irradiance[k].z)
 
         var n_cl_lights = len(self.frame_cluster_lights)
+        var sl_clust = StagingSlice()
         if n_cl_lights > 0:
-            var cl_addr = self.buf_clusters.cpu_address
-            var far_z_cl = max(self.near_z + Float32(1.0), self.cluster_far_z)
-            put32(cl_addr + 0 * 4, UInt32(n_cl_lights))
-            put_float(cl_addr + 1 * 4, self.near_z)
-            put_float(cl_addr + 2 * 4, far_z_cl)
-            put_float(cl_addr + 3 * 4, log2(far_z_cl / max(Float32(1e-4), self.near_z)))
-            put_float(cl_addr + 4 * 4, tan_x)
-            put_float(cl_addr + 5 * 4, tan_y)
             var cl_words = List[UInt32](capacity=n_cl_lights * 16)
             for cl_i in range(n_cl_lights):
                 self.frame_cluster_lights[cl_i].append_words(cl_words)
-            _ = external_call[
-                "memcpy", Int
-            ](cl_addr + AAA_CLUSTER_LIGHTS_BASE * 4, Int(cl_words.unsafe_ptr()), len(cl_words) * 4)
+            var cl_bytes = (AAA_CLUSTER_LIGHTS_BASE + len(cl_words)) * 4
+            sl_clust = self.staging_ring.alloc(self.vk, cur_slot, cl_bytes)
+            if sl_clust.cpu_address != 0:
+                var cl_addr = sl_clust.cpu_address
+                var far_z_cl = max(self.near_z + Float32(1.0), self.cluster_far_z)
+                put32(cl_addr + 0 * 4, UInt32(n_cl_lights))
+                put_float(cl_addr + 1 * 4, self.near_z)
+                put_float(cl_addr + 2 * 4, far_z_cl)
+                put_float(cl_addr + 3 * 4, log2(far_z_cl / max(Float32(1e-4), self.near_z)))
+                put_float(cl_addr + 4 * 4, tan_x)
+                put_float(cl_addr + 5 * 4, tan_y)
+                _ = external_call[
+                    "memcpy", Int
+                ](cl_addr + AAA_CLUSTER_LIGHTS_BASE * 4, Int(cl_words.unsafe_ptr()), len(cl_words) * 4)
             _ = len(cl_words)
-        else:
-            put32(self.buf_clusters.cpu_address, 0)
 
         var r_flags: UInt32 = 0
         if self.enable_vsm and not self.furnace_white_dome:
@@ -4132,16 +6049,42 @@ struct FlintAaaVulkanRenderer(Movable):
             for d_w in range(GPU_DECAL_VOLUME_WORDS):
                 put32(g_addr + (d_base + d_w) * 4, d_words[d_w])
 
-        # Pack Bucket 2 alpha-masked VisBuffer draws & hardware `CULL_MODE_FRONT` clip-space outline draws
-        var am_vis_draws = self._pack_alphamask_visbuffer_commands(n_inst, tan_x, tan_y)
-        var outline_vis_draws = 0 if self.furnace_white_dome else self._pack_outline_visbuffer_commands(n_inst, tan_x, tan_y)
+        # F18 Terrain Clipmap Globals (`b_globals[3784..3815]`)
+        if self.terrain_clipmap_active:
+            var tc_words = self.terrain_clipmap_desc.pack_words()
+            for tw in range(len(tc_words)):
+                put32(g_addr + (AAA_GLOBALS_TERRAIN_CLIPMAP_WORD + tw) * 4, tc_words[tw])
+            put32(g_addr + AAA_GLOBALS_TERRAIN_META_WORD * 4, UInt32(1))
+            for r in range(min(8, len(self.terrain_ring_origins))):
+                put_float(g_addr + (AAA_GLOBALS_TERRAIN_ORIGINS_WORD + r * 2 + 0) * 4, self.terrain_ring_origins[r][0])
+                put_float(g_addr + (AAA_GLOBALS_TERRAIN_ORIGINS_WORD + r * 2 + 1) * 4, self.terrain_ring_origins[r][1])
+        else:
+            put32(g_addr + AAA_GLOBALS_TERRAIN_META_WORD * 4, UInt32(0))
 
-        # Reset indirect draw counters and candidate queue = 0
-        put32(self.buf_indirect.cpu_address, 0)
-        if self.buf_indirect_phase2.cpu_address != 0:
-            put32(self.buf_indirect_phase2.cpu_address, 0)
-        if self.buf_occluded_candidates.cpu_address != 0:
-            put32(self.buf_occluded_candidates.cpu_address, 0)
+        # Mirror first 4096 bytes into host-visible shadow `self.buf_globals` for `studio/picking.mojo`
+        if self.buf_globals.cpu_address != 0 and g_addr != 0:
+            _ = external_call["memcpy", Int](
+                self.buf_globals.cpu_address, g_addr, min(4096, sl_glob.size)
+            )
+
+        # Pack Bucket 2 alpha-masked VisBuffer draws & hardware `CULL_MODE_FRONT` clip-space outline draws
+        var am_res = self._pack_alphamask_visbuffer_commands(cur_slot, n_inst, tan_x, tan_y)
+        var am_vis_draws = am_res[0]
+        var out_res = (0, StagingSlice(), StagingSlice()) if self.furnace_white_dome else self._pack_outline_visbuffer_commands(cur_slot, n_inst, tan_x, tan_y)
+        var outline_vis_draws = out_res[0]
+
+        # Stage deferred skinning uniforms/morphs before recording
+        var skin_stage_copies = List[Tuple[Int, StagingSlice]]()
+        if len(self.pending_skin_copies) > 0:
+            for sc_i in range(len(self.pending_skin_copies)):
+                var w_off = self.pending_skin_copies[sc_i][0]
+                ref w_arr = self.pending_skin_copies[sc_i][1]
+                if len(w_arr) > 0:
+                    var sl_sk = self.staging_ring.stage_bytes(
+                        self.vk, cur_slot, Int(w_arr.unsafe_ptr()), len(w_arr) * 4
+                    )
+                    skin_stage_copies.append((w_off * 4, sl_sk))
+            self.pending_skin_copies.clear()
 
         # 3. Ensure TLAS Capacity Before Recording (Zero per-frame `vkAllocateMemory` / `vkDestroyAccelerationStructureKHR`!)
         var use_rt_frame = self.vk.has_ray_query and n_inst > 0 and (
@@ -4152,8 +6095,8 @@ struct FlintAaaVulkanRenderer(Movable):
             or frame_has_glass
         )
         var inst_da: UInt64 = 0
-        if use_rt_frame:
-            inst_da = self.vk.buffer_device_address(self.buf_as_instances)
+        if use_rt_frame and cur_slot < len(self.ring_as_instances):
+            inst_da = self.vk.buffer_device_address(self.ring_as_instances[cur_slot])
             # Build sizes depend only on the instance count, so skip `vkGetAccelerationStructureBuildSizesKHR`
             # (16k instances) once this slot's TLAS is known to be large enough.
             var tlas_cap = max(self.max_instances, n_inst)
@@ -4161,17 +6104,18 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.ring_tlas_cap.append(0)
             var tlas_known_ok = (
                 cur_slot < len(self.ring_tlas_cap)
-                and self.frame_tlas.handle != 0
+                and cur_slot < len(self.ring_tlas)
+                and self.ring_tlas[cur_slot].handle != 0
                 and self.buf_as_scratch.size > 0
                 and self.ring_tlas_cap[cur_slot] >= tlas_cap
             )
-            if not tlas_known_ok:
-                if ensure_tlas_capacity_mixed_opaque(self.vk, self.frame_tlas, inst_da, tlas_cap, self.buf_as_scratch):
-                    self.vk.write_aaa_tlas(self.desc_set, BIND_AAA_TLAS, self.frame_tlas.handle)
-                    if cur_slot < len(self.ring_tlas):
-                        self.ring_tlas[cur_slot] = self.frame_tlas.copy()
-                if cur_slot < len(self.ring_tlas_cap) and self.frame_tlas.handle != 0:
+            if not tlas_known_ok and cur_slot < len(self.ring_tlas):
+                if ensure_tlas_capacity_mixed_opaque(self.vk, self.ring_tlas[cur_slot], inst_da, tlas_cap, self.buf_as_scratch):
+                    self.vk.write_aaa_tlas(self.desc_set, BIND_AAA_TLAS, self.ring_tlas[cur_slot].handle)
+                if cur_slot < len(self.ring_tlas_cap) and self.ring_tlas[cur_slot].handle != 0:
                     self.ring_tlas_cap[cur_slot] = max(self.ring_tlas_cap[cur_slot], tlas_cap)
+            if cur_slot < len(self.ring_tlas):
+                self.frame_tlas.handle = self.ring_tlas[cur_slot].handle
 
         # Single-Command-Buffer Mode: asynchronous single-pass execution without CPU stalls in steady-state,
         # with automatic Frame-0 / camera-teleport warmup so multi-cascade VSM shadows are crisp on the very first frame!
@@ -4186,6 +6130,9 @@ struct FlintAaaVulkanRenderer(Movable):
         var vsm_page_counts = List[Int]()
         var vsm_page_am_offsets = List[Int]()
         var vsm_page_am_counts = List[Int]()
+        var vsm_draws = 0
+        var sl_vsm_ind = StagingSlice()
+        var sl_vsm_pairs = StagingSlice()
         if vsm_active:
             if use_vsm_casc_frame:
                 var next_origins = compute_vsm_cascade_page_origins(self.sun_dir, self.cam_pos, base_vsm_ext)
@@ -4233,11 +6180,14 @@ struct FlintAaaVulkanRenderer(Movable):
                 for pg in pages:
                     vsm_allocs.append((pg.vx, pg.vy, pg.px, pg.py))
                 if len(vsm_allocs) > 0:
-                    var packed_vsm = self._pack_vsm_indirect_commands(n_inst, light_vp, vsm_allocs)
+                    var packed_vsm = self._pack_vsm_indirect_commands(cur_slot, n_inst, light_vp, vsm_allocs)
+                    vsm_draws = packed_vsm[0]
                     vsm_page_offsets = packed_vsm[1].copy()
                     vsm_page_counts = packed_vsm[2].copy()
                     vsm_page_am_offsets = packed_vsm[3].copy()
                     vsm_page_am_counts = packed_vsm[4].copy()
+                    sl_vsm_ind = packed_vsm[5]
+                    sl_vsm_pairs = packed_vsm[6]
             _ = len(tbl)
 
         # ====================================================================
@@ -4254,42 +6204,209 @@ struct FlintAaaVulkanRenderer(Movable):
 
         self.last_worklist_meshlets = worklist_count
         self.render_graph.begin_frame()
-        if not self.vk.begin_commands(cur_slot):
+        var use_async_vsm = vsm_active and self.enable_async_vsm and self.vk.has_side_queue() and self.side_cmd_base >= 0
+        var vis_slot = (FRAMES_IN_FLIGHT + cur_slot) if use_async_vsm else cur_slot
+        if not self.vk.begin_commands(vis_slot):
             return False
         if use_prof:
-            self.vk.reset_queries(cur_slot, q_base, AAA_QUERY_SLOT_STRIDE)
+            self.vk.reset_queries(vis_slot, q_base, AAA_QUERY_SLOT_STRIDE)
         if defer_this:
             # The CPU no longer waits between frames, so serialise this frame's GPU work behind the previous one
             # (single-instance buffers/images: history, post scratch, VSM atlas, surface cache, TLAS scratch...).
             self.vk.memory_barrier2(
-                cur_slot, _AAA_STAGE_ALL_COMMANDS, _AAA_ACCESS_MEMORY_READ_WRITE, _AAA_STAGE_ALL_COMMANDS, _AAA_ACCESS_MEMORY_READ_WRITE
+                vis_slot, _AAA_STAGE_ALL_COMMANDS, _AAA_ACCESS_MEMORY_READ_WRITE, _AAA_STAGE_ALL_COMMANDS, _AAA_ACCESS_MEMORY_READ_WRITE
             )
         if frame_q >= 0:
-            self.vk.write_timestamp(cur_slot, frame_q, PIPELINE_TOP)
+            self.vk.write_timestamp(vis_slot, frame_q, PIPELINE_TOP)
+
+        # Batched host->DEVICE_LOCAL staging copies + indirect zero fills + single transfer barrier
+        if sl_inst.size > 0:
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, sl_inst, self.ring_instances[cur_slot], 0)
+        if sl_sc.size > 0:
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, sl_sc, self.ring_surfcache[cur_slot], 0)
+        if self.vk.has_ray_query and sl_as.size > 0 and cur_slot < len(self.ring_as_instances):
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, sl_as, self.ring_as_instances[cur_slot], 0)
+        if sl_worklist.size > 0:
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, sl_worklist, self.ring_meshlet_worklist[cur_slot], 0)
+        self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, sl_glob, self.ring_globals[cur_slot], 0)
+        if n_cl_lights > 0 and sl_clust.size > 0:
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, sl_clust, self.ring_clusters[cur_slot], 0)
+        else:
+            self.vk.fill_buffer(vis_slot, self.ring_clusters[cur_slot], 0, 16, 0)
+        if am_vis_draws > 0:
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, am_res[1], self.ring_alphamask_indirect[cur_slot], 0)
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, am_res[2], self.ring_draw_pairs[cur_slot], (2 * self.max_draws) * 8)
+        if outline_vis_draws > 0:
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, out_res[1], self.ring_outline_indirect[cur_slot], 0)
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, out_res[2], self.ring_draw_pairs[cur_slot], (3 * self.max_draws) * 8)
+        if vsm_draws > 0:
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, sl_vsm_ind, self.buf_vsm_indirect, 0)
+            self.staging_ring.record_copy(self.vk, vis_slot, cur_slot, sl_vsm_pairs, self.ring_draw_pairs[cur_slot], (4 * self.max_draws) * 8)
+        for sc_i in range(len(skin_stage_copies)):
+            self.staging_ring.record_copy(
+                self.vk, vis_slot, cur_slot, skin_stage_copies[sc_i][1], self.buf_skinning, skin_stage_copies[sc_i][0]
+            )
+        self.vk.fill_buffer(vis_slot, self.ring_indirect[cur_slot], 0, 16, 0)
+        self.vk.fill_buffer(vis_slot, self.buf_indirect_phase2, 0, 16, 0)
+        self.vk.fill_buffer(vis_slot, self.buf_occluded_candidates, 0, 16, 0)
+        self.vk.memory_barrier2(
+            vis_slot,
+            PIPELINE_TRANSFER,
+            Int(ACCESS_TRANSFER_WRITE),
+            PIPELINE_AS_BUILD_KHR | PIPELINE_DRAW_INDIRECT | PIPELINE_VERTEX_SHADER | PIPELINE_FRAGMENT_SHADER | PIPELINE_COMPUTE,
+            Int(ACCESS_TRANSFER_READ | ACCESS_INDIRECT_READ | ACCESS_SHADER_READ | ACCESS_AS_READ_KHR),
+        )
 
         # Execute any deferred Dual-Quaternion skinning + BLAS refits inline (`0` extra submit!)
         if len(self.pending_skin_updates) > 0:
             for sk_i in range(len(self.pending_skin_updates)):
                 var sk_e = self.pending_skin_updates[sk_i].copy()
-                self._record_skin_dispatch_and_blas_refit(cur_slot, sk_e)
+                self._record_skin_dispatch_and_blas_refit(vis_slot, sk_e)
             self.pending_skin_updates.clear()
 
-        # Inline TLAS Rebuild (`0` host allocations, `0` extra submit!)
-        if use_rt_frame and self.frame_tlas.handle != 0:
-            record_build_tlas_mixed_opaque(self.vk, cur_slot, self.frame_tlas, inst_da, n_inst, self.buf_as_scratch)
+        # F18 GPU Compute Pre-Pass: VAT Crowd & Terrain Clipmap vertex generation BEFORE MeshletCull & TLAS!
+        var did_geom_eval = False
+        if len(vat_eval_tasks) > 0 and self._ensure_vat_crowd_eval_pipeline() != 0:
+            did_geom_eval = True
+            for vt_i in range(len(vat_eval_tasks)):
+                ref vt = vat_eval_tasks[vt_i]
+                ref vclip = self.vat_clips[vt.clip_id]
+                var push_vt = List[UInt32](length=16, fill=0)
+                push_vt[0] = UInt32(vt.vertex_count)
+                push_vt[1] = UInt32(vclip.desc.frame_count)
+                push_vt[2] = UInt32(vclip.desc.pos_tex_slot)
+                push_vt[3] = UInt32(vclip.desc.nrm_tex_slot)
+                push_vt[4] = UInt32(vt.first_vertex)
+                push_vt[5] = UInt32(vt.prev_pos_base_word)
+                push_vt[6] = bitcast[DType.uint32](vt.cur_norm_time)
+                push_vt[7] = bitcast[DType.uint32](vt.prev_norm_time)
+                self.vk.dispatch_aaa(
+                    vis_slot,
+                    self.pipe_vat_crowd_eval,
+                    self.pipe_layout,
+                    self.desc_set,
+                    push_vt,
+                    (vt.vertex_count + 63) // 64,
+                    1,
+                )
+
+        if len(terrain_eval_rings) > 0 and self._ensure_terrain_clipmap_eval_pipeline() != 0:
+            did_geom_eval = True
+            var world_sz_m = max(
+                Float32(64.0),
+                self.terrain_clipmap_desc.ring_half_extent(self.terrain_clipmap_desc.ring_count - 1) * Float32(2.0),
+            )
+            var world_ox = -world_sz_m * Float32(0.5)
+            var world_oz = -world_sz_m * Float32(0.5)
+            for tr_i in range(len(terrain_eval_rings)):
+                var tr = terrain_eval_rings[tr_i]
+                var r_idx = tr[0]
+                var v_cnt = tr[3]
+                var cell_sz = tr[4]
+                var ox = tr[5]
+                var oz = tr[6]
+                var half_ext = self.terrain_clipmap_desc.ring_half_extent(r_idx)
+                var skirt_drop = max(Float32(2.0), cell_sz * Float32(2.0))
+                var push_tr = List[UInt32](length=16, fill=0)
+                push_tr[0] = UInt32(v_cnt)
+                push_tr[1] = UInt32(tr[2])
+                push_tr[2] = UInt32(self.terrain_clipmap_desc.heightmap_slot)
+                push_tr[3] = UInt32(self.terrain_clipmap_desc.splat_control_slot)
+                push_tr[4] = bitcast[DType.uint32](ox)
+                push_tr[5] = bitcast[DType.uint32](oz)
+                push_tr[6] = bitcast[DType.uint32](cell_sz)
+                push_tr[7] = bitcast[DType.uint32](half_ext)
+                push_tr[8] = bitcast[DType.uint32](self.terrain_clipmap_desc.height_scale_m)
+                push_tr[9] = bitcast[DType.uint32](self.terrain_clipmap_desc.height_offset_m)
+                push_tr[10] = bitcast[DType.uint32](self.terrain_clipmap_desc.morph_start_ratio)
+                push_tr[11] = bitcast[DType.uint32](world_sz_m)
+                push_tr[12] = bitcast[DType.uint32](world_ox)
+                push_tr[13] = bitcast[DType.uint32](world_oz)
+                push_tr[14] = bitcast[DType.uint32](skirt_drop)
+                push_tr[15] = UInt32(self.terrain_clipmap_desc.grid_dim_per_ring)
+                self.vk.dispatch_aaa(
+                    vis_slot,
+                    self.pipe_terrain_clipmap_eval,
+                    self.pipe_layout,
+                    self.desc_set,
+                    push_tr,
+                    (v_cnt + 63) // 64,
+                    1,
+                )
+
+        if did_geom_eval:
             self.vk.memory_barrier2(
-                cur_slot,
+                vis_slot,
+                PIPELINE_COMPUTE,
+                Int(ACCESS_SHADER_WRITE),
+                PIPELINE_AS_BUILD_KHR | PIPELINE_VERTEX_SHADER | PIPELINE_COMPUTE,
+                Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
+            )
+            if use_rt_frame:
+                var v_addr = self.vk.buffer_device_address(self.buf_vertices)
+                for vt_i in range(len(vat_eval_tasks)):
+                    var mid = vat_eval_tasks[vt_i].mesh_id
+                    if mid >= 0 and mid < len(self.mesh_blas) and self.mesh_blas[mid].handle != 0:
+                        ref me = self.geom.meshes[mid]
+                        var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(me.first_index * 4)
+                        var max_v = max(0, me.first_vertex + me.vertex_count - 1)
+                        self.vk.refit_blas_triangles(
+                            vis_slot,
+                            self.mesh_blas[mid],
+                            v_addr,
+                            AAA_VERTEX_BYTES,
+                            max_v,
+                            i_addr,
+                            me.triangle_count,
+                            self.buf_as_scratch,
+                        )
+                        self.vk.memory_barrier2(
+                            vis_slot,
+                            PIPELINE_AS_BUILD_KHR,
+                            Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR),
+                            PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
+                            Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
+                        )
+                for tr_i in range(len(terrain_eval_rings)):
+                    var mid = terrain_eval_rings[tr_i][1]
+                    if mid >= 0 and mid < len(self.mesh_blas) and self.mesh_blas[mid].handle != 0:
+                        ref me = self.geom.meshes[mid]
+                        var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(me.first_index * 4)
+                        var max_v = max(0, me.first_vertex + me.vertex_count - 1)
+                        self.vk.refit_blas_triangles(
+                            vis_slot,
+                            self.mesh_blas[mid],
+                            v_addr,
+                            AAA_VERTEX_BYTES,
+                            max_v,
+                            i_addr,
+                            me.triangle_count,
+                            self.buf_as_scratch,
+                        )
+                        self.vk.memory_barrier2(
+                            vis_slot,
+                            PIPELINE_AS_BUILD_KHR,
+                            Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR),
+                            PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
+                            Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
+                        )
+
+        # Inline TLAS Rebuild (`0` host allocations, `0` extra submit!)
+        if use_rt_frame and cur_slot < len(self.ring_tlas) and self.ring_tlas[cur_slot].handle != 0:
+            record_build_tlas_mixed_opaque(self.vk, vis_slot, self.ring_tlas[cur_slot], inst_da, n_inst, self.buf_as_scratch)
+            self.vk.memory_barrier2(
+                vis_slot,
                 PIPELINE_AS_BUILD_KHR,
                 Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR),
                 PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
                 Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
             )
 
-        self.render_graph.emit_pass_barriers(self.vk, cur_slot, 0)
+        self.render_graph.emit_pass_barriers(self.vk, vis_slot, 0)
         if worklist_count > 0:
             var q_mc = next_q
             if use_prof:
-                self.vk.write_timestamp(cur_slot, q_mc, PIPELINE_TOP)
+                self.vk.write_timestamp(vis_slot, q_mc, PIPELINE_TOP)
                 next_q += 2
                 prof_pairs.append((String("MeshletCull"), q_mc))
             var push_cull = List[UInt32](length=16, fill=0)
@@ -4302,8 +6419,9 @@ struct FlintAaaVulkanRenderer(Movable):
             push_cull[6] = bitcast[DType.uint32](self.max_lod_error_px)
             push_cull[7] = 0  # Phase 1: cull_phase = 0
             push_cull[8] = UInt32(self.hiz_mip_levels)
+            push_cull[9] = UInt32(0)  # draw_pairs_base = 0
             self.vk.dispatch_aaa(
-                cur_slot,
+                vis_slot,
                 self.pipe_meshlet_cull,
                 self.pipe_layout,
                 self.desc_sets_cull_p1[cur_slot],
@@ -4312,56 +6430,59 @@ struct FlintAaaVulkanRenderer(Movable):
                 1,
             )
             if use_prof:
-                self.vk.write_timestamp(cur_slot, q_mc + 1, PIPELINE_BOTTOM)
-            self.render_graph.emit_pass_barriers(self.vk, cur_slot, 1)
+                self.vk.write_timestamp(vis_slot, q_mc + 1, PIPELINE_BOTTOM)
+            self.render_graph.emit_pass_barriers(self.vk, vis_slot, 1)
             self.vk.memory_barrier2(
-                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_READ)
+                vis_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_READ)
             )
-            self.vk.copy_buffer(cur_slot, self.buf_indirect, 0, rb_buf, 0, 4)
+            if rb_slot <= 0 or rb_slot - 1 >= len(self.readback_extra):
+                self.vk.copy_buffer(vis_slot, self.ring_indirect[cur_slot], 0, self.buf_ldr_readback, 0, 4)
+            else:
+                self.vk.copy_buffer(vis_slot, self.ring_indirect[cur_slot], 0, self.readback_extra[rb_slot - 1], 0, 4)
 
         # Hardware `VK_KHR_dynamic_rendering` 64-Bit Visibility Buffer + Reverse-Z Depth (Phase 1 Draw)
         var q_vb = next_q
         if use_prof:
-            self.vk.write_timestamp(cur_slot, q_vb, PIPELINE_TOP)
+            self.vk.write_timestamp(vis_slot, q_vb, PIPELINE_TOP)
             next_q += 2
             prof_pairs.append((String("VisBufferHwRaster"), q_vb))
-        if not self.render_graph.emit_pass_image_transition(self.vk, cur_slot, 1, self.rg_res_vis, self.vis_img):
+        if not self.render_graph.emit_pass_image_transition(self.vk, vis_slot, 1, self.rg_res_vis, self.vis_img):
             self.vk.transition_image(
-                cur_slot, self.vis_img, LAYOUT_COLOR_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE
+                vis_slot, self.vis_img, LAYOUT_COLOR_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE
             )
-        if not self.render_graph.emit_pass_image_transition(self.vk, cur_slot, 1, self.rg_res_depth, self.depth_img):
+        if not self.render_graph.emit_pass_image_transition(self.vk, vis_slot, 1, self.rg_res_depth, self.depth_img):
             self.vk.transition_image(
-                cur_slot, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE
+                vis_slot, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE
             )
         self.vk.begin_rendering(
-            cur_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, True, 0, 0, True, self.depth_img.view, True, 0.0
+            vis_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, True, 0, 0, True, self.depth_img.view, True, 0.0
         )
-        self.vk.set_viewport_and_scissor(cur_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
+        self.vk.set_viewport_and_scissor(vis_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
         if worklist_count > 0:
             var push_vb = List[UInt32](length=16, fill=0)
             push_vb[0] = 0
             push_vb[1] = bitcast[DType.uint32](jx_clip)
             push_vb[2] = bitcast[DType.uint32](jy_clip)
-            self.vk.bind_graphics_pipeline(cur_slot, self.pipe_visbuffer_gfx, self.pipe_layout, self.desc_set, push_vb)
-            self.vk.bind_index_buffer(cur_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
+            self.vk.bind_graphics_pipeline(vis_slot, self.pipe_visbuffer_gfx, self.pipe_layout, self.desc_set, push_vb)
+            self.vk.bind_index_buffer(vis_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
             self.vk.draw_indexed_indirect_count(
-                cur_slot,
-                self.buf_indirect,
+                vis_slot,
+                self.ring_indirect[cur_slot],
                 16,
-                self.buf_indirect,
+                self.ring_indirect[cur_slot],
                 0,
                 min(self.max_draws, worklist_count),
                 stride=20,
             )
-        self.vk.end_rendering(cur_slot)
+        self.vk.end_rendering(vis_slot)
 
         # Phase 2: Test occluded candidates against fresh current-frame multi-mip Hi-Z pyramid and draw disocclusions
         if n_inst > 0 and self.enable_hiz_cull and self.hiz_valid and self.frame_index > 0 and not cam_teleported:
             # Construct / downsample current frame Hi-Z depth pyramid (`D32_SFLOAT` -> multi-mip `R32_SFLOAT` min-reduction)
             self.vk.transition_image(
-                cur_slot, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+                vis_slot, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
             )
-            self._record_hiz_downsample(cur_slot)
+            self._record_hiz_downsample(vis_slot)
 
             # Phase 2 cull over candidates in self.buf_occluded_candidates
             var push_cull_p2 = List[UInt32](length=16, fill=0)
@@ -4374,8 +6495,9 @@ struct FlintAaaVulkanRenderer(Movable):
             push_cull_p2[6] = bitcast[DType.uint32](self.max_lod_error_px)
             push_cull_p2[7] = 1  # Phase 2: cull_phase = 1
             push_cull_p2[8] = UInt32(self.hiz_mip_levels)
+            push_cull_p2[9] = UInt32(self.max_draws)  # draw_pairs_base = max_draws
             self.vk.dispatch_aaa(
-                cur_slot,
+                vis_slot,
                 self.pipe_meshlet_cull,
                 self.pipe_layout,
                 self.desc_sets_cull_p2[cur_slot],
@@ -4384,33 +6506,32 @@ struct FlintAaaVulkanRenderer(Movable):
                 1,
             )
             self.vk.memory_barrier2(
-                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_DRAW_INDIRECT, Int(ACCESS_INDIRECT_READ)
+                vis_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_DRAW_INDIRECT, Int(ACCESS_INDIRECT_READ)
             )
 
             # Phase 2 Disocclusion Draw (LOAD existing VisBuffer & Depth, append newly visible meshlets)
-            # Note: `vis_img` stayed in `LAYOUT_COLOR_ATTACHMENT` since Phase 1; emit a color-attachment barrier (no duplicate transition).
             self.vk.memory_barrier2(
-                cur_slot,
+                vis_slot,
                 PIPELINE_COLOR_ATTACHMENT_OUTPUT,
                 Int(ACCESS_COLOR_ATTACHMENT_WRITE),
                 PIPELINE_COLOR_ATTACHMENT_OUTPUT,
                 Int(ACCESS_COLOR_ATTACHMENT_WRITE),
             )
             self.vk.transition_image(
-                cur_slot, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE
+                vis_slot, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE
             )
             self.vk.begin_rendering(
-                cur_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, False, 0, 0, True, self.depth_img.view, False, 0.0
+                vis_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, False, 0, 0, True, self.depth_img.view, False, 0.0
             )
-            self.vk.set_viewport_and_scissor(cur_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
+            self.vk.set_viewport_and_scissor(vis_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
             var push_vb2 = List[UInt32](length=16, fill=0)
             push_vb2[0] = 0
             push_vb2[1] = bitcast[DType.uint32](jx_clip)
             push_vb2[2] = bitcast[DType.uint32](jy_clip)
-            self.vk.bind_graphics_pipeline(cur_slot, self.pipe_visbuffer_gfx, self.pipe_layout, self.desc_set, push_vb2)
-            self.vk.bind_index_buffer(cur_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
+            self.vk.bind_graphics_pipeline(vis_slot, self.pipe_visbuffer_gfx, self.pipe_layout, self.desc_set, push_vb2)
+            self.vk.bind_index_buffer(vis_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
             self.vk.draw_indexed_indirect_count(
-                cur_slot,
+                vis_slot,
                 self.buf_indirect_phase2,
                 16,
                 self.buf_indirect_phase2,
@@ -4418,83 +6539,114 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.max_draws,
                 stride=20,
             )
-            self.vk.end_rendering(cur_slot)
+            self.vk.end_rendering(vis_slot)
 
         # Bucket 2 Hardware Alpha-Cutout VisBuffer Raster (`pipe_visbuffer_alphamask_gfx`, `early_depth = False`, `CULL_MODE_NONE`)
-        if am_vis_draws > 0:
+        if am_vis_draws > 0 and self._ensure_visbuffer_alphamask_pipeline() != 0:
             self.vk.memory_barrier2(
-                cur_slot,
+                vis_slot,
                 PIPELINE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_LATE_FRAGMENT_TESTS,
                 Int(ACCESS_COLOR_ATTACHMENT_WRITE | ACCESS_DEPTH_ATTACHMENT_WRITE),
                 PIPELINE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_EARLY_FRAGMENT_TESTS | PIPELINE_LATE_FRAGMENT_TESTS,
                 Int(ACCESS_COLOR_ATTACHMENT_WRITE | ACCESS_DEPTH_ATTACHMENT_READ | ACCESS_DEPTH_ATTACHMENT_WRITE),
             )
             self.vk.begin_rendering(
-                cur_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, False, 0, 0, True, self.depth_img.view, False, 0.0
+                vis_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, False, 0, 0, True, self.depth_img.view, False, 0.0
             )
-            self.vk.set_viewport_and_scissor(cur_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
+            self.vk.set_viewport_and_scissor(vis_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
             var push_vb_am = List[UInt32](length=16, fill=0)
             push_vb_am[0] = 0
             push_vb_am[1] = bitcast[DType.uint32](jx_clip)
             push_vb_am[2] = bitcast[DType.uint32](jy_clip)
-            self.vk.bind_graphics_pipeline(cur_slot, self.pipe_visbuffer_alphamask_gfx, self.pipe_layout, self.desc_set, push_vb_am)
-            self.vk.bind_index_buffer(cur_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
+            self.vk.bind_graphics_pipeline(vis_slot, self.pipe_visbuffer_alphamask_gfx, self.pipe_layout, self.desc_set, push_vb_am)
+            self.vk.bind_index_buffer(vis_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
             self.vk.draw_indexed_indirect(
-                cur_slot,
-                self.buf_alphamask_indirect,
+                vis_slot,
+                self.ring_alphamask_indirect[cur_slot],
                 16,
                 am_vis_draws,
                 stride=20,
             )
-            self.vk.end_rendering(cur_slot)
+            self.vk.end_rendering(vis_slot)
 
         # Hardware Clip-Space Variable-Width Per-Vertex Outline Pass (`pipe_npr_outline_gfx`, `CULL_MODE_FRONT`, Reverse-Z)
-        if outline_vis_draws > 0 and self.pipe_npr_outline_gfx != 0:
+        if outline_vis_draws > 0 and self._ensure_npr_outline_pipeline() != 0:
             self.vk.memory_barrier2(
-                cur_slot,
+                vis_slot,
                 PIPELINE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_LATE_FRAGMENT_TESTS,
                 Int(ACCESS_COLOR_ATTACHMENT_WRITE | ACCESS_DEPTH_ATTACHMENT_WRITE),
                 PIPELINE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_EARLY_FRAGMENT_TESTS | PIPELINE_LATE_FRAGMENT_TESTS,
                 Int(ACCESS_COLOR_ATTACHMENT_WRITE | ACCESS_DEPTH_ATTACHMENT_READ | ACCESS_DEPTH_ATTACHMENT_WRITE),
             )
             self.vk.begin_rendering(
-                cur_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, False, 0, 0, True, self.depth_img.view, False, 0.0
+                vis_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, False, 0, 0, True, self.depth_img.view, False, 0.0
             )
-            self.vk.set_viewport_and_scissor(cur_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
+            self.vk.set_viewport_and_scissor(vis_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
             var push_out = List[UInt32](length=16, fill=0)
             push_out[0] = 0
             push_out[1] = bitcast[DType.uint32](jx_clip)
             push_out[2] = bitcast[DType.uint32](jy_clip)
             push_out[3] = UInt32(self.render_w)
             push_out[4] = UInt32(self.render_h)
-            self.vk.bind_graphics_pipeline(cur_slot, self.pipe_npr_outline_gfx, self.pipe_layout, self.desc_set, push_out)
-            self.vk.bind_index_buffer(cur_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
+            self.vk.bind_graphics_pipeline(vis_slot, self.pipe_npr_outline_gfx, self.pipe_layout, self.desc_set, push_out)
+            self.vk.bind_index_buffer(vis_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
             self.vk.draw_indexed_indirect(
-                cur_slot,
-                self.buf_outline_indirect,
+                vis_slot,
+                self.ring_outline_indirect[cur_slot],
                 16,
                 outline_vis_draws,
                 stride=20,
             )
-            self.vk.end_rendering(cur_slot)
+            self.vk.end_rendering(vis_slot)
 
-        self.render_graph.emit_pass_barriers(self.vk, cur_slot, 2)
-        if not self.render_graph.emit_pass_image_transition(self.vk, cur_slot, 2, self.rg_res_vis, self.vis_img):
+        self.render_graph.emit_pass_barriers(self.vk, vis_slot, 2)
+        if not self.render_graph.emit_pass_image_transition(self.vk, vis_slot, 2, self.rg_res_vis, self.vis_img):
             self.vk.transition_image(
-                cur_slot, self.vis_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+                vis_slot, self.vis_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
             )
-        if not self.render_graph.emit_pass_image_transition(self.vk, cur_slot, 2, self.rg_res_depth, self.depth_img):
+        if not self.render_graph.emit_pass_image_transition(self.vk, vis_slot, 2, self.rg_res_depth, self.depth_img):
             self.vk.transition_image(
-                cur_slot, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+                vis_slot, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
             )
         # Refresh multi-mip Hi-Z pyramid from the final frame depth for next frame's Phase 1 occlusion cull
         if n_inst > 0 and self.enable_hiz_cull:
-            self._record_hiz_downsample(cur_slot)
+            self._record_hiz_downsample(vis_slot)
         if use_prof:
-            self.vk.write_timestamp(cur_slot, q_vb + 1, PIPELINE_BOTTOM)
+            self.vk.write_timestamp(vis_slot, q_vb + 1, PIPELINE_BOTTOM)
 
-        # VSM Mark Visible Virtual Shadow Pages (16k x 16k)
-        if vsm_active:
+        # VSM Mark Visible Virtual Shadow Pages (16k x 16k): Async Compute (`submit_side`) when available, else inline!
+        var f_side: UInt64 = 0
+        if use_async_vsm:
+            if not single_cmd_buf:
+                self.vk.memory_barrier2(vis_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
+            var f_vis = self.vk.submit_with_wait(vis_slot, self.vk.timeline, self.prev_submitted_fence, PIPELINE_TOP)
+            if f_vis == 0:
+                return False
+            self.prev_submitted_fence = 0
+
+            var side_slot = self.side_cmd_base + cur_slot
+            if not self.vk.begin_commands(side_slot):
+                return False
+            var push_vm = List[UInt32](length=16, fill=0)
+            push_vm[0] = UInt32(self.render_w)
+            push_vm[1] = UInt32(self.render_h)
+            self.vk.dispatch_aaa(
+                side_slot, self.pipe_vsm_mark, self.pipe_layout, self.desc_set, push_vm, (self.render_w + 7) // 8, (self.render_h + 7) // 8
+            )
+            self.vk.memory_barrier2(side_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_HOST | PIPELINE_COMPUTE, Int(ACCESS_HOST_READ | ACCESS_SHADER_READ))
+            f_side = self.vk.submit_side(side_slot, self.vk.timeline, f_vis, PIPELINE_COMPUTE)
+            if f_side == 0:
+                return False
+            self.last_async_compute_submits += 1
+
+            if not single_cmd_buf:
+                if not self.vk.wait(f_vis) or not self.vk.wait_side(f_side):
+                    return False
+                f_side = 0
+            else:
+                if not self.vk.begin_commands(cur_slot):
+                    return False
+        elif vsm_active:
             var q_vm = next_q
             if use_prof:
                 self.vk.write_timestamp(cur_slot, q_vm, PIPELINE_TOP)
@@ -4512,36 +6664,47 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Synchronous Frame-0 / Camera-Teleport VSM Page Readback (skipped in warmed-up single-command-buffer gameplay!)
         if not single_cmd_buf:
-            self.vk.memory_barrier2(cur_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
-            var f_group_a = self.vk.submit(cur_slot)
-            if f_group_a == 0 or not self.vk.wait(f_group_a):
-                return False
+            if not use_async_vsm:
+                self.vk.memory_barrier2(cur_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
+                var f_group_a = self.vk.submit_with_wait(cur_slot, self.vk.timeline, self.prev_submitted_fence, PIPELINE_TOP)
+                self.prev_submitted_fence = 0
+                if f_group_a == 0 or not self.vk.wait(f_group_a):
+                    return False
             self.last_culled_meshlet_draws = Int(get32(self.buf_ldr_readback.cpu_address))
             self.vsm_warmed_up = True
 
             var tbl = List[UInt32](length=VSM_TABLE_WORDS, fill=0)
-            _ = external_call["memcpy", Int](Int(tbl.unsafe_ptr()), self.buf_vsm_table.cpu_address, VSM_TABLE_WORDS * 4)
+            _ = external_call["memcpy", Int](Int(tbl.unsafe_ptr()), self.ring_vsm_table[cur_slot].cpu_address, VSM_TABLE_WORDS * 4)
             var saved_reqs = List[Int]()
             for v_i in range(16384):
                 if tbl[16384 + v_i] != 0:
                     saved_reqs.append(v_i)
             var pages = self.vsm.process_requests(tbl)
-            # Preserve GPU-marked request flags in `buf_vsm_table` so the next static frame runs `single_cmd_buf = True` and hits cache!
+            # Preserve GPU-marked request flags in `ring_vsm_table` so the next static frame runs `single_cmd_buf = True` and hits cache!
             for v_i in saved_reqs:
                 tbl[16384 + v_i] = 1
-            _ = external_call["memcpy", Int](self.buf_vsm_table.cpu_address, Int(tbl.unsafe_ptr()), VSM_TABLE_WORDS * 4)
+            _ = external_call["memcpy", Int](self.ring_vsm_table[cur_slot].cpu_address, Int(tbl.unsafe_ptr()), VSM_TABLE_WORDS * 4)
             _ = len(tbl)
             for pg in pages:
                 vsm_allocs.append((pg.vx, pg.vy, pg.px, pg.py))
             if len(vsm_allocs) > 0 and (self.last_culled_meshlet_draws > 0 or am_vis_draws > 0):
-                var packed_vsm = self._pack_vsm_indirect_commands(n_inst, light_vp, vsm_allocs)
+                var packed_vsm = self._pack_vsm_indirect_commands(cur_slot, n_inst, light_vp, vsm_allocs)
+                vsm_draws = packed_vsm[0]
                 vsm_page_offsets = packed_vsm[1].copy()
                 vsm_page_counts = packed_vsm[2].copy()
                 vsm_page_am_offsets = packed_vsm[3].copy()
                 vsm_page_am_counts = packed_vsm[4].copy()
+                sl_vsm_ind = packed_vsm[5]
+                sl_vsm_pairs = packed_vsm[6]
 
             if not self.vk.begin_commands(cur_slot):
                 return False
+            if vsm_draws > 0:
+                self.staging_ring.record_copy(self.vk, cur_slot, cur_slot, sl_vsm_ind, self.buf_vsm_indirect, 0)
+                self.staging_ring.record_copy(self.vk, cur_slot, cur_slot, sl_vsm_pairs, self.ring_draw_pairs[cur_slot], (4 * self.max_draws) * 8)
+                self.vk.memory_barrier2(
+                    cur_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_DRAW_INDIRECT | PIPELINE_VERTEX_SHADER, Int(ACCESS_INDIRECT_READ | ACCESS_SHADER_READ)
+                )
 
         # ====================================================================
         # PASS GROUP B: VSM Indirect Tile Raster + 2-Tier Lumen Surface-Cache +
@@ -4591,7 +6754,7 @@ struct FlintAaaVulkanRenderer(Movable):
                         var p_off = vsm_page_offsets[p_idx]
                         self.vk.bind_graphics_pipeline(cur_slot, self.pipe_vsm_gfx, self.pipe_layout, self.desc_set, push_vsm)
                         self.vk.draw_indirect(cur_slot, self.buf_vsm_indirect, p_off * 16, p_cnt, stride=16)
-                    if p_am_cnt > 0:
+                    if p_am_cnt > 0 and self._ensure_vsm_alphamask_pipeline() != 0:
                         var p_am_off = vsm_page_am_offsets[p_idx]
                         self.vk.bind_graphics_pipeline(cur_slot, self.pipe_vsm_alphamask_gfx, self.pipe_layout, self.desc_set, push_vsm)
                         self.vk.draw_indirect(cur_slot, self.buf_vsm_indirect, p_am_off * 16, p_am_cnt, stride=16)
@@ -4605,6 +6768,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Update Lumen Direct + Indirect Mesh Surface Cache (only required when RT GI multi-bounce is active!)
         if use_rt_frame and self.enable_rt_gi and sc_inst_count > 0:
+            _ = self._ensure_surfcache_pipeline()
             var q_sc = next_q
             if use_prof and q_sc + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_sc, PIPELINE_TOP)
@@ -4662,6 +6826,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # `16 x 9 x 24` Logarithmic-Z GPU Clustered Punctual + Heitz `LTC` Area Light Culler (`V18`)!
         if n_cl_lights > 0 and not self.furnace_white_dome:
+            _ = self._ensure_cluster_cull_pipeline()
             var q_cl = next_q
             if use_prof and q_cl + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_cl, PIPELINE_TOP)
@@ -4693,6 +6858,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var frox_out = froxel_pong_word_offset(max_pix) if (self.frame_index & 1) == 0 else froxel_ping_word_offset(max_pix)
         var frox_prefix = froxel_prefix_lut_word_offset(max_pix)
         if run_froxel or run_rain:
+            self._ensure_froxel_pipelines()
             var q_fi = next_q
             if use_prof and q_fi + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_fi, PIPELINE_TOP)
@@ -4740,6 +6906,8 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Soft RT sun shadows: area-sun trace + penumbra-sized edge-stopped denoise (`aaa_rt_shadow.mojo`)
         var rt_sun_flt_off = 0
+        if self.enable_rt_shadows and self.vk.has_ray_query and n_inst > 0 and not self.furnace_white_dome:
+            self._ensure_rt_shadow_pipelines()
         if (
             self.enable_rt_shadows
             and self.vk.has_ray_query
@@ -4786,11 +6954,69 @@ struct FlintAaaVulkanRenderer(Movable):
         )
         self.render_graph.emit_pass_barriers(self.vk, cur_slot, 3)
         var spec_in_off = spec_reblur_raw_offset(max_pix)
+        var tile_base = tile_classify_word_offset(max_pix)
+        var tiles_x_sh = (self.render_w + 7) // 8
+        var tiles_y_sh = (self.render_h + 7) // 8
+        var num_tiles_sh = max(1, tiles_x_sh * tiles_y_sh)
         var q_sh = next_q
         if use_prof and q_sh + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_sh, PIPELINE_TOP)
             next_q += 2
             prof_pairs.append((String("DeferredMultiLobeRtShade"), q_sh))
+
+        self.vk.fill_buffer(cur_slot, self.buf_post_scratch, tile_base * 4, AAA_SHADE_CLASS_COUNT * 4 * 4, 0)
+        self.vk.memory_barrier2(
+            cur_slot,
+            PIPELINE_TRANSFER,
+            Int(ACCESS_TRANSFER_WRITE),
+            PIPELINE_COMPUTE,
+            Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE),
+        )
+
+        var push_tc = List[UInt32](length=16, fill=0)
+        push_tc[0] = UInt32(self.render_w)
+        push_tc[1] = UInt32(self.render_h)
+        push_tc[2] = UInt32(len(self.materials))
+        push_tc[7] = UInt32(tile_base)
+        push_tc[8] = UInt32(num_tiles_sh)
+        self.vk.dispatch_aaa(
+            cur_slot,
+            self.pipe_tile_classify,
+            self.pipe_layout,
+            self.desc_set,
+            push_tc,
+            tiles_x_sh,
+            tiles_y_sh,
+        )
+        self.vk.memory_barrier2(
+            cur_slot,
+            PIPELINE_COMPUTE,
+            Int(ACCESS_SHADER_WRITE),
+            PIPELINE_DRAW_INDIRECT | PIPELINE_COMPUTE | PIPELINE_TRANSFER,
+            Int(ACCESS_INDIRECT_READ | ACCESS_SHADER_READ | ACCESS_TRANSFER_READ),
+        )
+        if do_readback:
+            if rb_slot <= 0 or rb_slot - 1 >= len(self.readback_extra):
+                for cls_i in range(AAA_SHADE_CLASS_COUNT):
+                    self.vk.copy_buffer(
+                        cur_slot,
+                        self.buf_post_scratch,
+                        (tile_base + cls_i * 4) * 4,
+                        self.buf_ldr_readback,
+                        12 + cls_i * 4,
+                        4,
+                    )
+            else:
+                for cls_i in range(AAA_SHADE_CLASS_COUNT):
+                    self.vk.copy_buffer(
+                        cur_slot,
+                        self.buf_post_scratch,
+                        (tile_base + cls_i * 4) * 4,
+                        self.readback_extra[rb_slot - 1],
+                        12 + cls_i * 4,
+                        4,
+                    )
+
         var push_sh = List[UInt32](length=16, fill=0)
         push_sh[0] = UInt32(self.render_w)
         push_sh[1] = UInt32(self.render_h)
@@ -4799,21 +7025,28 @@ struct FlintAaaVulkanRenderer(Movable):
         push_sh[4] = UInt32(1) if run_spec_reblur else UInt32(0)
         push_sh[5] = UInt32(spec_in_off)
         push_sh[6] = UInt32(rt_sun_flt_off)
-        self.vk.dispatch_aaa(
-            cur_slot,
-            self.pipe_deferred_shade,
-            self.pipe_layout,
-            self.desc_set,
-            push_sh,
-            (self.render_w + 7) // 8,
-            (self.render_h + 7) // 8,
-        )
+        push_sh[8] = UInt32(len(self.materials))
+        for cls_i in range(AAA_SHADE_CLASS_COUNT):
+            if self._has_material_class(cls_i):
+                var c_pipe = self._ensure_shade_class_pipeline(cls_i)
+                if c_pipe != 0:
+                    push_sh[7] = UInt32(tile_base + AAA_SHADE_CLASS_COUNT * 4 + cls_i * num_tiles_sh)
+                    self.vk.dispatch_indirect_aaa(
+                        cur_slot,
+                        c_pipe,
+                        self.pipe_layout,
+                        self.desc_set,
+                        push_sh,
+                        self.buf_post_scratch,
+                        (tile_base + cls_i * 4) * 4,
+                    )
         if use_prof and q_sh + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_sh + 1, PIPELINE_BOTTOM)
         self.render_graph.emit_pass_barriers(self.vk, cur_slot, 4)
 
         # `SVGF` Temporal Reprojection + Moments Variance Edge-Stopping `À-Trous` Denoiser
         if run_svgf:
+            self._ensure_svgf_pipelines()
             var q_sv = next_q
             if use_prof and q_sv + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_sv, PIPELINE_TOP)
@@ -4867,6 +7100,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # `NRD ReBLUR`-Lite Dual Virtual-Depth Spatiotemporal Specular Denoiser!
         if run_spec_reblur:
+            self._ensure_spec_reblur_pipelines()
             var q_rb = next_q
             if use_prof and q_rb + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_rb, PIPELINE_TOP)
@@ -4930,7 +7164,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.spec_reblur_valid_frames = 0
 
         # Stylized Anime NPR Cel, Outline & Eroding 3D Mesh VFX Resolve (`aaa_npr_cel.mojo`, `aaa_npr_vfx.mojo`)
-        if (n_cel > 0 or n_vfx > 0) and self.pipe_npr_cel_shade != 0:
+        if (n_cel > 0 or n_vfx > 0) and self._ensure_npr_cel_pipeline() != 0:
             var q_cel = next_q
             if use_prof and q_cel + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_cel, PIPELINE_TOP)
@@ -4956,7 +7190,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.vk.write_timestamp(cur_slot, q_cel + 1, PIPELINE_BOTTOM)
 
         # Ray-traced refractive glass over the shaded, denoised frame (`aaa_glass.mojo`)
-        if frame_has_glass and use_rt_frame and self.pipe_glass_refract != 0 and not self.furnace_white_dome:
+        if frame_has_glass and use_rt_frame and not self.furnace_white_dome and self._ensure_glass_refract_pipeline() != 0:
             var q_gl = next_q
             if use_prof and q_gl + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_gl, PIPELINE_TOP)
@@ -4978,6 +7212,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # When Water or GPU Rain will write partial reactive weights into `b_oit`, clear `b_oit[react]` first!
         if run_water or run_rain:
+            _ = self._ensure_oit_vol_pipeline()
             var push_clr_react = List[UInt32](length=16, fill=0)
             push_clr_react[0] = UInt32(self.render_w)
             push_clr_react[1] = UInt32(self.render_h)
@@ -4998,6 +7233,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Dielectric `Beer-Lambert` Refracting + Caustic + Foaming Water Pass (`aaa_water.mojo`)!
         if run_water:
+            _ = self._ensure_water_refract_pipeline()
             var q_wt = next_q
             if use_prof and q_wt + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_wt, PIPELINE_TOP)
@@ -5039,6 +7275,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # 64-Slice Hillaire Froxel Prefix-LUT Composite + GPU Froxel-Lit 3D Rain Streaks!
         if run_froxel or run_rain:
+            self._ensure_froxel_pipelines()
             var q_fm = next_q
             if use_prof and q_fm + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_fm, PIPELINE_TOP)
@@ -5068,6 +7305,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # Per-Pixel 4-Node Exact `OIT` + 6-Way Lightmapped Volumetric Plumes + Fresnel Rim Holograms!
         self.render_graph.emit_pass_barriers(self.vk, cur_slot, 5)
         if len(self.frame_plumes) > 0 or not (run_water or run_rain):
+            _ = self._ensure_oit_vol_pipeline()
             if oit_plume_copy_bytes > 0:
                 self.vk.copy_buffer(
                     cur_slot, self.ring_oit_staging[cur_slot], 0, self.buf_oit_nodes, 0, oit_plume_copy_bytes
@@ -5139,6 +7377,7 @@ struct FlintAaaVulkanRenderer(Movable):
             var tiles_y = (self.render_h + 15) // 16
             var num_tiles = tiles_x * tiles_y
 
+            self._ensure_particle_pipelines()
             var push_pc = List[UInt32](length=16, fill=0)
             push_pc[0] = UInt32(t_cnt_off)
             push_pc[1] = UInt32(num_tiles)
@@ -5234,6 +7473,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Thin-Lens Polygonal Diaphragm Bokeh Depth-of-Field at Native `output_w x output_h`!
         if self.enable_bokeh_dof and not self.furnace_white_dome:
+            _ = self._ensure_bokeh_dof_pipeline()
             var q_dof = next_q
             if use_prof and q_dof + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_dof, PIPELINE_TOP)
@@ -5267,7 +7507,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.vk.write_timestamp(cur_slot, q_dof + 1, PIPELINE_BOTTOM)
 
         # Screen-Space Chromatic-Dispersion Shockwaves & Manga Impact Frame (`aaa_npr_vfx.mojo`)
-        if (n_sw > 0 or imp_blend > Float32(0.001)) and self.pipe_npr_post_fx != 0:
+        if (n_sw > 0 or imp_blend > Float32(0.001)) and self._ensure_npr_post_fx_pipeline() != 0:
             var q_npf = next_q
             if use_prof and q_npf + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_npf, PIPELINE_TOP)
@@ -5312,6 +7552,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var saved_bm_h = 0
         var safe_bloom_mip_off = AAA_POST_BLOOM_BASE + max_pix * 8
         if self.bloom_intensity > Float32(1e-4) and not self.furnace_white_dome:
+            self._ensure_bloom_pipelines()
             var q_bl = next_q
             if use_prof and q_bl + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_bl, PIPELINE_TOP)
@@ -5398,6 +7639,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Tile-Max `180°` Rotary-Shutter Motion Blur (`group = 16 x 16` at Native `output_w x output_h`)!
         if self.enable_motion_blur and self.motion_blur_shutter > Float32(0.001) and not self.furnace_white_dome:
+            _ = self._ensure_motion_blur_pipeline()
             var q_mb = next_q
             if use_prof and q_mb + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_mb, PIPELINE_TOP)
@@ -5440,6 +7682,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # GPU 64-Bin Log-Luminance Histogram & Bounded 95%-Trimmed Auto-Exposure!
         if self.enable_auto_exposure and not self.furnace_white_dome:
+            self._ensure_auto_exposure_pipelines()
             var q_ae = next_q
             if use_prof and q_ae + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_ae, PIPELINE_TOP)
@@ -5474,16 +7717,111 @@ struct FlintAaaVulkanRenderer(Movable):
             if use_prof and q_ae + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_ae + 1, PIPELINE_BOTTOM)
 
-        # Cinema Display Tonemap (`AgX` Toe + `+5.5 EV` Shoulder / `HDR10 PQ` / `Linear sRGB` + Windshield Rain)!
+        var scrgb_swapchain = self.vk.swapchain != 0 and self.vk.swapchain_format == FORMAT_R16G16B16A16_SFLOAT
+        # Keep `vis_img` in `LAYOUT_SHADER_READ_ONLY` across both readback and live-swapchain frames so
+        # post-frame `VisBufferGpuPicker` readbacks remain valid without aliasing hazards (`post_alias_img`
+        # has no live pass consumer).
+
+        var skipped_before = self.vk.skipped
+        var img_idx = NO_IMAGE
+        if self.vk.swapchain != 0:
+            img_idx = self.vk.acquire_image(cur_slot)
+
+        # Upload dirty SDF font atlas and stage UI primitives into DEVICE_LOCAL `buf_post_scratch` BEFORE any render pass
+        var prim_cnt = 0
+        var prims_word_offset = self.ui_prims_word_offset(cur_slot)
+        if self.ui_draw_list.count() > 0:
+            if (
+                self.ui_font.is_dirty()
+                and self.ui_font_atlas_slot >= 0
+                and self.ui_font_atlas_slot < len(self.bindless_images)
+                and self.bindless_images[self.ui_font_atlas_slot].image != 0
+            ):
+                var atlas_bytes = len(self.ui_font.atlas)
+                if atlas_bytes > 0:
+                    var sl_font = self.staging_ring.stage_bytes(
+                        self.vk, cur_slot, Int(self.ui_font.atlas.unsafe_ptr()), atlas_bytes, align=16
+                    )
+                    if sl_font.cpu_address != 0:
+                        var src_st = (
+                            PIPELINE_TOP
+                            if self.bindless_images[self.ui_font_atlas_slot].layout == LAYOUT_UNDEFINED
+                            else (PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER)
+                        )
+                        var src_ac = (
+                            UInt32(0)
+                            if self.bindless_images[self.ui_font_atlas_slot].layout == LAYOUT_UNDEFINED
+                            else ACCESS_SHADER_READ
+                        )
+                        self.vk.transition_image(
+                            cur_slot,
+                            self.bindless_images[self.ui_font_atlas_slot],
+                            LAYOUT_TRANSFER_TARGET,
+                            src_st,
+                            src_ac,
+                            PIPELINE_TRANSFER,
+                            ACCESS_TRANSFER_WRITE,
+                        )
+                        self.staging_ring.upload_to_image_subregion(
+                            self.vk,
+                            cur_slot,
+                            cur_slot,
+                            sl_font,
+                            self.bindless_images[self.ui_font_atlas_slot],
+                            0,
+                            0,
+                            self.ui_font.atlas_width,
+                            self.ui_font.atlas_height,
+                        )
+                        self.vk.transition_image(
+                            cur_slot,
+                            self.bindless_images[self.ui_font_atlas_slot],
+                            LAYOUT_SHADER_READ_ONLY,
+                            PIPELINE_TRANSFER,
+                            ACCESS_TRANSFER_WRITE,
+                            PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER,
+                            ACCESS_SHADER_READ,
+                        )
+                        self.ui_font.mark_clean()
+
+            var max_prims_fit = AAA_UI_PRIM_REGION_WORDS // 16
+            prim_cnt = min(self.ui_draw_list.count(), min(32768, max_prims_fit))
+            var prim_bytes = prim_cnt * 64
+            if prim_bytes > 0:
+                var sl_ui = self.staging_ring.stage_bytes(
+                    self.vk, cur_slot, Int(self.ui_draw_list.prims.unsafe_ptr()), prim_bytes
+                )
+                self.staging_ring.record_copy(self.vk, cur_slot, cur_slot, sl_ui, self.buf_post_scratch, prims_word_offset * 4)
+            self.vk.memory_barrier2(
+                cur_slot,
+                PIPELINE_TRANSFER | PIPELINE_COMPUTE,
+                Int(ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE),
+                PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER,
+                Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE),
+            )
+
+        # Direct-to-Swapchain Present vs Headless/Readback Display Tonemap + UI Overlay
+        var disp_tonemap_mode = UInt32(2) if self.display_mode == AAA_DISPLAY_SCRGB_FP16 else self.display_mode
+        var copy_w = min(self.output_w, self.vk.swapchain_width) if self.vk.swapchain != 0 else self.output_w
+        var copy_h = min(self.output_h, self.vk.swapchain_height) if self.vk.swapchain != 0 else self.output_h
+        var direct_live = (
+            self.vk.swapchain != 0
+            and (not scrgb_swapchain)
+            and (not do_readback)
+            and img_idx != NO_IMAGE
+            and copy_w > 0
+            and copy_h > 0
+        )
+        var is_srgb_sw = (self.vk.swapchain_format == 50) or (self.vk.swapchain_format == 43)
+
         var q_dt = next_q
         if use_prof and q_dt + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_dt, PIPELINE_TOP)
             next_q += 2
             prof_pairs.append((String("CinemaDisplayTonemap"), q_dt))
-        var disp_tonemap_mode = UInt32(2) if self.display_mode == AAA_DISPLAY_SCRGB_FP16 else self.display_mode
         var push_dt = List[UInt32](length=16, fill=0)
-        push_dt[0] = UInt32(self.output_w)
-        push_dt[1] = UInt32(self.output_h)
+        push_dt[0] = UInt32(copy_w if direct_live else self.output_w)
+        push_dt[1] = UInt32(copy_h if direct_live else self.output_h)
         push_dt[2] = UInt32(out_ldr_off)
         push_dt[3] = disp_tonemap_mode
         push_dt[4] = UInt32(1) if has_saved_bloom_mip else UInt32(0)
@@ -5492,15 +7830,69 @@ struct FlintAaaVulkanRenderer(Movable):
         push_dt[7] = UInt32(safe_bloom_mip_off)
         push_dt[8] = bitcast[DType.uint32](self.grade_saturation - Float32(1.0))
         push_dt[9] = bitcast[DType.uint32](self.grade_contrast - Float32(1.0))
-        self.vk.dispatch_aaa(
-            cur_slot,
-            self.pipe_display_tonemap,
-            self.pipe_layout,
-            self.desc_set,
-            push_dt,
-            (self.output_w + 7) // 8,
-            (self.output_h + 7) // 8,
-        )
+        push_dt[10] = UInt32(1) if is_srgb_sw else UInt32(0)
+
+        var direct_used_storage = False
+        var direct_used_gfx = False
+        if direct_live:
+            self._ensure_direct_present_compute_pipelines()
+            var use_storage_direct = (
+                self.vk.swapchain_has_storage
+                and self.vk.has_storage_write_without_format
+                and self.pipe_display_tonemap_direct != 0
+                and img_idx < len(self.vk.image_views)
+                and self.vk.image_views[img_idx] != 0
+            )
+            if use_storage_direct:
+                direct_used_storage = True
+                self.vk.write_aaa_storage_image(
+                    self.desc_set, self.swapchain_img_binding, self.vk.image_views[img_idx], LAYOUT_GENERAL
+                )
+                self.vk.transition_swapchain_image(
+                    cur_slot, img_idx, LAYOUT_GENERAL, PIPELINE_TOP, 0, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE
+                )
+                self.vk.dispatch_aaa(
+                    cur_slot,
+                    self.pipe_display_tonemap_direct,
+                    self.pipe_layout,
+                    self.desc_set,
+                    push_dt,
+                    (copy_w + 7) // 8,
+                    (copy_h + 7) // 8,
+                )
+            elif (
+                img_idx < len(self.vk.image_views)
+                and self.vk.image_views[img_idx] != 0
+                and self._ensure_direct_present_pipelines(self.vk.swapchain_format)
+            ):
+                direct_used_gfx = True
+                self.vk.transition_swapchain_image(
+                    cur_slot, img_idx, LAYOUT_COLOR_ATTACHMENT, PIPELINE_TOP, 0, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE
+                )
+                self.vk.begin_rendering(
+                    cur_slot, 0, 0, copy_w, copy_h, True, self.vk.image_views[img_idx], False, 0, 0, False, 0, False, 0.0
+                )
+                self.vk.set_viewport_and_scissor(cur_slot, 0, 0, copy_w, copy_h, flip_y=False)
+                self.vk.bind_graphics_pipeline(cur_slot, self.pipe_display_present_gfx, self.pipe_layout, self.desc_set, push_dt)
+                self.vk.draw(cur_slot, 3, 1)
+                if self.ui_draw_list.count() == 0:
+                    self.vk.end_rendering(cur_slot)
+                    self.vk.transition_swapchain_image(
+                        cur_slot, img_idx, LAYOUT_PRESENT, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_BOTTOM, 0
+                    )
+            else:
+                direct_live = False
+
+        if not direct_live:
+            self.vk.dispatch_aaa(
+                cur_slot,
+                self.pipe_display_tonemap,
+                self.pipe_layout,
+                self.desc_set,
+                push_dt,
+                (self.output_w + 7) // 8,
+                (self.output_h + 7) // 8,
+            )
         if use_prof and q_dt + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_dt + 1, PIPELINE_BOTTOM)
 
@@ -5512,59 +7904,90 @@ struct FlintAaaVulkanRenderer(Movable):
                 next_q += 2
                 prof_pairs.append((String("UiSdfOverlay"), q_ui))
 
-            # Sync dirty font atlas if modified
-            if self.ui_font.is_dirty() and self.ui_font_img.image != 0:
-                var atlas_bytes = len(self.ui_font.atlas)
-                self.ensure_staging_capacity(atlas_bytes)
-                _ = external_call["memcpy", Int](self.buf_staging.cpu_address, Int(self.ui_font.atlas.unsafe_ptr()), atlas_bytes)
-                self.vk.transition_image(cur_slot, self.ui_font_img, LAYOUT_TRANSFER_TARGET, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
-                self.vk.upload_image_subregion(cur_slot, self.ui_font_img, self.buf_staging, 0, 0, 0, self.ui_font.atlas_width, self.ui_font.atlas_height)
-                self.vk.transition_image(cur_slot, self.ui_font_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
-                self.ui_font.mark_clean()
-
-            # Upload GpuUiPrim structs into buf_post_scratch at AAA_POST_UI_PRIMS_BASE_OFFSET
-            var prims_word_offset = self.ui_prims_word_offset(cur_slot)
-            var max_prims_fit = AAA_UI_PRIM_REGION_WORDS // 16
-            var prim_cnt = min(self.ui_draw_list.count(), min(32768, max_prims_fit))
-            var prim_bytes = prim_cnt * 64
-            var prim_dst = self.buf_post_scratch.cpu_address + prims_word_offset * 4
-            if prim_bytes > 0:
-                _ = external_call["memcpy", Int](prim_dst, Int(self.ui_draw_list.prims.unsafe_ptr()), prim_bytes)
-
-            self.vk.memory_barrier2(
-                cur_slot,
-                PIPELINE_COMPUTE,
-                Int(ACCESS_SHADER_WRITE),
-                PIPELINE_COMPUTE,
-                Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE),
-            )
-
             var push_ui = List[UInt32](length=16, fill=0)
-            push_ui[0] = UInt32(self.output_w)
-            push_ui[1] = UInt32(self.output_h)
+            push_ui[0] = UInt32(copy_w if direct_live else self.output_w)
+            push_ui[1] = UInt32(copy_h if direct_live else self.output_h)
             push_ui[2] = UInt32(prim_cnt)
             push_ui[3] = UInt32(prims_word_offset)
             push_ui[4] = UInt32(out_ldr_off)
             push_ui[5] = disp_tonemap_mode
-            self.vk.dispatch_aaa(
-                cur_slot,
-                self.pipe_ui_overlay,
-                self.pipe_layout,
-                self.desc_set,
-                push_ui,
-                (self.output_w + 15) // 16,
-                (self.output_h + 15) // 16,
-            )
-            self.vk.memory_barrier2(
-                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE | PIPELINE_TRANSFER, Int(ACCESS_SHADER_READ | ACCESS_TRANSFER_READ)
-            )
+            push_ui[10] = UInt32(1) if is_srgb_sw else UInt32(0)
+
+            if direct_used_gfx:
+                self.vk.bind_graphics_pipeline(cur_slot, self.pipe_ui_present_gfx, self.pipe_layout, self.desc_set, push_ui)
+                self.vk.draw(cur_slot, 3, 1)
+                self.vk.end_rendering(cur_slot)
+                self.vk.transition_swapchain_image(
+                    cur_slot, img_idx, LAYOUT_PRESENT, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_BOTTOM, 0
+                )
+            elif direct_used_storage:
+                if self.pipe_ui_overlay_direct != 0:
+                    self.vk.memory_barrier2(
+                        cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+                    )
+                    self.vk.dispatch_aaa(
+                        cur_slot,
+                        self.pipe_ui_overlay_direct,
+                        self.pipe_layout,
+                        self.desc_set,
+                        push_ui,
+                        (copy_w + 15) // 16,
+                        (copy_h + 15) // 16,
+                    )
+                    self.vk.transition_swapchain_image(
+                        cur_slot, img_idx, LAYOUT_PRESENT, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_BOTTOM, 0
+                    )
+                elif self._ensure_direct_present_pipelines(self.vk.swapchain_format):
+                    self.vk.transition_swapchain_image(
+                        cur_slot,
+                        img_idx,
+                        LAYOUT_COLOR_ATTACHMENT,
+                        PIPELINE_COMPUTE,
+                        ACCESS_SHADER_WRITE,
+                        PIPELINE_COLOR_ATTACHMENT_OUTPUT,
+                        UInt32(0x80) | ACCESS_COLOR_ATTACHMENT_WRITE,
+                    )
+                    self.vk.begin_rendering(
+                        cur_slot, 0, 0, copy_w, copy_h, True, self.vk.image_views[img_idx], False, 0, 0, False, 0, False, 0.0
+                    )
+                    self.vk.set_viewport_and_scissor(cur_slot, 0, 0, copy_w, copy_h, flip_y=False)
+                    self.vk.bind_graphics_pipeline(cur_slot, self.pipe_ui_present_gfx, self.pipe_layout, self.desc_set, push_ui)
+                    self.vk.draw(cur_slot, 3, 1)
+                    self.vk.end_rendering(cur_slot)
+                    self.vk.transition_swapchain_image(
+                        cur_slot, img_idx, LAYOUT_PRESENT, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_BOTTOM, 0
+                    )
+                else:
+                    self.vk.transition_swapchain_image(
+                        cur_slot, img_idx, LAYOUT_PRESENT, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_BOTTOM, 0
+                    )
+            else:
+                self.vk.memory_barrier2(
+                    cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+                )
+                self.vk.dispatch_aaa(
+                    cur_slot,
+                    self.pipe_ui_overlay,
+                    self.pipe_layout,
+                    self.desc_set,
+                    push_ui,
+                    (self.output_w + 15) // 16,
+                    (self.output_h + 15) // 16,
+                )
+                self.vk.memory_barrier2(
+                    cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE | PIPELINE_TRANSFER, Int(ACCESS_SHADER_READ | ACCESS_TRANSFER_READ)
+                )
             if use_prof and q_ui + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_ui + 1, PIPELINE_BOTTOM)
+        elif direct_used_storage:
+            self.vk.transition_swapchain_image(
+                cur_slot, img_idx, LAYOUT_PRESENT, PIPELINE_COMPUTE, ACCESS_SHADER_WRITE, PIPELINE_BOTTOM, 0
+            )
 
         # Extended Linear scRGB `R16G16B16A16_SFLOAT` (`8` bytes/pixel `RGBA16F`, `1.0 = 80 nits`) Output Pack!
-        var scrgb_swapchain = self.vk.swapchain != 0 and self.vk.swapchain_format == FORMAT_R16G16B16A16_SFLOAT
         var want_scrgb_fp16 = (self.display_mode == AAA_DISPLAY_SCRGB_FP16) or scrgb_swapchain
         if want_scrgb_fp16:
+            _ = self._ensure_scrgb_pack_pipeline()
             var push_scrgb = List[UInt32](length=16, fill=0)
             push_scrgb[0] = UInt32(self.output_w)
             push_scrgb[1] = UInt32(self.output_h)
@@ -5588,22 +8011,17 @@ struct FlintAaaVulkanRenderer(Movable):
             )
 
         # Feature 13 & 14: Presentation & Ring Synchronization (skip PCIe DMA readback on live swapchain unless forced!)
-        var do_readback = capture_readback or force_readback or self.force_readback or (self.vk.swapchain == 0)
         if do_readback:
             # DMA-copy final LDR frame + adapted exposure from `DEVICE_LOCAL` VRAM into `HOST_CACHED` readback memory
-            # (`buf_ldr_readback`, or this slot's ring buffer in deferred-readback mode).
             self.vk.memory_barrier2(
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_READ)
             )
-            self.vk.copy_buffer(cur_slot, self.buf_post_scratch, AAA_POST_ADAPTED_EXP_WORD * 4, rb_buf, 4, 8)
-            self.vk.copy_buffer(
-                cur_slot,
-                self.buf_history,
-                out_ldr_off * 4,
-                rb_buf,
-                64,
-                self.output_w * self.output_h * 4,
-            )
+            if rb_slot <= 0 or rb_slot - 1 >= len(self.readback_extra):
+                self.vk.copy_buffer(cur_slot, self.buf_post_scratch, AAA_POST_ADAPTED_EXP_WORD * 4, self.buf_ldr_readback, 4, 8)
+                self.vk.copy_buffer(cur_slot, self.buf_history, out_ldr_off * 4, self.buf_ldr_readback, 64, self.output_w * self.output_h * 4)
+            else:
+                self.vk.copy_buffer(cur_slot, self.buf_post_scratch, AAA_POST_ADAPTED_EXP_WORD * 4, self.readback_extra[rb_slot - 1], 4, 8)
+                self.vk.copy_buffer(cur_slot, self.buf_history, out_ldr_off * 4, self.readback_extra[rb_slot - 1], 64, self.output_w * self.output_h * 4)
             self.vk.memory_barrier2(cur_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
         if frame_q >= 0:
             self.vk.write_timestamp(cur_slot, frame_q + 1, PIPELINE_BOTTOM)
@@ -5611,13 +8029,12 @@ struct FlintAaaVulkanRenderer(Movable):
         var t_submit0 = get_time()
         self.last_cpu_record_ms = (t_submit0 - t_record0) * 1000.0
         var async_swapchain_submit = False
+        var wait_sem = self.vk.side_timeline if f_side > 0 else (self.vk.timeline if self.prev_submitted_fence > 0 else 0)
+        var wait_val = f_side if f_side > 0 else self.prev_submitted_fence
+        var wait_stg = PIPELINE_TOP
         if self.vk.swapchain != 0:
-            var skipped_before = self.vk.skipped
-            var img_idx = self.vk.acquire_image(cur_slot)
             if img_idx != NO_IMAGE:
-                var copy_w = min(self.output_w, self.vk.swapchain_width)
-                var copy_h = min(self.output_h, self.vk.swapchain_height)
-                if copy_w > 0 and copy_h > 0:
+                if (not direct_live) and copy_w > 0 and copy_h > 0:
                     if scrgb_swapchain:
                         # Copy 8-byte/pixel `R16G16B16A16_SFLOAT` Extended Linear scRGB buffer (NEVER 4-byte PQ words!)
                         self.vk.copy_to_image(
@@ -5639,23 +8056,39 @@ struct FlintAaaVulkanRenderer(Movable):
                             copy_w,
                             copy_h,
                         )
-                var f = self.vk.submit_and_present(cur_slot, img_idx)
+                var f = self.vk.submit_and_present(
+                    cur_slot,
+                    img_idx,
+                    extra_wait_sem=wait_sem,
+                    extra_wait_val=wait_val,
+                    extra_wait_stage=wait_stg,
+                )
                 self.frame_fences[cur_slot] = f
+                self.prev_submitted_fence = f
                 if self.vk.skipped > skipped_before:
                     # `vkQueuePresentKHR` returned `VK_ERROR_OUT_OF_DATE_KHR`: flag swapchain recreation.
                     self.swapchain_out_of_date = True
                 if do_readback and f != 0:
-                    _ = self.vk.wait(f)
+                    var ok_w = self.vk.wait(f)
                     self.frame_fences[cur_slot] = 0
+                    self.prev_submitted_fence = 0
+                    self._flush_slot_retirements(cur_slot)
+                    if not ok_w:
+                        return False
                 elif f != 0:
                     async_swapchain_submit = True
             else:
                 # `NO_IMAGE` / `VK_ERROR_OUT_OF_DATE_KHR`: finish command buffer, flag swapchain resize, and sync targets!
-                var f = self.vk.submit(cur_slot)
+                var f = self.vk.submit_with_wait(cur_slot, wait_sem, wait_val, wait_stg)
                 self.frame_fences[cur_slot] = f
                 if f != 0:
-                    _ = self.vk.wait(f)
+                    var ok_w = self.vk.wait(f)
                     self.frame_fences[cur_slot] = 0
+                    self.prev_submitted_fence = 0
+                    self._flush_slot_retirements(cur_slot)
+                    if not ok_w:
+                        return False
+                self.prev_submitted_fence = 0
                 self.swapchain_out_of_date = True
                 if (
                     self.vk.swapchain_width > 0
@@ -5664,17 +8097,24 @@ struct FlintAaaVulkanRenderer(Movable):
                 ):
                     _ = self.resize(self.vk.swapchain_width, self.vk.swapchain_height)
         else:
-            var f = self.vk.submit(cur_slot)
+            var f = self.vk.submit_with_wait(cur_slot, wait_sem, wait_val, wait_stg)
             self.frame_fences[cur_slot] = f
-            if defer_this and f != 0:
+            self.prev_submitted_fence = f
+            if f == 0:
+                return False
+            if defer_this:
                 # Phase A: do not wait; the next `render_frame()` (or `flush_deferred_frame()`) retires it.
                 self.pending_slot = cur_slot
                 self.pending_prof_pairs = prof_pairs.copy()
                 self.pending_frame_q = frame_q
                 self.pending_n_inst = n_inst
-            elif do_readback and f != 0:
-                _ = self.vk.wait(f)
+            elif do_readback:
+                var ok_w = self.vk.wait(f)
                 self.frame_fences[cur_slot] = 0
+                self.prev_submitted_fence = 0
+                self._flush_slot_retirements(cur_slot)
+                if not ok_w:
+                    return False
         self.last_cpu_submit_wait_ms = (get_time() - t_submit0) * 1000.0
 
         if async_swapchain_submit:
@@ -5685,9 +8125,13 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.slot_frame_q[cur_slot] = frame_q
                 self.slot_has_pending_queries[cur_slot] = True
         elif self.pending_slot < 0:
-            if single_cmd_buf and do_readback:
+            if do_readback:
                 self.last_culled_meshlet_draws = Int(get32(self.buf_ldr_readback.cpu_address)) if n_inst > 0 else 0
                 self.readback_ready_slot = 0
+                var tc_rb = self._readback_address()
+                if tc_rb != 0:
+                    for cls_i in range(AAA_SHADE_CLASS_COUNT):
+                        self.last_tile_classify_counts[cls_i] = Int(get32(tc_rb + 12 + cls_i * 4))
 
             # Read hardware `VkQueryPool` 64-bit GPU timestamps and convert delta ticks -> nanoseconds/milliseconds!
             self._read_gpu_timings(prof_pairs, frame_q)
@@ -5720,12 +8164,6 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.last_frame_gpu_ms = Float64(q_buf[1] - q_buf[0]) * self.vk.timestamp_period * 1.0e-6
         _ = len(q_buf)
 
-    def _readback_buffer(self, slot: Int) -> GpuBuffer:
-        """Readback buffer for ring `slot` (slot 0 and the synchronous path use `buf_ldr_readback`)."""
-        if slot <= 0 or slot - 1 >= len(self.readback_extra):
-            return self.buf_ldr_readback.copy()
-        return self.readback_extra[slot - 1].copy()
-
     def _readback_address(self) -> Int:
         """`cpu_address` of the readback buffer holding the latest completed frame."""
         if self.readback_ready_slot <= 0 or self.readback_ready_slot - 1 >= len(self.readback_extra):
@@ -5741,9 +8179,16 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pending_slot = -1
         if slot < len(self.frame_fences) and self.frame_fences[slot] != 0:
             _ = self.vk.wait(self.frame_fences[slot])
+            if self.prev_submitted_fence <= self.frame_fences[slot]:
+                self.prev_submitted_fence = 0
             self.frame_fences[slot] = 0
+        self._flush_slot_retirements(slot)
         self.readback_ready_slot = slot
-        self.last_culled_meshlet_draws = Int(get32(self._readback_address())) if self.pending_n_inst > 0 else 0
+        var tc_rb = self._readback_address()
+        self.last_culled_meshlet_draws = Int(get32(tc_rb)) if self.pending_n_inst > 0 else 0
+        if tc_rb != 0:
+            for cls_i in range(AAA_SHADE_CLASS_COUNT):
+                self.last_tile_classify_counts[cls_i] = Int(get32(tc_rb + 12 + cls_i * 4))
         var pairs = self.pending_prof_pairs^
         self.pending_prof_pairs = List[Tuple[String, Int]]()
         self._read_gpu_timings(pairs, self.pending_frame_q)
@@ -5753,6 +8198,9 @@ struct FlintAaaVulkanRenderer(Movable):
         """Deferred readback: block until the last submitted frame is done so `readback_pixels_into()`
         returns it (e.g. before a screenshot or when leaving deferred mode)."""
         self._retire_pending_frame()
+        for s_i in range(len(self.frame_fences)):
+            if self.frame_fences[s_i] == 0:
+                self._flush_slot_retirements(s_i)
 
     def get_adapted_exposure(self) -> Tuple[Float32, Float32]:
         """Returns `(adapted_exposure, avg_scene_luminance)` computed on GPU by `aaa_adapt_exposure_shader`."""
@@ -5778,29 +8226,55 @@ struct FlintAaaVulkanRenderer(Movable):
         self.readback_pixels_into(out)
         return out^
 
-    def readback_resolved_hdr(self) -> List[Vec3]:
+    def readback_resolved_hdr(mut self) -> List[Vec3]:
         """Reads back linear HDR `(R, G, B)` resolved by `FlintTSR v2` before display OETF."""
         var n = self.output_w * self.output_h
         var max_pix = max(n, self.render_w * self.render_h)
         var last_written_hist = (max_pix * 20) if ((self.frame_index - 1) & 1) == 0 else (max_pix * 16)
-        var raw_f = List[Float32](length=n * 4, fill=0.0)
-        _ = external_call[
-            "memcpy", Int
-        ](Int(raw_f.unsafe_ptr()), self.buf_history.cpu_address + last_written_hist * 4, n * 16)
         var out = List[Vec3](length=n, fill=Vec3())
-        for i in range(n):
-            out[i] = Vec3(raw_f[i * 4 + 0], raw_f[i * 4 + 1], raw_f[i * 4 + 2])
-        _ = len(raw_f)
+        if not self.active or self.buf_history.vk_buffer == 0 or n <= 0:
+            return out^
+        var rb = self.vk.create_buffer(n * 16, local=False, cpu_reads=True)
+        if rb.vk_buffer == 0 or rb.cpu_address == 0:
+            self.vk.destroy_buffer(rb)
+            return out^
+        self.vk.wait_idle()
+        if self.vk.begin_commands(0):
+            self.vk.copy_buffer(0, self.buf_history, last_written_hist * 4, rb, 0, n * 16)
+            self.vk.memory_barrier2(0, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
+            var f = self.vk.submit(0)
+            if f != 0 and self.vk.wait(f):
+                var raw_f = List[Float32](length=n * 4, fill=0.0)
+                _ = external_call[
+                    "memcpy", Int
+                ](Int(raw_f.unsafe_ptr()), rb.cpu_address, n * 16)
+                for i in range(n):
+                    out[i] = Vec3(raw_f[i * 4 + 0], raw_f[i * 4 + 1], raw_f[i * 4 + 2])
+                _ = len(raw_f)
+        self.vk.destroy_buffer(rb)
         return out^
 
-    def readback_scrgb_rgba16f_words(self) -> List[UInt32]:
+    def readback_scrgb_rgba16f_words(mut self) -> List[UInt32]:
         """Reads back `8`-byte/pixel `R16G16B16A16_SFLOAT` (`2 x UInt32` per pixel) Extended Linear scRGB words (`1.0 = 80 nits`)."""
         var n_words = self.output_w * self.output_h * 2
         var out = List[UInt32](length=n_words, fill=0)
-        if self.buf_post_scratch.cpu_address != 0 and (AAA_POST_BLOOM_BASE + n_words) * 4 <= self.buf_post_scratch.size:
-            _ = external_call[
-                "memcpy", Int
-            ](Int(out.unsafe_ptr()), self.buf_post_scratch.cpu_address + AAA_POST_BLOOM_BASE * 4, n_words * 4)
+        if not self.active or self.buf_post_scratch.vk_buffer == 0 or n_words <= 0:
+            return out^
+        if (AAA_POST_BLOOM_BASE + n_words) * 4 <= self.buf_post_scratch.size:
+            var rb = self.vk.create_buffer(n_words * 4, local=False, cpu_reads=True)
+            if rb.vk_buffer != 0 and rb.cpu_address != 0:
+                self.vk.wait_idle()
+                if self.vk.begin_commands(0):
+                    self.vk.copy_buffer(0, self.buf_post_scratch, AAA_POST_BLOOM_BASE * 4, rb, 0, n_words * 4)
+                    self.vk.memory_barrier2(
+                        0, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ)
+                    )
+                    var f = self.vk.submit(0)
+                    if f != 0 and self.vk.wait(f):
+                        _ = external_call[
+                            "memcpy", Int
+                        ](Int(out.unsafe_ptr()), rb.cpu_address, n_words * 4)
+            self.vk.destroy_buffer(rb)
         return out^
 
     def shutdown(mut self):
@@ -5812,6 +8286,9 @@ struct FlintAaaVulkanRenderer(Movable):
             self.active = False
             return
         self.vk.wait_idle()
+        for fi in range(len(self.frame_fences)):
+            self.frame_fences[fi] = 0
+        self.prev_submitted_fence = 0
         for i in range(len(self.mesh_blas)):
             self.vk.destroy_accel_struct(self.mesh_blas[i])
         self.mesh_blas.clear()
@@ -5819,7 +8296,9 @@ struct FlintAaaVulkanRenderer(Movable):
             if self.ring_tlas[i].handle != 0:
                 self.vk.destroy_accel_struct(self.ring_tlas[i])
         self.ring_tlas.clear()
-        self.frame_tlas = VulkanAccelStruct()
+        self.frame_tlas.handle = 0
+        self.frame_tlas.buffer = GpuBuffer()
+        self.frame_tlas.ctrl_ptr = 0
 
         for i in range(len(self.ring_as_instances)):
             if self.ring_as_instances[i].size > 0:
@@ -5831,12 +8310,23 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.destroy_buffer(self.buf_as_scratch)
             self.buf_as_scratch = GpuBuffer()
 
-        self.ui_font_img = VulkanImage()
+        self.ui_font_img.image = 0
+        self.ui_font_img.view = 0
+        self.ui_font_img.ctrl_ptr = 0
         for i in range(len(self.bindless_images)):
             self.vk.destroy_image(self.bindless_images[i])
         self.bindless_images.clear()
-        self.vk.destroy_image(self.vis_img)
-        self.vk.destroy_image(self.depth_img)
+        for s_i in range(len(self.deferred_destroy_images)):
+            for d_i in range(len(self.deferred_destroy_images[s_i])):
+                self.vk.destroy_image(self.deferred_destroy_images[s_i][d_i])
+            self.deferred_destroy_images[s_i].clear()
+        for s_i in range(len(self.pending_bindless_desc_writes)):
+            self.pending_bindless_desc_writes[s_i].clear()
+        self.bindless_free_slots.clear()
+        self.bindless_resident_min_mip.clear()
+        self.bindless_vram_bytes.clear()
+        self.bindless_layouts_init.clear()
+        self._free_aliased_targets()
         self.vk.destroy_image(self.hiz_img)
         self.vk.destroy_image(self.vsm_img)
         self.vk.destroy_image(self.brdf_lut_img)
@@ -5844,52 +8334,154 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_image(self.env_cube_img)
 
         self.vk.destroy_sampler(self.samp_aniso16)
+        for m_i in range(len(self.samp_aniso16_min_lod)):
+            self.vk.destroy_sampler(self.samp_aniso16_min_lod[m_i])
+        self.samp_aniso16_min_lod.clear()
         self.vk.destroy_sampler(self.samp_linear_clamp)
         self.vk.destroy_sampler(self.samp_nearest)
 
-        self.vk.destroy_pipeline(self.pipe_meshlet_cull)
+        if self.pipe_meshlet_cull != 0:
+            self.vk.destroy_pipeline(self.pipe_meshlet_cull)
+            self.pipe_meshlet_cull = 0
         if self.pipe_hiz_downsample != 0:
             self.vk.destroy_pipeline(self.pipe_hiz_downsample)
             self.pipe_hiz_downsample = 0
-        self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
-        self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)
+        if self.pipe_visbuffer_gfx != 0:
+            self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
+            self.pipe_visbuffer_gfx = 0
+        if self.pipe_visbuffer_alphamask_gfx != 0:
+            self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)
+            self.pipe_visbuffer_alphamask_gfx = 0
         if self.pipe_npr_outline_gfx != 0:
             self.vk.destroy_pipeline(self.pipe_npr_outline_gfx)
             self.pipe_npr_outline_gfx = 0
-        self.vk.destroy_pipeline(self.pipe_vsm_mark)
-        self.vk.destroy_pipeline(self.pipe_vsm_gfx)
-        self.vk.destroy_pipeline(self.pipe_vsm_alphamask_gfx)
-        self.vk.destroy_pipeline(self.pipe_surfcache)
-        self.vk.destroy_pipeline(self.pipe_cluster_cull)
-        self.vk.destroy_pipeline(self.pipe_dq_skinning)
-        self.vk.destroy_pipeline(self.pipe_deferred_shade)
-        self.vk.destroy_pipeline(self.pipe_svgf_reproject)
-        self.vk.destroy_pipeline(self.pipe_svgf_atrous)
-        self.vk.destroy_pipeline(self.pipe_oit_vol)
-        self.vk.destroy_pipeline(self.pipe_luma_hist)
-        self.vk.destroy_pipeline(self.pipe_adapt_exp)
-        self.vk.destroy_pipeline(self.pipe_bloom_down)
-        self.vk.destroy_pipeline(self.pipe_bloom_up)
-        self.vk.destroy_pipeline(self.pipe_bokeh_dof)
-        self.vk.destroy_pipeline(self.pipe_tsr_display)
-        self.vk.destroy_pipeline(self.pipe_spec_reblur_temp)
-        self.vk.destroy_pipeline(self.pipe_spec_reblur_atrous)
-        self.vk.destroy_pipeline(self.pipe_froxel_inject)
-        self.vk.destroy_pipeline(self.pipe_froxel_prefix)
-        self.vk.destroy_pipeline(self.pipe_froxel_march)
-        self.vk.destroy_pipeline(self.pipe_particle_clear)
-        self.vk.destroy_pipeline(self.pipe_particle_sim)
-        self.vk.destroy_pipeline(self.pipe_particle_comp)
-        self.vk.destroy_pipeline(self.pipe_water_refract)
+        if self.pipe_vsm_mark != 0:
+            self.vk.destroy_pipeline(self.pipe_vsm_mark)
+            self.pipe_vsm_mark = 0
+        if self.pipe_vsm_gfx != 0:
+            self.vk.destroy_pipeline(self.pipe_vsm_gfx)
+            self.pipe_vsm_gfx = 0
+        if self.pipe_vsm_alphamask_gfx != 0:
+            self.vk.destroy_pipeline(self.pipe_vsm_alphamask_gfx)
+            self.pipe_vsm_alphamask_gfx = 0
+        if self.pipe_surfcache != 0:
+            self.vk.destroy_pipeline(self.pipe_surfcache)
+            self.pipe_surfcache = 0
+        if self.pipe_cluster_cull != 0:
+            self.vk.destroy_pipeline(self.pipe_cluster_cull)
+            self.pipe_cluster_cull = 0
+        if self.pipe_dq_skinning != 0:
+            self.vk.destroy_pipeline(self.pipe_dq_skinning)
+            self.pipe_dq_skinning = 0
+        if self.pipe_tile_classify != 0:
+            self.vk.destroy_pipeline(self.pipe_tile_classify)
+            self.pipe_tile_classify = 0
+        if self.pipe_shade_sky != 0:
+            self.vk.destroy_pipeline(self.pipe_shade_sky)
+            self.pipe_shade_sky = 0
+        if self.pipe_shade_unlit != 0:
+            self.vk.destroy_pipeline(self.pipe_shade_unlit)
+            self.pipe_shade_unlit = 0
+        if self.pipe_shade_pbr != 0:
+            self.vk.destroy_pipeline(self.pipe_shade_pbr)
+            self.pipe_shade_pbr = 0
+        if self.pipe_shade_foliage_sss != 0:
+            self.vk.destroy_pipeline(self.pipe_shade_foliage_sss)
+            self.pipe_shade_foliage_sss = 0
+        if self.pipe_shade_complex != 0:
+            self.vk.destroy_pipeline(self.pipe_shade_complex)
+            self.pipe_shade_complex = 0
+        if self.pipe_vat_crowd_eval != 0:
+            self.vk.destroy_pipeline(self.pipe_vat_crowd_eval)
+            self.pipe_vat_crowd_eval = 0
+        if self.pipe_terrain_clipmap_eval != 0:
+            self.vk.destroy_pipeline(self.pipe_terrain_clipmap_eval)
+            self.pipe_terrain_clipmap_eval = 0
+        if self.pipe_svgf_reproject != 0:
+            self.vk.destroy_pipeline(self.pipe_svgf_reproject)
+            self.pipe_svgf_reproject = 0
+        if self.pipe_svgf_atrous != 0:
+            self.vk.destroy_pipeline(self.pipe_svgf_atrous)
+            self.pipe_svgf_atrous = 0
+        if self.pipe_oit_vol != 0:
+            self.vk.destroy_pipeline(self.pipe_oit_vol)
+            self.pipe_oit_vol = 0
+        if self.pipe_luma_hist != 0:
+            self.vk.destroy_pipeline(self.pipe_luma_hist)
+            self.pipe_luma_hist = 0
+        if self.pipe_adapt_exp != 0:
+            self.vk.destroy_pipeline(self.pipe_adapt_exp)
+            self.pipe_adapt_exp = 0
+        if self.pipe_bloom_down != 0:
+            self.vk.destroy_pipeline(self.pipe_bloom_down)
+            self.pipe_bloom_down = 0
+        if self.pipe_bloom_up != 0:
+            self.vk.destroy_pipeline(self.pipe_bloom_up)
+            self.pipe_bloom_up = 0
+        if self.pipe_bokeh_dof != 0:
+            self.vk.destroy_pipeline(self.pipe_bokeh_dof)
+            self.pipe_bokeh_dof = 0
+        if self.pipe_tsr_display != 0:
+            self.vk.destroy_pipeline(self.pipe_tsr_display)
+            self.pipe_tsr_display = 0
+        if self.pipe_spec_reblur_temp != 0:
+            self.vk.destroy_pipeline(self.pipe_spec_reblur_temp)
+            self.pipe_spec_reblur_temp = 0
+        if self.pipe_spec_reblur_atrous != 0:
+            self.vk.destroy_pipeline(self.pipe_spec_reblur_atrous)
+            self.pipe_spec_reblur_atrous = 0
+        if self.pipe_froxel_inject != 0:
+            self.vk.destroy_pipeline(self.pipe_froxel_inject)
+            self.pipe_froxel_inject = 0
+        if self.pipe_froxel_prefix != 0:
+            self.vk.destroy_pipeline(self.pipe_froxel_prefix)
+            self.pipe_froxel_prefix = 0
+        if self.pipe_froxel_march != 0:
+            self.vk.destroy_pipeline(self.pipe_froxel_march)
+            self.pipe_froxel_march = 0
+        if self.pipe_particle_clear != 0:
+            self.vk.destroy_pipeline(self.pipe_particle_clear)
+            self.pipe_particle_clear = 0
+        if self.pipe_particle_sim != 0:
+            self.vk.destroy_pipeline(self.pipe_particle_sim)
+            self.pipe_particle_sim = 0
+        if self.pipe_particle_comp != 0:
+            self.vk.destroy_pipeline(self.pipe_particle_comp)
+            self.pipe_particle_comp = 0
+        if self.pipe_water_refract != 0:
+            self.vk.destroy_pipeline(self.pipe_water_refract)
+            self.pipe_water_refract = 0
         if self.pipe_rt_shadow_trace != 0:
             self.vk.destroy_pipeline(self.pipe_rt_shadow_trace)
+            self.pipe_rt_shadow_trace = 0
         if self.pipe_rt_shadow_filter != 0:
             self.vk.destroy_pipeline(self.pipe_rt_shadow_filter)
+            self.pipe_rt_shadow_filter = 0
         if self.pipe_glass_refract != 0:
             self.vk.destroy_pipeline(self.pipe_glass_refract)
-        self.vk.destroy_pipeline(self.pipe_tsr_v3_resolve)
-        self.vk.destroy_pipeline(self.pipe_motion_blur)
-        self.vk.destroy_pipeline(self.pipe_display_tonemap)
+            self.pipe_glass_refract = 0
+        if self.pipe_tsr_v3_resolve != 0:
+            self.vk.destroy_pipeline(self.pipe_tsr_v3_resolve)
+            self.pipe_tsr_v3_resolve = 0
+        if self.pipe_motion_blur != 0:
+            self.vk.destroy_pipeline(self.pipe_motion_blur)
+            self.pipe_motion_blur = 0
+        if self.pipe_display_tonemap != 0:
+            self.vk.destroy_pipeline(self.pipe_display_tonemap)
+            self.pipe_display_tonemap = 0
+        if self.pipe_display_tonemap_direct != 0:
+            self.vk.destroy_pipeline(self.pipe_display_tonemap_direct)
+            self.pipe_display_tonemap_direct = 0
+        if self.pipe_ui_overlay_direct != 0:
+            self.vk.destroy_pipeline(self.pipe_ui_overlay_direct)
+            self.pipe_ui_overlay_direct = 0
+        if self.pipe_display_present_gfx != 0:
+            self.vk.destroy_pipeline(self.pipe_display_present_gfx)
+            self.pipe_display_present_gfx = 0
+        if self.pipe_ui_present_gfx != 0:
+            self.vk.destroy_pipeline(self.pipe_ui_present_gfx)
+            self.pipe_ui_present_gfx = 0
+        self.present_gfx_format = 0
         if self.pipe_npr_cel_shade != 0:
             self.vk.destroy_pipeline(self.pipe_npr_cel_shade)
             self.pipe_npr_cel_shade = 0
@@ -5908,7 +8500,6 @@ struct FlintAaaVulkanRenderer(Movable):
             if self.ring_globals[i].size > 0:
                 self.vk.destroy_buffer(self.ring_globals[i])
         self.ring_globals.clear()
-        self.buf_globals = GpuBuffer()
 
         for i in range(len(self.ring_instances)):
             if self.ring_instances[i].size > 0:
@@ -5962,6 +8553,13 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.vk.destroy_buffer(self.ring_meshlet_worklist[i])
         self.ring_meshlet_worklist.clear()
 
+        for i in range(len(self.ring_draw_pairs)):
+            if self.ring_draw_pairs[i].size > 0:
+                self.vk.destroy_buffer(self.ring_draw_pairs[i])
+        self.ring_draw_pairs.clear()
+
+        self.staging_ring.shutdown(self.vk)
+
         self.slot_prof_pairs.clear()
         self.slot_frame_q.clear()
         self.slot_has_pending_queries.clear()
@@ -5969,17 +8567,11 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_buffer(self.buf_vertices)
         self.vk.destroy_buffer(self.buf_indices)
         self.vk.destroy_buffer(self.buf_meshlets)
-        self.vk.destroy_buffer(self.buf_instances)
         self.vk.destroy_buffer(self.buf_materials)
-        self.vk.destroy_buffer(self.buf_indirect)
         self.vk.destroy_buffer(self.buf_vsm_indirect)
         self.vk.destroy_buffer(self.buf_globals)
-        self.vk.destroy_buffer(self.buf_hdr_out)
         self.vk.destroy_buffer(self.buf_history)
-        self.vk.destroy_buffer(self.buf_vsm_table)
-        self.vk.destroy_buffer(self.buf_surfcache)
         self.vk.destroy_buffer(self.buf_oit_nodes)
-        self.vk.destroy_buffer(self.buf_clusters)
         self.vk.destroy_buffer(self.buf_skinning)
         self.vk.destroy_buffer(self.buf_post_scratch)
         self.vk.destroy_buffer(self.buf_ldr_readback)
@@ -5989,8 +8581,6 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pending_slot = -1
         self.readback_ready_slot = 0
         self.vk.destroy_buffer(self.buf_staging)
-        self.vk.destroy_buffer(self.buf_indirect_phase2)
-        self.vk.destroy_buffer(self.buf_occluded_candidates)
 
         if self.vk.pipeline_cache != 0:
             _ = self.vk.save_pipeline_cache("build/vk_pso.cache")

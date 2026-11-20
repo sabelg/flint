@@ -814,6 +814,8 @@ comptime CAPABILITY_SHADER_NON_UNIFORM: UInt32 = 5301
 comptime CAPABILITY_SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING: UInt32 = 5307
 comptime CAPABILITY_RAY_QUERY_KHR: UInt32 = 4472
 comptime CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS: UInt32 = 49
+comptime CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT: UInt32 = 55
+comptime CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: UInt32 = 56
 comptime CAPABILITY_GROUP_NON_UNIFORM_ARITHMETIC: UInt32 = 63
 comptime CAPABILITY_GROUP_NON_UNIFORM_BALLOT: UInt32 = 64
 comptime CAPABILITY_GEOMETRY: UInt32 = 6
@@ -835,6 +837,7 @@ comptime SCOPE_DEVICE: UInt32 = 1
 comptime SCOPE_WORKGROUP: UInt32 = 2
 comptime SCOPE_SUBGROUP: UInt32 = 3
 
+comptime IMAGE_FORMAT_UNKNOWN: UInt32 = 0
 comptime IMAGE_FORMAT_RGBA16F: UInt32 = 2
 comptime IMAGE_FORMAT_R11F_G11F_B10F: UInt32 = 8
 
@@ -881,6 +884,7 @@ struct AaaSpirvModule(Movable):
     var type_ray_query_khr: UInt32
     var type_storage_image_rgba16f: UInt32
     var type_storage_image_r11g11b10f: UInt32
+    var type_storage_image_unknown: UInt32
     var primitive_id_var: UInt32
     var pointer_buffer_uint: UInt32
     var pointer_function_uint: UInt32
@@ -913,6 +917,7 @@ struct AaaSpirvModule(Movable):
         early_depth: Bool = True,
         enable_subgroups: Bool = False,
         enable_storage_image_formats: Bool = False,
+        enable_storage_image_without_format: Bool = False,
     ):
         self.bound = 1
         self.exec_model = exec_model
@@ -930,6 +935,9 @@ struct AaaSpirvModule(Movable):
             self.capabilities.append(CAPABILITY_GROUP_NON_UNIFORM_ARITHMETIC)
         if enable_storage_image_formats:
             self.capabilities.append(CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS)
+        if enable_storage_image_without_format:
+            self.capabilities.append(CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT)
+            self.capabilities.append(CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT)
         self.interface_vars = List[UInt32]()
         self.decorations = List[UInt32]()
         self.globals = List[UInt32]()
@@ -959,6 +967,7 @@ struct AaaSpirvModule(Movable):
         self.type_ray_query_khr = 0
         self.type_storage_image_rgba16f = 0
         self.type_storage_image_r11g11b10f = 0
+        self.type_storage_image_unknown = 0
         self.primitive_id_var = 0
         self.pointer_buffer_uint = 0
         self.pointer_function_uint = 0
@@ -1029,11 +1038,13 @@ struct AaaSpirvModule(Movable):
         emit(self.globals, OP_TYPE_IMAGE, self.type_uimage_2d, self.type_uint, DIM_2D, 0, 0, 0, 1, 0)
         emit(self.globals, OP_TYPE_SAMPLED_IMAGE, self.type_sampled_u2d, self.type_uimage_2d)
 
-        # Hardware 2D Storage Images (Rgba16f and R11fG11fB10f, Sampled=2)
+        # Hardware 2D Storage Images (Rgba16f, R11fG11fB10f, and Unknown formatless, Sampled=2)
         self.type_storage_image_rgba16f = self.fresh()
         emit(self.globals, OP_TYPE_IMAGE, self.type_storage_image_rgba16f, self.type_float, DIM_2D, 0, 0, 0, 2, IMAGE_FORMAT_RGBA16F)
         self.type_storage_image_r11g11b10f = self.fresh()
         emit(self.globals, OP_TYPE_IMAGE, self.type_storage_image_r11g11b10f, self.type_float, DIM_2D, 0, 0, 0, 2, IMAGE_FORMAT_R11F_G11F_B10F)
+        self.type_storage_image_unknown = self.fresh()
+        emit(self.globals, OP_TYPE_IMAGE, self.type_storage_image_unknown, self.type_float, DIM_2D, 0, 0, 0, 2, IMAGE_FORMAT_UNKNOWN)
 
         if enable_ray_query:
             self.type_accel_khr = self.fresh()
@@ -2002,7 +2013,22 @@ struct AaaSpirvModule(Movable):
 
     # Hardware 2D Storage Images
     def storage_image_2d(mut self, binding: Int, set: Int = 0, format: UInt32 = IMAGE_FORMAT_RGBA16F) -> Tuple[UInt32, UInt32]:
-        var img_t = self.type_storage_image_rgba16f if format == IMAGE_FORMAT_RGBA16F else self.type_storage_image_r11g11b10f
+        var img_t = self.type_storage_image_rgba16f
+        if format == IMAGE_FORMAT_R11F_G11F_B10F:
+            img_t = self.type_storage_image_r11g11b10f
+        elif format == IMAGE_FORMAT_UNKNOWN:
+            img_t = self.type_storage_image_unknown
+            var has_r = False
+            var has_w = False
+            for c in self.capabilities:
+                if c == CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT:
+                    has_r = True
+                elif c == CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT:
+                    has_w = True
+            if not has_r:
+                self.capabilities.append(CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT)
+            if not has_w:
+                self.capabilities.append(CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT)
         var ptr_t = self.fresh()
         var var_id = self.fresh()
         emit(self.globals, OP_TYPE_POINTER, ptr_t, STORAGE_UNIFORM_CONSTANT, img_t)

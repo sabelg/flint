@@ -4,7 +4,7 @@ Provides:
 - `comp_hash64(StaticString) -> UInt64`: deterministic compile-time/runtime component hash
 - `Entity(index: UInt32, generation: UInt32)`: 64-bit generational entity handle (unbounded archetypes)
 - `trait Component(Copyable, Movable, Deinitable)`: `COMPONENT_ID`, `STORAGE_MODE` (`STORAGE_TABLE` / `STORAGE_SPARSE`)
-- `BitSet256`: 256-bit component signature set for O(1) archetype queries & schedule conflict analysis
+- `ComponentBitSet` (`BitSet256` alias): hybrid inline-256 + dynamic overflow component signature set for O(1) archetype queries & schedule conflict analysis
 - `ArchetypeChunk`: 64-byte aligned, 8-SIMD-lane-multiple columnar storage with per-8-row `changed_ticks`
 - `ArchetypeGraph`: cached `add_edges` / `remove_edges` for O(1) `insert[C]` / `remove[C]` transitions
 - `SparseSet`: paged sparse-set storage for `STORAGE_SPARSE` tags and volatile components
@@ -12,22 +12,20 @@ Provides:
   `Entity` remapping and deterministic `detsort` `(order_key / lane_id, seq)` playback
 - `Events[T]`: double-buffered 2-frame event channel (`send`, `swap_buffers`, `read_since`)
 - `World`: full ECS runtime with lifetime-safe `par_for_each1` / `par_for_each2` over `JobPool`
-  and `<0.2 ms` binary `snapshot_blob` / `restore_blob` / `state_checksum`.
+  and `<0.2 ms` portable binary `snapshot_blob` / `restore_blob` / `state_checksum`.
 """
-from std.atomic import Atomic
+from std.atomic import Atomic, Ordering
 from std.collections import List
-from std.ffi import external_call
+from std.ffi import external_call, _Global
 from std.sys import size_of, align_of
-from std.time import monotonic
 from flint.core.detsort import stable_order, mix64
 from flint.core.ecs import EntityHandle, ECB_PROV_GEN, run_parallel_ctx
 from flint.core.jobs import JobPool, MAX_WORKERS
 from flint.core.memory import MemCharge, MEM_ENTITIES
 from flint.core.serial import BlobWriter, BlobReader, fourcc, fast_hash64
 
-comptime MAX_COMPONENTS: Int = 256
-comptime _COMP_HASH_CAP: Int = 512
-comptime _COMP_HASH_MASK: Int = _COMP_HASH_CAP - 1
+comptime MAX_COMPONENTS: Int = 65536  # Soft legacy export; World imposes no fixed component limit
+comptime _INITIAL_COMP_HASH_CAP: Int = 512
 comptime STORAGE_TABLE: Int = 0
 comptime STORAGE_SPARSE: Int = 1
 
@@ -51,24 +49,16 @@ comptime CMD_INSERT: UInt8 = 3
 comptime CMD_REMOVE: UInt8 = 4
 
 comptime WORLD_BLOB_TAG: UInt32 = 0x32534345  # "ECS2"
-comptime WORLD_BLOB_VERSION: Int = 2
-comptime VAULT_TOKEN_MAGIC: UInt32 = 0x464C5654  # "FLVT"
+comptime WORLD_BLOB_VERSION: Int = 3
 
-# Process-local fixed-address ECS runtime page (implicit worker order + non-trivial Clone Vault)
-comptime _ECS_RUNTIME_BASE: Int = 0x5D5B00000000
-comptime _ECS_RUNTIME_BYTES: Int = 16384
+# Dynamic process-local ECS runtime page (64x64B per-worker implicit order table)
+comptime _ECS_RT_CTRL_KEY: StaticString = "FLINT_ECS_RT_CTRL"
+comptime _ECS_RUNTIME_BYTES: Int = 8192
 comptime _ECS_RUNTIME_MAGIC: Int = 0x31534345544E4C46  # "FLNTECS1"
 comptime _RT_MAGIC_OFF: Int = 0
 comptime _RT_PID_OFF: Int = 8
-comptime _RT_LOCK_OFF: Int = 16
-comptime _RT_SLOTS_PTR_OFF: Int = 24
-comptime _RT_COUNT_OFF: Int = 32
-comptime _RT_CAP_OFF: Int = 40
-comptime _RT_CURSOR_OFF: Int = 48
-comptime _RT_NONCE_OFF: Int = 56
 comptime _RT_WORKER_ORDER_OFF: Int = 256  # 64 slots * 64-byte cache line = 4096 B
 comptime _WORKER_ORDER_SLOTS: Int = 64
-comptime _MAX_VAULT_SLOTS: Int = 1 << 18  # 262,144 slots (18-bit index + 14-bit gen)
 
 
 def comp_hash64(name: StaticString) -> UInt64:
@@ -202,28 +192,88 @@ def _popcnt64(val: UInt64) -> Int:
     return Int((x * UInt64(0x0101010101010101)) >> 56)
 
 
-@fieldwise_init
-struct BitSet256(Copyable, ImplicitlyCopyable, Movable, Equatable):
-    """Fixed 256-bit mask for component signatures and system conflict sets."""
+struct ComponentBitSet(Copyable, Movable, Equatable):
+    """Hybrid inline-256 + dynamic overflow bitset for unbounded component signatures and schedule conflicts."""
     var w0: UInt64
     var w1: UInt64
     var w2: UInt64
     var w3: UInt64
+    var overflow: List[UInt64]
 
     def __init__(out self):
         self.w0 = 0
         self.w1 = 0
         self.w2 = 0
         self.w3 = 0
+        self.overflow = List[UInt64]()
+
+    def __init__(out self, w0: UInt64, w1: UInt64, w2: UInt64, w3: UInt64):
+        self.w0 = w0
+        self.w1 = w1
+        self.w2 = w2
+        self.w3 = w3
+        self.overflow = List[UInt64]()
+
+    def __init__(out self, *, copy: Self):
+        self.w0 = copy.w0
+        self.w1 = copy.w1
+        self.w2 = copy.w2
+        self.w3 = copy.w3
+        self.overflow = copy.overflow.copy()
+
+    @always_inline
+    def _trim(mut self):
+        while len(self.overflow) > 0 and self.overflow[len(self.overflow) - 1] == 0:
+            _ = self.overflow.pop()
+
+    @always_inline
+    def trimmed_word_count(self) -> Int:
+        var n = len(self.overflow)
+        while n > 0:
+            if self.overflow[n - 1] != 0:
+                return 4 + n
+            n -= 1
+        if self.w3 != 0:
+            return 4
+        if self.w2 != 0:
+            return 3
+        if self.w1 != 0:
+            return 2
+        if self.w0 != 0:
+            return 1
+        return 0
+
+    @always_inline
+    def word_at(self, idx: Int) -> UInt64:
+        if idx == 0:
+            return self.w0
+        if idx == 1:
+            return self.w1
+        if idx == 2:
+            return self.w2
+        if idx == 3:
+            return self.w3
+        var ov = idx - 4
+        if ov >= 0 and ov < len(self.overflow):
+            return self.overflow[ov]
+        return 0
 
     @always_inline
     def __eq__(self, other: Self) -> Bool:
-        return (
-            self.w0 == other.w0
-            and self.w1 == other.w1
-            and self.w2 == other.w2
-            and self.w3 == other.w3
-        )
+        if (
+            self.w0 != other.w0
+            or self.w1 != other.w1
+            or self.w2 != other.w2
+            or self.w3 != other.w3
+        ):
+            return False
+        var max_ov = max(len(self.overflow), len(other.overflow))
+        for i in range(max_ov):
+            var a = self.overflow[i] if i < len(self.overflow) else UInt64(0)
+            var b = other.overflow[i] if i < len(other.overflow) else UInt64(0)
+            if a != b:
+                return False
+        return True
 
     @always_inline
     def __ne__(self, other: Self) -> Bool:
@@ -231,11 +281,16 @@ struct BitSet256(Copyable, ImplicitlyCopyable, Movable, Equatable):
 
     @always_inline
     def is_empty(self) -> Bool:
-        return (self.w0 | self.w1 | self.w2 | self.w3) == 0
+        if (self.w0 | self.w1 | self.w2 | self.w3) != 0:
+            return False
+        for i in range(len(self.overflow)):
+            if self.overflow[i] != 0:
+                return False
+        return True
 
     @always_inline
     def set(mut self, bit: Int):
-        if bit < 0 or bit >= 256:
+        if bit < 0:
             return
         var word = bit >> 6
         var shift = UInt64(bit & 63)
@@ -246,12 +301,17 @@ struct BitSet256(Copyable, ImplicitlyCopyable, Movable, Equatable):
             self.w1 |= mask
         elif word == 2:
             self.w2 |= mask
-        else:
+        elif word == 3:
             self.w3 |= mask
+        else:
+            var ov = word - 4
+            while len(self.overflow) <= ov:
+                self.overflow.append(0)
+            self.overflow[ov] |= mask
 
     @always_inline
     def clear(mut self, bit: Int):
-        if bit < 0 or bit >= 256:
+        if bit < 0:
             return
         var word = bit >> 6
         var shift = UInt64(bit & 63)
@@ -262,12 +322,25 @@ struct BitSet256(Copyable, ImplicitlyCopyable, Movable, Equatable):
             self.w1 &= mask
         elif word == 2:
             self.w2 &= mask
-        else:
+        elif word == 3:
             self.w3 &= mask
+        else:
+            var ov = word - 4
+            if ov < len(self.overflow):
+                self.overflow[ov] &= mask
+                self._trim()
+
+    @always_inline
+    def clear_all(mut self):
+        self.w0 = 0
+        self.w1 = 0
+        self.w2 = 0
+        self.w3 = 0
+        self.overflow.clear()
 
     @always_inline
     def test(self, bit: Int) -> Bool:
-        if bit < 0 or bit >= 256:
+        if bit < 0:
             return False
         var word = bit >> 6
         var shift = UInt64(bit & 63)
@@ -277,46 +350,79 @@ struct BitSet256(Copyable, ImplicitlyCopyable, Movable, Equatable):
             return ((self.w1 >> shift) & 1) != 0
         if word == 2:
             return ((self.w2 >> shift) & 1) != 0
-        return ((self.w3 >> shift) & 1) != 0
+        if word == 3:
+            return ((self.w3 >> shift) & 1) != 0
+        var ov = word - 4
+        if ov < len(self.overflow):
+            return ((self.overflow[ov] >> shift) & 1) != 0
+        return False
+
+    @always_inline
+    def has(self, bit: Int) -> Bool:
+        return self.test(bit)
 
     @always_inline
     def with_bit(self, bit: Int) -> Self:
-        var out = self
+        var out = self.copy()
         out.set(bit)
-        return out
+        return out^
 
     @always_inline
     def without_bit(self, bit: Int) -> Self:
-        var out = self
+        var out = self.copy()
         out.clear(bit)
-        return out
+        return out^
 
     @always_inline
     def union(self, other: Self) -> Self:
-        return Self(
+        var out = Self(
             self.w0 | other.w0,
             self.w1 | other.w1,
             self.w2 | other.w2,
             self.w3 | other.w3,
         )
+        var max_ov = max(len(self.overflow), len(other.overflow))
+        if max_ov > 0:
+            out.overflow = List[UInt64](capacity=max_ov)
+            for i in range(max_ov):
+                var a = self.overflow[i] if i < len(self.overflow) else UInt64(0)
+                var b = other.overflow[i] if i < len(other.overflow) else UInt64(0)
+                out.overflow.append(a | b)
+            out._trim()
+        return out^
 
     @always_inline
     def intersection(self, other: Self) -> Self:
-        return Self(
+        var out = Self(
             self.w0 & other.w0,
             self.w1 & other.w1,
             self.w2 & other.w2,
             self.w3 & other.w3,
         )
+        var min_ov = min(len(self.overflow), len(other.overflow))
+        if min_ov > 0:
+            out.overflow = List[UInt64](capacity=min_ov)
+            for i in range(min_ov):
+                out.overflow.append(self.overflow[i] & other.overflow[i])
+            out._trim()
+        return out^
 
     @always_inline
     def without(self, other: Self) -> Self:
-        return Self(
+        var out = Self(
             self.w0 & ~other.w0,
             self.w1 & ~other.w1,
             self.w2 & ~other.w2,
             self.w3 & ~other.w3,
         )
+        var n_ov = len(self.overflow)
+        if n_ov > 0:
+            out.overflow = List[UInt64](capacity=n_ov)
+            for i in range(n_ov):
+                var b = other.overflow[i] if i < len(other.overflow) else UInt64(0)
+                out.overflow.append(self.overflow[i] & ~b)
+            out._trim()
+        return out^
 
     @always_inline
     def __or__(self, other: Self) -> Self:
@@ -328,14 +434,41 @@ struct BitSet256(Copyable, ImplicitlyCopyable, Movable, Equatable):
 
     @always_inline
     def contains_all(self, required: Self) -> Bool:
-        return self.intersection(required) == required
+        if (
+            (self.w0 & required.w0) != required.w0
+            or (self.w1 & required.w1) != required.w1
+            or (self.w2 & required.w2) != required.w2
+            or (self.w3 & required.w3) != required.w3
+        ):
+            return False
+        for i in range(len(required.overflow)):
+            var rw = required.overflow[i]
+            if rw != 0:
+                var sw = self.overflow[i] if i < len(self.overflow) else UInt64(0)
+                if (sw & rw) != rw:
+                    return False
+        return True
 
     @always_inline
     def intersects(self, other: Self) -> Bool:
-        return not self.intersection(other).is_empty()
+        if (
+            (self.w0 & other.w0)
+            | (self.w1 & other.w1)
+            | (self.w2 & other.w2)
+            | (self.w3 & other.w3)
+        ) != 0:
+            return True
+        var min_ov = min(len(self.overflow), len(other.overflow))
+        for i in range(min_ov):
+            if (self.overflow[i] & other.overflow[i]) != 0:
+                return True
+        return False
 
     def popcount(self) -> Int:
-        return _popcnt64(self.w0) + _popcnt64(self.w1) + _popcnt64(self.w2) + _popcnt64(self.w3)
+        var cnt = _popcnt64(self.w0) + _popcnt64(self.w1) + _popcnt64(self.w2) + _popcnt64(self.w3)
+        for i in range(len(self.overflow)):
+            cnt += _popcnt64(self.overflow[i])
+        return cnt
 
     def first_set(self) -> Int:
         if self.w0 != 0:
@@ -346,17 +479,27 @@ struct BitSet256(Copyable, ImplicitlyCopyable, Movable, Equatable):
             return 128 + _ctz64(self.w2)
         if self.w3 != 0:
             return 192 + _ctz64(self.w3)
+        for i in range(len(self.overflow)):
+            if self.overflow[i] != 0:
+                return (4 + i) * 64 + _ctz64(self.overflow[i])
         return -1
 
     def hash64(self) -> UInt64:
         var h = mix64(self.w0 ^ UInt64(0x9E3779B97F4A7C15))
         h = mix64(h ^ self.w1)
         h = mix64(h ^ self.w2)
-        return mix64(h ^ self.w3)
+        h = mix64(h ^ self.w3)
+        var wc = self.trimmed_word_count()
+        for i in range(4, wc):
+            h = mix64(h ^ self.word_at(i))
+        return h
+
+
+comptime BitSet256 = ComponentBitSet
 
 
 # ---------------------------------------------------------------------------
-# Type-erased component lifecycle, Clone Vault & per-worker implicit order
+# Type-erased component lifecycle & dynamic per-worker implicit order
 # ---------------------------------------------------------------------------
 
 comptime _DropFn = def(Int) thin -> None
@@ -466,88 +609,153 @@ struct ComponentInfo(Copyable, ImplicitlyCopyable, Movable):
         return self.bin_read_fn(comp_addr, reader_addr)
 
 
-@fieldwise_init
-struct _VaultSlot(Copyable, ImplicitlyCopyable, Movable):
-    var ptr: Int
-    var alloc_bytes: Int
-    var byte_size: Int
-    var component_hash: UInt64
-    var token: UInt64
-    var gen: UInt32
-    var alive: Bool
-    var destroy_fn: _DropFn
+def _ecs_rt_on_exit(ctrl: Int) abi("C"):
+    if ctrl == 0:
+        return
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    while True:
+        var cur = base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+        if cur == 0:
+            break
+        var expected = cur
+        if base_ptr[unsafe_offset=0].compare_exchange[
+            failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+        ](expected, Int64(0)):
+            external_call["free", NoneType](Int(cur))
+            break
+    external_call["free", NoneType](ctrl)
+
+
+def _init_ecs_rt_ctrl() -> Int:
+    var ctrl = external_call["aligned_alloc", Int](Int(64), Int(64))
+    if ctrl == 0:
+        return 0
+    var p = Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    for i in range(8):
+        p[unsafe_offset=i] = 0
+    _ = external_call["__cxa_atexit", Int32](_ecs_rt_on_exit, ctrl, Int(0))
+    return ctrl
+
+
+comptime _ECS_RT_GLOBAL = _Global["FLINT_ECS_RT_CTRL", _init_ecs_rt_ctrl]
 
 
 @always_inline
-def _rt_word(offset: Int) -> Pointer[Atomic[Int64], MutAnyOrigin]:
-    return Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=_ECS_RUNTIME_BASE + offset)
+def _ecs_rt_ctrl_addr() -> Int:
+    var slot = external_call["KGEN_CompilerRT_GetGlobalOrNull", Int](
+        Int(_ECS_RT_CTRL_KEY.unsafe_ptr()), _ECS_RT_CTRL_KEY.byte_length()
+    )
+    if slot == 0:
+        return 0
+    return Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=slot)[unsafe_offset=0]
+
+
+@always_inline
+def _ecs_rt_ctrl_addr_or_create() -> Int:
+    try:
+        return _ECS_RT_GLOBAL.get_or_create_ptr()[unsafe_offset=0]
+    except:
+        return 0
+
+
+@always_inline
+def _ecs_runtime_base() -> Int:
+    var ctrl = _ecs_rt_ctrl_addr()
+    if ctrl == 0:
+        return 0
+    return Int(
+        Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)[
+            unsafe_offset=0
+        ].load[ordering=Ordering.ACQUIRE]()
+    )
+
+
+@always_inline
+def _rt_word_at(base: Int, offset: Int) -> Pointer[Atomic[Int64], MutAnyOrigin]:
+    return Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=base + offset)
 
 
 @always_inline
 def _ecs_runtime_ready() -> Bool:
-    if external_call["msync", Int32](_ECS_RUNTIME_BASE, 4096, Int32(1)) != 0:
+    var base = _ecs_runtime_base()
+    if base == 0:
         return False
-    var magic = Int(_rt_word(_RT_MAGIC_OFF)[unsafe_offset=0].load())
+    var magic = Int(
+        _rt_word_at(base, _RT_MAGIC_OFF)[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+    )
     if magic != _ECS_RUNTIME_MAGIC:
         return False
     var pid = Int(external_call["getpid", Int32]())
-    return Int(_rt_word(_RT_PID_OFF)[unsafe_offset=0].load()) == pid
+    return (
+        Int(_rt_word_at(base, _RT_PID_OFF)[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]())
+        == pid
+    )
 
 
 def _ecs_runtime_ensure() -> Bool:
-    if _ecs_runtime_ready():
-        return True
-    var cur_pid = Int(external_call["getpid", Int32]())
-    var nonce = Int(
-        ((UInt64(cur_pid) * UInt64(0x9E3779B97F4A7C15)) ^ UInt64(monotonic())) & UInt64(0x3FFF)
-    )
-    if nonce == 0:
-        nonce = 1
-    var got = external_call["mmap", Int](
-        _ECS_RUNTIME_BASE,
-        _ECS_RUNTIME_BYTES,
-        Int32(3),
-        Int32(0x22 | 0x100000),
-        Int32(-1),
-        Int(0),
-    )
-    if got == _ECS_RUNTIME_BASE:
-        _rt_word(_RT_PID_OFF)[unsafe_offset=0].store(Int64(cur_pid))
-        _rt_word(_RT_NONCE_OFF)[unsafe_offset=0].store(Int64(nonce))
-        _rt_word(_RT_MAGIC_OFF)[unsafe_offset=0].store(Int64(_ECS_RUNTIME_MAGIC))
-        return True
-    if external_call["msync", Int32](_ECS_RUNTIME_BASE, 4096, Int32(1)) != 0:
+    var ctrl = _ecs_rt_ctrl_addr_or_create()
+    if ctrl == 0:
         return False
-    var magic = Int(_rt_word(_RT_MAGIC_OFF)[unsafe_offset=0].load())
-    if magic == _ECS_RUNTIME_MAGIC and Int(_rt_word(_RT_PID_OFF)[unsafe_offset=0].load()) != cur_pid:
-        # Inherited across fork(): reset process-local state cleanly for child PID
-        _ = external_call["memset", Int](_ECS_RUNTIME_BASE, Int32(0), _ECS_RUNTIME_BYTES)
-        _rt_word(_RT_PID_OFF)[unsafe_offset=0].store(Int64(cur_pid))
-        _rt_word(_RT_NONCE_OFF)[unsafe_offset=0].store(Int64(nonce))
-        _rt_word(_RT_MAGIC_OFF)[unsafe_offset=0].store(Int64(_ECS_RUNTIME_MAGIC))
-        return True
+    var cur_pid = Int(external_call["getpid", Int32]())
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    var existing = Int(base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]())
+    if existing != 0:
+        var magic = Int(
+            _rt_word_at(existing, _RT_MAGIC_OFF)[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+        )
+        if magic == _ECS_RUNTIME_MAGIC:
+            var rec_pid = Int(
+                _rt_word_at(existing, _RT_PID_OFF)[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+            )
+            if rec_pid == cur_pid:
+                return True
+            # Inherited across fork(): reset process-local state cleanly for child PID
+            _ = external_call["memset", Int](existing, Int32(0), _ECS_RUNTIME_BYTES)
+            _rt_word_at(existing, _RT_PID_OFF)[unsafe_offset=0].store[ordering=Ordering.RELEASE](
+                Int64(cur_pid)
+            )
+            _rt_word_at(existing, _RT_MAGIC_OFF)[unsafe_offset=0].store[ordering=Ordering.RELEASE](
+                Int64(_ECS_RUNTIME_MAGIC)
+            )
+            return True
+    var blk = external_call["aligned_alloc", Int](Int(64), Int(_ECS_RUNTIME_BYTES))
+    if blk == 0:
+        return False
+    _ = external_call["memset", Int](blk, Int32(0), _ECS_RUNTIME_BYTES)
+    _rt_word_at(blk, _RT_PID_OFF)[unsafe_offset=0].store[ordering=Ordering.RELEASE](Int64(cur_pid))
+    _rt_word_at(blk, _RT_MAGIC_OFF)[unsafe_offset=0].store[ordering=Ordering.RELEASE](
+        Int64(_ECS_RUNTIME_MAGIC)
+    )
+    var expected = Int64(0)
+    if not base_ptr[unsafe_offset=0].compare_exchange[
+        failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+    ](expected, Int64(blk)):
+        external_call["free", NoneType](blk)
     return _ecs_runtime_ready()
 
 
-@always_inline
-def _rt_lock():
-    var w = _rt_word(_RT_LOCK_OFF)
+def ecs_runtime_shutdown():
+    """Frees the dynamic ECS runtime block early (idempotent with __cxa_atexit)."""
+    var ctrl = _ecs_rt_ctrl_addr()
+    if ctrl == 0:
+        return
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
     while True:
-        var expected = Int64(0)
-        if w[unsafe_offset=0].compare_exchange(expected, Int64(1)):
+        var cur = base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+        if cur == 0:
             return
-        _ = external_call["sched_yield", Int32]()
+        var expected = cur
+        if base_ptr[unsafe_offset=0].compare_exchange[
+            failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+        ](expected, Int64(0)):
+            external_call["free", NoneType](Int(cur))
+            return
 
 
 @always_inline
-def _rt_unlock():
-    _rt_word(_RT_LOCK_OFF)[unsafe_offset=0].store(Int64(0))
-
-
-@always_inline
-def _lane_order_slot(lane: Int) -> Pointer[Atomic[Int64], MutAnyOrigin]:
+def _lane_order_slot_from_base(base: Int, lane: Int) -> Pointer[Atomic[Int64], MutAnyOrigin]:
     var slot = lane & (_WORKER_ORDER_SLOTS - 1)
-    return _rt_word(_RT_WORKER_ORDER_OFF + slot * 64)
+    return _rt_word_at(base, _RT_WORKER_ORDER_OFF + slot * 64)
 
 
 @always_inline
@@ -557,151 +765,20 @@ def _set_lane_implicit_order(lane: Int, implicit_order: UInt64):
     if not _ecs_runtime_ready():
         if not _ecs_runtime_ensure():
             return
-    _lane_order_slot(lane)[unsafe_offset=0].store(Int64(implicit_order))
+    var base = _ecs_runtime_base()
+    if base == 0:
+        return
+    _lane_order_slot_from_base(base, lane)[unsafe_offset=0].store(Int64(implicit_order))
 
 
 @always_inline
 def _get_lane_implicit_order(lane: Int) -> UInt64:
     if not _ecs_runtime_ready():
         return 0
-    return UInt64(_lane_order_slot(lane)[unsafe_offset=0].load())
-
-
-def _vault_store_clone(info: ComponentInfo, src_addr: Int) -> UInt64:
-    """Clones live non-trivial component at `src_addr` into the in-process Clone Vault and
-    returns an 8-byte tagged token (`0x464C5654` magic + 14-bit gen + 18-bit slot)."""
-    if src_addr == 0 or info.byte_size <= 0 or not _ecs_runtime_ensure():
+    var base = _ecs_runtime_base()
+    if base == 0:
         return 0
-    _rt_lock()
-    var slots_ptr = Int(_rt_word(_RT_SLOTS_PTR_OFF)[unsafe_offset=0].load())
-    var count = Int(_rt_word(_RT_COUNT_OFF)[unsafe_offset=0].load())
-    var cap = Int(_rt_word(_RT_CAP_OFF)[unsafe_offset=0].load())
-    var cursor = Int(_rt_word(_RT_CURSOR_OFF)[unsafe_offset=0].load())
-    var nonce = UInt32(Int(_rt_word(_RT_NONCE_OFF)[unsafe_offset=0].load()))
-
-    var slot_idx: Int
-    if count < _MAX_VAULT_SLOTS:
-        if count >= cap:
-            var new_cap = min(_MAX_VAULT_SLOTS, max(256, cap * 2))
-            var raw_bytes = ((new_cap * size_of[_VaultSlot]()) + 63) & ~63
-            var new_arr = external_call["aligned_alloc", Int](64, raw_bytes)
-            if new_arr == 0:
-                _rt_unlock()
-                return 0
-            _ = external_call["memset", Int](new_arr, Int32(0), raw_bytes)
-            if slots_ptr != 0:
-                if count > 0:
-                    _ = external_call["memcpy", Int](
-                        new_arr, slots_ptr, count * size_of[_VaultSlot]()
-                    )
-                external_call["free", NoneType](slots_ptr)
-            slots_ptr = new_arr
-            cap = new_cap
-            _rt_word(_RT_SLOTS_PTR_OFF)[unsafe_offset=0].store(Int64(slots_ptr))
-            _rt_word(_RT_CAP_OFF)[unsafe_offset=0].store(Int64(cap))
-        slot_idx = count
-        count += 1
-        _rt_word(_RT_COUNT_OFF)[unsafe_offset=0].store(Int64(count))
-        Pointer[_VaultSlot, MutAnyOrigin](unsafe_from_address=slots_ptr)[unsafe_offset=slot_idx] = (
-            _VaultSlot(0, 0, 0, 0, 0, 0, False, _noop_drop)
-        )
-    else:
-        slot_idx = cursor & (_MAX_VAULT_SLOTS - 1)
-        _rt_word(_RT_CURSOR_OFF)[unsafe_offset=0].store(Int64((slot_idx + 1) & (_MAX_VAULT_SLOTS - 1)))
-        ref old_slot = Pointer[_VaultSlot, MutAnyOrigin](unsafe_from_address=slots_ptr)[
-            unsafe_offset=slot_idx
-        ]
-        if old_slot.alive and old_slot.ptr != 0:
-            var old_drop = old_slot.destroy_fn
-            old_drop(old_slot.ptr)
-            old_slot.alive = False
-
-    ref slot = Pointer[_VaultSlot, MutAnyOrigin](unsafe_from_address=slots_ptr)[unsafe_offset=slot_idx]
-    var needed_bytes = max(64, (info.byte_size + 63) & ~63)
-    if slot.ptr == 0 or slot.alloc_bytes < needed_bytes:
-        if slot.ptr != 0:
-            external_call["free", NoneType](slot.ptr)
-        slot.ptr = external_call["aligned_alloc", Int](64, needed_bytes)
-        slot.alloc_bytes = needed_bytes if slot.ptr != 0 else 0
-    if slot.ptr == 0:
-        _rt_unlock()
-        return 0
-    _ = external_call["memset", Int](slot.ptr, Int32(0), slot.alloc_bytes)
-
-    var cfn = info.copy_init_fn
-    cfn(slot.ptr, src_addr)
-
-    var next_gen = (slot.gen + 1) & UInt32(0x3FFF)
-    if next_gen == 0:
-        next_gen = 1
-    slot.gen = next_gen
-    var tok_gen = (next_gen ^ nonce) & UInt32(0x3FFF)
-    if tok_gen == 0:
-        tok_gen = next_gen
-    var token = (UInt64(VAULT_TOKEN_MAGIC) << 32) | (UInt64(tok_gen) << 18) | UInt64(slot_idx)
-    slot.byte_size = info.byte_size
-    slot.component_hash = info.component_hash
-    slot.token = token
-    slot.destroy_fn = info.destroy_fn
-    slot.alive = True
-    _rt_unlock()
-    return token
-
-
-def _vault_restore_clone(token: UInt64, info: ComponentInfo, dst_addr: Int) -> Bool:
-    """Validates `token` in the in-process Clone Vault and copy-initializes `dst_addr`."""
-    if UInt32(token >> 32) != VAULT_TOKEN_MAGIC or dst_addr == 0:
-        return False
-    if not _ecs_runtime_ready():
-        return False
-    var slot_idx = Int(token & UInt64(_MAX_VAULT_SLOTS - 1))
-    _rt_lock()
-    var slots_ptr = Int(_rt_word(_RT_SLOTS_PTR_OFF)[unsafe_offset=0].load())
-    var count = Int(_rt_word(_RT_COUNT_OFF)[unsafe_offset=0].load())
-    if slots_ptr == 0 or slot_idx < 0 or slot_idx >= count:
-        _rt_unlock()
-        return False
-    ref slot = Pointer[_VaultSlot, ImmutAnyOrigin](unsafe_from_address=slots_ptr)[
-        unsafe_offset=slot_idx
-    ]
-    if (
-        not slot.alive
-        or slot.ptr == 0
-        or slot.token != token
-        or slot.component_hash != info.component_hash
-        or slot.byte_size != info.byte_size
-    ):
-        _rt_unlock()
-        return False
-    var cfn = info.copy_init_fn
-    cfn(dst_addr, slot.ptr)
-    _rt_unlock()
-    return True
-
-
-def clear_component_clone_vault():
-    """Destroys and releases all cached non-trivial component clones in the in-process vault."""
-    if not _ecs_runtime_ready():
-        return
-    _rt_lock()
-    var slots_ptr = Int(_rt_word(_RT_SLOTS_PTR_OFF)[unsafe_offset=0].load())
-    var count = Int(_rt_word(_RT_COUNT_OFF)[unsafe_offset=0].load())
-    if slots_ptr != 0:
-        var arr = Pointer[_VaultSlot, MutAnyOrigin](unsafe_from_address=slots_ptr)
-        for i in range(count):
-            if arr[unsafe_offset=i].alive and arr[unsafe_offset=i].ptr != 0:
-                var dfn = arr[unsafe_offset=i].destroy_fn
-                dfn(arr[unsafe_offset=i].ptr)
-                arr[unsafe_offset=i].alive = False
-            if arr[unsafe_offset=i].ptr != 0:
-                external_call["free", NoneType](arr[unsafe_offset=i].ptr)
-                arr[unsafe_offset=i].ptr = 0
-        external_call["free", NoneType](slots_ptr)
-    _rt_word(_RT_SLOTS_PTR_OFF)[unsafe_offset=0].store(0)
-    _rt_word(_RT_COUNT_OFF)[unsafe_offset=0].store(0)
-    _rt_word(_RT_CAP_OFF)[unsafe_offset=0].store(0)
-    _rt_word(_RT_CURSOR_OFF)[unsafe_offset=0].store(0)
-    _rt_unlock()
+    return UInt64(_lane_order_slot_from_base(base, lane)[unsafe_offset=0].load())
 
 
 # ---------------------------------------------------------------------------
@@ -852,38 +929,52 @@ struct ArchetypeChunk(Movable):
 struct Archetype(Movable):
     """Table archetype with cached `ArchetypeGraph` O(1) add/remove transition edges."""
     var id: Int
-    var table_mask: BitSet256
+    var table_mask: ComponentBitSet
     var comp_type_ids: List[Int]
     var col_elem_sizes: List[Int]
-    var type_to_col: Array[Int16, MAX_COMPONENTS]
-    var add_edges: Array[Int32, MAX_COMPONENTS]
-    var remove_edges: Array[Int32, MAX_COMPONENTS]
+    var type_to_col: List[Int32]
+    var add_edges: List[Int32]
+    var remove_edges: List[Int32]
     var chunks: List[ArchetypeChunk]
     var chunk_rows: Int
 
     def __init__(
         out self,
         id: Int,
-        table_mask: BitSet256,
+        table_mask: ComponentBitSet,
         comp_type_ids: List[Int],
         col_elem_sizes: List[Int],
         chunk_rows: Int = DEFAULT_CHUNK_ROWS,
     ):
         self.id = id
-        self.table_mask = table_mask
+        self.table_mask = table_mask.copy()
         self.comp_type_ids = comp_type_ids.copy()
         self.col_elem_sizes = col_elem_sizes.copy()
-        self.type_to_col = Array[Int16, MAX_COMPONENTS](fill=-1)
+        var max_tid = -1
         for c in range(len(comp_type_ids)):
-            self.type_to_col[comp_type_ids[c]] = Int16(c)
-        self.add_edges = Array[Int32, MAX_COMPONENTS](fill=-1)
-        self.remove_edges = Array[Int32, MAX_COMPONENTS](fill=-1)
+            if comp_type_ids[c] > max_tid:
+                max_tid = comp_type_ids[c]
+        self.type_to_col = List[Int32](length=max(0, max_tid + 1), fill=-1)
+        for c in range(len(comp_type_ids)):
+            self.type_to_col[comp_type_ids[c]] = Int32(c)
+        self.add_edges = List[Int32]()
+        self.remove_edges = List[Int32]()
         self.chunks = List[ArchetypeChunk]()
         self.chunk_rows = ((max(SIMD_LANES, chunk_rows) + (SIMD_LANES - 1)) // SIMD_LANES) * SIMD_LANES
 
     @always_inline
+    def _ensure_add_edge_cap(mut self, tid: Int):
+        while len(self.add_edges) <= tid:
+            self.add_edges.append(-1)
+
+    @always_inline
+    def _ensure_remove_edge_cap(mut self, tid: Int):
+        while len(self.remove_edges) <= tid:
+            self.remove_edges.append(-1)
+
+    @always_inline
     def col_index(self, type_id: Int) -> Int:
-        if type_id < 0 or type_id >= MAX_COMPONENTS:
+        if type_id < 0 or type_id >= len(self.type_to_col):
             return -1
         return Int(self.type_to_col[type_id])
 
@@ -1368,13 +1459,13 @@ struct Events[T: Copyable & Deinitable](Movable):
 # ---------------------------------------------------------------------------
 
 @fieldwise_init
-struct EntityRecord(Copyable, ImplicitlyCopyable, Movable):
+struct EntityRecord(Copyable, Movable):
     var generation: UInt32
     var alive: Bool
     var archetype_id: Int32
     var chunk_idx: Int32
     var row_in_chunk: Int32
-    var sparse_mask: BitSet256
+    var sparse_mask: ComponentBitSet
 
 
 def _blob_fits(reader: BlobReader, count: Int, elem_bytes: Int) -> Bool:
@@ -1416,20 +1507,20 @@ struct _ParSlice2(Copyable, ImplicitlyCopyable, Movable):
 
 
 @fieldwise_init
-struct _ParDispatch1[C0: Component](Copyable, ImplicitlyCopyable, Movable):
+struct _ParDispatch1[C0: Component](Copyable, Movable):
     var world_addr: Int
     var pool_addr: Int
     var slices_ptr: Int
     var kernel: def(Int, Int, Entity, Pointer[Self.C0, MutAnyOrigin], Int) thin -> None
     var user_ctx: Int
     var tid0: Int
-    var ex_sparse: BitSet256
+    var ex_sparse: ComponentBitSet
     var has_ex_sparse: Bool
-    var runtime_ready: Bool
+    var rt_base: Int
 
 
 @fieldwise_init
-struct _ParDispatch2[C0: Component, C1: Component](Copyable, ImplicitlyCopyable, Movable):
+struct _ParDispatch2[C0: Component, C1: Component](Copyable, Movable):
     var world_addr: Int
     var pool_addr: Int
     var slices_ptr: Int
@@ -1437,9 +1528,9 @@ struct _ParDispatch2[C0: Component, C1: Component](Copyable, ImplicitlyCopyable,
     var user_ctx: Int
     var tid0: Int
     var tid1: Int
-    var ex_sparse: BitSet256
+    var ex_sparse: ComponentBitSet
     var has_ex_sparse: Bool
-    var runtime_ready: Bool
+    var rt_base: Int
 
 
 def _par_worker1[C0: Component](ctx_addr: Int, slice_idx: Int):
@@ -1448,8 +1539,9 @@ def _par_worker1[C0: Component](ctx_addr: Int, slice_idx: Int):
     if disp.pool_addr != 0:
         ref pool = Pointer[JobPool, ImmutAnyOrigin](unsafe_from_address=disp.pool_addr)[unsafe_offset=0]
         lane = pool.current_thread_index()
-    var order_slot = _lane_order_slot(lane)
-    var prev_imp = UInt64(order_slot[unsafe_offset=0].load()) if disp.runtime_ready else UInt64(0)
+    var prev_imp = UInt64(0)
+    if disp.rt_base != 0:
+        prev_imp = UInt64(_lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].load())
     var sl = Pointer[_ParSlice1, ImmutAnyOrigin](unsafe_from_address=disp.slices_ptr)[unsafe_offset=slice_idx]
     var kfn = disp.kernel
     var ents = Pointer[Entity, ImmutAnyOrigin](unsafe_from_address=sl.entities_ptr)
@@ -1459,8 +1551,10 @@ def _par_worker1[C0: Component](ctx_addr: Int, slice_idx: Int):
             var ord = sl.global_order_base + i
             var e = ents[unsafe_offset=r]
             var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sl.col0_ptr + r * sl.elem0_size)
-            if disp.runtime_ready:
-                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            if disp.rt_base != 0:
+                _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(
+                    Int64(UInt64(ord) + 1)
+                )
             kfn(lane, ord, e, p0, disp.user_ctx)
     elif not sl.is_sparse0:
         ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=disp.world_addr)[unsafe_offset=0]
@@ -1471,8 +1565,10 @@ def _par_worker1[C0: Component](ctx_addr: Int, slice_idx: Int):
             if world.entities[Int(e.index)].sparse_mask.intersects(disp.ex_sparse):
                 continue
             var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sl.col0_ptr + r * sl.elem0_size)
-            if disp.runtime_ready:
-                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            if disp.rt_base != 0:
+                _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(
+                    Int64(UInt64(ord) + 1)
+                )
             kfn(lane, ord, e, p0, disp.user_ctx)
     else:
         ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=disp.world_addr)[unsafe_offset=0]
@@ -1486,11 +1582,13 @@ def _par_worker1[C0: Component](ctx_addr: Int, slice_idx: Int):
             var di = sset.dense_index_of(e.index)
             if di >= 0:
                 var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sset.value_ptr(di))
-                if disp.runtime_ready:
-                    order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+                if disp.rt_base != 0:
+                    _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(
+                        Int64(UInt64(ord) + 1)
+                    )
                 kfn(lane, ord, e, p0, disp.user_ctx)
-    if disp.runtime_ready:
-        order_slot[unsafe_offset=0].store(Int64(prev_imp))
+    if disp.rt_base != 0:
+        _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(Int64(prev_imp))
 
 
 def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
@@ -1499,8 +1597,9 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
     if disp.pool_addr != 0:
         ref pool = Pointer[JobPool, ImmutAnyOrigin](unsafe_from_address=disp.pool_addr)[unsafe_offset=0]
         lane = pool.current_thread_index()
-    var order_slot = _lane_order_slot(lane)
-    var prev_imp = UInt64(order_slot[unsafe_offset=0].load()) if disp.runtime_ready else UInt64(0)
+    var prev_imp = UInt64(0)
+    if disp.rt_base != 0:
+        prev_imp = UInt64(_lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].load())
     var sl = Pointer[_ParSlice2, ImmutAnyOrigin](unsafe_from_address=disp.slices_ptr)[unsafe_offset=slice_idx]
     var kfn = disp.kernel
     var ents = Pointer[Entity, ImmutAnyOrigin](unsafe_from_address=sl.entities_ptr)
@@ -1511,8 +1610,10 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
             var e = ents[unsafe_offset=r]
             var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sl.col0_ptr + r * sl.elem0_size)
             var p1 = Pointer[C1, MutAnyOrigin](unsafe_from_address=sl.col1_ptr + r * sl.elem1_size)
-            if disp.runtime_ready:
-                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            if disp.rt_base != 0:
+                _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(
+                    Int64(UInt64(ord) + 1)
+                )
             kfn(lane, ord, e, p0, p1, disp.user_ctx)
     else:
         ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=disp.world_addr)[unsafe_offset=0]
@@ -1540,8 +1641,10 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
                 if d1 < 0:
                     continue
                 a1 = s1.value_ptr(d1)
-            if disp.runtime_ready:
-                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            if disp.rt_base != 0:
+                _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(
+                    Int64(UInt64(ord) + 1)
+                )
             kfn(
                 lane,
                 ord,
@@ -1550,8 +1653,8 @@ def _par_worker2[C0: Component, C1: Component](ctx_addr: Int, slice_idx: Int):
                 Pointer[C1, MutAnyOrigin](unsafe_from_address=a1),
                 disp.user_ctx,
             )
-    if disp.runtime_ready:
-        order_slot[unsafe_offset=0].store(Int64(prev_imp))
+    if disp.rt_base != 0:
+        _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(Int64(prev_imp))
 
 
 @fieldwise_init
@@ -1579,7 +1682,7 @@ struct _ParSlice3(Copyable, ImplicitlyCopyable, Movable):
 
 
 @fieldwise_init
-struct _ParDispatch3[C0: Component, C1: Component, C2: Component](Copyable, ImplicitlyCopyable, Movable):
+struct _ParDispatch3[C0: Component, C1: Component, C2: Component](Copyable, Movable):
     var world_addr: Int
     var pool_addr: Int
     var slices_ptr: Int
@@ -1596,9 +1699,9 @@ struct _ParDispatch3[C0: Component, C1: Component, C2: Component](Copyable, Impl
     var tid0: Int
     var tid1: Int
     var tid2: Int
-    var ex_sparse: BitSet256
+    var ex_sparse: ComponentBitSet
     var has_ex_sparse: Bool
-    var runtime_ready: Bool
+    var rt_base: Int
 
 
 def _par_worker3[C0: Component, C1: Component, C2: Component](ctx_addr: Int, slice_idx: Int):
@@ -1607,8 +1710,9 @@ def _par_worker3[C0: Component, C1: Component, C2: Component](ctx_addr: Int, sli
     if disp.pool_addr != 0:
         ref pool = Pointer[JobPool, ImmutAnyOrigin](unsafe_from_address=disp.pool_addr)[unsafe_offset=0]
         lane = pool.current_thread_index()
-    var order_slot = _lane_order_slot(lane)
-    var prev_imp = UInt64(order_slot[unsafe_offset=0].load()) if disp.runtime_ready else UInt64(0)
+    var prev_imp = UInt64(0)
+    if disp.rt_base != 0:
+        prev_imp = UInt64(_lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].load())
     var sl = Pointer[_ParSlice3, ImmutAnyOrigin](unsafe_from_address=disp.slices_ptr)[unsafe_offset=slice_idx]
     var kfn = disp.kernel
     var ents = Pointer[Entity, ImmutAnyOrigin](unsafe_from_address=sl.entities_ptr)
@@ -1620,8 +1724,10 @@ def _par_worker3[C0: Component, C1: Component, C2: Component](ctx_addr: Int, sli
             var p0 = Pointer[C0, MutAnyOrigin](unsafe_from_address=sl.col0_ptr + r * sl.elem0_size)
             var p1 = Pointer[C1, MutAnyOrigin](unsafe_from_address=sl.col1_ptr + r * sl.elem1_size)
             var p2 = Pointer[C2, MutAnyOrigin](unsafe_from_address=sl.col2_ptr + r * sl.elem2_size)
-            if disp.runtime_ready:
-                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            if disp.rt_base != 0:
+                _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(
+                    Int64(UInt64(ord) + 1)
+                )
             kfn(lane, ord, e, p0, p1, p2, disp.user_ctx)
     else:
         ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=disp.world_addr)[unsafe_offset=0]
@@ -1658,8 +1764,10 @@ def _par_worker3[C0: Component, C1: Component, C2: Component](ctx_addr: Int, sli
                 if d2 < 0:
                     continue
                 a2 = s2.value_ptr(d2)
-            if disp.runtime_ready:
-                order_slot[unsafe_offset=0].store(Int64(UInt64(ord) + 1))
+            if disp.rt_base != 0:
+                _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(
+                    Int64(UInt64(ord) + 1)
+                )
             kfn(
                 lane,
                 ord,
@@ -1669,8 +1777,8 @@ def _par_worker3[C0: Component, C1: Component, C2: Component](ctx_addr: Int, sli
                 Pointer[C2, MutAnyOrigin](unsafe_from_address=a2),
                 disp.user_ctx,
             )
-    if disp.runtime_ready:
-        order_slot[unsafe_offset=0].store(Int64(prev_imp))
+    if disp.rt_base != 0:
+        _lane_order_slot_from_base(disp.rt_base, lane)[unsafe_offset=0].store(Int64(prev_imp))
 
 
 # ---------------------------------------------------------------------------
@@ -1685,32 +1793,34 @@ struct World(Movable):
     var live_entities: Int
     var current_tick: UInt32
     var components: List[ComponentInfo]
-    var comp_hash_keys: Array[UInt64, _COMP_HASH_CAP]
-    var comp_hash_vals: Array[Int16, _COMP_HASH_CAP]
-    var table_comp_mask: BitSet256
-    var sparse_comp_mask: BitSet256
-    var comp_to_sparse: Array[Int, MAX_COMPONENTS]
+    var comp_hash_keys: List[UInt64]
+    var comp_hash_vals: List[Int32]
+    var table_comp_mask: ComponentBitSet
+    var sparse_comp_mask: ComponentBitSet
+    var comp_to_sparse: List[Int]
     var sparse_sets: List[SparseSet]
     var archetypes: List[Archetype]
     var chunk_rows: Int
+    var restore_epoch: UInt64
 
     def __init__(out self, chunk_rows: Int = DEFAULT_CHUNK_ROWS):
         self.entities = List[EntityRecord]()
         self.free_indices = List[UInt32]()
         self.live_entities = 0
         self.current_tick = 1
+        self.restore_epoch = 0
         self.components = List[ComponentInfo]()
-        self.comp_hash_keys = Array[UInt64, _COMP_HASH_CAP](fill=0)
-        self.comp_hash_vals = Array[Int16, _COMP_HASH_CAP](fill=-1)
-        self.table_comp_mask = BitSet256()
-        self.sparse_comp_mask = BitSet256()
-        self.comp_to_sparse = Array[Int, MAX_COMPONENTS](fill=-1)
+        self.comp_hash_keys = List[UInt64](length=_INITIAL_COMP_HASH_CAP, fill=0)
+        self.comp_hash_vals = List[Int32](length=_INITIAL_COMP_HASH_CAP, fill=-1)
+        self.table_comp_mask = ComponentBitSet()
+        self.sparse_comp_mask = ComponentBitSet()
+        self.comp_to_sparse = List[Int]()
         self.sparse_sets = List[SparseSet]()
         self.chunk_rows = ((max(SIMD_LANES, chunk_rows) + (SIMD_LANES - 1)) // SIMD_LANES) * SIMD_LANES
         self.archetypes = List[Archetype]()
         var empty_ids = List[Int]()
         var empty_sizes = List[Int]()
-        self.archetypes.append(Archetype(0, BitSet256(), empty_ids, empty_sizes, self.chunk_rows))
+        self.archetypes.append(Archetype(0, ComponentBitSet(), empty_ids, empty_sizes, self.chunk_rows))
 
     def __deinit__(deinit self):
         self._drop_all_live_components()
@@ -1796,33 +1906,57 @@ struct World(Movable):
 
     @always_inline
     def find_component_by_hash(self, comp_hash: UInt64) -> Int:
-        var slot = Int(comp_hash ^ (comp_hash >> 33)) & _COMP_HASH_MASK
-        for _ in range(_COMP_HASH_CAP):
+        var cap = len(self.comp_hash_vals)
+        if cap == 0:
+            return -1
+        var mask = cap - 1
+        var slot = Int(comp_hash ^ (comp_hash >> 33)) & mask
+        for _ in range(cap):
             var tid = Int(self.comp_hash_vals[slot])
             if tid < 0:
                 return -1
             if self.comp_hash_keys[slot] == comp_hash:
                 return tid
-            slot = (slot + 1) & _COMP_HASH_MASK
+            slot = (slot + 1) & mask
         return -1
 
+    def _rehash_component_table(mut self, new_cap: Int):
+        var cap = max(_INITIAL_COMP_HASH_CAP, new_cap)
+        var new_keys = List[UInt64](length=cap, fill=0)
+        var new_vals = List[Int32](length=cap, fill=-1)
+        var mask = cap - 1
+        for i in range(len(self.comp_hash_vals)):
+            var tid = self.comp_hash_vals[i]
+            if tid >= 0:
+                var k = self.comp_hash_keys[i]
+                var slot = Int(k ^ (k >> 33)) & mask
+                while new_vals[slot] >= 0:
+                    slot = (slot + 1) & mask
+                new_keys[slot] = k
+                new_vals[slot] = tid
+        self.comp_hash_keys = new_keys^
+        self.comp_hash_vals = new_vals^
+
     def _index_component_hash(mut self, comp_hash: UInt64, tid: Int):
-        var slot = Int(comp_hash ^ (comp_hash >> 33)) & _COMP_HASH_MASK
-        for _ in range(_COMP_HASH_CAP):
+        var cap = len(self.comp_hash_vals)
+        if len(self.components) * 2 >= cap:
+            self._rehash_component_table(max(_INITIAL_COMP_HASH_CAP, cap * 2))
+            cap = len(self.comp_hash_vals)
+        var mask = cap - 1
+        var slot = Int(comp_hash ^ (comp_hash >> 33)) & mask
+        for _ in range(cap):
             if self.comp_hash_vals[slot] < 0 or self.comp_hash_keys[slot] == comp_hash:
                 self.comp_hash_keys[slot] = comp_hash
-                self.comp_hash_vals[slot] = Int16(tid)
+                self.comp_hash_vals[slot] = Int32(tid)
                 return
-            slot = (slot + 1) & _COMP_HASH_MASK
+            slot = (slot + 1) & mask
 
     def register_component[C: Component](mut self) -> Int:
-        """Idempotently registers `C` and returns its dense `0..255` component type ID."""
+        """Idempotently registers `C` and returns its dense component type ID."""
         var existing = self.find_component_by_hash(C.COMPONENT_ID)
         if existing >= 0:
             return existing
         var tid = len(self.components)
-        if tid >= MAX_COMPONENTS:
-            return -1
         comptime is_triv = C.__copy_ctor_is_trivial and C.__move_ctor_is_trivial and C.__del__is_trivial
         var cfn: _CopyInitFn = _noop_copy_init
         var mfn: _MoveInitFn = _noop_move_init
@@ -1853,9 +1987,10 @@ struct World(Movable):
         if mode == STORAGE_SPARSE:
             self.sparse_comp_mask.set(tid)
             var sidx = len(self.sparse_sets)
-            self.comp_to_sparse[tid] = sidx
+            self.comp_to_sparse.append(sidx)
             self.sparse_sets.append(SparseSet(tid, bsz))
         else:
+            self.comp_to_sparse.append(-1)
             self.table_comp_mask.set(tid)
         self._index_component_hash(C.COMPONENT_ID, tid)
         return tid
@@ -1885,8 +2020,6 @@ struct World(Movable):
                 return -1
             return existing
         var tid = len(self.components)
-        if tid >= MAX_COMPONENTS:
-            return -1
         var aln = max(1, alignment)
         self.components.append(
             ComponentInfo(
@@ -1907,9 +2040,10 @@ struct World(Movable):
         if storage_mode == STORAGE_SPARSE:
             self.sparse_comp_mask.set(tid)
             var sidx = len(self.sparse_sets)
-            self.comp_to_sparse[tid] = sidx
+            self.comp_to_sparse.append(sidx)
             self.sparse_sets.append(SparseSet(tid, bsz))
         else:
+            self.comp_to_sparse.append(-1)
             self.table_comp_mask.set(tid)
         self._index_component_hash(comp_hash, tid)
         return tid
@@ -1927,10 +2061,9 @@ struct World(Movable):
                 _ = external_call["memcpy", Int](dst_ptr, src_ptr, info.byte_size)
             self.entities[idx].sparse_mask.set(tid)
             return True
-        var rec = self.entities[idx]
-        var src_arch = Int(rec.archetype_id)
-        var src_ch = Int(rec.chunk_idx)
-        var src_row = Int(rec.row_in_chunk)
+        var src_arch = Int(self.entities[idx].archetype_id)
+        var src_ch = Int(self.entities[idx].chunk_idx)
+        var src_row = Int(self.entities[idx].row_in_chunk)
         var existing_col = self.archetypes[src_arch].col_index(tid)
         if existing_col >= 0:
             var cell = self.archetypes[src_arch].chunks[src_ch].cell_ptr(existing_col, src_row)
@@ -1952,7 +2085,7 @@ struct World(Movable):
     def has_by_type_id(self, entity: Entity, tid: Int) -> Bool:
         if tid < 0 or tid >= len(self.components) or not self.is_alive(entity):
             return False
-        var rec = self.entities[Int(entity.index)]
+        ref rec = self.entities[Int(entity.index)]
         if self.components[tid].storage_mode == STORAGE_SPARSE:
             return rec.sparse_mask.test(tid)
         return self.archetypes[Int(rec.archetype_id)].table_mask.test(tid)
@@ -1960,7 +2093,7 @@ struct World(Movable):
     def get_raw_ptr(self, entity: Entity, tid: Int) -> Int:
         if tid < 0 or tid >= len(self.components) or not self.is_alive(entity):
             return 0
-        var rec = self.entities[Int(entity.index)]
+        ref rec = self.entities[Int(entity.index)]
         var info = self.components[tid]
         if info.storage_mode == STORAGE_SPARSE:
             if not rec.sparse_mask.test(tid):
@@ -1980,10 +2113,10 @@ struct World(Movable):
     def get_raw_ptr_mut(mut self, entity: Entity, tid: Int) -> Int:
         if tid < 0 or tid >= len(self.components) or not self.is_alive(entity):
             return 0
-        var rec = self.entities[Int(entity.index)]
+        var idx = Int(entity.index)
         var info = self.components[tid]
         if info.storage_mode == STORAGE_SPARSE:
-            if not rec.sparse_mask.test(tid):
+            if not self.entities[idx].sparse_mask.test(tid):
                 return 0
             var sidx = self.comp_to_sparse[tid]
             var di = self.sparse_sets[sidx].dense_index_of(entity.index)
@@ -1991,12 +2124,12 @@ struct World(Movable):
                 return 0
             self.sparse_sets[sidx].changed_ticks[di] = self.current_tick
             return self.sparse_sets[sidx].value_ptr(di)
-        var arch_id = Int(rec.archetype_id)
+        var arch_id = Int(self.entities[idx].archetype_id)
+        var ch = Int(self.entities[idx].chunk_idx)
+        var row = Int(self.entities[idx].row_in_chunk)
         var col = self.archetypes[arch_id].col_index(tid)
         if col < 0:
             return 0
-        var ch = Int(rec.chunk_idx)
-        var row = Int(rec.row_in_chunk)
         self.archetypes[arch_id].chunks[ch].mark_changed(col, row, self.current_tick)
         var addr = self.archetypes[arch_id].chunks[ch].cell_ptr(col, row)
         if addr == 0 and info.byte_size == 0:
@@ -2007,9 +2140,9 @@ struct World(Movable):
     def component_id[C: Component](self) -> Int:
         return self.find_component_by_hash(C.COMPONENT_ID)
 
-    def bit_for[C: Component](mut self) -> BitSet256:
+    def bit_for[C: Component](mut self) -> ComponentBitSet:
         var tid = self.register_component[C]()
-        return BitSet256().with_bit(tid)
+        return ComponentBitSet().with_bit(tid)
 
     @always_inline
     def is_alive(self, entity: Entity) -> Bool:
@@ -2018,7 +2151,7 @@ struct World(Movable):
         var idx = Int(entity.index)
         if idx < 0 or idx >= len(self.entities):
             return False
-        var rec = self.entities[idx]
+        ref rec = self.entities[idx]
         return rec.alive and rec.generation == entity.generation
 
     def spawn_empty(mut self) -> Entity:
@@ -2032,24 +2165,28 @@ struct World(Movable):
         else:
             idx = UInt32(len(self.entities))
             gen = 1
-            self.entities.append(EntityRecord(1, False, 0, 0, 0, BitSet256()))
+            self.entities.append(EntityRecord(1, False, 0, 0, 0, ComponentBitSet()))
         var entity = Entity(idx, gen)
         var ch_idx = self.archetypes[0].ensure_chunk_with_space()
         var row = self.archetypes[0].chunks[ch_idx].push_uninit_row(entity, self.current_tick)
         self.entities[Int(idx)] = EntityRecord(
-            gen, True, 0, Int32(ch_idx), Int32(row), BitSet256()
+            gen, True, 0, Int32(ch_idx), Int32(row), ComponentBitSet()
         )
         self.live_entities += 1
         return entity
+
+    def spawn(mut self) -> Entity:
+        return self.spawn_empty()
 
     def despawn(mut self, entity: Entity) -> Bool:
         if not self.is_alive(entity):
             return False
         var idx = Int(entity.index)
-        var rec = self.entities[idx]
-        var arch_id = Int(rec.archetype_id)
-        var ch_idx = Int(rec.chunk_idx)
-        var row = Int(rec.row_in_chunk)
+        var rec_gen = self.entities[idx].generation
+        var arch_id = Int(self.entities[idx].archetype_id)
+        var ch_idx = Int(self.entities[idx].chunk_idx)
+        var row = Int(self.entities[idx].row_in_chunk)
+        var smask = self.entities[idx].sparse_mask.copy()
 
         # Drop table components at row, then swap-remove row in chunk
         for c in range(len(self.archetypes[arch_id].comp_type_ids)):
@@ -2065,55 +2202,65 @@ struct World(Movable):
         self._reclaim_empty_chunk(arch_id, ch_idx)
 
         # Remove any sparse components attached to this entity
-        var smask = rec.sparse_mask
-        while not smask.is_empty():
-            var stid = smask.first_set()
-            smask.clear(stid)
-            var sidx = self.comp_to_sparse[stid]
-            if sidx >= 0:
-                _ = self.sparse_sets[sidx].remove(entity.index, self.components[stid])
+        var wc = smask.trimmed_word_count()
+        for wi in range(wc):
+            var w = smask.word_at(wi)
+            while w != 0:
+                var stid = wi * 64 + _ctz64(w)
+                w &= w - 1
+                var sidx = self.comp_to_sparse[stid]
+                if sidx >= 0:
+                    _ = self.sparse_sets[sidx].remove(entity.index, self.components[stid])
 
-        var next_gen = _next_entity_gen(rec.generation)
-        self.entities[idx] = EntityRecord(next_gen, False, -1, -1, -1, BitSet256())
+        var next_gen = _next_entity_gen(rec_gen)
+        self.entities[idx] = EntityRecord(next_gen, False, -1, -1, -1, ComponentBitSet())
         self.free_indices.append(entity.index)
         self.live_entities -= 1
         return True
 
     # ---- ArchetypeGraph O(1) Transitions ----
 
-    def _find_or_create_archetype(mut self, mask: BitSet256) -> Int:
+    def _find_or_create_archetype(mut self, mask: ComponentBitSet) -> Int:
         for i in range(len(self.archetypes)):
             if self.archetypes[i].table_mask == mask:
                 return i
         var ids = List[Int]()
         var sizes = List[Int]()
-        var rem = mask
-        while not rem.is_empty():
-            var tid = rem.first_set()
-            rem.clear(tid)
-            ids.append(tid)
-            sizes.append(self.components[tid].byte_size)
+        var wc = mask.trimmed_word_count()
+        for wi in range(wc):
+            var w = mask.word_at(wi)
+            while w != 0:
+                var tid = wi * 64 + _ctz64(w)
+                w &= w - 1
+                ids.append(tid)
+                sizes.append(self.components[tid].byte_size)
         var new_id = len(self.archetypes)
         self.archetypes.append(Archetype(new_id, mask, ids, sizes, self.chunk_rows))
         return new_id
 
     def _next_archetype_add(mut self, src_arch: Int, tid: Int) -> Int:
-        var cached = Int(self.archetypes[src_arch].add_edges[tid])
-        if cached >= 0:
-            return cached
+        if tid >= 0 and tid < len(self.archetypes[src_arch].add_edges):
+            var cached = Int(self.archetypes[src_arch].add_edges[tid])
+            if cached >= 0:
+                return cached
         var target_mask = self.archetypes[src_arch].table_mask.with_bit(tid)
         var dst_arch = self._find_or_create_archetype(target_mask)
+        self.archetypes[src_arch]._ensure_add_edge_cap(tid)
         self.archetypes[src_arch].add_edges[tid] = Int32(dst_arch)
+        self.archetypes[dst_arch]._ensure_remove_edge_cap(tid)
         self.archetypes[dst_arch].remove_edges[tid] = Int32(src_arch)
         return dst_arch
 
     def _next_archetype_remove(mut self, src_arch: Int, tid: Int) -> Int:
-        var cached = Int(self.archetypes[src_arch].remove_edges[tid])
-        if cached >= 0:
-            return cached
+        if tid >= 0 and tid < len(self.archetypes[src_arch].remove_edges):
+            var cached = Int(self.archetypes[src_arch].remove_edges[tid])
+            if cached >= 0:
+                return cached
         var target_mask = self.archetypes[src_arch].table_mask.without_bit(tid)
         var dst_arch = self._find_or_create_archetype(target_mask)
+        self.archetypes[src_arch]._ensure_remove_edge_cap(tid)
         self.archetypes[src_arch].remove_edges[tid] = Int32(dst_arch)
+        self.archetypes[dst_arch]._ensure_add_edge_cap(tid)
         self.archetypes[dst_arch].add_edges[tid] = Int32(src_arch)
         return dst_arch
 
@@ -2181,10 +2328,9 @@ struct World(Movable):
             self.entities[idx].sparse_mask.set(tid)
             return True
 
-        var rec = self.entities[idx]
-        var src_arch = Int(rec.archetype_id)
-        var src_ch = Int(rec.chunk_idx)
-        var src_row = Int(rec.row_in_chunk)
+        var src_arch = Int(self.entities[idx].archetype_id)
+        var src_ch = Int(self.entities[idx].chunk_idx)
+        var src_row = Int(self.entities[idx].row_in_chunk)
         var existing_col = self.archetypes[src_arch].col_index(tid)
         if existing_col >= 0:
             var cell = self.archetypes[src_arch].chunks[src_ch].cell_ptr(existing_col, src_row)
@@ -2219,13 +2365,14 @@ struct World(Movable):
             var sidx = self.comp_to_sparse[tid]
             return self.sparse_sets[sidx].remove(entity.index, info)
 
-        var rec = self.entities[idx]
-        var src_arch = Int(rec.archetype_id)
+        var src_arch = Int(self.entities[idx].archetype_id)
+        var src_ch = Int(self.entities[idx].chunk_idx)
+        var src_row = Int(self.entities[idx].row_in_chunk)
         if not self.archetypes[src_arch].table_mask.test(tid):
             return False
         var dst_arch = self._next_archetype_remove(src_arch, tid)
         _ = self._move_entity_archetype(
-            entity, src_arch, Int(rec.chunk_idx), Int(rec.row_in_chunk), dst_arch, tid
+            entity, src_arch, src_ch, src_row, dst_arch, tid
         )
         return True
 
@@ -2239,7 +2386,7 @@ struct World(Movable):
         var tid = self.find_component_by_hash(C.COMPONENT_ID)
         if tid < 0:
             return False
-        var rec = self.entities[Int(entity.index)]
+        ref rec = self.entities[Int(entity.index)]
         if C.STORAGE_MODE == STORAGE_SPARSE:
             return rec.sparse_mask.test(tid)
         return self.archetypes[Int(rec.archetype_id)].table_mask.test(tid)
@@ -2268,8 +2415,8 @@ struct World(Movable):
 
     def query_entities(
         self,
-        with_mask: BitSet256,
-        without_mask: BitSet256 = BitSet256(),
+        with_mask: ComponentBitSet,
+        without_mask: ComponentBitSet = ComponentBitSet(),
     ) -> List[Entity]:
         """Collects all live entities matching `with_mask` and excluding `without_mask`."""
         var out = List[Entity]()
@@ -2294,7 +2441,7 @@ struct World(Movable):
                 for r in range(chunk.count):
                     var e = chunk.entities[r]
                     if check_sparse:
-                        var sm = self.entities[Int(e.index)].sparse_mask
+                        ref sm = self.entities[Int(e.index)].sparse_mask
                         if not sm.contains_all(req_sparse) or sm.intersects(ex_sparse):
                             continue
                     out.append(e)
@@ -2303,8 +2450,8 @@ struct World(Movable):
     def query_changed_entities[C: Component](
         self,
         since_tick: UInt32,
-        with_mask: BitSet256 = BitSet256(),
-        without_mask: BitSet256 = BitSet256(),
+        with_mask: ComponentBitSet = ComponentBitSet(),
+        without_mask: ComponentBitSet = ComponentBitSet(),
     ) -> List[Entity]:
         """Collects all live entities with `C` (plus `with_mask`, excluding `without_mask`)
         whose `C` changed after `since_tick`, skipping unchanged chunks and 8-row SIMD groups."""
@@ -2346,7 +2493,7 @@ struct World(Movable):
                         for r in range(r_start, r_end):
                             var e = chunk.entities[r]
                             if check_sparse:
-                                var sm = self.entities[Int(e.index)].sparse_mask
+                                ref sm = self.entities[Int(e.index)].sparse_mask
                                 if not sm.contains_all(req_sparse) or sm.intersects(ex_sparse):
                                     continue
                             out.append(e)
@@ -2354,7 +2501,7 @@ struct World(Movable):
                     for r in range(chunk.count):
                         var e = chunk.entities[r]
                         if check_sparse:
-                            var sm = self.entities[Int(e.index)].sparse_mask
+                            ref sm = self.entities[Int(e.index)].sparse_mask
                             if not sm.contains_all(req_sparse) or sm.intersects(ex_sparse):
                                 continue
                         if is_sparse and since_tick > 0:
@@ -2370,7 +2517,7 @@ struct World(Movable):
         mut pool: JobPool,
         kernel: def(Int, Int, Entity, Pointer[C0, MutAnyOrigin], Int) thin -> None,
         user_ctx: Int = 0,
-        without_mask: BitSet256 = BitSet256(),
+        without_mask: ComponentBitSet = ComponentBitSet(),
         read_only: Bool = False,
         changed_since: UInt32 = 0,
     ):
@@ -2380,8 +2527,8 @@ struct World(Movable):
         var tid0 = self.find_component_by_hash(C0.COMPONENT_ID)
         if tid0 < 0:
             return
-        var rt_ready = _ecs_runtime_ensure()
-        var req_mask = BitSet256().with_bit(tid0)
+        var rt_base = _ecs_runtime_base() if _ecs_runtime_ensure() else 0
+        var req_mask = ComponentBitSet().with_bit(tid0)
         var req_table = req_mask.intersection(self.table_comp_mask)
         var ex_table = without_mask.intersection(self.table_comp_mask)
         var ex_sparse = without_mask.intersection(self.sparse_comp_mask)
@@ -2432,9 +2579,9 @@ struct World(Movable):
                 kernel,
                 user_ctx,
                 tid0,
-                ex_sparse,
+                ex_sparse^,
                 has_ex_sparse,
-                rt_ready,
+                rt_base,
             )
             run_parallel_ctx(pool, len(slices), disp, _par_worker1[C0])
         for a in range(len(self.archetypes)):
@@ -2451,7 +2598,7 @@ struct World(Movable):
         mut pool: JobPool,
         kernel: def(Int, Int, Entity, Pointer[C0, MutAnyOrigin], Pointer[C1, MutAnyOrigin], Int) thin -> None,
         user_ctx: Int = 0,
-        without_mask: BitSet256 = BitSet256(),
+        without_mask: ComponentBitSet = ComponentBitSet(),
         read_only: Bool = False,
         changed_since: UInt32 = 0,
     ):
@@ -2462,8 +2609,8 @@ struct World(Movable):
         var tid1 = self.find_component_by_hash(C1.COMPONENT_ID)
         if tid0 < 0 or tid1 < 0:
             return
-        var rt_ready = _ecs_runtime_ensure()
-        var req_mask = BitSet256().with_bit(tid0).with_bit(tid1)
+        var rt_base = _ecs_runtime_base() if _ecs_runtime_ensure() else 0
+        var req_mask = ComponentBitSet().with_bit(tid0).with_bit(tid1)
         var req_table = req_mask.intersection(self.table_comp_mask)
         var ex_table = without_mask.intersection(self.table_comp_mask)
         var ex_sparse = without_mask.intersection(self.sparse_comp_mask)
@@ -2532,9 +2679,9 @@ struct World(Movable):
                 user_ctx,
                 tid0,
                 tid1,
-                ex_sparse,
+                ex_sparse^,
                 has_ex_sparse,
-                rt_ready,
+                rt_base,
             )
             run_parallel_ctx(pool, len(slices), disp, _par_worker2[C0, C1])
         for a in range(len(self.archetypes)):
@@ -2559,7 +2706,7 @@ struct World(Movable):
             Int,
         ) thin -> None,
         user_ctx: Int = 0,
-        without_mask: BitSet256 = BitSet256(),
+        without_mask: ComponentBitSet = ComponentBitSet(),
         read_only: Bool = False,
         changed_since: UInt32 = 0,
     ):
@@ -2571,8 +2718,8 @@ struct World(Movable):
         var tid2 = self.find_component_by_hash(C2.COMPONENT_ID)
         if tid0 < 0 or tid1 < 0 or tid2 < 0:
             return
-        var rt_ready = _ecs_runtime_ensure()
-        var req_mask = BitSet256().with_bit(tid0).with_bit(tid1).with_bit(tid2)
+        var rt_base = _ecs_runtime_base() if _ecs_runtime_ensure() else 0
+        var req_mask = ComponentBitSet().with_bit(tid0).with_bit(tid1).with_bit(tid2)
         var req_table = req_mask.intersection(self.table_comp_mask)
         var ex_table = without_mask.intersection(self.table_comp_mask)
         var ex_sparse = without_mask.intersection(self.sparse_comp_mask)
@@ -2658,9 +2805,9 @@ struct World(Movable):
                 tid0,
                 tid1,
                 tid2,
-                ex_sparse,
+                ex_sparse^,
                 has_ex_sparse,
-                rt_ready,
+                rt_base,
             )
             run_parallel_ctx(pool, len(slices), disp, _par_worker3[C0, C1, C2])
         for a in range(len(self.archetypes)):
@@ -2744,16 +2891,18 @@ struct World(Movable):
         """Computes a registration-order-independent deterministic 64-bit hash of the ECS World."""
         var h = mix64(UInt64(0xEC520005EC520005) ^ UInt64(self.live_entities))
         for i in range(len(self.entities)):
-            var rec = self.entities[i]
+            ref rec = self.entities[i]
             if rec.alive:
                 h = mix64(h ^ (UInt64(i) | (UInt64(rec.generation) << 32)))
-                var sm = rec.sparse_mask
                 var sm_hash = UInt64(0)
-                while not sm.is_empty():
-                    var stid = sm.first_set()
-                    sm.clear(stid)
-                    if stid >= 0 and stid < len(self.components):
-                        sm_hash ^= mix64(self.components[stid].component_hash)
+                var wc = rec.sparse_mask.trimmed_word_count()
+                for wi in range(wc):
+                    var w = rec.sparse_mask.word_at(wi)
+                    while w != 0:
+                        var stid = wi * 64 + _ctz64(w)
+                        w &= w - 1
+                        if stid >= 0 and stid < len(self.components):
+                            sm_hash ^= mix64(self.components[stid].component_hash)
                 h = mix64(h ^ sm_hash)
 
         var arch_acc = UInt64(0)
@@ -2820,9 +2969,41 @@ struct World(Movable):
             sparse_acc ^= mix64(sh)
         return mix64(h ^ sparse_acc)
 
-    def snapshot_blob(self, mut out: BlobWriter):
-        """Writes an instant `<0.2 ms` binary snapshot of component metadata, entities, archetypes,
-        and sparse sets (cloning non-trivial components without custom codecs into the Clone Vault)."""
+    def snapshot_blob(self) raises -> List[UInt8]:
+        """Returns a portable binary snapshot of this `World` as `List[UInt8]`."""
+        var writer = BlobWriter()
+        self.snapshot_blob(writer)
+        var out = List[UInt8]()
+        swap(out, writer.data)
+        return out^
+
+    def snapshot_blob(self, mut out: BlobWriter) raises:
+        """Writes a portable `<0.2 ms` binary snapshot of component metadata, entities, archetypes,
+        and sparse sets. Raises `Error` if any live non-trivial component lacks binary hooks."""
+        # Pre-validate before mutating `out` so a failing snapshot leaves `out` intact.
+        for a in range(len(self.archetypes)):
+            ref arch = self.archetypes[a]
+            if arch.entity_count() > 0:
+                for c in range(len(arch.comp_type_ids)):
+                    var tid = arch.comp_type_ids[c]
+                    var info = self.components[tid]
+                    if info.byte_size > 0 and not info.has_custom_bin and not info.is_trivial_pod:
+                        raise Error(
+                            "World.snapshot_blob: non-trivial component "
+                            + String(info.component_hash)
+                            + " lacks binary serialization hooks"
+                        )
+        for s in range(len(self.sparse_sets)):
+            ref sset = self.sparse_sets[s]
+            if len(sset.dense_entities) > 0:
+                var info = self.components[sset.type_id]
+                if info.byte_size > 0 and not info.has_custom_bin and not info.is_trivial_pod:
+                    raise Error(
+                        "World.snapshot_blob: non-trivial sparse component "
+                        + String(info.component_hash)
+                        + " lacks binary serialization hooks"
+                    )
+
         out.begin(WORLD_BLOB_TAG, WORLD_BLOB_VERSION)
         out.u32(self.current_tick)
         out.integer(self.live_entities)
@@ -2830,7 +3011,7 @@ struct World(Movable):
         out.integer(len(self.free_indices))
 
         # Compute which registered components are actually referenced by non-empty storage
-        var used_mask = BitSet256()
+        var used_mask = ComponentBitSet()
         var non_empty_archs = 0
         for a in range(len(self.archetypes)):
             if self.archetypes[a].entity_count() > 0:
@@ -2851,11 +3032,9 @@ struct World(Movable):
             out.integer(info.byte_size)
             out.boolean(used_mask.test(i))
 
-        if len(self.entities) > 0:
-            out.write_bytes_raw(
-                Int(self.entities.unsafe_ptr()),
-                len(self.entities) * size_of[EntityRecord](),
-            )
+        for i in range(len(self.entities)):
+            out.u32(self.entities[i].generation)
+            out.boolean(self.entities[i].alive)
         if len(self.free_indices) > 0:
             out.write_bytes_raw(
                 Int(self.free_indices.unsafe_ptr()),
@@ -2869,10 +3048,10 @@ struct World(Movable):
             ref arch = self.archetypes[a]
             if arch.entity_count() == 0:
                 continue
-            out.u64(arch.table_mask.w0)
-            out.u64(arch.table_mask.w1)
-            out.u64(arch.table_mask.w2)
-            out.u64(arch.table_mask.w3)
+            var wc = arch.table_mask.trimmed_word_count()
+            out.u32(UInt32(wc))
+            for wi in range(wc):
+                out.u64(arch.table_mask.word_at(wi))
             out.integer(len(arch.chunks))
             for ch in range(len(arch.chunks)):
                 ref chunk = arch.chunks[ch]
@@ -2893,14 +3072,9 @@ struct World(Movable):
                                 out.u8(1)
                                 for r in range(chunk.count):
                                     info.write_custom_bin(col_ptr + r * info.byte_size, out_addr)
-                            elif info.is_trivial_pod:
+                            else:
                                 out.u8(0)
                                 out.write_bytes_raw(col_ptr, chunk.count * info.byte_size)
-                            else:
-                                out.u8(2)
-                                for r in range(chunk.count):
-                                    var tok = _vault_store_clone(info, col_ptr + r * info.byte_size)
-                                    out.u64(tok)
 
         out.integer(non_empty_sparse)
         for s in range(len(self.sparse_sets)):
@@ -2920,14 +3094,9 @@ struct World(Movable):
                     out.u8(1)
                     for r in range(scnt):
                         info.write_custom_bin(sset.value_ptr(r), out_addr)
-                elif info.is_trivial_pod:
+                else:
                     out.u8(0)
                     out.write_bytes_raw(sset.data_ptr, scnt * info.byte_size)
-                else:
-                    out.u8(2)
-                    for r in range(scnt):
-                        var tok = _vault_store_clone(info, sset.value_ptr(r))
-                        out.u64(tok)
         out.end()
 
     def _abort_partial_chunk(
@@ -2951,10 +3120,67 @@ struct World(Movable):
         chunk.count = 0
         chunk.entities.clear()
 
+    def _find_or_create_staged_archetype(
+        self,
+        mut staged_archetypes: List[Archetype],
+        mask: ComponentBitSet,
+    ) -> Int:
+        for i in range(len(staged_archetypes)):
+            if staged_archetypes[i].table_mask == mask:
+                return i
+        var ids = List[Int]()
+        var sizes = List[Int]()
+        var wc = mask.trimmed_word_count()
+        for wi in range(wc):
+            var w = mask.word_at(wi)
+            while w != 0:
+                var tid = wi * 64 + _ctz64(w)
+                w &= w - 1
+                ids.append(tid)
+                sizes.append(self.components[tid].byte_size)
+        var new_id = len(staged_archetypes)
+        staged_archetypes.append(Archetype(new_id, mask, ids, sizes, self.chunk_rows))
+        return new_id
+
+    def _drop_staged_state(
+        self,
+        mut staged_archetypes: List[Archetype],
+        mut staged_sparse: List[SparseSet],
+    ):
+        for a in range(len(staged_archetypes)):
+            ref arch = staged_archetypes[a]
+            for ch in range(len(arch.chunks)):
+                ref chunk = arch.chunks[ch]
+                for c in range(len(arch.comp_type_ids)):
+                    var tid = arch.comp_type_ids[c]
+                    var info = self.components[tid]
+                    if info.byte_size > 0 and not info.is_trivial_pod:
+                        var base = chunk.column_ptr(c)
+                        for r in range(chunk.count):
+                            info.drop_at(base + r * info.byte_size)
+                chunk.count = 0
+                chunk.entities.clear()
+        for s in range(len(staged_sparse)):
+            var tid = staged_sparse[s].type_id
+            staged_sparse[s].clear_with_drop(self.components[tid])
+
+    def restore_blob(mut self, data: Span[UInt8, _]) raises:
+        """Restores `World` from raw `snapshot_blob` bytes."""
+        var buf = List[UInt8](capacity=max(1, len(data)))
+        if len(data) > 0:
+            buf.resize(unsafe_uninit_length=len(data))
+            _ = external_call["memcpy", Int](
+                Int(buf.unsafe_ptr()), Int(data.unsafe_ptr()), len(data)
+            )
+        var reader = BlobReader(buf^)
+        self.restore_blob(reader)
+
     def restore_blob(mut self, mut reader: BlobReader) raises:
         """Restores `World` from a `snapshot_blob` buffer (`<0.2 ms`), remapping component IDs by
-        `COMPONENT_ID` hash and validating all registered components before mutating `self`."""
-        _ = reader.enter(WORLD_BLOB_TAG, WORLD_BLOB_VERSION)
+        `COMPONENT_ID` hash and staging all data before mutating `self` so any error leaves `self` untouched."""
+        var blob_ver = reader.enter(WORLD_BLOB_TAG, WORLD_BLOB_VERSION)
+        if blob_ver != WORLD_BLOB_VERSION:
+            raise Error("World.restore_blob: unsupported ECS2 blob version " + String(blob_ver))
         var saved_tick = reader.u32()
         var saved_live = reader.integer()
         var ent_len = reader.integer()
@@ -2966,16 +3192,18 @@ struct World(Movable):
             or ent_len < 0
             or free_len < 0
             or saved_comp_count < 0
-            or saved_comp_count > MAX_COMPONENTS
+            or saved_live > ent_len
         ):
             raise Error("World.restore_blob: corrupted ECS2 header")
-        if not _blob_fits(reader, ent_len, size_of[EntityRecord]()) or not _blob_fits(
-            reader, free_len, size_of[UInt32]()
+        if (
+            not _blob_fits(reader, ent_len, 5)
+            or not _blob_fits(reader, free_len, size_of[UInt32]())
+            or not _blob_fits(reader, saved_comp_count, 25)
         ):
-            raise Error("World.restore_blob: entity or free-list count exceeds blob size")
+            raise Error("World.restore_blob: header counts exceed blob size")
 
-        # Validate & remap saved_i -> local_i BEFORE mutating self!
-        var saved_to_local = Array[Int, MAX_COMPONENTS](fill=-1)
+        # Validate & remap saved_i -> local_i BEFORE staging/mutating self!
+        var saved_to_local = List[Int](length=saved_comp_count, fill=-1)
         for si in range(saved_comp_count):
             var chash = reader.u64()
             var smode = reader.integer()
@@ -2999,84 +3227,86 @@ struct World(Movable):
             elif local_tid >= 0 and self.components[local_tid].storage_mode == smode and self.components[local_tid].byte_size == bsz:
                 saved_to_local[si] = local_tid
 
-        var new_entities = List[EntityRecord](capacity=max(1, ent_len))
-        new_entities.resize(unsafe_uninit_length=ent_len)
-        if ent_len > 0:
-            if not reader.read_bytes_raw(
-                Int(new_entities.unsafe_ptr()), ent_len * size_of[EntityRecord]()
-            ):
-                raise Error("World.restore_blob: truncated ECS2 entity records")
-        # Placement comes only from the chunk tables below, never from the raw records;
-        # `alive` is normalized from its raw byte (any non-zero byte means alive).
+        var staged_entities = List[EntityRecord](capacity=max(1, ent_len))
         var alive_count = 0
-        for i in range(ent_len):
-            var alive_byte = Pointer[UInt8, ImmutAnyOrigin](
-                unsafe_from_address=Int(Pointer(to=new_entities[i].alive))
-            )[unsafe_offset=0]
-            new_entities[i].alive = alive_byte != 0
-            new_entities[i].sparse_mask = BitSet256()
-            new_entities[i].archetype_id = -1
-            new_entities[i].chunk_idx = -1
-            new_entities[i].row_in_chunk = -1
-            if new_entities[i].alive:
+        for _ in range(ent_len):
+            var gen = reader.u32()
+            var is_alive = reader.boolean()
+            if reader.failed:
+                raise Error("World.restore_blob: truncated ECS2 entity records")
+            if gen == 0 or (gen & PROVISIONAL_GEN_BIT) != 0 or gen > MAX_LIVE_GENERATION:
+                raise Error("World.restore_blob: invalid or provisional entity generation")
+            staged_entities.append(EntityRecord(gen, is_alive, -1, -1, -1, ComponentBitSet()))
+            if is_alive:
                 alive_count += 1
         if alive_count != saved_live:
             raise Error("World.restore_blob: live entity count does not match entity records")
 
-        var new_free = List[UInt32](capacity=max(1, free_len))
-        new_free.resize(unsafe_uninit_length=free_len)
+        var staged_free = List[UInt32](capacity=max(1, free_len))
+        staged_free.resize(unsafe_uninit_length=free_len)
         if free_len > 0:
             if not reader.read_bytes_raw(
-                Int(new_free.unsafe_ptr()), free_len * size_of[UInt32]()
+                Int(staged_free.unsafe_ptr()), free_len * size_of[UInt32]()
             ):
                 raise Error("World.restore_blob: truncated ECS2 free list")
+        var seen_free = List[Bool](length=ent_len, fill=False)
         for i in range(free_len):
-            var fidx = Int(new_free[i])
-            if fidx >= ent_len or new_entities[fidx].alive:
-                raise Error("World.restore_blob: free list names a live or out-of-range entity")
+            var fidx = Int(staged_free[i])
+            if fidx < 0 or fidx >= ent_len or staged_entities[fidx].alive or seen_free[fidx]:
+                raise Error("World.restore_blob: free list names a live, duplicate, or out-of-range entity")
+            seen_free[fidx] = True
 
-        # Header & entity tables validated: now safe to clear destination world
-        self._drop_all_live_components()
-        for a in range(len(self.archetypes)):
-            self.archetypes[a].chunks.clear()
-        self.current_tick = saved_tick
-        self.live_entities = saved_live
-        self.entities = new_entities^
-        self.free_indices = new_free^
+        # Decode archetypes, chunks, and sparse sets into staged storage before mutating `self`.
+        var staged_archetypes = List[Archetype]()
+        var empty_ids = List[Int]()
+        var empty_sizes = List[Int]()
+        staged_archetypes.append(Archetype(0, ComponentBitSet(), empty_ids, empty_sizes, self.chunk_rows))
+        var staged_sparse = List[SparseSet]()
+        var staged_sparse_sidx = List[Int]()
 
         var reader_addr = Int(Pointer(to=reader))
         var num_archs = reader.integer()
-        if num_archs < 0 or reader.failed or not _blob_fits(reader, num_archs, 40):
-            self.clear_entities()
+        if num_archs < 0 or reader.failed or not _blob_fits(reader, num_archs, 12):
             raise Error("World.restore_blob: corrupted archetype count")
 
         for _ in range(num_archs):
-            var saved_mask = BitSet256(reader.u64(), reader.u64(), reader.u64(), reader.u64())
-            var local_mask = BitSet256()
-            var rem = saved_mask
-            while not rem.is_empty():
-                var saved_tid = rem.first_set()
-                rem.clear(saved_tid)
-                if saved_tid < 0 or saved_tid >= saved_comp_count or saved_to_local[saved_tid] < 0:
-                    self.clear_entities()
-                    raise Error("World.restore_blob: unregistered component ID in archetype mask")
-                local_mask.set(saved_to_local[saved_tid])
+            var wc = Int(reader.u32())
+            if wc < 0 or reader.failed or not _blob_fits(reader, wc, 8):
+                self._drop_staged_state(staged_archetypes, staged_sparse)
+                raise Error("World.restore_blob: corrupted archetype mask word count")
+            var local_mask = ComponentBitSet()
+            for wi in range(wc):
+                var word = reader.u64()
+                if reader.failed:
+                    self._drop_staged_state(staged_archetypes, staged_sparse)
+                    raise Error("World.restore_blob: truncated archetype mask words")
+                while word != 0:
+                    var saved_tid = wi * 64 + _ctz64(word)
+                    word &= word - 1
+                    if saved_tid < 0 or saved_tid >= saved_comp_count or saved_to_local[saved_tid] < 0:
+                        self._drop_staged_state(staged_archetypes, staged_sparse)
+                        raise Error("World.restore_blob: unregistered component ID in archetype mask")
+                    var local_tid = saved_to_local[saved_tid]
+                    if not self.table_comp_mask.test(local_tid):
+                        self._drop_staged_state(staged_archetypes, staged_sparse)
+                        raise Error("World.restore_blob: non-table component in archetype table_mask")
+                    local_mask.set(local_tid)
 
-            var dst_arch = self._find_or_create_archetype(local_mask)
+            var dst_arch = self._find_or_create_staged_archetype(staged_archetypes, local_mask)
             var num_chunks = reader.integer()
             if num_chunks < 0 or reader.failed or not _blob_fits(reader, num_chunks, 8):
-                self.clear_entities()
+                self._drop_staged_state(staged_archetypes, staged_sparse)
                 raise Error("World.restore_blob: corrupted chunk count")
 
             for _ in range(num_chunks):
                 var cnt = reader.integer()
                 if cnt < 0 or reader.failed or not _blob_fits(reader, cnt, size_of[Entity]()):
-                    self.clear_entities()
+                    self._drop_staged_state(staged_archetypes, staged_sparse)
                     raise Error("World.restore_blob: corrupted chunk row count")
-                var dst_ch = len(self.archetypes[dst_arch].chunks)
+                var dst_ch = len(staged_archetypes[dst_arch].chunks)
                 var chunk = ArchetypeChunk(
-                    self.archetypes[dst_arch].comp_type_ids,
-                    self.archetypes[dst_arch].col_elem_sizes,
+                    staged_archetypes[dst_arch].comp_type_ids,
+                    staged_archetypes[dst_arch].col_elem_sizes,
                     max(self.chunk_rows, cnt),
                 )
                 chunk.count = cnt
@@ -3087,181 +3317,216 @@ struct World(Movable):
                     ):
                         chunk.count = 0
                         chunk.entities.clear()
-                        self.clear_entities()
+                        self._drop_staged_state(staged_archetypes, staged_sparse)
                         raise Error("World.restore_blob: truncated ECS2 chunk entities")
                     for r in range(cnt):
                         var e = chunk.entities[r]
                         var eidx = Int(e.index)
                         if (
                             eidx < 0
-                            or eidx >= len(self.entities)
-                            or not self.entities[eidx].alive
-                            or self.entities[eidx].generation != e.generation
-                            or self.entities[eidx].archetype_id != -1
+                            or eidx >= len(staged_entities)
+                            or not staged_entities[eidx].alive
+                            or staged_entities[eidx].generation != e.generation
+                            or staged_entities[eidx].archetype_id != -1
                         ):
                             chunk.count = 0
                             chunk.entities.clear()
-                            self.clear_entities()
+                            self._drop_staged_state(staged_archetypes, staged_sparse)
                             raise Error(
                                 "World.restore_blob: chunk names a dead, stale, duplicate or out-of-range entity"
                             )
-                        self.entities[eidx].archetype_id = Int32(dst_arch)
-                        self.entities[eidx].chunk_idx = Int32(dst_ch)
-                        self.entities[eidx].row_in_chunk = Int32(r)
+                        staged_entities[eidx].archetype_id = Int32(dst_arch)
+                        staged_entities[eidx].chunk_idx = Int32(dst_ch)
+                        staged_entities[eidx].row_in_chunk = Int32(r)
 
                     var saved_cols = reader.integer()
-                    if saved_cols != len(self.archetypes[dst_arch].comp_type_ids) or reader.failed:
+                    if saved_cols != len(staged_archetypes[dst_arch].comp_type_ids) or reader.failed:
                         chunk.count = 0
                         chunk.entities.clear()
-                        self.clear_entities()
+                        self._drop_staged_state(staged_archetypes, staged_sparse)
                         raise Error("World.restore_blob: column count mismatch in archetype")
 
                     var col_ready = List[Bool](length=saved_cols, fill=False)
                     for _ in range(saved_cols):
                         var chash = reader.u64()
+                        if reader.failed:
+                            self._abort_partial_chunk(chunk, col_ready, -1, 0)
+                            self._drop_staged_state(staged_archetypes, staged_sparse)
+                            raise Error("World.restore_blob: truncated column component ID")
                         var tid = self.find_component_by_hash(chash)
                         if tid < 0:
                             self._abort_partial_chunk(chunk, col_ready, -1, 0)
-                            self.clear_entities()
+                            self._drop_staged_state(staged_archetypes, staged_sparse)
                             raise Error("World.restore_blob: unregistered component ID " + String(chash))
-                        var col_idx = self.archetypes[dst_arch].col_index(tid)
+                        var col_idx = staged_archetypes[dst_arch].col_index(tid)
                         if col_idx < 0:
                             self._abort_partial_chunk(chunk, col_ready, -1, 0)
-                            self.clear_entities()
+                            self._drop_staged_state(staged_archetypes, staged_sparse)
                             raise Error("World.restore_blob: component column missing in archetype")
+                        if col_ready[col_idx]:
+                            self._abort_partial_chunk(chunk, col_ready, -1, 0)
+                            self._drop_staged_state(staged_archetypes, staged_sparse)
+                            raise Error("World.restore_blob: duplicate component column in archetype")
                         var info = self.components[tid]
-                        chunk.mark_all_groups_changed(col_idx, self.current_tick)
+                        chunk.mark_all_groups_changed(col_idx, saved_tick)
                         if info.byte_size > 0:
                             var col_ptr = chunk.column_ptr(col_idx)
                             if col_ptr == 0:
                                 self._abort_partial_chunk(chunk, col_ready, -1, 0)
-                                self.clear_entities()
+                                self._drop_staged_state(staged_archetypes, staged_sparse)
                                 raise Error("World.restore_blob: null column buffer")
                             var mode_tag = reader.u8()
+                            if reader.failed:
+                                self._abort_partial_chunk(chunk, col_ready, -1, 0)
+                                self._drop_staged_state(staged_archetypes, staged_sparse)
+                                raise Error("World.restore_blob: truncated column encoding tag")
                             if mode_tag == 1:
                                 if not info.has_custom_bin:
                                     self._abort_partial_chunk(chunk, col_ready, -1, 0)
-                                    self.clear_entities()
+                                    self._drop_staged_state(staged_archetypes, staged_sparse)
                                     raise Error("World.restore_blob: missing custom binary codec")
                                 for r in range(cnt):
                                     if not info.read_custom_bin(col_ptr + r * info.byte_size, reader_addr):
                                         self._abort_partial_chunk(chunk, col_ready, col_idx, r)
-                                        self.clear_entities()
+                                        self._drop_staged_state(staged_archetypes, staged_sparse)
                                         raise Error("World.restore_blob: custom component binary read failed")
                             elif mode_tag == 0:
                                 if not info.is_trivial_pod:
                                     self._abort_partial_chunk(chunk, col_ready, -1, 0)
-                                    self.clear_entities()
+                                    self._drop_staged_state(staged_archetypes, staged_sparse)
                                     raise Error("World.restore_blob: non-trivial component cannot raw-memcpy")
                                 if not reader.read_bytes_raw(col_ptr, cnt * info.byte_size):
                                     self._abort_partial_chunk(chunk, col_ready, -1, 0)
-                                    self.clear_entities()
+                                    self._drop_staged_state(staged_archetypes, staged_sparse)
                                     raise Error("World.restore_blob: truncated ECS2 column bytes")
                             elif mode_tag == 2:
-                                for r in range(cnt):
-                                    var tok = reader.u64()
-                                    if reader.failed or not _vault_restore_clone(
-                                        tok, info, col_ptr + r * info.byte_size
-                                    ):
-                                        self._abort_partial_chunk(chunk, col_ready, col_idx, r)
-                                        self.clear_entities()
-                                        raise Error(
-                                            "World.restore_blob: invalid or foreign Clone Vault token for component ID "
-                                            + String(chash)
-                                        )
+                                self._abort_partial_chunk(chunk, col_ready, -1, 0)
+                                self._drop_staged_state(staged_archetypes, staged_sparse)
+                                raise Error(
+                                    "World.restore_blob: legacy Clone Vault tag 2 is unsupported for component ID "
+                                    + String(chash)
+                                )
                             else:
                                 self._abort_partial_chunk(chunk, col_ready, -1, 0)
-                                self.clear_entities()
+                                self._drop_staged_state(staged_archetypes, staged_sparse)
                                 raise Error("World.restore_blob: unknown column encoding tag")
                         col_ready[col_idx] = True
-                self.archetypes[dst_arch].chunks.append(chunk^)
+                staged_archetypes[dst_arch].chunks.append(chunk^)
 
-        for i in range(len(self.entities)):
-            if self.entities[i].alive and self.entities[i].archetype_id < 0:
-                self.clear_entities()
+        for i in range(len(staged_entities)):
+            if staged_entities[i].alive and staged_entities[i].archetype_id < 0:
+                self._drop_staged_state(staged_archetypes, staged_sparse)
                 raise Error("World.restore_blob: live entity is missing from every archetype chunk")
 
         var num_sparse = reader.integer()
         if num_sparse < 0 or reader.failed or not _blob_fits(reader, num_sparse, 16):
-            self.clear_entities()
+            self._drop_staged_state(staged_archetypes, staged_sparse)
             raise Error("World.restore_blob: corrupted sparse set count")
 
+        var seen_sparse = ComponentBitSet()
         for _ in range(num_sparse):
             var chash = reader.u64()
+            if reader.failed:
+                self._drop_staged_state(staged_archetypes, staged_sparse)
+                raise Error("World.restore_blob: truncated sparse component ID")
             var tid = self.find_component_by_hash(chash)
             if tid < 0:
-                self.clear_entities()
+                self._drop_staged_state(staged_archetypes, staged_sparse)
                 raise Error("World.restore_blob: unregistered component ID " + String(chash))
             var scnt = reader.integer()
             if scnt < 0 or reader.failed or not _blob_fits(reader, scnt, size_of[Entity]()):
-                self.clear_entities()
+                self._drop_staged_state(staged_archetypes, staged_sparse)
                 raise Error("World.restore_blob: corrupted sparse entity count")
             var sidx = self.comp_to_sparse[tid]
             if sidx < 0:
-                self.clear_entities()
+                self._drop_staged_state(staged_archetypes, staged_sparse)
                 raise Error("World.restore_blob: component is not STORAGE_SPARSE")
+            if seen_sparse.test(tid):
+                self._drop_staged_state(staged_archetypes, staged_sparse)
+                raise Error("World.restore_blob: duplicate sparse component in blob")
+            seen_sparse.set(tid)
+
             var info = self.components[tid]
-            ref sset = self.sparse_sets[sidx]
+            var sset = SparseSet(tid, info.byte_size)
             sset._ensure_data_capacity(scnt, info)
             var sp_ents = List[Entity](capacity=max(1, scnt))
             sp_ents.resize(unsafe_uninit_length=scnt)
             if scnt > 0:
                 if not reader.read_bytes_raw(Int(sp_ents.unsafe_ptr()), scnt * size_of[Entity]()):
-                    self.clear_entities()
+                    self._drop_staged_state(staged_archetypes, staged_sparse)
                     raise Error("World.restore_blob: truncated ECS2 sparse entities")
 
             if info.byte_size > 0 and scnt > 0:
+                if sset.data_ptr == 0:
+                    self._drop_staged_state(staged_archetypes, staged_sparse)
+                    raise Error("World.restore_blob: null sparse buffer")
                 var mode_tag = reader.u8()
+                if reader.failed:
+                    self._drop_staged_state(staged_archetypes, staged_sparse)
+                    raise Error("World.restore_blob: truncated sparse encoding tag")
                 if mode_tag == 1:
                     if not info.has_custom_bin:
-                        self.clear_entities()
+                        self._drop_staged_state(staged_archetypes, staged_sparse)
                         raise Error("World.restore_blob: missing sparse custom binary codec")
                     for di in range(scnt):
                         if not info.read_custom_bin(sset.data_ptr + di * info.byte_size, reader_addr):
                             for prev_di in range(di):
                                 info.drop_at(sset.data_ptr + prev_di * info.byte_size)
-                            self.clear_entities()
+                            self._drop_staged_state(staged_archetypes, staged_sparse)
                             raise Error("World.restore_blob: sparse custom binary read failed")
                 elif mode_tag == 0:
                     if not info.is_trivial_pod:
-                        self.clear_entities()
+                        self._drop_staged_state(staged_archetypes, staged_sparse)
                         raise Error("World.restore_blob: non-trivial sparse component cannot raw-memcpy")
                     if not reader.read_bytes_raw(sset.data_ptr, scnt * info.byte_size):
-                        self.clear_entities()
+                        self._drop_staged_state(staged_archetypes, staged_sparse)
                         raise Error("World.restore_blob: truncated ECS2 sparse bytes")
                 elif mode_tag == 2:
-                    for di in range(scnt):
-                        var tok = reader.u64()
-                        if reader.failed or not _vault_restore_clone(
-                            tok, info, sset.data_ptr + di * info.byte_size
-                        ):
-                            for prev_di in range(di):
-                                info.drop_at(sset.data_ptr + prev_di * info.byte_size)
-                            self.clear_entities()
-                            raise Error(
-                                "World.restore_blob: invalid or foreign sparse Clone Vault token for component ID "
-                                + String(chash)
-                            )
+                    self._drop_staged_state(staged_archetypes, staged_sparse)
+                    raise Error(
+                        "World.restore_blob: legacy Clone Vault tag 2 is unsupported for sparse component ID "
+                        + String(chash)
+                    )
                 else:
-                    self.clear_entities()
+                    self._drop_staged_state(staged_archetypes, staged_sparse)
                     raise Error("World.restore_blob: unknown sparse encoding tag")
 
             sset.dense_entities = sp_ents^
-            sset.changed_ticks = List[UInt32](length=scnt, fill=self.current_tick)
+            sset.changed_ticks = List[UInt32](length=scnt, fill=saved_tick)
             for di in range(scnt):
                 var eidx = Int(sset.dense_entities[di].index)
                 if (
                     eidx < 0
-                    or eidx >= len(self.entities)
-                    or not self.entities[eidx].alive
-                    or self.entities[eidx].generation != sset.dense_entities[di].generation
-                    or self.entities[eidx].sparse_mask.test(tid)
+                    or eidx >= len(staged_entities)
+                    or not staged_entities[eidx].alive
+                    or staged_entities[eidx].generation != sset.dense_entities[di].generation
+                    or staged_entities[eidx].sparse_mask.test(tid)
                 ):
-                    self.clear_entities()
+                    sset.clear_with_drop(info)
+                    self._drop_staged_state(staged_archetypes, staged_sparse)
                     raise Error("World.restore_blob: sparse set names a dead, stale, duplicate or out-of-range entity")
                 var page = eidx >> SPARSE_PAGE_BITS
                 sset._ensure_page(page)
                 sset.pages[page][eidx & SPARSE_PAGE_MASK] = Int32(di)
-                self.entities[eidx].sparse_mask.set(tid)
+                staged_entities[eidx].sparse_mask.set(tid)
 
-        reader.leave()
+            staged_sparse.append(sset^)
+            staged_sparse_sidx.append(sidx)
+
+        try:
+            reader.leave()
+        except err:
+            self._drop_staged_state(staged_archetypes, staged_sparse)
+            raise Error(String(err))
+
+        # Commit staged state atomically after all validation & `reader.leave()` succeed.
+        self._drop_all_live_components()
+        self.current_tick = saved_tick
+        self.restore_epoch += 1
+        self.live_entities = saved_live
+        self.entities = staged_entities^
+        self.free_indices = staged_free^
+        self.archetypes = staged_archetypes^
+        for i in range(len(staged_sparse)):
+            var sidx = staged_sparse_sidx[i]
+            swap(self.sparse_sets[sidx], staged_sparse[i])

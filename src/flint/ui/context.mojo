@@ -25,10 +25,14 @@ from flint.platform.input import (
 )
 from flint.render.font import SdfFont
 from flint.text.utf8 import decode_utf8, encode_utf8
-from flint.text.rich_text import parse_rich, layout_rich, SPAN_BUTTON
+from flint.text.bidi import BIDI_AUTO, BIDI_LTR
+from flint.text.shaper import ShapedGlyph
+from flint.text.rich_text import parse_rich, layout_rich, layout_rich_shaped, SPAN_BUTTON
 from flint.ui.button_glyphs import pad_button, face_color
 from flint.ui.draw_list import (
     UiDrawList,
+    GpuUiPrim,
+    PRIM_GLYPH,
     UI_FLAG_BORDER,
     UI_FLAG_DROP_SHADOW,
     UI_FLAG_VERT_GRADIENT,
@@ -49,6 +53,9 @@ from flint.ui.flexbox_dock import (
 # Flint Keyboard Keycodes (matching platform/x11.mojo & ui/widgets.mojo)
 comptime UI_KEY_SPACE: Int = 32
 comptime UI_KEY_A: Int = 65
+comptime UI_KEY_C: Int = 67
+comptime UI_KEY_V: Int = 86
+comptime UI_KEY_X: Int = 88
 comptime UI_KEY_ESCAPE: Int = 256
 comptime UI_KEY_ENTER: Int = 257
 comptime UI_KEY_TAB: Int = 258
@@ -176,6 +183,10 @@ struct RetainedWidgetState(Copyable, ImplicitlyCopyable, Movable):
     var tree_open: Bool
     var tree_initialized: Bool
     var drag_start_val: Float32
+    var scroll_x: Float32
+    var last_click_time: Float32
+    var last_click_cp: Int
+    var drag_selecting: Bool
 
     def __init__(out self):
         self.cursor_cp = 0
@@ -185,6 +196,10 @@ struct RetainedWidgetState(Copyable, ImplicitlyCopyable, Movable):
         self.tree_open = False
         self.tree_initialized = False
         self.drag_start_val = 0.0
+        self.scroll_x = 0.0
+        self.last_click_time = -10.0
+        self.last_click_cp = -1
+        self.drag_selecting = False
 
 
 @fieldwise_init
@@ -279,12 +294,33 @@ struct UiContext(Movable):
     var key_home_pressed: Bool
     var key_end_pressed: Bool
     var key_a_pressed: Bool
+    var key_c_pressed: Bool
+    var key_v_pressed: Bool
+    var key_x_pressed: Bool
     var pad_nav_next: Bool
     var pad_nav_prev: Bool
     var pad_confirm: Bool
     var pad_cancel: Bool
     var pad_sony: Bool
     var from_pad: Bool
+    # Clipboard, IME & Timing (M4b F26)
+    var ui_time_sec: Float32
+    var clipboard_text: String
+    var clipboard_out: String
+    var clipboard_out_dirty: Bool
+    var ime_active: Bool
+    var ime_preedit: String
+    var ime_cursor_cp: Int
+    var ime_sel_len: Int
+    var ime_commit: String
+    var ime_widget_id: UInt64
+    var ime_widget_name: String
+    var _prev_input_ime_active: Bool
+    var _ime_suppressed: Bool
+    var _ime_widget_seen: Bool
+    var _cancelled_ime_preedit: String
+    var _cancelled_ime_cursor_cp: Int
+    var _cancelled_ime_sel_len: Int
     # Interaction & Modal Focus Trap
     var hovered_id: UInt64
     var active_id: UInt64
@@ -347,12 +383,32 @@ struct UiContext(Movable):
         self.key_home_pressed = False
         self.key_end_pressed = False
         self.key_a_pressed = False
+        self.key_c_pressed = False
+        self.key_v_pressed = False
+        self.key_x_pressed = False
         self.pad_nav_next = False
         self.pad_nav_prev = False
         self.pad_confirm = False
         self.pad_cancel = False
         self.pad_sony = False
         self.from_pad = False
+        self.ui_time_sec = 0.0
+        self.clipboard_text = ""
+        self.clipboard_out = ""
+        self.clipboard_out_dirty = False
+        self.ime_active = False
+        self.ime_preedit = ""
+        self.ime_cursor_cp = 0
+        self.ime_sel_len = 0
+        self.ime_commit = ""
+        self.ime_widget_id = 0
+        self.ime_widget_name = ""
+        self._prev_input_ime_active = False
+        self._ime_suppressed = False
+        self._ime_widget_seen = False
+        self._cancelled_ime_preedit = ""
+        self._cancelled_ime_cursor_cp = 0
+        self._cancelled_ime_sel_len = 0
         self.hovered_id = 0
         self.active_id = 0
         self.focused_id = 0
@@ -391,10 +447,14 @@ struct UiContext(Movable):
         self.hovered_id = 0
         self.last_item_id = 0
         self.culled_items_this_frame = 0
+        self._ime_widget_seen = False
 
         self.screen_w = max(Float32(1.0), screen_w)
         self.screen_h = max(Float32(1.0), screen_h)
         self.dt = max(Float32(1.0e-4), dt)
+        self.ui_time_sec += self.dt
+        self.clipboard_out_dirty = False
+        self.clipboard_out = ""
 
         if input.has_mouse_position:
             self.mouse_x = input.last_mouse_x
@@ -423,6 +483,40 @@ struct UiContext(Movable):
         self.key_home_pressed = input.key_pressed(UI_KEY_HOME)
         self.key_end_pressed = input.key_pressed(UI_KEY_END)
         self.key_a_pressed = input.key_pressed(UI_KEY_A)
+        self.key_c_pressed = input.key_pressed(UI_KEY_C)
+        self.key_v_pressed = input.key_pressed(UI_KEY_V)
+        self.key_x_pressed = input.key_pressed(UI_KEY_X)
+
+        if input.ime_commit.byte_length() > 0:
+            self.ime_commit = input.ime_commit
+            self.ime_active = False
+            self.ime_preedit = ""
+            self.ime_cursor_cp = 0
+            self.ime_sel_len = 0
+            self._ime_suppressed = False
+        if input.ime_active:
+            if self._ime_suppressed:
+                if (
+                    input.ime_preedit != self._cancelled_ime_preedit
+                    or input.ime_cursor_cp != self._cancelled_ime_cursor_cp
+                    or input.ime_sel_len != self._cancelled_ime_sel_len
+                ):
+                    self._ime_suppressed = False
+            if not self._ime_suppressed:
+                self.ime_active = True
+                self.ime_preedit = input.ime_preedit
+                self.ime_cursor_cp = input.ime_cursor_cp
+                self.ime_sel_len = input.ime_sel_len
+        else:
+            self._ime_suppressed = False
+            if self._prev_input_ime_active:
+                self.ime_active = False
+                self.ime_preedit = ""
+                self.ime_cursor_cp = 0
+                self.ime_sel_len = 0
+                self.ime_widget_id = 0
+                self.ime_widget_name = ""
+        self._prev_input_ime_active = input.ime_active
 
         var pd_down = input.gamepad_pressed(0, PAD_DOWN) or input.gamepad_pressed(0, PAD_RIGHT)
         var pd_up = input.gamepad_pressed(0, PAD_UP) or input.gamepad_pressed(0, PAD_LEFT)
@@ -504,9 +598,12 @@ struct UiContext(Movable):
             if not in_modal:
                 self.focused_id = self.modal_focusables[0]
 
+        if self.ime_active and self.ime_widget_id != 0 and (not self._ime_widget_seen or self.focused_id != self.ime_widget_id):
+            self.cancel_ime()
+
         var step_next = (self.key_tab_pressed and not self.key_shift) or self.pad_nav_next
         var step_prev = (self.key_tab_pressed and self.key_shift) or self.pad_nav_prev
-        if step_next or step_prev:
+        if (step_next or step_prev) and not self.ime_active:
             ref ring = self.modal_focusables if modal_was_open else self.bg_focusables
             var n = len(ring)
             if n > 0:
@@ -547,6 +644,9 @@ struct UiContext(Movable):
             # Keep text_input focused via focused_id while releasing mouse-drag active_id
             self.active_id = 0
 
+        if self.ime_active and self.ime_widget_id != 0 and self.focused_id != self.ime_widget_id:
+            self.cancel_ime()
+        self.ime_commit = ""
         self.active_modal_id = 0
 
     # ---- Internal Layout & State Helpers ----
@@ -563,7 +663,14 @@ struct UiContext(Movable):
     def _blocked_by_modal(self) -> Bool:
         return self.had_modal_prev_frame and self.modal_depth == 0
 
+    def _set_focused(mut self, wid: UInt64):
+        if self.ime_active and self.ime_widget_id != 0 and self.ime_widget_id != wid:
+            self.cancel_ime()
+        self.focused_id = wid
+
     def _register_focusable(mut self, wid: UInt64):
+        if wid == self.ime_widget_id:
+            self._ime_widget_seen = True
         if self.modal_depth > 0:
             self.modal_focusables.append(wid)
         else:
@@ -582,13 +689,64 @@ struct UiContext(Movable):
 
     def _measure_text(self, text: String, size_px: Float32) -> Float32:
         if self.font.valid:
+            if self.font.has_source or len(self.font.fallbacks) > 0:
+                return self.font.measure_shaped(text, size_px)
             return self.font.measure(text, size_px)
         return Float32(len(decode_utf8(text))) * size_px * Float32(0.56)
+
+    @staticmethod
+    def _emit_shaped_glyphs(
+        mut draw_list: UiDrawList,
+        font_slot: Int,
+        mut font: SdfFont,
+        shaped: List[ShapedGlyph],
+        x: Float32,
+        baseline: Float32,
+        size_px: Float32,
+        color: UInt32,
+    ):
+        var scale = size_px / (font.bake_px if font.bake_px > 0.0 else Float32(1.0))
+        var sdf_to_screen = font.spread * scale / Float32(127.0)
+        var aw = Float32(font.atlas_width if font.atlas_width > 0 else 1)
+        var ah = Float32(font.atlas_height if font.atlas_height > 0 else 1)
+        var c = draw_list.current_clip()
+        var clip0 = UInt32(c[0]) | (UInt32(c[1]) << 16)
+        var clip1 = UInt32(c[2]) | (UInt32(c[3]) << 16)
+        var flags: UInt32 = (UInt32(1 << 6) if font.channels >= 3 else UInt32(0)) | (UInt32(1 << 7) if font.channels >= 4 else UInt32(0))
+        var hdr: UInt32 = (PRIM_GLYPH & 0xF) | (UInt32(font_slot & 0xFFF) << 4) | (flags << 16)
+        var pen = x
+        for sg in shaped:
+            var g_idx = font.ensure_glyph_id(sg.glyph_id, sg.font_index, sg.codepoint)
+            if g_idx < 0:
+                g_idx = font.glyph_for(sg.codepoint)
+            if g_idx >= 0 and g_idx < len(font.glyphs):
+                ref g = font.glyphs[g_idx]
+                if g.w > 0 and g.h > 0:
+                    var gx0 = pen + g.xoff * scale + sg.x_offset
+                    var gy0 = baseline + g.yoff * scale - sg.y_offset
+                    var gx1 = gx0 + Float32(g.w) * scale
+                    var gy1 = gy0 + Float32(g.h) * scale
+                    var u0 = Float32(g.x) / aw
+                    var v0 = Float32(g.y) / ah
+                    var u1 = Float32(g.x + g.w) / aw
+                    var v1 = Float32(g.y + g.h) / ah
+                    draw_list.prims.append(GpuUiPrim(
+                        gx0, gy0, gx1, gy1,
+                        u0, v0, u1, v1,
+                        clip0, clip1,
+                        color, 0,
+                        sdf_to_screen, 0.0, 0.0, hdr,
+                    ))
+            pen += sg.x_advance
 
     def _draw_text(mut self, text: String, x: Float32, y: Float32, size_px: Float32, color: UInt32):
         if self.font.valid:
             var baseline = y + size_px * Float32(0.82)
-            self.draw_list.add_text_mut(self.font_slot, self.font, text, x, baseline, size_px, color)
+            if self.font.has_source or len(self.font.fallbacks) > 0:
+                var shaped = self.font.shape_text(text, size_px, BIDI_AUTO)
+                Self._emit_shaped_glyphs(self.draw_list, self.font_slot, self.font, shaped, x, baseline, size_px, color)
+            else:
+                self.draw_list.add_text_mut(self.font_slot, self.font, text, x, baseline, size_px, color)
         else:
             # Headless fallback when no SdfFont atlas is loaded: emit compact glyph-box indicator prims
             var n_cp = len(decode_utf8(text))
@@ -869,6 +1027,31 @@ struct UiContext(Movable):
     def rich_label(mut self, markup: String, max_width: Float32 = 0.0):
         var spans = parse_rich(markup)
         var df = self.display_font.copy() if self.display_font.valid else self.font.copy()
+        if self.font.valid and (self.font.has_source or len(self.font.fallbacks) > 0):
+            var rls = layout_rich_shaped(spans, self.font, df, self.theme.font_size, 0, max_width, 0, self.from_pad, self.pad_sony)
+            var h = max(self.theme.row_height, rls.height + Float32(4.0))
+            var w = max(Float32(40.0), rls.width if max_width <= Float32(0.0) else max_width)
+            var r = self._alloc_item_rect(0, w, h)
+            for i in range(len(rls.runs)):
+                ref run = rls.runs[i]
+                var rx = r.x + run.x
+                var ry = r.y + run.baseline - run.px * Float32(0.82)
+                if run.kind == SPAN_BUTTON:
+                    var btn = pad_button(run.action)
+                    var fcol = UInt32(0xFF000000) | face_color(btn, self.pad_sony)
+                    self.draw_list.add_controller_symbol(btn, rx, ry, run.width, run.px * Float32(1.1), fcol)
+                else:
+                    var col = self.theme.text_primary
+                    if run.color >= 0:
+                        var rr = (run.color >> 16) & 0xFF
+                        var gg = (run.color >> 8) & 0xFF
+                        var bb = run.color & 0xFF
+                        col = pack_rgba8(rr, gg, bb, 255)
+                    if run.face == 1 and self.display_font.valid:
+                        Self._emit_shaped_glyphs(self.draw_list, self.font_slot, self.display_font, run.glyphs, rx, r.y + run.baseline, run.px, col)
+                    else:
+                        Self._emit_shaped_glyphs(self.draw_list, self.font_slot, self.font, run.glyphs, rx, r.y + run.baseline, run.px, col)
+            return
         var rl = layout_rich(spans, self.font, df, self.theme.font_size, 0, max_width, 0, self.from_pad, self.pad_sony)
         var h = max(self.theme.row_height, rl.height + Float32(4.0))
         var w = max(Float32(40.0), rl.width if max_width <= Float32(0.0) else max_width)
@@ -903,7 +1086,7 @@ struct UiContext(Movable):
             self.hovered_id = wid
             if self.mouse_pressed_l:
                 self.active_id = wid
-                self.focused_id = wid
+                self._set_focused(wid)
 
         var clicked = False
         if not blocked:
@@ -947,7 +1130,7 @@ struct UiContext(Movable):
         if hovered:
             self.hovered_id = wid
             if self.mouse_pressed_l:
-                self.focused_id = wid
+                self._set_focused(wid)
                 checked = not checked
                 toggled = True
         if (not blocked) and self.focused_id == wid and (self.key_enter_pressed or self.key_space_pressed or self.pad_confirm):
@@ -990,7 +1173,7 @@ struct UiContext(Movable):
         var hovered = (not blocked) and track.contains(self.mouse_x, self.mouse_y)
         if hovered and self.mouse_pressed_l:
             self.active_id = wid
-            self.focused_id = wid
+            self._set_focused(wid)
 
         var span = max(Float32(1.0e-6), max_val - min_val)
         var changed = False
@@ -1049,7 +1232,7 @@ struct UiContext(Movable):
             var cr = RectF(r.x + Float32(c) * (comp_w + Float32(4.0)), r.y + Float32(2.0), comp_w, r.h - Float32(4.0))
             if not blocked and cr.contains(self.mouse_x, self.mouse_y) and self.mouse_pressed_l:
                 self.active_id = cid
-                self.focused_id = cid
+                self._set_focused(cid)
             if not blocked and self.active_id == cid and self.mouse_down_l and self.mouse_delta_x != Float32(0.0):
                 vals[c] = max(min_val, min(max_val, vals[c] + self.mouse_delta_x * speed))
                 changed = True
@@ -1063,11 +1246,94 @@ struct UiContext(Movable):
         self._draw_text(label_text, r.x + r.w * Float32(0.68) + Float32(6.0), r.y + Float32(3.0), self.theme.font_size, self.theme.text_primary)
         return changed
 
+    # ---- Clipboard & IME API ----
+
+    def set_clipboard(mut self, text: String):
+        self.clipboard_text = text
+
+    def get_clipboard(self) -> String:
+        return self.clipboard_text
+
+    def has_clipboard_out(self) -> Bool:
+        return self.clipboard_out_dirty
+
+    def take_clipboard_out(mut self) -> String:
+        var s = self.clipboard_out
+        self.clipboard_out = ""
+        self.clipboard_out_dirty = False
+        return s
+
+    def wants_clipboard_paste(self, input: InputState) -> Bool:
+        var ctrl = input.key_down(UI_KEY_LEFT_CTRL) or input.key_down(UI_KEY_RIGHT_CTRL)
+        return ctrl and input.key_pressed(UI_KEY_V) and not self.ime_active
+
+    def set_ime_preedit(mut self, preedit: String, cursor_cp: Int = -1, sel_len: Int = 0):
+        self._ime_suppressed = False
+        self.ime_preedit = preedit
+        self.ime_active = preedit.byte_length() > 0
+        if cursor_cp < 0:
+            self.ime_cursor_cp = len(decode_utf8(preedit))
+        else:
+            self.ime_cursor_cp = cursor_cp
+        self.ime_sel_len = max(0, sel_len)
+        if not self.ime_active:
+            self.ime_widget_id = 0
+            self.ime_widget_name = ""
+
+    def commit_ime(mut self, text: String):
+        self._ime_suppressed = False
+        self.ime_commit += text
+        self.ime_active = False
+        self.ime_preedit = ""
+        self.ime_cursor_cp = 0
+        self.ime_sel_len = 0
+
+    def cancel_ime(mut self):
+        if self._prev_input_ime_active and self.ime_preedit.byte_length() > 0:
+            self._ime_suppressed = True
+            self._cancelled_ime_preedit = self.ime_preedit
+            self._cancelled_ime_cursor_cp = self.ime_cursor_cp
+            self._cancelled_ime_sel_len = self.ime_sel_len
+        self.ime_active = False
+        self.ime_preedit = ""
+        self.ime_cursor_cp = 0
+        self.ime_sel_len = 0
+        self.ime_commit = ""
+        self.ime_widget_id = 0
+        self.ime_widget_name = ""
+
+    def active_ime_preedit(self, id: String) -> String:
+        if not self.ime_active:
+            return ""
+        var wid = self.widget_id(id)
+        if self.ime_widget_id == wid or self.ime_widget_name == id or self.focused_id == wid:
+            return self.ime_preedit
+        return ""
+
     # ---- UTF-8 Multi-Byte-Safe TextInput ----
 
     def text_cursor_codepoint(mut self, id: String) -> Int:
         var st = self._get_state(self.widget_id(id))
         return st.cursor_cp
+
+    def text_scroll_x(mut self, id: String) -> Float32:
+        var st = self._get_state(self.widget_id(id))
+        return st.scroll_x
+
+    def text_selection_range_cp(mut self, id: String) -> Tuple[Int, Int]:
+        var st = self._get_state(self.widget_id(id))
+        if st.select_anchor_cp < 0 or st.select_anchor_cp == st.cursor_cp:
+            return (st.cursor_cp, st.cursor_cp)
+        return (min(st.cursor_cp, st.select_anchor_cp), max(st.cursor_cp, st.select_anchor_cp))
+
+    def text_selection_byte_range(mut self, id: String, text: String) -> Tuple[Int, Int]:
+        var codes = decode_utf8(text)
+        var rng = self.text_selection_range_cp(id)
+        var lo = max(0, min(len(codes), rng[0]))
+        var hi = max(0, min(len(codes), rng[1]))
+        var b0 = encode_utf8(codes, 0, lo).byte_length()
+        var b1 = encode_utf8(codes, 0, hi).byte_length()
+        return (b0, b1)
 
     def text_cursor_byte_offset(mut self, id: String, text: String) -> Int:
         """Returns the exact UTF-8 byte boundary corresponding to `cursor_cp`."""
@@ -1077,6 +1343,75 @@ struct UiContext(Movable):
         var prefix = encode_utf8(codes, 0, cp)
         return prefix.byte_length()
 
+    def _hit_test_codepoint_x(self, codes: List[Int], rel_x: Float32, size_px: Float32) -> Int:
+        if rel_x <= Float32(0.0) or len(codes) == 0:
+            return 0
+        var pen: Float32 = 0.0
+        var scale = size_px / (self.font.bake_px if (self.font.valid and self.font.bake_px > 0.0) else Float32(1.0))
+        var n = len(codes)
+        for i in range(n):
+            var adv: Float32
+            if self.font.valid:
+                adv = self.font.advance_of(codes[i]) * scale
+                if i + 1 < n:
+                    adv += self.font.kern(codes[i], codes[i + 1]) * scale
+            else:
+                adv = size_px * Float32(0.56)
+            if rel_x < pen + adv * Float32(0.5):
+                return i
+            pen += adv
+        return n
+
+    @staticmethod
+    def _is_word_cp(cp: Int) -> Bool:
+        if (cp >= 48 and cp <= 57) or (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122) or cp == 95:
+            return True
+        return cp >= 128 and cp != 0x3000 and cp != 0xA0
+
+    @staticmethod
+    def _word_bounds_at(codes: List[Int], cp: Int) -> Tuple[Int, Int]:
+        var n = len(codes)
+        if n == 0:
+            return (0, 0)
+        var idx = max(0, min(n - 1, cp))
+        var is_w = UiContext._is_word_cp(codes[idx])
+        var lo = idx
+        while lo > 0 and UiContext._is_word_cp(codes[lo - 1]) == is_w:
+            lo -= 1
+        var hi = idx + 1
+        while hi < n and UiContext._is_word_cp(codes[hi]) == is_w:
+            hi += 1
+        return (lo, hi)
+
+    @staticmethod
+    def _delete_codepoint_range(codes: List[Int], lo: Int, hi: Int) -> List[Int]:
+        var out = List[Int](capacity=max(0, len(codes) - (hi - lo)))
+        for i in range(lo):
+            out.append(codes[i])
+        for i in range(hi, len(codes)):
+            out.append(codes[i])
+        return out^
+
+    @staticmethod
+    def _insert_codepoints_replacing(codes: List[Int], lo: Int, hi: Int, ins: List[Int]) -> List[Int]:
+        var out = List[Int](capacity=max(0, len(codes) - (hi - lo) + len(ins)))
+        for i in range(lo):
+            out.append(codes[i])
+        for c in ins:
+            out.append(c)
+        for i in range(hi, len(codes)):
+            out.append(codes[i])
+        return out^
+
+    @staticmethod
+    def _filter_single_line_codes(text: String) -> List[Int]:
+        var ins_codes = decode_utf8(text)
+        var filtered = List[Int]()
+        for c in ins_codes:
+            if c >= 32 and c != 127:
+                filtered.append(c)
+        return filtered^
+
     def text_input(
         mut self,
         id: String,
@@ -1085,8 +1420,8 @@ struct UiContext(Movable):
         placeholder: String = "",
     ) -> Bool:
         """UTF-8 multi-byte-safe single-line text editor operating strictly on Unicode
-        scalar codepoints (`decode_utf8` / `encode_utf8`) so cursor motion, Backspace,
-        Delete, selection, and insertion NEVER split multi-byte characters."""
+        scalar codepoints (`decode_utf8` / `encode_utf8`) with clipboard (`Ctrl+C/V/X/A`),
+        mouse-click/drag/double-click selection, horizontal scroll, and IME composition."""
         var wid = self.widget_id(id)
         var r = self._alloc_item_rect(wid, w, self.theme.row_height + Float32(4.0))
         self._register_focusable(wid)
@@ -1096,7 +1431,7 @@ struct UiContext(Movable):
         if hovered:
             self.hovered_id = wid
             if self.mouse_pressed_l:
-                self.focused_id = wid
+                self._set_focused(wid)
                 self.active_id = wid
 
         var codes = decode_utf8(text)
@@ -1105,122 +1440,244 @@ struct UiContext(Movable):
         if st.select_anchor_cp >= 0:
             st.select_anchor_cp = max(0, min(len(codes), st.select_anchor_cp))
 
+        var pad_x = r.x + Float32(8.0)
+        var inner_w = max(Float32(1.0), r.w - Float32(16.0))
+        var text_y = r.y + Float32(4.0)
+        var font_size = self.theme.font_size
+
         var edited = False
         var focused = (not blocked) and self.focused_id == wid
 
+        if not focused and self.ime_active and self.ime_widget_id == wid:
+            self.cancel_ime()
+        if focused and self.ime_active and self.ime_widget_id != wid:
+            if self.ime_widget_id != 0:
+                self.cancel_ime()
+            else:
+                self.ime_widget_id = wid
+                self.ime_widget_name = id
+                self._ime_widget_seen = True
+
+        # Mouse click, double-click word select, and drag selection
+        if not blocked:
+            if hovered and self.mouse_pressed_l:
+                if self.ime_active and self.ime_widget_id == wid:
+                    self.cancel_ime()
+                var hit_cp = self._hit_test_codepoint_x(codes, self.mouse_x - (pad_x - st.scroll_x), font_size)
+                if (self.ui_time_sec - st.last_click_time) <= Float32(0.40) and abs(hit_cp - st.last_click_cp) <= 1 and len(codes) > 0:
+                    var probe_cp = hit_cp - 1 if hit_cp >= len(codes) else hit_cp
+                    var wb = Self._word_bounds_at(codes, probe_cp)
+                    st.select_anchor_cp = wb[0]
+                    st.cursor_cp = wb[1]
+                    st.drag_selecting = False
+                    st.last_click_time = Float32(-10.0)
+                else:
+                    if self.key_shift:
+                        if st.select_anchor_cp < 0:
+                            st.select_anchor_cp = st.cursor_cp
+                        st.cursor_cp = hit_cp
+                    else:
+                        st.cursor_cp = hit_cp
+                        st.select_anchor_cp = hit_cp
+                    st.drag_selecting = True
+                    st.last_click_time = self.ui_time_sec
+                    st.last_click_cp = hit_cp
+            elif self.active_id == wid and self.mouse_down_l and not self.mouse_pressed_l and st.drag_selecting:
+                var hit_cp = self._hit_test_codepoint_x(codes, self.mouse_x - (pad_x - st.scroll_x), font_size)
+                st.cursor_cp = hit_cp
+            if not self.mouse_down_l:
+                st.drag_selecting = False
+                if st.select_anchor_cp == st.cursor_cp:
+                    st.select_anchor_cp = -1
+
         if focused:
-            # Ctrl+A: select all codepoints
-            if self.key_ctrl and self.key_a_pressed:
-                st.select_anchor_cp = 0
-                st.cursor_cp = len(codes)
-
-            # Navigation along codepoint boundaries
-            if self.key_left_pressed:
-                if self.key_shift:
-                    if st.select_anchor_cp < 0:
-                        st.select_anchor_cp = st.cursor_cp
-                    st.cursor_cp = max(0, st.cursor_cp - 1)
-                elif st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
-                    st.cursor_cp = min(st.cursor_cp, st.select_anchor_cp)
-                    st.select_anchor_cp = -1
-                else:
-                    st.select_anchor_cp = -1
-                    st.cursor_cp = max(0, st.cursor_cp - 1)
-
-            if self.key_right_pressed:
-                if self.key_shift:
-                    if st.select_anchor_cp < 0:
-                        st.select_anchor_cp = st.cursor_cp
-                    st.cursor_cp = min(len(codes), st.cursor_cp + 1)
-                elif st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
-                    st.cursor_cp = max(st.cursor_cp, st.select_anchor_cp)
-                    st.select_anchor_cp = -1
-                else:
-                    st.select_anchor_cp = -1
-                    st.cursor_cp = min(len(codes), st.cursor_cp + 1)
-
-            if self.key_home_pressed:
-                if self.key_shift and st.select_anchor_cp < 0:
-                    st.select_anchor_cp = st.cursor_cp
-                elif not self.key_shift:
-                    st.select_anchor_cp = -1
-                st.cursor_cp = 0
-
-            if self.key_end_pressed:
-                if self.key_shift and st.select_anchor_cp < 0:
-                    st.select_anchor_cp = st.cursor_cp
-                elif not self.key_shift:
-                    st.select_anchor_cp = -1
-                st.cursor_cp = len(codes)
-
-            # Backspace (deletes selection or full multi-byte codepoint before cursor)
-            if self.key_bs_pressed:
-                if st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
-                    var lo = min(st.cursor_cp, st.select_anchor_cp)
-                    var hi = max(st.cursor_cp, st.select_anchor_cp)
-                    var next_codes = List[Int](capacity=len(codes) - (hi - lo))
-                    for i in range(lo):
-                        next_codes.append(codes[i])
-                    for i in range(hi, len(codes)):
-                        next_codes.append(codes[i])
-                    codes = next_codes^
-                    st.cursor_cp = lo
-                    st.select_anchor_cp = -1
-                    edited = True
-                elif st.cursor_cp > 0:
-                    var del_at = st.cursor_cp - 1
-                    _ = codes.pop(del_at)
-                    st.cursor_cp = del_at
-                    edited = True
-
-            # Forward Delete (deletes selection or full multi-byte codepoint at cursor)
-            if self.key_del_pressed:
-                if st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
-                    var lo = min(st.cursor_cp, st.select_anchor_cp)
-                    var hi = max(st.cursor_cp, st.select_anchor_cp)
-                    var next_codes = List[Int](capacity=len(codes) - (hi - lo))
-                    for i in range(lo):
-                        next_codes.append(codes[i])
-                    for i in range(hi, len(codes)):
-                        next_codes.append(codes[i])
-                    codes = next_codes^
-                    st.cursor_cp = lo
-                    st.select_anchor_cp = -1
-                    edited = True
-                elif st.cursor_cp < len(codes):
-                    _ = codes.pop(st.cursor_cp)
-                    edited = True
-
-            # Insert UTF-8 text from `input.text_input_utf8`
-            if self.text_utf8.byte_length() > 0 and not self.key_ctrl:
-                var ins_codes = decode_utf8(self.text_utf8)
-                var filtered = List[Int]()
-                for c in ins_codes:
-                    if c >= 32 and c != 127:
-                        filtered.append(c)
-                if len(filtered) > 0:
+            if self.ime_commit.byte_length() > 0:
+                if self.ime_widget_id == 0 or self.ime_widget_id == wid:
+                    var ins = Self._filter_single_line_codes(self.ime_commit)
                     var lo = st.cursor_cp
                     var hi = st.cursor_cp
                     if st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
                         lo = min(st.cursor_cp, st.select_anchor_cp)
                         hi = max(st.cursor_cp, st.select_anchor_cp)
-                    var rebuilt = List[Int](capacity=len(codes) - (hi - lo) + len(filtered))
-                    for i in range(lo):
-                        rebuilt.append(codes[i])
-                    for c in filtered:
-                        rebuilt.append(c)
-                    for i in range(hi, len(codes)):
-                        rebuilt.append(codes[i])
-                    codes = rebuilt^
-                    st.cursor_cp = lo + len(filtered)
+                    if len(ins) > 0 or lo != hi:
+                        codes = Self._insert_codepoints_replacing(codes, lo, hi, ins)
+                        st.cursor_cp = lo + len(ins)
+                        st.select_anchor_cp = -1
+                        edited = True
+                    self.ime_commit = ""
+                    if not self.ime_active or self.ime_preedit.byte_length() == 0:
+                        self.ime_active = False
+                        self.ime_preedit = ""
+                        self.ime_cursor_cp = 0
+                        self.ime_sel_len = 0
+                        self.ime_widget_id = 0
+                        self.ime_widget_name = ""
+                    elif self.ime_widget_id == 0:
+                        self.ime_widget_id = wid
+                        self.ime_widget_name = id
+                        self._ime_widget_seen = True
+
+            if self.ime_active:
+                if self.key_esc_pressed:
+                    self.cancel_ime()
+                elif self.key_enter_pressed:
+                    var ins = Self._filter_single_line_codes(self.ime_preedit)
+                    if len(ins) > 0:
+                        var lo = st.cursor_cp
+                        var hi = st.cursor_cp
+                        if st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
+                            lo = min(st.cursor_cp, st.select_anchor_cp)
+                            hi = max(st.cursor_cp, st.select_anchor_cp)
+                        codes = Self._insert_codepoints_replacing(codes, lo, hi, ins)
+                        st.cursor_cp = lo + len(ins)
+                        st.select_anchor_cp = -1
+                        edited = True
+                    self.cancel_ime()
+            else:
+                var has_sel = st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp
+                var sel_lo = min(st.cursor_cp, st.select_anchor_cp) if has_sel else st.cursor_cp
+                var sel_hi = max(st.cursor_cp, st.select_anchor_cp) if has_sel else st.cursor_cp
+
+                # Ctrl+A: select all codepoints
+                if self.key_ctrl and self.key_a_pressed:
+                    st.select_anchor_cp = 0
+                    st.cursor_cp = len(codes)
+
+                # Ctrl+C: copy selection
+                if self.key_ctrl and self.key_c_pressed and has_sel:
+                    var slice = encode_utf8(codes, sel_lo, sel_hi)
+                    self.clipboard_text = slice
+                    self.clipboard_out = slice
+                    self.clipboard_out_dirty = True
+
+                # Ctrl+X: cut selection
+                if self.key_ctrl and self.key_x_pressed and has_sel:
+                    var slice = encode_utf8(codes, sel_lo, sel_hi)
+                    self.clipboard_text = slice
+                    self.clipboard_out = slice
+                    self.clipboard_out_dirty = True
+                    codes = Self._delete_codepoint_range(codes, sel_lo, sel_hi)
+                    st.cursor_cp = sel_lo
                     st.select_anchor_cp = -1
                     edited = True
 
+                # Ctrl+V: paste clipboard replacing selection
+                if self.key_ctrl and self.key_v_pressed and self.clipboard_text.byte_length() > 0:
+                    var ins = Self._filter_single_line_codes(self.clipboard_text)
+                    if len(ins) > 0:
+                        var lo = st.cursor_cp
+                        var hi = st.cursor_cp
+                        if st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
+                            lo = min(st.cursor_cp, st.select_anchor_cp)
+                            hi = max(st.cursor_cp, st.select_anchor_cp)
+                        codes = Self._insert_codepoints_replacing(codes, lo, hi, ins)
+                        st.cursor_cp = lo + len(ins)
+                        st.select_anchor_cp = -1
+                        edited = True
+
+                # Navigation along codepoint boundaries
+                if self.key_left_pressed:
+                    if self.key_shift:
+                        if st.select_anchor_cp < 0:
+                            st.select_anchor_cp = st.cursor_cp
+                        st.cursor_cp = max(0, st.cursor_cp - 1)
+                    elif st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
+                        st.cursor_cp = min(st.cursor_cp, st.select_anchor_cp)
+                        st.select_anchor_cp = -1
+                    else:
+                        st.select_anchor_cp = -1
+                        st.cursor_cp = max(0, st.cursor_cp - 1)
+
+                if self.key_right_pressed:
+                    if self.key_shift:
+                        if st.select_anchor_cp < 0:
+                            st.select_anchor_cp = st.cursor_cp
+                        st.cursor_cp = min(len(codes), st.cursor_cp + 1)
+                    elif st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
+                        st.cursor_cp = max(st.cursor_cp, st.select_anchor_cp)
+                        st.select_anchor_cp = -1
+                    else:
+                        st.select_anchor_cp = -1
+                        st.cursor_cp = min(len(codes), st.cursor_cp + 1)
+
+                if self.key_home_pressed:
+                    if self.key_shift and st.select_anchor_cp < 0:
+                        st.select_anchor_cp = st.cursor_cp
+                    elif not self.key_shift:
+                        st.select_anchor_cp = -1
+                    st.cursor_cp = 0
+
+                if self.key_end_pressed:
+                    if self.key_shift and st.select_anchor_cp < 0:
+                        st.select_anchor_cp = st.cursor_cp
+                    elif not self.key_shift:
+                        st.select_anchor_cp = -1
+                    st.cursor_cp = len(codes)
+
+                # Backspace (deletes selection or full multi-byte codepoint before cursor)
+                if self.key_bs_pressed:
+                    if st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
+                        var lo = min(st.cursor_cp, st.select_anchor_cp)
+                        var hi = max(st.cursor_cp, st.select_anchor_cp)
+                        codes = Self._delete_codepoint_range(codes, lo, hi)
+                        st.cursor_cp = lo
+                        st.select_anchor_cp = -1
+                        edited = True
+                    elif st.cursor_cp > 0:
+                        var del_at = st.cursor_cp - 1
+                        _ = codes.pop(del_at)
+                        st.cursor_cp = del_at
+                        edited = True
+
+                # Forward Delete (deletes selection or full multi-byte codepoint at cursor)
+                if self.key_del_pressed:
+                    if st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
+                        var lo = min(st.cursor_cp, st.select_anchor_cp)
+                        var hi = max(st.cursor_cp, st.select_anchor_cp)
+                        codes = Self._delete_codepoint_range(codes, lo, hi)
+                        st.cursor_cp = lo
+                        st.select_anchor_cp = -1
+                        edited = True
+                    elif st.cursor_cp < len(codes):
+                        _ = codes.pop(st.cursor_cp)
+                        edited = True
+
+                # Insert UTF-8 text from `input.text_input_utf8`
+                if self.text_utf8.byte_length() > 0 and not self.key_ctrl:
+                    var filtered = Self._filter_single_line_codes(self.text_utf8)
+                    if len(filtered) > 0:
+                        var lo = st.cursor_cp
+                        var hi = st.cursor_cp
+                        if st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
+                            lo = min(st.cursor_cp, st.select_anchor_cp)
+                            hi = max(st.cursor_cp, st.select_anchor_cp)
+                        codes = Self._insert_codepoints_replacing(codes, lo, hi, filtered)
+                        st.cursor_cp = lo + len(filtered)
+                        st.select_anchor_cp = -1
+                        edited = True
+
         if edited:
             text = encode_utf8(codes)
+
+        # Horizontal scroll tracking to keep caret visible
+        var show_ime = focused and self.ime_active and self.ime_preedit.byte_length() > 0
+        var ime_codes = decode_utf8(self.ime_preedit) if show_ime else List[Int]()
+        var ime_cur_cp = max(0, min(len(ime_codes), self.ime_cursor_cp)) if show_ime else 0
+        var prefix_str = encode_utf8(codes, 0, st.cursor_cp)
+        var prefix_w = self._measure_text(prefix_str, font_size)
+        var ime_pre_cur_w = self._measure_text(encode_utf8(ime_codes, 0, ime_cur_cp), font_size) if show_ime else Float32(0.0)
+        var caret_px = prefix_w + ime_pre_cur_w
+        if caret_px < st.scroll_x:
+            st.scroll_x = caret_px
+        elif caret_px > st.scroll_x + inner_w:
+            st.scroll_x = caret_px - inner_w
+        var total_render_w = self._measure_text(text, font_size) + (self._measure_text(self.ime_preedit, font_size) if show_ime else Float32(0.0))
+        var max_scroll_x = max(Float32(0.0), total_render_w - inner_w)
+        st.scroll_x = max(Float32(0.0), min(max_scroll_x, st.scroll_x))
+
         self.state_map[wid] = st
 
-        # Render input box, selection highlight, text/placeholder, and caret
+        # Render input box, selection highlight, text/placeholder, IME preedit/underline, and caret
         self.draw_list.add_rect(
             r.x, r.y, r.w, r.h,
             self.theme.bg_window,
@@ -1230,21 +1687,38 @@ struct UiContext(Movable):
         )
         self.draw_list.push_clip(Int(r.x + Float32(2.0)), Int(r.y + Float32(1.0)), Int(r.right() - Float32(2.0)), Int(r.bottom() - Float32(1.0)))
 
-        var pad_x = r.x + Float32(8.0)
-        var text_y = r.y + Float32(4.0)
-        if len(codes) == 0 and placeholder.byte_length() > 0 and not focused:
-            self._draw_text(placeholder, pad_x, text_y, self.theme.font_size, self.theme.text_muted)
+        var draw_x = pad_x - st.scroll_x
+        if len(codes) == 0 and placeholder.byte_length() > 0 and not focused and not show_ime:
+            self._draw_text(placeholder, pad_x, text_y, font_size, self.theme.text_muted)
+        elif show_ime:
+            var preedit_txt = self.ime_preedit
+            var preedit_w = self._measure_text(preedit_txt, font_size)
+            var suffix_str = encode_utf8(codes, st.cursor_cp, len(codes))
+            if st.cursor_cp > 0:
+                self._draw_text(prefix_str, draw_x, text_y, font_size, self.theme.text_primary)
+            var ime_x = draw_x + prefix_w
+            if self.ime_sel_len > 0:
+                var cl_end = min(len(ime_codes), ime_cur_cp + self.ime_sel_len)
+                var cl_w = max(Float32(2.0), self._measure_text(encode_utf8(ime_codes, ime_cur_cp, cl_end), font_size))
+                self.draw_list.add_rect(ime_x + ime_pre_cur_w, r.y + Float32(3.0), cl_w, r.h - Float32(6.0), self.theme.accent_dim, 2.0)
+                self.draw_list.add_line(ime_x + ime_pre_cur_w, r.bottom() - Float32(4.0), ime_x + ime_pre_cur_w + cl_w, r.bottom() - Float32(4.0), 2.5, self.theme.focus_ring)
+            self._draw_text(preedit_txt, ime_x, text_y, font_size, self.theme.text_primary)
+            self.draw_list.add_line(ime_x, r.bottom() - Float32(4.0), ime_x + preedit_w, r.bottom() - Float32(4.0), 1.5, self.theme.accent)
+            if st.cursor_cp < len(codes):
+                self._draw_text(suffix_str, ime_x + preedit_w, text_y, font_size, self.theme.text_primary)
+            var caret_x = ime_x + ime_pre_cur_w
+            self.draw_list.add_line(caret_x, r.y + Float32(4.0), caret_x, r.bottom() - Float32(4.0), 1.6, self.theme.focus_ring)
         else:
             if focused and st.select_anchor_cp >= 0 and st.select_anchor_cp != st.cursor_cp:
                 var lo = min(st.cursor_cp, st.select_anchor_cp)
                 var hi = max(st.cursor_cp, st.select_anchor_cp)
-                var x0 = pad_x + self._measure_text(encode_utf8(codes, 0, lo), self.theme.font_size)
-                var x1 = pad_x + self._measure_text(encode_utf8(codes, 0, hi), self.theme.font_size)
+                var x0 = draw_x + self._measure_text(encode_utf8(codes, 0, lo), font_size)
+                var x1 = draw_x + self._measure_text(encode_utf8(codes, 0, hi), font_size)
                 self.draw_list.add_rect(x0, r.y + Float32(3.0), max(Float32(2.0), x1 - x0), r.h - Float32(6.0), self.theme.accent_dim, 2.0)
 
-            self._draw_text(text, pad_x, text_y, self.theme.font_size, self.theme.text_primary)
+            self._draw_text(text, draw_x, text_y, font_size, self.theme.text_primary)
             if focused:
-                var caret_x = pad_x + self._measure_text(encode_utf8(codes, 0, st.cursor_cp), self.theme.font_size)
+                var caret_x = draw_x + prefix_w
                 self.draw_list.add_line(caret_x, r.y + Float32(4.0), caret_x, r.bottom() - Float32(4.0), 1.6, self.theme.focus_ring)
 
         self.draw_list.pop_clip()
@@ -1444,7 +1918,7 @@ struct UiContext(Movable):
         self.active_modal_id = wid
         self.had_modal_prev_frame = True  # Immediately trap background focus & input
 
-        if self.key_esc_pressed or self.pad_cancel:
+        if (self.key_esc_pressed and not self.ime_active) or self.pad_cancel:
             is_open = False
             self.modal_depth -= 1
             self.active_modal_id = 0

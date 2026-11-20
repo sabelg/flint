@@ -1,76 +1,140 @@
-"""Tier 4 Real-World Application Scenarios: S4 Asset Pipeline & glTF Ingestion.
-End-to-end ingestion pipeline: synthetic glTF 2.0 asset with AAA material extensions,
-Forsyth post-transform vertex cache optimization, QEM LOD meshlet simplification,
-packaging into .flpk container, and header validation.
+"""Tier 4 Real-World Application Scenarios: S4 Asset Pipeline & Studio Ingestion.
+Genuine end-to-end ingestion slice: `GLB + PNG + WAV -> cooker_v2 -> .flpk v3 (FlpkV3MappedArchive)
+-> AssetServer (JobPool async load + AaaResidencyStreamer VRAM bridge) -> FlintAaaVulkanRenderer
++ FlintStudioState + McpServerV2`.
 """
 from std.collections import List
+from std.ffi import external_call
+from flint.assets.cooker_v2 import cook_workspace
+from flint.assets.flpk_v3 import FlpkV3MappedArchive
+from flint.assets.image import write_png
+from flint.assets.server import ASSET_STATE_READY, AssetServer
+from flint.core.jobs import JobPool
 from flint.core.math import Vec3
-from flint.assets.meshlet import compute_acmr, optimize_vertex_cache_forsyth, simplify_mesh_qem
-from flint.render.aaa_bsdf import AaaMaterial, eval_thin_film_iridescence_cpu
-from flint.assets.vfs import encode_pack, pack_read
+from flint.devtools.mcp_v2 import McpServerV2
+from flint.platform.os import make_dirs, write_bytes
+from flint.render.material_graph import MaterialAsset
+from flint.render.render_world import RENDER_TIER_2_AAA_VISBUFFER_RT, ScalableRenderer
+from flint.studio import FlintStudioState
 from e2e.common.harness import TestContext
-from e2e.common.mock_data import create_mock_meshlet_mesh, create_mock_model_with_extensions, create_mock_flpk_data
+from e2e.common.mock_data import create_mock_glb_bytes, create_mock_wav_bytes
+
+
+def _pid_str() -> String:
+    return String(Int(external_call["getpid", Int32]()))
+
+
+def _cleanup_dir(path: String):
+    var cmd = String("rm -rf ") + path
+    _ = external_call["system", Int32](cmd.as_c_string_span())
 
 
 def test_t4_asset_pipeline_full_ingestion(mut ctx: TestContext) raises:
-    # 1. Ingest glTF model with AAA material extensions
-    var model = create_mock_model_with_extensions()
-    ctx.assert_true(len(model.meshes) > 0, "ingested glTF model contains mesh primitives")
-    ctx.assert_true(len(model.textures) >= 3, "ingested glTF model contains PBR textures")
+    var tmp_root = "/tmp/flint_e2e_t4_assets_" + _pid_str()
+    var src_dir = tmp_root + "/src"
+    var cache_dir = tmp_root + "/cache"
+    var flpk_path = tmp_root + "/bundle.flpk"
+    _cleanup_dir(tmp_root)
+    _ = make_dirs(src_dir)
+    _ = make_dirs(cache_dir)
 
-    # Verify material parameters from extensions
-    var raw_mesh = model.meshes[0].copy()
-    ctx.assert_approx(raw_mesh.roughness, 0.25, 0.01, "roughness extension ingested accurately")
-    ctx.assert_approx(raw_mesh.metallic, 0.75, 0.01, "metallic extension ingested accurately")
-    ctx.assert_approx(raw_mesh.emissive_strength, 2.5, 0.01, "emissive strength ingested accurately")
+    var pool = JobPool()
+    _ = pool.allocate()
+    _ = pool.start(2)
+    var studio = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_2_AAA_VISBUFFER_RT,
+        width=160,
+        height=120,
+        worker_threads=0,
+    )
+    var assets = AssetServer(stream_budget_bytes_per_tick=4096, lru_max_bytes=16 * 1024 * 1024, enable_watcher=False)
 
-    # 2. Extract primary mesh and run Forsyth post-transform cache optimizer
-    var int_indices = List[Int]()
-    for i in range(len(raw_mesh.indices)):
-        int_indices.append(Int(raw_mesh.indices[i]))
+    try:
+        # 1. Author real GLB, PNG, and WAV source files in temp workspace
+        var glb_b = create_mock_glb_bytes()
+        ctx.assert_true(write_bytes(src_dir + "/model.glb", glb_b), "write source model.glb")
+        var rgba = List[UInt32](length=32 * 32, fill=0xFF3399EE)
+        for y in range(32):
+            for x in range(32):
+                if ((x // 4) + (y // 4)) % 2 == 0:
+                    rgba[y * 32 + x] = 0xFFEEAA22
+        ctx.assert_true(write_png(src_dir + "/albedo.png", rgba, 32, 32), "write source albedo.png")
+        var wav_b = create_mock_wav_bytes()
+        ctx.assert_true(write_bytes(src_dir + "/beep.wav", wav_b), "write source beep.wav")
 
-    var v_count = len(raw_mesh.positions) // 3
-    var opt_indices = optimize_vertex_cache_forsyth(int_indices, v_count, 32)
-    ctx.assert_equal(len(opt_indices), len(int_indices), "cache optimization preserves total index count")
+        # 2. Cook workspace across JobPool into .flpk v3
+        var rep = cook_workspace(src_dir, flpk_path, pool, cache_dir=cache_dir, force_recook=True, page_align=True)
+        ctx.assert_true(rep.ok, "cook_workspace succeeds")
+        ctx.assert_true(rep.total_assets >= 2, "cook_workspace cooked >= 2 assets")
+        ctx.assert_true(rep.archive_bytes >= 64, "cooked .flpk archive non-trivial")
 
-    var unopt_acmr = compute_acmr(int_indices, 32)
-    var opt_acmr = compute_acmr(opt_indices, 32)
-    ctx.assert_true(opt_acmr <= unopt_acmr + 0.05, "Forsyth optimizer achieves high GPU FIFO-32 cache locality")
+        # 3. Verify FlpkV3MappedArchive alignment & ECMA-182 CRC64
+        var arch = FlpkV3MappedArchive.open(flpk_path)
+        ctx.assert_true(arch.valid, "FlpkV3MappedArchive opens cooked bundle")
+        var toc_glb = arch.find_by_path("model.glb", 0)
+        ctx.assert_true(toc_glb >= 0, "TOC locates cooked model.glb")
+        ctx.assert_true(arch.verify_entry_crc64(toc_glb), "model.glb CRC64 verifies")
+        ctx.assert_equal(Int(arch.toc_entry(toc_glb).payload_offset & 63), 0, "cooked payload 64-byte aligned")
+        arch.close()
 
-    # 3. Generate LOD 1 via QEM surface simplification
-    var orig_tris = len(raw_mesh.indices) // 3
-    var target_l1_tris = orig_tris // 2
-    var lod1_result = simplify_mesh_qem(raw_mesh, target_l1_tris)
-    var lod1_mesh = lod1_result[0].copy()
-    var lod1_err = lod1_result[1]
-    var lod1_tris = len(lod1_mesh.indices) // 3
-    ctx.assert_true(lod1_tris <= orig_tris, "LOD 1 decimation reduces polygon complexity")
-    ctx.assert_true(lod1_err >= 0.0, "geometric surface error calculated monotonically")
+        # 4. Mount .flpk v3 in AssetServer & bridge residency to Vulkan Tier 2 renderer
+        ctx.assert_true(assets.mount_flpk(flpk_path), "AssetServer mounts cooked .flpk v3")
+        ref ren = studio.app.resources.get_ptr_mut[ScalableRenderer]().value()[unsafe_offset=0]
+        ctx.assert_true(ren.uses_vulkan(), "FlintStudioState runs Tier 2 Vulkan renderer")
+        assets.attach_renderer_residency_bridge(ren.gpu_slot[0])
 
-    # 4. Pack processed asset into .flpk container bundle
-    var file_names = List[String]()
-    var file_buffers = List[List[UInt8]]()
+        var h_mesh = assets.load_mesh_async("model.glb")
+        var h_tex = assets.load_texture_async("albedo.png", progressive=True)
+        var done = assets.poll_async_loads(pool)
+        ctx.assert_true(done >= 2, "JobPool completes async mesh + texture loads")
+        ctx.assert_equal(assets.meshes.asset_state(h_mesh), ASSET_STATE_READY, "cooked mesh reaches ASSET_STATE_READY")
+        ctx.assert_equal(assets.textures.asset_state(h_tex), ASSET_STATE_READY, "cooked texture reaches ASSET_STATE_READY")
 
-    file_names.append(String("model_lod0.bin"))
-    var b0 = List[UInt8]()
-    b0.append(0xAA); b0.append(0xBB); b0.append(0xCC); b0.append(0xDD)
-    file_buffers.append(b0^)
+        var mesh_ptr = assets.meshes.get_ptr(h_mesh)
+        ctx.assert_true(Bool(mesh_ptr) and mesh_ptr.value()[unsafe_offset=0].has_collider, "cooked mesh includes BVH8 collider")
+        ctx.assert_true(len(mesh_ptr.value()[unsafe_offset=0].geom.meshes) > 0, "cooked mesh includes geometry LOD slices")
 
-    file_names.append(String("model_lod1.bin"))
-    var b1 = List[UInt8]()
-    b1.append(0x11); b1.append(0x22); b1.append(0x33); b1.append(0x44)
-    file_buffers.append(b1^)
+        # Register loaded asset in renderer + spawn studio entity via McpServerV2
+        var mat_id = ren.register_material(MaterialAsset(base_color=Vec3(0.8, 0.6, 0.4), roughness=0.3))
+        _ = mat_id
+        var mcp = McpServerV2(workspace_root=tmp_root, auth_token="")
+        var spawn_resp = mcp.handle_jsonrpc(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ecs.spawn_entity\",\"arguments\":{\"name\":\"CookedProp\"}}}",
+            studio,
+            assets,
+            pool,
+        )
+        ctx.assert_true(spawn_resp.find("\"isError\":false") >= 0, "McpServerV2 spawns studio entity")
 
-    var flpk_container = encode_pack(file_names, file_buffers)
-    ctx.assert_true(len(flpk_container) >= 64, "packed .flpk meets container alignment requirements")
+        # 5. Multi-frame progressive mip streaming + PIE + studio render loop
+        for f in range(6):
+            _ = assets.tick(Float64(f) * 0.0167)
+            _ = studio.pie_step(1)
+            studio.render_editor_frame(160, 120)
 
-    # Verify container header magic & entry count
-    var count = Int(flpk_container[8]) | (Int(flpk_container[9]) << 8)
-    ctx.assert_equal(count, 2, "container directory indexes exactly 2 asset streams")
+        var tex_slot = Int(h_tex.slot())
+        var min_mip = assets.textures.get_ptr(h_tex).value()[unsafe_offset=0].resident_min_mip
+        var slot_vram = assets.textures.slot_vram_bytes[tex_slot]
+        var total_vram = assets.total_vram_live_bytes()
+        var gpu_frame = studio.app.resources.get_ptr[ScalableRenderer]().value()[unsafe_offset=0].gpu_slot[0].frame_index
 
-    # 5. Evaluate glTF KHR_materials_iridescence extension
-    var irid_rgb = eval_thin_film_iridescence_cpu(0.707, 400.0, 1.5)
-    ctx.assert_true(irid_rgb.x > 0.0 or irid_rgb.y > 0.0 or irid_rgb.z > 0.0, "thin-film iridescence evaluates non-zero spectral reflectance")
+        ctx.assert_true(slot_vram > 0 and total_vram > 0, "AaaResidencyStreamer tracks non-zero GPU VRAM residency")
+        ctx.assert_equal(min_mip, 0, "progressive texture drains to mip 0")
+        ctx.assert_true(studio.live_entity_count() >= 1, "studio owns live spawned entity")
+        ctx.assert_true(studio.sim_tick >= 6, "studio PIE stepped 6 frames")
+        ctx.assert_true(gpu_frame >= 6, "Vulkan renderer executed >= 6 editor frames")
+    except e:
+        assets.close()
+        studio.shutdown()
+        pool.stop()
+        _cleanup_dir(tmp_root)
+        raise e^
+
+    assets.close()
+    studio.shutdown()
+    pool.stop()
+    _cleanup_dir(tmp_root)
 
 
 # =========================================================================
@@ -80,6 +144,7 @@ def test_t4_asset_pipeline_full_ingestion(mut ctx: TestContext) raises:
 def run_all(mut ctx: TestContext) raises:
     ctx.start_suite("T4_RealWorld_AssetPipeline")
     try: test_t4_asset_pipeline_full_ingestion(ctx); ctx.record_pass("test_t4_asset_pipeline_full_ingestion") except e: ctx.record_fail("test_t4_asset_pipeline_full_ingestion", String(e))
+
 
 def main() raises:
     var ctx = TestContext()

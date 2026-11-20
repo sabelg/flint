@@ -27,6 +27,7 @@ from flint.render.aaa_visbuffer import (
     AAA_PUSH_WORDS,
     BIND_AAA_BINDLESS_TEX,
     BIND_AAA_DEPTH_TEX,
+    BIND_AAA_DRAW_PAIRS,
     BIND_AAA_GLOBALS,
     BIND_AAA_INDICES,
     BIND_AAA_INSTANCES,
@@ -575,11 +576,13 @@ def vsm_page_vertex_shader() -> List[UInt32]:
     var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
     var b_instances = s.buffer(BIND_AAA_INSTANCES)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_draw_pairs = s.buffer(BIND_AAA_DRAW_PAIRS)
 
     var v_idx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    var draw_slot = s.instance_index()
+    var dp_off = s.imul(draw_slot, s.uint(2))
+    var inst_id = s.load_word(b_draw_pairs, dp_off)
+    var ml_id = s.load_word(b_draw_pairs, s.iadd(dp_off, s.uint(1)))
 
     var local_prim = s.udiv(v_idx, s.uint(3))
     var corner = s.umod(v_idx, s.uint(3))
@@ -621,14 +624,16 @@ def vsm_alphamask_vertex_shader() -> List[UInt32]:
     var b_instances = s.buffer(BIND_AAA_INSTANCES)
     var b_materials = s.buffer(BIND_AAA_MATERIALS)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_draw_pairs = s.buffer(BIND_AAA_DRAW_PAIRS)
 
     var out_uv = s.add_stage_io(STORAGE_OUTPUT, s.type_vec2, location=0, flat=False)
     var out_talb = s.add_stage_io(STORAGE_OUTPUT, s.type_uint, location=1, flat=True)
 
     var v_idx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    var draw_slot = s.instance_index()
+    var dp_off = s.imul(draw_slot, s.uint(2))
+    var inst_id = s.load_word(b_draw_pairs, dp_off)
+    var ml_id = s.load_word(b_draw_pairs, s.iadd(dp_off, s.uint(1)))
 
     var local_prim = s.udiv(v_idx, s.uint(3))
     var corner = s.umod(v_idx, s.uint(3))

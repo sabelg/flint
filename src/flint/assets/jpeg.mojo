@@ -1,6 +1,7 @@
-"""Native baseline sequential JPEG decoder/encoder & unified PNG/JPEG auto-decoder."""
+"""Native sequential (`SOF0`/`SOF1`) & progressive (`SOF2`) JPEG decoder/encoder & unified PNG/JPEG/KTX2 auto-decoder."""
 from std.math import cos, max, min, sqrt
 from flint.assets.image import NativeImage, decode_png
+from flint.assets.ktx2 import decode_ktx2, is_ktx2_magic
 
 
 def jpeg_be16(data: List[UInt8], offset: Int) -> Int:
@@ -9,8 +10,9 @@ def jpeg_be16(data: List[UInt8], offset: Int) -> Int:
     return (Int(data[offset]) << 8) | Int(data[offset + 1])
 
 
+@always_inline
 def jpeg_zigzag(index: Int) -> Int:
-    var order = [
+    comptime _ZIGZAG = SIMD[DType.uint8, 64](
         0, 1, 8, 16, 9, 2, 3, 10,
         17, 24, 32, 25, 18, 11, 4, 5,
         12, 19, 26, 33, 40, 48, 41, 34,
@@ -19,39 +21,46 @@ def jpeg_zigzag(index: Int) -> Int:
         29, 22, 15, 23, 30, 37, 44, 51,
         58, 59, 52, 45, 38, 31, 39, 46,
         53, 60, 61, 54, 47, 55, 62, 63,
-    ]
-    return order[index]
+    )
+    return Int(_ZIGZAG[index])
 
 
 struct JpegBits(Copyable, Movable):
-    var data: List[UInt8]
+    var ptr: Int
+    var length: Int
     var position: Int
     var current: Int
     var remaining: Int
     var valid: Bool
 
     def __init__(out self, data: List[UInt8], start: Int):
-        self.data = data.copy()
+        self.ptr = Int(data.unsafe_ptr())
+        self.length = len(data)
         self.position = start
         self.current = 0
         self.remaining = 0
-        self.valid = True
+        self.valid = start >= 0 and start <= self.length and self.ptr != 0
+
+    @always_inline
+    def _byte(self, idx: Int) -> Int:
+        var p = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=self.ptr)
+        return Int(p[unsafe_offset=idx])
 
     def read_bit(mut self) -> Int:
         if self.remaining == 0:
-            if self.position >= len(self.data):
+            if self.position >= self.length:
                 self.valid = False
                 return 0
-            var value = Int(self.data[self.position])
+            var value = self._byte(self.position)
             self.position += 1
             if value == 255:
-                if self.position >= len(self.data):
+                if self.position >= self.length:
                     self.valid = False
                     return 0
-                var following = Int(self.data[self.position])
+                var following = self._byte(self.position)
                 self.position += 1
-                while following == 255 and self.position < len(self.data):
-                    following = Int(self.data[self.position])
+                while following == 255 and self.position < self.length:
+                    following = self._byte(self.position)
                     self.position += 1
                 if following != 0:
                     self.valid = False
@@ -69,10 +78,17 @@ struct JpegBits(Copyable, Movable):
 
     def restart(mut self) -> Bool:
         self.remaining = 0
-        if self.position + 2 > len(self.data) or Int(self.data[self.position]) != 255:
+        self.current = 0
+        while self.position < self.length and self._byte(self.position) != 255:
+            # No unaligned extra bytes allowed; fail unless right at 0xFF
             self.valid = False
             return False
-        var marker = Int(self.data[self.position + 1])
+        while self.position + 1 < self.length and self._byte(self.position) == 255 and self._byte(self.position + 1) == 255:
+            self.position += 1
+        if self.position + 2 > self.length or self._byte(self.position) != 255:
+            self.valid = False
+            return False
+        var marker = self._byte(self.position + 1)
         self.position += 2
         if marker < 208 or marker > 215:
             self.valid = False
@@ -136,7 +152,10 @@ struct JpegComponent(Copyable, Movable):
     var predictor: Int
     var stride: Int
     var rows: Int
+    var blocks_w: Int
+    var blocks_h: Int
     var samples: List[UInt8]
+    var coeffs: List[Int32]
 
     def __init__(out self):
         self.identifier = 0
@@ -148,7 +167,10 @@ struct JpegComponent(Copyable, Movable):
         self.predictor = 0
         self.stride = 0
         self.rows = 0
+        self.blocks_w = 0
+        self.blocks_h = 0
         self.samples = List[UInt8]()
+        self.coeffs = List[Int32]()
 
 
 def jpeg_extend(mut bits: JpegBits, size: Int) -> Int:
@@ -284,6 +306,186 @@ def jpeg_channel(value: Float32) -> UInt8:
     return UInt8(Int(value + 0.5))
 
 
+def _jpeg_decode_prog_block(
+    mut bits: JpegBits,
+    mut component: JpegComponent,
+    dc_table: JpegHuffman,
+    ac_table: JpegHuffman,
+    bx: Int,
+    by: Int,
+    ss: Int,
+    se: Int,
+    ah: Int,
+    al: Int,
+    mut eobrun: Int,
+):
+    if bx < 0 or bx >= component.blocks_w or by < 0 or by >= component.blocks_h:
+        bits.valid = False
+        return
+    var off = (by * component.blocks_w + bx) * 64
+    if ss == 0:
+        if ah == 0:
+            if not dc_table.valid:
+                bits.valid = False
+                return
+            var dc_size = dc_table.decode(bits)
+            if not bits.valid or dc_size < 0 or dc_size > 16:
+                bits.valid = False
+                return
+            component.predictor += jpeg_extend(bits, dc_size)
+            if not bits.valid:
+                return
+            component.coeffs[off] = Int32(component.predictor) << Int32(al)
+        else:
+            var b = bits.read_bit()
+            if not bits.valid:
+                return
+            if b != 0:
+                component.coeffs[off] |= Int32(1 << al)
+        return
+
+    var p1 = Int32(1 << al)
+    var m1 = -p1
+    var k = ss
+    if ah == 0:
+        if eobrun > 0:
+            eobrun -= 1
+            return
+        if not ac_table.valid:
+            bits.valid = False
+            return
+        while k <= se and bits.valid:
+            var sym = ac_table.decode(bits)
+            if not bits.valid or sym < 0:
+                bits.valid = False
+                return
+            var r = sym >> 4
+            var s = sym & 15
+            if s == 0:
+                if r == 15:
+                    k += 16
+                    if k > se + 1:
+                        bits.valid = False
+                        return
+                else:
+                    eobrun = (1 << r) + bits.read_bits(r) - 1
+                    if not bits.valid:
+                        return
+                    break
+            else:
+                k += r
+                if k > se or s > 16:
+                    bits.valid = False
+                    return
+                var val = jpeg_extend(bits, s)
+                if not bits.valid:
+                    return
+                component.coeffs[off + jpeg_zigzag(k)] = Int32(val) * p1
+                k += 1
+        return
+
+    # AC Refinement scan (Ss > 0, Ah > 0)
+    if eobrun == 0:
+        if not ac_table.valid:
+            bits.valid = False
+            return
+        while k <= se and bits.valid:
+            var sym = ac_table.decode(bits)
+            if not bits.valid or sym < 0:
+                bits.valid = False
+                return
+            var r = sym >> 4
+            var s = sym & 15
+            var new_val: Int32 = 0
+            if s == 0:
+                if r < 15:
+                    eobrun = (1 << r) + bits.read_bits(r)
+                    if not bits.valid:
+                        return
+                    break
+            elif s == 1:
+                var sign_b = bits.read_bit()
+                if not bits.valid:
+                    return
+                new_val = p1 if sign_b == 1 else m1
+            else:
+                bits.valid = False
+                return
+
+            while k <= se and bits.valid:
+                var nat = jpeg_zigzag(k)
+                var cur = component.coeffs[off + nat]
+                if cur != 0:
+                    var ref_b = bits.read_bit()
+                    if not bits.valid:
+                        return
+                    var abs_cur = Int(cur) if cur >= 0 else -Int(cur)
+                    if ref_b != 0 and (abs_cur & Int(p1)) == 0:
+                        component.coeffs[off + nat] = cur + (p1 if cur > 0 else m1)
+                else:
+                    if r == 0:
+                        break
+                    r -= 1
+                k += 1
+            if not bits.valid:
+                return
+            if k > se:
+                if s != 0:
+                    bits.valid = False
+                return
+            if new_val != 0:
+                component.coeffs[off + jpeg_zigzag(k)] = new_val
+            k += 1
+
+    if eobrun > 0:
+        while k <= se and bits.valid:
+            var nat = jpeg_zigzag(k)
+            var cur = component.coeffs[off + nat]
+            if cur != 0:
+                var ref_b = bits.read_bit()
+                if not bits.valid:
+                    return
+                var abs_cur = Int(cur) if cur >= 0 else -Int(cur)
+                if ref_b != 0 and (abs_cur & Int(p1)) == 0:
+                    component.coeffs[off + nat] = cur + (p1 if cur > 0 else m1)
+            k += 1
+        eobrun -= 1
+
+
+def _jpeg_assemble_image(
+    mut components: List[JpegComponent],
+    width: Int,
+    height: Int,
+    maximum_horizontal: Int,
+    maximum_vertical: Int,
+    maximum_size: Int,
+) -> NativeImage:
+    var image = NativeImage()
+    var scale = 1
+    while (width + scale - 1) // scale > maximum_size or (height + scale - 1) // scale > maximum_size:
+        scale *= 2
+    image.width = (width + scale - 1) // scale
+    image.height = (height + scale - 1) // scale
+    image.pixels = List[UInt32](length=image.width * image.height, fill=0xFF000000)
+    for y in range(image.height):
+        var source_y = min(height - 1, y * scale)
+        for x in range(image.width):
+            var source_x = min(width - 1, x * scale)
+            if len(components) == 1:
+                var sample = components[0].samples[(source_y * components[0].vertical // maximum_vertical) * components[0].stride + source_x * components[0].horizontal // maximum_horizontal]
+                image.pixels[y * image.width + x] = 0xFF000000 | UInt32(sample) << 16 | UInt32(sample) << 8 | UInt32(sample)
+            else:
+                var y_sample = Float32(components[0].samples[(source_y * components[0].vertical // maximum_vertical) * components[0].stride + source_x * components[0].horizontal // maximum_horizontal])
+                var cb = Float32(components[1].samples[(source_y * components[1].vertical // maximum_vertical) * components[1].stride + source_x * components[1].horizontal // maximum_horizontal]) - 128.0
+                var cr = Float32(components[2].samples[(source_y * components[2].vertical // maximum_vertical) * components[2].stride + source_x * components[2].horizontal // maximum_horizontal]) - 128.0
+                var red = jpeg_channel(y_sample + 1.402 * cr)
+                var green = jpeg_channel(y_sample - 0.344136 * cb - 0.714136 * cr)
+                var blue = jpeg_channel(y_sample + 1.772 * cb)
+                image.pixels[y * image.width + x] = 0xFF000000 | UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue)
+    image.valid = True
+    return image^
+
+
 def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     var image = NativeImage()
     if len(data) < 16 or Int(data[0]) != 255 or Int(data[1]) != 216:
@@ -301,8 +503,11 @@ def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     var maximum_horizontal = 1
     var maximum_vertical = 1
     var restart_interval = 0
+    var is_progressive = False
+    var scan_count = 0
+    var got_eoi = False
     var offset = 2
-    while offset + 4 <= len(data):
+    while offset + 2 <= len(data):
         while offset < len(data) and Int(data[offset]) == 255:
             offset += 1
         if offset >= len(data):
@@ -310,9 +515,12 @@ def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
         var marker = Int(data[offset])
         offset += 1
         if marker == 217:
+            got_eoi = True
             break
         if marker == 1 or (marker >= 208 and marker <= 215):
             continue
+        if offset + 2 > len(data):
+            return image^
         var length = jpeg_be16(data, offset)
         if length < 2 or offset + length > len(data):
             return image^
@@ -361,13 +569,16 @@ def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
                     ac_tables[table].build(counts, symbols)
                 else:
                     return image^
+            if position != end:
+                return image^
         elif marker == 221:  # DRI
             if end - start != 2:
                 return image^
             restart_interval = jpeg_be16(data, start)
-        elif marker == 192:  # SOF0, baseline sequential
+        elif marker == 192 or marker == 193 or marker == 194:  # SOF0 / SOF1 / SOF2
             if len(components) > 0 or end - start < 6 or Int(data[start]) != 8:
                 return image^
+            is_progressive = marker == 194
             height = jpeg_be16(data, start + 1)
             width = jpeg_be16(data, start + 3)
             var count = Int(data[start + 5])
@@ -380,99 +591,190 @@ def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
                 component.horizontal = Int(data[position + 1]) >> 4
                 component.vertical = Int(data[position + 1]) & 15
                 component.quantization = Int(data[position + 2])
-                if component.horizontal <= 0 or component.vertical <= 0 or component.quantization > 3:
+                if component.horizontal <= 0 or component.horizontal > 4 or component.vertical <= 0 or component.vertical > 4 or component.quantization > 3:
                     return image^
+                for existing_c in components:
+                    if existing_c.identifier == component.identifier:
+                        return image^
                 maximum_horizontal = max(maximum_horizontal, component.horizontal)
                 maximum_vertical = max(maximum_vertical, component.vertical)
                 components.append(component^)
+            var mcu_w0 = (width + maximum_horizontal * 8 - 1) // (maximum_horizontal * 8)
+            var mcu_h0 = (height + maximum_vertical * 8 - 1) // (maximum_vertical * 8)
+            for ci in range(len(components)):
+                components[ci].blocks_w = mcu_w0 * components[ci].horizontal
+                components[ci].blocks_h = mcu_h0 * components[ci].vertical
+                components[ci].stride = components[ci].blocks_w * 8
+                components[ci].rows = components[ci].blocks_h * 8
+                if is_progressive:
+                    components[ci].coeffs = List[Int32](length=components[ci].blocks_w * components[ci].blocks_h * 64, fill=0)
+                else:
+                    components[ci].samples = List[UInt8](length=components[ci].stride * components[ci].rows, fill=0)
         elif marker == 218:  # SOS
             if width <= 0 or height <= 0 or len(components) == 0 or end <= start:
                 return image^
             var count = Int(data[start])
-            if count != len(components) or start + 1 + count * 2 + 3 != end:
+            if count <= 0 or count > len(components) or start + 1 + count * 2 + 3 != end:
                 return image^
+            var ss = Int(data[end - 3])
+            var se = Int(data[end - 2])
+            var ah = Int(data[end - 1]) >> 4
+            var al = Int(data[end - 1]) & 15
+            if not is_progressive:
+                if count != len(components) or ss != 0 or se != 63 or ah != 0 or al != 0:
+                    return image^
+            else:
+                if ss > se or se >= 64 or ah > 13 or al > 13:
+                    return image^
+                if ah != 0 and ah != al + 1:
+                    return image^
+                if ss == 0 and se != 0:
+                    return image^
+                if ss > 0 and count != 1:
+                    return image^
+
+            var scan_comp_indices = List[Int](capacity=count)
             for index in range(count):
                 var identifier = Int(data[start + 1 + index * 2])
                 var tables = Int(data[start + 2 + index * 2])
-                if tables >> 4 > 3 or tables & 15 > 3:
+                if (tables >> 4) > 3 or (tables & 15) > 3:
                     return image^
-                var found = False
+                var found_idx = -1
                 for component_index in range(len(components)):
                     if components[component_index].identifier == identifier:
-                        components[component_index].dc_table = tables >> 4
-                        components[component_index].ac_table = tables & 15
-                        components[component_index].predictor = 0
-                        found = True
-                if not found:
+                        found_idx = component_index
+                        break
+                if found_idx < 0:
                     return image^
-            var mcu_width = (width + maximum_horizontal * 8 - 1) // (maximum_horizontal * 8)
-            var mcu_height = (height + maximum_vertical * 8 - 1) // (maximum_vertical * 8)
-            for component_index in range(len(components)):
-                var horizontal_blocks = mcu_width * components[component_index].horizontal
-                var vertical_blocks = mcu_height * components[component_index].vertical
-                components[component_index].stride = horizontal_blocks * 8
-                components[component_index].rows = vertical_blocks * 8
-                components[component_index].samples = List[UInt8](length=components[component_index].stride * components[component_index].rows, fill=0)
+                for prev_idx in scan_comp_indices:
+                    if prev_idx == found_idx:
+                        return image^
+                components[found_idx].dc_table = tables >> 4
+                components[found_idx].ac_table = tables & 15
+                components[found_idx].predictor = 0
+                scan_comp_indices.append(found_idx)
+
             var bits = JpegBits(data, end)
-            var coefficients = List[Float32](length=64, fill=0)
-            var workspace = List[Float32](length=64, fill=0)
-            for mcu_y in range(mcu_height):
-                for mcu_x in range(mcu_width):
-                    var mcu = mcu_y * mcu_width + mcu_x
-                    if restart_interval > 0 and mcu > 0 and mcu % restart_interval == 0:
-                        if not bits.restart():
+            if not is_progressive:
+                var mcu_width = (width + maximum_horizontal * 8 - 1) // (maximum_horizontal * 8)
+                var mcu_height = (height + maximum_vertical * 8 - 1) // (maximum_vertical * 8)
+                var coefficients = List[Float32](length=64, fill=0)
+                var workspace = List[Float32](length=64, fill=0)
+                for mcu_y in range(mcu_height):
+                    for mcu_x in range(mcu_width):
+                        var mcu = mcu_y * mcu_width + mcu_x
+                        if restart_interval > 0 and mcu > 0 and mcu % restart_interval == 0:
+                            if not bits.restart():
+                                return image^
+                            for component_index in range(len(components)):
+                                components[component_index].predictor = 0
+                        for scan_index in range(count):
+                            var component_index = scan_comp_indices[scan_index]
+                            for vertical in range(components[component_index].vertical):
+                                for horizontal in range(components[component_index].horizontal):
+                                    var block_x = (mcu_x * components[component_index].horizontal + horizontal) * 8
+                                    var block_y = (mcu_y * components[component_index].vertical + vertical) * 8
+                                    var dc_index = components[component_index].dc_table
+                                    var ac_index = components[component_index].ac_table
+                                    var quantization_index = components[component_index].quantization
+                                    jpeg_decode_block(bits, components[component_index], quantization[quantization_index], dc_tables[dc_index], ac_tables[ac_index], coefficients, workspace, block_x, block_y)
+                                    if not bits.valid:
+                                        return image^
+                _ = len(data)
+                return _jpeg_assemble_image(components, width, height, maximum_horizontal, maximum_vertical, maximum_size)
+
+            # Progressive SOF2 scan
+            var eobrun = 0
+            if count > 1:
+                var mcu_width = (width + maximum_horizontal * 8 - 1) // (maximum_horizontal * 8)
+                var mcu_height = (height + maximum_vertical * 8 - 1) // (maximum_vertical * 8)
+                for mcu_y in range(mcu_height):
+                    for mcu_x in range(mcu_width):
+                        var mcu = mcu_y * mcu_width + mcu_x
+                        if restart_interval > 0 and mcu > 0 and mcu % restart_interval == 0:
+                            if not bits.restart():
+                                return image^
+                            for ci in scan_comp_indices:
+                                components[ci].predictor = 0
+                            eobrun = 0
+                        for scan_index in range(count):
+                            var ci = scan_comp_indices[scan_index]
+                            var dc_i = components[ci].dc_table
+                            var ac_i = components[ci].ac_table
+                            for vertical in range(components[ci].vertical):
+                                for horizontal in range(components[ci].horizontal):
+                                    var bx = mcu_x * components[ci].horizontal + horizontal
+                                    var by = mcu_y * components[ci].vertical + vertical
+                                    _jpeg_decode_prog_block(bits, components[ci], dc_tables[dc_i], ac_tables[ac_i], bx, by, ss, se, ah, al, eobrun)
+                                    if not bits.valid:
+                                        return image^
+            else:
+                var ci = scan_comp_indices[0]
+                var dc_i = components[ci].dc_table
+                var ac_i = components[ci].ac_table
+                var comp_w = (width * components[ci].horizontal + maximum_horizontal - 1) // maximum_horizontal
+                var comp_h = (height * components[ci].vertical + maximum_vertical - 1) // maximum_vertical
+                var scan_bx = max(1, (comp_w + 7) // 8)
+                var scan_by = max(1, (comp_h + 7) // 8)
+                for by in range(scan_by):
+                    for bx in range(scan_bx):
+                        var blk_i = by * scan_bx + bx
+                        if restart_interval > 0 and blk_i > 0 and blk_i % restart_interval == 0:
+                            if not bits.restart():
+                                return image^
+                            components[ci].predictor = 0
+                            eobrun = 0
+                        _jpeg_decode_prog_block(bits, components[ci], dc_tables[dc_i], ac_tables[ac_i], bx, by, ss, se, ah, al, eobrun)
+                        if not bits.valid:
                             return image^
-                        for component_index in range(len(components)):
-                            components[component_index].predictor = 0
-                    for scan_index in range(count):
-                        var identifier = Int(data[start + 1 + scan_index * 2])
-                        var component_index = -1
-                        for candidate in range(len(components)):
-                            if components[candidate].identifier == identifier:
-                                component_index = candidate
-                        if component_index < 0:
-                            return image^
-                        for vertical in range(components[component_index].vertical):
-                            for horizontal in range(components[component_index].horizontal):
-                                var block_x = (mcu_x * components[component_index].horizontal + horizontal) * 8
-                                var block_y = (mcu_y * components[component_index].vertical + vertical) * 8
-                                var dc_index = components[component_index].dc_table
-                                var ac_index = components[component_index].ac_table
-                                var quantization_index = components[component_index].quantization
-                                jpeg_decode_block(bits, components[component_index], quantization[quantization_index], dc_tables[dc_index], ac_tables[ac_index], coefficients, workspace, block_x, block_y)
-                                if not bits.valid:
-                                    return image^
-            var scale = 1
-            while (width + scale - 1) // scale > maximum_size or (height + scale - 1) // scale > maximum_size:
-                scale *= 2
-            image.width = (width + scale - 1) // scale
-            image.height = (height + scale - 1) // scale
-            image.pixels = List[UInt32](length=image.width * image.height, fill=0xFF000000)
-            for y in range(image.height):
-                var source_y = min(height - 1, y * scale)
-                for x in range(image.width):
-                    var source_x = min(width - 1, x * scale)
-                    if len(components) == 1:
-                        var sample = components[0].samples[(source_y * components[0].vertical // maximum_vertical) * components[0].stride + source_x * components[0].horizontal // maximum_horizontal]
-                        image.pixels[y * image.width + x] = 0xFF000000 | UInt32(sample) << 16 | UInt32(sample) << 8 | UInt32(sample)
-                    else:
-                        var y_sample = Float32(components[0].samples[(source_y * components[0].vertical // maximum_vertical) * components[0].stride + source_x * components[0].horizontal // maximum_horizontal])
-                        var cb = Float32(components[1].samples[(source_y * components[1].vertical // maximum_vertical) * components[1].stride + source_x * components[1].horizontal // maximum_horizontal]) - 128.0
-                        var cr = Float32(components[2].samples[(source_y * components[2].vertical // maximum_vertical) * components[2].stride + source_x * components[2].horizontal // maximum_horizontal]) - 128.0
-                        var red = jpeg_channel(y_sample + 1.402 * cr)
-                        var green = jpeg_channel(y_sample - 0.344136 * cb - 0.714136 * cr)
-                        var blue = jpeg_channel(y_sample + 1.772 * cb)
-                        image.pixels[y * image.width + x] = 0xFF000000 | UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue)
-            image.valid = True
-            return image^
+            if not bits.valid:
+                return image^
+            scan_count += 1
+            var next_pos = bits.position
+            while next_pos < len(data):
+                if Int(data[next_pos]) == 255:
+                    var j = next_pos + 1
+                    while j < len(data) and Int(data[j]) == 255:
+                        j += 1
+                    if j < len(data):
+                        var m2 = Int(data[j])
+                        if m2 == 0 or (m2 >= 208 and m2 <= 215):
+                            next_pos = j + 1
+                            continue
+                    break
+                next_pos += 1
+            offset = next_pos
+            continue
         offset = end
+
+    _ = len(data)
+    if is_progressive and scan_count > 0 and got_eoi and width > 0 and height > 0:
+        var coefficients = List[Float32](length=64, fill=0)
+        var workspace = List[Float32](length=64, fill=0)
+        for ci in range(len(components)):
+            components[ci].samples = List[UInt8](length=components[ci].stride * components[ci].rows, fill=0)
+            var q_idx = components[ci].quantization
+            for by in range(components[ci].blocks_h):
+                for bx in range(components[ci].blocks_w):
+                    var off = (by * components[ci].blocks_w + bx) * 64
+                    var ac_count = 0
+                    for i in range(64):
+                        var cv = Int(components[ci].coeffs[off + i])
+                        if i > 0 and cv != 0:
+                            ac_count += 1
+                        coefficients[i] = Float32(cv * quantization[q_idx][i])
+                    jpeg_idct_store(coefficients, components[ci].samples, components[ci].stride, bx * 8, by * 8, workspace, ac_count)
+        return _jpeg_assemble_image(components, width, height, maximum_horizontal, maximum_vertical, maximum_size)
+
     return image^
 
 
 def decode_image_auto(data: List[UInt8], maximum_size: Int = 4096) -> NativeImage:
-    """Automatically decodes either an embedded baseline JPEG (`0xFF 0xD8`) or PNG (`0x89 'P' 'N' 'G'`) byte stream."""
+    """Automatically decodes an embedded JPEG (`0xFF 0xD8`), KTX2 (`0xAB 'K' 'T' 'X' ...`), or PNG byte stream."""
     if len(data) >= 2 and Int(data[0]) == 0xFF and Int(data[1]) == 0xD8:
         return decode_jpeg(data, maximum_size)
+    if is_ktx2_magic(data):
+        return decode_ktx2(data, maximum_size)
     return decode_png(data, maximum_size)
 
 

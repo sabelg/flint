@@ -31,7 +31,12 @@ from flint.ui.draw_list import (
 )
 from flint.render.spirv import (
     AaaSpirvModule,
+    IMAGE_FORMAT_UNKNOWN,
+    MODEL_FRAGMENT,
     MODEL_GL_COMPUTE,
+    OP_STORE,
+    STORAGE_OUTPUT,
+    emit,
 )
 from flint.render.aaa_visbuffer import (
     AAA_MAX_BINDLESS,
@@ -39,6 +44,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_BINDLESS_TEX,
     BIND_AAA_HISTORY,
     BIND_AAA_POST_SCRATCH,
+    BIND_AAA_SWAPCHAIN_IMG,
 )
 
 comptime AAA_POST_UI_PRIMS_BASE_OFFSET: Int = 1024
@@ -366,7 +372,10 @@ def _emit_nine_slice_axis(
     return s.nclamp(s.load_f(out_uv), s.float(0.0), s.float(1.0))
 
 
-def aaa_ui_overlay_shader() -> List[UInt32]:
+def aaa_ui_overlay_shader(
+    direct_swapchain: Bool = False,
+    swapchain_binding: Int = BIND_AAA_SWAPCHAIN_IMG,
+) -> List[UInt32]:
     """Tile-Binned GPU UI SDF Overlay Compute Shader (16x16 workgroups, chunked 256-prim LDS loop).
     Push[0] = out_w, Push[1] = out_h, Push[2] = prim_count,
     Push[3] = prims_word_offset (in BIND_AAA_POST_SCRATCH),
@@ -379,10 +388,15 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
         group_height=16,
         push_words=AAA_PUSH_WORDS,
         enable_bindless=True,
+        enable_storage_image_without_format=direct_swapchain,
     )
     var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
     var b_hist = s.buffer(BIND_AAA_HISTORY)
     var bindless_arr = s.bindless_sampled_array_2d(BIND_AAA_BINDLESS_TEX, AAA_MAX_BINDLESS)
+    var swap_img = (UInt32(0), UInt32(0))
+    if direct_swapchain:
+        swap_img = s.storage_image_2d(swapchain_binding, format=IMAGE_FORMAT_UNKNOWN)
+    _ = b_hist
 
     var gx = s.invocation_axis(0)
     var gy = s.invocation_axis(1)
@@ -491,21 +505,36 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
 
     # Lazy background fetch on first chunk touching this tile (avoids touching untouched 3D scene tiles!)
     s.begin_if(s.logical_and(in_screen, s.ieq(s.load_u(bg_loaded), s.uint(0))))
-    var bg_raw = s.load_word(b_hist, pix_idx)
-    s.begin_if(is_hdr10)
-    var inv1023 = s.float(1.0 / 1023.0)
-    var pq_r = s.fmul(s.float_from_uint(s.bit_and(bg_raw, s.uint(0x3FF))), inv1023)
-    var pq_g = s.fmul(s.float_from_uint(s.bit_and(s.shr(bg_raw, s.uint(10)), s.uint(0x3FF))), inv1023)
-    var pq_b = s.fmul(s.float_from_uint(s.bit_and(s.shr(bg_raw, s.uint(20)), s.uint(0x3FF))), inv1023)
-    s.store(accum_r, _emit_pq_eotf_100nits(s, pq_r))
-    s.store(accum_g, _emit_pq_eotf_100nits(s, pq_g))
-    s.store(accum_b, _emit_pq_eotf_100nits(s, pq_b))
-    s.begin_else()
-    var bg_rgba = _emit_unpack_flint_argb(s, bg_raw)
-    s.store(accum_r, bg_rgba[0])
-    s.store(accum_g, bg_rgba[1])
-    s.store(accum_b, bg_rgba[2])
-    s.end_if()
+    if direct_swapchain:
+        var bg_v4 = s.image_read(swap_img, s.uvec2(gx, gy))
+        var bg_x = s.extract_f(bg_v4, 0)
+        var bg_y = s.extract_f(bg_v4, 1)
+        var bg_z = s.extract_f(bg_v4, 2)
+        s.begin_if(is_hdr10)
+        s.store(accum_r, _emit_pq_eotf_100nits(s, bg_x))
+        s.store(accum_g, _emit_pq_eotf_100nits(s, bg_y))
+        s.store(accum_b, _emit_pq_eotf_100nits(s, bg_z))
+        s.begin_else()
+        s.store(accum_r, bg_x)
+        s.store(accum_g, bg_y)
+        s.store(accum_b, bg_z)
+        s.end_if()
+    else:
+        var bg_raw = s.load_word(b_hist, pix_idx)
+        s.begin_if(is_hdr10)
+        var inv1023 = s.float(1.0 / 1023.0)
+        var pq_r = s.fmul(s.float_from_uint(s.bit_and(bg_raw, s.uint(0x3FF))), inv1023)
+        var pq_g = s.fmul(s.float_from_uint(s.bit_and(s.shr(bg_raw, s.uint(10)), s.uint(0x3FF))), inv1023)
+        var pq_b = s.fmul(s.float_from_uint(s.bit_and(s.shr(bg_raw, s.uint(20)), s.uint(0x3FF))), inv1023)
+        s.store(accum_r, _emit_pq_eotf_100nits(s, pq_r))
+        s.store(accum_g, _emit_pq_eotf_100nits(s, pq_g))
+        s.store(accum_b, _emit_pq_eotf_100nits(s, pq_b))
+        s.begin_else()
+        var bg_rgba = _emit_unpack_flint_argb(s, bg_raw)
+        s.store(accum_r, bg_rgba[0])
+        s.store(accum_g, bg_rgba[1])
+        s.store(accum_b, bg_rgba[2])
+        s.end_if()
     s.store(bg_loaded, s.uint(1))
     s.end_if()
 
@@ -1044,30 +1073,162 @@ def aaa_ui_overlay_shader() -> List[UInt32]:
     s.store(chunk_base_var, s.iadd(chunk_base, s.uint(UInt32(TILE_PRIM_CAP))))
     s.end_loop()
 
-    # Write final composited pixel back to `b_hist` if any UI chunk touched this tile
+    # Write final composited pixel back to swapchain image or `b_hist` if any UI chunk touched this tile
     s.begin_if(s.logical_and(in_screen, s.ine(s.load_u(bg_loaded), s.uint(0))))
-    var packed_out = s.uvar(s.uint(0xFF000000))
-    s.begin_if(is_hdr10)
-    var pqr_o = s.umin(s.uint(1023), s.saturate_uint(s.fma(_emit_pq_oetf_100nits(s, s.load_f(accum_r)), s.float(1023.0), s.float(0.5))))
-    var pqg_o = s.umin(s.uint(1023), s.saturate_uint(s.fma(_emit_pq_oetf_100nits(s, s.load_f(accum_g)), s.float(1023.0), s.float(0.5))))
-    var pqb_o = s.umin(s.uint(1023), s.saturate_uint(s.fma(_emit_pq_oetf_100nits(s, s.load_f(accum_b)), s.float(1023.0), s.float(0.5))))
-    s.store(
-        packed_out,
-        s.bit_or(s.uint(0xC0000000), s.bit_or(s.shl(pqb_o, s.uint(20)), s.bit_or(s.shl(pqg_o, s.uint(10)), pqr_o))),
-    )
-    s.begin_else()
-    var final_r = s.umin(s.uint(255), s.saturate_uint(s.fma(s.nclamp(s.load_f(accum_r), s.float(0.0), s.float(1.0)), s.float(255.0), s.float(0.5))))
-    var final_g = s.umin(s.uint(255), s.saturate_uint(s.fma(s.nclamp(s.load_f(accum_g), s.float(0.0), s.float(1.0)), s.float(255.0), s.float(0.5))))
-    var final_b = s.umin(s.uint(255), s.saturate_uint(s.fma(s.nclamp(s.load_f(accum_b), s.float(0.0), s.float(1.0)), s.float(255.0), s.float(0.5))))
-    s.store(
-        packed_out,
-        s.bit_or(
-            s.uint(0xFF000000),
-            s.bit_or(s.shl(final_r, s.uint(16)), s.bit_or(s.shl(final_g, s.uint(8)), final_b)),
-        ),
-    )
-    s.end_if()
-    s.store_word(b_hist, pix_idx, s.load_u(packed_out))
+    if direct_swapchain:
+        var out_r = s.fvar(s.float(0.0))
+        var out_g = s.fvar(s.float(0.0))
+        var out_b = s.fvar(s.float(0.0))
+        s.begin_if(is_hdr10)
+        s.store(out_r, _emit_pq_oetf_100nits(s, s.load_f(accum_r)))
+        s.store(out_g, _emit_pq_oetf_100nits(s, s.load_f(accum_g)))
+        s.store(out_b, _emit_pq_oetf_100nits(s, s.load_f(accum_b)))
+        s.begin_else()
+        s.store(out_r, s.nclamp(s.load_f(accum_r), s.float(0.0), s.float(1.0)))
+        s.store(out_g, s.nclamp(s.load_f(accum_g), s.float(0.0), s.float(1.0)))
+        s.store(out_b, s.nclamp(s.load_f(accum_b), s.float(0.0), s.float(1.0)))
+        s.end_if()
+        s.image_write(swap_img, s.uvec2(gx, gy), s.vec4(s.load_f(out_r), s.load_f(out_g), s.load_f(out_b), s.float(1.0)))
+    else:
+        var packed_out = s.uvar(s.uint(0xFF000000))
+        s.begin_if(is_hdr10)
+        var pqr_o = s.umin(s.uint(1023), s.saturate_uint(s.fma(_emit_pq_oetf_100nits(s, s.load_f(accum_r)), s.float(1023.0), s.float(0.5))))
+        var pqg_o = s.umin(s.uint(1023), s.saturate_uint(s.fma(_emit_pq_oetf_100nits(s, s.load_f(accum_g)), s.float(1023.0), s.float(0.5))))
+        var pqb_o = s.umin(s.uint(1023), s.saturate_uint(s.fma(_emit_pq_oetf_100nits(s, s.load_f(accum_b)), s.float(1023.0), s.float(0.5))))
+        s.store(
+            packed_out,
+            s.bit_or(s.uint(0xC0000000), s.bit_or(s.shl(pqb_o, s.uint(20)), s.bit_or(s.shl(pqg_o, s.uint(10)), pqr_o))),
+        )
+        s.begin_else()
+        var final_r = s.umin(s.uint(255), s.saturate_uint(s.fma(s.nclamp(s.load_f(accum_r), s.float(0.0), s.float(1.0)), s.float(255.0), s.float(0.5))))
+        var final_g = s.umin(s.uint(255), s.saturate_uint(s.fma(s.nclamp(s.load_f(accum_g), s.float(0.0), s.float(1.0)), s.float(255.0), s.float(0.5))))
+        var final_b = s.umin(s.uint(255), s.saturate_uint(s.fma(s.nclamp(s.load_f(accum_b), s.float(0.0), s.float(1.0)), s.float(255.0), s.float(0.5))))
+        s.store(
+            packed_out,
+            s.bit_or(
+                s.uint(0xFF000000),
+                s.bit_or(s.shl(final_r, s.uint(16)), s.bit_or(s.shl(final_g, s.uint(8)), final_b)),
+            ),
+        )
+        s.end_if()
+        s.store_word(b_hist, pix_idx, s.load_u(packed_out))
     s.end_if()
 
+    return s.finish()
+
+
+def aaa_ui_overlay_direct_shader(swapchain_binding: Int = BIND_AAA_SWAPCHAIN_IMG) -> List[UInt32]:
+    """Direct-to-Swapchain GPU UI SDF Overlay Compute Pass (`storage image2D`)."""
+    return aaa_ui_overlay_shader(direct_swapchain=True, swapchain_binding=swapchain_binding)
+
+
+def aaa_ui_present_fragment_shader() -> List[UInt32]:
+    """Fullscreen `VK_KHR_dynamic_rendering` alpha-blended UI SDF fragment pass for non-storage swapchains."""
+    var s = AaaSpirvModule(MODEL_FRAGMENT, push_words=AAA_PUSH_WORDS, enable_bindless=True, early_depth=False)
+    var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
+    var bindless_arr = s.bindless_sampled_array_2d(BIND_AAA_BINDLESS_TEX, AAA_MAX_BINDLESS)
+    var out_col = s.add_stage_io(STORAGE_OUTPUT, s.type_vec4, location=0, flat=False)
+
+    var fc = s.frag_coord()
+    var fgx = s.extract_f(fc, 0)
+    var fgy = s.extract_f(fc, 1)
+    var gx = s.saturate_uint(s.ffloor(fgx))
+    var gy = s.saturate_uint(s.ffloor(fgy))
+    var prim_cnt = s.push_word(2)
+    var prims_off = s.push_word(3)
+    var is_srgb_rt = s.ine(s.push_word(10), s.uint(0))
+
+    var acc_r = s.fvar(s.float(0.0))
+    var acc_g = s.fvar(s.float(0.0))
+    var acc_b = s.fvar(s.float(0.0))
+    var acc_a = s.fvar(s.float(0.0))
+
+    var i_v = s.uvar(s.uint(0))
+    s.begin_loop()
+    var i = s.load_u(i_v)
+    s.break_if(s.uge(i, prim_cnt))
+    var pb = s.iadd(prims_off, s.imul(i, s.uint(16)))
+    var cxy0 = s.load_word(b_post, s.iadd(pb, s.uint(8)))
+    var cxy1 = s.load_word(b_post, s.iadd(pb, s.uint(9)))
+    var cx0 = s.bit_and(cxy0, s.uint(0xFFFF))
+    var cy0 = s.shr(cxy0, s.uint(16))
+    var cx1 = s.bit_and(cxy1, s.uint(0xFFFF))
+    var cy1 = s.shr(cxy1, s.uint(16))
+    var in_clip = s.logical_and(
+        s.logical_and(s.uge(gx, cx0), s.ult(gx, cx1)),
+        s.logical_and(s.uge(gy, cy0), s.ult(gy, cy1)),
+    )
+    s.begin_if(in_clip)
+    var x0 = s.load_float(b_post, pb)
+    var y0 = s.load_float(b_post, s.iadd(pb, s.uint(1)))
+    var x1 = s.load_float(b_post, s.iadd(pb, s.uint(2)))
+    var y1 = s.load_float(b_post, s.iadd(pb, s.uint(3)))
+    var hdr = s.load_word(b_post, s.iadd(pb, s.uint(15)))
+    var kind = s.bit_and(hdr, s.uint(0xF))
+    var tex_slot = s.bit_and(s.shr(hdr, s.uint(4)), s.uint(0xFFF))
+    var param0 = s.load_float(b_post, s.iadd(pb, s.uint(12)))
+    var param1 = s.load_float(b_post, s.iadd(pb, s.uint(13)))
+    var pad = s.nmax(s.float(1.0), s.nmax(param0, param1))
+    var in_box = s.logical_and(
+        s.logical_and(s.fge(fgx, s.fsub(s.nmin(x0, x1), pad)), s.fge(s.fadd(s.nmax(x0, x1), pad), fgx)),
+        s.logical_and(s.fge(fgy, s.fsub(s.nmin(y0, y1), pad)), s.fge(s.fadd(s.nmax(y0, y1), pad), fgy)),
+    )
+    s.begin_if(in_box)
+    var rgba = _emit_unpack_flint_argb(s, s.load_word(b_post, s.iadd(pb, s.uint(10))))
+    var cov_v = s.fvar(s.float(0.0))
+    var sr_v = s.fvar(rgba[0])
+    var sg_v = s.fvar(rgba[1])
+    var sb_v = s.fvar(rgba[2])
+    var sa_v = s.fvar(rgba[3])
+    s.begin_if(s.ieq(kind, s.uint(0)))
+    var hw = s.fmul(s.nmax(s.float(0.5), s.fsub(x1, x0)), s.float(0.5))
+    var hh = s.fmul(s.nmax(s.float(0.5), s.fsub(y1, y0)), s.float(0.5))
+    var d_s = _emit_rounded_box_sdf(s, fgx, fgy, s.fadd(x0, hw), s.fadd(y0, hh), hw, hh, param0)
+    s.store(cov_v, s.nclamp(s.fsub(s.float(0.5), d_s), s.float(0.0), s.float(1.0)))
+    s.begin_else()
+    s.begin_if(s.ieq(kind, s.uint(4)))
+    var dl = _emit_seg_dist(s, fgx, fgy, x0, y0, x1, y1)
+    s.store(cov_v, s.nclamp(s.fsub(s.fmul(s.nmax(param0, s.float(1.0)), s.float(0.5)), dl), s.float(0.0), s.float(1.0)))
+    s.begin_else()
+    var u0 = s.load_float(b_post, s.iadd(pb, s.uint(4)))
+    var v0 = s.load_float(b_post, s.iadd(pb, s.uint(5)))
+    var u1 = s.load_float(b_post, s.iadd(pb, s.uint(6)))
+    var v1 = s.load_float(b_post, s.iadd(pb, s.uint(7)))
+    var tu = s.nclamp(s.fadd(u0, s.fmul(s.fdiv(s.fsub(fgx, x0), s.nmax(s.float(0.5), s.fsub(x1, x0))), s.fsub(u1, u0))), s.float(0.0), s.float(1.0))
+    var tv = s.nclamp(s.fadd(v0, s.fmul(s.fdiv(s.fsub(fgy, y0), s.nmax(s.float(0.5), s.fsub(y1, y0))), s.fsub(v1, v0))), s.float(0.0), s.float(1.0))
+    var ts = s.sample_bindless_lod(bindless_arr, tex_slot, s.vec2(tu, tv), s.float(0.0))
+    s.begin_if(s.ieq(kind, s.uint(1)))
+    var dist_g = s.extract_f(ts, 0)
+    var w_px = s.nmax(s.float(0.04), s.fmul(param0, s.float(0.35)))
+    var t_sm = s.nclamp(s.fdiv(s.fsub(dist_g, s.fsub(s.float(0.5), w_px)), s.fmul(w_px, s.float(2.0))), s.float(0.0), s.float(1.0))
+    s.store(cov_v, s.fmul(s.fmul(t_sm, t_sm), s.fsub(s.float(3.0), s.fmul(s.float(2.0), t_sm))))
+    s.begin_else()
+    s.store(sr_v, s.fmul(rgba[0], s.extract_f(ts, 0)))
+    s.store(sg_v, s.fmul(rgba[1], s.extract_f(ts, 1)))
+    s.store(sb_v, s.fmul(rgba[2], s.extract_f(ts, 2)))
+    s.store(sa_v, s.fmul(rgba[3], s.extract_f(ts, 3)))
+    s.store(cov_v, s.float(1.0))
+    s.end_if()
+    s.end_if()
+    s.end_if()
+    var eff_a = s.fmul(s.load_f(sa_v), s.load_f(cov_v))
+    var oma = s.fsub(s.float(1.0), eff_a)
+    s.store(acc_r, s.fma(s.load_f(acc_r), oma, s.fmul(s.load_f(sr_v), eff_a)))
+    s.store(acc_g, s.fma(s.load_f(acc_g), oma, s.fmul(s.load_f(sg_v), eff_a)))
+    s.store(acc_b, s.fma(s.load_f(acc_b), oma, s.fmul(s.load_f(sb_v), eff_a)))
+    s.store(acc_a, s.fma(s.load_f(acc_a), oma, eff_a))
+    s.end_if()
+    s.end_if()
+    s.store(i_v, s.iadd(i, s.uint(1)))
+    s.end_loop()
+
+    var fa = s.nclamp(s.load_f(acc_a), s.float(0.0), s.float(1.0))
+    var inv_a = s.select_f(s.fgt(fa, s.float(1e-5)), s.fdiv(s.float(1.0), fa), s.float(0.0))
+    var pr = s.nclamp(s.fmul(s.load_f(acc_r), inv_a), s.float(0.0), s.float(1.0))
+    var pg = s.nclamp(s.fmul(s.load_f(acc_g), inv_a), s.float(0.0), s.float(1.0))
+    var pb_o = s.nclamp(s.fmul(s.load_f(acc_b), inv_a), s.float(0.0), s.float(1.0))
+    var fr = s.select_f(is_srgb_rt, s.fpow(s.nmax(pr, s.float(1e-6)), s.float(2.2)), pr)
+    var fg = s.select_f(is_srgb_rt, s.fpow(s.nmax(pg, s.float(1e-6)), s.float(2.2)), pg)
+    var fb = s.select_f(is_srgb_rt, s.fpow(s.nmax(pb_o, s.float(1e-6)), s.float(2.2)), pb_o)
+    emit(s.code, OP_STORE, out_col[1], s.vec4(fr, fg, fb, fa))
     return s.finish()

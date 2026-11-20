@@ -42,18 +42,55 @@ read_flint_toml_value() {
     local key="$3"
     [[ -f "$file" ]] || return 1
     awk -v sec="[$section]" -v k="$key" '
-        /^[[:space:]]*\[/ { in_sec = ($0 ~ "^[[:space:]]*" sec "[[:space:]]*$"); next }
+        function strip_toml_comment(s,    i, n, ch, q, esc, sq) {
+            sq = sprintf("%c", 39)
+            n = length(s)
+            q = ""
+            esc = 0
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (q == "") {
+                    if (ch == "#") return substr(s, 1, i - 1)
+                    if (ch == "\"" || ch == sq) { q = ch; esc = 0 }
+                } else if (q == "\"") {
+                    if (esc) esc = 0
+                    else if (ch == "\\") esc = 1
+                    else if (ch == "\"") q = ""
+                } else if (ch == sq) {
+                    q = ""
+                }
+            }
+            return s
+        }
+        BEGIN { in_sec = 0; found = 0 }
+        { gsub(/\r$/, "") }
+        /^[[:space:]]*\[/ {
+            hdr = strip_toml_comment($0)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", hdr)
+            in_sec = (hdr == sec)
+            next
+        }
         in_sec {
-            line = $0
-            sub(/#.*$/, "", line)
-            if (line ~ "^[[:space:]]*" k "[[:space:]]*=") {
-                sub(/^[^=]*=[[:space:]]*/, "", line)
-                sub(/[[:space:]]*$/, "", line)
-                gsub(/^"|"$/, "", line)
-                print line
-                exit 0
+            line = strip_toml_comment($0)
+            eq = index(line, "=")
+            if (eq > 0) {
+                key_part = substr(line, 1, eq - 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key_part)
+                if (key_part == k) {
+                    val = substr(line, eq + 1)
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+                    n = length(val)
+                    q = sprintf("%c", 39)
+                    if (n >= 2 && ((substr(val, 1, 1) == "\"" && substr(val, n, 1) == "\"") || (substr(val, 1, 1) == q && substr(val, n, 1) == q))) {
+                        val = substr(val, 2, n - 2)
+                    }
+                    print val
+                    found = 1
+                    exit 0
+                }
             }
         }
+        END { if (!found) exit 1 }
     ' "$file"
 }
 
@@ -61,8 +98,13 @@ is_binary_fresh() {
     local src="$1"
     local out="$2"
     local extra_inc="${3-__DEFAULT_TESTS__}"
+    local opt="${4:--O3}"
     [[ "${FLINT_FORCE_BUILD:-0}" == "1" ]] && return 1
     [[ -x "$out" ]] || return 1
+    [[ -f "${out}.opt" ]] || return 1
+    local prev_opt
+    prev_opt="$(cat "${out}.opt" 2>/dev/null || true)"
+    [[ "$prev_opt" == "$opt" ]] || return 1
     [[ "$src" -nt "$out" ]] && return 1
     local hit
     hit="$(find "${ROOT}/src" -name '*.mojo' ! -name 'build_stamp.mojo' -newer "$out" -print -quit 2>/dev/null || true)"
@@ -82,13 +124,17 @@ compile_mojo() {
     local out="$2"
     local opt="${3:--O3}"
     local extra_inc="${4-__DEFAULT_TESTS__}"
-    if is_binary_fresh "$src" "$out" "$extra_inc"; then
+    if is_binary_fresh "$src" "$out" "$extra_inc" "$opt"; then
         echo "[Flint] Up-to-date: ${out#${ROOT}/}"
         return 0
     fi
     local tmp
     tmp="$(mktemp "/tmp/flint-link-$(basename "$out")-XXXXXX")"
-    rm -f "$tmp" "$out"
+    rm -f "$tmp" "$out" "${out}.opt"
+    local fp_args=()
+    if [[ "${FLINT_DETERMINISTIC_FP:-1}" != "0" ]]; then
+        fp_args=("--fp-mode" "contract=off")
+    fi
     local werror_args=()
     if [[ "${FLINT_WERROR:-1}" != "0" ]]; then
         werror_args=("--Werror")
@@ -99,15 +145,19 @@ compile_mojo() {
     elif [[ -n "$extra_inc" ]]; then
         inc_args+=("-I" "$extra_inc")
     fi
-    if ! "$MOJO_BIN" build "$src" -o "$tmp" "${inc_args[@]}" "$opt" --fp-mode contract=off "${werror_args[@]}"; then
+    if ! "$MOJO_BIN" build "$src" -o "$tmp" "${inc_args[@]}" "$opt" "${fp_args[@]}" "${werror_args[@]}"; then
         rm -f "$tmp"
         return 1  # also when called from an `if`, where `set -e` does not stop us
     fi
     mkdir -p "$(dirname "$out")"
-    rm -f "$out"
+    rm -f "$out" "${out}.opt"
     cp "$tmp" "$out"
     chmod +x "$out"
     rm -f "$tmp"
+    local opt_tmp
+    opt_tmp="$(mktemp "${out}.opt.XXXXXX")"
+    printf '%s\n' "$opt" > "$opt_tmp"
+    mv -f "$opt_tmp" "${out}.opt"
 }
 
 write_build_stamp() {
@@ -165,13 +215,21 @@ cmd_build() {
 
     # If invoked inside a scaffolded game repo containing flint.toml and no engine target was given, build that project!
     if [[ -z "$target" && "$CALLER_PWD" != "$ROOT" && -f "${CALLER_PWD}/flint.toml" ]]; then
-        local proj_name proj_entry
-        proj_name="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "name" || basename "$CALLER_PWD")"
-        proj_entry="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "entry" || echo "src/main.mojo")"
+        local toml_file="${CALLER_PWD}/flint.toml"
+        local proj_name proj_entry toml_werror toml_det_fp eff_werror eff_det_fp
+        proj_name="$(read_flint_toml_value "$toml_file" "project" "name" || true)"
+        proj_entry="$(read_flint_toml_value "$toml_file" "project" "entry" || true)"
         [[ -z "$proj_name" ]] && proj_name="$(basename "$CALLER_PWD")"
         [[ -z "$proj_entry" ]] && proj_entry="src/main.mojo"
+        toml_werror="$(read_flint_toml_value "$toml_file" "engine" "werror" || echo "true")"
+        toml_det_fp="$(read_flint_toml_value "$toml_file" "engine" "deterministic_fp" || echo "true")"
+        eff_werror="${FLINT_WERROR:-1}"
+        eff_det_fp="${FLINT_DETERMINISTIC_FP:-1}"
+        [[ "$toml_werror" == "false" ]] && eff_werror="0"
+        [[ "$toml_det_fp" == "false" ]] && eff_det_fp="0"
         echo "[Flint] Building ${proj_name} (${proj_entry}) -> ${CALLER_PWD}/build/${proj_name} ..."
-        compile_mojo "${CALLER_PWD}/${proj_entry}" "${CALLER_PWD}/build/${proj_name}" "-O3" "${CALLER_PWD}/src"
+        FLINT_WERROR="$eff_werror" FLINT_DETERMINISTIC_FP="$eff_det_fp" \
+            compile_mojo "${CALLER_PWD}/${proj_entry}" "${CALLER_PWD}/build/${proj_name}" "-O3" "${CALLER_PWD}/src"
         echo "[Flint] Build complete."
         return 0
     fi
@@ -277,21 +335,49 @@ cmd_run() {
     fi
     resolve_mojo
     write_build_stamp "$MOJO_BIN"
-    local proj_name proj_entry
-    proj_name="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "name" || basename "$CALLER_PWD")"
-    proj_entry="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "entry" || echo "src/main.mojo")"
+    local toml_file="${CALLER_PWD}/flint.toml"
+    local proj_name proj_entry toml_werror toml_det_fp eff_werror eff_det_fp
+    proj_name="$(read_flint_toml_value "$toml_file" "project" "name" || true)"
+    proj_entry="$(read_flint_toml_value "$toml_file" "project" "entry" || true)"
     [[ -z "$proj_name" ]] && proj_name="$(basename "$CALLER_PWD")"
     [[ -z "$proj_entry" ]] && proj_entry="src/main.mojo"
+    toml_werror="$(read_flint_toml_value "$toml_file" "engine" "werror" || echo "true")"
+    toml_det_fp="$(read_flint_toml_value "$toml_file" "engine" "deterministic_fp" || echo "true")"
+    eff_werror="${FLINT_WERROR:-1}"
+    eff_det_fp="${FLINT_DETERMINISTIC_FP:-1}"
+    [[ "$toml_werror" == "false" ]] && eff_werror="0"
+    [[ "$toml_det_fp" == "false" ]] && eff_det_fp="0"
     local bin="${CALLER_PWD}/build/${proj_name}"
     echo "[Flint] Building ${proj_name} (${proj_entry}) -> ${bin} ..."
-    compile_mojo "${CALLER_PWD}/${proj_entry}" "$bin" "-O3" "${CALLER_PWD}/src"
+    FLINT_WERROR="$eff_werror" FLINT_DETERMINISTIC_FP="$eff_det_fp" \
+        compile_mojo "${CALLER_PWD}/${proj_entry}" "$bin" "-O3" "${CALLER_PWD}/src"
     cd "$CALLER_PWD"
     exec "$bin" "$@"
 }
 
 cmd_pack() {
     cmd_build pack
-    "${ROOT}/build/flint-pack" "$@"
+    if [[ $# -eq 0 && -f "${CALLER_PWD}/flint.toml" ]]; then
+        local pack_out
+        pack_out="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "assets" "pack_output" || true)"
+        [[ -z "$pack_out" ]] && pack_out="build/assets.flpk"
+        if [[ ! -d "${CALLER_PWD}/assets" ]]; then
+            echo "[Flint Pack] ERROR: No assets/ directory found in ${CALLER_PWD}." >&2
+            return 1
+        fi
+        local asset_files=()
+        local f
+        while IFS= read -r -d '' f; do
+            asset_files+=("${f#${CALLER_PWD}/}")
+        done < <(find "${CALLER_PWD}/assets" -type f -size +0c -print0 | sort -z)
+        if [[ ${#asset_files[@]} -eq 0 ]]; then
+            echo "[Flint Pack] ERROR: No non-empty asset files found under ${CALLER_PWD}/assets." >&2
+            return 1
+        fi
+        (cd "$CALLER_PWD" && mkdir -p "$(dirname "$pack_out")" && "${ROOT}/build/flint-pack" "$pack_out" "${asset_files[@]}")
+        return $?
+    fi
+    (cd "$CALLER_PWD" && "${ROOT}/build/flint-pack" "$@")
 }
 
 run_v5_suites() {
@@ -394,7 +480,20 @@ cmd_studio() {
         echo "[Flint Studio] ERROR: examples/studio/main.mojo not found." >&2
         exit 1
     fi
-    cmd_build studio
+    local is_mcp=0
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == "--mcp-stdio" ]]; then
+            is_mcp=1
+            break
+        fi
+    done
+    if [[ "$is_mcp" -eq 1 ]]; then
+        cmd_build studio >&2
+        cd "$CALLER_PWD"
+    else
+        cmd_build studio
+    fi
     exec "${ROOT}/build/flint-studio" "$@"
 }
 
@@ -619,6 +718,7 @@ cmd_preview() {
             echo "[Preview] Built in $((SECONDS - started)) s."
             stop_child
             if mv -f "${bin}.next" "$bin"; then
+                mv -f "${bin}.next.opt" "${bin}.opt" 2>/dev/null || true
                 launch_child
             fi
         else
@@ -670,16 +770,349 @@ cmd_gate() {
     cmd_sync --verify
     cmd_build all
     "${ROOT}/build/flint-test"
-    # The e2e suite checks the headless shot, so render it first.
+    # Render all showcase & Studio headless shots before E2E and FLIP checks.
     mkdir -p "${ROOT}/build/shots"
     "${ROOT}/build/flint-spark" --shots
+    "${ROOT}/build/flint-world" --shots
+    "${ROOT}/build/flint-studio" --headless-smoke --out "${ROOT}/build/shots/flint_studio_smoke.png"
+    "${ROOT}/build/flint-studio" --shots
     "${ROOT}/build/flint-e2e"
     "${ROOT}/build/flint-cycles-test"
     run_v5_suites
+    cmd_lab all
+    echo "[Flint Gate] Running golden-frame FLIP and perf_history p99 verification..."
+    compile_mojo "${ROOT}/tools/gate_verify.mojo" "${ROOT}/build/flint-gate-verify" "-O3"
+    "${ROOT}/build/flint-gate-verify"
 
     echo "============================================================"
     echo " [PASS] FLINT GATE PASSED (100% Standalone + Zero Warnings)"
     echo "============================================================"
+}
+
+cmd_package() {
+    local out_dir=""
+    local target=""
+    local assets_dir=""
+    local assets_explicit=0
+    local proj_name=""
+    local loose_assets=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: bash tools/flint.sh package [out_dir] [--out <dir>] [--target <spark|world|studio|cycles|kms|kms3d|path.mojo>] [--assets <dir>] [--name <name>] [--loose-assets]"
+                echo "  Builds a self-contained release bundle (bin/, lib/, assets.flpk, flint.toml, MANIFEST.txt, run.sh)."
+                return 0
+                ;;
+            --out)
+                [[ $# -ge 2 ]] || { echo "[Flint Package] ERROR: --out requires a directory argument." >&2; return 1; }
+                out_dir="$2"; shift 2 ;;
+            --out=*)
+                out_dir="${1#--out=}"; shift ;;
+            --target)
+                [[ $# -ge 2 ]] || { echo "[Flint Package] ERROR: --target requires an argument." >&2; return 1; }
+                target="$2"; shift 2 ;;
+            --target=*)
+                target="${1#--target=}"; shift ;;
+            --assets)
+                [[ $# -ge 2 ]] || { echo "[Flint Package] ERROR: --assets requires a directory argument." >&2; return 1; }
+                assets_dir="$2"; assets_explicit=1; shift 2 ;;
+            --assets=*)
+                assets_dir="${1#--assets=}"; assets_explicit=1; shift ;;
+            --name)
+                [[ $# -ge 2 ]] || { echo "[Flint Package] ERROR: --name requires a name argument." >&2; return 1; }
+                proj_name="$2"; shift 2 ;;
+            --name=*)
+                proj_name="${1#--name=}"; shift ;;
+            --loose-assets)
+                loose_assets=1; shift ;;
+            -*)
+                echo "[Flint Package] ERROR: Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                if [[ -z "$out_dir" ]]; then
+                    out_dir="$1"
+                    shift
+                else
+                    echo "[Flint Package] ERROR: Unexpected argument: $1" >&2
+                    return 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -n "$assets_dir" && "$assets_dir" != /* ]]; then
+        assets_dir="${CALLER_PWD}/${assets_dir}"
+    fi
+    if [[ "$assets_explicit" -eq 1 && ( -z "$assets_dir" || ! -d "$assets_dir" ) ]]; then
+        echo "[Flint Package] ERROR: --assets directory not found: ${assets_dir:-<empty>}" >&2
+        return 1
+    fi
+
+    resolve_mojo
+    write_build_stamp "$MOJO_BIN"
+
+    local mode="engine"
+    local src=""
+    local extra_inc=""
+    local proj_version="0.1.0"
+    local build_bin=""
+    local eff_werror="${FLINT_WERROR:-1}"
+    local eff_det_fp="${FLINT_DETERMINISTIC_FP:-1}"
+    local pack_output_name="assets.flpk"
+
+    if [[ -z "$target" && -f "${CALLER_PWD}/flint.toml" ]]; then
+        mode="project"
+        local toml_file="${CALLER_PWD}/flint.toml"
+        local toml_name toml_ver toml_entry toml_werror toml_det_fp toml_pack
+        toml_name="$(read_flint_toml_value "$toml_file" "project" "name" || true)"
+        toml_ver="$(read_flint_toml_value "$toml_file" "project" "version" || true)"
+        toml_entry="$(read_flint_toml_value "$toml_file" "project" "entry" || true)"
+        toml_werror="$(read_flint_toml_value "$toml_file" "engine" "werror" || echo "true")"
+        toml_det_fp="$(read_flint_toml_value "$toml_file" "engine" "deterministic_fp" || echo "true")"
+        toml_pack="$(read_flint_toml_value "$toml_file" "assets" "pack_output" || true)"
+
+        [[ -z "$proj_name" ]] && proj_name="${toml_name:-$(basename "$CALLER_PWD")}"
+        [[ -n "$toml_ver" ]] && proj_version="$toml_ver"
+        local entry_rel="${toml_entry:-src/main.mojo}"
+        if [[ "$entry_rel" == /* ]]; then
+            src="$entry_rel"
+        else
+            src="${CALLER_PWD}/${entry_rel}"
+        fi
+        [[ -d "${CALLER_PWD}/src" ]] && extra_inc="${CALLER_PWD}/src"
+        [[ "$toml_werror" == "false" ]] && eff_werror="0"
+        [[ "$toml_det_fp" == "false" ]] && eff_det_fp="0"
+        if [[ -n "$toml_pack" ]]; then
+            pack_output_name="$(basename "$toml_pack")"
+            [[ -z "$pack_output_name" ]] && pack_output_name="assets.flpk"
+        fi
+        build_bin="${CALLER_PWD}/build/${proj_name}"
+        if [[ -z "$assets_dir" && -d "${CALLER_PWD}/assets" ]]; then
+            assets_dir="${CALLER_PWD}/assets"
+        fi
+    else
+        target="${target:-spark}"
+        local default_name=""
+        case "$target" in
+            spark)  src="${ROOT}/examples/minimal_spark/main.mojo"; default_name="flint-spark" ;;
+            world)  src="${ROOT}/examples/open_world/main.mojo"; default_name="flint-world" ;;
+            studio) src="${ROOT}/examples/studio/main.mojo"; default_name="flint-studio" ;;
+            cycles) src="${ROOT}/examples/cycles/main.mojo"; default_name="flint-cycles" ;;
+            kms)    src="${ROOT}/examples/kms_console/main.mojo"; default_name="flint-kms" ;;
+            kms3d)  src="${ROOT}/examples/kms_3d/main.mojo"; default_name="flint-kms3d" ;;
+            *)
+                if [[ "$target" == /* ]]; then
+                    src="$target"
+                elif [[ -f "${CALLER_PWD}/${target}" ]]; then
+                    src="${CALLER_PWD}/${target}"
+                elif [[ -f "${ROOT}/${target}" ]]; then
+                    src="${ROOT}/${target}"
+                else
+                    echo "[Flint Package] ERROR: Unknown target or missing .mojo file: $target" >&2
+                    return 1
+                fi
+                default_name="$(basename "$src" .mojo)"
+                ;;
+        esac
+        [[ -z "$proj_name" ]] && proj_name="$default_name"
+        extra_inc=""
+        build_bin="${ROOT}/build/${proj_name}"
+    fi
+
+    if [[ ! -f "$src" ]]; then
+        echo "[Flint Package] ERROR: Entry source not found: ${src}" >&2
+        return 1
+    fi
+
+    if [[ -z "$out_dir" ]]; then
+        out_dir="${CALLER_PWD}/dist/${proj_name}"
+    elif [[ "$out_dir" != /* ]]; then
+        out_dir="${CALLER_PWD}/${out_dir}"
+    fi
+    mkdir -p "${out_dir}/bin" "${out_dir}/lib"
+    out_dir="$(cd "$out_dir" && pwd)"
+
+    echo "[Flint Package] Building ${proj_name} (${src}) ..."
+    mkdir -p "$(dirname "$build_bin")"
+    FLINT_WERROR="$eff_werror" FLINT_DETERMINISTIC_FP="$eff_det_fp" \
+        compile_mojo "$src" "$build_bin" "-O3" "$extra_inc"
+
+    cp -f "$build_bin" "${out_dir}/bin/${proj_name}"
+    chmod 0755 "${out_dir}/bin/${proj_name}"
+
+    local mojo_lib_dir=""
+    if [[ -n "${MOJO_PREFIX:-}" && -d "${MOJO_PREFIX}/lib" ]]; then
+        mojo_lib_dir="${MOJO_PREFIX}/lib"
+    else
+        local cand_dir
+        cand_dir="$(cd "$(dirname "$MOJO_BIN")/.." && pwd)/lib"
+        [[ -d "$cand_dir" ]] && mojo_lib_dir="$cand_dir"
+    fi
+
+    local so_name
+    for so_name in libKGENCompilerRTShared.so libMSupportGlobals.so libAsyncRTRuntimeGlobals.so; do
+        local so_src=""
+        if [[ -n "$mojo_lib_dir" && -f "${mojo_lib_dir}/${so_name}" ]]; then
+            so_src="${mojo_lib_dir}/${so_name}"
+        elif command -v ldd >/dev/null 2>&1; then
+            so_src="$(ldd "${out_dir}/bin/${proj_name}" 2>/dev/null | awk -v n="$so_name" '$1 == n && $3 ~ /^\// {print $3; exit}' || true)"
+        fi
+        if [[ -n "$so_src" && -f "$so_src" ]]; then
+            cp -L -f "$so_src" "${out_dir}/lib/${so_name}"
+            chmod 0644 "${out_dir}/lib/${so_name}"
+        fi
+    done
+
+    local has_flpk=0
+    local packed_flpk="${out_dir}/${pack_output_name}"
+    if [[ -n "$assets_dir" && -d "$assets_dir" ]]; then
+        local abs_assets assets_base rel_assets_prefix
+        abs_assets="$(cd "$assets_dir" && pwd)"
+        if [[ "$abs_assets" == "${CALLER_PWD}/"* ]]; then
+            assets_base="$CALLER_PWD"
+        else
+            assets_base="$(dirname "$abs_assets")"
+        fi
+        rel_assets_prefix="${abs_assets#${assets_base}/}"
+
+        local non_empty_files=()
+        local zero_files=()
+        local f
+        while IFS= read -r -d '' f; do
+            local rel_f="${f#${assets_base}/}"
+            if [[ -s "$f" ]]; then
+                non_empty_files+=("$rel_f")
+            else
+                zero_files+=("$rel_f")
+            fi
+        done < <(find "$abs_assets" -type f -print0 | sort -z)
+
+        if [[ ${#non_empty_files[@]} -gt 0 ]]; then
+            echo "[Flint Package] Packing ${#non_empty_files[@]} asset file(s) -> ${packed_flpk} ..."
+            compile_mojo "${ROOT}/examples/pack_cli/main.mojo" "${ROOT}/build/flint-pack" "-O3" "" >&2
+            rm -f "$packed_flpk"
+            (cd "$assets_base" && "${ROOT}/build/flint-pack" "$packed_flpk" "${non_empty_files[@]}")
+            if [[ ! -s "$packed_flpk" ]]; then
+                echo "[Flint Package] ERROR: Failed to pack assets into ${packed_flpk}" >&2
+                return 1
+            fi
+            chmod 0644 "$packed_flpk"
+            has_flpk=1
+        fi
+
+        if [[ "$loose_assets" -eq 1 || ${#zero_files[@]} -gt 0 ]]; then
+            local copy_list=()
+            if [[ "$loose_assets" -eq 1 ]]; then
+                copy_list=("${non_empty_files[@]}" "${zero_files[@]}")
+            else
+                copy_list=("${zero_files[@]}")
+            fi
+            local rf
+            for rf in "${copy_list[@]}"; do
+                [[ -n "$rf" ]] || continue
+                local dest_rel="$rf"
+                if [[ "$rf" == "${rel_assets_prefix}/"* ]]; then
+                    dest_rel="assets/${rf#${rel_assets_prefix}/}"
+                fi
+                mkdir -p "${out_dir}/$(dirname "$dest_rel")"
+                cp -f "${assets_base}/${rf}" "${out_dir}/${dest_rel}"
+                chmod 0644 "${out_dir}/${dest_rel}"
+            done
+        fi
+    fi
+
+    if [[ "$mode" == "project" && -f "${CALLER_PWD}/flint.toml" ]]; then
+        if [[ "$has_flpk" -eq 1 ]]; then
+            awk -v po="$pack_output_name" '
+                function strip_toml_comment(s,    i, n, ch, q, esc, sq) {
+                    sq = sprintf("%c", 39)
+                    n = length(s)
+                    q = ""
+                    esc = 0
+                    for (i = 1; i <= n; i++) {
+                        ch = substr(s, i, 1)
+                        if (q == "") {
+                            if (ch == "#") return substr(s, 1, i - 1)
+                            if (ch == "\"" || ch == sq) { q = ch; esc = 0 }
+                        } else if (q == "\"") {
+                            if (esc) esc = 0
+                            else if (ch == "\\") esc = 1
+                            else if (ch == "\"") q = ""
+                        } else if (ch == sq) {
+                            q = ""
+                        }
+                    }
+                    return s
+                }
+                BEGIN { in_assets = 0 }
+                /^[[:space:]]*\[/ {
+                    hdr = strip_toml_comment($0); gsub(/\r$/, "", hdr); gsub(/^[[:space:]]+|[[:space:]]+$/, "", hdr)
+                    in_assets = (hdr == "[assets]")
+                }
+                in_assets && /^[[:space:]]*pack_output[[:space:]]*=/ {
+                    print "pack_output = \"" po "\""
+                    next
+                }
+                { print }
+            ' "${CALLER_PWD}/flint.toml" > "${out_dir}/flint.toml"
+        else
+            cp -f "${CALLER_PWD}/flint.toml" "${out_dir}/flint.toml"
+        fi
+    else
+        cat > "${out_dir}/flint.toml" <<EOF
+[project]
+name = "${proj_name}"
+version = "${proj_version}"
+target = "${target}"
+
+[engine]
+flint_version = ">=5.0"
+deterministic_fp = true
+werror = true
+
+[assets]
+pack_output = "$([[ "$has_flpk" -eq 1 ]] && echo "$pack_output_name" || echo "")"
+EOF
+    fi
+    chmod 0644 "${out_dir}/flint.toml"
+
+    cat > "${out_dir}/run.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="\${HERE}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+cd "\$HERE"
+exec "\${HERE}/bin/${proj_name}" "\$@"
+EOF
+    chmod 0755 "${out_dir}/run.sh"
+
+    local git_commit="dev"
+    if git rev-parse --short HEAD >/dev/null 2>&1; then
+        git_commit="$(git rev-parse --short HEAD)"
+    fi
+    local mojo_ver
+    mojo_ver="$("$MOJO_BIN" --version 2>/dev/null | awk '{print $2}' || echo "1.2.0")"
+    local bin_sha="unknown"
+    if command -v sha256sum >/dev/null 2>&1; then
+        bin_sha="$(sha256sum "${out_dir}/bin/${proj_name}" | awk '{print $1}')"
+    fi
+    cat > "${out_dir}/MANIFEST.txt" <<EOF
+name=${proj_name}
+version=${proj_version}
+mode=${mode}
+source=${src}
+binary=bin/${proj_name}
+binary_sha256=${bin_sha}
+mojo_version=${mojo_ver}
+git_commit=${git_commit}
+assets_pack=$([[ "$has_flpk" -eq 1 ]] && echo "$pack_output_name" || echo "none")
+packaged_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+    chmod 0644 "${out_dir}/MANIFEST.txt"
+
+    echo "[Flint Package] Release bundle ready at: ${out_dir}"
 }
 
 cmd_new() {
@@ -688,11 +1121,16 @@ cmd_new() {
         echo "Usage: tools/flint.sh new <target_directory>" >&2
         exit 1
     fi
+    if [[ "$dest" != /* ]]; then
+        dest="${CALLER_PWD}/${dest}"
+    fi
     mkdir -p "${dest}/src" "${dest}/assets" "${dest}/tools"
-    local app_name
-    app_name="$(basename "$dest")"
+    local abs_dest app_name safe_app_name
+    abs_dest="$(cd "$dest" && pwd)"
+    app_name="$(basename "$abs_dest")"
+    safe_app_name="$(printf '%s' "$app_name" | sed 's/[&/\\]/\\&/g')"
 
-    cat > "${dest}/flint.toml" <<EOF
+    cat > "${abs_dest}/flint.toml" <<EOF
 [project]
 name = "${app_name}"
 version = "0.1.0"
@@ -721,7 +1159,7 @@ mtu_bytes = 1180
 pack_output = "build/assets.flpk"
 EOF
 
-    cat > "${dest}/pixi.toml" <<EOF
+    cat > "${abs_dest}/pixi.toml" <<EOF
 [workspace]
 name = "${app_name}"
 version = "0.1.0"
@@ -736,91 +1174,736 @@ mojo = ">=1.2.0,<1.3"
 play = "bash tools/run.sh"
 EOF
 
-    cat > "${dest}/tools/run.sh" <<EOF
+    cat > "${abs_dest}/.gitignore" <<'EOF'
+build/
+dist/
+.pixi/
+*.flpk
+*.flcook
+*.png
+EOF
+
+    sed "s/__FLINT_APP_NAME__/${safe_app_name}/g" > "${abs_dest}/README.md" <<'EOF'
+# __FLINT_APP_NAME__
+
+Standalone Pure-Mojo 1.2 game project powered by **Flint Engine v5**.
+
+## Quick Start
+- Interactive run: `FLINT_ROOT=/path/to/flint bash tools/run.sh`
+- Headless smoke test: `FLINT_ROOT=/path/to/flint bash tools/run.sh --headless-smoke`
+- Headless PNG shot: `FLINT_ROOT=/path/to/flint bash tools/run.sh --shots --out build/shots/__FLINT_APP_NAME__.png`
+- Pack assets: `bash /path/to/flint/tools/flint.sh pack`
+- Live preview: `bash /path/to/flint/tools/flint.sh preview .`
+- Release bundle: `bash /path/to/flint/tools/flint.sh package`
+
+## Configuration
+Edit `flint.toml` to configure `[project]`, `[engine]`, `[window]`, `[physics]`, `[net]`, and `[assets]`.
+EOF
+
+    cat > "${abs_dest}/tools/run.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-APP_ROOT="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
-FLINT_ROOT="\${FLINT_ROOT:-}"
-if [[ -z "\$FLINT_ROOT" ]]; then
-    for cand in "\${APP_ROOT}/../flint" "\${HOME}/flint"; do
-        if [[ -d "\${cand}/src/flint" ]]; then
-            FLINT_ROOT="\$cand"
+APP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FLINT_ROOT="${FLINT_ROOT:-}"
+if [[ -z "$FLINT_ROOT" ]]; then
+    for cand in "${APP_ROOT}/../flint" "${HOME}/flint"; do
+        if [[ -d "${cand}/src/flint" ]]; then
+            FLINT_ROOT="$cand"
             break
         fi
     done
 fi
-if [[ -z "\$FLINT_ROOT" || ! -d "\${FLINT_ROOT}/src/flint" ]]; then
+if [[ -z "$FLINT_ROOT" || ! -d "${FLINT_ROOT}/src/flint" ]]; then
     echo "[Flint] ERROR: Set FLINT_ROOT=/path/to/flint before running." >&2
     exit 1
 fi
-mkdir -p "\${APP_ROOT}/build"
+mkdir -p "${APP_ROOT}/build"
 
-MOJO_BIN="\${MOJO:-}"
-if [[ -z "\$MOJO_BIN" ]]; then
-    if [[ -x "\${APP_ROOT}/.pixi/envs/default/bin/mojo" ]]; then
-        PFX="\${APP_ROOT}/.pixi/envs/default"
-        export MOJO_PREFIX="\$PFX"
-        export MODULAR_HOME="\${PFX}/share/max"
-        export LD_LIBRARY_PATH="\${PFX}/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-        MOJO_BIN="\${PFX}/bin/mojo"
-    elif [[ -x "\${FLINT_ROOT}/.pixi/envs/default/bin/mojo" ]]; then
-        PFX="\${FLINT_ROOT}/.pixi/envs/default"
-        export MOJO_PREFIX="\$PFX"
-        export MODULAR_HOME="\${PFX}/share/max"
-        export LD_LIBRARY_PATH="\${PFX}/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-        MOJO_BIN="\${PFX}/bin/mojo"
+MOJO_BIN="${MOJO:-}"
+if [[ -z "$MOJO_BIN" ]]; then
+    if [[ -x "${APP_ROOT}/.pixi/envs/default/bin/mojo" ]]; then
+        PFX="${APP_ROOT}/.pixi/envs/default"
+        export MOJO_PREFIX="$PFX"
+        export MODULAR_HOME="${PFX}/share/max"
+        export LD_LIBRARY_PATH="${PFX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        MOJO_BIN="${PFX}/bin/mojo"
+    elif [[ -x "${FLINT_ROOT}/.pixi/envs/default/bin/mojo" ]]; then
+        PFX="${FLINT_ROOT}/.pixi/envs/default"
+        export MOJO_PREFIX="$PFX"
+        export MODULAR_HOME="${PFX}/share/max"
+        export LD_LIBRARY_PATH="${PFX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        MOJO_BIN="${PFX}/bin/mojo"
     else
         MOJO_BIN="mojo"
     fi
 fi
 
-BIN="\${APP_ROOT}/build/${app_name}"
-"\$MOJO_BIN" build "\${APP_ROOT}/src/main.mojo" -o "\$BIN" \\
-    -I "\${FLINT_ROOT}/src" -I "\${APP_ROOT}/src" \\
-    -O3 --fp-mode contract=off --Werror
-exec "\$BIN" "\$@"
-EOF
-    chmod +x "${dest}/tools/run.sh"
+_read_toml() {
+    local sec="[$1]" k="$2"
+    [[ -f "${APP_ROOT}/flint.toml" ]] || return 1
+    awk -v sec="$sec" -v k="$k" '
+        function strip_toml_comment(s,    i, n, ch, q, esc, sq) {
+            sq = sprintf("%c", 39)
+            n = length(s)
+            q = ""
+            esc = 0
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (q == "") {
+                    if (ch == "#") return substr(s, 1, i - 1)
+                    if (ch == "\"" || ch == sq) { q = ch; esc = 0 }
+                } else if (q == "\"") {
+                    if (esc) esc = 0
+                    else if (ch == "\\") esc = 1
+                    else if (ch == "\"") q = ""
+                } else if (ch == sq) {
+                    q = ""
+                }
+            }
+            return s
+        }
+        BEGIN { in_sec = 0; found = 0 }
+        { gsub(/\r$/, "") }
+        /^[[:space:]]*\[/ {
+            hdr = strip_toml_comment($0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", hdr)
+            in_sec = (hdr == sec); next
+        }
+        in_sec {
+            line = strip_toml_comment($0)
+            eq = index(line, "=")
+            if (eq > 0) {
+                key_part = substr(line, 1, eq - 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key_part)
+                if (key_part == k) {
+                    val = substr(line, eq + 1)
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+                    n = length(val)
+                    q = sprintf("%c", 39)
+                    if (n >= 2 && ((substr(val, 1, 1) == "\"" && substr(val, n, 1) == "\"") || (substr(val, 1, 1) == q && substr(val, n, 1) == q))) {
+                        val = substr(val, 2, n - 2)
+                    }
+                    print val; found = 1; exit 0
+                }
+            }
+        }
+        END { if (!found) exit 1 }
+    ' "${APP_ROOT}/flint.toml"
+}
 
-    cat > "${dest}/src/main.mojo" <<EOF
-"""Standalone game scaffolded by Flint Engine v5 ('flint.sh new')."""
+PROJ_NAME="$(_read_toml project name || basename "$APP_ROOT")"
+PROJ_ENTRY="$(_read_toml project entry || echo "src/main.mojo")"
+TOML_WERROR="$(_read_toml engine werror || echo "true")"
+TOML_DET_FP="$(_read_toml engine deterministic_fp || echo "true")"
+[[ -z "$PROJ_NAME" ]] && PROJ_NAME="$(basename "$APP_ROOT")"
+[[ -z "$PROJ_ENTRY" ]] && PROJ_ENTRY="src/main.mojo"
+
+BUILD_FLAGS=("-O3")
+[[ "$TOML_DET_FP" != "false" ]] && BUILD_FLAGS+=("--fp-mode" "contract=off")
+[[ "$TOML_WERROR" != "false" && "${FLINT_WERROR:-1}" != "0" ]] && BUILD_FLAGS+=("--Werror")
+
+BIN="${APP_ROOT}/build/${PROJ_NAME}"
+"$MOJO_BIN" build "${APP_ROOT}/${PROJ_ENTRY}" -o "$BIN" \
+    -I "${FLINT_ROOT}/src" -I "${APP_ROOT}/src" \
+    "${BUILD_FLAGS[@]}"
+cd "$APP_ROOT"
+exec "$BIN" "$@"
+EOF
+    chmod +x "${abs_dest}/tools/run.sh"
+
+    sed "s/__FLINT_APP_NAME__/${safe_app_name}/g" > "${abs_dest}/src/main.mojo" <<'EOF'
+"""Flint Engine v5 game: __FLINT_APP_NAME__."""
+from std.math import cos, max, min, sin
 from std.sys import argv
-from flint.core.math import Vec3
-from flint.platform.wayland import WaylandWindow
-from flint.platform.input import InputState
-from flint.render.simd_canvas import Camera3D, SimdCanvas
+from flint.app import (
+    AppConfig,
+    EngineApp,
+    FrameTime,
+    Resource,
+    Resources,
+    STAGE_LAST,
+    STAGE_UPDATE,
+)
+from flint.app.window_plugin import WindowPlugin, WindowStateResource
+from flint.assets.image import write_png
+from flint.assets.mesh_builder import MeshBuilder
+from flint.assets.server import AssetServer
+from flint.audio.plugin import AudioEmitterComponent, AudioListenerComponent, AudioPlugin
+from flint.audio.server import AudioServer, BUS_AMBIENCE
+from flint.core.jobs import JobPool
+from flint.core.math import Quat, Vec3
+from flint.ecs import (
+    Component,
+    Entity,
+    ParallelCommands,
+    STORAGE_TABLE,
+    World,
+    comp_hash64,
+)
+from flint.input.input_map import ACTION_BOOL, InputContext, InputMap
+from flint.input.plugin import InputPlugin
+from flint.physics.plugin import ColliderComponent, PhysicsPlugin, RigidBodyComponent
+from flint.physics.world import PhysicsWorld
+from flint.platform.kms import on_virtual_console
+from flint.platform.os import (
+    env_flag,
+    env_value,
+    file_size,
+    get_time,
+    make_dirs,
+    parent_directory,
+    read_bytes,
+)
+from flint.render.material_graph import MaterialAsset
+from flint.render.plugin import (
+    CameraComponent,
+    MeshRendererComponent,
+    PointLightComponent,
+    RenderPlugin,
+)
+from flint.render.render_world import (
+    RENDER_TIER_0_HEADLESS_SIMD,
+    RENDER_TIER_1_FORWARD_CLUSTERED,
+    ScalableRenderer,
+)
+from flint.render.swapchain_surface import PRESENT_FIFO, PRESENT_IMMEDIATE
+from flint.scene import (
+    GlobalTransform,
+    LocalTransform,
+    PrevGlobalTransform,
+    TransformPlugin,
+    set_parent,
+)
+
+
+struct GameConfig(Copyable, Movable):
+    var app_name: String
+    var window_title: String
+    var window_width: Int
+    var window_height: Int
+    var vsync: Bool
+    var fixed_hz: Int
+    var net_tick_hz: Int
+    var net_max_rollback_ticks: Int
+    var net_mtu_bytes: Int
+    var pack_output: String
+
+    def __init__(out self):
+        self.app_name = "__FLINT_APP_NAME__"
+        self.window_title = "__FLINT_APP_NAME__"
+        self.window_width = 1280
+        self.window_height = 720
+        self.vsync = True
+        self.fixed_hz = 60
+        self.net_tick_hz = 60
+        self.net_max_rollback_ticks = 8
+        self.net_mtu_bytes = 1180
+        self.pack_output = "build/assets.flpk"
+
+
+def _trim_ascii(bytes: Span[UInt8, _], start: Int, end: Int) -> String:
+    var s = start
+    var e = end
+    while s < e and (bytes[s] == 32 or bytes[s] == 9):
+        s += 1
+    while e > s and (bytes[e - 1] == 32 or bytes[e - 1] == 9 or bytes[e - 1] == 13):
+        e -= 1
+    var out = List[UInt8](capacity=max(0, e - s))
+    for i in range(s, e):
+        out.append(bytes[i])
+    return String(unsafe_from_utf8=out)
+
+
+def _unquote(text: String) -> String:
+    var b = text.as_bytes()
+    var n = len(b)
+    if n >= 2 and ((b[0] == 34 and b[n - 1] == 34) or (b[0] == 39 and b[n - 1] == 39)):
+        var out = List[UInt8](capacity=n - 2)
+        for i in range(1, n - 1):
+            out.append(b[i])
+        return String(unsafe_from_utf8=out)
+    return text
+
+
+def _parse_int(text: String, fallback: Int) -> Int:
+    var b = text.as_bytes()
+    var n = len(b)
+    if n == 0:
+        return fallback
+    var i = 0
+    var sign = 1
+    if b[0] == 45:
+        sign = -1
+        i = 1
+    if i >= n:
+        return fallback
+    var val = 0
+    while i < n:
+        if b[i] < 48 or b[i] > 57:
+            return fallback
+        val = val * 10 + Int(b[i] - 48)
+        i += 1
+    return sign * val
+
+
+def _load_flint_toml() -> GameConfig:
+    var cfg = GameConfig()
+    var raw = read_bytes("flint.toml")
+    if len(raw) == 0:
+        return cfg^
+    var section = String("")
+    var line_start = 0
+    var n = len(raw)
+    for idx in range(n + 1):
+        if idx < n and raw[idx] != 10:
+            continue
+        var line_end = idx
+        var quote_char: UInt8 = 0
+        var escaped = False
+        for c in range(line_start, line_end):
+            var ch = raw[c]
+            if quote_char == 0:
+                if ch == 34 or ch == 39:
+                    quote_char = ch
+                    escaped = False
+                elif ch == 35:
+                    line_end = c
+                    break
+            else:
+                if quote_char == 34 and escaped:
+                    escaped = False
+                elif quote_char == 34 and ch == 92:
+                    escaped = True
+                elif ch == quote_char:
+                    quote_char = 0
+        var trimmed = _trim_ascii(raw, line_start, line_end)
+        line_start = idx + 1
+        var tb = trimmed.as_bytes()
+        if len(tb) == 0:
+            continue
+        if len(tb) >= 2 and tb[0] == 91 and tb[len(tb) - 1] == 93:
+            section = _trim_ascii(tb, 1, len(tb) - 1)
+            continue
+        var eq_pos = -1
+        for c in range(len(tb)):
+            if tb[c] == 61:
+                eq_pos = c
+                break
+        if eq_pos <= 0:
+            continue
+        var key = _trim_ascii(tb, 0, eq_pos)
+        var val = _unquote(_trim_ascii(tb, eq_pos + 1, len(tb)))
+        if section == "project" and key == "name" and val.byte_length() > 0:
+            cfg.app_name = val
+        elif section == "window":
+            if key == "title" and val.byte_length() > 0:
+                cfg.window_title = val
+            elif key == "width":
+                cfg.window_width = max(64, _parse_int(val, cfg.window_width))
+            elif key == "height":
+                cfg.window_height = max(64, _parse_int(val, cfg.window_height))
+            elif key == "vsync":
+                cfg.vsync = val == "true"
+        elif section == "physics" and key == "fixed_hz":
+            cfg.fixed_hz = max(1, _parse_int(val, cfg.fixed_hz))
+        elif section == "net":
+            if key == "tick_hz":
+                cfg.net_tick_hz = max(1, _parse_int(val, cfg.net_tick_hz))
+            elif key == "max_rollback_ticks":
+                cfg.net_max_rollback_ticks = max(0, _parse_int(val, cfg.net_max_rollback_ticks))
+            elif key == "mtu_bytes":
+                cfg.net_mtu_bytes = max(256, _parse_int(val, cfg.net_mtu_bytes))
+        elif section == "assets" and key == "pack_output" and val.byte_length() > 0:
+            cfg.pack_output = val
+    return cfg^
+
+
+@fieldwise_init
+struct SpinComponent(Component, ImplicitlyCopyable):
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.game.SpinComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    var speed: Float32
+    var angle: Float32
+
+
+struct GameStateResource(Resource, Movable):
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.game.GameStateResource")
+    var headless: Bool
+    var cam_yaw: Float32
+    var cam_dist: Float32
+    var camera_entity: Entity
+    var cube_entity: Entity
+
+    def __init__(out self, headless: Bool):
+        self.headless = headless
+        self.cam_yaw = Float32(0.65)
+        self.cam_dist = Float32(7.5)
+        self.camera_entity = Entity()
+        self.cube_entity = Entity()
+
+
+def _sys_game_update(
+    world_ptr: Pointer[World, MutAnyOrigin],
+    res_ptr: Pointer[Resources, MutAnyOrigin],
+    _pool_ptr: Pointer[JobPool, MutAnyOrigin],
+    _cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
+    _ctx: Int,
+):
+    ref world = world_ptr[unsafe_offset=0]
+    ref resources = res_ptr[unsafe_offset=0]
+    var st_opt = resources.get_ptr_mut[GameStateResource]()
+    if not st_opt:
+        return
+    ref state = st_opt.value()[unsafe_offset=0]
+
+    var dt = Float32(1.0 / 60.0)
+    var ft_opt = resources.get_ptr[FrameTime]()
+    if ft_opt:
+        var fdt = ft_opt.value()[unsafe_offset=0].delta_seconds
+        if fdt > Float32(0.0):
+            dt = fdt
+
+    var win_opt = resources.get_ptr_mut[WindowStateResource]()
+    var rend_opt = resources.get_ptr_mut[ScalableRenderer]()
+    if win_opt and rend_opt:
+        ref win_res = win_opt.value()[unsafe_offset=0]
+        if win_res.resized and win_res.width > 0 and win_res.height > 0:
+            _ = rend_opt.value()[unsafe_offset=0].resize(win_res.width, win_res.height)
+
+    var imap_opt = resources.get_ptr[InputMap]()
+    if not state.headless and imap_opt:
+        ref imap = imap_opt.value()[unsafe_offset=0]
+        if imap.just_pressed("quit"):
+            if win_opt:
+                win_opt.value()[unsafe_offset=0].request_close()
+            return
+        if imap.is_down("orbit_left"):
+            state.cam_yaw -= Float32(1.5) * dt
+        if imap.is_down("orbit_right"):
+            state.cam_yaw += Float32(1.5) * dt
+        if imap.just_pressed("jump"):
+            var rb_opt = world.get_ptr[RigidBodyComponent](state.cube_entity)
+            var phys_opt = resources.get_ptr_mut[PhysicsWorld]()
+            if rb_opt and phys_opt:
+                var slot = phys_opt.value()[unsafe_offset=0].find_slot_by_id(
+                    rb_opt.value()[unsafe_offset=0].body_id
+                )
+                if slot >= 0:
+                    phys_opt.value()[unsafe_offset=0].apply_impulse(slot, Vec3(0.0, 5.5, 0.0))
+
+    var spin_mask = world.bit_for[SpinComponent]().union(world.bit_for[LocalTransform]())
+    var spin_entities = world.query_entities(spin_mask)
+    for i in range(len(spin_entities)):
+        var se = spin_entities[i]
+        var sp_opt = world.get_ptr_mut[SpinComponent](se)
+        var lt_opt = world.get_ptr_mut[LocalTransform](se)
+        if sp_opt and lt_opt:
+            ref sp = sp_opt.value()[unsafe_offset=0]
+            sp.angle += sp.speed * dt
+            lt_opt.value()[unsafe_offset=0].rotation = Quat(
+                0.0, sin(sp.angle * Float32(0.5)), 0.0, cos(sp.angle * Float32(0.5))
+            )
+
+    var eye = Vec3(
+        cos(state.cam_yaw) * state.cam_dist,
+        Float32(3.6),
+        sin(state.cam_yaw) * state.cam_dist,
+    )
+    var target = Vec3(0.0, 1.0, 0.0)
+    var cam_lt = world.get_ptr_mut[LocalTransform](state.camera_entity)
+    var cam_c = world.get_ptr_mut[CameraComponent](state.camera_entity)
+    if cam_lt and cam_c:
+        cam_lt.value()[unsafe_offset=0].translation = eye
+        cam_c.value()[unsafe_offset=0].look_target_offset = target - eye
+
+
+def _sys_game_present(
+    _world_ptr: Pointer[World, MutAnyOrigin],
+    res_ptr: Pointer[Resources, MutAnyOrigin],
+    _pool_ptr: Pointer[JobPool, MutAnyOrigin],
+    _cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
+    _ctx: Int,
+):
+    ref resources = res_ptr[unsafe_offset=0]
+    var st_opt = resources.get_ptr[GameStateResource]()
+    var rend_opt = resources.get_ptr_mut[ScalableRenderer]()
+    var win_opt = resources.get_ptr_mut[WindowStateResource]()
+    if not st_opt or not rend_opt or not win_opt:
+        return
+    if st_opt.value()[unsafe_offset=0].headless:
+        return
+    ref renderer = rend_opt.value()[unsafe_offset=0]
+    ref win_res = win_opt.value()[unsafe_offset=0]
+    if (not renderer.surface.is_zero_copy_gpu()) and len(win_res.windows) > 0:
+        var px = renderer.readback_pixels()
+        win_res.windows[0].present(px, renderer.width, renderer.height)
+
+
+def _setup_input(mut app: EngineApp):
+    var imap_opt = app.resources.get_ptr_mut[InputMap]()
+    if not imap_opt:
+        return
+    ref imap = imap_opt.value()[unsafe_offset=0]
+    _ = imap.register_action("orbit_left", ACTION_BOOL)
+    _ = imap.register_action("orbit_right", ACTION_BOOL)
+    _ = imap.register_action("jump", ACTION_BOOL)
+    _ = imap.register_action("quit", ACTION_BOOL)
+    var ctx = InputContext("gameplay", priority=10)
+    ctx.bind_key("orbit_left", 65)    # A
+    ctx.bind_key("orbit_left", 263)   # Left
+    ctx.bind_key("orbit_right", 68)   # D
+    ctx.bind_key("orbit_right", 262)  # Right
+    ctx.bind_key("jump", 32)          # Space
+    ctx.bind_key("quit", 256)         # Esc
+    imap.add_context(ctx^)
+    imap.push_context("gameplay")
+
+
+def _setup_scene(mut app: EngineApp):
+    var rend_opt = app.resources.get_ptr_mut[ScalableRenderer]()
+    var st_opt = app.resources.get_ptr_mut[GameStateResource]()
+    var aud_opt = app.resources.get_ptr_mut[AudioServer]()
+    if not rend_opt or not st_opt:
+        return
+    ref renderer = rend_opt.value()[unsafe_offset=0]
+    ref state = st_opt.value()[unsafe_offset=0]
+
+    var mat_ground = renderer.register_material(
+        MaterialAsset(base_color=Vec3(0.12, 0.18, 0.28), roughness=0.82, metallic=0.05)
+    )
+    var mat_cube = renderer.register_material(
+        MaterialAsset(base_color=Vec3(0.95, 0.58, 0.16), roughness=0.28, metallic=0.25)
+    )
+    var mat_beacon = renderer.register_material(
+        MaterialAsset(base_color=Vec3(0.20, 0.78, 0.96), roughness=0.20, metallic=0.40)
+    )
+
+    var mb_ground = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.82, metallic=0.05)
+    mb_ground.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(8.0, 0.5, 8.0), bevel=0.04)
+    var ground_mesh = renderer.register_mesh(mb_ground^.finish(), mat_ground)
+
+    var mb_cube = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.28, metallic=0.25)
+    mb_cube.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(0.55, 0.55, 0.55), bevel=0.06)
+    var cube_mesh = renderer.register_mesh(mb_cube^.finish(), mat_cube)
+
+    var mb_beacon = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.20, metallic=0.40)
+    mb_beacon.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(0.22, 0.22, 0.22), bevel=0.03)
+    var beacon_mesh = renderer.register_mesh(mb_beacon^.finish(), mat_beacon)
+
+    var ground_e = app.world.spawn()
+    _ = app.world.insert[LocalTransform](ground_e, LocalTransform(Vec3(0.0, -0.5, 0.0)))
+    _ = app.world.insert[GlobalTransform](ground_e, GlobalTransform())
+    _ = app.world.insert[RigidBodyComponent](ground_e, RigidBodyComponent.static_body())
+    _ = app.world.insert[ColliderComponent](ground_e, ColliderComponent.box(Vec3(8.0, 0.5, 8.0)))
+    _ = app.world.insert[MeshRendererComponent](ground_e, MeshRendererComponent(ground_mesh, mat_ground))
+
+    var cube_e = app.world.spawn()
+    _ = app.world.insert[LocalTransform](cube_e, LocalTransform(Vec3(0.0, 2.5, 0.0)))
+    _ = app.world.insert[GlobalTransform](cube_e, GlobalTransform())
+    _ = app.world.insert[PrevGlobalTransform](cube_e, PrevGlobalTransform())
+    _ = app.world.insert[RigidBodyComponent](cube_e, RigidBodyComponent.dynamic(mass=Float32(1.0)))
+    _ = app.world.insert[ColliderComponent](cube_e, ColliderComponent.box(Vec3(0.55, 0.55, 0.55)))
+    _ = app.world.insert[MeshRendererComponent](cube_e, MeshRendererComponent(cube_mesh, mat_cube))
+    if aud_opt:
+        var pcm = List[Int16](capacity=12000)
+        for s in range(12000):
+            var ph = Float32(s) / Float32(48000.0) * Float32(6.2831853)
+            var wave = sin(ph * Float32(220.0)) * Float32(0.4)
+            pcm.append(Int16(Int(wave * Float32(8000.0))))
+        var aid = aud_opt.value()[unsafe_offset=0].register_pcm16_asset(pcm, channels=1, sample_rate=48000)
+        _ = app.world.insert[AudioEmitterComponent](
+            cube_e,
+            AudioEmitterComponent(
+                asset_id=aid,
+                volume=Float32(0.35),
+                bus_id=BUS_AMBIENCE,
+                looping=True,
+                spatial=True,
+                play_on_spawn=True,
+            ),
+        )
+    state.cube_entity = cube_e
+
+    var beacon_e = app.world.spawn()
+    _ = app.world.insert[LocalTransform](beacon_e, LocalTransform(Vec3(0.0, 1.05, 0.0)))
+    _ = app.world.insert[GlobalTransform](beacon_e, GlobalTransform())
+    _ = app.world.insert[SpinComponent](beacon_e, SpinComponent(Float32(2.2), Float32(0.0)))
+    _ = app.world.insert[MeshRendererComponent](beacon_e, MeshRendererComponent(beacon_mesh, mat_beacon))
+    _ = set_parent(app.world, beacon_e, cube_e)
+
+    var cam_e = app.world.spawn()
+    var eye = Vec3(cos(state.cam_yaw) * state.cam_dist, Float32(3.6), sin(state.cam_yaw) * state.cam_dist)
+    _ = app.world.insert[LocalTransform](cam_e, LocalTransform(eye))
+    _ = app.world.insert[GlobalTransform](cam_e, GlobalTransform())
+    _ = app.world.insert[CameraComponent](
+        cam_e,
+        CameraComponent(
+            fov_y_deg=Float32(55.0),
+            near_z=Float32(0.10),
+            far_z=Float32(250.0),
+            active=True,
+            look_target_offset=Vec3(0.0, 1.0, 0.0) - eye,
+        ),
+    )
+    _ = app.world.insert[AudioListenerComponent](cam_e, AudioListenerComponent(active=True))
+    state.camera_entity = cam_e
+
+    var light_e = app.world.spawn()
+    _ = app.world.insert[LocalTransform](light_e, LocalTransform(Vec3(4.0, 6.0, 4.0)))
+    _ = app.world.insert[GlobalTransform](light_e, GlobalTransform())
+    _ = app.world.insert[PointLightComponent](
+        light_e, PointLightComponent(Vec3(12.0, 10.0, 8.0), radius=Float32(28.0), enabled=True)
+    )
 
 
 def main():
+    var cfg = _load_flint_toml()
+    var headless_smoke = False
+    var shots_mode = False
+    var out_png = String("")
+
     var args = argv()
-    var smoke_only = False
-    for i in range(1, len(args)):
-        if String(args[i]) == "--smoke" or String(args[i]) == "--headless-smoke":
-            smoke_only = True
-    var canvas = SimdCanvas(960, 540)
-    var cam = Camera3D(960, 540, Vec3(0.0, 3.0, 7.5), Vec3(0.0, 0.0, 0.0), 55.0)
-    if smoke_only:
-        canvas.clear(0x141E30, 0x0A0E17)
-        canvas.draw_line_3d(cam, Vec3(-2.0, 0.0, 0.0), Vec3(2.0, 0.0, 0.0), 0xF49E38, 2)
-        print("${app_name} smoke frame rendered cleanly (960x540).")
+    var ai = 1
+    while ai < len(args):
+        var a = String(args[ai])
+        if a == "--smoke" or a == "--headless-smoke":
+            headless_smoke = True
+        elif a == "--shots":
+            shots_mode = True
+        elif a == "--out" and ai + 1 < len(args):
+            out_png = String(args[ai + 1])
+            ai += 1
+        ai += 1
+
+    var no_display = (
+        env_flag("FLINT_HEADLESS")
+        or (
+            env_value("FLINT_BACKEND").byte_length() == 0
+            and env_value("WAYLAND_DISPLAY").byte_length() == 0
+            and env_value("DISPLAY").byte_length() == 0
+            and not on_virtual_console()
+        )
+    )
+    var effective_headless = headless_smoke or shots_mode or no_display
+
+    var assets = AssetServer(enable_watcher=not effective_headless)
+    if file_size(cfg.pack_output) > 0:
+        _ = assets.mount_flpk(cfg.pack_output)
+    elif file_size("assets.flpk") > 0:
+        _ = assets.mount_flpk("assets.flpk")
+    elif not effective_headless:
+        _ = assets.watch_loose_directory("assets")
+
+    var app_cfg = AppConfig(
+        title=cfg.window_title,
+        headless=effective_headless,
+        fixed_hz=Float32(cfg.fixed_hz),
+    )
+    var app = EngineApp(app_cfg^)
+    var render_tier = (
+        RENDER_TIER_0_HEADLESS_SIMD if effective_headless else RENDER_TIER_1_FORWARD_CLUSTERED
+    )
+
+    app.add_plugin(TransformPlugin(snapshot_prev_in_fixed=True))
+    app.add_plugin(
+        WindowPlugin(
+            headless=effective_headless,
+            width=cfg.window_width,
+            height=cfg.window_height,
+            title=cfg.window_title,
+        )
+    )
+    app.add_plugin(InputPlugin(enable_evdev=not effective_headless))
+    app.add_plugin(PhysicsPlugin(gravity=Float32(9.81)))
+    app.add_plugin(AudioPlugin(headless=effective_headless))
+    app.add_plugin(RenderPlugin(tier=render_tier, width=cfg.window_width, height=cfg.window_height))
+
+    _ = app.register_component[SpinComponent]()
+    app.insert_resource[GameStateResource](GameStateResource(effective_headless))
+    _ = app.add_system(STAGE_UPDATE, "game.update", _sys_game_update, exclusive=True)
+    _ = app.add_system(STAGE_LAST, "game.present", _sys_game_present, exclusive=True)
+
+    _setup_input(app)
+    _setup_scene(app)
+
+    if headless_smoke or shots_mode or no_display:
+        app.startup()
+        var steps = 4 if headless_smoke else 1
+        for _ in range(steps):
+            app.step_one_frame(Float32(1.0) / Float32(max(1, cfg.fixed_hz)))
+
+        var shot_target = out_png
+        if shots_mode and shot_target.byte_length() == 0:
+            shot_target = "build/shots/" + cfg.app_name + ".png"
+        if shot_target.byte_length() > 0:
+            var pdir = parent_directory(shot_target)
+            if pdir.byte_length() > 0 and pdir != ".":
+                _ = make_dirs(pdir)
+            var rend_opt = app.resources.get_ptr[ScalableRenderer]()
+            if rend_opt:
+                ref r = rend_opt.value()[unsafe_offset=0]
+                var px = r.readback_pixels()
+                _ = write_png(shot_target, px, r.width, r.height)
+
+        var bodies = 0
+        var phys_opt = app.resources.get_ptr[PhysicsWorld]()
+        if phys_opt:
+            bodies = len(phys_opt.value()[unsafe_offset=0].bodies)
+        print(
+            "["
+            + cfg.app_name
+            + "] Headless v5 frame loop OK ("
+            + String(cfg.window_width)
+            + "x"
+            + String(cfg.window_height)
+            + ", fixed_hz="
+            + String(cfg.fixed_hz)
+            + ", net_mtu="
+            + String(cfg.net_mtu_bytes)
+            + ", bodies="
+            + String(bodies)
+            + ")."
+        )
+        assets.close()
+        app.shutdown()
         return
-    var win = WaylandWindow()
-    var input = InputState()
-    if not win.initialize(960, 540):
-        print("Headless environment detected — initialized Flint SimdCanvas (960x540) cleanly.")
+
+    app.startup()
+    var win_open = False
+    var win_opt = app.resources.get_ptr_mut[WindowStateResource]()
+    var rend_opt = app.resources.get_ptr_mut[ScalableRenderer]()
+    if win_opt:
+        ref win_res = win_opt.value()[unsafe_offset=0]
+        win_open = win_res.is_open()
+        if win_open and rend_opt and len(win_res.windows) > 0:
+            var pmode = PRESENT_FIFO if cfg.vsync else PRESENT_IMMEDIATE
+            _ = rend_opt.value()[unsafe_offset=0].attach_window_surface(
+                win_res.windows[0], present_mode=pmode
+            )
+
+    if not win_open:
+        print("[" + cfg.app_name + "] No display available; exiting cleanly. Use '--headless-smoke' or '--shots'.")
+        assets.close()
+        app.shutdown()
         return
-    while not win.close_requested:
-        input.begin_frame()
-        win.poll(input)
-        if input.key_pressed(256):
+
+    var last_t = get_time()
+    while True:
+        var open_now = False
+        var wo = app.resources.get_ptr[WindowStateResource]()
+        if wo:
+            open_now = wo.value()[unsafe_offset=0].is_open()
+        if not open_now:
             break
-        canvas.clear(0x141E30, 0x0A0E17)
-        canvas.draw_line_3d(cam, Vec3(-2.0, 0.0, 0.0), Vec3(2.0, 0.0, 0.0), 0xF49E38, 2)
-        canvas.draw_text(20, 20, "${app_name^^} - POWERED BY FLINT V5", 0xF49E38, 2)
-        win.present(canvas.pixels, canvas.width, canvas.height)
-    win.close()
+        var now = get_time()
+        var dt = Float32(min(0.05, max(0.001, now - last_t)))
+        last_t = now
+        _ = assets.tick(now)
+        app.step_one_frame(dt)
+
+    assets.close()
+    app.shutdown()
 EOF
-    echo "[Flint] Scaffolded new standalone Flint project (with flint.toml) at: ${dest}"
+    echo "[Flint] Scaffolded new standalone Flint v5 project (with flint.toml) at: ${abs_dest}"
 }
 
 subcmd="${1:-help}"
@@ -830,6 +1913,7 @@ case "$subcmd" in
     build)   cmd_build "$@" ;;
     run)     cmd_run "$@" ;;
     pack)    cmd_pack "$@" ;;
+    package) cmd_package "$@" ;;
     test)    cmd_test "$@" ;;
     lab)     cmd_lab "$@" ;;
     studio)  cmd_studio "$@" ;;
@@ -863,6 +1947,7 @@ case "$subcmd" in
         echo "  kms3d                GPU 3D on the bare display via VK_KHR_display"
         echo "  cycles live|render|query ... Pure-Mojo TidalCycles-style live coding (docs/CYCLES.md)"
         echo "  pack <out.flpk> <files...> Bundle loose assets into a single .flpk VFS archive"
+        echo "  package [out_dir] [...]    Build a self-contained release bundle (bin/, lib/, assets.flpk, flint.toml, run.sh)"
         echo "  shot                 Render deterministic headless PNG to build/shots/flint_spark.png"
         echo "  sync [deepsong_dir]  Harvest latest pure-Mojo libraries from Deepsong & run Zero-Leak Gate"
         echo "  gate                 Run full standalone verification gate (sync + build + unit/e2e/v5 + shot)"

@@ -44,15 +44,36 @@ from flint.net import (
     CHAN_RELIABLE_ORDERED,
     CHAN_RELIABLE_UNORDERED,
     CHAN_UNRELIABLE_RAW,
+    ClientPredictionBuffer,
     DatagramView,
+    HitboxPose,
+    HitboxSnapshotRing,
     IPV6_SAFE_MTU_BYTES,
     JITTER_TRIANGULAR,
+    LagCompHistory,
+    LagCompHit,
     MAX_RELIABLE_FRAG_COUNT,
+    NAT_PUNCH_MAGIC,
+    NATPunchProbe,
     NetChannel,
-    NetHub,
     NetEndpoint,
+    NetHub,
+    NetTransport,
+    PUNCH_KIND_PROBE,
+    PUNCH_STATE_DIRECT,
+    PUNCH_STATE_RELAY_FALLBACK,
     PacketWireHeader,
+    PredictedInputEntry,
+    PredictedState,
+    PredictionBuffer,
+    PredictionStepper,
+    RELAY_FLAG_DATA,
+    RELAY_FLAG_REGISTER,
+    RELAY_HEADER_BYTES,
+    RELAY_WIRE_MAGIC,
     ROLLBACK_INPUT_HISTORY_K,
+    RelayForwardHeader,
+    RelayServer,
     ReplicatedEntity,
     RollbackInput,
     RollbackSession,
@@ -61,6 +82,7 @@ from flint.net import (
     SnapshotInterpolationBuffer,
     SnapshotReader,
     SnapshotReplicator,
+    SpatialInterestGrid,
     UdpSocket,
     VirtualEndpoint,
     VirtualNetSim,
@@ -1455,6 +1477,1271 @@ def test_j_wave2_aead_cookie_channels_despawn_interp() raises:
     assert_true(quat_angular_error_deg(sampled[0].rot, expected_mid_rot) < Float32(0.2))
 
 
+struct _PredStepper(PredictionStepper):
+    var accel: Float32
+
+    def __init__(out self, accel: Float32 = 2.0):
+        self.accel = accel
+
+    def step_prediction(
+        mut self,
+        mut state: PredictedState,
+        input_ptr: Int,
+        input_seq: Int,
+        tick: Int,
+        dt: Float32,
+    ):
+        _ = input_seq
+        _ = tick
+        var cmd = Pointer[PhysicsRollbackInput, ImmutAnyOrigin](
+            unsafe_from_address=input_ptr
+        )[unsafe_offset=0]
+        state.vel = Vec3(
+            state.vel.x + cmd.impulse_x * self.accel * dt,
+            state.vel.y + cmd.impulse_y * self.accel * dt,
+            state.vel.z + cmd.impulse_z * self.accel * dt,
+        )
+        state.pos = state.pos + state.vel * dt
+
+
+struct _NanPredStepper(PredictionStepper):
+    def __init__(out self):
+        pass
+
+    def step_prediction(
+        mut self,
+        mut state: PredictedState,
+        input_ptr: Int,
+        input_seq: Int,
+        tick: Int,
+        dt: Float32,
+    ):
+        _ = input_ptr
+        _ = input_seq
+        _ = tick
+        _ = dt
+        state.pos.x = Float32(0.0) / Float32(0.0)
+
+
+struct _SymmetricNatTransport(NetTransport):
+    var ep: VirtualEndpoint
+    var relay_ep: NetEndpoint
+    var allow_direct: Bool
+    var _tmp_views: List[DatagramView]
+
+    def __init__(
+        out self,
+        var ep: VirtualEndpoint,
+        relay_ep: NetEndpoint,
+        allow_direct: Bool = False,
+    ):
+        self.ep = ep^
+        self.relay_ep = relay_ep
+        self.allow_direct = allow_direct
+        self._tmp_views = List[DatagramView](capacity=64)
+
+    def local_endpoint(self) -> NetEndpoint:
+        return self.ep.local_endpoint()
+
+    def send_raw(mut self, dst: NetEndpoint, data_ptr: Int, length: Int) -> Bool:
+        if dst != self.relay_ep and not self.allow_direct:
+            return True
+        return self.ep.send_raw(dst, data_ptr, length)
+
+    def queue_send_raw(
+        mut self, dst: NetEndpoint, data_ptr: Int, length: Int
+    ) -> Bool:
+        if dst != self.relay_ep and not self.allow_direct:
+            return True
+        return self.ep.queue_send_raw(dst, data_ptr, length)
+
+    def flush_sends(mut self) -> Int:
+        return self.ep.flush_sends()
+
+    def recv_batch(mut self, mut out_views: List[DatagramView]) -> Int:
+        out_views.clear()
+        var n = self.ep.recv_batch(self._tmp_views)
+        for i in range(n):
+            var v = self._tmp_views[i]
+            if v.sender == self.relay_ep or self.allow_direct:
+                out_views.append(v)
+        return len(out_views)
+
+
+struct _ConeNatTransport(NetTransport):
+    var ep: VirtualEndpoint
+    var relay_ep: NetEndpoint
+    var opened_peers: List[NetEndpoint]
+    var _tmp_views: List[DatagramView]
+
+    def __init__(out self, var ep: VirtualEndpoint, relay_ep: NetEndpoint):
+        self.ep = ep^
+        self.relay_ep = relay_ep
+        self.opened_peers = List[NetEndpoint](capacity=8)
+        self._tmp_views = List[DatagramView](capacity=64)
+
+    def _record_outbound(mut self, dst: NetEndpoint):
+        if dst == self.relay_ep or dst.port == 0:
+            return
+        for i in range(len(self.opened_peers)):
+            if self.opened_peers[i] == dst:
+                return
+        self.opened_peers.append(dst)
+
+    def _is_opened(self, src: NetEndpoint) -> Bool:
+        if src == self.relay_ep:
+            return True
+        for i in range(len(self.opened_peers)):
+            if self.opened_peers[i] == src:
+                return True
+        return False
+
+    def local_endpoint(self) -> NetEndpoint:
+        return self.ep.local_endpoint()
+
+    def send_raw(mut self, dst: NetEndpoint, data_ptr: Int, length: Int) -> Bool:
+        self._record_outbound(dst)
+        return self.ep.send_raw(dst, data_ptr, length)
+
+    def queue_send_raw(
+        mut self, dst: NetEndpoint, data_ptr: Int, length: Int
+    ) -> Bool:
+        self._record_outbound(dst)
+        return self.ep.queue_send_raw(dst, data_ptr, length)
+
+    def flush_sends(mut self) -> Int:
+        return self.ep.flush_sends()
+
+    def recv_batch(mut self, mut out_views: List[DatagramView]) -> Int:
+        out_views.clear()
+        var n = self.ep.recv_batch(self._tmp_views)
+        for i in range(n):
+            var v = self._tmp_views[i]
+            if self._is_opened(v.sender):
+                out_views.append(v)
+        return len(out_views)
+
+
+def test_k_f6_client_prediction_reconciliation() raises:
+    print("  [Test K] F6 ClientPredictionBuffer rewind+replay, PredictionStepper, VisualSmoother & wire last_acked_input_seq...")
+    # 1. Exact prediction match & trimming
+    var buf = PredictionBuffer[PhysicsRollbackInput](capacity=64)
+    for seq in range(1, 11):
+        var cmd = PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0)
+        buf.push_predicted(
+            seq,
+            cmd,
+            PredictedState(Vec3(Float32(seq), 0.0, 0.0), Vec3(1.0, 0.0, 0.0)),
+            tick=seq,
+            dt=Float32(0.05),
+        )
+    assert_equal(buf.pending_count(), 10)
+    var matched_s = buf.reconcile(
+        4, PredictedState(Vec3(4.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0))
+    )
+    assert_equal(buf.last_acked_input_seq, 4)
+    assert_equal(buf.mispredictions, 0)
+    assert_equal(buf.pending_count(), 6)
+    assert_true(abs(matched_s.pos.x - Float32(10.0)) < Float32(1.0e-4))
+
+    # 2. Misprediction at seq=5 -> rewind & replay 6..10, plus stale ACK guard
+    var smoother = VisualSmoother(decay_rate=18.0)
+    var corrected = buf.reconcile_smoothed(
+        5,
+        PredictedState(Vec3(3.5, 0.0, 0.0), Vec3(1.0, 0.0, 0.0)),
+        smoother,
+    )
+    assert_equal(buf.last_acked_input_seq, 5)
+    assert_equal(buf.mispredictions, 1)
+    assert_equal(buf.replayed_inputs, 5)
+    assert_equal(buf.pending_count(), 5)
+    assert_true(abs(corrected.pos.x - Float32(8.5)) < Float32(1.0e-3))
+    assert_true(abs(smoother.pos_offset.x - Float32(1.5)) < Float32(1.0e-3))
+
+    # VisualSmoother linear decay + teleport snap
+    var smooth_lin = VisualSmoother(decay_rate=18.0)
+    smooth_lin.record_correction(Vec3(10.0, 0.0, 0.0), Vec3(8.0, 0.0, 0.0))
+    assert_true(abs(smooth_lin.pos_offset.x - Float32(2.0)) < Float32(1.0e-4))
+    smooth_lin.step_linear(Float32(0.1), linear_speed=Float32(10.0))
+    assert_true(abs(smooth_lin.pos_offset.x - Float32(1.0)) < Float32(1.0e-4))
+    smooth_lin.step_linear(Float32(0.2), linear_speed=Float32(10.0))
+    assert_true(smooth_lin.pos_offset.length_squared() < Float32(1.0e-8))
+    smooth_lin.record_correction(
+        Vec3(100.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0), snap_threshold=Float32(5.0)
+    )
+    assert_true(smooth_lin.pos_offset.length_squared() < Float32(1.0e-8))
+
+    # Stale ACK must not regress last_acked_input_seq or latest_state
+    var stale_s = buf.reconcile(
+        3, PredictedState(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
+    )
+    assert_equal(buf.last_acked_input_seq, 5)
+    assert_true(abs(stale_s.pos.x - Float32(8.5)) < Float32(1.0e-3))
+
+    # 3. Deterministic PredictionStepper replay
+    var step_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    var stepper = _PredStepper(accel=2.0)
+    var sim_s = PredictedState(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
+    var dt = Float32(0.5)
+    for seq in range(0, 6):
+        var cmd = PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0)
+        stepper.step_prediction(sim_s, Int(Pointer(to=cmd)), seq, seq, dt)
+        _ = cmd.same_input(cmd)
+        step_buf.push_predicted(seq, cmd, sim_s, tick=seq, dt=dt)
+    # Initial seq=0 ACK works cleanly; server collided at seq=1 resetting vel.x=0, pos.x=0.5
+    var r0 = step_buf.reconcile_with(
+        0, PredictedState(Vec3(0.5, 0.0, 0.0), Vec3(1.0, 0.0, 0.0)), stepper
+    )
+    assert_equal(step_buf.last_acked_input_seq, 0)
+    assert_equal(step_buf.mispredictions, 0)
+    _ = r0
+    var auth1 = PredictedState(Vec3(0.5, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
+    var r1 = step_buf.reconcile_with(1, auth1, stepper)
+    assert_equal(step_buf.mispredictions, 1)
+    # Replaying seq 2,3,4,5 (4 steps of dt=0.5, accel=2 -> dv=1.0/step):
+    # v=(1,2,3,4), dx=(0.5+1.0+1.5+2.0)=5.0 => pos.x=5.5, vel.x=4.0
+    assert_true(abs(r1.pos.x - Float32(5.5)) < Float32(1.0e-3))
+    assert_true(abs(r1.vel.x - Float32(4.0)) < Float32(1.0e-3))
+
+    # Overflow eviction & out-of-window ACKs
+    var small_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=4)
+    for seq in range(1, 8):
+        small_buf.push_predicted(
+            seq,
+            PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+            PredictedState(Vec3(Float32(seq), 0.0, 0.0)),
+        )
+    assert_equal(small_buf.overflow_evictions, 3)
+    assert_equal(small_buf.pending_count(), 4)
+    var old_ack = small_buf.reconcile(2, PredictedState(Vec3(2.0, 0.0, 0.0)))
+    assert_equal(small_buf.pending_count(), 4)
+    assert_true(abs(old_ack.pos.x - Float32(7.0)) < Float32(1.0e-4))
+    var future_ack = small_buf.reconcile(99, PredictedState(Vec3(99.0, 0.0, 0.0)))
+    assert_equal(small_buf.pending_count(), 0)
+    assert_true(abs(future_ack.pos.x - Float32(99.0)) < Float32(1.0e-4))
+
+    # 4. End-to-end SnapshotReplicator -> SnapshotClientReceiver `last_acked_input_seq` wire round-trip
+    var rep = SnapshotReplicator(
+        max_entities=8, max_clients=1, max_packet_bytes=512, interest_radius=100.0, world_bounds=256.0
+    )
+    var cli = SnapshotClientReceiver(8, 256.0)
+    rep.set_client_view(0, Vec3(0.0, 0.0, 0.0), 100.0)
+    rep.set_entity(0, Vec3(2.0, 0.0, 0.0))
+    rep.set_client_acked_input_seq(0, 42)
+    rep.prepare_tick()
+    var p0 = rep.build_client_packet(0)
+    var d0 = cli.apply_packet(p0[1])
+    assert_true(d0[0])
+    assert_true(cli.has_acked_input_seq)
+    assert_equal(cli.last_acked_input_seq, 42)
+    rep.notify_client_ack(0, d0[1])
+
+    # Truncated packet carrying acked_input_seq=99 must NOT advance cli.last_acked_input_seq
+    rep.set_client_acked_input_seq(0, 99)
+    rep.set_entity(0, Vec3(3.0, 0.0, 0.0))
+    rep.prepare_tick()
+    var p1 = rep.build_client_packet(0)
+    var trunc = List[UInt8]()
+    for i in range(min(13, len(p1[1]) - 1)):
+        trunc.append(p1[1][i])
+    assert_false(cli.apply_packet(trunc)[0])
+    assert_equal(cli.last_acked_input_seq, 42)
+    assert_true(cli.apply_packet(p1[1])[0])
+    assert_equal(cli.last_acked_input_seq, 99)
+
+    # 5. Regression checks: NaN auth_state, gap ACK [1,2,4,5], forward jump reconcile_smoothed, VisualSmoother NaN dt & 1e20 overflow
+    var nan32 = Float32(0.0) / Float32(0.0)
+    var nan_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    nan_buf.push_predicted(
+        1,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(1.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0)),
+    )
+    _ = nan_buf.reconcile(1, PredictedState(Vec3(nan32, 0.0, 0.0)))
+    assert_equal(nan_buf.mispredictions, 1)
+
+    var nan_sm = VisualSmoother()
+    nan_sm.pos_offset = Vec3(nan32, 0.0, 0.0)
+    assert_true(nan_sm.snap_if_exceeds(Float32(5.0)))
+    assert_true(nan_sm.pos_offset.length_squared() == Float32(0.0))
+
+    nan_sm.record_correction(Vec3(2.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
+    nan_sm.step(nan32)
+    nan_sm.step_linear(nan32)
+    assert_true((nan_sm.pos_offset.x - nan_sm.pos_offset.x) == Float32(0.0))
+    assert_true(abs(nan_sm.pos_offset.x - Float32(2.0)) < Float32(1.0e-5))
+
+    var big_sm = VisualSmoother()
+    big_sm.record_correction(Vec3(Float32(1.0e20), 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
+    big_sm.step_linear(Float32(0.016))
+    assert_true((big_sm.pos_offset.x - big_sm.pos_offset.x) == Float32(0.0))
+
+    # Gap ACK [1,2,4,5] with acked_seq=3 preserves future entries [4,5]
+    var gap_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    for seq in [1, 2, 4, 5]:
+        gap_buf.push_predicted(
+            seq,
+            PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+            PredictedState(Vec3(Float32(seq), 0.0, 0.0), Vec3(1.0, 0.0, 0.0)),
+        )
+    var gap_res = gap_buf.reconcile(
+        3, PredictedState(Vec3(3.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0))
+    )
+    assert_equal(gap_buf.pending_count(), 2)
+    assert_equal(gap_buf.last_acked_input_seq, 3)
+    assert_true(abs(gap_res.pos.x - Float32(6.0)) < Float32(1.0e-3))
+
+    var gap_step_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    var gap_stepper = _PredStepper(accel=2.0)
+    var gs = PredictedState()
+    for seq in [1, 2, 4, 5]:
+        var cmd = PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0)
+        gap_stepper.step_prediction(gs, Int(Pointer(to=cmd)), seq, seq, Float32(0.5))
+        _ = cmd.same_input(cmd)
+        gap_step_buf.push_predicted(seq, cmd, gs, tick=seq, dt=Float32(0.5))
+    var gap_step_res = gap_step_buf.reconcile_with(
+        3, PredictedState(Vec3(1.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0)), gap_stepper
+    )
+    assert_equal(gap_step_buf.pending_count(), 2)
+    assert_equal(gap_step_buf.last_acked_input_seq, 3)
+    # 2 steps from (pos=1, vel=1) with accel=2, dt=0.5 -> v=2,3 => x=1+1+1.5=3.5
+    assert_true(abs(gap_step_res.pos.x - Float32(3.5)) < Float32(1.0e-3))
+
+    # reconcile_smoothed forward-jump acked_seq > newest still records smoothing offset
+    var fwd_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    for seq in range(1, 6):
+        fwd_buf.push_predicted(
+            seq,
+            PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+            PredictedState(Vec3(Float32(seq), 0.0, 0.0)),
+        )
+    var fwd_sm = VisualSmoother()
+    var fwd_res = fwd_buf.reconcile_smoothed(
+        10, PredictedState(Vec3(20.0, 0.0, 0.0)), fwd_sm
+    )
+    assert_equal(fwd_buf.pending_count(), 0)
+    assert_true(abs(fwd_res.pos.x - Float32(20.0)) < Float32(1.0e-4))
+    assert_true(abs(fwd_sm.pos_offset.x - Float32(-15.0)) < Float32(1.0e-3))
+    assert_true(abs(fwd_sm.smooth_pos(fwd_res.pos).x - Float32(5.0)) < Float32(1.0e-3))
+
+    # Iteration 3 regressions: reconcile_smoothed NaN recovery, push_predicted NaN rejection,
+    # VisualSmoother.step NaN sanitization, and snap_if_exceeds(1e20) overflow guard
+    var rec_sm_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    rec_sm_buf.push_predicted(
+        1,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(1.0, 0.0, 0.0)),
+    )
+    rec_sm_buf.push_predicted(
+        2,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(2.0, 0.0, 0.0)),
+    )
+    # push_predicted must ignore non-finite predicted_state
+    rec_sm_buf.push_predicted(
+        3,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(nan32, 0.0, 0.0)),
+    )
+    assert_equal(rec_sm_buf.pending_count(), 2)
+    assert_true(
+        (rec_sm_buf.latest_state.pos.x - rec_sm_buf.latest_state.pos.x)
+        == Float32(0.0)
+    )
+    assert_true(abs(rec_sm_buf.latest_state.pos.x - Float32(2.0)) < Float32(1.0e-4))
+
+    var rec_sm = VisualSmoother(Float32(12.0))
+    var r_bad = rec_sm_buf.reconcile_smoothed(
+        1, PredictedState(Vec3(nan32, 0.0, 0.0)), rec_sm
+    )
+    assert_equal(rec_sm_buf.mispredictions, 1)
+    assert_true((r_bad.pos.x - r_bad.pos.x) == Float32(0.0))
+    var r_ok = rec_sm_buf.reconcile_smoothed(
+        2, PredictedState(Vec3(2.0, 0.0, 0.0)), rec_sm
+    )
+    rec_sm.step(Float32(0.016))
+    assert_true((r_ok.pos.x - r_ok.pos.x) == Float32(0.0))
+    assert_true(
+        (rec_sm.pos_offset.x - rec_sm.pos_offset.x) == Float32(0.0)
+    )
+    assert_true(
+        (rec_sm.rot_offset.w - rec_sm.rot_offset.w) == Float32(0.0)
+    )
+
+    # Direct VisualSmoother.step sanitizes NaN offsets & snap_if_exceeds handles >= 1e19
+    var step_nan_sm = VisualSmoother(Float32(12.0))
+    step_nan_sm.pos_offset = Vec3(nan32, 0.0, 0.0)
+    step_nan_sm.rot_offset = Quat(nan32, 0.0, 0.0, 1.0)
+    step_nan_sm.step(Float32(0.016))
+    assert_true(step_nan_sm.pos_offset.length_squared() == Float32(0.0))
+    assert_true(
+        (step_nan_sm.rot_offset.w - step_nan_sm.rot_offset.w) == Float32(0.0)
+    )
+
+    var snap_big_sm = VisualSmoother(Float32(12.0))
+    snap_big_sm.pos_offset = Vec3(Float32(2.0e20), 0.0, 0.0)
+    assert_true(snap_big_sm.snap_if_exceeds(Float32(1.0e20)))
+    assert_true(snap_big_sm.pos_offset.length_squared() == Float32(0.0))
+    snap_big_sm.pos_offset = Vec3(Float32(0.5e20), 0.0, 0.0)
+    assert_false(snap_big_sm.snap_if_exceeds(Float32(1.0e20)))
+
+    # Iteration 4 regressions: ±3e38 delta replay finiteness & NaN-producing PredictionStepper guard
+    var ext_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    ext_buf.push_predicted(
+        1,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(Float32(-3.0e38), 0.0, 0.0)),
+    )
+    ext_buf.push_predicted(
+        2,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(Float32(3.0e38), 0.0, 0.0)),
+    )
+    var r_ext = ext_buf.reconcile(
+        1, PredictedState(Vec3(Float32(-2.9e38), 0.0, 0.0))
+    )
+    assert_true((r_ext.pos.x - r_ext.pos.x) == Float32(0.0))
+    assert_true((ext_buf.latest_state.pos.x - ext_buf.latest_state.pos.x) == Float32(0.0))
+
+    var ov_sum_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    ov_sum_buf.push_predicted(
+        1,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(Float32(0.0), 0.0, 0.0)),
+    )
+    ov_sum_buf.push_predicted(
+        2,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(Float32(2.0e38), 0.0, 0.0)),
+    )
+    var r_ov_sum = ov_sum_buf.reconcile(
+        1, PredictedState(Vec3(Float32(2.0e38), 0.0, 0.0))
+    )
+    assert_true((r_ov_sum.pos.x - r_ov_sum.pos.x) == Float32(0.0))
+    assert_true((ov_sum_buf.latest_state.pos.x - ov_sum_buf.latest_state.pos.x) == Float32(0.0))
+
+    var nan_st = _NanPredStepper()
+    var nan_st_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    nan_st_buf.push_predicted(
+        1,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(1.0, 0.0, 0.0)),
+    )
+    nan_st_buf.push_predicted(
+        2,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(2.0, 0.0, 0.0)),
+    )
+    var r_nan_st = nan_st_buf.reconcile_with(
+        1, PredictedState(Vec3(1.5, 0.0, 0.0)), nan_st
+    )
+    assert_true((r_nan_st.pos.x - r_nan_st.pos.x) == Float32(0.0))
+    assert_true((nan_st_buf.latest_state.pos.x - nan_st_buf.latest_state.pos.x) == Float32(0.0))
+    assert_equal(nan_st_buf.mispredictions, 1)
+
+    var nan_gap_buf = ClientPredictionBuffer[PhysicsRollbackInput](capacity=8)
+    nan_gap_buf.push_predicted(
+        1,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(1.0, 0.0, 0.0)),
+    )
+    nan_gap_buf.push_predicted(
+        4,
+        PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0),
+        PredictedState(Vec3(4.0, 0.0, 0.0)),
+    )
+    var r_nan_gap = nan_gap_buf.reconcile_with(
+        2, PredictedState(Vec3(2.5, 0.0, 0.0)), nan_st
+    )
+    assert_true((r_nan_gap.pos.x - r_nan_gap.pos.x) == Float32(0.0))
+    assert_true((nan_gap_buf.latest_state.pos.x - nan_gap_buf.latest_state.pos.x) == Float32(0.0))
+    assert_true(nan_gap_buf.mispredictions >= 1)
+
+
+def test_l_f7_server_lag_compensation() raises:
+    print("  [Test L] F7 HitboxSnapshotRing & LagCompHistory temporal rewind, interpolation, OBB SAT & capsule...")
+    var ring = HitboxSnapshotRing(capacity=16, max_rewind_ms=200.0)
+
+    # Record 3 snapshots (0, 50, 100 ms) with Sphere, AABB, 45-deg rotating OBB, and Capsule
+    var p_0 = List[HitboxPose]()
+    p_0.append(HitboxPose.sphere(entity_id=1, center=Vec3(0.0, 1.0, 0.0), radius=Float32(0.5)))
+    p_0.append(HitboxPose.aabb(entity_id=2, center=Vec3(10.0, 1.0, 0.0), half_extents=Vec3(0.5, 1.0, 0.5)))
+    p_0.append(
+        HitboxPose.obb(
+            entity_id=3,
+            center=Vec3(20.0, 1.0, 0.0),
+            rot=Quat.from_euler(0.0, 0.0, 0.0),
+            half_extents=Vec3(1.5, 0.5, 0.4),
+        )
+    )
+    p_0.append(
+        HitboxPose.capsule(
+            entity_id=4,
+            center=Vec3(30.0, 1.0, 0.0),
+            rot=Quat.identity(),
+            radius=Float32(0.4),
+            half_height=Float32(0.8),
+        )
+    )
+    ring.record_snapshot(0, 0.0, p_0)
+
+    var p_50 = List[HitboxPose]()
+    p_50.append(HitboxPose.sphere(entity_id=1, center=Vec3(4.0, 1.0, 0.0), radius=Float32(0.5)))
+    p_50.append(HitboxPose.aabb(entity_id=2, center=Vec3(10.0, 1.0, 0.0), half_extents=Vec3(0.5, 1.0, 0.5)))
+    p_50.append(
+        HitboxPose.obb(
+            entity_id=3,
+            center=Vec3(20.0, 1.0, 0.0),
+            rot=Quat.from_euler(0.0, Float32(1.5707963), 0.0),  # 90 deg at 50 ms -> 45 deg at 25 ms
+            half_extents=Vec3(1.5, 0.5, 0.4),
+        )
+    )
+    p_50.append(
+        HitboxPose.capsule(
+            entity_id=4,
+            center=Vec3(32.0, 1.0, 0.0),
+            rot=Quat.identity(),
+            radius=Float32(0.4),
+            half_height=Float32(0.8),
+        )
+    )
+    ring.record_snapshot(1, 50.0, p_50)
+
+    var p_100 = List[HitboxPose]()
+    p_100.append(HitboxPose.sphere(entity_id=1, center=Vec3(8.0, 1.0, 0.0), radius=Float32(0.5)))
+    ring.record_snapshot(2, 100.0, p_100)
+
+    # 1. Interpolated sphere hit at t=25ms (alpha=0.5 -> x=2.0)
+    var h_sph = ring.rewind_and_raycast(25.0, Vec3(2.0, 1.0, -4.0), Vec3(0.0, 0.0, 1.0), 20.0)
+    assert_true(h_sph.hit and h_sph.entity_id == 1)
+    assert_false(h_sph.was_clamped)
+    assert_true(abs(h_sph.point.z - Float32(-0.5)) < Float32(0.01))
+    assert_true(abs(h_sph.normal.z - Float32(-1.0)) < Float32(0.01))
+
+    # 2. 45-degree interpolated OBB at t=25ms: ray starting at (21.0, 1.0, 0.5) along +Z
+    # is inside the world-space AABB [-1.34, +1.34]^2 but misses the 45-deg rotated OBB completely
+    var miss_obb_corner = ring.rewind_and_raycast(
+        25.0, Vec3(21.0, 1.0, 0.5), Vec3(0.0, 0.0, 1.0), 10.0
+    )
+    assert_false(miss_obb_corner.hit)
+    # Ray along Z hitting rotated OBB at x=20.7 (intersects diagonal around z=-0.7)
+    var hit_obb = ring.rewind_and_raycast(
+        25.0, Vec3(20.7, 1.0, -3.0), Vec3(0.0, 0.0, 1.0), 10.0
+    )
+    assert_true(hit_obb.hit and hit_obb.entity_id == 3)
+    assert_true(hit_obb.normal.x < Float32(-0.5) and hit_obb.normal.z < Float32(-0.5))
+
+    # 3. Capsule at t=25ms (x=31.0, y in [0.2, 1.8] body + caps): hit at y=1.6
+    var hit_cap = ring.rewind_and_raycast(
+        25.0, Vec3(31.0, 1.6, -4.0), Vec3(0.0, 0.0, 1.0), 10.0
+    )
+    assert_true(hit_cap.hit and hit_cap.entity_id == 4)
+
+    # 4. Inside-shape raycast returns t=0, point=origin
+    var hit_inside = ring.rewind_and_raycast(
+        25.0, Vec3(2.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0), 10.0
+    )
+    assert_true(hit_inside.hit and hit_inside.entity_id == 1)
+    assert_true(hit_inside.distance == Float32(0.0))
+    assert_true(hit_inside.fraction == Float32(0.0))
+
+    # 5. ignore_entity_id skips shooter & zero-length ray returns miss
+    assert_false(
+        ring.rewind_and_raycast(
+            25.0, Vec3(2.0, 1.0, -4.0), Vec3(0.0, 0.0, 1.0), 20.0, ignore_entity_id=1
+        ).hit
+    )
+    assert_false(ring.rewind_and_raycast(25.0, Vec3(), Vec3(), 10.0).hit)
+
+    # 6. Overlap sphere & AABB (15-axis SAT + analytical segment-AABB)
+    var ov_sph = ring.rewind_and_overlap(25.0, Vec3(2.0, 1.0, 0.0), Float32(0.25))
+    assert_equal(len(ov_sph), 1)
+    assert_equal(ov_sph[0].entity_id, 1)
+
+    # AABB near rotated OBB corner: AABB proxy would intersect, 15-axis SAT correctly rejects
+    var ov_aabb_miss = ring.rewind_and_overlap_aabb(
+        25.0, Vec3(21.15, 0.6, 0.35), Vec3(21.45, 1.4, 0.65)
+    )
+    assert_equal(len(ov_aabb_miss), 0)
+    var ov_aabb_cap = ring.rewind_and_overlap_aabb(
+        25.0, Vec3(30.7, 1.4, -0.3), Vec3(31.3, 1.9, 0.3)
+    )
+    assert_equal(len(ov_aabb_cap), 1)
+    assert_equal(ov_aabb_cap[0].entity_id, 4)
+
+    # 7. Bounded max_rewind_ms + ring wraparound
+    for k in range(3, 25):
+        var t_ms = Float64(k) * 50.0
+        var ps = List[HitboxPose]()
+        ps.append(HitboxPose.sphere(entity_id=9, center=Vec3(Float32(k), 0.0, 0.0), radius=Float32(0.5)))
+        ring.record_snapshot(k, t_ms, ps)
+    # latest = 24*50 = 1200ms, max_rewind_ms = 200 -> min allowed = 1000ms (k=20 -> x=20.0)
+    var clamped_hit = ring.rewind_and_raycast(100.0, Vec3(20.0, 0.0, -3.0), Vec3(0.0, 0.0, 1.0), 10.0)
+    assert_true(clamped_hit.was_clamped)
+    assert_true(abs(clamped_hit.rewind_time_ms - 1000.0) < 1.0e-6)
+    assert_true(clamped_hit.hit and clamped_hit.entity_id == 9)
+
+    # 8. LagCompHistory tick API
+    var hist = LagCompHistory(max_entities=8, max_history_ticks=12)
+    for tk in range(10):
+        var ps = List[HitboxPose]()
+        ps.append(HitboxPose(entity_id=5, center=Vec3(Float32(tk) * 3.0, 1.0, 0.0), radius=Float32(0.6)))
+        hist.record_tick(tk, ps)
+    var thit = hist.raycast_at_tick(4, Vec3(12.0, 1.0, -5.0), Vec3(0.0, 0.0, 1.0), 20.0)
+    assert_true(thit.hit and thit.entity_id == 5)
+    assert_false(hist.raycast_at_tick(9, Vec3(12.0, 1.0, -5.0), Vec3(0.0, 0.0, 1.0), 20.0).hit)
+
+    # 9. Regression checks: NaN/Inf query vectors & non-finite HitboxPose must cleanly miss
+    var nan32 = Float32(0.0) / Float32(0.0)
+    var inf32 = Float32(1.0) / Float32(0.0)
+    assert_false(ring.rewind_and_raycast(1000.0, Vec3(20.0, 0.0, -3.0), Vec3(nan32, 0.0, 1.0), 10.0).hit)
+    assert_false(ring.rewind_and_raycast(1000.0, Vec3(nan32, 0.0, -3.0), Vec3(0.0, 0.0, 1.0), 10.0).hit)
+    assert_false(ring.rewind_and_raycast(1000.0, Vec3(20.0, 0.0, -3.0), Vec3(0.0, 0.0, 1.0), inf32).hit)
+    assert_equal(len(ring.rewind_and_overlap(1000.0, Vec3(nan32, 0.0, 0.0), Float32(2.0))), 0)
+    assert_equal(len(ring.rewind_and_overlap_aabb(1000.0, Vec3(nan32, -1.0, -1.0), Vec3(21.0, 1.0, 1.0))), 0)
+
+    var bad_ring = HitboxSnapshotRing(capacity=4, max_rewind_ms=100.0)
+    var bad_poses = List[HitboxPose]()
+    bad_poses.append(HitboxPose.sphere(1, Vec3(nan32, 0.0, 0.0), Float32(1.0)))
+    bad_poses.append(HitboxPose.aabb(2, Vec3(0.0, 0.0, 0.0), Vec3(nan32, 1.0, 1.0)))
+    bad_ring.record_snapshot(0, 10.0, bad_poses)
+    assert_false(bad_ring.rewind_and_raycast(10.0, Vec3(0.0, 0.0, -5.0), Vec3(0.0, 0.0, 1.0), 10.0).hit)
+    assert_equal(len(bad_ring.rewind_and_overlap(10.0, Vec3(0.0, 0.0, 0.0), Float32(5.0))), 0)
+    assert_equal(len(bad_ring.rewind_and_overlap_aabb(10.0, Vec3(-5.0, -5.0, -5.0), Vec3(5.0, 5.0, 5.0))), 0)
+
+    # Iteration 3 regressions: +-Inf timestamps rejected and huge Quat(1e30,...) normalizes cleanly
+    var inf64 = Float64(1.0) / Float64(0.0)
+    var inf_ring = HitboxSnapshotRing(capacity=4, max_rewind_ms=100.0)
+    var valid_pose = List[HitboxPose]()
+    valid_pose.append(HitboxPose.sphere(10, Vec3(0.0, 0.0, 0.0), Float32(1.0)))
+    inf_ring.record_snapshot(0, 10.0, valid_pose)
+    inf_ring.record_snapshot(1, inf64, valid_pose)
+    inf_ring.record_snapshot(2, -inf64, valid_pose)
+    assert_equal(inf_ring.snapshot_count(), 1)
+    assert_true((inf_ring.newest_time_ms() - inf_ring.newest_time_ms()) == 0.0)
+    inf_ring.record_snapshot(3, 20.0, valid_pose)
+    assert_equal(inf_ring.snapshot_count(), 2)
+    assert_true(abs(inf_ring.newest_time_ms() - 20.0) < 1.0e-6)
+
+    var big_q_pose = HitboxPose.obb(
+        entity_id=11,
+        center=Vec3(0.0, 0.0, 0.0),
+        rot=Quat(Float32(1.0e30), Float32(1.0e30), Float32(1.0e30), Float32(1.0e30)),
+        half_extents=Vec3(1.0, 1.0, 1.0),
+    )
+    assert_true(big_q_pose.active)
+    assert_true(abs(big_q_pose.rot.length() - Float32(1.0)) < Float32(1.0e-4))
+    var big_q_ring = HitboxSnapshotRing(capacity=4, max_rewind_ms=100.0)
+    var big_q_poses = List[HitboxPose]()
+    big_q_poses.append(big_q_pose)
+    big_q_ring.record_snapshot(0, 10.0, big_q_poses)
+    assert_true(
+        big_q_ring.rewind_and_raycast(
+            10.0, Vec3(0.0, 0.0, -5.0), Vec3(0.0, 0.0, 1.0), 10.0
+        ).hit
+    )
+
+
+def test_m_f8_chunk_relative_open_world_quantization() raises:
+    print("  [Test M] F8 Chunk-relative open-world quantization (±100,000 m, cross-chunk deltas, i32 chunks & full fallback)...")
+    # 1. ±100,000 m precision with chunk_size=256.0 and non-pow2 chunk_size=100.0
+    var rep = SnapshotReplicator(
+        max_entities=16, max_clients=1, max_packet_bytes=1000, interest_radius=300.0, chunk_size=256.0
+    )
+    var cli = SnapshotClientReceiver(max_entities=16, chunk_size=256.0)
+    var far_a = Vec3(Float32(100_000.25), Float32(2_500.5), Float32(-100_000.75))
+    var far_b = Vec3(Float32(100_020.0), Float32(2_500.5), Float32(-100_010.0))
+    rep.set_client_view(0, far_a, 300.0)
+    rep.set_entity(0, far_a, Quat.identity(), Vec3(), UInt32(1))
+    rep.set_entity(1, far_b, Quat.identity(), Vec3(), UInt32(2))
+    rep.prepare_tick()
+    var p0 = rep.build_client_packet(0)
+    var d0 = cli.apply_packet(p0[1])
+    assert_true(d0[0])
+    rep.notify_client_ack(0, d0[1])
+    assert_true((cli.entities[0].pos - far_a).length() < Float32(0.01))
+    assert_true((cli.entities[1].pos - far_b).length() < Float32(0.01))
+
+    # 2. Smooth cross-chunk walk across x = 255.90 -> 256.10 and x = -0.08 -> +0.08
+    var cross_rep = SnapshotReplicator(
+        max_entities=8, max_clients=1, max_packet_bytes=1000, interest_radius=100.0, chunk_size=256.0
+    )
+    var cross_cli = SnapshotClientReceiver(max_entities=8, chunk_size=256.0)
+    cross_rep.set_client_view(0, Vec3(128.0, 0.0, 0.0), 300.0)
+    for step in range(20):
+        var x0 = Float32(255.85) + Float32(step) * Float32(0.025)
+        var x1 = Float32(-0.15) + Float32(step) * Float32(0.025)
+        cross_rep.set_entity(0, Vec3(x0, 1.0, 0.0))
+        cross_rep.set_entity(1, Vec3(x1, 1.0, 0.0))
+        cross_rep.prepare_tick()
+        var pk = cross_rep.build_client_packet(0)
+        var dr = cross_cli.apply_packet(pk[1])
+        assert_true(dr[0])
+        cross_rep.notify_client_ack(0, dr[1])
+        assert_true((cross_cli.entities[0].pos - Vec3(x0, 1.0, 0.0)).length() < Float32(0.01))
+        assert_true((cross_cli.entities[1].pos - Vec3(x1, 1.0, 0.0)).length() < Float32(0.01))
+
+    # 3. Exact chunk-multiple teleport (same local qx, changed chunk_ix) must trigger DIRTY_POS
+    cross_rep.set_entity(0, Vec3(Float32(10.0), 1.0, 0.0))
+    cross_rep.prepare_tick()
+    var p_pre_tp = cross_rep.build_client_packet(0)
+    var d_pre_tp = cross_cli.apply_packet(p_pre_tp[1])
+    assert_true(d_pre_tp[0])
+    cross_rep.notify_client_ack(0, d_pre_tp[1])
+    assert_true(abs(cross_cli.entities[0].pos.x - Float32(10.0)) < Float32(0.01))
+
+    cross_rep.set_entity(0, Vec3(Float32(266.0), 1.0, 0.0))
+    cross_rep.prepare_tick()
+    var p_tp = cross_rep.build_client_packet(0)
+    var d_tp = cross_cli.apply_packet(p_tp[1])
+    assert_true(d_tp[0])
+    cross_rep.notify_client_ack(0, d_tp[1])
+    assert_true(abs(cross_cli.entities[0].pos.x - Float32(266.0)) < Float32(0.01))
+
+    # 4. Non-power-of-2 chunk_size=100.0 + fine chunk_size=1.0 (i32 chunk coords > 32767) + unacked ring overwrite full fallback
+    var np2_rep = SnapshotReplicator(
+        max_entities=4, max_clients=1, max_packet_bytes=1000, interest_radius=200.0, chunk_size=100.0
+    )
+    var np2_cli = SnapshotClientReceiver(max_entities=4, chunk_size=100.0)
+    var np2_pos = Vec3(Float32(-99_950.35), Float32(1_234.56), Float32(100_005.125))
+    np2_rep.set_client_view(0, np2_pos, 200.0)
+    np2_rep.set_entity(0, np2_pos)
+    np2_rep.prepare_tick()
+    var np2_pkt = np2_rep.build_client_packet(0)
+    assert_true(np2_cli.apply_packet(np2_pkt[1])[0])
+    assert_true((np2_cli.entities[0].pos - np2_pos).length() < Float32(0.015))
+
+    var fine_rep = SnapshotReplicator(
+        max_entities=4, max_clients=1, max_packet_bytes=1000, interest_radius=200.0, chunk_size=1.0
+    )
+    var fine_cli = SnapshotClientReceiver(max_entities=4, chunk_size=1.0)
+    var ultra_far = Vec3(Float32(100_000.25), Float32(-50_000.5), Float32(80_000.75))
+    fine_rep.set_client_view(0, ultra_far, 200.0)
+    for k in range(36):
+        # Do NOT notify ack for 35 ticks to force baseline overwrite -> full-snapshot fallback on tick 35
+        fine_rep.set_entity(0, ultra_far + Vec3(Float32(k) * Float32(0.01), 0.0, 0.0))
+        fine_rep.prepare_tick()
+        var fp = fine_rep.build_client_packet(0)
+        if k == 35:
+            assert_true(fine_cli.apply_packet(fp[1])[0])
+            var exp = ultra_far + Vec3(Float32(35) * Float32(0.01), 0.0, 0.0)
+            assert_true((fine_cli.entities[0].pos - exp).length() < Float32(0.01))
+
+    # 5. Regression check: >32 unacked full-snapshot fallback deactivates destroyed zombie entities
+    var z_rep = SnapshotReplicator(
+        max_entities=8, max_clients=1, max_packet_bytes=1000, interest_radius=200.0, chunk_size=256.0
+    )
+    var z_cli = SnapshotClientReceiver(max_entities=8, chunk_size=256.0)
+    z_rep.set_client_view(0, Vec3(0.0, 0.0, 0.0), 200.0)
+    z_rep.set_entity(0, Vec3(2.0, 0.0, 0.0))
+    z_rep.set_entity(1, Vec3(4.0, 0.0, 0.0))
+    z_rep.prepare_tick()
+    var zp0 = z_rep.build_client_packet(0)
+    var zr0 = z_cli.apply_packet(zp0[1])
+    assert_true(zr0[0])
+    z_rep.notify_client_ack(0, zr0[1])
+    assert_true(z_cli.entities[0].active and z_cli.entities[1].active)
+
+    z_rep.destroy_entity(1)
+    for k in range(1, 35):
+        z_rep.set_entity(0, Vec3(2.0 + Float32(k) * Float32(0.1), 0.0, 0.0))
+        z_rep.prepare_tick()
+        var zpk = z_rep.build_client_packet(0)
+        if k == 34:
+            var zr34 = z_cli.apply_packet(zpk[1])
+            assert_true(zr34[0])
+            z_rep.notify_client_ack(0, zr34[1])
+    assert_true(z_cli.entities[0].active)
+    assert_false(z_cli.entities[1].active)
+    z_rep.prepare_tick()
+    var zp35 = z_rep.build_client_packet(0)
+    assert_true(z_cli.apply_packet(zp35[1])[0])
+    assert_false(z_cli.entities[1].active)
+
+    # 6. Regression check: _quant_pos_axis Inf / Int32 range clamping
+    var nan32 = Float32(0.0) / Float32(0.0)
+    var inf32 = Float32(1.0) / Float32(0.0)
+    var inf_rep = SnapshotReplicator(
+        max_entities=4, max_clients=1, max_packet_bytes=1000, interest_radius=200.0, chunk_size=1.0
+    )
+    var inf_cli = SnapshotClientReceiver(max_entities=4, chunk_size=1.0)
+    inf_rep.set_client_view(0, Vec3(0.0, 0.0, 0.0), 200.0)
+    inf_rep.set_entity(0, Vec3(inf32, -inf32, nan32))
+    inf_rep.set_entity(1, Vec3(Float32(1.0e38), Float32(-1.0e38), Float32(0.0)))
+    inf_rep.prepare_tick()
+    var inf_pkt = inf_rep.build_client_packet(0)
+    assert_true(inf_cli.apply_packet(inf_pkt[1])[0])
+    var p_inf = inf_cli.entities[0].pos
+    assert_true((p_inf.x - p_inf.x) == Float32(0.0) and abs(p_inf.x) < Float32(1.0))
+    assert_true((p_inf.y - p_inf.y) == Float32(0.0) and abs(p_inf.y) < Float32(1.0))
+    assert_true((p_inf.z - p_inf.z) == Float32(0.0) and abs(p_inf.z) < Float32(1.0))
+    var p_big = inf_cli.entities[1].pos
+    assert_true((p_big.x - p_big.x) == Float32(0.0))
+    assert_true((p_big.y - p_big.y) == Float32(0.0))
+
+    # 7. Iteration 4 regressions: SpatialInterestGrid 64-bit cells at 1e11, query_sphere guards,
+    #    and SnapshotInterpolationBuffer out-of-order & NaN timestamp handling
+    var huge_pos = Vec3(Float32(1.0e11), 0.0, 0.0)
+    var grid_ents = List[ReplicatedEntity]()
+    var ge0 = ReplicatedEntity(0)
+    ge0.active = True
+    ge0.pos = huge_pos
+    grid_ents.append(ge0)
+    var ge1 = ReplicatedEntity(1)
+    ge1.active = True
+    ge1.pos = Vec3(nan32, 0.0, 0.0)
+    grid_ents.append(ge1)
+    var ge2 = ReplicatedEntity(2)
+    ge2.active = True
+    ge2.pos = Vec3(0.0, 0.0, 0.0)
+    grid_ents.append(ge2)
+
+    var big_grid = SpatialInterestGrid(max_entities=4, cell_size=32.0, use_3d=False)
+    big_grid.rebuild(grid_ents)
+    var q_out = List[Int]()
+    big_grid.query_sphere(grid_ents, huge_pos, Float32(200.0), q_out)
+    assert_equal(len(q_out), 1)
+    assert_equal(q_out[0], 0)
+
+    # query_sphere rejects non-finite center, NaN/+Inf/-10 radius, and handles huge 1e7 finite radius cleanly
+    big_grid.query_sphere(grid_ents, Vec3(nan32, 0.0, 0.0), Float32(100.0), q_out)
+    assert_equal(len(q_out), 0)
+    big_grid.query_sphere(grid_ents, Vec3(0.0, 0.0, 0.0), nan32, q_out)
+    assert_equal(len(q_out), 0)
+    big_grid.query_sphere(grid_ents, Vec3(0.0, 0.0, 0.0), inf32, q_out)
+    assert_equal(len(q_out), 0)
+    big_grid.query_sphere(grid_ents, Vec3(0.0, 0.0, 0.0), Float32(-10.0), q_out)
+    assert_equal(len(q_out), 0)
+    big_grid.query_sphere(grid_ents, Vec3(0.0, 0.0, 0.0), Float32(1.0e7), q_out)
+    assert_equal(len(q_out), 1)
+    assert_equal(q_out[0], 2)
+
+    # SnapshotReplicator round-trip at (1e11, 0, 0) with chunk_size=64.0, cell_size=32.0
+    var far_rep = SnapshotReplicator(
+        max_entities=8,
+        max_clients=1,
+        max_packet_bytes=512,
+        interest_radius=200.0,
+        cell_size=32.0,
+        chunk_size=64.0,
+    )
+    var far_cli = SnapshotClientReceiver(max_entities=8, chunk_size=64.0)
+    far_rep.set_entity(0, huge_pos)
+    far_rep.set_client_view(0, huge_pos, Float32(200.0))
+    far_rep.prepare_tick()
+    var far_pkt = far_rep.build_client_packet(0)
+    var far_ack = far_cli.apply_packet(far_pkt[1])
+    assert_true(far_ack[0])
+    assert_true(far_cli.entities[0].active)
+    assert_true(abs(far_cli.entities[0].pos.x - huge_pos.x) <= Float32(8192.0))
+
+    # SnapshotInterpolationBuffer out-of-order [100, 200, 150] -> sample(175.0) == 175.0
+    var ooo_interp = SnapshotInterpolationBuffer(
+        max_entities=4, interp_delay_ms=0.0, ring_capacity=4
+    )
+    var s100 = List[ReplicatedEntity]()
+    var s200 = List[ReplicatedEntity]()
+    var s150 = List[ReplicatedEntity]()
+    for i in range(4):
+        s100.append(ReplicatedEntity(i))
+        s200.append(ReplicatedEntity(i))
+        s150.append(ReplicatedEntity(i))
+    s100[0].active = True
+    s100[0].pos = Vec3(Float32(100.0), 0.0, 0.0)
+    s200[0].active = True
+    s200[0].pos = Vec3(Float32(200.0), 0.0, 0.0)
+    s150[0].active = True
+    s150[0].pos = Vec3(Float32(150.0), 0.0, 0.0)
+    ooo_interp.push_snapshot(100.0, s100)
+    ooo_interp.push_snapshot(200.0, s200)
+    ooo_interp.push_snapshot(150.0, s150)
+    var ooo_out = List[ReplicatedEntity]()
+    assert_true(ooo_interp.sample(175.0, ooo_out))
+    assert_true(abs(ooo_out[0].pos.x - Float32(175.0)) < Float32(1.0e-3))
+
+    # SnapshotInterpolationBuffer [100, NaN, 200] -> sample(150.0) == 150.0 & sample(NaN) == False
+    var nan_interp = SnapshotInterpolationBuffer(
+        max_entities=4, interp_delay_ms=0.0, ring_capacity=4
+    )
+    var nan64 = Float64(0.0) / Float64(0.0)
+    nan_interp.push_snapshot(100.0, s100)
+    nan_interp.push_snapshot(nan64, s150)
+    nan_interp.push_snapshot(200.0, s200)
+    var nan_out = List[ReplicatedEntity]()
+    assert_true(nan_interp.sample(150.0, nan_out))
+    assert_true(abs(nan_out[0].pos.x - Float32(150.0)) < Float32(1.0e-3))
+    assert_false(nan_interp.sample(nan64, nan_out))
+
+    # Full ring drops stale timestamp < oldest and sorts intermediate replacement
+    var cap2_interp = SnapshotInterpolationBuffer(
+        max_entities=4, interp_delay_ms=0.0, ring_capacity=2
+    )
+    var s50 = List[ReplicatedEntity]()
+    for i in range(4):
+        s50.append(ReplicatedEntity(i))
+    s50[0].active = True
+    s50[0].pos = Vec3(Float32(50.0), 0.0, 0.0)
+    cap2_interp.push_snapshot(100.0, s100)
+    cap2_interp.push_snapshot(200.0, s200)
+    cap2_interp.push_snapshot(50.0, s50)
+    assert_true(cap2_interp.sample(150.0, nan_out))
+    assert_true(abs(nan_out[0].pos.x - Float32(150.0)) < Float32(1.0e-3))
+    cap2_interp.push_snapshot(150.0, s150)
+    assert_true(cap2_interp.sample(175.0, nan_out))
+    assert_true(abs(nan_out[0].pos.x - Float32(175.0)) < Float32(1.0e-3))
+
+
+def test_n_f9_nat_relay_rollback_topology() raises:
+    print("  [Test N] F9 RelayForwardHeader, RelayServer, NATPunchProbe (Symmetric fallback, Cone upgrade, mid-session fallback & anti-spoof)...")
+    # 1. RelayForwardHeader round-trip, truncation & hop_ttl checks
+    var hdr = RelayForwardHeader(
+        session_token=UInt64(0x1122334455667788),
+        src_peer=1,
+        dst_peer=2,
+        flags=RELAY_FLAG_DATA,
+        seq=UInt16(77),
+        hop_ttl=1,
+    )
+    var hdr_bytes = hdr.encode_bytes()
+    assert_equal(len(hdr_bytes), RELAY_HEADER_BYTES)
+    var parsed_ok = RelayForwardHeader.parse_from_ptr(
+        Int(hdr_bytes.unsafe_ptr()), len(hdr_bytes)
+    )
+    assert_true(parsed_ok[0])
+    assert_equal(parsed_ok[1].session_token, hdr.session_token)
+    assert_equal(parsed_ok[1].src_peer, 1)
+    assert_equal(parsed_ok[1].dst_peer, 2)
+    assert_equal(Int(parsed_ok[1].seq), 77)
+    assert_false(
+        RelayForwardHeader.parse_from_ptr(Int(hdr_bytes.unsafe_ptr()), 10)[0]
+    )
+
+    # 2. Symmetric NAT Relay Fallback (all direct P2P blocked)
+    var sim_sym = VirtualNetSim.from_rtt(rtt_ms=20.0, jitter_ms=3.0, loss_rate=0.03, seed=0xF9A1)
+    var r_ep_sym = sim_sym.create_ipv4_peer(0, 9900)
+    var raw_sym0 = sim_sym.create_ipv4_peer(1, 9901)
+    var raw_sym1 = sim_sym.create_ipv4_peer(2, 9902)
+    var sym_addrs = List[NetEndpoint]()
+    sym_addrs.append(raw_sym0.local_endpoint())
+    sym_addrs.append(raw_sym1.local_endpoint())
+
+    var nat0 = _SymmetricNatTransport(raw_sym0^, r_ep_sym.local_endpoint(), allow_direct=False)
+    var nat1 = _SymmetricNatTransport(raw_sym1^, r_ep_sym.local_endpoint(), allow_direct=False)
+    var relay_sym = RelayServer(r_ep_sym.local_endpoint())
+
+    var pw_sym0 = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var pw_sym1 = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var s_sym0 = RollbackSession[PhysicsRollbackInput](0, sym_addrs, input_delay_ticks=2, max_rollback_ticks=8, checksum_interval=4)
+    var s_sym1 = RollbackSession[PhysicsRollbackInput](1, sym_addrs, input_delay_ticks=2, max_rollback_ticks=8, checksum_interval=4)
+    s_sym0.enable_relay(r_ep_sym.local_endpoint(), attempt_nat_punch=True, probe_timeout_ms=120.0)
+    s_sym1.enable_relay(r_ep_sym.local_endpoint(), attempt_nat_punch=True, probe_timeout_ms=120.0)
+    s_sym0.bind_world(pw_sym0)
+    s_sym1.bind_world(pw_sym1)
+
+    for f in range(100):
+        var now = sim_sym.now_ms()
+        relay_sym.poll(r_ep_sym, now)
+        var c0 = PhysicsRollbackInput(Float32(f % 3), 0.0, 1.0, 0.0, 0)
+        var c1 = PhysicsRollbackInput(-1.0, 0.0, Float32(f % 2), 0.0, 0)
+        _ = s_sym0.step_frame(c0, pw_sym0, nat0, now)
+        _ = s_sym1.step_frame(c1, pw_sym1, nat1, now)
+        sim_sym.advance_ms(1000.0 / 60.0)
+
+    assert_false(s_sym0.desync_detected)
+    assert_false(s_sym1.desync_detected)
+    assert_true(s_sym0.is_peer_relayed(1) and s_sym1.is_peer_relayed(0))
+    assert_true(s_sym0.punch_fallbacks >= 1 and s_sym1.punch_fallbacks >= 1)
+    assert_true(s_sym0.relayed_packets_sent > 0 and s_sym0.relayed_packets_received > 0)
+    assert_true(s_sym0.direct_packets_received == 0)
+    assert_true(len(s_sym0.confirmed_hash_history) >= 50)
+    for t in range(50):
+        assert_equal(s_sym0.confirmed_hash_history[t], s_sym1.confirmed_hash_history[t])
+
+    # 3. Cone NAT Hole-Punch Upgrade (RELAY -> DIRECT)
+    var sim_cone = VirtualNetSim.from_rtt(rtt_ms=16.0, jitter_ms=1.0, loss_rate=0.0, seed=0xF9B2)
+    var r_ep_cone = sim_cone.create_ipv4_peer(0, 9910)
+    var raw_c0 = sim_cone.create_ipv4_peer(1, 9911)
+    var raw_c1 = sim_cone.create_ipv4_peer(2, 9912)
+    var cone_addrs = List[NetEndpoint]()
+    cone_addrs.append(raw_c0.local_endpoint())
+    cone_addrs.append(raw_c1.local_endpoint())
+
+    var cone0 = _ConeNatTransport(raw_c0^, r_ep_cone.local_endpoint())
+    var cone1 = _ConeNatTransport(raw_c1^, r_ep_cone.local_endpoint())
+    var relay_cone = RelayServer(r_ep_cone.local_endpoint())
+
+    var pw_c0 = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var pw_c1 = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var s_c0 = RollbackSession[PhysicsRollbackInput](0, cone_addrs, input_delay_ticks=2, max_rollback_ticks=8, checksum_interval=4)
+    var s_c1 = RollbackSession[PhysicsRollbackInput](1, cone_addrs, input_delay_ticks=2, max_rollback_ticks=8, checksum_interval=4)
+    s_c0.enable_relay(r_ep_cone.local_endpoint(), attempt_nat_punch=True, probe_timeout_ms=1000.0)
+    s_c1.enable_relay(r_ep_cone.local_endpoint(), attempt_nat_punch=True, probe_timeout_ms=1000.0)
+    s_c0.bind_world(pw_c0)
+    s_c1.bind_world(pw_c1)
+
+    for f in range(90):
+        var now = sim_cone.now_ms()
+        relay_cone.poll(r_ep_cone, now)
+        var cmd = PhysicsRollbackInput(Float32(f % 4), 0.0, -1.0, 0.0, 0)
+        _ = s_c0.step_frame(cmd, pw_c0, cone0, now)
+        _ = s_c1.step_frame(cmd, pw_c1, cone1, now)
+        sim_cone.advance_ms(1000.0 / 60.0)
+
+    assert_false(s_c0.desync_detected)
+    assert_false(s_c1.desync_detected)
+    assert_true(s_c0.punch_upgrades >= 1 and s_c1.punch_upgrades >= 1)
+    assert_true(s_c0.is_peer_direct(1) and s_c1.is_peer_direct(0))
+    assert_true(s_c0.direct_packets_sent > 0 and s_c0.direct_packets_received > 0)
+    assert_true(len(s_c0.confirmed_hash_history) >= 50)
+    for t in range(50):
+        assert_equal(s_c0.confirmed_hash_history[t], s_c1.confirmed_hash_history[t])
+
+    # 4. Mid-session Direct -> Relay Fallback when direct path drops
+    var sim_mid = VirtualNetSim.from_rtt(rtt_ms=10.0, jitter_ms=0.0, loss_rate=0.0, seed=0xF9C3)
+    var r_ep_mid = sim_mid.create_ipv4_peer(0, 9920)
+    var raw_m0 = sim_mid.create_ipv4_peer(1, 9921)
+    var raw_m1 = sim_mid.create_ipv4_peer(2, 9922)
+    var mid_addrs = List[NetEndpoint]()
+    mid_addrs.append(raw_m0.local_endpoint())
+    mid_addrs.append(raw_m1.local_endpoint())
+
+    var mid0 = _SymmetricNatTransport(raw_m0^, r_ep_mid.local_endpoint(), allow_direct=True)
+    var mid1 = _SymmetricNatTransport(raw_m1^, r_ep_mid.local_endpoint(), allow_direct=True)
+    var relay_mid = RelayServer(r_ep_mid.local_endpoint())
+
+    var pw_m0 = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var pw_m1 = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var s_m0 = RollbackSession[PhysicsRollbackInput](0, mid_addrs, input_delay_ticks=2, max_rollback_ticks=8, checksum_interval=4)
+    var s_m1 = RollbackSession[PhysicsRollbackInput](1, mid_addrs, input_delay_ticks=2, max_rollback_ticks=8, checksum_interval=4)
+    s_m0.enable_relay(r_ep_mid.local_endpoint(), attempt_nat_punch=True, probe_timeout_ms=1000.0, direct_idle_fallback_ms=150.0)
+    s_m1.enable_relay(r_ep_mid.local_endpoint(), attempt_nat_punch=True, probe_timeout_ms=1000.0, direct_idle_fallback_ms=150.0)
+    s_m0.bind_world(pw_m0)
+    s_m1.bind_world(pw_m1)
+
+    for _ in range(40):
+        var now = sim_mid.now_ms()
+        relay_mid.poll(r_ep_mid, now)
+        var cmd = PhysicsRollbackInput(1.0, 0.0, 0.0, 0.0, 0)
+        _ = s_m0.step_frame(cmd, pw_m0, mid0, now)
+        _ = s_m1.step_frame(cmd, pw_m1, mid1, now)
+        sim_mid.advance_ms(1000.0 / 60.0)
+    assert_true(s_m0.is_peer_direct(1) and s_m1.is_peer_direct(0))
+
+    # Break direct connectivity mid-session -> both fall back to relay seamlessly
+    mid0.allow_direct = False
+    mid1.allow_direct = False
+    for _ in range(40, 100):
+        var now = sim_mid.now_ms()
+        relay_mid.poll(r_ep_mid, now)
+        var cmd = PhysicsRollbackInput(0.0, 0.0, 1.0, 0.0, 0)
+        _ = s_m0.step_frame(cmd, pw_m0, mid0, now)
+        _ = s_m1.step_frame(cmd, pw_m1, mid1, now)
+        sim_mid.advance_ms(1000.0 / 60.0)
+    assert_true(s_m0.is_peer_relayed(1) and s_m1.is_peer_relayed(0))
+    assert_true(s_m0.punch_fallbacks >= 1 and s_m1.punch_fallbacks >= 1)
+    assert_false(s_m0.desync_detected or s_m1.desync_detected)
+    for t in range(60):
+        assert_equal(s_m0.confirmed_hash_history[t], s_m1.confirmed_hash_history[t])
+
+    # 5. RelayServer anti-hijack & RollbackSession relay anti-spoofing
+    var sim_sec = VirtualNetSim.from_rtt(rtt_ms=10.0, jitter_ms=0.0, loss_rate=0.0, seed=0xF9D4)
+    var r_sec_ep = sim_sec.create_ipv4_peer(0, 9930)
+    var p0_sec = sim_sec.create_ipv4_peer(1, 9931)
+    var p1_sec = sim_sec.create_ipv4_peer(2, 9932)
+    var rogue_sec = sim_sec.create_ipv4_peer(3, 9939)
+    var relay_sec = RelayServer(r_sec_ep.local_endpoint())
+
+    var reg_bytes = RelayForwardHeader(
+        session_token=DEFAULT_ROLLBACK_SESSION_TOKEN,
+        src_peer=1,
+        dst_peer=1,
+        flags=RELAY_FLAG_REGISTER,
+    ).encode_bytes()
+    assert_true(p1_sec.send_raw(r_sec_ep.local_endpoint(), Int(reg_bytes.unsafe_ptr()), len(reg_bytes)))
+    sim_sec.advance_ms(10.0)
+    relay_sec.poll(r_sec_ep, sim_sec.now_ms())
+    assert_equal(relay_sec.registrations, 1)
+
+    # Rogue tries to hijack (DEFAULT_ROLLBACK_SESSION_TOKEN, peer 1) from different endpoint
+    assert_true(rogue_sec.send_raw(r_sec_ep.local_endpoint(), Int(reg_bytes.unsafe_ptr()), len(reg_bytes)))
+    _ = reg_bytes[0]
+    sim_sec.advance_ms(10.0)
+    relay_sec.poll(r_sec_ep, sim_sec.now_ms())
+    assert_true(relay_sec.spoofed_packets_dropped >= 1)
+    var lk = relay_sec.lookup_peer(DEFAULT_ROLLBACK_SESSION_TOKEN, 1)
+    assert_true(lk[0] and lk[1] == p1_sec.local_endpoint())
+
+    # Rogue sends forged RELAY_WIRE_MAGIC directly to RollbackSession s_sec0 pretending to be relay
+    var sec_addrs = List[NetEndpoint]()
+    sec_addrs.append(p0_sec.local_endpoint())
+    sec_addrs.append(p1_sec.local_endpoint())
+    var pw_sec = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var s_sec = RollbackSession[PhysicsRollbackInput](0, sec_addrs)
+    s_sec.enable_relay(r_sec_ep.local_endpoint())
+    var forged_relay = RelayForwardHeader(
+        session_token=DEFAULT_ROLLBACK_SESSION_TOKEN,
+        src_peer=1,
+        dst_peer=0,
+        flags=RELAY_FLAG_DATA,
+    ).encode_bytes()
+    for _ in range(32):
+        forged_relay.append(0)
+    assert_true(rogue_sec.send_raw(p0_sec.local_endpoint(), Int(forged_relay.unsafe_ptr()), len(forged_relay)))
+    _ = forged_relay[0]
+    sim_sec.advance_ms(10.0)
+    s_sec.poll_network(pw_sec, p0_sec, sim_sec.now_ms())
+    assert_true(s_sec.spoofed_packets_dropped >= 1)
+
+    # Relayed packet from valid relay_endpoint whose inner sender_id != outer hdr.src_peer must be dropped
+    var prev_drops = s_sec.spoofed_packets_dropped
+    var mismatch_bw = BitWriter(128)
+    mismatch_bw.write_u32(_RB_WIRE_MAGIC)
+    mismatch_bw.write_u64(DEFAULT_ROLLBACK_SESSION_TOKEN)
+    mismatch_bw.write_u8(UInt8(0))  # inner sender_id == 0, while outer hdr.src_peer == 1!
+    for _ in range(32):
+        mismatch_bw.write_u8(0)
+    var inner_m = mismatch_bw.finish()
+    var mismatch_pkt = RelayForwardHeader(
+        session_token=DEFAULT_ROLLBACK_SESSION_TOKEN,
+        src_peer=1,
+        dst_peer=0,
+        flags=RELAY_FLAG_DATA,
+    ).encode_bytes()
+    for b in range(len(inner_m)):
+        mismatch_pkt.append(inner_m[b])
+    assert_true(r_sec_ep.send_raw(p0_sec.local_endpoint(), Int(mismatch_pkt.unsafe_ptr()), len(mismatch_pkt)))
+    _ = mismatch_pkt[0]
+    sim_sec.advance_ms(10.0)
+    s_sec.poll_network(pw_sec, p0_sec, sim_sec.now_ms())
+    assert_true(s_sec.spoofed_packets_dropped > prev_drops)
+    assert_true(sim_sec.now_ms() >= 0.0)
+
+    # 6. Regression check: non-deterministic NATPunchProbe.local_nonce & PUNCH_KIND_PROBE hijack defense when DIRECT
+    var probe_a = NATPunchProbe(
+        local_peer=0,
+        relay_endpoint=r_ep_cone.local_endpoint(),
+        target_peer=1,
+        session_token=DEFAULT_ROLLBACK_SESSION_TOKEN,
+    )
+    var probe_b = NATPunchProbe(
+        local_peer=0,
+        relay_endpoint=r_ep_cone.local_endpoint(),
+        target_peer=1,
+        session_token=DEFAULT_ROLLBACK_SESSION_TOKEN,
+    )
+    assert_true(probe_a.local_nonce != probe_b.local_nonce)
+
+    # Send forged PUNCH_KIND_PROBE from rogue_sec to s_c0 (already DIRECT with peer 1)
+    var ep_before = s_c0.peer_endpoints[1]
+    var punch_before = s_c0.peer_punches[1].target_endpoint
+    var drops_before = s_c0.spoofed_packets_dropped
+    var rogue_probe = List[UInt8](unsafe_uninit_length=24)
+    var rp_base = Int(rogue_probe.unsafe_ptr())
+    Pointer[UInt32, MutAnyOrigin](unsafe_from_address=rp_base).unsafe_store[alignment=1](NAT_PUNCH_MAGIC)
+    Pointer[UInt64, MutAnyOrigin](unsafe_from_address=rp_base + 4).unsafe_store[alignment=1](DEFAULT_ROLLBACK_SESSION_TOKEN)
+    rogue_probe[12] = PUNCH_KIND_PROBE
+    rogue_probe[13] = UInt8(1)
+    rogue_probe[14] = UInt8(0)
+    rogue_probe[15] = UInt8(0)
+    Pointer[UInt64, MutAnyOrigin](unsafe_from_address=rp_base + 16).unsafe_store[alignment=1](UInt64(0))
+    var rogue_punch_ep = sim_cone.create_ipv4_peer(9, 9949)
+    cone0.opened_peers.append(rogue_punch_ep.local_endpoint())
+    assert_true(rogue_punch_ep.send_raw(cone0.local_endpoint(), Int(rogue_probe.unsafe_ptr()), len(rogue_probe)))
+    _ = rogue_probe[0]
+    sim_cone.advance_ms(20.0)
+    s_c0.poll_network(pw_c0, cone0, sim_cone.now_ms())
+    assert_true(s_c0.peer_endpoints[1] == ep_before)
+    assert_true(s_c0.peer_punches[1].target_endpoint == punch_before)
+    assert_true(s_c0.spoofed_packets_dropped > drops_before)
+
+    # Direct NATPunchProbe.ingest_datagram check for PUNCH_KIND_PROBE hijack when DIRECT
+    var rogue_view = DatagramView(
+        rogue_punch_ep.local_endpoint(),
+        Int(rogue_probe.unsafe_ptr()),
+        len(rogue_probe),
+    )
+    assert_false(s_c0.peer_punches[1].ingest_datagram(rogue_view, cone0, sim_cone.now_ms()))
+    _ = rogue_probe[0]
+    assert_true(sim_cone.now_ms() >= 0.0)
+
+    # 7. Regression check: RelayServer.poll evicts stale peers BEFORE Pass 1 registration
+    var sim_evict = VirtualNetSim.from_rtt(rtt_ms=5.0, jitter_ms=0.0, loss_rate=0.0, seed=0xF9E7)
+    var r_ev_ep = sim_evict.create_ipv4_peer(0, 9950)
+    var ev_p0 = sim_evict.create_ipv4_peer(1, 9951)
+    var ev_p1 = sim_evict.create_ipv4_peer(2, 9952)
+    var ev_p2 = sim_evict.create_ipv4_peer(3, 9953)
+    var relay_ev = RelayServer(r_ev_ep.local_endpoint(), max_peers=2, peer_timeout_ms=100.0)
+    var tok_ev = UInt64(0xABCD1234EF567890)
+    for pid in range(2):
+        var rb = RelayForwardHeader(
+            session_token=tok_ev, src_peer=pid, dst_peer=pid, flags=RELAY_FLAG_REGISTER
+        ).encode_bytes()
+        if pid == 0:
+            _ = ev_p0.send_raw(r_ev_ep.local_endpoint(), Int(rb.unsafe_ptr()), len(rb))
+        else:
+            _ = ev_p1.send_raw(r_ev_ep.local_endpoint(), Int(rb.unsafe_ptr()), len(rb))
+        _ = rb[0]
+    sim_evict.advance_ms(10.0)
+    relay_ev.poll(r_ev_ep, sim_evict.now_ms())
+    assert_equal(relay_ev.active_peer_count(), 2)
+    assert_equal(relay_ev.registrations, 2)
+
+    # Advance past peer_timeout_ms=100ms, then register peer 2 in a single poll
+    sim_evict.advance_ms(120.0)
+    var rb2 = RelayForwardHeader(
+        session_token=tok_ev, src_peer=2, dst_peer=2, flags=RELAY_FLAG_REGISTER
+    ).encode_bytes()
+    _ = ev_p2.send_raw(r_ev_ep.local_endpoint(), Int(rb2.unsafe_ptr()), len(rb2))
+    _ = rb2[0]
+    sim_evict.advance_ms(10.0)
+    relay_ev.poll(r_ev_ep, sim_evict.now_ms())
+    assert_equal(relay_ev.registrations, 3)
+    assert_equal(relay_ev.invalid_packets_dropped, 0)
+    assert_equal(relay_ev.active_peer_count(), 1)
+    assert_true(relay_ev.lookup_peer(tok_ev, 2)[0])
+    assert_true(sim_evict.now_ms() >= 0.0)
+
+    # 8. Regression check: RollbackSession + RelayServer.enable_cookie_auth end-to-end
+    var sim_ck = VirtualNetSim.from_rtt(rtt_ms=16.0, jitter_ms=1.0, loss_rate=0.0, seed=0xF9CC)
+    var r_ep_ck = sim_ck.create_ipv4_peer(0, 9960)
+    var raw_ck0 = sim_ck.create_ipv4_peer(1, 9961)
+    var raw_ck1 = sim_ck.create_ipv4_peer(2, 9962)
+    var ck_addrs = List[NetEndpoint]()
+    ck_addrs.append(raw_ck0.local_endpoint())
+    ck_addrs.append(raw_ck1.local_endpoint())
+    var nat_ck0 = _SymmetricNatTransport(raw_ck0^, r_ep_ck.local_endpoint(), allow_direct=False)
+    var nat_ck1 = _SymmetricNatTransport(raw_ck1^, r_ep_ck.local_endpoint(), allow_direct=False)
+    var relay_ck = RelayServer(r_ep_ck.local_endpoint())
+    relay_ck.enable_cookie_auth(AeadKey.from_u64x4(11, 22, 33, 44), bucket_ms=10000.0)
+
+    var pw_ck0 = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var pw_ck1 = PhysicsRollbackAdapter.create_arena(num_peers=2)
+    var s_ck0 = RollbackSession[PhysicsRollbackInput](0, ck_addrs, input_delay_ticks=2, max_rollback_ticks=8, checksum_interval=4)
+    var s_ck1 = RollbackSession[PhysicsRollbackInput](1, ck_addrs, input_delay_ticks=2, max_rollback_ticks=8, checksum_interval=4)
+    s_ck0.enable_relay(r_ep_ck.local_endpoint(), attempt_nat_punch=True, probe_timeout_ms=100.0)
+    s_ck1.enable_relay(r_ep_ck.local_endpoint(), attempt_nat_punch=True, probe_timeout_ms=100.0)
+    s_ck0.bind_world(pw_ck0)
+    s_ck1.bind_world(pw_ck1)
+
+    for f in range(70):
+        var now = sim_ck.now_ms()
+        relay_ck.poll(r_ep_ck, now)
+        var cmd = PhysicsRollbackInput(Float32(f % 3), 0.0, 1.0, 0.0, 0)
+        _ = s_ck0.step_frame(cmd, pw_ck0, nat_ck0, now)
+        _ = s_ck1.step_frame(cmd, pw_ck1, nat_ck1, now)
+        sim_ck.advance_ms(1000.0 / 60.0)
+
+    assert_true(relay_ck.registrations >= 2)
+    assert_true(relay_ck.packets_forwarded > 0)
+    assert_true(s_ck0.relay_has_cookie and s_ck1.relay_has_cookie)
+    assert_true(s_ck0.relayed_packets_received > 0 and s_ck1.relayed_packets_received > 0)
+    assert_false(s_ck0.desync_detected or s_ck1.desync_detected)
+    assert_true(len(s_ck0.confirmed_hash_history) >= 30)
+    for t in range(30):
+        assert_equal(s_ck0.confirmed_hash_history[t], s_ck1.confirmed_hash_history[t])
+    assert_true(sim_ck.now_ms() >= 0.0)
+
+
 def main() raises:
     var t_start = monotonic()
     set_sim_float_mode()
@@ -1471,6 +2758,10 @@ def main() raises:
     test_h_net_hub_routing_accept_drop()
     test_i_security_dos_and_wraparound_regressions()
     test_j_wave2_aead_cookie_channels_despawn_interp()
+    test_k_f6_client_prediction_reconciliation()
+    test_l_f7_server_lag_compensation()
+    test_m_f8_chunk_relative_open_world_quantization()
+    test_n_f9_nat_relay_rollback_topology()
     var total_ms = Float64(monotonic() - t_start) / 1.0e6
     print("============================================================")
     print(" [PASS] ALL FLINT V5 NET & ROLLBACK TESTS PASSED (" + String(Int(total_ms)) + " ms)")

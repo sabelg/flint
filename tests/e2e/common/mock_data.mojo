@@ -2,11 +2,16 @@
 from std.collections import List
 from std.math import sin
 from flint.core.math import Vec3
-from flint.core.transform import Quat
-from flint.assets.model import NativeModel, NativeMesh, NativeTexture, NativeNode, NativeSkin
+from flint.assets.model import NativeModel, NativeMesh, NativeTexture
 from flint.assets.mesh_builder import MeshBuilder, append_node_meshes
 from flint.assets.glb_writer import encode_native_glb
-from flint.assets.vfs import encode_pack
+from flint.assets.flpk_v3 import (
+    ASSET_KIND_RAW,
+    CHUNK_COMP_NONE,
+    AssetUuid,
+    FlpkBuildChunk,
+    encode_flpk_v3,
+)
 
 
 def create_mock_texture(width: Int = 16, height: Int = 16, color: UInt32 = 0xFF808080) -> NativeTexture:
@@ -53,28 +58,51 @@ def create_mock_glb_bytes() -> List[UInt8]:
     return encode_native_glb(model)
 
 
-def create_mock_flpk_data() -> List[UInt8]:
-    var names = List[String]()
-    var files = List[List[UInt8]]()
+def create_mock_flpk_v3_data() -> List[UInt8]:
+    var chunks = List[FlpkBuildChunk]()
 
-    names.append(String("manifest.json"))
-    var json_str = String("{\"name\":\"mock_pack\",\"version\":2,\"assets\":[\"model.glb\",\"audio.wav\"]}")
+    var json_str = String("{\"name\":\"mock_pack\",\"version\":3,\"assets\":[\"model.glb\",\"audio.wav\"]}")
     var f1 = List[UInt8]()
-    for b in json_str.bytes():
+    for b in json_str.as_bytes():
         f1.append(b)
-    files.append(f1^)
+    chunks.append(
+        FlpkBuildChunk(
+            AssetUuid.from_path("manifest.json"),
+            "manifest.json",
+            0,
+            ASSET_KIND_RAW,
+            f1^,
+            CHUNK_COMP_NONE,
+        )
+    )
 
-    names.append(String("model.glb"))
-    files.append(create_mock_glb_bytes())
+    chunks.append(
+        FlpkBuildChunk(
+            AssetUuid.from_path("model.glb"),
+            "model.glb",
+            0,
+            ASSET_KIND_RAW,
+            create_mock_glb_bytes(),
+            CHUNK_COMP_NONE,
+        )
+    )
 
-    names.append(String("readme.txt"))
-    var txt = String("Flint Engine V2 Persistent Pack")
+    var txt = String("Flint Engine V5 Persistent Pack")
     var f3 = List[UInt8]()
-    for b in txt.bytes():
+    for b in txt.as_bytes():
         f3.append(b)
-    files.append(f3^)
+    chunks.append(
+        FlpkBuildChunk(
+            AssetUuid.from_path("readme.txt"),
+            "readme.txt",
+            0,
+            ASSET_KIND_RAW,
+            f3^,
+            CHUNK_COMP_NONE,
+        )
+    )
 
-    return encode_pack(names, files)
+    return encode_flpk_v3(chunks, page_align=False)
 
 
 def create_mock_meshlet_mesh(subdivisions: Int = 12) -> NativeMesh:

@@ -30,6 +30,36 @@ comptime DIRTY_ALL: UInt8 = DIRTY_POS | DIRTY_ROT | DIRTY_VEL | DIRTY_STATE
 comptime _BASELINE_RING: Int = 32
 comptime _BASELINE_MASK: Int = 31
 comptime _REPL_MAGIC: UInt16 = 0x5235  # "5R"
+comptime _MAX_GRID_QUERY_CELLS: Int = 4096
+
+
+@always_inline
+def _rep_is_finite32(v: Float32) -> Bool:
+    return (v - v) == Float32(0.0)
+
+
+@always_inline
+def _rep_is_finite64(v: Float64) -> Bool:
+    return (v - v) == 0.0
+
+
+@always_inline
+def _rep_vec3_finite(v: Vec3) -> Bool:
+    return (
+        _rep_is_finite32(v.x)
+        and _rep_is_finite32(v.y)
+        and _rep_is_finite32(v.z)
+    )
+
+
+@always_inline
+def _rep_cell_coord(v: Float64, inv_cell_size: Float64) -> Int:
+    var cf = floor(v * inv_cell_size)
+    if cf < -4.0e18:
+        cf = -4.0e18
+    elif cf > 4.0e18:
+        cf = 4.0e18
+    return Int(cf)
 
 
 @fieldwise_init
@@ -56,6 +86,9 @@ struct ReplicatedEntity(Copyable, ImplicitlyCopyable, Movable):
 @fieldwise_init
 struct _QuantizedEntitySnap(Copyable, ImplicitlyCopyable, Movable):
     var known: Bool
+    var chunk_ix: Int32
+    var chunk_iy: Int32
+    var chunk_iz: Int32
     var qx: Int
     var qy: Int
     var qz: Int
@@ -68,6 +101,9 @@ struct _QuantizedEntitySnap(Copyable, ImplicitlyCopyable, Movable):
 
     def __init__(out self):
         self.known = False
+        self.chunk_ix = 0
+        self.chunk_iy = 0
+        self.chunk_iz = 0
         self.qx = 0
         self.qy = 0
         self.qz = 0
@@ -107,6 +143,8 @@ struct _ClientRepState(Movable):
     var next_snap_seq: UInt16
     var has_acked_seq: Bool
     var last_acked_seq: UInt16
+    var has_acked_input_seq: Bool
+    var last_acked_input_seq: UInt32
     var priority_accum: List[Float32]
     var baselines: List[_ClientBaselineSlot]
     var bytes_sent_total: Int
@@ -119,6 +157,8 @@ struct _ClientRepState(Movable):
         self.next_snap_seq = 0
         self.has_acked_seq = False
         self.last_acked_seq = 0
+        self.has_acked_input_seq = False
+        self.last_acked_input_seq = 0
         self.priority_accum = List[Float32](length=max_entities, fill=0.0)
         self.baselines = List[_ClientBaselineSlot](capacity=_BASELINE_RING)
         for _ in range(_BASELINE_RING):
@@ -135,9 +175,9 @@ struct SpatialInterestGrid(Movable):
     var num_buckets: Int
     var bucket_heads: List[Int32]
     var next_entity: List[Int32]
-    var cell_coords_x: List[Int32]
-    var cell_coords_y: List[Int32]
-    var cell_coords_z: List[Int32]
+    var cell_coords_x: List[Int]
+    var cell_coords_y: List[Int]
+    var cell_coords_z: List[Int]
 
     def __init__(
         out self,
@@ -153,9 +193,9 @@ struct SpatialInterestGrid(Movable):
         self.num_buckets = 1 << max(6, min(14, bucket_pow2))
         self.bucket_heads = List[Int32](length=self.num_buckets, fill=-1)
         self.next_entity = List[Int32](length=max_entities, fill=-1)
-        self.cell_coords_x = List[Int32](length=max_entities, fill=0)
-        self.cell_coords_y = List[Int32](length=max_entities, fill=0)
-        self.cell_coords_z = List[Int32](length=max_entities, fill=0)
+        self.cell_coords_x = List[Int](length=max_entities, fill=0)
+        self.cell_coords_y = List[Int](length=max_entities, fill=0)
+        self.cell_coords_z = List[Int](length=max_entities, fill=0)
 
     @always_inline
     def _bucket_idx(self, cx: Int, cy: Int, cz: Int) -> Int:
@@ -177,20 +217,21 @@ struct SpatialInterestGrid(Movable):
         for b in range(self.num_buckets):
             self.bucket_heads[b] = -1
 
+        var inv_cs64 = Float64(self.inv_cell_size)
         # Insert in reverse entity index so forward linked-list walk visits ascending indices!
         var idx = n - 1
         while idx >= 0:
-            if entities[idx].active:
-                var cx = Int(floor(entities[idx].pos.x * self.inv_cell_size))
+            if entities[idx].active and _rep_vec3_finite(entities[idx].pos):
+                var cx = _rep_cell_coord(Float64(entities[idx].pos.x), inv_cs64)
                 var cy = (
-                    Int(floor(entities[idx].pos.y * self.inv_cell_size))
+                    _rep_cell_coord(Float64(entities[idx].pos.y), inv_cs64)
                     if self.use_3d
                     else 0
                 )
-                var cz = Int(floor(entities[idx].pos.z * self.inv_cell_size))
-                self.cell_coords_x[idx] = Int32(cx)
-                self.cell_coords_y[idx] = Int32(cy)
-                self.cell_coords_z[idx] = Int32(cz)
+                var cz = _rep_cell_coord(Float64(entities[idx].pos.z), inv_cs64)
+                self.cell_coords_x[idx] = cx
+                self.cell_coords_y[idx] = cy
+                self.cell_coords_z[idx] = cz
                 var b = self._bucket_idx(cx, cy, cz)
                 self.next_entity[idx] = self.bucket_heads[b]
                 self.bucket_heads[b] = Int32(idx)
@@ -206,22 +247,62 @@ struct SpatialInterestGrid(Movable):
         mut out_indices: List[Int],
     ):
         out_indices.clear()
-        var r = max(Float32(0.0), radius)
-        var r_sq = r * r
-        var min_cx = Int(floor((center.x - r) * self.inv_cell_size))
-        var max_cx = Int(floor((center.x + r) * self.inv_cell_size))
+        if not _rep_vec3_finite(center):
+            return
+        if not _rep_is_finite32(radius) or radius < Float32(0.0):
+            return
+        var r64 = Float64(radius)
+        var r_sq64 = r64 * r64
+        var inv_cs64 = Float64(self.inv_cell_size)
+        var min_cx = _rep_cell_coord(Float64(center.x) - r64, inv_cs64)
+        var max_cx = _rep_cell_coord(Float64(center.x) + r64, inv_cs64)
         var min_cy = (
-            Int(floor((center.y - r) * self.inv_cell_size))
+            _rep_cell_coord(Float64(center.y) - r64, inv_cs64)
             if self.use_3d
             else 0
         )
         var max_cy = (
-            Int(floor((center.y + r) * self.inv_cell_size))
+            _rep_cell_coord(Float64(center.y) + r64, inv_cs64)
             if self.use_3d
             else 0
         )
-        var min_cz = Int(floor((center.z - r) * self.inv_cell_size))
-        var max_cz = Int(floor((center.z + r) * self.inv_cell_size))
+        var min_cz = _rep_cell_coord(Float64(center.z) - r64, inv_cs64)
+        var max_cz = _rep_cell_coord(Float64(center.z) + r64, inv_cs64)
+
+        var span_x = max_cx - min_cx + 1
+        var span_y = (max_cy - min_cy + 1) if self.use_3d else 1
+        var span_z = max_cz - min_cz + 1
+        var use_linear = (
+            span_x <= 0
+            or span_y <= 0
+            or span_z <= 0
+            or span_x > _MAX_GRID_QUERY_CELLS
+            or span_y > _MAX_GRID_QUERY_CELLS
+            or span_z > _MAX_GRID_QUERY_CELLS
+        )
+        if not use_linear:
+            var span_xy = span_x * span_y
+            if (
+                span_xy > _MAX_GRID_QUERY_CELLS
+                or span_xy * span_z > _MAX_GRID_QUERY_CELLS
+            ):
+                use_linear = True
+
+        if use_linear:
+            for idx in range(len(entities)):
+                if not entities[idx].active or not _rep_vec3_finite(entities[idx].pos):
+                    continue
+                var dx = Float64(entities[idx].pos.x) - Float64(center.x)
+                var dz = Float64(entities[idx].pos.z) - Float64(center.z)
+                var d_sq: Float64
+                if self.use_3d:
+                    var dy = Float64(entities[idx].pos.y) - Float64(center.y)
+                    d_sq = dx * dx + dy * dy + dz * dz
+                else:
+                    d_sq = dx * dx + dz * dz
+                if d_sq <= r_sq64:
+                    out_indices.append(idx)
+            return
 
         for cy in range(min_cy, max_cy + 1):
             for cz in range(min_cz, max_cz + 1):
@@ -230,20 +311,90 @@ struct SpatialInterestGrid(Movable):
                     var cur = Int(self.bucket_heads[b])
                     while cur >= 0:
                         if (
-                            Int(self.cell_coords_x[cur]) == cx
-                            and Int(self.cell_coords_y[cur]) == cy
-                            and Int(self.cell_coords_z[cur]) == cz
+                            self.cell_coords_x[cur] == cx
+                            and self.cell_coords_y[cur] == cy
+                            and self.cell_coords_z[cur] == cz
+                            and entities[cur].active
+                            and _rep_vec3_finite(entities[cur].pos)
                         ):
-                            var d: Float32
+                            var dx = Float64(entities[cur].pos.x) - Float64(center.x)
+                            var dz = Float64(entities[cur].pos.z) - Float64(center.z)
+                            var d_sq: Float64
                             if self.use_3d:
-                                d = (entities[cur].pos - center).length_squared()
+                                var dy = Float64(entities[cur].pos.y) - Float64(center.y)
+                                d_sq = dx * dx + dy * dy + dz * dz
                             else:
-                                var dx = entities[cur].pos.x - center.x
-                                var dz = entities[cur].pos.z - center.z
-                                d = dx * dx + dz * dz
-                            if d <= r_sq:
+                                d_sq = dx * dx + dz * dz
+                            if d_sq <= r_sq64:
                                 out_indices.append(cur)
                         cur = Int(self.next_entity[cur])
+
+
+@always_inline
+def _quant_pos_axis(v: Float32, chunk_size: Float32) -> Tuple[Int32, Int]:
+    var cs = Float64(chunk_size)
+    var vf = Float64(v) if (v - v) == Float32(0.0) else 0.0
+    var cf = floor(vf / cs)
+    if cf < -2147483648.0:
+        cf = -2147483648.0
+    elif cf > 2147483647.0:
+        cf = 2147483647.0
+    var c = Int32(cf)
+    var local = vf - cf * cs
+    if local < 0.0:
+        if c > Int32(-2147483648):
+            c -= 1
+            local += cs
+        else:
+            local = 0.0
+    elif local >= cs:
+        if c < Int32(2147483647):
+            c += 1
+            local -= cs
+        else:
+            local = cs
+    var q = Int(floor((local / cs) * 65536.0))
+    if q < 0:
+        q = 0
+    elif q > 65535:
+        q = 65535
+    return (c, q)
+
+
+@always_inline
+def _dequant_pos_axis(c: Int32, q: Int, chunk_size: Float32) -> Float32:
+    var cs = Float64(chunk_size)
+    var origin = Float64(c) * cs
+    var local = ((Float64(q) + 0.5) / 65536.0) * cs
+    return Float32(origin + local)
+
+
+@always_inline
+def _apply_axis_delta(mut chunk: Int32, mut q: Int, delta: Int):
+    var total = q + delta
+    while total >= 65536:
+        total -= 65536
+        chunk += 1
+    while total < 0:
+        total += 65536
+        chunk -= 1
+    q = total
+
+
+@always_inline
+def _sign_extend_i16(raw: UInt64) -> Int32:
+    var u = Int(raw & 0xFFFF)
+    if u >= 32768:
+        u -= 65536
+    return Int32(u)
+
+
+@always_inline
+def _u32_to_i32(raw: UInt32) -> Int32:
+    var v = Int64(raw)
+    if v >= 2147483648:
+        v -= 4294967296
+    return Int32(v)
 
 
 struct SnapshotReplicator(Movable):
@@ -253,6 +404,7 @@ struct SnapshotReplicator(Movable):
     var max_packet_bytes: Int
     var world_min: Float32
     var world_max: Float32
+    var chunk_size: Float32
     var vel_limit: Float32
 
     var entities: List[ReplicatedEntity]
@@ -278,12 +430,18 @@ struct SnapshotReplicator(Movable):
         use_3d_grid: Bool = False,
         world_bounds: Float32 = 512.0,
         vel_limit: Float32 = 120.0,
+        chunk_size: Float32 = 0.0,
     ):
         self.max_entities = max(1, max_entities)
         self.max_clients = max(1, max_clients)
         self.max_packet_bytes = max(64, min(1180, max_packet_bytes))
         self.world_min = -abs(world_bounds)
         self.world_max = abs(world_bounds)
+        self.chunk_size = (
+            max(Float32(1.0), chunk_size)
+            if chunk_size > Float32(0.0)
+            else max(Float32(64.0), abs(world_bounds))
+        )
         self.vel_limit = max(Float32(1.0), vel_limit)
 
         self.entities = List[ReplicatedEntity](capacity=self.max_entities)
@@ -398,17 +556,38 @@ struct SnapshotReplicator(Movable):
             self.clients[client_id].has_acked_seq = True
             self.clients[client_id].last_acked_seq = acked_snap_seq
 
+    def set_client_acked_input_seq(mut self, client_id: Int, input_seq: Int):
+        """Records the latest authoritative input sequence processed for `client_id`."""
+        if client_id < 0 or client_id >= self.max_clients or input_seq < 0:
+            return
+        var u_seq = UInt32(input_seq & 0xFFFFFFFF)
+        if (
+            not self.clients[client_id].has_acked_input_seq
+            or u_seq > self.clients[client_id].last_acked_input_seq
+        ):
+            self.clients[client_id].has_acked_input_seq = True
+            self.clients[client_id].last_acked_input_seq = u_seq
+
+    def notify_client_input_ack(mut self, client_id: Int, input_seq: Int):
+        self.set_client_acked_input_seq(client_id, input_seq)
+
     def prepare_tick(mut self):
-        """Quantizes current world state once (including 32-bit rotations) and rebuilds the spatial grid."""
+        """Quantizes current world state once (chunk-relative positions + 32-bit rotations) and rebuilds spatial grid."""
         for i in range(self.max_entities):
             if not self.entities[i].active:
                 self.quantized_now[i].known = False
                 continue
             var q = _QuantizedEntitySnap()
             q.known = True
-            q.qx = self._quant_pos(self.entities[i].pos.x)
-            q.qy = self._quant_pos(self.entities[i].pos.y)
-            q.qz = self._quant_pos(self.entities[i].pos.z)
+            var px = _quant_pos_axis(self.entities[i].pos.x, self.chunk_size)
+            var py = _quant_pos_axis(self.entities[i].pos.y, self.chunk_size)
+            var pz = _quant_pos_axis(self.entities[i].pos.z, self.chunk_size)
+            q.chunk_ix = px[0]
+            q.qx = px[1]
+            q.chunk_iy = py[0]
+            q.qy = py[1]
+            q.chunk_iz = pz[0]
+            q.qz = pz[1]
             q.rot = self.entities[i].rot
             q.packed_rot = pack_quat_smallest_three(self.entities[i].rot)
             q.vx = self._quant_vel(self.entities[i].vel.x)
@@ -424,7 +603,14 @@ struct SnapshotReplicator(Movable):
         if not base.known:
             return DIRTY_ALL
         var mask = DIRTY_NONE
-        if cur.qx != base.qx or cur.qy != base.qy or cur.qz != base.qz:
+        if (
+            cur.chunk_ix != base.chunk_ix
+            or cur.chunk_iy != base.chunk_iy
+            or cur.chunk_iz != base.chunk_iz
+            or cur.qx != base.qx
+            or cur.qy != base.qy
+            or cur.qz != base.qz
+        ):
             mask |= DIRTY_POS
         if (
             cur.packed_rot != base.packed_rot
@@ -535,14 +721,17 @@ struct SnapshotReplicator(Movable):
                 )
                 self.clients[client_id].baselines[new_slot].known_eids.append(eid)
 
-        # Encode header (`8` bytes + 1-bit `has_base` flag):
-        # magic u16, snap_seq u16, base_seq u16, count_placeholder u16, has_base bool
+        # Encode header (`12` bytes + 2 flag bits = 13-byte min packet):
+        # magic u16, snap_seq u16, base_seq u16, count_placeholder u16,
+        # last_acked_input_seq u32, has_base bool, has_acked_input bool
         self.writer.clear()
         self.writer.write_u16(_REPL_MAGIC)
         self.writer.write_u16(snap_seq)
         self.writer.write_u16(base_seq)
         self.writer.write_u16(0)  # patched after packing budgeted entities
+        self.writer.write_u32(self.clients[client_id].last_acked_input_seq)
         self.writer.write_bool(has_base)
+        self.writer.write_bool(self.clients[client_id].has_acked_input_seq)
 
         var packed_entities = 0
         var any_removed = False
@@ -578,9 +767,18 @@ struct SnapshotReplicator(Movable):
             self.writer.write_bits(UInt64(mask & 0x0F), 4)
 
             if (mask & DIRTY_POS) != 0:
-                var dx = cur_q.qx - base_q.qx
-                var dy = cur_q.qy - base_q.qy
-                var dz = cur_q.qz - base_q.qz
+                var dx = (
+                    (Int(cur_q.chunk_ix) - Int(base_q.chunk_ix)) * 65536
+                    + (cur_q.qx - base_q.qx)
+                )
+                var dy = (
+                    (Int(cur_q.chunk_iy) - Int(base_q.chunk_iy)) * 65536
+                    + (cur_q.qy - base_q.qy)
+                )
+                var dz = (
+                    (Int(cur_q.chunk_iz) - Int(base_q.chunk_iz)) * 65536
+                    + (cur_q.qz - base_q.qz)
+                )
                 var use_small_delta = (
                     base_q.known
                     and abs(dx) <= 127
@@ -593,6 +791,35 @@ struct SnapshotReplicator(Movable):
                     self.writer.write_int_bounded(dy, -127, 127)
                     self.writer.write_int_bounded(dz, -127, 127)
                 else:
+                    var fits_i16 = (
+                        cur_q.chunk_ix >= -32768
+                        and cur_q.chunk_ix <= 32767
+                        and cur_q.chunk_iy >= -32768
+                        and cur_q.chunk_iy <= 32767
+                        and cur_q.chunk_iz >= -32768
+                        and cur_q.chunk_iz <= 32767
+                    )
+                    self.writer.write_bool(fits_i16)
+                    if fits_i16:
+                        self.writer.write_bits(
+                            UInt64(Int(cur_q.chunk_ix) & 0xFFFF), 16
+                        )
+                        self.writer.write_bits(
+                            UInt64(Int(cur_q.chunk_iy) & 0xFFFF), 16
+                        )
+                        self.writer.write_bits(
+                            UInt64(Int(cur_q.chunk_iz) & 0xFFFF), 16
+                        )
+                    else:
+                        self.writer.write_u32(
+                            UInt32(Int(cur_q.chunk_ix) & 0xFFFFFFFF)
+                        )
+                        self.writer.write_u32(
+                            UInt32(Int(cur_q.chunk_iy) & 0xFFFFFFFF)
+                        )
+                        self.writer.write_u32(
+                            UInt32(Int(cur_q.chunk_iz) & 0xFFFFFFFF)
+                        )
                     self.writer.write_bits(UInt64(cur_q.qx), 16)
                     self.writer.write_bits(UInt64(cur_q.qy), 16)
                     self.writer.write_bits(UInt64(cur_q.qz), 16)
@@ -620,6 +847,9 @@ struct SnapshotReplicator(Movable):
             var updated_b = base_q
             updated_b.known = True
             if (mask & DIRTY_POS) != 0:
+                updated_b.chunk_ix = cur_q.chunk_ix
+                updated_b.chunk_iy = cur_q.chunk_iy
+                updated_b.chunk_iz = cur_q.chunk_iz
                 updated_b.qx = cur_q.qx
                 updated_b.qy = cur_q.qy
                 updated_b.qz = cur_q.qz
@@ -679,6 +909,7 @@ struct SnapshotClientReceiver(Movable):
     var max_entities: Int
     var world_min: Float32
     var world_max: Float32
+    var chunk_size: Float32
     var vel_limit: Float32
     var entities: List[ReplicatedEntity]
     var baselines: List[_ClientBaselineSlot]
@@ -688,6 +919,8 @@ struct SnapshotClientReceiver(Movable):
     var _removed_eids: List[Int]
     var has_decoded_seq: Bool
     var last_decoded_seq: UInt16
+    var has_acked_input_seq: Bool
+    var last_acked_input_seq: Int
     var decoded_packets: Int
 
     def __init__(
@@ -695,10 +928,16 @@ struct SnapshotClientReceiver(Movable):
         max_entities: Int = 512,
         world_bounds: Float32 = 512.0,
         vel_limit: Float32 = 120.0,
+        chunk_size: Float32 = 0.0,
     ):
         self.max_entities = max(1, max_entities)
         self.world_min = -abs(world_bounds)
         self.world_max = abs(world_bounds)
+        self.chunk_size = (
+            max(Float32(1.0), chunk_size)
+            if chunk_size > Float32(0.0)
+            else max(Float32(64.0), abs(world_bounds))
+        )
         self.vel_limit = max(Float32(1.0), vel_limit)
         self.entities = List[ReplicatedEntity](capacity=self.max_entities)
         for i in range(self.max_entities):
@@ -714,6 +953,8 @@ struct SnapshotClientReceiver(Movable):
         self._removed_eids = List[Int](capacity=64)
         self.has_decoded_seq = False
         self.last_decoded_seq = 0
+        self.has_acked_input_seq = False
+        self.last_acked_input_seq = 0
         self.decoded_packets = 0
 
     def _clear_staging_sparse(mut self):
@@ -723,7 +964,7 @@ struct SnapshotClientReceiver(Movable):
         self._staging_known_eids.clear()
 
     def apply_packet(mut self, pkt: List[UInt8]) -> Tuple[Bool, UInt16]:
-        if len(pkt) < 9:
+        if len(pkt) < 13:
             return (False, UInt16(0))
         var r = BitReader(pkt)
         var magic = r.read_u16()
@@ -732,7 +973,9 @@ struct SnapshotClientReceiver(Movable):
         var snap_seq = r.read_u16()
         var base_seq = r.read_u16()
         var count = Int(r.read_u16())
+        var pkt_acked_input_seq = Int(r.read_u32())
         var has_base = r.read_bool()
+        var pkt_has_acked_input = r.read_bool()
         if r.overflowed:
             return (False, UInt16(0))
 
@@ -776,10 +1019,22 @@ struct SnapshotClientReceiver(Movable):
             if (mask & DIRTY_POS) != 0:
                 var is_delta = r.read_bool()
                 if is_delta:
-                    q.qx += r.read_int_bounded(-127, 127)
-                    q.qy += r.read_int_bounded(-127, 127)
-                    q.qz += r.read_int_bounded(-127, 127)
+                    var dx = r.read_int_bounded(-127, 127)
+                    var dy = r.read_int_bounded(-127, 127)
+                    var dz = r.read_int_bounded(-127, 127)
+                    _apply_axis_delta(q.chunk_ix, q.qx, dx)
+                    _apply_axis_delta(q.chunk_iy, q.qy, dy)
+                    _apply_axis_delta(q.chunk_iz, q.qz, dz)
                 else:
+                    var fits_i16 = r.read_bool()
+                    if fits_i16:
+                        q.chunk_ix = _sign_extend_i16(r.read_bits(16))
+                        q.chunk_iy = _sign_extend_i16(r.read_bits(16))
+                        q.chunk_iz = _sign_extend_i16(r.read_bits(16))
+                    else:
+                        q.chunk_ix = _u32_to_i32(r.read_u32())
+                        q.chunk_iy = _u32_to_i32(r.read_u32())
+                        q.chunk_iz = _u32_to_i32(r.read_u32())
                     q.qx = Int(r.read_bits(16))
                     q.qy = Int(r.read_bits(16))
                     q.qz = Int(r.read_bits(16))
@@ -814,20 +1069,24 @@ struct SnapshotClientReceiver(Movable):
                 self.baselines[new_slot].entities[eid] = self._staging_baseline[eid]
                 self.baselines[new_slot].known_eids.append(eid)
 
+        if not has_base:
+            for eid in range(self.max_entities):
+                if not self._staging_baseline[eid].known:
+                    self.entities[eid].active = False
+
         for i in range(len(self._removed_eids)):
             var eid = self._removed_eids[i]
             self.entities[eid].active = False
 
-        var span_pos = self.world_max - self.world_min
         var span_vel = Float32(2.0) * self.vel_limit
         for i in range(len(self._decoded_eids)):
             var eid = self._decoded_eids[i]
             var q = self._staging_baseline[eid]
             self.entities[eid].active = True
             self.entities[eid].pos = Vec3(
-                self.world_min + (Float32(q.qx) / Float32(65535.0)) * span_pos,
-                self.world_min + (Float32(q.qy) / Float32(65535.0)) * span_pos,
-                self.world_min + (Float32(q.qz) / Float32(65535.0)) * span_pos,
+                _dequant_pos_axis(q.chunk_ix, q.qx, self.chunk_size),
+                _dequant_pos_axis(q.chunk_iy, q.qy, self.chunk_size),
+                _dequant_pos_axis(q.chunk_iz, q.qz, self.chunk_size),
             )
             self.entities[eid].rot = q.rot
             self.entities[eid].vel = Vec3(
@@ -839,6 +1098,12 @@ struct SnapshotClientReceiver(Movable):
 
         self.has_decoded_seq = True
         self.last_decoded_seq = snap_seq
+        if pkt_has_acked_input and (
+            not self.has_acked_input_seq
+            or pkt_acked_input_seq > self.last_acked_input_seq
+        ):
+            self.has_acked_input_seq = True
+            self.last_acked_input_seq = pkt_acked_input_seq
         self.decoded_packets += 1
         return (True, snap_seq)
 
@@ -862,6 +1127,7 @@ struct SnapshotInterpolationBuffer(Movable):
     var capacity: Int
     var interp_delay_ms: Float64
     var frames: List[_InterpFrame]
+    var slot_order: List[Int]
     var count: Int
     var write_idx: Int
 
@@ -873,18 +1139,36 @@ struct SnapshotInterpolationBuffer(Movable):
     ):
         self.max_entities = max(1, max_entities)
         self.capacity = max(2, ring_capacity)
-        self.interp_delay_ms = max(0.0, interp_delay_ms)
+        self.interp_delay_ms = (
+            max(0.0, interp_delay_ms)
+            if _rep_is_finite64(interp_delay_ms)
+            else 0.0
+        )
         self.frames = List[_InterpFrame](capacity=self.capacity)
-        for _ in range(self.capacity):
+        self.slot_order = List[Int](capacity=self.capacity)
+        for s in range(self.capacity):
             self.frames.append(_InterpFrame(self.max_entities))
+            self.slot_order.append(s)
         self.count = 0
         self.write_idx = 0
 
     def push_snapshot(
         mut self, server_time_ms: Float64, entities: List[ReplicatedEntity]
     ):
-        """Records an authoritative decoded snapshot at `server_time_ms`."""
-        var slot = self.write_idx
+        """Records an authoritative decoded snapshot at `server_time_ms` in chronological order."""
+        if not _rep_is_finite64(server_time_ms):
+            return
+
+        if self.count == self.capacity:
+            var oldest_slot = self.slot_order[0]
+            if server_time_ms < self.frames[oldest_slot].time_ms:
+                return
+            for i in range(self.count - 1):
+                self.slot_order[i] = self.slot_order[i + 1]
+            self.slot_order[self.count - 1] = oldest_slot
+            self.count -= 1
+
+        var slot = self.slot_order[self.count]
         self.frames[slot].valid = True
         self.frames[slot].time_ms = server_time_ms
         var n = min(self.max_entities, len(entities))
@@ -892,26 +1176,39 @@ struct SnapshotInterpolationBuffer(Movable):
             self.frames[slot].entities[i] = entities[i]
         for i in range(n, self.max_entities):
             self.frames[slot].entities[i].active = False
+
+        var ins = self.count
+        while (
+            ins > 0
+            and self.frames[self.slot_order[ins - 1]].time_ms > server_time_ms
+        ):
+            self.slot_order[ins] = self.slot_order[ins - 1]
+            ins -= 1
+        self.slot_order[ins] = slot
+        self.count += 1
         self.write_idx = (self.write_idx + 1) % self.capacity
-        if self.count < self.capacity:
-            self.count += 1
 
     def sample(
         self, render_time_ms: Float64, mut out_entities: List[ReplicatedEntity]
     ) -> Bool:
         """Samples interpolated entity transforms at `render_time_ms - interp_delay_ms`."""
-        if self.count == 0:
+        if (
+            self.count == 0
+            or not _rep_is_finite64(render_time_ms)
+            or not _rep_is_finite64(self.interp_delay_ms)
+        ):
             return False
+        var target_t = render_time_ms - self.interp_delay_ms
+        if not _rep_is_finite64(target_t):
+            return False
+
         if len(out_entities) < self.max_entities:
             out_entities.clear()
             for i in range(self.max_entities):
                 out_entities.append(ReplicatedEntity(i))
 
-        var target_t = render_time_ms - self.interp_delay_ms
-        var oldest_idx = (
-            (self.write_idx - self.count + self.capacity) % self.capacity
-        )
-        var newest_idx = (self.write_idx - 1 + self.capacity) % self.capacity
+        var oldest_idx = self.slot_order[0]
+        var newest_idx = self.slot_order[self.count - 1]
 
         if self.count == 1 or target_t <= self.frames[oldest_idx].time_ms:
             for i in range(self.max_entities):
@@ -927,8 +1224,8 @@ struct SnapshotInterpolationBuffer(Movable):
         var idx0 = oldest_idx
         var idx1 = oldest_idx
         for k in range(self.count - 1):
-            var a = (oldest_idx + k) % self.capacity
-            var b = (oldest_idx + k + 1) % self.capacity
+            var a = self.slot_order[k]
+            var b = self.slot_order[k + 1]
             if (
                 self.frames[a].time_ms <= target_t
                 and target_t <= self.frames[b].time_ms
@@ -939,7 +1236,7 @@ struct SnapshotInterpolationBuffer(Movable):
 
         var dt = self.frames[idx1].time_ms - self.frames[idx0].time_ms
         var alpha = Float32(0.0)
-        if dt > 1.0e-6:
+        if dt > 1.0e-6 and _rep_is_finite64(dt):
             alpha = max(
                 Float32(0.0),
                 min(Float32(1.0), Float32((target_t - self.frames[idx0].time_ms) / dt)),

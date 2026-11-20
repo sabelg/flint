@@ -18,53 +18,88 @@ from std.atomic import Atomic
 from std.collections import List
 from std.ffi import external_call
 from std.math import abs
+from std.memory import bitcast
 from std.sys import size_of
 from std.testing import assert_true, assert_equal
 
 from flint.core.anchor import (
-    ANCHOR,
     ANCHOR_BYTES,
     STACKS,
     STACK_BYTES,
     STACK_SLOTS,
+    SYS_MSYNC,
     A_REPLAY_BUFFER,
     A_REPLAY_COMMITTED,
     A_REPLAY_PENDING,
+    anchor_base,
+    anchor_ready,
+    anchor_shutdown,
     install_anchor,
     load,
+    sys,
 )
 from flint.core.cvars import ConsoleVars, CVAR_COUNT
+from flint.core.detsort import mix64
 from flint.core.detmath import (
     MXCSR_SIM,
+    f32_bits,
     f32_from_bits,
     write_mxcsr,
     set_sim_float_mode,
     sim_float_mode_ok,
     det_sin,
     det_cos,
+    det_atan,
+    det_atan2,
+    det_asin,
+    det_acos,
+    det_exp,
+    det_log,
+    det_pow,
+    scale_by_pow2,
     PI,
 )
-from flint.core.ecs import EntityHandle, ArchetypeSlots, ECB_PROV_GEN
-from flint.core.jobs import JobPool, run_jobs, run_jobs_affine
+from flint.core.ecs import EntityHandle, ArchetypeSlots, SimdColumn, ECB_PROV_GEN
+from flint.core.jobs import (
+    JobPool,
+    JOB_PRIO_HIGH,
+    JOB_PRIO_NORMAL,
+    JOB_PRIO_LOW,
+    MAX_DEPENDENTS,
+    run_jobs,
+    run_jobs_affine,
+)
 from flint.core.math import Vec3, Quat, Mat4
-from flint.core.memory import Arena, MEM_FRAME
+from flint.core.memory import (
+    Arena,
+    FrameArenas,
+    MemCharge,
+    MEM_FRAME,
+    MEM_RENDER,
+    MEM_ENTITIES,
+    memory_install,
+    memory_ready,
+    memory_shutdown,
+    memory_base,
+    mem_live,
+    mem_count,
+)
 from flint.core.profiler import ProfileTimeline, ZONE_COUNT, profile_ticks
 from flint.core.serial import BlobWriter, BlobReader, fourcc, fast_hash64
 from flint.core.session_replay import SessionRecorder, FLUSH_AT
 from flint.assets.json import JsonDocument
 from flint.platform.dynlib import dl_open, dl_close, dl_error
-from flint.platform.os import get_time, write_bytes, remove_file, file_size, env_now
+from flint.platform.os import get_time, write_bytes, remove_file, file_size, env_now, read_stream
 
 from flint.ecs import (
     CHUNK_ALIGN,
     STORAGE_TABLE,
     STORAGE_SPARSE,
-    VAULT_TOKEN_MAGIC,
     NULL_ENTITY,
     comp_hash64,
-    clear_component_clone_vault,
     Entity,
     Component,
+    ComponentBitSet,
     BitSet256,
     ParallelCommands,
     Events,
@@ -1081,8 +1116,8 @@ def test_f_live_so_plugin_hot_reload() raises:
 
 
 # ===========================================================================
-# Suite (g): v5 Review Regressions — Component Hash Remap, Heap-Owning Clone
-#            Vault, Resource Resize, Implicit ParallelCommands Order & Handles
+# Suite (g): v5 Review Regressions — Component Hash Remap, Portable Heap
+#            Snapshot/Restore, Resource Resize, Implicit ParallelCommands & Handles
 # ===========================================================================
 
 struct HeapNamedComp(Component):
@@ -1095,6 +1130,22 @@ struct HeapNamedComp(Component):
 
     def __init__(out self, *, copy: Self):
         self.label = copy.label
+
+
+def _heap_named_write(comp_addr: Int, writer_addr: Int):
+    ref comp = Pointer[HeapNamedComp, ImmutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    out.text(comp.label)
+
+
+def _heap_named_read(comp_addr: Int, reader_addr: Int) -> Bool:
+    ref reader = Pointer[BlobReader, MutAnyOrigin](unsafe_from_address=reader_addr)[unsafe_offset=0]
+    var label = reader.text()
+    if reader.failed:
+        return False
+    var dst = Pointer[HeapNamedComp, MutAnyOrigin](unsafe_from_address=comp_addr)
+    __get_address_as_uninit_lvalue(dst._mlir_value) = HeapNamedComp(label^)
+    return True
 
 
 struct TrackedHeapBag(Component):
@@ -1133,6 +1184,33 @@ struct TrackedHeapBag(Component):
             Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=3] += 1  # drops
 
 
+def _tracked_bag_write(comp_addr: Int, writer_addr: Int):
+    ref comp = Pointer[TrackedHeapBag, ImmutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    out.integer(comp.stats_addr)
+    out.text(comp.tag)
+    out.integer(len(comp.values))
+    for i in range(len(comp.values)):
+        out.integer(comp.values[i])
+
+
+def _tracked_bag_read(comp_addr: Int, reader_addr: Int) -> Bool:
+    ref reader = Pointer[BlobReader, MutAnyOrigin](unsafe_from_address=reader_addr)[unsafe_offset=0]
+    var stats_addr = reader.integer()
+    var tag = reader.text()
+    var n = reader.integer()
+    if reader.failed or n < 0 or n > 1000000:
+        return False
+    var vals = List[Int](capacity=max(1, n))
+    for _ in range(n):
+        vals.append(reader.integer())
+    if reader.failed:
+        return False
+    var dst = Pointer[TrackedHeapBag, MutAnyOrigin](unsafe_from_address=comp_addr)
+    __get_address_as_uninit_lvalue(dst._mlir_value) = TrackedHeapBag(stats_addr, tag^, vals^)
+    return True
+
+
 struct SparseHeapTag(Component):
     comptime COMPONENT_ID: UInt64 = comp_hash64("test.SparseHeapTag")
     comptime STORAGE_MODE: Int = STORAGE_SPARSE
@@ -1143,6 +1221,22 @@ struct SparseHeapTag(Component):
 
     def __init__(out self, *, copy: Self):
         self.note = copy.note
+
+
+def _sparse_heap_write(comp_addr: Int, writer_addr: Int):
+    ref comp = Pointer[SparseHeapTag, ImmutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    out.text(comp.note)
+
+
+def _sparse_heap_read(comp_addr: Int, reader_addr: Int) -> Bool:
+    ref reader = Pointer[BlobReader, MutAnyOrigin](unsafe_from_address=reader_addr)[unsafe_offset=0]
+    var note = reader.text()
+    if reader.failed:
+        return False
+    var dst = Pointer[SparseHeapTag, MutAnyOrigin](unsafe_from_address=comp_addr)
+    __get_address_as_uninit_lvalue(dst._mlir_value) = SparseHeapTag(note^)
+    return True
 
 
 struct TrackedResource(Resource):
@@ -1213,6 +1307,8 @@ def _make_heap_string(prefix: String, idx: Int) -> String:
 
 def _run_tracked_bag_scope(stats_addr: Int) raises:
     var wt = World()
+    var bag_tid = wt.register_component[TrackedHeapBag]()
+    wt.set_component_binary_hooks(bag_tid, _tracked_bag_write, _tracked_bag_read)
     var tracked_ents = List[Entity]()
     for i in range(12):
         var e = wt.spawn_empty()
@@ -1247,33 +1343,6 @@ def _run_tracked_bag_scope(stats_addr: Int) raises:
         ref b5 = wt.get_ptr[TrackedHeapBag](tracked_ents[5]).value()[unsafe_offset=0]
         assert_equal(len(b5.values), 16)
         assert_equal(b5.values[15], 515)
-
-    # Corrupt Clone Vault token magic/gen in a copy of wt_snap and verify clean Error + zero leak
-    var corrupted_bytes = wt_snap.data.copy()
-    var magic_b0 = UInt8(VAULT_TOKEN_MAGIC & 0xFF)
-    var magic_b1 = UInt8((VAULT_TOKEN_MAGIC >> 8) & 0xFF)
-    var magic_b2 = UInt8((VAULT_TOKEN_MAGIC >> 16) & 0xFF)
-    var magic_b3 = UInt8((VAULT_TOKEN_MAGIC >> 24) & 0xFF)
-    var patched_tok = False
-    for bi in range(4, len(corrupted_bytes) - 4):
-        if (
-            corrupted_bytes[bi] == magic_b0
-            and corrupted_bytes[bi + 1] == magic_b1
-            and corrupted_bytes[bi + 2] == magic_b2
-            and corrupted_bytes[bi + 3] == magic_b3
-        ):
-            # Flip generation bits in lower 32-bit word right before magic upper 32-bit word
-            corrupted_bytes[bi - 1] ^= 0x3C
-            patched_tok = True
-            break
-    assert_true(patched_tok, "Snapshot must contain 0x464C5654 Clone Vault token")
-    var bad_rd = BlobReader(corrupted_bytes^)
-    var caught_bad_tok = False
-    try:
-        wt.restore_blob(bad_rd)
-    except err:
-        caught_bad_tok = "Clone Vault token" in String(err)
-    assert_true(caught_bad_tok, "Invalid/foreign Clone Vault token must raise clean Error")
 
 
 def _run_tracked_res_scope(rl_addr: Int) raises:
@@ -1336,10 +1405,13 @@ def test_g_v5_review_regressions() raises:
     # 2. Non-trivial heap-owning String & List[Int] components across 100 snapshot/mutate/restore cycles
     var bag_stats = List[Int](length=4, fill=0)
     var stats_addr = Int(bag_stats.unsafe_ptr())
-    clear_component_clone_vault()
 
     # Pure String world: verify state_checksum() bit-identity across 100 snapshot -> mutate -> restore cycles
     var ws = World()
+    var hn_tid = ws.register_component[HeapNamedComp]()
+    ws.set_component_binary_hooks(hn_tid, _heap_named_write, _heap_named_read)
+    var sh_tid = ws.register_component[SparseHeapTag]()
+    ws.set_component_binary_hooks(sh_tid, _sparse_heap_write, _sparse_heap_read)
     var es0 = ws.spawn_empty()
     var es1 = ws.spawn_empty()
     var s0_orig = _make_heap_string("hero_alpha_non_sso_heap_payload", 0)
@@ -1369,10 +1441,9 @@ def test_g_v5_review_regressions() raises:
     # Tracked String + List[Int] world: 100 cycles of snapshot -> archetype moves/despawn -> restore + zero-leak proof
     _run_tracked_bag_scope(stats_addr)
 
-    # wt has now deinitialized; clear vault and verify EXACT 0 live instances!
-    clear_component_clone_vault()
+    # wt has now deinitialized; verify EXACT 0 live instances and >= 1200 drops!
     assert_equal(bag_stats[0], 0)
-    assert_true(bag_stats[1] >= 1200 and bag_stats[3] >= 1200)
+    assert_true(bag_stats[3] >= 1200)
     _ = len(bag_stats)
 
     # 3. Resources.insert_pod_raw & Resources.insert[R] resize safety (16 B -> 256 B -> 1024 B)
@@ -1564,10 +1635,12 @@ def test_i_audit_regressions() raises:
     var small = List[UInt8](length=1024, fill=UInt8(0x11))
     rec.write_dev(small)
     assert_equal(Int(rec.buffer.unsafe_ptr()), initial_ptr)
+    var ab = anchor_base()
     if anchor_ok:
-        assert_equal(load(ANCHOR + A_REPLAY_BUFFER), Int(rec.buffer.unsafe_ptr()))
-        assert_equal(load(ANCHOR + A_REPLAY_COMMITTED), len(rec.buffer))
-        assert_equal(load(ANCHOR + A_REPLAY_PENDING), len(rec.buffer))
+        assert_true(ab != 0 and ab != 0x5D5D00000000, "anchor_base must be dynamic non-zero address")
+        assert_equal(load(ab + A_REPLAY_BUFFER), Int(rec.buffer.unsafe_ptr()))
+        assert_equal(load(ab + A_REPLAY_COMMITTED), len(rec.buffer))
+        assert_equal(load(ab + A_REPLAY_PENDING), len(rec.buffer))
 
     # Cross FLUSH_AT via two 600 KiB chunks: must flush before extending, never reallocating buffer
     var chunk_600k = List[UInt8](length=600 * 1024, fill=UInt8(0x22))
@@ -1576,8 +1649,8 @@ def test_i_audit_regressions() raises:
     assert_equal(Int(rec.buffer.unsafe_ptr()), initial_ptr)
     assert_equal(rec.buffer.capacity(), initial_cap)
     if anchor_ok:
-        assert_equal(load(ANCHOR + A_REPLAY_BUFFER), Int(rec.buffer.unsafe_ptr()))
-        assert_equal(load(ANCHOR + A_REPLAY_COMMITTED), len(rec.buffer))
+        assert_equal(load(ab + A_REPLAY_BUFFER), Int(rec.buffer.unsafe_ptr()))
+        assert_equal(load(ab + A_REPLAY_COMMITTED), len(rec.buffer))
 
     # Oversized single dev payload (> FLUSH_AT): must write directly without reallocating buffer
     var huge = List[UInt8](length=FLUSH_AT + 4096, fill=UInt8(0x33))
@@ -1586,9 +1659,9 @@ def test_i_audit_regressions() raises:
     assert_equal(rec.buffer.capacity(), initial_cap)
     assert_equal(len(rec.buffer), 0)
     if anchor_ok:
-        assert_equal(load(ANCHOR + A_REPLAY_BUFFER), initial_ptr)
-        assert_equal(load(ANCHOR + A_REPLAY_COMMITTED), 0)
-        assert_equal(load(ANCHOR + A_REPLAY_PENDING), 0)
+        assert_equal(load(ab + A_REPLAY_BUFFER), initial_ptr)
+        assert_equal(load(ab + A_REPLAY_COMMITTED), 0)
+        assert_equal(load(ab + A_REPLAY_PENDING), 0)
 
     rec.finish()
     var expected_bytes = 16 + 1024 + 2 * (600 * 1024) + (FLUSH_AT + 4096)
@@ -1859,6 +1932,1692 @@ def test_j_wave2_powerhouse_upgrades() raises:
     assert_equal(mC.at(1, 3), Float32(4.0))
 
 
+def _assert_simd8_unary(
+    name: StaticString,
+    vals: List[Float32],
+    vec_fn: def(SIMD[DType.float32, 8]) thin -> SIMD[DType.float32, 8],
+    scalar_fn: def(Float32) thin -> Float32,
+) raises:
+    var i = 0
+    while i < len(vals):
+        var v = SIMD[DType.float32, 8](0.0)
+        for lane in range(8):
+            var idx = i + lane if i + lane < len(vals) else len(vals) - 1
+            v[lane] = vals[idx]
+        var out_v = vec_fn(v)
+        var out_bits = bitcast[DType.uint32](out_v)
+        for lane in range(8):
+            var s_bits = f32_bits(scalar_fn(v[lane]))
+            if out_bits[lane] != s_bits:
+                assert_equal(
+                    out_bits[lane],
+                    s_bits,
+                    String(name) + " bit mismatch at lane " + String(lane) + " input_bits=" + String(f32_bits(v[lane])),
+                )
+        i += 8
+
+
+def _vec_sin(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    return det_sin(x)
+
+
+def _scl_sin(x: Float32) -> Float32:
+    return det_sin(x)
+
+
+def _vec_cos(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    return det_cos(x)
+
+
+def _scl_cos(x: Float32) -> Float32:
+    return det_cos(x)
+
+
+def _vec_atan(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    return det_atan(x)
+
+
+def _scl_atan(x: Float32) -> Float32:
+    return det_atan(x)
+
+
+def _vec_asin(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    return det_asin(x)
+
+
+def _scl_asin(x: Float32) -> Float32:
+    return det_asin(x)
+
+
+def _vec_acos(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    return det_acos(x)
+
+
+def _scl_acos(x: Float32) -> Float32:
+    return det_acos(x)
+
+
+def _vec_exp(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    return det_exp(x)
+
+
+def _scl_exp(x: Float32) -> Float32:
+    return det_exp(x)
+
+
+def _vec_log(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    return det_log(x)
+
+
+def _scl_log(x: Float32) -> Float32:
+    return det_log(x)
+
+
+def test_k_detmath_simd8_bit_exact() raises:
+    set_sim_float_mode()
+    var qnan = f32_from_bits(0x7FC00000)
+    var payload_nan = f32_from_bits(0x7FC01234)
+    var neg_payload_nan = f32_from_bits(0xFFC01234)
+    var pinf = f32_from_bits(0x7F800000)
+    var ninf = f32_from_bits(0xFF800000)
+    var sub_min = f32_from_bits(0x00000001)
+    var sub_neg = f32_from_bits(0x80000001)
+    var sub_max = f32_from_bits(0x007FFFFF)
+    var min_norm = f32_from_bits(0x00800000)
+
+    var trig_vals: List[Float32] = [
+        -2.0 * PI, -1.25 * PI, -0.5 * PI, Float32(-0.0), Float32(0.0), 0.25 * PI, 0.75 * PI, PI,
+        1.25 * PI, 1.5 * PI, 1.75 * PI, 2.0 * PI, Float32(100.0), Float32(-1000.0), Float32(9.99e8), Float32(1.0e9),
+        Float32(-1.0e9), Float32(1.0e12), pinf, ninf, qnan, payload_nan, sub_min, sub_neg,
+    ]
+    _assert_simd8_unary("det_sin", trig_vals, _vec_sin, _scl_sin)
+    _assert_simd8_unary("det_cos", trig_vals, _vec_cos, _scl_cos)
+
+    var atan_vals: List[Float32] = [
+        Float32(0.0), Float32(-0.0), Float32(0.4142135623730950), Float32(0.415),
+        Float32(2.414213562373095), Float32(2.5), Float32(-100.0), pinf,
+        ninf, qnan, payload_nan, neg_payload_nan, Float32(-0.41421356), Float32(-2.41421356), Float32(1e-10), Float32(1e20),
+    ]
+    _assert_simd8_unary("det_atan", atan_vals, _vec_atan, _scl_atan)
+
+    var invtrig_vals: List[Float32] = [
+        Float32(-1.0001), Float32(-1.0), Float32(-0.75), Float32(-0.500001),
+        Float32(-0.5), Float32(-0.0), Float32(0.5), Float32(1.0),
+        Float32(1.0001), qnan, pinf, ninf, Float32(0.25), Float32(-0.25), Float32(0.999999), sub_min,
+    ]
+    _assert_simd8_unary("det_asin", invtrig_vals, _vec_asin, _scl_asin)
+    _assert_simd8_unary("det_acos", invtrig_vals, _vec_acos, _scl_acos)
+
+    var exp_vals: List[Float32] = [
+        Float32(-104.0), Float32(-103.97208), Float32(-103.9), Float32(-87.5),
+        Float32(-1.0), Float32(-0.0), Float32(0.6931472), Float32(88.722839),
+        Float32(88.723), Float32(89.0), qnan, payload_nan, pinf, ninf, Float32(10.0), sub_min,
+    ]
+    _assert_simd8_unary("det_exp", exp_vals, _vec_exp, _scl_exp)
+
+    var log_vals: List[Float32] = [
+        sub_min, f32_from_bits(0x00400000), sub_max, min_norm,
+        Float32(0.5), Float32(0.7071), Float32(0.7072), Float32(1.0),
+        Float32(2.0), Float32(100.0), Float32(0.0), Float32(-0.0),
+        Float32(-1.0), pinf, ninf, qnan,
+    ]
+    _assert_simd8_unary("det_log", log_vals, _vec_log, _scl_log)
+
+    # det_atan2(y, x) binary matrix
+    var ay: List[Float32] = [
+        Float32(1.0), Float32(1.0), Float32(-1.0), Float32(-1.0),
+        Float32(0.0), Float32(-0.0), Float32(0.0), Float32(-0.0),
+        Float32(0.0), Float32(-0.0), Float32(5.0), Float32(-5.0),
+        qnan, Float32(1.0), pinf, Float32(1.0),
+    ]
+    var ax: List[Float32] = [
+        Float32(1.0), Float32(-1.0), Float32(1.0), Float32(-1.0),
+        Float32(0.0), Float32(0.0), Float32(-0.0), Float32(-0.0),
+        Float32(-5.0), Float32(-5.0), Float32(0.0), Float32(0.0),
+        Float32(1.0), qnan, ninf, ninf,
+    ]
+    for base in range(0, len(ay), 8):
+        var vy = SIMD[DType.float32, 8](0.0)
+        var vx = SIMD[DType.float32, 8](0.0)
+        for lane in range(8):
+            vy[lane] = ay[base + lane]
+            vx[lane] = ax[base + lane]
+        var vo = det_atan2(vy, vx)
+        var vb = bitcast[DType.uint32](vo)
+        for lane in range(8):
+            assert_equal(vb[lane], f32_bits(det_atan2(vy[lane], vx[lane])))
+
+    # det_pow(x, y) binary matrix
+    var px: List[Float32] = [
+        qnan, Float32(1.0), Float32(0.0), Float32(-0.0),
+        Float32(-2.0), Float32(-2.0), Float32(-2.0), Float32(-2.0),
+        Float32(2.0), Float32(0.5), sub_min, Float32(3.0),
+        ninf, ninf, Float32(2.0), qnan,
+    ]
+    var py: List[Float32] = [
+        Float32(0.0), qnan, Float32(2.0), Float32(-2.0),
+        Float32(2.0), Float32(3.0), Float32(-3.0), Float32(0.5),
+        Float32(10.0), Float32(-4.0), Float32(0.5), Float32(0.25),
+        Float32(3.0), Float32(0.5), qnan, Float32(2.0),
+    ]
+    for base in range(0, len(px), 8):
+        var vx = SIMD[DType.float32, 8](0.0)
+        var vy = SIMD[DType.float32, 8](0.0)
+        for lane in range(8):
+            vx[lane] = px[base + lane]
+            vy[lane] = py[base + lane]
+        var vo = det_pow(vx, vy)
+        var vb = bitcast[DType.uint32](vo)
+        for lane in range(8):
+            assert_equal(vb[lane], f32_bits(det_pow(vx[lane], vy[lane])))
+
+    # Direct scale_by_pow2 multi-step parity
+    var sx = SIMD[DType.float32, 8](Float32(1.5), Float32(1.5), Float32(-0.75), sub_max, Float32(1.0), Float32(2.0), Float32(1.25), Float32(0.5))
+    var sn = SIMD[DType.int32, 8](128, -140, 260, -260, 0, 10, -10, 127)
+    var sres = scale_by_pow2(sx, sn)
+    var sbits = bitcast[DType.uint32](sres)
+    for lane in range(8):
+        assert_equal(sbits[lane], f32_bits(scale_by_pow2(sx[lane], Int(sn[lane]))))
+
+
+@fieldwise_init
+struct _StealJobCtx(Copyable, Movable):
+    var counts_ptr: Int
+    var tids_ptr: Int
+    var idx: Int
+
+
+def _test_l_steal_job(ctx_addr: Int, chunk: Int):
+    ref c = Pointer[_StealJobCtx, origin=MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    var cnt = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.counts_ptr + c.idx * 8)
+    _ = cnt[unsafe_offset=0].fetch_add(1)
+    var tid = Int64(external_call["pthread_self", UInt64]())
+    Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=c.tids_ptr + c.idx * 8)[unsafe_offset=0] = tid
+    if c.idx % 16 == 0:
+        var acc = UInt64(c.idx + chunk + 1)
+        for _ in range(3000):
+            acc = acc * UInt64(6364136223846793005) + UInt64(1)
+        if acc == UInt64(0):
+            _ = cnt[unsafe_offset=0].fetch_add(0)
+
+
+@fieldwise_init
+struct _AffineOutCtx(Copyable, Movable):
+    var out_ptr: Int
+
+
+def _test_l_affine_job(ctx_addr: Int, chunk: Int):
+    ref c = Pointer[_AffineOutCtx, origin=MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    var p = Pointer[Float32, origin=MutAnyOrigin](unsafe_from_address=c.out_ptr + chunk * 4)
+    p[unsafe_offset=0] = Float32(chunk * 3 + 7) * Float32(0.125)
+
+
+@fieldwise_init
+struct _BlockerCtx(Copyable, Movable):
+    var started_addr: Int
+    var go_addr: Int
+
+
+def _test_l_blocker_job(ctx_addr: Int, chunk: Int):
+    ref c = Pointer[_BlockerCtx, origin=MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.started_addr)[unsafe_offset=0].store(1)
+    var go_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.go_addr)
+    while go_ptr[unsafe_offset=0].load() == 0:
+        _ = external_call["sched_yield", Int32]()
+
+
+@fieldwise_init
+struct _PrioItemCtx(Copyable, Movable):
+    var prio: Int
+    var log_addr: Int
+    var log_idx_addr: Int
+    var done_addr: Int
+
+
+def _test_l_prio_job(ctx_addr: Int, chunk: Int):
+    ref c = Pointer[_PrioItemCtx, origin=MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    var idx = Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.log_idx_addr)[unsafe_offset=0].fetch_add(1))
+    Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=c.log_addr + idx * 8)[unsafe_offset=0] = Int64(c.prio)
+    _ = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.done_addr)[unsafe_offset=0].fetch_add(1)
+
+
+@fieldwise_init
+struct _DepItemCtx(Copyable, Movable):
+    var root_done_addr: Int
+    var dep_done_addr: Int
+    var dep_total_addr: Int
+    var idx: Int
+
+
+def _test_l_root_job(ctx_addr: Int, chunk: Int):
+    Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0].store(1)
+
+
+def _test_l_dep_job(ctx_addr: Int, chunk: Int):
+    ref c = Pointer[_DepItemCtx, origin=MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    if Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.root_done_addr)[unsafe_offset=0].load() == 1:
+        Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.dep_done_addr + c.idx * 8)[unsafe_offset=0].store(1)
+    _ = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.dep_total_addr)[unsafe_offset=0].fetch_add(1)
+
+
+def _raii_scope_drop_without_stop() raises:
+    var p = JobPool()
+    assert_true(p.start(4), "RAII scope pool start(4)")
+    var out = List[Float32](length=64, fill=Float32(0.0))
+    var ctx = _AffineOutCtx(Int(out.unsafe_ptr()))
+    p.run(_test_l_affine_job, Int(Pointer(to=ctx)), 64)
+    _ = ctx.out_ptr
+    assert_equal(out[63], Float32(63 * 3 + 7) * Float32(0.125))
+
+
+def _raii_scope_move_and_drop() raises:
+    var p1 = JobPool()
+    assert_true(p1.start(2), "RAII move pool start(2)")
+    var p2 = p1^
+    assert_equal(p2.workers, 2)
+    var out = List[Float32](length=32, fill=Float32(0.0))
+    var ctx = _AffineOutCtx(Int(out.unsafe_ptr()))
+    p2.run(_test_l_affine_job, Int(Pointer(to=ctx)), 32)
+    _ = ctx.out_ptr
+    assert_equal(out[31], Float32(31 * 3 + 7) * Float32(0.125))
+
+
+def test_l_jobpool_chase_lev_prio_raii() raises:
+    assert_equal(MAX_DEPENDENTS, 16)
+
+    # 1. Chase-Lev multi-worker stealing concurrency (256 asymmetric jobs on 4 workers)
+    var pool = JobPool()
+    assert_true(pool.start(4), "JobPool.start(4) must succeed")
+    var n_jobs = 256
+    var counts = List[Int64](length=n_jobs, fill=0)
+    var tids = List[Int64](length=n_jobs, fill=0)
+    var ctxs = List[_StealJobCtx](capacity=n_jobs)
+    for i in range(n_jobs):
+        ctxs.append(_StealJobCtx(Int(counts.unsafe_ptr()), Int(tids.unsafe_ptr()), i))
+    var handles = List[Int](capacity=n_jobs)
+    for i in range(n_jobs):
+        var h = pool.create(_test_l_steal_job, Int(ctxs.unsafe_ptr()) + i * size_of[_StealJobCtx](), 1)
+        handles.append(h)
+    for i in range(n_jobs):
+        pool.submit(handles[i])
+    for i in range(n_jobs):
+        pool.wait(handles[i])
+    _ = len(ctxs)
+    var distinct_tids = List[Int64]()
+    for i in range(n_jobs):
+        assert_equal(counts[i], Int64(1))
+        var t = tids[i]
+        var seen = False
+        for j in range(len(distinct_tids)):
+            if distinct_tids[j] == t:
+                seen = True
+                break
+        if not seen:
+            distinct_tids.append(t)
+    assert_true(len(distinct_tids) >= 2, "Chase-Lev must distribute work across >= 2 threads")
+
+    # 2. pool.run_affine parity (0 workers vs 4 workers) across 1, 7, 65, 513 chunks
+    var serial_pool = JobPool()
+    assert_true(serial_pool.allocate(), "serial pool allocate")
+    var chunk_counts: List[Int] = [1, 7, 65, 513]
+    for ci in range(len(chunk_counts)):
+        var n = chunk_counts[ci]
+        var out_s = List[Float32](length=n, fill=Float32(-1.0))
+        var out_p = List[Float32](length=n, fill=Float32(-1.0))
+        var cs = _AffineOutCtx(Int(out_s.unsafe_ptr()))
+        var cp = _AffineOutCtx(Int(out_p.unsafe_ptr()))
+        serial_pool.run_affine(_test_l_affine_job, Int(Pointer(to=cs)), n)
+        pool.run_affine(_test_l_affine_job, Int(Pointer(to=cp)), n)
+        _ = cs.out_ptr
+        _ = cp.out_ptr
+        for k in range(n):
+            assert_equal(f32_bits(out_p[k]), f32_bits(out_s[k]))
+    serial_pool.stop()
+    pool.stop()
+    pool.stop()  # idempotent explicit stop
+
+    # 3. 3-tier priority ordering (JOB_PRIO_HIGH -> JOB_PRIO_NORMAL -> JOB_PRIO_LOW)
+    var p1 = JobPool()
+    assert_true(p1.start(1), "1-worker pool for priority test")
+    var started = List[Int64](length=1, fill=0)
+    var go = List[Int64](length=1, fill=0)
+    var bctx = _BlockerCtx(Int(started.unsafe_ptr()), Int(go.unsafe_ptr()))
+    var gate = p1.create(_test_l_blocker_job, Int(Pointer(to=bctx)), 1)
+    p1.submit(gate, JOB_PRIO_HIGH)
+    var started_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=Int(started.unsafe_ptr()))
+    while started_ptr[unsafe_offset=0].load() == 0:
+        _ = external_call["sched_yield", Int32]()
+
+    var prio_log = List[Int64](length=24, fill=-1)
+    var log_idx = List[Int64](length=1, fill=0)
+    var done_cnt = List[Int64](length=1, fill=0)
+    var p_ctxs = List[_PrioItemCtx](capacity=24)
+    var p_handles = List[Int](capacity=24)
+    var tiers: List[Int] = [JOB_PRIO_LOW, JOB_PRIO_NORMAL, JOB_PRIO_HIGH]
+    for ti in range(3):
+        for k in range(8):
+            var idx = ti * 8 + k
+            p_ctxs.append(_PrioItemCtx(tiers[ti], Int(prio_log.unsafe_ptr()), Int(log_idx.unsafe_ptr()), Int(done_cnt.unsafe_ptr())))
+            var h = p1.create(_test_l_prio_job, Int(p_ctxs.unsafe_ptr()) + idx * size_of[_PrioItemCtx](), 1)
+            p_handles.append(h)
+            p1.submit(h, tiers[ti])
+
+    Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=Int(go.unsafe_ptr()))[unsafe_offset=0].store(1)
+    var done_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=Int(done_cnt.unsafe_ptr()))
+    while done_ptr[unsafe_offset=0].load() < 24:
+        _ = external_call["sched_yield", Int32]()
+    p1.wait(gate)
+    for i in range(24):
+        p1.wait(p_handles[i])
+    _ = bctx.go_addr
+    _ = len(started)
+    _ = len(go)
+    _ = len(p_ctxs)
+    _ = len(log_idx)
+    _ = len(done_cnt)
+    for i in range(8):
+        assert_equal(prio_log[i], Int64(JOB_PRIO_HIGH))
+    for i in range(8, 16):
+        assert_equal(prio_log[i], Int64(JOB_PRIO_NORMAL))
+    for i in range(16, 24):
+        assert_equal(prio_log[i], Int64(JOB_PRIO_LOW))
+    p1.stop()
+
+    # 4. Dynamic dependents > 16 (64 and 96 dependents across 2 waves, zero abort)
+    var pd = JobPool()
+    assert_true(pd.start(4), "dependent overflow pool start(4)")
+    var wave_sizes: List[Int] = [64, 96]
+    for wi in range(len(wave_sizes)):
+        var n_dep = wave_sizes[wi]
+        var root_done = List[Int64](length=1, fill=0)
+        var dep_done = List[Int64](length=n_dep, fill=0)
+        var dep_total = List[Int64](length=1, fill=0)
+        var d_ctxs = List[_DepItemCtx](capacity=n_dep)
+        var root = pd.create(_test_l_root_job, Int(root_done.unsafe_ptr()), 1)
+        var d_handles = List[Int](capacity=n_dep)
+        for i in range(n_dep):
+            d_ctxs.append(_DepItemCtx(Int(root_done.unsafe_ptr()), Int(dep_done.unsafe_ptr()), Int(dep_total.unsafe_ptr()), i))
+            var dh = pd.create(_test_l_dep_job, Int(d_ctxs.unsafe_ptr()) + i * size_of[_DepItemCtx](), 1)
+            pd.depend(dh, root)
+            d_handles.append(dh)
+        for i in range(n_dep):
+            pd.submit(d_handles[i])
+        pd.submit(root)
+        for i in range(n_dep):
+            pd.wait(d_handles[i])
+        pd.wait(root)
+        _ = len(d_ctxs)
+        _ = len(root_done)
+        assert_equal(dep_total[0], Int64(n_dep))
+        for i in range(n_dep):
+            assert_equal(dep_done[i], Int64(1))
+    pd.stop()
+
+    # 5. RAII __deinit__ without explicit stop + move + drop
+    _raii_scope_drop_without_stop()
+    _raii_scope_move_and_drop()
+
+
+def _raii_mem_charge_scope(base_live: Int, base_cnt: Int) raises:
+    var c1 = MemCharge(MEM_RENDER, 4096, 1)
+    c1.set(8192)
+    assert_equal(mem_live(MEM_RENDER), base_live + 8192)
+    assert_equal(mem_count(MEM_RENDER), base_cnt + 1)
+    var c2 = c1^
+    assert_equal(mem_live(MEM_RENDER), base_live + 8192)
+    assert_equal(mem_count(MEM_RENDER), base_cnt + 1)
+    c2.release()
+    assert_equal(mem_live(MEM_RENDER), base_live)
+    assert_equal(mem_count(MEM_RENDER), base_cnt)
+
+
+def _raii_arena_scope(base_live: Int, base_cnt: Int) raises:
+    var a1 = Arena(MEM_FRAME, 8192)
+    var p = a1.alloc(128, 64)
+    assert_true(a1.owns(p))
+    assert_equal(mem_live(MEM_FRAME), base_live + 8192)
+    assert_equal(mem_count(MEM_FRAME), base_cnt + 1)
+    var a2 = a1^
+    assert_true(a2.owns(p))
+    assert_equal(mem_live(MEM_FRAME), base_live + 8192)
+    assert_equal(mem_count(MEM_FRAME), base_cnt + 1)
+    a2.release()
+    assert_equal(mem_live(MEM_FRAME), base_live)
+    assert_equal(mem_count(MEM_FRAME), base_cnt)
+
+
+def _raii_frame_arenas_scope(base_live: Int, base_cnt: Int) raises:
+    var fa1 = FrameArenas(3, 4096)
+    fa1.begin(0)
+    _ = fa1.alloc(256, 64)
+    assert_equal(fa1.capacity(), 12288)
+    assert_equal(mem_live(MEM_FRAME), base_live + 12288)
+    assert_equal(mem_count(MEM_FRAME), base_cnt + 3)
+    var fa2 = fa1^
+    assert_equal(fa2.capacity(), 12288)
+    assert_equal(fa2.overflows(), 0)
+    assert_equal(mem_live(MEM_FRAME), base_live + 12288)
+    assert_equal(mem_count(MEM_FRAME), base_cnt + 3)
+    fa2.release()
+    assert_equal(mem_live(MEM_FRAME), base_live)
+    assert_equal(mem_count(MEM_FRAME), base_cnt)
+
+
+def _raii_simd_col_scope(base_live: Int, base_cnt: Int) raises:
+    var col1 = SimdColumn[DType.float32](64, MEM_ENTITIES)
+    col1.store8(0, SIMD[DType.float32, 8](1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0))
+    assert_equal(mem_live(MEM_ENTITIES), base_live + 256)
+    assert_equal(mem_count(MEM_ENTITIES), base_cnt + 1)
+    var col2 = col1^
+    assert_equal(col2.load8(0)[3], Float32(4.0))
+    assert_equal(mem_live(MEM_ENTITIES), base_live + 256)
+    assert_equal(mem_count(MEM_ENTITIES), base_cnt + 1)
+    col2.release()
+    assert_equal(mem_live(MEM_ENTITIES), base_live)
+    assert_equal(mem_count(MEM_ENTITIES), base_cnt)
+
+
+def _raii_slots_scope() raises:
+    var s1 = ArchetypeSlots(2, 32)
+    var h1 = s1.spawn()
+    var h2 = s1.spawn(deferred=True)
+    var s2 = s1^
+    assert_equal(s2.resolve(h1), 0)
+    assert_equal(s2.resolve(h2, allow_spawning=True), 1)
+    s2.commit_tick()
+    assert_equal(s2.live_count, 2)
+    assert_true(s2.despawn(h1))
+    s2.release()
+    s2.release()  # idempotent
+
+
+def _raii_implicit_drop_scope() raises:
+    var c_a = MemCharge(MEM_RENDER, 2048, 1)
+    var c_b = c_a^
+    var ar_a = Arena(MEM_FRAME, 4096)
+    var ar_b = ar_a^
+    var fa_a = FrameArenas(2, 4096)
+    var fa_b = fa_a^
+    var sc_a = SimdColumn[DType.float32](16, MEM_ENTITIES)
+    var sc_b = sc_a^
+    _ = c_b.bytes
+    _ = ar_b.capacity
+    _ = fa_b.capacity()
+    _ = sc_b.capacity
+
+
+def test_m_core_raii_and_dynamic_alloc() raises:
+    assert_true(memory_install(), "dynamic memory_install must succeed")
+    assert_true(memory_ready(), "memory_ready must be True")
+    assert_true(install_anchor(), "dynamic install_anchor must succeed")
+    assert_true(anchor_ready(), "anchor_ready must be True")
+
+    var mb = memory_base()
+    var ab = anchor_base()
+    assert_true(mb != 0 and (mb < 0x5D5B00000000 or mb > 0x5D5EFFFFFFFF), "memory_base must be dynamic outside 0x5D5B..0x5D5E")
+    assert_true(ab != 0 and (ab < 0x5D5B00000000 or ab > 0x5D5EFFFFFFFF), "anchor_base must be dynamic outside 0x5D5B..0x5D5E")
+    assert_true(sys(SYS_MSYNC, 0x5D5C00000000, 4096, 1) != 0, "legacy 0x5D5C must not be mapped")
+    assert_true(sys(SYS_MSYNC, 0x5D5D00000000, 4096, 1) != 0, "legacy 0x5D5D must not be mapped")
+
+    # Simultaneous independent instances without collision
+    var a1 = Arena(MEM_FRAME, 4096)
+    var a2 = Arena(MEM_FRAME, 4096)
+    var a3 = Arena(MEM_FRAME, 4096)
+    var p1 = a1.alloc(64, 64)
+    var p2 = a2.alloc(64, 64)
+    var p3 = a3.alloc(64, 64)
+    assert_true(a1.owns(p1) and not a2.owns(p1) and not a3.owns(p1))
+    assert_true(a2.owns(p2) and not a1.owns(p2) and not a3.owns(p2))
+    assert_true(a3.owns(p3) and not a1.owns(p3) and not a2.owns(p3))
+
+    var fa1 = FrameArenas(2, 4096)
+    var fa2 = FrameArenas(3, 4096)
+    fa1.begin(0)
+    fa2.begin(1)
+    assert_true(fa1.alloc(128, 64) != fa2.alloc(128, 64))
+    assert_equal(fa1.capacity(), 8192)
+    assert_equal(fa2.capacity(), 12288)
+    _ = fa1.alloc(8192, 64)
+    assert_equal(fa1.overflows(), 1)
+    assert_equal(fa2.overflows(), 0)
+
+    var col_a = SimdColumn[DType.float32](16, MEM_ENTITIES)
+    var col_b = SimdColumn[DType.float32](16, MEM_ENTITIES)
+    col_a.set(0, Float32(11.0))
+    col_b.set(0, Float32(22.0))
+    assert_true(col_a.base_addr() != col_b.base_addr())
+    assert_equal(col_a.get(0), Float32(11.0))
+    assert_equal(col_b.get(0), Float32(22.0))
+
+    var sl_a = ArchetypeSlots(1, 16)
+    var sl_b = ArchetypeSlots(2, 16)
+    var ha = sl_a.spawn()
+    var hb = sl_b.spawn()
+    assert_equal(sl_a.resolve(ha), 0)
+    assert_equal(sl_b.resolve(ha), -1)
+    assert_equal(sl_b.resolve(hb), 0)
+
+    # RAII move + drop accounting (zero leaks)
+    var base_render_live = mem_live(MEM_RENDER)
+    var base_render_cnt = mem_count(MEM_RENDER)
+    _raii_mem_charge_scope(base_render_live, base_render_cnt)
+    assert_equal(mem_live(MEM_RENDER), base_render_live)
+    assert_equal(mem_count(MEM_RENDER), base_render_cnt)
+
+    var base_frame_live = mem_live(MEM_FRAME)
+    var base_frame_cnt = mem_count(MEM_FRAME)
+    _raii_arena_scope(base_frame_live, base_frame_cnt)
+    assert_equal(mem_live(MEM_FRAME), base_frame_live)
+    assert_equal(mem_count(MEM_FRAME), base_frame_cnt)
+
+    _raii_frame_arenas_scope(base_frame_live, base_frame_cnt)
+    assert_equal(mem_live(MEM_FRAME), base_frame_live)
+    assert_equal(mem_count(MEM_FRAME), base_frame_cnt)
+
+    var base_ent_live = mem_live(MEM_ENTITIES)
+    var base_ent_cnt = mem_count(MEM_ENTITIES)
+    _raii_simd_col_scope(base_ent_live, base_ent_cnt)
+    assert_equal(mem_live(MEM_ENTITIES), base_ent_live)
+    assert_equal(mem_count(MEM_ENTITIES), base_ent_cnt)
+
+    _raii_slots_scope()
+
+    # Implicit __deinit__ without calling release()
+    var imp_render_live = mem_live(MEM_RENDER)
+    var imp_render_cnt = mem_count(MEM_RENDER)
+    var imp_frame_live = mem_live(MEM_FRAME)
+    var imp_frame_cnt = mem_count(MEM_FRAME)
+    var imp_ent_live = mem_live(MEM_ENTITIES)
+    var imp_ent_cnt = mem_count(MEM_ENTITIES)
+    _raii_implicit_drop_scope()
+    assert_equal(mem_live(MEM_RENDER), imp_render_live)
+    assert_equal(mem_count(MEM_RENDER), imp_render_cnt)
+    assert_equal(mem_live(MEM_FRAME), imp_frame_live)
+    assert_equal(mem_count(MEM_FRAME), imp_frame_cnt)
+    assert_equal(mem_live(MEM_ENTITIES), imp_ent_live)
+    assert_equal(mem_count(MEM_ENTITIES), imp_ent_cnt)
+
+    # Idempotent shutdown + clean re-install
+    memory_shutdown()
+    memory_shutdown()
+    assert_true(not memory_ready() and memory_base() == 0, "memory_shutdown must clear base")
+    assert_true(memory_install() and memory_ready() and memory_base() != 0, "memory_install must re-initialize cleanly")
+
+    anchor_shutdown()
+    anchor_shutdown()
+    assert_true(not anchor_ready() and anchor_base() == 0, "anchor_shutdown must clear base")
+    assert_true(install_anchor() and anchor_ready() and anchor_base() != 0, "install_anchor must re-initialize cleanly")
+
+
+# ===========================================================================
+# Suite (n): >256 Components (ComponentBitSet, World, Archetype, Schedule, Snap)
+# ===========================================================================
+
+def _n_high_writer_sys(
+    _w: Pointer[World, MutAnyOrigin],
+    _r: Pointer[Resources, MutAnyOrigin],
+    _p: Pointer[JobPool, MutAnyOrigin],
+    _c: Pointer[ParallelCommands, MutAnyOrigin],
+    ctx: Int,
+):
+    _ = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=ctx)[unsafe_offset=0].store(777)
+
+
+def _n_high_reader_sys(
+    _w: Pointer[World, MutAnyOrigin],
+    _r: Pointer[Resources, MutAnyOrigin],
+    _p: Pointer[JobPool, MutAnyOrigin],
+    _c: Pointer[ParallelCommands, MutAnyOrigin],
+    ctx: Int,
+):
+    var seen = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=ctx)[unsafe_offset=0].load()
+    _ = Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=ctx)[unsafe_offset=1].store(seen)
+
+
+def test_n_ecs_over_256_components() raises:
+    # 1. ComponentBitSet API & canonical trailing-zero trimming
+    var bs = ComponentBitSet()
+    assert_true(bs.is_empty())
+    assert_equal(bs.first_set(), -1)
+    assert_equal(bs.popcount(), 0)
+    bs.set(0)
+    bs.set(255)
+    bs.set(256)
+    bs.set(300)
+    bs.set(515)
+    bs.set(700)
+    assert_true(bs.has(0) and bs.has(255) and bs.has(256) and bs.has(300) and bs.has(515) and bs.has(700))
+    assert_true(bs.test(700) and not bs.has(701) and not bs.has(-1))
+    assert_equal(bs.popcount(), 6)
+    assert_equal(bs.first_set(), 0)
+    assert_equal(bs.trimmed_word_count(), 11)  # 700 >> 6 == 10 -> 11 words
+
+    bs.clear(700)
+    bs.clear(300)
+    assert_true(not bs.has(700) and not bs.has(300))
+    assert_equal(bs.popcount(), 4)
+
+    var canon_a = ComponentBitSet()
+    canon_a.set(300)
+    canon_a.set(650)
+    canon_a.clear(300)
+    canon_a.clear(650)
+    var canon_empty = ComponentBitSet()
+    assert_true(canon_a == canon_empty)
+    assert_true(canon_a.is_empty())
+    assert_equal(canon_a.trimmed_word_count(), 0)
+    assert_equal(canon_a.hash64(), canon_empty.hash64())
+
+    var m1 = ComponentBitSet().with_bit(260).with_bit(520)
+    var m2 = ComponentBitSet().with_bit(520).with_bit(610)
+    assert_true(m1.intersects(m2))
+    assert_true((m1 | m2).contains_all(m1))
+    assert_true((m1 | m2).contains_all(m2))
+    assert_equal((m1 & m2).first_set(), 520)
+    assert_equal((m1.without(m2)).first_set(), 260)
+    m1.clear_all()
+    assert_true(m1.is_empty())
+
+    # 2. Register 600 POD components (exceeding both 256 and old _COMP_HASH_CAP=512!) + typed >600
+    var w = World()
+    var pod_tids = List[Int](capacity=600)
+    var pod_hashes = List[UInt64](capacity=600)
+    for i in range(600):
+        var h = mix64(UInt64(0xF200000100000000) + UInt64(i + 1))
+        if h == 0:
+            h = UInt64(i + 1)
+        var mode = STORAGE_SPARSE if i >= 520 else STORAGE_TABLE
+        var tid = w.register_pod_component(h, size_of[Int32](), 4, mode)
+        assert_equal(tid, i)
+        pod_tids.append(tid)
+        pod_hashes.append(h)
+
+    var tid_pos = w.register_component[CompPos]()
+    var tid_vel = w.register_component[CompVel]()
+    var tid_burn = w.register_component[TagBurningSparse]()
+    assert_equal(tid_pos, 600)
+    assert_equal(tid_vel, 601)
+    assert_equal(tid_burn, 602)
+
+    # Verify hash table rehashing works for all 603 components
+    for i in range(600):
+        assert_equal(w.find_component_by_hash(pod_hashes[i]), i)
+    assert_equal(w.find_component_by_hash(CompPos.COMPONENT_ID), 600)
+    assert_equal(w.find_component_by_hash(TagBurningSparse.COMPONENT_ID), 602)
+
+    # 3. Archetype transitions, sparse masks & query_entities above bits 256 & 512
+    var e1 = w.spawn_empty()
+    var e2 = w.spawn_empty()
+    var e3 = w.spawn_empty()
+    var v0 = Int32(101)
+    var v255 = Int32(255)
+    var v256 = Int32(256)
+    var v320 = Int32(320)
+    var v515 = Int32(515)
+    var v550 = Int32(550)
+    assert_true(w.insert_raw_pod(e1, 0, Int(Pointer(to=v0))))
+    assert_true(w.insert_raw_pod(e1, 255, Int(Pointer(to=v255))))
+    assert_true(w.insert_raw_pod(e1, 256, Int(Pointer(to=v256))))
+    assert_true(w.insert_raw_pod(e1, 320, Int(Pointer(to=v320))))
+    assert_true(w.insert_raw_pod(e1, 515, Int(Pointer(to=v515))))
+    assert_true(w.insert_raw_pod(e1, 550, Int(Pointer(to=v550))))
+    assert_true(w.insert[CompPos](e1, CompPos(11.0, 22.0, 33.0)))
+    assert_true(w.insert[TagBurningSparse](e1, TagBurningSparse(44.5)))
+
+    assert_true(w.insert_raw_pod(e2, 320, Int(Pointer(to=v320))))
+    assert_true(w.insert_raw_pod(e2, 515, Int(Pointer(to=v515))))
+    assert_true(w.insert[CompPos](e2, CompPos(1.0, 2.0, 3.0)))
+    assert_true(w.insert[CompVel](e2, CompVel(4.0, 5.0, 6.0)))
+
+    assert_true(w.insert_raw_pod(e3, 320, Int(Pointer(to=v320))))
+    assert_true(w.insert_raw_pod(e3, 550, Int(Pointer(to=v550))))
+    assert_true(w.insert[CompPos](e3, CompPos(7.0, 8.0, 9.0)))
+
+    assert_true(w.has_by_type_id(e1, 515) and w.has_by_type_id(e1, 550))
+    assert_true(w.remove_by_type_id(e3, 550))
+    assert_true(not w.has_by_type_id(e3, 550))
+
+    var q_mask = ComponentBitSet().with_bit(320).with_bit(515).with_bit(tid_pos)
+    var q_excl = ComponentBitSet().with_bit(550)
+    var q_res = w.query_entities(q_mask, q_excl)
+    assert_equal(len(q_res), 1)
+    assert_true(q_res[0] == e2)
+
+    var q_all_320_pos = w.query_entities(ComponentBitSet().with_bit(320).with_bit(tid_pos))
+    assert_equal(len(q_all_320_pos), 3)
+
+    # 4. Schedule conflict DAG at bit >= 256 and >= 512
+    var sched = Schedule()
+    var res = Resources()
+    var cmds = ParallelCommands()
+    var pool = JobPool()
+    _ = pool.start(4)
+    var dag_buf = List[Int64](length=2, fill=0)
+    var dag_addr = Int(dag_buf.unsafe_ptr())
+    var bit_520 = ComponentBitSet().with_bit(520)
+    _ = sched.add_system(STAGE_UPDATE, "high_writer", _n_high_writer_sys, writes=bit_520, user_ctx=dag_addr)
+    _ = sched.add_system(STAGE_UPDATE, "high_reader", _n_high_reader_sys, reads=bit_520, user_ctx=dag_addr)
+    sched.run_stage(STAGE_UPDATE, w, res, pool, cmds)
+    assert_equal(_atomic_load_i64(dag_addr, 0), 777)
+    assert_equal(_atomic_load_i64(dag_addr, 1), 777)
+    _ = len(dag_buf)
+    pool.stop()
+
+    # 5. snapshot_blob -> restore_blob with permuted registration order for >600 components
+    var snap = w.snapshot_blob()
+    var w_dst = World()
+    # Register typed components first, then sparse PODs, then table PODs in reverse!
+    _ = w_dst.register_component[TagBurningSparse]()
+    _ = w_dst.register_component[CompVel]()
+    _ = w_dst.register_component[CompPos]()
+    for i in range(599, -1, -1):
+        var mode = STORAGE_SPARSE if i >= 520 else STORAGE_TABLE
+        _ = w_dst.register_pod_component(pod_hashes[i], size_of[Int32](), 4, mode)
+
+    w_dst.restore_blob(snap)
+    assert_equal(w_dst.state_checksum(), w.state_checksum())
+    assert_equal(w_dst.entity_count(), 3)
+    assert_equal(w_dst.get[CompPos](e1).x, Float32(11.0))
+    assert_equal(w_dst.get[TagBurningSparse](e1).dps, Float32(44.5))
+    var tid_515_dst = w_dst.find_component_by_hash(pod_hashes[515])
+    var p515 = w_dst.get_raw_ptr(e1, tid_515_dst)
+    assert_true(p515 != 0)
+    assert_equal(Pointer[Int32, ImmutAnyOrigin](unsafe_from_address=p515)[unsafe_offset=0], Int32(515))
+    var tid_550_dst = w_dst.find_component_by_hash(pod_hashes[550])
+    var p550 = w_dst.get_raw_ptr(e1, tid_550_dst)
+    assert_true(p550 != 0)
+    assert_equal(Pointer[Int32, ImmutAnyOrigin](unsafe_from_address=p550)[unsafe_offset=0], Int32(550))
+
+
+# ===========================================================================
+# Suite (o): Portable Snapshot/Restore & Missing Binary Hooks / Tag 2 Error
+# ===========================================================================
+
+struct NestedHeapComp(SerializableComponent):
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.NestedHeapComp")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "NestedHeapComp"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("NHCP")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var title: String
+    var tags: List[String]
+    var points: List[Vec3]
+
+    def __init__(out self, var title: String, var tags: List[String], var points: List[Vec3]):
+        self.title = title^
+        self.tags = tags^
+        self.points = points^
+
+    def __init__(out self, *, copy: Self):
+        self.title = copy.title
+        self.tags = copy.tags.copy()
+        self.points = copy.points.copy()
+
+    def write_bin(self, mut out: BlobWriter):
+        out.text(self.title)
+        out.integer(len(self.tags))
+        for i in range(len(self.tags)):
+            out.text(self.tags[i])
+        out.integer(len(self.points))
+        for i in range(len(self.points)):
+            out.vec3(self.points[i])
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        _ = version
+        var title = reader.text()
+        var n_tags = reader.integer()
+        if reader.failed or n_tags < 0 or n_tags > 10000:
+            raise Error("NestedHeapComp: invalid tags count")
+        var tags = List[String](capacity=max(1, n_tags))
+        for _ in range(n_tags):
+            tags.append(reader.text())
+        var n_pts = reader.integer()
+        if reader.failed or n_pts < 0 or n_pts > 10000:
+            raise Error("NestedHeapComp: invalid points count")
+        var points = List[Vec3](capacity=max(1, n_pts))
+        for _ in range(n_pts):
+            points.append(reader.vec3())
+        if reader.failed:
+            raise Error("NestedHeapComp: truncated payload")
+        return Self(title^, tags^, points^)
+
+    def write_json(self) -> String:
+        return "{\"title\": \"" + self.title + "\"}"
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        var t = doc.text(doc.object_get(node, "title"), "")
+        return Self(t, List[String](), List[Vec3]())
+
+
+struct UnhookedTableHeap(Component):
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.UnhookedTableHeap")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    var label: String
+
+    def __init__(out self, var label: String):
+        self.label = label^
+
+    def __init__(out self, *, copy: Self):
+        self.label = copy.label
+
+
+struct UnhookedSparseHeap(Component):
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.UnhookedSparseHeap")
+    comptime STORAGE_MODE: Int = STORAGE_SPARSE
+    var note: String
+
+    def __init__(out self, var note: String):
+        self.note = note^
+
+    def __init__(out self, *, copy: Self):
+        self.note = copy.note
+
+
+def _find_last_u64(bytes: List[UInt8], val: UInt64) -> Int:
+    var b0 = UInt8(val & 0xFF)
+    var b1 = UInt8((val >> 8) & 0xFF)
+    var b2 = UInt8((val >> 16) & 0xFF)
+    var b3 = UInt8((val >> 24) & 0xFF)
+    var b4 = UInt8((val >> 32) & 0xFF)
+    var b5 = UInt8((val >> 40) & 0xFF)
+    var b6 = UInt8((val >> 48) & 0xFF)
+    var b7 = UInt8((val >> 56) & 0xFF)
+    var found = -1
+    for i in range(len(bytes) - 7):
+        if (
+            bytes[i] == b0
+            and bytes[i + 1] == b1
+            and bytes[i + 2] == b2
+            and bytes[i + 3] == b3
+            and bytes[i + 4] == b4
+            and bytes[i + 5] == b5
+            and bytes[i + 6] == b6
+            and bytes[i + 7] == b7
+        ):
+            found = i
+    return found
+
+
+def _capture_cross_world_portable_snap(stats_addr: Int) raises -> Tuple[List[UInt8], UInt64, Entity, Entity]:
+    var reg = ComponentRegistry.with_builtins()
+    reg.register[NestedHeapComp]()
+
+    var w_src = World()
+    reg.ensure_registered_in_world(w_src)
+    var hn_tid = w_src.register_component[HeapNamedComp]()
+    w_src.set_component_binary_hooks(hn_tid, _heap_named_write, _heap_named_read)
+    var bag_tid = w_src.register_component[TrackedHeapBag]()
+    w_src.set_component_binary_hooks(bag_tid, _tracked_bag_write, _tracked_bag_read)
+    var sh_tid = w_src.register_component[SparseHeapTag]()
+    w_src.set_component_binary_hooks(sh_tid, _sparse_heap_write, _sparse_heap_read)
+
+    var e0 = w_src.spawn_empty()
+    var e1 = w_src.spawn_empty()
+    var tags = List[String]()
+    tags.append(_make_heap_string("tagA", 1))
+    tags.append(_make_heap_string("tagB", 2))
+    var pts = List[Vec3]()
+    pts.append(Vec3(1.5, -2.5, 3.5))
+    pts.append(Vec3(9.0, 8.0, 7.0))
+    _ = w_src.insert[NestedHeapComp](e0, NestedHeapComp(_make_heap_string("nested_title", 0), tags^, pts^))
+    _ = w_src.insert[HeapNamedComp](e0, HeapNamedComp(_make_heap_string("portable_hero", 10)))
+    _ = w_src.insert[SparseHeapTag](e0, SparseHeapTag(_make_heap_string("portable_sparse", 20)))
+
+    var bag_vals = List[Int]()
+    for k in range(10):
+        bag_vals.append(k * 7 + 3)
+    _ = w_src.insert[TrackedHeapBag](e1, TrackedHeapBag(stats_addr, _make_heap_string("bag1", 1), bag_vals^))
+
+    var cs = w_src.state_checksum()
+    var snap = w_src.snapshot_blob()
+    return (snap^, cs, e0, e1)
+
+
+def _restore_cross_world_portable_snap(
+    snap: List[UInt8], expected_cs: UInt64, e0: Entity, e1: Entity
+) raises:
+    var reg = ComponentRegistry.with_builtins()
+    reg.register[NestedHeapComp]()
+
+    # Independent destination world with permuted registration order (w_src is already destroyed!)
+    var w_dst = World()
+    var sh_tid = w_dst.register_component[SparseHeapTag]()
+    w_dst.set_component_binary_hooks(sh_tid, _sparse_heap_write, _sparse_heap_read)
+    var bag_tid = w_dst.register_component[TrackedHeapBag]()
+    w_dst.set_component_binary_hooks(bag_tid, _tracked_bag_write, _tracked_bag_read)
+    var hn_tid = w_dst.register_component[HeapNamedComp]()
+    w_dst.set_component_binary_hooks(hn_tid, _heap_named_write, _heap_named_read)
+    reg.ensure_registered_in_world(w_dst)
+
+    # Restore via List[UInt8] -> Span[UInt8, _] overload
+    w_dst.restore_blob(snap)
+    assert_equal(w_dst.state_checksum(), expected_cs)
+    assert_equal(w_dst.entity_count(), 2)
+    ref nh = w_dst.get_ptr[NestedHeapComp](e0).value()[unsafe_offset=0]
+    assert_equal(nh.title, _make_heap_string("nested_title", 0))
+    assert_equal(len(nh.tags), 2)
+    assert_equal(nh.tags[1], _make_heap_string("tagB", 2))
+    assert_equal(len(nh.points), 2)
+    assert_equal(nh.points[1].z, Float32(7.0))
+    assert_equal(w_dst.get_ptr[HeapNamedComp](e0).value()[unsafe_offset=0].label, _make_heap_string("portable_hero", 10))
+    assert_equal(w_dst.get_ptr[SparseHeapTag](e0).value()[unsafe_offset=0].note, _make_heap_string("portable_sparse", 20))
+    ref bag = w_dst.get_ptr[TrackedHeapBag](e1).value()[unsafe_offset=0]
+    assert_equal(len(bag.values), 10)
+    assert_equal(bag.values[9], 66)
+
+
+def test_o_portable_snapshot_and_missing_hooks_error() raises:
+    # 1. Cross-world portable snapshot -> destroy w_src -> restore into w_dst (zero leaks!)
+    var bag_stats = List[Int](length=4, fill=0)
+    var stats_addr = Int(bag_stats.unsafe_ptr())
+    var cap = _capture_cross_world_portable_snap(stats_addr)
+    assert_equal(bag_stats[0], 0)
+    _restore_cross_world_portable_snap(cap[0], cap[1], cap[2], cap[3])
+    assert_equal(bag_stats[0], 0)
+    assert_true(bag_stats[3] >= 2)
+    _ = len(bag_stats)
+
+    # 2. Explicit Error when snapshot_blob encounters unhooked non-trivial STORAGE_TABLE component
+    var w_bad_t = World()
+    var et = w_bad_t.spawn_empty()
+    _ = w_bad_t.insert[UnhookedTableHeap](et, UnhookedTableHeap(_make_heap_string("no_hooks", 1)))
+    var bw = BlobWriter()
+    bw.u32(0x12345678)
+    var caught_table = False
+    try:
+        w_bad_t.snapshot_blob(bw)
+    except:
+        caught_table = True
+    assert_true(caught_table, "snapshot_blob must raise Error for unhooked non-trivial table component")
+    assert_equal(len(bw.data), 4)
+    assert_equal(len(bw.open_at), 0)
+
+    # 3. Explicit Error when snapshot_blob encounters unhooked non-trivial STORAGE_SPARSE component
+    var w_bad_s = World()
+    var es = w_bad_s.spawn_empty()
+    _ = w_bad_s.insert[UnhookedSparseHeap](es, UnhookedSparseHeap(_make_heap_string("no_sparse_hooks", 2)))
+    var caught_sparse = False
+    try:
+        _ = w_bad_s.snapshot_blob()
+    except:
+        caught_sparse = True
+    assert_true(caught_sparse, "snapshot_blob must raise Error for unhooked non-trivial sparse component")
+
+    # 4. Explicit Error on legacy Clone Vault tag 2 in World.restore_blob (both table and sparse)
+    var w_tag = World()
+    var htid = w_tag.register_component[HeapNamedComp]()
+    w_tag.set_component_binary_hooks(htid, _heap_named_write, _heap_named_read)
+    var stid = w_tag.register_component[SparseHeapTag]()
+    w_tag.set_component_binary_hooks(stid, _sparse_heap_write, _sparse_heap_read)
+    var etag = w_tag.spawn_empty()
+    _ = w_tag.insert[HeapNamedComp](etag, HeapNamedComp(_make_heap_string("tag_probe", 5)))
+    _ = w_tag.insert[SparseHeapTag](etag, SparseHeapTag(_make_heap_string("sparse_probe", 6)))
+    var good_snap = w_tag.snapshot_blob()
+
+    # Patch table column mode_tag (byte immediately after last HeapNamedComp.COMPONENT_ID) from 1 -> 2
+    var bad_table_snap = good_snap.copy()
+    var t_off = _find_last_u64(bad_table_snap, HeapNamedComp.COMPONENT_ID)
+    assert_true(t_off >= 0 and bad_table_snap[t_off + 8] == 1)
+    bad_table_snap[t_off + 8] = 2
+    var caught_tag2_table = False
+    try:
+        w_tag.restore_blob(bad_table_snap)
+    except:
+        caught_tag2_table = True
+    assert_true(caught_tag2_table, "restore_blob must reject legacy tag 2 for table columns")
+
+    # Patch sparse mode_tag (byte after last SparseHeapTag.COMPONENT_ID + scnt(8) + 1*Entity(8)) from 1 -> 2
+    var bad_sparse_snap = good_snap.copy()
+    var s_off = _find_last_u64(bad_sparse_snap, SparseHeapTag.COMPONENT_ID)
+    assert_true(s_off >= 0 and bad_sparse_snap[s_off + 24] == 1)
+    bad_sparse_snap[s_off + 24] = 2
+    var caught_tag2_sparse = False
+    try:
+        w_tag.restore_blob(bad_sparse_snap)
+    except:
+        caught_tag2_sparse = True
+    assert_true(caught_tag2_sparse, "restore_blob must reject legacy tag 2 for sparse sets")
+
+
+# ===========================================================================
+# Suite (p): Zero Fixed 0x5D5B..0x5D5E Mappings in /proc/self/maps
+# ===========================================================================
+
+def test_p_no_fixed_ecs_mappings_in_proc_maps() raises:
+    # Exercise World, ParallelCommands + par_for_each1, and snapshot_blob / restore_blob
+    var w = World()
+    _ = w.register_component[CompPos]()
+    _ = w.register_component[CompVel]()
+    for i in range(128):
+        var e = w.spawn_empty()
+        _ = w.insert[CompPos](e, CompPos(Float32(i), 1.0, 2.0))
+    var pool = JobPool()
+    _ = pool.start(4)
+    var cmds = ParallelCommands()
+    w.par_for_each1[CompPos](pool, _implicit_order_kernel, Int(Pointer(to=cmds)))
+    w.flush_commands(cmds)
+    pool.stop()
+
+    var snap = w.snapshot_blob()
+    var w2 = World()
+    _ = w2.register_component[CompPos]()
+    _ = w2.register_component[CompVel]()
+    w2.restore_blob(snap)
+    assert_equal(w2.state_checksum(), w.state_checksum())
+
+    var raw_maps = read_stream("/proc/self/maps")
+    assert_true(len(raw_maps) > 0, "read_stream('/proc/self/maps') must return non-empty output")
+    var maps_str = String(unsafe_from_utf8=raw_maps).lower()
+    assert_true("5d5b" not in maps_str, "/proc/self/maps must not contain fixed 0x5D5B mapping")
+    assert_true("5d5c" not in maps_str, "/proc/self/maps must not contain fixed 0x5D5C mapping")
+    assert_true("5d5d" not in maps_str, "/proc/self/maps must not contain fixed 0x5D5D mapping")
+    assert_true("5d5e" not in maps_str, "/proc/self/maps must not contain fixed 0x5D5E mapping")
+    assert_true(sys(SYS_MSYNC, 0x5D5B00000000, 4096, 1) != 0, "legacy 0x5D5B must not be mapped")
+
+
+# ===========================================================================
+# Suite (q): Atomic World.restore_blob Staging, Duplicate Guards & Children DoS
+# ===========================================================================
+
+struct TrackedHeapBagB(Component):
+    """Second distinct tracked non-trivial table component for duplicate-column & UB-drop checks."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.TrackedHeapBagB")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    var stats_addr: Int
+    var tag: String
+    var values: List[Int]
+
+    def __init__(out self, stats_addr: Int, var tag: String, var values: List[Int]):
+        self.stats_addr = stats_addr
+        self.tag = tag^
+        self.values = values^
+        if stats_addr != 0:
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=stats_addr)[unsafe_offset=0] += 1
+
+    def __init__(out self, *, copy: Self):
+        self.stats_addr = copy.stats_addr
+        self.tag = copy.tag
+        self.values = copy.values.copy()
+        if self.stats_addr != 0:
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=0] += 1
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=1] += 1
+
+    def __init__(out self, *, deinit move: Self):
+        self.stats_addr = move.stats_addr
+        self.tag = move.tag^
+        self.values = move.values^
+        if self.stats_addr != 0:
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=2] += 1
+
+    def __deinit__(deinit self):
+        if self.stats_addr != 0:
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=0] -= 1
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=3] += 1
+
+
+def _tracked_bag_b_write(comp_addr: Int, writer_addr: Int):
+    ref comp = Pointer[TrackedHeapBagB, ImmutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    out.integer(comp.stats_addr)
+    out.text(comp.tag)
+    out.integer(len(comp.values))
+    for i in range(len(comp.values)):
+        out.integer(comp.values[i])
+
+
+def _tracked_bag_b_read(comp_addr: Int, reader_addr: Int) -> Bool:
+    ref reader = Pointer[BlobReader, MutAnyOrigin](unsafe_from_address=reader_addr)[unsafe_offset=0]
+    var stats_addr = reader.integer()
+    var tag = reader.text()
+    var n = reader.integer()
+    if reader.failed or n < 0 or n > 1000000:
+        return False
+    var vals = List[Int](capacity=max(1, n))
+    for _ in range(n):
+        vals.append(reader.integer())
+    if reader.failed:
+        return False
+    var dst = Pointer[TrackedHeapBagB, MutAnyOrigin](unsafe_from_address=comp_addr)
+    __get_address_as_uninit_lvalue(dst._mlir_value) = TrackedHeapBagB(stats_addr, tag^, vals^)
+    return True
+
+
+struct TrackedSparseBag(Component):
+    """Tracked non-trivial STORAGE_SPARSE component verifying zero leaks / double-frees."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.TrackedSparseBag")
+    comptime STORAGE_MODE: Int = STORAGE_SPARSE
+    var stats_addr: Int
+    var note: String
+    var nums: List[Int]
+
+    def __init__(out self, stats_addr: Int, var note: String, var nums: List[Int]):
+        self.stats_addr = stats_addr
+        self.note = note^
+        self.nums = nums^
+        if stats_addr != 0:
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=stats_addr)[unsafe_offset=0] += 1
+
+    def __init__(out self, *, copy: Self):
+        self.stats_addr = copy.stats_addr
+        self.note = copy.note
+        self.nums = copy.nums.copy()
+        if self.stats_addr != 0:
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=0] += 1
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=1] += 1
+
+    def __init__(out self, *, deinit move: Self):
+        self.stats_addr = move.stats_addr
+        self.note = move.note^
+        self.nums = move.nums^
+        if self.stats_addr != 0:
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=2] += 1
+
+    def __deinit__(deinit self):
+        if self.stats_addr != 0:
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=0] -= 1
+            Pointer[Int, MutAnyOrigin](unsafe_from_address=self.stats_addr)[unsafe_offset=3] += 1
+
+
+def _tracked_sparse_write(comp_addr: Int, writer_addr: Int):
+    ref comp = Pointer[TrackedSparseBag, ImmutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    out.integer(comp.stats_addr)
+    out.text(comp.note)
+    out.integer(len(comp.nums))
+    for i in range(len(comp.nums)):
+        out.integer(comp.nums[i])
+
+
+def _tracked_sparse_read(comp_addr: Int, reader_addr: Int) -> Bool:
+    ref reader = Pointer[BlobReader, MutAnyOrigin](unsafe_from_address=reader_addr)[unsafe_offset=0]
+    var stats_addr = reader.integer()
+    var note = reader.text()
+    var n = reader.integer()
+    if reader.failed or n < 0 or n > 1000000:
+        return False
+    var nums = List[Int](capacity=max(1, n))
+    for _ in range(n):
+        nums.append(reader.integer())
+    if reader.failed:
+        return False
+    var dst = Pointer[TrackedSparseBag, MutAnyOrigin](unsafe_from_address=comp_addr)
+    __get_address_as_uninit_lvalue(dst._mlir_value) = TrackedSparseBag(stats_addr, note^, nums^)
+    return True
+
+
+@fieldwise_init
+struct OverrunHookComp(Component, ImplicitlyCopyable):
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.OverrunHookComp")
+    comptime STORAGE_MODE: Int = STORAGE_SPARSE
+    var val: Int32
+
+
+def _overrun_hook_write(comp_addr: Int, writer_addr: Int):
+    ref comp = Pointer[OverrunHookComp, ImmutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    out.u32(UInt32(comp.val))
+
+
+def _overrun_hook_read(comp_addr: Int, reader_addr: Int) -> Bool:
+    ref reader = Pointer[BlobReader, MutAnyOrigin](unsafe_from_address=reader_addr)[unsafe_offset=0]
+    var v = Int32(reader.u32())
+    # Force an overrun past the current blob's limit while returning True so `reader.leave()` catches it
+    reader.offset = reader.limit() + 1
+    Pointer[OverrunHookComp, MutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0] = OverrunHookComp(v)
+    return True
+
+
+def _write_u64_at(mut bytes: List[UInt8], offset: Int, val: UInt64):
+    for k in range(8):
+        bytes[offset + k] = UInt8((val >> UInt64(k * 8)) & 0xFF)
+
+
+def _assert_dst_preserved(
+    w: World,
+    e0: Entity,
+    e1: Entity,
+    orig_count: Int,
+    orig_cs: UInt64,
+    expected_tag: String,
+    expected_sp_note: String,
+) raises:
+    assert_equal(w.entity_count(), orig_count)
+    assert_true(w.is_alive(e0) and w.is_alive(e1))
+    assert_equal(w.state_checksum(), orig_cs)
+    assert_equal(w.get_ptr[TrackedHeapBag](e0).value()[unsafe_offset=0].tag, expected_tag)
+    assert_equal(w.get_ptr[TrackedSparseBag](e0).value()[unsafe_offset=0].note, expected_sp_note)
+
+
+def _register_q_world_types(mut w: World):
+    var t_a = w.register_component[TrackedHeapBag]()
+    w.set_component_binary_hooks(t_a, _tracked_bag_write, _tracked_bag_read)
+    var t_b = w.register_component[TrackedHeapBagB]()
+    w.set_component_binary_hooks(t_b, _tracked_bag_b_write, _tracked_bag_b_read)
+    var t_sp = w.register_component[TrackedSparseBag]()
+    w.set_component_binary_hooks(t_sp, _tracked_sparse_write, _tracked_sparse_read)
+    var t_hn = w.register_component[HeapNamedComp]()
+    w.set_component_binary_hooks(t_hn, _heap_named_write, _heap_named_read)
+    var t_sh = w.register_component[SparseHeapTag]()
+    w.set_component_binary_hooks(t_sh, _sparse_heap_write, _sparse_heap_read)
+    var t_ov = w.register_component[OverrunHookComp]()
+    w.set_component_binary_hooks(t_ov, _overrun_hook_write, _overrun_hook_read)
+    _ = w.register_component[CompPos]()
+    _ = w.register_component[TagBurningSparse]()
+
+
+def _q_ints(a: Int) -> List[Int]:
+    var out = List[Int](capacity=1)
+    out.append(a)
+    return out^
+
+
+def _q_ints2(a: Int, b: Int) -> List[Int]:
+    var out = List[Int](capacity=2)
+    out.append(a)
+    out.append(b)
+    return out^
+
+
+def _run_q_atomicity_scope(
+    dst_stats_addr: Int,
+    src_a_stats_addr: Int,
+    src_b_stats_addr: Int,
+    src_sp_stats_addr: Int,
+) raises:
+    var w_dst = World()
+    _register_q_world_types(w_dst)
+    var e0 = w_dst.spawn_empty()
+    var e1 = w_dst.spawn_empty()
+    var expected_tag = _make_heap_string("dst_preserved_table", 1)
+    var expected_sp_note = _make_heap_string("dst_preserved_sparse", 2)
+    _ = w_dst.insert[TrackedHeapBag](e0, TrackedHeapBag(dst_stats_addr, expected_tag.copy(), _q_ints2(10, 20)))
+    _ = w_dst.insert[TrackedSparseBag](e0, TrackedSparseBag(dst_stats_addr, expected_sp_note.copy(), _q_ints2(40, 50)))
+    _ = w_dst.insert[CompPos](e0, CompPos(7.0, 8.0, 9.0))
+    _ = w_dst.insert[HeapNamedComp](e1, HeapNamedComp(_make_heap_string("dst_e1_name", 3)))
+    _ = set_parent(w_dst, e1, e0)
+
+    var orig_count = w_dst.entity_count()
+    var orig_cs = w_dst.state_checksum()
+
+    # 1. Legacy tag 2 (table & sparse) must raise and preserve w_dst with 0 staged leaks
+    var w_tag = World()
+    _register_q_world_types(w_tag)
+    var et = w_tag.spawn_empty()
+    _ = w_tag.insert[TrackedHeapBag](et, TrackedHeapBag(src_a_stats_addr, _make_heap_string("src_tag2", 1), _q_ints2(1, 2)))
+    _ = w_tag.insert[TrackedSparseBag](et, TrackedSparseBag(src_sp_stats_addr, _make_heap_string("src_sp2", 2), _q_ints2(3, 4)))
+    var tag_snap = w_tag.snapshot_blob()
+
+    var bad_t2 = tag_snap.copy()
+    var t2_off = _find_last_u64(bad_t2, TrackedHeapBag.COMPONENT_ID)
+    assert_true(t2_off >= 0 and bad_t2[t2_off + 8] == 1)
+    bad_t2[t2_off + 8] = 2
+    var caught = False
+    try:
+        w_dst.restore_blob(bad_t2)
+    except:
+        caught = True
+    assert_true(caught, "restore_blob must reject table tag 2")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+
+    var bad_s2 = tag_snap.copy()
+    var s2_off = _find_last_u64(bad_s2, TrackedSparseBag.COMPONENT_ID)
+    assert_true(s2_off >= 0 and bad_s2[s2_off + 24] == 1)
+    bad_s2[s2_off + 24] = 2
+    caught = False
+    try:
+        w_dst.restore_blob(bad_s2)
+    except:
+        caught = True
+    assert_true(caught, "restore_blob must reject sparse tag 2")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+    assert_equal(Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_a_stats_addr)[unsafe_offset=0], 1)
+    assert_equal(Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_sp_stats_addr)[unsafe_offset=0], 1)
+
+    # 2. Corrupted wc = 0xFFFFFFFF and num_archs = 0x7FFFFFFF must raise and preserve w_dst
+    for mode in range(2):
+        var bw = BlobWriter()
+        bw.begin(fourcc("ECS2"), 3)
+        bw.u32(1)
+        bw.integer(1)
+        bw.integer(1)
+        bw.integer(0)
+        bw.integer(1)
+        bw.u64(CompPos.COMPONENT_ID)
+        bw.integer(STORAGE_TABLE)
+        bw.integer(size_of[CompPos]())
+        bw.boolean(True)
+        bw.u32(1)
+        bw.boolean(True)
+        if mode == 0:
+            bw.integer(0x7FFFFFFF)  # num_archs = 0x7FFFFFFF
+        else:
+            bw.integer(1)  # num_archs = 1
+            bw.u32(UInt32(0xFFFFFFFF))  # wc = 0xFFFFFFFF
+        bw.end()
+        caught = False
+        try:
+            w_dst.restore_blob(bw.data)
+        except:
+            caught = True
+        assert_true(caught, "restore_blob must reject huge num_archs / wc without mutating w_dst")
+        _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+
+    # 3a. Mid-stream table read_custom_bin failure (entity 0 succeeds, entity 1 fails -> 0 staged leaks)
+    var w_mid_t = World()
+    _register_q_world_types(w_mid_t)
+    var mt0 = w_mid_t.spawn_empty()
+    var mt1 = w_mid_t.spawn_empty()
+    _ = w_mid_t.insert[TrackedHeapBag](mt0, TrackedHeapBag(src_a_stats_addr, _make_heap_string("mid_t0", 1), _q_ints(11)))
+    _ = w_mid_t.insert[TrackedHeapBag](mt1, TrackedHeapBag(src_a_stats_addr, _make_heap_string("mid_t1", 2), _q_ints(22)))
+    var mid_t_snap = w_mid_t.snapshot_blob()
+    # Second TrackedHeapBag payload has len(values) = 1 right before the single Int(22) at the end of the column
+    var mt_col_off = _find_last_u64(mid_t_snap, TrackedHeapBag.COMPONENT_ID)
+    assert_true(mt_col_off >= 0 and mid_t_snap[mt_col_off + 8] == 1)
+    # Locate the second occurrence of UInt64(1) followed by UInt64(22)
+    var val22_off = _find_last_u64(mid_t_snap, UInt64(22))
+    assert_true(val22_off >= 8)
+    _write_u64_at(mid_t_snap, val22_off - 8, UInt64(0xFFFFFFFFFFFFFFFF))  # n = -1 -> _tracked_bag_read returns False
+    caught = False
+    try:
+        w_dst.restore_blob(mid_t_snap)
+    except:
+        caught = True
+    assert_true(caught, "restore_blob must raise on mid-stream table read_custom_bin failure")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+    assert_equal(Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_a_stats_addr)[unsafe_offset=0], 3)
+
+    # 3b. Mid-stream sparse read_custom_bin failure (entity 0 succeeds, entity 1 fails -> 0 staged leaks)
+    var w_mid_s = World()
+    _register_q_world_types(w_mid_s)
+    var ms0 = w_mid_s.spawn_empty()
+    var ms1 = w_mid_s.spawn_empty()
+    _ = w_mid_s.insert[TrackedSparseBag](ms0, TrackedSparseBag(src_sp_stats_addr, _make_heap_string("mid_s0", 1), _q_ints(33)))
+    _ = w_mid_s.insert[TrackedSparseBag](ms1, TrackedSparseBag(src_sp_stats_addr, _make_heap_string("mid_s1", 2), _q_ints(44)))
+    var mid_s_snap = w_mid_s.snapshot_blob()
+    var val44_off = _find_last_u64(mid_s_snap, UInt64(44))
+    assert_true(val44_off >= 8)
+    _write_u64_at(mid_s_snap, val44_off - 8, UInt64(0xFFFFFFFFFFFFFFFF))
+    caught = False
+    try:
+        w_dst.restore_blob(mid_s_snap)
+    except:
+        caught = True
+    assert_true(caught, "restore_blob must raise on mid-stream sparse read_custom_bin failure")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+    assert_equal(Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_sp_stats_addr)[unsafe_offset=0], 3)
+
+    # 4. reader.leave() overrun failure must drop staged state (0 leaks) and preserve w_dst
+    var w_ov = World()
+    _register_q_world_types(w_ov)
+    var eov = w_ov.spawn_empty()
+    _ = w_ov.insert[TrackedHeapBag](eov, TrackedHeapBag(src_a_stats_addr, _make_heap_string("overrun_staged", 9), _q_ints2(7, 8)))
+    _ = w_ov.insert[OverrunHookComp](eov, OverrunHookComp(123))
+    var ov_snap = w_ov.snapshot_blob()
+    caught = False
+    var ov_err = String("")
+    try:
+        w_dst.restore_blob(ov_snap)
+    except err:
+        caught = True
+        ov_err = String(err)
+    assert_true(caught and ("overran" in ov_err), "restore_blob must propagate reader.leave() overrun error")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+    assert_equal(Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_a_stats_addr)[unsafe_offset=0], 4)
+
+    # 5. Duplicate table column hash: must reject cleanly, drop column 1 (0 leaks), NEVER drop uninit column 2, preserve w_dst
+    var w_dup_col = World()
+    _register_q_world_types(w_dup_col)
+    var edc = w_dup_col.spawn_empty()
+    _ = w_dup_col.insert[TrackedHeapBag](edc, TrackedHeapBag(src_a_stats_addr, _make_heap_string("dup_col_a", 1), _q_ints(55)))
+    _ = w_dup_col.insert[TrackedHeapBagB](edc, TrackedHeapBagB(src_b_stats_addr, _make_heap_string("dup_col_b", 2), _q_ints(66)))
+    var drops_b_before = Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_b_stats_addr)[unsafe_offset=3]
+    var dup_col_snap = w_dup_col.snapshot_blob()
+    var col_b_off = _find_last_u64(dup_col_snap, TrackedHeapBagB.COMPONENT_ID)
+    assert_true(col_b_off >= 0)
+    _write_u64_at(dup_col_snap, col_b_off, TrackedHeapBag.COMPONENT_ID)
+    caught = False
+    var dup_col_err = String("")
+    try:
+        w_dst.restore_blob(dup_col_snap)
+    except err:
+        caught = True
+        dup_col_err = String(err)
+    assert_true(caught and ("duplicate component column" in dup_col_err), "restore_blob must reject duplicate table column hash")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+    assert_equal(Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_a_stats_addr)[unsafe_offset=0], 5)
+    assert_equal(Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_b_stats_addr)[unsafe_offset=3], drops_b_before)
+
+    # 6. Duplicate sparse component hash: must reject cleanly (0 leaks, 0 double-frees) and preserve w_dst
+    var w_dup_sp = World()
+    _register_q_world_types(w_dup_sp)
+    var edsp = w_dup_sp.spawn_empty()
+    _ = w_dup_sp.insert[TrackedSparseBag](edsp, TrackedSparseBag(src_sp_stats_addr, _make_heap_string("dup_sp", 1), _q_ints(77)))
+    _ = w_dup_sp.insert[SparseHeapTag](edsp, SparseHeapTag(_make_heap_string("dup_sp_tag", 2)))
+    var dup_sp_snap = w_dup_sp.snapshot_blob()
+    var sp_tag_off = _find_last_u64(dup_sp_snap, SparseHeapTag.COMPONENT_ID)
+    assert_true(sp_tag_off >= 0)
+    _write_u64_at(dup_sp_snap, sp_tag_off, TrackedSparseBag.COMPONENT_ID)
+    caught = False
+    var dup_sp_err = String("")
+    try:
+        w_dst.restore_blob(dup_sp_snap)
+    except err:
+        caught = True
+        dup_sp_err = String(err)
+    assert_true(caught and ("duplicate sparse component" in dup_sp_err), "restore_blob must reject duplicate sparse component hash")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+    assert_equal(Pointer[Int, ImmutAnyOrigin](unsafe_from_address=src_sp_stats_addr)[unsafe_offset=0], 4)
+
+    # 7. STORAGE_SPARSE bit in archetype table_mask: must reject and preserve w_dst
+    var bw_sp_mask = BlobWriter()
+    bw_sp_mask.begin(fourcc("ECS2"), 3)
+    bw_sp_mask.u32(1)
+    bw_sp_mask.integer(1)
+    bw_sp_mask.integer(1)
+    bw_sp_mask.integer(0)
+    bw_sp_mask.integer(2)
+    bw_sp_mask.u64(CompPos.COMPONENT_ID)
+    bw_sp_mask.integer(STORAGE_TABLE)
+    bw_sp_mask.integer(size_of[CompPos]())
+    bw_sp_mask.boolean(True)
+    bw_sp_mask.u64(TagBurningSparse.COMPONENT_ID)
+    bw_sp_mask.integer(STORAGE_SPARSE)
+    bw_sp_mask.integer(size_of[TagBurningSparse]())
+    bw_sp_mask.boolean(True)
+    bw_sp_mask.u32(1)
+    bw_sp_mask.boolean(True)
+    bw_sp_mask.integer(1)  # num_archs
+    bw_sp_mask.u32(1)  # wc = 1
+    bw_sp_mask.u64(UInt64(3))  # bit 0 (CompPos) | bit 1 (TagBurningSparse, STORAGE_SPARSE!)
+    bw_sp_mask.integer(0)
+    bw_sp_mask.integer(0)
+    bw_sp_mask.end()
+    caught = False
+    var sp_mask_err = String("")
+    try:
+        w_dst.restore_blob(bw_sp_mask.data)
+    except err:
+        caught = True
+        sp_mask_err = String(err)
+    assert_true(caught and ("non-table component in archetype table_mask" in sp_mask_err), "restore_blob must reject STORAGE_SPARSE bit in table_mask")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+
+    # 8. Children binary payload n = 0x7FFFFFFFFFFFFFFF must return immediately with Error (no CPU hang!)
+    var w_ch = World()
+    _register_q_world_types(w_ch)
+    var cp = w_ch.spawn_empty()
+    var cc1 = w_ch.spawn_empty()
+    var cc2 = w_ch.spawn_empty()
+    _ = set_parent(w_ch, cc1, cp)
+    _ = set_parent(w_ch, cc2, cp)
+    var ch_snap = w_ch.snapshot_blob()
+    var ch_off = _find_last_u64(ch_snap, Children.COMPONENT_ID)
+    assert_true(ch_off >= 0 and ch_snap[ch_off + 8] == 1)
+    _write_u64_at(ch_snap, ch_off + 9, UInt64(0x7FFFFFFFFFFFFFFF))
+    var t_ch0 = get_time()
+    caught = False
+    try:
+        w_dst.restore_blob(ch_snap)
+    except:
+        caught = True
+    var t_ch_dt = get_time() - t_ch0
+    assert_true(caught, "Children n = 0x7FFFFFFFFFFFFFFF must fail cleanly")
+    assert_true(t_ch_dt < 0.5, "Children n = 0x7FFFFFFFFFFFFFFF must fail immediately without CPU hang")
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+
+    # 9. Duplicate index in free_indices ([0, 0] for dead slot 0) must raise Error and preserve w_dst
+    var bw_dup_free = BlobWriter()
+    bw_dup_free.begin(fourcc("ECS2"), 3)
+    bw_dup_free.u32(1)  # saved_tick
+    bw_dup_free.integer(1)  # saved_live
+    bw_dup_free.integer(2)  # ent_len
+    bw_dup_free.integer(2)  # free_len = 2 (duplicate [0, 0]!)
+    bw_dup_free.integer(1)  # saved_comp_count
+    bw_dup_free.u64(CompPos.COMPONENT_ID)
+    bw_dup_free.integer(STORAGE_TABLE)
+    bw_dup_free.integer(size_of[CompPos]())
+    bw_dup_free.boolean(True)
+    bw_dup_free.u32(2)  # slot 0: gen=2, alive=False
+    bw_dup_free.boolean(False)
+    bw_dup_free.u32(1)  # slot 1: gen=1, alive=True
+    bw_dup_free.boolean(True)
+    bw_dup_free.u32(0)  # free_indices[0] = 0
+    bw_dup_free.u32(0)  # free_indices[1] = 0 (duplicate!)
+    bw_dup_free.integer(1)  # num_archs = 1
+    bw_dup_free.u32(1)  # wc = 1
+    bw_dup_free.u64(UInt64(1))  # bit 0 = CompPos
+    bw_dup_free.integer(1)  # num_chunks = 1
+    bw_dup_free.integer(1)  # cnt = 1
+    var df_ent = Entity(1, 1)
+    bw_dup_free.write_bytes_raw(Int(Pointer(to=df_ent)), size_of[Entity]())
+    bw_dup_free.integer(1)  # saved_cols = 1
+    bw_dup_free.u64(CompPos.COMPONENT_ID)
+    bw_dup_free.u8(0)  # POD mode_tag = 0
+    var df_pos = CompPos(1.0, 2.0, 3.0)
+    bw_dup_free.write_bytes_raw(Int(Pointer(to=df_pos)), size_of[CompPos]())
+    bw_dup_free.integer(0)  # num_sparse = 0
+    bw_dup_free.end()
+    caught = False
+    var dup_free_err = String("")
+    try:
+        w_dst.restore_blob(bw_dup_free.data)
+    except err:
+        caught = True
+        dup_free_err = String(err)
+    assert_true(
+        caught and ("duplicate" in dup_free_err),
+        "restore_blob must reject duplicate free_indices=[0, 0]",
+    )
+    _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+
+    # 10. Invalid or provisional entity generations (gen==0 live, gen==0 free, gen==0x80000001 free)
+    #     must raise Error and preserve w_dst without leaks
+    for gen_case in range(3):
+        var bw_gen = BlobWriter()
+        bw_gen.begin(fourcc("ECS2"), 3)
+        bw_gen.u32(1)  # saved_tick
+        if gen_case == 0:
+            bw_gen.integer(2)  # saved_live
+            bw_gen.integer(2)  # ent_len
+            bw_gen.integer(0)  # free_len
+        else:
+            bw_gen.integer(1)  # saved_live
+            bw_gen.integer(2)  # ent_len
+            bw_gen.integer(1)  # free_len
+        bw_gen.integer(1)  # saved_comp_count
+        bw_gen.u64(CompPos.COMPONENT_ID)
+        bw_gen.integer(STORAGE_TABLE)
+        bw_gen.integer(size_of[CompPos]())
+        bw_gen.boolean(True)
+        if gen_case == 0:
+            # (a) live slot 1 with gen == 0 referenced by chunk
+            bw_gen.u32(1)  # slot 0: gen=1, alive=True
+            bw_gen.boolean(True)
+            bw_gen.u32(0)  # slot 1: gen=0, alive=True (invalid!)
+            bw_gen.boolean(True)
+        elif gen_case == 1:
+            # (b) dead slot 0 with gen == 0 in free_indices
+            bw_gen.u32(0)  # slot 0: gen=0, alive=False (invalid!)
+            bw_gen.boolean(False)
+            bw_gen.u32(1)  # slot 1: gen=1, alive=True
+            bw_gen.boolean(True)
+            bw_gen.u32(0)  # free_indices = [0]
+        else:
+            # (c) dead slot 0 with gen == 0x80000001 (PROVISIONAL_GEN_BIT) in free_indices
+            bw_gen.u32(UInt32(0x80000001))  # slot 0: provisional bit set, alive=False (invalid!)
+            bw_gen.boolean(False)
+            bw_gen.u32(1)  # slot 1: gen=1, alive=True
+            bw_gen.boolean(True)
+            bw_gen.u32(0)  # free_indices = [0]
+        bw_gen.integer(1)  # num_archs = 1
+        bw_gen.u32(1)  # wc = 1
+        bw_gen.u64(UInt64(1))  # bit 0 = CompPos
+        bw_gen.integer(1)  # num_chunks = 1
+        if gen_case == 0:
+            bw_gen.integer(2)  # cnt = 2
+            var ge0 = Entity(0, 1)
+            var ge1 = Entity(1, 0)
+            bw_gen.write_bytes_raw(Int(Pointer(to=ge0)), size_of[Entity]())
+            bw_gen.write_bytes_raw(Int(Pointer(to=ge1)), size_of[Entity]())
+            bw_gen.integer(1)  # saved_cols = 1
+            bw_gen.u64(CompPos.COMPONENT_ID)
+            bw_gen.u8(0)  # POD mode_tag = 0
+            var gp0 = CompPos(1.0, 2.0, 3.0)
+            var gp1 = CompPos(4.0, 5.0, 6.0)
+            bw_gen.write_bytes_raw(Int(Pointer(to=gp0)), size_of[CompPos]())
+            bw_gen.write_bytes_raw(Int(Pointer(to=gp1)), size_of[CompPos]())
+        else:
+            bw_gen.integer(1)  # cnt = 1
+            var ge1 = Entity(1, 1)
+            bw_gen.write_bytes_raw(Int(Pointer(to=ge1)), size_of[Entity]())
+            bw_gen.integer(1)  # saved_cols = 1
+            bw_gen.u64(CompPos.COMPONENT_ID)
+            bw_gen.u8(0)  # POD mode_tag = 0
+            var gp1 = CompPos(1.0, 2.0, 3.0)
+            bw_gen.write_bytes_raw(Int(Pointer(to=gp1)), size_of[CompPos]())
+        bw_gen.integer(0)  # num_sparse = 0
+        bw_gen.end()
+        caught = False
+        var gen_err = String("")
+        try:
+            w_dst.restore_blob(bw_gen.data)
+        except err:
+            caught = True
+            gen_err = String(err)
+        assert_true(
+            caught and ("invalid or provisional entity generation" in gen_err),
+            "restore_blob must reject invalid/provisional entity generation case " + String(gen_case),
+        )
+        _assert_dst_preserved(w_dst, e0, e1, orig_count, orig_cs, expected_tag, expected_sp_note)
+
+
+def test_q_restore_blob_atomicity_and_hostile_fuzz_regressions() raises:
+    var dst_stats = List[Int](length=4, fill=0)
+    var src_a_stats = List[Int](length=4, fill=0)
+    var src_b_stats = List[Int](length=4, fill=0)
+    var src_sp_stats = List[Int](length=4, fill=0)
+
+    _run_q_atomicity_scope(
+        Int(dst_stats.unsafe_ptr()),
+        Int(src_a_stats.unsafe_ptr()),
+        Int(src_b_stats.unsafe_ptr()),
+        Int(src_sp_stats.unsafe_ptr()),
+    )
+
+    assert_equal(dst_stats[0], 0)
+    assert_equal(src_a_stats[0], 0)
+    assert_equal(src_b_stats[0], 0)
+    assert_equal(src_b_stats[3], 1)  # Only w_dup_col's edc instance was dropped; never uninit column!
+    assert_equal(src_sp_stats[0], 0)
+    _ = len(dst_stats)
+    _ = len(src_a_stats)
+    _ = len(src_b_stats)
+    _ = len(src_sp_stats)
+
+
 def main() raises:
     var t0 = get_time()
     print("[Flint v5 Track 1] Running Core, Hybrid ECS v2, Scene/Prefab & Hot-Reload Suite...")
@@ -1882,7 +3641,7 @@ def main() raises:
     print("  [PASS] (f) Live .so gameplay plugin hot-reload (v1 -> v2 state-preserving swap + dl_close)")
 
     test_g_v5_review_regressions()
-    print("  [PASS] (g) v5 Review Regressions (hash remap, heap Clone Vault 100x, resource resize, implicit cmds, handles)")
+    print("  [PASS] (g) v5 Review Regressions (hash remap, portable heap 100x, resource resize, implicit cmds, handles)")
 
     test_h_restore_blob_rejects_hostile_counts()
     print("  [PASS] (h) restore_blob rejects corrupted counts and entity tables without allocating")
@@ -1893,5 +3652,26 @@ def main() raises:
     test_j_wave2_powerhouse_upgrades()
     print("  [PASS] (j) Wave 2 upgrades (par_for_each3/read_only/Changed, chunk reclaim, dirty transforms, dynamic CVars/zones)")
 
+    test_k_detmath_simd8_bit_exact()
+    print("  [PASS] (k) detmath SIMD[F32, 8] bit-exact overloads (trig, inv-trig, exp, log, pow, scale_by_pow2)")
+
+    test_l_jobpool_chase_lev_prio_raii()
+    print("  [PASS] (l) JobPool Chase-Lev stealing, 3-tier priority, >64 dependents, run_affine & RAII lifecycle")
+
+    test_m_core_raii_and_dynamic_alloc()
+    print("  [PASS] (m) Core RAII (MemCharge/Arena/FrameArenas/SimdColumn/ArchetypeSlots) & dynamic memory/anchor")
+
+    test_n_ecs_over_256_components()
+    print("  [PASS] (n) ECS >256 & >512 components (ComponentBitSet, Archetype, Schedule DAG, permuted snapshot)")
+
+    test_o_portable_snapshot_and_missing_hooks_error()
+    print("  [PASS] (o) Portable snapshot/restore across Worlds & explicit Error on missing hooks / tag 2")
+
+    test_p_no_fixed_ecs_mappings_in_proc_maps()
+    print("  [PASS] (p) Zero fixed 0x5D5B..0x5D5E mappings in /proc/self/maps after ECS/JobPool/snapshot exercise")
+
+    test_q_restore_blob_atomicity_and_hostile_fuzz_regressions()
+    print("  [PASS] (q) Atomic restore_blob staging, duplicate col/sparse guards, mask mode & Children bounds check")
+
     var elapsed = get_time() - t0
-    print("[Flint v5 Track 1] ALL 10 SUITES PASSED in " + String(elapsed) + " s")
+    print("[Flint v5 Track 1] ALL 17 SUITES PASSED in " + String(elapsed) + " s")

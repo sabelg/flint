@@ -19,7 +19,7 @@ from std.ffi import external_call
 from std.sys.info import size_of
 from flint.core.offset_allocator import OffsetAllocator, OffsetAllocation, OA_UNUSED
 from flint.platform.dynlib import dl_open, dl_sym, dl_close
-from flint.platform.amdgpu import GpuBuffer
+from flint.platform.amdgpu import GpuBuffer, ReleaseVkBufferFn, _GpuBufferControl, _buf_ctrl_ptr
 from flint.platform.os import env_flag, env_value, read_bytes, write_bytes
 
 comptime Call1 = def(Int) thin abi("C") -> Int32
@@ -70,6 +70,7 @@ comptime TYPE_COMMAND_POOL_CREATE_INFO: UInt32 = 39
 comptime TYPE_COMMAND_BUFFER_ALLOCATE_INFO: UInt32 = 40
 comptime TYPE_COMMAND_BUFFER_BEGIN_INFO: UInt32 = 42
 comptime TYPE_MEMORY_BARRIER: UInt32 = 46
+comptime TYPE_BUFFER_MEMORY_BARRIER: UInt32 = 44
 comptime TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO: UInt32 = 1000128004
 comptime TYPE_TIMELINE_SEMAPHORE_FEATURES: UInt32 = 1000207000
 comptime TYPE_SEMAPHORE_TYPE_CREATE_INFO: UInt32 = 1000207002
@@ -126,6 +127,8 @@ comptime MAX_REPORTED_MESSAGES: Int = 12
 
 comptime TYPE_XCB_SURFACE_CREATE_INFO: UInt32 = 1000005000
 comptime TYPE_WAYLAND_SURFACE_CREATE_INFO: UInt32 = 1000006000
+comptime TYPE_WIN32_SURFACE_CREATE_INFO: UInt32 = 1000009000
+comptime TYPE_METAL_SURFACE_CREATE_INFO: UInt32 = 1000217000
 comptime TYPE_DISPLAY_SURFACE_CREATE_INFO: UInt32 = 1000002001
 comptime DISPLAY_ALPHA_OPAQUE: UInt32 = 1
 comptime DISPLAY_ALPHA_GLOBAL: UInt32 = 2
@@ -188,8 +191,15 @@ comptime TYPE_PIPELINE_RENDERING_CREATE_INFO: UInt32 = 1000044002
 comptime TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO: UInt32 = 1000161000
 comptime TYPE_BUFFER_DEVICE_ADDRESS_INFO: UInt32 = 1000244001
 comptime TYPE_MEMORY_BARRIER_2: UInt32 = 1000314000
+comptime TYPE_BUFFER_MEMORY_BARRIER_2: UInt32 = 1000314001
 comptime TYPE_IMAGE_MEMORY_BARRIER_2: UInt32 = 1000314002
 comptime TYPE_DEPENDENCY_INFO: UInt32 = 1000314003
+comptime FORMAT_FEATURE_STORAGE_IMAGE_BIT: UInt32 = 0x2
+comptime FORMAT_FEATURE_COLOR_ATTACHMENT_BIT: UInt32 = 0x80
+comptime FORMAT_FEATURE_BLIT_DST_BIT: UInt32 = 0x800
+comptime PIPELINE_ALL_COMMANDS: Int = 0x10000
+comptime ACCESS_MEMORY_READ: UInt32 = 0x8000
+comptime ACCESS_MEMORY_WRITE: UInt32 = 0x10000
 
 comptime TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR: UInt32 = 1000150000
 comptime TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR: UInt32 = 1000150002
@@ -312,6 +322,18 @@ def put_float(address: Int, value: Float32):
     Pointer[Float32, origin=MutAnyOrigin](unsafe_from_address=address)[unsafe_offset=0] = value
 
 
+@fieldwise_init
+struct VkMemReq(Copyable, ImplicitlyCopyable, Movable):
+    var size: Int
+    var alignment: Int
+    var memory_type_bits: UInt32
+
+    def __init__(out self):
+        self.size = 0
+        self.alignment = 0
+        self.memory_type_bits = 0
+
+
 struct VulkanMemBlock(Movable):
     """64 MiB `VkDeviceMemory` slab sub-allocated via `OffsetAllocator` (4 KiB units)."""
     var memory: Int
@@ -321,6 +343,9 @@ struct VulkanMemBlock(Movable):
     var bda: Bool
     var allocator: OffsetAllocator
     var live_allocs: Int
+    var device: Int
+    var fn_free_memory: Int
+    var ctrl_ptr: Int
 
     def __init__(
         out self,
@@ -329,6 +354,9 @@ struct VulkanMemBlock(Movable):
         size_bytes: Int,
         mapped_ptr: Int,
         bda: Bool,
+        device: Int = 0,
+        fn_free_memory: Int = 0,
+        ctrl_ptr: Int = 0,
     ):
         self.memory = memory
         self.memory_type_index = memory_type_index
@@ -337,6 +365,34 @@ struct VulkanMemBlock(Movable):
         self.bda = bda
         self.allocator = OffsetAllocator(UInt32(size_bytes // VK_SUBALLOC_UNIT_BYTES), 8192)
         self.live_allocs = 0
+        self.device = device
+        self.fn_free_memory = fn_free_memory
+        self.ctrl_ptr = ctrl_ptr
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].ref_count += 1
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.memory = existing.memory
+        self.memory_type_index = existing.memory_type_index
+        self.size_bytes = existing.size_bytes
+        self.mapped_ptr = existing.mapped_ptr
+        self.bda = existing.bda
+        self.allocator = existing.allocator^
+        self.live_allocs = existing.live_allocs
+        self.device = existing.device
+        self.fn_free_memory = existing.fn_free_memory
+        self.ctrl_ptr = existing.ctrl_ptr
+        existing.memory = 0
+        existing.mapped_ptr = 0
+        existing.size_bytes = 0
+        existing.live_allocs = 0
+        existing.device = 0
+        existing.fn_free_memory = 0
+        existing.ctrl_ptr = 0
+
+    def __deinit__(deinit self):
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_release_mem_block(self.ctrl_ptr, self.memory)
 
 
 @always_inline
@@ -344,7 +400,147 @@ def _vk_block_ptr(addr: Int) -> Pointer[VulkanMemBlock, MutAnyOrigin]:
     return Pointer[VulkanMemBlock, MutAnyOrigin](unsafe_from_address=addr)
 
 
-struct VulkanImage(Copyable, Movable):
+struct _VkDeviceControlBlock:
+    var ref_count: Int
+    var device_alive: Bool
+    var device: Int
+    var fn_destroy_buffer: Int
+    var fn_free_memory: Int
+    var fn_destroy_image: Int
+    var fn_destroy_image_view: Int
+    var fn_destroy_accel: Int
+    var mem_blocks: List[Int]
+
+    def __init__(out self, device: Int):
+        self.ref_count = 1
+        self.device_alive = True
+        self.device = device
+        self.fn_destroy_buffer = 0
+        self.fn_free_memory = 0
+        self.fn_destroy_image = 0
+        self.fn_destroy_image_view = 0
+        self.fn_destroy_accel = 0
+        self.mem_blocks = List[Int]()
+
+
+@always_inline
+def _vk_ctrl_ptr(addr: Int) -> Pointer[_VkDeviceControlBlock, MutAnyOrigin]:
+    return Pointer[_VkDeviceControlBlock, MutAnyOrigin](unsafe_from_address=addr)
+
+
+def _vk_ctrl_destroy_mem_blocks(mut ctrl: _VkDeviceControlBlock):
+    for addr in ctrl.mem_blocks:
+        if addr != 0:
+            var p = _vk_block_ptr(addr)
+            var blk = __get_address_as_owned_value(p._mlir_value)
+            if blk.memory != 0 and ctrl.device != 0 and ctrl.fn_free_memory != 0:
+                _ = call3(ctrl.fn_free_memory, ctrl.device, blk.memory, 0)
+            blk.memory = 0
+            blk.device = 0
+            if blk.ctrl_ptr != 0:
+                blk.ctrl_ptr = 0
+                ctrl.ref_count -= 1
+            _ = blk^
+            external_call["free", NoneType](addr)
+    ctrl.mem_blocks.clear()
+
+
+def _vk_ctrl_subfree(mut ctrl: _VkDeviceControlBlock, vk_memory: Int, block_idx: Int, byte_offset: Int, oa_meta: UInt32):
+    if block_idx == -2:
+        return
+    if block_idx >= 0 and block_idx < len(ctrl.mem_blocks):
+        var addr = ctrl.mem_blocks[block_idx]
+        if addr != 0:
+            ref blk = _vk_block_ptr(addr)[unsafe_offset=0]
+            blk.allocator.free(OffsetAllocation(UInt32(byte_offset // VK_SUBALLOC_UNIT_BYTES), oa_meta))
+            if blk.live_allocs > 0:
+                blk.live_allocs -= 1
+        return
+    if vk_memory != 0 and ctrl.device != 0 and ctrl.fn_free_memory != 0:
+        _ = call3(ctrl.fn_free_memory, ctrl.device, vk_memory, 0)
+
+
+def _vk_ctrl_free_block(ctrl_addr: Int):
+    if ctrl_addr == 0:
+        return
+    var p = _vk_ctrl_ptr(ctrl_addr)
+    var ctrl = __get_address_as_owned_value(p._mlir_value)
+    _vk_ctrl_destroy_mem_blocks(ctrl)
+    _ = ctrl^
+    external_call["free", NoneType](ctrl_addr)
+
+
+def _vk_ctrl_release_buffer(
+    ctrl_addr: Int,
+    vk_buffer: Int,
+    vk_memory: Int,
+    mem_offset: Int,
+    block_idx: Int,
+    oa_meta: UInt32,
+    already_destroyed: Bool,
+) abi("C") -> Int32:
+    if ctrl_addr == 0:
+        return 0
+    ref ctrl = _vk_ctrl_ptr(ctrl_addr)[unsafe_offset=0]
+    if not already_destroyed and ctrl.device_alive and ctrl.device != 0:
+        if vk_buffer != 0 and ctrl.fn_destroy_buffer != 0:
+            _ = call3(ctrl.fn_destroy_buffer, ctrl.device, vk_buffer, 0)
+        _vk_ctrl_subfree(ctrl, vk_memory, block_idx, mem_offset, oa_meta)
+    ctrl.ref_count -= 1
+    if ctrl.ref_count <= 0:
+        _vk_ctrl_free_block(ctrl_addr)
+    return 0
+
+
+def _vk_ctrl_release_image(
+    ctrl_addr: Int,
+    image: Int,
+    view: Int,
+    memory: Int,
+    mem_offset: Int,
+    block_idx: Int,
+    oa_meta: UInt32,
+):
+    if ctrl_addr == 0:
+        return
+    ref ctrl = _vk_ctrl_ptr(ctrl_addr)[unsafe_offset=0]
+    if ctrl.device_alive and ctrl.device != 0:
+        if view != 0 and ctrl.fn_destroy_image_view != 0:
+            _ = call3(ctrl.fn_destroy_image_view, ctrl.device, view, 0)
+        if image != 0 and ctrl.fn_destroy_image != 0:
+            _ = call3(ctrl.fn_destroy_image, ctrl.device, image, 0)
+        if memory != 0:
+            _vk_ctrl_subfree(ctrl, memory, block_idx, mem_offset, oa_meta)
+    ctrl.ref_count -= 1
+    if ctrl.ref_count <= 0:
+        _vk_ctrl_free_block(ctrl_addr)
+
+
+def _vk_ctrl_release_accel(ctrl_addr: Int, handle: Int):
+    if ctrl_addr == 0:
+        return
+    ref ctrl = _vk_ctrl_ptr(ctrl_addr)[unsafe_offset=0]
+    if ctrl.device_alive and ctrl.device != 0:
+        if handle != 0 and ctrl.fn_destroy_accel != 0:
+            _ = call3(ctrl.fn_destroy_accel, ctrl.device, handle, 0)
+    ctrl.ref_count -= 1
+    if ctrl.ref_count <= 0:
+        _vk_ctrl_free_block(ctrl_addr)
+
+
+def _vk_ctrl_release_mem_block(ctrl_addr: Int, memory: Int):
+    if ctrl_addr == 0:
+        return
+    ref ctrl = _vk_ctrl_ptr(ctrl_addr)[unsafe_offset=0]
+    if ctrl.device_alive and ctrl.device != 0:
+        if memory != 0 and ctrl.fn_free_memory != 0:
+            _ = call3(ctrl.fn_free_memory, ctrl.device, memory, 0)
+    ctrl.ref_count -= 1
+    if ctrl.ref_count <= 0:
+        _vk_ctrl_free_block(ctrl_addr)
+
+
+struct VulkanImage(Movable):
     var image: Int
     var view: Int
     var memory: Int
@@ -357,6 +553,8 @@ struct VulkanImage(Copyable, Movable):
     var mip_levels: Int
     var layers: Int
     var layout: UInt32
+    var memory_bytes: Int
+    var ctrl_ptr: Int
 
     def __init__(out self):
         self.image = 0
@@ -371,20 +569,73 @@ struct VulkanImage(Copyable, Movable):
         self.mip_levels = 1
         self.layers = 1
         self.layout = LAYOUT_UNDEFINED
+        self.memory_bytes = 0
+        self.ctrl_ptr = 0
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.image = existing.image
+        self.view = existing.view
+        self.memory = existing.memory
+        self.memory_offset = existing.memory_offset
+        self.suballoc_block = existing.suballoc_block
+        self.suballoc_meta = existing.suballoc_meta
+        self.format = existing.format
+        self.width = existing.width
+        self.height = existing.height
+        self.mip_levels = existing.mip_levels
+        self.layers = existing.layers
+        self.layout = existing.layout
+        self.memory_bytes = existing.memory_bytes
+        self.ctrl_ptr = existing.ctrl_ptr
+        existing.image = 0
+        existing.view = 0
+        existing.memory = 0
+        existing.memory_offset = 0
+        existing.suballoc_block = -1
+        existing.suballoc_meta = OA_UNUSED
+        existing.memory_bytes = 0
+        existing.ctrl_ptr = 0
+
+    def __deinit__(deinit self):
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_release_image(
+                self.ctrl_ptr,
+                self.image,
+                self.view,
+                self.memory,
+                self.memory_offset,
+                self.suballoc_block,
+                self.suballoc_meta,
+            )
 
 
-struct VulkanAccelStruct(Copyable, Movable):
+struct VulkanAccelStruct(Movable):
     var handle: Int
     var buffer: GpuBuffer
     var device_address: UInt64
+    var ctrl_ptr: Int
 
     def __init__(out self):
         self.handle = 0
         self.buffer = GpuBuffer()
         self.device_address = 0
+        self.ctrl_ptr = 0
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.handle = existing.handle
+        self.device_address = existing.device_address
+        self.ctrl_ptr = existing.ctrl_ptr
+        existing.handle = 0
+        existing.device_address = 0
+        existing.ctrl_ptr = 0
+        self.buffer = existing.buffer^
+
+    def __deinit__(deinit self):
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_release_accel(self.ctrl_ptr, self.handle)
 
 
-struct SwapchainHandle(Copyable, Movable):
+struct SwapchainHandle(Movable):
     var surface: Int
     var swapchain: Int
     var vk_swapchain: Int
@@ -407,6 +658,28 @@ struct SwapchainHandle(Copyable, Movable):
         self.present_mode = PRESENT_FIFO
         self.image_count = 0
         self.is_hdr = False
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.surface = existing.surface
+        self.swapchain = existing.swapchain
+        self.vk_swapchain = existing.vk_swapchain
+        self.width = existing.width
+        self.height = existing.height
+        self.format = existing.format
+        self.color_space = existing.color_space
+        self.present_mode = existing.present_mode
+        self.image_count = existing.image_count
+        self.is_hdr = existing.is_hdr
+        existing.surface = 0
+        existing.swapchain = 0
+        existing.vk_swapchain = 0
+        existing.width = 0
+        existing.height = 0
+        existing.image_count = 0
+        existing.is_hdr = False
+
+    def __deinit__(deinit self):
+        pass
 
     def __init__(
         out self,
@@ -549,7 +822,7 @@ def on_debug_message(severity: UInt32, types: UInt32, data: Int, user: Int) abi(
     return 0  # never abort the call that was being checked
 
 
-struct VulkanGpu(Copyable, Movable):
+struct VulkanGpu(Movable):
     var library: Int
     var instance: Int
     var physical: Int
@@ -572,6 +845,8 @@ struct VulkanGpu(Copyable, Movable):
     var has_wayland_surface: Bool
     var has_xcb_surface: Bool
     var has_xlib_surface: Bool
+    var has_win32_surface: Bool
+    var has_metal_surface: Bool
     var has_swapchain_colorspace: Bool
     var has_display_surface: Bool  # VK_KHR_display + VK_EXT_acquire_drm_display: present with no compositor
     var display: Int  # the VkDisplayKHR taken from a KMS connector, released with the swapchain
@@ -582,6 +857,9 @@ struct VulkanGpu(Copyable, Movable):
     var has_sync2: Bool
     var has_bda: Bool
     var has_draw_indirect_count: Bool
+    var has_draw_indirect_first_instance: Bool
+    var has_storage_read_without_format: Bool
+    var has_storage_write_without_format: Bool
     var has_ray_query: Bool
     var timeline: Int
     # The side queue, for work beside the frames (GPU meshing): a compute-only
@@ -600,6 +878,8 @@ struct VulkanGpu(Copyable, Movable):
     var descriptor_layout: Int
     var pipeline_layout: Int
     var pipeline_cache: Int
+    var pso_cache_dirty: Bool
+    var initial_pso_cache_bytes: Int
     var descriptor_pool: Int
     var side_pools: List[Int]  # descriptor pools of passes outside the frame (GPU meshing)
     var layout_bindings: Int
@@ -611,9 +891,13 @@ struct VulkanGpu(Copyable, Movable):
     var swapchain_format: UInt32
     var swapchain_color_space: UInt32
     var swapchain_present_mode: UInt32
+    var swapchain_usage_flags: UInt32
+    var swapchain_has_storage: Bool
+    var swapchain_has_color_attachment: Bool
     var is_hdr: Bool
     var images: List[Int]
     var image_views: List[Int]
+    var swapchain_image_layouts: List[UInt32]
     var acquire_semaphores: List[Int]
     var finished_semaphores: List[Int]
     var presented: Int
@@ -650,13 +934,15 @@ struct VulkanGpu(Copyable, Movable):
     var device_call_cache: Dict[String, Int]
     var device_call_cache_device: Int
     var overflow_slabs: List[Int]
-    var mem_blocks: List[Int]
+    var aliased_heaps: List[Int]
+    var ctrl_ptr: Int
 
     def __init__(out self):
         self.device_call_cache = Dict[String, Int]()
         self.device_call_cache_device = 0
         self.overflow_slabs = List[Int]()
-        self.mem_blocks = List[Int]()
+        self.aliased_heaps = List[Int]()
+        self.ctrl_ptr = 0
         self.library = 0
         self.instance = 0
         self.physical = 0
@@ -681,6 +967,8 @@ struct VulkanGpu(Copyable, Movable):
         self.has_wayland_surface = False
         self.has_xcb_surface = False
         self.has_xlib_surface = False
+        self.has_win32_surface = False
+        self.has_metal_surface = False
         self.has_swapchain_colorspace = False
         self.api_version = API_VERSION_1_2
         self.has_vulkan_13 = False
@@ -689,6 +977,9 @@ struct VulkanGpu(Copyable, Movable):
         self.has_sync2 = False
         self.has_bda = False
         self.has_draw_indirect_count = False
+        self.has_draw_indirect_first_instance = False
+        self.has_storage_read_without_format = False
+        self.has_storage_write_without_format = False
         self.has_ray_query = False
         self.timeline = 0
         self.side_family = 0
@@ -704,6 +995,8 @@ struct VulkanGpu(Copyable, Movable):
         self.descriptor_layout = 0
         self.pipeline_layout = 0
         self.pipeline_cache = 0
+        self.pso_cache_dirty = False
+        self.initial_pso_cache_bytes = 0
         self.descriptor_pool = 0
         self.side_pools = List[Int]()
         self.layout_bindings = 0
@@ -715,9 +1008,13 @@ struct VulkanGpu(Copyable, Movable):
         self.swapchain_format = FORMAT_B8G8R8A8_UNORM
         self.swapchain_color_space = COLOR_SPACE_SRGB_NONLINEAR
         self.swapchain_present_mode = PRESENT_FIFO
+        self.swapchain_usage_flags = 0
+        self.swapchain_has_storage = False
+        self.swapchain_has_color_attachment = False
         self.is_hdr = False
         self.images = List[Int]()
         self.image_views = List[Int]()
+        self.swapchain_image_layouts = List[UInt32]()
         self.acquire_semaphores = List[Int]()
         self.finished_semaphores = List[Int]()
         self.presented = 0
@@ -749,6 +1046,150 @@ struct VulkanGpu(Copyable, Movable):
         self.fn_wait_semaphores = 0
         self.fn_update_descriptors = 0
         self.fn_calibrate = 0
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.library = existing.library
+        self.instance = existing.instance
+        self.physical = existing.physical
+        self.device = existing.device
+        self.queue = existing.queue
+        self.family = existing.family
+        self.messenger = existing.messenger
+        self.messages = existing.messages
+        self.arena = existing.arena
+        self.arena_used = existing.arena_used
+        self.device_type = existing.device_type
+        self.memory_properties = existing.memory_properties
+        self.timestamp_period = existing.timestamp_period
+        self.timestamps = existing.timestamps
+        self.max_buffer = existing.max_buffer
+        self.has_dma_buf = existing.has_dma_buf
+        self.has_calibration = existing.has_calibration
+        self.has_swapchain = existing.has_swapchain
+        self.has_wayland_surface = existing.has_wayland_surface
+        self.has_xcb_surface = existing.has_xcb_surface
+        self.has_xlib_surface = existing.has_xlib_surface
+        self.has_win32_surface = existing.has_win32_surface
+        self.has_metal_surface = existing.has_metal_surface
+        self.has_swapchain_colorspace = existing.has_swapchain_colorspace
+        self.has_display_surface = existing.has_display_surface
+        self.display = existing.display
+        self.api_version = existing.api_version
+        self.has_vulkan_13 = existing.has_vulkan_13
+        self.has_dynamic_rendering = existing.has_dynamic_rendering
+        self.has_descriptor_indexing = existing.has_descriptor_indexing
+        self.has_sync2 = existing.has_sync2
+        self.has_bda = existing.has_bda
+        self.has_draw_indirect_count = existing.has_draw_indirect_count
+        self.has_draw_indirect_first_instance = existing.has_draw_indirect_first_instance
+        self.has_storage_read_without_format = existing.has_storage_read_without_format
+        self.has_storage_write_without_format = existing.has_storage_write_without_format
+        self.has_ray_query = existing.has_ray_query
+        self.timeline = existing.timeline
+        self.side_family = existing.side_family
+        self.side_index = existing.side_index
+        self.side_queue = existing.side_queue
+        self.side_timeline = existing.side_timeline
+        self.side_next = existing.side_next
+        self.side_pool = existing.side_pool
+        self.next_signal = existing.next_signal
+        self.command_pool = existing.command_pool
+        self.query_pool = existing.query_pool
+        self.descriptor_layout = existing.descriptor_layout
+        self.pipeline_layout = existing.pipeline_layout
+        self.pipeline_cache = existing.pipeline_cache
+        self.pso_cache_dirty = existing.pso_cache_dirty
+        self.initial_pso_cache_bytes = existing.initial_pso_cache_bytes
+        self.descriptor_pool = existing.descriptor_pool
+        self.layout_bindings = existing.layout_bindings
+        self.surface = existing.surface
+        self.swapchain = existing.swapchain
+        self.swapchain_width = existing.swapchain_width
+        self.swapchain_height = existing.swapchain_height
+        self.swapchain_format = existing.swapchain_format
+        self.swapchain_color_space = existing.swapchain_color_space
+        self.swapchain_present_mode = existing.swapchain_present_mode
+        self.swapchain_usage_flags = existing.swapchain_usage_flags
+        self.swapchain_has_storage = existing.swapchain_has_storage
+        self.swapchain_has_color_attachment = existing.swapchain_has_color_attachment
+        self.is_hdr = existing.is_hdr
+        self.presented = existing.presented
+        self.skipped = existing.skipped
+        self.proc_instance = existing.proc_instance
+        self.proc_device = existing.proc_device
+        self.fn_create_buffer = existing.fn_create_buffer
+        self.fn_destroy_buffer = existing.fn_destroy_buffer
+        self.fn_get_buffer_requirements = existing.fn_get_buffer_requirements
+        self.fn_allocate_memory = existing.fn_allocate_memory
+        self.fn_free_memory = existing.fn_free_memory
+        self.fn_bind_buffer_memory = existing.fn_bind_buffer_memory
+        self.fn_map_memory = existing.fn_map_memory
+        self.fn_get_memory_fd = existing.fn_get_memory_fd
+        self.fn_begin_commands = existing.fn_begin_commands
+        self.fn_end_commands = existing.fn_end_commands
+        self.fn_reset_commands = existing.fn_reset_commands
+        self.fn_bind_pipeline = existing.fn_bind_pipeline
+        self.fn_bind_descriptor_sets = existing.fn_bind_descriptor_sets
+        self.fn_push_constants = existing.fn_push_constants
+        self.fn_dispatch = existing.fn_dispatch
+        self.fn_dispatch_indirect = existing.fn_dispatch_indirect
+        self.fn_pipeline_barrier = existing.fn_pipeline_barrier
+        self.fn_write_timestamp = existing.fn_write_timestamp
+        self.fn_reset_query_pool = existing.fn_reset_query_pool
+        self.fn_get_query_results = existing.fn_get_query_results
+        self.fn_queue_submit = existing.fn_queue_submit
+        self.fn_wait_semaphores = existing.fn_wait_semaphores
+        self.fn_update_descriptors = existing.fn_update_descriptors
+        self.fn_calibrate = existing.fn_calibrate
+        self.device_call_cache_device = existing.device_call_cache_device
+        self.ctrl_ptr = existing.ctrl_ptr
+
+        existing.library = 0
+        existing.instance = 0
+        existing.physical = 0
+        existing.device = 0
+        existing.queue = 0
+        existing.messenger = 0
+        existing.messages = 0
+        existing.arena = 0
+        existing.arena_used = 0
+        existing.memory_properties = 0
+        existing.display = 0
+        existing.timeline = 0
+        existing.side_queue = 0
+        existing.side_timeline = 0
+        existing.side_pool = 0
+        existing.command_pool = 0
+        existing.query_pool = 0
+        existing.descriptor_layout = 0
+        existing.pipeline_layout = 0
+        existing.pipeline_cache = 0
+        existing.pso_cache_dirty = False
+        existing.initial_pso_cache_bytes = 0
+        existing.descriptor_pool = 0
+        existing.surface = 0
+        existing.swapchain = 0
+        existing.proc_instance = 0
+        existing.proc_device = 0
+        existing.device_call_cache_device = 0
+        existing.ctrl_ptr = 0
+
+        self.device_name = existing.device_name^
+        self.command_buffers = existing.command_buffers^
+        self.side_pools = existing.side_pools^
+        self.pipelines = existing.pipelines^
+        self.images = existing.images^
+        self.image_views = existing.image_views^
+        self.swapchain_image_layouts = existing.swapchain_image_layouts^
+        self.acquire_semaphores = existing.acquire_semaphores^
+        self.finished_semaphores = existing.finished_semaphores^
+        self.error = existing.error^
+        self.device_call_cache = existing.device_call_cache^
+        self.overflow_slabs = existing.overflow_slabs^
+        self.aliased_heaps = existing.aliased_heaps^
+
+    def __deinit__(deinit self):
+        self.close()
 
     def fail(mut self, message: String) -> Bool:
         self.error = message
@@ -918,6 +1359,8 @@ struct VulkanGpu(Copyable, Movable):
             "VK_KHR_wayland_surface",
             "VK_KHR_xcb_surface",
             "VK_KHR_xlib_surface",
+            "VK_KHR_win32_surface",
+            "VK_EXT_metal_surface",
             "VK_EXT_swapchain_colorspace",
         ]:
             if String(wanted) in offered:
@@ -926,6 +1369,8 @@ struct VulkanGpu(Copyable, Movable):
         var has_wl = False
         var has_xcb = False
         var has_xlib = False
+        var has_win32 = False
+        var has_metal = False
         var has_cs = False
         for ext in extensions:
             if ext == "VK_KHR_surface":
@@ -936,11 +1381,17 @@ struct VulkanGpu(Copyable, Movable):
                 has_xcb = True
             elif ext == "VK_KHR_xlib_surface":
                 has_xlib = True
+            elif ext == "VK_KHR_win32_surface":
+                has_win32 = True
+            elif ext == "VK_EXT_metal_surface":
+                has_metal = True
             elif ext == "VK_EXT_swapchain_colorspace":
                 has_cs = True
         self.has_wayland_surface = has_surf and has_wl
         self.has_xcb_surface = has_surf and has_xcb
         self.has_xlib_surface = has_surf and has_xlib
+        self.has_win32_surface = has_surf and has_win32
+        self.has_metal_surface = has_surf and has_metal
         self.has_swapchain_colorspace = has_surf and has_cs
         # Presenting straight to a KMS connector (platform/kms.mojo, GPU mode): all three or none.
         if has_surf and "VK_KHR_display" in offered and "VK_EXT_direct_mode_display" in offered and "VK_EXT_acquire_drm_display" in offered:
@@ -1149,12 +1600,18 @@ struct VulkanGpu(Copyable, Movable):
             put64(vk12 + 8, vk13)
             put32(vk13, TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
 
-            # Core 1.0 features: geometryShader (16+16=32), multiDrawIndirect (16+36=52), samplerAnisotropy (16+76=92), fragmentStoresAndAtomics (16+104=120)
+            # Core 1.0 features: geometryShader (16+16=32), multiDrawIndirect (16+36=52), drawIndirectFirstInstance (16+40=56), samplerAnisotropy (16+76=92), fragmentStoresAndAtomics (16+104=120), shaderStorageImageExtendedFormats (16+116=132), Read/WriteWithoutFormat (16+124=140, 16+128=144)
             put32(feat2 + 16 + 16, get32(q_feat2 + 16 + 16))   # geometryShader (for gl_PrimitiveID in fragment shaders)
             put32(feat2 + 16 + 36, get32(q_feat2 + 16 + 36))
+            put32(feat2 + 16 + 40, get32(q_feat2 + 16 + 40))   # drawIndirectFirstInstance
             put32(feat2 + 16 + 76, get32(q_feat2 + 16 + 76))
             put32(feat2 + 16 + 104, get32(q_feat2 + 16 + 104))
             put32(feat2 + 16 + 116, get32(q_feat2 + 16 + 116))  # shaderStorageImageExtendedFormats
+            put32(feat2 + 16 + 124, get32(q_feat2 + 16 + 124))  # shaderStorageImageReadWithoutFormat
+            put32(feat2 + 16 + 128, get32(q_feat2 + 16 + 128))  # shaderStorageImageWriteWithoutFormat
+            self.has_draw_indirect_first_instance = get32(q_feat2 + 16 + 40) != 0
+            self.has_storage_read_without_format = get32(q_feat2 + 16 + 124) != 0
+            self.has_storage_write_without_format = get32(q_feat2 + 16 + 128) != 0
 
             # Vulkan 1.2 features
             put32(vk12 + 20, get32(q_vk12 + 20))   # drawIndirectCount
@@ -1208,6 +1665,10 @@ struct VulkanGpu(Copyable, Movable):
         if not self.check(call4(create, self.physical, info, 0, slot), "vkCreateDevice"):
             return False
         self.device = get64(slot)
+        var c_raw = external_call["calloc", Int](Int(1), max(128, size_of[_VkDeviceControlBlock]()))
+        var c_p = _vk_ctrl_ptr(c_raw)
+        __get_address_as_uninit_lvalue(c_p._mlir_value) = _VkDeviceControlBlock(self.device)
+        self.ctrl_ptr = c_raw
         var get_queue = self.device_call("vkGetDeviceQueue")
         _ = call4(get_queue, self.device, Int(self.family), 0, slot)
         self.queue = get64(slot)
@@ -1245,6 +1706,14 @@ struct VulkanGpu(Copyable, Movable):
         self.fn_update_descriptors = self.device_call("vkUpdateDescriptorSets")
         if self.has_dma_buf:
             self.fn_get_memory_fd = self.device_call("vkGetMemoryFdKHR")
+        if self.ctrl_ptr != 0:
+            ref ctrl = _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0]
+            ctrl.fn_destroy_buffer = self.fn_destroy_buffer
+            ctrl.fn_free_memory = self.fn_free_memory
+            ctrl.fn_destroy_image = self.device_call("vkDestroyImage")
+            ctrl.fn_destroy_image_view = self.device_call("vkDestroyImageView")
+            if self.has_ray_query:
+                ctrl.fn_destroy_accel = self.device_call("vkDestroyAccelerationStructureKHR")
         return self.error.byte_length() == 0
 
     def create_queue_objects(mut self) -> Bool:
@@ -1310,11 +1779,19 @@ struct VulkanGpu(Copyable, Movable):
     def has_side_queue(self) -> Bool:
         return self.side_index >= 0
 
-    def submit_side(mut self, frame: Int) -> UInt64:
+    def submit_side(
+        mut self,
+        frame: Int,
+        wait_semaphore: Int = 0,
+        wait_value: UInt64 = 0,
+        wait_stage: Int = PIPELINE_COMPUTE,
+    ) -> UInt64:
         """End a side command buffer and queue it on the side queue. Its fence counts
         on the side timeline (wait with `wait_side`). Without a side queue it goes
         on the main queue, and the fence is a main one."""
         if not self.has_side_queue():
+            if wait_semaphore != 0:
+                return self.submit_with_wait(frame, wait_semaphore, wait_value, wait_stage)
             return self.submit(frame)
         if not self.check(call1(self.fn_end_commands, self.command_buffers[frame]), "vkEndCommandBuffer"):
             return 0
@@ -1333,6 +1810,18 @@ struct VulkanGpu(Copyable, Movable):
         var info = self.scratch(72)
         put32(info, TYPE_SUBMIT_INFO)
         put64(info + 8, timeline)
+        if wait_semaphore != 0:
+            var waits = self.scratch(8)
+            put64(waits, wait_semaphore)
+            var stages = self.scratch(8)
+            put32(stages, UInt32(wait_stage))
+            var wait_vals = self.scratch(8)
+            put64(wait_vals, Int(wait_value))
+            put32(timeline + 16, 1)
+            put64(timeline + 24, wait_vals)
+            put32(info + 16, 1)
+            put64(info + 24, waits)
+            put64(info + 32, stages)
         put32(info + 40, 1)
         put64(info + 48, commands)
         put32(info + 56, 1)
@@ -1340,6 +1829,67 @@ struct VulkanGpu(Copyable, Movable):
         if not self.check(call4(self.fn_queue_submit, self.side_queue, 1, info, 0), "vkQueueSubmit"):
             return 0
         self.side_next += 1
+        return value
+
+    def submit_with_wait(
+        mut self,
+        frame: Int,
+        wait_semaphore: Int = 0,
+        wait_value: UInt64 = 0,
+        wait_stage: Int = PIPELINE_COMPUTE,
+        wait_semaphore2: Int = 0,
+        wait_value2: UInt64 = 0,
+        wait_stage2: Int = PIPELINE_TOP,
+    ) -> UInt64:
+        """Ends command buffer `frame` and submits on `self.queue`, optionally waiting on 1-2 timeline semaphores."""
+        if wait_semaphore == 0 and wait_semaphore2 == 0:
+            return self.submit(frame)
+        if not self.check(call1(self.fn_end_commands, self.command_buffers[frame]), "vkEndCommandBuffer"):
+            return 0
+        self.rewind()
+        var value = self.next_signal
+        var commands = self.scratch(8)
+        put64(commands, self.command_buffers[frame])
+        var semaphores = self.scratch(8)
+        put64(semaphores, self.timeline)
+        var values = self.scratch(8)
+        put64(values, Int(value))
+
+        var w_cnt = (1 if wait_semaphore != 0 else 0) + (1 if wait_semaphore2 != 0 else 0)
+        var waits = self.scratch(max(1, w_cnt) * 8)
+        var stages = self.scratch(max(1, w_cnt) * 4)
+        var wait_vals = self.scratch(max(1, w_cnt) * 8)
+        var wi = 0
+        if wait_semaphore != 0:
+            put64(waits + wi * 8, wait_semaphore)
+            put32(stages + wi * 4, UInt32(wait_stage))
+            put64(wait_vals + wi * 8, Int(wait_value))
+            wi += 1
+        if wait_semaphore2 != 0:
+            put64(waits + wi * 8, wait_semaphore2)
+            put32(stages + wi * 4, UInt32(wait_stage2))
+            put64(wait_vals + wi * 8, Int(wait_value2))
+
+        var timeline = self.scratch(48)
+        put32(timeline, TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+        put32(timeline + 16, UInt32(w_cnt))
+        put64(timeline + 24, wait_vals)
+        put32(timeline + 32, 1)
+        put64(timeline + 40, values)
+
+        var info = self.scratch(72)
+        put32(info, TYPE_SUBMIT_INFO)
+        put64(info + 8, timeline)
+        put32(info + 16, UInt32(w_cnt))
+        put64(info + 24, waits)
+        put64(info + 32, stages)
+        put32(info + 40, 1)
+        put64(info + 48, commands)
+        put32(info + 56, 1)
+        put64(info + 64, semaphores)
+        if not self.check(call4(self.fn_queue_submit, self.queue, 1, info, 0), "vkQueueSubmit"):
+            return 0
+        self.next_signal += 1
         return value
 
     def wait_side(mut self, fence: UInt64) -> Bool:
@@ -1396,11 +1946,16 @@ struct VulkanGpu(Copyable, Movable):
         return get64(slot)
 
     def suballoc_block_count(self) -> Int:
-        return len(self.mem_blocks)
+        if self.ctrl_ptr == 0:
+            return 0
+        return len(_vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].mem_blocks)
 
     def suballoc_live_count(self) -> Int:
+        if self.ctrl_ptr == 0:
+            return 0
         var total = 0
-        for addr in self.mem_blocks:
+        ref blocks = _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].mem_blocks
+        for addr in blocks:
             if addr != 0:
                 total += _vk_block_ptr(addr)[unsafe_offset=0].live_allocs
         return total
@@ -1410,6 +1965,32 @@ struct VulkanGpu(Copyable, Movable):
             return False
         var flags = get32(self.memory_properties + 4 + type_index * 8)
         return (flags & MEMORY_HOST_VISIBLE) != 0
+
+    def _is_memory_type_device_local(self, type_index: Int) -> Bool:
+        if type_index < 0 or self.memory_properties == 0:
+            return False
+        var flags = get32(self.memory_properties + 4 + type_index * 8)
+        return (flags & MEMORY_DEVICE_LOCAL) != 0
+
+    def _attach_vk_buf_state(mut self, mut buf: GpuBuffer):
+        if self.ctrl_ptr == 0 or buf.vk_buffer == 0:
+            return
+        var st_raw = external_call["calloc", Int](Int(1), max(128, size_of[_GpuBufferControl]()))
+        ref st = _buf_ctrl_ptr(st_raw)[unsafe_offset=0]
+        var cb: ReleaseVkBufferFn = _vk_ctrl_release_buffer
+        st.ref_count = 1
+        st.destroyed = False
+        st.backend_kind = 1
+        st.ctrl_ptr = self.ctrl_ptr
+        st.release_fn = Pointer(to=cb).unsafe_bitcast[Int]()[unsafe_offset=0]
+        st.vk_buffer = buf.vk_buffer
+        st.vk_memory = buf.vk_memory
+        st.vk_memory_offset = buf.vk_memory_offset
+        st.vk_suballoc_block = buf.vk_suballoc_block
+        st.vk_suballoc_meta = buf.vk_suballoc_meta
+        ref ctrl = _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0]
+        ctrl.ref_count += 1
+        buf.state_ptr = st_raw
 
     def _suballoc_memory(
         mut self,
@@ -1423,6 +2004,9 @@ struct VulkanGpu(Copyable, Movable):
         """Sub-allocates from 64 MiB per-(memoryTypeIndex, bda) `OffsetAllocator` slabs,
         falling back to dedicated `vkAllocateMemory` for >32 MiB or special-flag allocations.
         Returns `(vk_memory, byte_offset, cpu_mapped_addr, block_idx, oa_meta)`."""
+        if self.ctrl_ptr == 0:
+            return (0, 0, 0, -1, OA_UNUSED)
+        ref blocks = _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].mem_blocks
         var can_suballoc = (
             size <= VK_SUBALLOC_DEDICATED_THRESHOLD
             and alignment <= VK_SUBALLOC_UNIT_BYTES
@@ -1430,8 +2014,8 @@ struct VulkanGpu(Copyable, Movable):
         )
         if can_suballoc:
             var units = UInt32(max(1, (size + VK_SUBALLOC_UNIT_BYTES - 1) // VK_SUBALLOC_UNIT_BYTES))
-            for bi in range(len(self.mem_blocks)):
-                var addr = self.mem_blocks[bi]
+            for bi in range(len(blocks)):
+                var addr = blocks[bi]
                 if addr == 0:
                     continue
                 ref blk = _vk_block_ptr(addr)[unsafe_offset=0]
@@ -1470,10 +2054,10 @@ struct VulkanGpu(Copyable, Movable):
                     var raw = external_call["calloc", Int](Int(1), max(64, size_of[VulkanMemBlock]()))
                     var p = _vk_block_ptr(raw)
                     __get_address_as_uninit_lvalue(p._mlir_value) = VulkanMemBlock(
-                        blk_mem, type_index, blk_size, mapped, bda
+                        blk_mem, type_index, blk_size, mapped, bda, self.device, self.fn_free_memory, self.ctrl_ptr
                     )
-                    var bi = len(self.mem_blocks)
-                    self.mem_blocks.append(raw)
+                    var bi = len(blocks)
+                    blocks.append(raw)
                     ref blk = _vk_block_ptr(raw)[unsafe_offset=0]
                     var alloc = blk.allocator.allocate(units)
                     if alloc.ok():
@@ -1496,29 +2080,31 @@ struct VulkanGpu(Copyable, Movable):
         return (ded_mem, 0, ded_cpu, -1, OA_UNUSED)
 
     def _subfree_memory(mut self, vk_memory: Int, block_idx: Int, byte_offset: Int, oa_meta: UInt32):
-        if block_idx >= 0 and block_idx < len(self.mem_blocks):
-            var addr = self.mem_blocks[block_idx]
-            if addr != 0:
-                ref blk = _vk_block_ptr(addr)[unsafe_offset=0]
-                blk.allocator.free(OffsetAllocation(UInt32(byte_offset // VK_SUBALLOC_UNIT_BYTES), oa_meta))
-                if blk.live_allocs > 0:
-                    blk.live_allocs -= 1
+        if block_idx == -2 or self.ctrl_ptr == 0:
             return
-        if vk_memory != 0 and self.device != 0:
-            _ = call3(self.fn_free_memory, self.device, vk_memory, 0)
+        _vk_ctrl_subfree(_vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0], vk_memory, block_idx, byte_offset, oa_meta)
 
     def _destroy_mem_blocks(mut self):
-        for addr in self.mem_blocks:
-            if addr != 0:
-                var p = _vk_block_ptr(addr)
-                var blk = __get_address_as_owned_value(p._mlir_value)
-                if blk.memory != 0 and self.device != 0:
-                    _ = call3(self.fn_free_memory, self.device, blk.memory, 0)
-                _ = blk^
-                external_call["free", NoneType](addr)
-        self.mem_blocks.clear()
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_destroy_mem_blocks(_vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0])
 
-    def create_buffer(mut self, size: Int, local: Bool, shared: Bool = False, cpu_reads: Bool = False) -> GpuBuffer:
+    def _populate_queue_sharing(mut self, info: Int, sharing_off: Int, qcnt_off: Int, pq_off: Int, concurrent: Bool):
+        if concurrent and self.side_index >= 0 and self.side_family != self.family:
+            var q_arr = self.scratch(8)
+            put32(q_arr + 0, self.family)
+            put32(q_arr + 4, self.side_family)
+            put32(info + sharing_off, 1)  # VK_SHARING_MODE_CONCURRENT
+            put32(info + qcnt_off, 2)
+            put64(info + pq_off, q_arr)
+
+    def create_buffer(
+        mut self,
+        size: Int,
+        local: Bool,
+        shared: Bool = False,
+        cpu_reads: Bool = False,
+        concurrent: Bool = False,
+    ) -> GpuBuffer:
         """A mapped storage buffer. Local memory is the GPU's own, reachable by the CPU
         through a resizable BAR; where that is too small, or `local` is False, it is
         the CPU's memory. With `cpu_reads` that memory is cached: reading a frame from
@@ -1539,6 +2125,7 @@ struct VulkanGpu(Copyable, Movable):
         put64(info + 8, external)
         put64(info + 24, rounded)
         put32(info + 32, BUFFER_USAGE)
+        self._populate_queue_sharing(info, 36, 40, 48, concurrent)
         var slot = self.scratch(8)
         if call4(self.fn_create_buffer, self.device, info, 0, slot) != SUCCESS:
             _ = self.fail("vkCreateBuffer failed for " + String(rounded) + " bytes")
@@ -1556,6 +2143,7 @@ struct VulkanGpu(Copyable, Movable):
         var cpu_addr = 0
         var blk_idx = -1
         var oa_meta = OA_UNUSED
+        var is_vram = False
         if local:
             var bar = self.memory_type(allowed, host | MEMORY_DEVICE_LOCAL, extras)
             if bar >= 0:
@@ -1565,6 +2153,7 @@ struct VulkanGpu(Copyable, Movable):
                 cpu_addr = res[2]
                 blk_idx = res[3]
                 oa_meta = res[4]
+                is_vram = memory != 0
         if memory == 0:
             # Write-combined where the CPU only writes, which is the faster way to do that.
             var system = -1
@@ -1581,6 +2170,7 @@ struct VulkanGpu(Copyable, Movable):
                 cpu_addr = res[2]
                 blk_idx = res[3]
                 oa_meta = res[4]
+                is_vram = self._is_memory_type_device_local(system)
         if memory == 0:
             _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
             _ = self.fail("no memory for a buffer of " + String(rounded) + " bytes")
@@ -1596,14 +2186,132 @@ struct VulkanGpu(Copyable, Movable):
         mapped.vk_memory_offset = mem_offset
         mapped.vk_suballoc_block = blk_idx
         mapped.vk_suballoc_meta = oa_meta
+        mapped.vram = is_vram
+        self._attach_vk_buf_state(mapped)
         return mapped^
+
+    def create_buffer_device_local(
+        mut self,
+        size: Int,
+        usage: UInt32 = BUFFER_USAGE,
+        bda: Bool = False,
+        concurrent: Bool = False,
+    ) -> GpuBuffer:
+        """Allocates a true `DEVICE_LOCAL`-only VRAM buffer (`cpu_address == 0` when non-host-visible VRAM exists)."""
+        var extra = usage | (BUFFER_USAGE_DEVICE_ADDRESS if bda else UInt32(0))
+        return self.create_buffer_bda(size, extra_usage=extra, host_visible=False, cpu_reads=False, concurrent=concurrent)
+
+    def create_buffer_unbound(
+        mut self,
+        size: Int,
+        mut out_req: VkMemReq,
+        usage: UInt32 = BUFFER_USAGE,
+        bda: Bool = False,
+        concurrent: Bool = True,
+    ) -> GpuBuffer:
+        """Creates a `VkBuffer` without backing memory and queries its `VkMemoryRequirements` for `AaaRenderGraph` aliasing."""
+        self.rewind()
+        out_req = VkMemReq()
+        var rounded = max(4096, (size + 4095) & ~4095)
+        var extra = usage | (BUFFER_USAGE_DEVICE_ADDRESS if (bda and self.has_bda) else UInt32(0))
+        var info = self.scratch(56)
+        put32(info, TYPE_BUFFER_CREATE_INFO)
+        put64(info + 24, rounded)
+        put32(info + 32, BUFFER_USAGE | extra)
+        self._populate_queue_sharing(info, 36, 40, 48, concurrent)
+        var slot = self.scratch(8)
+        if call4(self.fn_create_buffer, self.device, info, 0, slot) != SUCCESS:
+            _ = self.fail("vkCreateBuffer (unbound) failed")
+            return GpuBuffer()
+        var buffer = get64(slot)
+        var req_raw = self.scratch(24)
+        _ = call3(self.fn_get_buffer_requirements, self.device, buffer, req_raw)
+        out_req = VkMemReq(get64(req_raw), max(1, get64(req_raw + 8)), get32(req_raw + 16))
+        var out = GpuBuffer(0, rounded, 0, 0)
+        out.vk_buffer = buffer
+        out.vk_suballoc_block = -2
+        out.vram = True
+        self._attach_vk_buf_state(out)
+        return out^
+
+    def create_aliased_heap(
+        mut self,
+        size: Int,
+        memory_type_bits: UInt32 = 0xFFFFFFFF,
+        local: Bool = True,
+        bda: Bool = False,
+    ) -> Int:
+        """Allocates a shared `VkDeviceMemory` heap for `AaaRenderGraph` aliased transient resources."""
+        if self.device == 0 or size <= 0:
+            return 0
+        self.rewind()
+        var extras = ~(MEMORY_DEVICE_LOCAL | MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT | MEMORY_HOST_CACHED)
+        var mt = -1
+        if local:
+            mt = self.memory_type(memory_type_bits, MEMORY_DEVICE_LOCAL, extras | MEMORY_HOST_VISIBLE)
+            if mt < 0:
+                mt = self.memory_type(memory_type_bits, MEMORY_DEVICE_LOCAL, MEMORY_HOST_VISIBLE)
+            if mt < 0:
+                mt = self.memory_type(memory_type_bits, MEMORY_DEVICE_LOCAL, 0)
+        if mt < 0:
+            mt = self.memory_type(memory_type_bits, 0, 0)
+        if mt < 0:
+            _ = self.fail("no memory type for aliased heap")
+            return 0
+        var next_ptr = 0
+        if bda and self.has_bda:
+            next_ptr = self.scratch(24)
+            put32(next_ptr, TYPE_MEMORY_ALLOCATE_FLAGS_INFO)
+            put32(next_ptr + 16, MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+        var mem = self.allocation(size, mt, next_ptr)
+        if mem != 0:
+            self.aliased_heaps.append(mem)
+        return mem
+
+    def destroy_aliased_heap(mut self, heap_mem: Int):
+        if heap_mem == 0 or self.device == 0:
+            return
+        _ = call3(self.fn_free_memory, self.device, heap_mem, 0)
+        var i = 0
+        while i < len(self.aliased_heaps):
+            if self.aliased_heaps[i] == heap_mem:
+                _ = self.aliased_heaps.pop(i)
+            else:
+                i += 1
+
+    def bind_buffer_aliased(mut self, mut buf: GpuBuffer, heap_mem: Int, offset: Int) -> Bool:
+        """Binds an unbound `GpuBuffer` into `heap_mem` at `offset` (`vk_suballoc_block = -2`, `vk_memory = 0` so `destroy_buffer` never frees the shared heap)."""
+        if self.device == 0 or buf.vk_buffer == 0 or heap_mem == 0:
+            return False
+        if call4(self.fn_bind_buffer_memory, self.device, buf.vk_buffer, heap_mem, offset) != SUCCESS:
+            _ = self.fail("vkBindBufferMemory (aliased) failed")
+            return False
+        buf.vk_memory = 0
+        buf.vk_memory_offset = offset
+        buf.vk_suballoc_block = -2
+        buf.vram = True
+        if buf.state_ptr != 0:
+            ref st = _buf_ctrl_ptr(buf.state_ptr)[unsafe_offset=0]
+            st.vk_memory = 0
+            st.vk_memory_offset = offset
+            st.vk_suballoc_block = -2
+        return True
 
     def destroy_buffer(mut self, buffer: GpuBuffer):
         """Release a buffer the GPU has finished with. The empty value is ignored."""
-        if buffer.size == 0:
+        if buffer.size == 0 or buffer.vk_buffer == 0:
             return
-        _ = call3(self.fn_destroy_buffer, self.device, buffer.vk_buffer, 0)
-        self._subfree_memory(buffer.vk_memory, buffer.vk_suballoc_block, buffer.vk_memory_offset, buffer.vk_suballoc_meta)
+        if buffer.state_ptr != 0:
+            ref st = _buf_ctrl_ptr(buffer.state_ptr)[unsafe_offset=0]
+            if st.destroyed:
+                return
+            st.destroyed = True
+        if self.device != 0:
+            _ = call3(self.fn_destroy_buffer, self.device, buffer.vk_buffer, 0)
+            if buffer.vk_suballoc_block != -2:
+                self._subfree_memory(
+                    buffer.vk_memory, buffer.vk_suballoc_block, buffer.vk_memory_offset, buffer.vk_suballoc_meta
+                )
 
     def export_buffer(mut self, buffer: GpuBuffer) -> Int:
         """Share a buffer as a dmabuf file descriptor. Returns -1 on failure."""
@@ -1943,6 +2651,65 @@ struct VulkanGpu(Copyable, Movable):
             self.acquire_semaphores.append(self.create_binary_semaphore())
         return True
 
+    def create_win32_surface(mut self, hwnd: UInt64, hinstance: UInt64, frames: Int = 2) -> Bool:
+        """Create a Vulkan surface for a Win32 HWND (`VK_KHR_win32_surface`, dynamically resolved)."""
+        if not self.has_win32_surface or not self.has_swapchain:
+            return self.fail("VK_KHR_win32_surface not available")
+        if hwnd == 0:
+            return self.fail("invalid Win32 hwnd")
+        self.rewind()
+        var info = self.scratch(40)
+        put32(info, TYPE_WIN32_SURFACE_CREATE_INFO)
+        put64(info + 8, 0)
+        put32(info + 16, 0)
+        put64(info + 24, Int(hinstance))
+        put64(info + 32, Int(hwnd))
+        var slot = self.scratch(8)
+        var fn_create = self.instance_call("vkCreateWin32SurfaceKHR")
+        if fn_create == 0:
+            return self.fail("vkCreateWin32SurfaceKHR not found")
+        if not self.check(call4(fn_create, self.instance, info, 0, slot), "vkCreateWin32SurfaceKHR"):
+            return False
+        self.surface = get64(slot)
+        var supported = self.scratch(8)
+        if not self.check(call4(self.instance_call("vkGetPhysicalDeviceSurfaceSupportKHR"), self.physical, Int(self.family), self.surface, supported), "vkGetPhysicalDeviceSurfaceSupportKHR"):
+            return False
+        if get32(supported) == 0:
+            return self.fail("this queue cannot present to the Win32 window")
+        self.rewind()
+        for _ in range(frames):
+            self.acquire_semaphores.append(self.create_binary_semaphore())
+        return True
+
+    def create_macos_surface(mut self, metal_layer: UInt64, frames: Int = 2) -> Bool:
+        """Create a Vulkan surface for a macOS CAMetalLayer (`VK_EXT_metal_surface`, dynamically resolved)."""
+        if not self.has_metal_surface or not self.has_swapchain:
+            return self.fail("VK_EXT_metal_surface not available")
+        if metal_layer == 0:
+            return self.fail("invalid CAMetalLayer pointer")
+        self.rewind()
+        var info = self.scratch(32)
+        put32(info, TYPE_METAL_SURFACE_CREATE_INFO)
+        put64(info + 8, 0)
+        put32(info + 16, 0)
+        put64(info + 24, Int(metal_layer))
+        var slot = self.scratch(8)
+        var fn_create = self.instance_call("vkCreateMetalSurfaceEXT")
+        if fn_create == 0:
+            return self.fail("vkCreateMetalSurfaceEXT not found")
+        if not self.check(call4(fn_create, self.instance, info, 0, slot), "vkCreateMetalSurfaceEXT"):
+            return False
+        self.surface = get64(slot)
+        var supported = self.scratch(8)
+        if not self.check(call4(self.instance_call("vkGetPhysicalDeviceSurfaceSupportKHR"), self.physical, Int(self.family), self.surface, supported), "vkGetPhysicalDeviceSurfaceSupportKHR"):
+            return False
+        if get32(supported) == 0:
+            return self.fail("this queue cannot present to the Metal layer")
+        self.rewind()
+        for _ in range(frames):
+            self.acquire_semaphores.append(self.create_binary_semaphore())
+        return True
+
     def create_drm_display_surface(mut self, drm_fd: Int, connector: Int, width: Int, height: Int, refresh_mhz: Int, frames: Int = 2, exact_size: Bool = False) -> Bool:
         """Present straight to a KMS connector, no compositor: take the display through our
         DRM master fd (VK_EXT_acquire_drm_display), match the KMS mode, pick a plane that can
@@ -2093,6 +2860,61 @@ struct VulkanGpu(Copyable, Movable):
             self.is_hdr,
         )
 
+    def attach_win32_surface(
+        mut self,
+        hwnd: UInt64,
+        hinstance: UInt64 = 0,
+        width: Int = 1280,
+        height: Int = 720,
+        prefer_mailbox: Bool = True,
+        prefer_hdr10: Bool = False,
+    ) -> SwapchainHandle:
+        """Attaches a Win32 HWND surface and initializes a Vulkan swapchain (`VK_KHR_win32_surface`)."""
+        if not self.create_win32_surface(hwnd, hinstance, 2):
+            return SwapchainHandle()
+        var sw = width if width > 0 else 1280
+        var sh = height if height > 0 else 720
+        if not self.create_swapchain(sw, sh, prefer_mailbox=prefer_mailbox, prefer_hdr10=prefer_hdr10):
+            return SwapchainHandle()
+        return SwapchainHandle(
+            self.surface,
+            self.swapchain,
+            self.swapchain_width,
+            self.swapchain_height,
+            self.swapchain_format,
+            self.swapchain_color_space,
+            self.swapchain_present_mode,
+            len(self.images),
+            self.is_hdr,
+        )
+
+    def attach_macos_surface(
+        mut self,
+        metal_layer: UInt64,
+        width: Int = 1280,
+        height: Int = 720,
+        prefer_mailbox: Bool = True,
+        prefer_hdr10: Bool = False,
+    ) -> SwapchainHandle:
+        """Attaches a macOS CAMetalLayer surface and initializes a Vulkan swapchain (`VK_EXT_metal_surface`)."""
+        if not self.create_macos_surface(metal_layer, 2):
+            return SwapchainHandle()
+        var sw = width if width > 0 else 1280
+        var sh = height if height > 0 else 720
+        if not self.create_swapchain(sw, sh, prefer_mailbox=prefer_mailbox, prefer_hdr10=prefer_hdr10):
+            return SwapchainHandle()
+        return SwapchainHandle(
+            self.surface,
+            self.swapchain,
+            self.swapchain_width,
+            self.swapchain_height,
+            self.swapchain_format,
+            self.swapchain_color_space,
+            self.swapchain_present_mode,
+            len(self.images),
+            self.is_hdr,
+        )
+
     def create_image_view(mut self, img: Int, format: UInt32, aspect: UInt32 = ASPECT_COLOR) -> Int:
         self.rewind()
         var view_info = self.scratch(80)
@@ -2217,6 +3039,11 @@ struct VulkanGpu(Copyable, Movable):
         var usage_flags = IMAGE_USAGE_TRANSFER_TARGET | (sup_usages & IMAGE_USAGE_COLOR_ATTACHMENT)
         if (sup_usages & IMAGE_USAGE_STORAGE) != 0:
             usage_flags |= IMAGE_USAGE_STORAGE
+        self.swapchain_usage_flags = usage_flags
+        self.swapchain_has_color_attachment = (usage_flags & IMAGE_USAGE_COLOR_ATTACHMENT) != 0
+        self.swapchain_has_storage = (usage_flags & IMAGE_USAGE_STORAGE) != 0 and (
+            (self.get_format_optimal_features(chosen_format) & FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0
+        )
 
         var prev_sc = Int(old_swapchain) if old_swapchain != 0 else self.swapchain
         var info = self.scratch(104)
@@ -2257,14 +3084,41 @@ struct VulkanGpu(Copyable, Movable):
         if not self.check(call4(list_images, self.device, self.swapchain, count_slot, images), "vkGetSwapchainImagesKHR"):
             return False
         self.images.clear()
+        self.swapchain_image_layouts.clear()
         for index in range(image_count):
             self.images.append(get64(images + index * 8))
+            self.swapchain_image_layouts.append(LAYOUT_UNDEFINED)
         while len(self.finished_semaphores) < image_count:
             self.finished_semaphores.append(self.create_binary_semaphore())
         for index in range(image_count):
             var view = self.create_image_view(self.images[index], chosen_format, ASPECT_COLOR)
             self.image_views.append(view)
         return True
+
+    def get_format_optimal_features(mut self, format: UInt32) -> UInt32:
+        if self.physical == 0 or self.instance == 0:
+            return 0
+        self.rewind()
+        var props = self.scratch(16)
+        _ = call3(self.instance_call("vkGetPhysicalDeviceFormatProperties"), self.physical, Int(format), props)
+        return get32(props + 4)  # optimalTilingFeatures
+
+    def transition_swapchain_image(
+        mut self,
+        frame: Int,
+        image: Int,
+        new_layout: UInt32,
+        src_stage: Int,
+        src_access: UInt32,
+        dst_stage: Int,
+        dst_access: UInt32,
+    ):
+        if image < 0 or image >= len(self.images):
+            return
+        var old_layout = self.swapchain_image_layouts[image] if image < len(self.swapchain_image_layouts) else LAYOUT_UNDEFINED
+        self.image_barrier(frame, image, old_layout, new_layout, src_stage, src_access, dst_stage, dst_access)
+        if image < len(self.swapchain_image_layouts):
+            self.swapchain_image_layouts[image] = new_layout
 
     def acquire_image(mut self, frame: Int) -> Int:
         """The next image to fill, or NO_IMAGE to skip presenting this frame."""
@@ -2332,34 +3186,49 @@ struct VulkanGpu(Copyable, Movable):
         _ = call6(self.device_call("vkCmdCopyBufferToImage"), self.command_buffers[frame], source.vk_buffer, self.images[image], Int(LAYOUT_TRANSFER_TARGET), 1, region)
         self.image_barrier(frame, image, LAYOUT_TRANSFER_TARGET, LAYOUT_PRESENT, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_BOTTOM, 0)
 
-    def submit_and_present(mut self, frame: Int, image: Int) -> UInt64:
-        """As `submit`, waiting for the acquired image and handing it to the compositor."""
+    def submit_and_present(
+        mut self,
+        frame: Int,
+        image: Int,
+        wait_stage: Int = PIPELINE_COMPUTE | PIPELINE_COLOR_ATTACHMENT_OUTPUT | PIPELINE_TRANSFER,
+        extra_wait_sem: Int = 0,
+        extra_wait_val: UInt64 = 0,
+        extra_wait_stage: Int = PIPELINE_COMPUTE,
+    ) -> UInt64:
+        """As `submit`, waiting for the acquired image (and optional timeline wait) and handing it to the compositor."""
         if not self.check(call1(self.fn_end_commands, self.command_buffers[frame]), "vkEndCommandBuffer"):
             return 0
         self.rewind()
         var value = self.next_signal
         var commands = self.scratch(8)
         put64(commands, self.command_buffers[frame])
-        var waits = self.scratch(8)
+        var has_extra = extra_wait_sem != 0 and extra_wait_val > 0
+        var wait_cnt = 2 if has_extra else 1
+        var waits = self.scratch(16)
         put64(waits, self.acquire_semaphores[frame])
-        var stages = self.scratch(8)
-        put32(stages, UInt32(PIPELINE_TRANSFER))
+        var stages = self.scratch(16)
+        put32(stages, UInt32(wait_stage))
+        var wait_values = self.scratch(16)
+        put64(wait_values, 0)
+        if has_extra:
+            put64(waits + 8, extra_wait_sem)
+            put32(stages + 4, UInt32(extra_wait_stage))
+            put64(wait_values + 8, Int(extra_wait_val))
         var signals = self.scratch(16)
         put64(signals, self.timeline)
         put64(signals + 8, self.finished_semaphores[image])
         var values = self.scratch(16)
         put64(values, Int(value))
-        var wait_values = self.scratch(8)
         var timeline = self.scratch(48)
         put32(timeline, TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
-        put32(timeline + 16, 1)
+        put32(timeline + 16, UInt32(wait_cnt))
         put64(timeline + 24, wait_values)
         put32(timeline + 32, 2)
         put64(timeline + 40, values)
         var info = self.scratch(72)
         put32(info, TYPE_SUBMIT_INFO)
         put64(info + 8, timeline)
-        put32(info + 16, 1)
+        put32(info + 16, UInt32(wait_cnt))
         put64(info + 24, waits)
         put64(info + 32, stages)
         put32(info + 40, 1)
@@ -2413,6 +3282,7 @@ struct VulkanGpu(Copyable, Movable):
         self.acquire_semaphores.clear()
         self.finished_semaphores.clear()
         self.images.clear()
+        self.swapchain_image_layouts.clear()
         _ = call3(self.instance_call("vkDestroySurfaceKHR"), self.instance, self.surface, 0)
         self.surface = 0
         self.release_display()
@@ -2449,6 +3319,8 @@ struct VulkanGpu(Copyable, Movable):
             if self.pipeline_cache != 0:
                 _ = call3(self.device_call("vkDestroyPipelineCache"), self.device, self.pipeline_cache, 0)
                 self.pipeline_cache = 0
+            self.pso_cache_dirty = False
+            self.initial_pso_cache_bytes = 0
             self.rewind()
             if self.descriptor_pool != 0:
                 _ = call3(self.device_call("vkDestroyDescriptorPool"), self.device, self.descriptor_pool, 0)
@@ -2471,11 +3343,23 @@ struct VulkanGpu(Copyable, Movable):
                 _ = call3(self.device_call("vkDestroyCommandPool"), self.device, self.command_pool, 0)
             if self.timeline != 0:
                 _ = call3(self.device_call("vkDestroySemaphore"), self.device, self.timeline, 0)
+            for h_idx in range(len(self.aliased_heaps)):
+                if self.aliased_heaps[h_idx] != 0:
+                    _ = call3(self.fn_free_memory, self.device, self.aliased_heaps[h_idx], 0)
+            self.aliased_heaps.clear()
+            if self.ctrl_ptr != 0:
+                _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].device_alive = False
             self._destroy_mem_blocks()
             _ = call2(self.device_call("vkDestroyDevice"), self.device, 0)
             self.device = 0
             self.device_call_cache.clear()
             self.device_call_cache_device = 0
+            if self.ctrl_ptr != 0:
+                ref ctrl = _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0]
+                ctrl.ref_count -= 1
+                if ctrl.ref_count <= 0:
+                    _vk_ctrl_free_block(self.ctrl_ptr)
+                self.ctrl_ptr = 0
         self.rewind()
         if self.messenger != 0:
             _ = call3(self.instance_call("vkDestroyDebugUtilsMessengerEXT"), self.instance, self.messenger, 0)
@@ -2498,6 +3382,7 @@ struct VulkanGpu(Copyable, Movable):
         extra_usage: UInt32 = 0,
         host_visible: Bool = True,
         cpu_reads: Bool = False,
+        concurrent: Bool = False,
     ) -> GpuBuffer:
         """Allocates a buffer with optional `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` + `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`."""
         self.rewind()
@@ -2507,6 +3392,7 @@ struct VulkanGpu(Copyable, Movable):
         put32(info, TYPE_BUFFER_CREATE_INFO)
         put64(info + 24, rounded)
         put32(info + 32, BUFFER_USAGE | extra_usage)
+        self._populate_queue_sharing(info, 36, 40, 48, concurrent)
         var slot = self.scratch(8)
         if call4(self.fn_create_buffer, self.device, info, 0, slot) != SUCCESS:
             _ = self.fail("vkCreateBuffer (BDA) failed")
@@ -2529,9 +3415,12 @@ struct VulkanGpu(Copyable, Movable):
         var cpu_addr = 0
         var blk_idx = -1
         var oa_meta = OA_UNUSED
+        var is_vram = False
         var extras = ~(MEMORY_DEVICE_LOCAL | MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT | MEMORY_HOST_CACHED)
         if not host_visible:
-            var dev_only = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, extras & ~MEMORY_HOST_VISIBLE & ~MEMORY_HOST_COHERENT)
+            var dev_only = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, extras | MEMORY_HOST_VISIBLE)
+            if dev_only < 0:
+                dev_only = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, MEMORY_HOST_VISIBLE)
             if dev_only < 0:
                 dev_only = self.memory_type(allowed, MEMORY_DEVICE_LOCAL, 0)
             if dev_only >= 0:
@@ -2541,6 +3430,7 @@ struct VulkanGpu(Copyable, Movable):
                 cpu_addr = res[2]
                 blk_idx = res[3]
                 oa_meta = res[4]
+                is_vram = memory != 0
         if memory == 0:
             var host = MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT
             var mt = self.memory_type(allowed, host | (MEMORY_HOST_CACHED if cpu_reads else MEMORY_DEVICE_LOCAL), extras)
@@ -2555,6 +3445,7 @@ struct VulkanGpu(Copyable, Movable):
                 cpu_addr = res[2]
                 blk_idx = res[3]
                 oa_meta = res[4]
+                is_vram = self._is_memory_type_device_local(mt)
         if memory == 0:
             _ = call3(self.fn_destroy_buffer, self.device, buffer, 0)
             _ = self.fail("no memory for BDA buffer")
@@ -2569,6 +3460,8 @@ struct VulkanGpu(Copyable, Movable):
         out.vk_memory_offset = mem_offset
         out.vk_suballoc_block = blk_idx
         out.vk_suballoc_meta = oa_meta
+        out.vram = is_vram
+        self._attach_vk_buf_state(out)
         return out^
 
     def buffer_device_address(mut self, buffer: GpuBuffer) -> UInt64:
@@ -2594,6 +3487,7 @@ struct VulkanGpu(Copyable, Movable):
         usage: UInt32,
         mip_levels: Int = 1,
         cube: Bool = False,
+        concurrent: Bool = False,
     ) -> VulkanImage:
         """Creates an optimal-tiled 2D or 6-face Cubemap `VkImage` + `VkDeviceMemory` + `VkImageView`."""
         var out = VulkanImage()
@@ -2613,6 +3507,7 @@ struct VulkanGpu(Copyable, Movable):
         put32(info + 48, SAMPLE_COUNT_1)
         put32(info + 52, 0)  # VK_IMAGE_TILING_OPTIMAL
         put32(info + 56, usage)
+        self._populate_queue_sharing(info, 60, 64, 72, concurrent)
         put32(info + 80, LAYOUT_UNDEFINED)
         var slot = self.scratch(8)
         if not self.check(call4(self.device_call("vkCreateImage"), self.device, info, 0, slot), "vkCreateImage"):
@@ -2668,23 +3563,124 @@ struct VulkanGpu(Copyable, Movable):
         out.mip_levels = max(1, mip_levels)
         out.layers = layers
         out.layout = LAYOUT_UNDEFINED
+        out.memory_bytes = needed
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].ref_count += 1
+            out.ctrl_ptr = self.ctrl_ptr
         return out^
 
+    def create_image_2d_unbound(
+        mut self,
+        width: Int,
+        height: Int,
+        format: UInt32,
+        usage: UInt32,
+        mut out_req: VkMemReq,
+        mip_levels: Int = 1,
+        cube: Bool = False,
+        concurrent: Bool = True,
+    ) -> VulkanImage:
+        """Creates an optimal-tiled `VkImage` without backing memory and queries `VkMemReq` for `AaaRenderGraph` aliasing."""
+        var out = VulkanImage()
+        out_req = VkMemReq()
+        self.rewind()
+        var layers = 6 if cube else 1
+        var info = self.scratch(88)
+        put32(info, TYPE_IMAGE_CREATE_INFO)
+        if cube:
+            put32(info + 16, IMAGE_CREATE_CUBE_COMPATIBLE)
+        put32(info + 20, 1)
+        put32(info + 24, format)
+        put32(info + 28, UInt32(width))
+        put32(info + 32, UInt32(height))
+        put32(info + 36, 1)
+        put32(info + 40, UInt32(max(1, mip_levels)))
+        put32(info + 44, UInt32(layers))
+        put32(info + 48, SAMPLE_COUNT_1)
+        put32(info + 52, 0)
+        put32(info + 56, usage)
+        self._populate_queue_sharing(info, 60, 64, 72, concurrent)
+        put32(info + 80, LAYOUT_UNDEFINED)
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateImage"), self.device, info, 0, slot), "vkCreateImage(unbound)"):
+            return out^
+        var img = get64(slot)
+        var req_raw = self.scratch(24)
+        _ = call3(self.device_call("vkGetImageMemoryRequirements"), self.device, img, req_raw)
+        out_req = VkMemReq(get64(req_raw), max(1, get64(req_raw + 8)), get32(req_raw + 16))
+        out.image = img
+        out.view = 0
+        out.memory = 0
+        out.memory_offset = 0
+        out.suballoc_block = -2
+        out.format = format
+        out.width = width
+        out.height = height
+        out.mip_levels = max(1, mip_levels)
+        out.layers = layers
+        out.layout = LAYOUT_UNDEFINED
+        out.memory_bytes = out_req.size
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].ref_count += 1
+            out.ctrl_ptr = self.ctrl_ptr
+        return out^
+
+    def bind_image_aliased(
+        mut self,
+        mut img: VulkanImage,
+        heap_mem: Int,
+        offset: Int,
+        cube: Bool = False,
+    ) -> Bool:
+        """Binds an unbound `VulkanImage` into `heap_mem` at `offset` and creates its `VkImageView`."""
+        if self.device == 0 or img.image == 0 or heap_mem == 0:
+            return False
+        if call4(self.device_call("vkBindImageMemory"), self.device, img.image, heap_mem, offset) != SUCCESS:
+            _ = self.fail("vkBindImageMemory (aliased) failed")
+            return False
+        img.memory = 0
+        img.memory_offset = offset
+        img.suballoc_block = -2
+        self.rewind()
+        var aspect = ASPECT_DEPTH if img.format == FORMAT_D32_SFLOAT else ASPECT_COLOR
+        var view_info = self.scratch(80)
+        put32(view_info, TYPE_IMAGE_VIEW_CREATE_INFO)
+        put64(view_info + 24, img.image)
+        put32(view_info + 32, IMAGE_VIEW_TYPE_CUBE if cube else IMAGE_VIEW_TYPE_2D)
+        put32(view_info + 36, img.format)
+        put32(view_info + 56, aspect)
+        put32(view_info + 60, 0)
+        put32(view_info + 64, UInt32(max(1, img.mip_levels)))
+        put32(view_info + 68, 0)
+        put32(view_info + 72, UInt32(max(1, img.layers)))
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateImageView"), self.device, view_info, 0, slot), "vkCreateImageView(aliased)"):
+            return False
+        img.view = get64(slot)
+        return True
+
     def destroy_image(mut self, mut img: VulkanImage):
-        if img.view != 0:
+        if img.view != 0 and self.device != 0:
             self.rewind()
             _ = call3(self.device_call("vkDestroyImageView"), self.device, img.view, 0)
-            img.view = 0
-        if img.image != 0:
+        img.view = 0
+        if img.image != 0 and self.device != 0:
             self.rewind()
             _ = call3(self.device_call("vkDestroyImage"), self.device, img.image, 0)
-            img.image = 0
-        if img.memory != 0:
+        img.image = 0
+        if img.suballoc_block != -2 and img.memory != 0:
             self._subfree_memory(img.memory, img.suballoc_block, img.memory_offset, img.suballoc_meta)
-            img.memory = 0
-            img.memory_offset = 0
-            img.suballoc_block = -1
-            img.suballoc_meta = OA_UNUSED
+        img.memory = 0
+        img.memory_offset = 0
+        img.suballoc_block = -1
+        img.suballoc_meta = OA_UNUSED
+        img.memory_bytes = 0
+        if img.ctrl_ptr != 0:
+            ref ctrl = _vk_ctrl_ptr(img.ctrl_ptr)[unsafe_offset=0]
+            ctrl.ref_count -= 1
+            if ctrl.ref_count <= 0:
+                _vk_ctrl_free_block(img.ctrl_ptr)
+            img.ctrl_ptr = 0
 
     def create_sampler(
         mut self,
@@ -2692,6 +3688,7 @@ struct VulkanGpu(Copyable, Movable):
         max_anisotropy: Float32 = 16.0,
         clamp_to_edge: Bool = False,
         max_lod: Float32 = 16.0,
+        min_lod: Float32 = 0.0,
     ) -> Int:
         self.rewind()
         var info = self.scratch(80)
@@ -2707,7 +3704,7 @@ struct VulkanGpu(Copyable, Movable):
         if linear and max_anisotropy > Float32(1.0):
             put32(info + 48, 1)
             put_float(info + 52, max_anisotropy)
-        put_float(info + 64, Float32(0.0))
+        put_float(info + 64, min_lod)
         put_float(info + 68, max_lod)
         var slot = self.scratch(8)
         if not self.check(call4(self.device_call("vkCreateSampler"), self.device, info, 0, slot), "vkCreateSampler"):
@@ -2771,6 +3768,64 @@ struct VulkanGpu(Copyable, Movable):
             _ = call10(self.fn_pipeline_barrier, self.command_buffers[frame], src_stage, dst_stage, 0, 0, 0, 0, 0, 1, barrier)
         img.layout = new_layout
 
+    def transition_image_mip_range(
+        mut self,
+        frame: Int,
+        img: VulkanImage,
+        base_mip: Int,
+        level_count: Int,
+        old_layout: UInt32,
+        new_layout: UInt32,
+        src_stage: Int,
+        src_access: UInt32,
+        dst_stage: Int,
+        dst_access: UInt32,
+    ):
+        if img.image == 0 or frame < 0 or frame >= len(self.command_buffers):
+            return
+        var aspect = ASPECT_DEPTH if img.format == FORMAT_D32_SFLOAT else ASPECT_COLOR
+        var eff_base = max(0, min(img.mip_levels - 1, base_mip))
+        var eff_cnt = max(1, min(img.mip_levels - eff_base, level_count))
+        self.rewind()
+        if self.has_sync2:
+            var imb2 = self.scratch(96)
+            put32(imb2, TYPE_IMAGE_MEMORY_BARRIER_2)
+            put64(imb2 + 16, src_stage)
+            put64(imb2 + 24, Int(src_access))
+            put64(imb2 + 32, dst_stage)
+            put64(imb2 + 40, Int(dst_access))
+            put32(imb2 + 48, old_layout)
+            put32(imb2 + 52, new_layout)
+            put32(imb2 + 56, 0xFFFFFFFF)
+            put32(imb2 + 60, 0xFFFFFFFF)
+            put64(imb2 + 64, img.image)
+            put32(imb2 + 72, aspect)
+            put32(imb2 + 76, UInt32(eff_base))
+            put32(imb2 + 80, UInt32(eff_cnt))
+            put32(imb2 + 84, 0)
+            put32(imb2 + 88, UInt32(max(1, img.layers)))
+            var dep = self.scratch(64)
+            put32(dep, TYPE_DEPENDENCY_INFO)
+            put32(dep + 48, 1)
+            put64(dep + 56, imb2)
+            _ = call2(self.device_call("vkCmdPipelineBarrier2"), self.command_buffers[frame], dep)
+        else:
+            var barrier = self.scratch(72)
+            put32(barrier, TYPE_IMAGE_MEMORY_BARRIER)
+            put32(barrier + 16, src_access)
+            put32(barrier + 20, dst_access)
+            put32(barrier + 24, old_layout)
+            put32(barrier + 28, new_layout)
+            put32(barrier + 32, 0xFFFFFFFF)
+            put32(barrier + 36, 0xFFFFFFFF)
+            put64(barrier + 40, img.image)
+            put32(barrier + 48, aspect)
+            put32(barrier + 52, UInt32(eff_base))
+            put32(barrier + 56, UInt32(eff_cnt))
+            put32(barrier + 60, 0)
+            put32(barrier + 64, UInt32(max(1, img.layers)))
+            _ = call10(self.fn_pipeline_barrier, self.command_buffers[frame], src_stage, dst_stage, 0, 0, 0, 0, 0, 1, barrier)
+
     def memory_barrier2(mut self, frame: Int, src_stage: Int, src_access: Int, dst_stage: Int, dst_access: Int):
         if self.has_sync2:
             self.rewind()
@@ -2787,6 +3842,65 @@ struct VulkanGpu(Copyable, Movable):
             _ = call2(self.device_call("vkCmdPipelineBarrier2"), self.command_buffers[frame], dep)
         else:
             self.barrier(frame, src_stage, UInt32(src_access), dst_stage, UInt32(dst_access))
+
+    def buffer_barrier2_raw(
+        mut self,
+        frame: Int,
+        vk_buffer: Int,
+        offset: Int,
+        size: Int,
+        src_stage: Int,
+        src_access: Int,
+        dst_stage: Int,
+        dst_access: Int,
+    ):
+        """Records a real per-buffer `VkBufferMemoryBarrier2` (falling back to `VkBufferMemoryBarrier` without Sync2)."""
+        if vk_buffer == 0:
+            self.memory_barrier2(frame, src_stage, src_access, dst_stage, dst_access)
+            return
+        self.rewind()
+        var sz = size if size > 0 else WHOLE_SIZE
+        if self.has_sync2:
+            var bmb2 = self.scratch(80)
+            put32(bmb2, TYPE_BUFFER_MEMORY_BARRIER_2)
+            put64(bmb2 + 16, src_stage)
+            put64(bmb2 + 24, src_access)
+            put64(bmb2 + 32, dst_stage)
+            put64(bmb2 + 40, dst_access)
+            put32(bmb2 + 48, 0xFFFFFFFF)
+            put32(bmb2 + 52, 0xFFFFFFFF)
+            put64(bmb2 + 56, vk_buffer)
+            put64(bmb2 + 64, offset)
+            put64(bmb2 + 72, sz)
+            var dep = self.scratch(64)
+            put32(dep, TYPE_DEPENDENCY_INFO)
+            put32(dep + 32, 1)
+            put64(dep + 40, bmb2)
+            _ = call2(self.device_call("vkCmdPipelineBarrier2"), self.command_buffers[frame], dep)
+        else:
+            var bmb = self.scratch(56)
+            put32(bmb, TYPE_BUFFER_MEMORY_BARRIER)
+            put32(bmb + 16, UInt32(src_access))
+            put32(bmb + 20, UInt32(dst_access))
+            put32(bmb + 24, 0xFFFFFFFF)
+            put32(bmb + 28, 0xFFFFFFFF)
+            put64(bmb + 32, vk_buffer)
+            put64(bmb + 40, offset)
+            put64(bmb + 48, sz)
+            _ = call10(self.fn_pipeline_barrier, self.command_buffers[frame], src_stage, dst_stage, 0, 0, 0, 1, bmb, 0, 0)
+
+    def buffer_barrier2(
+        mut self,
+        frame: Int,
+        buf: GpuBuffer,
+        offset: Int,
+        size: Int,
+        src_stage: Int,
+        src_access: Int,
+        dst_stage: Int,
+        dst_access: Int,
+    ):
+        self.buffer_barrier2_raw(frame, buf.vk_buffer, offset, size, src_stage, src_access, dst_stage, dst_access)
 
     def upload_image_mip(
         mut self,
@@ -2896,15 +4010,23 @@ struct VulkanGpu(Copyable, Movable):
         max_bindless_textures: Int,
         has_tlas: Bool,
         push_bytes: Int,
+        storage_image_count: Int = 0,
     ) -> Tuple[Int, Int]:
         """Builds a unified DescriptorSetLayout + PipelineLayout for AAA Graphics, Bindless & Ray-Query passes:
         - bindings `0 .. storage_count - 1`: Storage Buffers (`Vertex | Fragment | Compute`)
         - bindings `storage_count .. storage_count + single_sampler_count - 1`: Combined Image Samplers (VisBuffer, Depth, VSM, Cubemap, LUT)
         - binding `storage_count + single_sampler_count`: Bindless `sampler2D[max_bindless_textures]` (`PARTIALLY_BOUND | UPDATE_AFTER_BIND`)
-        - binding `storage_count + single_sampler_count + 1` (if `has_tlas`): `VkAccelerationStructureKHR`
+        - next binding (if `has_tlas`): `VkAccelerationStructureKHR`
+        - next `storage_image_count` bindings: `DESCRIPTOR_STORAGE_IMAGE` (`PARTIALLY_BOUND | UPDATE_AFTER_BIND`)
         """
         self.rewind()
-        var total_bindings = storage_count + single_sampler_count + (1 if max_bindless_textures > 0 else 0) + (1 if has_tlas else 0)
+        var total_bindings = (
+            storage_count
+            + single_sampler_count
+            + (1 if max_bindless_textures > 0 else 0)
+            + (1 if has_tlas else 0)
+            + storage_image_count
+        )
         var table = self.scratch(total_bindings * 24)
         var flags_arr = self.scratch(total_bindings * 4)
         var all_stages = STAGE_VERTEX_SHADER | STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER
@@ -2947,6 +4069,15 @@ struct VulkanGpu(Copyable, Movable):
             put32(flags_arr + b * 4, DESCRIPTOR_BINDING_PARTIALLY_BOUND)
             b += 1
 
+        for _ in range(storage_image_count):
+            var e = table + b * 24
+            put32(e, UInt32(b))
+            put32(e + 4, DESCRIPTOR_STORAGE_IMAGE)
+            put32(e + 8, 1)
+            put32(e + 12, STAGE_COMPUTE_SHADER)
+            put32(flags_arr + b * 4, DESCRIPTOR_BINDING_PARTIALLY_BOUND | DESCRIPTOR_BINDING_UPDATE_AFTER_BIND)
+            b += 1
+
         var bind_flags_info = self.scratch(32)
         put32(bind_flags_info, TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO)
         put32(bind_flags_info + 16, UInt32(total_bindings))
@@ -2986,17 +4117,23 @@ struct VulkanGpu(Copyable, Movable):
         single_sampler_count: Int,
         max_bindless_textures: Int,
         has_tlas: Bool,
+        storage_image_count: Int = 0,
     ) -> Tuple[Int, Int]:
         self.rewind()
-        var pool_types = 2 + (1 if has_tlas else 0)
+        var pool_types = 2 + (1 if has_tlas else 0) + (1 if storage_image_count > 0 else 0)
         var sizes = self.scratch(pool_types * 8)
         put32(sizes, DESCRIPTOR_STORAGE_BUFFER)
         put32(sizes + 4, UInt32(max(1, storage_count)))
         put32(sizes + 8, DESCRIPTOR_COMBINED_IMAGE_SAMPLER)
         put32(sizes + 12, UInt32(max(1, single_sampler_count + max_bindless_textures)))
+        var p_off = 16
         if has_tlas:
-            put32(sizes + 16, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
-            put32(sizes + 20, 1)
+            put32(sizes + p_off, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
+            put32(sizes + p_off + 4, 1)
+            p_off += 8
+        if storage_image_count > 0:
+            put32(sizes + p_off, DESCRIPTOR_STORAGE_IMAGE)
+            put32(sizes + p_off + 4, UInt32(storage_image_count))
 
         var pool_info = self.scratch(40)
         put32(pool_info, TYPE_DESCRIPTOR_POOL_CREATE_INFO)
@@ -3029,17 +4166,23 @@ struct VulkanGpu(Copyable, Movable):
         single_sampler_count: Int,
         max_bindless_textures: Int,
         has_tlas: Bool,
+        storage_image_count: Int = 0,
     ) -> Tuple[Int, List[Int]]:
         self.rewind()
-        var pool_types = 2 + (1 if has_tlas else 0)
+        var pool_types = 2 + (1 if has_tlas else 0) + (1 if storage_image_count > 0 else 0)
         var sizes = self.scratch(pool_types * 8)
         put32(sizes, DESCRIPTOR_STORAGE_BUFFER)
         put32(sizes + 4, UInt32(max(1, storage_count * count)))
         put32(sizes + 8, DESCRIPTOR_COMBINED_IMAGE_SAMPLER)
         put32(sizes + 12, UInt32(max(1, (single_sampler_count + max_bindless_textures) * count)))
+        var p_off = 16
         if has_tlas:
-            put32(sizes + 16, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
-            put32(sizes + 20, UInt32(count))
+            put32(sizes + p_off, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
+            put32(sizes + p_off + 4, UInt32(count))
+            p_off += 8
+        if storage_image_count > 0:
+            put32(sizes + p_off, DESCRIPTOR_STORAGE_IMAGE)
+            put32(sizes + p_off + 4, UInt32(storage_image_count * count))
 
         var pool_info = self.scratch(40)
         put32(pool_info, TYPE_DESCRIPTOR_POOL_CREATE_INFO)
@@ -3094,6 +4237,28 @@ struct VulkanGpu(Copyable, Movable):
         put64(write + 40, img_info)
         _ = call5(self.fn_update_descriptors, self.device, 1, write, 0, 0)
 
+    def write_aaa_storage_image(
+        mut self,
+        descriptor_set: Int,
+        binding: Int,
+        image_view: Int,
+        image_layout: UInt32 = LAYOUT_GENERAL,
+    ):
+        self.rewind()
+        var img_info = self.scratch(24)
+        put64(img_info, 0)
+        put64(img_info + 8, image_view)
+        put32(img_info + 16, image_layout)
+        var write = self.scratch(64)
+        put32(write, TYPE_WRITE_DESCRIPTOR_SET)
+        put64(write + 16, descriptor_set)
+        put32(write + 24, UInt32(binding))
+        put32(write + 28, 0)
+        put32(write + 32, 1)
+        put32(write + 36, DESCRIPTOR_STORAGE_IMAGE)
+        put64(write + 40, img_info)
+        _ = call5(self.fn_update_descriptors, self.device, 1, write, 0, 0)
+
     def write_aaa_tlas(mut self, descriptor_set: Int, binding: Int, tlas_handle: Int):
         self.rewind()
         var handles = self.scratch(8)
@@ -3134,6 +4299,8 @@ struct VulkanGpu(Copyable, Movable):
         _ = call3(self.device_call("vkDestroyShaderModule"), self.device, module, 0)
         if not self.check(result, "vkCreateComputePipelines(AAA)"):
             return 0
+        if pipeline != 0:
+            self.pso_cache_dirty = True
         return pipeline
 
     def create_graphics_pipeline(
@@ -3149,6 +4316,7 @@ struct VulkanGpu(Copyable, Movable):
         depth_compare: UInt32 = COMPARE_GREATER_OR_EQUAL,
         cull_mode: UInt32 = CULL_MODE_NONE,
         front_face: UInt32 = FRONT_FACE_CCW,
+        alpha_blend: Bool = False,
     ) -> Int:
         """Creates a Vulkan 1.3 `VK_KHR_dynamic_rendering` hardware graphics pipeline (Vertex + optional Fragment)."""
         self.rewind()
@@ -3215,6 +4383,14 @@ struct VulkanGpu(Copyable, Movable):
         put32(ds + 28, depth_compare)
 
         var cb_att = self.scratch(32)
+        if alpha_blend:
+            put32(cb_att + 0, 1)   # blendEnable = VK_TRUE
+            put32(cb_att + 4, 6)   # VK_BLEND_FACTOR_SRC_ALPHA
+            put32(cb_att + 8, 7)   # VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+            put32(cb_att + 12, 0)  # VK_BLEND_OP_ADD
+            put32(cb_att + 16, 1)  # VK_BLEND_FACTOR_ONE
+            put32(cb_att + 20, 7)  # VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+            put32(cb_att + 24, 0)  # VK_BLEND_OP_ADD
         put32(cb_att + 28, 0xF)  # RGBA write mask
 
         var cb = self.scratch(56)
@@ -3261,6 +4437,8 @@ struct VulkanGpu(Copyable, Movable):
             _ = call3(self.device_call("vkDestroyShaderModule"), self.device, f_mod, 0)
         if not self.check(res, "vkCreateGraphicsPipelines"):
             return 0
+        if pipe != 0:
+            self.pso_cache_dirty = True
         return pipe
 
     def destroy_pipeline(mut self, pipeline: Int):
@@ -3293,11 +4471,15 @@ struct VulkanGpu(Copyable, Movable):
         if not self.check(res, "vkCreatePipelineCache"):
             return False
         self.pipeline_cache = get64(slot)
+        self.pso_cache_dirty = False
+        self.initial_pso_cache_bytes = len(data) if has_data else 0
         return True
 
     def save_pipeline_cache(mut self, path: String) -> Bool:
         if self.device == 0 or self.pipeline_cache == 0 or path.byte_length() == 0:
             return False
+        if not self.pso_cache_dirty:
+            return True
         self.rewind()
         var size_slot = self.scratch(8)
         put64(size_slot, 0)
@@ -3307,10 +4489,14 @@ struct VulkanGpu(Copyable, Movable):
         var sz = get64(size_slot)
         if sz <= 0:
             return False
+        if self.initial_pso_cache_bytes > 0 and sz < self.initial_pso_cache_bytes:
+            return True
         var data = List[UInt8](length=sz, fill=0)
         res = call4(self.device_call("vkGetPipelineCacheData"), self.device, self.pipeline_cache, size_slot, Int(data.unsafe_ptr()))
         if not self.check(res, "vkGetPipelineCacheData(data)"):
             return False
+        self.pso_cache_dirty = False
+        self.initial_pso_cache_bytes = sz
         return write_bytes(path, data)
 
     def destroy_aaa_descriptors(mut self, pool: Int, dsl: Int, pipeline_layout: Int):
@@ -3432,6 +4618,27 @@ struct VulkanGpu(Copyable, Movable):
         if len(push) > 0:
             _ = call6(self.fn_push_constants, commands, pipeline_layout, all_stages, 0, len(push) * 4, Int(push.unsafe_ptr()))
         _ = call4(self.fn_dispatch, commands, max(1, groups_x), max(1, groups_y), max(1, groups_z))
+
+    def dispatch_indirect_aaa(
+        mut self,
+        frame: Int,
+        pipeline: Int,
+        pipeline_layout: Int,
+        descriptor_set: Int,
+        push: List[UInt32],
+        arguments: GpuBuffer,
+        offset: Int = 0,
+    ):
+        self.rewind()
+        var commands = self.command_buffers[frame]
+        var sets = self.scratch(8)
+        put64(sets, descriptor_set)
+        var all_stages = Int(STAGE_VERTEX_SHADER | STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER)
+        _ = call3(self.fn_bind_pipeline, commands, BIND_POINT_COMPUTE, pipeline)
+        _ = call8(self.fn_bind_descriptor_sets, commands, BIND_POINT_COMPUTE, pipeline_layout, 0, 1, sets, 0, 0)
+        if len(push) > 0:
+            _ = call6(self.fn_push_constants, commands, pipeline_layout, all_stages, 0, len(push) * 4, Int(push.unsafe_ptr()))
+        _ = call3(self.fn_dispatch_indirect, commands, arguments.vk_buffer, offset)
 
     def draw(mut self, frame: Int, vertex_count: Int, instance_count: Int = 1, first_vertex: Int = 0, first_instance: Int = 0):
         self.rewind()
@@ -3558,6 +4765,27 @@ struct VulkanGpu(Copyable, Movable):
             dst.vk_buffer,
             1,
             region,
+        )
+
+    def fill_buffer(
+        mut self,
+        frame: Int,
+        dst: GpuBuffer,
+        dst_offset: Int,
+        byte_count: Int,
+        data: UInt32 = 0,
+    ):
+        """Fills `dst[dst_offset .. +byte_count]` on the GPU via `vkCmdFillBuffer` (4-byte aligned)."""
+        if byte_count <= 0 or dst.vk_buffer == 0:
+            return
+        self.rewind()
+        _ = call5(
+            self.device_call("vkCmdFillBuffer"),
+            self.command_buffers[frame],
+            dst.vk_buffer,
+            dst_offset,
+            byte_count,
+            Int(data),
         )
 
     def draw_indirect_count(
@@ -3713,6 +4941,9 @@ struct VulkanGpu(Copyable, Movable):
         out.handle = handle
         out.buffer = as_buf^
         out.device_address = as_da
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].ref_count += 1
+            out.ctrl_ptr = self.ctrl_ptr
         return out^
 
     def refit_blas_triangles(
@@ -3855,6 +5086,9 @@ struct VulkanGpu(Copyable, Movable):
 
         out.handle = handle
         out.buffer = as_buf^
+        if self.ctrl_ptr != 0:
+            _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].ref_count += 1
+            out.ctrl_ptr = self.ctrl_ptr
         return out^
 
     def ensure_tlas_capacity(
@@ -3931,6 +5165,9 @@ struct VulkanGpu(Copyable, Movable):
             return False
         tlas.handle = get64(slot)
         tlas.buffer = as_buf^
+        if self.ctrl_ptr != 0 and tlas.ctrl_ptr == 0:
+            _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].ref_count += 1
+            tlas.ctrl_ptr = self.ctrl_ptr
         return True
 
     def record_build_tlas(
@@ -3970,11 +5207,17 @@ struct VulkanGpu(Copyable, Movable):
         _ = call4(self.device_call("vkCmdBuildAccelerationStructuresKHR"), self.command_buffers[frame], 1, binfo, pp_range)
 
     def destroy_accel_struct(mut self, mut accel: VulkanAccelStruct):
-        if accel.handle != 0:
+        if accel.handle != 0 and self.device != 0:
             self.rewind()
             _ = call3(self.device_call("vkDestroyAccelerationStructureKHR"), self.device, accel.handle, 0)
-            accel.handle = 0
+        accel.handle = 0
         if accel.buffer.size > 0:
             self.destroy_buffer(accel.buffer)
             accel.buffer = GpuBuffer()
         accel.device_address = 0
+        if accel.ctrl_ptr != 0:
+            ref ctrl = _vk_ctrl_ptr(accel.ctrl_ptr)[unsafe_offset=0]
+            ctrl.ref_count -= 1
+            if ctrl.ref_count <= 0:
+                _vk_ctrl_free_block(accel.ctrl_ptr)
+            accel.ctrl_ptr = 0

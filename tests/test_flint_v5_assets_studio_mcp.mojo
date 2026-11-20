@@ -18,8 +18,15 @@ Verifies all 6 Track 5 subsystems end-to-end in `< 2s`:
 """
 from std.atomic import Atomic
 from std.ffi import external_call
-from std.math import abs, cos, sin
+from std.math import abs, cos, exp, log, max, min, pow, sin
+from std.memory import bitcast
 from std.sys.info import CompilationTarget
+from std.time import monotonic
+from flint.assets.bc_compress import (
+    bake_toksvig_normal_orm_pyramid,
+    downsample_normals_and_orm_toksvig_2x,
+    f32_to_uf16_bits,
+)
 from flint.assets.cooker_v2 import cook_workspace
 from flint.assets.flpk_v3 import (
     ASSET_KIND_MESH,
@@ -37,10 +44,25 @@ from flint.assets.flpk_v3 import (
     read_flmeta,
     write_flmeta,
 )
-from flint.assets.hdr_image import encode_radiance_hdr
-from flint.assets.image import append_be32, append_chunk, decode_png, write_png
+from flint.assets.glb_native import parse_native_glb
+from flint.assets.glb_writer import encode_native_glb
+from flint.assets.hdr_image import (
+    EXR_DWAA_COMPRESSION,
+    EXR_DWAB_COMPRESSION,
+    EXR_NO_COMPRESSION,
+    EXR_PIZ_COMPRESSION,
+    EXR_RLE_COMPRESSION,
+    decode_exr_fp16,
+    decode_hdr_or_exr,
+    encode_radiance_hdr,
+)
+from flint.assets.image import append_be32, append_chunk, decode_png, encode_png, write_png
+from flint.assets.jpeg import decode_image_auto, decode_jpeg
 from flint.assets.json import parse_json
+from flint.assets.ktx2 import decode_ktx2, decompress_zstd
 from flint.assets.mesh_builder import MeshBuilder
+from flint.assets.meshlet import AaaGeometryPool, MeshLodSlice, _SymQuadric, simplify_mesh_qem
+from flint.assets.model import NativeMesh, NativeModel, NativeTexture
 from flint.assets.server import (
     ASSET_STATE_FAILED,
     ASSET_STATE_LOADING,
@@ -55,7 +77,7 @@ from flint.assets.watcher import AssetWatcher, IN_CLOSE_WRITE, IN_IGNORED, IN_Q_
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool
 from flint.core.lz4 import address_of
-from flint.core.math import Quat, Vec3
+from flint.core.math import Quat, Vec2, Vec3
 from flint.core.transform import Mat4
 from flint.devtools.mcp_v2 import (
     FlintMcpUnixListener,
@@ -64,14 +86,70 @@ from flint.devtools.mcp_v2 import (
     default_mcp_socket_path,
     sanitize_output_path,
 )
+from flint.physics.world import (
+    BODY_MOTION_DYNAMIC,
+    BODY_MOTION_KINEMATIC,
+    BODY_MOTION_STATIC,
+    PhysicsWorld,
+)
+from flint.physics.plugin import ColliderComponent, RigidBodyComponent
 from flint.platform.input import InputState
 from flint.platform.os import get_time, make_dirs, read_bytes, remove_file, write_bytes
+from flint.platform.vulkan import LAYOUT_SHADER_READ_ONLY, LAYOUT_UNDEFINED, VulkanGpu
+from flint.procedural import (
+    ENFORCER_BONE_COUNT,
+    SubdCage,
+    bake_conifer_needle_sprig_512,
+    bake_cyber_billboard_512,
+    bake_fissured_bark_256,
+    bake_interior_windowbox_atlas_512,
+    bake_oak_leaf_sprig_512,
+    bake_palm_frond_512,
+    build_articulated_crowd_pose_bank,
+    build_botanical_oak,
+    build_botanical_palm,
+    build_botanical_pine,
+    build_colonnade_arcade_bay,
+    build_facade_mullion_spandrel_grid,
+    build_flowering_bush,
+    build_grass_wildflower_tuft,
+    build_lathed_wheel_assembly,
+    build_manicured_hedge_and_planter,
+    build_rooftop_hvac_chiller,
+    build_rooftop_vtol_helipad,
+    build_rooftop_vtol_helipad_parts,
+    build_street_bollard_and_grate,
+    build_street_bollard_and_grate_parts,
+    build_street_traffic_cantilever,
+    build_street_traffic_cantilever_parts,
+    build_subd_coaster_car_shell,
+    build_subd_cyber_enforcer_rigged,
+    build_subd_cyber_enforcer_rigged_v3,
+    build_subd_spinner_hovercar_body_and_canopy,
+    build_subd_supercar_body_and_glass,
+    build_subd_traffic_vehicle,
+    build_transit_shelter,
+    build_transit_shelter_parts,
+    build_urban_ginkgo_tree,
+    creased_subdivide,
+    extrude_profile_beveled,
+    make_chamfered_girder_profile,
+    make_curb_profile,
+    subdivide_to_mesh,
+    sweep_catenary_cable,
+    sweep_profile_rmf,
+)
 from flint.render.aaa_bsdf import AaaMaterial
-from flint.render.aaa_renderer import FlintAaaVulkanRenderer
+from flint.render.aaa_renderer import FRAMES_IN_FLIGHT, FlintAaaVulkanRenderer
 from flint.render.font import SdfFont
+from flint.render.material_graph import MaterialAsset
+from flint.render.plugin import MaterialOverrideComponent, MeshRendererComponent
+from flint.render.render_world import RENDER_TIER_0_HEADLESS_SIMD, RENDER_TIER_2_AAA_VISBUFFER_RT, ScalableRenderer
+from flint.scene.transform_hierarchy import Children, GlobalTransform, HierarchyDepth, LocalTransform, Parent
 from flint.studio import (
     COLLIDER_BOX,
     COLLIDER_SPHERE,
+    FIELD_COLOR_RGB,
     FIELD_F32,
     GIZMO_AXIS_X,
     GIZMO_AXIS_Y,
@@ -88,12 +166,19 @@ from flint.studio import (
     FieldVisitor,
     FlintStudioState,
     InspectedField,
+    StudioEntityMetaComponent,
+    StudioStyleComponent,
+    ViewportPickResult,
     ViewportRay,
+    VisBufferGpuPicker,
     bake_procedural_to_glb,
+    build_studio_reference_grid_mesh,
+    build_subd_material_orb,
     decode_visbuffer_pick,
     emit_gizmo_draw_list,
     emit_studio_ui_draw_list,
     encode_visbuffer_words,
+    fill_instance_entity_maps,
     gizmo_rotation_delta_rad,
     gizmo_scale_drag,
     gizmo_world_scale,
@@ -558,6 +643,93 @@ def test_c_visbuffer_picking() raises:
     var err_m = (pick.world_pos - true_pt).length()
     _assert(err_m < Float32(0.01), "analytical VisBuffer 3D world_pos error >= 1 cm: " + String(Float64(err_m)))
 
+    # 40-bit VisBuffer packing/decoding round-trip (instance_id > 1023, meshlet_id > 65535, 8-bit prim, 16-bit mat, sky=0)
+    var w40 = encode_visbuffer_words(instance_id=131075, meshlet_id=200000, material_id=65535, local_prim_id=255)
+    var p40 = decode_visbuffer_pick(
+        px, py, w40[0], w40[1], depth_d32, w, h,
+        cam_pos, cam_fwd, cam_rgt, cam_up, fov_y, near_z,
+    )
+    _assert(
+        p40.hit
+        and p40.instance_id == 131075
+        and p40.meshlet_id == 200000
+        and p40.material_id == 65535
+        and p40.local_prim_id == 255,
+        "40-bit VisBuffer encode/decode failed for large instance_id/meshlet_id",
+    )
+    var p_sky = decode_visbuffer_pick(
+        px, py, UInt32(0), UInt32(0), depth_d32, w, h,
+        cam_pos, cam_fwd, cam_rgt, cam_up, fov_y, near_z,
+    )
+    _assert(not p_sky.hit, "VisBuffer sky word0 == 0 must decode hit=False")
+
+    # Bug 3 regression: NaN, -qNaN, +Inf, -Inf, sub-epsilon, huge depth, invalid camera/basis, and px/py clamping
+    var nan_f32 = bitcast[DType.float32](UInt32(0x7FC00000))
+    var qnan_neg = bitcast[DType.float32](UInt32(0xFFC00001))
+    var pos_inf = bitcast[DType.float32](UInt32(0x7F800000))
+    var neg_inf = bitcast[DType.float32](UInt32(0xFF800000))
+    var bad_depths = List[Float32]()
+    bad_depths.append(nan_f32)
+    bad_depths.append(qnan_neg)
+    bad_depths.append(pos_inf)
+    bad_depths.append(neg_inf)
+    bad_depths.append(Float32(1.0e-8))
+    bad_depths.append(Float32(1.0e9))
+    for di in range(len(bad_depths)):
+        var p_bad = decode_visbuffer_pick(
+            px, py, vis_words[0], vis_words[1], bad_depths[di], w, h,
+            cam_pos, cam_fwd, cam_rgt, cam_up, fov_y, near_z, inst_map,
+        )
+        _assert(
+            not p_bad.hit
+            and p_bad.entity_id == -1
+            and p_bad.linear_depth_m == Float32(0.0)
+            and p_bad.world_pos.x == Float32(0.0)
+            and p_bad.world_pos.y == Float32(0.0)
+            and p_bad.world_pos.z == Float32(0.0),
+            "non-finite or out-of-range depth_d32 must decode hit=False (idx=" + String(di) + ")",
+        )
+
+    var p_bad_near = decode_visbuffer_pick(
+        px, py, vis_words[0], vis_words[1], depth_d32, w, h,
+        cam_pos, cam_fwd, cam_rgt, cam_up, fov_y, Float32(0.0), inst_map,
+    )
+    var p_bad_fov = decode_visbuffer_pick(
+        px, py, vis_words[0], vis_words[1], depth_d32, w, h,
+        cam_pos, cam_fwd, cam_rgt, cam_up, Float32(180.0), near_z, inst_map,
+    )
+    var p_bad_jit = decode_visbuffer_pick(
+        px, py, vis_words[0], vis_words[1], depth_d32, w, h,
+        cam_pos, cam_fwd, cam_rgt, cam_up, fov_y, near_z, inst_map,
+        jitter_clip_x=nan_f32,
+    )
+    var p_bad_pos = decode_visbuffer_pick(
+        px, py, vis_words[0], vis_words[1], depth_d32, w, h,
+        Vec3(nan_f32, 0.0, 0.0), cam_fwd, cam_rgt, cam_up, fov_y, near_z, inst_map,
+    )
+    var p_zero_fwd = decode_visbuffer_pick(
+        px, py, vis_words[0], vis_words[1], depth_d32, w, h,
+        cam_pos, Vec3(0.0, 0.0, 0.0), cam_rgt, cam_up, fov_y, near_z, inst_map,
+    )
+    var p_zero_rgt = decode_visbuffer_pick(
+        px, py, vis_words[0], vis_words[1], depth_d32, w, h,
+        cam_pos, cam_fwd, Vec3(0.0, 0.0, 0.0), cam_up, fov_y, near_z, inst_map,
+    )
+    _assert(
+        not p_bad_near.hit
+        and not p_bad_fov.hit
+        and not p_bad_jit.hit
+        and not p_bad_pos.hit
+        and not p_zero_fwd.hit
+        and not p_zero_rgt.hit,
+        "invalid camera/projection/basis inputs must decode hit=False",
+    )
+    var p_clamp = decode_visbuffer_pick(
+        -50, 99999, vis_words[0], vis_words[1], depth_d32, w, h,
+        cam_pos, cam_fwd, cam_rgt, cam_up, fov_y, near_z, inst_map,
+    )
+    _assert(p_clamp.hit and p_clamp.world_pos.x == p_clamp.world_pos.x, "clamped out-of-bounds px/py must remain valid")
+
     # Headless FlintAaaVulkanRenderer 1-pixel GPU VisBuffer + Reverse-Z depth readback test
     var ren = FlintAaaVulkanRenderer(width=160, height=120, tsr_scale=1.0, max_draws=1024, max_instances=256, env_cube_dim=16)
     if ren.active:
@@ -583,6 +755,8 @@ def test_c_visbuffer_picking() raises:
 
         var gpu_inst_map = List[Int]()
         gpu_inst_map.append(4242)
+        var gpu_inst_bits = List[UInt64]()
+        gpu_inst_bits.append(UInt64(0x123456789ABCDEF0))
         var gpu_pick = pick_renderer_viewport_once(ren, 80, 60, gpu_inst_map)
         _assert(gpu_pick.hit, "GPU VisBuffer center pixel pick must hit quad")
         _assert(gpu_pick.entity_id == 4242 and gpu_pick.instance_id == 0, "GPU pick entity/instance ID mismatch")
@@ -592,7 +766,286 @@ def test_c_visbuffer_picking() raises:
 
         var sky_pick = pick_renderer_viewport_once(ren, 2, 2, gpu_inst_map)
         _assert(not sky_pick.hit, "GPU VisBuffer corner sky pixel must report hit=False")
+
+        # Async non-stalling FRAMES_IN_FLIGHT ring-buffered GPU picking + camera motion snapshot invariance
+        ren.deferred_readback = True
+        var async_picker = VisBufferGpuPicker()
+        var harvested_picks = List[Tuple[UInt64, ViewportPickResult]]()
+
+        # Frame 0: queue & dispatch center hit on slot 0
+        var req_0 = async_picker.request_pick(80, 60, gpu_inst_map, gpu_inst_bits)
+        ren.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), fov_y_deg=55.0, near_z=0.20)
+        ren.draw_instance(me.mesh_id, Mat4(), material_override=mat_id, uniform_scale=1.0)
+        _assert(ren.render_frame(capture_readback=False), "async frame 0 render failed")
+        _assert(async_picker.dispatch_pending_pick(ren, gpu_inst_map, gpu_inst_bits), "async pick 0 dispatch failed")
+        _assert(async_picker.total_submitted == 1, "expected total_submitted == 1 after frame 0")
+
+        # Frame 1: queue & dispatch sky miss on slot 1 (overlapping FRAMES_IN_FLIGHT)
+        var req_1 = async_picker.request_pick(2, 2, gpu_inst_map, gpu_inst_bits)
+        ren.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), fov_y_deg=55.0, near_z=0.20)
+        ren.draw_instance(me.mesh_id, Mat4(), material_override=mat_id, uniform_scale=1.0)
+        _assert(ren.render_frame(capture_readback=False), "async frame 1 render failed")
+        _assert(async_picker.dispatch_pending_pick(ren, gpu_inst_map, gpu_inst_bits), "async pick 1 dispatch failed")
+        _assert(async_picker.total_submitted == 2, "expected total_submitted == 2 after frame 1")
+
+        # Frame 2..16: move camera away while harvesting to verify camera snapshot invariance!
+        for pf in range(16):
+            while True:
+                var polled = async_picker.poll_completed_pick_entry(ren)
+                if not polled:
+                    break
+                harvested_picks.append(polled.value())
+            if len(harvested_picks) >= 2:
+                break
+            var cam_x = Float32(10.0 + Float32(pf))
+            ren.begin_frame(Vec3(cam_x, 3.0, -4.0), Vec3(cam_x, 3.0, 2.0), fov_y_deg=55.0, near_z=0.20)
+            ren.draw_instance(me.mesh_id, Mat4(), material_override=mat_id, uniform_scale=1.0)
+            _assert(ren.render_frame(capture_readback=False), "async pump frame failed")
+
+        while len(harvested_picks) < 2 and async_picker.is_pick_inflight():
+            ren.flush_deferred_frame()
+            while True:
+                var polled = async_picker.poll_completed_pick_entry(ren)
+                if not polled:
+                    break
+                harvested_picks.append(polled.value())
+
+        _assert(len(harvested_picks) == 2 and async_picker.total_harvested == 2, "async ring-buffer must harvest both picks")
+        _assert(harvested_picks[0][0] == req_0 and harvested_picks[1][0] == req_1, "async pick request_id ordering mismatch")
+        var hp0 = harvested_picks[0][1]
+        var hp1 = harvested_picks[1][1]
+        _assert(
+            hp0.hit
+            and hp0.entity_id == 4242
+            and hp0.entity_bits == UInt64(0x123456789ABCDEF0)
+            and hp0.material_id == mat_id
+            and abs(hp0.world_pos.z - Float32(3.5)) < Float32(0.01),
+            "async pick 0 snapshot-invariant decode failed",
+        )
+        _assert(not hp1.hit, "async pick 1 sky pixel must report hit=False")
+
+        # Bug 2 regression: Option A preserves RenderGraph aliasing + keeps vis_img in LAYOUT_SHADER_READ_ONLY
+        ren.flush_deferred_frame()
+        var rg_m = ren.get_render_graph_aliasing_metrics()
+        _assert(
+            ren.vis_img.suballoc_block == -2
+            and ren.post_alias_img.suballoc_block == -2
+            and ren.render_graph.aliased_img_peak_bytes > 0
+            and rg_m.compiled_barrier_count >= 7
+            and ren.render_graph.aliasing_barriers_compiled > 0,
+            "Bug 2 Option A must preserve all AaaRenderGraph aliasing allocations and metrics",
+        )
+        ren.deferred_readback = False
+        ren.force_readback = False
+        ren.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), fov_y_deg=55.0, near_z=0.20)
+        ren.draw_instance(me.mesh_id, Mat4(), material_override=mat_id, uniform_scale=1.0)
+        _assert(ren.render_frame(capture_readback=False, force_readback=False), "steady-state render_frame failed")
+        _assert(
+            ren.vis_img.layout == LAYOUT_SHADER_READ_ONLY
+            and ren.depth_img.layout == LAYOUT_SHADER_READ_ONLY
+            and ren.post_alias_img.layout == LAYOUT_UNDEFINED,
+            "Bug 2 Option A: vis_img/depth_img must remain LAYOUT_SHADER_READ_ONLY and post_alias_img LAYOUT_UNDEFINED",
+        )
+        var steady_pick = pick_renderer_viewport_once(ren, 80, 60, gpu_inst_map)
+        _assert(
+            steady_pick.hit
+            and steady_pick.entity_id == 4242
+            and abs(steady_pick.world_pos.z - Float32(3.5)) < Float32(0.01),
+            "post-frame pick after Bug 2 Option A fix must hit entity 4242 within 1 cm",
+        )
+        # Verify dispatch_pending_pick refuses LAYOUT_UNDEFINED vis_img and succeeds once restored
+        _ = async_picker.request_pick(80, 60)
+        ren.vis_img.layout = LAYOUT_UNDEFINED
+        _assert(
+            not async_picker.dispatch_pending_pick(ren, gpu_inst_map, gpu_inst_bits),
+            "dispatch_pending_pick must return False when vis_img.layout != LAYOUT_SHADER_READ_ONLY",
+        )
+        ren.vis_img.layout = LAYOUT_SHADER_READ_ONLY
+        _assert(
+            async_picker.dispatch_pending_pick(ren, gpu_inst_map, gpu_inst_bits),
+            "dispatch_pending_pick must succeed once vis_img.layout == LAYOUT_SHADER_READ_ONLY",
+        )
+        var b2_slot = (async_picker.write_cursor + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT
+        if async_picker.slots[b2_slot].fence != 0:
+            _ = ren.vk.wait(async_picker.slots[b2_slot].fence)
+        var b2_got = async_picker.poll_completed_pick(ren)
+        _assert(b2_got and b2_got.value().hit and b2_got.value().entity_id == 4242, "restored-layout pick failed")
+
+        async_picker.shutdown(ren)
         ren.shutdown()
+
+    # Bug 1 regression: Studio E2E instance-to-entity filtering (mesh_id=-1 / OOB), 1-arg vs explicit overload, and delete-all empty-map check
+    var st_pick = FlintStudioState(headless=True, render_tier=RENDER_TIER_2_AAA_VISBUFFER_RT, width=320, height=240)
+    var st_r_opt = st_pick.app.resources.get_ptr_mut[ScalableRenderer]()
+    if st_r_opt and st_r_opt.value()[unsafe_offset=0].uses_vulkan():
+        var quad_mb = MeshBuilder()
+        var qv0 = quad_mb.add_vertex(Vec3(-0.75, -0.75, 0.0), Vec3(0.0, 0.0, -1.0), 0.0, 1.0)
+        var qv1 = quad_mb.add_vertex(Vec3(0.75, -0.75, 0.0), Vec3(0.0, 0.0, -1.0), 1.0, 1.0)
+        var qv2 = quad_mb.add_vertex(Vec3(0.75, 0.75, 0.0), Vec3(0.0, 0.0, -1.0), 1.0, 0.0)
+        var qv3 = quad_mb.add_vertex(Vec3(-0.75, 0.75, 0.0), Vec3(0.0, 0.0, -1.0), 0.0, 0.0)
+        quad_mb.add_tri(qv0, qv1, qv2)
+        quad_mb.add_tri(qv0, qv2, qv3)
+        var valid_mat_id = st_r_opt.value()[unsafe_offset=0].register_material(
+            MaterialAsset(base_color=Vec3(0.2, 0.8, 0.3), roughness=0.4, metallic=0.1)
+        )
+        var valid_mesh_id = st_r_opt.value()[unsafe_offset=0].register_mesh(quad_mb^.finish(), valid_mat_id, build_lods=False)
+        ref st_gpu = st_r_opt.value()[unsafe_offset=0].gpu_slot[0]
+        st_gpu.tsr_history_weight = Float32(0.0)
+        st_gpu.enable_vsm = False
+        st_gpu.enable_rt_shadows = False
+        st_gpu.enable_rt_reflections = False
+        st_gpu.enable_rt_gi = False
+
+        var bad_neg = st_pick.spawn_entity("BadNeg", position=Vec3(-4.0, 0.0, 4.0), mesh_id=-1, record_undo=False)
+        var bad_oob = st_pick.spawn_entity("BadOob", position=Vec3(4.0, 0.0, 4.0), mesh_id=999, record_undo=False)
+        var valid_first = st_pick.spawn_entity("ValidFirst", position=Vec3(-2.0, 0.0, 4.0), mesh_id=valid_mesh_id, record_undo=False)
+        var valid_after_bad = st_pick.spawn_entity("ValidAfterBad", position=Vec3(0.0, 0.0, 4.0), mesh_id=valid_mesh_id, record_undo=False)
+        var valid_after_bits = st_pick.resolve_entity(valid_after_bad).to_bits()
+
+        st_pick.look_at(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 4.0))
+        st_pick.render_editor_frame(320, 240)
+
+        var inst_to_ent = List[Int]()
+        var inst_to_bits = List[UInt64]()
+        fill_instance_entity_maps(st_pick, inst_to_ent, inst_to_bits)
+        _assert(
+            len(inst_to_ent) == 2
+            and len(inst_to_bits) == 2
+            and inst_to_ent[0] == valid_first
+            and inst_to_ent[1] == valid_after_bad
+            and len(inst_to_ent) == len(st_gpu.frame_instances),
+            "fill_instance_entity_maps must filter mesh_id=-1 and OOB mesh_id to match gpu.frame_instances",
+        )
+
+        var pt_proj = project_world_to_viewport(
+            Vec3(0.0, 0.0, 4.0), 0.0, 0.0, 320.0, 240.0,
+            st_pick.cam_pos, st_pick.cam_fwd, st_pick.cam_right, st_pick.cam_up, st_pick.fov_y_deg, Float32(0.15),
+        )
+        _assert(pt_proj[3], "ValidAfterBad center must project in front of camera")
+        var px_v = Int(pt_proj[0])
+        var py_v = Int(pt_proj[1])
+
+        var st_picker = VisBufferGpuPicker()
+        var req_explicit = st_picker.request_pick(px_v, py_v)
+        _assert(
+            st_picker.dispatch_pending_pick(st_gpu, inst_to_ent, inst_to_bits),
+            "Studio E2E explicit-map dispatch_pending_pick failed",
+        )
+        _assert(
+            len(st_picker.queued_inst_to_ent) == 0 and len(st_picker.queued_inst_to_bits) == 0,
+            "dispatch_pending_pick must clear queued_inst_to_ent/bits upon successful dispatch",
+        )
+        var sl_exp = (st_picker.write_cursor + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT
+        if st_picker.slots[sl_exp].fence != 0:
+            _ = st_gpu.vk.wait(st_picker.slots[sl_exp].fence)
+        var got_exp = st_picker.poll_completed_pick_entry(st_gpu)
+        _assert(
+            got_exp
+            and got_exp.value()[0] == req_explicit
+            and got_exp.value()[1].hit
+            and got_exp.value()[1].entity_id == valid_after_bad
+            and got_exp.value()[1].entity_bits == valid_after_bits,
+            "ValidAfterBad explicit-map pick selected wrong entity or generation bits",
+        )
+
+        # 1-arg dispatch_pending_pick with maps passed at request_pick time
+        var req_1arg = st_picker.request_pick(px_v, py_v, inst_to_ent, inst_to_bits)
+        _assert(st_picker.dispatch_pending_pick(st_gpu), "1-arg dispatch_pending_pick failed")
+        _assert(
+            len(st_picker.queued_inst_to_ent) == 0 and len(st_picker.queued_inst_to_bits) == 0,
+            "1-arg dispatch_pending_pick must clear queued_inst_to_ent/bits",
+        )
+        var sl_1arg = (st_picker.write_cursor + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT
+        if st_picker.slots[sl_1arg].fence != 0:
+            _ = st_gpu.vk.wait(st_picker.slots[sl_1arg].fence)
+        var got_1arg = st_picker.poll_completed_pick_entry(st_gpu)
+        _assert(
+            got_1arg
+            and got_1arg.value()[0] == req_1arg
+            and got_1arg.value()[1].hit
+            and got_1arg.value()[1].entity_id == valid_after_bad
+            and got_1arg.value()[1].entity_bits == valid_after_bits,
+            "1-arg dispatch_pending_pick failed to decode queued maps",
+        )
+
+        # Delete-all-entities empty-map check (explicit empty overload + 1-arg empty frame_instances)
+        var req_del = st_picker.request_pick(160, 120, inst_to_ent, inst_to_bits)
+        _ = st_pick.despawn_entity(bad_neg, record_undo=False)
+        _ = st_pick.despawn_entity(bad_oob, record_undo=False)
+        _ = st_pick.despawn_entity(valid_first, record_undo=False)
+        _ = st_pick.despawn_entity(valid_after_bad, record_undo=False)
+        st_pick.render_editor_frame(320, 240)
+        fill_instance_entity_maps(st_pick, inst_to_ent, inst_to_bits)
+        _assert(
+            len(inst_to_ent) == 0 and len(inst_to_bits) == 0 and len(st_gpu.frame_instances) == 0,
+            "delete-all-entities must yield empty inst_to_ent and frame_instances",
+        )
+        _assert(
+            st_picker.dispatch_pending_pick(st_gpu, inst_to_ent, inst_to_bits),
+            "empty-scene explicit dispatch_pending_pick failed",
+        )
+        var sl_del = (st_picker.write_cursor + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT
+        _assert(
+            len(st_picker.slots[sl_del].instance_to_entity) == 0
+            and len(st_picker.slots[sl_del].instance_to_entity_bits) == 0
+            and len(st_picker.queued_inst_to_ent) == 0
+            and len(st_picker.queued_inst_to_bits) == 0,
+            "empty-scene dispatch must NOT fall back to stale queued_inst_to_ent/bits",
+        )
+        if st_picker.slots[sl_del].fence != 0:
+            _ = st_gpu.vk.wait(st_picker.slots[sl_del].fence)
+        var got_del = st_picker.poll_completed_pick_entry(st_gpu)
+        _assert(
+            got_del and got_del.value()[0] == req_del and (not got_del.value()[1].hit) and got_del.value()[1].entity_id == -1,
+            "empty-scene pick must report hit=False, entity_id=-1",
+        )
+
+        # Also verify 1-arg dispatch_pending_pick with 0 frame_instances ignores stale request_pick maps
+        var stale_ents = List[Int]()
+        stale_ents.append(valid_after_bad)
+        var stale_bits = List[UInt64]()
+        stale_bits.append(valid_after_bits)
+        var req_del_1arg = st_picker.request_pick(160, 120, stale_ents, stale_bits)
+        _assert(st_picker.dispatch_pending_pick(st_gpu), "empty-scene 1-arg dispatch_pending_pick failed")
+        var sl_del_1arg = (st_picker.write_cursor + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT
+        _assert(
+            len(st_picker.slots[sl_del_1arg].instance_to_entity) == 0
+            and len(st_picker.slots[sl_del_1arg].instance_to_entity_bits) == 0
+            and len(st_picker.queued_inst_to_ent) == 0,
+            "empty-scene 1-arg dispatch must drop stale queued_inst_to_ent when frame_instances is empty",
+        )
+        if st_picker.slots[sl_del_1arg].fence != 0:
+            _ = st_gpu.vk.wait(st_picker.slots[sl_del_1arg].fence)
+        var got_del_1arg = st_picker.poll_completed_pick_entry(st_gpu)
+        _assert(
+            got_del_1arg and got_del_1arg.value()[0] == req_del_1arg and (not got_del_1arg.value()[1].hit),
+            "empty-scene 1-arg pick must report hit=False",
+        )
+
+        st_picker.shutdown(st_gpu)
+    st_pick.shutdown()
+
+    # Tier-0 / software fallback picking through VisBufferGpuPicker unified queue
+    var sw_studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=320, height=240)
+    sw_studio.look_at(Vec3(0.0, 1.0, -6.0), Vec3(0.0, 1.0, 0.0))
+    var box_id = sw_studio.spawn_entity("SwPickBox", position=Vec3(0.0, 1.0, 0.0), collider_kind=COLLIDER_BOX, collider_half_extents=Vec3(0.75, 0.75, 0.75))
+    var sw_picker = VisBufferGpuPicker()
+    var sw_req = sw_picker.request_pick(160, 120)
+    var sw_ray = ViewportRay.from_screen(
+        160.0, 120.0, 0.0, 0.0, 320.0, 240.0,
+        sw_studio.cam_pos, sw_studio.cam_fwd, sw_studio.cam_right, sw_studio.cam_up, sw_studio.fov_y_deg,
+    )
+    var sw_hit = sw_studio.raycast_scene(sw_ray.origin, sw_ray.dir, 100.0)
+    _assert(sw_hit.hit and sw_hit.entity_id == box_id, "Tier-0 raycast_scene missed SwPickBox")
+    var sw_res = ViewportPickResult()
+    sw_res.hit = sw_hit.hit
+    sw_res.entity_id = sw_hit.entity_id
+    sw_res.entity_bits = sw_studio.resolve_entity(box_id).to_bits()
+    sw_res.linear_depth_m = sw_hit.distance
+    sw_res.world_pos = sw_hit.point
+    sw_picker.push_software_pick_result(sw_req, sw_res)
+    _assert(sw_picker.has_completed_pick() and sw_picker.total_harvested == 1, "software pick queue failed")
+    sw_studio.shutdown()
 
 
 # ============================================================================
@@ -722,14 +1175,14 @@ def test_e_undo_redo_50_and_pie_120_ticks() raises:
     # Verify Inspectable + FieldVisitor reflection (including NPR/VFX/Stepped-Anim fields)
     var drop_id = studio.spawn_entity(
         "DynamicSphere",
-        position=Vec3(0.0, 5.0, 0.0),
+        position=Vec3(-6.0, 5.0, 4.0),
         collider_kind=COLLIDER_SPHERE,
         collider_half_extents=Vec3(0.5, 0.5, 0.5),
         mass=8.0,
     )
     var fvis = FieldVisitor()
     studio.entities[drop_id].inspect(fvis)
-    _assert(len(fvis.fields) == 26, "FieldVisitor must reflect all 26 StudioEntityNode properties")
+    _assert(len(fvis.fields) == 26, "FieldVisitor must reflect all 26 StudioEntityView properties")
 
     # Verify configure_entity_npr_cel, configure_entity_stylized_vfx & patch_entity_field Undo/Redo fnv64 invertibility
     var h_npr_base = studio.state_hash()
@@ -1550,6 +2003,2032 @@ def test_h_wave2_png_async_studio_scene(tmp_root: String, pack_path: String, mut
     print("    [OK] Hardened PNG decoder, async AssetServer & Studio .flscene round-trip passed!")
 
 
+def _test_put_u16_le(mut out: List[UInt8], v: Int):
+    out.append(UInt8(v & 0xFF))
+    out.append(UInt8((v >> 8) & 0xFF))
+
+
+def _test_put_u32_le(mut out: List[UInt8], v: UInt32):
+    out.append(UInt8(v & 0xFF))
+    out.append(UInt8((v >> 8) & 0xFF))
+    out.append(UInt8((v >> 16) & 0xFF))
+    out.append(UInt8((v >> 24) & 0xFF))
+
+
+def _test_put_u64_le(mut out: List[UInt8], v: UInt64):
+    _test_put_u32_le(out, UInt32(v & 0xFFFFFFFF))
+    _test_put_u32_le(out, UInt32((v >> 32) & 0xFFFFFFFF))
+
+
+def _test_put_u16_be(mut out: List[UInt8], v: Int):
+    out.append(UInt8((v >> 8) & 0xFF))
+    out.append(UInt8(v & 0xFF))
+
+
+def _wrap_zlib_stored(raw: List[UInt8]) -> List[UInt8]:
+    var out = List[UInt8]()
+    out.append(0x78)
+    out.append(0x01)
+    var pos = 0
+    while pos < len(raw) or len(raw) == 0:
+        var chunk = min(65535, len(raw) - pos)
+        var last = 1 if (pos + chunk >= len(raw)) else 0
+        out.append(UInt8(last))
+        _test_put_u16_le(out, chunk)
+        _test_put_u16_le(out, chunk ^ 0xFFFF)
+        for i in range(chunk):
+            out.append(raw[pos + i])
+        pos += chunk
+        if len(raw) == 0:
+            break
+    # Adler32
+    var s1: UInt32 = 1
+    var s2: UInt32 = 0
+    for b in raw:
+        s1 = (s1 + UInt32(b)) % 65521
+        s2 = (s2 + s1) % 65521
+    var adler = (s2 << 16) | s1
+    out.append(UInt8((adler >> 24) & 0xFF))
+    out.append(UInt8((adler >> 16) & 0xFF))
+    out.append(UInt8((adler >> 8) & 0xFF))
+    out.append(UInt8(adler & 0xFF))
+    return out^
+
+
+def _wrap_zstd_frame(raw: List[UInt8], rle_byte: Int = -1, rle_len: Int = 0) -> List[UInt8]:
+    var out = List[UInt8]()
+    _test_put_u32_le(out, 0xFD2FB528)
+    out.append(0x20)  # single segment, 1-byte FCS
+    var total = rle_len if rle_byte >= 0 else len(raw)
+    out.append(UInt8(total))
+    var btype = 1 if rle_byte >= 0 else 0
+    var bh = (total << 3) | (btype << 1) | 1
+    out.append(UInt8(bh & 0xFF))
+    out.append(UInt8((bh >> 8) & 0xFF))
+    out.append(UInt8((bh >> 16) & 0xFF))
+    if rle_byte >= 0:
+        out.append(UInt8(rle_byte))
+    else:
+        for b in raw:
+            out.append(b)
+    return out^
+
+
+def _build_ktx2_bytes(
+    w: Int,
+    h: Int,
+    vk_fmt: Int,
+    supercomp: Int,
+    color_model: Int,
+    level_payload: List[UInt8],
+    uncomp_len: Int,
+    sgd: List[UInt8] = List[UInt8](),
+) -> List[UInt8]:
+    var out = List[UInt8]()
+    var magic: List[UInt8] = [0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A]
+    for b in magic:
+        out.append(b)
+    _test_put_u32_le(out, UInt32(vk_fmt))
+    _test_put_u32_le(out, 1)  # typeSize
+    _test_put_u32_le(out, UInt32(w))
+    _test_put_u32_le(out, UInt32(h))
+    _test_put_u32_le(out, 0)  # depth
+    _test_put_u32_le(out, 0)  # layerCount
+    _test_put_u32_le(out, 1)  # faceCount
+    _test_put_u32_le(out, 1)  # levelCount
+    _test_put_u32_le(out, UInt32(supercomp))
+
+    var dfd_off = 80 + 24
+    var dfd_len = 44
+    var sgd_off = dfd_off + dfd_len
+    var sgd_len = len(sgd)
+    var data_off = sgd_off + sgd_len
+
+    _test_put_u32_le(out, UInt32(dfd_off))
+    _test_put_u32_le(out, UInt32(dfd_len))
+    _test_put_u32_le(out, 0)
+    _test_put_u32_le(out, 0)
+    _test_put_u64_le(out, UInt64(sgd_off if sgd_len > 0 else 0))
+    _test_put_u64_le(out, UInt64(sgd_len))
+
+    # Level 0 index (24 bytes)
+    _test_put_u64_le(out, UInt64(data_off))
+    _test_put_u64_le(out, UInt64(len(level_payload)))
+    _test_put_u64_le(out, UInt64(uncomp_len))
+
+    # Standard 44-byte Khronos DFD v1.3 (+8 versionNumber=2, +10 blockSize=40, +12 colorModel)
+    _test_put_u32_le(out, UInt32(dfd_len))
+    _test_put_u32_le(out, 0)
+    _test_put_u16_le(out, 2)
+    _test_put_u16_le(out, dfd_len - 4)
+    out.append(UInt8(color_model))
+    out.append(1); out.append(1); out.append(0)
+    for _ in range(28):
+        out.append(0)
+
+    for b in sgd:
+        out.append(b)
+    for b in level_payload:
+        out.append(b)
+    return out^
+
+
+def _exr_rle_compress(raw: List[UInt8]) -> List[UInt8]:
+    """Valid OpenEXR RLE compressor (literal runs)."""
+    var out = List[UInt8]()
+    var pos = 0
+    while pos < len(raw):
+        var run = min(127, len(raw) - pos)
+        out.append(bitcast[DType.uint8](Int8(-run)))
+        for i in range(run):
+            out.append(raw[pos + i])
+        pos += run
+    return out^
+
+
+def _exr_reorder_and_predict(raw: List[UInt8]) -> List[UInt8]:
+    """Inverse of `_exr_undo_predictor_and_reorder` for building valid ZIP/RLE/DWA test fixtures."""
+    var n = len(raw)
+    if n <= 1:
+        return raw.copy()
+    var pred = List[UInt8](length=n, fill=0)
+    var half = (n + 1) // 2
+    var i1 = 0
+    var i2 = half
+    var j = 0
+    while j < n:
+        pred[i1] = raw[j]
+        i1 += 1; j += 1
+        if j < n:
+            pred[i2] = raw[j]
+            i2 += 1; j += 1
+    var out = List[UInt8](length=n, fill=0)
+    out[0] = pred[0]
+    for i in range(1, n):
+        out[i] = UInt8((Int(pred[i]) - Int(pred[i - 1]) + 128) & 0xFF)
+    return out^
+
+
+def _exr_wenc14(a: UInt16, b: UInt16) -> Tuple[UInt16, UInt16]:
+    var ai = Int(a)
+    var bi = Int(b)
+    var hi = (ai - bi) & 0xFFFF
+    var h_s = Int(bitcast[DType.int16](UInt16(hi)))
+    var li = (ai - (h_s & 1) - (h_s >> 1)) & 0xFFFF
+    return (UInt16(li), UInt16(hi))
+
+
+def _exr_wav2_encode(mut buf: List[UInt16], base: Int, nx: Int, ox: Int, ny: Int, oy: Int):
+    var n = nx if nx < ny else ny
+    var p = 1
+    var p2 = 2
+    while p2 <= n:
+        var y_end = oy * (ny - p2)
+        var x_end = ox * (nx - p2)
+        var iy = 0
+        while iy <= y_end:
+            var ix = 0
+            while ix <= x_end:
+                var i00 = base + iy + ix
+                var i01 = i00 + ox * p
+                var i10 = i00 + oy * p
+                var i11 = i10 + ox * p
+                var h0 = _exr_wenc14(buf[i00], buf[i01]); buf[i00] = h0[0]; buf[i01] = h0[1]
+                var h1 = _exr_wenc14(buf[i10], buf[i11]); buf[i10] = h1[0]; buf[i11] = h1[1]
+                var v0 = _exr_wenc14(buf[i00], buf[i10]); buf[i00] = v0[0]; buf[i10] = v0[1]
+                var v1 = _exr_wenc14(buf[i01], buf[i11]); buf[i01] = v1[0]; buf[i11] = v1[1]
+                ix += ox * p2
+            if (nx & p) != 0:
+                var i00 = base + iy + ix
+                var i10 = i00 + oy * p
+                var v0 = _exr_wenc14(buf[i00], buf[i10]); buf[i00] = v0[0]; buf[i10] = v0[1]
+            iy += oy * p2
+        if (ny & p) != 0:
+            var ix = 0
+            while ix <= x_end:
+                var i00 = base + iy + ix
+                var i01 = i00 + ox * p
+                var h0 = _exr_wenc14(buf[i00], buf[i01]); buf[i00] = h0[0]; buf[i01] = h0[1]
+                ix += ox * p2
+        p = p2
+        p2 <<= 1
+
+
+struct _ExrMsbWriter(Movable):
+    var out: List[UInt8]
+    var buf: UInt64
+    var cnt: Int
+    var total_bits: Int
+
+    def __init__(out self):
+        self.out = List[UInt8]()
+        self.buf = 0
+        self.cnt = 0
+        self.total_bits = 0
+
+    def write_msb(mut self, val: UInt64, bits: Int):
+        for i in range(bits):
+            var b = (val >> UInt64(bits - 1 - i)) & 1
+            self.buf = (self.buf << 1) | b
+            self.cnt += 1
+            self.total_bits += 1
+            if self.cnt == 8:
+                self.out.append(UInt8(self.buf & 0xFF))
+                self.buf = 0
+                self.cnt = 0
+
+    def flush(mut self):
+        if self.cnt > 0:
+            self.out.append(UInt8((self.buf << UInt64(8 - self.cnt)) & 0xFF))
+            self.buf = 0
+            self.cnt = 0
+
+
+def _build_exr_huf_blob(vals: List[UInt16]) -> List[UInt8]:
+    """Minimal valid OpenEXR MSB-first canonical Huffman encoder for test fixtures."""
+    var max_s = 0
+    for v in vals:
+        if Int(v) > max_s:
+            max_s = Int(v)
+    var sym_limit = max(1, max_s + 1)
+    # Assign uniform 8-bit or 16-bit code length across 0..max_s
+    var blen = 1
+    while (1 << blen) <= sym_limit:
+        blen += 1
+    var im = 0
+    var iM = max_s + 1  # rle_sym
+    var tw = _ExrMsbWriter()
+    for _ in range(im, iM + 1):
+        tw.write_msb(UInt64(blen), 6)
+    tw.flush()
+
+    var first_code = UInt64(0)
+    var dw = _ExrMsbWriter()
+    for v in vals:
+        dw.write_msb(first_code + UInt64(v), blen)
+    var n_bits = dw.total_bits
+    dw.flush()
+
+    var out = List[UInt8]()
+    _test_put_u32_le(out, UInt32(im))
+    _test_put_u32_le(out, UInt32(iM))
+    _test_put_u32_le(out, UInt32(len(tw.out)))
+    _test_put_u32_le(out, UInt32(n_bits))
+    _test_put_u32_le(out, 0)
+    for b in tw.out:
+        out.append(b)
+    for b in dw.out:
+        out.append(b)
+    return out^
+
+
+def _write_exr_header(mut out: List[UInt8], w: Int, h: Int, compression: Int, tiled: Bool, tile_x: Int = 4, tile_y: Int = 4, mipmap: Bool = False):
+    _test_put_u32_le(out, 20000630)
+    _test_put_u32_le(out, UInt32(2 | (0x200 if tiled else 0)))
+    for attr in ["channels", "chlist"]:
+        for b in attr.as_bytes():
+            out.append(b)
+        out.append(0)
+    _test_put_u32_le(out, 3 * 18 + 1)
+    for ch in ["B", "G", "R"]:
+        for b in ch.as_bytes():
+            out.append(b)
+        out.append(0)
+        _test_put_u32_le(out, 1)  # HALF
+        out.append(1); out.append(0); out.append(0); out.append(0)
+        _test_put_u32_le(out, 1); _test_put_u32_le(out, 1)
+    out.append(0)
+    for attr in ["compression", "compression"]:
+        for b in attr.as_bytes():
+            out.append(b)
+        out.append(0)
+    _test_put_u32_le(out, 1)
+    out.append(UInt8(compression))
+    for win in ["dataWindow", "displayWindow"]:
+        for b in win.as_bytes():
+            out.append(b)
+        out.append(0)
+        for b in "box2i".as_bytes():
+            out.append(b)
+        out.append(0)
+        _test_put_u32_le(out, 16)
+        _test_put_u32_le(out, 0); _test_put_u32_le(out, 0)
+        _test_put_u32_le(out, UInt32(w - 1)); _test_put_u32_le(out, UInt32(h - 1))
+    if tiled:
+        for attr in ["tiles", "tiledesc"]:
+            for b in attr.as_bytes():
+                out.append(b)
+            out.append(0)
+        _test_put_u32_le(out, 9)
+        _test_put_u32_le(out, UInt32(tile_x))
+        _test_put_u32_le(out, UInt32(tile_y))
+        out.append(UInt8(1 if mipmap else 0))
+    out.append(0)
+
+
+struct _Sof2BitWriter(Movable):
+    var out: List[UInt8]
+    var buf: UInt32
+    var count: Int
+
+    def __init__(out self):
+        self.out = List[UInt8]()
+        self.buf = 0
+        self.count = 0
+
+    def write_bits(mut self, code: Int, nbits: Int):
+        if nbits <= 0:
+            return
+        self.buf = (self.buf << UInt32(nbits)) | UInt32(code & ((1 << nbits) - 1))
+        self.count += nbits
+        while self.count >= 8:
+            self.count -= 8
+            var b = UInt8((self.buf >> UInt32(self.count)) & 0xFF)
+            self.out.append(b)
+            if b == 0xFF:
+                self.out.append(0x00)
+
+    def flush_and_rst(mut self, rst_idx: Int):
+        if self.count > 0:
+            var pad = 8 - self.count
+            self.write_bits((1 << pad) - 1, pad)
+        self.count = 0
+        self.buf = 0
+        if rst_idx >= 0:
+            self.out.append(0xFF)
+            self.out.append(UInt8(0xD0 + (rst_idx & 7)))
+
+
+def test_i_f20_residency_and_f21_codecs(tmp_root: String) raises:
+    print("  [i] Testing F20 loose_root font/audio + Vulkan residency mip upload/eviction & F21 GLB/KTX2/SOF2/EXR codecs...")
+
+    # ---- F20: AssetServer loose_root load_font / load_audio + hot reload ----
+    var f20_ws = tmp_root + "/f20_loose"
+    _ = make_dirs(f20_ws + "/audio")
+    _ = make_dirs(f20_ws + "/fonts")
+    var wav = _make_minimal_wav_16bit()
+    _assert(write_bytes(f20_ws + "/audio/loose_tone.wav", wav), "write loose wav failed")
+    var ttf_src = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+    var ttf_bytes = read_bytes(ttf_src)
+    var has_sys_ttf = len(ttf_bytes) > 0
+    if has_sys_ttf:
+        _assert(write_bytes(f20_ws + "/fonts/mono.ttf", ttf_bytes), "write loose ttf failed")
+
+    var fsrv = AssetServer(stream_budget_bytes_per_tick=65536, enable_watcher=False)
+    _ = fsrv.watch_loose_directory(f20_ws)
+    var h_aud = fsrv.load_audio("audio/loose_tone.wav")
+    _assert(h_aud.is_valid() and fsrv.audios.is_loaded(h_aud), "loose_root load_audio failed")
+    var aud_p = fsrv.audios.borrow(h_aud)
+    _assert(aud_p[].channels == 1 and aud_p[].sample_rate == 48000 and len(aud_p[].samples) == 64, "loose audio PCM mismatch")
+    var ep_aud0 = fsrv.audios.reload_epoch(h_aud)
+    _assert(fsrv._hot_reload_path("audio/loose_tone.wav"), "hot reload loose audio failed")
+    _assert(fsrv.audios.reload_epoch(h_aud) > ep_aud0, "hot reload audio must bump reload_epoch")
+
+    if has_sys_ttf:
+        var h_fnt = fsrv.load_font("fonts/mono.ttf")
+        _assert(h_fnt.is_valid() and fsrv.fonts.is_loaded(h_fnt), "loose_root load_font(.ttf) failed")
+        var fnt_p = fsrv.fonts.borrow(h_fnt)
+        _assert(fnt_p[].font.valid and len(fnt_p[].dsf_data) > 0, "loose TTF did not bake valid SdfFont")
+        var dsf_cp = fnt_p[].dsf_data.copy()
+        _assert(write_bytes(f20_ws + "/fonts/mono.dsf", dsf_cp), "write .dsf failed")
+        var h_dsf = fsrv.load_font("fonts/mono.dsf")
+        _assert(h_dsf.is_valid() and fsrv.fonts.borrow(h_dsf)[].font.valid, "loose_root load_font(.dsf) failed")
+    fsrv.close()
+
+    # ---- F20: VulkanGpu residency bridge + real cooked texture streaming + vk.close() before srv.close() ----
+    var vsrv = AssetServer(stream_budget_bytes_per_tick=65536, enable_watcher=False)
+    var vk = VulkanGpu()
+    if vk.initialize(validate=False, need_discrete=False):
+        vsrv.attach_vulkan_residency_bridge(vk)
+        var qslot = vsrv.textures.allocate_queued(AssetUuid.from_path("residency/q.png"), "residency/q.png", 1)
+        _assert(qslot.is_valid(), "allocate_queued failed")
+        _assert(vsrv.upload_mip_to_gpu(qslot, mip_level=0, byte_size=16384), "upload_mip_to_gpu queued failed")
+        _assert(vsrv.total_vram_live_bytes() > 0, "total_vram_live_bytes must be > 0 after GPU mip upload")
+        _assert(vsrv.textures.slot_vram_bytes[Int(qslot.slot())] > 0, "slot_vram_bytes must be > 0")
+        _assert(vsrv.streamer.vram_live_bytes > 0, "streamer.vram_live_bytes must be > 0")
+        _ = vsrv.textures.release(qslot)
+        _ = vsrv.textures.evict_lru_unreferenced(0)
+        _assert(vsrv.total_vram_live_bytes() == 0, "VRAM must drop to 0 after eviction")
+        _assert(vsrv.streamer.vram_live_bytes == 0, "streamer VRAM must drop to 0 after eviction")
+        # Intentionally close vk before vsrv.close() to verify zero leak/crash
+        vk.close()
+    else:
+        vk.close()
+    vsrv.close()
+
+    # ---- F21: KTX2 (None, Zlib, Zstd Raw/RLE, UASTC Mode 8, BasisLZ/ETC1S, BC7) + Corrupt Rejection ----
+    var k_px = List[UInt8]()
+    for _ in range(16):
+        k_px.append(UInt8(200)); k_px.append(UInt8(100)); k_px.append(UInt8(50)); k_px.append(UInt8(255))
+    var k_none = _build_ktx2_bytes(4, 4, 43, 0, 1, k_px, len(k_px))
+    var d_none = decode_image_auto(k_none, 4096)
+    _assert(d_none.valid and d_none.width == 4 and d_none.height == 4, "KTX2 RGBA8 None failed")
+    _assert(d_none.pixels[0] == UInt32(0xFFC86432), "KTX2 RGBA8 pixel mismatch")
+
+    var k_zlib = _build_ktx2_bytes(4, 4, 43, 3, 1, _wrap_zlib_stored(k_px), len(k_px))
+    var d_zlib = decode_ktx2(k_zlib, 4096)
+    _assert(d_zlib.valid and d_zlib.pixels[0] == UInt32(0xFFC86432), "KTX2 Zlib failed")
+
+    var k_zstd_raw = _build_ktx2_bytes(4, 4, 43, 2, 1, _wrap_zstd_frame(k_px), len(k_px))
+    var d_zstd_raw = decode_ktx2(k_zstd_raw, 4096)
+    _assert(d_zstd_raw.valid and d_zstd_raw.pixels[0] == UInt32(0xFFC86432), "KTX2 Zstd raw failed")
+
+    var k_zstd_rle = _build_ktx2_bytes(4, 4, 37, 2, 1, _wrap_zstd_frame(List[UInt8](), rle_byte=0x44, rle_len=64), 64)
+    var d_zstd_rle = decode_ktx2(k_zstd_rle, 4096)
+    _assert(d_zstd_rle.valid and d_zstd_rle.pixels[0] == UInt32(0x44444444), "KTX2 Zstd RLE failed")
+
+    # UASTC Mode 8 constant RGBA block (Khronos DFS §23: mode=23 @0(5), R=0x12 @5, G=0x34 @13, B=0x56 @21, A=0xFE @29)
+    var uastc_blk = List[UInt8](length=16, fill=0)
+    var u_hdr = UInt64(23) | (UInt64(0x12) << 5) | (UInt64(0x34) << 13) | (UInt64(0x56) << 21) | (UInt64(0xFE) << 29)
+    for bi in range(8):
+        uastc_blk[bi] = UInt8((u_hdr >> UInt64(bi * 8)) & 0xFF)
+    var k_uastc = _build_ktx2_bytes(4, 4, 0, 0, 166, uastc_blk, 16)
+    var d_uastc = decode_ktx2(k_uastc, 4096)
+    _assert(d_uastc.valid and d_uastc.pixels[0] == UInt32(0xFE123456), "KTX2 UASTC Mode 8 failed")
+
+    # BasisLZ / ETC1S compact codebook fixture
+    var sgd = List[UInt8]()
+    _test_put_u16_le(sgd, 1); _test_put_u16_le(sgd, 1)  # 1 endpoint, 1 selector
+    _test_put_u32_le(sgd, 3); _test_put_u32_le(sgd, 4); _test_put_u32_le(sgd, 0); _test_put_u32_le(sgd, 0)
+    _test_put_u32_le(sgd, 0); _test_put_u32_le(sgd, 0); _test_put_u32_le(sgd, 1); _test_put_u32_le(sgd, 0); _test_put_u32_le(sgd, 0)
+    var c5 = (31 << 10) | (0 << 5) | 0  # pure red
+    _test_put_u16_le(sgd, c5); sgd.append(0)  # endpoint 0, inten table 0 (+/-2)
+    _test_put_u32_le(sgd, 0)  # selector 0 (idx=0 -> +2)
+    var etc_slice = List[UInt8]()
+    etc_slice.append(0)
+    var k_blz = _build_ktx2_bytes(4, 4, 0, 1, 163, etc_slice, 0, sgd)
+    var d_blz = decode_ktx2(k_blz, 4096)
+    _assert(d_blz.valid and ((d_blz.pixels[0] >> 16) & 0xFF) > 240, "KTX2 BasisLZ/ETC1S failed")
+
+    # Corrupt KTX2 rejection
+    var bad_ktx2 = k_none.copy()
+    bad_ktx2.resize(40, UInt8(0))
+    _assert(not decode_ktx2(bad_ktx2, 4096).valid, "Truncated KTX2 must be rejected")
+
+    # ---- M3c Iter-2 KTX2 Regressions: multi-KB Zstd (of_val - 3), 4-stream regen_sz < 6, BC7 Modes 0/2/4, UASTC modes, BasisLZ Huffman ----
+    # 1. Genuine `/usr/bin/zstd -3` 4096-byte (32x32 RGBA8) stream with 64-byte non-repeat match offset (of_code=6 -> of_val=67 -> offset=64)
+    var zbig_frame: List[UInt8] = [
+        40, 181, 47, 253, 4, 88, 85, 2, 0, 4, 4, 32, 39, 46, 255, 60, 67, 74, 255, 88, 95, 102, 255,
+        116, 123, 130, 255, 144, 151, 158, 255, 172, 179, 186, 255, 200, 207, 214, 255, 228, 235, 242, 255,
+        0, 7, 14, 255, 28, 35, 42, 255, 56, 63, 70, 255, 84, 91, 98, 255, 112, 119, 126, 255, 140, 147, 154, 255,
+        168, 175, 182, 255, 196, 203, 210, 255, 1, 0, 64, 239, 7, 63, 68, 1, 86, 239, 134, 150,
+    ]
+    var k_zbig = _build_ktx2_bytes(32, 32, 37, 2, 1, zbig_frame, 4096)
+    var d_zbig = decode_ktx2(k_zbig, 4096)
+    _assert(d_zbig.valid and d_zbig.pixels[0] == UInt32(0xFF20272E) and d_zbig.pixels[16] == UInt32(0xFF20272E) and d_zbig.pixels[1023] == UInt32(0xFFC4CBD2), "KTX2 4KB Zstd non-repeat match offset failed")
+
+    # Reject 4-stream Huffman Zstd literals with regen_sz < 6
+    var z_bad_huf = List[UInt8]()
+    _test_put_u32_le(z_bad_huf, 0xFD2FB528)
+    z_bad_huf.append(UInt8(0x20)); z_bad_huf.append(UInt8(4))  # FCS=4
+    var bh_bad = (10 << 3) | (2 << 1) | 1  # last=1, compressed, size=10
+    z_bad_huf.append(UInt8(bh_bad & 0xFF)); z_bad_huf.append(UInt8((bh_bad >> 8) & 0xFF)); z_bad_huf.append(UInt8((bh_bad >> 16) & 0xFF))
+    z_bad_huf.append(UInt8((4 << 4) | (1 << 2) | 2))  # Lit type=2 (Compressed/Huf), size_fmt=1 (4 streams!), regen_sz=4 (< 6!)
+    for _ in range(9): z_bad_huf.append(UInt8(0))
+    _assert(not decode_ktx2(_build_ktx2_bytes(1, 1, 37, 2, 1, z_bad_huf, 4), 4096).valid, "Zstd 4-stream Huffman with regen_sz < 6 must be rejected")
+
+    # 2. BC7 Modes 0, 2 (3-subset Table.P3) & Mode 4 (idx_mode=1)
+    # BC7 Mode 0: bit0=1, part=14 (4b: Table.P3[14] = 0xA9A59450 -> t0=sub0, t1=sub0? 0x50: t0=0,t1=0,t2=1,t3=1, t4=0,t5=1,t6=0,t7=1, t8=1,t9=1,t10=2,t11=2...)
+    # Sub0=Red(R=15), Sub1=Green(G=15), Sub2=Blue(B=15), Alpha=255, all 3b indices=0 -> pick endpoint 0 of each subset!
+    var bc7_m0 = List[UInt8](length=16, fill=0)
+    # Header: bit0=1, part@1..4 = 14 -> bits 0..4 = 1 | (14<<1) = 29;
+    # R0..R5 @5..28: R0=15(sub0),R1=15 @5..12 (0xFF<<5); G2=15,G3=15 @37..44; B4=15,B5=15 @69..76; pbits@77..82 = 0x3F
+    var m0_lo = UInt64(29) | (UInt64(0xFF) << 5) | (UInt64(0xFF) << 37)
+    var m0_hi = (UInt64(0xFF) << (69 - 64)) | (UInt64(0x3F) << (77 - 64))
+    for bi in range(8):
+        bc7_m0[bi] = UInt8((m0_lo >> UInt64(bi * 8)) & 0xFF)
+        bc7_m0[8 + bi] = UInt8((m0_hi >> UInt64(bi * 8)) & 0xFF)
+    var d_bc7_m0 = decode_ktx2(_build_ktx2_bytes(4, 4, 145, 0, 1, bc7_m0, 16), 4096)
+    _assert(d_bc7_m0.valid and d_bc7_m0.pixels[0] == UInt32(0xFFFF0808) and d_bc7_m0.pixels[2] == UInt32(0xFF08FF08) and d_bc7_m0.pixels[15] == UInt32(0xFF0808FF), "BC7 Mode 0 Table.P3[14] failed")
+
+    # BC7 Mode 2: bits0..2=0b100 (4), part=45 (6b @3..8: Table.P3[45] = 0x69286928 -> t0=0, t1=2, t2=2, t3=0, t4=1, t5=2...)
+    # Sub0=Red(R0=31), Sub1=Green(G2=31), Sub2=Blue(B4=31), all 2b indices=0
+    var bc7_m2 = List[UInt8](length=16, fill=0)
+    var m2_lo = UInt64(4) | (UInt64(45) << 3) | (UInt64(31) << 9) | (UInt64(31) << 49)
+    var m2_hi = UInt64(31) << (89 - 64)
+    for bi in range(8):
+        bc7_m2[bi] = UInt8((m2_lo >> UInt64(bi * 8)) & 0xFF)
+        bc7_m2[8 + bi] = UInt8((m2_hi >> UInt64(bi * 8)) & 0xFF)
+    var d_bc7_m2 = decode_ktx2(_build_ktx2_bytes(4, 4, 145, 0, 1, bc7_m2, 16), 4096)
+    _assert(d_bc7_m2.valid and d_bc7_m2.pixels[0] == UInt32(0xFFFF0000) and d_bc7_m2.pixels[4] == UInt32(0xFF00FF00) and d_bc7_m2.pixels[1] == UInt32(0xFF0000FF), "BC7 Mode 2 Table.P3[45] failed")
+
+    # BC7 Mode 4 with idx_mode=1: 0b10000(16) @0..4, rot=0 @5..6, idx_mode=1 @7, R0=0,R1=31 @8..17 -> R1=31 @13(5), G=0, B=0, A0=0,A1=63 @38..49 -> A1=63 @44(6)
+    # 2b indices FIRST @50..80 (31b -> a_idx), 3b indices SECOND @81..127 (47b -> c_idx)
+    # Set texel 1: a_idx[1] = 0 (@51..52 = 0), c_idx[1] = 7 (@83..85 = 7) -> expects R=255, A=0!
+    var bc7_m4 = List[UInt8](length=16, fill=0)
+    var m4_lo = UInt64(16) | (UInt64(1) << 7) | (UInt64(31) << 13) | (UInt64(63) << 44)
+    var m4_hi = UInt64(7) << (83 - 64)
+    for bi in range(8):
+        bc7_m4[bi] = UInt8((m4_lo >> UInt64(bi * 8)) & 0xFF)
+        bc7_m4[8 + bi] = UInt8((m4_hi >> UInt64(bi * 8)) & 0xFF)
+    var d_bc7_m4 = decode_ktx2(_build_ktx2_bytes(4, 4, 145, 0, 1, bc7_m4, 16), 4096)
+    _assert(d_bc7_m4.valid and d_bc7_m4.pixels[1] == UInt32(0x00FF0000), "BC7 Mode 4 idx_mode=1 block-order failed")
+
+    # 3. UASTC Modes: Mode 0 (trits), Mode 7 (PAT=0), Mode 11 (dual-plane RGBA, ccs=3), Mode 15 (LA), Mode 18 (5b RGB+5b W) + Mode 19 rejection
+    # UASTC Mode 0 (code 0x01 @0(4)): ETQ all 0 except RL=0, RH=(trit0? No, trit1=0, EBITS RH=1 -> ASTC val=1 -> 255!), W[1]=15 -> R=255 at px1, R=0 at px0!
+    var u0_blk = List[UInt8](length=16, fill=0)
+    var u0_lo = UInt64(0x01) | (UInt64(1) << 35)  # RH EBITS @29+6=35 = 1 -> 255; G=0,B=0
+    var u0_hi = UInt64(15) << (68 - 64)  # W[0] is 3b @65..67 (=0), W[1] is 4b @68..71 (=15 -> w=64)
+    for bi in range(8):
+        u0_blk[bi] = UInt8((u0_lo >> UInt64(bi * 8)) & 0xFF)
+        u0_blk[8 + bi] = UInt8((u0_hi >> UInt64(bi * 8)) & 0xFF)
+    var d_u0 = decode_ktx2(_build_ktx2_bytes(4, 4, 0, 0, 166, u0_blk, 16), 4096)
+    _assert(d_u0.valid and d_u0.pixels[0] == UInt32(0xFF000000) and d_u0.pixels[1] == UInt32(0xFFFF0000), "UASTC Mode 0 failed")
+
+    # UASTC Mode 11 (code 0x00 @0(2), dual-plane RGBA, ccs=3 @19(2), EBITS R0=0,R1=1 @34..41 -> R1=1 -> 255, A0=0,A1=1 @58..65):
+    # W[0]: p0=0, p1=0 @66..67 (1b each); W[1]: p0=3 @68..69 (R=255), p1=0 @70..71 (A=0) -> px1 = 0x00FF0000!
+    var u11_blk = List[UInt8](length=16, fill=0)
+    var u11_lo = (UInt64(3) << 19) | (UInt64(1) << 38) | (UInt64(1) << 62)
+    var u11_hi = UInt64(3) << (68 - 64)
+    for bi in range(8):
+        u11_blk[bi] = UInt8((u11_lo >> UInt64(bi * 8)) & 0xFF)
+        u11_blk[8 + bi] = UInt8((u11_hi >> UInt64(bi * 8)) & 0xFF)
+    var d_u11 = decode_ktx2(_build_ktx2_bytes(4, 4, 0, 0, 166, u11_blk, 16), 4096)
+    _assert(d_u11.valid and d_u11.pixels[1] == UInt32(0x00FF0000), "UASTC Mode 11 dual-plane failed")
+
+    # UASTC Mode 15 (code 0x05 @0(7), LA direct): L0=0x80 @30, L1=0x80 @38, A0=0x40 @46, A1=0x40 @54 -> all pixels 0x40808080
+    var u15_blk = List[UInt8](length=16, fill=0)
+    var u15_lo = UInt64(0x05) | (UInt64(0x80) << 30) | (UInt64(0x80) << 38) | (UInt64(0x40) << 46) | (UInt64(0x40) << 54)
+    for bi in range(8): u15_blk[bi] = UInt8((u15_lo >> UInt64(bi * 8)) & 0xFF)
+    var d_u15 = decode_ktx2(_build_ktx2_bytes(4, 4, 0, 0, 166, u15_blk, 16), 4096)
+    _assert(d_u15.valid and d_u15.pixels[0] == UInt32(0x40808080), "UASTC Mode 15 LA failed")
+
+    # UASTC Mode 19 (reserved 0x45) must be rejected
+    var u19_blk = List[UInt8](length=16, fill=0); u19_blk[0] = UInt8(0x45)
+    _assert(not decode_ktx2(_build_ktx2_bytes(4, 4, 0, 0, 166, u19_blk, 16), 4096).valid, "UASTC reserved Mode 19 must be rejected")
+
+    # 4. Nontrivial BasisLZ Huffman (`tbl_bytes > 0`, 3-symbol canonical Huffman table)
+    # ep_huf: 32 syms (0..31), codelen_bits=2, len(0)=1 (code 0), len(1)=2 (code 0b10 -> rev 0b01), len(31)=2 (code 0b11 -> rev 0b11)
+    # sel_huf: 2 syms (0..1), codelen_bits=2, len(0)=1 (code 0), len(1)=1 (code 1)
+    var huf_tbl = List[UInt8](length=16, fill=0)
+    var ep_hdr_val = UInt64(32) | (UInt64(2) << 14) | (UInt64(1) << 19) | (UInt64(2) << 21)
+    for bi in range(8): huf_tbl[bi] = UInt8((ep_hdr_val >> UInt64(bi * 8)) & 0xFF)
+    huf_tbl[10] = UInt8(0x04)  # sym 31 length=2 at bit 81..82
+    var sel_hdr_u64 = UInt64(2) | (UInt64(2) << 14) | (UInt64(1) << 19) | (UInt64(1) << 21)
+    for bit_i in range(23):
+        if ((sel_hdr_u64 >> UInt64(bit_i)) & 1) != 0:
+            var ab = 83 + bit_i
+            huf_tbl[ab >> 3] |= UInt8(1 << (ab & 7))
+    # ep stream: 1 endpoint -> dr=31 (code 0b11, 2b), dg=0 (0, 1b), db=0 (0, 1b), di=0 (0, 1b) = 0b00011 = 0x03 (1 byte)
+    var sgd_h = List[UInt8]()
+    _test_put_u16_le(sgd_h, 1); _test_put_u16_le(sgd_h, 1)
+    _test_put_u32_le(sgd_h, 1); _test_put_u32_le(sgd_h, 1); _test_put_u32_le(sgd_h, 16); _test_put_u32_le(sgd_h, 0)
+    _test_put_u32_le(sgd_h, 0); _test_put_u32_le(sgd_h, 0); _test_put_u32_le(sgd_h, 1); _test_put_u32_le(sgd_h, 0); _test_put_u32_le(sgd_h, 0)
+    sgd_h.append(UInt8(0x03))  # ep_bytes (1)
+    sgd_h.append(UInt8(0x00))  # sel_bytes (1)
+    for b in huf_tbl: sgd_h.append(b)  # tbl_bytes (16)
+    var etc_h_slice = List[UInt8](); etc_h_slice.append(UInt8(0x00))
+    var d_blz_h = decode_ktx2(_build_ktx2_bytes(4, 4, 0, 1, 163, etc_h_slice, 0, sgd_h), 4096)
+    _assert(d_blz_h.valid and ((d_blz_h.pixels[0] >> 16) & 0xFF) > 240, "KTX2 BasisLZ Huffman (tbl_bytes > 0) failed")
+
+    # 5. Khronos 44-byte DFD colorModel @ +12 routing (vk_format=0, supercompression=0)
+    var zero_16 = List[UInt8](length=16, fill=0)
+    _assert(
+        not decode_ktx2(_build_ktx2_bytes(4, 4, 0, 0, 163, zero_16, 16), 4096).valid,
+        "KTX2 vk_format=0 supercomp=0 colorModel=163 (ETC1S) with invalid payload must fail (not route to UASTC)",
+    )
+    _assert(
+        not decode_ktx2(_build_ktx2_bytes(4, 4, 0, 0, 1, zero_16, 16), 4096).valid,
+        "KTX2 vk_format=0 supercomp=0 unknown/RGBSDA colorModel=1 must fail",
+    )
+    var d_uastc_std = decode_ktx2(_build_ktx2_bytes(4, 4, 0, 0, 166, uastc_blk, 16), 4096)
+    _assert(d_uastc_std.valid and d_uastc_std.pixels[0] == UInt32(0xFE123456), "KTX2 standard 44-byte DFD UASTC (colorModel=166) failed")
+
+    # ---- F21: GLB TANGENT (5126 & 5120 negative handedness), TEXCOORD_1, occlusion, emissive, KHR_texture_basisu, QEM/Cooked/Writer ----
+    var mdl_w = NativeModel()
+    var tex_w = NativeTexture()
+    tex_w.width = 4; tex_w.height = 4
+    tex_w.pixels = List[UInt32](length=16, fill=0xFF40C080)
+    mdl_w.textures.append(tex_w^)
+    var mesh_w = NativeMesh()
+    mesh_w.positions = [Float32(0), Float32(0), Float32(0), Float32(1), Float32(0), Float32(0), Float32(0), Float32(1), Float32(0), Float32(1), Float32(1), Float32(0)]
+    mesh_w.normals = [Float32(0), Float32(0), Float32(1), Float32(0), Float32(0), Float32(1), Float32(0), Float32(0), Float32(1), Float32(0), Float32(0), Float32(1)]
+    mesh_w.tangents = [Float32(1), Float32(0), Float32(0), Float32(-1), Float32(1), Float32(0), Float32(0), Float32(-1), Float32(1), Float32(0), Float32(0), Float32(-1), Float32(1), Float32(0), Float32(0), Float32(-1)]
+    mesh_w.texcoords = [Float32(0), Float32(0), Float32(1), Float32(0), Float32(0), Float32(1), Float32(1), Float32(1)]
+    mesh_w.texcoords1 = [Float32(0.25), Float32(0.5), Float32(0.75), Float32(0.5), Float32(0.25), Float32(0.75), Float32(0.75), Float32(0.75)]
+    mesh_w.indices = [0, 1, 2, 1, 3, 2]
+    mesh_w.texture = 0
+    mesh_w.occlusion_texture = 0
+    mesh_w.occlusion_texcoord = 1
+    mesh_w.occlusion_strength = Float32(0.75)
+    mesh_w.emissive_texture = 0
+    mesh_w.emissive_texcoord = 1
+    mesh_w.emissive_color = Vec3(1.0, 0.5, 0.25)
+    mesh_w.emissive_strength = Float32(2.0)
+    mdl_w.meshes.append(mesh_w^)
+
+    var glb_rt = encode_native_glb(mdl_w)
+    var mdl_rt = parse_native_glb(glb_rt)
+    _assert(mdl_rt.loaded() and len(mdl_rt.meshes) == 1, "GLB writer/reader round-trip failed")
+    _assert(len(mdl_rt.meshes[0].tangents) == 16 and mdl_rt.meshes[0].tangents[3] < Float32(0.0), "GLB TANGENT round-trip lost handedness")
+    _assert(len(mdl_rt.meshes[0].texcoords1) == 8 and abs(mdl_rt.meshes[0].texcoords1[0] - Float32(0.25)) < Float32(1e-4), "GLB TEXCOORD_1 round-trip failed")
+    _assert(mdl_rt.meshes[0].occlusion_texture == 0 and mdl_rt.meshes[0].occlusion_texcoord == 1, "GLB occlusionTexture round-trip failed")
+    _assert(abs(mdl_rt.meshes[0].occlusion_strength - Float32(0.75)) < Float32(1e-3), "GLB occlusion_strength mismatch")
+    _assert(mdl_rt.meshes[0].emissive_texture == 0 and mdl_rt.meshes[0].emissive_texcoord == 1, "GLB emissiveTexture round-trip failed")
+
+    # Verify authored negative-tw tangent reaches AaaGeometryPool vertex_words[11] bit 0
+    var gpool = AaaGeometryPool()
+    _ = gpool.add_mesh(mdl_rt.meshes[0], 0, build_lods=False)
+    _assert((gpool.vertex_words[11] & UInt32(1)) == UInt32(1), "AaaGeometryPool must preserve authored TANGENT w=-1 sign bit")
+
+    # Verify QEM decimation preserves tangents, texcoords1, occlusion & emissive
+    var qem_m = simplify_mesh_qem(mdl_rt.meshes[0], 1)
+    _assert(qem_m[0].occlusion_texture == 0 and qem_m[0].emissive_texture == 0, "simplify_mesh_qem must preserve occlusion/emissive")
+    _assert(len(qem_m[0].tangents) > 0 and len(qem_m[0].texcoords1) > 0, "simplify_mesh_qem must preserve tangents/texcoords1")
+
+    # GLB with KHR_texture_basisu pointing to KTX2 bufferView + INT8 TANGENT (5120) + omitted emissiveFactor
+    var glb_bin = List[UInt8]()
+    var pos_f = [Float32(0), Float32(0), Float32(0), Float32(1), Float32(0), Float32(0), Float32(0), Float32(1), Float32(0)]
+    for fv in pos_f:
+        _test_put_u32_le(glb_bin, bitcast[DType.uint32](fv))
+    var t_off = len(glb_bin)
+    for _ in range(3):
+        glb_bin.append(127); glb_bin.append(0); glb_bin.append(0); glb_bin.append(bitcast[DType.uint8](Int8(-127)))
+    var k_off = len(glb_bin)
+    for b in k_uastc:
+        glb_bin.append(b)
+    while len(glb_bin) % 4 != 0:
+        glb_bin.append(0)
+    var gj = (
+        '{"asset":{"version":"2.0"},"extensionsUsed":["KHR_texture_basisu","KHR_materials_emissive_strength"],'
+        + '"buffers":[{"byteLength":' + String(len(glb_bin)) + '}],'
+        + '"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},'
+        + '{"buffer":0,"byteOffset":' + String(t_off) + ',"byteLength":12},'
+        + '{"buffer":0,"byteOffset":' + String(k_off) + ',"byteLength":' + String(len(k_uastc)) + '}],'
+        + '"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},'
+        + '{"bufferView":1,"componentType":5120,"normalized":true,"count":3,"type":"VEC4"}],'
+        + '"images":[{"bufferView":2,"mimeType":"image/ktx2"}],'
+        + '"textures":[{"extensions":{"KHR_texture_basisu":{"source":0}}}],'
+        + '"materials":[{"emissiveTexture":{"index":0},"extensions":{"KHR_materials_emissive_strength":{"emissiveStrength":3.0}}}],'
+        + '"meshes":[{"primitives":[{"attributes":{"POSITION":0,"TANGENT":1},"material":0}]}],'
+        + '"nodes":[{"mesh":0}],"scene":0,"scenes":[{"nodes":[0]}]}'
+    )
+    var gjb = _str_bytes(gj)
+    while len(gjb) % 4 != 0:
+        gjb.append(0x20)
+    var kglb = List[UInt8]()
+    var ktot = 12 + 8 + len(gjb) + 8 + len(glb_bin)
+    _test_put_u32_le(kglb, 0x46546C67); _test_put_u32_le(kglb, 2); _test_put_u32_le(kglb, UInt32(ktot))
+    _test_put_u32_le(kglb, UInt32(len(gjb))); _test_put_u32_le(kglb, 0x4E4F534A)
+    for b in gjb: kglb.append(b)
+    _test_put_u32_le(kglb, UInt32(len(glb_bin))); _test_put_u32_le(kglb, 0x004E4942)
+    for b in glb_bin: kglb.append(b)
+    var kmdl = parse_native_glb(kglb)
+    _assert(kmdl.loaded() and len(kmdl.textures) == 1 and kmdl.textures[0].width == 4, "GLB KHR_texture_basisu KTX2 decode failed")
+    _assert(kmdl.textures[0].pixels[0] == UInt32(0xFE123456), "GLB KHR_texture_basisu pixel mismatch")
+    _assert(kmdl.meshes[0].tangents[3] < Float32(0.0) and abs(kmdl.meshes[0].emissive_strength - Float32(3.0)) < Float32(1e-3), "GLB INT8 TANGENT / emissiveStrength failed")
+
+    # ---- F21: Progressive SOF2 JPEG (17x13 multi-scan 4:2:0 color + DRI/RST + DC refine + AC first EOBRUN + AC refine ZRL) ----
+    var jout = List[UInt8]()
+    jout.append(0xFF); jout.append(0xD8)
+    jout.append(0xFF); jout.append(0xDB); _test_put_u16_be(jout, 67); jout.append(0)
+    for _ in range(64): jout.append(1)
+    # DRI = 2
+    jout.append(0xFF); jout.append(0xDD); _test_put_u16_be(jout, 4); _test_put_u16_be(jout, 2)
+    # SOF2 17x13, 3 components (Y 2x2, Cb 1x1, Cr 1x1 -> 2x1 MCUs)
+    jout.append(0xFF); jout.append(0xC2); _test_put_u16_be(jout, 17)
+    jout.append(8); _test_put_u16_be(jout, 13); _test_put_u16_be(jout, 17); jout.append(3)
+    jout.append(1); jout.append(0x22); jout.append(0)
+    jout.append(2); jout.append(0x11); jout.append(0)
+    jout.append(3); jout.append(0x11); jout.append(0)
+    # DHT DC0: sym 0 -> '0', sym 7 -> '10', sym 8 -> '11'
+    jout.append(0xFF); jout.append(0xC4); _test_put_u16_be(jout, 22); jout.append(0x00)
+    jout.append(1); jout.append(2)
+    for _ in range(14): jout.append(0)
+    jout.append(0); jout.append(7); jout.append(8)
+    # SOS 1: Interleaved Y+Cb+Cr DC first (Ss=0, Se=0, Ah=0, Al=1)
+    # Target DC: Y = +200 (shifted 1 => +100, cat 7, bits 100), Cb = -400 (shifted 1 => -200, cat 8, bits 55), Cr = +400 (shifted 1 => +200, cat 8, bits 200)
+    jout.append(0xFF); jout.append(0xDA); _test_put_u16_be(jout, 12)
+    jout.append(3); jout.append(1); jout.append(0x00); jout.append(2); jout.append(0x00); jout.append(3); jout.append(0x00)
+    jout.append(0); jout.append(0); jout.append(0x01)
+    var sb1 = _Sof2BitWriter()
+    # MCU 0: 4 Y blocks (+100 then 0,0,0), 1 Cb (-200), 1 Cr (+200)
+    sb1.write_bits(0b10, 2); sb1.write_bits(100, 7)  # Y0 diff +100
+    sb1.write_bits(0b0, 1); sb1.write_bits(0b0, 1); sb1.write_bits(0b0, 1)  # Y1,Y2,Y3 diff 0
+    sb1.write_bits(0b11, 2); sb1.write_bits(55, 8)   # Cb diff -200
+    sb1.write_bits(0b11, 2); sb1.write_bits(200, 8)  # Cr diff +200
+    # MCU 1 (all diff 0)
+    for _ in range(6): sb1.write_bits(0b0, 1)
+    sb1.flush_and_rst(-1)
+    for b in sb1.out: jout.append(b)
+    # SOS 2: Interleaved DC refine (Ss=0, Se=0, Ah=1, Al=0) -> 12 zero refinement bits
+    jout.append(0xFF); jout.append(0xDA); _test_put_u16_be(jout, 12)
+    jout.append(3); jout.append(1); jout.append(0x00); jout.append(2); jout.append(0x00); jout.append(3); jout.append(0x00)
+    jout.append(0); jout.append(0); jout.append(0x10)
+    var sb2 = _Sof2BitWriter()
+    for _ in range(12): sb2.write_bits(0, 1)
+    sb2.flush_and_rst(-1)
+    for b in sb2.out: jout.append(b)
+    # DHT AC0: sym 0x00 -> '00' (EOB), sym 0x10 -> '01' (EOBRUN=2..3), sym 0x01 -> '10' (s=1), sym 0xF0 -> '11' (ZRL)
+    jout.append(0xFF); jout.append(0xC4); _test_put_u16_be(jout, 23); jout.append(0x10)
+    jout.append(0); jout.append(4)
+    for _ in range(14): jout.append(0)
+    jout.append(0x00); jout.append(0x10); jout.append(0x01); jout.append(0xF0)
+    # SOS 3: Y non-interleaved AC first (Ss=1, Se=63, Ah=0, Al=1), 4x2=8 blocks with DRI=2 -> RST0, RST1, RST2!
+    # Block 0: k=1 -> sym 0x01 val +1 (coeffs[zz(1)] = +2), then EOB (0x00); Block 1: EOB; RST0; Blocks 2..7: EOBRUN=2 per pair!
+    jout.append(0xFF); jout.append(0xDA); _test_put_u16_be(jout, 8)
+    jout.append(1); jout.append(1); jout.append(0x00); jout.append(1); jout.append(63); jout.append(0x01)
+    var sb3 = _Sof2BitWriter()
+    sb3.write_bits(0b10, 2); sb3.write_bits(1, 1); sb3.write_bits(0b00, 2)  # blk 0
+    sb3.write_bits(0b00, 2)  # blk 1
+    sb3.flush_and_rst(0)
+    sb3.write_bits(0b01, 2); sb3.write_bits(0, 1)  # EOBRUN=2 covers blk 2,3
+    sb3.flush_and_rst(1)
+    sb3.write_bits(0b01, 2); sb3.write_bits(0, 1)  # EOBRUN=2 covers blk 4,5
+    sb3.flush_and_rst(2)
+    sb3.write_bits(0b01, 2); sb3.write_bits(0, 1)  # EOBRUN=2 covers blk 6,7
+    sb3.flush_and_rst(-1)
+    for b in sb3.out: jout.append(b)
+    # SOS 4: Y AC refine (Ss=1, Se=63, Ah=1, Al=0) with DRI=2: blk 0 ZRL(0xF0) skips 16 zeros (refines zz(1) with bit 1 -> +3), then s=1 (+1 at k=17), then EOB!
+    jout.append(0xFF); jout.append(0xDA); _test_put_u16_be(jout, 8)
+    jout.append(1); jout.append(1); jout.append(0x00); jout.append(1); jout.append(63); jout.append(0x10)
+    var sb4 = _Sof2BitWriter()
+    sb4.write_bits(0b11, 2); sb4.write_bits(1, 1)  # blk 0: ZRL (refines non-zero zz(1) with 1), k -> 17
+    sb4.write_bits(0b10, 2); sb4.write_bits(1, 1); sb4.write_bits(0b00, 2)  # blk 0: s=1 sign=1 at k=17, then EOB
+    sb4.write_bits(0b00, 2)  # blk 1: EOB
+    sb4.flush_and_rst(0)
+    sb4.write_bits(0b01, 2); sb4.write_bits(0, 1)
+    sb4.flush_and_rst(1)
+    sb4.write_bits(0b01, 2); sb4.write_bits(0, 1)
+    sb4.flush_and_rst(2)
+    sb4.write_bits(0b01, 2); sb4.write_bits(0, 1)
+    sb4.flush_and_rst(-1)
+    for b in sb4.out: jout.append(b)
+    jout.append(0xFF); jout.append(0xD9)
+
+    var j_prog = decode_jpeg(jout, 1024)
+    _assert(j_prog.valid and j_prog.width == 17 and j_prog.height == 13, "Multi-scan SOF2 17x13 decode failed")
+    var p0 = j_prog.pixels[0]
+    var pr = Int((p0 >> 16) & 0xFF)
+    var pb = Int(p0 & 0xFF)
+    _assert(pr > 200 and pb < 80, "SOF2 YCbCr->RGB reddish pixel mismatch: r=" + String(pr) + " b=" + String(pb))
+
+    # Corrupt SOF2 rejections (Ns > 1 on AC scan; invalid Ah != Al + 1)
+    var bad_sof2 = jout.copy()
+    var patched_sof2 = False
+    for i in range(len(bad_sof2) - 10):
+        if bad_sof2[i] == 0xFF and bad_sof2[i + 1] == 0xDA and bad_sof2[i + 4] == 1 and bad_sof2[i + 8] == 63:
+            bad_sof2[i + 9] = 0x20  # Ah=2, Al=0 invalid!
+            patched_sof2 = True
+            break
+    _assert(patched_sof2 and not decode_jpeg(bad_sof2, 1024).valid, "SOF2 with invalid Ah != Al + 1 must fail")
+
+    # ---- F21: OpenEXR Tiled (5x5 edge clamping + MIPMAP), RLE, PIZ, DWAA & DWAB + Negative Checks ----
+    # 1. Tiled 5x5 EXR (tile 4x4, MIPMAP_LEVELS -> level 0 tiles + level 1 ignored)
+    var exr_tiled = List[UInt8]()
+    _write_exr_header(exr_tiled, 5, 5, EXR_NO_COMPRESSION, tiled=True, tile_x=4, tile_y=4, mipmap=True)
+    # Mipmap levels: L0 (5x5 -> 2x2=4 tiles), L1 (2x2 -> 1x1=1 tile), L2 (1x1 -> 1x1=1 tile) => 6 chunks
+    var t_tbl_pos = len(exr_tiled)
+    for _ in range(6):
+        _test_put_u64_le(exr_tiled, 0)
+    var t_offs = List[UInt64]()
+    var t_dims = [(0, 0, 0, 4, 4), (1, 0, 0, 1, 4), (0, 1, 0, 4, 1), (1, 1, 0, 1, 1), (0, 0, 1, 2, 2), (0, 0, 2, 1, 1)]
+    for td in t_dims:
+        t_offs.append(UInt64(len(exr_tiled)))
+        _test_put_u32_le(exr_tiled, UInt32(td[0]))
+        _test_put_u32_le(exr_tiled, UInt32(td[1]))
+        _test_put_u32_le(exr_tiled, UInt32(td[2]))
+        _test_put_u32_le(exr_tiled, UInt32(td[2]))
+        var pbytes = td[3] * td[4] * 3 * 2
+        _test_put_u32_le(exr_tiled, UInt32(pbytes))
+        var h_r = f32_to_uf16_bits(Float32(0.75)) if td[2] == 0 else f32_to_uf16_bits(Float32(9.0))
+        var h_g = f32_to_uf16_bits(Float32(0.5))
+        var h_b = f32_to_uf16_bits(Float32(0.25))
+        for _ in range(td[4]):
+            for _ in range(td[3]): _test_put_u16_le(exr_tiled, h_b)
+            for _ in range(td[3]): _test_put_u16_le(exr_tiled, h_g)
+            for _ in range(td[3]): _test_put_u16_le(exr_tiled, h_r)
+    for ci in range(6):
+        var v = t_offs[ci]
+        for bi in range(8):
+            exr_tiled[t_tbl_pos + ci * 8 + bi] = UInt8((v >> UInt64(bi * 8)) & 0xFF)
+    var d_tiled = decode_exr_fp16(exr_tiled)
+    _assert(d_tiled.valid and d_tiled.width == 5 and d_tiled.height == 5, "Tiled 5x5 EXR decode failed")
+    _assert(abs(d_tiled.pixels[4 * 5 + 4].x - Float32(0.75)) < Float32(1e-2), "Tiled edge-tile (4,4) pixel mismatch")
+
+    # 2. Scanline RLE EXR (4x2)
+    var exr_rle = List[UInt8]()
+    _write_exr_header(exr_rle, 4, 2, EXR_RLE_COMPRESSION, tiled=False)
+    var rle_tbl = len(exr_rle)
+    _test_put_u64_le(exr_rle, 0); _test_put_u64_le(exr_rle, 0)
+    var rle_offs = List[UInt64]()
+    for row in range(2):
+        var raw_row = List[UInt8]()
+        var hb = f32_to_uf16_bits(Float32(0.25))
+        var hg = f32_to_uf16_bits(Float32(0.5))
+        var hr = f32_to_uf16_bits(Float32(1.5))
+        for _ in range(4): _test_put_u16_le(raw_row, hb)
+        for _ in range(4): _test_put_u16_le(raw_row, hg)
+        for _ in range(4): _test_put_u16_le(raw_row, hr)
+        var comp_rle = _exr_rle_compress(_exr_reorder_and_predict(raw_row))
+        rle_offs.append(UInt64(len(exr_rle)))
+        _test_put_u32_le(exr_rle, UInt32(row))
+        _test_put_u32_le(exr_rle, UInt32(len(comp_rle)))
+        for b in comp_rle: exr_rle.append(b)
+    for ri in range(2):
+        for bi in range(8):
+            exr_rle[rle_tbl + ri * 8 + bi] = UInt8((rle_offs[ri] >> UInt64(bi * 8)) & 0xFF)
+    var d_rle = decode_exr_fp16(exr_rle)
+    _assert(d_rle.valid and abs(d_rle.pixels[0].x - Float32(1.5)) < Float32(1e-2), "EXR RLE pixel mismatch")
+
+    # 3. Scanline PIZ EXR (4x4, genuine bitmap + LUT + 2D Haar wavelet + canonical Huffman)
+    var exr_piz = List[UInt8]()
+    _write_exr_header(exr_piz, 4, 4, EXR_PIZ_COMPRESSION, tiled=False)
+    var piz_tbl = len(exr_piz)
+    _test_put_u64_le(exr_piz, 0)
+    var piz_off = UInt64(len(exr_piz))
+    for bi in range(8): exr_piz[piz_tbl + bi] = UInt8((piz_off >> UInt64(bi * 8)) & 0xFF)
+    var piz_u16 = List[UInt16]()
+    var h_b = UInt16(f32_to_uf16_bits(Float32(0.125)))
+    var h_g = UInt16(f32_to_uf16_bits(Float32(0.5)))
+    var h_r = UInt16(f32_to_uf16_bits(Float32(2.0)))
+    for _ in range(16): piz_u16.append(h_b)
+    for _ in range(16): piz_u16.append(h_g)
+    for _ in range(16): piz_u16.append(h_r)
+    # Build forward bitmap & reverse LUT (map raw u16 -> compact index)
+    var bm = List[UInt8](length=8192, fill=0)
+    for v in piz_u16:
+        if v != 0:
+            bm[Int(v) >> 3] |= UInt8(1 << (Int(v) & 7))
+    var min_nz = 8191; var max_nz = 0
+    for bi in range(8192):
+        if bm[bi] != 0:
+            if bi < min_nz: min_nz = bi
+            if bi > max_nz: max_nz = bi
+    var inv_lut = List[UInt16](length=65536, fill=0)
+    var lk = 0
+    for i in range(65536):
+        if i == 0 or (bm[i >> 3] & UInt8(1 << (i & 7))) != 0:
+            inv_lut[i] = UInt16(lk)
+            lk += 1
+    for i in range(len(piz_u16)):
+        piz_u16[i] = inv_lut[Int(piz_u16[i])]
+    for ci in range(3):
+        _exr_wav2_encode(piz_u16, ci * 16, 4, 1, 4, 4)
+    var huf_blob = _build_exr_huf_blob(piz_u16)
+    var piz_chunk = List[UInt8]()
+    _test_put_u16_le(piz_chunk, min_nz); _test_put_u16_le(piz_chunk, max_nz)
+    for bi in range(min_nz, max_nz + 1): piz_chunk.append(bm[bi])
+    _test_put_u32_le(piz_chunk, UInt32(len(huf_blob)))
+    for b in huf_blob: piz_chunk.append(b)
+    _test_put_u32_le(exr_piz, 0); _test_put_u32_le(exr_piz, UInt32(len(piz_chunk)))
+    for b in piz_chunk: exr_piz.append(b)
+    var d_piz = decode_exr_fp16(exr_piz)
+    _assert(d_piz.valid and abs(d_piz.pixels[0].x - Float32(2.0)) < Float32(1e-2) and abs(d_piz.pixels[0].z - Float32(0.125)) < Float32(1e-2), "EXR PIZ pixel round-trip failed")
+
+    # 4. Scanline DWAA (8) & DWAB (9) EXR (8x8 flat linear Rec.709 RGB -> FDCT DC-only -> zlib DC + AC EOB)
+    for comp_dwa in [EXR_DWAA_COMPRESSION, EXR_DWAB_COMPRESSION]:
+        var exr_dwa = List[UInt8]()
+        _write_exr_header(exr_dwa, 8, 8, comp_dwa, tiled=False)
+        var dwa_tbl = len(exr_dwa)
+        _test_put_u64_le(exr_dwa, 0)
+        var dwa_off = UInt64(len(exr_dwa))
+        for bi in range(8): exr_dwa[dwa_tbl + bi] = UInt8((dwa_off >> UInt64(bi * 8)) & 0xFF)
+        # Desired linear RGB = (0.5, 0.25, 0.05) -> nonlinear (0.5^(1/2.2), ...) -> Rec.709 Y, Cb, Cr -> * 8.0 for orthonormal 8x8 DC!
+        var r_lin = Float32(0.5); var g_lin = Float32(0.25); var b_lin = Float32(0.05)
+        var r_nl = exp(log(r_lin) / Float32(2.2))
+        var g_nl = exp(log(g_lin) / Float32(2.2))
+        var b_nl = exp(log(b_lin) / Float32(2.2))
+        var y_nl = Float32(0.2126) * r_nl + Float32(0.7152) * g_nl + Float32(0.0722) * b_nl
+        var cb_nl = (b_nl - y_nl) / Float32(1.8556)
+        var cr_nl = (r_nl - y_nl) / Float32(1.5747)
+        # OpenEXR chlist is sorted (B, G, R); DWA CSC planes are stored in [Y, Cb, Cr] order
+        var dc_bytes = List[UInt8]()
+        for v_dc in [y_nl * Float32(8.0), cb_nl * Float32(8.0), cr_nl * Float32(8.0)]:
+            var hv = f32_to_uf16_bits(v_dc) if v_dc >= 0 else (0x8000 | f32_to_uf16_bits(-v_dc))
+            _test_put_u16_le(dc_bytes, hv)
+        var dc_comp = _wrap_zlib_stored(_exr_reorder_and_predict(dc_bytes))
+        var ac_u16 = List[UInt16](length=3, fill=UInt16(0xFF00))  # 3 EOB markers
+        var ac_bytes = List[UInt8]()
+        for av in ac_u16: _test_put_u16_le(ac_bytes, Int(av))
+        var ac_comp = _wrap_zlib_stored(ac_bytes)
+
+        var dwa_chunk = List[UInt8]()
+        _test_put_u64_le(dwa_chunk, 2)  # version 2
+        _test_put_u64_le(dwa_chunk, 0); _test_put_u64_le(dwa_chunk, 0)  # unknown
+        _test_put_u64_le(dwa_chunk, UInt64(len(ac_comp)))
+        _test_put_u64_le(dwa_chunk, UInt64(len(dc_comp)))
+        _test_put_u64_le(dwa_chunk, 0); _test_put_u64_le(dwa_chunk, 0); _test_put_u64_le(dwa_chunk, 0)  # rle
+        _test_put_u64_le(dwa_chunk, 3)  # total_ac_cnt
+        _test_put_u64_le(dwa_chunk, 3)  # total_dc_cnt
+        _test_put_u64_le(dwa_chunk, 1)  # ac_compression = DEFLATE
+        # Rule table: R -> LOSSY_DCT + csc 0 (val=(1<<2)|(1<<4)=0x14), G -> 0x24, B -> 0x34
+        _test_put_u16_le(dwa_chunk, 11)
+        dwa_chunk.append(UInt8(ord("R"))); dwa_chunk.append(0); dwa_chunk.append(0x14)
+        dwa_chunk.append(UInt8(ord("G"))); dwa_chunk.append(0); dwa_chunk.append(0x24)
+        dwa_chunk.append(UInt8(ord("B"))); dwa_chunk.append(0); dwa_chunk.append(0x34)
+        for b in ac_comp: dwa_chunk.append(b)
+        for b in dc_comp: dwa_chunk.append(b)
+
+        _test_put_u32_le(exr_dwa, 0); _test_put_u32_le(exr_dwa, UInt32(len(dwa_chunk)))
+        for b in dwa_chunk: exr_dwa.append(b)
+
+        var d_dwa = decode_hdr_or_exr(exr_dwa)
+        _assert(d_dwa.valid and d_dwa.width == 8 and d_dwa.height == 8, "EXR DWA decode failed for compression=" + String(comp_dwa))
+        _assert(
+            abs(d_dwa.pixels[0].x - r_lin) < Float32(0.02)
+            and abs(d_dwa.pixels[0].y - g_lin) < Float32(0.02)
+            and abs(d_dwa.pixels[0].z - b_lin) < Float32(0.02),
+            "EXR DWA pixel mismatch",
+        )
+
+    # Strict EXR negative checks: tiled flag 0x200 without tiles attr; truncated PIZ/DWAA
+    var bad_tiled = exr_rle.copy()
+    bad_tiled[5] |= UInt8(0x02)
+    _assert(not decode_exr_fp16(bad_tiled).valid, "EXR with 0x200 flag and no tiles attr must be rejected")
+    var trunc_dwa = List[UInt8]()
+    _write_exr_header(trunc_dwa, 4, 4, EXR_DWAA_COMPRESSION, tiled=False)
+    _test_put_u64_le(trunc_dwa, UInt64(len(trunc_dwa) + 8))
+    _test_put_u32_le(trunc_dwa, 0); _test_put_u32_le(trunc_dwa, 24)
+    for _ in range(24): trunc_dwa.append(0)
+    _assert(not decode_exr_fp16(trunc_dwa).valid, "Truncated 24-byte DWAA chunk must be rejected")
+
+    # ---- M3c Iter-2 EXR Regressions: Oversubscribed Huffman, Truncated DWA sub-streams, OOB/missing tiles, 16x16 Multi-block DWAA/DWAB ----
+    # 1. Oversubscribed EXR PIZ Huffman (im=0, iM=3, all 4 symbols have len=1 -> Kraft overflow)
+    var bad_huf_exr = List[UInt8]()
+    _write_exr_header(bad_huf_exr, 4, 4, EXR_PIZ_COMPRESSION, tiled=False)
+    _test_put_u64_le(bad_huf_exr, UInt64(len(bad_huf_exr) + 8))
+    var bad_huf_blob = List[UInt8]()
+    _test_put_u32_le(bad_huf_blob, 0); _test_put_u32_le(bad_huf_blob, 3)  # im=0, iM=3
+    _test_put_u32_le(bad_huf_blob, 3); _test_put_u32_le(bad_huf_blob, 4); _test_put_u32_le(bad_huf_blob, 0)
+    # 4 x 6-bit lengths of 1 (= 0b000001): packed MSB-first = 0x04, 0x10, 0x41 + 1 dummy bit byte
+    bad_huf_blob.append(UInt8(0x04)); bad_huf_blob.append(UInt8(0x10)); bad_huf_blob.append(UInt8(0x41)); bad_huf_blob.append(UInt8(0x00))
+    var bhuf_chunk = List[UInt8]()
+    _test_put_u16_le(bhuf_chunk, 0); _test_put_u16_le(bhuf_chunk, 0); bhuf_chunk.append(UInt8(0x0F))  # min_nz=0, max_nz=0, bitmap 4 syms
+    _test_put_u32_le(bhuf_chunk, UInt32(len(bad_huf_blob)))
+    for b in bad_huf_blob: bhuf_chunk.append(b)
+    _test_put_u32_le(bad_huf_exr, 0); _test_put_u32_le(bad_huf_exr, UInt32(len(bhuf_chunk)))
+    for b in bhuf_chunk: bad_huf_exr.append(b)
+    _assert(not decode_exr_fp16(bad_huf_exr).valid, "Oversubscribed EXR PIZ Huffman must return valid=False without crashing")
+
+    # 2. Truncated DWA sub-streams (`dc_comp_sz=0` with `total_dc_cnt=3` + truncated `ac_u16`)
+    var bad_dwa_dc = List[UInt8]()
+    _write_exr_header(bad_dwa_dc, 8, 8, EXR_DWAA_COMPRESSION, tiled=False)
+    _test_put_u64_le(bad_dwa_dc, UInt64(len(bad_dwa_dc) + 8))
+    var dc0_chunk = List[UInt8]()
+    _test_put_u64_le(dc0_chunk, 2)
+    _test_put_u64_le(dc0_chunk, 0); _test_put_u64_le(dc0_chunk, 0)
+    _test_put_u64_le(dc0_chunk, 0); _test_put_u64_le(dc0_chunk, 0)  # ac_comp=0, dc_comp=0
+    _test_put_u64_le(dc0_chunk, 0); _test_put_u64_le(dc0_chunk, 0); _test_put_u64_le(dc0_chunk, 0)
+    _test_put_u64_le(dc0_chunk, 0); _test_put_u64_le(dc0_chunk, 3); _test_put_u64_le(dc0_chunk, 1)  # total_dc_cnt=3!
+    _test_put_u16_le(dc0_chunk, 11)
+    dc0_chunk.append(UInt8(ord("R"))); dc0_chunk.append(0); dc0_chunk.append(0x14)
+    dc0_chunk.append(UInt8(ord("G"))); dc0_chunk.append(0); dc0_chunk.append(0x24)
+    dc0_chunk.append(UInt8(ord("B"))); dc0_chunk.append(0); dc0_chunk.append(0x34)
+    _test_put_u32_le(bad_dwa_dc, 0); _test_put_u32_le(bad_dwa_dc, UInt32(len(dc0_chunk)))
+    for b in dc0_chunk: bad_dwa_dc.append(b)
+    _assert(not decode_exr_fp16(bad_dwa_dc).valid, "DWA chunk with dc_comp_sz=0 and total_dc_cnt=3 must be rejected")
+
+    # 3. OOB tile coordinates & missing level-0 tiles
+    var oob_tile_exr = List[UInt8]()
+    _write_exr_header(oob_tile_exr, 4, 4, EXR_NO_COMPRESSION, tiled=True)
+    _test_put_u64_le(oob_tile_exr, UInt64(len(oob_tile_exr) + 8))
+    _test_put_u32_le(oob_tile_exr, 1); _test_put_u32_le(oob_tile_exr, 0)  # tx=1 is OOB for 4x4 with tile_w=4!
+    _test_put_u32_le(oob_tile_exr, 0); _test_put_u32_le(oob_tile_exr, 0)
+    _test_put_u32_le(oob_tile_exr, 96)
+    for _ in range(96): oob_tile_exr.append(0)
+    _assert(not decode_exr_fp16(oob_tile_exr).valid, "EXR with OOB tile coordinate must be rejected")
+
+    # 4. Multi-block 16x16 DWAA/DWAB (`[Y, Cb, Cr]` + `block_major` AC, `ac_compression=0` Huffman & `1` DEFLATE)
+    for ac_mode in range(2):
+        var c_type = EXR_DWAA_COMPRESSION if ac_mode == 1 else EXR_DWAB_COMPRESSION
+        var exr16 = List[UInt8]()
+        _write_exr_header(exr16, 16, 16, c_type, tiled=False)
+        var t16 = len(exr16)
+        _test_put_u64_le(exr16, 0)
+        var off16 = UInt64(len(exr16))
+        for bi in range(8): exr16[t16 + bi] = UInt8((off16 >> UInt64(bi * 8)) & 0xFF)
+        # 4 blocks (8x8 each): b0=(0,0) gray(0.5), b1=(8,0) red-ish + non-zero Y AC[1], b2=(0,8) green-ish, b3=(8,8) blue-ish
+        var b_y = List[Float32](); var b_cb = List[Float32](); var b_cr = List[Float32]()
+        var br_vals: List[Float32] = [Float32(0.5), Float32(0.6), Float32(0.1), Float32(0.1)]
+        var bg_vals: List[Float32] = [Float32(0.5), Float32(0.1), Float32(0.6), Float32(0.1)]
+        var bb_vals: List[Float32] = [Float32(0.5), Float32(0.1), Float32(0.1), Float32(0.6)]
+        for bi in range(4):
+            var rn = exp(log(br_vals[bi]) / Float32(2.2))
+            var gn = exp(log(bg_vals[bi]) / Float32(2.2))
+            var bn = exp(log(bb_vals[bi]) / Float32(2.2))
+            var yn = Float32(0.2126) * rn + Float32(0.7152) * gn + Float32(0.0722) * bn
+            b_y.append(yn * Float32(8.0))
+            b_cb.append(((bn - yn) / Float32(1.8556)) * Float32(8.0))
+            b_cr.append(((rn - yn) / Float32(1.5747)) * Float32(8.0))
+        # DC stream is channel-major: all 4 Y, all 4 Cb, all 4 Cr
+        var dc16_bytes = List[UInt8]()
+        for v_dc in b_y:
+            var hv = f32_to_uf16_bits(v_dc) if v_dc >= 0 else (0x8000 | f32_to_uf16_bits(-v_dc))
+            _test_put_u16_le(dc16_bytes, hv)
+        for v_dc in b_cb:
+            var hv = f32_to_uf16_bits(v_dc) if v_dc >= 0 else (0x8000 | f32_to_uf16_bits(-v_dc))
+            _test_put_u16_le(dc16_bytes, hv)
+        for v_dc in b_cr:
+            var hv = f32_to_uf16_bits(v_dc) if v_dc >= 0 else (0x8000 | f32_to_uf16_bits(-v_dc))
+            _test_put_u16_le(dc16_bytes, hv)
+        var dc16_comp = _wrap_zlib_stored(_exr_reorder_and_predict(dc16_bytes))
+        # AC stream is block-major: b0 (3 EOB), b1 Y has 1 non-zero AC coeff (0x3800 = 0.5) + EOB then Cb/Cr EOB, b2 (3 EOB), b3 (3 EOB) -> 13 u16s!
+        var ac16_u16 = List[UInt16]()
+        for _ in range(3): ac16_u16.append(UInt16(0xFF00))  # b0
+        ac16_u16.append(UInt16(f32_to_uf16_bits(Float32(0.5)))); ac16_u16.append(UInt16(0xFF00))  # b1 Y
+        ac16_u16.append(UInt16(0xFF00)); ac16_u16.append(UInt16(0xFF00))  # b1 Cb, Cr
+        for _ in range(6): ac16_u16.append(UInt16(0xFF00))  # b2, b3
+        var ac16_comp: List[UInt8]
+        if ac_mode == 1:
+            var ac16_bytes = List[UInt8]()
+            for av in ac16_u16: _test_put_u16_le(ac16_bytes, Int(av))
+            ac16_comp = _wrap_zlib_stored(ac16_bytes)
+        else:
+            ac16_comp = _build_exr_huf_blob(ac16_u16)
+
+        var dw16_chunk = List[UInt8]()
+        _test_put_u64_le(dw16_chunk, 2)
+        _test_put_u64_le(dw16_chunk, 0); _test_put_u64_le(dw16_chunk, 0)
+        _test_put_u64_le(dw16_chunk, UInt64(len(ac16_comp)))
+        _test_put_u64_le(dw16_chunk, UInt64(len(dc16_comp)))
+        _test_put_u64_le(dw16_chunk, 0); _test_put_u64_le(dw16_chunk, 0); _test_put_u64_le(dw16_chunk, 0)
+        _test_put_u64_le(dw16_chunk, UInt64(len(ac16_u16)))
+        _test_put_u64_le(dw16_chunk, 12)
+        _test_put_u64_le(dw16_chunk, UInt64(ac_mode))
+        _test_put_u16_le(dw16_chunk, 11)
+        dw16_chunk.append(UInt8(ord("R"))); dw16_chunk.append(0); dw16_chunk.append(0x14)
+        dw16_chunk.append(UInt8(ord("G"))); dw16_chunk.append(0); dw16_chunk.append(0x24)
+        dw16_chunk.append(UInt8(ord("B"))); dw16_chunk.append(0); dw16_chunk.append(0x34)
+        for b in ac16_comp: dw16_chunk.append(b)
+        for b in dc16_comp: dw16_chunk.append(b)
+        _test_put_u32_le(exr16, 0); _test_put_u32_le(exr16, UInt32(len(dw16_chunk)))
+        for b in dw16_chunk: exr16.append(b)
+        var d16 = decode_exr_fp16(exr16)
+        _assert(d16.valid and d16.width == 16 and d16.height == 16, "16x16 multi-block DWA decode failed")
+        # Verify block (8,0) vs (15,0) reflects block_major AC[1] (>0 at x=8, < at x=15), and (0,8) is green-dominant, (8,8) is blue-dominant
+        _assert(d16.pixels[0 * 16 + 8].x > d16.pixels[0 * 16 + 15].x, "16x16 DWA block_major AC gradient failed")
+        _assert(d16.pixels[8 * 16 + 0].y > d16.pixels[8 * 16 + 0].x and d16.pixels[8 * 16 + 8].z > d16.pixels[8 * 16 + 8].y, "16x16 DWA [Y,Cb,Cr] CSC failed")
+
+    # 5. Scanline EXR OOB y_coord (y=99..102) & incomplete/duplicate scanline coverage rejection
+    var oob_scan_exr = List[UInt8]()
+    _write_exr_header(oob_scan_exr, 4, 4, EXR_NO_COMPRESSION, tiled=False)
+    var oob_tbl = len(oob_scan_exr)
+    for _ in range(4): _test_put_u64_le(oob_scan_exr, 0)
+    for row in range(4):
+        var r_off = UInt64(len(oob_scan_exr))
+        for bi in range(8): oob_scan_exr[oob_tbl + row * 8 + bi] = UInt8((r_off >> UInt64(bi * 8)) & 0xFF)
+        _test_put_u32_le(oob_scan_exr, UInt32(99 + row))
+        _test_put_u32_le(oob_scan_exr, 24)
+        for _ in range(24): oob_scan_exr.append(0)
+    _assert(not decode_exr_fp16(oob_scan_exr).valid, "Scanline EXR with OOB y_coord (99..102) must return valid=False")
+
+    var dup_scan_exr = List[UInt8]()
+    _write_exr_header(dup_scan_exr, 4, 4, EXR_NO_COMPRESSION, tiled=False)
+    var dup_tbl = len(dup_scan_exr)
+    for _ in range(4): _test_put_u64_le(dup_scan_exr, 0)
+    var dup_ys: List[Int] = [0, 0, 2, 3]
+    for row in range(4):
+        var r_off = UInt64(len(dup_scan_exr))
+        for bi in range(8): dup_scan_exr[dup_tbl + row * 8 + bi] = UInt8((r_off >> UInt64(bi * 8)) & 0xFF)
+        _test_put_u32_le(dup_scan_exr, UInt32(dup_ys[row]))
+        _test_put_u32_le(dup_scan_exr, 24)
+        for _ in range(24): dup_scan_exr.append(0)
+    _assert(not decode_exr_fp16(dup_scan_exr).valid, "Scanline EXR with duplicate/incomplete scanline coverage must return valid=False")
+
+    print("    [OK] F20 residency/loose_root & F21 GLB/KTX2/SOF2/EXR codecs passed!")
+
+
+def test_j_studio_v5_unification_ux_and_headless_smoke(tmp_root: String) raises:
+    print("  [j] Testing F30 Studio EngineApp+World+Scene+PhysicsWorld unification, .flscn/.flscnb, multi-select, hierarchy reparenting & 1280x720 smoke...")
+
+    # 1. Empty Studio starts with 0 ECS entities & real EngineApp plugins/resources
+    var st = FlintStudioState()
+    _assert(st.live_entity_count() == 0 and st.app.world.entity_count() == 0, "empty Studio must have 0 entities")
+    _assert(st.app.resources.has[PhysicsWorld]() and st.app.resources.has[ScalableRenderer](), "Studio must host PhysicsWorld and ScalableRenderer resources")
+
+    # Spawn parent, child, and sibling dynamic sphere
+    var p_id = st.spawn_entity("ParentRoot", position=Vec3(2.0, 0.0, 0.0), collider_kind=COLLIDER_BOX, mass=0.0)
+    var c_id = st.spawn_entity("ChildBox", position=Vec3(0.0, 2.0, 0.0), collider_kind=COLLIDER_BOX, mass=0.0)
+    var d_id = st.spawn_entity("DynBall", position=Vec3(-2.0, 5.0, 0.0), collider_kind=COLLIDER_SPHERE, collider_half_extents=Vec3(0.5, 0.5, 0.5), mass=4.0)
+    var p_e = st.resolve_entity(p_id)
+    var c_e = st.resolve_entity(c_id)
+    var d_e = st.resolve_entity(d_id)
+    _assert(
+        st.app.world.has[LocalTransform](p_e)
+        and st.app.world.has[GlobalTransform](p_e)
+        and st.app.world.has[MeshRendererComponent](p_e)
+        and st.app.world.has[MaterialOverrideComponent](p_e)
+        and st.app.world.has[RigidBodyComponent](d_e)
+        and st.app.world.has[ColliderComponent](d_e)
+        and st.app.world.has[StudioEntityMetaComponent](p_e)
+        and st.app.world.has[StudioStyleComponent](p_e),
+        "Studio entities must carry v5 ECS components in app.world",
+    )
+
+    # 1b. M2 Inactive-Body & STATIC -> DYNAMIC wind_area_over_mass regression inside Studio PhysicsWorld
+    var inact_id = st.spawn_entity("InactiveBody", position=Vec3(5.0, 3.0, 0.0), collider_kind=COLLIDER_BOX, mass=0.0)
+    var inact_e = st.resolve_entity(inact_id)
+    ref phys_p0 = st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0]
+    var body_cnt_0 = len(phys_p0.bodies)
+    st.app.world.get_ptr_mut[RigidBodyComponent](inact_e).value()[unsafe_offset=0].active = False
+    for _ in range(5):
+        _ = st.step_simulation(1)
+    var body_cnt_1 = len(st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].bodies)
+    _assert(body_cnt_1 == body_cnt_0, "inactive RigidBodyComponent must not leak PhysicsWorld bodies per frame")
+    var f_mass = InspectedField("mass", FIELD_F32)
+    f_mass.f_val = Float32(6.0)
+    _assert(st.patch_entity_field(inact_id, "mass", f_mass), "STATIC->DYNAMIC mass patch failed")
+    var inact_bid = st.app.world.get_ptr[RigidBodyComponent](inact_e).value()[unsafe_offset=0].body_id
+    var inact_slot = st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].find_slot_by_id_any(inact_bid)
+    _assert(
+        inact_slot >= 0 and st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].bodies[inact_slot].wind_area_over_mass > Float32(0.0),
+        "STATIC->DYNAMIC transition must recompute wind_area_over_mass",
+    )
+    _ = st.despawn_entity(inact_id, record_undo=False)
+    st.sim_tick = 0
+
+    # 1c. Challenger 1 Regression: `_apply_collider_and_rb` must preserve custom RigidBodyComponent & ColliderComponent fields
+    var cust_id = st.spawn_entity("CustomPhysics", position=Vec3(3.0, 4.0, 1.0), collider_kind=COLLIDER_BOX, mass=5.0, record_undo=False)
+    var cust_e = st.resolve_entity(cust_id)
+    ref cust_rb = st.app.world.get_ptr_mut[RigidBodyComponent](cust_e).value()[unsafe_offset=0]
+    cust_rb.linear_damping = Float32(0.27)
+    cust_rb.angular_damping = Float32(0.63)
+    cust_rb.rolling_resistance = Float32(0.19)
+    cust_rb.gravity_scale = Float32(0.4)
+    cust_rb.material = 7
+    cust_rb.enable_ccd = True
+    ref cust_col = st.app.world.get_ptr_mut[ColliderComponent](cust_e).value()[unsafe_offset=0]
+    cust_col.local_offset = Vec3(0.1, 0.2, 0.3)
+    cust_col.is_trigger = True
+
+    var col_patch = InspectedField("base_color", FIELD_COLOR_RGB)
+    col_patch.v3_val = Vec3(0.2, 0.7, 0.4)
+    _assert(st.patch_entity_field(cust_id, "base_color", col_patch), "patch base_color on custom physics entity failed")
+    _assert(st.set_entity_transform(cust_id, Vec3(3.5, 4.5, 1.5), Quat(0.0, 0.0, 0.0, 1.0), Vec3(1.0, 1.0, 1.0)), "set_entity_transform on custom physics entity failed")
+
+    ref post_rb = st.app.world.get_ptr[RigidBodyComponent](cust_e).value()[unsafe_offset=0]
+    _assert(
+        abs(post_rb.linear_damping - Float32(0.27)) < Float32(1e-5)
+        and abs(post_rb.angular_damping - Float32(0.63)) < Float32(1e-5)
+        and abs(post_rb.rolling_resistance - Float32(0.19)) < Float32(1e-5)
+        and abs(post_rb.gravity_scale - Float32(0.4)) < Float32(1e-5)
+        and post_rb.material == 7
+        and post_rb.enable_ccd,
+        "patch_entity_field / set_entity_transform must preserve custom RigidBodyComponent fields",
+    )
+    ref post_col = st.app.world.get_ptr[ColliderComponent](cust_e).value()[unsafe_offset=0]
+    _assert(
+        abs(post_col.local_offset.x - Float32(0.1)) < Float32(1e-5)
+        and abs(post_col.local_offset.y - Float32(0.2)) < Float32(1e-5)
+        and abs(post_col.local_offset.z - Float32(0.3)) < Float32(1e-5)
+        and post_col.is_trigger,
+        "patch_entity_field / set_entity_transform must preserve custom ColliderComponent fields",
+    )
+    _ = st.despawn_entity(cust_id, record_undo=False)
+
+    # 1d. Challenger 1 Regression: BODY_MOTION_KINEMATIC must survive unrelated edits, while DYNAMIC <-> STATIC tracks mass
+    var kin_id = st.spawn_entity("KinematicBody", position=Vec3(-3.0, 2.0, 0.0), collider_kind=COLLIDER_BOX, mass=0.0, record_undo=False)
+    var kin_e = st.resolve_entity(kin_id)
+    st.app.world.get_ptr_mut[RigidBodyComponent](kin_e).value()[unsafe_offset=0].motion_mode = BODY_MOTION_KINEMATIC
+    _assert(st.patch_entity_field(kin_id, "base_color", col_patch), "patch base_color on kinematic entity failed")
+    _assert(
+        st.app.world.get_ptr[RigidBodyComponent](kin_e).value()[unsafe_offset=0].motion_mode == BODY_MOTION_KINEMATIC,
+        "unrelated edit must preserve BODY_MOTION_KINEMATIC",
+    )
+    var dyn_sw_mass = InspectedField("mass", FIELD_F32)
+    dyn_sw_mass.f_val = Float32(3.0)
+    _assert(st.patch_entity_field(kin_id, "mass", dyn_sw_mass), "kinematic->dynamic mass patch failed")
+    _assert(
+        st.app.world.get_ptr[RigidBodyComponent](kin_e).value()[unsafe_offset=0].motion_mode == BODY_MOTION_DYNAMIC,
+        "positive mass edit must switch motion_mode to BODY_MOTION_DYNAMIC",
+    )
+    dyn_sw_mass.f_val = Float32(0.0)
+    _assert(st.patch_entity_field(kin_id, "mass", dyn_sw_mass), "dynamic->static mass patch failed")
+    _assert(
+        st.app.world.get_ptr[RigidBodyComponent](kin_e).value()[unsafe_offset=0].motion_mode == BODY_MOTION_STATIC,
+        "zero mass edit from dynamic must switch motion_mode to BODY_MOTION_STATIC",
+    )
+    _ = st.despawn_entity(kin_id, record_undo=False)
+
+    # Also verify _sync_compat_view projects mass=0.0 for BODY_MOTION_KINEMATIC even if rb.mass > 0
+    var kin2_id = st.spawn_entity("KinematicNonZeroMass", position=Vec3(-4.0, 2.0, 0.0), collider_kind=COLLIDER_BOX, mass=2.5, record_undo=False)
+    var kin2_e = st.resolve_entity(kin2_id)
+    st.app.world.get_ptr_mut[RigidBodyComponent](kin2_e).value()[unsafe_offset=0].motion_mode = BODY_MOTION_KINEMATIC
+    st._sync_compat_view()
+    _assert(st.entities[kin2_id].mass == Float32(0.0), "_sync_compat_view must project 0.0 mass for BODY_MOTION_KINEMATIC")
+    _assert(st.patch_entity_field(kin2_id, "base_color", col_patch), "patch base_color on kinematic non-zero mass entity failed")
+    _assert(
+        st.app.world.get_ptr[RigidBodyComponent](kin2_e).value()[unsafe_offset=0].motion_mode == BODY_MOTION_KINEMATIC,
+        "unrelated edit must preserve BODY_MOTION_KINEMATIC when rb.mass was non-zero",
+    )
+    _ = st.despawn_entity(kin2_id, record_undo=False)
+
+    # 1e. Challenger 1 Regression (Iter 3): moving active=False dynamic entity must not leak PhysicsWorld bodies or churn body_id
+    var z_eid = st.spawn_entity("InactiveDynLeakCheck", position=Vec3(0.0, 3.0, 0.0), collider_kind=COLLIDER_BOX, mass=2.0, record_undo=False)
+    var z_e = st.resolve_entity(z_eid)
+    st.app.world.get_ptr_mut[RigidBodyComponent](z_e).value()[unsafe_offset=0].active = False
+    st._sync_ecs_and_physics()
+    var z_cnt_before = len(st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].bodies)
+    var orig_bid = st.app.world.get_ptr[RigidBodyComponent](z_e).value()[unsafe_offset=0].body_id
+    _assert(orig_bid >= 0, "inactive dynamic entity must keep valid body_id after sync")
+    for mi in range(5):
+        _assert(
+            st.set_entity_transform(z_eid, Vec3(Float32(mi + 1), 3.0, 0.0), Quat(0.0, 0.0, 0.0, 1.0), Vec3(1.0, 1.0, 1.0)),
+            "set_entity_transform on inactive dynamic entity failed",
+        )
+        var cur_bid = st.app.world.get_ptr[RigidBodyComponent](z_e).value()[unsafe_offset=0].body_id
+        _assert(cur_bid == orig_bid, "transforming active=False dynamic entity must preserve body_id")
+        var cur_cnt = len(st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].bodies)
+        _assert(cur_cnt == z_cnt_before, "transforming active=False dynamic entity must not leak PhysicsWorld bodies")
+    _assert(st.despawn_entity(z_eid, record_undo=False), "despawn inactive dynamic entity failed")
+    var z_cnt_after = len(st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].bodies)
+    _assert(z_cnt_after == z_cnt_before - 1, "despawn_entity must remove inactive dynamic entity's PhysicsWorld body cleanly")
+    st.sim_tick = 0
+
+    # 2. Hierarchy Reparenting (`set_parent` / `clear_parent`), GlobalTransform propagation, Cycle Guard & Undo/Redo
+    var h_pre_rep = st.state_hash()
+    _assert(st.reparent_entity(c_id, p_id, preserve_world_transform=False, record_undo=True), "reparent c->p failed")
+    _assert(st.parent_of(c_id) == p_id, "parent_of(c) must equal p_id")
+    _assert(st.app.world.has[Parent](c_e), "world must have Parent component on child")
+    _assert(st.app.world.has[Children](p_e) and st.app.world.get_ptr[Children](p_e).value()[unsafe_offset=0].contains(c_e), "parent Children must contain child")
+    _assert(st.app.world.get_ptr[HierarchyDepth](c_e).value()[unsafe_offset=0].depth == 1, "child HierarchyDepth must be 1")
+    var c_gt = st.app.world.get_ptr[GlobalTransform](c_e).value()[unsafe_offset=0].copy()
+    _assert(abs(c_gt.translation.x - Float32(2.0)) < Float32(1e-4) and abs(c_gt.translation.y - Float32(2.0)) < Float32(1e-4), "GlobalTransform must compose parent+child")
+
+    # Cycle guard: self-parent & descendant-parent must return False
+    _assert(not st.reparent_entity(p_id, p_id), "self-parent must be rejected")
+    _assert(not st.reparent_entity(p_id, c_id), "cyclic parent->child reparent must be rejected")
+
+    # Undo/redo reparenting
+    var h_post_rep = st.state_hash()
+    _assert(h_post_rep != h_pre_rep, "reparenting must mutate state_hash")
+    _assert(st.undo() and st.state_hash() == h_pre_rep and st.parent_of(c_id) == -1 and not st.app.world.has[Parent](c_e), "undo reparent failed")
+    _assert(st.redo() and st.state_hash() == h_post_rep and st.parent_of(c_id) == p_id, "redo reparent failed")
+
+    # preserve_world_transform=True test
+    _assert(st.reparent_entity(c_id, -1, preserve_world_transform=True, record_undo=True), "unparent with preserve_world failed")
+    var c_gt_unp = st.app.world.get_ptr[GlobalTransform](c_e).value()[unsafe_offset=0].copy()
+    _assert(abs(c_gt_unp.translation.x - Float32(2.0)) < Float32(1e-4), "preserve_world_transform=True must keep world X=2.0")
+    _ = st.undo()  # back to c under p
+
+    # 3. `.flscn` JSON & `.flscnb` LZ4 Binary Save/Load Round-Trip
+    var flscn_path = tmp_root + "/studio_v5_scene.flscn"
+    var flscnb_path = tmp_root + "/studio_v5_scene.flscnb"
+    var h_save = st.state_hash()
+    _assert(st.save_scene_file(flscn_path) and st.save_scene_file(flscnb_path), "save .flscn/.flscnb failed")
+
+    var st_json = FlintStudioState()
+    _assert(st_json.load_scene_file(flscn_path), "load .flscn failed")
+    _assert(st_json.live_entity_count() == 3 and st_json.state_hash() == h_save, ".flscn load state_hash mismatch")
+    _assert(st_json.parent_of(1) == 0, ".flscn load did not reconstruct Parent/Children")
+    st_json.shutdown()
+
+    var st_bin = FlintStudioState()
+    _assert(st_bin.load_scene_file(flscnb_path), "load .flscnb failed")
+    _assert(st_bin.live_entity_count() == 3 and st_bin.state_hash() == h_save, ".flscnb load state_hash mismatch")
+    _assert(st_bin.parent_of(1) == 0, ".flscnb load did not reconstruct Parent/Children")
+    st_bin.shutdown()
+
+    # 4. PIE 120-Tick Rollback (World checksum AND PhysicsWorld body state bit-for-bit!)
+    var pre_pie_world_sum = st.app.world.state_checksum()
+    var pre_pie_hash = st.state_hash()
+    var d_bid = st.app.world.get_ptr[RigidBodyComponent](d_e).value()[unsafe_offset=0].body_id
+    var d_slot = st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].find_slot_by_id(d_bid)
+    var pre_pie_body_cnt = len(st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].bodies)
+    var pre_pie_body_y = st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].bodies[d_slot].pos.y
+    var pre_pie_body_vy = st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0].bodies[d_slot].linear_vel.y
+
+    _assert(st.pie_play(), "PIE play failed")
+    _assert(st.pie_step(120) == 120, "PIE step 120 failed")
+    _assert(st.entities[d_id].translation.y < Float32(1.5), "DynBall must fall under PhysicsWorld gravity during PIE")
+    _assert(st.app.world.state_checksum() != pre_pie_world_sum, "World state_checksum must mutate during PIE")
+    _assert(st.pie_stop(), "PIE stop failed")
+    _assert(not st.scene.has_pie_snapshot and len(st.scene.pie_snapshot) == 0, "PIE stop must clear Scene PIE snapshot")
+
+    _assert(st.state_hash() == pre_pie_hash, "PIE stop state_hash mismatch")
+    _assert(st.app.world.state_checksum() == pre_pie_world_sum, "PIE stop must restore World.state_checksum bit-for-bit")
+    ref phys_after = st.app.resources.get_ptr[PhysicsWorld]().value()[unsafe_offset=0]
+    var d_slot_after = phys_after.find_slot_by_id(d_bid)
+    _assert(
+        len(phys_after.bodies) == pre_pie_body_cnt
+        and d_slot_after >= 0
+        and phys_after.bodies[d_slot_after].pos.y == pre_pie_body_y
+        and phys_after.bodies[d_slot_after].linear_vel.y == pre_pie_body_vy,
+        "PIE stop must restore PhysicsWorld body count, pos, and velocity bit-for-bit",
+    )
+
+    # 5. Multi-Select (Ctrl toggle, Shift range over DFS tree including collapsed subtrees), Bulk Ops & UI
+    st.select_entity(p_id)
+    _assert(st.selected_count() == 1 and st.is_selected(p_id), "single select failed")
+    st.select_entity(d_id, multi_select=True)
+    _assert(st.selected_count() == 2 and st.is_selected(p_id) and st.is_selected(d_id), "Ctrl multi-select add failed")
+    st.select_entity(p_id, multi_select=True)
+    _assert(st.selected_count() == 1 and not st.is_selected(p_id) and st.is_selected(d_id), "Ctrl multi-select toggle remove failed")
+
+    # Shift range over expanded tree [p_id, c_id, d_id]
+    _assert(len(st.hierarchy_visible_rows()) == 3, "expanded hierarchy must show 3 visible rows")
+    st.select_entity(p_id)
+    st.select_entity(d_id, range_select=True)
+    _assert(st.selected_count() == 3 and st.is_selected(p_id) and st.is_selected(c_id) and st.is_selected(d_id), "Shift range select failed")
+
+    # Collapse p_id -> visible order hides c_id -> Shift range p_id..d_id selects only [p_id, d_id]!
+    st.set_hierarchy_expanded(p_id, False)
+    var collapsed_rows = st.hierarchy_visible_rows()
+    _assert(len(collapsed_rows) == 2 and collapsed_rows[0].entity_id == p_id and collapsed_rows[1].entity_id == d_id, "collapsed parent must hide child rows (expected 2 visible rows)")
+    st.select_entity(p_id)
+    st.select_entity(d_id, range_select=True)
+    _assert(st.selected_count() == 2 and st.is_selected(p_id) and st.is_selected(d_id) and not st.is_selected(c_id), "collapsed subtree must be skipped in Shift range")
+    st.set_hierarchy_expanded(p_id, True)
+    _assert(len(st.hierarchy_visible_rows()) == 3, "re-expanded hierarchy must show 3 visible rows")
+
+    # Bulk translate & bulk patch with Undo/Redo
+    st.select_entity(p_id)
+    st.select_entity(d_id, multi_select=True)
+    var h_pre_bulk = st.state_hash()
+    _assert(st.bulk_translate_selected(Vec3(1.0, 0.0, 0.0), coalesce_key=777), "bulk translate 1 failed")
+    _assert(st.bulk_translate_selected(Vec3(0.5, 0.0, 0.0), coalesce_key=777), "bulk translate 2 coalesce failed")
+    _assert(abs(st.entities[p_id].translation.x - Float32(3.5)) < Float32(1e-4), "bulk translate p_id mismatch")
+    _assert(abs(st.entities[d_id].translation.x - Float32(-0.5)) < Float32(1e-4), "bulk translate d_id mismatch")
+    var f_bulk_r = InspectedField("roughness", FIELD_F32)
+    f_bulk_r.f_val = Float32(0.91)
+    _assert(st.bulk_patch_field("roughness", f_bulk_r) == 2, "bulk_patch_field failed")
+    var h_post_bulk = st.state_hash()
+    _assert(st.undo() and st.undo() and st.state_hash() == h_pre_bulk, "bulk undo mismatch")
+    _assert(st.redo() and st.redo() and st.state_hash() == h_post_bulk, "bulk redo mismatch")
+
+    # Bulk duplicate & bulk delete + Undo
+    var dup_ids = st.duplicate_selected(record_undo=True)
+    _assert(len(dup_ids) == 2 and st.live_entity_count() == 5, "duplicate_selected failed")
+    _assert(st.despawn_selected(record_undo=True) == 2 and st.live_entity_count() == 3, "despawn_selected failed")
+    _assert(st.undo() and st.live_entity_count() == 5 and st.undo() and st.state_hash() == h_post_bulk, "undo bulk delete/dup mismatch")
+
+    # Simulated UI Hierarchy & Multi-Select click interaction (`emit_studio_ui_draw_list`)
+    var ui_dl = UiDrawList()
+    var sim_in = InputState()
+    emit_studio_ui_draw_list(ui_dl, st, -1, SdfFont(), 1280, 720, input=sim_in)
+    _assert(ui_dl.count() > 50, "Studio UI draw list must emit Hierarchy + Inspector + Viewport primitives")
+    # Click [Unparent] button in Hierarchy when c_id is selected
+    st.select_entity(c_id)
+    emit_studio_ui_draw_list(ui_dl, st, -1, SdfFont(), 1280, 720, input=sim_in)
+    var h_info = st.dock.find_panel("Hierarchy")
+    _assert(h_info[0] >= 0 and h_info[2], "Hierarchy dock panel must be active")
+    var cx_btn = h_info[3].x + Float32(28.0)
+    var cy_btn = h_info[3].y + Float32(16.0)
+    sim_in.begin_frame()
+    sim_in.move_mouse(cx_btn, cy_btn)
+    sim_in.set_mouse(0, True)
+    emit_studio_ui_draw_list(ui_dl, st, -1, SdfFont(), 1280, 720, input=sim_in)
+    sim_in.begin_frame()
+    sim_in.move_mouse(cx_btn, cy_btn)
+    sim_in.set_mouse(0, False)
+    emit_studio_ui_draw_list(ui_dl, st, -1, SdfFont(), 1280, 720, input=sim_in)
+    _assert(st.parent_of(c_id) == -1, "clicking Hierarchy Unparent button must unparent selected child")
+
+    # 6. `.otf` Font Discovery in `scan_asset_browser`
+    var otf_dir = tmp_root + "/ab_otf"
+    _ = make_dirs(otf_dir)
+    var dummy_otf = List[UInt8](length=16, fill=UInt8(0x4F))
+    _assert(write_bytes(otf_dir + "/studio_ui.otf", dummy_otf), "write dummy .otf failed")
+    var ab_cnt = st.scan_asset_browser(dir_path=otf_dir)
+    _assert(ab_cnt == 1 and st.asset_browser_entries[0] == "studio_ui.otf", "scan_asset_browser must discover .otf fonts")
+    st.shutdown()
+
+    # 7. 1280x720 Headless Smoke Render & PNG Dimension Verification
+    var smoke_studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_2_AAA_VISBUFFER_RT, width=1280, height=720)
+    var s_grid_mid = 0
+    var s_orb_mid = 0
+    var s_rend_opt = smoke_studio.app.resources.get_ptr_mut[ScalableRenderer]()
+    if s_rend_opt:
+        ref s_rend = s_rend_opt.value()[unsafe_offset=0]
+        var m0 = s_rend.register_material(MaterialAsset(base_color=Vec3(0.30, 0.35, 0.42), roughness=0.6, metallic=0.05))
+        var m1 = s_rend.register_material(MaterialAsset(base_color=Vec3(0.85, 0.25, 0.20), roughness=0.2, metallic=0.75))
+        s_grid_mid = s_rend.register_mesh(build_studio_reference_grid_mesh(16.0, 8), m0, build_lods=False)
+        s_orb_mid = s_rend.register_mesh(build_subd_material_orb(0.88, 2), m1, build_lods=False)
+    _ = smoke_studio.spawn_entity("SmokeGrid", position=Vec3(0.0, 0.0, 0.0), mesh_id=s_grid_mid, record_undo=False)
+    _ = smoke_studio.spawn_entity("SmokeOrb", position=Vec3(0.0, 1.0, 0.0), base_color=Vec3(0.85, 0.25, 0.20), mesh_id=s_orb_mid, record_undo=False)
+    smoke_studio.look_at(Vec3(-5.0, 3.5, -6.5), Vec3(0.0, 0.8, 0.0))
+    smoke_studio.render_editor_frame(1280, 720)
+    var smoke_px = smoke_studio.app.resources.get_ptr_mut[ScalableRenderer]().value()[unsafe_offset=0].readback_pixels()
+    _assert(len(smoke_px) == 1280 * 720, "1280x720 headless Studio smoke pixel buffer size mismatch")
+    var smoke_png = tmp_root + "/studio_smoke_1280x720.png"
+    _assert(write_png(smoke_png, smoke_px, 1280, 720), "write headless smoke PNG failed")
+    var smoke_dec = decode_png(read_bytes(smoke_png), maximum_size=2048)
+    _assert(smoke_dec.valid and smoke_dec.width == 1280 and smoke_dec.height == 720, "decoded Studio smoke PNG must be 1280x720")
+    var non_uniform = False
+    var first_px = smoke_dec.pixels[0]
+    for pi in range(0, len(smoke_dec.pixels), 97):
+        if smoke_dec.pixels[pi] != first_px:
+            non_uniform = True
+            break
+    _assert(non_uniform, "Studio smoke PNG must have non-uniform rendered pixels")
+    smoke_studio.shutdown()
+
+    print("    [OK] F30 Studio EngineApp+World+Scene+PhysicsWorld unification, UX & 1280x720 smoke passed!")
+
+
+def _build_uv_seamed_torus_3072t() -> NativeMesh:
+    """Builds a `32 x 48` (`3,072`-triangle) closed torus with an explicit UV seam along `u = 0 / 1` and `v = 0 / 1`."""
+    var m = NativeMesh()
+    comptime MAJ_SEGS: Int = 48
+    comptime MIN_SEGS: Int = 32
+    comptime R_MAJ: Float32 = 2.0
+    comptime R_MIN: Float32 = 0.65
+    comptime TAU: Float32 = 6.28318530
+
+    for i in range(MAJ_SEGS + 1):
+        var tu = Float32(i) / Float32(MAJ_SEGS)
+        var phi = tu * TAU
+        var cp = cos(phi)
+        var sp = sin(phi)
+        for j in range(MIN_SEGS + 1):
+            var tv = Float32(j) / Float32(MIN_SEGS)
+            var theta = tv * TAU
+            var ct = cos(theta)
+            var st = sin(theta)
+            var ring_r = R_MAJ + R_MIN * ct
+            var px = ring_r * cp
+            var py = R_MIN * st
+            var pz = ring_r * sp
+            var nx = ct * cp
+            var ny = st
+            var nz = ct * sp
+            m.positions.append(px); m.positions.append(py); m.positions.append(pz)
+            m.normals.append(nx); m.normals.append(ny); m.normals.append(nz)
+            m.texcoords.append(tu); m.texcoords.append(tv)
+            m.ao.append(UInt8(220))
+            var cr = UInt8(60 + Int(tu * Float32(160.0)))
+            var cg = UInt8(90 + Int(tv * Float32(120.0)))
+            m.colors.append(cr); m.colors.append(cg); m.colors.append(UInt8(210)); m.colors.append(UInt8(255))
+
+    var stride = MIN_SEGS + 1
+    for i in range(MAJ_SEGS):
+        for j in range(MIN_SEGS):
+            var i0 = i * stride + j
+            var i1 = i0 + 1
+            var i2 = i0 + stride + 1
+            var i3 = i0 + stride
+            m.indices.append(i0); m.indices.append(i1); m.indices.append(i2)
+            m.indices.append(i0); m.indices.append(i2); m.indices.append(i3)
+    return m^
+
+
+def _count_open_spatial_boundary_edges(meshes: List[NativeMesh]) -> Int:
+    """Welds spatial vertex positions within `1e-4` across `meshes` and counts undirected edges with `tri_count != 2`."""
+    var rep_pos = List[Vec3]()
+    var all_tris = List[Int]()
+
+    for m_i in range(len(meshes)):
+        ref m = meshes[m_i]
+        var vc = m.vertex_count()
+        var v_map = List[Int](length=vc, fill=0)
+        for v in range(vc):
+            var p = Vec3(m.positions[v * 3], m.positions[v * 3 + 1], m.positions[v * 3 + 2])
+            var found = -1
+            for r in range(len(rep_pos)):
+                if (rep_pos[r] - p).length_squared() <= Float32(1e-8):
+                    found = r
+                    break
+            if found >= 0:
+                v_map[v] = found
+            else:
+                v_map[v] = len(rep_pos)
+                rep_pos.append(p)
+        var tc = len(m.indices) // 3
+        for t in range(tc):
+            var a = v_map[m.indices[t * 3]]
+            var b = v_map[m.indices[t * 3 + 1]]
+            var c = v_map[m.indices[t * 3 + 2]]
+            if a != b and b != c and c != a:
+                all_tris.append(a); all_tris.append(b); all_tris.append(c)
+
+    var e_u = List[Int]()
+    var e_v = List[Int]()
+    var e_cnt = List[Int]()
+    var n_t = len(all_tris) // 3
+    for t in range(n_t):
+        var vs = [all_tris[t * 3], all_tris[t * 3 + 1], all_tris[t * 3 + 2]]
+        for k in range(3):
+            var u0 = min(vs[k], vs[(k + 1) % 3])
+            var u1 = max(vs[k], vs[(k + 1) % 3])
+            var idx = -1
+            for ei in range(len(e_u)):
+                if e_u[ei] == u0 and e_v[ei] == u1:
+                    idx = ei
+                    break
+            if idx >= 0:
+                e_cnt[idx] += 1
+            else:
+                e_u.append(u0); e_v.append(u1); e_cnt.append(1)
+
+    var non_manifold = 0
+    for ei in range(len(e_cnt)):
+        if e_cnt[ei] != 2:
+            non_manifold += 1
+    return non_manifold
+
+
+def _assert_valid_mesh_attribs(m: NativeMesh, label: String, require_colors: Bool = False) raises:
+    var vc = m.vertex_count()
+    var tc = len(m.indices) // 3
+    _assert(vc >= 3, label + ": vertex_count >= 3")
+    _assert(tc >= 1, label + ": triangle_count >= 1")
+    _assert(len(m.normals) == vc * 3, label + ": normals length == 3 * V")
+    _assert(len(m.texcoords) == vc * 2, label + ": texcoords length == 2 * V")
+    _assert(len(m.ao) == vc, label + ": ao length == V")
+    if require_colors:
+        _assert(len(m.colors) == vc * 4, label + ": colors length == 4 * V")
+    for idx in m.indices:
+        if idx < 0 or idx >= vc:
+            raise Error(label + ": out-of-range triangle index")
+    for v in range(vc):
+        var n = Vec3(m.normals[v * 3], m.normals[v * 3 + 1], m.normals[v * 3 + 2])
+        if abs(n.length() - Float32(1.0)) > Float32(0.05):
+            raise Error(label + ": non-unit vertex normal")
+
+
+def test_qem_minheap_speed_and_validity() raises:
+    var torus = _build_uv_seamed_torus_3072t()
+    _assert(torus.triangle_count() == 3072, "input torus has 3,072 triangles")
+
+    var t_start_ns = monotonic()
+    var lod1 = simplify_mesh_qem(torus, 1536)
+    var lod2 = simplify_mesh_qem(lod1[0], 768)
+    var lod3 = simplify_mesh_qem(lod2[0], 384)
+    var elapsed_ms = Float64(monotonic() - t_start_ns) / 1_000_000.0
+    print("    [Benchmark] 3,072-tri 3-LOD QEM chain simplified in", elapsed_ms, "ms")
+
+    _assert(elapsed_ms < 15.0, "3,072-tri 3-step QEM simplification completes in < 15 ms")
+    _assert(lod1[0].triangle_count() <= 1560 and lod1[0].triangle_count() >= 1400, "LOD 1 reaches ~1,536 tris")
+    _assert(lod2[0].triangle_count() <= 800 and lod2[0].triangle_count() >= 700, "LOD 2 reaches ~768 tris")
+    _assert(lod3[0].triangle_count() <= 420 and lod3[0].triangle_count() >= 340, "LOD 3 reaches ~384 tris")
+    _assert(lod1[1] > Float32(0.0) and lod2[1] > Float32(0.0) and lod3[1] > Float32(0.0), "positive QEM geometric errors")
+
+    _assert_valid_mesh_attribs(lod3[0], "QEM LOD3 torus", require_colors=True)
+    _assert(Int(lod3[0].colors[2]) == 210, "QEM LOD3 preserves vertex color blue channel across collapses")
+
+    var m_list = List[NativeMesh]()
+    m_list.append(lod3[0].copy())
+    _assert(_count_open_spatial_boundary_edges(m_list) == 0, "UV-seamed torus stays 100% watertight after 8x QEM decimation")
+
+
+def test_vertex_words_11_ao_and_splat_packing() raises:
+    var m_std = NativeMesh()
+    m_std.positions = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    m_std.normals = [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+    m_std.texcoords = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+    m_std.ao = [UInt8(255), UInt8(128), UInt8(0)]
+    m_std.indices = [0, 2, 1]
+
+    var pool = AaaGeometryPool()
+    var entry_std = pool.append_mesh(m_std, material_id=0, build_lods=False)
+    _assert(entry_std.vertex_count == 3, "standard mesh stores 3 vertices")
+
+    var w11_v0 = pool.vertex_words[0 * 12 + 11]
+    var w11_v1 = pool.vertex_words[1 * 12 + 11]
+    var w11_v2 = pool.vertex_words[2 * 12 + 11]
+
+    _assert(Int((w11_v0 >> 1) & 1) == 0, "standard mesh bit 1 (is_terrain_splat) == 0")
+    _assert(Int((w11_v0 >> 2) & 0x3F) == 63, "ao_byte=255 packs to ao_u6=63 in bits 2..7")
+    _assert(Int(w11_v0 >> 8) == 0xFFFFFF, "uncolored standard mesh defaults bits 8..31 to white 0xFFFFFF")
+    _assert(Int((w11_v1 >> 2) & 0x3F) == 32, "ao_byte=128 packs to ao_u6=32")
+    _assert(Int((w11_v2 >> 2) & 0x3F) == 0, "ao_byte=0 packs to ao_u6=0")
+
+    var m_col = m_std.copy()
+    m_col.colors = [
+        UInt8(0x12), UInt8(0x34), UInt8(0x56), UInt8(255),
+        UInt8(0xFE), UInt8(0x80), UInt8(0x05), UInt8(255),
+        UInt8(0x00), UInt8(0x00), UInt8(0x00), UInt8(255),
+    ]
+    var entry_col = pool.append_mesh(m_col, material_id=1, build_lods=False)
+    var base_cv = entry_col.first_vertex
+    var cw_v0 = pool.vertex_words[(base_cv + 0) * 12 + 11]
+    var cw_v1 = pool.vertex_words[(base_cv + 1) * 12 + 11]
+    var cw_v2 = pool.vertex_words[(base_cv + 2) * 12 + 11]
+
+    _assert(Int((cw_v0 >> 1) & 1) == 0, "colored standard mesh bit 1 == 0")
+    _assert(Int((cw_v0 >> 8) & 0xFF) == 0x12, "colored v0 r8 == 0x12 in bits 8..15")
+    _assert(Int((cw_v0 >> 16) & 0xFF) == 0x34, "colored v0 g8 == 0x34 in bits 16..23")
+    _assert(Int((cw_v0 >> 24) & 0xFF) == 0x56, "colored v0 b8 == 0x56 in bits 24..31")
+    _assert(Int((cw_v1 >> 8) & 0xFF) == 0xFE, "colored v1 r8 == 0xFE")
+    _assert(Int((cw_v1 >> 16) & 0xFF) == 0x80, "colored v1 g8 == 0x80")
+    _assert(Int((cw_v1 >> 24) & 0xFF) == 0x05, "colored v1 b8 == 0x05")
+    _assert(Int(cw_v2 >> 8) == 0x010000, "pure-black [0,0,0] clamps b8=1 so (meta >> 8) == 0x010000 != 0")
+
+    var splat_w = List[UInt32]()
+    splat_w.append(UInt32(0xC37F2A))
+    splat_w.append(UInt32(0x112233))
+    splat_w.append(UInt32(0xABCDEF))
+    var splat_id = pool.add_splat_mesh(m_std, splat_w, build_lods=False)
+    _assert(splat_id == 2, "add_splat_mesh returns mesh_id == 2")
+
+    var base_sv = pool.meshes[splat_id].first_vertex
+    var sw_v0 = pool.vertex_words[(base_sv + 0) * 12 + 11]
+    _assert(Int((sw_v0 >> 1) & 1) == 1, "splat mesh bit 1 (is_terrain_splat) == 1")
+    _assert(Int((sw_v0 >> 2) & 0x3F) == 63, "splat mesh preserves ao_u6=63 in bits 2..7")
+    _assert(Int((sw_v0 >> 8) & 0xFF) == 0x2A, "bits 8..15 == w_sand (0x2A)")
+    _assert(Int((sw_v0 >> 16) & 0xFF) == 0x7F, "bits 16..23 == w_rock (0x7F)")
+    _assert(Int((sw_v0 >> 24) & 0xFF) == 0xC3, "bits 24..31 == w_cobble (0xC3)")
+
+
+def test_toksvig_normal_variance_roughness() raises:
+    comptime W: Int = 8
+    comptime H: Int = 8
+    var flat_n = List[Vec3](length=W * H, fill=Vec3(0.0, 0.0, 1.0))
+    var orm_mirror = List[UInt32](length=W * H, fill=UInt32(0xFFFF1000))
+
+    var ds_flat = downsample_normals_and_orm_toksvig_2x(flat_n, orm_mirror, W, H, toksvig_scale=1.0)
+    var flat_g = Int((ds_flat[1][0] >> 8) & 255)
+    _assert(flat_g == 16, "zero-variance flat normals preserve exact mirror roughness G=16")
+
+    var bumpy_n = List[Vec3](capacity=W * H)
+    for y in range(H):
+        for x in range(W):
+            var sx = Float32(-0.62) if ((x & 1) == 0) else Float32(0.62)
+            var sy = Float32(-0.62) if ((y & 1) == 0) else Float32(0.62)
+            bumpy_n.append(Vec3(sx, sy, Float32(0.48)).normalized())
+
+    var ds_bumpy = downsample_normals_and_orm_toksvig_2x(bumpy_n, orm_mirror, W, H, toksvig_scale=1.0)
+    var bumpy_g = Int((ds_bumpy[1][0] >> 8) & 255)
+    _assert(bumpy_g > 160, "high-variance 2x2 normals dramatically boost Toksvig roughness (G > 160 vs 16)")
+    _assert(abs(ds_bumpy[0][0].length() - Float32(1.0)) <= Float32(0.005), "downsampled Toksvig normal is normalized for BC5")
+
+    var wave_n = List[Vec3](capacity=W * H)
+    for _ in range(H):
+        for x in range(W):
+            var wx = Float32(0.35) if (((x >> 1) & 1) == 0) else Float32(-0.35)
+            var nx = Float32(0.18) if ((x & 1) == 0) else Float32(-0.18)
+            wave_n.append(Vec3(wx + nx, 0.0, Float32(0.90)).normalized())
+
+    var pyr = bake_toksvig_normal_orm_pyramid(wave_n, orm_mirror, W, H, toksvig_scale=1.0)
+    var g_mip0 = Int((pyr[1][0][0] >> 8) & 255)
+    var g_mip1 = Int((pyr[1][1][0] >> 8) & 255)
+    var g_mip2 = Int((pyr[1][2][0] >> 8) & 255)
+    _assert(g_mip1 > g_mip0, "Toksvig mip 1 roughness > mip 0 roughness")
+    _assert(g_mip2 > g_mip1, "Toksvig mip 2 roughness > mip 1 roughness across coarser normal wave")
+
+
+def test_subd_creases_and_vehicles() raises:
+    var c_smooth = SubdCage()
+    var c_sharp = SubdCage()
+    for sx in range(-1, 2, 2):
+        for sy in range(-1, 2, 2):
+            for sz in range(-1, 2, 2):
+                var p = Vec3(Float32(sx), Float32(sy), Float32(sz))
+                _ = c_smooth.add_vert(p)
+                _ = c_sharp.add_vert(p)
+    var faces = [
+        [0, 1, 3, 2], [4, 6, 7, 5], [0, 4, 5, 1],
+        [2, 3, 7, 6], [0, 2, 6, 4], [1, 5, 7, 3],
+    ]
+    for f_i in range(6):
+        ref f = faces[f_i]
+        c_smooth.add_quad(f[0], f[1], f[2], f[3])
+        c_sharp.add_quad(f[0], f[1], f[2], f[3])
+        for k in range(4):
+            c_sharp.set_edge_sharpness(f[k], f[(k + 1) % 4], Float32(5.0))
+
+    var grp_meshes = creased_subdivide(c_smooth, levels=2, split_sharp_threshold=1.4)
+    _assert(len(grp_meshes) == 1, "single-group SubdCage emits 1 group mesh")
+    var m_smooth = subdivide_to_mesh(c_smooth, levels=2, split_sharp_threshold=1.4)
+    var m_sharp = subdivide_to_mesh(c_sharp, levels=2, split_sharp_threshold=1.4)
+    _assert(m_smooth.triangle_count() == 192, "2-level Catmull-Clark cube yields 6 * 32 = 192 tris")
+    _assert(m_sharp.triangle_count() == 192, "creased cube preserves exact 192-tri quad topology")
+    _assert(m_sharp.vertex_count() > m_smooth.vertex_count(), "sharp creases split hard normal wedges cleanly")
+    m_smooth.ensure_bounds()
+    m_sharp.ensure_bounds()
+    _assert(m_sharp.bounds_radius > m_smooth.bounds_radius + Float32(0.35), "sharp creases preserve crisp corner extent vs smooth sphere shrink")
+
+    var sm_list = List[NativeMesh]()
+    sm_list.append(m_smooth.copy())
+    _assert(_count_open_spatial_boundary_edges(sm_list) == 0, "subdivided cube is 100% watertight")
+
+    var sc = build_subd_supercar_body_and_glass()
+    var sc_tris = sc[0].triangle_count() + sc[1].triangle_count()
+    _assert(sc_tris >= 2200 and sc_tris <= 2850, "SubD supercar is within ~2,200-2,800 tri budget")
+    _assert_valid_mesh_attribs(sc[0], "Supercar body")
+    _assert_valid_mesh_attribs(sc[1], "Supercar glass")
+    var sc_list = List[NativeMesh]()
+    sc_list.append(sc[0].copy()); sc_list.append(sc[1].copy())
+    _assert(_count_open_spatial_boundary_edges(sc_list) == 0, "mirror-welded SubD supercar body+glass is 100% watertight")
+
+    var sp = build_subd_spinner_hovercar_body_and_canopy()
+    var sp_tris = sp[0].triangle_count() + sp[1].triangle_count()
+    _assert(sp_tris >= 1650 and sp_tris <= 2050, "SubD Spinner hovercar is ~1,856 tris")
+    var sp_list = List[NativeMesh]()
+    sp_list.append(sp[0].copy()); sp_list.append(sp[1].copy())
+    _assert(_count_open_spatial_boundary_edges(sp_list) == 0, "twin-prong SubD Spinner hovercar is 100% watertight")
+
+    for arch in range(3):
+        var tv = build_subd_traffic_vehicle(arch)
+        _assert(tv.triangle_count() >= 1200 and tv.triangle_count() <= 1600, "traffic vehicle archetype within ~1,200-1,600 tris")
+        _assert_valid_mesh_attribs(tv, "Traffic vehicle " + String(arch))
+        var tv_list = List[NativeMesh]()
+        tv_list.append(tv^)
+        _assert(_count_open_spatial_boundary_edges(tv_list) == 0, "traffic vehicle is watertight")
+
+    for style in range(4):
+        var cc = build_subd_coaster_car_shell(style)
+        _assert(cc.triangle_count() >= 1100 and cc.triangle_count() <= 1550, "coaster car shell within ~1,100-1,500 tris")
+        _assert_valid_mesh_attribs(cc, "Coaster car " + String(style))
+        var cc_list = List[NativeMesh]()
+        cc_list.append(cc^)
+        _assert(_count_open_spatial_boundary_edges(cc_list) == 0, "coaster car shell is watertight")
+
+
+def test_loft_bevel_and_lathed_wheels() raises:
+    var wh = build_lathed_wheel_assembly(0.35, 0.28, spoke_count=5)
+    var total_w_tris = wh[0].triangle_count() + wh[1].triangle_count() + wh[2].triangle_count()
+    _assert(total_w_tris >= 360 and total_w_tris <= 480, "5-spoke lathed wheel+rotor+caliper is ~420 tris")
+    _assert_valid_mesh_attribs(wh[0], "Lathed tire")
+    _assert_valid_mesh_attribs(wh[1], "Alloy rim & rotor")
+    _assert_valid_mesh_attribs(wh[2], "6-piston brake caliper")
+
+    var girder_prof = make_chamfered_girder_profile()
+    _assert(len(girder_prof) == 16, "chamfered box-girder spine profile has 16 vertices")
+
+    var loop_pts = List[Vec3]()
+    for i in range(24):
+        var a = (Float32(i) / Float32(23.0)) * Float32(6.2831853)
+        loop_pts.append(Vec3(Float32(i) * Float32(0.15), Float32(5.0) - cos(a) * Float32(4.0), sin(a) * Float32(4.0)))
+    var loop_mesh = sweep_profile_rmf(loop_pts, girder_prof, closed_loop=False, closed_profile=True)
+    _assert_valid_mesh_attribs(loop_mesh, "RMF vertical loop girder")
+
+    var curb_prof = make_curb_profile()
+    var curb_pts: List[Vec3] = [Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), Vec3(2.0, 0.0, 10.0)]
+    var curb_mesh = sweep_profile_rmf(curb_pts, curb_prof)
+    _assert_valid_mesh_attribs(curb_mesh, "RMF street curb")
+
+    var cable = sweep_catenary_cable(Vec3(-4.0, 5.0, 0.0), Vec3(4.0, 5.0, 0.0), sag=0.65)
+    _assert_valid_mesh_attribs(cable, "Catenary cable")
+
+    var sq: List[Vec2] = [Vec2(-1.0, -1.0), Vec2(1.0, -1.0), Vec2(1.0, 1.0), Vec2(-1.0, 1.0)]
+    var ext = extrude_profile_beveled(sq, height=1.2, corner_fillet=0.15, cap_chamfer=0.06)
+    _assert_valid_mesh_attribs(ext, "Beveled extrusion")
+
+
+def _assert_botanical_cutout_atlas_512(
+    sprig: Tuple[List[UInt32], List[Vec3]],
+    label: String,
+    min_opaque: Int,
+    min_cutout: Int,
+) raises:
+    _assert(len(sprig[0]) == 512 * 512, label + ": 512x512 ARGB texels")
+    _assert(len(sprig[1]) == 512 * 512, label + ": 512x512 BC5 tangent normals")
+    var opaque_px = 0
+    var cutout_px = 0
+    for i in range(len(sprig[0])):
+        var a = Int((sprig[0][i] >> 24) & 255)
+        if a >= 200:
+            opaque_px += 1
+        elif a == 0:
+            cutout_px += 1
+    _assert(opaque_px >= min_opaque, label + ": rich botanical leaf/needle coverage")
+    _assert(cutout_px >= min_cutout, label + ": crisp alpha=0 sky cutout gaps between leaves/needles")
+    _assert(abs(sprig[1][256 * 512 + 256].length() - Float32(1.0)) <= Float32(0.02), label + ": unit tangent normal")
+
+
+def test_foliage_crowd_and_arch_kits() raises:
+    var oak_sprig = bake_oak_leaf_sprig_512()
+    _assert_botanical_cutout_atlas_512(oak_sprig, "Oak leaf sprig 512", min_opaque=25000, min_cutout=60000)
+
+    var pine_sprig = bake_conifer_needle_sprig_512()
+    _assert_botanical_cutout_atlas_512(pine_sprig, "Conifer needle sprig 512", min_opaque=18000, min_cutout=60000)
+
+    var palm_sprig = bake_palm_frond_512()
+    _assert_botanical_cutout_atlas_512(palm_sprig, "Palm frond 512", min_opaque=20000, min_cutout=60000)
+
+    var bark = bake_fissured_bark_256()
+    _assert(len(bark[0]) == 256 * 256, "fissured bark albedo is 256x256")
+    _assert(len(bark[1]) == 256 * 256, "fissured bark normal map is 256x256")
+    _assert(abs(bark[1][128 * 256 + 64].length() - Float32(1.0)) <= Float32(0.02), "fissured bark normal is normalized")
+
+    var pine = build_botanical_pine(42, 5.5)
+    var pine_tris = pine[0].triangle_count() + pine[1].triangle_count()
+    _assert(pine_tris >= 500 and pine_tris <= 1300, "botanical pine within cross-foil sprig budget")
+    _assert_valid_mesh_attribs(pine[0], "Pine trunk", require_colors=True)
+    _assert_valid_mesh_attribs(pine[1], "Pine needles", require_colors=True)
+    _assert(not pine[0].double_sided, "pine trunk is single-sided closed bark")
+    _assert(pine[1].alpha_mode == 1, "pine canopy uses alpha_mode == 1 mask cutout")
+    _assert(pine[1].double_sided, "pine canopy is double-sided")
+
+    var oak0 = build_botanical_oak(0, 6.0)
+    var oak1 = build_botanical_oak(1, 6.0)
+    var oak2 = build_botanical_oak(2, 6.0)
+    var oak_tris = oak0[0].triangle_count() + oak0[1].triangle_count()
+    _assert(oak_tris >= 500 and oak_tris <= 1400, "botanical oak within cross-foil sprig budget")
+    _assert_valid_mesh_attribs(oak0[0], "Oak trunk", require_colors=True)
+    _assert_valid_mesh_attribs(oak0[1], "Oak canopy", require_colors=True)
+    _assert(not oak0[0].double_sided, "oak trunk is single-sided")
+    _assert(oak0[1].alpha_mode == 1, "oak canopy uses alpha_mode == 1")
+    _assert(oak0[1].double_sided, "oak canopy is double-sided")
+
+    var seed_diff_01 = Float32(0.0)
+    var seed_diff_12 = Float32(0.0)
+    var n_cmp = min(len(oak0[1].positions), min(len(oak1[1].positions), len(oak2[1].positions)))
+    for i in range(n_cmp):
+        seed_diff_01 += abs(oak0[1].positions[i] - oak1[1].positions[i])
+        seed_diff_12 += abs(oak1[1].positions[i] - oak2[1].positions[i])
+    _assert(seed_diff_01 > Float32(25.0) and seed_diff_12 > Float32(25.0), "seeds 0, 1, 2 produce distinct branch & crown silhouettes")
+
+    var min_ao = 255
+    var max_ao = 0
+    for ao_b in oak0[1].ao:
+        var v = Int(ao_b)
+        if v < min_ao: min_ao = v
+        if v > max_ao: max_ao = v
+    _assert(min_ao <= 150 and max_ao >= 230, "oak canopy bakes radial crown AO gradient")
+
+    var palm = build_botanical_palm(19, 5.8)
+    _assert_valid_mesh_attribs(palm[0], "Palm trunk", require_colors=True)
+    _assert_valid_mesh_attribs(palm[1], "Palm fronds", require_colors=True)
+    _assert(palm[1].alpha_mode == 1, "palm fronds use alpha_mode == 1")
+
+    var ginkgo = build_urban_ginkgo_tree(31, 5.2)
+    _assert_valid_mesh_attribs(ginkgo[0], "Ginkgo trunk", require_colors=True)
+    _assert_valid_mesh_attribs(ginkgo[1], "Ginkgo canopy", require_colors=True)
+    _assert(ginkgo[1].alpha_mode == 1, "ginkgo canopy uses alpha_mode == 1")
+
+    var tuft = build_grass_wildflower_tuft(7)
+    _assert_valid_mesh_attribs(tuft, "Grass wildflower tuft", require_colors=True)
+    _assert(tuft.triangle_count() >= 12 and tuft.triangle_count() <= 48, "grass/wildflower tuft is lightweight")
+
+    var hedge_pair = build_manicured_hedge_and_planter(3.2, 1.1, 0.95)
+    _assert_valid_mesh_attribs(hedge_pair[0], "Planter stone curb", require_colors=True)
+    _assert_valid_mesh_attribs(hedge_pair[1], "Manicured hedge foliage", require_colors=True)
+
+    var bush = build_flowering_bush(11, 0.85)
+    _assert_valid_mesh_attribs(bush, "Flowering bush", require_colors=True)
+
+    var mech_v3 = build_subd_cyber_enforcer_rigged_v3()
+    _assert(mech_v3[0].bone_count == ENFORCER_BONE_COUNT, "Armor submesh has 16 bones")
+    _assert(mech_v3[1].bone_count == ENFORCER_BONE_COUNT, "Chassis submesh has 16 bones")
+    _assert(mech_v3[2].bone_count == ENFORCER_BONE_COUNT, "Emissive submesh has 16 bones")
+    _assert(len(mech_v3[0].rig_model.nodes) == 16, "Armor rig_model has 16 NativeNodes")
+    _assert_valid_mesh_attribs(mech_v3[0].mesh, "Cyber-Enforcer Armor", require_colors=True)
+    _assert_valid_mesh_attribs(mech_v3[1].mesh, "Cyber-Enforcer Chassis", require_colors=True)
+    _assert_valid_mesh_attribs(mech_v3[2].mesh, "Cyber-Enforcer HDR Emissive", require_colors=True)
+    _assert(mech_v3[2].mesh.emissive_strength > Float32(1.0), "Cyber-Enforcer emissive submesh carries HDR emissive_strength")
+
+    var mech = build_subd_cyber_enforcer_rigged()
+    _assert(mech.bone_count == ENFORCER_BONE_COUNT, "Merged Cyber-Enforcer has 16 hierarchical bones")
+    _assert(
+        mech.mesh.triangle_count()
+        == mech_v3[0].mesh.triangle_count() + mech_v3[1].mesh.triangle_count() + mech_v3[2].mesh.triangle_count(),
+        "Merged Cyber-Enforcer equals sum of Armor + Chassis + Emissive triangles",
+    )
+    _assert_valid_mesh_attribs(mech.mesh, "Merged Cyber-Enforcer SubD mesh", require_colors=True)
+    for v in range(mech.mesh.vertex_count()):
+        var w_sum = mech.mesh.weights[v * 4] + mech.mesh.weights[v * 4 + 1] + mech.mesh.weights[v * 4 + 2] + mech.mesh.weights[v * 4 + 3]
+        if abs(w_sum - Float32(1.0)) > Float32(1e-3):
+            raise Error("unnormalized skin weight on Cyber-Enforcer")
+
+    var crowd_dry = build_articulated_crowd_pose_bank(with_umbrella=False)
+    var crowd_rain = build_articulated_crowd_pose_bank(with_umbrella=True)
+    _assert(len(crowd_dry) == 12, "dry crowd bank has 12 poses")
+    _assert(len(crowd_rain) == 12, "rain umbrella crowd bank has 12 poses")
+    var dry_tris = crowd_dry[0][0].triangle_count() + crowd_dry[0][1].triangle_count()
+    var rain_tris = crowd_rain[0][0].triangle_count() + crowd_rain[0][1].triangle_count()
+    _assert(dry_tris >= 580 and dry_tris <= 780, "crowd pose is ~680 tris")
+    _assert(rain_tris > dry_tris + 40, "12-ribbed domed umbrella adds canopy + shaft geometry")
+    _assert_valid_mesh_attribs(crowd_rain[0][0], "Crowd upper garment", require_colors=True)
+    _assert_valid_mesh_attribs(crowd_rain[0][1], "Crowd lower & umbrella", require_colors=True)
+
+    var diff_accum = Float32(0.0)
+    var pos0 = crowd_dry[0][1].positions.copy()
+    var pos2 = crowd_dry[2][1].positions.copy()
+    for i in range(len(pos0)):
+        diff_accum += abs(pos0[i] - pos2[i])
+    _assert(diff_accum > Float32(5.0), "walk cycle phases deform leg/shoe positions distinctly")
+
+    var atlas = bake_interior_windowbox_atlas_512()
+    _assert(len(atlas[0]) == 512 * 512, "interior albedo atlas is 512x512")
+    _assert(len(atlas[1]) == 512 * 512, "mullion+warble normal atlas is 512x512")
+    _assert(len(atlas[2]) == 512 * 512, "interior ORM atlas is 512x512")
+    var border_px = atlas[0][64 * 512 + 1]
+    var border_luma = Int((border_px >> 16) & 255) + Int((border_px >> 8) & 255) + Int(border_px & 255)
+    _assert(border_luma > 45, "interior room tile edge has no black outer window frame")
+    var glass_n = atlas[1][64 * 512 + 64]
+    var mull_n = atlas[1][64 * 512 + 1]
+    _assert(abs(glass_n.x) <= Float32(0.03) and abs(glass_n.y) <= Float32(0.03), "interior glass pane warble within +-1.2 deg")
+    _assert(abs(mull_n.x) > Float32(0.30), "mullion border normal has crisp bevel tilt")
+
+    var bb0 = bake_cyber_billboard_512(0)
+    var bb3 = bake_cyber_billboard_512(3)
+    for v_idx in range(8):
+        var bb = bake_cyber_billboard_512(v_idx)
+        _assert(len(bb) == 512 * 512, "cyber billboard variant " + String(v_idx) + " is 512x512")
+        var bright_neon = 0
+        for p_i in range(0, 512 * 512, 16):
+            var px = bb[p_i]
+            var mr = max(Int((px >> 16) & 255), max(Int((px >> 8) & 255), Int(px & 255)))
+            if mr >= 180:
+                bright_neon += 1
+        _assert(bright_neon >= 300, "cyber billboard variant " + String(v_idx) + " has vibrant neon artwork/glyphs")
+    var bb_diff = 0
+    for p_i in range(0, 512 * 512, 32):
+        if bb0[p_i] != bb3[p_i]:
+            bb_diff += 1
+    _assert(bb_diff > 1000, "cyber billboard variants depict distinct graphic layouts")
+
+    _assert_valid_mesh_attribs(build_colonnade_arcade_bay(), "Colonnade arcade bay")
+    _assert_valid_mesh_attribs(build_facade_mullion_spandrel_grid(), "Facade mullion grid")
+    _assert_valid_mesh_attribs(build_rooftop_hvac_chiller(), "Rooftop HVAC chiller")
+
+    var heli_parts = build_rooftop_vtol_helipad_parts()
+    _assert_valid_mesh_attribs(heli_parts[0], "Helipad base", require_colors=True)
+    _assert_valid_mesh_attribs(heli_parts[1], "Helipad HDR beacons", require_colors=True)
+    _assert(heli_parts[1].emissive_strength > Float32(1.0), "helipad beacons have HDR emissive_strength")
+    _assert_valid_mesh_attribs(build_rooftop_vtol_helipad(), "Rooftop VTOL helipad merged", require_colors=True)
+
+    var cant_parts = build_street_traffic_cantilever_parts()
+    _assert_valid_mesh_attribs(cant_parts[0], "Traffic cantilever mast", require_colors=True)
+    _assert_valid_mesh_attribs(cant_parts[1], "Traffic signal lenses", require_colors=True)
+    _assert(cant_parts[1].emissive_strength > Float32(1.0), "traffic lenses have HDR emissive_strength")
+    _assert_valid_mesh_attribs(build_street_traffic_cantilever(), "Traffic cantilever merged", require_colors=True)
+
+    var boll_parts = build_street_bollard_and_grate_parts()
+    _assert_valid_mesh_attribs(boll_parts[0], "Street bollard & grate base", require_colors=True)
+    _assert_valid_mesh_attribs(boll_parts[1], "Bollard cyan LED collar", require_colors=True)
+    _assert_valid_mesh_attribs(build_street_bollard_and_grate(), "Street bollard & grate merged", require_colors=True)
+
+    var shelt_parts = build_transit_shelter_parts()
+    _assert_valid_mesh_attribs(shelt_parts[0], "Transit shelter frame", require_colors=True)
+    _assert_valid_mesh_attribs(shelt_parts[1], "Transit shelter ad/LED strips", require_colors=True)
+    _assert_valid_mesh_attribs(build_transit_shelter(), "Transit shelter merged", require_colors=True)
+
+
+def test_f26_regression_and_lod_dag_cook() raises:
+    var q = _SymQuadric.from_plane(0.0, 1.0, 0.0, -2.0)
+    _assert(abs(Float32(q.eval(Vec3(0.0, 2.0, 0.0)))) <= Float32(0.001), "point on plane evaluates to zero quadric error")
+
+    var mock_mb = MeshBuilder(base_color=0xFF00AAFF, roughness=0.3, metallic=0.1)
+    mock_mb.add_ellipsoid(Vec3(0.0, 0.0, 0.0), Vec3(2.0, 2.0, 2.0), 12, 12)
+    var mock_m = mock_mb^.finish()
+    var red = simplify_mesh_qem(mock_m, len(mock_m.indices) // 6)
+    _assert(len(red[0].indices) > 0 and len(red[0].indices) < len(mock_m.indices), "mock meshlet QEM reduction valid")
+
+    var sc = build_subd_supercar_body_and_glass()
+    var pool = AaaGeometryPool()
+    var entry = pool.append_mesh(sc[0], material_id=3, build_lods=True)
+    _assert(entry.lod_count == 4, "SubD supercar cooks full 4-level LOD 0..3 QEM Meshlet DAG")
+    _assert(entry.lods[3].triangle_count < entry.lods[0].triangle_count, "LOD 3 has fewer triangles than LOD 0")
+    _assert(entry.lods[1].object_error < entry.lods[2].object_error and entry.lods[2].object_error < entry.lods[3].object_error, "strictly monotonic LOD errors")
+
+    var sl = MeshLodSlice(0, 4, 200, 0.025)
+    _assert(sl.meshlet_count == 4, "MeshLodSlice preserved")
+
+
+def test_qem_skin_lod_weights() raises:
+    # 11c. QEM Skin-LOD Top-4 Joint/Weight Blending & Renormalization (`sum == 1.0`)
+    var grid_m = NativeMesh()
+    comptime GX: Int = 9
+    comptime GY: Int = 9
+    for gy in range(GY):
+        for gx in range(GX):
+            grid_m.positions.append(Float32(gx) * Float32(0.25))
+            grid_m.positions.append(Float32(gy) * Float32(0.25))
+            grid_m.positions.append(Float32(0.0))
+            grid_m.normals.append(Float32(0.0)); grid_m.normals.append(Float32(0.0)); grid_m.normals.append(Float32(1.0))
+            grid_m.texcoords.append(Float32(gx) / Float32(GX - 1))
+            grid_m.texcoords.append(Float32(gy) / Float32(GY - 1))
+            var b_base = UInt16((gx + gy) % 6)
+            grid_m.joints.append(b_base)
+            grid_m.joints.append((b_base + UInt16(1)) % UInt16(8))
+            grid_m.joints.append((b_base + UInt16(2)) % UInt16(8))
+            grid_m.joints.append((b_base + UInt16(3)) % UInt16(8))
+            grid_m.weights.append(Float32(0.45))
+            grid_m.weights.append(Float32(0.25))
+            grid_m.weights.append(Float32(0.20))
+            grid_m.weights.append(Float32(0.10))
+    for gy in range(GY - 1):
+        for gx in range(GX - 1):
+            var i0 = gy * GX + gx
+            var i1 = i0 + 1
+            var i2 = i0 + GX + 1
+            var i3 = i0 + GX
+            grid_m.indices.append(i0); grid_m.indices.append(i1); grid_m.indices.append(i2)
+            grid_m.indices.append(i0); grid_m.indices.append(i2); grid_m.indices.append(i3)
+    var qem_sk = simplify_mesh_qem(grid_m, 32)
+    var sv_cnt = qem_sk[0].vertex_count()
+    _assert(qem_sk[0].triangle_count() <= 40 and sv_cnt > 0, "QEM skinned grid reduces cleanly")
+    _assert(len(qem_sk[0].joints) == sv_cnt * 4, "QEM skinned grid preserves 4 joints per vertex")
+    _assert(len(qem_sk[0].weights) == sv_cnt * 4, "QEM skinned grid preserves 4 weights per vertex")
+    for sv in range(sv_cnt):
+        var sw0 = qem_sk[0].weights[sv * 4 + 0]
+        var sw1 = qem_sk[0].weights[sv * 4 + 1]
+        var sw2 = qem_sk[0].weights[sv * 4 + 2]
+        var sw3 = qem_sk[0].weights[sv * 4 + 3]
+        _assert(
+            sw0 >= sw1 - Float32(1e-5) and sw1 >= sw2 - Float32(1e-5) and sw2 >= sw3 - Float32(1e-5) and sw3 >= Float32(0.0),
+            "QEM skinned weights remain descending and non-negative",
+        )
+        _assert(abs((sw0 + sw1 + sw2 + sw3) - Float32(1.0)) < Float32(1e-5), "QEM skinned weights renormalize to 1.0")
+
+
+def test_k_procedural_qem_and_toksvig() raises:
+    print("  [k] Testing O(T log T) QEM LODs, vertex_words[11] AO/splat, Toksvig, SubD, loft/RMF, foliage, crowd, arch kits & QEM skin LOD...")
+    test_qem_minheap_speed_and_validity()
+    test_vertex_words_11_ao_and_splat_packing()
+    test_toksvig_normal_variance_roughness()
+    test_subd_creases_and_vehicles()
+    test_loft_bevel_and_lathed_wheels()
+    test_foliage_crowd_and_arch_kits()
+    test_f26_regression_and_lod_dag_cook()
+    test_qem_skin_lod_weights()
+    print("    [OK] Procedural SubD/Loft/Foliage/Crowd/Arch, QEM LODs, QEM skin LOD & Toksvig passed!")
+
+
 def main() raises:
     var t0 = get_time()
     var pid = Int(external_call["getpid", Int32]())
@@ -1569,9 +4048,12 @@ def main() raises:
     test_f_mcp_v2_end_to_end(tmp_root, pool)
     test_g_audit_regressions()
     test_h_wave2_png_async_studio_scene(tmp_root, pack_path, pool)
+    test_i_f20_residency_and_f21_codecs(tmp_root)
+    test_j_studio_v5_unification_ux_and_headless_smoke(tmp_root)
+    test_k_procedural_qem_and_toksvig()
 
     pool.stop()
     _rm_rf_tmp(tmp_root)
 
     var elapsed_ms = (get_time() - t0) * 1000.0
-    print("[Flint v5 Track 5] ALL 8 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")
+    print("[Flint v5 Track 5] ALL 11 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")

@@ -15,6 +15,7 @@ from std.time import monotonic
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import det_sin, det_cos, PI
 from flint.core.serial import BlobWriter, BlobReader, fnv64
+from flint.lab import EngineBenchSuite
 from flint.physics.narrowphase import ConvexHull
 from flint.physics.shapes_v5 import CompoundShape, HeightfieldCollider, SixDofMotorJoint
 from flint.physics.vehicle import VehicleChassis
@@ -98,6 +99,7 @@ def _build_snapshot_world(mut w: PhysicsWorld, mut car: VehicleChassis):
 
 def main() raises:
     var t_start_ns = monotonic()
+    var suite = EngineBenchSuite("flint_v5_physics")
 
     # -----------------------------------------------------------------------
     # 1. 200-Body Pile + Vehicle Rollback Snapshot Determinism
@@ -116,10 +118,13 @@ def main() raises:
     world_a.serialize(snap_w)
     car_a.serialize(snap_w)
 
-    # Continue uninterrupted to tick 300
+    # Continue uninterrupted to tick 300 (collect per-tick latency samples)
+    var step_samples = List[Float64](capacity=180)
     for _ in range(180):
+        var ts0 = monotonic()
         world_a.step(dt)
         car_a.substep_suspension(dt, throttle=0.30, brake=0.15, steer=-0.15)
+        step_samples.append(Float64(monotonic() - ts0) / 1.0e6)
 
     var end_a = BlobWriter()
     world_a.serialize(end_a)
@@ -142,6 +147,20 @@ def main() raises:
     car_b.serialize(end_b)
     var hash_b = fnv64(end_b.data)
     var snap_ms = Float64(monotonic() - t0) / 1.0e6
+    _ = suite.record_samples(
+        "physics_200body_step",
+        step_samples,
+        budget_p99_ms=4.0,
+        detail="200_bodies+joints+vehicle",
+    )
+    _ = suite.record_determinism_gate(
+        "physics_rollback_det_120_300",
+        hash_a,
+        hash_b,
+        elapsed_ms=snap_ms,
+        budget_ms=1000.0,
+        detail="bytes=" + String(len(snap_w.data)),
+    )
     print(
         "[lab_physics] 1. 200-body+joints+vehicle snapshot 120->300:",
         "hash_match =", hash_a == hash_b,
@@ -152,18 +171,12 @@ def main() raises:
     # -----------------------------------------------------------------------
     # 2. Quickhull 3D + V-HACD-lite + Heightfield DDA
     # -----------------------------------------------------------------------
-    var t1 = monotonic()
     var cloud = List[Vec3]()
     for i in range(96):
         var a = Float32(i) * Float32(0.37)
         var b = Float32(i) * Float32(0.71)
         cloud.append(Vec3(det_cos(a) * Float32(1.2), det_sin(b) * Float32(0.8), det_sin(a) * det_cos(b)))
-    var qhull = ConvexHull.build_quickhull(cloud, max_verts=32)
-    var mp_hull = qhull.compute_polyhedral_mass_properties(Float32(1000.0))
-
     var l_mesh = _make_l_shape_mesh()
-    var compound = CompoundShape.decompose_vhacd_lite(l_mesh[0], l_mesh[1], max_hulls=4, voxel_res=14)
-
     var hf_nx = 33
     var hf_nz = 33
     var hf_h = List[Float32](capacity=hf_nx * hf_nz)
@@ -172,21 +185,45 @@ def main() raises:
             var fx = Float32(ix) * Float32(0.5)
             var fz = Float32(iz) * Float32(0.5)
             hf_h.append(Float32(1.5) * Float32(sin(Float64(fx * 0.25)) * cos(Float64(fz * 0.25))))
-    var hf = HeightfieldCollider.build(hf_h, hf_nx, hf_nz, Vec3(-8.0, 0.0, -8.0), 0.5)
-    var dda_hit = hf.raycast_dda(Vec3(-7.0, 4.0, -7.0), Vec3(1.0, -0.35, 1.0).normalized(), Float32(30.0))
-    var shapes_ms = Float64(monotonic() - t1) / 1.0e6
+
+    var shapes_samples = List[Float64](capacity=16)
+    var qhull_verts = 0
+    var hull_mass = Float32(0.0)
+    var vhacd_hulls = 0
+    var dda_ok = False
+    for _ in range(16):
+        var t1 = monotonic()
+        var qhull = ConvexHull.build_quickhull(cloud, max_verts=32)
+        var mp_hull = qhull.compute_polyhedral_mass_properties(Float32(1000.0))
+        var compound = CompoundShape.decompose_vhacd_lite(l_mesh[0], l_mesh[1], max_hulls=4, voxel_res=14)
+        var hf = HeightfieldCollider.build(hf_h, hf_nx, hf_nz, Vec3(-8.0, 0.0, -8.0), 0.5)
+        var dda_hit = hf.raycast_dda(Vec3(-7.0, 4.0, -7.0), Vec3(1.0, -0.35, 1.0).normalized(), Float32(30.0))
+        shapes_samples.append(Float64(monotonic() - t1) / 1.0e6)
+        qhull_verts = len(qhull.vertices)
+        hull_mass = mp_hull[0]
+        vhacd_hulls = compound.child_count()
+        dda_ok = dda_hit.hit
+    _ = suite.record_samples(
+        "physics_shapes_vhacd_dda",
+        shapes_samples,
+        budget_p99_ms=2.0,
+        detail="qhull=" + String(qhull_verts) + " vhacd=" + String(vhacd_hulls),
+    )
+    _ = suite.record_determinism_gate(
+        "physics_shapes_valid",
+        UInt64(1 if (qhull_verts > 0 and vhacd_hulls > 0 and dda_ok) else 0),
+        UInt64(1),
+    )
     print(
-        "[lab_physics] 2. Quickhull verts =", len(qhull.vertices),
-        "mass =", mp_hull[0],
-        "VHACD hulls =", compound.child_count(),
-        "DDA hit =", dda_hit.hit,
-        "ms =", shapes_ms,
+        "[lab_physics] 2. Quickhull verts =", qhull_verts,
+        "mass =", hull_mass,
+        "VHACD hulls =", vhacd_hulls,
+        "DDA hit =", dda_ok,
     )
 
     # -----------------------------------------------------------------------
     # 3. KCC Stair Climb + Turntable + Crate Push
     # -----------------------------------------------------------------------
-    var t2 = monotonic()
     var kw = PhysicsWorld()
     _ = kw.add_box(Vec3(0.0, -0.5, 0.0), Vec3(30.0, 0.5, 30.0), mass=0.0)
     for s in range(5):
@@ -200,9 +237,24 @@ def main() raises:
     var cfg = CharacterControllerConfig()
     cfg.step_height = 0.35
     var kcc = CharacterController(Vec3(0.0, cfg.half_height + cfg.radius, 0.5), cfg)
+    var kcc_samples = List[Float64](capacity=90)
+    var t2 = monotonic()
     for _ in range(90):
+        var tk0 = monotonic()
         _ = kcc.move_and_slide(kw, Vec3(0.0, 0.0, 4.5), dt)
+        kcc_samples.append(Float64(monotonic() - tk0) / 1.0e6)
     var kcc_ms = Float64(monotonic() - t2) / 1.0e6
+    _ = suite.record_samples(
+        "physics_kcc_stair_90t",
+        kcc_samples,
+        budget_p99_ms=0.25,
+        detail="foot_y=" + String(kcc.foot_position().y),
+    )
+    _ = suite.record_determinism_gate(
+        "physics_kcc_climbed",
+        UInt64(1 if (kcc.grounded and kcc.foot_position().y > Float32(0.5)) else 0),
+        UInt64(1),
+    )
     print(
         "[lab_physics] 3. KCC 5-step stair climb foot_y =", kcc.foot_position().y,
         "grounded =", kcc.grounded,
@@ -225,12 +277,29 @@ def main() raises:
     var nav = NavMesh.build_from_physics(nw, ncfg)
     var path_open = nav.find_path(Vec3(-5.0, 0.0, 0.0), Vec3(5.0, 0.0, 0.0))
 
-    var t_carve0 = monotonic()
-    _ = nav.add_obstacle(NavObstacle.box(1, Vec3(0.0, 1.0, 0.0), Vec3(0.45, 1.0, 1.4)))
-    var carve_ms = Float64(monotonic() - t_carve0) / 1.0e6
-    var path_blocked = nav.find_path(Vec3(-5.0, 0.0, 0.0), Vec3(5.0, 0.0, 0.0))
-    nav.remove_obstacle(1)
-    var path_reopened = nav.find_path(Vec3(-5.0, 0.0, 0.0), Vec3(5.0, 0.0, 0.0))
+    var carve_samples = List[Float64](capacity=16)
+    var blocked_ok = True
+    var reopened_ok = True
+    for _ in range(16):
+        var t_carve0 = monotonic()
+        _ = nav.add_obstacle(NavObstacle.box(1, Vec3(0.0, 1.0, 0.0), Vec3(0.45, 1.0, 1.4)))
+        carve_samples.append(Float64(monotonic() - t_carve0) / 1.0e6)
+        var path_blocked = nav.find_path(Vec3(-5.0, 0.0, 0.0), Vec3(5.0, 0.0, 0.0))
+        nav.remove_obstacle(1)
+        var path_reopened = nav.find_path(Vec3(-5.0, 0.0, 0.0), Vec3(5.0, 0.0, 0.0))
+        blocked_ok = blocked_ok and (not path_blocked.found)
+        reopened_ok = reopened_ok and path_reopened.found
+    _ = suite.record_samples(
+        "nav_obstacle_carve",
+        carve_samples,
+        budget_p99_ms=0.25,
+        detail="open=" + String(path_open.found) + " blocked=" + String(not blocked_ok) + " reopen=" + String(reopened_ok),
+    )
+    _ = suite.record_determinism_gate(
+        "nav_doorway_carve_valid",
+        UInt64(1 if (path_open.found and blocked_ok and reopened_ok) else 0),
+        UInt64(1),
+    )
 
     var crowd = CrowdSimulator(time_horizon=1.8, neighbor_dist=4.5, max_neighbors=16)
     for i in range(256):
@@ -239,20 +308,35 @@ def main() raises:
         var start_p = Vec3(det_cos(ang) * r_ring, 0.0, det_sin(ang) * r_ring)
         _ = crowd.add_agent(start_p, radius=0.32, max_speed=3.5, goal=Vec3(-start_p.x, 0.0, -start_p.z))
 
+    var orca_samples = List[Float64](capacity=1000)
     var max_overlaps = 0
     for _ in range(1000):
+        var to0 = monotonic()
         crowd.step_orca_simd8(dt)
         var ov = crowd.count_overlaps()
+        orca_samples.append(Float64(monotonic() - to0) / 1.0e6)
         if ov > max_overlaps:
             max_overlaps = ov
     var nav_ms = Float64(monotonic() - t3) / 1.0e6
+    _ = suite.record_samples(
+        "nav_orca_256_tick",
+        orca_samples,
+        budget_p99_ms=3.0,
+        detail="max_overlaps=" + String(max_overlaps),
+    )
+    _ = suite.record_determinism_gate(
+        "nav_orca_zero_overlaps",
+        UInt64(max_overlaps),
+        UInt64(0),
+    )
     print(
         "[lab_physics] 4. NavMesh polys =", len(nav.polys),
-        "open/blocked/reopen =", path_open.found, path_blocked.found, path_reopened.found,
-        "carve_ms =", carve_ms,
+        "open/blocked/reopen =", path_open.found, not blocked_ok, reopened_ok,
         "256-ORCA 1000-tick max_overlaps =", max_overlaps,
         "total_nav_ms =", nav_ms,
     )
 
     var total_ms = Float64(monotonic() - t_start_ns) / 1.0e6
     print("[lab_physics] COMPLETE in", total_ms, "ms")
+    if not suite.finish_and_export("physics"):
+        raise Error("lab_physics failed verification gates")

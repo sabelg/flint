@@ -13,6 +13,7 @@ and GPU SDF UI overlay executing in `<2.0s` (both headless CI and live Wayland/X
 from std.collections import List
 from std.ffi import external_call
 from std.math import abs, cos, max, min, sin
+from std.time import monotonic
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.model import (
     NativeAnimation,
@@ -23,6 +24,7 @@ from flint.assets.model import (
 )
 from flint.core.math import Mat4, Vec3
 from flint.core.transform import Quat, trs
+from flint.lab import EngineBenchSuite
 from flint.platform.os import get_time
 from flint.render.aaa_bsdf import AaaMaterial
 from flint.render.aaa_vsm import compute_vsm_cascade_matrices
@@ -126,22 +128,60 @@ def _make_ui_border_tex() -> List[UInt32]:
     return out^
 
 
-def main():
+def main() raises:
     var t_start = get_time()
     print("=== Flint v5 Procedural Render Lab (`labs/lab_render.mojo`) ===")
+    var suite = EngineBenchSuite("flint_v5_render")
 
     # 1. Validate `SurfaceMaterialNode` + `OpSpecConstant` SPIR-V compilation
-    var mat_spv = compile_surface_material_shader(StandardPbrMaterialNode(enable_detail_layer=True))
-    var spv_rep = validate_spirv_module(mat_spv)
-    if not spv_rep.valid:
-        print("SPIR-V validation error:", spv_rep.errors[0])
-        external_call["exit", NoneType](Int32(1))
+    var spv_samples = List[Float64](capacity=8)
+    var mat_spv = List[UInt32]()
+    var spv_valid = True
+    var spv_err = String()
+    for _ in range(8):
+        var ts0 = monotonic()
+        mat_spv = compile_surface_material_shader(StandardPbrMaterialNode(enable_detail_layer=True))
+        var spv_rep = validate_spirv_module(mat_spv)
+        spv_samples.append(Float64(monotonic() - ts0) / 1.0e6)
+        if not spv_rep.valid:
+            spv_valid = False
+            if len(spv_rep.errors) > 0:
+                spv_err = spv_rep.errors[0]
+    _ = suite.record_samples(
+        "render_spirv_mat_compile",
+        spv_samples,
+        budget_p99_ms=25.0,
+        detail="words=" + String(len(mat_spv)),
+    )
+    if not spv_valid:
+        print("SPIR-V validation error:", spv_err)
+        _ = suite.record_determinism_gate("render_spirv_valid", UInt64(0), UInt64(1))
+        _ = suite.finish_and_export("render")
+        raise Error("SPIR-V validation failed")
 
     # 2. Bake Procedural Skeletal VAT Crowd Clip (`RGBA16F`) & verify 3D motion vectors
     var walker = _build_walker_model()
-    var vat_clip = bake_vat_crowd_clip_rgba16f(walker, 0, 0, sample_fps=30.0, looping=True)
-    var vat_sample = sample_vat_vertex_cpu(vat_clip, walker.meshes[0].vertex_count() - 1, Float32(0.125), Float32(0.125 - 1.0 / 60.0))
-    var vat_mv_len = (vat_sample[0] - vat_sample[2]).length()
+    var vat_samples = List[Float64](capacity=8)
+    var vat_frames = 0
+    var vat_mv_len = Float32(0.0)
+    for _ in range(8):
+        var tv0 = monotonic()
+        var vat_clip = bake_vat_crowd_clip_rgba16f(walker, 0, 0, sample_fps=30.0, looping=True)
+        var vat_sample = sample_vat_vertex_cpu(vat_clip, walker.meshes[0].vertex_count() - 1, Float32(0.125), Float32(0.125 - 1.0 / 60.0))
+        vat_samples.append(Float64(monotonic() - tv0) / 1.0e6)
+        vat_frames = vat_clip.desc.frame_count
+        vat_mv_len = (vat_sample[0] - vat_sample[2]).length()
+    _ = suite.record_samples(
+        "render_vat_crowd_bake",
+        vat_samples,
+        budget_p99_ms=25.0,
+        detail="frames=" + String(vat_frames),
+    )
+    _ = suite.record_determinism_gate(
+        "render_vat_motion_nonzero",
+        UInt64(1 if vat_mv_len > Float32(0.0) else 0),
+        UInt64(1),
+    )
 
     # 3. Initialize 3-Tier `ScalableRenderer` (`256 x 192` compact showcase)
     var W = 256
@@ -211,7 +251,8 @@ def main():
     var world_ring = DoubleBufferedRenderWorld()
     var extractor = RenderExtractor()
 
-    for frame_i in range(2):
+    var frame_samples = List[Float64](capacity=16)
+    for frame_i in range(18):
         ref w = world_ring.write_world()
         extractor.begin_extraction(w, UInt64(frame_i + 1))
         w.camera = RenderCameraPacket(eye=Vec3(0.0, 3.2, 7.8), target=Vec3(0.0, 1.5, 0.0), fov_y_deg=50.0)
@@ -239,7 +280,7 @@ def main():
                 )
 
         # Moving Crowd Agents (`UInt64` entity IDs `500..507` generating per-instance motion vectors!)
-        var step_z = Float32(frame_i) * Float32(0.18)
+        var step_z = Float32(frame_i) * Float32(0.05)
         for ag in range(8):
             var ax = Float32(-2.8) + Float32(ag) * Float32(0.55)
             extractor.extract_entity(w, UInt64(500 + ag), mesh_crowd_id, trs(Vec3(ax, 0.0, Float32(1.8) - step_z), Quat(), Vec3(0.55, 0.55, 0.55)), mat_gold)
@@ -266,11 +307,23 @@ def main():
             ui.add_rect(210.0, 8.0, 20.0, 20.0, ov_col)
         ui.add_rect(210.0, 8.0, 20.0, 20.0, 0xFF10F030)
 
-        if not renderer.render_world(world_ring.read_world(), ui, capture_readback=(frame_i == 1)):
+        var tf0 = monotonic()
+        if not renderer.render_world(world_ring.read_world(), ui, capture_readback=(frame_i == 17)):
             print("render_world failed")
             renderer.shutdown()
-            external_call["exit", NoneType](Int32(1))
+            raise Error("render_world failed")
+        var frame_ms = Float64(monotonic() - tf0) / 1.0e6
+        if frame_i >= 2:
+            frame_samples.append(frame_ms)
 
+    _ = suite.record_samples(
+        "render_world_256x192_frame",
+        frame_samples,
+        budget_p99_ms=50.0,
+        detail=renderer.tier_name(),
+    )
+
+    var tui0 = monotonic()
     var px = renderer.readback_pixels()
     var red_sw = px[16 * W + 16]
     var blue_sw = px[16 * W + 44]
@@ -278,18 +331,50 @@ def main():
     var r_ok = abs(Int((red_sw >> 16) & 0xFF) - 255) <= 2 and abs(Int(red_sw & 0xFF) - 64) <= 2
     var b_ok = abs(Int((blue_sw >> 16) & 0xFF) - 32) <= 2 and abs(Int(blue_sw & 0xFF) - 255) <= 2
     var ov_ok = abs(Int((tile_321 >> 8) & 0xFF) - 240) <= 2
+    var ui_check_ms = Float64(monotonic() - tui0) / 1.0e6
+    _ = suite.record_single(
+        "render_ui_readback_check",
+        ui_check_ms,
+        passed=(renderer.tier == 0 or (r_ok and b_ok and ov_ok)),
+        budget_ms=50.0,
+    )
+
+    # 5. 2-Frame Static FLIP Determinism Check (`tsr_history_weight = 0.0`)
+    var ui_det = UiDrawList()
+    ui_det.add_rect(8.0, 8.0, 24.0, 24.0, 0xFFFF2040)
+    ui_det.add_rect(36.0, 8.0, 24.0, 24.0, 0xFF2040FF)
+    if renderer.uses_vulkan():
+        renderer.gpu_slot[0].frame_index = 18
+    var ok_a = renderer.render_world(world_ring.read_world(), ui_det, capture_readback=True)
+    var px_a = renderer.readback_pixels()
+    if renderer.uses_vulkan():
+        renderer.gpu_slot[0].frame_index = 18
+    var ok_b = renderer.render_world(world_ring.read_world(), ui_det, capture_readback=True)
+    var px_b = renderer.readback_pixels()
+    if not ok_a or not ok_b:
+        px_a.clear()
+        px_b.clear()
+    _ = suite.verify_golden_pixels(
+        "render_2frame_flip_det",
+        px_a,
+        px_b,
+        W,
+        H,
+        tolerance=2,
+        spread_per_million=500,
+        flip_limit=0.01,
+    )
 
     var elapsed = get_time() - t_start
     print("  Active Tier           :", renderer.tier_name())
     print("  SPIR-V Material Words :", len(mat_spv), "(OpSpecConstant validated)")
     print("  VSM Cascades          :", len(vsm_cascades), "(±16m, ±64m, ±256m, ±1024m)")
-    print("  VAT Crowd Frames      :", vat_clip.desc.frame_count, "| MotionVec |dv| =", vat_mv_len)
+    print("  VAT Crowd Frames      :", vat_frames, "| MotionVec |dv| =", vat_mv_len)
     print("  White-Furnace Luma    :", furnace_luma)
     print("  UI Red/Blue/321-Tile  :", r_ok, b_ok, ov_ok)
     print("  Total Elapsed         :", elapsed, "s")
 
     renderer.shutdown()
-    if renderer.tier != 0 and (not r_ok or not b_ok or not ov_ok):
-        print("FAIL: GPU UI readback check failed")
-        external_call["exit", NoneType](Int32(1))
+    if not suite.finish_and_export("render"):
+        raise Error("lab_render failed verification gates")
     print("=== Flint v5 Render Lab Complete ===")

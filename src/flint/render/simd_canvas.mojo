@@ -111,7 +111,7 @@ struct Camera3D(Copyable, ImplicitlyCopyable, Movable):
         return (sx, sy, inv_z, True)
 
 
-struct SimdCanvas(Copyable, Movable):
+struct SimdCanvas(Movable):
     """8-wide SIMD depth-buffered ARGB8888 canvas supporting 3D geometry, 2D depth sprites & HUD."""
     var width: Int
     var height: Int

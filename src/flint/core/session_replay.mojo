@@ -14,8 +14,8 @@ more hold the input of the tick now running.
 """
 from std.ffi import external_call
 from flint.core.anchor import (
-    ANCHOR, A_REPLAY_ACTIVE, A_REPLAY_BUFFER, A_REPLAY_COMMITTED, A_REPLAY_PENDING, A_REPLAY_TICKS, T_REPLAY_PATH,
-    anchor_ready, set_text, store,
+    A_REPLAY_ACTIVE, A_REPLAY_BUFFER, A_REPLAY_COMMITTED, A_REPLAY_PENDING, A_REPLAY_TICKS, T_REPLAY_PATH,
+    anchor_base, anchor_ready, set_text, store,
 )
 from flint.core.replay import TICK_BYTES, encode_checks, write_input
 from flint.platform.input import InputState
@@ -50,19 +50,24 @@ struct SessionRecorder(Movable):
         self.ticks = 0
         self.buffer.clear()
         if for_crashes and anchor_ready():
-            set_text(T_REPLAY_PATH, path)
-            self.publish()
-            store(ANCHOR + A_REPLAY_ACTIVE, 1)
-            self.published = True
+            var base = anchor_base()
+            if base != 0:
+                set_text(T_REPLAY_PATH, path)
+                self.publish()
+                store(base + A_REPLAY_ACTIVE, 1)
+                self.published = True
         return True
 
     def publish(self, pending: Int = -1):
         if not self.published and not anchor_ready():
             return
-        store(ANCHOR + A_REPLAY_BUFFER, Int(self.buffer.unsafe_ptr()))
-        store(ANCHOR + A_REPLAY_COMMITTED, len(self.buffer))
-        store(ANCHOR + A_REPLAY_PENDING, pending if pending >= 0 else len(self.buffer))
-        store(ANCHOR + A_REPLAY_TICKS, self.ticks)
+        var base = anchor_base()
+        if base == 0:
+            return
+        store(base + A_REPLAY_BUFFER, Int(self.buffer.unsafe_ptr()))
+        store(base + A_REPLAY_COMMITTED, len(self.buffer))
+        store(base + A_REPLAY_PENDING, pending if pending >= 0 else len(self.buffer))
+        store(base + A_REPLAY_TICKS, self.ticks)
 
     def begin_tick(mut self, input: InputState):
         """The tick's input, before it runs."""
@@ -70,7 +75,9 @@ struct SessionRecorder(Movable):
             return
         write_input(self.buffer, input)
         if self.published:
-            store(ANCHOR + A_REPLAY_PENDING, len(self.buffer))
+            var base = anchor_base()
+            if base != 0:
+                store(base + A_REPLAY_PENDING, len(self.buffer))
 
     def end_tick(mut self, checks: List[UInt64]):
         """The tick's checksums, after it ran. Whole ticks reach the file a MiB at a time."""
@@ -79,9 +86,11 @@ struct SessionRecorder(Movable):
         encode_checks(self.buffer, checks)
         self.ticks += 1
         if self.published:
-            store(ANCHOR + A_REPLAY_COMMITTED, len(self.buffer))
-            store(ANCHOR + A_REPLAY_PENDING, len(self.buffer))
-            store(ANCHOR + A_REPLAY_TICKS, self.ticks)
+            var base = anchor_base()
+            if base != 0:
+                store(base + A_REPLAY_COMMITTED, len(self.buffer))
+                store(base + A_REPLAY_PENDING, len(self.buffer))
+                store(base + A_REPLAY_TICKS, self.ticks)
         if len(self.buffer) >= FLUSH_AT:
             self.flush()
 
@@ -103,9 +112,11 @@ struct SessionRecorder(Movable):
             return
         self.buffer.extend(records.copy())
         if self.published:
-            store(ANCHOR + A_REPLAY_BUFFER, Int(self.buffer.unsafe_ptr()))
-            store(ANCHOR + A_REPLAY_COMMITTED, len(self.buffer))
-            store(ANCHOR + A_REPLAY_PENDING, len(self.buffer))
+            var base = anchor_base()
+            if base != 0:
+                store(base + A_REPLAY_BUFFER, Int(self.buffer.unsafe_ptr()))
+                store(base + A_REPLAY_COMMITTED, len(self.buffer))
+                store(base + A_REPLAY_PENDING, len(self.buffer))
         if len(self.buffer) >= FLUSH_AT:
             self.flush()
 
@@ -113,9 +124,11 @@ struct SessionRecorder(Movable):
         if not self.active or len(self.buffer) == 0:
             return
         if self.published:
-            # Told first: a crash during the write must not append these bytes twice.
-            store(ANCHOR + A_REPLAY_COMMITTED, 0)
-            store(ANCHOR + A_REPLAY_PENDING, 0)
+            var base = anchor_base()
+            if base != 0:
+                # Told first: a crash during the write must not append these bytes twice.
+                store(base + A_REPLAY_COMMITTED, 0)
+                store(base + A_REPLAY_PENDING, 0)
         if not append_bytes(self.path, self.buffer):
             print("RECORDING_WRITE_FAILED " + self.path)
         self.buffer.clear()
@@ -123,6 +136,8 @@ struct SessionRecorder(Movable):
     def finish(mut self):
         self.flush()
         if self.published:
-            store(ANCHOR + A_REPLAY_ACTIVE, 0)
+            var base = anchor_base()
+            if base != 0:
+                store(base + A_REPLAY_ACTIVE, 0)
             self.published = False
         self.active = False

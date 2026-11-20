@@ -2,10 +2,10 @@
 the GPU watchdog share.
 
 Mojo has no global variables, and a signal handler gets no pointer of its
-own, so the safety net lives at a fixed address, `ANCHOR`. `install_anchor`
-maps it once per process with MAP_FIXED_NOREPLACE (it never replaces a
-mapping that is already there); everything else finds it with
-`anchor_ready()`, which checks the mapping, a magic word and the process id.
+own, so the safety net is dynamically mapped via anonymous `mmap(0)` and
+published through a lock-free `FLINT_ANCHOR_CTRL` global control block;
+everything else finds it with `anchor_base()` / `anchor_ready()`, which checks
+the mapping, a magic word and the process id.
 
 Everything here is safe to call from a signal handler: raw system calls
 through `syscall`, plain loads and stores, no allocation. Numbers are written
@@ -20,14 +20,14 @@ Layout (byte offsets from ANCHOR):
     131072 ..        the log ring (core/log.mojo)
     2 MiB .. 4 MiB   alternate signal stacks, 64 KiB per thread
 """
-from std.ffi import external_call
-from std.atomic import Atomic
+from std.ffi import external_call, _Global
+from std.atomic import Atomic, Ordering
 from std.sys.info import CompilationTarget
 from std.time import monotonic
 
-comptime ANCHOR: Int = 0x5D5D00000000
 comptime ANCHOR_BYTES: Int = STACKS + STACK_SLOTS * STACK_BYTES
 comptime ANCHOR_MAGIC: Int = 0x31454641534453  # "SDSAFE1"
+comptime _ANCHOR_CTRL_KEY: StaticString = "FLINT_ANCHOR_CTRL"
 
 # Words.
 comptime A_MAGIC: Int = 0
@@ -101,15 +101,76 @@ comptime O_WRONLY_CREATE_APPEND: Int = 1 | 64 | 1024 | 0x80000
 comptime O_READ: Int = 0x80000
 
 
+def _anchor_on_exit(ctrl: Int) abi("C"):
+    if ctrl == 0:
+        return
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    while True:
+        var cur = base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+        if cur == 0:
+            break
+        var expected = cur
+        if base_ptr[unsafe_offset=0].compare_exchange[
+            failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+        ](expected, Int64(0)):
+            _ = external_call["munmap", Int32](Int(cur), Int(ANCHOR_BYTES))
+            break
+    external_call["free", NoneType](ctrl)
+
+
+def _init_anchor_ctrl() -> Int:
+    var ctrl = external_call["aligned_alloc", Int](Int(64), Int(64))
+    if ctrl == 0:
+        return 0
+    var p = Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    for i in range(8):
+        p[unsafe_offset=i] = 0
+    _ = external_call["__cxa_atexit", Int32](_anchor_on_exit, ctrl, Int(0))
+    return ctrl
+
+
+comptime _ANCHOR_GLOBAL = _Global["FLINT_ANCHOR_CTRL", _init_anchor_ctrl]
+
+
+@always_inline
+def _anchor_ctrl_addr() -> Int:
+    var slot = external_call["KGEN_CompilerRT_GetGlobalOrNull", Int](
+        Int(_ANCHOR_CTRL_KEY.unsafe_ptr()), _ANCHOR_CTRL_KEY.byte_length()
+    )
+    if slot == 0:
+        return 0
+    return Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=slot)[unsafe_offset=0]
+
+
+@always_inline
+def _anchor_ctrl_addr_or_create() -> Int:
+    try:
+        return _ANCHOR_GLOBAL.get_or_create_ptr()[unsafe_offset=0]
+    except:
+        return 0
+
+
+@always_inline
+def anchor_base() -> Int:
+    """Async-signal-safe, zero-alloc base address of the safety anchor, or 0 if uninstalled."""
+    var ctrl = _anchor_ctrl_addr()
+    if ctrl == 0:
+        return 0
+    return Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]())
+
+
 def text_offset(area: Int) -> Int:
     """Where an area starts. Branches, not a list: a list would allocate."""
+    var base = anchor_base()
+    if base == 0:
+        return 0
     if area == T_STAMP:
-        return ANCHOR + 1024
+        return base + 1024
     if area <= T_STATUS:
-        return ANCHOR + 1152 + (area - 1) * 512
+        return base + 1152 + (area - 1) * 512
     if area == T_CVARS:
-        return ANCHOR + 4352
-    return ANCHOR + 12544
+        return base + 4352
+    return base + 12544
 
 
 def text_capacity(area: Int) -> Int:
@@ -156,27 +217,37 @@ def store_byte(address: Int, value: Int):
 
 
 def atomic_word(offset: Int) -> Pointer[Atomic[Int64], origin=MutAnyOrigin]:
-    return Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ANCHOR + offset)
+    return Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=anchor_base() + offset)
 
 
 def anchor_add(offset: Int, amount: Int = 1) -> Int:
     """Add to an anchor counter from any thread. Returns the value before."""
-    return Int(atomic_word(offset)[unsafe_offset=0].fetch_add(Int64(amount)))
+    var base = anchor_base()
+    if base == 0:
+        return 0
+    return Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base + offset)[unsafe_offset=0].fetch_add(Int64(amount)))
 
 
 def anchor_get(offset: Int) -> Int:
-    return Int(atomic_word(offset)[unsafe_offset=0].load())
+    var base = anchor_base()
+    if base == 0:
+        return 0
+    return Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base + offset)[unsafe_offset=0].load())
 
 
 def anchor_set(offset: Int, value: Int):
-    atomic_word(offset)[unsafe_offset=0].store(Int64(value))
+    var base = anchor_base()
+    if base == 0:
+        return
+    Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base + offset)[unsafe_offset=0].store(Int64(value))
 
 
 def anchor_ready() -> Bool:
-    """True when this process has installed the anchor."""
-    if sys(SYS_MSYNC, ANCHOR, 4096, 1) != 0:  # MS_ASYNC; fails with ENOMEM when nothing is mapped
+    """True when this process has installed the anchor (zero-alloc if uninstalled)."""
+    var base = anchor_base()
+    if base == 0:
         return False
-    return load(ANCHOR + A_MAGIC) == ANCHOR_MAGIC and load(ANCHOR + A_PID) == sys(SYS_GETPID)
+    return load(base + A_MAGIC) == ANCHOR_MAGIC and load(base + A_PID) == sys(SYS_GETPID)
 
 
 def monotonic_ns() -> Int:
@@ -184,28 +255,54 @@ def monotonic_ns() -> Int:
 
 
 def install_anchor() -> Bool:
-    """Map the anchor for this process. Safe to repeat; False if the address is taken
-    by something else, and then the safety net stays off."""
+    """Map the anchor dynamically for this process. Safe to repeat and to race."""
     if anchor_ready():
         return True
-    # MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE
-    var mapped = external_call["mmap", Int](ANCHOR, ANCHOR_BYTES, Int32(3), Int32(0x22 | 0x100000), Int32(-1), Int(0))
-    if mapped != ANCHOR:
-        # A fork of a process that had it: the mapping is there, the pid is not ours.
-        if sys(SYS_MSYNC, ANCHOR, 4096, 1) == 0 and load(ANCHOR + A_MAGIC) == ANCHOR_MAGIC:
-            store(ANCHOR + A_PID, sys(SYS_GETPID))
-            return True
+    var ctrl = _anchor_ctrl_addr_or_create()
+    if ctrl == 0:
         return False
-    store(ANCHOR + A_PID, sys(SYS_GETPID))
-    store(ANCHOR + A_LOG_FD, -1)
-    store(ANCHOR + A_TICK, -1)
-    store(ANCHOR + A_LOG_ECHO, 3)  # warnings and worse
-    store(ANCHOR + A_LOG_LEVEL, 2)  # info
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    var existing = Int(base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]())
+    if existing != 0 and load(existing + A_MAGIC) == ANCHOR_MAGIC:
+        store(existing + A_PID, sys(SYS_GETPID))
+        return True
+    # Dynamic OS anonymous mmap (no fixed address)
+    var mapped = external_call["mmap", Int](Int(0), ANCHOR_BYTES, Int32(3), Int32(0x22), Int32(-1), Int(0))
+    if mapped == 0 or mapped == -1:
+        return False
+    store(mapped + A_PID, sys(SYS_GETPID))
+    store(mapped + A_LOG_FD, -1)
+    store(mapped + A_TICK, -1)
+    store(mapped + A_LOG_ECHO, 3)  # warnings and worse
+    store(mapped + A_LOG_LEVEL, 2)  # info
     for category in range(32):
-        store_byte(ANCHOR + A_CATEGORY_LEVELS + category, 255)  # follow the default
-    store(ANCHOR + A_START_NS, monotonic_ns())
-    store(ANCHOR + A_MAGIC, ANCHOR_MAGIC)
-    return True
+        store_byte(mapped + A_CATEGORY_LEVELS + category, 255)  # follow the default
+    store(mapped + A_START_NS, monotonic_ns())
+    store(mapped + A_MAGIC, ANCHOR_MAGIC)
+    var expected = Int64(0)
+    if not base_ptr[unsafe_offset=0].compare_exchange[
+        failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+    ](expected, Int64(mapped)):
+        _ = external_call["munmap", Int32](mapped, Int(ANCHOR_BYTES))
+    return anchor_ready()
+
+
+def anchor_shutdown():
+    """Unmap the safety anchor early (idempotent with __cxa_atexit)."""
+    var ctrl = _anchor_ctrl_addr()
+    if ctrl == 0:
+        return
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    while True:
+        var cur = base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+        if cur == 0:
+            return
+        var expected = cur
+        if base_ptr[unsafe_offset=0].compare_exchange[
+            failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+        ](expected, Int64(0)):
+            _ = external_call["munmap", Int32](Int(cur), Int(ANCHOR_BYTES))
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -214,20 +311,29 @@ def install_anchor() -> Bool:
 
 def set_text(area: Int, text: String):
     """Copy text into an area, cut to fit. The length is written last."""
+    var anchor = anchor_base()
+    if anchor == 0:
+        return
     var bytes = text.as_bytes()
     var count = min(len(bytes), text_capacity(area))
     var base = text_offset(area)
-    store(ANCHOR + A_TEXT_LENGTHS + area * 8, 0)
+    store(anchor + A_TEXT_LENGTHS + area * 8, 0)
     for index in range(count):
         store_byte(base + index, Int(bytes[index]))
-    store(ANCHOR + A_TEXT_LENGTHS + area * 8, count)
+    store(anchor + A_TEXT_LENGTHS + area * 8, count)
 
 
 def text_length(area: Int) -> Int:
-    return min(load(ANCHOR + A_TEXT_LENGTHS + area * 8), text_capacity(area))
+    var anchor = anchor_base()
+    if anchor == 0:
+        return 0
+    return min(load(anchor + A_TEXT_LENGTHS + area * 8), text_capacity(area))
 
 
 def get_text(area: Int) -> String:
+    var anchor = anchor_base()
+    if anchor == 0:
+        return String()
     var bytes = List[UInt8]()
     var base = text_offset(area)
     for index in range(text_length(area)):

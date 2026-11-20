@@ -807,7 +807,7 @@ def visbuffer_alphamask_vfx_fragment_shader() -> List[UInt32]:
 
     s.discard_if(s.flt(s.load_f(alpha_v), s.float(0.48)))
 
-    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFFFF)))
+    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFF)))
     emit(s.code, OP_STORE, out_col[1], s.uvec4(w0, w1, s.uint(0), s.uint(1)))
     return s.finish()
 

@@ -493,7 +493,7 @@ struct Scene(Movable):
 
     # ---- Instant Play-In-Editor (PIE) World Snapshot / Restore (<0.2 ms) ----
 
-    def enter_pie(mut self, world: World):
+    def enter_pie(mut self, world: World) raises:
         """Captures an instant binary snapshot of `world` prior to Play-In-Editor simulation."""
         var writer = BlobWriter()
         world.snapshot_blob(writer)

@@ -431,7 +431,59 @@ struct VehicleChassis(Copyable, Movable):
         brake: Float32,
         steer: Float32,
     ):
+        var unused_forces = List[Vec3]()
+        var empty_ground_vels = List[Vec3]()
+        self._step_dynamics_impl(
+            dt,
+            throttle,
+            brake,
+            steer,
+            Float32(9.81),
+            empty_ground_vels,
+            unused_forces,
+            True,
+        )
+
+    def step_world_substep(
+        mut self,
+        dt: Float32,
+        throttle: Float32,
+        brake: Float32,
+        steer: Float32,
+        gravity_y: Float32,
+        ground_vels: List[Vec3],
+        mut out_wheel_forces: List[Vec3],
+        apply_gyro: Bool = False,
+    ):
+        """Advances one 240 Hz vehicle substep using externally probed `wheel_states`
+        and moving contact surface `ground_vels`, emitting per-wheel world forces
+        for two-way reaction impulses onto hit `PhysicsWorld` dynamic bodies."""
+        self._step_dynamics_impl(
+            dt,
+            throttle,
+            brake,
+            steer,
+            gravity_y,
+            ground_vels,
+            out_wheel_forces,
+            apply_gyro,
+        )
+
+    def _step_dynamics_impl(
+        mut self,
+        dt: Float32,
+        throttle: Float32,
+        brake: Float32,
+        steer: Float32,
+        gravity_y: Float32,
+        ground_vels: List[Vec3],
+        mut out_wheel_forces: List[Vec3],
+        apply_gyro: Bool,
+    ):
         var num_wheels = len(self.wheels)
+        out_wheel_forces.clear()
+        for _ in range(num_wheels):
+            out_wheel_forces.append(Vec3())
         if num_wheels < 4:
             return
 
@@ -445,7 +497,7 @@ struct VehicleChassis(Copyable, Movable):
         var f_drag = -self.linear_vel * (Float32(0.5) * Float32(1.225) * self.drag_coeff * Float32(2.2) * speed)
         var f_down = -up * (Float32(0.5) * Float32(1.225) * self.downforce_coeff * Float32(2.2) * fwd_speed * fwd_speed)
 
-        var total_force = Vec3(0, -9.81 * self.mass, 0) + f_drag + f_down
+        var total_force = Vec3(0, -gravity_y * self.mass, 0) + f_drag + f_down
         var total_torque = Vec3(0, 0, 0)
 
         # 2. Ackermann wheel steering geometry
@@ -483,6 +535,7 @@ struct VehicleChassis(Copyable, Movable):
 
             var hub_r = self.rot.rotate(cfg.offset)
             var susp_force = self.wheel_states[i].contact_normal * f_norm
+            out_wheel_forces[i] = out_wheel_forces[i] + susp_force
             total_force = total_force + susp_force
             total_torque = total_torque + hub_r.cross(susp_force)
 
@@ -545,7 +598,8 @@ struct VehicleChassis(Copyable, Movable):
 
             var n_contact = self.wheel_states[i].contact_normal
             var raw_arm = self.wheel_states[i].contact_point - self.pos
-            var patch_vel = self.linear_vel + self.angular_vel.cross(raw_arm)
+            var ground_v = ground_vels[i] if i < len(ground_vels) else Vec3()
+            var patch_vel = (self.linear_vel + self.angular_vel.cross(raw_arm)) - ground_v
 
             var sa = self.wheel_states[i].steer_angle
             var c_sa = det_cos(sa)
@@ -618,6 +672,7 @@ struct VehicleChassis(Copyable, Movable):
             self.wheel_states[i].aligning_torque = mz
 
             var tire_force = wheel_fwd * fx + wheel_lat * fy
+            out_wheel_forces[i] = out_wheel_forces[i] + tire_force
             total_force = total_force + tire_force
 
             # Apply tire force at (contact_point - self.pos) with roll_center_blend
@@ -641,7 +696,7 @@ struct VehicleChassis(Copyable, Movable):
             wb_cur.y + tau_local.y * self.inv_inertia.y * dt,
             wb_cur.z + tau_local.z * self.inv_inertia.z * dt,
         )
-        var wb_next = _implicit_gyro_step(wb_forced, self.inertia, dt)
+        var wb_next = _implicit_gyro_step(wb_forced, self.inertia, dt) if apply_gyro else wb_forced
         self.angular_vel = self.rot.rotate(wb_next)
         self.rot = (Quat.from_scaled_angle(self.angular_vel * dt) * self.rot).normalized()
 

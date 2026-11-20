@@ -112,7 +112,7 @@ struct AcquiredFrame(Copyable, ImplicitlyCopyable, Movable):
         return swapchain_format_bytes_per_pixel(self.format)
 
 
-struct SwapchainSurface(Copyable, Movable):
+struct SwapchainSurface(Movable):
     """Unified zero-copy GPU WSI swapchain & headless CI surface manager (100% pure-Mojo, zero `libxcb`)."""
     var backend: UInt32
     var present_mode: UInt32
@@ -134,6 +134,25 @@ struct SwapchainSurface(Copyable, Movable):
         self.frames_presented = 0
         self.resize_generations = 0
         self.last_error = ""
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.backend = existing.backend
+        self.present_mode = existing.present_mode
+        self.display_mode = existing.display_mode
+        self.width = existing.width
+        self.height = existing.height
+        self.handle = existing.handle^
+        self.frames_presented = existing.frames_presented
+        self.resize_generations = existing.resize_generations
+        self.last_error = existing.last_error^
+        existing.backend = SURFACE_HEADLESS
+        existing.width = 0
+        existing.height = 0
+        existing.frames_presented = 0
+        existing.resize_generations = 0
+
+    def __deinit__(deinit self):
+        pass
 
     def backend_name(self) -> String:
         if self.backend == SURFACE_WAYLAND:
@@ -262,7 +281,17 @@ struct SwapchainSurface(Copyable, Movable):
                         len(vk.images),
                         vk.is_hdr,
                     )
-                    window.swapchain = sc_wl.copy()
+                    window.swapchain = SwapchainHandle(
+                        vk.surface,
+                        vk.swapchain,
+                        vk.swapchain_width,
+                        vk.swapchain_height,
+                        vk.swapchain_format,
+                        vk.swapchain_color_space,
+                        vk.swapchain_present_mode,
+                        len(vk.images),
+                        vk.is_hdr,
+                    )
                     window.gpu_width = sc_wl.width
                     window.gpu_height = sc_wl.height
                     window.fit_swapchain_to_window()
@@ -424,6 +453,31 @@ struct SwapchainSurface(Copyable, Movable):
                 copy_h,
             )
         var fence = vk.submit_and_present(acquired.slot_index, acquired.image_index)
+        if fence != 0:
+            self.frames_presented += 1
+        return fence
+
+    def present_direct(
+        mut self,
+        mut vk: VulkanGpu,
+        acquired: AcquiredFrame,
+        extra_wait_sem: Int = 0,
+        extra_wait_val: UInt64 = 0,
+    ) -> UInt64:
+        """Presents an already directly-rendered swapchain image without any `buf_history` -> `copy_to_image` bounce."""
+        if not acquired.valid:
+            return 0
+        if acquired.is_headless or vk.swapchain == 0:
+            var f_hl = vk.submit(acquired.slot_index)
+            if f_hl != 0:
+                self.frames_presented += 1
+            return f_hl
+        var fence = vk.submit_and_present(
+            acquired.slot_index,
+            acquired.image_index,
+            extra_wait_sem=extra_wait_sem,
+            extra_wait_val=extra_wait_val,
+        )
         if fence != 0:
             self.frames_presented += 1
         return fence

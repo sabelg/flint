@@ -36,12 +36,12 @@ Budgets come from the `mem.budget.<tag>` console variables, in MiB (0 = none).
 `memory_check_budgets` runs once per frame on the main thread, outside ticks:
 memory is presentation and never changes the simulation.
 """
-from std.ffi import external_call
-from std.atomic import Atomic
+from std.ffi import external_call, _Global
+from std.atomic import Atomic, Ordering
 
-comptime MEMORY_BASE: Int = 0x5D5C00000000
 comptime MEMORY_BYTES: Int = 16384
 comptime MEMORY_MAGIC: Int = 0x314D454D4453  # "SDMEM1"
+comptime _MEMORY_CTRL_KEY: StaticString = "FLINT_MEMORY_CTRL"
 
 # Tags. CPU tags first, then the GPU ones from MEM_FIRST_GPU.
 comptime MEM_TERRAIN: Int = 0     # brick pool: mixed 8^3 bricks
@@ -134,12 +134,70 @@ def default_budget_mib(tag: Int) -> Float32:
 
 
 # ---------------------------------------------------------------------------
-# The mapping
+# The mapping (dynamic OS allocation via lock-free global control block)
 # ---------------------------------------------------------------------------
+
+def _memory_on_exit(ctrl: Int) abi("C"):
+    if ctrl == 0:
+        return
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    while True:
+        var cur = base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+        if cur == 0:
+            break
+        var expected = cur
+        if base_ptr[unsafe_offset=0].compare_exchange[
+            failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+        ](expected, Int64(0)):
+            external_call["free", NoneType](Int(cur))
+            break
+    external_call["free", NoneType](ctrl)
+
+
+def _init_memory_ctrl() -> Int:
+    var ctrl = external_call["aligned_alloc", Int](Int(64), Int(64))
+    if ctrl == 0:
+        return 0
+    var p = Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    for i in range(8):
+        p[unsafe_offset=i] = 0
+    _ = external_call["__cxa_atexit", Int32](_memory_on_exit, ctrl, Int(0))
+    return ctrl
+
+
+comptime _MEMORY_GLOBAL = _Global["FLINT_MEMORY_CTRL", _init_memory_ctrl]
+
+
+@always_inline
+def _memory_ctrl_addr() -> Int:
+    var slot = external_call["KGEN_CompilerRT_GetGlobalOrNull", Int](
+        Int(_MEMORY_CTRL_KEY.unsafe_ptr()), _MEMORY_CTRL_KEY.byte_length()
+    )
+    if slot == 0:
+        return 0
+    return Pointer[Int, origin=MutAnyOrigin](unsafe_from_address=slot)[unsafe_offset=0]
+
+
+@always_inline
+def _memory_ctrl_addr_or_create() -> Int:
+    try:
+        return _MEMORY_GLOBAL.get_or_create_ptr()[unsafe_offset=0]
+    except:
+        return 0
+
+
+@always_inline
+def memory_base() -> Int:
+    """Base address of the process memory tracker, or 0 if not installed."""
+    var ctrl = _memory_ctrl_addr()
+    if ctrl == 0:
+        return 0
+    return Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]())
+
 
 @always_inline
 def mem_word(offset: Int) -> Pointer[Atomic[Int64], origin=MutAnyOrigin]:
-    return Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=MEMORY_BASE + offset)
+    return Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=memory_base() + offset)
 
 
 @always_inline
@@ -147,74 +205,112 @@ def tag_word(tag: Int, field: Int) -> Pointer[Atomic[Int64], origin=MutAnyOrigin
     return mem_word(W_TAGS + tag * TAG_STRIDE + field)
 
 
-def mapped(address: Int) -> Bool:
-    # MS_ASYNC; fails with ENOMEM when nothing is mapped there.
-    return external_call["msync", Int32](address, 4096, Int32(1)) == 0
-
-
 def memory_ready() -> Bool:
-    """True when this process has the tracker mapped (and it is ours)."""
-    if not mapped(MEMORY_BASE):
+    """True when this process has the tracker allocated (zero-alloc if uninstalled)."""
+    var base = memory_base()
+    if base == 0:
         return False
-    var magic = Int(mem_word(W_MAGIC)[unsafe_offset=0].load())
+    var magic = Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base + W_MAGIC)[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]())
     return magic == MEMORY_MAGIC or magic == 0
 
 
 def memory_install() -> Bool:
-    """Map the tracker once per process. Safe to repeat, and to race: the
-    mapping is zero-filled, and all-zero counters are a valid empty tracker."""
-    if memory_ready():
-        return True
-    # MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE
-    var got = external_call["mmap", Int](MEMORY_BASE, MEMORY_BYTES, Int32(3), Int32(0x22 | 0x100000), Int32(-1), Int(0))
-    if got != MEMORY_BASE:
-        # Another thread mapped it first (fine), or the address belongs to
-        # something else: then nothing is tracked.
-        return memory_ready()
-    mem_word(W_MAGIC)[unsafe_offset=0].store(Int64(MEMORY_MAGIC))
-    return True
+    """Allocate the tracker once per process. Safe to repeat and to race."""
+    var ctrl = _memory_ctrl_addr_or_create()
+    if ctrl == 0:
+        return False
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    var existing = Int(base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]())
+    if existing != 0:
+        var magic = Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=existing + W_MAGIC)[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]())
+        return magic == MEMORY_MAGIC or magic == 0
+    var blk = external_call["aligned_alloc", Int](Int(64), Int(MEMORY_BYTES))
+    if blk == 0:
+        return False
+    var p = Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=blk)
+    for i in range(MEMORY_BYTES // 8):
+        p[unsafe_offset=i] = 0
+    Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=blk + W_MAGIC)[unsafe_offset=0].store[ordering=Ordering.RELEASE](Int64(MEMORY_MAGIC))
+    var expected = Int64(0)
+    if not base_ptr[unsafe_offset=0].compare_exchange[
+        failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+    ](expected, Int64(blk)):
+        external_call["free", NoneType](blk)
+    return memory_ready()
+
+
+def memory_shutdown():
+    """Free the process memory tracker early (idempotent with __cxa_atexit)."""
+    var ctrl = _memory_ctrl_addr()
+    if ctrl == 0:
+        return
+    var base_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctrl)
+    while True:
+        var cur = base_ptr[unsafe_offset=0].load[ordering=Ordering.ACQUIRE]()
+        if cur == 0:
+            return
+        var expected = cur
+        if base_ptr[unsafe_offset=0].compare_exchange[
+            failure_ordering=Ordering.RELAXED, success_ordering=Ordering.SEQUENTIAL
+        ](expected, Int64(0)):
+            external_call["free", NoneType](Int(cur))
+            return
+
+
+@always_inline
+def _raise_peak_at(base_addr: Int, offset: Int, value: Int):
+    """peak = max(peak, value), from any thread."""
+    var w = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base_addr + offset)
+    while True:
+        var peak = w[unsafe_offset=0].load()
+        if Int64(value) <= peak:
+            return
+        if w[unsafe_offset=0].compare_exchange(peak, Int64(value)):
+            return
 
 
 @always_inline
 def raise_peak(offset: Int, value: Int):
     """peak = max(peak, value), from any thread."""
-    while True:
-        var peak = mem_word(offset)[unsafe_offset=0].load()
-        if Int64(value) <= peak:
-            return
-        if mem_word(offset)[unsafe_offset=0].compare_exchange(peak, Int64(value)):
-            return
+    var base_addr = memory_base()
+    if base_addr != 0:
+        _raise_peak_at(base_addr, offset, value)
 
 
 def mem_add(tag: Int, delta: Int, count_delta: Int = 0):
-    """Move a tag by `delta` bytes and `count_delta` live allocations. Only for
-    code that holds a charge or arena (so the mapping exists); any thread."""
+    """Move a tag by `delta` bytes and `count_delta` live allocations. Any thread."""
     if tag == MEM_DOMAIN_VRAM or tag == MEM_DOMAIN_GTT:
         mem_add_domain(tag == MEM_DOMAIN_VRAM, delta)
         return
     if tag < 0 or tag >= MEM_TAGS:
         return
+    var base_addr = memory_base()
+    if base_addr == 0:
+        return
     var base = W_TAGS + tag * TAG_STRIDE
     if delta != 0:
-        var live = Int(mem_word(base + T_LIVE)[unsafe_offset=0].fetch_add(Int64(delta))) + delta
+        var live = Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base_addr + base + T_LIVE)[unsafe_offset=0].fetch_add(Int64(delta))) + delta
         if delta > 0:
-            raise_peak(base + T_PEAK, live)
+            _raise_peak_at(base_addr, base + T_PEAK, live)
         var total = W_GPU_LIVE if mem_tag_gpu(tag) else W_CPU_LIVE
-        var sum = Int(mem_word(total)[unsafe_offset=0].fetch_add(Int64(delta))) + delta
+        var sum = Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base_addr + total)[unsafe_offset=0].fetch_add(Int64(delta))) + delta
         if delta > 0:
-            raise_peak(total + 8, sum)
+            _raise_peak_at(base_addr, total + 8, sum)
     if count_delta != 0:
-        _ = mem_word(base + T_COUNT)[unsafe_offset=0].fetch_add(Int64(count_delta))
+        _ = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base_addr + base + T_COUNT)[unsafe_offset=0].fetch_add(Int64(count_delta))
         if count_delta > 0:
-            _ = mem_word(base + T_ALLOCS)[unsafe_offset=0].fetch_add(Int64(count_delta))
+            _ = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base_addr + base + T_ALLOCS)[unsafe_offset=0].fetch_add(Int64(count_delta))
 
 
 def mem_add_domain(vram: Bool, delta: Int):
     """GPU bytes by where they live: VRAM, or GTT (system memory the GPU maps)."""
+    var base_addr = memory_base()
+    if base_addr == 0:
+        return
     var live = W_VRAM_LIVE if vram else W_GTT_LIVE
-    var now = Int(mem_word(live)[unsafe_offset=0].fetch_add(Int64(delta))) + delta
+    var now = Int(Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=base_addr + live)[unsafe_offset=0].fetch_add(Int64(delta))) + delta
     if delta > 0:
-        raise_peak(live + 8, now)
+        _raise_peak_at(base_addr, live + 8, now)
 
 
 def mem_get(tag: Int, field: Int) -> Int:
@@ -302,7 +398,7 @@ def describe_crossing(tag: Int) -> String:
 # Charges
 # ---------------------------------------------------------------------------
 
-struct MemCharge(Copyable, Movable):
+struct MemCharge(Movable):
     """One owner's bytes under one tag, given back when the charge dies."""
     var tag: Int    # -1: untracked
     var bytes: Int
@@ -324,13 +420,18 @@ struct MemCharge(Copyable, Movable):
             self.bytes = 0
             self.count = 0
 
-    def __init__(out self, *, copy: Self):
-        """A copy is a second allocation of the same size."""
-        self.tag = copy.tag
-        self.bytes = copy.bytes
-        self.count = copy.count
+    def __init__(out self, *, deinit move: Self):
+        self.tag = move.tag
+        self.bytes = move.bytes
+        self.count = move.count
+
+    def release(mut self):
+        """Idempotently release this charge early."""
         if self.tag >= 0:
-            mem_add(self.tag, self.bytes, self.count)
+            mem_add(self.tag, -self.bytes, -self.count)
+            self.tag = -1
+            self.bytes = 0
+            self.count = 0
 
     def __deinit__(deinit self):
         if self.tag >= 0:
@@ -353,7 +454,7 @@ struct MemCharge(Copyable, Movable):
 # Arenas
 # ---------------------------------------------------------------------------
 
-struct Arena(Copyable, Movable):
+struct Arena(Movable):
     """A bump allocator over one block, charged at its capacity. Allocation is
     for one thread (the owner's); `reset` frees everything at once. A request
     that does not fit returns 0 and counts as an overflow: the caller falls back
@@ -381,10 +482,25 @@ struct Arena(Copyable, Movable):
         self.resets = 0
         self.charge = MemCharge(tag, self.capacity)
 
-    def __init__(out self, *, copy: Self):
-        """A copy is a new, empty arena of the same size (the old one's pointers
-        stay with it)."""
-        self = Arena(copy.tag, copy.capacity)
+    def __init__(out self, *, deinit move: Self):
+        self.tag = move.tag
+        self.base = move.base
+        self.capacity = move.capacity
+        self.used = move.used
+        self.peak = move.peak
+        self.allocations = move.allocations
+        self.overflows = move.overflows
+        self.resets = move.resets
+        self.charge = move.charge^
+
+    def release(mut self):
+        """Idempotently free the arena buffer and release its MemCharge."""
+        if self.base != 0:
+            external_call["free", NoneType](self.base)
+            self.base = 0
+        self.capacity = 0
+        self.used = 0
+        self.charge.release()
 
     def __deinit__(deinit self):
         if self.base != 0:
@@ -414,13 +530,13 @@ struct Arena(Copyable, Movable):
         self.resets += 1
 
     def owns(self, address: Int) -> Bool:
-        return address >= self.base and address < self.base + self.capacity
+        return self.base != 0 and address >= self.base and address < self.base + self.capacity
 
 
 comptime FRAME_ARENA_BYTES: Int = 1 << 20
 
 
-struct FrameArenas(Copyable, Movable):
+struct FrameArenas(Movable):
     """One arena per frame in flight. `begin(slot)` is called once the frame
     that last used the slot is finished on the GPU (GpuRaster.begin has waited
     for its fence), or at once on the CPU renderer; it resets that arena and
@@ -438,7 +554,25 @@ struct FrameArenas(Copyable, Movable):
         self.frames = 0
         self.frame_peak = 0
 
+    def __init__(out self, *, deinit move: Self):
+        self.arenas = move.arenas^
+        self.current = move.current
+        self.frames = move.frames
+        self.frame_peak = move.frame_peak
+
+    def release(mut self):
+        """Idempotently release all frame arenas and their memory charges."""
+        self.arenas.clear()
+        self.current = 0
+        self.frames = 0
+        self.frame_peak = 0
+
+    def __deinit__(deinit self):
+        self.arenas.clear()
+
     def begin(mut self, slot: Int):
+        if len(self.arenas) == 0:
+            return
         var index = slot % len(self.arenas) if slot >= 0 else 0
         var used = self.arenas[self.current].used
         if used > self.frame_peak:
@@ -448,28 +582,36 @@ struct FrameArenas(Copyable, Movable):
         self.frames += 1
 
     def next_slot(self) -> Int:
+        if len(self.arenas) == 0:
+            return 0
         return (self.current + 1) % len(self.arenas)
 
     @always_inline
     def alloc(mut self, bytes: Int, align: Int = 16) -> Int:
+        if len(self.arenas) == 0:
+            return 0
         return self.arenas[self.current].alloc(bytes, align)
 
     def used(self) -> Int:
+        if len(self.arenas) == 0:
+            return 0
         return self.arenas[self.current].used
 
     def peak(self) -> Int:
+        if len(self.arenas) == 0:
+            return self.frame_peak
         return max(self.frame_peak, self.arenas[self.current].used)
 
     def capacity(self) -> Int:
         var total = 0
-        for arena in self.arenas:
-            total += arena.capacity
+        for i in range(len(self.arenas)):
+            total += self.arenas[i].capacity
         return total
 
     def overflows(self) -> Int:
         var total = 0
-        for arena in self.arenas:
-            total += arena.overflows
+        for i in range(len(self.arenas)):
+            total += self.arenas[i].overflows
         return total
 
 

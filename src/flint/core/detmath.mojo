@@ -21,6 +21,7 @@ exceptions masked. `core/jobs.mojo` sets it on every worker, and a tick
 asserts it (`gameplay/invariants.mojo`).
 """
 from std.math import floor, sqrt
+from std.memory import bitcast
 from std.sys import llvm_intrinsic
 from std.sys._assembly import inlined_assembly
 from std.sys.info import CompilationTarget
@@ -284,6 +285,245 @@ def det_pow(x: Float32, y: Float32) -> Float32:
         var half = y * Float32(0.5)
         return -magnitude if floor(half) != half else magnitude
     return det_exp(y * det_log(x))
+
+
+# ---------------------------------------------------------------------------
+# 8-lane SIMD deterministic math (bit-exact with scalar Float32)
+# ---------------------------------------------------------------------------
+
+comptime _F8 = SIMD[DType.float32, 8]
+comptime _I8 = SIMD[DType.int32, 8]
+comptime _U8 = SIMD[DType.uint32, 8]
+comptime _B8 = SIMD[DType.bool, 8]
+
+
+@always_inline
+def _f8_bits(x: _F8) -> _U8:
+    return bitcast[DType.uint32](x)
+
+
+@always_inline
+def _f8_from_bits(bits: _U8) -> _F8:
+    return bitcast[DType.float32](bits)
+
+
+@always_inline
+def _is_nan8(x: _F8) -> _B8:
+    return (_f8_bits(x) & _U8(0x7FFFFFFF)).gt(_U8(0x7F800000))
+
+
+@always_inline
+def _is_finite8(x: _F8) -> _B8:
+    return (_f8_bits(x) & _U8(0x7F800000)).ne(_U8(0x7F800000))
+
+
+@always_inline
+def _qnan8() -> _F8:
+    return _f8_from_bits(_U8(0x7FC00000))
+
+
+@always_inline
+def _inf8() -> _F8:
+    return _f8_from_bits(_U8(0x7F800000))
+
+
+@always_inline
+def _neg_zero8() -> _F8:
+    return _f8_from_bits(_U8(0x80000000))
+
+
+@always_inline
+def scale_by_pow2(x: SIMD[DType.float32, 8], n: SIMD[DType.int32, 8]) -> SIMD[DType.float32, 8]:
+    """8-lane `x * 2^n` with exact powers of two matching scalar `scale_by_pow2`."""
+    var value = x
+    var e = n
+    var done = _B8(fill=False)
+    var pow2_127 = _f8_from_bits(_U8(UInt32(254) << 23))
+    var pow2_m126 = _f8_from_bits(_U8(UInt32(1) << 23))
+    while True:
+        var gt = (~done) & e.gt(_I8(127))
+        if not gt.reduce_or():
+            break
+        value = gt.select(value * pow2_127, value)
+        e = gt.select(e - _I8(127), e)
+        var early_hi = gt & e.gt(_I8(127)) & (~_is_finite8(value))
+        done |= early_hi
+        var cont_hi = gt & (~early_hi) & e.gt(_I8(127))
+        if not cont_hi.reduce_or():
+            break
+    while True:
+        var lt = (~done) & e.lt(_I8(-126))
+        if not lt.reduce_or():
+            break
+        value = lt.select(value * pow2_m126, value)
+        e = lt.select(e + _I8(126), e)
+        var early_lo = lt & e.lt(_I8(-126)) & value.eq(_F8(0.0))
+        done |= early_lo
+        var cont_lo = lt & (~early_lo) & e.lt(_I8(-126))
+        if not cont_lo.reduce_or():
+            break
+    var safe_e = done.select(_I8(0), e)
+    var scale_bits = ((safe_e + _I8(127)).cast[DType.uint32]()) << _U8(23)
+    var scaled = value * _f8_from_bits(scale_bits)
+    return done.select(value, scaled)
+
+
+@always_inline
+def _sin_poly8(r: _F8, z: _F8) -> _F8:
+    return ((_F8(-1.9515295891e-4) * z + _F8(8.3321608736e-3)) * z + _F8(-1.6666654611e-1)) * z * r + r
+
+
+@always_inline
+def _cos_poly8(z: _F8) -> _F8:
+    return ((_F8(2.443315711809948e-5) * z + _F8(-1.388731625493765e-3)) * z + _F8(4.166664568298827e-2)) * z * z - _F8(0.5) * z + _F8(1.0)
+
+
+@always_inline
+def det_sin(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var in_range = abs(x).lt(_F8(1.0e9))
+    var xr = in_range.select(x, _F8(0.0))
+    var j = floor(xr * _F8(TWO_OVER_PI) + _F8(0.5))
+    var r = ((xr - j * _F8(PIO2_1)) - j * _F8(PIO2_2)) - j * _F8(PIO2_3)
+    var z = r * r
+    var s = _sin_poly8(r, z)
+    var c = _cos_poly8(z)
+    var q = j.cast[DType.int32]() & _I8(3)
+    var poly = q.eq(0).select(s, q.eq(1).select(c, q.eq(2).select(-s, -c)))
+    var fallback = _is_finite8(x).select(_F8(0.0), _qnan8())
+    return in_range.select(poly, fallback)
+
+
+@always_inline
+def det_cos(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var in_range = abs(x).lt(_F8(1.0e9))
+    var xr = in_range.select(x, _F8(0.0))
+    var j = floor(xr * _F8(TWO_OVER_PI) + _F8(0.5))
+    var r = ((xr - j * _F8(PIO2_1)) - j * _F8(PIO2_2)) - j * _F8(PIO2_3)
+    var z = r * r
+    var s = _sin_poly8(r, z)
+    var c = _cos_poly8(z)
+    var q = j.cast[DType.int32]() & _I8(3)
+    var poly = q.eq(0).select(c, q.eq(1).select(-s, q.eq(2).select(-c, s)))
+    var fallback = _is_finite8(x).select(_F8(1.0), _qnan8())
+    return in_range.select(poly, fallback)
+
+
+@always_inline
+def det_atan(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var a = abs(x)
+    var gt_hi = a.gt(_F8(2.414213562373095))
+    var gt_mid = (~gt_hi) & a.gt(_F8(0.4142135623730950))
+    var base = gt_hi.select(_F8(HALF_PI), gt_mid.select(_F8(QUARTER_PI), _F8(0.0)))
+    var ar = gt_hi.select(_F8(-1.0) / a, gt_mid.select((a - _F8(1.0)) / (a + _F8(1.0)), a))
+    var z = ar * ar
+    var res = base + ((((_F8(8.05374449538e-2) * z - _F8(1.38776856032e-1)) * z + _F8(1.99777106478e-1)) * z - _F8(3.33329491539e-1)) * z * ar + ar)
+    var signed = x.lt(_F8(0.0)).select(-res, res)
+    return _f8_from_bits(_is_nan8(x).select(_f8_bits(x), _f8_bits(signed)))
+
+
+@always_inline
+def det_atan2(y: SIMD[DType.float32, 8], x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var x_zero = x.eq(_F8(0.0))
+    var y_zero = y.eq(_F8(0.0))
+    var y_neg = (_f8_bits(y) >> _U8(31)).ne(_U8(0))
+    var x_neg = (_f8_bits(x) >> _U8(31)).ne(_U8(0))
+    var x_safe = x_zero.select(_F8(1.0), x)
+    var angle = det_atan(y / x_safe)
+    angle = x.lt(_F8(0.0)).select(y.lt(_F8(0.0)).select(angle - _F8(PI), angle + _F8(PI)), angle)
+    var y_zero_res = x.gt(_F8(0.0)).select(y, y_neg.select(_F8(-PI), _F8(PI)))
+    var res = y_zero.select(y_zero_res, angle)
+    var x0_y0 = x_neg.select(y_neg.select(_F8(-PI), _F8(PI)), y_neg.select(_neg_zero8(), _F8(0.0)))
+    var x0_res = y_zero.select(x0_y0, y.lt(_F8(0.0)).select(_F8(-HALF_PI), _F8(HALF_PI)))
+    res = x_zero.select(x0_res, res)
+    return (_is_nan8(x) | _is_nan8(y)).select(_qnan8(), res)
+
+
+@always_inline
+def _asin_core8(s: _F8, z: _F8) -> _F8:
+    return ((((_F8(4.2163199048e-2) * z + _F8(2.4181311049e-2)) * z + _F8(4.5470025998e-2)) * z + _F8(7.4953002686e-2)) * z + _F8(1.6666752422e-1)) * z * s + s
+
+
+@always_inline
+def det_asin(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var a = abs(x)
+    var in_dom = a.le(_F8(1.0))
+    var asafe = in_dom.select(a, _F8(0.0))
+    var gt_half = asafe.gt(_F8(0.5))
+    var z_hi = _F8(0.5) * (_F8(1.0) - asafe)
+    var s_hi = sqrt(z_hi)
+    var p = _asin_core8(gt_half.select(s_hi, asafe), gt_half.select(z_hi, asafe * asafe))
+    var res = gt_half.select(_F8(HALF_PI) - (p + p), p)
+    var signed = x.lt(_F8(0.0)).select(-res, res)
+    return in_dom.select(signed, _qnan8())
+
+
+@always_inline
+def det_acos(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var in_dom = abs(x).le(_F8(1.0))
+    var xs = in_dom.select(x, _F8(0.0))
+    var lt_nh = xs.lt(_F8(-0.5))
+    var gt_ph = xs.gt(_F8(0.5))
+    var arg = lt_nh.select(sqrt(_F8(0.5) * (_F8(1.0) + xs)), gt_ph.select(sqrt(_F8(0.5) * (_F8(1.0) - xs)), xs))
+    var s = det_asin(arg)
+    var res = lt_nh.select(_F8(PI) - _F8(2.0) * s, gt_ph.select(_F8(2.0) * s, _F8(HALF_PI) - s))
+    return in_dom.select(res, _qnan8())
+
+
+@always_inline
+def det_exp(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var is_nan_v = _is_nan8(x)
+    var ov = x.gt(_F8(88.72283905206835))
+    var un = x.lt(_F8(-103.97207708))
+    var in_rng = (~is_nan_v) & (~ov) & (~un)
+    var xr = in_rng.select(x, _F8(0.0))
+    var n = floor(_F8(LOG2E) * xr + _F8(0.5))
+    var r = (xr - n * _F8(LN2_HI)) - n * _F8(LN2_LO)
+    var z = r * r
+    var p = (((((_F8(1.9875691500e-4) * r + _F8(1.3981999507e-3)) * r + _F8(8.3334519073e-3)) * r + _F8(4.1665795894e-2)) * r + _F8(1.6666665459e-1)) * r + _F8(5.0000001201e-1)) * z + r + _F8(1.0)
+    var res = scale_by_pow2(p, n.cast[DType.int32]())
+    var non_nan = ov.select(_inf8(), un.select(_F8(0.0), res))
+    return _f8_from_bits(is_nan_v.select(_f8_bits(x), _f8_bits(non_nan)))
+
+
+@always_inline
+def det_log(x: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var bad = _is_nan8(x) | x.lt(_F8(0.0))
+    var is_zero = x.eq(_F8(0.0))
+    var is_pinf = (~bad) & (~is_zero) & (~_is_finite8(x))
+    var valid = (~bad) & (~is_zero) & (~is_pinf)
+    var xs = valid.select(x, _F8(1.0))
+    var bits = _f8_bits(xs)
+    var is_sub = (bits & _U8(0x7F800000)).eq(_U8(0))
+    bits = is_sub.select(_f8_bits(xs * _f8_from_bits(_U8(UInt32(152) << 23))), bits)
+    var e = is_sub.select(_I8(-25), _I8(0)) + ((bits >> _U8(23)) & _U8(0xFF)).cast[DType.int32]() - _I8(126)
+    var m = _f8_from_bits((bits & _U8(0x007FFFFF)) | _U8(0x3F000000))
+    var lt_sh = m.lt(_F8(SQRT_HALF))
+    e = lt_sh.select(e - _I8(1), e)
+    m = lt_sh.select(m + m - _F8(1.0), m - _F8(1.0))
+    var z = m * m
+    var y = ((((((((_F8(7.0376836292e-2) * m - _F8(1.1514610310e-1)) * m + _F8(1.1676998740e-1)) * m - _F8(1.2420140846e-1)) * m + _F8(1.4249322787e-1)) * m - _F8(1.6668057665e-1)) * m + _F8(2.0000714765e-1)) * m - _F8(2.4999993993e-1)) * m + _F8(3.3333331174e-1)) * m * z
+    var fe = e.cast[DType.float32]()
+    y = y + fe * _F8(LN2_LO)
+    y = y - _F8(0.5) * z
+    var res = (m + y) + fe * _F8(LN2_HI)
+    return bad.select(_qnan8(), is_zero.select(-_inf8(), is_pinf.select(x, res)))
+
+
+@always_inline
+def det_pow(x: SIMD[DType.float32, 8], y: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    var is_one = y.eq(_F8(0.0)) | x.eq(_F8(1.0))
+    var is_nan_xy = _is_nan8(x) | _is_nan8(y)
+    var x_zero = x.eq(_F8(0.0))
+    var x_neg = x.lt(_F8(0.0))
+    var mag = det_exp(y * det_log(abs(x)))
+    var neg_bad = floor(y).ne(y)
+    var half = y * _F8(0.5)
+    var neg_odd = floor(half).ne(half)
+    var neg_res = neg_bad.select(_qnan8(), neg_odd.select(-mag, mag))
+    var res = x_neg.select(neg_res, mag)
+    res = x_zero.select(y.gt(_F8(0.0)).select(_F8(0.0), _inf8()), res)
+    res = is_nan_xy.select(_qnan8(), res)
+    return is_one.select(_F8(1.0), res)
 
 
 # ---------------------------------------------------------------------------

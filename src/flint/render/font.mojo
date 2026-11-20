@@ -23,7 +23,17 @@ from std.collections import Dict
 from flint.platform.os import read_bytes, write_bytes
 from flint.text.utf8 import decode_utf8 as text_decode_utf8
 from flint.text.ttf import TrueTypeFont
-from flint.text.sdf_bake import bake_glyph, bake_font, dsf_bytes, ShelfPacker, invisible
+from flint.text.sdf_bake import (
+    bake_glyph,
+    bake_glyph_id,
+    bake_font,
+    dsf_bytes,
+    msdf_median,
+    ShelfPacker,
+    invisible,
+)
+from flint.text.bidi import BIDI_AUTO
+from flint.text.shaper import ShapedGlyph, FontFallbackChain, TextShaper
 
 comptime DSF_MAGIC: Int = 0x31465344
 comptime GLYPH_TABLE: Int = 0x2700  # codepoints below this are looked up directly
@@ -67,6 +77,7 @@ struct SdfFont(Copyable, Movable):
     var valid: Bool
     var atlas_width: Int
     var atlas_height: Int
+    var channels: Int
     var bake_px: Float32
     var spread: Float32
     var ascent: Float32
@@ -91,11 +102,18 @@ struct SdfFont(Copyable, Movable):
     var dirty_y0: Int
     var dirty_y1: Int
     var atlas_version: UInt64
+    # M4b F26: fallback fonts & glyph-ID cache for GSUB/shaped glyphs
+    var fallbacks: List[TrueTypeFont]
+    var fallback_scales: List[Float32]
+    var gid_extra: Dict[Int, Int]
+    var dynamic_gids: List[Int]
+    var baked_cp_map: Dict[Int, Int]
 
     def __init__(out self):
         self.valid = False
         self.atlas_width = 0
         self.atlas_height = 0
+        self.channels = 1
         self.bake_px = 48
         self.spread = 6
         self.ascent = 0
@@ -119,32 +137,81 @@ struct SdfFont(Copyable, Movable):
         self.dirty_y0 = 0
         self.dirty_y1 = 0
         self.atlas_version = 0
+        self.fallbacks = List[TrueTypeFont]()
+        self.fallback_scales = List[Float32]()
+        self.gid_extra = Dict[Int, Int]()
+        self.dynamic_gids = List[Int]()
+        self.baked_cp_map = Dict[Int, Int]()
 
     def load(mut self, path: String) -> Bool:
         return self.load_bytes(read_bytes(path))
 
     def load_bytes(mut self, data: List[UInt8]) -> Bool:
         self.valid = False
-        if len(data) < 44 or read_i32(data, 0) != DSF_MAGIC or read_i32(data, 4) != 1:
+        if len(data) < 44 or read_i32(data, 0) != DSF_MAGIC:
             return False
-        self.atlas_width = read_i32(data, 8)
-        self.atlas_height = read_i32(data, 12)
-        self.bake_px = Float32(read_i32(data, 16))
-        self.spread = Float32(read_i32(data, 20))
-        self.pad = self.spread + 1
-        self.ascent = Float32(read_i32(data, 24)) / 64.0
-        self.descent = Float32(read_i32(data, 28)) / 64.0
-        self.line_height = Float32(read_i32(data, 32)) / 64.0
+        var version = read_i32(data, 4)
+        if version != 1 and version != 2:
+            return False
+        var hdr_bytes = 48 if version == 2 else 44
+        if len(data) < hdr_bytes:
+            return False
+        var atlas_w = read_i32(data, 8)
+        var atlas_h = read_i32(data, 12)
+        var bake_px_i = read_i32(data, 16)
+        var spread_i = read_i32(data, 20)
+        var ascent_i = read_i32(data, 24)
+        var descent_i = read_i32(data, 28)
+        var line_height_i = read_i32(data, 32)
         var glyph_count = read_i32(data, 36)
         var kern_count = read_i32(data, 40)
-        var atlas_start = 44 + glyph_count * 32 + kern_count * 12
-        if glyph_count <= 0 or kern_count < 0 or self.atlas_width <= 0 or self.atlas_height <= 0:
+        var ch = read_i32(data, 44) if version == 2 else 1
+        if atlas_w <= 0 or atlas_h <= 0 or (ch != 1 and ch != 3 and ch != 4):
             return False
-        if len(data) != atlas_start + self.atlas_width * self.atlas_height:
+        if glyph_count <= 0 or kern_count < 0 or bake_px_i <= 0 or spread_i <= 0:
             return False
+        var bake_px_f = Float32(bake_px_i)
+        var spread_f = Float32(spread_i)
+        if not (bake_px_f > Float32(0.0)) or not (spread_f > Float32(0.0)):
+            return False
+
+        # Overflow-free bounds checks against `len(data)`
+        var rem = len(data) - hdr_bytes
+        if rem < 0:
+            return False
+        if glyph_count > rem // 32:
+            return False
+        rem -= glyph_count * 32
+        if kern_count > rem // 12:
+            return False
+        rem -= kern_count * 12
+        if atlas_w > rem // ch:
+            return False
+        var row_bytes = atlas_w * ch
+        if atlas_h > rem // row_bytes:
+            return False
+        if atlas_h * row_bytes != rem:
+            return False
+
+        self.atlas_width = atlas_w
+        self.atlas_height = atlas_h
+        self.bake_px = bake_px_f
+        self.spread = spread_f
+        self.pad = self.spread + 1
+        self.ascent = Float32(ascent_i) / 64.0
+        self.descent = Float32(descent_i) / 64.0
+        self.line_height = Float32(line_height_i) / 64.0
+        self.channels = ch
+        var atlas_start = hdr_bytes + glyph_count * 32 + kern_count * 12
+
         self.lookup = List[Int](length=GLYPH_TABLE, fill=-1)
         self.glyphs = List[Glyph]()
-        var offset = 44
+        self.extra = Dict[Int, Int]()
+        self.dynamic_codes = List[Int]()
+        self.gid_extra = Dict[Int, Int]()
+        self.dynamic_gids = List[Int]()
+        self.baked_cp_map = Dict[Int, Int]()
+        var offset = hdr_bytes
         for _ in range(glyph_count):
             var code = read_i32(data, offset)
             var glyph = Glyph()
@@ -155,10 +222,22 @@ struct SdfFont(Copyable, Movable):
             glyph.xoff = Float32(read_i32(data, offset + 20)) / 64.0
             glyph.yoff = Float32(read_i32(data, offset + 24)) / 64.0
             glyph.advance = Float32(read_i32(data, offset + 28)) / 64.0
-            if glyph.x < 0 or glyph.y < 0 or glyph.x + glyph.w > self.atlas_width or glyph.y + glyph.h > self.atlas_height:
+            if (
+                glyph.x < 0
+                or glyph.y < 0
+                or glyph.w < 0
+                or glyph.h < 0
+                or glyph.x + glyph.w > self.atlas_width
+                or glyph.y + glyph.h > self.atlas_height
+            ):
                 return False
+            var g_idx = len(self.glyphs)
             if code >= 0 and code < GLYPH_TABLE:
-                self.lookup[code] = len(self.glyphs)
+                self.lookup[code] = g_idx
+                self.baked_cp_map[code] = g_idx + 1
+            elif code >= GLYPH_TABLE:
+                self.extra[code] = g_idx
+                self.baked_cp_map[code] = g_idx + 1
             self.glyphs.append(glyph)
             offset += 32
         self.kerning = Dict[Int, Float32]()
@@ -166,8 +245,9 @@ struct SdfFont(Copyable, Movable):
             var key = read_i32(data, offset) * 65536 + read_i32(data, offset + 4)
             self.kerning[key] = Float32(read_i32(data, offset + 8)) / 64.0
             offset += 12
-        self.atlas = List[UInt8](length=self.atlas_width * self.atlas_height, fill=0)
-        for index in range(len(self.atlas)):
+        var atlas_bytes = self.atlas_width * self.atlas_height * self.channels
+        self.atlas = List[UInt8](length=atlas_bytes, fill=0)
+        for index in range(atlas_bytes):
             self.atlas[index] = data[atlas_start + index]
         # Cap height from 'H': the top of its ink is the cell top plus the padding.
         var h_index = self.glyph_index(72)
@@ -175,6 +255,8 @@ struct SdfFont(Copyable, Movable):
             self.cap_height = -(self.glyphs[h_index].yoff + self.pad)
         else:
             self.cap_height = self.ascent * 0.7
+        self.baked_count = len(self.glyphs)
+        self.baked_height = 0
         self.dirty_y0 = 0
         self.dirty_y1 = self.atlas_height
         self.atlas_version = 1
@@ -188,10 +270,11 @@ struct SdfFont(Copyable, Movable):
         spread: Int = 6,
         weight: Float32 = 0,
         cache_dsf: String = "",
+        channels: Int = 1,
     ) -> Bool:
-        """Load a TrueType (.ttf) font directly, baking an anti-aliased SDF atlas
-        for ASCII 32..126 (with optional .dsf cache) and attaching the outline source
-        for on-demand Unicode glyphs."""
+        """Load a TrueType/OpenType (.ttf/.otf) font directly, baking an SDF/MSDF/MTSDF
+        atlas for ASCII 32..126 (with optional .dsf cache) and attaching the outline
+        source for on-demand Unicode glyphs."""
         if cache_dsf.byte_length() > 0 and self.load(cache_dsf):
             _ = self.attach_source(path, weight)
             return True
@@ -204,7 +287,7 @@ struct SdfFont(Copyable, Movable):
         for c in range(32, 127):
             codes.append(c)
         try:
-            var baked = bake_font(font, codes, bake_px, spread, 512)
+            var baked = bake_font(font, codes, bake_px, spread, 512, channels)
             var bytes = dsf_bytes(baked)
             if cache_dsf.byte_length() > 0:
                 _ = write_bytes(cache_dsf, bytes)
@@ -214,15 +297,52 @@ struct SdfFont(Copyable, Movable):
             return False
         self.source = font^
         self.has_source = True
+        self._ensure_dynamic_page()
+        return True
+
+    def load_otf(
+        mut self,
+        path: String,
+        bake_px: Int = 44,
+        spread: Int = 6,
+        weight: Float32 = 0,
+        cache_dsf: String = "",
+        channels: Int = 1,
+    ) -> Bool:
+        return self.load_ttf(path, bake_px, spread, weight, cache_dsf, channels)
+
+    def load_msdf(
+        mut self,
+        path: String,
+        bake_px: Int = 44,
+        spread: Int = 6,
+        weight: Float32 = 0,
+        cache_dsf: String = "",
+    ) -> Bool:
+        return self.load_ttf(path, bake_px, spread, weight, cache_dsf, 3)
+
+    def load_mtsdf(
+        mut self,
+        path: String,
+        bake_px: Int = 44,
+        spread: Int = 6,
+        weight: Float32 = 0,
+        cache_dsf: String = "",
+    ) -> Bool:
+        return self.load_ttf(path, bake_px, spread, weight, cache_dsf, 4)
+
+    def _ensure_dynamic_page(mut self):
+        if not self.valid or self.baked_height > 0 or self.atlas_width <= 0:
+            return
+        var ch = max(1, self.channels)
         self.baked_count = len(self.glyphs)
         self.baked_height = self.atlas_height
         self.atlas_height += DYNAMIC_ROWS
-        self.atlas.resize(self.atlas_width * self.atlas_height, 0)
+        self.atlas.resize(self.atlas_width * self.atlas_height * ch, 0)
         self.packer = ShelfPacker(self.atlas_width, self.atlas_height, self.baked_height + 1)
         self.dirty_y0 = 0
         self.dirty_y1 = self.atlas_height
         self.atlas_version += 1
-        return True
 
     def glyph_index(self, code: Int) -> Int:
         if code >= 0 and code < GLYPH_TABLE:
@@ -238,17 +358,96 @@ struct SdfFont(Copyable, Movable):
             index = self.glyph_index(FALLBACK_CODEPOINT)
         return index
 
+    def resolve_codepoint(self, code: Int) -> Tuple[Int, Int]:
+        if code < 0:
+            return (0, 0)
+        if self.has_source and self.source.valid:
+            var gid = self.source.glyph_id(code)
+            if gid != 0:
+                return (0, gid)
+        elif self.valid:
+            var idx = self.glyph_index(code)
+            if idx >= 0 and idx < self.baked_count:
+                return (0, idx + 1)
+        for i in range(len(self.fallbacks)):
+            if self.fallbacks[i].valid:
+                var gid = self.fallbacks[i].glyph_id(code)
+                if gid != 0:
+                    return (i + 1, gid)
+        return (0, 0)
+
+    def add_fallback_font(mut self, var font: TrueTypeFont, match_ascent: Bool = False) -> Bool:
+        if not font.valid:
+            return False
+        var mscale: Float32 = 1.0
+        if match_ascent:
+            var p_asc: Float32 = 0.0
+            if self.has_source and self.source.valid:
+                p_asc = Float32(max(1, self.source.ascender)) / Float32(max(1, self.source.units_per_em))
+            elif self.valid and self.bake_px > Float32(0.0):
+                p_asc = self.ascent / self.bake_px
+            if p_asc > Float32(0.0):
+                var f_asc = Float32(max(1, font.ascender)) / Float32(max(1, font.units_per_em))
+                if f_asc > Float32(1.0e-5):
+                    mscale = p_asc / f_asc
+        self.fallbacks.append(font^)
+        self.fallback_scales.append(mscale)
+        if self.valid:
+            self._ensure_dynamic_page()
+        return True
+
+    def add_fallback_bytes(mut self, var data: List[UInt8], weight: Float32 = 0, match_ascent: Bool = False) -> Bool:
+        var font = TrueTypeFont()
+        if not font.load_bytes(data^):
+            return False
+        if weight > 0:
+            _ = font.set_variation("wght", weight)
+        return self.add_fallback_font(font^, match_ascent)
+
+    def add_fallback(mut self, path: String, weight: Float32 = 0, match_ascent: Bool = False) -> Bool:
+        return self.add_fallback_bytes(read_bytes(path), weight, match_ascent)
+
+    def clear_fallbacks(mut self):
+        self.fallbacks.clear()
+        self.fallback_scales.clear()
+        if self.valid and self.baked_height > 0:
+            self.flush()
+
+    def fallback_chain(self) -> FontFallbackChain:
+        var chain = FontFallbackChain()
+        if self.has_source:
+            chain.set_primary(self.source.copy())
+        else:
+            chain.set_primary(TrueTypeFont())
+            if self.valid:
+                var advs = List[Float32](capacity=self.baked_count)
+                for i in range(self.baked_count):
+                    advs.append(self.glyphs[i].advance)
+                chain.set_baked_primary(
+                    self.bake_px,
+                    self.baked_cp_map.copy(),
+                    advs^,
+                    self.kerning.copy(),
+                )
+        for i in range(len(self.fallbacks)):
+            chain.add_fallback_scaled(self.fallbacks[i].copy(), self.fallback_scales[i])
+        return chain^
+
     def kern(self, left: Int, right: Int) -> Float32:
         var key = left * 65536 + right
         var found = self.kerning.get(key)
         if found:
             return found.value()
-        if self.has_source and (self.is_dynamic(left) or self.is_dynamic(right)):
-            # A pair with a dynamic glyph: ask the font itself.
-            var a = self.source.glyph_id(left)
-            var b = self.source.glyph_id(right)
-            if a != 0 and b != 0:
-                return self.source.kerning(a, b) * self.bake_px / Float32(self.source.units_per_em)
+        if (self.has_source or len(self.fallbacks) > 0) and (self.is_dynamic(left) or self.is_dynamic(right)):
+            var ra = self.resolve_codepoint(left)
+            var rb = self.resolve_codepoint(right)
+            if ra[1] != 0 and rb[1] != 0 and ra[0] == rb[0]:
+                var fi = ra[0]
+                if fi == 0 and self.has_source:
+                    return self.source.kerning(ra[1], rb[1]) * self.bake_px / Float32(max(1, self.source.units_per_em))
+                if fi > 0 and fi - 1 < len(self.fallbacks):
+                    var fb_idx = fi - 1
+                    return self.fallbacks[fb_idx].kerning(ra[1], rb[1]) * self.bake_px * self.fallback_scales[fb_idx] / Float32(max(1, self.fallbacks[fb_idx].units_per_em))
         return 0
 
     def is_dynamic(self, code: Int) -> Bool:
@@ -256,17 +455,21 @@ struct SdfFont(Copyable, Movable):
         return index < 0 or index >= self.baked_count
 
     def advance_of(self, code: Int) -> Float32:
-        """Advance in bake px: the baked glyph's, else the source's (a glyph
-        not baked yet), else the fallback's."""
+        """Advance in bake px: the baked glyph's, else the source/fallback's,
+        else the '?' fallback."""
         var index = self.glyph_index(code)
         if index >= 0:
             return self.glyphs[index].advance
-        if self.has_source:
+        if self.has_source or len(self.fallbacks) > 0:
             if invisible(code):
                 return 0
-            var id = self.source.glyph_id(code)
-            if id != 0:
-                return self.source.advance(id) * self.bake_px / Float32(self.source.units_per_em)
+            var res = self.resolve_codepoint(code)
+            if res[1] != 0:
+                if res[0] == 0 and self.has_source:
+                    return self.source.advance(res[1]) * self.bake_px / Float32(max(1, self.source.units_per_em))
+                if res[0] > 0 and res[0] - 1 < len(self.fallbacks):
+                    var fb_idx = res[0] - 1
+                    return self.fallbacks[fb_idx].advance(res[1]) * self.bake_px * self.fallback_scales[fb_idx] / Float32(max(1, self.fallbacks[fb_idx].units_per_em))
         var fallback = self.glyph_index(FALLBACK_CODEPOINT)
         return self.glyphs[fallback].advance if fallback >= 0 else Float32(0)
 
@@ -298,25 +501,46 @@ struct SdfFont(Copyable, Movable):
             _ = font.set_variation("wght", weight)
         self.source = font^
         self.has_source = True
-        self.baked_count = len(self.glyphs)
-        self.baked_height = self.atlas_height
-        self.atlas_height += DYNAMIC_ROWS
-        self.atlas.resize(self.atlas_width * self.atlas_height, 0)
-        self.packer = ShelfPacker(self.atlas_width, self.atlas_height, self.baked_height + 1)
-        self.dirty_y0 = 0
-        self.dirty_y1 = self.atlas_height
-        self.atlas_version += 1
+        self._ensure_dynamic_page()
         return True
 
-    def ensure(mut self, code: Int) -> Bool:
-        """Make `code` drawable: True if it is (or is now) in the atlas."""
-        if self.glyph_index(code) >= 0:
-            return True
-        if not self.has_source or code < 0:
-            return False
-        if not invisible(code) and not self.source.has_glyph(code):
-            return False
-        var baked = bake_glyph(self.source, code, Int(self.bake_px), Int(self.spread))
+    def ensure_glyph_id(mut self, glyph_id: Int, font_index: Int = 0, code: Int = 0) -> Int:
+        """Bake and cache a specific `(font_index, glyph_id)` (including GSUB
+        ligatures/contextual forms and fallback font glyphs) into the dynamic page."""
+        if glyph_id < 0 or not self.valid:
+            return -1
+        var gid_key = (font_index << 20) | (glyph_id & 0xFFFFF)
+        var cached = self.gid_extra.get(gid_key)
+        if cached:
+            return cached.value()
+        if code > 0:
+            var existing_cp = self.glyph_index(code)
+            if existing_cp >= 0:
+                var rc = self.resolve_codepoint(code)
+                if rc[0] == font_index and rc[1] == glyph_id:
+                    self.gid_extra[gid_key] = existing_cp
+                    return existing_cp
+        if font_index == 0 and not self.has_source:
+            if code > 0:
+                var existing = self.glyph_index(code)
+                if existing >= 0 and existing < self.baked_count:
+                    return existing
+            if glyph_id > 0 and glyph_id - 1 < self.baked_count:
+                return glyph_id - 1
+            return self.glyph_for(code) if code > 0 else -1
+        var mscale: Float32 = 1.0
+        var has_font = False
+        if font_index == 0 and self.has_source and self.source.valid:
+            has_font = True
+        elif font_index > 0 and font_index - 1 < len(self.fallbacks) and self.fallbacks[font_index - 1].valid:
+            has_font = True
+            mscale = self.fallback_scales[font_index - 1]
+        if not has_font:
+            return -1
+
+        self._ensure_dynamic_page()
+        var ch = max(1, self.channels)
+        var baked = bake_glyph_id(self.source, glyph_id, Int(self.bake_px), Int(self.spread), code, mscale, ch) if font_index == 0 else bake_glyph_id(self.fallbacks[font_index - 1], glyph_id, Int(self.bake_px), Int(self.spread), code, mscale, ch)
         var spot = (0, 0)
         if baked.w > 0:
             spot = self.packer.place(baked.w, baked.h)
@@ -324,10 +548,14 @@ struct SdfFont(Copyable, Movable):
                 self.flush()
                 spot = self.packer.place(baked.w, baked.h)
                 if spot[0] < 0:
-                    return False
+                    return -1
+            var g_ch = max(1, baked.channels)
             for j in range(baked.h):
                 for i in range(baked.w):
-                    self.atlas[(spot[1] + j) * self.atlas_width + spot[0] + i] = baked.pixels[j * baked.w + i]
+                    var dst_base = ((spot[1] + j) * self.atlas_width + spot[0] + i) * ch
+                    var src_base = (j * baked.w + i) * g_ch
+                    for c in range(ch):
+                        self.atlas[dst_base + c] = baked.pixels[src_base + min(c, g_ch - 1)]
         var glyph = Glyph()
         glyph.x = spot[0]
         glyph.y = spot[1]
@@ -337,25 +565,91 @@ struct SdfFont(Copyable, Movable):
         glyph.yoff = baked.yoff
         glyph.advance = baked.advance
         self.glyphs.append(glyph)
-        if code < GLYPH_TABLE:
-            self.lookup[code] = len(self.glyphs) - 1
-        else:
-            self.extra[code] = len(self.glyphs) - 1
-        self.dynamic_codes.append(code)
+        var g_idx = len(self.glyphs) - 1
+        self.gid_extra[gid_key] = g_idx
+        self.dynamic_gids.append(gid_key)
+        if code > 0 and self.glyph_index(code) < 0:
+            var rc = self.resolve_codepoint(code)
+            if rc[0] == font_index and rc[1] == glyph_id:
+                if code < GLYPH_TABLE:
+                    self.lookup[code] = g_idx
+                else:
+                    self.extra[code] = g_idx
+                self.dynamic_codes.append(code)
         self.dynamic_baked += 1
         if spot[0] >= 0 and baked.w > 0:
             self.dirty_y0 = min(self.dirty_y0, spot[1])
             self.dirty_y1 = max(self.dirty_y1, spot[1] + baked.h)
             self.atlas_version += 1
-        return True
+        return g_idx
+
+    def ensure(mut self, code: Int) -> Bool:
+        """Make `code` drawable: True if it is (or is now) in the atlas."""
+        if self.glyph_index(code) >= 0:
+            return True
+        if code < 0 or not self.valid:
+            return False
+        if not self.has_source and len(self.fallbacks) == 0:
+            return False
+        if invisible(code):
+            var fi = 0 if (self.has_source and self.source.valid) else 1
+            return self.ensure_glyph_id(0, fi, code) >= 0
+        var res = self.resolve_codepoint(code)
+        if res[1] == 0:
+            return False
+        return self.ensure_glyph_id(res[1], res[0], code) >= 0
 
     def ensure_text(mut self, text: String):
-        if not self.has_source:
+        if not self.has_source and len(self.fallbacks) == 0:
             return
         for code in decode_utf8(text):
             if code >= 0 and code < GLYPH_TABLE and self.lookup[code] >= 0:
                 continue
             _ = self.ensure(code)
+
+    def shape_text(
+        self,
+        text: String,
+        px: Float32,
+        base_dir: Int = BIDI_AUTO,
+        alt_choice: Int = 0,
+    ) -> List[ShapedGlyph]:
+        if not self.valid and not self.has_source and len(self.fallbacks) == 0:
+            return List[ShapedGlyph]()
+        var shaper = TextShaper(self.fallback_chain(), "", alt_choice)
+        return shaper.shape_text(text, px, base_dir)
+
+    def shape_and_ensure(
+        mut self,
+        text: String,
+        px: Float32,
+        base_dir: Int = BIDI_AUTO,
+        alt_choice: Int = 0,
+    ) -> List[Tuple[ShapedGlyph, Int]]:
+        var out = List[Tuple[ShapedGlyph, Int]]()
+        var shaped = self.shape_text(text, px, base_dir, alt_choice)
+        for sg in shaped:
+            var idx = self.ensure_glyph_id(sg.glyph_id, sg.font_index, sg.codepoint)
+            if idx < 0:
+                idx = self.glyph_for(sg.codepoint)
+            out.append((sg, idx))
+        return out^
+
+    def measure_shaped(
+        self,
+        text: String,
+        px: Float32,
+        base_dir: Int = BIDI_AUTO,
+    ) -> Float32:
+        if not self.valid:
+            return 0.0
+        if not self.has_source and len(self.fallbacks) == 0:
+            return self.measure(text, px)
+        var shaped = self.shape_text(text, px, base_dir)
+        var total: Float32 = 0.0
+        for sg in shaped:
+            total += sg.x_advance
+        return total
 
     def flush(mut self):
         """Empty the dynamic page: forget its glyphs and clear its rows."""
@@ -365,8 +659,12 @@ struct SdfFont(Copyable, Movable):
             else:
                 _ = self.extra.pop(code, -1)
         self.dynamic_codes.clear()
+        for gid_key in self.dynamic_gids:
+            _ = self.gid_extra.pop(gid_key, -1)
+        self.dynamic_gids.clear()
         self.glyphs.resize(self.baked_count, Glyph())
-        for index in range(self.baked_height * self.atlas_width, len(self.atlas)):
+        var ch = max(1, self.channels)
+        for index in range(self.baked_height * self.atlas_width * ch, len(self.atlas)):
             self.atlas[index] = 0
         self.packer.reset()
         self.flushes += 1
@@ -397,10 +695,44 @@ struct SdfFont(Copyable, Movable):
         var bottom = c + (d - c) * tx
         return top + (bottom - top) * ty
 
-    def texel(self, x: Int, y: Int) -> Float32:
+    def sample_channel(self, x: Float32, y: Float32, channel: Int) -> Float32:
+        var fx = x - 0.5
+        var fy = y - 0.5
+        var x0 = Int(fx) if fx >= 0 else Int(fx) - 1
+        var y0 = Int(fy) if fy >= 0 else Int(fy) - 1
+        var tx = fx - Float32(x0)
+        var ty = fy - Float32(y0)
+        var a = self.texel(x0, y0, channel)
+        var b = self.texel(x0 + 1, y0, channel)
+        var c = self.texel(x0, y0 + 1, channel)
+        var d = self.texel(x0 + 1, y0 + 1, channel)
+        var top = a + (b - a) * tx
+        var bottom = c + (d - c) * tx
+        return top + (bottom - top) * ty
+
+    def sample_msdf(self, x: Float32, y: Float32) -> Float32:
+        """Bilinear RGB sample followed by Chlumsky median(r, g, b)."""
+        if self.channels < 3:
+            return self.sample(x, y)
+        var r = self.sample_channel(x, y, 0)
+        var g = self.sample_channel(x, y, 1)
+        var b = self.sample_channel(x, y, 2)
+        return msdf_median(r, g, b)
+
+    def sample_true_distance(self, x: Float32, y: Float32) -> Float32:
+        """Bilinear true signed distance (alpha channel on MTSDF, else MSDF/SDF)."""
+        if self.channels >= 4:
+            return self.sample_channel(x, y, 3)
+        if self.channels == 3:
+            return self.sample_msdf(x, y)
+        return self.sample(x, y)
+
+    def texel(self, x: Int, y: Int, channel: Int = 0) -> Float32:
         if x < 0 or y < 0 or x >= self.atlas_width or y >= self.atlas_height:
             return 0
-        return Float32(self.atlas[y * self.atlas_width + x])
+        var ch = max(1, self.channels)
+        var c = max(0, min(ch - 1, channel))
+        return Float32(self.atlas[(y * self.atlas_width + x) * ch + c])
 
 
 # Original 5x7 bitmap glyphs, packed in five-bit rows from top to bottom.

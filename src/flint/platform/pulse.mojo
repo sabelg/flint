@@ -324,6 +324,27 @@ struct PulseClient(Movable):
         self.underflows = 0
         self.error = ""
 
+    def __moveinit__(out self, deinit existing: Self):
+        self.fd = existing.fd
+        self.channel = existing.channel
+        self.requested_bytes = existing.requested_bytes
+        self.next_tag = existing.next_tag
+        self.incoming = existing.incoming^
+        self.incoming_head = existing.incoming_head
+        self.recv_buf = existing.recv_buf^
+        self.frame_payload = existing.frame_payload^
+        self.pending_out = existing.pending_out^
+        self.pending_out_head = existing.pending_out_head
+        self.poll_fd_buf = existing.poll_fd_buf^
+        self.underflows = existing.underflows
+        self.error = existing.error^
+        existing.fd = -1
+        existing.channel = 0
+        existing.requested_bytes = 0
+
+    def __deinit__(deinit self):
+        self.close()
+
     def fail(mut self, message: String) -> Bool:
         self.error = message
         self.close()

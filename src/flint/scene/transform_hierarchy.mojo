@@ -35,6 +35,7 @@ from flint.app.engine_app import (
     EngineApp,
     Resource,
     Resources,
+    WorldTickSyncResource,
     STAGE_FIXED_UPDATE,
     STAGE_POST_UPDATE,
 )
@@ -387,9 +388,15 @@ def _children_bin_read(comp_addr: Int, reader_addr: Int) -> Bool:
     var n = r.integer()
     if n < 0 or r.failed:
         return False
+    var rem = r.limit() - r.offset
+    if rem < 0 or n > rem // 8:
+        return False
     var built = Children()
     for _ in range(n):
-        built.push_unique(Entity.from_bits(r.u64()))
+        var bits = r.u64()
+        if r.failed:
+            return False
+        built.push_unique(Entity.from_bits(bits))
     if r.failed:
         return False
     var dst = Pointer[Children, MutAnyOrigin](unsafe_from_address=comp_addr)
@@ -541,6 +548,7 @@ struct TransformPropagationCache(Resource):
     var buckets: List[List[_PropNodeItem]]
     var dirty_flags: List[UInt8]
     var last_propagated_tick: UInt32
+    var last_restore_epoch: UInt64
     var last_propagated_count: Int
     var last_skipped_count: Int
 
@@ -548,6 +556,7 @@ struct TransformPropagationCache(Resource):
         self.buckets = List[List[_PropNodeItem]]()
         self.dirty_flags = List[UInt8]()
         self.last_propagated_tick = 0
+        self.last_restore_epoch = 0
         self.last_propagated_count = 0
         self.last_skipped_count = 0
 
@@ -650,7 +659,12 @@ def propagate_transforms_parallel_cached(
         _ = external_call["memset", Int](Int(cache.dirty_flags.unsafe_ptr()), Int32(0), ent_cap)
 
     var last_tick = cache.last_propagated_tick
-    var force_all = (last_tick == 0) or copy_to_prev
+    var force_all = (
+        (last_tick == 0)
+        or (world.current_tick <= last_tick)
+        or (world.restore_epoch != cache.last_restore_epoch)
+        or copy_to_prev
+    )
     var skipped = 0
     var propagated = 0
     var with_lt_gt = BitSet256().with_bit(tid_local).with_bit(tid_global)
@@ -790,6 +804,7 @@ def propagate_transforms_parallel_cached(
                         world.archetypes[a].chunks[ch].mark_changed(col_gt, r, world.current_tick)
 
     cache.last_propagated_tick = world.current_tick
+    cache.last_restore_epoch = world.restore_epoch
     cache.last_propagated_count = propagated
     cache.last_skipped_count = skipped
 
@@ -870,6 +885,14 @@ def _sys_propagate_transforms(
 ):
     var cache_opt = res_ptr[unsafe_offset=0].get_ptr_mut[TransformPropagationCache]()
     if cache_opt:
+        var sync_opt = res_ptr[unsafe_offset=0].get_ptr[WorldTickSyncResource]()
+        if sync_opt:
+            ref sync = sync_opt.value()[unsafe_offset=0]
+            if (
+                sync.has_observed
+                and sync.min_tick_since_post_update <= cache_opt.value()[unsafe_offset=0].last_propagated_tick
+            ):
+                cache_opt.value()[unsafe_offset=0].invalidate()
         propagate_transforms_parallel_cached(
             world_ptr[unsafe_offset=0],
             pool_ptr[unsafe_offset=0],
@@ -890,6 +913,14 @@ def _sys_propagate_transforms(
         )
 
 
+def _has_transform_system(app: EngineApp, stage: Int, name: StaticString) -> Bool:
+    ref sys = app.schedule.stages[stage].systems
+    for i in range(len(sys)):
+        if sys[i].name == name:
+            return True
+    return False
+
+
 struct TransformPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
     """Registers transform hierarchy components and parallel propagation systems in `EngineApp`."""
     var snapshot_prev_in_fixed: Bool
@@ -907,7 +938,9 @@ struct TransformPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
         var b_par = app.world.bit_for[Parent]()
         var b_dep = app.world.bit_for[HierarchyDepth]()
 
-        if self.snapshot_prev_in_fixed:
+        if self.snapshot_prev_in_fixed and not _has_transform_system(
+            app, STAGE_FIXED_UPDATE, "flint.scene.snapshot_prev_transforms"
+        ):
             _ = app.add_system(
                 STAGE_FIXED_UPDATE,
                 "flint.scene.snapshot_prev_transforms",
@@ -919,11 +952,30 @@ struct TransformPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
 
         # Non-exclusive parallel propagation: defers missing GlobalTransform insertion via
         # ParallelCommands so unrelated STAGE_POST_UPDATE systems can run concurrently.
-        _ = app.add_system(
-            STAGE_POST_UPDATE,
-            "flint.scene.propagate_transforms",
-            _sys_propagate_transforms,
-            reads=b_loc.union(b_par).union(b_dep),
-            writes=b_gt,
-            exclusive=False,
-        )
+        if not _has_transform_system(app, STAGE_POST_UPDATE, "flint.scene.propagate_transforms"):
+            var prop_id = app.add_system(
+                STAGE_POST_UPDATE,
+                "flint.scene.propagate_transforms",
+                _sys_propagate_transforms,
+                reads=b_loc.union(b_par).union(b_dep),
+                writes=b_gt,
+                exclusive=False,
+            )
+            # Ensure `flint.scene.propagate_transforms` precedes `flint.net.replicate` in
+            # `STAGE_POST_UPDATE` even if `NetPlugin` was registered before `TransformPlugin`.
+            ref st_post = app.schedule.stages[STAGE_POST_UPDATE]
+            var found_net_idx = -1
+            for i in range(len(st_post.systems) - 1):
+                if st_post.systems[i].name == "flint.net.replicate":
+                    found_net_idx = i
+                    break
+            if found_net_idx >= 0:
+                var last_idx = len(st_post.systems) - 1
+                var prop_desc = st_post.systems[last_idx].copy()
+                var k = last_idx
+                while k > found_net_idx:
+                    st_post.systems[k] = st_post.systems[k - 1].copy()
+                    k -= 1
+                st_post.systems[found_net_idx] = prop_desc^
+                st_post.systems[found_net_idx + 1].explicit_after.append(prop_id)
+                st_post.dirty = True

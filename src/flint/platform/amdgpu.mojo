@@ -5,6 +5,7 @@ go straight to the render node through ioctl. Vulkan, Mesa, and libdrm are not
 used. Struct sizes and ioctl numbers match the kernel's amdgpu_drm.h.
 """
 from std.ffi import external_call
+from std.sys.info import size_of
 from std.time import monotonic
 from flint.platform.amd_isa import ISA_GFX12, ISA_GFX103
 from flint.platform.os import close_fd, env_value, last_errno, read_stream
@@ -98,7 +99,60 @@ def gpu_ioctl(fd: Int, request: UInt64, mut args: List[UInt64]) -> Int:
     return Int(external_call["ioctl", Int32](Int32(fd), request, args.unsafe_ptr()))
 
 
-struct GpuBuffer(Copyable, Movable):
+comptime ReleaseVkBufferFn = def(Int, Int, Int, Int, Int, UInt32, Bool) thin abi("C") -> Int32
+
+
+struct _AmdDeviceControlBlock:
+    var ref_count: Int
+    var gpu_ref_count: Int
+    var fd: Int
+    var alive: Bool
+
+
+struct _GpuBufferControl:
+    var ref_count: Int
+    var destroyed: Bool
+    var backend_kind: Int  # 0 = non-owning/empty, 1 = vulkan, 2 = amdgpu
+    var ctrl_ptr: Int
+    var release_fn: Int
+    var vk_buffer: Int
+    var vk_memory: Int
+    var vk_memory_offset: Int
+    var vk_suballoc_block: Int
+    var vk_suballoc_meta: UInt32
+    var amd_handle: UInt32
+    var amd_gpu_address: UInt64
+    var amd_cpu_address: Int
+    var amd_size: Int
+
+
+@always_inline
+def _amd_ctrl_ptr(addr: Int) -> Pointer[_AmdDeviceControlBlock, MutAnyOrigin]:
+    return Pointer[_AmdDeviceControlBlock, MutAnyOrigin](unsafe_from_address=addr)
+
+
+@always_inline
+def _buf_ctrl_ptr(addr: Int) -> Pointer[_GpuBufferControl, MutAnyOrigin]:
+    return Pointer[_GpuBufferControl, MutAnyOrigin](unsafe_from_address=addr)
+
+
+def _amd_release_buffer_handles(fd: Int, handle: UInt32, gpu_address: UInt64, cpu_address: Int, size: Int):
+    if size <= 0 or fd < 0:
+        return
+    if cpu_address != 0:
+        _ = external_call["munmap", Int32](cpu_address, size)
+    var va = List[UInt64](length=8, fill=0)
+    va[0] = UInt64(handle)
+    va[1] = UInt64(VA_OP_UNMAP)
+    va[2] = gpu_address
+    va[4] = UInt64(size)
+    _ = gpu_ioctl(fd, IOCTL_GEM_VA, va)
+    var close_args = List[UInt64](length=1, fill=0)
+    close_args[0] = UInt64(handle)
+    _ = gpu_ioctl(fd, IOCTL_GEM_CLOSE, close_args)
+
+
+struct GpuBuffer(Movable):
     var handle: UInt32
     var size: Int
     var gpu_address: UInt64
@@ -110,6 +164,7 @@ struct GpuBuffer(Copyable, Movable):
     var vk_suballoc_meta: UInt32
     var tag: Int  # the memory tag it is charged to (core/memory.mojo), -1 when not charged
     var vram: Bool
+    var state_ptr: Int
 
     def __init__(out self, handle: UInt32 = 0, size: Int = 0, gpu_address: UInt64 = 0, cpu_address: Int = 0):
         self.handle = handle
@@ -123,6 +178,63 @@ struct GpuBuffer(Copyable, Movable):
         self.vk_suballoc_meta = 0xFFFFFFFF
         self.tag = -1
         self.vram = False
+        self.state_ptr = 0
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.handle = existing.handle
+        self.size = existing.size
+        self.gpu_address = existing.gpu_address
+        self.cpu_address = existing.cpu_address
+        self.vk_buffer = existing.vk_buffer
+        self.vk_memory = existing.vk_memory
+        self.vk_memory_offset = existing.vk_memory_offset
+        self.vk_suballoc_block = existing.vk_suballoc_block
+        self.vk_suballoc_meta = existing.vk_suballoc_meta
+        self.tag = existing.tag
+        self.vram = existing.vram
+        self.state_ptr = existing.state_ptr
+        existing.handle = 0
+        existing.size = 0
+        existing.gpu_address = 0
+        existing.cpu_address = 0
+        existing.vk_buffer = 0
+        existing.vk_memory = 0
+        existing.vk_memory_offset = 0
+        existing.vk_suballoc_block = -1
+        existing.vk_suballoc_meta = 0xFFFFFFFF
+        existing.tag = -1
+        existing.vram = False
+        existing.state_ptr = 0
+
+    def __deinit__(deinit self):
+        if self.state_ptr == 0:
+            return
+        ref st = _buf_ctrl_ptr(self.state_ptr)[unsafe_offset=0]
+        st.ref_count -= 1
+        if st.ref_count > 0:
+            return
+        if st.backend_kind == 1 and st.release_fn != 0 and st.ctrl_ptr != 0:
+            var fn_slot = st.release_fn
+            var cb = Pointer(to=fn_slot).unsafe_bitcast[ReleaseVkBufferFn]()[unsafe_offset=0]
+            _ = cb(
+                st.ctrl_ptr,
+                st.vk_buffer,
+                st.vk_memory,
+                st.vk_memory_offset,
+                st.vk_suballoc_block,
+                st.vk_suballoc_meta,
+                st.destroyed,
+            )
+        elif st.backend_kind == 2 and st.ctrl_ptr != 0:
+            ref actrl = _amd_ctrl_ptr(st.ctrl_ptr)[unsafe_offset=0]
+            if not st.destroyed and actrl.alive:
+                _amd_release_buffer_handles(
+                    actrl.fd, st.amd_handle, st.amd_gpu_address, st.amd_cpu_address, st.amd_size
+                )
+            actrl.ref_count -= 1
+            if actrl.ref_count <= 0:
+                external_call["free", NoneType](st.ctrl_ptr)
+        external_call["free", NoneType](self.state_ptr)
 
     def read32(self, index: Int) -> UInt32:
         return Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=self.cpu_address + index * 4)[unsafe_offset=0]
@@ -132,7 +244,7 @@ struct GpuBuffer(Copyable, Movable):
         pointer[unsafe_offset=0] = value
 
 
-struct AmdGpu(Copyable, Movable):
+struct AmdGpu(Movable):
     var fd: Int
     var context: UInt32
     var device_id: UInt32
@@ -150,6 +262,7 @@ struct AmdGpu(Copyable, Movable):
     var timed_out: Bool  # the last failed wait ran out of time; the GPU may be hung
     var lost: Bool  # a submission was refused because a reset made the context unusable
     var minor: Int
+    var ctrl_ptr: Int
 
     def __init__(out self):
         self.fd = -1
@@ -169,6 +282,40 @@ struct AmdGpu(Copyable, Movable):
         self.timed_out = False
         self.lost = False
         self.minor = -1
+        self.ctrl_ptr = 0
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.fd = existing.fd
+        self.context = existing.context
+        self.device_id = existing.device_id
+        self.family = existing.family
+        self.shader_engines = existing.shader_engines
+        self.clock_khz = existing.clock_khz
+        self.active_compute_units = existing.active_compute_units
+        self.va_start = existing.va_start
+        self.va_end = existing.va_end
+        self.next_va = existing.next_va
+        self.ib_start_alignment = existing.ib_start_alignment
+        self.ib_size_alignment = existing.ib_size_alignment
+        self.compute_rings = existing.compute_rings
+        self.error = existing.error^
+        self.timed_out = existing.timed_out
+        self.lost = existing.lost
+        self.minor = existing.minor
+        self.ctrl_ptr = existing.ctrl_ptr
+        existing.fd = -1
+        existing.context = 0
+        existing.minor = -1
+        existing.ctrl_ptr = 0
+
+    def __deinit__(deinit self):
+        if self.ctrl_ptr != 0:
+            ref ctrl = _amd_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0]
+            if ctrl.gpu_ref_count > 1:
+                ctrl.gpu_ref_count -= 1
+                ctrl.ref_count -= 1
+                return
+        self.close()
 
     def fail(mut self, message: String) -> Bool:
         self.error = message
@@ -181,8 +328,17 @@ struct AmdGpu(Copyable, Movable):
         if fd < 0:
             return False
         if self.read_device_info(fd) and self.supported():
+            if self.ctrl_ptr != 0:
+                self.close()
             self.fd = fd
             self.minor = minor
+            var c_raw = external_call["calloc", Int](Int(1), max(64, size_of[_AmdDeviceControlBlock]()))
+            ref ctrl = _amd_ctrl_ptr(c_raw)[unsafe_offset=0]
+            ctrl.ref_count = 1
+            ctrl.gpu_ref_count = 1
+            ctrl.fd = fd
+            ctrl.alive = True
+            self.ctrl_ptr = c_raw
             return True
         close_fd(fd)
         return False
@@ -215,8 +371,7 @@ struct AmdGpu(Copyable, Movable):
                 if self.open_node(minor):
                     if not prefer_discrete or not self.integrated():
                         return True
-                    close_fd(self.fd)
-                    self.fd = -1
+                    self.close()
         return self.fail("no supported GPU render node found")
 
     def read_device_info(mut self, fd: Int) -> Bool:
@@ -310,10 +465,29 @@ struct AmdGpu(Copyable, Movable):
     def close(mut self):
         """Free the context and close the device. The kernel frees every buffer with
         the file, and stops what this file still had queued."""
-        self.free_context()
-        if self.fd >= 0:
-            close_fd(self.fd)
-        self.fd = -1
+        if self.ctrl_ptr != 0:
+            ref ctrl = _amd_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0]
+            if ctrl.alive:
+                self.free_context()
+                if self.fd >= 0:
+                    close_fd(self.fd)
+                ctrl.alive = False
+                ctrl.fd = -1
+            self.fd = -1
+            self.context = 0
+            self.minor = -1
+            ctrl.gpu_ref_count -= 1
+            ctrl.ref_count -= 1
+            if ctrl.ref_count <= 0:
+                external_call["free", NoneType](self.ctrl_ptr)
+            self.ctrl_ptr = 0
+        else:
+            self.free_context()
+            if self.fd >= 0:
+                close_fd(self.fd)
+            self.fd = -1
+            self.context = 0
+            self.minor = -1
 
     def create_buffer(mut self, size: Int, domain: UInt64, flags: UInt32) -> GpuBuffer:
         """Allocate, map for the GPU, and map for the CPU. Size 0 reports failure."""
@@ -349,22 +523,33 @@ struct AmdGpu(Copyable, Movable):
         if cpu == -1:
             _ = self.fail("CPU mapping failed")
             return GpuBuffer()
-        return GpuBuffer(handle, rounded, address, cpu)
+        var out = GpuBuffer(handle, rounded, address, cpu)
+        if self.ctrl_ptr != 0:
+            var st_raw = external_call["calloc", Int](Int(1), max(128, size_of[_GpuBufferControl]()))
+            ref st = _buf_ctrl_ptr(st_raw)[unsafe_offset=0]
+            st.ref_count = 1
+            st.destroyed = False
+            st.backend_kind = 2
+            st.ctrl_ptr = self.ctrl_ptr
+            st.amd_handle = handle
+            st.amd_gpu_address = address
+            st.amd_cpu_address = cpu
+            st.amd_size = rounded
+            ref actrl = _amd_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0]
+            actrl.ref_count += 1
+            out.state_ptr = st_raw
+        return out^
 
     def destroy_buffer(mut self, buffer: GpuBuffer):
         """Release a buffer the GPU has finished with. The empty value is ignored."""
         if buffer.size == 0:
             return
-        _ = external_call["munmap", Int32](buffer.cpu_address, buffer.size)
-        var va = List[UInt64](length=8, fill=0)
-        va[0] = UInt64(buffer.handle)
-        va[1] = UInt64(VA_OP_UNMAP)
-        va[2] = buffer.gpu_address
-        va[4] = UInt64(buffer.size)
-        _ = gpu_ioctl(self.fd, IOCTL_GEM_VA, va)
-        var close = List[UInt64](length=1, fill=0)
-        close[0] = UInt64(buffer.handle)
-        _ = gpu_ioctl(self.fd, IOCTL_GEM_CLOSE, close)
+        if buffer.state_ptr != 0:
+            ref st = _buf_ctrl_ptr(buffer.state_ptr)[unsafe_offset=0]
+            if st.destroyed:
+                return
+            st.destroyed = True
+        _amd_release_buffer_handles(self.fd, buffer.handle, buffer.gpu_address, buffer.cpu_address, buffer.size)
 
     def export_buffer(mut self, buffer: GpuBuffer) -> Int:
         """Share a buffer as a dmabuf file descriptor. Returns -1 on failure."""

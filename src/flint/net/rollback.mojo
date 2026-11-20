@@ -15,7 +15,7 @@ Implements:
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import abs, max, min
+from std.math import abs, max, min, sqrt
 from std.time import monotonic
 from flint.core.detmath import (
     det_cos,
@@ -29,6 +29,24 @@ from flint.core.math import Quat, Vec3
 from flint.core.serial import BlobReader, BlobWriter
 from flint.net.bitpack import BitReader, BitWriter
 from flint.net.channel import seq_gt
+from flint.net.relay import (
+    NAT_DIRECT_IDLE_FALLBACK_MS,
+    NAT_PUNCH_DEFAULT_TIMEOUT_MS,
+    NAT_PUNCH_MAGIC,
+    NATPunchProbe,
+    PUNCH_KIND_ACK,
+    PUNCH_KIND_PROBE,
+    RELAY_ENDPOINT_PAYLOAD_BYTES,
+    RELAY_FLAG_COOKIE_CHALLENGE,
+    RELAY_FLAG_DATA,
+    RELAY_FLAG_PEER_ENDPOINT,
+    RELAY_FLAG_REGISTER,
+    RELAY_FLAG_REGISTER_ACK,
+    RELAY_HEADER_BYTES,
+    RELAY_WIRE_MAGIC,
+    RelayForwardHeader,
+    decode_relay_endpoint_at,
+)
 from flint.net.socket_udp import DatagramView, NetEndpoint, NetTransport
 from flint.physics.world import PhysicsWorld
 
@@ -149,8 +167,32 @@ struct SnapshotRingSlot(Movable):
         self.writer = BlobWriter()
 
 
+@always_inline
+def _rb_is_finite32(v: Float32) -> Bool:
+    return (v - v) == Float32(0.0)
+
+
+@always_inline
+def _rb_vec3_finite(v: Vec3) -> Bool:
+    return (
+        _rb_is_finite32(v.x)
+        and _rb_is_finite32(v.y)
+        and _rb_is_finite32(v.z)
+    )
+
+
+@always_inline
+def _rb_quat_finite(q: Quat) -> Bool:
+    return (
+        _rb_is_finite32(q.x)
+        and _rb_is_finite32(q.y)
+        and _rb_is_finite32(q.z)
+        and _rb_is_finite32(q.w)
+    )
+
+
 struct VisualSmoother(Copyable, ImplicitlyCopyable, Movable):
-    """Presentation-space exponential error decay (`det_exp`) hiding rollback snap corrections."""
+    """Presentation-space exponential/linear error decay hiding prediction/rollback snap corrections."""
     var pos_offset: Vec3
     var rot_offset: Quat
     var half_life_rate: Float32
@@ -160,24 +202,129 @@ struct VisualSmoother(Copyable, ImplicitlyCopyable, Movable):
         self.rot_offset = Quat.identity()
         self.half_life_rate = max(Float32(0.5), decay_rate)
 
+    def snap_if_exceeds(mut self, max_dist: Float32) -> Bool:
+        """Clears residual visual offset immediately when a correction exceeds `max_dist` (teleport)."""
+        var pos_ok = _rb_vec3_finite(self.pos_offset)
+        var rot_ok = _rb_quat_finite(self.rot_offset)
+        if not pos_ok or not rot_ok:
+            self.pos_offset = Vec3(0.0, 0.0, 0.0)
+            self.rot_offset = Quat.identity()
+            return True
+        if not _rb_is_finite32(max_dist) or max_dist < Float32(0.0):
+            return False
+        var ax = abs(self.pos_offset.x)
+        var ay = abs(self.pos_offset.y)
+        var az = abs(self.pos_offset.z)
+        var m = max(ax, max(ay, az))
+        var d = Float32(0.0)
+        if m > Float32(0.0):
+            var sx = self.pos_offset.x / m
+            var sy = self.pos_offset.y / m
+            var sz = self.pos_offset.z / m
+            d = m * sqrt(sx * sx + sy * sy + sz * sz)
+        if not (d <= max_dist):
+            self.pos_offset = Vec3(0.0, 0.0, 0.0)
+            self.rot_offset = Quat.identity()
+            return True
+        return False
+
     def record_correction(
         mut self,
         prev_visual_pos: Vec3,
         new_auth_pos: Vec3,
         prev_visual_rot: Quat = Quat.identity(),
         new_auth_rot: Quat = Quat.identity(),
+        snap_threshold: Float32 = Float32(-1.0),
     ):
+        if (
+            not _rb_vec3_finite(prev_visual_pos)
+            or not _rb_vec3_finite(new_auth_pos)
+            or not _rb_quat_finite(prev_visual_rot)
+            or not _rb_quat_finite(new_auth_rot)
+        ):
+            self.pos_offset = Vec3(0.0, 0.0, 0.0)
+            self.rot_offset = Quat.identity()
+            return
         self.pos_offset = prev_visual_pos - new_auth_pos
         self.rot_offset = (
             prev_visual_rot * new_auth_rot.conjugate()
         ).normalized()
+        if not _rb_vec3_finite(self.pos_offset) or not _rb_quat_finite(
+            self.rot_offset
+        ):
+            self.pos_offset = Vec3(0.0, 0.0, 0.0)
+            self.rot_offset = Quat.identity()
+            return
+        if snap_threshold >= Float32(0.0):
+            _ = self.snap_if_exceeds(snap_threshold)
 
     def step(mut self, dt: Float32):
-        if dt <= Float32(0.0):
+        if not (dt > Float32(0.0)) or not _rb_is_finite32(dt):
             return
+        if not _rb_vec3_finite(self.pos_offset):
+            self.pos_offset = Vec3(0.0, 0.0, 0.0)
+        if not _rb_quat_finite(self.rot_offset):
+            self.rot_offset = Quat.identity()
         var decay = det_exp(-self.half_life_rate * dt)
         self.pos_offset = self.pos_offset * decay
         self.rot_offset = Quat.identity().slerp(self.rot_offset, decay)
+
+    def step_linear(
+        mut self,
+        dt: Float32,
+        linear_speed: Float32 = Float32(12.0),
+        angular_rate: Float32 = Float32(10.0),
+    ):
+        """Decays residual visual offset at constant linear speed (`linear_speed * dt`)."""
+        if not (dt > Float32(0.0)) or not _rb_is_finite32(dt):
+            return
+        if (
+            not _rb_is_finite32(self.pos_offset.x)
+            or not _rb_is_finite32(self.pos_offset.y)
+            or not _rb_is_finite32(self.pos_offset.z)
+        ):
+            self.pos_offset = Vec3(0.0, 0.0, 0.0)
+        if (
+            not _rb_is_finite32(self.rot_offset.x)
+            or not _rb_is_finite32(self.rot_offset.y)
+            or not _rb_is_finite32(self.rot_offset.z)
+            or not _rb_is_finite32(self.rot_offset.w)
+        ):
+            self.rot_offset = Quat.identity()
+
+        var spd = (
+            linear_speed
+            if (_rb_is_finite32(linear_speed) and linear_speed > Float32(0.0))
+            else Float32(0.0)
+        )
+        var step_d = spd * dt
+        var ax = abs(self.pos_offset.x)
+        var ay = abs(self.pos_offset.y)
+        var az = abs(self.pos_offset.z)
+        var m = max(ax, max(ay, az))
+        if m == Float32(0.0):
+            self.pos_offset = Vec3(0.0, 0.0, 0.0)
+        elif not _rb_is_finite32(step_d):
+            self.pos_offset = Vec3(0.0, 0.0, 0.0)
+        else:
+            var sx = self.pos_offset.x / m
+            var sy = self.pos_offset.y / m
+            var sz = self.pos_offset.z / m
+            var d = m * sqrt(sx * sx + sy * sy + sz * sz)
+            if not _rb_is_finite32(d) or d <= step_d:
+                self.pos_offset = Vec3(0.0, 0.0, 0.0)
+            else:
+                self.pos_offset = self.pos_offset * ((d - step_d) / d)
+
+        var ang_r = (
+            angular_rate
+            if (_rb_is_finite32(angular_rate) and angular_rate > Float32(0.0))
+            else Float32(0.0)
+        )
+        var rot_t = min(Float32(1.0), ang_r * dt)
+        if not _rb_is_finite32(rot_t):
+            rot_t = Float32(1.0)
+        self.rot_offset = self.rot_offset.slerp(Quat.identity(), rot_t)
 
     @always_inline
     def smooth_pos(self, auth_pos: Vec3) -> Vec3:
@@ -256,6 +403,24 @@ struct RollbackSession[InputT: RollbackInput](Movable):
     var packets_received: Int
     var spoofed_packets_dropped: Int
     var stall_frames: Int
+
+    # NAT traversal & relay fallback topology (F9)
+    var relay_enabled: Bool
+    var relay_endpoint: NetEndpoint
+    var relay_attempt_punch: Bool
+    var relay_last_register_ms: Float64
+    var relay_register_interval_ms: Float64
+    var relay_has_cookie: Bool
+    var relay_cookie: Array[UInt8, 16]
+    var peer_punches: List[NATPunchProbe]
+    var peer_using_relay: List[Bool]
+    var relay_tx_scratch: List[UInt8]
+    var relayed_packets_sent: Int
+    var relayed_packets_received: Int
+    var direct_packets_sent: Int
+    var direct_packets_received: Int
+    var punch_upgrades: Int
+    var punch_fallbacks: Int
 
     def __init__(
         out self,
@@ -358,11 +523,111 @@ struct RollbackSession[InputT: RollbackInput](Movable):
         self.spoofed_packets_dropped = 0
         self.stall_frames = 0
 
+        self.relay_enabled = False
+        self.relay_endpoint = NetEndpoint()
+        self.relay_attempt_punch = True
+        self.relay_last_register_ms = -1.0e9
+        self.relay_register_interval_ms = 1000.0
+        self.relay_has_cookie = False
+        self.relay_cookie = Array[UInt8, 16](fill=UInt8(0))
+        self.peer_punches = List[NATPunchProbe]()
+        self.peer_using_relay = List[Bool](length=self.num_peers, fill=False)
+        self.relay_tx_scratch = List[UInt8](capacity=256)
+        self.relayed_packets_sent = 0
+        self.relayed_packets_received = 0
+        self.direct_packets_sent = 0
+        self.direct_packets_received = 0
+        self.punch_upgrades = 0
+        self.punch_fallbacks = 0
+
         # Pre-seed deterministic neutral inputs for initial delay ticks `[0 .. input_delay_ticks - 1]`
         var neutral_canon = self._canonicalize_input(Self.InputT())
         for p in range(self.num_peers):
             for t in range(self.input_delay_ticks):
                 self._store_auth_input(p, t, neutral_canon)
+
+    def enable_relay(
+        mut self,
+        relay_endpoint: NetEndpoint,
+        attempt_nat_punch: Bool = True,
+        probe_timeout_ms: Float64 = NAT_PUNCH_DEFAULT_TIMEOUT_MS,
+        direct_idle_fallback_ms: Float64 = NAT_DIRECT_IDLE_FALLBACK_MS,
+    ):
+        """Enables NAT relay fallback and parallel UDP hole-punch probing for this session."""
+        self.relay_enabled = relay_endpoint.port != 0
+        self.relay_endpoint = relay_endpoint
+        self.relay_attempt_punch = attempt_nat_punch
+        self.relay_last_register_ms = -1.0e9
+        self.relay_has_cookie = False
+        self.relay_cookie = Array[UInt8, 16](fill=UInt8(0))
+        self.peer_punches.clear()
+        for p in range(self.num_peers):
+            self.peer_punches.append(
+                NATPunchProbe(
+                    local_peer=self.local_peer_id,
+                    relay_endpoint=relay_endpoint,
+                    target_peer=p,
+                    target_endpoint=self.peer_endpoints[p],
+                    session_token=self.session_token,
+                    probe_timeout_ms=probe_timeout_ms,
+                    direct_idle_fallback_ms=direct_idle_fallback_ms,
+                )
+            )
+            self.peer_using_relay[p] = (
+                self.relay_enabled and p != self.local_peer_id
+            )
+
+    def disable_relay(mut self):
+        self.relay_enabled = False
+        self.relay_endpoint = NetEndpoint()
+        self.relay_has_cookie = False
+        self.relay_cookie = Array[UInt8, 16](fill=UInt8(0))
+        self.peer_punches.clear()
+        for p in range(self.num_peers):
+            self.peer_using_relay[p] = False
+
+    def _send_relay_register[TransT: NetTransport](
+        mut self, mut transport: TransT, now_ms: Float64, pkt_seq: UInt16
+    ):
+        if not self.relay_enabled or self.relay_endpoint.port == 0:
+            return
+        var reg_hdr = RelayForwardHeader(
+            session_token=self.session_token,
+            src_peer=self.local_peer_id,
+            dst_peer=self.local_peer_id,
+            flags=RELAY_FLAG_REGISTER,
+            seq=pkt_seq,
+            hop_ttl=0,
+        )
+        var total_len = RELAY_HEADER_BYTES + (
+            16 if self.relay_has_cookie else 0
+        )
+        if len(self.relay_tx_scratch) < total_len:
+            self.relay_tx_scratch.resize(unsafe_uninit_length=total_len)
+        reg_hdr.write_into(self.relay_tx_scratch)
+        if self.relay_has_cookie:
+            for b in range(16):
+                self.relay_tx_scratch[RELAY_HEADER_BYTES + b] = (
+                    self.relay_cookie[b]
+                )
+        _ = transport.queue_send_raw(
+            self.relay_endpoint,
+            Int(self.relay_tx_scratch.unsafe_ptr()),
+            total_len,
+        )
+        self.relay_last_register_ms = now_ms
+
+    @always_inline
+    def is_peer_relayed(self, peer_id: Int) -> Bool:
+        if peer_id < 0 or peer_id >= self.num_peers:
+            return False
+        return self.relay_enabled and self.peer_using_relay[peer_id]
+
+    @always_inline
+    def is_peer_direct(self, peer_id: Int) -> Bool:
+        if peer_id < 0 or peer_id >= self.num_peers or peer_id == self.local_peer_id:
+            return False
+        return not self.is_peer_relayed(peer_id)
 
     def _canonicalize_input(mut self, raw_in: Self.InputT) -> Self.InputT:
         """Round-trips `raw_in` through bit quantization so local and remote peers step bit-exact values."""
@@ -552,9 +817,40 @@ struct RollbackSession[InputT: RollbackInput](Movable):
                 send_ck_tick = aligned_c
                 send_ck_hash = self.local_checksum_hash[c_slot]
 
+        if self.relay_enabled and self.relay_endpoint.port != 0:
+            if (
+                now_ms - self.relay_last_register_ms
+                >= self.relay_register_interval_ms
+            ):
+                self._send_relay_register(transport, now_ms, pkt_seq)
+
         for dst_p in range(self.num_peers):
             if dst_p == self.local_peer_id:
                 continue
+
+            var use_relay = False
+            if self.relay_enabled and self.relay_endpoint.port != 0:
+                if (
+                    self.relay_attempt_punch
+                    and dst_p < len(self.peer_punches)
+                ):
+                    var prev_up = self.peer_punches[dst_p].direct_upgrades
+                    var prev_fb = self.peer_punches[dst_p].relay_fallbacks
+                    self.peer_punches[dst_p].poll(transport, now_ms)
+                    self.punch_upgrades += (
+                        self.peer_punches[dst_p].direct_upgrades - prev_up
+                    )
+                    self.punch_fallbacks += (
+                        self.peer_punches[dst_p].relay_fallbacks - prev_fb
+                    )
+                    use_relay = not self.peer_punches[dst_p].is_direct()
+                else:
+                    use_relay = True
+                self.peer_using_relay[dst_p] = use_relay
+
+            var eff_mtu = ROLLBACK_PACKET_MTU_BYTES - (
+                RELAY_HEADER_BYTES if use_relay else 0
+            )
 
             # ACK-driven retransmission: start from peer's acked tick + 1 (or at least K redundant ticks)
             var need_t = max(0, self.peer_acked_local_tick[dst_p] + 1)
@@ -593,23 +889,48 @@ struct RollbackSession[InputT: RollbackInput](Movable):
                 var saved_mark = self.tx_bit_writer.mark()
                 var inp = self._get_auth_input(self.local_peer_id, first_t + k)
                 inp.encode_bits(self.tx_bit_writer)
-                if (
-                    k > 0
-                    and self.tx_bit_writer.byte_length()
-                    > ROLLBACK_PACKET_MTU_BYTES
-                ):
+                if k > 0 and self.tx_bit_writer.byte_length() > eff_mtu:
                     self.tx_bit_writer.restore(saved_mark)
                     break
                 actual_count += 1
 
             self.tx_bit_writer.flush_align()
             self.tx_bit_writer.data[29] = UInt8(actual_count & 0xFF)
-            if transport.queue_send_raw(
-                self.peer_endpoints[dst_p],
-                Int(self.tx_bit_writer.data.unsafe_ptr()),
-                len(self.tx_bit_writer.data),
-            ):
-                self.packets_sent += 1
+            if use_relay:
+                var inner_len = len(self.tx_bit_writer.data)
+                self.relay_tx_scratch.resize(
+                    unsafe_uninit_length=RELAY_HEADER_BYTES + inner_len
+                )
+                var data_hdr = RelayForwardHeader(
+                    session_token=self.session_token,
+                    src_peer=self.local_peer_id,
+                    dst_peer=dst_p,
+                    flags=RELAY_FLAG_DATA,
+                    seq=pkt_seq,
+                    hop_ttl=1,
+                )
+                data_hdr.write_into(self.relay_tx_scratch)
+                _ = external_call["memcpy", Int](
+                    Int(self.relay_tx_scratch.unsafe_ptr())
+                    + RELAY_HEADER_BYTES,
+                    Int(self.tx_bit_writer.data.unsafe_ptr()),
+                    Int64(inner_len),
+                )
+                if transport.queue_send_raw(
+                    self.relay_endpoint,
+                    Int(self.relay_tx_scratch.unsafe_ptr()),
+                    RELAY_HEADER_BYTES + inner_len,
+                ):
+                    self.packets_sent += 1
+                    self.relayed_packets_sent += 1
+            else:
+                if transport.queue_send_raw(
+                    self.peer_endpoints[dst_p],
+                    Int(self.tx_bit_writer.data.unsafe_ptr()),
+                    len(self.tx_bit_writer.data),
+                ):
+                    self.packets_sent += 1
+                    self.direct_packets_sent += 1
 
         _ = transport.flush_sends()
 
@@ -628,20 +949,156 @@ struct RollbackSession[InputT: RollbackInput](Movable):
                 var view = self.rx_views[i]
                 var reader = BitReader.from_raw_ptr(view.data_ptr, view.length)
                 var magic = reader.read_u32()
-                if reader.overflowed or magic != _RB_WIRE_MAGIC:
-                    continue
-                var pkt_token = reader.read_u64()
-                var sender_id = Int(reader.read_u8())
                 if reader.overflowed:
                     continue
-                if (
-                    pkt_token != self.session_token
-                    or sender_id < 0
-                    or sender_id >= self.num_peers
-                    or sender_id == self.local_peer_id
-                    or view.sender != self.peer_endpoints[sender_id]
-                ):
-                    self.spoofed_packets_dropped += 1
+
+                if magic == NAT_PUNCH_MAGIC:
+                    if not self.relay_enabled or view.length < 24:
+                        continue
+                    var p_raw = Pointer[UInt8, ImmutAnyOrigin](
+                        unsafe_from_address=view.data_ptr
+                    )
+                    var p_kind = p_raw[unsafe_offset=12]
+                    var p_src = Int(p_raw[unsafe_offset=13])
+                    if (
+                        p_src >= 0
+                        and p_src < len(self.peer_punches)
+                        and p_src != self.local_peer_id
+                    ):
+                        var was_direct = self.peer_punches[p_src].is_direct()
+                        if (
+                            was_direct
+                            and p_kind == PUNCH_KIND_PROBE
+                            and view.sender
+                            != self.peer_punches[p_src].target_endpoint
+                        ):
+                            self.spoofed_packets_dropped += 1
+                            continue
+                        if self.peer_punches[p_src].ingest_datagram(
+                            view, transport, now_ms
+                        ):
+                            if self.peer_punches[p_src].is_direct():
+                                if (
+                                    not was_direct
+                                    or p_kind == PUNCH_KIND_ACK
+                                    or view.sender
+                                    == self.peer_endpoints[p_src]
+                                ):
+                                    self.peer_endpoints[p_src] = (
+                                        self.peer_punches[p_src].target_endpoint
+                                    )
+                                    self.peer_using_relay[p_src] = False
+                                if not was_direct:
+                                    self.punch_upgrades += 1
+                        else:
+                            self.spoofed_packets_dropped += 1
+                    continue
+
+                var is_relayed_rx = False
+                var pkt_token: UInt64
+                var sender_id: Int
+
+                if magic == RELAY_WIRE_MAGIC:
+                    var parsed = RelayForwardHeader.parse_from_ptr(
+                        view.data_ptr, view.length
+                    )
+                    if not parsed[0]:
+                        continue
+                    var hdr = parsed[1]
+                    if (
+                        not self.relay_enabled
+                        or view.sender != self.relay_endpoint
+                        or hdr.session_token != self.session_token
+                    ):
+                        self.spoofed_packets_dropped += 1
+                        continue
+                    if hdr.flags == RELAY_FLAG_REGISTER_ACK:
+                        continue
+                    if hdr.flags == RELAY_FLAG_COOKIE_CHALLENGE:
+                        if view.length >= RELAY_HEADER_BYTES + 16:
+                            var p_ck = Pointer[UInt8, ImmutAnyOrigin](
+                                unsafe_from_address=view.data_ptr
+                                + RELAY_HEADER_BYTES
+                            )
+                            for b in range(16):
+                                self.relay_cookie[b] = p_ck[unsafe_offset=b]
+                            self.relay_has_cookie = True
+                            for p_i in range(len(self.peer_punches)):
+                                self.peer_punches[p_i].set_relay_cookie(
+                                    self.relay_cookie
+                                )
+                            self._send_relay_register(
+                                transport, now_ms, self.local_pkt_seq
+                            )
+                            _ = transport.flush_sends()
+                        continue
+                    if hdr.flags == RELAY_FLAG_PEER_ENDPOINT:
+                        if (
+                            view.length
+                            >= RELAY_HEADER_BYTES + RELAY_ENDPOINT_PAYLOAD_BYTES
+                        ):
+                            var about_p = hdr.src_peer
+                            var ep = decode_relay_endpoint_at(
+                                view.data_ptr, RELAY_HEADER_BYTES
+                            )
+                            if (
+                                about_p >= 0
+                                and about_p < self.num_peers
+                                and about_p != self.local_peer_id
+                                and ep.port != 0
+                            ):
+                                if (
+                                    about_p < len(self.peer_punches)
+                                    and not self.peer_punches[about_p].is_direct()
+                                ):
+                                    self.peer_punches[about_p].set_target(
+                                        about_p, ep
+                                    )
+                                    self.peer_endpoints[about_p] = ep
+                        continue
+                    if hdr.flags != RELAY_FLAG_DATA:
+                        continue
+                    if (
+                        hdr.dst_peer != self.local_peer_id
+                        or hdr.src_peer < 0
+                        or hdr.src_peer >= self.num_peers
+                        or hdr.src_peer == self.local_peer_id
+                    ):
+                        self.spoofed_packets_dropped += 1
+                        continue
+                    reader = BitReader.from_raw_ptr(
+                        view.data_ptr + RELAY_HEADER_BYTES,
+                        view.length - RELAY_HEADER_BYTES,
+                    )
+                    var inner_magic = reader.read_u32()
+                    if reader.overflowed or inner_magic != _RB_WIRE_MAGIC:
+                        continue
+                    pkt_token = reader.read_u64()
+                    sender_id = Int(reader.read_u8())
+                    if reader.overflowed:
+                        continue
+                    if (
+                        pkt_token != self.session_token
+                        or sender_id != hdr.src_peer
+                    ):
+                        self.spoofed_packets_dropped += 1
+                        continue
+                    is_relayed_rx = True
+                elif magic == _RB_WIRE_MAGIC:
+                    pkt_token = reader.read_u64()
+                    sender_id = Int(reader.read_u8())
+                    if reader.overflowed:
+                        continue
+                    if (
+                        pkt_token != self.session_token
+                        or sender_id < 0
+                        or sender_id >= self.num_peers
+                        or sender_id == self.local_peer_id
+                        or view.sender != self.peer_endpoints[sender_id]
+                    ):
+                        self.spoofed_packets_dropped += 1
+                        continue
+                else:
                     continue
 
                 var pkt_seq = reader.read_u16()
@@ -665,6 +1122,15 @@ struct RollbackSession[InputT: RollbackInput](Movable):
                     continue
 
                 self.packets_received += 1
+                if is_relayed_rx:
+                    self.relayed_packets_received += 1
+                else:
+                    self.direct_packets_received += 1
+                    if (
+                        self.relay_enabled
+                        and sender_id < len(self.peer_punches)
+                    ):
+                        self.peer_punches[sender_id].last_direct_rx_ms = now_ms
 
                 var acked_local = peer_next_needed - 1
                 if acked_local > self.peer_acked_local_tick[sender_id]:

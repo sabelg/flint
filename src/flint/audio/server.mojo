@@ -24,6 +24,8 @@ from std.math import sin, cos, sqrt, exp, log10, floor, abs, atan2, isnan, isinf
 from std.memory import bitcast
 from std.sys import size_of
 from flint.core.math import Vec3
+from flint.app.engine_app import Resource
+from flint.ecs.world import comp_hash64
 from flint.platform.os import close_fd
 from flint.platform.pulse import PulseClient
 from flint.platform.audio import WavClip, alsa_open_pcm, alsa_write_interleaved, alsa_close_pcm
@@ -2554,11 +2556,12 @@ struct AudioRtEngine(Movable):
                 break
 
 
-struct AudioServer(Movable):
+struct AudioServer(Resource, Movable):
     """Multithreaded real-time Flint v5 AudioServer backed by a heap-pinned
     `AudioRtEngine` (`rt_core_addr`). Moving `AudioServer` moves ONLY the 8-byte
     `rt_core_addr` pointer and caller-side handle/ID counters, never invalidating
     the RT pthread's `AudioRtEngine*` address or racing with RT mixer state."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.audio.AudioServer")
     var rt_core_addr: Int
     var sample_rate: Int
     var sr_f: Float32

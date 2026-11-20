@@ -121,7 +121,7 @@ def _trailing_zeros_64(val: UInt64) -> Int:
     return count
 
 
-struct ArchetypeSlots(Copyable, Movable):
+struct ArchetypeSlots(Movable):
     """Deterministic lowest-free row pool with chunked bitset O(1) allocation and deferred tick commit."""
     var archetype: Int
     var capacity: Int
@@ -147,6 +147,32 @@ struct ArchetypeSlots(Copyable, Movable):
         self.used = 0
         self.pending = 0
         self.live_count = 0
+
+    def __init__(out self, *, deinit move: Self):
+        self.archetype = move.archetype
+        self.capacity = move.capacity
+        self.state = move.state^
+        self.generation = move.generation^
+        self.free_mask = move.free_mask^
+        self.used = move.used
+        self.pending = move.pending
+        self.live_count = move.live_count
+
+    def release(mut self):
+        """Idempotently release internal slot storage."""
+        self.state.clear()
+        self.generation.clear()
+        self.free_mask.clear()
+        self.archetype = 0
+        self.capacity = 0
+        self.used = 0
+        self.pending = 0
+        self.live_count = 0
+
+    def __deinit__(deinit self):
+        self.state.clear()
+        self.generation.clear()
+        self.free_mask.clear()
 
     def spawn(mut self, deferred: Bool = False) -> EntityHandle:
         for c in range(len(self.free_mask)):
@@ -370,7 +396,7 @@ struct EntityCommandBuffer(Movable):
         self._release()
 
 
-struct SimdColumn[dtype: DType](Copyable, Movable):
+struct SimdColumn[dtype: DType](Movable):
     """8-lane SIMD-padded SoA column with automatic MemCharge RAM tracking and binary persistence."""
     var data: List[Scalar[Self.dtype]]
     var capacity: Int
@@ -382,6 +408,20 @@ struct SimdColumn[dtype: DType](Copyable, Movable):
         self.capacity = padded
         self.charge = MemCharge(mem_tag)
         self.charge.set(padded * size_of[Scalar[Self.dtype]]())
+
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data^
+        self.capacity = move.capacity
+        self.charge = move.charge^
+
+    def release(mut self):
+        """Idempotently release column data and its MemCharge."""
+        self.data.clear()
+        self.capacity = 0
+        self.charge.release()
+
+    def __deinit__(deinit self):
+        self.data.clear()
 
     @always_inline
     def base_addr(self) -> Int:

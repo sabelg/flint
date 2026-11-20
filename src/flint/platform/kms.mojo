@@ -17,7 +17,7 @@ Input, with no compositor to deliver it:
     `TakeControl` + `TakeDevice`), as it does for display servers. Then keys come
     from evdev too, since logind turns the VT keyboard off. A small software cursor
     is drawn while the pointer is not locked.
-  * gamepads: `InputState.poll_gamepad()`, as on every backend.
+  * gamepads: `EvdevHub` (`/dev/input/event*`), as on every backend.
 
 The console is always given back. The VT is put in KD_GRAPHICS so the text
 console stops drawing over the frames; on `close()`, at process exit
@@ -42,6 +42,8 @@ falls back to the CPU path when Vulkan cannot have the display.
 """
 from std.ffi import external_call
 from flint.platform.input import InputState
+from flint.platform.traits import WindowBackend
+from flint.input.evdev import EvdevHub
 from flint.platform.os import env_value, env_flag, close_fd, get_time, list_directory, last_errno
 from flint.platform.wayland import evdev_key
 from flint.platform.logind import LogindSession, device_numbers
@@ -704,7 +706,7 @@ def on_virtual_console() -> Bool:
 # ---------------------------------------------------------------------------
 
 
-struct KmsWindow(Copyable, Movable):
+struct KmsWindow(WindowBackend):
     var drm_fd: Int
     var tty_fd: Int
     var card_path: String
@@ -754,6 +756,8 @@ struct KmsWindow(Copyable, Movable):
     var ctrl_down: Bool
     var for_vulkan: Bool
     var last_error: String
+    var clipboard_text: String
+    var evdev: EvdevHub
 
     def __init__(out self):
         self.drm_fd = -1
@@ -805,6 +809,70 @@ struct KmsWindow(Copyable, Movable):
         self.ctrl_down = False
         self.for_vulkan = False
         self.last_error = ""
+        self.clipboard_text = ""
+        self.evdev = EvdevHub(enable_hotplug=False)
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.drm_fd = existing.drm_fd
+        self.tty_fd = existing.tty_fd
+        self.card_path = existing.card_path^
+        self.connector_id = existing.connector_id
+        self.encoder_id = existing.encoder_id
+        self.crtc_id = existing.crtc_id
+        self.mode = existing.mode^
+        self.width = existing.width
+        self.height = existing.height
+        self.logical_width = existing.logical_width
+        self.logical_height = existing.logical_height
+        self.close_requested = existing.close_requested
+        self.focused = existing.focused
+        self.fullscreen = existing.fullscreen
+        self.pointer_locked = existing.pointer_locked
+        self.cursor_visible = existing.cursor_visible
+        self.handles = existing.handles^
+        self.fb_ids = existing.fb_ids^
+        self.maps = existing.maps^
+        self.pitch = existing.pitch
+        self.buffer_size = existing.buffer_size
+        self.front = existing.front
+        self.flip_pending = existing.flip_pending
+        self.flips = existing.flips
+        self.last_flip_at = existing.last_flip_at
+        self.uncapped = existing.uncapped
+        self.x_map = existing.x_map^
+        self.x_map_source = existing.x_map_source
+        self.x_map_target = existing.x_map_target
+        self.keyboard_from_tty = existing.keyboard_from_tty
+        self.decoder = existing.decoder^
+        self.input_fds = existing.input_fds^
+        self.input_is_keyboard = existing.input_is_keyboard^
+        self.logind = existing.logind^
+        self.using_logind = existing.using_logind
+        self.input_note = existing.input_note^
+        self.cursor_x = existing.cursor_x
+        self.cursor_y = existing.cursor_y
+        self.pending_rel_x = existing.pending_rel_x
+        self.pending_rel_y = existing.pending_rel_y
+        self.pending_moved = existing.pending_moved
+        self.pending_wheel = existing.pending_wheel
+        self.pending_keys = existing.pending_keys^
+        self.pending_key_down = existing.pending_key_down^
+        self.pending_buttons = existing.pending_buttons^
+        self.pending_button_down = existing.pending_button_down^
+        self.ctrl_down = existing.ctrl_down
+        self.for_vulkan = existing.for_vulkan
+        self.last_error = existing.last_error^
+        self.clipboard_text = existing.clipboard_text^
+        self.evdev = existing.evdev^
+        existing.drm_fd = -1
+        existing.tty_fd = -1
+        existing.using_logind = False
+        existing.flip_pending = False
+        existing.buffer_size = 0
+        existing.for_vulkan = False
+
+    def __deinit__(deinit self):
+        self.close()
 
     def active(self) -> Bool:
         return self.drm_fd >= 0 and (self.for_vulkan or len(self.fb_ids) == 2)
@@ -1300,6 +1368,8 @@ struct KmsWindow(Copyable, Movable):
         rstore(R_ACTIVE, 1)
         self.open_input_devices()
         self.claim_console()
+        _ = self.evdev.enable_hotplug()
+        _ = self.evdev.discover_initial()
         if self.input_note.byte_length() > 0:
             print("FLINT_KMS_INPUT " + self.input_note)
         if self.for_vulkan:
@@ -1318,10 +1388,13 @@ struct KmsWindow(Copyable, Movable):
         return True
 
     def close(mut self):
+        var had_console_or_drm = self.drm_fd >= 0 or self.tty_fd >= 0
         if self.drm_fd >= 0:
             self.wait_flip(100)
-        kms_restore_console()
+        if had_console_or_drm:
+            kms_restore_console()
         self.destroy_buffers()
+        self.evdev.close()
         for fd in self.input_fds:
             close_fd(fd)
         self.input_fds.clear()
@@ -1332,7 +1405,7 @@ struct KmsWindow(Copyable, Movable):
         self.drm_fd = -1
         close_fd(self.tty_fd)
         self.tty_fd = -1
-        if rescue_ready():
+        if had_console_or_drm and rescue_ready():
             rstore(R_DRM_FD, -1)
             rstore(R_TTY_FD, -1)
             rstore(R_CRTC_SAVED, 0)
@@ -1531,7 +1604,7 @@ struct KmsWindow(Copyable, Movable):
                             self.queue_key(code, value != 0)
 
     def poll(mut self, mut input: InputState):
-        input.poll_gamepad()
+        self.evdev.poll(input)
         if not self.active():
             return
         if kms_stop_requested():
@@ -1577,6 +1650,31 @@ struct KmsWindow(Copyable, Movable):
     def toggle_fullscreen(mut self):
         """Always fullscreen: there is nothing else on a bare display."""
         pass
+
+    def poll_events(mut self, mut input: InputState):
+        self.poll(input)
+
+    def present_argb(mut self, pixels: List[UInt32], width: Int, height: Int):
+        var copy_px = pixels.copy()
+        self.present(copy_px, width, height)
+
+    def should_close(self) -> Bool:
+        return self.close_requested
+
+    def framebuffer_size(self) -> Tuple[Int, Int]:
+        return (max(1, self.width), max(1, self.height))
+
+    def content_scale(self) -> Float32:
+        return Float32(1.0)
+
+    def clipboard_get(mut self) -> String:
+        return self.clipboard_text
+
+    def clipboard_set(mut self, text: String):
+        self.clipboard_text = text
+
+    def shutdown(mut self):
+        self.close()
 
 
 def kms_probe() -> String:

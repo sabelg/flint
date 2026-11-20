@@ -27,13 +27,13 @@ crash.
 from std.ffi import external_call
 from std.atomic import Atomic
 from flint.core.anchor import (
-    ANCHOR, A_CHECK_FAILURES, A_CRASHED, A_ENSURE_FAILURES, A_GPU_HANGS, A_HANDLER_INSTALLED, A_HOT_RELOADS,
+    A_CHECK_FAILURES, A_CRASHED, A_ENSURE_FAILURES, A_GPU_HANGS, A_HANDLER_INSTALLED, A_HOT_RELOADS,
     A_LOG_DROPPED, A_LOG_FD, A_LOG_HEAD, A_NEXT_STACK, A_REPLAY_ACTIVE, A_REPLAY_BUFFER, A_REPLAY_COMMITTED,
     A_REPLAY_PENDING, A_REPLAY_TICKS, A_TICK, AT_FDCWD, FORMAT_BUFFER, FORMAT_BYTES, IS_X86, O_READ, O_WRONLY_CREATE_APPEND,
     O_WRONLY_CREATE_TRUNC, RawText, SCRATCH_FRAMES, SCRATCH_PATH, SCRATCH_SIGNAL, SCRATCH_PATH2, SCRATCH_READ, STACKS, STACK_BYTES,
     STACK_SLOTS, SYS_CLOSE, SYS_GETPID, SYS_GETTID, SYS_LINKAT, SYS_MKDIRAT, SYS_NANOSLEEP, SYS_OPENAT, SYS_READ, SYS_READLINKAT,
     SYS_TGKILL, SYS_WRITE, T_BUILD_ID, T_CVARS, T_EXE_PATH, T_REASON, T_REPLAY_PATH, T_STAMP, T_STATE_DIR, T_STATUS,
-    anchor_add, anchor_ready, atomic_word, c_string, load, set_text, store, sys, text_length, wall_seconds,
+    anchor_add, anchor_base, anchor_ready, atomic_word, c_string, load, set_text, store, sys, text_length, wall_seconds,
     write_utc,
 )
 from flint.core.build_info import build_stamp
@@ -135,12 +135,15 @@ def install_thread_stack() -> Bool:
     crash should have one; without it a stack overflow cannot be reported."""
     if not anchor_ready():
         return False
+    var base = anchor_base()
+    if base == 0:
+        return False
     # The first thread (main) keeps slot 0; others take 1..31 in turn, so pools that
     # stop and start again reuse the stacks of threads that are gone.
     var claim = anchor_add(A_NEXT_STACK)
     var slot = 0 if claim == 0 else 1 + (claim - 1) % (STACK_SLOTS - 1)
     var stack = List[Int](length=3, fill=0)  # stack_t: ss_sp, ss_flags, ss_size
-    stack[0] = ANCHOR + STACKS + slot * STACK_BYTES
+    stack[0] = base + STACKS + slot * STACK_BYTES
     stack[2] = STACK_BYTES
     var result = external_call["sigaltstack", Int32](Int(stack.unsafe_ptr()), Int(0))
     _ = stack^
@@ -153,6 +156,9 @@ def install_crash_handler(status: String = "") -> Bool:
     if not anchor_ready() and not start_log():
         if not anchor_ready():
             return False
+    var base = anchor_base()
+    if base == 0:
+        return False
     set_text(T_STAMP, build_stamp())
     var executable = executable_path()
     set_text(T_EXE_PATH, executable)
@@ -173,7 +179,7 @@ def install_crash_handler(status: String = "") -> Bool:
         if external_call["sigaction", Int32](Int32(signal), Int(action.unsafe_ptr()), Int(0)) != 0:
             ok = False
     _ = action^
-    store(ANCHOR + A_HANDLER_INSTALLED, 1 if ok else 0)
+    store(base + A_HANDLER_INSTALLED, 1 if ok else 0)
     return ok
 
 
@@ -207,7 +213,11 @@ def path_join(mut out: RawText, area: Int, tail: StaticString) -> Int:
 
 def write_maps(fd: Int, mut out: RawText):
     """Copy the executable lines of /proc/self/maps: what symbolize needs."""
-    var path = RawText(ANCHOR + SCRATCH_PATH2, 1024)
+    var base = anchor_base()
+    if base == 0:
+        out.text("(maps unavailable)\n")
+        return
+    var path = RawText(base + SCRATCH_PATH2, 1024)
     path.text("/proc/self/maps")
     var maps = sys(SYS_OPENAT, AT_FDCWD, path.terminate(), O_READ)
     if maps < 0:
@@ -217,11 +227,11 @@ def write_maps(fd: Int, mut out: RawText):
     var keep = False
     var field = 0
     while True:
-        var count = sys(SYS_READ, maps, ANCHOR + SCRATCH_READ, 4096)
+        var count = sys(SYS_READ, maps, base + SCRATCH_READ, 4096)
         if count <= 0:
             break
         for index in range(count):
-            var byte = Int(Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=ANCHOR + SCRATCH_READ + index)[unsafe_offset=0])
+            var byte = Int(Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=base + SCRATCH_READ + index)[unsafe_offset=0])
             out.byte(byte)
             if byte == 32:
                 field += 1
@@ -240,6 +250,9 @@ def write_maps(fd: Int, mut out: RawText):
 
 
 def copy_file(source: Int, destination: Int) -> Bool:
+    var base = anchor_base()
+    if base == 0:
+        return False
     var input = sys(SYS_OPENAT, AT_FDCWD, source, O_READ)
     if input < 0:
         return False
@@ -249,7 +262,7 @@ def copy_file(source: Int, destination: Int) -> Bool:
         return False
     var ok = True
     while True:
-        var count = sys(SYS_READ, input, ANCHOR + SCRATCH_READ, 4096)
+        var count = sys(SYS_READ, input, base + SCRATCH_READ, 4096)
         if count == 0:
             break
         if count < 0:
@@ -257,7 +270,7 @@ def copy_file(source: Int, destination: Int) -> Bool:
             break
         var written = 0
         while written < count:
-            var step = sys(SYS_WRITE, output, ANCHOR + SCRATCH_READ + written, count - written)
+            var step = sys(SYS_WRITE, output, base + SCRATCH_READ + written, count - written)
             if step <= 0:
                 ok = False
                 break
@@ -272,32 +285,35 @@ def copy_file(source: Int, destination: Int) -> Bool:
 def save_replay(mut out: RawText, mut path: RawText, folder_length: Int) -> Int:
     """Append what the play loop had not written yet, then put the whole file in
     the crash folder. Returns the number of whole ticks, or -1 with no replay."""
-    if load(ANCHOR + A_REPLAY_ACTIVE) == 0:
+    var base = anchor_base()
+    if base == 0:
         return -1
-    var source = RawText(ANCHOR + SCRATCH_PATH2, 1024)
+    if load(base + A_REPLAY_ACTIVE) == 0:
+        return -1
+    var source = RawText(base + SCRATCH_PATH2, 1024)
     source.area(T_REPLAY_PATH)
     _ = source.terminate()
     var fd = sys(SYS_OPENAT, AT_FDCWD, source.base, O_WRONLY_CREATE_APPEND, 0o644)
     if fd < 0:
         return -1
-    var buffer = load(ANCHOR + A_REPLAY_BUFFER)
-    var committed = load(ANCHOR + A_REPLAY_COMMITTED)
-    var pending = load(ANCHOR + A_REPLAY_PENDING)
+    var buffer = load(base + A_REPLAY_BUFFER)
+    var committed = load(base + A_REPLAY_COMMITTED)
+    var pending = load(base + A_REPLAY_PENDING)
     if buffer != 0 and committed > 0:
         _ = write_all_raw(fd, buffer, committed)
     if buffer != 0 and pending > committed:
         # The crashing tick: its input, then zero checksums, which no real tick has.
         _ = write_all_raw(fd, buffer + committed, pending - committed)
         for index in range(CHECK_BYTES):
-            Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=ANCHOR + SCRATCH_READ + index)[unsafe_offset=0] = 0
-        _ = write_all_raw(fd, ANCHOR + SCRATCH_READ, CHECK_BYTES)
+            Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=base + SCRATCH_READ + index)[unsafe_offset=0] = 0
+        _ = write_all_raw(fd, base + SCRATCH_READ, CHECK_BYTES)
     _ = sys(SYS_CLOSE, fd)
     path.length = folder_length
     path.text("/replay.sdrp")
     _ = path.terminate()
     if sys(SYS_LINKAT, AT_FDCWD, source.base, AT_FDCWD, path.base, 0) != 0:
         _ = copy_file(source.base, path.base)
-    return load(ANCHOR + A_REPLAY_TICKS)
+    return load(base + A_REPLAY_TICKS)
 
 
 def write_all_raw(fd: Int, address: Int, count: Int) -> Bool:
@@ -312,6 +328,10 @@ def write_all_raw(fd: Int, address: Int, count: Int) -> Bool:
 
 def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     var number = Int(signal)
+    var base = anchor_base()
+    if base == 0:
+        restore_and_reraise(number, info)
+        return
     var tid = sys(SYS_GETTID)
     var expected = Int64(0)
     var first = 0
@@ -321,9 +341,9 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
         # Another thread is writing the report. Wait for it to end the process;
         # this same thread failing again falls through to the default action.
         if first != tid:
-            store(ANCHOR + SCRATCH_SIGNAL + 256, 10)  # a timespec: ten seconds
-            store(ANCHOR + SCRATCH_SIGNAL + 264, 0)
-            _ = sys(SYS_NANOSLEEP, ANCHOR + SCRATCH_SIGNAL + 256, 0)
+            store(base + SCRATCH_SIGNAL + 256, 10)  # a timespec: ten seconds
+            store(base + SCRATCH_SIGNAL + 264, 0)
+            _ = sys(SYS_NANOSLEEP, base + SCRATCH_SIGNAL + 256, 0)
         restore_and_reraise(number, info)
         return
     var code = Int(Pointer[Int32, origin=MutAnyOrigin](unsafe_from_address=info + 8)[unsafe_offset=0])
@@ -331,10 +351,10 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     var pc = load(context + UCONTEXT_RIP) if context != 0 else 0
     var sp = load(context + UCONTEXT_RSP) if context != 0 else 0
     var fp = load(context + UCONTEXT_RBP) if context != 0 else 0
-    var frames = Int(external_call["backtrace", Int32](ANCHOR + SCRATCH_FRAMES, Int32(64)))
+    var frames = Int(external_call["backtrace", Int32](base + SCRATCH_FRAMES, Int32(64)))
 
     # The folder: <state>/crashes/<UTC>-<pid>
-    var path = RawText(ANCHOR + SCRATCH_PATH, 1024)
+    var path = RawText(base + SCRATCH_PATH, 1024)
     path.area(T_STATE_DIR)
     _ = path.terminate()
     _ = make_folder(path)
@@ -342,7 +362,7 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     _ = path.terminate()
     _ = make_folder(path)
     path.byte(47)
-    var seconds = wall_seconds(ANCHOR + SCRATCH_SIGNAL + 320)
+    var seconds = wall_seconds(base + SCRATCH_SIGNAL + 320)
     write_utc(path, seconds, True)
     path.byte(45)
     path.decimal(sys(SYS_GETPID))
@@ -350,7 +370,7 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     _ = make_folder(path)
     var folder_length = path.length
 
-    var out = RawText(ANCHOR + FORMAT_BUFFER, FORMAT_BYTES)
+    var out = RawText(base + FORMAT_BUFFER, FORMAT_BYTES)
     path.text("/crash.txt")
     var fd = sys(SYS_OPENAT, AT_FDCWD, path.terminate(), O_WRONLY_CREATE_TRUNC, 0o644)
     var replay_ticks = save_replay(out, path, folder_length)
@@ -384,13 +404,13 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     out.text(" tid: ")
     out.decimal(tid)
     out.text("\ntick: ")
-    out.decimal(load(ANCHOR + A_TICK))
+    out.decimal(load(base + A_TICK))
     out.text("\nreplay: ")
     if replay_ticks >= 0:
         out.text("replay.sdrp (")
         out.decimal(replay_ticks)
         out.text(" whole ticks")
-        if load(ANCHOR + A_REPLAY_PENDING) > load(ANCHOR + A_REPLAY_COMMITTED):
+        if load(base + A_REPLAY_PENDING) > load(base + A_REPLAY_COMMITTED):
             out.text(", then the input of the tick that crashed")
         out.text(")")
     else:
@@ -398,17 +418,17 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     out.text("\nstatus: ")
     out.area(T_STATUS)
     out.text("\ncounters: ensure_failures=")
-    out.decimal(load(ANCHOR + A_ENSURE_FAILURES))
+    out.decimal(load(base + A_ENSURE_FAILURES))
     out.text(" check_failures=")
-    out.decimal(load(ANCHOR + A_CHECK_FAILURES))
+    out.decimal(load(base + A_CHECK_FAILURES))
     out.text(" gpu_hangs=")
-    out.decimal(load(ANCHOR + A_GPU_HANGS))
+    out.decimal(load(base + A_GPU_HANGS))
     out.text(" hot_reloads=")
-    out.decimal(load(ANCHOR + A_HOT_RELOADS))
+    out.decimal(load(base + A_HOT_RELOADS))
     out.text(" log_entries=")
-    out.decimal(load(ANCHOR + A_LOG_HEAD))
+    out.decimal(load(base + A_LOG_HEAD))
     out.text(" log_dropped=")
-    out.decimal(load(ANCHOR + A_LOG_DROPPED))
+    out.decimal(load(base + A_LOG_DROPPED))
     out.text("\nregisters: pc=")
     out.hex(pc)
     out.text(" sp=")
@@ -420,7 +440,7 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
         out.text("  #")
         out.decimal(index)
         out.text(" ")
-        out.hex(load(ANCHOR + SCRATCH_FRAMES + index * 8))
+        out.hex(load(base + SCRATCH_FRAMES + index * 8))
         out.byte(10)
     out.text("  pc ")
     out.hex(pc)
@@ -430,7 +450,7 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     if fd >= 0:
         _ = out.write_to(fd)
     out.length = 0
-    var head = load(ANCHOR + A_LOG_HEAD)
+    var head = load(base + A_LOG_HEAD)
     var first_entry = head - TAIL_ENTRIES if head > TAIL_ENTRIES else 0
     for index in range(first_entry, head):
         out.text("  ")
@@ -464,9 +484,11 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
 def restore_and_reraise(signal: Int, info: Int):
     """Put the default action back. A fault re-runs its instruction when the handler
     returns and dies of it; a signal that was sent is sent again."""
-    for index in range(19):  # a zeroed struct sigaction: SIG_DFL
-        store(ANCHOR + SCRATCH_SIGNAL + index * 8, 0)
-    _ = external_call["sigaction", Int32](Int32(signal), ANCHOR + SCRATCH_SIGNAL, Int(0))
+    var base = anchor_base()
+    if base != 0:
+        for index in range(19):  # a zeroed struct sigaction: SIG_DFL
+            store(base + SCRATCH_SIGNAL + index * 8, 0)
+        _ = external_call["sigaction", Int32](Int32(signal), base + SCRATCH_SIGNAL, Int(0))
     var code = Int(Pointer[Int32, origin=MutAnyOrigin](unsafe_from_address=info + 8)[unsafe_offset=0])
     if code <= 0 or signal == SIGABRT:
         _ = sys(SYS_TGKILL, sys(SYS_GETPID), sys(SYS_GETTID), signal)

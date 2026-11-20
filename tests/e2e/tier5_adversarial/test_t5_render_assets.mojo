@@ -1,39 +1,142 @@
-"""Tier 5 Adversarial Coverage Hardening: Render & Asset Subsystems."""
+"""Tier 5 Adversarial Coverage Hardening: Render & Asset Subsystems (11 tests).
+Validates MaterialAsset GPU SSBO extensions, AaaGeometryPool + flpk_v3 cooked slabs,
+unaligned GLB parsing, flpk_v3 alignment & corruption/overflow rejection, QEM + BC7/BC6H,
+v5 SPIR-V shaders, F19 1025-material growth & 18-bit instance limits, HOST_CACHED
+DEVICE_LOCAL staging readbacks for GPU skinning velocity, RenderGraph budgets, and ReSTIR/VSM.
+"""
 from std.collections import List
+from std.ffi import external_call
 from std.math import abs
 from std.memory import bitcast
-from flint.core.math import Vec3
-from flint.core.transform import Quat, Mat4, trs
-from flint.platform.os import write_bytes, remove_file
-from flint.assets.model import NativeModel, NativeMesh, NativeNode
-from flint.assets.mesh_builder import MeshBuilder
-from flint.assets.cooked_model import model_bytes, read_model, model_difference
-from flint.assets.glb_writer import encode_native_glb, append_u32_le, append_f32_le
+from flint.assets.bc_compress import (
+    compute_argb_psnr_db,
+    decode_bc6h_hdr,
+    decode_bc7_rgba,
+    encode_bc6h_hdr,
+    encode_bc7_rgba,
+)
+from flint.assets.flpk_v3 import (
+    ASSET_KIND_MESH,
+    ASSET_KIND_RAW,
+    CHUNK_COMP_NONE,
+    AssetUuid,
+    FlpkBuildChunk,
+    FlpkV3MappedArchive,
+    crc64_ecma_ptr,
+    decode_cooked_mesh_slab_into,
+    encode_cooked_mesh_slab,
+    encode_flpk_v3,
+)
 from flint.assets.glb_native import parse_native_glb
-from flint.assets.vfs import encode_pack, pack_directory, FlpkMappedArchive
-from flint.assets.meshlet import simplify_mesh_qem
-from flint.assets.bc_compress import encode_bc7_rgba, decode_bc7_rgba, encode_bc6h_hdr, decode_bc6h_hdr, compute_argb_psnr_db
-from flint.render.spirv_validate import validate_spirv_module
-from flint.render.ui_overlay import aaa_ui_overlay_shader
+from flint.assets.glb_writer import append_f32_le, append_u32_le, encode_native_glb
+from flint.assets.mesh_builder import MeshBuilder
+from flint.assets.meshlet import AaaGeometryPool, simplify_mesh_qem
+from flint.assets.model import NativeMesh, NativeModel, NativeNode
+from flint.core.lz4 import address_of
+from flint.core.math import Vec3
+from flint.core.transform import Mat4, Quat, trs
+from flint.platform.os import write_bytes
+from flint.platform.vulkan import (
+    ACCESS_HOST_READ,
+    ACCESS_TRANSFER_WRITE,
+    GpuBuffer,
+    PIPELINE_HOST,
+    PIPELINE_TRANSFER,
+)
 from flint.render.aaa_bsdf import AaaMaterial
 from flint.render.aaa_clustered_lights import RestirReservoir
+from flint.render.aaa_froxel_volumetrics import (
+    froxel_inject_and_reproject_shader,
+    froxel_raymarch_integrate_shader,
+)
+from flint.render.aaa_gi_svgf import (
+    AAA_SHADE_CLASS_STANDARD_PBR,
+    aaa_deferred_shade_class_shader,
+    aaa_shade_sky_shader,
+    aaa_tile_classify_shader,
+)
+from flint.render.aaa_post_tsr import (
+    AAA_DISPLAY_LINEAR_SRGB,
+    aaa_display_tonemap_shader,
+    aaa_tsr_v3_resolve_shader,
+)
 from flint.render.aaa_render_graph import (
-    AaaRenderGraph, RgResourceAccess,
-    RG_QUEUE_GRAPHICS, RG_QUEUE_ASYNC_COMPUTE,
-    RG_USAGE_COMPUTE_WRITE, RG_USAGE_COMPUTE_READ, RG_USAGE_FRAGMENT_READ,
+    AaaRenderGraph,
+    RG_QUEUE_ASYNC_COMPUTE,
+    RG_QUEUE_GRAPHICS,
+    RG_USAGE_COMPUTE_READ,
+    RG_USAGE_COMPUTE_WRITE,
+    RG_USAGE_FRAGMENT_READ,
+    RgResourceAccess,
 )
-from flint.render.aaa_vsm import VsmPageManager, VSM_TABLE_WORDS, VSM_VIRTUAL_PAGE_COUNT
-from flint.render.aaa_skinning_rt import AAA_SKIN_PREV_POS_BASE
-from flint.render.aaa_post_tsr import AAA_DISPLAY_LINEAR_SRGB
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
-from flint.render.vulkan_shaders import (
-    raster_shader, hiz_pyramid_shader, gpu_cull_shader,
-    tsr_upscale_shader, froxel_integrate_shader, sky_lut_shader,
+from flint.render.aaa_skinning_rt import AAA_SKIN_PREV_POS_BASE, DualQuat
+from flint.render.aaa_visbuffer import (
+    AAA_MAX_PACKED_INSTANCES,
+    hiz_depth_downsample_shader,
+    meshlet_cull_shader,
+    visbuffer_fragment_shader,
+    visbuffer_vertex_shader,
 )
+from flint.render.aaa_vsm import VSM_TABLE_WORDS, VSM_VIRTUAL_PAGE_COUNT, VsmPageManager
+from flint.render.material_graph import (
+    MaterialAsset,
+    terrain_clipmap_eval_shader,
+    vat_crowd_eval_shader,
+)
+from flint.render.spirv_validate import validate_spirv_module
+from flint.render.ui_overlay import aaa_ui_overlay_shader
 from e2e.common.harness import TestContext
 
 
+def _pid_str() -> String:
+    return String(Int(external_call["getpid", Int32]()))
+
+
+def _readback_dev_floats(mut ren: FlintAaaVulkanRenderer, buf_kind: Int, byte_off: Int, float_count: Int) -> List[Float32]:
+    var out = List[Float32](length=float_count, fill=Float32(0.0))
+    var src_vk = ren.buf_skinning.vk_buffer if buf_kind == 0 else ren.buf_hdr_out.vk_buffer
+    if not ren.active or src_vk == 0 or float_count <= 0:
+        return out^
+    var byte_len = float_count * 4
+    var rb = ren.vk.create_buffer(byte_len, local=False, cpu_reads=True)
+    if rb.vk_buffer != 0 and rb.cpu_address != 0:
+        ren.vk.wait_idle()
+        if ren.vk.begin_commands(0):
+            if buf_kind == 0:
+                ren.vk.copy_buffer(0, ren.buf_skinning, byte_off, rb, 0, byte_len)
+            else:
+                ren.vk.copy_buffer(0, ren.buf_hdr_out, byte_off, rb, 0, byte_len)
+            ren.vk.memory_barrier2(
+                0, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ)
+            )
+            var f = ren.vk.submit(0)
+            if f != 0 and ren.vk.wait(f):
+                _ = external_call["memcpy", Int](Int(out.unsafe_ptr()), rb.cpu_address, byte_len)
+    ren.vk.destroy_buffer(rb)
+    return out^
+
+
 def test_t5_cooked_model_preserves_extensions(mut ctx: TestContext) raises:
+    var mat1 = MaterialAsset(base_color=Vec3(0.7, 0.75, 0.8), roughness=0.3, metallic=0.8)
+    mat1.clearcoat = Float32(0.85)
+    mat1.clearcoat_roughness = Float32(0.12)
+    mat1.specular_factor = Float32(0.25)
+    mat1.iridescence = Float32(0.90)
+    mat1.iridescence_thickness_nm = Float32(420.0)
+    mat1.iridescence_ior = Float32(1.45)
+    mat1.sheen_color = Vec3(0.4, 0.6, 0.8)
+    mat1.sheen_roughness = Float32(0.35)
+
+    var mat2 = MaterialAsset(base_color=Vec3(0.7, 0.75, 0.8), roughness=0.3, metallic=0.8)
+    var w1 = mat1.pack_words()
+    var w2 = mat2.pack_words()
+    var diff_words = 0
+    for i in range(len(w1)):
+        if w1[i] != w2[i]:
+            diff_words += 1
+    ctx.assert_true(diff_words >= 4, "MaterialAsset 24-word GPU packing detects PBR extension differences")
+
     var m1 = NativeModel()
     var mb = MeshBuilder(base_color=0xFFAABBCC, roughness=0.3, metallic=0.8)
     mb.add_beveled_box(Vec3(-1, -1, -1), Vec3(1, 1, 1), 0.1)
@@ -46,25 +149,28 @@ def test_t5_cooked_model_preserves_extensions(mut ctx: TestContext) raises:
     mesh.iridescence_ior = 1.45
     mesh.sheen_color = Vec3(0.4, 0.6, 0.8)
     mesh.sheen_roughness = 0.35
-    m1.meshes.append(mesh^)
+    m1.meshes.append(mesh.copy())
 
-    var m2 = NativeModel()
-    var mb2 = MeshBuilder(base_color=0xFFAABBCC, roughness=0.3, metallic=0.8)
-    mb2.add_beveled_box(Vec3(-1, -1, -1), Vec3(1, 1, 1), 0.1)
-    m2.meshes.append(mb2^.finish())
+    var loaded = parse_native_glb(encode_native_glb(m1))
+    ctx.assert_approx(loaded.meshes[0].clearcoat, 0.85, 0.01, "GLB preserves clearcoat")
+    ctx.assert_approx(loaded.meshes[0].clearcoat_roughness, 0.12, 0.01, "GLB preserves clearcoat_roughness")
+    ctx.assert_approx(loaded.meshes[0].specular_factor, 0.25, 0.01, "GLB preserves specular_factor")
+    ctx.assert_approx(loaded.meshes[0].iridescence, 0.90, 0.01, "GLB preserves iridescence")
+    ctx.assert_approx(loaded.meshes[0].iridescence_thickness_nm, 420.0, 2.5, "GLB preserves iridescence_thickness_nm")
+    ctx.assert_approx(loaded.meshes[0].iridescence_ior, 1.45, 0.01, "GLB preserves iridescence_ior")
+    ctx.assert_approx(loaded.meshes[0].sheen_color.x, 0.4, 0.02, "GLB preserves sheen_color")
+    ctx.assert_approx(loaded.meshes[0].sheen_roughness, 0.35, 0.01, "GLB preserves sheen_roughness")
 
-    ctx.assert_true(model_difference(m1, m2).byte_length() > 0, "model_difference must detect glTF extension differences")
-    var err = String("")
-    var loaded = read_model(model_bytes(m1), err)
-    ctx.assert_equal(err.byte_length(), 0, "read_model error-free")
-    ctx.assert_approx(loaded.meshes[0].clearcoat, 0.85, 0.001, "cooked model preserves clearcoat")
-    ctx.assert_approx(loaded.meshes[0].clearcoat_roughness, 0.12, 0.001, "cooked model preserves clearcoat_roughness")
-    ctx.assert_approx(loaded.meshes[0].specular_factor, 0.25, 0.001, "cooked model preserves specular_factor")
-    ctx.assert_approx(loaded.meshes[0].iridescence, 0.90, 0.001, "cooked model preserves iridescence")
-    ctx.assert_approx(loaded.meshes[0].iridescence_thickness_nm, 420.0, 0.01, "cooked model preserves iridescence_thickness_nm")
-    ctx.assert_approx(loaded.meshes[0].iridescence_ior, 1.45, 0.001, "cooked model preserves iridescence_ior")
-    ctx.assert_approx(loaded.meshes[0].sheen_color.x, 0.4, 0.001, "cooked model preserves sheen_color")
-    ctx.assert_approx(loaded.meshes[0].sheen_roughness, 0.35, 0.001, "cooked model preserves sheen_roughness")
+    var pool = AaaGeometryPool()
+    var entry = pool.append_mesh(mesh, 0, build_lods=True)
+    var slab = encode_cooked_mesh_slab(pool)
+    var pool2 = AaaGeometryPool()
+    var dec = decode_cooked_mesh_slab_into(slab, pool2)
+    ctx.assert_true(dec[0], "flpk_v3 cooked mesh slab decodes cleanly")
+    ctx.assert_equal(len(pool2.meshes), 1, "decoded AaaGeometryPool preserves mesh count")
+    ctx.assert_equal(pool2.meshes[0].vertex_count, entry.vertex_count, "decoded slab preserves vertex_count")
+    ctx.assert_equal(pool2.meshes[0].triangle_count, entry.triangle_count, "decoded slab preserves triangle_count")
+    ctx.assert_equal(len(pool2.meshes[0].lods), len(entry.lods), "decoded slab preserves LOD slices")
 
 
 def test_t5_glb_writer_roundtrips_extensions(mut ctx: TestContext) raises:
@@ -148,67 +254,88 @@ def test_t5_glb_unaligned_accessor_and_extensions(mut ctx: TestContext) raises:
 
 
 def test_t5_vfs_mmap_alignment_and_corrupt_reject(mut ctx: TestContext) raises:
-    var names = List[String]()
-    var files = List[List[UInt8]]()
-    names.append("empty.bin"); files.append(List[UInt8]())
-    names.append("odd_name_123.txt")
-    var f1 = List[UInt8]()
-    for i in range(13): f1.append(UInt8(65 + i))
-    files.append(f1^)
-    names.append("tail.bin")
-    var f2 = List[UInt8]()
-    for i in range(70): f2.append(UInt8(i))
-    files.append(f2^)
+    var pid_s = _pid_str()
+    var p_path = "/tmp/flint_e2e_t5_v3_ok_" + pid_s + ".flpk"
+    var bad_path = "/tmp/flint_e2e_t5_v3_bad_" + pid_s + ".flpk"
+    var ovf_path = "/tmp/flint_e2e_t5_v3_ovf_" + pid_s + ".flpk"
+    ctx.cleanup_artifact(p_path)
+    ctx.cleanup_artifact(bad_path)
+    ctx.cleanup_artifact(ovf_path)
 
-    var pack = encode_pack(names, files)
-    var p_path = String("/tmp/flint_t5_vfs_test.flpk")
-    var bad_path = String("/tmp/flint_t5_vfs_bad.flpk")
-    _ = write_bytes(p_path, pack)
-    var entries = pack_directory(p_path)
-    ctx.assert_equal(len(entries), 3, "3 entries in directory")
-    for i in range(len(entries)):
-        ctx.assert_equal(entries[i].offset % 64, 0, "all flpk v2 entries 64-byte aligned")
+    try:
+        var chunks = List[FlpkBuildChunk]()
+        chunks.append(FlpkBuildChunk(AssetUuid.from_path("empty.bin"), "empty.bin", 0, ASSET_KIND_RAW, List[UInt8](), CHUNK_COMP_NONE))
+        var f1 = List[UInt8]()
+        for i in range(13): f1.append(UInt8(65 + i))
+        chunks.append(FlpkBuildChunk(AssetUuid.from_path("odd_name_123.txt"), "odd_name_123.txt", 0, ASSET_KIND_RAW, f1^, CHUNK_COMP_NONE))
+        var f2 = List[UInt8]()
+        for i in range(4096): f2.append(UInt8(i & 0xFF))
+        chunks.append(FlpkBuildChunk(AssetUuid.from_path("tail.bin"), "tail.bin", 0, ASSET_KIND_MESH, f2^, CHUNK_COMP_NONE))
 
-    var arch = FlpkMappedArchive.open(p_path)
-    ctx.assert_true(arch.addr != 0, "mmap succeeded")
-    ctx.assert_equal(len(arch.read_entry("empty.bin")), 0, "0-byte payload reads cleanly")
-    ctx.assert_equal(len(arch.read_entry("odd_name_123.txt")), 13, "13-byte payload reads cleanly")
-    ctx.assert_equal(len(arch.read_entry("tail.bin")), 70, "70-byte payload reads cleanly")
-    arch.close()
+        var pack = encode_flpk_v3(chunks, page_align=True)
+        ctx.assert_true(write_bytes(p_path, pack), "write valid flpk_v3")
+        var arch = FlpkV3MappedArchive.open(p_path)
+        ctx.assert_true(arch.valid, "FlpkV3MappedArchive mmap opens cleanly")
+        ctx.assert_equal(arch.toc_count(), 3, "3 TOC entries indexed")
+        ctx.assert_equal(Int(arch.toc_entry(0).payload_offset % UInt64(64)), 0, "small chunk 64-byte aligned")
+        ctx.assert_equal(Int(arch.toc_entry(1).payload_offset % UInt64(64)), 0, "odd-length chunk 64-byte aligned")
+        ctx.assert_equal(Int(arch.toc_entry(2).payload_offset % UInt64(4096)), 0, ">=4096B chunk 4096-byte page aligned")
 
-    # Corrupt negative size in entry 1: mmap parser must reject corrupt entries
-    var bad = pack.copy()
-    var e1_off_sz = 16 + (20 + 9) + (20 + 16) - 4
-    bad[e1_off_sz + 0] = 0xFF; bad[e1_off_sz + 1] = 0xFF
-    bad[e1_off_sz + 2] = 0xFF; bad[e1_off_sz + 3] = 0xFF
-    _ = write_bytes(bad_path, bad)
-    var arch_bad = FlpkMappedArchive.open(bad_path)
-    var bad_read = arch_bad.read_entry("odd_name_123.txt")
-    var bad_count = len(arch_bad.entries)
-    arch_bad.close()
+        var r0 = arch.read_payload_by_toc(0, verify_crc=True)
+        var r1 = arch.read_payload_by_toc(1, verify_crc=True)
+        var r2 = arch.read_payload_by_toc(2, verify_crc=True)
+        var t2_off = Int(arch.toc_entry(2).payload_offset)
+        var str_end = Int(arch.header.path_table_offset) + Int(arch.header.hash_table_capacity) * 16 + Int(arch.header.string_pool_bytes)
+        var meta_end = (str_end + 63) & ~63
+        arch.close()
 
-    # Craft 64-bit signed integer overflow in entry 0: offset = 0x7FFFFFFFFFFFF000, size = 0x2000
-    var ovf = pack.copy()
-    var e0_off_at = 16 + 4 + 9  # header(16) + name_len(4) + len("empty.bin")(9)
-    var ovf_off = UInt64(0x7FFFFFFFFFFFF000)
-    var ovf_sz = UInt64(0x2000)
-    for b_i in range(8):
-        ovf[e0_off_at + b_i] = UInt8((ovf_off >> UInt64(b_i * 8)) & 0xFF)
-        ovf[e0_off_at + 8 + b_i] = UInt8((ovf_sz >> UInt64(b_i * 8)) & 0xFF)
-    var ovf_path = String("/tmp/flint_t5_vfs_ovf.flpk")
-    _ = write_bytes(ovf_path, ovf)
-    var ovf_dir = pack_directory(ovf_path)
-    var arch_ovf = FlpkMappedArchive.open(ovf_path)
-    var ovf_mmap_cnt = len(arch_ovf.entries)
-    arch_ovf.close()
+        ctx.assert_true(r0[0] and len(r0[1]) == 0, "0-byte payload reads cleanly with CRC64")
+        ctx.assert_true(r1[0] and len(r1[1]) == 13, "13-byte payload reads cleanly with CRC64")
+        ctx.assert_true(r2[0] and len(r2[1]) == 4096, "4096-byte payload reads cleanly with CRC64")
 
-    _ = remove_file(p_path)
-    _ = remove_file(bad_path)
-    _ = remove_file(ovf_path)
-    ctx.assert_equal(bad_count, 0, "corrupt directory rejected entirely")
-    ctx.assert_equal(len(bad_read), 0, "corrupt negative-size entry must be rejected safely")
-    ctx.assert_equal(len(ovf_dir), 0, "pack_directory must reject 64-bit signed offset+size overflow")
-    ctx.assert_equal(ovf_mmap_cnt, 0, "FlpkMappedArchive must reject 64-bit signed offset+size overflow")
+        # 1. Corrupt payload byte -> verify_entry_crc64 / read_payload_by_toc rejects cleanly
+        var bad = pack.copy()
+        bad[t2_off] = bad[t2_off] ^ 0xFF
+        _ = write_bytes(bad_path, bad)
+        var arch_bad = FlpkV3MappedArchive.open(bad_path)
+        ctx.assert_true(arch_bad.valid, "metadata remains valid while payload is corrupted")
+        var bad_crc_ok = arch_bad.verify_entry_crc64(2)
+        var bad_read = arch_bad.read_payload_by_toc(2, verify_crc=True)
+        arch_bad.close()
+        ctx.assert_false(bad_crc_ok, "corrupted payload fails ECMA-182 CRC64 verification")
+        ctx.assert_false(bad_read[0], "read_payload_by_toc rejects corrupted payload")
+
+        # 2. Craft 64-bit signed offset+size overflow in TOC entry 0 with valid forged TOC CRC64 -> open() reaches _range_within_u64
+        var ovf = pack.copy()
+        var e0_off_at = 64 + 24
+        var ovf_off = UInt64(0x7FFFFFFFFFFFF000)
+        var ovf_sz = UInt64(0x2000)
+        for b_i in range(8):
+            ovf[e0_off_at + b_i] = UInt8((ovf_off >> UInt64(b_i * 8)) & 0xFF)
+            ovf[e0_off_at + 8 + b_i] = UInt8((ovf_sz >> UInt64(b_i * 8)) & 0xFF)
+        var hdr_crc = crc64_ecma_ptr(address_of(ovf), 56, 0)
+        var meta_crc = crc64_ecma_ptr(address_of(ovf) + 64, meta_end - 64, hdr_crc)
+        _ = len(ovf)
+        for b_i in range(8):
+            ovf[56 + b_i] = UInt8((meta_crc >> UInt64(b_i * 8)) & 0xFF)
+        _ = write_bytes(ovf_path, ovf)
+        var arch_ovf = FlpkV3MappedArchive.open(ovf_path)
+        var ovf_valid = arch_ovf.valid
+        var ovf_cnt = arch_ovf.toc_count()
+        var ovf_note = arch_ovf.error_note
+        arch_ovf.close()
+        ctx.assert_false(ovf_valid, "FlpkV3MappedArchive rejects overflowing TOC entry even with valid CRC64")
+        ctx.assert_equal(ovf_cnt, 0, "rejected flpk_v3 exposes 0 TOC entries")
+        ctx.assert_equal(ovf_note, "TOC entry payload range out of bounds", "forged-CRC overflow reaches _range_within_u64 range guard")
+    except e:
+        ctx.cleanup_artifact(p_path)
+        ctx.cleanup_artifact(bad_path)
+        ctx.cleanup_artifact(ovf_path)
+        raise e^
+
+    ctx.cleanup_artifact(p_path)
+    ctx.cleanup_artifact(bad_path)
+    ctx.cleanup_artifact(ovf_path)
 
 
 def test_t5_qem_preserves_extensions_and_bc_non4x4(mut ctx: TestContext) raises:
@@ -251,26 +378,35 @@ def test_t5_qem_preserves_extensions_and_bc_non4x4(mut ctx: TestContext) raises:
 
 
 def test_t5_ui_overlay_shader_and_glyph_render(mut ctx: TestContext) raises:
-    var rep = validate_spirv_module(aaa_ui_overlay_shader())
-    ctx.assert_true(rep.valid, "aaa_ui_overlay_shader passes SPIR-V SSA validator")
-    ctx.assert_true(validate_spirv_module(raster_shader()).valid, "raster_shader validates")
-    ctx.assert_true(validate_spirv_module(hiz_pyramid_shader()).valid, "hiz_pyramid_shader validates")
-    ctx.assert_true(validate_spirv_module(gpu_cull_shader()).valid, "gpu_cull_shader validates")
-    ctx.assert_true(validate_spirv_module(tsr_upscale_shader()).valid, "tsr_upscale_shader validates")
-    ctx.assert_true(validate_spirv_module(froxel_integrate_shader()).valid, "froxel_integrate_shader validates")
-    ctx.assert_true(validate_spirv_module(sky_lut_shader()).valid, "sky_lut_shader validates")
+    ctx.assert_true(validate_spirv_module(aaa_ui_overlay_shader()).valid, "aaa_ui_overlay_shader validates")
+    ctx.assert_true(validate_spirv_module(visbuffer_vertex_shader()).valid, "visbuffer_vertex_shader validates")
+    ctx.assert_true(validate_spirv_module(visbuffer_fragment_shader()).valid, "visbuffer_fragment_shader validates")
+    ctx.assert_true(validate_spirv_module(hiz_depth_downsample_shader()).valid, "hiz_depth_downsample_shader validates")
+    ctx.assert_true(validate_spirv_module(meshlet_cull_shader()).valid, "meshlet_cull_shader validates")
+    ctx.assert_true(validate_spirv_module(aaa_tile_classify_shader()).valid, "aaa_tile_classify_shader validates")
+    ctx.assert_true(
+        validate_spirv_module(aaa_deferred_shade_class_shader(True, AAA_SHADE_CLASS_STANDARD_PBR, True)).valid,
+        "aaa_deferred_shade_class_shader validates",
+    )
+    ctx.assert_true(validate_spirv_module(aaa_shade_sky_shader()).valid, "aaa_shade_sky_shader validates")
+    ctx.assert_true(validate_spirv_module(aaa_tsr_v3_resolve_shader()).valid, "aaa_tsr_v3_resolve_shader validates")
+    ctx.assert_true(validate_spirv_module(aaa_display_tonemap_shader()).valid, "aaa_display_tonemap_shader validates")
+    ctx.assert_true(validate_spirv_module(froxel_inject_and_reproject_shader()).valid, "froxel_inject_and_reproject_shader validates")
+    ctx.assert_true(validate_spirv_module(froxel_raymarch_integrate_shader()).valid, "froxel_raymarch_integrate_shader validates")
+    ctx.assert_true(validate_spirv_module(vat_crowd_eval_shader()).valid, "vat_crowd_eval_shader validates")
+    ctx.assert_true(validate_spirv_module(terrain_clipmap_eval_shader()).valid, "terrain_clipmap_eval_shader validates")
 
     var ren = FlintAaaVulkanRenderer(width=160, height=120)
+    ctx.assert_true(ren.active, "FlintAaaVulkanRenderer active for UI glyph render")
+    ctx.assert_true(ren.ui_font.valid, "UI SDF font loaded in renderer")
     ren.display_mode = AAA_DISPLAY_LINEAR_SRGB
     ren.begin_frame(Vec3(0, 0, -5), Vec3(0, 0, 0))
     ren.ui_draw_list.add_rect(0.0, 0.0, 160.0, 120.0, 0xFF000000, 0.0)
-    if ren.ui_font.valid:
-        ren.ui_draw_list.add_text(ren.ui_font_atlas_slot, ren.ui_font, "H", 20.0, 60.0, 32.0, 0xFFFFFFFF)
-    _ = ren.render_frame(capture_readback=True)
+    ren.ui_draw_list.add_text(ren.ui_font_atlas_slot, ren.ui_font, "H", 20.0, 60.0, 32.0, 0xFFFFFFFF)
+    ctx.assert_true(ren.render_frame(capture_readback=True), "UI glyph frame renders")
     var px = ren.readback_pixels()
     ren.shutdown()
 
-    # Check that glyph bbox contains BOTH lit and unlit pixels (actual glyph silhouette, not solid block)
     var lit = 0; var dark = 0
     for y in range(30, 62):
         for x in range(20, 44):
@@ -281,6 +417,7 @@ def test_t5_ui_overlay_shader_and_glyph_render(mut ctx: TestContext) raises:
 
 def test_t5_ui_scratch_overflow_guard(mut ctx: TestContext) raises:
     var ren = FlintAaaVulkanRenderer(width=16, height=16)
+    ctx.assert_true(ren.active, "FlintAaaVulkanRenderer active for 16x16 scratch guard")
     ren.begin_frame()
     for _ in range(500):
         ren.ui_draw_list.add_rect(0.0, 0.0, 10.0, 10.0, 0xFF00FF00)
@@ -291,6 +428,7 @@ def test_t5_ui_scratch_overflow_guard(mut ctx: TestContext) raises:
 
 def test_t5_renderer_1024_instances_and_materials(mut ctx: TestContext) raises:
     var ren = FlintAaaVulkanRenderer(width=192, height=128, max_instances=2048)
+    ctx.assert_true(ren.active, "FlintAaaVulkanRenderer active")
     ren.display_mode = AAA_DISPLAY_LINEAR_SRGB
     ren.enable_vsm = False
     var m_green = ren.add_material(AaaMaterial(base_color=Vec3(0.0, 1.0, 0.0), roughness=0.5))
@@ -307,28 +445,50 @@ def test_t5_renderer_1024_instances_and_materials(mut ctx: TestContext) raises:
     for _ in range(1024):
         ren.draw_instance(me.mesh_id, offscreen, material_override=m_green)
     ren.draw_instance(me.mesh_id, trs(Vec3(0, 0, 0), Quat(), Vec3(1, 1, 1)), material_override=m_red)
-    _ = ren.render_frame(capture_readback=True)
+    ctx.assert_true(ren.render_frame(capture_readback=True), "1025-instance frame renders")
     var center_px = ren.readback_pixels()[64 * 192 + 96]
 
-    # Verify 1024-material SSBO bounds check
+    # F19: Dynamic material buffer growth beyond 1024 materials
     while len(ren.materials) < 1024:
         _ = ren.add_material(AaaMaterial())
-    var overflow_id = ren.add_material(AaaMaterial())
+    var mat_1024 = AaaMaterial(base_color=Vec3(0.0, 0.0, 1.0), roughness=0.5)
+    mat_1024.emissive = Vec3(0.0, 0.0, 5.0)
+    var id_1024 = ren.add_material(mat_1024)
     var mat_count = len(ren.materials)
+    var mat_buf_size = ren.buf_materials.size
+    ren.begin_frame(Vec3(0.0, 0.0, -3.6), Vec3(0.0, 0.0, 0.0), fov_y_deg=50.0)
+    ren.draw_instance(me.mesh_id, trs(Vec3(0, 0, 0), Quat(), Vec3(1, 1, 1)), material_override=id_1024)
+    ctx.assert_true(ren.render_frame(capture_readback=True), "1025th material draws cleanly after SSBO grow")
+    var blue_center = ren.readback_pixels()[64 * 192 + 96]
     ren.shutdown()
 
-    var ren_cap = FlintAaaVulkanRenderer(width=64, height=64, max_instances=65536)
+    # F19: 18-bit VisBuffer packed instance limit (262143)
+    var ren_64k = FlintAaaVulkanRenderer(width=64, height=64, max_instances=65536)
+    ctx.assert_true(ren_64k.active, "ren_64k active")
+    var max_64k = ren_64k.max_instances
+    ren_64k.shutdown()
+
+    var ren_cap = FlintAaaVulkanRenderer(width=64, height=64, max_instances=300000)
+    ctx.assert_true(ren_cap.active, "ren_cap active")
     var capped_max_inst = ren_cap.max_instances
     ren_cap.shutdown()
 
-    ctx.assert_equal(capped_max_inst, 32768, "max_instances must clamp to 15-bit VisBuffer limit 32768")
-    ctx.assert_true(Int((center_px >> 16) & 255) > 240 and Int(center_px & 255) < 80, "instance 1024 must render red without VisBuffer wraparound")
-    ctx.assert_equal(overflow_id, -1, "1025th material must be rejected cleanly")
-    ctx.assert_equal(mat_count, 1024, "material list capped at 1024")
+    ctx.assert_equal(max_64k, 65536, "65536 instances supported without legacy 32768 cap")
+    ctx.assert_equal(capped_max_inst, Int(AAA_MAX_PACKED_INSTANCES), "max_instances clamps to 18-bit VisBuffer limit 262143")
+    ctx.assert_true(Int((center_px >> 16) & 255) > 240 and Int(center_px & 255) < 80, "instance 1024 renders red without VisBuffer wraparound")
+    ctx.assert_equal(id_1024, 1024, "1025th material succeeds via F19 dynamic buffer growth")
+    ctx.assert_equal(mat_count, 1025, "material list dynamically grows to 1025")
+    ctx.assert_true(mat_buf_size >= 1025 * 24 * 4, "buf_materials grew to hold 1025 materials")
+    ctx.assert_true(Int(blue_center & 255) > 220, "1025th material renders blue accurately")
 
 
 def test_t5_skinned_prev_pos_offset(mut ctx: TestContext) raises:
     var ren = FlintAaaVulkanRenderer(width=64, height=64)
+    ctx.assert_true(ren.active, "FlintAaaVulkanRenderer active for GPU skinning test")
+    ctx.assert_equal(ren.buf_skinning.cpu_address, 0, "buf_skinning resides in DEVICE_LOCAL VRAM (cpu_address == 0)")
+    ctx.assert_equal(ren.buf_hdr_out.cpu_address, 0, "buf_hdr_out resides in DEVICE_LOCAL VRAM (cpu_address == 0)")
+    ctx.assert_equal(ren.buf_hdr_out.vk_suballoc_block, -2, "buf_hdr_out bound to aliased transient heap (-2)")
+
     ren.display_mode = AAA_DISPLAY_LINEAR_SRGB
     ren.enable_vsm = False
     var mb_s = MeshBuilder()
@@ -341,23 +501,48 @@ def test_t5_skinned_prev_pos_offset(mut ctx: TestContext) raises:
     var j_pack = List[UInt32](length=sk_m.vertex_count(), fill=0)
     var j_w = List[Vec3](length=sk_m.vertex_count(), fill=Vec3(1.0, 0.0, 0.0))
     var sk_entry = ren.add_skinned_mesh(sk_m, j_pack, j_w, 0)
-    var ptr_skin = Pointer[UInt32, ImmutAnyOrigin](unsafe_from_address=ren.buf_skinning.cpu_address)
-    var at_bind0_x = bitcast[DType.float32](ptr_skin[unsafe_offset=AAA_SKIN_PREV_POS_BASE + sk_entry.skin_bind_first_slot * 3])
 
-    # Stationary skinned mesh added after static mesh must produce zero phantom motion vectors
+    # Read back DEVICE_LOCAL buf_skinning via HOST_CACHED staging copy (zero raw .cpu_address dereference!)
+    var skin_off_bytes = (AAA_SKIN_PREV_POS_BASE + sk_entry.skin_bind_first_slot * 3) * 4
+    var skin_floats = _readback_dev_floats(ren, 0, skin_off_bytes, 4)
+    var at_bind0_x = skin_floats[0]
+
+    # Frame 1: stationary skinned mesh added after static mesh must produce zero phantom motion vectors
     ren.begin_frame(Vec3(1.5, 0.5, -3.5), Vec3(1.5, 0.5, 0.0))
     ren.svgf_passes = 0
     ren.draw_instance(sk_entry.mesh_entry.mesh_id, trs(Vec3(1.5, 0.5, 0.0), Quat(), Vec3(1, 1, 1)))
-    _ = ren.render_frame(capture_readback=True)
-    var hdr_ptr = Pointer[UInt32, ImmutAnyOrigin](unsafe_from_address=ren.buf_hdr_out.cpu_address)
+    ctx.assert_true(ren.render_frame(capture_readback=True), "frame 1 stationary skinned render succeeds")
+    var hdr1 = _readback_dev_floats(ren, 1, 0, 64 * 64 * 8)
     var pix_base = (32 * 64 + 32) * 8
-    var linear_z = bitcast[DType.float32](hdr_ptr[unsafe_offset=pix_base + 3])
-    var vel_u = bitcast[DType.float32](hdr_ptr[unsafe_offset=pix_base + 4])
-    var vel_v = bitcast[DType.float32](hdr_ptr[unsafe_offset=pix_base + 5])
+    var linear_z1 = hdr1[pix_base + 3]
+    var vel_u1 = hdr1[pix_base + 4]
+    var vel_v1 = hdr1[pix_base + 5]
+    var resolved1 = ren.readback_resolved_hdr()
+
+    # Frame 2: real skeletal displacement via defer_to_frame=True must produce non-zero GPU motion vectors
+    var id_bones = List[DualQuat]()
+    id_bones.append(DualQuat())
+    var moved_bones = List[DualQuat]()
+    moved_bones.append(DualQuat.from_quat_trans(Quat(), Vec3(0.4, 0.0, 0.0)))
+    _ = ren.update_skinned_mesh_bones(sk_entry, moved_bones, id_bones, invalidate_vsm=False, defer_to_frame=True)
+    ren.begin_frame(Vec3(1.5, 0.5, -3.5), Vec3(1.5, 0.5, 0.0))
+    ren.draw_instance(sk_entry.mesh_entry.mesh_id, trs(Vec3(1.5, 0.5, 0.0), Quat(), Vec3(1, 1, 1)))
+    ctx.assert_true(ren.render_frame(capture_readback=True), "frame 2 displaced skinned render succeeds")
+    var hdr2 = _readback_dev_floats(ren, 1, 0, 64 * 64 * 8)
+    var max_vel = Float32(0.0)
+    for pi in range(64 * 64):
+        var pb = pi * 8
+        if hdr2[pb + 3] < Float32(100.0):
+            var vm = abs(hdr2[pb + 4]) + abs(hdr2[pb + 5])
+            if vm > max_vel:
+                max_vel = vm
     ren.shutdown()
+
     ctx.assert_approx(at_bind0_x, sk_m.positions[0], 0.001, "skinned prev_pos initialized at skin_bind_first_slot * 3")
-    ctx.assert_true(linear_z < Float32(100.0), "center pixel hits stationary skinned mesh")
-    ctx.assert_true(abs(vel_u) < Float32(1e-3) and abs(vel_v) < Float32(1e-3), "stationary skinned mesh after static mesh must have zero phantom velocity")
+    ctx.assert_true(linear_z1 < Float32(100.0), "center pixel hits stationary skinned mesh")
+    ctx.assert_true(abs(vel_u1) < Float32(1e-3) and abs(vel_v1) < Float32(1e-3), "stationary skinned mesh after static mesh has zero phantom velocity")
+    ctx.assert_equal(len(resolved1), 64 * 64, "readback_resolved_hdr returns full 64x64 buffer")
+    ctx.assert_true(max_vel > Float32(1e-4), "multi-frame skeletal bone displacement emits non-zero GPU motion vectors")
 
 
 def test_t5_render_graph_budget_and_multireader_barriers(mut ctx: TestContext) raises:
@@ -412,3 +597,11 @@ def run_all(mut ctx: TestContext) raises:
     try: test_t5_skinned_prev_pos_offset(ctx); ctx.record_pass("test_t5_skinned_prev_pos_offset") except e: ctx.record_fail("test_t5_skinned_prev_pos_offset", String(e))
     try: test_t5_render_graph_budget_and_multireader_barriers(ctx); ctx.record_pass("test_t5_render_graph_budget_and_multireader_barriers") except e: ctx.record_fail("test_t5_render_graph_budget_and_multireader_barriers", String(e))
     try: test_t5_restir_rand1_and_vsm_oversubscription(ctx); ctx.record_pass("test_t5_restir_rand1_and_vsm_oversubscription") except e: ctx.record_fail("test_t5_restir_rand1_and_vsm_oversubscription", String(e))
+
+
+def main() raises:
+    var ctx = TestContext()
+    run_all(ctx)
+    ctx.print_summary()
+    if ctx.failed_tests > 0:
+        raise Error("test_t5_render_assets failed")

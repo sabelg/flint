@@ -6,12 +6,14 @@ for this window: see platform/wayland_bridge.mojo. All this code runs the same t
 """
 from std.ffi import external_call
 from flint.platform.input import InputState
+from flint.platform.traits import WindowBackend
+from flint.input.evdev import EvdevHub
 from flint.platform.wayland_bridge import WaylandBridge
 from flint.platform.x11 import X11Window
+from flint.platform.xkb import XkbKeymap
 from flint.platform.kms import KmsWindow, on_virtual_console, fit_rect
 from flint.platform.vulkan import VulkanGpu, SwapchainHandle
-from flint.platform.dynlib import dl_open, dl_sym, dl_close
-from flint.platform.os import env_value, env_flag, close_fd, get_time
+from flint.platform.os import env_value, env_flag, close_fd, get_time, last_errno, EINTR
 
 # Held in the pending key and button queues: everything held is released here.
 comptime RELEASE_HELD: Int = -1
@@ -66,6 +68,79 @@ def wl_append_string(mut data: List[UInt8], value: String):
 
 def wl_fixed(value: Int) -> Float32:
     return Float32(value) / 256.0
+
+
+def wl_get_string(data: List[UInt8], offset: Int, max_end: Int) -> String:
+    if offset + 4 > max_end or offset + 4 > len(data):
+        return ""
+    var length = wl_get32(data, offset)
+    if length <= 1 or offset + 4 + length > max_end or offset + 4 + length > len(data):
+        return ""
+    var bytes = List[UInt8](capacity=length - 1)
+    for i in range(length - 1):
+        bytes.append(data[offset + 4 + i])
+    return String(unsafe_from_utf8=bytes)
+
+
+def wl_append_nullable_string(mut data: List[UInt8], value: String):
+    if value.byte_length() == 0:
+        wl_append32(data, 0)
+    else:
+        wl_append_string(data, value)
+
+
+def _hex_digit_val(b: UInt8) -> Int:
+    if b >= 48 and b <= 57:
+        return Int(b - 48)
+    if b >= 65 and b <= 70:
+        return Int(b - 55)
+    if b >= 97 and b <= 102:
+        return Int(b - 87)
+    return -1
+
+
+def parse_uri_list(text: String) -> List[String]:
+    """Parses RFC 2483 `text/uri-list` payload into decoded local filesystem paths."""
+    var out = List[String]()
+    var bytes = text.as_bytes()
+    var n = len(bytes)
+    var i = 0
+    while i < n:
+        var start = i
+        while i < n and bytes[i] != 10:
+            i += 1
+        var end = i
+        if end > start and bytes[end - 1] == 13:
+            end -= 1
+        while start < end and (bytes[start] == 32 or bytes[start] == 9):
+            start += 1
+        while end > start and (bytes[end - 1] == 32 or bytes[end - 1] == 9):
+            end -= 1
+        if i < n and bytes[i] == 10:
+            i += 1
+        if end <= start or bytes[start] == 35:  # empty or '#' comment
+            continue
+        var line = String(text[byte=start:end])
+        var path_raw = line
+        if line.startswith("file://localhost/"):
+            path_raw = String(line[byte=16:])
+        elif line.startswith("file:///"):
+            path_raw = String(line[byte=7:])
+        var pbytes = path_raw.as_bytes()
+        var decoded = List[UInt8](capacity=len(pbytes))
+        var j = 0
+        while j < len(pbytes):
+            if pbytes[j] == 37 and j + 2 < len(pbytes):
+                var hi = _hex_digit_val(pbytes[j + 1])
+                var lo = _hex_digit_val(pbytes[j + 2])
+                if hi >= 0 and lo >= 0:
+                    decoded.append(UInt8((hi << 4) | lo))
+                    j += 3
+                    continue
+            decoded.append(pbytes[j])
+            j += 1
+        out.append(String(unsafe_from_utf8=decoded))
+    return out^
 
 
 def evdev_key(key: Int) -> Int:
@@ -137,10 +212,28 @@ def evdev_key(key: Int) -> Int:
         return 44
     if key == 53:
         return 47
+    if key == 102:
+        return 268  # Home
+    if key == 107:
+        return 269  # End
+    if key == 110:
+        return 260  # Insert
+    if key == 111:
+        return 261  # Delete
+    if key == 104:
+        return 266  # PageUp
+    if key == 109:
+        return 267  # PageDown
+    if key == 58:
+        return 280  # CapsLock
+    if key == 125:
+        return 343  # LeftSuper
+    if key == 126:
+        return 347  # RightSuper
     return -1
 
 
-struct WaylandWindow(Copyable, Movable):
+struct WaylandWindow(WindowBackend):
     var fd: Int
     var bridge: WaylandBridge
     var wants_bridge: Bool
@@ -183,6 +276,7 @@ struct WaylandWindow(Copyable, Movable):
     var pointer_enter_serial: Int
     var keyboard: Int
     var incoming: List[UInt8]
+    var pending_fds: List[Int]
     var awaiting_syncs: List[Int]
     var done_callbacks: List[Int]
     var protocol_errors: Int
@@ -217,9 +311,34 @@ struct WaylandWindow(Copyable, Movable):
     var window_title: String
     var logical_width: Int
     var logical_height: Int
-    var x11_xcb_lib: Int
-    var x11_xcb_conn: Int
-    var x11_xcb_disconnect: Int
+    # F23: Fractional scaling, Server-Side Decorations, Clipboard & DnD, XKB, EvdevHub
+    var fractional_scale_manager: Int
+    var fractional_scale: Int
+    var fractional_scale_num: Int
+    var preferred_buffer_scale: Int
+    var applied_buffer_scale: Int
+    var scale_changed: Bool
+    var decoration_manager: Int
+    var toplevel_decoration: Int
+    var decoration_mode: Int
+    var data_device_manager: Int
+    var data_device_version: Int
+    var data_device: Int
+    var last_input_serial: Int
+    var clipboard_source: Int
+    var clipboard_text: String
+    var clipboard_owned: Bool
+    var selection_offer_id: Int
+    var offer_ids: List[Int]
+    var offer_mimes: List[List[String]]
+    var dnd_offer_id: Int
+    var dnd_serial: Int
+    var dnd_x: Float32
+    var dnd_y: Float32
+    var pending_dropped_files: List[String]
+    var xkb_keymap: XkbKeymap
+    var pending_text_utf8: String
+    var evdev: EvdevHub
 
     def __init__(out self):
         self.fd = -1
@@ -264,6 +383,7 @@ struct WaylandWindow(Copyable, Movable):
         self.pointer_enter_serial = 0
         self.keyboard = 0
         self.incoming = List[UInt8]()
+        self.pending_fds = List[Int]()
         self.awaiting_syncs = List[Int]()
         self.done_callbacks = List[Int]()
         self.protocol_errors = 0
@@ -298,9 +418,164 @@ struct WaylandWindow(Copyable, Movable):
         self.window_title = "FLINT ENGINE"
         self.logical_width = 1280
         self.logical_height = 720
-        self.x11_xcb_lib = 0
-        self.x11_xcb_conn = 0
-        self.x11_xcb_disconnect = 0
+        self.fractional_scale_manager = 0
+        self.fractional_scale = 0
+        self.fractional_scale_num = 120
+        self.preferred_buffer_scale = 1
+        self.applied_buffer_scale = 1
+        self.scale_changed = False
+        self.decoration_manager = 0
+        self.toplevel_decoration = 0
+        self.decoration_mode = 0
+        self.data_device_manager = 0
+        self.data_device_version = 0
+        self.data_device = 0
+        self.last_input_serial = 0
+        self.clipboard_source = 0
+        self.clipboard_text = ""
+        self.clipboard_owned = False
+        self.selection_offer_id = 0
+        self.offer_ids = List[Int]()
+        self.offer_mimes = List[List[String]]()
+        self.dnd_offer_id = 0
+        self.dnd_serial = 0
+        self.dnd_x = 0
+        self.dnd_y = 0
+        self.pending_dropped_files = List[String]()
+        self.xkb_keymap = XkbKeymap()
+        self.pending_text_utf8 = ""
+        self.evdev = EvdevHub(enable_hotplug=False)
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.fd = existing.fd
+        self.bridge = existing.bridge^
+        self.wants_bridge = existing.wants_bridge
+        self.width = existing.width
+        self.height = existing.height
+        self.close_requested = existing.close_requested
+        self.configured = existing.configured
+        self.focused = existing.focused
+        self.fullscreen = existing.fullscreen
+        self.next_id = existing.next_id
+        self.registry = existing.registry
+        self.compositor = existing.compositor
+        self.compositor_name = existing.compositor_name
+        self.shm = existing.shm
+        self.shm_name = existing.shm_name
+        self.dmabuf = existing.dmabuf
+        self.buffer_releases = existing.buffer_releases
+        self.commits = existing.commits
+        self.viewporter = existing.viewporter
+        self.viewport = existing.viewport
+        self.viewport_width = existing.viewport_width
+        self.viewport_height = existing.viewport_height
+        self.pointer_constraints = existing.pointer_constraints
+        self.relative_manager = existing.relative_manager
+        self.relative_pointer = existing.relative_pointer
+        self.locked_pointer = existing.locked_pointer
+        self.pointer_locked = existing.pointer_locked
+        self.pending_relative_x = existing.pending_relative_x
+        self.pending_relative_y = existing.pending_relative_y
+        self.wm_base = existing.wm_base
+        self.wm_name = existing.wm_name
+        self.seat = existing.seat
+        self.seat_name = existing.seat_name
+        self.seat_version = existing.seat_version
+        self.seat_capabilities = existing.seat_capabilities
+        self.surface = existing.surface
+        self.xdg_surface = existing.xdg_surface
+        self.toplevel = existing.toplevel
+        self.pointer = existing.pointer
+        self.pointer_enter_serial = existing.pointer_enter_serial
+        self.keyboard = existing.keyboard
+        self.incoming = existing.incoming^
+        self.pending_fds = existing.pending_fds^
+        self.awaiting_syncs = existing.awaiting_syncs^
+        self.done_callbacks = existing.done_callbacks^
+        self.protocol_errors = existing.protocol_errors
+        self.dmabuf_objects = existing.dmabuf_objects^
+        self.buffer_rejected = existing.buffer_rejected
+        self.last_error = existing.last_error^
+        self.shared_fd = existing.shared_fd
+        self.shared_size = existing.shared_size
+        self.pool = existing.pool
+        self.buffers = existing.buffers^
+        self.buffer_busy = existing.buffer_busy^
+        self.buffer_width = existing.buffer_width
+        self.buffer_height = existing.buffer_height
+        self.frame_callback = existing.frame_callback
+        self.frame_requested_at = existing.frame_requested_at
+        self.pending_mouse_x = existing.pending_mouse_x
+        self.pending_mouse_y = existing.pending_mouse_y
+        self.pending_buttons = existing.pending_buttons^
+        self.pending_button_down = existing.pending_button_down^
+        self.pending_wheel = existing.pending_wheel
+        self.pending_keys = existing.pending_keys^
+        self.pending_key_down = existing.pending_key_down^
+        self.x11 = existing.x11^
+        self.using_x11 = existing.using_x11
+        self.kms = existing.kms^
+        self.using_kms = existing.using_kms
+        self.wants_kms_vulkan = existing.wants_kms_vulkan
+        self.wants_gpu_fullscreen = existing.wants_gpu_fullscreen
+        self.swapchain = existing.swapchain^
+        self.gpu_width = existing.gpu_width
+        self.gpu_height = existing.gpu_height
+        self.window_title = existing.window_title^
+        self.logical_width = existing.logical_width
+        self.logical_height = existing.logical_height
+        self.fractional_scale_manager = existing.fractional_scale_manager
+        self.fractional_scale = existing.fractional_scale
+        self.fractional_scale_num = existing.fractional_scale_num
+        self.preferred_buffer_scale = existing.preferred_buffer_scale
+        self.applied_buffer_scale = existing.applied_buffer_scale
+        self.scale_changed = existing.scale_changed
+        self.decoration_manager = existing.decoration_manager
+        self.toplevel_decoration = existing.toplevel_decoration
+        self.decoration_mode = existing.decoration_mode
+        self.data_device_manager = existing.data_device_manager
+        self.data_device_version = existing.data_device_version
+        self.data_device = existing.data_device
+        self.last_input_serial = existing.last_input_serial
+        self.clipboard_source = existing.clipboard_source
+        self.clipboard_text = existing.clipboard_text^
+        self.clipboard_owned = existing.clipboard_owned
+        self.selection_offer_id = existing.selection_offer_id
+        self.offer_ids = existing.offer_ids^
+        self.offer_mimes = existing.offer_mimes^
+        self.dnd_offer_id = existing.dnd_offer_id
+        self.dnd_serial = existing.dnd_serial
+        self.dnd_x = existing.dnd_x
+        self.dnd_y = existing.dnd_y
+        self.pending_dropped_files = existing.pending_dropped_files^
+        self.xkb_keymap = existing.xkb_keymap^
+        self.pending_text_utf8 = existing.pending_text_utf8^
+        self.evdev = existing.evdev^
+        existing.fd = -1
+        existing.shared_fd = -1
+        existing.shared_size = 0
+        existing.using_x11 = False
+        existing.using_kms = False
+        existing.gpu_width = 0
+        existing.gpu_height = 0
+        existing.toplevel = 0
+        existing.xdg_surface = 0
+        existing.surface = 0
+        existing.pointer = 0
+        existing.keyboard = 0
+        existing.seat = 0
+        existing.wm_base = 0
+        existing.pool = 0
+        existing.viewport = 0
+        existing.fractional_scale = 0
+        existing.toplevel_decoration = 0
+        existing.data_device = 0
+        existing.clipboard_source = 0
+        existing.selection_offer_id = 0
+        existing.dnd_offer_id = 0
+
+    def __deinit__(deinit self):
+        self.close()
 
     def set_title(mut self, title: String):
         self.window_title = title
@@ -456,25 +731,190 @@ struct WaylandWindow(Copyable, Movable):
         _ = self.request(1, 0, body)
         return callback
 
+    def pop_incoming_fd(mut self) -> Int:
+        if len(self.pending_fds) == 0:
+            return -1
+        return self.pending_fds.pop(0)
+
+    def _register_offer(mut self, offer_id: Int):
+        if offer_id == 0:
+            return
+        for i in range(len(self.offer_ids)):
+            if self.offer_ids[i] == offer_id:
+                self.offer_mimes[i].clear()
+                return
+        self.offer_ids.append(offer_id)
+        self.offer_mimes.append(List[String]())
+
+    def _has_offer(self, offer_id: Int) -> Bool:
+        if offer_id == 0:
+            return False
+        for i in range(len(self.offer_ids)):
+            if self.offer_ids[i] == offer_id:
+                return True
+        return False
+
+    def _add_offer_mime(mut self, offer_id: Int, mime: String):
+        for i in range(len(self.offer_ids)):
+            if self.offer_ids[i] == offer_id:
+                self.offer_mimes[i].append(mime)
+                return
+
+    def _offer_has_mime(self, offer_id: Int, mime: String) -> Bool:
+        for i in range(len(self.offer_ids)):
+            if self.offer_ids[i] == offer_id:
+                for m in self.offer_mimes[i]:
+                    if m == mime:
+                        return True
+                return False
+        return False
+
+    def _destroy_offer(mut self, offer_id: Int):
+        if offer_id == 0:
+            return
+        if self.fd >= 0:
+            _ = self.empty_request(offer_id, 2)  # wl_data_offer.destroy
+        for i in range(len(self.offer_ids)):
+            if self.offer_ids[i] == offer_id:
+                _ = self.offer_ids.pop(i)
+                _ = self.offer_mimes.pop(i)
+                return
+
+    def _pick_text_mime(self, offer_id: Int) -> String:
+        if self._offer_has_mime(offer_id, "text/plain;charset=utf-8"):
+            return "text/plain;charset=utf-8"
+        if self._offer_has_mime(offer_id, "UTF8_STRING"):
+            return "UTF8_STRING"
+        if self._offer_has_mime(offer_id, "text/plain"):
+            return "text/plain"
+        return ""
+
+    def _pick_dnd_mime(self, offer_id: Int) -> String:
+        if self._offer_has_mime(offer_id, "text/uri-list"):
+            return "text/uri-list"
+        if self._offer_has_mime(offer_id, "text/plain;charset=utf-8"):
+            return "text/plain;charset=utf-8"
+        if self._offer_has_mime(offer_id, "text/plain"):
+            return "text/plain"
+        return ""
+
+    def _read_offer_string(mut self, offer_id: Int, mime: String) -> String:
+        if self.fd < 0 or offer_id == 0 or mime.byte_length() == 0:
+            return ""
+        var pipe_fds = List[Int32](length=2, fill=-1)
+        if external_call["pipe2", Int32](pipe_fds.unsafe_ptr(), Int32(0x80800)) != 0:  # O_NONBLOCK | O_CLOEXEC
+            if external_call["pipe", Int32](pipe_fds.unsafe_ptr()) != 0:
+                return ""
+            _ = external_call["fcntl", Int32](pipe_fds[0], Int32(4), Int32(0x800))
+        var read_fd = Int(pipe_fds[0])
+        var write_fd = Int(pipe_fds[1])
+
+        var body = List[UInt8]()
+        wl_append_string(body, mime)
+        var req = List[UInt8](length=8 + len(body), fill=0)
+        wl_put32(req, 0, offer_id)
+        wl_put16(req, 4, 1)  # wl_data_offer.receive
+        wl_put16(req, 6, len(req))
+        for i in range(len(body)):
+            req[8 + i] = body[i]
+        var ok = self.send_with_fd(req, write_fd)
+        close_fd(write_fd)
+        if not ok:
+            close_fd(read_fd)
+            return ""
+
+        var out = List[UInt8]()
+        var chunk = List[UInt8](length=4096, fill=0)
+        var pfd = List[UInt8](length=8, fill=0)
+        var deadline = get_time() + 0.25
+        while get_time() < deadline:
+            var n = Int(external_call["read", Int64](Int32(read_fd), chunk.unsafe_ptr(), Int64(len(chunk))))
+            if n > 0:
+                for i in range(n):
+                    out.append(chunk[i])
+                continue
+            if n == 0:
+                break
+            var err = last_errno()
+            if err == EINTR:
+                continue
+            if err != Int32(11):  # not EAGAIN
+                break
+            wl_put32(pfd, 0, read_fd)
+            wl_put16(pfd, 4, 1)  # POLLIN
+            _ = external_call["poll", Int32](pfd.unsafe_ptr(), UInt64(1), Int32(10))
+            self.receive()
+        _ = len(chunk)
+        _ = len(pfd)
+        close_fd(read_fd)
+        return String(unsafe_from_utf8=out)
+
+    def ensure_data_device(mut self):
+        if self.data_device != 0 or self.data_device_manager == 0 or self.seat == 0 or self.fd < 0:
+            return
+        self.data_device = self.allocate_id()
+        if self.bridge.active():
+            self.bridge.note_data_device(self.data_device)
+        var body = List[UInt8]()
+        wl_append32(body, self.data_device)
+        wl_append32(body, self.seat)
+        _ = self.request(self.data_device_manager, 1, body)  # get_data_device
+
     def receive(mut self):
         if self.bridge.active():
-            self.bridge.read_into(self.incoming)
+            self.bridge.read_into(self.incoming, self.pending_fds)
             if self.bridge.failed():
                 self.close_requested = True
             self.handle_incoming()
             return
+        if self.fd < 0:
+            return
         var buffer = List[UInt8](length=16384, fill=0)
-        while True:
-            var count = Int(external_call["recv", Int64](Int32(self.fd), buffer.unsafe_ptr(), Int64(len(buffer)), Int32(64)))
+        var iov = List[UInt8](length=16, fill=0)
+        var control = List[UInt8](length=272, fill=0)
+        var msg = List[UInt8](length=56, fill=0)
+        for _ in range(128):
+            for k in range(len(control)):
+                control[k] = 0
+            for k in range(len(msg)):
+                msg[k] = 0
+            wl_put64(iov, 0, UInt64(buffer.unsafe_ptr()))
+            wl_put64(iov, 8, UInt64(len(buffer)))
+            wl_put64(msg, 16, UInt64(iov.unsafe_ptr()))
+            wl_put64(msg, 24, 1)
+            wl_put64(msg, 32, UInt64(control.unsafe_ptr()))
+            wl_put64(msg, 40, UInt64(len(control)))
+            var count = Int(external_call["recvmsg", Int64](Int32(self.fd), msg.unsafe_ptr(), Int32(64)))  # MSG_DONTWAIT
             if count == 0:
                 self.close_requested = True
                 break
             if count < 0:
+                if last_errno() == EINTR:
+                    continue
                 break
             for index in range(count):
                 self.incoming.append(buffer[index])
-            if count < len(buffer):
+            var ctrl_len = 0
+            for idx in range(8):
+                ctrl_len |= Int(msg[40 + idx]) << (idx * 8)
+            var off = 0
+            while off + 16 <= ctrl_len and off + 16 <= len(control):
+                var cmsg_len = 0
+                for idx in range(8):
+                    cmsg_len |= Int(control[off + idx]) << (idx * 8)
+                if cmsg_len < 16 or off + cmsg_len > len(control):
+                    break
+                if wl_get32(control, off + 8) == 1 and wl_get32(control, off + 12) == 1:  # SOL_SOCKET, SCM_RIGHTS
+                    var n_fds = (cmsg_len - 16) // 4
+                    for idx in range(n_fds):
+                        self.pending_fds.append(wl_get32(control, off + 16 + idx * 4))
+                off += (cmsg_len + 7) & ~7
+            if count < len(buffer) and ctrl_len == 0:
                 break
+        _ = len(buffer)
+        _ = len(iov)
+        _ = len(control)
+        _ = len(msg)
         self.handle_incoming()
 
     def handle_incoming(mut self):
@@ -487,10 +927,13 @@ struct WaylandWindow(Copyable, Movable):
                 self.protocol_errors += 1
                 self.last_error = "invalid event header"
                 self.close_requested = True
+                self.incoming.clear()
                 return
             if len(self.incoming) < size:
                 break
-            self.handle_event(object, opcode, size)
+            var pkt = List[UInt8](length=size, fill=0)
+            for i in range(size):
+                pkt[i] = self.incoming[i]
             var rem = len(self.incoming) - size
             if rem == 0:
                 self.incoming.clear()
@@ -498,20 +941,21 @@ struct WaylandWindow(Copyable, Movable):
                 for i in range(rem):
                     self.incoming[i] = self.incoming[size + i]
                 self.incoming.resize(rem, 0)
+            self.handle_event(pkt, object, opcode, size)
 
-    def handle_event(mut self, object: Int, opcode: Int, size: Int):
+    def handle_event(mut self, pkt: List[UInt8], object: Int, opcode: Int, size: Int):
         if object == 1 and opcode == 0:
             self.protocol_errors += 1
-            var culprit = wl_get32(self.incoming, 8) if size >= 12 else 0
+            var culprit = wl_get32(pkt, 8) if size >= 12 else 0
             var message = "wl_display error"
             # wl_display.error carries object id, error code, then the message.
             if size >= 24:
-                var length = wl_get32(self.incoming, 16)
+                var length = wl_get32(pkt, 16)
                 if length > 0 and 20 + length <= size:
                     var bytes = List[UInt8]()
                     for index in range(length - 1):
-                        bytes.append(self.incoming[20 + index])
-                    message = "object " + String(wl_get32(self.incoming, 8)) + " code " + String(wl_get32(self.incoming, 12)) + ": " + String(unsafe_from_utf8=bytes)
+                        bytes.append(pkt[20 + index])
+                    message = "object " + String(wl_get32(pkt, 8)) + " code " + String(wl_get32(pkt, 12)) + ": " + String(unsafe_from_utf8=bytes)
             self.last_error = message
             # The connection is lost either way, but only this error has a way forward.
             if culprit != 0 and (culprit == self.dmabuf or culprit in self.dmabuf_objects):
@@ -522,18 +966,18 @@ struct WaylandWindow(Copyable, Movable):
         if object == 1 and opcode == 1:
             return
         if object == self.registry and opcode == 0 and size >= 20:
-            var name = wl_get32(self.incoming, 8)
-            var length = wl_get32(self.incoming, 12)
+            var name = wl_get32(pkt, 8)
+            var length = wl_get32(pkt, 12)
             if length <= 0 or 16 + length > size:
                 return
             var bytes = List[UInt8]()
             for index in range(length - 1):
-                bytes.append(self.incoming[16 + index])
+                bytes.append(pkt[16 + index])
             var interface = String(unsafe_from_utf8=bytes)
             var version_offset = 16 + ((length + 3) & ~3)
             if version_offset + 4 > size:
                 return
-            var version = wl_get32(self.incoming, version_offset)
+            var version = wl_get32(pkt, version_offset)
             if interface == "wl_compositor" and self.compositor == 0:
                 self.compositor_name = name
                 self.compositor = self.bind_compositor(name, version)
@@ -555,31 +999,55 @@ struct WaylandWindow(Copyable, Movable):
                 self.seat_name = name
                 self.seat_version = min(version, 5)
                 self.seat = self.bind_global(name, interface, self.seat_version)
+                self.ensure_data_device()
+            elif interface == "wp_fractional_scale_manager_v1" and self.fractional_scale_manager == 0:
+                self.fractional_scale_manager = self.bind_global(name, interface, 1)
+            elif interface == "zxdg_decoration_manager_v1" and self.decoration_manager == 0:
+                self.decoration_manager = self.bind_global(name, interface, 1)
+            elif interface == "wl_data_device_manager" and self.data_device_manager == 0:
+                self.data_device_version = min(version, 3)
+                self.data_device_manager = self.bind_global(name, interface, self.data_device_version)
+                self.ensure_data_device()
+            return
+        if object == self.surface and self.surface != 0:
+            if opcode == 2 and size >= 12:  # preferred_buffer_scale
+                self.preferred_buffer_scale = max(1, wl_get32(pkt, 8))
+            return
+        if object == self.fractional_scale and self.fractional_scale != 0:
+            if opcode == 0 and size >= 12:  # preferred_scale
+                var num = wl_get32(pkt, 8)
+                if num > 0:
+                    self.fractional_scale_num = num
+                    self.scale_changed = True
+            return
+        if object == self.toplevel_decoration and self.toplevel_decoration != 0:
+            if opcode == 0 and size >= 12:  # configure(mode)
+                self.decoration_mode = wl_get32(pkt, 8)
             return
         if object == self.wm_base and opcode == 0:
             var body = List[UInt8]()
-            wl_append32(body, wl_get32(self.incoming, 8))
+            wl_append32(body, wl_get32(pkt, 8))
             _ = self.request(self.wm_base, 3, body)
             return
         if object == self.xdg_surface and opcode == 0:
             var body = List[UInt8]()
-            wl_append32(body, wl_get32(self.incoming, 8))
+            wl_append32(body, wl_get32(pkt, 8))
             _ = self.request(self.xdg_surface, 4, body)
             self.configured = True
             return
         if object == self.toplevel and opcode == 0:
-            var width = wl_get32(self.incoming, 8)
-            var height = wl_get32(self.incoming, 12)
+            var width = wl_get32(pkt, 8)
+            var height = wl_get32(pkt, 12)
             if width > 0 and height > 0 and (width != self.width or height != self.height):
                 self.width = width
                 self.height = height
             self.fullscreen = False
             self.focused = False
             if size >= 20:
-                var states_length = wl_get32(self.incoming, 16)
+                var states_length = wl_get32(pkt, 16)
                 var count = min((size - 20) // 4, states_length // 4)
                 for index in range(count):
-                    var state = wl_get32(self.incoming, 20 + index * 4)
+                    var state = wl_get32(pkt, 20 + index * 4)
                     if state == 2:
                         self.fullscreen = True
                     elif state == 4:
@@ -589,7 +1057,7 @@ struct WaylandWindow(Copyable, Movable):
             self.close_requested = True
             return
         if object == self.seat and opcode == 0:
-            self.seat_capabilities = wl_get32(self.incoming, 8)
+            self.seat_capabilities = wl_get32(pkt, 8)
             self.create_input_devices()
             return
         if object == self.locked_pointer and self.locked_pointer != 0:
@@ -600,42 +1068,167 @@ struct WaylandWindow(Copyable, Movable):
         if object == self.relative_pointer and self.relative_pointer != 0:
             # Fields: time high, time low, dx, dy, then unaccelerated dx and dy at 24 and 28.
             if opcode == 0 and size >= 32 and self.pointer_locked:
-                self.pending_relative_x += wl_fixed(wl_gets32(self.incoming, 24))
-                self.pending_relative_y += wl_fixed(wl_gets32(self.incoming, 28))
+                self.pending_relative_x += wl_fixed(wl_gets32(pkt, 24))
+                self.pending_relative_y += wl_fixed(wl_gets32(pkt, 28))
             return
-        if object == self.pointer:
+        if object == self.pointer and self.pointer != 0:
             if opcode == 0 and size >= 16:
-                self.pointer_enter_serial = wl_get32(self.incoming, 8)
+                self.pointer_enter_serial = wl_get32(pkt, 8)
+                self.last_input_serial = self.pointer_enter_serial
                 if self.pointer_locked:
                     self.hide_cursor()
             elif opcode == 1:
                 self.pending_buttons.append(RELEASE_HELD)
                 self.pending_button_down.append(False)
             elif opcode == 2 and size >= 20:
-                self.pending_mouse_x = wl_fixed(wl_gets32(self.incoming, 12))
-                self.pending_mouse_y = wl_fixed(wl_gets32(self.incoming, 16))
+                self.pending_mouse_x = wl_fixed(wl_gets32(pkt, 12))
+                self.pending_mouse_y = wl_fixed(wl_gets32(pkt, 16))
             elif opcode == 3 and size >= 24:
-                var button = wl_get32(self.incoming, 16) - 272  # BTN_LEFT, BTN_RIGHT, BTN_MIDDLE
+                self.last_input_serial = wl_get32(pkt, 8)
+                var button = wl_get32(pkt, 16) - 272  # BTN_LEFT, BTN_RIGHT, BTN_MIDDLE
                 if button >= 0 and button < MOUSE_BUTTONS:
                     self.pending_buttons.append(button)
-                    self.pending_button_down.append(wl_get32(self.incoming, 20) == 1)
+                    self.pending_button_down.append(wl_get32(pkt, 20) == 1)
             elif opcode == 4 and size >= 20:
-                var axis = wl_get32(self.incoming, 12)
+                var axis = wl_get32(pkt, 12)
                 if axis == 0:
-                    self.pending_wheel -= wl_fixed(wl_gets32(self.incoming, 16))
+                    self.pending_wheel -= wl_fixed(wl_gets32(pkt, 16))
             return
-        if object == self.keyboard:
-            if opcode == 1:
+        if object == self.keyboard and self.keyboard != 0:
+            if opcode == 0 and size >= 16:  # keymap(format, fd, size)
+                var fmt = wl_get32(pkt, 8)
+                var ksz = wl_get32(pkt, 12)
+                var kfd = self.pop_incoming_fd()
+                if fmt == 1 and kfd >= 0 and ksz > 0:
+                    var mapped = external_call["mmap", Int](
+                        Int(0), Int64(ksz), Int32(1), Int32(2), Int32(kfd), Int64(0)
+                    )  # PROT_READ=1, MAP_PRIVATE=2
+                    if mapped != 0 and mapped != -1:
+                        var ptr = Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=mapped)
+                        var bytes = List[UInt8](capacity=ksz)
+                        for i in range(ksz):
+                            var b = ptr[unsafe_offset=i]
+                            if b == 0:
+                                break
+                            bytes.append(b)
+                        _ = external_call["munmap", Int32](mapped, Int64(ksz))
+                        _ = self.xkb_keymap.parse(String(unsafe_from_utf8=bytes))
+                elif fmt == 0:
+                    self.xkb_keymap.reset_us_fallback()
+                if kfd >= 0:
+                    close_fd(kfd)
+            elif opcode == 1:
+                if size >= 12:
+                    self.last_input_serial = wl_get32(pkt, 8)
                 self.focused = True
             elif opcode == 2:
                 self.focused = False
                 self.pending_keys.append(RELEASE_HELD)
                 self.pending_key_down.append(False)
             elif opcode == 3 and size >= 24:
-                var key = evdev_key(wl_get32(self.incoming, 16))
+                self.last_input_serial = wl_get32(pkt, 8)
+                var evdev_code = wl_get32(pkt, 16)
+                var is_pressed = wl_get32(pkt, 20) == 1
+                var key = evdev_key(evdev_code)
                 if key >= 0:
                     self.pending_keys.append(key)
-                    self.pending_key_down.append(wl_get32(self.incoming, 20) == 1)
+                    self.pending_key_down.append(is_pressed)
+                if is_pressed:
+                    var utf8 = self.xkb_keymap.translate_key_to_utf8(evdev_code)
+                    if utf8.byte_length() > 0:
+                        self.pending_text_utf8 += utf8
+            elif opcode == 4 and size >= 28:  # modifiers(serial, depressed, latched, locked, group)
+                self.xkb_keymap.set_modifiers(
+                    wl_get32(pkt, 12),
+                    wl_get32(pkt, 16),
+                    wl_get32(pkt, 20),
+                    wl_get32(pkt, 24),
+                )
+            return
+        if object == self.data_device and self.data_device != 0:
+            if opcode == 0 and size >= 12:  # data_offer(new_id)
+                self._register_offer(wl_get32(pkt, 8))
+            elif opcode == 1 and size >= 28:  # enter(serial, surface, x, y, id)
+                var serial = wl_get32(pkt, 8)
+                var oid = wl_get32(pkt, 24)
+                if self.dnd_offer_id != 0 and self.dnd_offer_id != oid and self.dnd_offer_id != self.selection_offer_id:
+                    self._destroy_offer(self.dnd_offer_id)
+                self.dnd_serial = serial
+                self.dnd_x = wl_fixed(wl_gets32(pkt, 16))
+                self.dnd_y = wl_fixed(wl_gets32(pkt, 20))
+                self.dnd_offer_id = oid
+                if oid != 0:
+                    var dnd_mime = self._pick_dnd_mime(oid)
+                    var acc_body = List[UInt8]()
+                    wl_append32(acc_body, serial)
+                    wl_append_nullable_string(acc_body, dnd_mime)
+                    _ = self.request(oid, 0, acc_body)  # accept
+                    if self.data_device_version >= 3 and dnd_mime.byte_length() > 0:
+                        var act_body = List[UInt8]()
+                        wl_append32(act_body, 1)  # copy
+                        wl_append32(act_body, 1)  # preferred = copy
+                        _ = self.request(oid, 4, act_body)  # set_actions
+            elif opcode == 2:  # leave
+                if self.dnd_offer_id != 0 and self.dnd_offer_id != self.selection_offer_id:
+                    self._destroy_offer(self.dnd_offer_id)
+                self.dnd_offer_id = 0
+            elif opcode == 3 and size >= 20:  # motion(time, x, y)
+                self.dnd_x = wl_fixed(wl_gets32(pkt, 12))
+                self.dnd_y = wl_fixed(wl_gets32(pkt, 16))
+            elif opcode == 4:  # drop
+                if self.dnd_offer_id != 0:
+                    var drop_oid = self.dnd_offer_id
+                    self.dnd_offer_id = 0
+                    var dnd_mime = self._pick_dnd_mime(drop_oid)
+                    if dnd_mime.byte_length() > 0:
+                        var payload = self._read_offer_string(drop_oid, dnd_mime)
+                        if dnd_mime == "text/uri-list":
+                            var paths = parse_uri_list(payload)
+                            for p in paths:
+                                self.pending_dropped_files.append(p)
+                        elif payload.byte_length() > 0:
+                            self.pending_dropped_files.append(payload)
+                    if self.data_device_version >= 3:
+                        _ = self.empty_request(drop_oid, 3)  # finish
+                    if drop_oid != self.selection_offer_id:
+                        self._destroy_offer(drop_oid)
+            elif opcode == 5 and size >= 12:  # selection(id)
+                var new_sel = wl_get32(pkt, 8)
+                if self.selection_offer_id != 0 and self.selection_offer_id != new_sel and self.selection_offer_id != self.dnd_offer_id:
+                    self._destroy_offer(self.selection_offer_id)
+                self.selection_offer_id = new_sel
+            return
+        if self._has_offer(object):
+            if opcode == 0 and size >= 12:  # wl_data_offer.offer(mime_type)
+                var mime = wl_get_string(pkt, 8, size)
+                if mime.byte_length() > 0:
+                    self._add_offer_mime(object, mime)
+            return
+        if object == self.clipboard_source and self.clipboard_source != 0:
+            if opcode == 1:  # wl_data_source.send(mime_type, fd)
+                var sfd = self.pop_incoming_fd()
+                if sfd >= 0:
+                    var bytes = self.clipboard_text.as_bytes()
+                    var off = 0
+                    while off < len(bytes):
+                        var w = Int(
+                            external_call["write", Int64](
+                                Int32(sfd),
+                                bytes.unsafe_ptr().unsafe_offset(off),
+                                Int64(len(bytes) - off),
+                            )
+                        )
+                        if w > 0:
+                            off += w
+                            continue
+                        if w < 0 and (last_errno() == EINTR or last_errno() == Int32(11)):
+                            continue
+                        break
+                    close_fd(sfd)
+            elif opcode == 2:  # wl_data_source.cancelled
+                _ = self.empty_request(self.clipboard_source, 1)  # destroy
+                self.clipboard_source = 0
+                self.clipboard_owned = False
             return
         if object in self.buffers and opcode == 0:
             for index in range(len(self.buffers)):
@@ -784,6 +1377,21 @@ struct WaylandWindow(Copyable, Movable):
             body = List[UInt8]()
             wl_append32(body, 0)  # xdg_toplevel.set_fullscreen on any output
             _ = self.request(self.toplevel, 11, body)
+        if self.fractional_scale_manager != 0 and self.fractional_scale == 0:
+            self.fractional_scale = self.allocate_id()
+            body = List[UInt8]()
+            wl_append32(body, self.fractional_scale)
+            wl_append32(body, self.surface)
+            _ = self.request(self.fractional_scale_manager, 1, body)
+        if self.decoration_manager != 0 and self.toplevel_decoration == 0:
+            self.toplevel_decoration = self.allocate_id()
+            body = List[UInt8]()
+            wl_append32(body, self.toplevel_decoration)
+            wl_append32(body, self.toplevel)
+            _ = self.request(self.decoration_manager, 1, body)
+            body = List[UInt8]()
+            wl_append32(body, 2)  # server-side decoration mode
+            _ = self.request(self.toplevel_decoration, 1, body)
         _ = self.empty_request(self.surface, 6)
         body = List[UInt8]()
         wl_append32(body, 0)
@@ -794,52 +1402,13 @@ struct WaylandWindow(Copyable, Movable):
         if not self.wait_callback(self.sync(), True):
             self.close()
             return False
+        _ = self.evdev.enable_hotplug()
+        _ = self.evdev.discover_initial()
         return True
 
     def enable_vulkan_bridge(mut self):
         """Enables `WaylandBridge` before `initialize()` so windowed Wayland sessions can attach zero-copy Vulkan swapchains."""
         self.wants_bridge = True
-
-    def _ensure_xcb_connection(mut self) -> Bool:
-        """Lazily opens `libxcb.so.1` and connects an `xcb_connection_t*` for `VK_KHR_xcb_surface`."""
-        if self.x11_xcb_conn != 0:
-            return True
-        if self.x11_xcb_lib == 0:
-            self.x11_xcb_lib = dl_open("libxcb.so.1")
-        if self.x11_xcb_lib == 0:
-            return False
-        var fn_connect = dl_sym(self.x11_xcb_lib, "xcb_connect")
-        var fn_has_err = dl_sym(self.x11_xcb_lib, "xcb_connection_has_error")
-        self.x11_xcb_disconnect = dl_sym(self.x11_xcb_lib, "xcb_disconnect")
-        if fn_connect == 0 or fn_has_err == 0 or self.x11_xcb_disconnect == 0:
-            _ = dl_close(self.x11_xcb_lib)
-            self.x11_xcb_lib = 0
-            self.x11_xcb_disconnect = 0
-            return False
-        comptime XcbConnect = def(Int, Int) thin abi("C") -> Int
-        comptime XcbHasError = def(Int) thin abi("C") -> Int32
-        var conn = Pointer(to=fn_connect).unsafe_bitcast[XcbConnect]()[unsafe_offset=0](0, 0)
-        if conn == 0:
-            return False
-        var err = Pointer(to=fn_has_err).unsafe_bitcast[XcbHasError]()[unsafe_offset=0](conn)
-        if err != 0:
-            comptime XcbDisconnect = def(Int) thin abi("C") -> None
-            var fn_disc = self.x11_xcb_disconnect
-            Pointer(to=fn_disc).unsafe_bitcast[XcbDisconnect]()[unsafe_offset=0](conn)
-            return False
-        self.x11_xcb_conn = conn
-        return True
-
-    def _close_xcb_connection(mut self):
-        if self.x11_xcb_conn != 0 and self.x11_xcb_disconnect != 0:
-            comptime XcbDisconnect = def(Int) thin abi("C") -> None
-            var fn_disc = self.x11_xcb_disconnect
-            Pointer(to=fn_disc).unsafe_bitcast[XcbDisconnect]()[unsafe_offset=0](self.x11_xcb_conn)
-        self.x11_xcb_conn = 0
-        self.x11_xcb_disconnect = 0
-        if self.x11_xcb_lib != 0:
-            _ = dl_close(self.x11_xcb_lib)
-            self.x11_xcb_lib = 0
 
     def attach_vulkan(mut self, mut vk: VulkanGpu, width: Int, height: Int, prefer_mailbox: Bool = True, prefer_hdr10: Bool = False) -> SwapchainHandle:
         """A swapchain on whatever this window is, so a game presents zero-copy without
@@ -849,35 +1418,43 @@ struct WaylandWindow(Copyable, Movable):
           size; the compositor scales it to the window (wp_viewporter), aspect-fit when
           fullscreen, so a fullscreen game can be scanned out with no copy at all.
         - KMS: Vulkan takes the display at a mode of exactly that size (KmsWindow.attach_vulkan).
-        - X11: opens a `libxcb.so.1` connection and attaches `VK_KHR_xcb_surface` against `self.x11.window_id`.
+        - X11: delegates to `X11Window.attach_vulkan()` (`VK_KHR_xcb_surface`).
         An empty handle (`swapchain == 0`) means keep presenting CPU frames with present(),
         which still works. When it is not empty present() does nothing, so draw HUDs
         on the GPU. Call `vk.close_swapchain()` before close()."""
         if self.using_kms:
-            var sc_kms = self.kms.attach_vulkan(vk, width, height, prefer_hdr10)
-            self.swapchain = sc_kms.copy()
-            return sc_kms^
-        if self.using_x11:
-            if not self.x11.active() or not self._ensure_xcb_connection():
-                self.swapchain = SwapchainHandle()
-                return SwapchainHandle()
-            var sc_x11 = vk.attach_surface(
-                xcb_conn=self.x11_xcb_conn,
-                xcb_win=self.x11.window_id,
-                width=width,
-                height=height,
-                prefer_mailbox=prefer_mailbox,
-                prefer_hdr10=prefer_hdr10,
+            self.swapchain = self.kms.attach_vulkan(vk, width, height, prefer_hdr10)
+            return SwapchainHandle(
+                self.swapchain.surface,
+                self.swapchain.swapchain,
+                self.swapchain.width,
+                self.swapchain.height,
+                self.swapchain.format,
+                self.swapchain.color_space,
+                self.swapchain.present_mode,
+                self.swapchain.image_count,
+                self.swapchain.is_hdr,
             )
-            self.swapchain = sc_x11.copy()
-            if sc_x11.swapchain != 0:
-                self.gpu_width = sc_x11.width
-                self.gpu_height = sc_x11.height
-            return sc_x11^
+        if self.using_x11:
+            self.swapchain = self.x11.attach_vulkan(vk, width, height, prefer_mailbox, prefer_hdr10)
+            if self.swapchain.swapchain != 0:
+                self.gpu_width = self.swapchain.width
+                self.gpu_height = self.swapchain.height
+            return SwapchainHandle(
+                self.swapchain.surface,
+                self.swapchain.swapchain,
+                self.swapchain.width,
+                self.swapchain.height,
+                self.swapchain.format,
+                self.swapchain.color_space,
+                self.swapchain.present_mode,
+                self.swapchain.image_count,
+                self.swapchain.is_hdr,
+            )
         if not self.bridge.active() or self.bridge.surface_proxy == 0:
             self.swapchain = SwapchainHandle()
             return SwapchainHandle()
-        var sc = vk.attach_surface(
+        self.swapchain = vk.attach_surface(
             wl_display=self.bridge.display,
             wl_surface=self.bridge.surface_proxy,
             width=width,
@@ -885,25 +1462,34 @@ struct WaylandWindow(Copyable, Movable):
             prefer_mailbox=prefer_mailbox,
             prefer_hdr10=prefer_hdr10,
         )
-        self.swapchain = sc.copy()
-        if sc.swapchain != 0:
-            self.gpu_width = sc.width
-            self.gpu_height = sc.height
+        if self.swapchain.swapchain != 0:
+            self.gpu_width = self.swapchain.width
+            self.gpu_height = self.swapchain.height
             self.fit_swapchain_to_window()
-        return sc^
+        return SwapchainHandle(
+            self.swapchain.surface,
+            self.swapchain.swapchain,
+            self.swapchain.width,
+            self.swapchain.height,
+            self.swapchain.format,
+            self.swapchain.color_space,
+            self.swapchain.present_mode,
+            self.swapchain.image_count,
+            self.swapchain.is_hdr,
+        )
 
     def detach_vulkan(mut self, mut vk: VulkanGpu) -> Bool:
         """Undo attach_vulkan: close the swapchain and go back to present() with CPU frames
         (on KMS this sets the window's own mode again). True when present() works again."""
         self.swapchain = SwapchainHandle()
-        if self.using_kms:
-            return self.kms.detach_vulkan(vk)
-        vk.close_swapchain()
-        if self.using_x11:
-            self._close_xcb_connection()
         self.gpu_width = 0
         self.gpu_height = 0
-        return self.fd >= 0 or self.using_x11
+        if self.using_kms:
+            return self.kms.detach_vulkan(vk)
+        if self.using_x11:
+            return self.x11.detach_vulkan(vk)
+        vk.close_swapchain()
+        return self.fd >= 0
 
     def presents_on_gpu(self) -> Bool:
         """True once a Vulkan swapchain owns presentation on KMS, Wayland, or X11 (present() is then a no-op)."""
@@ -956,7 +1542,7 @@ struct WaylandWindow(Copyable, Movable):
             self.focused = self.x11.focused
             self.fullscreen = self.x11.fullscreen
             return
-        input.poll_gamepad()
+        self.evdev.poll(input)
         if self.fd < 0:
             return
         self.receive()
@@ -1001,6 +1587,12 @@ struct WaylandWindow(Copyable, Movable):
                 input.set_key(self.pending_keys[index], self.pending_key_down[index])
         self.pending_keys.clear()
         self.pending_key_down.clear()
+        if self.pending_text_utf8.byte_length() > 0:
+            input.push_text_utf8(self.pending_text_utf8)
+            self.pending_text_utf8 = ""
+        for p in self.pending_dropped_files:
+            input.push_dropped_file(p)
+        self.pending_dropped_files.clear()
 
     def destroy_shared(mut self):
         for buffer in self.buffers:
@@ -1122,8 +1714,18 @@ struct WaylandWindow(Copyable, Movable):
             self.frame_callback = 0
         # When `wp_viewporter` is available, keep the shm pool at `source_width x source_height`
         # so the Wayland compositor stretches it on the GPU in 0 ms instead of scaling on CPU!
-        var tgt_w = source_width if self.viewporter != 0 else self.width
-        var tgt_h = source_height if self.viewporter != 0 else self.height
+        var tgt_w = source_width
+        var tgt_h = source_height
+        if self.viewporter == 0:
+            var fb = self.framebuffer_size()
+            tgt_w = fb[0]
+            tgt_h = fb[1]
+            var target_bscale = max(1, self.preferred_buffer_scale)
+            if self.applied_buffer_scale != target_bscale:
+                var bs_body = List[UInt8]()
+                wl_append32(bs_body, target_bscale)
+                _ = self.request(self.surface, 8, bs_body)  # wl_surface.set_buffer_scale
+                self.applied_buffer_scale = target_bscale
         if self.shared_fd < 0 or self.buffer_width != tgt_w or self.buffer_height != tgt_h:
             if not self.create_shared(tgt_w, tgt_h):
                 self.protocol_errors += 1
@@ -1323,6 +1925,96 @@ struct WaylandWindow(Copyable, Movable):
             wl_append32(body, 0)
             _ = self.request(self.toplevel, 11, body)
 
+    def content_scale(self) -> Float32:
+        if self.using_kms:
+            return 1.0
+        if self.using_x11:
+            return self.x11.content_scale()
+        if self.fractional_scale != 0 and self.fractional_scale_num > 0:
+            return Float32(self.fractional_scale_num) / Float32(120.0)
+        return Float32(max(1, self.preferred_buffer_scale))
+
+    def framebuffer_size(self) -> Tuple[Int, Int]:
+        if self.using_kms:
+            return (max(1, self.kms.width), max(1, self.kms.height))
+        if self.using_x11:
+            return self.x11.framebuffer_size()
+        var s = self.content_scale()
+        return (
+            max(1, Int(Float32(self.width) * s + Float32(0.5))),
+            max(1, Int(Float32(self.height) * s + Float32(0.5))),
+        )
+
+    def supports_fractional_scale_protocol(self) -> Bool:
+        return True
+
+    def supports_xdg_decoration_protocol(self) -> Bool:
+        return True
+
+    def supports_data_device_clipboard(self) -> Bool:
+        return True
+
+    def clipboard_set(mut self, text: String):
+        if self.using_x11:
+            self.x11.clipboard_set(text)
+            return
+        if self.using_kms:
+            self.kms.clipboard_set(text)
+            return
+        self.clipboard_text = text
+        self.clipboard_owned = True
+        if self.fd < 0 or self.data_device_manager == 0 or self.data_device == 0:
+            return
+        if self.clipboard_source != 0:
+            _ = self.empty_request(self.clipboard_source, 1)  # destroy old source
+            self.clipboard_source = 0
+        self.clipboard_source = self.allocate_id()
+        if self.bridge.active():
+            self.bridge.note_data_source(self.clipboard_source)
+        var cbody = List[UInt8]()
+        wl_append32(cbody, self.clipboard_source)
+        _ = self.request(self.data_device_manager, 0, cbody)  # create_data_source
+        for mime in ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"]:
+            var obody = List[UInt8]()
+            wl_append_string(obody, String(mime))
+            _ = self.request(self.clipboard_source, 0, obody)  # wl_data_source.offer
+        var sbody = List[UInt8]()
+        wl_append32(sbody, self.clipboard_source)
+        wl_append32(sbody, self.last_input_serial)
+        _ = self.request(self.data_device, 1, sbody)  # set_selection
+
+    def clipboard_get(mut self) -> String:
+        if self.using_x11:
+            return self.x11.clipboard_get()
+        if self.using_kms:
+            return self.kms.clipboard_get()
+        if self.clipboard_owned:
+            return self.clipboard_text
+        if self.fd < 0 or self.selection_offer_id == 0:
+            return ""
+        var mime = self._pick_text_mime(self.selection_offer_id)
+        if mime.byte_length() == 0:
+            return ""
+        return self._read_offer_string(self.selection_offer_id, mime)
+
+    def take_dropped_files(mut self) -> List[String]:
+        var out = self.pending_dropped_files.copy()
+        self.pending_dropped_files.clear()
+        return out^
+
+    def poll_events(mut self, mut input: InputState):
+        self.poll(input)
+
+    def present_argb(mut self, pixels: List[UInt32], width: Int, height: Int):
+        var copy_px = pixels.copy()
+        self.present(copy_px, width, height)
+
+    def should_close(self) -> Bool:
+        return self.close_requested
+
+    def shutdown(mut self):
+        self.close()
+
     def reconnect(mut self) -> Bool:
         """Open the window again on a new connection, after a fatal error about buffers.
 
@@ -1332,9 +2024,7 @@ struct WaylandWindow(Copyable, Movable):
         var width = self.width
         var height = self.height
         var fullscreen = self.fullscreen
-        self.bridge.stop()
-        close_fd(self.fd)
-        close_fd(self.shared_fd)
+        self.close()
         self = WaylandWindow()
         if not self.initialize(width, height):
             return False
@@ -1350,17 +2040,25 @@ struct WaylandWindow(Copyable, Movable):
         self.swapchain = SwapchainHandle()
         self.gpu_width = 0
         self.gpu_height = 0
-        if self.using_kms:
-            self.kms.close()
-            self.using_kms = False
-            return
-        if self.using_x11:
-            self._close_xcb_connection()
-            self.x11.close()
-            self.using_x11 = False
-            return
+        self.evdev.close()
+        self.kms.close()
+        self.using_kms = False
+        self.x11.close()
+        self.using_x11 = False
+        self.destroy_shared()
         if self.fd >= 0:
-            self.destroy_shared()
+            if self.toplevel_decoration > 0:
+                _ = self.empty_request(self.toplevel_decoration, 0)
+            if self.fractional_scale > 0:
+                _ = self.empty_request(self.fractional_scale, 0)
+            if self.clipboard_source > 0:
+                _ = self.empty_request(self.clipboard_source, 1)
+            if self.selection_offer_id > 0:
+                _ = self.empty_request(self.selection_offer_id, 2)
+            if self.dnd_offer_id > 0 and self.dnd_offer_id != self.selection_offer_id:
+                _ = self.empty_request(self.dnd_offer_id, 2)
+            if self.data_device > 0 and self.data_device_version >= 2:
+                _ = self.empty_request(self.data_device, 2)
             if self.toplevel > 0:
                 _ = self.empty_request(self.toplevel, 0)
             if self.xdg_surface > 0:
@@ -1376,6 +2074,9 @@ struct WaylandWindow(Copyable, Movable):
             if self.wm_base > 0:
                 _ = self.empty_request(self.wm_base, 0)
         self.bridge.stop()
+        for pfd in self.pending_fds:
+            close_fd(pfd)
+        self.pending_fds.clear()
         close_fd(self.fd)
         self.fd = -1
         self.frame_callback = 0
@@ -1383,8 +2084,19 @@ struct WaylandWindow(Copyable, Movable):
         self.viewport = 0
         self.viewport_width = 0
         self.viewport_height = 0
+        self.fractional_scale = 0
+        self.toplevel_decoration = 0
+        self.data_device = 0
+        self.clipboard_source = 0
+        self.clipboard_owned = False
+        self.selection_offer_id = 0
+        self.dnd_offer_id = 0
+        self.offer_ids.clear()
+        self.offer_mimes.clear()
         self.toplevel = 0
         self.xdg_surface = 0
         self.surface = 0
         self.pointer = 0
         self.keyboard = 0
+        self.seat = 0
+        self.wm_base = 0

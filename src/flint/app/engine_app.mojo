@@ -4,7 +4,7 @@ Provides:
 - `trait Resource(Movable, Deinitable)` and `Resources` type-erased singleton registry
 - `FixedTime` (fixed-dt accumulator + spiral-of-death clamp + `overstep_alpha` with harmonic snap)
 - `FrameTime` (per-frame variable delta, elapsed wall time, frame counter)
-- 8-stage `Schedule` (`STAGE_STARTUP .. STAGE_SHUTDOWN`) with `BitSet256` read/write conflict DAG
+- 8-stage `Schedule` (`STAGE_STARTUP .. STAGE_SHUTDOWN`) with `ComponentBitSet` read/write conflict DAG
   compiler and automatic `JobPool` `MAX_DEPENDENTS = 16` zero-chunk relay node splitting
 - `trait EnginePlugin`, `AppConfig`, and `EngineApp` (`add_plugin`, `insert_resource`,
   `register_component`, `add_system`, `step_one_frame`, `run` supporting headless `max_frames`).
@@ -21,7 +21,7 @@ from flint.core.profiler import ProfileTimeline
 from flint.ecs.world import (
     World,
     Component,
-    BitSet256,
+    ComponentBitSet,
     ParallelCommands,
     comp_hash64,
 )
@@ -308,6 +308,30 @@ struct FrameTime(Resource, Copyable, ImplicitlyCopyable):
         self.frame_index = 0
 
 
+@fieldwise_init
+struct WorldTickSyncResource(Resource, Copyable, ImplicitlyCopyable):
+    """Tracks minimum `World.current_tick` observed prior to `STAGE_POST_UPDATE` so
+    `TransformPlugin` detects rollbacks even when `STAGE_FIXED_UPDATE` advances ticks."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.app.WorldTickSyncResource")
+    var min_tick_since_post_update: UInt32
+    var has_observed: Bool
+
+    def __init__(out self):
+        self.min_tick_since_post_update = UInt32(0xFFFFFFFF)
+        self.has_observed = False
+
+    @always_inline
+    def observe(mut self, tick: UInt32):
+        if (not self.has_observed) or tick < self.min_tick_since_post_update:
+            self.min_tick_since_post_update = tick
+            self.has_observed = True
+
+    @always_inline
+    def reset(mut self):
+        self.min_tick_since_post_update = UInt32(0xFFFFFFFF)
+        self.has_observed = False
+
+
 # ---------------------------------------------------------------------------
 # 8-Stage Conflict-DAG Schedule with Automatic MAX_DEPENDENTS=16 Relay Splitting
 # ---------------------------------------------------------------------------
@@ -326,8 +350,8 @@ struct SystemDescriptor(Copyable, Movable):
     var id: Int
     var name: String
     var fn_ptr: SystemFn
-    var reads: BitSet256
-    var writes: BitSet256
+    var reads: ComponentBitSet
+    var writes: ComponentBitSet
     var exclusive: Bool
     var user_ctx: Int
     var explicit_after: List[Int]
@@ -484,8 +508,8 @@ struct Schedule(Movable):
         stage: Int,
         name: String,
         fn_ptr: SystemFn,
-        reads: BitSet256 = BitSet256(),
-        writes: BitSet256 = BitSet256(),
+        reads: ComponentBitSet = ComponentBitSet(),
+        writes: ComponentBitSet = ComponentBitSet(),
         exclusive: Bool = False,
         user_ctx: Int = 0,
         after_system_id: Int = -1,
@@ -498,7 +522,7 @@ struct Schedule(Movable):
         if after_system_id >= 0:
             after.append(after_system_id)
         self.stages[stage].systems.append(
-            SystemDescriptor(sid, name, fn_ptr, reads, writes, exclusive, user_ctx, after^)
+            SystemDescriptor(sid, name, fn_ptr, reads.copy(), writes.copy(), exclusive, user_ctx, after^)
         )
         self.stages[stage].dirty = True
         return sid
@@ -703,6 +727,7 @@ struct EngineApp(Movable):
         self.shut_down = False
         self.resources.insert[FixedTime](FixedTime(fixed_hz, max_steps))
         self.resources.insert[FrameTime](FrameTime())
+        self.resources.insert[WorldTickSyncResource](WorldTickSyncResource())
 
     def __deinit__(deinit self):
         if self.profiler.active:
@@ -731,8 +756,8 @@ struct EngineApp(Movable):
         stage: Int,
         name: String,
         fn_ptr: SystemFn,
-        reads: BitSet256 = BitSet256(),
-        writes: BitSet256 = BitSet256(),
+        reads: ComponentBitSet = ComponentBitSet(),
+        writes: ComponentBitSet = ComponentBitSet(),
         exclusive: Bool = False,
         user_ctx: Int = 0,
         after_system_id: Int = -1,
@@ -756,9 +781,17 @@ struct EngineApp(Movable):
         self.world.flush_commands(self.commands)
         self.started = True
 
+    @always_inline
+    def _observe_tick_sync(mut self):
+        var sync_opt = self.resources.get_ptr_mut[WorldTickSyncResource]()
+        if sync_opt:
+            sync_opt.value()[unsafe_offset=0].observe(self.world.current_tick)
+
     def step_one_frame(mut self, frame_dt: Float32):
         if not self.started:
             self.startup()
+
+        self._observe_tick_sync()
 
         if self.profiler.active:
             self.profiler.begin_frame()
@@ -773,9 +806,11 @@ struct EngineApp(Movable):
 
         self.schedule.run_stage(STAGE_FIRST, self.world, self.resources, self.pool, self.commands)
         self.world.flush_commands(self.commands)
+        self._observe_tick_sync()
 
         self.schedule.run_stage(STAGE_PRE_UPDATE, self.world, self.resources, self.pool, self.commands)
         self.world.flush_commands(self.commands)
+        self._observe_tick_sync()
 
         var due_steps = 0
         var fix_opt = self.resources.get_ptr_mut[FixedTime]()
@@ -786,23 +821,34 @@ struct EngineApp(Movable):
             _ = self.world.advance_tick()
             self.schedule.run_stage(STAGE_FIXED_UPDATE, self.world, self.resources, self.pool, self.commands)
             self.world.flush_commands(self.commands)
+            self._observe_tick_sync()
             var fp2 = self.resources.get_ptr_mut[FixedTime]()
             if fp2:
                 fp2.value()[unsafe_offset=0].tick_count += 1
 
         self.schedule.run_stage(STAGE_UPDATE, self.world, self.resources, self.pool, self.commands)
         self.world.flush_commands(self.commands)
+        self._observe_tick_sync()
 
         self.schedule.run_stage(STAGE_POST_UPDATE, self.world, self.resources, self.pool, self.commands)
         self.world.flush_commands(self.commands)
 
+        var post_update_tick = self.world.current_tick
+        var sync_rst = self.resources.get_ptr_mut[WorldTickSyncResource]()
+        if sync_rst:
+            sync_rst.value()[unsafe_offset=0].reset()
+
         self.schedule.run_stage(STAGE_LAST, self.world, self.resources, self.pool, self.commands)
         self.world.flush_commands(self.commands)
+        if self.world.current_tick < post_update_tick:
+            self._observe_tick_sync()
 
         var res_ptr = Pointer[Resources, MutAnyOrigin](unsafe_from_address=Int(Pointer(to=self.resources)))
         for i in range(len(self.event_swap_hooks)):
             var hook = self.event_swap_hooks[i]
             hook(res_ptr)
+
+        _ = self.world.advance_tick()
 
         if self.profiler.active:
             self.profiler.end_frame()

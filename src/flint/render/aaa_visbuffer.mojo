@@ -42,25 +42,27 @@ comptime BIND_AAA_SURFCACHE: Int = 10    # Direct-lit Lumen-style per-triangle/m
 comptime BIND_AAA_OIT_NODES: Int = 11    # Per-pixel 4-layer exact short-stack OIT + 6-way volumetric plumes
 comptime BIND_AAA_CLUSTERS: Int = 12     # 16x9x24 Log-Z Clustered Punctual & Heitz LTC Area Lights (V18)
 comptime BIND_AAA_SKINNING: Int = 13     # Dual-Quaternion Bone Palettes + Bind-Pose + Prev Skinned Verts (V18)
-comptime BIND_AAA_WORKLIST: Int = 13     # 1D Compacted Meshlet Cull Worklist (packed `(inst_idx << 17) | ml_id`)
+comptime BIND_AAA_WORKLIST: Int = 13     # 1D Compacted Meshlet Cull Worklist (2 words/entry: `inst_idx, ml_id`)
 comptime BIND_AAA_POST_SCRATCH: Int = 14 # Auto-Exposure Histogram + 5-Mip Dual-Kawase Bloom + Bokeh DoF (V19)
-comptime BIND_AAA_CANDIDATES: Int = 14   # Two-Phase Hi-Z Occluded Candidates Queue
-comptime AAA_STORAGE_COUNT: Int = 15
+comptime BIND_AAA_CANDIDATES: Int = 14   # Two-Phase Hi-Z Occluded Candidates Queue (2 words/entry: `inst_idx, ml_id`)
+comptime BIND_AAA_DRAW_PAIRS: Int = 15   # GPU Draw `(inst_id, ml_id)` pairs indexed by `gl_InstanceIndex`
+comptime AAA_STORAGE_COUNT: Int = 16
 
-comptime BIND_AAA_VIS_TEX: Int = 15      # usampler2D (VK_FORMAT_R32G32_UINT VisBuffer)
-comptime BIND_AAA_DEPTH_TEX: Int = 16    # sampler2D  (VK_FORMAT_D32_SFLOAT Reverse-Z Depth)
-comptime BIND_AAA_VSM_TEX: Int = 17      # sampler2D  (VK_FORMAT_R32_SFLOAT / D32_SFLOAT Physical VSM Page Pool)
-comptime BIND_AAA_ENV_CUBE: Int = 18     # samplerCube (VK_FORMAT_BC6H_UFLOAT 6-Mip Split-Sum GGX Cubemap)
-comptime BIND_AAA_BRDF_LUT: Int = 19     # sampler2D  (VK_FORMAT_R16G16_SFLOAT Split-Sum Multi-Scatter LUT)
-comptime BIND_AAA_LTC_LUT: Int = 20      # sampler2D  (VK_FORMAT_R16G16_SFLOAT Heitz LTC 64x64 Inverse-Matrix LUT)
+comptime BIND_AAA_VIS_TEX: Int = 16      # usampler2D (VK_FORMAT_R32G32_UINT VisBuffer)
+comptime BIND_AAA_DEPTH_TEX: Int = 17    # sampler2D  (VK_FORMAT_D32_SFLOAT Reverse-Z Depth)
+comptime BIND_AAA_VSM_TEX: Int = 18      # sampler2D  (VK_FORMAT_R32_SFLOAT / D32_SFLOAT Physical VSM Page Pool)
+comptime BIND_AAA_ENV_CUBE: Int = 19     # samplerCube (VK_FORMAT_BC6H_UFLOAT 6-Mip Split-Sum GGX Cubemap)
+comptime BIND_AAA_BRDF_LUT: Int = 20     # sampler2D  (VK_FORMAT_R16G16_SFLOAT Split-Sum Multi-Scatter LUT)
+comptime BIND_AAA_LTC_LUT: Int = 21      # sampler2D  (VK_FORMAT_R16G16_SFLOAT Heitz LTC 64x64 Inverse-Matrix LUT)
 comptime AAA_SINGLE_SAMPLERS: Int = 6
 
-comptime BIND_AAA_BINDLESS_TEX: Int = 21 # sampler2D[AAA_MAX_BINDLESS] (BC7_UNORM, BC7_SRGB, BC5_UNORM, BC6H_UFLOAT)
+comptime BIND_AAA_BINDLESS_TEX: Int = 22 # sampler2D[AAA_MAX_BINDLESS] (BC7_UNORM, BC7_SRGB, BC5_UNORM, BC6H_UFLOAT)
 comptime AAA_MAX_BINDLESS: Int = 4096
-comptime BIND_AAA_TLAS: Int = 22         # accelerationStructureKHR (Hardware BLAS/TLAS for SPV_KHR_ray_query)
+comptime BIND_AAA_TLAS: Int = 23         # accelerationStructureKHR (Hardware BLAS/TLAS for SPV_KHR_ray_query)
+comptime BIND_AAA_SWAPCHAIN_IMG: Int = 24 # writeonly/readwrite storage image2D bound to acquired swapchain image
 
-comptime AAA_MAX_PACKED_MESHLET_ID: UInt32 = 0x1FFFE  # 17-bit VisBuffer payload: 0 = sky, 1..0x1FFFF = ml_id + 1
-comptime AAA_MAX_PACKED_INSTANCES: UInt32 = 0x7FFF    # 15-bit VisBuffer payload: inst_id in 0..32767
+comptime AAA_MAX_PACKED_MESHLET_ID: UInt32 = 0x3FFFFE  # 22-bit VisBuffer payload: 0 = sky, 1..0x3FFFFF = ml_id + 1
+comptime AAA_MAX_PACKED_INSTANCES: UInt32 = 0x3FFFF    # 18-bit VisBuffer payload: inst_id in 0..262143
 comptime AAA_HIZ_MAX_MIPS: Int = 8                    # Multi-mip Reverse-Z min-reduction Hi-Z pyramid (mips 0..7)
 
 comptime AAA_PUSH_WORDS: Int = 16
@@ -222,6 +224,7 @@ def meshlet_cull_shader() -> List[UInt32]:
     var depth_samp = s.sampled_image_2d(BIND_AAA_DEPTH_TEX)
     var b_worklist = s.buffer(BIND_AAA_WORKLIST)
     var b_candidates = s.buffer(BIND_AAA_CANDIDATES)
+    var b_draw_pairs = s.buffer(BIND_AAA_DRAW_PAIRS)
 
     var work_count = s.push_word(0)
     var max_draws = s.push_word(1)
@@ -231,6 +234,7 @@ def meshlet_cull_shader() -> List[UInt32]:
     var scr_h = s.float_from_uint(s.push_word(5))
     var max_lod_px = s.push_float(6)
     var cull_phase = s.push_word(7)
+    var draw_pairs_base = s.push_word(9)
 
     var inst_idx_var = s.uvar(s.uint(0))
     var ml_id_var = s.uvar(s.uint(0))
@@ -243,20 +247,20 @@ def meshlet_cull_shader() -> List[UInt32]:
 
     var is_p1 = s.ieq(cull_phase, s.uint(0))
     s.begin_if(is_p1)
-    # Phase 1: 1D compacted `(inst_idx, ml_id)` meshlet worklist (zero idle threads for mixed mesh sizes!)
+    # Phase 1: 1D compacted 2-word `(inst_idx, ml_id)` meshlet worklist
     s.begin_if(s.ult(flat_id, work_count))
-    var work_packed = s.load_word(b_worklist, flat_id)
-    s.store(inst_idx_var, s.shr(work_packed, s.uint(17)))
-    s.store(ml_id_var, s.bit_and(work_packed, s.uint(0x1FFFF)))
+    var wl_off = s.imul(flat_id, s.uint(2))
+    s.store(inst_idx_var, s.load_word(b_worklist, wl_off))
+    s.store(ml_id_var, s.load_word(b_worklist, s.iadd(wl_off, s.uint(1))))
     s.store(valid_var, s.uint(1))
     s.end_if()
     s.begin_else()
-    # Phase 2: process candidate meshlets queued in b_candidates
+    # Phase 2: process 2-word candidate meshlets queued in b_candidates
     var cand_total = s.load_word(b_candidates, s.uint(0))
     s.begin_if(s.logical_and(s.ult(flat_id, cand_total), s.ult(flat_id, max_draws)))
-    var cand_packed = s.load_word(b_candidates, s.iadd(s.uint(4), flat_id))
-    s.store(inst_idx_var, s.shr(cand_packed, s.uint(17)))
-    s.store(ml_id_var, s.bit_and(cand_packed, s.uint(0x1FFFF)))
+    var cand_off = s.iadd(s.uint(4), s.imul(flat_id, s.uint(2)))
+    s.store(inst_idx_var, s.load_word(b_candidates, cand_off))
+    s.store(ml_id_var, s.load_word(b_candidates, s.iadd(cand_off, s.uint(1))))
     s.store(valid_var, s.uint(1))
     s.end_if()
     s.end_if()
@@ -265,7 +269,7 @@ def meshlet_cull_shader() -> List[UInt32]:
 
     var inst_idx = s.load_u(inst_idx_var)
     var ml_id = s.load_u(ml_id_var)
-    # Guard against silent 17-bit ml_id (0..0x1FFFE) and 15-bit inst_idx (0..0x7FFF) packing wraparound
+    # Guard against 22-bit ml_id (0..0x3FFFFE) and 18-bit inst_idx (0..0x3FFFF) VisBuffer limits
     s.return_if(
         s.logical_or(
             s.ult(s.uint(AAA_MAX_PACKED_MESHLET_ID), ml_id),
@@ -399,12 +403,13 @@ def meshlet_cull_shader() -> List[UInt32]:
     # In Reverse-Z, a closer occluder has LARGER depth; meshlet is occluded iff ALL 5 taps > sphere_rev_z!
     var min_occ_z = s.nmin(d0, s.nmin(s.nmin(d1, d2), s.nmin(d3, d4)))
     var is_occluded = s.fgt(min_occ_z, s.fadd(sphere_rev_z, s.float(0.0005)))
-    # In Phase 1: append occluded candidate word into b_candidates
+    # In Phase 1: append 2-word occluded candidate pair `(inst_idx, ml_id)` into b_candidates
     s.begin_if(s.logical_and(is_occluded, is_p1))
     var cand_slot = s.atomic_add_word(b_candidates, s.uint(0), s.uint(1))
     s.begin_if(s.ult(cand_slot, max_draws))
-    var packed_cand = s.bit_or(s.shl(inst_idx, s.uint(17)), s.bit_and(ml_id, s.uint(0x1FFFF)))
-    s.store_word(b_candidates, s.iadd(s.uint(4), cand_slot), packed_cand)
+    var c_dst = s.iadd(s.uint(4), s.imul(cand_slot, s.uint(2)))
+    s.store_word(b_candidates, c_dst, inst_idx)
+    s.store_word(b_candidates, s.iadd(c_dst, s.uint(1)), ml_id)
     s.end_if()
     s.end_if()
     s.return_if(is_occluded)
@@ -412,18 +417,21 @@ def meshlet_cull_shader() -> List[UInt32]:
     s.end_if()
     s.end_if()
 
-    # 4. Append `VkDrawIndexedIndirectCommand` (`indexCount, instanceCount, firstIndex, vertexOffset, firstInstance`)
+    # 4. Append `(inst_idx, ml_id)` to `b_draw_pairs[draw_slot]` + `VkDrawIndexedIndirectCommand`
     var slot = s.atomic_add_word(b_indirect, s.uint(0), s.uint(1))
     s.begin_if(s.ult(slot, max_draws))
+    var draw_slot = s.iadd(draw_pairs_base, slot)
+    var dp_off = s.imul(draw_slot, s.uint(2))
+    s.store_word(b_draw_pairs, dp_off, inst_idx)
+    s.store_word(b_draw_pairs, s.iadd(dp_off, s.uint(1)), ml_id)
     var cmd_base = s.iadd(s.uint(4), s.imul(slot, s.uint(5)))
     var idx_cnt = s.imul(tri_cnt, s.uint(3))
     var first_idx = s.imul(first_tri, s.uint(3))
-    var packed_first_inst = s.bit_or(s.shl(inst_idx, s.uint(17)), s.bit_and(ml_id, s.uint(0x1FFFF)))
     s.store_word(b_indirect, cmd_base, idx_cnt)
     s.store_word(b_indirect, s.iadd(cmd_base, s.uint(1)), s.uint(1))
     s.store_word(b_indirect, s.iadd(cmd_base, s.uint(2)), first_idx)
     s.store_word(b_indirect, s.iadd(cmd_base, s.uint(3)), s.uint(0))
-    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(4)), packed_first_inst)
+    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(4)), draw_slot)
     s.end_if()
 
     return s.finish()
@@ -440,13 +448,15 @@ def visbuffer_vertex_shader() -> List[UInt32]:
     var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
     var b_instances = s.buffer(BIND_AAA_INSTANCES)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_draw_pairs = s.buffer(BIND_AAA_DRAW_PAIRS)
     _ = b_indices
     var out_vis = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec2, location=0, flat=True)
 
     var real_vtx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    var draw_slot = s.instance_index()
+    var dp_off = s.imul(draw_slot, s.uint(2))
+    var inst_id = s.load_word(b_draw_pairs, dp_off)
+    var ml_id = s.load_word(b_draw_pairs, s.iadd(dp_off, s.uint(1)))
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
@@ -473,9 +483,16 @@ def visbuffer_vertex_shader() -> List[UInt32]:
     var cy_jit = s.fma(jy, clip[3], clip[1])
     s.write_clip_position(cx_jit, cy_jit, clip[2], clip[3])
 
-    # VisBuffer payload: word0 = (inst_id << 17) | min(ml_id + 1, 0x1FFFF), word1_base = (final_mat << 16)
-    var pay0 = s.bit_or(s.shl(inst_id, s.uint(17)), s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x1FFFF)))
-    var pay1_base = s.shl(final_mat, s.uint(16))
+    # 40-bit VisBuffer payload: word0 = ((inst_id & 0x3FF) << 22) | min(ml_id + 1, 0x3FFFFF),
+    # word1_base = (final_mat << 16) | (((inst_id >> 10) & 0xFF) << 8)
+    var pay0 = s.bit_or(
+        s.shl(s.bit_and(inst_id, s.uint(0x3FF)), s.uint(22)),
+        s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x3FFFFF)),
+    )
+    var pay1_base = s.bit_or(
+        s.shl(final_mat, s.uint(16)),
+        s.shl(s.bit_and(s.shr(inst_id, s.uint(10)), s.uint(0xFF)), s.uint(8)),
+    )
     emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
 
     return s.finish()
@@ -492,7 +509,7 @@ def visbuffer_fragment_shader() -> List[UInt32]:
     emit(s.code, OP_LOAD, s.type_uvec2, vis_val, in_vis[1])
     var w0 = s.extract_u(vis_val, 0)
     var w1_base = s.extract_u(vis_val, 1)
-    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFFFF)))
+    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFF)))
     emit(s.code, OP_STORE, out_col[1], s.uvec4(w0, w1, s.uint(0), s.uint(1)))
     return s.finish()
 
@@ -508,6 +525,7 @@ def visbuffer_alphamask_vertex_shader() -> List[UInt32]:
     var b_instances = s.buffer(BIND_AAA_INSTANCES)
     var b_materials = s.buffer(BIND_AAA_MATERIALS)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_draw_pairs = s.buffer(BIND_AAA_DRAW_PAIRS)
     _ = b_indices
 
     var out_vis = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec2, location=0, flat=True)
@@ -515,9 +533,10 @@ def visbuffer_alphamask_vertex_shader() -> List[UInt32]:
     var out_talb = s.add_stage_io(STORAGE_OUTPUT, s.type_uint, location=2, flat=True)
 
     var real_vtx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    var draw_slot = s.instance_index()
+    var dp_off = s.imul(draw_slot, s.uint(2))
+    var inst_id = s.load_word(b_draw_pairs, dp_off)
+    var ml_id = s.load_word(b_draw_pairs, s.iadd(dp_off, s.uint(1)))
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
@@ -548,8 +567,14 @@ def visbuffer_alphamask_vertex_shader() -> List[UInt32]:
     var cy_jit = s.fma(jy, clip[3], clip[1])
     s.write_clip_position(cx_jit, cy_jit, clip[2], clip[3])
 
-    var pay0 = s.bit_or(s.shl(inst_id, s.uint(17)), s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x1FFFF)))
-    var pay1_base = s.shl(final_mat, s.uint(16))
+    var pay0 = s.bit_or(
+        s.shl(s.bit_and(inst_id, s.uint(0x3FF)), s.uint(22)),
+        s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x3FFFFF)),
+    )
+    var pay1_base = s.bit_or(
+        s.shl(final_mat, s.uint(16)),
+        s.shl(s.bit_and(s.shr(inst_id, s.uint(10)), s.uint(0xFF)), s.uint(8)),
+    )
     emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
     emit(s.code, OP_STORE, out_uv[1], s.vec2(uv_u, uv_v))
     emit(s.code, OP_STORE, out_talb[1], t_alb)
@@ -609,7 +634,7 @@ def visbuffer_alphamask_fragment_shader() -> List[UInt32]:
     emit(s.code, OP_LOAD, s.type_uvec2, vis_val, in_vis[1])
     var w0 = s.extract_u(vis_val, 0)
     var w1_base = s.extract_u(vis_val, 1)
-    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFFFF)))
+    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFF)))
     emit(s.code, OP_STORE, out_col[1], s.uvec4(w0, w1, s.uint(0), s.uint(1)))
     return s.finish()
 

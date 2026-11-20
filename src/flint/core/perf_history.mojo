@@ -1,55 +1,48 @@
-"""Performance history for the regression gate (package 0.7).
+"""Performance history for the Flint Engine v5 regression gate (`v5.0`).
 
-Every gate run appends one row to `docs/PERF_HISTORY.csv`: the date, commit,
-package, result, the profiled replay's frame times at 3440x1440 on the RX 9070,
-and a chosen number from each benchmark. A number more than 10% worse than the
-median of the same column in the last three rows that passed (or were accepted)
-fails the gate. Every number here is a time or a size, so higher is worse.
+Every recorded gate run appends one row to `docs/PERF_HISTORY.csv`: the date,
+commit, package, result, and the p50/p99 subsystem benchmark measurements from
+`tools/flint.sh lab all`. A number more than 10% worse than the median of the
+same column in the last three rows that passed (or were accepted) fails the
+gate, and any metric exceeding its absolute budget also fails. Every number
+here is a time or a size, so higher is worse.
 
-Each number also has a noise floor: a change smaller than the floor never counts,
-however large it is in percent. A floor is 1.5 times the range the column's gate
-value covered over 8 repeated gate measurements on rog (`SD_GATE_ONLY=noise
-bash tools/regression_gate.sh`; the measurements are in docs/PERF_HISTORY.md).
-On every column but the two voxel meshing times that is under 10% of the
-number, so the floor changes nothing and the plain 10% rule decides.
+Each metric also has a noise floor: a change smaller than the floor never
+counts, however large it is in percent. A floor is 1.5 times the range the
+metric covered across repeated `-O3` calibration runs on the reference host
+(recorded in `docs/PERF_HISTORY.md`).
 
-Memory peaks (`mem_*` columns, package 0.11) are exact for a replay, so they
-are judged at 2% (MEMORY_GROWTH_LIMIT) instead of 10%: the memory-growth rule.
+Memory-growth metrics use `MEMORY_GROWTH_LIMIT` (2%) instead of 10%.
 
-A package that knowingly trades speed for a feature adds a line
-`- accept <package> <column|all>: <why>` to docs/PERF_HISTORY.md, and the gate
-records that row as `accepted` instead of failing.
+A release that knowingly trades speed for a feature adds a line
+`- accept <package> <column|all>: <why>` to `docs/PERF_HISTORY.md`, and the
+gate records that row as `accepted` instead of failing.
 
-An accepted column restarts its baseline (package 0.13): for the rows after it,
-that column is judged against the median of the last three passing rows from
-the accepting row onward (that row alone until more exist), never against rows
-from before the accepted cost. A column nobody accepted keeps the plain rule.
-Which rows accepted which columns is read from the history itself: a row whose
-result is `accepted`, of a package with an accept line for the column.
+An accepted column restarts its baseline: for the rows after it, that column is
+judged against the median of the last three passing rows from the accepting row
+onward (that row alone until more exist), never against rows from before the
+accepted cost. A column nobody accepted keeps the plain rule.
 
 A column over its limit is measured a second time before it fails (`settle`),
 and every row reports each column's drift since the first passing row of its
-phase and since the 0.7 baseline (`drift`); see docs/PERF_HISTORY.md.
+phase and since the `v5.0` baseline (`drift`); see `docs/PERF_HISTORY.md`.
 """
 
 comptime REGRESSION_LIMIT: Float64 = 0.10
-# Tracked memory peaks (0.11) are exact: the same replay charges the same bytes
-# every run. Growth past 2% fails, however the times look.
+# Tracked memory peaks are exact: growth past 2% fails.
 comptime MEMORY_GROWTH_LIMIT: Float64 = 0.02
 comptime BASELINE_ROWS: Int = 3
-# 1.5 x the range of dig_remesh_p99_ms over six golden-perf runs on rog (docs/PERF_HISTORY.md).
-comptime DIG_REMESH_FLOOR: Float64 = 0.22
 comptime FIXED_COLUMNS: Int = 4  # date, commit, package, result
-# Drift (0.13): a column this much above the first passing row of its phase is
-# a warning in the gate summary and the runner's notification, never a failure.
+# Drift: a column this much above the first passing row of its phase is a
+# warning in the gate summary, never a failure.
 comptime DRIFT_WARNING: Float64 = 0.25
-comptime BASELINE_PACKAGE = "0.7"
+comptime BASELINE_PACKAGE = "v5.0"
 
 
 struct PerfMetric(Copyable, Movable):
     var name: String      # CSV column
-    var source: String    # which log: perf, voxel, physics, ...
-    var prefix: String    # the number follows this text on the last line that has it
+    var source: String    # which lab: lab_physics, lab_anim, lab_render, lab_audio_ui, lab_net
+    var prefix: String    # text prefix if parsed from stdout logs
     var floor: Float64    # changes smaller than this never count
     var budget: Float64   # an absolute limit (0 = none)
     var limit: Float64    # how much worse than the baseline fails, as a fraction
@@ -64,106 +57,47 @@ struct PerfMetric(Copyable, Movable):
 
 
 def perf_metrics() -> List[PerfMetric]:
-    # Floors: 1.5 x the measured range (docs/PERF_HISTORY.md, "Noise floors").
-    # Re-measure and update both when a column or the machine changes.
+    # Floors: >= 1.5 x the measured `-O3` range (docs/PERF_HISTORY.md, "Noise floors").
+    # Column names match `EngineBenchSuite.to_perf_table()` `<case>_p50_ms` / `<case>_p99_ms` 1-to-1.
     var list = List[PerfMetric]()
-    # The profiled replay of the heaviest golden recording at 3440x1440.
-    list.append(PerfMetric("frame_p50_ms", "perf", "frame_p50_ms=", 0.034))
-    list.append(PerfMetric("frame_p99_ms", "perf", "frame_p99_ms=", 0.26))
-    list.append(PerfMetric("tick_p99_ms", "perf", "tick_p99_ms=", 0.003))
-    # Physics sub-budget from the 2026-11 physics research: 4 ms p99 per tick.
-    list.append(PerfMetric("physics_tick_p99_ms", "perf", "physics_tick_p99_ms=", 0.0034, 4.0))
-    list.append(PerfMetric("peak_rss_mib", "perf", "peak_rss_mib=", 38))
-    # The memory-growth rule (0.11): tracked peaks of the same replay. The
-    # floor is a quarter MiB (the frame arena's in KiB), the limit 2%.
-    list.append(PerfMetric("mem_cpu_peak_mib", "perf", "mem_cpu_peak_mib=", 0.25, 0, MEMORY_GROWTH_LIMIT))
-    list.append(PerfMetric("mem_gpu_peak_mib", "perf", "mem_gpu_peak_mib=", 0.25, 0, MEMORY_GROWTH_LIMIT))
-    list.append(PerfMetric("mem_terrain_peak_mib", "perf", "mem_terrain_peak_mib=", 0.25, 0, MEMORY_GROWTH_LIMIT))
-    list.append(PerfMetric("mem_frame_peak_kib", "perf", "mem_frame_peak_kib=", 4, 0, MEMORY_GROWTH_LIMIT))
-    # Digging (package 1.6): the profiled destruction replay's remesh time on
-    # frames with dirty chunks, and the meshing memory peaks (the CPU chunk
-    # meshes and the GPU chunk-mesh heap), held to the memory rule.
-    list.append(PerfMetric("dig_remesh_p99_ms", "perf", "dig_remesh_p99_ms=", DIG_REMESH_FLOOR))
-    list.append(PerfMetric("mem_mesh_peak_mib", "perf", "mem_mesh_peak_mib=", 0.25, 0, MEMORY_GROWTH_LIMIT))
-    list.append(PerfMetric("mesh_heap_peak_mib", "perf", "mesh_heap_peak_mib=", 0.25, 0, MEMORY_GROWTH_LIMIT))
-    # Benchmarks (tools/run.sh benchmark and benchmark-smooth).
-    list.append(PerfMetric("voxel_initial_mesh_ms", "voxel", "initial_mesh_ms=", 0.57))
-    list.append(PerfMetric("voxel_dirty_remesh_ms", "voxel", "dirty_remesh_ms=", 0.47))
-    list.append(PerfMetric("voxel_carve_ms", "voxel", "carve_ms=", 0.0031))
-    list.append(PerfMetric("physics_debris_step_p50_ms", "physics", "debris_step_p50_ms=", 0.00078))
-    list.append(PerfMetric("physics_debris_step_p99_ms", "physics", "debris_step_p99_ms=", 0.0034))
-    list.append(PerfMetric("physics_destruction_step_p95_ms", "physics", "destruction_step_p95_ms=", 0.0013))
-    list.append(PerfMetric("physics_projectile_sweep_p50_ms", "physics", "projectile_sweep_p50_ms=", 0.0000016))
-    list.append(PerfMetric("lighting_vertex_q2_p50_ms", "lighting", "vertex_lighting_q2_p50_ms=", 0.00032))
-    list.append(PerfMetric("lighting_ao_mesh_p50_ms", "lighting", "voxel_ao_mesh_p50_ms=", 0.0064))
-    list.append(PerfMetric("lighting_post_q2_p50_ms", "lighting", "scene_post_q2_p50_ms=", 0.016))
-    list.append(PerfMetric("systemic_r2_update_p50_ms", "systemic", "heavy_r2_standard_update_p50_ms=", 0.00076))
-    list.append(PerfMetric("systemic_r2_physics_p50_ms", "systemic", "heavy_r2_standard_physics_step_p50_ms=", 0.00038))
-    list.append(PerfMetric("smooth_exposed_chunk_ms", "smooth", "exposed=", 0.0015))
-    list.append(PerfMetric("smooth_smooth_chunk_ms", "smooth", "smooth=", 0.015))
-    list.append(PerfMetric("jobs_chain_ns", "jobs", "empty job in a chain", 3.9))
-    list.append(PerfMetric("jobs_fan_out_us", "jobs", "fan-out of 64 chunks:", 0.45))
-    list.append(PerfMetric("profiler_zone_ns", "profiler", "zone on, one thread", 0.3))
-    list.append(PerfMetric("profiler_end_frame_file_ns", "profiler", "end_frame with 1000 events, file", 450))
-    list.append(PerfMetric("debug_draw_scene_ms", "debug-draw", "a scene: 40 boxes, 40 spheres, 40 labels :", 0.0037))
-    list.append(PerfMetric("debug_draw_busy_ms", "debug-draw", "busy: 200 boxes, 200 spheres, 200 labels :", 0.014))
-    # Collision scenes (package 2.11, tools/run.sh benchmark-collision). Floors
-    # are 1.5 x the range of six runs on the dev machine (docs/PERF_HISTORY.md).
-    list.append(PerfMetric("collision_rain_step_p50_ms", "collision", "rain_step_p50_ms=", 0.03))
-    list.append(PerfMetric("collision_pile_step_p50_ms", "collision", "pile_step_p50_ms=", 0.02))
-    list.append(PerfMetric("collision_throw_step_p50_ms", "collision", "throw_step_p50_ms=", 0.003))
-    list.append(PerfMetric("collision_query_ray_us", "collision", "query_ray_us=", 0.012))
-    # Solver scenes (package 2.2, tools/run.sh benchmark-solver; the 0.7
-    # physics scenes). Floors are 1.5 x the range of six runs on rog
-    # (docs/PERF_HISTORY.md).
-    list.append(PerfMetric("solver_pyramid_step_p50_ms", "solver", "pyramid_step_p50_ms=", 0.0005))
-    list.append(PerfMetric("solver_pile_step_p50_ms", "solver", "pile_step_p50_ms=", 0.016))
-    list.append(PerfMetric("solver_pile_step_p99_ms", "solver", "pile_step_p99_ms=", 0.052))
-    list.append(PerfMetric("solver_rain_step_p50_ms", "solver", "rain_step_p50_ms=", 0.034))
-    list.append(PerfMetric("solver_smash_step_p50_ms", "solver", "smash_step_p50_ms=", 0.018))
-    list.append(PerfMetric("solver_throw_step_p50_ms", "solver", "throw_step_p50_ms=", 0.0029))
-    list.append(PerfMetric("solver_tumbler_step_p50_ms", "solver", "tumbler_step_p50_ms=", 0.0025))
-    list.append(PerfMetric("solver_chain_step_p50_ms", "solver", "chain_step_p50_ms=", 0.0006))
-    list.append(PerfMetric("solver_pile_7w_step_p50_ms", "solver", "pile_7w_step_p50_ms=", 0.0069))
-    # Forces, wind and floating (package 2.12, tools/run.sh benchmark-forces).
-    # Floors are 1.5 x the range of six runs on rog (docs/PERF_HISTORY.md).
-    list.append(PerfMetric("forces_flotilla_step_p50_ms", "forces", "flotilla_step_p50_ms=", 0.0017))
-    list.append(PerfMetric("forces_fields_step_p50_ms", "forces", "fields_step_p50_ms=", 0.0004))
-    list.append(PerfMetric("forces_joints_step_p50_ms", "forces", "joints_step_p50_ms=", 0.0018))
-    list.append(PerfMetric("forces_ropes_step_p50_ms", "forces", "ropes_step_p50_ms=", 0.0033))
-    list.append(PerfMetric("forces_wind_eval_ns", "forces", "wind_eval_ns=", 12.0))
-    list.append(PerfMetric("forces_wind_mirror_bake_p50_ms", "forces", "wind_mirror_bake_p50_ms=", 0.034))
-    list.append(PerfMetric("forces_calm_step_p50_ms", "forces", "calm_step_p50_ms=", 0.069))
-    # Grab, carry, throw and surf (package 2.3, tools/run.sh benchmark-carry).
-    # Floors are 1.5 x the range of six runs on rog (docs/PERF_HISTORY.md).
-    list.append(PerfMetric("carry_toss_step_p50_ms", "carry", "toss_step_p50_ms=", 0.095))
-    list.append(PerfMetric("carry_split_step_p50_ms", "carry", "split_step_p50_ms=", 0.011))
-    list.append(PerfMetric("carry_surf_tick_p50_ms", "carry", "surf_tick_p50_ms=", 0.0001))
-    # The effects library's heavy scene (package 2.13, tools/run.sh
-    # benchmark-fx: 200 decals, 20 ambient areas with rain, beams, 3440x1440
-    # on the RX 9070). Floors are 1.5 x the range of six runs on rog
-    # (docs/PERF_HISTORY.md).
-    list.append(PerfMetric("fx_heavy_frame_p50_ms", "fx", "heavy_frame_p50_ms=", 0.2))
-    list.append(PerfMetric("fx_cpu_p50_ms", "fx", "fx_cpu_p50_ms=", 0.011))
-    list.append(PerfMetric("fx_decal_spawn_us", "fx", "decal_spawn_us=", 0.21))
-    # Movers and layer mechanics (package 2.14, tools/run.sh
-    # benchmark-mechanics: mechanics.demo's game tick, its own work, lifts,
-    # belts, magnets and a three-mirror beam). Floors are 1.5 x the range of
-    # six runs on rog, rounded up (docs/PERF_HISTORY.md).
-    list.append(PerfMetric("mech_demo_tick_p50_ms", "mechanics", "demo_tick_p50_ms=", 0.002))
-    list.append(PerfMetric("mech_plain_tick_p50_ms", "mechanics", "plain_tick_p50_ms=", 0.0008))
-    list.append(PerfMetric("mech_systems_us", "mechanics", "systems_us=", 0.08))
-    list.append(PerfMetric("mech_movers_step_p50_ms", "mechanics", "movers_step_p50_ms=", 0.002))
-    list.append(PerfMetric("mech_belts_step_p50_ms", "mechanics", "belts_step_p50_ms=", 0.0017))
-    list.append(PerfMetric("mech_magnets_step_p50_ms", "mechanics", "magnets_step_p50_ms=", 0.001))
-    list.append(PerfMetric("mech_beam_trace_us", "mechanics", "beam_trace_us=", 0.08))
-    # The hum (package 3.24, tools/run.sh benchmark-hum): a whole frame of the
-    # heaviest restored layer (gold lit, every ambient emitter at full rate)
-    # at 3440x1440 on the RX 9070. The floor is the one of
-    # fx_heavy_frame_p50_ms times 1.5 (the same kind of frame in the same
-    # layer); the machine was busy with the package's builds when the column
-    # was added, so its own six runs are still to be measured.
-    list.append(PerfMetric("hum_restored_frame_p50_ms", "hum", "hum_restored_frame_p50_ms=", 0.3))
+    # Physics, KCC, Shapes & Nav/ORCA (`labs/lab_physics.mojo`)
+    list.append(PerfMetric("physics_200body_step_p50_ms", "lab_physics", "physics_200body_step_p50_ms=", 0.05, 2.0))
+    list.append(PerfMetric("physics_200body_step_p99_ms", "lab_physics", "physics_200body_step_p99_ms=", 0.50, 4.0))
+    list.append(PerfMetric("physics_rollback_det_120_300_p99_ms", "lab_physics", "physics_rollback_det_120_300_p99_ms=", 90.0, 1000.0))
+    list.append(PerfMetric("physics_shapes_vhacd_dda_p99_ms", "lab_physics", "physics_shapes_vhacd_dda_p99_ms=", 0.05, 2.0))
+    list.append(PerfMetric("physics_kcc_stair_90t_p99_ms", "lab_physics", "physics_kcc_stair_90t_p99_ms=", 0.02, 0.25))
+    list.append(PerfMetric("nav_obstacle_carve_p99_ms", "lab_physics", "nav_obstacle_carve_p99_ms=", 0.02, 0.25))
+    list.append(PerfMetric("nav_orca_256_tick_p50_ms", "lab_physics", "nav_orca_256_tick_p50_ms=", 0.10, 2.0))
+    list.append(PerfMetric("nav_orca_256_tick_p99_ms", "lab_physics", "nav_orca_256_tick_p99_ms=", 0.15, 3.0))
+    # Animation, IK, Ragdoll, AI & Camera (`labs/lab_anim.mojo`)
+    list.append(PerfMetric("anim_flanim_roundtrip_p99_ms", "lab_anim", "anim_flanim_roundtrip_p99_ms=", 0.05, 0.5))
+    list.append(PerfMetric("anim_socket_foot_ik_p99_ms", "lab_anim", "anim_socket_foot_ik_p99_ms=", 0.05, 0.5))
+    list.append(PerfMetric("anim_ragdoll_sm_tick_p99_ms", "lab_anim", "anim_ragdoll_sm_tick_p99_ms=", 0.09, 0.5))
+    list.append(PerfMetric("ai_bt_utility_perc_cam_p99_ms", "lab_anim", "ai_bt_utility_perc_cam_p99_ms=", 0.02, 0.5))
+    list.append(PerfMetric("anim_ai_state_det_p99_ms", "lab_anim", "anim_ai_state_det_p99_ms=", 7.0, 50.0))
+    # Vulkan VisBuffer/RT Render, SPIR-V & VAT (`labs/lab_render.mojo`)
+    list.append(PerfMetric("render_spirv_mat_compile_p99_ms", "lab_render", "render_spirv_mat_compile_p99_ms=", 0.20, 25.0))
+    list.append(PerfMetric("render_vat_crowd_bake_p99_ms", "lab_render", "render_vat_crowd_bake_p99_ms=", 0.10, 25.0))
+    list.append(PerfMetric("render_world_256x192_frame_p50_ms", "lab_render", "render_world_256x192_frame_p50_ms=", 0.25, 25.0))
+    list.append(PerfMetric("render_world_256x192_frame_p99_ms", "lab_render", "render_world_256x192_frame_p99_ms=", 0.30, 50.0))
+    list.append(PerfMetric("render_ui_readback_check_p99_ms", "lab_render", "render_ui_readback_check_p99_ms=", 0.05, 50.0))
+    # Audio QOA/BVH/Server, Flexbox DockSpace UI & InputMap (`labs/lab_audio_ui.mojo`)
+    list.append(PerfMetric("audio_qoa_codec_p99_ms", "lab_audio_ui", "audio_qoa_codec_p99_ms=", 0.90, 5.0))
+    list.append(PerfMetric("audio_bvh_acoustics_p99_ms", "lab_audio_ui", "audio_bvh_acoustics_p99_ms=", 0.02, 1.0))
+    list.append(PerfMetric("audio_server_quantum_p99_ms", "lab_audio_ui", "audio_server_quantum_p99_ms=", 0.15, 2.0))
+    list.append(PerfMetric("ui_dockspace_100k_frame_p99_ms", "lab_audio_ui", "ui_dockspace_100k_frame_p99_ms=", 0.02, 0.5))
+    list.append(PerfMetric("input_lockstep_det_p99_ms", "lab_audio_ui", "input_lockstep_det_p99_ms=", 0.02, 5.0))
+    # Networking, BitPack, GGPO Rollback & AOI Replicator (`labs/lab_net.mojo`)
+    list.append(PerfMetric("udp_dual_stack_32_mmsg_p99_ms", "lab_net", "udp_dual_stack_32_mmsg_p99_ms=", 0.30, 50.0))
+    list.append(PerfMetric("bitpack_10k_quat32_fuzz_p99_ms", "lab_net", "bitpack_10k_quat32_fuzz_p99_ms=", 6.0, 50.0))
+    list.append(PerfMetric("channel_reliable_8kib_loss12_p99_ms", "lab_net", "channel_reliable_8kib_loss12_p99_ms=", 0.50, 50.0))
+    list.append(PerfMetric("rollback_8tick_resim_latency_p99_ms", "lab_net", "rollback_8tick_resim_latency_p99_ms=", 0.02, 1.2))
+    list.append(PerfMetric("rollback_4peer_10000_ticks_p99_ms", "lab_net", "rollback_4peer_10000_ticks_p99_ms=", 25.0, 1500.0))
+    list.append(PerfMetric("physics_world_rollback_spoof_auth_p99_ms", "lab_net", "physics_world_rollback_spoof_auth_p99_ms=", 1.0, 1000.0))
+    list.append(PerfMetric("replicator_16c_256e_tick_p50_ms", "lab_net", "replicator_16c_256e_tick_p50_ms=", 0.05, 3.0))
+    list.append(PerfMetric("replicator_16c_256e_tick_p99_ms", "lab_net", "replicator_16c_256e_tick_p99_ms=", 0.05, 5.0))
+    list.append(PerfMetric("replicator_bandwidth_gate_24kbs_p99_ms", "lab_net", "replicator_bandwidth_gate_24kbs_p99_ms=", 1.5, 100.0))
+    list.append(PerfMetric("lab_harness_flip_and_csv_p99_ms", "lab_net", "lab_harness_flip_and_csv_p99_ms=", 0.10, 50.0))
     return list^
 
 
@@ -394,7 +328,7 @@ def baseline_from(table: PerfTable, accepts: List[AcceptLine], name: String, bef
 
 
 def baseline(table: PerfTable, name: String) -> Tuple[Int, Float64]:
-    """The plain rule (0.7), which a column nobody accepted still gets: how many
+    """The plain rule, which a column nobody accepted still gets: how many
     earlier rows were used (0 to 3), and the median of their values: the last
     three rows that passed or were accepted and have this number."""
     var base = baseline_from(table, List[AcceptLine](), name, len(table.rows))
@@ -457,7 +391,7 @@ def judge(metric: PerfMetric, value: Float64, table: PerfTable) -> Finding:
 
 
 def settle(metric: PerfMetric, first: Finding, second: Float64, table: PerfTable, accepts: List[AcceptLine], before: Int) -> Finding:
-    """A column that was over its limit, measured again (0.13): one noisy run
+    """A column that was over its limit, measured again: one noisy run
     must not fail the gate. The column keeps the better of the two measurements
     and fails only if that is still over, which is the same as both being over.
     Both measurements stay in the finding and go into the row."""
@@ -479,10 +413,9 @@ def remeasured_cell(findings: List[Finding]) -> String:
 
 
 def build_seconds_cell(text: String) -> String:
-    """The row's `build_s` cell (package 0.14): how long the gate's build step
-    took, whole seconds, or empty when it is not a whole number (the gate
-    reused build/, or ran only the perf step). Written, never judged: no
-    PerfMetric is named build_s."""
+    """The row's `build_s` cell: how long the gate's build step
+    took, whole seconds, or empty when it is not a whole number. Written,
+    never judged: no PerfMetric is named build_s."""
     if text.byte_length() == 0:
         return String()
     for byte in text.as_bytes():
@@ -509,20 +442,22 @@ def is_accepted(columns: List[String], name: String) -> Bool:
 
 
 # ---------------------------------------------------------------------------
-# Drift (package 0.13)
+# Drift
 # ---------------------------------------------------------------------------
 
 def package_phase(package: String) -> String:
-    """The phase of a plan package: "3" for "3.3". Empty for anything else
-    (`manual` rows)."""
-    var at = package.find(".")
-    if at <= 0:
-        return String()
+    """The phase of a plan package: "5" for "v5.0" or "5.0". Empty for anything else."""
+    var start = 0
     var bytes = package.as_bytes()
-    for index in range(at):
+    if len(bytes) > 0 and (bytes[0] == 118 or bytes[0] == 86):  # 'v' or 'V'
+        start = 1
+    var at = package.find(".", start)
+    if at <= start:
+        return String()
+    for index in range(start, at):
         if bytes[index] < 48 or bytes[index] > 57:
             return String()
-    return String(package[byte=0:at])
+    return String(package[byte=start:at])
 
 
 def signed_percent(fraction: Float64) -> String:
@@ -534,7 +469,7 @@ def signed_percent(fraction: Float64) -> String:
 
 struct Drift(Copyable, Movable):
     """How far one column of a new row has moved since the first passing row of
-    the package's phase and since the 0.7 baseline row, and which packages
+    the package's phase and since the baseline row, and which packages
     accepted a cost in it on the way. A report, never a failure."""
     var metric: String
     var value: Float64
@@ -576,7 +511,7 @@ struct Drift(Copyable, Movable):
         return self.phase_change() > DRIFT_WARNING and self.value - self.phase_base > self.floor
 
     def line(self) -> String:
-        """`<column> +N% since phase <P> (accepted in ...); +M% since 0.7 (...)`."""
+        """`<column> +N% since phase <P> (accepted in ...); +M% since v5.0 (...)`."""
         var text = self.metric + " " + signed_percent(self.phase_change()) + " since phase " + self.phase
         if len(self.phase_accepts) > 0:
             text += " (accepted in " + ", ".join(self.phase_accepts) + ")"
@@ -611,11 +546,10 @@ def drift(
     package: String, accepted_now: Bool, before: Int,
 ) -> Drift:
     """The drift of `value`, a new row of `package` judged after the first
-    `before` rows. The phase is the package's (a `manual` row takes the last
-    plan row's); its start is the first passing row of that phase with the
-    column, the long drift is from the last passing 0.7 row with it, or from
-    the column's first passing row if it is younger than 0.7. Nothing counts
-    from before the 0.7 baseline row."""
+    `before` rows. The phase is the package's; its start is the first passing
+    row of that phase with the column, and the long drift is from the last
+    passing baseline row with it, or from the column's first passing row if it
+    is younger than the baseline. Nothing counts from before the baseline row."""
     var rows = min(before, len(table.rows))
     var column = table.column(metric.name)
     var package_column = table.column("package")
@@ -713,3 +647,115 @@ def effective_limit(floor: Float64, base: Float64) -> Float64:
     if base <= 0:
         return REGRESSION_LIMIT
     return max(REGRESSION_LIMIT, floor / base)
+
+
+# ---------------------------------------------------------------------------
+# Lab CSV merging and row-level regression gating
+# ---------------------------------------------------------------------------
+
+
+def merge_lab_csvs(
+    csv_texts: List[String],
+    package_name: String = "v5-gate",
+    date_str: String = "2026-11-20",
+    commit_str: String = "",
+) -> PerfTable:
+    """Merges the latest row from each per-lab CSV into a single unified PerfTable row."""
+    var out = PerfTable()
+    var row = List[String](length=len(out.header), fill=String())
+    var all_pass = True
+    var resolved_date = date_str
+    var resolved_commit = commit_str
+
+    for i in range(len(csv_texts)):
+        var raw = csv_texts[i]
+        if raw.byte_length() == 0:
+            all_pass = False
+            continue
+        var t = parse_table(raw)
+        if len(t.rows) == 0:
+            all_pass = False
+            continue
+        var r_idx = len(t.rows) - 1
+        var c_res = t.column("result")
+        if c_res >= 0 and t.cell(r_idx, c_res) != "pass":
+            all_pass = False
+        var c_date = t.column("date")
+        if resolved_date.byte_length() == 0 and c_date >= 0:
+            resolved_date = t.cell(r_idx, c_date)
+        var c_commit = t.column("commit")
+        if resolved_commit.byte_length() == 0 and c_commit >= 0:
+            resolved_commit = t.cell(r_idx, c_commit)
+
+        for col_idx in range(len(t.header)):
+            var col_name = t.header[col_idx]
+            if (
+                col_name == "date"
+                or col_name == "commit"
+                or col_name == "package"
+                or col_name == "result"
+            ):
+                continue
+            var dst_col = out.ensure_column(col_name)
+            while len(row) < len(out.header):
+                row.append(String())
+            row[dst_col] = t.cell(r_idx, col_idx)
+
+    var cd = out.column("date")
+    var cc = out.column("commit")
+    var cp = out.column("package")
+    var cr = out.column("result")
+    if cd >= 0:
+        row[cd] = resolved_date
+    if cc >= 0:
+        row[cc] = resolved_commit
+    if cp >= 0:
+        row[cp] = package_name
+    if cr >= 0:
+        row[cr] = "pass" if all_pass else "fail"
+    out.rows.append(row^)
+    return out^
+
+
+def append_candidate_row(mut history: PerfTable, candidate: PerfTable, candidate_row: Int = 0):
+    """Appends `candidate.rows[candidate_row]` into `history`, aligning and adding columns."""
+    if candidate_row < 0 or candidate_row >= len(candidate.rows):
+        return
+    for col_idx in range(len(candidate.header)):
+        _ = history.ensure_column(candidate.header[col_idx])
+    var row = List[String](length=len(history.header), fill=String())
+    for col_idx in range(len(candidate.header)):
+        var dst = history.column(candidate.header[col_idx])
+        if dst >= 0:
+            row[dst] = candidate.cell(candidate_row, col_idx)
+    history.rows.append(row^)
+
+
+def judge_lab_row(
+    metrics: List[PerfMetric],
+    candidate: PerfTable,
+    candidate_row: Int,
+    history: PerfTable,
+    accepts: List[AcceptLine],
+) -> List[Finding]:
+    """Judges all matching metrics in `candidate.rows[candidate_row]` against `history`."""
+    var findings = List[Finding]()
+    if candidate_row < 0 or candidate_row >= len(candidate.rows):
+        return findings^
+    var pkg_col = candidate.column("package")
+    var pkg = candidate.cell(candidate_row, pkg_col) if pkg_col >= 0 else String()
+    for i in range(len(metrics)):
+        ref m = metrics[i]
+        var col = candidate.column(m.name)
+        if col < 0:
+            continue
+        var parsed = value_at(candidate, candidate_row, col)
+        if not parsed[0]:
+            continue
+        var finding = judge_from(m, parsed[1], history, accepts, len(history.rows))
+        for a in range(len(accepts)):
+            if accepts[a].package == pkg and (accepts[a].column == m.name or accepts[a].column == "all"):
+                finding.accepted = True
+                break
+        findings.append(finding^)
+    return findings^

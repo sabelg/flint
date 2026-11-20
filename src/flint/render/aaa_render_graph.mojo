@@ -2,25 +2,43 @@
 `OffsetAllocator` Transient Memory Aliasing, Async Compute Queue Scheduling &
 Zero-Hitch Mip/Meshlet Residency Streaming (`aaa_render_graph.mojo`).
 """
+from std.ffi import external_call
 from flint.core.offset_allocator import OffsetAllocation, OffsetAllocator
 from flint.platform.vulkan import (
     ACCESS_COLOR_ATTACHMENT_WRITE,
     ACCESS_DEPTH_ATTACHMENT_READ,
     ACCESS_DEPTH_ATTACHMENT_WRITE,
     ACCESS_INDIRECT_READ,
+    ACCESS_MEMORY_READ,
+    ACCESS_MEMORY_WRITE,
     ACCESS_SHADER_READ,
     ACCESS_SHADER_WRITE,
+    ACCESS_TRANSFER_WRITE,
+    FORMAT_BC5_UNORM,
+    FORMAT_BC6H_UFLOAT,
+    FORMAT_BC7_SRGB,
+    FORMAT_BC7_UNORM,
+    FORMAT_R16G16B16A16_SFLOAT,
+    FORMAT_R8_UNORM,
+    FORMAT_R8G8B8A8_UNORM,
+    IMAGE_USAGE_SAMPLED,
+    IMAGE_USAGE_TRANSFER_TARGET,
     LAYOUT_COLOR_ATTACHMENT,
     LAYOUT_DEPTH_ATTACHMENT,
     LAYOUT_GENERAL,
     LAYOUT_SHADER_READ_ONLY,
+    LAYOUT_TRANSFER_TARGET,
     LAYOUT_UNDEFINED,
+    PIPELINE_ALL_COMMANDS,
     PIPELINE_COLOR_ATTACHMENT_OUTPUT,
     PIPELINE_COMPUTE,
     PIPELINE_DRAW_INDIRECT,
     PIPELINE_EARLY_FRAGMENT_TESTS,
     PIPELINE_FRAGMENT_SHADER,
     PIPELINE_LATE_FRAGMENT_TESTS,
+    PIPELINE_TOP,
+    PIPELINE_TRANSFER,
+    VkMemReq,
     VulkanGpu,
     VulkanImage,
 )
@@ -41,20 +59,38 @@ comptime RG_UNIT_BYTES: Int = 256
 struct RgResourceDesc(Copyable, Movable):
     var name: String
     var size_bytes: Int
+    var alignment_bytes: Int
+    var memory_type_bits: UInt32
     var transient: Bool
     var is_image: Bool
     var first_pass: Int
     var last_pass: Int
     var aliased_offset_bytes: Int
+    var vk_buffer: Int
+    var bind_offset: Int
+    var bind_size: Int
 
-    def __init__(out self, name: String, size_bytes: Int, transient: Bool = True, is_image: Bool = False):
+    def __init__(
+        out self,
+        name: String,
+        size_bytes: Int,
+        transient: Bool = True,
+        is_image: Bool = False,
+        alignment_bytes: Int = RG_UNIT_BYTES,
+        memory_type_bits: UInt32 = 0xFFFFFFFF,
+    ):
         self.name = name
         self.size_bytes = max(RG_UNIT_BYTES, size_bytes)
+        self.alignment_bytes = max(RG_UNIT_BYTES, alignment_bytes)
+        self.memory_type_bits = memory_type_bits
         self.transient = transient
         self.is_image = is_image
         self.first_pass = 999999
         self.last_pass = -1
         self.aliased_offset_bytes = 0
+        self.vk_buffer = 0
+        self.bind_offset = 0
+        self.bind_size = 0
 
 
 @fieldwise_init
@@ -99,6 +135,10 @@ struct RgBarrierRecord(Copyable, Movable):
     var is_image_barrier: Bool
     var old_layout: UInt32
     var new_layout: UInt32
+    var is_aliasing_barrier: Bool
+    var buffer_handle: Int
+    var buffer_offset: Int
+    var buffer_size: Int
 
     def __init__(
         out self,
@@ -112,6 +152,10 @@ struct RgBarrierRecord(Copyable, Movable):
         is_image_barrier: Bool = False,
         old_layout: UInt32 = LAYOUT_UNDEFINED,
         new_layout: UInt32 = LAYOUT_UNDEFINED,
+        is_aliasing_barrier: Bool = False,
+        buffer_handle: Int = 0,
+        buffer_offset: Int = 0,
+        buffer_size: Int = 0,
     ):
         self.pass_index = pass_index
         self.resource_id = resource_id
@@ -123,6 +167,10 @@ struct RgBarrierRecord(Copyable, Movable):
         self.is_image_barrier = is_image_barrier
         self.old_layout = old_layout
         self.new_layout = new_layout
+        self.is_aliasing_barrier = is_aliasing_barrier
+        self.buffer_handle = buffer_handle
+        self.buffer_offset = buffer_offset
+        self.buffer_size = buffer_size
 
 
 struct AaaGpuPassTiming(Copyable, Movable):
@@ -179,8 +227,14 @@ struct AaaRenderGraph(Movable):
     var total_gpu_ms: Float64
     var unaliased_transient_bytes: Int
     var aliased_peak_bytes: Int
+    var aliased_buf_peak_bytes: Int
+    var aliased_img_peak_bytes: Int
+    var buffer_memory_type_bits: UInt32
+    var image_memory_type_bits: UInt32
     var async_compute_pass_count: Int
     var barriers_emitted_last_frame: Int
+    var buffer_barriers_emitted_last_frame: Int
+    var aliasing_barriers_compiled: Int
     var passes_executed_last_frame: Int
 
     def __init__(out self):
@@ -191,18 +245,48 @@ struct AaaRenderGraph(Movable):
         self.total_gpu_ms = 0.0
         self.unaliased_transient_bytes = 0
         self.aliased_peak_bytes = 0
+        self.aliased_buf_peak_bytes = 0
+        self.aliased_img_peak_bytes = 0
+        self.buffer_memory_type_bits = 0xFFFFFFFF
+        self.image_memory_type_bits = 0xFFFFFFFF
         self.async_compute_pass_count = 0
         self.barriers_emitted_last_frame = 0
+        self.buffer_barriers_emitted_last_frame = 0
+        self.aliasing_barriers_compiled = 0
         self.passes_executed_last_frame = 0
 
     def begin_frame(mut self):
         self.barriers_emitted_last_frame = 0
+        self.buffer_barriers_emitted_last_frame = 0
         self.passes_executed_last_frame = 0
 
-    def add_resource(mut self, name: String, size_bytes: Int, transient: Bool = True, is_image: Bool = False) -> Int:
+    def add_resource(
+        mut self,
+        name: String,
+        size_bytes: Int,
+        transient: Bool = True,
+        is_image: Bool = False,
+        alignment_bytes: Int = RG_UNIT_BYTES,
+        memory_type_bits: UInt32 = 0xFFFFFFFF,
+    ) -> Int:
         var id = len(self.resources)
-        self.resources.append(RgResourceDesc(name, size_bytes, transient, is_image))
+        self.resources.append(RgResourceDesc(name, size_bytes, transient, is_image, alignment_bytes, memory_type_bits))
         return id
+
+    def set_resource_requirements(mut self, rid: Int, req: VkMemReq):
+        if rid < 0 or rid >= len(self.resources):
+            return
+        self.resources[rid].size_bytes = max(RG_UNIT_BYTES, req.size)
+        self.resources[rid].alignment_bytes = max(RG_UNIT_BYTES, req.alignment)
+        if req.memory_type_bits != 0:
+            self.resources[rid].memory_type_bits = req.memory_type_bits
+
+    def bind_resource_buffer(mut self, rid: Int, vk_buffer: Int, offset: Int = 0, size: Int = 0):
+        if rid < 0 or rid >= len(self.resources):
+            return
+        self.resources[rid].vk_buffer = vk_buffer
+        self.resources[rid].bind_offset = offset
+        self.resources[rid].bind_size = size if size > 0 else self.resources[rid].size_bytes
 
     def add_pass(mut self, name: String, accesses: List[RgResourceAccess], queue_kind: Int = RG_QUEUE_GRAPHICS) -> Int:
         var pid = len(self.passes)
@@ -217,7 +301,12 @@ struct AaaRenderGraph(Movable):
         self.barriers.clear()
         self.unaliased_transient_bytes = 0
         self.aliased_peak_bytes = 0
+        self.aliased_buf_peak_bytes = 0
+        self.aliased_img_peak_bytes = 0
+        self.buffer_memory_type_bits = 0xFFFFFFFF
+        self.image_memory_type_bits = 0xFFFFFFFF
         self.async_compute_pass_count = 0
+        self.aliasing_barriers_compiled = 0
 
         for r in range(len(self.resources)):
             self.resources[r].first_pass = 999999
@@ -234,39 +323,102 @@ struct AaaRenderGraph(Movable):
                 if p_idx > self.resources[rid].last_pass:
                     self.resources[rid].last_pass = p_idx
 
-        # 1. Transient VRAM aliasing via OffsetAllocator
+        # 1. Transient VRAM aliasing via separate Buffer & Image OffsetAllocators
         var has_active_transient = False
         for r in range(len(self.resources)):
             if self.resources[r].transient and self.resources[r].last_pass >= 0:
-                var aligned = ((self.resources[r].size_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES) * RG_UNIT_BYTES
+                var align_b = max(RG_UNIT_BYTES, self.resources[r].alignment_bytes)
+                var aligned = ((self.resources[r].size_bytes + align_b - 1) // align_b) * align_b
                 self.unaliased_transient_bytes += aligned
                 has_active_transient = True
+                if self.resources[r].is_image:
+                    self.image_memory_type_bits &= self.resources[r].memory_type_bits
+                else:
+                    self.buffer_memory_type_bits &= self.resources[r].memory_type_bits
 
         if heap_capacity_bytes <= 0:
             if has_active_transient:
                 return False
         var heap_units = UInt32(max(1, (heap_capacity_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES))
-        var oa = OffsetAllocator(heap_units, max_allocations=1024)
+        var oa_buf = OffsetAllocator(heap_units, max_allocations=1024)
+        var oa_img = OffsetAllocator(heap_units, max_allocations=1024)
+        var max_buf_end_bytes = 0
+        var max_img_end_bytes = 0
         var live_allocs = List[OffsetAllocation](length=len(self.resources), fill=OffsetAllocation())
+        var freed_starts = List[Int]()
+        var freed_ends = List[Int]()
+        var freed_is_img = List[Bool]()
 
         for p_idx in range(len(self.passes)):
             # Allocate resources whose lifetime starts on `p_idx`
             for r in range(len(self.resources)):
                 if self.resources[r].transient and self.resources[r].first_pass == p_idx:
-                    var units = UInt32((self.resources[r].size_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES)
-                    var al = oa.allocate(units)
+                    var is_img_r = self.resources[r].is_image
+                    var align_b = max(RG_UNIT_BYTES, self.resources[r].alignment_bytes)
+                    var align_u = (align_b + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES
+                    var units = UInt32((self.resources[r].size_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES + align_u - 1)
+                    var al = oa_img.allocate(units) if is_img_r else oa_buf.allocate(units)
                     if not al.ok():
                         return False
                     live_allocs[r] = al
-                    self.resources[r].aliased_offset_bytes = Int(al.offset) * RG_UNIT_BYTES
+                    var base_bytes = Int(al.offset) * RG_UNIT_BYTES
+                    var off_bytes = ((base_bytes + align_b - 1) // align_b) * align_b
+                    self.resources[r].aliased_offset_bytes = off_bytes
+                    var aligned_sz = ((self.resources[r].size_bytes + align_b - 1) // align_b) * align_b
+                    var end_bytes = off_bytes + self.resources[r].size_bytes
+                    var end_aligned = off_bytes + aligned_sz
+                    if is_img_r:
+                        if end_aligned > max_img_end_bytes:
+                            max_img_end_bytes = end_aligned
+                    else:
+                        if end_aligned > max_buf_end_bytes:
+                            max_buf_end_bytes = end_aligned
+                    var aliased_overlap = False
+                    for fi in range(len(freed_starts)):
+                        if freed_is_img[fi] == is_img_r and off_bytes < freed_ends[fi] and freed_starts[fi] < end_bytes:
+                            aliased_overlap = True
+                            break
+                    if aliased_overlap:
+                        var dst_st = PIPELINE_ALL_COMMANDS
+                        var dst_ac = Int(ACCESS_MEMORY_READ | ACCESS_MEMORY_WRITE)
+                        for acc in self.passes[p_idx].accesses:
+                            if acc.resource_id == r:
+                                var sa = _usage_to_vk_stage_access(acc.usage)
+                                dst_st = sa[0]
+                                dst_ac = sa[1]
+                                break
+                        self.barriers.append(
+                            RgBarrierRecord(
+                                p_idx,
+                                r,
+                                PIPELINE_ALL_COMMANDS,
+                                Int(ACCESS_MEMORY_WRITE),
+                                dst_st,
+                                dst_ac,
+                                False,
+                                False,
+                                LAYOUT_UNDEFINED,
+                                LAYOUT_UNDEFINED,
+                                True,
+                            )
+                        )
+                        self.aliasing_barriers_compiled += 1
 
             # Free resources whose lifetime ends on `p_idx` so downstream passes alias the exact same VRAM!
             for r in range(len(self.resources)):
                 if self.resources[r].transient and self.resources[r].last_pass == p_idx:
-                    oa.free(live_allocs[r])
+                    if self.resources[r].is_image:
+                        oa_img.free(live_allocs[r])
+                    else:
+                        oa_buf.free(live_allocs[r])
                     live_allocs[r] = OffsetAllocation()
+                    freed_starts.append(self.resources[r].aliased_offset_bytes)
+                    freed_ends.append(self.resources[r].aliased_offset_bytes + self.resources[r].size_bytes)
+                    freed_is_img.append(self.resources[r].is_image)
 
-        self.aliased_peak_bytes = Int(oa.peak_used) * RG_UNIT_BYTES
+        self.aliased_buf_peak_bytes = max(Int(oa_buf.peak_used) * RG_UNIT_BYTES, max_buf_end_bytes)
+        self.aliased_img_peak_bytes = max(Int(oa_img.peak_used) * RG_UNIT_BYTES, max_img_end_bytes)
+        self.aliased_peak_bytes = self.aliased_buf_peak_bytes + self.aliased_img_peak_bytes
 
         # 2. Automatic `VK_KHR_synchronization2` RAW / WAR / WAW hazard barrier synthesis
         var last_write_stage = List[Int](length=len(self.resources), fill=0)
@@ -289,6 +441,9 @@ struct AaaRenderGraph(Movable):
                 var is_img = self.resources[rid].is_image
                 var tgt_layout = _usage_to_vk_layout(acc.usage) if is_img else LAYOUT_UNDEFINED
                 var prev_layout = last_layout[rid] if is_img else LAYOUT_UNDEFINED
+                var r_vk_buf = self.resources[rid].vk_buffer if not is_img else 0
+                var r_b_off = self.resources[rid].bind_offset if not is_img else 0
+                var r_b_sz = (self.resources[rid].bind_size if self.resources[rid].bind_size > 0 else self.resources[rid].size_bytes) if not is_img else 0
 
                 if is_wr:
                     if read_stages_q0[rid] != 0 or read_stages_q1[rid] != 0:
@@ -305,6 +460,10 @@ struct AaaRenderGraph(Movable):
                                     is_img,
                                     prev_layout,
                                     tgt_layout,
+                                    False,
+                                    r_vk_buf,
+                                    r_b_off,
+                                    r_b_sz,
                                 )
                             )
                         if read_stages_q1[rid] != 0:
@@ -320,6 +479,10 @@ struct AaaRenderGraph(Movable):
                                     is_img,
                                     prev_layout,
                                     tgt_layout,
+                                    False,
+                                    r_vk_buf,
+                                    r_b_off,
+                                    r_b_sz,
                                 )
                             )
                     elif last_write_stage[rid] != 0:
@@ -335,6 +498,10 @@ struct AaaRenderGraph(Movable):
                                 is_img,
                                 prev_layout,
                                 tgt_layout,
+                                False,
+                                r_vk_buf,
+                                r_b_off,
+                                r_b_sz,
                             )
                         )
                     elif is_img and prev_layout != tgt_layout:
@@ -385,6 +552,10 @@ struct AaaRenderGraph(Movable):
                                     is_img,
                                     prev_layout,
                                     tgt_layout,
+                                    False,
+                                    r_vk_buf,
+                                    r_b_off,
+                                    r_b_sz,
                                 )
                             )
                     if is_img:
@@ -397,12 +568,25 @@ struct AaaRenderGraph(Movable):
         return True
 
     def emit_pass_barriers(mut self, mut vk: VulkanGpu, cmd_slot: Int, pass_index: Int):
-        """Emits per-resource `vkCmdPipelineBarrier2` buffer/memory barriers scheduled before `pass_index`."""
+        """Emits per-resource `vkCmdPipelineBarrier2` `VkBufferMemoryBarrier2` / aliasing barriers before `pass_index`."""
         self.passes_executed_last_frame += 1
         var emitted = 0
         for b in self.barriers:
             if b.pass_index == pass_index and not b.is_image_barrier:
-                vk.memory_barrier2(cmd_slot, b.src_stage, b.src_access, b.dst_stage, b.dst_access)
+                if b.is_aliasing_barrier:
+                    vk.memory_barrier2(cmd_slot, b.src_stage, b.src_access, b.dst_stage, b.dst_access)
+                else:
+                    var rid = b.resource_id
+                    var buf_h = b.buffer_handle if b.buffer_handle != 0 else self.resources[rid].vk_buffer
+                    if buf_h != 0:
+                        var b_off = b.buffer_offset if b.buffer_handle != 0 else self.resources[rid].bind_offset
+                        var b_sz = b.buffer_size if b.buffer_handle != 0 else (
+                            self.resources[rid].bind_size if self.resources[rid].bind_size > 0 else self.resources[rid].size_bytes
+                        )
+                        vk.buffer_barrier2_raw(cmd_slot, buf_h, b_off, b_sz, b.src_stage, b.src_access, b.dst_stage, b.dst_access)
+                        self.buffer_barriers_emitted_last_frame += 1
+                    else:
+                        vk.memory_barrier2(cmd_slot, b.src_stage, b.src_access, b.dst_stage, b.dst_access)
                 emitted += 1
         self.barriers_emitted_last_frame += emitted
 
@@ -474,6 +658,26 @@ struct ResidencyUploadItem(Copyable, ImplicitlyCopyable, Movable):
     var is_mesh_lod: Bool
 
 
+def bc_format_mip_bytes(width: Int, height: Int, mip_level: Int, vk_format: UInt32) -> Tuple[Int, Int, Int]:
+    """Computes `(mip_w, mip_h, byte_size)` for a single mip level of a Vulkan texture format."""
+    var mw = max(1, width >> max(0, mip_level))
+    var mh = max(1, height >> max(0, mip_level))
+    if (
+        vk_format == FORMAT_BC7_SRGB
+        or vk_format == FORMAT_BC7_UNORM
+        or vk_format == FORMAT_BC5_UNORM
+        or vk_format == FORMAT_BC6H_UFLOAT
+    ):
+        var bx = (mw + 3) // 4
+        var by = (mh + 3) // 4
+        return (mw, mh, bx * by * 16)
+    if vk_format == FORMAT_R8_UNORM:
+        return (mw, mh, mw * mh)
+    if vk_format == FORMAT_R16G16B16A16_SFLOAT:
+        return (mw, mh, mw * mh * 8)
+    return (mw, mh, mw * mh * 4)
+
+
 struct AaaResidencyStreamer(Movable):
     """Zero-hitch GPU Mip-Tail & Meshlet Residency Feedback Streamer."""
     var resident_min_mip: List[Int]     # Current resident finest mip per bindless texture
@@ -482,6 +686,14 @@ struct AaaResidencyStreamer(Movable):
     var streamed_chunks_last_tick: Int
     var upload_queue: List[ResidencyUploadItem]
     var drained_bytes_last_tick: Int
+    var slot_images: List[VulkanImage]
+    var slot_vram_bytes: List[Int]
+    var slot_mip_mask: List[UInt32]
+    var slot_layouts_init: List[Bool]
+    var slot_bindless_idx: List[Int]
+    var vram_live_bytes: Int
+    var vk_ptr: Int
+    var initial_tail_mip: Int
 
     def __init__(out self, max_textures: Int = 256, initial_tail_mip: Int = 4):
         self.resident_min_mip = List[Int](length=max_textures, fill=initial_tail_mip)
@@ -490,6 +702,194 @@ struct AaaResidencyStreamer(Movable):
         self.streamed_chunks_last_tick = 0
         self.upload_queue = List[ResidencyUploadItem]()
         self.drained_bytes_last_tick = 0
+        self.slot_images = List[VulkanImage](capacity=max_textures)
+        for _ in range(max_textures):
+            self.slot_images.append(VulkanImage())
+        self.slot_vram_bytes = List[Int](length=max_textures, fill=0)
+        self.slot_mip_mask = List[UInt32](length=max_textures, fill=0)
+        self.slot_layouts_init = List[Bool](length=max_textures, fill=False)
+        self.slot_bindless_idx = List[Int](length=max_textures, fill=-1)
+        self.vram_live_bytes = 0
+        self.vk_ptr = 0
+        self.initial_tail_mip = initial_tail_mip
+
+    def _ensure_slot(mut self, slot: Int):
+        if slot < 0:
+            return
+        while len(self.resident_min_mip) <= slot:
+            self.resident_min_mip.append(self.initial_tail_mip)
+            self.requested_min_mip.append(self.initial_tail_mip)
+        while len(self.slot_images) <= slot:
+            self.slot_images.append(VulkanImage())
+            self.slot_vram_bytes.append(0)
+            self.slot_mip_mask.append(0)
+            self.slot_layouts_init.append(False)
+            self.slot_bindless_idx.append(-1)
+
+    def attach_vulkan(mut self, mut vk: VulkanGpu):
+        self.vk_ptr = Int(Pointer(to=vk))
+        if vk.device != 0 and len(vk.command_buffers) == 0:
+            _ = vk.allocate_command_buffers(1)
+
+    def detach_vulkan(mut self):
+        for i in range(len(self.slot_images)):
+            if self.slot_images[i].image != 0:
+                self.slot_images[i] = VulkanImage()
+            self.slot_vram_bytes[i] = 0
+            self.slot_mip_mask[i] = 0
+            self.slot_layouts_init[i] = False
+            self.slot_bindless_idx[i] = -1
+        self.vram_live_bytes = 0
+        self.vk_ptr = 0
+
+    def upload_mip_to_slot(
+        mut self,
+        slot: Int,
+        mip_level: Int,
+        width: Int,
+        height: Int,
+        mip_count: Int,
+        vk_format: UInt32,
+        data_ptr: Int,
+        data_bytes: Int,
+    ) -> Int:
+        if slot < 0 or self.vk_ptr == 0:
+            return 0
+        ref vk = Pointer[VulkanGpu, MutAnyOrigin](unsafe_from_address=self.vk_ptr)[unsafe_offset=0]
+        if vk.device == 0:
+            return 0
+        if len(vk.command_buffers) == 0:
+            if not vk.allocate_command_buffers(1):
+                return 0
+        self._ensure_slot(slot)
+        var eff_w = max(1, width)
+        var eff_h = max(1, height)
+        var eff_mips = max(1, min(16, mip_count))
+        var eff_mip = max(0, min(eff_mips - 1, mip_level))
+
+        if self.slot_images[slot].image != 0 and (
+            self.slot_images[slot].width != eff_w
+            or self.slot_images[slot].height != eff_h
+            or self.slot_images[slot].format != vk_format
+            or self.slot_images[slot].mip_levels != eff_mips
+        ):
+            _ = self.evict_slot_gpu(slot)
+
+        if self.slot_images[slot].image == 0:
+            var img = vk.create_image_2d(
+                eff_w,
+                eff_h,
+                vk_format,
+                IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED,
+                mip_levels=eff_mips,
+            )
+            if img.image == 0:
+                return 0
+            self.slot_images[slot] = img^
+            self.slot_layouts_init[slot] = False
+
+        var mip_info = bc_format_mip_bytes(eff_w, eff_h, eff_mip, vk_format)
+        var mip_w = mip_info[0]
+        var mip_h = mip_info[1]
+        var expected_bytes = mip_info[2]
+        var stage_bytes = max(16, max(expected_bytes, data_bytes))
+
+        var staging = vk.create_buffer(stage_bytes, local=False)
+        if staging.vk_buffer == 0 or staging.cpu_address == 0:
+            if staging.vk_buffer != 0:
+                vk.destroy_buffer(staging)
+            return 0
+
+        if data_ptr != 0 and data_bytes > 0:
+            var copy_len = min(stage_bytes, data_bytes)
+            _ = external_call["memcpy", Int](staging.cpu_address, data_ptr, copy_len)
+            if copy_len < stage_bytes:
+                _ = external_call["memset", Int](staging.cpu_address + copy_len, Int32(0), stage_bytes - copy_len)
+        else:
+            _ = external_call["memset", Int](staging.cpu_address, Int32(0x7F), stage_bytes)
+
+        if not vk.begin_commands(0):
+            vk.destroy_buffer(staging)
+            return 0
+
+        if not self.slot_layouts_init[slot]:
+            vk.transition_image_mip_range(
+                0,
+                self.slot_images[slot],
+                0,
+                eff_mips,
+                LAYOUT_UNDEFINED,
+                LAYOUT_SHADER_READ_ONLY,
+                PIPELINE_TOP,
+                0,
+                PIPELINE_COMPUTE,
+                ACCESS_SHADER_READ,
+            )
+            self.slot_layouts_init[slot] = True
+            self.slot_images[slot].layout = LAYOUT_SHADER_READ_ONLY
+
+        vk.transition_image_mip_range(
+            0,
+            self.slot_images[slot],
+            eff_mip,
+            1,
+            LAYOUT_SHADER_READ_ONLY,
+            LAYOUT_TRANSFER_TARGET,
+            PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER,
+            ACCESS_SHADER_READ,
+            PIPELINE_TRANSFER,
+            ACCESS_TRANSFER_WRITE,
+        )
+        vk.upload_image_mip(0, self.slot_images[slot], staging, 0, eff_mip, mip_w, mip_h)
+        vk.transition_image_mip_range(
+            0,
+            self.slot_images[slot],
+            eff_mip,
+            1,
+            LAYOUT_TRANSFER_TARGET,
+            LAYOUT_SHADER_READ_ONLY,
+            PIPELINE_TRANSFER,
+            ACCESS_TRANSFER_WRITE,
+            PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER,
+            ACCESS_SHADER_READ,
+        )
+        var f = vk.submit(0)
+        if f != 0:
+            _ = vk.wait(f)
+        vk.destroy_buffer(staging)
+
+        self.slot_mip_mask[slot] |= UInt32(1) << UInt32(eff_mip)
+        if eff_mip < self.resident_min_mip[slot]:
+            self.resident_min_mip[slot] = eff_mip
+
+        var prev_vram = self.slot_vram_bytes[slot]
+        var vram_sz = max(stage_bytes, self.slot_images[slot].memory_bytes)
+        self.slot_vram_bytes[slot] = vram_sz
+        self.vram_live_bytes = max(0, self.vram_live_bytes - prev_vram + vram_sz)
+        return vram_sz
+
+    def evict_slot_gpu(mut self, slot: Int) -> Int:
+        if slot < 0 or slot >= len(self.slot_images):
+            return 0
+        var freed = self.slot_vram_bytes[slot]
+        if self.slot_images[slot].image != 0:
+            if self.vk_ptr != 0:
+                ref vk = Pointer[VulkanGpu, MutAnyOrigin](unsafe_from_address=self.vk_ptr)[unsafe_offset=0]
+                if vk.device != 0:
+                    vk.destroy_image(self.slot_images[slot])
+                else:
+                    self.slot_images[slot] = VulkanImage()
+            else:
+                self.slot_images[slot] = VulkanImage()
+        self.slot_mip_mask[slot] = 0
+        self.slot_layouts_init[slot] = False
+        self.slot_bindless_idx[slot] = -1
+        self.vram_live_bytes = max(0, self.vram_live_bytes - freed)
+        self.slot_vram_bytes[slot] = 0
+        if slot < len(self.resident_min_mip):
+            self.resident_min_mip[slot] = self.initial_tail_mip
+            self.requested_min_mip[slot] = self.initial_tail_mip
+        return freed
 
     def record_gpu_feedback(mut self, tex_id: Int, needed_mip: Int):
         if tex_id >= 0 and tex_id < len(self.requested_min_mip):

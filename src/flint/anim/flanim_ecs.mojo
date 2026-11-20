@@ -44,7 +44,7 @@ from flint.anim.pose import (
 )
 from flint.anim.procedural import Placement, FootPlantSolver, DEG
 from flint.anim.ragdoll import ArticulatedRagdoll, RagdollObbCollider
-from flint.physics.filter import CollisionFilter, CAT_ALL
+from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC, CAT_ALL
 from flint.physics.world import (
     PhysicsWorld,
     BODY_SHAPE_SPHERE,
@@ -568,6 +568,8 @@ struct RagdollStateMachine(Copyable, Movable):
     var chest_limb_index: Int
     var last_pelvis_snap_m: Float32
     var recovery_count: Int
+    var world_ragdoll_slot: Int
+    var _world_dirty: Bool
     var scratch_pose: Pose
     var scratch_ahead: Pose
 
@@ -590,6 +592,8 @@ struct RagdollStateMachine(Copyable, Movable):
         self.chest_limb_index = 1
         self.last_pelvis_snap_m = Float32(0.0)
         self.recovery_count = 0
+        self.world_ragdoll_slot = -1
+        self._world_dirty = False
         self.scratch_pose = Pose()
         self.scratch_ahead = Pose()
 
@@ -710,6 +714,7 @@ struct RagdollStateMachine(Copyable, Movable):
         self.state = RAGDOLL_SM_ACTIVE_PD
         self.active_pd_duration = max(Float32(0.05), duration)
         self.active_pd_timer = Float32(0.0)
+        self._world_dirty = True
 
     def enter_limp(
         mut self,
@@ -724,6 +729,7 @@ struct RagdollStateMachine(Copyable, Movable):
         self.ragdoll.go_limp()
         self.state = RAGDOLL_SM_LIMP
         self.limp_timer = Float32(0.0)
+        self._world_dirty = True
 
     def apply_hit_impulse(
         mut self,
@@ -743,6 +749,7 @@ struct RagdollStateMachine(Copyable, Movable):
         elif self.state != RAGDOLL_SM_LIMP:
             self.enter_active_pd(skel, placement, model, dt, Float32(0.85), self.active_pd_duration)
         self.ragdoll.apply_impulse_at_bone(bone_node, world_impulse, world_point)
+        self._world_dirty = True
 
     def begin_getup(
         mut self,
@@ -860,6 +867,148 @@ struct RagdollStateMachine(Copyable, Movable):
             return
 
         # RAGDOLL_SM_GETUP_SUPINE or RAGDOLL_SM_GETUP_PRONE
+        var is_sup = self.state == RAGDOLL_SM_GETUP_SUPINE
+        var clip_idx = self.supine_getup_clip if is_sup else self.prone_getup_clip
+        self.getup_time += max(Float32(0.0), dt)
+
+        if clip_idx >= 0 and clip_idx < len(model.animations):
+            var dur = max(Float32(0.01), model.animations[clip_idx].duration)
+            var t_clamped = min(dur, self.getup_time)
+            var t_ahead = min(dur, t_clamped + max(Float32(0.001), dt))
+            sample_pose(model, clip_idx, t_clamped, self.scratch_pose)
+            sample_pose(model, clip_idx, t_ahead, self.scratch_ahead)
+        elif anim_pose.count() == len(model.nodes):
+            self.scratch_pose.assign(anim_pose)
+            self.scratch_ahead.assign(anim_pose)
+        else:
+            self.scratch_pose.rest(model)
+            self.scratch_ahead.rest(model)
+
+        self.inertial.apply(self.scratch_pose, self.scratch_ahead, False, self.getup_halflife, dt)
+        skel.apply_pose(self.scratch_pose, model)
+
+        if self.getup_time >= self.getup_duration:
+            if anim_pose.count() == len(model.nodes):
+                self.scratch_pose.assign(anim_pose)
+                self.scratch_ahead.assign(anim_pose)
+                self.inertial.apply(self.scratch_pose, self.scratch_ahead, True, self.getup_halflife, max(Float32(0.001), dt))
+            self.state = RAGDOLL_SM_ANIMATED
+
+    def attach_to_world(mut self, mut world: PhysicsWorld) -> Int:
+        """Registers or syncs `self.ragdoll` into `world` as hosted capsule bodies + `SixDofMotorJoint`s."""
+        if self.world_ragdoll_slot >= 0 and self.world_ragdoll_slot < len(world.ragdolls):
+            world.sync_ragdoll_from_state(self.world_ragdoll_slot, self.ragdoll)
+        else:
+            self.world_ragdoll_slot = world.add_ragdoll(self.ragdoll.copy())
+            if self.state == RAGDOLL_SM_ANIMATED:
+                world.set_ragdoll_active(self.world_ragdoll_slot, False)
+        self._world_dirty = False
+        return self.world_ragdoll_slot
+
+    def _sync_floor_plane_from_world(mut self, world: PhysicsWorld):
+        if len(self.ragdoll.limbs) == 0:
+            return
+        var pelvis_w = self.ragdoll.pelvis_world_position()
+        var floor_hit = world.raycast(
+            pelvis_w + Vec3(0.0, 0.85, 0.0),
+            Vec3(0.0, -1.0, 0.0),
+            Float32(12.0),
+            CollisionFilter(CAT_ALL, CAT_TERRAIN | CAT_STATIC, 0),
+            self.ignore_body_id,
+        )
+        if floor_hit.hit and floor_hit.normal.y > Float32(0.2):
+            var plane_off = floor_hit.normal.dot(floor_hit.point)
+            var fric = Float32(0.6)
+            if floor_hit.body_slot >= 0 and floor_hit.body_slot < len(world.bodies):
+                fric = world.bodies[floor_hit.body_slot].friction
+            self.ragdoll.set_surface_plane(floor_hit.normal, plane_off, fric)
+
+    def update_world(
+        mut self,
+        mut world: PhysicsWorld,
+        mut skel: SkeletonInstance,
+        mut placement: Placement,
+        model: NativeModel,
+        anim_pose: Pose,
+        dt: Float32,
+        auto_recover: Bool = True,
+        step_world: Bool = True,
+    ):
+        """Advances the ragdoll state machine using two-way `PhysicsWorld`-hosted capsules & joints."""
+        skel.ensure_topology(model)
+        if skel.node_count > 0:
+            skel.snapshot_prev_matrices()
+
+        if self.state == RAGDOLL_SM_ANIMATED:
+            if self.world_ragdoll_slot >= 0:
+                world.set_ragdoll_active(self.world_ragdoll_slot, False)
+            if anim_pose.count() == len(model.nodes):
+                self.scratch_pose.assign(anim_pose)
+            else:
+                self.scratch_pose.rest(model)
+            self.scratch_ahead.assign(self.scratch_pose)
+            self.inertial.apply(self.scratch_pose, self.scratch_ahead, False, self.getup_halflife, dt)
+            skel.apply_pose(self.scratch_pose, model)
+            return
+
+        if self.state == RAGDOLL_SM_ACTIVE_PD or self.state == RAGDOLL_SM_LIMP:
+            if self.world_ragdoll_slot < 0 or self._world_dirty:
+                _ = self.attach_to_world(world)
+            world.set_ragdoll_active(self.world_ragdoll_slot, True)
+
+            if self.state == RAGDOLL_SM_ACTIVE_PD and anim_pose.count() == len(model.nodes):
+                self.ragdoll.set_target_pose(anim_pose, placement.yaw * DEG)
+                var targets = List[Quat](capacity=len(self.ragdoll.states))
+                for i in range(len(self.ragdoll.states)):
+                    targets.append(self.ragdoll.states[i].target_local_rot)
+                world.set_ragdoll_targets(
+                    self.world_ragdoll_slot,
+                    targets,
+                    self.ragdoll.target_root_world_rot,
+                    self.ragdoll.motor_scale,
+                    False,
+                )
+
+            if step_world:
+                world.step(dt)
+
+            self.ragdoll = world.ragdoll_state(self.world_ragdoll_slot)
+            self.ragdoll.write_to_skeleton(skel, model, placement)
+
+            if self.state == RAGDOLL_SM_ACTIVE_PD:
+                self.active_pd_timer += max(Float32(0.0), dt)
+                if auto_recover and self.active_pd_timer >= self.active_pd_duration:
+                    self._sync_floor_plane_from_world(world)
+                    if anim_pose.count() == len(model.nodes):
+                        self.scratch_pose.assign(anim_pose)
+                    else:
+                        self.scratch_pose.assign(self.ragdoll.rest_pose)
+                    var root_pos = placement.position
+                    var root_yaw_rad = placement.yaw * DEG
+                    var pelvis_before = self.ragdoll.pelvis_world_position()
+                    self.ragdoll.begin_recovery(root_pos, root_yaw_rad, self.inertial, self.scratch_pose)
+                    placement.position = root_pos
+                    placement.yaw = root_yaw_rad / DEG
+                    skel.pose.resize(len(model.nodes))
+                    for idx in range(min(skel.pose.count(), len(self.inertial.out_t))):
+                        skel.pose.t[idx] = self.inertial.out_t[idx]
+                        skel.pose.r[idx] = self.inertial.out_r[idx]
+                        skel.pose.s[idx] = self.inertial.out_s[idx]
+                    skel.update_matrices(model)
+                    var pelvis_node = self.ragdoll.limbs[0].bone_node
+                    self.last_pelvis_snap_m = (placement.to_world(skel.global_position(pelvis_node)) - pelvis_before).length()
+                    world.set_ragdoll_active(self.world_ragdoll_slot, False)
+                    self.state = RAGDOLL_SM_ANIMATED
+            else:
+                self.limp_timer += max(Float32(0.0), dt)
+                if auto_recover and self.limp_timer >= self.min_limp_time and self.ragdoll.settled():
+                    self._sync_floor_plane_from_world(world)
+                    self.begin_getup(skel, placement, model, anim_pose)
+                    world.set_ragdoll_active(self.world_ragdoll_slot, False)
+            return
+
+        if self.world_ragdoll_slot >= 0:
+            world.set_ragdoll_active(self.world_ragdoll_slot, False)
         var is_sup = self.state == RAGDOLL_SM_GETUP_SUPINE
         var clip_idx = self.supine_getup_clip if is_sup else self.prone_getup_clip
         self.getup_time += max(Float32(0.0), dt)

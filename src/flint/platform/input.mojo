@@ -1,7 +1,7 @@
-"""Explicit keyboard, mouse, and Linux joystick state."""
+"""Explicit keyboard, mouse, and Evdev gamepad state."""
 from std.ffi import external_call
 from std.math import sqrt
-from flint.platform.os import close_fd, list_directory
+from flint.platform.os import close_fd
 
 # Named pad controls. The first eleven match the Linux xpad joystick layout, and the
 # rest are built from axes so menus and actions can treat them as plain buttons.
@@ -37,19 +37,12 @@ comptime PAD_AXIS_DPAD_X: Int = 6
 comptime PAD_AXIS_DPAD_Y: Int = 7
 comptime PAD_DEADZONE: Float32 = 0.12
 comptime PAD_DIRECTION: Float32 = 0.6
-comptime PAD_RETRY_POLLS: Int = 120
 comptime MAX_PADS: Int = 4
 comptime ENODEV: Int32 = 19
-comptime JSIOCGNAME_64: UInt64 = 0x80406A13
-comptime JSIOCGAXES: UInt64 = 0x80016A11
-comptime JSIOCGBUTTONS: UInt64 = 0x80016A12
 comptime EV_FF: Int = 0x15
 comptime FF_RUMBLE: Int = 0x50
 comptime EVIOCSFF: UInt64 = 0x40304580
 comptime EVIOCRMFF: UInt64 = 0x40044581
-comptime PAD_MIN_AXES: Int = 2
-comptime PAD_MIN_BUTTONS: Int = 4
-comptime PAD_MAX_BUTTONS: Int = 32  # keyboards and mice posing as joysticks report far more
 comptime KEY_SLOTS: Int = 512
 # Package 3.15: holding a mash-to-hold key repeats its press every this many ticks.
 comptime MASH_REPEAT_TICKS: Int = 8
@@ -67,14 +60,6 @@ def identity_map(count: Int) -> List[Int]:
     for index in range(count):
         out.append(index)
     return out^
-
-
-def is_gamepad(name: String, axes: Int, buttons: Int) -> Bool:
-    """Whether a joystick node is a controller. Keyboards, mice and a pad's
-    motion sensors can also appear as /dev/input/jsN and must not take a slot."""
-    if "Motion Sensors" in name or "Touchpad" in name or "Mouse" in name or "Keyboard" in name:
-        return False
-    return axes >= PAD_MIN_AXES and buttons >= PAD_MIN_BUTTONS and buttons <= PAD_MAX_BUTTONS
 
 
 struct PadState(Copyable, Movable):
@@ -348,8 +333,6 @@ struct InputState(Copyable, Movable):
     var last_mouse_y: Float32
     var has_mouse_position: Bool
     var pads: List[PadState]
-    var pad_paths: List[String]
-    var pad_retry: Int
     # Package 3.15: the bindings, applied before anything reads or records
     # the input, so the simulation and a recording only see logical keys
     # (the default layout) whatever the player bound.
@@ -366,6 +349,12 @@ struct InputState(Copyable, Movable):
     var deadzone_right: Float32
     var mouse_extra_down: Array[Bool, 8]
     var text_input_utf8: String
+    var dropped_files: List[String]
+    var ime_preedit: String
+    var ime_cursor_cp: Int
+    var ime_sel_len: Int
+    var ime_active: Bool
+    var ime_commit: String
 
     def __init__(out self):
         self.keys = List[Bool](length=512, fill=False)
@@ -381,8 +370,6 @@ struct InputState(Copyable, Movable):
         self.last_mouse_y = 0
         self.has_mouse_position = False
         self.pads = List[PadState](length=MAX_PADS, fill=PadState())
-        self.pad_paths = List[String](length=MAX_PADS, fill="")
-        self.pad_retry = 0
         self.key_map = identity_map(KEY_SLOTS)
         self.pad_map = identity_map(PAD_CONTROLS)
         self.toggle_keys = List[Bool](length=KEY_SLOTS, fill=False)
@@ -396,6 +383,12 @@ struct InputState(Copyable, Movable):
         self.deadzone_right = PAD_DEADZONE
         self.mouse_extra_down = Array[Bool, 8](fill=False)
         self.text_input_utf8 = String()
+        self.dropped_files = List[String]()
+        self.ime_preedit = String()
+        self.ime_cursor_cp = 0
+        self.ime_sel_len = 0
+        self.ime_active = False
+        self.ime_commit = String()
 
     def begin_frame(mut self):
         for index in range(512):
@@ -411,14 +404,47 @@ struct InputState(Copyable, Movable):
         self.delta_y = 0
         self.wheel = 0
         self.text_input_utf8 = String()
+        self.dropped_files.clear()
+        self.ime_commit = String()
 
     def push_text_utf8(mut self, text: String):
         self.text_input_utf8 += text
+
+    def set_ime_preedit(mut self, preedit: String, cursor_cp: Int = -1, sel_len: Int = 0):
+        self.ime_preedit = preedit
+        self.ime_active = preedit.byte_length() > 0
+        if cursor_cp < 0:
+            var cp_count = 0
+            for b in preedit.as_bytes():
+                if (Int(b) & 0xC0) != 0x80:
+                    cp_count += 1
+            self.ime_cursor_cp = cp_count
+        else:
+            self.ime_cursor_cp = cursor_cp
+        self.ime_sel_len = max(0, sel_len)
+
+    def commit_ime_preedit(mut self, text: String):
+        self.ime_commit += text
+        self.ime_preedit = String()
+        self.ime_cursor_cp = 0
+        self.ime_sel_len = 0
+        self.ime_active = False
+
+    def clear_ime_preedit(mut self):
+        self.ime_preedit = String()
+        self.ime_cursor_cp = 0
+        self.ime_sel_len = 0
+        self.ime_active = False
+        self.ime_commit = String()
+
+    def push_dropped_file(mut self, path: String):
+        self.dropped_files.append(path)
 
     def mute(mut self):
         """Nothing is held and nothing happened. The console does this every frame it
         is open, before any tick, so the simulation and a recording both see silence."""
         self.begin_frame()
+        self.clear_ime_preedit()
         for index in range(512):
             self.keys[index] = False
             self.physical_keys[index] = False
@@ -577,100 +603,9 @@ struct InputState(Copyable, Movable):
     def mouse_wheel(self) -> Float32:
         return self.wheel
 
-    def open_pads(mut self):
-        """Claim joystick nodes for empty pad slots, so a controller can arrive at any time."""
-        for slot in range(MAX_PADS):
-            if self.pads[slot].fd >= 0 or self.pads[slot].connected:
-                continue
-            for number in range(8):
-                var path = "/dev/input/js" + String(number)
-                var taken = False
-                for other in range(MAX_PADS):
-                    if self.pads[other].fd >= 0 and self.pad_paths[other] == path:
-                        taken = True
-                if taken:
-                    continue
-                var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(0 | 2048), Int32(0)))
-                if fd < 0:
-                    continue
-                var name = List[UInt8](length=64, fill=0)
-                _ = external_call["ioctl", Int32](Int32(fd), JSIOCGNAME_64, name.unsafe_ptr())
-                var text = String()
-                for byte in name:
-                    if byte == 0:
-                        break
-                    text += chr(Int(byte))
-                var axes = List[UInt8](length=1, fill=0)
-                var buttons = List[UInt8](length=1, fill=0)
-                _ = external_call["ioctl", Int32](Int32(fd), JSIOCGAXES, axes.unsafe_ptr())
-                _ = external_call["ioctl", Int32](Int32(fd), JSIOCGBUTTONS, buttons.unsafe_ptr())
-                if not is_gamepad(text, Int(axes[0]), Int(buttons[0])):
-                    close_fd(fd)
-                    continue
-                self.pads[slot].fd = fd
-                self.pads[slot].connected = True
-                self.pad_paths[slot] = path
-                self.pads[slot].sony_layout = "Sony" in text or "DualSense" in text or "DualShock" in text or "Wireless Controller" in text
-                # Open sibling /dev/input/event* O_RDWR for EV_FF rumble (jsN is read-only and lacks EVIOCSFF)
-                var sys_entries = list_directory("/sys/class/input/js" + String(number) + "/device")
-                for entry in sys_entries:
-                    if entry.startswith("event"):
-                        var ev_path = "/dev/input/" + entry
-                        var ev_fd = Int(external_call["open", Int32](ev_path.as_c_string_span(), Int32(2 | 2048 | 0x80000), Int32(0)))
-                        if ev_fd >= 0:
-                            self.pads[slot].ff_fd = ev_fd
-                            self.pads[slot].ff_writable = True
-                            self.pads[slot].owns_ff_fd = True
-                            break
-                break
-
-    def poll_pad(mut self, slot: Int):
-        var event = List[UInt8](length=8, fill=0)
-        while True:
-            var count = Int(external_call["read", Int64](Int32(self.pads[slot].fd), event.unsafe_ptr(), Int64(8)))
-            if count != 8:
-                # A controller that went away reports ENODEV instead of "try again".
-                var error = external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()
-                if count < 0 and error[unsafe_offset=0] == ENODEV:
-                    close_fd(self.pads[slot].fd)
-                    self.pads[slot].fd = -1
-                    self.pads[slot].connected = False
-                    if self.pads[slot].owns_ff_fd and self.pads[slot].ff_fd >= 0:
-                        close_fd(self.pads[slot].ff_fd)
-                    self.pads[slot].ff_fd = -1
-                    self.pads[slot].ff_writable = False
-                    self.pads[slot].owns_ff_fd = False
-                    self.pads[slot].clear()
-                return
-            var raw_value = Int16(UInt16(event[4]) | (UInt16(event[5]) << 8))
-            self.pads[slot].apply_event_with(Int(event[6]) & 0x7F, Int(event[7]), Int(raw_value), self.pad_map, self.toggle_pads, self.deadzone_left, self.deadzone_right)
-
-    def poll_gamepad(mut self):
-        self.pad_retry -= 1
-        if self.pad_retry <= 0:
-            self.pad_retry = PAD_RETRY_POLLS
-            self.open_pads()
-        for slot in range(MAX_PADS):
-            if self.pads[slot].fd >= 0:
-                self.poll_pad(slot)
-        self.promote_pads()
-
     def set_pad_rumble(mut self, slot: Int, weak: Float32, strong: Float32, duration_ms: Int = 1000):
         if slot >= 0 and slot < MAX_PADS:
             self.pads[slot].set_rumble(weak, strong, duration_ms)
-
-    def promote_pads(mut self):
-        """Keep the first connected pad in slot 0, which is the one play reads,
-        so unplugging the first controller hands play to the next connected pad."""
-        if self.pads[0].fd >= 0 or self.pads[0].connected:
-            return
-        for s in range(1, MAX_PADS):
-            if self.pads[s].fd >= 0 or self.pads[s].connected:
-                self.pads[0] = self.pads[s].copy()
-                self.pad_paths[0] = self.pad_paths[s]
-                self.pads[s] = PadState()
-                self.pad_paths[s] = ""
-                return
 
     def gamepad_available(self, pad: Int = 0) -> Bool:
         return pad >= 0 and pad < MAX_PADS and (self.pads[pad].fd >= 0 or self.pads[pad].connected)
@@ -701,11 +636,21 @@ struct InputState(Copyable, Movable):
 
     def pad_is_sony(self) -> Bool:
         for pad in range(MAX_PADS):
-            if self.pads[pad].fd >= 0 and self.pads[pad].sony_layout:
+            if (self.pads[pad].connected or self.pads[pad].fd >= 0) and self.pads[pad].sony_layout:
                 return True
+        return False
+
+    def uses_legacy_jsdev(self) -> Bool:
         return False
 
     def close(mut self):
         for slot in range(MAX_PADS):
-            close_fd(self.pads[slot].fd)
-            self.pads[slot].fd = -1
+            if self.pads[slot].fd >= 0:
+                close_fd(self.pads[slot].fd)
+                self.pads[slot].fd = -1
+            if self.pads[slot].owns_ff_fd and self.pads[slot].ff_fd >= 0:
+                close_fd(self.pads[slot].ff_fd)
+            self.pads[slot].ff_fd = -1
+            self.pads[slot].ff_writable = False
+            self.pads[slot].owns_ff_fd = False
+            self.pads[slot].connected = False

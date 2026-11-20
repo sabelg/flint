@@ -22,11 +22,11 @@ the echo level or above are printed and the rest are dropped.
 """
 from std.atomic import Atomic
 from flint.core.anchor import (
-    ANCHOR, A_CATEGORY_LEVELS, A_LOG_DROPPED, A_LOG_ECHO, A_LOG_FD, A_LOG_FLUSHED, A_LOG_HEAD, A_LOG_LEVEL,
+    A_CATEGORY_LEVELS, A_LOG_DROPPED, A_LOG_ECHO, A_LOG_FD, A_LOG_FLUSHED, A_LOG_HEAD, A_LOG_LEVEL,
     A_START_NS, A_TICK, LOG_RING, O_WRONLY_CREATE_APPEND, AT_FDCWD, RawText, SYS_CLOSE, SYS_GETTID, SYS_OPENAT,
-    T_LOG_PATH, T_STATE_DIR, anchor_get, anchor_ready, anchor_set, atomic_word, install_anchor, load, load_byte,
-    monotonic_ns, set_text, store, store_byte, sys, text_offset, text_length, wall_seconds, write_all, write_utc,
-    FORMAT_BUFFER, c_string, get_text,
+    T_LOG_PATH, T_STATE_DIR, anchor_base, anchor_get, anchor_ready, anchor_set, atomic_word, install_anchor, load,
+    load_byte, monotonic_ns, set_text, store, store_byte, sys, text_offset, text_length, wall_seconds, write_all,
+    write_utc, FORMAT_BUFFER, c_string, get_text,
 )
 from flint.platform.os import env_value, make_dirs, rename_file, file_size
 
@@ -143,7 +143,10 @@ def find_category(name: String) -> Int:
 
 
 def entry_address(index: Int) -> Int:
-    return ANCHOR + LOG_RING + (index & (LOG_ENTRIES - 1)) * ENTRY_BYTES
+    var base = anchor_base()
+    if base == 0:
+        return 0
+    return base + LOG_RING + (index & (LOG_ENTRIES - 1)) * ENTRY_BYTES
 
 
 def entry_sequence(index: Int) -> Pointer[Atomic[Int64], origin=MutAnyOrigin]:
@@ -162,15 +165,21 @@ def category_level(category: Int) -> Int:
 
 
 def category_level_unchecked(category: Int) -> Int:
-    var own = load_byte(ANCHOR + A_CATEGORY_LEVELS + category) if category >= 0 and category < 32 else LOG_FOLLOW
-    return load(ANCHOR + A_LOG_LEVEL) if own == LOG_FOLLOW else own
+    var base = anchor_base()
+    if base == 0:
+        return LOG_WARN
+    var own = load_byte(base + A_CATEGORY_LEVELS + category) if category >= 0 and category < 32 else LOG_FOLLOW
+    return load(base + A_LOG_LEVEL) if own == LOG_FOLLOW else own
 
 
 def log_enabled(category: Int, level: Int) -> Bool:
     """Would an entry be kept? Use it to skip building an expensive message."""
     if not anchor_ready():
         return level >= LOG_WARN
-    return level >= category_level_unchecked(category) or level >= load(ANCHOR + A_LOG_ECHO)
+    var base = anchor_base()
+    if base == 0:
+        return level >= LOG_WARN
+    return level >= category_level_unchecked(category) or level >= load(base + A_LOG_ECHO)
 
 
 def log_message(category: Int, level: Int, message: String):
@@ -179,12 +188,17 @@ def log_message(category: Int, level: Int, message: String):
         if level >= LOG_WARN:
             print("[" + level_name(level) + " " + category_name(category) + "] " + message)
         return
-    if level >= load(ANCHOR + A_LOG_ECHO):
+    var base = anchor_base()
+    if base == 0:
+        return
+    if level >= load(base + A_LOG_ECHO):
         print("[" + level_name(level) + " " + category_name(category) + "] " + message)
     if level < category_level_unchecked(category):
         return
     var claim = anchor_add_head()
     var entry = entry_address(claim)
+    if entry == 0:
+        return
     # Odd while writing, so a reader never takes half an entry.
     entry_sequence(claim)[unsafe_offset=0].store(Int64(claim * 2 + 1))
     var bytes = message.as_bytes()
@@ -194,8 +208,8 @@ def log_message(category: Int, level: Int, message: String):
     store_byte(entry + 10, count & 0xFF)
     store_byte(entry + 11, count >> 8)
     Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=entry + 12)[unsafe_offset=0] = UInt32(sys(SYS_GETTID) & 0xFFFFFFFF)
-    store(entry + 16, load(ANCHOR + A_TICK))
-    store(entry + 24, monotonic_ns() - load(ANCHOR + A_START_NS))
+    store(entry + 16, load(base + A_TICK))
+    store(entry + 24, monotonic_ns() - load(base + A_START_NS))
     for index in range(count):
         store_byte(entry + ENTRY_TEXT + index, Int(bytes[index]))
     entry_sequence(claim)[unsafe_offset=0].store(Int64(claim * 2 + 2))
@@ -231,18 +245,24 @@ def log_fatal(category: Int, message: String):
 
 def set_log_level(level: Int):
     if anchor_ready() and level >= 0 and level <= LOG_OFF:
-        store(ANCHOR + A_LOG_LEVEL, level)
+        var base = anchor_base()
+        if base != 0:
+            store(base + A_LOG_LEVEL, level)
 
 
 def set_category_level(category: Int, level: Int):
     """LOG_FOLLOW makes the category use the default level again."""
     if anchor_ready() and category >= 0 and category < LOG_CATEGORIES and (level == LOG_FOLLOW or (level >= 0 and level <= LOG_OFF)):
-        store_byte(ANCHOR + A_CATEGORY_LEVELS + category, level)
+        var base = anchor_base()
+        if base != 0:
+            store_byte(base + A_CATEGORY_LEVELS + category, level)
 
 
 def set_echo_level(level: Int):
     if anchor_ready() and level >= 0 and level <= LOG_OFF:
-        store(ANCHOR + A_LOG_ECHO, level)
+        var base = anchor_base()
+        if base != 0:
+            store(base + A_LOG_ECHO, level)
 
 
 def apply_log_settings(text: String) -> Int:
@@ -274,7 +294,9 @@ def apply_log_settings(text: String) -> Int:
 def set_log_tick(tick: Int):
     """The tick now running, stamped on entries and the crash report. -1 between ticks."""
     if anchor_ready():
-        store(ANCHOR + A_TICK, tick)
+        var base = anchor_base()
+        if base != 0:
+            store(base + A_TICK, tick)
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +307,8 @@ def format_entry(mut out: RawText, index: Int) -> Bool:
     """One line for entry `index`, or False if it was overwritten or is still
     being written. Allocates nothing, so the crash handler can call it."""
     var entry = entry_address(index)
+    if entry == 0:
+        return False
     var sequence = Int(entry_sequence(index)[unsafe_offset=0].load())
     if sequence != index * 2 + 2:
         return False
@@ -363,12 +387,16 @@ def start_log(name: String = "sharddepth", directory: String = "") -> Bool:
     if fd < 0:
         print("LOG_FAILED cannot open " + path)
         return False
-    var previous = load(ANCHOR + A_LOG_FD)
+    var base = anchor_base()
+    if base == 0:
+        _ = sys(SYS_CLOSE, fd)
+        return False
+    var previous = load(base + A_LOG_FD)
     if previous >= 0:
         _ = sys(SYS_CLOSE, previous)
-    store(ANCHOR + A_LOG_FD, fd)
+    store(base + A_LOG_FD, fd)
     set_text(T_LOG_PATH, path)
-    var header = RawText(ANCHOR + FLUSH_BUFFER, FLUSH_BYTES)
+    var header = RawText(base + FLUSH_BUFFER, FLUSH_BYTES)
     header.text("--- log opened ")
     write_utc(header, wall_seconds(), False)
     header.text(" (times below are seconds since start) ---\n")
@@ -385,14 +413,17 @@ def flush_log() -> Int:
     Returns how many entries were written."""
     if not anchor_ready():
         return 0
-    var fd = load(ANCHOR + A_LOG_FD)
+    var base = anchor_base()
+    if base == 0:
+        return 0
+    var fd = load(base + A_LOG_FD)
     var head = anchor_get(A_LOG_HEAD)
     var next = anchor_get(A_LOG_FLUSHED)
     if head - next > LOG_ENTRIES:
         _ = atomic_word(A_LOG_DROPPED)[unsafe_offset=0].fetch_add(Int64(head - LOG_ENTRIES - next))
         next = head - LOG_ENTRIES
     var written = 0
-    var out = RawText(ANCHOR + FLUSH_BUFFER, FLUSH_BYTES)
+    var out = RawText(base + FLUSH_BUFFER, FLUSH_BYTES)
     while next < head:
         if out.length > FLUSH_BYTES - ENTRY_BYTES - 64:
             if fd >= 0:

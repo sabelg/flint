@@ -139,9 +139,12 @@ def emit_visbuffer_surface(
     """Decodes a (non-sky) VisBuffer texel, intersects its triangle with the ray `o + t d` (Moller-Trumbore)
     and returns the world position and the interpolated vertex normal turned toward the ray origin:
     `(wx, wy, wz, nx, ny, nz)`."""
-    var inst_id = s.shr(vis0, s.uint(17))
-    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
-    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
+    var inst_id = s.bit_or(
+        s.shr(vis0, s.uint(22)),
+        s.shl(s.bit_and(s.shr(vis1, s.uint(8)), s.uint(0xFF)), s.uint(10)),
+    )
+    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x3FFFFF)), s.uint(1))
+    var local_prim = s.bit_and(vis1, s.uint(0xFF))
     var first_tri = s.load_word(b_meshlets, s.iadd(s.imul(ml_id, s.uint(12)), s.uint(8)))
     var idx_off = s.imul(s.iadd(first_tri, local_prim), s.uint(3))
     var v0_off = s.imul(s.load_word(b_indices, idx_off), s.uint(12))

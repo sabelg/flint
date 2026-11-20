@@ -999,7 +999,9 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
 
     var max_err = Float32(0.0)
     var has_uv = len(mesh.texcoords) >= v_count * 2
+    var has_uv1 = len(mesh.texcoords1) >= v_count * 2
     var has_nrm = len(mesh.normals) >= v_count * 3
+    var has_tang = len(mesh.tangents) >= v_count * 4
     var has_col = len(mesh.colors) >= v_count * 4
     var has_joints = len(mesh.joints) >= v_count * 4
     var has_weights = len(mesh.weights) >= v_count * 4
@@ -1032,7 +1034,9 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
 
     var new_v_pos = mesh.positions.copy()
     var new_v_nrm = mesh.normals.copy()
+    var new_v_tang = mesh.tangents.copy()
     var new_v_uv = mesh.texcoords.copy()
+    var new_v_uv1 = mesh.texcoords1.copy()
     var new_v_col = mesh.colors.copy()
     var wedge_parent = List[Int](length=v_count, fill=0)
     for vi in range(v_count):
@@ -1177,6 +1181,15 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
                         var nm = (na * (Float32(1.0) - best_t) + nb * best_t).normalized()
                         if nm.length_squared() > Float32(0.1):
                             new_v_nrm[va * 3] = nm.x; new_v_nrm[va * 3 + 1] = nm.y; new_v_nrm[va * 3 + 2] = nm.z
+                    if has_tang:
+                        var ta = Vec3(new_v_tang[va * 4], new_v_tang[va * 4 + 1], new_v_tang[va * 4 + 2])
+                        var tb = Vec3(new_v_tang[vb * 4], new_v_tang[vb * 4 + 1], new_v_tang[vb * 4 + 2])
+                        var tm = (ta * (Float32(1.0) - best_t) + tb * best_t).normalized()
+                        if tm.length_squared() > Float32(0.1):
+                            new_v_tang[va * 4] = tm.x; new_v_tang[va * 4 + 1] = tm.y; new_v_tang[va * 4 + 2] = tm.z
+                    if has_uv1:
+                        new_v_uv1[va * 2] = new_v_uv1[va * 2] * (Float32(1.0) - best_t) + new_v_uv1[vb * 2] * best_t
+                        new_v_uv1[va * 2 + 1] = new_v_uv1[va * 2 + 1] * (Float32(1.0) - best_t) + new_v_uv1[vb * 2 + 1] * best_t
                     wedge_parent[vb] = va
             tri_alive[ti] = False
             live_tris -= 1
@@ -1287,6 +1300,11 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
     out_mesh.texture = mesh.texture
     out_mesh.normal_orm_texture = mesh.normal_orm_texture
     out_mesh.orm_texture = mesh.orm_texture
+    out_mesh.occlusion_texture = mesh.occlusion_texture
+    out_mesh.occlusion_texcoord = mesh.occlusion_texcoord
+    out_mesh.occlusion_strength = mesh.occlusion_strength
+    out_mesh.emissive_texture = mesh.emissive_texture
+    out_mesh.emissive_texcoord = mesh.emissive_texcoord
     out_mesh.emissive_color = mesh.emissive_color
     out_mesh.emissive_strength = mesh.emissive_strength
     out_mesh.clearcoat = mesh.clearcoat
@@ -1318,9 +1336,17 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
                     out_mesh.normals.append(new_v_nrm[old_v * 3])
                     out_mesh.normals.append(new_v_nrm[old_v * 3 + 1])
                     out_mesh.normals.append(new_v_nrm[old_v * 3 + 2])
+                if has_tang:
+                    out_mesh.tangents.append(new_v_tang[old_v * 4])
+                    out_mesh.tangents.append(new_v_tang[old_v * 4 + 1])
+                    out_mesh.tangents.append(new_v_tang[old_v * 4 + 2])
+                    out_mesh.tangents.append(new_v_tang[old_v * 4 + 3])
                 if has_uv:
                     out_mesh.texcoords.append(new_v_uv[old_v * 2])
                     out_mesh.texcoords.append(new_v_uv[old_v * 2 + 1])
+                if has_uv1:
+                    out_mesh.texcoords1.append(new_v_uv1[old_v * 2])
+                    out_mesh.texcoords1.append(new_v_uv1[old_v * 2 + 1])
                 if has_col:
                     out_mesh.colors.append(new_v_col[old_v * 4])
                     out_mesh.colors.append(new_v_col[old_v * 4 + 1])
@@ -1412,6 +1438,7 @@ struct AaaGeometryPool(Movable):
         var tan_v = List[Vec3](length=v_count, fill=Vec3(0.0, 0.0, 0.0))
         var has_uv = len(mesh.texcoords) >= v_count * 2
         var has_nrm = len(mesh.normals) >= v_count * 3
+        var has_authored_tang = len(mesh.tangents) >= v_count * 4
         var has_vcol = len(mesh.colors) >= v_count * 4
 
         for ti in range(raw_tris):
@@ -1464,17 +1491,31 @@ struct AaaGeometryPool(Movable):
             if has_nrm:
                 n = Vec3(mesh.normals[vi * 3], mesh.normals[vi * 3 + 1], mesh.normals[vi * 3 + 2]).normalized()
 
-            var t_raw = tan_u[vi] - n * n.dot(tan_u[vi])
-            var t_len2 = t_raw.length_squared()
-            var tang: Vec3
+            var tang = Vec3(1.0, 0.0, 0.0)
             var sign_neg: UInt32 = 0
-            if t_len2 > Float32(1e-8):
-                tang = t_raw * (Float32(1.0) / sqrt(t_len2))
-                if n.cross(tang).dot(tan_v[vi]) < Float32(0.0):
-                    sign_neg = 1
-            else:
-                var helper = Vec3(1.0, 0.0, 0.0) if abs(n.y) > Float32(0.9) else Vec3(0.0, 1.0, 0.0)
-                tang = helper.cross(n).normalized()
+            var used_authored = False
+            if has_authored_tang:
+                var tx = mesh.tangents[vi * 4 + 0]
+                var ty = mesh.tangents[vi * 4 + 1]
+                var tz = mesh.tangents[vi * 4 + 2]
+                var tw = mesh.tangents[vi * 4 + 3]
+                var at_vec = Vec3(tx, ty, tz)
+                var t_auth = at_vec - n * n.dot(at_vec)
+                var a_len2 = t_auth.length_squared()
+                if a_len2 > Float32(1e-8):
+                    tang = t_auth * (Float32(1.0) / sqrt(a_len2))
+                    sign_neg = UInt32(1) if tw < Float32(0.0) else UInt32(0)
+                    used_authored = True
+            if not used_authored:
+                var t_raw = tan_u[vi] - n * n.dot(tan_u[vi])
+                var t_len2 = t_raw.length_squared()
+                if t_len2 > Float32(1e-8):
+                    tang = t_raw * (Float32(1.0) / sqrt(t_len2))
+                    if n.cross(tang).dot(tan_v[vi]) < Float32(0.0):
+                        sign_neg = 1
+                else:
+                    var helper = Vec3(1.0, 0.0, 0.0) if abs(n.y) > Float32(0.9) else Vec3(0.0, 1.0, 0.0)
+                    tang = helper.cross(n).normalized()
 
             var u0 = mesh.texcoords[vi * 2 + 0] if has_uv else (px * Float32(0.5))
             var v0 = mesh.texcoords[vi * 2 + 1] if has_uv else (pz * Float32(0.5))

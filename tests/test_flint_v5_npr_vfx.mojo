@@ -25,6 +25,12 @@ from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.model import NativeMesh
 from flint.core.math import Vec3
 from flint.core.transform import Mat4, Quat, trs
+from flint.platform.vulkan import (
+    ACCESS_HOST_READ,
+    ACCESS_TRANSFER_WRITE,
+    PIPELINE_HOST,
+    PIPELINE_TRANSFER,
+)
 from flint.render.aaa_bsdf import AaaMaterial
 from flint.render.aaa_ibl import SkyDomeParams, bake_bc6h_ibl_cubemap_and_sh9
 from flint.render.aaa_npr_cel import (
@@ -59,6 +65,30 @@ from flint.render.spirv_validate import validate_spirv_module
 def _fail(msg: String):
     print("  [FAIL]", msg)
     external_call["exit", NoneType](Int32(1))
+
+
+def _readback_vertices_floats(
+    mut ren: FlintAaaVulkanRenderer, first_vertex: Int, vertex_count: Int
+) -> List[Float32]:
+    var n_floats = vertex_count * 12
+    var out = List[Float32](length=n_floats, fill=Float32(0.0))
+    if not ren.active or ren.buf_vertices.vk_buffer == 0 or n_floats <= 0:
+        return out^
+    var byte_len = n_floats * 4
+    var src_byte_offset = first_vertex * 48
+    var rb = ren.vk.create_buffer(byte_len, local=False, cpu_reads=True)
+    if rb.vk_buffer != 0 and rb.cpu_address != 0:
+        ren.vk.wait_idle()
+        if ren.vk.begin_commands(0):
+            ren.vk.copy_buffer(0, ren.buf_vertices, src_byte_offset, rb, 0, byte_len)
+            ren.vk.memory_barrier2(
+                0, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ)
+            )
+            var f = ren.vk.submit(0)
+            if f != 0 and ren.vk.wait(f):
+                _ = external_call["memcpy", Int](Int(out.unsafe_ptr()), rb.cpu_address, byte_len)
+    ren.vk.destroy_buffer(rb)
+    return out^
 
 
 def _assert(cond: Bool, msg: String):
@@ -331,10 +361,7 @@ def test_gpu_cel_outlines_smear_and_vfx():
 
     _ = ren.update_skinned_mesh_smear(sk_entry, sk_bones, sk_bones, sk_smears, sk_smears)
 
-    var gpu_v = List[Float32](length=bv_cnt * 12, fill=0.0)
-    _ = external_call[
-        "memcpy", Int
-    ](Int(gpu_v.unsafe_ptr()), ren.buf_vertices.cpu_address + sk_entry.mesh_entry.first_vertex * 48, bv_cnt * 48)
+    var gpu_v = _readback_vertices_floats(ren, sk_entry.mesh_entry.first_vertex, bv_cnt)
     for vi in range(bv_cnt):
         var bp = Vec3(box_m.positions[vi * 3], box_m.positions[vi * 3 + 1], box_m.positions[vi * 3 + 2])
         var bn = Vec3(box_m.normals[vi * 3], box_m.normals[vi * 3 + 1], box_m.normals[vi * 3 + 2])
@@ -346,9 +373,7 @@ def test_gpu_cel_outlines_smear_and_vfx():
         _assert((gn - cpu_ref[1]).length() < Float32(1e-3), "GPU Smear-Skinning J^{-T} normal matches CPU < 1e-3")
 
     _ = ren.update_skinned_mesh_bones(sk_entry, sk_bones, sk_bones)
-    _ = external_call[
-        "memcpy", Int
-    ](Int(gpu_v.unsafe_ptr()), ren.buf_vertices.cpu_address + sk_entry.mesh_entry.first_vertex * 48, bv_cnt * 48)
+    gpu_v = _readback_vertices_floats(ren, sk_entry.mesh_entry.first_vertex, bv_cnt)
     var bp0 = Vec3(box_m.positions[0], box_m.positions[1], box_m.positions[2])
     var bn0 = Vec3(box_m.normals[0], box_m.normals[1], box_m.normals[2])
     var rigid_ref = skin_vertex_dq_cpu(sk_bones, 0, 1, 0, 0, j_weights[0].x, j_weights[0].y, 0.0, 0.0, bp0, bn0)

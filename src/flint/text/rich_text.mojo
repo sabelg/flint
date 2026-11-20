@@ -22,6 +22,14 @@ behaves like a letter.
 from flint.render.font import SdfFont
 from flint.text.utf8 import decode_utf8, encode_utf8
 from flint.text.line_break import TextLine, break_items
+from flint.text.bidi import (
+    BIDI_AUTO,
+    resolve_bidi,
+    reorder_line,
+    bidi_mirror,
+    compute_arabic_forms,
+)
+from flint.text.shaper import ShapedGlyph, TextShaper, FontFallbackChain
 from flint.ui.button_glyphs import ACTION_NONE, action_id, glyph_shape, glyph_label, glyph_width
 
 comptime SPAN_TEXT: Int = 0
@@ -41,7 +49,6 @@ struct RichSpan(Copyable, ImplicitlyCopyable, Movable):
     var action: Int     # for SPAN_BUTTON
 
 
-@fieldwise_init
 struct PlacedRun(Copyable, ImplicitlyCopyable, Movable):
     var kind: Int
     var text: String
@@ -53,6 +60,36 @@ struct PlacedRun(Copyable, ImplicitlyCopyable, Movable):
     var color: Int
     var face: Int           # resolved: 0 UI, 1 display
     var action: Int
+    var level: Int
+    var rtl: Bool
+
+    def __init__(
+        out self,
+        kind: Int,
+        text: String,
+        x: Float32,
+        line: Int,
+        baseline: Float32,
+        width: Float32,
+        px: Float32,
+        color: Int,
+        face: Int,
+        action: Int,
+        level: Int = 0,
+        rtl: Bool = False,
+    ):
+        self.kind = kind
+        self.text = text
+        self.x = x
+        self.line = line
+        self.baseline = baseline
+        self.width = width
+        self.px = px
+        self.color = color
+        self.face = face
+        self.action = action
+        self.level = level
+        self.rtl = rtl
 
 
 struct RichLayout(Copyable, Movable):
@@ -60,12 +97,14 @@ struct RichLayout(Copyable, Movable):
     var lines: Int
     var width: Float32
     var height: Float32
+    var base_level: Int
 
     def __init__(out self):
         self.runs = List[PlacedRun]()
         self.lines = 0
         self.width = 0
         self.height = 0
+        self.base_level = 0
 
 
 def hex_value(bytes: List[UInt8]) -> Int:
@@ -254,13 +293,25 @@ def face_font_metric(ui: SdfFont, display: SdfFont, face: Int) -> Tuple[Float32,
     return (ui.line_height, ui.cap_height, ui.bake_px)
 
 
+def _visual_run_text(codes: List[Int], start: Int, end: Int, rtl: Bool) -> String:
+    if not rtl:
+        return encode_utf8(codes, start, end)
+    var rev = List[Int](capacity=end - start)
+    var i = end - 1
+    while i >= start:
+        rev.append(bidi_mirror(codes[i]))
+        i -= 1
+    return encode_utf8(rev)
+
+
 def layout_rich(
     spans: List[RichSpan], ui: SdfFont, display: SdfFont, px: Float32, base_face: Int,
     max_width: Float32, align: Int, pad: Bool, sony: Bool, keys: List[String] = List[String](),
+    base_dir: Int = BIDI_AUTO,
 ) -> RichLayout:
     """Place `spans` on lines no wider than `max_width` (<= 0: no limit) at
     `px` per em. align 0 left, 1 centre, 2 right inside the widest line (or
-    `max_width` when given). Units are those of `px`."""
+    `max_width` when given). Reorders mixed/RTL lines via UAX #9 BiDi."""
     var codes = List[Int]()
     var owner = List[Int]()
     var advance = List[Float32]()
@@ -292,16 +343,17 @@ def layout_rich(
                     k = (display.kern(span_codes[i - 1], code) if face == 1 else ui.kern(span_codes[i - 1], code)) * font_scale
             advance.append(a)
             kern_before.append(k)
+    var resolved = resolve_bidi(codes, base_dir)
     var lines = break_items(codes, advance, kern_before, max_width)
     var layout = RichLayout()
     layout.lines = len(lines)
+    layout.base_level = resolved.base_level
     for line in lines:
         layout.width = max(layout.width, line.width)
     var box = max_width if max_width > 0 else layout.width
     var top: Float32 = 0
     for l in range(len(lines)):
         var line = lines[l]
-        # The tallest span on the line sets its height and baseline.
         var line_h: Float32 = 0
         var cap: Float32 = 0
         for index in range(line.start, line.end):
@@ -321,28 +373,260 @@ def layout_rich(
             x = (box - line.width) * 0.5
         elif align == 2:
             x = box - line.width
-        var index = line.start
-        while index < line.end:
-            var s = owner[index]
-            var span = spans[s]
+
+        var bidi_runs = reorder_line(resolved, line.start, line.end)
+        for br in bidi_runs:
+            var rtl = br.is_rtl()
+            # Partition [br.start, br.end) into contiguous span-owner segments
+            var seg_starts = List[Int]()
+            var seg_ends = List[Int]()
+            var p = br.start
+            while p < br.end:
+                var s_id = owner[p]
+                var s_start = p
+                if spans[s_id].kind == SPAN_BUTTON:
+                    p += 1
+                else:
+                    while p < br.end and owner[p] == s_id and spans[owner[p]].kind != SPAN_BUTTON:
+                        p += 1
+                seg_starts.append(s_start)
+                seg_ends.append(p)
+
+            var seg_count = len(seg_starts)
+            for k in range(seg_count):
+                var seg_i = (seg_count - 1 - k) if rtl else k
+                var rs = seg_starts[seg_i]
+                var re = seg_ends[seg_i]
+                var s = owner[rs]
+                var span = spans[s]
+                var face = span.face if span.face >= 0 else base_face
+                var span_px = px * Float32(span.scale) / 100.0
+                if span.kind == SPAN_BUTTON:
+                    layout.runs.append(PlacedRun(SPAN_BUTTON, String(), x, l, baseline, advance[rs], span_px, span.color, face, span.action, br.level, rtl))
+                    x += advance[rs]
+                    continue
+                var vis_end = re
+                while vis_end > rs and (codes[vis_end - 1] == 0x0A or codes[vis_end - 1] == 0x0D or codes[vis_end - 1] == 0x20):
+                    vis_end -= 1
+                var vis_w: Float32 = 0
+                for idx in range(rs, vis_end):
+                    vis_w += advance[idx] + (kern_before[idx] if idx > line.start and idx > rs else Float32(0))
+                var trail_w: Float32 = 0
+                for idx in range(vis_end, re):
+                    trail_w += advance[idx] + (kern_before[idx] if idx > line.start and idx > rs else Float32(0))
+                if rtl:
+                    if re < line.end:
+                        x += trail_w
+                    if vis_end > rs:
+                        var vtxt = _visual_run_text(codes, rs, vis_end, True)
+                        layout.runs.append(PlacedRun(SPAN_TEXT, vtxt, x, l, baseline, vis_w, span_px, span.color, face, ACTION_NONE, br.level, True))
+                    x += vis_w
+                else:
+                    if vis_end > rs:
+                        var vtxt = _visual_run_text(codes, rs, vis_end, False)
+                        layout.runs.append(PlacedRun(SPAN_TEXT, vtxt, x, l, baseline, vis_w + trail_w, span_px, span.color, face, ACTION_NONE, br.level, False))
+                    x += vis_w + trail_w
+        top += line_h
+    layout.height = top
+    return layout^
+
+
+struct PlacedShapedRun(Copyable, Movable):
+    var kind: Int
+    var glyphs: List[ShapedGlyph]
+    var x: Float32
+    var line: Int
+    var baseline: Float32
+    var width: Float32
+    var px: Float32
+    var color: Int
+    var face: Int
+    var action: Int
+    var level: Int
+    var rtl: Bool
+
+    def __init__(
+        out self,
+        kind: Int,
+        var glyphs: List[ShapedGlyph],
+        x: Float32,
+        line: Int,
+        baseline: Float32,
+        width: Float32,
+        px: Float32,
+        color: Int,
+        face: Int,
+        action: Int,
+        level: Int = 0,
+        rtl: Bool = False,
+    ):
+        self.kind = kind
+        self.glyphs = glyphs^
+        self.x = x
+        self.line = line
+        self.baseline = baseline
+        self.width = width
+        self.px = px
+        self.color = color
+        self.face = face
+        self.action = action
+        self.level = level
+        self.rtl = rtl
+
+
+struct RichShapedLayout(Copyable, Movable):
+    var runs: List[PlacedShapedRun]
+    var lines: Int
+    var width: Float32
+    var height: Float32
+    var base_level: Int
+
+    def __init__(out self):
+        self.runs = List[PlacedShapedRun]()
+        self.lines = 0
+        self.width = 0.0
+        self.height = 0.0
+        self.base_level = 0
+
+
+def layout_rich_shaped(
+    spans: List[RichSpan],
+    ui: SdfFont,
+    display: SdfFont,
+    px: Float32,
+    base_face: Int,
+    max_width: Float32,
+    align: Int,
+    pad: Bool,
+    sony: Bool,
+    keys: List[String] = List[String](),
+    base_dir: Int = BIDI_AUTO,
+) -> RichShapedLayout:
+    """Full GSUB + BiDi + fallback-chain shaped rich text layout without
+    double-reversing RTL text."""
+    var codes = List[Int]()
+    var owner = List[Int]()
+    var advance = List[Float32]()
+    var kern_before = List[Float32]()
+    var ui_chain = ui.fallback_chain()
+    var disp_chain = display.fallback_chain() if (display.valid or display.has_source or len(display.fallbacks) > 0) else ui.fallback_chain()
+    var ui_shaper = TextShaper(ui_chain^)
+    var disp_shaper = TextShaper(disp_chain^)
+
+    for s in range(len(spans)):
+        var span = spans[s]
+        var face = span.face if span.face >= 0 else base_face
+        var span_px = px * Float32(span.scale) / 100.0
+        if span.kind == SPAN_BUTTON:
+            var h = span_px * BUTTON_HEIGHT
+            var label = glyph_label(span.action, pad, sony, keys)
+            var label_width = run_width_text(ui, label, span_px * BUTTON_LABEL)
+            codes.append(OBJECT_CODE)
+            owner.append(s)
+            advance.append(glyph_width(glyph_shape(span.action, pad), label_width, h))
+            kern_before.append(0.0)
+            continue
+        var font_scale = span_px / (display.bake_px if face == 1 else ui.bake_px)
+        var span_codes = decode_utf8(span.text)
+        for i in range(len(span_codes)):
+            var code = span_codes[i]
+            codes.append(code)
+            owner.append(s)
+            var a: Float32 = 0.0
+            var k: Float32 = 0.0
+            if code != 0x0A and code != 0x0D:
+                a = (display.advance_of(code) if face == 1 else ui.advance_of(code)) * font_scale
+                if i > 0:
+                    k = (display.kern(span_codes[i - 1], code) if face == 1 else ui.kern(span_codes[i - 1], code)) * font_scale
+            advance.append(a)
+            kern_before.append(k)
+
+    var resolved = resolve_bidi(codes, base_dir)
+    var arabic_forms = compute_arabic_forms(codes)
+    var lines = break_items(codes, advance, kern_before, max_width)
+    var layout = RichShapedLayout()
+    layout.lines = len(lines)
+    layout.base_level = resolved.base_level
+    for line in lines:
+        layout.width = max(layout.width, line.width)
+    var box = max_width if max_width > 0 else layout.width
+    var top: Float32 = 0.0
+    for l in range(len(lines)):
+        var line = lines[l]
+        var line_h: Float32 = 0.0
+        var cap: Float32 = 0.0
+        for index in range(line.start, line.end):
+            var span = spans[owner[index]]
             var face = span.face if span.face >= 0 else base_face
+            var metric = face_font_metric(ui, display, face)
             var span_px = px * Float32(span.scale) / 100.0
-            if span.kind == SPAN_BUTTON:
-                layout.runs.append(PlacedRun(SPAN_BUTTON, String(), x, l, baseline, advance[index], span_px, span.color, face, span.action))
-                x += advance[index]
-                index += 1
-                continue
-            var run_start = index
-            var run_x = x
-            while index < line.end and owner[index] == s:
-                x += advance[index] + (kern_before[index] if index > line.start and index > run_start else Float32(0))
-                index += 1
-            # Leave the newline and hanging spaces out of the drawn text.
-            var run_end = index
-            while run_end > run_start and (codes[run_end - 1] == 0x0A or codes[run_end - 1] == 0x20):
-                run_end -= 1
-            if run_end > run_start:
-                layout.runs.append(PlacedRun(SPAN_TEXT, encode_utf8(codes, run_start, run_end), run_x, l, baseline, x - run_x, span_px, span.color, face, ACTION_NONE))
+            line_h = max(line_h, metric[0] * span_px / metric[2])
+            cap = max(cap, metric[1] * span_px / metric[2])
+        if line.end == line.start or line_h == 0.0:
+            var metric = face_font_metric(ui, display, base_face)
+            line_h = metric[0] * px / metric[2]
+            cap = metric[1] * px / metric[2]
+        var baseline = top + cap
+        var x: Float32 = 0.0
+        if align == 1:
+            x = (box - line.width) * Float32(0.5)
+        elif align == 2:
+            x = box - line.width
+
+        var bidi_runs = reorder_line(resolved, line.start, line.end)
+        for br in bidi_runs:
+            var rtl = br.is_rtl()
+            var seg_starts = List[Int]()
+            var seg_ends = List[Int]()
+            var p = br.start
+            while p < br.end:
+                var s_id = owner[p]
+                var s_start = p
+                if spans[s_id].kind == SPAN_BUTTON:
+                    p += 1
+                else:
+                    while p < br.end and owner[p] == s_id and spans[owner[p]].kind != SPAN_BUTTON:
+                        p += 1
+                seg_starts.append(s_start)
+                seg_ends.append(p)
+
+            var seg_count = len(seg_starts)
+            for k in range(seg_count):
+                var seg_i = (seg_count - 1 - k) if rtl else k
+                var rs = seg_starts[seg_i]
+                var re = seg_ends[seg_i]
+                var s = owner[rs]
+                var span = spans[s]
+                var face = span.face if span.face >= 0 else base_face
+                var span_px = px * Float32(span.scale) / 100.0
+                if span.kind == SPAN_BUTTON:
+                    layout.runs.append(PlacedShapedRun(SPAN_BUTTON, List[ShapedGlyph](), x, l, baseline, advance[rs], span_px, span.color, face, span.action, br.level, rtl))
+                    x += advance[rs]
+                    continue
+                var vis_end = re
+                while vis_end > rs and (codes[vis_end - 1] == 0x0A or codes[vis_end - 1] == 0x0D or codes[vis_end - 1] == 0x20):
+                    vis_end -= 1
+                var sglyphs = List[ShapedGlyph]()
+                var shaped_w: Float32 = 0.0
+                if vis_end > rs:
+                    var sruns = disp_shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px) if face == 1 else ui_shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px)
+                    for sr in sruns:
+                        for g in sr.glyphs:
+                            sglyphs.append(g)
+                            shaped_w += g.x_advance
+                var trailing_space_w: Float32 = 0.0
+                for idx in range(vis_end, re):
+                    trailing_space_w += advance[idx]
+                if rtl:
+                    if re < line.end:
+                        x += trailing_space_w
+                    if len(sglyphs) > 0:
+                        layout.runs.append(PlacedShapedRun(SPAN_TEXT, sglyphs^, x, l, baseline, shaped_w, span_px, span.color, face, ACTION_NONE, br.level, True))
+                    x += shaped_w
+                else:
+                    if len(sglyphs) > 0:
+                        layout.runs.append(PlacedShapedRun(SPAN_TEXT, sglyphs^, x, l, baseline, shaped_w, span_px, span.color, face, ACTION_NONE, br.level, False))
+                    x += shaped_w + trailing_space_w
         top += line_h
     layout.height = top
     return layout^

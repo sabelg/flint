@@ -54,6 +54,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_POST_SCRATCH,
     BIND_AAA_SKINNING,
     BIND_AAA_VERTICES,
+    emit_vec3_normalize,
 )
 
 # ============================================================================
@@ -262,7 +263,11 @@ struct MaterialAsset(Copyable, Movable):
         m.roughness = bitcast[DType.float32](words[offset + 4])
         m.metallic = bitcast[DType.float32](words[offset + 5])
         m.clearcoat = bitcast[DType.float32](words[offset + 6])
-        m.clearcoat_roughness = bitcast[DType.float32](words[offset + 7])
+        var enc_cc_r = bitcast[DType.float32](words[offset + 7])
+        m.clearcoat_roughness = abs(enc_cc_r)
+        if enc_cc_r < Float32(0.0):
+            m.flags |= MAT_FLAG_DOUBLE_SIDED
+            m.domain = MAT_DOMAIN_TWO_SIDED_FOLIAGE
         if m.clearcoat > Float32(0.001):
             m.domain = MAT_DOMAIN_CLEARCOAT
             m.flags |= MAT_FLAG_CLEARCOAT
@@ -284,7 +289,10 @@ struct MaterialAsset(Copyable, Movable):
             bitcast[DType.float32](words[offset + 17]),
             bitcast[DType.float32](words[offset + 18]),
         )
-        m.sheen_roughness = bitcast[DType.float32](words[offset + 19])
+        var enc_sh_r = bitcast[DType.float32](words[offset + 19])
+        m.sheen_roughness = abs(enc_sh_r)
+        if enc_sh_r < Float32(0.0):
+            m.domain = MAT_DOMAIN_UNLIT_UI
         var sss_premult = Vec3(
             bitcast[DType.float32](words[offset + 20]),
             bitcast[DType.float32](words[offset + 21]),
@@ -426,17 +434,17 @@ struct MaterialAsset(Copyable, Movable):
             metallic=self.metallic,
         )
         out.opacity = self.opacity
-        out.specular_factor = self.specular_factor
+        out.specular_factor = max(Float32(0.0), min(Float32(1.0), self.specular_factor))
         out.clearcoat = self.clearcoat
-        out.clearcoat_roughness = self.clearcoat_roughness
+        out.clearcoat_roughness = max(Float32(0.04), min(Float32(1.0), self.clearcoat_roughness))
         out.emissive = self.emissive
-        out.detail_uv_scale = self.detail_uv_scale
+        out.detail_uv_scale = max(Float32(0.001), self.detail_uv_scale)
         out.detail_normal_strength = self.detail_normal_strength
         out.iridescence = self.iridescence
         out.iridescence_thickness_nm = self.iridescence_thickness_nm
         out.iridescence_ior = self.iridescence_ior
         out.sheen_color = self.sheen_color
-        out.sheen_roughness = self.sheen_roughness
+        out.sheen_roughness = max(Float32(0.05), self.sheen_roughness)
         out.subsurface_color = self.subsurface_color
         out.subsurface_amount = self.subsurface_amount
         out.albedo_tex = Int(self.albedo_slot) if self.albedo_slot != BINDLESS_SLOT_NONE else -1
@@ -445,7 +453,9 @@ struct MaterialAsset(Copyable, Movable):
         out.detail_normal_tex = Int(self.detail_normal_slot) if self.detail_normal_slot != BINDLESS_SLOT_NONE else -1
         out.interior_parallax_enabled = (self.flags & MAT_FLAG_INTERIOR_PARALLAX) != 0
         out.road_wetness_mode = (self.flags & MAT_FLAG_ROAD_WETNESS) != 0
-        if (self.flags & MAT_FLAG_ALPHA_MASKED) != 0:
+        out.unlit = (self.domain == MAT_DOMAIN_UNLIT_UI)
+        out.two_sided_foliage = (self.domain == MAT_DOMAIN_TWO_SIDED_FOLIAGE) or ((self.flags & MAT_FLAG_DOUBLE_SIDED) != 0)
+        if (self.flags & MAT_FLAG_ALPHA_MASKED) != 0 or self.alpha_cutoff > Float32(0.01):
             out.alpha_cutoff = max(Float32(0.05), self.alpha_cutoff)
         return out^
 
@@ -781,6 +791,10 @@ struct GpuDecalVolume(Copyable, Movable):
 # 4. `TerrainClipmapDesc` (Concentric Toroidal Terrain Clipmap Descriptor)
 # ============================================================================
 
+comptime AAA_GLOBALS_TERRAIN_CLIPMAP_WORD: Int = 3784  # 12 words [3784..3795] from TerrainClipmapDesc.pack_words()
+comptime AAA_GLOBALS_TERRAIN_META_WORD: Int = 3796     # [0]=enabled_u32, [1]=world_size_m, [2]=world_origin_x, [3]=world_origin_z
+comptime AAA_GLOBALS_TERRAIN_ORIGINS_WORD: Int = 3800  # 8 x (ox_f32, oz_f32) = 16 words [3800..3815]
+
 struct TerrainClipmapDesc(Copyable, Movable):
     """Configures concentric GPU geometry clipmap terrain rings with 16-bit bindless splat maps."""
     var ring_count: Int
@@ -879,7 +893,7 @@ struct VatCrowdClipDesc(Copyable, ImplicitlyCopyable, Movable):
         self.nrm_tex_slot = BINDLESS_SLOT_NONE
 
 
-struct BakedVatCrowdClip(Movable):
+struct BakedVatCrowdClip(Copyable, Movable):
     """Baked `RGBA16F` (`width = vertex_count`, `height = frame_count`) position + normal VAT textures."""
     var desc: VatCrowdClipDesc
     var pos_rgba16f: List[UInt16]  # 4 x UInt16 (px, py, pz, 1.0) per (frame * vertex_count + v)
@@ -1201,4 +1215,179 @@ def vat_crowd_eval_shader() -> List[UInt32]:
     s.store_float(b_skin, p_base, s.extract_f(prev_pos4, 0))
     s.store_float(b_skin, s.iadd(p_base, s.uint(1)), s.extract_f(prev_pos4, 1))
     s.store_float(b_skin, s.iadd(p_base, s.uint(2)), s.extract_f(prev_pos4, 2))
+    return s.finish()
+
+
+def terrain_clipmap_eval_shader() -> List[UInt32]:
+    """GPU Compute Toroidal Terrain Clipmap Evaluator (`group = 64 x 1`):
+    Reads canonical ring-local `(lx, lz)` from `b_verts[v_base + 0, 2]` and skirt bit `(meta & 4) == 0`,
+    samples bindless `RGBA16F` heightmap (or deterministic procedural FBM fallback), applies geomorphing
+    near `morph_start_ratio * ring_half_extent_m`, drops outer skirts by `skirt_depth_m`, derives
+    splat weights, and writes `(lx, wy, lz)`, normal, tangent, world UV, and splat `meta`!
+    Push[0]=vertex_count, [1]=dst_first_vertex, [2]=heightmap_slot, [3]=splat_control_slot,
+    [4]=ring_snapped_ox, [5]=ring_snapped_oz, [6]=ring_cell_size_m, [7]=ring_half_extent_m,
+    [8]=height_scale_m, [9]=height_offset_m, [10]=morph_start_ratio,
+    [11]=world_size_m, [12]=world_origin_x, [13]=world_origin_z, [14]=skirt_depth_m, [15]=grid_dim_per_ring.
+    """
+    var s = AaaSpirvModule(
+        MODEL_GL_COMPUTE,
+        group_width=64,
+        group_height=1,
+        push_words=AAA_PUSH_WORDS,
+        enable_bindless=True,
+    )
+    var b_verts = s.buffer(BIND_AAA_VERTICES)
+    var bindless_arr = s.bindless_sampled_array_2d(BIND_AAA_BINDLESS_TEX, AAA_MAX_BINDLESS)
+
+    var v_id = s.invocation_axis(0)
+    var v_cnt = s.push_word(0)
+    s.return_if(s.uge(v_id, v_cnt))
+
+    var dst_first_v = s.push_word(1)
+    var hm_slot = s.push_word(2)
+    var splat_slot = s.push_word(3)
+    var ring_ox = s.push_float(4)
+    var ring_oz = s.push_float(5)
+    var cell_sz = s.nmax(s.float(0.05), s.push_float(6))
+    var half_ext = s.nmax(s.float(0.5), s.push_float(7))
+    var h_scale = s.push_float(8)
+    var h_offset = s.push_float(9)
+    var morph_start = s.nclamp(s.push_float(10), s.float(0.1), s.float(0.95))
+    var world_sz = s.nmax(s.float(1.0), s.push_float(11))
+    var world_ox = s.push_float(12)
+    var world_oz = s.push_float(13)
+    var skirt_drop = s.push_float(14)
+
+    var v_base = s.imul(s.iadd(dst_first_v, v_id), s.uint(12))
+    var lx = s.load_float(b_verts, v_base)
+    var lz = s.load_float(b_verts, s.iadd(v_base, s.uint(2)))
+    var meta_in = s.load_word(b_verts, s.iadd(v_base, s.uint(11)))
+    var is_skirt = s.ieq(s.bit_and(meta_in, s.uint(4)), s.uint(0))
+
+    var wx = s.fadd(ring_ox, lx)
+    var wz = s.fadd(ring_oz, lz)
+    var inv_wsz = s.fdiv(s.float(1.0), world_sz)
+    var hm_u = s.nclamp(s.fmul(s.fsub(wx, world_ox), inv_wsz), s.float(0.0), s.float(1.0))
+    var hm_v = s.nclamp(s.fmul(s.fsub(wz, world_oz), inv_wsz), s.float(0.0), s.float(1.0))
+
+    var h0_v = s.fvar(s.float(0.0))
+    var dh_dx_v = s.fvar(s.float(0.0))
+    var dh_dz_v = s.fvar(s.float(0.0))
+
+    # Geomorphing weight near outer boundary of ring
+    var r_cheb = s.nmax(s.fabs(lx), s.fabs(lz))
+    var r_norm = s.fdiv(r_cheb, half_ext)
+    var morph_w = s.nclamp(
+        s.fdiv(s.fsub(r_norm, morph_start), s.nmax(s.float(0.05), s.fsub(s.float(1.0), morph_start))),
+        s.float(0.0),
+        s.float(1.0),
+    )
+    var gx_i = s.saturate_uint(s.ffloor(s.fadd(s.fdiv(s.fabs(lx), cell_sz), s.float(0.5))))
+    var gz_i = s.saturate_uint(s.ffloor(s.fadd(s.fdiv(s.fabs(lz), cell_sz), s.float(0.5))))
+    var odd_x = s.ine(s.bit_and(gx_i, s.uint(1)), s.uint(0))
+    var odd_z = s.ine(s.bit_and(gz_i, s.uint(1)), s.uint(0))
+
+    var step_uv = s.nmax(s.float(1.0 / 512.0), s.fmul(cell_sz, inv_wsz))
+    var step_m = s.fmul(step_uv, world_sz)
+
+    s.begin_if(s.ult(hm_slot, s.uint(UInt32(AAA_MAX_BINDLESS))))
+    var hc = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(hm_u, hm_v), s.float(0.0)), 0)
+    var hr = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(s.nmin(s.float(1.0), s.fadd(hm_u, step_uv)), hm_v), s.float(0.0)), 0)
+    var hl = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(s.nmax(s.float(0.0), s.fsub(hm_u, step_uv)), hm_v), s.float(0.0)), 0)
+    var hu = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(hm_u, s.nmin(s.float(1.0), s.fadd(hm_v, step_uv))), s.float(0.0)), 0)
+    var hd = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(hm_u, s.nmax(s.float(0.0), s.fsub(hm_v, step_uv))), s.float(0.0)), 0)
+
+    var du_c = s.fmul(cell_sz, inv_wsz)
+    var h_coarse = s.fvar(hc)
+    s.begin_if(s.logical_and(odd_x, odd_z))
+    var h_c0 = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(s.nmax(s.float(0.0), s.fsub(hm_u, du_c)), s.nmax(s.float(0.0), s.fsub(hm_v, du_c))), s.float(0.0)), 0)
+    var h_c1 = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(s.nmin(s.float(1.0), s.fadd(hm_u, du_c)), s.nmin(s.float(1.0), s.fadd(hm_v, du_c))), s.float(0.0)), 0)
+    s.store(h_coarse, s.fmul(s.fadd(h_c0, h_c1), s.float(0.5)))
+    s.begin_else()
+    s.begin_if(odd_x)
+    var h_x0 = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(s.nmax(s.float(0.0), s.fsub(hm_u, du_c)), hm_v), s.float(0.0)), 0)
+    var h_x1 = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(s.nmin(s.float(1.0), s.fadd(hm_u, du_c)), hm_v), s.float(0.0)), 0)
+    s.store(h_coarse, s.fmul(s.fadd(h_x0, h_x1), s.float(0.5)))
+    s.begin_else()
+    s.begin_if(odd_z)
+    var h_z0 = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(hm_u, s.nmax(s.float(0.0), s.fsub(hm_v, du_c))), s.float(0.0)), 0)
+    var h_z1 = s.extract_f(s.sample_bindless_lod(bindless_arr, hm_slot, s.vec2(hm_u, s.nmin(s.float(1.0), s.fadd(hm_v, du_c))), s.float(0.0)), 0)
+    s.store(h_coarse, s.fmul(s.fadd(h_z0, h_z1), s.float(0.5)))
+    s.end_if()
+    s.end_if()
+    s.end_if()
+
+    var h_morphed = s.fma(s.fsub(s.load_f(h_coarse), hc), morph_w, hc)
+    s.store(h0_v, h_morphed)
+    var inv_2s = s.fdiv(h_scale, s.fmul(s.float(2.0), step_m))
+    s.store(dh_dx_v, s.fmul(s.fsub(hr, hl), inv_2s))
+    s.store(dh_dz_v, s.fmul(s.fsub(hu, hd), inv_2s))
+
+    s.begin_else()
+    # Deterministic procedural terrain height fallback
+    var kx = s.float(0.045)
+    var kz = s.float(0.038)
+    var px_p = s.fmul(wx, kx)
+    var pz_p = s.fmul(wz, kz)
+    var s1 = s.fsin(px_p)
+    var c1 = s.fcos(pz_p)
+    var h_proc = s.fma(s.fmul(s1, c1), s.float(0.45), s.float(0.50))
+    s.store(h0_v, h_proc)
+    s.store(dh_dx_v, s.fmul(h_scale, s.fmul(s.float(0.45), s.fmul(kx, s.fmul(s.fcos(px_p), c1)))))
+    s.store(dh_dz_v, s.fmul(h_scale, s.fmul(s.float(-0.45), s.fmul(kz, s.fmul(s1, s.fsin(pz_p))))))
+    s.end_if()
+
+    var h_norm = s.load_f(h0_v)
+    var wy_base = s.fma(h_norm, h_scale, h_offset)
+    var wy = s.select_f(is_skirt, s.fsub(wy_base, skirt_drop), wy_base)
+
+    var n_u = emit_vec3_normalize(s, s.fneg(s.load_f(dh_dx_v)), s.float(1.0), s.fneg(s.load_f(dh_dz_v)))
+    var nx = n_u[0]; var ny = n_u[1]; var nz = n_u[2]
+    # Tangent orthogonal to normal: normalize(1 - nx*nx, -nx*ny, -nx*nz)
+    var t_u = emit_vec3_normalize(s, s.fsub(s.float(1.0), s.fmul(nx, nx)), s.fneg(s.fmul(nx, ny)), s.fneg(s.fmul(nx, nz)))
+
+    # Splat weights `(w_sand, w_rock, w_cobb)` packed into bits 8..31 of `meta`
+    var w_sand_v = s.fvar(s.float(0.0))
+    var w_rock_v = s.fvar(s.float(0.0))
+    var w_cobb_v = s.fvar(s.float(0.0))
+    s.begin_if(s.ult(splat_slot, s.uint(UInt32(AAA_MAX_BINDLESS))))
+    var sp = s.sample_bindless_lod(bindless_arr, splat_slot, s.vec2(hm_u, hm_v), s.float(0.0))
+    var sp0 = s.nmax(s.float(0.0), s.extract_f(sp, 0))
+    var sp1 = s.nmax(s.float(0.0), s.extract_f(sp, 1))
+    var sp2 = s.nmax(s.float(0.0), s.extract_f(sp, 2))
+    var sp3 = s.nmax(s.float(0.0), s.extract_f(sp, 3))
+    var sp_sum = s.fadd(s.fadd(sp0, sp1), s.fadd(sp2, sp3))
+    var has_sp = s.fgt(sp_sum, s.float(1e-4))
+    var inv_sp = s.select_f(has_sp, s.fdiv(s.float(1.0), s.nmax(s.float(1e-4), sp_sum)), s.float(0.0))
+    s.store(w_sand_v, s.nclamp(s.fmul(sp1, inv_sp), s.float(0.0), s.float(1.0)))
+    s.store(w_rock_v, s.nclamp(s.fmul(sp2, inv_sp), s.float(0.0), s.float(1.0)))
+    s.store(w_cobb_v, s.nclamp(s.fmul(sp3, inv_sp), s.float(0.0), s.float(1.0)))
+    s.begin_else()
+    var slope = s.nclamp(s.fsub(s.float(1.0), ny), s.float(0.0), s.float(1.0))
+    var w_rk = s.nclamp(s.fmul(slope, s.float(3.0)), s.float(0.0), s.float(1.0))
+    var w_sd = s.fmul(s.nclamp(s.fsub(s.float(1.0), s.fmul(s.fabs(s.fsub(h_norm, s.float(0.15))), s.float(4.0))), s.float(0.0), s.float(1.0)), s.fsub(s.float(1.0), w_rk))
+    var w_cb = s.fmul(s.nclamp(s.fmul(s.fsub(h_norm, s.float(0.75)), s.float(3.0)), s.float(0.0), s.float(1.0)), s.fsub(s.float(1.0), w_rk))
+    s.store(w_sand_v, w_sd)
+    s.store(w_rock_v, w_rk)
+    s.store(w_cobb_v, w_cb)
+    s.end_if()
+
+    var w1_u = s.umin(s.uint(255), s.saturate_uint(s.fma(s.load_f(w_sand_v), s.float(255.0), s.float(0.5))))
+    var w2_u = s.umin(s.uint(255), s.saturate_uint(s.fma(s.load_f(w_rock_v), s.float(255.0), s.float(0.5))))
+    var w3_u = s.umin(s.uint(255), s.saturate_uint(s.fma(s.load_f(w_cobb_v), s.float(255.0), s.float(0.5))))
+    var meta_out = s.bit_or(
+        s.bit_and(meta_in, s.uint(0xFF)),
+        s.bit_or(s.shl(w1_u, s.uint(8)), s.bit_or(s.shl(w2_u, s.uint(16)), s.shl(w3_u, s.uint(24)))),
+    )
+
+    s.store_float(b_verts, s.iadd(v_base, s.uint(1)), wy)
+    s.store_float(b_verts, s.iadd(v_base, s.uint(3)), nx)
+    s.store_float(b_verts, s.iadd(v_base, s.uint(4)), ny)
+    s.store_float(b_verts, s.iadd(v_base, s.uint(5)), nz)
+    s.store_float(b_verts, s.iadd(v_base, s.uint(6)), t_u[0])
+    s.store_float(b_verts, s.iadd(v_base, s.uint(7)), t_u[1])
+    s.store_float(b_verts, s.iadd(v_base, s.uint(8)), t_u[2])
+    s.store_float(b_verts, s.iadd(v_base, s.uint(9)), s.fmul(wx, s.float(0.25)))
+    s.store_float(b_verts, s.iadd(v_base, s.uint(10)), s.fmul(wz, s.float(0.25)))
+    s.store_word(b_verts, s.iadd(v_base, s.uint(11)), meta_out)
     return s.finish()

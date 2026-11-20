@@ -1,32 +1,57 @@
 """Flint Studio Visual Scene Editor State, Reversible Undo/Redo, 1-Click LZ4 PIE & Procedural Forge (`studio_app.mojo`).
 
 Implements:
-  1. `StudioEntityNode` (`Serializable`, `Inspectable`): Authoritative Studio scene graph entity table
-     (name, TRS, parent, generational mesh/material handles, PBR material overrides, collider, rigid-body mass, visibility/lock).
-  2. `trait Inspectable` + `struct FieldVisitor`: Zero-macro reflection driving both the Studio Inspector UI
-     and generic AI/editor property patching.
-  3. Reversible Coalesced `EditorTransaction` Undo/Redo Stack (`undo()`, `redo()`, `state_hash()`):
-     Exact algebraic invertibility (`fnv64` match at every step across spawn, despawn, and coalesced TRS/material edits).
-  4. **1-Click Play-In-Editor (`PieSession`)** backed by LZ4 `checkpoint.mojo`:
-     `pie_play()`, `pie_pause()`, `pie_step()`, `pie_stop()` with deterministic IEEE-754 physics stepping
-     and verified bit-for-bit identical `fnv64` world restoration on stop!
-  5. Analytical scene collider raycasting (`Sphere`, `OBB Box`, `Capsule`, `Bvh8MeshCollider`) & Procedural Forge
-     bake-to-`.glb` (`flint.procedural` + `flint.assets.glb_writer`).
-  6. Docked AAA Studio Editor UI builder (`emit_studio_ui_draw_list`) rendering Hierarchy, Viewport + 3D Gizmos,
-     Asset/PIE Dock, and `FieldVisitor` Inspector into GPU `UiDrawList`.
+  1. Unified Engine v5 Spine (`EngineApp` + `WindowPlugin` + `TransformPlugin` + `InputPlugin` +
+     `PhysicsPlugin` + `RenderPlugin` + `flint.ecs.World` + `flint.scene.Scene` + `PhysicsWorld`):
+     Authoritative ECS components (`LocalTransform`, `GlobalTransform`, `PrevGlobalTransform`,
+     `Parent`, `Children`, `HierarchyDepth`, `MeshRendererComponent`, `MaterialOverrideComponent`,
+     `RigidBodyComponent`, `ColliderComponent`, `StudioEntityMetaComponent`, `StudioStyleComponent`)
+     with a derived `StudioEntityView` projection for MCP/Inspector reflection.
+  2. Multi-Select & Cycle-Safe Hierarchy Reparenting (`selected_entity_ids`, Ctrl/Shift selection,
+     `reparent_entity`, `reparent_selected_to`, centroid gizmos, bulk Inspector/duplicate/delete).
+  3. Reversible Coalesced `EditorTransaction` Undo/Redo Stack (`World.snapshot_blob`/`restore_blob`)
+     with bit-exact `fnv64` `state_hash()` invertibility.
+  4. **1-Click Play-In-Editor (`PieSession`)** backed by `Scene` + `World.snapshot_blob`/`restore_blob`
+     + `PhysicsWorld.serialize`/`deserialize` + LZ4 `checkpoint.mojo`.
+  5. `.flscn` / `.flscnb` scene persistence, `PhysicsWorld.raycast_all` scene raycasting,
+     Procedural Forge bake-to-`.glb`, and docked AAA Studio Editor UI (`emit_studio_ui_draw_list`)
+     with collapsible indented hierarchy tree & drag-and-drop reparenting.
 """
+from std.collections import Dict
 from std.math import abs, asin, cos, max, min, sin, sqrt
-from flint.core.detmath import PI, det_atan2, set_sim_float_mode
-from flint.core.math import Quat, Vec3
-from flint.core.serial import BlobReader, BlobWriter, Serializable, fnv64, fourcc
-from flint.core.transform import Mat4, trs
-from flint.anim.flanim_ecs import SteppedAnimClock
+from flint.anim.flanim_ecs import SteppedAnimClock, compute_volume_preserving_smear_scale
+from flint.anim.plugin import register_anim_codecs
+from flint.app.engine_app import (
+    AppConfig,
+    EngineApp,
+    FixedTime,
+    STAGE_FIRST,
+    STAGE_FIXED_UPDATE,
+    STAGE_LAST,
+    STAGE_POST_UPDATE,
+    STAGE_PRE_UPDATE,
+    STAGE_UPDATE,
+)
+from flint.app.window_plugin import WindowPlugin
 from flint.assets.checkpoint import pack_checkpoint_lz4, unpack_checkpoint_lz4
 from flint.assets.flpk_v3 import FlpkV3MappedArchive, UntypedHandle
 from flint.assets.glb_writer import encode_native_glb, write_native_glb
+from flint.assets.json import JsonDocument
+from flint.assets.json_write import json_quote
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.model import NativeMesh, NativeModel
 from flint.camera.rig import CAM_MODE_FREE_FLY, CAM_MODE_ORBIT_FOLLOW, CameraRig
+from flint.core.detmath import PI, det_atan2, set_sim_float_mode
+from flint.core.math import Quat, Vec3
+from flint.core.serial import BlobReader, BlobWriter, fnv64, fourcc
+from flint.core.transform import Mat4, trs
+from flint.ecs.world import (
+    Entity,
+    NULL_ENTITY,
+    STORAGE_TABLE,
+    World,
+    comp_hash64,
+)
 from flint.input.input_map import (
     ACTION_AXIS2D,
     ACTION_BOOL,
@@ -34,8 +59,26 @@ from flint.input.input_map import (
     InputMap,
     MOD_CTRL,
 )
+from flint.input.plugin import InputPlugin
 from flint.physics.bvh import Bvh8MeshCollider
-from flint.physics.world import PhysicsWorld
+from flint.physics.filter import CollisionFilter
+from flint.physics.plugin import (
+    ColliderComponent,
+    PhysicsPlugin,
+    PhysicsSyncStateResource,
+    RigidBodyComponent,
+    register_physics_codecs,
+)
+from flint.physics.world import (
+    BODY_MOTION_DYNAMIC,
+    BODY_MOTION_KINEMATIC,
+    BODY_MOTION_STATIC,
+    BODY_SHAPE_BOX,
+    BODY_SHAPE_CAPSULE,
+    BODY_SHAPE_CONVEX_HULL,
+    BODY_SHAPE_SPHERE,
+    PhysicsWorld,
+)
 from flint.platform.input import InputState
 from flint.platform.os import list_directory, make_dirs, parent_directory, read_bytes, write_bytes
 from flint.procedural.arch_kit import (
@@ -47,7 +90,42 @@ from flint.procedural.foliage import (
     build_botanical_pine,
 )
 from flint.procedural.subd import SubdCage, subdivide_to_mesh
+from flint.render.aaa_bsdf import AaaMaterial
+from flint.render.aaa_clustered_lights import AaaClusterLight
+from flint.render.aaa_npr_cel import AaaCelParams
+from flint.render.aaa_npr_vfx import AaaImpactFrameParams, AaaShockwaveRing, AaaStylizedVfxParams
 from flint.render.font import SdfFont
+from flint.render.material_graph import MaterialAsset
+from flint.render.plugin import (
+    CameraComponent,
+    MaterialOverrideComponent,
+    MeshRendererComponent,
+    RenderPlugin,
+    RenderPluginStateResource,
+    register_render_codecs,
+)
+from flint.render.render_world import (
+    RENDER_TIER_0_HEADLESS_SIMD,
+    RenderCameraPacket,
+    RenderWorld,
+    ScalableRenderer,
+)
+from flint.scene.scene import ComponentRegistry, Scene
+from flint.scene.transform_hierarchy import (
+    Children,
+    GlobalTransform,
+    HierarchyDepth,
+    LocalTransform,
+    Parent,
+    PrevGlobalTransform,
+    SerializableComponent,
+    TransformPlugin,
+    TransformPropagationCache,
+    clear_parent,
+    propagate_transforms_parallel_cached,
+    set_parent,
+    snapshot_prev_global_transforms,
+)
 from flint.studio.gizmo import (
     GIZMO_AXIS_NONE,
     GIZMO_MODE_ROTATE,
@@ -63,6 +141,7 @@ from flint.ui.flexbox_dock import (
     DockSpace,
     FlexStyle,
     RectF,
+    RectF as _RectF,
 )
 
 comptime COLLIDER_NONE: Int = 0
@@ -82,6 +161,8 @@ comptime PIE_PAUSED: Int = 2
 comptime TX_SPAWN_ENTITY: Int = 1
 comptime TX_DESPAWN_ENTITY: Int = 2
 comptime TX_PATCH_ENTITY: Int = 3
+comptime TX_REPARENT_ENTITY: Int = 4
+comptime TX_BATCH_EDIT: Int = 5
 
 comptime FIELD_BOOL: Int = 1
 comptime FIELD_INT: Int = 2
@@ -90,6 +171,29 @@ comptime FIELD_STRING: Int = 4
 comptime FIELD_VEC3: Int = 5
 comptime FIELD_QUAT: Int = 6
 comptime FIELD_COLOR_RGB: Int = 7
+
+comptime STUDIO_CHECKPOINT_FOURCC: UInt32 = fourcc("STDV")
+comptime MAX_UNDO_STACK: Int = 512
+comptime MAX_UNDO_BLOB_BYTES: Int = 64 * 1024 * 1024
+
+
+@always_inline
+def _f32_s(v: Float32) -> String:
+    return String(Float64(v))
+
+
+def _vec3_json(v: Vec3) -> String:
+    return "[" + _f32_s(v.x) + ", " + _f32_s(v.y) + ", " + _f32_s(v.z) + "]"
+
+
+def _read_vec3_json(doc: JsonDocument, node: Int, fallback: Vec3 = Vec3()) -> Vec3:
+    if doc.array_size(node) < 3:
+        return fallback
+    return Vec3(
+        Float32(doc.number(doc.at(node, 0), Float64(fallback.x))),
+        Float32(doc.number(doc.at(node, 1), Float64(fallback.y))),
+        Float32(doc.number(doc.at(node, 2), Float64(fallback.z))),
+    )
 
 
 # ============================================================================
@@ -205,10 +309,218 @@ trait Inspectable:
 
 
 # ============================================================================
-# 2. `StudioEntityNode` Scene Table Entry
+# 2. Studio ECS Components (`SerializableComponent`) & Derived Compat View
 # ============================================================================
 
-struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
+struct StudioEntityMetaComponent(SerializableComponent):
+    """Authoritative Studio editor metadata stored in `flint.ecs.World`."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.studio.StudioEntityMetaComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "StudioEntityMetaComponent"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("SMET")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var name: String
+    var locked: Bool
+    var mesh_handle_packed: UInt64
+    var material_handle_packed: UInt64
+    var collider_kind: Int
+    var collider_half_extents: Vec3
+    var restitution: Float32
+    var friction: Float32
+    var bvh_slot: Int
+
+    def __init__(
+        out self,
+        name: String = "Entity",
+        locked: Bool = False,
+        mesh_handle_packed: UInt64 = 0,
+        material_handle_packed: UInt64 = 0,
+        collider_kind: Int = COLLIDER_BOX,
+        collider_half_extents: Vec3 = Vec3(0.5, 0.5, 0.5),
+        restitution: Float32 = 0.32,
+        friction: Float32 = 0.55,
+        bvh_slot: Int = -1,
+    ):
+        self.name = name
+        self.locked = locked
+        self.mesh_handle_packed = mesh_handle_packed
+        self.material_handle_packed = material_handle_packed
+        self.collider_kind = collider_kind
+        self.collider_half_extents = collider_half_extents
+        self.restitution = restitution
+        self.friction = friction
+        self.bvh_slot = bvh_slot
+
+    def write_bin(self, mut out: BlobWriter):
+        out.text(self.name)
+        out.boolean(self.locked)
+        out.u64(self.mesh_handle_packed)
+        out.u64(self.material_handle_packed)
+        out.integer(self.collider_kind)
+        out.vec3(self.collider_half_extents)
+        out.f32(self.restitution)
+        out.f32(self.friction)
+        out.integer(self.bvh_slot)
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        _ = version
+        var nm = reader.text()
+        var lk = reader.boolean()
+        var mh = reader.u64()
+        var mat_h = reader.u64()
+        var ck = reader.integer()
+        var che = reader.vec3()
+        var rest = reader.f32()
+        var fric = reader.f32()
+        var bvh = reader.integer()
+        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh)
+
+    def write_json(self) -> String:
+        return (
+            "{\"name\": " + json_quote(self.name)
+            + ", \"locked\": " + ("true" if self.locked else "false")
+            + ", \"mesh_handle_packed\": " + String(self.mesh_handle_packed)
+            + ", \"material_handle_packed\": " + String(self.material_handle_packed)
+            + ", \"collider_kind\": " + String(self.collider_kind)
+            + ", \"collider_half_extents\": " + _vec3_json(self.collider_half_extents)
+            + ", \"restitution\": " + _f32_s(self.restitution)
+            + ", \"friction\": " + _f32_s(self.friction)
+            + ", \"bvh_slot\": " + String(self.bvh_slot)
+            + "}"
+        )
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        var nm = doc.text(doc.object_get(node, "name"), "Entity")
+        var lk = doc.boolean(doc.object_get(node, "locked"), False)
+        var mh = UInt64(max(0, doc.integer(doc.object_get(node, "mesh_handle_packed"), 0)))
+        var mat_h = UInt64(max(0, doc.integer(doc.object_get(node, "material_handle_packed"), 0)))
+        var ck = doc.integer(doc.object_get(node, "collider_kind"), COLLIDER_BOX)
+        var che = _read_vec3_json(doc, doc.object_get(node, "collider_half_extents"), Vec3(0.5, 0.5, 0.5))
+        var rest = Float32(doc.number(doc.object_get(node, "restitution"), 0.32))
+        var fric = Float32(doc.number(doc.object_get(node, "friction"), 0.55))
+        var bvh = doc.integer(doc.object_get(node, "bvh_slot"), -1)
+        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh)
+
+
+struct StudioStyleComponent(SerializableComponent, ImplicitlyCopyable):
+    """Authoritative Studio NPR Cel / Stylized VFX / Clearcoat / Stepped-Anim parameters in `World`."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.studio.StudioStyleComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "StudioStyleComponent"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("SSTY")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var shading_mode: Int
+    var cel_shadow_tint: Vec3
+    var cel_outline_width_px: Float32
+    var cel_outline_color: Vec3
+    var cel_rim_color: Vec3
+    var cel_hair_halo: Float32
+    var vfx_erosion: Float32
+    var vfx_scroll_speed: Float32
+    var vfx_core_color: Vec3
+    var vfx_edge_color: Vec3
+    var anim_step_hz: Float32
+    var smear_stretch: Float32
+    var clearcoat: Float32
+    var clearcoat_roughness: Float32
+
+    def __init__(out self):
+        self.shading_mode = SHADING_PBR
+        self.cel_shadow_tint = Vec3(0.55, 0.38, 0.44)
+        self.cel_outline_width_px = Float32(2.0)
+        self.cel_outline_color = Vec3(0.015, 0.012, 0.018)
+        self.cel_rim_color = Vec3(0.45, 0.52, 0.68)
+        self.cel_hair_halo = Float32(0.0)
+        self.vfx_erosion = Float32(0.35)
+        self.vfx_scroll_speed = Float32(3.2)
+        self.vfx_core_color = Vec3(8.5, 6.2, 2.2)
+        self.vfx_edge_color = Vec3(4.2, 0.30, 0.04)
+        self.anim_step_hz = Float32(0.0)
+        self.smear_stretch = Float32(1.0)
+        self.clearcoat = Float32(0.0)
+        self.clearcoat_roughness = Float32(0.05)
+
+    def write_bin(self, mut out: BlobWriter):
+        out.integer(self.shading_mode)
+        out.vec3(self.cel_shadow_tint)
+        out.f32(self.cel_outline_width_px)
+        out.vec3(self.cel_outline_color)
+        out.vec3(self.cel_rim_color)
+        out.f32(self.cel_hair_halo)
+        out.f32(self.vfx_erosion)
+        out.f32(self.vfx_scroll_speed)
+        out.vec3(self.vfx_core_color)
+        out.vec3(self.vfx_edge_color)
+        out.f32(self.anim_step_hz)
+        out.f32(self.smear_stretch)
+        out.f32(self.clearcoat)
+        out.f32(self.clearcoat_roughness)
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        _ = version
+        var s = Self()
+        s.shading_mode = reader.integer()
+        s.cel_shadow_tint = reader.vec3()
+        s.cel_outline_width_px = reader.f32()
+        s.cel_outline_color = reader.vec3()
+        s.cel_rim_color = reader.vec3()
+        s.cel_hair_halo = reader.f32()
+        s.vfx_erosion = reader.f32()
+        s.vfx_scroll_speed = reader.f32()
+        s.vfx_core_color = reader.vec3()
+        s.vfx_edge_color = reader.vec3()
+        s.anim_step_hz = reader.f32()
+        s.smear_stretch = reader.f32()
+        s.clearcoat = reader.f32()
+        s.clearcoat_roughness = reader.f32()
+        return s
+
+    def write_json(self) -> String:
+        return (
+            "{\"shading_mode\": " + String(self.shading_mode)
+            + ", \"cel_shadow_tint\": " + _vec3_json(self.cel_shadow_tint)
+            + ", \"cel_outline_width_px\": " + _f32_s(self.cel_outline_width_px)
+            + ", \"cel_outline_color\": " + _vec3_json(self.cel_outline_color)
+            + ", \"cel_rim_color\": " + _vec3_json(self.cel_rim_color)
+            + ", \"cel_hair_halo\": " + _f32_s(self.cel_hair_halo)
+            + ", \"vfx_erosion\": " + _f32_s(self.vfx_erosion)
+            + ", \"vfx_scroll_speed\": " + _f32_s(self.vfx_scroll_speed)
+            + ", \"vfx_core_color\": " + _vec3_json(self.vfx_core_color)
+            + ", \"vfx_edge_color\": " + _vec3_json(self.vfx_edge_color)
+            + ", \"anim_step_hz\": " + _f32_s(self.anim_step_hz)
+            + ", \"smear_stretch\": " + _f32_s(self.smear_stretch)
+            + ", \"clearcoat\": " + _f32_s(self.clearcoat)
+            + ", \"clearcoat_roughness\": " + _f32_s(self.clearcoat_roughness)
+            + "}"
+        )
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        var s = Self()
+        s.shading_mode = doc.integer(doc.object_get(node, "shading_mode"), SHADING_PBR)
+        s.cel_shadow_tint = _read_vec3_json(doc, doc.object_get(node, "cel_shadow_tint"), s.cel_shadow_tint)
+        s.cel_outline_width_px = Float32(doc.number(doc.object_get(node, "cel_outline_width_px"), Float64(s.cel_outline_width_px)))
+        s.cel_outline_color = _read_vec3_json(doc, doc.object_get(node, "cel_outline_color"), s.cel_outline_color)
+        s.cel_rim_color = _read_vec3_json(doc, doc.object_get(node, "cel_rim_color"), s.cel_rim_color)
+        s.cel_hair_halo = Float32(doc.number(doc.object_get(node, "cel_hair_halo"), Float64(s.cel_hair_halo)))
+        s.vfx_erosion = Float32(doc.number(doc.object_get(node, "vfx_erosion"), Float64(s.vfx_erosion)))
+        s.vfx_scroll_speed = Float32(doc.number(doc.object_get(node, "vfx_scroll_speed"), Float64(s.vfx_scroll_speed)))
+        s.vfx_core_color = _read_vec3_json(doc, doc.object_get(node, "vfx_core_color"), s.vfx_core_color)
+        s.vfx_edge_color = _read_vec3_json(doc, doc.object_get(node, "vfx_edge_color"), s.vfx_edge_color)
+        s.anim_step_hz = Float32(doc.number(doc.object_get(node, "anim_step_hz"), Float64(s.anim_step_hz)))
+        s.smear_stretch = Float32(doc.number(doc.object_get(node, "smear_stretch"), Float64(s.smear_stretch)))
+        s.clearcoat = Float32(doc.number(doc.object_get(node, "clearcoat"), Float64(s.clearcoat)))
+        s.clearcoat_roughness = Float32(doc.number(doc.object_get(node, "clearcoat_roughness"), Float64(s.clearcoat_roughness)))
+        return s
+
+
+struct StudioEntityView(Copyable, Movable, Inspectable):
+    """Derived non-authoritative ECS projection view for Inspector / MCP / compat access."""
     var entity_id: Int
     var alive: Bool
     var name: String
@@ -246,9 +558,9 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
     var anim_step_hz: Float32
     var smear_stretch: Float32
 
-    def __init__(out self, entity_id: Int = 0, name: String = "Entity"):
+    def __init__(out self, entity_id: Int = 0, name: String = "Entity", alive: Bool = True):
         self.entity_id = entity_id
-        self.alive = True
+        self.alive = alive
         self.name = name
         self.parent_id = -1
         self.translation = Vec3(0.0, 0.0, 0.0)
@@ -266,7 +578,7 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
         self.emissive = Vec3(0.0, 0.0, 0.0)
         self.collider_kind = COLLIDER_BOX
         self.collider_half_extents = Vec3(0.5, 0.5, 0.5)
-        self.mass = Float32(0.0)  # 0.0 = static, > 0.0 = dynamic rigid body
+        self.mass = Float32(0.0)
         self.restitution = Float32(0.32)
         self.friction = Float32(0.55)
         self.visible = True
@@ -318,122 +630,83 @@ struct StudioEntityNode(Copyable, Movable, Serializable, Inspectable):
     def inspect(mut self, mut v: FieldVisitor):
         self.inspect_fields(v)
 
-    def serialize(self, mut out: BlobWriter):
-        out.begin(fourcc("SENT"), 2)
-        out.integer(self.entity_id)
-        out.boolean(self.alive)
-        out.text(self.name)
-        out.integer(self.parent_id)
-        out.vec3(self.translation)
-        out.quat(self.rotation)
-        out.vec3(self.scale)
-        out.vec3(self.linear_velocity)
-        out.vec3(self.angular_velocity)
-        out.u64(self.mesh_handle.packed)
-        out.integer(self.mesh_id)
-        out.u64(self.material_handle.packed)
-        out.integer(self.material_id)
-        out.vec3(self.base_color)
-        out.f32(self.roughness)
-        out.f32(self.metallic)
-        out.vec3(self.emissive)
-        out.integer(self.collider_kind)
-        out.vec3(self.collider_half_extents)
-        out.f32(self.mass)
-        out.f32(self.restitution)
-        out.f32(self.friction)
-        out.boolean(self.visible)
-        out.boolean(self.locked)
-        out.integer(self.shading_mode)
-        out.vec3(self.cel_shadow_tint)
-        out.f32(self.cel_outline_width_px)
-        out.vec3(self.cel_outline_color)
-        out.vec3(self.cel_rim_color)
-        out.f32(self.cel_hair_halo)
-        out.f32(self.vfx_erosion)
-        out.f32(self.vfx_scroll_speed)
-        out.vec3(self.vfx_core_color)
-        out.vec3(self.vfx_edge_color)
-        out.f32(self.anim_step_hz)
-        out.f32(self.smear_stretch)
-        out.end()
 
-    def deserialize(mut self, mut input: BlobReader) raises:
-        var ver = input.enter(fourcc("SENT"), 2)
-        self.entity_id = input.integer()
-        self.alive = input.boolean()
-        self.name = input.text()
-        self.parent_id = input.integer()
-        self.translation = input.vec3()
-        self.rotation = input.quat()
-        self.scale = input.vec3()
-        self.linear_velocity = input.vec3()
-        self.angular_velocity = input.vec3()
-        self.mesh_handle = UntypedHandle(input.u64())
-        self.mesh_id = input.integer()
-        self.material_handle = UntypedHandle(input.u64())
-        self.material_id = input.integer()
-        self.base_color = input.vec3()
-        self.roughness = input.f32()
-        self.metallic = input.f32()
-        self.emissive = input.vec3()
-        self.collider_kind = input.integer()
-        self.collider_half_extents = input.vec3()
-        self.mass = input.f32()
-        self.restitution = input.f32()
-        self.friction = input.f32()
-        self.visible = input.boolean()
-        self.locked = input.boolean()
-        if ver >= 2:
-            self.shading_mode = input.integer()
-            self.cel_shadow_tint = input.vec3()
-            self.cel_outline_width_px = input.f32()
-            self.cel_outline_color = input.vec3()
-            self.cel_rim_color = input.vec3()
-            self.cel_hair_halo = input.f32()
-            self.vfx_erosion = input.f32()
-            self.vfx_scroll_speed = input.f32()
-            self.vfx_core_color = input.vec3()
-            self.vfx_edge_color = input.vec3()
-            self.anim_step_hz = input.f32()
-            self.smear_stretch = input.f32()
-        input.leave()
+@fieldwise_init
+struct HierarchyRow(Copyable, ImplicitlyCopyable, Movable):
+    var entity_id: Int
+    var parent_id: Int
+    var depth: Int
+    var has_children: Bool
+    var expanded: Bool
+
+
+@fieldwise_init
+struct SelectedTransformSnap(Copyable, ImplicitlyCopyable, Movable):
+    var entity_id: Int
+    var local_pos: Vec3
+    var local_rot: Quat
+    var local_scl: Vec3
+    var world_pos: Vec3
+    var world_rot: Quat
+    var world_scl: Vec3
+    var parent_id: Int
 
 
 # ============================================================================
 # 3. Reversible Coalesced `EditorTransaction` & `PieSession`
 # ============================================================================
 
-comptime MAX_UNDO_STACK: Int = 512
-
-
 struct EditorTransaction(Copyable, Movable):
     var op: Int
     var entity_id: Int
-    var appended_slot: Bool
-    var before_node: StudioEntityNode
-    var after_node: StudioEntityNode
+    var affected_ids: List[Int]
+    var before_world_blob: List[UInt8]
+    var after_world_blob: List[UInt8]
     var prev_selected_id: Int
     var next_selected_id: Int
+    var prev_selected_ids: List[Int]
+    var next_selected_ids: List[Int]
+    var prev_anchor_id: Int
+    var next_anchor_id: Int
     var coalesce_key: UInt64
     var label: String
-    var reparented_child_ids: List[Int]
 
     def __init__(out self, op: Int = TX_PATCH_ENTITY, entity_id: Int = 0, label: String = "Edit"):
         self.op = op
         self.entity_id = entity_id
-        self.appended_slot = False
-        self.before_node = StudioEntityNode(entity_id)
-        self.after_node = StudioEntityNode(entity_id)
+        self.affected_ids = List[Int]()
+        self.before_world_blob = List[UInt8]()
+        self.after_world_blob = List[UInt8]()
         self.prev_selected_id = -1
         self.next_selected_id = -1
+        self.prev_selected_ids = List[Int]()
+        self.next_selected_ids = List[Int]()
+        self.prev_anchor_id = -1
+        self.next_anchor_id = -1
         self.coalesce_key = 0
         self.label = label
-        self.reparented_child_ids = List[Int]()
+
+    def __init__(out self, *, copy: Self):
+        self.op = copy.op
+        self.entity_id = copy.entity_id
+        self.affected_ids = copy.affected_ids.copy()
+        self.before_world_blob = copy.before_world_blob.copy()
+        self.after_world_blob = copy.after_world_blob.copy()
+        self.prev_selected_id = copy.prev_selected_id
+        self.next_selected_id = copy.next_selected_id
+        self.prev_selected_ids = copy.prev_selected_ids.copy()
+        self.next_selected_ids = copy.next_selected_ids.copy()
+        self.prev_anchor_id = copy.prev_anchor_id
+        self.next_anchor_id = copy.next_anchor_id
+        self.coalesce_key = copy.coalesce_key
+        self.label = copy.label
+
+    def approx_bytes(self) -> Int:
+        return len(self.before_world_blob) + len(self.after_world_blob) + 128
 
 
 struct PieSession(Copyable, Movable):
-    """1-Click Play-In-Editor session state backed by an LZ4 integrity-checked binary snapshot."""
+    """1-Click Play-In-Editor session backed by `World.snapshot_blob`, `PhysicsWorld.serialize`, and LZ4."""
     var mode: Int
     var checkpoint_lz4: List[UInt8]
     var pre_play_hash: UInt64
@@ -464,8 +737,38 @@ struct StudioRaycastHit(Copyable, ImplicitlyCopyable, Movable):
         self.normal = Vec3(0.0, 1.0, 0.0)
 
 
+struct StudioGpuMaterials(Movable):
+    """Cached GPU PBR/NPR-Cel/VFX material slot mappings per Studio entity slot."""
+    var grid_mesh_id: Int
+    var orb_mesh_id: Int
+    var torus_mesh_id: Int
+    var colonnade_mesh_id: Int
+    var foliage_trunk_id: Int
+    var foliage_canopy_id: Int
+    var mat_trunk_id: Int
+    var mat_foliage_id: Int
+    var entity_pbr_mat_ids: List[Int]
+    var entity_cel_mat_ids: List[Int]
+    var entity_vfx_mat_ids: List[Int]
+    var uploaded: Bool
+
+    def __init__(out self):
+        self.grid_mesh_id = 0
+        self.orb_mesh_id = 0
+        self.torus_mesh_id = 0
+        self.colonnade_mesh_id = 0
+        self.foliage_trunk_id = 0
+        self.foliage_canopy_id = 0
+        self.mat_trunk_id = 0
+        self.mat_foliage_id = 0
+        self.entity_pbr_mat_ids = List[Int]()
+        self.entity_cel_mat_ids = List[Int]()
+        self.entity_vfx_mat_ids = List[Int]()
+        self.uploaded = False
+
+
 # ============================================================================
-# 4. `FlintStudioState`: Scene Graph, Undo/Redo, Deterministic Physics & PIE
+# 4. `FlintStudioState`: EngineApp + World + Scene + PhysicsWorld + Multi-Select
 # ============================================================================
 
 def _create_studio_dockspace() -> DockSpace:
@@ -520,11 +823,46 @@ def _create_studio_input_map() -> InputMap:
     return imap^
 
 
-struct FlintStudioState(Movable, Serializable):
-    var entities: List[StudioEntityNode]
+def _write_blob_bytes(mut out: BlobWriter, data: List[UInt8]):
+    out.u32(UInt32(len(data)))
+    for i in range(len(data)):
+        out.u8(data[i])
+
+
+def _read_blob_bytes(mut r: BlobReader) -> List[UInt8]:
+    var n = Int(r.u32())
+    if n < 0 or r.failed:
+        return List[UInt8]()
+    var rem = r.limit() - r.offset
+    if n > rem:
+        r.failed = True
+        return List[UInt8]()
+    var buf = List[UInt8](capacity=n)
+    for _ in range(n):
+        buf.append(r.u8())
+    return buf^
+
+
+def _write_filter_canon(mut out: BlobWriter, f: CollisionFilter):
+    out.u32(f.category)
+    out.u32(f.mask)
+    out.integer(Int(f.group))
+
+
+struct FlintStudioState(Movable):
+    """Unified Engine v5 Studio State backed by `EngineApp`, `World`, `Scene`, and `PhysicsWorld`."""
+    var app: EngineApp
+    var scene: Scene
+    var registry: ComponentRegistry
+    var entities: List[StudioEntityView]  # Derived compat projection synced from `app.world`
     var static_bvh_colliders: List[Bvh8MeshCollider]
-    var entity_bvh_slot: List[Int]
+    var gpu_materials: StudioGpuMaterials
+
     var selected_entity_id: Int
+    var selected_entity_ids: List[Int]
+    var selection_anchor_id: Int
+    var hierarchy_expanded: Dict[Int, Bool]
+
     var gizmo_mode: Int
     var active_gizmo_handle: Int
     var snap_enabled: Bool
@@ -534,23 +872,22 @@ struct FlintStudioState(Movable, Serializable):
     var gravity: Vec3
     var ground_plane_y: Float32
     var has_ground_plane: Bool
+    var _ground_body_id: Int
 
     var undo_stack: List[EditorTransaction]
     var redo_stack: List[EditorTransaction]
     var pie: PieSession
 
-    # Studio-level Stepped Animation Clock & Preview NPR Post-FX State
     var stepped_clock: SteppedAnimClock
     var preview_impact_blend: Float32
     var preview_impact_invert: Bool
     var preview_shockwave_active: Bool
     var preview_shockwave_radius: Float32
 
-    # Integrated v5 Subsystems: `DockSpace`, `UiContext`, `CameraRig`, and `InputMap`
     var dock: DockSpace
     var ui_ctx: UiContext
     var camera_rig: CameraRig
-    var cam_world: PhysicsWorld
+    var _cam_dummy_world: PhysicsWorld
     var input_map: InputMap
     var cam_target: Vec3
     var ui_edit_seq: UInt64
@@ -560,7 +897,6 @@ struct FlintStudioState(Movable, Serializable):
     var asset_browser_entries: List[String]
     var asset_browser_scanned: Bool
 
-    # Synced Editor Viewport Camera Vectors
     var cam_pos: Vec3
     var cam_fwd: Vec3
     var cam_right: Vec3
@@ -568,11 +904,47 @@ struct FlintStudioState(Movable, Serializable):
     var fov_y_deg: Float32
     var near_z: Float32
 
-    def __init__(out self):
-        self.entities = List[StudioEntityNode]()
+    def __init__(
+        out self,
+        headless: Bool = True,
+        render_tier: UInt32 = RENDER_TIER_0_HEADLESS_SIMD,
+        width: Int = 1280,
+        height: Int = 720,
+        worker_threads: Int = 0,
+    ):
+        self.app = EngineApp(
+            AppConfig(
+                title="FLINT STUDIO v5 — AAA VISUAL EDITOR",
+                headless=headless,
+                worker_threads=worker_threads,
+                fixed_hz=60.0,
+            )
+        )
+        self.app.add_plugin(WindowPlugin(headless=headless, width=width, height=height, title="FLINT STUDIO v5 — AAA VISUAL EDITOR"))
+        self.app.add_plugin(TransformPlugin())
+        self.app.add_plugin(InputPlugin())
+        self.app.add_plugin(PhysicsPlugin(gravity=9.81))
+        self.app.add_plugin(RenderPlugin(tier=render_tier, width=width, height=height, tsr_scale=1.0))
+
+        self.registry = ComponentRegistry.with_builtins()
+        register_physics_codecs(self.registry)
+        register_render_codecs(self.registry)
+        register_anim_codecs(self.registry)
+        self.registry.register[StudioEntityMetaComponent]()
+        self.registry.register[StudioStyleComponent]()
+        self.registry.ensure_registered_in_world(self.app.world)
+        self.app.startup()
+
+        self.scene = Scene("FlintStudioScene")
+        self.entities = List[StudioEntityView]()
         self.static_bvh_colliders = List[Bvh8MeshCollider]()
-        self.entity_bvh_slot = List[Int]()
+        self.gpu_materials = StudioGpuMaterials()
+
         self.selected_entity_id = -1
+        self.selected_entity_ids = List[Int]()
+        self.selection_anchor_id = -1
+        self.hierarchy_expanded = Dict[Int, Bool]()
+
         self.gizmo_mode = GIZMO_MODE_TRANSLATE
         self.active_gizmo_handle = GIZMO_AXIS_NONE
         self.snap_enabled = True
@@ -582,6 +954,7 @@ struct FlintStudioState(Movable, Serializable):
         self.gravity = Vec3(0.0, -9.81, 0.0)
         self.ground_plane_y = Float32(0.0)
         self.has_ground_plane = True
+        self._ground_body_id = -1
 
         self.undo_stack = List[EditorTransaction]()
         self.redo_stack = List[EditorTransaction]()
@@ -600,11 +973,11 @@ struct FlintStudioState(Movable, Serializable):
         self.camera_rig = CameraRig(CAM_MODE_ORBIT_FOLLOW)
         self.camera_rig.fov_deg = Float32(52.0)
         self.camera_rig.look_offset = Vec3(0.0, 0.0, 0.0)
-        self.cam_world = PhysicsWorld()
+        self._cam_dummy_world = PhysicsWorld()
         self.input_map = _create_studio_input_map()
         self.cam_target = Vec3(0.0, 0.9, 1.0)
         self.ui_edit_seq = UInt64(50000)
-        self.scene_file_path = "build/studio_scene.flscene"
+        self.scene_file_path = "build/studio_scene.flscn"
         self.asset_browser_dir = ""
         self.asset_browser_pack = ""
         self.asset_browser_entries = List[String]()
@@ -617,6 +990,264 @@ struct FlintStudioState(Movable, Serializable):
         self.fov_y_deg = Float32(52.0)
         self.near_z = Float32(0.15)
         self.look_at(Vec3(-6.5, 4.2, -9.5), Vec3(0.0, 0.9, 1.0))
+        var fix_init = self.app.resources.get_ptr_mut[FixedTime]()
+        if fix_init:
+            fix_init.value()[unsafe_offset=0].overstep_alpha = Float32(1.0)
+
+    def shutdown(mut self):
+        self.app.shutdown()
+
+    # ---- Entity Resolution & Sync Helpers ----
+
+    @always_inline
+    def resolve_entity(self, entity_id: Int) -> Entity:
+        if entity_id < 0 or entity_id >= len(self.app.world.entities):
+            return NULL_ENTITY
+        if not self.app.world.entities[entity_id].alive:
+            return NULL_ENTITY
+        return Entity(UInt32(entity_id), self.app.world.entities[entity_id].generation)
+
+    @always_inline
+    def is_alive_id(self, entity_id: Int) -> Bool:
+        return self.resolve_entity(entity_id).valid()
+
+    def entity_ids(self) -> List[Int]:
+        var out = List[Int]()
+        for i in range(len(self.app.world.entities)):
+            if self.app.world.entities[i].alive:
+                out.append(i)
+        return out^
+
+    def parent_of(self, entity_id: Int) -> Int:
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return -1
+        var p_opt = self.app.world.get_ptr[Parent](e)
+        if not p_opt:
+            return -1
+        var pe = p_opt.value()[unsafe_offset=0].entity
+        if not self.app.world.is_alive(pe):
+            return -1
+        return Int(pe.index)
+
+    def children_of(self, entity_id: Int) -> List[Int]:
+        var out = List[Int]()
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return out^
+        var ch_opt = self.app.world.get_ptr[Children](e)
+        if not ch_opt:
+            return out^
+        ref ch = ch_opt.value()[unsafe_offset=0]
+        for i in range(ch.len()):
+            var ce = ch.at(i)
+            if self.app.world.is_alive(ce):
+                out.append(Int(ce.index))
+        # Sort ascending by entity_id for deterministic tree ordering
+        for i in range(1, len(out)):
+            var key = out[i]
+            var j = i - 1
+            while j >= 0 and out[j] > key:
+                out[j + 1] = out[j]
+                j -= 1
+            out[j + 1] = key
+        return out^
+
+    def _ensure_ground_plane(mut self):
+        var phys_opt = self.app.resources.get_ptr_mut[PhysicsWorld]()
+        if not phys_opt:
+            return
+        ref physics = phys_opt.value()[unsafe_offset=0]
+        physics.gravity = -self.gravity.y
+        if self.has_ground_plane:
+            var floor_center = Vec3(0.0, self.ground_plane_y - Float32(1.0), 0.0)
+            var slot = physics.find_slot_by_id_any(self._ground_body_id) if self._ground_body_id >= 0 else -1
+            if slot < 0:
+                slot = physics.add_box(
+                    floor_center,
+                    Vec3(500.0, 1.0, 500.0),
+                    mass=0.0,
+                    restitution=0.32,
+                    friction=0.55,
+                )
+                self._ground_body_id = physics.body_id(slot)
+            else:
+                physics.bodies[slot].pos = floor_center
+                physics.bodies[slot].active = True
+        elif self._ground_body_id >= 0:
+            var slot = physics.find_slot_by_id_any(self._ground_body_id)
+            if slot >= 0:
+                physics.swap_remove_body(slot)
+            self._ground_body_id = -1
+
+    def _propagate_transforms_immediate(mut self):
+        var cache_opt = self.app.resources.get_ptr_mut[TransformPropagationCache]()
+        if cache_opt:
+            cache_opt.value()[unsafe_offset=0].invalidate()
+            propagate_transforms_parallel_cached(
+                self.app.world,
+                self.app.pool,
+                cache_opt.value()[unsafe_offset=0],
+                copy_to_prev=False,
+                allow_insert_missing=True,
+            )
+
+    def _sync_physics_pre_only(mut self):
+        self._ensure_ground_plane()
+        self.app.schedule.run_stage(
+            STAGE_PRE_UPDATE,
+            self.app.world,
+            self.app.resources,
+            self.app.pool,
+            self.app.commands,
+        )
+        self.app.world.flush_commands(self.app.commands)
+
+    def _reset_physics_world_and_sync(mut self):
+        var phys_opt = self.app.resources.get_ptr_mut[PhysicsWorld]()
+        if phys_opt:
+            phys_opt.value()[unsafe_offset=0] = PhysicsWorld(gravity=-self.gravity.y)
+            phys_opt.value()[unsafe_offset=0].gravity = -self.gravity.y
+        var sync_opt = self.app.resources.get_ptr_mut[PhysicsSyncStateResource]()
+        if sync_opt:
+            sync_opt.value()[unsafe_offset=0] = PhysicsSyncStateResource()
+        self._ground_body_id = -1
+        self._sync_ecs_and_physics()
+
+    def _sync_compat_view(mut self):
+        var cap = len(self.app.world.entities)
+        while len(self.entities) < cap:
+            self.entities.append(StudioEntityView(len(self.entities), "Entity", alive=False))
+        while len(self.entities) > cap:
+            _ = self.entities.pop()
+
+        for i in range(cap):
+            if not self.app.world.entities[i].alive:
+                self.entities[i].entity_id = i
+                self.entities[i].alive = False
+                self.entities[i].parent_id = -1
+                continue
+
+            var e = Entity(UInt32(i), self.app.world.entities[i].generation)
+            ref v = self.entities[i]
+            v.entity_id = i
+            v.alive = True
+            v.parent_id = self.parent_of(i)
+
+            var lt_opt = self.app.world.get_ptr[LocalTransform](e)
+            if lt_opt:
+                ref lt = lt_opt.value()[unsafe_offset=0]
+                v.translation = lt.translation
+                v.rotation = lt.rotation
+                v.scale = lt.scale
+            else:
+                v.translation = Vec3()
+                v.rotation = Quat()
+                v.scale = Vec3(1.0, 1.0, 1.0)
+
+            var mr_opt = self.app.world.get_ptr[MeshRendererComponent](e)
+            if mr_opt:
+                ref mr = mr_opt.value()[unsafe_offset=0]
+                v.mesh_id = mr.mesh_id
+                v.material_id = mr.material_id
+                v.visible = mr.visible
+            else:
+                v.mesh_id = 0
+                v.material_id = 0
+                v.visible = True
+
+            var mo_opt = self.app.world.get_ptr[MaterialOverrideComponent](e)
+            if mo_opt:
+                ref mo = mo_opt.value()[unsafe_offset=0]
+                if mo.material_id >= 0:
+                    v.material_id = mo.material_id
+                v.base_color = mo.base_color
+                v.roughness = mo.roughness
+                v.metallic = mo.metallic
+                v.emissive = mo.emissive
+
+            var meta_opt = self.app.world.get_ptr[StudioEntityMetaComponent](e)
+            if meta_opt:
+                ref meta = meta_opt.value()[unsafe_offset=0]
+                v.name = meta.name
+                v.locked = meta.locked
+                v.mesh_handle = UntypedHandle(meta.mesh_handle_packed)
+                v.material_handle = UntypedHandle(meta.material_handle_packed)
+                v.collider_kind = meta.collider_kind
+                v.collider_half_extents = meta.collider_half_extents
+                v.restitution = meta.restitution
+                v.friction = meta.friction
+            else:
+                v.name = "Entity_" + String(i)
+                v.locked = False
+                v.collider_kind = COLLIDER_NONE
+
+            var col_opt = self.app.world.get_ptr[ColliderComponent](e)
+            if col_opt:
+                v.collider_half_extents = col_opt.value()[unsafe_offset=0].half_extents
+
+            var rb_opt = self.app.world.get_ptr[RigidBodyComponent](e)
+            if rb_opt:
+                ref rb = rb_opt.value()[unsafe_offset=0]
+                v.linear_velocity = rb.linear_vel
+                v.angular_velocity = rb.angular_vel
+                v.mass = rb.mass if rb.motion_mode == BODY_MOTION_DYNAMIC else Float32(0.0)
+                v.restitution = rb.restitution
+                v.friction = rb.friction
+            else:
+                v.linear_velocity = Vec3()
+                v.angular_velocity = Vec3()
+                v.mass = Float32(0.0)
+
+            var st_opt = self.app.world.get_ptr[StudioStyleComponent](e)
+            if st_opt:
+                ref st = st_opt.value()[unsafe_offset=0]
+                v.shading_mode = st.shading_mode
+                v.cel_shadow_tint = st.cel_shadow_tint
+                v.cel_outline_width_px = st.cel_outline_width_px
+                v.cel_outline_color = st.cel_outline_color
+                v.cel_rim_color = st.cel_rim_color
+                v.cel_hair_halo = st.cel_hair_halo
+                v.vfx_erosion = st.vfx_erosion
+                v.vfx_scroll_speed = st.vfx_scroll_speed
+                v.vfx_core_color = st.vfx_core_color
+                v.vfx_edge_color = st.vfx_edge_color
+                v.anim_step_hz = st.anim_step_hz
+                v.smear_stretch = st.smear_stretch
+
+    def _sync_ecs_and_physics(mut self):
+        self._propagate_transforms_immediate()
+        self._sync_physics_pre_only()
+        self._sync_compat_view()
+
+    def _sync_ecs_physics_and_render(mut self):
+        self._sync_ecs_and_physics()
+
+    def _capture_world_blob(self) -> List[UInt8]:
+        var w = BlobWriter()
+        try:
+            self.app.world.snapshot_blob(w)
+        except:
+            return List[UInt8]()
+        var out = List[UInt8]()
+        swap(out, w.data)
+        return out^
+
+    def _restore_world_blob(mut self, data: List[UInt8]) -> Bool:
+        if len(data) == 0:
+            return False
+        try:
+            var r = BlobReader(data.copy())
+            self.app.world.restore_blob(r)
+            if r.failed:
+                return False
+        except:
+            return False
+        self.registry.ensure_registered_in_world(self.app.world)
+        self._reset_physics_world_and_sync()
+        return True
+
+    # ---- Camera ----
 
     def _sync_from_camera_rig(mut self):
         self.cam_pos = self.camera_rig.world_pos
@@ -643,7 +1274,7 @@ struct FlintStudioState(Movable, Serializable):
         self.camera_rig.spring_arm.current_length.value = dist
         self.camera_rig.spring_arm.current_length.velocity = Float32(0.0)
         self.camera_rig.fly_pos = eye
-        self.camera_rig.update(self.cam_world, target, Float32(0.0))
+        self.camera_rig.update(self._cam_dummy_world, target, Float32(0.0))
         self._sync_from_camera_rig()
 
     def update_camera(
@@ -656,7 +1287,7 @@ struct FlintStudioState(Movable, Serializable):
     ):
         if orbit_delta_yaw_deg != Float32(0.0) or orbit_delta_pitch_deg != Float32(0.0):
             self.camera_rig.rotate_orbit(orbit_delta_yaw_deg, orbit_delta_pitch_deg)
-        self.camera_rig.update(self.cam_world, self.cam_target, dt, fly_move_local=fly_move_local, fly_speed=fly_speed)
+        self.camera_rig.update(self._cam_dummy_world, self.cam_target, dt, fly_move_local=fly_move_local, fly_speed=fly_speed)
         self._sync_from_camera_rig()
 
     def viewport_rect(mut self, screen_w: Int, screen_h: Int) -> RectF:
@@ -665,6 +1296,254 @@ struct FlintStudioState(Movable, Serializable):
         if vp[0] >= 0:
             return vp[3]
         return RectF(Float32(236.0), Float32(46.0), Float32(max(160, screen_w - 524)), Float32(max(120, screen_h - 184)))
+
+    # ---- Multi-Select & Hierarchy Tree Queries ----
+
+    def _normalize_selection_from_primary(mut self):
+        if len(self.selected_entity_ids) == 0 and self.selected_entity_id >= 0 and self.is_alive_id(self.selected_entity_id):
+            self.selected_entity_ids.append(self.selected_entity_id)
+            if self.selection_anchor_id < 0:
+                self.selection_anchor_id = self.selected_entity_id
+
+    def _prune_selection(mut self):
+        self._normalize_selection_from_primary()
+        var kept = List[Int]()
+        for i in range(len(self.selected_entity_ids)):
+            var eid = self.selected_entity_ids[i]
+            if not self.is_alive_id(eid):
+                continue
+            var dup = False
+            for j in range(len(kept)):
+                if kept[j] == eid:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(eid)
+        self.selected_entity_ids = kept^
+        if not self.is_alive_id(self.selected_entity_id):
+            if len(self.selected_entity_ids) > 0:
+                self.selected_entity_id = self.selected_entity_ids[len(self.selected_entity_ids) - 1]
+            else:
+                self.selected_entity_id = -1
+        if not self.is_alive_id(self.selection_anchor_id):
+            self.selection_anchor_id = self.selected_entity_id
+
+    def _restore_selection(mut self, ids: List[Int], primary_id: Int, anchor_id: Int = -1):
+        self.selected_entity_ids = ids.copy()
+        self.selected_entity_id = primary_id
+        self.selection_anchor_id = anchor_id if anchor_id >= 0 else primary_id
+        self._prune_selection()
+
+    def is_selected(self, entity_id: Int) -> Bool:
+        if entity_id < 0:
+            return False
+        for i in range(len(self.selected_entity_ids)):
+            if self.selected_entity_ids[i] == entity_id:
+                return True
+        return len(self.selected_entity_ids) == 0 and self.selected_entity_id == entity_id
+
+    def selected_count(self) -> Int:
+        if len(self.selected_entity_ids) > 0:
+            return len(self.selected_entity_ids)
+        if self.selected_entity_id >= 0 and self.is_alive_id(self.selected_entity_id):
+            return 1
+        return 0
+
+    def selected_entities(self) -> List[Entity]:
+        var out = List[Entity]()
+        if len(self.selected_entity_ids) > 0:
+            for i in range(len(self.selected_entity_ids)):
+                var e = self.resolve_entity(self.selected_entity_ids[i])
+                if e.valid():
+                    out.append(e)
+        elif self.selected_entity_id >= 0:
+            var e = self.resolve_entity(self.selected_entity_id)
+            if e.valid():
+                out.append(e)
+        return out^
+
+    def clear_selection(mut self):
+        self.selected_entity_ids.clear()
+        self.selected_entity_id = -1
+        self.selection_anchor_id = -1
+
+    def is_hierarchy_expanded(self, entity_id: Int) -> Bool:
+        var found = self.hierarchy_expanded.get(entity_id)
+        if found:
+            return found.value()
+        return True
+
+    def set_hierarchy_expanded(mut self, entity_id: Int, expanded: Bool):
+        self.hierarchy_expanded[entity_id] = expanded
+
+    def toggle_hierarchy_expanded(mut self, entity_id: Int) -> Bool:
+        var next_v = not self.is_hierarchy_expanded(entity_id)
+        self.hierarchy_expanded[entity_id] = next_v
+        return next_v
+
+    def _collect_hierarchy_dfs(
+        self,
+        entity_id: Int,
+        parent_id: Int,
+        depth: Int,
+        mut out: List[HierarchyRow],
+        mut visited: List[Bool],
+    ):
+        if entity_id < 0 or entity_id >= len(visited) or visited[entity_id] or depth >= 64:
+            return
+        visited[entity_id] = True
+        var ch = self.children_of(entity_id)
+        var has_ch = len(ch) > 0
+        var exp = self.is_hierarchy_expanded(entity_id)
+        out.append(HierarchyRow(entity_id, parent_id, depth, has_ch, exp))
+        if has_ch and exp:
+            for i in range(len(ch)):
+                self._collect_hierarchy_dfs(ch[i], entity_id, depth + 1, out, visited)
+
+    def hierarchy_visible_rows(self) -> List[HierarchyRow]:
+        var out = List[HierarchyRow]()
+        var n = len(self.app.world.entities)
+        if n == 0:
+            return out^
+        var visited = List[Bool](length=n, fill=False)
+        for i in range(n):
+            if self.app.world.entities[i].alive and self.parent_of(i) < 0:
+                self._collect_hierarchy_dfs(i, -1, 0, out, visited)
+        # Fallback for any orphan whose parent died externally (never emit children of collapsed live parents)
+        for i in range(n):
+            if self.app.world.entities[i].alive and not visited[i] and self.parent_of(i) < 0:
+                self._collect_hierarchy_dfs(i, -1, 0, out, visited)
+        return out^
+
+    def hierarchy_display_order(self) -> List[Int]:
+        var rows = self.hierarchy_visible_rows()
+        var order = List[Int](capacity=len(rows))
+        for i in range(len(rows)):
+            order.append(rows[i].entity_id)
+        return order^
+
+    def select_entity(
+        mut self,
+        entity_id: Int,
+        multi_select: Bool = False,
+        range_select: Bool = False,
+        visible_order: List[Int] = List[Int](),
+    ):
+        self._normalize_selection_from_primary()
+        if not self.is_alive_id(entity_id):
+            if (not multi_select) and (not range_select):
+                self.clear_selection()
+            return
+
+        if range_select:
+            var order = visible_order.copy() if len(visible_order) > 0 else self.hierarchy_display_order()
+            var anchor = self.selection_anchor_id if self.is_alive_id(self.selection_anchor_id) else self.selected_entity_id
+            if not self.is_alive_id(anchor):
+                anchor = entity_id
+            var ia = -1
+            var ib = -1
+            for i in range(len(order)):
+                if order[i] == anchor:
+                    ia = i
+                if order[i] == entity_id:
+                    ib = i
+            if ia >= 0 and ib >= 0:
+                var lo = min(ia, ib)
+                var hi = max(ia, ib)
+                if not multi_select:
+                    self.selected_entity_ids.clear()
+                    self.selected_entity_id = -1
+                for k in range(lo, hi + 1):
+                    var cand = order[k]
+                    if self.is_alive_id(cand) and not self.is_selected(cand):
+                        self.selected_entity_ids.append(cand)
+                self.selected_entity_id = entity_id
+                self.selection_anchor_id = anchor
+                return
+
+        if multi_select:
+            var found_idx = -1
+            for i in range(len(self.selected_entity_ids)):
+                if self.selected_entity_ids[i] == entity_id:
+                    found_idx = i
+                    break
+            if found_idx >= 0:
+                var next_list = List[Int](capacity=max(0, len(self.selected_entity_ids) - 1))
+                for i in range(len(self.selected_entity_ids)):
+                    if i != found_idx:
+                        next_list.append(self.selected_entity_ids[i])
+                self.selected_entity_ids = next_list^
+                if self.selected_entity_id == entity_id:
+                    self.selected_entity_id = (
+                        self.selected_entity_ids[len(self.selected_entity_ids) - 1]
+                        if len(self.selected_entity_ids) > 0
+                        else -1
+                    )
+                if self.selection_anchor_id == entity_id:
+                    self.selection_anchor_id = self.selected_entity_id
+            else:
+                self.selected_entity_ids.append(entity_id)
+                self.selected_entity_id = entity_id
+                self.selection_anchor_id = entity_id
+            return
+
+        self.selected_entity_ids.clear()
+        self.selected_entity_ids.append(entity_id)
+        self.selected_entity_id = entity_id
+        self.selection_anchor_id = entity_id
+
+    def _top_level_selected_ids(self) -> List[Int]:
+        """Filters selection to exclude any entity whose ancestor is also selected (avoids double-transform)."""
+        var ids = List[Int]()
+        if len(self.selected_entity_ids) > 0:
+            for i in range(len(self.selected_entity_ids)):
+                if self.is_alive_id(self.selected_entity_ids[i]):
+                    ids.append(self.selected_entity_ids[i])
+        elif self.is_alive_id(self.selected_entity_id):
+            ids.append(self.selected_entity_id)
+
+        var top = List[Int](capacity=len(ids))
+        for i in range(len(ids)):
+            var eid = ids[i]
+            var has_sel_anc = False
+            var cur = self.parent_of(eid)
+            var hops = 0
+            while cur >= 0 and hops < 64:
+                var found_anc = False
+                for j in range(len(ids)):
+                    if ids[j] == cur:
+                        found_anc = True
+                        break
+                if found_anc:
+                    has_sel_anc = True
+                    break
+                cur = self.parent_of(cur)
+                hops += 1
+            if not has_sel_anc:
+                top.append(eid)
+        return top^
+
+    def selection_gizmo_pivot(self) -> Tuple[Bool, Vec3]:
+        var ents = self.selected_entities()
+        if len(ents) == 0:
+            return (False, Vec3())
+        var sum_p = Vec3()
+        var cnt = 0
+        for i in range(len(ents)):
+            var gt_opt = self.app.world.get_ptr[GlobalTransform](ents[i])
+            if gt_opt:
+                sum_p = sum_p + gt_opt.value()[unsafe_offset=0].translation
+                cnt += 1
+            else:
+                var lt_opt = self.app.world.get_ptr[LocalTransform](ents[i])
+                if lt_opt:
+                    sum_p = sum_p + lt_opt.value()[unsafe_offset=0].translation
+                    cnt += 1
+        if cnt == 0:
+            return (False, Vec3())
+        return (True, sum_p * (Float32(1.0) / Float32(cnt)))
+
+    # ---- Editor Input ----
 
     def process_editor_input(mut self, input: InputState, dt: Float32) -> Bool:
         """Evaluates `InputMap` editor hotkeys (`W/E/R`, `Ctrl+Z`, `Ctrl+Y`, `F5` PIE) & `CameraRig` orbit/fly.
@@ -680,10 +1559,16 @@ struct FlintStudioState(Movable, Serializable):
             _ = self.save_scene_file()
         if self.input_map.just_pressed("editor_load"):
             _ = self.load_scene_file()
-        if self.input_map.just_pressed("editor_duplicate") and self.selected_entity_id >= 0:
-            _ = self.duplicate_entity(self.selected_entity_id, record_undo=True)
-        if self.input_map.just_pressed("editor_delete") and self.selected_entity_id >= 0:
-            _ = self.despawn_entity(self.selected_entity_id, record_undo=True)
+        if self.input_map.just_pressed("editor_duplicate") and self.selected_count() > 0:
+            if len(self.selected_entity_ids) > 1:
+                _ = self.duplicate_selected(record_undo=True)
+            elif self.selected_entity_id >= 0:
+                _ = self.duplicate_entity(self.selected_entity_id, record_undo=True)
+        if self.input_map.just_pressed("editor_delete") and self.selected_count() > 0:
+            if len(self.selected_entity_ids) > 1:
+                _ = self.despawn_selected(record_undo=True)
+            elif self.selected_entity_id >= 0:
+                _ = self.despawn_entity(self.selected_entity_id, record_undo=True)
         if self.input_map.just_pressed("pie_toggle"):
             if self.pie.mode == PIE_STOPPED:
                 _ = self.pie_play()
@@ -711,12 +1596,12 @@ struct FlintStudioState(Movable, Serializable):
             self.camera_rig.fly_pos = self.cam_pos
             dyaw += input.mouse_delta_x() * Float32(0.18)
             dpitch += input.mouse_delta_y() * Float32(0.18)
-            if input.key_down(87): fly_move.z += Float32(1.0)   # W
-            if input.key_down(83): fly_move.z -= Float32(1.0)   # S
-            if input.key_down(68): fly_move.x += Float32(1.0)   # D
-            if input.key_down(65): fly_move.x -= Float32(1.0)   # A
-            if input.key_down(69): fly_move.y += Float32(1.0)   # E
-            if input.key_down(81): fly_move.y -= Float32(1.0)   # Q
+            if input.key_down(87): fly_move.z += Float32(1.0)
+            if input.key_down(83): fly_move.z -= Float32(1.0)
+            if input.key_down(68): fly_move.x += Float32(1.0)
+            if input.key_down(65): fly_move.x -= Float32(1.0)
+            if input.key_down(69): fly_move.y += Float32(1.0)
+            if input.key_down(81): fly_move.y -= Float32(1.0)
             self.update_camera(dt, dyaw, dpitch, fly_move_local=fly_move, fly_speed=Float32(8.5))
             self.cam_target = self.cam_pos + self.cam_fwd * self.camera_rig.spring_arm.target_length
             self.camera_rig.pivot_spring.value = self.cam_target
@@ -725,18 +1610,66 @@ struct FlintStudioState(Movable, Serializable):
             self.update_camera(dt, dyaw, dpitch)
         return True
 
-    # ---- Authoritative Binary Serialization & `fnv64` State Hash ----
+    # ---- Authoritative Binary Serialization, `.flscn`/`.flscnb` Persistence & `fnv64` Hash ----
+
+    def _collect_entity_runtime_links(self) -> List[Tuple[Int, Int, Int]]:
+        var links = List[Tuple[Int, Int, Int]]()
+        for i in range(len(self.app.world.entities)):
+            if not self.app.world.entities[i].alive:
+                continue
+            var e = Entity(UInt32(i), self.app.world.entities[i].generation)
+            var bid = -1
+            var tid = -1
+            var rb_opt = self.app.world.get_ptr[RigidBodyComponent](e)
+            if rb_opt:
+                bid = rb_opt.value()[unsafe_offset=0].body_id
+            var col_opt = self.app.world.get_ptr[ColliderComponent](e)
+            if col_opt:
+                tid = col_opt.value()[unsafe_offset=0].trigger_id
+            if bid >= 0 or tid >= 0:
+                links.append((i, bid, tid))
+        return links^
+
+    def _restore_entity_runtime_links(mut self, links: List[Tuple[Int, Int, Int]]):
+        var sync_opt = self.app.resources.get_ptr_mut[PhysicsSyncStateResource]()
+        if sync_opt:
+            sync_opt.value()[unsafe_offset=0] = PhysicsSyncStateResource()
+        for li in range(len(links)):
+            var eid = links[li][0]
+            var bid = links[li][1]
+            var tid = links[li][2]
+            var e = self.resolve_entity(eid)
+            if not e.valid():
+                continue
+            if bid >= 0:
+                var rb_opt = self.app.world.get_ptr_mut[RigidBodyComponent](e)
+                if rb_opt:
+                    rb_opt.value()[unsafe_offset=0].body_id = bid
+                    if sync_opt:
+                        var lt_opt = self.app.world.get_ptr[LocalTransform](e)
+                        var p = lt_opt.value()[unsafe_offset=0].translation if lt_opt else Vec3()
+                        var r = lt_opt.value()[unsafe_offset=0].rotation if lt_opt else Quat()
+                        sync_opt.value()[unsafe_offset=0].record_body(e, bid, p, r)
+                        sync_opt.value()[unsafe_offset=0].record_body_collider(e, self.app.world.get_ptr[ColliderComponent](e))
+            if tid >= 0:
+                var col_opt = self.app.world.get_ptr_mut[ColliderComponent](e)
+                if col_opt:
+                    col_opt.value()[unsafe_offset=0].trigger_id = tid
+                    if sync_opt:
+                        sync_opt.value()[unsafe_offset=0].record_trigger(e, tid)
 
     def serialize(self, mut out: BlobWriter):
-        out.begin(fourcc("FSTD"), 2)
+        out.begin(STUDIO_CHECKPOINT_FOURCC, 1)
         out.integer(self.selected_entity_id)
+        out.u32(UInt32(len(self.selected_entity_ids)))
+        for i in range(len(self.selected_entity_ids)):
+            out.integer(self.selected_entity_ids[i])
+        out.integer(self.selection_anchor_id)
         out.integer(self.sim_tick)
         out.vec3(self.gravity)
         out.f32(self.ground_plane_y)
         out.boolean(self.has_ground_plane)
-        out.u32(UInt32(len(self.entities)))
-        for i in range(len(self.entities)):
-            self.entities[i].serialize(out)
+        out.integer(self._ground_body_id)
         out.f32(self.stepped_clock.raw_time_sec)
         out.f32(self.stepped_clock.stepped_time_sec)
         out.f32(self.stepped_clock.step_hz)
@@ -746,59 +1679,195 @@ struct FlintStudioState(Movable, Serializable):
         out.boolean(self.preview_impact_invert)
         out.boolean(self.preview_shockwave_active)
         out.f32(self.preview_shockwave_radius)
+
+        var wb = BlobWriter()
+        try:
+            self.app.world.snapshot_blob(wb)
+        except:
+            pass
+        _write_blob_bytes(out, wb.data)
+
+        var pb = BlobWriter()
+        var phys_opt = self.app.resources.get_ptr[PhysicsWorld]()
+        if phys_opt:
+            phys_opt.value()[unsafe_offset=0].serialize(pb)
+        _write_blob_bytes(out, pb.data)
+
+        var links = self._collect_entity_runtime_links()
+        out.u32(UInt32(len(links)))
+        for i in range(len(links)):
+            out.integer(links[i][0])
+            out.integer(links[i][1])
+            out.integer(links[i][2])
         out.end()
 
     def deserialize(mut self, mut input: BlobReader) raises:
-        var ver = input.enter(fourcc("FSTD"), 2)
+        _ = input.enter(STUDIO_CHECKPOINT_FOURCC, 1)
         self.selected_entity_id = input.integer()
+        var n_sel = Int(input.u32())
+        self.selected_entity_ids.clear()
+        for _ in range(n_sel):
+            self.selected_entity_ids.append(input.integer())
+        self.selection_anchor_id = input.integer()
         self.sim_tick = input.integer()
         self.gravity = input.vec3()
         self.ground_plane_y = input.f32()
         self.has_ground_plane = input.boolean()
-        var n_ent = Int(input.u32())
-        var loaded = List[StudioEntityNode](capacity=n_ent)
-        for _ in range(n_ent):
-            var nd = StudioEntityNode()
-            nd.deserialize(input)
-            loaded.append(nd^)
-        if ver >= 2:
-            self.stepped_clock.raw_time_sec = input.f32()
-            self.stepped_clock.stepped_time_sec = input.f32()
-            self.stepped_clock.step_hz = input.f32()
-            self.stepped_clock.hitstop_remaining_sec = input.f32()
-            self.stepped_clock.pose_changed_this_tick = input.boolean()
-            self.preview_impact_blend = input.f32()
-            self.preview_impact_invert = input.boolean()
-            self.preview_shockwave_active = input.boolean()
-            self.preview_shockwave_radius = input.f32()
+        self._ground_body_id = input.integer()
+        self.stepped_clock.raw_time_sec = input.f32()
+        self.stepped_clock.stepped_time_sec = input.f32()
+        self.stepped_clock.step_hz = input.f32()
+        self.stepped_clock.hitstop_remaining_sec = input.f32()
+        self.stepped_clock.pose_changed_this_tick = input.boolean()
+        self.preview_impact_blend = input.f32()
+        self.preview_impact_invert = input.boolean()
+        self.preview_shockwave_active = input.boolean()
+        self.preview_shockwave_radius = input.f32()
+
+        var w_bytes = _read_blob_bytes(input)
+        var p_bytes = _read_blob_bytes(input)
+        var n_links = Int(input.u32())
+        var links = List[Tuple[Int, Int, Int]](capacity=max(0, n_links))
+        for _ in range(max(0, n_links)):
+            var eid = input.integer()
+            var bid = input.integer()
+            var tid = input.integer()
+            links.append((eid, bid, tid))
         input.leave()
-        self.entities = loaded^
-        while len(self.entity_bvh_slot) < len(self.entities):
-            self.entity_bvh_slot.append(-1)
+        if input.failed:
+            raise Error("Failed to read Studio checkpoint blob")
+
+        if len(w_bytes) > 0:
+            var wr = BlobReader(w_bytes^)
+            self.app.world.restore_blob(wr)
+            self.registry.ensure_registered_in_world(self.app.world)
+
+        if len(p_bytes) > 0:
+            var phys_opt = self.app.resources.get_ptr_mut[PhysicsWorld]()
+            if phys_opt:
+                var pr = BlobReader(p_bytes^)
+                phys_opt.value()[unsafe_offset=0].deserialize(pr)
+                phys_opt.value()[unsafe_offset=0].gravity = -self.gravity.y
+            self._restore_entity_runtime_links(links)
+            self._propagate_transforms_immediate()
+            self._sync_compat_view()
+        else:
+            self._reset_physics_world_and_sync()
+        self._prune_selection()
 
     def state_hash(self) -> UInt64:
-        """Computes bit-exact `fnv64` digest over all authoritative Studio scene & simulation state."""
+        """Computes bit-exact `fnv64` digest over canonical authored ECS/Scene + Studio sim state
+        (strictly invariant to ephemeral `PhysicsWorld` runtime IDs)."""
         var w = BlobWriter()
-        self.serialize(w)
+        w.begin(fourcc("SHSH"), 1)
+        w.integer(self.sim_tick)
+        w.vec3(self.gravity)
+        w.f32(self.ground_plane_y)
+        w.boolean(self.has_ground_plane)
+        w.f32(self.stepped_clock.raw_time_sec)
+        w.f32(self.stepped_clock.stepped_time_sec)
+        w.f32(self.stepped_clock.step_hz)
+        w.f32(self.stepped_clock.hitstop_remaining_sec)
+        w.boolean(self.stepped_clock.pose_changed_this_tick)
+        w.f32(self.preview_impact_blend)
+        w.boolean(self.preview_impact_invert)
+        w.boolean(self.preview_shockwave_active)
+        w.f32(self.preview_shockwave_radius)
+
+        # Canonical sorted entities (excluding ephemeral runtime body_id/trigger_id/runtime_index)
+        var ents = List[Entity]()
+        var ent_to_slot = List[Int](length=max(1, len(self.app.world.entities)), fill=-1)
+        for idx in range(len(self.app.world.entities)):
+            if self.app.world.entities[idx].alive:
+                ent_to_slot[idx] = len(ents)
+                ents.append(Entity(UInt32(idx), self.app.world.entities[idx].generation))
+
+        w.integer(len(ents))
+        var sorted_codecs = self.registry.sorted_entry_indices()
+        var rb_hash = RigidBodyComponent.COMPONENT_ID
+        var col_hash = ColliderComponent.COMPONENT_ID
+        var prev_gt_hash = PrevGlobalTransform.COMPONENT_ID
+
+        for slot in range(len(ents)):
+            var e = ents[slot]
+            var p_slot = -1
+            var p_opt = self.app.world.get_ptr[Parent](e)
+            if p_opt:
+                var pe = p_opt.value()[unsafe_offset=0].entity
+                if self.app.world.is_alive(pe) and Int(pe.index) < len(ent_to_slot):
+                    p_slot = ent_to_slot[Int(pe.index)]
+            w.integer(p_slot)
+
+            for ci in range(len(sorted_codecs)):
+                var cidx = sorted_codecs[ci]
+                var chash = self.registry.entries[cidx].component_hash
+                if chash == prev_gt_hash:
+                    continue
+                if not self.registry.has_on_entity(cidx, self.app.world, e):
+                    continue
+                w.u64(chash)
+                if chash == rb_hash:
+                    var rb_opt = self.app.world.get_ptr[RigidBodyComponent](e)
+                    if rb_opt:
+                        ref rb = rb_opt.value()[unsafe_offset=0]
+                        w.u8(rb.motion_mode)
+                        w.f32(rb.mass)
+                        w.vec3(rb.linear_vel)
+                        w.vec3(rb.angular_vel)
+                        w.f32(rb.friction)
+                        w.f32(rb.restitution)
+                        w.f32(rb.rolling_resistance)
+                        w.f32(rb.linear_damping)
+                        w.f32(rb.angular_damping)
+                        w.f32(rb.gravity_scale)
+                        _write_filter_canon(w, rb.filter)
+                        w.boolean(rb.can_sleep)
+                        w.boolean(rb.enable_ccd)
+                        w.integer(rb.material)
+                        w.boolean(rb.active)
+                elif chash == col_hash:
+                    var c_opt = self.app.world.get_ptr[ColliderComponent](e)
+                    if c_opt:
+                        ref c = c_opt.value()[unsafe_offset=0]
+                        w.integer(c.shape)
+                        w.f32(c.radius)
+                        w.f32(c.half_height)
+                        w.vec3(c.half_extents)
+                        w.vec3(c.local_offset)
+                        w.quat(c.local_rot)
+                        w.boolean(c.is_trigger)
+                        _write_filter_canon(w, c.filter)
+                        w.integer(len(c.points))
+                        for pi in range(len(c.points)):
+                            w.vec3(c.points[pi])
+                else:
+                    _ = self.registry.write_entity_bin(cidx, self.app.world, e, w)
+        w.end()
         return fnv64(w.data)
 
     def save_scene_file(mut self, path: String = "") -> Bool:
-        """Serializes the full Studio scene to a `.flscene` binary file on disk."""
+        """Saves the Studio scene via `Scene.save_flscnb_file` (`.flscnb`/`.flscene`) or `Scene.save_flscn_file` (`.flscn`)."""
         var target = path if path.byte_length() > 0 else self.scene_file_path
         if target.byte_length() == 0:
             return False
         var parent = parent_directory(target)
         if parent.byte_length() > 0 and parent != ".":
             _ = make_dirs(parent)
-        var w = BlobWriter()
-        self.serialize(w)
-        if not write_bytes(target, w.data):
+        var ok: Bool
+        if target.endswith(".flscn"):
+            try:
+                ok = self.scene.save_flscn_file(target, self.app.world, self.registry)
+            except:
+                ok = False
+        else:
+            ok = self.scene.save_flscnb_file(target, self.app.world, self.registry)
+        if not ok:
             return False
         self.scene_file_path = target
         return True
 
     def load_scene_file(mut self, path: String = "") -> Bool:
-        """Loads and deserializes a `.flscene` binary file from disk into Studio state."""
+        """Loads a `.flscn`, `.flscnb`, or `.flscene` file into `app.world` and syncs transforms/physics."""
         var target = path if path.byte_length() > 0 else self.scene_file_path
         if target.byte_length() == 0:
             return False
@@ -806,15 +1875,19 @@ struct FlintStudioState(Movable, Serializable):
         if len(raw) == 0:
             return False
         try:
-            var r = BlobReader(raw^)
-            self.deserialize(r)
-            if r.failed:
-                return False
+            if target.endswith(".flscn") or raw[0] == UInt8(123):  # '{'
+                _ = self.scene.load_flscn_bytes(self.app.world, self.registry, raw, clear_existing=True)
+            else:
+                _ = self.scene.load_flscnb_bytes(self.app.world, self.registry, raw, clear_existing=True)
         except:
             return False
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self.clear_selection()
+        if len(self.app.world.entities) > 0 and self.app.world.entities[0].alive:
+            self.select_entity(0)
         self.scene_file_path = target
+        self._reset_physics_world_and_sync()
         return True
 
     def scan_asset_browser(mut self, dir_path: String = "", pack_path: String = "") -> Int:
@@ -849,10 +1922,13 @@ struct FlintStudioState(Movable, Serializable):
                     or name.endswith(".jpeg")
                     or name.endswith(".hdr")
                     or name.endswith(".exr")
+                    or name.endswith(".flscn")
+                    or name.endswith(".flscnb")
                     or name.endswith(".flscene")
                     or name.endswith(".flpk")
                     or name.endswith(".wav")
                     or name.endswith(".ttf")
+                    or name.endswith(".otf")
                 ):
                     var dup = False
                     for e in self.asset_browser_entries:
@@ -866,26 +1942,19 @@ struct FlintStudioState(Movable, Serializable):
         return len(self.asset_browser_entries)
 
     def live_entity_count(self) -> Int:
-        var cnt = 0
-        for i in range(len(self.entities)):
-            if self.entities[i].alive:
-                cnt += 1
-        return cnt
+        return self.app.world.entity_count()
 
     def world_matrix(self, entity_id: Int) -> Mat4:
-        if entity_id < 0 or entity_id >= len(self.entities):
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
             return Mat4()
-        var local_m = self.entities[entity_id].local_matrix()
-        var pid = self.entities[entity_id].parent_id
-        var depth = 0
-        while pid >= 0 and pid < len(self.entities) and depth < 16:
-            if not self.entities[pid].alive:
-                break
-            var pm = self.entities[pid].local_matrix()
-            local_m = pm.multiply(local_m)
-            pid = self.entities[pid].parent_id
-            depth += 1
-        return local_m^
+        var gt_opt = self.app.world.get_ptr[GlobalTransform](e)
+        if gt_opt:
+            return gt_opt.value()[unsafe_offset=0].matrix.copy()
+        var lt_opt = self.app.world.get_ptr[LocalTransform](e)
+        if lt_opt:
+            return lt_opt.value()[unsafe_offset=0].to_mat4()
+        return Mat4()
 
     # ---- Reversible Coalesced Transaction Stack ----
 
@@ -897,6 +1966,149 @@ struct FlintStudioState(Movable, Serializable):
             for i in range(excess, len(self.undo_stack)):
                 trimmed.append(self.undo_stack[i].copy())
             self.undo_stack = trimmed^
+
+        var total_bytes = 0
+        for i in range(len(self.undo_stack)):
+            total_bytes += self.undo_stack[i].approx_bytes()
+        if total_bytes > MAX_UNDO_BLOB_BYTES and len(self.undo_stack) > 32:
+            var drop_n = 0
+            while total_bytes > MAX_UNDO_BLOB_BYTES and len(self.undo_stack) - drop_n > 32:
+                total_bytes -= self.undo_stack[drop_n].approx_bytes()
+                drop_n += 1
+            if drop_n > 0:
+                var trimmed_b = List[EditorTransaction](capacity=len(self.undo_stack) - drop_n)
+                for i in range(drop_n, len(self.undo_stack)):
+                    trimmed_b.append(self.undo_stack[i].copy())
+                self.undo_stack = trimmed_b^
+
+    def _record_world_tx(
+        mut self,
+        op: Int,
+        primary_id: Int,
+        var affected: List[Int],
+        var before_blob: List[UInt8],
+        prev_ids: List[Int],
+        prev_primary: Int,
+        prev_anchor: Int,
+        label: String,
+        coalesce_key: UInt64 = 0,
+    ):
+        var after_blob = self._capture_world_blob()
+        if coalesce_key != 0 and len(self.undo_stack) > 0 and len(self.redo_stack) == 0:
+            ref top = self.undo_stack[len(self.undo_stack) - 1]
+            if top.op == op and top.entity_id == primary_id and top.coalesce_key == coalesce_key:
+                top.after_world_blob = after_blob^
+                top.next_selected_id = self.selected_entity_id
+                top.next_selected_ids = self.selected_entity_ids.copy()
+                top.next_anchor_id = self.selection_anchor_id
+                return
+
+        var tx = EditorTransaction(op, primary_id, label)
+        tx.affected_ids = affected^
+        tx.before_world_blob = before_blob^
+        tx.after_world_blob = after_blob^
+        tx.prev_selected_id = prev_primary
+        tx.next_selected_id = self.selected_entity_id
+        tx.prev_selected_ids = prev_ids.copy()
+        tx.next_selected_ids = self.selected_entity_ids.copy()
+        tx.prev_anchor_id = prev_anchor
+        tx.next_anchor_id = self.selection_anchor_id
+        tx.coalesce_key = coalesce_key
+        self._push_undo(tx^)
+        self.redo_stack.clear()
+
+    def _apply_collider_and_rb(
+        mut self,
+        e: Entity,
+        collider_kind: Int,
+        collider_half_extents: Vec3,
+        mass: Float32,
+        restitution: Float32,
+        friction: Float32,
+        lin_vel: Vec3,
+        ang_vel: Vec3,
+    ):
+        var he = Vec3(
+            max(Float32(0.01), collider_half_extents.x),
+            max(Float32(0.01), collider_half_extents.y),
+            max(Float32(0.01), collider_half_extents.z),
+        )
+        var m = max(Float32(0.0), mass)
+
+        if collider_kind != COLLIDER_NONE:
+            var existing_col = self.app.world.get_ptr[ColliderComponent](e)
+            var target_shape = BODY_SHAPE_BOX
+            if collider_kind == COLLIDER_SPHERE:
+                target_shape = BODY_SHAPE_SPHERE
+            elif collider_kind == COLLIDER_CAPSULE:
+                target_shape = BODY_SHAPE_CAPSULE
+            elif (
+                collider_kind == COLLIDER_STATIC_MESH
+                and existing_col
+                and existing_col.value()[unsafe_offset=0].shape == BODY_SHAPE_CONVEX_HULL
+            ):
+                target_shape = BODY_SHAPE_CONVEX_HULL
+
+            var col: ColliderComponent
+            if existing_col:
+                col = existing_col.value()[unsafe_offset=0].copy()
+                if col.shape != target_shape:
+                    col.shape = target_shape
+                    if target_shape != BODY_SHAPE_CONVEX_HULL:
+                        col.points.clear()
+                col.half_extents = he
+                if target_shape == BODY_SHAPE_SPHERE:
+                    col.radius = he.x
+                elif target_shape == BODY_SHAPE_CAPSULE:
+                    col.radius = he.x
+                    col.half_height = he.y
+                else:
+                    col.radius = he.length()
+            else:
+                if target_shape == BODY_SHAPE_SPHERE:
+                    col = ColliderComponent.sphere(he.x)
+                    col.half_extents = he
+                elif target_shape == BODY_SHAPE_CAPSULE:
+                    col = ColliderComponent.capsule(he.x, he.y)
+                    col.half_extents = he
+                else:
+                    col = ColliderComponent.box(he)
+            _ = self.app.world.insert[ColliderComponent](e, col^)
+        else:
+            if self.app.world.has[ColliderComponent](e):
+                _ = self.app.world.remove[ColliderComponent](e)
+
+        if collider_kind != COLLIDER_NONE or m > Float32(0.0):
+            var existing_rb = self.app.world.get_ptr[RigidBodyComponent](e)
+            var rb: RigidBodyComponent
+            if existing_rb:
+                rb = existing_rb.value()[unsafe_offset=0].copy()
+                if m <= Float32(0.0):
+                    if rb.motion_mode != BODY_MOTION_KINEMATIC:
+                        rb.motion_mode = BODY_MOTION_STATIC
+                    rb.mass = Float32(0.0)
+                else:
+                    rb.motion_mode = BODY_MOTION_DYNAMIC
+                    rb.mass = m
+                rb.restitution = restitution
+                rb.friction = friction
+                rb.linear_vel = lin_vel
+                rb.angular_vel = ang_vel
+                if collider_kind == COLLIDER_NONE:
+                    rb.filter = CollisionFilter(0, 0, 0)
+            else:
+                rb = RigidBodyComponent.static_body() if m <= Float32(0.0) else RigidBodyComponent.dynamic(m)
+                rb.restitution = restitution
+                rb.friction = friction
+                rb.linear_vel = lin_vel
+                rb.angular_vel = ang_vel
+                rb.linear_damping = Float32(0.04)
+                if collider_kind == COLLIDER_NONE:
+                    rb.filter = CollisionFilter(0, 0, 0)
+            _ = self.app.world.insert[RigidBodyComponent](e, rb)
+        else:
+            if self.app.world.has[RigidBodyComponent](e):
+                _ = self.app.world.remove[RigidBodyComponent](e)
 
     def spawn_entity(
         mut self,
@@ -914,140 +2126,546 @@ struct FlintStudioState(Movable, Serializable):
         parent_id: Int = -1,
         record_undo: Bool = True,
     ) -> Int:
-        var reuse_id = -1
-        for i in range(len(self.entities)):
-            if not self.entities[i].alive:
-                reuse_id = i
-                break
+        var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
 
-        var appended = reuse_id < 0
-        var eid = len(self.entities) if appended else reuse_id
+        var e = self.app.world.spawn_empty()
+        var eid = Int(e.index)
+        var q = rotation.normalized()
+        var lt = LocalTransform(position, q, scale)
+        var gt = GlobalTransform.from_local(lt)
+        _ = self.app.world.insert[LocalTransform](e, lt)
+        _ = self.app.world.insert[GlobalTransform](e, gt.copy())
+        _ = self.app.world.insert[PrevGlobalTransform](e, PrevGlobalTransform(gt^))
+        _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(mesh_id, -1, True, True))
+        var clamp_r = max(Float32(0.04), min(Float32(1.0), roughness))
+        var clamp_m = max(Float32(0.0), min(Float32(1.0), metallic))
+        _ = self.app.world.insert[MaterialOverrideComponent](
+            e, MaterialOverrideComponent(-1, base_color, clamp_r, clamp_m, Vec3(), True)
+        )
+        _ = self.app.world.insert[StudioEntityMetaComponent](
+            e,
+            StudioEntityMetaComponent(
+                name=name,
+                collider_kind=collider_kind,
+                collider_half_extents=collider_half_extents,
+            ),
+        )
+        _ = self.app.world.insert[StudioStyleComponent](e, StudioStyleComponent())
+        self._apply_collider_and_rb(
+            e, collider_kind, collider_half_extents, mass, Float32(0.32), Float32(0.55), Vec3(), Vec3()
+        )
 
-        var node = StudioEntityNode(eid, name)
-        node.parent_id = parent_id
-        node.translation = position
-        node.rotation = rotation.normalized()
-        node.scale = scale
-        node.collider_kind = collider_kind
-        node.collider_half_extents = collider_half_extents
-        node.mass = max(Float32(0.0), mass)
-        node.base_color = base_color
-        node.roughness = max(Float32(0.04), min(Float32(1.0), roughness))
-        node.metallic = max(Float32(0.0), min(Float32(1.0), metallic))
-        node.mesh_id = mesh_id
+        if parent_id >= 0:
+            var pe = self.resolve_entity(parent_id)
+            if pe.valid():
+                _ = set_parent(self.app.world, e, pe)
 
-        var tx = EditorTransaction(TX_SPAWN_ENTITY, eid, "Spawn " + name)
-        tx.appended_slot = appended
-        tx.prev_selected_id = self.selected_entity_id
-        tx.next_selected_id = eid
-        tx.after_node = node.copy()
+        self.select_entity(eid)
+        self._sync_ecs_and_physics()
 
-        if appended:
-            self.entities.append(node^)
-            self.entity_bvh_slot.append(-1)
-        else:
-            tx.before_node = self.entities[eid].copy()
-            self.entities[eid] = node^
-            if eid < len(self.entity_bvh_slot):
-                self.entity_bvh_slot[eid] = -1
-
-        self.selected_entity_id = eid
         if record_undo:
-            self._push_undo(tx^)
-            self.redo_stack.clear()
+            var aff = List[Int]()
+            aff.append(eid)
+            self._record_world_tx(
+                TX_SPAWN_ENTITY, eid, aff^, before_blob^, prev_ids, prev_primary, prev_anchor, "Spawn " + name
+            )
         return eid
+
+    def _duplicate_entity_raw(mut self, src_id: Int) -> Int:
+        var src_e = self.resolve_entity(src_id)
+        if not src_e.valid():
+            return -1
+        var lt = self.app.world.get[LocalTransform](src_e) if self.app.world.has[LocalTransform](src_e) else LocalTransform()
+        lt.translation = lt.translation + Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
+        var mr = self.app.world.get[MeshRendererComponent](src_e) if self.app.world.has[MeshRendererComponent](src_e) else MeshRendererComponent()
+        var mo = self.app.world.get[MaterialOverrideComponent](src_e) if self.app.world.has[MaterialOverrideComponent](src_e) else MaterialOverrideComponent()
+        var meta = StudioEntityMetaComponent()
+        var meta_opt = self.app.world.get_ptr[StudioEntityMetaComponent](src_e)
+        if meta_opt:
+            ref m = meta_opt.value()[unsafe_offset=0]
+            meta = StudioEntityMetaComponent(
+                m.name + "_Copy",
+                m.locked,
+                m.mesh_handle_packed,
+                m.material_handle_packed,
+                m.collider_kind,
+                m.collider_half_extents,
+                m.restitution,
+                m.friction,
+                -1,
+            )
+        var style = self.app.world.get[StudioStyleComponent](src_e) if self.app.world.has[StudioStyleComponent](src_e) else StudioStyleComponent()
+        var par_id = self.parent_of(src_id)
+
+        var new_e = self.app.world.spawn_empty()
+        var new_id = Int(new_e.index)
+        var gt = GlobalTransform.from_local(lt)
+        _ = self.app.world.insert[LocalTransform](new_e, lt)
+        _ = self.app.world.insert[GlobalTransform](new_e, gt.copy())
+        _ = self.app.world.insert[PrevGlobalTransform](new_e, PrevGlobalTransform(gt^))
+        _ = self.app.world.insert[MeshRendererComponent](new_e, mr)
+        _ = self.app.world.insert[MaterialOverrideComponent](new_e, mo)
+        _ = self.app.world.insert[StudioEntityMetaComponent](new_e, meta^)
+        _ = self.app.world.insert[StudioStyleComponent](new_e, style)
+
+        var col_opt = self.app.world.get_ptr[ColliderComponent](src_e)
+        if col_opt:
+            ref sc = col_opt.value()[unsafe_offset=0]
+            var nc = ColliderComponent(
+                sc.shape, sc.radius, sc.half_height, sc.half_extents, sc.local_offset, sc.local_rot, sc.is_trigger, sc.filter, -1
+            )
+            nc.points = sc.points.copy()
+            _ = self.app.world.insert[ColliderComponent](new_e, nc^)
+
+        var rb_opt = self.app.world.get_ptr[RigidBodyComponent](src_e)
+        if rb_opt:
+            var nrb = rb_opt.value()[unsafe_offset=0]
+            nrb.body_id = -1
+            _ = self.app.world.insert[RigidBodyComponent](new_e, nrb)
+
+        if par_id >= 0:
+            var pe = self.resolve_entity(par_id)
+            if pe.valid():
+                _ = set_parent(self.app.world, new_e, pe)
+
+        return new_id
 
     def duplicate_entity(mut self, entity_id: Int, record_undo: Bool = True) -> Int:
-        """Duplicates an existing live entity (including NPR/VFX/collider properties) as a single Undo/Redo transaction."""
-        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+        """Duplicates an existing live entity as a single Undo/Redo transaction."""
+        if not self.is_alive_id(entity_id):
             return -1
-        var src = self.entities[entity_id].copy()
-        var reuse_id = -1
-        for i in range(len(self.entities)):
-            if not self.entities[i].alive:
-                reuse_id = i
-                break
-        var appended = reuse_id < 0
-        var eid = len(self.entities) if appended else reuse_id
+        var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
 
-        src.entity_id = eid
-        src.name = src.name + "_Copy"
-        src.translation = src.translation + Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
-        src.alive = True
+        var new_id = self._duplicate_entity_raw(entity_id)
+        if new_id < 0:
+            return -1
+        self.select_entity(new_id)
+        self._sync_ecs_and_physics()
 
-        var tx = EditorTransaction(TX_SPAWN_ENTITY, eid, "Duplicate " + src.name)
-        tx.appended_slot = appended
-        tx.prev_selected_id = self.selected_entity_id
-        tx.next_selected_id = eid
-        tx.after_node = src.copy()
-
-        if appended:
-            self.entities.append(src^)
-            self.entity_bvh_slot.append(-1)
-        else:
-            tx.before_node = self.entities[eid].copy()
-            self.entities[eid] = src^
-            if eid < len(self.entity_bvh_slot):
-                self.entity_bvh_slot[eid] = -1
-
-        self.selected_entity_id = eid
         if record_undo:
-            self._push_undo(tx^)
-            self.redo_stack.clear()
-        return eid
+            var aff = List[Int]()
+            aff.append(new_id)
+            var nm = self.entities[new_id].name if new_id < len(self.entities) else "Entity"
+            self._record_world_tx(
+                TX_SPAWN_ENTITY, new_id, aff^, before_blob^, prev_ids, prev_primary, prev_anchor, "Duplicate " + nm
+            )
+        return new_id
+
+    def duplicate_selected(mut self, record_undo: Bool = True) -> List[Int]:
+        """Duplicates all currently selected entities in a single atomic transaction."""
+        self._normalize_selection_from_primary()
+        var srcs = List[Int]()
+        for i in range(len(self.selected_entity_ids)):
+            if self.is_alive_id(self.selected_entity_ids[i]):
+                srcs.append(self.selected_entity_ids[i])
+        var created = List[Int]()
+        if len(srcs) == 0:
+            return created^
+
+        var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+
+        for i in range(len(srcs)):
+            var nid = self._duplicate_entity_raw(srcs[i])
+            if nid >= 0:
+                created.append(nid)
+
+        if len(created) == 0:
+            return created^
+
+        self.selected_entity_ids = created.copy()
+        self.selected_entity_id = created[len(created) - 1]
+        self.selection_anchor_id = created[0]
+        self._sync_ecs_and_physics()
+
+        if record_undo:
+            var aff = created.copy()
+            self._record_world_tx(
+                TX_BATCH_EDIT,
+                self.selected_entity_id,
+                aff^,
+                before_blob^,
+                prev_ids,
+                prev_primary,
+                prev_anchor,
+                "Duplicate " + String(len(created)) + " Entities",
+            )
+        return created^
+
+    def _despawn_entity_raw(mut self, entity_id: Int) -> Bool:
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return False
+        # Detach live children and parent BEFORE World.despawn(e) so no dangling Children/Parent links remain!
+        var ch = self.children_of(entity_id)
+        for ci in range(len(ch)):
+            var ce = self.resolve_entity(ch[ci])
+            if ce.valid():
+                _ = clear_parent(self.app.world, ce)
+        _ = clear_parent(self.app.world, e)
+        _ = self.app.world.despawn(e)
+        return True
 
     def despawn_entity(mut self, entity_id: Int, record_undo: Bool = True) -> Bool:
-        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+        if not self.is_alive_id(entity_id):
             return False
-        var tx = EditorTransaction(TX_DESPAWN_ENTITY, entity_id, "Despawn " + self.entities[entity_id].name)
-        tx.before_node = self.entities[entity_id].copy()
-        tx.prev_selected_id = self.selected_entity_id
-        self.entities[entity_id].alive = False
-        # Detach any live children so they are not orphaned with a dangling/reused parent_id
-        for i in range(len(self.entities)):
-            if self.entities[i].alive and self.entities[i].parent_id == entity_id:
-                self.entities[i].parent_id = -1
-                tx.reparented_child_ids.append(i)
-        if self.selected_entity_id == entity_id:
-            self.selected_entity_id = -1
-            for i in range(len(self.entities)):
-                if self.entities[i].alive:
-                    self.selected_entity_id = i
+        var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+        var nm = self.entities[entity_id].name if entity_id < len(self.entities) else "Entity"
+
+        if not self._despawn_entity_raw(entity_id):
+            return False
+
+        self._prune_selection()
+        if self.selected_entity_id < 0:
+            for i in range(len(self.app.world.entities)):
+                if self.app.world.entities[i].alive:
+                    self.select_entity(i)
                     break
-        tx.next_selected_id = self.selected_entity_id
-        tx.after_node = self.entities[entity_id].copy()
+
+        self._sync_ecs_and_physics()
         if record_undo:
-            self._push_undo(tx^)
-            self.redo_stack.clear()
+            var aff = List[Int]()
+            aff.append(entity_id)
+            self._record_world_tx(
+                TX_DESPAWN_ENTITY, entity_id, aff^, before_blob^, prev_ids, prev_primary, prev_anchor, "Despawn " + nm
+            )
+        return True
+
+    def despawn_selected(mut self, record_undo: Bool = True) -> Int:
+        self._normalize_selection_from_primary()
+        var targets = List[Int]()
+        for i in range(len(self.selected_entity_ids)):
+            if self.is_alive_id(self.selected_entity_ids[i]):
+                targets.append(self.selected_entity_ids[i])
+        if len(targets) == 0:
+            return 0
+
+        var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+
+        var count = 0
+        for i in range(len(targets)):
+            if self._despawn_entity_raw(targets[i]):
+                count += 1
+
+        self.clear_selection()
+        self._sync_ecs_and_physics()
+        if record_undo and count > 0:
+            self._record_world_tx(
+                TX_BATCH_EDIT,
+                targets[0],
+                targets^,
+                before_blob^,
+                prev_ids,
+                prev_primary,
+                prev_anchor,
+                "Delete " + String(count) + " Entities",
+            )
+        return count
+
+    def _is_ancestor(self, candidate_anc_id: Int, node_id: Int) -> Bool:
+        var cur = node_id
+        var hops = 0
+        while cur >= 0 and hops < 64:
+            if cur == candidate_anc_id:
+                return True
+            cur = self.parent_of(cur)
+            hops += 1
+        return False
+
+    def _reparent_entity_raw(
+        mut self,
+        child_id: Int,
+        new_parent_id: Int,
+        preserve_world_transform: Bool,
+    ) -> Bool:
+        var child_e = self.resolve_entity(child_id)
+        if not child_e.valid() or child_id == new_parent_id:
+            return False
+        if new_parent_id >= 0:
+            if not self.is_alive_id(new_parent_id):
+                return False
+            if self._is_ancestor(child_id, new_parent_id):
+                return False
+
+        var pre_w_pos = Vec3()
+        var pre_w_rot = Quat()
+        var pre_w_scl = Vec3(1.0, 1.0, 1.0)
+        if preserve_world_transform:
+            var gt_opt = self.app.world.get_ptr[GlobalTransform](child_e)
+            if gt_opt:
+                ref gt = gt_opt.value()[unsafe_offset=0]
+                pre_w_pos = gt.translation
+                pre_w_rot = gt.rotation
+                pre_w_scl = gt.scale
+            else:
+                var lt_opt = self.app.world.get_ptr[LocalTransform](child_e)
+                if lt_opt:
+                    ref lt = lt_opt.value()[unsafe_offset=0]
+                    pre_w_pos = lt.translation
+                    pre_w_rot = lt.rotation
+                    pre_w_scl = lt.scale
+
+        var ok: Bool
+        if new_parent_id < 0:
+            var had_parent = self.parent_of(child_id) >= 0
+            ok = clear_parent(self.app.world, child_e) if had_parent else True
+        else:
+            var parent_e = self.resolve_entity(new_parent_id)
+            ok = set_parent(self.app.world, child_e, parent_e)
+        if not ok:
+            return False
+
+        if preserve_world_transform:
+            var new_lt: LocalTransform
+            if new_parent_id < 0:
+                new_lt = LocalTransform(pre_w_pos, pre_w_rot.normalized(), pre_w_scl)
+            else:
+                var parent_e = self.resolve_entity(new_parent_id)
+                var pgt_opt = self.app.world.get_ptr[GlobalTransform](parent_e)
+                if pgt_opt:
+                    ref pgt = pgt_opt.value()[unsafe_offset=0]
+                    var inv_q = pgt.rotation.conjugate()
+                    var rel_p = inv_q.rotate(pre_w_pos - pgt.translation)
+                    var sx = pgt.scale.x if abs(pgt.scale.x) > Float32(1.0e-6) else Float32(1.0)
+                    var sy = pgt.scale.y if abs(pgt.scale.y) > Float32(1.0e-6) else Float32(1.0)
+                    var sz = pgt.scale.z if abs(pgt.scale.z) > Float32(1.0e-6) else Float32(1.0)
+                    new_lt = LocalTransform(
+                        Vec3(rel_p.x / sx, rel_p.y / sy, rel_p.z / sz),
+                        (inv_q * pre_w_rot).normalized(),
+                        Vec3(pre_w_scl.x / sx, pre_w_scl.y / sy, pre_w_scl.z / sz),
+                    )
+                else:
+                    new_lt = LocalTransform(pre_w_pos, pre_w_rot.normalized(), pre_w_scl)
+            _ = self.app.world.insert[LocalTransform](child_e, new_lt)
+        return True
+
+    def reparent_entity(
+        mut self,
+        child_id: Int,
+        new_parent_id: Int,
+        preserve_world_transform: Bool = False,
+        record_undo: Bool = True,
+    ) -> Bool:
+        if not self.is_alive_id(child_id) or child_id == new_parent_id:
+            return False
+        if new_parent_id >= 0:
+            if not self.is_alive_id(new_parent_id) or self._is_ancestor(child_id, new_parent_id):
+                return False
+        if self.parent_of(child_id) == new_parent_id:
+            return True
+
+        var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+
+        if not self._reparent_entity_raw(child_id, new_parent_id, preserve_world_transform):
+            return False
+
+        self._sync_ecs_and_physics()
+        if record_undo:
+            var aff = List[Int]()
+            aff.append(child_id)
+            if new_parent_id >= 0:
+                aff.append(new_parent_id)
+            self._record_world_tx(
+                TX_REPARENT_ENTITY,
+                child_id,
+                aff^,
+                before_blob^,
+                prev_ids,
+                prev_primary,
+                prev_anchor,
+                "Reparent #" + String(child_id),
+            )
+        return True
+
+    def reparent_selected_to(
+        mut self,
+        target_parent_id: Int,
+        preserve_world_transform: Bool = False,
+        record_undo: Bool = True,
+    ) -> Int:
+        self._normalize_selection_from_primary()
+        if target_parent_id >= 0 and not self.is_alive_id(target_parent_id):
+            return 0
+
+        var eligible = List[Int]()
+        for i in range(len(self.selected_entity_ids)):
+            var eid = self.selected_entity_ids[i]
+            if not self.is_alive_id(eid) or eid == target_parent_id:
+                continue
+            if self.parent_of(eid) == target_parent_id:
+                continue
+            if target_parent_id >= 0 and self._is_ancestor(eid, target_parent_id):
+                continue
+            eligible.append(eid)
+
+        if len(eligible) == 0:
+            return 0
+
+        var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+
+        var moved = 0
+        for i in range(len(eligible)):
+            if self._reparent_entity_raw(eligible[i], target_parent_id, preserve_world_transform):
+                moved += 1
+
+        if moved > 0:
+            self._sync_ecs_and_physics()
+            if record_undo:
+                self._record_world_tx(
+                    TX_REPARENT_ENTITY,
+                    eligible[0],
+                    eligible^,
+                    before_blob^,
+                    prev_ids,
+                    prev_primary,
+                    prev_anchor,
+                    "Reparent Selected (" + String(moved) + ")",
+                )
+        return moved
+
+    def _apply_view_to_world(mut self, entity_id: Int, updated: StudioEntityView) -> Bool:
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return False
+
+        var cur_par = self.parent_of(entity_id)
+        if updated.parent_id != cur_par:
+            if updated.parent_id < 0:
+                _ = clear_parent(self.app.world, e)
+            else:
+                var pe = self.resolve_entity(updated.parent_id)
+                if not pe.valid() or not set_parent(self.app.world, e, pe):
+                    return False
+
+        _ = self.app.world.insert[LocalTransform](
+            e, LocalTransform(updated.translation, updated.rotation.normalized(), updated.scale)
+        )
+        _ = self.app.world.insert[MeshRendererComponent](
+            e, MeshRendererComponent(updated.mesh_id, updated.material_id, True, updated.visible)
+        )
+        var clamp_r = max(Float32(0.04), min(Float32(1.0), updated.roughness))
+        var clamp_m = max(Float32(0.0), min(Float32(1.0), updated.metallic))
+        _ = self.app.world.insert[MaterialOverrideComponent](
+            e,
+            MaterialOverrideComponent(
+                updated.material_id,
+                updated.base_color,
+                clamp_r,
+                clamp_m,
+                updated.emissive,
+                enabled=(updated.shading_mode == SHADING_PBR),
+            ),
+        )
+
+        var bvh_s = -1
+        var old_meta = self.app.world.get_ptr[StudioEntityMetaComponent](e)
+        if old_meta:
+            bvh_s = old_meta.value()[unsafe_offset=0].bvh_slot
+        _ = self.app.world.insert[StudioEntityMetaComponent](
+            e,
+            StudioEntityMetaComponent(
+                updated.name,
+                updated.locked,
+                updated.mesh_handle.packed,
+                updated.material_handle.packed,
+                updated.collider_kind,
+                updated.collider_half_extents,
+                updated.restitution,
+                updated.friction,
+                bvh_s,
+            ),
+        )
+
+        var st = StudioStyleComponent()
+        var old_st = self.app.world.get_ptr[StudioStyleComponent](e)
+        if old_st:
+            st = old_st.value()[unsafe_offset=0]
+        st.shading_mode = updated.shading_mode
+        st.cel_shadow_tint = updated.cel_shadow_tint
+        st.cel_outline_width_px = updated.cel_outline_width_px
+        st.cel_outline_color = updated.cel_outline_color
+        st.cel_rim_color = updated.cel_rim_color
+        st.cel_hair_halo = updated.cel_hair_halo
+        st.vfx_erosion = updated.vfx_erosion
+        st.vfx_scroll_speed = updated.vfx_scroll_speed
+        st.vfx_core_color = updated.vfx_core_color
+        st.vfx_edge_color = updated.vfx_edge_color
+        st.anim_step_hz = updated.anim_step_hz
+        st.smear_stretch = updated.smear_stretch
+        _ = self.app.world.insert[StudioStyleComponent](e, st)
+
+        self._apply_collider_and_rb(
+            e,
+            updated.collider_kind,
+            updated.collider_half_extents,
+            updated.mass,
+            updated.restitution,
+            updated.friction,
+            updated.linear_velocity,
+            updated.angular_velocity,
+        )
         return True
 
     def commit_node_edit(
         mut self,
         entity_id: Int,
-        var updated_node: StudioEntityNode,
+        var updated_view: StudioEntityView,
         label: String = "Edit Entity",
         coalesce_key: UInt64 = 0,
     ) -> Bool:
-        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+        if not self.is_alive_id(entity_id):
             return False
 
-        # Coalesce continuous interactive gizmo/slider drags with identical non-zero `coalesce_key`
-        if coalesce_key != 0 and len(self.undo_stack) > 0 and len(self.redo_stack) == 0:
-            ref top = self.undo_stack[len(self.undo_stack) - 1]
-            if top.op == TX_PATCH_ENTITY and top.entity_id == entity_id and top.coalesce_key == coalesce_key:
-                top.after_node = updated_node.copy()
-                self.entities[entity_id] = updated_node^
-                return True
+        var can_coalesce = (
+            coalesce_key != 0
+            and len(self.undo_stack) > 0
+            and len(self.redo_stack) == 0
+            and self.undo_stack[len(self.undo_stack) - 1].op == TX_PATCH_ENTITY
+            and self.undo_stack[len(self.undo_stack) - 1].entity_id == entity_id
+            and self.undo_stack[len(self.undo_stack) - 1].coalesce_key == coalesce_key
+        )
+        var before_blob = List[UInt8]() if can_coalesce else self._capture_world_blob()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
 
-        var tx = EditorTransaction(TX_PATCH_ENTITY, entity_id, label)
-        tx.before_node = self.entities[entity_id].copy()
-        tx.after_node = updated_node.copy()
-        tx.prev_selected_id = self.selected_entity_id
-        tx.next_selected_id = self.selected_entity_id
-        tx.coalesce_key = coalesce_key
-        self.entities[entity_id] = updated_node^
-        self._push_undo(tx^)
-        self.redo_stack.clear()
+        if not self._apply_view_to_world(entity_id, updated_view):
+            return False
+
+        self._sync_ecs_and_physics()
+        var aff = List[Int]()
+        aff.append(entity_id)
+        self._record_world_tx(
+            TX_PATCH_ENTITY,
+            entity_id,
+            aff^,
+            before_blob^,
+            prev_ids,
+            prev_primary,
+            prev_anchor,
+            label,
+            coalesce_key=coalesce_key,
+        )
         return True
 
     def set_entity_transform(
@@ -1058,13 +2676,13 @@ struct FlintStudioState(Movable, Serializable):
         scale: Vec3,
         coalesce_key: UInt64 = 0,
     ) -> Bool:
-        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+        if not self.is_alive_id(entity_id):
             return False
-        var nd = self.entities[entity_id].copy()
-        nd.translation = position
-        nd.rotation = rotation.normalized()
-        nd.scale = scale
-        return self.commit_node_edit(entity_id, nd^, "Transform", coalesce_key)
+        var v = self.entities[entity_id].copy()
+        v.translation = position
+        v.rotation = rotation.normalized()
+        v.scale = scale
+        return self.commit_node_edit(entity_id, v^, "Transform", coalesce_key)
 
     def patch_entity_field(
         mut self,
@@ -1073,14 +2691,195 @@ struct FlintStudioState(Movable, Serializable):
         new_val: InspectedField,
         coalesce_key: UInt64 = 0,
     ) -> Bool:
-        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+        if not self.is_alive_id(entity_id):
             return False
-        var nd = self.entities[entity_id].copy()
+        var v = self.entities[entity_id].copy()
         var vis = FieldVisitor.for_patch(field_name, new_val)
-        nd.inspect_fields(vis)
+        v.inspect_fields(vis)
         if not vis.mutated:
             return False
-        return self.commit_node_edit(entity_id, nd^, "Patch " + field_name, coalesce_key)
+        if field_name == "parent_id":
+            if v.parent_id >= 0 and (not self.is_alive_id(v.parent_id) or v.parent_id == entity_id or self._is_ancestor(entity_id, v.parent_id)):
+                return False
+        return self.commit_node_edit(entity_id, v^, "Patch " + field_name, coalesce_key)
+
+    def capture_selected_transforms(self) -> List[SelectedTransformSnap]:
+        var top_ids = self._top_level_selected_ids()
+        var snaps = List[SelectedTransformSnap](capacity=len(top_ids))
+        for i in range(len(top_ids)):
+            var eid = top_ids[i]
+            var e = self.resolve_entity(eid)
+            if not e.valid():
+                continue
+            var lt = self.app.world.get[LocalTransform](e) if self.app.world.has[LocalTransform](e) else LocalTransform()
+            var gt = self.app.world.get[GlobalTransform](e) if self.app.world.has[GlobalTransform](e) else GlobalTransform.from_local(lt)
+            snaps.append(
+                SelectedTransformSnap(
+                    eid,
+                    lt.translation,
+                    lt.rotation,
+                    lt.scale,
+                    gt.translation,
+                    gt.rotation,
+                    gt.scale,
+                    self.parent_of(eid),
+                )
+            )
+        return snaps^
+
+    def apply_gizmo_drag_selected(
+        mut self,
+        snaps: List[SelectedTransformSnap],
+        pivot: Vec3,
+        world_delta_pos: Vec3,
+        world_dq_rot: Quat,
+        scale_factor: Vec3,
+        mode: Int,
+        coalesce_key: UInt64 = 0,
+    ) -> Bool:
+        if len(snaps) == 0:
+            return False
+
+        var primary_id = self.selected_entity_id if self.selected_entity_id >= 0 else snaps[0].entity_id
+        var can_coalesce = (
+            coalesce_key != 0
+            and len(self.undo_stack) > 0
+            and len(self.redo_stack) == 0
+            and self.undo_stack[len(self.undo_stack) - 1].op == TX_BATCH_EDIT
+            and self.undo_stack[len(self.undo_stack) - 1].entity_id == primary_id
+            and self.undo_stack[len(self.undo_stack) - 1].coalesce_key == coalesce_key
+        )
+        var before_blob = List[UInt8]() if can_coalesce else self._capture_world_blob()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+
+        var aff = List[Int](capacity=len(snaps))
+        for i in range(len(snaps)):
+            ref sn = snaps[i]
+            var e = self.resolve_entity(sn.entity_id)
+            if not e.valid():
+                continue
+            aff.append(sn.entity_id)
+
+            var target_w_pos = sn.world_pos
+            var target_w_rot = sn.world_rot
+            var target_local_scl = sn.local_scl
+            if mode == GIZMO_MODE_TRANSLATE:
+                target_w_pos = sn.world_pos + world_delta_pos
+            elif mode == GIZMO_MODE_ROTATE:
+                var rel = sn.world_pos - pivot
+                target_w_pos = pivot + world_dq_rot.rotate(rel)
+                target_w_rot = world_dq_rot.multiply(sn.world_rot).normalized()
+            elif mode == GIZMO_MODE_SCALE:
+                target_local_scl = Vec3(
+                    max(Float32(0.01), sn.local_scl.x * scale_factor.x),
+                    max(Float32(0.01), sn.local_scl.y * scale_factor.y),
+                    max(Float32(0.01), sn.local_scl.z * scale_factor.z),
+                )
+
+            var new_lt = LocalTransform(target_w_pos, target_w_rot, target_local_scl)
+            if sn.parent_id >= 0:
+                var pe = self.resolve_entity(sn.parent_id)
+                if pe.valid():
+                    var pgt_opt = self.app.world.get_ptr[GlobalTransform](pe)
+                    if pgt_opt:
+                        ref pgt = pgt_opt.value()[unsafe_offset=0]
+                        var inv_q = pgt.rotation.conjugate()
+                        var lp = inv_q.rotate(target_w_pos - pgt.translation)
+                        var sx = pgt.scale.x if abs(pgt.scale.x) > Float32(1.0e-6) else Float32(1.0)
+                        var sy = pgt.scale.y if abs(pgt.scale.y) > Float32(1.0e-6) else Float32(1.0)
+                        var sz = pgt.scale.z if abs(pgt.scale.z) > Float32(1.0e-6) else Float32(1.0)
+                        new_lt = LocalTransform(
+                            Vec3(lp.x / sx, lp.y / sy, lp.z / sz),
+                            (inv_q * target_w_rot).normalized(),
+                            target_local_scl,
+                        )
+            _ = self.app.world.insert[LocalTransform](e, new_lt)
+
+        if len(aff) == 0:
+            return False
+
+        self._sync_ecs_and_physics()
+        self._record_world_tx(
+            TX_BATCH_EDIT,
+            primary_id,
+            aff^,
+            before_blob^,
+            prev_ids,
+            prev_primary,
+            prev_anchor,
+            "Transform Selected",
+            coalesce_key=coalesce_key,
+        )
+        return True
+
+    def bulk_translate_selected(mut self, delta: Vec3, coalesce_key: UInt64 = 0) -> Bool:
+        var snaps = self.capture_selected_transforms()
+        if len(snaps) == 0:
+            return False
+        var piv = self.selection_gizmo_pivot()
+        return self.apply_gizmo_drag_selected(
+            snaps,
+            piv[1],
+            delta,
+            Quat(0.0, 0.0, 0.0, 1.0),
+            Vec3(1.0, 1.0, 1.0),
+            GIZMO_MODE_TRANSLATE,
+            coalesce_key=coalesce_key,
+        )
+
+    def bulk_patch_field(
+        mut self,
+        field_name: String,
+        new_val: InspectedField,
+        coalesce_key: UInt64 = 0,
+    ) -> Int:
+        self._normalize_selection_from_primary()
+        var targets = List[Int]()
+        for i in range(len(self.selected_entity_ids)):
+            if self.is_alive_id(self.selected_entity_ids[i]):
+                targets.append(self.selected_entity_ids[i])
+        if len(targets) == 0:
+            return 0
+
+        var primary_id = self.selected_entity_id if self.selected_entity_id >= 0 else targets[0]
+        var can_coalesce = (
+            coalesce_key != 0
+            and len(self.undo_stack) > 0
+            and len(self.redo_stack) == 0
+            and self.undo_stack[len(self.undo_stack) - 1].op == TX_BATCH_EDIT
+            and self.undo_stack[len(self.undo_stack) - 1].entity_id == primary_id
+            and self.undo_stack[len(self.undo_stack) - 1].coalesce_key == coalesce_key
+        )
+        var before_blob = List[UInt8]() if can_coalesce else self._capture_world_blob()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+
+        var patched = 0
+        for i in range(len(targets)):
+            var eid = targets[i]
+            var v = self.entities[eid].copy()
+            var vis = FieldVisitor.for_patch(field_name, new_val)
+            v.inspect_fields(vis)
+            if vis.mutated and self._apply_view_to_world(eid, v):
+                patched += 1
+
+        if patched > 0:
+            self._sync_ecs_and_physics()
+            self._record_world_tx(
+                TX_BATCH_EDIT,
+                primary_id,
+                targets^,
+                before_blob^,
+                prev_ids,
+                prev_primary,
+                prev_anchor,
+                "Bulk Patch " + field_name,
+                coalesce_key=coalesce_key,
+            )
+        return patched
 
     def configure_entity_npr_cel(
         mut self,
@@ -1094,18 +2893,18 @@ struct FlintStudioState(Movable, Serializable):
         smear_stretch: Float32 = 1.0,
         coalesce_key: UInt64 = 0,
     ) -> Bool:
-        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+        if not self.is_alive_id(entity_id):
             return False
-        var nd = self.entities[entity_id].copy()
-        nd.shading_mode = SHADING_NPR_CEL
-        nd.cel_shadow_tint = cel_shadow_tint
-        nd.cel_outline_width_px = max(Float32(0.0), min(Float32(24.0), cel_outline_width_px))
-        nd.cel_outline_color = cel_outline_color
-        nd.cel_rim_color = cel_rim_color
-        nd.cel_hair_halo = max(Float32(0.0), cel_hair_halo)
-        nd.anim_step_hz = max(Float32(0.0), anim_step_hz)
-        nd.smear_stretch = max(Float32(0.55), min(Float32(3.2), smear_stretch))
-        return self.commit_node_edit(entity_id, nd^, "Configure NPR Cel", coalesce_key)
+        var v = self.entities[entity_id].copy()
+        v.shading_mode = SHADING_NPR_CEL
+        v.cel_shadow_tint = cel_shadow_tint
+        v.cel_outline_width_px = max(Float32(0.0), min(Float32(24.0), cel_outline_width_px))
+        v.cel_outline_color = cel_outline_color
+        v.cel_rim_color = cel_rim_color
+        v.cel_hair_halo = max(Float32(0.0), cel_hair_halo)
+        v.anim_step_hz = max(Float32(0.0), anim_step_hz)
+        v.smear_stretch = max(Float32(0.55), min(Float32(3.2), smear_stretch))
+        return self.commit_node_edit(entity_id, v^, "Configure NPR Cel", coalesce_key)
 
     def configure_entity_stylized_vfx(
         mut self,
@@ -1118,27 +2917,29 @@ struct FlintStudioState(Movable, Serializable):
         smear_stretch: Float32 = 1.0,
         coalesce_key: UInt64 = 0,
     ) -> Bool:
-        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+        if not self.is_alive_id(entity_id):
             return False
-        var nd = self.entities[entity_id].copy()
-        nd.shading_mode = SHADING_STYLIZED_VFX
-        nd.vfx_erosion = max(Float32(0.0), min(Float32(1.0), vfx_erosion))
-        nd.vfx_scroll_speed = vfx_scroll_speed
-        nd.vfx_core_color = vfx_core_color
-        nd.vfx_edge_color = vfx_edge_color
-        nd.anim_step_hz = max(Float32(0.0), anim_step_hz)
-        nd.smear_stretch = max(Float32(0.55), min(Float32(3.2), smear_stretch))
-        return self.commit_node_edit(entity_id, nd^, "Configure Stylized VFX", coalesce_key)
+        var v = self.entities[entity_id].copy()
+        v.shading_mode = SHADING_STYLIZED_VFX
+        v.vfx_erosion = max(Float32(0.0), min(Float32(1.0), vfx_erosion))
+        v.vfx_scroll_speed = vfx_scroll_speed
+        v.vfx_core_color = vfx_core_color
+        v.vfx_edge_color = vfx_edge_color
+        v.anim_step_hz = max(Float32(0.0), anim_step_hz)
+        v.smear_stretch = max(Float32(0.55), min(Float32(3.2), smear_stretch))
+        return self.commit_node_edit(entity_id, v^, "Configure Stylized VFX", coalesce_key)
 
     def attach_static_bvh_collider(mut self, entity_id: Int, var bvh: Bvh8MeshCollider):
-        if entity_id < 0 or entity_id >= len(self.entities):
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
             return
-        while len(self.entity_bvh_slot) < len(self.entities):
-            self.entity_bvh_slot.append(-1)
         var slot = len(self.static_bvh_colliders)
         self.static_bvh_colliders.append(bvh^)
-        self.entity_bvh_slot[entity_id] = slot
-        self.entities[entity_id].collider_kind = COLLIDER_STATIC_MESH
+        var meta_opt = self.app.world.get_ptr_mut[StudioEntityMetaComponent](e)
+        if meta_opt:
+            meta_opt.value()[unsafe_offset=0].collider_kind = COLLIDER_STATIC_MESH
+            meta_opt.value()[unsafe_offset=0].bvh_slot = slot
+        self._sync_compat_view()
 
     def can_undo(self) -> Bool:
         return len(self.undo_stack) > 0
@@ -1150,23 +2951,10 @@ struct FlintStudioState(Movable, Serializable):
         if len(self.undo_stack) == 0:
             return False
         var tx = self.undo_stack.pop()
-        if tx.op == TX_SPAWN_ENTITY:
-            if tx.appended_slot and tx.entity_id == len(self.entities) - 1:
-                _ = self.entities.pop()
-                if len(self.entity_bvh_slot) > len(self.entities):
-                    _ = self.entity_bvh_slot.pop()
-            elif tx.entity_id >= 0 and tx.entity_id < len(self.entities):
-                self.entities[tx.entity_id] = tx.before_node.copy()
-            self.selected_entity_id = tx.prev_selected_id
-        elif tx.op == TX_DESPAWN_ENTITY or tx.op == TX_PATCH_ENTITY:
-            if tx.entity_id >= 0 and tx.entity_id < len(self.entities):
-                self.entities[tx.entity_id] = tx.before_node.copy()
-            if tx.op == TX_DESPAWN_ENTITY:
-                for ci in range(len(tx.reparented_child_ids)):
-                    var cid = tx.reparented_child_ids[ci]
-                    if cid >= 0 and cid < len(self.entities):
-                        self.entities[cid].parent_id = tx.entity_id
-            self.selected_entity_id = tx.prev_selected_id
+        if not self._restore_world_blob(tx.before_world_blob):
+            self.undo_stack.append(tx^)
+            return False
+        self._restore_selection(tx.prev_selected_ids, tx.prev_selected_id, tx.prev_anchor_id)
         self.redo_stack.append(tx^)
         return True
 
@@ -1174,113 +2962,282 @@ struct FlintStudioState(Movable, Serializable):
         if len(self.redo_stack) == 0:
             return False
         var tx = self.redo_stack.pop()
-        if tx.op == TX_SPAWN_ENTITY:
-            if tx.appended_slot and tx.entity_id == len(self.entities):
-                self.entities.append(tx.after_node.copy())
-                self.entity_bvh_slot.append(-1)
-            elif tx.entity_id >= 0 and tx.entity_id < len(self.entities):
-                self.entities[tx.entity_id] = tx.after_node.copy()
-            self.selected_entity_id = tx.next_selected_id
-        elif tx.op == TX_DESPAWN_ENTITY or tx.op == TX_PATCH_ENTITY:
-            if tx.entity_id >= 0 and tx.entity_id < len(self.entities):
-                self.entities[tx.entity_id] = tx.after_node.copy()
-            if tx.op == TX_DESPAWN_ENTITY:
-                for ci in range(len(tx.reparented_child_ids)):
-                    var cid = tx.reparented_child_ids[ci]
-                    if cid >= 0 and cid < len(self.entities):
-                        self.entities[cid].parent_id = -1
-            self.selected_entity_id = tx.next_selected_id
+        if not self._restore_world_blob(tx.after_world_blob):
+            self.redo_stack.append(tx^)
+            return False
+        self._restore_selection(tx.next_selected_ids, tx.next_selected_id, tx.next_anchor_id)
         self._push_undo(tx^)
         return True
 
-    # ---- Deterministic Physics Step & Analytical Raycast ----
+    # ---- Deterministic `PhysicsWorld` Step, Editor Frame Render & Analytical/Physics Raycast ----
 
-    def step_physics_deterministic(mut self, ticks: Int = 1, dt: Float32 = Float32(1.0 / 60.0)) -> Int:
-        """Advances deterministic IEEE-754 rigid-body dynamics across `ticks` sub-stepped frames."""
+    def step_simulation(mut self, ticks: Int = 1, dt: Float32 = Float32(1.0 / 60.0)) -> Int:
+        """Advances `PhysicsWorld` via `PhysicsPlugin` (`STAGE_PRE_UPDATE` + `STAGE_FIXED_UPDATE` x `ticks`)
+        and propagates `GlobalTransform` (`STAGE_POST_UPDATE`)."""
         if ticks <= 0:
             return 0
         set_sim_float_mode()
-        comptime SUBSTEPS: Int = 4
-        var h = dt / Float32(SUBSTEPS)
-        var n = len(self.entities)
+        self._ensure_ground_plane()
+        var fix_opt = self.app.resources.get_ptr_mut[FixedTime]()
+        var saved_dt = Float32(1.0 / 60.0)
+        if fix_opt:
+            saved_dt = fix_opt.value()[unsafe_offset=0].dt
+            fix_opt.value()[unsafe_offset=0].dt = dt
+            fix_opt.value()[unsafe_offset=0].dt_f64 = Float64(dt)
+
+        self.app.schedule.run_stage(
+            STAGE_PRE_UPDATE,
+            self.app.world,
+            self.app.resources,
+            self.app.pool,
+            self.app.commands,
+        )
+        self.app.world.flush_commands(self.app.commands)
 
         for _ in range(ticks):
-            for _ in range(SUBSTEPS):
-                # 1. Symplectic Euler velocity + position integration for dynamic bodies (`mass > 0`)
-                for i in range(n):
-                    if not self.entities[i].alive or self.entities[i].mass <= Float32(0.0):
-                        continue
-                    var lv = self.entities[i].linear_velocity + self.gravity * h
-                    lv = lv * max(Float32(0.0), Float32(1.0) - Float32(0.04) * h)
-                    var pos = self.entities[i].translation + lv * h
-
-                    var w = self.entities[i].angular_velocity
-                    if w.length_squared() > Float32(1.0e-10):
-                        var q = self.entities[i].rotation
-                        var dq = Quat(
-                            Float32(0.5) * h * (w.x * q.w + w.y * q.z - w.z * q.y),
-                            Float32(0.5) * h * (-w.x * q.z + w.y * q.w + w.z * q.x),
-                            Float32(0.5) * h * (w.x * q.y - w.y * q.x + w.z * q.w),
-                            Float32(0.5) * h * (-w.x * q.x - w.y * q.y - w.z * q.z),
-                        )
-                        self.entities[i].rotation = Quat(q.x + dq.x, q.y + dq.y, q.z + dq.z, q.w + dq.w).normalized()
-
-                    # Ground plane contact solve
-                    if self.has_ground_plane and self.entities[i].collider_kind != COLLIDER_NONE:
-                        var half_y = self.entities[i].collider_half_extents.y * self.entities[i].scale.y
-                        if self.entities[i].collider_kind == COLLIDER_SPHERE:
-                            half_y = self.entities[i].collider_half_extents.x * self.entities[i].scale.x
-                        var min_y = self.ground_plane_y + max(Float32(0.02), half_y)
-                        if pos.y < min_y:
-                            pos.y = min_y
-                            if lv.y < Float32(0.0):
-                                var rest = self.entities[i].restitution if (-lv.y) > Float32(0.5) else Float32(0.0)
-                                lv.y = -lv.y * rest
-                                var fric_damp = max(Float32(0.0), Float32(1.0) - self.entities[i].friction * Float32(4.0) * h)
-                                lv.x *= fric_damp
-                                lv.z *= fric_damp
-
-                    self.entities[i].translation = pos
-                    self.entities[i].linear_velocity = lv
-
-                # 2. Pairwise dynamic-vs-dynamic / dynamic-vs-static sphere-proxy & BVH8 collision resolution
-                for i in range(n):
-                    if not self.entities[i].alive or self.entities[i].collider_kind == COLLIDER_NONE:
-                        continue
-                    for j in range(i + 1, n):
-                        if not self.entities[j].alive or self.entities[j].collider_kind == COLLIDER_NONE:
-                            continue
-                        var dyn_a = self.entities[i].mass > Float32(0.0)
-                        var dyn_b = self.entities[j].mass > Float32(0.0)
-                        if not dyn_a and not dyn_b:
-                            continue
-
-                        var ra = max(Float32(0.05), self.entities[i].collider_half_extents.x * self.entities[i].scale.x)
-                        var rb = max(Float32(0.05), self.entities[j].collider_half_extents.x * self.entities[j].scale.x)
-                        var delta = self.entities[j].translation - self.entities[i].translation
-                        var dist2 = delta.length_squared()
-                        var r_sum = ra + rb
-                        if dist2 < r_sum * r_sum:
-                            var dist = sqrt(max(Float32(1.0e-8), dist2))
-                            var nrm = (delta * (Float32(1.0) / dist)) if dist > Float32(1.0e-4) else Vec3(0.0, 1.0, 0.0)
-                            var pen = r_sum - dist
-                            var inv_ma = (Float32(1.0) / self.entities[i].mass) if dyn_a else Float32(0.0)
-                            var inv_mb = (Float32(1.0) / self.entities[j].mass) if dyn_b else Float32(0.0)
-                            var inv_sum = inv_ma + inv_mb
-                            if inv_sum > Float32(0.0):
-                                self.entities[i].translation = self.entities[i].translation - nrm * (pen * (inv_ma / inv_sum))
-                                self.entities[j].translation = self.entities[j].translation + nrm * (pen * (inv_mb / inv_sum))
-                                var rvel = (self.entities[j].linear_velocity - self.entities[i].linear_velocity).dot(nrm)
-                                if rvel < Float32(0.0):
-                                    var e = min(self.entities[i].restitution, self.entities[j].restitution)
-                                    var j_imp = -(Float32(1.0) + e) * rvel / inv_sum
-                                    self.entities[i].linear_velocity = self.entities[i].linear_velocity - nrm * (j_imp * inv_ma)
-                                    self.entities[j].linear_velocity = self.entities[j].linear_velocity + nrm * (j_imp * inv_mb)
-
+            _ = self.app.world.advance_tick()
+            self.app.schedule.run_stage(
+                STAGE_FIXED_UPDATE,
+                self.app.world,
+                self.app.resources,
+                self.app.pool,
+                self.app.commands,
+            )
+            self.app.world.flush_commands(self.app.commands)
             self.sim_tick += 1
+
+        if fix_opt:
+            fix_opt.value()[unsafe_offset=0].dt = saved_dt
+            fix_opt.value()[unsafe_offset=0].dt_f64 = Float64(saved_dt)
+            fix_opt.value()[unsafe_offset=0].overstep_alpha = Float32(1.0)
+
+        self.app.schedule.run_stage(
+            STAGE_POST_UPDATE,
+            self.app.world,
+            self.app.resources,
+            self.app.pool,
+            self.app.commands,
+        )
+        self.app.world.flush_commands(self.app.commands)
+        self._sync_compat_view()
         return ticks
 
-    # ---- 1-Click Play-In-Editor (`PieSession` + LZ4 `checkpoint.mojo`) ----
+    def step_physics_deterministic(mut self, ticks: Int = 1, dt: Float32 = Float32(1.0 / 60.0)) -> Int:
+        """Forwarding alias to `step_simulation(ticks, dt)` (`PhysicsPlugin` + `PhysicsWorld`)."""
+        return self.step_simulation(ticks, dt)
+
+    def _sync_studio_pre_render(
+        mut self,
+        screen_w: Int,
+        screen_h: Int,
+        gpu_ms: Float64 = 0.0,
+        mounted_packs: Int = 0,
+        mcp_clients: Int = 0,
+        input: InputState = InputState(),
+        dt: Float32 = 1.0 / 60.0,
+    ):
+        if self.pie.mode != PIE_PLAYING:
+            snapshot_prev_global_transforms(self.app.world, self.app.pool)
+            var fix_edit = self.app.resources.get_ptr_mut[FixedTime]()
+            if fix_edit:
+                fix_edit.value()[unsafe_offset=0].overstep_alpha = Float32(1.0)
+
+        # 1. Sync camera when no active user CameraComponent entity exists
+        var has_cam_ent = False
+        var cam_mask = self.app.world.bit_for[CameraComponent]()
+        var cam_ents = self.app.world.query_entities(cam_mask)
+        for i in range(len(cam_ents)):
+            var c_opt = self.app.world.get_ptr[CameraComponent](cam_ents[i])
+            if c_opt and c_opt.value()[unsafe_offset=0].active:
+                has_cam_ent = True
+                break
+        if not has_cam_ent:
+            var rw_opt = self.app.resources.get_ptr_mut[RenderWorld]()
+            if rw_opt:
+                ref rw = rw_opt.value()[unsafe_offset=0]
+                rw.camera = RenderCameraPacket(
+                    self.cam_pos,
+                    self.cam_pos + self.cam_fwd * Float32(10.0),
+                    Vec3(0.0, 1.0, 0.0),
+                    self.fov_y_deg,
+                    self.near_z,
+                    Float32(1000.0),
+                    Float32(1.08),
+                )
+
+        # 2. Sync GPU NPR Cel / VFX materials & post-FX onto ScalableRenderer + gpu_slot[0]
+        var rend_opt = self.app.resources.get_ptr_mut[ScalableRenderer]()
+        var font_slot = -1
+        var font_copy = SdfFont()
+        if rend_opt:
+            ref renderer = rend_opt.value()[unsafe_offset=0]
+            var n_ents = len(self.app.world.entities)
+            while len(self.gpu_materials.entity_pbr_mat_ids) < n_ents:
+                self.gpu_materials.entity_pbr_mat_ids.append(-1)
+                self.gpu_materials.entity_cel_mat_ids.append(-1)
+                self.gpu_materials.entity_vfx_mat_ids.append(-1)
+
+            if renderer.uses_vulkan():
+                ref gpu = renderer.gpu_slot[0]
+                font_slot = gpu.ui_font_atlas_slot
+                font_copy = gpu.ui_font.copy()
+
+                if self.preview_shockwave_active:
+                    gpu.submit_shockwave(
+                        AaaShockwaveRing(
+                            center_u=Float32(0.5),
+                            center_v=Float32(0.5),
+                            radius_uv=self.preview_shockwave_radius,
+                        )
+                    )
+                if self.preview_impact_blend > Float32(0.0):
+                    gpu.set_impact_frame(
+                        AaaImpactFrameParams(
+                            blend=self.preview_impact_blend,
+                            invert_polarity=self.preview_impact_invert,
+                        )
+                    )
+                else:
+                    gpu.clear_impact_frame()
+
+                for i in range(n_ents):
+                    if not self.app.world.entities[i].alive:
+                        continue
+                    var e = Entity(UInt32(i), self.app.world.entities[i].generation)
+                    var mr_opt = self.app.world.get_ptr_mut[MeshRendererComponent](e)
+                    var mo_opt = self.app.world.get_ptr_mut[MaterialOverrideComponent](e)
+                    var st_opt = self.app.world.get_ptr[StudioStyleComponent](e)
+                    if not mr_opt or not mo_opt or not st_opt:
+                        continue
+                    ref mr = mr_opt.value()[unsafe_offset=0]
+                    ref mo = mo_opt.value()[unsafe_offset=0]
+                    ref st = st_opt.value()[unsafe_offset=0]
+
+                    var mat = AaaMaterial(base_color=mo.base_color, roughness=mo.roughness, metallic=mo.metallic)
+                    mat.emissive = mo.emissive
+                    mat.clearcoat = st.clearcoat
+                    mat.clearcoat_roughness = st.clearcoat_roughness
+
+                    if st.shading_mode == SHADING_NPR_CEL:
+                        var cel = AaaCelParams(
+                            sss_shadow_tint=st.cel_shadow_tint,
+                            rim_color=st.cel_rim_color,
+                            hair_halo_strength=st.cel_hair_halo,
+                            outline_width_px=st.cel_outline_width_px,
+                            outline_color=st.cel_outline_color,
+                        )
+                        if self.gpu_materials.entity_cel_mat_ids[i] < 0:
+                            self.gpu_materials.entity_cel_mat_ids[i] = gpu.add_cel_material(mat, cel)
+                        else:
+                            gpu.update_material(self.gpu_materials.entity_cel_mat_ids[i], mat)
+                            _ = gpu.update_cel_material(self.gpu_materials.entity_cel_mat_ids[i], cel)
+                        mo.enabled = False
+                        mr.material_id = max(0, self.gpu_materials.entity_cel_mat_ids[i])
+                    elif st.shading_mode == SHADING_STYLIZED_VFX:
+                        var vfx = AaaStylizedVfxParams.anime_flame(
+                            core_color=st.vfx_core_color,
+                            edge_color=st.vfx_edge_color,
+                            erosion=st.vfx_erosion,
+                            scroll_speed=st.vfx_scroll_speed,
+                        )
+                        if self.gpu_materials.entity_vfx_mat_ids[i] < 0:
+                            self.gpu_materials.entity_vfx_mat_ids[i] = gpu.add_vfx_material(mat, vfx)
+                        else:
+                            var vfx_mat = mat.copy()
+                            vfx_mat.alpha_cutoff = Float32(0.48)
+                            gpu.update_material(self.gpu_materials.entity_vfx_mat_ids[i], vfx_mat)
+                            _ = gpu.update_vfx_material(self.gpu_materials.entity_vfx_mat_ids[i], vfx)
+                        mo.enabled = False
+                        mr.material_id = max(0, self.gpu_materials.entity_vfx_mat_ids[i])
+                    else:
+                        if self.gpu_materials.entity_pbr_mat_ids[i] < 0:
+                            var ma = MaterialAsset(
+                                base_color=mo.base_color,
+                                roughness=mo.roughness,
+                                metallic=mo.metallic,
+                            )
+                            ma.emissive = mo.emissive
+                            ma.clearcoat = st.clearcoat
+                            ma.clearcoat_roughness = st.clearcoat_roughness
+                            self.gpu_materials.entity_pbr_mat_ids[i] = renderer.register_material(ma)
+                        var pbr_id = self.gpu_materials.entity_pbr_mat_ids[i]
+                        if pbr_id >= 0:
+                            mr.material_id = pbr_id
+                            mo.material_id = pbr_id
+                        mo.enabled = True
+                        if pbr_id >= 0 and st.clearcoat > Float32(0.0):
+                            gpu.update_material(pbr_id, mat)
+
+                    # Apply smear stretch to GlobalTransform for render extraction if active
+                    if st.smear_stretch != Float32(1.0):
+                        var gt_opt = self.app.world.get_ptr_mut[GlobalTransform](e)
+                        if gt_opt:
+                            var sm = compute_volume_preserving_smear_scale(st.smear_stretch)
+                            gt_opt.value()[unsafe_offset=0].matrix = gt_opt.value()[unsafe_offset=0].matrix.multiply(
+                                trs(Vec3(0.0, 0.0, 0.0), Quat(0.0, 0.0, 0.0, 1.0), sm)
+                            )
+
+        # 3. Emit Studio DockSpace + Hierarchy + Inspector + Gizmos into RenderPluginStateResource.ui_draw_list
+        var ui_copy = UiDrawList()
+        emit_studio_ui_draw_list(
+            ui_copy,
+            self,
+            font_slot,
+            font_copy,
+            screen_w,
+            screen_h,
+            gpu_ms=gpu_ms,
+            mounted_packs=mounted_packs,
+            mcp_clients=mcp_clients,
+            input=input,
+            dt=dt,
+        )
+        var rps_opt = self.app.resources.get_ptr_mut[RenderPluginStateResource]()
+        if rps_opt:
+            rps_opt.value()[unsafe_offset=0].ui_draw_list = ui_copy^
+
+        var rw_opt2 = self.app.resources.get_ptr_mut[RenderWorld]()
+        if rw_opt2:
+            rw_opt2.value()[unsafe_offset=0].cluster_lights.append(
+                AaaClusterLight.point(Vec3(-2.8, 3.8, -2.5), Vec3(18.0, 14.0, 10.0), Float32(14.0))
+            )
+            rw_opt2.value()[unsafe_offset=0].cluster_lights.append(
+                AaaClusterLight.point(Vec3(4.8, 4.2, 0.5), Vec3(8.0, 14.0, 24.0), Float32(14.0))
+            )
+
+    def render_editor_frame(
+        mut self,
+        screen_w: Int,
+        screen_h: Int,
+        gpu_ms: Float64 = 0.0,
+        mounted_packs: Int = 0,
+        mcp_clients: Int = 0,
+        input: InputState = InputState(),
+        dt: Float32 = 1.0 / 60.0,
+    ):
+        """Runs Edit/PIE update stages (`STAGE_PRE_UPDATE`..`STAGE_LAST` without fixed step in Edit mode)
+        so `RenderPlugin` extracts ECS entities + Studio UI and renders via `ScalableRenderer`."""
+        self._ensure_ground_plane()
+        self.app.schedule.run_stage(STAGE_PRE_UPDATE, self.app.world, self.app.resources, self.app.pool, self.app.commands)
+        self.app.world.flush_commands(self.app.commands)
+        self.app.schedule.run_stage(STAGE_UPDATE, self.app.world, self.app.resources, self.app.pool, self.app.commands)
+        self.app.world.flush_commands(self.app.commands)
+        self.app.schedule.run_stage(STAGE_POST_UPDATE, self.app.world, self.app.resources, self.app.pool, self.app.commands)
+        self.app.world.flush_commands(self.app.commands)
+
+        self._sync_studio_pre_render(screen_w, screen_h, gpu_ms, mounted_packs, mcp_clients, input, dt)
+
+        self.app.schedule.run_stage(STAGE_LAST, self.app.world, self.app.resources, self.app.pool, self.app.commands)
+        self.app.world.flush_commands(self.app.commands)
+
+        var res_ptr = Pointer[EngineApp, MutAnyOrigin](unsafe_from_address=Int(Pointer(to=self.app)))
+        var r_ptr = Pointer(to=res_ptr[unsafe_offset=0].resources)
+        for i in range(len(self.app.event_swap_hooks)):
+            var hook = self.app.event_swap_hooks[i]
+            hook(r_ptr)
+        self._sync_compat_view()
+
+    # ---- 1-Click Play-In-Editor (`PieSession` + `Scene` + `PhysicsWorld` + LZ4) ----
 
     def pie_play(mut self) -> Bool:
         if self.pie.mode == PIE_PLAYING:
@@ -1288,9 +3245,13 @@ struct FlintStudioState(Movable, Serializable):
         if self.pie.mode == PIE_PAUSED:
             self.pie.mode = PIE_PLAYING
             return True
+        self.pie.pre_play_hash = self.state_hash()
+        try:
+            self.scene.enter_pie(self.app.world)
+        except:
+            pass
         var w = BlobWriter()
         self.serialize(w)
-        self.pie.pre_play_hash = fnv64(w.data)
         self.pie.checkpoint_lz4 = pack_checkpoint_lz4(w)
         self.pie.ticks_simulated = 0
         self.pie.last_restore_verified = False
@@ -1311,34 +3272,33 @@ struct FlintStudioState(Movable, Serializable):
             if not self.pie_play():
                 return 0
             self.pie.mode = PIE_PAUSED
-        if (
-            self.selected_entity_id >= 0
-            and self.selected_entity_id < len(self.entities)
-            and self.entities[self.selected_entity_id].alive
-            and self.entities[self.selected_entity_id].anim_step_hz > Float32(0.0)
-        ):
-            self.stepped_clock.step_hz = self.entities[self.selected_entity_id].anim_step_hz
-        var done = self.step_physics_deterministic(ticks, dt)
+        if self.selected_entity_id >= 0 and self.is_alive_id(self.selected_entity_id):
+            var st_opt = self.app.world.get_ptr[StudioStyleComponent](self.resolve_entity(self.selected_entity_id))
+            if st_opt and st_opt.value()[unsafe_offset=0].anim_step_hz > Float32(0.0):
+                self.stepped_clock.step_hz = st_opt.value()[unsafe_offset=0].anim_step_hz
+        var done = self.step_simulation(ticks, dt)
         for _ in range(done):
             _ = self.stepped_clock.advance(dt)
         self.pie.ticks_simulated += done
         return done
 
     def pie_stop(mut self) raises -> Bool:
-        """Restores the exact pre-PIE world from the LZ4 checkpoint and verifies bit-for-bit `fnv64` equality."""
+        """Restores exact pre-PIE `World` + `PhysicsWorld` from LZ4 checkpoint and verifies `fnv64` equality."""
         if self.pie.mode == PIE_STOPPED or len(self.pie.checkpoint_lz4) == 0:
             self.pie.mode = PIE_STOPPED
             return False
         var reader = unpack_checkpoint_lz4(self.pie.checkpoint_lz4)
         self.deserialize(reader)
         self.pie.mode = PIE_STOPPED
+        self.scene.has_pie_snapshot = False
+        self.scene.pie_snapshot.clear()
         var restored_hash = self.state_hash()
         self.pie.last_restore_verified = restored_hash == self.pie.pre_play_hash
         if not self.pie.last_restore_verified:
             raise Error("PIE LZ4 world restore hash mismatch")
         return True
 
-    # ---- Analytical Scene Collider Raycast ----
+    # ---- `PhysicsWorld` + Static BVH Scene Raycast ----
 
     def raycast_scene(self, origin: Vec3, direction: Vec3, max_distance: Float32 = 1000.0) -> StudioRaycastHit:
         var best = StudioRaycastHit()
@@ -1348,111 +3308,128 @@ struct FlintStudioState(Movable, Serializable):
         var dir = direction * (Float32(1.0) / d_len)
         best.distance = max_distance
 
-        for i in range(len(self.entities)):
-            ref ent = self.entities[i]
-            if not ent.alive or not ent.visible or ent.collider_kind == COLLIDER_NONE:
-                continue
+        var phys_opt = self.app.resources.get_ptr[PhysicsWorld]()
+        var sync_opt = self.app.resources.get_ptr[PhysicsSyncStateResource]()
+        if phys_opt and sync_opt:
+            ref physics = phys_opt.value()[unsafe_offset=0]
+            ref sync = sync_opt.value()[unsafe_offset=0]
+            var hits = physics.raycast_all(origin, dir, max_distance, ignore_body_id=self._ground_body_id)
+            for hi in range(len(hits)):
+                ref h = hits[hi]
+                var ent_bits_opt = sync.body_to_entity.get(h.body_id)
+                if not ent_bits_opt:
+                    continue
+                var e = Entity.from_bits(ent_bits_opt.value())
+                if not self.app.world.is_alive(e):
+                    continue
+                var mr_opt = self.app.world.get_ptr[MeshRendererComponent](e)
+                if mr_opt and not mr_opt.value()[unsafe_offset=0].visible:
+                    continue
+                if h.distance < best.distance:
+                    best.hit = True
+                    best.entity_id = Int(e.index)
+                    best.distance = h.distance
+                    best.point = h.point
+                    best.normal = h.normal
+                break
 
-            if ent.collider_kind == COLLIDER_SPHERE:
-                var rad = max(Float32(0.01), ent.collider_half_extents.x * ent.scale.x)
-                var oc = origin - ent.translation
-                var b = oc.dot(dir)
-                var c = oc.dot(oc) - rad * rad
-                var disc = b * b - c
-                if disc >= Float32(0.0):
-                    var s = sqrt(disc)
-                    var t = -b - s
-                    if t < Float32(0.0):
-                        t = -b + s
-                    if t >= Float32(0.0) and t < best.distance:
+        # Also check attached static BVH8 mesh colliders
+        for i in range(len(self.app.world.entities)):
+            if not self.app.world.entities[i].alive:
+                continue
+            var e = Entity(UInt32(i), self.app.world.entities[i].generation)
+            var meta_opt = self.app.world.get_ptr[StudioEntityMetaComponent](e)
+            if not meta_opt:
+                continue
+            ref meta = meta_opt.value()[unsafe_offset=0]
+            if meta.collider_kind != COLLIDER_STATIC_MESH or meta.bvh_slot < 0 or meta.bvh_slot >= len(self.static_bvh_colliders):
+                continue
+            var mr_opt = self.app.world.get_ptr[MeshRendererComponent](e)
+            if mr_opt and not mr_opt.value()[unsafe_offset=0].visible:
+                continue
+            var w_pos = Vec3()
+            var w_rot = Quat()
+            var w_scl = Vec3(1.0, 1.0, 1.0)
+            var gt_opt = self.app.world.get_ptr[GlobalTransform](e)
+            if gt_opt:
+                w_pos = gt_opt.value()[unsafe_offset=0].translation
+                w_rot = gt_opt.value()[unsafe_offset=0].rotation
+                w_scl = gt_opt.value()[unsafe_offset=0].scale
+            var inv_q = w_rot.conjugate()
+            var inv_s = Vec3(
+                Float32(1.0) / max(Float32(1.0e-4), w_scl.x),
+                Float32(1.0) / max(Float32(1.0e-4), w_scl.y),
+                Float32(1.0) / max(Float32(1.0e-4), w_scl.z),
+            )
+            var loc_o_raw = inv_q.rotate(origin - w_pos)
+            var loc_o = Vec3(loc_o_raw.x * inv_s.x, loc_o_raw.y * inv_s.y, loc_o_raw.z * inv_s.z)
+            var loc_d_raw = inv_q.rotate(dir)
+            var loc_d_scaled = Vec3(loc_d_raw.x * inv_s.x, loc_d_raw.y * inv_s.y, loc_d_raw.z * inv_s.z)
+            var d_scale = loc_d_scaled.length()
+            if d_scale > Float32(1.0e-7):
+                var loc_d_u = loc_d_scaled * (Float32(1.0) / d_scale)
+                var bhit = self.static_bvh_colliders[meta.bvh_slot].raycast(loc_o, loc_d_u, best.distance * d_scale)
+                if bhit.hit:
+                    var world_t = bhit.t / d_scale
+                    if world_t >= Float32(0.0) and world_t < best.distance:
                         best.hit = True
                         best.entity_id = i
-                        best.distance = t
-                        best.point = origin + dir * t
-                        best.normal = (best.point - ent.translation).normalized()
-
-            elif ent.collider_kind == COLLIDER_BOX or ent.collider_kind == COLLIDER_CAPSULE:
-                var inv_q = ent.rotation.conjugate()
-                var loc_o = inv_q.rotate(origin - ent.translation)
-                var loc_d = inv_q.rotate(dir)
-                var he = Vec3(
-                    max(Float32(0.01), ent.collider_half_extents.x * ent.scale.x),
-                    max(Float32(0.01), ent.collider_half_extents.y * ent.scale.y),
-                    max(Float32(0.01), ent.collider_half_extents.z * ent.scale.z),
-                )
-                var tmin = Float32(0.0)
-                var tmax = best.distance
-                var hit_n = Vec3(0.0, 1.0, 0.0)
-                var ok = True
-
-                var o_arr = [loc_o.x, loc_o.y, loc_o.z]
-                var d_arr = [loc_d.x, loc_d.y, loc_d.z]
-                var h_arr = [he.x, he.y, he.z]
-                var n_axes = [Vec3(1.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0)]
-
-                for ax in range(3):
-                    if abs(d_arr[ax]) < Float32(1.0e-7):
-                        if o_arr[ax] < -h_arr[ax] or o_arr[ax] > h_arr[ax]:
-                            ok = False
-                            break
-                    else:
-                        var inv_d = Float32(1.0) / d_arr[ax]
-                        var t1 = (-h_arr[ax] - o_arr[ax]) * inv_d
-                        var t2 = (h_arr[ax] - o_arr[ax]) * inv_d
-                        var n_cand = -n_axes[ax] if d_arr[ax] > Float32(0.0) else n_axes[ax]
-                        if t1 > t2:
-                            var tmp = t1; t1 = t2; t2 = tmp
-                        if t1 > tmin:
-                            tmin = t1
-                            hit_n = n_cand
-                        if t2 < tmax:
-                            tmax = t2
-                        if tmin > tmax:
-                            ok = False
-                            break
-                if ok and tmin >= Float32(0.0) and tmin < best.distance:
-                    best.hit = True
-                    best.entity_id = i
-                    best.distance = tmin
-                    best.point = origin + dir * tmin
-                    best.normal = ent.rotation.rotate(hit_n).normalized()
-
-            elif ent.collider_kind == COLLIDER_STATIC_MESH and i < len(self.entity_bvh_slot):
-                var bslot = self.entity_bvh_slot[i]
-                if bslot >= 0 and bslot < len(self.static_bvh_colliders):
-                    var inv_q = ent.rotation.conjugate()
-                    var inv_s = Vec3(
-                        Float32(1.0) / max(Float32(1.0e-4), ent.scale.x),
-                        Float32(1.0) / max(Float32(1.0e-4), ent.scale.y),
-                        Float32(1.0) / max(Float32(1.0e-4), ent.scale.z),
-                    )
-                    var loc_o_raw = inv_q.rotate(origin - ent.translation)
-                    var loc_o = Vec3(loc_o_raw.x * inv_s.x, loc_o_raw.y * inv_s.y, loc_o_raw.z * inv_s.z)
-                    var loc_d_raw = inv_q.rotate(dir)
-                    var loc_d_scaled = Vec3(loc_d_raw.x * inv_s.x, loc_d_raw.y * inv_s.y, loc_d_raw.z * inv_s.z)
-                    var d_scale = loc_d_scaled.length()
-                    if d_scale > Float32(1.0e-7):
-                        var loc_d_u = loc_d_scaled * (Float32(1.0) / d_scale)
-                        var bhit = self.static_bvh_colliders[bslot].raycast(loc_o, loc_d_u, best.distance * d_scale)
-                        if bhit.hit:
-                            var world_t = bhit.t / d_scale
-                            if world_t >= Float32(0.0) and world_t < best.distance:
-                                best.hit = True
-                                best.entity_id = i
-                                best.distance = world_t
-                                best.point = origin + dir * world_t
-                                best.normal = ent.rotation.rotate(bhit.normal).normalized()
+                        best.distance = world_t
+                        best.point = origin + dir * world_t
+                        best.normal = w_rot.rotate(bhit.normal).normalized()
 
         if self.has_ground_plane and abs(dir.y) > Float32(1.0e-6):
             var tg = (self.ground_plane_y - origin.y) / dir.y
             if tg >= Float32(0.0) and tg < best.distance:
                 best.hit = True
-                best.entity_id = -2  # ground plane sentinel
+                best.entity_id = -2
                 best.distance = tg
                 best.point = origin + dir * tg
                 best.normal = Vec3(0.0, 1.0, 0.0)
 
         return best
+
+    def fill_render_instance_entity_maps(
+        self,
+        mut out_inst_to_entity: List[Int],
+        mut out_inst_to_bits: List[UInt64],
+    ):
+        """Populates `out_inst_to_entity` / `out_inst_to_bits` matching `FlintAaaVulkanRenderer.draw_instance`
+        and Tier-0 `_render_tier0_simd` filtering (`mesh_id >= 0 and mesh_id < mesh_count`, `max_instances`)."""
+        out_inst_to_entity.clear()
+        out_inst_to_bits.clear()
+        var rw_opt = self.app.resources.get_ptr[RenderWorld]()
+        if not rw_opt:
+            return
+        ref rw = rw_opt.value()[unsafe_offset=0]
+        var rend_opt = self.app.resources.get_ptr[ScalableRenderer]()
+        var mesh_count = -1
+        var max_inst = -1
+        if rend_opt and rend_opt.value()[unsafe_offset=0].uses_vulkan():
+            ref gpu = rend_opt.value()[unsafe_offset=0].gpu_slot[0]
+            mesh_count = len(gpu.geom.meshes)
+            max_inst = gpu.max_instances
+        elif rend_opt:
+            mesh_count = len(rend_opt.value()[unsafe_offset=0].cpu_meshes)
+        for i in range(len(rw.instances)):
+            if max_inst >= 0 and len(out_inst_to_entity) >= max_inst:
+                break
+            var mid = rw.instances[i].mesh_id
+            if mesh_count >= 0 and (mid < 0 or mid >= mesh_count):
+                continue
+            var bits = rw.instances[i].entity_id
+            var e = Entity.from_bits(bits)
+            out_inst_to_entity.append(Int(e.index))
+            out_inst_to_bits.append(bits)
+
+
+def fill_instance_entity_maps(
+    studio: FlintStudioState,
+    mut out_inst_to_entity: List[Int],
+    mut out_inst_to_bits: List[UInt64],
+):
+    """Shared helper populating compact GPU instance-to-entity maps for `VisBufferGpuPicker`."""
+    studio.fill_render_instance_entity_maps(out_inst_to_entity, out_inst_to_bits)
 
 
 # ============================================================================
@@ -1527,15 +3504,13 @@ def build_subd_material_orb(radius: Float32 = 0.88, levels: Int = 3) -> NativeMe
     var v6 = cage.add_vert(Vec3( s,  s, -s))
     var v7 = cage.add_vert(Vec3(-s,  s, -s))
 
-    # Outward-wound closed 6-quad manifold control cage
-    cage.add_quad(v0, v1, v2, v3)  # +Z
-    cage.add_quad(v5, v4, v7, v6)  # -Z
-    cage.add_quad(v1, v5, v6, v2)  # +X
-    cage.add_quad(v4, v0, v3, v7)  # -X
-    cage.add_quad(v3, v2, v6, v7)  # +Y
-    cage.add_quad(v4, v5, v1, v0)  # -Y
+    cage.add_quad(v0, v1, v2, v3)
+    cage.add_quad(v5, v4, v7, v6)
+    cage.add_quad(v1, v5, v6, v2)
+    cage.add_quad(v4, v0, v3, v7)
+    cage.add_quad(v3, v2, v6, v7)
+    cage.add_quad(v4, v5, v1, v0)
 
-    # Semi-sharp studio base-stand ring
     cage.set_edge_sharpness(v4, v5, Float32(2.2))
     cage.set_edge_sharpness(v5, v1, Float32(2.2))
     cage.set_edge_sharpness(v1, v0, Float32(2.2))
@@ -1635,7 +3610,6 @@ def _fmt_f32_2dp(v: Float32) -> String:
 
 
 def _quat_to_euler_deg(q_in: Quat) -> Vec3:
-    """Converts unit quaternion `q` to XYZ Euler angles in degrees `(pitch_x, yaw_y, roll_z)`."""
     var q = q_in.normalized()
     var rad_to_deg = Float32(180.0) / PI
     var sinr_cosp = Float32(2.0) * (q.w * q.x + q.y * q.z)
@@ -1652,7 +3626,6 @@ def _quat_to_euler_deg(q_in: Quat) -> Vec3:
 
 
 def _euler_deg_to_quat(deg: Vec3) -> Quat:
-    """Converts XYZ Euler angles in degrees `(pitch_x, yaw_y, roll_z)` to a normalized `Quat`."""
     var half_d2r = (PI / Float32(180.0)) * Float32(0.5)
     var cx = cos(deg.x * half_d2r)
     var sx = sin(deg.x * half_d2r)
@@ -1666,6 +3639,86 @@ def _euler_deg_to_quat(deg: Vec3) -> Quat:
         cx * cy * sz - sx * sy * cz,
         cx * cy * cz + sx * sy * sz,
     ).normalized()
+
+
+def _studio_hierarchy_row(
+    mut studio: FlintStudioState,
+    row: HierarchyRow,
+    ent_name: String,
+    row_w: Float32,
+    display_order: List[Int],
+) -> Tuple[Bool, Int]:
+    """Renders an indented collapsible hierarchy row with disclosure toggle, Ctrl/Shift selection,
+    and drag-and-drop reparenting source/target. Returns `(dropped_here, dropped_child_id)`."""
+    ref ui = studio.ui_ctx
+    var row_h = ui.theme.row_height
+    var wid = ui.widget_id("hier_row_" + String(row.entity_id))
+
+    if len(ui.scroll_stack) > 0:
+        var top_i = len(ui.box_stack) - 1
+        var cy = ui.box_stack[top_i].cursor_y
+        var sc = ui.scroll_stack[len(ui.scroll_stack) - 1]
+        if cy + row_h < sc.view_rect.y or cy > sc.view_rect.bottom():
+            ui.box_stack[top_i].cursor_y = cy + row_h + ui.box_stack[top_i].gap
+            ui.culled_items_this_frame += 1
+            return (False, -1)
+
+    var r = ui._alloc_item_rect(wid, row_w, row_h)
+    var indent = Float32(row.depth * 14)
+    var is_pri = studio.selected_entity_id == row.entity_id
+    var is_sel = studio.is_selected(row.entity_id)
+
+    var bg_col = UInt32(0)
+    if is_pri:
+        bg_col = ui.theme.accent
+    elif is_sel:
+        bg_col = pack_rgba8(48, 86, 138, 220)
+    elif (not ui._blocked_by_modal()) and r.contains(ui.mouse_x, ui.mouse_y):
+        bg_col = ui.theme.bg_widget_hover
+
+    if bg_col != 0:
+        ui.draw_list.add_rect(r.x, r.y, r.w, r.h, bg_col, 3.0)
+
+    var disc_x = r.x + indent + Float32(4.0)
+    var disc_r = _RectF(disc_x, r.y, Float32(16.0), r.h)
+    var hovered = (not ui._blocked_by_modal()) and r.contains(ui.mouse_x, ui.mouse_y)
+
+    if row.has_children:
+        var ax = disc_x + Float32(7.0)
+        var ay = r.center_y()
+        if row.expanded:
+            ui.draw_list.add_line(ax - Float32(4.0), ay - Float32(2.0), ax, ay + Float32(3.0), 1.6, ui.theme.text_primary)
+            ui.draw_list.add_line(ax, ay + Float32(3.0), ax + Float32(4.0), ay - Float32(2.0), 1.6, ui.theme.text_primary)
+        else:
+            ui.draw_list.add_line(ax - Float32(2.0), ay - Float32(4.0), ax + Float32(3.0), ay, 1.6, ui.theme.text_primary)
+            ui.draw_list.add_line(ax + Float32(3.0), ay, ax - Float32(2.0), ay + Float32(4.0), 1.6, ui.theme.text_primary)
+
+    if hovered and ui.mouse_pressed_l:
+        if row.has_children and disc_r.contains(ui.mouse_x, ui.mouse_y):
+            _ = studio.toggle_hierarchy_expanded(row.entity_id)
+        else:
+            studio.select_entity(
+                row.entity_id,
+                multi_select=ui.key_ctrl,
+                range_select=ui.key_shift,
+                visible_order=display_order,
+            )
+
+    var mark = "* " if is_pri else ("+ " if is_sel else "")
+    var txt_col = pack_rgba8(14, 18, 24, 255) if is_pri else ui.theme.text_primary
+    ui._draw_text(
+        mark + ent_name,
+        disc_x + Float32(16.0),
+        r.y + Float32(3.0),
+        ui.theme.font_size,
+        txt_col,
+    )
+
+    _ = ui.begin_drag_source("STUDIO_ENTITY", row.entity_id, ent_name)
+    var drop = ui.accept_drag_target("STUDIO_ENTITY")
+    if drop[0] and drop[1] != row.entity_id:
+        return (True, drop[1])
+    return (False, -1)
 
 
 def emit_studio_ui_draw_list(
@@ -1682,8 +3735,11 @@ def emit_studio_ui_draw_list(
     dt: Float32 = 1.0 / 60.0,
 ):
     """Builds the `Flint Studio v5` visual editor UI using `DockSpace` + `UiContext`
-    (`begin_dock_panel`, `tree_node`, `drag_float3`, `slider_float`, `checkbox`, `button`)
-    plus 3D viewport selection gizmos into `ui`."""
+    with multi-select, collapsible indented hierarchy tree + drag-and-drop reparenting,
+    centroid multi-select gizmos, and single/bulk `FieldVisitor` Inspector."""
+    studio._normalize_selection_from_primary()
+    studio._prune_selection()
+
     var sw = Float32(max(320, screen_w))
     var sh = Float32(max(240, screen_h))
 
@@ -1699,18 +3755,13 @@ def emit_studio_ui_draw_list(
     var vp_info = studio.dock.find_panel("SceneViewport")
     var vp = vp_info[3] if vp_info[0] >= 0 else RectF(Float32(240.0), Float32(54.0), sw - Float32(520.0), sh - Float32(190.0))
 
-    # 1. 3D Viewport Active Selection Gizmo (emitted directly to `ui` which uses `0xAARRGGBB` colors!)
-    if (
-        studio.selected_entity_id >= 0
-        and studio.selected_entity_id < len(studio.entities)
-        and studio.entities[studio.selected_entity_id].alive
-    ):
-        var wm = studio.world_matrix(studio.selected_entity_id)
-        var pivot = Vec3(wm.values[12], wm.values[13], wm.values[14])
+    # 1. 3D Viewport Active Selection Gizmo (centroid across multi-selected entities)
+    var giz_piv = studio.selection_gizmo_pivot()
+    if giz_piv[0]:
         ui.push_clip(Int(vp.x), Int(vp.y), Int(vp.right()), Int(vp.bottom()))
         emit_gizmo_draw_list(
             ui,
-            pivot,
+            giz_piv[1],
             studio.gizmo_mode,
             studio.active_gizmo_handle,
             vp.x,
@@ -1727,10 +3778,11 @@ def emit_studio_ui_draw_list(
 
     var mode_txt = "TRANSLATE [W]" if studio.gizmo_mode == GIZMO_MODE_TRANSLATE else ("ROTATE [E]" if studio.gizmo_mode == GIZMO_MODE_ROTATE else "SCALE [R]")
     var cam_txt = "FLY" if studio.camera_rig.mode == CAM_MODE_FREE_FLY else "ORBIT"
+    var sel_txt = "SEL:" + String(studio.selected_count())
     studio.ui_ctx.draw_list.add_rect(
         vp.x + Float32(10.0),
         vp.y + Float32(8.0),
-        Float32(292.0),
+        Float32(348.0),
         Float32(22.0),
         pack_rgba8(14, 20, 30, 210),
         4.0,
@@ -1738,7 +3790,7 @@ def emit_studio_ui_draw_list(
         studio.ui_ctx.theme.border,
     )
     studio.ui_ctx._draw_text(
-        "CAM:" + cam_txt + "  |  " + mode_txt,
+        "CAM:" + cam_txt + "  |  " + mode_txt + "  |  " + sel_txt,
         vp.x + Float32(18.0),
         vp.y + Float32(11.0),
         Float32(12.5),
@@ -1747,13 +3799,18 @@ def emit_studio_ui_draw_list(
 
     # 2. Top Command & 1-Click PIE Toolbar (`DockSpace` -> `"Toolbar"`)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Toolbar"):
-        studio.ui_ctx.begin_box("studio_toolbar_row", FlexStyle.row(gap=6.0, pad=0.0))
+        studio.ui_ctx.begin_box("studio_toolbar_row", FlexStyle.row(gap=5.0, pad=0.0))
+        var brand_st = FlexStyle.row(gap=0.0, pad=0.0)
+        brand_st.fixed_w = 122.0
+        brand_st.fixed_h = 22.0
+        studio.ui_ctx.begin_box("tb_brand_box", brand_st)
         studio.ui_ctx.label("FLINT STUDIO v5", pack_rgba8(255, 213, 79, 255))
-        if studio.ui_ctx.button("tb_move", "W Move", 78.0, 22.0):
+        studio.ui_ctx.end_box()
+        if studio.ui_ctx.button("tb_move", "W Move", 72.0, 22.0):
             studio.gizmo_mode = GIZMO_MODE_TRANSLATE
-        if studio.ui_ctx.button("tb_rot", "E Rotate", 84.0, 22.0):
+        if studio.ui_ctx.button("tb_rot", "E Rotate", 78.0, 22.0):
             studio.gizmo_mode = GIZMO_MODE_ROTATE
-        if studio.ui_ctx.button("tb_scl", "R Scale", 78.0, 22.0):
+        if studio.ui_ctx.button("tb_scl", "R Scale", 72.0, 22.0):
             studio.gizmo_mode = GIZMO_MODE_SCALE
 
         var is_play = studio.pie.mode == PIE_PLAYING
@@ -1762,7 +3819,7 @@ def emit_studio_ui_draw_list(
             if is_play
             else ("PIE RESUME [F5]" if studio.pie.mode == PIE_PAUSED else "1-CLICK PIE [F5]")
         )
-        if studio.ui_ctx.button("tb_pie", pie_lbl, 154.0, 22.0):
+        if studio.ui_ctx.button("tb_pie", pie_lbl, 144.0, 22.0):
             if studio.pie.mode == PIE_STOPPED:
                 _ = studio.pie_play()
             else:
@@ -1771,53 +3828,147 @@ def emit_studio_ui_draw_list(
                 except:
                     studio.pie.mode = PIE_STOPPED
 
-        if studio.ui_ctx.button("tb_undo", "Undo [Ctrl+Z]", 108.0, 22.0):
+        if studio.ui_ctx.button("tb_undo", "Undo [Ctrl+Z]", 102.0, 22.0):
             _ = studio.undo()
-        if studio.ui_ctx.button("tb_redo", "Redo [Ctrl+Y]", 108.0, 22.0):
+        if studio.ui_ctx.button("tb_redo", "Redo [Ctrl+Y]", 102.0, 22.0):
             _ = studio.redo()
-        if studio.ui_ctx.button("tb_save", "Save [Ctrl+S]", 104.0, 22.0):
+        if studio.ui_ctx.button("tb_save", "Save [Ctrl+S]", 98.0, 22.0):
             _ = studio.save_scene_file()
-        if studio.ui_ctx.button("tb_load", "Load [Ctrl+O]", 104.0, 22.0):
+        if studio.ui_ctx.button("tb_load", "Load [Ctrl+O]", 98.0, 22.0):
             _ = studio.load_scene_file()
         _ = studio.ui_ctx.checkbox("tb_snap", "Snap", studio.snap_enabled)
+        var stats_st = FlexStyle.row(gap=0.0, pad=0.0)
+        stats_st.fixed_w = 180.0
+        stats_st.fixed_h = 22.0
+        studio.ui_ctx.begin_box("tb_stats_box", stats_st)
         studio.ui_ctx.label(
             "U:" + String(len(studio.undo_stack)) + " R:" + String(len(studio.redo_stack)) + " | GPU " + _fmt_f32_2dp(Float32(gpu_ms)) + " ms",
             studio.ui_ctx.theme.text_muted,
         )
         studio.ui_ctx.end_box()
+        studio.ui_ctx.end_box()
         studio.ui_ctx.end_dock_panel()
 
-    # 3. Left Scene Hierarchy Outliner (`DockSpace` -> `"Hierarchy"`, `tree_node` + `begin_scroll_view`)
+    # 3. Left Scene Hierarchy Outliner (`DockSpace` -> `"Hierarchy"`, collapsible tree + multi-select + DnD reparent)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Hierarchy"):
         var h_info = studio.dock.find_panel("Hierarchy")
-        var h_h = max(Float32(80.0), h_info[3].h - Float32(14.0))
+        var panel_w = max(Float32(140.0), h_info[3].w - Float32(16.0))
+        studio.ui_ctx.begin_box("hier_actions", FlexStyle.row(gap=4.0, pad=0.0))
+        var half_bw = max(Float32(60.0), (panel_w - Float32(8.0)) * Float32(0.5))
+        if studio.ui_ctx.button("hier_unparent", "Unparent", half_bw, 20.0):
+            _ = studio.reparent_selected_to(-1, preserve_world_transform=True, record_undo=True)
+        if studio.ui_ctx.button("hier_parent_pri", "Parent->Pri", half_bw, 20.0):
+            if studio.selected_count() >= 2 and studio.selected_entity_id >= 0:
+                _ = studio.reparent_selected_to(studio.selected_entity_id, preserve_world_transform=True, record_undo=True)
+        studio.ui_ctx.end_box()
+
+        var h_h = max(Float32(80.0), h_info[3].h - Float32(42.0))
         studio.ui_ctx.begin_scroll_view("hierarchy_scroll", 0.0, h_h)
-        if studio.ui_ctx.tree_node("world_root", "StudioWorld (" + String(studio.live_entity_count()) + ")", default_open=True):
-            for i in range(len(studio.entities)):
-                if not studio.entities[i].alive:
-                    continue
-                var prefix = "* " if i == studio.selected_entity_id else "  "
-                var row_w = max(Float32(120.0), h_info[3].w - Float32(48.0))
-                if studio.ui_ctx.button("ent_sel_" + String(i), prefix + studio.entities[i].name, row_w, 22.0):
-                    studio.selected_entity_id = i
+        var root_open = studio.ui_ctx.tree_node("world_root", "StudioWorld (" + String(studio.live_entity_count()) + ")", default_open=True)
+        var root_drop = studio.ui_ctx.accept_drag_target("STUDIO_ENTITY")
+        var pending_reparent = False
+        var reparent_child = -1
+        var reparent_target = -1
+        if root_drop[0]:
+            pending_reparent = True
+            reparent_child = root_drop[1]
+            reparent_target = -1
+
+        if root_open:
+            var rows = studio.hierarchy_visible_rows()
+            var disp_order = List[Int](capacity=len(rows))
+            for ri in range(len(rows)):
+                disp_order.append(rows[ri].entity_id)
+            var row_w = max(Float32(120.0), h_info[3].w - Float32(48.0))
+            for ri in range(len(rows)):
+                var row = rows[ri]
+                var ename = studio.entities[row.entity_id].name if row.entity_id < len(studio.entities) else ("Entity_" + String(row.entity_id))
+                var res = _studio_hierarchy_row(studio, row, ename, row_w, disp_order)
+                if res[0]:
+                    pending_reparent = True
+                    reparent_child = res[1]
+                    reparent_target = row.entity_id
             studio.ui_ctx.tree_pop()
+
+        if pending_reparent and reparent_child >= 0:
+            if studio.is_selected(reparent_child) and studio.selected_count() > 1:
+                _ = studio.reparent_selected_to(reparent_target, preserve_world_transform=True, record_undo=True)
+            else:
+                _ = studio.reparent_entity(reparent_child, reparent_target, preserve_world_transform=True, record_undo=True)
+
         studio.ui_ctx.end_scroll_view()
         studio.ui_ctx.end_dock_panel()
 
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Outliner"):
         studio.ui_ctx.label("Live Entities: " + String(studio.live_entity_count()))
+        studio.ui_ctx.label("Selected: " + String(studio.selected_count()))
         studio.ui_ctx.label("State Hash: " + String(studio.state_hash()), studio.ui_ctx.theme.text_muted)
         studio.ui_ctx.end_dock_panel()
 
-    # 4. Right Inspector (`DockSpace` -> `"Inspector"`, `FieldVisitor` + `drag_float3` + `slider_float` + `checkbox`)
+    # 4. Right Inspector (`DockSpace` -> `"Inspector"`, single or bulk multi-select)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Inspector"):
         var i_info = studio.dock.find_panel("Inspector")
         var panel_w = max(Float32(180.0), i_info[3].w - Float32(16.0))
-        if (
-            studio.selected_entity_id >= 0
-            and studio.selected_entity_id < len(studio.entities)
-            and studio.entities[studio.selected_entity_id].alive
-        ):
+        var sel_cnt = studio.selected_count()
+        if sel_cnt > 1 and studio.selected_entity_id >= 0 and studio.is_alive_id(studio.selected_entity_id):
+            var pri_id = studio.selected_entity_id
+            var pri_view = studio.entities[pri_id].copy()
+            studio.ui_ctx.label(
+                "Multi-Select: " + String(sel_cnt) + " entities (Primary #" + String(pri_id) + ": " + pri_view.name + ")",
+                studio.ui_ctx.theme.accent,
+            )
+            var bulk_delta = Vec3()
+            var mat_w = max(Float32(160.0), panel_w - Float32(20.0))
+            if studio.ui_ctx.drag_float3("bulk_delta", "Move Delta", bulk_delta, speed=0.05, w=mat_w):
+                if not studio.ui_ctx.mouse_down_l:
+                    studio.ui_edit_seq += 1
+                _ = studio.bulk_translate_selected(bulk_delta, coalesce_key=studio.ui_edit_seq)
+
+            var b_col = pri_view.base_color
+            if studio.ui_ctx.drag_float3("bulk_col", "Bulk Albedo", b_col, speed=0.01, min_val=0.0, max_val=1.0, w=mat_w):
+                if not studio.ui_ctx.mouse_down_l:
+                    studio.ui_edit_seq += 1
+                var f_col = InspectedField("base_color", FIELD_COLOR_RGB)
+                f_col.v3_val = b_col
+                _ = studio.bulk_patch_field("base_color", f_col, coalesce_key=studio.ui_edit_seq)
+
+            var b_rgh = pri_view.roughness
+            if studio.ui_ctx.slider_float("bulk_rgh", "Bulk Rough", b_rgh, Float32(0.04), Float32(1.0), w=mat_w):
+                if not studio.ui_ctx.mouse_down_l:
+                    studio.ui_edit_seq += 1
+                var f_rgh = InspectedField("roughness", FIELD_F32)
+                f_rgh.f_val = b_rgh
+                _ = studio.bulk_patch_field("roughness", f_rgh, coalesce_key=studio.ui_edit_seq)
+
+            var b_met = pri_view.metallic
+            if studio.ui_ctx.slider_float("bulk_met", "Bulk Metal", b_met, Float32(0.0), Float32(1.0), w=mat_w):
+                if not studio.ui_ctx.mouse_down_l:
+                    studio.ui_edit_seq += 1
+                var f_met = InspectedField("metallic", FIELD_F32)
+                f_met.f_val = b_met
+                _ = studio.bulk_patch_field("metallic", f_met, coalesce_key=studio.ui_edit_seq)
+
+            var b_vis = pri_view.visible
+            if studio.ui_ctx.checkbox("bulk_vis", "Bulk Visible", b_vis):
+                var f_vis = InspectedField("visible", FIELD_BOOL)
+                f_vis.b_val = b_vis
+                _ = studio.bulk_patch_field("visible", f_vis)
+
+            studio.ui_ctx.begin_box("bulk_rep_row", FlexStyle.row(gap=6.0, pad=0.0))
+            var act_w = max(Float32(80.0), (panel_w - Float32(12.0)) * Float32(0.5))
+            if studio.ui_ctx.button("bulk_parent_pri", "Parent->Pri", act_w, 22.0):
+                _ = studio.reparent_selected_to(pri_id, preserve_world_transform=True, record_undo=True)
+            if studio.ui_ctx.button("bulk_unparent", "Unparent", act_w, 22.0):
+                _ = studio.reparent_selected_to(-1, preserve_world_transform=True, record_undo=True)
+            studio.ui_ctx.end_box()
+
+            studio.ui_ctx.begin_box("bulk_actions_row", FlexStyle.row(gap=6.0, pad=0.0))
+            if studio.ui_ctx.button("btn_dup_sel", "Dup Selected", act_w, 24.0):
+                _ = studio.duplicate_selected(record_undo=True)
+            if studio.ui_ctx.button("btn_del_sel", "Del Selected", act_w, 24.0):
+                _ = studio.despawn_selected(record_undo=True)
+            studio.ui_ctx.end_box()
+        elif studio.selected_entity_id >= 0 and studio.is_alive_id(studio.selected_entity_id):
             var eid = studio.selected_entity_id
             var vis = FieldVisitor()
             studio.entities[eid].inspect_fields(vis)
@@ -1830,6 +3981,17 @@ def emit_studio_ui_draw_list(
                 else ("Stylized VFX" if cur.shading_mode == SHADING_STYLIZED_VFX else "PBR")
             )
             studio.ui_ctx.label("Entity #" + String(eid) + ": " + cur.name, studio.ui_ctx.theme.accent)
+            var par_lbl = (
+                studio.entities[cur.parent_id].name
+                if (cur.parent_id >= 0 and cur.parent_id < len(studio.entities) and studio.entities[cur.parent_id].alive)
+                else "Root"
+            )
+            studio.ui_ctx.label("Parent: " + par_lbl, studio.ui_ctx.theme.text_muted)
+            if cur.parent_id >= 0:
+                if studio.ui_ctx.button("insp_unparent", "Unparent to Root", 136.0, 20.0):
+                    _ = studio.reparent_entity(eid, -1, preserve_world_transform=True, record_undo=True)
+                    cur = studio.entities[eid].copy()
+
             studio.ui_ctx.label(
                 "Shading: " + shd_lbl + "  |  Reflected Fields: " + String(len(vis.fields)),
                 studio.ui_ctx.theme.accent if cur.shading_mode != SHADING_PBR else studio.ui_ctx.theme.text_muted,
@@ -1956,7 +4118,7 @@ def emit_studio_ui_draw_list(
             for ai in range(show_n):
                 var entry_name = studio.asset_browser_entries[ai]
                 if studio.ui_ctx.button("ab_item_" + String(ai), entry_name, 148.0, 32.0):
-                    if entry_name.endswith(".flscene"):
+                    if entry_name.endswith(".flscn") or entry_name.endswith(".flscnb") or entry_name.endswith(".flscene"):
                         var fp = (
                             (studio.asset_browser_dir + "/" + entry_name)
                             if studio.asset_browser_dir.byte_length() > 0
@@ -1992,7 +4154,6 @@ def emit_studio_ui_draw_list(
 
     studio.ui_ctx.end_frame()
 
-    # Transfer `UiContext` GPU primitives to `ui` (unified `0xAARRGGBB` packing; apply SDF glyph gain)
     for i in range(len(studio.ui_ctx.draw_list.prims)):
         var p = studio.ui_ctx.draw_list.prims[i]
         if (p.header & 0xF) == PRIM_GLYPH and p.param0 < Float32(0.5):

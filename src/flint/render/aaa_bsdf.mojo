@@ -68,6 +68,8 @@ struct AaaMaterial(Copyable, Movable):
     var interior_parallax_enabled: Bool
     var road_wetness_mode: Bool
     var alpha_cutoff: Float32
+    var unlit: Bool
+    var two_sided_foliage: Bool
 
     def __init__(
         out self,
@@ -99,6 +101,8 @@ struct AaaMaterial(Copyable, Movable):
         self.interior_parallax_enabled = False
         self.road_wetness_mode = False
         self.alpha_cutoff = Float32(0.0)
+        self.unlit = False
+        self.two_sided_foliage = False
 
     @always_inline
     def is_alpha_masked(self) -> Bool:
@@ -117,14 +121,19 @@ struct AaaMaterial(Copyable, Movable):
         var sss_bit = AAA_MAT_SSS_BIT if self.subsurface_amount > Float32(0.001) else UInt32(0)
         var packed_tex = t_alb | (t_nrm << 8) | (t_orm << 16) | (t_det << 24) | int_bit | sss_bit
 
-        var abs_det_scale = max(Float32(0.001), abs(self.detail_uv_scale))
-        var encoded_det_scale = -abs_det_scale if (self.road_wetness_mode or self.detail_uv_scale < Float32(0.0)) else abs_det_scale
-        var abs_spec_fac = max(Float32(0.0), min(Float32(1.0), abs(self.specular_factor)))
+        var abs_det_scale = max(Float32(0.001), self.detail_uv_scale)
+        var encoded_det_scale = -abs_det_scale if self.road_wetness_mode else abs_det_scale
+        var abs_spec_fac = max(Float32(0.0), min(Float32(1.0), self.specular_factor))
         var encoded_spec_fac = (
             -max(Float32(1e-4), abs_spec_fac)
-            if (self.alpha_cutoff > Float32(0.01) or self.specular_factor < Float32(0.0))
+            if self.alpha_cutoff > Float32(0.01)
             else abs_spec_fac
         )
+
+        var abs_cc_r = max(Float32(0.04), min(Float32(1.0), self.clearcoat_roughness))
+        var encoded_cc_r = -abs_cc_r if self.two_sided_foliage else abs_cc_r
+        var abs_sh_r = max(Float32(0.05), self.sheen_roughness)
+        var encoded_sh_r = -abs_sh_r if self.unlit else abs_sh_r
 
         out.append(bitcast[DType.uint32](self.base_color.x))
         out.append(bitcast[DType.uint32](self.base_color.y))
@@ -133,7 +142,7 @@ struct AaaMaterial(Copyable, Movable):
         out.append(bitcast[DType.uint32](max(Float32(0.04), min(Float32(1.0), self.roughness))))
         out.append(bitcast[DType.uint32](max(Float32(0.0), min(Float32(1.0), self.metallic))))
         out.append(bitcast[DType.uint32](max(Float32(0.0), min(Float32(1.0), self.clearcoat))))
-        out.append(bitcast[DType.uint32](max(Float32(0.04), min(Float32(1.0), self.clearcoat_roughness))))
+        out.append(bitcast[DType.uint32](encoded_cc_r))
         out.append(bitcast[DType.uint32](self.emissive.x))
         out.append(bitcast[DType.uint32](self.emissive.y))
         out.append(bitcast[DType.uint32](self.emissive.z))
@@ -145,7 +154,7 @@ struct AaaMaterial(Copyable, Movable):
         out.append(bitcast[DType.uint32](self.sheen_color.x))
         out.append(bitcast[DType.uint32](self.sheen_color.y))
         out.append(bitcast[DType.uint32](self.sheen_color.z))
-        out.append(bitcast[DType.uint32](max(Float32(0.05), self.sheen_roughness)))
+        out.append(bitcast[DType.uint32](encoded_sh_r))
         out.append(bitcast[DType.uint32](self.subsurface_color.x * self.subsurface_amount))
         out.append(bitcast[DType.uint32](self.subsurface_color.y * self.subsurface_amount))
         out.append(bitcast[DType.uint32](self.subsurface_color.z * self.subsurface_amount))
@@ -259,6 +268,9 @@ def emit_direct_multilobe_bsdf(
     sss_b: UInt32,
     lut_a: UInt32,
     lut_b: UInt32,
+    enable_clearcoat: Bool = True,
+    enable_sheen: Bool = True,
+    enable_sss: Bool = True,
 ) -> Tuple[UInt32, UInt32, UInt32]:
     """SPIR-V direct sun illumination across GGX + Multi-Scatter + Clearcoat + Charlie Sheen + Burley Wrap SSS!"""
     var h = emit_vec3_normalize(s, s.fadd(vx, lx), s.fadd(vy, ly), s.fadd(vz, lz))
@@ -304,28 +316,36 @@ def emit_direct_multilobe_bsdf(
     var diff_g = s.fmul(kd_g, s.fmul(alb_g, inv_pi))
     var diff_b = s.fmul(kd_b, s.fmul(alb_b, inv_pi))
 
-    # 2. Estevez-Kulla Charlie Cloth Sheen Lobe
-    var inv_sr = s.fdiv(s.float(1.0), s.nmax(s.float(0.05), sheen_rough))
-    var sin2_h = s.nmax(s.float(1e-5), s.fsub(s.float(1.0), s.fmul(ndoth, ndoth)))
-    var d_charlie = s.fmul(
-        s.fmul(s.fadd(s.float(2.0), inv_sr), s.fpow(sin2_h, s.fmul(inv_sr, s.float(0.5)))),
-        s.float(0.15915494),
-    )
-    var sheen_v = s.fdiv(d_charlie, s.nmax(s.float(0.25), s.fmul(s.float(4.0), s.fsub(s.fadd(ndotl, ndotv), s.fmul(ndotl, ndotv)))))
-    var sh_r = s.fmul(sheen_r, sheen_v)
-    var sh_g = s.fmul(sheen_g, sheen_v)
-    var sh_b = s.fmul(sheen_b, sheen_v)
+    var base_r = s.fmul(s.fadd(diff_r, sr), ndotl)
+    var base_g = s.fmul(s.fadd(diff_g, sg), ndotl)
+    var base_b = s.fmul(s.fadd(diff_b, sb), ndotl)
 
-    var base_r = s.fmul(s.fadd(s.fadd(diff_r, sr), sh_r), ndotl)
-    var base_g = s.fmul(s.fadd(s.fadd(diff_g, sg), sh_g), ndotl)
-    var base_b = s.fmul(s.fadd(s.fadd(diff_b, sb), sh_b), ndotl)
+    # 2. Estevez-Kulla Charlie Cloth Sheen Lobe
+    if enable_sheen:
+        var inv_sr = s.fdiv(s.float(1.0), s.nmax(s.float(0.05), sheen_rough))
+        var sin2_h = s.nmax(s.float(1e-5), s.fsub(s.float(1.0), s.fmul(ndoth, ndoth)))
+        var d_charlie = s.fmul(
+            s.fmul(s.fadd(s.float(2.0), inv_sr), s.fpow(sin2_h, s.fmul(inv_sr, s.float(0.5)))),
+            s.float(0.15915494),
+        )
+        var sheen_v = s.fdiv(d_charlie, s.nmax(s.float(0.25), s.fmul(s.float(4.0), s.fsub(s.fadd(ndotl, ndotv), s.fmul(ndotl, ndotv)))))
+        var sh_r = s.fmul(sheen_r, sheen_v)
+        var sh_g = s.fmul(sheen_g, sheen_v)
+        var sh_b = s.fmul(sheen_b, sheen_v)
+        base_r = s.fma(sh_r, ndotl, base_r)
+        base_g = s.fma(sh_g, ndotl, base_g)
+        base_b = s.fma(sh_b, ndotl, base_b)
 
     # 3. Burley Wrap Subsurface Scattering (illuminates past terminator `NdotL + 0.45`)
-    var wrap_nl = s.nmax(s.float(0.0), s.fdiv(s.fadd(raw_ndotl, s.float(0.45)), s.float(1.45)))
-    var sss_lobe = s.fmul(wrap_nl, inv_pi)
-    base_r = s.fma(sss_r, sss_lobe, base_r)
-    base_g = s.fma(sss_g, sss_lobe, base_g)
-    base_b = s.fma(sss_b, sss_lobe, base_b)
+    if enable_sss:
+        var wrap_nl = s.nmax(s.float(0.0), s.fdiv(s.fadd(raw_ndotl, s.float(0.45)), s.float(1.45)))
+        var sss_lobe = s.fmul(wrap_nl, inv_pi)
+        base_r = s.fma(sss_r, sss_lobe, base_r)
+        base_g = s.fma(sss_g, sss_lobe, base_g)
+        base_b = s.fma(sss_b, sss_lobe, base_b)
+
+    if not enable_clearcoat:
+        return (base_r, base_g, base_b)
 
     # 4. Top Clearcoat Dielectric Layer (`F0 = 0.04`) + Substrate Energy Attenuation
     var cc_a = s.nmax(s.float(0.002), s.fmul(clearcoat_rough, clearcoat_rough))

@@ -5,10 +5,12 @@ state-hash gating, golden-frame perceptual FLIP verification with automatic Magm
 heatmap PNG export on failure, and `perf_history.mojo` CSV reporting.
 """
 from std.collections import List
+from std.sys import argv
 from flint.core.build_stamp import BUILD_COMMIT
 from flint.core.perf_history import PerfTable, parse_table
 from flint.assets.image import write_png
 from flint.platform.os import (
+    env_value,
     file_size,
     make_dirs,
     parent_directory,
@@ -17,6 +19,50 @@ from flint.platform.os import (
 )
 from flint.render.flip import flip_error_map, flip_heat_image, flip_mean
 from flint.render.image_diff import ImageDiff, compare_pixels, compare_with_png
+
+
+def _cli_flag_value(flag_name: String) -> String:
+    var args = argv()
+    var eq_prefix = flag_name + "="
+    var i = 1
+    while i < len(args):
+        var a = String(args[i])
+        if a == flag_name and i + 1 < len(args):
+            return String(args[i + 1])
+        if a.startswith(eq_prefix):
+            return String(a[byte=eq_prefix.byte_length():a.byte_length()])
+        i += 1
+    return String()
+
+
+def resolve_lab_csv_path(lab_slug: String) -> String:
+    var cli = _cli_flag_value("--csv")
+    if cli.byte_length() > 0:
+        return cli
+    var env_p = env_value("FLINT_PERF_CSV")
+    if env_p.byte_length() > 0:
+        return env_p
+    return "build/labs/lab_" + lab_slug + "_perf.csv"
+
+
+def resolve_lab_package(default_pkg: String = "v5-lab") -> String:
+    var cli = _cli_flag_value("--package")
+    if cli.byte_length() > 0:
+        return cli
+    var env_p = env_value("FLINT_PERF_PACKAGE")
+    if env_p.byte_length() > 0:
+        return env_p
+    return default_pkg
+
+
+def resolve_lab_date(default_date: String = "2026-11-20") -> String:
+    var cli = _cli_flag_value("--date")
+    if cli.byte_length() > 0:
+        return cli
+    var env_d = env_value("FLINT_PERF_DATE")
+    if env_d.byte_length() > 0:
+        return env_d
+    return default_date
 
 
 def _fmt_f64_3(val: Float64) -> String:
@@ -437,3 +483,12 @@ struct EngineBenchSuite(Movable):
         if dir_p.byte_length() > 0 and dir_p != ".":
             _ = make_dirs(dir_p)
         return write_bytes(csv_path, out_bytes)
+
+    def finish_and_export(self, lab_slug: String) -> Bool:
+        var passed = self.print_summary()
+        var csv_path = resolve_lab_csv_path(lab_slug)
+        var pkg = resolve_lab_package()
+        var date_s = resolve_lab_date()
+        var csv_ok = self.append_perf_history_csv(csv_path, pkg, date_s)
+        print("[lab_" + lab_slug + "] perf_csv ->", csv_path)
+        return passed and csv_ok

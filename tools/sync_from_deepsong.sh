@@ -66,60 +66,55 @@ FLINT_ENHANCED = {
     ("assets", "image.mojo"),
     ("assets", "jpeg.mojo"),
     ("assets", "model.mojo"),
-    ("assets", "vfs.mojo"),
     ("render", "font.mojo"),
     ("render", "fx_atlas.mojo"),
     ("render", "gpu_layout.mojo"),
-    ("render", "gpu_raster.mojo"),
     ("render", "grading.mojo"),
     ("render", "lighting.mojo"),
-    ("render", "rasterizer.mojo"),
     ("render", "spirv.mojo"),
-    ("render", "vulkan_shaders.mojo"),
 }
 
 MODULES = {
     "core": [
-        "anchor.mojo", "build_info.mojo", "check.mojo", "console.mojo", "crash.mojo",
-        "crc32.mojo", "cvars.mojo", "detmath.mojo", "detsort.mojo", "entity.mojo",
+        "anchor.mojo", "build_info.mojo", "console.mojo", "crash.mojo",
+        "cvars.mojo", "detmath.mojo", "detsort.mojo",
         "ik.mojo", "jobs.mojo", "log.mojo", "lz4.mojo", "math.mojo", "memory.mojo",
         "offset_allocator.mojo", "perf_history.mojo", "profiler.mojo", "replay.mojo",
-        "serial.mojo", "session_replay.mojo", "springs.mojo", "test_history.mojo",
+        "serial.mojo", "session_replay.mojo", "springs.mojo",
         "transform.mojo",
     ],
     "platform": [
-        "amd_isa.mojo", "amdgpu.mojo", "audio.mojo", "input.mojo", "narration.mojo",
+        "amd_isa.mojo", "amdgpu.mojo", "audio.mojo", "input.mojo",
         "os.mojo", "pulse.mojo", "vulkan.mojo", "wayland.mojo", "wayland_bridge.mojo",
     ],
     "assets": [
-        "asset_check.mojo", "clip_names.mojo", "cook.mojo", "cooked.mojo", "cooked_model.mojo",
-        "glb.mojo", "glb_native.mojo", "hot_reload.mojo", "image.mojo", "jpeg.mojo", "json.mojo",
-        "json_write.mojo", "manifest.mojo", "model.mojo", "vfs.mojo",
+        "glb.mojo", "glb_native.mojo", "image.mojo", "jpeg.mojo", "json.mojo",
+        "json_write.mojo", "manifest.mojo", "model.mojo",
     ],
     "text": [
-        "lettering.mojo", "line_break.mojo", "rich_text.mojo", "sdf_bake.mojo",
+        "line_break.mojo", "rich_text.mojo", "sdf_bake.mojo",
         "ttf.mojo", "utf8.mojo",
     ],
     "ui": [
-        "button_glyphs.mojo", "layout.mojo", "nine_slice.mojo", "widgets.mojo",
+        "button_glyphs.mojo", "layout.mojo", "nine_slice.mojo",
     ],
     "render": [
-        "debug_draw.mojo", "dither.mojo", "flip.mojo", "font.mojo", "frame_passes.mojo",
-        "fx_atlas.mojo", "gpu_layout.mojo", "gpu_raster.mojo", "gpu_skinning.mojo",
+        "debug_draw.mojo", "dither.mojo", "flip.mojo", "font.mojo",
+        "fx_atlas.mojo", "gpu_layout.mojo",
         "grading.mojo", "image_diff.mojo", "kernel.mojo", "lighting.mojo",
-        "livelink.mojo", "particle_atlas.mojo", "particle_layout.mojo",
-        "rasterizer.mojo", "spirv.mojo", "vulkan_shaders.mojo",
+        "particle_atlas.mojo", "particle_layout.mojo",
+        "spirv.mojo",
     ],
     "physics": [
         "broadphase.mojo", "density_table.mojo", "events.mojo", "forces.mojo",
-        "handling.mojo", "islands.mojo", "joints.mojo", "mass.mojo", "ropes.mojo",
+        "islands.mojo", "joints.mojo",
         "solver.mojo", "solver_bodies.mojo", "water.mojo", "wind.mojo",
-        "wind_mirror.mojo", "xpbd.mojo",
+        "xpbd.mojo",
     ],
     "anim": [
-        "animator.mojo", "cloth_proxy.mojo", "correctives.mojo", "graph.mojo",
+        "animator.mojo", "correctives.mojo", "graph.mojo",
         "helper_joints.mojo", "pose.mojo", "procedural.mojo", "ragdoll.mojo",
-        "skin_limb.mojo", "skinning.mojo", "spring_bones.mojo", "sync.mojo",
+        "skinning.mojo", "spring_bones.mojo", "sync.mojo",
     ],
 }
 
@@ -191,19 +186,6 @@ for pkg, files in MODULES.items():
             if "def dot(self," not in text:
                 text = text.replace(target, extra)
 
-        # Upgrade VFS pack magic & extensions to Flint defaults while preserving env overrides
-        if pkg == "assets" and fname == "vfs.mojo":
-            text = text.replace('PACK_PATH = "build/deepsong.sdpack"', 'PACK_PATH = "build/assets.flpk"')
-            text = text.replace('0x4B504453  # "SDPK"', '0x4B504C46  # "FLPK"')
-            text = text.replace('env_now("SD_COOKED")', 'env_now("FLINT_COOKED")')
-            text = text.replace('env_now("SD_PACK")', 'env_now("FLINT_PACK")')
-
-        if pkg == "assets" and fname == "asset_check.mojo":
-            text = text.replace("re-export with bash tools/run.sh assets ", "re-export asset ")
-
-        if pkg == "assets" and fname == "hot_reload.mojo":
-            text = text.replace("assets/deepsong/layers/layer5.json", "assets/layers/layer5.json")
-
         # Enrich Wayland evdev key table with full US-QWERTY punctuation & Flint window title
         if pkg == "platform" and fname == "wayland.mojo":
             text = text.replace('"SHARDDEPTH"', '"FLINT ENGINE"')
@@ -248,6 +230,40 @@ for pkg, files in MODULES.items():
 print(f"[Flint Sync] Synced and namespaced {copied} pure-Mojo modules into src/flint/ (protected {len(FLINT_ENHANCED)} Flint-enhanced modules).")
 PY
 fi
+
+# Verify all manifest entries in MODULES and FLINT_ENHANCED exist on disk under src/flint/
+python3 - "$ROOT/tools/sync_from_deepsong.sh" "$ROOT/src/flint" <<'PY'
+import ast
+import os
+import re
+import sys
+
+sync_path, dst_root = sys.argv[1], sys.argv[2]
+with open(sync_path, "r", encoding="utf-8") as fh:
+    src = fh.read()
+
+m_enh = re.search(r"FLINT_ENHANCED\s*=\s*(\{.*?\n\})", src, re.DOTALL)
+m_mod = re.search(r"MODULES\s*=\s*(\{.*?\n\})", src, re.DOTALL)
+if not m_enh or not m_mod:
+    print("[FAIL] Could not parse FLINT_ENHANCED or MODULES manifest in sync_from_deepsong.sh", file=sys.stderr)
+    sys.exit(1)
+
+enhanced = ast.literal_eval(m_enh.group(1))
+modules = ast.literal_eval(m_mod.group(1))
+missing = []
+for pkg, fname in sorted(enhanced):
+    if not os.path.isfile(os.path.join(dst_root, pkg, fname)):
+        missing.append(f"FLINT_ENHANCED: {pkg}/{fname}")
+for pkg, files in sorted(modules.items()):
+    for fname in files:
+        if not os.path.isfile(os.path.join(dst_root, pkg, fname)):
+            missing.append(f"MODULES: {pkg}/{fname}")
+
+if missing:
+    for item in missing:
+        print(f"[FAIL] Missing sync manifest entry on disk: {item}", file=sys.stderr)
+    sys.exit(1)
+PY
 
 # Zero-Game-Leak Gate: ensure zero gameplay.* or world.* imports exist anywhere in src/flint/
 if grep -rnE "^from (gameplay|world)(\.| )" "$ROOT/src/flint/"; then

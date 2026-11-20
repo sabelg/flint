@@ -7,7 +7,16 @@
 """
 from std.math import atan2, cos, exp, log, log2, max, min, sin, sqrt
 from flint.core.math import Vec3
-from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
+from flint.render.spirv import (
+    AaaSpirvModule,
+    IMAGE_FORMAT_UNKNOWN,
+    MODEL_FRAGMENT,
+    MODEL_GL_COMPUTE,
+    MODEL_VERTEX,
+    OP_STORE,
+    STORAGE_OUTPUT,
+    emit,
+)
 from flint.render.shader_dsl import (
     GpuF32,
     GpuU32,
@@ -34,6 +43,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_HISTORY,
     BIND_AAA_OIT_NODES,
     BIND_AAA_POST_SCRATCH,
+    BIND_AAA_SWAPCHAIN_IMG,
 )
 from flint.render.aaa_oit_volumetrics import AAA_OIT_REACTIVE_BASE_WORDS
 
@@ -1638,6 +1648,196 @@ def aaa_display_tonemap_shader() -> List[UInt32]:
     s.end_if()
 
     s.store_word(b_hist, s.iadd(out_ldr_off, dst_pix), s.load_u(packed_px))
+    return s.finish()
+
+
+def aaa_display_tonemap_direct_shader(swapchain_binding: Int = BIND_AAA_SWAPCHAIN_IMG) -> List[UInt32]:
+    """Direct-to-Swapchain Compute Display Output (`group = 8 x 8` writing `storage image2D` directly,
+    bypassing `buf_history[out_ldr_off..]` + `copy_to_image`). Push[2] is unused (`0`)."""
+    var s = AaaSpirvModule(
+        MODEL_GL_COMPUTE,
+        group_width=8,
+        group_height=8,
+        push_words=AAA_PUSH_WORDS,
+        enable_storage_image_without_format=True,
+    )
+    var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_hdr = s.buffer(BIND_AAA_HDR_OUT)
+    var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
+    var swap_img = s.storage_image_2d(swapchain_binding, format=IMAGE_FORMAT_UNKNOWN)
+
+    var dx = s.invocation_axis(0)
+    var dy = s.invocation_axis(1)
+    var dst_w = s.push_word(0)
+    var dst_h = s.push_word(1)
+    var disp_mode = s.push_word(3)
+    var has_bloom_mip = s.ine(s.push_word(4), s.uint(0))
+    var bm_w = s.push_word(5)
+    var bm_h = s.push_word(6)
+    var bm_off = s.push_word(7)
+    var grade_sat = s.push_float(8)
+    var grade_con = s.push_float(9)
+    s.return_if(s.logical_or(s.uge(dx, dst_w), s.uge(dy, dst_h)))
+
+    var f_dw = s.float_from_uint(dst_w)
+    var f_dh = s.float_from_uint(dst_h)
+    var uv_u = s.fdiv(s.fadd(s.float_from_uint(dx), s.float(0.5)), f_dw)
+    var uv_v = s.fdiv(s.fadd(s.float_from_uint(dy), s.float(0.5)), f_dh)
+
+    var dst_pix = s.iadd(s.imul(dy, dst_w), dx)
+    var h_base = s.imul(dst_pix, s.uint(8))
+    var base_r = s.load_float(b_hdr, h_base)
+    var base_g = s.load_float(b_hdr, s.iadd(h_base, s.uint(1)))
+    var base_b = s.load_float(b_hdr, s.iadd(h_base, s.uint(2)))
+    var fin_r = s.fvar(base_r)
+    var fin_g = s.fvar(base_g)
+    var fin_b = s.fvar(base_b)
+    _ = has_bloom_mip
+    _ = bm_w
+    _ = bm_h
+    _ = bm_off
+
+    var base_exp = s.load_float(b_globals, s.uint(47))
+    var auto_exp_on = s.ine(s.load_word(b_globals, s.uint(119)), s.uint(0))
+    var adapt_exp = s.load_float(b_post, s.uint(UInt32(AAA_POST_ADAPTED_EXP_WORD)))
+    var eff_exp = s.select_f(auto_exp_on, s.fmul(base_exp, adapt_exp), base_exp)
+
+    var vig_str = s.load_float(b_globals, s.uint(115))
+    var tan_x_v = s.load_float(b_globals, s.uint(39))
+    var tan_y_v = s.load_float(b_globals, s.uint(43))
+    var nx_v = s.fmul(s.fma(uv_u, s.float(2.0), s.float(-1.0)), tan_x_v)
+    var ny_v = s.fmul(s.fma(uv_v, s.float(2.0), s.float(-1.0)), tan_y_v)
+    var cos2_th = s.fdiv(s.float(1.0), s.fadd(s.float(1.0), s.fma(nx_v, nx_v, s.fmul(ny_v, ny_v))))
+    var cos4_th = s.fmul(cos2_th, cos2_th)
+    var vig_mul = s.fma(s.fsub(cos4_th, s.float(1.0)), vig_str, s.float(1.0))
+    var exposure = s.fmul(eff_exp, vig_mul)
+
+    var exp_r = s.fmul(s.load_f(fin_r), exposure)
+    var exp_g = s.fmul(s.load_f(fin_g), exposure)
+    var exp_b = s.fmul(s.load_f(fin_b), exposure)
+
+    var out_r = s.fvar(s.float(0.0))
+    var out_g = s.fvar(s.float(0.0))
+    var out_b = s.fvar(s.float(0.0))
+    s.begin_if(s.ieq(disp_mode, s.uint(AAA_DISPLAY_HDR10_PQ)))
+    var r2020 = s.fma(exp_r, s.float(0.627404), s.fma(exp_g, s.float(0.329283), s.fmul(exp_b, s.float(0.043313))))
+    var g2020 = s.fma(exp_r, s.float(0.069097), s.fma(exp_g, s.float(0.919540), s.fmul(exp_b, s.float(0.011362))))
+    var b2020 = s.fma(exp_r, s.float(0.016391), s.fma(exp_g, s.float(0.088013), s.fmul(exp_b, s.float(0.895595))))
+    s.store(out_r, _emit_st2084_pq_oetf(s, r2020))
+    s.store(out_g, _emit_st2084_pq_oetf(s, g2020))
+    s.store(out_b, _emit_st2084_pq_oetf(s, b2020))
+    s.begin_else()
+    var dr = s.fvar(s.float(0.0))
+    var dg = s.fvar(s.float(0.0))
+    var db = s.fvar(s.float(0.0))
+    s.begin_if(s.ieq(disp_mode, s.uint(AAA_DISPLAY_LINEAR_SRGB)))
+    s.store(dr, _emit_srgb_oetf(s, exp_r))
+    s.store(dg, _emit_srgb_oetf(s, exp_g))
+    s.store(db, _emit_srgb_oetf(s, exp_b))
+    s.begin_else()
+    var agx = _emit_agx_tonemap(s, exp_r, exp_g, exp_b)
+    s.store(dr, agx[0]); s.store(dg, agx[1]); s.store(db, agx[2])
+    s.end_if()
+    var graded = _emit_display_grade(s, s.load_f(dr), s.load_f(dg), s.load_f(db), grade_sat, grade_con)
+    s.store(out_r, s.nclamp(graded[0], s.float(0.0), s.float(1.0)))
+    s.store(out_g, s.nclamp(graded[1], s.float(0.0), s.float(1.0)))
+    s.store(out_b, s.nclamp(graded[2], s.float(0.0), s.float(1.0)))
+    s.end_if()
+
+    s.image_write(swap_img, s.uvec2(dx, dy), s.vec4(s.load_f(out_r), s.load_f(out_g), s.load_f(out_b), s.float(1.0)))
+    return s.finish()
+
+
+def aaa_display_present_vertex_shader() -> List[UInt32]:
+    """Fullscreen triangle vertex shader (`draw(3, 1)`) for direct `VK_KHR_dynamic_rendering` swapchain present."""
+    var s = AaaSpirvModule(MODEL_VERTEX, push_words=AAA_PUSH_WORDS)
+    var vid = s.vertex_index()
+    var is_v1 = s.ieq(vid, s.uint(1))
+    var is_v2 = s.ieq(vid, s.uint(2))
+    var cx = s.select_f(is_v1, s.float(3.0), s.float(-1.0))
+    var cy = s.select_f(is_v2, s.float(3.0), s.float(-1.0))
+    s.write_clip_position(cx, cy, s.float(0.0), s.float(1.0))
+    return s.finish()
+
+
+def aaa_display_present_fragment_shader() -> List[UInt32]:
+    """Fullscreen `VK_KHR_dynamic_rendering` fragment tonemapper directly into swapchain color attachment."""
+    var s = AaaSpirvModule(MODEL_FRAGMENT, push_words=AAA_PUSH_WORDS, early_depth=False)
+    var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_hdr = s.buffer(BIND_AAA_HDR_OUT)
+    var b_post = s.buffer(BIND_AAA_POST_SCRATCH)
+    var out_col = s.add_stage_io(STORAGE_OUTPUT, s.type_vec4, location=0, flat=False)
+
+    var fc = s.frag_coord()
+    var dst_w = s.push_word(0)
+    var dst_h = s.push_word(1)
+    var disp_mode = s.push_word(3)
+    var grade_sat = s.push_float(8)
+    var grade_con = s.push_float(9)
+    var is_srgb_rt = s.ine(s.push_word(10), s.uint(0))
+
+    var dx = s.umin(s.isub(dst_w, s.uint(1)), s.saturate_uint(s.ffloor(s.extract_f(fc, 0))))
+    var dy = s.umin(s.isub(dst_h, s.uint(1)), s.saturate_uint(s.ffloor(s.extract_f(fc, 1))))
+    var uv_u = s.fdiv(s.fadd(s.float_from_uint(dx), s.float(0.5)), s.float_from_uint(dst_w))
+    var uv_v = s.fdiv(s.fadd(s.float_from_uint(dy), s.float(0.5)), s.float_from_uint(dst_h))
+
+    var dst_pix = s.iadd(s.imul(dy, dst_w), dx)
+    var h_base = s.imul(dst_pix, s.uint(8))
+    var base_r = s.load_float(b_hdr, h_base)
+    var base_g = s.load_float(b_hdr, s.iadd(h_base, s.uint(1)))
+    var base_b = s.load_float(b_hdr, s.iadd(h_base, s.uint(2)))
+
+    var base_exp = s.load_float(b_globals, s.uint(47))
+    var auto_exp_on = s.ine(s.load_word(b_globals, s.uint(119)), s.uint(0))
+    var adapt_exp = s.load_float(b_post, s.uint(UInt32(AAA_POST_ADAPTED_EXP_WORD)))
+    var eff_exp = s.select_f(auto_exp_on, s.fmul(base_exp, adapt_exp), base_exp)
+
+    var vig_str = s.load_float(b_globals, s.uint(115))
+    var tan_x_v = s.load_float(b_globals, s.uint(39))
+    var tan_y_v = s.load_float(b_globals, s.uint(43))
+    var nx_v = s.fmul(s.fma(uv_u, s.float(2.0), s.float(-1.0)), tan_x_v)
+    var ny_v = s.fmul(s.fma(uv_v, s.float(2.0), s.float(-1.0)), tan_y_v)
+    var cos2_th = s.fdiv(s.float(1.0), s.fadd(s.float(1.0), s.fma(nx_v, nx_v, s.fmul(ny_v, ny_v))))
+    var cos4_th = s.fmul(cos2_th, cos2_th)
+    var vig_mul = s.fma(s.fsub(cos4_th, s.float(1.0)), vig_str, s.float(1.0))
+    var exposure = s.fmul(eff_exp, vig_mul)
+
+    var exp_r = s.fmul(base_r, exposure)
+    var exp_g = s.fmul(base_g, exposure)
+    var exp_b = s.fmul(base_b, exposure)
+
+    var out_r = s.fvar(s.float(0.0))
+    var out_g = s.fvar(s.float(0.0))
+    var out_b = s.fvar(s.float(0.0))
+    s.begin_if(s.ieq(disp_mode, s.uint(AAA_DISPLAY_HDR10_PQ)))
+    var r2020 = s.fma(exp_r, s.float(0.627404), s.fma(exp_g, s.float(0.329283), s.fmul(exp_b, s.float(0.043313))))
+    var g2020 = s.fma(exp_r, s.float(0.069097), s.fma(exp_g, s.float(0.919540), s.fmul(exp_b, s.float(0.011362))))
+    var b2020 = s.fma(exp_r, s.float(0.016391), s.fma(exp_g, s.float(0.088013), s.fmul(exp_b, s.float(0.895595))))
+    s.store(out_r, _emit_st2084_pq_oetf(s, r2020))
+    s.store(out_g, _emit_st2084_pq_oetf(s, g2020))
+    s.store(out_b, _emit_st2084_pq_oetf(s, b2020))
+    s.begin_else()
+    var dr = s.fvar(s.float(0.0))
+    var dg = s.fvar(s.float(0.0))
+    var db = s.fvar(s.float(0.0))
+    s.begin_if(s.ieq(disp_mode, s.uint(AAA_DISPLAY_LINEAR_SRGB)))
+    s.store(dr, _emit_srgb_oetf(s, exp_r))
+    s.store(dg, _emit_srgb_oetf(s, exp_g))
+    s.store(db, _emit_srgb_oetf(s, exp_b))
+    s.begin_else()
+    var agx = _emit_agx_tonemap(s, exp_r, exp_g, exp_b)
+    s.store(dr, agx[0]); s.store(dg, agx[1]); s.store(db, agx[2])
+    s.end_if()
+    var graded = _emit_display_grade(s, s.load_f(dr), s.load_f(dg), s.load_f(db), grade_sat, grade_con)
+    var cr = s.nclamp(graded[0], s.float(0.0), s.float(1.0))
+    var cg = s.nclamp(graded[1], s.float(0.0), s.float(1.0))
+    var cb = s.nclamp(graded[2], s.float(0.0), s.float(1.0))
+    s.store(out_r, s.select_f(is_srgb_rt, s.fpow(s.nmax(cr, s.float(1e-6)), s.float(2.2)), cr))
+    s.store(out_g, s.select_f(is_srgb_rt, s.fpow(s.nmax(cg, s.float(1e-6)), s.float(2.2)), cg))
+    s.store(out_b, s.select_f(is_srgb_rt, s.fpow(s.nmax(cb, s.float(1e-6)), s.float(2.2)), cb))
+    s.end_if()
+
+    emit(s.code, OP_STORE, out_col[1], s.vec4(s.load_f(out_r), s.load_f(out_g), s.load_f(out_b), s.float(1.0)))
     return s.finish()
 
 

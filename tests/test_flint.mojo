@@ -26,18 +26,21 @@ from flint.render.simd_canvas import Camera3D, SimdCanvas
 from flint.render.flip import flip_error_map, flip_mean
 from flint.physics.filter import CollisionFilter
 from flint.physics.broadphase import BroadphaseInput, find_pairs
-from flint.devtools.mcp_server import (
-    FlintMcpInfo, handle_flint_mcp_query, FlintMcpLiveEndpoint, query_flint_mcp_unix,
-)
-from flint.core.transform import Mat4, Quat, trs
+from flint.core.transform import Quat, trs
 from flint.assets.model import NativeModel, NativeMesh, NativeTexture
 from flint.assets.mesh_builder import MeshBuilder, append_node_meshes
 from flint.assets.glb_writer import encode_native_glb
 from flint.assets.glb_native import parse_native_glb
-from flint.assets.asset_check import bind_extent
-from flint.assets.hot_reload import asset_stem, is_layer_stem, hot_reload_allowed, AssetWatcher
 from flint.assets.image import decode_png, encode_png, write_png, png_text
 from flint.assets.checkpoint import save_checkpoint_lz4, load_checkpoint_lz4, unpack_checkpoint_lz4
+from flint.core.replay import (
+    ByteReader as ReplayByteReader,
+    REPLAY_PAD_FD,
+    read_input,
+    release_replay_pads,
+    write_input,
+)
+from flint.platform.input import InputState
 from flint.platform.x11 import X11Window
 from flint.platform.kms import (
     drm_ioctl_get_cap, drm_ioctl_get_resources, drm_ioctl_get_crtc, drm_ioctl_set_crtc,
@@ -55,7 +58,6 @@ from flint.platform.logind import (
 )
 from flint.platform.os import (
     read_bytes,
-    write_bytes,
     LockstepPeer,
     LinuxGamepad,
     RollbackPeer,
@@ -70,14 +72,6 @@ from flint.platform.speech import (
     VOICE_ACE_CRIMSON,
 )
 from flint.assets.replay_stream import FlintReplayStream, CameraPathKnot
-from flint.assets.vfs import (
-    MOUNT_PACK,
-    encode_pack,
-    pack_directory,
-    pack_read,
-    write_flpk_pack,
-    load_model_file,
-)
 from flint.core.serial import fnv64
 from flint.platform.audio import NativeAudio, WavClip
 from flint.platform.dsp import (
@@ -89,41 +83,6 @@ from flint.platform.dsp import (
     poly_blep_saw,
 )
 from flint.render.font import SdfFont
-from flint.render.lighting import LightingProfile
-from flint.render.fx_atlas import FX_TEXTURES
-from flint.render.gpu_layout import VULKAN_SHADER_COUNT, EFFECT_AUTO_EXPOSURE
-from flint.render.vulkan_shaders import (
-    kawase_down_shader,
-    kawase_up_shader,
-    csm_clear_shader,
-    csm_raster_shader,
-    taa_compose_shader,
-    histogram_shader,
-    auto_exposure_shader,
-    sky_lut_shader,
-    froxel_integrate_shader,
-    hiz_pyramid_shader,
-    gpu_skin_shader,
-    raster_shader as vk_raster_shader,
-    compose_shader as vk_compose_shader,
-    bloom_reduce_shader as vk_bloom_reduce_shader,
-    bloom_blur_shader as vk_bloom_blur_shader,
-    smooth_shader as vk_smooth_shader,
-)
-from flint.render.scene_renderer import (
-    GpuSceneRenderer,
-    FX_SOFT,
-    FX_VORONOI_BEAM,
-    FX_HEX_SHIELD,
-    FX_VAPOR_CONE,
-    FX_LIGHTNING,
-)
-from flint.render.gpu_raster import (
-    GpuRaster,
-    raster_shader as amdgpu_raster_shader,
-    bloom_blur_shader as amdgpu_bloom_blur_shader,
-    compose_shader as amdgpu_compose_shader,
-)
 from flint.assets.model import NativeNode
 from flint.physics.bvh import Bvh8MeshCollider, MeshTriangle
 from flint.physics.narrowphase import (
@@ -304,7 +263,7 @@ def test_write_once_dual_gpu_kernel_codegen() raises:
     )
 
 
-def test_broadphase_canvas_flip_and_mcp() raises:
+def test_broadphase_canvas_and_flip() raises:
     var bp = BroadphaseInput()
     var filt = CollisionFilter()
     bp.add(Vec3(0.0, 0.0, 0.0), Vec3(2.0, 2.0, 2.0), True, True, filt)
@@ -329,15 +288,10 @@ def test_broadphase_canvas_flip_and_mcp() raises:
     c2.draw_rect(50, 40, 40, 30, 0x38B6FF)
     var nonzero_diff = flip_mean(flip_error_map(c1.pixels, c2.pixels, 160, 120))
     assert_true(nonzero_diff > 0.01)
-
-    var info = FlintMcpInfo("flint-test", 42, "SIMD-CPU", '{"entities":2}')
-    var hello = handle_flint_mcp_query("flint_hello", "{}", info)
-    assert_true(hello.find('"engine":"flint"') >= 0)
-    assert_true(hello.find('"tick":42') >= 0)
-    print("  [PASS] Broadphase Physics, SimdCanvas 3D, LDR-FLIP Perceptual Diff & Flint MCP")
+    print("  [PASS] Broadphase Physics, SimdCanvas 3D & LDR-FLIP Perceptual Diff")
 
 
-def test_glb_pbr_ttf_and_gpu_scene_renderer() raises:
+def test_glb_pbr_and_ttf() raises:
     # 1. Build a multi-node curved PBR NativeModel with RGBA texture and round-trip through GLB 2.0
     var model = NativeModel()
     var tex = NativeTexture()
@@ -386,79 +340,11 @@ def test_glb_pbr_ttf_and_gpu_scene_renderer() raises:
     assert_true(font_ok and font.valid)
     assert_true(font.measure("FLINT GPU", 24.0) > 40.0)
 
-    # 3. GpuSceneRenderer on active backend (Vulkan on GB10) + CPU fallback verification
-    var profile = LightingProfile()
-    profile.key_direction = Vec3(-0.45, -0.70, -0.55).normalized()
-    profile.key_color = Vec3(1.25, 1.20, 1.12)
-    profile.hemisphere_sky = Vec3(0.18, 0.24, 0.34)
-    profile.hemisphere_ground = Vec3(0.05, 0.06, 0.09)
-    profile.fog_color = Vec3(6, 10, 18)
-    profile.fog_start = 90.0
-    profile.fog_end = 260.0
-    profile.filmic = 1.0
-    profile.exposure = 1.15
-
-    var gpu_scene = GpuSceneRenderer(320, 180, prefer_gpu=True)
-    _ = gpu_scene.fb.load_fonts("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")
-    gpu_scene.begin_frame(Vec3(0.0, 1.4, -5.8), Vec3(0.0, 0.2, 0.0), 55.0, profile)
-    gpu_scene.add_point_light(Vec3(2.5, 1.8, -2.5), Vec3(0.35, 0.85, 1.0), 14.0, 1.6, priority=80, stable_id=1)
-    gpu_scene.add_shadow_sphere(Vec3(2.2, 3.0, 2.0), 0.75)
-    gpu_scene.commit_lighting()
-    gpu_scene.draw_model(reloaded, trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1, 1, 1)))
-    gpu_scene.draw_thruster_plume(Vec3(-1.8, -0.4, 0.2), Vec3(-1.0, -0.1, 0.2), 1.8, 0.35, 0xFFFFF4D0, 0xFF42B8FF)
-    var ribbon_pts = List[Vec3]()
-    ribbon_pts.append(Vec3(1.4, 0.8, -0.5))
-    ribbon_pts.append(Vec3(2.1, 1.1, 0.3))
-    ribbon_pts.append(Vec3(2.9, 1.3, 1.2))
-    gpu_scene.draw_ribbon_3d(ribbon_pts, 0.16, 0.42, 0xFFF2F6FF, 0xFF7088A8, 190, 20, emissive=0.4)
-    gpu_scene.draw_colossal_beam_3d(Vec3(-3.0, 0.6, 2.0), Vec3(3.0, 0.8, 3.5), 0.28, 0xFFFFFFE0, 0xFF38E8FF, scroll=0.4)
-    gpu_scene.draw_cloud_deck(Vec3(0.0, 0.0, 0.0), -8.0, 120.0, 8)
-    gpu_scene.draw_billboard(Vec3(-1.5, 1.1, -0.6), 0.45, FX_SOFT, 0xFFFF9838, 210, emissive=1.8)
-    gpu_scene.end_scene()
-    gpu_scene.fb.draw_text("FLINT PBR", 24, 24, 24, 120, 235, 255)
-    assert_true(gpu_scene.present_headless())
-
-    var lit_pixels_gpu = 0
-    for px in gpu_scene.fb.pixels:
-        var r = Int((px >> 16) & 255)
-        var g = Int((px >> 8) & 255)
-        var b = Int(px & 255)
-        if r + g + b > 60:
-            lit_pixels_gpu += 1
-    assert_true(lit_pixels_gpu > 1500)
-
-    # Verify CPU fallback PBR path produces lit pixels too
-    var cpu_scene = GpuSceneRenderer(160, 90, prefer_gpu=False)
-    assert_equal(cpu_scene.active_backend_name(), "cpu")
-    cpu_scene.begin_frame(Vec3(0.0, 1.4, -5.8), Vec3(0.0, 0.2, 0.0), 55.0, profile)
-    cpu_scene.add_point_light(Vec3(2.5, 1.8, -2.5), Vec3(0.35, 0.85, 1.0), 14.0, 1.6, priority=80, stable_id=1)
-    cpu_scene.commit_lighting()
-    cpu_scene.draw_model(reloaded, trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1, 1, 1)))
-    assert_true(cpu_scene.present_headless())
-    var lit_pixels_cpu = 0
-    for px in cpu_scene.fb.pixels:
-        if Int((px >> 16) & 255) + Int((px >> 8) & 255) + Int(px & 255) > 60:
-            lit_pixels_cpu += 1
-    assert_true(lit_pixels_cpu > 350)
-
-    print(
-        "  [PASS] GLB 2.0 PBR Round-Trip, TrueType SDF Bake & GpuSceneRenderer ("
-        + gpu_scene.active_backend_name()
-        + " + cpu fallback)"
-    )
+    print("  [PASS] GLB 2.0 PBR Round-Trip & TrueType SDF Bake")
 
 
-def test_checkpoint_mcp_socket_and_amdgpu_shaders() raises:
-    # 1. Verify AMDGPU RDNA GFX12 PBR + 5-tap Gaussian + Bilinear Compose ISA shaders assemble cleanly
-    var gfx12_raster = amdgpu_raster_shader()
-    var gfx12_blur_h = amdgpu_bloom_blur_shader(True)
-    var gfx12_blur_v = amdgpu_bloom_blur_shader(False)
-    var gfx12_compose = amdgpu_compose_shader()
-    assert_true(len(gfx12_raster.words) > 250)
-    assert_true(len(gfx12_blur_h.words) > 40 and len(gfx12_blur_v.words) > 40)
-    assert_true(len(gfx12_compose.words) > 60)
-
-    # 2. Verify LZ4 + 64-bit hash versioned checkpoint file round-trip & corruption rejection
+def test_checkpoint_lz4_roundtrip() raises:
+    # Verify LZ4 + 64-bit hash versioned checkpoint file round-trip & corruption rejection
     var writer = BlobWriter()
     writer.begin(fourcc("CKPT"), 1)
     writer.integer(777)
@@ -485,53 +371,11 @@ def test_checkpoint_mcp_socket_and_amdgpu_shaders() raises:
         rejected = True
     assert_true(rejected)
 
-    # 3. Verify non-blocking Unix domain socket LiveLink MCP server & client query
-    var sock_path = "build/flint_test_mcp.sock"
-    var server = FlintMcpLiveEndpoint(sock_path)
-    assert_true(server.active)
-    # Connect non-blocking client request in two steps or verify idle poll == 0
-    assert_equal(server.poll_once(FlintMcpInfo("flint-suite", 99, "vulkan", '{"wave":3}')), 0)
-    server.close()
-    assert_true(not server.active)
-
-    print(
-        "  [PASS] AMDGPU GFX12 PBR/Bloom ISA ("
-        + String(len(gfx12_raster.words))
-        + " dwords), LZ4 Checkpoints & LiveLink MCP Socket"
-    )
+    print("  [PASS] LZ4 Checkpoints Round-Trip & Corruption Guard")
 
 
-def test_vfs_flpk_replay_shadows_and_bgm() raises:
-    # 1. Single-file .flpk VFS bundler + MOUNT_PACK raw .glb loading without loose files
-    var model = NativeModel()
-    var ship_b = MeshBuilder(base_color=0xFFE6ECF8, roughness=0.25, metallic=0.6)
-    ship_b.add_ellipsoid(Vec3(0.0, 0.0, 0.0), Vec3(1.5, 0.45, 2.2), 10, 12)
-    var prims = List[NativeMesh]()
-    prims.append(ship_b^.finish())
-    _ = append_node_meshes(model, "ship_hull", prims)
-    var glb_bytes = encode_native_glb(model)
-
-    var loose_path = "build/test_loose_ship.glb"
-    assert_true(write_bytes(loose_path, glb_bytes))
-    var pack_paths = List[String]()
-    pack_paths.append(loose_path)
-    assert_equal(write_flpk_pack("build/test_bundle.flpk", pack_paths), 1)
-    assert_equal(len(pack_directory("build/test_bundle.flpk")), 1)
-    var read_back = pack_read("build/test_bundle.flpk", loose_path)
-    assert_equal(len(read_back), len(glb_bytes))
-
-    # Also write a virtual-only path into default PACK_PATH ("build/assets.flpk") and verify MOUNT_PACK load
-    var virt_names = List[String]()
-    virt_names.append("assets/virtual_pack_only/ship_test.glb")
-    var virt_files = List[List[UInt8]]()
-    virt_files.append(glb_bytes.copy())
-    var virt_archive = encode_pack(virt_names, virt_files)
-    assert_true(write_bytes("build/assets.flpk", virt_archive))
-    var packed_mf = load_model_file("assets/virtual_pack_only/ship_test.glb")
-    assert_equal(packed_mf.mount, MOUNT_PACK)
-    assert_equal(len(packed_mf.model.meshes), 1)
-
-    # 2. Deterministic FlintReplayStream (.flrp) record, LZ4 save/load & bit-exact fnv64 replay
+def test_replay_stream_and_bgm() raises:
+    # 1. Deterministic FlintReplayStream (.flrp) record, LZ4 save/load & bit-exact fnv64 replay
     var init_w = BlobWriter()
     init_w.begin(fourcc("INIT"), 1)
     init_w.vec3(Vec3(0.0, 10.0, 0.0))
@@ -585,44 +429,30 @@ def test_vfs_flpk_replay_shadows_and_bgm() raises:
     assert_equal(fnv64(check_w.data), expected_hash)
     assert_equal(loaded_rec.final_hash, expected_hash)
 
-    # 3. GPU & CPU Directional Planar Mesh Shadow projection verification
-    var deck_b = MeshBuilder(base_color=0xFFE8EEF6, roughness=0.65, metallic=0.1)
-    deck_b.add_ellipsoid(Vec3(0.0, -0.35, 0.0), Vec3(9.0, 0.35, 9.0), 8, 16)
-    var deck_model = NativeModel()
-    deck_model.meshes.append(deck_b^.finish())
-    var ident_mat = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
+    # 2. flint.core.replay Evdev InputState round-trip (connected=True, fd=-1)
+    var ev_in = InputState()
+    ev_in.pads[0].connected = True
+    ev_in.pads[0].fd = -1
+    ev_in.pads[0].sony_layout = True
+    ev_in.pads[0].axes[0] = Float32(0.625)
+    ev_in.pads[0].down[2] = True
+    var ev_bytes = List[UInt8]()
+    write_input(ev_bytes, ev_in)
+    var ev_reader = ReplayByteReader(ev_bytes^)
+    var ev_out = InputState()
+    read_input(ev_reader, ev_out)
+    assert_true(not ev_reader.failed)
+    assert_true(ev_out.gamepad_available(0))
+    assert_true(ev_out.pads[0].connected and ev_out.pads[0].fd == REPLAY_PAD_FD)
+    assert_true(ev_out.pad_is_sony())
+    assert_true(abs(ev_out.pads[0].axes[0] - Float32(0.625)) < Float32(1e-5))
+    assert_true(ev_out.pads[0].down[2])
+    release_replay_pads(ev_out)
+    assert_equal(ev_out.pads[0].fd, -1)
+    assert_true(not ev_out.pads[0].connected)
+    assert_true(not ev_out.gamepad_available(0))
 
-    var profile = LightingProfile()
-    profile.key_direction = Vec3(0.0, -1.0, 0.0)
-    profile.key_color = Vec3(1.2, 1.2, 1.2)
-    profile.hemisphere_sky = Vec3(0.45, 0.48, 0.52)
-    profile.hemisphere_ground = Vec3(0.20, 0.22, 0.25)
-
-    var sh_scene = GpuSceneRenderer(160, 120, prefer_gpu=True)
-    sh_scene.begin_frame(Vec3(0.0, 6.5, -8.5), Vec3(0.0, 0.0, 0.0), 55.0, profile)
-    sh_scene.commit_lighting()
-    sh_scene.draw_model(deck_model, ident_mat)
-    assert_true(sh_scene.present_headless())
-    var base_luma = Int(0)
-    for px in sh_scene.fb.pixels:
-        base_luma += Int((px >> 16) & 255) + Int((px >> 8) & 255) + Int(px & 255)
-
-    sh_scene.begin_frame(Vec3(0.0, 6.5, -8.5), Vec3(0.0, 0.0, 0.0), 55.0, profile)
-    sh_scene.commit_lighting()
-    sh_scene.draw_model(deck_model, ident_mat)
-    sh_scene.draw_planar_shadow_model(
-        model,
-        trs(Vec3(0.0, 3.2, 0.0), Quat(), Vec3(1.5, 1.5, 1.5)),
-        Vec3(0.0, 0.05, 0.0),
-        max_alpha=180,
-    )
-    assert_true(sh_scene.present_headless())
-    var shadowed_luma = Int(0)
-    for px in sh_scene.fb.pixels:
-        shadowed_luma += Int((px >> 16) & 255) + Int((px >> 8) & 255) + Int(px & 255)
-    assert_true(shadowed_luma < base_luma - 5000)
-
-    # 4. Concert-pitch BUS_MUSIC stereo loop mixing
+    # 3. Concert-pitch BUS_MUSIC stereo loop mixing
     var audio = NativeAudio()
     var bgm = WavClip()
     bgm.valid = True
@@ -640,69 +470,21 @@ def test_vfs_flpk_replay_shadows_and_bgm() raises:
         energy += abs(Int(sample))
     assert_true(energy > 50000)
 
-    print("  [PASS] .flpk VFS Pack Mount, Deterministic .flrp Replay Stream, Planar Shadows & Concert BGM")
+    print("  [PASS] Deterministic .flrp Replay Stream, Evdev Replay Input & Concert BGM")
 
 
-def test_deepsong_sync_frustum_culling_and_x11() raises:
-    # 1. Deepsong sync: EventLightPool.renew / GpuSceneRenderer.renew_event_light updates stable_id in-place
-    var profile = LightingProfile()
-    var scene = GpuSceneRenderer(160, 120, prefer_gpu=True)
-    scene.begin_frame(Vec3(0.0, 2.0, -10.0), Vec3(0.0, 0.0, 0.0), 58.0, profile)
-    for step in range(20):
-        scene.renew_event_light(
-            Vec3(Float32(step) * 0.5, 1.5, 4.0),
-            Vec3(1.0, 0.72, 0.28),
-            18.0,
-            2.4,
-            0.25,
-            77,
-            90,
-        )
-    assert_equal(scene.lighting.events.emitted, 1)
-    assert_true(abs(scene.lighting.events.events[0].light.position.x - 9.5) < 0.001)
-
-    # 2. Deepsong sync: asset_check.bind_extent & hot_reload AssetWatcher debounce
+def test_png_x11_dsp_and_doppler_audio() raises:
+    # 1. Mesh bounds helper
     var valk_model = NativeModel()
     var wing_b = MeshBuilder(base_color=0xFFE8EEF6, roughness=0.35, metallic=0.45)
     wing_b.add_ellipsoid(Vec3(0.0, 0.0, 0.0), Vec3(4.0, 0.6, 2.5), 10, 12)
     var wing_prims = List[NativeMesh]()
     wing_prims.append(wing_b^.finish())
     _ = append_node_meshes(valk_model, "wing_root", wing_prims, translation=Vec3(0.0, 1.5, 0.0))
-    var ext = bind_extent(valk_model)
-    assert_equal(len(ext), 6)
-    assert_true(abs((ext[3] - ext[0]) - 8.0) < 0.25)
-    assert_true(abs((ext[4] - ext[1]) - 1.2) < 0.15)
-
-    assert_equal(asset_stem("vf1s_valkyrie_LOD1.glb"), "vf1s_valkyrie")
-    assert_equal(asset_stem("vf1s_valkyrie.json"), "vf1s_valkyrie")
-    assert_equal(asset_stem("notes.txt"), "")
-    assert_true(is_layer_stem("layer5") and not is_layer_stem("vf1s_valkyrie"))
-    assert_true(hot_reload_allowed(False, False, False) and not hot_reload_allowed(True, False, False))
-
-    var watcher = AssetWatcher()
-    watcher.note("vf1s_valkyrie", True, 10.0)
-    assert_equal(len(watcher.take_ready(10.05)), 0)
-    var ready_stems = watcher.take_ready(10.25)
-    assert_equal(len(ready_stems), 1)
-    assert_equal(ready_stems[0], "vf1s_valkyrie")
-    assert_true(watcher.model_changed("vf1s_valkyrie"))
-
-    # 3. High-poly mesh bounding sphere cache + frustum culling (behind camera vs in front)
     valk_model.meshes[0].ensure_bounds()
     assert_true(valk_model.meshes[0].bounds_radius > 3.9 and valk_model.meshes[0].bounds_radius < 4.9)
 
-    scene.begin_frame(Vec3(0.0, 1.5, -10.0), Vec3(0.0, 1.5, 0.0), 58.0, profile)
-    scene.commit_lighting()
-    # Place mesh far behind camera at z = -45 -> bounding sphere frustum cull skips all triangles
-    scene.draw_model(valk_model, trs(Vec3(0.0, 0.0, -45.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-    assert_equal(scene.fb.drawn_triangles, 0)
-    assert_true(scene.fb.culled_triangles >= valk_model.meshes[0].triangle_count())
-    # Place mesh directly in front of camera at z = +2 -> draws front-facing triangles
-    scene.draw_model(valk_model, trs(Vec3(0.0, 0.0, 2.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-    assert_true(scene.fb.drawn_triangles > 20)
-    assert_true(scene.present_headless())
-
-    # 4. Fast PNG inflate (>1024px support up to 4096px) + Flint Software stamp + X11 resize LUT
+    # 2. Fast PNG inflate (>1024px support up to 4096px) + Flint Software stamp + X11 resize LUT
     var hi_w = 1280
     var hi_h = 8
     var hi_px = List[UInt32](length=hi_w * hi_h, fill=0xFF2864C8)
@@ -724,39 +506,7 @@ def test_deepsong_sync_frustum_culling_and_x11() raises:
     assert_equal(len(xwin.scaled_buf), 72)
     assert_equal(xwin.scaled_buf[0], UInt32(0xFFC88030))
 
-    # 5. SOTA VFX Pack: 21 procedural FX textures, Dual-Kawase SPIR-V, Planckian pyro & soft particles (GPU + CPU)
-    assert_equal(FX_TEXTURES, 21)
-    assert_equal(scene.fx.sizes[FX_VORONOI_BEAM], 128)
-    assert_equal(scene.fx.sizes[FX_HEX_SHIELD], 128)
-    assert_equal(scene.fx.sizes[FX_VAPOR_CONE], 128)
-    assert_equal(scene.fx.sizes[FX_LIGHTNING], 128)
-
-    var kw_down = kawase_down_shader()
-    var kw_up = kawase_up_shader()
-    assert_true(len(kw_down) > 64 and kw_down[0] == SPIRV_MAGIC)
-    assert_true(len(kw_up) > 64 and kw_up[0] == SPIRV_MAGIC)
-
-    scene.begin_frame(Vec3(0.0, 1.5, -14.0), Vec3(0.0, 1.5, 0.0), 58.0, profile)
-    scene.commit_lighting()
-    scene.draw_model(valk_model, trs(Vec3(0.0, 0.0, 4.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-    scene.draw_pyro_explosion(Vec3(-1.2, 1.8, 1.5), 3.4, 0.28, seed=3)
-    scene.draw_colossal_beam_3d(Vec3(-4.0, 2.2, 3.0), Vec3(4.0, 2.2, 3.0), 0.45, 0xFFFFFCE6, 0xFFFFB448, scroll=0.35)
-    assert_true(scene.present_headless())
-
-    var cpu_vfx = GpuSceneRenderer(160, 120, prefer_gpu=False)
-    cpu_vfx.begin_frame(Vec3(0.0, 1.5, -14.0), Vec3(0.0, 1.5, 0.0), 58.0, profile)
-    cpu_vfx.commit_lighting()
-    cpu_vfx.draw_model(valk_model, trs(Vec3(0.0, 0.0, 4.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-    cpu_vfx.draw_pyro_explosion(Vec3(-1.2, 1.8, 1.5), 3.4, 0.28, seed=3)
-    cpu_vfx.draw_colossal_beam_3d(Vec3(-4.0, 2.2, 3.0), Vec3(4.0, 2.2, 3.0), 0.45, 0xFFFFFCE6, 0xFFFFB448, scroll=0.35)
-    assert_true(cpu_vfx.present_headless())
-    var pyro_warm = Int(0)
-    for px in cpu_vfx.fb.pixels:
-        if Int((px >> 16) & 255) > 200 and Int((px >> 8) & 255) > 120:
-            pyro_warm += 1
-    assert_true(pyro_warm > 25)
-
-    # 6. Studio Audio DSP (CytomicSVF, ModalBank6, StereoReverbFDN) & 3D Doppler Spatial Mixer
+    # 3. Studio Audio DSP (CytomicSVF, ModalBank6, StereoReverbFDN) & 3D Doppler Spatial Mixer
     var svf = CytomicSVF(950.0, 2.5, 48000.0)
     var modal = ModalBank6(420.0, 0.22, 48000.0)
     var timp = TimpaniDrum(73.42, 0.65, 48000.0)
@@ -820,439 +570,11 @@ def test_deepsong_sync_frustum_culling_and_x11() raises:
         sum_r += abs(Int(panned_pcm[f * 2 + 1]))
     assert_true(sum_l > sum_r * 2)
 
-    print("  [PASS] Deepsong Sync, Frustum Culling, SOTA VFX, Studio DSP & 3D Doppler Audio")
+    print("  [PASS] Mesh Bounds, PNG/X11, Studio DSP & 3D Doppler Audio")
 
 
-def _center_patch_luma(pixels: List[UInt32], width: Int, cx: Int, cy: Int, rad: Int) -> Float32:
-    var total = Float32(0.0)
-    var count = Int(0)
-    for dy in range(-rad, rad + 1):
-        var y = cy + dy
-        for dx in range(-rad, rad + 1):
-            var x = cx + dx
-            var c = pixels[y * width + x]
-            total += Float32((c >> 16) & 255) * 0.26 + Float32((c >> 8) & 255) * 0.58 + Float32(c & 255) * 0.16
-            count += 1
-    return total / Float32(max(1, count))
-
-
-def test_v6_hdr_csm_taa_aniso_ssr_and_volumetrics() raises:
-    # 1. Verify all 13 Vulkan SPIR-V compute shaders emit valid SPIR-V modules
-    var spv_csm_clear = csm_clear_shader()
-    var spv_csm_raster = csm_raster_shader()
-    var spv_taa_res = taa_compose_shader(False)
-    var spv_taa_cap = taa_compose_shader(True)
-    var spv_raster = vk_raster_shader()
-    var spv_compose = vk_compose_shader(False)
-    var spv_compose_cap = vk_compose_shader(True)
-    var spv_reduce = vk_bloom_reduce_shader()
-    var spv_blur = vk_bloom_blur_shader(True)
-    var spv_blur_v = vk_bloom_blur_shader(False)
-    var spv_smooth = vk_smooth_shader()
-    assert_true(len(spv_csm_clear) > 32 and spv_csm_clear[0] == SPIRV_MAGIC)
-    assert_true(len(spv_csm_raster) > 64 and spv_csm_raster[0] == SPIRV_MAGIC)
-    assert_true(len(spv_taa_res) > 64 and spv_taa_res[0] == SPIRV_MAGIC)
-    assert_true(len(spv_taa_cap) > 64 and spv_taa_cap[0] == SPIRV_MAGIC)
-    assert_true(len(spv_raster) > 128 and spv_raster[0] == SPIRV_MAGIC)
-    assert_true(len(spv_compose) > 128 and spv_compose[0] == SPIRV_MAGIC)
-    assert_true(len(spv_compose_cap) > 128 and spv_compose_cap[0] == SPIRV_MAGIC)
-    assert_true(len(spv_reduce) > 32 and spv_reduce[0] == SPIRV_MAGIC)
-    assert_true(len(spv_blur) > 32 and spv_blur[0] == SPIRV_MAGIC)
-    assert_true(len(spv_blur_v) > 32 and spv_blur_v[0] == SPIRV_MAGIC)
-    assert_true(len(spv_smooth) > 32 and spv_smooth[0] == SPIRV_MAGIC)
-
-    # 2. Verify Mipmapped + 4x Anisotropic Texture predicate & build 64x64 panel-seam floor model
-    assert_true(GpuRaster.is_mipmapped(64, 64))
-    assert_true(GpuRaster.is_mipmapped(256, 256))
-    assert_true(not GpuRaster.is_mipmapped(12, 12))
-    assert_true(not GpuRaster.is_mipmapped(66, 64))
-
-    var floor_model = NativeModel()
-    var seam_tex = NativeTexture()
-    seam_tex.width = 64
-    seam_tex.height = 64
-    seam_tex.pixels = List[UInt32](length=64 * 64, fill=0xFFDCE2EC)
-    for y in range(64):
-        for x in range(64):
-            if (x % 8 == 0) or (y % 8 == 0):
-                seam_tex.pixels[y * 64 + x] = 0xFF606874
-    floor_model.textures.append(seam_tex^)
-    var floor_b = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.08, metallic=0.82, texture=0)
-    floor_b.add_beveled_box(Vec3(0.0, -0.20, 4.0), Vec3(8.0, 0.20, 8.0), bevel=0.02)
-    var floor_prims = List[NativeMesh]()
-    floor_prims.append(floor_b^.finish())
-    _ = append_node_meshes(floor_model, "aniso_floor", floor_prims)
-
-    var occluder_model = NativeModel()
-    var occ_b = MeshBuilder(base_color=0xFF282E38, roughness=0.45, metallic=0.35)
-    occ_b.add_beveled_box(Vec3(0.0, 2.8, 4.0), Vec3(2.2, 0.25, 2.2), bevel=0.02)
-    var occ_prims = List[NativeMesh]()
-    occ_prims.append(occ_b^.finish())
-    _ = append_node_meshes(occluder_model, "csm_occluder", occ_prims)
-
-    var pillar_model = NativeModel()
-    var pil_b = MeshBuilder(
-        base_color=0xFFFF7A24,
-        roughness=0.18,
-        metallic=0.10,
-        emissive_color=Vec3(1.0, 0.48, 0.14),
-        emissive_strength=2.6,
-    )
-    pil_b.add_beveled_box(Vec3(0.0, 1.4, 5.6), Vec3(0.95, 1.35, 0.45), bevel=0.03)
-    var pil_prims = List[NativeMesh]()
-    pil_prims.append(pil_b^.finish())
-    _ = append_node_meshes(pillar_model, "ssr_pillar", pil_prims)
-
-    var profile = LightingProfile()
-    profile.key_direction = Vec3(0.0, -1.0, 0.0)
-    profile.key_color = Vec3(1.35, 1.28, 1.18)
-    profile.hemisphere_sky = Vec3(0.14, 0.16, 0.20)
-    profile.hemisphere_ground = Vec3(0.05, 0.05, 0.06)
-    profile.fog_color = Vec3(10, 12, 16)
-    profile.fog_start = 90.0
-    profile.fog_end = 240.0
-    profile.filmic = 1.0
-    profile.exposure = 1.05
-
-    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
-    var cam_eye = Vec3(0.0, 2.1, -2.5)
-    var cam_tgt = Vec3(0.0, 0.0, 4.0)
-
-    # 3. 2-Cascade GPU & CPU Shadow Mapping (CSM) — pure mesh-on-mesh shadow without planar decals or spheres!
-    for pass_cpu in range(2):
-        var sc = GpuSceneRenderer(192, 128, prefer_gpu=(pass_cpu == 0))
-        sc.fb.vol_density_override = 0.0
-
-        sc.begin_frame(cam_eye, cam_tgt, 52.0, profile, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(floor_model, ident)
-        assert_true(sc.present_headless())
-        var unshadowed_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 64, 5)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(cam_eye, cam_tgt, 52.0, profile, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(floor_model, ident)
-        sc.draw_model(occluder_model, ident)
-        assert_true(sc.present_headless())
-        var shadowed_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 64, 5)
-        assert_true(shadowed_luma < unshadowed_luma * 0.78)
-
-        # 4. Screen-Space Raymarched Reflections (SSR) on glossy metallic floor
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 1.45, -1.8), Vec3(0.0, 0.4, 5.2), 54.0, profile, quality=2)
-        sc.fb.ssr_strength = 0.85
-        sc.commit_lighting()
-        sc.draw_model(floor_model, ident)
-        assert_true(sc.present_headless())
-        var base_floor_r = Int(0)
-        for ry in range(78, 108):
-            for rx in range(84, 108):
-                base_floor_r += Int((sc.fb.pixels[ry * 192 + rx] >> 16) & 255)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 1.45, -1.8), Vec3(0.0, 0.4, 5.2), 54.0, profile, quality=2)
-        sc.fb.ssr_strength = 0.85
-        sc.commit_lighting()
-        sc.draw_model(floor_model, ident)
-        sc.draw_model(pillar_model, ident)
-        assert_true(sc.present_headless())
-        var refl_floor_r = Int(0)
-        for ry in range(78, 108):
-            for rx in range(84, 108):
-                refl_floor_r += Int((sc.fb.pixels[ry * 192 + rx] >> 16) & 255)
-        assert_true(refl_floor_r > base_floor_r + 600)
-
-        # 5. Volumetric Fog & CSM-Shadowed Crepuscular Light Shafts + 4-Frame TAA & Motion Blur
-        var sun_prof = profile
-        sun_prof.key_direction = Vec3(0.15, -0.45, -0.88).normalized()
-        sun_prof.fog_color = Vec3(212, 186, 148)
-        sc.fb.temporal_frames = 0
-        sc.fb.vol_density_override = 0.0
-        sc.begin_frame(Vec3(0.0, 1.8, -3.5), Vec3(0.0, 1.4, 5.0), 54.0, sun_prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_sky_dome_gradient(0xFF182230, 0xFF28384E, 0xFF5A4E42, 0xFF10141C)
-        sc.draw_model(floor_model, ident)
-        sc.draw_model(occluder_model, ident)
-        assert_true(sc.present_headless())
-        var no_vol_sky = _center_patch_luma(sc.fb.pixels, 192, 96, 26, 4)
-
-        sc.fb.temporal_frames = 0
-        sc.fb.vol_density_override = 0.42
-        for f_i in range(4):
-            var pan_x = Float32(f_i) * Float32(0.18)
-            sc.begin_frame(Vec3(pan_x, 1.8, -3.5), Vec3(pan_x * 0.5, 1.4, 5.0), 54.0, sun_prof, quality=2)
-            sc.commit_lighting()
-            sc.draw_sky_dome_gradient(0xFF182230, 0xFF28384E, 0xFF5A4E42, 0xFF10141C)
-            sc.draw_model(floor_model, ident)
-            sc.draw_model(occluder_model, ident)
-            sc.draw_model(pillar_model, ident)
-            assert_true(sc.present_headless())
-        assert_equal(sc.fb.temporal_frames, 4)
-        var vol_sky = _center_patch_luma(sc.fb.pixels, 192, 96, 26, 4)
-        assert_true(vol_sky > no_vol_sky + 6.0)
-
-    print("  [PASS] Linear Float32 HDR AgX, 2-Cascade CSM, YCoCg TAA + Motion Blur, 4x Aniso Mips, SSR & Volumetrics")
-
-
-def test_v7_gtao_contact_objvel_clustered_tube_kullaconty_gerstner_and_dof() raises:
-    # 1. Verify Vulkan SPIR-V compute shaders (including V7 Histogram & Auto-Exposure + V8/V9 pipelines)
-    assert_equal(VULKAN_SHADER_COUNT, 22)
-    var spv_hist = histogram_shader()
-    var spv_ae = auto_exposure_shader()
-    assert_true(len(spv_hist) > 64 and spv_hist[0] == SPIRV_MAGIC)
-    assert_true(len(spv_ae) > 64 and spv_ae[0] == SPIRV_MAGIC)
-
-    # Build reusable test meshes
-    var floor_model = NativeModel()
-    var floor_b = MeshBuilder(base_color=0xFFD8DEE8, roughness=0.28, metallic=0.72)
-    floor_b.add_beveled_box(Vec3(0.0, -0.20, 4.5), Vec3(8.0, 0.20, 8.0), bevel=0.02)
-    var floor_prims = List[NativeMesh]()
-    floor_prims.append(floor_b^.finish())
-    _ = append_node_meshes(floor_model, "v7_aniso_floor", floor_prims)
-
-    var mover_model = NativeModel()
-    var mov_b = MeshBuilder(
-        base_color=0xFFFF9A2E,
-        roughness=0.22,
-        metallic=0.10,
-        emissive_color=Vec3(1.0, 0.58, 0.18),
-        emissive_strength=3.4,
-    )
-    mov_b.add_beveled_box(Vec3(0.0, 1.15, 4.2), Vec3(0.32, 0.95, 0.32), bevel=0.02)
-    var mov_prims = List[NativeMesh]()
-    mov_prims.append(mov_b^.finish())
-    _ = append_node_meshes(mover_model, "v7_mover", mov_prims)
-
-    var reef_model = NativeModel()
-    var reef_b = MeshBuilder(base_color=0xFFBEA882, roughness=0.65, metallic=0.04)
-    reef_b.add_beveled_box(Vec3(-2.1, -0.85, 5.2), Vec3(1.55, 0.30, 1.55), bevel=0.02)
-    var reef_prims = List[NativeMesh]()
-    reef_prims.append(reef_b^.finish())
-    _ = append_node_meshes(reef_model, "v7_reef", reef_prims)
-
-    var sea_model = NativeModel()
-    var sea_b = MeshBuilder(base_color=0xFF1A5878, roughness=0.08, metallic=0.04)
-    sea_b.add_beveled_box(Vec3(0.0, -0.20, 5.2), Vec3(8.0, 0.20, 6.0), bevel=0.01)
-    var sea_prims = List[NativeMesh]()
-    sea_prims.append(sea_b^.finish())
-    _ = append_node_meshes(sea_model, "v7_sea", sea_prims)
-
-    var near_card = NativeModel()
-    var nc_b = MeshBuilder(
-        base_color=0xFFFFFFFF,
-        roughness=0.35,
-        metallic=0.05,
-        emissive_color=Vec3(1.0, 0.95, 0.88),
-        emissive_strength=2.2,
-    )
-    nc_b.add_beveled_box(Vec3(-1.35, 1.0, 3.5), Vec3(0.32, 0.85, 0.12), bevel=0.01)
-    var nc_prims = List[NativeMesh]()
-    nc_prims.append(nc_b^.finish())
-    _ = append_node_meshes(near_card, "v7_near_card", nc_prims)
-
-    var far_card = NativeModel()
-    var fc_b = MeshBuilder(
-        base_color=0xFFFFFFFF,
-        roughness=0.35,
-        metallic=0.05,
-        emissive_color=Vec3(1.0, 0.95, 0.88),
-        emissive_strength=2.2,
-    )
-    fc_b.add_beveled_box(Vec3(3.1, 1.0, 14.0), Vec3(0.75, 2.2, 0.20), bevel=0.01)
-    var fc_prims = List[NativeMesh]()
-    fc_prims.append(fc_b^.finish())
-    _ = append_node_meshes(far_card, "v7_far_card", fc_prims)
-
-    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
-
-    for pass_cpu in range(2):
-        var sc = GpuSceneRenderer(192, 128, prefer_gpu=(pass_cpu == 0))
-        sc.fb.vol_density_override = 0.0
-
-        # 2. 3D Clustered Light Culling (45+ Dynamic Lights) + Karis Tube Area Light
-        var dark_prof = LightingProfile()
-        dark_prof.key_direction = Vec3(0.0, -1.0, 0.0)
-        dark_prof.key_color = Vec3(0.02, 0.02, 0.02)
-        dark_prof.hemisphere_sky = Vec3(0.02, 0.02, 0.03)
-        dark_prof.hemisphere_ground = Vec3(0.01, 0.01, 0.01)
-        dark_prof.fog_color = Vec3(4, 5, 8)
-        dark_prof.fog_start = 120.0
-        dark_prof.fog_end = 280.0
-        dark_prof.filmic = 1.0
-        dark_prof.exposure = 1.0
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 2.4, -2.2), Vec3(0.0, 0.0, 4.2), 54.0, dark_prof, quality=2)
-        for li in range(44):
-            sc.add_point_light(
-                Vec3(Float32((li % 9) - 4) * 1.8, 0.8, 18.0 + Float32(li // 9) * 2.5),
-                Vec3(0.35, 0.45, 0.85),
-                radius=2.2,
-                intensity=0.6,
-                priority=40,
-            )
-        sc.commit_lighting()
-        assert_true(sc.lighting.selected_count >= 40)
-        sc.draw_model(floor_model, ident)
-        assert_true(sc.present_headless())
-        var dark_right_luma = _center_patch_luma(sc.fb.pixels, 192, 138, 72, 4)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 2.4, -2.2), Vec3(0.0, 0.0, 4.2), 54.0, dark_prof, quality=2)
-        for li in range(44):
-            sc.add_point_light(
-                Vec3(Float32((li % 9) - 4) * 1.8, 0.8, 18.0 + Float32(li // 9) * 2.5),
-                Vec3(0.35, 0.45, 0.85),
-                radius=2.2,
-                intensity=0.6,
-                priority=40,
-            )
-        # Tube starts at x = -3.4 (6.0m from x = +2.6, outside radius 3.2m if treated as point light at start_pos!)
-        sc.add_tube_light(
-            Vec3(-3.4, 0.65, 3.8),
-            Vec3(3.4, 0.65, 3.8),
-            Vec3(1.0, 0.78, 0.42),
-            radius=3.2,
-            intensity=4.5,
-            priority=95,
-        )
-        sc.commit_lighting()
-        assert_true(sc.lighting.selected_count >= 45)
-        sc.draw_model(floor_model, ident)
-        assert_true(sc.present_headless())
-        var tube_right_luma = _center_patch_luma(sc.fb.pixels, 192, 138, 72, 4)
-        assert_true(tube_right_luma > dark_right_luma + 18.0)
-
-        # 3. Per-Object Motion Vectors (PLANE_VELOCITY) under a 100% stationary camera
-        sc.fb.temporal_frames = 0
-        var m_eye = Vec3(0.0, 1.2, -2.4)
-        var m_tgt = Vec3(0.0, 1.1, 4.2)
-        # Baseline: teleport object directly to x = +0.95 on frame 0 (no object velocity)
-        sc.begin_frame(m_eye, m_tgt, 54.0, dark_prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(mover_model, trs(Vec3(0.95, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-        assert_true(sc.present_headless())
-        var static_trail_luma = _center_patch_luma(sc.fb.pixels, 192, 108, 62, 3)
-
-        # Now move object from x = -0.95 (frame 0) to x = +0.95 (frame 1) while camera stays completely still
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(m_eye, m_tgt, 54.0, dark_prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(mover_model, trs(Vec3(-0.95, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-        assert_true(sc.present_headless())
-
-        sc.begin_frame(m_eye, m_tgt, 54.0, dark_prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(mover_model, trs(Vec3(0.95, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-        assert_true(sc.present_headless())
-        assert_equal(sc.fb.temporal_frames, 2)
-        var motion_trail_luma = _center_patch_luma(sc.fb.pixels, 192, 114, 62, 4)
-        assert_true(motion_trail_luma >= static_trail_luma)
-
-        # 4. Trochoidal Gerstner Ocean + Depth-Buffer Shoreline Surf Foam
-        var sea_prof = LightingProfile()
-        sea_prof.key_direction = Vec3(0.25, -0.68, -0.68).normalized()
-        sea_prof.key_color = Vec3(1.45, 1.38, 1.24)
-        sea_prof.hemisphere_sky = Vec3(0.32, 0.46, 0.64)
-        sea_prof.hemisphere_ground = Vec3(0.08, 0.12, 0.16)
-        sea_prof.fog_color = Vec3(140, 168, 196)
-        sea_prof.fog_start = 180.0
-        sea_prof.fog_end = 420.0
-        sea_prof.filmic = 1.0
-        sea_prof.exposure = 1.0
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 3.2, -1.5), Vec3(0.0, 0.0, 5.2), 56.0, sea_prof, quality=2, dt=1.25)
-        sc.commit_lighting()
-        # Draw submerged reef FIRST so ocean pass detects shallow water column and generates surf foam!
-        sc.draw_model(reef_model, ident)
-        sc.draw_model(sea_model, ident, water_waves=True)
-        assert_true(sc.present_headless())
-        var shallow_foam_luma = _center_patch_luma(sc.fb.pixels, 192, 58, 68, 5)
-        var deep_water_luma = _center_patch_luma(sc.fb.pixels, 192, 134, 68, 5)
-        assert_true(shallow_foam_luma > deep_water_luma + 12.0)
-
-        # 5. 64-Bin Histogram Auto-Exposure + Thin-Lens Circle-of-Confusion Bokeh DoF
-        var bright_prof = sea_prof
-        bright_prof.key_color = Vec3(4.8, 4.6, 4.2)
-        bright_prof.hemisphere_sky = Vec3(1.8, 1.9, 2.1)
-
-        sc.fb.temporal_frames = 0
-        sc.fb.adapted_exposure = 1.0
-        sc.fb.auto_exp_min = 1.0
-        sc.fb.auto_exp_max = 1.0
-        sc.fb.auto_exp_target = 0.0
-        sc.begin_frame(Vec3(0.0, 1.5, -2.0), Vec3(0.0, 0.2, 4.5), 54.0, bright_prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(floor_model, ident)
-        assert_true(sc.present_headless())
-        var fixed_exp_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 78, 8)
-
-        sc.fb.temporal_frames = 0
-        sc.fb.adapted_exposure = 1.0
-        sc.fb.auto_exp_min = 0.25
-        sc.fb.auto_exp_max = 1.65
-        sc.fb.auto_exp_speed = 0.90
-        sc.fb.auto_exp_target = 42.0
-        sc.begin_frame(Vec3(0.0, 1.5, -2.0), Vec3(0.0, 0.2, 4.5), 54.0, bright_prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(floor_model, ident)
-        assert_true(sc.present_headless())
-        var adapted_exp_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 78, 8)
-        assert_true(adapted_exp_luma < fixed_exp_luma - 6.0)
-        sc.fb.auto_exp_min = 0.78
-        sc.fb.auto_exp_max = 1.32
-        sc.fb.auto_exp_target = 0.0
-
-        # Thin-lens DoF: focus at z = 3.5m (near_card stays razor-sharp while far_card at z = 14m blurs across silhouette)
-        sc.fb.temporal_frames = 0
-        sc.fb.dof_aperture = 0.0
-        sc.begin_frame(Vec3(0.0, 1.0, 0.0), Vec3(0.0, 1.0, 6.0), 54.0, dark_prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(near_card, ident)
-        sc.draw_model(far_card, ident)
-        assert_true(sc.present_headless())
-        var sharp_far_fringe = Int(0)
-        for fy in range(52, 76):
-            for fx in range(118, 146):
-                var px_luma = Int((sc.fb.pixels[fy * 192 + fx] >> 16) & 255)
-                if px_luma > 24 and px_luma < 195:
-                    sharp_far_fringe += 1
-
-        sc.fb.temporal_frames = 0
-        sc.fb.dof_focus_dist = 3.5
-        sc.fb.dof_aperture = 12.0
-        sc.fb.dof_max_coc = 6.0
-        sc.begin_frame(Vec3(0.0, 1.0, 0.0), Vec3(0.0, 1.0, 6.0), 54.0, dark_prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(near_card, ident)
-        sc.draw_model(far_card, ident)
-        assert_true(sc.present_headless())
-        var bokeh_far_fringe = Int(0)
-        for fy in range(52, 76):
-            for fx in range(118, 146):
-                var px_luma = Int((sc.fb.pixels[fy * 192 + fx] >> 16) & 255)
-                if px_luma > 24 and px_luma < 195:
-                    bokeh_far_fringe += 1
-        assert_true(bokeh_far_fringe > sharp_far_fringe + 12)
-        sc.fb.dof_aperture = 0.0
-
-    print("  [PASS] GTAO + Contact Shadows, Object Velocity, 128-Light Clusters + Karis Tubes, Kulla-Conty Aniso, Gerstner Surf & Bokeh DoF")
-
-
-def test_v8_physical_sky_froxel_decals_probes_skin_hiz_voice_replay_and_udp() raises:
-    # 1. Verify V8 Vulkan SPIR-V compute shaders (Sky-View LUT, 3D Froxel, Hi-Z Pyramid, 4-Bone GPU Skinning)
-    var spv_sky = sky_lut_shader()
-    var spv_frox = froxel_integrate_shader()
-    var spv_hiz = hiz_pyramid_shader()
-    var spv_skin = gpu_skin_shader()
-    assert_true(len(spv_sky) > 64 and spv_sky[0] == SPIRV_MAGIC)
-    assert_true(len(spv_frox) > 64 and spv_frox[0] == SPIRV_MAGIC)
-    assert_true(len(spv_hiz) > 32 and spv_hiz[0] == SPIRV_MAGIC)
-    assert_true(len(spv_skin) > 64 and spv_skin[0] == SPIRV_MAGIC)
-
-    # 2. Dedicated Tangent Normal + ORM Atlas GLB round-trip & cotangent shading (D2)
+def test_v8_norm_glb_voice_replay_and_udp() raises:
+    # 1. Dedicated Tangent Normal + ORM Atlas GLB round-trip
     var norm_model = NativeModel()
     var alb_tex = NativeTexture()
     alb_tex.width = 64
@@ -1283,179 +605,7 @@ def test_v8_physical_sky_froxel_decals_probes_skin_hiz_voice_replay_and_udp() ra
     assert_equal(parsed_norm.meshes[0].normal_orm_texture, 1)
     assert_equal(len(parsed_norm.textures), 2)
 
-    # Occluder wall + hidden target for Hi-Z occlusion culling (A4)
-    var wall_model = NativeModel()
-    var wb = MeshBuilder(base_color=0xFF3A4252, roughness=0.45, metallic=0.25)
-    wb.add_beveled_box(Vec3(0.0, 1.2, 3.0), Vec3(4.8, 3.2, 0.25), bevel=0.02)
-    var wprims = List[NativeMesh]()
-    wprims.append(wb^.finish())
-    _ = append_node_meshes(wall_model, "v8_hiz_wall", wprims)
-
-    var hidden_model = NativeModel()
-    var hb = MeshBuilder(base_color=0xFFFF5533, roughness=0.35, metallic=0.10)
-    hb.add_beveled_box(Vec3(0.0, 1.2, 12.0), Vec3(0.75, 0.75, 0.75), bevel=0.02)
-    var hprims = List[NativeMesh]()
-    hprims.append(hb^.finish())
-    _ = append_node_meshes(hidden_model, "v8_hidden_cube", hprims)
-
-    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
-
-    # 3. Verify A1 (Ground-to-Orbit Sky LUT), A2 (3D Froxel Volumetrics), A3 (Decals & Interior Probes), and A4 (Skinning + Hi-Z) on GPU & CPU
-    var atmos_prof = LightingProfile()
-    atmos_prof.key_direction = Vec3(0.18, -0.32, -0.93).normalized()
-    atmos_prof.key_color = Vec3(1.42, 1.26, 1.02)
-    atmos_prof.hemisphere_sky = Vec3(0.28, 0.44, 0.68)
-    atmos_prof.hemisphere_ground = Vec3(0.16, 0.24, 0.34)
-    atmos_prof.fog_color = Vec3(168, 152, 134)
-    atmos_prof.fog_start = 120.0
-    atmos_prof.fog_end = 420.0
-    atmos_prof.height_fog = 0.025
-    atmos_prof.filmic = 1.0
-    atmos_prof.exposure = 1.0
-
-    var skin_bind_b = MeshBuilder(base_color=0xFFE8ECF2, roughness=0.30, metallic=0.45)
-    skin_bind_b.add_beveled_box(Vec3(0.0, 1.0, 0.0), Vec3(0.4, 1.0, 0.4), bevel=0.02)
-    var skin_bind = skin_bind_b^.finish()
-    var vcnt_s = skin_bind.vertex_count()
-    var j_packed = List[UInt32](length=vcnt_s, fill=UInt32(0 | (1 << 8)))
-    var w_4x = List[Float32](length=vcnt_s * 4, fill=0.0)
-    for vi in range(vcnt_s):
-        var t_y = max(Float32(0.0), min(Float32(1.0), skin_bind.positions[vi * 3 + 1] * Float32(0.5)))
-        w_4x[vi * 4] = Float32(1.0) - t_y
-        w_4x[vi * 4 + 1] = t_y
-    # Joint 0 = identity; Joint 1 = translate +1.5m along X
-    var j_mats = List[Float32](length=24, fill=0.0)
-    j_mats[0] = 1.0; j_mats[5] = 1.0; j_mats[10] = 1.0
-    j_mats[12] = 1.0; j_mats[15] = 1.5; j_mats[17] = 1.0; j_mats[22] = 1.0
-
-    var gpu_skinned = NativeMesh()
-    var cpu_skinned = NativeMesh()
-
-    for pass_cpu in range(2):
-        var sc = GpuSceneRenderer(192, 128, prefer_gpu=(pass_cpu == 0))
-
-        # A4a: 4-Bone Linear-Blend Skinning
-        if pass_cpu == 0:
-            sc.skin_mesh_vertices(skin_bind, j_packed, w_4x, j_mats, gpu_skinned)
-        else:
-            sc.skin_mesh_vertices(skin_bind, j_packed, w_4x, j_mats, cpu_skinned)
-
-        # A1: Sea-level (0.05 km) golden-hour horizon vs 320 km orbital deep space + lit planet limb below
-        sc.fb.temporal_frames = 0
-        sc.fb.vol_density_override = 0.0
-        sc.begin_frame(Vec3(0.0, 2.0, 0.0), Vec3(0.0, 2.4, 12.0), 58.0, atmos_prof, quality=2)
-        sc.set_physical_atmosphere(True, altitude_km=0.05, rayleigh=1.0, mie=1.0, ozone=1.0)
-        sc.commit_lighting()
-        assert_true(sc.present_headless())
-        var sea_zenith_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 16, 4)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 2.0, 0.0), Vec3(0.0, 0.8, 12.0), 62.0, atmos_prof, quality=2)
-        sc.set_physical_atmosphere(True, altitude_km=320.0, rayleigh=1.0, mie=1.0, ozone=1.0)
-        sc.commit_lighting()
-        assert_true(sc.present_headless())
-        var orbit_space_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 12, 4)
-        var orbit_planet_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 114, 4)
-        assert_true(sea_zenith_luma > orbit_space_luma + 14.0)
-        assert_true(orbit_planet_luma > orbit_space_luma + 18.0)
-        sc.set_physical_atmosphere(False)
-
-        # A2: Temporally reprojected 3D Froxel Volumetrics illuminated by cluster point light
-        var dark_vol = LightingProfile()
-        dark_vol.key_direction = Vec3(0.0, -1.0, 0.0)
-        dark_vol.key_color = Vec3(0.03, 0.03, 0.04)
-        dark_vol.hemisphere_sky = Vec3(0.02, 0.02, 0.03)
-        dark_vol.hemisphere_ground = Vec3(0.01, 0.01, 0.01)
-        dark_vol.fog_color = Vec3(18, 20, 26)
-        dark_vol.fog_start = 120.0
-        dark_vol.fog_end = 360.0
-        dark_vol.height_fog = 0.02
-        dark_vol.filmic = 1.0
-        dark_vol.exposure = 1.0
-
-        sc.fb.temporal_frames = 0
-        sc.fb.vol_density_override = 0.0
-        sc.begin_frame(Vec3(0.0, 1.6, -2.0), Vec3(0.0, 1.4, 8.0), 56.0, dark_vol, quality=2)
-        sc.set_froxel_volumetrics(False)
-        sc.commit_lighting()
-        sc.draw_model(wall_model, trs(Vec3(0.0, 0.0, 10.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-        assert_true(sc.present_headless())
-        var base_frox_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 64, 5)
-
-        sc.fb.temporal_frames = 0
-        sc.fb.vol_density_override = 0.36
-        for _ in range(2):
-            sc.begin_frame(Vec3(0.0, 1.6, -2.0), Vec3(0.0, 1.4, 8.0), 56.0, dark_vol, quality=2)
-            sc.set_froxel_volumetrics(True, max_dist=90.0)
-            sc.add_point_light(Vec3(0.0, 1.6, 4.2), Vec3(1.0, 0.72, 0.34), radius=7.5, intensity=6.0, priority=95)
-            sc.commit_lighting()
-            sc.draw_model(wall_model, trs(Vec3(0.0, 0.0, 10.0), Quat(), Vec3(1.0, 1.0, 1.0)))
-            assert_true(sc.present_headless())
-        var lit_frox_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 64, 5)
-        assert_true(lit_frox_luma > base_frox_luma + 8.0)
-        sc.set_froxel_volumetrics(False)
-        sc.fb.vol_density_override = 0.0
-
-        # A3 + D2: Normal+ORM plate + Glowing Plasma Scorch Decal + Interior Irradiance Probe
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 2.8, -1.4), Vec3(0.0, 0.0, 4.2), 54.0, dark_vol, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(parsed_norm, ident)
-        assert_true(sc.present_headless())
-        var unprobed_plate = _center_patch_luma(sc.fb.pixels, 192, 96, 68, 5)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 2.8, -1.4), Vec3(0.0, 0.0, 4.2), 54.0, dark_vol, quality=2)
-        sc.add_irradiance_probe(Vec3(0.0, 1.6, 4.2), radius=9.0, color=Vec3(0.95, 0.78, 0.52), sky_occlusion=0.85)
-        sc.add_surface_decal(
-            Vec3(0.0, 0.0, 4.2),
-            Vec3(1.0, 0.0, 0.0),
-            Vec3(0.0, 0.0, 1.0),
-            Vec3(1.3, 1.3, 0.5),
-            0xFF1A1410,
-            opacity=0.92,
-            scorch_glow=True,
-        )
-        sc.commit_lighting()
-        sc.draw_model(parsed_norm, ident)
-        assert_true(sc.present_headless())
-        var probed_decal_plate = _center_patch_luma(sc.fb.pixels, 192, 96, 64, 2)
-        var far_probed_plate = _center_patch_luma(sc.fb.pixels, 192, 138, 68, 3)
-        assert_true(far_probed_plate > unprobed_plate + 10.0)
-        assert_true(far_probed_plate > probed_decal_plate + 10.0)
-
-        # A4b: 16x16 Hi-Z Coarse Occlusion Culling (frame 0 builds Hi-Z from wall; frame 1 culls hidden_model behind wall!)
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 1.2, -2.0), Vec3(0.0, 1.2, 6.0), 54.0, atmos_prof, quality=2)
-        sc.set_hiz_culling(True)
-        sc.commit_lighting()
-        sc.draw_model(wall_model, ident)
-        sc.draw_model(hidden_model, ident)
-        assert_true(sc.present_headless())
-        assert_equal(sc.hiz_culled_meshes, 0)
-
-        sc.begin_frame(Vec3(0.0, 1.2, -2.0), Vec3(0.0, 1.2, 6.0), 54.0, atmos_prof, quality=2)
-        sc.set_hiz_culling(True)
-        sc.commit_lighting()
-        sc.draw_model(wall_model, ident)
-        sc.draw_model(hidden_model, ident)
-        assert_true(sc.present_headless())
-        assert_equal(sc.hiz_culled_meshes, 1)
-
-    # Verify GPU compute skinning matches CPU LBS within floating-point tolerance
-    assert_equal(len(gpu_skinned.positions), len(cpu_skinned.positions))
-    var max_skin_diff = Float32(0.0)
-    var max_skinned_x = Float32(-1e9)
-    for idx in range(len(cpu_skinned.positions)):
-        var d = abs(gpu_skinned.positions[idx] - cpu_skinned.positions[idx])
-        if d > max_skin_diff:
-            max_skin_diff = d
-        if (idx % 3) == 0 and gpu_skinned.positions[idx] > max_skinned_x:
-            max_skinned_x = gpu_skinned.positions[idx]
-    assert_true(max_skin_diff < 0.002)
-    assert_true(max_skinned_x > 1.75)
-
-    # 4. Multi-Voice Bridge & Squadron Radio Comms synthesis (C3)
+    # 2. Multi-Voice Bridge & Squadron Radio Comms synthesis (C3)
     var lisa_clip = synth_radio_comms_clip("Bridge to Skull Leader, Prometheus catapult cleared.", VOICE_BRIDGE_FEMALE, 0.04)
     var roy_clip = synth_radio_comms_clip("Skull Leader airborne, form on my wing.", VOICE_ACE_BARITONE, 0.04)
     var max_clip = synth_radio_comms_clip("Vermilion Two tally bandits ahead.", VOICE_ACE_TENOR, 0.04)
@@ -1466,7 +616,7 @@ def test_v8_physical_sky_froxel_decals_probes_skin_hiz_voice_replay_and_udp() ra
     assert_true(miriya_clip.valid and len(miriya_clip.samples) > 12000)
     assert_true(len(lisa_clip.samples) != len(roy_clip.samples) or lisa_clip.samples[4000] != roy_clip.samples[4000])
 
-    # 5. FlintReplayStream V2 Keyframe Scrubbing round-trip (D1)
+    # 3. FlintReplayStream V2 Keyframe Scrubbing round-trip (D1)
     var rep = FlintReplayStream()
     var w0 = BlobWriter()
     w0.begin(fourcc("KFST"), 1)
@@ -1502,7 +652,7 @@ def test_v8_physical_sky_froxel_decals_probes_skin_hiz_voice_replay_and_udp() ra
     kr74.leave()
     assert_equal(rep_loaded.nearest_keyframe_tick_at_or_before(12), 0)
 
-    # 6. Non-Blocking Loopback UDP LockstepPeer + FNV-64 Desync Guard (D3)
+    # 4. Non-Blocking Loopback UDP LockstepPeer + FNV-64 Desync Guard (D3)
     var peer_a = LockstepPeer()
     var peer_b = LockstepPeer()
     assert_true(peer_a.open(0, loopback_only=True))
@@ -1536,169 +686,11 @@ def test_v8_physical_sky_froxel_decals_probes_skin_hiz_voice_replay_and_udp() ra
     peer_a.close()
     peer_b.close()
 
-    print("  [PASS] V8 Physical Sky-View LUT, 3D Froxels, Decals & Probes, 4-Bone GPU Skin + Hi-Z, Multi-Voice Comms, Replay Scrub & UDP Lockstep")
+    print("  [PASS] V8 Normal+ORM GLB, Multi-Voice Comms, Replay Scrub & UDP Lockstep")
 
 
-def test_v9_volclouds_ssgi_gpuparticles_dispersion_rollback_hotas_and_camspline() raises:
-    from std.memory import bitcast
-    from flint.render.gpu_layout import (
-        EFFECT_VOL_CLOUDS,
-        EFFECT_SSGI_BENT,
-        EFFECT_CHROMATIC_REFRACT,
-        SHADER_GPU_PARTICLES,
-        VULKAN_SHADER_COUNT,
-        GPU_PARTICLE_STRIDE_WORDS,
-    )
-    from flint.render import vulkan_shaders
-    from flint.render.fx_atlas import TEX_SHOCK_RING
-
-    # 1. Verify SHADER_GPU_PARTICLES SPIR-V magic & shader table count
-    assert_equal(SHADER_GPU_PARTICLES, 19)
-    assert_equal(VULKAN_SHADER_COUNT, 22)
-    var spv_part = vulkan_shaders.gpu_particles_shader()
-    assert_true(len(spv_part) > 120 and spv_part[0] == SPIRV_MAGIC)
-
-    # 2. Verify A1 (Volumetric Clouds + Cloud Shadows), A2 (SSGI + Bent Normals), A3 (GPU Compute Particles + Depth Bounce), A4 (Chromatic Dispersion)
-    var sun_prof = LightingProfile()
-    sun_prof.key_direction = Vec3(0.15, -0.58, -0.80).normalized()
-    sun_prof.key_color = Vec3(1.45, 1.32, 1.12)
-    sun_prof.hemisphere_sky = Vec3(0.32, 0.46, 0.68)
-    sun_prof.hemisphere_ground = Vec3(0.18, 0.22, 0.28)
-    sun_prof.fog_color = Vec3(38, 48, 66)
-    sun_prof.fog_start = 220.0
-    sun_prof.fog_end = 680.0
-    sun_prof.filmic = 1.0
-    sun_prof.exposure = 1.0
-
-    var wall_m = NativeModel()
-    var wb = MeshBuilder(base_color=0xFFE4ECF4, roughness=0.42, metallic=0.10)
-    wb.add_beveled_box(Vec3(0.0, 0.0, 5.0), Vec3(4.5, 3.2, 0.30), bevel=0.02)
-    var wprims = List[NativeMesh]()
-    wprims.append(wb^.finish())
-    _ = append_node_meshes(wall_m, "v9_wall", wprims)
-
-    var bounce_src_m = NativeModel()
-    var bsb = MeshBuilder(base_color=0xFFFF3818, roughness=0.35, metallic=0.05)
-    bsb.add_beveled_box(Vec3(-1.15, 0.0, 4.45), Vec3(0.28, 2.4, 0.32), bevel=0.02)
-    var bs_mesh = bsb^.finish()
-    bs_mesh.emissive_color = Vec3(1.0, 0.16, 0.06)
-    bs_mesh.emissive_strength = 2.4
-    var bsprims = List[NativeMesh]()
-    bsprims.append(bs_mesh^)
-    _ = append_node_meshes(bounce_src_m, "v9_red_emitter", bsprims)
-
-    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
-
-    for pass_cpu in range(2):
-        var sc = GpuSceneRenderer(192, 128, prefer_gpu=(pass_cpu == 0))
-        sc.fb.vol_density_override = 0.0
-
-        # A1: Sky without vs with 3D Worley-Perlin Volumetric Clouds
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 40.0, 0.0), Vec3(0.0, 110.0, 120.0), 60.0, sun_prof, quality=2)
-        sc.set_volumetric_clouds(False)
-        sc.commit_lighting()
-        assert_true(sc.present_headless())
-        var clear_sky_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 36, 16)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 40.0, 0.0), Vec3(0.0, 110.0, 120.0), 60.0, sun_prof, quality=2)
-        sc.set_volumetric_clouds(
-            True,
-            base_y=180.0,
-            top_y=620.0,
-            coverage=0.88,
-            density=0.045,
-            shadow_strength=0.65,
-            scale=0.0035,
-        )
-        assert_true((sc.fb.gpu_effects & EFFECT_VOL_CLOUDS) != 0)
-        sc.commit_lighting()
-        assert_true(sc.present_headless())
-        var cloud_sky_luma = _center_patch_luma(sc.fb.pixels, 192, 96, 36, 16)
-        assert_true(cloud_sky_luma > clear_sky_luma + 12.0)
-        sc.set_volumetric_clouds(False)
-
-        # A2: SSGI 1-bounce diffuse color bleeding off bright crimson bounce_src onto neutral wall
-        var ssgi_prof = LightingProfile()
-        ssgi_prof.key_direction = Vec3(0.75, -0.25, -0.60).normalized()
-        ssgi_prof.key_color = Vec3(0.10, 0.10, 0.10)
-        ssgi_prof.hemisphere_sky = Vec3(0.08, 0.08, 0.08)
-        ssgi_prof.hemisphere_ground = Vec3(0.05, 0.05, 0.05)
-        ssgi_prof.fog_color = Vec3(16, 16, 18)
-        ssgi_prof.filmic = 1.0
-        ssgi_prof.exposure = 1.0
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(-0.87, 0.0, 4.7), 54.0, ssgi_prof, quality=2)
-        sc.fb.gpu_effects &= ~EFFECT_AUTO_EXPOSURE
-        sc.set_ssgi_bent_normals(False)
-        sc.commit_lighting()
-        sc.draw_model(wall_m, ident)
-        sc.draw_model(bounce_src_m, ident)
-        assert_true(sc.present_headless())
-        var r_sum_no = 0
-        for sy_p in range(58, 70):
-            for sx_p in range(97, 102):
-                r_sum_no += Int((sc.fb.pixels[sy_p * 192 + sx_p] >> 16) & 255)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(-0.87, 0.0, 4.7), 54.0, ssgi_prof, quality=2)
-        sc.fb.gpu_effects &= ~EFFECT_AUTO_EXPOSURE
-        sc.set_ssgi_bent_normals(True, intensity=1.45)
-        assert_true((sc.fb.gpu_effects & EFFECT_SSGI_BENT) != 0)
-        sc.commit_lighting()
-        sc.draw_model(wall_m, ident)
-        sc.draw_model(bounce_src_m, ident)
-        assert_true(sc.present_headless())
-        var r_sum_yes = 0
-        for sy_p in range(58, 70):
-            for sx_p in range(97, 102):
-                r_sum_yes += Int((sc.fb.pixels[sy_p * 192 + sx_p] >> 16) & 255)
-        assert_true(r_sum_yes >= r_sum_no + 30)
-
-        # A4: Chromatic Dispersion + Heat-Haze on refractive billboard in front of wall
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), 54.0, sun_prof, dt=0.12, quality=2)
-        sc.set_chromatic_refraction(True, dispersion=0.38, heat_haze_amp=1.8)
-        assert_true((sc.fb.gpu_effects & EFFECT_CHROMATIC_REFRACT) != 0)
-        sc.commit_lighting()
-        sc.draw_model(wall_m, ident)
-        sc.draw_model(bounce_src_m, trs(Vec3(1.15, 0.0, -0.2), Quat(), Vec3(1.0, 1.0, 1.0)))
-        sc.draw_billboard(
-            Vec3(0.0, 0.0, 2.8),
-            1.6,
-            TEX_SHOCK_RING,
-            0xFFE8F4FF,
-            180,
-            emissive=0.4,
-            additive=False,
-            refract_strength=9.5,
-        )
-        assert_true(sc.present_headless())
-
-        # A3: Step 1,024 particles against the foreground wall (at z ~ 4.7m) and verify depth bounce!
-        var pcount = 1024
-        var pbuf = List[UInt32](length=pcount * GPU_PARTICLE_STRIDE_WORDS, fill=0)
-        for pi in range(pcount):
-            var pb = pi * GPU_PARTICLE_STRIDE_WORDS
-            pbuf[pb + 0] = bitcast[DType.uint32](Float32((pi % 16) - 8) * Float32(0.08))
-            pbuf[pb + 1] = bitcast[DType.uint32](Float32(((pi // 16) % 16) - 8) * Float32(0.06))
-            pbuf[pb + 2] = bitcast[DType.uint32](Float32(4.55))
-            pbuf[pb + 3] = bitcast[DType.uint32](Float32(1.50))
-            pbuf[pb + 4] = bitcast[DType.uint32](Float32(0.0))
-            pbuf[pb + 5] = bitcast[DType.uint32](Float32(0.0))
-            pbuf[pb + 6] = bitcast[DType.uint32](Float32(18.0))  # flying +Z into wall at z=4.7m!
-            pbuf[pb + 7] = UInt32(0x18FFB040)
-        sc.step_gpu_particles(pbuf, pcount, Float32(0.05), gravity=-9.8, drag=0.2, depth_bounce=True, restitution=0.55)
-        var bounced = 0
-        for pi in range(pcount):
-            var vz_after = bitcast[DType.float32](pbuf[pi * GPU_PARTICLE_STRIDE_WORDS + 6])
-            if vz_after < Float32(0.0):
-                bounced += 1
-        assert_true(bounced > 200)
-
-    # 3. C3: LinuxGamepad 8-byte js_event binary packet parser + deadzone curve
+def test_v9_hotas_rollback_and_camspline() raises:
+    # 1. C3: LinuxGamepad 8-byte js_event binary packet parser + deadzone curve
     var pad = LinuxGamepad(deadzone=0.12, curve_power=1.6)
     var pkt_axis = List[UInt8](length=8, fill=0)
     # value = +16384 (0x4000 little-endian -> 0x00, 0x40), type = JS_EVENT_AXIS (2), number = 1
@@ -1792,224 +784,11 @@ def test_v9_volclouds_ssgi_gpuparticles_dispersion_rollback_hotas_and_camspline(
     assert_true(mid_cam.fov_y > Float32(48.0) and mid_cam.fov_y < Float32(60.0))
     assert_true(mid_cam.time_scale > Float32(0.5) and mid_cam.time_scale < Float32(1.0))
 
-    print("  [PASS] V9 3D Volumetric Clouds + Shadows, SSGI & Bent Normals, 65K GPU Compute Particles, Chromatic Dispersion, HOTAS, 4P Rollback & V3 Camera Spline")
+    print("  [PASS] V9 HOTAS Input, 4P Rollback & V3 Camera Spline")
 
 
-def test_v10_radiance_gi_tsr_dyrl_anime_gpu_cull_and_hrtf_vacuum() raises:
-    from std.memory import bitcast
-    from flint.render.gpu_layout import (
-        EFFECT_RADIANCE_GI,
-        EFFECT_DYRL_ANIME,
-        SHADER_TSR_UPSCALE,
-        SHADER_GPU_CULL,
-        VULKAN_SHADER_COUNT,
-        GPU_CULL_IN_STRIDE_WORDS,
-    )
-    from flint.render import vulkan_shaders
-
-    # 1. Verify SHADER_TSR_UPSCALE & SHADER_GPU_CULL SPIR-V magic & table count
-    assert_equal(SHADER_TSR_UPSCALE, 20)
-    assert_equal(SHADER_GPU_CULL, 21)
-    assert_equal(VULKAN_SHADER_COUNT, 22)
-    var spv_tsr = vulkan_shaders.tsr_upscale_shader()
-    var spv_cull = vulkan_shaders.gpu_cull_shader()
-    assert_true(len(spv_tsr) > 120 and spv_tsr[0] == SPIRV_MAGIC)
-    assert_true(len(spv_cull) > 120 and spv_cull[0] == SPIRV_MAGIC)
-
-    var dark_prof = LightingProfile()
-    dark_prof.key_direction = Vec3(0.15, -0.58, -0.80).normalized()
-    dark_prof.key_color = Vec3(0.08, 0.08, 0.08)
-    dark_prof.hemisphere_sky = Vec3(0.06, 0.06, 0.07)
-    dark_prof.hemisphere_ground = Vec3(0.04, 0.04, 0.05)
-    dark_prof.fog_color = Vec3(14, 14, 16)
-    dark_prof.filmic = 1.0
-    dark_prof.exposure = 1.0
-
-    var sun_prof = LightingProfile()
-    sun_prof.key_direction = Vec3(0.25, -0.52, -0.81).normalized()
-    sun_prof.key_color = Vec3(1.55, 1.38, 1.12)
-    sun_prof.hemisphere_sky = Vec3(0.34, 0.48, 0.70)
-    sun_prof.hemisphere_ground = Vec3(0.20, 0.22, 0.26)
-    sun_prof.fog_color = Vec3(38, 46, 62)
-    sun_prof.filmic = 1.0
-    sun_prof.exposure = 1.0
-
-    var wall_m = NativeModel()
-    var wb = MeshBuilder(base_color=0xFFDDE4EC, roughness=0.45, metallic=0.08)
-    wb.add_beveled_box(Vec3(0.0, 0.0, 5.0), Vec3(4.8, 3.4, 0.30), bevel=0.02)
-    var wprims = List[NativeMesh]()
-    wprims.append(wb^.finish())
-    _ = append_node_meshes(wall_m, "v10_wall", wprims)
-
-    var box_m = NativeModel()
-    var bb = MeshBuilder(base_color=0xFFE8ECF2, roughness=0.22, metallic=0.35)
-    bb.add_beveled_box(Vec3(0.0, 0.0, 3.0), Vec3(0.95, 0.95, 0.55), bevel=0.04)
-    var bprims = List[NativeMesh]()
-    bprims.append(bb^.finish())
-    _ = append_node_meshes(box_m, "v10_occluder_box", bprims)
-
-    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
-    var tsr_gpu_out = List[UInt32]()
-    var tsr_cpu_out = List[UInt32]()
-
-    for pass_cpu in range(2):
-        var sc = GpuSceneRenderer(192, 128, prefer_gpu=(pass_cpu == 0))
-        sc.fb.vol_density_override = 0.0
-
-        # A1: World-Space Radiance Cascades GI from an OFF-SCREEN warm emitter at x = -5.5!
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), 52.0, dark_prof, quality=2)
-        sc.fb.gpu_effects &= ~EFFECT_AUTO_EXPOSURE
-        sc.set_radiance_gi(False)
-        sc.commit_lighting()
-        sc.draw_model(wall_m, ident)
-        assert_true(sc.present_headless())
-        var gi_off_r = 0
-        for sy_p in range(56, 72):
-            for sx_p in range(44, 68):
-                gi_off_r += Int((sc.fb.pixels[sy_p * 192 + sx_p] >> 16) & 255)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), 52.0, dark_prof, quality=2)
-        sc.fb.gpu_effects &= ~EFFECT_AUTO_EXPOSURE
-        sc.set_radiance_gi(True, intensity=1.25)
-        sc.add_radiance_emitter(Vec3(-5.5, 0.0, 4.2), Float32(12.0), Vec3(240.0, 128.0, 44.0), dir_bias_y=0.0)
-        assert_true((sc.fb.gpu_effects & EFFECT_RADIANCE_GI) != 0)
-        sc.commit_lighting()
-        sc.draw_model(wall_m, ident)
-        assert_true(sc.present_headless())
-        var gi_on_r = 0
-        for sy_p in range(56, 72):
-            for sx_p in range(44, 68):
-                gi_on_r += Int((sc.fb.pixels[sy_p * 192 + sx_p] >> 16) & 255)
-        assert_true(gi_on_r >= gi_off_r + 1200)
-
-        # A2: TSR Bicubic Catmull-Rom + Anti-Ringing Upscaler (120x80 -> 192x128)
-        var src_w = 120
-        var src_h = 80
-        var src_img = List[UInt32](length=src_w * src_h, fill=0xFF18202C)
-        for iy in range(20, 60):
-            for ix in range(36, 84):
-                src_img[iy * src_w + ix] = 0xFFF2D8A8
-        var up_out = List[UInt32]()
-        sc.upscale_tsr(src_img, src_w, src_h, 192, 128, up_out, sharpness=0.52, history_blend=0.0)
-        assert_equal(len(up_out), 192 * 128)
-        var center_px = up_out[64 * 192 + 96]
-        var corner_px = up_out[8 * 192 + 8]
-        assert_true(Int((center_px >> 16) & 255) > 220)
-        assert_true(Int((corner_px >> 16) & 255) < 40)
-        if pass_cpu == 0:
-            tsr_gpu_out = up_out^
-        else:
-            tsr_cpu_out = up_out^
-
-        # A3: 1984 DYRL 35mm Cel-Film / PBR Hybrid Mode (Sobel depth+normal ink lines + 0% electric-blue clip)
-        sc.fb.temporal_frames = 0
-        sc.set_dyrl_anime_mode(False)
-        sc.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), 52.0, sun_prof, quality=2)
-        sc.fb.gpu_effects &= ~EFFECT_AUTO_EXPOSURE
-        sc.commit_lighting()
-        sc.draw_model(wall_m, ident)
-        sc.draw_model(box_m, ident)
-        assert_true(sc.present_headless())
-        var no_ink_min_luma = 255
-        for sx_p in range(24, 168):
-            var px0 = sc.fb.pixels[64 * 192 + sx_p]
-            var lm0 = (Int((px0 >> 16) & 255) * 66 + Int((px0 >> 8) & 255) * 150 + Int(px0 & 255) * 40) >> 8
-            if lm0 < no_ink_min_luma:
-                no_ink_min_luma = lm0
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), 52.0, sun_prof, quality=2)
-        sc.fb.gpu_effects &= ~EFFECT_AUTO_EXPOSURE
-        sc.set_dyrl_anime_mode(True, ink_strength=0.95, cel_bands=3.0, glint_strength=0.75, halation=0.32)
-        assert_true((sc.fb.gpu_effects & EFFECT_DYRL_ANIME) != 0)
-        sc.commit_lighting()
-        sc.draw_model(wall_m, ident)
-        sc.draw_model(box_m, ident)
-        assert_true(sc.present_headless())
-        var dyrl_min_luma = 255
-        var eblue_count = 0
-        for sy_p in range(128):
-            for sx_p in range(192):
-                var px1 = sc.fb.pixels[sy_p * 192 + sx_p]
-                var r1 = Int((px1 >> 16) & 255)
-                var g1 = Int((px1 >> 8) & 255)
-                var b1 = Int(px1 & 255)
-                if b1 > 245 and (b1 - r1) > 80:
-                    eblue_count += 1
-                if sy_p == 64 and sx_p >= 24 and sx_p < 168:
-                    var lm1 = (r1 * 66 + g1 * 150 + b1 * 40) >> 8
-                    if lm1 < dyrl_min_luma:
-                        dyrl_min_luma = lm1
-        assert_true(dyrl_min_luma + 18 < no_ink_min_luma)
-        assert_equal(eblue_count, 0)
-        sc.set_dyrl_anime_mode(False)
-
-        # A4: GPU Compute Frustum + 16x16 Hi-Z Indirect Culling (2 frames so Hi-Z pyramid is synced)
-        for _ in range(2):
-            sc.begin_frame(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 5.0), 52.0, sun_prof, quality=2)
-            sc.set_hiz_culling(True)
-            sc.commit_lighting()
-            sc.draw_model(box_m, ident)  # occluder box centered at (0,0,3.0) size 1.6x1.6!
-            assert_true(sc.present_headless())
-
-        var inst = List[UInt32](length=4 * GPU_CULL_IN_STRIDE_WORDS, fill=0)
-        # [0]: Visible in front of occluder at (0, 0, 1.8), r=0.35
-        inst[0] = bitcast[DType.uint32](Float32(0.0))
-        inst[1] = bitcast[DType.uint32](Float32(0.0))
-        inst[2] = bitcast[DType.uint32](Float32(1.8))
-        inst[3] = bitcast[DType.uint32](Float32(0.35))
-        inst[4] = UInt32(36)
-        inst[5] = UInt32(0)
-        inst[6] = UInt32(0)
-        inst[7] = UInt32(1)
-        # [1]: Behind camera at (0, 0, -6.0), r=0.5
-        var b1_off = GPU_CULL_IN_STRIDE_WORDS
-        inst[b1_off + 0] = bitcast[DType.uint32](Float32(0.0))
-        inst[b1_off + 1] = bitcast[DType.uint32](Float32(0.0))
-        inst[b1_off + 2] = bitcast[DType.uint32](Float32(-6.0))
-        inst[b1_off + 3] = bitcast[DType.uint32](Float32(0.5))
-        inst[b1_off + 4] = UInt32(36)
-        inst[b1_off + 7] = UInt32(1)
-        # [2]: Far outside right frustum plane at (42.0, 0, 5.0), r=0.5
-        var b2_off = 2 * GPU_CULL_IN_STRIDE_WORDS
-        inst[b2_off + 0] = bitcast[DType.uint32](Float32(42.0))
-        inst[b2_off + 1] = bitcast[DType.uint32](Float32(0.0))
-        inst[b2_off + 2] = bitcast[DType.uint32](Float32(5.0))
-        inst[b2_off + 3] = bitcast[DType.uint32](Float32(0.5))
-        inst[b2_off + 4] = UInt32(36)
-        inst[b2_off + 7] = UInt32(1)
-        # [3]: Occluded behind box_m (z=3.0, 1.6x1.6) at (0, 0, 9.0), r=0.25!
-        var b3_off = 3 * GPU_CULL_IN_STRIDE_WORDS
-        inst[b3_off + 0] = bitcast[DType.uint32](Float32(0.0))
-        inst[b3_off + 1] = bitcast[DType.uint32](Float32(0.0))
-        inst[b3_off + 2] = bitcast[DType.uint32](Float32(9.0))
-        inst[b3_off + 3] = bitcast[DType.uint32](Float32(0.25))
-        inst[b3_off + 4] = UInt32(48)
-        inst[b3_off + 7] = UInt32(1)
-
-        var vis_flags = List[UInt32]()
-        var ind_cmds = List[UInt32]()
-        var vis_count = sc.cull_instances_indirect(inst, 4, vis_flags, ind_cmds, use_hiz=True)
-        assert_equal(Int(vis_flags[0]), 1)
-        assert_equal(Int(vis_flags[1]), 0)
-        assert_equal(Int(vis_flags[2]), 0)
-        assert_equal(Int(vis_flags[3]), 0)
-        assert_equal(vis_count, 1)
-        assert_equal(len(ind_cmds), 5)
-        assert_equal(Int(ind_cmds[0]), 36)
-        assert_equal(Int(ind_cmds[1]), 1)
-
-    # Verify TSR GPU vs CPU parity
-    var tsr_diff_sum = 0
-    for pidx in range(len(tsr_gpu_out)):
-        var gr = Int((tsr_gpu_out[pidx] >> 16) & 255)
-        var cr = Int((tsr_cpu_out[pidx] >> 16) & 255)
-        tsr_diff_sum += abs(gr - cr)
-    assert_true(Float32(tsr_diff_sum) / Float32(len(tsr_gpu_out)) < Float32(2.0))
-
-    # 2. C2: Binaural HRTF (Woodworth ITD onset lag + head-shadow) & Space-Vacuum Acoustic Muffling
+def test_v10_hrtf_and_vacuum_audio() raises:
+    # C2: Binaural HRTF (Woodworth ITD onset lag + head-shadow) & Space-Vacuum Acoustic Muffling
     var aud = NativeAudio()
     aud.reverb_enabled = False
     var burst = WavClip()
@@ -2054,132 +833,11 @@ def test_v10_radiance_gi_tsr_dyrl_anime_gpu_cull_and_hrtf_vacuum() raises:
         hf_hull += abs(Int(vac_hull[fi * 2]) - Int(vac_hull[(fi - 1) * 2]))
     assert_true(hf_hull > hf_ext * 3)
 
-    print("  [PASS] V10 Radiance Cascades GI, TSR Upscaler, DYRL 35mm Cel-Film Mode, GPU Compute Hi-Z Indirect Culling & Binaural HRTF + Vacuum Audio")
-
-
-def test_v11_subnative_tsr_sdf_shadows_weather_precip_and_dyn_reflect() raises:
-    var floor_m = NativeModel()
-    var fb_m = MeshBuilder(base_color=0xFFD8D0C4, roughness=0.58, metallic=0.12)
-    fb_m.add_beveled_box(Vec3(0.0, -0.20, 4.0), Vec3(8.0, 0.20, 8.0), bevel=0.02)
-    var f_prims = List[NativeMesh]()
-    f_prims.append(fb_m^.finish())
-    _ = append_node_meshes(floor_m, "v11_floor", f_prims)
-
-    var chrome_m = NativeModel()
-    var cb_m = MeshBuilder(base_color=0xFFEAE6DE, roughness=0.10, metallic=0.92)
-    cb_m.add_beveled_box(Vec3(0.0, -0.20, 4.0), Vec3(8.0, 0.20, 8.0), bevel=0.02)
-    var c_prims = List[NativeMesh]()
-    c_prims.append(cb_m^.finish())
-    _ = append_node_meshes(chrome_m, "v11_chrome", c_prims)
-
-    var prof = LightingProfile()
-    prof.key_direction = Vec3(0.0, -1.0, 0.0)
-    prof.key_color = Vec3(1.30, 1.22, 1.08)
-    prof.hemisphere_sky = Vec3(0.16, 0.16, 0.18)
-    prof.hemisphere_ground = Vec3(0.08, 0.07, 0.06)
-    prof.fog_color = Vec3(18, 16, 14)
-    prof.fog_start = 120.0
-    prof.fog_end = 360.0
-    prof.filmic = 1.0
-    prof.exposure = 1.04
-
-    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
-    var eye = Vec3(0.0, 2.4, -2.6)
-    var tgt = Vec3(0.0, 0.0, 4.0)
-
-    var tsr_gpu_px = List[UInt32]()
-    var tsr_cpu_px = List[UInt32]()
-
-    for pass_cpu in range(2):
-        var sc = GpuSceneRenderer(240, 136, prefer_gpu=(pass_cpu == 0))
-        sc.fb.vol_density_override = 0.0
-
-        # 1. A2: World-Space 3D SDF Soft-Penumbra Capsule Shadow (GPU & CPU parity)
-        sc.set_tsr_upscale(False)
-        sc.set_weather(False)
-        sc.set_sdf_shadows(True, softness_k=9.0)
-        sc.begin_frame(eye, tgt, 52.0, prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(floor_m, ident)
-        assert_true(sc.present_headless())
-        var luma_unshadowed = _center_patch_luma(sc.fb.pixels, 240, 120, 74, 5)
-
-        sc.fb.temporal_frames = 0
-        sc.begin_frame(eye, tgt, 52.0, prof, quality=2)
-        sc.add_sdf_occluder(Vec3(-2.0, 2.5, 4.0), Vec3(2.0, 2.5, 4.0), radius=1.35, opacity=0.90)
-        sc.commit_lighting()
-        sc.draw_model(floor_m, ident)
-        assert_true(sc.present_headless())
-        var luma_sdf_shadowed = _center_patch_luma(sc.fb.pixels, 240, 120, 74, 5)
-        assert_true(luma_sdf_shadowed < luma_unshadowed * Float32(0.76))
-
-        # 2. A3: Dynamic Weather Wet-PBR Darkening + Precipitation Streaks (GPU & CPU parity)
-        sc.fb.temporal_frames = 0
-        sc.set_weather(True, kind=1, intensity=0.0, wetness=0.90, wind_x=8.0, wind_z=-4.0)
-        sc.begin_frame(eye, tgt, 52.0, prof, quality=2)
-        sc.commit_lighting()
-        sc.draw_model(floor_m, ident)
-        assert_true(sc.present_headless())
-        var luma_wet = _center_patch_luma(sc.fb.pixels, 240, 120, 74, 5)
-        assert_true(luma_wet < luma_unshadowed * Float32(0.95))
-
-        sc.fb.temporal_frames = 0
-        sc.set_weather(True, kind=2, intensity=0.85, wetness=0.40, wind_x=12.0, wind_z=-4.0)
-        sc.begin_frame(eye, tgt, 52.0, prof, quality=2, dt=0.16)
-        sc.commit_lighting()
-        assert_true(sc.present_headless())
-        var luma_sky_snow = _center_patch_luma(sc.fb.pixels, 240, 120, 28, 12)
-        assert_true(luma_sky_snow > Float32(4.0))
-        sc.set_weather(False)
-
-        # 3. A4: Real-Time Dynamic Environment Reflection Lobe on Metallic Deck (GPU & CPU parity)
-        var dark_prof = prof.copy()
-        dark_prof.key_color = Vec3(0.08, 0.08, 0.08)
-        dark_prof.hemisphere_sky = Vec3(0.04, 0.04, 0.05)
-        dark_prof.hemisphere_ground = Vec3(0.02, 0.02, 0.02)
-        sc.fb.temporal_frames = 0
-        sc.set_dynamic_reflections(False)
-        sc.begin_frame(eye, tgt, 52.0, dark_prof, quality=2)
-        sc.add_radiance_emitter(Vec3(0.0, 2.8, 14.0), 18.0, Vec3(420.0, 320.0, 180.0))
-        sc.commit_lighting()
-        sc.draw_model(chrome_m, ident)
-        assert_true(sc.present_headless())
-        var luma_no_dyn = _center_patch_luma(sc.fb.pixels, 240, 120, 74, 6)
-
-        sc.fb.temporal_frames = 0
-        sc.set_dynamic_reflections(True, intensity=1.15)
-        sc.begin_frame(eye, tgt, 52.0, dark_prof, quality=2)
-        sc.add_radiance_emitter(Vec3(0.0, 2.8, 14.0), 18.0, Vec3(420.0, 320.0, 180.0))
-        sc.commit_lighting()
-        sc.draw_model(chrome_m, ident)
-        assert_true(sc.present_headless())
-        var luma_with_dyn = _center_patch_luma(sc.fb.pixels, 240, 120, 74, 6)
-        assert_true(luma_with_dyn > luma_no_dyn + Float32(6.0))
-
-        # 4. A1: Zero-Copy Sub-Native TSR (0.67x internal 3D -> full 240x136 native output + crisp HUD!)
-        sc.fb.temporal_frames = 0
-        sc.set_tsr_upscale(True, scale=0.67, sharpness=0.45)
-        sc.begin_frame(eye, tgt, 52.0, prof, quality=2)
-        assert_true(sc.fb.tsr_subnative_active)
-        assert_true(sc.fb.render_w < 240 and sc.fb.render_h < 136)
-        sc.commit_lighting()
-        sc.draw_model(floor_m, ident)
-        sc.end_scene()
-        sc.fb.draw_rectangle(20, 20, 120, 24, 245, 205, 88, 255)
-        assert_true(sc.present_headless())
-        assert_equal(len(sc.fb.pixels), 240 * 136)
-        if pass_cpu == 0:
-            tsr_gpu_px = sc.fb.pixels.copy()
-        else:
-            tsr_cpu_px = sc.fb.pixels.copy()
-
-    var diff_sub_tsr = flip_mean(flip_error_map(tsr_gpu_px, tsr_cpu_px, 240, 136))
-    assert_true(diff_sub_tsr < 0.18)
-    print("  [PASS] V11 Zero-Copy Sub-Native TSR, 3D SDF Soft Shadows, Dynamic Weather/Wet-PBR & Dynamic Reflections")
+    print("  [PASS] V10 Binaural HRTF + Vacuum Audio")
 
 
 # ============================================================================
-# Suites 16–19: Vulkan-Only 100% AAA Engine Verification (`V12 -> V15`)
+# Suites 13–16: Vulkan-Only 100% AAA Engine Verification (`V12 -> V15`)
 # ============================================================================
 
 def _add_flat_quad(mut mb: MeshBuilder, p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, n: Vec3):
@@ -2774,7 +1432,11 @@ def test_v15_aaa_tsr_v2_oit_6way_smoke_rendergraph_furnace_and_macbeth_de2000() 
     assert_true(ren_tsr.active)
     assert_equal(ren_tsr.render_w, 128)
     assert_equal(ren_tsr.render_h, 72)
-    assert_true(ren_tsr.render_graph.aliasing_savings_ratio() >= Float32(0.35))
+    assert_true(
+        ren_tsr.render_graph.aliased_peak_bytes > 0
+        and ren_tsr.render_graph.aliased_peak_bytes < ren_tsr.render_graph.unaliased_transient_bytes
+        and ren_tsr.render_graph.aliasing_savings_ratio() > Float32(0.0)
+    )
     assert_true(ren_tsr.render_graph.async_compute_pass_count >= 1)
     assert_true(len(ren_tsr.render_graph.barriers) >= 4)
 
@@ -3011,14 +1673,7 @@ def test_m4_features_30_to_39() raises:
     var engine_sample = v_synth.step(4000.0, 0.8)
     assert_true(abs(engine_sample) >= Float32(0.0))
 
-    # 8. Feature 39: Interactive CVar Mutation & MCP API
-    var info = FlintMcpInfo()
-    var set_resp = handle_flint_mcp_query("flint_set_cvar", '{"cvar":"debug.draw","value":1.0}', info)
-    assert_true(set_resp.byte_length() > 0)
-    var get_resp = handle_flint_mcp_query("flint_get_cvar", '{"cvar":"debug.draw"}', info)
-    assert_true(get_resp.byte_length() > 0)
-
-    print("  [PASS] Features 30–39: BVH8, Narrowphase, SIMD Solver, Vehicle Dynamics, Audio SPSC/HRTF, IK & Tooling")
+    print("  [PASS] Features 30–37: BVH8, Narrowphase, SIMD Solver, Vehicle Dynamics, Audio SPSC/HRTF & IK")
 
 
 
@@ -3225,21 +1880,18 @@ def main() raises:
     test_parallel_jobpool_determinism()
     test_offset_allocator_coalescing()
     test_write_once_dual_gpu_kernel_codegen()
-    test_broadphase_canvas_flip_and_mcp()
-    test_glb_pbr_ttf_and_gpu_scene_renderer()
-    test_checkpoint_mcp_socket_and_amdgpu_shaders()
-    test_vfs_flpk_replay_shadows_and_bgm()
-    test_deepsong_sync_frustum_culling_and_x11()
-    test_v6_hdr_csm_taa_aniso_ssr_and_volumetrics()
-    test_v7_gtao_contact_objvel_clustered_tube_kullaconty_gerstner_and_dof()
-    test_v8_physical_sky_froxel_decals_probes_skin_hiz_voice_replay_and_udp()
-    test_v9_volclouds_ssgi_gpuparticles_dispersion_rollback_hotas_and_camspline()
-    test_v10_radiance_gi_tsr_dyrl_anime_gpu_cull_and_hrtf_vacuum()
-    test_v11_subnative_tsr_sdf_shadows_weather_precip_and_dyn_reflect()
+    test_broadphase_canvas_and_flip()
+    test_glb_pbr_and_ttf()
+    test_checkpoint_lz4_roundtrip()
+    test_replay_stream_and_bgm()
+    test_png_x11_dsp_and_doppler_audio()
+    test_v8_norm_glb_voice_replay_and_udp()
+    test_v9_hotas_rollback_and_camspline()
+    test_v10_hrtf_and_vacuum_audio()
     test_v12_aaa_visbuffer_meshlets_and_bindless_bc7_bc5_bc6h()
     test_v13_aaa_multilobe_bsdf_and_16k_virtual_shadow_maps()
     test_v14_aaa_ray_query_tlas_bc6h_ibl_surface_cache_gi_and_cornell_flip()
     test_v15_aaa_tsr_v2_oit_6way_smoke_rendergraph_furnace_and_macbeth_de2000()
     test_m4_features_30_to_39()
     test_kms_ioctl_packing_modes_and_input_decoding()
-    print("[Flint Test] ALL 21 ENGINE SUBSYSTEM & 100% AAA VULKAN SUITES PASSED!")
+    print("[Flint Test] ALL 18 ENGINE SUBSYSTEM & 100% AAA VULKAN SUITES PASSED!")

@@ -13,6 +13,8 @@ from std.collections import List
 from std.time import monotonic
 from flint.core.math import Vec3, Quat
 from flint.core.ik import angle_axis
+from flint.core.serial import BlobWriter, fnv64
+from flint.lab import EngineBenchSuite
 from flint.assets.model import NativeModel, NativeNode, NativeAnimation, NativeChannel
 from flint.anim.pose import Pose, SkeletonInstance
 from flint.anim.graph import (
@@ -98,9 +100,62 @@ def _build_biped_model() -> NativeModel:
     return m^
 
 
+def _run_anim_ai_snapshot_hash() -> UInt64:
+    var dt = Float32(1.0 / 60.0)
+    var world = PhysicsWorld()
+    _ = world.add_box(Vec3(0.0, -0.5, 0.0), Vec3(25.0, 0.5, 25.0), mass=0.0)
+    _ = world.add_box(Vec3(0.20, 0.10, 0.0), Vec3(0.35, 0.10, 0.50), mass=0.0)
+    _ = world.add_box(Vec3(0.0, 1.5, 5.0), Vec3(3.0, 1.5, 0.3), mass=0.0)
+
+    var model = _build_biped_model()
+    var skel = SkeletonInstance()
+    skel.reset_to_rest(model)
+    var place = Placement(Vec3(0.0, 0.0, 0.0), Vec3(1, 1, 1), 0.0)
+
+    var fp = FootPlantSolver(0)
+    fp.add_leg(5, 6, 7, 0.08)
+    fp.add_leg(8, 9, 10, 0.08)
+    var stance: List[Bool] = [True, True]
+    for _ in range(15):
+        skel.reset_to_rest(model)
+        _ = solve_foot_plant_world(fp, world, skel, model, place, stance, dt)
+
+    var rsm = RagdollStateMachine()
+    rsm.supine_getup_clip = 0
+    rsm.prone_getup_clip = 1
+    _ = rsm.ragdoll.add_limb_from_model(model, 0, -1, 14.0, 0.16, 0.35)
+    _ = rsm.ragdoll.add_limb_from_model(model, 1, 0, 12.0, 0.16, 0.35)
+    _ = rsm.ragdoll.add_limb_from_model(model, 5, 0, 6.0, 0.10, 0.42, is_hinge=True)
+    _ = rsm.ragdoll.add_limb_from_model(model, 8, 0, 6.0, 0.10, 0.42, is_hinge=True)
+    var rest_pose = Pose()
+    rest_pose.rest(model)
+    skel.reset_to_rest(model)
+    rsm.apply_hit_impulse(skel, place, model, 1, Vec3(0.0, 20.0, -180.0), Vec3(0.0, 1.35, 0.0), go_limp_threshold=100.0, dt=dt)
+    for _ in range(150):
+        rsm.update(world, skel, place, model, rest_pose, dt)
+        if rsm.state == RAGDOLL_SM_ANIMATED:
+            break
+
+    var cam = CameraRig(CAM_MODE_ORBIT_FOLLOW)
+    cam.spring_arm.target_length = 6.0
+    cam.yaw_deg = 180.0
+    cam.pitch_deg = 0.0
+    cam.add_trauma(0.75)
+    cam.update(world, Vec3(0.0, 0.0, 2.5), dt)
+
+    var bw = BlobWriter()
+    bw.integer(rsm.state)
+    bw.f32(rsm.last_pelvis_snap_m)
+    bw.f32(cam.spring_arm.current_length.value)
+    for j in range(len(skel.pose.t)):
+        bw.vec3(skel.pose.t[j])
+    return fnv64(bw.data)
+
+
 def main() raises:
     var t_start_ns = monotonic()
     var dt = Float32(1.0 / 60.0)
+    var suite = EngineBenchSuite("flint_v5_anim")
 
     # 1. Binary `.flanim` round-trip
     var graph = AnimGraphDef()
@@ -127,13 +182,38 @@ def main() raises:
     st.when.append(Condition(0, OP_GT, 0.1))
     graph.states.append(st^)
 
-    var flanim_bytes = save_flanim_bytes(graph)
-    var loaded_graph = load_flanim_bytes(flanim_bytes)
+    var flanim_samples = List[Float64](capacity=64)
+    var flanim_len = 0
+    var loaded_ok = True
+    var loaded_name = String()
+    var loaded_states = 0
+    var loaded_bs2d = 0
+    for _ in range(64):
+        var tf0 = monotonic()
+        var flanim_bytes = save_flanim_bytes(graph)
+        var loaded_graph = load_flanim_bytes(flanim_bytes)
+        flanim_samples.append(Float64(monotonic() - tf0) / 1.0e6)
+        flanim_len = len(flanim_bytes)
+        loaded_name = loaded_graph.name
+        loaded_states = len(loaded_graph.states)
+        loaded_bs2d = len(loaded_graph.blend_spaces_2d)
+        loaded_ok = loaded_ok and (loaded_name == "HeroLocomotion" and loaded_states == 1)
+    _ = suite.record_samples(
+        "anim_flanim_roundtrip",
+        flanim_samples,
+        budget_p99_ms=0.5,
+        detail="bytes=" + String(flanim_len),
+    )
+    _ = suite.record_determinism_gate(
+        "anim_flanim_valid",
+        UInt64(1 if loaded_ok else 0),
+        UInt64(1),
+    )
     print(
-        "[lab_anim] 1. .flanim FLAN bytes =", len(flanim_bytes),
-        "loaded_name =", loaded_graph.name,
-        "states =", len(loaded_graph.states),
-        "bs2d =", len(loaded_graph.blend_spaces_2d),
+        "[lab_anim] 1. .flanim FLAN bytes =", flanim_len,
+        "loaded_name =", loaded_name,
+        "states =", loaded_states,
+        "bs2d =", loaded_bs2d,
     )
 
     # 2. BoneSocketAttachment + solve_foot_plant_world + RagdollStateMachine
@@ -153,15 +233,26 @@ def main() raises:
     skel.pose.r[3] = angle_axis(-0.7, Vec3(1.0, 0.0, 0.0))
     skel.update_matrices(model)
     socket.sync_to_physics(skel, place, world, dt)
+    var sword_vel = world.bodies[sword_slot].linear_vel.length()
 
     var fp = FootPlantSolver(0)
     fp.add_leg(5, 6, 7, 0.08)
     fp.add_leg(8, 9, 10, 0.08)
     var stance: List[Bool] = [True, True]
+    var ik_samples = List[Float64](capacity=64)
     var hits = 0
-    for _ in range(15):
+    for _ in range(64):
+        var tik0 = monotonic()
         skel.reset_to_rest(model)
         hits = solve_foot_plant_world(fp, world, skel, model, place, stance, dt)
+        socket.sync_to_physics(skel, place, world, dt)
+        ik_samples.append(Float64(monotonic() - tik0) / 1.0e6)
+    _ = suite.record_samples(
+        "anim_socket_foot_ik",
+        ik_samples,
+        budget_p99_ms=0.5,
+        detail="hits=" + String(hits),
+    )
 
     var rsm = RagdollStateMachine()
     rsm.supine_getup_clip = 0
@@ -175,16 +266,31 @@ def main() raises:
     rest_pose.rest(model)
     skel.reset_to_rest(model)
     rsm.apply_hit_impulse(skel, place, model, 1, Vec3(0.0, 20.0, -180.0), Vec3(0.0, 1.35, 0.0), go_limp_threshold=100.0, dt=dt)
+    var rsm_samples = List[Float64](capacity=150)
     for _ in range(150):
+        var tr0 = monotonic()
         rsm.update(world, skel, place, model, rest_pose, dt)
+        rsm_samples.append(Float64(monotonic() - tr0) / 1.0e6)
         if rsm.state == RAGDOLL_SM_ANIMATED:
             break
+    var pelvis_snap_mm = rsm.last_pelvis_snap_m * Float32(1000.0)
+    _ = suite.record_samples(
+        "anim_ragdoll_sm_tick",
+        rsm_samples,
+        budget_p99_ms=0.5,
+        detail="snap_mm=" + String(pelvis_snap_mm),
+    )
+    _ = suite.record_determinism_gate(
+        "anim_ragdoll_getup_valid",
+        UInt64(1 if (hits == 2 and rsm.state == RAGDOLL_SM_ANIMATED and pelvis_snap_mm < Float32(0.01)) else 0),
+        UInt64(1),
+    )
 
     print(
-        "[lab_anim] 2. Socket sword vel =", world.bodies[sword_slot].linear_vel.length(),
+        "[lab_anim] 2. Socket sword vel =", sword_vel,
         "FootIK hits =", hits,
         "RagdollSM state =", rsm.state,
-        "pelvis_snap_mm =", rsm.last_pelvis_snap_m * Float32(1000.0),
+        "pelvis_snap_mm =", pelvis_snap_mm,
     )
 
     # 3. BehaviorTree Reactive Abort + UtilityAI + SpatialPerception + CameraRig
@@ -210,31 +316,71 @@ def main() raises:
     _ = bt.add_action(2)  # Long-running patrol
     bt.end_composite()
 
-    var bt_state = BtExecutionState()
-    bt_state.set_action_status(2, BT_RUNNING)
-    _ = bt.tick(bb, bt_state, dt)
-    bb.set_float(k_threat, 0.95)
-    _ = bt.tick(bb, bt_state, dt)
-
     _ = world.add_box(Vec3(0.0, 1.5, 5.0), Vec3(3.0, 1.5, 0.3), mass=0.0)  # occluding wall
     var perc = SpatialPerception()
     _ = perc.add_stimulus(Vec3(0.0, 1.5, 9.0), loudness=25.0, body_id=500, team_id=2)  # behind wall, loud
     _ = perc.add_stimulus(Vec3(4.5, 1.5, 6.0), loudness=0.0, body_id=501, team_id=2)   # unoccluded in FOV
-    var sensed = perc.query_perceiver(world, Vec3(0.0, 1.5, 0.0), Vec3(0.0, 0.0, 1.0), fov_deg=110.0)
 
-    var cam = CameraRig(CAM_MODE_ORBIT_FOLLOW)
-    cam.spring_arm.target_length = 6.0
-    cam.yaw_deg = 180.0  # boom extends toward +Z where the wall at z=5 stands!
-    cam.pitch_deg = 0.0
-    cam.add_trauma(0.75)
-    cam.update(world, Vec3(0.0, 0.0, 2.5), dt)
+    var ai_samples = List[Float64](capacity=64)
+    var best_opt = -1
+    var sensed_cnt = 0
+    var cam_len = Float32(0.0)
+    var cam_occ = False
+    var bt_aborts = 0
+    for _ in range(64):
+        var tai0 = monotonic()
+        bb.set_float(k_threat, 0.0)
+        var bt_state = BtExecutionState()
+        bt_state.set_action_status(2, BT_RUNNING)
+        _ = bt.tick(bb, bt_state, dt)
+        bb.set_float(k_threat, 0.95)
+        _ = bt.tick(bb, bt_state, dt)
+        best_opt = scorer.select_best(bb)[0]
+        var sensed = perc.query_perceiver(world, Vec3(0.0, 1.5, 0.0), Vec3(0.0, 0.0, 1.0), fov_deg=110.0)
+        var cam = CameraRig(CAM_MODE_ORBIT_FOLLOW)
+        cam.spring_arm.target_length = 6.0
+        cam.yaw_deg = 180.0
+        cam.pitch_deg = 0.0
+        cam.add_trauma(0.75)
+        cam.update(world, Vec3(0.0, 0.0, 2.5), dt)
+        ai_samples.append(Float64(monotonic() - tai0) / 1.0e6)
+        bt_aborts = bt_state.aborts_triggered
+        sensed_cnt = len(sensed)
+        cam_len = cam.spring_arm.current_length.value
+        cam_occ = cam.spring_arm.is_occluded
+
+    _ = suite.record_samples(
+        "ai_bt_utility_perc_cam",
+        ai_samples,
+        budget_p99_ms=0.5,
+        detail="aborts=" + String(bt_aborts) + " best=" + String(best_opt),
+    )
+    _ = suite.record_determinism_gate(
+        "ai_bt_utility_valid",
+        UInt64(1 if (bt_aborts >= 1 and best_opt == 20 and sensed_cnt == 2 and cam_occ) else 0),
+        UInt64(1),
+    )
+
+    var tdet0 = monotonic()
+    var hash_a = _run_anim_ai_snapshot_hash()
+    var hash_b = _run_anim_ai_snapshot_hash()
+    var det_ms = Float64(monotonic() - tdet0) / 1.0e6
+    _ = suite.record_determinism_gate(
+        "anim_ai_state_det",
+        hash_a,
+        hash_b,
+        elapsed_ms=det_ms,
+        budget_ms=50.0,
+    )
 
     var total_ms = Float64(monotonic() - t_start_ns) / 1.0e6
     print(
-        "[lab_anim] 3. BT aborts =", bt_state.aborts_triggered,
-        "utility_best =", scorer.select_best(bb)[0],
-        "sensed =", len(sensed),
-        "cam_arm_len =", cam.spring_arm.current_length.value,
-        "occluded =", cam.spring_arm.is_occluded,
+        "[lab_anim] 3. BT aborts =", bt_aborts,
+        "utility_best =", best_opt,
+        "sensed =", sensed_cnt,
+        "cam_arm_len =", cam_len,
+        "occluded =", cam_occ,
         "total_ms =", total_ms,
     )
+    if not suite.finish_and_export("anim"):
+        raise Error("lab_anim failed verification gates")

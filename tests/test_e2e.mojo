@@ -1,10 +1,11 @@
 """Flint Engine E2E Test Suite Master Runner.
 
-Aggregates and executes all 480 tests across Tiers 1–4:
+Aggregates and executes all 505 tests across Tiers 1–5:
 - Tier 1: Feature Coverage (F01–F43: 215 tests).
 - Tier 2: Boundary & Corner Cases (F01–F43: 215 tests).
 - Tier 3: Cross-Feature Pairwise Interactions (45 tests).
 - Tier 4: Real-World Application Scenarios (5 tests).
+- Tier 5: Adversarial Coverage Hardening (25 tests).
 """
 from e2e.common.harness import TestContext
 

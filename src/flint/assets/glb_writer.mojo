@@ -33,7 +33,9 @@ def fmt_f32(value: Float32) -> String:
 struct PrimExportIds(Copyable, ImplicitlyCopyable, Movable):
     var pos_acc: Int
     var norm_acc: Int
+    var tang_acc: Int
     var uv_acc: Int
+    var uv1_acc: Int
     var col_acc: Int
     var idx_acc: Int
     var mat_idx: Int
@@ -80,7 +82,7 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
         ref mesh = model.meshes[m_idx]
         var vcount = mesh.vertex_count()
         if vcount <= 0:
-            prim_exports.append(PrimExportIds(-1, -1, -1, -1, -1, -1))
+            prim_exports.append(PrimExportIds(-1, -1, -1, -1, -1, -1, -1, -1))
             continue
 
         # POSITION (VEC3 float32 + min/max)
@@ -156,6 +158,44 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
             '{"bufferView": ' + String(uv_bv) + ', "componentType": 5126, "count": ' + String(vcount) + ', "type": "VEC2"}'
         )
 
+        # TANGENT (optional VEC4 float32)
+        var tang_acc = -1
+        if len(mesh.tangents) >= vcount * 4:
+            pad4(bin_data, 0)
+            var tang_off = len(bin_data)
+            for v in range(vcount):
+                append_f32_le(bin_data, mesh.tangents[v * 4 + 0])
+                append_f32_le(bin_data, mesh.tangents[v * 4 + 1])
+                append_f32_le(bin_data, mesh.tangents[v * 4 + 2])
+                append_f32_le(bin_data, mesh.tangents[v * 4 + 3])
+            var tang_len = len(bin_data) - tang_off
+            var tang_bv = len(buffer_views)
+            buffer_views.append(
+                '{"buffer": 0, "byteOffset": ' + String(tang_off) + ', "byteLength": ' + String(tang_len) + ', "target": 34962}'
+            )
+            tang_acc = len(accessors)
+            accessors.append(
+                '{"bufferView": ' + String(tang_bv) + ', "componentType": 5126, "count": ' + String(vcount) + ', "type": "VEC4"}'
+            )
+
+        # TEXCOORD_1 (optional VEC2 float32)
+        var uv1_acc = -1
+        if len(mesh.texcoords1) >= vcount * 2:
+            pad4(bin_data, 0)
+            var uv1_off = len(bin_data)
+            for v in range(vcount):
+                append_f32_le(bin_data, mesh.texcoords1[v * 2 + 0])
+                append_f32_le(bin_data, mesh.texcoords1[v * 2 + 1])
+            var uv1_len = len(bin_data) - uv1_off
+            var uv1_bv = len(buffer_views)
+            buffer_views.append(
+                '{"buffer": 0, "byteOffset": ' + String(uv1_off) + ', "byteLength": ' + String(uv1_len) + ', "target": 34962}'
+            )
+            uv1_acc = len(accessors)
+            accessors.append(
+                '{"bufferView": ' + String(uv1_bv) + ', "componentType": 5126, "count": ' + String(vcount) + ', "type": "VEC2"}'
+            )
+
         # COLOR_0 (optional VEC4 normalized uint8 -> 5121 normalized)
         var col_acc = -1
         if len(mesh.colors) >= vcount * 4:
@@ -225,6 +265,17 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
         )
         if mesh.normal_orm_texture >= 0 and mesh.normal_orm_texture < len(textures_json):
             mat_str += ', "normalTexture": {"index": ' + String(mesh.normal_orm_texture) + "}"
+        if mesh.occlusion_texture >= 0 and mesh.occlusion_texture < len(textures_json):
+            mat_str += (
+                ', "occlusionTexture": {"index": ' + String(mesh.occlusion_texture)
+                + ', "texCoord": ' + String(mesh.occlusion_texcoord)
+                + ', "strength": ' + fmt_f32(mesh.occlusion_strength) + "}"
+            )
+        if mesh.emissive_texture >= 0 and mesh.emissive_texture < len(textures_json):
+            mat_str += (
+                ', "emissiveTexture": {"index": ' + String(mesh.emissive_texture)
+                + ', "texCoord": ' + String(mesh.emissive_texcoord) + "}"
+            )
         var ext_parts = List[String]()
         if mesh.emissive_strength > 0.0001:
             var ef = mesh.emissive_color
@@ -263,7 +314,7 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
         var mat_idx = len(materials_json)
         materials_json.append(mat_str)
 
-        prim_exports.append(PrimExportIds(pos_acc, norm_acc, uv_acc, col_acc, idx_acc, mat_idx))
+        prim_exports.append(PrimExportIds(pos_acc, norm_acc, tang_acc, uv_acc, uv1_acc, col_acc, idx_acc, mat_idx))
 
     # Helper to format a primitive JSON string
     var gltf_meshes_json = List[String]()
@@ -281,6 +332,10 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
                 prims_str += ", "
             first_p = False
             var attrs = '"POSITION": ' + String(pe.pos_acc) + ', "NORMAL": ' + String(pe.norm_acc) + ', "TEXCOORD_0": ' + String(pe.uv_acc)
+            if pe.tang_acc >= 0:
+                attrs += ', "TANGENT": ' + String(pe.tang_acc)
+            if pe.uv1_acc >= 0:
+                attrs += ', "TEXCOORD_1": ' + String(pe.uv1_acc)
             if pe.col_acc >= 0:
                 attrs += ', "COLOR_0": ' + String(pe.col_acc)
             prims_str += '{"attributes": {' + attrs + '}, "indices": ' + String(pe.idx_acc) + ', "material": ' + String(pe.mat_idx) + ', "mode": 4}'
@@ -307,6 +362,10 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
                         prims_str += ", "
                     var pe = prim_exports[node_prims[p_i]]
                     var attrs = '"POSITION": ' + String(pe.pos_acc) + ', "NORMAL": ' + String(pe.norm_acc) + ', "TEXCOORD_0": ' + String(pe.uv_acc)
+                    if pe.tang_acc >= 0:
+                        attrs += ', "TANGENT": ' + String(pe.tang_acc)
+                    if pe.uv1_acc >= 0:
+                        attrs += ', "TEXCOORD_1": ' + String(pe.uv1_acc)
                     if pe.col_acc >= 0:
                         attrs += ', "COLOR_0": ' + String(pe.col_acc)
                     prims_str += '{"attributes": {' + attrs + '}, "indices": ' + String(pe.idx_acc) + ', "material": ' + String(pe.mat_idx) + ', "mode": 4}'

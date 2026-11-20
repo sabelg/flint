@@ -18,6 +18,7 @@ from flint.assets.cooker_v2 import (
     cook_hdr_texture_bundle,
     cook_png_texture_bundle,
     cook_single_source_bytes,
+    cook_ttf_font_bundle,
 )
 from flint.assets.flpk_v3 import (
     ASSET_KIND_AUDIO,
@@ -28,7 +29,10 @@ from flint.assets.flpk_v3 import (
     ASSET_KIND_TEXTURE,
     SUB_ID_BVH8_COLLIDER,
     SUB_ID_PRIMARY_OR_TAIL,
+    TEX_FMT_BC5_UNORM,
+    TEX_FMT_BC6H_UFLOAT,
     TEX_FMT_BC7_SRGB,
+    TEX_FMT_BC7_UNORM,
     AssetPayload,
     AssetUuid,
     FlpkV3MappedArchive,
@@ -46,8 +50,17 @@ from flint.assets.flpk_v3 import (
 from flint.assets.meshlet import AaaGeometryPool
 from flint.assets.watcher import AssetWatcher
 from flint.physics.bvh import Bvh8MeshCollider
+from flint.platform.audio import decode_wav
 from flint.platform.os import read_bytes
-from flint.render.aaa_render_graph import AaaResidencyStreamer
+from flint.platform.vulkan import (
+    FORMAT_BC5_UNORM,
+    FORMAT_BC6H_UFLOAT,
+    FORMAT_BC7_SRGB,
+    FORMAT_BC7_UNORM,
+    VulkanGpu,
+)
+from flint.render.aaa_render_graph import AaaResidencyStreamer, bc_format_mip_bytes
+from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.render.font import SdfFont
 
 
@@ -206,6 +219,9 @@ struct CookedAudioAsset(AssetPayload):
 # 2. Generational Ref-Counted `TypedAssetStorage[T: AssetPayload]`
 # ============================================================================
 
+comptime AssetEvictCallback = def(Int, Int) thin -> None
+
+
 struct TypedAssetStorage[T: AssetPayload](Movable):
     """Generational arena with O(1) stale-handle rejection, `Optional[T]` slot residency,
     strong ref-counts, immediate payload deinit on LRU eviction/unload, and hot-reload epochs."""
@@ -227,6 +243,8 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
     var cpu_live_bytes: Int
     var vram_live_bytes: Int
     var live_bytes: Int
+    var evict_ctx: Int
+    var evict_cb: Optional[AssetEvictCallback]
 
     def __init__(out self):
         self.payloads = List[Optional[Self.T]]()
@@ -247,6 +265,29 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         self.cpu_live_bytes = 0
         self.vram_live_bytes = 0
         self.live_bytes = 0
+        self.evict_ctx = 0
+        self.evict_cb = None
+
+    def set_evict_hook(mut self, ctx: Int, cb: AssetEvictCallback):
+        self.evict_ctx = ctx
+        self.evict_cb = Optional[AssetEvictCallback](cb)
+
+    def clear_evict_hook(mut self):
+        self.evict_ctx = 0
+        self.evict_cb = None
+
+    def set_slot_vram_bytes_at(mut self, s: Int, vram_bytes: Int) -> Bool:
+        if s < 0 or s >= len(self.occupied) or not self.occupied[s]:
+            return False
+        var prev_vram = self.slot_vram_bytes[s]
+        var next_vram = max(0, vram_bytes)
+        self.slot_vram_bytes[s] = next_vram
+        self.vram_live_bytes = max(0, self.vram_live_bytes - prev_vram + next_vram)
+        self.live_bytes = self.cpu_live_bytes + self.vram_live_bytes
+        return True
+
+    def set_slot_vram_bytes(mut self, handle: Handle[Self.T], vram_bytes: Int) -> Bool:
+        return self.set_slot_vram_bytes_at(self.valid_slot(handle), vram_bytes)
 
     @staticmethod
     @always_inline
@@ -323,7 +364,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         handle: Handle[Self.T],
         var payload: Self.T,
         tick: UInt64,
-        vram_bytes: Int = 0,
+        vram_bytes: Int = -1,
     ) -> Bool:
         """Populates an allocated slot with `Optional[T](payload^)` and updates CPU/VRAM live byte counters."""
         var s = self.valid_slot(handle)
@@ -332,7 +373,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         var prev_cpu = self.slot_cpu_bytes[s]
         var prev_vram = self.slot_vram_bytes[s]
         var next_cpu = max(0, payload.byte_footprint())
-        var next_vram = max(0, vram_bytes)
+        var next_vram = prev_vram if vram_bytes < 0 else max(0, vram_bytes)
         self.payloads[s] = Optional[Self.T](payload^)
         self.states[s] = ASSET_STATE_READY
         self.slot_cpu_bytes[s] = next_cpu
@@ -363,7 +404,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         uuid: AssetUuid,
         rel_path: String,
         tick: UInt64,
-        vram_bytes: Int = 0,
+        vram_bytes: Int = -1,
     ) -> Handle[Self.T]:
         var h = self.allocate_queued(uuid, rel_path, tick)
         _ = self.set_loaded(h, payload^, tick, vram_bytes)
@@ -446,7 +487,7 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         handle: Handle[Self.T],
         var new_payload: Self.T,
         tick: UInt64,
-        vram_bytes: Int = 0,
+        vram_bytes: Int = -1,
     ) -> Bool:
         return self.set_loaded(handle, new_payload^, tick, vram_bytes)
 
@@ -461,6 +502,8 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
         return self.unload(handle)
 
     def _evict_slot_index(mut self, s: Int):
+        if self.evict_cb and self.evict_ctx != 0:
+            self.evict_cb.value()(self.evict_ctx, s)
         var cpu_b = self.slot_cpu_bytes[s]
         var vram_b = self.slot_vram_bytes[s]
         var old_path = self.rel_paths[s]
@@ -696,6 +739,44 @@ def _tex_async_worker(ctx_addr: Int, idx: Int):
 # 4. Async `AssetServer`
 # ============================================================================
 
+def _asset_server_evict_texture_slot(ctx: Int, slot: Int) -> None:
+    if ctx == 0:
+        return
+    ref srv = Pointer[AssetServer, MutAnyOrigin](unsafe_from_address=ctx)[unsafe_offset=0]
+    if srv.renderer_ptr != 0 and slot >= 0 and slot < len(srv.streamer.slot_bindless_idx):
+        var b_idx = srv.streamer.slot_bindless_idx[slot]
+        if b_idx >= 0:
+            ref ren = Pointer[FlintAaaVulkanRenderer, MutAnyOrigin](unsafe_from_address=srv.renderer_ptr)[unsafe_offset=0]
+            if ren.vk.device != 0:
+                ren.evict_bindless_texture_slot(b_idx)
+            srv.streamer.slot_bindless_idx[slot] = -1
+    _ = srv.streamer.evict_slot_gpu(slot)
+
+
+@always_inline
+def _tex_format_to_vk(tex_format: UInt8) -> UInt32:
+    if tex_format == TEX_FMT_BC7_UNORM:
+        return FORMAT_BC7_UNORM
+    if tex_format == TEX_FMT_BC5_UNORM:
+        return FORMAT_BC5_UNORM
+    if tex_format == TEX_FMT_BC6H_UFLOAT:
+        return FORMAT_BC6H_UFLOAT
+    return FORMAT_BC7_SRGB
+
+
+def _infer_queued_bc7_dims(byte_size: Int, mip_level: Int) -> Tuple[Int, Int, Int]:
+    var eff_bytes = max(16, byte_size)
+    var blocks = max(1, (eff_bytes + 15) // 16)
+    var bw = 1
+    while (bw * 2) * (bw * 2) <= blocks:
+        bw *= 2
+    var bh = max(1, (blocks + bw - 1) // bw)
+    var mip_w = max(4, bw * 4)
+    var mip_h = max(4, bh * 4)
+    var shift = max(0, min(12, mip_level))
+    return (max(4, mip_w << shift), max(4, mip_h << shift), max(1, shift + 1))
+
+
 struct AssetServer(Movable):
     """Unified Flint v5 Asset Server managing persistent `.flpk` v3 mounts, generational handles,
     progressive byte-budgeted mip streaming, LRU eviction, and live recursive `inotify` hot-reload."""
@@ -703,6 +784,7 @@ struct AssetServer(Movable):
     var loose_root: String
     var watcher: AssetWatcher
     var streamer: AaaResidencyStreamer
+    var renderer_ptr: Int
     var stream_budget_bytes_per_tick: Int
     var lru_max_bytes: Int
     var current_tick: UInt64
@@ -728,6 +810,7 @@ struct AssetServer(Movable):
         self.loose_root = String()
         self.watcher = AssetWatcher(enabled=enable_watcher)
         self.streamer = AaaResidencyStreamer(max_textures=1024, initial_tail_mip=4)
+        self.renderer_ptr = 0
         self.stream_budget_bytes_per_tick = max(256, stream_budget_bytes_per_tick)
         self.lru_max_bytes = max(65536, lru_max_bytes)
         self.current_tick = 1
@@ -743,10 +826,161 @@ struct AssetServer(Movable):
         self.pending_mesh_loads = List[_PendingMeshLoad]()
         self.pending_texture_loads = List[_PendingTextureLoad]()
 
+    def __moveinit__(out self, deinit existing: Self):
+        self.mounts = existing.mounts^
+        self.loose_root = existing.loose_root^
+        self.watcher = existing.watcher^
+        self.streamer = existing.streamer^
+        self.renderer_ptr = existing.renderer_ptr
+        self.stream_budget_bytes_per_tick = existing.stream_budget_bytes_per_tick
+        self.lru_max_bytes = existing.lru_max_bytes
+        self.current_tick = existing.current_tick
+        self.hot_reloads_applied = existing.hot_reloads_applied
+        self.meshes = existing.meshes^
+        self.textures = existing.textures^
+        self.hdrs = existing.hdrs^
+        self.fonts = existing.fonts^
+        self.audios = existing.audios^
+        self.raws = existing.raws^
+        self.pending_mesh_loads = existing.pending_mesh_loads^
+        self.pending_texture_loads = existing.pending_texture_loads^
+        existing.renderer_ptr = 0
+        if self.textures.evict_cb:
+            self.textures.evict_ctx = Int(Pointer(to=self))
+
     def close(mut self):
+        self.textures.clear_evict_hook()
+        self.streamer.detach_vulkan()
+        self.renderer_ptr = 0
         for i in range(len(self.mounts)):
             self.mounts[i].close()
         self.mounts.clear()
+
+    def attach_vulkan_residency_bridge(mut self, mut vk: VulkanGpu):
+        """Attaches a standalone `VulkanGpu` to `AaaResidencyStreamer` for real GPU mip uploads & VRAM tracking."""
+        self.renderer_ptr = 0
+        self.streamer.attach_vulkan(vk)
+        self.textures.set_evict_hook(Int(Pointer(to=self)), _asset_server_evict_texture_slot)
+
+    def attach_renderer_residency_bridge(mut self, mut ren: FlintAaaVulkanRenderer):
+        """Attaches a live `FlintAaaVulkanRenderer` so streamed mips stage into bindless slots with `minLod` clamping."""
+        self.renderer_ptr = Int(Pointer(to=ren))
+        self.streamer.attach_vulkan(ren.vk)
+        self.textures.set_evict_hook(Int(Pointer(to=self)), _asset_server_evict_texture_slot)
+
+    def upload_mip_to_gpu(
+        mut self,
+        handle: Handle[CookedTextureAsset],
+        mip_level: Int = 0,
+        byte_size: Int = 0,
+    ) -> Bool:
+        """Uploads `mip_level` of `handle` (loaded or queued) to GPU VRAM and updates `slot_vram_bytes`."""
+        var s = self.textures.valid_slot(handle)
+        if s < 0:
+            return False
+        if self.renderer_ptr == 0 and self.streamer.vk_ptr == 0:
+            return False
+        self.textures.set_evict_hook(Int(Pointer(to=self)), _asset_server_evict_texture_slot)
+
+        var width: Int
+        var height: Int
+        var mip_count: Int
+        var vk_fmt = FORMAT_BC7_SRGB
+        var data_ptr = 0
+        var data_bytes = max(16, byte_size)
+        var eff_mip = max(0, mip_level)
+
+        if self.textures.payloads[s]:
+            ref tex = self.textures.payloads[s].unsafe_value()
+            width = max(1, tex.width)
+            height = max(1, tex.height)
+            mip_count = max(1, min(16, tex.mip_count))
+            eff_mip = max(0, min(mip_count - 1, mip_level))
+            vk_fmt = _tex_format_to_vk(tex.tex_format)
+            if eff_mip < len(tex.mips) and len(tex.mips[eff_mip]) > 0:
+                data_ptr = Int(tex.mips[eff_mip].unsafe_ptr())
+                data_bytes = len(tex.mips[eff_mip])
+            elif eff_mip < 16 and tex.mip_sizes[eff_mip] > 0:
+                data_bytes = Int(tex.mip_sizes[eff_mip])
+            if eff_mip < tex.resident_min_mip:
+                tex.resident_min_mip = eff_mip
+        else:
+            var dims = _infer_queued_bc7_dims(byte_size, eff_mip)
+            width = dims[0]
+            height = dims[1]
+            mip_count = dims[2]
+
+        if self.renderer_ptr != 0:
+            ref ren = Pointer[FlintAaaVulkanRenderer, MutAnyOrigin](unsafe_from_address=self.renderer_ptr)[unsafe_offset=0]
+            if ren.vk.device == 0:
+                return False
+            self.streamer._ensure_slot(s)
+            var b_idx = self.streamer.slot_bindless_idx[s]
+            var need_alloc = b_idx < 0 or b_idx >= len(ren.bindless_images) or ren.bindless_images[b_idx].image == 0
+            if not need_alloc:
+                if (
+                    ren.bindless_images[b_idx].width != width
+                    or ren.bindless_images[b_idx].height != height
+                    or ren.bindless_images[b_idx].format != vk_fmt
+                    or ren.bindless_images[b_idx].mip_levels != mip_count
+                ):
+                    ren.evict_bindless_texture_slot(b_idx)
+                    need_alloc = True
+            if need_alloc:
+                b_idx = ren.allocate_bindless_texture_slot(width, height, mip_count, vk_fmt)
+                if b_idx < 0:
+                    return False
+                self.streamer.slot_bindless_idx[s] = b_idx
+            var minfo = bc_format_mip_bytes(width, height, eff_mip, vk_fmt)
+            var vram_b = ren.upload_bindless_mip_staged(
+                b_idx,
+                eff_mip,
+                minfo[0],
+                minfo[1],
+                data_ptr,
+                max(minfo[2], data_bytes),
+            )
+            if vram_b <= 0:
+                return False
+            var prev_sv = self.streamer.slot_vram_bytes[s]
+            self.streamer.slot_vram_bytes[s] = vram_b
+            self.streamer.vram_live_bytes = max(0, self.streamer.vram_live_bytes - prev_sv + vram_b)
+            self.streamer.slot_mip_mask[s] |= UInt32(1) << UInt32(eff_mip)
+            if eff_mip < self.streamer.resident_min_mip[s]:
+                self.streamer.resident_min_mip[s] = eff_mip
+            _ = self.textures.set_slot_vram_bytes_at(s, vram_b)
+            return True
+
+        var vram_b = self.streamer.upload_mip_to_slot(
+            s,
+            eff_mip,
+            width,
+            height,
+            mip_count,
+            vk_fmt,
+            data_ptr,
+            data_bytes,
+        )
+        if vram_b <= 0:
+            return False
+        _ = self.textures.set_slot_vram_bytes_at(s, vram_b)
+        return True
+
+    def _upload_resident_mips_to_gpu(mut self, handle: Handle[CookedTextureAsset]):
+        if self.renderer_ptr == 0 and self.streamer.vk_ptr == 0:
+            return
+        var s = self.textures.valid_slot(handle)
+        if s < 0 or not self.textures.payloads[s]:
+            return
+        var m_cnt = self.textures.payloads[s].unsafe_value().mip_count
+        var res_min = self.textures.payloads[s].unsafe_value().resident_min_mip
+        var m = m_cnt - 1
+        while m >= max(0, res_min):
+            if m < len(self.textures.payloads[s].unsafe_value().mips):
+                var blen = len(self.textures.payloads[s].unsafe_value().mips[m])
+                if blen > 0:
+                    _ = self.upload_mip_to_gpu(handle, m, blen)
+            m -= 1
 
     def mount_flpk(mut self, pack_path: String) -> Bool:
         """Mounts a `.flpk` v3 archive persistently via `mmap` (zero per-read `mmap`/`munmap` churn!)."""
@@ -891,15 +1125,18 @@ struct AssetServer(Movable):
 
             var h = self.textures.insert(asset^, entry.uuid, rel_path, self.current_tick)
             var slot_i = Int(h.slot())
-            if slot_i >= 0 and slot_i < len(self.streamer.resident_min_mip):
-                self.streamer.resident_min_mip[slot_i] = Int(hdr.tail_first_mip)
-                self.streamer.requested_min_mip[slot_i] = Int(hdr.tail_first_mip)
+            self.streamer._ensure_slot(slot_i)
+            self.streamer.resident_min_mip[slot_i] = Int(hdr.tail_first_mip)
+            self.streamer.requested_min_mip[slot_i] = Int(hdr.tail_first_mip)
+            self._upload_resident_mips_to_gpu(h)
             if progressive and Int(hdr.tail_first_mip) > 0:
                 self.request_texture_mips(h, target_min_mip=0)
             else:
                 # Eagerly load all high-res mips immediately
                 for m in range(Int(hdr.tail_first_mip) - 1, -1, -1):
-                    _ = self._stream_single_texture_mip(slot_i, m)
+                    if self._stream_single_texture_mip(slot_i, m):
+                        if self.renderer_ptr != 0 or self.streamer.vk_ptr != 0:
+                            _ = self.upload_mip_to_gpu(h, m, 0)
             return h
 
         if self.loose_root.byte_length() > 0:
@@ -925,7 +1162,13 @@ struct AssetServer(Movable):
                             var sub_m = Int(cooked.chunks[ci].sub_id) - 1
                             if sub_m >= 0 and sub_m < len(asset.mips):
                                 asset.mips[sub_m] = cooked.chunks[ci].raw_payload.copy()
-                        return self.textures.insert(asset^, meta.uuid, rel_path, self.current_tick)
+                        var h = self.textures.insert(asset^, meta.uuid, rel_path, self.current_tick)
+                        var slot_i = Int(h.slot())
+                        self.streamer._ensure_slot(slot_i)
+                        self.streamer.resident_min_mip[slot_i] = 0
+                        self.streamer.requested_min_mip[slot_i] = 0
+                        self._upload_resident_mips_to_gpu(h)
+                        return h
         return Handle[CookedTextureAsset]()
 
     def request_texture_mips(mut self, handle: Handle[CookedTextureAsset], target_min_mip: Int = 0, priority: Int = 0):
@@ -1055,6 +1298,20 @@ struct AssetServer(Movable):
                 fa.dsf_data = pay[1].copy()
                 _ = fa.font.load_bytes(fa.dsf_data)
                 return self.fonts.insert(fa^, e.uuid, rel_path, self.current_tick)
+        if self.loose_root.byte_length() > 0:
+            var full = self.loose_root + "/" + rel_path
+            var raw = read_bytes(full)
+            if len(raw) > 0:
+                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_FONT)
+                var fa = CookedFontAsset()
+                if fa.font.load_bytes(raw):
+                    fa.dsf_data = raw.copy()
+                    return self.fonts.insert(fa^, meta.uuid, rel_path, self.current_tick)
+                var cooked = cook_ttf_font_bundle(raw, meta, rel_path)
+                if cooked.valid and len(cooked.chunks) > 0:
+                    fa.dsf_data = cooked.chunks[0].raw_payload.copy()
+                    if fa.font.load_bytes(fa.dsf_data):
+                        return self.fonts.insert(fa^, meta.uuid, rel_path, self.current_tick)
         return Handle[CookedFontAsset]()
 
     def load_audio(mut self, rel_path: String) -> Handle[CookedAudioAsset]:
@@ -1076,6 +1333,25 @@ struct AssetServer(Movable):
                     aa.sample_rate = dec[2]
                     aa.samples = dec[3].copy()
                     return self.audios.insert(aa^, e.uuid, rel_path, self.current_tick)
+        if self.loose_root.byte_length() > 0:
+            var full = self.loose_root + "/" + rel_path
+            var raw = read_bytes(full)
+            if len(raw) > 0:
+                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_AUDIO)
+                var dec = decode_audio_pcm_slab(raw)
+                if dec[0]:
+                    var aa = CookedAudioAsset()
+                    aa.channels = dec[1]
+                    aa.sample_rate = dec[2]
+                    aa.samples = dec[3].copy()
+                    return self.audios.insert(aa^, meta.uuid, rel_path, self.current_tick)
+                var clip = decode_wav(raw)
+                if clip.valid:
+                    var aa = CookedAudioAsset()
+                    aa.channels = clip.channels
+                    aa.sample_rate = clip.sample_rate
+                    aa.samples = clip.samples.copy()
+                    return self.audios.insert(aa^, meta.uuid, rel_path, self.current_tick)
         return Handle[CookedAudioAsset]()
 
     def load_raw(mut self, rel_path: String) -> Handle[RawBytesAsset]:
@@ -1222,16 +1498,23 @@ struct AssetServer(Movable):
                     var prog = tctx.jobs[i].progressive
                     var a = tctx.jobs[i].asset.copy()
                     _ = self.textures.set_loaded(h, a^, self.current_tick)
+                    var slot_i = Int(h.slot())
+                    self.streamer._ensure_slot(slot_i)
                     if is_cooked:
-                        var slot_i = Int(h.slot())
-                        if slot_i >= 0 and slot_i < len(self.streamer.resident_min_mip):
-                            self.streamer.resident_min_mip[slot_i] = tail_mip
-                            self.streamer.requested_min_mip[slot_i] = tail_mip
+                        self.streamer.resident_min_mip[slot_i] = tail_mip
+                        self.streamer.requested_min_mip[slot_i] = tail_mip
+                        self._upload_resident_mips_to_gpu(h)
                         if prog and tail_mip > 0:
                             self.request_texture_mips(h, target_min_mip=0)
                         else:
                             for m in range(tail_mip - 1, -1, -1):
-                                _ = self._stream_single_texture_mip(slot_i, m)
+                                if self._stream_single_texture_mip(slot_i, m):
+                                    if self.renderer_ptr != 0 or self.streamer.vk_ptr != 0:
+                                        _ = self.upload_mip_to_gpu(h, m, 0)
+                    else:
+                        self.streamer.resident_min_mip[slot_i] = 0
+                        self.streamer.requested_min_mip[slot_i] = 0
+                        self._upload_resident_mips_to_gpu(h)
                 else:
                     _ = self.textures.set_failed(h)
                 completed += 1
@@ -1272,6 +1555,7 @@ struct AssetServer(Movable):
                             asset.mips[sm] = cooked.chunks[ci].raw_payload.copy()
                     var h = Handle[CookedTextureAsset](UInt32(ts), self.textures.generations[ts])
                     if self.textures.replace_in_place(h, asset^, self.current_tick):
+                        self._upload_resident_mips_to_gpu(h)
                         self.hot_reloads_applied += 1
                         return True
 
@@ -1318,6 +1602,49 @@ struct AssetServer(Movable):
                     if self.hdrs.replace_in_place(h, asset^, self.current_tick):
                         self.hot_reloads_applied += 1
                         return True
+
+        # Check fonts (O(1) lookup)
+        var fs = self.fonts.find_slot_by_path(rel_path)
+        if fs >= 0:
+            var fa = CookedFontAsset()
+            var loaded_ok = fa.font.load_bytes(raw)
+            if loaded_ok:
+                fa.dsf_data = raw.copy()
+            else:
+                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_FONT)
+                var cooked = cook_ttf_font_bundle(raw, meta, rel_path)
+                if cooked.valid and len(cooked.chunks) > 0:
+                    fa.dsf_data = cooked.chunks[0].raw_payload.copy()
+                    loaded_ok = fa.font.load_bytes(fa.dsf_data)
+            if loaded_ok:
+                var h = Handle[CookedFontAsset](UInt32(fs), self.fonts.generations[fs])
+                if self.fonts.replace_in_place(h, fa^, self.current_tick):
+                    self.hot_reloads_applied += 1
+                    return True
+
+        # Check audios (O(1) lookup)
+        var aus = self.audios.find_slot_by_path(rel_path)
+        if aus >= 0:
+            var aa = CookedAudioAsset()
+            var ok_aud = False
+            var dec = decode_audio_pcm_slab(raw)
+            if dec[0]:
+                aa.channels = dec[1]
+                aa.sample_rate = dec[2]
+                aa.samples = dec[3].copy()
+                ok_aud = True
+            else:
+                var clip = decode_wav(raw)
+                if clip.valid:
+                    aa.channels = clip.channels
+                    aa.sample_rate = clip.sample_rate
+                    aa.samples = clip.samples.copy()
+                    ok_aud = True
+            if ok_aud:
+                var h = Handle[CookedAudioAsset](UInt32(aus), self.audios.generations[aus])
+                if self.audios.replace_in_place(h, aa^, self.current_tick):
+                    self.hot_reloads_applied += 1
+                    return True
 
         # Check raw bytes (O(1) lookup)
         var rs = self.raws.find_slot_by_path(rel_path)
@@ -1386,6 +1713,13 @@ struct AssetServer(Movable):
             var u = drained[i]
             if not u.is_mesh_lod:
                 if self._stream_single_texture_mip(u.target_id, u.sub_level):
+                    if (
+                        (self.renderer_ptr != 0 or self.streamer.vk_ptr != 0)
+                        and u.target_id >= 0
+                        and u.target_id < len(self.textures.generations)
+                    ):
+                        var th = Handle[CookedTextureAsset](UInt32(u.target_id), self.textures.generations[u.target_id])
+                        _ = self.upload_mip_to_gpu(th, u.sub_level, u.byte_size)
                     work_done += 1
 
         # 2. Poll recursive `inotify` AssetWatcher for live hot-reload

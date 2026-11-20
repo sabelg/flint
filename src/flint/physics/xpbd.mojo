@@ -12,7 +12,7 @@ Upgrades in v4:
 """
 from std.collections import List
 from std.math import sqrt, max, min, abs
-from flint.core.math import Vec3
+from flint.core.math import Vec3, Quat
 from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.physics.solver_bodies import SolverBodies, rotate_vec
 
@@ -23,6 +23,11 @@ comptime XPBD_CHAIN_TAG: UInt32 = fourcc("XPBC")
 comptime XPBD_MESH_TAG: UInt32 = fourcc("XPBM")
 comptime XPBD_ATT_TAG: UInt32 = fourcc("XPBA")
 comptime XPBD_BLOB_VERSION: Int = 1
+comptime XPBD_ATT_BLOB_VERSION: Int = 2
+
+comptime COLLIDER_SPHERE: Int = 0
+comptime COLLIDER_CAPSULE: Int = 1
+comptime COLLIDER_BOX: Int = 2
 
 
 struct ChainCollider(Copyable, ImplicitlyCopyable, Movable):
@@ -30,22 +35,50 @@ struct ChainCollider(Copyable, ImplicitlyCopyable, Movable):
     var end: Vec3
     var radius: Float32
     var is_capsule: Bool
+    var kind: Int
+    var rot: Quat
+    var half_extents: Vec3
+    var solver_body: Int
+    var body_id: Int
 
-    def __init__(out self, center: Vec3, radius: Float32):
+    def __init__(out self, center: Vec3, radius: Float32, solver_body: Int = -1, body_id: Int = -1):
         self.center = center
         self.end = center
         self.radius = radius
         self.is_capsule = False
+        self.kind = COLLIDER_SPHERE
+        self.rot = Quat()
+        self.half_extents = Vec3()
+        self.solver_body = solver_body
+        self.body_id = body_id
 
-    def __init__(out self, a: Vec3, b: Vec3, radius: Float32):
+    def __init__(out self, a: Vec3, b: Vec3, radius: Float32, solver_body: Int = -1, body_id: Int = -1):
         self.center = a
         self.end = b
         self.radius = radius
         self.is_capsule = True
+        self.kind = COLLIDER_CAPSULE
+        self.rot = Quat()
+        self.half_extents = Vec3()
+        self.solver_body = solver_body
+        self.body_id = body_id
 
     @staticmethod
-    def capsule(a: Vec3, b: Vec3, radius: Float32) -> Self:
-        return Self(a, b, radius)
+    def sphere(center: Vec3, radius: Float32, solver_body: Int = -1, body_id: Int = -1) -> Self:
+        return Self(center, radius, solver_body, body_id)
+
+    @staticmethod
+    def capsule(a: Vec3, b: Vec3, radius: Float32, solver_body: Int = -1, body_id: Int = -1) -> Self:
+        return Self(a, b, radius, solver_body, body_id)
+
+    @staticmethod
+    def box(center: Vec3, rot: Quat, half_extents: Vec3, solver_body: Int = -1, body_id: Int = -1) -> Self:
+        var out = Self(center, Float32(0.0), solver_body, body_id)
+        out.kind = COLLIDER_BOX
+        out.is_capsule = False
+        out.rot = rot.normalized()
+        out.half_extents = half_extents
+        return out
 
     @always_inline
     def closest_axis_point(self, p: Vec3) -> Vec3:
@@ -61,9 +94,10 @@ struct ChainCollider(Copyable, ImplicitlyCopyable, Movable):
 
 struct RigidAttachment(Copyable, ImplicitlyCopyable, Movable):
     """Two-way XPBD attachment linking particle `particle` to `SolverBodies` row `solver_body`
-    at body-local offset `local_anchor` with compliance `compliance` (m/N)."""
+    (or persistent `PhysicsWorld` body `body_id`) at body-local offset `local_anchor` with compliance `compliance` (m/N)."""
     var particle: Int
     var solver_body: Int
+    var body_id: Int
     var local_anchor: Vec3
     var rest_length: Float32
     var compliance: Float32
@@ -76,33 +110,169 @@ struct RigidAttachment(Copyable, ImplicitlyCopyable, Movable):
         local_anchor: Vec3,
         compliance: Float32 = 0.0,
         rest_length: Float32 = 0.0,
+        body_id: Int = -1,
     ):
         self.particle = particle
         self.solver_body = solver_body
+        self.body_id = body_id
         self.local_anchor = local_anchor
         self.rest_length = rest_length
         self.compliance = compliance
         self.lam = 0.0
 
+    @staticmethod
+    def to_body_id(
+        particle: Int,
+        body_id: Int,
+        local_anchor: Vec3,
+        compliance: Float32 = 0.0,
+        rest_length: Float32 = 0.0,
+    ) -> Self:
+        return Self(particle, -1, local_anchor, compliance, rest_length, body_id)
+
     def serialize(self, mut w: BlobWriter):
-        w.begin(XPBD_ATT_TAG, XPBD_BLOB_VERSION)
+        w.begin(XPBD_ATT_TAG, XPBD_ATT_BLOB_VERSION)
         w.integer(self.particle)
         w.integer(self.solver_body)
         w.vec3(self.local_anchor)
         w.f32(self.rest_length)
         w.f32(self.compliance)
         w.f32(self.lam)
+        w.integer(self.body_id)
         w.end()
 
     def deserialize(mut self, mut r: BlobReader) raises:
-        _ = r.enter(XPBD_ATT_TAG, XPBD_BLOB_VERSION)
+        var ver = r.enter(XPBD_ATT_TAG, XPBD_ATT_BLOB_VERSION)
         self.particle = r.integer()
         self.solver_body = r.integer()
         self.local_anchor = r.vec3()
         self.rest_length = r.f32()
         self.compliance = r.f32()
         self.lam = r.f32()
+        self.body_id = r.integer() if ver >= 2 else -1
         r.leave()
+
+
+@always_inline
+def _particle_attached_to_collider(
+    particle: Int,
+    c: ChainCollider,
+    attachments: List[RigidAttachment],
+) -> Bool:
+    for a_i in range(len(attachments)):
+        ref att = attachments[a_i]
+        if att.particle != particle:
+            continue
+        if c.body_id >= 0 and att.body_id == c.body_id:
+            return True
+        if c.solver_body >= 0 and att.solver_body == c.solver_body:
+            return True
+    return False
+
+
+@always_inline
+def _collide_particle_with_collider(
+    mut p: Vec3,
+    p_radius: Float32,
+    wp: Float32,
+    c: ChainCollider,
+    mut bodies: SolverBodies,
+    h: Float32,
+    sub_t: Float32,
+) -> Bool:
+    """Resolves particle vs Sphere/Capsule/OBB `ChainCollider` with two-way impulse exchange
+    onto `bodies[c.solver_body]` when `solver_body` refers to a dynamic `SolverBodies` row.
+    Returns `True` if contact occurred."""
+    var b = c.solver_body
+    var has_solver = b >= 0 and b < bodies.count
+    var shift = bodies.velocity(b) * sub_t if has_solver else Vec3()
+    var c_center = c.center + shift
+    var c_end = c.end + shift
+
+    var n_w: Vec3
+    var pen: Float32
+    var contact_pt: Vec3
+
+    if c.kind == COLLIDER_BOX:
+        var p_loc = c.rot.conjugate().rotate(p - c_center)
+        var he = c.half_extents
+        var clamped = Vec3(
+            max(-he.x, min(he.x, p_loc.x)),
+            max(-he.y, min(he.y, p_loc.y)),
+            max(-he.z, min(he.z, p_loc.z)),
+        )
+        var diff = p_loc - clamped
+        var d = diff.length()
+        if d > Float32(1.0e-6):
+            if d >= p_radius:
+                return False
+            var n_loc = diff * (Float32(1.0) / d)
+            pen = p_radius - d
+            n_w = c.rot.rotate(n_loc)
+            contact_pt = c_center + c.rot.rotate(clamped)
+        else:
+            var dx = he.x - abs(p_loc.x)
+            var dy = he.y - abs(p_loc.y)
+            var dz = he.z - abs(p_loc.z)
+            var n_loc: Vec3
+            var face_d: Float32
+            if dx <= dy and dx <= dz:
+                n_loc = Vec3(Float32(1.0) if p_loc.x >= Float32(0.0) else Float32(-1.0), 0.0, 0.0)
+                face_d = dx
+            elif dy <= dz:
+                n_loc = Vec3(0.0, Float32(1.0) if p_loc.y >= Float32(0.0) else Float32(-1.0), 0.0)
+                face_d = dy
+            else:
+                n_loc = Vec3(0.0, 0.0, Float32(1.0) if p_loc.z >= Float32(0.0) else Float32(-1.0))
+                face_d = dz
+            pen = face_d + p_radius
+            n_w = c.rot.rotate(n_loc)
+            contact_pt = c_center + c.rot.rotate(p_loc + n_loc * face_d)
+    else:
+        var cp = c_center
+        if c.is_capsule:
+            var ab = c_end - c_center
+            var ab2 = ab.length_squared()
+            if ab2 > Float32(1.0e-10):
+                var t = max(Float32(0.0), min(Float32(1.0), (p - c_center).dot(ab) / ab2))
+                cp = c_center + ab * t
+        var d_vec = p - cp
+        var dist = d_vec.length()
+        var reach = c.radius + p_radius
+        if dist >= reach:
+            return False
+        if dist > Float32(1.0e-6):
+            n_w = d_vec * (Float32(1.0) / dist)
+        else:
+            n_w = Vec3(0.0, 1.0, 0.0)
+        pen = reach - dist
+        contact_pt = cp + n_w * c.radius
+
+    if pen <= Float32(0.0):
+        return False
+
+    var mb = bodies.inv_mass[b] if has_solver else Float32(0.0)
+    if not has_solver or mb <= Float32(0.0):
+        p = p + n_w * pen
+        return True
+
+    var rb = contact_pt - (bodies.center(b) + shift)
+    var ib = bodies.inertia(b)
+    var rn = rb.cross(n_w)
+    var w_body = mb + rn.dot(ib.apply(rn))
+    var denom = wp + w_body
+    if denom <= Float32(1.0e-12):
+        return False
+
+    var dl = pen / denom
+    if wp > Float32(0.0):
+        p = p + n_w * (wp * dl)
+
+    var j_body = -n_w * (dl / h)
+    var vb = bodies.velocity(b) + j_body * mb
+    var wb = bodies.angular(b) + ib.apply(rb.cross(j_body))
+    bodies.set_velocity(b, vb, wb)
+    return True
 
 
 @always_inline
@@ -247,6 +417,75 @@ struct ParticleChain(Copyable, Movable):
         var dummy_bodies = SolverBodies()
         self.step_coupled(dt, substeps, gravity, wind, colliders, dummy_atts, dummy_bodies, iterations)
 
+    def step_substep_coupled(
+        mut self,
+        h: Float32,
+        sub_t: Float32,
+        gravity: Float32,
+        wind: List[Vec3],
+        colliders: List[ChainCollider],
+        mut attachments: List[RigidAttachment],
+        mut bodies: SolverBodies,
+        iterations: Int = 2,
+    ):
+        """Advances one XPBD substep of size `h` with two-way `RigidAttachment` impulse feedback."""
+        if h <= Float32(1.0e-8):
+            return
+        var iters = max(1, iterations)
+        var alpha_tilde = self.compliance / (h * h)
+
+        self._ensure_lambdas()
+        for a_i in range(len(attachments)):
+            attachments[a_i].lam = Float32(0.0)
+
+        for i in range(len(self.position)):
+            self.previous[i] = self.position[i]
+            if self.inv_mass[i] == 0:
+                continue
+            var v = self.velocity[i]
+            v.y -= gravity * h
+            if i < len(wind):
+                v = v + (wind[i] - v) * min(Float32(1), self.wind_drag * h)
+            v = v * max(Float32(0), 1 - self.damping * h)
+            self.velocity[i] = v
+            self.position[i] = self.position[i] + v * h
+
+        for _ in range(iters):
+            for a_i in range(len(attachments)):
+                _project_rigid_attachment(self.position, self.inv_mass, attachments[a_i], bodies, h, sub_t)
+
+            for i in range(len(self.rest)):
+                var wa = self.inv_mass[i]
+                var wb = self.inv_mass[i + 1]
+                var w_sum = wa + wb
+                var denom = w_sum + alpha_tilde
+                if denom <= Float32(0.0) or w_sum <= Float32(0.0):
+                    continue
+                var d = self.position[i + 1] - self.position[i]
+                var length = d.length()
+                if length < Float32(1.0e-6):
+                    continue
+                var c = length - self.rest[i]
+                var lam = self.lambdas[i]
+                var dl = (-c - alpha_tilde * lam) / denom
+                self.lambdas[i] = lam + dl
+                var n_dir = d * (Float32(1.0) / length)
+                self.position[i] = self.position[i] - n_dir * (dl * wa)
+                self.position[i + 1] = self.position[i + 1] + n_dir * (dl * wb)
+
+        for i in range(len(self.position)):
+            if self.inv_mass[i] == 0:
+                continue
+            for c in colliders:
+                if _particle_attached_to_collider(i, c, attachments):
+                    continue
+                var p_i = self.position[i]
+                if _collide_particle_with_collider(p_i, Float32(0.0), self.inv_mass[i], c, bodies, h, sub_t):
+                    self.position[i] = p_i
+            if self.position[i].y < self.floor:
+                self.position[i].y = self.floor
+            self.velocity[i] = (self.position[i] - self.previous[i]) * (Float32(1.0) / h)
+
     def step_coupled(
         mut self,
         dt: Float32,
@@ -262,66 +501,11 @@ struct ParticleChain(Copyable, Movable):
         if dt <= Float32(1.0e-8):
             return
         var n = max(1, substeps)
-        var iters = max(1, iterations)
         var h = dt / Float32(n)
-        var alpha_tilde = self.compliance / (h * h)
-
         for sub in range(n):
-            var sub_t = Float32(sub) * h
-            self._ensure_lambdas()
-            for a_i in range(len(attachments)):
-                attachments[a_i].lam = Float32(0.0)
-
-            for i in range(len(self.position)):
-                self.previous[i] = self.position[i]
-                if self.inv_mass[i] == 0:
-                    continue
-                var v = self.velocity[i]
-                v.y -= gravity * h
-                if i < len(wind):
-                    v = v + (wind[i] - v) * min(Float32(1), self.wind_drag * h)
-                v = v * max(Float32(0), 1 - self.damping * h)
-                self.velocity[i] = v
-                self.position[i] = self.position[i] + v * h
-
-            for _ in range(iters):
-                for a_i in range(len(attachments)):
-                    _project_rigid_attachment(self.position, self.inv_mass, attachments[a_i], bodies, h, sub_t)
-
-                for i in range(len(self.rest)):
-                    var wa = self.inv_mass[i]
-                    var wb = self.inv_mass[i + 1]
-                    var w_sum = wa + wb
-                    var denom = w_sum + alpha_tilde
-                    if denom <= Float32(0.0) or w_sum <= Float32(0.0):
-                        continue
-                    var d = self.position[i + 1] - self.position[i]
-                    var length = d.length()
-                    if length < Float32(1.0e-6):
-                        continue
-                    var c = length - self.rest[i]
-                    var lam = self.lambdas[i]
-                    var dl = (-c - alpha_tilde * lam) / denom
-                    self.lambdas[i] = lam + dl
-                    var n_dir = d * (Float32(1.0) / length)
-                    self.position[i] = self.position[i] - n_dir * (dl * wa)
-                    self.position[i + 1] = self.position[i + 1] + n_dir * (dl * wb)
-
-            for i in range(len(self.position)):
-                if self.inv_mass[i] == 0:
-                    continue
-                for c in colliders:
-                    var cp = c.closest_axis_point(self.position[i])
-                    var d = self.position[i] - cp
-                    var dist = d.length()
-                    if dist < c.radius:
-                        if dist > Float32(1.0e-6):
-                            self.position[i] = cp + d * (c.radius / dist)
-                        else:
-                            self.position[i] = cp + Vec3(0, c.radius, 0)
-                if self.position[i].y < self.floor:
-                    self.position[i].y = self.floor
-                self.velocity[i] = (self.position[i] - self.previous[i]) * (Float32(1.0) / h)
+            self.step_substep_coupled(
+                h, Float32(sub) * h, gravity, wind, colliders, attachments, bodies, iterations
+            )
 
     def serialize(self, mut w: BlobWriter):
         """Bit-exact snapshot of XPBD `ParticleChain` including `lambdas`."""
@@ -515,6 +699,101 @@ struct ParticleMesh(Copyable, Movable):
         var dummy_bodies = SolverBodies()
         self.step_coupled(dt, substeps, gravity, wind, colliders, dummy_atts, dummy_bodies, iterations)
 
+    def step_substep_coupled(
+        mut self,
+        h: Float32,
+        sub_t: Float32,
+        gravity: Float32,
+        wind: List[Vec3],
+        colliders: List[ChainCollider],
+        mut attachments: List[RigidAttachment],
+        mut bodies: SolverBodies,
+        iterations: Int = 2,
+    ):
+        """Advances one XPBD mesh substep of size `h` with two-way `RigidAttachment` impulse feedback."""
+        if h <= Float32(1.0e-8):
+            return
+        var iters = max(1, iterations)
+        var inv_h2 = Float32(1.0) / (h * h)
+        var g = gravity * self.gravity_scale
+
+        self._ensure_lambdas()
+        for a_i in range(len(attachments)):
+            attachments[a_i].lam = Float32(0.0)
+
+        for i in range(len(self.position)):
+            self.previous[i] = self.position[i]
+            if self.inv_mass[i] == 0:
+                continue
+            var v = self.velocity[i] + self.accel[i] * h
+            v.y -= g * h
+            if i < len(wind) and self.wind_drag > 0:
+                v = v + (wind[i] - v) * min(Float32(1), self.wind_drag * h)
+            v = v * max(Float32(0), 1 - self.damping * h)
+            self.velocity[i] = v
+            var p = self.position[i] + v * h
+            if self.power[i] > 0:
+                p = p + (self.target[i] - p) * min(Float32(1), self.power[i] * h)
+            self.position[i] = p
+
+        for _ in range(iters):
+            for a_i in range(len(attachments)):
+                _project_rigid_attachment(self.position, self.inv_mass, attachments[a_i], bodies, h, sub_t)
+
+            for k in range(len(self.link_a)):
+                var a = self.link_a[k]
+                var b = self.link_b[k]
+                var wa = self.inv_mass[a]
+                var wb = self.inv_mass[b]
+                var w_sum = wa + wb
+                var alpha_tilde = self.link_compliance[k] * inv_h2
+                var denom = w_sum + alpha_tilde
+                if denom <= Float32(0.0) or w_sum <= Float32(0.0):
+                    continue
+                var d = self.position[b] - self.position[a]
+                var length = d.length()
+                if length < Float32(1.0e-6):
+                    continue
+                var c = length - self.rest[k]
+                var lam = self.lambdas[k]
+                if self.link_kind[k] == LINK_MIN and c >= Float32(0.0) and lam <= Float32(0.0):
+                    continue
+                var dl = (-c - alpha_tilde * lam) / denom
+                if self.link_kind[k] == LINK_MIN:
+                    var new_lam = max(Float32(0.0), lam + dl)
+                    dl = new_lam - lam
+                    self.lambdas[k] = new_lam
+                else:
+                    self.lambdas[k] = lam + dl
+                var n_dir = d * (Float32(1.0) / length)
+                self.position[a] = self.position[a] - n_dir * (dl * wa)
+                self.position[b] = self.position[b] + n_dir * (dl * wb)
+
+        self.touching = 0
+        for i in range(len(self.position)):
+            if self.inv_mass[i] == 0:
+                continue
+            for c in colliders:
+                if _particle_attached_to_collider(i, c, attachments):
+                    continue
+                var p_i = self.position[i]
+                if _collide_particle_with_collider(p_i, self.radius[i], self.inv_mass[i], c, bodies, h, sub_t):
+                    self.position[i] = p_i
+            var ground = self.floor[i] + self.radius[i]
+            var on_floor = False
+            if self.position[i].y < ground:
+                self.position[i].y = ground
+                on_floor = True
+                self.touching += 1
+            var v = (self.position[i] - self.previous[i]) * (Float32(1.0) / h)
+            if on_floor:
+                var keep = max(Float32(0), 1 - self.friction)
+                v = Vec3(v.x * keep, max(Float32(0), v.y), v.z * keep)
+                self.position[i] = self.previous[i] + v * h
+                if self.position[i].y < ground:
+                    self.position[i].y = ground
+            self.velocity[i] = v
+
     def step_coupled(
         mut self,
         dt: Float32,
@@ -530,94 +809,13 @@ struct ParticleMesh(Copyable, Movable):
         if dt <= Float32(1.0e-8):
             return
         var n = max(1, substeps)
-        var iters = max(1, iterations)
         var h = dt / Float32(n)
-        var inv_h2 = Float32(1.0) / (h * h)
-        var g = gravity * self.gravity_scale
         self.steps_run += 1
 
         for sub in range(n):
-            var sub_t = Float32(sub) * h
-            self._ensure_lambdas()
-            for a_i in range(len(attachments)):
-                attachments[a_i].lam = Float32(0.0)
-
-            for i in range(len(self.position)):
-                self.previous[i] = self.position[i]
-                if self.inv_mass[i] == 0:
-                    continue
-                var v = self.velocity[i] + self.accel[i] * h
-                v.y -= g * h
-                if i < len(wind) and self.wind_drag > 0:
-                    v = v + (wind[i] - v) * min(Float32(1), self.wind_drag * h)
-                v = v * max(Float32(0), 1 - self.damping * h)
-                self.velocity[i] = v
-                var p = self.position[i] + v * h
-                if self.power[i] > 0:
-                    p = p + (self.target[i] - p) * min(Float32(1), self.power[i] * h)
-                self.position[i] = p
-
-            for _ in range(iters):
-                for a_i in range(len(attachments)):
-                    _project_rigid_attachment(self.position, self.inv_mass, attachments[a_i], bodies, h, sub_t)
-
-                for k in range(len(self.link_a)):
-                    var a = self.link_a[k]
-                    var b = self.link_b[k]
-                    var wa = self.inv_mass[a]
-                    var wb = self.inv_mass[b]
-                    var w_sum = wa + wb
-                    var alpha_tilde = self.link_compliance[k] * inv_h2
-                    var denom = w_sum + alpha_tilde
-                    if denom <= Float32(0.0) or w_sum <= Float32(0.0):
-                        continue
-                    var d = self.position[b] - self.position[a]
-                    var length = d.length()
-                    if length < Float32(1.0e-6):
-                        continue
-                    var c = length - self.rest[k]
-                    var lam = self.lambdas[k]
-                    if self.link_kind[k] == LINK_MIN and c >= Float32(0.0) and lam <= Float32(0.0):
-                        continue
-                    var dl = (-c - alpha_tilde * lam) / denom
-                    if self.link_kind[k] == LINK_MIN:
-                        var new_lam = max(Float32(0.0), lam + dl)
-                        dl = new_lam - lam
-                        self.lambdas[k] = new_lam
-                    else:
-                        self.lambdas[k] = lam + dl
-                    var n_dir = d * (Float32(1.0) / length)
-                    self.position[a] = self.position[a] - n_dir * (dl * wa)
-                    self.position[b] = self.position[b] + n_dir * (dl * wb)
-
-            self.touching = 0
-            for i in range(len(self.position)):
-                if self.inv_mass[i] == 0:
-                    continue
-                for c in colliders:
-                    var cp = c.closest_axis_point(self.position[i])
-                    var d = self.position[i] - cp
-                    var dist = d.length()
-                    var reach = c.radius + self.radius[i]
-                    if dist < reach:
-                        if dist > Float32(1.0e-6):
-                            self.position[i] = cp + d * (reach / dist)
-                        else:
-                            self.position[i] = cp + Vec3(0, reach, 0)
-                var ground = self.floor[i] + self.radius[i]
-                var on_floor = False
-                if self.position[i].y < ground:
-                    self.position[i].y = ground
-                    on_floor = True
-                    self.touching += 1
-                var v = (self.position[i] - self.previous[i]) * (Float32(1.0) / h)
-                if on_floor:
-                    var keep = max(Float32(0), 1 - self.friction)
-                    v = Vec3(v.x * keep, max(Float32(0), v.y), v.z * keep)
-                    self.position[i] = self.previous[i] + v * h
-                    if self.position[i].y < ground:
-                        self.position[i].y = ground
-                self.velocity[i] = v
+            self.step_substep_coupled(
+                h, Float32(sub) * h, gravity, wind, colliders, attachments, bodies, iterations
+            )
 
     def serialize(self, mut w: BlobWriter):
         """Bit-exact snapshot of XPBD `ParticleMesh` including `lambdas`."""

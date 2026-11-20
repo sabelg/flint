@@ -64,7 +64,9 @@ struct NativeSkin(Copyable, Movable):
 struct NativeMesh(Copyable, Movable):
     var positions: List[Float32]
     var normals: List[Float32]
+    var tangents: List[Float32]
     var texcoords: List[Float32]
+    var texcoords1: List[Float32]
     var colors: List[UInt8]
     var ao: List[UInt8]
     var indices: List[Int]
@@ -73,6 +75,11 @@ struct NativeMesh(Copyable, Movable):
     var texture: Int
     var normal_orm_texture: Int
     var orm_texture: Int
+    var occlusion_texture: Int
+    var occlusion_texcoord: Int
+    var occlusion_strength: Float32
+    var emissive_texture: Int
+    var emissive_texcoord: Int
     var base_color: UInt32
     var roughness: Float32
     var metallic: Float32
@@ -103,7 +110,9 @@ struct NativeMesh(Copyable, Movable):
     def __init__(out self):
         self.positions = List[Float32]()
         self.normals = List[Float32]()
+        self.tangents = List[Float32]()
         self.texcoords = List[Float32]()
+        self.texcoords1 = List[Float32]()
         self.colors = List[UInt8]()
         self.ao = List[UInt8]()
         self.indices = List[Int]()
@@ -112,6 +121,11 @@ struct NativeMesh(Copyable, Movable):
         self.texture = -1
         self.normal_orm_texture = -1
         self.orm_texture = -1
+        self.occlusion_texture = -1
+        self.occlusion_texcoord = 0
+        self.occlusion_strength = 1.0
+        self.emissive_texture = -1
+        self.emissive_texcoord = 0
         self.base_color = 0xFFFFFFFF
         self.roughness = 0.55
         self.metallic = 0.0
@@ -338,7 +352,7 @@ struct NativeModel(Copyable, Movable):
         """Heap bytes this model holds (list capacities), for its memory tag."""
         var total = self.meshes.capacity() * size_of[NativeMesh]() + self.textures.capacity() * size_of[NativeTexture]()
         for mesh in self.meshes:
-            total += (mesh.positions.capacity() + mesh.normals.capacity() + mesh.texcoords.capacity() + mesh.weights.capacity()) * 4
+            total += (mesh.positions.capacity() + mesh.normals.capacity() + mesh.tangents.capacity() + mesh.texcoords.capacity() + mesh.texcoords1.capacity() + mesh.weights.capacity()) * 4
             total += mesh.colors.capacity() + mesh.ao.capacity() + mesh.indices.capacity() * 8 + mesh.joints.capacity() * 2
             total += (mesh.morph_positions.capacity() + mesh.morph_normals.capacity() + mesh.centers.capacity()) * 4
         for texture in self.textures:

@@ -208,8 +208,11 @@ def aaa_glass_refract_shader() -> List[UInt32]:
     var vis_uv4 = s.texel_fetch_u2d(vis_samp, s.uvec2(px, py), s.uint(0))
     var vis0 = s.extract_u(vis_uv4, 0)
     var vis1 = s.extract_u(vis_uv4, 1)
-    s.return_if(s.ieq(vis0, s.uint(0)))
-    var inst_id = s.shr(vis0, s.uint(17))
+    s.return_if(s.ieq(s.bit_and(vis0, s.uint(0x3FFFFF)), s.uint(0)))
+    var inst_id = s.bit_or(
+        s.shr(vis0, s.uint(22)),
+        s.shl(s.bit_and(s.shr(vis1, s.uint(8)), s.uint(0xFF)), s.uint(10)),
+    )
     var w39 = s.load_word(b_instances, s.iadd(s.imul(inst_id, s.uint(UInt32(AAA_INSTANCE_WORDS))), s.uint(39)))
     s.return_if(s.ieq(s.bit_and(w39, s.uint(AAA_INSTANCE_GLASS_BIT)), s.uint(0)))
     var mat_id = s.bit_and(w39, s.uint(0xFFFF))

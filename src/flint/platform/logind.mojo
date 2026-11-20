@@ -196,7 +196,7 @@ def hex_ascii(text: String) -> String:
     return out
 
 
-struct LogindSession(Copyable, Movable):
+struct LogindSession(Movable):
     """A system-bus connection that controls this process's logind session."""
     var fd: Int
     var serial: Int
@@ -212,6 +212,19 @@ struct LogindSession(Copyable, Movable):
         self.incoming = List[UInt8]()
         self.pending_fds = List[Int]()
         self.last_error = ""
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.fd = existing.fd
+        self.serial = existing.serial
+        self.controlled = existing.controlled
+        self.incoming = existing.incoming^
+        self.pending_fds = existing.pending_fds^
+        self.last_error = existing.last_error^
+        existing.fd = -1
+        existing.controlled = False
+
+    def __deinit__(deinit self):
+        self.close()
 
     def write_all(mut self, data: List[UInt8]) -> Bool:
         var done = 0

@@ -71,11 +71,11 @@ struct NativeAccessor(Copyable, Movable):
             var value = Float32(Int(binary[offset]) | (Int(binary[offset + 1]) << 8))
             return value / 65535.0 if self.normalized else value
         if self.component_type == 5120:
-            var value = Float32(Int8(binary[offset]))
+            var value = Float32(bitcast[DType.int8](binary[offset]))
             return max(Float32(-1), value / 127.0) if self.normalized else value
         if self.component_type == 5122:
-            var raw = Int16(UInt16(binary[offset]) | (UInt16(binary[offset + 1]) << 8))
-            var value = Float32(raw)
+            var raw_u16 = UInt16(binary[offset]) | (UInt16(binary[offset + 1]) << 8)
+            var value = Float32(bitcast[DType.int16](raw_u16))
             return max(Float32(-1), value / 32767.0) if self.normalized else value
         return 0
 
@@ -148,6 +148,34 @@ def load_native_glb(path: String) -> NativeModel:
     return parse_native_glb(read_bytes(path))
 
 
+def _decode_glb_image_node(
+    document: JsonDocument,
+    images: Int,
+    views: Int,
+    binary: List[UInt8],
+    img_idx: Int,
+) -> NativeTexture:
+    var texture = NativeTexture()
+    if img_idx < 0:
+        return texture^
+    var image_node = document.at(images, img_idx)
+    if image_node < 0:
+        return texture^
+    var view = document.at(views, document.integer(document.object_get(image_node, "bufferView"), -1))
+    if view >= 0:
+        var offset = document.integer(document.object_get(view, "byteOffset"), 0)
+        var length = document.integer(document.object_get(view, "byteLength"), 0)
+        if offset >= 0 and length > 0 and length <= len(binary) - offset:
+            var bytes = List[UInt8](length=length, fill=0)
+            _ = external_call["memcpy", Int](Int(bytes.unsafe_ptr()), Int(binary.unsafe_ptr()) + offset, length)
+            var decoded = decode_image_auto(bytes, 4096)
+            if decoded.valid:
+                texture.width = decoded.width
+                texture.height = decoded.height
+                swap(texture.pixels, decoded.pixels)
+    return texture^
+
+
 def parse_native_glb(file: List[UInt8]) -> NativeModel:
     var model = NativeModel()
     if len(file) < 28 or little_u32(file, 0) != 0x46546C67 or little_u32(file, 4) != 2 or little_u32(file, 8) != len(file):
@@ -173,21 +201,18 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
     var views = document.object_get(document.root, "bufferViews")
     for texture_index in range(document.array_size(textures)):
         var texture_node = document.at(textures, texture_index)
-        var source = document.integer(document.object_get(texture_node, "source"), -1)
-        var image_node = document.at(images, source)
-        var view = document.at(views, document.integer(document.object_get(image_node, "bufferView"), -1))
+        var std_source = document.integer(document.object_get(texture_node, "source"), -1)
+        var tex_ext = document.object_get(texture_node, "extensions")
+        var basisu_source = -1
+        if tex_ext != -1:
+            var basisu_ext = document.object_get(tex_ext, "KHR_texture_basisu")
+            if basisu_ext != -1:
+                basisu_source = document.integer(document.object_get(basisu_ext, "source"), -1)
         var texture = NativeTexture()
-        if view >= 0:
-            var offset = document.integer(document.object_get(view, "byteOffset"), 0)
-            var length = document.integer(document.object_get(view, "byteLength"), 0)
-            if offset >= 0 and length > 0 and length <= len(binary) - offset:
-                var bytes = List[UInt8](length=length, fill=0)
-                _ = external_call["memcpy", Int](Int(bytes.unsafe_ptr()), Int(binary.unsafe_ptr()) + offset, length)
-                var decoded = decode_image_auto(bytes, 4096)
-                if decoded.valid:
-                    texture.width = decoded.width
-                    texture.height = decoded.height
-                    swap(texture.pixels, decoded.pixels)
+        if basisu_source >= 0:
+            texture = _decode_glb_image_node(document, images, views, binary, basisu_source)
+        if texture.width <= 0 and std_source >= 0 and std_source != basisu_source:
+            texture = _decode_glb_image_node(document, images, views, binary, std_source)
         model.textures.append(texture^)
 
     var materials = document.object_get(document.root, "materials")
@@ -209,21 +234,46 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             if not positions.valid or positions.components != 3:
                 return NativeModel()
             var normals = load_accessor(document, document.integer(document.object_get(attributes, "NORMAL"), -1), len(binary))
+            var tangents = load_accessor(document, document.integer(document.object_get(attributes, "TANGENT"), -1), len(binary))
             var uv = load_accessor(document, document.integer(document.object_get(attributes, "TEXCOORD_0"), -1), len(binary))
+            var uv1 = load_accessor(document, document.integer(document.object_get(attributes, "TEXCOORD_1"), -1), len(binary))
             var colors = load_accessor(document, document.integer(document.object_get(attributes, "COLOR_0"), -1), len(binary))
             var joints = load_accessor(document, document.integer(document.object_get(attributes, "JOINTS_0"), -1), len(binary))
             var weights = load_accessor(document, document.integer(document.object_get(attributes, "WEIGHTS_0"), -1), len(binary))
             var weights_extra = load_accessor(document, document.integer(document.object_get(attributes, "WEIGHTS_1"), -1), len(binary))
+            var has_tangents = tangents.valid and tangents.components == 4 and tangents.count >= positions.count
+            var has_uv1 = uv1.valid and uv1.components >= 2 and uv1.count >= positions.count
             mesh.positions.reserve(positions.count * 3)
             mesh.normals.reserve(positions.count * 3)
+            if has_tangents:
+                mesh.tangents.reserve(positions.count * 4)
             mesh.texcoords.reserve(positions.count * 2)
+            if has_uv1:
+                mesh.texcoords1.reserve(positions.count * 2)
             mesh.colors.reserve(positions.count * 4)
             for vertex in range(positions.count):
                 for axis in range(3):
                     mesh.positions.append(positions.float_value(binary, vertex, axis))
                     mesh.normals.append(normals.float_value(binary, vertex, axis) if normals.valid else (Float32(1) if axis == 1 else Float32(0)))
+                if has_tangents:
+                    var tx = tangents.float_value(binary, vertex, 0)
+                    var ty = tangents.float_value(binary, vertex, 1)
+                    var tz = tangents.float_value(binary, vertex, 2)
+                    var tw_raw = tangents.float_value(binary, vertex, 3)
+                    var t_vec = Vec3(tx, ty, tz)
+                    if t_vec.length_squared() > Float32(1e-12):
+                        t_vec = t_vec.normalized()
+                    else:
+                        t_vec = Vec3(1.0, 0.0, 0.0)
+                    mesh.tangents.append(t_vec.x)
+                    mesh.tangents.append(t_vec.y)
+                    mesh.tangents.append(t_vec.z)
+                    mesh.tangents.append(Float32(-1.0) if tw_raw < Float32(0.0) else Float32(1.0))
                 mesh.texcoords.append(uv.float_value(binary, vertex, 0) if uv.valid else 0.0)
                 mesh.texcoords.append(uv.float_value(binary, vertex, 1) if uv.valid else 0.0)
+                if has_uv1:
+                    mesh.texcoords1.append(uv1.float_value(binary, vertex, 0))
+                    mesh.texcoords1.append(uv1.float_value(binary, vertex, 1))
                 if colors.valid:
                     mesh.colors.append(UInt8(max(0, min(255, Int(colors.float_value(binary, vertex, 0) * 255)))))
                     mesh.colors.append(UInt8(max(0, min(255, Int(colors.float_value(binary, vertex, 1) * 255)))))
@@ -287,12 +337,28 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 mesh.orm_texture = document.integer(document.object_get(mr_texture, "index"), -1)
                 var norm_texture = document.object_get(material, "normalTexture")
                 mesh.normal_orm_texture = document.integer(document.object_get(norm_texture, "index"), -1)
+                var occ_texture = document.object_get(material, "occlusionTexture")
+                if occ_texture != -1:
+                    mesh.occlusion_texture = document.integer(document.object_get(occ_texture, "index"), -1)
+                    mesh.occlusion_texcoord = document.integer(document.object_get(occ_texture, "texCoord"), 0)
+                    mesh.occlusion_strength = max(Float32(0.0), min(Float32(1.0), Float32(document.number(document.object_get(occ_texture, "strength"), 1.0))))
+                var em_texture = document.object_get(material, "emissiveTexture")
+                if em_texture != -1:
+                    mesh.emissive_texture = document.integer(document.object_get(em_texture, "index"), -1)
+                    mesh.emissive_texcoord = document.integer(document.object_get(em_texture, "texCoord"), 0)
                 mesh.roughness = max(Float32(0.05), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "roughnessFactor"), 0.55))))
                 mesh.metallic = max(Float32(0.0), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "metallicFactor"), 0.0))))
                 var alpha_mode = document.text(document.object_get(material, "alphaMode"), "OPAQUE")
                 mesh.alpha_mode = 2 if alpha_mode == "BLEND" else (1 if alpha_mode == "MASK" else 0)
                 mesh.double_sided = document.boolean(document.object_get(material, "doubleSided"), False)
                 var extensions = document.object_get(material, "extensions")
+                var ext_em_strength: Float32 = 1.0
+                if extensions != -1:
+                    var emissive_extension = document.object_get(extensions, "KHR_materials_emissive_strength")
+                    if emissive_extension == -1:
+                        emissive_extension = document.object_get(extensions, "KHR_emissive_strength")
+                    if emissive_extension != -1:
+                        ext_em_strength = max(Float32(0.0), Float32(document.number(document.object_get(emissive_extension, "emissiveStrength"), 1.0)))
                 var emissive = document.object_get(material, "emissiveFactor")
                 if document.array_size(emissive) == 3:
                     mesh.emissive_color = Vec3(
@@ -301,18 +367,17 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                         Float32(document.number(document.at(emissive, 2), 0)),
                     )
                     var em_max = max(mesh.emissive_color.x, max(mesh.emissive_color.y, mesh.emissive_color.z))
-                    var strength: Float32 = 1.0
-                    if extensions != -1:
-                        var emissive_extension = document.object_get(extensions, "KHR_materials_emissive_strength")
-                        if emissive_extension == -1:
-                            emissive_extension = document.object_get(extensions, "KHR_emissive_strength")
-                        if emissive_extension != -1:
-                            strength = Float32(document.number(document.object_get(emissive_extension, "emissiveStrength"), 1.0))
                     if em_max > 0.0001:
-                        mesh.emissive_strength = em_max * strength
+                        mesh.emissive_strength = em_max * ext_em_strength
                         mesh.emissive_color = mesh.emissive_color * (Float32(1.0) / em_max)
+                    elif mesh.emissive_texture >= 0:
+                        mesh.emissive_color = Vec3(1.0, 1.0, 1.0)
+                        mesh.emissive_strength = ext_em_strength
                     else:
                         mesh.emissive_strength = 0.0
+                elif mesh.emissive_texture >= 0:
+                    mesh.emissive_color = Vec3(1.0, 1.0, 1.0)
+                    mesh.emissive_strength = ext_em_strength
 
                 if extensions != -1:
                     var cc_ext = document.object_get(extensions, "KHR_materials_clearcoat")

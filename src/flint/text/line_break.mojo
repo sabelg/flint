@@ -22,6 +22,20 @@ entries) is more than two Latin languages need; it can replace
 `break_allowed` without changing callers.
 """
 from flint.render.font import SdfFont
+from flint.text.utf8 import decode_utf8
+from flint.text.bidi import (
+    BIDI_AUTO,
+    resolve_bidi,
+    reorder_line,
+    compute_arabic_forms,
+)
+from flint.text.shaper import (
+    FontFallbackChain,
+    TextShaper,
+    ShapedGlyph,
+    ShapedLine,
+    is_bidi_format_code,
+)
 
 
 @fieldwise_init
@@ -32,7 +46,11 @@ struct TextLine(Copyable, ImplicitlyCopyable, Movable):
 
 
 def is_space(code: Int) -> Bool:
-    return code == 0x20 or code == 0x09 or code == 0x3000
+    return code == 0x20 or code == 0x09 or code == 0x0D or code == 0x3000
+
+
+def is_bidi_control(code: Int) -> Bool:
+    return is_bidi_format_code(code)
 
 
 def is_glue(code: Int) -> Bool:
@@ -43,6 +61,8 @@ def is_closing(code: Int) -> Bool:
     if code == 0x2E or code == 0x2C or code == 0x3B or code == 0x3A or code == 0x21 or code == 0x3F:
         return True
     if code == 0x29 or code == 0x5D or code == 0x7D or code == 0xBB or code == 0x2026 or code == 0x2019 or code == 0x201D:
+        return True
+    if code == 0x060C or code == 0x061B or code == 0x061F:
         return True
     return code == 0x3001 or code == 0x3002 or code == 0x300D or code == 0x300F or code == 0xFF09 or code == 0xFF01 or code == 0xFF1F
 
@@ -98,9 +118,9 @@ def item_widths(font: SdfFont, codes: List[Int], px: Float32, mut advance: List[
     for index in range(len(codes)):
         var a: Float32 = 0
         var k: Float32 = 0
-        if font.valid and codes[index] != 0x0A:
+        if font.valid and codes[index] != 0x0A and codes[index] != 0x0D and not is_bidi_control(codes[index]):
             a = font.advance_of(codes[index]) * scale
-            if index > 0:
+            if index > 0 and not is_bidi_control(codes[index - 1]):
                 k = font.kern(codes[index - 1], codes[index]) * scale
         advance.append(a)
         kern_before.append(k)
@@ -158,3 +178,55 @@ def wrap(font: SdfFont, codes: List[Int], px: Float32, max_width: Float32) -> Li
     var kern_before = List[Float32]()
     item_widths(font, codes, px, advance, kern_before)
     return break_items(codes, advance, kern_before, max_width)
+
+
+def wrap_shaped(
+    chain: FontFallbackChain,
+    text: String,
+    px: Float32,
+    max_width: Float32,
+    base_dir: Int = BIDI_AUTO,
+    lang_tag: String = "",
+) -> List[ShapedLine]:
+    """Break `text` into lines using GSUB/kern-shaped cluster widths, then
+    visually reorder each wrapped line via UAX #9 L1/L2 and shape runs."""
+    var out = List[ShapedLine]()
+    var codes = decode_utf8(text)
+    var n = len(codes)
+    if n == 0:
+        return out^
+
+    var resolved = resolve_bidi(codes, base_dir)
+    var arabic_forms = compute_arabic_forms(codes)
+    var shaper = TextShaper(chain.copy(), lang_tag)
+
+    var adv = List[Float32](length=n, fill=0.0)
+    var kern_b = List[Float32](length=n, fill=0.0)
+    var idx = 0
+    while idx < n:
+        var lvl = resolved.levels[idx]
+        var s = idx
+        while idx < n and resolved.levels[idx] == lvl:
+            idx += 1
+        var sruns = shaper.shape_run_slice(codes, arabic_forms, s, idx, lvl, px)
+        for sr in sruns:
+            for g in sr.glyphs:
+                if g.cluster >= 0 and g.cluster < n:
+                    adv[g.cluster] += g.x_advance
+
+    var lines = break_items(codes, adv, kern_b, max_width)
+    for tl in lines:
+        var bidi_runs = reorder_line(resolved, tl.start, tl.end)
+        var sline = ShapedLine(tl.start, tl.end, tl.width)
+        var line_w: Float32 = 0.0
+        for br in bidi_runs:
+            var sruns = shaper.shape_run_slice(codes, arabic_forms, br.start, br.end, br.level, px)
+            for sr in sruns:
+                for g in sr.glyphs:
+                    sline.glyphs.append(g)
+                    line_w += g.x_advance
+        # Keep break_items visible width unless zero (e.g., when shaped width differs from trailing spaces)
+        if sline.width == 0.0 and line_w > 0.0:
+            sline.width = line_w
+        out.append(sline^)
+    return out^

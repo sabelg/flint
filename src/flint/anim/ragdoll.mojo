@@ -29,6 +29,7 @@ from std.math import sqrt, floor
 from flint.core.detmath import det_exp, det_atan2, det_sin, det_cos, PI
 from flint.core.math import Vec3
 from flint.core.transform import Quat
+from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.core.ik import cross, dot, safe_normalized, angle_axis
 from flint.assets.model import NativeModel
 from flint.anim.pose import (
@@ -49,6 +50,8 @@ from flint.physics.xpbd import ParticleMesh, ChainCollider, LINK_MIN
 comptime RAGDOLL_STEP: Float32 = 1.0 / 120.0
 comptime RAGDOLL_MAX_STEPS: Int = 12
 comptime RAGDOLL_SUBSTEPS: Int = 2
+comptime RAGDOLL_BLOB_TAG: UInt32 = fourcc("RAGD")
+comptime RAGDOLL_BLOB_VERSION: Int = 1
 
 comptime RAGDOLL_ANIMATED: Int = 0
 comptime RAGDOLL_REACTING: Int = 1
@@ -1775,3 +1778,196 @@ struct ArticulatedRagdoll(Copyable, Movable):
         inertial.has_prev_settled = False
         self.is_limp = False
         self.is_active = False
+
+    def serialize(self, mut w: BlobWriter):
+        """Writes deterministic binary snapshot of `ArticulatedRagdoll`."""
+        w.begin(RAGDOLL_BLOB_TAG, RAGDOLL_BLOB_VERSION)
+        w.integer(len(self.limbs))
+        for i in range(len(self.limbs)):
+            ref ld = self.limbs[i]
+            w.integer(ld.bone_node)
+            w.integer(ld.parent_limb)
+            w.f32(ld.mass)
+            w.f32(ld.radius)
+            w.f32(ld.length)
+            w.vec3(ld.local_axis)
+            w.vec3(ld.local_com_offset)
+            w.vec3(ld.parent_anchor_local)
+            w.quat(ld.rest_local_rot)
+            w.boolean(ld.is_hinge)
+            w.vec3(ld.hinge_axis_local)
+            w.f32(ld.hinge_min_rad)
+            w.f32(ld.hinge_max_rad)
+            w.f32(ld.swing_cone_rad)
+            w.f32(ld.twist_min_rad)
+            w.f32(ld.twist_max_rad)
+            w.f32(ld.active_stiffness)
+            w.f32(ld.active_damping)
+            w.f32(ld.max_torque)
+
+        w.integer(len(self.states))
+        for i in range(len(self.states)):
+            ref st = self.states[i]
+            w.vec3(st.com_pos)
+            w.vec3(st.prev_com_pos)
+            w.quat(st.rotation)
+            w.quat(st.prev_rotation)
+            w.vec3(st.linear_vel)
+            w.vec3(st.angular_vel)
+            w.f32(st.inv_mass)
+            w.f32(st.inv_inertia_axial)
+            w.f32(st.inv_inertia_trans)
+            w.quat(st.target_local_rot)
+            w.boolean(st.on_surface)
+
+        w.integer(len(self.obb_colliders))
+        for i in range(len(self.obb_colliders)):
+            ref ob = self.obb_colliders[i]
+            w.vec3(ob.center)
+            w.quat(ob.rotation)
+            w.vec3(ob.half_extents)
+            w.f32(ob.friction)
+            w.f32(ob.restitution)
+
+        w.integer(len(self.skel_parents))
+        for i in range(len(self.skel_parents)):
+            w.integer(self.skel_parents[i])
+
+        w.integer(len(self.skel_topo_order))
+        for i in range(len(self.skel_topo_order)):
+            w.integer(self.skel_topo_order[i])
+
+        var rp_cnt = self.rest_pose.count()
+        w.integer(rp_cnt)
+        for i in range(rp_cnt):
+            w.vec3(self.rest_pose.t[i])
+            w.quat(self.rest_pose.r[i])
+            w.vec3(self.rest_pose.s[i])
+
+        w.quat(self.pelvis_rest_global_rot)
+        w.vec3(self.gravity)
+        w.boolean(self.has_floor)
+        w.vec3(self.floor_normal)
+        w.f32(self.floor_offset)
+        w.f32(self.floor_friction)
+        w.f32(self.linear_damping)
+        w.f32(self.angular_damping)
+        w.f32(self.scale)
+        w.integer(self.solver_iterations)
+        w.f32(self.joint_compliance)
+        w.f32(self.motor_scale)
+        w.f32(self.root_attitude_stiffness)
+        w.f32(self.root_attitude_damping)
+        w.f32(self.root_attitude_max_torque)
+        w.quat(self.target_root_world_rot)
+        w.boolean(self.is_limp)
+        w.boolean(self.is_active)
+        w.f32(self.still_seconds)
+        w.integer(self.steps_taken)
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        """Restores `ArticulatedRagdoll` from a binary snapshot."""
+        _ = r.enter(RAGDOLL_BLOB_TAG, RAGDOLL_BLOB_VERSION)
+        var n_limbs = r.integer()
+        if n_limbs < 0 or n_limbs > 4096:
+            raise Error("ragdoll blob: invalid limb count")
+        self.limbs.clear()
+        for _ in range(n_limbs):
+            var ld = ArticulatedLimbDef()
+            ld.bone_node = r.integer()
+            ld.parent_limb = r.integer()
+            ld.mass = r.f32()
+            ld.radius = r.f32()
+            ld.length = r.f32()
+            ld.local_axis = r.vec3()
+            ld.local_com_offset = r.vec3()
+            ld.parent_anchor_local = r.vec3()
+            ld.rest_local_rot = r.quat()
+            ld.is_hinge = r.boolean()
+            ld.hinge_axis_local = r.vec3()
+            ld.hinge_min_rad = r.f32()
+            ld.hinge_max_rad = r.f32()
+            ld.swing_cone_rad = r.f32()
+            ld.twist_min_rad = r.f32()
+            ld.twist_max_rad = r.f32()
+            ld.active_stiffness = r.f32()
+            ld.active_damping = r.f32()
+            ld.max_torque = r.f32()
+            self.limbs.append(ld)
+
+        var n_states = r.integer()
+        if n_states < 0 or n_states > 4096:
+            raise Error("ragdoll blob: invalid state count")
+        self.states.clear()
+        for _ in range(n_states):
+            var st = ArticulatedLimbState()
+            st.com_pos = r.vec3()
+            st.prev_com_pos = r.vec3()
+            st.rotation = r.quat()
+            st.prev_rotation = r.quat()
+            st.linear_vel = r.vec3()
+            st.angular_vel = r.vec3()
+            st.inv_mass = r.f32()
+            st.inv_inertia_axial = r.f32()
+            st.inv_inertia_trans = r.f32()
+            st.target_local_rot = r.quat()
+            st.on_surface = r.boolean()
+            self.states.append(st)
+
+        var n_obbs = r.integer()
+        if n_obbs < 0 or n_obbs > 4096:
+            raise Error("ragdoll blob: invalid obb count")
+        self.obb_colliders.clear()
+        for _ in range(n_obbs):
+            var c = r.vec3()
+            var q = r.quat()
+            var he = r.vec3()
+            var fr = r.f32()
+            var re = r.f32()
+            self.obb_colliders.append(RagdollObbCollider(c, q, he, fr, re))
+
+        var n_par = r.integer()
+        if n_par < 0 or n_par > 65536:
+            raise Error("ragdoll blob: invalid parent count")
+        self.skel_parents.clear()
+        for _ in range(n_par):
+            self.skel_parents.append(r.integer())
+
+        var n_topo = r.integer()
+        if n_topo < 0 or n_topo > 65536:
+            raise Error("ragdoll blob: invalid topo count")
+        self.skel_topo_order.clear()
+        for _ in range(n_topo):
+            self.skel_topo_order.append(r.integer())
+
+        var rp_cnt = r.integer()
+        if rp_cnt < 0 or rp_cnt > 65536:
+            raise Error("ragdoll blob: invalid rest pose count")
+        self.rest_pose = Pose(rp_cnt)
+        for i in range(rp_cnt):
+            self.rest_pose.t[i] = r.vec3()
+            self.rest_pose.r[i] = r.quat()
+            self.rest_pose.s[i] = r.vec3()
+
+        self.pelvis_rest_global_rot = r.quat()
+        self.gravity = r.vec3()
+        self.has_floor = r.boolean()
+        self.floor_normal = r.vec3()
+        self.floor_offset = r.f32()
+        self.floor_friction = r.f32()
+        self.linear_damping = r.f32()
+        self.angular_damping = r.f32()
+        self.scale = r.f32()
+        self.solver_iterations = r.integer()
+        self.joint_compliance = r.f32()
+        self.motor_scale = r.f32()
+        self.root_attitude_stiffness = r.f32()
+        self.root_attitude_damping = r.f32()
+        self.root_attitude_max_torque = r.f32()
+        self.target_root_world_rot = r.quat()
+        self.is_limp = r.boolean()
+        self.is_active = r.boolean()
+        self.still_seconds = r.f32()
+        self.steps_taken = r.integer()
+        r.leave()

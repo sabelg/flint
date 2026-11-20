@@ -16,6 +16,8 @@ from std.collections import List
 from std.math import sqrt, abs
 from flint.assets.json import parse_json
 from flint.assets.json_write import json_quote
+from flint.app.engine_app import Resource
+from flint.ecs.world import comp_hash64
 from flint.platform.input import (
     InputState,
     PAD_A,
@@ -328,8 +330,9 @@ def _pad_control_display(ctrl: Int, sony: Bool) -> Tuple[String, UInt32]:
     return ("Pad" + String(ctrl), UInt32(0xFFD0D6E0))
 
 
-struct InputMap(Copyable, Movable):
+struct InputMap(Resource, Copyable, Movable):
     """Context-stacked declarative action & axis mapper."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.input.InputMap")
     var actions: List[ActionState]
     var contexts: List[InputContext]
     var active_stack: List[String]

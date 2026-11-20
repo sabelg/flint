@@ -22,6 +22,8 @@ from std.math import abs, cos, max, min, pi, sin, sqrt, tan
 from flint.assets.model import NativeMesh
 from flint.core.math import Mat4, Vec3
 from flint.core.transform import Quat
+from flint.app.engine_app import Resource
+from flint.ecs.world import comp_hash64
 from flint.platform.wayland import WaylandWindow
 from flint.render.aaa_clustered_lights import AaaClusterLight
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
@@ -34,7 +36,14 @@ from flint.render.debug_draw import (
     perpendicular,
     side_of,
 )
-from flint.render.material_graph import GpuDecalVolume, MaterialAsset, SurfaceMaterialNode
+from flint.render.material_graph import (
+    BakedVatCrowdClip,
+    GpuDecalVolume,
+    MaterialAsset,
+    SurfaceMaterialNode,
+    TerrainClipmapDesc,
+    sample_vat_vertex_cpu,
+)
 from flint.render.simd_canvas import Camera3D, SimdCanvas, pack_argb
 from flint.render.swapchain_surface import (
     DISPLAY_SDR_SRGB,
@@ -606,8 +615,36 @@ struct RenderInstancePacket(Copyable, Movable):
         self.cast_shadows = cast_shadows
 
 
-struct RenderWorld(Copyable, Movable):
+@fieldwise_init
+struct VatCrowdInstancePacket(Copyable, Movable):
+    """Per-instance VAT crowd packet stored on `RenderWorld` (pure `Copyable, Movable`)."""
+    var entity_id: UInt64
+    var clip_id: Int
+    var phase_sec: Float32
+    var prev_phase_sec: Float32
+    var world_mat: Mat4
+    var prev_world_mat: Mat4
+    var material_id: Int
+    var uniform_scale: Float32
+    var has_prev: Bool
+
+
+@fieldwise_init
+struct TerrainClipmapPacket(Copyable, Movable):
+    """Terrain clipmap descriptor packet stored on `RenderWorld` (`Copyable, Movable`)."""
+    var active: Bool
+    var desc: TerrainClipmapDesc
+    var material_id: Int
+
+    def __init__(out self):
+        self.active = False
+        self.desc = TerrainClipmapDesc()
+        self.material_id = -1
+
+
+struct RenderWorld(Resource, Copyable, Movable):
     """Self-contained extracted snapshot of one simulation frame ready for GPU/SIMD submission."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.render.RenderWorld")
     var frame_number: UInt64
     var delta_time: Float32
     var camera: RenderCameraPacket
@@ -615,6 +652,8 @@ struct RenderWorld(Copyable, Movable):
     var sun_radiance: Vec3
     var ibl_intensity: Float32
     var instances: List[RenderInstancePacket]
+    var vat_instances: List[VatCrowdInstancePacket]
+    var terrain_clipmap: TerrainClipmapPacket
     var cluster_lights: List[AaaClusterLight]
     var decals: List[GpuDecalVolume]
     var debug_lines: DebugLineBatch
@@ -627,6 +666,8 @@ struct RenderWorld(Copyable, Movable):
         self.sun_radiance = Vec3(3.2, 3.0, 2.75)
         self.ibl_intensity = Float32(1.0)
         self.instances = List[RenderInstancePacket]()
+        self.vat_instances = List[VatCrowdInstancePacket]()
+        self.terrain_clipmap = TerrainClipmapPacket()
         self.cluster_lights = List[AaaClusterLight]()
         self.decals = List[GpuDecalVolume]()
         self.debug_lines = DebugLineBatch()
@@ -635,6 +676,7 @@ struct RenderWorld(Copyable, Movable):
         self.frame_number = frame_number
         self.delta_time = delta_time
         self.instances.clear()
+        self.vat_instances.clear()
         self.cluster_lights.clear()
         self.decals.clear()
         self.debug_lines.clear()
@@ -756,6 +798,57 @@ struct RenderExtractor(Copyable, Movable):
                 )
             )
 
+    def extract_vat_crowd_entity(
+        mut self,
+        mut world: RenderWorld,
+        entity_id: UInt64,
+        clip_id: Int,
+        phase_sec: Float32,
+        prev_phase_sec: Float32,
+        world_mat: Mat4,
+        material_id: Int = -1,
+    ):
+        """Extracts a VAT crowd instance into `world.vat_instances`, resolving `prev_world_mat` by `entity_id`."""
+        var u_scale = _extract_max_scale(world_mat)
+        var found = self.id_to_slot.get(entity_id)
+        if found:
+            var slot = found.value()
+            var prev_m = self.slot_mats[slot].copy()
+            self.slot_mats[slot] = world_mat.copy()
+            self.slot_last_frame[slot] = self.active_frame
+            world.vat_instances.append(
+                VatCrowdInstancePacket(
+                    entity_id,
+                    clip_id,
+                    phase_sec,
+                    prev_phase_sec,
+                    world_mat.copy(),
+                    prev_m^,
+                    material_id,
+                    u_scale,
+                    True,
+                )
+            )
+        else:
+            var new_slot = len(self.slot_ids)
+            self.id_to_slot[entity_id] = new_slot
+            self.slot_ids.append(entity_id)
+            self.slot_mats.append(world_mat.copy())
+            self.slot_last_frame.append(self.active_frame)
+            world.vat_instances.append(
+                VatCrowdInstancePacket(
+                    entity_id,
+                    clip_id,
+                    phase_sec,
+                    prev_phase_sec,
+                    world_mat.copy(),
+                    world_mat.copy(),
+                    material_id,
+                    u_scale,
+                    False,
+                )
+            )
+
     def end_extraction(mut self):
         """Prunes despawned entity IDs that were not extracted in `active_frame`."""
         var stale = 0
@@ -792,9 +885,10 @@ comptime RENDER_TIER_1_FORWARD_CLUSTERED: UInt32 = 1
 comptime RENDER_TIER_2_AAA_VISBUFFER_RT: UInt32 = 2
 
 
-struct ScalableRenderer(Movable):
+struct ScalableRenderer(Resource, Movable):
     """Unified 3-Tier Flint v5 Renderer scaling seamlessly from `<4 MiB` CPU SIMD CI (`Tier 0`)
     to Clustered Forward/VisBuffer+VSM (`Tier 1`) to Flagship Hardware RT+SVGF+TSR (`Tier 2`)."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.render.ScalableRenderer")
     var tier: UInt32
     var requested_tier: UInt32
     var width: Int
@@ -803,6 +897,15 @@ struct ScalableRenderer(Movable):
     var cpu_canvas: SimdCanvas
     var cpu_meshes: List[NativeMesh]
     var cpu_mesh_materials: List[Int]
+    var cpu_vat_clips: List[BakedVatCrowdClip]
+    var cpu_vat_meshes: List[NativeMesh]
+    var cpu_vat_materials: List[Int]
+    var gpu_terrain_synced: Bool
+    var gpu_terrain_desc: TerrainClipmapDesc
+    var gpu_terrain_mat_id: Int
+    var cpu_terrain_heights: List[Float32]
+    var cpu_terrain_hm_w: Int
+    var cpu_terrain_hm_h: Int
     var materials: List[MaterialAsset]
     var gpu_slot: List[FlintAaaVulkanRenderer]
 
@@ -822,6 +925,15 @@ struct ScalableRenderer(Movable):
         self.cpu_canvas = SimdCanvas(self.width, self.height)
         self.cpu_meshes = List[NativeMesh]()
         self.cpu_mesh_materials = List[Int]()
+        self.cpu_vat_clips = List[BakedVatCrowdClip]()
+        self.cpu_vat_meshes = List[NativeMesh]()
+        self.cpu_vat_materials = List[Int]()
+        self.gpu_terrain_synced = False
+        self.gpu_terrain_desc = TerrainClipmapDesc()
+        self.gpu_terrain_mat_id = -1
+        self.cpu_terrain_heights = List[Float32]()
+        self.cpu_terrain_hm_w = 0
+        self.cpu_terrain_hm_h = 0
         self.materials = List[MaterialAsset]()
         self.gpu_slot = List[FlintAaaVulkanRenderer]()
 
@@ -927,6 +1039,58 @@ struct ScalableRenderer(Movable):
         self.cpu_mesh_materials.append(mat_id)
         return id
 
+    def register_vat_crowd_clip(
+        mut self,
+        clip: BakedVatCrowdClip,
+        template_mesh: NativeMesh,
+        mat_id: Int = 0,
+        max_phase_slots: Int = 8,
+    ) -> Int:
+        var id = len(self.cpu_vat_clips)
+        if self.uses_vulkan():
+            var gpu_id = self.gpu_slot[0].register_vat_crowd_clip(clip, template_mesh, mat_id, max_phase_slots=max_phase_slots)
+            if gpu_id < 0:
+                return -1
+            while len(self.cpu_vat_clips) < gpu_id:
+                self.cpu_vat_clips.append(BakedVatCrowdClip(clip.desc))
+                self.cpu_vat_meshes.append(NativeMesh())
+                self.cpu_vat_materials.append(0)
+            id = gpu_id
+        self.cpu_vat_clips.append(clip.copy())
+        self.cpu_vat_meshes.append(template_mesh.copy())
+        self.cpu_vat_materials.append(mat_id)
+        return id
+
+    def set_terrain_clipmap(
+        mut self,
+        desc: TerrainClipmapDesc,
+        material_id: Int = -1,
+        heights: List[Float32] = List[Float32](),
+        height_w: Int = 0,
+        height_h: Int = 0,
+    ) -> TerrainClipmapDesc:
+        """Uploads optional `heights` heightmap (`RGBA16F`) and activates `TerrainClipmapDesc` on GPU/Tier-0."""
+        var final_desc = desc.copy()
+        if len(heights) > 0 and height_w > 0 and height_h > 0:
+            self.cpu_terrain_heights = heights.copy()
+            self.cpu_terrain_hm_w = height_w
+            self.cpu_terrain_hm_h = height_h
+            if self.uses_vulkan():
+                var slot = self.gpu_slot[0].upload_terrain_heightmap_rgba16f(heights, height_w, height_h)
+                if slot >= 0:
+                    final_desc.heightmap_slot = UInt16(slot)
+        self.gpu_terrain_desc = final_desc.copy()
+        self.gpu_terrain_mat_id = material_id
+        if self.uses_vulkan():
+            self.gpu_slot[0].set_terrain_clipmap(final_desc, material_id)
+            self.gpu_terrain_synced = True
+        return final_desc.copy()
+
+    def clear_terrain_clipmap(mut self):
+        self.gpu_terrain_synced = False
+        if self.uses_vulkan():
+            self.gpu_slot[0].clear_terrain_clipmap()
+
     def _material_color_argb(self, mat_id: Int) -> UInt32:
         if mat_id >= 0 and mat_id < len(self.materials):
             var bc = self.materials[mat_id].base_color
@@ -974,6 +1138,57 @@ struct ScalableRenderer(Movable):
                     Vec3(m.positions[i2 * 3 + 0], m.positions[i2 * 3 + 1], m.positions[i2 * 3 + 2])
                 )
                 self.cpu_canvas.draw_tri_3d_lit(cam, p0, p1, p2, col, world.sun_dir)
+
+        for v_i in range(len(world.vat_instances)):
+            ref vi = world.vat_instances[v_i]
+            if vi.clip_id < 0 or vi.clip_id >= len(self.cpu_vat_clips):
+                continue
+            ref clip = self.cpu_vat_clips[vi.clip_id]
+            ref vm = self.cpu_vat_meshes[vi.clip_id]
+            var mat_idx = vi.material_id if vi.material_id >= 0 else self.cpu_vat_materials[vi.clip_id]
+            var col = self._material_color_argb(mat_idx)
+            var n_tris = len(vm.indices) // 3
+            var n_verts = vm.vertex_count()
+            for t in range(n_tris):
+                var i0 = vm.indices[t * 3 + 0]
+                var i1 = vm.indices[t * 3 + 1]
+                var i2 = vm.indices[t * 3 + 2]
+                if i0 < 0 or i1 < 0 or i2 < 0 or i0 >= n_verts or i1 >= n_verts or i2 >= n_verts:
+                    continue
+                var lp0 = sample_vat_vertex_cpu(clip, i0, vi.phase_sec, vi.prev_phase_sec)[0]
+                var lp1 = sample_vat_vertex_cpu(clip, i1, vi.phase_sec, vi.prev_phase_sec)[0]
+                var lp2 = sample_vat_vertex_cpu(clip, i2, vi.phase_sec, vi.prev_phase_sec)[0]
+                var p0 = vi.world_mat.transform_point(lp0)
+                var p1 = vi.world_mat.transform_point(lp1)
+                var p2 = vi.world_mat.transform_point(lp2)
+                self.cpu_canvas.draw_tri_3d_lit(cam, p0, p1, p2, col, world.sun_dir)
+
+        if world.terrain_clipmap.active:
+            var td = world.terrain_clipmap.desc.copy()
+            var col = self._material_color_argb(world.terrain_clipmap.material_id)
+            var ox = td.snapped_ring_origin_xz(world.camera.eye, 0)[0]
+            var oz = td.snapped_ring_origin_xz(world.camera.eye, 0)[1]
+            var step = td.ring_cell_size(0) * Float32(4.0)
+            var hm_w = self.cpu_terrain_hm_w
+            var hm_h = self.cpu_terrain_hm_h
+            for gz in range(-4, 4):
+                for gx in range(-4, 4):
+                    var x0 = ox + Float32(gx) * step
+                    var x1 = x0 + step
+                    var z0 = oz + Float32(gz) * step
+                    var z1 = z0 + step
+                    var y00 = td.height_offset_m + Float32(0.5) * td.height_scale_m
+                    if hm_w > 0 and hm_h > 0 and len(self.cpu_terrain_heights) >= hm_w * hm_h:
+                        var u0 = max(Float32(0.0), min(Float32(1.0), (x0 + Float32(32.0)) / Float32(64.0)))
+                        var v0 = max(Float32(0.0), min(Float32(1.0), (z0 + Float32(32.0)) / Float32(64.0)))
+                        var hi = min(hm_h - 1, Int(v0 * Float32(hm_h - 1))) * hm_w + min(hm_w - 1, Int(u0 * Float32(hm_w - 1)))
+                        y00 = td.height_offset_m + self.cpu_terrain_heights[hi] * td.height_scale_m
+                    var p00 = Vec3(x0, y00, z0)
+                    var p10 = Vec3(x1, y00, z0)
+                    var p01 = Vec3(x0, y00, z1)
+                    var p11 = Vec3(x1, y00, z1)
+                    self.cpu_canvas.draw_tri_3d_lit(cam, p00, p01, p11, col, world.sun_dir)
+                    self.cpu_canvas.draw_tri_3d_lit(cam, p00, p11, p10, col, world.sun_dir)
 
         var n_dbg = world.debug_lines.segment_count()
         for s_i in range(n_dbg):
@@ -1048,6 +1263,52 @@ struct ScalableRenderer(Movable):
             _ = self.resize(self.width, self.height)
 
         ref gpu = self.gpu_slot[0]
+        if world.terrain_clipmap.active:
+            var td = world.terrain_clipmap.desc.copy()
+            var needs_geom_sync = (
+                not self.gpu_terrain_synced
+                or td.ring_count != self.gpu_terrain_desc.ring_count
+                or td.grid_dim_per_ring != self.gpu_terrain_desc.grid_dim_per_ring
+                or abs(td.base_cell_size_m - self.gpu_terrain_desc.base_cell_size_m) > Float32(1e-5)
+                or abs(td.height_scale_m - self.gpu_terrain_desc.height_scale_m) > Float32(1e-5)
+                or abs(td.height_offset_m - self.gpu_terrain_desc.height_offset_m) > Float32(1e-5)
+                or world.terrain_clipmap.material_id != self.gpu_terrain_mat_id
+            )
+            var needs_slot_sync = (
+                abs(td.morph_start_ratio - self.gpu_terrain_desc.morph_start_ratio) > Float32(1e-5)
+                or td.heightmap_slot != self.gpu_terrain_desc.heightmap_slot
+                or td.normalmap_slot != self.gpu_terrain_desc.normalmap_slot
+                or td.splat_control_slot != self.gpu_terrain_desc.splat_control_slot
+            )
+            if not needs_slot_sync:
+                if len(td.layer_albedo_slots) != len(self.gpu_terrain_desc.layer_albedo_slots):
+                    needs_slot_sync = True
+                else:
+                    for k_s in range(len(td.layer_albedo_slots)):
+                        if td.layer_albedo_slots[k_s] != self.gpu_terrain_desc.layer_albedo_slots[k_s]:
+                            needs_slot_sync = True
+                            break
+                if not needs_slot_sync:
+                    if len(td.layer_normal_slots) != len(self.gpu_terrain_desc.layer_normal_slots):
+                        needs_slot_sync = True
+                    else:
+                        for k_s in range(len(td.layer_normal_slots)):
+                            if td.layer_normal_slots[k_s] != self.gpu_terrain_desc.layer_normal_slots[k_s]:
+                                needs_slot_sync = True
+                                break
+            if needs_geom_sync:
+                gpu.set_terrain_clipmap(td, world.terrain_clipmap.material_id)
+                self.gpu_terrain_desc = td.copy()
+                self.gpu_terrain_mat_id = world.terrain_clipmap.material_id
+                self.gpu_terrain_synced = True
+            elif needs_slot_sync:
+                gpu.terrain_clipmap_desc = td.copy()
+                gpu.terrain_clipmap_dirty = True
+                self.gpu_terrain_desc = td.copy()
+        elif self.gpu_terrain_synced:
+            gpu.clear_terrain_clipmap()
+            self.gpu_terrain_synced = False
+
         gpu.sun_dir = world.sun_dir.normalized()
         gpu.sun_radiance = world.sun_radiance
         gpu.ibl_intensity = world.ibl_intensity
@@ -1068,6 +1329,18 @@ struct ScalableRenderer(Movable):
                 inst.material_id,
                 inst.uniform_scale,
                 inst.has_prev,
+            )
+        for v_i in range(len(world.vat_instances)):
+            ref vi = world.vat_instances[v_i]
+            gpu.draw_vat_crowd_instance(
+                vi.clip_id,
+                vi.phase_sec,
+                vi.prev_phase_sec,
+                vi.world_mat,
+                vi.prev_world_mat,
+                vi.material_id,
+                vi.uniform_scale,
+                vi.has_prev,
             )
         for l_i in range(len(world.cluster_lights)):
             gpu.add_cluster_light(world.cluster_lights[l_i])
@@ -1104,3 +1377,6 @@ struct ScalableRenderer(Movable):
             self.surface.shutdown_vk(self.gpu_slot[0].vk)
             self.gpu_slot[0].shutdown()
             self.gpu_slot.clear()
+
+    def __deinit__(deinit self):
+        self.shutdown()

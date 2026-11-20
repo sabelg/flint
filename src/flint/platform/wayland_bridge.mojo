@@ -48,8 +48,35 @@ comptime WORD_FAILED: Int = 18
 comptime WORD_IO_SCRATCH: Int = 19
 comptime WORD_POLL_SCRATCH: Int = 20
 comptime WORD_WAIT_SCRATCH: Int = 21
-comptime STATE_WORDS: Int = 24
+comptime WORD_GAME_FDS: Int = 22
+comptime WORD_GAME_FD_COUNT: Int = 23
+comptime WORD_DATA_DEVICE: Int = 24
+comptime WORD_DATA_SOURCE: Int = 25
+comptime WORD_OFFER_IDS: Int = 26
+comptime WORD_OFFER_COUNT: Int = 27
+comptime WORD_LIB_IFACES: Int = 28
+comptime WORD_STRICT_IFACE: Int = 29
+comptime STATE_WORDS: Int = 30
+comptime MAX_OFFERS: Int = 32
+comptime LIB_IFACE_CAP: Int = 1024
 comptime IO_SCRATCH_BYTES: Int = 16 + 56 + CONTROL_BYTES
+
+comptime LIB_IFACE_UNKNOWN: Int = 0
+comptime LIB_IFACE_NO_FD: Int = 1
+comptime LIB_IFACE_REGISTRY: Int = 2
+comptime LIB_IFACE_DMABUF: Int = 3
+comptime LIB_IFACE_DMABUF_FEEDBACK: Int = 4
+comptime LIB_IFACE_EXPLICIT_SYNC: Int = 5
+comptime LIB_IFACE_SURFACE_SYNC: Int = 6
+comptime LIB_IFACE_BUFFER_RELEASE: Int = 7
+comptime LIB_IFACE_COLOR_MANAGER: Int = 8
+comptime LIB_IFACE_COLOR_SURFACE_FEEDBACK: Int = 9
+comptime LIB_IFACE_IMAGE_DESC_CREATOR: Int = 10
+comptime LIB_IFACE_IMAGE_DESC: Int = 11
+comptime LIB_IFACE_IMAGE_DESC_INFO: Int = 12
+comptime LIB_IFACE_DRM_LEASE_DEV: Int = 13
+comptime LIB_IFACE_DRM_LEASE_REQ: Int = 14
+comptime LIB_IFACE_DRM_LEASE: Int = 15
 
 comptime STREAM_BYTES: Int = 256 * 1024
 comptime GAME_BYTES: Int = 1024 * 1024
@@ -100,12 +127,217 @@ def set_owned(state: Int, id: Int):
         pointer[unsafe_offset=0] = pointer[unsafe_offset=0] | (UInt8(1) << UInt8(id % 8))
 
 
+def is_server_offer(state: Int, id: Int) -> Bool:
+    if id == 0:
+        return False
+    var offers = word(state, WORD_OFFER_IDS)
+    var count = min(MAX_OFFERS, word(state, WORD_OFFER_COUNT))
+    if offers == 0 or count <= 0:
+        return False
+    for i in range(count):
+        if Int(get32(offers + i * 4)) == id:
+            return True
+    return False
+
+
+def register_server_offer(state: Int, id: Int):
+    if id == 0:
+        return
+    var offers = word(state, WORD_OFFER_IDS)
+    if offers == 0:
+        return
+    var count = word(state, WORD_OFFER_COUNT)
+    for i in range(min(MAX_OFFERS, count)):
+        if Int(get32(offers + i * 4)) == id:
+            return
+    if count < MAX_OFFERS:
+        put32(offers + count * 4, UInt32(id))
+        set_word(state, WORD_OFFER_COUNT, count + 1)
+    else:
+        for i in range(MAX_OFFERS - 1):
+            put32(offers + i * 4, get32(offers + (i + 1) * 4))
+        put32(offers + (MAX_OFFERS - 1) * 4, UInt32(id))
+
+
 def lock(state: Int):
     _ = external_call["pthread_mutex_lock", Int32](word(state, WORD_MUTEX))
 
 
 def unlock(state: Int):
     _ = external_call["pthread_mutex_unlock", Int32](word(state, WORD_MUTEX))
+
+
+def init_lib_ifaces(state: Int):
+    if word(state, WORD_LIB_IFACES) == 0:
+        set_word(state, WORD_LIB_IFACES, external_call["calloc", Int](Int(LIB_IFACE_CAP), Int(8)))
+
+
+def free_lib_ifaces(state: Int):
+    if state == 0:
+        return
+    var tbl = word(state, WORD_LIB_IFACES)
+    if tbl != 0:
+        external_call["free", NoneType](tbl)
+        set_word(state, WORD_LIB_IFACES, 0)
+
+
+def register_lib_iface(state: Int, id: Int, iface: Int):
+    if id <= 0:
+        return
+    init_lib_ifaces(state)
+    set_word(state, WORD_STRICT_IFACE, 1)
+    var tbl = word(state, WORD_LIB_IFACES)
+    if tbl == 0:
+        return
+    var mask = LIB_IFACE_CAP - 1
+    var idx = Int((UInt32(id) * UInt32(2654435761)) & UInt32(mask))
+    for _ in range(LIB_IFACE_CAP):
+        var slot = tbl + idx * 8
+        var cur = Int(get32(slot))
+        if cur == 0 or cur == id:
+            put32(slot, UInt32(id))
+            put32(slot + 4, UInt32(iface))
+            return
+        idx = (idx + 1) & mask
+
+
+def lookup_lib_iface(state: Int, id: Int) -> Int:
+    if id <= 0:
+        return LIB_IFACE_UNKNOWN
+    var tbl = word(state, WORD_LIB_IFACES)
+    if tbl == 0:
+        return LIB_IFACE_UNKNOWN
+    var mask = LIB_IFACE_CAP - 1
+    var idx = Int((UInt32(id) * UInt32(2654435761)) & UInt32(mask))
+    for _ in range(LIB_IFACE_CAP):
+        var slot = tbl + idx * 8
+        var cur = Int(get32(slot))
+        if cur == 0:
+            return LIB_IFACE_UNKNOWN
+        if cur == id:
+            return Int(get32(slot + 4))
+        idx = (idx + 1) & mask
+    return LIB_IFACE_UNKNOWN
+
+
+def unregister_lib_iface(state: Int, id: Int):
+    if id <= 0:
+        return
+    var tbl = word(state, WORD_LIB_IFACES)
+    if tbl == 0:
+        return
+    var mask = LIB_IFACE_CAP - 1
+    var i = Int((UInt32(id) * UInt32(2654435761)) & UInt32(mask))
+    var found = False
+    for _ in range(LIB_IFACE_CAP):
+        var slot = tbl + i * 8
+        var cur = Int(get32(slot))
+        if cur == 0:
+            return
+        if cur == id:
+            found = True
+            break
+        i = (i + 1) & mask
+    if not found:
+        return
+    var j = i
+    while True:
+        j = (j + 1) & mask
+        if j == i:
+            put32(tbl + i * 8, UInt32(0))
+            put32(tbl + i * 8 + 4, UInt32(0))
+            return
+        var j_slot = tbl + j * 8
+        var j_id = Int(get32(j_slot))
+        if j_id == 0:
+            put32(tbl + i * 8, UInt32(0))
+            put32(tbl + i * 8 + 4, UInt32(0))
+            return
+        var k = Int((UInt32(j_id) * UInt32(2654435761)) & UInt32(mask))
+        var can_move = (k <= i or k > j) if i < j else (k <= i and k > j)
+        if can_move:
+            put32(tbl + i * 8, UInt32(j_id))
+            put32(tbl + i * 8 + 4, get32(j_slot + 4))
+            i = j
+
+
+@always_inline
+def _lib_event_has_fd(iface: Int, opcode: Int) -> Bool:
+    return (
+        (iface == LIB_IFACE_DMABUF_FEEDBACK and opcode == 1)
+        or (iface == LIB_IFACE_BUFFER_RELEASE and opcode == 0)
+        or (iface == LIB_IFACE_IMAGE_DESC_INFO and opcode == 1)
+        or (iface == LIB_IFACE_DRM_LEASE_DEV and opcode == 0)
+        or (iface == LIB_IFACE_DRM_LEASE and opcode == 0)
+    )
+
+
+def _wire_name_eq(addr: Int, name_len: Int, target: String) -> Bool:
+    if name_len != target.byte_length():
+        return False
+    var ptr = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=addr)
+    var tbytes = target.as_bytes()
+    for i in range(name_len):
+        if ptr[unsafe_offset=i] != tbytes[i]:
+            return False
+    return True
+
+
+def _track_outgoing_request(state: Int, msg: Int, obj: Int, op: Int, size: Int):
+    if obj == WL_DISPLAY_ID:
+        if op == 0 and size >= 12:
+            register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_NO_FD)
+        elif op == 1 and size >= 12:
+            register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_REGISTRY)
+        return
+    var iface = lookup_lib_iface(state, obj)
+    if iface == LIB_IFACE_UNKNOWN:
+        return
+    if iface == LIB_IFACE_REGISTRY and op == 0 and size >= 24:
+        var slen = Int(get32(msg + 12))
+        var padded = (slen + 3) & ~3
+        if slen > 0 and size >= 24 + padded:
+            var name_len = slen - 1
+            var name_addr = msg + 16
+            var new_id = Int(get32(msg + 20 + padded))
+            var kind = LIB_IFACE_NO_FD
+            if _wire_name_eq(name_addr, name_len, "zwp_linux_dmabuf_v1"):
+                kind = LIB_IFACE_DMABUF
+            elif _wire_name_eq(name_addr, name_len, "zwp_linux_explicit_synchronization_v1"):
+                kind = LIB_IFACE_EXPLICIT_SYNC
+            elif _wire_name_eq(name_addr, name_len, "wp_color_manager_v1"):
+                kind = LIB_IFACE_COLOR_MANAGER
+            elif _wire_name_eq(name_addr, name_len, "wp_drm_lease_device_v1"):
+                kind = LIB_IFACE_DRM_LEASE_DEV
+            register_lib_iface(state, new_id, kind)
+    elif iface == LIB_IFACE_DMABUF and size >= 12:
+        if op == 1:
+            register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_NO_FD)
+        elif op == 2 or op == 3:
+            register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_DMABUF_FEEDBACK)
+    elif iface == LIB_IFACE_EXPLICIT_SYNC and op == 1 and size >= 12:
+        register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_SURFACE_SYNC)
+    elif iface == LIB_IFACE_SURFACE_SYNC and op == 2 and size >= 12:
+        register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_BUFFER_RELEASE)
+    elif iface == LIB_IFACE_COLOR_MANAGER and size >= 12:
+        if op == 1 or op == 2:
+            register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_NO_FD)
+        elif op == 3:
+            register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_COLOR_SURFACE_FEEDBACK)
+        elif op == 4 or op == 5:
+            register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_IMAGE_DESC_CREATOR)
+        elif op == 6 or op == 7:
+            register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_IMAGE_DESC)
+    elif iface == LIB_IFACE_COLOR_SURFACE_FEEDBACK and (op == 1 or op == 2) and size >= 12:
+        register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_IMAGE_DESC)
+    elif iface == LIB_IFACE_IMAGE_DESC_CREATOR and op == 0 and size >= 12:
+        register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_IMAGE_DESC)
+    elif iface == LIB_IFACE_IMAGE_DESC and op == 1 and size >= 12:
+        register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_IMAGE_DESC_INFO)
+    elif iface == LIB_IFACE_DRM_LEASE_DEV and op == 0 and size >= 12:
+        register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_DRM_LEASE_REQ)
+    elif iface == LIB_IFACE_DRM_LEASE_REQ and op == 1 and size >= 12:
+        register_lib_iface(state, Int(get32(msg + 8)), LIB_IFACE_DRM_LEASE)
 
 
 def receive_some(fd: Int, buffer: Int, capacity: Int, fds: Int, mut fd_count: Int, scratch: Int) -> Int:
@@ -169,6 +401,103 @@ def send_some(fd: Int, buffer: Int, size: Int, fds: Int, fd_count: Int, scratch:
     return ok
 
 
+def _count_remaining_game_fds(state: Int, buffer: Int, start_offset: Int, used: Int) -> Int:
+    """Counts FD-carrying game events (`wl_keyboard.keymap`, `wl_data_source.send`) from `start_offset` onward."""
+    var kb_id = word(state, WORD_KEYBOARD)
+    var ds_id = word(state, WORD_DATA_SOURCE)
+    if kb_id == 0 and ds_id == 0:
+        return 0
+    var scan = start_offset
+    var count = 0
+    while used - scan >= 8:
+        var obj = Int(get32(buffer + scan))
+        var hdr = Int(get32(buffer + scan + 4))
+        var op = hdr & 0xFFFF
+        var sz = hdr >> 16
+        if is_owned(state, obj) and (
+            (kb_id != 0 and obj == kb_id and op == 0)
+            or (ds_id != 0 and obj == ds_id and op == 1)
+        ):
+            count += 1
+        if sz < 8 or used - scan < sz:
+            break
+        scan += sz
+    if used - scan > 0 and used - scan < 8:
+        if used - scan < 4:
+            count += 1
+        else:
+            var partial_obj = Int(get32(buffer + scan))
+            if (kb_id != 0 and partial_obj == kb_id) or (ds_id != 0 and partial_obj == ds_id):
+                if used - scan >= 6:
+                    var op_ptr = Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=buffer + scan + 4)
+                    var partial_op = Int(op_ptr[unsafe_offset=0]) | (Int(op_ptr[unsafe_offset=1]) << 8)
+                    if (kb_id != 0 and partial_obj == kb_id and partial_op == 0) or (
+                        ds_id != 0 and partial_obj == ds_id and partial_op == 1
+                    ):
+                        count += 1
+                else:
+                    count += 1
+    return count
+
+
+def _in_new_offers(new_offers: Array[Int, MAX_OFFERS], count: Int, obj: Int) -> Bool:
+    if obj == 0:
+        return False
+    for i in range(count):
+        if new_offers[i] == obj:
+            return True
+    return False
+
+
+def _has_library_msg_after_game_fd(state: Int, buffer: Int, start_offset: Int, used: Int) -> Bool:
+    """Legacy fallback (WORD_STRICT_IFACE == 0): returns True if any `for_library` message appears after a game FD event."""
+    var kb_id = word(state, WORD_KEYBOARD)
+    var ds_id = word(state, WORD_DATA_SOURCE)
+    if kb_id == 0 and ds_id == 0:
+        return False
+    var data_dev_id = word(state, WORD_DATA_DEVICE)
+    var new_offers = Array[Int, MAX_OFFERS](fill=0)
+    var new_offer_count = 0
+    var scan = start_offset
+    var seen_game_fd = False
+    while used - scan >= 8:
+        var obj = Int(get32(buffer + scan))
+        var hdr = Int(get32(buffer + scan + 4))
+        var op = hdr & 0xFFFF
+        var sz = hdr >> 16
+        if sz < 8 or used - scan < sz:
+            if seen_game_fd:
+                var partial_for_game = is_owned(state, obj) or is_server_offer(state, obj) or _in_new_offers(new_offers, new_offer_count, obj)
+                if not partial_for_game:
+                    return True
+            break
+        if data_dev_id != 0 and obj == data_dev_id and op == 0 and sz >= 12:
+            var oid = Int(get32(buffer + scan + 8))
+            if oid != 0 and new_offer_count < MAX_OFFERS and not _in_new_offers(new_offers, new_offer_count, oid):
+                new_offers[new_offer_count] = oid
+                new_offer_count += 1
+        var for_game = is_owned(state, obj) or is_server_offer(state, obj) or _in_new_offers(new_offers, new_offer_count, obj)
+        var for_library = not for_game
+        if obj == WL_DISPLAY_ID:
+            for_library = op == OPCODE_ERROR or not (
+                op == OPCODE_DELETE_ID and sz >= 12 and is_owned(state, Int(get32(buffer + scan + 8)))
+            )
+        if for_library and seen_game_fd:
+            return True
+        if for_game and (
+            (kb_id != 0 and obj == kb_id and op == 0)
+            or (ds_id != 0 and obj == ds_id and op == 1)
+        ):
+            seen_game_fd = True
+        scan += sz
+    if seen_game_fd and used - scan >= 4 and used - scan < 8:
+        var partial_obj = Int(get32(buffer + scan))
+        var partial_for_game = is_owned(state, partial_obj) or is_server_offer(state, partial_obj) or _in_new_offers(new_offers, new_offer_count, partial_obj)
+        if not partial_for_game:
+            return True
+    return False
+
+
 def take_incoming(state: Int) -> Bool:
     """Compositor to here: sort every whole event. True if the game got something."""
     var used = word(state, WORD_IN_USED)
@@ -189,27 +518,70 @@ def take_incoming(state: Int) -> Bool:
         var size = header >> 16
         if size < 8 or used - offset < size:
             break
-        var for_game = is_owned(state, object)
+        var for_game = is_owned(state, object) or is_server_offer(state, object)
         var for_library = not for_game
+        var dead_lib_id = 0
         if object == WL_DISPLAY_ID:
             for_game = opcode == OPCODE_ERROR
-            for_library = opcode == OPCODE_ERROR or not (opcode == OPCODE_DELETE_ID and is_owned(state, Int(get32(buffer + offset + 8))))
+            if opcode == OPCODE_ERROR:
+                for_library = True
+            elif opcode == OPCODE_DELETE_ID and size >= 12:
+                var dead_id = Int(get32(buffer + offset + 8))
+                var owned_dead = is_owned(state, dead_id)
+                for_library = not owned_dead
+                if not owned_dead:
+                    dead_lib_id = dead_id
+            else:
+                for_library = True
         if for_game:
+            var data_dev_id = word(state, WORD_DATA_DEVICE)
+            if data_dev_id != 0 and object == data_dev_id and opcode == 0 and size >= 12:
+                register_server_offer(state, Int(get32(buffer + offset + 8)))
             var game_used = word(state, WORD_GAME_USED)
             if game_used + size <= GAME_BYTES:
                 _ = external_call["memcpy", Int](word(state, WORD_GAME) + game_used, buffer + offset, size)
                 set_word(state, WORD_GAME_USED, game_used + size)
                 game_got = True
-            if object == word(state, WORD_KEYBOARD) and opcode == 0 and fd_count > 0:
-                close_fd(get64(fds))
+            var kb_id = word(state, WORD_KEYBOARD)
+            var ds_id = word(state, WORD_DATA_SOURCE)
+            var carries_game_fd = (
+                (kb_id != 0 and object == kb_id and opcode == 0)
+                or (ds_id != 0 and object == ds_id and opcode == 1)
+            )
+            if carries_game_fd and fd_count > 0:
+                var carried_fd = Int(get64(fds))
                 fd_count -= 1
                 _ = external_call["memmove", Int](fds, fds + 8, fd_count * 8)
+                var g_fds = word(state, WORD_GAME_FDS)
+                var g_cnt = word(state, WORD_GAME_FD_COUNT)
+                if g_fds != 0 and g_cnt < MAX_FDS:
+                    put64(g_fds + g_cnt * 8, carried_fd)
+                    set_word(state, WORD_GAME_FD_COUNT, g_cnt + 1)
+                else:
+                    close_fd(carried_fd)
         if for_library:
-            if not send_some(word(state, WORD_LIBRARY), buffer + offset, size, fds, fd_count, io_scratch):
+            var lib_fd_count = 0
+            if word(state, WORD_STRICT_IFACE) != 0:
+                var iface = lookup_lib_iface(state, object)
+                if fd_count > 0 and _lib_event_has_fd(iface, opcode):
+                    lib_fd_count = 1
+            else:
+                var rem_game_fds = _count_remaining_game_fds(state, buffer, offset, used)
+                if rem_game_fds == 0:
+                    lib_fd_count = fd_count
+                elif fd_count > rem_game_fds:
+                    if not _has_library_msg_after_game_fd(state, buffer, offset + size, used):
+                        lib_fd_count = fd_count - rem_game_fds
+            if not send_some(word(state, WORD_LIBRARY), buffer + offset, size, fds, lib_fd_count, io_scratch):
                 set_word(state, WORD_FAILED, 1)
-            for index in range(fd_count):
-                close_fd(get64(fds + index * 8))  # the kernel holds copies now
-            fd_count = 0
+            if lib_fd_count > 0:
+                for index in range(lib_fd_count):
+                    close_fd(get64(fds + index * 8))  # the kernel holds copies now
+                fd_count -= lib_fd_count
+                if fd_count > 0:
+                    _ = external_call["memmove", Int](fds, fds + lib_fd_count * 8, fd_count * 8)
+            if dead_lib_id != 0:
+                unregister_lib_iface(state, dead_lib_id)
         offset += size
     if offset > 0:
         _ = external_call["memmove", Int](buffer, buffer + offset, used - offset)
@@ -233,9 +605,13 @@ def take_outgoing(state: Int):
         used += count
         var whole = 0
         while used - whole >= 8:
-            var size = Int(get32(buffer + whole + 4)) >> 16
+            var obj = Int(get32(buffer + whole))
+            var hdr = Int(get32(buffer + whole + 4))
+            var op = hdr & 0xFFFF
+            var size = hdr >> 16
             if size < 8 or used - whole < size:
                 break
+            _track_outgoing_request(state, buffer + whole, obj, op, size)
             whole += size
         if whole > 0:
             if not send_some(word(state, WORD_REAL), buffer, whole, fds, fd_count, io_scratch):
@@ -273,7 +649,7 @@ def bridge_thread(state: Int) abi("C") -> Int:
     return 0
 
 
-struct WaylandBridge(Copyable, Movable):
+struct WaylandBridge(Movable):
     var state: Int
     var library: Int
     var display: Int  # wl_display*
@@ -307,6 +683,40 @@ struct WaylandBridge(Copyable, Movable):
         self.surface_interface = 0
         self.error = ""
 
+    def __moveinit__(out self, deinit existing: Self):
+        self.state = existing.state
+        self.library = existing.library
+        self.display = existing.display
+        self.surface_proxy = existing.surface_proxy
+        self.compositor_proxy = existing.compositor_proxy
+        self.fn_flush = existing.fn_flush
+        self.fn_proxy_create = existing.fn_proxy_create
+        self.fn_proxy_id = existing.fn_proxy_id
+        self.fn_constructor = existing.fn_constructor
+        self.fn_disconnect = existing.fn_disconnect
+        self.fn_proxy_destroy = existing.fn_proxy_destroy
+        self.callback_interface = existing.callback_interface
+        self.compositor_interface = existing.compositor_interface
+        self.surface_interface = existing.surface_interface
+        self.error = existing.error^
+        existing.state = 0
+        existing.library = 0
+        existing.display = 0
+        existing.surface_proxy = 0
+        existing.compositor_proxy = 0
+        existing.fn_flush = 0
+        existing.fn_proxy_create = 0
+        existing.fn_proxy_id = 0
+        existing.fn_constructor = 0
+        existing.fn_disconnect = 0
+        existing.fn_proxy_destroy = 0
+        existing.callback_interface = 0
+        existing.compositor_interface = 0
+        existing.surface_interface = 0
+
+    def __deinit__(deinit self):
+        self.stop()
+
     def active(self) -> Bool:
         return self.state != 0
 
@@ -334,17 +744,23 @@ struct WaylandBridge(Copyable, Movable):
         self.compositor_interface = self.symbol("wl_compositor_interface")
         self.surface_interface = self.symbol("wl_surface_interface")
         if self.error.byte_length() > 0:
+            self.stop()
             return False
         var pair = external_call["malloc", Int](8)
         if external_call["socketpair", Int32](Int32(1), Int32(1), Int32(0), pair) != 0:
+            external_call["free", NoneType](pair)
             self.error = "socketpair failed"
+            self.stop()
             return False
         var ours = Int(get32(pair))
         var theirs = Int(get32(pair + 4))
         external_call["free", NoneType](pair)
         self.display = self.connect_display(connect, theirs)
         if self.display == 0:
+            close_fd(ours)
+            close_fd(theirs)
             self.error = "wl_display_connect_to_fd failed"
+            self.stop()
             return False
         var state = external_call["calloc", Int](Int(STATE_WORDS), Int(8))
         set_word(state, WORD_REAL, real_fd)
@@ -359,13 +775,38 @@ struct WaylandBridge(Copyable, Movable):
         set_word(state, WORD_MUTEX, mutex_ptr)
         set_word(state, WORD_IN_FDS, external_call["malloc", Int](MAX_FDS * 8))
         set_word(state, WORD_OUT_FDS, external_call["malloc", Int](MAX_FDS * 8))
+        set_word(state, WORD_GAME_FDS, external_call["malloc", Int](MAX_FDS * 8))
+        set_word(state, WORD_OFFER_IDS, external_call["calloc", Int](Int(MAX_OFFERS), Int(4)))
         set_word(state, WORD_IO_SCRATCH, external_call["calloc", Int](Int(1), IO_SCRATCH_BYTES))
         set_word(state, WORD_POLL_SCRATCH, external_call["calloc", Int](Int(1), Int(32)))
         set_word(state, WORD_WAIT_SCRATCH, external_call["calloc", Int](Int(1), Int(24)))
+        init_lib_ifaces(state)
+        set_word(state, WORD_STRICT_IFACE, 1)
         set_owned(state, WL_DISPLAY_ID)
         var thread = 0
         if external_call["pthread_create", Int32](Pointer(to=thread), Int(0), bridge_thread, state) != 0:
             self.error = "the bridge thread did not start"
+            if self.display != 0 and self.fn_disconnect != 0:
+                _ = call1(self.fn_disconnect, self.display)
+            self.display = 0
+            close_fd(ours)
+            close_fd(word(state, WORD_NOTIFY))
+            _ = external_call["pthread_mutex_destroy", Int32](mutex_ptr)
+            external_call["free", NoneType](mutex_ptr)
+            external_call["free", NoneType](word(state, WORD_IN))
+            external_call["free", NoneType](word(state, WORD_OUT))
+            external_call["free", NoneType](word(state, WORD_GAME))
+            external_call["free", NoneType](word(state, WORD_OWNED))
+            external_call["free", NoneType](word(state, WORD_IN_FDS))
+            external_call["free", NoneType](word(state, WORD_OUT_FDS))
+            external_call["free", NoneType](word(state, WORD_GAME_FDS))
+            external_call["free", NoneType](word(state, WORD_OFFER_IDS))
+            external_call["free", NoneType](word(state, WORD_IO_SCRATCH))
+            external_call["free", NoneType](word(state, WORD_POLL_SCRATCH))
+            external_call["free", NoneType](word(state, WORD_WAIT_SCRATCH))
+            free_lib_ifaces(state)
+            external_call["free", NoneType](state)
+            self.stop()
             return False
         set_word(state, WORD_THREAD, thread)
         self.state = state
@@ -432,8 +873,24 @@ struct WaylandBridge(Copyable, Movable):
         return id
 
     def note_keyboard(self, id: Int):
+        if self.state == 0:
+            return
         lock(self.state)
         set_word(self.state, WORD_KEYBOARD, id)
+        unlock(self.state)
+
+    def note_data_device(self, id: Int):
+        if self.state == 0:
+            return
+        lock(self.state)
+        set_word(self.state, WORD_DATA_DEVICE, id)
+        unlock(self.state)
+
+    def note_data_source(self, id: Int):
+        if self.state == 0:
+            return
+        lock(self.state)
+        set_word(self.state, WORD_DATA_SOURCE, id)
         unlock(self.state)
 
     def write_all(self, address: Int, size: Int) -> Bool:
@@ -453,12 +910,24 @@ struct WaylandBridge(Copyable, Movable):
         return ok
 
     def read_into(self, mut incoming: List[UInt8]):
+        var unused_fds = List[Int]()
+        self.read_into(incoming, unused_fds)
+        for fd in unused_fds:
+            close_fd(fd)
+
+    def read_into(self, mut incoming: List[UInt8], mut incoming_fds: List[Int]):
         lock(self.state)
         var used = word(self.state, WORD_GAME_USED)
         var pointer = Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=word(self.state, WORD_GAME))
         for index in range(used):
             incoming.append(pointer[unsafe_offset=index])
         set_word(self.state, WORD_GAME_USED, 0)
+        var g_fds = word(self.state, WORD_GAME_FDS)
+        var g_cnt = word(self.state, WORD_GAME_FD_COUNT)
+        if g_fds != 0 and g_cnt > 0:
+            for i in range(g_cnt):
+                incoming_fds.append(Int(get64(g_fds + i * 8)))
+            set_word(state=self.state, index=WORD_GAME_FD_COUNT, value=0)
         unlock(self.state)
 
     def wait(self, timeout_ms: Int) -> Bool:
@@ -495,6 +964,10 @@ struct WaylandBridge(Copyable, Movable):
             var out_fd_count = word(self.state, WORD_OUT_FD_COUNT)
             for idx in range(out_fd_count):
                 close_fd(get64(out_fds + idx * 8))
+            var g_fds = word(self.state, WORD_GAME_FDS)
+            var g_fd_count = word(self.state, WORD_GAME_FD_COUNT)
+            for idx in range(g_fd_count):
+                close_fd(get64(g_fds + idx * 8))
             var mutex_ptr = word(self.state, WORD_MUTEX)
             if mutex_ptr != 0:
                 _ = external_call["pthread_mutex_destroy", Int32](mutex_ptr)
@@ -505,11 +978,28 @@ struct WaylandBridge(Copyable, Movable):
             external_call["free", NoneType](word(self.state, WORD_OWNED))
             external_call["free", NoneType](in_fds)
             external_call["free", NoneType](out_fds)
+            external_call["free", NoneType](g_fds)
+            external_call["free", NoneType](word(self.state, WORD_OFFER_IDS))
             external_call["free", NoneType](word(self.state, WORD_IO_SCRATCH))
             external_call["free", NoneType](word(self.state, WORD_POLL_SCRATCH))
             external_call["free", NoneType](word(self.state, WORD_WAIT_SCRATCH))
+            free_lib_ifaces(self.state)
             external_call["free", NoneType](self.state)
             self.state = 0
+        elif self.display != 0 and self.fn_disconnect != 0:
+            _ = call1(self.fn_disconnect, self.display)
+            self.display = 0
         if self.library != 0:
             _ = dl_close(self.library)
             self.library = 0
+        self.surface_proxy = 0
+        self.compositor_proxy = 0
+        self.fn_flush = 0
+        self.fn_proxy_create = 0
+        self.fn_proxy_id = 0
+        self.fn_constructor = 0
+        self.fn_disconnect = 0
+        self.fn_proxy_destroy = 0
+        self.callback_interface = 0
+        self.compositor_interface = 0
+        self.surface_interface = 0

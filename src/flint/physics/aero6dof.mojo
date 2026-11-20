@@ -16,8 +16,9 @@ First-class flight dynamics & guidance module for *Robotech* / high-speed aerosp
    - Pure 8-wide `SIMD[DType.float32, 8]` Zero-Effort-Miss Augmented Proportional Navigation
      (ZEM-APN) + decaying helical *Itano Circus* corkscrew weave kernel.
 """
-from std.math import sqrt, floor, abs, min, max
+from std.math import sqrt, abs, min, max
 from flint.core.math import Vec3, Quat
+from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.core.detmath import (
     det_sin,
     det_cos,
@@ -25,12 +26,13 @@ from flint.core.detmath import (
     det_exp,
     set_sim_float_mode,
     PI,
-    TWO_OVER_PI,
-    PIO2_1,
-    PIO2_2,
-    PIO2_3,
 )
-from flint.physics.solver_bodies import LANES, F8, I8, V8
+from flint.physics.solver_bodies import LANES, F8, V8
+
+comptime AERO_CFG_TAG: UInt32 = fourcc("AROC")
+comptime AERO_CTRL_TAG: UInt32 = fourcc("AROK")
+comptime AERO_STATE_TAG: UInt32 = fourcc("AROS")
+comptime AERO_BLOB_VERSION: Int = 1
 
 
 comptime ISA_RHO0: Float32 = 1.225
@@ -198,6 +200,62 @@ struct Aero6DofConfig(Copyable, ImplicitlyCopyable, Movable):
         self.gerwalk_nozzle_right = Vec3(1.85, -0.95, 0.35)
         self.max_hover_nozzle_thrust = 115000.0
 
+    def serialize(self, mut w: BlobWriter):
+        w.begin(AERO_CFG_TAG, AERO_BLOB_VERSION)
+        w.f32(self.mass_0)
+        w.f32(self.mass_1)
+        w.vec3(self.inertia_0)
+        w.vec3(self.inertia_1)
+        w.f32(self.wingspan_0)
+        w.f32(self.wingspan_1)
+        w.f32(self.wing_area_0)
+        w.f32(self.wing_area_1)
+        w.f32(self.cl_alpha)
+        w.f32(self.cl0)
+        w.f32(self.cd0_0)
+        w.f32(self.cd0_1)
+        w.f32(self.cd_wave_peak)
+        w.f32(self.stall_alpha)
+        w.f32(self.max_afterburner_thrust)
+        w.f32(self.sfc_kg_per_n_s)
+        w.f32(self.tvc_arm_z)
+        w.f32(self.max_tvc_angle_rad)
+        w.vec3(self.aero_ctrl_torque_gain)
+        w.vec3(self.aero_rate_damping)
+        w.vec3(self.rcs_max_torque)
+        w.vec3(self.gerwalk_nozzle_left)
+        w.vec3(self.gerwalk_nozzle_right)
+        w.f32(self.max_hover_nozzle_thrust)
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        _ = r.enter(AERO_CFG_TAG, AERO_BLOB_VERSION)
+        self.mass_0 = r.f32()
+        self.mass_1 = r.f32()
+        self.inertia_0 = r.vec3()
+        self.inertia_1 = r.vec3()
+        self.wingspan_0 = r.f32()
+        self.wingspan_1 = r.f32()
+        self.wing_area_0 = r.f32()
+        self.wing_area_1 = r.f32()
+        self.cl_alpha = r.f32()
+        self.cl0 = r.f32()
+        self.cd0_0 = r.f32()
+        self.cd0_1 = r.f32()
+        self.cd_wave_peak = r.f32()
+        self.stall_alpha = r.f32()
+        self.max_afterburner_thrust = r.f32()
+        self.sfc_kg_per_n_s = r.f32()
+        self.tvc_arm_z = r.f32()
+        self.max_tvc_angle_rad = r.f32()
+        self.aero_ctrl_torque_gain = r.vec3()
+        self.aero_rate_damping = r.vec3()
+        self.rcs_max_torque = r.vec3()
+        self.gerwalk_nozzle_left = r.vec3()
+        self.gerwalk_nozzle_right = r.vec3()
+        self.max_hover_nozzle_thrust = r.f32()
+        r.leave()
+
 
 struct Aero6DofControls(Copyable, ImplicitlyCopyable, Movable):
     var throttle: Float32
@@ -232,6 +290,44 @@ struct Aero6DofControls(Copyable, ImplicitlyCopyable, Movable):
         self.wind_vel = Vec3()
         self.ground_y = 0.0
         self.gravity = 9.81
+
+    def serialize(self, mut w: BlobWriter):
+        w.begin(AERO_CTRL_TAG, AERO_BLOB_VERSION)
+        w.f32(self.throttle)
+        w.f32(self.pitch_cmd)
+        w.f32(self.yaw_cmd)
+        w.f32(self.roll_cmd)
+        w.f32(self.tvc_pitch)
+        w.f32(self.tvc_yaw)
+        w.vec3(self.rcs_cmd)
+        w.f32(self.morph_u_target)
+        w.f32(self.morph_rate)
+        w.f32(self.hover_left_throttle)
+        w.f32(self.hover_right_throttle)
+        w.f32(self.hover_tilt_rad)
+        w.vec3(self.wind_vel)
+        w.f32(self.ground_y)
+        w.f32(self.gravity)
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        _ = r.enter(AERO_CTRL_TAG, AERO_BLOB_VERSION)
+        self.throttle = r.f32()
+        self.pitch_cmd = r.f32()
+        self.yaw_cmd = r.f32()
+        self.roll_cmd = r.f32()
+        self.tvc_pitch = r.f32()
+        self.tvc_yaw = r.f32()
+        self.rcs_cmd = r.vec3()
+        self.morph_u_target = r.f32()
+        self.morph_rate = r.f32()
+        self.hover_left_throttle = r.f32()
+        self.hover_right_throttle = r.f32()
+        self.hover_tilt_rad = r.f32()
+        self.wind_vel = r.vec3()
+        self.ground_y = r.f32()
+        self.gravity = r.f32()
+        r.leave()
 
 
 struct Aero6DofState(Copyable, ImplicitlyCopyable, Movable):
@@ -272,6 +368,48 @@ struct Aero6DofState(Copyable, ImplicitlyCopyable, Movable):
         self.current_mass = 13200.0
         self.current_inertia = Vec3(28000.0, 82000.0, 19000.0)
         self.g_load = 1.0
+
+    def serialize(self, mut w: BlobWriter):
+        w.begin(AERO_STATE_TAG, AERO_BLOB_VERSION)
+        w.vec3(self.pos)
+        w.quat(self.rot)
+        w.vec3(self.linear_vel)
+        w.vec3(self.angular_vel)
+        w.f32(self.morph_u)
+        w.f32(self.fuel_mass)
+        w.f32(self.mach)
+        w.f32(self.alpha_rad)
+        w.f32(self.beta_rad)
+        w.f32(self.dynamic_pressure)
+        w.f32(self.cl)
+        w.f32(self.cd)
+        w.f32(self.cd_wave)
+        w.f32(self.ge_lift_factor)
+        w.f32(self.current_mass)
+        w.vec3(self.current_inertia)
+        w.f32(self.g_load)
+        w.end()
+
+    def deserialize(mut self, mut r: BlobReader) raises:
+        _ = r.enter(AERO_STATE_TAG, AERO_BLOB_VERSION)
+        self.pos = r.vec3()
+        self.rot = r.quat()
+        self.linear_vel = r.vec3()
+        self.angular_vel = r.vec3()
+        self.morph_u = r.f32()
+        self.fuel_mass = r.f32()
+        self.mach = r.f32()
+        self.alpha_rad = r.f32()
+        self.beta_rad = r.f32()
+        self.dynamic_pressure = r.f32()
+        self.cl = r.f32()
+        self.cd = r.f32()
+        self.cd_wave = r.f32()
+        self.ge_lift_factor = r.f32()
+        self.current_mass = r.f32()
+        self.current_inertia = r.vec3()
+        self.g_load = r.f32()
+        r.leave()
 
 
 @always_inline
@@ -325,6 +463,177 @@ def _solve_implicit_euler_rotation(wb0: Vec3, inertia: Vec3, tau_b: Vec3, h: Flo
     return w
 
 
+def eval_aero6dof_forces(
+    mut state: Aero6DofState,
+    cfg: Aero6DofConfig,
+    ctrl: Aero6DofControls,
+    h: Float32,
+) -> Tuple[Vec3, Vec3]:
+    """Evaluates aerodynamic, TVC, GERWALK hover-nozzle, and RCS forces & torques over step `h`.
+    Updates `morph_u`, `fuel_mass`, `current_mass`, `current_inertia`, `g_load`, and telemetry
+    without integrating `pos`, `rot`, `linear_vel`, or `angular_vel`.
+    Returns `(f_non_grav_world, tau_total_body)`."""
+    # 1. Morph blend u(t) and instantaneous mass & principal inertia I(u) = lerp(I_0, I_1, u)
+    var u_tgt = max(Float32(0.0), min(Float32(1.0), ctrl.morph_u_target))
+    var max_du = max(Float32(0.0), ctrl.morph_rate) * h
+    var du = max(-max_du, min(max_du, u_tgt - state.morph_u))
+    state.morph_u = max(Float32(0.0), min(Float32(1.0), state.morph_u + du))
+    var u = state.morph_u
+    var om_u = Float32(1.0) - u
+
+    var dry_mass = om_u * cfg.mass_0 + u * cfg.mass_1
+    var cur_mass = max(Float32(10.0), dry_mass + max(Float32(0.0), state.fuel_mass))
+    var cur_i = Vec3(
+        om_u * cfg.inertia_0.x + u * cfg.inertia_1.x,
+        om_u * cfg.inertia_0.y + u * cfg.inertia_1.y,
+        om_u * cfg.inertia_0.z + u * cfg.inertia_1.z,
+    )
+    var span = om_u * cfg.wingspan_0 + u * cfg.wingspan_1
+    var area = max(Float32(0.5), om_u * cfg.wing_area_0 + u * cfg.wing_area_1)
+    var cd0 = om_u * cfg.cd0_0 + u * cfg.cd0_1
+    var aspect_ratio = (span * span) / area
+
+    state.current_mass = cur_mass
+    state.current_inertia = cur_i
+
+    # 2. ISA Atmosphere & Ground Effect
+    var isa = eval_isa_atmosphere(state.pos.y)
+    var rho = isa[0]
+    var a_sound = isa[1]
+    var h_agl = state.pos.y - ctrl.ground_y
+    var ge = eval_ground_effect(h_agl, span)
+    var ge_lift = ge[0]
+    var ge_ind_drag = ge[1]
+    state.ge_lift_factor = ge_lift
+
+    # 3. Body-frame airspeed, AoA alpha, sideslip beta, Mach, and dynamic pressure
+    # Body frame convention: +X starboard-right, +Y dorsal-up, +Z nose-forward
+    var inv_q = state.rot.conjugate()
+    var v_air_w = state.linear_vel - ctrl.wind_vel
+    var vb = inv_q.rotate(v_air_w)
+    var v_mag = vb.length()
+    var mach = v_mag / max(Float32(1.0), a_sound)
+    var q_dyn = Float32(0.5) * rho * v_mag * v_mag
+    state.mach = mach
+    state.dynamic_pressure = q_dyn
+
+    var f_aero_b = Vec3()
+    var tau_aero_b = Vec3()
+    var wb = inv_q.rotate(state.angular_vel)
+
+    if v_mag > Float32(0.05) and q_dyn > Float32(1.0e-5):
+        var alpha = det_atan2(-vb.y, vb.z)
+        var v_yz = sqrt(vb.y * vb.y + vb.z * vb.z)
+        var beta = det_atan2(-vb.x, max(Float32(1.0e-4), v_yz))
+        state.alpha_rad = alpha
+        state.beta_rad = beta
+
+        var trans = eval_transonic_wave_drag(mach, cfg.cd_wave_peak)
+        var pg_mult = trans[0]
+        var cd_wave = trans[1]
+        state.cd_wave = cd_wave
+
+        var polar = eval_post_stall_polar(
+            alpha, cfg.cl_alpha, cfg.cl0, cd0, cfg.stall_alpha,
+            aspect_ratio, pg_mult, ge_lift, ge_ind_drag, cd_wave,
+        )
+        var cl = polar[0]
+        var cd = polar[1]
+        var cm_static = polar[2]
+        state.cl = cl
+        state.cd = cd
+
+        # Wind axes in body space: drag opposes vb, lift perpendicular to vb in (Y, Z) symmetry plane
+        var drag_dir_b = -vb * (Float32(1.0) / v_mag)
+        var lift_dir_b = Vec3(0.0, det_cos(alpha), det_sin(alpha))
+        var cy_side = -Float32(0.85) * det_sin(beta)
+
+        var q_s = q_dyn * area
+        f_aero_b = drag_dir_b * (q_s * cd) + lift_dir_b * (q_s * cl) + Vec3(q_s * cy_side, 0.0, 0.0)
+
+        # Aerodynamic stability, control surfaces, and angular rate damping
+        var chord = area / max(Float32(0.5), span)
+        var pitch_surf = max(Float32(-1.0), min(Float32(1.0), ctrl.pitch_cmd))
+        var yaw_surf = max(Float32(-1.0), min(Float32(1.0), ctrl.yaw_cmd))
+        var roll_surf = max(Float32(-1.0), min(Float32(1.0), ctrl.roll_cmd))
+
+        # Control surface authority fades smoothly post-stall while TVC/RCS remain 100% active
+        var surf_eff = Float32(1.0) / (Float32(1.0) + Float32(1.5) * det_sin(alpha) * det_sin(alpha))
+        var damp_scale = min(Float32(2.5), rho / ISA_RHO0) * max(Float32(0.2), min(Float32(3.0), v_mag / Float32(100.0)))
+
+        tau_aero_b = Vec3(
+            q_s * chord * cm_static - q_s * cfg.aero_ctrl_torque_gain.x * surf_eff * pitch_surf - cfg.aero_rate_damping.x * damp_scale * wb.x,
+            -q_s * span * Float32(0.18) * det_sin(beta) + q_s * cfg.aero_ctrl_torque_gain.y * surf_eff * yaw_surf - cfg.aero_rate_damping.y * damp_scale * wb.y,
+            -q_s * span * Float32(0.06) * det_sin(beta) + q_s * cfg.aero_ctrl_torque_gain.z * surf_eff * roll_surf - cfg.aero_rate_damping.z * damp_scale * wb.z,
+        )
+    else:
+        state.alpha_rad = 0.0
+        state.beta_rad = 0.0
+        state.cl = 0.0
+        state.cd = cd0
+        state.cd_wave = 0.0
+
+    # 4. Main Afterburner + Thrust Vectoring Control (TVC)
+    var fuel_empty = (cfg.sfc_kg_per_n_s > Float32(0.0) and state.fuel_mass <= Float32(0.0)) or state.fuel_mass < Float32(0.0)
+    var th_main = max(Float32(0.0), min(Float32(1.0), ctrl.throttle))
+    if fuel_empty:
+        th_main = Float32(0.0)
+    var main_thrust_mag = th_main * cfg.max_afterburner_thrust
+
+    # Deflect aft exhaust nozzle: positive pitch_cmd deflects thrust vector so aft tail pushes -Y, pitching nose +X up!
+    var tvc_p = ctrl.tvc_pitch if ctrl.tvc_pitch != Float32(0.0) else ctrl.pitch_cmd * cfg.max_tvc_angle_rad
+    var tvc_y = ctrl.tvc_yaw if ctrl.tvc_yaw != Float32(0.0) else ctrl.yaw_cmd * cfg.max_tvc_angle_rad
+    tvc_p = max(-cfg.max_tvc_angle_rad, min(cfg.max_tvc_angle_rad, tvc_p))
+    tvc_y = max(-cfg.max_tvc_angle_rad, min(cfg.max_tvc_angle_rad, tvc_y))
+
+    var cp_t = det_cos(tvc_p)
+    var sp_t = det_sin(tvc_p)
+    var cy_t = det_cos(tvc_y)
+    var sy_t = det_sin(tvc_y)
+    # With r_tvc = (0, 0, tvc_arm_z < 0):
+    # r_tvc x F_tvc = (0, 0, -|z|) x (Fx, Fy, Fz) = (+|z|*Fy, -|z|*Fx, 0).
+    # Nose-up rotation (+Z -> +Y) is -X, so tvc_p > 0 pushes tail -Y (Fy < 0 => tau_x < 0, nose UP!).
+    var f_tvc_b = Vec3(
+        -sy_t * cp_t * main_thrust_mag,
+        -sp_t * main_thrust_mag,
+        cy_t * cp_t * main_thrust_mag,
+    )
+    var r_tvc = Vec3(0.0, 0.0, cfg.tvc_arm_z)
+    var tau_tvc_b = r_tvc.cross(f_tvc_b)
+
+    # 5. Off-CoM GERWALK Twin Vectoring Hover Nozzles
+    var th_hl = max(Float32(0.0), min(Float32(1.0), ctrl.hover_left_throttle))
+    var th_hr = max(Float32(0.0), min(Float32(1.0), ctrl.hover_right_throttle))
+    if fuel_empty:
+        th_hl = Float32(0.0)
+        th_hr = Float32(0.0)
+    var noz_dir_b = Vec3(0.0, det_sin(ctrl.hover_tilt_rad), det_cos(ctrl.hover_tilt_rad))
+    var f_noz_l = noz_dir_b * (th_hl * cfg.max_hover_nozzle_thrust)
+    var f_noz_r = noz_dir_b * (th_hr * cfg.max_hover_nozzle_thrust)
+    var tau_noz_b = cfg.gerwalk_nozzle_left.cross(f_noz_l) + cfg.gerwalk_nozzle_right.cross(f_noz_r)
+
+    # Fuel burn update (if configured)
+    if cfg.sfc_kg_per_n_s > Float32(0.0) and state.fuel_mass > Float32(0.0):
+        var total_thrust_n = main_thrust_mag + (th_hl + th_hr) * cfg.max_hover_nozzle_thrust
+        state.fuel_mass = max(Float32(0.0), state.fuel_mass - cfg.sfc_kg_per_n_s * total_thrust_n * h)
+
+    # 6. Reaction Control System (RCS) verniers (100% effective at 0 airspeed and in orbital vacuum)
+    var rcs_in = ctrl.rcs_cmd
+    if rcs_in.length_squared() == Float32(0.0) and q_dyn < Float32(250.0):
+        rcs_in = Vec3(-ctrl.pitch_cmd, ctrl.yaw_cmd, ctrl.roll_cmd)
+    var tau_rcs_b = Vec3(
+        max(Float32(-1.0), min(Float32(1.0), rcs_in.x)) * cfg.rcs_max_torque.x,
+        max(Float32(-1.0), min(Float32(1.0), rcs_in.y)) * cfg.rcs_max_torque.y,
+        max(Float32(-1.0), min(Float32(1.0), rcs_in.z)) * cfg.rcs_max_torque.z,
+    )
+
+    var f_body_total = f_aero_b + f_tvc_b + f_noz_l + f_noz_r
+    var f_non_grav_w = state.rot.rotate(f_body_total)
+    state.g_load = (f_non_grav_w.length() / cur_mass) / Float32(9.81)
+    var tau_total_b = tau_aero_b + tau_tvc_b + tau_noz_b + tau_rcs_b
+    return (f_non_grav_w, tau_total_b)
+
+
 def step_aero6dof(
     mut state: Aero6DofState,
     cfg: Aero6DofConfig,
@@ -340,168 +649,18 @@ def step_aero6dof(
     var h = dt / Float32(steps)
 
     for _ in range(steps):
-        # 1. Morph blend u(t) and instantaneous mass & principal inertia I(u) = lerp(I_0, I_1, u)
-        var u_tgt = max(Float32(0.0), min(Float32(1.0), ctrl.morph_u_target))
-        var max_du = max(Float32(0.0), ctrl.morph_rate) * h
-        var du = max(-max_du, min(max_du, u_tgt - state.morph_u))
-        state.morph_u = max(Float32(0.0), min(Float32(1.0), state.morph_u + du))
-        var u = state.morph_u
-        var om_u = Float32(1.0) - u
-
-        var dry_mass = om_u * cfg.mass_0 + u * cfg.mass_1
-        var cur_mass = max(Float32(10.0), dry_mass + max(Float32(0.0), state.fuel_mass))
-        var cur_i = Vec3(
-            om_u * cfg.inertia_0.x + u * cfg.inertia_1.x,
-            om_u * cfg.inertia_0.y + u * cfg.inertia_1.y,
-            om_u * cfg.inertia_0.z + u * cfg.inertia_1.z,
-        )
-        var span = om_u * cfg.wingspan_0 + u * cfg.wingspan_1
-        var area = max(Float32(0.5), om_u * cfg.wing_area_0 + u * cfg.wing_area_1)
-        var cd0 = om_u * cfg.cd0_0 + u * cfg.cd0_1
-        var aspect_ratio = (span * span) / area
-
-        state.current_mass = cur_mass
-        state.current_inertia = cur_i
-
-        # 2. ISA Atmosphere & Ground Effect
-        var isa = eval_isa_atmosphere(state.pos.y)
-        var rho = isa[0]
-        var a_sound = isa[1]
-        var h_agl = state.pos.y - ctrl.ground_y
-        var ge = eval_ground_effect(h_agl, span)
-        var ge_lift = ge[0]
-        var ge_ind_drag = ge[1]
-        state.ge_lift_factor = ge_lift
-
-        # 3. Body-frame airspeed, AoA alpha, sideslip beta, Mach, and dynamic pressure
-        # Body frame convention: +X starboard-right, +Y dorsal-up, +Z nose-forward
-        var inv_q = state.rot.conjugate()
-        var v_air_w = state.linear_vel - ctrl.wind_vel
-        var vb = inv_q.rotate(v_air_w)
-        var v_mag = vb.length()
-        var mach = v_mag / max(Float32(1.0), a_sound)
-        var q_dyn = Float32(0.5) * rho * v_mag * v_mag
-        state.mach = mach
-        state.dynamic_pressure = q_dyn
-
-        var f_aero_b = Vec3()
-        var tau_aero_b = Vec3()
-        var wb = inv_q.rotate(state.angular_vel)
-
-        if v_mag > Float32(0.05) and q_dyn > Float32(1.0e-5):
-            var alpha = det_atan2(-vb.y, vb.z)
-            var v_yz = sqrt(vb.y * vb.y + vb.z * vb.z)
-            var beta = det_atan2(-vb.x, max(Float32(1.0e-4), v_yz))
-            state.alpha_rad = alpha
-            state.beta_rad = beta
-
-            var trans = eval_transonic_wave_drag(mach, cfg.cd_wave_peak)
-            var pg_mult = trans[0]
-            var cd_wave = trans[1]
-            state.cd_wave = cd_wave
-
-            var polar = eval_post_stall_polar(
-                alpha, cfg.cl_alpha, cfg.cl0, cd0, cfg.stall_alpha,
-                aspect_ratio, pg_mult, ge_lift, ge_ind_drag, cd_wave,
-            )
-            var cl = polar[0]
-            var cd = polar[1]
-            var cm_static = polar[2]
-            state.cl = cl
-            state.cd = cd
-
-            # Wind axes in body space: drag opposes vb, lift perpendicular to vb in (Y, Z) symmetry plane
-            var drag_dir_b = -vb * (Float32(1.0) / v_mag)
-            var lift_dir_b = Vec3(0.0, det_cos(alpha), det_sin(alpha))
-            var cy_side = -Float32(0.85) * det_sin(beta)
-
-            var q_s = q_dyn * area
-            f_aero_b = drag_dir_b * (q_s * cd) + lift_dir_b * (q_s * cl) + Vec3(q_s * cy_side, 0.0, 0.0)
-
-            # Aerodynamic stability, control surfaces, and angular rate damping
-            var chord = area / max(Float32(0.5), span)
-            var pitch_surf = max(Float32(-1.0), min(Float32(1.0), ctrl.pitch_cmd))
-            var yaw_surf = max(Float32(-1.0), min(Float32(1.0), ctrl.yaw_cmd))
-            var roll_surf = max(Float32(-1.0), min(Float32(1.0), ctrl.roll_cmd))
-
-            # Control surface authority fades smoothly post-stall while TVC/RCS remain 100% active
-            var surf_eff = Float32(1.0) / (Float32(1.0) + Float32(1.5) * det_sin(alpha) * det_sin(alpha))
-            var damp_scale = min(Float32(2.5), rho / ISA_RHO0) * max(Float32(0.2), min(Float32(3.0), v_mag / Float32(100.0)))
-
-            tau_aero_b = Vec3(
-                q_s * chord * cm_static - q_s * cfg.aero_ctrl_torque_gain.x * surf_eff * pitch_surf - cfg.aero_rate_damping.x * damp_scale * wb.x,
-                -q_s * span * Float32(0.18) * det_sin(beta) + q_s * cfg.aero_ctrl_torque_gain.y * surf_eff * yaw_surf - cfg.aero_rate_damping.y * damp_scale * wb.y,
-                -q_s * span * Float32(0.06) * det_sin(beta) + q_s * cfg.aero_ctrl_torque_gain.z * surf_eff * roll_surf - cfg.aero_rate_damping.z * damp_scale * wb.z,
-            )
-        else:
-            state.alpha_rad = 0.0
-            state.beta_rad = 0.0
-            state.cl = 0.0
-            state.cd = cd0
-            state.cd_wave = 0.0
-
-        # 4. Main Afterburner + Thrust Vectoring Control (TVC)
-        var th_main = max(Float32(0.0), min(Float32(1.0), ctrl.throttle))
-        if state.fuel_mass < Float32(0.0):
-            th_main = Float32(0.0)
-        var main_thrust_mag = th_main * cfg.max_afterburner_thrust
-
-        # Deflect aft exhaust nozzle: positive pitch_cmd deflects thrust vector so aft tail pushes -Y, pitching nose +X up!
-        var tvc_p = ctrl.tvc_pitch if ctrl.tvc_pitch != Float32(0.0) else ctrl.pitch_cmd * cfg.max_tvc_angle_rad
-        var tvc_y = ctrl.tvc_yaw if ctrl.tvc_yaw != Float32(0.0) else ctrl.yaw_cmd * cfg.max_tvc_angle_rad
-        tvc_p = max(-cfg.max_tvc_angle_rad, min(cfg.max_tvc_angle_rad, tvc_p))
-        tvc_y = max(-cfg.max_tvc_angle_rad, min(cfg.max_tvc_angle_rad, tvc_y))
-
-        var cp_t = det_cos(tvc_p)
-        var sp_t = det_sin(tvc_p)
-        var cy_t = det_cos(tvc_y)
-        var sy_t = det_sin(tvc_y)
-        # With r_tvc = (0, 0, tvc_arm_z < 0):
-        # r_tvc x F_tvc = (0, 0, -|z|) x (Fx, Fy, Fz) = (+|z|*Fy, -|z|*Fx, 0).
-        # Nose-up rotation (+Z -> +Y) is -X, so tvc_p > 0 pushes tail -Y (Fy < 0 => tau_x < 0, nose UP!).
-        var f_tvc_b = Vec3(
-            -sy_t * cp_t * main_thrust_mag,
-            -sp_t * main_thrust_mag,
-            cy_t * cp_t * main_thrust_mag,
-        )
-        var r_tvc = Vec3(0.0, 0.0, cfg.tvc_arm_z)
-        var tau_tvc_b = r_tvc.cross(f_tvc_b)
-
-        # 5. Off-CoM GERWALK Twin Vectoring Hover Nozzles
-        var th_hl = max(Float32(0.0), min(Float32(1.0), ctrl.hover_left_throttle))
-        var th_hr = max(Float32(0.0), min(Float32(1.0), ctrl.hover_right_throttle))
-        var noz_dir_b = Vec3(0.0, det_sin(ctrl.hover_tilt_rad), det_cos(ctrl.hover_tilt_rad))
-        var f_noz_l = noz_dir_b * (th_hl * cfg.max_hover_nozzle_thrust)
-        var f_noz_r = noz_dir_b * (th_hr * cfg.max_hover_nozzle_thrust)
-        var tau_noz_b = cfg.gerwalk_nozzle_left.cross(f_noz_l) + cfg.gerwalk_nozzle_right.cross(f_noz_r)
-
-        # Fuel burn update (if configured)
-        if cfg.sfc_kg_per_n_s > Float32(0.0) and state.fuel_mass > Float32(0.0):
-            var total_thrust_n = main_thrust_mag + (th_hl + th_hr) * cfg.max_hover_nozzle_thrust
-            state.fuel_mass = max(Float32(0.0), state.fuel_mass - cfg.sfc_kg_per_n_s * total_thrust_n * h)
-
-        # 6. Reaction Control System (RCS) verniers (100% effective at 0 airspeed and in orbital vacuum)
-        var rcs_in = ctrl.rcs_cmd
-        if rcs_in.length_squared() == Float32(0.0) and q_dyn < Float32(250.0):
-            rcs_in = Vec3(-ctrl.pitch_cmd, ctrl.yaw_cmd, ctrl.roll_cmd)
-        var tau_rcs_b = Vec3(
-            max(Float32(-1.0), min(Float32(1.0), rcs_in.x)) * cfg.rcs_max_torque.x,
-            max(Float32(-1.0), min(Float32(1.0), rcs_in.y)) * cfg.rcs_max_torque.y,
-            max(Float32(-1.0), min(Float32(1.0), rcs_in.z)) * cfg.rcs_max_torque.z,
-        )
+        var ft = eval_aero6dof_forces(state, cfg, ctrl, h)
+        var f_non_grav_w = ft[0]
+        var tau_total_b = ft[1]
 
         # 7. True Newtonian translational integration: a = F / m(t)
-        var f_body_total = f_aero_b + f_tvc_b + f_noz_l + f_noz_r
-        var f_non_grav_w = state.rot.rotate(f_body_total)
-        var accel_w = f_non_grav_w * (Float32(1.0) / cur_mass) + Vec3(0.0, -ctrl.gravity, 0.0)
-        state.g_load = (f_non_grav_w.length() / cur_mass) / Float32(9.81)
-
+        var accel_w = f_non_grav_w * (Float32(1.0) / state.current_mass) + Vec3(0.0, -ctrl.gravity, 0.0)
         state.linear_vel = state.linear_vel + accel_w * h
         state.pos = state.pos + state.linear_vel * h
 
         # 8. Implicit Newton-Raphson gyroscopic + external moment integration & detmath SO(3) attitude update
-        var tau_total_b = tau_aero_b + tau_tvc_b + tau_noz_b + tau_rcs_b
-        var wb_next = _solve_implicit_euler_rotation(wb, cur_i, tau_total_b, h)
+        var wb = state.rot.conjugate().rotate(state.angular_vel)
+        var wb_next = _solve_implicit_euler_rotation(wb, state.current_inertia, tau_total_b, h)
         state.angular_vel = state.rot.rotate(wb_next)
         state.rot = (Quat.from_scaled_angle(state.angular_vel * h) * state.rot).normalized()
 
@@ -509,24 +668,6 @@ def step_aero6dof(
 # =========================================================================
 # 8-Wide SIMD ZEM-APN + Decaying Helical Itano Circus Missile Swarm Kernel
 # =========================================================================
-
-@always_inline
-def _det_sincos_f8(x: F8) -> Tuple[F8, F8]:
-    """8-wide SIMD deterministic Cephes minimax `(sin, cos)` with Cody-Waite reduction (zero std.math.sin/cos)."""
-    var j = floor(x * F8(TWO_OVER_PI) + F8(0.5))
-    var r = ((x - j * F8(PIO2_1)) - j * F8(PIO2_2)) - j * F8(PIO2_3)
-    var z = r * r
-    var s_poly = ((F8(-1.9515295891e-4) * z + F8(8.3321608736e-3)) * z + F8(-1.6666654611e-1)) * z * r + r
-    var c_poly = ((F8(2.443315711809948e-5) * z + F8(-1.388731625493765e-3)) * z + F8(4.166664568298827e-2)) * z * z - F8(0.5) * z + F8(1.0)
-
-    var q = I8(j) & I8(3)
-    var q0 = q.eq(I8(0))
-    var q1 = q.eq(I8(1))
-    var q2 = q.eq(I8(2))
-
-    var sin_out = q0.select(s_poly, q1.select(c_poly, q2.select(F8(0.0) - s_poly, F8(0.0) - c_poly)))
-    var cos_out = q0.select(c_poly, q1.select(F8(0.0) - s_poly, q2.select(F8(0.0) - c_poly, s_poly)))
-    return (sin_out, cos_out)
 
 
 @fieldwise_init
@@ -593,13 +734,14 @@ def step_zem_apn_simd8(
     var e2 = u_los.cross(e1)
 
     swirl_phase = swirl_phase + F8(swirl_freq) * h
-    var sc = _det_sincos_f8(swirl_phase)
+    var s_swirl = det_sin(swirl_phase)
+    var c_swirl = det_cos(swirl_phase)
     var fade_t = max(
         F8(0.0),
         min(F8(1.0), (dist - F8(terminal_homing_range)) / F8(max(Float32(1.0), swirl_fade_span))),
     )
     var swirl_mag = F8(swirl_amp) * fade_t * fade_t
-    var a_swirl = e1.scale(sc[1] * swirl_mag) + e2.scale(sc[0] * swirl_mag)
+    var a_swirl = e1.scale(c_swirl * swirl_mag) + e2.scale(s_swirl * swirl_mag)
 
     # Structural G-limit clamp on lateral guidance + swirl acceleration
     var a_lat = a_apn + a_swirl

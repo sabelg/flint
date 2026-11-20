@@ -550,6 +550,27 @@ struct LockstepPeer(Movable):
         self.local_hashes = List[UInt64]()
         self.remote_frames = List[LockstepFrame]()
 
+    def __moveinit__(out self, deinit existing: Self):
+        self.fd = existing.fd
+        self.local_port = existing.local_port
+        self.peer_ip_a = existing.peer_ip_a
+        self.peer_ip_b = existing.peer_ip_b
+        self.peer_ip_c = existing.peer_ip_c
+        self.peer_ip_d = existing.peer_ip_d
+        self.peer_port = existing.peer_port
+        self.packets_sent = existing.packets_sent
+        self.packets_received = existing.packets_received
+        self.desync_detected = existing.desync_detected
+        self.desync_tick = existing.desync_tick
+        self.local_ticks = existing.local_ticks^
+        self.local_hashes = existing.local_hashes^
+        self.remote_frames = existing.remote_frames^
+        existing.fd = -1
+        existing.local_port = 0
+
+    def __deinit__(deinit self):
+        self.close()
+
     def open(mut self, bind_port: Int = 0, loopback_only: Bool = False) -> Bool:
         self.close()
         var res = udp_open_nonblocking(bind_port, loopback_only)
@@ -689,8 +710,7 @@ comptime GAMEPAD_MAX_BUTTONS: Int = 32
 
 
 struct LinuxGamepad(Movable):
-    """Polls standard Linux `/dev/input/js*` 8-byte `js_event` packets (`O_RDONLY | O_NONBLOCK`)
-    with configurable axial deadzone, response exponent, and synthetic packet injection for tests."""
+    """Legacy joystick packet parser & deadzone/curve shaper; device polling retired in favor of `flint.input.evdev.EvdevHub`."""
     var fd: Int
     var device_index: Int
     var connected: Bool
@@ -712,17 +732,26 @@ struct LinuxGamepad(Movable):
         self.prev_buttons = List[Bool](length=GAMEPAD_MAX_BUTTONS, fill=False)
         self.events_processed = 0
 
-    def open_first_available(mut self) -> Bool:
+    def __moveinit__(out self, deinit existing: Self):
+        self.fd = existing.fd
+        self.device_index = existing.device_index
+        self.connected = existing.connected
+        self.deadzone = existing.deadzone
+        self.curve_power = existing.curve_power
+        self.axes = existing.axes^
+        self.buttons = existing.buttons^
+        self.prev_buttons = existing.prev_buttons^
+        self.events_processed = existing.events_processed
+        existing.fd = -1
+        existing.device_index = -1
+        existing.connected = False
+
+    def __deinit__(deinit self):
         self.close()
-        for idx in range(4):
-            var path = "/dev/input/js" + String(idx)
-            var fd_try = Int(external_call["open", Int32](path.as_c_string_span(), Int32(2048), Int32(0)))
-            _ = path.byte_length()
-            if fd_try >= 0:
-                self.fd = fd_try
-                self.device_index = idx
-                self.connected = True
-                return True
+
+    def open_first_available(mut self) -> Bool:
+        """Legacy joystick device opening is retired; use `EvdevHub` (`/dev/input/event*`)."""
+        self.close()
         return False
 
     def close(mut self):
@@ -893,6 +922,27 @@ struct RollbackPeer(Movable):
         self.rollback_from_tick = -1
         self.desync_detected = False
         self.desync_tick = -1
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.fd = existing.fd
+        self.local_port = existing.local_port
+        self.local_slot = existing.local_slot
+        self.player_count = existing.player_count
+        self.endpoints = existing.endpoints^
+        self.history = existing.history^
+        self.last_confirmed_input = existing.last_confirmed_input^
+        self.snapshots = existing.snapshots^
+        self.packets_sent = existing.packets_sent
+        self.packets_received = existing.packets_received
+        self.rollbacks_triggered = existing.rollbacks_triggered
+        self.rollback_from_tick = existing.rollback_from_tick
+        self.desync_detected = existing.desync_detected
+        self.desync_tick = existing.desync_tick
+        existing.fd = -1
+        existing.local_port = 0
+
+    def __deinit__(deinit self):
+        self.close()
 
     def open(mut self, bind_port: Int = 0, loopback_only: Bool = False) -> Bool:
         self.close()

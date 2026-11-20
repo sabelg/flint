@@ -34,6 +34,7 @@ from flint.render.aaa_visbuffer import (
     AAA_PUSH_WORDS,
     BIND_AAA_BINDLESS_TEX,
     BIND_AAA_CLUSTERS,
+    BIND_AAA_DRAW_PAIRS,
     BIND_AAA_GLOBALS,
     BIND_AAA_HDR_OUT,
     BIND_AAA_HISTORY,
@@ -405,13 +406,15 @@ def npr_outline_vertex_shader() -> List[UInt32]:
     var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
     var b_instances = s.buffer(BIND_AAA_INSTANCES)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
+    var b_draw_pairs = s.buffer(BIND_AAA_DRAW_PAIRS)
     _ = b_indices
     var out_vis = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec2, location=0, flat=True)
 
     var real_vtx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    var draw_slot = s.instance_index()
+    var dp_off = s.imul(draw_slot, s.uint(2))
+    var inst_id = s.load_word(b_draw_pairs, dp_off)
+    var ml_id = s.load_word(b_draw_pairs, s.iadd(dp_off, s.uint(1)))
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
@@ -530,8 +533,14 @@ def npr_outline_vertex_shader() -> List[UInt32]:
     var final_cw = s.select_f(valid_out, clip[3], s.float(1.0))
     s.write_clip_position(final_cx, final_cy, final_cz, final_cw)
 
-    var pay0 = s.bit_or(s.shl(inst_id, s.uint(17)), s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x1FFFF)))
-    var pay1_base = s.shl(out_mat, s.uint(16))
+    var pay0 = s.bit_or(
+        s.shl(s.bit_and(inst_id, s.uint(0x3FF)), s.uint(22)),
+        s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x3FFFFF)),
+    )
+    var pay1_base = s.bit_or(
+        s.shl(out_mat, s.uint(16)),
+        s.shl(s.bit_and(s.shr(inst_id, s.uint(10)), s.uint(0xFF)), s.uint(8)),
+    )
     emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
     return s.finish()
 
@@ -547,7 +556,7 @@ def npr_outline_fragment_shader() -> List[UInt32]:
     emit(s.code, OP_LOAD, s.type_uvec2, vis_val, in_vis[1])
     var w0 = s.extract_u(vis_val, 0)
     var w1_base = s.extract_u(vis_val, 1)
-    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFFFF)))
+    var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFF)))
     emit(s.code, OP_STORE, out_col[1], s.uvec4(w0, w1, s.uint(0), s.uint(1)))
     return s.finish()
 
@@ -686,9 +695,12 @@ def aaa_npr_cel_shade_shader() -> List[UInt32]:
         s.fma(rgt_z, s.fmul(ndc_x, tan_x), s.fma(up_z, s.fmul(ndc_y1, tan_y), fwd_z)),
     )
 
-    var inst_id = s.shr(vis0, s.uint(17))
-    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
-    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
+    var inst_id = s.bit_or(
+        s.shr(vis0, s.uint(22)),
+        s.shl(s.bit_and(s.shr(vis1, s.uint(8)), s.uint(0xFF)), s.uint(10)),
+    )
+    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x3FFFFF)), s.uint(1))
+    var local_prim = s.bit_and(vis1, s.uint(0xFF))
     var first_tri = s.load_word(b_meshlets, s.iadd(s.imul(ml_id, s.uint(12)), s.uint(8)))
     var idx_off = s.imul(s.iadd(first_tri, local_prim), s.uint(3))
     var v0_off = s.imul(s.load_word(b_indices, idx_off), s.uint(12))

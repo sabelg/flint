@@ -7,7 +7,7 @@ DualSense (`0..255`) unpressed triggers always read `0.0`, while opening event n
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import abs
+from std.math import abs, sqrt
 from flint.platform.os import close_fd, list_directory, last_errno, EINTR
 from flint.platform.input import (
     InputState,
@@ -28,7 +28,12 @@ from flint.platform.input import (
     PAD_RIGHT,
     PAD_LT,
     PAD_RT,
+    PAD_STICK_UP,
+    PAD_STICK_DOWN,
+    PAD_STICK_LEFT,
+    PAD_STICK_RIGHT,
     PAD_CONTROLS,
+    PAD_DIRECTION,
     PAD_AXIS_LEFT_X,
     PAD_AXIS_LEFT_Y,
     PAD_AXIS_LT,
@@ -203,7 +208,7 @@ struct AbsAxisInfo(Copyable, ImplicitlyCopyable, Movable):
         self.raw_value = 0
 
 
-struct EvdevGamepad(Copyable, Movable):
+struct EvdevGamepad(Movable):
     """Single Linux `/dev/input/event*` gamepad with `EVIOCGABS` axis calibration & `EV_FF` rumble."""
     var fd: Int
     var writable: Bool
@@ -221,7 +226,10 @@ struct EvdevGamepad(Copyable, Movable):
     var down: Array[Bool, PAD_CONTROLS]
     var pressed: Array[Bool, PAD_CONTROLS]
     var released: Array[Bool, PAD_CONTROLS]
+    var press_count: Array[Int, PAD_CONTROLS]
+    var released_first: Array[Bool, PAD_CONTROLS]
     var events_processed: UInt64
+    var device_gen: UInt64
 
     def __init__(out self):
         self.fd = -1
@@ -240,14 +248,51 @@ struct EvdevGamepad(Copyable, Movable):
         self.down = Array[Bool, PAD_CONTROLS](fill=False)
         self.pressed = Array[Bool, PAD_CONTROLS](fill=False)
         self.released = Array[Bool, PAD_CONTROLS](fill=False)
+        self.press_count = Array[Int, PAD_CONTROLS](fill=0)
+        self.released_first = Array[Bool, PAD_CONTROLS](fill=False)
         self.events_processed = 0
+        self.device_gen = 0
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.fd = existing.fd
+        self.writable = existing.writable
+        self.connected = existing.connected
+        self.path = existing.path^
+        self.name = existing.name^
+        self.bustype = existing.bustype
+        self.vendor_id = existing.vendor_id
+        self.product_id = existing.product_id
+        self.version = existing.version
+        self.is_sony = existing.is_sony
+        self.ff_effect_id = existing.ff_effect_id
+        self.abs_info = existing.abs_info^
+        self.axes = existing.axes^
+        self.down = existing.down^
+        self.pressed = existing.pressed^
+        self.released = existing.released^
+        self.press_count = existing.press_count^
+        self.released_first = existing.released_first^
+        self.events_processed = existing.events_processed
+        self.device_gen = existing.device_gen
+        existing.fd = -1
+        existing.writable = False
+        existing.connected = False
+        existing.ff_effect_id = -1
+        existing.device_gen = 0
+
+    def __deinit__(deinit self):
+        self.close()
 
     def begin_frame(mut self):
         for i in range(PAD_CONTROLS):
             self.pressed[i] = False
             self.released[i] = False
+            self.press_count[i] = 0
+            self.released_first[i] = False
 
     def set_vendor_product(mut self, vendor: UInt16, product: UInt16, name: String = ""):
+        if not self.connected:
+            self.device_gen += 1
         self.vendor_id = vendor
         self.product_id = product
         self.name = name
@@ -298,7 +343,10 @@ struct EvdevGamepad(Copyable, Movable):
             return
         if is_down and not self.down[ctrl]:
             self.pressed[ctrl] = True
+            self.press_count[ctrl] += 1
         elif (not is_down) and self.down[ctrl]:
+            if self.press_count[ctrl] == 0:
+                self.released_first[ctrl] = True
             self.released[ctrl] = True
         self.down[ctrl] = is_down
 
@@ -507,6 +555,8 @@ struct EvdevGamepad(Copyable, Movable):
             self.stop_rumble()
             close_fd(self.fd)
             self.fd = -1
+        if self.connected:
+            self.device_gen += 1
         self.connected = False
         self.writable = False
         self.path = ""
@@ -517,12 +567,14 @@ struct EvdevGamepad(Copyable, Movable):
             self.down[i] = False
             self.pressed[i] = False
             self.released[i] = False
+            self.press_count[i] = 0
+            self.released_first[i] = False
 
     def poll(mut self) -> Int:
         """Non-blocking drain of 24-byte `input_event` packets from `/dev/input/event*`."""
-        self.begin_frame()
         if self.fd < 0:
             return 0
+        self.begin_frame()
         var buf = List[UInt8](length=24 * 16, fill=0)
         var count = 0
         while True:
@@ -565,7 +617,7 @@ struct EvdevGamepad(Copyable, Movable):
             _ = external_call["write", Int64](Int32(self.fd), stop_ev.unsafe_ptr(), Int64(24))
 
     def sync_into_input_state(self, mut input: InputState, slot: Int = 0):
-        """Copies calibrated evdev axes & buttons into `InputState.pads[slot]`."""
+        """Copies calibrated evdev axes & buttons into `InputState.pads[slot]`, applying radial deadzones, `PAD_STICK_*`, and `pad_map`/`toggle_pads`."""
         if slot < 0 or slot >= len(input.pads):
             return
         if not self.connected:
@@ -581,18 +633,62 @@ struct EvdevGamepad(Copyable, Movable):
         input.pads[slot].ff_fd = self.fd
         input.pads[slot].ff_writable = self.writable
         input.pads[slot].owns_ff_fd = False
+
+        # Copy raw calibrated axes and apply scaled radial deadzone to left & right sticks
         for a in range(8):
-            input.pads[slot].axes[a] = self.axes[a]
             input.pads[slot].raw_axes[a] = self.axes[a]
+        input.pads[slot].axes[PAD_AXIS_LT] = self.axes[PAD_AXIS_LT]
+        input.pads[slot].axes[PAD_AXIS_RT] = self.axes[PAD_AXIS_RT]
+        input.pads[slot].axes[PAD_AXIS_DPAD_X] = self.axes[PAD_AXIS_DPAD_X]
+        input.pads[slot].axes[PAD_AXIS_DPAD_Y] = self.axes[PAD_AXIS_DPAD_Y]
+
+        var dz_l = max(Float32(0.0), min(Float32(0.95), input.deadzone_left))
+        var lrx = self.axes[PAD_AXIS_LEFT_X]
+        var lry = self.axes[PAD_AXIS_LEFT_Y]
+        var lr = sqrt(lrx * lrx + lry * lry)
+        if lr < dz_l:
+            input.pads[slot].axes[PAD_AXIS_LEFT_X] = 0.0
+            input.pads[slot].axes[PAD_AXIS_LEFT_Y] = 0.0
+        else:
+            var lscale = min(Float32(1.0), (lr - dz_l) / max(Float32(0.0001), Float32(1.0) - dz_l)) / max(lr, Float32(1e-6))
+            input.pads[slot].axes[PAD_AXIS_LEFT_X] = lrx * lscale
+            input.pads[slot].axes[PAD_AXIS_LEFT_Y] = lry * lscale
+
+        var dz_r = max(Float32(0.0), min(Float32(0.95), input.deadzone_right))
+        var rrx = self.axes[PAD_AXIS_RIGHT_X]
+        var rry = self.axes[PAD_AXIS_RIGHT_Y]
+        var rr = sqrt(rrx * rrx + rry * rry)
+        if rr < dz_r:
+            input.pads[slot].axes[PAD_AXIS_RIGHT_X] = 0.0
+            input.pads[slot].axes[PAD_AXIS_RIGHT_Y] = 0.0
+        else:
+            var rscale = min(Float32(1.0), (rr - dz_r) / max(Float32(0.0001), Float32(1.0) - dz_r)) / max(rr, Float32(1e-6))
+            input.pads[slot].axes[PAD_AXIS_RIGHT_X] = rrx * rscale
+            input.pads[slot].axes[PAD_AXIS_RIGHT_Y] = rry * rscale
+
+        input.pads[slot].set_control(PAD_STICK_LEFT, input.pads[slot].axes[PAD_AXIS_LEFT_X] < -PAD_DIRECTION)
+        input.pads[slot].set_control(PAD_STICK_RIGHT, input.pads[slot].axes[PAD_AXIS_LEFT_X] > PAD_DIRECTION)
+        input.pads[slot].set_control(PAD_STICK_UP, input.pads[slot].axes[PAD_AXIS_LEFT_Y] < -PAD_DIRECTION)
+        input.pads[slot].set_control(PAD_STICK_DOWN, input.pads[slot].axes[PAD_AXIS_LEFT_Y] > PAD_DIRECTION)
+
         for c in range(PAD_CONTROLS):
-            if self.pressed[c]:
-                input.pads[slot].pressed[c] = True
-            input.pads[slot].down[c] = self.down[c]
+            if c >= PAD_STICK_UP and c <= PAD_STICK_RIGHT:
+                continue
+            if self.released_first[c]:
+                input.pads[slot].set_mapped(c, False, input.pad_map, input.toggle_pads)
+            if self.press_count[c] > 0:
+                for p in range(self.press_count[c]):
+                    input.pads[slot].set_mapped(c, True, input.pad_map, input.toggle_pads)
+                    if p + 1 < self.press_count[c] or not self.down[c]:
+                        input.pads[slot].set_mapped(c, False, input.pad_map, input.toggle_pads)
+            elif not self.released_first[c]:
+                input.pads[slot].set_mapped(c, self.down[c], input.pad_map, input.toggle_pads)
 
 
 struct EvdevHub(Movable):
     """Multi-controller `/dev/input/event*` manager with non-blocking `inotify` hotplug."""
     var pads: List[EvdevGamepad]
+    var synced_gen: Array[UInt64, MAX_EVDEV_PADS]
     var inotify_fd: Int32
     var watch_wd: Int32
     var scanned_once: Bool
@@ -601,18 +697,36 @@ struct EvdevHub(Movable):
         self.pads = List[EvdevGamepad](capacity=MAX_EVDEV_PADS)
         for _ in range(MAX_EVDEV_PADS):
             self.pads.append(EvdevGamepad())
+        self.synced_gen = Array[UInt64, MAX_EVDEV_PADS](fill=0)
         self.inotify_fd = Int32(-1)
         self.watch_wd = Int32(-1)
         self.scanned_once = False
         if enable_hotplug:
-            self.inotify_fd = external_call["inotify_init1", Int32](IN_NONBLOCK_CLOEXEC)
-            if self.inotify_fd >= 0:
-                var dir_path = String("/dev/input")
-                self.watch_wd = external_call["inotify_add_watch", Int32](
-                    self.inotify_fd,
-                    dir_path.as_c_string_span(),
-                    IN_CREATE | IN_DELETE | IN_ATTRIB,
-                )
+            _ = self.enable_hotplug()
+
+    def enable_hotplug(mut self) -> Bool:
+        if self.inotify_fd >= 0:
+            return True
+        self.inotify_fd = external_call["inotify_init1", Int32](IN_NONBLOCK_CLOEXEC)
+        if self.inotify_fd >= 0:
+            var dir_path = String("/dev/input")
+            self.watch_wd = external_call["inotify_add_watch", Int32](
+                self.inotify_fd,
+                dir_path.as_c_string_span(),
+                IN_CREATE | IN_DELETE | IN_ATTRIB,
+            )
+            return True
+        return False
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.pads = existing.pads^
+        self.synced_gen = existing.synced_gen^
+        self.inotify_fd = existing.inotify_fd
+        self.watch_wd = existing.watch_wd
+        self.scanned_once = existing.scanned_once
+        existing.inotify_fd = Int32(-1)
+        existing.watch_wd = Int32(-1)
+        existing.scanned_once = False
 
     def __deinit__(deinit self):
         self.close()
@@ -620,10 +734,12 @@ struct EvdevHub(Movable):
     def close(mut self):
         for i in range(len(self.pads)):
             self.pads[i].close()
+            self.synced_gen[i] = 0
         if self.inotify_fd >= 0:
             close_fd(Int(self.inotify_fd))
             self.inotify_fd = Int32(-1)
             self.watch_wd = Int32(-1)
+        self.scanned_once = False
 
     def _is_path_open(self, full_path: String) -> Bool:
         for i in range(len(self.pads)):
@@ -652,6 +768,21 @@ struct EvdevHub(Movable):
         self.scanned_once = True
         return opened
 
+    def discover_initial(mut self) -> Int:
+        return self.scan_devices()
+
+    def connected_count(self) -> Int:
+        var count = 0
+        for s in range(len(self.pads)):
+            if self.pads[s].connected:
+                count += 1
+        return count
+
+    def set_rumble(mut self, slot: Int, strong_motor: Float32, weak_motor: Float32, duration_ms: Int = 1000) -> Bool:
+        if slot < 0 or slot >= len(self.pads) or not self.pads[slot].connected:
+            return False
+        return self.pads[slot].set_rumble(strong_motor, weak_motor, duration_ms)
+
     def _drain_hotplug_inotify(mut self) -> Bool:
         if self.inotify_fd < 0:
             return False
@@ -664,21 +795,27 @@ struct EvdevHub(Movable):
             any_event = True
         return any_event
 
+    def poll(mut self, mut input: InputState):
+        self.poll_all(input)
+
+    def poll_into(mut self, mut input: InputState):
+        self.poll(input)
+
     def poll_all(mut self, mut input: InputState):
         if not self.scanned_once or self._drain_hotplug_inotify():
             _ = self.scan_devices()
-        var out_slot = 0
-        for s in range(len(self.pads)):
+        var n_slots = min(len(self.pads), len(input.pads))
+        for s in range(n_slots):
             if self.pads[s].connected:
                 _ = self.pads[s].poll()
-                if self.pads[s].connected and out_slot < len(input.pads):
-                    self.pads[s].sync_into_input_state(input, out_slot)
-                    out_slot += 1
-        while out_slot < len(input.pads):
-            if input.pads[out_slot].fd < 0 and input.pads[out_slot].connected:
-                input.pads[out_slot].connected = False
-                input.pads[out_slot].ff_fd = -1
-                input.pads[out_slot].ff_writable = False
-                input.pads[out_slot].owns_ff_fd = False
-                input.pads[out_slot].clear()
-            out_slot += 1
+            if self.pads[s].connected:
+                if self.synced_gen[s] != self.pads[s].device_gen:
+                    if input.pads[s].fd < 0:
+                        input.pads[s].clear()
+                    self.synced_gen[s] = self.pads[s].device_gen
+                self.pads[s].sync_into_input_state(input, s)
+                if self.pads[s].fd < 0:
+                    self.pads[s].begin_frame()
+            else:
+                self.synced_gen[s] = 0
+                self.pads[s].sync_into_input_state(input, s)

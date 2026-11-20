@@ -457,7 +457,7 @@ struct AudioVoice:
         self.hull_conducted = False
 
 
-struct NativeAudio:
+struct NativeAudio(Movable):
     var clips: List[WavClip]
     var voices: List[AudioVoice]
     var music: WavClip
@@ -545,6 +545,54 @@ struct NativeAudio:
         self.events_dropped = 0
         self.voices_stolen = 0
         self.bank_limited = 0
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.clips = existing.clips^
+        self.voices = existing.voices^
+        self.music = existing.music^
+        self.music_loaded = existing.music_loaded
+        self.music_position = existing.music_position
+        self.music_pitch = existing.music_pitch
+        self.music_volume = existing.music_volume
+        self.music_pitch_follow = existing.music_pitch_follow
+        self.fd = existing.fd
+        self.ready = existing.ready
+        self.output_rate = existing.output_rate
+        self.period_frames = existing.period_frames
+        self.buffer_frames = existing.buffer_frames
+        self.pending = existing.pending^
+        self.pulse = existing.pulse^
+        self.frames_submitted = existing.frames_submitted
+        self.xruns = existing.xruns
+        self.last_error = existing.last_error^
+        self.next_order = existing.next_order
+        self.events_accepted = existing.events_accepted
+        self.events_dropped = existing.events_dropped
+        self.voices_stolen = existing.voices_stolen
+        self.bank_limited = existing.bank_limited
+        self.bus_volume = existing.bus_volume^
+        self.mono = existing.mono
+        self.output_name = existing.output_name^
+        self.drone_clip = existing.drone_clip
+        self.drone_level = existing.drone_level
+        self.drone_gain = existing.drone_gain
+        self.drone_phase = existing.drone_phase
+        self.drone_low = existing.drone_low
+        self.drone_low_r = existing.drone_low_r
+        self.reverb = existing.reverb^
+        self.reverb_enabled = existing.reverb_enabled
+        self.speech_duck = existing.speech_duck
+        self.hrtf_enabled = existing.hrtf_enabled
+        self.vacuum_mix = existing.vacuum_mix
+        self.queue = existing.queue^
+        self.listener_pos = existing.listener_pos
+        self.mix_buf = existing.mix_buf^
+        self.rev_send_buf = existing.rev_send_buf^
+        existing.fd = -1
+        existing.ready = False
+
+    def __deinit__(deinit self):
+        self.close()
 
     def load_assets(mut self):
         var paths = [

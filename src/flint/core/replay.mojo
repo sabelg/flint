@@ -214,7 +214,7 @@ def write_input(mut out: List[UInt8], input: InputState):
     put_u32(out, float_bits(input.wheel))
     for pad in range(MAX_PADS):
         var flags = UInt8(0)
-        if input.pads[pad].fd >= 0:
+        if input.pads[pad].connected or input.pads[pad].fd >= 0:
             flags |= 1
         if input.pads[pad].sony_layout:
             flags |= 2
@@ -241,8 +241,10 @@ def read_input(mut reader: ByteReader, mut input: InputState):
     input.wheel = bits_float(reader.u32())
     for pad in range(MAX_PADS):
         var flags = reader.u8()
-        input.pads[pad].fd = REPLAY_PAD_FD if flags & 1 == 1 else -1
-        input.pads[pad].sony_layout = flags & 2 == 2
+        var pad_connected = (flags & 1) == 1
+        input.pads[pad].connected = pad_connected
+        input.pads[pad].fd = REPLAY_PAD_FD if pad_connected else -1
+        input.pads[pad].sony_layout = (flags & 2) == 2
         for axis in range(PAD_AXES):
             input.pads[pad].axes[axis] = bits_float(reader.u32())
         var down = reader.bits(32)
@@ -257,6 +259,7 @@ def release_replay_pads(mut input: InputState):
     for pad in range(MAX_PADS):
         if input.pads[pad].fd == REPLAY_PAD_FD:
             input.pads[pad].fd = -1
+            input.pads[pad].connected = False
 
 
 # ---------------------------------------------------------------------------
