@@ -637,7 +637,7 @@ def compile_surface_material_shader[NodeT: SurfaceMaterialNode](node: NodeT) -> 
     var gy = dsl.global_id_y()
     var w_u = dsl.push_u32(0)
     var h_u = dsl.push_u32(1)
-    var mat_id = dsl.push_u32(2) + spec_mode * UInt32(0)
+    var mat_id = dsl.push_u32(2)
     var time_s = dsl.push_f32(3)
     var out_base = dsl.push_u32(4)
     var wy_scale = max_f(dsl.push_f32(5), 1.0)
@@ -655,14 +655,34 @@ def compile_surface_material_shader[NodeT: SurfaceMaterialNode](node: NodeT) -> 
     )
     var res = node.evaluate_surface(dsl, inputs, b_mats, bindless)
     var cc_out = dsl.var_f32(dsl.f32(0.0))
+    var rough_out = dsl.var_f32(res.roughness)
+    var metal_out = dsl.var_f32(res.metallic)
+    var em_gain = dsl.var_f32(dsl.f32(1.0))
+
     dsl.if_then(spec_cc)
     cc_out.set(res.clearcoat)
     dsl.end_if()
 
+    # SpecId 1 (`domain_override`): 0 = standard, 1 = clearcoat, 2 = subsurface skin, 4 = unlit emissive
+    dsl.if_then(spec_mode.eq(dsl.u32(UInt32(MAT_DOMAIN_CLEARCOAT))))
+    cc_out.set(max_f(cc_out.get(), dsl.f32(0.5)))
+    rough_out.set(clamp_f(rough_out.get() * dsl.f32(0.85), dsl.f32(0.04), dsl.f32(1.0)))
+    dsl.end_if()
+
+    dsl.if_then(spec_mode.eq(dsl.u32(UInt32(MAT_DOMAIN_SUBSURFACE_SKIN))))
+    metal_out.set(dsl.f32(0.0))
+    rough_out.set(max_f(rough_out.get(), dsl.f32(0.35)))
+    dsl.end_if()
+
+    dsl.if_then(spec_mode.eq(dsl.u32(UInt32(MAT_DOMAIN_UNLIT_UI))))
+    metal_out.set(dsl.f32(0.0))
+    em_gain.set(dsl.f32(2.0))
+    dsl.end_if()
+
     var out_idx = out_base + (gy * w_u + gx) * UInt32(8)
-    b_out.store_vec3(out_idx, res.base_color + res.emissive)
-    b_out.store_f32(out_idx + UInt32(3), res.roughness)
-    b_out.store_f32(out_idx + UInt32(4), res.metallic)
+    b_out.store_vec3(out_idx, res.base_color + res.emissive * em_gain.get())
+    b_out.store_f32(out_idx + UInt32(3), rough_out.get())
+    b_out.store_f32(out_idx + UInt32(4), metal_out.get())
     b_out.store_f32(out_idx + UInt32(5), cc_out.get())
     b_out.store_f32(out_idx + UInt32(6), res.opacity)
     b_out.store_f32(out_idx + UInt32(7), abs_f(res.normal_ts.z()))
@@ -674,6 +694,9 @@ def compile_surface_material_shader[NodeT: SurfaceMaterialNode](node: NodeT) -> 
 # ============================================================================
 
 comptime GPU_DECAL_VOLUME_WORDS: Int = 24
+comptime AAA_MAX_DECALS: Int = 32
+comptime AAA_GLOBALS_DECAL_COUNT_WORD: Int = 3008
+comptime AAA_GLOBALS_DECAL_TABLE_WORD: Int = 3016  # 32 * 24 = 768 words: [3016 .. 3783] in ring-buffered buf_globals
 
 comptime DECAL_BLEND_ALBEDO: UInt16 = 1 << 0
 comptime DECAL_BLEND_NORMAL: UInt16 = 1 << 1

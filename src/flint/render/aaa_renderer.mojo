@@ -129,6 +129,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_VIS_TEX,
     BIND_AAA_VSM_TABLE,
     BIND_AAA_VSM_TEX,
+    BIND_AAA_WORKLIST,
     compute_hiz_mip_levels,
     hiz_depth_downsample_shader,
     make_reverse_z_perspective,
@@ -139,6 +140,11 @@ from flint.render.aaa_visbuffer import (
 )
 from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AaaMaterial
 from flint.render.material_graph import (
+    AAA_GLOBALS_DECAL_COUNT_WORD,
+    AAA_GLOBALS_DECAL_TABLE_WORD,
+    AAA_MAX_DECALS,
+    GPU_DECAL_VOLUME_WORDS,
+    GpuDecalVolume,
     MaterialAsset,
     SurfaceMaterialNode,
     compile_surface_material_shader,
@@ -346,6 +352,7 @@ from flint.render.aaa_render_graph import (
     RG_USAGE_COMPUTE_WRITE,
     RG_USAGE_DEPTH_ATT_WRITE,
     RG_USAGE_INDIRECT_ARGS,
+    RgAliasingMetrics,
     RgResourceAccess,
 )
 
@@ -503,6 +510,9 @@ struct FlintAaaVulkanRenderer(Movable):
     var ring_surfcache: List[GpuBuffer]
     var ring_vsm_table: List[GpuBuffer]
     var ring_oit_staging: List[GpuBuffer]
+    var ring_meshlet_worklist: List[GpuBuffer]
+    var meshlet_worklist_cap: Int
+    var last_worklist_meshlets: Int
     var ring_tlas: List[VulkanAccelStruct]
     var ring_tlas_cap: List[Int]  # instance capacity each slot's TLAS + shared scratch were sized for
     var desc_sets: List[Int]
@@ -647,6 +657,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var frame_shockwaves: List[AaaShockwaveRing]
     var impact_frame: AaaImpactFrameParams
     var frame_instances: List[AaaDrawInstance]
+    var frame_decals: List[GpuDecalVolume]
     var frame_plumes: List[AaaVolumetricPlume]
     var frame_particle_emitters: List[AaaParticleEmitter]
     var particle_ring_cursor: Int
@@ -670,6 +681,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var aerial_mie_g: Float32
     var vsm: VsmPageManager
     var render_graph: AaaRenderGraph
+    var rg_res_vis: Int
+    var rg_res_depth: Int
     var streamer: AaaResidencyStreamer
     var sh9_irradiance: List[Vec3]
     var env_cube_dim: Int
@@ -871,6 +884,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.ring_surfcache = List[GpuBuffer]()
         self.ring_vsm_table = List[GpuBuffer]()
         self.ring_oit_staging = List[GpuBuffer]()
+        self.ring_meshlet_worklist = List[GpuBuffer]()
+        self.meshlet_worklist_cap = max(self.max_draws * 2, 262144)
+        self.last_worklist_meshlets = 0
         self.ring_tlas = List[VulkanAccelStruct]()
         self.ring_tlas_cap = List[Int]()
         self.desc_sets = List[Int]()
@@ -921,6 +937,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.geom = AaaGeometryPool()
         self.materials = List[AaaMaterial]()
         self.frame_instances = List[AaaDrawInstance]()
+        self.frame_decals = List[GpuDecalVolume]()
         self.frame_plumes = List[AaaVolumetricPlume]()
         self.frame_particle_emitters = List[AaaParticleEmitter]()
         self.particle_ring_cursor = 0
@@ -944,6 +961,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.aerial_mie_g = Float32(0.80)
         self.vsm = VsmPageManager()
         self.render_graph = AaaRenderGraph()
+        self.rg_res_vis = -1
+        self.rg_res_depth = -1
         self.streamer = AaaResidencyStreamer()
         self.sh9_irradiance = List[Vec3](length=9, fill=Vec3(0.0, 0.0, 0.0))
         self.env_cube_dim = max(16, env_cube_dim)
@@ -1053,14 +1072,16 @@ struct FlintAaaVulkanRenderer(Movable):
         var pix_r = self.render_w * self.render_h
         var pix_o = self.output_w * self.output_h
         var est_draws = min(self.max_draws, max(2048, pix_r // 2))
-        var r_indirect = self.render_graph.add_resource("IndirectDrawCmds", est_draws * 16, transient=True)
-        var r_hiz = self.render_graph.add_resource("ReverseZHiZPyramid", pix_r * 4, transient=True)
-        var r_vis = self.render_graph.add_resource("VisBuffer64", pix_r * 8, transient=True)
-        var r_vsm_req = self.render_graph.add_resource("VsmPageRequests", VSM_TABLE_WORDS * 4, transient=True)
-        var r_hdr = self.render_graph.add_resource("LinearHdrScratch", pix_r * 32, transient=True)
-        var r_svgf = self.render_graph.add_resource("SvgfPingPong", pix_r * 32, transient=True)
-        var r_oit = self.render_graph.add_resource("Oit4NodePool", pix_r * 32, transient=True)
-        var r_tsr = self.render_graph.add_resource("TsrUpscaleScratch", pix_o * 16, transient=True)
+        var r_indirect = self.render_graph.add_resource("IndirectDrawCmds", est_draws * 16, transient=True, is_image=False)
+        var r_hiz = self.render_graph.add_resource("ReverseZHiZPyramid", pix_r * 4, transient=True, is_image=True)
+        var r_vis = self.render_graph.add_resource("VisBuffer64", pix_r * 8, transient=True, is_image=True)
+        var r_vsm_req = self.render_graph.add_resource("VsmPageRequests", VSM_TABLE_WORDS * 4, transient=True, is_image=False)
+        var r_hdr = self.render_graph.add_resource("LinearHdrScratch", pix_r * 32, transient=True, is_image=False)
+        var r_svgf = self.render_graph.add_resource("SvgfPingPong", pix_r * 32, transient=True, is_image=False)
+        var r_oit = self.render_graph.add_resource("Oit4NodePool", pix_r * 32, transient=True, is_image=False)
+        var r_tsr = self.render_graph.add_resource("TsrUpscaleScratch", pix_o * 16, transient=True, is_image=False)
+        self.rg_res_vis = r_vis
+        self.rg_res_depth = r_hiz
 
         var p0 = List[RgResourceAccess]()
         p0.append(RgResourceAccess(r_indirect, RG_USAGE_COMPUTE_WRITE))
@@ -1404,6 +1425,7 @@ struct FlintAaaVulkanRenderer(Movable):
             _ = external_call["memset", Int](b_vsm.cpu_address, Int32(0), b_vsm.size)
             var b_oit_st = self.vk.create_buffer(oit_stage_bytes, local=False)
             _ = external_call["memset", Int](b_oit_st.cpu_address, Int32(0), b_oit_st.size)
+            var b_wl = self.vk.create_buffer(self.meshlet_worklist_cap * 4, local=True)
             self.ring_globals.append(b_glob^)
             self.ring_instances.append(b_inst^)
             self.ring_indirect.append(b_ind^)
@@ -1413,6 +1435,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.ring_surfcache.append(b_sc^)
             self.ring_vsm_table.append(b_vsm^)
             self.ring_oit_staging.append(b_oit_st^)
+            self.ring_meshlet_worklist.append(b_wl^)
             if self.vk.has_ray_query:
                 var b_as = self.vk.create_buffer_bda(self.max_instances * 64, extra_usage=bda_flags, host_visible=True)
                 var tlas = VulkanAccelStruct()
@@ -1478,6 +1501,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds_p1, BIND_AAA_MATERIALS, self.buf_materials)
             self.vk.write_descriptor(ds_p1, BIND_AAA_INDIRECT, self.ring_indirect[slot])
             self.vk.write_descriptor(ds_p1, BIND_AAA_GLOBALS, self.ring_globals[slot])
+            self.vk.write_descriptor(ds_p1, BIND_AAA_WORKLIST, self.ring_meshlet_worklist[slot])
             self.vk.write_descriptor(ds_p1, BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
             self.vk.write_aaa_texture(ds_p1, BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
 
@@ -1490,6 +1514,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds_p2, BIND_AAA_MATERIALS, self.buf_materials)
             self.vk.write_descriptor(ds_p2, BIND_AAA_INDIRECT, self.buf_indirect_phase2)
             self.vk.write_descriptor(ds_p2, BIND_AAA_GLOBALS, self.ring_globals[slot])
+            self.vk.write_descriptor(ds_p2, BIND_AAA_WORKLIST, self.ring_meshlet_worklist[slot])
             self.vk.write_descriptor(ds_p2, BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
             self.vk.write_aaa_texture(ds_p2, BIND_AAA_DEPTH_TEX, 0, self.samp_nearest, self.hiz_img.view)
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_ENV_CUBE, 0, self.samp_linear_clamp, self.env_cube_img.view)
@@ -1721,6 +1746,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.froxel_valid_frames = 0
         self.hiz_valid = False
         self.swapchain_out_of_date = False
+        self._build_default_render_graph()
         return True
 
     def _record_hiz_downsample(mut self, cur_slot: Int):
@@ -3262,6 +3288,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.fov_y_deg = fov_y_deg
         self.near_z = near_z
         self.frame_instances.clear()
+        self.frame_decals.clear()
         self.frame_plumes.clear()
         self.frame_particle_emitters.clear()
         self.frame_cluster_lights.clear()
@@ -3292,6 +3319,15 @@ struct FlintAaaVulkanRenderer(Movable):
     def draw_volumetric_plume(mut self, plume: AaaVolumetricPlume):
         if len(self.frame_plumes) < AAA_MAX_OIT_PRIMS:
             self.frame_plumes.append(plume.copy())
+
+    def add_decal(mut self, decal: GpuDecalVolume):
+        """Queues a 96-byte (`24`-word) projected OBB deferred decal volume for this frame (up to `AAA_MAX_DECALS`)."""
+        if len(self.frame_decals) < AAA_MAX_DECALS:
+            self.frame_decals.append(decal.copy())
+
+    def get_render_graph_aliasing_metrics(self) -> RgAliasingMetrics:
+        """Returns compiled `AaaRenderGraph` transient VRAM aliasing savings and barrier statistics."""
+        return self.render_graph.aliasing_metrics()
 
     def submit_particle_emitter(mut self, emitter: AaaParticleEmitter):
         """Queues a GPU compute particle emitter burst/stream (`PARTICLE_SPARK_STREAK`, `WATER_SPRAY`, `DRIFT_SMOKE`,
@@ -3732,19 +3768,18 @@ struct FlintAaaVulkanRenderer(Movable):
             self.frame_tlas = self.ring_tlas[cur_slot].copy()
 
         var n_inst = len(self.frame_instances)
-        var max_ml_per_inst = 1
         var last_large_sc_inst = -1
         var sc_tri_counts = List[Int](capacity=min(1024, max(1, n_inst)))
         var sc_cursor = 1024  # Leave words [0..4095] for up to 1,024 instance headers!
         var sc_inst_count = min(1024, n_inst)
 
-        # 1. Upload Instance SSBO + Surface-Cache Headers + TLAS Instance Records
+        # 1. Upload Instance SSBO + 1D Compacted Meshlet Worklist + Surface-Cache Headers + TLAS Instance Records
+        var wl_ptr = self.ring_meshlet_worklist[cur_slot].cpu_address
+        var worklist_count = 0
         var frame_has_glass = False
         for i in range(n_inst):
             ref di = self.frame_instances[i]
             ref me = self.geom.meshes[di.mesh_id]
-            if me.meshlet_count > max_ml_per_inst:
-                max_ml_per_inst = me.meshlet_count
             var dst = self.buf_instances.cpu_address + i * AAA_INSTANCE_WORDS * 4
             for k in range(16):
                 put_float(dst + k * 4, di.world_mat.values[k])
@@ -3774,6 +3809,18 @@ struct FlintAaaVulkanRenderer(Movable):
                 | ((UInt32(1) if is_am_inst else UInt32(0)) << 17)
                 | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0)),
             )
+            # Compact opaque `(inst_idx, ml_id)` pairs into flat 1D meshlet cull worklist (zero wasted threads!)
+            if not is_am_inst and i <= Int(AAA_MAX_PACKED_INSTANCES) and wl_ptr != 0:
+                var first_ml = me.first_meshlet
+                var ml_cnt = me.meshlet_count
+                for m_loc in range(ml_cnt):
+                    if worklist_count >= self.meshlet_worklist_cap:
+                        break
+                    var ml_id = first_ml + m_loc
+                    if ml_id > Int(AAA_MAX_PACKED_MESHLET_ID):
+                        break
+                    put32(wl_ptr + worklist_count * 4, UInt32((i << 17) | (ml_id & 0x1FFFF)))
+                    worklist_count += 1
             var my_sc_base = 0xFFFFFF
             if i < 1024:
                 var sc_hdr = self.buf_surfcache.cpu_address + i * 16
@@ -4076,6 +4123,15 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 10) * 4, self.impact_frame.accent_color.y)
         put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 11) * 4, self.impact_frame.accent_color.z)
 
+        # Projected OBB Deferred Decals (`GpuDecalVolume`, ring-buffered in `buf_globals[3008..3783]`)
+        var n_dec = min(AAA_MAX_DECALS, len(self.frame_decals))
+        put32(g_addr + AAA_GLOBALS_DECAL_COUNT_WORD * 4, UInt32(n_dec))
+        for d_i in range(n_dec):
+            var d_words = self.frame_decals[d_i].pack_words()
+            var d_base = AAA_GLOBALS_DECAL_TABLE_WORD + d_i * GPU_DECAL_VOLUME_WORDS
+            for d_w in range(GPU_DECAL_VOLUME_WORDS):
+                put32(g_addr + (d_base + d_w) * 4, d_words[d_w])
+
         # Pack Bucket 2 alpha-masked VisBuffer draws & hardware `CULL_MODE_FRONT` clip-space outline draws
         var am_vis_draws = self._pack_alphamask_visbuffer_commands(n_inst, tan_x, tan_y)
         var outline_vis_draws = 0 if self.furnace_white_dome else self._pack_outline_visbuffer_commands(n_inst, tan_x, tan_y)
@@ -4196,6 +4252,8 @@ struct FlintAaaVulkanRenderer(Movable):
         var t_record0 = get_time()
         self.last_cpu_vsm_ms = (t_record0 - t_vsm0) * 1000.0
 
+        self.last_worklist_meshlets = worklist_count
+        self.render_graph.begin_frame()
         if not self.vk.begin_commands(cur_slot):
             return False
         if use_prof:
@@ -4227,14 +4285,15 @@ struct FlintAaaVulkanRenderer(Movable):
                 Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
             )
 
-        if n_inst > 0:
+        self.render_graph.emit_pass_barriers(self.vk, cur_slot, 0)
+        if worklist_count > 0:
             var q_mc = next_q
             if use_prof:
                 self.vk.write_timestamp(cur_slot, q_mc, PIPELINE_TOP)
                 next_q += 2
                 prof_pairs.append((String("MeshletCull"), q_mc))
             var push_cull = List[UInt32](length=16, fill=0)
-            push_cull[0] = UInt32(n_inst)
+            push_cull[0] = UInt32(worklist_count)
             push_cull[1] = UInt32(self.max_draws)
             push_cull[2] = UInt32(1) if self.enable_cone_cull else UInt32(0)
             push_cull[3] = UInt32(1) if (self.enable_hiz_cull and self.hiz_valid and self.frame_index > 0 and not cam_teleported) else UInt32(0)
@@ -4249,14 +4308,14 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.pipe_layout,
                 self.desc_sets_cull_p1[cur_slot],
                 push_cull,
-                (n_inst + 7) // 8,
-                (max_ml_per_inst + 7) // 8,
+                (worklist_count + 63) // 64,
+                1,
             )
             if use_prof:
                 self.vk.write_timestamp(cur_slot, q_mc + 1, PIPELINE_BOTTOM)
             self.render_graph.emit_pass_barriers(self.vk, cur_slot, 1)
             self.vk.memory_barrier2(
-                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_DRAW_INDIRECT | PIPELINE_TRANSFER, Int(ACCESS_INDIRECT_READ | ACCESS_TRANSFER_READ)
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_READ)
             )
             self.vk.copy_buffer(cur_slot, self.buf_indirect, 0, rb_buf, 0, 4)
 
@@ -4266,17 +4325,19 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_timestamp(cur_slot, q_vb, PIPELINE_TOP)
             next_q += 2
             prof_pairs.append((String("VisBufferHwRaster"), q_vb))
-        self.vk.transition_image(
-            cur_slot, self.vis_img, LAYOUT_COLOR_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE
-        )
-        self.vk.transition_image(
-            cur_slot, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE
-        )
+        if not self.render_graph.emit_pass_image_transition(self.vk, cur_slot, 1, self.rg_res_vis, self.vis_img):
+            self.vk.transition_image(
+                cur_slot, self.vis_img, LAYOUT_COLOR_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE
+            )
+        if not self.render_graph.emit_pass_image_transition(self.vk, cur_slot, 1, self.rg_res_depth, self.depth_img):
+            self.vk.transition_image(
+                cur_slot, self.depth_img, LAYOUT_DEPTH_ATTACHMENT, PIPELINE_COMPUTE, ACCESS_SHADER_READ, PIPELINE_EARLY_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE
+            )
         self.vk.begin_rendering(
             cur_slot, 0, 0, self.render_w, self.render_h, True, self.vis_img.view, True, 0, 0, True, self.depth_img.view, True, 0.0
         )
         self.vk.set_viewport_and_scissor(cur_slot, 0, 0, self.render_w, self.render_h, flip_y=True)
-        if n_inst > 0:
+        if worklist_count > 0:
             var push_vb = List[UInt32](length=16, fill=0)
             push_vb[0] = 0
             push_vb[1] = bitcast[DType.uint32](jx_clip)
@@ -4289,7 +4350,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 16,
                 self.buf_indirect,
                 0,
-                min(self.max_draws, n_inst * max_ml_per_inst),
+                min(self.max_draws, worklist_count),
                 stride=20,
             )
         self.vk.end_rendering(cur_slot)
@@ -4417,12 +4478,15 @@ struct FlintAaaVulkanRenderer(Movable):
             )
             self.vk.end_rendering(cur_slot)
 
-        self.vk.transition_image(
-            cur_slot, self.vis_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
-        )
-        self.vk.transition_image(
-            cur_slot, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
-        )
+        self.render_graph.emit_pass_barriers(self.vk, cur_slot, 2)
+        if not self.render_graph.emit_pass_image_transition(self.vk, cur_slot, 2, self.rg_res_vis, self.vis_img):
+            self.vk.transition_image(
+                cur_slot, self.vis_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_COLOR_ATTACHMENT_OUTPUT, ACCESS_COLOR_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+            )
+        if not self.render_graph.emit_pass_image_transition(self.vk, cur_slot, 2, self.rg_res_depth, self.depth_img):
+            self.vk.transition_image(
+                cur_slot, self.depth_img, LAYOUT_SHADER_READ_ONLY, PIPELINE_LATE_FRAGMENT_TESTS, ACCESS_DEPTH_ATTACHMENT_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+            )
         # Refresh multi-mip Hi-Z pyramid from the final frame depth for next frame's Phase 1 occlusion cull
         if n_inst > 0 and self.enable_hiz_cull:
             self._record_hiz_downsample(cur_slot)
@@ -4720,6 +4784,7 @@ struct FlintAaaVulkanRenderer(Movable):
             and self.vk.has_ray_query
             and n_inst > 0
         )
+        self.render_graph.emit_pass_barriers(self.vk, cur_slot, 3)
         var spec_in_off = spec_reblur_raw_offset(max_pix)
         var q_sh = next_q
         if use_prof and q_sh + 1 < q_limit:
@@ -5001,6 +5066,7 @@ struct FlintAaaVulkanRenderer(Movable):
             )
 
         # Per-Pixel 4-Node Exact `OIT` + 6-Way Lightmapped Volumetric Plumes + Fresnel Rim Holograms!
+        self.render_graph.emit_pass_barriers(self.vk, cur_slot, 5)
         if len(self.frame_plumes) > 0 or not (run_water or run_rain):
             if oit_plume_copy_bytes > 0:
                 self.vk.copy_buffer(
@@ -5117,6 +5183,7 @@ struct FlintAaaVulkanRenderer(Movable):
             )
 
         # `FlintTSR v3` Pre-Bloom Temporal Upscale & 16-Phase Halton Anti-Aliasing (`render_w x render_h -> output_w x output_h`)!
+        self.render_graph.emit_pass_barriers(self.vk, cur_slot, 6)
         var q_tsr = next_q
         if use_prof and q_tsr + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_tsr, PIPELINE_TOP)
@@ -5889,6 +5956,11 @@ struct FlintAaaVulkanRenderer(Movable):
             if self.ring_oit_staging[i].size > 0:
                 self.vk.destroy_buffer(self.ring_oit_staging[i])
         self.ring_oit_staging.clear()
+
+        for i in range(len(self.ring_meshlet_worklist)):
+            if self.ring_meshlet_worklist[i].size > 0:
+                self.vk.destroy_buffer(self.ring_meshlet_worklist[i])
+        self.ring_meshlet_worklist.clear()
 
         self.slot_prof_pairs.clear()
         self.slot_frame_q.clear()
