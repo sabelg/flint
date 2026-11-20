@@ -15,14 +15,14 @@ Implements:
   6. Docked AAA Studio Editor UI builder (`emit_studio_ui_draw_list`) rendering Hierarchy, Viewport + 3D Gizmos,
      Asset/PIE Dock, and `FieldVisitor` Inspector into GPU `UiDrawList`.
 """
-from std.math import abs, cos, max, min, sin, sqrt
+from std.math import abs, asin, cos, max, min, sin, sqrt
 from flint.core.detmath import PI, det_atan2, set_sim_float_mode
 from flint.core.math import Quat, Vec3
 from flint.core.serial import BlobReader, BlobWriter, Serializable, fnv64, fourcc
 from flint.core.transform import Mat4, trs
 from flint.anim.flanim_ecs import SteppedAnimClock
 from flint.assets.checkpoint import pack_checkpoint_lz4, unpack_checkpoint_lz4
-from flint.assets.flpk_v3 import UntypedHandle
+from flint.assets.flpk_v3 import FlpkV3MappedArchive, UntypedHandle
 from flint.assets.glb_writer import encode_native_glb, write_native_glb
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.model import NativeMesh, NativeModel
@@ -37,6 +37,7 @@ from flint.input.input_map import (
 from flint.physics.bvh import Bvh8MeshCollider
 from flint.physics.world import PhysicsWorld
 from flint.platform.input import InputState
+from flint.platform.os import list_directory, make_dirs, parent_directory, read_bytes, write_bytes
 from flint.procedural.arch_kit import (
     build_colonnade_arcade_bay,
     build_street_bollard_and_grate,
@@ -489,6 +490,10 @@ def _create_studio_input_map() -> InputMap:
     _ = imap.register_action("gizmo_scale", ACTION_BOOL)
     _ = imap.register_action("editor_undo", ACTION_BOOL)
     _ = imap.register_action("editor_redo", ACTION_BOOL)
+    _ = imap.register_action("editor_save", ACTION_BOOL)
+    _ = imap.register_action("editor_load", ACTION_BOOL)
+    _ = imap.register_action("editor_duplicate", ACTION_BOOL)
+    _ = imap.register_action("editor_delete", ACTION_BOOL)
     _ = imap.register_action("pie_toggle", ACTION_BOOL)
     _ = imap.register_action("editor_quit", ACTION_BOOL)
     _ = imap.register_action("cam_orbit", ACTION_AXIS2D)
@@ -499,6 +504,10 @@ def _create_studio_input_map() -> InputMap:
     ctx.bind_key("gizmo_scale", 82)                      # R
     ctx.bind_key("editor_undo", 90, modifiers=MOD_CTRL)  # Ctrl+Z
     ctx.bind_key("editor_redo", 89, modifiers=MOD_CTRL)  # Ctrl+Y
+    ctx.bind_key("editor_save", 83, modifiers=MOD_CTRL)  # Ctrl+S
+    ctx.bind_key("editor_load", 79, modifiers=MOD_CTRL)  # Ctrl+O
+    ctx.bind_key("editor_duplicate", 68, modifiers=MOD_CTRL)  # Ctrl+D
+    ctx.bind_key("editor_delete", 261)                   # Delete
     ctx.bind_key("pie_toggle", 294)                      # F5
     ctx.bind_key("pie_toggle", 80)                       # P (secondary shortcut)
     ctx.bind_key("editor_quit", 256)                     # Escape
@@ -545,6 +554,11 @@ struct FlintStudioState(Movable, Serializable):
     var input_map: InputMap
     var cam_target: Vec3
     var ui_edit_seq: UInt64
+    var scene_file_path: String
+    var asset_browser_dir: String
+    var asset_browser_pack: String
+    var asset_browser_entries: List[String]
+    var asset_browser_scanned: Bool
 
     # Synced Editor Viewport Camera Vectors
     var cam_pos: Vec3
@@ -590,6 +604,11 @@ struct FlintStudioState(Movable, Serializable):
         self.input_map = _create_studio_input_map()
         self.cam_target = Vec3(0.0, 0.9, 1.0)
         self.ui_edit_seq = UInt64(50000)
+        self.scene_file_path = "build/studio_scene.flscene"
+        self.asset_browser_dir = ""
+        self.asset_browser_pack = ""
+        self.asset_browser_entries = List[String]()
+        self.asset_browser_scanned = False
 
         self.cam_pos = Vec3(-6.5, 4.2, -9.5)
         self.cam_fwd = Vec3(0.52, -0.26, 0.81).normalized()
@@ -657,6 +676,14 @@ struct FlintStudioState(Movable, Serializable):
             _ = self.undo()
         if self.input_map.just_pressed("editor_redo"):
             _ = self.redo()
+        if self.input_map.just_pressed("editor_save"):
+            _ = self.save_scene_file()
+        if self.input_map.just_pressed("editor_load"):
+            _ = self.load_scene_file()
+        if self.input_map.just_pressed("editor_duplicate") and self.selected_entity_id >= 0:
+            _ = self.duplicate_entity(self.selected_entity_id, record_undo=True)
+        if self.input_map.just_pressed("editor_delete") and self.selected_entity_id >= 0:
+            _ = self.despawn_entity(self.selected_entity_id, record_undo=True)
         if self.input_map.just_pressed("pie_toggle"):
             if self.pie.mode == PIE_STOPPED:
                 _ = self.pie_play()
@@ -755,6 +782,89 @@ struct FlintStudioState(Movable, Serializable):
         self.serialize(w)
         return fnv64(w.data)
 
+    def save_scene_file(mut self, path: String = "") -> Bool:
+        """Serializes the full Studio scene to a `.flscene` binary file on disk."""
+        var target = path if path.byte_length() > 0 else self.scene_file_path
+        if target.byte_length() == 0:
+            return False
+        var parent = parent_directory(target)
+        if parent.byte_length() > 0 and parent != ".":
+            _ = make_dirs(parent)
+        var w = BlobWriter()
+        self.serialize(w)
+        if not write_bytes(target, w.data):
+            return False
+        self.scene_file_path = target
+        return True
+
+    def load_scene_file(mut self, path: String = "") -> Bool:
+        """Loads and deserializes a `.flscene` binary file from disk into Studio state."""
+        var target = path if path.byte_length() > 0 else self.scene_file_path
+        if target.byte_length() == 0:
+            return False
+        var raw = read_bytes(target)
+        if len(raw) == 0:
+            return False
+        try:
+            var r = BlobReader(raw^)
+            self.deserialize(r)
+            if r.failed:
+                return False
+        except:
+            return False
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.scene_file_path = target
+        return True
+
+    def scan_asset_browser(mut self, dir_path: String = "", pack_path: String = "") -> Int:
+        """Scans a workspace directory and/or `.flpk` v3 archive to populate the Asset Browser panel."""
+        self.asset_browser_entries.clear()
+        var target_dir = dir_path if dir_path.byte_length() > 0 else self.asset_browser_dir
+        var target_pack = pack_path if pack_path.byte_length() > 0 else self.asset_browser_pack
+
+        if target_pack.byte_length() > 0:
+            var arch = FlpkV3MappedArchive.open(target_pack)
+            if arch.valid:
+                for i in range(arch.entry_count):
+                    var rp = arch.entry_path(i)
+                    if rp.byte_length() == 0:
+                        continue
+                    var dup = False
+                    for e in self.asset_browser_entries:
+                        if e == rp:
+                            dup = True
+                            break
+                    if not dup:
+                        self.asset_browser_entries.append(rp)
+                arch.close()
+
+        if target_dir.byte_length() > 0:
+            var names = list_directory(target_dir)
+            for name in names:
+                if (
+                    name.endswith(".glb")
+                    or name.endswith(".png")
+                    or name.endswith(".jpg")
+                    or name.endswith(".jpeg")
+                    or name.endswith(".hdr")
+                    or name.endswith(".exr")
+                    or name.endswith(".flscene")
+                    or name.endswith(".flpk")
+                    or name.endswith(".wav")
+                    or name.endswith(".ttf")
+                ):
+                    var dup = False
+                    for e in self.asset_browser_entries:
+                        if e == name:
+                            dup = True
+                            break
+                    if not dup:
+                        self.asset_browser_entries.append(name)
+
+        self.asset_browser_scanned = True
+        return len(self.asset_browser_entries)
+
     def live_entity_count(self) -> Int:
         var cnt = 0
         for i in range(len(self.entities)):
@@ -838,6 +948,45 @@ struct FlintStudioState(Movable, Serializable):
         else:
             tx.before_node = self.entities[eid].copy()
             self.entities[eid] = node^
+            if eid < len(self.entity_bvh_slot):
+                self.entity_bvh_slot[eid] = -1
+
+        self.selected_entity_id = eid
+        if record_undo:
+            self._push_undo(tx^)
+            self.redo_stack.clear()
+        return eid
+
+    def duplicate_entity(mut self, entity_id: Int, record_undo: Bool = True) -> Int:
+        """Duplicates an existing live entity (including NPR/VFX/collider properties) as a single Undo/Redo transaction."""
+        if entity_id < 0 or entity_id >= len(self.entities) or not self.entities[entity_id].alive:
+            return -1
+        var src = self.entities[entity_id].copy()
+        var reuse_id = -1
+        for i in range(len(self.entities)):
+            if not self.entities[i].alive:
+                reuse_id = i
+                break
+        var appended = reuse_id < 0
+        var eid = len(self.entities) if appended else reuse_id
+
+        src.entity_id = eid
+        src.name = src.name + "_Copy"
+        src.translation = src.translation + Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
+        src.alive = True
+
+        var tx = EditorTransaction(TX_SPAWN_ENTITY, eid, "Duplicate " + src.name)
+        tx.appended_slot = appended
+        tx.prev_selected_id = self.selected_entity_id
+        tx.next_selected_id = eid
+        tx.after_node = src.copy()
+
+        if appended:
+            self.entities.append(src^)
+            self.entity_bvh_slot.append(-1)
+        else:
+            tx.before_node = self.entities[eid].copy()
+            self.entities[eid] = src^
             if eid < len(self.entity_bvh_slot):
                 self.entity_bvh_slot[eid] = -1
 
@@ -1485,6 +1634,40 @@ def _fmt_f32_2dp(v: Float32) -> String:
     return sign + String(whole) + "." + fstr
 
 
+def _quat_to_euler_deg(q_in: Quat) -> Vec3:
+    """Converts unit quaternion `q` to XYZ Euler angles in degrees `(pitch_x, yaw_y, roll_z)`."""
+    var q = q_in.normalized()
+    var rad_to_deg = Float32(180.0) / PI
+    var sinr_cosp = Float32(2.0) * (q.w * q.x + q.y * q.z)
+    var cosr_cosp = Float32(1.0) - Float32(2.0) * (q.x * q.x + q.y * q.y)
+    var rx = det_atan2(sinr_cosp, cosr_cosp) * rad_to_deg
+
+    var sinp = max(Float32(-1.0), min(Float32(1.0), Float32(2.0) * (q.w * q.y - q.z * q.x)))
+    var ry = asin(sinp) * rad_to_deg
+
+    var siny_cosp = Float32(2.0) * (q.w * q.z + q.x * q.y)
+    var cosy_cosp = Float32(1.0) - Float32(2.0) * (q.y * q.y + q.z * q.z)
+    var rz = det_atan2(siny_cosp, cosy_cosp) * rad_to_deg
+    return Vec3(rx, ry, rz)
+
+
+def _euler_deg_to_quat(deg: Vec3) -> Quat:
+    """Converts XYZ Euler angles in degrees `(pitch_x, yaw_y, roll_z)` to a normalized `Quat`."""
+    var half_d2r = (PI / Float32(180.0)) * Float32(0.5)
+    var cx = cos(deg.x * half_d2r)
+    var sx = sin(deg.x * half_d2r)
+    var cy = cos(deg.y * half_d2r)
+    var sy = sin(deg.y * half_d2r)
+    var cz = cos(deg.z * half_d2r)
+    var sz = sin(deg.z * half_d2r)
+    return Quat(
+        sx * cy * cz - cx * sy * sz,
+        cx * sy * cz + sx * cy * sz,
+        cx * cy * sz - sx * sy * cz,
+        cx * cy * cz + sx * sy * sz,
+    ).normalized()
+
+
 def emit_studio_ui_draw_list(
     mut ui: UiDrawList,
     mut studio: FlintStudioState,
@@ -1592,6 +1775,10 @@ def emit_studio_ui_draw_list(
             _ = studio.undo()
         if studio.ui_ctx.button("tb_redo", "Redo [Ctrl+Y]", 108.0, 22.0):
             _ = studio.redo()
+        if studio.ui_ctx.button("tb_save", "Save [Ctrl+S]", 104.0, 22.0):
+            _ = studio.save_scene_file()
+        if studio.ui_ctx.button("tb_load", "Load [Ctrl+O]", 104.0, 22.0):
+            _ = studio.load_scene_file()
         _ = studio.ui_ctx.checkbox("tb_snap", "Snap", studio.snap_enabled)
         studio.ui_ctx.label(
             "U:" + String(len(studio.undo_stack)) + " R:" + String(len(studio.redo_stack)) + " | GPU " + _fmt_f32_2dp(Float32(gpu_ms)) + " ms",
@@ -1668,6 +1855,10 @@ def emit_studio_ui_draw_list(
                 var tr_w = max(Float32(160.0), panel_w - Float32(20.0))
                 if studio.ui_ctx.drag_float3("tr_pos", "Pos", cur.translation, speed=0.04, w=tr_w):
                     changed = True
+                var rot_deg = _quat_to_euler_deg(cur.rotation)
+                if studio.ui_ctx.drag_float3("tr_rot", "Rot", rot_deg, speed=0.5, min_val=-360.0, max_val=360.0, w=tr_w):
+                    cur.rotation = _euler_deg_to_quat(rot_deg)
+                    changed = True
                 if studio.ui_ctx.drag_float3("tr_scl", "Scale", cur.scale, speed=0.02, min_val=0.05, max_val=50.0, w=tr_w):
                     changed = True
                 studio.ui_ctx.tree_pop()
@@ -1723,15 +1914,13 @@ def emit_studio_ui_draw_list(
                     studio.ui_edit_seq += 1
                 _ = studio.commit_node_edit(eid, cur^, "Inspector UI Edit", coalesce_key=studio.ui_edit_seq)
 
-            if studio.ui_ctx.button("btn_dup_orb", "+ Spawn SubD MaterialOrb", panel_w, 24.0):
-                _ = studio.spawn_entity(
-                    "SubD_MaterialOrb",
-                    position=Vec3(0.0, 1.2, 0.0),
-                    collider_kind=COLLIDER_SPHERE,
-                    collider_half_extents=Vec3(0.85, 0.85, 0.85),
-                    mesh_id=1,
-                    record_undo=True,
-                )
+            studio.ui_ctx.begin_box("ent_actions_row", FlexStyle.row(gap=6.0, pad=0.0))
+            var act_w = max(Float32(80.0), (panel_w - Float32(12.0)) * Float32(0.5))
+            if studio.ui_ctx.button("btn_dup_ent", "Duplicate [Ctrl+D]", act_w, 24.0):
+                _ = studio.duplicate_entity(eid, record_undo=True)
+            if studio.ui_ctx.button("btn_del_ent", "Delete [Del]", act_w, 24.0):
+                _ = studio.despawn_entity(eid, record_undo=True)
+            studio.ui_ctx.end_box()
         else:
             studio.ui_ctx.label("No entity selected", studio.ui_ctx.theme.text_muted)
         studio.ui_ctx.end_dock_panel()
@@ -1744,23 +1933,55 @@ def emit_studio_ui_draw_list(
             studio.update_camera(Float32(0.0))
         studio.ui_ctx.end_dock_panel()
 
-    # 5. Bottom Asset Server, Procedural Presets & MCP v2 Dock (`DockSpace` -> `"AssetBrowser"`)
+    # 5. Bottom Asset Server, Scanned Workspace/Pack Browser & Procedural Presets (`DockSpace` -> `"AssetBrowser"`)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "AssetBrowser"):
+        if (not studio.asset_browser_scanned) and (
+            studio.asset_browser_dir.byte_length() > 0 or studio.asset_browser_pack.byte_length() > 0
+        ):
+            _ = studio.scan_asset_browser()
         studio.ui_ctx.label(
-            "ASSET SERVER (.flpk v3=" + String(mounted_packs) + ")  |  PROCEDURAL STUDIO KIT  |  MCP v2 CLIENTS=" + String(mcp_clients),
+            "ASSET BROWSER (.flpk v3="
+            + String(mounted_packs)
+            + ", items="
+            + String(len(studio.asset_browser_entries))
+            + ")  |  MCP v2 CLIENTS="
+            + String(mcp_clients),
             studio.ui_ctx.theme.accent,
         )
         studio.ui_ctx.begin_box("preset_cards_row", FlexStyle.row(gap=8.0, pad=2.0))
-        if studio.ui_ctx.button("card_orb", "SubD_MaterialOrb", 142.0, 32.0):
-            _ = studio.spawn_entity("SubD_MaterialOrb", position=Vec3(0.0, 1.1, 0.0), collider_kind=COLLIDER_SPHERE, mesh_id=1)
-        if studio.ui_ctx.button("card_torus", "SubD_CatmullTorus", 148.0, 32.0):
-            _ = studio.spawn_entity("SubD_CatmullTorus", position=Vec3(1.8, 2.2, 0.5), collider_kind=COLLIDER_SPHERE, mass=6.0, mesh_id=2)
-        if studio.ui_ctx.button("card_arch", "ArchKit_Colonnade", 148.0, 32.0):
-            _ = studio.spawn_entity("ArchKit_Colonnade", position=Vec3(0.0, 0.0, 5.8), collider_kind=COLLIDER_BOX, mesh_id=3)
-        if studio.ui_ctx.button("card_fol", "Botanical_Foliage", 142.0, 32.0):
-            _ = studio.spawn_entity("Botanical_FoliageSample", position=Vec3(-4.2, 0.0, 2.2), collider_kind=COLLIDER_BOX, mesh_id=4)
-        if studio.ui_ctx.button("card_grid", "Studio_RefGrid", 132.0, 32.0):
-            _ = studio.spawn_entity("Studio_ReferenceGrid", position=Vec3(0.0, 0.0, 0.0), collider_kind=COLLIDER_BOX, mesh_id=0)
+        if len(studio.asset_browser_entries) > 0:
+            if studio.ui_ctx.button("ab_rescan", "Rescan", 72.0, 32.0):
+                _ = studio.scan_asset_browser()
+            var show_n = min(10, len(studio.asset_browser_entries))
+            for ai in range(show_n):
+                var entry_name = studio.asset_browser_entries[ai]
+                if studio.ui_ctx.button("ab_item_" + String(ai), entry_name, 148.0, 32.0):
+                    if entry_name.endswith(".flscene"):
+                        var fp = (
+                            (studio.asset_browser_dir + "/" + entry_name)
+                            if studio.asset_browser_dir.byte_length() > 0
+                            else entry_name
+                        )
+                        _ = studio.load_scene_file(fp)
+                    else:
+                        _ = studio.spawn_entity(
+                            entry_name,
+                            position=Vec3(Float32(ai) * Float32(0.5), Float32(1.0), Float32(0.0)),
+                            collider_kind=COLLIDER_BOX,
+                            mesh_id=1,
+                            record_undo=True,
+                        )
+        else:
+            if studio.ui_ctx.button("card_orb", "SubD_MaterialOrb", 142.0, 32.0):
+                _ = studio.spawn_entity("SubD_MaterialOrb", position=Vec3(0.0, 1.1, 0.0), collider_kind=COLLIDER_SPHERE, mesh_id=1)
+            if studio.ui_ctx.button("card_torus", "SubD_CatmullTorus", 148.0, 32.0):
+                _ = studio.spawn_entity("SubD_CatmullTorus", position=Vec3(1.8, 2.2, 0.5), collider_kind=COLLIDER_SPHERE, mass=6.0, mesh_id=2)
+            if studio.ui_ctx.button("card_arch", "ArchKit_Colonnade", 148.0, 32.0):
+                _ = studio.spawn_entity("ArchKit_Colonnade", position=Vec3(0.0, 0.0, 5.8), collider_kind=COLLIDER_BOX, mesh_id=3)
+            if studio.ui_ctx.button("card_fol", "Botanical_Foliage", 142.0, 32.0):
+                _ = studio.spawn_entity("Botanical_FoliageSample", position=Vec3(-4.2, 0.0, 2.2), collider_kind=COLLIDER_BOX, mesh_id=4)
+            if studio.ui_ctx.button("card_grid", "Studio_RefGrid", 132.0, 32.0):
+                _ = studio.spawn_entity("Studio_ReferenceGrid", position=Vec3(0.0, 0.0, 0.0), collider_kind=COLLIDER_BOX, mesh_id=0)
         studio.ui_ctx.end_box()
         studio.ui_ctx.end_dock_panel()
 
