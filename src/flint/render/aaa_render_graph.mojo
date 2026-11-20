@@ -10,6 +10,11 @@ from flint.platform.vulkan import (
     ACCESS_INDIRECT_READ,
     ACCESS_SHADER_READ,
     ACCESS_SHADER_WRITE,
+    LAYOUT_COLOR_ATTACHMENT,
+    LAYOUT_DEPTH_ATTACHMENT,
+    LAYOUT_GENERAL,
+    LAYOUT_SHADER_READ_ONLY,
+    LAYOUT_UNDEFINED,
     PIPELINE_COLOR_ATTACHMENT_OUTPUT,
     PIPELINE_COMPUTE,
     PIPELINE_DRAW_INDIRECT,
@@ -17,6 +22,7 @@ from flint.platform.vulkan import (
     PIPELINE_FRAGMENT_SHADER,
     PIPELINE_LATE_FRAGMENT_TESTS,
     VulkanGpu,
+    VulkanImage,
 )
 
 comptime RG_QUEUE_GRAPHICS: Int = 0
@@ -36,17 +42,30 @@ struct RgResourceDesc(Copyable, Movable):
     var name: String
     var size_bytes: Int
     var transient: Bool
+    var is_image: Bool
     var first_pass: Int
     var last_pass: Int
     var aliased_offset_bytes: Int
 
-    def __init__(out self, name: String, size_bytes: Int, transient: Bool = True):
+    def __init__(out self, name: String, size_bytes: Int, transient: Bool = True, is_image: Bool = False):
         self.name = name
         self.size_bytes = max(RG_UNIT_BYTES, size_bytes)
         self.transient = transient
+        self.is_image = is_image
         self.first_pass = 999999
         self.last_pass = -1
         self.aliased_offset_bytes = 0
+
+
+@fieldwise_init
+struct RgAliasingMetrics(Copyable, ImplicitlyCopyable, Movable):
+    """Snapshot of `OffsetAllocator` transient VRAM aliasing and compiled barrier counts."""
+    var unaliased_bytes: Int
+    var aliased_peak_bytes: Int
+    var saved_bytes: Int
+    var savings_ratio: Float32
+    var transient_resource_count: Int
+    var compiled_barrier_count: Int
 
 
 struct RgResourceAccess(Copyable, Movable):
@@ -77,6 +96,9 @@ struct RgBarrierRecord(Copyable, Movable):
     var dst_stage: Int
     var dst_access: Int
     var cross_queue_handoff: Bool
+    var is_image_barrier: Bool
+    var old_layout: UInt32
+    var new_layout: UInt32
 
     def __init__(
         out self,
@@ -87,6 +109,9 @@ struct RgBarrierRecord(Copyable, Movable):
         dst_stage: Int,
         dst_access: Int,
         cross_queue_handoff: Bool = False,
+        is_image_barrier: Bool = False,
+        old_layout: UInt32 = LAYOUT_UNDEFINED,
+        new_layout: UInt32 = LAYOUT_UNDEFINED,
     ):
         self.pass_index = pass_index
         self.resource_id = resource_id
@@ -95,6 +120,9 @@ struct RgBarrierRecord(Copyable, Movable):
         self.dst_stage = dst_stage
         self.dst_access = dst_access
         self.cross_queue_handoff = cross_queue_handoff
+        self.is_image_barrier = is_image_barrier
+        self.old_layout = old_layout
+        self.new_layout = new_layout
 
 
 struct AaaGpuPassTiming(Copyable, Movable):
@@ -129,6 +157,18 @@ def _usage_to_vk_stage_access(usage: Int) -> Tuple[Int, Int, Bool]:
     return (PIPELINE_FRAGMENT_SHADER, Int(ACCESS_SHADER_READ), False)
 
 
+@always_inline
+def _usage_to_vk_layout(usage: Int) -> UInt32:
+    """Maps logical `RG_USAGE_*` to target `VkImageLayout` for image resources."""
+    if usage == RG_USAGE_COLOR_ATT_WRITE:
+        return LAYOUT_COLOR_ATTACHMENT
+    if usage == RG_USAGE_DEPTH_ATT_WRITE:
+        return LAYOUT_DEPTH_ATTACHMENT
+    if usage == RG_USAGE_COMPUTE_WRITE:
+        return LAYOUT_GENERAL
+    return LAYOUT_SHADER_READ_ONLY
+
+
 struct AaaRenderGraph(Movable):
     """Compiled declarative frame graph with `VK_KHR_synchronization2` barrier synthesis,
     `OffsetAllocator` transient VRAM aliasing, and hardware `VkQueryPool` pass timings."""
@@ -140,6 +180,8 @@ struct AaaRenderGraph(Movable):
     var unaliased_transient_bytes: Int
     var aliased_peak_bytes: Int
     var async_compute_pass_count: Int
+    var barriers_emitted_last_frame: Int
+    var passes_executed_last_frame: Int
 
     def __init__(out self):
         self.resources = List[RgResourceDesc]()
@@ -150,10 +192,16 @@ struct AaaRenderGraph(Movable):
         self.unaliased_transient_bytes = 0
         self.aliased_peak_bytes = 0
         self.async_compute_pass_count = 0
+        self.barriers_emitted_last_frame = 0
+        self.passes_executed_last_frame = 0
 
-    def add_resource(mut self, name: String, size_bytes: Int, transient: Bool = True) -> Int:
+    def begin_frame(mut self):
+        self.barriers_emitted_last_frame = 0
+        self.passes_executed_last_frame = 0
+
+    def add_resource(mut self, name: String, size_bytes: Int, transient: Bool = True, is_image: Bool = False) -> Int:
         var id = len(self.resources)
-        self.resources.append(RgResourceDesc(name, size_bytes, transient))
+        self.resources.append(RgResourceDesc(name, size_bytes, transient, is_image))
         return id
 
     def add_pass(mut self, name: String, accesses: List[RgResourceAccess], queue_kind: Int = RG_QUEUE_GRAPHICS) -> Int:
@@ -228,6 +276,7 @@ struct AaaRenderGraph(Movable):
         var synced_stages_q1 = List[Int](length=len(self.resources), fill=0)
         var read_stages_q0 = List[Int](length=len(self.resources), fill=0)
         var read_stages_q1 = List[Int](length=len(self.resources), fill=0)
+        var last_layout = List[UInt32](length=len(self.resources), fill=LAYOUT_SHADER_READ_ONLY)
 
         for p_idx in range(len(self.passes)):
             var cur_q = self.passes[p_idx].queue_kind
@@ -237,6 +286,9 @@ struct AaaRenderGraph(Movable):
                 var dst_st = sa[0]
                 var dst_ac = sa[1]
                 var is_wr = sa[2]
+                var is_img = self.resources[rid].is_image
+                var tgt_layout = _usage_to_vk_layout(acc.usage) if is_img else LAYOUT_UNDEFINED
+                var prev_layout = last_layout[rid] if is_img else LAYOUT_UNDEFINED
 
                 if is_wr:
                     if read_stages_q0[rid] != 0 or read_stages_q1[rid] != 0:
@@ -250,6 +302,9 @@ struct AaaRenderGraph(Movable):
                                     dst_st,
                                     dst_ac,
                                     RG_QUEUE_GRAPHICS != cur_q,
+                                    is_img,
+                                    prev_layout,
+                                    tgt_layout,
                                 )
                             )
                         if read_stages_q1[rid] != 0:
@@ -262,6 +317,9 @@ struct AaaRenderGraph(Movable):
                                     dst_st,
                                     dst_ac,
                                     RG_QUEUE_ASYNC_COMPUTE != cur_q,
+                                    is_img,
+                                    prev_layout,
+                                    tgt_layout,
                                 )
                             )
                     elif last_write_stage[rid] != 0:
@@ -274,11 +332,31 @@ struct AaaRenderGraph(Movable):
                                 dst_st,
                                 dst_ac,
                                 last_write_queue[rid] != cur_q,
+                                is_img,
+                                prev_layout,
+                                tgt_layout,
+                            )
+                        )
+                    elif is_img and prev_layout != tgt_layout:
+                        self.barriers.append(
+                            RgBarrierRecord(
+                                p_idx,
+                                rid,
+                                PIPELINE_COMPUTE,
+                                Int(ACCESS_SHADER_READ),
+                                dst_st,
+                                dst_ac,
+                                False,
+                                True,
+                                prev_layout,
+                                tgt_layout,
                             )
                         )
                     last_write_stage[rid] = dst_st
                     last_write_access[rid] = dst_ac
                     last_write_queue[rid] = cur_q
+                    if is_img:
+                        last_layout[rid] = tgt_layout
                     synced_stages_q0[rid] = 0
                     synced_stages_q1[rid] = 0
                     read_stages_q0[rid] = 0
@@ -304,8 +382,13 @@ struct AaaRenderGraph(Movable):
                                     dst_st,
                                     dst_ac,
                                     last_write_queue[rid] != cur_q,
+                                    is_img,
+                                    prev_layout,
+                                    tgt_layout,
                                 )
                             )
+                    if is_img:
+                        last_layout[rid] = tgt_layout
                     if cur_q == RG_QUEUE_GRAPHICS:
                         read_stages_q0[rid] |= dst_st
                     else:
@@ -313,22 +396,58 @@ struct AaaRenderGraph(Movable):
 
         return True
 
-    def emit_pass_barriers(self, mut vk: VulkanGpu, cmd_slot: Int, pass_index: Int):
-        """Emits merged `vkCmdPipelineBarrier2` memory barriers scheduled before `pass_index`."""
-        var src_st = 0
-        var src_ac = 0
-        var dst_st = 0
-        var dst_ac = 0
-        var any_b = False
+    def emit_pass_barriers(mut self, mut vk: VulkanGpu, cmd_slot: Int, pass_index: Int):
+        """Emits per-resource `vkCmdPipelineBarrier2` buffer/memory barriers scheduled before `pass_index`."""
+        self.passes_executed_last_frame += 1
+        var emitted = 0
         for b in self.barriers:
-            if b.pass_index == pass_index:
-                src_st |= b.src_stage
-                src_ac |= b.src_access
-                dst_st |= b.dst_stage
-                dst_ac |= b.dst_access
-                any_b = True
-        if any_b:
-            vk.memory_barrier2(cmd_slot, src_st, src_ac, dst_st, dst_ac)
+            if b.pass_index == pass_index and not b.is_image_barrier:
+                vk.memory_barrier2(cmd_slot, b.src_stage, b.src_access, b.dst_stage, b.dst_access)
+                emitted += 1
+        self.barriers_emitted_last_frame += emitted
+
+    def emit_pass_image_transition(
+        mut self,
+        mut vk: VulkanGpu,
+        cmd_slot: Int,
+        pass_index: Int,
+        resource_id: Int,
+        mut img: VulkanImage,
+    ) -> Bool:
+        """Emits a compiled image layout transition barrier for `resource_id` scheduled before `pass_index`."""
+        for b in self.barriers:
+            if b.pass_index == pass_index and b.resource_id == resource_id and b.is_image_barrier:
+                if img.layout != b.new_layout:
+                    vk.transition_image(
+                        cmd_slot,
+                        img,
+                        b.new_layout,
+                        b.src_stage,
+                        UInt32(b.src_access),
+                        b.dst_stage,
+                        UInt32(b.dst_access),
+                    )
+                else:
+                    vk.memory_barrier2(cmd_slot, b.src_stage, b.src_access, b.dst_stage, b.dst_access)
+                self.barriers_emitted_last_frame += 1
+                return True
+        return False
+
+    def aliasing_metrics(self) -> RgAliasingMetrics:
+        """Returns a structured snapshot of transient VRAM aliasing savings and compiled barrier counts."""
+        var transient_cnt = 0
+        for r in range(len(self.resources)):
+            if self.resources[r].transient and self.resources[r].last_pass >= 0:
+                transient_cnt += 1
+        var saved = max(0, self.unaliased_transient_bytes - self.aliased_peak_bytes)
+        return RgAliasingMetrics(
+            self.unaliased_transient_bytes,
+            self.aliased_peak_bytes,
+            saved,
+            self.aliasing_savings_ratio(),
+            transient_cnt,
+            len(self.barriers),
+        )
 
     def aliasing_savings_ratio(self) -> Float32:
         if self.unaliased_transient_bytes <= 0:

@@ -1322,6 +1322,64 @@ def test_render_features_glass_water_particles():
     var resized_px = ren.readback_pixels()
     _assert(len(resized_px) == 192 * 128, "Post-resize readback matches new 192x128 dimensions")
 
+    # Wave 2: 1D Compacted Meshlet Worklist + AaaRenderGraph Barrier & Aliasing Metrics
+    var rg_m = ren.get_render_graph_aliasing_metrics()
+    _assert(
+        rg_m.unaliased_bytes > 0
+        and rg_m.aliased_peak_bytes > 0
+        and rg_m.aliased_peak_bytes < rg_m.unaliased_bytes
+        and rg_m.saved_bytes == rg_m.unaliased_bytes - rg_m.aliased_peak_bytes
+        and rg_m.compiled_barrier_count >= 7,
+        "AaaRenderGraph OffsetAllocator VRAM aliasing & barrier compilation verified",
+    )
+    _assert(
+        ren.render_graph.passes_executed_last_frame >= 7 and ren.render_graph.barriers_emitted_last_frame >= 5,
+        "AaaRenderGraph emitted barriers across core frame passes",
+    )
+    var expected_wl = ren.geom.meshes[box_e.mesh_id].meshlet_count * 10 + ren.geom.meshes[ball_e.mesh_id].meshlet_count
+    ren.begin_frame(eye, tgt, fov_y_deg=40.0)
+    for k_i in range(10):
+        ren.draw_instance(box_e.mesh_id, trs(Vec3(Float32(k_i) * Float32(0.4) - Float32(1.8), -0.1, 0.0), Quat(), Vec3(0.2, 0.1, 0.2)))
+    ren.draw_instance(ball_e.mesh_id, trs(Vec3(0.0, 1.0, 0.0), Quat(), Vec3(0.5, 0.5, 0.5)), material_override=mat_floor)
+    _assert(ren.render_frame(capture_readback=True), "1D compacted meshlet worklist frame rendered")
+    _assert(
+        ren.last_worklist_meshlets == expected_wl and ren.last_culled_meshlet_draws > 0,
+        "1D compacted worklist count matches exact sum of meshlets (" + String(ren.last_worklist_meshlets) + " vs " + String(expected_wl) + ")",
+    )
+
+    # Wave 2: Projected OBB Deferred Decal (`GpuDecalVolume`) GPU upload & shading verification
+    ren.enable_vsm = False
+    ren.sun_dir = Vec3(0.0, 0.9, 0.4).normalized()
+    ren.sun_radiance = Vec3(4.0, 4.0, 4.0)
+    var dec_eye = Vec3(0.0, 3.0, 3.5)
+    var dec_tgt = Vec3(0.0, 0.0, 0.0)
+    var rw_d = ren.output_w
+    var rh_d = ren.output_h
+    var mid_idx = (rh_d // 2) * rw_d + (rw_d // 2)
+
+    ren.begin_frame(dec_eye, dec_tgt, fov_y_deg=45.0)
+    ren.draw_instance(box_e.mesh_id, trs(Vec3(0.0, -0.1, 0.0), Quat(), Vec3(5.0, 0.1, 5.0)), material_override=mat_floor)
+    _assert(ren.render_frame(capture_readback=True), "Decal baseline floor frame rendered")
+    var floor_base = ren.readback_resolved_hdr()[mid_idx].copy()
+
+    var red_decal = GpuDecalVolume(
+        center=Vec3(0.0, 0.0, 0.0),
+        half_extents=Vec3(2.5, 1.0, 2.5),
+        rotation=Quat(),
+        albedo_slot=BINDLESS_SLOT_NONE,
+        opacity=1.0,
+    )
+    red_decal.tint_rgb = Vec3(0.95, 0.04, 0.04)
+    ren.begin_frame(dec_eye, dec_tgt, fov_y_deg=45.0)
+    ren.draw_instance(box_e.mesh_id, trs(Vec3(0.0, -0.1, 0.0), Quat(), Vec3(5.0, 0.1, 5.0)), material_override=mat_floor)
+    ren.add_decal(red_decal)
+    _assert(ren.render_frame(capture_readback=True), "Projected OBB decal frame rendered")
+    var floor_dec = ren.readback_resolved_hdr()[mid_idx].copy()
+    _assert(
+        floor_dec.x > floor_base.x * Float32(1.8) and floor_dec.x > floor_dec.z * Float32(3.0),
+        "Projected OBB red decal shaded onto grey floor (r: " + String(floor_base.x) + " -> " + String(floor_dec.x) + ", b: " + String(floor_dec.z) + ")",
+    )
+
     print("[PASS] Suite 7: Soft RT Shadows + Refractive Glass + Shaped Water + Generic GPU Particles (green "
           + String(g0) + " -> " + String(g1) + ", " + glass_note + ")")
     ren.shutdown()

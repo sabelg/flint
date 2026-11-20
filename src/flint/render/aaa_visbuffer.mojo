@@ -42,6 +42,7 @@ comptime BIND_AAA_SURFCACHE: Int = 10    # Direct-lit Lumen-style per-triangle/m
 comptime BIND_AAA_OIT_NODES: Int = 11    # Per-pixel 4-layer exact short-stack OIT + 6-way volumetric plumes
 comptime BIND_AAA_CLUSTERS: Int = 12     # 16x9x24 Log-Z Clustered Punctual & Heitz LTC Area Lights (V18)
 comptime BIND_AAA_SKINNING: Int = 13     # Dual-Quaternion Bone Palettes + Bind-Pose + Prev Skinned Verts (V18)
+comptime BIND_AAA_WORKLIST: Int = 13     # 1D Compacted Meshlet Cull Worklist (packed `(inst_idx << 17) | ml_id`)
 comptime BIND_AAA_POST_SCRATCH: Int = 14 # Auto-Exposure Histogram + 5-Mip Dual-Kawase Bloom + Bokeh DoF (V19)
 comptime BIND_AAA_CANDIDATES: Int = 14   # Two-Phase Hi-Z Occluded Candidates Queue
 comptime AAA_STORAGE_COUNT: Int = 15
@@ -219,9 +220,10 @@ def meshlet_cull_shader() -> List[UInt32]:
     var b_indirect = s.buffer(BIND_AAA_INDIRECT)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
     var depth_samp = s.sampled_image_2d(BIND_AAA_DEPTH_TEX)
+    var b_worklist = s.buffer(BIND_AAA_WORKLIST)
     var b_candidates = s.buffer(BIND_AAA_CANDIDATES)
 
-    var inst_count = s.push_word(0)
+    var work_count = s.push_word(0)
     var max_draws = s.push_word(1)
     var enable_cone = s.push_word(2)
     var enable_hiz = s.push_word(3)
@@ -234,29 +236,25 @@ def meshlet_cull_shader() -> List[UInt32]:
     var ml_id_var = s.uvar(s.uint(0))
     var valid_var = s.uvar(s.uint(0))
 
-    var is_p1 = s.ieq(cull_phase, s.uint(0))
-    s.begin_if(is_p1)
-    var p1_inst = s.invocation_axis(0)
-    var p1_local_ml = s.invocation_axis(1)
-    s.begin_if(s.ult(p1_inst, inst_count))
-    var inst_base_p1 = s.imul(p1_inst, s.uint(UInt32(AAA_INSTANCE_WORDS)))
-    var first_ml_p1 = s.load_word(b_instances, s.iadd(inst_base_p1, s.uint(32)))
-    var ml_count_p1 = s.load_word(b_instances, s.iadd(inst_base_p1, s.uint(33)))
-    s.begin_if(s.ult(p1_local_ml, ml_count_p1))
-    s.store(inst_idx_var, p1_inst)
-    s.store(ml_id_var, s.iadd(first_ml_p1, p1_local_ml))
-    s.store(valid_var, s.uint(1))
-    s.end_if()
-    s.end_if()
-    s.begin_else()
-    # Phase 2: process candidate meshlets queued in b_candidates
-    var cand_id = s.iadd(
+    var flat_id = s.iadd(
         s.imul(s.workgroup_axis(0), s.uint(64)),
         s.iadd(s.imul(s.local_axis(1), s.uint(8)), s.local_axis(0)),
     )
+
+    var is_p1 = s.ieq(cull_phase, s.uint(0))
+    s.begin_if(is_p1)
+    # Phase 1: 1D compacted `(inst_idx, ml_id)` meshlet worklist (zero idle threads for mixed mesh sizes!)
+    s.begin_if(s.ult(flat_id, work_count))
+    var work_packed = s.load_word(b_worklist, flat_id)
+    s.store(inst_idx_var, s.shr(work_packed, s.uint(17)))
+    s.store(ml_id_var, s.bit_and(work_packed, s.uint(0x1FFFF)))
+    s.store(valid_var, s.uint(1))
+    s.end_if()
+    s.begin_else()
+    # Phase 2: process candidate meshlets queued in b_candidates
     var cand_total = s.load_word(b_candidates, s.uint(0))
-    s.begin_if(s.logical_and(s.ult(cand_id, cand_total), s.ult(cand_id, max_draws)))
-    var cand_packed = s.load_word(b_candidates, s.iadd(s.uint(4), cand_id))
+    s.begin_if(s.logical_and(s.ult(flat_id, cand_total), s.ult(flat_id, max_draws)))
+    var cand_packed = s.load_word(b_candidates, s.iadd(s.uint(4), flat_id))
     s.store(inst_idx_var, s.shr(cand_packed, s.uint(17)))
     s.store(ml_id_var, s.bit_and(cand_packed, s.uint(0x1FFFF)))
     s.store(valid_var, s.uint(1))

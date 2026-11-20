@@ -1071,6 +1071,8 @@ struct ScalableRenderer(Movable):
             )
         for l_i in range(len(world.cluster_lights)):
             gpu.add_cluster_light(world.cluster_lights[l_i])
+        for d_i in range(len(world.decals)):
+            gpu.add_decal(world.decals[d_i])
 
         # Copy caller UI primitives + project 3D DebugLineBatch into GPU SDF `PRIM_LINE` segments
         for p_i in range(ui.count()):

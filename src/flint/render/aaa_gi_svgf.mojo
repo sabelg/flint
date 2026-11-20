@@ -48,6 +48,15 @@ from flint.render.aaa_bsdf import (
     emit_rnm_blend,
 )
 from flint.render.aaa_vsm import emit_vsm_pcss_shadow
+from flint.render.material_graph import (
+    AAA_GLOBALS_DECAL_COUNT_WORD,
+    AAA_GLOBALS_DECAL_TABLE_WORD,
+    AAA_MAX_DECALS,
+    DECAL_BLEND_ALBEDO,
+    DECAL_BLEND_ROUGHNESS,
+    DECAL_BLEND_STAIN_MULTIPLY,
+    GPU_DECAL_VOLUME_WORDS,
+)
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.aaa_raytracing import (
     RAY_FLAG_OPAQUE_KHR,
@@ -1440,6 +1449,89 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var nx_v = s.fvar(s.fmul(wn[0], flip_n))
     var ny_v = s.fvar(s.fmul(wn[1], flip_n))
     var nz_v = s.fvar(s.fmul(wn[2], flip_n))
+
+    # Projected OBB Deferred Decals (`GpuDecalVolume`, `AAA_GLOBALS_DECAL_COUNT_WORD`, `AAA_GLOBALS_DECAL_TABLE_WORD`)
+    var n_decals = s.umin(
+        s.load_word(b_globals, s.uint(UInt32(AAA_GLOBALS_DECAL_COUNT_WORD))),
+        s.uint(UInt32(AAA_MAX_DECALS)),
+    )
+    s.begin_if(s.logical_and(s.ine(n_decals, s.uint(0)), s.logical_not(is_furnace)))
+    var dec_i = s.uvar(s.uint(0))
+    s.begin_loop()
+    var di_u = s.load_u(dec_i)
+    s.break_if(s.uge(di_u, n_decals))
+    var d_off = s.iadd(s.uint(UInt32(AAA_GLOBALS_DECAL_TABLE_WORD)), s.imul(di_u, s.uint(UInt32(GPU_DECAL_VOLUME_WORDS))))
+    var loc_d = emit_mat4_mul_point(s, b_globals, d_off, wx, wy, wz)
+    var in_x = s.fle(s.fabs(loc_d[0]), s.float(0.5))
+    var in_y = s.fle(s.fabs(loc_d[1]), s.float(0.5))
+    var in_z = s.fle(s.fabs(loc_d[2]), s.float(0.5))
+    s.begin_if(s.logical_and(s.logical_and(in_x, in_y), in_z))
+    # Row 1 of column-major `world_to_obb` encodes `obb_up_world * inv_sy` at words `[1, 5, 9]`
+    var d_up = emit_vec3_normalize(
+        s,
+        s.load_float(b_globals, s.iadd(d_off, s.uint(1))),
+        s.load_float(b_globals, s.iadd(d_off, s.uint(5))),
+        s.load_float(b_globals, s.iadd(d_off, s.uint(9))),
+    )
+    var d_cos = emit_vec3_dot(s, s.load_f(nx_v), s.load_f(ny_v), s.load_f(nz_v), d_up[0], d_up[1], d_up[2])
+    var d_fade_cos = s.load_float(b_globals, s.iadd(d_off, s.uint(22)))
+    s.begin_if(s.fgt(d_cos, d_fade_cos))
+    var ang_fade = s.nclamp(
+        s.fdiv(s.fsub(d_cos, d_fade_cos), s.nmax(s.float(0.05), s.fsub(s.float(1.0), d_fade_cos))),
+        s.float(0.0),
+        s.float(1.0),
+    )
+    var box_fade = s.nclamp(s.fmul(s.fsub(s.float(0.5), s.fabs(loc_d[1])), s.float(6.0)), s.float(0.0), s.float(1.0))
+    var d_op = s.load_float(b_globals, s.iadd(d_off, s.uint(21)))
+    var d_uv = s.vec2(s.fadd(loc_d[0], s.float(0.5)), s.fadd(loc_d[2], s.float(0.5)))
+
+    var d_w16 = s.load_word(b_globals, s.iadd(d_off, s.uint(16)))
+    var d_w17 = s.load_word(b_globals, s.iadd(d_off, s.uint(17)))
+    var d_alb_slot = s.bit_and(d_w16, s.uint(0xFFFF))
+    var d_orm_slot = s.bit_and(d_w17, s.uint(0xFFFF))
+    var d_flags = s.shr(d_w17, s.uint(16))
+
+    var d_r = s.fvar(s.load_float(b_globals, s.iadd(d_off, s.uint(18))))
+    var d_g = s.fvar(s.load_float(b_globals, s.iadd(d_off, s.uint(19))))
+    var d_b = s.fvar(s.load_float(b_globals, s.iadd(d_off, s.uint(20))))
+    var d_a = s.fvar(s.fmul(d_op, s.fmul(ang_fade, box_fade)))
+
+    s.begin_if(s.ult(d_alb_slot, s.uint(UInt32(AAA_MAX_BINDLESS))))
+    var d_tex = s.sample_bindless_lod(bindless_arr, d_alb_slot, d_uv, s.float(0.0))
+    s.store(d_r, s.fmul(s.load_f(d_r), s.extract_f(d_tex, 0)))
+    s.store(d_g, s.fmul(s.load_f(d_g), s.extract_f(d_tex, 1)))
+    s.store(d_b, s.fmul(s.load_f(d_b), s.extract_f(d_tex, 2)))
+    s.store(d_a, s.fmul(s.load_f(d_a), s.extract_f(d_tex, 3)))
+    s.end_if()
+
+    var dw = s.nclamp(s.load_f(d_a), s.float(0.0), s.float(1.0))
+    var inv_dw = s.fsub(s.float(1.0), dw)
+    s.begin_if(s.ine(s.bit_and(d_flags, s.uint(UInt32(DECAL_BLEND_ALBEDO))), s.uint(0)))
+    var is_mul = s.ine(s.bit_and(d_flags, s.uint(UInt32(DECAL_BLEND_STAIN_MULTIPLY))), s.uint(0))
+    var cur_ar = s.load_f(alb_r); var cur_ag = s.load_f(alb_g); var cur_ab = s.load_f(alb_b)
+    var tgt_r = s.select_f(is_mul, s.fmul(cur_ar, s.load_f(d_r)), s.load_f(d_r))
+    var tgt_g = s.select_f(is_mul, s.fmul(cur_ag, s.load_f(d_g)), s.load_f(d_g))
+    var tgt_b = s.select_f(is_mul, s.fmul(cur_ab, s.load_f(d_b)), s.load_f(d_b))
+    s.store(alb_r, s.fma(cur_ar, inv_dw, s.fmul(tgt_r, dw)))
+    s.store(alb_g, s.fma(cur_ag, inv_dw, s.fmul(tgt_g, dw)))
+    s.store(alb_b, s.fma(cur_ab, inv_dw, s.fmul(tgt_b, dw)))
+    s.end_if()
+
+    s.begin_if(
+        s.logical_and(
+            s.ine(s.bit_and(d_flags, s.uint(UInt32(DECAL_BLEND_ROUGHNESS))), s.uint(0)),
+            s.ult(d_orm_slot, s.uint(UInt32(AAA_MAX_BINDLESS))),
+        )
+    )
+    var d_orm = s.sample_bindless_lod(bindless_arr, d_orm_slot, d_uv, s.float(0.0))
+    s.store(rough, s.nclamp(s.fma(s.load_f(rough), inv_dw, s.fmul(s.extract_f(d_orm, 1), dw)), s.float(0.04), s.float(1.0)))
+    s.end_if()
+
+    s.end_if()
+    s.end_if()
+    s.store(dec_i, s.iadd(di_u, s.uint(1)))
+    s.end_loop()
+    s.end_if()
 
     # Kaplanyan & Hill 2016 Curvature + Detail Specular AA into BOTH `rough` and `ccoat_r`
     s.begin_if(s.logical_not(is_furnace))
