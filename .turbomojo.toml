@@ -1,0 +1,10 @@
+[tools]
+include_paths = ["src", "tests"]
+
+[run]
+active = "studio"
+
+[run.studio]
+file = "examples/studio/main.mojo"
+cwd = "."
+build = true

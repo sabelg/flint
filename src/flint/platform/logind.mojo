@@ -19,7 +19,7 @@ index). No libdbus or libsystemd.
 """
 from std.ffi import external_call
 from flint.core.anchor import sys, IS_X86, SYS_READ, SYS_WRITE
-from flint.platform.os import close_fd, get_time
+from flint.platform.os import open_path_fd, close_fd, get_time
 
 comptime SYS_SOCKET: Int = 41 if IS_X86 else 198
 comptime SYS_CONNECT: Int = 42 if IS_X86 else 203
@@ -143,22 +143,32 @@ def dbus_message_length(data: List[UInt8]) -> Int:
 def dbus_parse(data: List[UInt8], length: Int) -> DbusMessage:
     """Decode one little-endian message's header fields and body."""
     var message = DbusMessage()
+    var limit = min(length, len(data))
+    if limit < 16:
+        return message^
     message.kind = Int(data[1])
     message.serial = dbus_get32(data, 8)
-    var fields_end = 16 + dbus_get32(data, 12)
+    var header_len = dbus_get32(data, 12)
+    if header_len < 0 or header_len > limit - 16:
+        return message^
+    var fields_end = 16 + header_len
     var pos = 16
     while pos < fields_end:
         while pos % 8 != 0:
             pos += 1
-        if pos >= fields_end:
+        if pos + 2 > fields_end:
             break
         var code = Int(data[pos])
         var sig_length = Int(data[pos + 1])
+        if pos + 2 + sig_length + 1 > fields_end:
+            break
         var type_code = Int(data[pos + 2]) if sig_length > 0 else 0
         pos += 2 + sig_length + 1
         if type_code == 117:  # 'u'
             while pos % 4 != 0:
                 pos += 1
+            if pos + 4 > fields_end:
+                break
             var value = dbus_get32(data, pos)
             pos += 4
             if code == 5:
@@ -168,22 +178,32 @@ def dbus_parse(data: List[UInt8], length: Int) -> DbusMessage:
         elif type_code == 115 or type_code == 111:  # 's', 'o'
             while pos % 4 != 0:
                 pos += 1
+            if pos + 4 > fields_end:
+                break
             var text_length = dbus_get32(data, pos)
+            if text_length < 0 or text_length >= fields_end - (pos + 4):
+                break
             if code == 4:
-                var name = List[UInt8]()
+                var name = List[UInt8](capacity=text_length)
                 for index in range(text_length):
                     name.append(data[pos + 4 + index])
                 message.error_name = String(unsafe_from_utf8=name)
             pos += 4 + text_length + 1
         elif type_code == 103:  # 'g'
-            pos += 1 + Int(data[pos]) + 1
+            if pos + 1 > fields_end:
+                break
+            var g_len = Int(data[pos])
+            if pos + 1 + g_len + 1 > fields_end:
+                break
+            pos += 1 + g_len + 1
         else:
             break  # a type no bus daemon puts in a header; stop rather than misread
     var body_start = fields_end
     while body_start % 8 != 0:
         body_start += 1
-    for index in range(body_start, length):
-        message.body.append(data[index])
+    if body_start < limit:
+        for index in range(body_start, limit):
+            message.body.append(data[index])
     return message^
 
 
@@ -444,7 +464,7 @@ struct LogindSession(Movable):
 def device_numbers(event_name: String) -> Tuple[Int, Int]:
     """Major and minor of /dev/input/<name>, read from /sys/class/input/<name>/dev ("13:67")."""
     var path = "/sys/class/input/" + event_name + "/dev"
-    var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(0x80000), Int32(0)))
+    var fd = open_path_fd(path, Int32(0x80000))
     if fd < 0:
         return (-1, -1)
     var buf = List[UInt8](length=32, fill=0)

@@ -503,7 +503,8 @@ struct ProfileTimeline(Movable):
         self.take_events(self.frame)
         self.handle.record(ZONE_FRAME, self.frame_started, ended)
         self.take_events(self.frame)
-        var total_ms = self.to_ms(ended - self.frame_started)
+        var frame_ticks = (ended - self.frame_started) if Int64(ended - self.frame_started) >= 0 else UInt64(0)
+        var total_ms = self.to_ms(frame_ticks)
         var zcount = min(self.zone_count(), len(self.zone_ticks))
         for zone in range(zcount):
             self.history[zone * HISTORY_FRAMES + self.frame % HISTORY_FRAMES] = self.to_ms(self.zone_ticks[zone])
@@ -545,7 +546,7 @@ struct ProfileTimeline(Movable):
         else:
             lane = self.lane_of(thread)
             self.frame_events.append(ProfileEvent(zone, lane, started, ended))
-        if zone >= 0 and zone < len(self.zone_ticks):
+        if zone >= 0 and zone < len(self.zone_ticks) and Int64(ended - started) >= 0:
             self.zone_ticks[zone] += ended - started
         if self.fd >= 0:
             self.write_event(zone, lane, started, ended, event_frame)
@@ -572,7 +573,7 @@ struct ProfileTimeline(Movable):
             self.gpu_span_counts[row] = 0
         var count = self.gpu_span_counts[row]
         var opened = self.frame_starts[row]
-        if count >= GPU_SPANS_PER_FRAME or started < opened:
+        if count >= GPU_SPANS_PER_FRAME or Int64(started - opened) < 0 or Int64(ended - started) < 0:
             return
         self.gpu_spans[row * GPU_SPANS_PER_FRAME + count] = DisplayEvent(zone, GPU_LANE, 1 if zone != ZONE_GPU_FRAME else 0, self.to_ms(started - opened), self.to_ms(ended - opened))
         self.gpu_span_counts[row] = count + 1
@@ -590,14 +591,15 @@ struct ProfileTimeline(Movable):
         while index > 0 and len(self.candidate) < MAX_DISPLAY_EVENTS:
             index -= 1
             ref event = self.frame_events[index]
-            if event.ended < self.frame_started or event.zone == ZONE_FRAME:
+            if Int64(event.ended - self.frame_started) < 0 or event.zone == ZONE_FRAME:
                 continue
             var depth = depths[event.lane]
             # Going backwards in time, a zone that starts after this one ends is
             # a sibling or a sibling's child, not a parent.
-            while depth > 0 and stacks[event.lane * MAX_DEPTH + depth - 1] >= event.ended:
+            while depth > 0 and Int64(stacks[event.lane * MAX_DEPTH + depth - 1] - event.ended) >= 0:
                 depth -= 1
-            var start_ms = self.to_ms(max(event.started, self.frame_started) - self.frame_started)
+            var clamped_start = event.started if Int64(event.started - self.frame_started) >= 0 else self.frame_started
+            var start_ms = self.to_ms(clamped_start - self.frame_started)
             self.candidate.append(DisplayEvent(event.zone, event.lane, depth, start_ms, self.to_ms(event.ended - self.frame_started)))
             if depth < MAX_DEPTH:
                 stacks[event.lane * MAX_DEPTH + depth] = event.started
@@ -707,8 +709,8 @@ struct ProfileTimeline(Movable):
         if path.byte_length() == 0:
             return
         var owned = path
-        # O_WRONLY | O_CREAT | O_TRUNC, as write_bytes.
-        self.fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 64 | 512), Int32(438)))
+        # O_WRONLY | O_CREAT | O_TRUNC via openat(AT_FDCWD=-100) so we never collide with stdlib `open`.
+        self.fd = Int(external_call["openat", Int32](Int32(-100), owned.as_c_string_span(), Int32(1 | 64 | 512), Int32(438)))
         if self.fd < 0:
             print("PROFILE_FILE_FAILED " + path)
             self.path = String()
@@ -758,9 +760,11 @@ struct ProfileTimeline(Movable):
         self.append_byte(44)
         self.append_string(zone)
         self.append_text(",\"ts\":")
-        self.append_microseconds(started - self.origin if started > self.origin else 0)
+        var ts_ticks = (started - self.origin) if Int64(started - self.origin) >= 0 else UInt64(0)
+        self.append_microseconds(ts_ticks)
         self.append_text(",\"dur\":")
-        self.append_microseconds(ended - started)
+        var dur_ticks = (ended - started) if Int64(ended - started) >= 0 else UInt64(0)
+        self.append_microseconds(dur_ticks)
         if zone == ZONE_FRAME or lane == GPU_LANE:
             self.append_text(",\"args\":{\"frame\":")
             self.append_number(frame)

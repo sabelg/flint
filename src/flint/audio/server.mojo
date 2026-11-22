@@ -58,6 +58,23 @@ comptime MAX_LOGICAL_EMITTERS: Int = 512
 comptime MAX_PHYSICAL_VOICES: Int = 64
 comptime STEAL_XFADE_SAMPLES: Int = 128
 comptime MAX_QUANTUM_FRAMES: Int = 2048
+
+
+@always_inline
+def _sanitize_pitch(p: Float32) -> Float32:
+    if isnan(p) or isinf(p):
+        return Float32(1.0)
+    return max(Float32(0.05), min(Float32(16.0), p))
+
+
+@always_inline
+def _wrap_loop_pos(pos: Float64, total_f: Float64) -> Float64:
+    if total_f <= 0.0 or isnan(pos) or isinf(pos):
+        return 0.0
+    var wrapped = pos - floor(pos / total_f) * total_f
+    if wrapped < 0.0 or wrapped >= total_f or isnan(wrapped):
+        return 0.0
+    return wrapped
 comptime LIMITER_LOOKAHEAD: Int = 64
 comptime WOODWORTH_HEAD_RADIUS_M: Float32 = 0.082  # 8.2 cm -> 29.50 samples @ +90 deg, 48 kHz
 
@@ -1608,8 +1625,8 @@ struct AudioRtEngine(Movable):
                     else:
                         em.pan_2d = cmd.p0
                         em.priority = 2
-                    em.volume = max(Float32(0.0), cmd.p6)
-                    em.pitch = max(Float32(0.05), cmd.p7)
+                    em.volume = max(Float32(0.0), cmd.p6) if not (isnan(cmd.p6) or isinf(cmd.p6)) else Float32(1.0)
+                    em.pitch = _sanitize_pitch(cmd.p7)
                     em.occlusion_gain = 1.0
                     em.occlusion_cutoff_hz = CLEAR_CUTOFF_HZ
                     em.obstruction_factor = 0.0
@@ -1629,10 +1646,10 @@ struct AudioRtEngine(Movable):
                 ):
                     self.emitters[s].pos = Vec3(cmd.p0, cmd.p1, cmd.p2)
                     self.emitters[s].vel = Vec3(cmd.p3, cmd.p4, cmd.p5)
-                    if cmd.p6 >= Float32(0.0):
+                    if cmd.p6 >= Float32(0.0) and not (isnan(cmd.p6) or isinf(cmd.p6)):
                         self.emitters[s].volume = cmd.p6
-                    if cmd.p7 > Float32(0.0):
-                        self.emitters[s].pitch = cmd.p7
+                    if cmd.p7 > Float32(0.0) and not isnan(cmd.p7):
+                        self.emitters[s].pitch = _sanitize_pitch(cmd.p7)
             elif k == ACMD_SET_OCCLUSION:
                 var s = Int(cmd.slot)
                 if (
@@ -2061,12 +2078,10 @@ struct AudioRtEngine(Movable):
             )
             self.emitters[s].virtual_frame_pos += step * Float64(frames)
             if self.emitters[s].looping and asset.total_frames > 0:
-                while self.emitters[s].virtual_frame_pos >= Float64(
-                    asset.total_frames
-                ):
-                    self.emitters[s].virtual_frame_pos -= Float64(
-                        asset.total_frames
-                    )
+                self.emitters[s].virtual_frame_pos = _wrap_loop_pos(
+                    self.emitters[s].virtual_frame_pos,
+                    Float64(asset.total_frames),
+                )
             elif self.emitters[s].virtual_frame_pos >= Float64(
                 asset.total_frames
             ):
@@ -2250,8 +2265,7 @@ struct AudioRtEngine(Movable):
 
                     pos += stp
                     if em.looping and total_f > 0.0:
-                        while pos >= total_f:
-                            pos -= total_f
+                        pos = _wrap_loop_pos(pos, total_f)
 
                 if self.voices[v].steal_xfade_active:
                     var xp = self.voices[v].steal_xfade_pos

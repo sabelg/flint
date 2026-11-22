@@ -617,7 +617,13 @@ struct ContactCache(Copyable, Movable):
         self.clear()
         self.next_id = input.integer()
         var count = input.integer()
-        if count < 0 or count > 1 << 20:
+        var entry_bytes = 80 if version >= 2 else 68
+        if (
+            input.failed
+            or count < 0
+            or count > 1 << 20
+            or count > max(0, input.limit() - input.offset) // entry_bytes
+        ):
             raise Error("contact cache blob lists " + String(count) + " contacts")
         for _ in range(count):
             var a = input.integer()
@@ -635,11 +641,18 @@ struct ContactCache(Copyable, Movable):
         self._entries_dirty = False
         self._rebuild_entry_index(0)
         var pairs = input.integer()
-        if pairs < 0 or pairs > 1 << 20:
+        if (
+            input.failed
+            or pairs < 0
+            or pairs > 1 << 20
+            or pairs > max(0, input.limit() - input.offset) // 16
+        ):
             raise Error("contact cache blob lists " + String(pairs) + " touching pairs")
         for _ in range(pairs):
             self.touching_a.append(input.integer())
             self.touching_b.append(input.integer())
+        if input.failed:
+            raise Error("corrupted contact cache blob")
 
 
 @always_inline

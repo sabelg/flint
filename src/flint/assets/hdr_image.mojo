@@ -238,7 +238,10 @@ def _parse_int_decimal(s: String) -> Int:
     for i in range(len(sb)):
         var b = Int(sb[i])
         if b >= 48 and b <= 57:
-            v = v * 10 + (b - 48)
+            var d = b - 48
+            if v > (0x7FFFFFFFFFFFFFFF - d) // 10:
+                return -1
+            v = v * 10 + d
             has_d = True
     return v if has_d else -1
 
@@ -300,7 +303,11 @@ def decode_radiance_hdr(data: List[UInt8]) -> HdrImage:
             height = val
         elif len(ab) >= 2 and (ab[1] == 88 or ab[1] == 120):  # 'X' / 'x'
             width = val
-    if width <= 0 or height <= 0 or width * height > 33_554_432:
+    if width <= 0 or height <= 0 or width > 33_554_432 or height > 33_554_432 or width > 33_554_432 // height:
+        return img^
+    var rem_bytes = n - pos
+    var min_scan_bytes = (4 + 8 * ((width + 126) // 127)) if (width >= 8 and width <= 0x7FFF) else (width * 4)
+    if height > rem_bytes // min_scan_bytes:
         return img^
 
     img.width = width
@@ -397,7 +404,7 @@ def _exr_rle_uncompress(data: List[UInt8], start: Int, packed_sz: Int, expected_
     var end = start + packed_sz
     if start < 0 or packed_sz < 0 or end > len(data) or expected_out < 0:
         return (False, empty^)
-    var out = List[UInt8](capacity=expected_out)
+    var out = List[UInt8](capacity=min(expected_out, 1 << 20))
     var p = start
     while p < end:
         var c = Int(bitcast[DType.int8](data[p]))
@@ -490,6 +497,8 @@ def _exr_huf_uncompress(
 ) -> Tuple[Bool, List[UInt16]]:
     """OpenEXR canonical MSB-first Huffman decoder (PIZ & DWA `AC_STATIC_HUFFMAN`)."""
     var empty = List[UInt16]()
+    if n_raw_u16 < 0:
+        return (False, empty^)
     if huf_len == 0:
         if n_raw_u16 == 0:
             return (True, empty^)
@@ -593,7 +602,7 @@ def _exr_huf_uncompress(
     var data_end = data_start + (n_bits + 7) // 8
     var dbr = _ExrMsbReader(data, data_start, data_end)
     var bits_left = n_bits
-    var out = List[UInt16](capacity=n_raw_u16)
+    var out = List[UInt16](capacity=min(n_raw_u16, 1 << 20))
     var rle_sym = iM
 
     while bits_left > 0 and len(out) < n_raw_u16 and dbr.valid:
@@ -1140,20 +1149,73 @@ def _exr_decode_dwa_block(
             else:
                 ch_scheme[ci] = 0; ch_csc[ci] = -1
 
-    if p + unknown_comp_sz + ac_comp_sz + dc_comp_sz + rle_comp_sz > data_end:
+    var avail = data_end - p
+    if (
+        unknown_comp_sz > avail
+        or ac_comp_sz > avail - unknown_comp_sz
+        or dc_comp_sz > avail - unknown_comp_sz - ac_comp_sz
+        or rle_comp_sz > avail - unknown_comp_sz - ac_comp_sz - dc_comp_sz
+    ):
         return False
     if unknown_uncomp_sz > 0 and unknown_comp_sz <= 0:
         return False
+    if unknown_comp_sz > 0 and unknown_uncomp_sz <= 0:
+        return False
     if total_ac_cnt > 0 and ac_comp_sz <= 0:
+        return False
+    if ac_comp_sz > 0 and total_ac_cnt <= 0:
         return False
     if total_dc_cnt > 0 and dc_comp_sz <= 0:
         return False
+    if dc_comp_sz > 0 and total_dc_cnt <= 0:
+        return False
     if (rle_raw_sz > 0 or rle_uncomp_sz > 0) and rle_comp_sz <= 0:
         return False
+    if rle_comp_sz > 0 and (rle_uncomp_sz <= 0 or rle_raw_sz <= 0):
+        return False
+
+    if bw <= 0 or bh <= 0 or n_ch <= 0 or expected_raw <= 0:
+        return False
+
+    var unk_expected = 0
+    var rle_expected = 0
+    var n_dct = 0
+    for ci in range(n_ch):
+        if ch_scheme[ci] == 0:
+            unk_expected += bw * bh * ch_byte_sizes[ci]
+        elif ch_scheme[ci] == 1:
+            n_dct += 1
+        elif ch_scheme[ci] == 2:
+            rle_expected += bw * bh * ch_byte_sizes[ci]
+
+    if unknown_uncomp_sz > unk_expected:
+        return False
+    if rle_raw_sz > rle_expected:
+        return False
+    if rle_uncomp_sz > rle_raw_sz * 2 + 16:
+        return False
+
+    var nbx = (bw + 7) // 8
+    var nby = (bh + 7) // 8
+    var n_blocks = nbx * nby
+    comptime DWA_MAX_STREAM_BYTES: Int = 128 * 1024 * 1024
+    var max_u16_limit = DWA_MAX_STREAM_BYTES // 2
+    if n_dct == 0:
+        if total_dc_cnt > 0 or total_ac_cnt > 0:
+            return False
+    else:
+        if n_blocks > max_u16_limit // n_dct:
+            return False
+        if total_dc_cnt != n_dct * n_blocks:
+            return False
+        var max_ac_per_ch = max_u16_limit if n_blocks > max_u16_limit // 64 else 64 * n_blocks
+        var max_ac_cnt = max_u16_limit if max_ac_per_ch > max_u16_limit // n_dct else n_dct * max_ac_per_ch
+        if total_ac_cnt > max_ac_cnt:
+            return False
 
     var unknown_bytes = List[UInt8]()
     if unknown_comp_sz > 0:
-        unknown_bytes = inflate_zlib(data, p, unknown_uncomp_sz)
+        unknown_bytes = inflate_zlib(data, p, unknown_uncomp_sz, unknown_comp_sz)
         if len(unknown_bytes) != unknown_uncomp_sz:
             return False
         p += unknown_comp_sz
@@ -1166,28 +1228,30 @@ def _exr_decode_dwa_block(
                 return False
             ac_u16 = hres[1].copy()
         else:
-            var inf_ac = inflate_zlib(data, p, total_ac_cnt * 2)
+            var inf_ac = inflate_zlib(data, p, total_ac_cnt * 2, ac_comp_sz)
             if len(inf_ac) != total_ac_cnt * 2:
                 return False
-            ac_u16 = List[UInt16](capacity=total_ac_cnt)
+            ac_u16 = List[UInt16](capacity=min(total_ac_cnt, 1 << 20))
             for i in range(total_ac_cnt):
                 ac_u16.append(UInt16(_le_u16(inf_ac, i * 2)))
     p += ac_comp_sz
 
     var dc_u16 = List[UInt16]()
     if total_dc_cnt > 0:
-        var inf_dc = inflate_zlib(data, p, total_dc_cnt * 2)
+        var inf_dc = inflate_zlib(data, p, total_dc_cnt * 2, dc_comp_sz)
         if len(inf_dc) != total_dc_cnt * 2:
             return False
         var raw_dc = _exr_undo_predictor_and_reorder(inf_dc)
-        dc_u16 = List[UInt16](capacity=total_dc_cnt)
+        if len(raw_dc) != total_dc_cnt * 2:
+            return False
+        dc_u16 = List[UInt16](capacity=min(total_dc_cnt, 1 << 20))
         for i in range(total_dc_cnt):
             dc_u16.append(UInt16(_le_u16(raw_dc, i * 2)))
     p += dc_comp_sz
 
     var rle_raw = List[UInt8]()
     if rle_comp_sz > 0:
-        var inf_rle = inflate_zlib(data, p, rle_uncomp_sz)
+        var inf_rle = inflate_zlib(data, p, rle_uncomp_sz, rle_comp_sz)
         if len(inf_rle) != rle_uncomp_sz:
             return False
         var rres = _exr_rle_uncompress(inf_rle, 0, len(inf_rle), rle_raw_sz)
@@ -1197,9 +1261,6 @@ def _exr_decode_dwa_block(
     p += rle_comp_sz
 
     # Build DCT channel block grids
-    var nbx = (bw + 7) // 8
-    var nby = (bh + 7) // 8
-    var n_blocks = nbx * nby
     var dct_ch_indices = List[Int]()
     for ci in range(n_ch):
         if ch_scheme[ci] == 1:
@@ -1399,10 +1460,16 @@ def _exr_decode_chunk_into(
     dst_y0: Int,
     mut img: HdrImage,
 ) -> Bool:
-    var bytes_per_pixel_row = 0
+    if bw <= 0 or bh <= 0 or len(ch_types) == 0:
+        return False
+    comptime EXR_MAX_CHUNK_BYTES: Int = 128 * 1024 * 1024
+    var bytes_per_pixel = 0
     for ci in range(len(ch_types)):
-        bytes_per_pixel_row += ch_byte_sizes[ci] * bw
-    var expected_raw = bh * bytes_per_pixel_row
+        bytes_per_pixel += ch_byte_sizes[ci]
+    var px_cnt = bw * bh
+    if bytes_per_pixel <= 0 or px_cnt <= 0 or bytes_per_pixel > EXR_MAX_CHUNK_BYTES // px_cnt:
+        return False
+    var expected_raw = px_cnt * bytes_per_pixel
 
     if compression == EXR_PIZ_COMPRESSION:
         return _exr_decode_piz_block(
@@ -1426,15 +1493,14 @@ def _exr_decode_chunk_into(
             return False
         raw_block = _exr_undo_predictor_and_reorder(rres[1])
     else:
-        if packed_sz >= expected_raw:
-            raw_block = List[UInt8](length=expected_raw, fill=0)
-            for k in range(expected_raw):
-                raw_block[k] = data[data_start + k]
-        else:
-            var inflated = inflate_zlib(data, data_start, expected_raw)
-            if len(inflated) != expected_raw:
-                return False
-            raw_block = _exr_undo_predictor_and_reorder(inflated)
+        if compression != EXR_ZIPS_COMPRESSION and compression != EXR_ZIP_COMPRESSION:
+            return False
+        if packed_sz <= 0:
+            return False
+        var inflated = inflate_zlib(data, data_start, expected_raw, packed_sz)
+        if len(inflated) != expected_raw:
+            return False
+        raw_block = _exr_undo_predictor_and_reorder(inflated)
 
     var r_cursor = 0
     for ly in range(bh):
@@ -1541,7 +1607,7 @@ def decode_exr_fp16(data: List[UInt8]) -> HdrImage:
         or len(ch_names) == 0
         or width > 33_554_432
         or height > 33_554_432
-        or width * height > 33_554_432
+        or width > 33_554_432 // height
     ):
         return img^
     if (
@@ -1582,10 +1648,6 @@ def decode_exr_fp16(data: List[UInt8]) -> HdrImage:
         else:
             ch_rgb_role.append(-1)
 
-    img.width = width
-    img.height = height
-    img.pixels = List[Vec3](length=width * height, fill=Vec3(0.0, 0.0, 0.0))
-
     if is_tiled:
         var ntx0 = (width + tile_x - 1) // tile_x
         var nty0 = (height + tile_y - 1) // tile_y
@@ -1611,26 +1673,32 @@ def decode_exr_fp16(data: List[UInt8]) -> HdrImage:
                     var lw = _exr_level_size(width, lx, rounding_mode)
                     n_chunks += ((lw + tile_x - 1) // tile_x) * nty
 
-        if n_chunks <= 0 or pos + n_chunks * 8 > n:
+        if n_chunks <= 0 or n_chunks > (n - pos) // 8:
             return HdrImage()
         var offsets = List[Int](capacity=n_chunks)
         for c_idx in range(n_chunks):
-            offsets.append(_le_u64(data, pos + c_idx * 8))
+            var c_off = _le_u64(data, pos + c_idx * 8)
+            if c_off < 0 or c_off > n - 20:
+                return HdrImage()
+            var packed_sz = _le_i32(data, c_off + 16)
+            if packed_sz < 0 or packed_sz > n - (c_off + 20):
+                return HdrImage()
+            offsets.append(c_off)
+
+        img.width = width
+        img.height = height
+        img.pixels = List[Vec3](length=width * height, fill=Vec3(0.0, 0.0, 0.0))
 
         var seen_l0 = List[Bool](length=expected_l0_tiles, fill=False)
         var l0_decoded = 0
         for c_idx in range(n_chunks):
             var c_off = offsets[c_idx]
-            if c_off < 0 or c_off + 20 > n:
-                return HdrImage()
             var tx_idx = _le_i32(data, c_off)
             var ty_idx = _le_i32(data, c_off + 4)
             var lx = _le_i32(data, c_off + 8)
             var ly = _le_i32(data, c_off + 12)
             var packed_sz = _le_i32(data, c_off + 16)
             var data_start = c_off + 20
-            if packed_sz < 0 or data_start + packed_sz > n:
-                return HdrImage()
             if lx < 0 or ly < 0:
                 return HdrImage()
             if lx != 0 or ly != 0:
@@ -1665,25 +1733,31 @@ def decode_exr_fp16(data: List[UInt8]) -> HdrImage:
         lines_per_block = 256
 
     var num_blocks = (height + lines_per_block - 1) // lines_per_block
-    if pos + num_blocks * 8 > n:
+    if num_blocks <= 0 or num_blocks > (n - pos) // 8:
         return img^
 
     var offsets = List[Int](capacity=num_blocks)
     for b_idx in range(num_blocks):
-        offsets.append(_le_u64(data, pos + b_idx * 8))
+        var c_off = _le_u64(data, pos + b_idx * 8)
+        if c_off < 0 or c_off > n - 8:
+            return HdrImage()
+        var packed_sz = _le_i32(data, c_off + 4)
+        if packed_sz < 0 or packed_sz > n - (c_off + 8):
+            return HdrImage()
+        offsets.append(c_off)
+
+    img.width = width
+    img.height = height
+    img.pixels = List[Vec3](length=width * height, fill=Vec3(0.0, 0.0, 0.0))
 
     var seen_rows = List[Bool](length=height, fill=False)
     var blocks_decoded = 0
     var rows_decoded = 0
     for b_idx in range(num_blocks):
         var c_off = offsets[b_idx]
-        if c_off < 0 or c_off + 8 > n:
-            return HdrImage()
         var y_coord = _le_i32(data, c_off)
         var packed_sz = _le_i32(data, c_off + 4)
         var data_start = c_off + 8
-        if packed_sz < 0 or data_start + packed_sz > n:
-            return HdrImage()
 
         var rel_y0 = y_coord - y_min
         var block_lines = min(lines_per_block, height - rel_y0)

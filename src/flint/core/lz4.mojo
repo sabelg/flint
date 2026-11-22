@@ -249,6 +249,8 @@ def lz4_compress(data: List[UInt8]) -> List[UInt8]:
 def lz4_decompress(block: List[UInt8], raw_size: Int) -> List[UInt8]:
     """The decoded block, or an empty list if it is damaged or does not decode
     to exactly `raw_size` bytes."""
+    if raw_size <= 0:
+        return List[UInt8]()
     var out = List[UInt8](capacity=raw_size + 1)
     out.resize(unsafe_uninit_length=raw_size)
     var used = lz4_decompress_into(address_of(block), len(block), address_of(out), raw_size)

@@ -405,30 +405,93 @@ struct _StageGraph(Movable):
             self.dirty = False
             return
 
-        # Reachability bitmatrix (n x n booleans) to prune redundant transitive edges
-        # while strictly respecting registration-order R/W & W/W & explicit dependencies.
-        var reach = List[Bool](length=n * n, fill=False)
+        # Step 1: Build combined dependency graph over 0..n-1 with explicit dependencies taking
+        # precedence and registration-order R/W & W/W conflict edges included before topological sort.
+        var explicit_adj = List[List[Int]](capacity=n)
+        var indegree = List[Int](length=n, fill=0)
+        var step1_reach = List[Bool](length=n * n, fill=False)
         for i in range(n):
+            explicit_adj.append(List[Int]())
             self.compiled_nodes.append(_CompiledNode(i))
 
         for j in range(n):
-            # Walk predecessors i = j - 1 down to 0 so nearest conflicts establish reachability first
-            var i = j - 1
-            while i >= 0:
+            for k in range(len(self.systems[j].explicit_after)):
+                var target_id = self.systems[j].explicit_after[k]
+                for i in range(n):
+                    if i != j and self.systems[i].id == target_id:
+                        var dup = False
+                        for e in range(len(explicit_adj[i])):
+                            if explicit_adj[i][e] == j:
+                                dup = True
+                                break
+                        if not dup:
+                            explicit_adj[i].append(j)
+                            indegree[j] += 1
+                            step1_reach[i * n + j] = True
+                        break
+
+        # Transitive closure of explicit edges so conflict edges never reverse or cycle against them.
+        for mid in range(n):
+            for u in range(n):
+                if step1_reach[u * n + mid]:
+                    for v in range(n):
+                        if step1_reach[mid * n + v]:
+                            step1_reach[u * n + v] = True
+
+        # Add registration-order conflict edges (i < j) unless j is already ordered before i.
+        for i in range(n):
+            for j in range(i + 1, n):
+                if Self._conflicts(self.systems[i], self.systems[j]):
+                    if not step1_reach[j * n + i] and not step1_reach[i * n + j]:
+                        explicit_adj[i].append(j)
+                        indegree[j] += 1
+                        for u in range(n):
+                            if u == i or step1_reach[u * n + i]:
+                                for v in range(n):
+                                    if v == j or step1_reach[j * n + v]:
+                                        step1_reach[u * n + v] = True
+
+        var order = List[Int](capacity=n)
+        var placed = List[Bool](length=n, fill=False)
+        for _ in range(n):
+            var picked = -1
+            for cand in range(n):
+                if not placed[cand] and indegree[cand] == 0:
+                    picked = cand
+                    break
+            if picked < 0:
+                break
+            placed[picked] = True
+            order.append(picked)
+            for e in range(len(explicit_adj[picked])):
+                var nxt = explicit_adj[picked][e]
+                indegree[nxt] -= 1
+        if len(order) < n:
+            for cand in range(n):
+                if not placed[cand]:
+                    order.append(cand)
+
+        # Step 2: Reachability bitmatrix (n x n booleans) in topological order to prune redundant
+        # transitive edges while respecting explicit dependencies and R/W & W/W conflicts.
+        var reach = List[Bool](length=n * n, fill=False)
+        for oj in range(n):
+            var j = order[oj]
+            var oi = oj - 1
+            while oi >= 0:
+                var i = order[oi]
                 var must_order = Self._conflicts(self.systems[i], self.systems[j])
                 if not must_order:
                     for k in range(len(self.systems[j].explicit_after)):
                         if self.systems[j].explicit_after[k] == self.systems[i].id:
                             must_order = True
                             break
-                if must_order and not reach[i * n + j]:
+                if must_order and not reach[oi * n + oj]:
                     self.compiled_nodes[i].dependents.append(j)
-                    reach[i * n + j] = True
-                    # Propagate ancestors of i -> j
-                    for anc in range(i):
-                        if reach[anc * n + i]:
-                            reach[anc * n + j] = True
-                i -= 1
+                    reach[oi * n + oj] = True
+                    for o_anc in range(oi):
+                        if reach[o_anc * n + oi]:
+                            reach[o_anc * n + oj] = True
+                oi -= 1
 
         # Automatic JobPool MAX_DEPENDENTS = 16 zero-chunk relay node splitting:
         # Whenever any node u has > MAX_DEPENDENTS (16) outgoing dependents, keep the first

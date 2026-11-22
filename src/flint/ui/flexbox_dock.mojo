@@ -601,6 +601,7 @@ struct DockSpace(Copyable, Movable):
     def solve_layout(mut self, root_rect: RectF):
         if self.root < 0 or self.root >= len(self.nodes):
             return
+        var visited = List[Bool](length=len(self.nodes), fill=False)
         var stack_id = List[Int]()
         var stack_rect = List[RectF]()
         stack_id.append(self.root)
@@ -608,8 +609,9 @@ struct DockSpace(Copyable, Movable):
         while len(stack_id) > 0:
             var node_id = stack_id.pop()
             var rect = stack_rect.pop()
-            if node_id < 0 or node_id >= len(self.nodes):
+            if node_id < 0 or node_id >= len(self.nodes) or visited[node_id]:
                 continue
+            visited[node_id] = True
             self.nodes[node_id].rect = rect
             var k = self.nodes[node_id].kind
             if k == DOCK_SPLIT_H:
@@ -633,12 +635,14 @@ struct DockSpace(Copyable, Movable):
         var out = List[RectF]()
         if self.root < 0 or self.root >= len(self.nodes):
             return out^
+        var visited = List[Bool](length=len(self.nodes), fill=False)
         var stack = List[Int]()
         stack.append(self.root)
         while len(stack) > 0:
             var node_id = stack.pop()
-            if node_id < 0 or node_id >= len(self.nodes):
+            if node_id < 0 or node_id >= len(self.nodes) or visited[node_id]:
                 continue
+            visited[node_id] = True
             var k = self.nodes[node_id].kind
             if k == DOCK_SPLIT_H or k == DOCK_SPLIT_V:
                 stack.append(self.nodes[node_id].child_b)
@@ -780,9 +784,60 @@ struct DockSpace(Copyable, Movable):
                     dn.tabs.append(doc.text(doc.at(tabs_arr, ti), ""))
             parsed_nodes.append(dn^)
 
+        var root_idx = doc.integer(root_node, 0 if len(parsed_nodes) > 0 else -1)
+        var n_nodes = len(parsed_nodes)
+        if n_nodes == 0:
+            if root_idx != -1:
+                return False
+        else:
+            if root_idx < 0 or root_idx >= n_nodes:
+                return False
+            for i in range(n_nodes):
+                ref pn = parsed_nodes[i]
+                if pn.child_a < -1 or pn.child_a >= n_nodes or pn.child_b < -1 or pn.child_b >= n_nodes:
+                    return False
+                if pn.kind == DOCK_SPLIT_H or pn.kind == DOCK_SPLIT_V:
+                    if pn.child_a < 0 or pn.child_b < 0 or pn.child_a == pn.child_b:
+                        return False
+            var color = List[Int](length=n_nodes, fill=0)  # 0=unvisited, 1=visiting, 2=done
+            var dfs_node = List[Int]()
+            var dfs_exit = List[Bool]()
+            for start in range(n_nodes):
+                if color[start] != 0:
+                    continue
+                dfs_node.append(start)
+                dfs_exit.append(False)
+                while len(dfs_node) > 0:
+                    var u = dfs_node.pop()
+                    var exiting = dfs_exit.pop()
+                    if exiting:
+                        color[u] = 2
+                        continue
+                    if color[u] == 1:
+                        return False
+                    if color[u] == 2:
+                        continue
+                    color[u] = 1
+                    dfs_node.append(u)
+                    dfs_exit.append(True)
+                    var ca = parsed_nodes[u].child_a
+                    var cb = parsed_nodes[u].child_b
+                    if ca >= 0:
+                        if color[ca] == 1:
+                            return False
+                        if color[ca] == 0:
+                            dfs_node.append(ca)
+                            dfs_exit.append(False)
+                    if cb >= 0:
+                        if color[cb] == 1:
+                            return False
+                        if color[cb] == 0:
+                            dfs_node.append(cb)
+                            dfs_exit.append(False)
+
         self.clear()
         self.nodes = parsed_nodes^
-        self.root = doc.integer(root_node, 0 if len(self.nodes) > 0 else -1)
+        self.root = root_idx
         if hh_node >= 0:
             self.header_height = Float32(doc.number(hh_node, 24.0))
         return True

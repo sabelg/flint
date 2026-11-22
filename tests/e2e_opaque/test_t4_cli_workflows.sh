@@ -46,7 +46,7 @@ fail_step() {
 }
 
 # Resolve build/<bin_name> only if executable AND newer than both examples/<subdir>/main.mojo
-# and all src/flint/**/*.mojo; otherwise compile into $TMPD/bin/<bin_name>.
+# and all src/flint/**/*.mojo (excluding build_stamp.mojo); otherwise compile into $TMPD/bin/<bin_name>.
 resolve_bin() {
     local bin_name="$1"
     local example_subdir="$2"
@@ -54,7 +54,7 @@ resolve_bin() {
     local src="${ROOT}/examples/${example_subdir}/main.mojo"
     if [[ -x "${ROOT}/build/${bin_name}" && -f "$src" && ! "$src" -nt "${ROOT}/build/${bin_name}" ]]; then
         local newer_src=""
-        newer_src="$(find "${ROOT}/src/flint" -type f -name '*.mojo' -newer "${ROOT}/build/${bin_name}" -print -quit 2>/dev/null || true)"
+        newer_src="$(find "${ROOT}/src/flint" -type f -name '*.mojo' ! -name 'build_stamp.mojo' -newer "${ROOT}/build/${bin_name}" -print -quit 2>/dev/null || true)"
         if [[ -z "$newer_src" ]]; then
             RESOLVED_BIN="${ROOT}/build/${bin_name}"
             return 0
@@ -354,7 +354,7 @@ flags, count, toc_off, uuid_off, path_off, hcap, str_bytes, total_bytes, _toc_cr
     "<IIQQQIIQQ", data, 8
 )
 assert count >= 3, f"expected >= 3 entries in bundle, got {count}"
-assert 64 <= total_bytes <= len(data), f"bad total_file_bytes={total_bytes} vs len={len(data)}"
+assert total_bytes >= 64 and total_bytes == len(data), f"bad total_file_bytes={total_bytes} vs len={len(data)}"
 assert toc_off >= 64 and toc_off + count * 64 <= total_bytes, "bad toc_off"
 assert hcap >= count and (hcap & (hcap - 1)) == 0, f"bad hcap={hcap}"
 str_off = path_off + hcap * 16
@@ -409,11 +409,19 @@ def parse_cl_frames(buf):
             sep_len = 2
         assert sep >= 0, f"missing Content-Length separator at {pos}: {buf[pos:pos+80]!r}"
         hdr = buf[pos:sep].decode("ascii")
+        lines = hdr.splitlines()
+        assert len(lines) >= 1, f"empty header block at {pos}"
         cl = None
-        for line in hdr.splitlines():
-            if line.lower().startswith("content-length:"):
+        for line in lines:
+            low = line.lower()
+            if low.startswith("content-length:"):
+                assert cl is None, f"duplicate Content-Length header in {hdr!r}"
                 cl = int(line.split(":", 1)[1].strip())
-        assert cl is not None, f"missing Content-Length header in {hdr!r}"
+            elif low.startswith("content-type:"):
+                pass
+            else:
+                raise AssertionError(f"unexpected header line in MCP frame: {line!r} (full={hdr!r})")
+        assert cl is not None and cl >= 0, f"missing/invalid Content-Length header in {hdr!r}"
         body_start = sep + sep_len
         body_end = body_start + cl
         assert body_end <= len(buf), f"truncated body at {pos}"
@@ -467,16 +475,17 @@ for fname in ("assets/orb.glb", "cap_a.png", "cap_b.png", "assets.flpk"):
     fpath = os.path.join(mcp_ws, fname)
     assert os.path.isfile(fpath) and os.path.getsize(fpath) > 0, f"missing or empty {fpath}"
 
-for png_name in ("cap_a.png", "cap_b.png"):
-    pdata = open(os.path.join(mcp_ws, png_name), "rb").read()
-    assert pdata[:8] == b"\x89PNG\r\n\x1a\n", f"bad PNG magic in {png_name}"
-    w, h = struct.unpack(">II", pdata[16:24])
-    assert (w, h) == (128, 96), f"unexpected dims {w}x{h} in {png_name}"
-
 flpk_data = open(os.path.join(mcp_ws, "assets.flpk"), "rb").read()
 assert flpk_data[:4] == b"FLPK", f"bad FLPK magic in assets.flpk: {flpk_data[:4]!r}"
 PY
 )"; then
+        local png_name
+        for png_name in cap_a.png cap_b.png; do
+            if ! py_err="$(validate_png_dims "${mcp_ws}/${png_name}" 128 96)"; then
+                fail_step "t4_cli_s6_mcp_stdio_session" "${png_name} PNG validation failed: ${py_err}"
+                return
+            fi
+        done
         pass_step "t4_cli_s6_mcp_stdio_session"
     else
         fail_step "t4_cli_s6_mcp_stdio_session" "${py_err}"

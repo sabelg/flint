@@ -458,7 +458,7 @@ struct CompoundShape(Copyable, Movable):
         _ = r.enter(COMPOUND_BLOB_TAG, SHAPES_V5_BLOB_VERSION)
         var out = CompoundShape()
         var n_ch = r.integer()
-        if n_ch < 0 or n_ch > 4096:
+        if r.failed or n_ch < 0 or n_ch > 4096 or n_ch > max(0, r.limit() - r.offset) // 76:
             raise Error("compound blob: invalid child count")
         for _ in range(n_ch):
             var ch = CompoundChild()
@@ -470,13 +470,20 @@ struct CompoundShape(Copyable, Movable):
             ch.half_extents = r.vec3()
             ch.density_scale = r.f32()
             var nv = r.integer()
-            var verts = List[Vec3](capacity=max(0, nv))
+            if r.failed or nv < 0 or nv > (1 << 20) or nv > max(0, r.limit() - r.offset) // 12:
+                raise Error("compound blob: invalid vertex count")
+            var verts = List[Vec3](capacity=nv)
             for _ in range(nv):
                 verts.append(r.vec3())
             var ni = r.integer()
-            var idxs = List[Int32](capacity=max(0, ni))
+            if r.failed or ni < 0 or ni > (1 << 20) or ni > max(0, r.limit() - r.offset) // 8:
+                raise Error("compound blob: invalid index count")
+            var idxs = List[Int32](capacity=ni)
             for _ in range(ni):
-                idxs.append(Int32(r.integer()))
+                var idx = r.integer()
+                if r.failed or idx < 0 or idx >= nv:
+                    raise Error("compound blob: invalid hull vertex index")
+                idxs.append(Int32(idx))
             ch.hull = ConvexHull(verts, idxs)
             out.children.append(ch^)
         r.leave()

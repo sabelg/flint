@@ -291,8 +291,9 @@ struct CyclesEngine(Movable):
     var max_voices: Int
 
     def __init__(out self, sample_rate: Int = 48000):
-        self.sample_rate = sample_rate
-        self.sr = Float32(sample_rate)
+        var sr_safe = 48000 if sample_rate <= 0 else min(sample_rate, 384000)
+        self.sample_rate = sr_safe
+        self.sr = Float32(sr_safe)
         self.program = Program()
         self.cps = 0.5625
         self.cps_frac = Frac.from_float(0.5625)
@@ -301,8 +302,8 @@ struct CyclesEngine(Movable):
         self.voices = List[Voice]()
         self.bank = SampleBank()
         self.reverb = StereoReverbFDN(0.82, 0.32)
-        self.delay_l = List[Float32](length=sample_rate * 2, fill=0.0)
-        self.delay_r = List[Float32](length=sample_rate * 2, fill=0.0)
+        self.delay_l = List[Float32](length=sr_safe * 2, fill=0.0)
+        self.delay_r = List[Float32](length=sr_safe * 2, fill=0.0)
         self.delay_idx = 0
         self.delay_time = 0.375
         self.delay_fb = 0.45
@@ -320,14 +321,17 @@ struct CyclesEngine(Movable):
         return self.cycle_at(self.frames_since)
 
     def set_cps(mut self, cps: Float64):
-        if cps <= 0:
+        if not (cps > 0.0 and cps < 1.0e6):
+            return
+        var next_frac = Frac.from_float(cps)
+        if next_frac.num <= 0 or next_frac.den <= 0:
             return
         # Re-anchor the clock so the cycle position is continuous.
         var here = self.now()
         self.base_cycle = Frac.make128(Int128(here.num) * Int128(1 << 20) // Int128(here.den), Int128(1 << 20))
         self.frames_since = 0
         self.cps = cps
-        self.cps_frac = Frac.from_float(cps)
+        self.cps_frac = next_frac
 
     def load_program(mut self, var prog: Program) -> Bool:
         """Install an already-parsed `Program` (for RT-safe off-thread parsing)."""
@@ -381,16 +385,29 @@ struct CyclesEngine(Movable):
         var v = Voice(kind)
         v.wait = offset
         v.noise_seed = Int(ev.whole_b.num * 7919 + ev.whole_b.den * 104729 + self.events_played * 31)
-        var gain = Float32(p.get(P_GAIN, 1.0))
+        var gain_raw = p.get(P_GAIN, 1.0)
+        var gain = Float32(gain_raw) if gain_raw == gain_raw else Float32(1.0)
+        gain = Float32(16.0) if gain > Float32(16.0) else max(Float32(0.0), gain)
         v.amp = gain * gain * 0.42
-        var pan = Float32(p.get(P_PAN, 0.5))
+        var pan_raw = p.get(P_PAN, 0.5)
+        var pan = Float32(pan_raw) if pan_raw == pan_raw else Float32(0.5)
+        pan = Float32(1.0) if pan > Float32(1.0) else max(Float32(0.0), pan)
         var g = equal_power_gains(pan * 2.0 - 1.0)
         v.gain_l = g[0]
         v.gain_r = g[1]
-        v.room = Float32(p.get(P_ROOM, 0.0))
-        v.delay_send = Float32(p.get(P_DELAY, 0.0))
-        v.shape = Float32(max(0.0, min(0.99, p.get(P_SHAPE, 0.0))))
-        v.crush = Float32(p.get(P_CRUSH, 0.0))
+        var room_raw = p.get(P_ROOM, 0.0)
+        var room_f = Float32(room_raw) if room_raw == room_raw else Float32(0.0)
+        v.room = Float32(4.0) if room_f > Float32(4.0) else max(Float32(0.0), room_f)
+        var del_raw = p.get(P_DELAY, 0.0)
+        var del_f = Float32(del_raw) if del_raw == del_raw else Float32(0.0)
+        v.delay_send = Float32(4.0) if del_f > Float32(4.0) else max(Float32(0.0), del_f)
+        var shape_raw = p.get(P_SHAPE, 0.0)
+        var shape_f = shape_raw if shape_raw == shape_raw else 0.0
+        v.shape = Float32(max(0.0, min(0.99, shape_f)))
+        var crush_raw = p.get(P_CRUSH, 0.0)
+        v.crush = Float32(crush_raw) if (crush_raw == crush_raw and crush_raw > 0.0) else Float32(0.0)
+        if v.crush > Float32(32.0):
+            v.crush = Float32(32.0)
         v.coarse = Int(p.get(P_COARSE, 0.0))
         if p.has(P_SIZE):
             self.reverb.feedback = Float32(0.55 + 0.38 * max(0.0, min(1.0, p.vals[P_SIZE])))
@@ -411,6 +428,9 @@ struct CyclesEngine(Movable):
         var note = p.get(P_NOTE, 0.0)
         if kind >= VK_SINE or kind == VK_BELL or kind == VK_TIMPANI:
             note += n_val
+        if note != note:
+            note = 0.0
+        note = max(-120.0, min(120.0, note))
         var ratio = Float32(2.0 ** (note / 12.0))
         v.freq = Float32(261.6256) * ratio
         var sr = self.sr
@@ -675,9 +695,10 @@ struct CyclesEngine(Movable):
         if v.shape > 0:
             var drive = Float32(1) + v.shape * 10
             x = soft_clip_tanh(x * drive) / soft_clip_tanh(drive) * 0.9
-        if v.crush > 0:
-            var steps = Float32(2.0) ** max(Float32(1), v.crush - 1)
-            x = floor(x * steps + 0.5) / steps
+        if v.crush > 0 and v.crush == v.crush:
+            var crush_c = Float32(32.0) if v.crush > Float32(32.0) else max(Float32(1.0), v.crush)
+            var steps = Float32(2.0) ** (crush_c - Float32(1.0))
+            x = floor(x * steps + Float32(0.5)) / steps
         if v.coarse > 1:
             if v.t % v.coarse == 0:
                 v.held = x
@@ -687,24 +708,28 @@ struct CyclesEngine(Movable):
         if v.use_hp:
             _ = v.hp.process(x)
             x = v.hp.hp
-        return x * v.amp
+        var out_s = x * v.amp
+        return out_s if out_s == out_s else Float32(0.0)
 
     def render(mut self, frames: Int) -> List[Float32]:
         """Schedule the events starting in the next `frames` and mix them.
         Returns interleaved stereo floats."""
+        if frames <= 0:
+            return List[Float32]()
         var begin = self.now()
         var end = self.cycle_at(self.frames_since + frames)
         var span = (end - begin).to_float()
         var roots = List[Int]()
         for t in self.program.tracks:
             roots.append(t.root)
-        for root in roots:
-            var evs = self.program.pat.query_node(root, begin, end)
-            for i in range(len(evs)):
-                if not evs[i].has_onset():
-                    continue
-                var off = Int((evs[i].whole_b - begin).to_float() / span * Float64(frames))
-                self.spawn(evs[i], max(0, min(frames - 1, off)))
+        if span > 0.0:
+            for root in roots:
+                var evs = self.program.pat.query_node(root, begin, end)
+                for i in range(len(evs)):
+                    if not evs[i].has_onset():
+                        continue
+                    var off = Int((evs[i].whole_b - begin).to_float() / span * Float64(frames))
+                    self.spawn(evs[i], max(0, min(frames - 1, off)))
         var out = List[Float32](length=frames * 2, fill=0.0)
         var send_l = List[Float32](length=frames, fill=0.0)
         var send_r = List[Float32](length=frames, fill=0.0)
@@ -735,6 +760,8 @@ struct CyclesEngine(Movable):
                 self.voices[vi] = v^
                 vi += 1
         var dlen = len(self.delay_l)
+        if dlen <= 0:
+            return out^
         var dframes = max(1, min(dlen - 1, Int(self.delay_time * self.sr)))
         for f in range(frames):
             var wet = self.reverb.process_send(send_l[f], send_r[f])
@@ -750,6 +777,8 @@ struct CyclesEngine(Movable):
         return out^
 
     def render_i16(mut self, frames: Int) -> List[Int16]:
+        if frames <= 0:
+            return List[Int16]()
         var f = self.render(frames)
         var out = List[Int16](capacity=len(f))
         for i in range(len(f)):
@@ -796,6 +825,8 @@ def encode_wav16(samples: List[Int16], sample_rate: Int, channels: Int = 2) -> L
 
 def render_to_wav(code: String, seconds: Float64, path: String, sample_rate: Int = 48000) raises -> Int:
     """Offline render of a Tidal program; returns events played."""
+    if not (seconds > 0.0) or sample_rate <= 0:
+        return 0
     var engine = CyclesEngine(sample_rate)
     var errs = engine.load(code)
     if len(errs) > 0:
@@ -804,6 +835,8 @@ def render_to_wav(code: String, seconds: Float64, path: String, sample_rate: Int
             msg += "\n  " + e
         raise Error(msg)
     var total = Int(seconds * Float64(sample_rate))
+    if total <= 0:
+        return 0
     var pcm = List[Int16](capacity=total * 2)
     var done = 0
     while done < total:
@@ -822,6 +855,8 @@ def render_loop_to_wav(code: String, cycles: Int, path: String, sample_rate: Int
     """Render exactly `cycles` cycles as a seamless loop: one warm-up pass is
     rendered and thrown away, so the reverb/delay tails that wrap around the
     loop point are already in the captured pass. Returns the frame count."""
+    if cycles <= 0 or sample_rate <= 0:
+        return 0
     var engine = CyclesEngine(sample_rate)
     var errs = engine.load(code)
     if len(errs) > 0:
@@ -833,8 +868,12 @@ def render_loop_to_wav(code: String, cycles: Int, path: String, sample_rate: Int
     var stop = Frac.of(cycles * 2)
     # warm-up: render up to the frame where cycle `cycles` begins
     var cps = engine.cps_frac
+    if cps.num <= 0 or cps.den <= 0:
+        return 0
     var warm = Int((start / cps).to_float() * Float64(sample_rate) + 0.5)
     var loop_frames = Int(((stop - start) / cps).to_float() * Float64(sample_rate) + 0.5)
+    if warm < 0 or loop_frames <= 0:
+        return 0
     var done = 0
     while done < warm:
         var n = min(512, warm - done)

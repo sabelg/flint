@@ -108,6 +108,10 @@ struct GpuMatmul(Movable):
         var found = self.weights.get(key)
         if found:
             return found.value()
+        if rows <= 0 or cols <= 0 or src == 0:
+            raise Error("GpuMatmul.weight: invalid dimensions or null pointer")
+        if rows > 0x7FFFFFFF // cols or rows * cols > 0x7FFFFFFF // 4:
+            raise Error("GpuMatmul.weight: buffer size overflow")
         var n = rows * cols
         var buf = self.ctx.enqueue_create_buffer[DType.float32](n)
         with buf.map_to_host() as h:
@@ -143,7 +147,15 @@ struct GpuMatmul(Movable):
 
     def matmul(mut self, a: Int, w: Int, c: Int, bias: Int, bias_key: Int, m: Int, k: Int, n: Int) raises:
         """C[m,n] = A[m,k] @ W[k,n] (+ bias[n]); A and C are host addresses, W a resident buffer."""
+        if m <= 0 or k <= 0 or n <= 0:
+            raise Error("GpuMatmul.matmul: dimensions must be positive")
+        if a == 0 or c == 0 or w < 0 or w >= len(self.buffers):
+            raise Error("GpuMatmul.matmul: invalid buffer or pointer")
         var slices = (k + SLICE_K - 1) // SLICE_K
+        if m > 0x7FFFFFFF // max(k, n) or (m * n) > 0x7FFFFFFF // max(4, slices) or (m * k) > 0x7FFFFFFF // 4:
+            raise Error("GpuMatmul.matmul: tensor size overflow")
+        if slices <= 0 or n > 0x7FFFFFFF // slices:
+            raise Error("GpuMatmul.matmul: grid size overflow")
         self._reserve(m * k, m * n, slices * m * n)
         var bidx = -1
         if bias != 0:

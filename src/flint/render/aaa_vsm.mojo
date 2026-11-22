@@ -180,6 +180,10 @@ struct VsmPageManager(Movable):
     ) -> List[VsmPageAllocation]:
         """Consumes GPU request flags in `table_words[16384..32767]`, preserves cached valid pages,
         and returns only the newly allocated / invalidated pages that need hardware depth rasterization!"""
+        if len(table_words) < 2 * VSM_VIRTUAL_PAGE_COUNT:
+            self.cached_hits_last_frame = 0
+            self.newly_rendered_pages_last_frame = 0
+            return List[VsmPageAllocation]()
         self.current_epoch += 1
         self.cached_hits_last_frame = 0
         var to_render = List[VsmPageAllocation]()

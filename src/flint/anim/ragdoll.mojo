@@ -1870,7 +1870,7 @@ struct ArticulatedRagdoll(Copyable, Movable):
         """Restores `ArticulatedRagdoll` from a binary snapshot."""
         _ = r.enter(RAGDOLL_BLOB_TAG, RAGDOLL_BLOB_VERSION)
         var n_limbs = r.integer()
-        if n_limbs < 0 or n_limbs > 4096:
+        if r.failed or n_limbs < 0 or n_limbs > 4096 or n_limbs > max(0, r.limit() - r.offset) // 125:
             raise Error("ragdoll blob: invalid limb count")
         self.limbs.clear()
         for _ in range(n_limbs):
@@ -1897,7 +1897,13 @@ struct ArticulatedRagdoll(Copyable, Movable):
             self.limbs.append(ld)
 
         var n_states = r.integer()
-        if n_states < 0 or n_states > 4096:
+        if (
+            r.failed
+            or n_states < 0
+            or n_states > 4096
+            or n_states != n_limbs
+            or n_states > max(0, r.limit() - r.offset) // 109
+        ):
             raise Error("ragdoll blob: invalid state count")
         self.states.clear()
         for _ in range(n_states):
@@ -1916,7 +1922,7 @@ struct ArticulatedRagdoll(Copyable, Movable):
             self.states.append(st)
 
         var n_obbs = r.integer()
-        if n_obbs < 0 or n_obbs > 4096:
+        if r.failed or n_obbs < 0 or n_obbs > 4096 or n_obbs > max(0, r.limit() - r.offset) // 48:
             raise Error("ragdoll blob: invalid obb count")
         self.obb_colliders.clear()
         for _ in range(n_obbs):
@@ -1928,21 +1934,21 @@ struct ArticulatedRagdoll(Copyable, Movable):
             self.obb_colliders.append(RagdollObbCollider(c, q, he, fr, re))
 
         var n_par = r.integer()
-        if n_par < 0 or n_par > 65536:
+        if r.failed or n_par < 0 or n_par > 65536 or n_par > max(0, r.limit() - r.offset) // 8:
             raise Error("ragdoll blob: invalid parent count")
         self.skel_parents.clear()
         for _ in range(n_par):
             self.skel_parents.append(r.integer())
 
         var n_topo = r.integer()
-        if n_topo < 0 or n_topo > 65536:
+        if r.failed or n_topo < 0 or n_topo > 65536 or n_topo > max(0, r.limit() - r.offset) // 8:
             raise Error("ragdoll blob: invalid topo count")
         self.skel_topo_order.clear()
         for _ in range(n_topo):
             self.skel_topo_order.append(r.integer())
 
         var rp_cnt = r.integer()
-        if rp_cnt < 0 or rp_cnt > 65536:
+        if r.failed or rp_cnt < 0 or rp_cnt > 65536 or rp_cnt > max(0, r.limit() - r.offset) // 40:
             raise Error("ragdoll blob: invalid rest pose count")
         self.rest_pose = Pose(rp_cnt)
         for i in range(rp_cnt):
@@ -1971,3 +1977,31 @@ struct ArticulatedRagdoll(Copyable, Movable):
         self.still_seconds = r.f32()
         self.steps_taken = r.integer()
         r.leave()
+
+        for i in range(n_par):
+            var sp = self.skel_parents[i]
+            if sp < -1 or sp >= n_par or sp == i:
+                raise Error("ragdoll blob: invalid skel_parent index")
+        for i in range(n_topo):
+            var st_idx = self.skel_topo_order[i]
+            if st_idx < 0 or st_idx >= n_par:
+                raise Error("ragdoll blob: invalid skel_topo_order index")
+        for i in range(n_limbs):
+            var p = self.limbs[i].parent_limb
+            if p < -1 or p >= n_limbs or p == i:
+                raise Error("ragdoll blob: invalid parent_limb index")
+            var cur = p
+            var steps = 0
+            while cur >= 0 and steps < n_limbs:
+                if cur == i:
+                    raise Error("ragdoll blob: cycle in parent_limb")
+                cur = self.limbs[cur].parent_limb
+                steps += 1
+            if cur >= 0:
+                raise Error("ragdoll blob: cycle in parent_limb")
+            var bn = self.limbs[i].bone_node
+            if n_par > 0:
+                if bn < -1 or bn >= n_par:
+                    raise Error("ragdoll blob: bone_node index out of range")
+            elif bn < -1:
+                raise Error("ragdoll blob: negative bone_node index")

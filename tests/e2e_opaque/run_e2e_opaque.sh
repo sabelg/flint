@@ -16,8 +16,8 @@ usage() {
 Usage: run_e2e_opaque.sh [--strict] [--filter <substr>]
   --strict           Require all gated M1-M6 tests to compile with --Werror and pass.
   --filter <substr>  Only execute tests whose relative path contains <substr>.
-  Env: FLINT_E2E_TIMEOUT (seconds per test binary/fast script, default: 120; test_t4_cli_workflows.sh min 300s)
-       FLINT_E2E_CLI_TIMEOUT (seconds for test_gated_m5_m6_cli.sh, default: 600)
+  Env: FLINT_E2E_TIMEOUT (seconds per test binary/fast script, default: 120; test_t4_cli_workflows.sh min 600s)
+       FLINT_E2E_CLI_TIMEOUT (seconds for test_gated_m5_m6_cli.sh, default: 1200)
 EOF
 }
 
@@ -28,14 +28,14 @@ script_timeout_for() {
     local t="$TIMEOUT_SECS"
     case "$base" in
         test_gated_m5_m6_cli.sh)
-            local cli_t="${FLINT_E2E_CLI_TIMEOUT:-600}"
+            local cli_t="${FLINT_E2E_CLI_TIMEOUT:-1200}"
             if [[ "$t" -lt "$cli_t" ]]; then
                 t="$cli_t"
             fi
             ;;
         test_t4_cli_workflows.sh)
-            if [[ "$t" -lt 300 ]]; then
-                t=300
+            if [[ "$t" -lt 600 ]]; then
+                t=600
             fi
             ;;
     esac

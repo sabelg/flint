@@ -683,7 +683,12 @@ struct Scene(Movable):
         _ = reader.enter(SCENE_BIN_MAGIC, SCENE_SCHEMA_VERSION)
         self.name = reader.text()
         var count = reader.integer()
-        if count < 0 or reader.failed:
+        if (
+            reader.failed
+            or count < 0
+            or count > 1 << 20
+            or count > max(0, reader.limit() - reader.offset) // 16
+        ):
             raise Error("corrupted entity count in .flscnb")
 
         registry.ensure_registered_in_world(world)
@@ -698,6 +703,13 @@ struct Scene(Movable):
         for slot in range(count):
             parent_slots[slot] = reader.integer()
             var num_comps = reader.integer()
+            if (
+                reader.failed
+                or num_comps < 0
+                or num_comps > 65536
+                or num_comps > max(0, reader.limit() - reader.offset) // 12
+            ):
+                raise Error("corrupted component count in .flscnb")
             for _ in range(num_comps):
                 var tag = reader.peek_tag()
                 var cidx = registry.find_by_fourcc(tag)

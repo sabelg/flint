@@ -230,7 +230,7 @@ def alsa_open_pcm(rate: Int, preferred_period: Int, mut out_period: Int, mut out
         requested = env_value("SD_AUDIO_DEVICE")
     if requested.byte_length() > 0:
         var owned = requested
-        var fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 2048 | 0x80000), Int32(0)))
+        var fd = Int(external_call["openat", Int32](Int32(-100), owned.as_c_string_span(), Int32(1 | 2048 | 0x80000), Int32(0)))
         if fd >= 0:
             if _alsa_configure_fd(fd, rate, preferred_period, out_period, out_buffer):
                 return fd
@@ -240,7 +240,7 @@ def alsa_open_pcm(rate: Int, preferred_period: Int, mut out_period: Int, mut out
     for card in range(4):
         for dev in range(4):
             var path = "/dev/snd/pcmC" + String(card) + "D" + String(dev) + "p"
-            var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(1 | 2048 | 0x80000), Int32(0)))
+            var fd = Int(external_call["openat", Int32](Int32(-100), path.as_c_string_span(), Int32(1 | 2048 | 0x80000), Int32(0)))
             if fd < 0:
                 continue
             if _alsa_configure_fd(fd, rate, preferred_period, out_period, out_buffer):
@@ -712,7 +712,7 @@ struct NativeAudio(Movable):
         self.ready = False
         self.pending.clear()
         var owned = path
-        self.fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 2048), Int32(0)))
+        self.fd = Int(external_call["openat", Int32](Int32(-100), owned.as_c_string_span(), Int32(1 | 2048), Int32(0)))
         if self.fd < 0:
             self.last_error = "cannot open " + path + " errno " + String(self.errno())
             return False

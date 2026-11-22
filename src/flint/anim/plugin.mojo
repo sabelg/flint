@@ -273,13 +273,15 @@ struct SkeletonComponent(SerializableComponent):
         var mid = reader.u64()
         var dirty = reader.boolean()
         var n = reader.integer()
-        if n < 0 or n > 1 << 16:
+        if reader.failed or n < 0 or n > 1 << 16 or n > max(0, reader.limit() - reader.offset) // 40:
             raise Error("SkeletonComponent: invalid pose node count")
         var skel = SkeletonInstance(n)
         for i in range(n):
             skel.pose.t[i] = reader.vec3()
             skel.pose.r[i] = reader.quat()
             skel.pose.s[i] = reader.vec3()
+        if reader.failed:
+            raise Error("SkeletonComponent: truncated blob")
         return Self(mid, skel^, dirty)
 
     def write_json(self) -> String:
@@ -378,13 +380,13 @@ struct AnimatorComponent(SerializableComponent):
         out.animator.phase = reader.f32()
         out.animator.prev_phase = reader.f32()
         var n_p = reader.integer()
-        if n_p < 0 or n_p > 4096:
+        if reader.failed or n_p < 0 or n_p > 4096 or n_p > max(0, reader.limit() - reader.offset) // 4:
             raise Error("AnimatorComponent: invalid param count")
         for _ in range(n_p):
             out.animator.params.append(reader.f32())
         out.foot_plant.pelvis = reader.integer()
         var n_legs = reader.integer()
-        if n_legs < 0 or n_legs > 64:
+        if reader.failed or n_legs < 0 or n_legs > 64 or n_legs > max(0, reader.limit() - reader.offset) // 40:
             raise Error("AnimatorComponent: invalid foot_plant leg count")
         for _ in range(n_legs):
             var hip = reader.integer()
@@ -394,10 +396,12 @@ struct AnimatorComponent(SerializableComponent):
             var pole = reader.vec3()
             out.foot_plant.add_leg(hip, knee, ankle, ah, pole)
         var n_st = reader.integer()
-        if n_st < 0 or n_st > 64:
+        if reader.failed or n_st < 0 or n_st > 64 or n_st > max(0, reader.limit() - reader.offset):
             raise Error("AnimatorComponent: invalid stance count")
         for _ in range(n_st):
             out.foot_in_stance.append(reader.boolean())
+        if reader.failed:
+            raise Error("AnimatorComponent: truncated blob")
         return out^
 
     def write_json(self) -> String:
@@ -484,6 +488,8 @@ struct RagdollComponent(SerializableComponent):
         _ = reader.integer()
         sm.world_ragdoll_slot = -1
         sm._world_dirty = True
+        if reader.failed:
+            raise Error("RagdollComponent: truncated blob")
         return Self(sm^, auto_rec, sync_t)
 
     def write_json(self) -> String:
@@ -554,6 +560,8 @@ struct BoneSocketComponent(SerializableComponent):
         att.world_pos = wp
         att.world_rot = wr
         att.world_scale = ws
+        if reader.failed:
+            raise Error("BoneSocketComponent: truncated blob")
         return Self(sk_e, att^)
 
     def write_json(self) -> String:

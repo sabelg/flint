@@ -75,7 +75,7 @@ from flint.audio.plugin import (
 )
 from flint.core.jobs import JobPool
 from flint.core.math import Vec3, Quat
-from flint.ecs import Entity, ParallelCommands, World, comp_hash64
+from flint.ecs import ComponentBitSet, Entity, ParallelCommands, World, comp_hash64
 from flint.input import ACTION_BOOL, InputContext, InputMap
 from flint.input.plugin import InputPlugin, InputStateResource
 from flint.net import (
@@ -2471,9 +2471,92 @@ def test_net_plugin_before_transform_plugin_zero_lag() raises:
     srv_app.shutdown()
 
 
+def _t5_ord_sys_a(
+    _w: Pointer[World, MutAnyOrigin],
+    res_ptr: Pointer[Resources, MutAnyOrigin],
+    _p: Pointer[JobPool, MutAnyOrigin],
+    _c: Pointer[ParallelCommands, MutAnyOrigin],
+    ctx: Int,
+):
+    var log = Pointer[List[Int], MutAnyOrigin](unsafe_from_address=ctx)
+    log[unsafe_offset=0].append(1)
+
+
+def _t5_ord_sys_b(
+    _w: Pointer[World, MutAnyOrigin],
+    res_ptr: Pointer[Resources, MutAnyOrigin],
+    _p: Pointer[JobPool, MutAnyOrigin],
+    _c: Pointer[ParallelCommands, MutAnyOrigin],
+    ctx: Int,
+):
+    var log = Pointer[List[Int], MutAnyOrigin](unsafe_from_address=ctx)
+    log[unsafe_offset=0].append(2)
+
+
+def _t5_ord_sys_c(
+    _w: Pointer[World, MutAnyOrigin],
+    res_ptr: Pointer[Resources, MutAnyOrigin],
+    _p: Pointer[JobPool, MutAnyOrigin],
+    _c: Pointer[ParallelCommands, MutAnyOrigin],
+    ctx: Int,
+):
+    var log = Pointer[List[Int], MutAnyOrigin](unsafe_from_address=ctx)
+    log[unsafe_offset=0].append(3)
+
+
+def test_schedule_out_of_order_add_dependency() raises:
+    # [High-6] Register A before B before C, then constrain A after B and B after C!
+    var log = List[Int]()
+    var log_addr = Int(Pointer(to=log))
+    var app = EngineApp(AppConfig(title="OutOfOrderDep", headless=True, worker_threads=2))
+    var rw = ComponentBitSet().with_bit(0)
+    var sid_a = app.schedule.add_system(STAGE_UPDATE, "sys_a", _t5_ord_sys_a, writes=rw, user_ctx=log_addr)
+    var sid_b = app.schedule.add_system(STAGE_UPDATE, "sys_b", _t5_ord_sys_b, writes=rw, user_ctx=log_addr)
+    var sid_c = app.schedule.add_system(STAGE_UPDATE, "sys_c", _t5_ord_sys_c, user_ctx=log_addr)
+    app.schedule.add_dependency(STAGE_UPDATE, sid_a, sid_b)
+    app.schedule.add_dependency(STAGE_UPDATE, sid_b, sid_c)
+
+    app.startup()
+    app.step_one_frame(Float32(1.0 / 60.0))
+    app.shutdown()
+
+    assert_equal(len(log), 3)
+    assert_equal(log[0], 3)
+    assert_equal(log[1], 2)
+    assert_equal(log[2], 1)
+
+
+def test_schedule_conflict_with_explicit_dependency() raises:
+    # [HIGH-1] sys0 (writes A), sys1 (reads A), sys2 (reads B), add_dependency(STAGE_UPDATE, sys0, sys2)
+    # Must preserve registration-order R/W conflict (sys0 -> sys1) AND explicit (sys2 -> sys0) => [2, 0, 1]
+    var log = List[Int]()
+    var log_addr = Int(Pointer(to=log))
+    var app = EngineApp(AppConfig(title="ConflictExplicitDep", headless=True, worker_threads=2))
+    var comp_a = ComponentBitSet().with_bit(0)
+    var comp_b = ComponentBitSet().with_bit(1)
+    var s0 = app.schedule.add_system(STAGE_UPDATE, "sys0_wA", _t5_ord_sys_a, writes=comp_a, user_ctx=log_addr)
+    _ = app.schedule.add_system(STAGE_UPDATE, "sys1_rA", _t5_ord_sys_b, reads=comp_a, user_ctx=log_addr)
+    var s2 = app.schedule.add_system(STAGE_UPDATE, "sys2_rB", _t5_ord_sys_c, reads=comp_b, user_ctx=log_addr)
+    app.schedule.add_dependency(STAGE_UPDATE, s0, s2)
+    app.schedule.stages[STAGE_UPDATE].compile()
+    assert_equal(len(app.schedule.stages[STAGE_UPDATE].compiled_nodes[0].dependents), 1)
+    assert_equal(app.schedule.stages[STAGE_UPDATE].compiled_nodes[0].dependents[0], 1)
+    assert_equal(len(app.schedule.stages[STAGE_UPDATE].compiled_nodes[2].dependents), 1)
+    assert_equal(app.schedule.stages[STAGE_UPDATE].compiled_nodes[2].dependents[0], 0)
+
+    app.startup()
+    app.step_one_frame(Float32(1.0 / 60.0))
+    app.shutdown()
+
+    assert_equal(len(log), 3)
+    assert_equal(log[0], 3)  # s2
+    assert_equal(log[1], 1)  # s0
+    assert_equal(log[2], 2)  # s1
+
+
 def main() raises:
     var passed = 0
-    var total = 19
+    var total = 21
 
     test_window_and_input_plugin_ordering_and_actions()
     print("[PASS] test_window_and_input_plugin_ordering_and_actions")
@@ -2549,6 +2632,14 @@ def main() raises:
 
     test_net_plugin_before_transform_plugin_zero_lag()
     print("[PASS] test_net_plugin_before_transform_plugin_zero_lag")
+    passed += 1
+
+    test_schedule_out_of_order_add_dependency()
+    print("[PASS] test_schedule_out_of_order_add_dependency")
+    passed += 1
+
+    test_schedule_conflict_with_explicit_dependency()
+    print("[PASS] test_schedule_conflict_with_explicit_dependency")
     passed += 1
 
     print("[SUMMARY] " + String(passed) + "/" + String(total) + " passed")

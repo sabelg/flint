@@ -510,15 +510,23 @@ def aead_seal_raw(
     """RFC 8439 ChaCha20-Poly1305 AEAD seal: appends `ciphertext (pt_len B) || tag (16 B)`."""
     var otk = chacha20_block(key, 0, n0, n1, n2)
     var base_off = len(out_ct_tag)
+    var old_buf = Int(out_ct_tag.unsafe_ptr())
+    var aad_aliases = old_buf != 0 and aad_len > 0 and aad_ptr >= old_buf and aad_ptr < old_buf + base_off
+    var aad_rel = aad_ptr - old_buf if aad_aliases else 0
+    var pt_aliases = old_buf != 0 and pt_len > 0 and pt_ptr >= old_buf and pt_ptr < old_buf + base_off
+    var pt_rel = pt_ptr - old_buf if pt_aliases else 0
     var ct_len = max(0, pt_len)
     out_ct_tag.resize(base_off + ct_len + AEAD_TAG_BYTES, UInt8(0))
-    var ct_ptr = Int(out_ct_tag.unsafe_ptr()) + base_off
+    var new_buf = Int(out_ct_tag.unsafe_ptr())
+    var ct_ptr = new_buf + base_off
+    var eff_aad_ptr = (new_buf + aad_rel) if aad_aliases else aad_ptr
+    var eff_pt_ptr = (new_buf + pt_rel) if pt_aliases else pt_ptr
     if ct_len > 0:
-        chacha20_xor_ptr(key, 1, n0, n1, n2, pt_ptr, ct_len, ct_ptr)
+        chacha20_xor_ptr(key, 1, n0, n1, n2, eff_pt_ptr, ct_len, ct_ptr)
 
     var mac = _Poly1305State(otk)
     if aad_len > 0:
-        mac.update_ptr(aad_ptr, aad_len)
+        mac.update_ptr(eff_aad_ptr, aad_len)
         mac.pad16()
     if ct_len > 0:
         mac.update_ptr(ct_ptr, ct_len)
@@ -547,7 +555,7 @@ def aead_open_raw(
     mut out_pt: List[UInt8],
 ) -> Bool:
     """RFC 8439 ChaCha20-Poly1305 AEAD open: verifies tag in constant time before decrypting."""
-    if ct_len < 0 or tag_ptr == 0:
+    if ct_len < 0 or tag_ptr == 0 or (ct_len > 0 and ct_ptr == 0):
         return False
     var otk = chacha20_block(key, 0, n0, n1, n2)
     var mac = _Poly1305State(otk)
@@ -563,8 +571,30 @@ def aead_open_raw(
     if not poly1305_verify_tag(expected, tag_ptr):
         return False
 
-    out_pt.clear()
-    if ct_len > 0:
+    if ct_len == 0:
+        out_pt.clear()
+        return True
+    var out_buf = Int(out_pt.unsafe_ptr())
+    var out_cap = out_pt.capacity()
+    var ct_aliases = (
+        out_buf != 0
+        and ct_ptr < out_buf + out_cap
+        and ct_ptr + ct_len > out_buf
+    )
+    if ct_aliases:
+        var ct_copy = List[UInt8](capacity=ct_len)
+        var src = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=ct_ptr)
+        for i in range(ct_len):
+            ct_copy.append(src[unsafe_offset=i])
+        out_pt.clear()
+        out_pt.resize(ct_len, UInt8(0))
+        chacha20_xor_ptr(
+            key, 1, n0, n1, n2, Int(ct_copy.unsafe_ptr()), ct_len, Int(out_pt.unsafe_ptr())
+        )
+        _ = len(ct_copy)
+        _ = len(out_pt)
+    else:
+        out_pt.clear()
         out_pt.resize(ct_len, UInt8(0))
         chacha20_xor_ptr(
             key, 1, n0, n1, n2, ct_ptr, ct_len, Int(out_pt.unsafe_ptr())

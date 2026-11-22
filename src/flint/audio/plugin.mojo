@@ -201,6 +201,8 @@ struct AudioListenerComponent(SerializableComponent, ImplicitlyCopyable):
         var prio = reader.integer()
         var vol = reader.f32()
         var rp = reader.boolean()
+        if reader.failed:
+            raise Error("AudioListenerComponent: truncated blob")
         return Self(act, prio, vol, rp)
 
     def write_json(self) -> String:
@@ -342,6 +344,8 @@ struct AudioEmitterComponent(SerializableComponent):
         var obs = reader.f32()
         var pp = reader.vec3()
         var hpp = reader.boolean()
+        if reader.failed:
+            raise Error("AudioEmitterComponent: truncated blob")
         var out = Self(
             aid, apath, vol, pit, bid, loop, spat, prio, rdist, mdist,
             pos_spawn, pl, pending or pl, occ, ogain, cut, obs,

@@ -253,32 +253,44 @@ struct FlintReplayStream(Movable):
         out.app_name = r.text()
         out.final_hash = r.u64()
         var init_len = Int(r.u32())
+        if r.failed or init_len < 0 or init_len > max(0, r.limit() - r.offset):
+            raise Error("replay stream blob: invalid initial_blob length")
         out.initial_blob.reserve(init_len)
         for _ in range(init_len):
             out.initial_blob.append(r.u8())
         var count = Int(r.u32())
+        if r.failed or count < 0 or count > max(0, r.limit() - r.offset) // 8:
+            raise Error("replay stream blob: invalid tick count")
         out.tick_dts.reserve(count)
         out.tick_inputs.reserve(count)
         for _ in range(count):
             out.tick_dts.append(r.f32())
             var inp_len = Int(r.u32())
+            if r.failed or inp_len < 0 or inp_len > max(0, r.limit() - r.offset):
+                raise Error("replay stream blob: invalid tick input length")
             var frame_bytes = List[UInt8](capacity=inp_len)
             for _ in range(inp_len):
                 frame_bytes.append(r.u8())
             out.tick_inputs.append(frame_bytes^)
         if ver >= 2:
             var kf_n = Int(r.u32())
+            if r.failed or kf_n < 0 or kf_n > max(0, r.limit() - r.offset) // 8:
+                raise Error("replay stream blob: invalid keyframe count")
             out.keyframe_ticks.reserve(kf_n)
             out.keyframe_blobs.reserve(kf_n)
             for _ in range(kf_n):
                 out.keyframe_ticks.append(Int(r.u32()))
                 var kb_len = Int(r.u32())
+                if r.failed or kb_len < 0 or kb_len > max(0, r.limit() - r.offset):
+                    raise Error("replay stream blob: invalid keyframe length")
                 var kb = List[UInt8](capacity=kb_len)
                 for _ in range(kb_len):
                     kb.append(r.u8())
                 out.keyframe_blobs.append(kb^)
         if ver >= 3:
             var ck_n = Int(r.u32())
+            if r.failed or ck_n < 0 or ck_n > max(0, r.limit() - r.offset) // 40:
+                raise Error("replay stream blob: invalid camera knot count")
             out.camera_knots.reserve(ck_n)
             for _ in range(ck_n):
                 var kt = Int(r.u32())

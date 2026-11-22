@@ -271,6 +271,8 @@ struct NetworkIdentityComponent(SerializableComponent, ImplicitlyCopyable):
         var opid = reader.integer()
         var loc = reader.boolean()
         var auth = reader.u8()
+        if reader.failed:
+            raise Error("NetworkIdentityComponent: truncated blob")
         return Self(nid, opid, loc, auth)
 
     def write_json(self) -> String:
@@ -354,6 +356,8 @@ struct ReplicationComponent(SerializableComponent, ImplicitlyCopyable):
         var ir = reader.f32()
         var hr = reader.f32()
         var lc = reader.boolean()
+        if reader.failed:
+            raise Error("ReplicationComponent: truncated blob")
         return Self(rp, rr, rv, rs, sf, bp, ir, hr, lc)
 
     def write_json(self) -> String:
@@ -427,6 +431,8 @@ struct RollbackInputComponent(SerializableComponent, ImplicitlyCopyable):
         var st = reader.f32()
         var th = reader.f32()
         var ab = reader.u32()
+        if reader.failed:
+            raise Error("RollbackInputComponent: truncated blob")
         return Self(pid, seq, st, th, ab)
 
     def write_json(self) -> String:

@@ -156,6 +156,8 @@ struct LocalTransform(SerializableComponent, ImplicitlyCopyable):
         var t = reader.vec3()
         var r = reader.quat()
         var s = reader.vec3()
+        if reader.failed:
+            raise Error("LocalTransform: truncated blob")
         return Self(t, r, s)
 
     def write_json(self) -> String:
@@ -243,6 +245,8 @@ struct GlobalTransform(SerializableComponent):
         var t = reader.vec3()
         var r = reader.quat()
         var s = reader.vec3()
+        if reader.failed:
+            raise Error("GlobalTransform: truncated blob")
         return Self(m^, t, r, s)
 
     def write_json(self) -> String:

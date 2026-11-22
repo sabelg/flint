@@ -174,6 +174,8 @@ struct _BitReader128(Copyable, Movable):
         self.lo = 0
         self.hi = 0
         self.bit_pos = 0
+        if offset < 0 or len(data) < 16 or offset > len(data) - 16:
+            return
         for i in range(8):
             self.lo |= UInt64(data[offset + i]) << UInt64(i * 8)
         for i in range(8):
@@ -181,6 +183,8 @@ struct _BitReader128(Copyable, Movable):
 
     @always_inline
     def get(mut self, bits: Int) -> Int:
+        if bits <= 0 or bits > 63 or self.bit_pos >= 128:
+            return 0
         var mask = (UInt64(1) << UInt64(bits)) - UInt64(1)
         var res: UInt64
         if self.bit_pos < 64:
@@ -791,11 +795,11 @@ def encode_bc7_rgba_simd(
     multi_mode: Bool = True,
 ) -> List[UInt8]:
     """Multi-threaded `8-wide SIMD` + `JobPool` `BC7` encoder (`Modes 1, 3, 6`)."""
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height or len(pixels_argb) < width * height:
+        return List[UInt8]()
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
     var out = List[UInt8](length=bw * bh * 16, fill=0)
-    if len(pixels_argb) < width * height or width <= 0 or height <= 0:
-        return out^
 
     var jobs = min(bh, max(1, bh // 2))
     if jobs > 16:
@@ -823,11 +827,11 @@ def encode_bc7_rgba_simd(
 
 def encode_bc7_rgba(pixels_argb: List[UInt32], width: Int, height: Int, multi_mode: Bool = True) -> List[UInt8]:
     """Compresses `0xAARRGGBB` pixels into `VK_FORMAT_BC7_UNORM` / `BC7_SRGB` using 8-wide SIMD."""
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height or len(pixels_argb) < width * height:
+        return List[UInt8]()
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
     var out = List[UInt8](length=bw * bh * 16, fill=0)
-    if len(pixels_argb) < width * height or width <= 0 or height <= 0:
-        return out^
     var src_addr = Int(pixels_argb.unsafe_ptr())
     var dst_addr = Int(out.unsafe_ptr())
     for by in range(bh):
@@ -841,6 +845,8 @@ def encode_bc7_rgba(pixels_argb: List[UInt32], width: Int, height: Int, multi_mo
 
 def encode_bc7_rgba_scalar_reference(pixels_argb: List[UInt32], width: Int, height: Int) -> List[UInt8]:
     """Baseline scalar Mode-6 `BC7` encoder retained for `Suite 21` throughput & PSNR benchmarking."""
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height or len(pixels_argb) < width * height:
+        return List[UInt8]()
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
     var out = List[UInt8](capacity=bw * bh * 16)
@@ -926,8 +932,12 @@ def encode_bc7_rgba_scalar_reference(pixels_argb: List[UInt32], width: Int, heig
 
 def decode_bc7_rgba(blocks: List[UInt8], width: Int, height: Int) -> List[UInt32]:
     """Reference Khronos `BC7` decoder supporting Modes 1, 3, and 6 (`0xAARRGGBB`)."""
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height:
+        return List[UInt32]()
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
+    if len(blocks) // 16 < bw * bh:
+        return List[UInt32]()
     var out = List[UInt32](length=width * height, fill=0)
 
     for by in range(bh):
@@ -1096,6 +1106,8 @@ def _encode_bc4_channel(vals: Array[Int, 16], mut out: List[UInt8]):
 
 
 def _decode_bc4_channel(blocks: List[UInt8], off: Int) -> Array[Int, 16]:
+    if off < 0 or len(blocks) < 8 or off > len(blocks) - 8:
+        return Array[Int, 16](fill=0)
     var e0 = Int(blocks[off])
     var e1 = Int(blocks[off + 1])
     var pal = Array[Int, 8](fill=e0)
@@ -1128,6 +1140,8 @@ def _decode_bc4_channel(blocks: List[UInt8], off: Int) -> Array[Int, 16]:
 
 def encode_bc5_normals(normals: List[Vec3], width: Int, height: Int) -> List[UInt8]:
     """Compresses unit tangent-space normals into `VK_FORMAT_BC5_UNORM` (`16` bytes per `4x4` block)."""
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height or len(normals) < width * height:
+        return List[UInt8]()
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
     var out = List[UInt8](capacity=bw * bh * 16)
@@ -1152,8 +1166,12 @@ def encode_bc5_normals(normals: List[Vec3], width: Int, height: Int) -> List[UIn
 
 def decode_bc5_normals(blocks: List[UInt8], width: Int, height: Int) -> List[Vec3]:
     """Reference `BC5` decoder reconstructing exact unit `(Nx, Ny, Nz)` tangent normals."""
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height:
+        return List[Vec3]()
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
+    if len(blocks) // 16 < bw * bh:
+        return List[Vec3]()
     var out = List[Vec3](length=width * height, fill=Vec3(0.0, 0.0, 1.0))
 
     for by in range(bh):
@@ -1410,11 +1428,11 @@ def _encode_bc6h_tile_at(
 
 def encode_bc6h_hdr(hdr_rgb: List[Vec3], width: Int, height: Int, partitioned: Bool = True) -> List[UInt8]:
     """Compresses linear HDR `Vec3` radiance (`[0 .. 65504]`) into `VK_FORMAT_BC6H_UFLOAT` (Modes 11 & 10)."""
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height or len(hdr_rgb) < width * height:
+        return List[UInt8]()
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
     var out = List[UInt8](length=bw * bh * 16, fill=0)
-    if len(hdr_rgb) < width * height or width <= 0 or height <= 0:
-        return out^
     var dst_addr = Int(out.unsafe_ptr())
     for by in range(bh):
         for bx in range(bw):
@@ -1425,8 +1443,12 @@ def encode_bc6h_hdr(hdr_rgb: List[Vec3], width: Int, height: Int, partitioned: B
 
 def decode_bc6h_hdr(blocks: List[UInt8], width: Int, height: Int) -> List[Vec3]:
     """Reference Khronos `BC6H_UFLOAT` decoder supporting Mode 11 (`0x03`) and 2-Subset Mode 10 (`0x1E`)."""
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height:
+        return List[Vec3]()
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
+    if len(blocks) // 16 < bw * bh:
+        return List[Vec3]()
     var out = List[Vec3](length=width * height, fill=Vec3(0.0, 0.0, 0.0))
 
     for by in range(bh):

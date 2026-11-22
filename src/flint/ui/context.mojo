@@ -1090,7 +1090,7 @@ struct UiContext(Movable):
 
         var clicked = False
         if not blocked:
-            if hovered and self.mouse_released_l:
+            if hovered and self.mouse_released_l and self.active_id == wid:
                 clicked = True
             elif self.focused_id == wid and (self.key_enter_pressed or self.key_space_pressed or self.pad_confirm):
                 clicked = True

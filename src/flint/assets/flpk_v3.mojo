@@ -1220,6 +1220,8 @@ struct FlpkV3MappedArchive(Movable):
             _ = external_call["memcpy", Int](Int(out.unsafe_ptr()), self.addr + off, Int64(usz))
             return (True, out^)
         elif e.compression == CHUNK_COMP_LZ4:
+            if csz == 0 or UInt64(usz) > UInt64(csz) * 256:
+                return (False, List[UInt8]())
             var out = List[UInt8](capacity=usz + 1)
             out.resize(unsafe_uninit_length=usz)
             var got = lz4_decompress_into(self.addr + off, csz, Int(out.unsafe_ptr()), usz)
@@ -1675,6 +1677,61 @@ def decode_bvh8_collider_slab(data: List[UInt8]) -> Tuple[Bool, Bvh8MeshCollider
             nd.child_counts[lane] = bitcast[DType.int32](_ptr_u32(addr, cur)); cur += 4
         col.nodes.append(nd)
     _ = len(data)
+
+    if n_nodes == 0:
+        if col.root_node >= 0:
+            return (False, Bvh8MeshCollider())
+    elif col.root_node < 0 or col.root_node >= n_nodes:
+        return (False, Bvh8MeshCollider())
+
+    for ni in range(n_nodes):
+        ref nd = col.nodes[ni]
+        for lane in range(8):
+            var c_idx = Int(nd.child_indices[lane])
+            var c_cnt = Int(nd.child_counts[lane])
+            if c_cnt < 0:
+                return (False, Bvh8MeshCollider())
+            if c_cnt > 0:
+                var leaf_first = -c_idx - 1
+                if leaf_first < 0 or leaf_first > n_tri or c_cnt > n_tri - leaf_first:
+                    return (False, Bvh8MeshCollider())
+            else:
+                if c_idx < 0 or c_idx >= n_nodes:
+                    return (False, Bvh8MeshCollider())
+                if c_idx > 0 and c_idx == ni:
+                    return (False, Bvh8MeshCollider())
+
+    if n_nodes > 0:
+        var color = List[UInt8](length=n_nodes, fill=0)  # 0=unvisited, 1=visiting, 2=done
+        var dfs_node = List[Int]()
+        var dfs_lane = List[Int]()
+        for start_n in range(n_nodes):
+            var seed = col.root_node if start_n == 0 else start_n
+            if color[seed] != 0:
+                continue
+            color[seed] = 1
+            dfs_node.append(seed)
+            dfs_lane.append(0)
+            while len(dfs_node) > 0:
+                var top = len(dfs_node) - 1
+                var ni = dfs_node[top]
+                var li = dfs_lane[top]
+                if li >= 8:
+                    color[ni] = 2
+                    _ = dfs_node.pop()
+                    _ = dfs_lane.pop()
+                    continue
+                dfs_lane[top] = li + 1
+                var c_idx = Int(col.nodes[ni].child_indices[li])
+                var c_cnt = Int(col.nodes[ni].child_counts[li])
+                if c_cnt == 0 and c_idx > 0:
+                    if color[c_idx] == 1:
+                        return (False, Bvh8MeshCollider())
+                    if color[c_idx] == 0:
+                        color[c_idx] = 1
+                        dfs_node.append(c_idx)
+                        dfs_lane.append(0)
+
     return (True, col^)
 
 
@@ -1699,9 +1756,19 @@ def decode_audio_pcm_slab(data: List[UInt8]) -> Tuple[Bool, Int, Int, List[Int16
     var ch = Int(_ptr_u32(addr, 4))
     var sr = Int(_ptr_u32(addr, 8))
     var cnt_u64 = UInt64(_ptr_u32(addr, 12))
-    if cnt_u64 > 536_870_912 or UInt64(16) + cnt_u64 * 2 > UInt64(len(data)):
+    if (
+        ch <= 0
+        or ch > 8
+        or sr <= 0
+        or sr > 768_000
+        or cnt_u64 == 0
+        or cnt_u64 > 536_870_912
+        or UInt64(16) + cnt_u64 * 2 > UInt64(len(data))
+    ):
         return (False, 0, 0, List[Int16]())
     var cnt = Int(cnt_u64)
+    if cnt % ch != 0:
+        return (False, 0, 0, List[Int16]())
     var pcm = List[Int16](capacity=cnt)
     for i in range(cnt):
         var u = _ptr_u16(addr, 16 + i * 2)

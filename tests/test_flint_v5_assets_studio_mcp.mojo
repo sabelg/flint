@@ -16,6 +16,7 @@ Verifies all 6 Track 5 subsystems end-to-end in `< 2s`:
       -> `physics.step_deterministic` -> `studio.undo_redo` -> `render.capture_viewport` with `flip.mojo` diff
       + persistent non-blocking `FlintMcpUnixListener` socket session)!
 """
+from test_reference_fern import test_reference_fern
 from std.atomic import Atomic
 from std.ffi import external_call
 from std.math import abs, cos, exp, log, max, min, pow, sin
@@ -27,7 +28,7 @@ from flint.assets.bc_compress import (
     downsample_normals_and_orm_toksvig_2x,
     f32_to_uf16_bits,
 )
-from flint.assets.cooker_v2 import cook_workspace
+from flint.assets.cooker_v2 import _is_dir, cook_workspace
 from flint.assets.flpk_v3 import (
     ASSET_KIND_MESH,
     ASSET_KIND_RAW,
@@ -94,7 +95,7 @@ from flint.physics.world import (
 )
 from flint.physics.plugin import ColliderComponent, RigidBodyComponent
 from flint.platform.input import InputState
-from flint.platform.os import get_time, make_dirs, read_bytes, remove_file, write_bytes
+from flint.platform.os import file_size, get_time, make_dirs, read_bytes, remove_file, write_bytes
 from flint.platform.vulkan import LAYOUT_SHADER_READ_ONLY, LAYOUT_UNDEFINED, VulkanGpu
 from flint.procedural import (
     ENFORCER_BONE_COUNT,
@@ -3779,6 +3780,7 @@ def _assert_botanical_cutout_atlas_512(
 
 
 def test_foliage_crowd_and_arch_kits() raises:
+    test_reference_fern()
     var oak_sprig = bake_oak_leaf_sprig_512()
     _assert_botanical_cutout_atlas_512(oak_sprig, "Oak leaf sprig 512", min_opaque=25000, min_cutout=60000)
 
@@ -4029,6 +4031,83 @@ def test_k_procedural_qem_and_toksvig() raises:
     print("    [OK] Procedural SubD/Loft/Foliage/Crowd/Arch, QEM LODs, QEM skin LOD & Toksvig passed!")
 
 
+def test_l_cook_workspace_symlink_loop_bomb(tmp_root: String, mut pool: JobPool) raises:
+    # [HIGH-1] Dual self-symlinks (s1 -> ., s2 -> .) must be skipped immediately without hang or duplicate cooking
+    var ws = tmp_root + "/ws_symlink_bomb"
+    var cache = tmp_root + "/cache_symlink_bomb"
+    var out_flpk = tmp_root + "/symlink_bomb.flpk"
+    _ = make_dirs(ws)
+    _ = make_dirs(cache)
+    var px = List[UInt32](length=4, fill=UInt32(0xFF336699))
+    _assert(write_png(ws + "/real_tex.png", px, 2, 2), "write real_tex.png for symlink bomb test")
+    var dot = String(".")
+    var s1 = ws + "/s1"
+    var s2 = ws + "/s2"
+    var f_link = ws + "/file_link.png"
+    var f_target = String("real_tex.png")
+    _ = external_call["symlink", Int32](dot.as_c_string_span(), s1.as_c_string_span())
+    _ = external_call["symlink", Int32](dot.as_c_string_span(), s2.as_c_string_span())
+    _ = external_call["symlink", Int32](f_target.as_c_string_span(), f_link.as_c_string_span())
+
+    var t0 = get_time()
+    var rep = cook_workspace(ws, out_flpk, pool, cache_dir=cache, force_recook=True)
+    var dt_ms = (get_time() - t0) * 1000.0
+    _assert(rep.ok, "cook_workspace with symlink bomb must succeed")
+    _assert(rep.total_assets == 1, "symlink bomb must cook real_tex.png exactly once, got " + String(rep.total_assets))
+    _assert(dt_ms < 2000.0, "symlink bomb cook must finish quickly, took " + String(dt_ms) + " ms")
+    print("    [OK] Symlink-loop traversal bomb guard passed (" + String(Int(dt_ms)) + " ms, 1 asset cooked)!")
+
+
+def test_m_mcp_socket_path_stdlib_open_coexistence() raises:
+    # Verify flint.devtools.mcp_v2.default_mcp_socket_path() (mkdirat) compiles and runs cleanly
+    # alongside Mojo stdlib `with open(...)` (no LLVM external_call["mkdir"] signature collision).
+    with open("/dev/null", "r") as f:
+        var devnull_bytes = f.read_bytes()
+        _assert(len(devnull_bytes) == 0, "stdlib open('/dev/null', 'r') should return 0 bytes")
+    var sock_path = default_mcp_socket_path()
+    var uid_str = String(Int(external_call["getuid", UInt32]()))
+    _assert(sock_path.startswith("/"), "default_mcp_socket_path must be absolute: " + sock_path)
+    _assert(sock_path.endswith("/mcp.sock"), "default_mcp_socket_path must end with /mcp.sock: " + sock_path)
+    _assert(sock_path.find(uid_str) >= 0, "default_mcp_socket_path must include uid: " + sock_path)
+    print("    [OK] MCP default_mcp_socket_path + stdlib open() coexistence passed (" + sock_path + ")!")
+
+
+def test_n_os_read_bytes_dir_and_cooker_trailing_slash(tmp_root: String, mut pool: JobPool) raises:
+    var real_dir = tmp_root + "/os_guard_real_dir"
+    var sym_dir = tmp_root + "/os_guard_sym_dir"
+    var cache_dir = tmp_root + "/os_guard_cache"
+    var out_flpk = tmp_root + "/os_guard_sym.flpk"
+    _ = make_dirs(real_dir)
+    _ = make_dirs(cache_dir)
+
+    var px = List[UInt32](length=4, fill=UInt32(0xFF4488CC))
+    _assert(write_png(real_dir + "/sample.png", px, 2, 2), "write sample.png")
+    var empty_file = real_dir + "/empty.bin"
+    var empty_bytes = List[UInt8]()
+    _assert(write_bytes(empty_file, empty_bytes), "write empty.bin")
+
+    var sym_target = String("os_guard_real_dir")
+    _ = external_call["symlink", Int32](sym_target.as_c_string_span(), sym_dir.as_c_string_span())
+
+    # Directory & symlink-to-directory reads must return empty without SIGTRAP / INT64_MAX alloc
+    _assert(file_size(real_dir) == -1, "file_size on directory must return -1")
+    _assert(file_size(sym_dir) == -1, "file_size on symlink-to-directory must return -1")
+    _assert(len(read_bytes(real_dir)) == 0, "read_bytes on directory must return empty list")
+    _assert(len(read_bytes(sym_dir)) == 0, "read_bytes on symlink-to-directory must return empty list")
+    _assert(file_size(empty_file) == 0, "file_size on empty regular file must return 0")
+    _assert(len(read_bytes(empty_file)) == 0, "read_bytes on empty regular file must return empty list")
+    var png_size = file_size(real_dir + "/sample.png")
+    var png_bytes = read_bytes(real_dir + "/sample.png")
+    _assert(png_size > 0 and len(png_bytes) == png_size, "regular file size/read_bytes preserved")
+
+    # cooker_v2 _is_dir & cook_workspace must reject symlinks even with trailing slash
+    _assert(_is_dir(real_dir) and _is_dir(real_dir + "/"), "_is_dir accepts real directory with/without trailing slash")
+    _assert(not _is_dir(sym_dir) and not _is_dir(sym_dir + "/"), "_is_dir rejects symlink directory with/without trailing slash")
+    var rep = cook_workspace(sym_dir + "/", out_flpk, pool, cache_dir=cache_dir, force_recook=True)
+    _assert(rep.total_assets == 0, "cook_workspace on symlink directory with trailing slash must cook 0 assets")
+    print("    [OK] os.read_bytes/file_size dir guard & cooker_v2 trailing-slash symlink guard passed!")
+
+
 def main() raises:
     var t0 = get_time()
     var pid = Int(external_call["getpid", Int32]())
@@ -4051,9 +4130,12 @@ def main() raises:
     test_i_f20_residency_and_f21_codecs(tmp_root)
     test_j_studio_v5_unification_ux_and_headless_smoke(tmp_root)
     test_k_procedural_qem_and_toksvig()
+    test_l_cook_workspace_symlink_loop_bomb(tmp_root, pool)
+    test_m_mcp_socket_path_stdlib_open_coexistence()
+    test_n_os_read_bytes_dir_and_cooker_trailing_slash(tmp_root, pool)
 
     pool.stop()
     _rm_rf_tmp(tmp_root)
 
     var elapsed_ms = (get_time() - t0) * 1000.0
-    print("[Flint v5 Track 5] ALL 11 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")
+    print("[Flint v5 Track 5] ALL 14 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")

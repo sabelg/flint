@@ -138,10 +138,10 @@ struct FlintPluginApiV1(Copyable, ImplicitlyCopyable, Movable):
 def _copy_file_fast(src_path: String, dst_path: String) -> Bool:
     var s = src_path
     var d = dst_path
-    var rfd = external_call["open", Int32](s.as_c_string_span(), Int32(0), Int32(0))
+    var rfd = external_call["openat", Int32](Int32(-100), s.as_c_string_span(), Int32(0), Int32(0))
     if rfd < 0:
         return False
-    var wfd = external_call["open", Int32](d.as_c_string_span(), Int32(1 | 64 | 512), Int32(493))
+    var wfd = external_call["openat", Int32](Int32(-100), d.as_c_string_span(), Int32(1 | 64 | 512), Int32(493))
     if wfd < 0:
         _ = external_call["close", Int32](rfd)
         return False

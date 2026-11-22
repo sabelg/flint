@@ -84,11 +84,13 @@ struct CffPrivateDict(Copyable, Movable):
     var default_width: Float32
     var nominal_width: Float32
     var local_subrs: List[CffSlice]
+    var local_subrs_idx: Int
 
     def __init__(out self):
         self.default_width = 0.0
         self.nominal_width = 0.0
         self.local_subrs = List[CffSlice]()
+        self.local_subrs_idx = -1
 
 
 struct _T2State(Movable):
@@ -102,6 +104,8 @@ struct _T2State(Movable):
     var contour_open: Bool
     var contour_start: Int
     var done: Bool
+    var op_count: Int
+    var subr_call_count: Int
 
     def __init__(out self, default_width: Float32):
         self.stack = List[Float32]()
@@ -114,6 +118,8 @@ struct _T2State(Movable):
         self.contour_open = False
         self.contour_start = 0
         self.done = False
+        self.op_count = 0
+        self.subr_call_count = 0
 
 
 def tag_value(tag: String) -> Int:
@@ -206,6 +212,7 @@ struct TrueTypeFont(Copyable, Movable):
     var cff_gsubrs: List[CffSlice]
     var cff_private: CffPrivateDict
     var cff_fd_privates: List[CffPrivateDict]
+    var cff_local_subr_pools: List[List[CffSlice]]
     var cff_fd_select_off: Int
     var cff_encoding_off: Int
     var cff_charset_off: Int
@@ -242,6 +249,7 @@ struct TrueTypeFont(Copyable, Movable):
         self.cff_gsubrs = List[CffSlice]()
         self.cff_private = CffPrivateDict()
         self.cff_fd_privates = List[CffPrivateDict]()
+        self.cff_local_subr_pools = List[List[CffSlice]]()
         self.cff_fd_select_off = -1
         self.cff_encoding_off = -1
         self.cff_charset_off = -1
@@ -308,6 +316,7 @@ struct TrueTypeFont(Copyable, Movable):
         self.cff_gsubrs = List[CffSlice]()
         self.cff_private = CffPrivateDict()
         self.cff_fd_privates = List[CffPrivateDict]()
+        self.cff_local_subr_pools = List[List[CffSlice]]()
         self.cff_fd_select_off = -1
         self.cff_encoding_off = -1
         self.cff_charset_off = -1
@@ -331,7 +340,7 @@ struct TrueTypeFont(Copyable, Movable):
             var record = 12 + index * 16
             var offset = self.u32(record + 8)
             var length = self.u32(record + 12)
-            if offset + length > len(self.data):
+            if offset < 0 or length < 0 or offset > len(self.data) or length > len(self.data) - offset:
                 self.error = "a table runs past the end of the file"
                 return False
             self.tables[self.u32(record)] = offset
@@ -372,7 +381,7 @@ struct TrueTypeFont(Copyable, Movable):
             var os2 = self.table("OS/2")
             self.cap_height = Int(Float32(self.units_per_em) * 0.7)
             self.x_height = Int(Float32(self.units_per_em) * 0.5)
-            if os2 >= 0 and self.u16(os2) >= 2:
+            if os2 >= 0 and self.table_length("OS/2") >= 90 and self.u16(os2) >= 2:
                 self.x_height = self.i16(os2 + 86)
                 self.cap_height = self.i16(os2 + 88)
             if self.table("cmap") >= 0:
@@ -385,6 +394,9 @@ struct TrueTypeFont(Copyable, Movable):
                     self.error = "missing table " + name
                     return False
             var head = self.table("head")
+            if self.table_length("head") < 52 or self.table_length("maxp") < 6 or self.table_length("hhea") < 36:
+                self.error = "truncated font header tables"
+                return False
             self.units_per_em = self.u16(head + 18)
             self.index_to_loc = self.i16(head + 50)
             if self.units_per_em < 16 or self.units_per_em > 16384:
@@ -403,7 +415,7 @@ struct TrueTypeFont(Copyable, Movable):
             var os2 = self.table("OS/2")
             self.cap_height = Int(Float32(self.units_per_em) * 0.7)
             self.x_height = Int(Float32(self.units_per_em) * 0.5)
-            if os2 >= 0 and self.u16(os2) >= 2:
+            if os2 >= 0 and self.table_length("OS/2") >= 90 and self.u16(os2) >= 2:
                 self.x_height = self.i16(os2 + 86)
                 self.cap_height = self.i16(os2 + 88)
             if not self.pick_cmap():
@@ -418,14 +430,20 @@ struct TrueTypeFont(Copyable, Movable):
 
     def pick_cmap(mut self) -> Bool:
         var cmap = self.table("cmap")
-        var count = self.u16(cmap + 2)
+        var cmap_len = self.table_length("cmap")
+        if cmap < 0 or cmap_len < 4 or cmap + cmap_len > len(self.data):
+            return False
+        var count = min(self.u16(cmap + 2), (cmap_len - 4) // 8)
         var best = -1
         var best_score = 0
         for index in range(count):
             var record = cmap + 4 + index * 8
             var platform = self.u16(record)
             var encoding = self.u16(record + 2)
-            var sub = cmap + self.u32(record + 4)
+            var sub_rel = self.u32(record + 4)
+            if sub_rel < 4 or sub_rel + 4 > cmap_len:
+                continue
+            var sub = cmap + sub_rel
             var format = self.u16(sub)
             var score = 0
             if format == 12 and (platform == 3 and encoding == 10 or platform == 0):
@@ -547,11 +565,17 @@ struct TrueTypeFont(Copyable, Movable):
         self.axes = List[VariationAxis]()
         self.coords = List[Float32]()
         var fvar = self.table("fvar")
-        if fvar < 0:
+        var fvar_len = self.table_length("fvar")
+        if fvar < 0 or fvar_len < 16 or fvar + fvar_len > len(self.data):
             return
-        var axes_offset = fvar + self.u16(fvar + 4)
+        var axes_rel = self.u16(fvar + 4)
         var count = self.u16(fvar + 8)
         var size = self.u16(fvar + 10)
+        if size < 16 or axes_rel < 16 or axes_rel > fvar_len:
+            return
+        if count > (fvar_len - axes_rel) // size:
+            return
+        var axes_offset = fvar + axes_rel
         for index in range(count):
             var at = axes_offset + index * size
             self.axes.append(VariationAxis(self.u32(at), self.fixed(at + 4), self.fixed(at + 8), self.fixed(at + 12)))
@@ -582,12 +606,18 @@ struct TrueTypeFont(Copyable, Movable):
 
     def avar_map(self, axis: Int, value: Float32) -> Float32:
         var avar = self.table("avar")
-        if avar < 0:
+        var avar_len = self.table_length("avar")
+        if avar < 0 or avar_len < 8 or avar + avar_len > len(self.data):
             return value
+        var avar_end = avar + avar_len
         var count = self.u16(avar + 6)
         var at = avar + 8
         for index in range(count):
+            if at + 2 > avar_end:
+                return value
             var pairs = self.u16(at)
+            if at + 2 + pairs * 4 > avar_end:
+                return value
             if index == axis and pairs > 0:
                 var previous_from = self.f2dot14(at + 2)
                 var previous_to = self.f2dot14(at + 4)
@@ -608,8 +638,13 @@ struct TrueTypeFont(Copyable, Movable):
 
     def region_scalar(self, peaks: List[Float32], starts: List[Float32], ends: List[Float32], intermediate: Bool) -> Float32:
         """How much of one tuple's deltas apply at the current instance."""
+        var n_axes = len(self.coords)
+        if len(peaks) < n_axes:
+            return 0
+        if intermediate and (len(starts) < n_axes or len(ends) < n_axes):
+            return 0
         var scalar: Float32 = 1
-        for axis in range(len(self.coords)):
+        for axis in range(n_axes):
             var peak = peaks[axis]
             if peak == 0:
                 continue
@@ -655,7 +690,7 @@ struct TrueTypeFont(Copyable, Movable):
             return (False, slices^, at)
         var off_arr = at + 3
         var data_base = off_arr + (count + 1) * off_size - 1
-        if data_base + 1 > self.cff_end:
+        if data_base < 0 or data_base + 1 > self.cff_end:
             return (False, slices^, at)
         for i in range(count):
             var o0 = self.cff_uint(off_arr + i * off_size, off_size)
@@ -858,6 +893,9 @@ struct TrueTypeFont(Copyable, Movable):
                 self.error = "invalid CFF CharStrings INDEX"
                 return False
             self.cff_charstrings = cs_res[1].copy()
+        var subr_pool_by_off = Dict[Int, Int]()
+        var total_local_subr_slices = 0
+        comptime MAX_CFF_TOTAL_LOCAL_SUBRS: Int = 131072
         if priv_size > 0 and priv_off > 0 and cff + priv_off + priv_size <= self.cff_end:
             var subr_rel = -1
             var u1 = 0; var u2 = 0; var u3 = 0; var u4 = 0; var u5 = 0; var u6 = 0; var u7 = 0
@@ -869,10 +907,23 @@ struct TrueTypeFont(Copyable, Movable):
                 False,
                 u1, u2, u3, u4, u5, u6, u7, subr_rel,
             )
-            if subr_rel > 0 and cff + priv_off + subr_rel < self.cff_end:
-                var ls_res = self.cff_read_index(cff + priv_off + subr_rel)
-                if ls_res[0]:
-                    priv.local_subrs = ls_res[1].copy()
+            if subr_rel > 0 and cff + priv_off + subr_rel + 2 <= self.cff_end:
+                var subr_abs = cff + priv_off + subr_rel
+                var existing = subr_pool_by_off.get(subr_abs)
+                if existing:
+                    priv.local_subrs_idx = existing.value()
+                else:
+                    var cnt_peek = self.u16(subr_abs)
+                    if total_local_subr_slices + cnt_peek > MAX_CFF_TOTAL_LOCAL_SUBRS:
+                        self.error = "CFF local subr count exceeds limit"
+                        return False
+                    var ls_res = self.cff_read_index(subr_abs)
+                    if ls_res[0]:
+                        var pool_idx = len(self.cff_local_subr_pools)
+                        total_local_subr_slices += len(ls_res[1])
+                        self.cff_local_subr_pools.append(ls_res[1].copy())
+                        subr_pool_by_off[subr_abs] = pool_idx
+                        priv.local_subrs_idx = pool_idx
             self.cff_private = priv^
         if fd_array_off > 0 and fd_select_off > 0 and cff + fd_array_off < self.cff_end:
             self.cff_fd_select_off = cff + fd_select_off
@@ -900,10 +951,23 @@ struct TrueTypeFont(Copyable, Movable):
                             False,
                             v1, v2, v3, v4, v5, v6, v7, s_rel,
                         )
-                        if s_rel > 0 and cff + f_poff + s_rel < self.cff_end:
-                            var fls_res = self.cff_read_index(cff + f_poff + s_rel)
-                            if fls_res[0]:
-                                fd_priv.local_subrs = fls_res[1].copy()
+                        if s_rel > 0 and cff + f_poff + s_rel + 2 <= self.cff_end:
+                            var subr_abs = cff + f_poff + s_rel
+                            var existing = subr_pool_by_off.get(subr_abs)
+                            if existing:
+                                fd_priv.local_subrs_idx = existing.value()
+                            else:
+                                var cnt_peek = self.u16(subr_abs)
+                                if total_local_subr_slices + cnt_peek > MAX_CFF_TOTAL_LOCAL_SUBRS:
+                                    self.error = "CFF local subr count exceeds limit"
+                                    return False
+                                var fls_res = self.cff_read_index(subr_abs)
+                                if fls_res[0]:
+                                    var pool_idx = len(self.cff_local_subr_pools)
+                                    total_local_subr_slices += len(fls_res[1])
+                                    self.cff_local_subr_pools.append(fls_res[1].copy())
+                                    subr_pool_by_off[subr_abs] = pool_idx
+                                    fd_priv.local_subrs_idx = pool_idx
                     self.cff_fd_privates.append(fd_priv^)
         return True
 
@@ -1009,6 +1073,10 @@ struct TrueTypeFont(Copyable, Movable):
         var pc = slice.offset
         var end = min(self.cff_end, slice.offset + slice.length)
         while pc < end and not state.done:
+            state.op_count += 1
+            if state.op_count > 65536:
+                state.done = True
+                return
             var b0 = self.u8(pc)
             if b0 == 28:
                 if pc + 3 > end:
@@ -1183,16 +1251,28 @@ struct TrueTypeFont(Copyable, Movable):
                     var mask_bytes = (state.stem_count + 7) // 8
                     pc = min(end, pc + mask_bytes)
                 elif b0 == 10:  # callsubr
-                    if len(state.stack) >= 1 and len(priv.local_subrs) > 0:
-                        var bias = Self.cff_subr_bias(len(priv.local_subrs))
-                        var idx = Int(state.stack.pop()) + bias
-                        if idx >= 0 and idx < len(priv.local_subrs):
-                            self._exec_t2_slice(priv.local_subrs[idx], priv, state, out, depth + 1)
+                    if len(state.stack) >= 1:
+                        var has_pool = priv.local_subrs_idx >= 0 and priv.local_subrs_idx < len(self.cff_local_subr_pools)
+                        var n_subrs = len(self.cff_local_subr_pools[priv.local_subrs_idx]) if has_pool else len(priv.local_subrs)
+                        if n_subrs > 0:
+                            var bias = Self.cff_subr_bias(n_subrs)
+                            var idx = Int(state.stack.pop()) + bias
+                            if idx >= 0 and idx < n_subrs:
+                                state.subr_call_count += 1
+                                if state.subr_call_count > 4096:
+                                    state.done = True
+                                    return
+                                var subr_slice = self.cff_local_subr_pools[priv.local_subrs_idx][idx] if has_pool else priv.local_subrs[idx]
+                                self._exec_t2_slice(subr_slice, priv, state, out, depth + 1)
                 elif b0 == 29:  # callgsubr
                     if len(state.stack) >= 1 and len(self.cff_gsubrs) > 0:
                         var bias = Self.cff_subr_bias(len(self.cff_gsubrs))
                         var idx = Int(state.stack.pop()) + bias
                         if idx >= 0 and idx < len(self.cff_gsubrs):
+                            state.subr_call_count += 1
+                            if state.subr_call_count > 4096:
+                                state.done = True
+                                return
                             self._exec_t2_slice(self.cff_gsubrs[idx], priv, state, out, depth + 1)
                 elif b0 == 11:  # return
                     return
@@ -1522,20 +1602,36 @@ struct TrueTypeFont(Copyable, Movable):
 
     def read_simple(self, start: Int, contours: Int, mut result: GlyphOutline):
         var at = start + 10
-        var last = -1
+        var prev_end = -1
         for _ in range(contours):
-            last = self.u16(at)
-            result.ends.append(last)
+            if at + 2 > len(self.data):
+                result.ends.clear()
+                return
+            var end_pt = self.u16(at)
+            if end_pt < prev_end:
+                result.ends.clear()
+                return
+            result.ends.append(end_pt)
+            prev_end = end_pt
             at += 2
-        var count = last + 1
+        var count = max(0, prev_end + 1)
+        if at + 2 > len(self.data):
+            result.ends.clear()
+            return
         var instructions = self.u16(at)
         at += 2 + instructions
         var flags = List[Int]()
         while len(flags) < count:
+            if at >= len(self.data):
+                result.ends.clear()
+                return
             var flag = self.u8(at)
             at += 1
             flags.append(flag)
             if flag & 0x08 != 0:
+                if at >= len(self.data):
+                    result.ends.clear()
+                    return
                 var repeat = self.u8(at)
                 at += 1
                 for _ in range(repeat):
@@ -1620,16 +1716,24 @@ struct TrueTypeFont(Copyable, Movable):
         if len(self.coords) == 0:
             return
         var gvar = self.table("gvar")
-        if gvar < 0:
+        var gvar_len = self.table_length("gvar")
+        if gvar < 0 or gvar_len < 20 or gvar + gvar_len > len(self.data):
             return
+        var gvar_end = gvar + gvar_len
         var axis_count = self.u16(gvar + 4)
         var shared_count = self.u16(gvar + 6)
         var shared_offset = gvar + self.u32(gvar + 8)
         var glyphs = self.u16(gvar + 12)
         var long_offsets = self.u16(gvar + 14) & 1 != 0
         var array = gvar + self.u32(gvar + 16)
-        if glyph >= glyphs or axis_count != len(self.coords):
+        if glyph < 0 or glyph >= glyphs or axis_count != len(self.coords):
             return
+        if long_offsets:
+            if gvar + 20 + (glyph + 2) * 4 > gvar_end:
+                return
+        else:
+            if gvar + 20 + (glyph + 2) * 2 > gvar_end:
+                return
         var begin: Int
         var finish: Int
         if long_offsets:
@@ -1641,10 +1745,16 @@ struct TrueTypeFont(Copyable, Movable):
         if finish <= begin:
             return
         var base = array + begin
+        if base < gvar or base + 4 > gvar_end or array + finish > gvar_end:
+            return
+        if shared_count > 0 and (shared_offset < gvar or shared_offset + shared_count * axis_count * 2 > gvar_end):
+            return
         var tuple_word = self.u16(base)
         var tuple_count = tuple_word & 0x0FFF
         var data = base + self.u16(base + 2)
         var header = base + 4
+        if data < base or data > array + finish:
+            return
         var total = len(xs)
         var shared_points = List[Int]()
         var have_shared = False
@@ -1655,11 +1765,15 @@ struct TrueTypeFont(Copyable, Movable):
         var original_x = xs.copy()
         var original_y = ys.copy()
         for _ in range(tuple_count):
+            if header + 4 > gvar_end:
+                return
             var size = self.u16(header)
             var index = self.u16(header + 2)
             header += 4
             var peaks = List[Float32]()
             if index & 0x8000 != 0:
+                if header + axis_count * 2 > gvar_end:
+                    return
                 for axis in range(axis_count):
                     peaks.append(self.f2dot14(header + axis * 2))
                 header += axis_count * 2
@@ -1673,6 +1787,8 @@ struct TrueTypeFont(Copyable, Movable):
             var stops = List[Float32]()
             var intermediate = index & 0x4000 != 0
             if intermediate:
+                if header + axis_count * 4 > gvar_end:
+                    return
                 for axis in range(axis_count):
                     starts.append(self.f2dot14(header + axis * 2))
                     stops.append(self.f2dot14(header + (axis_count + axis) * 2))
@@ -1721,18 +1837,24 @@ struct TrueTypeFont(Copyable, Movable):
     def find_kern_lookups(mut self):
         self.kern_lookups = List[Int]()
         var gpos = self.table("GPOS")
-        if gpos < 0:
+        var gpos_len = self.table_length("GPOS")
+        if gpos < 0 or gpos_len < 10 or gpos + gpos_len > len(self.data):
             return
+        var gpos_end = gpos + gpos_len
         var features = gpos + self.u16(gpos + 6)
         var lookups = gpos + self.u16(gpos + 8)
-        var feature_count = self.u16(features)
+        if features + 2 > gpos_end or lookups + 2 > gpos_end:
+            return
+        var feature_count = min(self.u16(features), (gpos_end - features - 2) // 6)
         var wanted = List[Int]()
         for index in range(feature_count):
             var record = features + 2 + index * 6
             if self.u32(record) != tag_value("kern"):
                 continue
             var feature = features + self.u16(record + 4)
-            var count = self.u16(feature + 2)
+            if feature + 4 > gpos_end:
+                continue
+            var count = min(self.u16(feature + 2), (gpos_end - feature - 4) // 2)
             for k in range(count):
                 var lookup = self.u16(feature + 4 + k * 2)
                 var seen = False
@@ -1742,7 +1864,7 @@ struct TrueTypeFont(Copyable, Movable):
                 if not seen:
                     wanted.append(lookup)
         sort_ints(wanted)
-        var lookup_count = self.u16(lookups)
+        var lookup_count = min(self.u16(lookups), (gpos_end - lookups - 2) // 2)
         for lookup in wanted:
             if lookup < lookup_count:
                 self.kern_lookups.append(lookups + self.u16(lookups + 2 + lookup * 2))
@@ -1833,29 +1955,46 @@ struct TrueTypeFont(Copyable, Movable):
     def item_delta(self, outer: Int, inner: Int) -> Float32:
         """A delta from GDEF's item variation store at this instance."""
         var gdef = self.table("GDEF")
-        if gdef < 0 or self.u16(gdef + 2) < 3:
+        var gdef_len = self.table_length("GDEF")
+        if gdef < 0 or gdef_len < 18 or gdef + gdef_len > len(self.data):
+            return 0
+        var gdef_end = gdef + gdef_len
+        if self.u16(gdef + 2) < 3:
             return 0
         var store_offset = self.u32(gdef + 14)
-        if store_offset == 0:
+        if store_offset == 0 or store_offset > gdef_len - 8:
             return 0
         var store = gdef + store_offset
-        var regions = store + self.u32(store + 2)
+        var regions_rel = self.u32(store + 2)
         var data_count = self.u16(store + 6)
-        if outer >= data_count:
+        if outer < 0 or outer >= data_count or store + 8 + (outer + 1) * 4 > gdef_end:
             return 0
-        var data = store + self.u32(store + 8 + outer * 4)
+        var regions = store + regions_rel
+        if regions < store or regions + 4 > gdef_end:
+            return 0
+        var axis_count = self.u16(regions)
+        var region_total = self.u16(regions + 2)
+        if axis_count <= 0 or axis_count != len(self.coords):
+            return 0
+        var data_rel = self.u32(store + 8 + outer * 4)
+        var data = store + data_rel
+        if data < store or data + 6 > gdef_end:
+            return 0
         var items = self.u16(data)
         var word_word = self.u16(data + 2)
         var long_words = word_word & 0x8000 != 0
         var word_count = word_word & 0x7FFF
         var region_count = self.u16(data + 4)
-        if inner >= items:
+        if inner < 0 or inner >= items or word_count > region_count:
+            return 0
+        if data + 6 + region_count * 2 > gdef_end:
             return 0
         var word_size = 4 if long_words else 2
         var small_size = 2 if long_words else 1
         var row_size = word_count * word_size + (region_count - word_count) * small_size
         var row = data + 6 + region_count * 2 + inner * row_size
-        var axis_count = self.u16(regions)
+        if row < data or row + row_size > gdef_end:
+            return 0
         var total: Float32 = 0
         var at = row
         for r in range(region_count):
@@ -1871,9 +2010,11 @@ struct TrueTypeFont(Copyable, Movable):
                     delta = b - 256 if b >= 128 else b
                 at += small_size
             var region = self.u16(data + 6 + r * 2)
-            var peaks = List[Float32]()
-            var starts = List[Float32]()
-            var stops = List[Float32]()
+            if region >= region_total or regions + 4 + (region + 1) * axis_count * 6 > gdef_end:
+                return 0
+            var peaks = List[Float32](capacity=axis_count)
+            var starts = List[Float32](capacity=axis_count)
+            var stops = List[Float32](capacity=axis_count)
             for axis in range(axis_count):
                 var axis_at = regions + 4 + (region * axis_count + axis) * 6
                 starts.append(self.f2dot14(axis_at))
@@ -1950,16 +2091,22 @@ struct TrueTypeFont(Copyable, Movable):
 
     def old_kern(self, left: Int, right: Int) -> Float32:
         var kern = self.table("kern")
-        if kern < 0 or self.u16(kern) != 0:
+        var kern_len = self.table_length("kern")
+        if kern < 0 or kern_len < 4 or kern + kern_len > len(self.data) or self.u16(kern) != 0:
             return 0
+        var kern_end = kern + kern_len
         var tables = self.u16(kern + 2)
         var at = kern + 4
         var total: Float32 = 0
         for _ in range(tables):
+            if at + 6 > kern_end:
+                break
             var length = self.u16(at + 2)
+            if length < 6 or at + length > kern_end:
+                break
             var coverage = self.u16(at + 4)
-            if coverage >> 8 == 0 and coverage & 1 != 0:
-                var pairs = self.u16(at + 6)
+            if coverage >> 8 == 0 and coverage & 1 != 0 and at + 14 <= kern_end:
+                var pairs = min(self.u16(at + 6), (kern_end - at - 14) // 6)
                 var key = (left << 16) | right
                 var low = 0
                 var high = pairs - 1
@@ -2059,7 +2206,11 @@ struct TrueTypeFont(Copyable, Movable):
         return 0
 
     def _find_gsub_script(self, script_list: Int, wanted_tag: Int) -> Int:
-        var count = self.u16(script_list)
+        var gsub_len = self.table_length("GSUB")
+        var gsub_end = self.gsub_offset + gsub_len
+        if script_list < 0 or script_list + 2 > gsub_end:
+            return -1
+        var count = min(self.u16(script_list), (gsub_end - script_list - 2) // 6)
         for i in range(count):
             var rec = script_list + 2 + i * 6
             if self.u32(rec) == wanted_tag:
@@ -2068,25 +2219,29 @@ struct TrueTypeFont(Copyable, Movable):
 
     def find_gsub_lookups(self, script_tag: String, lang_tag: String = "") -> List[Tuple[Int, UInt32]]:
         var out = List[Tuple[Int, UInt32]]()
-        if self.gsub_offset < 0:
+        var gsub_len = self.table_length("GSUB")
+        if self.gsub_offset < 0 or gsub_len < 10 or self.gsub_offset + gsub_len > len(self.data):
             return out^
         var gsub = self.gsub_offset
+        var gsub_end = gsub + gsub_len
         var script_list = gsub + self.u16(gsub + 4)
         var feature_list = gsub + self.u16(gsub + 6)
+        if script_list + 2 > gsub_end or feature_list + 2 > gsub_end:
+            return out^
 
         var script_off = self._find_gsub_script(script_list, tag_value(script_tag))
         if script_off < 0:
             script_off = self._find_gsub_script(script_list, tag_value("DFLT"))
         if script_off < 0 and (script_tag == "latn" or script_tag == "DFLT"):
             script_off = self._find_gsub_script(script_list, tag_value("latn"))
-        if script_off < 0:
+        if script_off < 0 or script_off + 4 > gsub_end:
             return out^
 
         var lang_off = -1
         var def_lang = self.u16(script_off)
         if lang_tag.byte_length() > 0:
             var ltag_val = tag_value(lang_tag)
-            var lcount = self.u16(script_off + 2)
+            var lcount = min(self.u16(script_off + 2), (gsub_end - script_off - 4) // 6)
             for i in range(lcount):
                 var rec = script_off + 4 + i * 6
                 if self.u32(rec) == ltag_val:
@@ -2094,18 +2249,18 @@ struct TrueTypeFont(Copyable, Movable):
                     break
         if lang_off < 0 and def_lang != 0:
             lang_off = script_off + def_lang
-        if lang_off < 0:
+        if lang_off < 0 or lang_off + 6 > gsub_end:
             return out^
 
         var feat_indices = List[Int]()
         var req_feat = self.u16(lang_off + 2)
         if req_feat != 0xFFFF:
             feat_indices.append(req_feat)
-        var fcount = self.u16(lang_off + 4)
+        var fcount = min(self.u16(lang_off + 4), (gsub_end - lang_off - 6) // 2)
         for i in range(fcount):
             feat_indices.append(self.u16(lang_off + 6 + i * 2))
 
-        var total_features = self.u16(feature_list)
+        var total_features = min(self.u16(feature_list), (gsub_end - feature_list - 2) // 6)
         var lookup_masks = Dict[Int, UInt32]()
         var lookup_ids = List[Int]()
         for fidx in feat_indices:
@@ -2116,7 +2271,9 @@ struct TrueTypeFont(Copyable, Movable):
             if mask == 0:
                 continue
             var feat = feature_list + self.u16(rec + 4)
-            var lcnt = self.u16(feat + 2)
+            if feat + 4 > gsub_end:
+                continue
+            var lcnt = min(self.u16(feat + 2), (gsub_end - feat - 4) // 2)
             for k in range(lcnt):
                 var lidx = self.u16(feat + 4 + k * 2)
                 var prev = lookup_masks.get(lidx)
@@ -2137,14 +2294,21 @@ struct TrueTypeFont(Copyable, Movable):
         var lookups = self.find_gsub_lookups(script_tag, lang_tag)
         if len(lookups) == 0:
             return
+        var gsub_len = self.table_length("GSUB")
+        var gsub_end = self.gsub_offset + gsub_len
         var lookup_list = self.gsub_offset + self.u16(self.gsub_offset + 8)
-        var lookup_count = self.u16(lookup_list)
+        if lookup_list + 2 > gsub_end:
+            return
+        var lookup_count = min(self.u16(lookup_list), (gsub_end - lookup_list - 2) // 2)
+        var max_glyphs = max(len(glyphs), min(65536, max(4096, len(glyphs) * 8)))
         for entry in lookups:
+            if len(glyphs) >= max_glyphs:
+                break
             var lidx = entry[0]
             var fmask = entry[1]
             if lidx >= 0 and lidx < lookup_count:
                 var l_off = lookup_list + self.u16(lookup_list + 2 + lidx * 2)
-                self._apply_gsub_lookup(glyphs, l_off, fmask, lookup_list, lookup_count, 0)
+                self._apply_gsub_lookup(glyphs, l_off, fmask, lookup_list, lookup_count, 0, max_glyphs)
 
     def _next_non_ignored(self, glyphs: List[GsubGlyph], start: Int, lflag: Int, mfs: Int) -> Int:
         var p = start
@@ -2170,13 +2334,67 @@ struct TrueTypeFont(Copyable, Movable):
         lookup_list: Int,
         lookup_count: Int,
         depth: Int,
+        max_glyphs: Int = 65536,
     ):
-        if depth >= 8 or lookup_off < 0 or lookup_off + 6 > len(self.data):
+        if depth >= 8 or lookup_off < 0 or lookup_off + 6 > len(self.data) or len(glyphs) >= max_glyphs:
             return
         var ltype = self.u16(lookup_off)
         var lflag = self.u16(lookup_off + 2)
         var sub_count = self.u16(lookup_off + 4)
-        var mfs = self.u16(lookup_off + 6 + sub_count * 2) if (lflag & LOOKUP_FLAG_USE_MARK_FILTERING_SET) != 0 else -1
+        if lookup_off + 6 + sub_count * 2 > len(self.data):
+            return
+        var mfs = self.u16(lookup_off + 6 + sub_count * 2) if (lflag & LOOKUP_FLAG_USE_MARK_FILTERING_SET) != 0 and lookup_off + 8 + sub_count * 2 <= len(self.data) else -1
+        var all_multiple = (ltype == 2)
+        if ltype == 7 and sub_count > 0:
+            all_multiple = True
+            for s_idx in range(sub_count):
+                var ext_sub = lookup_off + self.u16(lookup_off + 6 + s_idx * 2)
+                if ext_sub + 8 > len(self.data) or self.u16(ext_sub) != 1 or self.u16(ext_sub + 2) != 2:
+                    all_multiple = False
+                    break
+        if all_multiple:
+            var out = List[GsubGlyph](capacity=len(glyphs))
+            var any_changed = False
+            var n_in = len(glyphs)
+            for i in range(n_in):
+                var g = glyphs[i]
+                if (g.mask & feat_mask) == 0 or self.should_ignore_glyph(g.glyph_id, lflag, mfs):
+                    out.append(g)
+                    continue
+                var expanded = False
+                for s_idx in range(sub_count):
+                    var sub = lookup_off + self.u16(lookup_off + 6 + s_idx * 2)
+                    if ltype == 7:
+                        sub = sub + self.u32(sub + 4)
+                    if sub < 0 or sub + 6 > len(self.data) or self.u16(sub) != 1:
+                        continue
+                    var cov_idx = self.coverage_index(sub + self.u16(sub + 2), g.glyph_id)
+                    var seq_cnt = self.u16(sub + 4)
+                    if cov_idx < 0 or cov_idx >= seq_cnt or sub + 8 + cov_idx * 2 > len(self.data):
+                        continue
+                    var seq = sub + self.u16(sub + 6 + cov_idx * 2)
+                    if seq < 0 or seq + 2 > len(self.data):
+                        continue
+                    var gcnt = self.u16(seq)
+                    if seq + 2 + gcnt * 2 > len(self.data):
+                        continue
+                    var rem_tail = n_in - 1 - i
+                    if len(out) + gcnt + rem_tail > max_glyphs:
+                        for k in range(i, n_in):
+                            out.append(glyphs[k])
+                        if any_changed:
+                            glyphs = out^
+                        return
+                    for k in range(gcnt):
+                        out.append(GsubGlyph(self.u16(seq + 2 + k * 2), g.cluster, g.mask, g.alt_choice))
+                    expanded = True
+                    any_changed = True
+                    break
+                if not expanded:
+                    out.append(g)
+            if any_changed:
+                glyphs = out^
+            return
         var i = 0
         while i < len(glyphs):
             if (glyphs[i].mask & feat_mask) == 0 or self.should_ignore_glyph(glyphs[i].glyph_id, lflag, mfs):
@@ -2188,12 +2406,12 @@ struct TrueTypeFont(Copyable, Movable):
                 var sub = lookup_off + self.u16(lookup_off + 6 + s_idx * 2)
                 var sub_type = ltype
                 if sub_type == 7:
-                    if self.u16(sub) != 1:
+                    if sub + 8 > len(self.data) or self.u16(sub) != 1:
                         continue
                     sub_type = self.u16(sub + 2)
                     sub = sub + self.u32(sub + 4)
                 var res = self._apply_gsub_subtable(
-                    glyphs, i, sub_type, sub, lflag, mfs, lookup_list, lookup_count, depth
+                    glyphs, i, sub_type, sub, lflag, mfs, lookup_list, lookup_count, depth, max_glyphs
                 )
                 if res[0]:
                     matched = True
@@ -2212,26 +2430,29 @@ struct TrueTypeFont(Copyable, Movable):
         lookup_list: Int,
         lookup_count: Int,
         depth: Int,
+        max_glyphs: Int = 65536,
     ) -> Bool:
         if depth >= 8 or lookup_idx < 0 or lookup_idx >= lookup_count or pos < 0 or pos >= len(glyphs):
             return False
         var lookup_off = lookup_list + self.u16(lookup_list + 2 + lookup_idx * 2)
+        if lookup_off < 0 or lookup_off + 6 > len(self.data):
+            return False
         var ltype = self.u16(lookup_off)
         var lflag = self.u16(lookup_off + 2)
         var sub_count = self.u16(lookup_off + 4)
-        var mfs = self.u16(lookup_off + 6 + sub_count * 2) if (lflag & LOOKUP_FLAG_USE_MARK_FILTERING_SET) != 0 else -1
+        var mfs = self.u16(lookup_off + 6 + sub_count * 2) if (lflag & LOOKUP_FLAG_USE_MARK_FILTERING_SET) != 0 and lookup_off + 8 + sub_count * 2 <= len(self.data) else -1
         if self.should_ignore_glyph(glyphs[pos].glyph_id, lflag, mfs):
             return False
         for s_idx in range(sub_count):
             var sub = lookup_off + self.u16(lookup_off + 6 + s_idx * 2)
             var sub_type = ltype
             if sub_type == 7:
-                if self.u16(sub) != 1:
+                if sub + 8 > len(self.data) or self.u16(sub) != 1:
                     continue
                 sub_type = self.u16(sub + 2)
                 sub = sub + self.u32(sub + 4)
             var res = self._apply_gsub_subtable(
-                glyphs, pos, sub_type, sub, lflag, mfs, lookup_list, lookup_count, depth + 1
+                glyphs, pos, sub_type, sub, lflag, mfs, lookup_list, lookup_count, depth + 1, max_glyphs
             )
             if res[0]:
                 return True
@@ -2245,13 +2466,14 @@ struct TrueTypeFont(Copyable, Movable):
         lookup_list: Int,
         lookup_count: Int,
         depth: Int,
+        max_glyphs: Int = 65536,
     ):
         for rec in seq_records:
             if rec.sequence_index < 0 or rec.sequence_index >= len(match_pos):
                 continue
             var p = match_pos[rec.sequence_index]
             var old_len = len(glyphs)
-            if self._apply_gsub_at(glyphs, p, rec.lookup_index, lookup_list, lookup_count, depth):
+            if self._apply_gsub_at(glyphs, p, rec.lookup_index, lookup_list, lookup_count, depth, max_glyphs):
                 var delta = len(glyphs) - old_len
                 if delta != 0:
                     for k in range(rec.sequence_index + 1, len(match_pos)):
@@ -2274,6 +2496,7 @@ struct TrueTypeFont(Copyable, Movable):
         lookup_list: Int,
         lookup_count: Int,
         depth: Int,
+        max_glyphs: Int = 65536,
     ) -> Tuple[Bool, Int]:
         if sub < 0 or sub + 4 > len(self.data) or i < 0 or i >= len(glyphs):
             return (False, i + 1)
@@ -2295,14 +2518,20 @@ struct TrueTypeFont(Copyable, Movable):
             return (False, i + 1)
 
         if sub_type == 2:  # MultipleSubst
-            if fmt != 1:
+            if fmt != 1 or sub + 6 > len(self.data):
                 return (False, i + 1)
             var cov_idx = self.coverage_index(sub + self.u16(sub + 2), gid)
             var seq_cnt = self.u16(sub + 4)
-            if cov_idx < 0 or cov_idx >= seq_cnt:
+            if cov_idx < 0 or cov_idx >= seq_cnt or sub + 8 + cov_idx * 2 > len(self.data):
                 return (False, i + 1)
             var seq = sub + self.u16(sub + 6 + cov_idx * 2)
+            if seq < 0 or seq + 2 > len(self.data):
+                return (False, i + 1)
             var gcnt = self.u16(seq)
+            if seq + 2 + gcnt * 2 > len(self.data):
+                return (False, i + 1)
+            if len(glyphs) - 1 + gcnt > max_glyphs:
+                return (False, len(glyphs))
             var orig = glyphs[i]
             var next_glyphs = List[GsubGlyph](capacity=len(glyphs) - 1 + gcnt)
             for k in range(i):
@@ -2388,7 +2617,7 @@ struct TrueTypeFont(Copyable, Movable):
                         cur = nxt
                     if ok:
                         var recs = self._read_seq_lookups(rule + 4 + max(0, gcnt - 1) * 2, scnt)
-                        self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth)
+                        self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth, max_glyphs)
                         return (True, max(i + 1, match_pos[len(match_pos) - 1] + 1))
                 return (False, i + 1)
             if fmt == 2:
@@ -2422,7 +2651,7 @@ struct TrueTypeFont(Copyable, Movable):
                         cur = nxt
                     if ok:
                         var recs = self._read_seq_lookups(rule + 4 + max(0, gcnt - 1) * 2, scnt)
-                        self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth)
+                        self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth, max_glyphs)
                         return (True, max(i + 1, match_pos[len(match_pos) - 1] + 1))
                 return (False, i + 1)
             if fmt == 3:
@@ -2445,7 +2674,7 @@ struct TrueTypeFont(Copyable, Movable):
                     cur = nxt
                 if ok:
                     var recs = self._read_seq_lookups(sub + 6 + gcnt * 2, scnt)
-                    self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth)
+                    self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth, max_glyphs)
                     return (True, max(i + 1, match_pos[len(match_pos) - 1] + 1))
                 return (False, i + 1)
             return (False, i + 1)
@@ -2499,7 +2728,7 @@ struct TrueTypeFont(Copyable, Movable):
                     if ok:
                         var scnt = self.u16(at)
                         var recs = self._read_seq_lookups(at + 2, scnt)
-                        self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth)
+                        self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth, max_glyphs)
                         return (True, max(i + 1, match_pos[len(match_pos) - 1] + 1))
                 return (False, i + 1)
             if fmt == 2:
@@ -2559,7 +2788,7 @@ struct TrueTypeFont(Copyable, Movable):
                     if ok:
                         var scnt = self.u16(at)
                         var recs = self._read_seq_lookups(at + 2, scnt)
-                        self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth)
+                        self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth, max_glyphs)
                         return (True, max(i + 1, match_pos[len(match_pos) - 1] + 1))
                 return (False, i + 1)
             if fmt == 3:
@@ -2607,7 +2836,7 @@ struct TrueTypeFont(Copyable, Movable):
                 if ok:
                     var scnt = self.u16(at)
                     var recs = self._read_seq_lookups(at + 2, scnt)
-                    self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth)
+                    self._apply_seq_lookups(glyphs, match_pos, recs, lookup_list, lookup_count, depth, max_glyphs)
                     return (True, max(i + 1, match_pos[len(match_pos) - 1] + 1))
                 return (False, i + 1)
         return (False, i + 1)

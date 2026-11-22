@@ -461,8 +461,9 @@ def _jpeg_assemble_image(
     maximum_size: Int,
 ) -> NativeImage:
     var image = NativeImage()
+    var max_dim = max(1, maximum_size)
     var scale = 1
-    while (width + scale - 1) // scale > maximum_size or (height + scale - 1) // scale > maximum_size:
+    while (width + scale - 1) // scale > max_dim or (height + scale - 1) // scale > max_dim:
         scale *= 2
     image.width = (width + scale - 1) // scale
     image.height = (height + scale - 1) // scale
@@ -606,10 +607,6 @@ def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
                 components[ci].blocks_h = mcu_h0 * components[ci].vertical
                 components[ci].stride = components[ci].blocks_w * 8
                 components[ci].rows = components[ci].blocks_h * 8
-                if is_progressive:
-                    components[ci].coeffs = List[Int32](length=components[ci].blocks_w * components[ci].blocks_h * 64, fill=0)
-                else:
-                    components[ci].samples = List[UInt8](length=components[ci].stride * components[ci].rows, fill=0)
         elif marker == 218:  # SOS
             if width <= 0 or height <= 0 or len(components) == 0 or end <= start:
                 return image^
@@ -649,10 +646,56 @@ def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
                 for prev_idx in scan_comp_indices:
                     if prev_idx == found_idx:
                         return image^
-                components[found_idx].dc_table = tables >> 4
-                components[found_idx].ac_table = tables & 15
+                var dc_t = tables >> 4
+                var ac_t = tables & 15
+                if (not is_progressive or (ss == 0 and ah == 0)) and not dc_tables[dc_t].valid:
+                    return image^
+                if (not is_progressive or (ss > 0 and ah == 0)) and not ac_tables[ac_t].valid:
+                    return image^
+                components[found_idx].dc_table = dc_t
+                components[found_idx].ac_table = ac_t
                 components[found_idx].predictor = 0
                 scan_comp_indices.append(found_idx)
+
+            var rem_bytes = len(data) - end
+            if rem_bytes <= 0:
+                return image^
+            var total_blocks = 0
+            for ci in range(len(components)):
+                total_blocks += components[ci].blocks_w * components[ci].blocks_h
+            if len(data) < (total_blocks + 7) // 8:
+                return image^
+            if not is_progressive:
+                var mcu_w_chk = (width + maximum_horizontal * 8 - 1) // (maximum_horizontal * 8)
+                var mcu_h_chk = (height + maximum_vertical * 8 - 1) // (maximum_vertical * 8)
+                var blocks_per_mcu = 0
+                for ci in scan_comp_indices:
+                    blocks_per_mcu += components[ci].horizontal * components[ci].vertical
+                var scan_blocks = mcu_w_chk * mcu_h_chk * blocks_per_mcu
+                if rem_bytes * 8 < scan_blocks * 2:
+                    return image^
+                for ci in range(len(components)):
+                    if len(components[ci].samples) == 0:
+                        components[ci].samples = List[UInt8](length=components[ci].stride * components[ci].rows, fill=0)
+            else:
+                var scan_blocks: Int
+                if count > 1:
+                    var mcu_w_chk = (width + maximum_horizontal * 8 - 1) // (maximum_horizontal * 8)
+                    var mcu_h_chk = (height + maximum_vertical * 8 - 1) // (maximum_vertical * 8)
+                    var blocks_per_mcu = 0
+                    for ci in scan_comp_indices:
+                        blocks_per_mcu += components[ci].horizontal * components[ci].vertical
+                    scan_blocks = mcu_w_chk * mcu_h_chk * blocks_per_mcu
+                else:
+                    var ci0 = scan_comp_indices[0]
+                    var comp_w0 = (width * components[ci0].horizontal + maximum_horizontal - 1) // maximum_horizontal
+                    var comp_h0 = (height * components[ci0].vertical + maximum_vertical - 1) // maximum_vertical
+                    scan_blocks = max(1, (comp_w0 + 7) // 8) * max(1, (comp_h0 + 7) // 8)
+                if ss == 0 and rem_bytes * 8 < scan_blocks:
+                    return image^
+                for ci in range(len(components)):
+                    if len(components[ci].coeffs) == 0:
+                        components[ci].coeffs = List[Int32](length=components[ci].blocks_w * components[ci].blocks_h * 64, fill=0)
 
             var bits = JpegBits(data, end)
             if not is_progressive:
@@ -752,6 +795,8 @@ def decode_jpeg(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
         var coefficients = List[Float32](length=64, fill=0)
         var workspace = List[Float32](length=64, fill=0)
         for ci in range(len(components)):
+            if len(components[ci].coeffs) < components[ci].blocks_w * components[ci].blocks_h * 64:
+                return image^
             components[ci].samples = List[UInt8](length=components[ci].stride * components[ci].rows, fill=0)
             var q_idx = components[ci].quantization
             for by in range(components[ci].blocks_h):

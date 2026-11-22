@@ -264,7 +264,7 @@ struct VehicleChassis(Copyable, Movable):
         return -Float32(35.0) * norm
 
     def _update_ackermann_steering(mut self, steer: Float32):
-        var num_wheels = len(self.wheels)
+        var num_wheels = min(len(self.wheels), len(self.wheel_states))
         var max_steer_rad = Float32(0.55)
         var s_clamped = max(Float32(-1.0), min(Float32(1.0), steer))
         if abs(s_clamped) <= Float32(1.0e-5):
@@ -360,7 +360,7 @@ struct VehicleChassis(Copyable, Movable):
 
     def _probe_flat_ground(mut self, dt: Float32):
         var up = self.rot.rotate(Vec3(0, 1, 0)).normalized()
-        var num_wheels = len(self.wheels)
+        var num_wheels = min(len(self.wheels), len(self.wheel_states))
         for i in range(num_wheels):
             var hub_r = self.rot.rotate(self.wheels[i].offset)
             var world_hub = self.pos + hub_r
@@ -392,7 +392,7 @@ struct VehicleChassis(Copyable, Movable):
     def _probe_bvh_ground(mut self, dt: Float32, bvh: Bvh8MeshCollider):
         var up = self.rot.rotate(Vec3(0, 1, 0)).normalized()
         var down = -up
-        var num_wheels = len(self.wheels)
+        var num_wheels = min(len(self.wheels), len(self.wheel_states))
         for i in range(num_wheels):
             var cfg = self.wheels[i]
             var hub_r = self.rot.rotate(cfg.offset)
@@ -484,7 +484,7 @@ struct VehicleChassis(Copyable, Movable):
         out_wheel_forces.clear()
         for _ in range(num_wheels):
             out_wheel_forces.append(Vec3())
-        if num_wheels < 4:
+        if num_wheels < 4 or len(self.wheel_states) < num_wheels:
             return
 
         var fwd = self.rot.rotate(Vec3(0, 0, 1)).normalized()
@@ -540,8 +540,10 @@ struct VehicleChassis(Copyable, Movable):
             total_torque = total_torque + hub_r.cross(susp_force)
 
         # 5. Powertrain: engine RPM update, torque curve, and 1.5-way LSD torque split
-        var gear_idx = max(0, min(len(self.gear_ratios) - 1, self.current_gear))
-        var total_ratio = self.gear_ratios[gear_idx] * self.final_drive
+        var total_ratio = self.final_drive
+        if len(self.gear_ratios) > 0:
+            var gear_idx = max(0, min(len(self.gear_ratios) - 1, self.current_gear))
+            total_ratio = self.gear_ratios[gear_idx] * self.final_drive
         var driven_count = 0
         var driven_omega_sum = Float32(0.0)
         var left_driven = -1
@@ -802,7 +804,7 @@ struct VehicleChassis(Copyable, Movable):
         self.redline_rpm = r.f32()
         self.current_gear = r.integer()
         var n_gears = r.integer()
-        if n_gears < 0 or n_gears > 64:
+        if r.failed or n_gears < 1 or n_gears > 64:
             raise Error("vehicle blob: invalid gear count")
         self.gear_ratios.clear()
         for _ in range(n_gears):
@@ -832,7 +834,7 @@ struct VehicleChassis(Copyable, Movable):
         self.tire_model = PacejkaTire(tp)
 
         var n_wheels = r.integer()
-        if n_wheels < 0 or n_wheels > 64:
+        if r.failed or n_wheels < 0 or n_wheels > 64:
             raise Error("vehicle blob: invalid wheel count")
         self.wheels.clear()
         for _ in range(n_wheels):
@@ -851,7 +853,7 @@ struct VehicleChassis(Copyable, Movable):
             self.wheels.append(wc)
 
         var n_states = r.integer()
-        if n_states < 0 or n_states > 64:
+        if r.failed or n_states < 0 or n_states > 64 or n_states != n_wheels:
             raise Error("vehicle blob: invalid wheel state count")
         self.wheel_states.clear()
         for _ in range(n_states):

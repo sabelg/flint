@@ -294,6 +294,8 @@ struct SimdCanvas(Movable):
         sp_depth: Float32,
     ):
         """8-wide SIMD masked & depth-tested sprite blitter (0 = transparent)."""
+        if sprite_addr == 0 or sp_w <= 0 or sp_h <= 0:
+            return
         if dst_x + sp_w <= 0 or dst_x >= self.width or dst_y + sp_h <= 0 or dst_y >= self.height:
             return
         var x0 = max(0, -dst_x)

@@ -312,9 +312,14 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             var indices_node = document.object_get(primitive, "indices")
             var indices = load_accessor(document, document.integer(indices_node, -1), len(binary))
             if indices.valid:
+                if indices.component_type != 5121 and indices.component_type != 5123 and indices.component_type != 5125:
+                    return NativeModel()
                 mesh.indices.reserve(indices.count)
                 for index in range(indices.count):
-                    mesh.indices.append(indices.unsigned_value(binary, index))
+                    var vi = indices.unsigned_value(binary, index)
+                    if vi < 0 or vi >= positions.count:
+                        return NativeModel()
+                    mesh.indices.append(vi)
             elif indices_node >= 0:
                 return NativeModel()
             else:

@@ -48,7 +48,7 @@ def _is_directory_path(path: String) -> Bool:
     var d = external_call["opendir", Int](owned.as_c_string_span())
     if d == 0:
         return False
-    _ = external_call["closedir", Int32](d)
+    _ = external_call["closedir", Int32](Pointer[UInt8, MutAnyOrigin](unsafe_from_address=d))
     return True
 
 
@@ -184,8 +184,12 @@ struct AssetWatcher(Movable):
                 return fname
             var rlen = root_prefix.byte_length()
             if dir_prefix.byte_length() > rlen and String(dir_prefix[byte=0:rlen]) == root_prefix:
-                var sub = String(dir_prefix[byte=rlen + 1 : dir_prefix.byte_length()])
-                return (sub + "/" + fname) if sub.byte_length() > 0 else fname
+                if root_prefix == "/":
+                    var sub = String(dir_prefix[byte=1 : dir_prefix.byte_length()])
+                    return (sub + "/" + fname) if sub.byte_length() > 0 else fname
+                if dir_prefix[byte=rlen] == "/":
+                    var sub = String(dir_prefix[byte=rlen + 1 : dir_prefix.byte_length()])
+                    return (sub + "/" + fname) if sub.byte_length() > 0 else fname
         return (dir_prefix + "/" + fname) if dir_prefix.byte_length() > 0 else fname
 
     def _enqueue_pending(mut self, rel_or_full: String, t: Float64):

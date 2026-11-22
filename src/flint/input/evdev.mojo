@@ -8,7 +8,7 @@ DualSense (`0..255`) unpressed triggers always read `0.0`, while opening event n
 from std.collections import List
 from std.ffi import external_call
 from std.math import abs, sqrt
-from flint.platform.os import close_fd, list_directory, last_errno, EINTR
+from flint.platform.os import open_path_fd, close_fd, list_directory, last_errno, EINTR
 from flint.platform.input import (
     InputState,
     PAD_A,
@@ -479,10 +479,10 @@ struct EvdevGamepad(Movable):
         verifies gamepad capability bits (`BTN_SOUTH` + `EV_ABS`), and reads `EVIOCGID` + `EVIOCGABS`."""
         self.close()
         var p_copy = dev_path
-        var fd_rw = Int(external_call["open", Int32](p_copy.as_c_string_span(), O_RDWR_NONBLOCK_CLOEXEC, Int32(0)))
+        var fd_rw = open_path_fd(p_copy, O_RDWR_NONBLOCK_CLOEXEC)
         var is_rw = True
         if fd_rw < 0:
-            fd_rw = Int(external_call["open", Int32](p_copy.as_c_string_span(), O_RDONLY_NONBLOCK_CLOEXEC, Int32(0)))
+            fd_rw = open_path_fd(p_copy, O_RDONLY_NONBLOCK_CLOEXEC)
             is_rw = False
         if fd_rw < 0:
             return False

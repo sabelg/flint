@@ -15,7 +15,7 @@ comments, and multi-line statements (continuation lines are indented).
 A statement that fails to parse is reported and skipped; the rest still run.
 """
 from flint.cycles.pattern import (
-    Frac, Pattern, Params, parse_mini, parse_number, param_id, scale_index, bjorklund,
+    Frac, Pattern, Params, parse_mini, parse_number, param_id, scale_index, bjorklund, MAX_PATTERN_COUNT,
     P_PAN, P_SPEED, P_SOUND, P_BEGIN, P_END, K_ATOM, K_ALT_ABS, K_STACK,
     ST_LEFT, ST_RIGHT, ST_BOTH, arp_mode, Params,
     CH_EVERY, CH_WHENMOD, CH_SOMECYCLES,
@@ -187,15 +187,21 @@ def _right_assoc(op: String) -> Bool:
     return op == "$" or op == "."
 
 
+comptime MAX_SCRIPT_PARSE_DEPTH: Int = 128
+comptime MAX_SCRIPT_EVAL_DEPTH: Int = 512
+
+
 struct Parser:
     var toks: List[Token]
     var pos: Int
     var nodes: List[Ast]
+    var depth: Int
 
     def __init__(out self, var toks: List[Token]):
         self.toks = toks^
         self.pos = 0
         self.nodes = List[Ast]()
+        self.depth = 0
 
     def add(mut self, var a: Ast) -> Int:
         self.nodes.append(a^)
@@ -208,6 +214,14 @@ struct Parser:
         return self.toks[self.pos].text
 
     def parse_expr(mut self, min_prec: Int) raises -> Int:
+        if self.depth >= MAX_SCRIPT_PARSE_DEPTH:
+            raise Error("expression nesting too deep (max " + String(MAX_SCRIPT_PARSE_DEPTH) + ")")
+        self.depth += 1
+        var res = self._parse_expr_inner(min_prec)
+        self.depth -= 1
+        return res
+
+    def _parse_expr_inner(mut self, min_prec: Int) raises -> Int:
         var left = self.parse_app()
         while self.kind() == T_OP:
             var op = self.text()
@@ -414,6 +428,7 @@ struct Program(Movable):
     var seed: Int
     var asts: List[Ast]
     var env: List[Binding]
+    var eval_depth: Int
 
     def __init__(out self):
         self.pat = Pattern()
@@ -426,6 +441,7 @@ struct Program(Movable):
         self.seed = 1000
         self.asts = List[Ast]()
         self.env = List[Binding]()
+        self.eval_depth = 0
 
     # ---- value helpers
 
@@ -499,7 +515,10 @@ struct Program(Movable):
         return per^
 
     def to_int(mut self, id: Int) raises -> Int:
-        return Int(self.to_numbers(id)[0])
+        var v = self.to_numbers(id)[0]
+        if v != v or v < -1.0e9 or v > 1.0e9:
+            raise Error("integer argument out of range")
+        return Int(v)
 
     def per_cycle(mut self, nums: List[Float64], ids: List[Int]) -> Int:
         if len(ids) == 1:
@@ -686,6 +705,10 @@ struct Program(Movable):
             var p = self.to_pattern(args[1])
             var ids = List[Int]()
             for a in amounts:
+                if a != a or a > Float64(MAX_PATTERN_COUNT):
+                    raise Error(name + " factor out of range (max 4096)")
+                if (name == "slow" or name == "sparsity") and a > 0.0 and (1.0 / a) > Float64(MAX_PATTERN_COUNT):
+                    raise Error(name + " factor too small (max 4096x)")
                 var f = Frac.from_float(a)
                 if name == "slow" or name == "sparsity":
                     ids.append(self.pat.slow(f, p))
@@ -790,11 +813,20 @@ struct Program(Movable):
                 return self.pat_val(self.pat.fast(Frac.of(len(ids)), cat))
             return self.pat_val(cat)
         if name == "iter" or name == "iter'":
-            return self.pat_val(self.pat.iter(self.to_int(args[0]), self.to_pattern(args[1]), name == "iter'"))
+            var count = self.to_int(args[0])
+            if count > MAX_PATTERN_COUNT:
+                raise Error(name + " count too large (max 4096)")
+            return self.pat_val(self.pat.iter(count, self.to_pattern(args[1]), name == "iter'"))
         if name == "ply":
-            return self.pat_val(self.pat.ply(self.to_int(args[0]), self.to_pattern(args[1])))
+            var count = self.to_int(args[0])
+            if count > MAX_PATTERN_COUNT:
+                raise Error("ply count too large (max 4096)")
+            return self.pat_val(self.pat.ply(count, self.to_pattern(args[1])))
         if name == "segment":
-            return self.pat_val(self.pat.segment(self.to_int(args[0]), self.to_pattern(args[1])))
+            var count = self.to_int(args[0])
+            if count > MAX_PATTERN_COUNT:
+                raise Error("segment count too large (max 4096)")
+            return self.pat_val(self.pat.segment(count, self.to_pattern(args[1])))
         if name == "range":
             var lo = self.to_numbers(args[0])[0]
             var hi = self.to_numbers(args[1])[0]
@@ -803,6 +835,8 @@ struct Program(Movable):
             return self.pat_val(self.pat.irand(self.to_int(args[0])))
         if name == "run":
             var count = self.to_int(args[0])
+            if count > MAX_PATTERN_COUNT:
+                raise Error("run count too large (max 4096)")
             var ids = List[Int]()
             for i in range(max(1, count)):
                 ids.append(self.pat.pure_number(Float64(i)))
@@ -818,21 +852,25 @@ struct Program(Movable):
         if name == "euclid" or name == "euclidInv" or name == "euclidOff" or name == "euclidOffFull":
             var k = self.to_int(args[0])
             var n = self.to_int(args[1])
+            if n > MAX_PATTERN_COUNT:
+                raise Error("euclid step count too large (max 4096)")
             var rot = 0
             var pi = 2
             if name == "euclidOff" or name == "euclidOffFull":
                 rot = self.to_int(args[2])
                 pi = 3
             var p = self.to_pattern(args[pi])
+            if n <= 0:
+                return self.pat_val(self.pat.silence())
             var bits = bjorklund(k, n)
             var slots = List[Int]()
             var rest = self.pat.silence()
             for i in range(n):
-                var bit = bits[(i + rot) % n]
+                var bit = bits[((i + rot) % n + n) % n]
                 if name == "euclidInv":
                     bit = not bit
                 slots.append(p if bit else rest)
-            return self.pat_val(self.pat.seq(slots) if n > 0 else rest)
+            return self.pat_val(self.pat.seq(slots))
         if name == "struct":
             var shape = self.to_pattern(args[0])
             return self.pat_val(self.pat.union(OP_SET, shape, self.to_pattern(args[1])))
@@ -865,11 +903,15 @@ struct Program(Movable):
             var p = self.to_pattern(args[1])
             var ids = List[Int]()
             for c in counts:
+                if c != c or c > Float64(MAX_PATTERN_COUNT):
+                    raise Error("chop count too large (max 4096)")
                 ids.append(self.pat.chop(Int(c), p))
             return self.pat_val(self.per_cycle(counts, ids))
         if name == "striate" or name == "striateBy":
             # fastcat of n copies, copy i playing the i-th part of each sample
             var n = self.to_int(args[0])
+            if n > MAX_PATTERN_COUNT:
+                raise Error(name + " count too large (max 4096)")
             var width = 1.0 / Float64(max(1, n))
             var pi = 1
             if name == "striateBy":
@@ -887,6 +929,8 @@ struct Program(Movable):
             return self.pat_val(self.pat.fast(Frac.of(len(parts)), cat))
         if name == "slice" or name == "splice" or name == "randslice":
             var n = self.to_int(args[0])
+            if n > MAX_PATTERN_COUNT:
+                raise Error(name + " count too large (max 4096)")
             var idx: Int
             var p: Int
             if name == "randslice":
@@ -920,7 +964,10 @@ struct Program(Movable):
                 t = self.apply_fn(args[1], p)
             return self.pat_val(self.within(span[0], span[1], t, p))
         if name == "chunk" or name == "chunk'":
-            var n = max(1, self.to_int(args[0]))
+            var n_raw = self.to_int(args[0])
+            if n_raw > MAX_PATTERN_COUNT:
+                raise Error(name + " count too large (max 4096)")
+            var n = max(1, n_raw)
             var p = self.to_pattern(args[2])
             var t = self.apply_fn(args[1], p)
             var ids = List[Int]()
@@ -943,6 +990,9 @@ struct Program(Movable):
             var p = self.to_pattern(args[1])
             var ids = List[Int]()
             for a in amounts:
+                var aa = -a if a < 0 else a
+                if aa > 0.0 and aa < 1.0 / Float64(MAX_PATTERN_COUNT):
+                    raise Error("linger amount too small (min 1/4096)")
                 if a < 0:
                     # negative: the end of the cycle instead
                     var f = Frac.from_float(-a)
@@ -957,6 +1007,8 @@ struct Program(Movable):
                 amount = self.to_numbers(args[0])[0]
                 ni = 1
             var n = self.to_numbers(args[ni])[0]
+            if n != n or n > Float64(MAX_PATTERN_COUNT):
+                raise Error(name + " count out of range (max 4096)")
             var p = self.to_pattern(args[ni + 1])
             # inside n (within (0.5, 1) (amount ~>))
             var fr = Frac.from_float(n)
@@ -1005,6 +1057,19 @@ struct Program(Movable):
     # ---- evaluation
 
     def eval(mut self, id: Int) raises -> Int:
+        if self.eval_depth >= MAX_SCRIPT_EVAL_DEPTH:
+            raise Error("evaluation recursion too deep (max " + String(MAX_SCRIPT_EVAL_DEPTH) + ")")
+        self.eval_depth += 1
+        var res: Int
+        try:
+            res = self._eval_inner(id)
+        except e:
+            self.eval_depth -= 1
+            raise e^
+        self.eval_depth -= 1
+        return res
+
+    def _eval_inner(mut self, id: Int) raises -> Int:
         var k = self.asts[id].kind
         var text = self.asts[id].text
         var na = self.asts[id].a

@@ -564,7 +564,15 @@ def decompress_zstd(data: List[UInt8], start: Int, byte_len: Int, expected_size:
         frame_content_size = Int(fcs_val)
         p += fcs_bytes
 
-    var cap = max(256, expected_size if expected_size > 0 else max(0, frame_content_size))
+    var max_out = 268_435_456
+    if expected_size > 0:
+        max_out = min(max_out, expected_size)
+    if frame_content_size >= 0:
+        if frame_content_size > max_out:
+            return (False, empty^)
+        max_out = min(max_out, frame_content_size)
+
+    var cap = max(256, min(1 << 20, max_out))
     var out = List[UInt8](capacity=cap)
     var huf = _ZstdHufTable()
     var ll_tbl = _ZstdFseTable()
@@ -606,14 +614,14 @@ def decompress_zstd(data: List[UInt8], start: Int, byte_len: Int, expected_size:
         if btype == 3:
             return (False, empty^)
         if btype == 0:  # Raw
-            if p + bsize > end:
+            if p + bsize > end or bsize > max_out - len(out):
                 return (False, empty^)
             for i in range(bsize):
                 out.append(data[p + i])
             p += bsize
             continue
         if btype == 1:  # RLE
-            if p + 1 > end:
+            if p + 1 > end or bsize > max_out - len(out):
                 return (False, empty^)
             var b = data[p]
             p += 1
@@ -648,6 +656,8 @@ def decompress_zstd(data: List[UInt8], start: Int, byte_len: Int, expected_size:
                     return (False, empty^)
                 regen_sz = (lhdr0 >> 4) | (Int(data[p + 1]) << 4) | (Int(data[p + 2]) << 12)
                 p += 3
+            if regen_sz > max_out - len(out):
+                return (False, empty^)
             if ltype == 0:
                 if p + regen_sz > bend:
                     return (False, empty^)
@@ -688,6 +698,8 @@ def decompress_zstd(data: List[UInt8], start: Int, byte_len: Int, expected_size:
                 p += 5
 
             if n_streams == 4 and regen_sz < 6:
+                return (False, empty^)
+            if regen_sz > max_out - len(out):
                 return (False, empty^)
 
             var lit_end = p + comp_sz
@@ -910,13 +922,13 @@ def decompress_zstd(data: List[UInt8], start: Int, byte_len: Int, expected_size:
                             rep[1] = rep[0]
                             rep[0] = tmp
 
-                if lit_cursor + ll_val > len(literals):
+                if lit_cursor + ll_val > len(literals) or ll_val > max_out - len(out):
                     return (False, empty^)
                 for li in range(ll_val):
                     out.append(literals[lit_cursor + li])
                 lit_cursor += ll_val
 
-                if offset <= 0 or offset > len(out):
+                if offset <= 0 or offset > len(out) or ml_val > max_out - len(out):
                     return (False, empty^)
                 for _ in range(ml_val):
                     out.append(out[len(out) - offset])
@@ -924,6 +936,9 @@ def decompress_zstd(data: List[UInt8], start: Int, byte_len: Int, expected_size:
             if sbr.bits_left() != 0:
                 return (False, empty^)
 
+        var rem_lit = len(literals) - lit_cursor
+        if rem_lit > max_out - len(out):
+            return (False, empty^)
         while lit_cursor < len(literals):
             out.append(literals[lit_cursor])
             lit_cursor += 1
@@ -1805,9 +1820,14 @@ def _decode_basislz_mip(
 ) -> Tuple[Bool, List[UInt32]]:
     """Decodes a KTX2 BasisLZ/ETC1S mip level using the SGD global endpoints/selectors/tables."""
     var empty = List[UInt32]()
-    if sgd_len < 20 + level_count * 20 or sgd_off < 0 or sgd_off + sgd_len > len(data):
+    if width <= 0 or height <= 0 or width > 16384 or height > 16384 or width > 40_000_000 // height:
         return (False, empty^)
-    if slice_off < 0 or slice_len <= 0 or slice_off + slice_len > len(data):
+    if level_count <= 0 or level_count > 16 or mip_level < 0 or mip_level >= level_count:
+        return (False, empty^)
+    var hdr_base = 20 + level_count * 20
+    if sgd_off < 0 or sgd_off > len(data) or sgd_len < hdr_base or sgd_len > len(data) - sgd_off:
+        return (False, empty^)
+    if slice_off < 0 or slice_len <= 0 or slice_off > len(data) or slice_len > len(data) - slice_off:
         return (False, empty^)
     var endpoint_cnt = _u16_le(data, sgd_off)
     var selector_cnt = _u16_le(data, sgd_off + 2)
@@ -1817,44 +1837,55 @@ def _decode_basislz_mip(
     var ext_bytes = _u32_le(data, sgd_off + 16)
     if endpoint_cnt <= 0 or selector_cnt <= 0 or ep_bytes < 0 or sel_bytes < 0 or tbl_bytes < 0 or ext_bytes < 0:
         return (False, empty^)
-    var hdr_end = sgd_off + 20 + level_count * 20
-    if hdr_end + ep_bytes + sel_bytes + tbl_bytes + ext_bytes > sgd_off + sgd_len:
+    var rem_sgd = sgd_len - hdr_base
+    if (
+        ep_bytes > rem_sgd
+        or sel_bytes > rem_sgd - ep_bytes
+        or tbl_bytes > rem_sgd - ep_bytes - sel_bytes
+        or ext_bytes > rem_sgd - ep_bytes - sel_bytes - tbl_bytes
+    ):
         return (False, empty^)
+    var hdr_end = sgd_off + hdr_base
 
     var desc_off = sgd_off + 20 + mip_level * 20
     var rgb_rel_off = _u32_le(data, desc_off + 4)
     var rgb_len = _u32_le(data, desc_off + 8)
-    if rgb_rel_off < 0 or rgb_len <= 0 or rgb_rel_off + rgb_len > slice_len:
+    if rgb_rel_off < 0 or rgb_len <= 0 or rgb_rel_off > slice_len or rgb_len > slice_len - rgb_rel_off:
         return (False, empty^)
 
     var ep_off = hdr_end
     var sel_off = ep_off + ep_bytes
     var tbl_off = sel_off + sel_bytes
 
-    # Decode global endpoints & selectors from BasisLZ tables or raw packed codebook
-    var endpoints_c5 = List[Int](length=endpoint_cnt, fill=0)
-    var endpoints_i = List[Int](length=endpoint_cnt, fill=0)
-    var selectors = List[UInt32](length=selector_cnt, fill=0)
-
     var bw = max(1, (width + 3) // 4)
     var bh = max(1, (height + 3) // 4)
-    var out = List[UInt32](length=width * height, fill=0xFF000000)
+    var num_blocks = bw * bh
 
     # Raw/uncompressed BasisLZ fallback if tbl_bytes == 0 (compact synthetic fixtures) or Huffman-coded BasisLZ
-    if tbl_bytes == 0 and ep_bytes >= endpoint_cnt * 3 and sel_bytes >= selector_cnt * 4:
-        for ei in range(endpoint_cnt):
-            var eo = ep_off + ei * 3
-            endpoints_c5[ei] = _u16_le(data, eo) & 0x7FFF
-            endpoints_i[ei] = Int(data[eo + 2]) & 7
-        for si in range(selector_cnt):
-            selectors[si] = _u32_le_u(data, sel_off + si * 4)
-        var sbr = _BasisLzBits(data, slice_off + rgb_rel_off, slice_off + rgb_rel_off + rgb_len)
+    if tbl_bytes == 0:
+        if ep_bytes < endpoint_cnt * 3 or sel_bytes < selector_cnt * 4:
+            return (False, empty^)
         var ep_bits = 1
         while (1 << ep_bits) < endpoint_cnt:
             ep_bits += 1
         var sel_bits = 1
         while (1 << sel_bits) < selector_cnt:
             sel_bits += 1
+        if rgb_len < (num_blocks * (ep_bits + sel_bits) + 7) // 8:
+            return (False, empty^)
+
+        var endpoints_c5 = List[Int](length=endpoint_cnt, fill=0)
+        var endpoints_i = List[Int](length=endpoint_cnt, fill=0)
+        var selectors = List[UInt32](length=selector_cnt, fill=0)
+        for ei in range(endpoint_cnt):
+            var eo = ep_off + ei * 3
+            endpoints_c5[ei] = _u16_le(data, eo) & 0x7FFF
+            endpoints_i[ei] = Int(data[eo + 2]) & 7
+        for si in range(selector_cnt):
+            selectors[si] = _u32_le_u(data, sel_off + si * 4)
+
+        var sbr = _BasisLzBits(data, slice_off + rgb_rel_off, slice_off + rgb_rel_off + rgb_len)
+        var out = List[UInt32](length=width * height, fill=0xFF000000)
         for by in range(bh):
             for bx in range(bw):
                 var ei = sbr.get_bits(ep_bits)
@@ -1864,13 +1895,17 @@ def _decode_basislz_mip(
                 _decode_etc1s_block(endpoints_c5[ei], endpoints_i[ei], selectors[si], out, bx, by, width, height)
         return (True, out^)
 
-    # Standard BasisLZ Huffman tables
+    # Standard BasisLZ Huffman tables — validate all tables/codebooks & slice budget BEFORE allocating pixels
+    if rgb_len < (num_blocks * 2 + 7) // 8:
+        return (False, empty^)
     var tbr = _BasisLzBits(data, tbl_off, tbl_off + tbl_bytes)
     var ep_huf = _BasisHuf()
     var sel_huf = _BasisHuf()
     if not ep_huf.read_from(tbr) or not sel_huf.read_from(tbr):
         return (False, empty^)
 
+    var endpoints_c5 = List[Int](length=endpoint_cnt, fill=0)
+    var endpoints_i = List[Int](length=endpoint_cnt, fill=0)
     var ebr = _BasisLzBits(data, ep_off, ep_off + ep_bytes)
     var prev_r = 0; var prev_g = 0; var prev_b = 0; var prev_i = 0
     for ei in range(endpoint_cnt):
@@ -1887,6 +1922,7 @@ def _decode_basislz_mip(
         endpoints_c5[ei] = (prev_r << 10) | (prev_g << 5) | prev_b
         endpoints_i[ei] = prev_i
 
+    var selectors = List[UInt32](length=selector_cnt, fill=0)
     var slbr = _BasisLzBits(data, sel_off, sel_off + sel_bytes)
     for si in range(selector_cnt):
         var s_lo = sel_huf.decode(slbr)
@@ -1896,6 +1932,7 @@ def _decode_basislz_mip(
         selectors[si] = UInt32(s_lo & 0xFFFF) | (UInt32(s_hi & 0xFFFF) << 16)
 
     var sbr = _BasisLzBits(data, slice_off + rgb_rel_off, slice_off + rgb_rel_off + rgb_len)
+    var out = List[UInt32](length=width * height, fill=0xFF000000)
     var ep_idx = 0
     var sel_idx = 0
     for by in range(bh):
@@ -1934,6 +1971,57 @@ def _downsample_2x_ktx2(pixels: List[UInt32], w: Int, h: Int) -> Tuple[List[UInt
             var b = ((p00 & 0xFF) + (p10 & 0xFF) + (p01 & 0xFF) + (p11 & 0xFF) + 2) >> 2
             out[y * nw + x] = (a << 24) | (r << 16) | (g << 8) | b
     return (out^, nw, nh)
+
+
+def _ktx2_expected_mip_bytes(mw: Int, mh: Int, vk_format: Int, dfd_color_model: Int) -> Int:
+    var bw = max(1, (mw + 3) // 4)
+    var bh = max(1, (mh + 3) // 4)
+    var blocks_n = bw * bh
+    var bytes = -1
+    if dfd_color_model == DFD_MODEL_UASTC and vk_format == 0:
+        bytes = blocks_n * 16
+    elif vk_format == 0:
+        return -1
+    elif (
+        vk_format == VK_FORMAT_R8G8B8A8_UNORM
+        or vk_format == VK_FORMAT_R8G8B8A8_SRGB
+        or vk_format == VK_FORMAT_B8G8R8A8_UNORM
+        or vk_format == VK_FORMAT_B8G8R8A8_SRGB
+    ):
+        bytes = mw * mh * 4
+    elif (
+        vk_format == VK_FORMAT_R8G8B8_UNORM
+        or vk_format == VK_FORMAT_R8G8B8_SRGB
+        or vk_format == VK_FORMAT_B8G8R8_UNORM
+        or vk_format == VK_FORMAT_B8G8R8_SRGB
+    ):
+        bytes = mw * mh * 3
+    elif vk_format == VK_FORMAT_R8G8_UNORM or vk_format == VK_FORMAT_R8G8_SRGB:
+        bytes = mw * mh * 2
+    elif vk_format == VK_FORMAT_R8_UNORM or vk_format == VK_FORMAT_R8_SRGB:
+        bytes = mw * mh
+    elif vk_format == VK_FORMAT_R16G16B16A16_SFLOAT:
+        bytes = mw * mh * 8
+    elif vk_format == VK_FORMAT_R32G32B32A32_SFLOAT:
+        bytes = mw * mh * 16
+    elif vk_format >= VK_FORMAT_BC1_RGB_UNORM and vk_format <= VK_FORMAT_BC1_RGBA_SRGB:
+        bytes = blocks_n * 8
+    elif (
+        vk_format == VK_FORMAT_BC2_UNORM
+        or vk_format == VK_FORMAT_BC2_SRGB
+        or vk_format == VK_FORMAT_BC3_UNORM
+        or vk_format == VK_FORMAT_BC3_SRGB
+        or vk_format == VK_FORMAT_BC5_UNORM
+        or vk_format == VK_FORMAT_BC5_SNORM
+        or vk_format == VK_FORMAT_BC7_UNORM
+        or vk_format == VK_FORMAT_BC7_SRGB
+    ):
+        bytes = blocks_n * 16
+    elif vk_format == VK_FORMAT_BC4_UNORM or vk_format == VK_FORMAT_BC4_SNORM:
+        bytes = blocks_n * 8
+    if bytes <= 0 or bytes > 268_435_456:
+        return -1
+    return bytes
 
 
 def decode_ktx2(data: List[UInt8], maximum_size: Int = 4096) -> NativeImage:
@@ -1993,6 +2081,10 @@ def decode_ktx2(data: List[UInt8], maximum_size: Int = 4096) -> NativeImage:
     var uncomp_len = Int(uncomp_len_u64)
     var mw = max(1, pixel_width >> chosen_mip)
     var mh = max(1, pixel_height >> chosen_mip)
+    if mw <= 0 or mh <= 0 or mw > 40_000_000 // mh:
+        return img^
+    if level_count == 1 and maximum_size > 0 and (mw > max(maximum_size, 4096) or mh > max(maximum_size, 4096)):
+        return img^
 
     var pixels: List[UInt32]
     if supercompression == KTX2_SC_BASIS_LZ or dfd_color_model == DFD_MODEL_ETC1S:
@@ -2001,18 +2093,25 @@ def decode_ktx2(data: List[UInt8], maximum_size: Int = 4096) -> NativeImage:
             return img^
         pixels = blz[1].copy()
     else:
+        var expected_mip_bytes = _ktx2_expected_mip_bytes(mw, mh, vk_format, dfd_color_model)
+        if expected_mip_bytes <= 0:
+            return img^
         var payload = List[UInt8]()
         if supercompression == KTX2_SC_NONE:
             payload.reserve(mip_len)
             for i in range(mip_len):
                 payload.append(data[mip_off + i])
         elif supercompression == KTX2_SC_ZLIB:
-            payload = inflate_zlib(data, mip_off, uncomp_len)
-            if len(payload) == 0 or (uncomp_len > 0 and len(payload) != uncomp_len):
+            if uncomp_len <= 0 or uncomp_len != expected_mip_bytes:
+                return img^
+            payload = inflate_zlib(data, mip_off, uncomp_len, mip_len)
+            if len(payload) != uncomp_len:
                 return img^
         elif supercompression == KTX2_SC_ZSTD:
+            if uncomp_len <= 0 or uncomp_len != expected_mip_bytes:
+                return img^
             var zres = decompress_zstd(data, mip_off, mip_len, uncomp_len)
-            if not zres[0]:
+            if not zres[0] or len(zres[1]) != uncomp_len:
                 return img^
             payload = zres[1].copy()
         else:

@@ -236,15 +236,29 @@ def optimize_vertex_cache_forsyth(indices: List[Int], vertex_count: Int, cache_s
 def _spatial_sort_triangles_sah(mesh: NativeMesh, in_indices: List[Int]) -> List[Int]:
     """Spatially orders triangles via 30-bit 3D Morton (`Z-order`) centroids + SAH bucket grouping
     before intra-cluster Forsyth cache ordering so meshlets have minimal bounding-sphere radii."""
-    var n_tris = len(in_indices) // 3
+    var v_count = mesh.vertex_count()
+    var raw_tris = len(in_indices) // 3
+    if v_count <= 0 or raw_tris <= 0 or len(mesh.positions) < v_count * 3:
+        return List[Int]()
+    var valid_indices = List[Int](capacity=raw_tris * 3)
+    for ti in range(raw_tris):
+        var a = in_indices[ti * 3]; var b = in_indices[ti * 3 + 1]; var c = in_indices[ti * 3 + 2]
+        if a < 0 or b < 0 or c < 0 or a >= v_count or b >= v_count or c >= v_count:
+            continue
+        valid_indices.append(a)
+        valid_indices.append(b)
+        valid_indices.append(c)
+    var n_tris = len(valid_indices) // 3
+    if n_tris == 0:
+        return List[Int]()
     if n_tris <= MESHLET_MAX_TRIS:
-        return optimize_vertex_cache_forsyth(in_indices, mesh.vertex_count())
+        return optimize_vertex_cache_forsyth(valid_indices, v_count)
 
     var bmin = Vec3(1e9, 1e9, 1e9)
     var bmax = Vec3(-1e9, -1e9, -1e9)
     var centroids = List[Vec3](capacity=n_tris)
     for ti in range(n_tris):
-        var a = in_indices[ti * 3]; var b = in_indices[ti * 3 + 1]; var c = in_indices[ti * 3 + 2]
+        var a = valid_indices[ti * 3]; var b = valid_indices[ti * 3 + 1]; var c = valid_indices[ti * 3 + 2]
         var p0 = Vec3(mesh.positions[a * 3], mesh.positions[a * 3 + 1], mesh.positions[a * 3 + 2])
         var p1 = Vec3(mesh.positions[b * 3], mesh.positions[b * 3 + 1], mesh.positions[b * 3 + 2])
         var p2 = Vec3(mesh.positions[c * 3], mesh.positions[c * 3 + 1], mesh.positions[c * 3 + 2])
@@ -313,9 +327,9 @@ def _spatial_sort_triangles_sah(mesh: NativeMesh, in_indices: List[Int]) -> List
         var sub_idx = List[Int](capacity=(end - start) * 3)
         for k in range(start, end):
             var ti = order[k]
-            sub_idx.append(in_indices[ti * 3])
-            sub_idx.append(in_indices[ti * 3 + 1])
-            sub_idx.append(in_indices[ti * 3 + 2])
+            sub_idx.append(valid_indices[ti * 3])
+            sub_idx.append(valid_indices[ti * 3 + 1])
+            sub_idx.append(valid_indices[ti * 3 + 2])
         var opt_sub = optimize_vertex_cache_forsyth(sub_idx, vc)
         for v in opt_sub:
             out.append(v)

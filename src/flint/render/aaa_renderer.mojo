@@ -1809,6 +1809,8 @@ struct FlintAaaVulkanRenderer(Movable):
             return False
         if not self.vk.allocate_command_buffers(FRAMES_IN_FLIGHT * 2):
             return False
+        if self.vk.timestamps and self.vk.query_pool == 0:
+            self.enable_gpu_profiler = self.vk.create_query_pool(FRAMES_IN_FLIGHT * AAA_QUERY_SLOT_STRIDE)
         if self.vk.has_side_queue():
             self.side_cmd_base = self.vk.allocate_side_command_buffers(FRAMES_IN_FLIGHT)
 
@@ -2269,6 +2271,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_buffer(self.buf_oit_nodes)
         self.vk.destroy_buffer(self.buf_post_scratch)
         self.vk.destroy_buffer(self.buf_ldr_readback)
+        self.buf_ldr_readback.cpu_address = 0
         for i in range(len(self.readback_extra)):
             self.vk.destroy_buffer(self.readback_extra[i])
         self.readback_extra.clear()
@@ -4932,6 +4935,14 @@ struct FlintAaaVulkanRenderer(Movable):
     # Frame Submission & Execution
     # ========================================================================
 
+    def invalidate_temporal_history(mut self):
+        """Call before rendering a camera cut or a discontinuous animation seek."""
+        self.has_prev_vp = False
+        self.has_prev_cam = False
+        self.hiz_valid = False
+        self.froxel_valid_frames = 0
+        self.spec_reblur_valid_frames = 0
+
     def begin_frame(
         mut self,
         cam_pos: Vec3 = Vec3(0.0, 1.5, -5.0),
@@ -5785,7 +5796,8 @@ struct FlintAaaVulkanRenderer(Movable):
         var view_m = _build_camera_view_col_major(self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up)
         var proj_m = make_reverse_z_perspective(fov_rad, aspect, self.near_z)
         var vp_m = _mat4_mul_col_major(proj_m, view_m)
-        if not self.has_prev_vp:
+        var camera_cut = not self.has_prev_vp
+        if camera_cut:
             self.prev_view_proj = vp_m.copy()
             self.has_prev_vp = True
 
@@ -6670,7 +6682,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.prev_submitted_fence = 0
                 if f_group_a == 0 or not self.vk.wait(f_group_a):
                     return False
-            self.last_culled_meshlet_draws = Int(get32(self.buf_ldr_readback.cpu_address))
+            self.last_culled_meshlet_draws = Int(get32(self.buf_ldr_readback.cpu_address)) if self.buf_ldr_readback.cpu_address != 0 else 0
             self.vsm_warmed_up = True
 
             var tbl = List[UInt32](length=VSM_TABLE_WORDS, fill=0)
@@ -7060,7 +7072,7 @@ struct FlintAaaVulkanRenderer(Movable):
             push_rep[1] = UInt32(self.render_h)
             push_rep[2] = UInt32(svgf_hist_in)
             push_rep[3] = UInt32(svgf_hist_out)
-            push_rep[4] = UInt32(self.frame_index)
+            push_rep[4] = UInt32(0 if camera_cut else self.frame_index)
             self.vk.dispatch_aaa(
                 cur_slot,
                 self.pipe_svgf_reproject,
@@ -7433,7 +7445,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var out_ldr_off = max_pix * 24
         var hist_in = ping_off if (self.frame_index & 1) == 0 else pong_off
         var hist_out = pong_off if (self.frame_index & 1) == 0 else ping_off
-        var eff_hist_w = Float32(0.0) if (self.frame_index == 0 or self.furnace_white_dome) else self.tsr_history_weight
+        var eff_hist_w = Float32(0.0) if (camera_cut or self.furnace_white_dome) else self.tsr_history_weight
 
         var push_tsr = List[UInt32](length=16, fill=0)
         push_tsr[0] = UInt32(self.render_w)
@@ -8126,7 +8138,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.slot_has_pending_queries[cur_slot] = True
         elif self.pending_slot < 0:
             if do_readback:
-                self.last_culled_meshlet_draws = Int(get32(self.buf_ldr_readback.cpu_address)) if n_inst > 0 else 0
+                self.last_culled_meshlet_draws = Int(get32(self.buf_ldr_readback.cpu_address)) if (n_inst > 0 and self.buf_ldr_readback.cpu_address != 0) else 0
                 self.readback_ready_slot = 0
                 var tc_rb = self._readback_address()
                 if tc_rb != 0:
@@ -8185,7 +8197,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self._flush_slot_retirements(slot)
         self.readback_ready_slot = slot
         var tc_rb = self._readback_address()
-        self.last_culled_meshlet_draws = Int(get32(tc_rb)) if self.pending_n_inst > 0 else 0
+        self.last_culled_meshlet_draws = Int(get32(tc_rb)) if (self.pending_n_inst > 0 and tc_rb != 0) else 0
         if tc_rb != 0:
             for cls_i in range(AAA_SHADE_CLASS_COUNT):
                 self.last_tile_classify_counts[cls_i] = Int(get32(tc_rb + 12 + cls_i * 4))
@@ -8204,8 +8216,11 @@ struct FlintAaaVulkanRenderer(Movable):
 
     def get_adapted_exposure(self) -> Tuple[Float32, Float32]:
         """Returns `(adapted_exposure, avg_scene_luminance)` computed on GPU by `aaa_adapt_exposure_shader`."""
-        var exp_u = get32(self._readback_address() + 4)
-        var lum_u = get32(self._readback_address() + 8)
+        var rb_addr = self._readback_address()
+        if not self.active or rb_addr == 0:
+            return (Float32(1.0), Float32(0.0))
+        var exp_u = get32(rb_addr + 4)
+        var lum_u = get32(rb_addr + 8)
         return (bitcast[DType.float32](exp_u), bitcast[DType.float32](lum_u))
 
     def get_gpu_pass_timings(self) -> List[AaaGpuPassTiming]:
@@ -8214,14 +8229,23 @@ struct FlintAaaVulkanRenderer(Movable):
     def readback_pixels_into(self, mut dst: List[UInt32]):
         """Zero-allocation `HOST_CACHED` frame readback straight into `dst` (`SimdCanvas.pixels`)!"""
         var n = self.output_w * self.output_h
+        if n <= 0:
+            return
         if len(dst) < n:
             dst.resize(n, 0)
+        var rb_addr = self._readback_address()
+        if not self.active or rb_addr == 0:
+            for i in range(n):
+                dst[i] = 0
+            return
         _ = external_call[
             "memcpy", Int
-        ](Int(dst.unsafe_ptr()), self._readback_address() + 64, n * 4)
+        ](Int(dst.unsafe_ptr()), rb_addr + 64, n * 4)
 
     def readback_pixels(self) -> List[UInt32]:
         var n = self.output_w * self.output_h
+        if n <= 0:
+            return List[UInt32]()
         var out = List[UInt32](length=n, fill=0)
         self.readback_pixels_into(out)
         return out^
@@ -8575,6 +8599,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_buffer(self.buf_skinning)
         self.vk.destroy_buffer(self.buf_post_scratch)
         self.vk.destroy_buffer(self.buf_ldr_readback)
+        self.buf_ldr_readback.cpu_address = 0
         for i in range(len(self.readback_extra)):
             self.vk.destroy_buffer(self.readback_extra[i])
         self.readback_extra.clear()

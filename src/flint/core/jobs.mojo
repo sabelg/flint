@@ -517,7 +517,7 @@ struct JobPool(Movable):
 
     def ready(self) -> Bool:
         """True when jobs can run in parallel, not merely on the calling thread."""
-        return self.workers > 0
+        return self.address != 0 and self.workers > 0
 
     def allocated(self) -> Bool:
         return self.address != 0
@@ -596,6 +596,8 @@ struct JobPool(Movable):
         self.workers = 0
 
     def stopping(self) -> Bool:
+        if self.address == 0:
+            return True
         return self._ref().stopping()
 
     def set_profiler(self, profiler: Profiler):
@@ -604,16 +606,22 @@ struct JobPool(Movable):
             self.word(PROFILER_WORD)[unsafe_offset=0].store(Int64(profiler.address))
 
     def jobs_completed(self) -> Int:
+        if self.address == 0:
+            return 0
         return Int(self.word(COMPLETED_WORD)[unsafe_offset=0].load())
 
     def jobs_helped(self) -> Int:
         """How many times a thread inside `wait` ran a job it was not waiting for."""
+        if self.address == 0:
+            return 0
         return Int(self.word(HELPED_WORD)[unsafe_offset=0].load())
 
     # ---- building the graph ----
 
     def create(self, run: JobBody, context: Int, chunks: Int = 1, zone: Int = ZONE_NONE) -> Int:
         """Reserve a job. It cannot run until `submit`, so dependencies can be added."""
+        if self.address == 0:
+            return NO_JOB
         var r = self._ref()
         var slot = 0
         var tries = 0
@@ -643,7 +651,7 @@ struct JobPool(Movable):
 
     def depend(self, job: Int, prerequisite: Int):
         """Make `job`, not yet submitted, wait for `prerequisite`, in any state."""
-        if prerequisite == NO_JOB:
+        if self.address == 0 or job == NO_JOB or prerequisite == NO_JOB:
             return
         var r = self._ref()
         var slot = job_slot(prerequisite)
@@ -686,6 +694,8 @@ struct JobPool(Movable):
 
     def submit(self, job: Int, priority: Int = JOB_PRIO_NORMAL):
         """Let the job go: it runs once everything it depends on has finished."""
+        if self.address == 0 or job == NO_JOB:
+            return
         var r = self._ref()
         var prio = r._clamp_prio(priority)
         self.slot_word(job_slot(job), SLOT_PRIORITY)[unsafe_offset=0].store[ordering=Ordering.RELEASE](Int64(prio))
@@ -693,6 +703,13 @@ struct JobPool(Movable):
 
     def run(self, body: JobBody, context: Int, chunks: Int = 1, zone: Int = ZONE_NONE):
         """Run one fan-out to the end, on this thread and any free worker."""
+        if chunks <= 0:
+            return
+        if self.address == 0:
+            set_sim_float_mode()
+            for chunk in range(chunks):
+                body(context, chunk)
+            return
         var job = self.create(body, context, chunks, zone)
         self.submit(job)
         self.wait(job)
@@ -705,6 +722,13 @@ struct JobPool(Movable):
 
     def chain(self, body: JobBody, context: Int, count: Int, zone: Int = ZONE_NONE) -> Int:
         """Submit `count` single-chunk jobs that run strictly one after another."""
+        if count <= 0:
+            return NO_JOB
+        if self.address == 0:
+            set_sim_float_mode()
+            for _ in range(count):
+                body(context, 0)
+            return NO_JOB
         var last = NO_JOB
         for _ in range(count):
             var job = self.create(body, context, 1, zone)
@@ -716,7 +740,7 @@ struct JobPool(Movable):
     def wait(self, job: Int):
         """Return when the job is finished, running ready jobs in the meantime."""
         set_sim_float_mode()
-        if job == NO_JOB:
+        if self.address == 0 or job == NO_JOB:
             return
         var r = self._ref()
         while not self.finished(job):
@@ -730,36 +754,54 @@ struct JobPool(Movable):
                 _ = external_call["sched_yield", Int32]()
 
     def finished(self, job: Int) -> Bool:
-        if job == NO_JOB:
+        if self.address == 0 or job == NO_JOB:
             return True
         return Int(self.slot_word(job_slot(job), SLOT_DONE)[unsafe_offset=0].load()) >= job_generation(job)
 
     def help(self) -> Bool:
         """Run one ready job if there is one."""
+        if self.address == 0:
+            return False
         return self._ref().help()
 
     def claim(self, job: Int) -> Int:
+        if self.address == 0 or job == NO_JOB:
+            return -1
         return self._ref().claim(job)
 
     def work_on(self, job: Int, spread: Bool) -> Bool:
+        if self.address == 0 or job == NO_JOB:
+            return False
         return self._ref().work_on(job, spread)
 
     def release(self, job: Int):
+        if self.address == 0 or job == NO_JOB:
+            return
         self._ref().release(job)
 
     def complete(self, job: Int):
+        if self.address == 0 or job == NO_JOB:
+            return
         self._ref().complete(job)
 
     def lock(self, slot: Int):
+        if self.address == 0 or slot < 0 or slot >= JOB_SLOTS:
+            return
         self._ref().lock(slot)
 
     def unlock(self, slot: Int):
+        if self.address == 0 or slot < 0 or slot >= JOB_SLOTS:
+            return
         self._ref().unlock(slot)
 
     def sleep(self):
+        if self.address == 0:
+            return
         self._ref().sleep()
 
     def futex_wake(self, count: Int):
+        if self.address == 0:
+            return
         self._ref().futex_wake(count)
 
     def current_thread_index(self) -> Int:

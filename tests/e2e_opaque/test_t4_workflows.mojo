@@ -326,185 +326,191 @@ def t4_s1_headless_game_loop() raises:
     app.startup()
 
     var audio_ptr = app.resources.get_ptr_mut[AudioServer]()
-    assert_true(Bool(audio_ptr))
-    assert_equal(audio_ptr.value()[unsafe_offset=0].audio_backend_name(), "headless")
-    assert_true(app.resources.has[PhysicsWorld]())
-    assert_true(app.resources.has[ScalableRenderer]())
-    assert_true(app.resources.has[AnimAssetCache]())
+    try:
+        assert_true(Bool(audio_ptr))
+        assert_equal(audio_ptr.value()[unsafe_offset=0].audio_backend_name(), "headless")
+        assert_true(app.resources.has[PhysicsWorld]())
+        assert_true(app.resources.has[ScalableRenderer]())
+        assert_true(app.resources.has[AnimAssetCache]())
 
-    # Register biped model & graph in AnimAssetCache
-    var biped = t4_make_procedural_biped()
-    var graph = AnimGraphDef()
-    graph.name = "T4BipedGraph"
-    var st = StateDef()
-    st.name = "Idle"
-    st.clip = 0
-    graph.states.append(st^)
-    var clips = List[ClipInfo]()
-    clips.append(ClipInfo("Idle", 0.50, True, 1.0))
-    var anim_cache = app.resources.get_ptr_mut[AnimAssetCache]()
-    assert_true(Bool(anim_cache))
-    anim_cache.value()[unsafe_offset=0].register_model(UInt64(1), biped.copy())
-    anim_cache.value()[unsafe_offset=0].register_graph(UInt64(10), graph^, clips^)
+        # Register biped model & graph in AnimAssetCache
+        var biped = t4_make_procedural_biped()
+        var graph = AnimGraphDef()
+        graph.name = "T4BipedGraph"
+        var st = StateDef()
+        st.name = "Idle"
+        st.clip = 0
+        graph.states.append(st^)
+        var clips = List[ClipInfo]()
+        clips.append(ClipInfo("Idle", 0.50, True, 1.0))
+        var anim_cache = app.resources.get_ptr_mut[AnimAssetCache]()
+        assert_true(Bool(anim_cache))
+        anim_cache.value()[unsafe_offset=0].register_model(UInt64(1), biped.copy())
+        anim_cache.value()[unsafe_offset=0].register_graph(UInt64(10), graph^, clips^)
 
-    # Register material & beveled box mesh on ScalableRenderer
-    var ren_ptr = app.resources.get_ptr_mut[ScalableRenderer]()
-    assert_true(Bool(ren_ptr))
-    ref renderer = ren_ptr.value()[unsafe_offset=0]
-    var mat_id = renderer.register_material(
-        MaterialAsset(base_color=Vec3(0.92, 0.35, 0.14), roughness=0.35, metallic=0.1)
-    )
-    var mb = MeshBuilder()
-    mb.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(0.65, 0.65, 0.65))
-    var mesh_id = renderer.register_mesh(mb^.finish(), mat_id, build_lods=False)
-
-    # Register 440 Hz tone in AudioServer
-    var pcm = t4_make_sine_pcm16(440.0, 24000, channels=1, amp=0.8, sample_rate=48000)
-    var aid = audio_ptr.value()[unsafe_offset=0].register_pcm16_asset(pcm, 1, 48000)
-    assert_true(aid >= 0)
-
-    # Spawn static floor
-    var floor_e = app.world.spawn()
-    assert_true(app.world.insert[LocalTransform](floor_e, LocalTransform(Vec3(0.0, -0.5, 0.0))))
-    assert_true(app.world.insert[GlobalTransform](floor_e, GlobalTransform()))
-    assert_true(app.world.insert[PrevGlobalTransform](floor_e, PrevGlobalTransform()))
-    assert_true(app.world.insert[RigidBodyComponent](floor_e, RigidBodyComponent.static_body()))
-    assert_true(app.world.insert[ColliderComponent](floor_e, ColliderComponent.box(Vec3(20.0, 0.5, 20.0))))
-
-    # Spawn dynamic falling crate with MeshRendererComponent
-    var crate_e = app.world.spawn()
-    assert_true(app.world.insert[LocalTransform](crate_e, LocalTransform(Vec3(0.0, 4.0, 0.0))))
-    assert_true(app.world.insert[GlobalTransform](crate_e, GlobalTransform()))
-    assert_true(app.world.insert[PrevGlobalTransform](crate_e, PrevGlobalTransform()))
-    assert_true(app.world.insert[RigidBodyComponent](crate_e, RigidBodyComponent.dynamic(mass=2.0)))
-    assert_true(app.world.insert[ColliderComponent](crate_e, ColliderComponent.box(Vec3(0.5, 0.5, 0.5))))
-    assert_true(app.world.insert[MeshRendererComponent](crate_e, MeshRendererComponent(mesh_id, mat_id)))
-
-    # Spawn character with SkeletonComponent + AnimatorComponent + RagdollComponent
-    var char_e = app.world.spawn()
-    assert_true(app.world.insert[LocalTransform](char_e, LocalTransform(Vec3(-2.5, 0.0, 0.0))))
-    assert_true(app.world.insert[GlobalTransform](char_e, GlobalTransform()))
-    assert_true(app.world.insert[PrevGlobalTransform](char_e, PrevGlobalTransform()))
-    assert_true(app.world.insert[SkeletonComponent](char_e, SkeletonComponent(UInt64(1))))
-    assert_true(app.world.insert[AnimatorComponent](char_e, AnimatorComponent(UInt64(10))))
-
-    var rsm = RagdollStateMachine()
-    _ = rsm.ragdoll.add_limb_from_model(biped, 0, -1, 15.0, 0.15, 0.35)
-    _ = rsm.ragdoll.add_limb_from_model(biped, 1, 0, 12.0, 0.15, 0.35)
-    _ = rsm.ragdoll.add_limb_from_model(biped, 5, 0, 6.0, 0.10, 0.40, is_hinge=True)
-    _ = rsm.ragdoll.add_limb_from_model(biped, 8, 0, 6.0, 0.10, 0.40, is_hinge=True)
-    var init_skel = SkeletonInstance()
-    init_skel.reset_to_rest(biped)
-    var dt = Float32(1.0 / 60.0)
-    rsm.ragdoll.handoff_from_skeleton(init_skel, Placement(Vec3(-2.5, 0.0, 0.0), Vec3(1.0, 1.0, 1.0), 0.0), biped, dt)
-    rsm.ragdoll.go_limp()
-    rsm.ragdoll.apply_impulse_at_bone(1, Vec3(8.0, 0.0, 4.0), Vec3(-2.5, 2.9, 0.0))
-    rsm.state = RAGDOLL_SM_LIMP
-    var initial_pelvis_y = rsm.ragdoll.pelvis_world_position().y
-    assert_true(app.world.insert[RagdollComponent](char_e, RagdollComponent(rsm^, auto_recover=False, pelvis_syncs_transform=True)))
-
-    # Camera + Light + AudioListener + AudioEmitter
-    var cam_e = app.world.spawn()
-    assert_true(app.world.insert[LocalTransform](cam_e, LocalTransform(Vec3(0.0, 2.5, 6.0))))
-    assert_true(app.world.insert[GlobalTransform](cam_e, GlobalTransform()))
-    assert_true(app.world.insert[PrevGlobalTransform](cam_e, PrevGlobalTransform()))
-    assert_true(app.world.insert[CameraComponent](cam_e, CameraComponent(fov_y_deg=55.0, active=True)))
-
-    var lgt_e = app.world.spawn()
-    assert_true(app.world.insert[LocalTransform](lgt_e, LocalTransform(Vec3(3.0, 6.0, 4.0))))
-    assert_true(app.world.insert[GlobalTransform](lgt_e, GlobalTransform()))
-    assert_true(app.world.insert[PointLightComponent](lgt_e, PointLightComponent(Vec3(24.0, 22.0, 20.0), Float32(18.0), True)))
-
-    var lis_e = app.world.spawn()
-    assert_true(app.world.insert[LocalTransform](lis_e, LocalTransform(Vec3(0.0, 1.5, 0.0))))
-    assert_true(app.world.insert[GlobalTransform](lis_e, GlobalTransform()))
-    assert_true(app.world.insert[AudioListenerComponent](lis_e, AudioListenerComponent(active=True, priority=1)))
-
-    var emt_e = app.world.spawn()
-    assert_true(app.world.insert[LocalTransform](emt_e, LocalTransform(Vec3(0.0, 1.5, -1.0))))
-    assert_true(app.world.insert[GlobalTransform](emt_e, GlobalTransform()))
-    assert_true(
-        app.world.insert[AudioEmitterComponent](
-            emt_e,
-            AudioEmitterComponent(asset_id=aid, volume=0.9, looping=True, spatial=True, play_on_spawn=True),
+        # Register material & beveled box mesh on ScalableRenderer
+        var ren_ptr = app.resources.get_ptr_mut[ScalableRenderer]()
+        assert_true(Bool(ren_ptr))
+        ref renderer = ren_ptr.value()[unsafe_offset=0]
+        var mat_id = renderer.register_material(
+            MaterialAsset(base_color=Vec3(0.92, 0.35, 0.14), roughness=0.35, metallic=0.1)
         )
-    )
+        var mb = MeshBuilder()
+        mb.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(0.65, 0.65, 0.65))
+        var mesh_id = renderer.register_mesh(mb^.finish(), mat_id, build_lods=False)
 
-    # Scene codecs & .flscnb round-trip + PIE capture
-    var reg = ComponentRegistry.with_builtins()
-    register_physics_codecs(reg)
-    register_anim_codecs(reg)
-    register_render_codecs(reg)
-    register_audio_codecs(reg)
-    var scene = Scene("T4GameLoop")
-    var flscnb = scene.save_flscnb_bytes(app.world, reg)
-    assert_true(len(flscnb) > 32)
-    var roundtrip_world = World()
-    reg.ensure_registered_in_world(roundtrip_world)
-    var rt_ents = scene.load_flscnb_bytes(roundtrip_world, reg, flscnb)
-    assert_equal(len(rt_ents), 7)
+        # Register 440 Hz tone in AudioServer
+        var pcm = t4_make_sine_pcm16(440.0, 24000, channels=1, amp=0.8, sample_rate=48000)
+        var aid = audio_ptr.value()[unsafe_offset=0].register_pcm16_asset(pcm, 1, 48000)
+        assert_true(aid >= 0)
 
-    scene.enter_pie(app.world)
+        # Spawn static floor
+        var floor_e = app.world.spawn()
+        assert_true(app.world.insert[LocalTransform](floor_e, LocalTransform(Vec3(0.0, -0.5, 0.0))))
+        assert_true(app.world.insert[GlobalTransform](floor_e, GlobalTransform()))
+        assert_true(app.world.insert[PrevGlobalTransform](floor_e, PrevGlobalTransform()))
+        assert_true(app.world.insert[RigidBodyComponent](floor_e, RigidBodyComponent.static_body()))
+        assert_true(app.world.insert[ColliderComponent](floor_e, ColliderComponent.box(Vec3(20.0, 0.5, 20.0))))
 
-    # Capture blank baseline on empty RenderWorld before simulation
-    var blank_rw = RenderWorld()
-    var empty_ui = UiDrawList()
-    assert_true(renderer.render_world(blank_rw, empty_ui, capture_readback=True, force_readback=True))
-    var blank_px = renderer.readback_pixels()
-    assert_equal(len(blank_px), W * H)
+        # Spawn dynamic falling crate with MeshRendererComponent
+        var crate_e = app.world.spawn()
+        assert_true(app.world.insert[LocalTransform](crate_e, LocalTransform(Vec3(0.0, 4.0, 0.0))))
+        assert_true(app.world.insert[GlobalTransform](crate_e, GlobalTransform()))
+        assert_true(app.world.insert[PrevGlobalTransform](crate_e, PrevGlobalTransform()))
+        assert_true(app.world.insert[RigidBodyComponent](crate_e, RigidBodyComponent.dynamic(mass=2.0)))
+        assert_true(app.world.insert[ColliderComponent](crate_e, ColliderComponent.box(Vec3(0.5, 0.5, 0.5))))
+        assert_true(app.world.insert[MeshRendererComponent](crate_e, MeshRendererComponent(mesh_id, mat_id)))
 
-    var phys_ptr = app.resources.get_ptr[PhysicsWorld]()
-    assert_true(Bool(phys_ptr))
-    var start_tick = phys_ptr.value()[unsafe_offset=0].tick
+        # Spawn character with SkeletonComponent + AnimatorComponent + RagdollComponent
+        var char_e = app.world.spawn()
+        assert_true(app.world.insert[LocalTransform](char_e, LocalTransform(Vec3(-2.5, 0.0, 0.0))))
+        assert_true(app.world.insert[GlobalTransform](char_e, GlobalTransform()))
+        assert_true(app.world.insert[PrevGlobalTransform](char_e, PrevGlobalTransform()))
+        assert_true(app.world.insert[SkeletonComponent](char_e, SkeletonComponent(UInt64(1))))
+        assert_true(app.world.insert[AnimatorComponent](char_e, AnimatorComponent(UInt64(10))))
 
-    # Step 30 frames of full EngineApp schedule
-    for _ in range(30):
-        app.step_one_frame(dt)
+        var rsm = RagdollStateMachine()
+        _ = rsm.ragdoll.add_limb_from_model(biped, 0, -1, 15.0, 0.15, 0.35)
+        _ = rsm.ragdoll.add_limb_from_model(biped, 1, 0, 12.0, 0.15, 0.35)
+        _ = rsm.ragdoll.add_limb_from_model(biped, 5, 0, 6.0, 0.10, 0.40, is_hinge=True)
+        _ = rsm.ragdoll.add_limb_from_model(biped, 8, 0, 6.0, 0.10, 0.40, is_hinge=True)
+        var init_skel = SkeletonInstance()
+        init_skel.reset_to_rest(biped)
+        var dt = Float32(1.0 / 60.0)
+        rsm.ragdoll.handoff_from_skeleton(init_skel, Placement(Vec3(-2.5, 0.0, 0.0), Vec3(1.0, 1.0, 1.0), 0.0), biped, dt)
+        rsm.ragdoll.go_limp()
+        rsm.ragdoll.apply_impulse_at_bone(1, Vec3(8.0, 0.0, 4.0), Vec3(-2.5, 2.9, 0.0))
+        rsm.state = RAGDOLL_SM_LIMP
+        var initial_pelvis_y = rsm.ragdoll.pelvis_world_position().y
+        assert_true(app.world.insert[RagdollComponent](char_e, RagdollComponent(rsm^, auto_recover=False, pelvis_syncs_transform=True)))
 
-    # Physics verification
-    var end_tick = phys_ptr.value()[unsafe_offset=0].tick
-    assert_equal(end_tick, start_tick + 30)
-    var crate_lt = app.world.get[LocalTransform](crate_e)
-    var crate_rb = app.world.get[RigidBodyComponent](crate_e)
-    assert_true(crate_rb.body_id >= 0)
-    assert_true(crate_lt.translation.y < Float32(3.5))
+        # Camera + Light + AudioListener + AudioEmitter
+        var cam_e = app.world.spawn()
+        assert_true(app.world.insert[LocalTransform](cam_e, LocalTransform(Vec3(0.0, 2.5, 6.0))))
+        assert_true(app.world.insert[GlobalTransform](cam_e, GlobalTransform()))
+        assert_true(app.world.insert[PrevGlobalTransform](cam_e, PrevGlobalTransform()))
+        assert_true(app.world.insert[CameraComponent](cam_e, CameraComponent(fov_y_deg=55.0, active=True)))
 
-    # Ragdoll verification inside PhysicsWorld
-    var rag_ptr = app.world.get_ptr[RagdollComponent](char_e)
-    assert_true(Bool(rag_ptr))
-    assert_true(rag_ptr.value()[unsafe_offset=0].state_machine.world_ragdoll_slot >= 0)
-    var end_pelvis_y = rag_ptr.value()[unsafe_offset=0].state_machine.ragdoll.pelvis_world_position().y
-    assert_true(end_pelvis_y < initial_pelvis_y - Float32(0.1))
+        var lgt_e = app.world.spawn()
+        assert_true(app.world.insert[LocalTransform](lgt_e, LocalTransform(Vec3(3.0, 6.0, 4.0))))
+        assert_true(app.world.insert[GlobalTransform](lgt_e, GlobalTransform()))
+        assert_true(app.world.insert[PointLightComponent](lgt_e, PointLightComponent(Vec3(24.0, 22.0, 20.0), Float32(18.0), True)))
 
-    # Render + FLIP/ImageDiff verification (handling 1-LSB TSR jitter)
-    var rstate_ptr = app.resources.get_ptr[RenderPluginStateResource]()
-    assert_true(Bool(rstate_ptr))
-    assert_true(rstate_ptr.value()[unsafe_offset=0].rendered_frames >= 30)
-    assert_true(rstate_ptr.value()[unsafe_offset=0].last_render_ok)
-    var rw_ptr = app.resources.get_ptr[RenderWorld]()
-    assert_true(Bool(rw_ptr))
-    assert_true(
-        renderer.render_world(
-            rw_ptr.value()[unsafe_offset=0],
-            empty_ui,
-            capture_readback=True,
-            force_readback=True,
+        var lis_e = app.world.spawn()
+        assert_true(app.world.insert[LocalTransform](lis_e, LocalTransform(Vec3(0.0, 1.5, 0.0))))
+        assert_true(app.world.insert[GlobalTransform](lis_e, GlobalTransform()))
+        assert_true(app.world.insert[AudioListenerComponent](lis_e, AudioListenerComponent(active=True, priority=1)))
+
+        var emt_e = app.world.spawn()
+        assert_true(app.world.insert[LocalTransform](emt_e, LocalTransform(Vec3(0.0, 1.5, -1.0))))
+        assert_true(app.world.insert[GlobalTransform](emt_e, GlobalTransform()))
+        assert_true(
+            app.world.insert[AudioEmitterComponent](
+                emt_e,
+                AudioEmitterComponent(asset_id=aid, volume=0.9, looping=True, spatial=True, play_on_spawn=True),
+            )
         )
-    )
-    var px = renderer.readback_pixels()
-    assert_equal(len(px), W * H)
-    var diff = compare_pixels(px, blank_px, W, H, tolerance=4)
-    assert_true(diff.over_tolerance >= 400)
-    assert_true(diff.worst >= 24)
-    assert_true(diff.flip_mean > 0.01)
 
-    # Audio active emitter check prior to shutdown
-    assert_true(audio_ptr.value()[unsafe_offset=0].active_logical_count() >= 1)
+        # Scene codecs & .flscnb round-trip + PIE capture
+        var reg = ComponentRegistry.with_builtins()
+        register_physics_codecs(reg)
+        register_anim_codecs(reg)
+        register_render_codecs(reg)
+        register_audio_codecs(reg)
+        var scene = Scene("T4GameLoop")
+        var flscnb = scene.save_flscnb_bytes(app.world, reg)
+        assert_true(len(flscnb) > 32)
+        var roundtrip_world = World()
+        reg.ensure_registered_in_world(roundtrip_world)
+        var rt_ents = scene.load_flscnb_bytes(roundtrip_world, reg, flscnb)
+        assert_equal(len(rt_ents), 7)
 
-    # Restore PIE snapshot & verify bit-exact crate reset
-    scene.exit_pie(app.world)
-    var restored_crate_lt = app.world.get[LocalTransform](crate_e)
-    assert_equal(f32_bits(restored_crate_lt.translation.y), f32_bits(Float32(4.0)))
+        scene.enter_pie(app.world)
+
+        var phys_ptr = app.resources.get_ptr[PhysicsWorld]()
+        assert_true(Bool(phys_ptr))
+        var start_tick = phys_ptr.value()[unsafe_offset=0].tick
+
+        # Step 30 frames of full EngineApp schedule
+        for _ in range(30):
+            app.step_one_frame(dt)
+
+        # Physics verification
+        var end_tick = phys_ptr.value()[unsafe_offset=0].tick
+        assert_equal(end_tick, start_tick + 30)
+        var crate_lt = app.world.get[LocalTransform](crate_e)
+        var crate_rb = app.world.get[RigidBodyComponent](crate_e)
+        assert_true(crate_rb.body_id >= 0)
+        assert_true(crate_lt.translation.y < Float32(3.5))
+
+        # Ragdoll verification inside PhysicsWorld
+        var rag_ptr = app.world.get_ptr[RagdollComponent](char_e)
+        assert_true(Bool(rag_ptr))
+        assert_true(rag_ptr.value()[unsafe_offset=0].state_machine.world_ragdoll_slot >= 0)
+        var end_pelvis_y = rag_ptr.value()[unsafe_offset=0].state_machine.ragdoll.pelvis_world_position().y
+        assert_true(end_pelvis_y < initial_pelvis_y - Float32(0.1))
+
+        # Render + FLIP/ImageDiff verification against a same-camera empty RenderWorld
+        var rstate_ptr = app.resources.get_ptr[RenderPluginStateResource]()
+        assert_true(Bool(rstate_ptr))
+        assert_true(rstate_ptr.value()[unsafe_offset=0].rendered_frames >= 30)
+        assert_true(rstate_ptr.value()[unsafe_offset=0].last_render_ok)
+        var rw_ptr = app.resources.get_ptr[RenderWorld]()
+        assert_true(Bool(rw_ptr))
+        assert_true(len(rw_ptr.value()[unsafe_offset=0].instances) >= 1)
+
+        var empty_ui = UiDrawList()
+        var blank_rw = RenderWorld()
+        blank_rw.camera = rw_ptr.value()[unsafe_offset=0].camera
+        assert_true(renderer.render_world(blank_rw, empty_ui, capture_readback=True, force_readback=True))
+        var blank_px = renderer.readback_pixels()
+        assert_equal(len(blank_px), W * H)
+
+        assert_true(
+            renderer.render_world(
+                rw_ptr.value()[unsafe_offset=0],
+                empty_ui,
+                capture_readback=True,
+                force_readback=True,
+            )
+        )
+        var px = renderer.readback_pixels()
+        assert_equal(len(px), W * H)
+        var diff = compare_pixels(px, blank_px, W, H, tolerance=4)
+        assert_true(diff.over_tolerance >= 400)
+        assert_true(diff.worst >= 24)
+        assert_true(diff.flip_mean > 0.01)
+
+        # Audio active emitter check prior to shutdown
+        assert_true(audio_ptr.value()[unsafe_offset=0].active_logical_count() >= 1)
+
+        # Restore PIE snapshot & verify bit-exact crate reset
+        scene.exit_pie(app.world)
+        var restored_crate_lt = app.world.get[LocalTransform](crate_e)
+        assert_equal(f32_bits(restored_crate_lt.translation.y), f32_bits(Float32(4.0)))
+    except e:
+        app.shutdown()
+        raise e^
 
     # Shutdown EngineApp -> RT audio thread stops, then offline quantum renders active voice deterministically
     app.shutdown()
@@ -1093,6 +1099,56 @@ def t4_s4_interactive_ui_text_input_pipeline() raises:
         ui.end_frame()
         assert_true(btn_rect.w > Float32(0.0) and input_rect.w > Float32(0.0))
 
+        # Frame 1b: hover without press/release -> must NOT click
+        inp.begin_frame()
+        inp.move_mouse(btn_rect.center_x(), btn_rect.center_y())
+        inp.set_mouse(0, False)
+        ui.begin_frame(inp, 1280.0, 720.0, Float32(1.0 / 60.0))
+        ui.update_dock_space(dock, screen)
+        var clicked_hover_only = False
+        if ui.begin_dock_panel(dock, "Outliner"):
+            clicked_hover_only = ui.button("btn_play", "Play")
+            ui.end_dock_panel()
+        if ui.begin_dock_panel(dock, "Console"):
+            ui.rich_label("[c=3EE88A]Match Ready[/c] [btn=jump]", 240.0)
+            _ = ui.text_input("chat_box", chat_text, 220.0, placeholder="Type...")
+            ui.end_dock_panel()
+        ui.end_frame()
+        assert_false(clicked_hover_only)
+
+        # Frame 1c: press inside Play button, then release outside -> must NOT click
+        inp.begin_frame()
+        inp.move_mouse(btn_rect.center_x(), btn_rect.center_y())
+        inp.set_mouse(0, True)
+        ui.begin_frame(inp, 1280.0, 720.0, Float32(1.0 / 60.0))
+        ui.update_dock_space(dock, screen)
+        var clicked_press_before_off = False
+        if ui.begin_dock_panel(dock, "Outliner"):
+            clicked_press_before_off = ui.button("btn_play", "Play")
+            ui.end_dock_panel()
+        if ui.begin_dock_panel(dock, "Console"):
+            ui.rich_label("[c=3EE88A]Match Ready[/c] [btn=jump]", 240.0)
+            _ = ui.text_input("chat_box", chat_text, 220.0, placeholder="Type...")
+            ui.end_dock_panel()
+        ui.end_frame()
+        assert_false(clicked_press_before_off)
+
+        inp.begin_frame()
+        inp.move_mouse(btn_rect.x + btn_rect.w + Float32(40.0), btn_rect.y + btn_rect.h + Float32(40.0))
+        inp.set_mouse(0, False)
+        ui.begin_frame(inp, 1280.0, 720.0, Float32(1.0 / 60.0))
+        ui.update_dock_space(dock, screen)
+        var clicked_release_off = False
+        if ui.begin_dock_panel(dock, "Outliner"):
+            clicked_release_off = ui.button("btn_play", "Play")
+            ui.end_dock_panel()
+        if ui.begin_dock_panel(dock, "Console"):
+            ui.rich_label("[c=3EE88A]Match Ready[/c] [btn=jump]", 240.0)
+            _ = ui.text_input("chat_box", chat_text, 220.0, placeholder="Type...")
+            ui.end_dock_panel()
+        ui.end_frame()
+        assert_false(clicked_release_off)
+
         # Frame 2: mouse press on Play button
         inp.begin_frame()
         inp.move_mouse(btn_rect.center_x(), btn_rect.center_y())
@@ -1436,11 +1492,25 @@ def t4_s5_studio_devtools_authoring_workflow(tmp_root: String) raises:
         )
         var cap1_sc = cap1_doc.object_get(cap1_doc.object_get(cap1_doc.root, "result"), "structuredContent")
         assert_true(cap1_doc.boolean(cap1_doc.object_get(cap1_sc, "ok"), False))
+        assert_false(cap1_doc.boolean(cap1_doc.object_get(cap1_sc, "has_flip_diff"), True))
         assert_true(file_size(ws + "/baseline.png") > 0)
+
+        var cap_same_doc = t4_parse_json_str(
+            mcp.handle_jsonrpc(
+                '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"render.capture_viewport","arguments":{"output_path":"baseline_copy.png","reference_path":"baseline.png","width":128,"height":96}}}',
+                studio,
+                assets,
+                pool,
+            )
+        )
+        var cap_same_sc = cap_same_doc.object_get(cap_same_doc.object_get(cap_same_doc.root, "result"), "structuredContent")
+        assert_true(cap_same_doc.boolean(cap_same_doc.object_get(cap_same_sc, "ok"), False))
+        assert_true(cap_same_doc.boolean(cap_same_doc.object_get(cap_same_sc, "has_flip_diff"), False))
+        assert_equal(cap_same_doc.number(cap_same_doc.object_get(cap_same_sc, "flip_mean"), -1.0), 0.0)
 
         var patch_doc = t4_parse_json_str(
             mcp.handle_jsonrpc(
-                '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ecs.patch_components","arguments":{"entity_id":'
+                '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"ecs.patch_components","arguments":{"entity_id":'
                 + String(gen_eid)
                 + ',"position":[0.2,2.0,-0.5],"base_color":[0.95,0.12,0.10]}}}',
                 studio,
@@ -1453,7 +1523,7 @@ def t4_s5_studio_devtools_authoring_workflow(tmp_root: String) raises:
 
         var cap2_doc = t4_parse_json_str(
             mcp.handle_jsonrpc(
-                '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"render.capture_viewport","arguments":{"output_path":"edited.png","reference_path":"baseline.png","width":128,"height":96}}}',
+                '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"render.capture_viewport","arguments":{"output_path":"edited.png","reference_path":"baseline.png","width":128,"height":96}}}',
                 studio,
                 assets,
                 pool,
@@ -1466,7 +1536,7 @@ def t4_s5_studio_devtools_authoring_workflow(tmp_root: String) raises:
 
         var insp_doc = t4_parse_json_str(
             mcp.handle_jsonrpc(
-                '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"render.inspect_gpu_frame","arguments":{}}}',
+                '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"render.inspect_gpu_frame","arguments":{}}}',
                 studio,
                 assets,
                 pool,
@@ -1477,7 +1547,7 @@ def t4_s5_studio_devtools_authoring_workflow(tmp_root: String) raises:
 
         var undo_doc = t4_parse_json_str(
             mcp.handle_jsonrpc(
-                '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"studio.undo_redo","arguments":{"action":"undo","steps":1}}}',
+                '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"studio.undo_redo","arguments":{"action":"undo","steps":1}}}',
                 studio,
                 assets,
                 pool,

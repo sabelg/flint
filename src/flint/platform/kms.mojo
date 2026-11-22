@@ -44,7 +44,7 @@ from std.ffi import external_call
 from flint.platform.input import InputState
 from flint.platform.traits import WindowBackend
 from flint.input.evdev import EvdevHub
-from flint.platform.os import env_value, env_flag, close_fd, get_time, list_directory, last_errno
+from flint.platform.os import set_signal_action, open_path_fd, env_value, env_flag, close_fd, get_time, list_directory, last_errno
 from flint.platform.wayland import evdev_key
 from flint.platform.logind import LogindSession, device_numbers
 from flint.platform.vulkan import VulkanGpu, SwapchainHandle
@@ -634,9 +634,9 @@ def kms_on_signal(signal: Int32, info: Int, context: Int) abi("C"):
     # Put back whatever handled this signal before (the crash reporter, or SIG_DFL).
     var slot = rescue_slot(number)
     if slot >= 0 and base != 0:
-        _ = external_call["sigaction", Int32](signal, base + R_OLD_ACTIONS + slot * SIGACTION_BYTES, Int(0))
+        _ = set_signal_action(signal, base + R_OLD_ACTIONS + slot * SIGACTION_BYTES, Int(0))
     elif base != 0:
-        _ = external_call["sigaction", Int32](signal, base + R_ZERO_ACTION, Int(0))
+        _ = set_signal_action(signal, base + R_ZERO_ACTION, Int(0))
     var code = Int(Pointer[Int32, origin=MutAnyOrigin](unsafe_from_address=info + 8)[unsafe_offset=0]) if info != 0 else 0
     if code <= 0 or is_stop_signal(number) or number == 6:
         # Sent, not a fault: send it again so the earlier action runs.
@@ -660,7 +660,7 @@ def install_rescue_handlers() -> Bool:
     var signals = rescue_signals()
     var ok = True
     for slot in range(len(signals)):
-        if external_call["sigaction", Int32](Int32(signals[slot]), Int(action.unsafe_ptr()), base + R_OLD_ACTIONS + slot * SIGACTION_BYTES) != 0:
+        if set_signal_action(Int32(signals[slot]), Int(action.unsafe_ptr()), base + R_OLD_ACTIONS + slot * SIGACTION_BYTES) != 0:
             ok = False
     _ = action^
     var exit_slot = List[Int](length=1, fill=0)
@@ -683,7 +683,7 @@ def open_controlling_vt() -> Int:
     candidates.append("/dev/tty")
     for path in candidates:
         var owned = path
-        var fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(O_RDWR_NONBLOCK_CLOEXEC), Int32(0)))
+        var fd = open_path_fd(owned, Int32(O_RDWR_NONBLOCK_CLOEXEC))
         if fd < 0:
             continue
         if ioctl_read_int(fd, KDGETMODE) >= 0:
@@ -1291,7 +1291,7 @@ struct KmsWindow(WindowBackend):
             if not name.startswith("event"):
                 continue
             var path = "/dev/input/" + name
-            var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(O_RDONLY_NONBLOCK_CLOEXEC), Int32(0)))
+            var fd = open_path_fd(path, Int32(O_RDONLY_NONBLOCK_CLOEXEC))
             if fd < 0:
                 var error = Int(last_errno())
                 if error == 13 or error == 1:  # EACCES, EPERM
@@ -1334,7 +1334,7 @@ struct KmsWindow(WindowBackend):
         var errors = String("")
         for candidate in self.card_candidates():
             var path = candidate
-            var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(O_RDWR_CLOEXEC), Int32(0)))
+            var fd = open_path_fd(path, Int32(O_RDWR_CLOEXEC))
             if fd < 0:
                 errors += path + ": cannot open (errno " + String(Int(last_errno())) + "); "
                 continue
@@ -1684,7 +1684,7 @@ def kms_probe() -> String:
     var probe = KmsWindow()
     for candidate in probe.card_candidates():
         var path = candidate
-        var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(O_RDWR_CLOEXEC), Int32(0)))
+        var fd = open_path_fd(path, Int32(O_RDWR_CLOEXEC))
         if fd < 0:
             report += path + ": cannot open (errno " + String(Int(last_errno())) + ")\n"
             continue

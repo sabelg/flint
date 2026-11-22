@@ -39,20 +39,30 @@ def env_flag(name: String) -> Bool:
     return text.byte_length() > 0 and text != "0" and text != "false" and text != "FALSE"
 
 
+@always_inline
+def set_signal_action(signal: Int32, action: Int, previous: Int = 0) -> Int32:
+    return external_call["sigaction", Int32](
+        signal, Pointer[UInt8, MutAnyOrigin](unsafe_from_address=action),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=previous),
+    )
+
+
+def open_path_fd(var path: String, flags: Int32, mode: Int32 = 0) -> Int:
+    # openat(AT_FDCWD) also coexists with stdlib's variadic declaration of open.
+    return Int(external_call["openat", Int32](Int32(-100), path.as_c_string_span(), flags, mode))
+
+
 def open_read(path: String) -> Int:
-    var owned = path
-    return Int(external_call["open", Int32](owned.as_c_string_span(), Int32(0), Int32(0)))
+    return open_path_fd(path, Int32(0))
 
 
 def open_write(path: String) -> Int:
-    var owned = path
-    return Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 64 | 512), Int32(438)))
+    return open_path_fd(path, Int32(1 | 64 | 512), 438)
 
 
 def append_bytes(path: String, mut data: List[UInt8]) -> Bool:
     """Appends to a file, creating it if needed (O_WRONLY | O_CREAT | O_APPEND)."""
-    var owned = path
-    var fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 64 | 1024), Int32(438)))
+    var fd = open_path_fd(path, Int32(1 | 64 | 1024), 438)
     if fd < 0:
         return False
     var offset = 0
@@ -78,7 +88,7 @@ def make_dirs(path: String) -> Bool:
         var owned = String(unsafe_from_utf8=prefix)
         if owned == "/":
             continue
-        var result = external_call["mkdir", Int32](owned.as_c_string_span(), Int32(511))
+        var result = external_call["mkdirat", Int32](Int32(-100), owned.as_c_string_span(), Int32(511))
         if result != 0:
             var error_pointer = external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()
             if Int(error_pointer[unsafe_offset=0]) != 17:  # EEXIST
@@ -106,9 +116,8 @@ def remove_file(path: String) -> Bool:
 def fsync_path(path: String, directory: Bool) -> Bool:
     """fsync(2) on a file or (O_DIRECTORY) a directory, so its entries are on disk."""
     comptime O_DIRECTORY_FLAG: Int32 = 65536 if CompilationTarget.is_x86() else 16384
-    var owned = path
     var flags = O_DIRECTORY_FLAG if directory else Int32(0)  # O_RDONLY | O_DIRECTORY
-    var fd = Int(external_call["open", Int32](owned.as_c_string_span(), flags, Int32(0)))
+    var fd = open_path_fd(path, flags)
     if fd < 0:
         return False
     var ok = external_call["fsync", Int32](Int32(fd)) == 0
@@ -193,16 +202,58 @@ def close_fd(fd: Int):
         _ = external_call["close", Int32](Int32(fd))
 
 
+def _fstat_regular_size(fd: Int) -> Int:
+    """Returns regular-file byte size via `fstat(2)`, or -1 if non-regular / invalid."""
+    if fd < 0:
+        return -1
+    comptime STAT_MODE_OFF: Int = 24 if CompilationTarget.is_x86() else 16
+    comptime S_IFMT: UInt32 = 0o170000
+    comptime S_IFREG: UInt32 = 0o100000
+    var buf = List[UInt8](length=256, fill=0)
+    if external_call["fstat", Int32](Int32(fd), buf.unsafe_ptr()) != 0:
+        return -1
+    var mode = Pointer[UInt32, ImmutAnyOrigin](
+        unsafe_from_address=Int(buf.unsafe_ptr()) + STAT_MODE_OFF
+    )[unsafe_offset=0]
+    if (mode & S_IFMT) != S_IFREG:
+        _ = len(buf)
+        return -1
+    var words = Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=Int(buf.unsafe_ptr()))
+    var size = Int(words[unsafe_offset=6])  # st_size at byte 48
+    _ = len(buf)
+    if size < 0 or size >= Int(0x7FFFFFFFFFFFFFFF):
+        return -1
+    return size
+
+
 def file_size(path: String) -> Int:
     var fd = open_read(path)
     if fd < 0:
         return -1
-    var size = Int(external_call["lseek", Int64](Int32(fd), Int64(0), Int32(2)))
+    var size = _fstat_regular_size(fd)
     close_fd(fd)
     return size
 
 
 comptime EINTR: Int32 = 4
+
+
+def is_symlink(path: String) -> Bool:
+    """Returns True if `path` is a symbolic link (`lstat` `S_IFMT == S_IFLNK`)."""
+    if path.byte_length() == 0:
+        return False
+    comptime STAT_MODE_OFF: Int = 24 if CompilationTarget.is_x86() else 16
+    comptime S_IFMT: UInt32 = 0o170000
+    comptime S_IFLNK: UInt32 = 0o120000
+    var owned = path
+    var buf = List[UInt8](length=256, fill=0)
+    if external_call["lstat", Int32](owned.as_c_string_span(), buf.unsafe_ptr()) != 0:
+        return False
+    var mode = Pointer[UInt32, ImmutAnyOrigin](
+        unsafe_from_address=Int(buf.unsafe_ptr()) + STAT_MODE_OFF
+    )[unsafe_offset=0]
+    _ = len(buf)
+    return (mode & S_IFMT) == S_IFLNK
 
 
 def file_stamp(path: String) -> Tuple[Int, Int]:
@@ -228,8 +279,9 @@ def list_directory(path: String) -> List[String]:
     var directory = external_call["opendir", Int](owned.as_c_string_span())
     if directory == 0:
         return names^
+    var dir_ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=directory)
     while True:
-        var entry = external_call["readdir", Int](directory)
+        var entry = external_call["readdir", Int](dir_ptr)
         if entry == 0:
             break
         var bytes = List[UInt8]()
@@ -243,7 +295,7 @@ def list_directory(path: String) -> List[String]:
         var name = String(unsafe_from_utf8=bytes)
         if name != "." and name != "..":
             names.append(name)
-    _ = external_call["closedir", Int32](directory)
+    _ = external_call["closedir", Int32](dir_ptr)
     for i in range(1, len(names)):
         var j = i
         while j > 0 and names[j] < names[j - 1]:
@@ -283,11 +335,12 @@ def last_errno() -> Int32:
 
 
 def read_bytes(path: String) -> List[UInt8]:
-    var size = file_size(path)
-    if size <= 0:
-        return List[UInt8]()
     var fd = open_read(path)
     if fd < 0:
+        return List[UInt8]()
+    var size = _fstat_regular_size(fd)
+    if size <= 0:
+        close_fd(fd)
         return List[UInt8]()
     var data = List[UInt8](length=size, fill=0)
     var offset = 0

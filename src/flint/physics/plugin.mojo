@@ -622,6 +622,8 @@ struct RigidBodyComponent(SerializableComponent, ImplicitlyCopyable):
         var mat = reader.integer()
         var act = reader.boolean()
         _ = reader.integer()
+        if reader.failed:
+            raise Error("RigidBodyComponent: truncated blob")
         return Self(mode, mass, lv, av, fric, rest, roll, ld, ad, gs, filt, sleep, ccd, mat, act, -1)
 
     def write_json(self) -> String:
@@ -767,12 +769,14 @@ struct ColliderComponent(SerializableComponent):
         var trig = reader.boolean()
         var filt = _read_filter(reader)
         var n_pts = reader.integer()
-        if n_pts < 0 or n_pts > 1 << 20:
+        if reader.failed or n_pts < 0 or n_pts > 1 << 20 or n_pts > max(0, reader.limit() - reader.offset) // 12:
             raise Error("ColliderComponent: invalid points count")
         var pts = List[Vec3](capacity=n_pts)
         for _ in range(n_pts):
             pts.append(reader.vec3())
         _ = reader.integer()
+        if reader.failed:
+            raise Error("ColliderComponent: truncated blob")
         var out = Self(sh, rad, hh, he, off, rot, trig, filt, -1)
         out.points = pts^
         return out^
@@ -943,6 +947,8 @@ struct JointComponent(SerializableComponent, ImplicitlyCopyable):
         var dp = reader.f32()
         var s6 = reader.boolean()
         _ = reader.integer()
+        if reader.failed:
+            raise Error("JointComponent: truncated blob")
         return Self(jk, eb, aa, ab, ax, lo, hi, cn, ln, el, em, es, ms, mm, sh, sd, bf, bt, hz, dp, s6, -1)
 
     def write_json(self) -> String:
@@ -1043,6 +1049,8 @@ struct CharacterControllerComponent(SerializableComponent):
         out.desired_vel = reader.vec3()
         out.jump_speed = reader.f32()
         out.active = reader.boolean()
+        if reader.failed:
+            raise Error("CharacterControllerComponent: truncated blob")
         return out^
 
     def write_json(self) -> String:
@@ -1151,6 +1159,8 @@ struct VehicleComponent(SerializableComponent):
         var fr = reader.f32()
         var re = reader.f32()
         _ = reader.integer()
+        if reader.failed:
+            raise Error("VehicleComponent: truncated blob")
         return Self(ch^, he, wf, bf, th, br, st, fr, re, -1)
 
     def write_json(self) -> String:
@@ -1232,6 +1242,8 @@ struct Aero6DofComponent(SerializableComponent, ImplicitlyCopyable):
         var filt = _read_filter(reader)
         var ccd = reader.boolean()
         _ = reader.integer()
+        if reader.failed:
+            raise Error("Aero6DofComponent: truncated blob")
         return Self(st, cfg, ctrl, he, filt, ccd, -1)
 
     def write_json(self) -> String:
@@ -1314,7 +1326,7 @@ struct ClothMeshComponent(SerializableComponent):
         var m = ParticleMesh()
         m.deserialize(reader)
         var na = reader.integer()
-        if na < 0 or na > 1 << 16:
+        if reader.failed or na < 0 or na > 1 << 16 or na > max(0, reader.limit() - reader.offset) // 52:
             raise Error("ClothMeshComponent: invalid attachment count")
         var atts = List[RigidAttachment](capacity=na)
         for _ in range(na):
@@ -1326,6 +1338,8 @@ struct ClothMeshComponent(SerializableComponent):
         var filt = _read_filter(reader)
         var w = reader.vec3()
         _ = reader.integer()
+        if reader.failed:
+            raise Error("ClothMeshComponent: truncated blob")
         return Self(m^, atts^, sub, iters, filt, w, -1)
 
     def write_json(self) -> String:

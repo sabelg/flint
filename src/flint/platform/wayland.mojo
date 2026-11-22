@@ -675,7 +675,7 @@ struct WaylandWindow(WindowBackend):
 
     def connect_socket(mut self) -> Bool:
         # A compositor disconnect must surface as a write error, not kill the game.
-        _ = external_call["signal", Int](Int32(13), Int(1))  # SIGPIPE, SIG_IGN
+        _ = external_call["sigignore", Int32](Int32(13))  # SIGPIPE
         var runtime = env_value("XDG_RUNTIME_DIR")
         var display = env_value("WAYLAND_DISPLAY")
         if display.byte_length() == 0:

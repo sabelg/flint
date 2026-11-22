@@ -22,7 +22,14 @@ def fptr_at(address: Int) -> Pointer[Float32, MutAnyOrigin]:
 def numel_of(shape: List[Int]) -> Int:
     var n = 1
     for d in shape:
-        n *= d
+        if d < 0:
+            return -1
+        if d == 0:
+            n = 0
+        elif n > 0 and d > 0x7FFFFFFFFFFFFFFF // n:
+            return -1
+        else:
+            n *= d
     return n
 
 
@@ -46,6 +53,13 @@ def strides_of(shape: List[Int]) -> List[Int]:
     return st^
 
 
+def _invalid_tensor(dtype: Int = DT_F32) -> Tensor:
+    var t = Tensor()
+    t.dtype = dtype
+    t.shape = [0]
+    return t^
+
+
 struct Tensor(Copyable, Movable):
     var dtype: Int
     var shape: List[Int]
@@ -62,6 +76,9 @@ struct Tensor(Copyable, Movable):
 
     @staticmethod
     def floats(var shape: List[Int], var data: List[Float32]) -> Tensor:
+        var n = numel_of(shape)
+        if n < 0 or len(data) < n:
+            return _invalid_tensor(DT_F32)
         var t = Tensor()
         t.shape = shape^
         t.f = data^
@@ -70,6 +87,8 @@ struct Tensor(Copyable, Movable):
     @staticmethod
     def zeros(var shape: List[Int]) -> Tensor:
         var n = numel_of(shape)
+        if n < 0:
+            return _invalid_tensor(DT_F32)
         var t = Tensor()
         t.shape = shape^
         t.f = List[Float32](length=n, fill=0.0)
@@ -77,6 +96,9 @@ struct Tensor(Copyable, Movable):
 
     @staticmethod
     def ints(dtype: Int, var shape: List[Int], var data: List[Int]) -> Tensor:
+        var n = numel_of(shape)
+        if n < 0 or len(data) < n:
+            return _invalid_tensor(dtype)
         var t = Tensor()
         t.dtype = dtype
         t.shape = shape^
@@ -85,6 +107,9 @@ struct Tensor(Copyable, Movable):
 
     @staticmethod
     def borrowed(var shape: List[Int], address: Int) -> Tensor:
+        var n = numel_of(shape)
+        if n < 0 or (n > 0 and address == 0):
+            return _invalid_tensor(DT_F32)
         var t = Tensor()
         t.shape = shape^
         t.ext = address
@@ -94,6 +119,8 @@ struct Tensor(Copyable, Movable):
     def like(src: Tensor, var shape: List[Int]) -> Tensor:
         """An empty (zero) tensor of `src`'s type."""
         var n = numel_of(shape)
+        if n < 0:
+            return _invalid_tensor(src.dtype)
         var t = Tensor()
         t.dtype = src.dtype
         t.shape = shape^
@@ -105,6 +132,16 @@ struct Tensor(Copyable, Movable):
 
     def numel(self) -> Int:
         return numel_of(self.shape)
+
+    def has_valid_storage(self) -> Bool:
+        var n = self.numel()
+        if n < 0:
+            return False
+        if n == 0:
+            return True
+        if self.is_float():
+            return self.ext != 0 or len(self.f) >= n
+        return len(self.i) >= n
 
     def rank(self) -> Int:
         return len(self.shape)
@@ -128,6 +165,8 @@ struct Tensor(Copyable, Movable):
         if self.ext == 0:
             return self.f.copy()
         var n = self.numel()
+        if n <= 0:
+            return List[Float32]()
         var out = List[Float32](length=n, fill=0.0)
         var p = fptr_at(self.ext)
         for k in range(n):
@@ -146,13 +185,20 @@ struct Tensor(Copyable, Movable):
         return self.i[k]
 
     def int_list(self) -> List[Int]:
-        var out = List[Int](capacity=self.numel())
-        for k in range(self.numel()):
+        var n = self.numel()
+        if n <= 0 or not self.has_valid_storage():
+            return List[Int]()
+        var out = List[Int](capacity=n)
+        for k in range(n):
             out.append(self.int_at(k))
         return out^
 
     def reshaped(self, var shape: List[Int]) -> Tensor:
         """The same values with another shape (borrowed weights stay borrowed)."""
+        var n = numel_of(shape)
+        var sn = self.numel()
+        if n < 0 or sn < 0 or n != sn:
+            return _invalid_tensor(self.dtype)
         var t = Tensor()
         t.dtype = self.dtype
         t.shape = shape^
@@ -191,6 +237,8 @@ def broadcast_offsets(shape: List[Int], out_shape: List[Int]) -> List[Int]:
     `shape` that numpy broadcasting maps to it."""
     var r = len(out_shape)
     var n = numel_of(out_shape)
+    if n < 0:
+        return List[Int]()
     var st = List[Int](length=r, fill=0)
     var acc = 1
     var k = len(shape) - 1

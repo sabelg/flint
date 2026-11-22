@@ -3,6 +3,7 @@ Opaque-box and requirement-driven verification of boundary values, extreme input
 """
 from std.collections import List
 from std.math import abs
+from std.time import monotonic
 from flint.anim.animator import Animator
 from flint.anim.graph import ROOT_STRIP, AnimGraphDef, StateDef
 from flint.anim.pose import Pose
@@ -608,9 +609,14 @@ def test_b_f12_bc7_weight_endpoints_0_and_64(mut ctx: TestContext) raises:
 
 def test_b_f12_clock_counter_monotonicity(mut ctx: TestContext) raises:
     var t0 = profile_ticks()
+    var t_imm = profile_ticks()
+    ctx.assert_true(t_imm >= t0, "profile_ticks is non-decreasing across immediate reads")
+    var wall0 = monotonic()
     var acc: UInt64 = 0
-    for i in range(1000):
-        acc += UInt64(i)
+    var iter: UInt64 = 0
+    while (monotonic() - wall0) < 100_000 or iter < 1000:
+        acc += iter
+        iter += 1
     var t1 = profile_ticks()
     ctx.assert_true(acc > 0 and t1 > t0, "profile_ticks advances monotonically across work")
     var tl = ProfileTimeline()

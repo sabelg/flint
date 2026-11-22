@@ -2174,12 +2174,25 @@ struct NavMesh(Copyable, Movable):
         self.chf.cell_size = r.f32()
         self.chf.cell_height = r.f32()
         var n_cols = r.integer()
+        if r.failed or n_cols < 0 or n_cols > (1 << 22) or n_cols > max(0, r.limit() - r.offset) // 16:
+            raise Error("navmesh blob: invalid column count")
         self.chf.col_first = List[Int32](capacity=n_cols)
         self.chf.col_count = List[UInt16](capacity=n_cols)
         for _ in range(n_cols):
-            self.chf.col_first.append(Int32(r.integer()))
-            self.chf.col_count.append(UInt16(r.integer()))
+            var cf = r.integer()
+            var cc = r.integer()
+            if r.failed or cf < 0 or cc < 0 or cc > 65535:
+                raise Error("navmesh blob: invalid column range")
+            self.chf.col_first.append(Int32(cf))
+            self.chf.col_count.append(UInt16(cc))
         var n_spans = r.integer()
+        if r.failed or n_spans < 0 or n_spans > (1 << 22) or n_spans > max(0, r.limit() - r.offset) // 82:
+            raise Error("navmesh blob: invalid span count")
+        for ci in range(n_cols):
+            var cf = Int(self.chf.col_first[ci])
+            var cc = Int(self.chf.col_count[ci])
+            if cf > n_spans or cc > n_spans - cf:
+                raise Error("navmesh blob: column span range out of bounds")
         self.chf.spans = List[CompactSpan](capacity=n_spans)
         for _ in range(n_spans):
             var sx = Int32(r.integer())
@@ -2190,17 +2203,27 @@ struct NavMesh(Copyable, Movable):
             var ar = r.u8()
             var dist = UInt16(r.integer())
             var reg = Int32(r.integer())
-            var n0 = Int32(r.integer())
-            var n1 = Int32(r.integer())
-            var n2 = Int32(r.integer())
-            var n3 = Int32(r.integer())
-            self.chf.spans.append(CompactSpan(sx, sz, sy, scei, ba, ar, dist, reg, n0, n1, n2, n3))
+            var n0 = r.integer()
+            var n1 = r.integer()
+            var n2 = r.integer()
+            var n3 = r.integer()
+            if (
+                r.failed
+                or n0 < -1 or n0 >= n_spans
+                or n1 < -1 or n1 >= n_spans
+                or n2 < -1 or n2 >= n_spans
+                or n3 < -1 or n3 >= n_spans
+            ):
+                raise Error("navmesh blob: span neighbor out of bounds")
+            self.chf.spans.append(CompactSpan(sx, sz, sy, scei, ba, ar, dist, reg, Int32(n0), Int32(n1), Int32(n2), Int32(n3)))
 
         # 3. Tile grid
         self.tiles_x = r.integer()
         self.tiles_z = r.integer()
         self.tile_size = r.integer()
         var n_tiles = r.integer()
+        if r.failed or n_tiles < 0 or n_tiles > (1 << 16) or n_tiles > max(0, r.limit() - r.offset) // 64:
+            raise Error("navmesh blob: invalid tile count")
         self.tiles = List[NavTile](capacity=n_tiles)
         for _ in range(n_tiles):
             var tx = r.integer()
@@ -2211,10 +2234,17 @@ struct NavMesh(Copyable, Movable):
             var z1 = r.integer()
             var t = NavTile(tx, tz, x0, x1, z0, z1)
             var n_sp = r.integer()
+            if r.failed or n_sp < 0 or n_sp > (1 << 22) or n_sp > max(0, r.limit() - r.offset) // 8:
+                raise Error("navmesh blob: invalid tile span count")
             t.span_indices = List[Int32](capacity=n_sp)
             for _ in range(n_sp):
-                t.span_indices.append(Int32(r.integer()))
+                var sp_idx = r.integer()
+                if r.failed or sp_idx < 0 or sp_idx >= n_spans:
+                    raise Error("navmesh blob: tile span index out of bounds")
+                t.span_indices.append(Int32(sp_idx))
             var n_p = r.integer()
+            if r.failed or n_p < 0 or n_p > (1 << 22) or n_p > max(0, r.limit() - r.offset) // 8:
+                raise Error("navmesh blob: invalid tile poly count")
             t.poly_ids = List[Int](capacity=n_p)
             for _ in range(n_p):
                 t.poly_ids.append(r.integer())
@@ -2222,10 +2252,19 @@ struct NavMesh(Copyable, Movable):
 
         # 4. Polygons & portals
         var n_polys = r.integer()
+        if r.failed or n_polys < 0 or n_polys > (1 << 20) or n_polys > max(0, r.limit() - r.offset) // 56:
+            raise Error("navmesh blob: invalid poly count")
+        for ti in range(n_tiles):
+            for pk in range(len(self.tiles[ti].poly_ids)):
+                var pid = self.tiles[ti].poly_ids[pk]
+                if pid < 0 or pid >= n_polys:
+                    raise Error("navmesh blob: tile poly_id out of bounds")
         self.polys = List[NavPoly](capacity=n_polys)
         for _ in range(n_polys):
             var p = NavPoly()
             var nv = r.integer()
+            if r.failed or nv < 0 or nv > (1 << 16) or nv > max(0, r.limit() - r.offset) // 12:
+                raise Error("navmesh blob: invalid poly vertex count")
             p.verts = List[Vec3](capacity=nv)
             for _ in range(nv):
                 p.verts.append(r.vec3())
@@ -2233,25 +2272,39 @@ struct NavMesh(Copyable, Movable):
             p.plane_n = r.vec3()
             p.plane_d = r.f32()
             var nn = r.integer()
+            if r.failed or nn < 0 or nn > (1 << 16) or nn > max(0, r.limit() - r.offset) // 32:
+                raise Error("navmesh blob: invalid poly neighbor count")
             p.neighbors = List[Int](capacity=nn)
             p.portal_left = List[Vec3](capacity=nn)
             p.portal_right = List[Vec3](capacity=nn)
             for _ in range(nn):
-                p.neighbors.append(r.integer())
+                var nb = r.integer()
+                if r.failed or nb < 0 or nb >= n_polys:
+                    raise Error("navmesh blob: poly neighbor out of bounds")
+                p.neighbors.append(nb)
                 p.portal_left.append(r.vec3())
                 p.portal_right.append(r.vec3())
+            if len(p.portal_left) != len(p.neighbors) or len(p.portal_right) != len(p.neighbors):
+                raise Error("navmesh blob: mismatched portal arrays")
             p.area_cost = r.f32()
             p.region_id = Int32(r.integer())
             self.polys.append(p^)
 
         var n_own = r.integer()
+        if r.failed or n_own != n_polys or n_own > max(0, r.limit() - r.offset) // 8:
+            raise Error("navmesh blob: invalid poly owner count")
         self.poly_owner_tile = List[Int](capacity=n_own)
         for _ in range(n_own):
-            self.poly_owner_tile.append(r.integer())
+            var owner_t = r.integer()
+            if r.failed or owner_t < 0 or owner_t >= n_tiles:
+                raise Error("navmesh blob: poly_owner_tile out of bounds")
+            self.poly_owner_tile.append(owner_t)
         self.next_region_id = Int32(r.integer())
 
         # 5. Obstacles
         var n_obs = r.integer()
+        if r.failed or n_obs < 0 or n_obs > (1 << 16) or n_obs > max(0, r.limit() - r.offset) // 58:
+            raise Error("navmesh blob: invalid obstacle count")
         self.obstacles = List[NavObstacle](capacity=n_obs)
         for _ in range(n_obs):
             var oid = r.integer()
@@ -2266,6 +2319,8 @@ struct NavMesh(Copyable, Movable):
 
         # 6. Off-mesh links
         var n_lnk = r.integer()
+        if r.failed or n_lnk < 0 or n_lnk > (1 << 16) or n_lnk > max(0, r.limit() - r.offset) // 59:
+            raise Error("navmesh blob: invalid link count")
         self.off_mesh_links = List[OffMeshLink](capacity=n_lnk)
         for _ in range(n_lnk):
             var lid = r.integer()
@@ -2278,6 +2333,12 @@ struct NavMesh(Copyable, Movable):
             var lenb = r.boolean()
             var lstart = r.integer()
             var lend = r.integer()
+            if (
+                r.failed
+                or lstart < -1 or lstart >= n_polys
+                or lend < -1 or lend >= n_polys
+            ):
+                raise Error("navmesh blob: off_mesh_link poly index out of bounds")
             self.off_mesh_links.append(OffMeshLink(lid, sp, ep, lrad, lkind, lbi, lcs, lenb, lstart, lend))
 
         r.leave()

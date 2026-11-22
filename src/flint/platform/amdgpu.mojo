@@ -324,7 +324,7 @@ struct AmdGpu(Movable):
     def open_node(mut self, minor: Int) -> Bool:
         # Render nodes must be opened read/write for command submission.
         var path = "/dev/dri/renderD" + String(minor)
-        var fd = Int(external_call["open", Int32](path.as_c_string_span(), Int32(2), Int32(0)))
+        var fd = Int(external_call["openat", Int32](Int32(-100), path.as_c_string_span(), Int32(2), Int32(0)))
         if fd < 0:
             return False
         if self.read_device_info(fd) and self.supported():

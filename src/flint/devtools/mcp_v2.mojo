@@ -297,7 +297,7 @@ def _ensure_private_dir_0700(dir_path: String, expected_uid: UInt32) -> Bool:
             return False
     var owned = dir_path
     var old_umask = external_call["umask", UInt32](UInt32(0o077))
-    var mrc = external_call["mkdir", Int32](owned.as_c_string_span(), UInt32(0o700))
+    var mrc = external_call["mkdirat", Int32](Int32(-100), owned.as_c_string_span(), UInt32(0o700))
     _ = external_call["umask", UInt32](old_umask)
     if mrc != 0 and last_errno() != Int32(17):  # EEXIST = 17
         return False
@@ -1104,9 +1104,13 @@ struct McpServerV2(Movable):
                     pixels = ren.readback_pixels()
                 else:
                     var sw_c = _render_studio_software_preview(studio, req_w, req_h)
+                    cap_w = sw_c.width
+                    cap_h = sw_c.height
                     pixels = sw_c.pixels.copy()
             else:
                 var sw_c = _render_studio_software_preview(studio, req_w, req_h)
+                cap_w = sw_c.width
+                cap_h = sw_c.height
                 pixels = sw_c.pixels.copy()
 
             var wrote = write_png(out_path, pixels, cap_w, cap_h)

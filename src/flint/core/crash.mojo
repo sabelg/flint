@@ -38,7 +38,7 @@ from flint.core.anchor import (
 )
 from flint.core.build_info import build_stamp
 from flint.core.log import LOG_ENTRIES, flush_log, format_entry, start_log
-from flint.platform.os import read_bytes
+from flint.platform.os import set_signal_action, read_bytes
 
 comptime CrashHandler = def(Int32, Int, Int) abi("C") thin -> None
 comptime SIGILL: Int = 4
@@ -176,7 +176,7 @@ def install_crash_handler(status: String = "") -> Bool:
     action[17] = SA_SIGINFO | SA_ONSTACK
     var ok = True
     for signal in crash_signals():
-        if external_call["sigaction", Int32](Int32(signal), Int(action.unsafe_ptr()), Int(0)) != 0:
+        if set_signal_action(Int32(signal), Int(action.unsafe_ptr()), Int(0)) != 0:
             ok = False
     _ = action^
     store(base + A_HANDLER_INSTALLED, 1 if ok else 0)
@@ -488,7 +488,7 @@ def restore_and_reraise(signal: Int, info: Int):
     if base != 0:
         for index in range(19):  # a zeroed struct sigaction: SIG_DFL
             store(base + SCRATCH_SIGNAL + index * 8, 0)
-        _ = external_call["sigaction", Int32](Int32(signal), base + SCRATCH_SIGNAL, Int(0))
+        _ = set_signal_action(Int32(signal), base + SCRATCH_SIGNAL, Int(0))
     var code = Int(Pointer[Int32, origin=MutAnyOrigin](unsafe_from_address=info + 8)[unsafe_offset=0])
     if code <= 0 or signal == SIGABRT:
         _ = sys(SYS_TGKILL, sys(SYS_GETPID), sys(SYS_GETTID), signal)

@@ -268,6 +268,8 @@ struct FieldVolume(Copyable, ImplicitlyCopyable, Movable):
         v.drag = input.f32()
         v.angular_drag = input.f32()
         v.mask = input.u32()
+        if input.failed:
+            raise Error("force blob: truncated FieldVolume")
         if v.target < 0 or v.target > TARGET_WATER or v.shape < 0 or v.shape > SHAPE_CAPSULE:
             raise Error("force blob: volume " + String(v.id) + " has an unknown target or shape")
         return v
@@ -420,14 +422,16 @@ struct ForceWorld(Copyable, Movable):
     def read(mut self, mut input: BlobReader) raises:
         self.clear()
         var count = input.integer()
-        if count < 0 or count > 1 << 16:
+        if input.failed or count < 0 or count > (1 << 16) or count > max(0, input.limit() - input.offset) // 120:
             raise Error("force blob lists " + String(count) + " volumes")
         for _ in range(count):
             self.volumes.append(FieldVolume.read(input))
         self.rebuild_wind()
         self.next_vorticle_id = input.integer()
         var vorticles = input.integer()
-        if vorticles < 0 or vorticles > 1 << 12:
+        if input.failed or vorticles < 0 or vorticles > (1 << 12) or vorticles > max(0, input.limit() - input.offset) // 96:
             raise Error("force blob lists " + String(vorticles) + " vorticles")
         for _ in range(vorticles):
             self.wind.vorticles.append(Vorticle.read(input))
+        if input.failed:
+            raise Error("force blob: truncated ForceWorld")

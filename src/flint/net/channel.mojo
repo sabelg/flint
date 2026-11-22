@@ -317,8 +317,11 @@ struct NetChannel(Movable):
         self.rx_replay = ReplayWindow64()
         self.crypto_auth_failures = 0
         self.crypto_replay_drops = 0
-        self._crypto_scratch = List[UInt8](capacity=IPV6_SAFE_MTU_BYTES)
-        self._decrypt_scratch = List[UInt8](capacity=IPV6_SAFE_MTU_BYTES)
+        var scratch_cap = max(
+            IPV6_SAFE_MTU_BYTES, self.max_mtu_bytes + AEAD_OVERHEAD_BYTES
+        )
+        self._crypto_scratch = List[UInt8](capacity=scratch_cap)
+        self._decrypt_scratch = List[UInt8](capacity=scratch_cap)
 
         self.sent_records = List[_SentPacketRecord](
             length=_SENT_TRACK_SIZE, fill=_SentPacketRecord()
@@ -593,7 +596,11 @@ struct NetChannel(Movable):
         else:
             if len(self.tx_scratch) < WIRE_HEADER_BYTES:
                 return False
+            var pt_len = len(self.tx_scratch) - WIRE_HEADER_BYTES
             self._crypto_scratch.clear()
+            self._crypto_scratch.reserve(
+                WIRE_HEADER_BYTES + AEAD_NONCE_BYTES + max(0, pt_len) + AEAD_TAG_BYTES
+            )
             # Copy 14-byte wire header with WIRE_FLAG_ENCRYPTED set
             for i in range(WIRE_HEADER_BYTES):
                 self._crypto_scratch.append(self.tx_scratch[i])
@@ -602,7 +609,6 @@ struct NetChannel(Movable):
             var nonce = self.tx_nonce
             self.tx_nonce += 1
             _put_u64(self._crypto_scratch, nonce)
-            var pt_len = len(self.tx_scratch) - WIRE_HEADER_BYTES
             var pt_ptr = (
                 Int(self.tx_scratch.unsafe_ptr()) + WIRE_HEADER_BYTES
                 if pt_len > 0

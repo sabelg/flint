@@ -48,7 +48,7 @@ struct PbReader(Copyable, Movable):
         self.wire = k & 7
 
     def fixed32(mut self) raises -> UInt32:
-        if self.pos + 4 > self.end:
+        if self.end - self.pos < 4:
             raise Error("protobuf: truncated fixed32")
         var v = Pointer[UInt32, MutAnyOrigin](unsafe_from_address=self.pos).unsafe_load[alignment=1]()
         self.pos += 4
@@ -58,7 +58,7 @@ struct PbReader(Copyable, Movable):
         """The (start, end) of a length-delimited field, skipping past it."""
         var n = self.varint()
         var start = self.pos
-        if n < 0 or start + n > self.end:
+        if n < 0 or self.end < start or n > self.end - start:
             raise Error("protobuf: length out of range")
         self.pos = start + n
         return (start, start + n)
@@ -79,10 +79,14 @@ struct PbReader(Copyable, Movable):
         if self.wire == WIRE_VARINT:
             _ = self.varint()
         elif self.wire == WIRE_I64:
+            if self.end - self.pos < 8:
+                raise Error("protobuf: truncated fixed64")
             self.pos += 8
         elif self.wire == WIRE_LEN:
             _ = self.length_delimited()
         elif self.wire == WIRE_I32:
+            if self.end - self.pos < 4:
+                raise Error("protobuf: truncated fixed32")
             self.pos += 4
         else:
             raise Error("protobuf: unsupported wire type " + String(self.wire))
@@ -101,7 +105,7 @@ struct PbReader(Copyable, Movable):
         if self.wire == WIRE_LEN:
             var r = self.length_delimited()
             var at = r[0]
-            while at + 4 <= r[1]:
+            while r[1] - at >= 4:
                 out.append(Pointer[Float32, MutAnyOrigin](unsafe_from_address=at).unsafe_load[alignment=1]())
                 at += 4
         else:

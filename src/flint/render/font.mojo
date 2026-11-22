@@ -345,7 +345,7 @@ struct SdfFont(Copyable, Movable):
         self.atlas_version += 1
 
     def glyph_index(self, code: Int) -> Int:
-        if code >= 0 and code < GLYPH_TABLE:
+        if code >= 0 and code < len(self.lookup):
             return self.lookup[code]
         var found = self.extra.get(code)
         if found:

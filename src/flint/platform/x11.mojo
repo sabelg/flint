@@ -849,7 +849,7 @@ struct X11Window(WindowBackend):
         if sock_path.byte_length() >= 106:
             return False
 
-        _ = external_call["signal", Int](Int32(13), Int(1))  # SIGPIPE, SIG_IGN
+        _ = external_call["sigignore", Int32](Int32(13))  # SIGPIPE
         self.fd = Int(external_call["socket", Int32](Int32(1), Int32(1), Int32(0)))
         if self.fd < 0:
             return False

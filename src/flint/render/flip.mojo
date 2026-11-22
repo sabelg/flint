@@ -94,10 +94,20 @@ def hyab(p: Lab, q: Lab) -> Float32:
     return abs(p.l - q.l) + sqrt(da * da + db * db)
 
 
-def csf_kernel(a1: Float32, b1: Float32, a2: Float32, b2: Float32, ppd: Float32) -> List[Float32]:
+@always_inline
+def _sanitize_ppd(ppd: Float32) -> Float32:
+    if ppd != ppd or ppd < Float32(1.0e-3):
+        return FLIP_PPD
+    if ppd > Float32(1024.0):
+        return Float32(1024.0)
+    return ppd
+
+
+def csf_kernel(a1: Float32, b1: Float32, a2: Float32, b2: Float32, ppd_in: Float32) -> List[Float32]:
     """One axis of a contrast-sensitivity filter, normalised to sum 1. The 2D
     filter is a sum of at most two Gaussians, each separable; the widths are
     in degrees, so a pixel is 1/ppd of a degree."""
+    var ppd = _sanitize_ppd(ppd_in)
     var widest = max(b1, b2)
     var radius = Int(ceil(3.0 * sqrt(widest / (2.0 * PI32 * PI32)) * ppd))
     var kernel = List[Float32]()
@@ -109,14 +119,16 @@ def csf_kernel(a1: Float32, b1: Float32, a2: Float32, b2: Float32, ppd: Float32)
             value += a2 * sqrt(PI32 / b2) * exp(-PI32 * PI32 * x * x / b2)
         kernel.append(value)
         total += value
-    for index in range(len(kernel)):
-        kernel[index] /= total
+    if total > Float32(0.0):
+        for index in range(len(kernel)):
+            kernel[index] /= total
     return kernel^
 
 
-def gaussian_kernel(a: Float32, b: Float32, ppd: Float32, radius: Int) -> List[Float32]:
+def gaussian_kernel(a: Float32, b: Float32, ppd_in: Float32, radius: Int) -> List[Float32]:
     """a sqrt(pi/b) exp(-pi^2 x^2 / b) on one axis, NOT normalised: a sum of
     two of these keeps their relative weight."""
+    var ppd = _sanitize_ppd(ppd_in)
     var kernel = List[Float32]()
     for offset in range(-radius, radius + 1):
         var x = Float32(offset) / ppd
@@ -126,6 +138,8 @@ def gaussian_kernel(a: Float32, b: Float32, ppd: Float32, radius: Int) -> List[F
 
 def blur_rows(source: List[Float32], width: Int, height: Int, kernel: List[Float32]) -> List[Float32]:
     """Convolution along x with clamped edges."""
+    if width <= 0 or height <= 0 or width > 0x7FFFFFFF // height:
+        return List[Float32]()
     var radius = len(kernel) // 2
     var out = List[Float32](length=width * height, fill=0)
     for y in range(height):
@@ -140,6 +154,8 @@ def blur_rows(source: List[Float32], width: Int, height: Int, kernel: List[Float
 
 
 def blur_columns(source: List[Float32], width: Int, height: Int, kernel: List[Float32]) -> List[Float32]:
+    if width <= 0 or height <= 0 or width > 0x7FFFFFFF // height:
+        return List[Float32]()
     var radius = len(kernel) // 2
     var out = List[Float32](length=width * height, fill=0)
     for y in range(height):
@@ -182,8 +198,11 @@ struct Opponent(Movable):
             self.luminance[index] = yy
 
 
-def filtered_lab(image: Opponent, width: Int, height: Int, ppd: Float32) -> List[Lab]:
+def filtered_lab(image: Opponent, width: Int, height: Int, ppd_in: Float32) -> List[Lab]:
     """The colour pipeline up to Hunt-adjusted Lab, after the CSF blur."""
+    if width <= 0 or height <= 0 or width > 0x7FFFFFFF // height:
+        return List[Lab]()
+    var ppd = _sanitize_ppd(ppd_in)
     var achromatic = csf_kernel(1.0, 0.0047, 0.0, 0.00001, ppd)
     var red_green = csf_kernel(1.0, 0.0053, 0.0, 0.00001, ppd)
     # Blue-yellow is two Gaussians: blur with each and add, normalised together.
@@ -195,9 +214,10 @@ def filtered_lab(image: Opponent, width: Int, height: Int, ppd: Float32) -> List
         for j in range(len(by_first)):
             total += by_first[i] * by_first[j] + by_second[i] * by_second[j]
     var scale = sqrt(total)
-    for i in range(len(by_first)):
-        by_first[i] /= scale
-        by_second[i] /= scale
+    if scale > Float32(0.0):
+        for i in range(len(by_first)):
+            by_first[i] /= scale
+            by_second[i] /= scale
     var y = separable(image.y, width, height, achromatic, achromatic)
     var cx = separable(image.cx, width, height, red_green, red_green)
     var cz_a = separable(image.cz, width, height, by_first, by_first)
@@ -228,17 +248,23 @@ def normalise_signed(mut kernel: List[Float32]):
         else:
             negative -= value
     for index in range(len(kernel)):
-        if kernel[index] > 0:
+        if kernel[index] > 0 and positive > 0:
             kernel[index] /= positive
-        elif negative > 0:
+        elif kernel[index] < 0 and negative > 0:
             kernel[index] /= negative
 
 
-def feature_kernels(ppd: Float32) -> Tuple[List[Float32], List[Float32], List[Float32]]:
+def feature_kernels(ppd_in: Float32) -> Tuple[List[Float32], List[Float32], List[Float32]]:
     """One axis of the edge (first derivative) and point (second derivative)
     detectors and the plain Gaussian for the other axis. Positive weights sum
     to 1 and negative ones to -1; the Gaussian sums to 1."""
+    var ppd = _sanitize_ppd(ppd_in)
     var sigma = 0.5 * FEATURE_WIDTH_DEGREES * ppd
+    var sigma2 = sigma * sigma
+    if sigma2 <= Float32(1.0e-12):
+        ppd = FLIP_PPD
+        sigma = 0.5 * FEATURE_WIDTH_DEGREES * ppd
+        sigma2 = sigma * sigma
     var radius = Int(ceil(3.0 * sigma))
     var gauss = List[Float32]()
     var edge = List[Float32]()
@@ -246,19 +272,23 @@ def feature_kernels(ppd: Float32) -> Tuple[List[Float32], List[Float32], List[Fl
     var g_total = Float32(0)
     for offset in range(-radius, radius + 1):
         var x = Float32(offset)
-        var g = exp(-(x * x) / (2.0 * sigma * sigma))
+        var g = exp(-(x * x) / (2.0 * sigma2))
         gauss.append(g)
         g_total += g
         edge.append(-x * g)
-        point.append((x * x / (sigma * sigma) - 1.0) * g)
-    for index in range(len(gauss)):
-        gauss[index] /= g_total
+        point.append((x * x / sigma2 - 1.0) * g)
+    if g_total > Float32(0.0):
+        for index in range(len(gauss)):
+            gauss[index] /= g_total
     normalise_signed(edge)
     normalise_signed(point)
     return (gauss^, edge^, point^)
 
 
-def feature_strengths(luminance: List[Float32], width: Int, height: Int, ppd: Float32) -> Tuple[List[Float32], List[Float32]]:
+def feature_strengths(luminance: List[Float32], width: Int, height: Int, ppd_in: Float32) -> Tuple[List[Float32], List[Float32]]:
+    if width <= 0 or height <= 0 or width > 0x7FFFFFFF // height:
+        return (List[Float32](), List[Float32]())
+    var ppd = _sanitize_ppd(ppd_in)
     var kernels = feature_kernels(ppd)
     ref gauss = kernels[0]
     ref edge = kernels[1]
@@ -279,15 +309,18 @@ def feature_strengths(luminance: List[Float32], width: Int, height: Int, ppd: Fl
 def flip_error_map(reference: List[UInt32], test: List[UInt32], width: Int, height: Int, ppd: Float32 = FLIP_PPD) -> List[Float32]:
     """Per-pixel FLIP of `test` against `reference` (0xAARRGGBB), in [0, 1].
     Empty when the sizes do not match."""
-    var count = width * height
-    if count <= 0 or len(reference) < count or len(test) < count:
+    if width <= 0 or height <= 0 or width > 0x7FFFFFFF // height:
         return List[Float32]()
+    var count = width * height
+    if len(reference) < count or len(test) < count:
+        return List[Float32]()
+    var ppd_s = _sanitize_ppd(ppd)
     var ref_image = Opponent(reference, count)
     var test_image = Opponent(test, count)
-    var ref_lab = filtered_lab(ref_image, width, height, ppd)
-    var test_lab = filtered_lab(test_image, width, height, ppd)
-    var ref_features = feature_strengths(ref_image.luminance, width, height, ppd)
-    var test_features = feature_strengths(test_image.luminance, width, height, ppd)
+    var ref_lab = filtered_lab(ref_image, width, height, ppd_s)
+    var test_lab = filtered_lab(test_image, width, height, ppd_s)
+    var ref_features = feature_strengths(ref_image.luminance, width, height, ppd_s)
+    var test_features = feature_strengths(test_image.luminance, width, height, ppd_s)
 
     var cmax = hyab(linear_rgb_to_hunt_lab(0, 1, 0), linear_rgb_to_hunt_lab(0, 0, 1)) ** QC
     var knee = PC * cmax

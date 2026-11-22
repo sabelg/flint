@@ -60,6 +60,7 @@ from flint.platform.audio import decode_wav
 from flint.platform.os import (
     file_stamp,
     get_time,
+    is_symlink,
     list_directory,
     make_dirs,
     parent_directory,
@@ -281,8 +282,13 @@ def cook_native_model_bundle(
     for mi in range(len(model.meshes)):
         ref mesh = model.meshes[mi]
         var vc = mesh.vertex_count()
-        if vc <= 0:
+        if vc <= 0 or len(mesh.positions) < vc * 3:
             continue
+        for idx_i in range(len(mesh.indices)):
+            var vi = mesh.indices[idx_i]
+            if vi < 0 or vi >= vc:
+                bundle.error = "mesh vertex index out of range"
+                return bundle^
         _ = geo.append_mesh(mesh, mi, build_lods=meta.build_lods)
         if meta.build_collider:
             var base_v = Int32(len(all_verts))
@@ -759,12 +765,25 @@ def _classify_asset_ext(name: String) -> Tuple[Bool, UInt8]:
     return (False, ASSET_KIND_RAW)
 
 
+comptime MAX_COOK_DEPTH: Int = 64
+
+
+def _strip_trailing_slashes(path: String) -> String:
+    var out = path
+    while out.byte_length() > 1 and out.as_bytes()[out.byte_length() - 1] == 47:
+        var trimmed = String(out[byte=0 : out.byte_length() - 1])
+        out = trimmed^
+    return out^
+
+
 def _is_dir(path: String) -> Bool:
-    var owned = path
-    var d = external_call["opendir", Int](owned.as_c_string_span())
+    var clean = _strip_trailing_slashes(path)
+    if is_symlink(clean):
+        return False
+    var d = external_call["opendir", Int](clean.as_c_string_span())
     if d == 0:
         return False
-    _ = external_call["closedir", Int32](d)
+    _ = external_call["closedir", Int32](Pointer[UInt8, MutAnyOrigin](unsafe_from_address=d))
     return True
 
 
@@ -774,13 +793,18 @@ def _collect_workspace_sources(
     mut out_full: List[String],
     mut out_rel: List[String],
     mut out_kinds: List[UInt8],
+    depth: Int = 0,
 ):
+    if depth >= MAX_COOK_DEPTH:
+        return
     var names = list_directory(cur_dir)
     for name in names:
         var full = (cur_dir + "/" + name) if cur_dir != "/" else ("/" + name)
+        if is_symlink(full):
+            continue
         var rel = (rel_prefix + "/" + name) if rel_prefix.byte_length() > 0 else name
         if _is_dir(full):
-            _collect_workspace_sources(full, rel, out_full, out_rel, out_kinds)
+            _collect_workspace_sources(full, rel, out_full, out_rel, out_kinds, depth + 1)
         else:
             var cls = _classify_asset_ext(name)
             if cls[0]:
@@ -858,11 +882,9 @@ def cook_workspace(
     var rel_paths = List[String]()
     var kinds = List[UInt8]()
     if source_dir.byte_length() > 0:
-        var clean_src = source_dir
-        while clean_src.byte_length() > 1 and clean_src.as_bytes()[clean_src.byte_length() - 1] == 47:
-            var trimmed = String(clean_src[byte=0 : clean_src.byte_length() - 1])
-            clean_src = trimmed^
-        _collect_workspace_sources(clean_src, "", full_paths, rel_paths, kinds)
+        var clean_src = _strip_trailing_slashes(source_dir)
+        if not is_symlink(clean_src):
+            _collect_workspace_sources(clean_src, "", full_paths, rel_paths, kinds)
 
     var total_n = len(full_paths) + len(procedural_items)
     rep.total_assets = total_n

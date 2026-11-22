@@ -375,10 +375,23 @@ t1_bin_spark_shots() {
         return
     fi
     local py_err=""
-    if py_err="$(validate_png_dims "$png" 1280 720)"; then
+    if ! py_err="$(validate_png_dims "$png" 1280 720)"; then
+        fail_test "t1_bin_spark_shots" "${py_err}"
+        return
+    fi
+
+    # Also verify --headless-smoke --out <path> CLI parity
+    local smoke_png="${TMPD}/spark_smoke.png"
+    local rc_smoke=0
+    (cd "${TMPD}/spark" && "$spark_bin" --headless-smoke --out "$smoke_png") >"${TMPD}/t1_spark_smoke.out" 2>"${TMPD}/t1_spark_smoke.err" || rc_smoke=$?
+    if [[ "$rc_smoke" -ne 0 || ! -f "$smoke_png" ]]; then
+        fail_test "t1_bin_spark_shots" "--headless-smoke --out failed (rc=${rc_smoke}, exists=$(test -f "$smoke_png" && echo yes || echo no))"
+        return
+    fi
+    if py_err="$(validate_png_dims "$smoke_png" 1280 720)"; then
         pass_test "t1_bin_spark_shots"
     else
-        fail_test "t1_bin_spark_shots" "${py_err}"
+        fail_test "t1_bin_spark_shots" "smoke PNG invalid: ${py_err}"
     fi
 }
 
@@ -417,7 +430,21 @@ t1_bin_world_shots() {
             return
         fi
     done
-    pass_test "t1_bin_world_shots"
+
+    # Also verify --headless-smoke --out <path> CLI parity
+    local smoke_png="${TMPD}/world_smoke.png"
+    local rc_smoke=0
+    (cd "${TMPD}/world" && "$world_bin" --headless-smoke --out "$smoke_png") >"${TMPD}/t1_world_smoke.out" 2>"${TMPD}/t1_world_smoke.err" || rc_smoke=$?
+    if [[ "$rc_smoke" -ne 0 || ! -f "$smoke_png" ]]; then
+        fail_test "t1_bin_world_shots" "--headless-smoke --out failed (rc=${rc_smoke}, exists=$(test -f "$smoke_png" && echo yes || echo no))"
+        return
+    fi
+    local py_smoke=""
+    if py_smoke="$(validate_png_dims "$smoke_png" 1280 720)"; then
+        pass_test "t1_bin_world_shots"
+    else
+        fail_test "t1_bin_world_shots" "smoke PNG invalid: ${py_smoke}"
+    fi
 }
 
 # 11. flint-studio --headless-smoke AND --mcp-stdio (both Content-Length and newline framing)
@@ -571,7 +598,7 @@ t2_cli_preview_help() {
     fi
 }
 
-# 5. flint-pack <3 args usage AND missing input error + no output file created
+# 5. flint-pack <3 args usage, error exit codes, missing input error + no output file created, and symlink-loop guard
 t2_bin_pack_errors() {
     if ! resolve_bin "flint-pack" "pack_cli"; then
         fail_test "t2_bin_pack_errors" "failed to resolve/compile flint-pack"
@@ -580,19 +607,93 @@ t2_bin_pack_errors() {
     local pack_bin="$RESOLVED_BIN"
     local rc1=0
     "$pack_bin" >"${TMPD}/t2_pack_args.out" 2>"${TMPD}/t2_pack_args.err" || rc1=$?
-    if ! grep -q "Usage: flint-pack" "${TMPD}/t2_pack_args.out"; then
-        fail_test "t2_bin_pack_errors" "missing usage message on <3 args"
+    if [[ "$rc1" -eq 0 ]] || ! grep -q "Usage: flint-pack" "${TMPD}/t2_pack_args.out"; then
+        fail_test "t2_bin_pack_errors" "expected non-zero exit & usage message on <3 args (rc=${rc1})"
+        return
+    fi
+    local rc_bogus=0
+    "$pack_bin" --bogus-opt >"${TMPD}/t2_pack_bogus.out" 2>"${TMPD}/t2_pack_bogus.err" || rc_bogus=$?
+    if [[ "$rc_bogus" -eq 0 ]] || ! grep -q "\[Flint Pack\] ERROR" "${TMPD}/t2_pack_bogus.out"; then
+        fail_test "t2_bin_pack_errors" "expected non-zero exit on unknown option (rc=${rc_bogus})"
         return
     fi
     local bad_out="${TMPD}/should_not_exist.flpk"
     rm -f "$bad_out"
     local rc2=0
     "$pack_bin" "$bad_out" "${TMPD}/nonexistent_input_asset.bin" >"${TMPD}/t2_pack_miss.out" 2>"${TMPD}/t2_pack_miss.err" || rc2=$?
-    if grep -q "\[Flint Pack\] ERROR" "${TMPD}/t2_pack_miss.out" && [[ ! -e "$bad_out" ]]; then
-        pass_test "t2_bin_pack_errors"
-    else
-        fail_test "t2_bin_pack_errors" "missing '[Flint Pack] ERROR' or created ${bad_out}"
+    if [[ "$rc2" -eq 0 ]] || ! grep -q "\[Flint Pack\] ERROR" "${TMPD}/t2_pack_miss.out" || [[ -e "$bad_out" ]]; then
+        fail_test "t2_bin_pack_errors" "expected non-zero exit & '[Flint Pack] ERROR' without creating ${bad_out} (rc=${rc2})"
+        return
     fi
+
+    # Symlink-loop traversal bomb guard: dual self-symlinks (s1 -> ., s2 -> .) must finish fast
+    local ws_bomb="${TMPD}/ws_symlink_bomb"
+    mkdir -p "$ws_bomb"
+    ln -s . "${ws_bomb}/s1"
+    ln -s . "${ws_bomb}/s2"
+    local rc_empty_cook=0
+    timeout 5s "$pack_bin" --cook "$ws_bomb" "${TMPD}/bomb_empty.flpk" >"${TMPD}/t2_pack_bomb.out" 2>"${TMPD}/t2_pack_bomb.err" || rc_empty_cook=$?
+    if [[ "$rc_empty_cook" -eq 124 || "$rc_empty_cook" -eq 0 ]]; then
+        fail_test "t2_bin_pack_errors" "symlink-only --cook hung or exited 0 (rc=${rc_empty_cook})"
+        return
+    fi
+
+    # Symlink-to-directory input/output and trailing-slash bypass guards
+    local real_wav_dir="${TMPD}/real_wav_dir"
+    local sym_wav_dir="${TMPD}/sym_wav_dir"
+    mkdir -p "$real_wav_dir"
+    python3 - "${real_wav_dir}/tone.wav" <<'PY'
+import struct, sys
+samples = b"\x00\x00\x00\x00"
+hdr = struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + len(samples), b"WAVE", b"fmt ", 16, 1, 1, 48000, 96000, 2, 16, b"data", len(samples))
+with open(sys.argv[1], "wb") as f:
+    f.write(hdr + samples)
+PY
+    printf 'sample payload\n' >"${TMPD}/pack_sym_sample.txt"
+    ln -s "$real_wav_dir" "$sym_wav_dir"
+
+    local rc_sym_raw=0
+    "$pack_bin" --raw "${TMPD}/sym_in.flpk" "$sym_wav_dir" >"${TMPD}/t2_pack_sym_raw.out" 2>"${TMPD}/t2_pack_sym_raw.err" || rc_sym_raw=$?
+    if [[ "$rc_sym_raw" -ne 1 ]] || ! grep -q "\[Flint Pack\] ERROR" "${TMPD}/t2_pack_sym_raw.out" || [[ -e "${TMPD}/sym_in.flpk" ]]; then
+        fail_test "t2_bin_pack_errors" "--raw symlink dir input expected rc=1 & ERROR (got rc=${rc_sym_raw})"
+        return
+    fi
+
+    local rc_sym_raw_slash=0
+    "$pack_bin" --raw "${TMPD}/sym_in_slash.flpk" "${sym_wav_dir}/" >"${TMPD}/t2_pack_sym_raw_slash.out" 2>"${TMPD}/t2_pack_sym_raw_slash.err" || rc_sym_raw_slash=$?
+    if [[ "$rc_sym_raw_slash" -ne 1 ]] || ! grep -q "\[Flint Pack\] ERROR" "${TMPD}/t2_pack_sym_raw_slash.out" || [[ -e "${TMPD}/sym_in_slash.flpk" ]]; then
+        fail_test "t2_bin_pack_errors" "--raw symlink dir/ input expected rc=1 & ERROR (got rc=${rc_sym_raw_slash})"
+        return
+    fi
+
+    local rc_sym_out=0
+    "$pack_bin" --raw "$sym_wav_dir" "${TMPD}/pack_sym_sample.txt" >"${TMPD}/t2_pack_sym_out.out" 2>"${TMPD}/t2_pack_sym_out.err" || rc_sym_out=$?
+    if [[ "$rc_sym_out" -ne 1 ]] || ! grep -q "\[Flint Pack\] ERROR" "${TMPD}/t2_pack_sym_out.out"; then
+        fail_test "t2_bin_pack_errors" "--raw symlink output expected rc=1 & ERROR (got rc=${rc_sym_out})"
+        return
+    fi
+
+    local rc_sym_cook=0
+    "$pack_bin" --cook "$sym_wav_dir" "${TMPD}/sym_cook1.flpk" >"${TMPD}/t2_pack_sym_cook.out" 2>"${TMPD}/t2_pack_sym_cook.err" || rc_sym_cook=$?
+    if [[ "$rc_sym_cook" -ne 1 ]] || ! grep -q "\[Flint Pack\] ERROR" "${TMPD}/t2_pack_sym_cook.out" || [[ -e "${TMPD}/sym_cook1.flpk" ]]; then
+        fail_test "t2_bin_pack_errors" "--cook symlink dir expected rc=1 & ERROR (got rc=${rc_sym_cook})"
+        return
+    fi
+
+    local rc_sym_cook_slash=0
+    "$pack_bin" --cook "${sym_wav_dir}/" "${TMPD}/sym_cook2.flpk" >"${TMPD}/t2_pack_sym_cook_slash.out" 2>"${TMPD}/t2_pack_sym_cook_slash.err" || rc_sym_cook_slash=$?
+    if [[ "$rc_sym_cook_slash" -ne 1 ]] || ! grep -q "\[Flint Pack\] ERROR" "${TMPD}/t2_pack_sym_cook_slash.out" || [[ -e "${TMPD}/sym_cook2.flpk" ]]; then
+        fail_test "t2_bin_pack_errors" "--cook symlink dir/ expected rc=1 & ERROR (got rc=${rc_sym_cook_slash})"
+        return
+    fi
+
+    local rc_real_cook_slash=0
+    (cd "$TMPD" && "$pack_bin" --cook "${real_wav_dir}/" "${TMPD}/real_cook_slash.flpk") >"${TMPD}/t2_pack_real_cook_slash.out" 2>"${TMPD}/t2_pack_real_cook_slash.err" || rc_real_cook_slash=$?
+    if [[ "$rc_real_cook_slash" -ne 0 ]] || [[ ! -s "${TMPD}/real_cook_slash.flpk" ]]; then
+        fail_test "t2_bin_pack_errors" "--cook real_dir/ positive control failed (rc=${rc_real_cook_slash})"
+        return
+    fi
+    pass_test "t2_bin_pack_errors"
 }
 
 # 6. flint-cycles <3 args usage, bad .tidal render exits non-zero, bad query exits non-zero

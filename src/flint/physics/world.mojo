@@ -5651,29 +5651,36 @@ struct PhysicsWorld(Resource, Movable):
         self.settings.force_serial = r.boolean()
 
         var n_hulls = r.integer()
-        if n_hulls < 0 or n_hulls > 1 << 16:
+        if r.failed or n_hulls < 0 or n_hulls > (1 << 16) or n_hulls > max(0, r.limit() - r.offset) // 16:
             raise Error("physics world blob: invalid hull count")
         self.hulls.clear()
         for _ in range(n_hulls):
             var nv = r.integer()
-            var verts = List[Vec3](capacity=max(0, nv))
+            if r.failed or nv < 0 or nv > (1 << 20) or nv > max(0, r.limit() - r.offset) // 12:
+                raise Error("physics world blob: invalid hull vertex count")
+            var verts = List[Vec3](capacity=nv)
             for _ in range(nv):
                 verts.append(r.vec3())
             var ni = r.integer()
-            var idxs = List[Int32](capacity=max(0, ni))
+            if r.failed or ni < 0 or ni > (1 << 20) or ni > max(0, r.limit() - r.offset) // 8:
+                raise Error("physics world blob: invalid hull index count")
+            var idxs = List[Int32](capacity=ni)
             for _ in range(ni):
-                idxs.append(Int32(r.integer()))
+                var idx = r.integer()
+                if r.failed or idx < 0 or idx >= nv:
+                    raise Error("physics world blob: invalid hull vertex index")
+                idxs.append(Int32(idx))
             self.hulls.append(ConvexHull(verts, idxs))
 
         var n_cmp = r.integer()
-        if n_cmp < 0 or n_cmp > 1 << 16:
+        if n_cmp < 0 or n_cmp > (1 << 16) or n_cmp > max(0, r.limit() - r.offset) // 16:
             raise Error("physics world blob: invalid compound count")
         self.compounds.clear()
         for _ in range(n_cmp):
             self.compounds.append(CompoundShape.deserialize(r))
 
         var n_bodies = r.integer()
-        if n_bodies < 0 or n_bodies > 1 << 20:
+        if n_bodies < 0 or n_bodies > (1 << 20) or n_bodies > max(0, r.limit() - r.offset) // 100:
             raise Error("physics world blob: invalid body count")
         self.bodies.clear()
         self.bodies.reserve(n_bodies)
@@ -5715,24 +5722,34 @@ struct PhysicsWorld(Resource, Movable):
             b.wind_area_over_mass = r.f32()
             b.force_accum = r.vec3()
             b.torque_accum = r.vec3()
+            if r.failed or b.shape < 0 or b.shape > BODY_SHAPE_COMPOUND:
+                raise Error("physics world blob: invalid body shape")
+            if b.shape == BODY_SHAPE_CONVEX_HULL and (b.shape_index < 0 or b.shape_index >= len(self.hulls)):
+                raise Error("physics world blob: convex hull shape_index out of bounds")
+            if b.shape == BODY_SHAPE_MESH_BVH8 and (b.shape_index < 0 or b.shape_index >= len(self.meshes)):
+                raise Error("physics world blob: mesh shape_index out of bounds")
+            if b.shape == BODY_SHAPE_HEIGHTFIELD and (b.shape_index < 0 or b.shape_index >= len(self.heightfields)):
+                raise Error("physics world blob: heightfield shape_index out of bounds")
+            if b.shape == BODY_SHAPE_COMPOUND and (b.shape_index < 0 or b.shape_index >= len(self.compounds)):
+                raise Error("physics world blob: compound shape_index out of bounds")
             self.bodies.append(b^)
 
         var n_joints = r.integer()
-        if n_joints < 0 or n_joints > 1 << 20:
+        if n_joints < 0 or n_joints > (1 << 20) or n_joints > max(0, r.limit() - r.offset) // 12:
             raise Error("physics world blob: invalid joint count")
         self.joints.clear()
         for _ in range(n_joints):
             self.joints.append(Joint.deserialize(r))
 
         var n_s6 = r.integer()
-        if n_s6 < 0 or n_s6 > 1 << 16:
+        if n_s6 < 0 or n_s6 > (1 << 16) or n_s6 > max(0, r.limit() - r.offset) // 12:
             raise Error("physics world blob: invalid six-dof joint count")
         self.six_dof_joints.clear()
         for _ in range(n_s6):
             self.six_dof_joints.append(SixDofMotorJoint.deserialize(r))
 
         var n_sens = r.integer()
-        if n_sens < 0 or n_sens > 1 << 16:
+        if n_sens < 0 or n_sens > (1 << 16) or n_sens > max(0, r.limit() - r.offset) // 52:
             raise Error("physics world blob: invalid sensor count")
         self.sensors.clear()
         for _ in range(n_sens):
@@ -5746,6 +5763,8 @@ struct PhysicsWorld(Resource, Movable):
             self.sensors.append(Sensor(s_id, s_c, s_h, s_rad, CollisionFilter(s_cat, s_mask, s_grp)))
 
         var n_sin = r.integer()
+        if n_sin < 0 or n_sin > (1 << 20) or n_sin > max(0, r.limit() - r.offset) // 16:
+            raise Error("physics world blob: invalid sensor_inside count")
         self.sensor_inside_a.clear()
         self.sensor_inside_b.clear()
         for _ in range(n_sin):
@@ -5753,7 +5772,7 @@ struct PhysicsWorld(Resource, Movable):
             self.sensor_inside_b.append(r.integer())
 
         var n_trig = r.integer()
-        if n_trig < 0 or n_trig > 1 << 16:
+        if n_trig < 0 or n_trig > (1 << 16) or n_trig > max(0, r.limit() - r.offset) // 81:
             raise Error("physics world blob: invalid trigger count")
         self.triggers.clear()
         for _ in range(n_trig):
@@ -5773,6 +5792,8 @@ struct PhysicsWorld(Resource, Movable):
             )
 
         var n_tin = r.integer()
+        if n_tin < 0 or n_tin > (1 << 20) or n_tin > max(0, r.limit() - r.offset) // 16:
+            raise Error("physics world blob: invalid trigger_inside count")
         self.trigger_inside_a.clear()
         self.trigger_inside_b.clear()
         for _ in range(n_tin):
@@ -5783,6 +5804,7 @@ struct PhysicsWorld(Resource, Movable):
 
         self.cache.deserialize(r)
         self.islands.deserialize(r)
+        self.islands.ensure_rows(len(self.bodies))
         self.islands.splits = r.integer()
         self.islands.merges = r.integer()
         self.graph.deserialize(r)
@@ -5799,7 +5821,7 @@ struct PhysicsWorld(Resource, Movable):
 
         if ver >= 2:
             var n_veh = r.integer()
-            if n_veh < 0 or n_veh > 1 << 16:
+            if n_veh < 0 or n_veh > (1 << 16) or n_veh > max(0, r.limit() - r.offset) // 32:
                 raise Error("physics world blob: invalid vehicle count")
             for _ in range(n_veh):
                 var v_bid = r.integer()
@@ -5814,7 +5836,7 @@ struct PhysicsWorld(Resource, Movable):
                 )
 
             var n_aero = r.integer()
-            if n_aero < 0 or n_aero > 1 << 16:
+            if n_aero < 0 or n_aero > (1 << 16) or n_aero > max(0, r.limit() - r.offset) // 32:
                 raise Error("physics world blob: invalid aero count")
             for _ in range(n_aero):
                 var a_bid = r.integer()
@@ -5828,13 +5850,13 @@ struct PhysicsWorld(Resource, Movable):
                 self.aero_bodies.append(AeroBodyEntry(a_bid, a_st, a_cfg, a_ctrl, a_act))
 
             var n_xc = r.integer()
-            if n_xc < 0 or n_xc > 1 << 16:
+            if n_xc < 0 or n_xc > (1 << 16) or n_xc > max(0, r.limit() - r.offset) // 32:
                 raise Error("physics world blob: invalid xpbd chain count")
             for _ in range(n_xc):
                 var ch = ParticleChain()
                 ch.deserialize(r)
                 var n_atts = r.integer()
-                if n_atts < 0 or n_atts > 1 << 16:
+                if n_atts < 0 or n_atts > (1 << 16) or n_atts > max(0, r.limit() - r.offset) // 12:
                     raise Error("physics world blob: invalid xpbd chain attachment count")
                 var atts = List[RigidAttachment](capacity=n_atts)
                 for _ in range(n_atts):
@@ -5842,7 +5864,7 @@ struct PhysicsWorld(Resource, Movable):
                     att.deserialize(r)
                     atts.append(att)
                 var n_w = r.integer()
-                if n_w < 0 or n_w > 1 << 20:
+                if n_w < 0 or n_w > (1 << 20) or n_w > max(0, r.limit() - r.offset) // 12:
                     raise Error("physics world blob: invalid xpbd chain wind count")
                 var wind = List[Vec3](capacity=n_w)
                 for _ in range(n_w):
@@ -5858,13 +5880,13 @@ struct PhysicsWorld(Resource, Movable):
                 self.xpbd_chains.append(entry^)
 
             var n_xm = r.integer()
-            if n_xm < 0 or n_xm > 1 << 16:
+            if n_xm < 0 or n_xm > (1 << 16) or n_xm > max(0, r.limit() - r.offset) // 32:
                 raise Error("physics world blob: invalid xpbd mesh count")
             for _ in range(n_xm):
                 var pm = ParticleMesh()
                 pm.deserialize(r)
                 var n_atts = r.integer()
-                if n_atts < 0 or n_atts > 1 << 16:
+                if n_atts < 0 or n_atts > (1 << 16) or n_atts > max(0, r.limit() - r.offset) // 12:
                     raise Error("physics world blob: invalid xpbd mesh attachment count")
                 var atts = List[RigidAttachment](capacity=n_atts)
                 for _ in range(n_atts):
@@ -5872,7 +5894,7 @@ struct PhysicsWorld(Resource, Movable):
                     att.deserialize(r)
                     atts.append(att)
                 var n_w = r.integer()
-                if n_w < 0 or n_w > 1 << 20:
+                if n_w < 0 or n_w > (1 << 20) or n_w > max(0, r.limit() - r.offset) // 12:
                     raise Error("physics world blob: invalid xpbd mesh wind count")
                 var wind = List[Vec3](capacity=n_w)
                 for _ in range(n_w):
@@ -5888,29 +5910,36 @@ struct PhysicsWorld(Resource, Movable):
                 self.xpbd_meshes.append(entry^)
 
             var n_rag = r.integer()
-            if n_rag < 0 or n_rag > 1 << 16:
+            if n_rag < 0 or n_rag > (1 << 16) or n_rag > max(0, r.limit() - r.offset) // 32:
                 raise Error("physics world blob: invalid ragdoll count")
             for _ in range(n_rag):
                 var rag = ArticulatedRagdoll()
                 rag.deserialize(r)
                 var hr = _HostedRagdoll(rag^)
                 var n_bids = r.integer()
-                if n_bids < 0 or n_bids > 4096:
+                var n_limbs = len(hr.rag.limbs)
+                if r.failed or n_bids < 0 or n_bids > 4096 or n_bids > max(0, r.limit() - r.offset) // 8 or n_bids != n_limbs:
                     raise Error("physics world blob: invalid ragdoll limb_body_ids count")
                 for _ in range(n_bids):
-                    hr.limb_body_ids.append(r.integer())
+                    var bid = r.integer()
+                    if r.failed or bid < 0:
+                        raise Error("physics world blob: invalid ragdoll limb body id")
+                    hr.limb_body_ids.append(bid)
                 var n_lq = r.integer()
-                if n_lq < 0 or n_lq > 4096:
+                if r.failed or n_lq < 0 or n_lq > 4096 or n_lq > max(0, r.limit() - r.offset) // 16 or n_lq != n_limbs:
                     raise Error("physics world blob: invalid ragdoll limb_align_quats count")
                 for _ in range(n_lq):
                     hr.limb_align_quats.append(r.quat())
                 var n_ji = r.integer()
-                if n_ji < 0 or n_ji > 4096:
+                if r.failed or n_ji < 0 or n_ji > 4096 or n_ji > max(0, r.limit() - r.offset) // 8 or n_ji != n_limbs:
                     raise Error("physics world blob: invalid ragdoll joint_indices count")
                 for _ in range(n_ji):
-                    hr.joint_indices.append(r.integer())
+                    var ji = r.integer()
+                    if r.failed or ji < -1 or ji >= len(self.six_dof_joints):
+                        raise Error("physics world blob: invalid ragdoll joint index")
+                    hr.joint_indices.append(ji)
                 var n_aq = r.integer()
-                if n_aq < 0 or n_aq > 4096:
+                if r.failed or n_aq < 0 or n_aq > 4096 or n_aq > max(0, r.limit() - r.offset) // 16 or n_aq != n_limbs:
                     raise Error("physics world blob: invalid ragdoll axis_align_quats count")
                 for _ in range(n_aq):
                     hr.axis_align_quats.append(r.quat())

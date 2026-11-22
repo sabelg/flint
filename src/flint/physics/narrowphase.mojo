@@ -1249,6 +1249,14 @@ struct ConvexHull(Copyable, Movable):
         if n_tris < 4 or len(verts) < 4:
             return (Float32(0.0), Vec3(), Sym3())
 
+        var n_verts = len(verts)
+        for t in range(n_tris):
+            var i0 = Int(tris[t * 3 + 0])
+            var i1 = Int(tris[t * 3 + 1])
+            var i2 = Int(tris[t * 3 + 2])
+            if i0 < 0 or i0 >= n_verts or i1 < 0 or i1 >= n_verts or i2 < 0 or i2 >= n_verts:
+                return (Float32(0.0), Vec3(), Sym3())
+
         # Reference centroid to avoid floating-point cancellation far from origin
         var p_ref = Vec3()
         for i in range(len(verts)):

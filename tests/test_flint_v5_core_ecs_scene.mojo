@@ -84,7 +84,7 @@ from flint.core.memory import (
     mem_live,
     mem_count,
 )
-from flint.core.profiler import ProfileTimeline, ZONE_COUNT, profile_ticks
+from flint.core.profiler import ProfileEvent, ProfileTimeline, ZONE_COUNT, ZONE_SIM, profile_ticks
 from flint.core.serial import BlobWriter, BlobReader, fourcc, fast_hash64
 from flint.core.session_replay import SessionRecorder, FLUSH_AT
 from flint.assets.json import JsonDocument
@@ -3618,6 +3618,254 @@ def test_q_restore_blob_atomicity_and_hostile_fuzz_regressions() raises:
     _ = len(src_sp_stats)
 
 
+@fieldwise_init
+struct SparseValComp(Component, Copyable, ImplicitlyCopyable, Movable):
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.t5.SparseValComp")
+    comptime STORAGE_MODE: Int = STORAGE_SPARSE
+    var v: Int
+
+
+@fieldwise_init
+struct SparseTagB(Component, Copyable, ImplicitlyCopyable, Movable):
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.t5.SparseTagB")
+    comptime STORAGE_MODE: Int = STORAGE_SPARSE
+    var b: Int
+
+
+@fieldwise_init
+struct TableTagC(Component, Copyable, ImplicitlyCopyable, Movable):
+    comptime COMPONENT_ID: UInt64 = comp_hash64("test.t5.TableTagC")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    var c: Int
+
+
+def _t5_sparse_inc1(_lane: Int, _ord: Int, _e: Entity, p0: Pointer[SparseValComp, MutAnyOrigin], _ctx: Int):
+    p0[unsafe_offset=0].v += 10
+
+
+def _t5_sparse_inc2(
+    _lane: Int,
+    _ord: Int,
+    _e: Entity,
+    p0: Pointer[SparseValComp, MutAnyOrigin],
+    p1: Pointer[SparseTagB, MutAnyOrigin],
+    _ctx: Int,
+):
+    p0[unsafe_offset=0].v += 1
+    p1[unsafe_offset=0].b += 2
+
+
+def _t5_sparse_inc3(
+    _lane: Int,
+    _ord: Int,
+    _e: Entity,
+    p0: Pointer[SparseValComp, MutAnyOrigin],
+    p1: Pointer[SparseTagB, MutAnyOrigin],
+    p2: Pointer[TableTagC, MutAnyOrigin],
+    _ctx: Int,
+):
+    p0[unsafe_offset=0].v += 1
+    p1[unsafe_offset=0].b += 1
+    p2[unsafe_offset=0].c += 1
+
+
+def test_r_tier5_sparse_par_changed_and_profiler_wrap_open() raises:
+    # 1. [High-7] par_for_each1/2/3 must update SparseSet.changed_ticks when not read_only
+    var w = World()
+    _ = w.register_component[SparseValComp]()
+    _ = w.register_component[SparseTagB]()
+    _ = w.register_component[TableTagC]()
+    var e1 = w.spawn_empty()
+    var e2 = w.spawn_empty()
+    _ = w.insert[SparseValComp](e1, SparseValComp(1))
+    _ = w.insert[SparseValComp](e2, SparseValComp(2))
+    _ = w.insert[SparseTagB](e2, SparseTagB(3))
+    _ = w.insert[TableTagC](e2, TableTagC(4))
+
+    var t0 = w.current_tick
+    _ = w.advance_tick()
+    var pool = JobPool()
+    _ = pool.start(2)
+
+    # read_only=True must NOT mark changed_ticks
+    w.par_for_each1[SparseValComp](pool, _t5_sparse_inc1, read_only=True)
+    assert_equal(len(w.query_changed_entities[SparseValComp](t0)), 0)
+
+    # read_only=False on par_for_each1 MUST mark changed_ticks for both e1 and e2
+    w.par_for_each1[SparseValComp](pool, _t5_sparse_inc1, read_only=False)
+    assert_equal(w.get[SparseValComp](e1).v, 21)
+    assert_equal(w.get[SparseValComp](e2).v, 22)
+    assert_equal(len(w.query_changed_entities[SparseValComp](t0)), 2)
+
+    var t1 = w.current_tick
+    _ = w.advance_tick()
+    # par_for_each2[SparseValComp, SparseTagB] only updates e2 (which has SparseTagB), NOT e1
+    w.par_for_each2[SparseValComp, SparseTagB](pool, _t5_sparse_inc2, read_only=False)
+    var chg2 = w.query_changed_entities[SparseValComp](t1)
+    assert_equal(len(chg2), 1)
+    assert_true(chg2[0] == e2)
+    assert_equal(len(w.query_changed_entities[SparseTagB](t1)), 1)
+
+    var t2 = w.current_tick
+    _ = w.advance_tick()
+    w.par_for_each3[SparseValComp, SparseTagB, TableTagC](pool, _t5_sparse_inc3, read_only=False)
+    assert_equal(len(w.query_changed_entities[SparseValComp](t2)), 1)
+    assert_equal(len(w.query_changed_entities[SparseTagB](t2)), 1)
+    assert_equal(len(w.query_changed_entities[TableTagC](t2)), 1)
+    pool.stop()
+
+    # 2. [High-5B/8/9/10] ProfileTimeline.open_file coexists with stdlib `with open(...)` + UInt64 wrap & underflow
+    var pid = Int(external_call["getpid", Int32]())
+    var trace_path = "/tmp/flint_t5_prof_" + String(pid) + ".json"
+    var tl = ProfileTimeline()
+    assert_true(tl.start(trace_path, overlay=True))
+    tl.nanoseconds_per_tick = 1.0  # 1 tick == 1 ns for exact assertions
+
+    # GPU span cross-wrap (opened near UInt64.MAX, started/ended past 0) + invalid ended<started rejection
+    tl.frame_starts[1] = UInt64.MAX - 100
+    tl.gpu_span_frames[1] = -1
+    tl.keep_gpu_span(ZONE_SIM, 1, UInt64(50), UInt64(200))
+    assert_equal(tl.gpu_span_counts[1], 1)
+    tl.keep_gpu_span(ZONE_SIM, 1, UInt64(300), UInt64(100))  # ended < started -> rejected
+    assert_equal(tl.gpu_span_counts[1], 1)
+
+    # hold_frame cross-wrap & wrap-spanning events
+    tl.frame_started = UInt64.MAX - 100
+    tl.frame_events.clear()
+    tl.frame_events.append(ProfileEvent(ZONE_SIM, 0, UInt64(10), UInt64(50)))  # post-wrap
+    tl.frame_events.append(ProfileEvent(ZONE_SIM, 0, UInt64.MAX - 50, UInt64(60)))  # wrap-spanning
+    tl.hold_frame(2, Float32(0.001))
+    assert_equal(len(tl.candidate), 2)
+
+    # write_event wraparound ts & ended < started dur clamp to 0.000
+    tl.origin = UInt64.MAX - 100
+    tl.write_event(ZONE_SIM, 0, UInt64(50), UInt64(150), 3)  # elapsed = 151 ticks = 0.151 us, dur = 0.100 us
+    tl.write_event(ZONE_SIM, 0, UInt64(200), UInt64(100), 3)  # ended < started -> dur = 0.000
+    tl.finish()
+
+    var trace_text: String
+    with open(trace_path, "r") as f:
+        trace_text = f.read()
+    assert_true("\"ts\":0.151" in trace_text, "wraparound ts must be 0.151, got: " + trace_text)
+    assert_true("\"dur\":0.000" in trace_text, "underflow dur must clamp to 0.000, got: " + trace_text)
+    _ = remove_file(trace_path)
+
+
+def _t5_r2_count1(
+    _lane: Int, _ord: Int, _e: Entity, _p0: Pointer[SparseValComp, MutAnyOrigin], ctx: Int
+):
+    var cnt = Pointer[Int, MutAnyOrigin](unsafe_from_address=ctx)
+    cnt[unsafe_offset=0] += 1
+
+
+def _t5_r2_count2_ss(
+    _lane: Int,
+    _ord: Int,
+    _e: Entity,
+    _p0: Pointer[SparseValComp, MutAnyOrigin],
+    _p1: Pointer[SparseTagB, MutAnyOrigin],
+    ctx: Int,
+):
+    var cnt = Pointer[Int, MutAnyOrigin](unsafe_from_address=ctx)
+    cnt[unsafe_offset=0] += 1
+
+
+def _t5_r2_count2_ds(
+    _lane: Int,
+    _ord: Int,
+    _e: Entity,
+    _p0: Pointer[TableTagC, MutAnyOrigin],
+    _p1: Pointer[SparseValComp, MutAnyOrigin],
+    ctx: Int,
+):
+    var cnt = Pointer[Int, MutAnyOrigin](unsafe_from_address=ctx)
+    cnt[unsafe_offset=0] += 1
+
+
+def _t5_r2_count3(
+    _lane: Int,
+    _ord: Int,
+    _e: Entity,
+    _p0: Pointer[SparseValComp, MutAnyOrigin],
+    _p1: Pointer[SparseTagB, MutAnyOrigin],
+    _p2: Pointer[TableTagC, MutAnyOrigin],
+    ctx: Int,
+):
+    var cnt = Pointer[Int, MutAnyOrigin](unsafe_from_address=ctx)
+    cnt[unsafe_offset=0] += 1
+
+
+def test_s_tier5_r2_sparse_changed_since() raises:
+    var w = World()
+    _ = w.register_component[SparseValComp]()
+    _ = w.register_component[SparseTagB]()
+    _ = w.register_component[TableTagC]()
+    var e1 = w.spawn_empty()
+    var e2 = w.spawn_empty()
+    _ = w.insert[TableTagC](e1, TableTagC(1))
+    _ = w.insert[SparseValComp](e1, SparseValComp(10))
+    _ = w.insert[SparseTagB](e1, SparseTagB(20))
+    _ = w.insert[TableTagC](e2, TableTagC(2))
+    _ = w.insert[SparseValComp](e2, SparseValComp(30))
+    _ = w.insert[SparseTagB](e2, SparseTagB(40))
+
+    _ = w.advance_tick()
+    var since = w.current_tick
+    _ = w.advance_tick()
+
+    var pool = JobPool()
+    _ = pool.start(1)
+    var hits = 0
+    var hits_addr = Int(Pointer(to=hits))
+
+    # 1. All sparse components unchanged since `since`: par_for_each1/2/3 must have 0 hits
+    w.par_for_each1[SparseValComp](pool, _t5_r2_count1, user_ctx=hits_addr, read_only=True, changed_since=since)
+    assert_equal(hits, 0)
+    assert_equal(len(w.query_changed_entities[SparseValComp](since)), 0)
+
+    w.par_for_each2[SparseValComp, SparseTagB](pool, _t5_r2_count2_ss, user_ctx=hits_addr, read_only=True, changed_since=since)
+    assert_equal(hits, 0)
+
+    w.par_for_each2[TableTagC, SparseValComp](pool, _t5_r2_count2_ds, user_ctx=hits_addr, read_only=True, changed_since=since)
+    assert_equal(hits, 0)
+
+    w.par_for_each3[SparseValComp, SparseTagB, TableTagC](pool, _t5_r2_count3, user_ctx=hits_addr, read_only=True, changed_since=since)
+    assert_equal(hits, 0)
+
+    # 2. Mutate ONLY e2's SparseValComp (e1 and e2 share SIMD group 0 for TableTagC!)
+    _ = w.insert[SparseValComp](e2, SparseValComp(31))
+
+    hits = 0
+    w.par_for_each1[SparseValComp](pool, _t5_r2_count1, user_ctx=hits_addr, read_only=True, changed_since=since)
+    assert_equal(hits, 1)
+
+    hits = 0
+    w.par_for_each2[SparseValComp, SparseTagB](pool, _t5_r2_count2_ss, user_ctx=hits_addr, read_only=True, changed_since=since)
+    assert_equal(hits, 1)
+
+    hits = 0
+    w.par_for_each3[SparseValComp, SparseTagB, TableTagC](pool, _t5_r2_count3, user_ctx=hits_addr, read_only=True, changed_since=since)
+    assert_equal(hits, 1)
+
+    # Mixed dense + sparse with read_only=False: must hit ONLY e2 and NOT pollute e1 in same group 0!
+    hits = 0
+    w.par_for_each2[TableTagC, SparseValComp](pool, _t5_r2_count2_ds, user_ctx=hits_addr, read_only=False, changed_since=since)
+    assert_equal(hits, 1)
+
+    # Verify read_only=False on par_for_each3 updates e2 without touching e1
+    _ = w.advance_tick()
+    var since2 = w.current_tick
+    _ = w.advance_tick()
+    _ = w.insert[SparseTagB](e1, SparseTagB(21))
+    hits = 0
+    w.par_for_each3[SparseValComp, SparseTagB, TableTagC](pool, _t5_r2_count3, user_ctx=hits_addr, read_only=False, changed_since=since2)
+    assert_equal(hits, 1)
+    assert_equal(len(w.query_changed_entities[SparseValComp](since2)), 1)
+    assert_true(w.query_changed_entities[SparseValComp](since2)[0] == e1)
+
+    pool.stop()
+
+
 def main() raises:
     var t0 = get_time()
     print("[Flint v5 Track 1] Running Core, Hybrid ECS v2, Scene/Prefab & Hot-Reload Suite...")
@@ -3673,5 +3921,11 @@ def main() raises:
     test_q_restore_blob_atomicity_and_hostile_fuzz_regressions()
     print("  [PASS] (q) Atomic restore_blob staging, duplicate col/sparse guards, mask mode & Children bounds check")
 
+    test_r_tier5_sparse_par_changed_and_profiler_wrap_open()
+    print("  [PASS] (r) Tier 5 par_for_each1/2/3 sparse changed_ticks, profiler wraparound & openat/open coexistence")
+
+    test_s_tier5_r2_sparse_changed_since()
+    print("  [PASS] (s) Tier 5 R2 par_for_each1/2/3 changed_since on STORAGE_SPARSE components")
+
     var elapsed = get_time() - t0
-    print("[Flint v5 Track 1] ALL 17 SUITES PASSED in " + String(elapsed) + " s")
+    print("[Flint v5 Track 1] ALL 19 SUITES PASSED in " + String(elapsed) + " s")

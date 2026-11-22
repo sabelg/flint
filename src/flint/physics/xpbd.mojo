@@ -535,7 +535,7 @@ struct ParticleChain(Copyable, Movable):
         """Restores bit-exact `ParticleChain` state from `BlobReader`."""
         _ = r.enter(XPBD_CHAIN_TAG, XPBD_BLOB_VERSION)
         var n_p = r.integer()
-        if n_p < 0 or n_p > 1 << 20:
+        if r.failed or n_p < 0 or n_p > 1 << 20 or n_p > max(0, r.limit() - r.offset) // 40:
             raise Error("xpbd chain blob: invalid particle count")
         self.position.clear()
         self.previous.clear()
@@ -547,13 +547,15 @@ struct ParticleChain(Copyable, Movable):
             self.velocity.append(r.vec3())
             self.inv_mass.append(r.f32())
         var n_r = r.integer()
-        if n_r < 0 or n_r > 1 << 20:
+        if r.failed or n_r < 0 or n_r > 1 << 20 or n_r > max(0, r.limit() - r.offset) // 4:
             raise Error("xpbd chain blob: invalid link count")
+        if n_r > 0 and n_p < n_r + 1:
+            raise Error("xpbd chain blob: link count exceeds particle count")
         self.rest.clear()
         for _ in range(n_r):
             self.rest.append(r.f32())
         var n_lam = r.integer()
-        if n_lam < 0 or n_lam > 1 << 20:
+        if r.failed or n_lam < 0 or n_lam > 1 << 20 or n_lam > max(0, r.limit() - r.offset) // 4:
             raise Error("xpbd chain blob: invalid lambda count")
         self.lambdas.clear()
         for _ in range(n_lam):
@@ -856,7 +858,7 @@ struct ParticleMesh(Copyable, Movable):
         """Restores bit-exact `ParticleMesh` state from `BlobReader`."""
         _ = r.enter(XPBD_MESH_TAG, XPBD_BLOB_VERSION)
         var n_p = r.integer()
-        if n_p < 0 or n_p > 1 << 20:
+        if r.failed or n_p < 0 or n_p > 1 << 20 or n_p > max(0, r.limit() - r.offset) // 76:
             raise Error("xpbd mesh blob: invalid particle count")
         self.position.clear()
         self.previous.clear()
@@ -878,7 +880,7 @@ struct ParticleMesh(Copyable, Movable):
             self.power.append(r.f32())
             self.accel.append(r.vec3())
         var n_l = r.integer()
-        if n_l < 0 or n_l > 1 << 21:
+        if r.failed or n_l < 0 or n_l > 1 << 21 or n_l > max(0, r.limit() - r.offset) // 32:
             raise Error("xpbd mesh blob: invalid link count")
         self.link_a.clear()
         self.link_b.clear()
@@ -886,13 +888,17 @@ struct ParticleMesh(Copyable, Movable):
         self.link_compliance.clear()
         self.link_kind.clear()
         for _ in range(n_l):
-            self.link_a.append(r.integer())
-            self.link_b.append(r.integer())
+            var la = r.integer()
+            var lb = r.integer()
+            if la < 0 or la >= n_p or lb < 0 or lb >= n_p:
+                raise Error("xpbd mesh blob: link particle index out of range")
+            self.link_a.append(la)
+            self.link_b.append(lb)
             self.rest.append(r.f32())
             self.link_compliance.append(r.f32())
             self.link_kind.append(r.integer())
         var n_lam = r.integer()
-        if n_lam < 0 or n_lam > 1 << 21:
+        if r.failed or n_lam < 0 or n_lam > 1 << 21 or n_lam > max(0, r.limit() - r.offset) // 4:
             raise Error("xpbd mesh blob: invalid lambda count")
         self.lambdas.clear()
         for _ in range(n_lam):

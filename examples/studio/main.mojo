@@ -417,6 +417,7 @@ def main() raises:
     var drag_snaps = List[SelectedTransformSnap]()
     var drag_seq = UInt64(100)
     var pending_pick_ctrls = List[Tuple[UInt64, Bool]]()
+    var resume_swapchain = False
     var t_last = get_time()
 
     while True:
@@ -442,6 +443,28 @@ def main() raises:
 
         var inp_opt = studio.app.resources.get_ptr[InputStateResource]()
         var frame_input = inp_opt.value()[unsafe_offset=0].input.copy() if inp_opt else InputState()
+
+        ref window = win_res.windows[0]
+        if studio.source_editor.present(window, frame_input, scene_hotkey=False):
+            # Track held keys across the focus boundary so returning with Ctrl+F8
+            # cannot trigger the scene's F8 binding again on the following frame.
+            studio.input_map.update(frame_input, dt)
+            var editor_renderer = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+            if editor_renderer:
+                ref renderer = editor_renderer.value()[unsafe_offset=0]
+                if studio.source_editor.visible and renderer.surface.is_zero_copy_gpu():
+                    # The text workspace presents a cached, pixel-aligned frame.
+                    _ = window.detach_vulkan(renderer.gpu_slot[0].vk)
+                    _ = renderer.surface.initialize_headless(out_w, out_h)
+                    resume_swapchain = True
+                elif not studio.source_editor.visible and resume_swapchain:
+                    _ = renderer.attach_window_surface(window)
+                    resume_swapchain = False
+                _ = assets.tick(now)
+                _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, renderer.gpu_slot[0])
+            dragging_gizmo = False
+            studio.active_gizmo_handle = GIZMO_AXIS_NONE
+            continue
 
         # Harvest completed non-stalling async GPU viewport picks from previous frames
         var r_pick = studio.app.resources.get_ptr_mut[ScalableRenderer]()
@@ -471,7 +494,11 @@ def main() raises:
                 elif not pick_ctrl:
                     studio.clear_selection()
 
-        if not studio.process_editor_input(frame_input, dt):
+        if studio.handle_command_menu(frame_input, out_w, out_h):
+            # Record held keys without sending menu gestures to the scene.
+            studio.input_map.update(frame_input, dt)
+            frame_input = InputState()
+        elif not studio.process_editor_input(frame_input, dt):
             break
 
         var vp_rect = studio.viewport_rect(out_w, out_h)

@@ -26,6 +26,7 @@ from flint.assets.flpk_v3 import (
 from flint.core.jobs import JobPool, default_worker_count
 from flint.platform.os import (
     file_stamp,
+    is_symlink,
     list_directory,
     make_dirs,
     parent_directory,
@@ -34,12 +35,25 @@ from flint.platform.os import (
 )
 
 
+comptime MAX_COOK_DEPTH: Int = 64
+
+
+def _strip_trailing_slashes(path: String) -> String:
+    var out = path
+    while out.byte_length() > 1 and out.as_bytes()[out.byte_length() - 1] == 47:
+        var trimmed = String(out[byte=0 : out.byte_length() - 1])
+        out = trimmed^
+    return out^
+
+
 def _is_dir(path: String) -> Bool:
-    var owned = path
-    var d = external_call["opendir", Int](owned.as_c_string_span())
+    var clean = _strip_trailing_slashes(path)
+    if is_symlink(clean):
+        return False
+    var d = external_call["opendir", Int](clean.as_c_string_span())
     if d == 0:
         return False
-    _ = external_call["closedir", Int32](d)
+    _ = external_call["closedir", Int32](Pointer[UInt8, MutAnyOrigin](unsafe_from_address=d))
     return True
 
 
@@ -56,13 +70,20 @@ def _is_cookable_ext(name: String) -> Bool:
     )
 
 
-def _has_cookable_sources(dir_path: String) -> Bool:
-    var entries = list_directory(dir_path)
+def _has_cookable_sources(dir_path: String, depth: Int = 0) -> Bool:
+    if depth >= MAX_COOK_DEPTH:
+        return False
+    var clean_dir = _strip_trailing_slashes(dir_path)
+    if is_symlink(clean_dir):
+        return False
+    var entries = list_directory(clean_dir)
     for i in range(len(entries)):
         var name = entries[i]
-        var full = (dir_path + "/" + name) if dir_path != "/" else ("/" + name)
+        var full = (clean_dir + "/" + name) if clean_dir != "/" else ("/" + name)
+        if is_symlink(full):
+            continue
         if _is_dir(full):
-            if _has_cookable_sources(full):
+            if _has_cookable_sources(full, depth + 1):
                 return True
         elif _is_cookable_ext(name):
             return True
@@ -83,11 +104,11 @@ def _default_kind_for_path(path: String) -> UInt8:
     return ASSET_KIND_RAW
 
 
-def _inspect_pack(pack_path: String):
+def _inspect_pack(pack_path: String) -> Int:
     var archive = FlpkV3MappedArchive.open(pack_path)
     if not archive.valid:
         print("[Flint Pack] ERROR: Invalid or unreadable .flpk v3 archive: " + pack_path)
-        return
+        return 1
     var cnt = archive.toc_count()
     print("[Flint Pack] Archive " + pack_path + " (.flpk v3, entries=" + String(cnt) + ")")
     for i in range(cnt):
@@ -101,23 +122,35 @@ def _inspect_pack(pack_path: String):
             + "/" + String(Int(entry.uncompressed_bytes))
         )
     archive.close()
+    return 0
 
 
-def _cook_dir(source_dir: String, output_pack: String, page_align: Bool):
-    if not _is_dir(source_dir):
+def _cook_dir(source_dir: String, output_pack: String, page_align: Bool) -> Int:
+    var clean_src = _strip_trailing_slashes(source_dir)
+    var clean_out = _strip_trailing_slashes(output_pack)
+    if is_symlink(clean_src):
+        print("[Flint Pack] ERROR: Symlink source directory rejected: " + source_dir)
+        return 1
+    if is_symlink(clean_out):
+        print("[Flint Pack] ERROR: Symlink output path rejected: " + output_pack)
+        return 1
+    if _is_dir(clean_out):
+        print("[Flint Pack] ERROR: Output path is a directory: " + output_pack)
+        return 1
+    if not _is_dir(clean_src):
         print("[Flint Pack] ERROR: Source directory missing or empty: " + source_dir)
-        return
-    var entries = list_directory(source_dir)
+        return 1
+    var entries = list_directory(clean_src)
     if len(entries) == 0:
         print("[Flint Pack] ERROR: Source directory missing or empty: " + source_dir)
-        return
-    if not _has_cookable_sources(source_dir):
+        return 1
+    if not _has_cookable_sources(clean_src):
         print("[Flint Pack] ERROR: Failed to cook workspace into " + output_pack)
-        return
-    var existed_before = (not _is_dir(output_pack)) and file_stamp(output_pack)[0] >= 0
+        return 1
+    var existed_before = (not _is_dir(clean_out)) and file_stamp(clean_out)[0] >= 0
     var pool = JobPool()
     _ = pool.start(max(1, default_worker_count()))
-    var rep = cook_workspace(source_dir, output_pack, pool, page_align=page_align)
+    var rep = cook_workspace(clean_src, output_pack, pool, page_align=page_align)
     pool.stop()
     var total_bytes = file_stamp(output_pack)[0]
     if rep.ok and rep.total_assets > 0 and total_bytes > 0:
@@ -132,17 +165,19 @@ def _cook_dir(source_dir: String, output_pack: String, page_align: Bool):
             + String(total_bytes)
             + " bytes)"
         )
+        return 0
     else:
         if not existed_before:
             _ = remove_file(output_pack)
         print("[Flint Pack] ERROR: Failed to cook workspace into " + output_pack)
+        return 1
 
 
-def main():
+def _run_pack() -> Int:
     var args = argv()
     if len(args) < 2:
         print("Usage: flint-pack <output.flpk> <asset1> [asset2 ...]")
-        return
+        return 1
 
     var flag_raw = False
     var flag_page_align = True
@@ -164,52 +199,58 @@ def main():
             print("Usage: flint-pack <output.flpk> <asset1> [asset2 ...]")
             print("       flint-pack --cook <source_dir> <output.flpk>")
             print("       flint-pack --inspect <pack.flpk>")
-            return
+            return 0
         elif a.startswith("-"):
             print("[Flint Pack] ERROR: Unknown option: " + a)
             print("Usage: flint-pack <output.flpk> <asset1> [asset2 ...]")
-            return
+            return 1
         else:
             positional.append(a)
 
     if flag_inspect:
         if len(positional) < 1:
             print("Usage: flint-pack --inspect <pack.flpk>")
-            return
-        _inspect_pack(positional[0])
-        return
+            return 1
+        return _inspect_pack(positional[0])
 
     if flag_cook:
         if len(positional) < 2:
             print("Usage: flint-pack --cook <source_dir> <output.flpk>")
-            return
-        _cook_dir(positional[0], positional[1], flag_page_align)
-        return
+            return 1
+        return _cook_dir(positional[0], positional[1], flag_page_align)
 
     if len(positional) < 2:
         print("Usage: flint-pack <output.flpk> <asset1> [asset2 ...]")
-        return
+        return 1
 
     var output_pack = positional[0]
-    if _is_dir(output_pack):
+    var clean_out = _strip_trailing_slashes(output_pack)
+    if is_symlink(clean_out):
+        print("[Flint Pack] ERROR: Symlink output path rejected: " + output_pack)
+        return 1
+    if _is_dir(clean_out):
         print("[Flint Pack] ERROR: Output path is a directory: " + output_pack)
-        return
+        return 1
     var all_chunks = List[FlpkBuildChunk]()
     var packed_assets = 0
 
     for i in range(1, len(positional)):
         var p = positional[i]
-        if _is_dir(p):
+        var clean_p = _strip_trailing_slashes(p)
+        if is_symlink(clean_p):
+            print("[Flint Pack] ERROR: Symlink input path rejected: " + p)
+            return 1
+        if _is_dir(clean_p):
             print("[Flint Pack] ERROR: Input path is a directory (use --cook): " + p)
-            return
+            return 1
         var st = file_stamp(p)
         if st[0] <= 0:
             print("[Flint Pack] ERROR: Missing or empty input asset: " + p)
-            return
+            return 1
         var src = read_bytes(p)
         if len(src) == 0:
             print("[Flint Pack] ERROR: Failed to read input asset: " + p)
-            return
+            return 1
         if flag_raw:
             all_chunks.append(
                 FlpkBuildChunk(
@@ -228,14 +269,14 @@ def main():
             var bundle = cook_single_source_bytes(src, meta, p)
             if not bundle.valid or len(bundle.chunks) == 0:
                 print("[Flint Pack] ERROR: Failed to cook asset '" + p + "': " + bundle.error)
-                return
+                return 1
             for c in range(len(bundle.chunks)):
                 all_chunks.append(bundle.chunks[c].copy())
             packed_assets += 1
 
     if packed_assets == 0 or len(all_chunks) == 0:
         print("[Flint Pack] ERROR: Failed to pack assets into " + output_pack)
-        return
+        return 1
 
     var pdir = parent_directory(output_pack)
     if pdir.byte_length() > 0 and pdir != ".":
@@ -243,18 +284,18 @@ def main():
 
     if not write_flpk_v3(output_pack, all_chunks, page_align=flag_page_align):
         print("[Flint Pack] ERROR: Failed to pack assets into " + output_pack)
-        return
+        return 1
 
     var total_bytes = file_stamp(output_pack)[0]
     if total_bytes <= 0:
         print("[Flint Pack] ERROR: Failed to pack assets into " + output_pack)
-        return
+        return 1
 
     var verify = FlpkV3MappedArchive.open(output_pack)
     if not verify.valid:
         verify.close()
         print("[Flint Pack] ERROR: Failed to verify packed archive: " + output_pack)
-        return
+        return 1
     verify.close()
 
     print(
@@ -268,3 +309,10 @@ def main():
         + String(total_bytes)
         + " bytes)"
     )
+    return 0
+
+
+def main():
+    var rc = _run_pack()
+    if rc != 0:
+        external_call["exit", NoneType](Int32(rc))

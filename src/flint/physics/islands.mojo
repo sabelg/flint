@@ -428,21 +428,23 @@ struct IslandSet(Copyable, Movable):
     def deserialize(mut self, mut input: BlobReader) raises:
         self.clear()
         var rows = input.integer()
-        if rows < 0 or rows > 1 << 16:
+        if input.failed or rows < 0 or rows > 1 << 16 or rows > max(0, input.limit() - input.offset) // 8:
             raise Error("island blob lists " + String(rows) + " rows")
         for _ in range(rows):
             self.label.append(input.integer())
         var links = input.integer()
-        if links < 0 or links > 1 << 20:
+        if input.failed or links < 0 or links > 1 << 20 or links > max(0, input.limit() - input.offset) // 16:
             raise Error("island blob lists " + String(links) + " links")
         for _ in range(links):
             self.link_a.append(input.integer())
             self.link_b.append(input.integer())
         var pending = input.integer()
-        if pending < 0 or pending > 1 << 16:
+        if input.failed or pending < 0 or pending > 1 << 16 or pending > max(0, input.limit() - input.offset) // 8:
             raise Error("island blob lists " + String(pending) + " pending islands")
         for _ in range(pending):
             self.pending.append(input.integer())
+        if input.failed:
+            raise Error("corrupted island blob")
 
 
 struct ConstraintGraph(Copyable, Movable):
@@ -566,8 +568,10 @@ struct ConstraintGraph(Copyable, Movable):
     def deserialize(mut self, mut input: BlobReader) raises:
         self.clear()
         var count = input.integer()
-        if count < 0 or count > 1 << 20:
+        if input.failed or count < 0 or count > 1 << 20 or count > max(0, input.limit() - input.offset) // 16:
             raise Error("colour blob lists " + String(count) + " pairs")
         for _ in range(count):
             self.keys.append(input.integer())
             self.colours.append(input.integer())
+        if input.failed:
+            raise Error("corrupted colour blob")

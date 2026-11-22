@@ -400,6 +400,13 @@ def decode_qoa(data: List[UInt8]) -> QoaClip:
     if first_ch < 1 or first_ch > QOA_MAX_CHANNELS or first_sr <= 0:
         return clip^
 
+    # Validate minimum encoded byte count before allocating sample buffer
+    var min_frames = (total_frames + 65534) // 65535
+    var min_slices = (total_frames + QOA_SLICE_LEN - 1) // QOA_SLICE_LEN
+    var min_bytes = 8 + min_frames * (8 + 16 * first_ch) + min_slices * (8 * first_ch)
+    if len(data) < min_bytes:
+        return clip^
+
     clip.channels = first_ch
     clip.sample_rate = first_sr
     clip.samples_per_channel = total_frames
@@ -471,6 +478,7 @@ struct QoaStreamCursor(Copyable, Movable):
     var total_frames: Int
     var current_sample_frame: Int
     var frame_byte_offset: Int
+    var frame_end_offset: Int
     var slice_byte_offset: Int
     var frame_samples_remaining: Int
     var slice_cache: Array[Int16, QOA_SLICE_LEN * QOA_MAX_CHANNELS]
@@ -485,6 +493,7 @@ struct QoaStreamCursor(Copyable, Movable):
         self.total_frames = 0
         self.current_sample_frame = 0
         self.frame_byte_offset = 8
+        self.frame_end_offset = 8
         self.slice_byte_offset = 8
         self.frame_samples_remaining = 0
         self.slice_cache = Array[Int16, QOA_SLICE_LEN * QOA_MAX_CHANNELS](fill=0)
@@ -513,7 +522,10 @@ struct QoaStreamCursor(Copyable, Movable):
         var ch = Int(data[byte_off])
         var fsamples = _get_be16_u(data, byte_off + 4)
         var fsize = _get_be16_u(data, byte_off + 6)
-        if ch != self.channels or fsamples <= 0 or byte_off + fsize > len(data):
+        if ch != self.channels or fsamples <= 0 or fsize < 8 + ch * 16 or byte_off + fsize > len(data):
+            return False
+        var need_slices = (fsamples + QOA_SLICE_LEN - 1) // QOA_SLICE_LEN
+        if fsize < 8 + ch * 16 + need_slices * ch * 8:
             return False
         var hp = byte_off + 8
         for c in range(ch):
@@ -527,6 +539,7 @@ struct QoaStreamCursor(Copyable, Movable):
             self.lms[c].w3 = _get_be16_s(data, hp + 14)
             hp += 16
         self.frame_byte_offset = byte_off
+        self.frame_end_offset = byte_off + fsize
         self.slice_byte_offset = hp
         self.frame_samples_remaining = fsamples
         self.slice_cache_pos = 0
@@ -544,7 +557,7 @@ struct QoaStreamCursor(Copyable, Movable):
                 return False
 
         var ch = self.channels
-        if self.slice_byte_offset + ch * 8 > len(data):
+        if self.slice_byte_offset + ch * 8 > self.frame_end_offset or self.slice_byte_offset + ch * 8 > len(data):
             return False
 
         var slice_len = min(QOA_SLICE_LEN, self.frame_samples_remaining)
@@ -622,15 +635,19 @@ struct QoaStreamCursor(Copyable, Movable):
 
     def decode_frames_into(mut self, data: List[UInt8], mut dst: List[Int16], dst_frame_offset: Int, frame_count: Int) -> Int:
         """Zero-allocation block decode into caller-owned `dst` buffer."""
-        if not self.valid or frame_count <= 0:
+        if not self.valid or frame_count <= 0 or dst_frame_offset < 0 or self.channels <= 0:
             return 0
-        var written = 0
         var ch = self.channels
-        while written < frame_count and self.current_sample_frame < self.total_frames:
+        var max_frames_in_dst = (len(dst) // ch) - dst_frame_offset
+        if max_frames_in_dst <= 0:
+            return 0
+        var target_frames = min(frame_count, max_frames_in_dst)
+        var written = 0
+        while written < target_frames and self.current_sample_frame < self.total_frames:
             if self.slice_cache_pos >= self.slice_cache_len:
                 if not self._decode_one_slice(data):
                     break
-            var avail = min(frame_count - written, self.slice_cache_len - self.slice_cache_pos)
+            var avail = min(target_frames - written, self.slice_cache_len - self.slice_cache_pos)
             for k in range(avail):
                 var src_base = (self.slice_cache_pos + k) * ch
                 var dst_base = (dst_frame_offset + written + k) * ch

@@ -139,6 +139,8 @@ struct MeshRendererComponent(SerializableComponent, ImplicitlyCopyable):
         var mat = reader.integer()
         var cs = reader.boolean()
         var vis = reader.boolean()
+        if reader.failed:
+            raise Error("MeshRendererComponent: truncated blob")
         return Self(mid, mat, cs, vis)
 
     def write_json(self) -> String:
@@ -207,6 +209,8 @@ struct CameraComponent(SerializableComponent, ImplicitlyCopyable):
         var exp = reader.f32()
         var act = reader.boolean()
         var off = reader.vec3()
+        if reader.failed:
+            raise Error("CameraComponent: truncated blob")
         return Self(fov, nz, fz, exp, act, off)
 
     def write_json(self) -> String:
@@ -264,6 +268,8 @@ struct PointLightComponent(SerializableComponent, ImplicitlyCopyable):
         var rad = reader.vec3()
         var r = reader.f32()
         var en = reader.boolean()
+        if reader.failed:
+            raise Error("PointLightComponent: truncated blob")
         return Self(rad, r, en)
 
     def write_json(self) -> String:
@@ -330,6 +336,8 @@ struct MaterialOverrideComponent(SerializableComponent, ImplicitlyCopyable):
         var mt = reader.f32()
         var em = reader.vec3()
         var en = reader.boolean()
+        if reader.failed:
+            raise Error("MaterialOverrideComponent: truncated blob")
         return Self(mid, bc, rg, mt, em, en)
 
     def write_json(self) -> String:
@@ -397,6 +405,8 @@ struct VatCrowdComponent(SerializableComponent, ImplicitlyCopyable):
         var pph = reader.f32()
         var mat = reader.integer()
         var vis = reader.boolean()
+        if reader.failed:
+            raise Error("VatCrowdComponent: truncated blob")
         return Self(cid, ph, pph, mat, vis)
 
     def write_json(self) -> String:

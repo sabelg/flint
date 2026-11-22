@@ -351,6 +351,7 @@ struct CrowdSimulator(Copyable, Movable):
     var _wall_head: List[Int]
     var _wall_next: List[Int]
     var _wall_seg_idx: List[Int]
+    var _large_walls: List[Int]
     var _wall_grid_dirty: Bool
 
     def __init__(
@@ -386,6 +387,7 @@ struct CrowdSimulator(Copyable, Movable):
         self._wall_head = List[Int]()
         self._wall_next = List[Int]()
         self._wall_seg_idx = List[Int]()
+        self._large_walls = List[Int]()
         self._wall_grid_dirty = True
 
     def _pad_columns(mut self):
@@ -460,6 +462,7 @@ struct CrowdSimulator(Copyable, Movable):
         self._wall_head.clear()
         self._wall_next.clear()
         self._wall_seg_idx.clear()
+        self._large_walls.clear()
         self._wall_grid_dirty = True
 
     def _ensure_wall_grid(mut self):
@@ -469,21 +472,31 @@ struct CrowdSimulator(Copyable, Movable):
         var n_walls = len(self.walls)
         self._wall_next.clear()
         self._wall_seg_idx.clear()
+        self._large_walls.clear()
         if n_walls == 0:
             self._wall_head.clear()
             return
         self._wall_head = List[Int](length=_ORCA_WALL_BUCKETS, fill=-1)
         var inv_wcs = Float32(1.0) / _ORCA_WALL_CELL_SIZE
+        var max_span_f = _ORCA_WALL_CELL_SIZE * Float32(64.0)
         for wi in range(n_walls):
             var w = self.walls[wi]
-            var cx0 = Int(floor(min(w.ax, w.bx) * inv_wcs))
-            var cx1 = Int(floor(max(w.ax, w.bx) * inv_wcs))
-            var cz0 = Int(floor(min(w.az, w.bz) * inv_wcs))
-            var cz1 = Int(floor(max(w.az, w.bz) * inv_wcs))
-            # Cap extreme span to avoid degenerate cell explosion
-            if (cx1 - cx0 + 1) * (cz1 - cz0 + 1) > 4096:
-                cx1 = min(cx1, cx0 + 63)
-                cz1 = min(cz1, cz0 + 63)
+            var lo_x = min(w.ax, w.bx)
+            var hi_x = max(w.ax, w.bx)
+            var lo_z = min(w.az, w.bz)
+            var hi_z = max(w.az, w.bz)
+            if (hi_x - lo_x) > max_span_f or (hi_z - lo_z) > max_span_f:
+                self._large_walls.append(wi)
+                continue
+            var cx0 = Int(floor(lo_x * inv_wcs))
+            var cx1 = Int(floor(hi_x * inv_wcs))
+            var cz0 = Int(floor(lo_z * inv_wcs))
+            var cz1 = Int(floor(hi_z * inv_wcs))
+            var span_x = cx1 - cx0 + 1
+            var span_z = cz1 - cz0 + 1
+            if span_x <= 0 or span_z <= 0 or span_x > 64 or span_z > 64 or span_x > 4096 // span_z:
+                self._large_walls.append(wi)
+                continue
             for cz in range(cz0, cz1 + 1):
                 for cx in range(cx0, cx1 + 1):
                     var bkt = Self._cell_bucket(cx, cz)
@@ -503,13 +516,29 @@ struct CrowdSimulator(Copyable, Movable):
         cur_stamp: Int,
     ):
         out_walls.clear()
-        if len(self._wall_head) == 0:
+        var n_walls = len(self.walls)
+        if n_walls == 0:
+            return
+        var max_span_f = _ORCA_WALL_CELL_SIZE * Float32(64.0)
+        if len(self._wall_head) == 0 or (hi_x - lo_x) > max_span_f or (hi_z - lo_z) > max_span_f:
+            for wi in range(n_walls):
+                if stamp[wi] != cur_stamp:
+                    stamp[wi] = cur_stamp
+                    out_walls.append(wi)
             return
         var inv_wcs = Float32(1.0) / _ORCA_WALL_CELL_SIZE
         var cx0 = Int(floor(lo_x * inv_wcs))
         var cx1 = Int(floor(hi_x * inv_wcs))
         var cz0 = Int(floor(lo_z * inv_wcs))
         var cz1 = Int(floor(hi_z * inv_wcs))
+        var span_x = cx1 - cx0 + 1
+        var span_z = cz1 - cz0 + 1
+        if span_x <= 0 or span_z <= 0 or span_x > 64 or span_z > 64 or span_x > 4096 // span_z:
+            for wi in range(n_walls):
+                if stamp[wi] != cur_stamp:
+                    stamp[wi] = cur_stamp
+                    out_walls.append(wi)
+            return
         for cz in range(cz0, cz1 + 1):
             for cx in range(cx0, cx1 + 1):
                 var bkt = Self._cell_bucket(cx, cz)
@@ -520,6 +549,11 @@ struct CrowdSimulator(Copyable, Movable):
                         stamp[wi] = cur_stamp
                         out_walls.append(wi)
                     node = self._wall_next[node]
+        for li in range(len(self._large_walls)):
+            var wi = self._large_walls[li]
+            if stamp[wi] != cur_stamp:
+                stamp[wi] = cur_stamp
+                out_walls.append(wi)
 
     def agent_position(self, idx: Int) -> Vec3:
         return Vec3(self.px[idx], self.py[idx], self.pz[idx])

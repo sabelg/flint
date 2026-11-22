@@ -13,6 +13,11 @@ arena and `Pattern.query` walks the tree.
 """
 from std.math import sin, floor
 
+comptime MAX_PATTERN_COUNT: Int = 4096
+comptime MAX_QUERY_EVENTS: Int = 16384
+comptime MAX_QUERY_STEPS: Int = 65536
+comptime _INT64_MAX_128: Int128 = Int128(0x7FFFFFFFFFFFFFFF)
+
 # ---------------------------------------------------------------- rational time
 
 
@@ -35,6 +40,10 @@ struct Frac(Copyable, ImplicitlyCopyable, Movable):
 
     @staticmethod
     def make(num: Int, den: Int) -> Frac:
+        if den == 0:
+            return Frac(0, 1)
+        if num == Int.MIN or den == Int.MIN:
+            return Frac.make128(Int128(num), Int128(den))
         var n = num
         var d = den
         if d < 0:
@@ -46,6 +55,10 @@ struct Frac(Copyable, ImplicitlyCopyable, Movable):
     @staticmethod
     def make128(num: Int128, den: Int128) -> Frac:
         """Reduce a 128-bit intermediate back to an `Int` fraction."""
+        if den == 0:
+            return Frac(0, 1)
+        if num == 0:
+            return Frac(0, 1)
         var n = num
         var d = den
         if d < 0:
@@ -59,7 +72,49 @@ struct Frac(Copyable, ImplicitlyCopyable, Movable):
             y = t
         if x == 0:
             x = 1
-        return Frac(Int(n // x), Int(d // x))
+        var rn = n // x
+        var rd = d // x
+        var neg = rn < 0
+        var abs_rn = -rn if neg else rn
+        if abs_rn <= _INT64_MAX_128 and rd <= _INT64_MAX_128:
+            return Frac(Int(rn), Int(rd))
+        # Continued-fraction convergent / semiconvergent within [-2^63+1, 2^63-1].
+        var a = abs_rn
+        var b = rd
+        var p0 = Int128(0)
+        var q0 = Int128(1)
+        var p1 = Int128(1)
+        var q1 = Int128(0)
+        while b != 0:
+            var q = a // b
+            var r = a % b
+            if (p1 > 0 and q > (_INT64_MAX_128 - p0) // p1) or (q1 > 0 and q > (_INT64_MAX_128 - q0) // q1):
+                var k_max = q
+                if p1 > 0:
+                    var kp = (_INT64_MAX_128 - p0) // p1
+                    if kp < k_max:
+                        k_max = kp
+                if q1 > 0:
+                    var kq = (_INT64_MAX_128 - q0) // q1
+                    if kq < k_max:
+                        k_max = kq
+                if k_max > 0:
+                    p1 = k_max * p1 + p0
+                    q1 = k_max * q1 + q0
+                break
+            var next_p = q * p1 + p0
+            var next_q = q * q1 + q0
+            p0 = p1
+            q0 = q1
+            p1 = next_p
+            q1 = next_q
+            a = b
+            b = r
+        if q1 == 0:
+            q1 = Int128(1)
+            p1 = _INT64_MAX_128
+        var out_n = -Int(p1) if neg else Int(p1)
+        return Frac(out_n, Int(q1))
 
     @staticmethod
     def of(n: Int) -> Frac:
@@ -68,11 +123,14 @@ struct Frac(Copyable, ImplicitlyCopyable, Movable):
     @staticmethod
     def from_float(x: Float64) -> Frac:
         """Nearest fraction with a small denominator (exact for 1/2, 1/3, 0.125, ...)."""
-        var best_n = Int(floor(x * 1048576.0 + 0.5))
+        if x != x:
+            return Frac(0, 1)
+        var cx = max(-1.0e9, min(1.0e9, x))
+        var best_n = Int(floor(cx * 1048576.0 + 0.5))
         var best = Frac.make(best_n, 1048576)
         for d in range(1, 65):
-            var n = Int(floor(x * Float64(d) + 0.5))
-            var err = Float64(n) / Float64(d) - x
+            var n = Int(floor(cx * Float64(d) + 0.5))
+            var err = Float64(n) / Float64(d) - cx
             if err < 0:
                 err = -err
             if err < 1.0e-9:
@@ -81,26 +139,27 @@ struct Frac(Copyable, ImplicitlyCopyable, Movable):
 
     def __add__(self, o: Frac) -> Frac:
         if self.den == o.den:
-            return Frac.make(self.num + o.num, self.den)
+            return Frac.make128(Int128(self.num) + Int128(o.num), Int128(self.den))
         return Frac.make128(
             Int128(self.num) * Int128(o.den) + Int128(o.num) * Int128(self.den), Int128(self.den) * Int128(o.den))
 
     def __sub__(self, o: Frac) -> Frac:
         if self.den == o.den:
-            return Frac.make(self.num - o.num, self.den)
+            return Frac.make128(Int128(self.num) - Int128(o.num), Int128(self.den))
         return Frac.make128(
             Int128(self.num) * Int128(o.den) - Int128(o.num) * Int128(self.den), Int128(self.den) * Int128(o.den))
 
     def __mul__(self, o: Frac) -> Frac:
-        var g1 = _gcd(self.num, o.den)
-        var g2 = _gcd(o.num, self.den)
-        return Frac.make128(
-            Int128(self.num // g1) * Int128(o.num // g2), Int128(self.den // g2) * Int128(o.den // g1))
+        return Frac.make128(Int128(self.num) * Int128(o.num), Int128(self.den) * Int128(o.den))
 
     def __truediv__(self, o: Frac) -> Frac:
-        return self * Frac.make(o.den, o.num)
+        if o.num == 0:
+            return Frac(0, 1)
+        return Frac.make128(Int128(self.num) * Int128(o.den), Int128(self.den) * Int128(o.num))
 
     def __neg__(self) -> Frac:
+        if self.num == Int.MIN:
+            return Frac.make128(-Int128(self.num), Int128(self.den))
         return Frac(-self.num, self.den)
 
     def __eq__(self, o: Frac) -> Bool:
@@ -364,13 +423,21 @@ def parse_number(text: String) -> Tuple[Float64, Bool]:
         var e = 0
         var ed = 0
         while i < n and b[i] >= UInt8(ord("0")) and b[i] <= UInt8(ord("9")):
-            e = e * 10 + Int(b[i]) - 48
+            if e <= 10000:
+                e = e * 10 + Int(b[i]) - 48
             i += 1
             ed += 1
         if ed == 0:
             return (0.0, False)
-        for _ in range(e):
-            value = value * 10.0 if es > 0 else value / 10.0
+        if value == 0.0:
+            value = 0.0
+        elif es > 0 and e > 308:
+            value = Float64(1e308) * Float64(1e308)
+        elif es < 0 and e > 324:
+            value = 0.0
+        else:
+            for _ in range(e):
+                value = value * 10.0 if es > 0 else value / 10.0
     if i != n:
         return (0.0, False)
     return (sign * value, True)
@@ -721,10 +788,13 @@ def chord_notes(word: String) -> Tuple[List[Float64], Bool]:
         var mod = String(parts[m])
         var count = parse_number(mod)
         if count[1]:
-            var want = Int(count[0])
+            var want_f = count[0]
+            if want_f != want_f or want_f < 0.0 or want_f > Float64(MAX_PATTERN_COUNT):
+                return (List[Float64](), False)
+            var want = min(MAX_PATTERN_COUNT, max(0, Int(want_f)))
             var base = len(table)
-            var ext = List[Int]()
-            for i in range(max(0, want)):
+            var ext = List[Int](capacity=want)
+            for i in range(want):
                 ext.append(table[i % base] + 12 * (i // base))
             notes = ext^
             continue
@@ -989,11 +1059,19 @@ struct Pattern(Copyable, Movable):
         return self.with_kids(K_RANDCAT, ids, List[Frac]())
 
     def fast(mut self, factor: Frac, child: Int) -> Int:
-        var n = node(K_FAST)
-        n.a = child
-        n.f = factor
         if factor.num <= 0:
             return self.silence()
+        var eff_factor = factor
+        var eff_child = child
+        if child >= 0 and child < len(self.nodes) and self.nodes[child].kind == K_FAST:
+            eff_factor = factor * self.nodes[child].f
+            eff_child = self.nodes[child].a
+        var n = node(K_FAST)
+        n.a = eff_child
+        if Int128(eff_factor.num) > Int128(MAX_PATTERN_COUNT) * Int128(eff_factor.den):
+            n.f = Frac.of(MAX_PATTERN_COUNT)
+        else:
+            n.f = eff_factor
         return self.add(n)
 
     def slow(mut self, factor: Frac, child: Int) -> Int:
@@ -1047,7 +1125,7 @@ struct Pattern(Copyable, Movable):
     def chop(mut self, count: Int, child: Int) -> Int:
         var n = node(K_CHOP)
         n.a = child
-        n.c = max(1, count)
+        n.c = min(MAX_PATTERN_COUNT, max(1, count))
         return self.add(n)
 
     def arp(mut self, mode: Int, child: Int) -> Int:
@@ -1077,13 +1155,16 @@ struct Pattern(Copyable, Movable):
             return child
         var n = node(K_LINGER)
         n.a = child
-        n.f = amount
+        if Int128(amount.den) > Int128(MAX_PATTERN_COUNT) * Int128(amount.num):
+            n.f = Frac.make(1, MAX_PATTERN_COUNT)
+        else:
+            n.f = amount
         return self.add(n)
 
     def slice_values(mut self, count: Int, child: Int) -> Int:
         var n = node(K_SLICEVAL)
         n.a = child
-        n.c = max(1, count)
+        n.c = min(MAX_PATTERN_COUNT, max(1, count))
         return self.add(n)
 
     def signal(mut self, shape: Int, seed: Int = 0) -> Int:
@@ -1113,20 +1194,20 @@ struct Pattern(Copyable, Movable):
     def ply(mut self, count: Int, child: Int) -> Int:
         var n = node(K_PLY)
         n.a = child
-        n.c = max(1, count)
+        n.c = min(MAX_PATTERN_COUNT, max(1, count))
         return self.add(n)
 
     def iter(mut self, count: Int, child: Int, backwards: Bool = False) -> Int:
         var n = node(K_ITER)
         n.a = child
-        n.c = max(1, count)
+        n.c = min(MAX_PATTERN_COUNT, max(1, count))
         n.d = 1 if backwards else 0
         return self.add(n)
 
     def segment(mut self, count: Int, child: Int) -> Int:
         var n = node(K_SEGMENT)
         n.a = child
-        n.c = max(1, count)
+        n.c = min(MAX_PATTERN_COUNT, max(1, count))
         return self.add(n)
 
     # ---- query
@@ -1151,15 +1232,32 @@ struct Pattern(Copyable, Movable):
         return out^
 
     def query_into(self, id: Int, begin: Frac, end: Frac, mut out: List[Event]):
-        if id < 0 or not (begin < end):
+        var budget = MAX_QUERY_EVENTS
+        var steps = MAX_QUERY_STEPS
+        self._query_into_bounded(id, begin, end, out, budget, steps, 0)
+
+    def _query_into_bounded(
+        self,
+        id: Int,
+        begin: Frac,
+        end: Frac,
+        mut out: List[Event],
+        mut budget: Int,
+        mut steps: Int,
+        depth: Int,
+    ):
+        if id < 0 or id >= len(self.nodes) or not (begin < end) or budget <= 0 or steps <= 0 or depth > 64:
             return
+        steps -= 1
         var n = self.nodes[id]
         var k = n.kind
         if k == K_SILENCE:
             return
         if k == K_ATOM:
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
+                budget -= 1
                 var wb = Frac.of(c)
                 var we = Frac.of(c + 1)
                 out.append(Event(wb, we, fmax(begin, wb), fmin(end, we), self.atoms[n.a].copy()))
@@ -1167,18 +1265,31 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_STACK:
             for i in range(n.kid_count):
-                self.query_into(self.kids[n.kid_start + i], begin, end, out)
+                if budget <= 0 or steps <= 0:
+                    break
+                self._query_into_bounded(self.kids[n.kid_start + i], begin, end, out, budget, steps, depth + 1)
             return
         if k == K_SEQ:
+            if n.kid_count <= 0:
+                return
             var total = Frac(0, 1)
             for i in range(n.kid_count):
-                total = total + self.weights[n.kid_start + i]
+                var wi = self.weights[n.kid_start + i]
+                if wi.num > 0:
+                    total = total + wi
+            if total.num <= 0:
+                return
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var cyc = Frac.of(c)
                 var acc = Frac(0, 1)
                 for i in range(n.kid_count):
+                    if budget <= 0 or steps <= 0:
+                        break
                     var w = self.weights[n.kid_start + i]
+                    if w.num <= 0:
+                        continue
                     var sb = cyc + acc / total
                     var se = cyc + (acc + w) / total
                     acc = acc + w
@@ -1189,7 +1300,9 @@ struct Pattern(Copyable, Movable):
                     # compressArc: the slot plays cycle `c` of the child.
                     var span = se - sb
                     var inner = List[Event]()
-                    self.query_into(self.kids[n.kid_start + i], cyc + (qb - sb) / span, cyc + (qe - sb) / span, inner)
+                    self._query_into_bounded(
+                        self.kids[n.kid_start + i], cyc + (qb - sb) / span, cyc + (qe - sb) / span, inner, budget, steps, depth + 1
+                    )
                     for j in range(len(inner)):
                         ref ev = inner[j]
                         out.append(Event(
@@ -1200,60 +1313,76 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_ALT:
             var count = n.kid_count
+            if count <= 0:
+                return
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var qb = fmax(begin, Frac.of(c))
                 var qe = fmin(end, Frac.of(c + 1))
-                var idx = c % count
+                var idx = ((c % count) + count) % count
                 # The child sees its own successive cycles: cycle c//count.
                 var offset = Frac.of(c - (c // count))
                 var inner = List[Event]()
-                self.query_into(self.kids[n.kid_start + idx], qb - offset, qe - offset, inner)
+                self._query_into_bounded(self.kids[n.kid_start + idx], qb - offset, qe - offset, inner, budget, steps, depth + 1)
                 for j in range(len(inner)):
                     ref ev = inner[j]
                     out.append(Event(ev.whole_b + offset, ev.whole_e + offset, ev.part_b + offset, ev.part_e + offset, ev.value.copy()))
                 c += 1
             return
         if k == K_ALT_ABS:
+            var count = n.kid_count
+            if count <= 0:
+                return
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var qb = fmax(begin, Frac.of(c))
                 var qe = fmin(end, Frac.of(c + 1))
-                self.query_into(self.kids[n.kid_start + (c % n.kid_count)], qb, qe, out)
+                var idx = ((c % count) + count) % count
+                self._query_into_bounded(self.kids[n.kid_start + idx], qb, qe, out, budget, steps, depth + 1)
                 c += 1
             return
         if k == K_RANDCAT:
+            var count = n.kid_count
+            if count <= 0:
+                return
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var qb = fmax(begin, Frac.of(c))
                 var qe = fmin(end, Frac.of(c + 1))
-                var idx = Int(time_hash(Frac.of(c), 77) * Float64(n.kid_count)) % n.kid_count
-                self.query_into(self.kids[n.kid_start + idx], qb, qe, out)
+                var raw_idx = Int(time_hash(Frac.of(c), 77) * Float64(count))
+                var idx = ((raw_idx % count) + count) % count
+                self._query_into_bounded(self.kids[n.kid_start + idx], qb, qe, out, budget, steps, depth + 1)
                 c += 1
             return
         if k == K_FAST:
+            if n.f.num <= 0 or n.f.den <= 0:
+                return
             var inner = List[Event]()
-            self.query_into(n.a, begin * n.f, end * n.f, inner)
+            self._query_into_bounded(n.a, begin * n.f, end * n.f, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
                 ref ev = inner[j]
                 out.append(Event(ev.whole_b / n.f, ev.whole_e / n.f, ev.part_b / n.f, ev.part_e / n.f, ev.value.copy()))
             return
         if k == K_SHIFT:
             var inner = List[Event]()
-            self.query_into(n.a, begin + n.f, end + n.f, inner)
+            self._query_into_bounded(n.a, begin + n.f, end + n.f, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
                 ref ev = inner[j]
                 out.append(Event(ev.whole_b - n.f, ev.whole_e - n.f, ev.part_b - n.f, ev.part_e - n.f, ev.value.copy()))
             return
         if k == K_REV:
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var cyc = Frac.of(c)
                 var nxt = Frac.of(c + 1)
                 var qb = fmax(begin, cyc)
                 var qe = fmin(end, nxt)
                 var inner = List[Event]()
-                self.query_into(n.a, cyc + (nxt - qe), cyc + (nxt - qb), inner)
+                self._query_into_bounded(n.a, cyc + (nxt - qe), cyc + (nxt - qb), inner, budget, steps, depth + 1)
                 for j in range(len(inner)):
                     ref ev = inner[j]
                     out.append(Event(
@@ -1263,7 +1392,8 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_CHOOSE:
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var qb = fmax(begin, Frac.of(c))
                 var qe = fmin(end, Frac.of(c + 1))
                 var pick: Bool
@@ -1273,12 +1403,12 @@ struct Pattern(Copyable, Movable):
                     pick = n.d > 0 and c % n.d >= n.e
                 else:
                     pick = time_hash(Frac.of(c), 4242) < n.x
-                self.query_into(n.b if pick else n.a, qb, qe, out)
+                self._query_into_bounded(n.b if pick else n.a, qb, qe, out, budget, steps, depth + 1)
                 c += 1
             return
         if k == K_DEGRADE:
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
                 var r = time_hash(inner[j].whole_b, n.c)
                 var keep = r >= n.x
@@ -1289,7 +1419,7 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_CONTROL:
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
                 ref ev = inner[j]
                 var p = Params()
@@ -1321,10 +1451,15 @@ struct Pattern(Copyable, Movable):
                 # Tidal's appBoth: every pair of overlapping events, wholes intersected.
                 var left = List[Event]()
                 var right = List[Event]()
-                self.query_into(n.a, begin, end, left)
-                self.query_into(n.b, begin, end, right)
+                self._query_into_bounded(n.a, begin, end, left, budget, steps, depth + 1)
+                self._query_into_bounded(n.b, begin, end, right, budget, steps, depth + 1)
                 for j in range(len(left)):
+                    if budget <= 0 or steps <= 0:
+                        break
                     for q in range(len(right)):
+                        if budget <= 0 or steps <= 0:
+                            break
+                        steps -= 1
                         var wb = fmax(left[j].whole_b, right[q].whole_b)
                         var we = fmin(left[j].whole_e, right[q].whole_e)
                         if not (wb < we):
@@ -1333,24 +1468,30 @@ struct Pattern(Copyable, Movable):
                         var pe = fmin(left[j].part_e, right[q].part_e)
                         if not (pb < pe):
                             continue
+                        budget -= 1
                         out.append(Event(wb, we, pb, pe, merge_params(n.c, left[j].value, right[q].value)))
                 return
             var structure = n.a if n.d == ST_LEFT else n.b
             var other = n.b if n.d == ST_LEFT else n.a
             var shaped = List[Event]()
-            self.query_into(structure, begin, end, shaped)
+            self._query_into_bounded(structure, begin, end, shaped, budget, steps, depth + 1)
             for j in range(len(shaped)):
+                if budget <= 0 or steps <= 0:
+                    break
                 ref ev = shaped[j]
                 # Values come from whatever the other side holds at the onset;
                 # where it holds nothing the event is dropped (as in Tidal).
                 var t = ev.whole_b
                 var probe = List[Event]()
-                self.query_into(other, t, t + Frac(1, 1 << 16), probe)
+                self._query_into_bounded(other, t, t + Frac(1, 1 << 16), probe, budget, steps, depth + 1)
                 # Every event the other side holds there counts: `struct "t" $ n "c'maj"`
                 # is three notes, as in Tidal.
                 for q in range(len(probe)):
+                    if budget <= 0:
+                        break
                     if not (probe[q].part_b <= t and t < probe[q].part_e):
                         continue
+                    budget -= 1
                     if n.d == ST_LEFT:
                         out.append(Event(ev.whole_b, ev.whole_e, ev.part_b, ev.part_e, merge_params(n.c, ev.value, probe[q].value)))
                     else:
@@ -1358,13 +1499,18 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_CHOP:
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
+                if budget <= 0 or steps <= 0:
+                    break
                 ref ev = inner[j]
                 var step = (ev.whole_e - ev.whole_b) / Frac.of(n.c)
                 var b0 = ev.value.get(P_BEGIN, 0.0)
                 var e0 = ev.value.get(P_END, 1.0)
                 for i in range(n.c):
+                    if budget <= 0 or steps <= 0:
+                        break
+                    steps -= 1
                     var wb = ev.whole_b + step * Frac.of(i)
                     var we = wb + step
                     var pb = fmax(fmax(wb, ev.part_b), begin)
@@ -1375,6 +1521,7 @@ struct Pattern(Copyable, Movable):
                     if not v.raw:
                         v.set(P_BEGIN, b0 + (e0 - b0) * Float64(i) / Float64(n.c))
                         v.set(P_END, b0 + (e0 - b0) * Float64(i + 1) / Float64(n.c))
+                    budget -= 1
                     out.append(Event(wb, we, pb, pe, v^))
             return
         if k == K_ARP:
@@ -1382,32 +1529,35 @@ struct Pattern(Copyable, Movable):
             var qb = Frac.of(begin.sam())
             var qe = Frac.of(end.sam() + (0 if Frac.of(end.sam()) == end else 1))
             var inner = List[Event]()
-            self.query_into(n.a, qb, qe, inner)
+            self._query_into_bounded(n.a, qb, qe, inner, budget, steps, depth + 1)
             for i in range(1, len(inner)):  # stable sort on whole
                 var j = i
                 while j > 0 and (inner[j].whole_b < inner[j - 1].whole_b or (inner[j].whole_b == inner[j - 1].whole_b and inner[j].whole_e < inner[j - 1].whole_e)):
                     inner.swap_elements(j, j - 1)
                     j -= 1
             var g = 0
-            while g < len(inner):
+            while g < len(inner) and budget > 0:
                 var h = g
                 while h < len(inner) and inner[h].whole_b == inner[g].whole_b and inner[h].whole_e == inner[g].whole_e:
                     h += 1
                 var order = arp_order(n.c, h - g)
                 var slot = (inner[g].whole_e - inner[g].whole_b) / Frac.of(len(order))
                 for r in range(len(order)):
+                    if budget <= 0:
+                        break
                     ref src = inner[g + order[r]]
                     var wb = src.whole_b + slot * Frac.of(r)
                     var we = wb + slot
                     var pb = fmax(fmax(wb, src.part_b), begin)
                     var pe = fmin(fmin(we, src.part_e), end)
                     if pb < pe:
+                        budget -= 1
                         out.append(Event(wb, we, pb, pe, src.value.copy()))
                 g = h
             return
         if k == K_WINDOW:
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
                 var t = inner[j].whole_b
                 var pos = (t - Frac.of(t.sam())).to_float()
@@ -1417,7 +1567,7 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_MATCH:
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             ref want = self.atoms[n.c]
             for j in range(len(inner)):
                 ref v = inner[j].value
@@ -1432,10 +1582,12 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_LINGER:
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var cyc = Frac.of(c)
                 var r = 0
-                while cyc + n.f * Frac.of(r) < fmin(end, cyc + Frac.of(1)):
+                while cyc + n.f * Frac.of(r) < fmin(end, cyc + Frac.of(1)) and budget > 0 and steps > 0:
+                    steps -= 1
                     var sb = cyc + n.f * Frac.of(r)
                     var se = fmin(sb + n.f, cyc + Frac.of(1))
                     var qb = fmax(begin, sb)
@@ -1443,7 +1595,7 @@ struct Pattern(Copyable, Movable):
                     if qb < qe:
                         var shift = n.f * Frac.of(r)
                         var inner = List[Event]()
-                        self.query_into(n.a, qb - shift, qe - shift, inner)
+                        self._query_into_bounded(n.a, qb - shift, qe - shift, inner, budget, steps, depth + 1)
                         for j in range(len(inner)):
                             ref ev = inner[j]
                             var we = fmin(ev.whole_e + shift, se)
@@ -1455,7 +1607,7 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_SLICEVAL:
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
                 ref ev = inner[j]
                 var i = ev.value.num if ev.value.raw else ev.value.get(P_N, 0.0)
@@ -1466,23 +1618,25 @@ struct Pattern(Copyable, Movable):
                 out.append(Event(ev.whole_b, ev.whole_e, ev.part_b, ev.part_e, p^))
             return
         if k == K_SIGNAL:
+            budget -= 1
             out.append(Event(begin, end, begin, end, raw_number(_signal_value(n.c, begin, n.d))))
             return
         if k == K_IRAND:
+            budget -= 1
             var v = floor(time_hash(begin, 31) * Float64(n.c))
             out.append(Event(begin, end, begin, end, raw_number(v)))
             return
         if k == K_SCALE:
             var table = _scale_by_index(n.c)
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
                 var ev = inner[j].copy()
                 var deg = ev.value.num if ev.value.raw else ev.value.get(P_N, ev.value.get(P_NOTE, 0.0))
-                var steps = len(table)
+                var steps_sc = len(table)
                 var di = Int(floor(deg))
-                var octv = di // steps
-                var semis = Float64(table[di - octv * steps] + octv * 12) + (deg - Float64(di))
+                var octv = di // steps_sc
+                var semis = Float64(table[di - octv * steps_sc] + octv * 12) + (deg - Float64(di))
                 if ev.value.raw:
                     ev.value = raw_number(semis)
                 else:
@@ -1494,7 +1648,7 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_RANGE:
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
                 var ev = inner[j].copy()
                 if ev.value.raw and ev.value.has_num:
@@ -1503,21 +1657,28 @@ struct Pattern(Copyable, Movable):
             return
         if k == K_PLY:
             var inner = List[Event]()
-            self.query_into(n.a, begin, end, inner)
+            self._query_into_bounded(n.a, begin, end, inner, budget, steps, depth + 1)
             for j in range(len(inner)):
+                if budget <= 0 or steps <= 0:
+                    break
                 ref ev = inner[j]
                 var step = (ev.whole_e - ev.whole_b) / Frac.of(n.c)
                 for r in range(n.c):
+                    if budget <= 0 or steps <= 0:
+                        break
+                    steps -= 1
                     var wb = ev.whole_b + step * Frac.of(r)
                     var we = wb + step
                     var pb = fmax(wb, ev.part_b)
                     var pe = fmin(we, ev.part_e)
                     if pb < pe:
+                        budget -= 1
                         out.append(Event(wb, we, pb, pe, ev.value.copy()))
             return
         if k == K_ITER:
             var c = begin.sam()
-            while Frac.of(c) < end:
+            while Frac.of(c) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var qb = fmax(begin, Frac.of(c))
                 var qe = fmin(end, Frac.of(c + 1))
                 var step = c % n.c
@@ -1525,7 +1686,7 @@ struct Pattern(Copyable, Movable):
                     step = (n.c - step) % n.c
                 var amount = Frac.make(step, n.c)
                 var inner = List[Event]()
-                self.query_into(n.a, qb + amount, qe + amount, inner)
+                self._query_into_bounded(n.a, qb + amount, qe + amount, inner, budget, steps, depth + 1)
                 for j in range(len(inner)):
                     ref ev = inner[j]
                     out.append(Event(ev.whole_b - amount, ev.whole_e - amount, ev.part_b - amount, ev.part_e - amount, ev.value.copy()))
@@ -1534,14 +1695,16 @@ struct Pattern(Copyable, Movable):
         if k == K_SEGMENT:
             var step = Frac.make(1, n.c)
             var slot = (begin / step).sam()
-            while step * Frac.of(slot) < end:
+            while step * Frac.of(slot) < end and budget > 0 and steps > 0:
+                steps -= 1
                 var wb = step * Frac.of(slot)
                 var we = wb + step
                 var probe = List[Event]()
-                self.query_into(n.a, wb, we, probe)
+                self._query_into_bounded(n.a, wb, we, probe, budget, steps, depth + 1)
                 if len(probe) > 0:
                     var pb = fmax(begin, wb)
                     var pe = fmin(end, we)
+                    budget -= 1
                     out.append(Event(wb, we, pb, pe, probe[0].value.copy()))
                 slot += 1
             return
@@ -1575,12 +1738,15 @@ def _scale_by_index(i: Int) -> List[Int]:
 
 def bjorklund(k: Int, n: Int) -> List[Bool]:
     """Bjorklund's algorithm exactly as Tidal implements it."""
+    if n <= 0:
+        return List[Bool]()
+    var nn = min(n, MAX_PATTERN_COUNT)
     var a = List[List[Bool]]()
     var b = List[List[Bool]]()
-    var kk = max(0, min(k, n))
+    var kk = max(0, min(k, nn))
     for _ in range(kk):
         a.append([True])
-    for _ in range(n - kk):
+    for _ in range(nn - kk):
         b.append([False])
     while len(b) > 1 and len(a) > 0:
         var m = min(len(a), len(b))
@@ -1612,6 +1778,9 @@ def bjorklund(k: Int, n: Int) -> List[Bool]:
 # ---------------------------------------------------------------- mini-notation
 
 
+comptime MAX_MINI_PARSE_DEPTH: Int = 128
+
+
 struct MiniParser:
     """Recursive-descent parser for Tidal mini-notation into a `Pattern` arena.
 
@@ -1627,6 +1796,7 @@ struct MiniParser:
     var pos: Int
     var error: String
     var seed: Int
+    var depth: Int
 
     def __init__(out self, text: String):
         self.text = text
@@ -1636,6 +1806,7 @@ struct MiniParser:
         self.pos = 0
         self.error = String()
         self.seed = 0
+        self.depth = 0
 
     def peek(self) -> Int:
         if self.pos < len(self.src):
@@ -1694,6 +1865,8 @@ struct MiniParser:
         var mode = 0  # 0 stack, 1 random choice
         while True:
             layers.append(self.parse_sequence(pat, close))
+            if self.error.byte_length() > 0:
+                break
             self.skip_ws()
             var c = self.peek()
             if c == ord(","):
@@ -1728,16 +1901,29 @@ struct MiniParser:
             if c == ord(".") and len(steps) > 0 and self.pos + 1 < len(self.src) and Int(self.src[self.pos + 1]) == ord("."):
                 # `0 .. 7` expands the previous number into a run
                 self.pos += 2
-                var hi = Int(self.read_number())
+                var hi_f = self.read_number()
+                if self.error.byte_length() > 0:
+                    break
+                if hi_f != hi_f or hi_f < -1.0e9 or hi_f > 1.0e9:
+                    self.fail("integer range too large (max 4096 elements)")
+                    break
+                var hi = Int(hi_f)
                 var last = steps[len(steps) - 1]
                 if pat.nodes[last].kind == K_ATOM and pat.atoms[pat.nodes[last].a].has_num:
                     var lo = Int(pat.atoms[pat.nodes[last].a].num)
+                    var diff = Int128(hi) - Int128(lo)
+                    if diff < Int128(-4095) or diff > Int128(4095):
+                        self.fail("integer range too large (max 4096 elements)")
+                        break
                     var w = ws[len(ws) - 1]
                     _ = steps.pop()
                     _ = ws.pop()
                     var step = 1 if hi >= lo else -1
                     var v = lo
                     while True:
+                        if len(steps) >= MAX_PATTERN_COUNT:
+                            self.fail("too many steps in sequence (max 4096)")
+                            break
                         steps.append(pat.pure_number(Float64(v)))
                         ws.append(w)
                         if v == hi:
@@ -1753,6 +1939,9 @@ struct MiniParser:
             if c == ord("!") and len(steps) > 0:
                 # bare `!` repeats the previous step
                 self.pos += 1
+                if len(steps) >= MAX_PATTERN_COUNT:
+                    self.fail("too many steps in sequence (max 4096)")
+                    break
                 steps.append(steps[len(steps) - 1])
                 ws.append(ws[len(ws) - 1])
                 continue
@@ -1782,6 +1971,15 @@ struct MiniParser:
         return pat.with_kids(K_SEQ, steps, ws)
 
     def parse_term(mut self, mut pat: Pattern) -> Int:
+        if self.depth >= MAX_MINI_PARSE_DEPTH:
+            self.fail("pattern nesting too deep (max " + String(MAX_MINI_PARSE_DEPTH) + ")")
+            return pat.silence()
+        self.depth += 1
+        var res = self._parse_term_inner(pat)
+        self.depth -= 1
+        return res
+
+    def _parse_term_inner(mut self, mut pat: Pattern) -> Int:
         self.skip_ws()
         var c = self.peek()
         if c == ord("~"):
@@ -1816,8 +2014,11 @@ struct MiniParser:
                 var alt = List[Int]()
                 for i in range(len(steps)):
                     var w = ws[i]
-                    var reps = w.num // w.den
-                    for _ in range(max(1, reps)):
+                    var reps = max(1, w.num // w.den)
+                    if reps > MAX_PATTERN_COUNT or len(alt) + reps > MAX_PATTERN_COUNT:
+                        self.fail("step repetition count too large (max 4096)")
+                        return pat.silence()
+                    for _ in range(reps):
                         alt.append(steps[i])
                 layers.append(pat.slowcat(alt) if len(alt) > 0 else pat.silence())
                 self.skip_ws()
@@ -1859,7 +2060,11 @@ struct MiniParser:
             var base = len(layer_steps[0]) if len(layer_steps) > 0 else 1
             if self.peek() == ord("%"):
                 self.pos += 1
-                base = Int(self.read_number())
+                var base_f = self.read_number()
+                if base_f != base_f or base_f < 1.0 or base_f > Float64(MAX_PATTERN_COUNT):
+                    self.fail("polymeter step count out of range (max 4096)")
+                    return pat.silence()
+                base = Int(base_f)
             var layers = List[Int]()
             for i in range(len(layer_steps)):
                 var count = len(layer_steps[i])
@@ -1906,15 +2111,29 @@ struct MiniParser:
                 var fs = self._factors()
                 var variants = List[Int]()
                 for f in fs:
+                    if (
+                        (c == ord("*") and Int128(f.num) > Int128(MAX_PATTERN_COUNT) * Int128(f.den))
+                        or (c == ord("/") and f.num > 0 and Int128(f.den) > Int128(MAX_PATTERN_COUNT) * Int128(f.num))
+                    ):
+                        self.fail("speed factor too large (max 4096)")
+                        return
                     variants.append(pat.fast(f, id) if c == ord("*") else pat.slow(f, id))
                 id = variants[0] if len(variants) == 1 else pat.with_kids(K_ALT_ABS, variants, List[Frac]())
             elif c == ord("@"):
                 self.pos += 1
-                weight = Frac.from_float(self.read_number())
+                var w_f = self.read_number()
+                if w_f != w_f or w_f < 0.0 or w_f > Float64(MAX_PATTERN_COUNT):
+                    self.fail("step weight out of range (max 4096)")
+                    return
+                weight = Frac.from_float(w_f)
             elif c == ord("!"):
                 if self.pos + 1 < len(self.src) and Int(self.src[self.pos + 1]) >= ord("0") and Int(self.src[self.pos + 1]) <= ord("9"):
                     self.pos += 1
-                    repeats = Int(self.read_number())
+                    var r_f = self.read_number()
+                    if r_f != r_f or r_f < 0.0 or r_f > Float64(MAX_PATTERN_COUNT):
+                        self.fail("repeat count too large (max 4096)")
+                        return
+                    repeats = Int(r_f)
                 else:
                     break
             elif c == ord("?"):
@@ -1948,6 +2167,9 @@ struct MiniParser:
                 var count = len(ks)
                 while count % len(ns) != 0 or count % len(rots) != 0:
                     count += len(ks)
+                    if count > MAX_PATTERN_COUNT:
+                        self.fail("euclid cycle count too large (max 4096)")
+                        return
                 var variants = List[Int]()
                 for v in range(count):
                     var k = ks[v % len(ks)].sam()
@@ -1957,6 +2179,9 @@ struct MiniParser:
                     if n <= 0:
                         variants.append(rest)
                         continue
+                    if n > MAX_PATTERN_COUNT:
+                        self.fail("euclid step count too large (max 4096)")
+                        return
                     var bits = bjorklund(k if k >= 0 else -k, n)
                     var slots = List[Int]()
                     for i in range(n):
@@ -1968,7 +2193,13 @@ struct MiniParser:
                 id = variants[0] if len(variants) == 1 else pat.with_kids(K_ALT_ABS, variants, List[Frac]())
             else:
                 break
-        for _ in range(max(1, repeats)):
+        if self.error.byte_length() > 0:
+            return
+        var add_reps = max(1, repeats)
+        if len(steps) + add_reps > MAX_PATTERN_COUNT:
+            self.fail("too many steps in sequence (max 4096)")
+            return
+        for _ in range(add_reps):
             steps.append(id)
             ws.append(weight)
 

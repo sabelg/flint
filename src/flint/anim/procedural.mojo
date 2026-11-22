@@ -432,7 +432,7 @@ def pose_position(pose: Pose, parents: List[Int], node: Int) -> Vec3:
     var guard = 0
     while current >= 0 and current < pose.count() and guard < 128:
         position = pose.t[current] + pose.r[current].rotate(position)
-        current = parents[current]
+        current = parents[current] if current < len(parents) else -1
         guard += 1
     return position
 

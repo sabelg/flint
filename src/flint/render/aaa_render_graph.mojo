@@ -318,6 +318,8 @@ struct AaaRenderGraph(Movable):
                 self.async_compute_pass_count += 1
             for acc in self.passes[p_idx].accesses:
                 var rid = acc.resource_id
+                if rid < 0 or rid >= len(self.resources):
+                    return False
                 if p_idx < self.resources[rid].first_pass:
                     self.resources[rid].first_pass = p_idx
                 if p_idx > self.resources[rid].last_pass:
@@ -325,11 +327,20 @@ struct AaaRenderGraph(Movable):
 
         # 1. Transient VRAM aliasing via separate Buffer & Image OffsetAllocators
         var has_active_transient = False
+        var unaliased_total = 0
         for r in range(len(self.resources)):
             if self.resources[r].transient and self.resources[r].last_pass >= 0:
-                var align_b = max(RG_UNIT_BYTES, self.resources[r].alignment_bytes)
-                var aligned = ((self.resources[r].size_bytes + align_b - 1) // align_b) * align_b
-                self.unaliased_transient_bytes += aligned
+                var sz_b = self.resources[r].size_bytes
+                var al_b = self.resources[r].alignment_bytes
+                if sz_b <= 0 or al_b <= 0:
+                    return False
+                var align_b = max(RG_UNIT_BYTES, al_b)
+                if sz_b > Int.MAX - align_b:
+                    return False
+                var aligned = ((sz_b + align_b - 1) // align_b) * align_b
+                if aligned > Int.MAX - unaliased_total:
+                    return False
+                unaliased_total += aligned
                 has_active_transient = True
                 if self.resources[r].is_image:
                     self.image_memory_type_bits &= self.resources[r].memory_type_bits
@@ -339,7 +350,14 @@ struct AaaRenderGraph(Movable):
         if heap_capacity_bytes <= 0:
             if has_active_transient:
                 return False
-        var heap_units = UInt32(max(1, (heap_capacity_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES))
+        var heap_units_i = 1
+        if heap_capacity_bytes > 0:
+            if heap_capacity_bytes > Int.MAX - (RG_UNIT_BYTES - 1):
+                return False
+            heap_units_i = max(1, (heap_capacity_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES)
+            if heap_units_i > 0xFFFFFFFF:
+                return False
+        var heap_units = UInt32(heap_units_i)
         var oa_buf = OffsetAllocator(heap_units, max_allocations=1024)
         var oa_img = OffsetAllocator(heap_units, max_allocations=1024)
         var max_buf_end_bytes = 0
@@ -354,9 +372,19 @@ struct AaaRenderGraph(Movable):
             for r in range(len(self.resources)):
                 if self.resources[r].transient and self.resources[r].first_pass == p_idx:
                     var is_img_r = self.resources[r].is_image
-                    var align_b = max(RG_UNIT_BYTES, self.resources[r].alignment_bytes)
+                    var sz_b = self.resources[r].size_bytes
+                    var al_b = self.resources[r].alignment_bytes
+                    if sz_b <= 0 or al_b <= 0:
+                        return False
+                    var align_b = max(RG_UNIT_BYTES, al_b)
+                    if sz_b > Int.MAX - RG_UNIT_BYTES or align_b > Int.MAX - RG_UNIT_BYTES:
+                        return False
                     var align_u = (align_b + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES
-                    var units = UInt32((self.resources[r].size_bytes + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES + align_u - 1)
+                    var size_u = (sz_b + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES
+                    var units_i = size_u + align_u - 1
+                    if units_i <= 0 or units_i > 0xFFFFFFFF or units_i > heap_units_i:
+                        return False
+                    var units = UInt32(units_i)
                     var al = oa_img.allocate(units) if is_img_r else oa_buf.allocate(units)
                     if not al.ok():
                         return False
@@ -416,6 +444,7 @@ struct AaaRenderGraph(Movable):
                     freed_ends.append(self.resources[r].aliased_offset_bytes + self.resources[r].size_bytes)
                     freed_is_img.append(self.resources[r].is_image)
 
+        self.unaliased_transient_bytes = unaliased_total
         self.aliased_buf_peak_bytes = max(Int(oa_buf.peak_used) * RG_UNIT_BYTES, max_buf_end_bytes)
         self.aliased_img_peak_bytes = max(Int(oa_img.peak_used) * RG_UNIT_BYTES, max_img_end_bytes)
         self.aliased_peak_bytes = self.aliased_buf_peak_bytes + self.aliased_img_peak_bytes

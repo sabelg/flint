@@ -13,11 +13,13 @@ The same `bake_glyph` serves the offline baker (`tools/bake_font.mojo`,
 which writes the `.dsf` files) and the game's dynamic glyph cache (a glyph
 missing from the baked atlas is baked from the font file on first use).
 """
-from std.math import sqrt, floor, ceil, sin, cos, acos
+from std.math import abs, sqrt, floor, ceil, sin, cos, acos
 from flint.text.ttf import TrueTypeFont, GlyphOutline
 
 comptime DSF_MAGIC: Int = 0x31465344  # "DSF1"
 comptime CURVE_TOLERANCE: Float32 = 0.05   # flattening error, bake px
+comptime MAX_BAKED_GLYPH_DIM: Int = 2048
+comptime MAX_BAKED_GLYPH_BYTES: Int = 4 * 1024 * 1024
 
 comptime EDGE_R: Int = 1
 comptime EDGE_G: Int = 2
@@ -132,9 +134,14 @@ def flatten(outline: GlyphOutline, scale: Float32) -> Segments:
     """Contours to segments in bake px (y flipped down). Supports TrueType
     quadratic contours (`is_cubic=False`) and CFF cubic contours (`is_cubic=True`)."""
     var segments = Segments()
+    var n_pts = min(len(outline.xs), min(len(outline.ys), len(outline.on)))
     var start = 0
     for contour in range(len(outline.ends)):
         var end = outline.ends[contour]
+        if start < 0 or end < start or start >= n_pts or end >= n_pts:
+            if end >= start:
+                start = end + 1
+            continue
         var count = end - start + 1
         if count < 2:
             start = end + 1
@@ -655,9 +662,14 @@ def extract_edge_contours(outline: GlyphOutline, scale: Float32) -> List[EdgeCon
     """Extracts exact Line/Quad/Cubic EdgeContours in y-down bake pixels and
     normalizes winding so TTF (CW y-up) and CFF (CCW y-up) share positive interior sign."""
     var contours = List[EdgeContour]()
+    var n_pts = min(len(outline.xs), min(len(outline.ys), len(outline.on)))
     var start = 0
     for c_idx in range(len(outline.ends)):
         var end = outline.ends[c_idx]
+        if start < 0 or end < start or start >= n_pts or end >= n_pts:
+            if end >= start:
+                start = end + 1
+            continue
         var count = end - start + 1
         if count < 2:
             start = end + 1
@@ -1058,6 +1070,8 @@ def _bake_glyph_msdf_internal(
     baked.code = code
     baked.glyph = glyph_id
     baked.channels = channels
+    if bake_px <= 0 or spread < 0 or metric_scale <= Float32(0.0):
+        return baked^
     var scale = (Float32(bake_px) / Float32(max(1, font.units_per_em))) * metric_scale
     if code != 0 and invisible(code):
         return baked^
@@ -1065,19 +1079,40 @@ def _bake_glyph_msdf_internal(
     baked.advance = outline.advance * scale
     if outline.point_count() == 0 or len(outline.ends) == 0:
         return baked^
+    var box = outline.bounds()
+    var fx0 = box[0] * scale
+    var fy0 = -box[3] * scale
+    var fx1 = box[2] * scale
+    var fy1 = -box[1] * scale
+    if not (
+        abs(fx0) <= Float32(1.0e6)
+        and abs(fy0) <= Float32(1.0e6)
+        and abs(fx1) <= Float32(1.0e6)
+        and abs(fy1) <= Float32(1.0e6)
+    ):
+        return baked^
+    var pad = spread + 1
+    var gx0 = Int(floor(fx0)) - pad
+    var gy0 = Int(floor(fy0)) - pad
+    var gx1 = Int(ceil(fx1)) + pad
+    var gy1 = Int(ceil(fy1)) + pad
+    var bw = gx1 - gx0
+    var bh = gy1 - gy0
+    if (
+        bw <= 0
+        or bh <= 0
+        or bw > MAX_BAKED_GLYPH_DIM
+        or bh > MAX_BAKED_GLYPH_DIM
+        or bw * bh * channels > MAX_BAKED_GLYPH_BYTES
+    ):
+        return baked^
     var contours = extract_edge_contours(outline, scale)
     if len(contours) == 0:
         return baked^
     color_edges(contours)
     var segments = flatten(outline, scale)
-    var box = outline.bounds()
-    var pad = spread + 1
-    var gx0 = Int(floor(box[0] * scale)) - pad
-    var gy0 = Int(floor(-box[3] * scale)) - pad
-    var gx1 = Int(ceil(box[2] * scale)) + pad
-    var gy1 = Int(ceil(-box[1] * scale)) + pad
-    baked.w = gx1 - gx0
-    baked.h = gy1 - gy0
+    baked.w = bw
+    baked.h = bh
     baked.xoff = Float32(gx0)
     baked.yoff = Float32(gy0)
     baked.pixels = List[UInt8](length=baked.w * baked.h * channels, fill=0)
@@ -1154,6 +1189,8 @@ def bake_glyph_id(
     baked.code = code
     baked.glyph = glyph_id
     baked.channels = 1
+    if bake_px <= 0 or spread < 0 or metric_scale <= Float32(0.0):
+        return baked^
     var scale = (Float32(bake_px) / Float32(max(1, font.units_per_em))) * metric_scale
     if code != 0 and invisible(code):
         return baked^
@@ -1161,17 +1198,38 @@ def bake_glyph_id(
     baked.advance = outline.advance * scale
     if outline.point_count() == 0 or len(outline.ends) == 0:
         return baked^
+    var box = outline.bounds()
+    var fx0 = box[0] * scale
+    var fy0 = -box[3] * scale
+    var fx1 = box[2] * scale
+    var fy1 = -box[1] * scale
+    if not (
+        abs(fx0) <= Float32(1.0e6)
+        and abs(fy0) <= Float32(1.0e6)
+        and abs(fx1) <= Float32(1.0e6)
+        and abs(fy1) <= Float32(1.0e6)
+    ):
+        return baked^
+    var pad = spread + 1
+    var gx0 = Int(floor(fx0)) - pad
+    var gy0 = Int(floor(fy0)) - pad
+    var gx1 = Int(ceil(fx1)) + pad
+    var gy1 = Int(ceil(fy1)) + pad
+    var bw = gx1 - gx0
+    var bh = gy1 - gy0
+    if (
+        bw <= 0
+        or bh <= 0
+        or bw > MAX_BAKED_GLYPH_DIM
+        or bh > MAX_BAKED_GLYPH_DIM
+        or bw * bh > MAX_BAKED_GLYPH_BYTES
+    ):
+        return baked^
     var segments = flatten(outline, scale)
     if segments.count() == 0:
         return baked^
-    var box = outline.bounds()
-    var pad = spread + 1
-    var gx0 = Int(floor(box[0] * scale)) - pad
-    var gy0 = Int(floor(-box[3] * scale)) - pad
-    var gx1 = Int(ceil(box[2] * scale)) + pad
-    var gy1 = Int(ceil(-box[1] * scale)) + pad
-    baked.w = gx1 - gx0
-    baked.h = gy1 - gy0
+    baked.w = bw
+    baked.h = bh
     baked.xoff = Float32(gx0)
     baked.yoff = Float32(gy0)
     baked.pixels = List[UInt8](length=baked.w * baked.h, fill=0)

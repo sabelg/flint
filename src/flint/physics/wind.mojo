@@ -134,7 +134,10 @@ struct FxVec(Copyable, ImplicitlyCopyable, Movable, Equatable):
     def read(mut input: BlobReader) raises -> Self:
         var x = Int64(input.u64())
         var y = Int64(input.u64())
-        return Self(x, y, Int64(input.u64()))
+        var z = Int64(input.u64())
+        if input.failed:
+            raise Error("wind blob: truncated FxVec")
+        return Self(x, y, z)
 
 
 def falloff_fx(kind: Int, t: Int64) -> Int64:
@@ -290,6 +293,10 @@ struct Vorticle(Copyable, ImplicitlyCopyable, Movable):
         v.burst = Int64(input.u64())
         v.life = input.integer()
         v.age = input.integer()
+        if input.failed:
+            raise Error("wind blob: truncated Vorticle")
+        if v.life < 1:
+            raise Error("wind blob: vorticle life must be >= 1")
         return v
 
 
@@ -308,6 +315,8 @@ def make_vorticle(id: Int, center: Vec3, axis: Vec3, radius: Float32, swirl: Flo
 
 
 def vorticle_wind(v: Vorticle, p: FxVec) -> FxVec:
+    if v.life <= 0 or v.radius <= 0:
+        return FxVec.zero()
     var d = p - v.center
     var r2 = d.dot_raw(d)
     var limit = v.radius * v.radius

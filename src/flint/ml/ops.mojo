@@ -5,7 +5,7 @@ SIMD inner loops; everything else is a plain loop, which is cheap for the small 
 of a motion model.
 """
 
-from std.math import sqrt, exp, atan, cos, sin, ceil, floor
+from std.math import sqrt, exp, erf, atan, cos, sin, ceil, floor, isnan, isinf
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
 from flint.ml.tensor import (
@@ -15,6 +15,32 @@ from flint.ml.tensor import (
 
 comptime LANES: Int = 8
 comptime F8 = SIMD[DType.float32, LANES]
+comptime MAX_RANGE_ELEMS: Int = 16_777_216
+
+
+@always_inline
+def _checked_mul(a: Int, b: Int) raises -> Int:
+    if a < 0 or b < 0:
+        raise Error("ops: negative dimension")
+    if a == 0 or b == 0:
+        return 0
+    if a > 0x7FFFFFFFFFFFFFFF // b:
+        raise Error("ops: integer multiplication overflow")
+    return a * b
+
+
+@always_inline
+def _checked_add(a: Int, b: Int) raises -> Int:
+    if a < 0 or b < 0:
+        raise Error("ops: negative dimension")
+    if a > 0x7FFFFFFFFFFFFFFF - b:
+        raise Error("ops: integer addition overflow")
+    return a + b
+
+
+def _require_valid_tensor(t: Tensor, op_name: String) raises:
+    if not t.has_valid_storage():
+        raise Error(op_name + ": invalid tensor shape or undersized storage")
 
 
 # ----------------------------------------------------------------------------------- unary
@@ -28,11 +54,16 @@ comptime U_ABS: Int = 5
 comptime U_NEG: Int = 6
 comptime U_NOT: Int = 7
 comptime U_LEAKY: Int = 8
+comptime U_ERF: Int = 9
+comptime U_SIGMOID: Int = 10
 
 
 def unary(op: Int, x: Tensor, alpha: Float32 = 0.01) raises -> Tensor:
+    _require_valid_tensor(x, "unary")
     var n = x.numel()
     if op == U_NOT:
+        if x.is_float():
+            raise Error("unary Not requires integer/bool tensor")
         var o = List[Int](length=n, fill=0)
         for k in range(n):
             o[k] = 1 if x.i[k] == 0 else 0
@@ -71,6 +102,11 @@ def unary(op: Int, x: Tensor, alpha: Float32 = 0.01) raises -> Tensor:
             r = v if v > 0 else 0
         elif op == U_ATAN:
             r = atan(v)
+        elif op == U_ERF:
+            r = erf(v)
+        elif op == U_SIGMOID:
+            var z = exp(-abs(v))
+            r = 1 / (1 + z) if v >= 0 else z / (1 + z)
         elif op == U_COS:
             r = cos(v)
         elif op == U_SIN:
@@ -168,8 +204,15 @@ def _float_repeat(op: Int, big: Tensor, small: Tensor, period: Int, var out_shap
 
 
 def binary(op: Int, a: Tensor, b: Tensor) raises -> Tensor:
+    _require_valid_tensor(a, "binary")
+    _require_valid_tensor(b, "binary")
+    var compare = op == B_EQ or op == B_LT or op == B_GT
+    if not compare and a.is_float() != b.is_float():
+        raise Error("binary: mismatched tensor dtypes")
     var out_shape = broadcast_shape(a.shape, b.shape)
     var n = numel_of(out_shape)
+    if n < 0:
+        raise Error("binary: tensor shape overflow")
     var same_a = a.numel() == n
     var same_b = b.numel() == n
     var plain_a = same_a and len(a.shape) == len(out_shape)
@@ -188,7 +231,6 @@ def binary(op: Int, a: Tensor, b: Tensor) raises -> Tensor:
         oa = broadcast_offsets(a.shape, out_shape)
     if not plain_b:
         ob = broadcast_offsets(b.shape, out_shape)
-    var compare = op == B_EQ or op == B_LT or op == B_GT
     if compare:
         var o = List[Int](length=n, fill=0)
         for e in range(n):
@@ -238,16 +280,28 @@ def binary(op: Int, a: Tensor, b: Tensor) raises -> Tensor:
     for e in range(n):
         var ia = e if plain_a else oa[e]
         var ib = e if plain_b else ob[e]
-        o[e] = _iop(op, a.i[ia], b.i[ib])
+        var bv = b.i[ib]
+        if (op == B_DIV or op == B_MOD) and bv == 0:
+            raise Error("binary: integer division by zero")
+        o[e] = _iop(op, a.i[ia], bv)
     return Tensor.ints(a.dtype, out_shape^, o^)
 
 
 def where(c: Tensor, x: Tensor, y: Tensor) raises -> Tensor:
+    _require_valid_tensor(c, "where")
+    _require_valid_tensor(x, "where")
+    _require_valid_tensor(y, "where")
+    if c.is_float():
+        raise Error("where: condition must be integer/bool")
+    if x.is_float() != y.is_float():
+        raise Error("where: mismatched branch tensor dtypes")
     var s = broadcast_shape(broadcast_shape(c.shape, x.shape), y.shape)
+    var n = numel_of(s)
+    if n < 0:
+        raise Error("where: tensor shape overflow")
     var oc = broadcast_offsets(c.shape, s)
     var ox = broadcast_offsets(x.shape, s)
     var oy = broadcast_offsets(y.shape, s)
-    var n = numel_of(s)
     var out = Tensor.like(x, s.copy())
     for e in range(n):
         var take_x = c.i[oc[e]] != 0
@@ -258,9 +312,11 @@ def where(c: Tensor, x: Tensor, y: Tensor) raises -> Tensor:
     return out^
 
 
-def clip(x: Tensor, lo: Float64, hi: Float64) -> Tensor:
+def clip(x: Tensor, lo: Float64, hi: Float64) raises -> Tensor:
+    _require_valid_tensor(x, "clip")
+    var n = x.numel()
     var out = Tensor.like(x, x.shape.copy())
-    for e in range(x.numel()):
+    for e in range(n):
         if x.is_float():
             out.f[e] = min(max(x.fget(e), Float32(lo)), Float32(hi))
         else:
@@ -269,6 +325,7 @@ def clip(x: Tensor, lo: Float64, hi: Float64) -> Tensor:
 
 
 def cast(x: Tensor, to: Int) raises -> Tensor:
+    _require_valid_tensor(x, "cast")
     var n = x.numel()
     if to == DT_F32:
         if x.is_float():
@@ -302,17 +359,35 @@ def _copy_elem(mut dst: Tensor, di: Int, src: Tensor, si: Int):
         dst.i[di] = src.i[si]
 
 
-def transpose(x: Tensor, perm: List[Int]) -> Tensor:
+def transpose(x: Tensor, perm: List[Int]) raises -> Tensor:
+    _require_valid_tensor(x, "transpose")
     var r = x.rank()
+    if len(perm) != r:
+        raise Error("transpose: perm length must match tensor rank")
+    var seen = List[Bool](length=r, fill=False)
+    for k in range(r):
+        var p = perm[k]
+        if p < 0 or p >= r or seen[p]:
+            raise Error("transpose: invalid permutation axis")
+        seen[p] = True
     var out_shape = List[Int](length=r, fill=1)
     for k in range(r):
         out_shape[k] = x.shape[perm[k]]
+    var n = numel_of(out_shape)
+    if n < 0:
+        raise Error("transpose: tensor shape overflow")
     var st = strides_of(x.shape)
     var pst = List[Int](length=r, fill=0)
     for k in range(r):
         pst[k] = st[perm[k]]
     var out = Tensor.like(x, out_shape.copy())
-    var n = out.numel()
+    if r == 0:
+        if n > 0:
+            if (x.is_float() and (x.ext != 0 or len(x.f) > 0)) or (not x.is_float() and len(x.i) > 0):
+                _copy_elem(out, 0, x, 0)
+        return out^
+    if n == 0:
+        return out^
     var ctr = List[Int](length=r, fill=0)
     var cur = 0
     if x.is_float():
@@ -350,24 +425,41 @@ def transpose(x: Tensor, perm: List[Int]) -> Tensor:
 
 
 def concat(xs: List[Tensor], axis_in: Int) raises -> Tensor:
+    if len(xs) == 0:
+        raise Error("concat: empty input list")
     var r = xs[0].rank()
+    if r == 0:
+        raise Error("concat: cannot concatenate 0-D tensors")
     var axis = norm_axis(axis_in, r)
+    if axis < 0 or axis >= r:
+        raise Error("concat: axis out of range")
     var out_shape = xs[0].shape.copy()
     var total = 0
     for t in xs:
-        total += t.shape[axis]
+        _require_valid_tensor(t, "concat")
+        if t.dtype != xs[0].dtype:
+            raise Error("concat: mismatched tensor dtypes")
+        if t.rank() != r:
+            raise Error("concat: mismatched tensor ranks")
+        for d in range(r):
+            if d != axis and t.shape[d] != out_shape[d]:
+                raise Error("concat: mismatched non-axis dimension")
+        total = _checked_add(total, t.shape[axis])
     out_shape[axis] = total
+    var out_n = numel_of(out_shape)
+    if out_n < 0:
+        raise Error("concat: tensor shape overflow")
     var outer = 1
     for k in range(axis):
-        outer *= out_shape[k]
+        outer = _checked_mul(outer, out_shape[k])
     var inner = 1
     for k in range(axis + 1, r):
-        inner *= out_shape[k]
+        inner = _checked_mul(inner, out_shape[k])
+    var row = _checked_mul(total, inner)
     var out = Tensor.like(xs[0], out_shape^)
-    var row = total * inner
     var off = 0
     for t in xs:
-        var chunk = t.shape[axis] * inner
+        var chunk = _checked_mul(t.shape[axis], inner)
         for o in range(outer):
             for c in range(chunk):
                 _copy_elem(out, o * row + off + c, t, o * chunk + c)
@@ -376,8 +468,14 @@ def concat(xs: List[Tensor], axis_in: Int) raises -> Tensor:
 
 
 def gather(data: Tensor, idx: Tensor, axis_in: Int) raises -> Tensor:
+    _require_valid_tensor(data, "gather")
+    _require_valid_tensor(idx, "gather")
     var r = data.rank()
+    if r == 0:
+        raise Error("gather: data must have rank >= 1")
     var axis = norm_axis(axis_in, r)
+    if axis < 0 or axis >= r:
+        raise Error("gather: axis out of range")
     var out_shape = List[Int]()
     for k in range(axis):
         out_shape.append(data.shape[k])
@@ -385,38 +483,56 @@ def gather(data: Tensor, idx: Tensor, axis_in: Int) raises -> Tensor:
         out_shape.append(d)
     for k in range(axis + 1, r):
         out_shape.append(data.shape[k])
+    var out_n = numel_of(out_shape)
+    if out_n < 0:
+        raise Error("gather: tensor shape overflow")
     var outer = 1
     for k in range(axis):
-        outer *= data.shape[k]
+        outer = _checked_mul(outer, data.shape[k])
     var inner = 1
     for k in range(axis + 1, r):
-        inner *= data.shape[k]
+        inner = _checked_mul(inner, data.shape[k])
     var dim = data.shape[axis]
     var ni = idx.numel()
+    for j in range(ni):
+        var g = idx.int_at(j)
+        if g < 0:
+            g += dim
+        if g < 0 or g >= dim:
+            raise Error("Gather: index out of range")
     var out = Tensor.like(data, out_shape^)
     for o in range(outer):
         for j in range(ni):
             var g = idx.int_at(j)
             if g < 0:
                 g += dim
-            if g < 0 or g >= dim:
-                raise Error("Gather: index out of range")
             for c in range(inner):
                 _copy_elem(out, (o * ni + j) * inner + c, data, (o * dim + g) * inner + c)
     return out^
 
 
 def gather_elements(data: Tensor, idx: Tensor, axis_in: Int) raises -> Tensor:
+    _require_valid_tensor(data, "gather_elements")
+    _require_valid_tensor(idx, "gather_elements")
     var r = data.rank()
+    if r == 0 or idx.rank() != r:
+        raise Error("gather_elements: data and indices must have matching rank >= 1")
     var axis = norm_axis(axis_in, r)
+    if axis < 0 or axis >= r:
+        raise Error("gather_elements: axis out of range")
+    for d in range(r):
+        if d != axis and idx.shape[d] > data.shape[d]:
+            raise Error("gather_elements: indices shape exceeds data shape on non-axis dimension")
+    var n = idx.numel()
     var dst = strides_of(data.shape)
     var out = Tensor.like(data, idx.shape.copy())
-    var n = idx.numel()
     var ctr = List[Int](length=r, fill=0)
     for e in range(n):
         var g = idx.int_at(e)
         if g < 0:
             g += data.shape[axis]
+        if g < 0 or g >= data.shape[axis]:
+            raise Error("gather_elements: index out of range")
         var off = 0
         for d in range(r):
             off += (g if d == axis else ctr[d]) * dst[d]
@@ -432,18 +548,36 @@ def gather_elements(data: Tensor, idx: Tensor, axis_in: Int) raises -> Tensor:
 
 
 def scatter_elements(data: Tensor, idx: Tensor, upd: Tensor, axis_in: Int) raises -> Tensor:
+    _require_valid_tensor(data, "scatter_elements")
+    _require_valid_tensor(idx, "scatter_elements")
+    _require_valid_tensor(upd, "scatter_elements")
     var r = data.rank()
+    if r == 0 or idx.rank() != r:
+        raise Error("scatter_elements: data and indices must have matching rank >= 1")
+    if data.is_float() != upd.is_float():
+        raise Error("scatter_elements: mismatched data and updates dtypes")
     var axis = norm_axis(axis_in, r)
+    if axis < 0 or axis >= r:
+        raise Error("scatter_elements: axis out of range")
+    if upd.rank() != r:
+        raise Error("scatter_elements: updates shape must match indices")
+    for d in range(r):
+        if upd.shape[d] != idx.shape[d]:
+            raise Error("scatter_elements: updates shape must match indices")
+        if d != axis and idx.shape[d] > data.shape[d]:
+            raise Error("scatter_elements: indices shape exceeds data shape on non-axis dimension")
+    var n = idx.numel()
     var dst = strides_of(data.shape)
     var out = data.reshaped(data.shape.copy())
     if out.is_float() and out.ext != 0:
         out = Tensor.floats(data.shape.copy(), data.owned_floats())
-    var n = idx.numel()
     var ctr = List[Int](length=r, fill=0)
     for e in range(n):
         var g = idx.int_at(e)
         if g < 0:
             g += data.shape[axis]
+        if g < 0 or g >= data.shape[axis]:
+            raise Error("scatter_elements: index out of range")
         var off = 0
         for d in range(r):
             off += (g if d == axis else ctr[d]) * dst[d]
@@ -459,21 +593,34 @@ def scatter_elements(data: Tensor, idx: Tensor, upd: Tensor, axis_in: Int) raise
 
 
 def scatter_nd(data: Tensor, idx: Tensor, upd: Tensor) raises -> Tensor:
+    _require_valid_tensor(data, "scatter_nd")
+    _require_valid_tensor(idx, "scatter_nd")
+    _require_valid_tensor(upd, "scatter_nd")
+    if idx.rank() < 1:
+        raise Error("scatter_nd: indices must have rank >= 1")
+    if data.is_float() != upd.is_float():
+        raise Error("scatter_nd: mismatched data and updates dtypes")
+    var k = idx.shape[idx.rank() - 1]
+    if k <= 0 or k > data.rank():
+        raise Error("scatter_nd: invalid index tuple size")
     var out = data.reshaped(data.shape.copy())
     if out.is_float() and out.ext != 0:
         out = Tensor.floats(data.shape.copy(), data.owned_floats())
-    var k = idx.shape[idx.rank() - 1]
     var dst = strides_of(data.shape)
     var slice_n = 1
     for d in range(k, data.rank()):
-        slice_n *= data.shape[d]
+        slice_n = _checked_mul(slice_n, data.shape[d])
     var rows = idx.numel() // k
+    if upd.numel() < _checked_mul(rows, slice_n):
+        raise Error("scatter_nd: updates tensor too small")
     for j in range(rows):
         var off = 0
         for d in range(k):
             var g = idx.int_at(j * k + d)
             if g < 0:
                 g += data.shape[d]
+            if g < 0 or g >= data.shape[d]:
+                raise Error("scatter_nd: index out of range")
             off += g * dst[d]
         for c in range(slice_n):
             _copy_elem(out, off + c, upd, j * slice_n + c)
@@ -481,12 +628,25 @@ def scatter_nd(data: Tensor, idx: Tensor, upd: Tensor) raises -> Tensor:
 
 
 def slice(data: Tensor, starts: List[Int], ends: List[Int], axes_in: List[Int], steps_in: List[Int]) raises -> Tensor:
+    _require_valid_tensor(data, "slice")
+    if len(ends) != len(starts):
+        raise Error("slice: starts and ends length mismatch")
+    if len(axes_in) != 0 and len(axes_in) != len(starts):
+        raise Error("slice: axes length mismatch")
+    if len(steps_in) != 0 and len(steps_in) != len(starts):
+        raise Error("slice: steps length mismatch")
     var r = data.rank()
     var st = List[Int](length=r, fill=0)
     var en = data.shape.copy()
     var sp = List[Int](length=r, fill=1)
+    var seen = List[Bool](length=r, fill=False)
     for j in range(len(starts)):
         var ax = norm_axis(axes_in[j] if len(axes_in) > 0 else j, r)
+        if ax < 0 or ax >= r:
+            raise Error("slice: axis out of range")
+        if seen[ax]:
+            raise Error("slice: duplicate axis")
+        seen[ax] = True
         var dim = data.shape[ax]
         var step = steps_in[j] if len(steps_in) > 0 else 1
         if step == 0:
@@ -508,14 +668,23 @@ def slice(data: Tensor, starts: List[Int], ends: List[Int], axes_in: List[Int], 
         sp[ax] = step
     var out_shape = List[Int](length=r, fill=0)
     for d in range(r):
-        var cnt: Int
+        var cnt: Int = 0
         if sp[d] > 0:
-            cnt = (en[d] - st[d] + sp[d] - 1) // sp[d]
+            if en[d] > st[d]:
+                cnt = (en[d] - st[d] - 1) // sp[d] + 1
         else:
-            cnt = (st[d] - en[d] + (-sp[d]) - 1) // (-sp[d])
-        out_shape[d] = max(cnt, 0)
+            if st[d] > en[d]:
+                if sp[d] < -0x7FFFFFFFFFFFFFFF:
+                    cnt = 1
+                else:
+                    cnt = (st[d] - en[d] - 1) // (-sp[d]) + 1
+        out_shape[d] = cnt
+    var n = numel_of(out_shape)
+    if n < 0:
+        raise Error("slice: tensor shape overflow")
     var out = Tensor.like(data, out_shape.copy())
-    var n = out.numel()
+    if n == 0:
+        return out^
     var dst = strides_of(data.shape)
     var ctr = List[Int](length=r, fill=0)
     for e in range(n):
@@ -534,7 +703,10 @@ def slice(data: Tensor, starts: List[Int], ends: List[Int], axes_in: List[Int], 
 
 
 def expand(x: Tensor, shape: List[Int]) raises -> Tensor:
+    _require_valid_tensor(x, "expand")
     var s = broadcast_shape(x.shape, shape)
+    if numel_of(s) < 0:
+        raise Error("expand: tensor shape overflow")
     var offs = broadcast_offsets(x.shape, s)
     var out = Tensor.like(x, s.copy())
     for e in range(len(offs)):
@@ -543,14 +715,20 @@ def expand(x: Tensor, shape: List[Int]) raises -> Tensor:
 
 
 def tile(x: Tensor, reps: List[Int]) raises -> Tensor:
+    _require_valid_tensor(x, "tile")
     var r = x.rank()
+    if len(reps) != r:
+        raise Error("tile: reps length must match tensor rank")
     var out_shape = List[Int](length=r, fill=0)
     for d in range(r):
-        out_shape[d] = x.shape[d] * reps[d]
+        out_shape[d] = _checked_mul(x.shape[d], reps[d])
+    var out_n = numel_of(out_shape)
+    if out_n < 0:
+        raise Error("tile: tensor shape overflow")
     var out = Tensor.like(x, out_shape.copy())
     var dst = strides_of(x.shape)
     var ctr = List[Int](length=r, fill=0)
-    for e in range(out.numel()):
+    for e in range(out_n):
         var off = 0
         for d in range(r):
             off += (ctr[d] % x.shape[d]) * dst[d]
@@ -566,10 +744,26 @@ def tile(x: Tensor, reps: List[Int]) raises -> Tensor:
 
 
 def range_op(start: Tensor, limit: Tensor, delta: Tensor) raises -> Tensor:
+    _require_valid_tensor(start, "range_op")
+    _require_valid_tensor(limit, "range_op")
+    _require_valid_tensor(delta, "range_op")
+    if start.numel() <= 0 or limit.numel() <= 0 or delta.numel() <= 0:
+        raise Error("range_op: operands must be non-empty")
+    if start.is_float() != limit.is_float() or start.is_float() != delta.is_float():
+        raise Error("range_op: mismatched operand dtypes")
     var s = start.get(0)
     var l = limit.get(0)
     var d = delta.get(0)
-    var n = max(Int(ceil((l - s) / d)), 0)
+    if isnan(s) or isinf(s) or isnan(l) or isinf(l) or isnan(d) or isinf(d):
+        raise Error("range_op: operands must be finite")
+    if d == 0.0:
+        raise Error("range_op: delta must be non-zero")
+    var span = (l - s) / d
+    if isnan(span) or isinf(span):
+        raise Error("range_op: range span overflow")
+    if span > Float64(MAX_RANGE_ELEMS):
+        raise Error("range_op: element count exceeds maximum limit")
+    var n = max(Int(ceil(span)), 0)
     if start.is_float():
         var o = List[Float32](length=n, fill=0.0)
         for k in range(n):
@@ -582,8 +776,14 @@ def range_op(start: Tensor, limit: Tensor, delta: Tensor) raises -> Tensor:
 
 
 def onehot(idx: Tensor, depth: Int, values: Tensor) raises -> Tensor:
+    _require_valid_tensor(idx, "onehot")
+    _require_valid_tensor(values, "onehot")
+    if depth < 0 or values.numel() < 2:
+        raise Error("onehot: invalid depth or values tensor")
     var out_shape = idx.shape.copy()
     out_shape.append(depth)
+    if numel_of(out_shape) < 0:
+        raise Error("onehot: tensor shape overflow")
     var out = Tensor.like(values, out_shape^)
     var n = idx.numel()
     for j in range(n):
@@ -597,7 +797,13 @@ def onehot(idx: Tensor, depth: Int, values: Tensor) raises -> Tensor:
 
 def resize_nearest(x: Tensor, out_shape: List[Int]) raises -> Tensor:
     """Resize with mode=nearest, nearest_mode=floor, coordinate_transformation_mode=asymmetric."""
+    _require_valid_tensor(x, "resize_nearest")
     var r = x.rank()
+    var out_n = numel_of(out_shape)
+    if len(out_shape) != r or out_n < 0:
+        raise Error("resize_nearest: invalid output shape")
+    if x.numel() == 0 and out_n > 0:
+        raise Error("resize_nearest: cannot resize empty input to non-empty output")
     var out = Tensor.like(x, out_shape.copy())
     var dst = strides_of(x.shape)
     var ctr = List[Int](length=r, fill=0)
@@ -621,24 +827,28 @@ def resize_nearest(x: Tensor, out_shape: List[Int]) raises -> Tensor:
 
 # ------------------------------------------------------------------------------- reductions
 
-def _outer_inner(shape: List[Int], axis: Int) -> Tuple[Int, Int, Int]:
+def _outer_inner(shape: List[Int], axis: Int) raises -> Tuple[Int, Int, Int]:
     var outer = 1
     for k in range(axis):
-        outer *= shape[k]
+        outer = _checked_mul(outer, shape[k])
     var inner = 1
     for k in range(axis + 1, len(shape)):
-        inner *= shape[k]
+        inner = _checked_mul(inner, shape[k])
     return (outer, shape[axis], inner)
 
 
 def reduce(x: Tensor, axes_in: List[Int], keepdims: Bool, l2: Bool) raises -> Tensor:
+    _require_valid_tensor(x, "reduce")
     var r = x.rank()
     var red = List[Bool](length=r, fill=False)
     if len(axes_in) == 0:
         for d in range(r):
             red[d] = True
     for a in axes_in:
-        red[norm_axis(a, r)] = True
+        var na = norm_axis(a, r)
+        if na < 0 or na >= r:
+            raise Error("reduce: axis out of range")
+        red[na] = True
     var out_shape = List[Int]()
     var kept = List[Int]()
     for d in range(r):
@@ -649,6 +859,8 @@ def reduce(x: Tensor, axes_in: List[Int], keepdims: Bool, l2: Bool) raises -> Te
             out_shape.append(1)
     var kst = strides_of(kept)
     var nk = numel_of(kept)
+    if nk < 0:
+        raise Error("reduce: tensor shape overflow")
     var acc = List[Float64](length=nk, fill=0.0)
     var ctr = List[Int](length=r, fill=0)
     for e in range(x.numel()):
@@ -677,15 +889,23 @@ def reduce(x: Tensor, axes_in: List[Int], keepdims: Bool, l2: Bool) raises -> Te
 
 
 def argmax(x: Tensor, axis_in: Int, keepdims: Bool) raises -> Tensor:
+    _require_valid_tensor(x, "argmax")
+    if x.rank() == 0:
+        raise Error("argmax: input must have rank >= 1")
     var axis = norm_axis(axis_in, x.rank())
+    if axis < 0 or axis >= x.rank():
+        raise Error("argmax: axis out of range")
     var oi = _outer_inner(x.shape, axis)
+    if oi[1] <= 0:
+        raise Error("argmax: empty axis dimension")
     var out_shape = List[Int]()
     for d in range(x.rank()):
         if d != axis:
             out_shape.append(x.shape[d])
         elif keepdims:
             out_shape.append(1)
-    var o = List[Int](length=oi[0] * oi[2], fill=0)
+    var out_n = _checked_mul(oi[0], oi[2])
+    var o = List[Int](length=out_n, fill=0)
     for a in range(oi[0]):
         for c in range(oi[2]):
             var best = 0
@@ -700,12 +920,22 @@ def argmax(x: Tensor, axis_in: Int, keepdims: Bool) raises -> Tensor:
 
 
 def topk(x: Tensor, k: Int, axis_in: Int, largest: Bool) raises -> List[Tensor]:
+    _require_valid_tensor(x, "topk")
+    if x.rank() == 0:
+        raise Error("topk: input must have rank >= 1")
     var axis = norm_axis(axis_in, x.rank())
+    if axis < 0 or axis >= x.rank():
+        raise Error("topk: axis out of range")
+    if k < 0 or k > x.shape[axis]:
+        raise Error("topk: k out of range")
     var oi = _outer_inner(x.shape, axis)
     var out_shape = x.shape.copy()
     out_shape[axis] = k
+    var out_n = numel_of(out_shape)
+    if out_n < 0:
+        raise Error("topk: tensor shape overflow")
     var vals = Tensor.like(x, out_shape.copy())
-    var inds = Tensor.ints(DT_I64, out_shape.copy(), List[Int](length=numel_of(out_shape), fill=0))
+    var inds = Tensor.ints(DT_I64, out_shape.copy(), List[Int](length=out_n, fill=0))
     var n = oi[1]
     for a in range(oi[0]):
         for c in range(oi[2]):
@@ -734,7 +964,12 @@ def topk(x: Tensor, k: Int, axis_in: Int, largest: Bool) raises -> List[Tensor]:
 
 
 def cumsum(x: Tensor, axis_in: Int, exclusive: Bool, reverse: Bool) raises -> Tensor:
+    _require_valid_tensor(x, "cumsum")
+    if x.rank() == 0:
+        raise Error("cumsum: input must have rank >= 1")
     var axis = norm_axis(axis_in, x.rank())
+    if axis < 0 or axis >= x.rank():
+        raise Error("cumsum: axis out of range")
     var oi = _outer_inner(x.shape, axis)
     var out = Tensor.like(x, x.shape.copy())
     for a in range(oi[0]):
@@ -762,8 +997,17 @@ def cumsum(x: Tensor, axis_in: Int, exclusive: Bool, reverse: Bool) raises -> Te
 
 
 def softmax(x: Tensor, axis_in: Int) raises -> Tensor:
+    _require_valid_tensor(x, "softmax")
+    if x.rank() == 0:
+        raise Error("softmax: input must have rank >= 1")
+    if not x.is_float():
+        raise Error("softmax: input must be float")
     var axis = norm_axis(axis_in, x.rank())
+    if axis < 0 or axis >= x.rank():
+        raise Error("softmax: axis out of range")
     var oi = _outer_inner(x.shape, axis)
+    if oi[1] <= 0:
+        raise Error("softmax: empty axis dimension")
     var out = Tensor.like(x, x.shape.copy())
     for a in range(oi[0]):
         for c in range(oi[2]):
@@ -782,7 +1026,17 @@ def softmax(x: Tensor, axis_in: Int) raises -> Tensor:
 
 
 def layer_norm(x: Tensor, scale: Tensor, bias: Tensor, has_bias: Bool, eps: Float32) raises -> Tensor:
+    _require_valid_tensor(x, "layer_norm")
+    _require_valid_tensor(scale, "layer_norm")
+    if has_bias:
+        _require_valid_tensor(bias, "layer_norm")
+    if not x.is_float() or not scale.is_float() or (has_bias and not bias.is_float()):
+        raise Error("layer_norm: inputs must be float tensors")
+    if x.rank() == 0:
+        raise Error("layer_norm: input must have rank >= 1")
     var n = x.shape[x.rank() - 1]
+    if n <= 0 or scale.numel() < n or (has_bias and bias.numel() < n):
+        raise Error("layer_norm: invalid normalization dimension")
     var rows = x.numel() // n
     var out = Tensor.like(x, x.shape.copy())
     for r in range(rows):
@@ -956,6 +1210,10 @@ def _contiguous(t: Tensor) -> Tensor:
 
 
 def matmul(mut pool: JobPool, a: Tensor, b: Tensor) raises -> Tensor:
+    _require_valid_tensor(a, "matmul")
+    _require_valid_tensor(b, "matmul")
+    if not a.is_float() or not b.is_float():
+        raise Error("MatMul: operands must be float tensors")
     if a.rank() < 2 or b.rank() < 2:
         raise Error("MatMul: rank-1 operands are not supported")
     var ra = a.rank()
@@ -972,13 +1230,17 @@ def matmul(mut pool: JobPool, a: Tensor, b: Tensor) raises -> Tensor:
     for d in range(rb - 2):
         bb.append(b.shape[d])
     var bs = broadcast_shape(ba, bb)
-    var oa = broadcast_offsets(ba, bs)
-    var ob = broadcast_offsets(bb, bs)
     var out_shape = bs.copy()
     out_shape.append(m)
     out_shape.append(n)
-    var out = Tensor.zeros(out_shape^)
     var batches = numel_of(bs)
+    if batches < 0 or numel_of(out_shape) < 0:
+        raise Error("matmul: tensor shape overflow")
+    var out = Tensor.zeros(out_shape^)
+    if batches == 0 or m == 0 or n == 0:
+        return out^
+    var oa = broadcast_offsets(ba, bs)
+    var ob = broadcast_offsets(bb, bs)
     var pa = a.fptr()
     var pb = b.fptr()
     var pc = out.fptr()
@@ -989,28 +1251,57 @@ def matmul(mut pool: JobPool, a: Tensor, b: Tensor) raises -> Tensor:
 
 def gemm(mut pool: JobPool, a: Tensor, b: Tensor, c: Tensor, has_c: Bool, alpha: Float32, beta: Float32,
          trans_a: Bool, trans_b: Bool) raises -> Tensor:
+    _require_valid_tensor(a, "gemm")
+    _require_valid_tensor(b, "gemm")
+    if has_c:
+        _require_valid_tensor(c, "gemm")
+    if not a.is_float() or not b.is_float() or (has_c and not c.is_float()):
+        raise Error("Gemm: operands must be float tensors")
+    if a.rank() != 2 or b.rank() != 2:
+        raise Error("Gemm: inputs must be 2-D")
     if trans_a or alpha != 1 or (has_c and beta != 1):
         raise Error("Gemm: only alpha=beta=1 without transA is supported")
     var m = a.shape[0]
     var k = a.shape[1]
+    var bk = b.shape[1] if trans_b else b.shape[0]
     var n = b.shape[0] if trans_b else b.shape[1]
+    if bk != k:
+        raise Error("Gemm: inner dims " + shape_str(a.shape) + " x " + shape_str(b.shape))
+    var out_n = numel_of([m, n])
+    if out_n < 0:
+        raise Error("Gemm: tensor shape overflow")
+    if has_c:
+        if c.rank() > 2:
+            raise Error("Gemm: bias C must have rank <= 2")
+        if c.rank() == 1 and c.shape[0] != n and c.shape[0] != 1:
+            raise Error("Gemm: incompatible bias C shape " + shape_str(c.shape))
+        if c.rank() == 2 and ((c.shape[0] != m and c.shape[0] != 1) or (c.shape[1] != n and c.shape[1] != 1)):
+            raise Error("Gemm: incompatible bias C shape " + shape_str(c.shape))
     var out = Tensor.zeros([m, n])
+    if out_n == 0:
+        return out^
     var bias = 0
     var cfull = Tensor()
     if has_c:
-        if c.numel() == n:
+        if (c.rank() == 1 and c.shape[0] == n) or (c.rank() == 2 and c.shape[0] == 1 and c.shape[1] == n):
             bias = c.fptr()
         else:
             cfull = expand(c, [m, n])
     matmul_2d(pool, a.fptr(), b.fptr(), out.fptr(), bias, m, k, n, trans_b)
     if has_c and bias == 0:
-        for e in range(m * n):
+        for e in range(out_n):
             out.f[e] += cfull.f[e]
     return out^
 
 
 def conv1d(mut pool: JobPool, x: Tensor, w: Tensor, b: Tensor, has_b: Bool, pad0: Int, pad1: Int, dil: Int,
            stride: Int, group: Int) raises -> Tensor:
+    _require_valid_tensor(x, "conv1d")
+    _require_valid_tensor(w, "conv1d")
+    if has_b:
+        _require_valid_tensor(b, "conv1d")
+    if not x.is_float() or not w.is_float() or (has_b and not b.is_float()):
+        raise Error("Conv: operands must be float tensors")
     if x.rank() != 3 or w.rank() != 3 or group != 1 or stride != 1:
         raise Error("Conv: only 1-D, group 1, stride 1 is supported")
     var batch = x.shape[0]
@@ -1018,11 +1309,27 @@ def conv1d(mut pool: JobPool, x: Tensor, w: Tensor, b: Tensor, has_b: Bool, pad0
     var t_in = x.shape[2]
     var cout = w.shape[0]
     var kw = w.shape[2]
-    var t_out = t_in + pad0 + pad1 - dil * (kw - 1)
-    var j = cin * kw
+    if w.shape[1] != cin:
+        raise Error("Conv: weight input channels mismatch")
+    if pad0 < 0 or pad1 < 0 or dil < 1 or kw < 1:
+        raise Error("Conv: invalid padding, dilation, or kernel size")
+    if has_b and (b.rank() != 1 or b.shape[0] != cout):
+        raise Error("Conv: bias must be 1-D with length cout")
+    var padded_t = _checked_add(_checked_add(t_in, pad0), pad1)
+    var span_k = _checked_mul(dil, kw - 1)
+    var t_out = padded_t - span_k
+    var out_n = numel_of([batch, cout, t_out])
+    if t_out < 0 or out_n < 0:
+        raise Error("Conv: invalid output shape")
+    var j = _checked_mul(cin, kw)
+    var col_n = _checked_mul(t_out, j)
+    var tmp_n = _checked_mul(t_out, cout)
     var out = Tensor.zeros([batch, cout, t_out])
+    if out_n == 0:
+        return out^
+    var bias_ptr = b.fptr() if has_b else 0
     # im2col^T: col[t, ci*kw + kk] so each output row is a dot product with W[co, :]
-    var col = List[Float32](length=t_out * j, fill=0.0)
+    var col = List[Float32](length=col_n, fill=0.0)
     for bi in range(batch):
         for t in range(t_out):
             for ci in range(cin):
@@ -1033,8 +1340,8 @@ def conv1d(mut pool: JobPool, x: Tensor, w: Tensor, b: Tensor, has_b: Bool, pad0
                     else:
                         col[t * j + ci * kw + kk] = 0
         # out^T[t, co] = col[t, :] . W[co, :]
-        var tmp = List[Float32](length=t_out * cout, fill=0.0)
-        matmul_2d(pool, Int(col.unsafe_ptr()), w.fptr(), Int(tmp.unsafe_ptr()), b.fptr() if has_b else 0,
+        var tmp = List[Float32](length=tmp_n, fill=0.0)
+        matmul_2d(pool, Int(col.unsafe_ptr()), w.fptr(), Int(tmp.unsafe_ptr()), bias_ptr,
                   t_out, j, cout, True)
         for co in range(cout):
             for t in range(t_out):

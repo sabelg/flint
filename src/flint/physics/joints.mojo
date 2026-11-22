@@ -266,6 +266,8 @@ struct Joint(Copyable, ImplicitlyCopyable, Movable):
             j.lower_impulse = input.f32()
             j.upper_impulse = input.f32()
             j.swing_impulse = input.f32()
+        if input.failed:
+            raise Error("solver blob: truncated Joint")
         if j.kind < JOINT_WELD or j.kind > JOINT_SWING_TWIST:
             raise Error("solver blob: joint " + String(j.id) + " has unknown kind " + String(j.kind))
         return j

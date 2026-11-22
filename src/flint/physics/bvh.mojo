@@ -529,8 +529,9 @@ struct Bvh8MeshCollider(Copyable, Movable):
     @staticmethod
     def build(vertices: List[Vec3], indices: List[Int32], material_ids: List[UInt16] = List[UInt16]()) -> Self:
         var col = Self()
+        var n_verts = len(vertices)
         var tri_count = len(indices) // 3
-        if tri_count <= 0:
+        if tri_count <= 0 or n_verts <= 0:
             return col^
 
         col.triangles.reserve(tri_count)
@@ -538,12 +539,16 @@ struct Bvh8MeshCollider(Copyable, Movable):
             var i0 = Int(indices[i * 3])
             var i1 = Int(indices[i * 3 + 1])
             var i2 = Int(indices[i * 3 + 2])
+            if i0 < 0 or i1 < 0 or i2 < 0 or i0 >= n_verts or i1 >= n_verts or i2 >= n_verts:
+                continue
             var v0 = vertices[i0]
             var v1 = vertices[i1]
             var v2 = vertices[i2]
             var mat_id: UInt16 = material_ids[i] if i < len(material_ids) else 0
             col.triangles.append(MeshTriangle(v0, v1, v2, mat_id))
 
+        if len(col.triangles) == 0:
+            return col^
         col.smooth_active_edges()
         col.build_tree()
         return col^
@@ -664,6 +669,11 @@ struct Bvh8MeshCollider(Copyable, Movable):
         var idy = F8(_safe_inv_dir(dir.y))
         var idz = F8(_safe_inv_dir(dir.z))
 
+        var n_nodes = len(self.nodes)
+        var n_tris = len(self.triangles)
+        if self.root_node < 0 or self.root_node >= n_nodes:
+            return hit^
+
         var stack_node = Array[Int32, 96](fill=0)
         var stack_t = Array[Float32, 96](fill=0.0)
         var sp = 1
@@ -672,12 +682,18 @@ struct Bvh8MeshCollider(Copyable, Movable):
 
         var child_buf_idx = Array[Int32, BVH8_CHILDREN](fill=0)
         var child_buf_t = Array[Float32, BVH8_CHILDREN](fill=0.0)
+        var steps = 0
+        var max_steps = n_nodes * 4 + 16
 
-        while sp > 0:
+        while sp > 0 and steps < max_steps:
+            steps += 1
             sp -= 1
             if stack_t[sp] >= hit.t:
                 continue
-            ref node = self.nodes[Int(stack_node[sp])]
+            var cur_idx = Int(stack_node[sp])
+            if cur_idx < 0 or cur_idx >= n_nodes:
+                continue
+            ref node = self.nodes[cur_idx]
 
             var tx1 = (node.min_x - ox) * idx
             var tx2 = (node.max_x - ox) * idx
@@ -706,16 +722,17 @@ struct Bvh8MeshCollider(Copyable, Movable):
                     var c_cnt = Int(node.child_counts[c])
                     if c_cnt > 0:
                         var leaf_first = -c_idx - 1
-                        for ti in range(leaf_first, leaf_first + c_cnt):
-                            var res = self.triangles[ti].ray_intersect(origin, dir, hit.t)
-                            if res[0] and res[1] < hit.t:
-                                hit.hit = True
-                                hit.t = res[1]
-                                hit.point = origin + dir * res[1]
-                                hit.normal = res[2]
-                                hit.triangle_index = ti
-                                hit.material_id = self.triangles[ti].material_id
-                    elif c_idx > 0:
+                        if leaf_first >= 0 and leaf_first <= n_tris and c_cnt <= n_tris - leaf_first:
+                            for ti in range(leaf_first, leaf_first + c_cnt):
+                                var res = self.triangles[ti].ray_intersect(origin, dir, hit.t)
+                                if res[0] and res[1] < hit.t:
+                                    hit.hit = True
+                                    hit.t = res[1]
+                                    hit.point = origin + dir * res[1]
+                                    hit.normal = res[2]
+                                    hit.triangle_index = ti
+                                    hit.material_id = self.triangles[ti].material_id
+                    elif c_idx > 0 and c_idx < n_nodes:
                         var te = t_enter[c]
                         if te < hit.t:
                             child_buf_idx[internal_count] = Int32(c_idx)
@@ -942,6 +959,11 @@ struct Bvh8MeshCollider(Copyable, Movable):
         var idz = F8(_safe_inv_dir(ndir.z))
         var tie_slack = Float32(1.0e-3) * max(Float32(1.0), dir_len)
 
+        var n_nodes = len(self.nodes)
+        var n_tris = len(self.triangles)
+        if self.root_node < 0 or self.root_node >= n_nodes:
+            return hit^
+
         var stack_node = Array[Int32, 96](fill=0)
         var stack_dist = Array[Float32, 96](fill=0.0)
         var sp = 1
@@ -951,14 +973,20 @@ struct Bvh8MeshCollider(Copyable, Movable):
         var child_buf_idx = Array[Int32, BVH8_CHILDREN](fill=0)
         var child_buf_d = Array[Float32, BVH8_CHILDREN](fill=0.0)
         var hit_smoothed = False
+        var steps = 0
+        var max_steps = n_nodes * 4 + 16
 
-        while sp > 0:
+        while sp > 0 and steps < max_steps:
+            steps += 1
             sp -= 1
             var limit_dist = min(max_dist, hit.toi * dir_len) + tie_slack
             if stack_dist[sp] > limit_dist:
                 continue
 
-            ref node = self.nodes[Int(stack_node[sp])]
+            var cur_idx = Int(stack_node[sp])
+            if cur_idx < 0 or cur_idx >= n_nodes:
+                continue
+            ref node = self.nodes[cur_idx]
             var tx1 = ((node.min_x - r_f8) - ox) * idx
             var tx2 = ((node.max_x + r_f8) - ox) * idx
             var tmin = min(tx1, tx2)
@@ -986,10 +1014,11 @@ struct Bvh8MeshCollider(Copyable, Movable):
                     var c_cnt = Int(node.child_counts[c])
                     if c_cnt > 0:
                         var leaf_first = -c_idx - 1
-                        var cur_max_d = min(max_dist, hit.toi * dir_len + tie_slack)
-                        for ti in range(leaf_first, leaf_first + c_cnt):
-                            self._sweep_sphere_tri(ti, start, ndir, dir_len, cur_max_d, radius, r2, hit, hit_smoothed)
-                    elif c_idx > 0:
+                        if leaf_first >= 0 and leaf_first <= n_tris and c_cnt <= n_tris - leaf_first:
+                            var cur_max_d = min(max_dist, hit.toi * dir_len + tie_slack)
+                            for ti in range(leaf_first, leaf_first + c_cnt):
+                                self._sweep_sphere_tri(ti, start, ndir, dir_len, cur_max_d, radius, r2, hit, hit_smoothed)
+                    elif c_idx > 0 and c_idx < n_nodes:
                         var te = t_enter[c]
                         if te <= min(max_dist, hit.toi * dir_len) + tie_slack:
                             child_buf_idx[internal_count] = Int32(c_idx)
@@ -1052,17 +1081,25 @@ struct Bvh8MeshCollider(Copyable, Movable):
 
     def _query_aabb_triangles(self, lo: Vec3, hi: Vec3, mut out_tris: List[Int]):
         """Collects triangle indices whose AABBs overlap `[lo, hi]` using 8-wide SIMD traversal."""
-        if len(self.nodes) == 0 or self.root_node < 0:
+        var n_nodes = len(self.nodes)
+        var n_tris = len(self.triangles)
+        if n_nodes == 0 or self.root_node < 0 or self.root_node >= n_nodes:
             return
         var qlo_x = F8(lo.x); var qlo_y = F8(lo.y); var qlo_z = F8(lo.z)
         var qhi_x = F8(hi.x); var qhi_y = F8(hi.y); var qhi_z = F8(hi.z)
         var stack = Array[Int32, 96](fill=0)
         var sp = 1
         stack[0] = Int32(self.root_node)
+        var steps = 0
+        var max_steps = n_nodes * 4 + 16
 
-        while sp > 0:
+        while sp > 0 and steps < max_steps:
+            steps += 1
             sp -= 1
-            ref node = self.nodes[Int(stack[sp])]
+            var cur_idx = Int(stack[sp])
+            if cur_idx < 0 or cur_idx >= n_nodes:
+                continue
+            ref node = self.nodes[cur_idx]
             var ov = (
                 qlo_x.le(node.max_x)
                 & qhi_x.ge(node.min_x)
@@ -1079,9 +1116,10 @@ struct Bvh8MeshCollider(Copyable, Movable):
                     var c_cnt = Int(node.child_counts[c])
                     if c_cnt > 0:
                         var first = -c_idx - 1
-                        for ti in range(first, first + c_cnt):
-                            out_tris.append(ti)
-                    elif c_idx > 0 and sp < 96:
+                        if first >= 0 and first <= n_tris and c_cnt <= n_tris - first:
+                            for ti in range(first, first + c_cnt):
+                                out_tris.append(ti)
+                    elif c_idx > 0 and c_idx < n_nodes and sp < 96:
                         stack[sp] = Int32(c_idx)
                         sp += 1
 

@@ -43,7 +43,7 @@ from flint.ecs import (
 from flint.input.input_map import ACTION_BOOL, InputContext, InputMap
 from flint.input.plugin import InputPlugin, InputStateResource
 from flint.platform.kms import on_virtual_console
-from flint.platform.os import env_flag, env_value, get_time, make_dirs
+from flint.platform.os import env_flag, env_value, get_time, make_dirs, parent_directory
 from flint.render.material_graph import MaterialAsset
 from flint.render.plugin import (
     CameraComponent,
@@ -90,6 +90,7 @@ struct SparkSimCtx(Copyable, ImplicitlyCopyable, Movable):
 struct SparkAppState(Resource, Movable):
     comptime RESOURCE_ID: UInt64 = comp_hash64("flint.examples.minimal_spark.SparkAppState")
     var headless_shots: Bool
+    var shot_out_path: String
     var sim_time: Float32
     var yaw: Float32
     var pitch: Float32
@@ -101,8 +102,9 @@ struct SparkAppState(Resource, Movable):
     var last_render_us: Int
     var overlays: FlintDevOverlays
 
-    def __init__(out self, headless_shots: Bool):
+    def __init__(out self, headless_shots: Bool, shot_out_path: String = "build/shots/flint_spark.png"):
         self.headless_shots = headless_shots
+        self.shot_out_path = shot_out_path
         self.sim_time = Float32(0.0)
         self.yaw = Float32(0.68)
         self.pitch = Float32(0.36)
@@ -387,15 +389,17 @@ def _sys_spark_present_or_shot(
 
     if state.headless_shots:
         if not state.shot_written:
-            _ = make_dirs("build/shots")
+            var pdir = parent_directory(state.shot_out_path)
+            if pdir.byte_length() > 0 and pdir != ".":
+                _ = make_dirs(pdir)
             _ = write_png(
-                "build/shots/flint_spark.png",
+                state.shot_out_path,
                 renderer.cpu_canvas.pixels,
                 renderer.width,
                 renderer.height,
             )
             state.shot_written = True
-            print("[Flint] Wrote headless showcase frame -> build/shots/flint_spark.png")
+            print("[Flint] Wrote headless showcase frame -> " + state.shot_out_path)
     else:
         var win_opt = resources.get_ptr_mut[WindowStateResource]()
         if win_opt:
@@ -578,9 +582,25 @@ def _populate_spark_scene(mut app: EngineApp, headless_shots: Bool):
 
 def main():
     var headless_shots = False
-    for i in range(1, len(argv())):
-        if String(argv()[i]) == "--shots":
+    var headless_smoke = False
+    var out_png = String("")
+    var args = argv()
+    var ai = 1
+    while ai < len(args):
+        var a = String(args[ai])
+        if a == "--shots":
             headless_shots = True
+        elif a == "--headless-smoke":
+            headless_smoke = True
+        elif a == "--out" and ai + 1 < len(args):
+            out_png = String(args[ai + 1])
+            ai += 1
+        ai += 1
+
+    var is_headless_run = headless_shots or headless_smoke
+    var target_png = out_png
+    if target_png.byte_length() == 0:
+        target_png = "/tmp/flint_spark_smoke.png" if (headless_smoke and not headless_shots) else "build/shots/flint_spark.png"
 
     var no_display = (
         env_flag("FLINT_HEADLESS")
@@ -591,7 +611,7 @@ def main():
             and not on_virtual_console()
         )
     )
-    var effective_headless = headless_shots or no_display
+    var effective_headless = is_headless_run or no_display
 
     var cfg = AppConfig(
         title="Flint v5 Minimal Spark",
@@ -607,7 +627,7 @@ def main():
 
     _ = app.register_component[SparkOrbitComponent]()
     _ = app.register_component[CrystalSatComponent]()
-    app.insert_resource[SparkAppState](SparkAppState(headless_shots))
+    app.insert_resource[SparkAppState](SparkAppState(is_headless_run, target_png))
 
     _ = app.add_system(STAGE_PRE_UPDATE, "spark.pre_resize", _sys_spark_pre_resize, exclusive=True)
     _ = app.add_system(STAGE_UPDATE, "spark.update", _sys_spark_update, exclusive=True)
@@ -615,9 +635,9 @@ def main():
 
     _setup_spark_input(app)
     _setup_spark_audio(app)
-    _populate_spark_scene(app, headless_shots)
+    _populate_spark_scene(app, is_headless_run)
 
-    if headless_shots:
+    if is_headless_run:
         app.run(max_frames=1)
         return
 

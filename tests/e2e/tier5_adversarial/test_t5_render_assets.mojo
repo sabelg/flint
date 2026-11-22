@@ -10,6 +10,7 @@ from std.math import abs
 from std.memory import bitcast
 from flint.assets.bc_compress import (
     compute_argb_psnr_db,
+    decode_bc5_normals,
     decode_bc6h_hdr,
     decode_bc7_rgba,
     encode_bc6h_hdr,
@@ -375,6 +376,19 @@ def test_t5_qem_preserves_extensions_and_bc_non4x4(mut ctx: TestContext) raises:
         if (i % 4) < 2: hdr[i] = Vec3(500.0, 1200.0, 50.0)
     var dec6 = decode_bc6h_hdr(encode_bc6h_hdr(hdr, w, h, partitioned=True), w, h)
     ctx.assert_equal(len(dec6), w * h, "BC6H 7x5 decoded count matches")
+
+    # Malformed / truncated / zero-dim / extreme-dim BCn buffers must return empty List cleanly
+    var short_buf = List[UInt8](length=15, fill=0)
+    ctx.assert_equal(len(decode_bc7_rgba(List[UInt8](), 4096, 4096)), 0, "BC7 empty buffer 4096x4096 returns empty")
+    ctx.assert_equal(len(decode_bc7_rgba(short_buf, 4, 4)), 0, "BC7 15-byte truncated buffer returns empty")
+    ctx.assert_equal(len(decode_bc7_rgba(bc7, 0, 4)), 0, "BC7 width=0 returns empty")
+    ctx.assert_equal(len(decode_bc7_rgba(bc7, 4, -1)), 0, "BC7 height<0 returns empty")
+    ctx.assert_equal(len(decode_bc5_normals(List[UInt8](), 64, 64)), 0, "BC5 empty buffer returns empty")
+    ctx.assert_equal(len(decode_bc5_normals(short_buf, 4, 4)), 0, "BC5 15-byte truncated buffer returns empty")
+    ctx.assert_equal(len(decode_bc5_normals(short_buf, 0, 0)), 0, "BC5 zero dims returns empty")
+    ctx.assert_equal(len(decode_bc6h_hdr(List[UInt8](), 64, 64)), 0, "BC6H empty buffer returns empty")
+    ctx.assert_equal(len(decode_bc6h_hdr(short_buf, 4, 4)), 0, "BC6H 15-byte truncated buffer returns empty")
+    ctx.assert_equal(len(decode_bc6h_hdr(bc7, 16384, 16384)), 0, "BC6H 16Kx16K pixel cap returns empty")
 
 
 def test_t5_ui_overlay_shader_and_glyph_render(mut ctx: TestContext) raises:

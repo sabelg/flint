@@ -75,6 +75,17 @@ comptime RAGDOLL_SM_GETUP_PRONE: Int = 4
 # 1. Binary `.flanim` (`FLAN` FourCC) Serializer & Loader
 # =========================================================================
 
+comptime FLANIM_MAX_LIST_LEN: Int = 65536
+
+
+def _checked_flanim_count(mut r: BlobReader, elem_bytes: Int, label: StaticString) raises -> Int:
+    var n = Int(r.u32())
+    var rem = max(0, r.limit() - r.offset)
+    if r.failed or n < 0 or n > FLANIM_MAX_LIST_LEN or n > rem // elem_bytes:
+        raise Error("corrupted .flanim " + String(label) + " count")
+    return n
+
+
 def _write_conditions(conds: List[Condition], mut w: BlobWriter):
     w.u32(UInt32(len(conds)))
     for i in range(len(conds)):
@@ -83,13 +94,15 @@ def _write_conditions(conds: List[Condition], mut w: BlobWriter):
         w.f32(conds[i].value)
 
 
-def _read_conditions(mut r: BlobReader) -> List[Condition]:
-    var n = Int(r.u32())
-    var out = List[Condition](capacity=max(0, n))
+def _read_conditions(mut r: BlobReader) raises -> List[Condition]:
+    var n = _checked_flanim_count(r, 20, "condition")
+    var out = List[Condition](capacity=n)
     for _ in range(n):
         var param = r.integer()
         var op = r.integer()
         var val = r.f32()
+        if r.failed:
+            raise Error("corrupted .flanim condition entry")
         out.append(Condition(param, op, val))
     return out^
 
@@ -227,25 +240,35 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
     var out = AnimGraphDef()
     out.name = r.text()
     out.default_blend = r.f32()
+    if r.failed:
+        raise Error("corrupted .flanim header")
 
-    var n_params = Int(r.u32())
+    var n_params = _checked_flanim_count(r, 4, "param")
     for _ in range(n_params):
         out.params.append(r.text())
+        if r.failed:
+            raise Error("corrupted .flanim param")
 
-    var n_masks = Int(r.u32())
+    var n_masks = _checked_flanim_count(r, 13, "mask")
     for _ in range(n_masks):
         var m = MaskDef()
         m.name = r.text()
         m.children = r.boolean()
-        var nb = Int(r.u32())
+        if r.failed:
+            raise Error("corrupted .flanim mask")
+        var nb = _checked_flanim_count(r, 4, "mask bone")
         for _ in range(nb):
             m.bones.append(r.text())
-        var nw = Int(r.u32())
+            if r.failed:
+                raise Error("corrupted .flanim mask bone")
+        var nw = _checked_flanim_count(r, 4, "mask weight")
         for _ in range(nw):
             m.weights.append(r.f32())
+            if r.failed:
+                raise Error("corrupted .flanim mask weight")
         out.masks.append(m^)
 
-    var n_bs = Int(r.u32())
+    var n_bs = _checked_flanim_count(r, 26, "blend_space")
     for _ in range(n_bs):
         var bs = BlendSpaceDef()
         bs.name = r.text()
@@ -254,14 +277,18 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
         bs.ground_rate = r.boolean()
         bs.min_rate = r.f32()
         bs.max_rate = r.f32()
-        var ns = Int(r.u32())
+        if r.failed:
+            raise Error("corrupted .flanim blend_space")
+        var ns = _checked_flanim_count(r, 12, "blend_space sample")
         for _ in range(ns):
             var clip = r.integer()
             var at = r.f32()
+            if r.failed:
+                raise Error("corrupted .flanim blend_space sample")
             bs.samples.append(BlendSampleDef(clip, at))
         out.blend_spaces.append(bs^)
 
-    var n_bs2 = Int(r.u32())
+    var n_bs2 = _checked_flanim_count(r, 35, "blend_space_2d")
     for _ in range(n_bs2):
         var bs2 = BlendSpace2DDef()
         bs2.name = r.text()
@@ -272,15 +299,19 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
         bs2.ground_rate = r.boolean()
         bs2.min_rate = r.f32()
         bs2.max_rate = r.f32()
-        var ns = Int(r.u32())
+        if r.failed:
+            raise Error("corrupted .flanim blend_space_2d")
+        var ns = _checked_flanim_count(r, 16, "blend_space_2d sample")
         for _ in range(ns):
             var clip = r.integer()
             var sx = r.f32()
             var sy = r.f32()
+            if r.failed:
+                raise Error("corrupted .flanim blend_space_2d sample")
             bs2.samples.append(BlendSample2DDef(clip, sx, sy))
         out.blend_spaces_2d.append(bs2^)
 
-    var n_states = Int(r.u32())
+    var n_states = _checked_flanim_count(r, 78, "state")
     for _ in range(n_states):
         var st = StateDef()
         st.name = r.text()
@@ -295,11 +326,13 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
         st.root_motion = r.integer()
         st.warp = r.integer()
         st.reset_time = r.boolean()
+        if r.failed:
+            raise Error("corrupted .flanim state")
         st.when = _read_conditions(r)
         st.hold_while = _read_conditions(r)
         out.states.append(st^)
 
-    var n_layers = Int(r.u32())
+    var n_layers = _checked_flanim_count(r, 54, "layer")
     for _ in range(n_layers):
         var ly = LayerDef()
         ly.name = r.text()
@@ -312,25 +345,33 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
         ly.weight_param = r.integer()
         ly.rate = r.f32()
         ly.loop = r.boolean()
+        if r.failed:
+            raise Error("corrupted .flanim layer")
         ly.when = _read_conditions(r)
-        var no = Int(r.u32())
+        var no = _checked_flanim_count(r, 8, "layer over")
         for _ in range(no):
             ly.over.append(r.integer())
+            if r.failed:
+                raise Error("corrupted .flanim layer over")
         out.layers.append(ly^)
 
-    var n_trans = Int(r.u32())
+    var n_trans = _checked_flanim_count(r, 20, "transition")
     for _ in range(n_trans):
         var src = r.integer()
         var dst = r.integer()
         var bl = r.f32()
+        if r.failed:
+            raise Error("corrupted .flanim transition")
         out.transitions.append(TransitionDef(src, dst, bl))
 
-    var n_set = Int(r.u32())
+    var n_set = _checked_flanim_count(r, 8, "setting")
     for _ in range(n_set):
         out.setting_names.append(r.text())
         out.setting_values.append(r.f32())
+        if r.failed:
+            raise Error("corrupted .flanim setting")
 
-    var n_forms = Int(r.u32())
+    var n_forms = _checked_flanim_count(r, 24, "form")
     for _ in range(n_forms):
         var fm = FormOffsetDef()
         fm.name = r.text()
@@ -338,10 +379,14 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
         fm.stride = r.f32()
         fm.hand_plant = r.f32()
         fm.half_length = r.f32()
-        var nb = Int(r.u32())
+        if r.failed:
+            raise Error("corrupted .flanim form")
+        var nb = _checked_flanim_count(r, 8, "form bone")
         for _ in range(nb):
             fm.bones.append(r.text())
             fm.bone_scales.append(r.f32())
+            if r.failed:
+                raise Error("corrupted .flanim form bone")
         out.forms.append(fm^)
 
     r.leave()

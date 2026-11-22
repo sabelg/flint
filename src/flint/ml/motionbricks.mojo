@@ -308,6 +308,8 @@ def load_bvh(path: String, fold_root: Bool = True) raises -> MbClip:
     if len(data) == 0:
         raise Error("BVH: cannot read " + path)
     var tok = _tokens(String(unsafe_from_utf8=data))
+    if len(tok) == 0:
+        raise Error("BVH: empty file " + path)
     var clip = MbClip()
     var channels = List[List[Int]]()   # per joint: channel codes 0..2 position xyz, 3..5 rotation xyz
     var stack = List[Int]()
@@ -319,6 +321,8 @@ def load_bvh(path: String, fold_root: Bool = True) raises -> MbClip:
             i += 1
             break
         if t == "ROOT" or t == "JOINT":
+            if i + 1 >= len(tok):
+                raise Error("BVH: unexpected EOF after " + t)
             var name = tok[i + 1]
             var parts = name.split(":")
             clip.skeleton.names.append(String(parts[len(parts) - 1]))
@@ -328,16 +332,28 @@ def load_bvh(path: String, fold_root: Bool = True) raises -> MbClip:
             stack.append(len(clip.skeleton.names) - 1)
             i += 2
         elif t == "End":
+            if i + 1 >= len(tok):
+                raise Error("BVH: unexpected EOF after End")
             in_end = True
             i += 2
         elif t == "OFFSET":
+            if i + 3 >= len(tok):
+                raise Error("BVH: unexpected EOF in OFFSET")
             if not in_end:
+                if len(stack) == 0:
+                    raise Error("BVH: OFFSET outside joint block")
                 var j = stack[len(stack) - 1]
                 clip.skeleton.reference[j].p = MbVec3(
                     Float32(atof(tok[i + 1])) * 0.01, Float32(atof(tok[i + 2])) * 0.01, Float32(atof(tok[i + 3])) * 0.01)
             i += 4
         elif t == "CHANNELS":
+            if i + 1 >= len(tok):
+                raise Error("BVH: unexpected EOF after CHANNELS")
+            if len(stack) == 0:
+                raise Error("BVH: CHANNELS outside joint block")
             var n = Int(atol(tok[i + 1]))
+            if n < 0 or i + 1 + n >= len(tok):
+                raise Error("BVH: truncated CHANNELS list")
             var j = stack[len(stack) - 1]
             for c in range(n):
                 var ch = tok[i + 2 + c].lower()
@@ -348,17 +364,27 @@ def load_bvh(path: String, fold_root: Bool = True) raises -> MbClip:
             if in_end:
                 in_end = False
             else:
+                if len(stack) == 0:
+                    raise Error("BVH: unmatched '}'")
                 _ = stack.pop()
             i += 1
         else:
             i += 1
+    if len(stack) != 0:
+        raise Error("BVH: unclosed joint block")
     var frames = 0
     while i < len(tok):
         if tok[i] == "Frames:":
+            if i + 1 >= len(tok):
+                raise Error("BVH: unexpected EOF after Frames:")
             frames = Int(atol(tok[i + 1]))
+            if frames < 0:
+                raise Error("BVH: negative frame count")
             i += 2
         elif tok[i] == "Frame" and i + 2 < len(tok) and tok[i + 1] == "Time:":
             var ft = atof(tok[i + 2])
+            if ft <= 0.0:
+                raise Error("BVH: invalid Frame Time")
             clip.sample_rate = Float32(Int(1.0 / ft * 100.0 + 0.5)) / 100.0
             i += 3
             break
@@ -368,7 +394,13 @@ def load_bvh(path: String, fold_root: Bool = True) raises -> MbClip:
     var per_frame = 0
     for j in range(nj):
         per_frame += len(channels[j])
-    if len(tok) - i < frames * per_frame:
+    var rem_tok = len(tok) - i
+    if (
+        frames < 0
+        or rem_tok < 0
+        or (per_frame > 0 and frames > rem_tok // per_frame)
+        or (per_frame == 0 and frames > 1_000_000)
+    ):
         raise Error("BVH: " + path + " has fewer motion values than its header says")
     for _ in range(frames):
         var pose = List[MbXform](capacity=nj)

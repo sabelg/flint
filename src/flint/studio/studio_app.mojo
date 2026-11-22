@@ -17,6 +17,8 @@ Implements:
      Procedural Forge bake-to-`.glb`, and docked AAA Studio Editor UI (`emit_studio_ui_draw_list`)
      with collapsible indented hierarchy tree & drag-and-drop reparenting.
 """
+from flint.studio.source_editor import EmbeddedIde
+from flint.studio import scene_menu
 from std.collections import Dict
 from std.math import abs, asin, cos, max, min, sin, sqrt
 from flint.anim.flanim_ecs import SteppedAnimClock, compute_volume_preserving_smear_scale
@@ -793,6 +795,7 @@ def _create_studio_input_map() -> InputMap:
     _ = imap.register_action("gizmo_scale", ACTION_BOOL)
     _ = imap.register_action("editor_undo", ACTION_BOOL)
     _ = imap.register_action("editor_redo", ACTION_BOOL)
+    _ = imap.register_action("source_editor", ACTION_BOOL)
     _ = imap.register_action("editor_save", ACTION_BOOL)
     _ = imap.register_action("editor_load", ACTION_BOOL)
     _ = imap.register_action("editor_duplicate", ACTION_BOOL)
@@ -807,6 +810,7 @@ def _create_studio_input_map() -> InputMap:
     ctx.bind_key("gizmo_scale", 82)                      # R
     ctx.bind_key("editor_undo", 90, modifiers=MOD_CTRL)  # Ctrl+Z
     ctx.bind_key("editor_redo", 89, modifiers=MOD_CTRL)  # Ctrl+Y
+    ctx.bind_key("source_editor", 297)                    # F8
     ctx.bind_key("editor_save", 83, modifiers=MOD_CTRL)  # Ctrl+S
     ctx.bind_key("editor_load", 79, modifiers=MOD_CTRL)  # Ctrl+O
     ctx.bind_key("editor_duplicate", 68, modifiers=MOD_CTRL)  # Ctrl+D
@@ -891,6 +895,8 @@ struct FlintStudioState(Movable):
     var input_map: InputMap
     var cam_target: Vec3
     var ui_edit_seq: UInt64
+    var menu: scene_menu.SceneMenu
+    var source_editor: EmbeddedIde
     var scene_file_path: String
     var asset_browser_dir: String
     var asset_browser_pack: String
@@ -977,6 +983,8 @@ struct FlintStudioState(Movable):
         self.input_map = _create_studio_input_map()
         self.cam_target = Vec3(0.0, 0.9, 1.0)
         self.ui_edit_seq = UInt64(50000)
+        self.source_editor = EmbeddedIde()
+        self.menu = scene_menu.SceneMenu()
         self.scene_file_path = "build/studio_scene.flscn"
         self.asset_browser_dir = ""
         self.asset_browser_pack = ""
@@ -995,6 +1003,8 @@ struct FlintStudioState(Movable):
             fix_init.value()[unsafe_offset=0].overstep_alpha = Float32(1.0)
 
     def shutdown(mut self):
+        self.menu.close()
+        self.source_editor.close()
         self.app.shutdown()
 
     # ---- Entity Resolution & Sync Helpers ----
@@ -1545,12 +1555,71 @@ struct FlintStudioState(Movable):
 
     # ---- Editor Input ----
 
+    def handle_command_menu(mut self, inp: InputState, width: Int, height: Int) -> Bool:
+        self.menu.poll()
+        self.dock.solve_layout(RectF(0,0,Float32(width),Float32(height)))
+        var panel = self.dock.find_panel("Toolbar")
+        if panel[0]<0 or not panel[2]:
+            self.menu.bar.group = -1
+            return False
+        ref bar = self.menu.bar
+        bar.x = Int(panel[3].x)+4
+        bar.y = Int(panel[3].y)
+        bar.height = min(30,max(1,Int(panel[3].h)))
+        bar.screen_w = width
+        bar.screen_h = height
+        bar.groups[1].items[0].enabled = Bool(self.undo_stack)
+        bar.groups[1].items[1].enabled = Bool(self.redo_stack)
+        bar.groups[2].items[3].title = "Disable grid snapping" if self.snap_enabled else "Enable grid snapping"
+        bar.groups[3].items[0].title = "Resume simulation" if self.pie.mode==PIE_PAUSED else "Play scene"
+        bar.groups[3].items[0].enabled = self.pie.mode!=PIE_PLAYING
+        bar.groups[3].items[1].enabled = self.pie.mode==PIE_PLAYING
+        bar.groups[3].items[2].enabled = self.pie.mode!=PIE_STOPPED
+        bar.groups[4].items[0].enabled = self.menu.has_project and self.menu.library_pid<=0
+        var action = bar.input(inp,Int(inp.last_mouse_x),Int(inp.last_mouse_y))
+        if action==scene_menu.SAVE:
+            self.menu.message = "Scene saved" if self.save_scene_file() else "Could not save scene"
+        elif action==scene_menu.LOAD:
+            self.menu.message = "Scene loaded" if self.load_scene_file() else "Could not load scene"
+        elif action==scene_menu.UNDO:
+            _ = self.undo()
+        elif action==scene_menu.REDO:
+            _ = self.redo()
+        elif action==scene_menu.MOVE:
+            self.gizmo_mode = GIZMO_MODE_TRANSLATE
+        elif action==scene_menu.ROTATE:
+            self.gizmo_mode = GIZMO_MODE_ROTATE
+        elif action==scene_menu.SCALE:
+            self.gizmo_mode = GIZMO_MODE_SCALE
+        elif action==scene_menu.SNAP:
+            self.snap_enabled = not self.snap_enabled
+        elif action==scene_menu.PLAY:
+            _ = self.pie_play()
+        elif action==scene_menu.PAUSE:
+            _ = self.pie_pause()
+        elif action==scene_menu.STOP:
+            try:
+                _ = self.pie_stop()
+            except err:
+                self.menu.message = String(err)
+        elif action==scene_menu.SOURCE:
+            self.source_editor.requested = True
+        elif action==scene_menu.MOTION_TAKES:
+            self.menu.open_takes()
+        elif action==scene_menu.KIMODO:
+            self.menu.open_kimodo()
+        elif action==scene_menu.LIBRARY:
+            self.menu.open_library()
+        return action>=0
+
     def process_editor_input(mut self, input: InputState, dt: Float32) -> Bool:
         """Evaluates `InputMap` editor hotkeys (`W/E/R`, `Ctrl+Z`, `Ctrl+Y`, `F5` PIE) & `CameraRig` orbit/fly.
         Returns `False` when `editor_quit` (`Esc`) is triggered."""
         self.input_map.update(input, dt)
         if self.input_map.just_pressed("editor_quit"):
             return False
+        if self.input_map.just_pressed("source_editor"):
+            self.source_editor.requested = True
         if self.input_map.just_pressed("editor_undo"):
             _ = self.undo()
         if self.input_map.just_pressed("editor_redo"):
@@ -1706,6 +1775,12 @@ struct FlintStudioState(Movable):
         self.selected_entity_id = input.integer()
         var n_sel = Int(input.u32())
         self.selected_entity_ids.clear()
+        var rem_sel = max(0, input.limit() - input.offset)
+        if input.failed or n_sel < 0 or n_sel > rem_sel // 8:
+            input.failed = True
+            input.leave()
+            raise Error("Failed to read Studio checkpoint blob")
+        self.selected_entity_ids.reserve(n_sel)
         for _ in range(n_sel):
             self.selected_entity_ids.append(input.integer())
         self.selection_anchor_id = input.integer()
@@ -1727,8 +1802,13 @@ struct FlintStudioState(Movable):
         var w_bytes = _read_blob_bytes(input)
         var p_bytes = _read_blob_bytes(input)
         var n_links = Int(input.u32())
-        var links = List[Tuple[Int, Int, Int]](capacity=max(0, n_links))
-        for _ in range(max(0, n_links)):
+        var rem_links = max(0, input.limit() - input.offset)
+        if input.failed or n_links < 0 or n_links > rem_links // 24:
+            input.failed = True
+            input.leave()
+            raise Error("Failed to read Studio checkpoint blob")
+        var links = List[Tuple[Int, Int, Int]](capacity=n_links)
+        for _ in range(n_links):
             var eid = input.integer()
             var bid = input.integer()
             var tid = input.integer()
@@ -3797,58 +3877,6 @@ def emit_studio_ui_draw_list(
         studio.ui_ctx.theme.text_primary,
     )
 
-    # 2. Top Command & 1-Click PIE Toolbar (`DockSpace` -> `"Toolbar"`)
-    if studio.ui_ctx.begin_dock_panel(studio.dock, "Toolbar"):
-        studio.ui_ctx.begin_box("studio_toolbar_row", FlexStyle.row(gap=5.0, pad=0.0))
-        var brand_st = FlexStyle.row(gap=0.0, pad=0.0)
-        brand_st.fixed_w = 122.0
-        brand_st.fixed_h = 22.0
-        studio.ui_ctx.begin_box("tb_brand_box", brand_st)
-        studio.ui_ctx.label("FLINT STUDIO v5", pack_rgba8(255, 213, 79, 255))
-        studio.ui_ctx.end_box()
-        if studio.ui_ctx.button("tb_move", "W Move", 72.0, 22.0):
-            studio.gizmo_mode = GIZMO_MODE_TRANSLATE
-        if studio.ui_ctx.button("tb_rot", "E Rotate", 78.0, 22.0):
-            studio.gizmo_mode = GIZMO_MODE_ROTATE
-        if studio.ui_ctx.button("tb_scl", "R Scale", 72.0, 22.0):
-            studio.gizmo_mode = GIZMO_MODE_SCALE
-
-        var is_play = studio.pie.mode == PIE_PLAYING
-        var pie_lbl = (
-            "PIE STOP [F5] T=" + String(studio.pie.ticks_simulated)
-            if is_play
-            else ("PIE RESUME [F5]" if studio.pie.mode == PIE_PAUSED else "1-CLICK PIE [F5]")
-        )
-        if studio.ui_ctx.button("tb_pie", pie_lbl, 144.0, 22.0):
-            if studio.pie.mode == PIE_STOPPED:
-                _ = studio.pie_play()
-            else:
-                try:
-                    _ = studio.pie_stop()
-                except:
-                    studio.pie.mode = PIE_STOPPED
-
-        if studio.ui_ctx.button("tb_undo", "Undo [Ctrl+Z]", 102.0, 22.0):
-            _ = studio.undo()
-        if studio.ui_ctx.button("tb_redo", "Redo [Ctrl+Y]", 102.0, 22.0):
-            _ = studio.redo()
-        if studio.ui_ctx.button("tb_save", "Save [Ctrl+S]", 98.0, 22.0):
-            _ = studio.save_scene_file()
-        if studio.ui_ctx.button("tb_load", "Load [Ctrl+O]", 98.0, 22.0):
-            _ = studio.load_scene_file()
-        _ = studio.ui_ctx.checkbox("tb_snap", "Snap", studio.snap_enabled)
-        var stats_st = FlexStyle.row(gap=0.0, pad=0.0)
-        stats_st.fixed_w = 180.0
-        stats_st.fixed_h = 22.0
-        studio.ui_ctx.begin_box("tb_stats_box", stats_st)
-        studio.ui_ctx.label(
-            "U:" + String(len(studio.undo_stack)) + " R:" + String(len(studio.redo_stack)) + " | GPU " + _fmt_f32_2dp(Float32(gpu_ms)) + " ms",
-            studio.ui_ctx.theme.text_muted,
-        )
-        studio.ui_ctx.end_box()
-        studio.ui_ctx.end_box()
-        studio.ui_ctx.end_dock_panel()
-
     # 3. Left Scene Hierarchy Outliner (`DockSpace` -> `"Hierarchy"`, collapsible tree + multi-select + DnD reparent)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Hierarchy"):
         var h_info = studio.dock.find_panel("Hierarchy")
@@ -4151,6 +4179,22 @@ def emit_studio_ui_draw_list(
         studio.ui_ctx.label("MCP v2 Active Clients: " + String(mcp_clients))
         studio.ui_ctx.label("Sandbox: strict workspace_root + SO_PEERCRED + 0600 socket", studio.ui_ctx.theme.text_muted)
         studio.ui_ctx.end_dock_panel()
+
+    # Draw popovers after the dock panels so the viewport cannot cover them.
+    var toolbar = studio.dock.find_panel("Toolbar")
+    if toolbar[0]>=0 and toolbar[2]:
+        ref bar = studio.menu.bar
+        bar.x = Int(toolbar[3].x)+4
+        bar.y = Int(toolbar[3].y)
+        bar.height = min(30,max(1,Int(toolbar[3].h)))
+        bar.screen_w = screen_w
+        bar.screen_h = screen_h
+        var right = bar.left(len(bar.groups))+14
+        if right+200 < Int(toolbar[3].right()):
+            var state = "Playing" if studio.pie.mode==PIE_PLAYING else ("Paused" if studio.pie.mode==PIE_PAUSED else "Scene editor")
+            var message = studio.menu.message if studio.menu.message else String(state)+"   |   GPU "+_fmt_f32_2dp(Float32(gpu_ms))+" ms"
+            studio.ui_ctx._draw_text(message,Float32(right),Float32(bar.y+3),13,studio.ui_ctx.theme.text_muted)
+        bar.draw(studio.ui_ctx.draw_list,studio.ui_ctx.font,font_slot)
 
     studio.ui_ctx.end_frame()
 

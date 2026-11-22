@@ -35,10 +35,11 @@ struct BitReader(Copyable, Movable):
     var bit_count: Int
     var valid: Bool
 
-    def __init__(out self, ref data: List[UInt8], start: Int):
+    def __init__(out self, ref data: List[UInt8], start: Int, end: Int = -1):
         self.ptr = Int(data.unsafe_ptr())
-        self.length = len(data)
-        self.position = start
+        var lim = len(data) if end < 0 else min(len(data), end)
+        self.length = max(start, lim) if start >= 0 else 0
+        self.position = max(0, start)
         self.bit_buf = 0
         self.bit_count = 0
         self.valid = True
@@ -207,23 +208,39 @@ def distance_extra(code: Int) -> Int:
     return values[max(0, min(29, code))]
 
 
-def inflate_zlib(data: List[UInt8], start: Int, expected_bytes: Int = 0) -> List[UInt8]:
-    var output = List[UInt8](capacity=max(256, expected_bytes))
-    if start + 6 > len(data):
-        return output^
-    var reader = BitReader(data, start + 2)
+def inflate_zlib(data: List[UInt8], start: Int, expected_bytes: Int = 0, max_in_bytes: Int = -1) -> List[UInt8]:
+    if start < 0 or max_in_bytes < -1 or max_in_bytes == 0 or start > len(data):
+        return List[UInt8]()
+    if max_in_bytes >= 0 and max_in_bytes > len(data) - start:
+        return List[UInt8]()
+    var in_end = len(data) if max_in_bytes < 0 else start + max_in_bytes
+    if in_end - start < 6:
+        return List[UInt8]()
+    var cmf = Int(data[start])
+    var flg = Int(data[start + 1])
+    if (cmf & 0x0F) != 8 or (cmf >> 4) > 7 or (flg & 0x20) != 0 or ((cmf * 256 + flg) % 31) != 0:
+        return List[UInt8]()
+    var max_out = min(expected_bytes, 536_870_912) if expected_bytes > 0 else 134_217_728
+    var output = List[UInt8](capacity=max(256, min(1 << 20, max_out)))
+    var reader = BitReader(data, start + 2, in_end)
     var final = 0
     while final == 0 and reader.valid:
         final = reader.read_bit()
         var kind = reader.read_bits(2)
+        if not reader.valid:
+            break
         if kind == 0:
             reader.align()
-            if reader.position + 4 > len(data):
+            if reader.position + 4 > in_end:
+                reader.valid = False
                 break
             var length = Int(data[reader.position]) | (Int(data[reader.position + 1]) << 8)
             var inverse = Int(data[reader.position + 2]) | (Int(data[reader.position + 3]) << 8)
             reader.position += 4
-            if (length ^ 65535) != inverse or reader.position + length > len(data):
+            if (length ^ 65535) != inverse or reader.position + length > in_end:
+                reader.valid = False
+                break
+            if length > max_out - len(output):
                 reader.valid = False
                 break
             for _ in range(length):
@@ -231,6 +248,7 @@ def inflate_zlib(data: List[UInt8], start: Int, expected_bytes: Int = 0) -> List
                 reader.position += 1
             continue
         if kind == 3:
+            reader.valid = False
             break
         var literal = Huffman()
         var distance = Huffman()
@@ -287,6 +305,9 @@ def inflate_zlib(data: List[UInt8], start: Int, expected_bytes: Int = 0) -> List
             if symbol < 0:
                 break
             if symbol < 256:
+                if len(output) >= max_out:
+                    reader.valid = False
+                    break
                 output.append(UInt8(symbol))
             elif symbol == 256:
                 break
@@ -300,11 +321,17 @@ def inflate_zlib(data: List[UInt8], start: Int, expected_bytes: Int = 0) -> List
                 if backwards <= 0 or backwards > len(output):
                     reader.valid = False
                     break
+                if length > max_out - len(output):
+                    reader.valid = False
+                    break
                 for _ in range(length):
                     output.append(output[len(output) - backwards])
             else:
                 reader.valid = False
-    if not reader.valid:
+    if final == 0 or not reader.valid:
+        return List[UInt8]()
+    reader.align()
+    if reader.position + 4 > in_end:
         return List[UInt8]()
     return output^
 
@@ -359,7 +386,7 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     var bit_depth = Int(data[24])
     var color_type = Int(data[25])
     var interlace = Int(data[28])
-    if width <= 0 or height <= 0 or width * height > 40000000 or interlace != 0:
+    if width <= 0 or height <= 0 or width > 40000000 or height > 40000000 or width > 40000000 // height or interlace != 0:
         return image^
 
     # Validate PNG spec (color_type, bit_depth) combinations
@@ -421,7 +448,7 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     var bits_per_pixel = samples_per_pixel * bit_depth
     var stride = (width * bits_per_pixel + 7) // 8
     var bpp = max(1, (bits_per_pixel + 7) // 8)
-    var raw = inflate_zlib(compressed, 0, (stride + 1) * height)
+    var raw = inflate_zlib(compressed, 0, (stride + 1) * height, len(compressed))
     if len(raw) != (stride + 1) * height:
         return image^
 
@@ -552,8 +579,9 @@ def decode_png(data: List[UInt8], maximum_size: Int = 1024) -> NativeImage:
     _ = len(scanlines)
 
     # Box-filter downscaling when image exceeds `maximum_size`
+    var max_dim = max(1, maximum_size)
     var scale = 1
-    while (width + scale - 1) // scale > maximum_size or (height + scale - 1) // scale > maximum_size:
+    while (width + scale - 1) // scale > max_dim or (height + scale - 1) // scale > max_dim:
         scale *= 2
     image.width = (width + scale - 1) // scale
     image.height = (height + scale - 1) // scale

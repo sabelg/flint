@@ -73,7 +73,7 @@ from flint.input.plugin import InputPlugin, InputStateResource
 from flint.physics.plugin import ColliderComponent, PhysicsPlugin, RigidBodyComponent
 from flint.physics.world import PhysicsWorld
 from flint.platform.kms import on_virtual_console
-from flint.platform.os import env_flag, env_value, get_time, make_dirs
+from flint.platform.os import env_flag, env_value, get_time, make_dirs, parent_directory
 from flint.render.aaa_clustered_lights import AaaClusterLight
 from flint.render.aaa_ibl import bake_hdr_image_ibl_cubemap_and_sh9
 from flint.render.aaa_post_tsr import AAA_DISPLAY_AGX_REC709, AaaPhysicalCamera
@@ -2175,12 +2175,80 @@ def _run_headless_shots(mut app: EngineApp):
     app.shutdown()
 
 
+def _run_headless_smoke(mut app: EngineApp, out_png: String):
+    var target_png = out_png if out_png.byte_length() > 0 else String("/tmp/flint_open_world_smoke.png")
+    var pdir = parent_directory(target_png)
+    if pdir.byte_length() > 0 and pdir != ".":
+        _ = make_dirs(pdir)
+    app.startup()
+
+    var e0_y = max(Float32(15.5), sample_valley_height(-22.0, -34.0) + Float32(8.5))
+    var cam_eye = Vec3(-22.0, e0_y, -34.0)
+    var cam_target = Vec3(2.0, 5.2, 24.0)
+    var t_sim = Float32(1.8)
+
+    var st_opt = app.resources.get_ptr_mut[OpenWorldStateResource]()
+    var rend_opt = app.resources.get_ptr_mut[ScalableRenderer]()
+    var rw_opt = app.resources.get_ptr_mut[RenderWorld]()
+    if st_opt and rend_opt and rw_opt:
+        ref state = st_opt.value()[unsafe_offset=0]
+        ref renderer = rend_opt.value()[unsafe_offset=0]
+        ref rw = rw_opt.value()[unsafe_offset=0]
+        ref ren = renderer.gpu_slot[0]
+        apply_time_of_day_preset(app.world, rw, renderer, state, 0)
+        ren.auto_exposure_speed = Float32(1.0)
+        state.sim_time = t_sim
+
+        var ctx = FlockSimCtx(t_sim, Float32(0.5))
+        app.world.par_for_each2[GliderOrWispComponent, LocalTransform](
+            app.pool, _step_glider_wisp_kernel, Int(Pointer(to=ctx))
+        )
+        var cur_bones = evaluate_sentinel_bones(t_sim)
+        _ = ren.update_skinned_mesh_bones(state.sentinel_skin, cur_bones, state.prev_bones)
+        state.prev_bones = cur_bones^
+
+        var cam_lt = app.world.get_ptr_mut[LocalTransform](state.cam_entity)
+        var cam_c = app.world.get_ptr_mut[CameraComponent](state.cam_entity)
+        if cam_lt and cam_c:
+            cam_lt.value()[unsafe_offset=0].translation = cam_eye
+            cam_lt.value()[unsafe_offset=0].rotation = Quat()
+            cam_c.value()[unsafe_offset=0].look_target_offset = cam_target - cam_eye
+
+        state.freeze_sim = True
+        for sub in range(2):
+            ren.tsr_history_weight = Float32(0.0) if sub == 0 else Float32(0.75)
+            app.step_one_frame(Float32(1.0 / 60.0) if sub == 0 else Float32(0.0))
+
+        var px = renderer.readback_pixels()
+        _ = write_png(target_png, px, renderer.width, renderer.height)
+        print(
+            "[Flint Open World] Saved 1280x720 smoke frame -> "
+            + target_png
+            + " (CulledDraws="
+            + String(ren.last_culled_meshlet_draws)
+            + ")"
+        )
+    app.shutdown()
+
+
 def main():
     var headless_shots = False
-    for i in range(1, len(argv())):
-        var arg = String(argv()[i])
+    var headless_smoke = False
+    var out_png = String("")
+    var args = argv()
+    var ai = 1
+    while ai < len(args):
+        var arg = String(args[ai])
         if arg == "--shots" or arg == "--headless":
             headless_shots = True
+        elif arg == "--headless-smoke":
+            headless_smoke = True
+        elif arg == "--out" and ai + 1 < len(args):
+            out_png = String(args[ai + 1])
+            ai += 1
+        ai += 1
+
+    var is_headless = headless_shots or headless_smoke
 
     var no_display = (
         env_flag("FLINT_HEADLESS")
@@ -2191,9 +2259,9 @@ def main():
             and not on_virtual_console()
         )
     )
-    if (not headless_shots) and no_display:
+    if (not is_headless) and no_display:
         print(
-            "[Flint Open World] No Wayland/X11 display detected. Run with '--shots' to render open-world PNGs."
+            "[Flint Open World] No Wayland/X11 display detected. Run with '--shots' or '--headless-smoke' for headless PNG output."
         )
         return
 
@@ -2202,7 +2270,7 @@ def main():
 
     var cfg = AppConfig(
         title="FLINT AAA OPEN WORLD - SUNSPIRE VALLEY",
-        headless=headless_shots,
+        headless=is_headless,
         fixed_hz=Float32(60.0),
     )
     var app = EngineApp(cfg^)
@@ -2242,16 +2310,16 @@ def main():
     app.add_plugin(TransformPlugin(snapshot_prev_in_fixed=True))
     app.add_plugin(
         WindowPlugin(
-            headless=headless_shots,
+            headless=is_headless,
             width=out_w,
             height=out_h,
             title="FLINT AAA OPEN WORLD - SUNSPIRE VALLEY",
         )
     )
-    app.add_plugin(InputPlugin(enable_evdev=not headless_shots))
+    app.add_plugin(InputPlugin(enable_evdev=not is_headless))
     app.add_plugin(PhysicsPlugin(gravity=0.0))
     app.add_plugin(AnimPlugin())
-    app.add_plugin(AudioPlugin(headless=headless_shots))
+    app.add_plugin(AudioPlugin(headless=is_headless))
     app.add_plugin(RenderPlugin(tier=RENDER_TIER_2_AAA_VISBUFFER_RT, width=out_w, height=out_h, tsr_scale=1.0))
 
     # Override RenderPlugin's STAGE_LAST extract_and_draw fn_ptr to include 18 Heitz LTC AreaLightComponents + HUD
@@ -2269,13 +2337,16 @@ def main():
 
     _setup_open_world_input(app)
     _setup_open_world_audio(app)
-    if not _populate_open_world_scene(app, headless_shots):
+    if not _populate_open_world_scene(app, is_headless):
         print("[Flint Open World] ERROR: Failed to populate Sunspire Valley scene.")
         app.shutdown()
         return
 
     if headless_shots:
         _run_headless_shots(app)
+        return
+    if headless_smoke:
+        _run_headless_smoke(app, out_png)
         return
 
     app.startup()

@@ -277,9 +277,9 @@ cmd_build() {
         build_labels+=("examples/pack_cli/main.mojo -> build/flint-pack")
     fi
     if [[ "$target" == "all" || "$target" == "test" || "$target" == "unit" ]]; then
-        build_srcs+=("${ROOT}/tests/test_flint.mojo")
-        build_outs+=("${ROOT}/build/flint-test")
-        build_labels+=("tests/test_flint.mojo -> build/flint-test")
+        build_srcs+=("${ROOT}/tests/test_flint.mojo" "${ROOT}/tests/test_embedded_ide.mojo")
+        build_outs+=("${ROOT}/build/flint-test" "${ROOT}/build/flint-embedded-ide-test")
+        build_labels+=("tests/test_flint.mojo -> build/flint-test" "tests/test_embedded_ide.mojo -> build/flint-embedded-ide-test")
     fi
     if [[ "$target" == "all" || "$target" == "test" || "$target" == "e2e" ]]; then
         build_srcs+=("${ROOT}/tests/test_e2e.mojo")
@@ -399,6 +399,8 @@ cmd_test() {
         cmd_build unit
         echo "[Flint] Running Flint Engine unit test suite..."
         "${ROOT}/build/flint-test"
+        echo "[Flint] Running Flint Embedded IDE test suite..."
+        "${ROOT}/build/flint-embedded-ide-test"
     elif [[ "$sub" == "v5" ]]; then
         cmd_build v5
         run_v5_suites
@@ -406,9 +408,14 @@ cmd_test() {
         cmd_build test
         echo "[Flint] Running Flint Engine test suite..."
         "${ROOT}/build/flint-test"
+        echo "[Flint] Running Flint Embedded IDE test suite..."
+        "${ROOT}/build/flint-embedded-ide-test"
         echo "[Flint] Running Flint Engine E2E test suite..."
         "${ROOT}/build/flint-e2e"
         run_v5_suites
+        echo "[Flint] Running Studio IDE & Profile Compare headless suites..."
+        bash "${ROOT}/tests/test_studio_ide.sh"
+        bash "${ROOT}/tests/test_studio_profile_compare.sh"
     fi
 }
 
@@ -475,7 +482,187 @@ cmd_lab() {
     done
 }
 
+# Run the installed terminal IDE with this project's compiler, sources and session.
+cmd_studio_ide() {
+    local mode="$1"
+    shift
+    (( $# <= 1 )) || { echo "studio --ide [FILE[:LINE[:COLUMN]]]" >&2; return 2; }
+    cd "$CALLER_PWD"
+    local ide="${FLINT_TURBOMOJO:-}" location="${1:-}" suffix="" project="$PWD"
+    local gui_args=()
+    if [[ "$mode" == --moves ]]; then
+        mode=--ide-gui
+        gui_args=(--moves)
+    fi
+    local program=tmide override=FLINT_TURBOMOJO
+    if [[ "$mode" == --ide-gui ]]; then
+        program=tmide-gui
+        override=FLINT_TURBOMOJO_GUI
+        ide="${FLINT_TURBOMOJO_GUI:-}"
+    fi
+    if [[ -z "$ide" ]]; then
+        ide="$(command -v "$program" || true)"
+        [[ -n "$ide" ]] || ide="$HOME/IDE/build/$program"
+    fi
+    [[ -f "$ide" && -x "$ide" ]] || { echo "Install $program or set $override to its executable." >&2; return 1; }
+    ide="$(realpath -- "$ide")"
+    local parent="$project"
+    while [[ ! -f "$parent/flint.toml" && "$parent" != / ]]; do
+        parent="$(dirname -- "$parent")"
+    done
+    if [[ -f "$parent/flint.toml" ]]; then project="$parent"; fi
+    if [[ -z "$location" ]]; then
+        if [[ -f "$project/flint.toml" ]]; then
+            location="$(read_flint_toml_value "$project/flint.toml" project entry || true)"
+            location="${location:-src/main.mojo}"
+            [[ "$location" == /* ]] || location="$project/$location"
+        else
+            project="$ROOT"
+            location="$ROOT/examples/studio/main.mojo"
+        fi
+    fi
+    # Match TurboMojo's FILE:LINE:COL grammar. A literal filename takes priority.
+    if [[ ! -f "$location" && "$location" =~ ^(.+):([0-9]+)$ ]]; then
+        location="${BASH_REMATCH[1]}"
+        suffix=":${BASH_REMATCH[2]}"
+        if [[ ! -f "$location" && "$location" =~ ^(.+):([0-9]+)$ ]]; then
+            location="${BASH_REMATCH[1]}"
+            suffix=":${BASH_REMATCH[2]}$suffix"
+        fi
+        if [[ "$suffix" =~ :0+(:|$) ]]; then
+            echo "Source line and column numbers start at 1." >&2
+            return 2
+        fi
+    fi
+    [[ -f "$location" ]] || { echo "Source file does not exist: $location" >&2; return 1; }
+    location="$(realpath -- "$location")$suffix"
+    cd "$project"
+    resolve_mojo
+    export PATH="$(dirname "$MOJO_BIN"):$PATH"
+    if [[ -f flint.toml ]]; then
+        mkdir -p build/flint-ide
+        local imports="build/flint-ide/engine-src"
+        if [[ ! -e "$imports" || -L "$imports" ]]; then
+            ln -sfnT -- "$ROOT/src" "$imports"
+        else
+            echo "Expected an engine source link at $project/$imports" >&2
+            return 1
+        fi
+    fi
+    local base="${FLINT_IDE_STATE_BASE:-${XDG_STATE_HOME:-$HOME/.local/state}}" key
+    key="$(printf '%s' "$PWD" | sha256sum)"
+    local state="$base/flint/ide/${key%% *}"
+    mkdir -p -- "$state"
+    if [[ "$mode" == --ide-embedded || "$mode" == --ide-gui ]]; then
+        # Each live pane owns its buffers and IPC files. Reuse its history on subsequent launches.
+        local slot=1 pane
+        while :; do
+            pane="$state/${mode#--ide-}-$slot"
+            mkdir -p -- "$pane"
+            exec 9>"$pane/session.lock"
+            flock -n 9 && break
+            slot=$((slot + 1))
+        done
+        exec env "TERM=xterm-256color" "COLORTERM=truecolor" "FLINT_IDE_STATE_BASE=$base" \
+            "XDG_STATE_HOME=$pane" "TURBOMOJO_COMPILER=${TURBOMOJO_COMPILER:-$MOJO_BIN}" "$ide" "${gui_args[@]}" "$location"
+    fi
+    local cmd=(env "FLINT_IDE_STATE_BASE=$base" "XDG_STATE_HOME=$state" "PATH=$PATH"
+        "TURBOMOJO_COMPILER=${TURBOMOJO_COMPILER:-$MOJO_BIN}"
+        "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "MODULAR_HOME=${MODULAR_HOME:-}" "$ide" --reuse "$location")
+    if [[ "$mode" == --ide && -t 0 && -t 1 ]]; then
+        exec "${cmd[@]}"
+    fi
+    if [[ -s "$state/turbomojo/ide-state.json" ]] &&
+        TERM=xterm-256color "${cmd[@]}" </dev/null >/dev/null 2>&1; then
+        return 0
+    fi
+    # A terminal-launched --reuse falls back to a full interactive session on first use.
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        echo "Open Studio --ide in an interactive terminal or launch it on a desktop." >&2
+        return 1
+    elif command -v gnome-terminal >/dev/null; then
+        gnome-terminal --working-directory="$project" -- "${cmd[@]}"
+    elif command -v x-terminal-emulator >/dev/null; then
+        x-terminal-emulator -e "${cmd[@]}" </dev/null &
+    else
+        echo "No desktop terminal found. Run studio --ide in your terminal." >&2
+        return 1
+    fi
+}
+
 cmd_studio() {
+    export FLINT_STUDIO_IDE_LAUNCHER="$ROOT/tools/flint.sh"
+    export FLINT_STUDIO_PROJECT="$CALLER_PWD"
+    export FLINT_STUDIO_IDE_FILE=""
+    case "${1:-}" in
+        --ide|--ide-window|--ide-embedded|--ide-gui|--moves) cmd_studio_ide "$@"; return ;;
+        --takes)
+            shift
+            resolve_mojo
+            compile_mojo "$ROOT/examples/kimodo/takes.mojo" "$ROOT/build/flint-takes" "-O3" "$ROOT/examples/kimodo"
+            cd "$CALLER_PWD"
+            exec "$ROOT/build/flint-takes" "$@"
+            ;;
+        --kimodo)
+            shift
+            resolve_mojo
+            compile_mojo "$ROOT/examples/kimodo/main.mojo" "$ROOT/build/flint-kimodo" "-O3" "$ROOT/examples/kimodo"
+            cd "$CALLER_PWD"
+            exec "$ROOT/build/flint-kimodo" "$@"
+            ;;
+        --compare|--build-profiles)
+            local action="$1" viewer="${ROOT}/build/flint-profile-studio"
+            shift
+            resolve_mojo
+            compile_mojo "${ROOT}/examples/profile/main.mojo" "$viewer" "-O3" ""
+            if [[ "$action" == "--compare" ]]; then
+                (cd "$CALLER_PWD" && "$viewer" "$@")
+                return
+            fi
+            local profiles=() selection selected
+            mapfile -t profiles < <(profile_names)
+            (( ${#profiles[@]} )) || { echo "No build profiles in $CALLER_PWD/flint.toml" >&2; return 1; }
+            selection="$(mktemp)"
+            "$viewer" --pick "$selection" "${profiles[@]}" || { rm -f "$selection"; return 1; }
+            selected="$(cat "$selection")"
+            rm -f "$selection"
+            [[ -n "$selected" ]] || return 0
+            cmd_package --profile "$selected"
+            return ;;
+        --capture)
+            shift
+            if [[ "${1:-}" == "--ssh" ]]; then
+                [[ $# == 4 && -n "$2" && "$2" != -* ]] || { echo "studio --capture --ssh HOST REMOTE_TRACE LOCAL_TRACE" >&2; return 1; }
+                (cd "$CALLER_PWD" && remote_capture "$2" "$3" "$4")
+                return
+            fi
+            [[ $# == 1 ]] || { echo "studio --capture TRACE_PATH" >&2; return 1; }
+            (cd "$CALLER_PWD" && request_capture "$1")
+            return ;;
+    esac
+    if [[ "${1:-}" == "--motion" || "${1:-}" == "--combat" || "${1:-}" == "--room" ]]; then
+        local tool="${1#--}"
+        shift
+        resolve_mojo
+        local source="${ROOT}/examples/motion/main.mojo" binary="${ROOT}/build/flint-motion" include=""
+        if [[ -f "${CALLER_PWD}/flint.toml" ]]; then
+            local entry
+            entry="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" studio "${tool}_entry" || true)"
+            if [[ -n "$entry" ]]; then
+                source="${CALLER_PWD}/$entry"
+                binary="${CALLER_PWD}/build/flint-${tool}"
+                include="${CALLER_PWD}/src"
+            fi
+        fi
+        if [[ "$tool" != motion && -z "$include" ]]; then
+            echo "studio --$tool needs a project with [studio] ${tool}_entry in flint.toml" >&2
+            return 1
+        fi
+        export FLINT_STUDIO_IDE_FILE="$source"
+        compile_mojo "$source" "$binary" "-O3" "$include"
+        cd "$CALLER_PWD"
+        exec "$binary" "$@"
+    fi
     if [[ ! -f "${ROOT}/examples/studio/main.mojo" ]]; then
         echo "[Flint Studio] ERROR: examples/studio/main.mojo not found." >&2
         exit 1
@@ -770,6 +957,9 @@ cmd_gate() {
     cmd_sync --verify
     cmd_build all
     "${ROOT}/build/flint-test"
+    "${ROOT}/build/flint-embedded-ide-test"
+    bash "${ROOT}/tests/test_studio_ide.sh"
+    bash "${ROOT}/tests/test_studio_profile_compare.sh"
     # Render all showcase & Studio headless shots before E2E and FLIP checks.
     mkdir -p "${ROOT}/build/shots"
     "${ROOT}/build/flint-spark" --shots
@@ -789,21 +979,81 @@ cmd_gate() {
     echo "============================================================"
 }
 
+profile_names() {
+    [[ -f "$CALLER_PWD/flint.toml" ]] || return 0
+    sed -nE 's/^[[:space:]]*\[build_profiles\.([a-zA-Z0-9_-]+)\][[:space:]]*(#.*)?$/\1/p' "$CALLER_PWD/flint.toml"
+}
+
+request_capture() (
+    local path="$1"
+    [[ -f "$path.ready" ]] || { echo "No listening development game at $path" >&2; return 1; }
+    local request token i
+    if [[ -f "$path.lock" ]] && flock -n "$path.lock" true; then
+        echo "The development game has stopped" >&2
+        return 1
+    fi
+    exec 8>"$path.client.lock"
+    flock -n 8 || { echo "Another Studio client is capturing this session" >&2; return 1; }
+    request="$(mktemp -- "$path.request.XXXXXX")"
+    token="$(basename -- "$request")"
+    printf '%s' "$token" > "$request"
+    if ! ln -- "$request" "$path.request" 2>/dev/null; then
+        rm -f -- "$request"
+        echo "Capture already requested" >&2
+        return 1
+    fi
+    rm -f -- "$request"
+    for ((i=0; i<1200; i++)); do
+        if [[ -s "$path.done" && "$(cat -- "$path.done")" == "$token" && ! -e "$path.request" && -s "$path" ]]; then
+            echo "Capture saved: $path"
+            return 0
+        fi
+        [[ -f "$path.ready" ]] || { echo "Game closed before capture completed" >&2; return 1; }
+        sleep 0.1
+    done
+    if [[ -f "$path.request" && "$(cat -- "$path.request")" == "$token" ]]; then
+        rm -f -- "$path.request"
+    fi
+    echo "Capture timed out waiting for the game at $path" >&2
+    return 1
+)
+
+remote_capture() (
+    set -euo pipefail
+    local host="$1" remote_file="$2" local_file="$3" temp
+    temp="$(mktemp -- "$local_file.partial.XXXXXX")"
+    trap 'rm -f -- "$temp"' EXIT
+    # The device needs Bash and the running development build. All user paths are shell-quoted.
+    {
+        printf '%s\n' 'set -euo pipefail'
+        declare -f request_capture
+        printf 'request_capture %q >&2\ncat -- %q\n' "$remote_file" "$remote_file"
+    } | ssh -T -- "$host" bash -s > "$temp"
+    [[ -s "$temp" ]] || return 1
+    mv -f -- "$temp" "$local_file"
+    echo "Downloaded trace: $local_file"
+)
+
 cmd_package() {
     local out_dir=""
     local target=""
     local assets_dir=""
     local assets_explicit=0
     local proj_name=""
-    local loose_assets=0
+    local loose_assets=0 profile="" platform=linux opt=-O3
+    local profile_section=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
-                echo "Usage: bash tools/flint.sh package [out_dir] [--out <dir>] [--target <spark|world|studio|cycles|kms|kms3d|path.mojo>] [--assets <dir>] [--name <name>] [--loose-assets]"
+                echo "Usage: bash tools/flint.sh package [out_dir] [--profile NAME | --list-profiles] [--out <dir>] [--target <spark|world|studio|cycles|kms|kms3d|path.mojo>] [--assets <dir>] [--name <name>] [--loose-assets]"
                 echo "  Builds a self-contained release bundle (bin/, lib/, assets.flpk, flint.toml, MANIFEST.txt, run.sh)."
                 return 0
                 ;;
+            --list-profiles) profile_names; return ;;
+            --profile)
+                [[ $# -ge 2 && "$2" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "Expected a build profile name" >&2; return 1; }
+                profile="$2"; shift 2 ;;
             --out)
                 [[ $# -ge 2 ]] || { echo "[Flint Package] ERROR: --out requires a directory argument." >&2; return 1; }
                 out_dir="$2"; shift 2 ;;
@@ -841,6 +1091,23 @@ cmd_package() {
                 ;;
         esac
     done
+
+    if [[ -n "$profile" ]]; then
+        profile_section="build_profiles.$profile"
+        local manifest="$CALLER_PWD/flint.toml"
+        platform="$(read_flint_toml_value "$manifest" "$profile_section" platform)" || { echo "Missing platform for profile $profile" >&2; return 1; }
+        opt="-$(read_flint_toml_value "$manifest" "$profile_section" optimization || echo O3)"
+        local loose
+        loose="$(read_flint_toml_value "$manifest" "$profile_section" loose_assets || echo false)"
+        [[ "$opt" =~ ^-O[0-3]$ && "$loose" =~ ^(true|false)$ ]] || { echo "Invalid optimization or loose_assets in $profile" >&2; return 1; }
+        [[ "$loose" == false ]] || loose_assets=1
+        case "$platform" in
+            linux|windows-wsl2) ;;
+            *) echo "Unsupported build platform: $platform" >&2; return 1 ;;
+        esac
+        [[ -z "$target" ]] || { echo "Project profiles use the project entry" >&2; return 1; }
+        [[ -n "$out_dir" ]] || out_dir="$CALLER_PWD/build/packages/$profile"
+    fi
 
     if [[ -n "$assets_dir" && "$assets_dir" != /* ]]; then
         assets_dir="${CALLER_PWD}/${assets_dir}"
@@ -889,6 +1156,7 @@ cmd_package() {
             [[ -z "$pack_output_name" ]] && pack_output_name="assets.flpk"
         fi
         build_bin="${CALLER_PWD}/build/${proj_name}"
+        [[ -z "$profile" ]] || build_bin="${CALLER_PWD}/build/profile-bin/$profile/${proj_name}"
         if [[ -z "$assets_dir" && -d "${CALLER_PWD}/assets" ]]; then
             assets_dir="${CALLER_PWD}/assets"
         fi
@@ -937,7 +1205,7 @@ cmd_package() {
     echo "[Flint Package] Building ${proj_name} (${src}) ..."
     mkdir -p "$(dirname "$build_bin")"
     FLINT_WERROR="$eff_werror" FLINT_DETERMINISTIC_FP="$eff_det_fp" \
-        compile_mojo "$src" "$build_bin" "-O3" "$extra_inc"
+        compile_mojo "$src" "$build_bin" "$opt" "$extra_inc"
 
     cp -f "$build_bin" "${out_dir}/bin/${proj_name}"
     chmod 0755 "${out_dir}/bin/${proj_name}"
@@ -1087,6 +1355,53 @@ cd "\$HERE"
 exec "\${HERE}/bin/${proj_name}" "\$@"
 EOF
     chmod 0755 "${out_dir}/run.sh"
+    if [[ "$platform" == windows-wsl2 ]]; then
+        # Rebuild on a differently architected Windows PC using the same sources and lockfile.
+        local kit
+        kit="$(mktemp -d -- "$out_dir/.wsl-source.XXXXXX")"
+        mkdir -p "$kit/engine" "$kit/game"
+        cp -a "$ROOT/src" "$kit/engine/"
+        cp "$ROOT/pixi.toml" "$ROOT/pixi.lock" "$kit/engine/"
+        cp -a "$ROOT/licenses" "$kit/engine/"
+        cp -a "$CALLER_PWD/src" "$kit/game/"
+        local entry="${src#"$CALLER_PWD/"}"
+        [[ "$entry" != "$src" && "$entry" != *".."* ]] || { echo "WSL source kit requires a project-local entry" >&2; return 1; }
+        if [[ "$entry" != src/* ]]; then
+            mkdir -p "$kit/game/$(dirname "$entry")"
+            cp "$src" "$kit/game/$entry"
+        fi
+        printf '%s\n' "$entry" > "$kit/entry"
+        printf '%s\n' "$opt" > "$kit/optimization"
+        : > "$kit/flags"
+        if [[ "$eff_werror" != 0 ]]; then echo --Werror >> "$kit/flags"; fi
+        if [[ "$eff_det_fp" != 0 ]]; then printf '%s\n' --fp-mode contract=off >> "$kit/flags"; fi
+        uname -m > "$kit/build-arch"
+        if [[ -d "$out_dir/wsl-source" && -f "$out_dir/wsl-source/entry" ]]; then
+            local old_kit
+            old_kit="$(mktemp -d -- "$out_dir/.wsl-previous.XXXXXX")"
+            mv -T "$out_dir/wsl-source" "$old_kit"
+            if ! mv -T "$kit" "$out_dir/wsl-source"; then
+                mv -T "$old_kit" "$out_dir/wsl-source"
+                return 1
+            fi
+            rm -rf -- "$old_kit"
+        else
+            mv -T "$kit" "$out_dir/wsl-source"
+        fi
+        echo "[Flint Package] Bundled project and Flint source for first-run WSL builds."
+        cp "$ROOT/tools/run-wsl.sh" "$out_dir/run-wsl.sh"
+        cp "$ROOT/tools/Play-WSL.cmd" "$out_dir/Play-WSL.cmd"
+        cat > "$out_dir/Windows-README.txt" <<'WSL_README'
+Extract the entire folder, then open Play-WSL.cmd.
+This build runs on Windows through a configured WSL2 Linux distribution.
+Graphical play requires WSLg and a working Vulkan driver inside that distribution.
+The bundled binary runs directly on the matching CPU architecture (see MANIFEST.txt).
+For a different architecture, install Pixi inside WSL and launch again. The first
+run downloads the locked Linux toolchain, compiles the included project and engine
+sources, and caches the player for subsequent launches.
+WSL_README
+    fi
+
 
     local git_commit="dev"
     if git rev-parse --short HEAD >/dev/null 2>&1; then
@@ -1108,6 +1423,10 @@ binary_sha256=${bin_sha}
 mojo_version=${mojo_ver}
 git_commit=${git_commit}
 assets_pack=$([[ "$has_flpk" -eq 1 ]] && echo "$pack_output_name" || echo "none")
+platform=$platform
+build_profile=$profile
+optimization=$opt
+architecture=$(uname -m)
 packaged_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
     chmod 0644 "${out_dir}/MANIFEST.txt"
@@ -1912,6 +2231,11 @@ case "$subcmd" in
     sync)    cmd_sync "$@" ;;
     build)   cmd_build "$@" ;;
     run)     cmd_run "$@" ;;
+    fern)
+        resolve_mojo
+        compile_mojo "${ROOT}/examples/fern/main.mojo" "${ROOT}/build/flint-fern" "-O3" ""
+        (cd "$CALLER_PWD" && "${ROOT}/build/flint-fern" "$@")
+        ;;
     pack)    cmd_pack "$@" ;;
     package) cmd_package "$@" ;;
     test)    cmd_test "$@" ;;
@@ -1935,13 +2259,21 @@ case "$subcmd" in
         echo "Commands:"
         echo "  doctor               Check Mojo 1.2 toolchain, Vulkan ICD, Wayland/X11/KMS, Audio, evdev & inotify"
         echo "  lab <name|all> [--fast] Compile & run subsystem lab (physics|anim|render|audio_ui|net|all)"
-        echo "  studio [...]         Build and launch Flint Studio visual editor / MCP v2 host"
+        echo "  studio --takes [take or recipe]     Preview and author motion, capture video and export BVH/GLB"
+        echo "  studio --kimodo [PROMPT OUTPUT.bvh [FRAMES STEPS SEED]]   Generate SOMA motion"
+        echo "  studio --compare A B [--text | --shot FILE]   Compare two frame captures"
+        echo "  studio --capture TRACE | --build-profiles    Capture a running game or select a build"
+        echo "  studio --moves                              Browse and rehearse project move presets"
+        echo "  studio --ide-gui [FILE[:LINE[:COL]]]         Open the native TurboMojo desktop window"
+        echo "  studio --ide [FILE[:LINE[:COL]]]             Open project source in TurboMojo"
+        echo "  studio [...]         Launch the visual editor, or use --motion / --combat / --room PRESET.json"
         echo "  mcp [...]            Build and launch Flint Studio headless MCP v2 stdio server"
         echo "  build [target] [--force] [-j N] Compile standalone targets (or flint.toml project) with incremental skip"
         echo "  run [...]            Build and run a scaffolded game project using flint.toml [project] entry"
         echo "  test [unit|e2e|v5]   Build and run standalone Flint Engine verification suites"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
         echo "  preview <program>    Live preview: rebuild on save and swap window (spark|world|studio|cycles|file|dir)"
+        echo "  fern IMAGE PREFIX    Bake an upright frond into near, medium and far GLBs"
         echo "  world [--shots]      Launch 512m x 512m AAA Vulkan Open-World sandbox"
         echo "  kms [--probe]        Run bare-display DRM/KMS demo from a text console (no X11/Wayland)"
         echo "  kms3d                GPU 3D on the bare display via VK_KHR_display"

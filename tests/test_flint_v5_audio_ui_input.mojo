@@ -4467,6 +4467,99 @@ def test_f27_multios_audio_and_backend_traits() raises:
     assert_false(sock_m.is_valid())
 
 
+def test_t5_button_drag_outside_and_qoa_bounds() raises:
+    # 1. [HIGH-4] UiContext.button must NOT fire on drag-from-outside release or cross-button release
+    var ui = UiContext()
+    var inp = InputState()
+
+    # Frame 0: Layout pass to capture exact button rects
+    inp.begin_frame()
+    ui.begin_frame(inp, 800.0, 600.0)
+    assert_false(ui.button("btn_a", "Alpha", 120.0, 32.0))
+    var ra = ui.last_item_rect
+    assert_false(ui.button("btn_b", "Beta", 120.0, 32.0))
+    var rb = ui.last_item_rect
+    ui.end_frame()
+
+    var ax = ra.x + ra.w * Float32(0.5)
+    var ay = ra.y + ra.h * Float32(0.5)
+    var bx = rb.x + rb.w * Float32(0.5)
+    var by = rb.y + rb.h * Float32(0.5)
+
+    # Frame 1: Press left mouse button outside any button
+    inp.begin_frame()
+    inp.move_mouse(600.0, 500.0)
+    inp.set_mouse(0, True)
+    ui.begin_frame(inp, 800.0, 600.0)
+    assert_false(ui.button("btn_a", "Alpha", 120.0, 32.0))
+    assert_false(ui.button("btn_b", "Beta", 120.0, 32.0))
+    ui.end_frame()
+    assert_equal(ui.active_id, UInt64(0))
+
+    # Frame 2: Drag pointer onto BtnA while holding left mouse button
+    inp.begin_frame()
+    inp.move_mouse(ax, ay)
+    ui.begin_frame(inp, 800.0, 600.0)
+    assert_false(ui.button("btn_a", "Alpha", 120.0, 32.0))
+    assert_false(ui.button("btn_b", "Beta", 120.0, 32.0))
+    ui.end_frame()
+
+    # Frame 3: Release on BtnA -> must NOT trigger click!
+    inp.begin_frame()
+    inp.set_mouse(0, False)
+    ui.begin_frame(inp, 800.0, 600.0)
+    assert_false(ui.button("btn_a", "Alpha", 120.0, 32.0))
+    assert_false(ui.button("btn_b", "Beta", 120.0, 32.0))
+    ui.end_frame()
+
+    # Press on BtnA, release on BtnB -> neither triggers click
+    inp.begin_frame()
+    inp.move_mouse(ax, ay)
+    inp.set_mouse(0, True)
+    ui.begin_frame(inp, 800.0, 600.0)
+    assert_false(ui.button("btn_a", "Alpha", 120.0, 32.0))
+    assert_false(ui.button("btn_b", "Beta", 120.0, 32.0))
+    ui.end_frame()
+    assert_true(ui.active_id != UInt64(0))
+
+    inp.begin_frame()
+    inp.move_mouse(bx, by)
+    inp.set_mouse(0, False)
+    ui.begin_frame(inp, 800.0, 600.0)
+    assert_false(ui.button("btn_a", "Alpha", 120.0, 32.0))
+    assert_false(ui.button("btn_b", "Beta", 120.0, 32.0))
+    ui.end_frame()
+
+    # Legitimate press + release inside BtnA DOES trigger click
+    inp.begin_frame()
+    inp.move_mouse(ax, ay)
+    inp.set_mouse(0, True)
+    ui.begin_frame(inp, 800.0, 600.0)
+    assert_false(ui.button("btn_a", "Alpha", 120.0, 32.0))
+    ui.end_frame()
+
+    inp.begin_frame()
+    inp.set_mouse(0, False)
+    ui.begin_frame(inp, 800.0, 600.0)
+    assert_true(ui.button("btn_a", "Alpha", 120.0, 32.0))
+    ui.end_frame()
+
+    # 2. [Crit-4] QoaStreamCursor.decode_frames_into bounds check on negative offset and undersized dst
+    var pcm = List[Int16](capacity=128)
+    for i in range(64):
+        pcm.append(Int16((i * 137) & 0x3FFF))
+        pcm.append(Int16((-i * 113) & 0x3FFF))
+    var qoa_bytes = encode_qoa(pcm, 2, 48000)
+    var cur = QoaStreamCursor()
+    assert_true(cur.open(qoa_bytes))
+    assert_true(cur.valid)
+    var tiny = List[Int16](length=5, fill=Int16(0))
+    assert_equal(cur.decode_frames_into(qoa_bytes, tiny, -1, 10), 0)
+    assert_equal(cur.decode_frames_into(qoa_bytes, tiny, 2, 10), 0)  # len(tiny)//2 == 2, offset 2 -> 0 room
+    var wrote_clamped = cur.decode_frames_into(qoa_bytes, tiny, 0, 10)
+    assert_equal(wrote_clamped, 2)
+
+
 def main() raises:
     var t_start = get_time()
     test_audio_server_mastering_and_virtualizer()
@@ -4497,6 +4590,8 @@ def main() raises:
     print("[PASS] (k3) F26 UiContext.text_input Clipboard, Mouse Hit-Test/Drag/DblClick, Scroll & IME")
     test_f27_multios_audio_and_backend_traits()
     print("[PASS] (l) F27 Multi-OS WindowBackend / AudioBackend / UdpSocket Trait & PCM Ring Checks")
+    test_t5_button_drag_outside_and_qoa_bounds()
+    print("[PASS] (m) Tier 5 UiContext.button Drag-From-Outside Guard & QoaStreamCursor Bounds Safety")
     var elapsed = get_time() - t_start
     print("ALL FLINT V5 TRACK 4 TESTS PASSED in", elapsed, "s")
     assert_true(elapsed < 10.0)

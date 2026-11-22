@@ -415,27 +415,30 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                     or op == OP_TYPE_RAY_QUERY_KHR
                     or op == OP_TYPE_ACCELERATION_STRUCTURE_KHR
                 ):
-                    var tid = Int(words[pos + 1])
-                    if tid <= 0 or tid >= bound or id_defined[tid]:
-                        rep.fail("invalid/duplicate OpType* <id> " + String(tid))
+                    if wc < 2:
+                        rep.fail("OpType* truncated (missing result <id>)")
                     else:
-                        id_defined[tid] = True
-                        id_is_global[tid] = True
-                        if op == OP_TYPE_VOID:
-                            type_kind[tid] = _KIND_VOID
-                        elif op == OP_TYPE_BOOL:
-                            type_kind[tid] = _KIND_BOOL
-                        elif op == OP_TYPE_INT:
-                            type_kind[tid] = _KIND_INT
-                        elif op == OP_TYPE_FLOAT:
-                            type_kind[tid] = _KIND_FLOAT
-                        elif op == OP_TYPE_VECTOR:
-                            type_kind[tid] = _KIND_VECTOR
-                        elif op == OP_TYPE_POINTER and wc >= 4:
-                            type_kind[tid] = _KIND_PTR
-                            ptr_pointee[tid] = Int(words[pos + 3])
+                        var tid = Int(words[pos + 1])
+                        if tid <= 0 or tid >= bound or id_defined[tid]:
+                            rep.fail("invalid/duplicate OpType* <id> " + String(tid))
                         else:
-                            type_kind[tid] = _KIND_OTHER_TYPE
+                            id_defined[tid] = True
+                            id_is_global[tid] = True
+                            if op == OP_TYPE_VOID:
+                                type_kind[tid] = _KIND_VOID
+                            elif op == OP_TYPE_BOOL:
+                                type_kind[tid] = _KIND_BOOL
+                            elif op == OP_TYPE_INT:
+                                type_kind[tid] = _KIND_INT
+                            elif op == OP_TYPE_FLOAT:
+                                type_kind[tid] = _KIND_FLOAT
+                            elif op == OP_TYPE_VECTOR:
+                                type_kind[tid] = _KIND_VECTOR
+                            elif op == OP_TYPE_POINTER and wc >= 4:
+                                type_kind[tid] = _KIND_PTR
+                                ptr_pointee[tid] = Int(words[pos + 3])
+                            else:
+                                type_kind[tid] = _KIND_OTHER_TYPE
                     if op == OP_TYPE_RAY_QUERY_KHR or op == OP_TYPE_ACCELERATION_STRUCTURE_KHR:
                         rep.has_ray_query = True
                         if not has_cap_ray_query or not has_ext_ray_query:
@@ -462,14 +465,16 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                     else:
                         var rtype = Int(words[pos + 1])
                         var rid = Int(words[pos + 2])
-                        if rtype <= 0 or rtype >= bound or not id_defined[rtype]:
+                        var rtype_ok = rtype > 0 and rtype < bound and id_defined[rtype]
+                        if not rtype_ok:
                             rep.fail("undefined result type <id> " + String(rtype) + " on global <id> " + String(rid))
                         if rid <= 0 or rid >= bound or id_defined[rid]:
                             rep.fail("invalid/duplicate global <id> " + String(rid))
                         else:
                             id_defined[rid] = True
                             id_is_global[rid] = True
-                            val_type[rid] = rtype
+                            if rtype_ok:
+                                val_type[rid] = rtype
                         if op == OP_VARIABLE and wc >= 4 and words[pos + 3] == STORAGE_FUNCTION:
                             rep.fail("Function storage-class OpVariable cannot appear at module scope")
         else:
@@ -513,51 +518,97 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                                 succ_idx[bi].append(sb)
                                 preds[sb].append(bi)
 
-                    # Reachability BFS from entry block 0
+                    # Reachability & Reverse Postorder via iterative DFS from entry block 0
                     var reachable = List[Bool](length=num_b, fill=False)
-                    var queue = List[Int]()
+                    var postorder = List[Int](capacity=num_b)
+                    var dfs_node = List[Int]()
+                    var dfs_edge = List[Int]()
                     reachable[0] = True
-                    queue.append(0)
-                    var q_head = 0
-                    while q_head < len(queue):
-                        var u = queue[q_head]
-                        q_head += 1
-                        for v in succ_idx[u]:
+                    dfs_node.append(0)
+                    dfs_edge.append(0)
+                    while len(dfs_node) > 0:
+                        var top = len(dfs_node) - 1
+                        var u = dfs_node[top]
+                        var ei = dfs_edge[top]
+                        if ei < len(succ_idx[u]):
+                            dfs_edge[top] = ei + 1
+                            var v = succ_idx[u][ei]
                             if not reachable[v]:
                                 reachable[v] = True
-                                queue.append(v)
+                                dfs_node.append(v)
+                                dfs_edge.append(0)
+                        else:
+                            postorder.append(u)
+                            _ = dfs_node.pop()
+                            _ = dfs_edge.pop()
 
-                    # Iterative Dominator dataflow: dom[b * num_b + d] == True iff d dominates b
-                    var dom = List[Bool](length=num_b * num_b, fill=False)
-                    dom[0] = True
-                    for b in range(1, num_b):
-                        if reachable[b]:
-                            for d in range(num_b):
-                                dom[b * num_b + d] = True
+                    var n_rpo = len(postorder)
+                    var rpo_blocks = List[Int](capacity=n_rpo)
+                    var rpo_pos = List[Int](length=num_b, fill=-1)
+                    for i in range(n_rpo):
+                        var b_id = postorder[n_rpo - 1 - i]
+                        rpo_blocks.append(b_id)
+                        rpo_pos[b_id] = i
 
+                    # O(num_b) Cooper-Harvey-Kennedy iterative immediate dominator algorithm
+                    var doms = List[Int](length=num_b, fill=-1)
+                    doms[0] = 0
                     var changed = True
                     while changed:
                         changed = False
-                        for b in range(1, num_b):
-                            if not reachable[b]:
-                                continue
-                            for d in range(num_b):
-                                var new_val: Bool
-                                if d == b:
-                                    new_val = True
-                                else:
-                                    var all_preds = True
-                                    var had_reach_pred = False
-                                    for p in preds[b]:
-                                        if reachable[p]:
-                                            had_reach_pred = True
-                                            if not dom[p * num_b + d]:
-                                                all_preds = False
-                                                break
-                                    new_val = had_reach_pred and all_preds
-                                if dom[b * num_b + d] != new_val:
-                                    dom[b * num_b + d] = new_val
-                                    changed = True
+                        for ri in range(1, n_rpo):
+                            var b = rpo_blocks[ri]
+                            var new_idom = -1
+                            for p in preds[b]:
+                                if reachable[p] and doms[p] != -1:
+                                    if new_idom == -1:
+                                        new_idom = p
+                                    else:
+                                        var f1 = p
+                                        var f2 = new_idom
+                                        while f1 != f2:
+                                            while rpo_pos[f1] > rpo_pos[f2]:
+                                                f1 = doms[f1]
+                                            while rpo_pos[f2] > rpo_pos[f1]:
+                                                f2 = doms[f2]
+                                        new_idom = f1
+                            if new_idom != -1 and doms[b] != new_idom:
+                                doms[b] = new_idom
+                                changed = True
+
+                    # Build dominator tree + Euler tour (tin/tout) for O(1) dominance queries
+                    var dom_children = List[List[Int]](capacity=num_b)
+                    for _ in range(num_b):
+                        dom_children.append(List[Int]())
+                    for b in range(1, num_b):
+                        if reachable[b] and doms[b] >= 0:
+                            dom_children[doms[b]].append(b)
+
+                    var tin = List[Int](length=num_b, fill=-1)
+                    var tout = List[Int](length=num_b, fill=-1)
+                    var timer = 0
+                    dfs_node.clear()
+                    dfs_edge.clear()
+                    dfs_node.append(0)
+                    dfs_edge.append(0)
+                    tin[0] = timer
+                    timer += 1
+                    while len(dfs_node) > 0:
+                        var top = len(dfs_node) - 1
+                        var u = dfs_node[top]
+                        var ei = dfs_edge[top]
+                        if ei < len(dom_children[u]):
+                            dfs_edge[top] = ei + 1
+                            var v = dom_children[u][ei]
+                            tin[v] = timer
+                            timer += 1
+                            dfs_node.append(v)
+                            dfs_edge.append(0)
+                        else:
+                            tout[u] = timer
+                            timer += 1
+                            _ = dfs_node.pop()
+                            _ = dfs_edge.pop()
 
                     # Verify SSA Dominance for every instruction operand inside the function!
                     for u_chk in fn_uses:
@@ -578,8 +629,10 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                                 rep.fail("OpPhi references unknown parent block label " + String(u_chk.phi_pred_label))
                             else:
                                 var pb = pb_opt.value()
-                                if reachable[pb] and not dom[pb * num_b + db]:
-                                    rep.fail("OpPhi operand <id> " + String(uid) + " does not dominate predecessor block")
+                                if reachable[pb]:
+                                    var dom_ok = reachable[db] and tin[db] <= tin[pb] and tout[pb] <= tout[db]
+                                    if not dom_ok:
+                                        rep.fail("OpPhi operand <id> " + String(uid) + " does not dominate predecessor block")
                         else:
                             var ub = u_chk.block_idx
                             if not reachable[ub]:
@@ -588,7 +641,8 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                                 if dord >= u_chk.inst_ord:
                                     rep.fail("SSA <id> " + String(uid) + " used before definition in same block")
                             else:
-                                if not dom[ub * num_b + db]:
+                                var dom_ok = reachable[db] and tin[db] <= tin[ub] and tout[ub] <= tout[db]
+                                if not dom_ok:
                                     rep.fail("SSA <id> " + String(uid) + " does not dominate use block " + String(ub))
 
                 in_function = False
@@ -599,28 +653,37 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                 if wc == 3:
                     var rtype = Int(words[pos + 1])
                     var rid = Int(words[pos + 2])
-                    if rid > 0 and rid < bound and not id_defined[rid]:
+                    var rtype_ok = rtype > 0 and rtype < bound and id_defined[rtype]
+                    if not rtype_ok:
+                        rep.fail("undefined result type <id> " + String(rtype) + " on OpFunctionParameter <id> " + String(rid))
+                    if rid <= 0 or rid >= bound or id_defined[rid]:
+                        rep.fail("invalid/duplicate OpFunctionParameter <id> " + String(rid))
+                    else:
                         id_defined[rid] = True
                         id_is_global[rid] = True
-                        val_type[rid] = rtype
+                        if rtype_ok:
+                            val_type[rid] = rtype
             elif op == OP_LABEL:
                 if cur_block >= 0 and not block_terminated[cur_block]:
                     rep.fail("OpLabel started before previous basic block was terminated")
-                var lid = Int(words[pos + 1])
-                if lid <= 0 or lid >= bound or id_defined[lid]:
-                    rep.fail("invalid/duplicate OpLabel <id> " + String(lid))
+                if wc != 2:
+                    rep.fail("OpLabel expects 2 words")
                 else:
-                    id_defined[lid] = True
-                cur_block = len(block_labels)
-                label_to_block[lid] = cur_block
-                block_labels.append(lid)
-                block_succs.append(List[Int]())
-                block_terminated.append(False)
-                block_merge_kind.append(0)
-                block_merge_target.append(0)
-                block_cont_target.append(0)
-                cur_inst_ord = 0
-                saw_non_phi_in_block = False
+                    var lid = Int(words[pos + 1])
+                    if lid <= 0 or lid >= bound or id_defined[lid]:
+                        rep.fail("invalid/duplicate OpLabel <id> " + String(lid))
+                    else:
+                        id_defined[lid] = True
+                    cur_block = len(block_labels)
+                    label_to_block[lid] = cur_block
+                    block_labels.append(lid)
+                    block_succs.append(List[Int]())
+                    block_terminated.append(False)
+                    block_merge_kind.append(0)
+                    block_merge_target.append(0)
+                    block_cont_target.append(0)
+                    cur_inst_ord = 0
+                    saw_non_phi_in_block = False
             else:
                 if cur_block < 0:
                     rep.fail("instruction appeared inside OpFunction before first OpLabel")
@@ -641,11 +704,15 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                     else:
                         var rtype = Int(words[pos + 1])
                         var rid = Int(words[pos + 2])
+                        var rtype_ok = rtype > 0 and rtype < bound and id_defined[rtype]
+                        if not rtype_ok:
+                            rep.fail("undefined result type <id> " + String(rtype) + " on OpPhi <id> " + String(rid))
                         if rid <= 0 or rid >= bound or id_defined[rid]:
                             rep.fail("invalid/duplicate OpPhi <id> " + String(rid))
                         else:
                             id_defined[rid] = True
-                            val_type[rid] = rtype
+                            if rtype_ok:
+                                val_type[rid] = rtype
                             def_block[rid] = cur_block
                             def_ord[rid] = cur_inst_ord
                         var k = 3
@@ -662,13 +729,17 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                     else:
                         var rtype = Int(words[pos + 1])
                         var rid = Int(words[pos + 2])
+                        var rtype_ok = rtype > 0 and rtype < bound and id_defined[rtype]
+                        if not rtype_ok:
+                            rep.fail("undefined result type <id> " + String(rtype) + " on local OpVariable <id> " + String(rid))
                         if words[pos + 3] != STORAGE_FUNCTION:
                             rep.fail("OpVariable inside function must have Function storage class")
                         if rid <= 0 or rid >= bound or id_defined[rid]:
                             rep.fail("invalid/duplicate local OpVariable <id> " + String(rid))
                         else:
                             id_defined[rid] = True
-                            val_type[rid] = rtype
+                            if rtype_ok:
+                                val_type[rid] = rtype
                             def_block[rid] = 0
                             def_ord[rid] = cur_inst_ord
                 elif op == OP_SELECTION_MERGE:
@@ -699,7 +770,8 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                         var cid = Int(words[pos + 1])
                         fn_uses.append(_UseCheck(cid, cur_block, cur_inst_ord))
                         if cid > 0 and cid < bound and id_defined[cid]:
-                            if type_kind[val_type[cid]] != _KIND_BOOL:
+                            var ct = val_type[cid]
+                            if ct <= 0 or ct >= bound or type_kind[ct] != _KIND_BOOL:
                                 rep.fail("OpBranchConditional condition <id> " + String(cid) + " must be OpTypeBool")
                         block_succs[cur_block].append(Int(words[pos + 2]))
                         block_succs[cur_block].append(Int(words[pos + 3]))
@@ -718,7 +790,7 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                         fn_uses.append(_UseCheck(oid, cur_block, cur_inst_ord))
                         if pid > 0 and pid < bound and oid > 0 and oid < bound and id_defined[pid] and id_defined[oid]:
                             var pt = val_type[pid]
-                            if type_kind[pt] != _KIND_PTR:
+                            if pt <= 0 or pt >= bound or type_kind[pt] != _KIND_PTR:
                                 rep.fail("OpStore target <id> " + String(pid) + " is not a pointer")
                             elif ptr_pointee[pt] != val_type[oid]:
                                 rep.fail("OpStore type mismatch: pointer pointee != stored object type")
@@ -748,13 +820,15 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                     if wc >= 3:
                         var rtype = Int(words[pos + 1])
                         var rid = Int(words[pos + 2])
-                        if rtype <= 0 or rtype >= bound or not id_defined[rtype]:
+                        var rtype_ok = rtype > 0 and rtype < bound and id_defined[rtype]
+                        if not rtype_ok:
                             rep.fail("instruction op=" + String(op) + " uses undefined Result Type <id> " + String(rtype))
                         if rid <= 0 or rid >= bound or id_defined[rid]:
                             rep.fail("duplicate or out-of-bounds Result <id> " + String(rid) + " at op=" + String(op))
                         else:
                             id_defined[rid] = True
-                            val_type[rid] = rtype
+                            if rtype_ok:
+                                val_type[rid] = rtype
                             def_block[rid] = cur_block
                             def_ord[rid] = cur_inst_ord
 
@@ -803,7 +877,7 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                                 fn_uses.append(_UseCheck(pid, cur_block, cur_inst_ord))
                                 if pid > 0 and pid < bound and id_defined[pid]:
                                     var pt = val_type[pid]
-                                    if type_kind[pt] != _KIND_PTR:
+                                    if pt <= 0 or pt >= bound or type_kind[pt] != _KIND_PTR:
                                         rep.fail("OpLoad source <id> " + String(pid) + " is not a pointer")
                                     elif ptr_pointee[pt] != rtype:
                                         rep.fail("OpLoad result type != pointer pointee type")
@@ -842,8 +916,10 @@ def validate_spirv_module(words: List[UInt32]) -> SpirvValidationReport:
                             var cid = Int(words[pos + 3])
                             var yid = Int(words[pos + 4])
                             var nid = Int(words[pos + 5])
-                            if cid > 0 and cid < bound and id_defined[cid] and type_kind[val_type[cid]] != _KIND_BOOL:
-                                rep.fail("OpSelect condition <id> " + String(cid) + " must be OpTypeBool")
+                            if cid > 0 and cid < bound and id_defined[cid]:
+                                var ct = val_type[cid]
+                                if ct <= 0 or ct >= bound or type_kind[ct] != _KIND_BOOL:
+                                    rep.fail("OpSelect condition <id> " + String(cid) + " must be OpTypeBool")
                             if yid > 0 and yid < bound and id_defined[yid] and val_type[yid] != rtype:
                                 rep.fail("OpSelect true-branch type != result type")
                             if nid > 0 and nid < bound and id_defined[nid] and val_type[nid] != rtype:
