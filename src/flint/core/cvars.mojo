@@ -15,6 +15,7 @@ which thread solves what: the solver gives the same bits either way
 `SD_CVARS="debug.draw=1,debug.lights=1"` sets them at start. A flag written
 alone, as in `SD_CVARS=debug.draw`, turns on.
 """
+from std.math import abs, isfinite
 from flint.core.memory import MEM_TAGS, mem_tag_key, default_budget_mib
 
 comptime CVAR_DEBUG_DRAW: Int = 0
@@ -207,14 +208,21 @@ def cvar_entry(index: Int) -> CVarEntry:
 
 def show_value(value: Float32) -> String:
     """A whole number without its decimals, otherwise as Float32 prints."""
-    if value == Float32(Int(value)):
-        return String(Int(value))
+    if not isfinite(value):
+        return String(value)
+    if abs(Float64(value)) <= 1.0e15:
+        var iv = Int(value)
+        if value == Float32(iv):
+            return String(iv)
     return String(value)
 
 
 def parse_value(text: String) -> Optional[Float32]:
     try:
-        return Float32(Float64(text))
+        var v = Float32(Float64(text))
+        if not isfinite(v):
+            return None
+        return v
     except:
         return None
 
@@ -268,6 +276,8 @@ struct ConsoleVars(Copyable, Movable):
 
     def set(mut self, index: Int, value: Float32):
         if index < 0 or index >= len(self.values):
+            return
+        if not isfinite(value):
             return
         self.values[index] = (Float32(1) if value != 0 else Float32(0)) if self.entry(index).flag else value
 

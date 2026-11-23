@@ -10,7 +10,7 @@ Implements:
      highlight stretching/skewing across all roughness & viewing angles.
   3. Multi-light VSM shadow sub-atlas region allocator (`allocate_local_light_vsm_regions`).
 """
-from std.math import cos, max, min, sin, sqrt
+from std.math import cos, isfinite, max, min, sin, sqrt
 from std.memory import bitcast
 from flint.core.detmath import det_acos
 from flint.core.math import Vec3
@@ -70,17 +70,28 @@ struct RestirReservoir(Copyable, Movable):
 
     def __init__(out self, light_id: UInt32, weight_sum: Float32, M_count: UInt32, target_pdf: Float32):
         self.light_id = light_id
-        self.weight_sum = weight_sum
+        self.weight_sum = weight_sum if (isfinite(weight_sum) and weight_sum >= Float32(0.0)) else Float32(0.0)
         self.M_count = M_count
-        self.target_pdf = target_pdf
+        self.target_pdf = target_pdf if (isfinite(target_pdf) and target_pdf >= Float32(0.0)) else Float32(0.0)
 
     def update(mut self, candidate_id: UInt32, candidate_target_pdf: Float32, sample_weight: Float32, rand_01: Float32) -> Bool:
         """Streams a candidate sample into the reservoir using weighted reservoir sampling."""
-        if sample_weight <= Float32(0.0) or candidate_target_pdf <= Float32(0.0):
+        if (
+            not isfinite(sample_weight)
+            or not isfinite(candidate_target_pdf)
+            or sample_weight <= Float32(0.0)
+            or candidate_target_pdf <= Float32(0.0)
+        ):
             return False
-        self.weight_sum += sample_weight
+        if not isfinite(self.weight_sum) or self.weight_sum < Float32(0.0):
+            self.weight_sum = Float32(0.0)
+        var new_w_sum = self.weight_sum + sample_weight
+        if not isfinite(new_w_sum):
+            return False
+        var safe_rand = max(Float32(0.0), min(Float32(1.0), rand_01)) if isfinite(rand_01) else Float32(1.0)
+        self.weight_sum = new_w_sum
         self.M_count += 1
-        if self.light_id == UInt32(0xFFFFFFFF) or rand_01 * self.weight_sum <= sample_weight:
+        if self.light_id == UInt32(0xFFFFFFFF) or safe_rand * self.weight_sum <= sample_weight:
             self.light_id = candidate_id
             self.target_pdf = candidate_target_pdf
             return True
@@ -88,12 +99,27 @@ struct RestirReservoir(Copyable, Movable):
 
     def merge(mut self, other: RestirReservoir, candidate_target_pdf: Float32, rand_01: Float32) -> Bool:
         """Merges a neighbor or temporal reservoir into this reservoir."""
-        if other.M_count == 0 or candidate_target_pdf <= Float32(0.0):
+        if (
+            other.M_count == 0
+            or not isfinite(candidate_target_pdf)
+            or candidate_target_pdf <= Float32(0.0)
+        ):
             return False
-        var w = candidate_target_pdf * other.unbiased_weight() * Float32(other.M_count)
-        self.weight_sum += w
+        var ow = other.unbiased_weight()
+        if not isfinite(ow) or ow < Float32(0.0):
+            return False
+        var w = candidate_target_pdf * ow * Float32(other.M_count)
+        if not isfinite(w):
+            return False
+        if not isfinite(self.weight_sum) or self.weight_sum < Float32(0.0):
+            self.weight_sum = Float32(0.0)
+        var new_w_sum = self.weight_sum + w
+        if not isfinite(new_w_sum):
+            return False
+        var safe_rand = max(Float32(0.0), min(Float32(1.0), rand_01)) if isfinite(rand_01) else Float32(1.0)
+        self.weight_sum = new_w_sum
         self.M_count += other.M_count
-        if w > Float32(0.0) and (self.light_id == UInt32(0xFFFFFFFF) or rand_01 * self.weight_sum <= w):
+        if w > Float32(0.0) and (self.light_id == UInt32(0xFFFFFFFF) or safe_rand * self.weight_sum <= w):
             self.light_id = other.light_id
             self.target_pdf = candidate_target_pdf
             return True
@@ -101,12 +127,21 @@ struct RestirReservoir(Copyable, Movable):
 
     def unbiased_weight(self) -> Float32:
         """Evaluates W = (1 / target_pdf) * (weight_sum / M_count)."""
-        if self.target_pdf <= Float32(1e-8) or self.M_count == 0:
+        if (
+            not isfinite(self.target_pdf)
+            or not isfinite(self.weight_sum)
+            or self.target_pdf <= Float32(1e-8)
+            or self.weight_sum <= Float32(0.0)
+            or self.M_count == 0
+        ):
             return Float32(0.0)
-        return self.weight_sum / (Float32(self.M_count) * self.target_pdf)
+        var w = self.weight_sum / (Float32(self.M_count) * self.target_pdf)
+        return w if isfinite(w) else Float32(0.0)
 
     def clamp_m(mut self, max_m: UInt32):
         """Clamps M_count to max_m while scaling weight_sum to preserve unbiased estimator W."""
+        if not isfinite(self.weight_sum) or self.weight_sum < Float32(0.0):
+            self.weight_sum = Float32(0.0)
         if self.M_count > max_m and max_m > 0:
             var factor = Float32(max_m) / Float32(self.M_count)
             self.weight_sum *= factor

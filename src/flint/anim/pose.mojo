@@ -13,7 +13,7 @@ Upgrades in Flint v4:
   paying zero per-bone trig when settled, and `reparent_socket_inertial` for
   seamless world-space weapon/hardpoint re-parenting.
 """
-from std.math import sqrt
+from std.math import isfinite, sqrt
 from flint.core.detmath import det_sin, det_cos, det_acos
 from flint.core.math import Vec3
 from flint.core.transform import Quat, Mat4, trs
@@ -404,7 +404,9 @@ def sample_pose(model: NativeModel, clip: Int, time_seconds: Float32, mut pose: 
     if clip < 0 or clip >= len(model.animations):
         return
     ref animation = model.animations[clip]
-    var time = max(Float32(0), min(time_seconds, animation.duration))
+    var dur = animation.duration if (isfinite(animation.duration) and animation.duration >= Float32(0.0)) else Float32(0.0)
+    var safe_t = time_seconds if isfinite(time_seconds) else Float32(0.0)
+    var time = max(Float32(0), min(dur, safe_t))
     for channel in animation.channels:
         var key_count = len(channel.times)
         if channel.node < 0 or channel.node >= pose.count() or key_count == 0:
@@ -509,7 +511,7 @@ def lerp3(a: Vec3, b: Vec3, w: Float32) -> Vec3:
 
 def blend_into(mut base: Pose, other: Pose, weight: Float32):
     """Blends base pose toward other by weight, across every node."""
-    if weight <= 0:
+    if not isfinite(weight) or weight <= 0:
         return
     var count = min(base.count(), other.count())
     if weight >= 1:
@@ -527,12 +529,15 @@ def blend_into(mut base: Pose, other: Pose, weight: Float32):
 def blend_masked(mut base: Pose, other: Pose, mask: List[Float32], weight: Float32):
     """An override layer: each node moves toward other by weight x its mask
     weight; nodes outside the mask keep the base."""
-    if weight <= 0:
+    if not isfinite(weight) or weight <= 0:
         return
     var count = min(min(base.count(), other.count()), len(mask))
     for index in range(count):
-        var w = min(Float32(1), mask[index] * weight)
-        if w <= 0:
+        var mw = mask[index]
+        if not isfinite(mw):
+            continue
+        var w = min(Float32(1), mw * weight)
+        if not isfinite(w) or w <= 0:
             continue
         if w >= 1:
             base.t[index] = other.t[index]
@@ -548,13 +553,16 @@ def add_additive(mut base: Pose, layer: Pose, reference: Pose, mask: List[Float3
     """An additive layer: layer's change from reference, times weight x the
     node's mask weight, on top of base (rotation: base * delta, translation
     added, scale multiplied by lerp(1, layer.s / ref.s, mw))."""
-    if weight <= 0:
+    if not isfinite(weight) or weight <= 0:
         return
     var count = min(min(base.count(), layer.count()), min(reference.count(), len(mask)))
     var identity = Quat()
     for index in range(count):
-        var w = mask[index] * weight
-        if w <= 0:
+        var mw = mask[index]
+        if not isfinite(mw):
+            continue
+        var w = mw * weight
+        if not isfinite(w) or w <= 0:
             continue
         var delta = reference.r[index].conjugate().multiply(layer.r[index]).normalized()
         base.r[index] = base.r[index].multiply(identity.slerp(delta, w)).normalized()

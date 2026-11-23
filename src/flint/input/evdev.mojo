@@ -7,7 +7,7 @@ DualSense (`0..255`) unpressed triggers always read `0.0`, while opening event n
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import abs, sqrt
+from std.math import abs, isfinite, sqrt
 from flint.platform.os import open_path_fd, close_fd, list_directory, last_errno, EINTR
 from flint.platform.input import (
     InputState,
@@ -33,6 +33,7 @@ from flint.platform.input import (
     PAD_STICK_LEFT,
     PAD_STICK_RIGHT,
     PAD_CONTROLS,
+    PAD_DEADZONE,
     PAD_DIRECTION,
     PAD_AXIS_LEFT_X,
     PAD_AXIS_LEFT_Y,
@@ -163,8 +164,10 @@ def pack_ff_rumble_effect(
     pkt[12] = UInt8(dly_u16 & 0xFF)
     pkt[13] = UInt8((dly_u16 >> 8) & 0xFF)
 
-    var s_clamped = max(Float32(0.0), min(Float32(1.0), strong_motor))
-    var w_clamped = max(Float32(0.0), min(Float32(1.0), weak_motor))
+    var s_safe = strong_motor if isfinite(strong_motor) else Float32(0.0)
+    var w_safe = weak_motor if isfinite(weak_motor) else Float32(0.0)
+    var s_clamped = max(Float32(0.0), min(Float32(1.0), s_safe))
+    var w_clamped = max(Float32(0.0), min(Float32(1.0), w_safe))
     var strong_u16 = UInt16(min(65535, max(0, Int(s_clamped * Float32(65535.0) + Float32(0.5)))))
     var weak_u16 = UInt16(min(65535, max(0, Int(w_clamped * Float32(65535.0) + Float32(0.5)))))
 
@@ -642,11 +645,12 @@ struct EvdevGamepad(Movable):
         input.pads[slot].axes[PAD_AXIS_DPAD_X] = self.axes[PAD_AXIS_DPAD_X]
         input.pads[slot].axes[PAD_AXIS_DPAD_Y] = self.axes[PAD_AXIS_DPAD_Y]
 
-        var dz_l = max(Float32(0.0), min(Float32(0.95), input.deadzone_left))
-        var lrx = self.axes[PAD_AXIS_LEFT_X]
-        var lry = self.axes[PAD_AXIS_LEFT_Y]
+        var safe_dz_l = input.deadzone_left if isfinite(input.deadzone_left) else PAD_DEADZONE
+        var dz_l = max(Float32(0.0), min(Float32(0.95), safe_dz_l))
+        var lrx = self.axes[PAD_AXIS_LEFT_X] if isfinite(self.axes[PAD_AXIS_LEFT_X]) else Float32(0.0)
+        var lry = self.axes[PAD_AXIS_LEFT_Y] if isfinite(self.axes[PAD_AXIS_LEFT_Y]) else Float32(0.0)
         var lr = sqrt(lrx * lrx + lry * lry)
-        if lr < dz_l:
+        if not isfinite(lr) or lr < dz_l:
             input.pads[slot].axes[PAD_AXIS_LEFT_X] = 0.0
             input.pads[slot].axes[PAD_AXIS_LEFT_Y] = 0.0
         else:
@@ -654,11 +658,12 @@ struct EvdevGamepad(Movable):
             input.pads[slot].axes[PAD_AXIS_LEFT_X] = lrx * lscale
             input.pads[slot].axes[PAD_AXIS_LEFT_Y] = lry * lscale
 
-        var dz_r = max(Float32(0.0), min(Float32(0.95), input.deadzone_right))
-        var rrx = self.axes[PAD_AXIS_RIGHT_X]
-        var rry = self.axes[PAD_AXIS_RIGHT_Y]
+        var safe_dz_r = input.deadzone_right if isfinite(input.deadzone_right) else PAD_DEADZONE
+        var dz_r = max(Float32(0.0), min(Float32(0.95), safe_dz_r))
+        var rrx = self.axes[PAD_AXIS_RIGHT_X] if isfinite(self.axes[PAD_AXIS_RIGHT_X]) else Float32(0.0)
+        var rry = self.axes[PAD_AXIS_RIGHT_Y] if isfinite(self.axes[PAD_AXIS_RIGHT_Y]) else Float32(0.0)
         var rr = sqrt(rrx * rrx + rry * rry)
-        if rr < dz_r:
+        if not isfinite(rr) or rr < dz_r:
             input.pads[slot].axes[PAD_AXIS_RIGHT_X] = 0.0
             input.pads[slot].axes[PAD_AXIS_RIGHT_Y] = 0.0
         else:

@@ -25,7 +25,7 @@ Upgrades in Flint v4:
      re-rooting world `(root_pos, root_yaw)` to the settled pelvis with `0.0 mm`
      snap and seamlessly seeding `Inertializer`.
 """
-from std.math import sqrt, floor
+from std.math import sqrt, floor, isfinite
 from flint.core.detmath import det_exp, det_atan2, det_sin, det_cos, PI
 from flint.core.math import Vec3
 from flint.core.transform import Quat
@@ -880,6 +880,32 @@ def _pose_global_rot(pose: Pose, parents: List[Int], node: Int) -> Quat:
     return rot.normalized()
 
 
+@always_inline
+def _rag_clamp_vec3_f64(x: Float64, y: Float64, z: Float64, lim: Float64) -> Vec3:
+    var sx = max(-lim, min(lim, x)) if isfinite(x) else 0.0
+    var sy = max(-lim, min(lim, y)) if isfinite(y) else 0.0
+    var sz = max(-lim, min(lim, z)) if isfinite(z) else 0.0
+    return Vec3(Float32(sx), Float32(sy), Float32(sz))
+
+
+@always_inline
+def _rag_clamp_vec3(v: Vec3, lim: Float32) -> Vec3:
+    var sx = max(-lim, min(lim, v.x)) if isfinite(v.x) else Float32(0.0)
+    var sy = max(-lim, min(lim, v.y)) if isfinite(v.y) else Float32(0.0)
+    var sz = max(-lim, min(lim, v.z)) if isfinite(v.z) else Float32(0.0)
+    return Vec3(sx, sy, sz)
+
+
+@always_inline
+def _rag_finite_quat(q: Quat) -> Quat:
+    if not (isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)):
+        return Quat()
+    var n2 = Float64(q.x) * Float64(q.x) + Float64(q.y) * Float64(q.y) + Float64(q.z) * Float64(q.z) + Float64(q.w) * Float64(q.w)
+    if not isfinite(n2) or n2 <= 1.0e-12:
+        return Quat()
+    return q.normalized()
+
+
 struct ArticulatedRagdoll(Copyable, Movable):
     """Data-driven 6-DOF active-PD & limp ragdoll for humanoids, reverse-joint walkers,
     and variable-geometry mechas (`VF-1 Battloid`, `Regult`, `Glaug`), supporting both
@@ -1235,11 +1261,54 @@ struct ArticulatedRagdoll(Copyable, Movable):
         var idx = self.limb_for_bone(bone_node)
         if idx < 0:
             return
-        var r = world_point - self.states[idx].com_pos
-        var torque_impulse = r.cross(world_impulse)
-        self.states[idx].linear_vel = self.states[idx].linear_vel + world_impulse * self.states[idx].inv_mass
-        self.states[idx].angular_vel = self.states[idx].angular_vel + self.states[idx].apply_world_inv_inertia(
-            torque_impulse, self.limbs[idx].local_axis
+        self.states[idx].com_pos = _rag_clamp_vec3(self.states[idx].com_pos, Float32(1.0e12))
+        self.states[idx].rotation = _rag_finite_quat(self.states[idx].rotation)
+        self.states[idx].linear_vel = _rag_clamp_vec3(self.states[idx].linear_vel, Float32(1.0e12))
+        self.states[idx].angular_vel = _rag_clamp_vec3(self.states[idx].angular_vel, Float32(1.0e12))
+
+        var imp_x = Float64(world_impulse.x) if isfinite(world_impulse.x) else 0.0
+        var imp_y = Float64(world_impulse.y) if isfinite(world_impulse.y) else 0.0
+        var imp_z = Float64(world_impulse.z) if isfinite(world_impulse.z) else 0.0
+        var com = self.states[idx].com_pos
+        var pt_x = Float64(world_point.x) if isfinite(world_point.x) else Float64(com.x)
+        var pt_y = Float64(world_point.y) if isfinite(world_point.y) else Float64(com.y)
+        var pt_z = Float64(world_point.z) if isfinite(world_point.z) else Float64(com.z)
+
+        var rx = pt_x - Float64(com.x)
+        var ry = pt_y - Float64(com.y)
+        var rz = pt_z - Float64(com.z)
+        var tx = ry * imp_z - rz * imp_y
+        var ty = rz * imp_x - rx * imp_z
+        var tz = rx * imp_y - ry * imp_x
+
+        var inv_m = Float64(self.states[idx].inv_mass) if isfinite(self.states[idx].inv_mass) else 0.0
+        var lv = self.states[idx].linear_vel
+        self.states[idx].linear_vel = _rag_clamp_vec3_f64(
+            Float64(lv.x) + imp_x * inv_m,
+            Float64(lv.y) + imp_y * inv_m,
+            Float64(lv.z) + imp_z * inv_m,
+            1.0e12,
+        )
+
+        var axis_w = self.states[idx].rotation.rotate(self.limbs[idx].local_axis)
+        var ax = Float64(axis_w.x) if isfinite(axis_w.x) else 0.0
+        var ay = Float64(axis_w.y) if isfinite(axis_w.y) else 1.0
+        var az = Float64(axis_w.z) if isfinite(axis_w.z) else 0.0
+        var proj = tx * ax + ty * ay + tz * az
+        var vp_x = ax * proj
+        var vp_y = ay * proj
+        var vp_z = az * proj
+        var ia = Float64(self.states[idx].inv_inertia_axial) if isfinite(self.states[idx].inv_inertia_axial) else 0.0
+        var it = Float64(self.states[idx].inv_inertia_trans) if isfinite(self.states[idx].inv_inertia_trans) else 0.0
+        var dw_x = vp_x * ia + (tx - vp_x) * it
+        var dw_y = vp_y * ia + (ty - vp_y) * it
+        var dw_z = vp_z * ia + (tz - vp_z) * it
+        var av = self.states[idx].angular_vel
+        self.states[idx].angular_vel = _rag_clamp_vec3_f64(
+            Float64(av.x) + dw_x,
+            Float64(av.y) + dw_y,
+            Float64(av.z) + dw_z,
+            1.0e12,
         )
         self.still_seconds = Float32(0.0)
 
@@ -1248,7 +1317,9 @@ struct ArticulatedRagdoll(Copyable, Movable):
         var idx = self.limb_for_bone(bone_node)
         if idx < 0:
             return
-        var hit_pt = self.states[idx].com_pos + self.states[idx].rotation.rotate(
+        var safe_com = _rag_clamp_vec3(self.states[idx].com_pos, Float32(1.0e12))
+        var safe_rot = _rag_finite_quat(self.states[idx].rotation)
+        var hit_pt = safe_com + safe_rot.rotate(
             self.limbs[idx].local_axis * (Float32(0.25) * self.limbs[idx].length * self.scale)
         )
         self.apply_impulse_at_bone(bone_node, world_impulse, hit_pt)
@@ -1461,10 +1532,18 @@ struct ArticulatedRagdoll(Copyable, Movable):
 
     def step(mut self, dt: Float32, substeps: Int = 4):
         """Advances 6-DOF articulated rigid-capsule physics by `dt` in `substeps` steps."""
-        if dt <= Float32(0.0) or len(self.limbs) == 0:
+        if not isfinite(dt) or dt <= Float32(0.0) or len(self.limbs) == 0:
             return
-        var n_sub = max(1, substeps)
-        var h = dt / Float32(n_sub)
+        for i in range(len(self.limbs)):
+            self.states[i].com_pos = _rag_clamp_vec3(self.states[i].com_pos, Float32(1.0e12))
+            self.states[i].rotation = _rag_finite_quat(self.states[i].rotation)
+            self.states[i].linear_vel = _rag_clamp_vec3(self.states[i].linear_vel, Float32(1.0e12))
+            self.states[i].angular_vel = _rag_clamp_vec3(self.states[i].angular_vel, Float32(1.0e12))
+        var safe_g = _rag_clamp_vec3(self.gravity, Float32(1.0e6))
+        var step_dt = min(dt, Float32(1.0))
+        var n_sub = max(1, min(64, substeps))
+        var n_iters = max(1, min(64, self.solver_iterations))
+        var h = step_dt / Float32(n_sub)
         var inv_h = Float32(1.0) / h
 
         for _ in range(n_sub):
@@ -1473,18 +1552,21 @@ struct ArticulatedRagdoll(Copyable, Movable):
             var lin_keep = max(Float32(0.0), Float32(1.0) - self.linear_damping * h)
             var ang_keep = max(Float32(0.0), Float32(1.0) - self.angular_damping * h)
             for i in range(len(self.limbs)):
-                self.states[i].prev_com_pos = self.states[i].com_pos
-                self.states[i].prev_rotation = self.states[i].rotation
+                self.states[i].prev_com_pos = _rag_clamp_vec3(self.states[i].com_pos, Float32(1.0e12))
+                self.states[i].prev_rotation = _rag_finite_quat(self.states[i].rotation)
                 self.states[i].on_surface = False
 
-                var v = (self.states[i].linear_vel + self.gravity * h) * lin_keep
-                var w = self.states[i].angular_vel * ang_keep
+                var v = _rag_clamp_vec3((self.states[i].linear_vel + safe_g * h) * lin_keep, Float32(1.0e12))
+                var w = _rag_clamp_vec3(self.states[i].angular_vel * ang_keep, Float32(1.0e12))
                 self.states[i].linear_vel = v
                 self.states[i].angular_vel = w
-                self.states[i].com_pos = self.states[i].com_pos + v * h
+                self.states[i].com_pos = _rag_clamp_vec3(self.states[i].com_pos + v * h, Float32(1.0e12))
                 self.states[i].rotation.integrate(w, h)
+                var q_int = self.states[i].rotation
+                if not (isfinite(q_int.x) and isfinite(q_int.y) and isfinite(q_int.z) and isfinite(q_int.w)):
+                    self.states[i].rotation = self.states[i].prev_rotation
 
-            for _ in range(self.solver_iterations):
+            for _ in range(n_iters):
                 self._solve_collisions()
                 self._solve_joint_constraints(h)
             self._enforce_exact_hierarchy_limits()
@@ -1505,23 +1587,25 @@ struct ArticulatedRagdoll(Copyable, Movable):
                     if d_b < Float32(0.0):
                         max_pen = max(max_pen, -d_b)
                         self.states[i].on_surface = True
-                if max_pen > Float32(0.0):
+                if max_pen > Float32(0.0) and isfinite(max_pen):
                     var lift = n_f * max_pen
                     for i in range(len(self.limbs)):
-                        self.states[i].com_pos = self.states[i].com_pos + lift
+                        self.states[i].com_pos = _rag_clamp_vec3(self.states[i].com_pos + lift, Float32(1.0e12))
 
             # Derive constrained 6-DOF velocities & apply surface contact friction
             for i in range(len(self.limbs)):
-                var v_new = (self.states[i].com_pos - self.states[i].prev_com_pos) * inv_h
-                var dq = self.states[i].rotation.multiply(self.states[i].prev_rotation.conjugate()).normalized()
-                var w_new = det_quat_to_scaled_angle(dq) * inv_h
+                self.states[i].com_pos = _rag_clamp_vec3(self.states[i].com_pos, Float32(1.0e12))
+                self.states[i].rotation = _rag_finite_quat(self.states[i].rotation)
+                var v_new = _rag_clamp_vec3((self.states[i].com_pos - self.states[i].prev_com_pos) * inv_h, Float32(1.0e12))
+                var dq = _rag_finite_quat(self.states[i].rotation.multiply(self.states[i].prev_rotation.conjugate()))
+                var w_new = _rag_clamp_vec3(det_quat_to_scaled_angle(dq) * inv_h, Float32(1.0e12))
                 if self.states[i].on_surface:
                     var n = self.floor_normal
                     var vn = dot(v_new, n)
                     var vt = v_new - n * vn
                     var keep_t = max(Float32(0.0), Float32(1.0) - self.floor_friction * Float32(0.25))
-                    v_new = vt * keep_t + n * max(Float32(0.0), vn)
-                    w_new = w_new * max(Float32(0.0), Float32(1.0) - self.floor_friction * Float32(0.15))
+                    v_new = _rag_clamp_vec3(vt * keep_t + n * max(Float32(0.0), vn), Float32(1.0e12))
+                    w_new = _rag_clamp_vec3(w_new * max(Float32(0.0), Float32(1.0) - self.floor_friction * Float32(0.15)), Float32(1.0e12))
                 self.states[i].linear_vel = v_new
                 self.states[i].angular_vel = w_new
             self.steps_taken += 1
@@ -1965,7 +2049,7 @@ struct ArticulatedRagdoll(Copyable, Movable):
         self.linear_damping = r.f32()
         self.angular_damping = r.f32()
         self.scale = r.f32()
-        self.solver_iterations = r.integer()
+        self.solver_iterations = max(1, min(64, r.integer()))
         self.joint_compliance = r.f32()
         self.motor_scale = r.f32()
         self.root_attitude_stiffness = r.f32()

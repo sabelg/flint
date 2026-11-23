@@ -11,6 +11,7 @@ Implements:
   over `(peer_endpoint, time_bucket)` to defeat IP-spoofed slot-exhaustion DoS.
 """
 from std.collections import List
+from std.math import isfinite
 from flint.net.socket_udp import NetEndpoint
 
 comptime AEAD_KEY_BYTES: Int = 32
@@ -741,10 +742,20 @@ struct StatelessCookieAuth(Copyable, ImplicitlyCopyable, Movable):
         mac.update_u64_le(bucket)
         return mac.finish()
 
+    def _time_bucket(self, now_ms: Float64) -> UInt64:
+        if not isfinite(now_ms) or now_ms <= 0.0:
+            return UInt64(0)
+        var q = now_ms / self.bucket_ms
+        if not isfinite(q) or q <= 0.0:
+            return UInt64(0)
+        if q >= 9223372036854774784.0:
+            return UInt64(Int64.MAX)
+        return UInt64(Int(q))
+
     def issue_cookie(
         self, ep: NetEndpoint, now_ms: Float64
     ) -> Array[UInt8, 16]:
-        var bucket = UInt64(max(0, Int(now_ms / self.bucket_ms)))
+        var bucket = self._time_bucket(now_ms)
         return self._cookie_for_bucket(ep, bucket)
 
     def verify_cookie(
@@ -752,7 +763,7 @@ struct StatelessCookieAuth(Copyable, ImplicitlyCopyable, Movable):
     ) -> Bool:
         if cookie_ptr == 0:
             return False
-        var bucket = UInt64(max(0, Int(now_ms / self.bucket_ms)))
+        var bucket = self._time_bucket(now_ms)
         var cur = self._cookie_for_bucket(ep, bucket)
         if poly1305_verify_tag(cur, cookie_ptr):
             return True

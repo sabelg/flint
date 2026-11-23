@@ -8,7 +8,7 @@ Provides both CPU material packing/evaluation and SPIR-V code generation for:
   4. Thin-Film Airy Interference Iridescence (`KHR_materials_iridescence`: `100..800 nm` optical path difference).
   5. Estevez-Kulla `Charlie` Cloth/Velvet Sheen NDF & Burley Wrap Subsurface Scattering (`SSS`).
 """
-from std.math import cos, exp, max, min, sin, sqrt
+from std.math import cos, exp, isfinite, max, min, sin, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.render.spirv import AaaSpirvModule
@@ -41,6 +41,27 @@ comptime AAA_MATERIAL_WORDS: Int = 24
 comptime AAA_MAT_DET_NONE: UInt32 = 0x3F
 comptime AAA_MAT_INTERIOR_PARALLAX: UInt32 = 0x40000000
 comptime AAA_MAT_SSS_BIT: UInt32 = 0x80000000
+
+
+@always_inline
+def _fin_clamp_bsdf(v: Float32, lo: Float32, hi: Float32, fallback: Float32) -> Float32:
+    if not isfinite(v):
+        return fallback
+    return max(lo, min(hi, v))
+
+
+@always_inline
+def _fin_f32_bsdf(v: Float32, fallback: Float32 = 0.0) -> Float32:
+    return v if isfinite(v) else fallback
+
+
+@always_inline
+def _fin_vec3_bsdf(v: Vec3, fallback: Vec3 = Vec3(0.0, 0.0, 0.0)) -> Vec3:
+    return Vec3(
+        v.x if isfinite(v.x) else fallback.x,
+        v.y if isfinite(v.y) else fallback.y,
+        v.z if isfinite(v.z) else fallback.z,
+    )
 
 
 struct AaaMaterial(Copyable, Movable):
@@ -77,11 +98,11 @@ struct AaaMaterial(Copyable, Movable):
         roughness: Float32 = 0.35,
         metallic: Float32 = 0.0,
     ):
-        self.base_color = base_color
+        self.base_color = _fin_vec3_bsdf(base_color, Vec3(0.8, 0.8, 0.8))
         self.opacity = Float32(1.0)
         self.specular_factor = Float32(1.0)
-        self.roughness = max(Float32(0.04), min(Float32(1.0), roughness))
-        self.metallic = max(Float32(0.0), min(Float32(1.0), metallic))
+        self.roughness = _fin_clamp_bsdf(roughness, Float32(0.04), Float32(1.0), Float32(0.5))
+        self.metallic = _fin_clamp_bsdf(metallic, Float32(0.0), Float32(1.0), Float32(0.0))
         self.clearcoat = Float32(0.0)
         self.clearcoat_roughness = Float32(0.08)
         self.emissive = Vec3(0.0, 0.0, 0.0)
@@ -117,47 +138,57 @@ struct AaaMaterial(Copyable, Movable):
             if self.detail_normal_tex >= 0
             else AAA_MAT_DET_NONE
         )
+        var sss_amt = _fin_clamp_bsdf(self.subsurface_amount, Float32(0.0), Float32(1.0), Float32(0.0))
         var int_bit = AAA_MAT_INTERIOR_PARALLAX if self.interior_parallax_enabled else UInt32(0)
-        var sss_bit = AAA_MAT_SSS_BIT if self.subsurface_amount > Float32(0.001) else UInt32(0)
+        var sss_bit = AAA_MAT_SSS_BIT if sss_amt > Float32(0.001) else UInt32(0)
         var packed_tex = t_alb | (t_nrm << 8) | (t_orm << 16) | (t_det << 24) | int_bit | sss_bit
 
-        var abs_det_scale = max(Float32(0.001), self.detail_uv_scale)
+        var bc = _fin_vec3_bsdf(self.base_color, Vec3(0.8, 0.8, 0.8))
+        var em = _fin_vec3_bsdf(self.emissive, Vec3(0.0, 0.0, 0.0))
+        var sh_c = _fin_vec3_bsdf(self.sheen_color, Vec3(0.0, 0.0, 0.0))
+        var sss_c = _fin_vec3_bsdf(self.subsurface_color, Vec3(0.9, 0.3, 0.2))
+        var alpha_cut = _fin_f32_bsdf(self.alpha_cutoff, Float32(0.0))
+
+        var abs_det_scale = _fin_clamp_bsdf(self.detail_uv_scale, Float32(0.001), Float32(1.0e4), Float32(8.0))
         var encoded_det_scale = -abs_det_scale if self.road_wetness_mode else abs_det_scale
-        var abs_spec_fac = max(Float32(0.0), min(Float32(1.0), self.specular_factor))
+        var abs_spec_fac = _fin_clamp_bsdf(self.specular_factor, Float32(0.0), Float32(1.0), Float32(1.0))
         var encoded_spec_fac = (
             -max(Float32(1e-4), abs_spec_fac)
-            if self.alpha_cutoff > Float32(0.01)
+            if alpha_cut > Float32(0.01)
             else abs_spec_fac
         )
 
-        var abs_cc_r = max(Float32(0.04), min(Float32(1.0), self.clearcoat_roughness))
+        var safe_rough = _fin_clamp_bsdf(self.roughness, Float32(0.04), Float32(1.0), Float32(0.5))
+        var safe_metal = _fin_clamp_bsdf(self.metallic, Float32(0.0), Float32(1.0), Float32(0.0))
+        var safe_cc = _fin_clamp_bsdf(self.clearcoat, Float32(0.0), Float32(1.0), Float32(0.0))
+        var abs_cc_r = _fin_clamp_bsdf(self.clearcoat_roughness, Float32(0.04), Float32(1.0), Float32(0.08))
         var encoded_cc_r = -abs_cc_r if self.two_sided_foliage else abs_cc_r
-        var abs_sh_r = max(Float32(0.05), self.sheen_roughness)
+        var abs_sh_r = max(Float32(0.05), _fin_f32_bsdf(self.sheen_roughness, Float32(0.5)))
         var encoded_sh_r = -abs_sh_r if self.unlit else abs_sh_r
 
-        out.append(bitcast[DType.uint32](self.base_color.x))
-        out.append(bitcast[DType.uint32](self.base_color.y))
-        out.append(bitcast[DType.uint32](self.base_color.z))
+        out.append(bitcast[DType.uint32](bc.x))
+        out.append(bitcast[DType.uint32](bc.y))
+        out.append(bitcast[DType.uint32](bc.z))
         out.append(bitcast[DType.uint32](encoded_spec_fac))
-        out.append(bitcast[DType.uint32](max(Float32(0.04), min(Float32(1.0), self.roughness))))
-        out.append(bitcast[DType.uint32](max(Float32(0.0), min(Float32(1.0), self.metallic))))
-        out.append(bitcast[DType.uint32](max(Float32(0.0), min(Float32(1.0), self.clearcoat))))
+        out.append(bitcast[DType.uint32](safe_rough))
+        out.append(bitcast[DType.uint32](safe_metal))
+        out.append(bitcast[DType.uint32](safe_cc))
         out.append(bitcast[DType.uint32](encoded_cc_r))
-        out.append(bitcast[DType.uint32](self.emissive.x))
-        out.append(bitcast[DType.uint32](self.emissive.y))
-        out.append(bitcast[DType.uint32](self.emissive.z))
+        out.append(bitcast[DType.uint32](em.x))
+        out.append(bitcast[DType.uint32](em.y))
+        out.append(bitcast[DType.uint32](em.z))
         out.append(bitcast[DType.uint32](encoded_det_scale))
-        out.append(bitcast[DType.uint32](self.detail_normal_strength))
-        out.append(bitcast[DType.uint32](self.iridescence))
-        out.append(bitcast[DType.uint32](self.iridescence_thickness_nm))
-        out.append(bitcast[DType.uint32](self.iridescence_ior))
-        out.append(bitcast[DType.uint32](self.sheen_color.x))
-        out.append(bitcast[DType.uint32](self.sheen_color.y))
-        out.append(bitcast[DType.uint32](self.sheen_color.z))
+        out.append(bitcast[DType.uint32](_fin_clamp_bsdf(self.detail_normal_strength, Float32(0.0), Float32(10.0), Float32(0.0))))
+        out.append(bitcast[DType.uint32](_fin_clamp_bsdf(self.iridescence, Float32(0.0), Float32(1.0), Float32(0.0))))
+        out.append(bitcast[DType.uint32](_fin_f32_bsdf(self.iridescence_thickness_nm, Float32(380.0))))
+        out.append(bitcast[DType.uint32](_fin_f32_bsdf(self.iridescence_ior, Float32(1.65))))
+        out.append(bitcast[DType.uint32](sh_c.x))
+        out.append(bitcast[DType.uint32](sh_c.y))
+        out.append(bitcast[DType.uint32](sh_c.z))
         out.append(bitcast[DType.uint32](encoded_sh_r))
-        out.append(bitcast[DType.uint32](self.subsurface_color.x * self.subsurface_amount))
-        out.append(bitcast[DType.uint32](self.subsurface_color.y * self.subsurface_amount))
-        out.append(bitcast[DType.uint32](self.subsurface_color.z * self.subsurface_amount))
+        out.append(bitcast[DType.uint32](_fin_f32_bsdf(sss_c.x * sss_amt, Float32(0.0))))
+        out.append(bitcast[DType.uint32](_fin_f32_bsdf(sss_c.y * sss_amt, Float32(0.0))))
+        out.append(bitcast[DType.uint32](_fin_f32_bsdf(sss_c.z * sss_amt, Float32(0.0))))
         out.append(packed_tex)
 
 

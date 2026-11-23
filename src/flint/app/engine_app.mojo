@@ -11,7 +11,7 @@ Provides:
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import min, max
+from std.math import isfinite, min, max
 from std.sys import size_of
 from std.time import monotonic
 from flint.core.crash import install_crash_handler
@@ -254,7 +254,7 @@ struct FixedTime(Resource, Copyable, ImplicitlyCopyable):
     var clamped_last_frame: Bool
 
     def __init__(out self, hz: Float32 = 60.0, max_steps_per_frame: Int = 8):
-        var safe_hz = max(Float32(1.0), hz)
+        var safe_hz = max(Float32(1.0), hz) if isfinite(hz) else Float32(60.0)
         var step64 = Float64(1.0) / Float64(safe_hz)
         var max_steps = max(1, max_steps_per_frame)
         self.dt = Float32(step64)
@@ -268,7 +268,8 @@ struct FixedTime(Resource, Copyable, ImplicitlyCopyable):
 
     def advance_frame(mut self, frame_dt: Float32) -> Int:
         """Accumulates `frame_dt`, clamps spiral-of-death, returns due fixed steps, and updates `overstep_alpha`."""
-        var delta = max(Float64(0.0), Float64(frame_dt))
+        var safe_dt = frame_dt if isfinite(frame_dt) else Float32(0.0)
+        var delta = max(Float64(0.0), Float64(safe_dt))
         self.accumulator += delta
         self.clamped_last_frame = False
         if self.accumulator > self.max_accumulator:
@@ -745,10 +746,14 @@ struct AppConfig(Copyable, Movable):
         self.title = title
         self.headless = headless
         self.worker_threads = default_worker_count() if worker_threads < 0 else worker_threads
-        self.fixed_hz = fixed_hz
+        self.fixed_hz = max(Float32(1.0), fixed_hz) if isfinite(fixed_hz) else Float32(60.0)
         self.max_fixed_steps_per_frame = max_fixed_steps_per_frame
-        self.default_frame_dt = default_frame_dt
-        self.max_frame_dt = max(Float32(0.001), max_frame_dt)
+        self.default_frame_dt = (
+            max(Float32(0.0), default_frame_dt) if isfinite(default_frame_dt) else Float32(1.0 / 60.0)
+        )
+        self.max_frame_dt = (
+            max(Float32(0.001), max_frame_dt) if isfinite(max_frame_dt) else Float32(0.1)
+        )
         self.enable_profiler = enable_profiler
         self.profile_path = profile_path
         self.enable_crash_handler = enable_crash_handler
@@ -859,7 +864,9 @@ struct EngineApp(Movable):
         if self.profiler.active:
             self.profiler.begin_frame()
 
-        var clamped_dt = max(Float32(0.0), min(self.config.max_frame_dt, frame_dt))
+        var safe_frame_dt = frame_dt if isfinite(frame_dt) else Float32(0.0)
+        var safe_max_dt = self.config.max_frame_dt if isfinite(self.config.max_frame_dt) else Float32(0.1)
+        var clamped_dt = max(Float32(0.0), min(safe_max_dt, safe_frame_dt))
         var ft_opt = self.resources.get_ptr_mut[FrameTime]()
         if ft_opt:
             var ft_ptr = ft_opt.value()
@@ -948,7 +955,9 @@ struct EngineApp(Movable):
                 break
             var raw_dt = Float32(Float64(now_ns - last_ns) * 1e-9)
             last_ns = now_ns
-            var dt = min(self.config.max_frame_dt, max(Float32(0.0), raw_dt))
+            var safe_raw_dt = raw_dt if isfinite(raw_dt) else Float32(0.0)
+            var safe_max_dt = self.config.max_frame_dt if isfinite(self.config.max_frame_dt) else Float32(0.1)
+            var dt = min(safe_max_dt, max(Float32(0.0), safe_raw_dt))
             self.step_one_frame(dt)
             frame += 1
         self.shutdown()

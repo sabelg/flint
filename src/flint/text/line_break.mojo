@@ -21,6 +21,7 @@ Rejected: the full UAX #14 pair table (40+ classes, about 1,800 table
 entries) is more than two Latin languages need; it can replace
 `break_allowed` without changing callers.
 """
+from std.math import isfinite
 from flint.render.font import SdfFont
 from flint.text.utf8 import decode_utf8
 from flint.text.bidi import (
@@ -101,29 +102,50 @@ def break_allowed(before: Int, after: Int) -> Bool:
 
 def run_width(font: SdfFont, codes: List[Int], start: Int, end: Int, px: Float32) -> Float32:
     """Advance width of `codes[start:end]` at `px` per em, kerned inside the run."""
-    if not font.valid or end <= start:
+    if not font.valid or end <= start or not isfinite(px) or px <= Float32(0.0) or not isfinite(font.bake_px) or font.bake_px <= Float32(0.0):
         return 0
     var scale = px / font.bake_px
+    if not isfinite(scale):
+        return 0
     var width: Float32 = 0
     for index in range(start, end):
         width += font.advance_of(codes[index])   # unbaked glyphs from the source (dynamic cache)
         if index + 1 < end:
             width += font.kern(codes[index], codes[index + 1])
-    return width * scale
+    var total = width * scale
+    return total if isfinite(total) else Float32(0)
 
 
 def item_widths(font: SdfFont, codes: List[Int], px: Float32, mut advance: List[Float32], mut kern_before: List[Float32]):
     """Per-codepoint advance and the kerning with the codepoint before it."""
-    var scale = px / font.bake_px if font.valid else Float32(0)
+    var scale = Float32(0)
+    if font.valid and isfinite(px) and px > Float32(0.0) and isfinite(font.bake_px) and font.bake_px > Float32(0.0):
+        var s = px / font.bake_px
+        if isfinite(s):
+            scale = s
     for index in range(len(codes)):
         var a: Float32 = 0
         var k: Float32 = 0
-        if font.valid and codes[index] != 0x0A and codes[index] != 0x0D and not is_bidi_control(codes[index]):
-            a = font.advance_of(codes[index]) * scale
+        if scale != Float32(0) and font.valid and codes[index] != 0x0A and codes[index] != 0x0D and not is_bidi_control(codes[index]):
+            var raw_a = font.advance_of(codes[index]) * scale
+            if isfinite(raw_a):
+                a = raw_a
             if index > 0 and not is_bidi_control(codes[index - 1]):
-                k = font.kern(codes[index - 1], codes[index]) * scale
+                var raw_k = font.kern(codes[index - 1], codes[index]) * scale
+                if isfinite(raw_k):
+                    k = raw_k
         advance.append(a)
         kern_before.append(k)
+
+
+@always_inline
+def _safe_add_f32_lb(a: Float32, b: Float32) -> Float32:
+    var sa = a if isfinite(a) else Float32(0.0)
+    var sb = b if isfinite(b) else Float32(0.0)
+    var s = sa + sb
+    if isfinite(s):
+        return s
+    return Float32(3.402823e38) if s > Float32(0.0) else Float32(-3.402823e38)
 
 
 def break_items(codes: List[Int], advance: List[Float32], kern_before: List[Float32], max_width: Float32) -> List[TextLine]:
@@ -149,8 +171,8 @@ def break_items(codes: List[Int], advance: List[Float32], kern_before: List[Floa
             if index > start and break_allowed(codes[index - 1], code):
                 last_break = index
                 last_break_visible = visible
-            var step = advance[index] + (kern_before[index] if index > start else Float32(0))
-            var next_width = width + step
+            var step = _safe_add_f32_lb(advance[index], (kern_before[index] if index > start else Float32(0)))
+            var next_width = _safe_add_f32_lb(width, step)
             if not is_space(code) and max_width > 0 and next_width > max_width and index > start:
                 if last_break > start:
                     lines.append(TextLine(start, last_break, last_break_visible))
@@ -202,29 +224,31 @@ def wrap_shaped(
 
     var adv = List[Float32](length=n, fill=0.0)
     var kern_b = List[Float32](length=n, fill=0.0)
+    var safe_px = px if (isfinite(px) and px > Float32(0.0)) else Float32(0.0)
+    var safe_max_w = max_width if (isfinite(max_width) and max_width > Float32(0.0)) else Float32(0.0)
     var idx = 0
     while idx < n:
         var lvl = resolved.levels[idx]
         var s = idx
         while idx < n and resolved.levels[idx] == lvl:
             idx += 1
-        var sruns = shaper.shape_run_slice(codes, arabic_forms, s, idx, lvl, px)
+        var sruns = shaper.shape_run_slice(codes, arabic_forms, s, idx, lvl, safe_px)
         for sr in sruns:
             for g in sr.glyphs:
                 if g.cluster >= 0 and g.cluster < n:
-                    adv[g.cluster] += g.x_advance
+                    adv[g.cluster] = _safe_add_f32_lb(adv[g.cluster], g.x_advance)
 
-    var lines = break_items(codes, adv, kern_b, max_width)
+    var lines = break_items(codes, adv, kern_b, safe_max_w)
     for tl in lines:
         var bidi_runs = reorder_line(resolved, tl.start, tl.end)
         var sline = ShapedLine(tl.start, tl.end, tl.width)
         var line_w: Float32 = 0.0
         for br in bidi_runs:
-            var sruns = shaper.shape_run_slice(codes, arabic_forms, br.start, br.end, br.level, px)
+            var sruns = shaper.shape_run_slice(codes, arabic_forms, br.start, br.end, br.level, safe_px)
             for sr in sruns:
                 for g in sr.glyphs:
                     sline.glyphs.append(g)
-                    line_w += g.x_advance
+                    line_w = _safe_add_f32_lb(line_w, g.x_advance)
         # Keep break_items visible width unless zero (e.g., when shaped width differs from trailing spaces)
         if sline.width == 0.0 and line_w > 0.0:
             sline.width = line_w

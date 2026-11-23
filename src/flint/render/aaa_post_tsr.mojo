@@ -5,7 +5,7 @@
   - Natural `cos^4(theta)` Optical Vignette, Disocclusion-Reactive `FlintTSR v2`,
     Physical Display Output (`AgX Rec.709`, `HDR10 PQ`, `IEC sRGB`) & `CIEDE2000` (`ΔE2000`).
 """
-from std.math import atan2, cos, exp, log, log2, max, min, sin, sqrt
+from std.math import atan2, cos, exp, isfinite, log, log2, max, min, sin, sqrt
 from flint.core.math import Vec3
 from flint.render.spirv import (
     AaaSpirvModule,
@@ -649,6 +649,14 @@ def _emit_display_grade(
 def eval_display_grade_cpu(rgb: Vec3, saturation: Float32, contrast: Float32) -> Vec3:
     """The display grade on display-encoded [0, 1] color: saturation around Rec.709 luma, then
     contrast around mid-grey 0.5; 1.0 and 1.0 leave the color unchanged."""
+    if not (
+        isfinite(rgb.x)
+        and isfinite(rgb.y)
+        and isfinite(rgb.z)
+        and isfinite(saturation)
+        and isfinite(contrast)
+    ):
+        return Vec3(0.0, 0.0, 0.0)
     var sat = max(Float32(0.0), saturation)
     var con = max(Float32(0.0), contrast)
     var luma = rgb.x * Float32(0.2126) + rgb.y * Float32(0.7152) + rgb.z * Float32(0.0722)

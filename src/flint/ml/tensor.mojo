@@ -175,13 +175,38 @@ struct Tensor(Copyable, Movable):
 
     def get(self, k: Int) -> Float64:
         """Element `k` as a double, whatever the type."""
+        if k < 0:
+            return Float64(0)
         if self.dtype == DT_F32:
-            return Float64(self.fget(k))
+            if self.ext != 0:
+                if k >= self.numel():
+                    return Float64(0)
+                return Float64(self.fget(k))
+            if k >= len(self.f):
+                return Float64(0)
+            return Float64(self.f[k])
+        if k >= len(self.i):
+            return Float64(0)
         return Float64(self.i[k])
 
     def int_at(self, k: Int) -> Int:
+        if k < 0:
+            return 0
         if self.dtype == DT_F32:
-            return Int(self.fget(k))
+            var v: Float32
+            if self.ext != 0:
+                if k >= self.numel():
+                    return 0
+                v = self.fget(k)
+            else:
+                if k >= len(self.f):
+                    return 0
+                v = self.f[k]
+            if v != v or v <= Float32(-9e18) or v >= Float32(9e18):
+                return 0
+            return Int(v)
+        if k >= len(self.i):
+            return 0
         return self.i[k]
 
     def int_list(self) -> List[Int]:
@@ -223,6 +248,8 @@ def broadcast_shape(a: List[Int], b: List[Int]) raises -> List[Int]:
     for k in range(r):
         var da = a[k - (r - len(a))] if k >= r - len(a) else 1
         var db = b[k - (r - len(b))] if k >= r - len(b) else 1
+        if da < 0 or db < 0:
+            raise Error("broadcast: negative dimension")
         if da == db or db == 1:
             out[k] = da
         elif da == 1:

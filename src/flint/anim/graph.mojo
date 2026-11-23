@@ -18,6 +18,7 @@ may be a clip name, which stands for that clip's number in the game's clip
 order. Parameter names must be among `params`, and the code that drives
 the graph says which names it sets (`AnimGraphDef.missing_params`).
 """
+from std.math import isfinite
 from flint.core.detmath import det_sin, det_cos
 from flint.assets.json import JsonDocument, parse_json
 from flint.platform.os import read_bytes
@@ -143,6 +144,9 @@ struct BlendSpace2DDef(Copyable, Movable):
         if n == 1:
             out[0] = Float32(1.0)
             return out^
+        if not (isfinite(x) and isfinite(y)):
+            out[0] = Float32(1.0)
+            return out^
 
         var total_w = Float32(0.0)
         if not self.is_polar:
@@ -159,10 +163,11 @@ struct BlendSpace2DDef(Copyable, Movable):
                     var vij_y = self.samples[j].y - yi
                     var denom = vij_x * vij_x + vij_y * vij_y
                     if denom > Float32(1.0e-10):
-                        var hij = Float32(1.0) - (vip_x * vij_x + vip_y * vij_y) / denom
-                        hij = max(Float32(0.0), min(Float32(1.0), hij))
-                        if hij < wi:
-                            wi = hij
+                        var hij_raw = Float32(1.0) - (vip_x * vij_x + vip_y * vij_y) / denom
+                        if isfinite(hij_raw):
+                            var hij = max(Float32(0.0), min(Float32(1.0), hij_raw))
+                            if hij < wi:
+                                wi = hij
                 out[i] = wi
                 total_w += wi
         else:
@@ -189,10 +194,11 @@ struct BlendSpace2DDef(Copyable, Movable):
                         var vip_0 = (cx - cxi) * r_scale
                         var vip_1 = (sx - sxi) * r_scale
                         var vip_2 = y - ri
-                        var hij = Float32(1.0) - (vip_0 * vij_0 + vip_1 * vij_1 + vip_2 * vij_2) / denom
-                        hij = max(Float32(0.0), min(Float32(1.0), hij))
-                        if hij < wi:
-                            wi = hij
+                        var hij_raw = Float32(1.0) - (vip_0 * vij_0 + vip_1 * vij_1 + vip_2 * vij_2) / denom
+                        if isfinite(hij_raw):
+                            var hij = max(Float32(0.0), min(Float32(1.0), hij_raw))
+                            if hij < wi:
+                                wi = hij
                 out[i] = wi
                 total_w += wi
 

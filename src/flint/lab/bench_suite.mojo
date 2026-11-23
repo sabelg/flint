@@ -5,6 +5,7 @@ state-hash gating, golden-frame perceptual FLIP verification with automatic Magm
 heatmap PNG export on failure, and `perf_history.mojo` CSV reporting.
 """
 from std.collections import List
+from std.math import isinf, isnan
 from std.sys import argv
 from flint.core.build_stamp import BUILD_COMMIT
 from flint.core.perf_history import PerfTable, parse_table
@@ -66,9 +67,17 @@ def resolve_lab_date(default_date: String = "2026-11-20") -> String:
 
 
 def _fmt_f64_3(val: Float64) -> String:
+    if isnan(val):
+        return "nan"
+    if isinf(val):
+        return "-inf" if val < 0.0 else "inf"
     var neg = val < 0.0
     var a = -val if neg else val
+    if a >= 1.0e15:
+        return ("-" if neg else "") + String(a)
     var scaled = Int(a * 1000.0 + 0.5)
+    if scaled == 0:
+        return "0.000"
     var whole = scaled // 1000
     var frac = scaled % 1000
     var frac_s = String(frac)

@@ -13,7 +13,7 @@ Provides:
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import max, min
+from std.math import isfinite, max, min
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool
 from flint.core.math import Vec3, Quat, Mat4
@@ -68,7 +68,17 @@ trait SerializableComponent(Component):
 
 @always_inline
 def _f32_json(v: Float32) -> String:
-    return String(Float64(v))
+    return String(Float64(v)) if isfinite(v) else String("0.0")
+
+
+@always_inline
+def _vec3_finite(v: Vec3) -> Bool:
+    return isfinite(v.x) and isfinite(v.y) and isfinite(v.z)
+
+
+@always_inline
+def _quat_finite(q: Quat) -> Bool:
+    return isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)
 
 
 def _vec3_json(v: Vec3) -> String:
@@ -89,25 +99,49 @@ def _quat_json(q: Quat) -> String:
     )
 
 
+def _json_vec3_all_finite(doc: JsonDocument, node: Int) -> Bool:
+    if node < 0 or doc.array_size(node) < 3:
+        return True
+    for i in range(3):
+        var d = doc.number(doc.at(node, i), 0.0)
+        if not isfinite(d) or not isfinite(Float32(d)):
+            return False
+    return True
+
+
+def _json_quat_all_finite(doc: JsonDocument, node: Int) -> Bool:
+    if node < 0 or doc.array_size(node) < 4:
+        return True
+    for i in range(4):
+        var d = doc.number(doc.at(node, i), 0.0)
+        if not isfinite(d) or not isfinite(Float32(d)):
+            return False
+    return True
+
+
 def _read_vec3_json(doc: JsonDocument, node: Int, fallback: Vec3 = Vec3()) -> Vec3:
     if doc.array_size(node) < 3:
         return fallback
+    var x = Float32(doc.number(doc.at(node, 0), Float64(fallback.x)))
+    var y = Float32(doc.number(doc.at(node, 1), Float64(fallback.y)))
+    var z = Float32(doc.number(doc.at(node, 2), Float64(fallback.z)))
     return Vec3(
-        Float32(doc.number(doc.at(node, 0), Float64(fallback.x))),
-        Float32(doc.number(doc.at(node, 1), Float64(fallback.y))),
-        Float32(doc.number(doc.at(node, 2), Float64(fallback.z))),
+        x if isfinite(x) else fallback.x,
+        y if isfinite(y) else fallback.y,
+        z if isfinite(z) else fallback.z,
     )
 
 
 def _read_quat_json(doc: JsonDocument, node: Int) -> Quat:
     if doc.array_size(node) < 4:
         return Quat.identity()
-    return Quat(
-        Float32(doc.number(doc.at(node, 0), 0.0)),
-        Float32(doc.number(doc.at(node, 1), 0.0)),
-        Float32(doc.number(doc.at(node, 2), 0.0)),
-        Float32(doc.number(doc.at(node, 3), 1.0)),
-    )
+    var x = Float32(doc.number(doc.at(node, 0), 0.0))
+    var y = Float32(doc.number(doc.at(node, 1), 0.0))
+    var z = Float32(doc.number(doc.at(node, 2), 0.0))
+    var w = Float32(doc.number(doc.at(node, 3), 1.0))
+    if not (isfinite(x) and isfinite(y) and isfinite(z) and isfinite(w)):
+        return Quat.identity()
+    return Quat(x, y, z, w)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +192,8 @@ struct LocalTransform(SerializableComponent, ImplicitlyCopyable):
         var s = reader.vec3()
         if reader.failed:
             raise Error("LocalTransform: truncated blob")
+        if not (_vec3_finite(t) and _quat_finite(r) and _vec3_finite(s)):
+            raise Error("LocalTransform: non-finite transform component")
         return Self(t, r, s)
 
     def write_json(self) -> String:
@@ -173,9 +209,18 @@ struct LocalTransform(SerializableComponent, ImplicitlyCopyable):
 
     @staticmethod
     def read_json(doc: JsonDocument, node: Int) raises -> Self:
-        var t = _read_vec3_json(doc, doc.object_get(node, "translation"), Vec3(0, 0, 0))
-        var r = _read_quat_json(doc, doc.object_get(node, "rotation"))
-        var s = _read_vec3_json(doc, doc.object_get(node, "scale"), Vec3(1, 1, 1))
+        var t_node = doc.object_get(node, "translation")
+        var r_node = doc.object_get(node, "rotation")
+        var s_node = doc.object_get(node, "scale")
+        if (
+            not _json_vec3_all_finite(doc, t_node)
+            or not _json_quat_all_finite(doc, r_node)
+            or not _json_vec3_all_finite(doc, s_node)
+        ):
+            raise Error("LocalTransform: non-finite transform component in JSON")
+        var t = _read_vec3_json(doc, t_node, Vec3(0, 0, 0))
+        var r = _read_quat_json(doc, r_node)
+        var s = _read_vec3_json(doc, s_node, Vec3(1, 1, 1))
         return Self(t, r, s)
 
 
@@ -241,12 +286,17 @@ struct GlobalTransform(SerializableComponent):
         _ = version
         var m = Mat4()
         for i in range(16):
-            m.values[i] = reader.f32()
+            var mv = reader.f32()
+            if not isfinite(mv):
+                raise Error("GlobalTransform: non-finite matrix entry")
+            m.values[i] = mv
         var t = reader.vec3()
         var r = reader.quat()
         var s = reader.vec3()
         if reader.failed:
             raise Error("GlobalTransform: truncated blob")
+        if not (_vec3_finite(t) and _quat_finite(r) and _vec3_finite(s)):
+            raise Error("GlobalTransform: non-finite transform component")
         return Self(m^, t, r, s)
 
     def write_json(self) -> String:
@@ -262,9 +312,18 @@ struct GlobalTransform(SerializableComponent):
 
     @staticmethod
     def read_json(doc: JsonDocument, node: Int) raises -> Self:
-        var t = _read_vec3_json(doc, doc.object_get(node, "translation"), Vec3(0, 0, 0))
-        var r = _read_quat_json(doc, doc.object_get(node, "rotation"))
-        var s = _read_vec3_json(doc, doc.object_get(node, "scale"), Vec3(1, 1, 1))
+        var t_node = doc.object_get(node, "translation")
+        var r_node = doc.object_get(node, "rotation")
+        var s_node = doc.object_get(node, "scale")
+        if (
+            not _json_vec3_all_finite(doc, t_node)
+            or not _json_quat_all_finite(doc, r_node)
+            or not _json_vec3_all_finite(doc, s_node)
+        ):
+            raise Error("GlobalTransform: non-finite transform component in JSON")
+        var t = _read_vec3_json(doc, t_node, Vec3(0, 0, 0))
+        var r = _read_quat_json(doc, r_node)
+        var s = _read_vec3_json(doc, s_node, Vec3(1, 1, 1))
         return Self(trs(t, r, s), t, r, s)
 
 
@@ -533,6 +592,7 @@ def clear_parent(mut world: World, child: Entity) -> Bool:
 # ---------------------------------------------------------------------------
 
 comptime _PROP_BATCH_SIZE: Int = 32
+comptime MAX_HIERARCHY_DEPTH: Int = 65536
 
 
 @fieldwise_init
@@ -722,12 +782,16 @@ def propagate_transforms_parallel_cached(
                         parent_gt_addr = world.get_raw_ptr(par_e, tid_global)
                         parent_idx = Int32(par_e.index)
                         if col_dep >= 0:
-                            depth = max(
-                                1,
-                                Int(
-                                    Pointer[HierarchyDepth, ImmutAnyOrigin](
-                                        unsafe_from_address=world.archetypes[a].chunks[ch].cell_ptr(col_dep, r)
-                                    )[unsafe_offset=0].depth
+                            var max_depth_cap = min(MAX_HIERARCHY_DEPTH, max(1, ent_cap))
+                            depth = min(
+                                max_depth_cap,
+                                max(
+                                    1,
+                                    Int(
+                                        Pointer[HierarchyDepth, ImmutAnyOrigin](
+                                            unsafe_from_address=world.archetypes[a].chunks[ch].cell_ptr(col_dep, r)
+                                        )[unsafe_offset=0].depth
+                                    ),
                                 ),
                             )
                         else:
@@ -845,7 +909,7 @@ def interpolate_global_transform(
 ) -> GlobalTransform:
     """Smoothly interpolates `prev` and `curr` world transforms using `alpha` in `[0, 1]`
     (linear translation/scale + shortest-arc `Quat.slerp` rotation, free of matrix-lerp shear)."""
-    var a = max(Float32(0.0), min(Float32(1.0), alpha))
+    var a = max(Float32(0.0), min(Float32(1.0), alpha)) if isfinite(alpha) else Float32(0.0)
     var pos = prev.translation + (curr.translation - prev.translation) * a
     var rot = prev.rotation.slerp(curr.rotation, a)
     var scl = prev.scale + (curr.scale - prev.scale) * a

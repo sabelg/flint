@@ -4,6 +4,7 @@ Only system calls and the C ABI exported by the host C runtime are touched here.
 No third-party compatibility library is linked into the game.
 """
 from std.ffi import external_call
+from std.math import isfinite
 from std.sys.info import CompilationTarget
 from std.time import monotonic
 
@@ -778,8 +779,10 @@ struct LinuxGamepad(Movable):
         self.fd = -1
         self.device_index = -1
         self.connected = False
-        self.deadzone = max(Float32(0.0), min(Float32(0.65), deadzone))
-        self.curve_power = max(Float32(1.0), min(Float32(3.0), curve_power))
+        var safe_dz = deadzone if isfinite(deadzone) else Float32(0.12)
+        var safe_cp = curve_power if isfinite(curve_power) else Float32(1.55)
+        self.deadzone = max(Float32(0.0), min(Float32(0.65), safe_dz))
+        self.curve_power = max(Float32(1.0), min(Float32(3.0), safe_cp))
         self.axes = List[Float32](length=GAMEPAD_MAX_AXES, fill=0.0)
         self.buttons = List[Bool](length=GAMEPAD_MAX_BUTTONS, fill=False)
         self.prev_buttons = List[Bool](length=GAMEPAD_MAX_BUTTONS, fill=False)

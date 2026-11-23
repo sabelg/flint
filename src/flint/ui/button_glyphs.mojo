@@ -143,6 +143,8 @@ def pad_button(action: Int) -> Int:
 
 
 def pad_shape(button: Int) -> Int:
+    if button < 0:
+        return SHAPE_STICK
     if button <= BUTTON_Y:
         return SHAPE_FACE
     if button <= BUTTON_RT or button == BUTTON_START or button == BUTTON_BACK:
@@ -155,6 +157,8 @@ def pad_shape(button: Int) -> Int:
 def pad_label(button: Int, sony: Bool) -> String:
     """Text printed on a controller button; empty where the shape says it
     (the PlayStation face buttons and the d-pad)."""
+    if button < 0:
+        return ""
     if button <= BUTTON_Y:
         if sony:
             return ""

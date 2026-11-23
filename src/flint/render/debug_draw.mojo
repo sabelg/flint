@@ -20,7 +20,7 @@ CPU has no depth on a GPU frame.
 The HUD layer outlives a frame, so `paint` can keep a list of what it wrote for
 the caller to undo before the next frame.
 """
-from std.math import cos, pi, sin, sqrt
+from std.math import cos, isfinite, pi, sin, sqrt
 from flint.core.math import Vec3
 from flint.core.transform import Quat
 from flint.render.font import bitmap_glyph
@@ -133,6 +133,8 @@ struct DebugDraw(Copyable, Movable):
     var view: DebugView
     var target: Int  # the image being painted
     var row_pixels: Int
+    var view_w: Int
+    var view_h: Int
     var high_bits: UInt32  # what a painted pixel holds above its colour
     var keep_written: Bool
     var thickness: Int
@@ -154,6 +156,8 @@ struct DebugDraw(Copyable, Movable):
         self.view = DebugView(Vec3(), Vec3(1, 0, 0), Vec3(0, 1, 0), Vec3(0, 0, 1), 1, 0, 0)
         self.target = 0
         self.row_pixels = 0
+        self.view_w = 0
+        self.view_h = 0
         self.high_bits = 0
         self.keep_written = False
         self.thickness = 1
@@ -205,13 +209,22 @@ struct DebugDraw(Copyable, Movable):
 
     def paint(mut self, view: DebugView, target: Int, row_pixels: Int, high_bits: UInt32, keep_written: Bool):
         """Paint every shape into the image, then age them."""
+        self.lines_painted = 0
+        self.shapes_painted = 0
+        if target == 0 or row_pixels <= 0 or view.width <= 0 or view.height <= 0 or row_pixels < view.width:
+            self.target = 0
+            self.row_pixels = 0
+            self.view_w = 0
+            self.view_h = 0
+            return
         self.view = view
         self.target = target
         self.row_pixels = row_pixels
+        self.view_w = view.width
+        self.view_h = view.height
         self.high_bits = high_bits
         self.keep_written = keep_written
         self.thickness = max(1, view.height // 720)
-        self.lines_painted = 0
         self.shapes_painted = len(self.shapes)
         # Text goes over every wire, or labels are unreadable in a busy frame.
         for index in range(len(self.shapes)):
@@ -236,6 +249,12 @@ struct DebugDraw(Copyable, Movable):
         var b = self.shapes[index].b
         var radius = self.shapes[index].radius
         var color = self.shapes[index].color
+        if not (isfinite(a.x) and isfinite(a.y) and isfinite(a.z)):
+            return
+        if kind != SHAPE_SPHERE and not (isfinite(b.x) and isfinite(b.y) and isfinite(b.z)):
+            return
+        if not isfinite(radius) or radius < Float32(0.0):
+            return
         if kind != SHAPE_LINE and self.view.to_camera(a).z + self.shapes[index].reach() < NEAR:
             return
         if kind == SHAPE_LINE:
@@ -296,6 +315,8 @@ struct DebugDraw(Copyable, Movable):
         self.ring(a, y, cap * -1, 0, half, color)
 
     def paint_box(mut self, center: Vec3, half: Vec3, rotation: Quat, color: UInt32):
+        if not (isfinite(rotation.x) and isfinite(rotation.y) and isfinite(rotation.z) and isfinite(rotation.w)):
+            return
         var corners = List[Vec3](capacity=8)
         for index in range(8):
             corners.append(center + rotation.rotate(Vec3(
@@ -311,20 +332,38 @@ struct DebugDraw(Copyable, Movable):
                     self.world_line(corners[index], corners[other], color)
 
     def world_line(mut self, start: Vec3, end: Vec3, color: UInt32):
+        if not (
+            isfinite(start.x) and isfinite(start.y) and isfinite(start.z)
+            and isfinite(end.x) and isfinite(end.y) and isfinite(end.z)
+        ):
+            return
         var a = self.view.to_camera(start)
         var b = self.view.to_camera(end)
+        if not (
+            isfinite(a.x) and isfinite(a.y) and isfinite(a.z)
+            and isfinite(b.x) and isfinite(b.y) and isfinite(b.z)
+        ):
+            return
         if a.z < NEAR and b.z < NEAR:
             return
         if a.z < NEAR:
+            if b.z == a.z:
+                return
             a = a + (b - a) * ((NEAR - a.z) / (b.z - a.z))
         elif b.z < NEAR:
+            if a.z == b.z:
+                return
             b = b + (a - b) * ((NEAR - b.z) / (a.z - b.z))
         self.screen_line(self.view.screen_x(a), self.view.screen_y(a), self.view.screen_x(b), self.view.screen_y(b), color)
 
     def screen_line(mut self, start_x: Float64, start_y: Float64, end_x: Float64, end_y: Float64, color: UInt32):
         """Clip to the image (Liang-Barsky), then step along the longer axis."""
+        if not (isfinite(start_x) and isfinite(start_y) and isfinite(end_x) and isfinite(end_y)):
+            return
         var dx = end_x - start_x
         var dy = end_y - start_y
+        if not (isfinite(dx) and isfinite(dy)):
+            return
         var enter = Float64(0)
         var leave = Float64(1)
         var limit_x = Float64(self.view.width) - 0.001
@@ -338,20 +377,31 @@ struct DebugDraw(Copyable, Movable):
                     return
                 continue
             var meet = room / toward
+            if not isfinite(meet):
+                return
             if toward < 0:
                 enter = max(enter, meet)
             else:
                 leave = min(leave, meet)
             if enter > leave:
                 return
-        self.lines_painted += 1
-        var x = Float32(start_x + dx * enter)
-        var y = Float32(start_y + dy * enter)
+        var sx_clip = start_x + dx * enter
+        var sy_clip = start_y + dy * enter
         dx *= leave - enter
         dy *= leave - enter
+        if not (isfinite(sx_clip) and isfinite(sy_clip) and isfinite(dx) and isfinite(dy)):
+            return
+        var x = Float32(sx_clip)
+        var y = Float32(sy_clip)
         var steps = Int(max(abs(dx), abs(dy))) + 1
+        var max_steps = max(self.view.width, self.view.height) * 4 + 16
+        if steps <= 0 or steps > max_steps:
+            return
         var step_x = Float32(dx / Float64(steps))
         var step_y = Float32(dy / Float64(steps))
+        if not (isfinite(x) and isfinite(y) and isfinite(step_x) and isfinite(step_y)):
+            return
+        self.lines_painted += 1
         var wide = abs(dx) >= abs(dy)
         var width = self.view.width
         var height = self.view.height
@@ -359,6 +409,8 @@ struct DebugDraw(Copyable, Movable):
         var back = (brush - 1) // 2
         var pixel = color | self.high_bits
         for _ in range(steps + 1):
+            if not (isfinite(x) and isfinite(y)):
+                break
             var px = Int(x)
             var py = Int(y)
             for offset in range(brush):
@@ -371,6 +423,18 @@ struct DebugDraw(Copyable, Movable):
 
     @always_inline
     def plot(mut self, x: Int, y: Int, pixel: UInt32):
+        if (
+            self.target == 0
+            or self.row_pixels <= 0
+            or self.view_w <= 0
+            or self.view_h <= 0
+            or x < 0
+            or y < 0
+            or x >= self.view_w
+            or x >= self.row_pixels
+            or y >= self.view_h
+        ):
+            return
         var image = Pointer[UInt32, origin=MutAnyOrigin](unsafe_from_address=self.target)
         image[unsafe_offset=y * self.row_pixels + x] = pixel
         if self.keep_written:
@@ -378,10 +442,17 @@ struct DebugDraw(Copyable, Movable):
 
     def paint_text(mut self, index: Int):
         """The bottom line ends at the anchor, so a label clears what it names."""
-        var in_camera = self.view.to_camera(self.shapes[index].a)
-        if in_camera.z < NEAR:
+        var anchor = self.shapes[index].a
+        if not (isfinite(anchor.x) and isfinite(anchor.y) and isfinite(anchor.z)):
             return
-        var center_x = Int(self.view.screen_x(in_camera))
+        var in_camera = self.view.to_camera(anchor)
+        if not (isfinite(in_camera.x) and isfinite(in_camera.y) and isfinite(in_camera.z)) or in_camera.z < NEAR:
+            return
+        var sx = self.view.screen_x(in_camera)
+        var sy = self.view.screen_y(in_camera)
+        if not (isfinite(sx) and isfinite(sy)):
+            return
+        var center_x = Int(sx)
         var scale = self.text_scale()
         var text = self.shapes[index].text.copy()
         var count = text.byte_length()
@@ -390,7 +461,7 @@ struct DebugDraw(Copyable, Movable):
             if Int(text.as_bytes()[position]) == NEWLINE:
                 lines += 1
         var line_height = (GLYPH_ROWS + 2) * scale
-        var top = Int(self.view.screen_y(in_camera)) - lines * line_height
+        var top = Int(sy) - lines * line_height
         var start = 0
         var color = self.shapes[index].color | self.high_bits
         var shadow = self.high_bits

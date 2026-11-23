@@ -16,7 +16,7 @@ Architecture:
      `10,000+` crowd instances animate independently with exact 3D motion vectors!
 """
 from std.collections import List
-from std.math import abs, floor, max, min, sqrt
+from std.math import abs, floor, isfinite, max, min, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.core.transform import Mat4, Quat, trs
@@ -191,10 +191,14 @@ struct MaterialAsset(Copyable, Movable):
         domain: UInt32 = MAT_DOMAIN_STANDARD_PBR,
         flags: UInt32 = MAT_FLAG_RECEIVE_DECALS,
     ):
-        self.base_color = base_color
+        self.base_color = Vec3(
+            base_color.x if isfinite(base_color.x) else Float32(0.8),
+            base_color.y if isfinite(base_color.y) else Float32(0.8),
+            base_color.z if isfinite(base_color.z) else Float32(0.8),
+        )
         self.opacity = Float32(1.0)
-        self.roughness = max(Float32(0.04), min(Float32(1.0), roughness))
-        self.metallic = max(Float32(0.0), min(Float32(1.0), metallic))
+        self.roughness = max(Float32(0.04), min(Float32(1.0), roughness)) if isfinite(roughness) else Float32(0.5)
+        self.metallic = max(Float32(0.0), min(Float32(1.0), metallic)) if isfinite(metallic) else Float32(0.0)
         self.specular_factor = Float32(1.0)
         self.alpha_cutoff = Float32(0.0)
         self.emissive = Vec3(0.0, 0.0, 0.0)
@@ -433,20 +437,32 @@ struct MaterialAsset(Copyable, Movable):
             roughness=self.roughness,
             metallic=self.metallic,
         )
-        out.opacity = self.opacity
-        out.specular_factor = max(Float32(0.0), min(Float32(1.0), self.specular_factor))
-        out.clearcoat = self.clearcoat
-        out.clearcoat_roughness = max(Float32(0.04), min(Float32(1.0), self.clearcoat_roughness))
-        out.emissive = self.emissive
-        out.detail_uv_scale = max(Float32(0.001), self.detail_uv_scale)
-        out.detail_normal_strength = self.detail_normal_strength
-        out.iridescence = self.iridescence
-        out.iridescence_thickness_nm = self.iridescence_thickness_nm
-        out.iridescence_ior = self.iridescence_ior
-        out.sheen_color = self.sheen_color
-        out.sheen_roughness = max(Float32(0.05), self.sheen_roughness)
-        out.subsurface_color = self.subsurface_color
-        out.subsurface_amount = self.subsurface_amount
+        out.opacity = max(Float32(0.0), min(Float32(1.0), self.opacity)) if isfinite(self.opacity) else Float32(1.0)
+        out.specular_factor = max(Float32(0.0), min(Float32(1.0), self.specular_factor)) if isfinite(self.specular_factor) else Float32(1.0)
+        out.clearcoat = max(Float32(0.0), min(Float32(1.0), self.clearcoat)) if isfinite(self.clearcoat) else Float32(0.0)
+        out.clearcoat_roughness = max(Float32(0.04), min(Float32(1.0), self.clearcoat_roughness)) if isfinite(self.clearcoat_roughness) else Float32(0.08)
+        out.emissive = Vec3(
+            self.emissive.x if isfinite(self.emissive.x) else Float32(0.0),
+            self.emissive.y if isfinite(self.emissive.y) else Float32(0.0),
+            self.emissive.z if isfinite(self.emissive.z) else Float32(0.0),
+        )
+        out.detail_uv_scale = max(Float32(0.001), self.detail_uv_scale) if isfinite(self.detail_uv_scale) else Float32(8.0)
+        out.detail_normal_strength = self.detail_normal_strength if isfinite(self.detail_normal_strength) else Float32(0.0)
+        out.iridescence = max(Float32(0.0), min(Float32(1.0), self.iridescence)) if isfinite(self.iridescence) else Float32(0.0)
+        out.iridescence_thickness_nm = self.iridescence_thickness_nm if isfinite(self.iridescence_thickness_nm) else Float32(380.0)
+        out.iridescence_ior = self.iridescence_ior if isfinite(self.iridescence_ior) else Float32(1.65)
+        out.sheen_color = Vec3(
+            self.sheen_color.x if isfinite(self.sheen_color.x) else Float32(0.0),
+            self.sheen_color.y if isfinite(self.sheen_color.y) else Float32(0.0),
+            self.sheen_color.z if isfinite(self.sheen_color.z) else Float32(0.0),
+        )
+        out.sheen_roughness = max(Float32(0.05), self.sheen_roughness) if isfinite(self.sheen_roughness) else Float32(0.5)
+        out.subsurface_color = Vec3(
+            self.subsurface_color.x if isfinite(self.subsurface_color.x) else Float32(0.9),
+            self.subsurface_color.y if isfinite(self.subsurface_color.y) else Float32(0.3),
+            self.subsurface_color.z if isfinite(self.subsurface_color.z) else Float32(0.2),
+        )
+        out.subsurface_amount = max(Float32(0.0), min(Float32(1.0), self.subsurface_amount)) if isfinite(self.subsurface_amount) else Float32(0.0)
         out.albedo_tex = Int(self.albedo_slot) if self.albedo_slot != BINDLESS_SLOT_NONE else -1
         out.normal_tex = Int(self.normal_slot) if self.normal_slot != BINDLESS_SLOT_NONE else -1
         out.orm_tex = Int(self.orm_slot) if self.orm_slot != BINDLESS_SLOT_NONE else -1
@@ -455,8 +471,9 @@ struct MaterialAsset(Copyable, Movable):
         out.road_wetness_mode = (self.flags & MAT_FLAG_ROAD_WETNESS) != 0
         out.unlit = (self.domain == MAT_DOMAIN_UNLIT_UI)
         out.two_sided_foliage = (self.domain == MAT_DOMAIN_TWO_SIDED_FOLIAGE) or ((self.flags & MAT_FLAG_DOUBLE_SIDED) != 0)
-        if (self.flags & MAT_FLAG_ALPHA_MASKED) != 0 or self.alpha_cutoff > Float32(0.01):
-            out.alpha_cutoff = max(Float32(0.05), self.alpha_cutoff)
+        var safe_cutoff = self.alpha_cutoff if isfinite(self.alpha_cutoff) else Float32(0.0)
+        if (self.flags & MAT_FLAG_ALPHA_MASKED) != 0 or safe_cutoff > Float32(0.01):
+            out.alpha_cutoff = max(Float32(0.05), safe_cutoff)
         return out^
 
 
@@ -886,8 +903,8 @@ struct VatCrowdClipDesc(Copyable, ImplicitlyCopyable, Movable):
         self.clip_index = clip_index
         self.vertex_count = max(0, vertex_count)
         self.frame_count = max(1, frame_count)
-        self.sample_fps = max(Float32(1.0), sample_fps)
-        self.duration_sec = max(Float32(1.0 / 60.0), duration_sec)
+        self.sample_fps = max(Float32(1.0), sample_fps) if isfinite(sample_fps) else Float32(30.0)
+        self.duration_sec = max(Float32(1.0 / 60.0), duration_sec) if isfinite(duration_sec) else Float32(1.0)
         self.looping = looping
         self.pos_tex_slot = BINDLESS_SLOT_NONE
         self.nrm_tex_slot = BINDLESS_SLOT_NONE
@@ -903,7 +920,19 @@ struct BakedVatCrowdClip(Copyable, Movable):
 
     def __init__(out self, desc: VatCrowdClipDesc):
         self.desc = desc
-        var texels = max(1, desc.vertex_count * desc.frame_count)
+        comptime MAX_VAT_TEXELS: Int = 8_388_608
+        var vc = max(0, desc.vertex_count)
+        var fc = max(1, desc.frame_count)
+        var texels = 1
+        if vc > 0:
+            if vc > MAX_VAT_TEXELS or fc > MAX_VAT_TEXELS // vc:
+                texels = MAX_VAT_TEXELS
+                self.desc.frame_count = max(1, MAX_VAT_TEXELS // vc)
+                if vc > MAX_VAT_TEXELS:
+                    self.desc.vertex_count = 0
+                    texels = 1
+            else:
+                texels = vc * fc
         self.pos_rgba16f = List[UInt16](length=texels * 4, fill=0)
         self.nrm_rgba16f = List[UInt16](length=texels * 4, fill=0)
         self.bounds_min = Vec3(1e9, 1e9, 1e9)
@@ -996,15 +1025,26 @@ def bake_vat_crowd_clip_rgba16f(
 
     ref mesh = model.meshes[mesh_index]
     var v_cnt = mesh.vertex_count()
-    if v_cnt <= 0:
+    comptime MAX_VAT_FRAMES: Int = 4096
+    comptime MAX_VAT_TEXELS: Int = 8_388_608
+    if v_cnt <= 0 or v_cnt > MAX_VAT_TEXELS // 2 or not isfinite(sample_fps):
         return BakedVatCrowdClip(VatCrowdClipDesc())
 
     var dur = Float32(1.0)
     var has_clip = clip_index >= 0 and clip_index < len(model.animations)
     if has_clip:
-        dur = max(Float32(1.0 / 30.0), model.animations[clip_index].duration)
+        var raw_dur = model.animations[clip_index].duration
+        if not isfinite(raw_dur) or raw_dur < Float32(0.0):
+            return BakedVatCrowdClip(VatCrowdClipDesc())
+        dur = max(Float32(1.0 / 30.0), raw_dur)
     var fps = max(Float32(1.0), sample_fps)
-    var f_cnt = max(2, Int(dur * fps + Float32(0.5)) + (0 if looping else 1))
+    var max_f = max(2, min(MAX_VAT_FRAMES, MAX_VAT_TEXELS // v_cnt))
+    var raw_f_f64 = Float64(dur) * Float64(fps) + 0.5 + (0.0 if looping else 1.0)
+    var f_cnt = 2
+    if isfinite(raw_f_f64) and raw_f_f64 > 2.0:
+        f_cnt = max(2, min(max_f, Int(min(Float64(max_f), raw_f_f64))))
+    if raw_f_f64 > Float64(max_f):
+        fps = Float32(f_cnt) / dur
 
     var desc = VatCrowdClipDesc(clip_index, v_cnt, f_cnt, fps, dur, looping)
     var out = BakedVatCrowdClip(desc)
@@ -1133,37 +1173,43 @@ def sample_vat_vertex_cpu(
     delivering smooth sub-frame deformation and exact 3D `cur_pos - prev_pos` motion vectors for TSR v3!"""
     if baked.desc.vertex_count <= 0 or baked.desc.frame_count <= 0:
         return (Vec3(), Vec3(0.0, 1.0, 0.0), Vec3())
+    if not isfinite(baked.desc.duration_sec) or baked.desc.duration_sec <= Float32(0.0):
+        return (Vec3(), Vec3(0.0, 1.0, 0.0), Vec3())
 
     var f_cnt = baked.desc.frame_count
-    var dur = baked.desc.duration_sec
+    var dur = Float64(baked.desc.duration_sec)
 
-    var t_cur = cur_time_sec
-    var t_prev = prev_time_sec
+    var t_cur = Float64(cur_time_sec) if isfinite(cur_time_sec) else 0.0
+    var t_prev = Float64(prev_time_sec) if isfinite(prev_time_sec) else 0.0
     if baked.desc.looping:
         t_cur = t_cur - floor(t_cur / dur) * dur
+        if t_cur < 0.0 or t_cur >= dur or not isfinite(t_cur):
+            t_cur = 0.0
         t_prev = t_prev - floor(t_prev / dur) * dur
-        var fc = (t_cur / dur) * Float32(f_cnt)
-        var fp = (t_prev / dur) * Float32(f_cnt)
+        if t_prev < 0.0 or t_prev >= dur or not isfinite(t_prev):
+            t_prev = 0.0
+        var fc = max(0.0, min(Float64(f_cnt), (t_cur / dur) * Float64(f_cnt)))
+        var fp = max(0.0, min(Float64(f_cnt), (t_prev / dur) * Float64(f_cnt)))
         var c0 = Int(floor(fc)) % f_cnt
         var c1 = (c0 + 1) % f_cnt
-        var tc = fc - floor(fc)
+        var tc = Float32(fc - floor(fc))
         var p0 = Int(floor(fp)) % f_cnt
         var p1 = (p0 + 1) % f_cnt
-        var tp = fp - floor(fp)
+        var tp = Float32(fp - floor(fp))
 
         var cp = baked.read_pos_frame(c0, vertex_idx) * (Float32(1.0) - tc) + baked.read_pos_frame(c1, vertex_idx) * tc
         var cn = (baked.read_nrm_frame(c0, vertex_idx) * (Float32(1.0) - tc) + baked.read_nrm_frame(c1, vertex_idx) * tc).normalized()
         var pp = baked.read_pos_frame(p0, vertex_idx) * (Float32(1.0) - tp) + baked.read_pos_frame(p1, vertex_idx) * tp
         return (cp, cn, pp)
 
-    var fc_cl = max(Float32(0.0), min(Float32(1.0), t_cur / dur)) * Float32(f_cnt - 1)
-    var fp_cl = max(Float32(0.0), min(Float32(1.0), t_prev / dur)) * Float32(f_cnt - 1)
-    var c0 = min(f_cnt - 1, Int(floor(fc_cl)))
+    var fc_cl = max(0.0, min(1.0, t_cur / dur)) * Float64(f_cnt - 1)
+    var fp_cl = max(0.0, min(1.0, t_prev / dur)) * Float64(f_cnt - 1)
+    var c0 = max(0, min(f_cnt - 1, Int(floor(fc_cl))))
     var c1 = min(f_cnt - 1, c0 + 1)
-    var tc = fc_cl - Float32(c0)
-    var p0 = min(f_cnt - 1, Int(floor(fp_cl)))
+    var tc = Float32(fc_cl - Float64(c0))
+    var p0 = max(0, min(f_cnt - 1, Int(floor(fp_cl))))
     var p1 = min(f_cnt - 1, p0 + 1)
-    var tp = fp_cl - Float32(p0)
+    var tp = Float32(fp_cl - Float64(p0))
     var cp = baked.read_pos_frame(c0, vertex_idx) * (Float32(1.0) - tc) + baked.read_pos_frame(c1, vertex_idx) * tc
     var cn = (baked.read_nrm_frame(c0, vertex_idx) * (Float32(1.0) - tc) + baked.read_nrm_frame(c1, vertex_idx) * tc).normalized()
     var pp = baked.read_pos_frame(p0, vertex_idx) * (Float32(1.0) - tp) + baked.read_pos_frame(p1, vertex_idx) * tp

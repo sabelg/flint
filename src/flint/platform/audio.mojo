@@ -6,7 +6,7 @@ loaded or linked. Failure to open or configure a device leaves the game silent.
 """
 from std.atomic import Atomic
 from std.ffi import external_call
-from std.math import floor, cos, abs, sqrt
+from std.math import floor, cos, abs, isfinite, sqrt
 from flint.core.math import Vec3
 from flint.platform.os import read_bytes, close_fd, env_value
 from flint.platform.pulse import PulseClient
@@ -280,18 +280,37 @@ def alsa_close_pcm(fd: Int):
 
 def clip_sample(clip: WavClip, position: Float64, channel: Int, looping: Bool = False) -> Float32:
     var frames = clip.frame_count()
-    if not clip.valid or frames == 0:
-        return 0
-    var base = Int(floor(position))
+    if (
+        not clip.valid
+        or clip.channels <= 0
+        or frames <= 0
+        or len(clip.samples) < frames * clip.channels
+        or not isfinite(position)
+    ):
+        return Float32(0.0)
+    var source_channel = max(0, min(channel, clip.channels - 1))
+    var base: Int
+    var following: Int
+    var fraction: Float32
     if looping:
-        base = base % frames
+        var f_f64 = Float64(frames)
+        var wrapped = position - floor(position / f_f64) * f_f64
+        if wrapped < 0.0:
+            wrapped += f_f64
+        if wrapped >= f_f64 or not isfinite(wrapped):
+            wrapped = 0.0
+        var fl = floor(wrapped)
+        base = max(0, min(frames - 1, Int(fl)))
+        following = (base + 1) % frames
+        fraction = Float32(max(0.0, min(1.0, wrapped - fl)))
     else:
-        base = max(0, min(frames - 1, base))
-    var following = (base + 1) % frames if looping else min(base + 1, frames - 1)
-    var source_channel = min(channel, clip.channels - 1)
+        var clamped = max(0.0, min(Float64(frames - 1), position))
+        var fl = floor(clamped)
+        base = max(0, min(frames - 1, Int(fl)))
+        following = min(base + 1, frames - 1)
+        fraction = Float32(max(0.0, min(1.0, clamped - fl)))
     var first = Float32(clip.samples[base * clip.channels + source_channel]) / 32768.0
     var second = Float32(clip.samples[following * clip.channels + source_channel]) / 32768.0
-    var fraction = Float32(position - floor(position))
     return first + (second - first) * fraction
 
 
@@ -637,9 +656,11 @@ struct NativeAudio(Movable):
                     self.voices[i].active = False
             elif cmd.kind == AUDIO_CMD_SET_BUS:
                 if cmd.bus >= 0 and cmd.bus < len(self.bus_volume):
-                    self.bus_volume[cmd.bus] = cmd.volume
+                    var vol = cmd.volume if isfinite(cmd.volume) else Float32(0.0)
+                    self.bus_volume[cmd.bus] = max(Float32(0.0), min(Float32(1.0), vol))
             elif cmd.kind == AUDIO_CMD_SET_LISTENER:
-                self.listener_pos = Vec3(cmd.pos_x, cmd.pos_y, cmd.pos_z)
+                if isfinite(cmd.pos_x) and isfinite(cmd.pos_y) and isfinite(cmd.pos_z):
+                    self.listener_pos = Vec3(cmd.pos_x, cmd.pos_y, cmd.pos_z)
 
     def errno(self) -> Int:
         var pointer = external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()
@@ -809,19 +830,24 @@ struct NativeAudio(Movable):
         self.music_loaded = self.music.valid
         self.music_position = 0
         self.music_pitch = 1.0
-        self.music_volume = max(Float32(0.0), min(Float32(1.0), volume))
+        var safe_vol = volume if isfinite(volume) else Float32(0.0)
+        self.music_volume = max(Float32(0.0), min(Float32(1.0), safe_vol))
         self.music_pitch_follow = pitch_follow
 
     def set_bus_volumes(mut self, effects: Float32, speech: Float32, music: Float32):
         """The options' three volumes, each 0 to 1."""
-        self.bus_volume[BUS_EFFECTS] = max(Float32(0), min(Float32(1), effects))
-        self.bus_volume[BUS_SPEECH] = max(Float32(0), min(Float32(1), speech))
-        self.bus_volume[BUS_MUSIC] = max(Float32(0), min(Float32(1), music))
+        var e = effects if isfinite(effects) else Float32(0.0)
+        var s = speech if isfinite(speech) else Float32(0.0)
+        var m = music if isfinite(music) else Float32(0.0)
+        self.bus_volume[BUS_EFFECTS] = max(Float32(0), min(Float32(1), e))
+        self.bus_volume[BUS_SPEECH] = max(Float32(0), min(Float32(1), s))
+        self.bus_volume[BUS_MUSIC] = max(Float32(0), min(Float32(1), m))
 
     def set_drone(mut self, level: Float32):
         """The low hum's level, 0 (silent) to 1 (package 3.24). The gain
         follows it over DRONE_EASE_SECONDS while mixing."""
-        self.drone_level = max(Float32(0), min(Float32(1), level))
+        var safe_lvl = level if isfinite(level) else Float32(0.0)
+        self.drone_level = max(Float32(0), min(Float32(1), safe_lvl))
 
     def mix_drone(mut self, mut mixed: List[Float32], count: Int):
         """Adds the stereo throttle-coupled turbine/ambient hum to a mixed block."""
@@ -925,7 +951,8 @@ struct NativeAudio(Movable):
 
     def set_vacuum_acoustics(mut self, mix: Float32):
         """Set orbital vacuum acoustic muffling (0.0 = full atmosphere, 1.0 = deep space sub-bass conduction)."""
-        self.vacuum_mix = max(Float32(0.0), min(Float32(1.0), mix))
+        var safe_mix = mix if isfinite(mix) else Float32(0.0)
+        self.vacuum_mix = max(Float32(0.0), min(Float32(1.0), safe_mix))
 
     def play_voice(
         mut self,
@@ -983,21 +1010,27 @@ struct NativeAudio(Movable):
                 self.events_dropped += 1
                 return
             self.voices_stolen += 1
+        var safe_pitch = pitch if isfinite(pitch) else Float32(1.0)
+        var safe_vol = volume if isfinite(volume) else Float32(0.0)
+        var safe_pan = pan if isfinite(pan) else Float32(0.0)
+        var safe_lpf = lpf_coeff if isfinite(lpf_coeff) else Float32(1.0)
+        var safe_rev = reverb_send if isfinite(reverb_send) else Float32(0.0)
+        var safe_elev = elevation if isfinite(elevation) else Float32(0.0)
         self.voices[selected].active = True
         self.voices[selected].clip = sound_id
         self.voices[selected].position = 0
-        self.voices[selected].pitch = max(Float32(0.25), min(Float32(4), pitch))
-        self.voices[selected].volume = max(Float32(0), min(Float32(1.25), volume))
-        self.voices[selected].pan = max(Float32(-1.0), min(Float32(1.0), pan))
-        self.voices[selected].lpf_coeff = max(Float32(0.04), min(Float32(1.0), lpf_coeff))
+        self.voices[selected].pitch = max(Float32(0.25), min(Float32(4), safe_pitch))
+        self.voices[selected].volume = max(Float32(0), min(Float32(1.25), safe_vol))
+        self.voices[selected].pan = max(Float32(-1.0), min(Float32(1.0), safe_pan))
+        self.voices[selected].lpf_coeff = max(Float32(0.04), min(Float32(1.0), safe_lpf))
         self.voices[selected].lp_l = 0.0
         self.voices[selected].lp_r = 0.0
-        self.voices[selected].reverb_send = max(Float32(0.0), min(Float32(0.65), reverb_send))
+        self.voices[selected].reverb_send = max(Float32(0.0), min(Float32(0.65), safe_rev))
         self.voices[selected].priority = priority
         self.voices[selected].order = self.next_order
         self.voices[selected].bank = bank
         self.voices[selected].bus = bus if bus == BUS_SPEECH else BUS_EFFECTS
-        self.voices[selected].elevation = max(Float32(-1.0), min(Float32(1.0), elevation))
+        self.voices[selected].elevation = max(Float32(-1.0), min(Float32(1.0), safe_elev))
         self.voices[selected].hull_conducted = hull_conducted
         self.next_order += 1
         self.events_accepted += 1
@@ -1063,12 +1096,13 @@ struct NativeAudio(Movable):
             doppler_scale,
         )
         var final_vol = base_volume * sp.gain
-        if final_vol < Float32(0.012):
+        if not isfinite(final_vol) or final_vol < Float32(0.012):
             return
         var rel = source_pos - listener_pos
         var dist = sqrt(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z)
         var up_dot = rel.x * listener_up.x + rel.y * listener_up.y + rel.z * listener_up.z
-        var elev = max(Float32(-1.0), min(Float32(1.0), up_dot / max(Float32(0.5), dist)))
+        var elev_raw = up_dot / max(Float32(0.5), dist)
+        var elev = max(Float32(-1.0), min(Float32(1.0), elev_raw)) if isfinite(elev_raw) else Float32(0.0)
         self.play_voice(
             sound_id,
             base_pitch * sp.doppler_pitch,
@@ -1218,6 +1252,9 @@ struct NativeAudio(Movable):
         var output = List[Int16](length=needed, fill=0)
         for index in range(needed):
             var x = self.mix_buf[index]
+            if not isfinite(x):
+                output[index] = Int16(0)
+                continue
             # Transparent below 0.72, smooth Padé tanh studio soft-knee ceiling above 0.72
             var sample: Float32
             if x > Float32(0.72):
@@ -1226,6 +1263,9 @@ struct NativeAudio(Movable):
                 sample = Float32(-0.72) + Float32(0.28) * soft_clip_tanh((x + Float32(0.72)) * Float32(2.6))
             else:
                 sample = x
+            if not isfinite(sample):
+                output[index] = Int16(0)
+                continue
             output[index] = Int16(Int(max(Float32(-1.0), min(Float32(1.0), sample)) * Float32(32767.0)))
         return output^
 

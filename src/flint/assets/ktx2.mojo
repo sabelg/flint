@@ -1,5 +1,5 @@
 """Pure-Mojo KTX2 container parser, RFC 8878 Zstandard, BasisLZ/ETC1S, UASTC & BCn texture decoder (`ktx2.mojo`)."""
-from std.math import max, min, sqrt
+from std.math import isfinite, isnan, max, min, sqrt
 from std.memory import bitcast
 from flint.assets.bc_compress import (
     _bc7_anchor2,
@@ -52,6 +52,33 @@ comptime VK_FORMAT_BC5_UNORM: Int = 141
 comptime VK_FORMAT_BC5_SNORM: Int = 142
 comptime VK_FORMAT_BC7_UNORM: Int = 145
 comptime VK_FORMAT_BC7_SRGB: Int = 146
+
+
+@always_inline
+def _sf16_bits_to_f32(h: Int) -> Float32:
+    var sign = UInt32((h >> 15) & 1) << 31
+    var exp16 = (h >> 10) & 0x1F
+    var mant16 = h & 0x3FF
+    if exp16 == 0:
+        if mant16 == 0:
+            return bitcast[DType.float32](sign)
+        var mag = Float32(mant16) * Float32(5.960464477539063e-8)
+        return -mag if sign != 0 else mag
+    if exp16 == 31:
+        if mant16 != 0:
+            return bitcast[DType.float32](UInt32(0x7FC00000))
+        return bitcast[DType.float32](sign | UInt32(0x7F800000))
+    var bits32 = sign | UInt32((exp16 - 15 + 127) << 23) | UInt32(mant16 << 13)
+    return bitcast[DType.float32](bits32)
+
+
+@always_inline
+def _f32_unit_to_u8(f: Float32) -> UInt32:
+    if isnan(f) or f <= Float32(0.0):
+        return UInt32(0)
+    if f >= Float32(1.0):
+        return UInt32(255)
+    return UInt32(max(0, min(255, Int(f * Float32(255.0) + Float32(0.5)))))
 
 
 @always_inline
@@ -503,9 +530,9 @@ def _zstd_decode_huf_stream(
 def decompress_zstd(data: List[UInt8], start: Int, byte_len: Int, expected_size: Int = 0) -> Tuple[Bool, List[UInt8]]:
     """Pure-Mojo RFC 8878 Zstandard decompressor."""
     var empty = List[UInt8]()
-    var end = start + byte_len
-    if start < 0 or byte_len < 6 or end > len(data):
+    if start < 0 or byte_len < 6 or start > len(data) or byte_len > len(data) - start:
         return (False, empty^)
+    var end = start + byte_len
     if _u32_le_u(data, start) != 0xFD2FB528:
         return (False, empty^)
 
@@ -2178,22 +2205,22 @@ def decode_ktx2(data: List[UInt8], maximum_size: Int = 4096) -> NativeImage:
             pixels = List[UInt32](capacity=mw * mh)
             for i in range(mw * mh):
                 var o = i * 8
-                var r = max(0, min(255, Int(uf16_bits_to_f32(_u16_le(payload, o) & 0x7FFF) * Float32(255.0) + Float32(0.5))))
-                var g = max(0, min(255, Int(uf16_bits_to_f32(_u16_le(payload, o + 2) & 0x7FFF) * Float32(255.0) + Float32(0.5))))
-                var b = max(0, min(255, Int(uf16_bits_to_f32(_u16_le(payload, o + 4) & 0x7FFF) * Float32(255.0) + Float32(0.5))))
-                var a = max(0, min(255, Int(uf16_bits_to_f32(_u16_le(payload, o + 6) & 0x7FFF) * Float32(255.0) + Float32(0.5))))
-                pixels.append((UInt32(a) << 24) | (UInt32(r) << 16) | (UInt32(g) << 8) | UInt32(b))
+                var r = _f32_unit_to_u8(_sf16_bits_to_f32(_u16_le(payload, o)))
+                var g = _f32_unit_to_u8(_sf16_bits_to_f32(_u16_le(payload, o + 2)))
+                var b = _f32_unit_to_u8(_sf16_bits_to_f32(_u16_le(payload, o + 4)))
+                var a = _f32_unit_to_u8(_sf16_bits_to_f32(_u16_le(payload, o + 6)))
+                pixels.append((a << 24) | (r << 16) | (g << 8) | b)
         elif vk_format == VK_FORMAT_R32G32B32A32_SFLOAT:
             if len(payload) < mw * mh * 16:
                 return img^
             pixels = List[UInt32](capacity=mw * mh)
             for i in range(mw * mh):
                 var o = i * 16
-                var r = max(0, min(255, Int(bitcast[DType.float32](_u32_le_u(payload, o)) * Float32(255.0) + Float32(0.5))))
-                var g = max(0, min(255, Int(bitcast[DType.float32](_u32_le_u(payload, o + 4)) * Float32(255.0) + Float32(0.5))))
-                var b = max(0, min(255, Int(bitcast[DType.float32](_u32_le_u(payload, o + 8)) * Float32(255.0) + Float32(0.5))))
-                var a = max(0, min(255, Int(bitcast[DType.float32](_u32_le_u(payload, o + 12)) * Float32(255.0) + Float32(0.5))))
-                pixels.append((UInt32(a) << 24) | (UInt32(r) << 16) | (UInt32(g) << 8) | UInt32(b))
+                var r = _f32_unit_to_u8(bitcast[DType.float32](_u32_le_u(payload, o)))
+                var g = _f32_unit_to_u8(bitcast[DType.float32](_u32_le_u(payload, o + 4)))
+                var b = _f32_unit_to_u8(bitcast[DType.float32](_u32_le_u(payload, o + 8)))
+                var a = _f32_unit_to_u8(bitcast[DType.float32](_u32_le_u(payload, o + 12)))
+                pixels.append((a << 24) | (r << 16) | (g << 8) | b)
         elif vk_format >= VK_FORMAT_BC1_RGB_UNORM and vk_format <= VK_FORMAT_BC1_RGBA_SRGB:
             if len(payload) < blocks_n * 8:
                 return img^

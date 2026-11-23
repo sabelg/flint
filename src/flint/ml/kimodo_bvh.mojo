@@ -1,5 +1,5 @@
 """Write Kimodo's local SOMA transforms as a centimetre, Z-Y-X BVH clip."""
-from std.math import asin, atan2
+from std.math import asin, atan2, isfinite
 from flint.ml.motionbricks import MbClip, MbSkeleton, MbQuat
 from flint.platform.os import write_file_durable
 
@@ -57,16 +57,32 @@ def _joint(
 
 
 def write_kimodo_bvh(clip: MbClip, path: String) raises:
-    if clip.skeleton.num_joints() != 30 or not clip.num_frames():
+    var expected_joints = clip.skeleton.num_joints()
+    if (
+        expected_joints != 30
+        or not clip.num_frames()
+        or len(clip.skeleton.parents) != expected_joints
+        or len(clip.skeleton.reference) != expected_joints
+    ):
         raise Error("Expected a SOMA30 clip")
+    if not isfinite(clip.sample_rate) or clip.sample_rate <= 0:
+        raise Error("Invalid clip sample rate")
+    var frame_time = 1.0 / Float64(clip.sample_rate)
+    if not isfinite(frame_time) or frame_time <= 0.0:
+        raise Error("Invalid clip sample rate")
+    for pose in clip.frames:
+        if len(pose) < expected_joints:
+            raise Error("Incomplete pose frame in write_kimodo_bvh")
     var text = String("HIERARCHY\n")
     var traversal = List[Int]()
     _joint(clip.skeleton, 0, "", text, traversal)
+    if len(traversal) != expected_joints:
+        raise Error("Incomplete SOMA30 skeleton hierarchy")
     text += (
         "MOTION\nFrames: "
         + String(clip.num_frames())
         + "\nFrame Time: "
-        + String(1.0 / Float64(clip.sample_rate))
+        + String(frame_time)
         + "\n"
     )
     for pose in clip.frames:

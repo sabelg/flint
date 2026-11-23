@@ -8,7 +8,7 @@ Provides geometry-driven 3D acoustic propagation over `Bvh8MeshCollider`:
   - 6-ray listener room-enclosure Sabine `RT60 = 0.161 * V / A` probe driving FDN reverb decay
 """
 from std.collections import List
-from std.math import sqrt, exp, abs
+from std.math import sqrt, exp, abs, isfinite
 from flint.core.math import Vec3
 from flint.physics.bvh import Bvh8MeshCollider
 
@@ -255,8 +255,20 @@ def probe_room_sabine_rt60(
     """Casts 6 cardinal rays `(±X, ±Y, ±Z)` from `listener_pos` to estimate enclosure
     volume `V`, material-weighted absorption `A`, and Sabine `RT60 = 0.161 * V / A`."""
     var out = RoomProbeResult()
-    if len(bvh.nodes) == 0 or bvh.root_node < 0:
+    if (
+        len(bvh.nodes) == 0
+        or bvh.root_node < 0
+        or not isfinite(listener_pos.x)
+        or not isfinite(listener_pos.y)
+        or not isfinite(listener_pos.z)
+    ):
         return out^
+
+    var safe_max_dist = (
+        max(Float32(0.35), min(Float32(1.0e12), max_probe_dist))
+        if isfinite(max_probe_dist)
+        else Float32(50.0)
+    )
 
     var dirs = Array[Vec3, 6](fill=Vec3())
     dirs[0] = Vec3(1.0, 0.0, 0.0)
@@ -266,47 +278,49 @@ def probe_room_sabine_rt60(
     dirs[4] = Vec3(0.0, 0.0, 1.0)
     dirs[5] = Vec3(0.0, 0.0, -1.0)
 
-    var dists = Array[Float32, 6](fill=max_probe_dist)
+    var dists = Array[Float32, 6](fill=safe_max_dist)
     var alphas = Array[Float32, 6](fill=1.0)  # Open sky = 100% absorption (anechoic escape)
     var hits = 0
-    var dist_sum = Float32(0.0)
+    var dist_sum = Float64(0.0)
 
     for i in range(6):
-        var h = bvh.raycast(listener_pos, dirs[i], max_probe_dist)
+        var h = bvh.raycast(listener_pos, dirs[i], safe_max_dist)
         if h.hit:
             hits += 1
-            var d = max(Float32(0.35), h.t)
+            var d = max(Float32(0.35), min(safe_max_dist, h.t)) if isfinite(h.t) else safe_max_dist
             dists[i] = d
-            dist_sum += d
+            dist_sum += Float64(d)
             var mat = materials.get(h.material_id)
-            alphas[i] = max(Float32(0.02), min(Float32(0.99), mat.absorption_mid))
+            var ab = mat.absorption_mid if isfinite(mat.absorption_mid) else Float32(0.5)
+            alphas[i] = max(Float32(0.02), min(Float32(0.99), ab))
         else:
-            dist_sum += max_probe_dist
+            dist_sum += Float64(safe_max_dist)
 
     out.hit_count = hits
     out.enclosure_factor = Float32(hits) / Float32(6.0)
-    out.mean_distance_m = dist_sum / Float32(6.0)
+    out.mean_distance_m = Float32(min(3.4e38, dist_sum / 6.0))
 
     if hits == 0:
         return out^
 
-    var wx = max(Float32(1.0), dists[0] + dists[1])
-    var wy = max(Float32(1.0), dists[2] + dists[3])
-    var wz = max(Float32(1.0), dists[4] + dists[5])
-    var vol = wx * wy * wz
-    out.estimated_volume_m3 = vol
+    var wx64 = max(1.0, Float64(dists[0]) + Float64(dists[1]))
+    var wy64 = max(1.0, Float64(dists[2]) + Float64(dists[3]))
+    var wz64 = max(1.0, Float64(dists[4]) + Float64(dists[5]))
+    var vol64 = wx64 * wy64 * wz64
+    out.estimated_volume_m3 = Float32(min(3.4e38, vol64)) if isfinite(vol64) else Float32(3.4e38)
 
-    var area_yz = wy * wz
-    var area_xz = wx * wz
-    var area_xy = wx * wy
-    var total_absorption = (
-        area_yz * (alphas[0] + alphas[1])
-        + area_xz * (alphas[2] + alphas[3])
-        + area_xy * (alphas[4] + alphas[5])
+    var area_yz64 = wy64 * wz64
+    var area_xz64 = wx64 * wz64
+    var area_xy64 = wx64 * wy64
+    var total_absorption64 = (
+        area_yz64 * (Float64(alphas[0]) + Float64(alphas[1]))
+        + area_xz64 * (Float64(alphas[2]) + Float64(alphas[3]))
+        + area_xy64 * (Float64(alphas[4]) + Float64(alphas[5]))
     )
 
-    var rt60 = Float32(0.161) * vol / max(Float32(0.1), total_absorption)
-    out.sabine_rt60_sec = max(Float32(0.08), min(Float32(6.5), rt60))
+    var rt60_64 = 0.161 * vol64 / max(0.1, total_absorption64)
+    var rt60 = Float32(max(0.08, min(6.5, rt60_64))) if isfinite(rt60_64) else Float32(6.5)
+    out.sabine_rt60_sec = rt60
 
     # Mean FDN delay line length in StereoReverbFDN is ~2074 frames @ 48 kHz = 0.0432 s:
     # g = 10^(-3 * tau_mean / RT60)

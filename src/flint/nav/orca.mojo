@@ -12,7 +12,7 @@ Implements van den Berg et al. (2011) Optimal Reciprocal Collision Avoidance (`C
    hard-disc & swept-wall depenetration (`step_orca_simd8`) enforcing exact 0-overlap invariants.
 """
 from std.collections import List
-from std.math import sqrt, abs, min, max, floor
+from std.math import sqrt, abs, min, max, floor, isfinite
 from flint.core.math import Vec3
 from flint.core.detsort import mix64
 from flint.physics.solver_bodies import F8, LANES
@@ -22,6 +22,19 @@ comptime _ORCA_HASH_BUCKETS: Int = 512
 comptime _ORCA_WALL_BUCKETS: Int = 512
 comptime _ORCA_WALL_CELL_SIZE: Float32 = 4.0
 comptime _ORCA_EPS: Float32 = 1.0e-5
+
+
+@always_inline
+def _safe_cell_coord(v: Float32, inv_cs: Float32) -> Int:
+    var f = Float64(v) * Float64(inv_cs)
+    if not isfinite(f):
+        return 0
+    var fl = floor(f)
+    if fl <= -1_000_000_000.0:
+        return -1_000_000_000
+    if fl >= 1_000_000_000.0:
+        return 1_000_000_000
+    return Int(fl)
 
 
 @fieldwise_init
@@ -481,17 +494,26 @@ struct CrowdSimulator(Copyable, Movable):
         var max_span_f = _ORCA_WALL_CELL_SIZE * Float32(64.0)
         for wi in range(n_walls):
             var w = self.walls[wi]
+            if not (isfinite(w.ax) and isfinite(w.az) and isfinite(w.bx) and isfinite(w.bz)):
+                continue
             var lo_x = min(w.ax, w.bx)
             var hi_x = max(w.ax, w.bx)
             var lo_z = min(w.az, w.bz)
             var hi_z = max(w.az, w.bz)
-            if (hi_x - lo_x) > max_span_f or (hi_z - lo_z) > max_span_f:
+            if (
+                (hi_x - lo_x) > max_span_f
+                or (hi_z - lo_z) > max_span_f
+                or abs(lo_x) > Float32(1.0e8)
+                or abs(hi_x) > Float32(1.0e8)
+                or abs(lo_z) > Float32(1.0e8)
+                or abs(hi_z) > Float32(1.0e8)
+            ):
                 self._large_walls.append(wi)
                 continue
-            var cx0 = Int(floor(lo_x * inv_wcs))
-            var cx1 = Int(floor(hi_x * inv_wcs))
-            var cz0 = Int(floor(lo_z * inv_wcs))
-            var cz1 = Int(floor(hi_z * inv_wcs))
+            var cx0 = _safe_cell_coord(lo_x, inv_wcs)
+            var cx1 = _safe_cell_coord(hi_x, inv_wcs)
+            var cz0 = _safe_cell_coord(lo_z, inv_wcs)
+            var cz1 = _safe_cell_coord(hi_z, inv_wcs)
             var span_x = cx1 - cx0 + 1
             var span_z = cz1 - cz0 + 1
             if span_x <= 0 or span_z <= 0 or span_x > 64 or span_z > 64 or span_x > 4096 // span_z:
@@ -520,17 +542,26 @@ struct CrowdSimulator(Copyable, Movable):
         if n_walls == 0:
             return
         var max_span_f = _ORCA_WALL_CELL_SIZE * Float32(64.0)
-        if len(self._wall_head) == 0 or (hi_x - lo_x) > max_span_f or (hi_z - lo_z) > max_span_f:
+        if (
+            len(self._wall_head) == 0
+            or not (isfinite(lo_x) and isfinite(lo_z) and isfinite(hi_x) and isfinite(hi_z))
+            or (hi_x - lo_x) > max_span_f
+            or (hi_z - lo_z) > max_span_f
+            or abs(lo_x) > Float32(1.0e8)
+            or abs(hi_x) > Float32(1.0e8)
+            or abs(lo_z) > Float32(1.0e8)
+            or abs(hi_z) > Float32(1.0e8)
+        ):
             for wi in range(n_walls):
                 if stamp[wi] != cur_stamp:
                     stamp[wi] = cur_stamp
                     out_walls.append(wi)
             return
         var inv_wcs = Float32(1.0) / _ORCA_WALL_CELL_SIZE
-        var cx0 = Int(floor(lo_x * inv_wcs))
-        var cx1 = Int(floor(hi_x * inv_wcs))
-        var cz0 = Int(floor(lo_z * inv_wcs))
-        var cz1 = Int(floor(hi_z * inv_wcs))
+        var cx0 = _safe_cell_coord(lo_x, inv_wcs)
+        var cx1 = _safe_cell_coord(hi_x, inv_wcs)
+        var cz0 = _safe_cell_coord(lo_z, inv_wcs)
+        var cz1 = _safe_cell_coord(hi_z, inv_wcs)
         var span_x = cx1 - cx0 + 1
         var span_z = cz1 - cz0 + 1
         if span_x <= 0 or span_z <= 0 or span_x > 64 or span_z > 64 or span_x > 4096 // span_z:
@@ -556,9 +587,13 @@ struct CrowdSimulator(Copyable, Movable):
                 out_walls.append(wi)
 
     def agent_position(self, idx: Int) -> Vec3:
+        if idx < 0 or idx >= self.count or idx >= len(self.px) or idx >= len(self.py) or idx >= len(self.pz):
+            return Vec3()
         return Vec3(self.px[idx], self.py[idx], self.pz[idx])
 
     def agent_velocity(self, idx: Int) -> Vec3:
+        if idx < 0 or idx >= self.count or idx >= len(self.vx) or idx >= len(self.vy) or idx >= len(self.vz):
+            return Vec3()
         return Vec3(self.vx[idx], self.vy[idx], self.vz[idx])
 
     def count_overlaps(self, tol: Float32 = 1.0e-4) -> Int:
@@ -853,8 +888,38 @@ struct CrowdSimulator(Copyable, Movable):
         """Executes one full crowd steering tick using SoA 8-wide `F8` SIMD preferred velocity,
         8-wide `F8` SIMD ORCA half-plane generation, 2D/3D LP solve, `F8` position update,
         and spatial-grid hard-constraint depenetration."""
-        if self.count == 0 or dt <= Float32(1.0e-7):
+        if self.count == 0 or not isfinite(dt) or dt <= Float32(1.0e-7):
             return
+        var safe_dt = min(dt, Float32(1.0))
+        for i in range(self.count):
+            if not self.active[i]:
+                continue
+            if not isfinite(self.px[i]):
+                self.px[i] = Float32(0.0)
+            if not isfinite(self.py[i]):
+                self.py[i] = Float32(0.0)
+            if not isfinite(self.pz[i]):
+                self.pz[i] = Float32(0.0)
+            if not isfinite(self.vx[i]):
+                self.vx[i] = Float32(0.0)
+            if not isfinite(self.vy[i]):
+                self.vy[i] = Float32(0.0)
+            if not isfinite(self.vz[i]):
+                self.vz[i] = Float32(0.0)
+            if not isfinite(self.pref_vx[i]):
+                self.pref_vx[i] = Float32(0.0)
+            if not isfinite(self.pref_vz[i]):
+                self.pref_vz[i] = Float32(0.0)
+            if not isfinite(self.max_speed[i]) or self.max_speed[i] < Float32(0.0):
+                self.max_speed[i] = Float32(0.0)
+            if not isfinite(self.radius[i]) or self.radius[i] < Float32(0.01):
+                self.radius[i] = Float32(0.01)
+            if self.has_goal[i] and (not isfinite(self.goal_x[i]) or not isfinite(self.goal_z[i])):
+                self.has_goal[i] = False
+                self.goal_x[i] = self.px[i]
+                self.goal_z[i] = self.pz[i]
+                self.pref_vx[i] = Float32(0.0)
+                self.pref_vz[i] = Float32(0.0)
         self._pad_columns()
         var n_batches = self.padded // LANES
         var p_ptr = self.px.unsafe_ptr()
@@ -930,8 +995,8 @@ struct CrowdSimulator(Copyable, Movable):
                 continue
             if self.radius[i] > max_r:
                 max_r = self.radius[i]
-            var cx = Int(floor(self.px[i] * inv_cs))
-            var cz = Int(floor(self.pz[i] * inv_cs))
+            var cx = _safe_cell_coord(self.px[i], inv_cs)
+            var cz = _safe_cell_coord(self.pz[i], inv_cs)
             agent_cx[i] = cx
             agent_cz[i] = cz
             var bkt = Self._cell_bucket(cx, cz)
@@ -943,7 +1008,7 @@ struct CrowdSimulator(Copyable, Movable):
         var new_vz = List[Float32](length=self.padded, fill=0.0)
         var inv_tau = Float32(1.0) / self.time_horizon
         var inv_tau_obst = Float32(1.0) / self.time_horizon_obst
-        var inv_dt = Float32(1.0) / dt
+        var inv_dt = Float32(1.0) / safe_dt
         var nb_dist2 = self.neighbor_dist * self.neighbor_dist
 
         var nb_indices = List[Int](capacity=self.max_neighbors + 8)
@@ -1137,7 +1202,7 @@ struct CrowdSimulator(Copyable, Movable):
         var vz_ptr = self.vz.unsafe_ptr()
         var nvx_ptr = new_vx.unsafe_ptr()
         var nvz_ptr = new_vz.unsafe_ptr()
-        var dt_v = F8(dt)
+        var dt_v = F8(safe_dt)
         for b in range(n_batches):
             var at = b * LANES
             var v_x = nvx_ptr.unsafe_load[width=LANES](at)
@@ -1146,6 +1211,17 @@ struct CrowdSimulator(Copyable, Movable):
             vz_ptr.unsafe_offset(at).unsafe_store(v_z)
             p_ptr.unsafe_offset(at).unsafe_store(p_ptr.unsafe_load[width=LANES](at) + v_x * dt_v)
             pz_ptr.unsafe_offset(at).unsafe_store(pz_ptr.unsafe_load[width=LANES](at) + v_z * dt_v)
+        for i in range(self.count):
+            if not self.active[i]:
+                continue
+            if not isfinite(self.px[i]):
+                self.px[i] = prev_px[i]
+            if not isfinite(self.pz[i]):
+                self.pz[i] = prev_pz[i]
+            if not isfinite(self.vx[i]):
+                self.vx[i] = Float32(0.0)
+            if not isfinite(self.vz[i]):
+                self.vz[i] = Float32(0.0)
 
         # 5. Tight spatial-grid SOR Gauss-Seidel hard-disc & swept-wall position projection
         # Enforces strict 0-overlap (`d >= r_i + r_j + 2.5e-4`) and zero wall tunneling on every tick!
@@ -1172,8 +1248,8 @@ struct CrowdSimulator(Copyable, Movable):
             for i in range(self.count):
                 if not self.active[i]:
                     continue
-                var cx = Int(floor(self.px[i] * dep_inv_cs))
-                var cz = Int(floor(self.pz[i] * dep_inv_cs))
+                var cx = _safe_cell_coord(self.px[i], dep_inv_cs)
+                var cz = _safe_cell_coord(self.pz[i], dep_inv_cs)
                 var bkt = Self._cell_bucket(cx, cz)
                 dep_next[i] = dep_head[bkt]
                 dep_head[bkt] = i
@@ -1186,8 +1262,8 @@ struct CrowdSimulator(Copyable, Movable):
                 var i = (self.count - 1 - step_i) if rev else step_i
                 if not self.active[i]:
                     continue
-                var icx = Int(floor(self.px[i] * dep_inv_cs))
-                var icz = Int(floor(self.pz[i] * dep_inv_cs))
+                var icx = _safe_cell_coord(self.px[i], dep_inv_cs)
+                var icz = _safe_cell_coord(self.pz[i], dep_inv_cs)
                 var aiy = self.py[i]
                 for dz_c in range(-1, 2):
                     for dx_c in range(-1, 2):

@@ -5,7 +5,8 @@ SIMD inner loops; everything else is a plain loop, which is cheap for the small 
 of a motion model.
 """
 
-from std.math import sqrt, exp, erf, atan, cos, sin, ceil, floor, isnan, isinf
+from std.math import sqrt, exp, erf, atan, cos, sin, ceil, floor, isnan, isinf, isfinite
+from std.memory import bitcast
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
 from flint.ml.tensor import (
@@ -61,6 +62,8 @@ comptime U_SIGMOID: Int = 10
 def unary(op: Int, x: Tensor, alpha: Float32 = 0.01) raises -> Tensor:
     _require_valid_tensor(x, "unary")
     var n = x.numel()
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("unary: tensor shape overflow or exceeds maximum limit")
     if op == U_NOT:
         if x.is_float():
             raise Error("unary Not requires integer/bool tensor")
@@ -136,6 +139,72 @@ comptime B_AND: Int = 9
 
 
 @always_inline
+def _fmod_f32(a: Float32, b: Float32) -> Float32:
+    """Exact pure-Mojo IEEE-754 float32 remainder (`fmodf`) without float-to-int overflow UB."""
+    var hx = bitcast[DType.uint32](a)
+    var hy = bitcast[DType.uint32](b)
+    var sx = hx & UInt32(0x80000000)
+    hx &= UInt32(0x7FFFFFFF)
+    hy &= UInt32(0x7FFFFFFF)
+    if hy == 0 or hx >= UInt32(0x7F800000) or hy > UInt32(0x7F800000):
+        return bitcast[DType.float32](UInt32(0x7FC00000))
+    if hx < hy:
+        return a
+    if hx == hy:
+        return bitcast[DType.float32](sx)
+    var ix: Int
+    var mx: UInt32
+    if hx < UInt32(0x00800000):
+        ix = -126
+        mx = hx
+        while mx < UInt32(0x00800000):
+            mx <<= UInt32(1)
+            ix -= 1
+    else:
+        ix = Int(hx >> UInt32(23)) - 127
+        mx = (hx & UInt32(0x007FFFFF)) | UInt32(0x00800000)
+    var iy: Int
+    var my: UInt32
+    if hy < UInt32(0x00800000):
+        iy = -126
+        my = hy
+        while my < UInt32(0x00800000):
+            my <<= UInt32(1)
+            iy -= 1
+    else:
+        iy = Int(hy >> UInt32(23)) - 127
+        my = (hy & UInt32(0x007FFFFF)) | UInt32(0x00800000)
+
+    var n = ix - iy
+    while n > 0:
+        var hz = Int64(mx) - Int64(my)
+        if hz < 0:
+            mx = mx + mx
+        else:
+            if hz == 0:
+                return bitcast[DType.float32](sx)
+            mx = UInt32(hz) + UInt32(hz)
+        n -= 1
+    var hz = Int64(mx) - Int64(my)
+    if hz >= 0:
+        mx = UInt32(hz)
+    if mx == 0:
+        return bitcast[DType.float32](sx)
+    while mx < UInt32(0x00800000):
+        mx = mx + mx
+        iy -= 1
+    if iy >= -126:
+        mx = (mx - UInt32(0x00800000)) | (UInt32(iy + 127) << UInt32(23))
+    else:
+        var shift = -126 - iy
+        if shift >= 32:
+            mx = 0
+        else:
+            mx >>= UInt32(shift)
+    return bitcast[DType.float32](sx | mx)
+
+
+@always_inline
 def _fop(op: Int, a: Float32, b: Float32) -> Float32:
     if op == B_ADD:
         return a + b
@@ -147,8 +216,7 @@ def _fop(op: Int, a: Float32, b: Float32) -> Float32:
         return a / b
     if op == B_MAX:
         return a if a >= b else b
-    # fmod
-    return a - b * Float32(Int(a / b))
+    return _fmod_f32(a, b)
 
 
 @always_inline
@@ -160,6 +228,8 @@ def _iop(op: Int, a: Int, b: Int) -> Int:
     if op == B_MUL:
         return a * b
     if op == B_DIV:
+        if b == -1 and a == Int(-0x7FFFFFFFFFFFFFFF - 1):
+            return a
         # C++ integer division truncates toward zero
         var q = a // b
         if (a % b != 0) and ((a < 0) != (b < 0)):
@@ -170,6 +240,8 @@ def _iop(op: Int, a: Int, b: Int) -> Int:
     if op == B_AND:
         return 1 if (a != 0 and b != 0) else 0
     # Mod with fmod=0: the result takes the divisor's sign (Python's %)
+    if b == -1 and a == Int(-0x7FFFFFFFFFFFFFFF - 1):
+        return 0
     return a % b
 
 
@@ -211,8 +283,8 @@ def binary(op: Int, a: Tensor, b: Tensor) raises -> Tensor:
         raise Error("binary: mismatched tensor dtypes")
     var out_shape = broadcast_shape(a.shape, b.shape)
     var n = numel_of(out_shape)
-    if n < 0:
-        raise Error("binary: tensor shape overflow")
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("binary: tensor shape overflow or exceeds maximum limit")
     var same_a = a.numel() == n
     var same_b = b.numel() == n
     var plain_a = same_a and len(a.shape) == len(out_shape)
@@ -297,8 +369,8 @@ def where(c: Tensor, x: Tensor, y: Tensor) raises -> Tensor:
         raise Error("where: mismatched branch tensor dtypes")
     var s = broadcast_shape(broadcast_shape(c.shape, x.shape), y.shape)
     var n = numel_of(s)
-    if n < 0:
-        raise Error("where: tensor shape overflow")
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("where: tensor shape overflow or exceeds maximum limit")
     var oc = broadcast_offsets(c.shape, s)
     var ox = broadcast_offsets(x.shape, s)
     var oy = broadcast_offsets(y.shape, s)
@@ -312,21 +384,52 @@ def where(c: Tensor, x: Tensor, y: Tensor) raises -> Tensor:
     return out^
 
 
+@always_inline
+def _f64_to_i64_sat(v: Float64) -> Int:
+    if isnan(v):
+        return 0
+    if v >= 9223372036854775808.0:
+        return 0x7FFFFFFFFFFFFFFF
+    if v <= -9223372036854775808.0:
+        return Int(-0x7FFFFFFFFFFFFFFF - 1)
+    return Int(v)
+
+
+@always_inline
+def _f64_to_i32_sat(v: Float64) -> Int:
+    if isnan(v):
+        return 0
+    if v >= 2147483647.0:
+        return 2147483647
+    if v <= -2147483648.0:
+        return -2147483648
+    return Int(Int32(Int(v)))
+
+
 def clip(x: Tensor, lo: Float64, hi: Float64) raises -> Tensor:
     _require_valid_tensor(x, "clip")
     var n = x.numel()
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("clip: tensor shape overflow or exceeds maximum limit")
     var out = Tensor.like(x, x.shape.copy())
     for e in range(n):
         if x.is_float():
             out.f[e] = min(max(x.fget(e), Float32(lo)), Float32(hi))
         else:
-            out.i[e] = Int(min(max(Float64(x.i[e]), lo), hi))
+            var v = Float64(x.i[e])
+            if not isnan(lo) and v < lo:
+                v = lo
+            if not isnan(hi) and v > hi:
+                v = hi
+            out.i[e] = _f64_to_i64_sat(v)
     return out^
 
 
 def cast(x: Tensor, to: Int) raises -> Tensor:
     _require_valid_tensor(x, "cast")
     var n = x.numel()
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("cast: tensor shape overflow or exceeds maximum limit")
     if to == DT_F32:
         if x.is_float():
             return x.reshaped(x.shape.copy())
@@ -341,11 +444,19 @@ def cast(x: Tensor, to: Int) raises -> Tensor:
         var v: Int
         if x.is_float():
             var f = x.fget(e)
-            v = (1 if f != 0 else 0) if to == DT_BOOL else Int(f)
+            if to == DT_BOOL:
+                v = 1 if f != Float32(0.0) else 0
+            elif to == DT_I32:
+                v = _f64_to_i32_sat(Float64(f))
+            else:
+                v = _f64_to_i64_sat(Float64(f))
         else:
-            v = (1 if x.i[e] != 0 else 0) if to == DT_BOOL else x.i[e]
-        if to == DT_I32:
-            v = Int(Int32(v))
+            if to == DT_BOOL:
+                v = 1 if x.i[e] != 0 else 0
+            elif to == DT_I32:
+                v = Int(Int32(x.i[e]))
+            else:
+                v = x.i[e]
         o[e] = v
     return Tensor.ints(to, x.shape.copy(), o^)
 
@@ -374,8 +485,8 @@ def transpose(x: Tensor, perm: List[Int]) raises -> Tensor:
     for k in range(r):
         out_shape[k] = x.shape[perm[k]]
     var n = numel_of(out_shape)
-    if n < 0:
-        raise Error("transpose: tensor shape overflow")
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("transpose: tensor shape overflow or exceeds maximum limit")
     var st = strides_of(x.shape)
     var pst = List[Int](length=r, fill=0)
     for k in range(r):
@@ -447,8 +558,8 @@ def concat(xs: List[Tensor], axis_in: Int) raises -> Tensor:
         total = _checked_add(total, t.shape[axis])
     out_shape[axis] = total
     var out_n = numel_of(out_shape)
-    if out_n < 0:
-        raise Error("concat: tensor shape overflow")
+    if out_n < 0 or out_n > MAX_RANGE_ELEMS:
+        raise Error("concat: tensor shape overflow or exceeds maximum limit")
     var outer = 1
     for k in range(axis):
         outer = _checked_mul(outer, out_shape[k])
@@ -484,8 +595,8 @@ def gather(data: Tensor, idx: Tensor, axis_in: Int) raises -> Tensor:
     for k in range(axis + 1, r):
         out_shape.append(data.shape[k])
     var out_n = numel_of(out_shape)
-    if out_n < 0:
-        raise Error("gather: tensor shape overflow")
+    if out_n < 0 or out_n > MAX_RANGE_ELEMS:
+        raise Error("gather: tensor shape overflow or exceeds maximum limit")
     var outer = 1
     for k in range(axis):
         outer = _checked_mul(outer, data.shape[k])
@@ -524,6 +635,8 @@ def gather_elements(data: Tensor, idx: Tensor, axis_in: Int) raises -> Tensor:
         if d != axis and idx.shape[d] > data.shape[d]:
             raise Error("gather_elements: indices shape exceeds data shape on non-axis dimension")
     var n = idx.numel()
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("gather_elements: tensor shape overflow or exceeds maximum limit")
     var dst = strides_of(data.shape)
     var out = Tensor.like(data, idx.shape.copy())
     var ctr = List[Int](length=r, fill=0)
@@ -567,6 +680,8 @@ def scatter_elements(data: Tensor, idx: Tensor, upd: Tensor, axis_in: Int) raise
         if d != axis and idx.shape[d] > data.shape[d]:
             raise Error("scatter_elements: indices shape exceeds data shape on non-axis dimension")
     var n = idx.numel()
+    if data.numel() > MAX_RANGE_ELEMS or n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("scatter_elements: tensor shape overflow or exceeds maximum limit")
     var dst = strides_of(data.shape)
     var out = data.reshaped(data.shape.copy())
     if out.is_float() and out.ext != 0:
@@ -603,6 +718,8 @@ def scatter_nd(data: Tensor, idx: Tensor, upd: Tensor) raises -> Tensor:
     var k = idx.shape[idx.rank() - 1]
     if k <= 0 or k > data.rank():
         raise Error("scatter_nd: invalid index tuple size")
+    if data.numel() > MAX_RANGE_ELEMS:
+        raise Error("scatter_nd: tensor exceeds maximum limit")
     var out = data.reshaped(data.shape.copy())
     if out.is_float() and out.ext != 0:
         out = Tensor.floats(data.shape.copy(), data.owned_floats())
@@ -680,8 +797,8 @@ def slice(data: Tensor, starts: List[Int], ends: List[Int], axes_in: List[Int], 
                     cnt = (st[d] - en[d] - 1) // (-sp[d]) + 1
         out_shape[d] = cnt
     var n = numel_of(out_shape)
-    if n < 0:
-        raise Error("slice: tensor shape overflow")
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("slice: tensor shape overflow or exceeds maximum limit")
     var out = Tensor.like(data, out_shape.copy())
     if n == 0:
         return out^
@@ -704,9 +821,13 @@ def slice(data: Tensor, starts: List[Int], ends: List[Int], axes_in: List[Int], 
 
 def expand(x: Tensor, shape: List[Int]) raises -> Tensor:
     _require_valid_tensor(x, "expand")
+    for d in shape:
+        if d < 0:
+            raise Error("expand: negative dimension")
     var s = broadcast_shape(x.shape, shape)
-    if numel_of(s) < 0:
-        raise Error("expand: tensor shape overflow")
+    var n = numel_of(s)
+    if n < 0 or n > MAX_RANGE_ELEMS:
+        raise Error("expand: tensor shape overflow or exceeds maximum limit")
     var offs = broadcast_offsets(x.shape, s)
     var out = Tensor.like(x, s.copy())
     for e in range(len(offs)):
@@ -723,8 +844,8 @@ def tile(x: Tensor, reps: List[Int]) raises -> Tensor:
     for d in range(r):
         out_shape[d] = _checked_mul(x.shape[d], reps[d])
     var out_n = numel_of(out_shape)
-    if out_n < 0:
-        raise Error("tile: tensor shape overflow")
+    if out_n < 0 or out_n > MAX_RANGE_ELEMS:
+        raise Error("tile: tensor shape overflow or exceeds maximum limit")
     var out = Tensor.like(x, out_shape.copy())
     var dst = strides_of(x.shape)
     var ctr = List[Int](length=r, fill=0)
@@ -763,7 +884,7 @@ def range_op(start: Tensor, limit: Tensor, delta: Tensor) raises -> Tensor:
         raise Error("range_op: range span overflow")
     if span > Float64(MAX_RANGE_ELEMS):
         raise Error("range_op: element count exceeds maximum limit")
-    var n = max(Int(ceil(span)), 0)
+    var n = 0 if span <= 0.0 else Int(ceil(span))
     if start.is_float():
         var o = List[Float32](length=n, fill=0.0)
         for k in range(n):
@@ -782,8 +903,9 @@ def onehot(idx: Tensor, depth: Int, values: Tensor) raises -> Tensor:
         raise Error("onehot: invalid depth or values tensor")
     var out_shape = idx.shape.copy()
     out_shape.append(depth)
-    if numel_of(out_shape) < 0:
-        raise Error("onehot: tensor shape overflow")
+    var out_n = numel_of(out_shape)
+    if out_n < 0 or out_n > MAX_RANGE_ELEMS:
+        raise Error("onehot: tensor shape overflow or exceeds maximum limit")
     var out = Tensor.like(values, out_shape^)
     var n = idx.numel()
     for j in range(n):
@@ -800,8 +922,8 @@ def resize_nearest(x: Tensor, out_shape: List[Int]) raises -> Tensor:
     _require_valid_tensor(x, "resize_nearest")
     var r = x.rank()
     var out_n = numel_of(out_shape)
-    if len(out_shape) != r or out_n < 0:
-        raise Error("resize_nearest: invalid output shape")
+    if len(out_shape) != r or out_n < 0 or out_n > MAX_RANGE_ELEMS:
+        raise Error("resize_nearest: invalid or oversized output shape")
     if x.numel() == 0 and out_n > 0:
         raise Error("resize_nearest: cannot resize empty input to non-empty output")
     var out = Tensor.like(x, out_shape.copy())
@@ -859,8 +981,8 @@ def reduce(x: Tensor, axes_in: List[Int], keepdims: Bool, l2: Bool) raises -> Te
             out_shape.append(1)
     var kst = strides_of(kept)
     var nk = numel_of(kept)
-    if nk < 0:
-        raise Error("reduce: tensor shape overflow")
+    if nk < 0 or nk > MAX_RANGE_ELEMS:
+        raise Error("reduce: tensor shape overflow or exceeds maximum limit")
     var acc = List[Float64](length=nk, fill=0.0)
     var ctr = List[Int](length=r, fill=0)
     for e in range(x.numel()):
@@ -884,7 +1006,7 @@ def reduce(x: Tensor, axes_in: List[Int], keepdims: Bool, l2: Bool) raises -> Te
         return Tensor.floats(out_shape^, o^)
     var o = List[Int](length=nk, fill=0)
     for k in range(nk):
-        o[k] = Int(acc[k])
+        o[k] = _f64_to_i64_sat(acc[k])
     return Tensor.ints(x.dtype, out_shape^, o^)
 
 
@@ -905,6 +1027,8 @@ def argmax(x: Tensor, axis_in: Int, keepdims: Bool) raises -> Tensor:
         elif keepdims:
             out_shape.append(1)
     var out_n = _checked_mul(oi[0], oi[2])
+    if out_n > MAX_RANGE_ELEMS:
+        raise Error("argmax: tensor exceeds maximum limit")
     var o = List[Int](length=out_n, fill=0)
     for a in range(oi[0]):
         for c in range(oi[2]):
@@ -932,8 +1056,8 @@ def topk(x: Tensor, k: Int, axis_in: Int, largest: Bool) raises -> List[Tensor]:
     var out_shape = x.shape.copy()
     out_shape[axis] = k
     var out_n = numel_of(out_shape)
-    if out_n < 0:
-        raise Error("topk: tensor shape overflow")
+    if out_n < 0 or out_n > MAX_RANGE_ELEMS or oi[1] > MAX_RANGE_ELEMS:
+        raise Error("topk: tensor shape overflow or exceeds maximum limit")
     var vals = Tensor.like(x, out_shape.copy())
     var inds = Tensor.ints(DT_I64, out_shape.copy(), List[Int](length=out_n, fill=0))
     var n = oi[1]
@@ -971,6 +1095,8 @@ def cumsum(x: Tensor, axis_in: Int, exclusive: Bool, reverse: Bool) raises -> Te
     if axis < 0 or axis >= x.rank():
         raise Error("cumsum: axis out of range")
     var oi = _outer_inner(x.shape, axis)
+    if x.numel() > MAX_RANGE_ELEMS:
+        raise Error("cumsum: tensor exceeds maximum limit")
     var out = Tensor.like(x, x.shape.copy())
     for a in range(oi[0]):
         for c in range(oi[2]):
@@ -1008,12 +1134,37 @@ def softmax(x: Tensor, axis_in: Int) raises -> Tensor:
     var oi = _outer_inner(x.shape, axis)
     if oi[1] <= 0:
         raise Error("softmax: empty axis dimension")
+    if x.numel() > MAX_RANGE_ELEMS:
+        raise Error("softmax: tensor exceeds maximum limit")
     var out = Tensor.like(x, x.shape.copy())
     for a in range(oi[0]):
         for c in range(oi[2]):
             var m = x.fget(a * oi[1] * oi[2] + c)
+            if isnan(m):
+                raise Error("softmax: NaN in input")
             for j in range(1, oi[1]):
-                m = max(m, x.fget((a * oi[1] + j) * oi[2] + c))
+                var v = x.fget((a * oi[1] + j) * oi[2] + c)
+                if isnan(v):
+                    raise Error("softmax: NaN in input")
+                if v > m:
+                    m = v
+            if isinf(m):
+                if m > Float32(0.0):
+                    var s_inf: Float32 = 0.0
+                    for j in range(oi[1]):
+                        var at = (a * oi[1] + j) * oi[2] + c
+                        var v = x.fget(at)
+                        var e = Float32(1.0) if (isinf(v) and v > Float32(0.0)) else Float32(0.0)
+                        out.f[at] = e
+                        s_inf += e
+                    var inv_s = Float32(1.0) / max(Float32(1.0), s_inf)
+                    for j in range(oi[1]):
+                        out.f[(a * oi[1] + j) * oi[2] + c] *= inv_s
+                else:
+                    var uni = Float32(1.0) / Float32(oi[1])
+                    for j in range(oi[1]):
+                        out.f[(a * oi[1] + j) * oi[2] + c] = uni
+                continue
             var s: Float32 = 0
             for j in range(oi[1]):
                 var at = (a * oi[1] + j) * oi[2] + c
@@ -1030,6 +1181,8 @@ def layer_norm(x: Tensor, scale: Tensor, bias: Tensor, has_bias: Bool, eps: Floa
     _require_valid_tensor(scale, "layer_norm")
     if has_bias:
         _require_valid_tensor(bias, "layer_norm")
+    if not isfinite(eps) or eps < Float32(0.0):
+        raise Error("layer_norm: epsilon must be finite and non-negative")
     if not x.is_float() or not scale.is_float() or (has_bias and not bias.is_float()):
         raise Error("layer_norm: inputs must be float tensors")
     if x.rank() == 0:
@@ -1037,25 +1190,38 @@ def layer_norm(x: Tensor, scale: Tensor, bias: Tensor, has_bias: Bool, eps: Floa
     var n = x.shape[x.rank() - 1]
     if n <= 0 or scale.numel() < n or (has_bias and bias.numel() < n):
         raise Error("layer_norm: invalid normalization dimension")
+    if x.numel() > MAX_RANGE_ELEMS:
+        raise Error("layer_norm: tensor exceeds maximum limit")
+    for j in range(scale.numel()):
+        if not isfinite(scale.fget(j)):
+            raise Error("layer_norm: non-finite element in scale")
+    if has_bias:
+        for j in range(bias.numel()):
+            if not isfinite(bias.fget(j)):
+                raise Error("layer_norm: non-finite element in bias")
     var rows = x.numel() // n
     var out = Tensor.like(x, x.shape.copy())
     for r in range(rows):
         var base = r * n
-        var mean: Float32 = 0
+        var mean: Float64 = 0.0
         for j in range(n):
-            mean += x.fget(base + j)
-        mean /= Float32(n)
-        var var_: Float32 = 0
+            var xj = x.fget(base + j)
+            if not isfinite(xj):
+                raise Error("layer_norm: non-finite element in input")
+            mean += Float64(xj)
+        mean /= Float64(n)
+        var var_: Float64 = 0.0
         for j in range(n):
-            var d = x.fget(base + j) - mean
+            var d = Float64(x.fget(base + j)) - mean
             var_ += d * d
-        var_ /= Float32(n)
-        var inv = 1.0 / sqrt(var_ + eps)
+        var_ /= Float64(n)
+        var denom = var_ + Float64(eps)
+        var inv = (1.0 / sqrt(denom)) if denom > 0.0 else 0.0
         for j in range(n):
-            var v = (x.fget(base + j) - mean) * inv * scale.fget(j)
+            var v = (Float64(x.fget(base + j)) - mean) * inv * Float64(scale.fget(j))
             if has_bias:
-                v += bias.fget(j)
-            out.f[base + j] = v
+                v += Float64(bias.fget(j))
+            out.f[base + j] = Float32(v)
     return out^
 
 
@@ -1234,8 +1400,9 @@ def matmul(mut pool: JobPool, a: Tensor, b: Tensor) raises -> Tensor:
     out_shape.append(m)
     out_shape.append(n)
     var batches = numel_of(bs)
-    if batches < 0 or numel_of(out_shape) < 0:
-        raise Error("matmul: tensor shape overflow")
+    var out_n = numel_of(out_shape)
+    if batches < 0 or out_n < 0 or out_n > MAX_RANGE_ELEMS:
+        raise Error("matmul: tensor shape overflow or exceeds maximum limit")
     var out = Tensor.zeros(out_shape^)
     if batches == 0 or m == 0 or n == 0:
         return out^
@@ -1268,8 +1435,8 @@ def gemm(mut pool: JobPool, a: Tensor, b: Tensor, c: Tensor, has_c: Bool, alpha:
     if bk != k:
         raise Error("Gemm: inner dims " + shape_str(a.shape) + " x " + shape_str(b.shape))
     var out_n = numel_of([m, n])
-    if out_n < 0:
-        raise Error("Gemm: tensor shape overflow")
+    if out_n < 0 or out_n > MAX_RANGE_ELEMS:
+        raise Error("Gemm: tensor shape overflow or exceeds maximum limit")
     if has_c:
         if c.rank() > 2:
             raise Error("Gemm: bias C must have rank <= 2")
@@ -1319,11 +1486,13 @@ def conv1d(mut pool: JobPool, x: Tensor, w: Tensor, b: Tensor, has_b: Bool, pad0
     var span_k = _checked_mul(dil, kw - 1)
     var t_out = padded_t - span_k
     var out_n = numel_of([batch, cout, t_out])
-    if t_out < 0 or out_n < 0:
-        raise Error("Conv: invalid output shape")
+    if t_out < 0 or out_n < 0 or out_n > MAX_RANGE_ELEMS:
+        raise Error("Conv: invalid or oversized output shape")
     var j = _checked_mul(cin, kw)
     var col_n = _checked_mul(t_out, j)
     var tmp_n = _checked_mul(t_out, cout)
+    if col_n > MAX_RANGE_ELEMS or tmp_n > MAX_RANGE_ELEMS:
+        raise Error("Conv: workspace exceeds maximum limit")
     var out = Tensor.zeros([batch, cout, t_out])
     if out_n == 0:
         return out^

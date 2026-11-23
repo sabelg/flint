@@ -1,5 +1,6 @@
 """Complete native GLB 2.0 runtime for Flint Engine (`flint.*`)."""
 from std.ffi import external_call
+from std.math import isfinite, isnan
 from std.memory import bitcast
 from flint.platform.os import read_bytes
 from flint.core.math import Vec3
@@ -14,6 +15,33 @@ def little_u32(data: List[UInt8], offset: Int) -> Int:
     if offset < 0 or offset + 4 > len(data):
         return -1
     return Int(data[offset]) | (Int(data[offset + 1]) << 8) | (Int(data[offset + 2]) << 16) | (Int(data[offset + 3]) << 24)
+
+
+@always_inline
+def _float_to_u8(v: Float64) -> UInt8:
+    if isnan(v) or v <= 0.0:
+        return UInt8(0)
+    if v >= 1.0:
+        return UInt8(255)
+    return UInt8(max(0, min(255, Int(v * 255.0))))
+
+
+@always_inline
+def _sanitize_emissive_comp(v: Float64) -> Float32:
+    if isnan(v) or v <= 0.0:
+        return Float32(0.0)
+    if not isfinite(v) or v > 1.0e6:
+        return Float32(1.0e6)
+    return Float32(v)
+
+
+@always_inline
+def _clamp_f32_range(v: Float64, lo: Float32, hi: Float32, fallback: Float32) -> Float32:
+    if isnan(v):
+        return fallback
+    if not isfinite(v):
+        return hi if v > 0.0 else lo
+    return max(lo, min(hi, Float32(v)))
 
 
 struct NativeAccessor(Copyable, Movable):
@@ -132,16 +160,52 @@ def load_accessor(document: JsonDocument, index: Int, binary_size: Int) -> Nativ
     return accessor^
 
 
+@always_inline
+def _sanitize_json_f32(v: Float64, fallback: Float32 = Float32(0.0)) -> Float32:
+    if not isfinite(v):
+        return fallback
+    var f = Float32(v)
+    if not isfinite(f):
+        return fallback
+    return f
+
+
 def read_vec3(document: JsonDocument, node: Int, fallback: Vec3) -> Vec3:
     if document.array_size(node) != 3:
         return fallback
-    return Vec3(Float32(document.number(document.at(node, 0))), Float32(document.number(document.at(node, 1))), Float32(document.number(document.at(node, 2))))
+    var v0 = document.number(document.at(node, 0), Float64(fallback.x))
+    var v1 = document.number(document.at(node, 1), Float64(fallback.y))
+    var v2 = document.number(document.at(node, 2), Float64(fallback.z))
+    if not isfinite(v0) or not isfinite(v1) or not isfinite(v2):
+        return fallback
+    var f0 = Float32(v0)
+    var f1 = Float32(v1)
+    var f2 = Float32(v2)
+    if not isfinite(f0) or not isfinite(f1) or not isfinite(f2):
+        return fallback
+    return Vec3(f0, f1, f2)
 
 
 def read_quat(document: JsonDocument, node: Int) -> Quat:
     if document.array_size(node) != 4:
         return Quat()
-    return Quat(Float32(document.number(document.at(node, 0))), Float32(document.number(document.at(node, 1))), Float32(document.number(document.at(node, 2))), Float32(document.number(document.at(node, 3)))).normalized()
+    var v0 = document.number(document.at(node, 0), 0.0)
+    var v1 = document.number(document.at(node, 1), 0.0)
+    var v2 = document.number(document.at(node, 2), 0.0)
+    var v3 = document.number(document.at(node, 3), 1.0)
+    if not isfinite(v0) or not isfinite(v1) or not isfinite(v2) or not isfinite(v3):
+        return Quat()
+    var f0 = Float32(v0)
+    var f1 = Float32(v1)
+    var f2 = Float32(v2)
+    var f3 = Float32(v3)
+    if not isfinite(f0) or not isfinite(f1) or not isfinite(f2) or not isfinite(f3):
+        return Quat()
+    var q = Quat(f0, f1, f2, f3)
+    var len2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w
+    if not isfinite(len2) or len2 <= Float32(1.0e-12):
+        return Quat()
+    return q.normalized()
 
 
 def load_native_glb(path: String) -> NativeModel:
@@ -275,10 +339,10 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                     mesh.texcoords1.append(uv1.float_value(binary, vertex, 0))
                     mesh.texcoords1.append(uv1.float_value(binary, vertex, 1))
                 if colors.valid:
-                    mesh.colors.append(UInt8(max(0, min(255, Int(colors.float_value(binary, vertex, 0) * 255)))))
-                    mesh.colors.append(UInt8(max(0, min(255, Int(colors.float_value(binary, vertex, 1) * 255)))))
-                    mesh.colors.append(UInt8(max(0, min(255, Int(colors.float_value(binary, vertex, 2) * 255)))))
-                    mesh.colors.append(UInt8(max(0, min(255, Int(colors.float_value(binary, vertex, 3) * 255)))) if colors.components > 3 else 255)
+                    mesh.colors.append(_float_to_u8(Float64(colors.float_value(binary, vertex, 0))))
+                    mesh.colors.append(_float_to_u8(Float64(colors.float_value(binary, vertex, 1))))
+                    mesh.colors.append(_float_to_u8(Float64(colors.float_value(binary, vertex, 2))))
+                    mesh.colors.append(_float_to_u8(Float64(colors.float_value(binary, vertex, 3))) if colors.components > 3 else 255)
                 else:
                     mesh.colors.append(255)
                     mesh.colors.append(255)
@@ -331,10 +395,10 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 var pbr = document.object_get(material, "pbrMetallicRoughness")
                 var factor = document.object_get(pbr, "baseColorFactor")
                 if document.array_size(factor) == 4:
-                    var red = UInt8(max(0, min(255, Int(document.number(document.at(factor, 0), 1) * 255))))
-                    var green = UInt8(max(0, min(255, Int(document.number(document.at(factor, 1), 1) * 255))))
-                    var blue = UInt8(max(0, min(255, Int(document.number(document.at(factor, 2), 1) * 255))))
-                    var alpha = UInt8(max(0, min(255, Int(document.number(document.at(factor, 3), 1) * 255))))
+                    var red = _float_to_u8(document.number(document.at(factor, 0), 1))
+                    var green = _float_to_u8(document.number(document.at(factor, 1), 1))
+                    var blue = _float_to_u8(document.number(document.at(factor, 2), 1))
+                    var alpha = _float_to_u8(document.number(document.at(factor, 3), 1))
                     mesh.base_color = UInt32(alpha) << 24 | UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue)
                 var base_texture = document.object_get(pbr, "baseColorTexture")
                 mesh.texture = document.integer(document.object_get(base_texture, "index"), -1)
@@ -346,13 +410,13 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 if occ_texture != -1:
                     mesh.occlusion_texture = document.integer(document.object_get(occ_texture, "index"), -1)
                     mesh.occlusion_texcoord = document.integer(document.object_get(occ_texture, "texCoord"), 0)
-                    mesh.occlusion_strength = max(Float32(0.0), min(Float32(1.0), Float32(document.number(document.object_get(occ_texture, "strength"), 1.0))))
+                    mesh.occlusion_strength = _clamp_f32_range(document.number(document.object_get(occ_texture, "strength"), 1.0), Float32(0.0), Float32(1.0), Float32(1.0))
                 var em_texture = document.object_get(material, "emissiveTexture")
                 if em_texture != -1:
                     mesh.emissive_texture = document.integer(document.object_get(em_texture, "index"), -1)
                     mesh.emissive_texcoord = document.integer(document.object_get(em_texture, "texCoord"), 0)
-                mesh.roughness = max(Float32(0.05), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "roughnessFactor"), 0.55))))
-                mesh.metallic = max(Float32(0.0), min(Float32(1.0), Float32(document.number(document.object_get(pbr, "metallicFactor"), 0.0))))
+                mesh.roughness = _clamp_f32_range(document.number(document.object_get(pbr, "roughnessFactor"), 0.55), Float32(0.05), Float32(1.0), Float32(0.55))
+                mesh.metallic = _clamp_f32_range(document.number(document.object_get(pbr, "metallicFactor"), 0.0), Float32(0.0), Float32(1.0), Float32(0.0))
                 var alpha_mode = document.text(document.object_get(material, "alphaMode"), "OPAQUE")
                 mesh.alpha_mode = 2 if alpha_mode == "BLEND" else (1 if alpha_mode == "MASK" else 0)
                 mesh.double_sided = document.boolean(document.object_get(material, "doubleSided"), False)
@@ -363,13 +427,13 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                     if emissive_extension == -1:
                         emissive_extension = document.object_get(extensions, "KHR_emissive_strength")
                     if emissive_extension != -1:
-                        ext_em_strength = max(Float32(0.0), Float32(document.number(document.object_get(emissive_extension, "emissiveStrength"), 1.0)))
+                        ext_em_strength = _sanitize_emissive_comp(document.number(document.object_get(emissive_extension, "emissiveStrength"), 1.0))
                 var emissive = document.object_get(material, "emissiveFactor")
                 if document.array_size(emissive) == 3:
                     mesh.emissive_color = Vec3(
-                        Float32(document.number(document.at(emissive, 0), 0)),
-                        Float32(document.number(document.at(emissive, 1), 0)),
-                        Float32(document.number(document.at(emissive, 2), 0)),
+                        _sanitize_emissive_comp(document.number(document.at(emissive, 0), 0)),
+                        _sanitize_emissive_comp(document.number(document.at(emissive, 1), 0)),
+                        _sanitize_emissive_comp(document.number(document.at(emissive, 2), 0)),
                     )
                     var em_max = max(mesh.emissive_color.x, max(mesh.emissive_color.y, mesh.emissive_color.z))
                     if em_max > 0.0001:
@@ -387,26 +451,26 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 if extensions != -1:
                     var cc_ext = document.object_get(extensions, "KHR_materials_clearcoat")
                     if cc_ext != -1:
-                        mesh.clearcoat = Float32(document.number(document.object_get(cc_ext, "clearcoatFactor"), 0.0))
-                        mesh.clearcoat_roughness = Float32(document.number(document.object_get(cc_ext, "clearcoatRoughnessFactor"), 0.0))
+                        mesh.clearcoat = _clamp_f32_range(document.number(document.object_get(cc_ext, "clearcoatFactor"), 0.0), Float32(0.0), Float32(1.0), Float32(0.0))
+                        mesh.clearcoat_roughness = _clamp_f32_range(document.number(document.object_get(cc_ext, "clearcoatRoughnessFactor"), 0.0), Float32(0.0), Float32(1.0), Float32(0.0))
                     var spec_ext = document.object_get(extensions, "KHR_materials_specular")
                     if spec_ext != -1:
-                        mesh.specular_factor = Float32(document.number(document.object_get(spec_ext, "specularFactor"), 1.0))
+                        mesh.specular_factor = _clamp_f32_range(document.number(document.object_get(spec_ext, "specularFactor"), 1.0), Float32(0.0), Float32(1.0), Float32(1.0))
                     var irid_ext = document.object_get(extensions, "KHR_materials_iridescence")
                     if irid_ext != -1:
-                        mesh.iridescence = Float32(document.number(document.object_get(irid_ext, "iridescenceFactor"), 0.0))
-                        mesh.iridescence_ior = Float32(document.number(document.object_get(irid_ext, "iridescenceIor"), 1.3))
-                        mesh.iridescence_thickness_nm = Float32(document.number(document.object_get(irid_ext, "iridescenceThicknessMaximum"), 100.0))
+                        mesh.iridescence = _clamp_f32_range(document.number(document.object_get(irid_ext, "iridescenceFactor"), 0.0), Float32(0.0), Float32(1.0), Float32(0.0))
+                        mesh.iridescence_ior = _clamp_f32_range(document.number(document.object_get(irid_ext, "iridescenceIor"), 1.3), Float32(1.0), Float32(5.0), Float32(1.3))
+                        mesh.iridescence_thickness_nm = _clamp_f32_range(document.number(document.object_get(irid_ext, "iridescenceThicknessMaximum"), 100.0), Float32(0.0), Float32(10000.0), Float32(100.0))
                     var sheen_ext = document.object_get(extensions, "KHR_materials_sheen")
                     if sheen_ext != -1:
                         var sc = document.object_get(sheen_ext, "sheenColorFactor")
                         if document.array_size(sc) == 3:
                             mesh.sheen_color = Vec3(
-                                Float32(document.number(document.at(sc, 0), 0.0)),
-                                Float32(document.number(document.at(sc, 1), 0.0)),
-                                Float32(document.number(document.at(sc, 2), 0.0)),
+                                _clamp_f32_range(document.number(document.at(sc, 0), 0.0), Float32(0.0), Float32(1.0), Float32(0.0)),
+                                _clamp_f32_range(document.number(document.at(sc, 1), 0.0), Float32(0.0), Float32(1.0), Float32(0.0)),
+                                _clamp_f32_range(document.number(document.at(sc, 2), 0.0), Float32(0.0), Float32(1.0), Float32(0.0)),
                             )
-                        mesh.sheen_roughness = Float32(document.number(document.object_get(sheen_ext, "sheenRoughnessFactor"), 0.0))
+                        mesh.sheen_roughness = _clamp_f32_range(document.number(document.object_get(sheen_ext, "sheenRoughnessFactor"), 0.0), Float32(0.0), Float32(1.0), Float32(0.0))
             if len(mesh.weights) == mesh.vertex_count() * 4 and len(mesh.weights) > 0:
                 # Package 3.4: the centers of rotation, once, where the model is read.
                 mesh.centers = compute_cor(mesh.positions, mesh.indices, mesh.joints, mesh.weights)
@@ -426,7 +490,11 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
         var matrix = document.object_get(source, "matrix")
         if document.array_size(matrix) == 16:
             for index in range(16):
-                node.matrix.values[index] = Float32(document.number(document.at(matrix, index)))
+                var def_m = Float32(1.0) if (index % 5 == 0) else Float32(0.0)
+                node.matrix.values[index] = _sanitize_json_f32(
+                    document.number(document.at(matrix, index), Float64(def_m)),
+                    def_m,
+                )
             node.has_matrix = True
         var children = document.object_get(source, "children")
         for index in range(document.array_size(children)):

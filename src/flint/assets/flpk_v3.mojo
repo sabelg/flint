@@ -17,6 +17,7 @@ Implements:
      - `sub_id = 16` (`SUB_ID_BVH8_COLLIDER`) pre-built `Bvh8MeshCollider` static collider slab.
 """
 from std.ffi import external_call
+from std.math import isfinite
 from std.memory import bitcast
 from flint.core.lz4 import address_of, lz4_compress, lz4_decompress_into
 from flint.core.math import Vec3
@@ -333,7 +334,14 @@ struct AssetMeta(Copyable, Movable):
         self.toksvig_scale = Float32(1.0)
         self.source_path = String()
 
+    @staticmethod
+    def _safe_toksvig(v: Float32) -> Float32:
+        if not isfinite(v):
+            return Float32(1.0)
+        return max(Float32(0.0), min(Float32(1.0e6), v))
+
     def settings_hash(self) -> UInt64:
+        var safe_tok = Self._safe_toksvig(self.toksvig_scale)
         var s = (
             self.uuid.format()
             + "|k=" + String(Int(self.asset_kind))
@@ -344,11 +352,12 @@ struct AssetMeta(Copyable, Movable):
             + "|lz4=" + ("1" if self.compress_lz4 else "0")
             + "|tail=" + String(self.tail_first_mip)
             + "|maxd=" + String(self.max_tex_dim)
-            + "|tok=" + String(Int(self.toksvig_scale * Float32(1000.0)))
+            + "|tok=" + String(Int(Float64(safe_tok) * 1000.0))
         )
         return fnv64_str(s)
 
     def to_json(self) -> String:
+        var safe_tok = Self._safe_toksvig(self.toksvig_scale)
         return (
             "{\n"
             + '  "uuid": ' + json_quote(self.uuid.format()) + ",\n"
@@ -360,7 +369,7 @@ struct AssetMeta(Copyable, Movable):
             + '  "compress_lz4": ' + ("true" if self.compress_lz4 else "false") + ",\n"
             + '  "tail_first_mip": ' + String(self.tail_first_mip) + ",\n"
             + '  "max_tex_dim": ' + String(self.max_tex_dim) + ",\n"
-            + '  "toksvig_scale": ' + String(Float64(self.toksvig_scale)) + ",\n"
+            + '  "toksvig_scale": ' + String(Float64(safe_tok)) + ",\n"
             + '  "source_path": ' + json_quote(self.source_path) + "\n"
             + "}\n"
         )
@@ -386,7 +395,15 @@ def parse_flmeta_bytes(raw: List[UInt8]) -> Tuple[Bool, AssetMeta]:
     meta.compress_lz4 = doc.boolean(doc.object_get(doc.root, "compress_lz4"), False)
     meta.tail_first_mip = max(0, min(15, doc.integer(doc.object_get(doc.root, "tail_first_mip"), 4)))
     meta.max_tex_dim = max(4, doc.integer(doc.object_get(doc.root, "max_tex_dim"), 2048))
-    meta.toksvig_scale = Float32(doc.number(doc.object_get(doc.root, "toksvig_scale"), 1.0))
+    var tok_node = doc.object_get(doc.root, "toksvig_scale")
+    if tok_node >= 0:
+        var tok_d = doc.number(tok_node, 1.0)
+        var tok_f = Float32(tok_d)
+        if not isfinite(tok_d) or not isfinite(tok_f):
+            return (False, meta^)
+        meta.toksvig_scale = AssetMeta._safe_toksvig(tok_f)
+    else:
+        meta.toksvig_scale = Float32(1.0)
     meta.source_path = doc.text(doc.object_get(doc.root, "source_path"))
     return (True, meta^)
 

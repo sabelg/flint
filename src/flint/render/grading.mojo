@@ -16,7 +16,7 @@ Grade: the ASC Color Decision List (slope, offset, power per channel), the
 film industry's standard primary grade, which a per-channel table holds
 exactly. Saturation stays the engine's separate cross-channel step.
 """
-from std.math import log2, pow
+from std.math import isfinite, log2, pow
 from flint.core.math import Vec3
 from flint.core.springs import SpringFloat
 from flint.render.lighting import LightingProfile, regional_profile
@@ -40,6 +40,8 @@ def agx_sigmoid(x: Float32) -> Float32:
 
 
 def agx_raw(linear: Float32) -> Float32:
+    if not isfinite(linear):
+        return agx_sigmoid(Float32(0.0))
     var value = max(linear * AGX_PRE_EXPOSURE, Float32(1e-10))
     var x = (log2(value) - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV)
     return agx_sigmoid(max(Float32(0), min(Float32(1), x)))
@@ -49,6 +51,8 @@ def filmic_curve(display: Float32) -> Float32:
     """Maps a display value in [0, 1] through the anchored AgX curve,
     blended with a proportional shadow toe so weak primary channels are not
     crushed into 'Notorious Six' primary hue twists."""
+    if not isfinite(display):
+        return Float32(0.0)
     var d = max(Float32(0), min(Float32(1), display))
     var low = agx_raw(0)
     var high = agx_raw(1)
@@ -58,6 +62,8 @@ def filmic_curve(display: Float32) -> Float32:
 
 
 def cdl(value: Float32, slope: Float32, offset: Float32, power: Float32) -> Float32:
+    if not (isfinite(value) and isfinite(slope) and isfinite(offset) and isfinite(power)):
+        return Float32(0.0)
     var graded = max(Float32(0), value * slope + offset)
     return pow(graded, power)
 
@@ -83,7 +89,11 @@ def build_tone_table(profile: LightingProfile, mut table: List[UInt8]):
 
 
 def to_byte(value: Float32) -> UInt8:
-    return UInt8(max(0, min(255, Int(value * 255.0 + 0.5))))
+    if not isfinite(value) or value <= Float32(0.0):
+        return UInt8(0)
+    if value >= Float32(1.0):
+        return UInt8(255)
+    return UInt8(max(0, min(255, Int(value * Float32(255.0) + Float32(0.5)))))
 
 
 def mix3(a: Vec3, b: Vec3, t: Float32) -> Vec3:
@@ -389,11 +399,14 @@ struct LookDirector(Copyable, Movable):
             self.layer = layer
             self.blend = 0
         self.to_look = target
-        self.blend = min(Float32(1), self.blend + dt / LOOK_BLEND_SECONDS)
-        if moment_strength > 0:
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt <= Float32(0.0)) else min(dt, Float32(10.0))
+        self.blend = min(Float32(1), self.blend + safe_dt / LOOK_BLEND_SECONDS)
+        if isfinite(moment_strength) and moment_strength > 0 and isfinite(moment_tint.x) and isfinite(moment_tint.y) and isfinite(moment_tint.z):
             self.moment_tint = moment_tint
-        self.moment.update(moment_strength, 0.08, dt)
-        self.danger.update(danger, 0.25, dt)
+        var safe_moment = moment_strength if isfinite(moment_strength) else Float32(0.0)
+        var safe_danger = danger if isfinite(danger) else Float32(0.0)
+        self.moment.update(safe_moment, 0.08, safe_dt)
+        self.danger.update(safe_danger, 0.25, safe_dt)
         var look = self.current()
         var strength = max(Float32(0), min(Float32(1), self.moment.value))
         if strength > 0.001:

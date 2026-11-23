@@ -1,5 +1,7 @@
 """Small strict JSON DOM used by the native glTF runtime."""
 
+from std.math import isfinite
+
 comptime MAX_EXPONENT: Int = 400
 
 
@@ -69,7 +71,10 @@ struct JsonDocument(Copyable, Movable):
     def integer(self, node: Int, fallback: Int = -1) -> Int:
         if node < 0 or node >= len(self.nodes) or self.nodes[node].kind != 2:
             return fallback
-        return Int(self.nodes[node].number)
+        var num = self.nodes[node].number
+        if not isfinite(num) or num < -9223372036854774784.0 or num > 9223372036854774784.0:
+            return fallback
+        return Int(num)
 
     def boolean(self, node: Int, fallback: Bool = False) -> Bool:
         if node < 0 or node >= len(self.nodes) or self.nodes[node].kind != 1:

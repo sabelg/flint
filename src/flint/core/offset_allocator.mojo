@@ -242,32 +242,35 @@ struct OffsetAllocator(Movable):
         if allocation.metadata == OA_UNUSED:
             return
         var node_index = allocation.metadata
-        var node = self.nodes[Int(node_index)]
+        var idx = Int(node_index)
+        if idx < 0 or idx >= len(self.nodes):
+            return
+        var node = self.nodes[idx]
         if not node.used:
             return  # a double free is a caller bug; refuse rather than corrupt
         var offset = node.data_offset
         var size = node.data_size
-        if node.neighbor_prev != OA_UNUSED and not self.nodes[Int(node.neighbor_prev)].used:
+        if node.neighbor_prev != OA_UNUSED and Int(node.neighbor_prev) < len(self.nodes) and not self.nodes[Int(node.neighbor_prev)].used:
             var prev = self.nodes[Int(node.neighbor_prev)]
             offset = prev.data_offset
             size += prev.data_size
             self.remove_node_from_bin(node.neighbor_prev)
             node.neighbor_prev = prev.neighbor_prev
-        if node.neighbor_next != OA_UNUSED and not self.nodes[Int(node.neighbor_next)].used:
+        if node.neighbor_next != OA_UNUSED and Int(node.neighbor_next) < len(self.nodes) and not self.nodes[Int(node.neighbor_next)].used:
             var next = self.nodes[Int(node.neighbor_next)]
             size += next.data_size
             self.remove_node_from_bin(node.neighbor_next)
             node.neighbor_next = next.neighbor_next
         var neighbor_next = node.neighbor_next
         var neighbor_prev = node.neighbor_prev
-        self.nodes[Int(node_index)] = OffsetNode()
+        self.nodes[idx] = OffsetNode()
         self.free_nodes[self.free_count] = node_index
         self.free_count += 1
         var combined = self.insert_node_into_bin(size, offset)
-        if neighbor_next != OA_UNUSED:
+        if neighbor_next != OA_UNUSED and Int(neighbor_next) < len(self.nodes):
             self.nodes[Int(combined)].neighbor_next = neighbor_next
             self.nodes[Int(neighbor_next)].neighbor_prev = combined
-        if neighbor_prev != OA_UNUSED:
+        if neighbor_prev != OA_UNUSED and Int(neighbor_prev) < len(self.nodes):
             self.nodes[Int(combined)].neighbor_prev = neighbor_prev
             self.nodes[Int(neighbor_prev)].neighbor_next = combined
         self.allocations -= 1
@@ -275,7 +278,12 @@ struct OffsetAllocator(Movable):
     def allocation_size(self, allocation: OffsetAllocation) -> UInt32:
         if allocation.metadata == OA_UNUSED:
             return 0
-        return self.nodes[Int(allocation.metadata)].data_size
+        var idx = Int(allocation.metadata)
+        if idx < 0 or idx >= len(self.nodes):
+            return 0
+        if not self.nodes[idx].used:
+            return 0
+        return self.nodes[idx].data_size
 
     def insert_node_into_bin(mut self, size: UInt32, data_offset: UInt32) -> UInt32:
         var code = size_to_bin_round_down(size)

@@ -5,7 +5,7 @@ projection into a unified float depth buffer (`SimdCanvas`), serving as:
   1. Ultra-low-footprint (`< 4 MiB`) deterministic CPU renderer & headless CI backend
   2. Direct HUD/overlay/sprite compositor companion to `flint.render.gpu_raster`
 """
-from std.math import sin, cos, tan, sqrt, floor
+from std.math import sin, cos, tan, sqrt, floor, isfinite
 from flint.core.math import Vec3
 from flint.core.memory import MemCharge, MEM_RENDER
 from flint.render.font import bitmap_glyph
@@ -24,6 +24,8 @@ def pack_argb(r: Int, g: Int, b: Int, a: Int = 255) -> UInt32:
 
 @always_inline
 def shade_rgb(col: UInt32, factor: Float32) -> UInt32:
+    if not isfinite(factor):
+        return pack_argb(0, 0, 0, 255)
     var s = max(Float32(0.0), min(Float32(2.0), factor))
     var r = Int(Float32((col >> 16) & 0xFF) * s)
     var g = Int(Float32((col >> 8) & 0xFF) * s)
@@ -188,14 +190,24 @@ struct SimdCanvas(Movable):
         x2: Float32, y2: Float32, z2: Float32,
         color: UInt32,
     ):
-        var min_x = max(0, Int(floor(min(x0, min(x1, x2)))))
-        var max_x = min(self.width - 1, Int(floor(max(x0, max(x1, x2)))) + 1)
-        var min_y = max(0, Int(floor(min(y0, min(y1, y2)))))
-        var max_y = min(self.height - 1, Int(floor(max(y0, max(y1, y2)))) + 1)
+        if (
+            not isfinite(x0) or not isfinite(y0) or not isfinite(z0)
+            or not isfinite(x1) or not isfinite(y1) or not isfinite(z1)
+            or not isfinite(x2) or not isfinite(y2) or not isfinite(z2)
+        ):
+            return
+        var f_min_x = max(Float64(0.0), min(Float64(self.width), floor(Float64(min(x0, min(x1, x2))))))
+        var f_max_x = max(Float64(-1.0), min(Float64(self.width - 1), floor(Float64(max(x0, max(x1, x2)))) + 1.0))
+        var f_min_y = max(Float64(0.0), min(Float64(self.height), floor(Float64(min(y0, min(y1, y2))))))
+        var f_max_y = max(Float64(-1.0), min(Float64(self.height - 1), floor(Float64(max(y0, max(y1, y2)))) + 1.0))
+        var min_x = Int(f_min_x)
+        var max_x = Int(f_max_x)
+        var min_y = Int(f_min_y)
+        var max_y = Int(f_max_y)
         if min_x > max_x or min_y > max_y:
             return
         var area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
-        if abs(area) < Float32(0.25):
+        if not isfinite(area) or abs(area) < Float32(0.25):
             return
         self.triangles_drawn += 1
         var inv_area = Float32(1.0) / area
@@ -251,23 +263,78 @@ struct SimdCanvas(Movable):
         var sb = cam.project(b)
         if not (sa[3] and sb[3]):
             return
-        var dx = sb[0] - sa[0]
-        var dy = sb[1] - sa[1]
-        var steps = Int(max(abs(dx), abs(dy)))
+        if (
+            not isfinite(sa[0]) or not isfinite(sa[1]) or not isfinite(sa[2])
+            or not isfinite(sb[0]) or not isfinite(sb[1]) or not isfinite(sb[2])
+        ):
+            return
+        var rad = min(64, max(0, thickness_px - 1))
+        var pad = Float64(rad + 2)
+        var x0 = Float64(sa[0])
+        var y0 = Float64(sa[1])
+        var z0 = Float64(sa[2])
+        var x1 = Float64(sb[0])
+        var y1 = Float64(sb[1])
+        var z1 = Float64(sb[2])
+        var dx = x1 - x0
+        var dy = y1 - y0
+        var dz = z1 - z0
+        var xmin = -pad
+        var xmax = Float64(self.width) + pad
+        var ymin = -pad
+        var ymax = Float64(self.height) + pad
+        var t0 = 0.0
+        var t1 = 1.0
+        var p_edges = [-dx, dx, -dy, dy]
+        var q_edges = [x0 - xmin, xmax - x0, y0 - ymin, ymax - y0]
+        for ei in range(4):
+            var pe = p_edges[ei]
+            var qe = q_edges[ei]
+            if pe == 0.0:
+                if qe < 0.0:
+                    return
+            else:
+                var r = qe / pe
+                if pe < 0.0:
+                    if r > t1:
+                        return
+                    if r > t0:
+                        t0 = r
+                else:
+                    if r < t0:
+                        return
+                    if r < t1:
+                        t1 = r
+        if t0 > t1:
+            return
+        var cx0 = x0 + t0 * dx
+        var cy0 = y0 + t0 * dy
+        var cz0 = z0 + t0 * dz
+        var cx1 = x0 + t1 * dx
+        var cy1 = y0 + t1 * dy
+        var cz1 = z0 + t1 * dz
+        var cdx = cx1 - cx0
+        var cdy = cy1 - cy0
+        var cdz = cz1 - cz0
+        var span = max(abs(cdx), abs(cdy))
+        if not isfinite(span) or span < 1.0:
+            return
+        var max_steps = max(64, max(self.width, self.height) * 4 + 256)
+        var steps = min(max_steps, Int(min(Float64(max_steps), span)))
         if steps <= 0:
             return
-        var inv = Float32(1.0) / Float32(steps)
-        var sx = dx * inv
-        var sy = dy * inv
-        var sz = (sb[2] - sa[2]) * inv
-        var cx = sa[0]
-        var cy = sa[1]
-        var cz = sa[2]
-        var rad = max(0, thickness_px - 1)
+        var inv = 1.0 / Float64(steps)
+        var sx = cdx * inv
+        var sy = cdy * inv
+        var sz = cdz * inv
+        var cx = cx0
+        var cy = cy0
+        var cz = cz0
         var opaque = color | 0xFF000000
         for _ in range(steps + 1):
             var ix = Int(cx)
             var iy = Int(cy)
+            var cz_f = Float32(cz)
             for oy in range(-rad, rad + 1):
                 var py = iy + oy
                 if py < 0 or py >= self.height:
@@ -277,9 +344,9 @@ struct SimdCanvas(Movable):
                     var px = ix + ox
                     if px >= 0 and px < self.width:
                         var fi = row + px
-                        if cz >= self.depth[fi]:
+                        if cz_f >= self.depth[fi]:
                             self.pixels[fi] = opaque
-                            self.depth[fi] = cz
+                            self.depth[fi] = cz_f
             cx += sx
             cy += sy
             cz += sz

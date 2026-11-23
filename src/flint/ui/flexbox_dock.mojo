@@ -11,7 +11,7 @@ Implements:
     splitter dragging, and `save_json()` / `load_json()` workspace persistence.
 """
 from std.collections import List
-from std.math import abs
+from std.math import abs, isfinite
 from flint.assets.json import parse_json
 from flint.assets.json_write import json_quote
 
@@ -37,7 +37,11 @@ comptime DOCK_TABS: Int = 2             # Multi-tab leaf panel
 comptime DOCK_CENTRAL_VIEWPORT: Int = 3 # Central pass-through 3D viewport
 
 
-@fieldwise_init
+@always_inline
+def _fin_f32_ui(v: Float32, fallback: Float32 = 0.0) -> Float32:
+    return v if isfinite(v) else fallback
+
+
 struct RectF(Copyable, ImplicitlyCopyable, Movable):
     """Axis-aligned 2D UI rectangle `(x, y, w, h)`."""
     var x: Float32
@@ -50,6 +54,12 @@ struct RectF(Copyable, ImplicitlyCopyable, Movable):
         self.y = 0.0
         self.w = 0.0
         self.h = 0.0
+
+    def __init__(out self, x: Float32, y: Float32, w: Float32, h: Float32):
+        self.x = x if isfinite(x) else Float32(0.0)
+        self.y = y if isfinite(y) else Float32(0.0)
+        self.w = w if isfinite(w) else Float32(0.0)
+        self.h = h if isfinite(h) else Float32(0.0)
 
     @always_inline
     def right(self) -> Float32:
@@ -91,10 +101,14 @@ struct RectF(Copyable, ImplicitlyCopyable, Movable):
 
     @always_inline
     def inset(self, l: Float32, t: Float32, r: Float32, b: Float32) -> RectF:
-        var pl = min(max(Float32(0.0), l), self.w)
-        var pr = min(max(Float32(0.0), r), max(Float32(0.0), self.w - pl))
-        var pt = min(max(Float32(0.0), t), self.h)
-        var pb = min(max(Float32(0.0), b), max(Float32(0.0), self.h - pt))
+        var sl = l if isfinite(l) else Float32(0.0)
+        var st = t if isfinite(t) else Float32(0.0)
+        var sr = r if isfinite(r) else Float32(0.0)
+        var sb = b if isfinite(b) else Float32(0.0)
+        var pl = min(max(Float32(0.0), sl), self.w)
+        var pr = min(max(Float32(0.0), sr), max(Float32(0.0), self.w - pl))
+        var pt = min(max(Float32(0.0), st), self.h)
+        var pb = min(max(Float32(0.0), sb), max(Float32(0.0), self.h - pt))
         return RectF(self.x + pl, self.y + pt, max(Float32(0.0), self.w - pl - pr), max(Float32(0.0), self.h - pt - pb))
 
 
@@ -143,18 +157,39 @@ struct FlexStyle(Copyable, ImplicitlyCopyable, Movable):
     @staticmethod
     def row(gap: Float32 = 4.0, pad: Float32 = 0.0, align_items: Int = ALIGN_CENTER) -> Self:
         var s = Self(FLEX_ROW)
-        s.gap = gap
-        s.pad_l = pad; s.pad_t = pad; s.pad_r = pad; s.pad_b = pad
+        s.gap = max(Float32(0.0), gap) if isfinite(gap) else Float32(0.0)
+        var p = max(Float32(0.0), pad) if isfinite(pad) else Float32(0.0)
+        s.pad_l = p; s.pad_t = p; s.pad_r = p; s.pad_b = p
         s.align_items = align_items
         return s^
 
     @staticmethod
     def col(gap: Float32 = 4.0, pad: Float32 = 0.0, align_items: Int = ALIGN_STRETCH) -> Self:
         var s = Self(FLEX_COL)
-        s.gap = gap
-        s.pad_l = pad; s.pad_t = pad; s.pad_r = pad; s.pad_b = pad
+        s.gap = max(Float32(0.0), gap) if isfinite(gap) else Float32(0.0)
+        var p = max(Float32(0.0), pad) if isfinite(pad) else Float32(0.0)
+        s.pad_l = p; s.pad_t = p; s.pad_r = p; s.pad_b = p
         s.align_items = align_items
         return s^
+
+
+def _sanitize_flex_style(st: FlexStyle) -> FlexStyle:
+    var out = st
+    out.basis = st.basis if isfinite(st.basis) else Float32(-1.0)
+    out.grow = max(Float32(0.0), st.grow) if isfinite(st.grow) else Float32(0.0)
+    out.shrink = max(Float32(0.0), st.shrink) if isfinite(st.shrink) else Float32(1.0)
+    out.min_w = max(Float32(0.0), st.min_w) if isfinite(st.min_w) else Float32(0.0)
+    out.min_h = max(Float32(0.0), st.min_h) if isfinite(st.min_h) else Float32(0.0)
+    out.max_w = max(out.min_w, st.max_w if isfinite(st.max_w) else Float32(1.0e9))
+    out.max_h = max(out.min_h, st.max_h if isfinite(st.max_h) else Float32(1.0e9))
+    out.pad_l = max(Float32(0.0), st.pad_l) if isfinite(st.pad_l) else Float32(0.0)
+    out.pad_t = max(Float32(0.0), st.pad_t) if isfinite(st.pad_t) else Float32(0.0)
+    out.pad_r = max(Float32(0.0), st.pad_r) if isfinite(st.pad_r) else Float32(0.0)
+    out.pad_b = max(Float32(0.0), st.pad_b) if isfinite(st.pad_b) else Float32(0.0)
+    out.gap = max(Float32(0.0), st.gap) if isfinite(st.gap) else Float32(0.0)
+    out.fixed_w = st.fixed_w if isfinite(st.fixed_w) else Float32(0.0)
+    out.fixed_h = st.fixed_h if isfinite(st.fixed_h) else Float32(0.0)
+    return out
 
 
 struct FlexNode(Copyable, Movable):
@@ -169,10 +204,10 @@ struct FlexNode(Copyable, Movable):
 
     def __init__(out self, parent: Int, style: FlexStyle, leaf_w: Float32 = 0.0, leaf_h: Float32 = 0.0):
         self.parent = parent
-        self.style = style
+        self.style = _sanitize_flex_style(style)
         self.children = List[Int]()
-        self.leaf_w = max(Float32(0.0), leaf_w)
-        self.leaf_h = max(Float32(0.0), leaf_h)
+        self.leaf_w = max(Float32(0.0), leaf_w) if isfinite(leaf_w) else Float32(0.0)
+        self.leaf_h = max(Float32(0.0), leaf_h) if isfinite(leaf_h) else Float32(0.0)
         self.measured_w = 0.0
         self.measured_h = 0.0
         self.rect = RectF()
@@ -197,9 +232,9 @@ struct FlexTree(Copyable, Movable):
 
     def _measure_single_node(mut self, idx: Int):
         var n_ch = len(self.nodes[idx].children)
-        var st = self.nodes[idx].style
-        var w = self.nodes[idx].leaf_w
-        var h = self.nodes[idx].leaf_h
+        var st = _sanitize_flex_style(self.nodes[idx].style)
+        var w = max(Float32(0.0), self.nodes[idx].leaf_w) if isfinite(self.nodes[idx].leaf_w) else Float32(0.0)
+        var h = max(Float32(0.0), self.nodes[idx].leaf_h) if isfinite(self.nodes[idx].leaf_h) else Float32(0.0)
 
         if n_ch > 0:
             var gap_total = Float32(max(0, n_ch - 1)) * max(Float32(0.0), st.gap)
@@ -241,7 +276,7 @@ struct FlexTree(Copyable, Movable):
         if n_ch == 0:
             return
 
-        var st = self.nodes[idx].style
+        var st = _sanitize_flex_style(self.nodes[idx].style)
         var outer = self.nodes[idx].rect
         var inner = outer.inset(st.pad_l, st.pad_t, st.pad_r, st.pad_b)
         var is_row = st.direction == FLEX_ROW
@@ -251,24 +286,28 @@ struct FlexTree(Copyable, Movable):
 
         var req_gap = max(Float32(0.0), st.gap)
         var eff_gap = req_gap
-        var total_gap = Float32(max(0, n_ch - 1)) * eff_gap
-        if total_gap > main_avail:
+        var total_gap64 = Float64(max(0, n_ch - 1)) * Float64(eff_gap)
+        if not isfinite(total_gap64) or total_gap64 > Float64(main_avail):
             eff_gap = main_avail / Float32(max(1, n_ch - 1)) if n_ch > 1 else Float32(0.0)
-            total_gap = Float32(max(0, n_ch - 1)) * eff_gap
+            total_gap64 = Float64(max(0, n_ch - 1)) * Float64(eff_gap)
+        var total_gap = Float32(total_gap64) if isfinite(total_gap64) else Float32(0.0)
         var avail_items = max(Float32(0.0), main_avail - total_gap)
+        var avail_items64 = Float64(avail_items)
 
         var base_m = List[Float32](length=n_ch, fill=0.0)
         var min_m = List[Float32](length=n_ch, fill=0.0)
         var max_m = List[Float32](length=n_ch, fill=0.0)
         var size_m = List[Float32](length=n_ch, fill=0.0)
+        var grow_m = List[Float32](length=n_ch, fill=0.0)
+        var shrink_m = List[Float32](length=n_ch, fill=1.0)
         var frozen = List[Bool](length=n_ch, fill=False)
 
-        var sum_min = Float32(0.0)
-        var sum_base = Float32(0.0)
+        var sum_min64 = 0.0
+        var sum_base64 = 0.0
 
         for i in range(n_ch):
             var c = self.nodes[idx].children[i]
-            var cst = self.nodes[c].style
+            var cst = _sanitize_flex_style(self.nodes[c].style)
             var mn = max(Float32(0.0), cst.min_w if is_row else cst.min_h)
             var mx = max(mn, cst.max_w if is_row else cst.max_h)
             var pref: Float32
@@ -279,49 +318,54 @@ struct FlexTree(Copyable, Movable):
             elif (not is_row) and cst.fixed_h > Float32(0.0):
                 pref = cst.fixed_h
             else:
-                pref = self.nodes[c].measured_w if is_row else self.nodes[c].measured_h
+                var mm = self.nodes[c].measured_w if is_row else self.nodes[c].measured_h
+                pref = mm if isfinite(mm) else Float32(0.0)
             pref = max(mn, min(mx, pref))
             min_m[i] = mn
             max_m[i] = mx
             base_m[i] = pref
             size_m[i] = pref
-            sum_min += mn
-            sum_base += pref
+            grow_m[i] = cst.grow
+            shrink_m[i] = cst.shrink
+            sum_min64 += Float64(mn)
+            sum_base64 += Float64(pref)
 
-        if sum_min > avail_items and sum_min > Float32(1.0e-6):
+        if sum_min64 > avail_items64 and sum_min64 > 1.0e-6:
             # Overconstrained container smaller than sum of child minimums: scale down proportionally to preserve bounds
-            var scale = avail_items / sum_min
+            var scale64 = avail_items64 / sum_min64
             for i in range(n_ch):
-                size_m[i] = min_m[i] * scale
-        elif abs(avail_items - sum_base) <= Float32(1.0e-5):
+                var scaled = Float64(min_m[i]) * scale64
+                size_m[i] = Float32(scaled) if isfinite(scaled) else Float32(0.0)
+        elif abs(avail_items64 - sum_base64) <= 1.0e-5:
             pass
-        elif avail_items > sum_base:
+        elif avail_items64 > sum_base64:
             # Positive free space: CSS Flexbox iterative freeze-loop over `grow`
             for i in range(n_ch):
-                if self.nodes[self.nodes[idx].children[i]].style.grow <= Float32(0.0):
+                if grow_m[i] <= Float32(0.0):
                     frozen[i] = True
 
             for _ in range(n_ch + 1):
-                var frozen_sum = Float32(0.0)
-                var unfrozen_base_sum = Float32(0.0)
-                var sum_grow = Float32(0.0)
+                var frozen_sum64 = 0.0
+                var unfrozen_base_sum64 = 0.0
+                var sum_grow64 = 0.0
                 for i in range(n_ch):
                     if frozen[i]:
-                        frozen_sum += size_m[i]
+                        frozen_sum64 += Float64(size_m[i])
                     else:
-                        unfrozen_base_sum += base_m[i]
-                        sum_grow += max(Float32(0.0), self.nodes[self.nodes[idx].children[i]].style.grow)
+                        unfrozen_base_sum64 += Float64(base_m[i])
+                        sum_grow64 += Float64(max(Float32(0.0), grow_m[i]))
 
-                if sum_grow <= Float32(1.0e-7):
+                if not isfinite(sum_grow64) or sum_grow64 <= 1.0e-7:
                     break
 
-                var rem_free = max(Float32(0.0), avail_items - frozen_sum - unfrozen_base_sum)
+                var rem_free64 = max(0.0, avail_items64 - frozen_sum64 - unfrozen_base_sum64)
                 var any_clamped = False
                 for i in range(n_ch):
                     if frozen[i]:
                         continue
-                    var g = max(Float32(0.0), self.nodes[self.nodes[idx].children[i]].style.grow)
-                    var target = base_m[i] + rem_free * (g / sum_grow)
+                    var g64 = Float64(max(Float32(0.0), grow_m[i]))
+                    var target64 = Float64(base_m[i]) + rem_free64 * (g64 / sum_grow64)
+                    var target = Float32(target64) if isfinite(target64) else max_m[i]
                     if target > max_m[i]:
                         size_m[i] = max_m[i]
                         frozen[i] = True
@@ -337,32 +381,34 @@ struct FlexTree(Copyable, Movable):
         else:
             # Deficit space (avail_items < sum_base): CSS Flexbox iterative weighted shrink
             for i in range(n_ch):
-                if self.nodes[self.nodes[idx].children[i]].style.shrink <= Float32(0.0):
+                if shrink_m[i] <= Float32(0.0):
                     frozen[i] = True
 
             for _ in range(n_ch + 1):
-                var frozen_sum = Float32(0.0)
-                var unfrozen_base_sum = Float32(0.0)
-                var sum_scaled_shrink = Float32(0.0)
+                var frozen_sum64 = 0.0
+                var unfrozen_base_sum64 = 0.0
+                var sum_scaled_shrink64 = 0.0
                 for i in range(n_ch):
                     if frozen[i]:
-                        frozen_sum += size_m[i]
+                        frozen_sum64 += Float64(size_m[i])
                     else:
-                        unfrozen_base_sum += base_m[i]
-                        var sh = max(Float32(0.0), self.nodes[self.nodes[idx].children[i]].style.shrink)
-                        sum_scaled_shrink += sh * max(Float32(1.0), base_m[i])
+                        unfrozen_base_sum64 += Float64(base_m[i])
+                        var sh64 = Float64(max(Float32(0.0), shrink_m[i]))
+                        sum_scaled_shrink64 += sh64 * max(1.0, Float64(base_m[i]))
 
-                if sum_scaled_shrink <= Float32(1.0e-7):
+                if not isfinite(sum_scaled_shrink64) or sum_scaled_shrink64 <= 1.0e-7:
                     break
 
-                var deficit = max(Float32(0.0), (frozen_sum + unfrozen_base_sum) - avail_items)
+                var rem_avail64 = max(0.0, avail_items64 - frozen_sum64)
                 var any_clamped = False
                 for i in range(n_ch):
                     if frozen[i]:
                         continue
-                    var sh = max(Float32(0.0), self.nodes[self.nodes[idx].children[i]].style.shrink)
-                    var w_sh = sh * max(Float32(1.0), base_m[i])
-                    var target = base_m[i] - deficit * (w_sh / sum_scaled_shrink)
+                    var sh64 = Float64(max(Float32(0.0), shrink_m[i]))
+                    var w_sh64 = sh64 * max(1.0, Float64(base_m[i]))
+                    var frac64 = w_sh64 / sum_scaled_shrink64
+                    var target64 = (Float64(base_m[i]) - unfrozen_base_sum64 * frac64) + rem_avail64 * frac64
+                    var target = Float32(target64) if isfinite(target64) else min_m[i]
                     if target < min_m[i]:
                         size_m[i] = min_m[i]
                         frozen[i] = True
@@ -373,26 +419,28 @@ struct FlexTree(Copyable, Movable):
                     break
 
             # If unshrinkable (`shrink == 0`) children still exceed container, clamp excess down to min_m
-            var cur_sum = Float32(0.0)
+            var cur_sum64 = 0.0
             for i in range(n_ch):
-                cur_sum += size_m[i]
-            if cur_sum > avail_items + Float32(1.0e-4):
-                var reducible = cur_sum - sum_min
-                var excess = cur_sum - avail_items
-                if reducible > Float32(1.0e-6):
-                    var frac = min(Float32(1.0), excess / reducible)
+                cur_sum64 += Float64(size_m[i])
+            if cur_sum64 > avail_items64 + 1.0e-4:
+                var reducible64 = cur_sum64 - sum_min64
+                var excess64 = cur_sum64 - avail_items64
+                if reducible64 > 1.0e-6:
+                    var frac64 = min(1.0, excess64 / reducible64)
                     for i in range(n_ch):
-                        size_m[i] = size_m[i] - (size_m[i] - min_m[i]) * frac
-                elif cur_sum > Float32(1.0e-6):
-                    var sc = avail_items / cur_sum
+                        var v64 = Float64(size_m[i]) - (Float64(size_m[i]) - Float64(min_m[i])) * frac64
+                        size_m[i] = Float32(v64) if isfinite(v64) else min_m[i]
+                elif cur_sum64 > 1.0e-6:
+                    var sc64 = avail_items64 / cur_sum64
                     for i in range(n_ch):
-                        size_m[i] *= sc
+                        var v64 = Float64(size_m[i]) * sc64
+                        size_m[i] = Float32(v64) if isfinite(v64) else Float32(0.0)
 
         # Main-axis placement (`justify_content`)
-        var used_items = Float32(0.0)
+        var used_items64 = 0.0
         for i in range(n_ch):
-            used_items += size_m[i]
-        var leftover = max(Float32(0.0), avail_items - used_items)
+            used_items64 += Float64(size_m[i])
+        var leftover = Float32(max(0.0, avail_items64 - used_items64))
         var start_offset = Float32(0.0)
         var extra_gap = Float32(0.0)
         if st.justify_content == JUSTIFY_CENTER:
@@ -407,7 +455,7 @@ struct FlexTree(Copyable, Movable):
 
         for i in range(n_ch):
             var c = self.nodes[idx].children[i]
-            var cst = self.nodes[c].style
+            var cst = _sanitize_flex_style(self.nodes[c].style)
             var align = cst.align_self if cst.align_self != ALIGN_AUTO else st.align_items
 
             var mn_c = min(cross_avail, max(Float32(0.0), cst.min_h if is_row else cst.min_w))
@@ -465,12 +513,11 @@ struct FlexTree(Copyable, Movable):
             oi -= 1
 
         # Pass 2: Top-down CSS freeze-loop space distribution (forward pre-order)
-        self.nodes[root_idx].rect = RectF(
-            root_rect.x,
-            root_rect.y,
-            max(Float32(0.0), root_rect.w),
-            max(Float32(0.0), root_rect.h),
-        )
+        var rx = root_rect.x if isfinite(root_rect.x) else Float32(0.0)
+        var ry = root_rect.y if isfinite(root_rect.y) else Float32(0.0)
+        var rw = max(Float32(0.0), root_rect.w) if isfinite(root_rect.w) else Float32(0.0)
+        var rh = max(Float32(0.0), root_rect.h) if isfinite(root_rect.h) else Float32(0.0)
+        self.nodes[root_idx].rect = RectF(rx, ry, rw, rh)
         for i in range(len(order)):
             self._solve_single_node(order[i])
 
@@ -571,7 +618,7 @@ struct DockSpace(Copyable, Movable):
         self.nodes.append(created^)
 
         self.nodes[target_id].kind = split_kind
-        self.nodes[target_id].ratio = max(self.min_ratio, min(Float32(1.0) - self.min_ratio, ratio))
+        self.nodes[target_id].ratio = self._clamp_ratio(ratio)
         self.nodes[target_id].tabs.clear()
         self.nodes[target_id].active_tab = 0
         if place_new_first:
@@ -598,14 +645,27 @@ struct DockSpace(Copyable, Movable):
         _ = d.split_node(s3[1], DOCK_SPLIT_V, 0.70, [String("Console"), String("AssetBrowser"), String("CyclesLive")], place_new_first=False)
         return d^
 
+    @always_inline
+    def _clamp_ratio(self, ratio: Float32) -> Float32:
+        var mr = min(Float32(0.49), max(Float32(0.0), self.min_ratio)) if isfinite(self.min_ratio) else Float32(0.08)
+        if not isfinite(ratio):
+            return Float32(0.5)
+        return max(mr, min(Float32(1.0) - mr, ratio))
+
     def solve_layout(mut self, root_rect: RectF):
         if self.root < 0 or self.root >= len(self.nodes):
             return
+        var safe_root = RectF(
+            root_rect.x if isfinite(root_rect.x) else Float32(0.0),
+            root_rect.y if isfinite(root_rect.y) else Float32(0.0),
+            max(Float32(0.0), root_rect.w) if isfinite(root_rect.w) else Float32(0.0),
+            max(Float32(0.0), root_rect.h) if isfinite(root_rect.h) else Float32(0.0),
+        )
         var visited = List[Bool](length=len(self.nodes), fill=False)
         var stack_id = List[Int]()
         var stack_rect = List[RectF]()
         stack_id.append(self.root)
-        stack_rect.append(root_rect)
+        stack_rect.append(safe_root)
         while len(stack_id) > 0:
             var node_id = stack_id.pop()
             var rect = stack_rect.pop()
@@ -615,20 +675,30 @@ struct DockSpace(Copyable, Movable):
             self.nodes[node_id].rect = rect
             var k = self.nodes[node_id].kind
             if k == DOCK_SPLIT_H:
-                var r = max(self.min_ratio, min(Float32(1.0) - self.min_ratio, self.nodes[node_id].ratio))
+                var r = self._clamp_ratio(self.nodes[node_id].ratio)
+                self.nodes[node_id].ratio = r
                 var wa = rect.w * r
-                var wb = rect.w - wa
+                if not isfinite(wa):
+                    wa = Float32(0.0)
+                var wb = max(Float32(0.0), rect.w - wa)
+                var xb_f64 = Float64(rect.x) + Float64(wa)
+                var xb = Float32(max(-3.4028234e38, min(3.4028234e38, xb_f64)))
                 var ca = self.nodes[node_id].child_a
                 var cb = self.nodes[node_id].child_b
-                stack_id.append(cb); stack_rect.append(RectF(rect.x + wa, rect.y, wb, rect.h))
+                stack_id.append(cb); stack_rect.append(RectF(xb, rect.y, wb, rect.h))
                 stack_id.append(ca); stack_rect.append(RectF(rect.x, rect.y, wa, rect.h))
             elif k == DOCK_SPLIT_V:
-                var r = max(self.min_ratio, min(Float32(1.0) - self.min_ratio, self.nodes[node_id].ratio))
+                var r = self._clamp_ratio(self.nodes[node_id].ratio)
+                self.nodes[node_id].ratio = r
                 var ha = rect.h * r
-                var hb = rect.h - ha
+                if not isfinite(ha):
+                    ha = Float32(0.0)
+                var hb = max(Float32(0.0), rect.h - ha)
+                var yb_f64 = Float64(rect.y) + Float64(ha)
+                var yb = Float32(max(-3.4028234e38, min(3.4028234e38, yb_f64)))
                 var ca = self.nodes[node_id].child_a
                 var cb = self.nodes[node_id].child_b
-                stack_id.append(cb); stack_rect.append(RectF(rect.x, rect.y + ha, rect.w, hb))
+                stack_id.append(cb); stack_rect.append(RectF(rect.x, yb, rect.w, hb))
                 stack_id.append(ca); stack_rect.append(RectF(rect.x, rect.y, rect.w, ha))
 
     def leaf_rects(self) -> List[RectF]:
@@ -657,6 +727,8 @@ struct DockSpace(Copyable, Movable):
             self.dragging_node = -1
 
         self.hovered_splitter_node = -1
+        if not isfinite(mx) or not isfinite(my):
+            return False
         var hit_half = Float32(4.0)
 
         for i in range(len(self.nodes)):
@@ -681,26 +753,35 @@ struct DockSpace(Copyable, Movable):
             var r = self.nodes[dn].rect
             if self.nodes[dn].kind == DOCK_SPLIT_H and r.w > Float32(1.0):
                 var nr = (mx - r.x) / r.w
-                self.nodes[dn].ratio = max(self.min_ratio, min(Float32(1.0) - self.min_ratio, nr))
+                if not isfinite(nr):
+                    return False
+                self.nodes[dn].ratio = self._clamp_ratio(nr)
                 self.solve_layout(root_rect)
                 return True
             elif self.nodes[dn].kind == DOCK_SPLIT_V and r.h > Float32(1.0):
                 var nr = (my - r.y) / r.h
-                self.nodes[dn].ratio = max(self.min_ratio, min(Float32(1.0) - self.min_ratio, nr))
+                if not isfinite(nr):
+                    return False
+                self.nodes[dn].ratio = self._clamp_ratio(nr)
                 self.solve_layout(root_rect)
                 return True
         return False
 
     def find_panel(self, panel_name: String) -> Tuple[Int, Int, Bool, RectF]:
         """Returns `(node_id, tab_index, is_active_tab, content_rect)` for `panel_name`."""
+        var safe_hh = max(Float32(0.0), self.header_height) if isfinite(self.header_height) else Float32(24.0)
         for i in range(len(self.nodes)):
             var k = self.nodes[i].kind
             if k == DOCK_TABS or k == DOCK_CENTRAL_VIEWPORT:
                 for t in range(len(self.nodes[i].tabs)):
                     if self.nodes[i].tabs[t] == panel_name:
                         var full = self.nodes[i].rect
-                        var hh = Float32(0.0) if k == DOCK_CENTRAL_VIEWPORT else min(self.header_height, full.h)
-                        var content = RectF(full.x, full.y + hh, full.w, max(Float32(0.0), full.h - hh))
+                        var fx = full.x if isfinite(full.x) else Float32(0.0)
+                        var fy = full.y if isfinite(full.y) else Float32(0.0)
+                        var fw = max(Float32(0.0), full.w) if isfinite(full.w) else Float32(0.0)
+                        var fh = max(Float32(0.0), full.h) if isfinite(full.h) else Float32(0.0)
+                        var hh = Float32(0.0) if k == DOCK_CENTRAL_VIEWPORT else min(safe_hh, fh)
+                        var content = RectF(fx, fy + hh, fw, max(Float32(0.0), fh - hh))
                         return (i, t, self.nodes[i].active_tab == t, content)
         return (-1, -1, False, RectF())
 
@@ -719,6 +800,8 @@ struct DockSpace(Copyable, Movable):
     @staticmethod
     def _fmt_ratio(v: Float32) -> String:
         # 6-decimal fixed-point representation for exact clean JSON round-trips
+        if not isfinite(v):
+            return "0.500000"
         var clamped = max(Float32(0.0), min(Float32(1.0), v))
         var scaled = Int(Float64(clamped) * 1000000.0 + 0.5)
         if scaled >= 1000000:
@@ -730,7 +813,8 @@ struct DockSpace(Copyable, Movable):
         return "0." + digits
 
     def save_json(self) -> String:
-        var out = String('{"version": 1, "root": ') + String(self.root) + ', "header_height": ' + String(Int(self.header_height)) + ', "nodes": ['
+        var safe_hh = Int(min(Float32(10000.0), max(Float32(0.0), self.header_height))) if isfinite(self.header_height) else 24
+        var out = String('{"version": 1, "root": ') + String(self.root) + ', "header_height": ' + String(safe_hh) + ', "nodes": ['
         for i in range(len(self.nodes)):
             if i > 0:
                 out += ", "
@@ -773,15 +857,16 @@ struct DockSpace(Copyable, Movable):
             var id = doc.integer(doc.object_get(obj, "id"), i)
             var kind = doc.integer(doc.object_get(obj, "kind"), DOCK_TABS)
             var dn = DockNode(id, kind)
-            dn.ratio = Float32(doc.number(doc.object_get(obj, "ratio"), 0.5))
+            dn.ratio = self._clamp_ratio(Float32(doc.number(doc.object_get(obj, "ratio"), 0.5)))
             dn.child_a = doc.integer(doc.object_get(obj, "child_a"), -1)
             dn.child_b = doc.integer(doc.object_get(obj, "child_b"), -1)
-            dn.active_tab = max(0, doc.integer(doc.object_get(obj, "active_tab"), 0))
+            var raw_active = doc.integer(doc.object_get(obj, "active_tab"), 0)
             var tabs_arr = doc.object_get(obj, "tabs")
             if tabs_arr >= 0:
                 var tc = doc.array_size(tabs_arr)
                 for ti in range(tc):
                     dn.tabs.append(doc.text(doc.at(tabs_arr, ti), ""))
+            dn.active_tab = max(0, min(max(0, len(dn.tabs) - 1), raw_active))
             parsed_nodes.append(dn^)
 
         var root_idx = doc.integer(root_node, 0 if len(parsed_nodes) > 0 else -1)
@@ -839,5 +924,6 @@ struct DockSpace(Copyable, Movable):
         self.nodes = parsed_nodes^
         self.root = root_idx
         if hh_node >= 0:
-            self.header_height = Float32(doc.number(hh_node, 24.0))
+            var hh = Float32(doc.number(hh_node, 24.0))
+            self.header_height = max(Float32(0.0), hh) if isfinite(hh) else Float32(24.0)
         return True

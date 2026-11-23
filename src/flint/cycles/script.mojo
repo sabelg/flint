@@ -879,6 +879,10 @@ struct Program(Movable):
             return self.pat_val(self.pat.shift_left(fr if name == "rotL" else -fr, self.to_pattern(args[1])))
         if name == "inside" or name == "outside":
             var n = self.to_numbers(args[0])[0]
+            if n != n or n <= 0.0 or n > Float64(MAX_PATTERN_COUNT):
+                raise Error(name + " factor out of range (must be > 0 and <= 4096)")
+            if (1.0 / n) > Float64(MAX_PATTERN_COUNT):
+                raise Error(name + " factor too small (max 4096x)")
             if name == "outside":
                 n = 1.0 / n
             var fr = Frac.from_float(n)

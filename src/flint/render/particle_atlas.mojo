@@ -8,7 +8,7 @@ ATLAS_FRAME x ATLAS_FRAME coverage bytes, made here from hashed value noise
 - frames 12-15: flame tongues (package 2.13; they were spare crumbs): a
   teardrop with its tip up, licked sideways a little differently each frame.
 """
-from std.math import sqrt, atan2, cos
+from std.math import sqrt, atan2, cos, floor, isfinite, isnan
 from flint.render.particle_layout import ATLAS_FRAME, ATLAS_FRAMES, ATLAS_BYTES
 
 
@@ -20,10 +20,20 @@ def lattice(x: Int, y: Int, seed: Int) -> Float32:
 
 
 def value_noise(x: Float32, y: Float32, seed: Int) -> Float32:
-    var ix = Int(x + 64.0) - 64
-    var iy = Int(y + 64.0) - 64
-    var fx = x - Float32(ix)
-    var fy = y - Float32(iy)
+    if not isfinite(x) or not isfinite(y):
+        return Float32(0.5)
+    var xd = Float64(x)
+    var yd = Float64(y)
+    if abs(xd) > 1.0e12:
+        xd = xd - floor(xd / 65536.0) * 65536.0
+    if abs(yd) > 1.0e12:
+        yd = yd - floor(yd / 65536.0) * 65536.0
+    var fx_fl = floor(xd)
+    var fy_fl = floor(yd)
+    var ix = Int(fx_fl)
+    var iy = Int(fy_fl)
+    var fx = Float32(xd - fx_fl)
+    var fy = Float32(yd - fy_fl)
     var sx = fx * fx * (3 - 2 * fx)
     var sy = fy * fy * (3 - 2 * fy)
     var a = lattice(ix, iy, seed)
@@ -34,6 +44,10 @@ def value_noise(x: Float32, y: Float32, seed: Int) -> Float32:
 
 
 def to_byte(value: Float32) -> UInt8:
+    if isnan(value) or value <= Float32(0.0):
+        return UInt8(0)
+    if value >= Float32(1.0):
+        return UInt8(255)
     return UInt8(max(0, min(255, Int(value * 255.0 + 0.5))))
 
 

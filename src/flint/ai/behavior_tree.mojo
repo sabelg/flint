@@ -12,7 +12,7 @@ Implements:
    `PhysicsWorld.raycast` line-of-sight wall occlusion, and inverse-square acoustic hearing.
 """
 from std.collections import List
-from std.math import sqrt, abs, min, max
+from std.math import sqrt, abs, min, max, isfinite
 from flint.core.math import Vec3
 from flint.core.detmath import det_cos, det_exp, det_pow
 from flint.physics.filter import CollisionFilter, CAT_ALL
@@ -149,8 +149,17 @@ struct UtilityConsideration(Copyable, ImplicitlyCopyable, Movable):
 
     def evaluate(self, bb: Blackboard) -> Float32:
         var raw = bb.get_float(self.bb_key)
+        if not isfinite(raw):
+            return Float32(0.0)
+        if not (isfinite(self.input_min) and isfinite(self.input_max) and isfinite(self.exponent)):
+            return Float32(0.0)
         var denom = self.input_max - self.input_min
-        var x = max(Float32(0.0), min(Float32(1.0), (raw - self.input_min) / denom)) if abs(denom) > Float32(1.0e-7) else Float32(0.0)
+        if not isfinite(denom) or abs(denom) <= Float32(1.0e-7):
+            return Float32(0.0)
+        var t_norm = (raw - self.input_min) / denom
+        if not isfinite(t_norm):
+            return Float32(0.0)
+        var x = max(Float32(0.0), min(Float32(1.0), t_norm))
         var y: Float32
         if self.curve_kind == CURVE_POLYNOMIAL:
             y = det_pow(x, max(Float32(0.05), self.exponent))
@@ -161,6 +170,8 @@ struct UtilityConsideration(Copyable, ImplicitlyCopyable, Movable):
             y = Float32(1.0) / (Float32(1.0) + max(Float32(0.1), self.exponent) * x)
         else:
             y = x
+        if not isfinite(y):
+            return Float32(0.0)
         y = max(Float32(0.0), min(Float32(1.0), y))
         return (Float32(1.0) - y) if self.invert else y
 
@@ -196,33 +207,42 @@ struct UtilityAiScorer(Copyable, Movable):
 
     @staticmethod
     def compensate_dave_mark(raw_product: Float32, num_considerations: Int) -> Float32:
-        if num_considerations <= 1 or raw_product <= Float32(0.0):
-            return max(Float32(0.0), raw_product)
+        if not isfinite(raw_product) or raw_product <= Float32(0.0):
+            return Float32(0.0)
+        if num_considerations <= 1:
+            return raw_product
         var mod_factor = Float32(1.0) - Float32(1.0) / Float32(num_considerations)
         var make_up = (Float32(1.0) - raw_product) * mod_factor
-        return raw_product + make_up * raw_product
+        var res = raw_product + make_up * raw_product
+        return res if isfinite(res) else Float32(0.0)
 
     @staticmethod
     def compensate_geometric_mean(raw_product: Float32, num_considerations: Int) -> Float32:
-        if num_considerations <= 1 or raw_product <= Float32(0.0):
-            return max(Float32(0.0), raw_product)
-        return det_pow(raw_product, Float32(1.0) / Float32(num_considerations))
+        if not isfinite(raw_product) or raw_product <= Float32(0.0):
+            return Float32(0.0)
+        if num_considerations <= 1:
+            return raw_product
+        var res = det_pow(raw_product, Float32(1.0) / Float32(num_considerations))
+        return res if isfinite(res) else Float32(0.0)
 
     def score_option(self, opt_index: Int, bb: Blackboard) -> Float32:
         if opt_index < 0 or opt_index >= len(self.options):
             return Float32(0.0)
         ref opt = self.options[opt_index]
+        if not isfinite(opt.weight) or opt.weight <= Float32(0.0):
+            return Float32(0.0)
         var k = len(opt.considerations)
         if k == 0:
             return opt.weight
         var prod = Float32(1.0)
         for i in range(k):
             var s = opt.considerations[i].evaluate(bb)
-            if s <= Float32(1.0e-7):
+            if not isfinite(s) or s <= Float32(1.0e-7):
                 return Float32(0.0)
             prod *= s
         var comp = Self.compensate_geometric_mean(prod, k) if self.use_geometric_mean else Self.compensate_dave_mark(prod, k)
-        return comp * opt.weight
+        var total = comp * opt.weight
+        return total if isfinite(total) else Float32(0.0)
 
     def select_best(self, bb: Blackboard) -> Tuple[Int, Float32]:
         """Returns `(best_option_id, best_score)`."""
@@ -609,7 +629,10 @@ struct BehaviorTree(Copyable, Movable):
     def tick(self, bb: Blackboard, mut state: BtExecutionState, dt: Float32) -> UInt8:
         if len(self.nodes) == 0:
             return BT_FAILURE
-        state.time_s += max(Float32(0.0), dt)
+        var safe_dt = dt if (isfinite(dt) and dt > Float32(0.0)) else Float32(0.0)
+        if not isfinite(state.time_s):
+            state.time_s = Float32(0.0)
+        state.time_s += safe_dt
         if len(state.cooldown_ready_at) < len(self.nodes):
             state.cooldown_ready_at.resize(len(self.nodes), Float32(0.0))
         if len(state.node_running) < len(self.nodes):

@@ -8,6 +8,7 @@ Verifies:
 """
 from std.collections import List
 from std.ffi import external_call
+from std.math import isfinite
 from std.sys import argv
 from flint.assets.image import decode_png, write_png
 from flint.core.build_stamp import BUILD_COMMIT
@@ -56,9 +57,15 @@ def _write_text(path: String, text: String) -> Bool:
 
 
 def _fmt_3(val: Float64) -> String:
+    if not isfinite(val):
+        if val > 0.0:
+            return String("inf")
+        if val < 0.0:
+            return String("-inf")
+        return String("nan")
     var neg = val < 0.0
     var a = -val if neg else val
-    var scaled = Int(a * 1000.0 + 0.5)
+    var scaled = Int(min(a * 1000.0 + 0.5, Float64(1e15)))
     var whole = scaled // 1000
     var frac = scaled % 1000
     var frac_s = String(frac)

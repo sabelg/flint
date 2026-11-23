@@ -9,6 +9,7 @@ clips' lengths and the spacing of their steps (Unreal's sync markers; Bungie
 and Ubisoft call them foot-sync markers). A clip without markers has one
 segment, the whole clip, starting at time 0.
 """
+from std.math import floor, isfinite
 from flint.core.math import Vec3
 from flint.assets.manifest import ManifestClip
 
@@ -164,16 +165,19 @@ struct SyncTrack(Copyable, Movable):
 
 
 def wrap_time(time: Float32, length: Float32) -> Float32:
-    if length <= 0:
-        return 0
-    var t = time
-    if t >= length or t < 0:
-        t = t - length * Float32(Int(t / length))
-        if t < 0:
-            t += length
-        if t >= length:
-            t -= length
-    return max(Float32(0), t)
+    if not isfinite(time) or not isfinite(length) or length <= Float32(0.0):
+        return Float32(0.0)
+    var t = Float64(time)
+    var l = Float64(length)
+    var wrapped = t - l * floor(t / l)
+    if wrapped < 0.0:
+        wrapped += l
+    if wrapped >= l or not isfinite(wrapped):
+        wrapped = 0.0
+    var res = Float32(wrapped)
+    if res >= length:
+        res = Float32(0.0)
+    return max(Float32(0.0), res)
 
 
 struct FiredEvent(Copyable, ImplicitlyCopyable, Movable):

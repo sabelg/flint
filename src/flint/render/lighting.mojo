@@ -3,7 +3,7 @@
 All illumination is evaluated at vertices. The rasterizer only interpolates the
 resulting RGB light, fog, and emissive attributes; gameplay never reads them.
 """
-from std.math import sin, sqrt
+from std.math import isfinite, sin, sqrt
 from flint.core.math import Vec3
 
 comptime MAX_REGISTERED_LIGHTS: Int = 256
@@ -53,11 +53,17 @@ struct LightingProfile(Copyable, ImplicitlyCopyable, Movable):
         self.cdl_power = Vec3(1, 1, 1)
         self.filmic = 0
 
+    @staticmethod
+    def _clamp_u8(v: Float32) -> UInt8:
+        if not isfinite(v):
+            return UInt8(0)
+        return UInt8(Int(max(Float32(0.0), min(Float32(255.0), v))))
+
     def fog_rgb(self) -> Tuple[UInt8, UInt8, UInt8]:
         return (
-            UInt8(max(0, min(255, Int(self.fog_color.x)))),
-            UInt8(max(0, min(255, Int(self.fog_color.y)))),
-            UInt8(max(0, min(255, Int(self.fog_color.z)))),
+            Self._clamp_u8(self.fog_color.x),
+            Self._clamp_u8(self.fog_color.y),
+            Self._clamp_u8(self.fog_color.z),
         )
 
 

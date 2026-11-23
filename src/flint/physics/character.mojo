@@ -14,7 +14,7 @@ Implements `CharacterControllerConfig` & `CharacterController` (`move_and_slide`
 7. Downward ground/ledge snapping and mass-clamped dynamic `RigidBody` impulse pushing.
 """
 from std.collections import List
-from std.math import sqrt, abs, min, max
+from std.math import sqrt, abs, min, max, isfinite
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import det_cos, det_atan2
 from flint.core.serial import BlobWriter, BlobReader, fourcc
@@ -79,6 +79,26 @@ def _project_walkable_speed_preserving(horiz_move: Vec3, ground_n: Vec3, up: Vec
     return slope_vec * (h_len / s_len)
 
 
+@always_inline
+def _safe_up(v: Vec3) -> Vec3:
+    if not (isfinite(v.x) and isfinite(v.y) and isfinite(v.z)):
+        return Vec3(0.0, 1.0, 0.0)
+    var l2 = v.length_squared()
+    if not isfinite(l2) or l2 <= Float32(1.0e-8):
+        return Vec3(0.0, 1.0, 0.0)
+    var n = v * (Float32(1.0) / sqrt(l2))
+    if not (isfinite(n.x) and isfinite(n.y) and isfinite(n.z)):
+        return Vec3(0.0, 1.0, 0.0)
+    return n
+
+
+@always_inline
+def _fin_f32_kcc(v: Float32, fallback: Float32, lo: Float32, hi: Float32) -> Float32:
+    if not isfinite(v):
+        return fallback
+    return max(lo, min(hi, v))
+
+
 @fieldwise_init
 struct CharacterControllerConfig(Copyable, ImplicitlyCopyable, Movable):
     var radius: Float32
@@ -140,7 +160,7 @@ struct CharacterController(Copyable, Movable):
         cfg: CharacterControllerConfig = CharacterControllerConfig(),
     ):
         self.cfg = cfg
-        self.pos = pos
+        self.pos = pos if (isfinite(pos.x) and isfinite(pos.y) and isfinite(pos.z)) else Vec3()
         self.yaw = 0.0
         self.velocity = Vec3()
         self.vertical_vel = 0.0
@@ -149,17 +169,35 @@ struct CharacterController(Copyable, Movable):
         self.stepped_up = False
         self.hit_wall = False
         self.hit_ceiling = False
-        self.ground_normal = cfg.up.normalized()
+        self.ground_normal = _safe_up(cfg.up)
         self.ground_body_id = -1
         self.ground_prev_pos = Vec3()
         self.ground_prev_rot = Quat()
         self.has_ground_frame = False
         self.platform_velocity = Vec3()
         self.pushed_body_ids = List[Int]()
+        self._sanitize_cfg()
+
+    def _sanitize_cfg(mut self):
+        self.cfg.radius = _fin_f32_kcc(self.cfg.radius, Float32(0.35), Float32(0.01), Float32(100.0))
+        self.cfg.half_height = _fin_f32_kcc(self.cfg.half_height, Float32(0.55), Float32(0.0), Float32(100.0))
+        self.cfg.skin_width = _fin_f32_kcc(self.cfg.skin_width, Float32(0.02), Float32(0.001), Float32(1.0))
+        self.cfg.max_slope_deg = _fin_f32_kcc(self.cfg.max_slope_deg, Float32(50.0), Float32(0.0), Float32(90.0))
+        self.cfg.step_height = _fin_f32_kcc(self.cfg.step_height, Float32(0.35), Float32(0.0), Float32(10.0))
+        self.cfg.snap_down_dist = _fin_f32_kcc(self.cfg.snap_down_dist, Float32(0.30), Float32(0.0), Float32(10.0))
+        self.cfg.max_slides = max(1, min(32, self.cfg.max_slides))
+        self.cfg.depenetration_iters = max(0, min(32, self.cfg.depenetration_iters))
+        self.cfg.mass = _fin_f32_kcc(self.cfg.mass, Float32(80.0), Float32(0.01), Float32(1.0e6))
+        self.cfg.push_force_scale = _fin_f32_kcc(self.cfg.push_force_scale, Float32(1.0), Float32(0.0), Float32(1.0e4))
+        self.cfg.max_push_mass_ratio = _fin_f32_kcc(self.cfg.max_push_mass_ratio, Float32(4.0), Float32(0.0), Float32(1.0e4))
+        self.cfg.gravity = _fin_f32_kcc(self.cfg.gravity, Float32(9.81), Float32(-1.0e3), Float32(1.0e3))
+        self.cfg.up = _safe_up(self.cfg.up)
 
     def foot_position(self) -> Vec3:
-        var up = self.cfg.up.normalized()
-        return self.pos - up * (self.cfg.half_height + self.cfg.radius)
+        var up = _safe_up(self.cfg.up)
+        var hh = _fin_f32_kcc(self.cfg.half_height, Float32(0.55), Float32(0.0), Float32(100.0))
+        var r = _fin_f32_kcc(self.cfg.radius, Float32(0.35), Float32(0.01), Float32(100.0))
+        return self.pos - up * (hh + r)
 
     def _capsule_rot(self) -> Quat:
         return Quat()
@@ -509,10 +547,30 @@ struct CharacterController(Copyable, Movable):
         self.hit_wall = False
         self.hit_ceiling = False
         self.pushed_body_ids.clear()
-        if dt <= Float32(1.0e-7):
+        if not (isfinite(self.pos.x) and isfinite(self.pos.y) and isfinite(self.pos.z)):
+            self.pos = Vec3()
+        if not (isfinite(self.velocity.x) and isfinite(self.velocity.y) and isfinite(self.velocity.z)):
+            self.velocity = Vec3()
+        if not isfinite(self.vertical_vel):
+            self.vertical_vel = Float32(0.0)
+        if not isfinite(self.yaw):
+            self.yaw = Float32(0.0)
+        if not (isfinite(self.platform_velocity.x) and isfinite(self.platform_velocity.y) and isfinite(self.platform_velocity.z)):
+            self.platform_velocity = Vec3()
+        self._sanitize_cfg()
+        var up = self.cfg.up
+        if not (isfinite(self.ground_normal.x) and isfinite(self.ground_normal.y) and isfinite(self.ground_normal.z)) or self.ground_normal.length_squared() <= Float32(1.0e-8):
+            self.ground_normal = up
+        if not isfinite(dt) or dt <= Float32(1.0e-7):
             return self.pos
+        var safe_dt = min(dt, Float32(0.1))
+        var safe_vel = Vec3(
+            max(Float32(-1.0e4), min(Float32(1.0e4), desired_vel.x)) if isfinite(desired_vel.x) else Float32(0.0),
+            max(Float32(-1.0e4), min(Float32(1.0e4), desired_vel.y)) if isfinite(desired_vel.y) else Float32(0.0),
+            max(Float32(-1.0e4), min(Float32(1.0e4), desired_vel.z)) if isfinite(desired_vel.z) else Float32(0.0),
+        )
+        var safe_jump = max(Float32(-1.0e4), min(Float32(1.0e4), jump_speed)) if isfinite(jump_speed) else Float32(0.0)
 
-        var up = self.cfg.up.normalized()
         var cos_walk = det_cos(self.cfg.max_slope_deg * KCC_DEG_TO_RAD)
         var start_pos = self.pos
         var was_grounded = self.grounded
@@ -521,15 +579,15 @@ struct CharacterController(Copyable, Movable):
         self._depenetrate(world)
 
         # 2. Moving & rotating platform attachment
-        self._apply_platform_attachment(world, dt, up)
+        self._apply_platform_attachment(world, safe_dt, up)
         var pos_after_plat = self.pos
 
         # 3. Decompose desired velocity into horizontal intent & vertical state
-        var v_up_in = desired_vel.dot(up)
-        var v_horiz = desired_vel - up * v_up_in
+        var v_up_in = safe_vel.dot(up)
+        var v_horiz = safe_vel - up * v_up_in
 
-        if jump_speed > Float32(0.0):
-            self.vertical_vel = jump_speed
+        if safe_jump > Float32(0.0):
+            self.vertical_vel = safe_jump
             self.grounded = False
             was_grounded = False
             self.has_ground_frame = False
@@ -543,10 +601,10 @@ struct CharacterController(Copyable, Movable):
         else:
             if abs(self.vertical_vel) < Float32(1.0e-6) and v_up_in < Float32(-0.01):
                 self.vertical_vel = v_up_in
-            self.vertical_vel -= self.cfg.gravity * dt
+            self.vertical_vel -= self.cfg.gravity * safe_dt
 
         # 4. Horizontal / Walkable-Slope Multi-Plane Slide + 3-Sweep Stair Auto-Climb
-        var rem_orig = v_horiz * dt
+        var rem_orig = v_horiz * safe_dt
         var rem = rem_orig
         var planes = List[Vec3]()
         var plane_walkable = List[Bool]()
@@ -586,7 +644,7 @@ struct CharacterController(Copyable, Movable):
                 and not world.bodies[hit_slot].is_static
             )
             if is_dyn_body:
-                self._push_dynamic_body(world, hit, desired_vel, up)
+                self._push_dynamic_body(world, hit, safe_vel, up)
 
             var n_dot_up = hit.normal.dot(up)
 
@@ -635,7 +693,7 @@ struct CharacterController(Copyable, Movable):
 
         # 5. Vertical Sweep (Jumping / Falling / Steep-Cliff Down-Slide / Ledge Ground Snapping)
         if self.vertical_vel > Float32(0.0):
-            var up_move = self.vertical_vel * dt
+            var up_move = self.vertical_vel * safe_dt
             var ceil_hit = self._sweep_capsule(world, self.pos, up * (up_move + self.cfg.skin_width))
             if ceil_hit.hit:
                 var safe_u = max(Float32(0.0), ceil_hit.distance - self.cfg.skin_width)
@@ -647,7 +705,7 @@ struct CharacterController(Copyable, Movable):
                 self.pos = self.pos + up * up_move
             self.grounded = False
         elif not self.stepped_up:
-            var fall_dist = abs(self.vertical_vel) * dt
+            var fall_dist = abs(self.vertical_vel) * safe_dt
             var probe_down = self.cfg.snap_down_dist if (was_grounded or self.grounded) else max(fall_dist, Float32(0.02))
             var down_hit = self._sweep_capsule(world, self.pos, -up * (probe_down + self.cfg.skin_width))
 
@@ -686,8 +744,8 @@ struct CharacterController(Copyable, Movable):
                     self.ground_body_id = -1
                     self.has_ground_frame = False
                     if was_grounded and abs(self.vertical_vel) < Float32(1.0e-5):
-                        self.vertical_vel = -self.cfg.gravity * dt
-                        fall_dist = abs(self.vertical_vel) * dt
+                        self.vertical_vel = -self.cfg.gravity * safe_dt
+                        fall_dist = abs(self.vertical_vel) * safe_dt
 
                     var grav_vec = -up * fall_dist
                     var steep_planes = List[Vec3]()
@@ -722,8 +780,8 @@ struct CharacterController(Copyable, Movable):
             else:
                 # Over open air or walked off sheer ledge > snap_down_dist
                 if was_grounded and fall_dist <= Float32(1.0e-6):
-                    self.vertical_vel = -self.cfg.gravity * dt
-                    fall_dist = abs(self.vertical_vel) * dt
+                    self.vertical_vel = -self.cfg.gravity * safe_dt
+                    fall_dist = abs(self.vertical_vel) * safe_dt
                 self.pos = self.pos - up * fall_dist
                 self.grounded = False
                 self.on_steep_slope = False
@@ -742,8 +800,13 @@ struct CharacterController(Copyable, Movable):
         else:
             self.has_ground_frame = False
 
-        self.velocity = (self.pos - pos_after_plat) * (Float32(1.0) / dt) + self.platform_velocity
-        _ = start_pos
+        self.velocity = (self.pos - pos_after_plat) * (Float32(1.0) / safe_dt) + self.platform_velocity
+        if not (isfinite(self.pos.x) and isfinite(self.pos.y) and isfinite(self.pos.z)):
+            self.pos = start_pos
+        if not (isfinite(self.velocity.x) and isfinite(self.velocity.y) and isfinite(self.velocity.z)):
+            self.velocity = Vec3()
+        if not isfinite(self.vertical_vel):
+            self.vertical_vel = Float32(0.0)
         return self.pos
 
     def serialize(self, mut w: BlobWriter):

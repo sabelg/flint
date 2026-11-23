@@ -16,7 +16,7 @@ Implements:
     3. `build_subd_traffic_vehicle(archetype)` (`0`=coupe, `1`=cyber-sedan, `2`=armored van, `~1,280–1,408` tris)
     4. `build_subd_coaster_car_shell(style)` (`0`=hyper tub, `1`=LSM nosecone, `2`=inverted ski-chair, `3`=PTC timber coach, `~1,280–1,408` tris)
 """
-from std.math import max, min, sqrt
+from std.math import isfinite, max, min, sqrt
 from flint.core.math import Vec2, Vec3
 from flint.assets.model import NativeMesh
 
@@ -41,6 +41,8 @@ def _hash_edge_pair(a: Int, b: Int) -> UInt64:
 
 @always_inline
 def _clamp01(x: Float32) -> Float32:
+    if not isfinite(x):
+        return Float32(0.0)
     return max(Float32(0.0), min(Float32(1.0), x))
 
 
@@ -95,7 +97,8 @@ struct SubdCage(Copyable, Movable):
     def add_vert(mut self, pos: Vec3, sharpness: Float32 = 0.0) -> Int:
         var idx = len(self.positions)
         self.positions.append(pos)
-        self.vert_sharpness.append(max(Float32(0.0), min(Float32(10.0), sharpness)))
+        var s = max(Float32(0.0), min(Float32(10.0), sharpness)) if isfinite(sharpness) else Float32(0.0)
+        self.vert_sharpness.append(s)
         return idx
 
     def add_uv(mut self, uv: Vec2) -> Int:
@@ -178,7 +181,7 @@ struct SubdCage(Copyable, Movable):
     def set_edge_sharpness(mut self, a: Int, b: Int, sharpness: Float32):
         if a == b or a < 0 or b < 0:
             return
-        var s = max(Float32(0.0), min(Float32(10.0), sharpness))
+        var s = max(Float32(0.0), min(Float32(10.0), sharpness)) if isfinite(sharpness) else Float32(0.0)
         if (len(self.edge_v0) + 1) * 2 >= len(self._edge_hash_keys):
             self._rehash_edges(len(self._edge_hash_keys) * 2)
 

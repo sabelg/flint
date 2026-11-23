@@ -22,7 +22,7 @@ Spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 server support
     14. `render.trigger_post_fx`
 """
 from std.ffi import external_call
-from std.math import abs, cos, max, min, sin
+from std.math import abs, cos, isfinite, max, min, sin
 from std.sys.info import CompilationTarget
 from flint.assets.checkpoint import pack_checkpoint_lz4
 from flint.assets.cooker_v2 import DEFAULT_COOK_CACHE_DIR, cook_workspace
@@ -450,19 +450,37 @@ def _mcp_tool_result(payload_json: String, is_error: Bool = False) -> String:
     )
 
 
+@always_inline
+def _fmt_json_f64(v: Float64) -> String:
+    if not isfinite(v):
+        return "0.0"
+    return String(v)
+
+
 def _fmt_vec3_json(v: Vec3) -> String:
-    return "[" + String(Float64(v.x)) + "," + String(Float64(v.y)) + "," + String(Float64(v.z)) + "]"
+    return "[" + _fmt_json_f64(Float64(v.x)) + "," + _fmt_json_f64(Float64(v.y)) + "," + _fmt_json_f64(Float64(v.z)) + "]"
 
 
 def _fmt_quat_json(q: Quat) -> String:
     return (
         "["
-        + String(Float64(q.x)) + ","
-        + String(Float64(q.y)) + ","
-        + String(Float64(q.z)) + ","
-        + String(Float64(q.w))
+        + _fmt_json_f64(Float64(q.x)) + ","
+        + _fmt_json_f64(Float64(q.y)) + ","
+        + _fmt_json_f64(Float64(q.z)) + ","
+        + _fmt_json_f64(Float64(q.w))
         + "]"
     )
+
+
+def _parse_finite_f32_arg(doc: JsonDocument, node: Int, fallback: Float32) -> Tuple[Bool, Float32]:
+    if node < 0 or node >= len(doc.nodes):
+        return (True, fallback)
+    if doc.nodes[node].kind != 2:
+        return (False, fallback)
+    var val = Float32(doc.nodes[node].number)
+    if not isfinite(val):
+        return (False, fallback)
+    return (True, val)
 
 
 def _parse_vec3_arg(doc: JsonDocument, node: Int, fallback: Vec3) -> Tuple[Bool, Vec3]:
@@ -475,7 +493,12 @@ def _parse_vec3_arg(doc: JsonDocument, node: Int, fallback: Vec3) -> Tuple[Bool,
     var c2 = doc.at(node, 2)
     if doc.nodes[c0].kind != 2 or doc.nodes[c1].kind != 2 or doc.nodes[c2].kind != 2:
         return (False, fallback)
-    return (True, Vec3(Float32(doc.nodes[c0].number), Float32(doc.nodes[c1].number), Float32(doc.nodes[c2].number)))
+    var x = Float32(doc.nodes[c0].number)
+    var y = Float32(doc.nodes[c1].number)
+    var z = Float32(doc.nodes[c2].number)
+    if not (isfinite(x) and isfinite(y) and isfinite(z)):
+        return (False, fallback)
+    return (True, Vec3(x, y, z))
 
 
 def _parse_quat_arg(doc: JsonDocument, node: Int, fallback: Quat) -> Tuple[Bool, Quat]:
@@ -488,13 +511,16 @@ def _parse_quat_arg(doc: JsonDocument, node: Int, fallback: Quat) -> Tuple[Bool,
         var c0 = doc.at(node, 0); var c1 = doc.at(node, 1); var c2 = doc.at(node, 2); var c3 = doc.at(node, 3)
         if doc.nodes[c0].kind != 2 or doc.nodes[c1].kind != 2 or doc.nodes[c2].kind != 2 or doc.nodes[c3].kind != 2:
             return (False, fallback)
-        var q = Quat(
-            Float32(doc.nodes[c0].number),
-            Float32(doc.nodes[c1].number),
-            Float32(doc.nodes[c2].number),
-            Float32(doc.nodes[c3].number),
-        )
-        return (True, q.normalized())
+        var qx = Float32(doc.nodes[c0].number)
+        var qy = Float32(doc.nodes[c1].number)
+        var qz = Float32(doc.nodes[c2].number)
+        var qw = Float32(doc.nodes[c3].number)
+        if not (isfinite(qx) and isfinite(qy) and isfinite(qz) and isfinite(qw)):
+            return (False, fallback)
+        var q = Quat(qx, qy, qz, qw).normalized()
+        if not (isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)):
+            return (False, fallback)
+        return (True, q)
     if sz == 3:
         var ev = _parse_vec3_arg(doc, node, Vec3())
         if not ev[0]:
@@ -503,7 +529,10 @@ def _parse_quat_arg(doc: JsonDocument, node: Int, fallback: Quat) -> Tuple[Bool,
         var qx = Quat(sin(ev[1].x * hr), 0.0, 0.0, cos(ev[1].x * hr))
         var qy = Quat(0.0, sin(ev[1].y * hr), 0.0, cos(ev[1].y * hr))
         var qz = Quat(0.0, 0.0, sin(ev[1].z * hr), cos(ev[1].z * hr))
-        return (True, qz.multiply(qy).multiply(qx).normalized())
+        var q = qz.multiply(qy).multiply(qx).normalized()
+        if not (isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)):
+            return (False, fallback)
+        return (True, q)
     return (False, fallback)
 
 
@@ -811,6 +840,15 @@ def _mcp_tools_list_json() -> String:
 # 3. Deterministic Software Viewport Preview Fallback (for Headless CPU Capture)
 # ============================================================================
 
+@always_inline
+def _clamp_color_u8(v: Float32) -> Int:
+    if not isfinite(v) or v <= Float32(0.0):
+        return 0
+    if v >= Float32(1.0):
+        return 255
+    return max(0, min(255, Int(v * Float32(255.0))))
+
+
 def _render_studio_software_preview(studio: FlintStudioState, width: Int, height: Int) -> SimdCanvas:
     var w = max(64, min(2048, width))
     var h = max(64, min(2048, height))
@@ -856,9 +894,9 @@ def _render_studio_software_preview(studio: FlintStudioState, width: Int, height
             var lc = Vec3(corners[ci].x * he.x, corners[ci].y * he.y, corners[ci].z * he.z)
             wc.append(ent.translation + ent.rotation.rotate(lc))
         var col = pack_argb(
-            Int(ent.base_color.x * Float32(255.0)),
-            Int(ent.base_color.y * Float32(255.0)),
-            Int(ent.base_color.z * Float32(255.0)),
+            _clamp_color_u8(ent.base_color.x),
+            _clamp_color_u8(ent.base_color.y),
+            _clamp_color_u8(ent.base_color.z),
         )
         for ti in range(12):
             var t = tris[ti]
@@ -953,7 +991,7 @@ struct McpServerV2(Movable):
                     + ',"scale":' + _fmt_vec3_json(e.scale)
                     + ',"collider":' + json_quote(_collider_to_string(e.collider_kind))
                     + ',"shading_mode":' + json_quote(_shading_mode_to_string(e.shading_mode))
-                    + ',"mass":' + String(Float64(e.mass))
+                    + ',"mass":' + _fmt_json_f64(Float64(e.mass))
                     + ',"visible":' + ("true" if e.visible else "false")
                     + "}"
                 )
@@ -977,9 +1015,14 @@ struct McpServerV2(Movable):
             if not (p_res[0] and r_res[0] and s_res[0] and bc_res[0]):
                 return (True, '{"ok":false,"error":"invalid Vec3/Quat argument"}')
             var col_k = _collider_from_string(doc.text(doc.object_get(args_node, "collider"), "box"))
-            var mass = Float32(max(0.0, doc.number(doc.object_get(args_node, "mass"), 0.0)))
-            var rough = Float32(doc.number(doc.object_get(args_node, "roughness"), 0.38))
-            var metal = Float32(doc.number(doc.object_get(args_node, "metallic"), 0.10))
+            var m_res = _parse_finite_f32_arg(doc, doc.object_get(args_node, "mass"), Float32(0.0))
+            var rg_res = _parse_finite_f32_arg(doc, doc.object_get(args_node, "roughness"), Float32(0.38))
+            var mt_res = _parse_finite_f32_arg(doc, doc.object_get(args_node, "metallic"), Float32(0.10))
+            if not (m_res[0] and rg_res[0] and mt_res[0]):
+                return (True, '{"ok":false,"error":"invalid non-finite numeric argument"}')
+            var mass = max(Float32(0.0), m_res[1])
+            var rough = rg_res[1]
+            var metal = mt_res[1]
 
             var eid = studio.spawn_entity(
                 name=name,
@@ -1035,14 +1078,23 @@ struct McpServerV2(Movable):
                     return (True, '{"ok":false,"error":"invalid base_color"}')
                 nd.base_color = br[1]
             var rg_node = doc.object_get(args_node, "roughness")
-            if rg_node >= 0 and doc.nodes[rg_node].kind == 2:
-                nd.roughness = max(Float32(0.04), min(Float32(1.0), Float32(doc.number(rg_node))))
+            if rg_node >= 0:
+                var rg_r = _parse_finite_f32_arg(doc, rg_node, nd.roughness)
+                if not rg_r[0]:
+                    return (True, '{"ok":false,"error":"invalid roughness"}')
+                nd.roughness = max(Float32(0.04), min(Float32(1.0), rg_r[1]))
             var mt_node = doc.object_get(args_node, "metallic")
-            if mt_node >= 0 and doc.nodes[mt_node].kind == 2:
-                nd.metallic = max(Float32(0.0), min(Float32(1.0), Float32(doc.number(mt_node))))
+            if mt_node >= 0:
+                var mt_r = _parse_finite_f32_arg(doc, mt_node, nd.metallic)
+                if not mt_r[0]:
+                    return (True, '{"ok":false,"error":"invalid metallic"}')
+                nd.metallic = max(Float32(0.0), min(Float32(1.0), mt_r[1]))
             var ms_node = doc.object_get(args_node, "mass")
-            if ms_node >= 0 and doc.nodes[ms_node].kind == 2:
-                nd.mass = max(Float32(0.0), Float32(doc.number(ms_node)))
+            if ms_node >= 0:
+                var ms_r = _parse_finite_f32_arg(doc, ms_node, nd.mass)
+                if not ms_r[0]:
+                    return (True, '{"ok":false,"error":"invalid mass"}')
+                nd.mass = max(Float32(0.0), ms_r[1])
             var vis_node = doc.object_get(args_node, "visible")
             if vis_node >= 0 and doc.nodes[vis_node].kind == 1:
                 nd.visible = doc.boolean(vis_node)
@@ -1071,8 +1123,8 @@ struct McpServerV2(Movable):
         if tool_name == "render.capture_viewport":
             var raw_out_path = doc.text(doc.object_get(args_node, "output_path"), "build/mcp_capture.png")
             var raw_ref_path = doc.text(doc.object_get(args_node, "reference_path"), "")
-            var req_w = max(64, doc.integer(doc.object_get(args_node, "width"), 320))
-            var req_h = max(64, doc.integer(doc.object_get(args_node, "height"), 180))
+            var req_w = max(64, min(8192, doc.integer(doc.object_get(args_node, "width"), 320)))
+            var req_h = max(64, min(8192, doc.integer(doc.object_get(args_node, "height"), 180)))
 
             var out_path: String
             try:
@@ -1131,7 +1183,7 @@ struct McpServerV2(Movable):
                 + ',"width":' + String(cap_w)
                 + ',"height":' + String(cap_h)
                 + ',"has_flip_diff":' + ("true" if has_flip else "false")
-                + ',"flip_mean":' + String(max(Float64(0.0), flip_val)) + "}",
+                + ',"flip_mean":' + _fmt_json_f64(max(Float64(0.0), flip_val)) + "}",
             )
 
         # 6. render.inspect_gpu_frame
@@ -1145,13 +1197,13 @@ struct McpServerV2(Movable):
                     if pi > 0:
                         passes += ","
                     ref pt = ren.render_graph.pass_timings[pi]
-                    passes += '{"name":' + json_quote(pt.pass_name) + ',"gpu_ms":' + String(pt.gpu_ms) + "}"
+                    passes += '{"name":' + json_quote(pt.pass_name) + ',"gpu_ms":' + _fmt_json_f64(Float64(pt.gpu_ms)) + "}"
                 passes += "]"
                 return (
                     False,
                     '{"ok":true,"backend":"VULKAN-AAA","frame_index":' + String(ren.frame_index)
-                    + ',"total_gpu_ms":' + String(ren.render_graph.total_gpu_ms)
-                    + ',"aliasing_savings_ratio":' + String(Float64(ren.render_graph.aliasing_savings_ratio()))
+                    + ',"total_gpu_ms":' + _fmt_json_f64(Float64(ren.render_graph.total_gpu_ms))
+                    + ',"aliasing_savings_ratio":' + _fmt_json_f64(Float64(ren.render_graph.aliasing_savings_ratio()))
                     + ',"culled_meshlet_draws":' + String(ren.last_culled_meshlet_draws)
                     + ',"cpu_live_bytes":' + String(cpu_bytes)
                     + ',"vram_live_bytes":' + String(vram_bytes)
@@ -1196,7 +1248,7 @@ struct McpServerV2(Movable):
                     + ',"cooked_count":' + String(rep.cooked_count)
                     + ',"cache_hits":' + String(rep.cache_hits)
                     + ',"archive_bytes":' + String(rep.archive_bytes)
-                    + ',"elapsed_ms":' + String(rep.elapsed_ms) + "}"
+                    + ',"elapsed_ms":' + _fmt_json_f64(Float64(rep.elapsed_ms)) + "}"
                 )
 
             return (
@@ -1216,6 +1268,8 @@ struct McpServerV2(Movable):
             var seed = max(1, doc.integer(doc.object_get(args_node, "seed"), 1))
             var do_spawn = doc.boolean(doc.object_get(args_node, "spawn_in_scene"), False)
             var pos_r = _parse_vec3_arg(doc, doc.object_get(args_node, "position"), Vec3(0.0, 0.0, 0.0))
+            if not pos_r[0]:
+                return (True, '{"ok":false,"error":"invalid position"}')
 
             var out_glb = String("")
             if raw_out_glb.byte_length() > 0:
@@ -1248,7 +1302,10 @@ struct McpServerV2(Movable):
         # 9. physics.step_deterministic (optional checkpoint output strictly sandboxed inside `workspace_root`)
         if tool_name == "physics.step_deterministic":
             var ticks = max(1, min(3600, doc.integer(doc.object_get(args_node, "ticks"), 1)))
-            var dt = Float32(max(0.0005, min(0.1, doc.number(doc.object_get(args_node, "dt"), 1.0 / 60.0))))
+            var dt_raw = doc.number(doc.object_get(args_node, "dt"), 1.0 / 60.0)
+            if not isfinite(dt_raw):
+                return (True, '{"ok":false,"error":"invalid non-finite dt"}')
+            var dt = Float32(max(0.0005, min(0.1, dt_raw)))
             var raw_out_cp = doc.text(doc.object_get(args_node, "output_path"), "")
             var safe_out_cp = String("")
             if raw_out_cp.byte_length() > 0:
@@ -1281,7 +1338,10 @@ struct McpServerV2(Movable):
             var d_res = _parse_vec3_arg(doc, doc.object_get(args_node, "direction"), Vec3(0.0, -1.0, 0.0))
             if not (o_res[0] and d_res[0]):
                 return (True, '{"ok":false,"error":"origin and direction must be [x,y,z]"}')
-            var max_d = Float32(max(0.01, doc.number(doc.object_get(args_node, "max_distance"), 1000.0)))
+            var md_res = _parse_finite_f32_arg(doc, doc.object_get(args_node, "max_distance"), Float32(1000.0))
+            if not md_res[0]:
+                return (True, '{"ok":false,"error":"invalid max_distance"}')
+            var max_d = max(Float32(0.01), md_res[1])
             var hit = studio.raycast_scene(o_res[1], d_res[1], max_d)
             var ename = String("")
             if hit.hit and hit.entity_id >= 0 and hit.entity_id < len(studio.entities):
@@ -1293,7 +1353,7 @@ struct McpServerV2(Movable):
                 '{"ok":true,"hit":' + ("true" if hit.hit else "false")
                 + ',"entity_id":' + String(hit.entity_id)
                 + ',"entity_name":' + json_quote(ename)
-                + ',"distance":' + String(Float64(hit.distance if hit.hit else Float32(0.0)))
+                + ',"distance":' + _fmt_json_f64(Float64(hit.distance if hit.hit else Float32(0.0)))
                 + ',"point":' + _fmt_vec3_json(hit.point)
                 + ',"normal":' + _fmt_vec3_json(hit.normal) + "}",
             )
@@ -1400,8 +1460,11 @@ struct McpServerV2(Movable):
                 nd.cel_shadow_tint = r_cst[1]
 
             var cow_node = doc.object_get(args_node, "cel_outline_width_px")
-            if cow_node >= 0 and doc.nodes[cow_node].kind == 2:
-                nd.cel_outline_width_px = max(Float32(0.0), min(Float32(24.0), Float32(doc.number(cow_node))))
+            if cow_node >= 0:
+                var cow_r = _parse_finite_f32_arg(doc, cow_node, nd.cel_outline_width_px)
+                if not cow_r[0]:
+                    return (True, '{"ok":false,"error":"invalid cel_outline_width_px"}')
+                nd.cel_outline_width_px = max(Float32(0.0), min(Float32(24.0), cow_r[1]))
 
             var coc_node = doc.object_get(args_node, "cel_outline_color")
             if coc_node >= 0:
@@ -1418,16 +1481,25 @@ struct McpServerV2(Movable):
                 nd.cel_rim_color = r_crc[1]
 
             var chh_node = doc.object_get(args_node, "cel_hair_halo")
-            if chh_node >= 0 and doc.nodes[chh_node].kind == 2:
-                nd.cel_hair_halo = max(Float32(0.0), Float32(doc.number(chh_node)))
+            if chh_node >= 0:
+                var chh_r = _parse_finite_f32_arg(doc, chh_node, nd.cel_hair_halo)
+                if not chh_r[0]:
+                    return (True, '{"ok":false,"error":"invalid cel_hair_halo"}')
+                nd.cel_hair_halo = max(Float32(0.0), chh_r[1])
 
             var ver_node = doc.object_get(args_node, "vfx_erosion")
-            if ver_node >= 0 and doc.nodes[ver_node].kind == 2:
-                nd.vfx_erosion = max(Float32(0.0), min(Float32(1.0), Float32(doc.number(ver_node))))
+            if ver_node >= 0:
+                var ver_r = _parse_finite_f32_arg(doc, ver_node, nd.vfx_erosion)
+                if not ver_r[0]:
+                    return (True, '{"ok":false,"error":"invalid vfx_erosion"}')
+                nd.vfx_erosion = max(Float32(0.0), min(Float32(1.0), ver_r[1]))
 
             var vss_node = doc.object_get(args_node, "vfx_scroll_speed")
-            if vss_node >= 0 and doc.nodes[vss_node].kind == 2:
-                nd.vfx_scroll_speed = Float32(doc.number(vss_node))
+            if vss_node >= 0:
+                var vss_r = _parse_finite_f32_arg(doc, vss_node, nd.vfx_scroll_speed)
+                if not vss_r[0]:
+                    return (True, '{"ok":false,"error":"invalid vfx_scroll_speed"}')
+                nd.vfx_scroll_speed = vss_r[1]
 
             var vcc_node = doc.object_get(args_node, "vfx_core_color")
             if vcc_node >= 0:
@@ -1444,12 +1516,18 @@ struct McpServerV2(Movable):
                 nd.vfx_edge_color = r_vec[1]
 
             var ash_node = doc.object_get(args_node, "anim_step_hz")
-            if ash_node >= 0 and doc.nodes[ash_node].kind == 2:
-                nd.anim_step_hz = max(Float32(0.0), Float32(doc.number(ash_node)))
+            if ash_node >= 0:
+                var ash_r = _parse_finite_f32_arg(doc, ash_node, nd.anim_step_hz)
+                if not ash_r[0]:
+                    return (True, '{"ok":false,"error":"invalid anim_step_hz"}')
+                nd.anim_step_hz = max(Float32(0.0), ash_r[1])
 
             var sms_node = doc.object_get(args_node, "smear_stretch")
-            if sms_node >= 0 and doc.nodes[sms_node].kind == 2:
-                nd.smear_stretch = max(Float32(0.55), min(Float32(3.2), Float32(doc.number(sms_node))))
+            if sms_node >= 0:
+                var sms_r = _parse_finite_f32_arg(doc, sms_node, nd.smear_stretch)
+                if not sms_r[0]:
+                    return (True, '{"ok":false,"error":"invalid smear_stretch"}')
+                nd.smear_stretch = max(Float32(0.55), min(Float32(3.2), sms_r[1]))
 
             var ckey = UInt64(max(0, doc.integer(doc.object_get(args_node, "coalesce_key"), 0)))
             _ = studio.commit_node_edit(eid, nd^, "MCP Configure NPR/VFX", ckey)
@@ -1459,10 +1537,10 @@ struct McpServerV2(Movable):
                 '{"ok":true,"entity_id":' + String(eid)
                 + ',"shading_mode":' + json_quote(_shading_mode_to_string(ent_after.shading_mode))
                 + ',"shading_mode_id":' + String(ent_after.shading_mode)
-                + ',"cel_outline_width_px":' + String(Float64(ent_after.cel_outline_width_px))
-                + ',"vfx_erosion":' + String(Float64(ent_after.vfx_erosion))
-                + ',"anim_step_hz":' + String(Float64(ent_after.anim_step_hz))
-                + ',"smear_stretch":' + String(Float64(ent_after.smear_stretch))
+                + ',"cel_outline_width_px":' + _fmt_json_f64(Float64(ent_after.cel_outline_width_px))
+                + ',"vfx_erosion":' + _fmt_json_f64(Float64(ent_after.vfx_erosion))
+                + ',"anim_step_hz":' + _fmt_json_f64(Float64(ent_after.anim_step_hz))
+                + ',"smear_stretch":' + _fmt_json_f64(Float64(ent_after.smear_stretch))
                 + ',"undo_depth":' + String(len(studio.undo_stack))
                 + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}",
             )
@@ -1477,8 +1555,11 @@ struct McpServerV2(Movable):
                 studio.stepped_clock.hitstop_remaining_sec = Float32(0.0)
 
             var ib_node = doc.object_get(args_node, "impact_blend")
-            if ib_node >= 0 and doc.nodes[ib_node].kind == 2:
-                studio.preview_impact_blend = max(Float32(0.0), min(Float32(1.0), Float32(doc.number(ib_node))))
+            if ib_node >= 0:
+                var ib_r = _parse_finite_f32_arg(doc, ib_node, studio.preview_impact_blend)
+                if not ib_r[0]:
+                    return (True, '{"ok":false,"error":"invalid impact_blend"}')
+                studio.preview_impact_blend = max(Float32(0.0), min(Float32(1.0), ib_r[1]))
 
             var ii_node = doc.object_get(args_node, "impact_invert")
             if ii_node >= 0 and doc.nodes[ii_node].kind == 1:
@@ -1489,12 +1570,18 @@ struct McpServerV2(Movable):
                 studio.preview_shockwave_active = doc.boolean(sa_node)
 
             var sr_node = doc.object_get(args_node, "shockwave_radius")
-            if sr_node >= 0 and doc.nodes[sr_node].kind == 2:
-                studio.preview_shockwave_radius = max(Float32(0.002), min(Float32(2.0), Float32(doc.number(sr_node))))
+            if sr_node >= 0:
+                var sr_r = _parse_finite_f32_arg(doc, sr_node, studio.preview_shockwave_radius)
+                if not sr_r[0]:
+                    return (True, '{"ok":false,"error":"invalid shockwave_radius"}')
+                studio.preview_shockwave_radius = max(Float32(0.002), min(Float32(2.0), sr_r[1]))
 
             var hs_node = doc.object_get(args_node, "hitstop_sec")
-            if hs_node >= 0 and doc.nodes[hs_node].kind == 2:
-                var hs_val = Float32(doc.number(hs_node))
+            if hs_node >= 0:
+                var hs_r = _parse_finite_f32_arg(doc, hs_node, Float32(0.0))
+                if not hs_r[0]:
+                    return (True, '{"ok":false,"error":"invalid hitstop_sec"}')
+                var hs_val = hs_r[1]
                 if hs_val <= Float32(0.0):
                     studio.stepped_clock.hitstop_remaining_sec = Float32(0.0)
                 else:
@@ -1522,11 +1609,11 @@ struct McpServerV2(Movable):
 
             return (
                 False,
-                '{"ok":true,"impact_blend":' + String(Float64(studio.preview_impact_blend))
+                '{"ok":true,"impact_blend":' + _fmt_json_f64(Float64(studio.preview_impact_blend))
                 + ',"impact_invert":' + ("true" if studio.preview_impact_invert else "false")
                 + ',"shockwave_active":' + ("true" if studio.preview_shockwave_active else "false")
-                + ',"shockwave_radius":' + String(Float64(studio.preview_shockwave_radius))
-                + ',"hitstop_remaining_sec":' + String(Float64(studio.stepped_clock.hitstop_remaining_sec))
+                + ',"shockwave_radius":' + _fmt_json_f64(Float64(studio.preview_shockwave_radius))
+                + ',"hitstop_remaining_sec":' + _fmt_json_f64(Float64(studio.stepped_clock.hitstop_remaining_sec))
                 + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}",
             )
 

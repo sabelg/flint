@@ -12,7 +12,7 @@ Emits 100% GPU `UiDrawList` vector primitives (`0` CPU pixel loops!):
     `begin_modal` / `end_modal` with `Tab` & Gamepad D-Pad navigation.
 """
 from std.collections import List, Dict
-from std.math import abs
+from std.math import abs, isfinite, isinf, isnan
 from flint.core.math import Vec3
 from flint.platform.input import (
     InputState,
@@ -85,8 +85,14 @@ def pack_rgba8(r: Int, g: Int, b: Int, a: Int = 255) -> UInt32:
 
 def format_float2(v: Float32) -> String:
     """Formats a `Float32` with 2 fixed decimal places (`0.05` -> `"0.05"`, `-0.5` -> `"-0.50"`)."""
+    if isnan(v):
+        return "nan"
+    if isinf(v):
+        return "-inf" if v < Float32(0.0) else "inf"
     var neg = v < Float32(0.0)
     var mag = -v if neg else v
+    if abs(Float64(mag)) >= 1.0e15:
+        return ("-" if neg else "") + String(mag)
     var scaled = Int(mag * Float32(100.0) + Float32(0.5))
     if scaled == 0:
         neg = False
@@ -449,23 +455,30 @@ struct UiContext(Movable):
         self.culled_items_this_frame = 0
         self._ime_widget_seen = False
 
-        self.screen_w = max(Float32(1.0), screen_w)
-        self.screen_h = max(Float32(1.0), screen_h)
-        self.dt = max(Float32(1.0e-4), dt)
+        self.screen_w = max(Float32(1.0), screen_w if isfinite(screen_w) else Float32(1280.0))
+        self.screen_h = max(Float32(1.0), screen_h if isfinite(screen_h) else Float32(720.0))
+        if not isfinite(dt):
+            self.dt = Float32(1.0 / 60.0)
+        else:
+            self.dt = max(Float32(1.0e-4), min(Float32(1.0), dt))
+        if not isfinite(self.ui_time_sec):
+            self.ui_time_sec = Float32(0.0)
         self.ui_time_sec += self.dt
         self.clipboard_out_dirty = False
         self.clipboard_out = ""
 
         if input.has_mouse_position:
-            self.mouse_x = input.last_mouse_x
-            self.mouse_y = input.last_mouse_y
+            if isfinite(input.last_mouse_x):
+                self.mouse_x = input.last_mouse_x
+            if isfinite(input.last_mouse_y):
+                self.mouse_y = input.last_mouse_y
         var prev_down = self.mouse_down_l
         self.mouse_down_l = input.mouse_down(0)
         self.mouse_pressed_l = input.mouse_pressed(0) or (self.mouse_down_l and not prev_down)
         self.mouse_released_l = (not self.mouse_down_l) and prev_down
-        self.mouse_delta_x = input.mouse_delta_x()
-        self.mouse_delta_y = input.mouse_delta_y()
-        self.mouse_wheel = input.mouse_wheel()
+        self.mouse_delta_x = input.mouse_delta_x() if isfinite(input.mouse_delta_x()) else Float32(0.0)
+        self.mouse_delta_y = input.mouse_delta_y() if isfinite(input.mouse_delta_y()) else Float32(0.0)
+        self.mouse_wheel = input.mouse_wheel() if isfinite(input.mouse_wheel()) else Float32(0.0)
         self.text_utf8 = input.text_input_utf8
 
         self.key_shift = input.key_down(UI_KEY_LEFT_SHIFT) or input.key_down(UI_KEY_RIGHT_SHIFT)
@@ -623,7 +636,7 @@ struct UiContext(Movable):
         if self.drag_drop.active:
             if not self.mouse_down_l:
                 self.drag_drop = DragDropPayload()
-            else:
+            elif isfinite(self.mouse_x) and isfinite(self.mouse_y):
                 var badge_txt = self.drag_drop.kind + ": " + self.drag_drop.str_value
                 var bw = max(Float32(90.0), self._measure_text(badge_txt, self.theme.font_size) + Float32(18.0))
                 var bh = self.theme.row_height
@@ -755,13 +768,16 @@ struct UiContext(Movable):
                 self.draw_list.add_rect(x, y + size_px * Float32(0.18), Float32(n_cp) * adv, size_px * Float32(0.64), color & UInt32(0x66FFFFFF), 2.0)
 
     def _alloc_item_rect(mut self, wid: UInt64, pref_w: Float32, pref_h: Float32, grow: Float32 = 0.0) -> RectF:
+        var safe_pw = max(Float32(0.0), pref_w) if isfinite(pref_w) else Float32(0.0)
+        var safe_ph = max(Float32(0.0), pref_h) if isfinite(pref_h) else Float32(0.0)
+        var safe_grow = max(Float32(0.0), grow) if isfinite(grow) else Float32(0.0)
         var top_i = len(self.box_stack) - 1
         var parent_flex = self.box_stack[top_i].flex_idx
         var st = FlexStyle()
-        st.fixed_w = pref_w
-        st.fixed_h = pref_h
-        st.grow = grow
-        var f_idx = self.flex.add_node(parent_flex, st, pref_w, pref_h)
+        st.fixed_w = safe_pw
+        st.fixed_h = safe_ph
+        st.grow = safe_grow
+        var f_idx = self.flex.add_node(parent_flex, st, safe_pw, safe_ph)
         if wid != 0:
             self.next_frame_ids.append(wid)
             self.next_frame_flex_idxs.append(f_idx)
@@ -770,17 +786,31 @@ struct UiContext(Movable):
         var r: RectF
         var cached = self.cached_rects.get(wid)
         if wid != 0 and cached and len(self.scroll_stack) == 0:
-            r = cached.value()
+            var cr = cached.value()
+            r = RectF(
+                cr.x if isfinite(cr.x) else Float32(0.0),
+                cr.y if isfinite(cr.y) else Float32(0.0),
+                max(Float32(0.0), cr.w) if isfinite(cr.w) else Float32(0.0),
+                max(Float32(0.0), cr.h) if isfinite(cr.h) else Float32(0.0),
+            )
         else:
+            var cx = scope.cursor_x if isfinite(scope.cursor_x) else Float32(0.0)
+            var cy = scope.cursor_y if isfinite(scope.cursor_y) else Float32(0.0)
             if scope.direction == FLEX_ROW:
-                var h = pref_h if pref_h > Float32(0.0) else max(Float32(0.0), scope.rect.bottom() - scope.pad_b - scope.cursor_y)
-                var w = pref_w if pref_w > Float32(0.0) else max(Float32(40.0), scope.rect.right() - scope.pad_r - scope.cursor_x)
-                r = RectF(scope.cursor_x, scope.cursor_y, w, h)
-                self.box_stack[top_i].cursor_x += w + scope.gap
+                var h = safe_ph if safe_ph > Float32(0.0) else max(Float32(0.0), scope.rect.bottom() - scope.pad_b - cy)
+                var w = safe_pw if safe_pw > Float32(0.0) else max(Float32(40.0), scope.rect.right() - scope.pad_r - cx)
+                if not isfinite(h):
+                    h = Float32(0.0)
+                if not isfinite(w):
+                    w = Float32(40.0)
+                r = RectF(cx, cy, w, h)
+                self.box_stack[top_i].cursor_x = cx + w + scope.gap
             else:
-                var w = pref_w if pref_w > Float32(0.0) else max(Float32(0.0), scope.rect.right() - scope.pad_r - scope.cursor_x)
-                r = RectF(scope.cursor_x, scope.cursor_y, w, pref_h)
-                self.box_stack[top_i].cursor_y += pref_h + scope.gap
+                var w = safe_pw if safe_pw > Float32(0.0) else max(Float32(0.0), scope.rect.right() - scope.pad_r - cx)
+                if not isfinite(w):
+                    w = Float32(0.0)
+                r = RectF(cx, cy, w, safe_ph)
+                self.box_stack[top_i].cursor_y = cy + safe_ph + scope.gap
         self.last_item_id = wid
         self.last_item_rect = r
         return r
@@ -791,9 +821,24 @@ struct UiContext(Movable):
         var wid = self.widget_id(id)
         var top_i = len(self.box_stack) - 1
         var parent_flex = self.box_stack[top_i].flex_idx
-        var pref_w = style.fixed_w if style.fixed_w > Float32(0.0) else Float32(0.0)
-        var pref_h = style.fixed_h if style.fixed_h > Float32(0.0) else Float32(0.0)
-        var f_idx = self.flex.add_node(parent_flex, style, pref_w, pref_h)
+        var safe_st = style
+        safe_st.basis = style.basis if isfinite(style.basis) else Float32(-1.0)
+        safe_st.grow = max(Float32(0.0), style.grow) if isfinite(style.grow) else Float32(0.0)
+        safe_st.shrink = max(Float32(0.0), style.shrink) if isfinite(style.shrink) else Float32(1.0)
+        safe_st.min_w = max(Float32(0.0), style.min_w) if isfinite(style.min_w) else Float32(0.0)
+        safe_st.min_h = max(Float32(0.0), style.min_h) if isfinite(style.min_h) else Float32(0.0)
+        safe_st.max_w = max(safe_st.min_w, style.max_w if isfinite(style.max_w) else Float32(1.0e9))
+        safe_st.max_h = max(safe_st.min_h, style.max_h if isfinite(style.max_h) else Float32(1.0e9))
+        safe_st.pad_l = max(Float32(0.0), style.pad_l) if isfinite(style.pad_l) else Float32(0.0)
+        safe_st.pad_t = max(Float32(0.0), style.pad_t) if isfinite(style.pad_t) else Float32(0.0)
+        safe_st.pad_r = max(Float32(0.0), style.pad_r) if isfinite(style.pad_r) else Float32(0.0)
+        safe_st.pad_b = max(Float32(0.0), style.pad_b) if isfinite(style.pad_b) else Float32(0.0)
+        safe_st.gap = max(Float32(0.0), style.gap) if isfinite(style.gap) else Float32(0.0)
+        safe_st.fixed_w = style.fixed_w if isfinite(style.fixed_w) else Float32(0.0)
+        safe_st.fixed_h = style.fixed_h if isfinite(style.fixed_h) else Float32(0.0)
+        var pref_w = safe_st.fixed_w if safe_st.fixed_w > Float32(0.0) else Float32(0.0)
+        var pref_h = safe_st.fixed_h if safe_st.fixed_h > Float32(0.0) else Float32(0.0)
+        var f_idx = self.flex.add_node(parent_flex, safe_st, pref_w, pref_h)
         self.next_frame_ids.append(wid)
         self.next_frame_flex_idxs.append(f_idx)
 
@@ -801,23 +846,31 @@ struct UiContext(Movable):
         var box_rect: RectF
         var cached = self.cached_rects.get(wid)
         if cached:
-            box_rect = cached.value()
+            var cr = cached.value()
+            box_rect = RectF(
+                cr.x if isfinite(cr.x) else Float32(0.0),
+                cr.y if isfinite(cr.y) else Float32(0.0),
+                max(Float32(0.0), cr.w) if isfinite(cr.w) else Float32(0.0),
+                max(Float32(0.0), cr.h) if isfinite(cr.h) else Float32(0.0),
+            )
         else:
-            var w = style.fixed_w if style.fixed_w > Float32(0.0) else max(Float32(0.0), parent_scope.rect.right() - parent_scope.pad_r - parent_scope.cursor_x)
-            var h = style.fixed_h if style.fixed_h > Float32(0.0) else max(Float32(0.0), parent_scope.rect.bottom() - parent_scope.pad_b - parent_scope.cursor_y)
-            box_rect = RectF(parent_scope.cursor_x, parent_scope.cursor_y, w, h)
+            var cx = parent_scope.cursor_x if isfinite(parent_scope.cursor_x) else Float32(0.0)
+            var cy = parent_scope.cursor_y if isfinite(parent_scope.cursor_y) else Float32(0.0)
+            var w = safe_st.fixed_w if safe_st.fixed_w > Float32(0.0) else max(Float32(0.0), parent_scope.rect.right() - parent_scope.pad_r - cx)
+            var h = safe_st.fixed_h if safe_st.fixed_h > Float32(0.0) else max(Float32(0.0), parent_scope.rect.bottom() - parent_scope.pad_b - cy)
+            box_rect = RectF(cx, cy, w if isfinite(w) else Float32(0.0), h if isfinite(h) else Float32(0.0))
 
         self.box_stack.append(
             _BoxScope(
                 wid,
                 f_idx,
                 box_rect,
-                box_rect.x + style.pad_l,
-                box_rect.y + style.pad_t,
-                style.direction,
-                style.gap,
-                style.pad_r,
-                style.pad_b,
+                box_rect.x + safe_st.pad_l,
+                box_rect.y + safe_st.pad_t,
+                safe_st.direction,
+                safe_st.gap,
+                safe_st.pad_r,
+                safe_st.pad_b,
             )
         )
         self.id_stack.append(wid)
@@ -844,7 +897,8 @@ struct UiContext(Movable):
             var r = dn.rect
             if dn.kind == DOCK_TABS:
                 self.draw_list.add_rect(r.x, r.y, r.w, r.h, self.theme.bg_panel, 0.0, 1.0, self.theme.border)
-                var hh = min(dock.header_height, r.h)
+                var safe_hh = max(Float32(0.0), dock.header_height) if isfinite(dock.header_height) else Float32(24.0)
+                var hh = min(safe_hh, max(Float32(0.0), r.h))
                 self.draw_list.add_rect(r.x, r.y, r.w, hh, self.theme.bg_header)
                 var tx = r.x + Float32(4.0)
                 for t in range(len(dn.tabs)):
@@ -887,7 +941,13 @@ struct UiContext(Movable):
         var found = dock.find_panel(panel_name)
         if found[0] < 0 or not found[2]:
             return False
-        var content = found[3]
+        var raw_content = found[3]
+        var content = RectF(
+            raw_content.x if isfinite(raw_content.x) else Float32(0.0),
+            raw_content.y if isfinite(raw_content.y) else Float32(0.0),
+            max(Float32(0.0), raw_content.w) if isfinite(raw_content.w) else Float32(0.0),
+            max(Float32(0.0), raw_content.h) if isfinite(raw_content.h) else Float32(0.0),
+        )
         var wid = self.widget_id("dock:" + panel_name)
         var st = FlexStyle.col(gap=4.0, pad=6.0)
         st.fixed_w = content.w
@@ -909,7 +969,11 @@ struct UiContext(Movable):
             )
         )
         self.id_stack.append(wid)
-        self.draw_list.push_clip(Int(content.x), Int(content.y), Int(content.right()), Int(content.bottom()))
+        var cx0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), content.x)))
+        var cy0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), content.y)))
+        var cx1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), content.right())))
+        var cy1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), content.bottom())))
+        self.draw_list.push_clip(cx0, cy0, cx1, cy1)
         return True
 
     def end_dock_panel(mut self):
@@ -920,15 +984,29 @@ struct UiContext(Movable):
 
     def begin_scroll_view(mut self, id: String, w: Float32, h: Float32, total_content_h: Float32 = -1.0):
         var wid = self.widget_id(id)
-        var rect = self._alloc_item_rect(wid, w, h)
+        var safe_w = max(Float32(0.0), w) if isfinite(w) else Float32(0.0)
+        var safe_h = max(Float32(0.0), h) if isfinite(h) else Float32(0.0)
+        var safe_content_h = total_content_h if isfinite(total_content_h) else Float32(-1.0)
+        var raw_rect = self._alloc_item_rect(wid, safe_w, safe_h)
+        var rx = raw_rect.x if isfinite(raw_rect.x) else Float32(0.0)
+        var ry = raw_rect.y if isfinite(raw_rect.y) else Float32(0.0)
+        var rw = max(Float32(0.0), raw_rect.w) if isfinite(raw_rect.w) else Float32(0.0)
+        var rh = max(Float32(0.0), raw_rect.h) if isfinite(raw_rect.h) else Float32(0.0)
+        var rect = RectF(rx, ry, rw, rh)
+        self.last_item_rect = rect
         var st = self._get_state(wid)
 
         if not self._blocked_by_modal() and rect.contains(self.mouse_x, self.mouse_y) and self.mouse_wheel != Float32(0.0):
-            st.scroll_y = max(Float32(0.0), min(st.scroll_max_y, st.scroll_y - self.mouse_wheel * Float32(36.0)))
+            var mw = self.mouse_wheel if isfinite(self.mouse_wheel) else Float32(0.0)
+            st.scroll_y = max(Float32(0.0), min(st.scroll_max_y, st.scroll_y - mw * Float32(36.0)))
             self.state_map[wid] = st
 
         self.draw_list.add_rect(rect.x, rect.y, rect.w, rect.h, self.theme.bg_window, self.theme.corner_radius, 1.0, self.theme.border)
-        self.draw_list.push_clip(Int(rect.x), Int(rect.y), Int(rect.right()), Int(rect.bottom()))
+        var cx0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.x)))
+        var cy0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.y)))
+        var cx1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.right())))
+        var cy1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.bottom())))
+        self.draw_list.push_clip(cx0, cy0, cx1, cy1)
 
         var inner_w = max(Float32(0.0), rect.w - self.theme.scrollbar_width - Float32(8.0))
         var box_st = FlexStyle.col(gap=2.0, pad=4.0)
@@ -940,7 +1018,7 @@ struct UiContext(Movable):
             _BoxScope(
                 wid,
                 f_idx,
-                RectF(rect.x + Float32(4.0), rect.y + Float32(4.0), inner_w, rect.h - Float32(8.0)),
+                RectF(rect.x + Float32(4.0), rect.y + Float32(4.0), inner_w, max(Float32(0.0), rect.h - Float32(8.0))),
                 rect.x + Float32(4.0),
                 start_y,
                 FLEX_COL,
@@ -950,7 +1028,7 @@ struct UiContext(Movable):
             )
         )
         self.id_stack.append(wid)
-        self.scroll_stack.append(_ScrollScope(wid, rect, start_y, st.scroll_y, total_content_h))
+        self.scroll_stack.append(_ScrollScope(wid, rect, start_y, st.scroll_y, safe_content_h))
 
     def end_scroll_view(mut self):
         if len(self.scroll_stack) == 0 or len(self.box_stack) <= 1:
@@ -959,11 +1037,21 @@ struct UiContext(Movable):
         var inner_scope = self.box_stack.pop()
         _ = self.id_stack.pop()
 
-        var measured_h = sc.explicit_content_h if sc.explicit_content_h >= Float32(0.0) else max(Float32(0.0), inner_scope.cursor_y - sc.start_cursor_y)
-        var max_scroll = max(Float32(0.0), measured_h - (sc.view_rect.h - Float32(8.0)))
+        var span_y = inner_scope.cursor_y - sc.start_cursor_y
+        var auto_h = max(Float32(0.0), span_y) if isfinite(span_y) else Float32(0.0)
+        var measured_h = (
+            sc.explicit_content_h
+            if (isfinite(sc.explicit_content_h) and sc.explicit_content_h >= Float32(0.0))
+            else auto_h
+        )
+        var view_h = sc.view_rect.h if isfinite(sc.view_rect.h) else Float32(0.0)
+        var max_scroll = max(Float32(0.0), measured_h - (view_h - Float32(8.0)))
+        if not isfinite(max_scroll):
+            max_scroll = Float32(0.0)
         var st = self._get_state(sc.id_hash)
         st.scroll_max_y = max_scroll
-        st.scroll_y = max(Float32(0.0), min(max_scroll, st.scroll_y))
+        var cur_sy = st.scroll_y if isfinite(st.scroll_y) else Float32(0.0)
+        st.scroll_y = max(Float32(0.0), min(max_scroll, cur_sy))
 
         # Scrollbar track & draggable thumb
         if max_scroll > Float32(0.5):
@@ -978,10 +1066,11 @@ struct UiContext(Movable):
 
             if not self._blocked_by_modal() and self.mouse_pressed_l and track_rect.contains(self.mouse_x, self.mouse_y):
                 self.active_id = sc.id_hash
-            if self.active_id == sc.id_hash and self.mouse_down_l:
+            if self.active_id == sc.id_hash and self.mouse_down_l and isfinite(self.mouse_y):
                 var rel_t = max(Float32(0.0), min(Float32(1.0), (self.mouse_y - track_y - thumb_h * Float32(0.5)) / travel))
-                st.scroll_y = rel_t * max_scroll
-                thumb_y = track_y + rel_t * travel
+                if isfinite(rel_t):
+                    st.scroll_y = rel_t * max_scroll
+                    thumb_y = track_y + rel_t * travel
 
             self.draw_list.add_rect(track_x, track_y, sb_w, track_h, pack_rgba8(14, 16, 20, 180), sb_w * Float32(0.5))
             self.draw_list.add_rect(
@@ -999,12 +1088,29 @@ struct UiContext(Movable):
     @always_inline
     def scroll_visible_range(self, total_items: Int, item_stride_y: Float32) -> Tuple[Int, Int]:
         """O(1) visible index range `[start_idx, end_idx)` for virtualized massive lists/trees."""
-        if total_items <= 0 or len(self.scroll_stack) == 0 or item_stride_y <= Float32(0.0):
+        if (
+            total_items <= 0
+            or len(self.scroll_stack) == 0
+            or not isfinite(item_stride_y)
+            or item_stride_y <= Float32(0.0)
+        ):
             return (0, max(0, total_items))
         var sc = self.scroll_stack[len(self.scroll_stack) - 1]
-        var first = max(0, Int(sc.scroll_y / item_stride_y))
-        var vis_cnt = Int(sc.view_rect.h / item_stride_y) + 3
-        var last = min(total_items, first + vis_cnt)
+        if not isfinite(sc.scroll_y) or not isfinite(sc.view_rect.h):
+            return (0, total_items)
+        var stride = Float64(item_stride_y)
+        var sy = max(0.0, Float64(sc.scroll_y))
+        var vh = max(0.0, Float64(sc.view_rect.h))
+        var max_f = Float64(total_items)
+        var first_f = sy / stride
+        var first = total_items if (not isfinite(first_f) or first_f >= max_f) else max(0, Int(first_f))
+        var vis_f = vh / stride
+        var vis_cnt: Int
+        if not isfinite(vis_f) or vis_f >= max_f:
+            vis_cnt = total_items
+        else:
+            vis_cnt = max(0, Int(vis_f)) + 3
+        var last = first + min(total_items - first, vis_cnt)
         return (first, last)
 
     # ---- Core Widgets ----
@@ -1025,12 +1131,13 @@ struct UiContext(Movable):
         self._draw_text(text, r.x + Float32(2.0), r.y + Float32(3.0), self.theme.font_size, col)
 
     def rich_label(mut self, markup: String, max_width: Float32 = 0.0):
+        var safe_max_w = max_width if (isfinite(max_width) and max_width > Float32(0.0)) else Float32(0.0)
         var spans = parse_rich(markup)
         var df = self.display_font.copy() if self.display_font.valid else self.font.copy()
         if self.font.valid and (self.font.has_source or len(self.font.fallbacks) > 0):
-            var rls = layout_rich_shaped(spans, self.font, df, self.theme.font_size, 0, max_width, 0, self.from_pad, self.pad_sony)
+            var rls = layout_rich_shaped(spans, self.font, df, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony)
             var h = max(self.theme.row_height, rls.height + Float32(4.0))
-            var w = max(Float32(40.0), rls.width if max_width <= Float32(0.0) else max_width)
+            var w = max(Float32(40.0), rls.width if safe_max_w <= Float32(0.0) else safe_max_w)
             var r = self._alloc_item_rect(0, w, h)
             for i in range(len(rls.runs)):
                 ref run = rls.runs[i]
@@ -1052,9 +1159,9 @@ struct UiContext(Movable):
                     else:
                         Self._emit_shaped_glyphs(self.draw_list, self.font_slot, self.font, run.glyphs, rx, r.y + run.baseline, run.px, col)
             return
-        var rl = layout_rich(spans, self.font, df, self.theme.font_size, 0, max_width, 0, self.from_pad, self.pad_sony)
+        var rl = layout_rich(spans, self.font, df, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony)
         var h = max(self.theme.row_height, rl.height + Float32(4.0))
-        var w = max(Float32(40.0), rl.width if max_width <= Float32(0.0) else max_width)
+        var w = max(Float32(40.0), rl.width if safe_max_w <= Float32(0.0) else safe_max_w)
         var r = self._alloc_item_rect(0, w, h)
         for i in range(len(rl.runs)):
             ref run = rl.runs[i]
@@ -1075,8 +1182,12 @@ struct UiContext(Movable):
 
     def button(mut self, id: String, label_text: String, w: Float32 = 0.0, h: Float32 = 0.0) -> Bool:
         var wid = self.widget_id(id)
-        var bw = w if w > Float32(0.0) else max(Float32(76.0), self._measure_text(label_text, self.theme.font_size) + Float32(24.0))
-        var bh = h if h > Float32(0.0) else self.theme.row_height + Float32(4.0)
+        var bw = w if (isfinite(w) and w > Float32(0.0)) else max(Float32(76.0), self._measure_text(label_text, self.theme.font_size) + Float32(24.0))
+        var bh = h if (isfinite(h) and h > Float32(0.0)) else self.theme.row_height + Float32(4.0)
+        if not isfinite(bw):
+            bw = Float32(76.0)
+        if not isfinite(bh):
+            bh = Float32(24.0)
         var r = self._alloc_item_rect(wid, bw, bh)
         self._register_focusable(wid)
 
@@ -1164,7 +1275,8 @@ struct UiContext(Movable):
         w: Float32 = 200.0,
     ) -> Bool:
         var wid = self.widget_id(id)
-        var r = self._alloc_item_rect(wid, w, self.theme.row_height)
+        var safe_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(200.0)
+        var r = self._alloc_item_rect(wid, safe_w, self.theme.row_height)
         self._register_focusable(wid)
 
         var blocked = self._blocked_by_modal()
@@ -1175,23 +1287,46 @@ struct UiContext(Movable):
             self.active_id = wid
             self._set_focused(wid)
 
-        var span = max(Float32(1.0e-6), max_val - min_val)
+        var lo64 = Float64(min_val) if isfinite(min_val) else 0.0
+        var hi64 = Float64(max_val) if isfinite(max_val) else (lo64 + 1.0)
+        if hi64 < lo64:
+            var tmp_b = lo64
+            lo64 = hi64
+            hi64 = tmp_b
+        var span64 = max(1.0e-6, hi64 - lo64)
+        var was_finite = isfinite(value)
+        var val64 = Float64(value) if was_finite else lo64
+        val64 = max(lo64, min(hi64, val64))
+        if not was_finite:
+            value = Float32(val64)
+
         var changed = False
         if (not blocked) and self.active_id == wid and self.mouse_down_l:
-            var t = max(Float32(0.0), min(Float32(1.0), (self.mouse_x - track.x) / max(Float32(1.0), track.w)))
-            var nv = min_val + t * span
-            if abs(nv - value) > Float32(1.0e-6):
-                value = nv
-                changed = True
+            if isfinite(self.mouse_x) and isfinite(track.x) and isfinite(track.w):
+                var t64 = max(0.0, min(1.0, (Float64(self.mouse_x) - Float64(track.x)) / max(1.0, Float64(track.w))))
+                var nv64 = max(lo64, min(hi64, lo64 + t64 * span64))
+                var nv = Float32(nv64)
+                if not isfinite(nv):
+                    nv = Float32(hi64 if t64 >= 0.5 else lo64)
+                if (not was_finite) or abs(Float64(nv) - Float64(value)) > 1.0e-6:
+                    value = nv
+                    changed = True
         elif (not blocked) and self.focused_id == wid:
             if self.key_left_pressed:
-                value = max(min_val, value - span * Float32(0.05))
+                var nv = Float32(max(lo64, val64 - span64 * 0.05))
+                if not isfinite(nv):
+                    nv = Float32(lo64)
+                value = nv
                 changed = True
             elif self.key_right_pressed:
-                value = min(max_val, value + span * Float32(0.05))
+                var nv = Float32(min(hi64, val64 + span64 * 0.05))
+                if not isfinite(nv):
+                    nv = Float32(hi64)
+                value = nv
                 changed = True
 
-        var norm = max(Float32(0.0), min(Float32(1.0), (value - min_val) / span))
+        var cur_v64 = Float64(value) if isfinite(value) else lo64
+        var norm = Float32(max(0.0, min(1.0, (cur_v64 - lo64) / span64)))
         var focused = (not blocked) and self.focused_id == wid
         self.draw_list.add_rect(
             track.x, track.y, track.w, track.h,
@@ -1216,11 +1351,22 @@ struct UiContext(Movable):
         max_val: Float32 = 1.0e6,
         w: Float32 = 260.0,
     ) -> Bool:
-        var r = self._alloc_item_rect(self.widget_id(id), w, self.theme.row_height)
+        var safe_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(260.0)
+        var r = self._alloc_item_rect(self.widget_id(id), safe_w, self.theme.row_height)
         var blocked = self._blocked_by_modal()
-        var comp_w = (r.w * Float32(0.68) - Float32(8.0)) / Float32(3.0)
+        var comp_w = max(Float32(1.0), (r.w * Float32(0.68) - Float32(8.0)) / Float32(3.0))
+        var lo64 = Float64(min_val) if isfinite(min_val) else -1.0e6
+        var hi64 = Float64(max_val) if isfinite(max_val) else 1.0e6
+        if hi64 < lo64:
+            var tmp_b = lo64
+            lo64 = hi64
+            hi64 = tmp_b
+        var sp64 = Float64(speed) if isfinite(speed) else 0.05
+        var had_non_finite = (not isfinite(v.x)) or (not isfinite(v.y)) or (not isfinite(v.z))
         var vals = Array[Float32, 3](fill=0.0)
-        vals[0] = v.x; vals[1] = v.y; vals[2] = v.z
+        vals[0] = v.x if isfinite(v.x) else Float32(max(lo64, min(hi64, 0.0)))
+        vals[1] = v.y if isfinite(v.y) else Float32(max(lo64, min(hi64, 0.0)))
+        vals[2] = v.z if isfinite(v.z) else Float32(max(lo64, min(hi64, 0.0)))
         var axis_cols = Array[UInt32, 3](fill=0)
         axis_cols[0] = pack_rgba8(224, 82, 82, 255)
         axis_cols[1] = pack_rgba8(92, 198, 108, 255)
@@ -1233,15 +1379,17 @@ struct UiContext(Movable):
             if not blocked and cr.contains(self.mouse_x, self.mouse_y) and self.mouse_pressed_l:
                 self.active_id = cid
                 self._set_focused(cid)
-            if not blocked and self.active_id == cid and self.mouse_down_l and self.mouse_delta_x != Float32(0.0):
-                vals[c] = max(min_val, min(max_val, vals[c] + self.mouse_delta_x * speed))
-                changed = True
+            if not blocked and self.active_id == cid and self.mouse_down_l and isfinite(self.mouse_delta_x) and self.mouse_delta_x != Float32(0.0):
+                var nv = Float32(max(lo64, min(hi64, Float64(vals[c]) + Float64(self.mouse_delta_x) * sp64)))
+                if isfinite(nv):
+                    vals[c] = nv
+                    changed = True
             self.draw_list.add_rect(cr.x, cr.y, cr.w, cr.h, self.theme.bg_widget, 3.0, 1.0, self.theme.border)
             self.draw_list.add_rect(cr.x, cr.y, 3.0, cr.h, axis_cols[c], 1.5)
             var txt = format_float2(vals[c])
             self._draw_text(txt, cr.x + Float32(6.0), cr.y + Float32(2.0), self.theme.font_size * Float32(0.88), self.theme.text_primary)
 
-        if changed:
+        if changed or had_non_finite:
             v.x = vals[0]; v.y = vals[1]; v.z = vals[2]
         self._draw_text(label_text, r.x + r.w * Float32(0.68) + Float32(6.0), r.y + Float32(3.0), self.theme.font_size, self.theme.text_primary)
         return changed
@@ -1423,7 +1571,8 @@ struct UiContext(Movable):
         scalar codepoints (`decode_utf8` / `encode_utf8`) with clipboard (`Ctrl+C/V/X/A`),
         mouse-click/drag/double-click selection, horizontal scroll, and IME composition."""
         var wid = self.widget_id(id)
-        var r = self._alloc_item_rect(wid, w, self.theme.row_height + Float32(4.0))
+        var safe_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(220.0)
+        var r = self._alloc_item_rect(wid, safe_w, self.theme.row_height + Float32(4.0))
         self._register_focusable(wid)
 
         var blocked = self._blocked_by_modal()
@@ -1685,7 +1834,11 @@ struct UiContext(Movable):
             Float32(2.0) if focused else Float32(1.0),
             self.theme.focus_ring if focused else self.theme.border,
         )
-        self.draw_list.push_clip(Int(r.x + Float32(2.0)), Int(r.y + Float32(1.0)), Int(r.right() - Float32(2.0)), Int(r.bottom() - Float32(1.0)))
+        var cx0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), r.x + Float32(2.0))))
+        var cy0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), r.y + Float32(1.0))))
+        var cx1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), r.right() - Float32(2.0))))
+        var cy1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), r.bottom() - Float32(1.0))))
+        self.draw_list.push_clip(cx0, cy0, cx1, cy1)
 
         var draw_x = pad_x - st.scroll_x
         if len(codes) == 0 and placeholder.byte_length() > 0 and not focused and not show_ime:
@@ -1855,21 +2008,37 @@ struct UiContext(Movable):
         var p0y = plot.bottom()
         var p1x = plot.right()
         var p1y = plot.y
-        var cx = plot.x + max(Float32(0.0), min(Float32(1.0), ctrl_x)) * plot.w
-        var cy = plot.bottom() - max(Float32(0.0), min(Float32(1.0), ctrl_y)) * plot.h
+        var had_non_finite = (not isfinite(ctrl_x)) or (not isfinite(ctrl_y))
+        var tx = ctrl_x if isfinite(ctrl_x) else Float32(0.5)
+        var ty = ctrl_y if isfinite(ctrl_y) else Float32(0.5)
+        tx = max(Float32(0.0), min(Float32(1.0), tx))
+        ty = max(Float32(0.0), min(Float32(1.0), ty))
+        var cx = plot.x + tx * plot.w
+        var cy = plot.bottom() - ty * plot.h
+        if not isfinite(cx):
+            cx = plot.x
+        if not isfinite(cy):
+            cy = plot.bottom()
 
         var changed = False
         if not self._blocked_by_modal():
             var dx = self.mouse_x - cx
             var dy = self.mouse_y - cy
-            if self.mouse_pressed_l and (dx * dx + dy * dy <= Float32(100.0) or plot.contains(self.mouse_x, self.mouse_y)):
-                self.active_id = wid
-            if self.active_id == wid and self.mouse_down_l and plot.w > Float32(1.0) and plot.h > Float32(1.0):
-                ctrl_x = max(Float32(0.0), min(Float32(1.0), (self.mouse_x - plot.x) / plot.w))
-                ctrl_y = max(Float32(0.0), min(Float32(1.0), (plot.bottom() - self.mouse_y) / plot.h))
-                cx = plot.x + ctrl_x * plot.w
-                cy = plot.bottom() - ctrl_y * plot.h
-                changed = True
+            if isfinite(dx) and isfinite(dy):
+                if self.mouse_pressed_l and (dx * dx + dy * dy <= Float32(100.0) or plot.contains(self.mouse_x, self.mouse_y)):
+                    self.active_id = wid
+                if self.active_id == wid and self.mouse_down_l and plot.w > Float32(1.0) and plot.h > Float32(1.0):
+                    var nx = (self.mouse_x - plot.x) / plot.w
+                    var ny = (plot.bottom() - self.mouse_y) / plot.h
+                    if isfinite(nx) and isfinite(ny):
+                        tx = max(Float32(0.0), min(Float32(1.0), nx))
+                        ty = max(Float32(0.0), min(Float32(1.0), ny))
+                        cx = plot.x + tx * plot.w
+                        cy = plot.bottom() - ty * plot.h
+                        changed = True
+        if changed or had_non_finite:
+            ctrl_x = tx
+            ctrl_y = ty
 
         self.draw_list.add_line(p0x, p0y, cx, cy, 1.0, self.theme.text_muted)
         self.draw_list.add_line(cx, cy, p1x, p1y, 1.0, self.theme.text_muted)
@@ -1926,11 +2095,15 @@ struct UiContext(Movable):
             return False
 
         # Full-screen dim backdrop
-        self.draw_list.add_rect(0.0, 0.0, self.screen_w, self.screen_h, self.theme.modal_backdrop)
+        var safe_sw = max(Float32(0.0), self.screen_w) if isfinite(self.screen_w) else Float32(1280.0)
+        var safe_sh = max(Float32(0.0), self.screen_h) if isfinite(self.screen_h) else Float32(720.0)
+        var safe_w = max(Float32(0.0), w) if isfinite(w) else Float32(0.0)
+        var safe_h = max(Float32(0.0), h) if isfinite(h) else Float32(0.0)
+        self.draw_list.add_rect(0.0, 0.0, safe_sw, safe_sh, self.theme.modal_backdrop)
 
-        var mx = max(Float32(0.0), (self.screen_w - w) * Float32(0.5))
-        var my = max(Float32(0.0), (self.screen_h - h) * Float32(0.5))
-        var mrect = RectF(mx, my, w, h)
+        var mx = max(Float32(0.0), (safe_sw - safe_w) * Float32(0.5))
+        var my = max(Float32(0.0), (safe_sh - safe_h) * Float32(0.5))
+        var mrect = RectF(mx, my, safe_w, safe_h)
 
         self.draw_list.add_rect_styled(
             mrect.x, mrect.y, mrect.w, mrect.h,

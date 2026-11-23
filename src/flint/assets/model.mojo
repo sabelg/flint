@@ -1,5 +1,5 @@
 """Mojo-owned geometry, material, scene, skin, and animation data."""
-from std.math import sqrt
+from std.math import isfinite, sqrt
 from std.sys import size_of
 from flint.core.math import Vec3
 from flint.core.transform import Quat, Mat4, trs
@@ -240,7 +240,10 @@ struct NativeAnimation(Copyable, Movable):
         self.duration = 0
 
     def frame_count(self) -> Int:
-        return max(1, Int(self.duration * 30.0) + 1)
+        if not isfinite(self.duration) or self.duration <= Float32(0.0):
+            return 1
+        var frames_f = min(Float64(1_000_000_000.0), Float64(self.duration) * 30.0)
+        return max(1, Int(frames_f) + 1)
 
 
 comptime DEFAULT_BLEND_HALFLIFE: Float32 = 0.08
@@ -595,19 +598,22 @@ struct NativeModel(Copyable, Movable):
         (Bollo, GDC 2018; Holden's spring formulation)."""
         if animation < 0 or animation >= len(self.animations):
             return
+        var safe_time = time if isfinite(time) else Float32(0.0)
+        var safe_dt = dt if (isfinite(dt) and dt > Float32(0.0)) else Float32(0.0)
+        var safe_halflife = halflife if (isfinite(halflife) and halflife > Float32(0.0)) else Float32(0.0)
         var count = len(self.nodes)
         if len(self.anim.out_t) != count:
             self.anim.resize(count)
-        var switching = self.anim.has_pose and animation != self.anim.clip and halflife > 0 and dt > 0
+        var switching = self.anim.has_pose and animation != self.anim.clip and safe_halflife > 0 and safe_dt > 0
         if switching:
             # Sample one step ahead to know how fast the new clip moves.
-            self.sample_clip(animation, time + dt)
+            self.sample_clip(animation, safe_time + safe_dt)
             for index in range(count):
                 self.anim.next_t[index] = self.nodes[index].translation
                 self.anim.next_r[index] = self.nodes[index].rotation
-        self.sample_clip(animation, time)
+        self.sample_clip(animation, safe_time)
         if switching:
-            var inverse_dt = 1.0 / dt
+            var inverse_dt = 1.0 / safe_dt
             for index in range(count):
                 var src_t = self.nodes[index].translation
                 var src_r = self.nodes[index].rotation
@@ -624,14 +630,14 @@ struct NativeModel(Copyable, Movable):
                 self.anim.off_r[index] = Vec3()
                 self.anim.vel_r[index] = Vec3()
         for index in range(count):
-            if dt > 0:
-                decay_spring(self.anim.off_t[index], self.anim.vel_t[index], halflife, dt)
-                decay_spring(self.anim.off_r[index], self.anim.vel_r[index], halflife, dt)
+            if safe_dt > 0:
+                decay_spring(self.anim.off_t[index], self.anim.vel_t[index], safe_halflife, safe_dt)
+                decay_spring(self.anim.off_r[index], self.anim.vel_r[index], safe_halflife, safe_dt)
             var final_t = self.nodes[index].translation + self.anim.off_t[index]
             var final_r = Quat.from_scaled_angle(self.anim.off_r[index]).multiply(self.nodes[index].rotation).normalized()
-            if self.anim.has_pose and dt > 0:
-                self.anim.out_vel_t[index] = (final_t - self.anim.out_t[index]) * (1.0 / dt)
-                self.anim.out_vel_r[index] = final_r.multiply(self.anim.out_r[index].conjugate()).to_scaled_angle() * (1.0 / dt)
+            if self.anim.has_pose and safe_dt > 0:
+                self.anim.out_vel_t[index] = (final_t - self.anim.out_t[index]) * (1.0 / safe_dt)
+                self.anim.out_vel_r[index] = final_r.multiply(self.anim.out_r[index].conjugate()).to_scaled_angle() * (1.0 / safe_dt)
             else:
                 self.anim.out_vel_t[index] = Vec3()
                 self.anim.out_vel_r[index] = Vec3()
@@ -689,7 +695,7 @@ struct NativeModel(Copyable, Movable):
         var rotation = Quat()
         var current = node
         var guard = 0
-        while current >= 0 and guard < 128:
+        while current >= 0 and current < len(self.nodes) and guard < 128:
             rotation = self.nodes[current].rotation.multiply(rotation)
             current = self.parents[current]
             guard += 1
@@ -701,7 +707,7 @@ struct NativeModel(Copyable, Movable):
         var position = Vec3()
         var current = node
         var guard = 0
-        while current >= 0 and guard < 128:
+        while current >= 0 and current < len(self.nodes) and guard < 128:
             position = self.nodes[current].translation + self.nodes[current].rotation.rotate(position)
             current = self.parents[current]
             guard += 1
@@ -709,7 +715,15 @@ struct NativeModel(Copyable, Movable):
 
     def solve_two_bone(mut self, upper: Int, middle: Int, end: Int, target: Vec3, pole: Vec3, weight: Float32 = 1.0):
         """Bends upper and middle so end reaches target (model space)."""
-        if upper < 0 or middle < 0 or end < 0 or weight <= 0:
+        var n = len(self.nodes)
+        if upper < 0 or upper >= n or middle < 0 or middle >= n or end < 0 or end >= n:
+            return
+        if not isfinite(weight) or weight <= 0:
+            return
+        if not (
+            isfinite(target.x) and isfinite(target.y) and isfinite(target.z)
+            and isfinite(pole.x) and isfinite(pole.y) and isfinite(pole.z)
+        ):
             return
         var a = self.global_position(upper)
         var b = self.global_position(middle)
@@ -724,7 +738,7 @@ struct NativeModel(Copyable, Movable):
 
     def offset_node(mut self, node: Int, model_delta: Vec3):
         """Moves a joint by a model-space offset (e.g. lowering the pelvis)."""
-        if node < 0:
+        if node < 0 or node >= len(self.nodes):
             return
         self.ensure_parents()
         var parent = self.parents[node]
@@ -768,15 +782,19 @@ struct NativeModel(Copyable, Movable):
         return largest
 
     def sample_clip(mut self, animation: Int, time_seconds: Float32):
+        if animation < 0 or animation >= len(self.animations):
+            return
+        var safe_time = time_seconds if isfinite(time_seconds) else Float32(0.0)
         self.active_animation = animation
-        self.active_time = time_seconds
+        self.active_time = safe_time
         self.transforms_revision += 1
         for index in range(len(self.nodes)):
             self.nodes[index].translation = self.nodes[index].base_translation
             self.nodes[index].rotation = self.nodes[index].base_rotation
             self.nodes[index].scale = self.nodes[index].base_scale
         ref clip = self.animations[animation]
-        var time = max(Float32(0), min(self.active_time, clip.duration))
+        var dur = clip.duration if (isfinite(clip.duration) and clip.duration >= Float32(0.0)) else Float32(0.0)
+        var time = max(Float32(0), min(self.active_time, dur))
         for channel in clip.channels:
             var key_count = len(channel.times)
             if channel.node < 0 or channel.node >= len(self.nodes) or key_count == 0:

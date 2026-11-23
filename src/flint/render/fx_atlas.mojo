@@ -20,7 +20,7 @@ below.
     leaf      a pointed leaf with its vein
     flame     a flame tongue, tip up (the CPU path's fire)
 """
-from std.math import sqrt, atan2, cos, sin
+from std.math import atan2, cos, isfinite, sin, sqrt
 from flint.render.particle_atlas import value_noise
 
 comptime TEX_VIGNETTE: Int = 8
@@ -42,12 +42,16 @@ comptime VIGNETTE_SIZE: Int = 128
 
 
 def argb(shade: Float32, alpha: Float32) -> UInt32:
-    var s = UInt32(max(0, min(255, Int(shade * 255.0 + 0.5))))
-    var a = UInt32(max(0, min(255, Int(alpha * 255.0 + 0.5))))
+    var sf = clamp01(shade)
+    var af = clamp01(alpha)
+    var s = UInt32(max(0, min(255, Int(sf * 255.0 + 0.5))))
+    var a = UInt32(max(0, min(255, Int(af * 255.0 + 0.5))))
     return (a << 24) | (s << 16) | (s << 8) | s
 
 
 def clamp01(value: Float32) -> Float32:
+    if not isfinite(value):
+        return Float32(0.0)
     return max(Float32(0), min(Float32(1), value))
 
 

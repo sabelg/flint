@@ -9,7 +9,7 @@ Implements `CameraRig` across 4 modes:
 Plus Squirrel Eiserloh deterministic `trauma * trauma` 6-DOF gradient-noise camera shake.
 """
 from std.collections import List
-from std.math import sqrt, abs, min, max, floor
+from std.math import sqrt, abs, min, max, floor, isfinite
 from flint.core.math import Vec3, Quat, Mat4
 from flint.core.transform import trs
 from flint.core.detmath import det_sin, det_cos, det_atan2, PI
@@ -36,9 +36,14 @@ def _det_grad_1d(hash_seed: UInt64, i: Int64) -> Float32:
 @always_inline
 def _det_perlin_1d(seed: UInt64, x: Float32) -> Float32:
     """Deterministic C2-continuous 1D quintic gradient/value noise in `[-1, 1]`."""
-    var xi = floor(x)
+    if not isfinite(x):
+        return Float32(0.0)
+    var xd = Float64(x)
+    if abs(xd) > 1.0e12:
+        xd = xd - floor(xd / 65536.0) * 65536.0
+    var xi = floor(xd)
     var i0 = Int64(xi)
-    var t = x - xi
+    var t = Float32(xd - xi)
     var fade = t * t * t * (t * (t * Float32(6.0) - Float32(15.0)) + Float32(10.0))
     var v0 = _det_grad_1d(seed, i0)
     var v1 = _det_grad_1d(seed, i0 + 1)
@@ -110,6 +115,10 @@ struct SpringArm(Copyable, ImplicitlyCopyable, Movable):
         dt: Float32,
         ignore_body_id: Int = -1,
     ) -> Vec3:
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt < Float32(0.0)) else min(dt, Float32(1.0))
+        if not isfinite(self.current_length.value):
+            self.current_length.value = self.target_length
+            self.current_length.velocity = Float32(0.0)
         var desired = self.target_length
         var sh = world.shapecast_sphere(
             pivot,
@@ -133,11 +142,11 @@ struct SpringArm(Copyable, ImplicitlyCopyable, Movable):
                 self.current_length.value = max_unobstructed
                 self.current_length.velocity = Float32(0.0)
             else:
-                self.current_length.update(max_unobstructed, self.snap_in_halflife, dt)
+                self.current_length.update(max_unobstructed, self.snap_in_halflife, safe_dt)
                 self.current_length.value = min(self.current_length.value, max_unobstructed)
         else:
             # Smooth critically-damped spring-out back toward target boom length
-            self.current_length.update(max_unobstructed, self.spring_out_halflife, dt)
+            self.current_length.update(max_unobstructed, self.spring_out_halflife, safe_dt)
 
         return pivot + arm_dir_unit * self.current_length.value
 
@@ -222,9 +231,13 @@ struct CameraRig(Copyable, Movable):
         self.unshaken_rot = Quat()
 
     def add_trauma(mut self, amount: Float32):
+        if not isfinite(amount):
+            return
         self.trauma = max(Float32(0.0), min(Float32(1.0), self.trauma + amount))
 
     def rotate_orbit(mut self, delta_yaw_deg: Float32, delta_pitch_deg: Float32):
+        if not isfinite(delta_yaw_deg) or not isfinite(delta_pitch_deg):
+            return
         self.yaw_deg += delta_yaw_deg
         self.yaw_deg -= Float32(360.0) * floor((self.yaw_deg + Float32(180.0)) * Float32(1.0 / 360.0))
         self.pitch_deg = max(self.min_pitch_deg, min(self.max_pitch_deg, self.pitch_deg + delta_pitch_deg))
@@ -238,9 +251,9 @@ struct CameraRig(Copyable, Movable):
             return Vec3()
         if n == 1:
             return self.rail_points[0]
-        var t_clamped = max(Float32(0.0), min(Float32(1.0), t_norm))
+        var t_clamped = Float32(0.0) if not isfinite(t_norm) else max(Float32(0.0), min(Float32(1.0), t_norm))
         var scaled = t_clamped * Float32(n - 1)
-        var seg = min(n - 2, Int(floor(scaled)))
+        var seg = max(0, min(n - 2, Int(floor(scaled))))
         var u = scaled - Float32(seg)
         var p0 = self.rail_points[max(0, seg - 1)]
         var p1 = self.rail_points[seg]
@@ -282,7 +295,13 @@ struct CameraRig(Copyable, Movable):
         fly_move_local: Vec3 = Vec3(),
         fly_speed: Float32 = 10.0,
     ):
+        if not isfinite(self.yaw_deg):
+            self.yaw_deg = Float32(0.0)
+        if not isfinite(self.pitch_deg):
+            self.pitch_deg = Float32(15.0)
         self.pitch_deg = max(self.min_pitch_deg, min(self.max_pitch_deg, self.pitch_deg))
+        var safe_target = target_pos if (isfinite(target_pos.x) and isfinite(target_pos.y) and isfinite(target_pos.z)) else Vec3()
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt < Float32(0.0)) else min(dt, Float32(1.0))
         var yaw_r = self.yaw_deg * _CAM_DEG_TO_RAD
         var pitch_r = self.pitch_deg * _CAM_DEG_TO_RAD
 
@@ -297,49 +316,74 @@ struct CameraRig(Copyable, Movable):
 
         if self.mode == CAM_MODE_FIRST_PERSON:
             var fp_fwd = Vec3(sy * cp, -sp, cy * cp).normalized()
-            base_pos = target_pos + self.first_person_eye_offset
+            base_pos = safe_target + self.first_person_eye_offset
             base_rot = _look_rotation(fp_fwd)
         elif self.mode == CAM_MODE_FREE_FLY:
             var fly_fwd = Vec3(sy * cp, -sp, cy * cp).normalized()
             base_rot = _look_rotation(fly_fwd)
-            var world_move = base_rot.rotate(fly_move_local) * fly_speed
+            var safe_speed = Float32(0.0) if not isfinite(fly_speed) else max(Float32(-1.0e6), min(Float32(1.0e6), fly_speed))
+            var safe_move = Vec3(
+                max(Float32(-1.0e6), min(Float32(1.0e6), fly_move_local.x)) if isfinite(fly_move_local.x) else Float32(0.0),
+                max(Float32(-1.0e6), min(Float32(1.0e6), fly_move_local.y)) if isfinite(fly_move_local.y) else Float32(0.0),
+                max(Float32(-1.0e6), min(Float32(1.0e6), fly_move_local.z)) if isfinite(fly_move_local.z) else Float32(0.0),
+            )
+            var world_move = base_rot.rotate(safe_move) * safe_speed
+            if not (isfinite(world_move.x) and isfinite(world_move.y) and isfinite(world_move.z)):
+                world_move = Vec3()
             self.fly_vel = world_move
-            self.fly_pos = self.fly_pos + self.fly_vel * max(Float32(0.0), dt)
+            if not (isfinite(self.fly_pos.x) and isfinite(self.fly_pos.y) and isfinite(self.fly_pos.z)):
+                self.fly_pos = Vec3(0.0, 2.0, -5.0)
+            self.fly_pos = self.fly_pos + self.fly_vel * safe_dt
             base_pos = self.fly_pos
         elif self.mode == CAM_MODE_RAIL_DOLLY:
-            var look_tgt = target_pos + self.look_offset
+            var look_tgt = safe_target + self.look_offset
+            if not (isfinite(self.pivot_spring.value.x) and isfinite(self.pivot_spring.value.y) and isfinite(self.pivot_spring.value.z)):
+                self.pivot_spring.value = look_tgt
+                self.pivot_spring.velocity = Vec3()
+            if not isfinite(self.rail_param.value):
+                self.rail_param.value = Float32(0.0)
+                self.rail_param.velocity = Float32(0.0)
             if not self.pivot_initialized:
                 self.pivot_spring.value = look_tgt
                 self.pivot_initialized = True
-            else:
-                self.pivot_spring.update(look_tgt, self.follow_halflife, dt)
+            elif safe_dt > Float32(0.0):
+                self.pivot_spring.update(look_tgt, self.follow_halflife, safe_dt)
             if self.rail_auto_track:
-                var goal_t = self._closest_rail_param(target_pos)
-                self.rail_param.update(goal_t, self.rail_halflife, dt)
+                var goal_t = self._closest_rail_param(safe_target)
+                if safe_dt > Float32(0.0):
+                    self.rail_param.update(goal_t, self.rail_halflife, safe_dt)
             base_pos = self._eval_catmull_rom_rail(self.rail_param.value)
             base_rot = _look_rotation(self.pivot_spring.value - base_pos)
         else:
             # CAM_MODE_ORBIT_FOLLOW
-            var goal_pivot = target_pos + self.look_offset
+            var goal_pivot = safe_target + self.look_offset
+            if not (isfinite(self.pivot_spring.value.x) and isfinite(self.pivot_spring.value.y) and isfinite(self.pivot_spring.value.z)):
+                self.pivot_spring.value = goal_pivot
+                self.pivot_spring.velocity = Vec3()
             if not self.pivot_initialized:
                 self.pivot_spring.value = goal_pivot
                 self.pivot_spring.velocity = Vec3()
                 self.pivot_initialized = True
-            else:
-                self.pivot_spring.update(goal_pivot, self.follow_halflife, dt)
+            elif safe_dt > Float32(0.0):
+                self.pivot_spring.update(goal_pivot, self.follow_halflife, safe_dt)
 
             var fwd = Vec3(sy * cp, -sp, cy * cp).normalized()
             base_rot = _look_rotation(fwd)
             var pivot = self.pivot_spring.value + base_rot.rotate(self.shoulder_offset)
             var arm_dir = -fwd
-            base_pos = self.spring_arm.resolve(world, pivot, arm_dir, dt, self.ignore_body_id)
+            base_pos = self.spring_arm.resolve(world, pivot, arm_dir, safe_dt, self.ignore_body_id)
 
         self.unshaken_pos = base_pos
         self.unshaken_rot = base_rot
 
         # Apply deterministic `trauma * trauma` 6-DOF Perlin camera shake
-        if self.trauma > Float32(1.0e-5) and dt >= Float32(0.0):
-            self.shake_time += dt
+        var shake_dt = Float32(0.0) if (not isfinite(dt) or dt < Float32(0.0)) else min(dt, Float32(1.0))
+        if self.trauma > Float32(1.0e-5) and shake_dt > Float32(0.0):
+            if not isfinite(self.shake_time):
+                self.shake_time = Float32(0.0)
+            self.shake_time += shake_dt
+            if self.shake_time >= Float32(65536.0):
+                self.shake_time = self.shake_time - floor(self.shake_time / Float32(65536.0)) * Float32(65536.0)
             var shake = self.trauma * self.trauma
             var phase = self.shake_time * self.shake_freq_hz
             var ox = _det_perlin_1d(self.shake_seed ^ 0x1111, phase) * self.max_shake_offset.x * shake
@@ -367,7 +411,7 @@ struct CameraRig(Copyable, Movable):
                         shake_delta = shake_delta * (max_d / s_len)
             self.world_pos = base_pos + shake_delta
             self.world_rot = (base_rot * q_shake).normalized()
-            self.trauma = max(Float32(0.0), self.trauma - self.trauma_decay * dt)
+            self.trauma = max(Float32(0.0), self.trauma - self.trauma_decay * shake_dt)
         else:
             self.world_pos = base_pos
             self.world_rot = base_rot

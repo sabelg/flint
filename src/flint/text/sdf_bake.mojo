@@ -13,7 +13,7 @@ The same `bake_glyph` serves the offline baker (`tools/bake_font.mojo`,
 which writes the `.dsf` files) and the game's dynamic glyph cache (a glyph
 missing from the baked atlas is baked from the font file on first use).
 """
-from std.math import abs, sqrt, floor, ceil, sin, cos, acos
+from std.math import abs, sqrt, floor, ceil, sin, cos, acos, isfinite
 from flint.text.ttf import TrueTypeFont, GlyphOutline
 
 comptime DSF_MAGIC: Int = 0x31465344  # "DSF1"
@@ -65,6 +65,8 @@ struct Segments(Movable):
         self.values = List[Float32]()
 
     def add(mut self, ax: Float32, ay: Float32, bx: Float32, by: Float32):
+        if not (isfinite(ax) and isfinite(ay) and isfinite(bx) and isfinite(by)):
+            return
         if ax == bx and ay == by:
             return
         self.values.append(ax)
@@ -77,11 +79,15 @@ struct Segments(Movable):
 
 
 def add_quad(mut segments: Segments, ax: Float32, ay: Float32, cx: Float32, cy: Float32, bx: Float32, by: Float32):
+    if not (isfinite(ax) and isfinite(ay) and isfinite(cx) and isfinite(cy) and isfinite(bx) and isfinite(by)):
+        return
     # Error of a quadratic flattened into n pieces is |a - 2c + b| / (8 n^2).
     var ex = ax - 2 * cx + bx
     var ey = ay - 2 * cy + by
     var deviation = sqrt(ex * ex + ey * ey)
-    var pieces = max(1, min(32, Int(ceil(sqrt(deviation / (8 * CURVE_TOLERANCE))))))
+    if not isfinite(deviation):
+        return
+    var pieces = max(1, min(32, Int(ceil(min(Float32(32.0), sqrt(deviation / (8 * CURVE_TOLERANCE)))))))
     var px = ax
     var py = ay
     for step in range(1, pieces + 1):
@@ -105,13 +111,22 @@ def add_cubic(
     bx: Float32,
     by: Float32,
 ):
+    if not (
+        isfinite(ax) and isfinite(ay)
+        and isfinite(c1x) and isfinite(c1y)
+        and isfinite(c2x) and isfinite(c2y)
+        and isfinite(bx) and isfinite(by)
+    ):
+        return
     # Wang's bound: max deviation of second difference controls flattening step count.
     var ex1 = ax - 2.0 * c1x + c2x
     var ey1 = ay - 2.0 * c1y + c2y
     var ex2 = c1x - 2.0 * c2x + bx
     var ey2 = c1y - 2.0 * c2y + by
     var dev = max(sqrt(ex1 * ex1 + ey1 * ey1), sqrt(ex2 * ex2 + ey2 * ey2))
-    var pieces = max(1, min(64, Int(ceil(sqrt(Float32(0.75) * dev / CURVE_TOLERANCE)))))
+    if not isfinite(dev):
+        return
+    var pieces = max(1, min(64, Int(ceil(min(Float32(64.0), sqrt(Float32(0.75) * dev / CURVE_TOLERANCE))))))
     var px = ax
     var py = ay
     for step in range(1, pieces + 1):
@@ -134,6 +149,8 @@ def flatten(outline: GlyphOutline, scale: Float32) -> Segments:
     """Contours to segments in bake px (y flipped down). Supports TrueType
     quadratic contours (`is_cubic=False`) and CFF cubic contours (`is_cubic=True`)."""
     var segments = Segments()
+    if not isfinite(scale) or scale <= Float32(0.0):
+        return segments^
     var n_pts = min(len(outline.xs), min(len(outline.ys), len(outline.on)))
     var start = 0
     for contour in range(len(outline.ends)):
@@ -149,10 +166,19 @@ def flatten(outline: GlyphOutline, scale: Float32) -> Segments:
         var xs = List[Float32]()
         var ys = List[Float32]()
         var on = List[Bool]()
+        var contour_ok = True
         for p in range(start, end + 1):
-            xs.append(outline.xs[p] * scale)
-            ys.append(-outline.ys[p] * scale)
+            var sx = outline.xs[p] * scale
+            var sy = -outline.ys[p] * scale
+            if not (isfinite(sx) and isfinite(sy)):
+                contour_ok = False
+                break
+            xs.append(sx)
+            ys.append(sy)
             on.append(outline.on[p])
+        if not contour_ok:
+            start = end + 1
+            continue
         if outline.is_cubic:
             var first = -1
             for p in range(count):
@@ -251,6 +277,8 @@ def flatten(outline: GlyphOutline, scale: Float32) -> Segments:
 
 def signed_distance(segments: Segments, px: Float32, py: Float32) -> Float32:
     """Distance from (px, py) to the outline, positive inside (nonzero rule)."""
+    if not (isfinite(px) and isfinite(py)):
+        return Float32(0.0)
     var best: Float32 = 1e30
     var winding = 0
     var v = segments.values.unsafe_ptr()
@@ -330,6 +358,86 @@ def _solve_cubic_real(a: Float32, b: Float32, c: Float32, d: Float32) -> List[Fl
         roots.append(r * cos(phi) - bn3)
         roots.append(r * cos(phi - two_pi_3) - bn3)
         roots.append(r * cos(phi + two_pi_3) - bn3)
+    return roots^
+
+
+def _solve_quadratic_roots64(a: Float64, b: Float64, c: Float64) -> List[Float64]:
+    var roots = List[Float64]()
+    if not (isfinite(a) and isfinite(b) and isfinite(c)):
+        return roots^
+    if abs(a) < 1.0e-12:
+        if abs(b) > 1.0e-12:
+            var r0 = -c / b
+            if isfinite(r0):
+                roots.append(r0)
+        return roots^
+    var disc = b * b - 4.0 * a * c
+    if disc >= 0.0 and isfinite(disc):
+        var s = sqrt(disc)
+        var r1 = (-b + s) / (2.0 * a)
+        if isfinite(r1):
+            roots.append(r1)
+        if disc > 1.0e-12:
+            var r2 = (-b - s) / (2.0 * a)
+            if isfinite(r2):
+                roots.append(r2)
+    return roots^
+
+
+def _solve_cubic_real64(a_in: Float64, b_in: Float64, c_in: Float64, d_in: Float64) -> List[Float64]:
+    if not (isfinite(a_in) and isfinite(b_in) and isfinite(c_in) and isfinite(d_in)):
+        return List[Float64]()
+    var scale = max(abs(a_in), max(abs(b_in), max(abs(c_in), abs(d_in))))
+    if not isfinite(scale) or scale <= 0.0:
+        return List[Float64]()
+    var a = a_in / scale
+    var b = b_in / scale
+    var c = c_in / scale
+    var d = d_in / scale
+    if abs(a) < 1.0e-12:
+        return _solve_quadratic_roots64(b, c, d)
+    var inv_a = 1.0 / a
+    var bn = b * inv_a
+    var cn = c * inv_a
+    var dn = d * inv_a
+    var bn3 = bn / 3.0
+    var p = cn - bn * bn3
+    var q = 2.0 * bn3 * bn3 * bn3 - bn3 * cn + dn
+    var half_q = q * 0.5
+    var p3 = p / 3.0
+    var disc = half_q * half_q + p3 * p3 * p3
+    if not isfinite(disc):
+        return List[Float64]()
+    var roots = List[Float64]()
+    if disc > 1.0e-14:
+        var sd = sqrt(disc)
+        var u_arg = -half_q + sd
+        var v_arg = -half_q - sd
+        var u = (abs(u_arg) ** (1.0 / 3.0)) * (1.0 if u_arg >= 0.0 else -1.0)
+        var v = (abs(v_arg) ** (1.0 / 3.0)) * (1.0 if v_arg >= 0.0 else -1.0)
+        var r0 = u + v - bn3
+        if isfinite(r0):
+            roots.append(r0)
+    elif p >= 0.0:
+        var t_single = (abs(q) ** (1.0 / 3.0)) * (-1.0 if q >= 0.0 else 1.0)
+        var r0 = t_single - bn3
+        if isfinite(r0):
+            roots.append(r0)
+    else:
+        var r = 2.0 * sqrt(max(0.0, -p3))
+        var denom = max(1.0e-18, sqrt(max(0.0, -p3 * p3 * p3)))
+        var cos_arg = max(-1.0, min(1.0, -half_q / denom))
+        var phi = acos(cos_arg) / 3.0
+        var two_pi_3 = 2.0943951023931953
+        var r0 = r * cos(phi) - bn3
+        var r1 = r * cos(phi - two_pi_3) - bn3
+        var r2 = r * cos(phi + two_pi_3) - bn3
+        if isfinite(r0):
+            roots.append(r0)
+        if isfinite(r1):
+            roots.append(r1)
+        if isfinite(r2):
+            roots.append(r2)
     return roots^
 
 
@@ -456,165 +564,288 @@ struct EdgeSegment(Copyable, ImplicitlyCopyable, Movable):
 
     def signed_distance_param(self, px: Float32, py: Float32) -> Tuple[Float32, Float32, Float32]:
         """Returns (signed_distance, orthogonality, raw_param_t)."""
+        if not (
+            isfinite(px) and isfinite(py)
+            and isfinite(self.p0x) and isfinite(self.p0y)
+            and isfinite(self.p1x) and isfinite(self.p1y)
+        ):
+            return (Float32(0.0), Float32(0.0), Float32(0.0))
+        if self.kind >= 1 and not (isfinite(self.c1x) and isfinite(self.c1y)):
+            return (Float32(0.0), Float32(0.0), Float32(0.0))
+        if self.kind == 2 and not (isfinite(self.c2x) and isfinite(self.c2y)):
+            return (Float32(0.0), Float32(0.0), Float32(0.0))
+
+        var px64 = Float64(px)
+        var py64 = Float64(py)
+        var p0x = Float64(self.p0x)
+        var p0y = Float64(self.p0y)
+        var p1x = Float64(self.p1x)
+        var p1y = Float64(self.p1y)
+        var max_f32 = Float64(3.4e38)
+
         if self.kind == 0:
-            var abx = self.p1x - self.p0x
-            var aby = self.p1y - self.p0y
-            var apx = px - self.p0x
-            var apy = py - self.p0y
+            var abx = p1x - p0x
+            var aby = p1y - p0y
+            var apx = px64 - p0x
+            var apy = py64 - p0y
             var ab_len2 = abx * abx + aby * aby
-            if ab_len2 < Float32(1.0e-12):
+            if not isfinite(ab_len2) or ab_len2 < 1.0e-12:
                 var d0 = sqrt(apx * apx + apy * apy)
-                return (-d0, Float32(0.0), Float32(0.0))
+                var sd0 = -d0 if isfinite(d0) else 0.0
+                return (Float32(max(-max_f32, min(max_f32, sd0))), Float32(0.0), Float32(0.0))
             var t_raw = (apx * abx + apy * aby) / ab_len2
-            var t = max(Float32(0.0), min(Float32(1.0), t_raw))
-            var qx = self.p0x + abx * t
-            var qy = self.p0y + aby * t
-            var dx = px - qx
-            var dy = py - qy
+            if not isfinite(t_raw):
+                t_raw = 0.0
+            var t = max(0.0, min(1.0, t_raw))
+            var dx = apx - abx * t
+            var dy = apy - aby * t
             var dist = sqrt(dx * dx + dy * dy)
             var cross_s = abx * apy - aby * apx
-            var signed_d = dist if cross_s >= Float32(0.0) else -dist
+            var signed_d = dist if cross_s >= 0.0 else -dist
             var ab_len = sqrt(ab_len2)
-            var ortho = Float32(1.0)
-            if dist > Float32(1.0e-6):
+            var ortho = 1.0
+            if dist > 1.0e-6 and ab_len > 1.0e-6:
                 ortho = abs((abx / ab_len) * (dy / dist) - (aby / ab_len) * (dx / dist))
-            return (signed_d, ortho, t_raw)
+            if not (isfinite(signed_d) and isfinite(ortho) and isfinite(t_raw)):
+                return (Float32(0.0), Float32(0.0), Float32(0.0))
+            return (
+                Float32(max(-max_f32, min(max_f32, signed_d))),
+                Float32(max(0.0, min(1.0, ortho))),
+                Float32(max(-max_f32, min(max_f32, t_raw))),
+            )
 
         if self.kind == 1:
-            var qax = self.p0x - px
-            var qay = self.p0y - py
-            var qbx = self.c1x - self.p0x
-            var qby = self.c1y - self.p0y
-            var qcx = self.p0x - Float32(2.0) * self.c1x + self.p1x
-            var qcy = self.p0y - Float32(2.0) * self.c1y + self.p1y
+            var c1x = Float64(self.c1x)
+            var c1y = Float64(self.c1y)
+            var qax = p0x - px64
+            var qay = p0y - py64
+            var qbx = c1x - p0x
+            var qby = c1y - p0y
+            var qcx = p0x - 2.0 * c1x + p1x
+            var qcy = p0y - 2.0 * c1y + p1y
             var a_coef = qcx * qcx + qcy * qcy
-            var b_coef = Float32(3.0) * (qbx * qcx + qby * qcy)
-            var c_coef = Float32(2.0) * (qbx * qbx + qby * qby) + (qax * qcx + qay * qcy)
+            var b_coef = 3.0 * (qbx * qcx + qby * qcy)
+            var c_coef = 2.0 * (qbx * qbx + qby * qby) + (qax * qcx + qay * qcy)
             var d_coef = qax * qbx + qay * qby
-            var roots = _solve_cubic_real(a_coef, b_coef, c_coef, d_coef)
-            var best_d2 = (self.p0x - px) * (self.p0x - px) + (self.p0y - py) * (self.p0y - py)
-            var best_t: Float32 = 0.0
-            var end_d2 = (self.p1x - px) * (self.p1x - px) + (self.p1y - py) * (self.p1y - py)
+            var roots = _solve_cubic_real64(a_coef, b_coef, c_coef, d_coef)
+            var best_d2 = qax * qax + qay * qay
+            var best_t = 0.0
+            var e1x = p1x - px64
+            var e1y = p1y - py64
+            var end_d2 = e1x * e1x + e1y * e1y
             if end_d2 < best_d2:
                 best_d2 = end_d2
                 best_t = 1.0
             for rt in roots:
-                if rt > Float32(0.0) and rt < Float32(1.0):
-                    var pt = self.point(rt)
-                    var dd = (pt[0] - px) * (pt[0] - px) + (pt[1] - py) * (pt[1] - py)
+                if rt > 0.0 and rt < 1.0:
+                    var u = 1.0 - rt
+                    var ptx = u * u * p0x + 2.0 * u * rt * c1x + rt * rt * p1x
+                    var pty = u * u * p0y + 2.0 * u * rt * c1y + rt * rt * p1y
+                    var ddx = ptx - px64
+                    var ddy = pty - py64
+                    var dd = ddx * ddx + ddy * ddy
                     if dd < best_d2:
                         best_d2 = dd
                         best_t = rt
-            var best_pt = self.point(best_t)
-            var dir_v = self.direction(best_t)
-            var dir_len = sqrt(dir_v[0] * dir_v[0] + dir_v[1] * dir_v[1])
-            var vx = px - best_pt[0]
-            var vy = py - best_pt[1]
+            var bu = 1.0 - best_t
+            var best_ptx = bu * bu * p0x + 2.0 * bu * best_t * c1x + best_t * best_t * p1x
+            var best_pty = bu * bu * p0y + 2.0 * bu * best_t * c1y + best_t * best_t * p1y
+            var dir_x = 2.0 * bu * (c1x - p0x) + 2.0 * best_t * (p1x - c1x)
+            var dir_y = 2.0 * bu * (c1y - p0y) + 2.0 * best_t * (p1y - c1y)
+            if dir_x * dir_x + dir_y * dir_y < 1.0e-10:
+                dir_x = p1x - p0x
+                dir_y = p1y - p0y
+            var dir_len = sqrt(dir_x * dir_x + dir_y * dir_y)
+            var vx = px64 - best_ptx
+            var vy = py64 - best_pty
             var dist = sqrt(best_d2)
-            var cross_s = dir_v[0] * vy - dir_v[1] * vx
-            var signed_d = dist if cross_s >= Float32(0.0) else -dist
-            var ortho = Float32(1.0)
-            if dist > Float32(1.0e-6) and dir_len > Float32(1.0e-6):
-                ortho = abs((dir_v[0] / dir_len) * (vy / dist) - (dir_v[1] / dir_len) * (vx / dist))
+            var cross_s = dir_x * vy - dir_y * vx
+            var signed_d = dist if cross_s >= 0.0 else -dist
+            var ortho = 1.0
+            if dist > 1.0e-6 and dir_len > 1.0e-6:
+                ortho = abs((dir_x / dir_len) * (vy / dist) - (dir_y / dir_len) * (vx / dist))
             var t_raw = best_t
-            if best_t == Float32(0.0) and dir_len > Float32(1.0e-6):
-                var d0 = self.direction(0.0)
-                var dl0 = d0[0] * d0[0] + d0[1] * d0[1]
-                if dl0 > Float32(1.0e-10) and ((px - self.p0x) * d0[0] + (py - self.p0y) * d0[1]) < Float32(0.0):
-                    t_raw = -Float32(0.1)
-            elif best_t == Float32(1.0) and dir_len > Float32(1.0e-6):
-                var d1 = self.direction(1.0)
-                var dl1 = d1[0] * d1[0] + d1[1] * d1[1]
-                if dl1 > Float32(1.0e-10) and ((px - self.p1x) * d1[0] + (py - self.p1y) * d1[1]) > Float32(0.0):
-                    t_raw = Float32(1.1)
-            return (signed_d, ortho, t_raw)
+            if best_t == 0.0 and dir_len > 1.0e-6:
+                var d0x = 2.0 * (c1x - p0x)
+                var d0y = 2.0 * (c1y - p0y)
+                if d0x * d0x + d0y * d0y < 1.0e-10:
+                    d0x = p1x - p0x
+                    d0y = p1y - p0y
+                var dl0 = d0x * d0x + d0y * d0y
+                if dl0 > 1.0e-10 and ((px64 - p0x) * d0x + (py64 - p0y) * d0y) < 0.0:
+                    t_raw = -0.1
+            elif best_t == 1.0 and dir_len > 1.0e-6:
+                var d1x = 2.0 * (p1x - c1x)
+                var d1y = 2.0 * (p1y - c1y)
+                if d1x * d1x + d1y * d1y < 1.0e-10:
+                    d1x = p1x - p0x
+                    d1y = p1y - p0y
+                var dl1 = d1x * d1x + d1y * d1y
+                if dl1 > 1.0e-10 and ((px64 - p1x) * d1x + (py64 - p1y) * d1y) > 0.0:
+                    t_raw = 1.1
+            if not (isfinite(signed_d) and isfinite(ortho) and isfinite(t_raw)):
+                return (Float32(0.0), Float32(0.0), Float32(0.0))
+            return (
+                Float32(max(-max_f32, min(max_f32, signed_d))),
+                Float32(max(0.0, min(1.0, ortho))),
+                Float32(t_raw),
+            )
 
-        # Cubic Bezier: 5-sample coarse search + 4-step Newton-Raphson refinement
-        var best_t: Float32 = 0.0
-        var best_d2: Float32 = 1.0e30
-        for s in range(5):
-            var ts = Float32(s) * Float32(0.25)
-            var pt = self.point(ts)
-            var dd = (pt[0] - px) * (pt[0] - px) + (pt[1] - py) * (pt[1] - py)
+        # Cubic Bezier: 5-sample coarse search + 4-step Newton-Raphson refinement in Float64
+        var c1x = Float64(self.c1x)
+        var c1y = Float64(self.c1y)
+        var c2x = Float64(self.c2x)
+        var c2y = Float64(self.c2y)
+        var best_t = 0.0
+        var best_d2 = (p0x - px64) * (p0x - px64) + (p0y - py64) * (p0y - py64)
+        for s in range(1, 5):
+            var ts = Float64(s) * 0.25
+            var us = 1.0 - ts
+            var us2 = us * us
+            var ts2 = ts * ts
+            var w0 = us2 * us
+            var w1 = 3.0 * us2 * ts
+            var w2 = 3.0 * us * ts2
+            var w3 = ts2 * ts
+            var ptx = w0 * p0x + w1 * c1x + w2 * c2x + w3 * p1x
+            var pty = w0 * p0y + w1 * c1y + w2 * c2y + w3 * p1y
+            var ddx = ptx - px64
+            var ddy = pty - py64
+            var dd = ddx * ddx + ddy * ddy
             if dd < best_d2:
                 best_d2 = dd
                 best_t = ts
         var t = best_t
         for _ in range(4):
-            var pt = self.point(t)
-            var u = Float32(1.0) - t
-            var d1x = Float32(3.0) * u * u * (self.c1x - self.p0x) + Float32(6.0) * u * t * (self.c2x - self.c1x) + Float32(3.0) * t * t * (self.p1x - self.c2x)
-            var d1y = Float32(3.0) * u * u * (self.c1y - self.p0y) + Float32(6.0) * u * t * (self.c2y - self.c1y) + Float32(3.0) * t * t * (self.p1y - self.c2y)
-            var d2x = Float32(6.0) * u * (self.c2x - Float32(2.0) * self.c1x + self.p0x) + Float32(6.0) * t * (self.p1x - Float32(2.0) * self.c2x + self.c1x)
-            var d2y = Float32(6.0) * u * (self.c2y - Float32(2.0) * self.c1y + self.p0y) + Float32(6.0) * t * (self.p1y - Float32(2.0) * self.c2y + self.c1y)
-            var rx = pt[0] - px
-            var ry = pt[1] - py
+            var u = 1.0 - t
+            var u2 = u * u
+            var t2 = t * t
+            var w0 = u2 * u
+            var w1 = 3.0 * u2 * t
+            var w2 = 3.0 * u * t2
+            var w3 = t2 * t
+            var ptx = w0 * p0x + w1 * c1x + w2 * c2x + w3 * p1x
+            var pty = w0 * p0y + w1 * c1y + w2 * c2y + w3 * p1y
+            var d1x = 3.0 * u2 * (c1x - p0x) + 6.0 * u * t * (c2x - c1x) + 3.0 * t2 * (p1x - c2x)
+            var d1y = 3.0 * u2 * (c1y - p0y) + 6.0 * u * t * (c2y - c1y) + 3.0 * t2 * (p1y - c2y)
+            var d2x = 6.0 * u * (c2x - 2.0 * c1x + p0x) + 6.0 * t * (p1x - 2.0 * c2x + c1x)
+            var d2y = 6.0 * u * (c2y - 2.0 * c1y + p0y) + 6.0 * t * (p1y - 2.0 * c2y + c1y)
+            var rx = ptx - px64
+            var ry = pty - py64
             var f_val = rx * d1x + ry * d1y
             var df_val = d1x * d1x + d1y * d1y + rx * d2x + ry * d2y
-            if abs(df_val) > Float32(1.0e-8):
-                var t_next = max(Float32(0.0), min(Float32(1.0), t - f_val / df_val))
-                var pt_next = self.point(t_next)
-                var dd_next = (pt_next[0] - px) * (pt_next[0] - px) + (pt_next[1] - py) * (pt_next[1] - py)
+            if abs(df_val) > 1.0e-12:
+                var t_next = max(0.0, min(1.0, t - f_val / df_val))
+                var un = 1.0 - t_next
+                var un2 = un * un
+                var tn2 = t_next * t_next
+                var pnx = un2 * un * p0x + 3.0 * un2 * t_next * c1x + 3.0 * un * tn2 * c2x + tn2 * t_next * p1x
+                var pny = un2 * un * p0y + 3.0 * un2 * t_next * c1y + 3.0 * un * tn2 * c2y + tn2 * t_next * p1y
+                var dd_next = (pnx - px64) * (pnx - px64) + (pny - py64) * (pny - py64)
                 if dd_next <= best_d2:
                     t = t_next
                     best_d2 = dd_next
-        var p0_d2 = (self.p0x - px) * (self.p0x - px) + (self.p0y - py) * (self.p0y - py)
+        var p0_d2 = (p0x - px64) * (p0x - px64) + (p0y - py64) * (p0y - py64)
         if p0_d2 < best_d2:
             best_d2 = p0_d2
             t = 0.0
-        var p1_d2 = (self.p1x - px) * (self.p1x - px) + (self.p1y - py) * (self.p1y - py)
+        var p1_d2 = (p1x - px64) * (p1x - px64) + (p1y - py64) * (p1y - py64)
         if p1_d2 < best_d2:
             best_d2 = p1_d2
             t = 1.0
-        var best_pt = self.point(t)
-        var dir_v = self.direction(t)
-        var dir_len = sqrt(dir_v[0] * dir_v[0] + dir_v[1] * dir_v[1])
-        var vx = px - best_pt[0]
-        var vy = py - best_pt[1]
+        var bu = 1.0 - t
+        var bu2 = bu * bu
+        var bt2 = t * t
+        var best_ptx = bu2 * bu * p0x + 3.0 * bu2 * t * c1x + 3.0 * bu * bt2 * c2x + bt2 * t * p1x
+        var best_pty = bu2 * bu * p0y + 3.0 * bu2 * t * c1y + 3.0 * bu * bt2 * c2y + bt2 * t * p1y
+        var dir_x = 3.0 * bu2 * (c1x - p0x) + 6.0 * bu * t * (c2x - c1x) + 3.0 * bt2 * (p1x - c2x)
+        var dir_y = 3.0 * bu2 * (c1y - p0y) + 6.0 * bu * t * (c2y - c1y) + 3.0 * bt2 * (p1y - c2y)
+        if dir_x * dir_x + dir_y * dir_y < 1.0e-10:
+            if t < 0.5:
+                dir_x = c2x - p0x
+                dir_y = c2y - p0y
+            else:
+                dir_x = p1x - c1x
+                dir_y = p1y - c1y
+            if dir_x * dir_x + dir_y * dir_y < 1.0e-10:
+                dir_x = p1x - p0x
+                dir_y = p1y - p0y
+        var dir_len = sqrt(dir_x * dir_x + dir_y * dir_y)
+        var vx = px64 - best_ptx
+        var vy = py64 - best_pty
         var dist = sqrt(best_d2)
-        var cross_s = dir_v[0] * vy - dir_v[1] * vx
-        var signed_d = dist if cross_s >= Float32(0.0) else -dist
-        var ortho = Float32(1.0)
-        if dist > Float32(1.0e-6) and dir_len > Float32(1.0e-6):
-            ortho = abs((dir_v[0] / dir_len) * (vy / dist) - (dir_v[1] / dir_len) * (vx / dist))
+        var cross_s = dir_x * vy - dir_y * vx
+        var signed_d = dist if cross_s >= 0.0 else -dist
+        var ortho = 1.0
+        if dist > 1.0e-6 and dir_len > 1.0e-6:
+            ortho = abs((dir_x / dir_len) * (vy / dist) - (dir_y / dir_len) * (vx / dist))
         var t_raw = t
-        if t == Float32(0.0):
-            var d0 = self.direction(0.0)
-            if (px - self.p0x) * d0[0] + (py - self.p0y) * d0[1] < Float32(0.0):
-                t_raw = -Float32(0.1)
-        elif t == Float32(1.0):
-            var d1 = self.direction(1.0)
-            if (px - self.p1x) * d1[0] + (py - self.p1y) * d1[1] > Float32(0.0):
-                t_raw = Float32(1.1)
-        return (signed_d, ortho, t_raw)
+        if t == 0.0:
+            var d0x = 3.0 * (c1x - p0x)
+            var d0y = 3.0 * (c1y - p0y)
+            if d0x * d0x + d0y * d0y < 1.0e-10:
+                d0x = c2x - p0x
+                d0y = c2y - p0y
+                if d0x * d0x + d0y * d0y < 1.0e-10:
+                    d0x = p1x - p0x
+                    d0y = p1y - p0y
+            if (px64 - p0x) * d0x + (py64 - p0y) * d0y < 0.0:
+                t_raw = -0.1
+        elif t == 1.0:
+            var d1x = 3.0 * (p1x - c2x)
+            var d1y = 3.0 * (p1y - c2y)
+            if d1x * d1x + d1y * d1y < 1.0e-10:
+                d1x = p1x - c1x
+                d1y = p1y - c1y
+                if d1x * d1x + d1y * d1y < 1.0e-10:
+                    d1x = p1x - p0x
+                    d1y = p1y - p0y
+            if (px64 - p1x) * d1x + (py64 - p1y) * d1y > 0.0:
+                t_raw = 1.1
+        if not (isfinite(signed_d) and isfinite(ortho) and isfinite(t_raw)):
+            return (Float32(0.0), Float32(0.0), Float32(0.0))
+        return (
+            Float32(max(-max_f32, min(max_f32, signed_d))),
+            Float32(max(0.0, min(1.0, ortho))),
+            Float32(t_raw),
+        )
 
     def to_pseudo_distance(self, px: Float32, py: Float32, d: Float32, t_raw: Float32) -> Float32:
+        if not (isfinite(px) and isfinite(py) and isfinite(d) and isfinite(t_raw)):
+            return d
+        var px64 = Float64(px)
+        var py64 = Float64(py)
+        var d64 = Float64(d)
         if t_raw < Float32(0.0):
             var dir_v = self.direction(0.0)
-            var dlen = sqrt(dir_v[0] * dir_v[0] + dir_v[1] * dir_v[1])
-            if dlen > Float32(1.0e-6):
-                var nx = dir_v[0] / dlen
-                var ny = dir_v[1] / dlen
-                var aqx = px - self.p0x
-                var aqy = py - self.p0y
+            var dx = Float64(dir_v[0])
+            var dy = Float64(dir_v[1])
+            var dlen = sqrt(dx * dx + dy * dy)
+            if isfinite(dlen) and dlen > 1.0e-6:
+                var nx = dx / dlen
+                var ny = dy / dlen
+                var aqx = px64 - Float64(self.p0x)
+                var aqy = py64 - Float64(self.p0y)
                 var ts = aqx * nx + aqy * ny
-                if ts < Float32(0.0):
+                if ts < 0.0:
                     var pd = nx * aqy - ny * aqx
-                    if abs(pd) <= abs(d):
-                        return pd
+                    if isfinite(pd) and abs(pd) <= abs(d64):
+                        return Float32(pd)
         elif t_raw > Float32(1.0):
             var dir_v = self.direction(1.0)
-            var dlen = sqrt(dir_v[0] * dir_v[0] + dir_v[1] * dir_v[1])
-            if dlen > Float32(1.0e-6):
-                var nx = dir_v[0] / dlen
-                var ny = dir_v[1] / dlen
-                var bqx = px - self.p1x
-                var bqy = py - self.p1y
+            var dx = Float64(dir_v[0])
+            var dy = Float64(dir_v[1])
+            var dlen = sqrt(dx * dx + dy * dy)
+            if isfinite(dlen) and dlen > 1.0e-6:
+                var nx = dx / dlen
+                var ny = dy / dlen
+                var bqx = px64 - Float64(self.p1x)
+                var bqy = py64 - Float64(self.p1y)
                 var ts = bqx * nx + bqy * ny
-                if ts > Float32(0.0):
+                if ts > 0.0:
                     var pd = nx * bqy - ny * bqx
-                    if abs(pd) <= abs(d):
-                        return pd
+                    if isfinite(pd) and abs(pd) <= abs(d64):
+                        return Float32(pd)
         return d
 
 
@@ -662,6 +893,8 @@ def extract_edge_contours(outline: GlyphOutline, scale: Float32) -> List[EdgeCon
     """Extracts exact Line/Quad/Cubic EdgeContours in y-down bake pixels and
     normalizes winding so TTF (CW y-up) and CFF (CCW y-up) share positive interior sign."""
     var contours = List[EdgeContour]()
+    if not isfinite(scale) or scale <= Float32(0.0):
+        return contours^
     var n_pts = min(len(outline.xs), min(len(outline.ys), len(outline.on)))
     var start = 0
     for c_idx in range(len(outline.ends)):
@@ -677,10 +910,19 @@ def extract_edge_contours(outline: GlyphOutline, scale: Float32) -> List[EdgeCon
         var xs = List[Float32]()
         var ys = List[Float32]()
         var on = List[Bool]()
+        var contour_ok = True
         for p in range(start, end + 1):
-            xs.append(outline.xs[p] * scale)
-            ys.append(-outline.ys[p] * scale)
+            var sx = outline.xs[p] * scale
+            var sy = -outline.ys[p] * scale
+            if not (isfinite(sx) and isfinite(sy)):
+                contour_ok = False
+                break
+            xs.append(sx)
+            ys.append(sy)
             on.append(outline.on[p])
+        if not contour_ok:
+            start = end + 1
+            continue
         var ec = EdgeContour()
         if outline.is_cubic:
             var first = -1
@@ -1070,22 +1312,28 @@ def _bake_glyph_msdf_internal(
     baked.code = code
     baked.glyph = glyph_id
     baked.channels = channels
-    if bake_px <= 0 or spread < 0 or metric_scale <= Float32(0.0):
+    if bake_px <= 0 or spread < 0 or not isfinite(metric_scale) or metric_scale <= Float32(0.0):
         return baked^
     var scale = (Float32(bake_px) / Float32(max(1, font.units_per_em))) * metric_scale
+    if not isfinite(scale) or scale <= Float32(0.0):
+        return baked^
     if code != 0 and invisible(code):
         return baked^
     var outline = font.outline(baked.glyph)
-    baked.advance = outline.advance * scale
+    baked.advance = (outline.advance * scale) if isfinite(outline.advance) else Float32(0.0)
     if outline.point_count() == 0 or len(outline.ends) == 0:
         return baked^
+    for p_i in range(outline.point_count()):
+        if not (isfinite(outline.xs[p_i]) and isfinite(outline.ys[p_i])):
+            return baked^
     var box = outline.bounds()
     var fx0 = box[0] * scale
     var fy0 = -box[3] * scale
     var fx1 = box[2] * scale
     var fy1 = -box[1] * scale
     if not (
-        abs(fx0) <= Float32(1.0e6)
+        isfinite(fx0) and isfinite(fy0) and isfinite(fx1) and isfinite(fy1)
+        and abs(fx0) <= Float32(1.0e6)
         and abs(fy0) <= Float32(1.0e6)
         and abs(fx1) <= Float32(1.0e6)
         and abs(fy1) <= Float32(1.0e6)
@@ -1161,12 +1409,16 @@ def _bake_glyph_msdf_internal(
             var pb = best_be.to_pseudo_distance(px, py, best_bd, best_bt) if best_bo >= Float32(0.0) else Float32(-1.0e6)
 
             var out_idx = (j * baked.w + i) * channels
-            baked.pixels[out_idx] = UInt8(max(0, min(255, Int(floor(Float32(128.0) + pr * to_units + Float32(0.5))))))
-            baked.pixels[out_idx + 1] = UInt8(max(0, min(255, Int(floor(Float32(128.0) + pg * to_units + Float32(0.5))))))
-            baked.pixels[out_idx + 2] = UInt8(max(0, min(255, Int(floor(Float32(128.0) + pb * to_units + Float32(0.5))))))
+            var vr = (Float32(128.0) + pr * to_units + Float32(0.5)) if isfinite(pr) else Float32(0.0)
+            var vg = (Float32(128.0) + pg * to_units + Float32(0.5)) if isfinite(pg) else Float32(0.0)
+            var vb = (Float32(128.0) + pb * to_units + Float32(0.5)) if isfinite(pb) else Float32(0.0)
+            baked.pixels[out_idx] = UInt8(Int(max(Float32(0.0), min(Float32(255.0), vr))))
+            baked.pixels[out_idx + 1] = UInt8(Int(max(Float32(0.0), min(Float32(255.0), vg))))
+            baked.pixels[out_idx + 2] = UInt8(Int(max(Float32(0.0), min(Float32(255.0), vb))))
             if channels == 4:
                 var td = signed_distance(segments, px, py) if segments.count() > 0 else msdf_median(pr, pg, pb)
-                baked.pixels[out_idx + 3] = UInt8(max(0, min(255, Int(floor(Float32(128.0) + td * to_units + Float32(0.5))))))
+                var va = (Float32(128.0) + td * to_units + Float32(0.5)) if isfinite(td) else Float32(0.0)
+                baked.pixels[out_idx + 3] = UInt8(Int(max(Float32(0.0), min(Float32(255.0), va))))
 
     _msdf_error_correct_impl(baked.pixels, baked.w, baked.h, channels, Float32(spread), segments, Float32(gx0), Float32(gy0), True)
     return baked^
@@ -1189,22 +1441,28 @@ def bake_glyph_id(
     baked.code = code
     baked.glyph = glyph_id
     baked.channels = 1
-    if bake_px <= 0 or spread < 0 or metric_scale <= Float32(0.0):
+    if bake_px <= 0 or spread < 0 or not isfinite(metric_scale) or metric_scale <= Float32(0.0):
         return baked^
     var scale = (Float32(bake_px) / Float32(max(1, font.units_per_em))) * metric_scale
+    if not isfinite(scale) or scale <= Float32(0.0):
+        return baked^
     if code != 0 and invisible(code):
         return baked^
     var outline = font.outline(baked.glyph)
-    baked.advance = outline.advance * scale
+    baked.advance = (outline.advance * scale) if isfinite(outline.advance) else Float32(0.0)
     if outline.point_count() == 0 or len(outline.ends) == 0:
         return baked^
+    for p_i in range(outline.point_count()):
+        if not (isfinite(outline.xs[p_i]) and isfinite(outline.ys[p_i])):
+            return baked^
     var box = outline.bounds()
     var fx0 = box[0] * scale
     var fy0 = -box[3] * scale
     var fx1 = box[2] * scale
     var fy1 = -box[1] * scale
     if not (
-        abs(fx0) <= Float32(1.0e6)
+        isfinite(fx0) and isfinite(fy0) and isfinite(fx1) and isfinite(fy1)
+        and abs(fx0) <= Float32(1.0e6)
         and abs(fy0) <= Float32(1.0e6)
         and abs(fx1) <= Float32(1.0e6)
         and abs(fy1) <= Float32(1.0e6)
@@ -1239,8 +1497,8 @@ def bake_glyph_id(
         for i in range(baked.w):
             var px = Float32(gx0 + i) + 0.5
             var d = signed_distance(segments, px, py)
-            var value = 128.0 + d * to_units
-            baked.pixels[j * baked.w + i] = UInt8(max(0, min(255, Int(floor(value + 0.5)))))
+            var value = (Float32(128.0) + d * to_units + Float32(0.5)) if isfinite(d) else Float32(0.0)
+            baked.pixels[j * baked.w + i] = UInt8(Int(max(Float32(0.0), min(Float32(255.0), value))))
     return baked^
 
 
@@ -1301,11 +1559,11 @@ struct ShelfPacker(Copyable, Movable):
     var shelf: Int
 
     def __init__(out self, width: Int, height: Int, top: Int = 0):
-        self.width = width
-        self.height = height
-        self.top = top
+        self.width = max(0, width)
+        self.height = max(0, height)
+        self.top = max(0, min(self.height, top))
         self.x = 0
-        self.y = top
+        self.y = self.top
         self.shelf = 0
 
     def reset(mut self):
@@ -1315,7 +1573,7 @@ struct ShelfPacker(Copyable, Movable):
 
     def place(mut self, w: Int, h: Int) -> Tuple[Int, Int]:
         """Top-left of a w x h cell, or (-1, -1) when the area is full."""
-        if w > self.width:
+        if w <= 0 or h <= 0 or w > self.width or h > self.height:
             return (-1, -1)
         if self.x + w > self.width:
             self.x = 0
@@ -1367,9 +1625,11 @@ def bake_font(font: TrueTypeFont, codes: List[Int], bake_px: Int, spread: Int, a
     the kerning pairs between them of a quarter pixel or more."""
     var ch = 4 if channels >= 4 else (3 if channels >= 3 else 1)
     var baked = BakedFont()
-    baked.bake_px = bake_px
-    baked.spread = spread
+    baked.bake_px = max(0, bake_px)
+    baked.spread = max(0, spread)
     baked.channels = ch
+    if atlas_width <= 0 or atlas_width > 16384 or bake_px <= 0 or spread < 0:
+        return baked^
     var scale = Float32(bake_px) / Float32(max(1, font.units_per_em))
     baked.ascent = ceil(Float32(font.ascender) * scale)
     baked.descent = ceil(Float32(-font.descender) * scale)
@@ -1403,11 +1663,18 @@ def bake_font(font: TrueTypeFont, codes: List[Int], bake_px: Int, spread: Int, a
         baked.glyphs[index].x = spot[0]
         baked.glyphs[index].y = spot[1]
     var height = 64
-    while height < packer.used_height():
+    var used_h = max(0, min(16384, packer.used_height()))
+    while height < used_h and height < 16384:
         height *= 2
+    if height <= 0 or height > 16384:
+        return BakedFont()
+    var max_bytes = 256 * 1024 * 1024
+    if atlas_width > max_bytes // (height * ch):
+        return BakedFont()
+    var total_bytes = atlas_width * height * ch
     baked.atlas_width = atlas_width
     baked.atlas_height = height
-    baked.atlas = List[UInt8](length=atlas_width * height * ch, fill=0)
+    baked.atlas = List[UInt8](length=total_bytes, fill=0)
     for glyph in baked.glyphs:
         var g_ch = max(1, glyph.channels)
         for j in range(glyph.h):
@@ -1442,7 +1709,16 @@ def put_i32(mut out: List[UInt8], value: Int):
 
 
 def fixed64(value: Float32) -> Int:
-    return Int(floor(value * 64.0 + 0.5))
+    if not isfinite(value):
+        return 0
+    var scaled = floor(Float64(value) * 64.0 + 0.5)
+    if not isfinite(scaled):
+        return 0
+    if scaled >= 2147483647.0:
+        return 2147483647
+    if scaled <= -2147483648.0:
+        return -2147483648
+    return Int(scaled)
 
 
 def dsf_bytes(baked: BakedFont) -> List[UInt8]:

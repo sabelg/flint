@@ -13,6 +13,7 @@ each side; 0 by default, up to 10% for televisions that crop the edge). A
 player, so a second player's HUD (decision 3, package 3.16) is the same
 code with another frame.
 """
+from std.math import isfinite, max, min
 
 comptime DESIGN_WIDTH: Int = 1280
 comptime DESIGN_HEIGHT: Int = 720
@@ -144,18 +145,22 @@ def ui_frame(width: Int, height: Int, ui_x: Int, ui_y: Int, scale: Float32, safe
     """The frame of a screen (or of one player's viewport inside it) whose
     design area starts at pixel (ui_x, ui_y)."""
     var frame = UiFrame()
-    var vw = width if viewport_w < 0 else viewport_w
-    var vh = height if viewport_h < 0 else viewport_h
-    frame.scale = scale
+    var safe_scale = scale if (isfinite(scale) and scale > Float32(1.0e-5)) else Float32(1.0)
+    var vw = max(0, width if viewport_w < 0 else viewport_w)
+    var vh = max(0, height if viewport_h < 0 else viewport_h)
+    frame.scale = safe_scale
     frame.player = player
     # Pixels to canvas units, rounded inward so nothing lands off screen.
-    frame.left = canvas_ceil(Float32(viewport_x - ui_x) / scale)
-    frame.top = canvas_ceil(Float32(viewport_y - ui_y) / scale)
-    frame.right = canvas_floor(Float32(viewport_x + vw - ui_x) / scale)
-    frame.bottom = canvas_floor(Float32(viewport_y + vh - ui_y) / scale)
-    var margin = max(Float32(0), min(MAX_SAFE_MARGIN, safe_margin))
-    var mx = Int(Float32(frame.width()) * margin + 0.5)
-    var my = Int(Float32(frame.height()) * margin + 0.5)
+    frame.left = canvas_ceil(Float32(Float64(viewport_x - ui_x) / Float64(safe_scale)))
+    frame.top = canvas_ceil(Float32(Float64(viewport_y - ui_y) / Float64(safe_scale)))
+    frame.right = canvas_floor(Float32(Float64(viewport_x + vw - ui_x) / Float64(safe_scale)))
+    frame.bottom = canvas_floor(Float32(Float64(viewport_y + vh - ui_y) / Float64(safe_scale)))
+    var clean_margin = safe_margin if isfinite(safe_margin) else Float32(0.0)
+    var margin = max(Float32(0), min(MAX_SAFE_MARGIN, clean_margin))
+    var fw_f = Float64(max(0, frame.width())) * Float64(margin) + 0.5
+    var fh_f = Float64(max(0, frame.height())) * Float64(margin) + 0.5
+    var mx = Int(min(1.0e9, fw_f)) if isfinite(fw_f) else 0
+    var my = Int(min(1.0e9, fh_f)) if isfinite(fh_f) else 0
     frame.safe_left = frame.left + mx
     frame.safe_top = frame.top + my
     frame.safe_right = frame.right - mx
@@ -164,14 +169,20 @@ def ui_frame(width: Int, height: Int, ui_x: Int, ui_y: Int, scale: Float32, safe
 
 
 def canvas_floor(value: Float32) -> Int:
-    var whole = Int(value)
-    if Float32(whole) > value:
+    if not isfinite(value):
+        return 0
+    var v = max(Float32(-1.0e9), min(Float32(1.0e9), value))
+    var whole = Int(v)
+    if Float32(whole) > v:
         whole -= 1
     return whole
 
 
 def canvas_ceil(value: Float32) -> Int:
-    var whole = Int(value)
-    if Float32(whole) < value:
+    if not isfinite(value):
+        return 0
+    var v = max(Float32(-1.0e9), min(Float32(1.0e9), value))
+    var whole = Int(v)
+    if Float32(whole) < v:
         whole += 1
     return whole

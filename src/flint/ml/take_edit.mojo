@@ -49,6 +49,13 @@ def edit_take(
     """
     if first < 0 or last >= clip.num_frames() or first >= last:
         raise Error("Select at least two frames inside the take")
+    var nj = clip.skeleton.num_joints()
+    if nj <= 0:
+        raise Error("Take skeleton has no joints")
+    for f in range(first, last + 1):
+        var flen = len(clip.frames[f])
+        if flen == 0 or flen != nj:
+            raise Error("Incomplete pose frame in edit_take")
     var result = MbClip()
     result.skeleton = clip.skeleton.copy()
     result.sample_rate = clip.sample_rate
@@ -86,10 +93,19 @@ def _squared(v: MbVec3) -> Float32:
 def find_cycle(clip: MbClip, first: Int, last: Int) raises -> Tuple[Int, Int]:
     """Find matching poses and velocities 0.5–2 seconds apart. Omit the repeated endpoint.
     """
-    var min_gap = max(2, Int(clip.sample_rate * 0.5 + 0.5))
-    var max_gap = min(last - first, max(min_gap, Int(clip.sample_rate * 2)))
-    if first < 0 or last >= clip.num_frames() or last - first < min_gap:
+    if not isfinite(clip.sample_rate) or clip.sample_rate <= 0:
+        raise Error("Invalid take sample rate")
+    if first < 0 or last >= clip.num_frames() or first >= last:
         raise Error("Loop search needs at least half a second of motion")
+    var sr = Float64(clip.sample_rate)
+    var min_gap_f = sr * 0.5 + 0.5
+    if min_gap_f > Float64(last - first):
+        raise Error("Loop search needs at least half a second of motion")
+    var min_gap = max(2, Int(min_gap_f))
+    if last - first < min_gap:
+        raise Error("Loop search needs at least half a second of motion")
+    var max_gap_f = sr * 2.0
+    var max_gap = last - first if max_gap_f >= Float64(last - first) else min(last - first, max(min_gap, Int(max_gap_f)))
     var joints = List[Int]()
     var names: List[String] = [
         "Hips",
@@ -101,18 +117,26 @@ def find_cycle(clip: MbClip, first: Int, last: Int) raises -> Tuple[Int, Int]:
         "LeftShin",
         "RightShin",
     ]
+    var max_joint = 0
     for name in names:
         var j = clip.skeleton.joint_index(name)
         if j < 0:
             raise Error("Loop search needs " + name)
+        if j > max_joint:
+            max_joint = j
         joints.append(j)
     # Remove planar travel for the pose comparison. Keep hip height and heading.
     var features = List[List[MbVec3]]()
     var velocities = List[List[MbVec3]]()
     for f in range(first, last + 1):
+        var flen = len(clip.frames[f])
+        if flen == 0 or flen <= max_joint or len(clip.skeleton.parents) < flen:
+            raise Error("Incomplete pose frame in find_cycle")
         var world = world_pose(
             clip.skeleton, clip.frames[f], MbXform.identity()
         )
+        if len(world) == 0 or len(world) <= max_joint:
+            raise Error("Incomplete pose frame in find_cycle")
         var root = world[0].p
         var pts = List[MbVec3]()
         for j in joints:

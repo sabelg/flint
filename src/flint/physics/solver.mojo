@@ -1153,7 +1153,7 @@ def _solve_impl(
     and optional `SixDofMotorJoint`s solved inside every `h = dt / substeps` substep."""
     set_sim_float_mode()
     var result = SolveResult()
-    var substeps = max(1, settings.substeps)
+    var substeps = max(1, min(64, settings.substeps))
     var h = dt / Float32(substeps)
     var inv_h = Float32(1.0) / h
     var soft = solver_softness(settings, h)

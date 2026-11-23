@@ -13,7 +13,7 @@ OBB/Sphere/Capsule `TriggerVolume` (`TRIGGER_ENTER`, `TRIGGER_STAY`, `TRIGGER_EX
 and bit-exact `serialize` / `deserialize` snapshots for rollback & PIE.
 """
 from std.collections import List
-from std.math import sqrt, abs, min, max
+from std.math import sqrt, abs, isfinite, min, max
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import set_sim_float_mode, det_acos, PI
 from flint.core.detsort import stable_order, mix64
@@ -552,7 +552,15 @@ struct RigidBody(Copyable, Movable):
             self.awake = True
         else:
             self.is_static = False
-            var m = dynamic_mass if dynamic_mass > Float32(0.0) else (self.mass if self.mass > Float32(0.0) else Float32(1.0))
+            var m = (
+                dynamic_mass
+                if (isfinite(dynamic_mass) and dynamic_mass > Float32(0.0))
+                else (
+                    self.mass
+                    if (isfinite(self.mass) and self.mass > Float32(0.0))
+                    else Float32(1.0)
+                )
+            )
             self.mass = m
             self.inv_mass = Float32(1.0) / m
             self.local_inertia = compute_shape_inertia(self.shape, m, self.radius, self.half_height, self.half_extents)
@@ -790,8 +798,8 @@ struct XpbdChainEntry(Copyable, Movable):
         self.chain = chain^
         self.attachments = attachments^
         self.wind = List[Vec3]()
-        self.substeps = max(1, substeps)
-        self.iterations = max(1, iterations)
+        self.substeps = max(1, min(64, substeps))
+        self.iterations = max(1, min(64, iterations))
         self.filter = filter
         self.active = active
 
@@ -817,8 +825,8 @@ struct XpbdMeshEntry(Copyable, Movable):
         self.mesh = mesh^
         self.attachments = attachments^
         self.wind = List[Vec3]()
-        self.substeps = max(1, substeps)
-        self.iterations = max(1, iterations)
+        self.substeps = max(1, min(64, substeps))
+        self.iterations = max(1, min(64, iterations))
         self.filter = filter
         self.active = active
 
@@ -1111,6 +1119,30 @@ struct PhysicsWorld(Resource, Movable):
             self.islands.drop(slot)
         self.rebuild_broadphase()
 
+    @staticmethod
+    @always_inline
+    def _fin_f32(v: Float32, fallback: Float32 = 0.0) -> Float32:
+        return v if isfinite(v) else fallback
+
+    @staticmethod
+    @always_inline
+    def _fin_vec3(v: Vec3, fallback: Vec3 = Vec3()) -> Vec3:
+        return Vec3(
+            v.x if isfinite(v.x) else fallback.x,
+            v.y if isfinite(v.y) else fallback.y,
+            v.z if isfinite(v.z) else fallback.z,
+        )
+
+    @staticmethod
+    @always_inline
+    def _fin_quat(q: Quat) -> Quat:
+        if not (isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)):
+            return Quat()
+        var n = q.normalized()
+        if not (isfinite(n.x) and isfinite(n.y) and isfinite(n.z) and isfinite(n.w)):
+            return Quat()
+        return n
+
     def add_sphere(
         mut self,
         pos: Vec3,
@@ -1124,14 +1156,15 @@ struct PhysicsWorld(Resource, Movable):
         var b = RigidBody(self.next_body_id)
         self.next_body_id += 1
         b.shape = BODY_SHAPE_SPHERE
-        b.radius = max(Float32(0.01), radius)
+        var safe_r = max(Float32(0.01), radius) if isfinite(radius) else Float32(0.5)
+        b.radius = safe_r
         b.half_extents = Vec3(b.radius, b.radius, b.radius)
-        b.pos = pos
-        b.rot = rot.normalized()
-        b.friction = friction
-        b.restitution = restitution
+        b.pos = Self._fin_vec3(pos)
+        b.rot = Self._fin_quat(rot)
+        b.friction = max(Float32(0.0), Self._fin_f32(friction, Float32(0.6)))
+        b.restitution = max(Float32(0.0), min(Float32(1.0), Self._fin_f32(restitution, Float32(0.1))))
         b.filter = filter
-        if mass <= Float32(0.0):
+        if not isfinite(mass) or mass <= Float32(0.0):
             b.mass = 0.0
             b.inv_mass = 0.0
             b.local_inertia = Vec3()
@@ -1162,15 +1195,15 @@ struct PhysicsWorld(Resource, Movable):
         var b = RigidBody(self.next_body_id)
         self.next_body_id += 1
         b.shape = BODY_SHAPE_CAPSULE
-        b.radius = max(Float32(0.01), radius)
-        b.half_height = max(Float32(0.0), half_height)
+        b.radius = max(Float32(0.01), radius) if isfinite(radius) else Float32(0.5)
+        b.half_height = max(Float32(0.0), half_height) if isfinite(half_height) else Float32(0.5)
         b.half_extents = Vec3(b.radius, b.half_height + b.radius, b.radius)
-        b.pos = pos
-        b.rot = rot.normalized()
-        b.friction = friction
-        b.restitution = restitution
+        b.pos = Self._fin_vec3(pos)
+        b.rot = Self._fin_quat(rot)
+        b.friction = max(Float32(0.0), Self._fin_f32(friction, Float32(0.6)))
+        b.restitution = max(Float32(0.0), min(Float32(1.0), Self._fin_f32(restitution, Float32(0.1))))
         b.filter = filter
-        if mass <= Float32(0.0):
+        if not isfinite(mass) or mass <= Float32(0.0):
             b.mass = 0.0
             b.inv_mass = 0.0
             b.local_inertia = Vec3()
@@ -1201,17 +1234,18 @@ struct PhysicsWorld(Resource, Movable):
         self.next_body_id += 1
         b.shape = BODY_SHAPE_BOX
         b.half_extents = Vec3(
-            max(Float32(0.01), half_extents.x),
-            max(Float32(0.01), half_extents.y),
-            max(Float32(0.01), half_extents.z),
+            max(Float32(0.01), half_extents.x) if isfinite(half_extents.x) else Float32(0.5),
+            max(Float32(0.01), half_extents.y) if isfinite(half_extents.y) else Float32(0.5),
+            max(Float32(0.01), half_extents.z) if isfinite(half_extents.z) else Float32(0.5),
         )
-        b.radius = b.half_extents.length()
-        b.pos = pos
-        b.rot = rot.normalized()
-        b.friction = friction
-        b.restitution = restitution
+        var raw_rad = b.half_extents.length()
+        b.radius = raw_rad if isfinite(raw_rad) else Float32(1.0)
+        b.pos = Self._fin_vec3(pos)
+        b.rot = Self._fin_quat(rot)
+        b.friction = max(Float32(0.0), Self._fin_f32(friction, Float32(0.6)))
+        b.restitution = max(Float32(0.0), min(Float32(1.0), Self._fin_f32(restitution, Float32(0.1))))
         b.filter = filter
-        if mass <= Float32(0.0):
+        if not isfinite(mass) or mass <= Float32(0.0):
             b.mass = 0.0
             b.inv_mass = 0.0
             b.local_inertia = Vec3()
@@ -1246,8 +1280,8 @@ struct PhysicsWorld(Resource, Movable):
     ) -> Int:
         var slot = self.add_box(pos, half_extents, 0.0, rot, friction, restitution, filter)
         self.bodies[slot].set_motion_mode(BODY_MOTION_KINEMATIC)
-        self.bodies[slot].linear_vel = linear_vel
-        self.bodies[slot].angular_vel = angular_vel
+        self.bodies[slot].linear_vel = Self._fin_vec3(linear_vel)
+        self.bodies[slot].angular_vel = Self._fin_vec3(angular_vel)
         return slot
 
     def add_convex_hull(
@@ -1262,19 +1296,20 @@ struct PhysicsWorld(Resource, Movable):
     ) -> Int:
         var h_idx = len(self.hulls)
         self.hulls.append(hull.copy())
-        var he = _hull_half_extents(hull)
+        var he = Self._fin_vec3(_hull_half_extents(hull), Vec3(0.5, 0.5, 0.5))
         var b = RigidBody(self.next_body_id)
         self.next_body_id += 1
         b.shape = BODY_SHAPE_CONVEX_HULL
         b.shape_index = h_idx
         b.half_extents = he
-        b.radius = he.length()
-        b.pos = pos
-        b.rot = rot.normalized()
-        b.friction = friction
-        b.restitution = restitution
+        var raw_rad = he.length()
+        b.radius = raw_rad if isfinite(raw_rad) else Float32(1.0)
+        b.pos = Self._fin_vec3(pos)
+        b.rot = Self._fin_quat(rot)
+        b.friction = max(Float32(0.0), Self._fin_f32(friction, Float32(0.6)))
+        b.restitution = max(Float32(0.0), min(Float32(1.0), Self._fin_f32(restitution, Float32(0.1))))
         b.filter = filter
-        if mass <= Float32(0.0):
+        if not isfinite(mass) or mass <= Float32(0.0):
             b.mass = 0.0
             b.inv_mass = 0.0
             b.local_inertia = Vec3()
@@ -1315,13 +1350,13 @@ struct PhysicsWorld(Resource, Movable):
         self.next_body_id += 1
         b.shape = BODY_SHAPE_MESH_BVH8
         b.shape_index = m_idx
-        b.pos = pos
-        b.rot = rot.normalized()
+        b.pos = Self._fin_vec3(pos)
+        b.rot = Self._fin_quat(rot)
         b.mass = 0.0
         b.inv_mass = 0.0
         b.local_inertia = Vec3()
-        b.friction = friction
-        b.restitution = restitution
+        b.friction = max(Float32(0.0), Self._fin_f32(friction, Float32(0.8)))
+        b.restitution = max(Float32(0.0), min(Float32(1.0), Self._fin_f32(restitution, Float32(0.0))))
         b.filter = filter
         b.is_static = True
         b.motion_mode = BODY_MOTION_STATIC
@@ -1343,13 +1378,13 @@ struct PhysicsWorld(Resource, Movable):
         self.next_body_id += 1
         b.shape = BODY_SHAPE_HEIGHTFIELD
         b.shape_index = hf_idx
-        b.pos = pos
-        b.rot = rot.normalized()
+        b.pos = Self._fin_vec3(pos)
+        b.rot = Self._fin_quat(rot)
         b.mass = 0.0
         b.inv_mass = 0.0
         b.local_inertia = Vec3()
-        b.friction = friction
-        b.restitution = restitution
+        b.friction = max(Float32(0.0), Self._fin_f32(friction, Float32(0.85)))
+        b.restitution = max(Float32(0.0), min(Float32(1.0), Self._fin_f32(restitution, Float32(0.05))))
         b.filter = filter
         b.is_static = True
         b.motion_mode = BODY_MOTION_STATIC
@@ -1369,19 +1404,20 @@ struct PhysicsWorld(Resource, Movable):
         var c_idx = len(self.compounds)
         self.compounds.append(compound.copy())
         var aabb0 = compound.tight_aabb(Vec3(), Quat())
-        var he = (aabb0[1] - aabb0[0]) * Float32(0.5)
+        var he = Self._fin_vec3((aabb0[1] - aabb0[0]) * Float32(0.5), Vec3(0.5, 0.5, 0.5))
         var b = RigidBody(self.next_body_id)
         self.next_body_id += 1
         b.shape = BODY_SHAPE_COMPOUND
         b.shape_index = c_idx
         b.half_extents = Vec3(max(Float32(0.02), he.x), max(Float32(0.02), he.y), max(Float32(0.02), he.z))
-        b.radius = b.half_extents.length()
-        b.pos = pos
-        b.rot = rot.normalized()
-        b.friction = friction
-        b.restitution = restitution
+        var raw_rad = b.half_extents.length()
+        b.radius = raw_rad if isfinite(raw_rad) else Float32(1.0)
+        b.pos = Self._fin_vec3(pos)
+        b.rot = Self._fin_quat(rot)
+        b.friction = max(Float32(0.0), Self._fin_f32(friction, Float32(0.6)))
+        b.restitution = max(Float32(0.0), min(Float32(1.0), Self._fin_f32(restitution, Float32(0.1))))
         b.filter = filter
-        if mass <= Float32(0.0):
+        if not isfinite(mass) or mass <= Float32(0.0):
             b.mass = 0.0
             b.inv_mass = 0.0
             b.local_inertia = Vec3()
@@ -1550,10 +1586,13 @@ struct PhysicsWorld(Resource, Movable):
         mut veh_dv: List[Vec3],
         mut veh_dw: List[Vec3],
     ):
+        if not isfinite(dt) or dt <= Float32(1.0e-7):
+            return
+        var safe_dt = min(dt, Float32(1.0))
         var sub_hz = Float32(240.0)
         var target_sub_dt = Float32(1.0) / sub_hz
-        var steps = max(1, Int(dt / target_sub_dt + Float32(0.5)))
-        var sub_dt = dt / Float32(steps)
+        var steps = min(2400, max(1, Int(safe_dt / target_sub_dt + Float32(0.5))))
+        var sub_dt = safe_dt / Float32(steps)
 
         for vi in range(len(self.vehicles)):
             if not self.vehicles[vi].active:
@@ -2315,8 +2354,8 @@ struct PhysicsWorld(Resource, Movable):
                 for pi in range(np):
                     eff_wind.append(self.force_world.wind_at(self.xpbd_chains[ci].chain.position[pi]))
 
-            var sub_n = max(1, self.xpbd_chains[ci].substeps)
-            var iters = self.xpbd_chains[ci].iterations
+            var sub_n = max(1, min(64, self.xpbd_chains[ci].substeps))
+            var iters = max(1, min(64, self.xpbd_chains[ci].iterations))
             var h = dt / Float32(sub_n)
             for sub in range(sub_n):
                 self.xpbd_chains[ci].chain.step_substep_coupled(
@@ -2367,8 +2406,8 @@ struct PhysicsWorld(Resource, Movable):
                 for pi in range(np):
                     eff_wind.append(self.force_world.wind_at(self.xpbd_meshes[mi].mesh.position[pi]))
 
-            var sub_n = max(1, self.xpbd_meshes[mi].substeps)
-            var iters = self.xpbd_meshes[mi].iterations
+            var sub_n = max(1, min(64, self.xpbd_meshes[mi].substeps))
+            var iters = max(1, min(64, self.xpbd_meshes[mi].iterations))
             var h = dt / Float32(sub_n)
             self.xpbd_meshes[mi].mesh.steps_run += 1
             for sub in range(sub_n):
@@ -3245,10 +3284,19 @@ struct PhysicsWorld(Resource, Movable):
     ) -> SceneCastHit:
         """O(log N) SIMD8 near-t ordered raycast across all active world colliders."""
         var best = SceneCastHit()
-        best.distance = max_dist
-        var d_len = dir.length()
-        if d_len <= Float32(1.0e-8) or max_dist <= Float32(0.0):
+        if (
+            not isfinite(max_dist)
+            or max_dist <= Float32(0.0)
+            or not (isfinite(origin.x) and isfinite(origin.y) and isfinite(origin.z))
+            or not (isfinite(dir.x) and isfinite(dir.y) and isfinite(dir.z))
+        ):
+            best.distance = Float32(0.0)
             return best^
+        var d_len = dir.length()
+        if not isfinite(d_len) or d_len <= Float32(1.0e-8):
+            best.distance = Float32(0.0)
+            return best^
+        best.distance = max_dist
         var ndir = dir * (Float32(1.0) / d_len)
 
         if len(self.broadphase_nodes) == 0:
@@ -3358,8 +3406,15 @@ struct PhysicsWorld(Resource, Movable):
     ) -> List[SceneCastHit]:
         """Returns all raycast hits along `[0, max_dist]` sorted ascending by `(distance, body_id)`."""
         var hits = List[SceneCastHit]()
+        if (
+            not isfinite(max_dist)
+            or max_dist <= Float32(0.0)
+            or not (isfinite(origin.x) and isfinite(origin.y) and isfinite(origin.z))
+            or not (isfinite(dir.x) and isfinite(dir.y) and isfinite(dir.z))
+        ):
+            return hits^
         var d_len = dir.length()
-        if d_len <= Float32(1.0e-8) or max_dist <= Float32(0.0):
+        if not isfinite(d_len) or d_len <= Float32(1.0e-8):
             return hits^
         var ndir = dir * (Float32(1.0) / d_len)
         var end = origin + ndir * max_dist
@@ -3649,6 +3704,15 @@ struct PhysicsWorld(Resource, Movable):
         ignore_body_id: Int,
     ) -> SceneCastHit:
         var best = SceneCastHit()
+        if (
+            not isfinite(inflate_r)
+            or not (isfinite(q_ext.x) and isfinite(q_ext.y) and isfinite(q_ext.z))
+            or not (isfinite(center.x) and isfinite(center.y) and isfinite(center.z))
+            or not (isfinite(delta.x) and isfinite(delta.y) and isfinite(delta.z))
+            or not (isfinite(rot.x) and isfinite(rot.y) and isfinite(rot.z) and isfinite(rot.w))
+        ):
+            best.distance = Float32(0.0)
+            return best^
         var end = center + delta
         var qlo = Vec3(min(center.x, end.x), min(center.y, end.y), min(center.z, end.z)) - q_ext
         var qhi = Vec3(max(center.x, end.x), max(center.y, end.y), max(center.z, end.z)) + q_ext
@@ -3674,6 +3738,10 @@ struct PhysicsWorld(Resource, Movable):
         filter: CollisionFilter = CollisionFilter(CAT_ALL, CAT_ALL, 0),
         ignore_body_id: Int = -1,
     ) -> SceneCastHit:
+        if not isfinite(radius):
+            var miss = SceneCastHit()
+            miss.distance = Float32(0.0)
+            return miss^
         var r = max(Float32(0.0), radius)
         return self._shapecast_hull_world(
             _make_point_hull(), r, Vec3(r, r, r), center, Quat(), delta, filter, ignore_body_id,
@@ -3689,6 +3757,10 @@ struct PhysicsWorld(Resource, Movable):
         filter: CollisionFilter = CollisionFilter(CAT_ALL, CAT_ALL, 0),
         ignore_body_id: Int = -1,
     ) -> SceneCastHit:
+        if not isfinite(radius) or not isfinite(half_height):
+            var miss = SceneCastHit()
+            miss.distance = Float32(0.0)
+            return miss^
         var r = max(Float32(0.0), radius)
         var hh = max(Float32(0.0), half_height)
         var ax = rot.rotate(Vec3(0, hh, 0))
@@ -3717,6 +3789,10 @@ struct PhysicsWorld(Resource, Movable):
         filter: CollisionFilter = CollisionFilter(CAT_ALL, CAT_ALL, 0),
         ignore_body_id: Int = -1,
     ) -> SceneCastHit:
+        if not (isfinite(half_extents.x) and isfinite(half_extents.y) and isfinite(half_extents.z)):
+            var miss = SceneCastHit()
+            miss.distance = Float32(0.0)
+            return miss^
         var axes = get_box_axes(rot)
         var wx = abs(axes[0].x) * half_extents.x + abs(axes[1].x) * half_extents.y + abs(axes[2].x) * half_extents.z
         var wy = abs(axes[0].y) * half_extents.x + abs(axes[1].y) * half_extents.y + abs(axes[2].y) * half_extents.z
@@ -3768,6 +3844,12 @@ struct PhysicsWorld(Resource, Movable):
         ignore_body_id: Int = -1,
     ) -> List[Int]:
         """Returns sorted body slots whose geometry overlaps `Sphere(center, radius)`."""
+        if (
+            not isfinite(radius)
+            or radius < Float32(0.0)
+            or not (isfinite(center.x) and isfinite(center.y) and isfinite(center.z))
+        ):
+            return List[Int]()
         var rv = Vec3(radius, radius, radius)
         var cands = List[Int]()
         self._query_bvh8_aabb_candidates(center - rv, center + rv, filter, ignore_body_id, cands)
@@ -3793,6 +3875,11 @@ struct PhysicsWorld(Resource, Movable):
     ) -> List[Int]:
         """Returns sorted body slots overlapping `[lo, hi]`."""
         var out = List[Int]()
+        if not (
+            isfinite(lo.x) and isfinite(lo.y) and isfinite(lo.z)
+            and isfinite(hi.x) and isfinite(hi.y) and isfinite(hi.z)
+        ):
+            return out^
         self._query_bvh8_aabb_candidates(lo, hi, filter, ignore_body_id, out)
         for i in range(1, len(out)):
             var key = out[i]
@@ -4515,11 +4602,14 @@ struct PhysicsWorld(Resource, Movable):
         """Executes one complete rigid-body simulation tick of duration `dt`."""
         set_sim_float_mode()
         self.events.clear()
-        if dt <= Float32(1.0e-7):
+        if not isfinite(dt) or dt <= Float32(1.0e-7):
             return
+        if not isfinite(self.gravity):
+            self.gravity = Float32(0.0)
+        var step_dt = min(dt, Float32(1.0))
 
         self._sync_motion_modes()
-        self.time_s += dt
+        self.time_s += step_dt
         self.tick += 1
         self.force_world.tick = self.tick
         self.force_world.wind.age()
@@ -4553,9 +4643,9 @@ struct PhysicsWorld(Resource, Movable):
         var veh_dv = List[Vec3](length=n_rows, fill=Vec3())
         var veh_dw = List[Vec3](length=n_rows, fill=Vec3())
         if len(self.vehicles) > 0:
-            self._step_vehicles_pre_solve(dt, is_veh, veh_dv, veh_dw)
+            self._step_vehicles_pre_solve(step_dt, is_veh, veh_dv, veh_dw)
         if len(self.aero_bodies) > 0:
-            self._step_aero_bodies_pre_solve(dt)
+            self._step_aero_bodies_pre_solve(step_dt)
         if len(self.xpbd_chains) > 0 or len(self.xpbd_meshes) > 0 or len(self.ragdolls) > 0:
             self._prepare_xpbd_and_ragdolls_pre_solve()
 
@@ -4563,7 +4653,7 @@ struct PhysicsWorld(Resource, Movable):
         var ccd_slots = List[Int]()
         var ccd_vpost = List[Vec3]()
         var ccd_rem = List[Float32]()
-        self._run_ccd_clamp(dt, ccd_slots, ccd_vpost, ccd_rem)
+        self._run_ccd_clamp(step_dt, ccd_slots, ccd_vpost, ccd_rem)
 
         # 3. Broadphase over all active bodies (retained into `self.broadphase_nodes` to avoid double rebuild)
         var bp_in = BroadphaseInput()
@@ -4581,11 +4671,11 @@ struct PhysicsWorld(Resource, Movable):
             )
             var is_moving = ((not b.is_static) and b.awake) or kin_moving
             if is_moving:
-                var move = b.linear_vel * dt
+                var move = b.linear_vel * step_dt
                 lo = Vec3(min(lo.x, lo.x + move.x), min(lo.y, lo.y + move.y), min(lo.z, lo.z + move.z))
                 hi = Vec3(max(hi.x, hi.x + move.x), max(hi.y, hi.y + move.y), max(hi.z, hi.z + move.z))
                 if b.angular_vel.length_squared() > Float32(1.0e-8):
-                    var rot_pad = b.angular_vel.length() * dt * b.radius
+                    var rot_pad = b.angular_vel.length() * step_dt * b.radius
                     var rp = Vec3(rot_pad, rot_pad, rot_pad)
                     lo = lo - rp
                     hi = hi + rp
@@ -4917,7 +5007,7 @@ struct PhysicsWorld(Resource, Movable):
                 sbodies.aay[si] = alpha_w.y
                 sbodies.aaz[si] = alpha_w.z
                 if is_veh[r]:
-                    var inv_dt = Float32(1.0) / dt
+                    var inv_dt = Float32(1.0) / step_dt
                     sbodies.ax[si] += veh_dv[r].x * inv_dt
                     sbodies.ay[si] += veh_dv[r].y * inv_dt
                     sbodies.az[si] += veh_dv[r].z * inv_dt
@@ -4935,7 +5025,7 @@ struct PhysicsWorld(Resource, Movable):
 
         # 5b. Two-way XPBD chains & cloth meshes (pre-solve so velocity impulses integrate on this tick)
         if len(self.xpbd_chains) > 0 or len(self.xpbd_meshes) > 0:
-            self._step_xpbd_post_sbodies(dt, row_to_solver, sbodies)
+            self._step_xpbd_post_sbodies(step_dt, row_to_solver, sbodies)
 
         # 6. Convert narrowphase ContactManifolds into solver Manifolds (explicit A->B to B->A normal negation!)
         var solver_manifolds = List[Manifold]()
@@ -5153,7 +5243,7 @@ struct PhysicsWorld(Resource, Movable):
                 self.joints,
                 j_rows,
                 self.settings,
-                dt,
+                step_dt,
                 pool_address,
                 self.cpus,
             )
@@ -5169,7 +5259,7 @@ struct PhysicsWorld(Resource, Movable):
                 s6_sb,
                 broken_s6,
                 self.settings,
-                dt,
+                step_dt,
                 pool_address,
                 self.cpus,
             )
@@ -5200,7 +5290,7 @@ struct PhysicsWorld(Resource, Movable):
 
         # 9b. Sync post-solve body poses & velocities back to M2a subsystems
         if len(self.vehicles) > 0 or len(self.aero_bodies) > 0 or len(self.ragdolls) > 0:
-            self._sync_m2_post_solve(dt)
+            self._sync_m2_post_solve(step_dt)
 
         # 10. Persist solved impulses to ContactCache and record PairTouch for events
         var manifold_touched = List[Bool](length=len(solver_manifolds), fill=False)
@@ -5639,7 +5729,7 @@ struct PhysicsWorld(Resource, Movable):
         self.next_joint_id = r.integer()
         self.next_trigger_id = r.integer()
 
-        self.settings.substeps = r.integer()
+        self.settings.substeps = max(1, min(64, r.integer()))
         self.settings.contact_hertz = r.f32()
         self.settings.damping_ratio = r.f32()
         self.settings.push_max_speed = r.f32()

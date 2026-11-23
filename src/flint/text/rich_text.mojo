@@ -19,6 +19,7 @@ word (the breaker sees one stream of codepoints across spans), kerning
 applies only inside a span, and a button is one unbreakable box that
 behaves like a letter.
 """
+from std.math import isfinite
 from flint.render.font import SdfFont
 from flint.text.utf8 import decode_utf8, encode_utf8
 from flint.text.line_break import TextLine, break_items
@@ -293,6 +294,34 @@ def face_font_metric(ui: SdfFont, display: SdfFont, face: Int) -> Tuple[Float32,
     return (ui.line_height, ui.cap_height, ui.bake_px)
 
 
+@always_inline
+def _safe_add_f32(a: Float32, b: Float32) -> Float32:
+    var sa = a if isfinite(a) else Float32(0.0)
+    var sb = b if isfinite(b) else Float32(0.0)
+    var s = sa + sb
+    if isfinite(s):
+        return s
+    return Float32(3.402823e38) if s > Float32(0.0) else Float32(-3.402823e38)
+
+
+def _safe_font_scale(px: Float32, bake_px: Float32) -> Float32:
+    if not isfinite(px) or not isfinite(bake_px) or bake_px <= Float32(0.0):
+        return Float32(0.0)
+    var scale = px / bake_px
+    if not isfinite(scale):
+        return Float32(0.0)
+    return scale
+
+
+def _safe_span_px(px: Float32, scale_pct: Int) -> Float32:
+    if not isfinite(px):
+        return Float32(0.0)
+    var span_px = px * Float32(scale_pct) / Float32(100.0)
+    if not isfinite(span_px):
+        return Float32(0.0)
+    return span_px
+
+
 def _visual_run_text(codes: List[Int], start: Int, end: Int, rtl: Bool) -> String:
     if not rtl:
         return encode_utf8(codes, start, end)
@@ -319,17 +348,25 @@ def layout_rich(
     for s in range(len(spans)):
         var span = spans[s]
         var face = span.face if span.face >= 0 else base_face
-        var span_px = px * Float32(span.scale) / 100.0
+        var span_px = _safe_span_px(px, span.scale)
         if span.kind == SPAN_BUTTON:
             var h = span_px * BUTTON_HEIGHT
+            if not isfinite(h):
+                h = Float32(0.0)
             var label = glyph_label(span.action, pad, sony, keys)
-            var label_width = run_width_text(ui, label, span_px * BUTTON_LABEL)
+            var label_px = span_px * BUTTON_LABEL
+            if not isfinite(label_px):
+                label_px = Float32(0.0)
+            var label_width = run_width_text(ui, label, label_px)
+            var adv = glyph_width(glyph_shape(span.action, pad), label_width, h)
+            if not isfinite(adv):
+                adv = Float32(0.0)
             codes.append(OBJECT_CODE)
             owner.append(s)
-            advance.append(glyph_width(glyph_shape(span.action, pad), label_width, h))
+            advance.append(adv)
             kern_before.append(0)
             continue
-        var font_scale = span_px / (display.bake_px if face == 1 else ui.bake_px)
+        var font_scale = _safe_font_scale(span_px, display.bake_px if face == 1 else ui.bake_px)
         var span_codes = decode_utf8(span.text)
         for i in range(len(span_codes)):
             var code = span_codes[i]
@@ -337,20 +374,26 @@ def layout_rich(
             owner.append(s)
             var a: Float32 = 0
             var k: Float32 = 0
-            if code != 0x0A:
-                a = (display.advance_of(code) if face == 1 else ui.advance_of(code)) * font_scale
+            if code != 0x0A and font_scale > Float32(0.0):
+                var raw_a = (display.advance_of(code) if face == 1 else ui.advance_of(code)) * font_scale
+                if isfinite(raw_a):
+                    a = raw_a
                 if i > 0:
-                    k = (display.kern(span_codes[i - 1], code) if face == 1 else ui.kern(span_codes[i - 1], code)) * font_scale
+                    var raw_k = (display.kern(span_codes[i - 1], code) if face == 1 else ui.kern(span_codes[i - 1], code)) * font_scale
+                    if isfinite(raw_k):
+                        k = raw_k
             advance.append(a)
             kern_before.append(k)
+    var safe_max_width = max_width if isfinite(max_width) else Float32(0.0)
     var resolved = resolve_bidi(codes, base_dir)
-    var lines = break_items(codes, advance, kern_before, max_width)
+    var lines = break_items(codes, advance, kern_before, safe_max_width)
     var layout = RichLayout()
     layout.lines = len(lines)
     layout.base_level = resolved.base_level
     for line in lines:
-        layout.width = max(layout.width, line.width)
-    var box = max_width if max_width > 0 else layout.width
+        if isfinite(line.width):
+            layout.width = max(layout.width, line.width)
+    var box = safe_max_width if safe_max_width > 0 else layout.width
     var top: Float32 = 0
     for l in range(len(lines)):
         var line = lines[l]
@@ -360,19 +403,36 @@ def layout_rich(
             var span = spans[owner[index]]
             var face = span.face if span.face >= 0 else base_face
             var metric = face_font_metric(ui, display, face)
-            var span_px = px * Float32(span.scale) / 100.0
-            line_h = max(line_h, metric[0] * span_px / metric[2])
-            cap = max(cap, metric[1] * span_px / metric[2])
+            var span_px = _safe_span_px(px, span.scale)
+            var mscale = _safe_font_scale(span_px, metric[2])
+            if isfinite(metric[0]):
+                var lh = metric[0] * mscale
+                if isfinite(lh):
+                    line_h = max(line_h, lh)
+            if isfinite(metric[1]):
+                var ch = metric[1] * mscale
+                if isfinite(ch):
+                    cap = max(cap, ch)
         if line.end == line.start or line_h == 0:
             var metric = face_font_metric(ui, display, base_face)
-            line_h = metric[0] * px / metric[2]
-            cap = metric[1] * px / metric[2]
-        var baseline = top + cap
+            var mscale = _safe_font_scale(px, metric[2])
+            if isfinite(metric[0]):
+                var lh = metric[0] * mscale
+                if isfinite(lh):
+                    line_h = lh
+            if isfinite(metric[1]):
+                var ch = metric[1] * mscale
+                if isfinite(ch):
+                    cap = ch
+        var baseline = _safe_add_f32(top, cap)
         var x: Float32 = 0
+        var line_w = line.width if isfinite(line.width) else Float32(0)
         if align == 1:
-            x = (box - line.width) * 0.5
+            x = (box - line_w) * 0.5
         elif align == 2:
-            x = box - line.width
+            x = box - line_w
+        if not isfinite(x):
+            x = Float32(0)
 
         var bidi_runs = reorder_line(resolved, line.start, line.end)
         for br in bidi_runs:
@@ -400,33 +460,36 @@ def layout_rich(
                 var s = owner[rs]
                 var span = spans[s]
                 var face = span.face if span.face >= 0 else base_face
-                var span_px = px * Float32(span.scale) / 100.0
+                var span_px = _safe_span_px(px, span.scale)
                 if span.kind == SPAN_BUTTON:
                     layout.runs.append(PlacedRun(SPAN_BUTTON, String(), x, l, baseline, advance[rs], span_px, span.color, face, span.action, br.level, rtl))
-                    x += advance[rs]
+                    x = _safe_add_f32(x, advance[rs])
                     continue
                 var vis_end = re
                 while vis_end > rs and (codes[vis_end - 1] == 0x0A or codes[vis_end - 1] == 0x0D or codes[vis_end - 1] == 0x20):
                     vis_end -= 1
                 var vis_w: Float32 = 0
                 for idx in range(rs, vis_end):
-                    vis_w += advance[idx] + (kern_before[idx] if idx > line.start and idx > rs else Float32(0))
+                    var step_w = _safe_add_f32(advance[idx], (kern_before[idx] if idx > line.start and idx > rs else Float32(0)))
+                    vis_w = _safe_add_f32(vis_w, step_w)
                 var trail_w: Float32 = 0
                 for idx in range(vis_end, re):
-                    trail_w += advance[idx] + (kern_before[idx] if idx > line.start and idx > rs else Float32(0))
+                    var step_tw = _safe_add_f32(advance[idx], (kern_before[idx] if idx > line.start and idx > rs else Float32(0)))
+                    trail_w = _safe_add_f32(trail_w, step_tw)
+                var total_seg_w = _safe_add_f32(vis_w, trail_w)
                 if rtl:
                     if re < line.end:
-                        x += trail_w
+                        x = _safe_add_f32(x, trail_w)
                     if vis_end > rs:
                         var vtxt = _visual_run_text(codes, rs, vis_end, True)
                         layout.runs.append(PlacedRun(SPAN_TEXT, vtxt, x, l, baseline, vis_w, span_px, span.color, face, ACTION_NONE, br.level, True))
-                    x += vis_w
+                    x = _safe_add_f32(x, vis_w)
                 else:
                     if vis_end > rs:
                         var vtxt = _visual_run_text(codes, rs, vis_end, False)
-                        layout.runs.append(PlacedRun(SPAN_TEXT, vtxt, x, l, baseline, vis_w + trail_w, span_px, span.color, face, ACTION_NONE, br.level, False))
-                    x += vis_w + trail_w
-        top += line_h
+                        layout.runs.append(PlacedRun(SPAN_TEXT, vtxt, x, l, baseline, total_seg_w, span_px, span.color, face, ACTION_NONE, br.level, False))
+                    x = _safe_add_f32(x, total_seg_w)
+        top = _safe_add_f32(top, line_h)
     layout.height = top
     return layout^
 
@@ -516,17 +579,25 @@ def layout_rich_shaped(
     for s in range(len(spans)):
         var span = spans[s]
         var face = span.face if span.face >= 0 else base_face
-        var span_px = px * Float32(span.scale) / 100.0
+        var span_px = _safe_span_px(px, span.scale)
         if span.kind == SPAN_BUTTON:
             var h = span_px * BUTTON_HEIGHT
+            if not isfinite(h):
+                h = Float32(0.0)
             var label = glyph_label(span.action, pad, sony, keys)
-            var label_width = run_width_text(ui, label, span_px * BUTTON_LABEL)
+            var label_px = span_px * BUTTON_LABEL
+            if not isfinite(label_px):
+                label_px = Float32(0.0)
+            var label_width = run_width_text(ui, label, label_px)
+            var adv = glyph_width(glyph_shape(span.action, pad), label_width, h)
+            if not isfinite(adv):
+                adv = Float32(0.0)
             codes.append(OBJECT_CODE)
             owner.append(s)
-            advance.append(glyph_width(glyph_shape(span.action, pad), label_width, h))
+            advance.append(adv)
             kern_before.append(0.0)
             continue
-        var font_scale = span_px / (display.bake_px if face == 1 else ui.bake_px)
+        var font_scale = _safe_font_scale(span_px, display.bake_px if face == 1 else ui.bake_px)
         var span_codes = decode_utf8(span.text)
         for i in range(len(span_codes)):
             var code = span_codes[i]
@@ -534,22 +605,28 @@ def layout_rich_shaped(
             owner.append(s)
             var a: Float32 = 0.0
             var k: Float32 = 0.0
-            if code != 0x0A and code != 0x0D:
-                a = (display.advance_of(code) if face == 1 else ui.advance_of(code)) * font_scale
+            if code != 0x0A and code != 0x0D and font_scale > Float32(0.0):
+                var raw_a = (display.advance_of(code) if face == 1 else ui.advance_of(code)) * font_scale
+                if isfinite(raw_a):
+                    a = raw_a
                 if i > 0:
-                    k = (display.kern(span_codes[i - 1], code) if face == 1 else ui.kern(span_codes[i - 1], code)) * font_scale
+                    var raw_k = (display.kern(span_codes[i - 1], code) if face == 1 else ui.kern(span_codes[i - 1], code)) * font_scale
+                    if isfinite(raw_k):
+                        k = raw_k
             advance.append(a)
             kern_before.append(k)
 
+    var safe_max_width = max_width if isfinite(max_width) else Float32(0.0)
     var resolved = resolve_bidi(codes, base_dir)
     var arabic_forms = compute_arabic_forms(codes)
-    var lines = break_items(codes, advance, kern_before, max_width)
+    var lines = break_items(codes, advance, kern_before, safe_max_width)
     var layout = RichShapedLayout()
     layout.lines = len(lines)
     layout.base_level = resolved.base_level
     for line in lines:
-        layout.width = max(layout.width, line.width)
-    var box = max_width if max_width > 0 else layout.width
+        if isfinite(line.width):
+            layout.width = max(layout.width, line.width)
+    var box = safe_max_width if safe_max_width > 0 else layout.width
     var top: Float32 = 0.0
     for l in range(len(lines)):
         var line = lines[l]
@@ -559,19 +636,36 @@ def layout_rich_shaped(
             var span = spans[owner[index]]
             var face = span.face if span.face >= 0 else base_face
             var metric = face_font_metric(ui, display, face)
-            var span_px = px * Float32(span.scale) / 100.0
-            line_h = max(line_h, metric[0] * span_px / metric[2])
-            cap = max(cap, metric[1] * span_px / metric[2])
+            var span_px = _safe_span_px(px, span.scale)
+            var mscale = _safe_font_scale(span_px, metric[2])
+            if isfinite(metric[0]):
+                var lh = metric[0] * mscale
+                if isfinite(lh):
+                    line_h = max(line_h, lh)
+            if isfinite(metric[1]):
+                var ch = metric[1] * mscale
+                if isfinite(ch):
+                    cap = max(cap, ch)
         if line.end == line.start or line_h == 0.0:
             var metric = face_font_metric(ui, display, base_face)
-            line_h = metric[0] * px / metric[2]
-            cap = metric[1] * px / metric[2]
-        var baseline = top + cap
+            var mscale = _safe_font_scale(px, metric[2])
+            if isfinite(metric[0]):
+                var lh = metric[0] * mscale
+                if isfinite(lh):
+                    line_h = lh
+            if isfinite(metric[1]):
+                var ch = metric[1] * mscale
+                if isfinite(ch):
+                    cap = ch
+        var baseline = _safe_add_f32(top, cap)
         var x: Float32 = 0.0
+        var line_w = line.width if isfinite(line.width) else Float32(0.0)
         if align == 1:
-            x = (box - line.width) * Float32(0.5)
+            x = (box - line_w) * Float32(0.5)
         elif align == 2:
-            x = box - line.width
+            x = box - line_w
+        if not isfinite(x):
+            x = Float32(0.0)
 
         var bidi_runs = reorder_line(resolved, line.start, line.end)
         for br in bidi_runs:
@@ -598,10 +692,10 @@ def layout_rich_shaped(
                 var s = owner[rs]
                 var span = spans[s]
                 var face = span.face if span.face >= 0 else base_face
-                var span_px = px * Float32(span.scale) / 100.0
+                var span_px = _safe_span_px(px, span.scale)
                 if span.kind == SPAN_BUTTON:
                     layout.runs.append(PlacedShapedRun(SPAN_BUTTON, List[ShapedGlyph](), x, l, baseline, advance[rs], span_px, span.color, face, span.action, br.level, rtl))
-                    x += advance[rs]
+                    x = _safe_add_f32(x, advance[rs])
                     continue
                 var vis_end = re
                 while vis_end > rs and (codes[vis_end - 1] == 0x0A or codes[vis_end - 1] == 0x0D or codes[vis_end - 1] == 0x20):
@@ -613,21 +707,21 @@ def layout_rich_shaped(
                     for sr in sruns:
                         for g in sr.glyphs:
                             sglyphs.append(g)
-                            shaped_w += g.x_advance
+                            shaped_w = _safe_add_f32(shaped_w, g.x_advance)
                 var trailing_space_w: Float32 = 0.0
                 for idx in range(vis_end, re):
-                    trailing_space_w += advance[idx]
+                    trailing_space_w = _safe_add_f32(trailing_space_w, advance[idx])
                 if rtl:
                     if re < line.end:
-                        x += trailing_space_w
+                        x = _safe_add_f32(x, trailing_space_w)
                     if len(sglyphs) > 0:
                         layout.runs.append(PlacedShapedRun(SPAN_TEXT, sglyphs^, x, l, baseline, shaped_w, span_px, span.color, face, ACTION_NONE, br.level, True))
-                    x += shaped_w
+                    x = _safe_add_f32(x, shaped_w)
                 else:
                     if len(sglyphs) > 0:
                         layout.runs.append(PlacedShapedRun(SPAN_TEXT, sglyphs^, x, l, baseline, shaped_w, span_px, span.color, face, ACTION_NONE, br.level, False))
-                    x += shaped_w + trailing_space_w
-        top += line_h
+                    x = _safe_add_f32(x, _safe_add_f32(shaped_w, trailing_space_w))
+        top = _safe_add_f32(top, line_h)
     layout.height = top
     return layout^
 

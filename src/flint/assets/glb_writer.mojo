@@ -1,4 +1,5 @@
 """Pure-Mojo binary glTF 2.0 (.glb) serializer for NativeModel."""
+from std.math import isfinite
 from flint.platform.os import write_bytes
 from flint.core.math import Vec3
 from flint.assets.image import encode_png
@@ -15,7 +16,7 @@ def append_u32_le(mut out: List[UInt8], value: Int):
 
 
 def append_f32_le(mut out: List[UInt8], value: Float32):
-    var copy = value
+    var copy = value if isfinite(value) else Float32(0.0)
     var bits = Pointer(to=copy).unsafe_bitcast[UInt32]()[unsafe_offset=0]
     append_u32_le(out, Int(bits))
 
@@ -26,6 +27,8 @@ def pad4(mut out: List[UInt8], pad_byte: UInt8 = 0):
 
 
 def fmt_f32(value: Float32) -> String:
+    if not isfinite(value):
+        return "0.0"
     return String(Float64(value))
 
 
@@ -88,22 +91,28 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
         # POSITION (VEC3 float32 + min/max)
         pad4(bin_data, 0)
         var pos_off = len(bin_data)
-        var min_x = mesh.positions[0]
-        var min_y = mesh.positions[1]
-        var min_z = mesh.positions[2]
-        var max_x = min_x
-        var max_y = min_y
-        var max_z = min_z
+        var min_x = Float32(0.0)
+        var min_y = Float32(0.0)
+        var min_z = Float32(0.0)
+        var max_x = Float32(0.0)
+        var max_y = Float32(0.0)
+        var max_z = Float32(0.0)
+        var has_pos = False
         for v in range(vcount):
-            var px = mesh.positions[v * 3]
-            var py = mesh.positions[v * 3 + 1]
-            var pz = mesh.positions[v * 3 + 2]
-            min_x = min(min_x, px)
-            min_y = min(min_y, py)
-            min_z = min(min_z, pz)
-            max_x = max(max_x, px)
-            max_y = max(max_y, py)
-            max_z = max(max_z, pz)
+            var px = mesh.positions[v * 3] if isfinite(mesh.positions[v * 3]) else Float32(0.0)
+            var py = mesh.positions[v * 3 + 1] if isfinite(mesh.positions[v * 3 + 1]) else Float32(0.0)
+            var pz = mesh.positions[v * 3 + 2] if isfinite(mesh.positions[v * 3 + 2]) else Float32(0.0)
+            if not has_pos:
+                min_x = px; min_y = py; min_z = pz
+                max_x = px; max_y = py; max_z = pz
+                has_pos = True
+            else:
+                min_x = min(min_x, px)
+                min_y = min(min_y, py)
+                min_z = min(min_z, pz)
+                max_x = max(max_x, px)
+                max_y = max(max_y, py)
+                max_z = max(max_z, pz)
             append_f32_le(bin_data, px)
             append_f32_le(bin_data, py)
             append_f32_le(bin_data, pz)

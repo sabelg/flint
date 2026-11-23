@@ -1,6 +1,6 @@
 """Explicit keyboard, mouse, and Evdev gamepad state."""
 from std.ffi import external_call
-from std.math import sqrt
+from std.math import isfinite, sqrt
 from flint.platform.os import close_fd
 
 # Named pad controls. The first eleven match the Linux xpad joystick layout, and the
@@ -56,6 +56,8 @@ def remappable_control(control: Int) -> Bool:
 
 
 def identity_map(count: Int) -> List[Int]:
+    if count <= 0:
+        return List[Int]()
     var out = List[Int](capacity=count)
     for index in range(count):
         out.append(index)
@@ -117,6 +119,8 @@ struct PadState(Copyable, Movable):
             self.rt_bipolar = min_val < 0
 
     def set_control(mut self, control: Int, down: Bool):
+        if control < 0 or control >= len(self.down):
+            return
         if down and not self.down[control]:
             self.pressed[control] = True
         self.down[control] = down
@@ -124,7 +128,7 @@ struct PadState(Copyable, Movable):
     def mapped_button(self, number: Int) -> Int:
         """The named control for a raw button number, or -1 if it has none."""
         if not self.sony_layout:
-            return number if number <= PAD_RIGHT_STICK else -1
+            return number if (number >= 0 and number <= PAD_RIGHT_STICK) else -1
         if number == 0:
             return PAD_A
         if number == 1:
@@ -153,13 +157,15 @@ struct PadState(Copyable, Movable):
         """A physical control through the pad map (package 3.15): a toggled
         logical control flips its latch on each physical press and ignores
         releases; controls that never remap set themselves."""
+        if control < 0 or control >= PAD_CONTROLS:
+            return
         if not remappable_control(control):
             self.set_control(control, down)
             return
-        var logical = pad_map[control] if control < len(pad_map) else control
+        var logical = pad_map[control] if (control < len(pad_map) and pad_map[control] >= 0 and pad_map[control] < PAD_CONTROLS) else control
         var was = self.physical[control]
         self.physical[control] = down
-        if logical < len(toggle) and toggle[logical]:
+        if logical >= 0 and logical < len(toggle) and toggle[logical]:
             if down and not was:
                 self.latched[logical] = not self.latched[logical]
                 self.set_control(logical, self.latched[logical])
@@ -174,11 +180,13 @@ struct PadState(Copyable, Movable):
     def apply_event_with(mut self, kind: Int, number: Int, raw_value: Int, pad_map: List[Int], toggle: List[Bool], deadzone_left: Float32, deadzone_right: Float32):
         """One event through the bindings (package 3.15): the pad map and
         toggles for buttons and triggers, a dead zone per stick."""
+        var dz_l = max(Float32(0.0), min(Float32(0.95), deadzone_left)) if isfinite(deadzone_left) else PAD_DEADZONE
+        var dz_r = max(Float32(0.0), min(Float32(0.95), deadzone_right)) if isfinite(deadzone_right) else PAD_DEADZONE
         if kind == 1:
             var control = self.mapped_button(number)
             if control >= 0:
                 self.set_mapped(control, raw_value != 0, pad_map, toggle)
-        elif kind == 2 and number < len(self.axes):
+        elif kind == 2 and number >= 0 and number < len(self.axes) and number < len(self.raw_axes):
             if number == PAD_AXIS_LT or number == PAD_AXIS_RT:
                 var trig: Float32
                 if number == PAD_AXIS_LT:
@@ -215,11 +223,11 @@ struct PadState(Copyable, Movable):
                 var rx = self.raw_axes[PAD_AXIS_LEFT_X]
                 var ry = self.raw_axes[PAD_AXIS_LEFT_Y]
                 var r = sqrt(rx * rx + ry * ry)
-                if r < deadzone_left:
+                if r < dz_l:
                     self.axes[PAD_AXIS_LEFT_X] = 0.0
                     self.axes[PAD_AXIS_LEFT_Y] = 0.0
                 else:
-                    var scale = min(Float32(1.0), (r - deadzone_left) / max(Float32(0.0001), Float32(1.0) - deadzone_left)) / max(r, Float32(1e-6))
+                    var scale = min(Float32(1.0), (r - dz_l) / max(Float32(0.0001), Float32(1.0) - dz_l)) / max(r, Float32(1e-6))
                     self.axes[PAD_AXIS_LEFT_X] = rx * scale
                     self.axes[PAD_AXIS_LEFT_Y] = ry * scale
                 self.set_control(PAD_STICK_LEFT, self.axes[PAD_AXIS_LEFT_X] < -PAD_DIRECTION)
@@ -232,11 +240,11 @@ struct PadState(Copyable, Movable):
                 var rx = self.raw_axes[PAD_AXIS_RIGHT_X]
                 var ry = self.raw_axes[PAD_AXIS_RIGHT_Y]
                 var r = sqrt(rx * rx + ry * ry)
-                if r < deadzone_right:
+                if r < dz_r:
                     self.axes[PAD_AXIS_RIGHT_X] = 0.0
                     self.axes[PAD_AXIS_RIGHT_Y] = 0.0
                 else:
-                    var scale = min(Float32(1.0), (r - deadzone_right) / max(Float32(0.0001), Float32(1.0) - deadzone_right)) / max(r, Float32(1e-6))
+                    var scale = min(Float32(1.0), (r - dz_r) / max(Float32(0.0001), Float32(1.0) - dz_r)) / max(r, Float32(1e-6))
                     self.axes[PAD_AXIS_RIGHT_X] = rx * scale
                     self.axes[PAD_AXIS_RIGHT_Y] = ry * scale
             elif number == PAD_AXIS_DPAD_X:
@@ -290,11 +298,13 @@ struct PadState(Copyable, Movable):
         effect[10] = UInt8(len_val & 0xFF)
         effect[11] = UInt8((len_val >> 8) & 0xFF)
         # strong magnitude
-        var strong_mag = UInt16(min(65535, max(0, Int(strong_motor * 65535.0))))
+        var s_in = max(Float32(0.0), min(Float32(1.0), strong_motor)) if isfinite(strong_motor) else Float32(0.0)
+        var strong_mag = UInt16(min(65535, max(0, Int(s_in * 65535.0))))
         effect[16] = UInt8(strong_mag & 0xFF)
         effect[17] = UInt8((strong_mag >> 8) & 0xFF)
         # weak magnitude
-        var weak_mag = UInt16(min(65535, max(0, Int(weak_motor * 65535.0))))
+        var w_in = max(Float32(0.0), min(Float32(1.0), weak_motor)) if isfinite(weak_motor) else Float32(0.0)
+        var weak_mag = UInt16(min(65535, max(0, Int(w_in * 65535.0))))
         effect[18] = UInt8(weak_mag & 0xFF)
         effect[19] = UInt8((weak_mag >> 8) & 0xFF)
 
@@ -523,6 +533,8 @@ struct InputState(Copyable, Movable):
         if physical < 0 or physical >= 512:
             return
         var key = self.key_map[physical]
+        if key < 0 or key >= KEY_SLOTS:
+            return
         var was = self.physical_keys[physical]
         self.physical_keys[physical] = down
         if self.toggle_keys[key]:

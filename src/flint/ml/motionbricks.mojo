@@ -15,7 +15,7 @@ Poses are local joint transforms (`MbXform`) of a `MbSkeleton` whose root (index
 SOMA `Hips` joint, in the model's space: Y up, metres.
 """
 
-from std.math import sqrt, atan2, sin, cos, floor
+from std.math import sqrt, atan2, sin, cos, floor, isfinite, isnan
 from flint.ml.onnx import OnnxModel
 from flint.ml.tensor import Tensor, DT_F32, DT_I32
 from flint.platform.os import read_bytes
@@ -74,6 +74,8 @@ def _cross(a: MbVec3, b: MbVec3) -> MbVec3:
 
 
 def _lerp3(a: MbVec3, b: MbVec3, t: Float32) -> MbVec3:
+    if not isfinite(t):
+        return a
     return a + (b - a) * t
 
 
@@ -121,15 +123,30 @@ def quat_axis_angle(axis: MbVec3, angle: Float32) -> MbQuat:
     return MbQuat(n.x * s, n.y * s, n.z * s, cos(angle * 0.5))
 
 
+def _mb_quat_finite(q: MbQuat) -> Bool:
+    return isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)
+
+
 def quat_slerp(q0: MbQuat, q1: MbQuat, t: Float32) -> MbQuat:
     """Warp's quat_slerp: q0 * exp(t * log(q0^-1 q1)), the short way round."""
-    var d = q0.inverse() * q1
+    var sq0 = q0.normalized() if _mb_quat_finite(q0) else MbQuat.identity()
+    if sq0.x == 0 and sq0.y == 0 and sq0.z == 0 and sq0.w == 0:
+        sq0 = MbQuat.identity()
+    var sq1 = q1.normalized() if _mb_quat_finite(q1) else sq0
+    if sq1.x == 0 and sq1.y == 0 and sq1.z == 0 and sq1.w == 0:
+        sq1 = sq0
+    if not isfinite(t):
+        return sq0
+    var d = sq0.inverse() * sq1
     var v = MbVec3(d.x, d.y, d.z)
     var axis = v.normalized()
     if d.w < 0:
         axis = axis * -1.0
     var angle = 2.0 * atan2(v.length(), abs(d.w))
-    return q0 * quat_axis_angle(axis, t * angle)
+    var res = (sq0 * quat_axis_angle(axis, t * angle)).normalized()
+    if not _mb_quat_finite(res) or (res.x == 0 and res.y == 0 and res.z == 0 and res.w == 0):
+        return sq0
+    return res
 
 
 def quat_from_basis(x: MbVec3, y: MbVec3, z: MbVec3) -> MbQuat:
@@ -233,8 +250,9 @@ def world_pose(skel: MbSkeleton, local: List[MbXform], root: MbXform) -> List[Mb
     """World transforms of one pose (parents precede their children)."""
     var out = List[MbXform](capacity=len(local))
     for j in range(len(local)):
-        var p = skel.parents[j]
-        out.append((root if p < 0 else out[p]) * local[j])
+        var p = skel.parents[j] if j < len(skel.parents) else -1
+        var parent_xf = root if (p < 0 or p >= len(out)) else out[p]
+        out.append(parent_xf * local[j])
     return out^
 
 
@@ -253,20 +271,43 @@ struct MbClip(Copyable, Movable):
         return len(self.frames)
 
     def duration(self) -> Float32:
-        return Float32(max(0, len(self.frames) - 1)) / self.sample_rate
+        if len(self.frames) <= 1 or not isfinite(self.sample_rate) or self.sample_rate <= 0.0:
+            return Float32(0)
+        return Float32(len(self.frames) - 1) / self.sample_rate
 
     def sample(self, time: Float32, root_offset: MbXform = MbXform.identity()) -> List[MbXform]:
         """The pose at `time` (clamped), blending the two nearest frames; root moved by root_offset."""
-        var last = max(0, len(self.frames) - 1)
-        var fr = time * self.sample_rate
+        var nj = self.skeleton.num_joints()
+        if len(self.frames) == 0:
+            var ref_out = List[MbXform](capacity=nj)
+            for j in range(nj):
+                var x = self.skeleton.reference[j] if j < len(self.skeleton.reference) else MbXform.identity()
+                if j == 0:
+                    x = root_offset * x
+                ref_out.append(x)
+            return ref_out^
+        var last = len(self.frames) - 1
+        var sr = self.sample_rate if (isfinite(self.sample_rate) and self.sample_rate > 0.0) else Float32(0.0)
+        var fr: Float32 = 0.0
+        if not isnan(time) and time > Float32(0.0):
+            if not isfinite(time):
+                fr = Float32(last)
+            else:
+                fr = time * sr
+                if not isfinite(fr) or fr >= Float32(last):
+                    fr = Float32(last)
         var f = min(max(Int(floor(fr)), 0), last)
         var blend: Float32 = 0
         if f < last:
-            blend = min(max(fr - Float32(f), 0), 1)
+            blend = min(max(fr - Float32(f), Float32(0)), Float32(1))
         var g = min(f + 1, last)
-        var out = List[MbXform](capacity=self.skeleton.num_joints())
-        for j in range(self.skeleton.num_joints()):
-            var x = blend_xform(self.frames[f][j], self.frames[g][j], blend)
+        var n_f = len(self.frames[f])
+        var n_g = len(self.frames[g])
+        var out = List[MbXform](capacity=nj)
+        for j in range(nj):
+            var xf = self.frames[f][j] if j < n_f else (self.skeleton.reference[j] if j < len(self.skeleton.reference) else MbXform.identity())
+            var xg = self.frames[g][j] if j < n_g else (self.skeleton.reference[j] if j < len(self.skeleton.reference) else MbXform.identity())
+            var x = blend_xform(xf, xg, blend)
             if j == 0:
                 x = root_offset * x
             out.append(x)
@@ -383,9 +424,15 @@ def load_bvh(path: String, fold_root: Bool = True) raises -> MbClip:
             i += 2
         elif tok[i] == "Frame" and i + 2 < len(tok) and tok[i + 1] == "Time:":
             var ft = atof(tok[i + 2])
-            if ft <= 0.0:
+            if not isfinite(ft) or ft <= 0.0:
                 raise Error("BVH: invalid Frame Time")
-            clip.sample_rate = Float32(Int(1.0 / ft * 100.0 + 0.5)) / 100.0
+            var inv = 1.0 / ft
+            if not isfinite(inv) or inv <= 0.0 or inv > 1_000_000.0:
+                raise Error("BVH: Frame Time out of supported range")
+            var rate = Float32(Int(inv * 100.0 + 0.5)) / 100.0
+            if not isfinite(rate) or rate <= 0.0:
+                raise Error("BVH: invalid sample rate from Frame Time")
+            clip.sample_rate = rate
             i += 3
             break
         else:

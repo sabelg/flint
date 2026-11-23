@@ -5,6 +5,7 @@ Records an initial authoritative `BlobWriter` state snapshot, a sequence of per-
 into a single LZ4-compressed `.flrp` binary file so simulations can record, replay,
 and bit-verify combat or gameplay sessions.
 """
+from std.math import isfinite
 from flint.core.math import Vec3
 from flint.core.serial import BlobWriter, BlobReader, fourcc, fnv64
 from flint.assets.checkpoint import (
@@ -42,6 +43,27 @@ struct CameraPathKnot(Copyable, Movable, ImplicitlyCopyable):
         self.fov_y = fov_y
         self.aperture = aperture
         self.time_scale = time_scale
+
+
+@always_inline
+def _sanitize_vec3(v: Vec3) -> Vec3:
+    return Vec3(
+        v.x if isfinite(v.x) else Float32(0.0),
+        v.y if isfinite(v.y) else Float32(0.0),
+        v.z if isfinite(v.z) else Float32(0.0),
+    )
+
+
+@always_inline
+def _sanitize_knot(k: CameraPathKnot) -> CameraPathKnot:
+    return CameraPathKnot(
+        k.tick,
+        _sanitize_vec3(k.eye),
+        _sanitize_vec3(k.target),
+        k.fov_y if isfinite(k.fov_y) else Float32(58.0),
+        k.aperture if isfinite(k.aperture) else Float32(0.0),
+        k.time_scale if isfinite(k.time_scale) else Float32(1.0),
+    )
 
 
 @always_inline
@@ -130,29 +152,38 @@ struct FlintReplayStream(Movable):
     def evaluate_camera_spline(self, fractional_tick: Float32) -> Tuple[Bool, CameraPathKnot]:
         """Evaluates smooth C1 Catmull-Rom spline across `camera_knots` at `fractional_tick`."""
         var n = len(self.camera_knots)
-        if n == 0:
+        if n == 0 or not isfinite(fractional_tick):
             return (False, CameraPathKnot())
         if n == 1 or fractional_tick <= Float32(self.camera_knots[0].tick):
-            return (True, self.camera_knots[0].copy())
+            return (True, _sanitize_knot(self.camera_knots[0]))
         if fractional_tick >= Float32(self.camera_knots[n - 1].tick):
-            return (True, self.camera_knots[n - 1].copy())
+            return (True, _sanitize_knot(self.camera_knots[n - 1]))
         var seg = 0
         for i in range(n - 1):
             if fractional_tick >= Float32(self.camera_knots[i].tick) and fractional_tick <= Float32(self.camera_knots[i + 1].tick):
                 seg = i
                 break
-        var k0 = self.camera_knots[max(0, seg - 1)].copy()
-        var k1 = self.camera_knots[seg].copy()
-        var k2 = self.camera_knots[seg + 1].copy()
-        var k3 = self.camera_knots[min(n - 1, seg + 2)].copy()
-        var span = max(Float32(0.0001), Float32(k2.tick - k1.tick))
-        var u = max(Float32(0.0), min(Float32(1.0), (fractional_tick - Float32(k1.tick)) / span))
-        var out_eye = _catmull_rom_vec3(k0.eye, k1.eye, k2.eye, k3.eye, u)
-        var out_tgt = _catmull_rom_vec3(k0.target, k1.target, k2.target, k3.target, u)
-        var out_fov = max(Float32(18.0), min(Float32(115.0), _catmull_rom_scalar(k0.fov_y, k1.fov_y, k2.fov_y, k3.fov_y, u)))
-        var out_ap = max(Float32(0.0), _catmull_rom_scalar(k0.aperture, k1.aperture, k2.aperture, k3.aperture, u))
-        var out_ts = max(Float32(0.05), min(Float32(4.0), _catmull_rom_scalar(k0.time_scale, k1.time_scale, k2.time_scale, k3.time_scale, u)))
-        return (True, CameraPathKnot(Int(fractional_tick), out_eye, out_tgt, out_fov, out_ap, out_ts))
+        var k0 = _sanitize_knot(self.camera_knots[max(0, seg - 1)])
+        var k1 = _sanitize_knot(self.camera_knots[seg])
+        var k2 = _sanitize_knot(self.camera_knots[seg + 1])
+        var k3 = _sanitize_knot(self.camera_knots[min(n - 1, seg + 2)])
+        var span64 = max(0.0001, Float64(k2.tick) - Float64(k1.tick))
+        var u_raw = Float32((Float64(fractional_tick) - Float64(k1.tick)) / span64)
+        var u = max(Float32(0.0), min(Float32(1.0), u_raw)) if isfinite(u_raw) else Float32(0.0)
+        var out_eye = _sanitize_vec3(_catmull_rom_vec3(k0.eye, k1.eye, k2.eye, k3.eye, u))
+        var out_tgt = _sanitize_vec3(_catmull_rom_vec3(k0.target, k1.target, k2.target, k3.target, u))
+        var raw_fov = _catmull_rom_scalar(k0.fov_y, k1.fov_y, k2.fov_y, k3.fov_y, u)
+        var out_fov = max(Float32(18.0), min(Float32(115.0), raw_fov if isfinite(raw_fov) else Float32(58.0)))
+        var raw_ap = _catmull_rom_scalar(k0.aperture, k1.aperture, k2.aperture, k3.aperture, u)
+        var out_ap = max(Float32(0.0), raw_ap if isfinite(raw_ap) else Float32(0.0))
+        var raw_ts = _catmull_rom_scalar(k0.time_scale, k1.time_scale, k2.time_scale, k3.time_scale, u)
+        var out_ts = max(Float32(0.05), min(Float32(4.0), raw_ts if isfinite(raw_ts) else Float32(1.0)))
+        var tick_i = k1.tick
+        if fractional_tick > Float32(Int.MIN) and fractional_tick < Float32(Int.MAX):
+            tick_i = max(k1.tick, min(k2.tick, Int(fractional_tick)))
+        elif fractional_tick >= Float32(Int.MAX):
+            tick_i = k2.tick
+        return (True, CameraPathKnot(tick_i, out_eye, out_tgt, out_fov, out_ap, out_ts))
 
     def begin_recording(mut self, app_name: String, initial_writer: BlobWriter):
         self.clear()

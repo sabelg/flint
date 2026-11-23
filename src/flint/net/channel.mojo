@@ -10,7 +10,7 @@ Implements:
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import abs, max, min
+from std.math import abs, isfinite, max, min
 from flint.net.crypto import (
     AEAD_NONCE_BYTES,
     AEAD_OVERHEAD_BYTES,
@@ -402,6 +402,8 @@ struct NetChannel(Movable):
     ):
         var slot = Int(wire_seq) & (_SENT_TRACK_SIZE - 1)
         self.sent_records[slot] = _SentPacketRecord()
+        if not isfinite(now_ms):
+            return
         self.sent_records[slot].occupied = True
         self.sent_records[slot].wire_seq = wire_seq
         self.sent_records[slot].acked = False
@@ -410,7 +412,7 @@ struct NetChannel(Movable):
         self.sent_records[slot].rel_seq = rel_seq
 
     def _update_rtt(mut self, sample_ms: Float64):
-        if sample_ms < 0.0 or sample_ms > 10000.0:
+        if not isfinite(sample_ms) or sample_ms < 0.0 or sample_ms > 10000.0:
             return
         if not self.rtt_initialized:
             self.srtt_ms = sample_ms
@@ -433,7 +435,8 @@ struct NetChannel(Movable):
         ):
             self.sent_records[slot].acked = True
             self.newly_acked_wire_seqs.append(acked_seq)
-            self._update_rtt(now_ms - self.sent_records[slot].sent_time_ms)
+            if isfinite(now_ms) and isfinite(self.sent_records[slot].sent_time_ms):
+                self._update_rtt(now_ms - self.sent_records[slot].sent_time_ms)
             if self.sent_records[slot].has_rel_frag:
                 self._mark_rel_seq_acked(self.sent_records[slot].rel_seq)
 
@@ -762,7 +765,8 @@ struct NetChannel(Movable):
         if self.out_frags[slot].send_count > 0:
             self.retransmissions += 1
         self.out_frags[slot].send_count += 1
-        self.out_frags[slot].last_sent_ms = now_ms
+        if isfinite(now_ms):
+            self.out_frags[slot].last_sent_ms = now_ms
         self._record_sent_packet(
             hdr.seq, now_ms, True, self.out_frags[slot].rel_seq
         )
@@ -1186,14 +1190,18 @@ struct NetChannel(Movable):
                 var eff_rto = min(4000.0, self.rto_ms * Float64(1 << backoff_shift))
                 var due = (
                     not is_retx
-                    or (now_ms - self.out_frags[slot].last_sent_ms) >= eff_rto
+                    or (
+                        isfinite(now_ms)
+                        and isfinite(self.out_frags[slot].last_sent_ms)
+                        and (now_ms - self.out_frags[slot].last_sent_ms) >= eff_rto
+                    )
                 )
                 if not due:
                     in_flight += 1
                     continue
                 if not is_retx and in_flight >= cwnd_cap:
                     continue
-                if is_retx and (now_ms - self._last_loss_ms) >= self.rto_ms:
+                if is_retx and isfinite(now_ms) and (now_ms - self._last_loss_ms) >= self.rto_ms:
                     self.ssthresh = max(2.0, self.cwnd * 0.5)
                     self.cwnd = max(2.0, self.ssthresh)
                     self._last_loss_ms = now_ms

@@ -12,7 +12,7 @@ Implements a 100% Pure-Mojo spherical-planet physical atmosphere:
      Distance-dependent RGB Beer-Lambert transmittance + Rayleigh / Cornette-Shanks Mie + Multiple-Scattering
      in-scattering along camera view rays for distant world geometry.
 """
-from std.math import atan2, cos, exp, max, min, sin, sqrt
+from std.math import atan2, cos, exp, floor, isfinite, max, min, sin, sqrt
 from flint.core.math import Vec3
 from flint.assets.bc_compress import encode_bc6h_hdr
 from flint.render.spirv import AaaSpirvModule
@@ -185,14 +185,19 @@ def _medium_extinction_and_scattering(
 
 @always_inline
 def _bilerp_lut(lut: List[Vec3], w: Int, h: Int, u_in: Float32, v_in: Float32, wrap_u: Bool = False) -> Vec3:
-    var u = u_in
+    if w <= 0 or h <= 0 or len(lut) < w * h:
+        return Vec3()
+    var u = u_in if isfinite(u_in) else Float32(0.0)
+    var v_safe = v_in if isfinite(v_in) else Float32(0.0)
     if wrap_u:
-        u = u - Float32(Int(u))
+        u = u - floor(u)
         if u < Float32(0.0):
             u += Float32(1.0)
+        if u >= Float32(1.0):
+            u = Float32(0.0)
     else:
         u = max(Float32(0.0), min(Float32(1.0), u))
-    var v = max(Float32(0.0), min(Float32(1.0), v_in))
+    var v = max(Float32(0.0), min(Float32(1.0), v_safe))
 
     var fx = u * Float32(w - 1)
     var fy = v * Float32(h - 1)
@@ -231,6 +236,8 @@ struct BrunetonSkyLuts(Movable):
 
     @always_inline
     def sample_transmittance(self, r_km: Float32, mu: Float32) -> Vec3:
+        if not (isfinite(r_km) and isfinite(mu)):
+            return Vec3(0.0, 0.0, 0.0)
         var u = (mu + Float32(0.25)) / Float32(1.25)
         var h_norm = max(Float32(0.0), min(Float32(1.0), (r_km - self.params.r_bottom_km) / (self.params.r_top_km - self.params.r_bottom_km)))
         var v = sqrt(h_norm)
@@ -238,6 +245,8 @@ struct BrunetonSkyLuts(Movable):
 
     @always_inline
     def sample_multiscatter(self, r_km: Float32, mu_s: Float32) -> Vec3:
+        if not (isfinite(r_km) and isfinite(mu_s)):
+            return Vec3(0.0, 0.0, 0.0)
         var u = Float32(0.5) + Float32(0.5) * mu_s
         var v = (r_km - self.params.r_bottom_km) / (self.params.r_top_km - self.params.r_bottom_km)
         return _bilerp_lut(self.multiscatter_lut, ATMO_MS_DIM, ATMO_MS_DIM, u, v, wrap_u=False)

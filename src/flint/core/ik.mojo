@@ -5,7 +5,7 @@ closed-loop 4-bar Freudenstein linkage, and 3-bone digitigrade walker IK.
 All trigonometric and exponential operations use `flint.core.detmath` so IK
 joint poses and combat hitboxes are 100% cross-ISA lockstep-deterministic.
 """
-from std.math import sqrt
+from std.math import isfinite, sqrt
 from flint.core.detmath import det_sin, det_cos, det_acos, det_atan2, det_exp, PI
 from flint.core.math import Vec3
 from flint.core.transform import Quat
@@ -23,15 +23,32 @@ def cross(a: Vec3, b: Vec3) -> Vec3:
 
 @always_inline
 def clamp1(value: Float32) -> Float32:
+    if not isfinite(value):
+        return Float32(0.0)
     return max(Float32(-1.0), min(Float32(1.0), value))
 
 
 @always_inline
+def _vec3_finite(v: Vec3) -> Bool:
+    return isfinite(v.x) and isfinite(v.y) and isfinite(v.z)
+
+
+@always_inline
+def _quat_finite(q: Quat) -> Bool:
+    return isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)
+
+
+@always_inline
 def safe_normalized(value: Vec3, fallback: Vec3) -> Vec3:
-    var length = value.length()
-    if length < Float32(0.000001):
+    if not _vec3_finite(value):
         return fallback
-    return value * (Float32(1.0) / length)
+    var length = value.length()
+    if not isfinite(length) or length < Float32(0.000001):
+        return fallback
+    var res = value * (Float32(1.0) / length)
+    if not _vec3_finite(res):
+        return fallback
+    return res
 
 
 @always_inline
@@ -100,6 +117,16 @@ def two_bone_ik(
     """Two-bone IK solver: a, b, c are upper, middle and end joint positions.
     a_global, b_global: the upper and middle joints' global rotations.
     pole: direction the middle joint should bend toward when straight."""
+    if not (
+        _vec3_finite(a)
+        and _vec3_finite(b)
+        and _vec3_finite(c)
+        and _vec3_finite(target)
+        and _vec3_finite(pole)
+        and _quat_finite(a_global)
+        and _quat_finite(b_global)
+    ):
+        return TwoBoneResult(Quat(), Quat())
     var eps = Float32(0.001)
     var lab = (b - a).length()
     var lcb = (b - c).length()
@@ -126,13 +153,17 @@ def two_bone_ik(
     var axis0 = safe_normalized(bend, Vec3(1, 0, 0))
     var a_inverse = a_global.conjugate()
     var b_inverse = b_global.conjugate()
-    var r0 = angle_axis(ac_ab_1 - ac_ab_0, a_inverse.rotate(axis0))
-    var r1 = angle_axis(ba_bc_1 - ba_bc_0, b_inverse.rotate(axis0))
-    return TwoBoneResult(r0.normalized(), r1.normalized())
+    var r0 = angle_axis(ac_ab_1 - ac_ab_0, a_inverse.rotate(axis0)).normalized()
+    var r1 = angle_axis(ba_bc_1 - ba_bc_0, b_inverse.rotate(axis0)).normalized()
+    if not (_quat_finite(r0) and _quat_finite(r1)):
+        return TwoBoneResult(Quat(), Quat())
+    return TwoBoneResult(r0, r1)
 
 
 def aim_rotation(a: Vec3, c: Vec3, target: Vec3, a_global: Quat) -> Quat:
     """Local rotation for joint a that turns direction a->c onto a->target."""
+    if not (_vec3_finite(a) and _vec3_finite(c) and _vec3_finite(target) and _quat_finite(a_global)):
+        return Quat()
     var from_direction = safe_normalized(c - a, Vec3(0, -1, 0))
     var to_direction = safe_normalized(target - a, from_direction)
     var d = clamp1(dot(from_direction, to_direction))
@@ -166,6 +197,16 @@ def solve_two_bone_pole(
     Returns `(dq_upper, dq_middle)` to post-multiply onto the local rotations of
     joints `a` and `b` (`r_a = r_a.multiply(dq_upper)`, `r_b = r_b.multiply(dq_middle)`).
     """
+    if not (
+        _vec3_finite(a)
+        and _vec3_finite(b)
+        and _vec3_finite(c)
+        and _vec3_finite(target)
+        and _vec3_finite(pole_pos)
+        and _quat_finite(gr_a)
+        and _quat_finite(gr_b)
+    ):
+        return (Quat(), Quat())
     var eps = Float32(0.001)
     var lab = (b - a).length()
     var lcb = (b - c).length()
@@ -214,6 +255,8 @@ def solve_two_bone_pole(
     # Final global rotation of joint a: ga_final = w_twist * w_aim * ga_1
     var ga_final = w_twist.multiply(w_aim).multiply(ga_1).normalized()
     var dq_upper = ga.conjugate().multiply(ga_final).normalized()
+    if not (_quat_finite(dq_upper) and _quat_finite(flex.middle)):
+        return (Quat(), Quat())
     return (dq_upper, flex.middle)
 
 
@@ -226,8 +269,12 @@ def fabrik(
 ) -> Bool:
     """Zero-allocation FABRIK solver using caller-owned `lengths_scratch`."""
     var count = len(points)
-    if count < 2:
+    if count < 2 or not _vec3_finite(target):
         return False
+    for index in range(count):
+        if not _vec3_finite(points[index]):
+            return False
+    var tol = tolerance if (isfinite(tolerance) and tolerance >= Float32(0.0)) else Float32(0.001)
     var segs = count - 1
     if len(lengths_scratch) < segs:
         lengths_scratch.resize(segs, Float32(0.0))
@@ -236,14 +283,17 @@ def fabrik(
         var length = (points[index + 1] - points[index]).length()
         lengths_scratch[index] = length
         total += length
+    if not isfinite(total):
+        return False
     var root = points[0]
-    if (target - root).length() >= total:
+    var target_dist = (target - root).length()
+    if not isfinite(target_dist) or target_dist >= total:
         var direction = safe_normalized(target - root, Vec3(0, 1, 0))
         for index in range(1, count):
             points[index] = points[index - 1] + direction * lengths_scratch[index - 1]
         return False
     for _ in range(iterations):
-        if (points[count - 1] - target).length() <= tolerance:
+        if (points[count - 1] - target).length() <= tol:
             return True
         points[count - 1] = target
         for index in range(count - 2, -1, -1):
@@ -253,15 +303,19 @@ def fabrik(
         for index in range(1, count):
             var direction = safe_normalized(points[index] - points[index - 1], Vec3(0, 1, 0))
             points[index] = points[index - 1] + direction * lengths_scratch[index - 1]
-    return (points[count - 1] - target).length() <= tolerance
+    return (points[count - 1] - target).length() <= tol
 
 
 def fabrik(mut points: List[Vec3], target: Vec3, iterations: Int = 12, tolerance: Float32 = 0.001) -> Bool:
     """Moves a joint chain (`points[0]` is fixed) so its end reaches `target`.
     Uses stack storage for chains up to 32 segments (zero heap allocations)."""
     var count = len(points)
-    if count < 2:
+    if count < 2 or not _vec3_finite(target):
         return False
+    for index in range(count):
+        if not _vec3_finite(points[index]):
+            return False
+    var tol = tolerance if (isfinite(tolerance) and tolerance >= Float32(0.0)) else Float32(0.001)
     var segs = count - 1
     if segs <= 32:
         var stack_lengths = Array[Float32, 32](fill=0.0)
@@ -270,14 +324,17 @@ def fabrik(mut points: List[Vec3], target: Vec3, iterations: Int = 12, tolerance
             var length = (points[index + 1] - points[index]).length()
             stack_lengths[index] = length
             total += length
+        if not isfinite(total):
+            return False
         var root = points[0]
-        if (target - root).length() >= total:
+        var target_dist = (target - root).length()
+        if not isfinite(target_dist) or target_dist >= total:
             var direction = safe_normalized(target - root, Vec3(0, 1, 0))
             for index in range(1, count):
                 points[index] = points[index - 1] + direction * stack_lengths[index - 1]
             return False
         for _ in range(iterations):
-            if (points[count - 1] - target).length() <= tolerance:
+            if (points[count - 1] - target).length() <= tol:
                 return True
             points[count - 1] = target
             for index in range(count - 2, -1, -1):
@@ -287,15 +344,17 @@ def fabrik(mut points: List[Vec3], target: Vec3, iterations: Int = 12, tolerance
             for index in range(1, count):
                 var direction = safe_normalized(points[index] - points[index - 1], Vec3(0, 1, 0))
                 points[index] = points[index - 1] + direction * stack_lengths[index - 1]
-        return (points[count - 1] - target).length() <= tolerance
+        return (points[count - 1] - target).length() <= tol
     var heap_lengths = List[Float32](length=segs, fill=0.0)
-    return fabrik(points, target, heap_lengths, iterations, tolerance)
+    return fabrik(points, target, heap_lengths, iterations, tol)
 
 
 def clamp_cone_direction(dir: Vec3, ref_dir: Vec3, max_angle_rad: Float32) -> Vec3:
     """Clamps unit vector `dir` to lie within `max_angle_rad` cone around `ref_dir`."""
     var ref_u = safe_normalized(ref_dir, Vec3(0, 1, 0))
     var u = safe_normalized(dir, ref_u)
+    if not isfinite(max_angle_rad):
+        return ref_u
     if max_angle_rad >= PI - Float32(1.0e-4):
         return u
     if max_angle_rad <= Float32(1.0e-6):
@@ -306,7 +365,8 @@ def clamp_cone_direction(dir: Vec3, ref_dir: Vec3, max_angle_rad: Float32) -> Ve
         return u
     var perp = u - ref_u * c
     var perp_u = safe_normalized(perp, ortho_fallback(ref_u))
-    return (ref_u * det_cos(max_angle_rad) + perp_u * det_sin(max_angle_rad)).normalized()
+    var res = ref_u * det_cos(max_angle_rad) + perp_u * det_sin(max_angle_rad)
+    return safe_normalized(res, ref_u)
 
 
 def fabrik_constrained(
@@ -322,8 +382,11 @@ def fabrik_constrained(
     """Constrained FABRIK solver with per-joint conical limits (`cone_limits_rad`
     in radians) and minimal-twist global joint `Quat` reconstruction in `out_rotations`."""
     var count = len(points)
-    if count < 2 or len(rest_points) < count:
+    if count < 2 or len(rest_points) < count or not _vec3_finite(target):
         return False
+    for index in range(count):
+        if not _vec3_finite(points[index]) or not _vec3_finite(rest_points[index]):
+            return False
     var segs = count - 1
     if len(lengths_scratch) < segs:
         lengths_scratch.resize(segs, Float32(0.0))
@@ -405,6 +468,18 @@ def solve_four_bar_linkage(
 
     Returns `(joint_b, joint_c, coupler_angle_rad, rocker_angle_rad)`.
     """
+    if not (
+        _vec3_finite(ground_a)
+        and _vec3_finite(ground_d)
+        and _vec3_finite(plane_normal)
+        and isfinite(len_crank_ab)
+        and isfinite(len_coupler_bc)
+        and isfinite(len_rocker_cd)
+        and isfinite(crank_angle)
+    ):
+        var safe_a = ground_a if _vec3_finite(ground_a) else Vec3()
+        return (safe_a, safe_a, Float32(0.0), Float32(0.0))
+
     var n = safe_normalized(plane_normal, Vec3(0, 0, 1))
     var ad_raw = ground_d - ground_a
     var ad_plane = ad_raw - n * dot(ad_raw, n)
@@ -423,9 +498,11 @@ def solve_four_bar_linkage(
     var dist = bd.length()
     var u = safe_normalized(bd, ex)
     var v = cross(n, u)
-    var branch = Float32(1.0) if sign_branch >= Float32(0.0) else Float32(-1.0)
+    var branch = Float32(1.0) if (not isfinite(sign_branch) or sign_branch >= Float32(0.0)) else Float32(-1.0)
 
     var joint_c: Vec3
+    if not isfinite(dist):
+        return (ground_a, ground_a, Float32(0.0), Float32(0.0))
     if dist >= r1 + r2 - Float32(1.0e-6):
         # Fully stretched limit
         joint_c = joint_b + u * r1
@@ -443,6 +520,8 @@ def solve_four_bar_linkage(
     var dc = joint_c - d_plane
     var coupler_angle = det_atan2(dot(bc, ey), dot(bc, ex))
     var rocker_angle = det_atan2(dot(dc, ey), dot(dc, ex))
+    if not (_vec3_finite(joint_b) and _vec3_finite(joint_c) and isfinite(coupler_angle) and isfinite(rocker_angle)):
+        return (ground_a, ground_a, Float32(0.0), Float32(0.0))
     return (joint_b, joint_c, coupler_angle, rocker_angle)
 
 
@@ -465,6 +544,15 @@ def three_bone_digitigrade_ik(
     supplied rest joint positions (`world_hip = q_hip`, `world_knee = q_hip * q_knee1`,
     `world_ankle = q_hip * q_knee1 * q_ankle_rev`).
     """
+    if not (
+        _vec3_finite(hip)
+        and _vec3_finite(knee1)
+        and _vec3_finite(ankle_rev)
+        and _vec3_finite(foot)
+        and _vec3_finite(target)
+        and _vec3_finite(forward_dir)
+    ):
+        return (Quat(), Quat(), Quat())
     var eps = Float32(0.001)
     var v1_rest = knee1 - hip
     var v2_rest = ankle_rev - knee1

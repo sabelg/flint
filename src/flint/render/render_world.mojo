@@ -18,7 +18,7 @@ Architecture:
        4-Cascade Toroidal VSM + FlintTSR + GPU SDF `UiSdfOverlayPass`.
 """
 from std.collections import Dict, List
-from std.math import abs, cos, max, min, pi, sin, sqrt, tan
+from std.math import abs, cos, isfinite, isnan, max, min, pi, sin, sqrt, tan
 from flint.assets.model import NativeMesh
 from flint.core.math import Mat4, Vec3
 from flint.core.transform import Quat
@@ -198,7 +198,8 @@ def _normalize_flint_rgba8(col: UInt32) -> UInt32:
 @always_inline
 def _scale_rgba8_alpha(col: UInt32, alpha_mul: Float32) -> UInt32:
     var base_a = Float32((col >> 24) & UInt32(0xFF))
-    var new_a = UInt32(max(0, min(255, Int(base_a * max(Float32(0.0), min(Float32(1.0), alpha_mul)) + Float32(0.5)))))
+    var safe_mul = Float32(0.0) if isnan(alpha_mul) else max(Float32(0.0), min(Float32(1.0), alpha_mul))
+    var new_a = UInt32(Int(max(Float32(0.0), min(Float32(255.0), base_a * safe_mul + Float32(0.5)))))
     return (col & UInt32(0x00FFFFFF)) | (new_a << 24)
 
 
@@ -448,10 +449,21 @@ struct DebugLineBatch(Copyable, Movable):
         var n_segs = self.segment_count()
         if n_segs <= 0 or screen_w <= 0 or screen_h <= 0:
             return 0
+        if not (
+            isfinite(eye.x) and isfinite(eye.y) and isfinite(eye.z)
+            and isfinite(target.x) and isfinite(target.y) and isfinite(target.z)
+            and isfinite(up_hint.x) and isfinite(up_hint.y) and isfinite(up_hint.z)
+            and isfinite(fov_y_deg) and isfinite(near_z)
+        ):
+            return 0
 
         var view = make_rh_look_at(eye, target, up_hint)
+        for m_i in range(16):
+            if not isfinite(view.values[m_i]):
+                return 0
         var clip_near = max(Float32(0.02), near_z)
-        var half_tan = max(Float32(1e-4), tan(fov_y_deg * DEG_TO_RAD_F32 * Float32(0.5)))
+        var safe_fov = max(Float32(1.0), min(Float32(179.0), fov_y_deg))
+        var half_tan = max(Float32(1e-4), tan(safe_fov * DEG_TO_RAD_F32 * Float32(0.5)))
         var focal_px = (Float32(screen_h) * Float32(0.5)) / half_tan
         var cx_px = Float32(screen_w) * Float32(0.5)
         var cy_px = Float32(screen_h) * Float32(0.5)
@@ -463,6 +475,12 @@ struct DebugLineBatch(Copyable, Movable):
         for i in range(n_segs):
             var v0 = self.vertices[i * 2]
             var v1 = self.vertices[i * 2 + 1]
+            if not (
+                isfinite(v0.pos.x) and isfinite(v0.pos.y) and isfinite(v0.pos.z)
+                and isfinite(v1.pos.x) and isfinite(v1.pos.y) and isfinite(v1.pos.z)
+                and isfinite(v0.thickness_px) and isfinite(v1.thickness_px)
+            ):
+                continue
 
             # Transform endpoints to RH `-Z` camera space (`depth = -z_cam > 0` in front of eye)
             var ax = view.at(0, 0) * v0.pos.x + view.at(0, 1) * v0.pos.y + view.at(0, 2) * v0.pos.z + view.at(0, 3)
@@ -512,6 +530,11 @@ struct DebugLineBatch(Copyable, Movable):
                 eff_th = max(Float32(1.0), base_th * max(Float32(0.55), fade))
 
             var pad = eff_th + Float32(3.0)
+            if not (
+                isfinite(sx0) and isfinite(sy0) and isfinite(sx1) and isfinite(sy1)
+                and isfinite(eff_th) and isfinite(eff_alpha)
+            ):
+                continue
             if (
                 max(sx0, sx1) < -pad
                 or min(sx0, sx1) > sw_f + pad
@@ -1094,9 +1117,12 @@ struct ScalableRenderer(Resource, Movable):
     def _material_color_argb(self, mat_id: Int) -> UInt32:
         if mat_id >= 0 and mat_id < len(self.materials):
             var bc = self.materials[mat_id].base_color
-            var r = Int(max(Float32(0.0), min(Float32(1.0), sqrt(max(Float32(0.0), bc.x)))) * Float32(255.0) + Float32(0.5))
-            var g = Int(max(Float32(0.0), min(Float32(1.0), sqrt(max(Float32(0.0), bc.y)))) * Float32(255.0) + Float32(0.5))
-            var b = Int(max(Float32(0.0), min(Float32(1.0), sqrt(max(Float32(0.0), bc.z)))) * Float32(255.0) + Float32(0.5))
+            var cx = Float32(0.0) if isnan(bc.x) else max(Float32(0.0), min(Float32(1.0), bc.x))
+            var cy = Float32(0.0) if isnan(bc.y) else max(Float32(0.0), min(Float32(1.0), bc.y))
+            var cz = Float32(0.0) if isnan(bc.z) else max(Float32(0.0), min(Float32(1.0), bc.z))
+            var r = Int(sqrt(cx) * Float32(255.0) + Float32(0.5))
+            var g = Int(sqrt(cy) * Float32(255.0) + Float32(0.5))
+            var b = Int(sqrt(cz) * Float32(255.0) + Float32(0.5))
             return pack_argb(r, g, b, 255)
         return 0xFFCCCCCC
 
@@ -1178,11 +1204,12 @@ struct ScalableRenderer(Resource, Movable):
                     var z0 = oz + Float32(gz) * step
                     var z1 = z0 + step
                     var y00 = td.height_offset_m + Float32(0.5) * td.height_scale_m
-                    if hm_w > 0 and hm_h > 0 and len(self.cpu_terrain_heights) >= hm_w * hm_h:
+                    if hm_w > 0 and hm_h > 0 and len(self.cpu_terrain_heights) >= hm_w * hm_h and isfinite(x0) and isfinite(z0):
                         var u0 = max(Float32(0.0), min(Float32(1.0), (x0 + Float32(32.0)) / Float32(64.0)))
                         var v0 = max(Float32(0.0), min(Float32(1.0), (z0 + Float32(32.0)) / Float32(64.0)))
-                        var hi = min(hm_h - 1, Int(v0 * Float32(hm_h - 1))) * hm_w + min(hm_w - 1, Int(u0 * Float32(hm_w - 1)))
-                        y00 = td.height_offset_m + self.cpu_terrain_heights[hi] * td.height_scale_m
+                        if isfinite(u0) and isfinite(v0):
+                            var hi = min(hm_h - 1, Int(v0 * Float32(hm_h - 1))) * hm_w + min(hm_w - 1, Int(u0 * Float32(hm_w - 1)))
+                            y00 = td.height_offset_m + self.cpu_terrain_heights[hi] * td.height_scale_m
                     var p00 = Vec3(x0, y00, z0)
                     var p10 = Vec3(x1, y00, z0)
                     var p01 = Vec3(x0, y00, z1)
@@ -1194,27 +1221,91 @@ struct ScalableRenderer(Resource, Movable):
         for s_i in range(n_dbg):
             var v0 = world.debug_lines.vertices[s_i * 2]
             var v1 = world.debug_lines.vertices[s_i * 2 + 1]
-            self.cpu_canvas.draw_line_3d(cam, v0.pos, v1.pos, v0.rgba8, max(1, Int(v0.thickness_px + Float32(0.5))))
+            var thick = Int(min(Float32(64.0), max(Float32(1.0), v0.thickness_px + Float32(0.5)))) if isfinite(v0.thickness_px) else 1
+            self.cpu_canvas.draw_line_3d(cam, v0.pos, v1.pos, v0.rgba8, thick)
 
+        var max_dim = max(self.width, self.height)
+        var max_steps_cap = max(64, max_dim * 2 + 128)
         for p_i in range(ui.count()):
             var pr = ui.prims[p_i]
             var kind = pr.header & UInt32(0xF)
             if kind == PRIM_SHAPE:
-                self.cpu_canvas.draw_rect(
-                    Int(pr.x0),
-                    Int(pr.y0),
-                    max(1, Int(pr.x1 - pr.x0)),
-                    max(1, Int(pr.y1 - pr.y0)),
-                    pr.fill_rgba8,
-                )
+                if isfinite(pr.x0) and isfinite(pr.y0) and isfinite(pr.x1) and isfinite(pr.y1):
+                    var rx0 = max(Float32(-1.0e6), min(Float32(1.0e6), pr.x0))
+                    var ry0 = max(Float32(-1.0e6), min(Float32(1.0e6), pr.y0))
+                    var rx1 = max(Float32(-1.0e6), min(Float32(1.0e6), pr.x1))
+                    var ry1 = max(Float32(-1.0e6), min(Float32(1.0e6), pr.y1))
+                    self.cpu_canvas.draw_rect(
+                        Int(rx0),
+                        Int(ry0),
+                        max(1, Int(rx1 - rx0)),
+                        max(1, Int(ry1 - ry0)),
+                        pr.fill_rgba8,
+                    )
             elif kind == PRIM_LINE:
-                var dx = pr.u1 - pr.u0
-                var dy = pr.v1 - pr.v0
-                var steps = max(1, Int(max(abs(dx), abs(dy))))
-                var inv_s = Float32(1.0) / Float32(steps)
+                if not (isfinite(pr.u0) and isfinite(pr.v0) and isfinite(pr.u1) and isfinite(pr.v1)):
+                    continue
+                var u0 = Float64(pr.u0)
+                var v0 = Float64(pr.v0)
+                var u1 = Float64(pr.u1)
+                var v1 = Float64(pr.v1)
+                var dx = u1 - u0
+                var dy = v1 - v0
+                if (
+                    abs(u0) > 1.0e6
+                    or abs(v0) > 1.0e6
+                    or abs(u1) > 1.0e6
+                    or abs(v1) > 1.0e6
+                    or abs(dx) > Float64(max_dim * 2 + 64)
+                    or abs(dy) > Float64(max_dim * 2 + 64)
+                ):
+                    # Liang-Barsky clip in Float64 against padded viewport [-1, W+1] x [-1, H+1]
+                    var t0 = 0.0
+                    var t1 = 1.0
+                    var xmin = -1.0
+                    var xmax = Float64(self.width) + 1.0
+                    var ymin = -1.0
+                    var ymax = Float64(self.height) + 1.0
+                    var p_edges = [-dx, dx, -dy, dy]
+                    var q_edges = [u0 - xmin, xmax - u0, v0 - ymin, ymax - v0]
+                    var visible = True
+                    for ei in range(4):
+                        var pe = p_edges[ei]
+                        var qe = q_edges[ei]
+                        if pe == 0.0:
+                            if qe < 0.0:
+                                visible = False
+                                break
+                        else:
+                            var r = qe / pe
+                            if pe < 0.0:
+                                if r > t1:
+                                    visible = False
+                                    break
+                                if r > t0:
+                                    t0 = r
+                            else:
+                                if r < t0:
+                                    visible = False
+                                    break
+                                if r < t1:
+                                    t1 = r
+                    if not visible or t0 > t1:
+                        continue
+                    var nu0 = max(xmin, min(xmax, u0 + t0 * dx))
+                    var nv0 = max(ymin, min(ymax, v0 + t0 * dy))
+                    var nu1 = max(xmin, min(xmax, u0 + t1 * dx))
+                    var nv1 = max(ymin, min(ymax, v0 + t1 * dy))
+                    u0 = nu0
+                    v0 = nv0
+                    dx = nu1 - nu0
+                    dy = nv1 - nv0
+                var span = max(abs(dx), abs(dy))
+                var steps = min(max_steps_cap, max(1, Int(min(Float64(max_steps_cap), span))))
+                var inv_s = 1.0 / Float64(steps)
                 for st in range(steps + 1):
-                    var px = Int(pr.u0 + dx * Float32(st) * inv_s)
-                    var py = Int(pr.v0 + dy * Float32(st) * inv_s)
+                    var px = Int(u0 + dx * Float64(st) * inv_s)
+                    var py = Int(v0 + dy * Float64(st) * inv_s)
                     if px >= 0 and px < self.width and py >= 0 and py < self.height:
                         self.cpu_canvas.pixels[py * self.width + px] = pr.fill_rgba8 | UInt32(0xFF000000)
 

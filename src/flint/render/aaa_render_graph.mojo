@@ -56,6 +56,23 @@ comptime RG_USAGE_FRAGMENT_READ: Int = 5
 comptime RG_UNIT_BYTES: Int = 256
 
 
+@always_inline
+def _rg_lcm_unit(al_b: Int) -> Int:
+    """Computes `lcm(RG_UNIT_BYTES, al_b)` with overflow guard (`0` on invalid/overflow)."""
+    if al_b <= 0:
+        return 0
+    var g_a = RG_UNIT_BYTES
+    var g_b = al_b
+    while g_b != 0:
+        var g_t = g_a % g_b
+        g_a = g_b
+        g_b = g_t
+    var factor = RG_UNIT_BYTES // g_a
+    if al_b > Int.MAX // factor:
+        return 0
+    return factor * al_b
+
+
 struct RgResourceDesc(Copyable, Movable):
     var name: String
     var size_bytes: Int
@@ -81,7 +98,7 @@ struct RgResourceDesc(Copyable, Movable):
     ):
         self.name = name
         self.size_bytes = max(RG_UNIT_BYTES, size_bytes)
-        self.alignment_bytes = max(RG_UNIT_BYTES, alignment_bytes)
+        self.alignment_bytes = max(1, alignment_bytes)
         self.memory_type_bits = memory_type_bits
         self.transient = transient
         self.is_image = is_image
@@ -277,7 +294,7 @@ struct AaaRenderGraph(Movable):
         if rid < 0 or rid >= len(self.resources):
             return
         self.resources[rid].size_bytes = max(RG_UNIT_BYTES, req.size)
-        self.resources[rid].alignment_bytes = max(RG_UNIT_BYTES, req.alignment)
+        self.resources[rid].alignment_bytes = max(1, req.alignment)
         if req.memory_type_bits != 0:
             self.resources[rid].memory_type_bits = req.memory_type_bits
 
@@ -334,8 +351,8 @@ struct AaaRenderGraph(Movable):
                 var al_b = self.resources[r].alignment_bytes
                 if sz_b <= 0 or al_b <= 0:
                     return False
-                var align_b = max(RG_UNIT_BYTES, al_b)
-                if sz_b > Int.MAX - align_b:
+                var align_b = _rg_lcm_unit(al_b)
+                if align_b <= 0 or sz_b > Int.MAX - align_b:
                     return False
                 var aligned = ((sz_b + align_b - 1) // align_b) * align_b
                 if aligned > Int.MAX - unaliased_total:
@@ -376,12 +393,13 @@ struct AaaRenderGraph(Movable):
                     var al_b = self.resources[r].alignment_bytes
                     if sz_b <= 0 or al_b <= 0:
                         return False
-                    var align_b = max(RG_UNIT_BYTES, al_b)
-                    if sz_b > Int.MAX - RG_UNIT_BYTES or align_b > Int.MAX - RG_UNIT_BYTES:
+                    var align_b = _rg_lcm_unit(al_b)
+                    if align_b <= 0:
                         return False
-                    var align_u = (align_b + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES
-                    var size_u = (sz_b + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES
-                    var units_i = size_u + align_u - 1
+                    var max_pad = align_b - RG_UNIT_BYTES
+                    if sz_b > Int.MAX - RG_UNIT_BYTES or max_pad > Int.MAX - sz_b - RG_UNIT_BYTES:
+                        return False
+                    var units_i = (sz_b + max_pad + RG_UNIT_BYTES - 1) // RG_UNIT_BYTES
                     if units_i <= 0 or units_i > 0xFFFFFFFF or units_i > heap_units_i:
                         return False
                     var units = UInt32(units_i)
@@ -390,9 +408,13 @@ struct AaaRenderGraph(Movable):
                         return False
                     live_allocs[r] = al
                     var base_bytes = Int(al.offset) * RG_UNIT_BYTES
+                    if base_bytes > Int.MAX - align_b:
+                        return False
                     var off_bytes = ((base_bytes + align_b - 1) // align_b) * align_b
                     self.resources[r].aliased_offset_bytes = off_bytes
                     var aligned_sz = ((self.resources[r].size_bytes + align_b - 1) // align_b) * align_b
+                    if off_bytes > Int.MAX - aligned_sz:
+                        return False
                     var end_bytes = off_bytes + self.resources[r].size_bytes
                     var end_aligned = off_bytes + aligned_sz
                     if is_img_r:

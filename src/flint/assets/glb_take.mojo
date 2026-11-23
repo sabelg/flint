@@ -1,5 +1,6 @@
 """Append one baked animation to a self-contained GLB, preserving original asset bytes."""
 from std.ffi import external_call
+from std.math import isfinite
 from flint.assets.glb_native import little_u32
 from flint.assets.glb_writer import append_f32_le, append_u32_le, pad4
 from flint.assets.json import JsonDocument
@@ -104,6 +105,16 @@ def append_take_glb(
     var samplers = List[String]()
     if not anim.channels:
         raise Error("Animation has no channels")
+    if not isfinite(anim.duration) or anim.duration < Float32(0.0):
+        raise Error("Animation duration must be finite and non-negative")
+    for c_idx in range(len(anim.channels)):
+        ref ch = anim.channels[c_idx]
+        for t in ch.times:
+            if not isfinite(t):
+                raise Error("Animation channel times must be finite")
+        for v in ch.values:
+            if not isfinite(v):
+                raise Error("Animation channel values must be finite")
     # Every track from the retarget baker shares the same time samples.
     for i in range(-1, len(anim.channels)):
         var time_track = i < 0

@@ -12,7 +12,7 @@ Implements:
    `collide_capsule`, and `collide_box` returning 4-point `ContactManifold`s.
 """
 from std.collections import List
-from std.math import sqrt, min, max, floor, abs
+from std.math import sqrt, min, max, floor, abs, isfinite
 from flint.core.math import Vec3, Quat
 from flint.core.detsort import mix64
 from flint.physics.solver_bodies import F8, I8, LANES
@@ -81,11 +81,20 @@ struct MeshTriangle(Copyable, ImplicitlyCopyable, Movable):
         self.v0 = v0
         self.v1 = v1
         self.v2 = v2
-        var e1 = v1 - v0
-        var e2 = v2 - v0
-        var n = e1.cross(e2)
-        var l = n.length()
-        self.normal = n * (Float32(1.0) / l) if l > Float32(1.0e-7) else Vec3(0, 1, 0)
+        var e1x = Float64(v1.x) - Float64(v0.x)
+        var e1y = Float64(v1.y) - Float64(v0.y)
+        var e1z = Float64(v1.z) - Float64(v0.z)
+        var e2x = Float64(v2.x) - Float64(v0.x)
+        var e2y = Float64(v2.y) - Float64(v0.y)
+        var e2z = Float64(v2.z) - Float64(v0.z)
+        var nx = e1y * e2z - e1z * e2y
+        var ny = e1z * e2x - e1x * e2z
+        var nz = e1x * e2y - e1y * e2x
+        var l = sqrt(nx * nx + ny * ny + nz * nz)
+        if isfinite(l) and l > 1.0e-12:
+            self.normal = Vec3(Float32(nx / l), Float32(ny / l), Float32(nz / l))
+        else:
+            self.normal = Vec3(0, 1, 0)
         self.active_edges = EDGE_ACTIVE_ALL
         self.material_id = material_id
 
@@ -105,16 +114,28 @@ struct MeshTriangle(Copyable, ImplicitlyCopyable, Movable):
 
     @always_inline
     def center(self) -> Vec3:
-        return (self.v0 + self.v1 + self.v2) * Float32(1.0 / 3.0)
+        return Vec3(
+            Float32((Float64(self.v0.x) + Float64(self.v1.x) + Float64(self.v2.x)) * (1.0 / 3.0)),
+            Float32((Float64(self.v0.y) + Float64(self.v1.y) + Float64(self.v2.y)) * (1.0 / 3.0)),
+            Float32((Float64(self.v0.z) + Float64(self.v1.z) + Float64(self.v2.z)) * (1.0 / 3.0)),
+        )
 
     def closest_point(self, p: Vec3) -> Tuple[Vec3, Vec3]:
         """Calculates closest point on triangle to p with active-edge and boundary-vertex smoothing."""
+        var abx = Float64(self.v1.x) - Float64(self.v0.x)
+        var aby = Float64(self.v1.y) - Float64(self.v0.y)
+        var abz = Float64(self.v1.z) - Float64(self.v0.z)
+        var acx = Float64(self.v2.x) - Float64(self.v0.x)
+        var acy = Float64(self.v2.y) - Float64(self.v0.y)
+        var acz = Float64(self.v2.z) - Float64(self.v0.z)
+        var apx = Float64(p.x) - Float64(self.v0.x)
+        var apy = Float64(p.y) - Float64(self.v0.y)
+        var apz = Float64(p.z) - Float64(self.v0.z)
         var ab = self.v1 - self.v0
-        var ac = self.v2 - self.v0
         var ap = p - self.v0
 
-        var d1 = ab.dot(ap)
-        var d2 = ac.dot(ap)
+        var d1 = abx * apx + aby * apy + abz * apz
+        var d2 = acx * apx + acy * apy + acz * apz
         if d1 <= 0.0 and d2 <= 0.0:
             var act01 = (self.active_edges & EDGE_ACTIVE_01) != 0
             var act20 = (self.active_edges & EDGE_ACTIVE_20) != 0
@@ -123,9 +144,12 @@ struct MeshTriangle(Copyable, ImplicitlyCopyable, Movable):
             var n = _clamp_vertex_normal(ap, self.normal, act01, m01, act20, m20)
             return (self.v0, n)
 
+        var bpx = Float64(p.x) - Float64(self.v1.x)
+        var bpy = Float64(p.y) - Float64(self.v1.y)
+        var bpz = Float64(p.z) - Float64(self.v1.z)
         var bp = p - self.v1
-        var d3 = ab.dot(bp)
-        var d4 = ac.dot(bp)
+        var d3 = abx * bpx + aby * bpy + abz * bpz
+        var d4 = acx * bpx + acy * bpy + acz * bpz
         if d3 >= 0.0 and d4 <= d3:
             var act01 = (self.active_edges & EDGE_ACTIVE_01) != 0
             var act12 = (self.active_edges & EDGE_ACTIVE_12) != 0
@@ -136,16 +160,23 @@ struct MeshTriangle(Copyable, ImplicitlyCopyable, Movable):
 
         var vc = d1 * d4 - d3 * d2
         if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
-            var v = d1 / (d1 - d3)
-            var pt = self.v0 + ab * v
+            var v = d1 / (d1 - d3) if (d1 - d3) != 0.0 else 0.0
+            var pt = Vec3(
+                Float32(Float64(self.v0.x) + abx * v),
+                Float32(Float64(self.v0.y) + aby * v),
+                Float32(Float64(self.v0.z) + abz * v),
+            )
             var n = (p - pt).normalized() if (p - pt).length_squared() > 1.0e-8 else self.normal
             if (self.active_edges & EDGE_ACTIVE_01) == 0:
                 n = self.normal
             return (pt, n)
 
+        var cpx = Float64(p.x) - Float64(self.v2.x)
+        var cpy = Float64(p.y) - Float64(self.v2.y)
+        var cpz = Float64(p.z) - Float64(self.v2.z)
         var cp = p - self.v2
-        var d5 = ab.dot(cp)
-        var d6 = ac.dot(cp)
+        var d5 = abx * cpx + aby * cpy + abz * cpz
+        var d6 = acx * cpx + acy * cpy + acz * cpz
         if d6 >= 0.0 and d5 <= d6:
             var act12 = (self.active_edges & EDGE_ACTIVE_12) != 0
             var act20 = (self.active_edges & EDGE_ACTIVE_20) != 0
@@ -156,8 +187,12 @@ struct MeshTriangle(Copyable, ImplicitlyCopyable, Movable):
 
         var vb = d5 * d2 - d1 * d6
         if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
-            var w = d2 / (d2 - d6)
-            var pt = self.v0 + ac * w
+            var w = d2 / (d2 - d6) if (d2 - d6) != 0.0 else 0.0
+            var pt = Vec3(
+                Float32(Float64(self.v0.x) + acx * w),
+                Float32(Float64(self.v0.y) + acy * w),
+                Float32(Float64(self.v0.z) + acz * w),
+            )
             var n = (p - pt).normalized() if (p - pt).length_squared() > 1.0e-8 else self.normal
             if (self.active_edges & EDGE_ACTIVE_20) == 0:
                 n = self.normal
@@ -165,39 +200,64 @@ struct MeshTriangle(Copyable, ImplicitlyCopyable, Movable):
 
         var va = d3 * d6 - d5 * d4
         if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
-            var w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
-            var pt = self.v1 + (self.v2 - self.v1) * w
+            var den = (d4 - d3) + (d5 - d6)
+            var w = (d4 - d3) / den if den != 0.0 else 0.0
+            var pt = Vec3(
+                Float32(Float64(self.v1.x) + (Float64(self.v2.x) - Float64(self.v1.x)) * w),
+                Float32(Float64(self.v1.y) + (Float64(self.v2.y) - Float64(self.v1.y)) * w),
+                Float32(Float64(self.v1.z) + (Float64(self.v2.z) - Float64(self.v1.z)) * w),
+            )
             var n = (p - pt).normalized() if (p - pt).length_squared() > 1.0e-8 else self.normal
             if (self.active_edges & EDGE_ACTIVE_12) == 0:
                 n = self.normal
             return (pt, n)
 
-        var denom = Float32(1.0) / (va + vb + vc)
+        var sum_v = va + vb + vc
+        if not isfinite(sum_v) or sum_v == 0.0:
+            return (self.v0, self.normal)
+        var denom = 1.0 / sum_v
         var v_coord = vb * denom
         var w_coord = vc * denom
-        var pt = self.v0 + ab * v_coord + ac * w_coord
+        var pt = Vec3(
+            Float32(Float64(self.v0.x) + abx * v_coord + acx * w_coord),
+            Float32(Float64(self.v0.y) + aby * v_coord + acy * w_coord),
+            Float32(Float64(self.v0.z) + abz * v_coord + acz * w_coord),
+        )
         return (pt, self.normal)
 
     def ray_intersect(self, orig: Vec3, dir: Vec3, max_t: Float32) -> Tuple[Bool, Float32, Vec3]:
         """Möller-Trumbore ray-triangle intersection."""
-        var e1 = self.v1 - self.v0
-        var e2 = self.v2 - self.v0
-        var pvec = dir.cross(e2)
-        var det = e1.dot(pvec)
-        if abs(det) < 1.0e-7:
+        var e1x = Float64(self.v1.x) - Float64(self.v0.x)
+        var e1y = Float64(self.v1.y) - Float64(self.v0.y)
+        var e1z = Float64(self.v1.z) - Float64(self.v0.z)
+        var e2x = Float64(self.v2.x) - Float64(self.v0.x)
+        var e2y = Float64(self.v2.y) - Float64(self.v0.y)
+        var e2z = Float64(self.v2.z) - Float64(self.v0.z)
+        var dx = Float64(dir.x)
+        var dy = Float64(dir.y)
+        var dz = Float64(dir.z)
+        var pvecx = dy * e2z - dz * e2y
+        var pvecy = dz * e2x - dx * e2z
+        var pvecz = dx * e2y - dy * e2x
+        var det = e1x * pvecx + e1y * pvecy + e1z * pvecz
+        if not isfinite(det) or abs(det) < 1.0e-12:
             return (False, max_t, self.normal)
-        var inv_det = Float32(1.0) / det
-        var tvec = orig - self.v0
-        var u = tvec.dot(pvec) * inv_det
+        var inv_det = 1.0 / det
+        var tvecx = Float64(orig.x) - Float64(self.v0.x)
+        var tvecy = Float64(orig.y) - Float64(self.v0.y)
+        var tvecz = Float64(orig.z) - Float64(self.v0.z)
+        var u = (tvecx * pvecx + tvecy * pvecy + tvecz * pvecz) * inv_det
         if u < 0.0 or u > 1.0:
             return (False, max_t, self.normal)
-        var qvec = tvec.cross(e1)
-        var v = dir.dot(qvec) * inv_det
+        var qvecx = tvecy * e1z - tvecz * e1y
+        var qvecy = tvecz * e1x - tvecx * e1z
+        var qvecz = tvecx * e1y - tvecy * e1x
+        var v = (dx * qvecx + dy * qvecy + dz * qvecz) * inv_det
         if v < 0.0 or (u + v) > 1.0:
             return (False, max_t, self.normal)
-        var t = e2.dot(qvec) * inv_det
-        if t >= 0.0 and t <= max_t:
-            return (True, t, self.normal)
+        var t64 = (e2x * qvecx + e2y * qvecy + e2z * qvecz) * inv_det
+        if isfinite(t64) and t64 >= 0.0 and t64 <= Float64(max_t):
+            return (True, Float32(t64), self.normal)
         return (False, max_t, self.normal)
 
 
@@ -264,9 +324,13 @@ struct SweepHit(Copyable, ImplicitlyCopyable, Movable):
 
 @always_inline
 def _quant_vert(v: Vec3) -> Tuple[Int64, Int64, Int64]:
-    var qx = Int64(floor(Float64(v.x) * 10000.0 + 0.5))
-    var qy = Int64(floor(Float64(v.y) * 10000.0 + 0.5))
-    var qz = Int64(floor(Float64(v.z) * 10000.0 + 0.5))
+    comptime QUANT_LIM: Float64 = 9.0e14
+    var sx = floor(Float64(v.x) * 10000.0 + 0.5) if isfinite(v.x) else 0.0
+    var sy = floor(Float64(v.y) * 10000.0 + 0.5) if isfinite(v.y) else 0.0
+    var sz = floor(Float64(v.z) * 10000.0 + 0.5) if isfinite(v.z) else 0.0
+    var qx = Int64(max(-QUANT_LIM, min(QUANT_LIM, sx))) if isfinite(sx) else Int64(0)
+    var qy = Int64(max(-QUANT_LIM, min(QUANT_LIM, sy))) if isfinite(sy) else Int64(0)
+    var qz = Int64(max(-QUANT_LIM, min(QUANT_LIM, sz))) if isfinite(sz) else Int64(0)
     return (qx, qy, qz)
 
 
@@ -367,10 +431,10 @@ def _build_mesh_bvh2(
     var c_mins = [c_lo.x, c_lo.y, c_lo.z]
 
     for ax in range(3):
-        if spans[ax] <= Float32(1.0e-6):
+        if not isfinite(spans[ax]) or spans[ax] <= Float32(1.0e-6):
             continue
-        var inv_span = Float32(_SAH_BINS) / spans[ax]
-        var c_min = c_mins[ax]
+        var inv_span = Float64(_SAH_BINS) / Float64(spans[ax])
+        var c_min = Float64(c_mins[ax])
         var bin_cnt = Array[Int, _SAH_BINS](fill=0)
         var b_lox = Array[Float32, _SAH_BINS](fill=1.0e30)
         var b_loy = Array[Float32, _SAH_BINS](fill=1.0e30)
@@ -382,12 +446,9 @@ def _build_mesh_bvh2(
         for i in range(start, end):
             var ti = perm[i]
             var bc = t_center[ti]
-            var coord = bc.x if ax == 0 else (bc.y if ax == 1 else bc.z)
-            var b = Int((coord - c_min) * inv_span)
-            if b < 0:
-                b = 0
-            elif b >= _SAH_BINS:
-                b = _SAH_BINS - 1
+            var coord = Float64(bc.x if ax == 0 else (bc.y if ax == 1 else bc.z))
+            var bf = (coord - c_min) * inv_span
+            var b = Int(max(0.0, min(Float64(_SAH_BINS - 1), bf))) if isfinite(bf) else 0
             bin_cnt[b] += 1
             var blo = t_lo[ti]
             var bhi = t_hi[ti]
@@ -427,19 +488,16 @@ def _build_mesh_bvh2(
 
     var mid = (start + end) // 2
     if best_axis >= 0 and best_split >= 0:
-        var inv_span = Float32(_SAH_BINS) / spans[best_axis]
-        var c_min = c_mins[best_axis]
+        var inv_span = Float64(_SAH_BINS) / Float64(spans[best_axis])
+        var c_min = Float64(c_mins[best_axis])
         var il = start
         var ir = end - 1
         while il <= ir:
             var ti = perm[il]
             var bc = t_center[ti]
-            var coord = bc.x if best_axis == 0 else (bc.y if best_axis == 1 else bc.z)
-            var b = Int((coord - c_min) * inv_span)
-            if b < 0:
-                b = 0
-            elif b >= _SAH_BINS:
-                b = _SAH_BINS - 1
+            var coord = Float64(bc.x if best_axis == 0 else (bc.y if best_axis == 1 else bc.z))
+            var bf = (coord - c_min) * inv_span
+            var b = Int(max(0.0, min(Float64(_SAH_BINS - 1), bf))) if isfinite(bf) else 0
             if b <= best_split:
                 il += 1
             else:

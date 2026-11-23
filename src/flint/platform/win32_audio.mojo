@@ -7,7 +7,7 @@ ring buffer, and a deterministic polyphonic voice + ambient drone mixer.
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import sin
+from std.math import isfinite, sin
 from std.sys.info import CompilationTarget
 from flint.platform.dsp import soft_clip_tanh
 from flint.platform.traits import AudioBackend
@@ -562,22 +562,26 @@ struct Win32Audio(AudioBackend):
         var slot = self.voice_cursor % WIN32_AUDIO_MAX_VOICES
         self.voice_cursor += 1
         var base_hz = 196.0 + Float64(abs(clip_id) % 12) * 32.0
-        var p = max(Float64(0.25), min(Float64(4.0), Float64(pitch)))
+        var safe_pitch = Float64(pitch) if isfinite(pitch) else Float64(1.0)
+        var p = max(Float64(0.25), min(Float64(4.0), safe_pitch))
+        var safe_gain = gain if isfinite(gain) else Float32(0.0)
         self.voices[slot] = _Win32SynthVoice(
             True,
             clip_id,
             0.0,
             base_hz * p,
-            max(Float32(0.0), min(Float32(2.0), gain)),
+            max(Float32(0.0), min(Float32(2.0), safe_gain)),
             0,
             self.sample_rate // 4,
         )
 
     def set_ambient_drone(mut self, level: Float32):
-        self.drone_level = max(Float32(0.0), min(Float32(1.0), level))
+        var safe_level = level if isfinite(level) else Float32(0.0)
+        self.drone_level = max(Float32(0.0), min(Float32(1.0), safe_level))
 
     def mix_into_slot(mut self, slot_idx: Int, master_gain: Float32, frames: Int):
-        var mg = max(Float32(0.0), min(Float32(2.0), master_gain))
+        var safe_mg = master_gain if isfinite(master_gain) else Float32(0.0)
+        var mg = max(Float32(0.0), min(Float32(2.0), safe_mg))
         var count = max(1, min(self.period_frames, frames))
         var two_pi = 6.283185307179586
         var inv_sr = 1.0 / Float64(self.sample_rate)

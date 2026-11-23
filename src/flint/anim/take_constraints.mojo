@@ -1,5 +1,5 @@
 """World-space authoring constraints for SOMA takes. Distances are metres."""
-from std.math import sqrt, atan2
+from std.math import sqrt, atan2, isfinite
 from flint.core.math import Quat, Vec3
 from flint.core.ik import shortest_arc_quat
 from flint.ml.motionbricks import (
@@ -22,6 +22,11 @@ def mb(v: Vec3) -> MbVec3:
 
 
 def position(clip: MbClip, frame: Int, j: Int) -> Vec3:
+    if frame < 0 or frame >= len(clip.frames):
+        return Vec3()
+    var nj = len(clip.frames[frame])
+    if j < 0 or j >= nj or len(clip.skeleton.parents) < nj:
+        return Vec3()
     return vec(
         world_pose(clip.skeleton, clip.frames[frame], MbXform.identity())[j].p
     )
@@ -35,6 +40,15 @@ def _turn(
     before: Vec3,
     after: Vec3,
 ):
+    if (
+        f < 0
+        or f >= len(clip.frames)
+        or j < 0
+        or j >= len(clip.frames[f])
+        or j >= len(clip.skeleton.parents)
+        or j >= len(world)
+    ):
+        return
     if min(before.length_squared(), after.length_squared()) < 1e-10:
         return
     var u = before.normalized()
@@ -46,25 +60,50 @@ def _turn(
 
         d = Quat(cross.x, cross.y, cross.z, 1 + cosine).normalized()
     var parent = clip.skeleton.parents[j]
-    var pq = MbQuat.identity() if parent < 0 else world[parent].q
+    var pq = MbQuat.identity() if (parent < 0 or parent >= len(world)) else world[parent].q
     clip.frames[f][j].q = (
         pq.inverse() * MbQuat(d.x, d.y, d.z, d.w) * world[j].q
     ).normalized()
 
 
 def aim_joint(mut clip: MbClip, f: Int, j: Int, child: Int, direction: Vec3):
+    if not (isfinite(direction.x) and isfinite(direction.y) and isfinite(direction.z)):
+        return
+    if f < 0 or f >= len(clip.frames):
+        return
+    var nj = len(clip.frames[f])
+    if j < 0 or j >= nj or child < 0 or child >= nj or len(clip.skeleton.parents) < nj:
+        return
     var w = world_pose(clip.skeleton, clip.frames[f], MbXform.identity())
+    if j >= len(w) or child >= len(w):
+        return
     _turn(clip, f, j, w, vec(w[child].p - w[j].p), direction)
 
 
 def pin_frame(mut clip: MbClip, f: Int, tip: Int, goal: Vec3):
+    if not (isfinite(goal.x) and isfinite(goal.y) and isfinite(goal.z)):
+        return
+    if f < 0 or f >= len(clip.frames):
+        return
+    var nj = len(clip.frames[f])
+    if tip < 0 or tip >= nj or tip >= len(clip.skeleton.parents) or len(clip.skeleton.parents) < nj:
+        return
     var mid = clip.skeleton.parents[tip]
+    if mid < 0 or mid >= tip or mid >= nj or mid >= len(clip.skeleton.parents):
+        return
     var upper = clip.skeleton.parents[mid]
+    if upper < 0 or upper >= mid or upper >= nj or upper >= len(clip.skeleton.parents):
+        return
     var w = world_pose(clip.skeleton, clip.frames[f], MbXform.identity())
+    if upper >= len(w) or mid >= len(w) or tip >= len(w):
+        return
     var a = vec(w[upper].p)
     var b = vec(w[mid].p)
     var c = vec(w[tip].p)
-    var u = (goal - a).normalized()
+    var diff = goal - a
+    if not (isfinite(diff.x) and isfinite(diff.y) and isfinite(diff.z)):
+        return
+    var u = diff.normalized()
     if u.length_squared() < 0.5:
         u = (c - a).normalized()
     var ab = (b - a).length()
@@ -106,9 +145,12 @@ def pin_joint(
     weight: Float32,
 ) raises -> Float32:
     check_interval(clip, start, end)
+    if not (isfinite(goal.x) and isfinite(goal.y) and isfinite(goal.z)):
+        raise Error("Pin goal must be finite")
     if (
         name not in ("LeftFoot", "RightFoot", "LeftHand", "RightHand")
         or fade < 0
+        or not isfinite(weight)
         or weight < 0
         or weight > 1
     ):
@@ -116,6 +158,14 @@ def pin_joint(
             "Pins need a hand or foot, a nonnegative fade and weight 0..1"
         )
     var j = clip.skeleton.joint_index(name)
+    if j < 0 or j >= len(clip.skeleton.parents):
+        raise Error("Unknown pin joint " + name)
+    var mid = clip.skeleton.parents[j]
+    if mid < 0 or mid >= j or mid >= len(clip.skeleton.parents):
+        raise Error("Pin joint requires a 2-bone parent chain: " + name)
+    var upper = clip.skeleton.parents[mid]
+    if upper < 0 or upper >= mid or upper >= len(clip.skeleton.parents):
+        raise Error("Pin joint requires a 2-bone parent chain: " + name)
     var peak: Float32 = 0
     for f in range(
         max(0, start - fade), min(clip.num_frames(), end + fade + 1)
@@ -132,17 +182,32 @@ def pin_joint(
 def clean_stances(
     mut clip: MbClip, speed: Float32, height: Float32, minimum: Int
 ) raises -> Int:
-    if speed <= 0 or height <= 0 or minimum < 2:
+    if not isfinite(speed) or speed <= 0 or not isfinite(height) or height <= 0 or minimum < 2:
         raise Error("Invalid stance thresholds")
+    if clip.num_frames() < 2 or not isfinite(clip.sample_rate) or clip.sample_rate <= 0:
+        return 0
     var count = 0
     for name in [String("LeftFoot"), String("RightFoot")]:
         var j = clip.skeleton.joint_index(name)
+        if j < 0 or j >= len(clip.skeleton.parents):
+            continue
+        var mid = clip.skeleton.parents[j]
+        if mid < 0 or mid >= j or mid >= len(clip.skeleton.parents):
+            continue
+        var upper = clip.skeleton.parents[mid]
+        if upper < 0 or upper >= mid or upper >= len(clip.skeleton.parents):
+            continue
         var p = List[Vec3]()
         var floor = Float32(1e20)
         for f in range(clip.num_frames()):
+            if j >= len(clip.frames[f]):
+                p.clear()
+                break
             var v = position(clip, f, j)
             p.append(v)
             floor = min(floor, v.y)
+        if len(p) < minimum:
+            continue
         var first = -1
         for f in range(len(p) + 1):
             var stance = False
@@ -176,20 +241,28 @@ def warp_contact(
 ) raises:
     check_interval(clip, start, end)
     var j = clip.skeleton.joint_index(joint)
-    if j < 0 or start == end or limit <= 0:
+    if j < 0 or start == end or not isfinite(limit) or limit <= 0:
         raise Error(
             "Warp needs a known joint, an approach interval and positive reach"
         )
     var offset = target - position(clip, end, j)
-    if offset.length() > limit:
+    if (
+        not isfinite(offset.x)
+        or not isfinite(offset.y)
+        or not isfinite(offset.z)
+        or offset.length() > limit
+    ):
         raise Error("Warp target exceeds maximum correction")
     for f in range(start, clip.num_frames()):
-        clip.frames[f][0].p = clip.frames[f][0].p + mb(offset) * smooth(
-            Float32(f - start) / Float32(end - start)
-        )
+        if len(clip.frames[f]) > 0:
+            clip.frames[f][0].p = clip.frames[f][0].p + mb(offset) * smooth(
+                Float32(f - start) / Float32(end - start)
+            )
 
 
 def follow_path(mut clip: MbClip, frames: List[Int], points: List[Vec3]) raises:
+    if clip.num_frames() < 2:
+        raise Error("Path needs a take with at least two frames")
     if (
         len(frames) < 2
         or len(frames) != len(points)
@@ -197,9 +270,19 @@ def follow_path(mut clip: MbClip, frames: List[Int], points: List[Vec3]) raises:
         or frames[len(frames) - 1] != clip.num_frames() - 1
     ):
         raise Error("Path needs increasing frame markers covering the take")
+    for i in range(len(points)):
+        var pt = points[i]
+        if not (isfinite(pt.x) and isfinite(pt.y) and isfinite(pt.z)):
+            raise Error("Path points must be finite")
+        if frames[i] < 0 or frames[i] >= clip.num_frames():
+            raise Error("Invalid path frame order")
+        if i > 0 and frames[i] <= frames[i - 1]:
+            raise Error("Invalid path frame order")
     var up = MbVec3(0, 1, 0)
     var original = List[MbVec3]()
     for pose in clip.frames:
+        if len(pose) == 0:
+            raise Error("Path requires non-empty poses for every frame")
         original.append(pose[0].p)
     var headings = List[MbQuat]()
     for i in range(len(points) - 1):

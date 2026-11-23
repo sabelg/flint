@@ -501,8 +501,25 @@ struct QoaStreamCursor(Copyable, Movable):
         self.slice_cache_len = 0
         self.lms = Array[QoaLms, QOA_MAX_CHANNELS](fill=QoaLms())
 
-    def open(mut self, data: List[UInt8]) -> Bool:
+    def _reset_stream_state(mut self):
         self.valid = False
+        self.channels = 0
+        self.sample_rate = 0
+        self.total_frames = 0
+        self.current_sample_frame = 0
+        self.frame_byte_offset = 8
+        self.frame_end_offset = 8
+        self.slice_byte_offset = 8
+        self.frame_samples_remaining = 0
+        self.slice_cache_pos = 0
+        self.slice_cache_len = 0
+        for i in range(QOA_SLICE_LEN * QOA_MAX_CHANNELS):
+            self.slice_cache[i] = 0
+        for c in range(QOA_MAX_CHANNELS):
+            self.lms[c] = QoaLms()
+
+    def open(mut self, data: List[UInt8]) -> Bool:
+        self._reset_stream_state()
         if len(data) < 16 or _get_be32(data, 0) != QOA_MAGIC:
             return False
         var total = Int(_get_be32(data, 4))
@@ -513,8 +530,11 @@ struct QoaStreamCursor(Copyable, Movable):
         self.channels = ch
         self.sample_rate = sr
         self.total_frames = total
+        if not self._seek_loaded(data, 0):
+            self._reset_stream_state()
+            return False
         self.valid = True
-        return self.seek(data, 0)
+        return True
 
     def _load_frame_header(mut self, data: List[UInt8], byte_off: Int) -> Bool:
         if byte_off + 8 + self.channels * 16 > len(data):
@@ -548,7 +568,7 @@ struct QoaStreamCursor(Copyable, Movable):
 
     def _decode_one_slice(mut self, data: List[UInt8]) -> Bool:
         """Decodes up to 20 sample frames into `self.slice_cache` with zero heap allocations."""
-        if not self.valid:
+        if self.channels <= 0:
             return False
         if self.frame_samples_remaining <= 0:
             if self.current_sample_frame - (self.slice_cache_len - self.slice_cache_pos) >= self.total_frames:
@@ -582,11 +602,7 @@ struct QoaStreamCursor(Copyable, Movable):
         self.slice_cache_len = slice_len
         return True
 
-    def seek(mut self, data: List[UInt8], target_sample_frame: Int) -> Bool:
-        """O(1) arithmetic frame seek to any sample index `[0, total_frames]`."""
-        if not self.valid:
-            if not self.open(data):
-                return False
+    def _seek_loaded(mut self, data: List[UInt8], target_sample_frame: Int) -> Bool:
         var clamped = max(0, min(self.total_frames, target_sample_frame))
         if clamped == self.total_frames:
             self.current_sample_frame = self.total_frames
@@ -617,6 +633,13 @@ struct QoaStreamCursor(Copyable, Movable):
 
         self.current_sample_frame = clamped
         return True
+
+    def seek(mut self, data: List[UInt8], target_sample_frame: Int) -> Bool:
+        """O(1) arithmetic frame seek to any sample index `[0, total_frames]`."""
+        if not self.valid:
+            if not self.open(data):
+                return False
+        return self._seek_loaded(data, target_sample_frame)
 
     @always_inline
     def read_next_frame_i16(mut self, data: List[UInt8], mut out_l: Int16, mut out_r: Int16) -> Bool:

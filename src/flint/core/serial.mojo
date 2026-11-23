@@ -137,13 +137,15 @@ struct BlobReader(Movable):
         self.ends = List[Int]()
 
     def remaining(self) -> Int:
-        return len(self.data) - self.offset
+        if self.offset < 0:
+            return len(self.data)
+        return max(0, len(self.data) - self.offset)
 
     def limit(self) -> Int:
         return self.ends[len(self.ends) - 1] if len(self.ends) > 0 else len(self.data)
 
     def peek_tag(self) -> UInt32:
-        if self.offset + 4 > self.limit():
+        if self.offset < 0 or self.offset + 4 > self.limit():
             return 0
         var value = UInt32(0)
         for shift in range(4):
@@ -162,7 +164,7 @@ struct BlobReader(Movable):
         if version < 1 or version > newest:
             self.failed = True
             raise Error("blob " + tag_text(tag) + " has version " + String(version) + "; this build reads 1 to " + String(newest))
-        if length < 0 or self.offset + length > self.limit():
+        if self.offset < 0 or length < 0 or length > self.limit() - self.offset:
             self.failed = True
             raise Error("blob " + tag_text(tag) + " is truncated")
         self.ends.append(self.offset + length)
@@ -173,13 +175,13 @@ struct BlobReader(Movable):
         if len(self.ends) == 0:
             raise Error("leave without enter")
         var end = self.ends.pop()
-        if self.failed or self.offset > end:
+        if self.failed or self.offset < 0 or self.offset > end:
             self.failed = True
             raise Error("blob payload overran its length")
         self.offset = end
 
     def u8(mut self) -> UInt8:
-        if self.offset >= self.limit():
+        if self.offset < 0 or self.offset >= self.limit():
             self.failed = True
             return 0
         var value = self.data[self.offset]
@@ -222,7 +224,7 @@ struct BlobReader(Movable):
 
     def text(mut self) -> String:
         var length = Int(self.u32())
-        if length < 0 or self.offset + length > self.limit():
+        if self.offset < 0 or length < 0 or length > self.limit() - self.offset:
             self.failed = True
             return String()
         var bytes = List[UInt8]()
@@ -233,7 +235,7 @@ struct BlobReader(Movable):
 
     def read_bytes_raw(mut self, dst_ptr: Int, byte_len: Int) -> Bool:
         """Reads `byte_len` raw bytes into `dst_ptr` in a single memcpy."""
-        if byte_len < 0 or self.offset + byte_len > self.limit():
+        if self.offset < 0 or byte_len < 0 or byte_len > self.limit() - self.offset:
             self.failed = True
             return False
         if byte_len > 0 and dst_ptr != 0:

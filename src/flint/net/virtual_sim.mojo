@@ -6,7 +6,7 @@ MTU enforcement using `detsort.MinHeap` and `detsort.mix64` — zero NIC traffic
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import max, min
+from std.math import isfinite, max, min
 from flint.core.detsort import MinHeap, mix64
 from flint.net.socket_udp import (
     DatagramView,
@@ -18,6 +18,34 @@ from flint.net.socket_udp import (
 
 comptime JITTER_UNIFORM: Int = 0
 comptime JITTER_TRIANGULAR: Int = 1
+comptime _MAX_SIM_TIME_US: Int = Int(Int64.MAX) - 1
+
+
+@always_inline
+def _clamp_rate_f64(v: Float64) -> Float64:
+    if not isfinite(v):
+        return 0.0
+    return max(0.0, min(1.0, v))
+
+
+@always_inline
+def _ms_to_us_saturated(ms: Float64) -> Int:
+    if not isfinite(ms) or ms <= 0.0:
+        return 0
+    var us_f = ms * 1000.0 + 0.5
+    if not isfinite(us_f) or us_f >= 9.0e18:
+        return Int(Int64.MAX)
+    return max(0, Int(us_f))
+
+
+@always_inline
+def _sat_add_i64(a: Int, b: Int) -> Int:
+    var s = Int128(a) + Int128(b)
+    if s > Int128(Int64.MAX):
+        return Int(Int64.MAX)
+    if s < Int128(Int64.MIN):
+        return Int(Int64.MIN)
+    return Int(s)
 
 
 struct _SimPacket(Copyable, Movable):
@@ -85,11 +113,11 @@ struct _VirtualSimCore(Movable):
     ):
         self.now_us = 0
         self.rng_state = seed ^ UInt64(0xD1B54A32D192ED03)
-        self.base_latency_us = max(0, Int(one_way_latency_ms * 1000.0 + 0.5))
-        self.jitter_us = max(0, Int(jitter_ms * 1000.0 + 0.5))
+        self.base_latency_us = _ms_to_us_saturated(one_way_latency_ms)
+        self.jitter_us = _ms_to_us_saturated(jitter_ms)
         self.jitter_mode = jitter_mode
-        self.loss_rate = max(0.0, min(1.0, loss_rate))
-        self.dup_rate = max(0.0, min(1.0, dup_rate))
+        self.loss_rate = _clamp_rate_f64(loss_rate)
+        self.dup_rate = _clamp_rate_f64(dup_rate)
         self.burst_loss_prob = 0.0
         self.burst_duration_us = 0
         self.global_blackout_until_us = -1
@@ -127,7 +155,16 @@ struct _VirtualSimCore(Movable):
         else:
             var u = self._next_unit_f64() * 2.0 - 1.0
             j_offset = u * Float64(self.jitter_us)
-        return max(0, self.base_latency_us + Int(j_offset))
+        var j_us: Int
+        if not isfinite(j_offset):
+            j_us = 0
+        elif j_offset >= 9.0e18:
+            j_us = Int(Int64.MAX)
+        elif j_offset <= -9.0e18:
+            j_us = Int(Int64.MIN)
+        else:
+            j_us = Int(j_offset)
+        return max(0, _sat_add_i64(self.base_latency_us, j_us))
 
     def _find_endpoint_idx(self, ep: NetEndpoint) -> Int:
         for i in range(len(self.inboxes)):
@@ -192,7 +229,7 @@ struct _VirtualSimCore(Movable):
             if self._next_unit_f64() < self.burst_loss_prob:
                 self.inboxes[src_idx].blackout_until_us = max(
                     self.inboxes[src_idx].blackout_until_us,
-                    self.now_us + self.burst_duration_us,
+                    _sat_add_i64(self.now_us, self.burst_duration_us),
                 )
 
         if self.inboxes[src_idx].drop_next_outbound > 0:
@@ -220,12 +257,12 @@ struct _VirtualSimCore(Movable):
         var src_ep = self.inboxes[src_idx].endpoint
         var delay1 = self._sample_delay_us()
         var slot1 = self._alloc_packet(src_ep, dst_idx, data_ptr, length)
-        self.flight_heap.push(self.now_us + delay1, slot1)
+        self.flight_heap.push(_sat_add_i64(self.now_us, delay1), slot1)
 
         if self.dup_rate > 0.0 and self._next_unit_f64() < self.dup_rate:
-            var delay2 = self._sample_delay_us() + 250
+            var delay2 = _sat_add_i64(self._sample_delay_us(), 250)
             var slot2 = self._alloc_packet(src_ep, dst_idx, data_ptr, length)
-            self.flight_heap.push(self.now_us + delay2, slot2)
+            self.flight_heap.push(_sat_add_i64(self.now_us, delay2), slot2)
             self.packets_duplicated += 1
 
         # Deliver zero-latency packets immediately
@@ -441,12 +478,20 @@ struct VirtualNetSim(Movable):
         return self.create_endpoint(ep)
 
     def advance_ms(mut self, delta_ms: Float64):
-        var delta_us = max(0, Int(delta_ms * 1000.0 + 0.5))
-        self._storage[0].now_us += delta_us
+        var delta_us = _ms_to_us_saturated(delta_ms)
+        self._storage[0].now_us = min(
+            _MAX_SIM_TIME_US,
+            _sat_add_i64(self._storage[0].now_us, delta_us),
+        )
         self._storage[0].pump_due()
 
     def set_time_ms(mut self, time_ms: Float64):
-        var target_us = max(self._storage[0].now_us, Int(time_ms * 1000.0 + 0.5))
+        if not isfinite(time_ms):
+            return
+        var target_us = min(
+            _MAX_SIM_TIME_US,
+            max(self._storage[0].now_us, _ms_to_us_saturated(time_ms)),
+        )
         self._storage[0].now_us = target_us
         self._storage[0].pump_due()
 
@@ -457,15 +502,13 @@ struct VirtualNetSim(Movable):
     def configure_burst_loss(
         mut self, prob_per_packet: Float64, blackout_duration_ms: Float64
     ):
-        self._storage[0].burst_loss_prob = max(0.0, min(1.0, prob_per_packet))
-        self._storage[0].burst_duration_us = max(
-            0, Int(blackout_duration_ms * 1000.0 + 0.5)
-        )
+        self._storage[0].burst_loss_prob = _clamp_rate_f64(prob_per_packet)
+        self._storage[0].burst_duration_us = _ms_to_us_saturated(blackout_duration_ms)
 
     def trigger_global_blackout(mut self, duration_ms: Float64):
-        var dur_us = max(0, Int(duration_ms * 1000.0 + 0.5))
-        self._storage[0].global_blackout_until_us = (
-            self._storage[0].now_us + dur_us
+        var dur_us = _ms_to_us_saturated(duration_ms)
+        self._storage[0].global_blackout_until_us = _sat_add_i64(
+            self._storage[0].now_us, dur_us
         )
 
     def drop_next_outbound_packets(mut self, endpoint_id: Int, count: Int):

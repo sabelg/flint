@@ -10,7 +10,7 @@ rounded corners or its lit top edge.
 no texture file is needed. Pixels are straight (not premultiplied) alpha;
 `SoftwareFramebuffer.draw_nine_slice` blends them like every other HUD call.
 """
-from std.math import sqrt
+from std.math import floor, isfinite, sqrt
 
 comptime SLICE_SLATE: Int = 0
 comptime SLICE_FOCUS: Int = 1
@@ -26,19 +26,42 @@ struct NineSlice(Copyable, Movable):
     var pixels: List[UInt32]   # ARGB, straight alpha
 
     def __init__(out self, width: Int, height: Int, left: Int, top: Int, right: Int, bottom: Int):
-        self.width = width
-        self.height = height
-        self.left = left
-        self.top = top
-        self.right = right
-        self.bottom = bottom
-        self.pixels = List[UInt32](length=width * height, fill=0)
+        var w = max(0, width)
+        var h = max(0, height)
+        if w <= 0 or h <= 0 or w > Int.MAX // h:
+            self.width = 0
+            self.height = 0
+            self.left = 0
+            self.top = 0
+            self.right = 0
+            self.bottom = 0
+            self.pixels = List[UInt32]()
+        else:
+            self.width = w
+            self.height = h
+            self.left = max(0, left)
+            self.top = max(0, top)
+            self.right = max(0, right)
+            self.bottom = max(0, bottom)
+            self.pixels = List[UInt32](length=w * h, fill=0)
 
     def at(self, x: Int, y: Int) -> UInt32:
-        return self.pixels[max(0, min(self.height - 1, y)) * self.width + max(0, min(self.width - 1, x))]
+        if self.width <= 0 or self.height <= 0 or len(self.pixels) == 0:
+            return UInt32(0)
+        var cx = max(0, min(self.width - 1, x))
+        var cy = max(0, min(self.height - 1, y))
+        var idx = cy * self.width + cx
+        if idx < 0 or idx >= len(self.pixels):
+            return UInt32(0)
+        return self.pixels[idx]
 
     def set(mut self, x: Int, y: Int, color: UInt32):
-        self.pixels[y * self.width + x] = color
+        if self.width <= 0 or self.height <= 0 or x < 0 or x >= self.width or y < 0 or y >= self.height:
+            return
+        var idx = y * self.width + x
+        if idx < 0 or idx >= len(self.pixels):
+            return
+        self.pixels[idx] = color
 
 
 def argb(alpha: Int, red: Int, green: Int, blue: Int) -> UInt32:
@@ -131,23 +154,31 @@ def slice_map(destination: Int, source: Int, first: Int, last: Int, scale: Float
     pixels per source pixel, shrunk together if the rectangle is smaller
     than both; the middle stretches over the source's middle."""
     var map = List[Int](length=max(0, destination), fill=0)
-    if destination <= 0:
+    if destination <= 0 or source <= 0:
         return map^
-    var head = Int(Float32(first) * scale + 0.5)
-    var tail = Int(Float32(last) * scale + 0.5)
-    if head + tail > destination:
-        var total = max(1, head + tail)
-        head = destination * head // total
+    var sc = Float64(scale) if (isfinite(scale) and scale > Float32(0.0)) else Float64(1.0)
+    var f = max(0, min(source, first))
+    var l = max(0, min(source - f, last))
+    var head_f = floor(Float64(f) * sc + 0.5)
+    var tail_f = floor(Float64(l) * sc + 0.5)
+    var head: Int
+    var tail: Int
+    if head_f + tail_f > Float64(destination):
+        var total_f = max(1.0, head_f + tail_f)
+        head = max(0, min(destination, Int(Float64(destination) * head_f / total_f)))
         tail = destination - head
+    else:
+        head = max(0, min(destination, Int(head_f)))
+        tail = max(0, min(destination - head, Int(tail_f)))
     var middle = destination - head - tail
-    var source_middle = max(1, source - first - last)
+    var source_middle = max(1, source - f - l)
     for index in range(destination):
         if index < head:
-            map[index] = min(first - 1, Int((Float32(index) + 0.5) * Float32(first) / Float32(head)))
+            map[index] = min(max(0, f - 1), Int((Float32(index) + 0.5) * Float32(f) / Float32(max(1, head))))
         elif index >= destination - tail:
             var into = index - (destination - tail)
-            map[index] = source - last + min(last - 1, Int((Float32(into) + 0.5) * Float32(last) / Float32(tail)))
+            map[index] = source - l + min(max(0, l - 1), Int((Float32(into) + 0.5) * Float32(l) / Float32(max(1, tail))))
         else:
             var into = index - head
-            map[index] = first + min(source_middle - 1, Int((Float32(into) + 0.5) * Float32(source_middle) / Float32(middle)))
+            map[index] = f + min(source_middle - 1, Int((Float32(into) + 0.5) * Float32(source_middle) / Float32(max(1, middle))))
     return map^

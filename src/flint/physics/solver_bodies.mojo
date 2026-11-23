@@ -12,7 +12,7 @@ v4 Upgrades:
    `I_b * (w_b^+ - w_b) + h * (w_b^+ x (I_b * w_b^+)) = 0`, preserving rotational
    energy and capturing the Dzhanibekov intermediate-axis flip without energy blowup.
 """
-from std.math import sqrt, abs, max
+from std.math import sqrt, abs, max, min
 from std.os import abort
 from flint.core.math import Vec3, Quat
 
@@ -153,6 +153,18 @@ struct Sym3(Copyable, ImplicitlyCopyable, Movable):
         var c12 = self.xy * self.xz - self.xx * self.yz
         var c22 = self.xx * self.yy - self.xy * self.xy
         return Self(c00 * inv, c11 * inv, c22 * inv, c01 * inv, c02 * inv, c12 * inv)
+
+
+@always_inline
+def _clamp_finite_f8(v: F8, lim: Float32 = Float32(1.0e15)) -> F8:
+    var is_nan = v.ne(v)
+    var safe = is_nan.select(F8(0.0), v)
+    return max(F8(-lim), min(F8(lim), safe))
+
+
+@always_inline
+def _clamp_finite_v8(v: V8, lim: Float32 = Float32(1.0e15)) -> V8:
+    return V8(_clamp_finite_f8(v.x, lim), _clamp_finite_f8(v.y, lim), _clamp_finite_f8(v.z, lim))
 
 
 def skew_sandwich(r: Vec3, i: Sym3) -> Sym3:
@@ -445,6 +457,8 @@ struct SolverBodies(Movable):
             fw = fw.scale(max(F8(0), F8(1) - ld(self.arate, at) * hv))
             v = V8(field.select(fv.x, v.x), field.select(fv.y, v.y), field.select(fv.z, v.z))
             w = V8(field.select(fw.x, w.x), field.select(fw.y, w.y), field.select(fw.z, w.z))
+        v = _clamp_finite_v8(v)
+        w = _clamp_finite_v8(w)
         v = v.scale(max(F8(0), F8(1) - ld(self.lin_damp, at) * hv))
         w = w.scale(max(F8(0), F8(1) - ld(self.ang_damp, at) * hv))
 
@@ -515,6 +529,8 @@ struct SolverBodies(Movable):
             var w_gyro = _quat_rotate_v8(qx, qy, qz, qw, wb_next)
             w = V8(valid.select(w_gyro.x, w.x), valid.select(w_gyro.y, w.y), valid.select(w_gyro.z, w.z))
 
+        v = _clamp_finite_v8(v)
+        w = _clamp_finite_v8(w)
         var speed2 = v.dot(v)
         var limit = F8(max_speed)
         var fast = speed2.gt(limit * limit)
@@ -534,12 +550,12 @@ struct SolverBodies(Movable):
         self._check_batch(batch, "integrate_positions")
         var at = batch * LANES
         var hv = F8(h)
-        var vx = ld(self.vx, at)
-        var vy = ld(self.vy, at)
-        var vz = ld(self.vz, at)
-        var wx = ld(self.wx, at)
-        var wy = ld(self.wy, at)
-        var wz = ld(self.wz, at)
+        var vx = _clamp_finite_f8(ld(self.vx, at))
+        var vy = _clamp_finite_f8(ld(self.vy, at))
+        var vz = _clamp_finite_f8(ld(self.vz, at))
+        var wx = _clamp_finite_f8(ld(self.wx, at))
+        var wy = _clamp_finite_f8(ld(self.wy, at))
+        var wz = _clamp_finite_f8(ld(self.wz, at))
         st(self.dpx, at, ld(self.dpx, at) + vx * hv)
         st(self.dpy, at, ld(self.dpy, at) + vy * hv)
         st(self.dpz, at, ld(self.dpz, at) + vz * hv)

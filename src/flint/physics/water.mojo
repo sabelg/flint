@@ -5,7 +5,7 @@ Preserves flat-water helpers (`NO_WATER`, `WATER_DENSITY`, `WATER_DRAG`, `floats
 `submerged_fraction`, `buoyant_acceleration`) for legacy voxel/field callers while
 providing SI Beaufort wave kinematics and rigid-body hydrodynamics.
 """
-from std.math import sqrt, max, min
+from std.math import sqrt, max, min, isfinite
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import det_sin, det_cos, PI
 
@@ -19,20 +19,30 @@ comptime MAX_BEAUFORT_WAVE_AMP: Float32 = 0.165
 
 
 def floats(material_density: Float32) -> Bool:
+    if not isfinite(material_density):
+        return False
     return material_density > 0 and material_density < WATER_DENSITY
 
 
 def submerged_fraction(bottom: Float32, height: Float32, water_level: Float32) -> Float32:
+    if not (isfinite(bottom) and isfinite(height) and isfinite(water_level)):
+        return Float32(0.0)
     if water_level <= NO_WATER + 1 or height <= 0:
-        return 0
-    return max(Float32(0), min(Float32(1), (water_level - bottom) / height))
+        return Float32(0.0)
+    var ratio = (Float64(water_level) - Float64(bottom)) / Float64(height)
+    if not isfinite(ratio):
+        return Float32(0.0)
+    return Float32(max(0.0, min(1.0, ratio)))
 
 
 def buoyant_acceleration(fraction: Float32, material_density: Float32, gravity: Float32) -> Float32:
     """Upward acceleration from displaced water (Archimedes)."""
+    if not (isfinite(fraction) and isfinite(material_density) and isfinite(gravity)):
+        return Float32(0.0)
     if fraction <= 0 or material_density <= 0:
-        return 0
-    return gravity * fraction * (WATER_DENSITY / material_density)
+        return Float32(0.0)
+    var res = gravity * fraction * (WATER_DENSITY / material_density)
+    return res if isfinite(res) else Float32(0.0)
 
 
 def eval_beaufort_wave(
@@ -49,6 +59,16 @@ def eval_beaufort_wave(
       - `normal`: unit surface normal `normalize(-d_eta/dx, 1, -d_eta/dz)`
       - `orbital_vel`: Airy deep-water wave particle velocity `(vx, vy, vz)` (m/s)
     """
+    if not (
+        isfinite(wx)
+        and isfinite(wz)
+        and isfinite(time_s)
+        and isfinite(water_y)
+        and isfinite(shallow_damp)
+    ):
+        var safe_y = water_y if isfinite(water_y) else Float32(0.0)
+        return (safe_y, Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 0.0))
+
     var k_arr = [
         Float32(0.42), Float32(0.71), Float32(1.18), Float32(1.95),
         Float32(3.15), Float32(4.85), Float32(6.90), Float32(9.20),
@@ -75,6 +95,8 @@ def eval_beaufort_wave(
         var kz = dir_z * kf
         var om = sqrt(Float32(9.81) * kf)
         var ph = wx * kx + wz * kz + time_s * om
+        if not isfinite(ph):
+            continue
         var s_ph = det_sin(ph)
         var c_ph = det_cos(ph)
 
@@ -91,6 +113,12 @@ def eval_beaufort_wave(
 
     var eta = water_y + crest_h
     var normal = Vec3(-dx_w, Float32(1.0), -dz_w).normalized()
+    if not (
+        isfinite(eta)
+        and isfinite(normal.x) and isfinite(normal.y) and isfinite(normal.z)
+        and isfinite(orb_x) and isfinite(orb_y) and isfinite(orb_z)
+    ):
+        return (water_y, Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 0.0))
     return (eta, normal, Vec3(orb_x, orb_y, orb_z))
 
 
@@ -110,6 +138,19 @@ struct BuoyancyWrench(Copyable, ImplicitlyCopyable, Movable):
         self.surface_eta = 0.0
 
 
+@always_inline
+def _clamp_vec3_f64(x: Float64, y: Float64, z: Float64, max_mag: Float64 = 1.0e35) -> Vec3:
+    if not (isfinite(x) and isfinite(y) and isfinite(z)):
+        return Vec3()
+    var mag = sqrt(x * x + y * y + z * z)
+    if not isfinite(mag):
+        return Vec3()
+    if mag > max_mag and mag > 0.0:
+        var s = max_mag / mag
+        return Vec3(Float32(x * s), Float32(y * s), Float32(z * s))
+    return Vec3(Float32(x), Float32(y), Float32(z))
+
+
 def eval_sphere_buoyancy_drag(
     center: Vec3,
     radius: Float32,
@@ -123,14 +164,33 @@ def eval_sphere_buoyancy_drag(
     use_waves: Bool = True,
 ) -> BuoyancyWrench:
     """Computes exact spherical-cap Archimedes buoyancy and quadratic drag in Beaufort waves."""
-    var r = max(Float32(1.0e-4), radius)
+    if not (
+        isfinite(center.x) and isfinite(center.y) and isfinite(center.z)
+        and isfinite(radius) and isfinite(water_y)
+    ):
+        return BuoyancyWrench(Vec3(), Vec3(), Float32(0.0), Float32(0.0), Float32(0.0))
+    var r = max(Float32(1.0e-4), min(Float32(1.0e6), radius))
     var max_surface = water_y + (MAX_BEAUFORT_WAVE_AMP if use_waves else Float32(0.0))
     if center.y - r >= max_surface:
         return BuoyancyWrench(Vec3(), Vec3(), Float32(0.0), Float32(0.0), water_y)
+    var safe_t = time_s if isfinite(time_s) else Float32(0.0)
+    var safe_rho = max(Float32(0.0), fluid_density) if isfinite(fluid_density) else RHO_SEAWATER_SI
+    var safe_g = gravity if isfinite(gravity) else Float32(9.81)
+    var safe_cd = max(Float32(0.0), cd) if isfinite(cd) else Float32(0.47)
+    var safe_lv = Vec3(
+        linear_vel.x if isfinite(linear_vel.x) else Float32(0.0),
+        linear_vel.y if isfinite(linear_vel.y) else Float32(0.0),
+        linear_vel.z if isfinite(linear_vel.z) else Float32(0.0),
+    )
+    var safe_av = Vec3(
+        angular_vel.x if isfinite(angular_vel.x) else Float32(0.0),
+        angular_vel.y if isfinite(angular_vel.y) else Float32(0.0),
+        angular_vel.z if isfinite(angular_vel.z) else Float32(0.0),
+    )
     var eta = water_y
     var orb_vel = Vec3()
     if use_waves:
-        var w = eval_beaufort_wave(center.x, center.z, time_s, water_y)
+        var w = eval_beaufort_wave(center.x, center.z, safe_t, water_y)
         eta = w[0]
         orb_vel = w[2]
 
@@ -143,12 +203,17 @@ def eval_sphere_buoyancy_drag(
     var v_sub = (PI * h_sub * h_sub / Float32(3.0)) * (Float32(3.0) * r - h_sub)
     var frac = max(Float32(0.0), min(Float32(1.0), v_sub / v_full))
 
-    var f_buoy = Vec3(0.0, fluid_density * v_sub * gravity, 0.0)
-    var v_rel = linear_vel - orb_vel
-    var rel_spd = v_rel.length()
-    var area_wet = PI * r * r * frac
-    var f_drag = -v_rel * (Float32(0.5) * fluid_density * cd * area_wet * rel_spd)
-    var tau_drag = -angular_vel * (fluid_density * r * r * v_sub * Float32(0.8))
+    var f_buoy = Vec3(0.0, safe_rho * v_sub * safe_g, 0.0)
+    var v_rel = safe_lv - orb_vel
+    var vx64 = Float64(v_rel.x)
+    var vy64 = Float64(v_rel.y)
+    var vz64 = Float64(v_rel.z)
+    var rel_spd64 = sqrt(vx64 * vx64 + vy64 * vy64 + vz64 * vz64)
+    var area_wet64 = Float64(PI) * Float64(r) * Float64(r) * Float64(frac)
+    var drag_k64 = 0.5 * Float64(safe_rho) * Float64(safe_cd) * area_wet64 * rel_spd64
+    var f_drag = _clamp_vec3_f64(-vx64 * drag_k64, -vy64 * drag_k64, -vz64 * drag_k64)
+    var tau_k64 = Float64(safe_rho) * Float64(r) * Float64(r) * Float64(v_sub) * 0.8
+    var tau_drag = _clamp_vec3_f64(-Float64(safe_av.x) * tau_k64, -Float64(safe_av.y) * tau_k64, -Float64(safe_av.z) * tau_k64)
 
     return BuoyancyWrench(f_buoy + f_drag, tau_drag, v_sub, frac, eta)
 
@@ -168,9 +233,30 @@ def eval_box_buoyancy_drag(
 ) -> BuoyancyWrench:
     """Evaluates 27-subcell Archimedes buoyancy, metacentric righting torque, and quadratic
     hydrodynamic drag on an oriented 3D box in Beaufort waves."""
-    var hx = max(Float32(1.0e-4), half_extents.x)
-    var hy = max(Float32(1.0e-4), half_extents.y)
-    var hz = max(Float32(1.0e-4), half_extents.z)
+    if not (
+        isfinite(center.x) and isfinite(center.y) and isfinite(center.z)
+        and isfinite(rot.x) and isfinite(rot.y) and isfinite(rot.z) and isfinite(rot.w)
+        and isfinite(half_extents.x) and isfinite(half_extents.y) and isfinite(half_extents.z)
+        and isfinite(water_y)
+    ):
+        return BuoyancyWrench(Vec3(), Vec3(), Float32(0.0), Float32(0.0), Float32(0.0))
+    var hx = max(Float32(1.0e-4), min(Float32(1.0e5), half_extents.x))
+    var hy = max(Float32(1.0e-4), min(Float32(1.0e5), half_extents.y))
+    var hz = max(Float32(1.0e-4), min(Float32(1.0e5), half_extents.z))
+    var safe_t = time_s if isfinite(time_s) else Float32(0.0)
+    var safe_rho = max(Float32(0.0), fluid_density) if isfinite(fluid_density) else RHO_SEAWATER_SI
+    var safe_g = gravity if isfinite(gravity) else Float32(9.81)
+    var safe_cd = max(Float32(0.0), cd) if isfinite(cd) else Float32(1.05)
+    var safe_lv = Vec3(
+        linear_vel.x if isfinite(linear_vel.x) else Float32(0.0),
+        linear_vel.y if isfinite(linear_vel.y) else Float32(0.0),
+        linear_vel.z if isfinite(linear_vel.z) else Float32(0.0),
+    )
+    var safe_av = Vec3(
+        angular_vel.x if isfinite(angular_vel.x) else Float32(0.0),
+        angular_vel.y if isfinite(angular_vel.y) else Float32(0.0),
+        angular_vel.z if isfinite(angular_vel.z) else Float32(0.0),
+    )
     var v_full = Float32(8.0) * hx * hy * hz
     var v_cell = v_full * Float32(1.0 / 27.0)
 
@@ -188,10 +274,14 @@ def eval_box_buoyancy_drag(
 
     var center_eta = water_y
     if use_waves:
-        center_eta = eval_beaufort_wave(center.x, center.z, time_s, water_y)[0]
+        center_eta = eval_beaufort_wave(center.x, center.z, safe_t, water_y)[0]
 
-    var total_f = Vec3()
-    var total_tau = Vec3()
+    var total_fx64 = 0.0
+    var total_fy64 = 0.0
+    var total_fz64 = 0.0
+    var total_tx64 = 0.0
+    var total_ty64 = 0.0
+    var total_tz64 = 0.0
     var v_sub_sum = Float32(0.0)
 
     var coords = [Float32(-2.0 / 3.0), Float32(0.0), Float32(2.0 / 3.0)]
@@ -206,7 +296,7 @@ def eval_box_buoyancy_drag(
                 var eta = water_y
                 var orb = Vec3()
                 if use_waves:
-                    var w = eval_beaufort_wave(p_cell.x, p_cell.z, time_s, water_y)
+                    var w = eval_beaufort_wave(p_cell.x, p_cell.z, safe_t, water_y)
                     eta = w[0]
                     orb = w[2]
 
@@ -219,19 +309,37 @@ def eval_box_buoyancy_drag(
 
                 var dv_vol = v_cell * sub_f
                 v_sub_sum += dv_vol
-                var f_b = Vec3(0.0, fluid_density * dv_vol * gravity, 0.0)
+                var fy_b = Float64(safe_rho) * Float64(dv_vol) * Float64(safe_g)
 
-                var v_pt = linear_vel + angular_vel.cross(r_arm) - orb
-                var spd = v_pt.length()
-                var f_d = -v_pt * (Float32(0.5) * fluid_density * cd * cell_area * sub_f * spd)
+                var v_pt = safe_lv + safe_av.cross(r_arm) - orb
+                var vpx64 = Float64(v_pt.x)
+                var vpy64 = Float64(v_pt.y)
+                var vpz64 = Float64(v_pt.z)
+                var spd64 = sqrt(vpx64 * vpx64 + vpy64 * vpy64 + vpz64 * vpz64)
+                var dk64 = 0.5 * Float64(safe_rho) * Float64(safe_cd) * Float64(cell_area) * Float64(sub_f) * spd64
+                var fx_c = -vpx64 * dk64
+                var fy_c = fy_b - vpy64 * dk64
+                var fz_c = -vpz64 * dk64
 
-                var f_cell = f_b + f_d
-                total_f = total_f + f_cell
-                total_tau = total_tau + r_arm.cross(f_cell)
+                total_fx64 += fx_c
+                total_fy64 += fy_c
+                total_fz64 += fz_c
+                total_tx64 += Float64(r_arm.y) * fz_c - Float64(r_arm.z) * fy_c
+                total_ty64 += Float64(r_arm.z) * fx_c - Float64(r_arm.x) * fz_c
+                total_tz64 += Float64(r_arm.x) * fy_c - Float64(r_arm.y) * fx_c
 
     var frac = max(Float32(0.0), min(Float32(1.0), v_sub_sum / v_full))
     if frac > Float32(0.0):
         var max_h = max(hx, max(hy, hz))
-        total_tau = total_tau - angular_vel * (fluid_density * max_h * max_h * v_sub_sum * Float32(0.4))
+        var ang_k64 = Float64(safe_rho) * Float64(max_h) * Float64(max_h) * Float64(v_sub_sum) * 0.4
+        total_tx64 -= Float64(safe_av.x) * ang_k64
+        total_ty64 -= Float64(safe_av.y) * ang_k64
+        total_tz64 -= Float64(safe_av.z) * ang_k64
 
-    return BuoyancyWrench(total_f, total_tau, v_sub_sum, frac, center_eta)
+    return BuoyancyWrench(
+        _clamp_vec3_f64(total_fx64, total_fy64, total_fz64),
+        _clamp_vec3_f64(total_tx64, total_ty64, total_tz64),
+        v_sub_sum,
+        frac,
+        center_eta,
+    )

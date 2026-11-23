@@ -432,17 +432,22 @@ struct SnapshotReplicator(Movable):
         vel_limit: Float32 = 120.0,
         chunk_size: Float32 = 0.0,
     ):
+        var wb = abs(world_bounds) if _rep_is_finite32(world_bounds) else Float32(512.0)
+        var vl = vel_limit if _rep_is_finite32(vel_limit) else Float32(120.0)
+        var cs_in = chunk_size if _rep_is_finite32(chunk_size) else Float32(0.0)
+        var ir_in = interest_radius if (_rep_is_finite32(interest_radius) and interest_radius > Float32(0.0)) else Float32(110.0)
+        var cell_in = cell_size if (_rep_is_finite32(cell_size) and cell_size > Float32(0.0)) else Float32(32.0)
         self.max_entities = max(1, max_entities)
         self.max_clients = max(1, max_clients)
         self.max_packet_bytes = max(64, min(1180, max_packet_bytes))
-        self.world_min = -abs(world_bounds)
-        self.world_max = abs(world_bounds)
+        self.world_min = -wb
+        self.world_max = wb
         self.chunk_size = (
-            max(Float32(1.0), chunk_size)
-            if chunk_size > Float32(0.0)
-            else max(Float32(64.0), abs(world_bounds))
+            max(Float32(1.0), cs_in)
+            if cs_in > Float32(0.0)
+            else max(Float32(64.0), wb)
         )
-        self.vel_limit = max(Float32(1.0), vel_limit)
+        self.vel_limit = max(Float32(1.0), vl)
 
         self.entities = List[ReplicatedEntity](capacity=self.max_entities)
         for i in range(self.max_entities):
@@ -454,11 +459,11 @@ struct SnapshotReplicator(Movable):
         self.clients = List[_ClientRepState](capacity=self.max_clients)
         for _ in range(self.max_clients):
             self.clients.append(
-                _ClientRepState(self.max_entities, interest_radius)
+                _ClientRepState(self.max_entities, ir_in)
             )
 
         self.grid = SpatialInterestGrid(
-            self.max_entities, cell_size, use_3d_grid
+            self.max_entities, cell_in, use_3d_grid
         )
         self.candidate_indices = List[Int](capacity=self.max_entities)
         self.candidate_masks = List[UInt8](
@@ -472,9 +477,12 @@ struct SnapshotReplicator(Movable):
 
     @always_inline
     def _quant_pos(self, v: Float32) -> Int:
+        var vf = v if _rep_is_finite32(v) else Float32(0.0)
         var span = self.world_max - self.world_min
+        if not _rep_is_finite32(span) or span <= Float32(0.0):
+            return 0
         var norm = max(
-            Float32(0.0), min(Float32(1.0), (v - self.world_min) / span)
+            Float32(0.0), min(Float32(1.0), (vf - self.world_min) / span)
         )
         return Int(norm * Float32(65535.0) + Float32(0.5))
 
@@ -486,9 +494,12 @@ struct SnapshotReplicator(Movable):
 
     @always_inline
     def _quant_vel(self, v: Float32) -> Int:
+        var vf = v if _rep_is_finite32(v) else Float32(0.0)
         var span = Float32(2.0) * self.vel_limit
+        if not _rep_is_finite32(span) or span <= Float32(0.0):
+            return 2048
         var norm = max(
-            Float32(0.0), min(Float32(1.0), (v + self.vel_limit) / span)
+            Float32(0.0), min(Float32(1.0), (vf + self.vel_limit) / span)
         )
         return Int(norm * Float32(4095.0) + Float32(0.5))
 
@@ -509,14 +520,31 @@ struct SnapshotReplicator(Movable):
     ):
         if entity_id < 0 or entity_id >= self.max_entities:
             return
+        var safe_pos = Vec3(
+            pos.x if _rep_is_finite32(pos.x) else Float32(0.0),
+            pos.y if _rep_is_finite32(pos.y) else Float32(0.0),
+            pos.z if _rep_is_finite32(pos.z) else Float32(0.0),
+        )
+        var safe_vel = Vec3(
+            vel.x if _rep_is_finite32(vel.x) else Float32(0.0),
+            vel.y if _rep_is_finite32(vel.y) else Float32(0.0),
+            vel.z if _rep_is_finite32(vel.z) else Float32(0.0),
+        )
+        var safe_rot = rot.normalized() if (
+            _rep_is_finite32(rot.x)
+            and _rep_is_finite32(rot.y)
+            and _rep_is_finite32(rot.z)
+            and _rep_is_finite32(rot.w)
+        ) else Quat.identity()
+        var safe_prio = base_priority if _rep_is_finite32(base_priority) else Float32(1.0)
         self.entities[entity_id].active = True
         self.entities[entity_id].net_id = entity_id
-        self.entities[entity_id].pos = pos
-        self.entities[entity_id].rot = rot.normalized()
-        self.entities[entity_id].vel = vel
+        self.entities[entity_id].pos = safe_pos
+        self.entities[entity_id].rot = safe_rot
+        self.entities[entity_id].vel = safe_vel
         self.entities[entity_id].state_flags = state_flags
         self.entities[entity_id].base_priority = max(
-            Float32(0.05), base_priority
+            Float32(0.05), safe_prio
         )
 
     def destroy_entity(mut self, entity_id: Int):
@@ -535,8 +563,12 @@ struct SnapshotReplicator(Movable):
         if client_id < 0 or client_id >= self.max_clients:
             return
         self.clients[client_id].connected = True
-        self.clients[client_id].observer_pos = observer_pos
-        if interest_radius > Float32(0.0):
+        self.clients[client_id].observer_pos = Vec3(
+            observer_pos.x if _rep_is_finite32(observer_pos.x) else Float32(0.0),
+            observer_pos.y if _rep_is_finite32(observer_pos.y) else Float32(0.0),
+            observer_pos.z if _rep_is_finite32(observer_pos.z) else Float32(0.0),
+        )
+        if _rep_is_finite32(interest_radius) and interest_radius > Float32(0.0):
             self.clients[client_id].interest_radius = interest_radius
 
     def notify_client_ack(mut self, client_id: Int, acked_snap_seq: UInt16):
@@ -700,9 +732,8 @@ struct SnapshotReplicator(Movable):
                 self.entities[eid].base_priority * near_boost * spawn_boost
             )
             self.clients[client_id].priority_accum[eid] += gain
-            var score = Int(
-                self.clients[client_id].priority_accum[eid] * Float32(1024.0)
-            )
+            var acc_raw = self.clients[client_id].priority_accum[eid] * Float32(1024.0)
+            var score = Int(max(Float32(-1.0e15), min(Float32(1.0e15), acc_raw))) if _rep_is_finite32(acc_raw) else 0
             dirty_candidates.append(eid)
             self.sort_keys.append(-score)  # ascending key => highest priority first
 

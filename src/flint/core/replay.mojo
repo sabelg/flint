@@ -151,7 +151,7 @@ struct ByteReader(Movable):
         return len(self.data) - self.offset
 
     def u8(mut self) -> UInt8:
-        if self.offset >= len(self.data):
+        if self.offset < 0 or self.offset >= len(self.data):
             self.failed = True
             return 0
         var value = self.data[self.offset]
@@ -171,6 +171,10 @@ struct ByteReader(Movable):
         return value
 
     def bits(mut self, count: Int) -> List[Bool]:
+        if count <= 0:
+            if count < 0:
+                self.failed = True
+            return List[Bool]()
         var flags = List[Bool](length=count, fill=False)
         var byte = UInt8(0)
         for index in range(count):
@@ -181,7 +185,7 @@ struct ByteReader(Movable):
 
     def bytes(mut self, count: Int) -> List[UInt8]:
         var out = List[UInt8]()
-        if count < 0 or self.offset + count > len(self.data):
+        if count < 0 or self.offset < 0 or self.offset + count > len(self.data):
             self.failed = True
             return out^
         for index in range(count):
@@ -369,6 +373,8 @@ def encode_dev_record(mut out: List[UInt8], kind: Int, payload: List[UInt8]):
 
 
 def word_at(data: List[UInt8], at: Int) -> UInt64:
+    if at < 0 or at + 8 > len(data):
+        return 0
     var value = UInt64(0)
     for byte in range(8):
         value |= UInt64(data[at + byte]) << UInt64(byte * 8)
@@ -377,7 +383,7 @@ def word_at(data: List[UInt8], at: Int) -> UInt64:
 
 def is_dev_record_at(data: List[UInt8], offset: Int) -> Bool:
     """Whether the TICK_BYTES record at `offset` is a dev record."""
-    if offset + TICK_BYTES > len(data):
+    if offset < 0 or offset + TICK_BYTES > len(data):
         return False
     return word_at(data, offset + INPUT_BYTES) == DEV_MAGIC
 
@@ -394,6 +400,9 @@ struct DevRecord(Copyable, Movable):
 def read_dev_record(mut reader: ByteReader) -> DevRecord:
     """Reads the dev record at the reader (check `is_dev_record_at` first)."""
     var start = reader.offset
+    if start < 0 or start + TICK_BYTES > len(reader.data):
+        reader.failed = True
+        return DevRecord(0, List[UInt8]())
     var count = Int(reader.u8()) | (Int(reader.u8()) << 8)
     var payload = reader.bytes(min(count, DEV_PAYLOAD_BYTES))
     reader.offset = start + INPUT_BYTES
@@ -422,7 +431,7 @@ def skip_dev_records(mut reader: ByteReader) -> Int:
 def count_ticks(reader: ByteReader) -> Int:
     """Tick records from the reader to the end, dev records not counted."""
     var ticks = 0
-    var at = reader.offset
+    var at = max(0, reader.offset)
     while at + TICK_BYTES <= len(reader.data):
         if not is_dev_record_at(reader.data, at):
             ticks += 1
@@ -434,7 +443,7 @@ def tick_offsets(reader: ByteReader) -> List[Int]:
     """The byte offset of every tick record from the reader on (dev records
     before a tick belong to it: its offset is the first of them)."""
     var offsets = List[Int]()
-    var at = reader.offset
+    var at = max(0, reader.offset)
     var group = at
     while at + TICK_BYTES <= len(reader.data):
         if not is_dev_record_at(reader.data, at):

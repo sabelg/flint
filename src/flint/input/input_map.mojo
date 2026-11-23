@@ -13,7 +13,7 @@ Features:
   - `save_json()` / `load_json()` runtime rebinding persistence & `pack_deterministic_tick()`.
 """
 from std.collections import List
-from std.math import sqrt, abs
+from std.math import sqrt, abs, isfinite
 from flint.assets.json import parse_json
 from flint.assets.json_write import json_quote
 from flint.app.engine_app import Resource
@@ -121,14 +121,20 @@ struct AxisCurve(Copyable, ImplicitlyCopyable, Movable):
         invert_y: Bool = False,
     ):
         self.mode = mode
-        self.inner_deadzone = max(Float32(0.0), min(Float32(0.85), inner_deadzone))
-        self.outer_deadzone = max(self.inner_deadzone + Float32(0.05), min(Float32(1.0), outer_deadzone))
-        self.exponent = max(Float32(0.25), min(Float32(4.0), exponent))
-        self.sensitivity = sensitivity
+        var idz = inner_deadzone if isfinite(inner_deadzone) else Float32(0.12)
+        var odz = outer_deadzone if isfinite(outer_deadzone) else Float32(0.98)
+        var exp_v = exponent if isfinite(exponent) else Float32(1.0)
+        var sens_v = sensitivity if isfinite(sensitivity) else Float32(1.0)
+        self.inner_deadzone = max(Float32(0.0), min(Float32(0.85), idz))
+        self.outer_deadzone = max(self.inner_deadzone + Float32(0.05), min(Float32(1.0), odz))
+        self.exponent = max(Float32(0.25), min(Float32(4.0), exp_v))
+        self.sensitivity = sens_v
         self.invert_x = invert_x
         self.invert_y = invert_y
 
     def eval_1d(self, raw: Float32) -> Float32:
+        if not isfinite(raw):
+            return Float32(0.0)
         var mag = abs(raw)
         if mag <= self.inner_deadzone:
             return 0.0
@@ -139,6 +145,8 @@ struct AxisCurve(Copyable, ImplicitlyCopyable, Movable):
         return sign * _pow_curve(norm, self.exponent) * self.sensitivity
 
     def eval_2d(self, raw_x: Float32, raw_y: Float32) -> Tuple[Float32, Float32]:
+        if not isfinite(raw_x) or not isfinite(raw_y):
+            return (Float32(0.0), Float32(0.0))
         var sx = -raw_x if self.invert_x else raw_x
         var sy = -raw_y if self.invert_y else raw_y
         if self.mode == DEADZONE_AXIAL:
@@ -148,6 +156,16 @@ struct AxisCurve(Copyable, ImplicitlyCopyable, Movable):
 
         # Scaled radial deadzone: continuous direction preservation with zero step discontinuity
         var r = sqrt(sx * sx + sy * sy)
+        if not isfinite(r):
+            var m = max(abs(sx), abs(sy))
+            if m <= Float32(0.0) or not isfinite(m):
+                return (Float32(0.0), Float32(0.0))
+            var ux = sx / m
+            var uy = sy / m
+            var ur = sqrt(ux * ux + uy * uy)
+            if ur <= Float32(1.0e-6) or not isfinite(ur):
+                return (Float32(0.0), Float32(0.0))
+            return ((ux / ur) * self.sensitivity, (uy / ur) * self.sensitivity)
         if r <= self.inner_deadzone or r <= Float32(1.0e-6):
             return (0.0, 0.0)
         var norm = min(Float32(1.0), (r - self.inner_deadzone) / max(Float32(1.0e-5), self.outer_deadzone - self.inner_deadzone))
@@ -157,6 +175,8 @@ struct AxisCurve(Copyable, ImplicitlyCopyable, Movable):
 
     @always_inline
     def _eval_single_no_inv(self, v: Float32) -> Float32:
+        if not isfinite(v):
+            return Float32(0.0)
         var mag = abs(v)
         if mag <= self.inner_deadzone:
             return 0.0
@@ -444,7 +464,8 @@ struct InputMap(Resource, Copyable, Movable):
     # ---- Evaluation ----
 
     def update(mut self, input: InputState, dt: Float32):
-        self.elapsed_time += Float64(max(Float32(0.0), dt))
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt < Float32(0.0)) else min(dt, Float32(10.0))
+        self.elapsed_time += Float64(safe_dt)
         if self.grounded:
             self.last_grounded_time = self.elapsed_time
 
@@ -548,13 +569,21 @@ struct InputMap(Resource, Copyable, Movable):
                                 consumed_mouse[mb] = True
 
                     elif b.source_kind == BIND_MOUSE_DELTA_2D:
-                        var dx = -input.mouse_delta_x() if b.curve.invert_x else input.mouse_delta_x()
-                        var dy = -input.mouse_delta_y() if b.curve.invert_y else input.mouse_delta_y()
+                        var raw_dx = input.mouse_delta_x()
+                        var raw_dy = input.mouse_delta_y()
+                        if not isfinite(raw_dx):
+                            raw_dx = Float32(0.0)
+                        if not isfinite(raw_dy):
+                            raw_dy = Float32(0.0)
+                        var dx = -raw_dx if b.curve.invert_x else raw_dx
+                        var dy = -raw_dy if b.curve.invert_y else raw_dy
                         var mx = dx * b.curve.sensitivity * b.scale_x
                         var my = dy * b.curve.sensitivity * b.scale_y
-                        self.actions[ai].value_x += mx
-                        self.actions[ai].value_y += my
-                        if abs(mx) + abs(my) > Float32(0.0):
+                        if isfinite(mx):
+                            self.actions[ai].value_x += mx
+                        if isfinite(my):
+                            self.actions[ai].value_y += my
+                        if (isfinite(mx) and abs(mx) > Float32(0.0)) or (isfinite(my) and abs(my) > Float32(0.0)):
                             unbounded_axis[ai] = True
 
                     elif b.source_kind == BIND_MOUSE_WHEEL_1D:
@@ -619,14 +648,32 @@ struct InputMap(Resource, Copyable, Movable):
                     self.actions[i].released = True
                 self.actions[i].value_x = Float32(1.0) if now_d else Float32(0.0)
             elif k == ACTION_AXIS1D:
+                if not isfinite(self.actions[i].value_x):
+                    self.actions[i].value_x = Float32(0.0)
                 if not unbounded_axis[i]:
                     self.actions[i].value_x = max(Float32(-1.0), min(Float32(1.0), self.actions[i].value_x))
             elif k == ACTION_AXIS2D:
+                if not isfinite(self.actions[i].value_x):
+                    self.actions[i].value_x = Float32(0.0)
+                if not isfinite(self.actions[i].value_y):
+                    self.actions[i].value_y = Float32(0.0)
                 if not unbounded_axis[i]:
                     var vx = self.actions[i].value_x
                     var vy = self.actions[i].value_y
                     var mag = sqrt(vx * vx + vy * vy)
-                    if mag > Float32(1.0):
+                    if not isfinite(mag):
+                        var m = max(abs(vx), abs(vy))
+                        if m > Float32(0.0) and isfinite(m):
+                            var ux = vx / m
+                            var uy = vy / m
+                            var ur = sqrt(ux * ux + uy * uy)
+                            if ur > Float32(1.0e-6) and isfinite(ur):
+                                self.actions[i].value_x = ux / ur
+                                self.actions[i].value_y = uy / ur
+                            else:
+                                self.actions[i].value_x = Float32(0.0)
+                                self.actions[i].value_y = Float32(0.0)
+                    elif mag > Float32(1.0):
                         var inv = Float32(1.0) / mag
                         self.actions[i].value_x = vx * inv
                         self.actions[i].value_y = vy * inv
@@ -803,10 +850,14 @@ struct InputMap(Resource, Copyable, Movable):
 
     @staticmethod
     def _fmt_f(v: Float32) -> String:
+        if not isfinite(v):
+            return "0.000"
         var neg = v < Float32(0.0)
-        var av = abs(v)
-        var whole = Int(av)
-        var frac = Int((av - Float32(whole)) * Float32(1000.0) + Float32(0.5))
+        var av64 = abs(Float64(v))
+        if av64 > 1.0e15:
+            return ("-" if neg else "") + String(av64)
+        var whole = Int(av64)
+        var frac = Int((av64 - Float64(whole)) * 1000.0 + 0.5)
         if frac >= 1000:
             whole += 1
             frac = 0
@@ -897,13 +948,21 @@ struct InputMap(Resource, Copyable, Movable):
                     var md = doc.integer(doc.object_get(bo, "modifiers"), MOD_NONE)
                     var sx = Float32(doc.number(doc.object_get(bo, "scale_x"), 1.0))
                     var sy = Float32(doc.number(doc.object_get(bo, "scale_y"), 0.0))
+                    if not isfinite(sx):
+                        sx = Float32(1.0)
+                    if not isfinite(sy):
+                        sy = Float32(0.0)
                     var cs = doc.boolean(doc.object_get(bo, "consume"), True)
+                    var dz_in = Float32(doc.number(doc.object_get(bo, "dz_in"), 0.12))
+                    var dz_out = Float32(doc.number(doc.object_get(bo, "dz_out"), 0.98))
+                    var exp_v = Float32(doc.number(doc.object_get(bo, "exp"), 1.0))
+                    var sens_v = Float32(doc.number(doc.object_get(bo, "sens"), 1.0))
                     var curve = AxisCurve(
                         doc.integer(doc.object_get(bo, "dz_mode"), DEADZONE_SCALED_RADIAL),
-                        Float32(doc.number(doc.object_get(bo, "dz_in"), 0.12)),
-                        Float32(doc.number(doc.object_get(bo, "dz_out"), 0.98)),
-                        Float32(doc.number(doc.object_get(bo, "exp"), 1.0)),
-                        Float32(doc.number(doc.object_get(bo, "sens"), 1.0)),
+                        dz_in if isfinite(dz_in) else Float32(0.12),
+                        dz_out if isfinite(dz_out) else Float32(0.98),
+                        exp_v if isfinite(exp_v) else Float32(1.0),
+                        sens_v if isfinite(sens_v) else Float32(1.0),
                     )
                     ctx.bindings.append(InputBinding(act, sk, cd, md, sx, sy, cs, curve))
             self.add_context(ctx^)

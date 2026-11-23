@@ -26,6 +26,7 @@ adds `swirl * k * (axis x d/r)` (turning air) and `burst * k * d/r` (air
 pushed out). They age one per tick, are dropped at the end of their life,
 and at most MAX_VORTICLES live (the oldest goes first).
 """
+from std.math import isfinite
 from flint.core.math import Vec3
 from flint.core.detsort import mix64
 from flint.core.serial import BlobWriter, BlobReader
@@ -43,7 +44,13 @@ comptime FALLOFF_SMOOTH: Int = 2
 
 def to_fx(value: Float32) -> Int64:
     """A float in Q16.16, rounded to nearest (exact: the scale is a power of two)."""
+    if not isfinite(value):
+        return 0
     var scaled = Float64(value) * 65536.0  # det: exact (a Float32 times 2^16 fits a Float64); rounded to an integer below
+    if scaled >= 9223372036854774784.0:
+        return Int64.MAX
+    if scaled <= -9223372036854774784.0:
+        return Int64.MIN
     if scaled >= 0:
         return Int64(scaled + 0.5)
     return -Int64(-scaled + 0.5)

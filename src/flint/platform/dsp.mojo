@@ -10,7 +10,7 @@ dependencies:
   - Quadrature-LFO `StereoChorus` & 4x4 Householder `StereoReverbFDN`
   - 3D Listener/Emitter equal-power panning, air-absorption LPF & radial Doppler shift
 """
-from std.math import sin, cos, tan, exp, sqrt, floor
+from std.math import sin, cos, tan, exp, sqrt, floor, isfinite, isnan
 from flint.core.math import Vec3
 
 comptime DSP_PI: Float32 = 3.141592653589793
@@ -30,6 +30,8 @@ def hash_white_noise(seed: Int) -> Float32:
 @always_inline
 def soft_clip_tanh(x: Float32) -> Float32:
     """Fast C2-continuous rational Padé `tanh(x)` soft clipper in `[-1.0, +1.0]`."""
+    if isnan(x):
+        return Float32(0.0)
     if x <= Float32(-3.0):
         return Float32(-1.0)
     if x >= Float32(3.0):
@@ -41,6 +43,8 @@ def soft_clip_tanh(x: Float32) -> Float32:
 @always_inline
 def tube_saturate(x: Float32, drive: Float32 = 1.5) -> Float32:
     """Asymmetric warm even/odd-harmonic saturation for punchy drums, bass & explosions."""
+    if not isfinite(x) or not isfinite(drive):
+        return Float32(0.0)
     var d = x * drive
     var asym = d + Float32(0.12) * d * d
     return soft_clip_tanh(asym) - Float32(0.042)
@@ -48,13 +52,15 @@ def tube_saturate(x: Float32, drive: Float32 = 1.5) -> Float32:
 
 @always_inline
 def wrap_phase01(p: Float32) -> Float32:
+    if not isfinite(p):
+        return Float32(0.0)
     return p - floor(p)
 
 
 @always_inline
 def poly_blep(t: Float32, dt: Float32) -> Float32:
     """2-point polynomial band-limited step residual at `t == 0` / `t == 1`."""
-    if dt <= Float32(1.0e-7):
+    if not isfinite(t) or not isfinite(dt) or dt <= Float32(1.0e-7):
         return Float32(0.0)
     if t < dt:
         var u = t / dt
@@ -68,6 +74,8 @@ def poly_blep(t: Float32, dt: Float32) -> Float32:
 @always_inline
 def poly_blep_saw(phase01: Float32, dt: Float32) -> Float32:
     """Alias-suppressed sawtooth wave in `[-1, +1]` for `phase01` in `[0, 1)`."""
+    if not isfinite(phase01):
+        return Float32(0.0)
     var t = wrap_phase01(phase01)
     var naive = Float32(2.0) * t - Float32(1.0)
     return naive - poly_blep(t, dt)
@@ -76,8 +84,11 @@ def poly_blep_saw(phase01: Float32, dt: Float32) -> Float32:
 @always_inline
 def poly_blep_pulse(phase01: Float32, dt: Float32, pulse_width: Float32 = 0.5) -> Float32:
     """Alias-suppressed variable-width pulse wave in `[-1, +1]`."""
+    if not isfinite(phase01):
+        return Float32(0.0)
     var t = wrap_phase01(phase01)
-    var pw = max(Float32(0.05), min(Float32(0.95), pulse_width))
+    var pw_in = pulse_width if isfinite(pulse_width) else Float32(0.5)
+    var pw = max(Float32(0.05), min(Float32(0.95), pw_in))
     var naive = Float32(1.0) if t < pw else Float32(-1.0)
     var t2 = wrap_phase01(t - pw + Float32(1.0))
     return naive + poly_blep(t, dt) - poly_blep(t2, dt)
@@ -86,7 +97,8 @@ def poly_blep_pulse(phase01: Float32, dt: Float32, pulse_width: Float32 = 0.5) -
 @always_inline
 def equal_power_gains(pan: Float32) -> Tuple[Float32, Float32]:
     """Constant-power stereo pan law (`pan` in `[-1.0, +1.0]`, center -> `(0.7071, 0.7071)`)."""
-    var p = max(Float32(-1.0), min(Float32(1.0), pan))
+    var p_in = pan if isfinite(pan) else Float32(0.0)
+    var p = max(Float32(-1.0), min(Float32(1.0), p_in))
     var angle = (p + Float32(1.0)) * (DSP_PI * Float32(0.25))
     return (cos(angle), sin(angle))
 
@@ -157,9 +169,13 @@ struct CytomicSVF(Copyable, ImplicitlyCopyable, Movable):
 
     @always_inline
     def set_params(mut self, cutoff_hz: Float32, q: Float32, sample_rate: Float32 = 48000.0):
-        var fc = max(Float32(16.0), min(sample_rate * Float32(0.475), cutoff_hz))
-        var qq = max(Float32(0.35), min(Float32(28.0), q))
-        var g = tan(DSP_PI * fc / sample_rate)
+        var sr_in = sample_rate if (isfinite(sample_rate) and sample_rate > Float32(0.0)) else Float32(48000.0)
+        var sr = max(Float32(1000.0), sr_in)
+        var fc_in = cutoff_hz if isfinite(cutoff_hz) else Float32(1200.0)
+        var fc = max(Float32(16.0), min(sr * Float32(0.475), fc_in))
+        var q_in = q if isfinite(q) else Float32(0.707)
+        var qq = max(Float32(0.35), min(Float32(28.0), q_in))
+        var g = tan(DSP_PI * fc / sr)
         self.k = Float32(1.0) / qq
         self.a1 = Float32(1.0) / (Float32(1.0) + g * (g + self.k))
         self.a2 = g * self.a1
@@ -167,15 +183,26 @@ struct CytomicSVF(Copyable, ImplicitlyCopyable, Movable):
 
     @always_inline
     def process(mut self, v0: Float32) -> Float32:
-        var v3 = v0 - self.ic2eq
+        var x = v0 if isfinite(v0) else Float32(0.0)
+        var v3 = x - self.ic2eq
         var v1 = self.a1 * self.ic1eq + self.a2 * v3
         var v2 = self.ic2eq + self.a2 * self.ic1eq + self.a3 * v3
-        self.ic1eq = Float32(2.0) * v1 - self.ic1eq
-        self.ic2eq = Float32(2.0) * v2 - self.ic2eq
+        var next_ic1 = Float32(2.0) * v1 - self.ic1eq
+        var next_ic2 = Float32(2.0) * v2 - self.ic2eq
+        if not (isfinite(v1) and isfinite(v2) and isfinite(next_ic1) and isfinite(next_ic2)):
+            self.ic1eq = Float32(0.0)
+            self.ic2eq = Float32(0.0)
+            self.lp = Float32(0.0)
+            self.bp = Float32(0.0)
+            self.hp = Float32(0.0)
+            self.notch = Float32(0.0)
+            return Float32(0.0)
+        self.ic1eq = next_ic1
+        self.ic2eq = next_ic2
         self.lp = v2
         self.bp = v1
-        self.hp = v0 - self.k * v1 - v2
-        self.notch = v0 - self.k * v1
+        self.hp = x - self.k * v1 - v2
+        self.notch = x - self.k * v1
         return v2
 
 
@@ -197,16 +224,25 @@ struct ModalResonator(Copyable, ImplicitlyCopyable, Movable):
 
     @always_inline
     def configure(mut self, freq_hz: Float32, decay_sec: Float32, gain: Float32, sample_rate: Float32 = 48000.0):
-        var f = max(Float32(24.0), min(sample_rate * Float32(0.46), freq_hz))
-        var tau = max(Float32(0.004), decay_sec)
-        var r = exp(Float32(-1.0) / (tau * sample_rate))
-        self.c1 = Float32(2.0) * r * cos(DSP_TAU * f / sample_rate)
+        var sr_in = sample_rate if isfinite(sample_rate) else Float32(48000.0)
+        var sr = max(Float32(1000.0), sr_in)
+        var f_in = freq_hz if isfinite(freq_hz) else Float32(440.0)
+        var f = max(Float32(24.0), min(sr * Float32(0.46), f_in))
+        var tau_in = decay_sec if isfinite(decay_sec) else Float32(0.15)
+        var tau = max(Float32(0.004), tau_in)
+        var r = exp(Float32(-1.0) / (tau * sr))
+        self.c1 = Float32(2.0) * r * cos(DSP_TAU * f / sr)
         self.c2 = r * r
-        self.gain = gain * (Float32(1.0) - r) * Float32(6.5)
+        var g_in = gain if isfinite(gain) else Float32(0.0)
+        var g_clamped = max(Float32(-100.0), min(Float32(100.0), g_in))
+        self.gain = g_clamped * (Float32(1.0) - r) * Float32(6.5)
 
     @always_inline
     def step(mut self, excitation: Float32) -> Float32:
-        var y0 = self.c1 * self.y1 - self.c2 * self.y2 + self.gain * excitation
+        var ex = excitation if isfinite(excitation) else Float32(0.0)
+        var y0 = self.c1 * self.y1 - self.c2 * self.y2 + self.gain * ex
+        if not isfinite(y0):
+            y0 = Float32(0.0)
         self.y2 = self.y1
         self.y1 = y0
         return y0
@@ -277,12 +313,14 @@ struct TimpaniDrum(Movable):
 
     @always_inline
     def process(mut self, felt_strike: Float32) -> Float32:
+        var strike = felt_strike if isfinite(felt_strike) else Float32(0.0)
         # Warm felt-mallet contact smoothing (~1.2 kHz one-pole) before exciting kettle membrane
-        self.mallet_lp += (felt_strike - self.mallet_lp) * Float32(0.145)
+        var next_lp = self.mallet_lp + (strike - self.mallet_lp) * Float32(0.145)
+        self.mallet_lp = next_lp if isfinite(next_lp) else Float32(0.0)
         var acc = Float32(0.0)
         for i in range(5):
             acc += self.modes[i].step(self.mallet_lp)
-        return acc
+        return acc if isfinite(acc) else Float32(0.0)
 
 
 struct StereoChorus(Movable):
@@ -300,7 +338,9 @@ struct StereoChorus(Movable):
         self.mask = 2047
         self.write_idx = 0
         self.lfo_phase = 0.0
-        self.lfo_inc = rate_hz / sample_rate
+        var r_in = rate_hz if isfinite(rate_hz) else Float32(0.85)
+        var sr_in = sample_rate if (isfinite(sample_rate) and sample_rate > Float32(0.0)) else Float32(48000.0)
+        self.lfo_inc = max(Float32(0.0), r_in) / sr_in
 
     @always_inline
     def _read_interp(self, buf: List[Float32], delay_samples: Float32) -> Float32:
@@ -314,16 +354,28 @@ struct StereoChorus(Movable):
 
     @always_inline
     def process(mut self, in_l: Float32, in_r: Float32, mix: Float32 = 0.32) -> Tuple[Float32, Float32]:
-        self.buf_l[self.write_idx] = in_l
-        self.buf_r[self.write_idx] = in_r
+        var sl = in_l if isfinite(in_l) else Float32(0.0)
+        var sr = in_r if isfinite(in_r) else Float32(0.0)
+        var m_in = mix if isfinite(mix) else Float32(0.0)
+        var m = max(Float32(0.0), min(Float32(1.0), m_in))
+        self.buf_l[self.write_idx] = sl
+        self.buf_r[self.write_idx] = sr
         var dl = Float32(520.0) + sin(self.lfo_phase * DSP_TAU) * Float32(195.0)
         var dr = Float32(560.0) + cos(self.lfo_phase * DSP_TAU) * Float32(195.0)
         var wet_l = self._read_interp(self.buf_l, dl)
         var wet_r = self._read_interp(self.buf_r, dr)
         self.write_idx = (self.write_idx + 1) & self.mask
         self.lfo_phase = wrap_phase01(self.lfo_phase + self.lfo_inc)
-        var dry = Float32(1.0) - mix * Float32(0.45)
-        return (in_l * dry + wet_l * mix, in_r * dry + wet_r * mix)
+        if not isfinite(self.lfo_phase):
+            self.lfo_phase = Float32(0.0)
+        var dry = Float32(1.0) - m * Float32(0.45)
+        var out_l = sl * dry + wet_l * m
+        var out_r = sr * dry + wet_r * m
+        if not isfinite(out_l):
+            out_l = Float32(0.0)
+        if not isfinite(out_r):
+            out_r = Float32(0.0)
+        return (out_l, out_r)
 
 
 struct StereoReverbFDN(Movable):
@@ -357,8 +409,10 @@ struct StereoReverbFDN(Movable):
         self.lp1 = 0.0
         self.lp2 = 0.0
         self.lp3 = 0.0
-        self.feedback = max(Float32(0.0), min(Float32(0.94), feedback))
-        self.damp = max(Float32(0.05), min(Float32(0.95), damp))
+        var fb_in = feedback if isfinite(feedback) else Float32(0.76)
+        var dp_in = damp if isfinite(damp) else Float32(0.34)
+        self.feedback = max(Float32(0.0), min(Float32(0.94), fb_in))
+        self.damp = max(Float32(0.05), min(Float32(0.95), dp_in))
 
     def clear(mut self):
         for i in range(len(self.line0)):
@@ -376,6 +430,8 @@ struct StereoReverbFDN(Movable):
 
     @always_inline
     def process_send(mut self, send_l: Float32, send_r: Float32) -> Tuple[Float32, Float32]:
+        var sl = send_l if isfinite(send_l) else Float32(0.0)
+        var sr = send_r if isfinite(send_r) else Float32(0.0)
         var d0 = self.line0[self.idx0]
         var d1 = self.line1[self.idx1]
         var d2 = self.line2[self.idx2]
@@ -390,10 +446,14 @@ struct StereoReverbFDN(Movable):
         # Unitary 4x4 Householder reflection: H * x = x - 0.5 * sum(x)
         var half_sum = (self.lp0 + self.lp1 + self.lp2 + self.lp3) * Float32(0.5)
         var fb = self.feedback
-        self.line0[self.idx0] = send_l * Float32(0.5) + (self.lp0 - half_sum) * fb
-        self.line1[self.idx1] = send_r * Float32(0.5) + (self.lp1 - half_sum) * fb
-        self.line2[self.idx2] = (send_l - send_r) * Float32(0.35) + (self.lp2 - half_sum) * fb
-        self.line3[self.idx3] = (send_l + send_r) * Float32(0.35) + (self.lp3 - half_sum) * fb
+        var n0 = sl * Float32(0.5) + (self.lp0 - half_sum) * fb
+        var n1 = sr * Float32(0.5) + (self.lp1 - half_sum) * fb
+        var n2 = (sl - sr) * Float32(0.35) + (self.lp2 - half_sum) * fb
+        var n3 = (sl + sr) * Float32(0.35) + (self.lp3 - half_sum) * fb
+        self.line0[self.idx0] = n0 if isfinite(n0) else Float32(0.0)
+        self.line1[self.idx1] = n1 if isfinite(n1) else Float32(0.0)
+        self.line2[self.idx2] = n2 if isfinite(n2) else Float32(0.0)
+        self.line3[self.idx3] = n3 if isfinite(n3) else Float32(0.0)
 
         self.idx0 += 1
         if self.idx0 >= 1499:
@@ -410,6 +470,10 @@ struct StereoReverbFDN(Movable):
 
         var wet_l = (d0 + d2 - d3 * Float32(0.35)) * Float32(0.45)
         var wet_r = (d1 - d2 * Float32(0.35) + d3) * Float32(0.45)
+        if not isfinite(wet_l):
+            wet_l = Float32(0.0)
+        if not isfinite(wet_r):
+            wet_r = Float32(0.0)
         return (wet_l, wet_r)
 
 
@@ -442,9 +506,29 @@ def compute_spatial_3d(
     """Computes 3D inverse-distance gain, equal-power stereo pan, radial-velocity Doppler
     pitch shift, atmospheric HF air-absorption LPF coefficient, and distance reverb send."""
     var out = SpatialVoiceParams()
-    var rel = source_pos - listener_pos
-    var dist = sqrt(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z)
-    if dist < Float32(0.05):
+    if not (
+        isfinite(listener_pos.x) and isfinite(listener_pos.y) and isfinite(listener_pos.z)
+        and isfinite(source_pos.x) and isfinite(source_pos.y) and isfinite(source_pos.z)
+    ):
+        out.gain = Float32(0.0)
+        out.pan = Float32(0.0)
+        out.doppler_pitch = Float32(1.0)
+        out.lpf_coeff = Float32(1.0)
+        out.reverb_send = Float32(0.0)
+        return out^
+
+    var rx = Float64(source_pos.x) - Float64(listener_pos.x)
+    var ry = Float64(source_pos.y) - Float64(listener_pos.y)
+    var rz = Float64(source_pos.z) - Float64(listener_pos.z)
+    var dist64 = sqrt(rx * rx + ry * ry + rz * rz)
+    if not isfinite(dist64):
+        out.gain = Float32(0.0)
+        out.pan = Float32(0.0)
+        out.doppler_pitch = Float32(1.0)
+        out.lpf_coeff = Float32(1.0)
+        out.reverb_send = Float32(0.0)
+        return out^
+    if dist64 < 0.05:
         out.gain = Float32(1.0)
         out.pan = Float32(0.0)
         out.doppler_pitch = Float32(1.0)
@@ -452,38 +536,60 @@ def compute_spatial_3d(
         out.reverb_send = Float32(0.10)
         return out^
 
-    var inv_d = Float32(1.0) / dist
-    var dir = Vec3(rel.x * inv_d, rel.y * inv_d, rel.z * inv_d)
+    var inv_d64 = 1.0 / dist64
+    var dir = Vec3(Float32(rx * inv_d64), Float32(ry * inv_d64), Float32(rz * inv_d64))
+    var dist = Float32(dist64) if isfinite(Float32(dist64)) else Float32(1.0e30)
 
     # 1. Smooth clamped inverse-distance rolloff + max_dist horizon fade
-    var rd = max(Float32(1.0), ref_dist)
-    var md = max(rd + Float32(10.0), max_dist)
+    var rd_in = ref_dist if isfinite(ref_dist) else Float32(22.0)
+    var rd = max(Float32(1.0), rd_in)
+    var md_in = max_dist if isfinite(max_dist) else Float32(420.0)
+    var md = max(rd + Float32(10.0), md_in)
     var atten = rd / (rd + Float32(0.85) * max(Float32(0.0), dist - rd))
     var horizon = max(Float32(0.0), Float32(1.0) - max(Float32(0.0), dist - md * Float32(0.75)) / (md * Float32(0.25)))
-    out.gain = max(Float32(0.0), min(Float32(1.15), atten * horizon))
+    var gain_raw = atten * horizon
+    out.gain = max(Float32(0.0), min(Float32(1.15), gain_raw)) if isfinite(gain_raw) else Float32(0.0)
 
     # 2. Azimuth stereo pan along listener's right ear vector (softened at point-blank range)
     var near_spread = min(Float32(1.0), dist / max(Float32(2.0), rd * Float32(0.45)))
-    var right_dot = dir.x * listener_right.x + dir.y * listener_right.y + dir.z * listener_right.z
-    out.pan = max(Float32(-0.95), min(Float32(0.95), right_dot * near_spread))
+    var r_ok = isfinite(listener_right.x) and isfinite(listener_right.y) and isfinite(listener_right.z)
+    var right_v = listener_right if r_ok else Vec3(0.0, 0.0, 0.0)
+    var right_dot = dir.x * right_v.x + dir.y * right_v.y + dir.z * right_v.z
+    var pan_raw = right_dot * near_spread
+    out.pan = max(Float32(-0.95), min(Float32(0.95), pan_raw)) if isfinite(pan_raw) else Float32(0.0)
 
     # 3. Radial-velocity acoustic Doppler shift: f' = f * (c + v_listener_toward) / (c + v_source_away)
-    var v_l_rad = listener_vel.x * dir.x + listener_vel.y * dir.y + listener_vel.z * dir.z
-    var v_s_rad = source_vel.x * dir.x + source_vel.y * dir.y + source_vel.z * dir.z
+    var lv_ok = isfinite(listener_vel.x) and isfinite(listener_vel.y) and isfinite(listener_vel.z)
+    var sv_ok = isfinite(source_vel.x) and isfinite(source_vel.y) and isfinite(source_vel.z)
+    var lv = listener_vel if lv_ok else Vec3(0.0, 0.0, 0.0)
+    var sv = source_vel if sv_ok else Vec3(0.0, 0.0, 0.0)
+    var dop_scale = doppler_scale if isfinite(doppler_scale) else Float32(0.65)
+    var v_l_rad = lv.x * dir.x + lv.y * dir.y + lv.z * dir.z
+    var v_s_rad = sv.x * dir.x + sv.y * dir.y + sv.z * dir.z
     var c = SPEED_OF_SOUND
-    var num = max(Float32(60.0), c + v_l_rad * doppler_scale)
-    var den = max(Float32(60.0), c + v_s_rad * doppler_scale)
-    out.doppler_pitch = max(Float32(0.48), min(Float32(2.15), num / den))
+    var num_raw = c + v_l_rad * dop_scale
+    var den_raw = c + v_s_rad * dop_scale
+    if isfinite(num_raw) and isfinite(den_raw):
+        var num = max(Float32(60.0), num_raw)
+        var den = max(Float32(60.0), den_raw)
+        var ratio = num / den
+        out.doppler_pitch = max(Float32(0.48), min(Float32(2.15), ratio)) if isfinite(ratio) else Float32(1.0)
+    else:
+        out.doppler_pitch = Float32(1.0)
 
     # 4. Atmospheric HF air-absorption LPF (1.0 close -> 0.22 far) & distance wet-reverb bloom
-    var dist_norm = max(Float32(0.0), min(Float32(1.0), (dist - rd) / (md - rd)))
+    var dist_norm_raw = (dist - rd) / (md - rd)
+    var dist_norm = max(Float32(0.0), min(Float32(1.0), dist_norm_raw)) if isfinite(dist_norm_raw) else Float32(1.0)
     out.lpf_coeff = Float32(1.0) - dist_norm * Float32(0.76)
     out.reverb_send = Float32(0.10) + dist_norm * Float32(0.28)
 
     # 5. Rear-cone pinna/head-shadow occlusion filtering when listener_fwd is provided
-    var fwd_dot = dir.x * listener_fwd.x + dir.y * listener_fwd.y + dir.z * listener_fwd.z
-    if fwd_dot < Float32(0.0):
-        out.lpf_coeff = max(Float32(0.12), out.lpf_coeff * (Float32(1.0) + fwd_dot * Float32(0.28)))
+    var fwd_ok = isfinite(listener_fwd.x) and isfinite(listener_fwd.y) and isfinite(listener_fwd.z)
+    var fwd_v = listener_fwd if fwd_ok else Vec3(0.0, 0.0, 1.0)
+    var fwd_dot = dir.x * fwd_v.x + dir.y * fwd_v.y + dir.z * fwd_v.z
+    if isfinite(fwd_dot) and fwd_dot < Float32(0.0):
+        var lpf_occ = out.lpf_coeff * (Float32(1.0) + fwd_dot * Float32(0.28))
+        out.lpf_coeff = max(Float32(0.12), lpf_occ) if isfinite(lpf_occ) else Float32(0.12)
 
     return out^
 
@@ -501,11 +607,12 @@ struct ItdDelayLine(Copyable, Movable):
         self.write_idx = 0
 
     def push(mut self, sample: Float32):
-        self.buffer[self.write_idx] = sample
+        self.buffer[self.write_idx] = sample if isfinite(sample) else Float32(0.0)
         self.write_idx = (self.write_idx + 1) & 63
 
     def read_delayed(self, delay_samples: Float32) -> Float32:
-        var d = max(Float32(0.0), min(Float32(60.0), delay_samples))
+        var ds = delay_samples if isfinite(delay_samples) else Float32(0.0)
+        var d = max(Float32(0.0), min(Float32(60.0), ds))
         var idelay = Int(floor(d))
         var frac = d - Float32(idelay)
 
@@ -523,7 +630,8 @@ struct ItdDelayLine(Copyable, Movable):
         var c1 = Float32(0.5) * (y2 - y0)
         var c2 = y0 - Float32(2.5) * y1 + Float32(2.0) * y2 - Float32(0.5) * y3
         var c3 = Float32(0.5) * (y3 - y0) + Float32(1.5) * (y1 - y2)
-        return ((c3 * frac + c2) * frac + c1) * frac + c0
+        var res = ((c3 * frac + c2) * frac + c1) * frac + c0
+        return res if isfinite(res) else Float32(0.0)
 
 
 struct VehicleHarmonicSynth(Movable):
@@ -538,16 +646,21 @@ struct VehicleHarmonicSynth(Movable):
     var sample_rate: Float32
 
     def __init__(out self, sample_rate: Float32 = 48000.0):
+        var sr_in = sample_rate if (isfinite(sample_rate) and sample_rate > Float32(0.0)) else Float32(48000.0)
+        var sr = max(Float32(1000.0), sr_in)
         self.phase_cyl1 = 0.0
         self.phase_cyl2 = 0.25
         self.phase_cyl3 = 0.50
         self.phase_cyl4 = 0.75
-        self.intake_svf = CytomicSVF(320.0, 1.4, sample_rate)
-        self.exhaust_svf = CytomicSVF(120.0, 1.8, sample_rate)
-        self.sample_rate = sample_rate
+        self.intake_svf = CytomicSVF(320.0, 1.4, sr)
+        self.exhaust_svf = CytomicSVF(120.0, 1.8, sr)
+        self.sample_rate = sr
 
     def step(mut self, rpm: Float32, load: Float32) -> Float32:
-        var clamped_rpm = max(Float32(650.0), min(Float32(9500.0), rpm))
+        var rpm_in = rpm if isfinite(rpm) else Float32(650.0)
+        var load_in = load if isfinite(load) else Float32(0.0)
+        var clamped_rpm = max(Float32(650.0), min(Float32(9500.0), rpm_in))
+        var clamped_load = max(Float32(0.0), min(Float32(2.0), load_in))
         var f0 = (clamped_rpm / Float32(60.0)) * Float32(2.0)
         var dt = f0 / self.sample_rate
 
@@ -563,9 +676,9 @@ struct VehicleHarmonicSynth(Movable):
 
         var engine_raw = (s1 + s2 * Float32(0.8) + s3 * Float32(0.6) + s4 * Float32(0.4)) * Float32(0.35)
         var exh = self.exhaust_svf.process(engine_raw)
-        var intk = self.intake_svf.process(engine_raw) * (load * Float32(0.5))
+        var intk = self.intake_svf.process(engine_raw) * (clamped_load * Float32(0.5))
         var mixed = exh + intk
-        return tube_saturate(mixed, Float32(1.2) + load * Float32(0.8))
+        return tube_saturate(mixed, Float32(1.2) + clamped_load * Float32(0.8))
 
 
 struct GranularBiomeSynth(Movable):
@@ -577,6 +690,7 @@ struct GranularBiomeSynth(Movable):
     var pink: PinkNoise
 
     def __init__(out self, sample_rate: Float32 = 48000.0):
+        var sr_in = sample_rate if (isfinite(sample_rate) and sample_rate > Float32(0.0)) else Float32(48000.0)
         self.grain_phases = List[Float32]()
         self.grain_freqs = List[Float32]()
         self.grain_gains = List[Float32]()
@@ -584,19 +698,21 @@ struct GranularBiomeSynth(Movable):
             self.grain_phases.append(Float32(i) * Float32(0.125))
             self.grain_freqs.append(Float32(120.0) + Float32(i) * Float32(45.0))
             self.grain_gains.append(Float32(0.12))
-        self.sample_rate = sample_rate
+        self.sample_rate = max(Float32(1000.0), sr_in)
         self.pink = PinkNoise()
 
     def step(mut self, intensity: Float32) -> Float32:
+        var inten_in = intensity if isfinite(intensity) else Float32(0.0)
+        var inten = max(Float32(0.0), min(Float32(4.0), inten_in))
         var out_sample = Float32(0.0)
-        var p_noise = self.pink.next() * intensity
+        var p_noise = self.pink.next() * inten
         for i in range(len(self.grain_phases)):
             var phase = self.grain_phases[i]
             var hann = Float32(0.5) * (Float32(1.0) - cos(DSP_TAU * phase))
             var osc = sin(DSP_TAU * phase * self.grain_freqs[i])
             out_sample += (osc * hann) * self.grain_gains[i]
 
-            var dt = (Float32(2.0) + intensity * Float32(6.0)) / self.sample_rate
+            var dt = (Float32(2.0) + inten * Float32(6.0)) / self.sample_rate
             self.grain_phases[i] = wrap_phase01(phase + dt)
 
         return soft_clip_tanh(out_sample * Float32(0.8) + p_noise * Float32(0.25))

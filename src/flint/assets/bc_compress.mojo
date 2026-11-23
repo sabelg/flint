@@ -15,7 +15,7 @@ Flint uploads 4:1 / 6:1 compressed `VkImage` mip chains directly to GPU hardware
   - Pre-cooked compressed `.flpk` mip-chunk packager & zero-cook runtime mip streamer.
 """
 from std.ffi import external_call
-from std.math import log2, max, min, sqrt
+from std.math import isfinite, isnan, log2, max, min, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.core.jobs import JobPool
@@ -204,6 +204,10 @@ struct _BitReader128(Copyable, Movable):
 @always_inline
 def f32_to_uf16_bits(val: Float32) -> Int:
     """Clamps `val` to `[0.0 .. 65504.0]` and returns IEEE-754 unsigned `F16` bits (`0 .. 0x7BFF`)."""
+    if isnan(val):
+        return 0
+    if not isfinite(val):
+        return 0 if val < Float32(0.0) else 0x7BFF
     var v = max(Float32(0.0), min(Float32(65504.0), val))
     var bits = bitcast[DType.uint32](v)
     var exp32 = Int((bits >> 23) & 0xFF)
@@ -1534,6 +1538,8 @@ def decode_bc6h_hdr(blocks: List[UInt8], width: Int, height: Int) -> List[Vec3]:
 # ============================================================================
 
 def downsample_argb_2x(pixels: List[UInt32], w: Int, h: Int) -> Tuple[List[UInt32], Int, Int]:
+    if w <= 0 or h <= 0 or len(pixels) // w < h:
+        return (List[UInt32](), 0, 0)
     var nw = max(1, w >> 1)
     var nh = max(1, h >> 1)
     var out = List[UInt32](length=nw * nh, fill=0)
@@ -1556,6 +1562,8 @@ def downsample_argb_2x(pixels: List[UInt32], w: Int, h: Int) -> Tuple[List[UInt3
 
 
 def downsample_normals_2x(normals: List[Vec3], w: Int, h: Int) -> Tuple[List[Vec3], Int, Int]:
+    if w <= 0 or h <= 0 or len(normals) // w < h:
+        return (List[Vec3](), 0, 0)
     var nw = max(1, w >> 1)
     var nh = max(1, h >> 1)
     var out = List[Vec3](length=nw * nh, fill=Vec3(0.0, 0.0, 1.0))

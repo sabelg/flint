@@ -16,6 +16,7 @@ from flint.core.serial import BlobWriter, BlobReader, fourcc
 
 comptime FLINT_MAGIC: UInt32 = 0x544E4C46  # "FLNT"
 comptime FLINT_ECS_VERSION: Int = 1
+comptime MAX_ARCHETYPE_SLOTS_CAP: Int = 1_048_576
 
 comptime ROW_FREE: UInt8 = 0
 comptime ROW_SPAWNING: UInt8 = 1
@@ -275,33 +276,58 @@ struct ArchetypeSlots(Movable):
 
     def read_blob(mut self, mut r: BlobReader) -> Bool:
         var ver = r.integer()
-        if ver != FLINT_ECS_VERSION:
+        var arch = r.integer()
+        var raw_cap = r.integer()
+        var raw_used = r.integer()
+        var raw_pending = r.integer()
+        var raw_live = r.integer()
+        if r.failed or ver != FLINT_ECS_VERSION:
             return False
-        self.archetype = r.integer()
-        var cap = max(8, r.integer())
-        if cap != self.capacity:
-            self.capacity = cap
-            self.state = List[UInt8](length=cap, fill=ROW_FREE)
-            self.generation = List[UInt32](length=cap, fill=0)
-        else:
-            for i in range(self.capacity):
-                self.state[i] = ROW_FREE
-                self.generation[i] = 0
-        self.used = min(self.capacity, max(0, r.integer()))
-        self.pending = max(0, r.integer())
-        self.live_count = max(0, r.integer())
-        var num_chunks = (self.capacity + 63) // 64
-        self.free_mask = List[UInt64](length=num_chunks, fill=0)
-        for i in range(self.capacity):
-            if i < self.used:
-                self.state[i] = r.u8()
-                self.generation[i] = r.u32()
-            else:
-                self.state[i] = ROW_FREE
-                self.generation[i] = 0
-            if self.state[i] == ROW_FREE:
-                self.free_mask[i // 64] |= (UInt64(1) << UInt64(i % 64))
-        return not r.failed
+        if raw_cap < 0 or raw_used < 0 or raw_pending < 0 or raw_live < 0:
+            return False
+        if raw_live > raw_used or raw_pending > raw_used:
+            return False
+        var cap = max(8, raw_cap)
+        if raw_used > cap or cap > MAX_ARCHETYPE_SLOTS_CAP:
+            return False
+        var avail = min(r.remaining(), r.limit() - r.offset)
+        if raw_used > avail // 5:
+            return False
+        var next_state = List[UInt8](length=cap, fill=ROW_FREE)
+        var next_gen = List[UInt32](length=cap, fill=0)
+        var num_chunks = (cap + 63) // 64
+        var next_mask = List[UInt64](length=num_chunks, fill=0)
+        var actual_live = 0
+        var actual_pending = 0
+        for i in range(cap):
+            if i < raw_used:
+                var st = r.u8()
+                next_state[i] = st
+                next_gen[i] = r.u32()
+                if st == ROW_LIVE:
+                    actual_live += 1
+                elif st == ROW_DESPAWNING:
+                    actual_live += 1
+                    actual_pending += 1
+                elif st == ROW_SPAWNING:
+                    actual_pending += 1
+                elif st != ROW_FREE:
+                    return False
+            if next_state[i] == ROW_FREE:
+                next_mask[i // 64] |= (UInt64(1) << UInt64(i % 64))
+        if r.failed:
+            return False
+        if actual_live != raw_live or actual_pending != raw_pending:
+            return False
+        self.archetype = arch
+        self.capacity = cap
+        self.used = raw_used
+        self.pending = raw_pending
+        self.live_count = raw_live
+        self.state = next_state^
+        self.generation = next_gen^
+        self.free_mask = next_mask^
+        return True
 
 
 comptime ECB_OP_SPAWN: Int = 1

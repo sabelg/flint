@@ -87,11 +87,15 @@ struct UiDrawList(Movable):
 
     def push_clip(mut self, x0: Int, y0: Int, x1: Int, y1: Int):
         var cur = self.current_clip()
-        var nx0 = UInt16(max(Int(cur[0]), max(0, x0)))
-        var ny0 = UInt16(max(Int(cur[1]), max(0, y0)))
-        var nx1 = UInt16(min(Int(cur[2]), max(0, x1)))
-        var ny1 = UInt16(min(Int(cur[3]), max(0, y1)))
-        self.clip_stack.append((nx0, ny0, nx1, ny1))
+        var ix0 = max(Int(cur[0]), min(65535, max(0, x0)))
+        var iy0 = max(Int(cur[1]), min(65535, max(0, y0)))
+        var ix1 = min(Int(cur[2]), min(65535, max(0, x1)))
+        var iy1 = min(Int(cur[3]), min(65535, max(0, y1)))
+        if ix1 < ix0:
+            ix1 = ix0
+        if iy1 < iy0:
+            iy1 = iy0
+        self.clip_stack.append((UInt16(ix0), UInt16(iy0), UInt16(ix1), UInt16(iy1)))
 
     def pop_clip(mut self):
         if len(self.clip_stack) > 0:

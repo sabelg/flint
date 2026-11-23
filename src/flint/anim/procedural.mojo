@@ -14,7 +14,7 @@ Upgrades in Flint v4:
   swing), surface-normal ankle pitch/roll alignment (clamped to `max_tilt_radians`),
   and critically damped `SpringFloat` pelvis lowering.
 """
-from std.math import sqrt
+from std.math import floor, isfinite, isnan, sqrt
 from flint.core.detmath import det_sin, det_cos, det_atan2, det_exp, det_acos, PI
 from flint.core.math import Vec3
 from flint.core.transform import Quat
@@ -122,31 +122,37 @@ struct LookAt(Copyable, Movable):
             ref_parent = model.parents[head]
         var ref_rot = model.global_rotation(ref_parent) if ref_parent >= 0 else Quat()
 
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt <= Float32(0.0)) else min(dt, Float32(1.0))
+        var safe_halflife = halflife if isfinite(halflife) else Float32(0.1)
+        var safe_max_yaw = max(Float32(0.0), max_yaw) if isfinite(max_yaw) else Float32(0.0)
+        var safe_max_pitch = max(Float32(0.0), max_pitch) if isfinite(max_pitch) else Float32(0.0)
+        var safe_spine_share = Float32(0.0) if isnan(spine_share) else max(Float32(0.0), min(Float32(1.0), spine_share))
+
         var goal_yaw = Float32(0)
         var goal_pitch = Float32(0)
         var want = Float32(0)
-        if has_target:
+        if has_target and isfinite(target.x) and isfinite(target.y) and isfinite(target.z):
             var eye = model.global_position(head)
             var d = ref_rot.conjugate().rotate(target - eye)
             var flat = sqrt(d.x * d.x + d.z * d.z)
-            if flat > Float32(0.01) or abs(d.y) > Float32(0.01):
+            if isfinite(flat) and isfinite(d.y) and (flat > Float32(0.01) or abs(d.y) > Float32(0.01)):
                 var yaw = det_atan2(d.x, d.z) / DEG
-                if abs(yaw) <= max_yaw * Float32(1.5):
-                    goal_yaw = max(-max_yaw, min(max_yaw, yaw))
-                    goal_pitch = max(-max_pitch, min(max_pitch, det_atan2(d.y, max(Float32(0.01), flat)) / DEG))
+                if isfinite(yaw) and abs(yaw) <= safe_max_yaw * Float32(1.5):
+                    goal_yaw = max(-safe_max_yaw, min(safe_max_yaw, yaw))
+                    goal_pitch = max(-safe_max_pitch, min(safe_max_pitch, det_atan2(d.y, max(Float32(0.01), flat)) / DEG))
                     want = Float32(1.0)
-        self.weight.update(want, halflife, dt)
-        self.yaw.update(goal_yaw, halflife, dt)
-        self.pitch.update(goal_pitch, halflife, dt)
-        var w = max(Float32(0), min(Float32(1), self.weight.value))
+        self.weight.update(want, safe_halflife, safe_dt)
+        self.yaw.update(goal_yaw, safe_halflife, safe_dt)
+        self.pitch.update(goal_pitch, safe_halflife, safe_dt)
+        var w = Float32(0.0) if isnan(self.weight.value) else max(Float32(0), min(Float32(1), self.weight.value))
         self.applied_yaw = self.yaw.value * w
         self.applied_pitch = self.pitch.value * w
-        if w < Float32(0.001):
+        if w < Float32(0.001) or not isfinite(self.applied_yaw) or not isfinite(self.applied_pitch):
             return
         var full_local = yaw_pitch(self.applied_yaw * DEG, self.applied_pitch * DEG)
         var full = ref_rot.multiply(full_local).multiply(ref_rot.conjugate()).normalized()
-        var part = Quat().slerp(full, max(Float32(0), min(Float32(1), spine_share)))
-        if spine >= 0 and spine_share > 0:
+        var part = Quat().slerp(full, safe_spine_share)
+        if spine >= 0 and safe_spine_share > 0:
             model.rotate_node_model(spine, part)
             model.rotate_node_model(head, full.multiply(part.conjugate()).normalized())
         else:
@@ -167,31 +173,37 @@ struct LookAt(Copyable, Movable):
             ref_parent = skel.parents[head]
         var ref_rot = skel.global_rotation(ref_parent) if ref_parent >= 0 else Quat()
 
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt <= Float32(0.0)) else min(dt, Float32(1.0))
+        var safe_halflife = halflife if isfinite(halflife) else Float32(0.1)
+        var safe_max_yaw = max(Float32(0.0), max_yaw) if isfinite(max_yaw) else Float32(0.0)
+        var safe_max_pitch = max(Float32(0.0), max_pitch) if isfinite(max_pitch) else Float32(0.0)
+        var safe_spine_share = Float32(0.0) if isnan(spine_share) else max(Float32(0.0), min(Float32(1.0), spine_share))
+
         var goal_yaw = Float32(0)
         var goal_pitch = Float32(0)
         var want = Float32(0)
-        if has_target:
+        if has_target and isfinite(target.x) and isfinite(target.y) and isfinite(target.z):
             var eye = skel.global_position(head)
             var d = ref_rot.conjugate().rotate(target - eye)
             var flat = sqrt(d.x * d.x + d.z * d.z)
-            if flat > Float32(0.01) or abs(d.y) > Float32(0.01):
+            if isfinite(flat) and isfinite(d.y) and (flat > Float32(0.01) or abs(d.y) > Float32(0.01)):
                 var yaw = det_atan2(d.x, d.z) / DEG
-                if abs(yaw) <= max_yaw * Float32(1.5):
-                    goal_yaw = max(-max_yaw, min(max_yaw, yaw))
-                    goal_pitch = max(-max_pitch, min(max_pitch, det_atan2(d.y, max(Float32(0.01), flat)) / DEG))
+                if isfinite(yaw) and abs(yaw) <= safe_max_yaw * Float32(1.5):
+                    goal_yaw = max(-safe_max_yaw, min(safe_max_yaw, yaw))
+                    goal_pitch = max(-safe_max_pitch, min(safe_max_pitch, det_atan2(d.y, max(Float32(0.01), flat)) / DEG))
                     want = Float32(1.0)
-        self.weight.update(want, halflife, dt)
-        self.yaw.update(goal_yaw, halflife, dt)
-        self.pitch.update(goal_pitch, halflife, dt)
-        var w = max(Float32(0), min(Float32(1), self.weight.value))
+        self.weight.update(want, safe_halflife, safe_dt)
+        self.yaw.update(goal_yaw, safe_halflife, safe_dt)
+        self.pitch.update(goal_pitch, safe_halflife, safe_dt)
+        var w = Float32(0.0) if isnan(self.weight.value) else max(Float32(0), min(Float32(1), self.weight.value))
         self.applied_yaw = self.yaw.value * w
         self.applied_pitch = self.pitch.value * w
-        if w < Float32(0.001):
+        if w < Float32(0.001) or not isfinite(self.applied_yaw) or not isfinite(self.applied_pitch):
             return
         var full_local = yaw_pitch(self.applied_yaw * DEG, self.applied_pitch * DEG)
         var full = ref_rot.multiply(full_local).multiply(ref_rot.conjugate()).normalized()
-        var part = Quat().slerp(full, max(Float32(0), min(Float32(1), spine_share)))
-        if spine >= 0 and spine_share > 0:
+        var part = Quat().slerp(full, safe_spine_share)
+        if spine >= 0 and safe_spine_share > 0:
             skel.rotate_node_model(spine, part, model)
             skel.rotate_node_model(head, full.multiply(part.conjugate()).normalized(), model)
         else:
@@ -213,13 +225,15 @@ struct HeadStabilizer(Copyable, Movable):
         if head < 0:
             return
         var current = model.global_rotation(head)
-        if not self.ready or dt <= 0:
+        if not self.ready or not isfinite(dt) or dt <= Float32(0.0):
             self.smoothed = current
             self.ready = True
             return
-        var follow = Float32(1.0) - det_exp(Float32(-0.69314718) * dt / max(Float32(0.001), halflife))
+        var safe_dt = min(dt, Float32(1.0))
+        var safe_halflife = max(Float32(0.001), halflife) if isfinite(halflife) else Float32(0.1)
+        var follow = Float32(1.0) - det_exp(Float32(-0.69314718) * safe_dt / safe_halflife)
         self.smoothed = self.smoothed.slerp(current, follow).normalized()
-        var k = max(Float32(0), min(Float32(1), strength))
+        var k = Float32(0.0) if isnan(strength) else max(Float32(0), min(Float32(1), strength))
         if k <= 0:
             return
         var target = current.slerp(self.smoothed, k)
@@ -240,12 +254,22 @@ struct Breathing(Copyable, Movable):
         mut self, mut model: NativeModel, spine: Int, head: Int, effort: Float32,
         rest_rate: Float32, hard_rate: Float32, depth: Float32, dt: Float32,
     ):
-        self.exertion.update(max(Float32(0), min(Float32(1), effort)), 1.6, dt)
+        if not isfinite(dt) or dt <= Float32(0.0):
+            return
+        var safe_dt = min(dt, Float32(1.0))
+        var safe_eff = Float32(0.0) if not isfinite(effort) else max(Float32(0), min(Float32(1), effort))
+        self.exertion.update(safe_eff, 1.6, safe_dt)
         var e = max(Float32(0), min(Float32(1), self.exertion.value))
         var rate = rest_rate + (hard_rate - rest_rate) * e
-        self.phase += dt * rate
-        self.phase -= Float32(Int(self.phase))
-        self.applied = det_sin(self.phase * Float32(6.2831853)) * depth * (Float32(1.0) + e)
+        if not isfinite(self.phase):
+            self.phase = Float32(0.0)
+        if isfinite(rate):
+            var next_p = Float64(self.phase) + Float64(safe_dt) * Float64(rate)
+            if isfinite(next_p):
+                next_p = next_p - floor(next_p)
+                self.phase = Float32(next_p)
+        var safe_depth = depth if isfinite(depth) else Float32(0.0)
+        self.applied = det_sin(self.phase * Float32(6.2831853)) * safe_depth * (Float32(1.0) + e)
         if spine >= 0:
             model.rotate_node_model(spine, angle_axis(-self.applied * DEG, Vec3(1, 0, 0)))
         if head >= 0:
@@ -273,22 +297,47 @@ struct Lean(Copyable, Movable):
         mut self, mut model: NativeModel, pelvis: Int, yaw_degrees: Float32, speed: Float32,
         roll_per_turn: Float32, pitch_per_accel: Float32, max_degrees: Float32, dt: Float32,
     ):
-        if dt <= 0:
+        if not isfinite(dt) or dt <= Float32(0.0):
             return
+        var safe_dt = min(dt, Float32(1.0))
+        var safe_yaw = yaw_degrees
+        if not isfinite(safe_yaw):
+            safe_yaw = self.last_yaw if isfinite(self.last_yaw) else Float32(0.0)
+        elif abs(safe_yaw) > Float32(1.0e6):
+            var yd = Float64(safe_yaw)
+            safe_yaw = Float32(yd - 360.0 * floor((yd + 180.0) / 360.0))
+        var safe_speed = speed
+        if not isfinite(safe_speed):
+            safe_speed = self.last_speed if isfinite(self.last_speed) else Float32(0.0)
+        var safe_max_deg = max(Float32(0.0), max_degrees) if isfinite(max_degrees) else Float32(0.0)
+        var safe_roll_k = roll_per_turn if isfinite(roll_per_turn) else Float32(0.0)
+        var safe_pitch_k = pitch_per_accel if isfinite(pitch_per_accel) else Float32(0.0)
+
         if not self.ready:
-            self.last_yaw = yaw_degrees
-            self.last_speed = speed
+            self.last_yaw = safe_yaw
+            self.last_speed = safe_speed
             self.ready = True
-        var turn = wrap_degrees(yaw_degrees - self.last_yaw) / dt
-        var accel = (speed - self.last_speed) / dt
-        self.last_yaw = yaw_degrees
-        self.last_speed = speed
-        var speed_share = min(Float32(1), speed / 6.0)
-        var roll_goal = max(-max_degrees, min(max_degrees, -turn / 100.0 * roll_per_turn * speed_share))
-        var pitch_goal = max(-max_degrees, min(max_degrees, accel * pitch_per_accel))
-        self.roll.update(roll_goal, 0.12, dt)
-        self.pitch.update(pitch_goal, 0.15, dt)
-        if pelvis < 0:
+        if not isfinite(self.last_yaw):
+            self.last_yaw = safe_yaw
+        if not isfinite(self.last_speed):
+            self.last_speed = safe_speed
+        var denom = max(safe_dt, Float32(1.0e-5))
+        var turn = wrap_degrees(safe_yaw - self.last_yaw) / denom
+        var accel = (safe_speed - self.last_speed) / denom
+        self.last_yaw = safe_yaw
+        self.last_speed = safe_speed
+        var speed_share = min(Float32(1.0), safe_speed / Float32(6.0))
+        var raw_roll = -turn / Float32(100.0) * safe_roll_k * speed_share
+        var raw_pitch = accel * safe_pitch_k
+        var roll_goal = Float32(0.0) if isnan(raw_roll) else max(-safe_max_deg, min(safe_max_deg, raw_roll))
+        var pitch_goal = Float32(0.0) if isnan(raw_pitch) else max(-safe_max_deg, min(safe_max_deg, raw_pitch))
+        if not isfinite(self.roll.value) or not isfinite(self.roll.velocity):
+            self.roll = SpringFloat(0.0)
+        if not isfinite(self.pitch.value) or not isfinite(self.pitch.velocity):
+            self.pitch = SpringFloat(0.0)
+        self.roll.update(roll_goal, Float32(0.12), safe_dt)
+        self.pitch.update(pitch_goal, Float32(0.15), safe_dt)
+        if pelvis < 0 or pelvis >= len(model.nodes):
             return
         var q = angle_axis(self.roll.value * DEG, Vec3(0, 0, 1)).multiply(angle_axis(self.pitch.value * DEG, Vec3(1, 0, 0)))
         model.rotate_node_model(pelvis, q.normalized())
@@ -302,10 +351,18 @@ def _step_analytical_spring3(
     dt: Float32,
 ):
     """Exact closed-form 2nd-order harmonic oscillator `x'' + c x' + k x = 0`."""
-    if dt <= Float32(0.0):
+    if not isfinite(dt) or dt <= Float32(0.0):
         return
-    var k = max(Float32(1.0e-5), stiffness)
-    var gamma = max(Float32(0.0), damping) * Float32(0.5)
+    if (
+        not (isfinite(offset.x) and isfinite(offset.y) and isfinite(offset.z))
+        or not (isfinite(velocity.x) and isfinite(velocity.y) and isfinite(velocity.z))
+    ):
+        offset = Vec3()
+        velocity = Vec3()
+        return
+    var safe_dt = min(dt, Float32(1.0))
+    var k = max(Float32(1.0e-5), stiffness) if isfinite(stiffness) else Float32(100.0)
+    var gamma = (max(Float32(0.0), damping) if isfinite(damping) else Float32(10.0)) * Float32(0.5)
     var disc = k - gamma * gamma
     var x0 = offset
     var v0 = velocity
@@ -313,30 +370,36 @@ def _step_analytical_spring3(
     if disc > Float32(1.0e-6):
         # Underdamped closed form: exp(-gamma*dt) * (x0*cos(wd*dt) + ((v0 + gamma*x0)/wd)*sin(wd*dt))
         var wd = sqrt(disc)
-        var env = det_exp(-gamma * dt)
-        var c = det_cos(wd * dt)
-        var s = det_sin(wd * dt)
+        var env = det_exp(-gamma * safe_dt)
+        var c = det_cos(wd * safe_dt)
+        var s = det_sin(wd * safe_dt)
         var b = (v0 + x0 * gamma) * (Float32(1.0) / wd)
         offset = (x0 * c + b * s) * env
         velocity = (v0 * c - (x0 * k + v0 * gamma) * (s / wd)) * env
     elif disc >= Float32(-1.0e-6):
         # Critically damped closed form
-        var env = det_exp(-gamma * dt)
+        var env = det_exp(-gamma * safe_dt)
         var j1 = v0 + x0 * gamma
-        offset = (x0 + j1 * dt) * env
-        velocity = (v0 - j1 * (gamma * dt)) * env
+        offset = (x0 + j1 * safe_dt) * env
+        velocity = (v0 - j1 * (gamma * safe_dt)) * env
     else:
         # Overdamped closed form
         var alpha = sqrt(-disc)
         var r1 = -gamma + alpha
         var r2 = -gamma - alpha
-        var e1 = det_exp(r1 * dt)
-        var e2 = det_exp(r2 * dt)
+        var e1 = det_exp(r1 * safe_dt)
+        var e2 = det_exp(r2 * safe_dt)
         var inv_2a = Float32(0.5) / alpha
         var c1 = (v0 - x0 * r2) * inv_2a
         var c2 = (x0 * r1 - v0) * inv_2a
         offset = c1 * e1 + c2 * e2
         velocity = c1 * (r1 * e1) + c2 * (r2 * e2)
+    if (
+        not (isfinite(offset.x) and isfinite(offset.y) and isfinite(offset.z))
+        or not (isfinite(velocity.x) and isfinite(velocity.y) and isfinite(velocity.z))
+    ):
+        offset = Vec3()
+        velocity = Vec3()
 
 
 struct Recoil(Copyable, Movable):
@@ -360,9 +423,9 @@ struct Recoil(Copyable, Movable):
 
     def step(mut self, stiffness: Float32, damping: Float32, dt: Float32) -> Bool:
         """Advances analytical recoil spring by `dt`; returns False when settled."""
-        if dt <= Float32(0.0):
+        if not isfinite(dt) or dt <= Float32(0.0):
             return self.offset.length() >= Float32(0.00005)
-        _step_analytical_spring3(self.offset, self.velocity, stiffness, damping, dt)
+        _step_analytical_spring3(self.offset, self.velocity, stiffness, damping, min(dt, Float32(1.0)))
         if self.offset.length() < Float32(0.00005) and self.velocity.length() < Float32(0.0005):
             self.offset = Vec3()
             self.velocity = Vec3()
@@ -404,16 +467,21 @@ struct OrientationWarp(Copyable, Movable):
         mut self, mut model: NativeModel, pelvis: Int, spine: Int, drawn_yaw: Float32, travel_yaw: Float32,
         moving: Bool, max_degrees: Float32, spine_back: Float32, dt: Float32,
     ):
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt <= Float32(0.0)) else min(dt, Float32(1.0))
+        var safe_max_deg = max(Float32(0.0), max_degrees) if isfinite(max_degrees) else Float32(0.0)
+        var safe_spine_back = spine_back if isfinite(spine_back) else Float32(0.0)
         var goal = Float32(0)
-        if moving:
-            goal = max(-max_degrees, min(max_degrees, wrap_degrees(travel_yaw - drawn_yaw)))
-        self.angle.update(goal, 0.06, dt)
+        if moving and isfinite(travel_yaw) and isfinite(drawn_yaw):
+            var diff = Float64(travel_yaw) - Float64(drawn_yaw)
+            var wrapped = Float32(diff - 360.0 * floor((diff + 180.0) / 360.0)) if abs(diff) > 1.0e6 else wrap_degrees(travel_yaw - drawn_yaw)
+            goal = max(-safe_max_deg, min(safe_max_deg, wrapped)) if isfinite(wrapped) else Float32(0.0)
+        self.angle.update(goal, Float32(0.06), safe_dt)
         self.applied = self.angle.value
-        if abs(self.applied) < 0.01 or pelvis < 0:
+        if not isfinite(self.applied) or abs(self.applied) < 0.01 or pelvis < 0:
             return
         model.rotate_node_model(pelvis, angle_axis(self.applied * DEG, Vec3(0, 1, 0)))
         if spine >= 0:
-            model.rotate_node_model(spine, angle_axis(-self.applied * spine_back * DEG, Vec3(0, 1, 0)))
+            model.rotate_node_model(spine, angle_axis(-self.applied * safe_spine_back * DEG, Vec3(0, 1, 0)))
 
 
 def pose_parents(model: NativeModel) -> List[Int]:
@@ -479,18 +547,21 @@ struct MotionWarp(Copyable, Movable):
         self.active = False
 
     def apply(mut self, mut model: NativeModel, root: Int, clip_time: Float32, dt: Float32, ease: Float32 = 0):
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt <= Float32(0.0)) else min(dt, Float32(1.0))
+        var safe_t = clip_time if isfinite(clip_time) else Float32(0.0)
+        var safe_ease = ease if isfinite(ease) else Float32(0.0)
         var want = Vec3()
-        if self.active:
-            self.progress = smooth01(clip_time / self.contact_time)
+        if self.active and isfinite(self.contact_time) and self.contact_time > Float32(0.0):
+            self.progress = smooth01(safe_t / self.contact_time)
             want = self.goal * self.progress
-            if ease > 0:
-                self.shown.update(want, ease, dt)
+            if safe_ease > 0:
+                self.shown.update(want, safe_ease, safe_dt)
             else:
                 self.shown.value = want
                 self.shown.velocity = Vec3()
         else:
             self.progress = 0
-            self.shown.update(want, 0.09, dt)
+            self.shown.update(want, Float32(0.09), safe_dt)
         if root >= 0 and self.shown.value.length() > 0.0001:
             model.offset_node(root, self.shown.value)
 
@@ -617,7 +688,8 @@ struct FootPlantSolver(Copyable, Movable):
         skel.ensure_topology(model)
         skel.update_matrices(model)
 
-        var scale_y = max(Float32(0.01), abs(placement.scale.y))
+        var safe_dt = Float32(0.0) if (not isfinite(dt) or dt <= Float32(0.0)) else min(dt, Float32(1.0))
+        var scale_y = max(Float32(0.01), abs(placement.scale.y)) if isfinite(placement.scale.y) else Float32(1.0)
         var anim_ankle_world = List[Vec3](capacity=leg_count)
         var raw_pelvis_drop = Float32(0.0)
 
@@ -626,13 +698,13 @@ struct FootPlantSolver(Copyable, Movable):
             var ankle_node = self.legs[f].ankle
             var p_anim = placement.to_world(skel.global_position(ankle_node))
             anim_ankle_world.append(p_anim)
-            if f < len(hit_heights):
+            if f < len(hit_heights) and isfinite(hit_heights[f]):
                 var y_sole_anim = p_anim.y - self.legs[f].ankle_height * scale_y
                 var diff_y = hit_heights[f] - y_sole_anim
                 raw_pelvis_drop = min(raw_pelvis_drop, diff_y)
 
         raw_pelvis_drop = max(-self.max_pelvis_drop * scale_y, min(Float32(0.0), raw_pelvis_drop))
-        self.pelvis_offset_y.update(raw_pelvis_drop, self.pelvis_halflife, dt)
+        self.pelvis_offset_y.update(raw_pelvis_drop, self.pelvis_halflife, safe_dt)
 
         if self.pelvis >= 0 and self.pelvis < skel.node_count and abs(self.pelvis_offset_y.value) > Float32(1.0e-5):
             skel.offset_node(self.pelvis, Vec3(0.0, self.pelvis_offset_y.value / scale_y, 0.0), model)
@@ -640,7 +712,8 @@ struct FootPlantSolver(Copyable, Movable):
         # 2. Per-leg world stance lock / swing inertial release + pole IK + normal alignment
         var world_yaw_q = placement.world_yaw_quat()
         var inv_world_yaw_q = world_yaw_q.conjugate()
-        var tilt_alpha = Float32(1.0) - det_exp(Float32(-0.69314718) * max(Float32(0.0), dt) / max(Float32(0.005), self.tilt_halflife))
+        var safe_tilt_hl = max(Float32(0.005), self.tilt_halflife) if isfinite(self.tilt_halflife) else Float32(0.06)
+        var tilt_alpha = Float32(1.0) - det_exp(Float32(-0.69314718) * safe_dt / safe_tilt_hl)
 
         for f in range(leg_count):
             var hip = self.legs[f].hip
@@ -652,8 +725,10 @@ struct FootPlantSolver(Copyable, Movable):
             var stance = in_stance[f] if f < len(in_stance) else False
             var ankle_h_world = self.legs[f].ankle_height * scale_y
             var p_anim = anim_ankle_world[f]
-            var y_hit = hit_heights[f] if f < len(hit_heights) else (p_anim.y - ankle_h_world)
+            var y_hit = hit_heights[f] if (f < len(hit_heights) and isfinite(hit_heights[f])) else (p_anim.y - ankle_h_world)
             var n_hit = hit_normals[f] if f < len(hit_normals) else Vec3(0.0, 1.0, 0.0)
+            if not (isfinite(n_hit.x) and isfinite(n_hit.y) and isfinite(n_hit.z)):
+                n_hit = Vec3(0.0, 1.0, 0.0)
 
             var swing_goal = Vec3(p_anim.x, max(p_anim.y, y_hit + ankle_h_world), p_anim.z)
             var target_world: Vec3
@@ -676,11 +751,11 @@ struct FootPlantSolver(Copyable, Movable):
                     self.legs[f].locked = False
                     self.legs[f].release_offset = self.legs[f].locked_world_pos - swing_goal
                     self.legs[f].release_vel = Vec3()
-                if dt > Float32(0.0):
-                    decay_spring(self.legs[f].release_offset, self.legs[f].release_vel, self.release_halflife, dt)
+                if safe_dt > Float32(0.0):
+                    decay_spring(self.legs[f].release_offset, self.legs[f].release_vel, self.release_halflife, safe_dt)
                 target_world = swing_goal + self.legs[f].release_offset
 
-            self.legs[f].stance_blend.update(Float32(1.0) if stance else Float32(0.0), self.tilt_halflife, dt)
+            self.legs[f].stance_blend.update(Float32(1.0) if stance else Float32(0.0), self.tilt_halflife, safe_dt)
 
             # Preserve animated ankle orientation prior to 2-bone IK knee flexion
             var pre_ik_ankle_rot = skel.global_rotation(ankle)

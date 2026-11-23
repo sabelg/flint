@@ -1,5 +1,5 @@
 """Parametric curved 3D mesh builders for NativeMesh (lathes, lofts, airfoils, ellipsoids, capsules, beveled hulls)."""
-from std.math import sin, cos, sqrt
+from std.math import sin, cos, sqrt, isfinite
 from flint.core.math import Vec3
 from flint.core.transform import Quat, trs
 from flint.assets.model import NativeMesh, NativeModel, NativeNode
@@ -117,10 +117,18 @@ struct MeshBuilder(Copyable, Movable):
         phi_end: Float32 = TAU_F32,
     ):
         """Smooth UV-mapped ellipsoid (or dome/canopy slice via theta/phi bounds)."""
+        if rings < 1 or segments < 3:
+            return
+        if not (
+            isfinite(center.x) and isfinite(center.y) and isfinite(center.z)
+            and isfinite(theta_start) and isfinite(theta_end)
+            and isfinite(phi_start) and isfinite(phi_end)
+        ):
+            return
         var base_v = self.mesh.vertex_count()
-        var rx = max(Float32(0.001), radii.x)
-        var ry = max(Float32(0.001), radii.y)
-        var rz = max(Float32(0.001), radii.z)
+        var rx = max(Float32(0.001), radii.x if isfinite(radii.x) else Float32(0.001))
+        var ry = max(Float32(0.001), radii.y if isfinite(radii.y) else Float32(0.001))
+        var rz = max(Float32(0.001), radii.z if isfinite(radii.z) else Float32(0.001))
         for r in range(rings + 1):
             var tr = Float32(r) / Float32(rings)
             var theta = theta_start + (theta_end - theta_start) * tr
@@ -171,8 +179,27 @@ struct MeshBuilder(Copyable, Movable):
     ):
         """Smooth lofted body along +Z with independent elliptical (rx, ry) and camber y_offset per station."""
         var count = len(z_stations)
-        if count < 2:
+        if (
+            count < 2
+            or len(rx_stations) != count
+            or len(ry_stations) != count
+            or len(y_offsets) != count
+            or segments < 3
+        ):
             return
+        if not (
+            isfinite(offset.x) and isfinite(offset.y) and isfinite(offset.z)
+            and isfinite(u0) and isfinite(v0) and isfinite(u1) and isfinite(v1)
+        ):
+            return
+        for i in range(count):
+            if not (
+                isfinite(z_stations[i])
+                and isfinite(rx_stations[i])
+                and isfinite(ry_stations[i])
+                and isfinite(y_offsets[i])
+            ):
+                return
         var base_v = self.mesh.vertex_count()
         for i in range(count):
             var tv = Float32(i) / Float32(count - 1)
@@ -274,6 +301,8 @@ struct MeshBuilder(Copyable, Movable):
         caps: Bool = True,
     ):
         """Arbitrary-axis smooth cylinder / truncated cone between p0 and p1."""
+        if segments < 3:
+            return
         var axis = p1 - p0
         var length = axis.length()
         if length < 0.0001:
@@ -345,6 +374,8 @@ struct MeshBuilder(Copyable, Movable):
         color: UInt32 = 0xFFFFFFFF,
     ):
         """NACA-style symmetric curved airfoil wing/stabilizer from root leading edge to tip leading edge."""
+        if chord_steps < 1 or span_steps < 1:
+            return
         var up_n = up_dir.normalized()
         var ch_n = chord_dir.normalized()
         var span_vec = tip_le - root_le

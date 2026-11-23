@@ -1,5 +1,5 @@
 """Inspect and edit a sampled motion using a shared 30 fps timeline."""
-from std.math import sin, cos
+from std.math import sin, cos, isfinite
 from flint.anim.choreography import MotionSequence, MotionPlayer, cue_kind, TRACK_FPS
 from flint.anim.procedural import Placement
 from flint.assets.model import NativeModel
@@ -33,7 +33,12 @@ def effect_sound(kind: Int) -> WavClip:
 
 
 def nearest_frame(seconds: Float32) -> Int:
-    return max(0, Int(seconds * TRACK_FPS + 0.5))
+    if not isfinite(seconds) or seconds <= Float32(0.0):
+        return 0
+    var scaled = Float64(seconds) * Float64(TRACK_FPS) + 0.5
+    if scaled >= 1000000000.0:
+        return 1000000000
+    return max(0, Int(scaled))
 
 
 def frame_joint(

@@ -662,11 +662,18 @@ def append_chunk(mut data: List[UInt8], kind: Int, payload: List[UInt8]):
 
 
 def encode_png(mut pixels: List[UInt32], width: Int, height: Int, software: String = "", alpha: Bool = False) -> List[UInt8]:
+    if width <= 0 or height <= 0:
+        return List[UInt8]()
+    var channels = 4 if alpha else 3
+    if width > (Int.MAX - 1) // channels:
+        return List[UInt8]()
+    var row_bytes = width * channels + 1
+    if height > Int.MAX // row_bytes or width > Int.MAX // height or len(pixels) < width * height:
+        return List[UInt8]()
     var output = List[UInt8]()
     var signature = [137, 80, 78, 71, 13, 10, 26, 10]
     for value in signature:
         output.append(UInt8(value))
-    var channels = 4 if alpha else 3
     var header = List[UInt8]()
     append_be32(header, width)
     append_be32(header, height)
@@ -688,7 +695,6 @@ def encode_png(mut pixels: List[UInt32], width: Int, height: Int, software: Stri
     var zlib = List[UInt8]()
     zlib.append(0x78)
     zlib.append(0x01)
-    var row_bytes = width * channels + 1
     var raw_size = row_bytes * height
     var position = 0
     var adler_a = 1
@@ -725,9 +731,11 @@ def encode_png(mut pixels: List[UInt32], width: Int, height: Int, software: Stri
 def write_png(path: String, mut pixels: List[UInt32], width: Int, height: Int, stamped: Bool = True) -> Bool:
     """A PNG with the build stamp in a text chunk. References compared over time
     (tests/golden/shots) are written unstamped, so they change only with their pixels."""
-    if width <= 0 or height <= 0 or len(pixels) < width * height:
+    if width <= 0 or height <= 0 or width > Int.MAX // height or len(pixels) < width * height:
         return False
     var data = encode_png(pixels, width, height, ("Flint " + build_stamp()) if stamped else String())
+    if len(data) == 0:
+        return False
     return write_bytes(path, data)
 
 

@@ -11,7 +11,7 @@ Upgrades in Flint v4:
   `time < prev_time` or `looped > 0`, with zero `0.5m` cutoff or dropped frames)
   plus `root_yaw_delta` extraction.
 """
-from std.math import floor
+from std.math import floor, isfinite
 from flint.core.detmath import det_atan2, det_sin, det_cos, PI
 from flint.core.math import Vec3
 from flint.core.transform import Quat
@@ -348,6 +348,9 @@ struct Animator(Copyable, Movable):
         self.root_yaw_delta = Float32(0.0)
         if not self.configured() or len(model.nodes) == 0:
             return
+        if not isfinite(dt) or dt <= Float32(0.0):
+            return
+        var safe_dt = dt
         self.bind(model, handle)
         var chosen = self.select()
         var restart_clock = False
@@ -369,20 +372,20 @@ struct Animator(Copyable, Movable):
                 self.prev_phase = 0
                 restart_clock = True
         else:
-            self.state_time += dt
-        self.advance(dt, restart_clock)
+            self.state_time += safe_dt
+        self.advance(safe_dt, restart_clock)
         var out = Pose()
         swap(out, self.pose)
         self.evaluate_base(model, out, 0)
         swap(out, self.pose)
         self.root_motion(model, restart_clock)
-        self.update_layers(dt)
+        self.update_layers(safe_dt)
         swap(out, self.pose)
         self.apply_layers(model, out)
         if self.switched:
             var ahead = Pose()
             swap(ahead, self.ahead)
-            self.evaluate_base(model, ahead, dt)
+            self.evaluate_base(model, ahead, safe_dt)
             self.apply_layers(model, ahead)
             if self.root_node >= 0 and self.root_node < ahead.count():
                 var mode = self.graph.states[self.state].root_motion
@@ -395,7 +398,7 @@ struct Animator(Copyable, Movable):
                         var strip_q = Quat(0.0, det_sin((base_yaw - cur_yaw) * Float32(0.5)), 0.0, det_cos((base_yaw - cur_yaw) * Float32(0.5)))
                         ahead.r[self.root_node] = strip_q.multiply(ahead.r[self.root_node]).normalized()
             swap(ahead, self.ahead)
-        self.inertial.apply(out, self.ahead, self.switched, self.halflife, dt)
+        self.inertial.apply(out, self.ahead, self.switched, self.halflife, safe_dt)
         swap(out, self.pose)
 
     def _blended_segment_length_1d(self, blend_idx: Int, leader_clip: Int, segment: Int) -> Float32:
@@ -522,18 +525,39 @@ struct Animator(Copyable, Movable):
                     passed_events(info, st.clip, before, target, 0, 1, self.events)
                 self.clip_time = target
             else:
-                var t = self.clip_time + (0 if restarted else dt * self.rate)
-                if info.loop and info.duration > 0:
-                    while t < 0:
-                        t += info.duration
-                        looped -= 1
-                    while t >= info.duration:
-                        t -= info.duration
-                        looped += 1
+                var safe_dt = dt if isfinite(dt) else Float32(0.0)
+                var safe_rate = self.rate if isfinite(self.rate) else Float32(1.0)
+                var dur = info.duration
+                var t = Float64(self.clip_time) + (0.0 if restarted else Float64(safe_dt) * Float64(safe_rate))
+                if not isfinite(t):
+                    t = 0.0
+                if info.loop and isfinite(dur) and dur > Float32(0.0):
+                    var d64 = Float64(dur)
+                    var q_f64 = floor(t / d64)
+                    if isfinite(q_f64):
+                        var wrapped = t - q_f64 * d64
+                        if wrapped < 0.0:
+                            wrapped += d64
+                        if wrapped >= d64:
+                            wrapped = 0.0
+                        t = wrapped
+                        if q_f64 >= 0.0 and q_f64 <= 1.0e9:
+                            looped = Int(q_f64)
+                        elif q_f64 > 1.0e9:
+                            looped = 1_000_000_000
+                        else:
+                            looped = 0
+                    else:
+                        t = 0.0
+                        looped = 0
                 else:
-                    t = max(Float32(0), min(t, info.duration))
-                passed_events(info, st.clip, before, t, max(0, looped), 1, self.events)
-                self.clip_time = t
+                    var d64 = Float64(dur) if (isfinite(dur) and dur > Float32(0.0)) else 0.0
+                    t = max(0.0, min(t, d64))
+                var t32 = Float32(t)
+                if info.loop and isfinite(dur) and dur > Float32(0.0) and t32 >= dur:
+                    t32 = Float32(0.0)
+                passed_events(info, st.clip, before, t32, max(0, looped), 1, self.events)
+                self.clip_time = t32
             self.last_looped = max(0, looped)
             self.leader_time = self.clip_time
             return
@@ -697,6 +721,7 @@ struct Animator(Copyable, Movable):
                 self.pose.r[self.root_node] = strip_q.multiply(self.pose.r[self.root_node]).normalized()
 
     def update_layers(mut self, dt: Float32):
+        var safe_dt = dt if isfinite(dt) else Float32(0.0)
         for index in range(len(self.graph.layers)):
             ref layer = self.graph.layers[index]
             var on = all_hold(layer.when, self.params)
@@ -710,12 +735,13 @@ struct Animator(Copyable, Movable):
                 target = layer.weight
                 if layer.weight_param >= 0:
                     target *= max(Float32(0), min(Float32(1), self.params[layer.weight_param]))
-            var step = dt / max(Float32(0.001), layer.fade)
+            var step = safe_dt / max(Float32(0.001), layer.fade)
             var w = self.layers[index].weight
             if w < target:
                 w = min(target, w + step)
             else:
                 w = max(target, w - step)
+            w = max(Float32(0.0), w)
             if w > 0 and not self.layers[index].on:
                 self.layers[index].time = 0
                 self.layers[index].on = True
@@ -723,20 +749,41 @@ struct Animator(Copyable, Movable):
                     passed_events(self.clips[layer.clip], layer.clip, -1, 0, 0, w, self.events)
             elif w > 0:
                 ref info = self.clips[layer.clip]
+                var dur = info.duration
                 var before = self.layers[index].time
-                var t = before + dt * layer.rate
+                var rate = layer.rate if isfinite(layer.rate) else Float32(1.0)
+                var t = Float64(before) + Float64(safe_dt) * Float64(rate)
+                if not isfinite(t):
+                    t = 0.0
                 var looped = 0
-                if layer.loop and info.duration > 0:
-                    while t < 0:
-                        t += info.duration
-                    while t >= info.duration:
-                        t -= info.duration
-                        looped += 1
+                if layer.loop and isfinite(dur) and dur > Float32(0.0):
+                    var d64 = Float64(dur)
+                    var q_f64 = floor(t / d64)
+                    if isfinite(q_f64):
+                        var wrapped = t - q_f64 * d64
+                        if wrapped < 0.0:
+                            wrapped += d64
+                        if wrapped >= d64:
+                            wrapped = 0.0
+                        t = wrapped
+                        if q_f64 >= 0.0 and q_f64 <= 1.0e9:
+                            looped = Int(q_f64)
+                        elif q_f64 > 1.0e9:
+                            looped = 1_000_000_000
+                        else:
+                            looped = 0
+                    else:
+                        t = 0.0
+                        looped = 0
                 else:
-                    t = max(Float32(0), min(t, info.duration))
+                    var d64 = Float64(dur) if (isfinite(dur) and dur > Float32(0.0)) else 0.0
+                    t = max(0.0, min(t, d64))
+                var t32 = Float32(t)
+                if layer.loop and isfinite(dur) and dur > Float32(0.0) and t32 >= dur:
+                    t32 = Float32(0.0)
                 if w >= 0.5:
-                    passed_events(info, layer.clip, before, t, looped, w, self.events)
-                self.layers[index].time = t
+                    passed_events(info, layer.clip, before, t32, looped, w, self.events)
+                self.layers[index].time = t32
             if w <= 0:
                 self.layers[index].on = False
             self.layers[index].weight = w

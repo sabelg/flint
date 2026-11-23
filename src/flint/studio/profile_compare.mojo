@@ -1,6 +1,6 @@
 """Compare complete Flint Trace Event captures, grouping repeated scopes by frame."""
 from std.collections import Dict
-from std.math import ceil
+from std.math import ceil, isfinite
 from flint.assets.json import JsonDocument, parse_json
 from flint.platform.os import read_bytes
 
@@ -39,7 +39,15 @@ struct Capture(Movable):
             var start = doc.number(doc.object_get(e, "ts"), -1)
             var dur = doc.number(doc.object_get(e, "dur"), -1)
             var id = doc.integer(doc.object_get(doc.object_get(e, "args"), "frame"), len(frames))
-            if start < 0 or dur < 0 or id in self.ids or (len(frames) > 0 and start < self.starts[len(frames)-1]):
+            if (
+                not isfinite(start)
+                or not isfinite(dur)
+                or start < 0
+                or dur < 0
+                or id < 0
+                or id in self.ids
+                or (len(frames) > 0 and start < self.starts[len(frames)-1])
+            ):
                 raise Error("Invalid or unordered Flint frame in " + path)
             self.ids[id] = len(frames)
             self.starts.append(start)
@@ -60,16 +68,16 @@ struct Capture(Movable):
             var id = doc.integer(doc.object_get(args, "frame"))
             var frame = self.ids.get(id, -1)
             if ph == "C":
-                if name == "gpu_ms" and frame >= 0:
+                if name == "gpu_ms" and frame >= 0 and args >= 0 and args < len(doc.nodes) and doc.nodes[args].kind == 5:
                     for k in range(len(doc.nodes[args].keys)):
                         var key = doc.nodes[args].keys[k]
                         var ms = doc.number(doc.nodes[args].children[k], -1)
-                        if key != "frame" and ms >= 0:
+                        if key != "frame" and isfinite(ms) and ms >= 0:
                             self.add(key, frame, ms)
                 continue
             var ts = doc.number(doc.object_get(e, "ts"), -1)
             var dur = doc.number(doc.object_get(e, "dur"), -1)
-            if dur < 0:
+            if not isfinite(ts) or not isfinite(dur) or dur < 0:
                 continue
             if id < 0:
                 # Legacy CPU events carry a timestamp, while delayed GPU spans carry a frame ID.

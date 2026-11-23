@@ -14,13 +14,31 @@ Verifies:
 """
 from test_kimodo import test_kimodo
 from std.ffi import external_call
-from std.math import abs, isnan, sqrt
+from std.math import abs, isfinite, isnan, sqrt
 from std.testing import assert_true, assert_equal
+from flint.core.jobs import JobPool
 from flint.ml.gpu import GpuMatmul
 from flint.ml.onnx import OnnxModel
 from flint.ml.protobuf import PbReader
-from flint.ml.tensor import Tensor, DT_F32, DT_I64, broadcast_offsets
-from flint.ml.ops import binary, where, concat, topk, scatter_nd, range_op, B_ADD, B_EQ, B_MUL
+from flint.ml.tensor import Tensor, DT_F32, DT_I64, broadcast_offsets, f32_from_bits
+from flint.ml.ops import (
+    binary,
+    where,
+    concat,
+    topk,
+    scatter_nd,
+    range_op,
+    expand,
+    tile,
+    onehot,
+    resize_nearest,
+    gemm,
+    softmax,
+    layer_norm,
+    B_ADD,
+    B_EQ,
+    B_MUL,
+)
 from flint.ml.motionbricks import (
     MotionBricks, MbConfig, MbMotion, MbQuat, MbVec3, MbXform, quat_slerp, quat_from_basis, quat_axis_angle,
     load_bvh, _correct_endpoints,
@@ -491,6 +509,297 @@ def test_t5_onnx_and_ops_negative() raises:
         caught_cos = True
     assert_true(caught_cos, "ConstantOfShape with empty value tensor must raise Error")
 
+    # 7f. Squeeze invalid non-1 dimension, duplicate axis, OOB axis, and valid squeeze (axes & default)
+    var n_sq = List[UInt8]()
+    _pb_str(n_sq, 1, "x"); _pb_str(n_sq, 1, "ax"); _pb_str(n_sq, 2, "y"); _pb_str(n_sq, 4, "Squeeze")
+    var g_sq = List[UInt8]()
+    _pb_bytes(g_sq, 1, n_sq)
+    _pb_bytes(g_sq, 11, vi_in); _pb_bytes(g_sq, 11, vi_ax); _pb_bytes(g_sq, 12, vi_out)
+    var m_sq = _load_temp_onnx("/tmp/flint_t5_sq_" + String(pid) + ".onnx", g_sq)
+    m_sq.set_input("x", Tensor.floats([2, 3], [1, 2, 3, 4, 5, 6]))
+    m_sq.set_input("ax", Tensor.ints(DT_I64, [1], [0]))
+    var caught_sq_non1 = False
+    try:
+        m_sq.run()
+    except:
+        caught_sq_non1 = True
+    assert_true(caught_sq_non1, "Squeeze on non-1 dimension must raise Error instead of returning shape=[0]")
+
+    m_sq.set_input("x", Tensor.floats([2, 1, 3], [1, 2, 3, 4, 5, 6]))
+    m_sq.set_input("ax", Tensor.ints(DT_I64, [2], [1, 1]))
+    var caught_sq_dup = False
+    try:
+        m_sq.run()
+    except:
+        caught_sq_dup = True
+    assert_true(caught_sq_dup, "Squeeze with duplicate axis must raise Error")
+
+    m_sq.set_input("ax", Tensor.ints(DT_I64, [1], [5]))
+    var caught_sq_oob = False
+    try:
+        m_sq.run()
+    except:
+        caught_sq_oob = True
+    assert_true(caught_sq_oob, "Squeeze with OOB axis must raise Error")
+
+    m_sq.set_input("x", Tensor.floats([1, 2, 1, 3], [1, 2, 3, 4, 5, 6]))
+    m_sq.set_input("ax", Tensor.ints(DT_I64, [2], [0, 2]))
+    m_sq.run()
+    var y_sq = m_sq.output("y")
+    assert_equal(len(y_sq.shape), 2)
+    assert_equal(y_sq.shape[0], 2)
+    assert_equal(y_sq.shape[1], 3)
+    assert_equal(y_sq.fget(5), Float32(6.0))
+
+    var n_sq_def = List[UInt8]()
+    _pb_str(n_sq_def, 1, "x"); _pb_str(n_sq_def, 2, "y"); _pb_str(n_sq_def, 4, "Squeeze")
+    var g_sq_def = List[UInt8]()
+    _pb_bytes(g_sq_def, 1, n_sq_def)
+    _pb_bytes(g_sq_def, 11, vi_in); _pb_bytes(g_sq_def, 12, vi_out)
+    var m_sq_def = _load_temp_onnx("/tmp/flint_t5_sqd_" + String(pid) + ".onnx", g_sq_def)
+    m_sq_def.set_input("x", Tensor.floats([1, 2, 1, 3], [1, 2, 3, 4, 5, 6]))
+    m_sq_def.run()
+    var y_sq_def = m_sq_def.output("y")
+    assert_equal(len(y_sq_def.shape), 2)
+    assert_equal(y_sq_def.shape[0], 2)
+    assert_equal(y_sq_def.shape[1], 3)
+    assert_equal(y_sq_def.fget(0), Float32(1.0))
+
+    # 7g. Resize with NaN / non-positive / +Inf scales must raise Error, and valid Resize must succeed
+    var attr_rs_mode = List[UInt8](); _pb_str(attr_rs_mode, 1, "mode"); _pb_str(attr_rs_mode, 4, "nearest")
+    var attr_rs_ctm = List[UInt8](); _pb_str(attr_rs_ctm, 1, "coordinate_transformation_mode"); _pb_str(attr_rs_ctm, 4, "asymmetric")
+    var attr_rs_nm = List[UInt8](); _pb_str(attr_rs_nm, 1, "nearest_mode"); _pb_str(attr_rs_nm, 4, "floor")
+    var vi_sc = List[UInt8](); _pb_str(vi_sc, 1, "sc")
+    var n_rs = List[UInt8]()
+    _pb_str(n_rs, 1, "x"); _pb_str(n_rs, 1, ""); _pb_str(n_rs, 1, "sc")
+    _pb_str(n_rs, 2, "y"); _pb_str(n_rs, 4, "Resize")
+    _pb_bytes(n_rs, 5, attr_rs_mode); _pb_bytes(n_rs, 5, attr_rs_ctm); _pb_bytes(n_rs, 5, attr_rs_nm)
+    var g_rs = List[UInt8]()
+    _pb_bytes(g_rs, 1, n_rs)
+    _pb_bytes(g_rs, 11, vi_in); _pb_bytes(g_rs, 11, vi_sc); _pb_bytes(g_rs, 12, vi_out)
+    var m_rs = _load_temp_onnx("/tmp/flint_t5_rs_" + String(pid) + ".onnx", g_rs)
+    m_rs.set_input("x", Tensor.floats([2, 2], [Float32(1), 2, 3, 4]))
+
+    var bad_scales: List[Float32] = [
+        f32_from_bits(0x7FC00000),  # NaN
+        Float32(0.0),               # zero
+        Float32(-1.0),              # negative
+        f32_from_bits(0x7F800000),  # +Inf
+    ]
+    for bs in bad_scales:
+        m_rs.set_input("sc", Tensor.floats([2], [bs, Float32(1.0)]))
+        var caught_rs = False
+        try:
+            m_rs.run()
+        except:
+            caught_rs = True
+        assert_true(caught_rs, "Resize with invalid scale must raise Error")
+
+    m_rs.set_input("sc", Tensor.floats([2], [Float32(2.0), Float32(2.0)]))
+    m_rs.run()
+    var y_rs = m_rs.output("y")
+    assert_equal(y_rs.shape[0], 4)
+    assert_equal(y_rs.shape[1], 4)
+    assert_equal(y_rs.fget(0), Float32(1.0))
+    assert_equal(y_rs.fget(15), Float32(4.0))
+
+    # 7h. Round 13 B1-B3: Multi-axis & int64 Resize OOM, ops.{tile, expand, onehot, resize_nearest, binary} MAX_RANGE_ELEMS, unset Tensor() SIGTRAP guards
+    # B1.1: 2D Resize with scales=[1e9, 1e9] (per-axis <= 1<<40, total > MAX_RANGE_ELEMS)
+    m_rs.set_input("sc", Tensor.floats([2], [Float32(1e9), Float32(1e9)]))
+    var caught_rs_2d = False
+    try:
+        m_rs.run()
+    except:
+        caught_rs_2d = True
+    assert_true(caught_rs_2d, "Resize 2D scales=[1e9, 1e9] must raise Error")
+
+    # B1.2: Resize with int64 sizes=[1<<30, 1<<30]
+    var vi_sz = List[UInt8](); _pb_str(vi_sz, 1, "sz")
+    var n_rs_sz = List[UInt8]()
+    _pb_str(n_rs_sz, 1, "x"); _pb_str(n_rs_sz, 1, ""); _pb_str(n_rs_sz, 1, ""); _pb_str(n_rs_sz, 1, "sz")
+    _pb_str(n_rs_sz, 2, "y"); _pb_str(n_rs_sz, 4, "Resize")
+    _pb_bytes(n_rs_sz, 5, attr_rs_mode); _pb_bytes(n_rs_sz, 5, attr_rs_ctm); _pb_bytes(n_rs_sz, 5, attr_rs_nm)
+    var g_rs_sz = List[UInt8]()
+    _pb_bytes(g_rs_sz, 1, n_rs_sz)
+    _pb_bytes(g_rs_sz, 11, vi_in); _pb_bytes(g_rs_sz, 11, vi_sz); _pb_bytes(g_rs_sz, 12, vi_out)
+    var m_rs_sz = _load_temp_onnx("/tmp/flint_t5_rsz_" + String(pid) + ".onnx", g_rs_sz)
+    m_rs_sz.set_input("x", Tensor.floats([2, 2], [Float32(1), 2, 3, 4]))
+    m_rs_sz.set_input("sz", Tensor.ints(DT_I64, [2], [1 << 30, 1 << 30]))
+    var caught_rs_int = False
+    try:
+        m_rs_sz.run()
+    except:
+        caught_rs_int = True
+    assert_true(caught_rs_int, "Resize int64 sizes=[1<<30, 1<<30] must raise Error")
+
+    m_rs_sz.set_input("sz", Tensor.ints(DT_I64, [2], [4, 4]))
+    m_rs_sz.run()
+    var y_rs_sz = m_rs_sz.output("y")
+    assert_equal(y_rs_sz.shape[0], 4)
+    assert_equal(y_rs_sz.shape[1], 4)
+
+    var caught_rn_big = False
+    try:
+        _ = resize_nearest(Tensor.floats([2, 2], [Float32(1), 2, 3, 4]), [1 << 14, 1 << 14])
+    except:
+        caught_rn_big = True
+    assert_true(caught_rn_big, "ops.resize_nearest exceeding MAX_RANGE_ELEMS must raise Error")
+
+    # B2: ops.{tile, expand, onehot, binary} MAX_RANGE_ELEMS enforcement
+    var caught_tile = False
+    try:
+        _ = tile(Tensor.floats([2, 2], [Float32(1), 2, 3, 4]), [1 << 30, 1 << 30])
+    except:
+        caught_tile = True
+    assert_true(caught_tile, "ops.tile exceeding MAX_RANGE_ELEMS must raise Error")
+
+    var caught_expand = False
+    try:
+        _ = expand(Tensor.floats([1, 1], [Float32(1.0)]), [1 << 30, 1 << 30])
+    except:
+        caught_expand = True
+    assert_true(caught_expand, "ops.expand exceeding MAX_RANGE_ELEMS must raise Error")
+
+    var caught_onehot = False
+    try:
+        var oh_idx = Tensor.ints(DT_I64, [1 << 13], List[Int](length=1 << 13, fill=0))
+        var oh_vals = Tensor.floats([2], [Float32(0.0), Float32(1.0)])
+        _ = onehot(oh_idx, 1 << 13, oh_vals)
+    except:
+        caught_onehot = True
+    assert_true(caught_onehot, "ops.onehot exceeding MAX_RANGE_ELEMS must raise Error")
+
+    var caught_bin_bcast = False
+    try:
+        var ba = Tensor.floats([1 << 13, 1], List[Float32](length=1 << 13, fill=Float32(1.0)))
+        var bb = Tensor.floats([1, 1 << 13], List[Float32](length=1 << 13, fill=Float32(2.0)))
+        _ = binary(B_ADD, ba, bb)
+    except:
+        caught_bin_bcast = True
+    assert_true(caught_bin_bcast, "ops.binary broadcast exceeding MAX_RANGE_ELEMS must raise Error")
+
+    # B3: Unset Tensor() auxiliary inputs in TopK, CumSum, OneHot, Resize, Clip must raise Error without SIGTRAP
+    var n_tk_u = List[UInt8]()
+    _pb_str(n_tk_u, 1, "x"); _pb_str(n_tk_u, 1, "ax"); _pb_str(n_tk_u, 2, "y"); _pb_str(n_tk_u, 4, "TopK")
+    var g_tk_u = List[UInt8]()
+    _pb_bytes(g_tk_u, 1, n_tk_u); _pb_bytes(g_tk_u, 11, vi_in); _pb_bytes(g_tk_u, 11, vi_ax); _pb_bytes(g_tk_u, 12, vi_out)
+    var m_tk_u = _load_temp_onnx("/tmp/flint_t5_tku_" + String(pid) + ".onnx", g_tk_u)
+    m_tk_u.set_input("x", Tensor.floats([3], [Float32(1), 2, 3]))
+    var caught_tk_u = False
+    try:
+        m_tk_u.run()
+    except:
+        caught_tk_u = True
+    assert_true(caught_tk_u, "TopK with unset k tensor must raise Error")
+
+    var n_cs_u = List[UInt8]()
+    _pb_str(n_cs_u, 1, "x"); _pb_str(n_cs_u, 1, "ax"); _pb_str(n_cs_u, 2, "y"); _pb_str(n_cs_u, 4, "CumSum")
+    var g_cs_u = List[UInt8]()
+    _pb_bytes(g_cs_u, 1, n_cs_u); _pb_bytes(g_cs_u, 11, vi_in); _pb_bytes(g_cs_u, 11, vi_ax); _pb_bytes(g_cs_u, 12, vi_out)
+    var m_cs_u = _load_temp_onnx("/tmp/flint_t5_csu_" + String(pid) + ".onnx", g_cs_u)
+    m_cs_u.set_input("x", Tensor.floats([3], [Float32(1), 2, 3]))
+    var caught_cs_u = False
+    try:
+        m_cs_u.run()
+    except:
+        caught_cs_u = True
+    assert_true(caught_cs_u, "CumSum with unset axis tensor must raise Error")
+
+    var vi_vals = List[UInt8](); _pb_str(vi_vals, 1, "vals")
+    var n_oh_u = List[UInt8]()
+    _pb_str(n_oh_u, 1, "x"); _pb_str(n_oh_u, 1, "ax"); _pb_str(n_oh_u, 1, "vals"); _pb_str(n_oh_u, 2, "y"); _pb_str(n_oh_u, 4, "OneHot")
+    var g_oh_u = List[UInt8]()
+    _pb_bytes(g_oh_u, 1, n_oh_u)
+    _pb_bytes(g_oh_u, 11, vi_in); _pb_bytes(g_oh_u, 11, vi_ax); _pb_bytes(g_oh_u, 11, vi_vals); _pb_bytes(g_oh_u, 12, vi_out)
+    var m_oh_u = _load_temp_onnx("/tmp/flint_t5_ohu_" + String(pid) + ".onnx", g_oh_u)
+    m_oh_u.set_input("x", Tensor.ints(DT_I64, [2], [0, 1]))
+    m_oh_u.set_input("vals", Tensor.floats([2], [Float32(0), Float32(1)]))
+    var caught_oh_u = False
+    try:
+        m_oh_u.run()
+    except:
+        caught_oh_u = True
+    assert_true(caught_oh_u, "OneHot with unset depth tensor must raise Error")
+
+    var m_rs_u = _load_temp_onnx("/tmp/flint_t5_rsu_" + String(pid) + ".onnx", g_rs)
+    m_rs_u.set_input("x", Tensor.floats([2], [Float32(1), 2]))
+    var caught_rs_u = False
+    try:
+        m_rs_u.run()
+    except:
+        caught_rs_u = True
+    assert_true(caught_rs_u, "Resize with unset scales tensor must raise Error")
+
+    var n_cl_u = List[UInt8]()
+    _pb_str(n_cl_u, 1, "x"); _pb_str(n_cl_u, 1, "ax"); _pb_str(n_cl_u, 2, "y"); _pb_str(n_cl_u, 4, "Clip")
+    var g_cl_u = List[UInt8]()
+    _pb_bytes(g_cl_u, 1, n_cl_u); _pb_bytes(g_cl_u, 11, vi_in); _pb_bytes(g_cl_u, 11, vi_ax); _pb_bytes(g_cl_u, 12, vi_out)
+    var m_cl_u = _load_temp_onnx("/tmp/flint_t5_clu_" + String(pid) + ".onnx", g_cl_u)
+    m_cl_u.set_input("x", Tensor.floats([2], [Float32(1), 2]))
+    var caught_cl_u = False
+    try:
+        m_cl_u.run()
+    except:
+        caught_cl_u = True
+    assert_true(caught_cl_u, "Clip with unset min tensor must raise Error")
+
+    var empty_t = Tensor()
+    assert_equal(empty_t.get(0), Float64(0.0))
+    assert_equal(empty_t.int_at(0), 0)
+    assert_equal(Tensor.floats([2], [Float32(1), 2]).get(99), Float64(0.0))
+
+    # B2b (R13b): ops.gemm & ONNX Gemm MAX_RANGE_ELEMS enforcement ([65536, 1] x [1, 65536] and [8192, 1] x [1, 8192])
+    var jp_gm = JobPool()
+    var ga_big = Tensor.floats([1 << 16, 1], List[Float32](length=1 << 16, fill=Float32(1.0)))
+    var gb_big = Tensor.floats([1, 1 << 16], List[Float32](length=1 << 16, fill=Float32(1.0)))
+    var caught_gemm_16 = False
+    try:
+        _ = gemm(jp_gm, ga_big, gb_big, Tensor(), False, Float32(1.0), Float32(1.0), False, False)
+    except:
+        caught_gemm_16 = True
+    assert_true(caught_gemm_16, "ops.gemm [65536, 1] x [1, 65536] exceeding MAX_RANGE_ELEMS must raise Error")
+
+    var ga_8k = Tensor.floats([8192, 1], List[Float32](length=8192, fill=Float32(1.0)))
+    var gb_8k = Tensor.floats([1, 8192], List[Float32](length=8192, fill=Float32(1.0)))
+    var caught_gemm_8k = False
+    try:
+        _ = gemm(jp_gm, ga_8k, gb_8k, Tensor(), False, Float32(1.0), Float32(1.0), False, False)
+    except:
+        caught_gemm_8k = True
+    assert_true(caught_gemm_8k, "ops.gemm [8192, 1] x [1, 8192] exceeding MAX_RANGE_ELEMS must raise Error")
+
+    var gemm_ok = gemm(
+        jp_gm,
+        Tensor.floats([2, 2], [Float32(1), 2, 3, 4]),
+        Tensor.floats([2, 2], [Float32(1), 0, 0, 1]),
+        Tensor(),
+        False,
+        Float32(1.0),
+        Float32(1.0),
+        False,
+        False,
+    )
+    assert_equal(gemm_ok.shape[0], 2)
+    assert_equal(gemm_ok.shape[1], 2)
+    assert_equal(gemm_ok.fget(3), Float32(4.0))
+
+    # ONNX Gemm node outer product > MAX_RANGE_ELEMS (with and without GPU)
+    var vi_gb = List[UInt8](); _pb_str(vi_gb, 1, "b")
+    var n_gm_big = List[UInt8]()
+    _pb_str(n_gm_big, 1, "x"); _pb_str(n_gm_big, 1, "b"); _pb_str(n_gm_big, 2, "y"); _pb_str(n_gm_big, 4, "Gemm")
+    var g_gm_big = List[UInt8]()
+    _pb_bytes(g_gm_big, 1, n_gm_big)
+    _pb_bytes(g_gm_big, 11, vi_in); _pb_bytes(g_gm_big, 11, vi_gb); _pb_bytes(g_gm_big, 12, vi_out)
+    var m_gm_big = _load_temp_onnx("/tmp/flint_t5_gmbig_" + String(pid) + ".onnx", g_gm_big)
+    m_gm_big.set_input("x", ga_8k^)
+    m_gm_big.set_input("b", gb_8k^)
+    var caught_onnx_gm = False
+    try:
+        m_gm_big.run()
+    except:
+        caught_onnx_gm = True
+    assert_true(caught_onnx_gm, "ONNX Gemm [8192, 1] x [1, 8192] exceeding MAX_RANGE_ELEMS must raise Error")
+
     print("  t5 onnx & ops negative boundary checks: ok")
 
 
@@ -748,7 +1057,129 @@ def test_t5_gpu_product_and_overflow_guards() raises:
         assert_true(mm_kzero_raised, "GpuMatmul.matmul(k=0) must raise Error")
         _ = len(dummy)
 
+    # 4e. Round 18: softmax(+Inf/-Inf) & layer_norm(eps < 0 / NaN)
+    var pinf_f = f32_from_bits(0x7F800000)
+    var ninf_f = f32_from_bits(0xFF800000)
+    var nan_f = f32_from_bits(0x7FC00000)
+    var sm_inf = softmax(Tensor.floats([2], [pinf_f, Float32(1.0)]), 0)
+    assert_true(abs(sm_inf.fget(0) - Float32(1.0)) < 1e-5)
+    assert_true(abs(sm_inf.fget(1) - Float32(0.0)) < 1e-5)
+    var sm_ninf = softmax(Tensor.floats([2], [ninf_f, ninf_f]), 0)
+    assert_true(abs(sm_ninf.fget(0) - Float32(0.5)) < 1e-5)
+    var ln_bad_raised = False
+    try:
+        _ = layer_norm(Tensor.floats([2], [1.0, 2.0]), Tensor.floats([2], [1.0, 1.0]), Tensor(), False, Float32(-1.0))
+    except:
+        ln_bad_raised = True
+    assert_true(ln_bad_raised, "layer_norm with negative eps must raise Error")
+    var ln_nan_raised = False
+    try:
+        _ = layer_norm(Tensor.floats([2], [1.0, 2.0]), Tensor.floats([2], [1.0, 1.0]), Tensor(), False, nan_f)
+    except:
+        ln_nan_raised = True
+    assert_true(ln_nan_raised, "layer_norm with NaN eps must raise Error")
+
+    var ln_in_nan_raised = False
+    try:
+        _ = layer_norm(Tensor.floats([2], [nan_f, 1.0]), Tensor.floats([2], [1.0, 1.0]), Tensor(), False, Float32(1.0e-5))
+    except:
+        ln_in_nan_raised = True
+    assert_true(ln_in_nan_raised, "layer_norm with NaN input must raise Error")
+
+    var ln_in_inf_raised = False
+    try:
+        _ = layer_norm(Tensor.floats([2], [pinf_f, 1.0]), Tensor.floats([2], [1.0, 1.0]), Tensor(), False, Float32(1.0e-5))
+    except:
+        ln_in_inf_raised = True
+    assert_true(ln_in_inf_raised, "layer_norm with +Inf input must raise Error")
+
+    var ln_scale_nan_raised = False
+    try:
+        _ = layer_norm(Tensor.floats([2], [1.0, 2.0]), Tensor.floats([2], [nan_f, 1.0]), Tensor(), False, Float32(1.0e-5))
+    except:
+        ln_scale_nan_raised = True
+    assert_true(ln_scale_nan_raised, "layer_norm with NaN scale must raise Error")
+
+    var ln_bias_inf_raised = False
+    try:
+        _ = layer_norm(Tensor.floats([2], [1.0, 2.0]), Tensor.floats([2], [1.0, 1.0]), Tensor.floats([2], [ninf_f, 0.0]), True, Float32(1.0e-5))
+    except:
+        ln_bias_inf_raised = True
+    assert_true(ln_bias_inf_raised, "layer_norm with -Inf bias must raise Error")
+
+    var ln_ext = layer_norm(
+        Tensor.floats([2], [Float32(3.4e38), Float32(3.4e38)]),
+        Tensor.floats([2], [Float32(1.0), Float32(1.0)]),
+        Tensor.floats([2], [Float32(0.0), Float32(0.0)]),
+        True,
+        Float32(1.0e-5),
+    )
+    assert_true(isfinite(ln_ext.fget(0)) and isfinite(ln_ext.fget(1)), "layer_norm([3.4e38, 3.4e38]) must be finite")
+    assert_true(abs(ln_ext.fget(0)) < 1e-5 and abs(ln_ext.fget(1)) < 1e-5, "layer_norm([3.4e38, 3.4e38]) must be [0, 0]")
+
+    var ln_spread = layer_norm(
+        Tensor.floats([2], [Float32(-3.4e38), Float32(3.4e38)]),
+        Tensor.floats([2], [Float32(1.0), Float32(1.0)]),
+        Tensor(),
+        False,
+        Float32(1.0e-5),
+    )
+    assert_true(abs(ln_spread.fget(0) + Float32(1.0)) < 1e-4, "layer_norm([-3.4e38, 3.4e38])[0] must be -1")
+    assert_true(abs(ln_spread.fget(1) - Float32(1.0)) < 1e-4, "layer_norm([-3.4e38, 3.4e38])[1] must be +1")
+
     print("  t5 gpu _gpu_product & overflow guards: ok")
+
+
+def test_t5_onnx_split_num_outputs_uneven() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var attr_no = List[UInt8]()
+    _pb_str(attr_no, 1, "num_outputs")
+    _pb_varint(attr_no, (3 << 3) | 0)
+    _pb_varint(attr_no, 4)
+
+    var node_split = List[UInt8]()
+    _pb_str(node_split, 1, "x")
+    _pb_str(node_split, 2, "y0")
+    _pb_str(node_split, 2, "y1")
+    _pb_str(node_split, 2, "y2")
+    _pb_str(node_split, 2, "y3")
+    _pb_str(node_split, 4, "Split")
+    _pb_bytes(node_split, 5, attr_no)
+
+    var vi_in = List[UInt8]()
+    _pb_str(vi_in, 1, "x")
+    var g = List[UInt8]()
+    _pb_bytes(g, 1, node_split)
+    _pb_bytes(g, 11, vi_in)
+    for out_name in ["y0", "y1", "y2", "y3"]:
+        var vi_o = List[UInt8]()
+        _pb_str(vi_o, 1, String(out_name))
+        _pb_bytes(g, 12, vi_o)
+
+    var model_bytes = List[UInt8]()
+    _pb_bytes(model_bytes, 7, g)
+
+    var path_s = "/tmp/flint_t5_split_" + String(pid) + ".onnx"
+    assert_true(write_bytes(path_s, model_bytes))
+    var m = OnnxModel.load(path_s, 1)
+    _ = remove_file(path_s)
+    m.set_input("x", Tensor.floats([5], [1.0, 2.0, 3.0, 4.0, 5.0]))
+    m.run()
+
+    var y0 = m.output("y0")
+    var y1 = m.output("y1")
+    var y2 = m.output("y2")
+    var y3 = m.output("y3")
+    assert_equal(y0.numel(), 2)
+    assert_equal(y1.numel(), 1)
+    assert_equal(y2.numel(), 1)
+    assert_equal(y3.numel(), 1)
+    assert_equal(y0.fget(0), Float32(1.0))
+    assert_equal(y0.fget(1), Float32(2.0))
+    assert_equal(y1.fget(0), Float32(3.0))
+    assert_equal(y2.fget(0), Float32(4.0))
+    assert_equal(y3.fget(0), Float32(5.0))
+    print("  t5 onnx Split(num_outputs=4) on [5] -> [2, 1, 1, 1]: ok")
 
 
 def main() raises:
@@ -760,4 +1191,5 @@ def main() raises:
     test_motionbricks_soma()
     test_t5_onnx_and_ops_negative()
     test_t5_gpu_product_and_overflow_guards()
+    test_t5_onnx_split_num_outputs_uneven()
     print("=== ALL FLINT v5 ML TESTS PASSED ===")

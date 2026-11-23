@@ -1,4 +1,5 @@
 """Native workspace toolbar and text canvas shared by Studio and TurboMojo."""
+from std.math import isfinite
 from flint.render.font import SdfFont
 from flint.ui.draw_list import UiDrawList, PRIM_GLYPH
 from flint.studio.ide_grid import IdeGrid, DEFAULT_BG
@@ -22,6 +23,8 @@ def toolbar_start(scene: Bool) -> Int:
 
 def toolbar_label(i: Int) -> String:
     var labels = ["Open", "Save", "Build", "Run"]
+    if i < 0 or i >= len(labels):
+        return ""
     return labels[i]
 
 
@@ -181,16 +184,31 @@ def raster_ui(mut pixels: List[UInt32], font: SdfFont, ui: UiDrawList, width: In
         return
     pixels.resize(width * height, 0)
     for p in ui.prims:
+        if not isfinite(p.x0) or not isfinite(p.y0) or not isfinite(p.x1) or not isfinite(p.y1):
+            continue
         var rgb = ui_color(p.fill_rgba8)
         var glyph = (p.header & 15) == PRIM_GLYPH
-        if glyph and (p.x1 <= p.x0 or p.y1 <= p.y0):
-            continue
-        var left = max(Int(p.clip_xy0 & 65535), Int(p.x0))
-        var right = min(Int(p.clip_xy1 & 65535), min(width, Int(p.x1 + 0.5)))
-        for y in range(
-            max(Int(p.clip_xy0 >> 16), Int(p.y0)),
-            min(Int(p.clip_xy1 >> 16), min(height, Int(p.y1 + 0.5))),
+        if glyph and (
+            not isfinite(p.param0)
+            or not isfinite(p.u0)
+            or not isfinite(p.v0)
+            or not isfinite(p.u1)
+            or not isfinite(p.v1)
+            or p.x1 <= p.x0
+            or p.y1 <= p.y0
         ):
+            continue
+        var x0_i = Int(max(Float64(0.0), min(Float64(width), Float64(p.x0))))
+        var y0_i = Int(max(Float64(0.0), min(Float64(height), Float64(p.y0))))
+        var x1_i = Int(max(Float64(0.0), min(Float64(width), Float64(p.x1) + 0.5)))
+        var y1_i = Int(max(Float64(0.0), min(Float64(height), Float64(p.y1) + 0.5)))
+        var left = max(Int(p.clip_xy0 & 65535), x0_i)
+        var right = min(Int(p.clip_xy1 & 65535), x1_i)
+        var top = max(Int(p.clip_xy0 >> 16), y0_i)
+        var bottom = min(Int(p.clip_xy1 >> 16), y1_i)
+        if left >= right or top >= bottom:
+            continue
+        for y in range(top, bottom):
             for x in range(left, right):
                 var index = y * width + x
                 if not glyph:

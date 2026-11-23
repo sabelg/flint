@@ -16,7 +16,7 @@ Implements:
    string-pulling producing taut Euclidean shortest paths.
 """
 from std.collections import List
-from std.math import sqrt, abs, min, max, floor
+from std.math import sqrt, abs, min, max, floor, isfinite
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import det_cos
 from flint.core.detsort import MinHeap
@@ -46,6 +46,23 @@ comptime OFFMESH_CLIMB: UInt8 = 2
 
 comptime OBSTACLE_BOX: UInt8 = 0
 comptime OBSTACLE_CYLINDER: UInt8 = 1
+
+
+@always_inline
+def _nav_vec3_isfinite(v: Vec3) -> Bool:
+    return isfinite(v.x) and isfinite(v.y) and isfinite(v.z)
+
+
+@always_inline
+def _nav_safe_floor_clamped(v: Float64, lo: Int, hi: Int) -> Int:
+    if not isfinite(v):
+        return lo
+    var f = floor(v)
+    if f <= Float64(lo):
+        return lo
+    if f >= Float64(hi):
+        return hi
+    return Int(f)
 
 
 @always_inline
@@ -638,36 +655,54 @@ struct NavMesh(Copyable, Movable):
         cfg: NavMeshConfig = NavMeshConfig(),
     ) -> NavMesh:
         var nav = NavMesh(cfg)
-        var n_tris = len(tri_a)
+        var n_tris = min(len(tri_a), min(len(tri_b), len(tri_c)))
         if n_tris == 0:
             return nav^
 
-        var raw_min = tri_a[0]
-        var raw_max = tri_a[0]
+        var has_finite = False
+        var raw_min = Vec3()
+        var raw_max = Vec3()
         for i in range(n_tris):
-            var tv = [tri_a[i], tri_b[i], tri_c[i]]
+            var va = tri_a[i]
+            var vb = tri_b[i]
+            var vc = tri_c[i]
+            if not (_nav_vec3_isfinite(va) and _nav_vec3_isfinite(vb) and _nav_vec3_isfinite(vc)):
+                continue
+            if not has_finite:
+                raw_min = va
+                raw_max = va
+                has_finite = True
+            var tv = [va, vb, vc]
             for k in range(3):
                 var v = tv[k]
                 raw_min.x = min(raw_min.x, v.x); raw_min.y = min(raw_min.y, v.y); raw_min.z = min(raw_min.z, v.z)
                 raw_max.x = max(raw_max.x, v.x); raw_max.y = max(raw_max.y, v.y); raw_max.z = max(raw_max.z, v.z)
 
-        var cs = max(Float32(0.05), cfg.cell_size)
-        var ch = max(Float32(0.02), cfg.cell_height)
-        var span_x = (raw_max.x - raw_min.x) + cs * Float32(2.0)
-        var span_z = (raw_max.z - raw_min.z) + cs * Float32(2.0)
-        var w = max(2, min(1024, Int(floor(span_x / cs)) + 1))
-        var d = max(2, min(1024, Int(floor(span_z / cs)) + 1))
-        var mid_x = (raw_min.x + raw_max.x) * Float32(0.5)
-        var mid_z = (raw_min.z + raw_max.z) * Float32(0.5)
-        var bmin = Vec3(
-            mid_x - Float32(w) * cs * Float32(0.5),
-            raw_min.y - ch * Float32(2.0),
-            mid_z - Float32(d) * cs * Float32(0.5),
-        )
+        if not has_finite:
+            return nav^
 
-        var inv_cs = Float32(1.0) / cs
-        var inv_ch = Float32(1.0) / ch
-        var cos_walk = det_cos(cfg.walkable_slope_deg * NAV_DEG_TO_RAD)
+        var cs = max(Float32(0.05), cfg.cell_size) if isfinite(cfg.cell_size) else Float32(0.25)
+        var ch = max(Float32(0.02), cfg.cell_height) if isfinite(cfg.cell_height) else Float32(0.10)
+        var cs64 = Float64(cs)
+        var ch64 = Float64(ch)
+        var span_x64 = (Float64(raw_max.x) - Float64(raw_min.x)) + cs64 * 2.0
+        var span_z64 = (Float64(raw_max.z) - Float64(raw_min.z)) + cs64 * 2.0
+        var w = _nav_safe_floor_clamped(span_x64 / cs64 + 1.0, 2, 1024)
+        var d = _nav_safe_floor_clamped(span_z64 / cs64 + 1.0, 2, 1024)
+        var mid_x = Float64(raw_min.x) * 0.5 + Float64(raw_max.x) * 0.5
+        var mid_z = Float64(raw_min.z) * 0.5 + Float64(raw_max.z) * 0.5
+        var bmin = Vec3(
+            Float32(mid_x - Float64(w) * cs64 * 0.5),
+            Float32(Float64(raw_min.y) - ch64 * 2.0),
+            Float32(mid_z - Float64(d) * cs64 * 0.5),
+        )
+        if not _nav_vec3_isfinite(bmin):
+            return nav^
+
+        var inv_cs64 = 1.0 / cs64
+        var inv_ch64 = 1.0 / ch64
+        var slope_deg = cfg.walkable_slope_deg if isfinite(cfg.walkable_slope_deg) else Float32(46.0)
+        var cos_walk = det_cos(slope_deg * NAV_DEG_TO_RAD)
 
         # 1. Solid Voxel Span Rasterization + collect non-walkable wall triangles for exact radius erosion
         var cols = List[List[_SolidSpan]](capacity=w * d)
@@ -681,9 +716,11 @@ struct NavMesh(Copyable, Movable):
             var v0 = tri_a[t]
             var v1 = tri_b[t]
             var v2 = tri_c[t]
+            if not (_nav_vec3_isfinite(v0) and _nav_vec3_isfinite(v1) and _nav_vec3_isfinite(v2)):
+                continue
             var raw_n = (v1 - v0).cross(v2 - v0)
             var nl = raw_n.length()
-            if nl <= Float32(1.0e-8):
+            if not isfinite(nl) or nl <= Float32(1.0e-8):
                 continue
             var n = raw_n * (Float32(1.0) / nl)
             var walkable = n.y >= cos_walk
@@ -695,10 +732,10 @@ struct NavMesh(Copyable, Movable):
             var tlo_z = min(v0.z, min(v1.z, v2.z))
             var thi_z = max(v0.z, max(v1.z, v2.z))
 
-            var iz0 = max(0, Int(floor((tlo_z - bmin.z) * inv_cs)))
-            var iz1 = min(d - 1, Int(floor((thi_z - bmin.z) * inv_cs)))
-            var ix0 = max(0, Int(floor((tlo_x - bmin.x) * inv_cs)))
-            var ix1 = min(w - 1, Int(floor((thi_x - bmin.x) * inv_cs)))
+            var iz0 = max(0, _nav_safe_floor_clamped((Float64(tlo_z) - Float64(bmin.z)) * inv_cs64, -1, d))
+            var iz1 = min(d - 1, _nav_safe_floor_clamped((Float64(thi_z) - Float64(bmin.z)) * inv_cs64, -1, d))
+            var ix0 = max(0, _nav_safe_floor_clamped((Float64(tlo_x) - Float64(bmin.x)) * inv_cs64, -1, w))
+            var ix1 = min(w - 1, _nav_safe_floor_clamped((Float64(thi_x) - Float64(bmin.x)) * inv_cs64, -1, w))
 
             var base_poly = List[Vec3](capacity=3)
             base_poly.append(v0); base_poly.append(v1); base_poly.append(v2)
@@ -731,9 +768,12 @@ struct NavMesh(Copyable, Movable):
                     for cp_i in range(1, len(cell_poly)):
                         cy_min = min(cy_min, cell_poly[cp_i].y)
                         cy_max = max(cy_max, cell_poly[cp_i].y)
+                    if not (isfinite(cy_min) and isfinite(cy_max)):
+                        continue
 
-                    var smin = UInt16(max(0, min(65534, Int(floor((cy_min - bmin.y) * inv_ch)))))
-                    var smax = UInt16(max(Int(smin) + 1, min(65535, Int(floor((cy_max - bmin.y) * inv_ch)) + 1)))
+                    var smin = UInt16(_nav_safe_floor_clamped((Float64(cy_min) - Float64(bmin.y)) * inv_ch64, 0, 65534))
+                    var smax_raw = _nav_safe_floor_clamped((Float64(cy_max) - Float64(bmin.y)) * inv_ch64, 0, 65534) + 1
+                    var smax = UInt16(max(Int(smin) + 1, min(65535, smax_raw)))
 
                     ref col = cols[iz * w + ix]
                     var inserted = False
@@ -773,8 +813,10 @@ struct NavMesh(Copyable, Movable):
         chf.col_first = List[Int32](length=w * d, fill=0)
         chf.col_count = List[UInt16](length=w * d, fill=0)
 
-        var walk_h_vox = max(1, Int(floor(cfg.walkable_height * inv_ch + Float32(0.999))))
-        var climb_vox = max(1, Int(floor(cfg.walkable_climb * inv_ch)))
+        var walk_h_val = cfg.walkable_height if isfinite(cfg.walkable_height) else Float32(1.80)
+        var walk_c_val = cfg.walkable_climb if isfinite(cfg.walkable_climb) else Float32(0.40)
+        var walk_h_vox = _nav_safe_floor_clamped(Float64(walk_h_val) * inv_ch64 + 0.999, 1, 65535)
+        var climb_vox = _nav_safe_floor_clamped(Float64(walk_c_val) * inv_ch64, 1, 65535)
 
         for iz in range(d):
             for ix in range(w):
@@ -822,10 +864,10 @@ struct NavMesh(Copyable, Movable):
 
         # 3a. Open-ledge 8-neighbor Chamfer distance erosion (cliffs & floor drop-offs)
         nav.chf = chf^
-        var rad = max(Float32(0.0), cfg.walkable_radius)
+        var rad = max(Float32(0.0), cfg.walkable_radius) if isfinite(cfg.walkable_radius) else Float32(0.0)
         if rad > Float32(1.0e-4):
             Self._compute_open_ledge_chamfer(nav.chf)
-            var ledge_thresh = UInt16(max(2, Int(floor((rad * inv_cs) * Float32(2.0) + Float32(0.5)))))
+            var ledge_thresh = UInt16(_nav_safe_floor_clamped((Float64(rad) * inv_cs64) * 2.0 + 0.5, 2, 65535))
             for i in range(len(nav.chf.spans)):
                 if nav.chf.spans[i].dist < ledge_thresh:
                     nav.chf.spans[i].base_area = 0
@@ -846,10 +888,10 @@ struct NavMesh(Copyable, Movable):
                 var tlo_z = min(v0.z, min(v1.z, v2.z)) - rad
                 var thi_z = max(v0.z, max(v1.z, v2.z)) + rad
 
-                var ix0 = max(0, Int(floor((tlo_x - bmin.x) * inv_cs)))
-                var ix1 = min(w - 1, Int(floor((thi_x - bmin.x) * inv_cs)))
-                var iz0 = max(0, Int(floor((tlo_z - bmin.z) * inv_cs)))
-                var iz1 = min(d - 1, Int(floor((thi_z - bmin.z) * inv_cs)))
+                var ix0 = max(0, _nav_safe_floor_clamped((Float64(tlo_x) - Float64(bmin.x)) * inv_cs64, -1, w))
+                var ix1 = min(w - 1, _nav_safe_floor_clamped((Float64(thi_x) - Float64(bmin.x)) * inv_cs64, -1, w))
+                var iz0 = max(0, _nav_safe_floor_clamped((Float64(tlo_z) - Float64(bmin.z)) * inv_cs64, -1, d))
+                var iz1 = min(d - 1, _nav_safe_floor_clamped((Float64(thi_z) - Float64(bmin.z)) * inv_cs64, -1, d))
 
                 for iz in range(iz0, iz1 + 1):
                     var z0 = bmin.z + Float32(iz) * cs
@@ -1004,28 +1046,32 @@ struct NavMesh(Copyable, Movable):
 
     def _obstacle_tile_bounds(self, obs: NavObstacle) -> Tuple[Int, Int, Int, Int]:
         """Returns `(tx0, tx1, tz0, tz1)` inclusive tile indices touched by `obs` inflated by `walkable_radius`."""
-        if self.tiles_x == 0 or self.tiles_z == 0:
+        if self.tiles_x == 0 or self.tiles_z == 0 or not _nav_vec3_isfinite(obs.pos):
             return (0, -1, 0, -1)
         var cs = self.chf.cell_size
-        var inv_cs = Float32(1.0) / max(Float32(1.0e-5), cs)
+        var inv_cs64 = 1.0 / Float64(max(Float32(1.0e-5), cs))
         var orig = self.chf.origin
         var pad_r = self.cfg.walkable_radius + cs
 
         var wx_e: Float32
         var wz_e: Float32
         if obs.shape == OBSTACLE_CYLINDER:
+            if not isfinite(obs.radius):
+                return (0, -1, 0, -1)
             wx_e = obs.radius + pad_r
             wz_e = obs.radius + pad_r
         else:
+            if not _nav_vec3_isfinite(obs.half_extents):
+                return (0, -1, 0, -1)
             var he = obs.half_extents + Vec3(pad_r, 0.0, pad_r)
             var axes = get_box_axes(obs.rot)
             wx_e = abs(axes[0].x) * he.x + abs(axes[1].x) * he.y + abs(axes[2].x) * he.z
             wz_e = abs(axes[0].z) * he.x + abs(axes[1].z) * he.y + abs(axes[2].z) * he.z
 
-        var ix0 = max(0, Int(floor((obs.pos.x - wx_e - orig.x) * inv_cs)))
-        var ix1 = min(self.chf.width - 1, Int(floor((obs.pos.x + wx_e - orig.x) * inv_cs)))
-        var iz0 = max(0, Int(floor((obs.pos.z - wz_e - orig.z) * inv_cs)))
-        var iz1 = min(self.chf.depth - 1, Int(floor((obs.pos.z + wz_e - orig.z) * inv_cs)))
+        var ix0 = max(0, _nav_safe_floor_clamped((Float64(obs.pos.x) - Float64(wx_e) - Float64(orig.x)) * inv_cs64, -1, self.chf.width))
+        var ix1 = min(self.chf.width - 1, _nav_safe_floor_clamped((Float64(obs.pos.x) + Float64(wx_e) - Float64(orig.x)) * inv_cs64, -1, self.chf.width))
+        var iz0 = max(0, _nav_safe_floor_clamped((Float64(obs.pos.z) - Float64(wz_e) - Float64(orig.z)) * inv_cs64, -1, self.chf.depth))
+        var iz1 = min(self.chf.depth - 1, _nav_safe_floor_clamped((Float64(obs.pos.z) + Float64(wz_e) - Float64(orig.z)) * inv_cs64, -1, self.chf.depth))
         if ix0 > ix1 or iz0 > iz1:
             return (0, -1, 0, -1)
         return (
@@ -1044,25 +1090,27 @@ struct NavMesh(Copyable, Movable):
 
         var cs = self.chf.cell_size
         var ch = self.chf.cell_height
-        var inv_cs = Float32(1.0) / max(Float32(1.0e-5), cs)
+        var inv_cs64 = 1.0 / Float64(max(Float32(1.0e-5), cs))
         var orig = self.chf.origin
         var pad_r = max(Float32(0.0), self.cfg.walkable_radius - Float32(1.0e-4))
         var half_cs = cs * Float32(0.5)
 
         for oi in range(len(self.obstacles)):
             ref obs = self.obstacles[oi]
-            if not obs.active:
+            if not obs.active or not _nav_vec3_isfinite(obs.pos):
                 continue
             var y_lo = obs.pos.y - obs.half_height - ch * Float32(2.0)
             var y_hi = obs.pos.y + obs.half_height + self.cfg.walkable_height
 
             if obs.shape == OBSTACLE_CYLINDER:
+                if not isfinite(obs.radius):
+                    continue
                 var r_eff = obs.radius + pad_r
                 var r2 = r_eff * r_eff
-                var ix0 = max(tile.x0, Int(floor((obs.pos.x - r_eff - orig.x) * inv_cs)))
-                var ix1 = min(tile.x1 - 1, Int(floor((obs.pos.x + r_eff - orig.x) * inv_cs)))
-                var iz0 = max(tile.z0, Int(floor((obs.pos.z - r_eff - orig.z) * inv_cs)))
-                var iz1 = min(tile.z1 - 1, Int(floor((obs.pos.z + r_eff - orig.z) * inv_cs)))
+                var ix0 = max(tile.x0, _nav_safe_floor_clamped((Float64(obs.pos.x) - Float64(r_eff) - Float64(orig.x)) * inv_cs64, tile.x0 - 1, tile.x1))
+                var ix1 = min(tile.x1 - 1, _nav_safe_floor_clamped((Float64(obs.pos.x) + Float64(r_eff) - Float64(orig.x)) * inv_cs64, tile.x0 - 1, tile.x1))
+                var iz0 = max(tile.z0, _nav_safe_floor_clamped((Float64(obs.pos.z) - Float64(r_eff) - Float64(orig.z)) * inv_cs64, tile.z0 - 1, tile.z1))
+                var iz1 = min(tile.z1 - 1, _nav_safe_floor_clamped((Float64(obs.pos.z) + Float64(r_eff) - Float64(orig.z)) * inv_cs64, tile.z0 - 1, tile.z1))
                 for iz in range(iz0, iz1 + 1):
                     var z0 = orig.z + Float32(iz) * cs
                     var z1 = z0 + cs
@@ -1078,14 +1126,16 @@ struct NavMesh(Copyable, Movable):
                                 if sy >= y_lo and sy <= y_hi:
                                     self.chf.spans[s].area = 0
             else:
+                if not _nav_vec3_isfinite(obs.half_extents):
+                    continue
                 var he_cell = obs.half_extents + Vec3(pad_r + half_cs, 0.0, pad_r + half_cs)
                 var axes = get_box_axes(obs.rot)
                 var wx_e = abs(axes[0].x) * he_cell.x + abs(axes[1].x) * he_cell.y + abs(axes[2].x) * he_cell.z
                 var wz_e = abs(axes[0].z) * he_cell.x + abs(axes[1].z) * he_cell.y + abs(axes[2].z) * he_cell.z
-                var ix0 = max(tile.x0, Int(floor((obs.pos.x - wx_e - orig.x) * inv_cs)))
-                var ix1 = min(tile.x1 - 1, Int(floor((obs.pos.x + wx_e - orig.x) * inv_cs)))
-                var iz0 = max(tile.z0, Int(floor((obs.pos.z - wz_e - orig.z) * inv_cs)))
-                var iz1 = min(tile.z1 - 1, Int(floor((obs.pos.z + wz_e - orig.z) * inv_cs)))
+                var ix0 = max(tile.x0, _nav_safe_floor_clamped((Float64(obs.pos.x) - Float64(wx_e) - Float64(orig.x)) * inv_cs64, tile.x0 - 1, tile.x1))
+                var ix1 = min(tile.x1 - 1, _nav_safe_floor_clamped((Float64(obs.pos.x) + Float64(wx_e) - Float64(orig.x)) * inv_cs64, tile.x0 - 1, tile.x1))
+                var iz0 = max(tile.z0, _nav_safe_floor_clamped((Float64(obs.pos.z) - Float64(wz_e) - Float64(orig.z)) * inv_cs64, tile.z0 - 1, tile.z1))
+                var iz1 = min(tile.z1 - 1, _nav_safe_floor_clamped((Float64(obs.pos.z) + Float64(wz_e) - Float64(orig.z)) * inv_cs64, tile.z0 - 1, tile.z1))
                 if ix0 > ix1 or iz0 > iz1:
                     continue
                 var inv_q = obs.rot.conjugate()
@@ -1546,24 +1596,26 @@ struct NavMesh(Copyable, Movable):
     # =========================================================================
 
     def find_nearest_poly(self, p: Vec3, max_search_dist: Float32 = 10.0) -> Tuple[Int, Vec3]:
+        if not _nav_vec3_isfinite(p) or not isfinite(max_search_dist) or max_search_dist < Float32(0.0):
+            return (-1, p)
         var best_idx = -1
         var best_pt = p
         var best_d2 = max_search_dist * max_search_dist
 
         if len(self.tiles) > 0 and self.tiles_x > 0 and self.tiles_z > 0 and self.tile_size > 0:
             var tile_w = Float32(self.tile_size) * self.chf.cell_size
-            var inv_tw = Float32(1.0) / max(Float32(1.0e-5), tile_w)
+            var inv_tw64 = 1.0 / Float64(max(Float32(1.0e-5), tile_w))
             var orig = self.chf.origin
-            var tx0 = max(0, Int(floor((p.x - max_search_dist - orig.x) * inv_tw)))
-            var tx1 = min(self.tiles_x - 1, Int(floor((p.x + max_search_dist - orig.x) * inv_tw)))
-            var tz0 = max(0, Int(floor((p.z - max_search_dist - orig.z) * inv_tw)))
-            var tz1 = min(self.tiles_z - 1, Int(floor((p.z + max_search_dist - orig.z) * inv_tw)))
+            var tx0 = max(0, _nav_safe_floor_clamped((Float64(p.x) - Float64(max_search_dist) - Float64(orig.x)) * inv_tw64, -1, self.tiles_x))
+            var tx1 = min(self.tiles_x - 1, _nav_safe_floor_clamped((Float64(p.x) + Float64(max_search_dist) - Float64(orig.x)) * inv_tw64, -1, self.tiles_x))
+            var tz0 = max(0, _nav_safe_floor_clamped((Float64(p.z) - Float64(max_search_dist) - Float64(orig.z)) * inv_tw64, -1, self.tiles_z))
+            var tz1 = min(self.tiles_z - 1, _nav_safe_floor_clamped((Float64(p.z) + Float64(max_search_dist) - Float64(orig.z)) * inv_tw64, -1, self.tiles_z))
             if tx0 > tx1 or tz0 > tz1:
                 return (-1, p)
 
             # Check the tile containing `p` first to tighten `best_d2` before scanning neighbors
-            var ctx = max(tx0, min(tx1, Int(floor((p.x - orig.x) * inv_tw))))
-            var ctz = max(tz0, min(tz1, Int(floor((p.z - orig.z) * inv_tw))))
+            var ctx = _nav_safe_floor_clamped((Float64(p.x) - Float64(orig.x)) * inv_tw64, tx0, tx1)
+            var ctz = _nav_safe_floor_clamped((Float64(p.z) - Float64(orig.z)) * inv_tw64, tz0, tz1)
             ref c_pids = self.tiles[ctz * self.tiles_x + ctx].poly_ids
             for k in range(len(c_pids)):
                 var pid = c_pids[k]
@@ -1634,15 +1686,17 @@ struct NavMesh(Copyable, Movable):
         return idx
 
     def _find_poly_containing_probe(self, p: Vec3, ref_y: Float32, max_dy: Float32) -> Int:
+        if not _nav_vec3_isfinite(p) or not isfinite(ref_y) or not isfinite(max_dy):
+            return -1
         if len(self.tiles) > 0 and self.tiles_x > 0 and self.tiles_z > 0 and self.tile_size > 0:
             var tile_w = Float32(self.tile_size) * self.chf.cell_size
-            var inv_tw = Float32(1.0) / max(Float32(1.0e-5), tile_w)
+            var inv_tw64 = 1.0 / Float64(max(Float32(1.0e-5), tile_w))
             var orig = self.chf.origin
-            var pad = Float32(2.0e-3)
-            var tx0 = max(0, Int(floor((p.x - pad - orig.x) * inv_tw)))
-            var tx1 = min(self.tiles_x - 1, Int(floor((p.x + pad - orig.x) * inv_tw)))
-            var tz0 = max(0, Int(floor((p.z - pad - orig.z) * inv_tw)))
-            var tz1 = min(self.tiles_z - 1, Int(floor((p.z + pad - orig.z) * inv_tw)))
+            var pad = 2.0e-3
+            var tx0 = max(0, _nav_safe_floor_clamped((Float64(p.x) - pad - Float64(orig.x)) * inv_tw64, -1, self.tiles_x))
+            var tx1 = min(self.tiles_x - 1, _nav_safe_floor_clamped((Float64(p.x) + pad - Float64(orig.x)) * inv_tw64, -1, self.tiles_x))
+            var tz0 = max(0, _nav_safe_floor_clamped((Float64(p.z) - pad - Float64(orig.z)) * inv_tw64, -1, self.tiles_z))
+            var tz1 = min(self.tiles_z - 1, _nav_safe_floor_clamped((Float64(p.z) + pad - Float64(orig.z)) * inv_tw64, -1, self.tiles_z))
             for tz in range(tz0, tz1 + 1):
                 for tx in range(tx0, tx1 + 1):
                     ref pids = self.tiles[tz * self.tiles_x + tx].poly_ids

@@ -886,7 +886,9 @@ def _build_huff_enc_codes[N_SYMS: Int](counts: Array[Int, 16], syms: Array[Int, 
 def encode_jpeg_baseline(pixels: List[UInt32], width: Int, height: Int, quality: Int = 92) -> List[UInt8]:
     """Pure-Mojo ITU-T.81 Baseline Sequential (`SOF0`, `4:4:4` YCbCr) JPEG encoder with Annex K Huffman tables."""
     var res = List[UInt8]()
-    if width <= 0 or height <= 0 or len(pixels) < width * height:
+    if width <= 0 or height <= 0 or width > 65535 or height > 65535:
+        return res^
+    if width > Int.MAX // height or len(pixels) < width * height:
         return res^
 
     var q_clamped = max(10, min(100, quality))

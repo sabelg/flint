@@ -577,18 +577,21 @@ struct Scene(Movable):
         if fmt != "flscn" or ver < 1 or ver > SCENE_SCHEMA_VERSION:
             raise Error("unsupported .flscn header or version")
 
-        self.name = doc.text(doc.object_get(doc.root, "name"), self.name)
-        registry.ensure_registered_in_world(world)
-        if clear_existing:
-            world.clear_entities()
-
+        var new_name = doc.text(doc.object_get(doc.root, "name"), self.name)
         var ents_arr = doc.object_get(doc.root, "entities")
+        if ents_arr >= 0 and doc.nodes[ents_arr].kind != 4:
+            raise Error("invalid entities array in .flscn")
         var count = doc.array_size(ents_arr)
+
+        # Stage parse, component decoding, parent range & cycle checks in an isolated World
+        # before mutating `world` or `self.name`.
+        var staging = World()
+        registry.ensure_registered_in_world(staging)
         var spawned = List[Entity](capacity=count)
         var parent_slots = List[Int](length=count, fill=-1)
 
         for _ in range(count):
-            spawned.append(world.spawn_empty())
+            spawned.append(staging.spawn_empty())
 
         for i in range(count):
             var enode = doc.at(ents_arr, i)
@@ -602,16 +605,44 @@ struct Scene(Movable):
                     var cidx = registry.find_by_name(sname)
                     if cidx < 0:
                         raise Error("unknown component in .flscn: " + sname)
-                    if not registry.read_entity_json(cidx, world, spawned[i], doc, cnode):
+                    if not registry.read_entity_json(cidx, staging, spawned[i], doc, cnode):
                         raise Error("failed to decode .flscn component: " + sname)
 
         for i in range(count):
             var p = parent_slots[i]
-            if p >= 0 and p < count:
-                if not set_parent(world, spawned[i], spawned[p]):
+            if p < -1 or p >= count:
+                raise Error("out-of-range parent slot in .flscn scene")
+            if p >= 0:
+                if not set_parent(staging, spawned[i], spawned[p]):
                     raise Error("cycle or invalid parent in .flscn scene")
 
-        return spawned^
+        registry.ensure_registered_in_world(world)
+        if clear_existing:
+            var snap = staging.snapshot_blob()
+            world.restore_blob(snap)
+            self.name = new_name
+            return spawned^
+
+        var live_spawned = List[Entity](capacity=count)
+        for _ in range(count):
+            live_spawned.append(world.spawn_empty())
+        for i in range(count):
+            var enode = doc.at(ents_arr, i)
+            var comps_obj = doc.object_get(enode, "components")
+            if comps_obj >= 0 and doc.nodes[comps_obj].kind == 5:
+                var num_keys = len(doc.nodes[comps_obj].keys)
+                for k in range(num_keys):
+                    var sname = doc.nodes[comps_obj].keys[k]
+                    var cnode = doc.nodes[comps_obj].children[k]
+                    var cidx = registry.find_by_name(sname)
+                    if cidx >= 0:
+                        _ = registry.read_entity_json(cidx, world, live_spawned[i], doc, cnode)
+        for i in range(count):
+            var p = parent_slots[i]
+            if p >= 0 and p < count:
+                _ = set_parent(world, live_spawned[i], live_spawned[p])
+        self.name = new_name
+        return live_spawned^
 
     def load_flscn_file(
         mut self,
@@ -679,9 +710,12 @@ struct Scene(Movable):
         var raw = lz4_unpack(packed)
         if len(raw) == 0:
             raise Error("corrupted or invalid LZ4 frame in .flscnb")
+        var raw_backup = List[UInt8]()
+        if not clear_existing:
+            raw_backup = raw.copy()
         var reader = BlobReader(raw^)
         _ = reader.enter(SCENE_BIN_MAGIC, SCENE_SCHEMA_VERSION)
-        self.name = reader.text()
+        var new_name = reader.text()
         var count = reader.integer()
         if (
             reader.failed
@@ -691,14 +725,14 @@ struct Scene(Movable):
         ):
             raise Error("corrupted entity count in .flscnb")
 
-        registry.ensure_registered_in_world(world)
-        if clear_existing:
-            world.clear_entities()
-
+        # Stage parse, component decoding, parent range & cycle checks in an isolated World
+        # before mutating `world` or `self.name`.
+        var staging = World()
+        registry.ensure_registered_in_world(staging)
         var spawned = List[Entity](capacity=count)
         var parent_slots = List[Int](length=count, fill=-1)
         for _ in range(count):
-            spawned.append(world.spawn_empty())
+            spawned.append(staging.spawn_empty())
 
         for slot in range(count):
             parent_slots[slot] = reader.integer()
@@ -715,18 +749,50 @@ struct Scene(Movable):
                 var cidx = registry.find_by_fourcc(tag)
                 if cidx < 0:
                     raise Error("unregistered component FourCC in .flscnb")
-                if not registry.read_entity_bin(cidx, world, spawned[slot], reader):
+                if not registry.read_entity_bin(cidx, staging, spawned[slot], reader):
                     raise Error("failed to decode binary component in .flscnb")
 
         reader.leave()
+        if reader.failed:
+            raise Error("truncated or corrupted .flscnb scene tail")
 
         for slot in range(count):
             var p = parent_slots[slot]
-            if p >= 0 and p < count:
-                if not set_parent(world, spawned[slot], spawned[p]):
+            if p < -1 or p >= count:
+                raise Error("out-of-range parent slot in .flscnb")
+            if p >= 0:
+                if not set_parent(staging, spawned[slot], spawned[p]):
                     raise Error("cycle or invalid parent in .flscnb")
 
-        return spawned^
+        registry.ensure_registered_in_world(world)
+        if clear_existing:
+            var snap = staging.snapshot_blob()
+            world.restore_blob(snap)
+            self.name = new_name
+            return spawned^
+
+        var reader2 = BlobReader(raw_backup^)
+        _ = reader2.enter(SCENE_BIN_MAGIC, SCENE_SCHEMA_VERSION)
+        _ = reader2.text()
+        _ = reader2.integer()
+        var live_spawned = List[Entity](capacity=count)
+        for _ in range(count):
+            live_spawned.append(world.spawn_empty())
+        for slot in range(count):
+            _ = reader2.integer()
+            var num_comps = reader2.integer()
+            for _ in range(num_comps):
+                var tag = reader2.peek_tag()
+                var cidx = registry.find_by_fourcc(tag)
+                if cidx >= 0:
+                    _ = registry.read_entity_bin(cidx, world, live_spawned[slot], reader2)
+        reader2.leave()
+        for slot in range(count):
+            var p = parent_slots[slot]
+            if p >= 0 and p < count:
+                _ = set_parent(world, live_spawned[slot], live_spawned[p])
+        self.name = new_name
+        return live_spawned^
 
     def load_flscnb_file(
         mut self,

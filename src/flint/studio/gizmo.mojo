@@ -9,7 +9,7 @@ Implements:
   - Screen-space handle hit-testing (`pick_gizmo_handle`) & crisp GPU `UiDrawList` rendering
     (`emit_gizmo_draw_list`) of X/Y/Z arrows, XY/XZ/YZ dual-axis planes, rotation rings & scale cubes.
 """
-from std.math import abs, atan2, cos, floor, max, min, sin, sqrt, tan
+from std.math import abs, atan2, cos, floor, isfinite, max, min, sin, sqrt, tan
 from flint.core.math import Vec3
 from flint.ui.draw_list import UiDrawList
 
@@ -90,11 +90,21 @@ def project_world_to_viewport(
     near_z: Float32 = 0.05,
 ) -> Tuple[Float32, Float32, Float32, Bool]:
     """Projects `world_pt` to viewport screen coordinates `(sx, sy, z_view, in_front)`."""
+    if not (
+        isfinite(world_pt.x) and isfinite(world_pt.y) and isfinite(world_pt.z)
+        and isfinite(cam_pos.x) and isfinite(cam_pos.y) and isfinite(cam_pos.z)
+        and isfinite(cam_fwd.x) and isfinite(cam_fwd.y) and isfinite(cam_fwd.z)
+        and isfinite(cam_right.x) and isfinite(cam_right.y) and isfinite(cam_right.z)
+        and isfinite(cam_up.x) and isfinite(cam_up.y) and isfinite(cam_up.z)
+        and isfinite(vp_x) and isfinite(vp_y) and isfinite(vp_w) and isfinite(vp_h)
+        and isfinite(fov_y_deg) and isfinite(near_z)
+    ):
+        return (0.0, 0.0, 0.0, False)
     var rel = world_pt - cam_pos
     var fwd = cam_fwd.normalized()
     var z_v = rel.dot(fwd)
-    if z_v < near_z:
-        return (0.0, 0.0, z_v, False)
+    if not isfinite(z_v) or z_v < near_z:
+        return (0.0, 0.0, z_v if isfinite(z_v) else Float32(0.0), False)
     var w = max(Float32(1.0), vp_w)
     var h = max(Float32(1.0), vp_h)
     var aspect = w / h
@@ -104,6 +114,8 @@ def project_world_to_viewport(
     var ndc_y = rel.dot(cam_up.normalized()) / (z_v * tan_y)
     var sx = vp_x + (ndc_x * Float32(0.5) + Float32(0.5)) * w
     var sy = vp_y + (Float32(0.5) - ndc_y * Float32(0.5)) * h
+    if not (isfinite(sx) and isfinite(sy)):
+        return (0.0, 0.0, z_v, False)
     return (sx, sy, z_v, True)
 
 
@@ -116,6 +128,13 @@ def gizmo_world_scale(
     target_px: Float32 = 96.0,
 ) -> Float32:
     """Computes world-space handle length so the gizmo projects to a constant `target_px` screen pixels."""
+    if not (
+        isfinite(gizmo_origin.x) and isfinite(gizmo_origin.y) and isfinite(gizmo_origin.z)
+        and isfinite(cam_pos.x) and isfinite(cam_pos.y) and isfinite(cam_pos.z)
+        and isfinite(cam_fwd.x) and isfinite(cam_fwd.y) and isfinite(cam_fwd.z)
+        and isfinite(fov_y_deg) and isfinite(target_px)
+    ):
+        return Float32(1.0)
     var fwd = cam_fwd.normalized()
     var rel = gizmo_origin - cam_pos
     var z_depth = rel.dot(fwd)
@@ -123,7 +142,8 @@ def gizmo_world_scale(
         z_depth = max(Float32(0.05), rel.length())
     var tan_half = tan(fov_y_deg * Float32(0.01745329252) * Float32(0.5))
     var world_per_px = (Float32(2.0) * z_depth * tan_half) / Float32(max(1, viewport_h))
-    return max(Float32(1.0e-4), world_per_px * target_px)
+    var res = max(Float32(1.0e-4), world_per_px * target_px)
+    return res if isfinite(res) else Float32(1.0)
 
 
 def ray_axis_closest_param(
@@ -133,23 +153,35 @@ def ray_axis_closest_param(
 ) -> Tuple[Bool, Float32, Float32]:
     """Analytical skew-line closest parameter `t` along `axis_origin + t * unit(axis_dir)` to `ray`.
     Returns `(valid, axis_param_t, closest_distance)`."""
-    var d = ray.dir.normalized()
+    if not (
+        isfinite(ray.origin.x) and isfinite(ray.origin.y) and isfinite(ray.origin.z)
+        and isfinite(ray.dir.x) and isfinite(ray.dir.y) and isfinite(ray.dir.z)
+        and isfinite(axis_origin.x) and isfinite(axis_origin.y) and isfinite(axis_origin.z)
+        and isfinite(axis_dir.x) and isfinite(axis_dir.y) and isfinite(axis_dir.z)
+    ):
+        return (False, Float32(0.0), Float32(0.0))
+    var d_len = ray.dir.length()
+    if not isfinite(d_len) or d_len <= Float32(1.0e-7):
+        return (False, Float32(0.0), Float32(0.0))
+    var d = ray.dir * (Float32(1.0) / d_len)
     var u_len = axis_dir.length()
-    if u_len <= Float32(1.0e-7):
-        return (False, Float32(0.0), Float32(1.0e30))
+    if not isfinite(u_len) or u_len <= Float32(1.0e-7):
+        return (False, Float32(0.0), Float32(0.0))
     var u = axis_dir * (Float32(1.0) / u_len)
     var w0 = ray.origin - axis_origin
     var b = d.dot(u)
     var denom = Float32(1.0) - b * b
-    if denom < Float32(1.0e-6):
-        return (False, Float32(0.0), Float32(1.0e30))
+    if not isfinite(denom) or denom < Float32(1.0e-6):
+        return (False, Float32(0.0), Float32(0.0))
     var d_w0 = d.dot(w0)
     var u_w0 = u.dot(w0)
     var s = (b * u_w0 - d_w0) / denom
     var t = (u_w0 - b * d_w0) / denom
-    if s < Float32(0.0):
-        return (False, t, Float32(1.0e30))
+    if not (isfinite(s) and isfinite(t)) or s < Float32(0.0):
+        return (False, Float32(0.0), Float32(0.0))
     var dist = (ray.at(s) - (axis_origin + u * t)).length()
+    if not isfinite(dist):
+        return (False, Float32(0.0), Float32(0.0))
     return (True, t, dist)
 
 
@@ -160,18 +192,31 @@ def ray_plane_hit(
 ) -> Tuple[Bool, Vec3, Float32]:
     """Intersects `ray` with `(X - plane_origin) . unit(plane_normal) = 0`.
     Returns `(hit, world_hit_point, ray_t)`."""
+    if not (
+        isfinite(ray.origin.x) and isfinite(ray.origin.y) and isfinite(ray.origin.z)
+        and isfinite(ray.dir.x) and isfinite(ray.dir.y) and isfinite(ray.dir.z)
+        and isfinite(plane_origin.x) and isfinite(plane_origin.y) and isfinite(plane_origin.z)
+        and isfinite(plane_normal.x) and isfinite(plane_normal.y) and isfinite(plane_normal.z)
+    ):
+        return (False, Vec3(), Float32(0.0))
     var n_len = plane_normal.length()
-    if n_len <= Float32(1.0e-7):
+    if not isfinite(n_len) or n_len <= Float32(1.0e-7):
         return (False, plane_origin, Float32(0.0))
     var n = plane_normal * (Float32(1.0) / n_len)
-    var d = ray.dir.normalized()
+    var d_len = ray.dir.length()
+    if not isfinite(d_len) or d_len <= Float32(1.0e-7):
+        return (False, plane_origin, Float32(0.0))
+    var d = ray.dir * (Float32(1.0) / d_len)
     var denom = d.dot(n)
-    if abs(denom) < Float32(1.0e-6):
+    if not isfinite(denom) or abs(denom) < Float32(1.0e-6):
         return (False, plane_origin, Float32(0.0))
     var t = (plane_origin - ray.origin).dot(n) / denom
-    if t < Float32(0.0):
-        return (False, plane_origin, t)
-    return (True, ray.at(t), t)
+    if not isfinite(t) or t < Float32(0.0):
+        return (False, plane_origin, t if isfinite(t) else Float32(0.0))
+    var hit_pt = ray.at(t)
+    if not (isfinite(hit_pt.x) and isfinite(hit_pt.y) and isfinite(hit_pt.z)):
+        return (False, plane_origin, Float32(0.0))
+    return (True, hit_pt, t)
 
 
 def gizmo_rotation_delta_rad(
@@ -185,15 +230,32 @@ def gizmo_rotation_delta_rad(
     """Computes signed rotation delta in radians around `ring_axis`.
     Automatically switches to a view-plane tangent solver when grazing incidence `|axis . view_dir| < 0.15`
     (e.g. `88°` edge-on view) so rotation never suffers near-parallel plane-intersection blowup!"""
+    if not (
+        isfinite(start_ray.origin.x) and isfinite(start_ray.origin.y) and isfinite(start_ray.origin.z)
+        and isfinite(start_ray.dir.x) and isfinite(start_ray.dir.y) and isfinite(start_ray.dir.z)
+        and isfinite(cur_ray.origin.x) and isfinite(cur_ray.origin.y) and isfinite(cur_ray.origin.z)
+        and isfinite(cur_ray.dir.x) and isfinite(cur_ray.dir.y) and isfinite(cur_ray.dir.z)
+        and isfinite(pivot.x) and isfinite(pivot.y) and isfinite(pivot.z)
+        and isfinite(ring_axis.x) and isfinite(ring_axis.y) and isfinite(ring_axis.z)
+        and isfinite(cam_fwd.x) and isfinite(cam_fwd.y) and isfinite(cam_fwd.z)
+        and isfinite(ring_world_radius)
+    ):
+        return Float32(0.0)
     var ax_len = ring_axis.length()
-    if ax_len <= Float32(1.0e-7):
+    if not isfinite(ax_len) or ax_len <= Float32(1.0e-7):
         return Float32(0.0)
     var axis = ring_axis * (Float32(1.0) / ax_len)
-    var view_n = cam_fwd.normalized()
+    var cf_len = cam_fwd.length()
+    if not isfinite(cf_len) or cf_len <= Float32(1.0e-7):
+        return Float32(0.0)
+    var view_n = cam_fwd * (Float32(1.0) / cf_len)
     var to_pivot = pivot - start_ray.origin
-    var view_ray = to_pivot.normalized() if to_pivot.length_squared() > Float32(1.0e-8) else view_n
+    var tp_len2 = to_pivot.length_squared()
+    var view_ray = to_pivot.normalized() if (isfinite(tp_len2) and tp_len2 > Float32(1.0e-8)) else view_n
 
     var grazing_cos = abs(axis.dot(view_ray))
+    if not isfinite(grazing_cos):
+        return Float32(0.0)
     if grazing_cos >= Float32(0.15):
         var h0 = ray_plane_hit(start_ray, pivot, axis)
         var h1 = ray_plane_hit(cur_ray, pivot, axis)
@@ -207,7 +269,11 @@ def gizmo_rotation_delta_rad(
                 var u1 = v1.normalized()
                 var sin_a = axis.dot(u0.cross(u1))
                 var cos_a = max(Float32(-1.0), min(Float32(1.0), u0.dot(u1)))
-                return atan2(sin_a, cos_a)
+                if isfinite(sin_a) and isfinite(cos_a):
+                    var ang = atan2(sin_a, cos_a)
+                    if isfinite(ang):
+                        return ang
+                return Float32(0.0)
 
     # Automatic `< 0.15` grazing-angle view-plane tangent fallback!
     var vp0 = ray_plane_hit(start_ray, pivot, view_n)
@@ -218,7 +284,12 @@ def gizmo_rotation_delta_rad(
     var tangent = raw_tan.normalized() if raw_tan.length_squared() > Float32(1.0e-8) else Vec3(1.0, 0.0, 0.0)
     var eff_r = max(Float32(0.05), ring_world_radius)
     var disp = (vp1[1] - vp0[1]).dot(tangent)
-    return max(Float32(-6.2831853), min(Float32(6.2831853), disp / eff_r))
+    if not isfinite(disp):
+        return Float32(0.0)
+    var d_rad = disp / eff_r
+    if not isfinite(d_rad):
+        return Float32(0.0)
+    return max(Float32(-6.2831853), min(Float32(6.2831853), d_rad))
 
 
 def gizmo_scale_drag(
@@ -233,17 +304,39 @@ def gizmo_scale_drag(
     snap_step: Float32 = 0.0,
 ) -> Vec3:
     """Solves 1D per-axis or uniform 3D scale drag relative to `start_scale`."""
-    var eff_r = max(Float32(0.05), gizmo_radius)
+    var safe_start = Vec3(
+        start_scale.x if isfinite(start_scale.x) else Float32(1.0),
+        start_scale.y if isfinite(start_scale.y) else Float32(1.0),
+        start_scale.z if isfinite(start_scale.z) else Float32(1.0),
+    )
+    if not (
+        isfinite(pivot.x) and isfinite(pivot.y) and isfinite(pivot.z)
+        and isfinite(cam_fwd.x) and isfinite(cam_fwd.y) and isfinite(cam_fwd.z)
+        and isfinite(cam_right.x) and isfinite(cam_right.y) and isfinite(cam_right.z)
+    ):
+        return safe_start
+    var gr = gizmo_radius if isfinite(gizmo_radius) else Float32(1.0)
+    var eff_r = max(Float32(0.05), gr)
+    var safe_snap = snap_step if (isfinite(snap_step) and snap_step > Float32(1.0e-6)) else Float32(0.0)
     if handle == GIZMO_SCALE_UNIFORM:
         var vp0 = ray_plane_hit(start_ray, pivot, cam_fwd)
         var vp1 = ray_plane_hit(cur_ray, pivot, cam_fwd)
         if not vp0[0] or not vp1[0]:
-            return start_scale
-        var delta_u = (vp1[1] - vp0[1]).dot(cam_right.normalized()) / eff_r
+            return safe_start
+        var cr_len = cam_right.length()
+        if not isfinite(cr_len) or cr_len <= Float32(1.0e-7):
+            return safe_start
+        var cr = cam_right * (Float32(1.0) / cr_len)
+        var delta_u = (vp1[1] - vp0[1]).dot(cr) / eff_r
+        if not isfinite(delta_u):
+            return safe_start
         var factor = max(Float32(0.05), Float32(1.0) + delta_u)
-        if snap_step > Float32(0.0):
-            factor = max(snap_step, snap_scalar(factor, snap_step))
-        return start_scale * factor
+        if safe_snap > Float32(0.0):
+            factor = max(safe_snap, snap_scalar(factor, safe_snap))
+        var res_u = safe_start * factor
+        if not (isfinite(res_u.x) and isfinite(res_u.y) and isfinite(res_u.z)):
+            return safe_start
+        return res_u
 
     var ax = Vec3(1.0, 0.0, 0.0)
     if handle == GIZMO_AXIS_Y:
@@ -253,34 +346,46 @@ def gizmo_scale_drag(
     var p0 = ray_axis_closest_param(start_ray, pivot, ax)
     var p1 = ray_axis_closest_param(cur_ray, pivot, ax)
     if not p0[0] or not p1[0]:
-        return start_scale
-    var ratio = max(Float32(0.05), Float32(1.0) + (p1[1] - p0[1]) / eff_r)
-    var out = start_scale
+        return safe_start
+    var ratio_raw = Float32(1.0) + (p1[1] - p0[1]) / eff_r
+    if not isfinite(ratio_raw):
+        return safe_start
+    var ratio = max(Float32(0.05), ratio_raw)
+    var out = safe_start
     if handle == GIZMO_AXIS_X:
-        out.x = max(Float32(0.01), start_scale.x * ratio)
-        if snap_step > Float32(0.0):
-            out.x = max(snap_step, snap_scalar(out.x, snap_step))
+        var sx = safe_start.x * ratio
+        out.x = max(Float32(0.01), sx) if isfinite(sx) else safe_start.x
+        if safe_snap > Float32(0.0):
+            out.x = max(safe_snap, snap_scalar(out.x, safe_snap))
     elif handle == GIZMO_AXIS_Y:
-        out.y = max(Float32(0.01), start_scale.y * ratio)
-        if snap_step > Float32(0.0):
-            out.y = max(snap_step, snap_scalar(out.y, snap_step))
+        var sy = safe_start.y * ratio
+        out.y = max(Float32(0.01), sy) if isfinite(sy) else safe_start.y
+        if safe_snap > Float32(0.0):
+            out.y = max(safe_snap, snap_scalar(out.y, safe_snap))
     elif handle == GIZMO_AXIS_Z:
-        out.z = max(Float32(0.01), start_scale.z * ratio)
-        if snap_step > Float32(0.0):
-            out.z = max(snap_step, snap_scalar(out.z, snap_step))
+        var sz = safe_start.z * ratio
+        out.z = max(Float32(0.01), sz) if isfinite(sz) else safe_start.z
+        if safe_snap > Float32(0.0):
+            out.z = max(safe_snap, snap_scalar(out.z, safe_snap))
     return out
 
 
 @always_inline
 def snap_scalar(val: Float32, step: Float32) -> Float32:
-    if step <= Float32(1.0e-6):
+    if not isfinite(val):
+        return Float32(0.0)
+    if not isfinite(step) or step <= Float32(1.0e-6):
         return val
-    return floor(val / step + Float32(0.5)) * step
+    var q = Float64(val) / Float64(step)
+    if not isfinite(q):
+        return val
+    var snapped = Float32(floor(q + 0.5) * Float64(step))
+    return snapped if isfinite(snapped) else val
 
 
 @always_inline
 def snap_translation(pos: Vec3, grid_step: Float32) -> Vec3:
-    if grid_step <= Float32(1.0e-6):
+    if not isfinite(grid_step) or grid_step <= Float32(1.0e-6):
         return pos
     return Vec3(
         snap_scalar(pos.x, grid_step),
@@ -291,7 +396,7 @@ def snap_translation(pos: Vec3, grid_step: Float32) -> Vec3:
 
 @always_inline
 def snap_angle(angle_rad: Float32, step_rad: Float32) -> Float32:
-    if step_rad <= Float32(1.0e-6):
+    if not isfinite(step_rad) or step_rad <= Float32(1.0e-6):
         return angle_rad
     return snap_scalar(angle_rad, step_rad)
 
@@ -302,15 +407,23 @@ def snap_angle_deg(angle_rad: Float32, step_deg: Float32 = 15.0) -> Float32:
 
 
 def _point_seg_dist_px(px: Float32, py: Float32, ax: Float32, ay: Float32, bx: Float32, by: Float32) -> Float32:
-    var vx = bx - ax
-    var vy = by - ay
+    if not (isfinite(px) and isfinite(py) and isfinite(ax) and isfinite(ay) and isfinite(bx) and isfinite(by)):
+        return Float32(1.0e30)
+    var vx = Float64(bx) - Float64(ax)
+    var vy = Float64(by) - Float64(ay)
     var len2 = vx * vx + vy * vy
-    if len2 <= Float32(1.0e-4):
-        return sqrt((px - ax) * (px - ax) + (py - ay) * (py - ay))
-    var t = max(Float32(0.0), min(Float32(1.0), ((px - ax) * vx + (py - ay) * vy) / len2))
-    var cx = ax + vx * t
-    var cy = ay + vy * t
-    return sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy))
+    if not isfinite(len2) or len2 <= 1.0e-4:
+        var dx0 = Float64(px) - Float64(ax)
+        var dy0 = Float64(py) - Float64(ay)
+        var d0 = sqrt(dx0 * dx0 + dy0 * dy0)
+        return Float32(d0) if isfinite(d0) else Float32(1.0e30)
+    var t = max(0.0, min(1.0, ((Float64(px) - Float64(ax)) * vx + (Float64(py) - Float64(ay)) * vy) / len2))
+    var cx = Float64(ax) + vx * t
+    var cy = Float64(ay) + vy * t
+    var dx = Float64(px) - cx
+    var dy = Float64(py) - cy
+    var d = sqrt(dx * dx + dy * dy)
+    return Float32(d) if isfinite(d) else Float32(1.0e30)
 
 
 def _emit_thick_line_ui(
@@ -322,14 +435,22 @@ def _emit_thick_line_ui(
     thickness: Float32,
     color: UInt32,
 ):
+    if not (isfinite(x0) and isfinite(y0) and isfinite(x1) and isfinite(y1) and isfinite(thickness)):
+        return
     var dx = x1 - x0
     var dy = y1 - y0
-    var dist = sqrt(dx * dx + dy * dy)
-    var rad = max(Float32(1.2), thickness * Float32(0.5))
-    var steps = max(1, min(64, Int(dist / max(Float32(2.2), rad * Float32(0.95))) + 1))
+    var dist64 = sqrt(Float64(dx) * Float64(dx) + Float64(dy) * Float64(dy))
+    if not isfinite(dist64):
+        return
+    var rad = max(Float32(1.2), min(Float32(256.0), thickness * Float32(0.5)))
+    var denom64 = Float64(max(Float32(2.2), rad * Float32(0.95)))
+    var steps = max(1, min(64, Int(min(64.0, dist64 / denom64)) + 1))
     for i in range(steps + 1):
         var t = Float32(i) / Float32(steps)
-        ui.add_circle(x0 + dx * t, y0 + dy * t, rad, color)
+        var px = x0 + dx * t
+        var py = y0 + dy * t
+        if isfinite(px) and isfinite(py):
+            ui.add_circle(px, py, rad, color)
 
 
 def pick_gizmo_handle(
@@ -349,13 +470,20 @@ def pick_gizmo_handle(
     target_px: Float32 = 96.0,
 ) -> Int:
     """Screen-space handle picker returning `GIZMO_AXIS_*`, `GIZMO_PLANE_*`, or `GIZMO_SCALE_UNIFORM`."""
+    if not (
+        isfinite(mouse_x) and isfinite(mouse_y)
+        and isfinite(vp_x) and isfinite(vp_y) and isfinite(vp_w) and isfinite(vp_h)
+        and isfinite(target_px)
+    ):
+        return GIZMO_AXIS_NONE
     var c_proj = project_world_to_viewport(pivot, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
     if not c_proj[3]:
         return GIZMO_AXIS_NONE
-    var wscale = gizmo_world_scale(pivot, cam_pos, cam_fwd, fov_y_deg, Int(vp_h), target_px)
+    var vph_i = Int(max(Float32(1.0), min(Float32(16384.0), vp_h)))
+    var wscale = gizmo_world_scale(pivot, cam_pos, cam_fwd, fov_y_deg, vph_i, target_px)
 
     if mode == GIZMO_MODE_SCALE:
-        var dc = sqrt((mouse_x - c_proj[0]) * (mouse_x - c_proj[0]) + (mouse_y - c_proj[1]) * (mouse_y - c_proj[1]))
+        var dc = _point_seg_dist_px(mouse_x, mouse_y, c_proj[0], c_proj[1], c_proj[0], c_proj[1])
         if dc <= Float32(11.0):
             return GIZMO_SCALE_UNIFORM
 
@@ -364,11 +492,11 @@ def pick_gizmo_handle(
             var p_xy = project_world_to_viewport(pivot + Vec3(wscale * 0.28, wscale * 0.28, 0.0), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             var p_xz = project_world_to_viewport(pivot + Vec3(wscale * 0.28, 0.0, wscale * 0.28), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             var p_yz = project_world_to_viewport(pivot + Vec3(0.0, wscale * 0.28, wscale * 0.28), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
-            if p_xy[3] and sqrt((mouse_x - p_xy[0]) * (mouse_x - p_xy[0]) + (mouse_y - p_xy[1]) * (mouse_y - p_xy[1])) <= Float32(11.0):
+            if p_xy[3] and _point_seg_dist_px(mouse_x, mouse_y, p_xy[0], p_xy[1], p_xy[0], p_xy[1]) <= Float32(11.0):
                 return GIZMO_PLANE_XY
-            if p_xz[3] and sqrt((mouse_x - p_xz[0]) * (mouse_x - p_xz[0]) + (mouse_y - p_xz[1]) * (mouse_y - p_xz[1])) <= Float32(11.0):
+            if p_xz[3] and _point_seg_dist_px(mouse_x, mouse_y, p_xz[0], p_xz[1], p_xz[0], p_xz[1]) <= Float32(11.0):
                 return GIZMO_PLANE_XZ
-            if p_yz[3] and sqrt((mouse_x - p_yz[0]) * (mouse_x - p_yz[0]) + (mouse_y - p_yz[1]) * (mouse_y - p_yz[1])) <= Float32(11.0):
+            if p_yz[3] and _point_seg_dist_px(mouse_x, mouse_y, p_yz[0], p_yz[1], p_yz[0], p_yz[1]) <= Float32(11.0):
                 return GIZMO_PLANE_YZ
 
         var axes = [Vec3(1.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0)]
@@ -425,12 +553,19 @@ def emit_gizmo_draw_list(
 ):
     """Emits crisp analytical 3D gizmo primitives (X/Y/Z arrows, XY/XZ/YZ dual-axis planes,
     3D rotation rings, or scale cubes) into `UiDrawList` clipped to the 3D viewport."""
+    if not (isfinite(vp_x) and isfinite(vp_y) and isfinite(vp_w) and isfinite(vp_h) and isfinite(target_px)):
+        return
     var c = project_world_to_viewport(pivot, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
     if not c[3]:
         return
-    ui.push_clip(Int(vp_x), Int(vp_y), Int(vp_x + vp_w), Int(vp_y + vp_h))
+    var cx0 = Int(max(Float32(-1.0e6), min(Float32(1.0e6), vp_x)))
+    var cy0 = Int(max(Float32(-1.0e6), min(Float32(1.0e6), vp_y)))
+    var cx1 = Int(max(Float32(-1.0e6), min(Float32(1.0e6), vp_x + vp_w)))
+    var cy1 = Int(max(Float32(-1.0e6), min(Float32(1.0e6), vp_y + vp_h)))
+    var vph_i = max(1, min(16384, cy1 - cy0))
+    ui.push_clip(cx0, cy0, cx1, cy1)
 
-    var wscale = gizmo_world_scale(pivot, cam_pos, cam_fwd, fov_y_deg, Int(vp_h), target_px)
+    var wscale = gizmo_world_scale(pivot, cam_pos, cam_fwd, fov_y_deg, vph_i, target_px)
     var axes = [Vec3(1.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0)]
     var cols = [GIZMO_COLOR_X, GIZMO_COLOR_Y, GIZMO_COLOR_Z]
     var h_ids = [GIZMO_AXIS_X, GIZMO_AXIS_Y, GIZMO_AXIS_Z]

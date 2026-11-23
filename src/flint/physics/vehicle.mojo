@@ -12,7 +12,7 @@ Implements:
    1.5-way Salisbury Limited-Slip Differential (LSD), and implicit chassis + wheel gyroscopics.
 """
 from std.collections import List
-from std.math import sqrt, max, min, abs
+from std.math import sqrt, max, min, abs, isfinite
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import det_sin, det_cos, det_atan2
 from flint.core.serial import BlobWriter, BlobReader, fourcc
@@ -88,43 +88,61 @@ struct WheelState(Copyable, ImplicitlyCopyable, Movable):
 
 
 @always_inline
+def _clamp_vec3_f64(x: Float64, y: Float64, z: Float64, max_mag: Float64 = 1.0e35) -> Vec3:
+    if not (isfinite(x) and isfinite(y) and isfinite(z)):
+        return Vec3()
+    var mag = sqrt(x * x + y * y + z * z)
+    if not isfinite(mag):
+        return Vec3()
+    if mag > max_mag and mag > 0.0:
+        var s = max_mag / mag
+        return Vec3(Float32(x * s), Float32(y * s), Float32(z * s))
+    return Vec3(Float32(x), Float32(y), Float32(z))
+
+
+@always_inline
 def _implicit_gyro_step(wb_in: Vec3, inertia: Vec3, dt: Float32) -> Vec3:
     """1-step Implicit Newton-Raphson solver for `I * (w^+ - w) + dt * (w^+ x (I * w^+)) = 0`."""
-    var ix = inertia.x
-    var iy = inertia.y
-    var iz = inertia.z
-    var fx = dt * (iz - iy) * wb_in.y * wb_in.z
-    var fy = dt * (ix - iz) * wb_in.z * wb_in.x
-    var fz = dt * (iy - ix) * wb_in.x * wb_in.y
+    var dt64 = Float64(dt)
+    var ix = Float64(inertia.x)
+    var iy = Float64(inertia.y)
+    var iz = Float64(inertia.z)
+    var wx = Float64(wb_in.x)
+    var wy = Float64(wb_in.y)
+    var wz = Float64(wb_in.z)
+    var fx = dt64 * (iz - iy) * wy * wz
+    var fy = dt64 * (ix - iz) * wz * wx
+    var fz = dt64 * (iy - ix) * wx * wy
 
     var j00 = ix
-    var j01 = dt * (iz - iy) * wb_in.z
-    var j02 = dt * (iz - iy) * wb_in.y
-    var j10 = dt * (ix - iz) * wb_in.z
+    var j01 = dt64 * (iz - iy) * wz
+    var j02 = dt64 * (iz - iy) * wy
+    var j10 = dt64 * (ix - iz) * wz
     var j11 = iy
-    var j12 = dt * (ix - iz) * wb_in.x
-    var j20 = dt * (iy - ix) * wb_in.y
-    var j21 = dt * (iy - ix) * wb_in.x
+    var j12 = dt64 * (ix - iz) * wx
+    var j20 = dt64 * (iy - ix) * wy
+    var j21 = dt64 * (iy - ix) * wx
     var j22 = iz
 
     var c00 = j11 * j22 - j12 * j21
     var c01 = j12 * j20 - j10 * j22
     var c02 = j10 * j21 - j11 * j20
     var det = j00 * c00 + j01 * c01 + j02 * c02
-    if abs(det) <= Float32(1.0e-18):
+    if not isfinite(det) or abs(det) <= 1.0e-18:
         return wb_in
-    var inv_det = Float32(1.0) / det
+    var inv_det = 1.0 / det
     var c10 = j02 * j21 - j01 * j22
     var c11 = j00 * j22 - j02 * j20
     var c12 = j01 * j20 - j00 * j21
     var c20 = j01 * j12 - j02 * j11
     var c21 = j02 * j10 - j00 * j12
     var c22 = j00 * j11 - j01 * j10
-    return Vec3(
-        wb_in.x - (c00 * fx + c10 * fy + c20 * fz) * inv_det,
-        wb_in.y - (c01 * fx + c11 * fy + c21 * fz) * inv_det,
-        wb_in.z - (c02 * fx + c12 * fy + c22 * fz) * inv_det,
-    )
+    var rx = wx - (c00 * fx + c10 * fy + c20 * fz) * inv_det
+    var ry = wy - (c01 * fx + c11 * fy + c21 * fz) * inv_det
+    var rz = wz - (c02 * fx + c12 * fy + c22 * fz) * inv_det
+    if not (isfinite(rx) and isfinite(ry) and isfinite(rz)):
+        return wb_in
+    return _clamp_vec3_f64(rx, ry, rz, 3.4e38)
 
 
 struct VehicleChassis(Copyable, Movable):
@@ -266,7 +284,8 @@ struct VehicleChassis(Copyable, Movable):
     def _update_ackermann_steering(mut self, steer: Float32):
         var num_wheels = min(len(self.wheels), len(self.wheel_states))
         var max_steer_rad = Float32(0.55)
-        var s_clamped = max(Float32(-1.0), min(Float32(1.0), steer))
+        var s_safe = steer if isfinite(steer) else Float32(0.0)
+        var s_clamped = max(Float32(-1.0), min(Float32(1.0), s_safe))
         if abs(s_clamped) <= Float32(1.0e-5):
             for i in range(num_wheels):
                 self.wheel_states[i].steer_angle = Float32(0.0)
@@ -310,14 +329,19 @@ struct VehicleChassis(Copyable, Movable):
         substep_hz: Float32 = 240.0,
     ):
         """Runs decoupled high-frequency suspension substepping (240 Hz default) on flat `y = 0`."""
-        if dt <= Float32(1.0e-7):
+        if not isfinite(dt) or dt <= Float32(1.0e-7):
             return
-        var th = throttle if throttle != Float32(0.0) else self.throttle_input
-        var br = brake if brake != Float32(0.0) else self.brake_input
-        var st = steer if steer != Float32(0.0) else self.steer_input
-        var sub_dt = Float32(1.0) / max(Float32(60.0), substep_hz)
-        var steps = max(1, Int(dt / sub_dt + Float32(0.5)))
-        var actual_sub_dt = dt / Float32(steps)
+        var th_in = throttle if (isfinite(throttle) and throttle != Float32(0.0)) else self.throttle_input
+        var br_in = brake if (isfinite(brake) and brake != Float32(0.0)) else self.brake_input
+        var st_in = steer if (isfinite(steer) and steer != Float32(0.0)) else self.steer_input
+        var th = th_in if isfinite(th_in) else Float32(0.0)
+        var br = br_in if isfinite(br_in) else Float32(0.0)
+        var st = st_in if isfinite(st_in) else Float32(0.0)
+        var safe_hz = max(Float32(60.0), min(Float32(2000.0), substep_hz)) if isfinite(substep_hz) else Float32(240.0)
+        var safe_dt = min(dt, Float32(1.0))
+        var sub_dt = Float32(1.0) / safe_hz
+        var steps = min(2400, max(1, Int(safe_dt / sub_dt + Float32(0.5))))
+        var actual_sub_dt = safe_dt / Float32(steps)
 
         for _ in range(steps):
             self._probe_flat_ground(actual_sub_dt)
@@ -333,14 +357,19 @@ struct VehicleChassis(Copyable, Movable):
         substep_hz: Float32 = 240.0,
     ):
         """Runs 240 Hz suspension substepping against a `Bvh8MeshCollider` terrain/track."""
-        if dt <= Float32(1.0e-7):
+        if not isfinite(dt) or dt <= Float32(1.0e-7):
             return
-        var th = throttle if throttle != Float32(0.0) else self.throttle_input
-        var br = brake if brake != Float32(0.0) else self.brake_input
-        var st = steer if steer != Float32(0.0) else self.steer_input
-        var sub_dt = Float32(1.0) / max(Float32(60.0), substep_hz)
-        var steps = max(1, Int(dt / sub_dt + Float32(0.5)))
-        var actual_sub_dt = dt / Float32(steps)
+        var th_in = throttle if (isfinite(throttle) and throttle != Float32(0.0)) else self.throttle_input
+        var br_in = brake if (isfinite(brake) and brake != Float32(0.0)) else self.brake_input
+        var st_in = steer if (isfinite(steer) and steer != Float32(0.0)) else self.steer_input
+        var th = th_in if isfinite(th_in) else Float32(0.0)
+        var br = br_in if isfinite(br_in) else Float32(0.0)
+        var st = st_in if isfinite(st_in) else Float32(0.0)
+        var safe_hz = max(Float32(60.0), min(Float32(2000.0), substep_hz)) if isfinite(substep_hz) else Float32(240.0)
+        var safe_dt = min(dt, Float32(1.0))
+        var sub_dt = Float32(1.0) / safe_hz
+        var steps = min(2400, max(1, Int(safe_dt / sub_dt + Float32(0.5))))
+        var actual_sub_dt = safe_dt / Float32(steps)
 
         for _ in range(steps):
             self._probe_bvh_ground(actual_sub_dt, bvh)
@@ -374,10 +403,14 @@ struct VehicleChassis(Copyable, Movable):
                 var old_comp = self.wheel_states[i].compression
                 var new_comp = min(self.wheels[i].max_travel, max(Float32(0.0), ground_y - wheel_bottom))
                 if was_grounded:
-                    self.wheel_states[i].compression_rate = (new_comp - old_comp) / dt
+                    var cr = (Float64(new_comp) - Float64(old_comp)) / Float64(dt)
+                    self.wheel_states[i].compression_rate = Float32(max(-3.4e38, min(3.4e38, cr))) if isfinite(cr) else Float32(0.0)
                 else:
-                    var hub_vel = self.linear_vel + self.angular_vel.cross(hub_r)
-                    self.wheel_states[i].compression_rate = -hub_vel.y
+                    var hv_y64 = Float64(self.linear_vel.y) + (
+                        Float64(self.angular_vel.z) * Float64(hub_r.x)
+                        - Float64(self.angular_vel.x) * Float64(hub_r.z)
+                    )
+                    self.wheel_states[i].compression_rate = Float32(max(-3.4e38, min(3.4e38, -hv_y64))) if isfinite(hv_y64) else Float32(0.0)
                 self.wheel_states[i].grounded = True
                 self.wheel_states[i].compression = new_comp
                 self.wheel_states[i].contact_point = Vec3(world_hub.x, ground_y, world_hub.z)
@@ -409,10 +442,14 @@ struct VehicleChassis(Copyable, Movable):
                 var raw_comp = (Float32(1.0) - sh.toi) * sweep_len
                 var new_comp = min(cfg.max_travel, max(Float32(0.0), raw_comp))
                 if was_grounded:
-                    self.wheel_states[i].compression_rate = (new_comp - old_comp) / dt
+                    var cr = (Float64(new_comp) - Float64(old_comp)) / Float64(dt)
+                    self.wheel_states[i].compression_rate = Float32(max(-3.4e38, min(3.4e38, cr))) if isfinite(cr) else Float32(0.0)
                 else:
-                    var hub_vel = self.linear_vel + self.angular_vel.cross(hub_r)
-                    self.wheel_states[i].compression_rate = -hub_vel.dot(n)
+                    var hv_x64 = Float64(self.linear_vel.x) + (Float64(self.angular_vel.y) * Float64(hub_r.z) - Float64(self.angular_vel.z) * Float64(hub_r.y))
+                    var hv_y64 = Float64(self.linear_vel.y) + (Float64(self.angular_vel.z) * Float64(hub_r.x) - Float64(self.angular_vel.x) * Float64(hub_r.z))
+                    var hv_z64 = Float64(self.linear_vel.z) + (Float64(self.angular_vel.x) * Float64(hub_r.y) - Float64(self.angular_vel.y) * Float64(hub_r.x))
+                    var cr = -(hv_x64 * Float64(n.x) + hv_y64 * Float64(n.y) + hv_z64 * Float64(n.z))
+                    self.wheel_states[i].compression_rate = Float32(max(-3.4e38, min(3.4e38, cr))) if isfinite(cr) else Float32(0.0)
                 self.wheel_states[i].grounded = True
                 self.wheel_states[i].compression = new_comp
                 self.wheel_states[i].contact_point = sh.point
@@ -471,11 +508,11 @@ struct VehicleChassis(Copyable, Movable):
 
     def _step_dynamics_impl(
         mut self,
-        dt: Float32,
-        throttle: Float32,
-        brake: Float32,
-        steer: Float32,
-        gravity_y: Float32,
+        dt_in: Float32,
+        throttle_in: Float32,
+        brake_in: Float32,
+        steer_in: Float32,
+        gravity_y_in: Float32,
         ground_vels: List[Vec3],
         mut out_wheel_forces: List[Vec3],
         apply_gyro: Bool,
@@ -486,19 +523,59 @@ struct VehicleChassis(Copyable, Movable):
             out_wheel_forces.append(Vec3())
         if num_wheels < 4 or len(self.wheel_states) < num_wheels:
             return
+        if not isfinite(dt_in) or dt_in <= Float32(1.0e-7):
+            return
+        var dt = min(dt_in, Float32(0.1))
+        var throttle = max(Float32(0.0), min(Float32(1.0), throttle_in)) if isfinite(throttle_in) else Float32(0.0)
+        var brake = max(Float32(0.0), min(Float32(1.0), brake_in)) if isfinite(brake_in) else Float32(0.0)
+        var steer = max(Float32(-1.0), min(Float32(1.0), steer_in)) if isfinite(steer_in) else Float32(0.0)
+        var gravity_y = gravity_y_in if isfinite(gravity_y_in) else Float32(9.81)
+        if not (isfinite(self.pos.x) and isfinite(self.pos.y) and isfinite(self.pos.z)):
+            self.pos = Vec3()
+        if not (isfinite(self.linear_vel.x) and isfinite(self.linear_vel.y) and isfinite(self.linear_vel.z)):
+            self.linear_vel = Vec3()
+        if not (isfinite(self.angular_vel.x) and isfinite(self.angular_vel.y) and isfinite(self.angular_vel.z)):
+            self.angular_vel = Vec3()
+        if not (isfinite(self.rot.x) and isfinite(self.rot.y) and isfinite(self.rot.z) and isfinite(self.rot.w)):
+            self.rot = Quat()
+        if not isfinite(self.engine_rpm):
+            self.engine_rpm = self.idle_rpm
 
         var fwd = self.rot.rotate(Vec3(0, 0, 1)).normalized()
         var up = self.rot.rotate(Vec3(0, 1, 0)).normalized()
         var right = self.rot.rotate(Vec3(1, 0, 0)).normalized()
 
-        # 1. Aerodynamic drag & downforce
-        var fwd_speed = self.linear_vel.dot(fwd)
-        var speed = self.linear_vel.length()
-        var f_drag = -self.linear_vel * (Float32(0.5) * Float32(1.225) * self.drag_coeff * Float32(2.2) * speed)
-        var f_down = -up * (Float32(0.5) * Float32(1.225) * self.downforce_coeff * Float32(2.2) * fwd_speed * fwd_speed)
+        # 1. Aerodynamic drag & downforce (Float64 overflow-safe for extreme speeds)
+        var lv_x64 = Float64(self.linear_vel.x)
+        var lv_y64 = Float64(self.linear_vel.y)
+        var lv_z64 = Float64(self.linear_vel.z)
+        var fwd_speed64 = lv_x64 * Float64(fwd.x) + lv_y64 * Float64(fwd.y) + lv_z64 * Float64(fwd.z)
+        var speed64 = sqrt(lv_x64 * lv_x64 + lv_y64 * lv_y64 + lv_z64 * lv_z64)
+        var drag_k64 = 0.5 * 1.225 * Float64(max(Float32(0.0), self.drag_coeff)) * 2.2 * speed64
+        var max_drag_k64 = 0.99 / max(1.0e-9, Float64(self.inv_mass) * Float64(dt))
+        if drag_k64 > max_drag_k64:
+            drag_k64 = max_drag_k64
+        var f_drag = _clamp_vec3_f64(
+            -lv_x64 * drag_k64,
+            -lv_y64 * drag_k64,
+            -lv_z64 * drag_k64,
+            1.0e35,
+        )
+        var f_down_mag64 = min(1.0e35, 0.5 * 1.225 * Float64(max(Float32(0.0), self.downforce_coeff)) * 2.2 * fwd_speed64 * fwd_speed64)
+        var f_down = _clamp_vec3_f64(
+            -Float64(up.x) * f_down_mag64,
+            -Float64(up.y) * f_down_mag64,
+            -Float64(up.z) * f_down_mag64,
+            1.0e35,
+        )
+        var f_grav = _clamp_vec3_f64(0.0, -Float64(gravity_y) * Float64(self.mass), 0.0, 1.0e35)
 
-        var total_force = Vec3(0, -gravity_y * self.mass, 0) + f_drag + f_down
-        var total_torque = Vec3(0, 0, 0)
+        var tf_x64 = Float64(f_grav.x) + Float64(f_drag.x) + Float64(f_down.x)
+        var tf_y64 = Float64(f_grav.y) + Float64(f_drag.y) + Float64(f_down.y)
+        var tf_z64 = Float64(f_grav.z) + Float64(f_drag.z) + Float64(f_down.z)
+        var tt_x64 = 0.0
+        var tt_y64 = 0.0
+        var tt_z64 = 0.0
 
         # 2. Ackermann wheel steering geometry
         self._update_ackermann_steering(steer)
@@ -514,11 +591,11 @@ struct VehicleChassis(Copyable, Movable):
                 continue
 
             var cfg = self.wheels[i]
-            var comp = self.wheel_states[i].compression
-            var crate = self.wheel_states[i].compression_rate
-            var f_spring = cfg.spring_k * comp
+            var comp = self.wheel_states[i].compression if isfinite(self.wheel_states[i].compression) else Float32(0.0)
+            var crate = self.wheel_states[i].compression_rate if isfinite(self.wheel_states[i].compression_rate) else Float32(0.0)
+            var f_spring64 = Float64(cfg.spring_k) * Float64(comp)
             var c_damp = cfg.damper_c_bump if crate >= Float32(0.0) else cfg.damper_c_rebound
-            var f_damper = c_damp * crate
+            var f_damper64 = Float64(c_damp) * Float64(crate)
 
             var arb_force = Float32(0.0)
             if i == 0:
@@ -529,15 +606,35 @@ struct VehicleChassis(Copyable, Movable):
                 arb_force = arb_r
             elif i == 3:
                 arb_force = -arb_r
+            var arb64 = Float64(arb_force) if isfinite(arb_force) else 0.0
 
-            var f_norm = max(Float32(0.0), f_spring + f_damper + arb_force)
-            self.wheel_states[i].normal_load = f_norm
+            var f_norm64 = f_spring64 + f_damper64 + arb64
+            if not isfinite(f_norm64) or f_norm64 < 0.0:
+                f_norm64 = 0.0
+            elif f_norm64 > 1.0e35:
+                f_norm64 = 1.0e35
+            self.wheel_states[i].normal_load = Float32(f_norm64)
 
             var hub_r = self.rot.rotate(cfg.offset)
-            var susp_force = self.wheel_states[i].contact_normal * f_norm
-            out_wheel_forces[i] = out_wheel_forces[i] + susp_force
-            total_force = total_force + susp_force
-            total_torque = total_torque + hub_r.cross(susp_force)
+            var cn = self.wheel_states[i].contact_normal
+            var susp_force = _clamp_vec3_f64(
+                Float64(cn.x) * f_norm64,
+                Float64(cn.y) * f_norm64,
+                Float64(cn.z) * f_norm64,
+                1.0e35,
+            )
+            out_wheel_forces[i] = _clamp_vec3_f64(
+                Float64(out_wheel_forces[i].x) + Float64(susp_force.x),
+                Float64(out_wheel_forces[i].y) + Float64(susp_force.y),
+                Float64(out_wheel_forces[i].z) + Float64(susp_force.z),
+                1.0e35,
+            )
+            tf_x64 += Float64(susp_force.x)
+            tf_y64 += Float64(susp_force.y)
+            tf_z64 += Float64(susp_force.z)
+            tt_x64 += Float64(hub_r.y) * Float64(susp_force.z) - Float64(hub_r.z) * Float64(susp_force.y)
+            tt_y64 += Float64(hub_r.z) * Float64(susp_force.x) - Float64(hub_r.x) * Float64(susp_force.z)
+            tt_z64 += Float64(hub_r.x) * Float64(susp_force.y) - Float64(hub_r.y) * Float64(susp_force.x)
 
         # 5. Powertrain: engine RPM update, torque curve, and 1.5-way LSD torque split
         var total_ratio = self.final_drive
@@ -545,28 +642,35 @@ struct VehicleChassis(Copyable, Movable):
             var gear_idx = max(0, min(len(self.gear_ratios) - 1, self.current_gear))
             total_ratio = self.gear_ratios[gear_idx] * self.final_drive
         var driven_count = 0
-        var driven_omega_sum = Float32(0.0)
+        var driven_omega_sum64 = 0.0
         var left_driven = -1
         var right_driven = -1
         for i in range(num_wheels):
+            if not isfinite(self.wheel_states[i].angular_velocity):
+                self.wheel_states[i].angular_velocity = Float32(0.0)
             if self.wheels[i].driven:
                 driven_count += 1
-                driven_omega_sum += self.wheel_states[i].angular_velocity
+                driven_omega_sum64 += Float64(self.wheel_states[i].angular_velocity)
                 if self.wheels[i].offset.x < Float32(0.0) and left_driven < 0:
                     left_driven = i
                 elif self.wheels[i].offset.x >= Float32(0.0) and right_driven < 0:
                     right_driven = i
 
-        var avg_omega = driven_omega_sum / Float32(max(1, driven_count))
-        var wheel_rpm = avg_omega * Float32(9.5492966)
+        var avg_omega64 = driven_omega_sum64 / Float64(max(1, driven_count))
+        var wheel_rpm64 = avg_omega64 * 9.5492966
+        var raw_target64 = abs(wheel_rpm64 * Float64(total_ratio)) + Float64(max(Float32(0.0), throttle)) * 650.0
+        if not isfinite(raw_target64):
+            raw_target64 = Float64(self.redline_rpm)
         var target_rpm = max(
             self.idle_rpm,
             min(
                 self.redline_rpm,
-                abs(wheel_rpm * total_ratio) + max(Float32(0.0), throttle) * Float32(650.0),
+                Float32(min(Float64(self.redline_rpm), raw_target64)),
             ),
         )
         self.engine_rpm += (target_rpm - self.engine_rpm) * min(Float32(1.0), dt * Float32(20.0))
+        if not isfinite(self.engine_rpm):
+            self.engine_rpm = self.idle_rpm
 
         var eng_torque = self._eval_engine_torque(self.engine_rpm, throttle)
         var axle_torque = eng_torque * total_ratio
@@ -575,8 +679,8 @@ struct VehicleChassis(Copyable, Movable):
         if left_driven >= 0 and right_driven >= 0 and left_driven < 8 and right_driven < 8:
             var lock_factor = self.lsd_power_lock if axle_torque >= Float32(0.0) else self.lsd_coast_lock
             var max_lock = self.lsd_preload + lock_factor * abs(axle_torque)
-            var d_omega = self.wheel_states[left_driven].angular_velocity - self.wheel_states[right_driven].angular_velocity
-            var t_lsd = max(-max_lock, min(max_lock, Float32(45.0) * d_omega))
+            var d_omega64 = Float64(self.wheel_states[left_driven].angular_velocity) - Float64(self.wheel_states[right_driven].angular_velocity)
+            var t_lsd = max(-max_lock, min(max_lock, Float32(max(-Float64(max_lock), min(Float64(max_lock), 45.0 * d_omega64)))))
             wheel_drive_torque[left_driven] = Float32(0.5) * axle_torque - t_lsd
             wheel_drive_torque[right_driven] = Float32(0.5) * axle_torque + t_lsd
         elif driven_count > 0:
@@ -599,9 +703,16 @@ struct VehicleChassis(Copyable, Movable):
                 continue
 
             var n_contact = self.wheel_states[i].contact_normal
-            var raw_arm = self.wheel_states[i].contact_point - self.pos
+            var arm_x64 = Float64(self.wheel_states[i].contact_point.x) - Float64(self.pos.x)
+            var arm_y64 = Float64(self.wheel_states[i].contact_point.y) - Float64(self.pos.y)
+            var arm_z64 = Float64(self.wheel_states[i].contact_point.z) - Float64(self.pos.z)
             var ground_v = ground_vels[i] if i < len(ground_vels) else Vec3()
-            var patch_vel = (self.linear_vel + self.angular_vel.cross(raw_arm)) - ground_v
+            var gv_x64 = Float64(ground_v.x) if isfinite(ground_v.x) else 0.0
+            var gv_y64 = Float64(ground_v.y) if isfinite(ground_v.y) else 0.0
+            var gv_z64 = Float64(ground_v.z) if isfinite(ground_v.z) else 0.0
+            var pv_x64 = lv_x64 + (Float64(self.angular_vel.y) * arm_z64 - Float64(self.angular_vel.z) * arm_y64) - gv_x64
+            var pv_y64 = lv_y64 + (Float64(self.angular_vel.z) * arm_x64 - Float64(self.angular_vel.x) * arm_z64) - gv_y64
+            var pv_z64 = lv_z64 + (Float64(self.angular_vel.x) * arm_y64 - Float64(self.angular_vel.y) * arm_x64) - gv_z64
 
             var sa = self.wheel_states[i].steer_angle
             var c_sa = det_cos(sa)
@@ -612,26 +723,30 @@ struct VehicleChassis(Copyable, Movable):
                 wheel_fwd = steer_fwd.normalized()
             var wheel_lat = n_contact.cross(wheel_fwd).normalized()
 
-            var v_long = patch_vel.dot(wheel_fwd)
-            var v_lat = patch_vel.dot(wheel_lat)
+            var v_long64 = pv_x64 * Float64(wheel_fwd.x) + pv_y64 * Float64(wheel_fwd.y) + pv_z64 * Float64(wheel_fwd.z)
+            var v_lat64 = pv_x64 * Float64(wheel_lat.x) + pv_y64 * Float64(wheel_lat.y) + pv_z64 * Float64(wheel_lat.z)
+            var v_long = Float32(max(-3.4e38, min(3.4e38, v_long64))) if isfinite(v_long64) else Float32(0.0)
+            var v_lat = Float32(max(-3.4e38, min(3.4e38, v_lat64))) if isfinite(v_lat64) else Float32(0.0)
 
             var r = cfg.radius
-            var omega = self.wheel_states[i].angular_velocity
+            var omega64 = Float64(self.wheel_states[i].angular_velocity)
             if cfg.driven and i < 8:
-                omega += (wheel_drive_torque[i] / w_inertia) * dt
+                omega64 += (Float64(wheel_drive_torque[i]) / Float64(w_inertia)) * Float64(dt)
 
             var wheel_brake_t = max_brake_torque * max(Float32(0.0), cfg.brake_factor)
             if brake_clamped > Float32(0.001) and abs(v_long) <= Float32(1.5):
-                var pre_decel = (wheel_brake_t / w_inertia) * dt
-                if abs(omega) <= pre_decel:
-                    omega = Float32(0.0)
-                elif omega > Float32(0.0):
-                    omega -= pre_decel
+                var pre_decel64 = (Float64(wheel_brake_t) / Float64(w_inertia)) * Float64(dt)
+                if abs(omega64) <= pre_decel64:
+                    omega64 = 0.0
+                elif omega64 > 0.0:
+                    omega64 -= pre_decel64
                 else:
-                    omega += pre_decel
+                    omega64 += pre_decel64
 
-            var tire_v = omega * r
-            var slip_ratio = (tire_v - v_long) / max(Float32(0.1), abs(v_long))
+            var tire_v64 = omega64 * Float64(r)
+            var tire_v = Float32(max(-3.4e38, min(3.4e38, tire_v64))) if isfinite(tire_v64) else Float32(0.0)
+            var sr64 = (tire_v64 - v_long64) / max(0.1, abs(v_long64))
+            var slip_ratio = Float32(max(-3.4e38, min(3.4e38, sr64))) if isfinite(sr64) else Float32(0.0)
             var slip_angle = -det_atan2(v_lat, max(Float32(0.1), abs(v_long)))
 
             self.wheel_states[i].slip_ratio = slip_ratio
@@ -646,61 +761,127 @@ struct VehicleChassis(Copyable, Movable):
                 self.wheel_states[i].bristle_x,
                 self.wheel_states[i].bristle_y,
             )
-            var fx = forces[0]
-            var fy = forces[1]
-            var mz = forces[2]
+            var fx = forces[0] if isfinite(forces[0]) else Float32(0.0)
+            var fy = forces[1] if isfinite(forces[1]) else Float32(0.0)
+            var mz = forces[2] if isfinite(forces[2]) else Float32(0.0)
 
-            var reaction_torque = -fx * r
-            var new_omega = omega + (reaction_torque / w_inertia) * dt
+            var reaction_torque64 = -Float64(fx) * Float64(r)
+            var new_omega64 = omega64 + (reaction_torque64 / Float64(w_inertia)) * Float64(dt)
             if brake_clamped > Float32(0.001):
-                var decel = (wheel_brake_t / w_inertia) * dt
-                if abs(v_long) > Float32(1.5):
-                    var abs_floor = (Float32(1.0) - Float32(0.15) * brake_clamped) * (abs(v_long) / max(Float32(0.05), r))
-                    if abs(new_omega) > abs_floor:
-                        if new_omega > Float32(0.0):
-                            new_omega = max(abs_floor, new_omega - decel)
+                var decel64 = (Float64(wheel_brake_t) / Float64(w_inertia)) * Float64(dt)
+                if abs(v_long64) > 1.5:
+                    var abs_floor64 = (1.0 - 0.15 * Float64(brake_clamped)) * (abs(v_long64) / max(0.05, Float64(r)))
+                    if abs(new_omega64) > abs_floor64:
+                        if new_omega64 > 0.0:
+                            new_omega64 = max(abs_floor64, new_omega64 - decel64)
                         else:
-                            new_omega = min(-abs_floor, new_omega + decel)
+                            new_omega64 = min(-abs_floor64, new_omega64 + decel64)
                 else:
-                    if abs(new_omega) <= decel:
-                        new_omega = Float32(0.0)
-                    elif new_omega > Float32(0.0):
-                        new_omega -= decel
+                    if abs(new_omega64) <= decel64:
+                        new_omega64 = 0.0
+                    elif new_omega64 > 0.0:
+                        new_omega64 -= decel64
                     else:
-                        new_omega += decel
+                        new_omega64 += decel64
+            var new_omega = Float32(max(-3.4e38, min(3.4e38, new_omega64))) if isfinite(new_omega64) else Float32(0.0)
             self.wheel_states[i].angular_velocity = new_omega
             self.wheel_states[i].longitudinal_force = fx
             self.wheel_states[i].lateral_force = fy
             self.wheel_states[i].aligning_torque = mz
 
-            var tire_force = wheel_fwd * fx + wheel_lat * fy
-            out_wheel_forces[i] = out_wheel_forces[i] + tire_force
-            total_force = total_force + tire_force
+            var tf_wx64 = Float64(wheel_fwd.x) * Float64(fx) + Float64(wheel_lat.x) * Float64(fy)
+            var tf_wy64 = Float64(wheel_fwd.y) * Float64(fx) + Float64(wheel_lat.y) * Float64(fy)
+            var tf_wz64 = Float64(wheel_fwd.z) * Float64(fx) + Float64(wheel_lat.z) * Float64(fy)
+            var tire_force = _clamp_vec3_f64(tf_wx64, tf_wy64, tf_wz64, 1.0e35)
+            out_wheel_forces[i] = _clamp_vec3_f64(
+                Float64(out_wheel_forces[i].x) + Float64(tire_force.x),
+                Float64(out_wheel_forces[i].y) + Float64(tire_force.y),
+                Float64(out_wheel_forces[i].z) + Float64(tire_force.z),
+                1.0e35,
+            )
+            tf_x64 += Float64(tire_force.x)
+            tf_y64 += Float64(tire_force.y)
+            tf_z64 += Float64(tire_force.z)
 
             # Apply tire force at (contact_point - self.pos) with roll_center_blend
-            var arm_vert = up * raw_arm.dot(up)
-            var force_arm = (raw_arm - arm_vert) + arm_vert * self.roll_center_blend
-            total_torque = total_torque + force_arm.cross(tire_force) + n_contact * mz
+            var arm_dot_up64 = arm_x64 * Float64(up.x) + arm_y64 * Float64(up.y) + arm_z64 * Float64(up.z)
+            var av_x64 = Float64(up.x) * arm_dot_up64
+            var av_y64 = Float64(up.y) * arm_dot_up64
+            var av_z64 = Float64(up.z) * arm_dot_up64
+            var rcb64 = Float64(self.roll_center_blend)
+            var fa_x64 = (arm_x64 - av_x64) + av_x64 * rcb64
+            var fa_y64 = (arm_y64 - av_y64) + av_y64 * rcb64
+            var fa_z64 = (arm_z64 - av_z64) + av_z64 * rcb64
+            tt_x64 += (fa_y64 * Float64(tire_force.z) - fa_z64 * Float64(tire_force.y)) + Float64(n_contact.x) * Float64(mz)
+            tt_y64 += (fa_z64 * Float64(tire_force.x) - fa_x64 * Float64(tire_force.z)) + Float64(n_contact.y) * Float64(mz)
+            tt_z64 += (fa_x64 * Float64(tire_force.y) - fa_y64 * Float64(tire_force.x)) + Float64(n_contact.z) * Float64(mz)
 
             # Spinning wheel gyroscopic precession reaction: -omega_chassis x L_wheel
-            var wheel_spin_l = -wheel_lat * (w_inertia * new_omega)
-            total_torque = total_torque - self.angular_vel.cross(wheel_spin_l)
+            var l_scale64 = Float64(w_inertia) * Float64(new_omega)
+            var wl_x64 = -Float64(wheel_lat.x) * l_scale64
+            var wl_y64 = -Float64(wheel_lat.y) * l_scale64
+            var wl_z64 = -Float64(wheel_lat.z) * l_scale64
+            tt_x64 -= Float64(self.angular_vel.y) * wl_z64 - Float64(self.angular_vel.z) * wl_y64
+            tt_y64 -= Float64(self.angular_vel.z) * wl_x64 - Float64(self.angular_vel.x) * wl_z64
+            tt_z64 -= Float64(self.angular_vel.x) * wl_y64 - Float64(self.angular_vel.y) * wl_x64
 
         # 7. Rigid body integration with implicit chassis gyroscopic torque & SO(3) attitude update
-        self.linear_vel = self.linear_vel + total_force * (self.inv_mass * dt)
-        self.pos = self.pos + self.linear_vel * dt
+        var total_force = _clamp_vec3_f64(tf_x64, tf_y64, tf_z64, 1.0e35)
+        var total_torque = _clamp_vec3_f64(tt_x64, tt_y64, tt_z64, 1.0e35)
+        var inv_m_dt64 = Float64(self.inv_mass) * Float64(dt)
+        self.linear_vel = _clamp_vec3_f64(
+            lv_x64 + Float64(total_force.x) * inv_m_dt64,
+            lv_y64 + Float64(total_force.y) * inv_m_dt64,
+            lv_z64 + Float64(total_force.z) * inv_m_dt64,
+            3.4e38,
+        )
+        self.pos = _clamp_vec3_f64(
+            Float64(self.pos.x) + Float64(self.linear_vel.x) * Float64(dt),
+            Float64(self.pos.y) + Float64(self.linear_vel.y) * Float64(dt),
+            Float64(self.pos.z) + Float64(self.linear_vel.z) * Float64(dt),
+            3.4e38,
+        )
 
         var inv_rot = self.rot.conjugate()
         var wb_cur = inv_rot.rotate(self.angular_vel)
         var tau_local = inv_rot.rotate(total_torque)
-        var wb_forced = Vec3(
-            wb_cur.x + tau_local.x * self.inv_inertia.x * dt,
-            wb_cur.y + tau_local.y * self.inv_inertia.y * dt,
-            wb_cur.z + tau_local.z * self.inv_inertia.z * dt,
+        var wb_forced = _clamp_vec3_f64(
+            Float64(wb_cur.x) + Float64(tau_local.x) * Float64(self.inv_inertia.x) * Float64(dt),
+            Float64(wb_cur.y) + Float64(tau_local.y) * Float64(self.inv_inertia.y) * Float64(dt),
+            Float64(wb_cur.z) + Float64(tau_local.z) * Float64(self.inv_inertia.z) * Float64(dt),
+            3.4e38,
         )
         var wb_next = _implicit_gyro_step(wb_forced, self.inertia, dt) if apply_gyro else wb_forced
-        self.angular_vel = self.rot.rotate(wb_next)
-        self.rot = (Quat.from_scaled_angle(self.angular_vel * dt) * self.rot).normalized()
+        var av_rot = self.rot.rotate(wb_next)
+        self.angular_vel = _clamp_vec3_f64(Float64(av_rot.x), Float64(av_rot.y), Float64(av_rot.z), 3.4e38)
+
+        var dw_x64 = Float64(self.angular_vel.x) * Float64(dt)
+        var dw_y64 = Float64(self.angular_vel.y) * Float64(dt)
+        var dw_z64 = Float64(self.angular_vel.z) * Float64(dt)
+        var ang64 = sqrt(dw_x64 * dw_x64 + dw_y64 * dw_y64 + dw_z64 * dw_z64)
+        var dq: Quat
+        if not isfinite(ang64) or ang64 < 1.0e-12:
+            dq = Quat()
+        elif ang64 < 1.0e-5:
+            dq = Quat(
+                Float32(dw_x64 * 0.5),
+                Float32(dw_y64 * 0.5),
+                Float32(dw_z64 * 0.5),
+                Float32(1.0),
+            ).normalized()
+        else:
+            var half32 = Float32((ang64 * 0.5) % 6.28318530717958647692)
+            var s = det_sin(half32)
+            var inv_ang = 1.0 / ang64
+            dq = Quat(
+                Float32(dw_x64 * inv_ang) * s,
+                Float32(dw_y64 * inv_ang) * s,
+                Float32(dw_z64 * inv_ang) * s,
+                det_cos(half32),
+            ).normalized()
+        var next_rot = (dq * self.rot).normalized()
+        if isfinite(next_rot.x) and isfinite(next_rot.y) and isfinite(next_rot.z) and isfinite(next_rot.w):
+            self.rot = next_rot
 
     def serialize(self, mut w: BlobWriter):
         """Bit-exact snapshot of chassis, powertrain, tire parameters, and wheel elastoplastic bristle state."""

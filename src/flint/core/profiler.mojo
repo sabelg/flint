@@ -32,6 +32,7 @@ each GPU pass. Lanes are named by `M` metadata events.
 """
 from std.atomic import Atomic
 from std.ffi import external_call
+from std.math import abs, isfinite, isinf, isnan
 from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
 from std.time import monotonic
@@ -120,9 +121,112 @@ comptime GPU_SPANS_PER_FRAME: Int = 8
 
 comptime FILE_BUFFER_BYTES: Int = 1 << 20
 comptime EVENT_TEXT_BYTES: Int = 256
+comptime MAX_ZONE_NAME_BYTES: Int = 96
 comptime MAX_FILE_BYTES: Int = 1 << 31
 comptime CALIBRATION_MICROSECONDS: UInt32 = 20000
 comptime BUDGET_MS: Float64 = 1000.0 / 60.0
+
+
+def _sanitize_zone_name(name: String, max_bytes: Int = MAX_ZONE_NAME_BYTES) -> String:
+    """Caps a zone name to at most `max_bytes` UTF-8 bytes and strips ASCII control chars."""
+    var raw = name.as_bytes()
+    var n = len(raw)
+    var out = List[UInt8](capacity=min(n, max_bytes))
+    var i = 0
+    while i < n and len(out) < max_bytes:
+        var b = raw[i]
+        var seq_len: Int
+        if (b & 0x80) == 0:
+            seq_len = 1
+        elif (b & 0xE0) == 0xC0 and i + 1 < n:
+            seq_len = 2
+        elif (b & 0xF0) == 0xE0 and i + 2 < n:
+            seq_len = 3
+        elif (b & 0xF8) == 0xF0 and i + 3 < n:
+            seq_len = 4
+        else:
+            # Invalid/truncated UTF-8 byte: replace with '_'
+            out.append(UInt8(95))
+            i += 1
+            continue
+        if len(out) + seq_len > max_bytes:
+            break
+        if seq_len == 1:
+            if b < 0x20 or b == 0x7F:
+                out.append(UInt8(95))
+            else:
+                out.append(b)
+        else:
+            for k in range(seq_len):
+                out.append(raw[i + k])
+        i += seq_len
+    return String(unsafe_from_utf8=out)
+
+
+def _json_escape_bounded(name: String, max_out_bytes: Int = MAX_ZONE_NAME_BYTES) -> String:
+    """Returns a valid JSON string literal payload (without surrounding quotes) of <= `max_out_bytes`."""
+    var raw = name.as_bytes()
+    var n = len(raw)
+    var out = List[UInt8](capacity=min(n, max_out_bytes))
+    var i = 0
+    while i < n and len(out) < max_out_bytes:
+        var b = raw[i]
+        if b == 34:  # '"'
+            if len(out) + 2 > max_out_bytes:
+                break
+            out.append(UInt8(92))
+            out.append(UInt8(34))
+            i += 1
+        elif b == 92:  # '\\'
+            if len(out) + 2 > max_out_bytes:
+                break
+            out.append(UInt8(92))
+            out.append(UInt8(92))
+            i += 1
+        elif b == 10:  # '\n'
+            if len(out) + 2 > max_out_bytes:
+                break
+            out.append(UInt8(92))
+            out.append(UInt8(110))
+            i += 1
+        elif b == 13:  # '\r'
+            if len(out) + 2 > max_out_bytes:
+                break
+            out.append(UInt8(92))
+            out.append(UInt8(114))
+            i += 1
+        elif b == 9:  # '\t'
+            if len(out) + 2 > max_out_bytes:
+                break
+            out.append(UInt8(92))
+            out.append(UInt8(116))
+            i += 1
+        elif b < 0x20 or b == 0x7F:
+            if len(out) + 1 > max_out_bytes:
+                break
+            out.append(UInt8(95))
+            i += 1
+        elif (b & 0x80) == 0:
+            out.append(b)
+            i += 1
+        else:
+            var seq_len: Int
+            if (b & 0xE0) == 0xC0 and i + 1 < n:
+                seq_len = 2
+            elif (b & 0xF0) == 0xE0 and i + 2 < n:
+                seq_len = 3
+            elif (b & 0xF8) == 0xF0 and i + 3 < n:
+                seq_len = 4
+            else:
+                out.append(UInt8(95))
+                i += 1
+                continue
+            if len(out) + seq_len > max_out_bytes:
+                break
+            for k in range(seq_len):
+                out.append(raw[i + k])
+            i += seq_len
+    return String(unsafe_from_utf8=out)
 
 
 def zone_name(zone: Int) -> String:
@@ -292,16 +396,30 @@ struct ZoneRow(Copyable, Movable):
 
 def report_ms(value: Float32) -> String:
     """Milliseconds to the microsecond: enough, and always plain digits."""
-    var scaled = Int(value * 1000.0 + 0.5)
+    if isnan(value):
+        return "nan"
+    if isinf(value):
+        return "-inf" if value < Float32(0.0) else "inf"
+    var neg = value < Float32(0.0)
+    var a = abs(Float64(value))
+    if a >= 1.0e15:
+        return ("-" if neg else "") + String(Float32(a))
+    var scaled = Int(a * 1000.0 + 0.5)
+    if scaled == 0:
+        return "0.000"
     var fraction = String(scaled % 1000)
-    return String(scaled // 1000) + "." + "0" * (3 - fraction.byte_length()) + fraction
+    return ("-" if neg else "") + String(scaled // 1000) + "." + "0" * (3 - fraction.byte_length()) + fraction
 
 
 def percentile_of(mut values: List[Float32], fraction: Float64) -> Float32:
     """`values` must be sorted."""
     if len(values) == 0:
         return 0
-    return values[min(len(values) - 1, Int(fraction * Float64(len(values) - 1)))]
+    if not isfinite(fraction):
+        return values[0]
+    var f = max(0.0, min(1.0, fraction))
+    var idx = max(0, min(len(values) - 1, Int(f * Float64(len(values) - 1))))
+    return values[idx]
 
 
 struct ProfileTimeline(Movable):
@@ -411,20 +529,21 @@ struct ProfileTimeline(Movable):
     def register_zone(mut self, name: String) -> Int:
         """Dynamically registers a custom profiler zone name and returns its dense zone ID.
         Idempotent: returns the existing ID if `name` matches a built-in or previously registered zone."""
+        var clean_name = _sanitize_zone_name(name, MAX_ZONE_NAME_BYTES)
         for z in range(ZONE_COUNT):
-            if zone_name(z) == name:
+            if zone_name(z) == clean_name:
                 return z
         for i in range(len(self.custom_zone_names)):
-            if self.custom_zone_names[i] == name:
+            if self.custom_zone_names[i] == clean_name:
                 return ZONE_COUNT + i
         var zid = ZONE_COUNT + len(self.custom_zone_names)
-        self.custom_zone_names.append(name)
+        self.custom_zone_names.append(clean_name)
         if self.active:
             self.zone_ticks.append(UInt64(0))
             for _ in range(HISTORY_FRAMES):
                 self.history.append(Float32(0))
             if len(self.zone_text) > 0:
-                self.zone_text.append("\"name\":\"" + name + "\"")
+                self.zone_text.append("\"name\":\"" + _json_escape_bounded(clean_name, MAX_ZONE_NAME_BYTES) + "\"")
         return zid
 
     def start(mut self, path: String, overlay: Bool = True) -> Bool:
@@ -473,7 +592,7 @@ struct ProfileTimeline(Movable):
             pass
         var spent_wall = monotonic() - wall
         var spent_ticks = profile_ticks() - ticks
-        if spent_ticks > 100:
+        if spent_ticks > 100 and spent_wall > 0:
             self.nanoseconds_per_tick = Float64(spent_wall) / Float64(spent_ticks)
         else:
             self.nanoseconds_per_tick = 0.5
@@ -705,6 +824,9 @@ struct ProfileTimeline(Movable):
             external_call["free", NoneType](self.buffer)
             self.buffer = 0
         self.buffer_used = 0
+        self.file_bytes = 0
+        self.file_full = False
+        self.first_event = True
         self.path = path
         if path.byte_length() == 0:
             return
@@ -725,7 +847,7 @@ struct ProfileTimeline(Movable):
         var zcount = self.zone_count()
         self.zone_text = List[String](capacity=zcount)
         for zone in range(zcount):
-            self.zone_text.append("\"name\":\"" + self.zone_label(zone) + "\"")
+            self.zone_text.append("\"name\":\"" + _json_escape_bounded(self.zone_label(zone), MAX_ZONE_NAME_BYTES) + "\"")
         self.append_text("[")
         for lane in range(len(self.lane_threads)):
             self.write_lane_name(lane)
@@ -737,24 +859,61 @@ struct ProfileTimeline(Movable):
             return "gpu"
         return "worker " + String(lane - FIRST_WORKER_LANE)
 
+    @always_inline
+    def _ensure_buffer_space(mut self, needed: Int) -> Bool:
+        if self.fd < 0 or self.buffer == 0 or needed < 0 or needed > FILE_BUFFER_BYTES:
+            return False
+        if self.buffer_used + needed <= FILE_BUFFER_BYTES:
+            return True
+        self.flush_file()
+        if self.fd < 0 or self.buffer == 0:
+            return False
+        return self.buffer_used + needed <= FILE_BUFFER_BYTES
+
+    def _append_raw_bytes(mut self, src_ptr: Int, size: Int):
+        if size <= 0 or self.fd < 0 or self.buffer == 0:
+            return
+        if size > FILE_BUFFER_BYTES:
+            self.flush_file()
+            if self.fd < 0 or self.buffer == 0:
+                return
+            var off = 0
+            while off < size and self.fd >= 0:
+                var chunk = min(size - off, FILE_BUFFER_BYTES)
+                _ = external_call["memcpy", Int](self.buffer, src_ptr + off, chunk)
+                self.buffer_used = chunk
+                self.flush_file()
+                off += chunk
+            return
+        if not self._ensure_buffer_space(size):
+            return
+        _ = external_call["memcpy", Int](self.buffer + self.buffer_used, src_ptr, size)
+        self.buffer_used += size
+
     def write_lane_name(mut self, lane: Int):
-        if self.fd < 0:
+        if self.fd < 0 or self.buffer == 0:
             return
         self.start_entry()
         self.append_text("{\"ph\":\"M\",\"pid\":1,\"tid\":")
         self.append_number(lane)
-        self.append_text(",\"name\":\"thread_name\",\"args\":{\"name\":\"" + self.lane_name(lane) + "\"}}")
+        self.append_text(",\"name\":\"thread_name\",\"args\":{\"name\":\"" + _json_escape_bounded(self.lane_name(lane), MAX_ZONE_NAME_BYTES) + "\"}}")
 
     def start_entry(mut self):
-        if self.buffer_used + EVENT_TEXT_BYTES > FILE_BUFFER_BYTES:
-            self.flush_file()
+        if self.fd < 0 or self.buffer == 0:
+            return
+        if not self._ensure_buffer_space(EVENT_TEXT_BYTES):
+            return
         if not self.first_event:
             self.append_byte(44)  # comma
         self.append_byte(10)  # newline
         self.first_event = False
 
     def write_event(mut self, zone: Int, lane: Int, started: UInt64, ended: UInt64, frame: Int):
+        if self.fd < 0 or self.buffer == 0:
+            return
         self.start_entry()
+        if self.fd < 0 or self.buffer == 0:
+            return
         self.append_text("{\"ph\":\"X\",\"pid\":1,\"tid\":")
         self.append_number(lane)
         self.append_byte(44)
@@ -773,13 +932,16 @@ struct ProfileTimeline(Movable):
 
     @always_inline
     def append_byte(mut self, value: UInt8):
+        if not self._ensure_buffer_space(1):
+            return
         Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=self.buffer + self.buffer_used)[unsafe_offset=0] = value
         self.buffer_used += 1
 
     def append_text(mut self, text: String):
         var size = text.byte_length()
-        _ = external_call["memcpy", Int](self.buffer + self.buffer_used, Int(text.as_bytes().unsafe_ptr()), size)
-        self.buffer_used += size
+        if size <= 0:
+            return
+        self._append_raw_bytes(Int(text.as_bytes().unsafe_ptr()), size)
 
     def append_string(mut self, zone: Int):
         if zone < 0 or zone >= len(self.zone_text):
@@ -787,17 +949,29 @@ struct ProfileTimeline(Movable):
             return
         ref text = self.zone_text[zone]
         var size = text.byte_length()
-        _ = external_call["memcpy", Int](self.buffer + self.buffer_used, Int(text.as_bytes().unsafe_ptr()), size)
-        self.buffer_used += size
+        if size <= 0:
+            return
+        self._append_raw_bytes(Int(text.as_bytes().unsafe_ptr()), size)
 
     def append_number(mut self, value: Int):
+        if self.fd < 0 or self.buffer == 0:
+            return
+        var v = value
+        if v < 0:
+            self.append_byte(45)  # '-'
+            if v == Int(-0x7FFFFFFFFFFFFFFF - 1):
+                self.append_text("9223372036854775808")
+                return
+            v = -v
         var digits = 1
-        var rest = value // 10
+        var rest = v // 10
         while rest > 0:
             digits += 1
             rest //= 10
+        if not self._ensure_buffer_space(digits):
+            return
         var position = self.buffer + self.buffer_used + digits
-        rest = value
+        rest = v
         for _ in range(digits):
             position -= 1
             Pointer[UInt8, origin=MutAnyOrigin](unsafe_from_address=position)[unsafe_offset=0] = UInt8(48 + rest % 10)
@@ -806,7 +980,16 @@ struct ProfileTimeline(Movable):
 
     def append_microseconds(mut self, ticks: UInt64):
         """Trace timestamps are microseconds; three decimals keep the nanoseconds."""
-        var nanoseconds = Int(Float64(ticks) * self.nanoseconds_per_tick)
+        if self.fd < 0 or self.buffer == 0:
+            return
+        var ns_f = Float64(ticks) * self.nanoseconds_per_tick
+        var nanoseconds: Int
+        if not isfinite(ns_f) or ns_f <= 0.0:
+            nanoseconds = 0
+        elif ns_f >= 9.0e18:
+            nanoseconds = 9_000_000_000_000_000_000
+        else:
+            nanoseconds = Int(ns_f)
         self.append_number(nanoseconds // 1000)
         var fraction = nanoseconds % 1000
         self.append_byte(46)

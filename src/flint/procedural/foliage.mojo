@@ -17,7 +17,7 @@ Implements Flint Engine v3 botanical assets in 100% pure Mojo:
      - `build_manicured_hedge_and_planter(length, width, height)`
      - `build_flowering_bush(seed, radius)`
 """
-from std.math import cos, floor, max, min, sin, sqrt
+from std.math import cos, floor, isfinite, max, min, sin, sqrt
 from flint.core.math import Vec3
 from flint.assets.model import NativeMesh
 from flint.assets.mesh_builder import MeshBuilder
@@ -723,7 +723,7 @@ def build_botanical_oak(seed: Int, height: Float32 = 6.0) -> Tuple[NativeMesh, N
     - `leaf_canopy_mesh` (`alpha_mode = 1`, `double_sided = True`): `72` curved 3D cross-foil sprig cards (`36` pairs = `288`->`576` tris)
       with `0.70` spherical-lobe normal transfer, radial crown `ao` (`95..255`), and warm sunlit-to-olive vertex `colors`!
     """
-    var h = max(Float32(2.4), height)
+    var h = max(Float32(2.4), min(Float32(200.0), height)) if isfinite(height) else Float32(6.0)
     var mb_trunk = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.82, metallic=0.0, double_sided=False)
     var mb_leaves = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.56, metallic=0.0, alpha_mode=1, double_sided=True)
 
@@ -805,7 +805,7 @@ def build_botanical_pine(seed: Int, height: Float32 = 5.5) -> Tuple[NativeMesh, 
     - `needle_canopy_mesh` (`alpha_mode = 1`, `double_sided = True`): `76` curved 3D cross-foil conifer sprig cards
       (`38` pairs = `608` tris) with `0.70` dome normal transfer, `95..255` radial AO, and crown-to-core `colors`.
     """
-    var h = max(Float32(2.0), height)
+    var h = max(Float32(2.0), min(Float32(200.0), height)) if isfinite(height) else Float32(5.5)
     var mb_trunk = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.80, metallic=0.0, double_sided=False)
     var mb_needles = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.60, metallic=0.0, alpha_mode=1, double_sided=True)
 
@@ -908,7 +908,7 @@ def build_botanical_pine(seed: Int, height: Float32 = 5.5) -> Tuple[NativeMesh, 
 def build_botanical_palm(seed: Int, height: Float32 = 5.8) -> Tuple[NativeMesh, NativeMesh]:
     """Builds `(trunk_mesh, frond_canopy_mesh)` (`double_sided = False` trunk, `alpha_mode = 1` + `double_sided = True`
     arching V-folded palm fronds mapped cleanly to `bake_palm_frond_512()`)."""
-    var h = max(Float32(2.8), height)
+    var h = max(Float32(2.8), min(Float32(200.0), height)) if isfinite(height) else Float32(5.8)
     var mb_trunk = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.78, metallic=0.0, double_sided=False)
     var mb_fronds = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.50, metallic=0.02, alpha_mode=1, double_sided=True)
 
@@ -1000,7 +1000,7 @@ def build_botanical_palm(seed: Int, height: Float32 = 5.8) -> Tuple[NativeMesh, 
 def build_urban_ginkgo_tree(seed: Int, height: Float32 = 5.2) -> Tuple[NativeMesh, NativeMesh]:
     """Builds `(trunk_mesh, ginkgo_canopy_mesh)` (`64` curved 3D cross-foil golden-chartreuse sprig cards,
     `alpha_mode = 1`, `double_sided = True`, distinct `seed` scaffold limb asymmetry & `0.70` lobe normals)."""
-    var h = max(Float32(2.4), height)
+    var h = max(Float32(2.4), min(Float32(200.0), height)) if isfinite(height) else Float32(5.2)
     var mb_trunk = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.78, metallic=0.0, double_sided=False)
     var mb_leaves = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.52, metallic=0.0, alpha_mode=1, double_sided=True)
 
@@ -1131,9 +1131,12 @@ def build_manicured_hedge_and_planter(
     height: Float32 = 1.05,
 ) -> Tuple[NativeMesh, NativeMesh]:
     """Builds `(stone_curb_mesh, foliage_hedge_mesh)` for plazas, avenues, and coaster queues."""
-    var hl = max(Float32(0.4), length * Float32(0.5))
-    var hw = max(Float32(0.25), width * Float32(0.5))
-    var h_tot = max(Float32(0.5), height)
+    var safe_len = min(Float32(200.0), max(Float32(0.4), length)) if isfinite(length) else Float32(3.2)
+    var safe_wid = min(Float32(50.0), max(Float32(0.5), width)) if isfinite(width) else Float32(0.9)
+    var safe_h = min(Float32(50.0), max(Float32(0.5), height)) if isfinite(height) else Float32(1.05)
+    var hl = max(Float32(0.4), safe_len * Float32(0.5))
+    var hw = max(Float32(0.25), safe_wid * Float32(0.5))
+    var h_tot = max(Float32(0.5), safe_h)
     var curb_h = min(Float32(0.28), h_tot * Float32(0.32))
 
     # 1. Chamfered granite planter curb + dark mulch soil bed
@@ -1155,7 +1158,7 @@ def build_manicured_hedge_and_planter(
     mb_hedge.add_beveled_box(Vec3(0.0, cy, 0.0), Vec3(h_hl, h_fol * Float32(0.5), h_hw), bevel=0.08, color=0xFF2B662E)
 
     # Stud perimeter & crown with ruffled 3D boxwood sprig cards for natural leafy silhouette breakup
-    var n_along = max(3, Int(length * Float32(2.2)))
+    var n_along = min(512, max(3, Int(safe_len * Float32(2.2))))
     for i in range(n_along):
         var tx = -h_hl * Float32(0.82) + (Float32(i) / Float32(max(1, n_along - 1))) * (h_hl * Float32(1.64))
         for side in range(-1, 2, 2):
@@ -1186,7 +1189,7 @@ def build_manicured_hedge_and_planter(
 def build_flowering_bush(seed: Int, radius: Float32 = 0.85) -> NativeMesh:
     """Builds an organic domed flowering park bush (`alpha_mode = 1`, `double_sided = True`) combining
     crossed leafy sprig rosettes with vibrant 3D multi-petal flower clusters."""
-    var r = max(Float32(0.30), radius)
+    var r = max(Float32(0.30), min(Float32(50.0), radius)) if isfinite(radius) else Float32(0.85)
     var mb = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.54, metallic=0.0, alpha_mode=1, double_sided=True)
     var center = Vec3(0.0, r * Float32(0.52), 0.0)
 

@@ -8,7 +8,7 @@ Architecture:
     uncovered or dirty pages via `VK_KHR_dynamic_rendering` per-tile `renderArea`.
   - Contact-Hardening `PCSS`: 8-tap Vogel-disk blocker search + 12-tap variable-penumbra PCF.
 """
-from std.math import abs, cos, floor, max, min, sin, sqrt
+from std.math import abs, cos, floor, isfinite, isnan, max, min, sin, sqrt
 from flint.core.math import Vec3
 from flint.render.spirv import (
     AaaSpirvModule,
@@ -95,6 +95,8 @@ def vsm_cascade_globals_word_offset(cascade: Int) -> Int:
 
 def get_vsm_cascade_index(dist: Float32) -> Int:
     """Selects clipmap cascade 0..3 based on receiver distance from camera."""
+    if isnan(dist):
+        return 0
     if dist <= VSM_CASCADE_0_EXTENT:
         return 0
     elif dist <= VSM_CASCADE_1_EXTENT:
@@ -166,10 +168,18 @@ struct VsmPageManager(Movable):
                 self.virtual_valid[row + lx] = False
 
     def invalidate_region(mut self, min_uv_x: Float32, min_uv_y: Float32, max_uv_x: Float32, max_uv_y: Float32):
-        var x0 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(min_uv_x * Float32(VSM_VIRTUAL_PAGES_DIM))))
-        var y0 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(min_uv_y * Float32(VSM_VIRTUAL_PAGES_DIM))))
-        var x1 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(max_uv_x * Float32(VSM_VIRTUAL_PAGES_DIM))))
-        var y1 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(max_uv_y * Float32(VSM_VIRTUAL_PAGES_DIM))))
+        if isnan(min_uv_x) or isnan(min_uv_y) or isnan(max_uv_x) or isnan(max_uv_y):
+            return
+        var ux0 = max(Float32(0.0), min(Float32(1.0), min_uv_x))
+        var uy0 = max(Float32(0.0), min(Float32(1.0), min_uv_y))
+        var ux1 = max(Float32(0.0), min(Float32(1.0), max_uv_x))
+        var uy1 = max(Float32(0.0), min(Float32(1.0), max_uv_y))
+        if not (isfinite(ux0) and isfinite(uy0) and isfinite(ux1) and isfinite(uy1)):
+            return
+        var x0 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(ux0 * Float32(VSM_VIRTUAL_PAGES_DIM))))
+        var y0 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(uy0 * Float32(VSM_VIRTUAL_PAGES_DIM))))
+        var x1 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(ux1 * Float32(VSM_VIRTUAL_PAGES_DIM))))
+        var y1 = max(0, min(VSM_VIRTUAL_PAGES_DIM - 1, Int(uy1 * Float32(VSM_VIRTUAL_PAGES_DIM))))
         for vy in range(y0, y1 + 1):
             for vx in range(x0, x1 + 1):
                 self.virtual_valid[vy * VSM_VIRTUAL_PAGES_DIM + vx] = False
@@ -288,19 +298,34 @@ def compute_vsm_cascade_page_origins(
 ) -> List[Tuple[Int, Int]]:
     """Computes integer light-space page origins `(page_x, page_y)` for each of the 4 toroidal VSM cascades
     (`±16m, ±64m, ±256m, ±1024m`) so camera translation snaps cleanly to `128x128`-texel page boundaries!"""
+    var origins = List[Tuple[Int, Int]](capacity=VSM_CASCADE_COUNT)
+    if not (
+        isfinite(light_dir_toward_sun.x)
+        and isfinite(light_dir_toward_sun.y)
+        and isfinite(light_dir_toward_sun.z)
+        and isfinite(camera_pos.x)
+        and isfinite(camera_pos.y)
+        and isfinite(camera_pos.z)
+        and isfinite(base_half_extent)
+    ):
+        for _ in range(VSM_CASCADE_COUNT):
+            origins.append((0, 0))
+        return origins^
     var fwd = (Vec3(0.0, 0.0, 0.0) - light_dir_toward_sun).normalized()
     var up_ref = Vec3(0.0, 0.0, 1.0) if abs(fwd.y) > Float32(0.92) else Vec3(0.0, 1.0, 0.0)
     var right = up_ref.cross(fwd).normalized()
     var up = fwd.cross(right).normalized()
-    var cam_lx = right.dot(camera_pos)
-    var cam_ly = up.dot(camera_pos)
+    var cam_lx = Float64(right.x) * Float64(camera_pos.x) + Float64(right.y) * Float64(camera_pos.y) + Float64(right.z) * Float64(camera_pos.z)
+    var cam_ly = Float64(up.x) * Float64(camera_pos.x) + Float64(up.y) * Float64(camera_pos.y) + Float64(up.z) * Float64(camera_pos.z)
 
-    var origins = List[Tuple[Int, Int]](capacity=VSM_CASCADE_COUNT)
+    comptime VSM_PAGE_COORD_LIM: Float64 = 1.0e15
     for c in range(VSM_CASCADE_COUNT):
-        var half_ext = max(Float32(1.0), base_half_extent) * Float32(1 << (2 * c))
-        var page_world = (Float32(2.0) * half_ext) / Float32(VSM_CASCADE_PAGES_DIM)
-        var px = Int(floor(cam_lx / page_world + Float32(0.5)))
-        var py = Int(floor(cam_ly / page_world + Float32(0.5)))
+        var half_ext = max(1.0, Float64(base_half_extent)) * Float64(1 << (2 * c))
+        var page_world = (2.0 * half_ext) / Float64(VSM_CASCADE_PAGES_DIM)
+        var qx = floor(cam_lx / page_world + 0.5)
+        var qy = floor(cam_ly / page_world + 0.5)
+        var px = Int(max(-VSM_PAGE_COORD_LIM, min(VSM_PAGE_COORD_LIM, qx))) if isfinite(qx) else 0
+        var py = Int(max(-VSM_PAGE_COORD_LIM, min(VSM_PAGE_COORD_LIM, qy))) if isfinite(qy) else 0
         origins.append((px, py))
     return origins^
 

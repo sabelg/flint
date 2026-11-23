@@ -20,6 +20,7 @@ bakes: a missing glyph is measured from the source's advance.
 This module only loads and measures; `Framebuffer` does the drawing.
 """
 from std.collections import Dict
+from std.math import isfinite
 from flint.platform.os import read_bytes, write_bytes
 from flint.text.utf8 import decode_utf8 as text_decode_utf8
 from flint.text.ttf import TrueTypeFont
@@ -475,16 +476,19 @@ struct SdfFont(Copyable, Movable):
 
     def measure(self, text: String, px: Float32) -> Float32:
         """Advance width of one line at `px` pixels per em."""
-        if not self.valid:
+        if not self.valid or not isfinite(px) or not isfinite(self.bake_px) or self.bake_px <= Float32(0.0):
             return 0
         var scale = px / self.bake_px
+        if not isfinite(scale):
+            return 0
         var codes = decode_utf8(text)
         var width: Float32 = 0
         for index in range(len(codes)):
             width += self.advance_of(codes[index])
             if index + 1 < len(codes):
                 width += self.kern(codes[index], codes[index + 1])
-        return width * scale
+        var total = width * scale
+        return total if isfinite(total) else Float32(0)
 
     # ---- the dynamic glyph cache ----
 

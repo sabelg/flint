@@ -8,7 +8,7 @@ Implements:
   defaults whenever a truncated or malformed packet attempts to read past `bit_len`.
 """
 from std.collections import List
-from std.math import abs, max, min, sqrt
+from std.math import abs, isfinite, max, min, sqrt
 from flint.core.detmath import SQRT_HALF, det_atan2, f32_bits, f32_from_bits
 from flint.core.math import Quat, Vec3
 
@@ -27,11 +27,24 @@ def bits_required(max_span: UInt64) -> Int:
 
 
 @always_inline
+def _safe_unit_quat(q_in: Quat) -> Quat:
+    if not (isfinite(q_in.x) and isfinite(q_in.y) and isfinite(q_in.z) and isfinite(q_in.w)):
+        return Quat.identity()
+    var l2 = q_in.length_squared()
+    if not isfinite(l2) or l2 <= Float32(1.0e-12):
+        return Quat.identity()
+    var q = q_in.normalized()
+    if not (isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)):
+        return Quat.identity()
+    return q
+
+
+@always_inline
 def quat_angular_error_deg(a: Quat, b: Quat) -> Float32:
     """Cancellation-free Kahan quaternion geodesic angle `acos(|qa . qb|)` in degrees:
     `phi = 2 * atan2(||qa - sign*qb||, ||qa + sign*qb||) * (180 / pi)`."""
-    var qa = a.normalized()
-    var qb = b.normalized()
+    var qa = _safe_unit_quat(a)
+    var qb = _safe_unit_quat(b)
     if qa.dot(qb) < Float32(0.0):
         qb = Quat(-qb.x, -qb.y, -qb.z, -qb.w)
     var dmx = qa.x - qb.x
@@ -129,7 +142,7 @@ def pack_quat_smallest_three(q_in: Quat) -> UInt32:
     codewords and quantizes onto a Body-Centered Cubic (`2 * 812^3 < 2^30`) lattice using
     16-candidate geodesic search (`< 0.10 deg` worst-case SO(3) error, ~0.04 deg typical).
     """
-    var q = q_in.normalized()
+    var q = _safe_unit_quat(q_in)
     var ax = abs(q.x)
     var ay = abs(q.y)
     var az = abs(q.z)
@@ -384,11 +397,12 @@ struct BitWriter(Copyable, Movable):
         var b = max(1, min(31, num_bits))
         var levels = (1 << b) - 1
         var span = max(Float32(1.0e-9), max_val - min_val)
-        var safe_val = value if value == value else min_val
+        var safe_min = min_val if isfinite(min_val) else Float32(0.0)
+        var safe_val = value if isfinite(value) else safe_min
         var norm = max(
-            Float32(0.0), min(Float32(1.0), (safe_val - min_val) / span)
+            Float32(0.0), min(Float32(1.0), (safe_val - safe_min) / span)
         )
-        if norm != norm:
+        if not isfinite(norm):
             norm = Float32(0.0)
         var q = Int(norm * Float32(levels) + Float32(0.5))
         q = max(0, min(levels, q))
@@ -416,7 +430,7 @@ struct BitWriter(Copyable, Movable):
     def write_quat_smallest_three_48(mut self, q_in: Quat):
         """48-bit high-precision Smallest-Three quaternion (`2 + 15 + 15 + 16 = 48` bits, `< 0.0025 deg`)."""
         comptime SPAN: Float32 = Float32(2.0) * SQRT_HALF
-        var q = q_in.normalized()
+        var q = _safe_unit_quat(q_in)
         var ax = abs(q.x)
         var ay = abs(q.y)
         var az = abs(q.z)

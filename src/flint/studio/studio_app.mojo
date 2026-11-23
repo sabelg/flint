@@ -20,7 +20,7 @@ Implements:
 from flint.studio.source_editor import EmbeddedIde
 from flint.studio import scene_menu
 from std.collections import Dict
-from std.math import abs, asin, cos, max, min, sin, sqrt
+from std.math import abs, asin, cos, isfinite, isinf, isnan, max, min, sin, sqrt
 from flint.anim.flanim_ecs import SteppedAnimClock, compute_volume_preserving_smear_scale
 from flint.anim.plugin import register_anim_codecs
 from flint.app.engine_app import (
@@ -2213,17 +2213,38 @@ struct FlintStudioState(Movable):
 
         var e = self.app.world.spawn_empty()
         var eid = Int(e.index)
-        var q = rotation.normalized()
-        var lt = LocalTransform(position, q, scale)
+        var safe_pos = Vec3(
+            position.x if isfinite(position.x) else Float32(0.0),
+            position.y if isfinite(position.y) else Float32(0.0),
+            position.z if isfinite(position.z) else Float32(0.0),
+        )
+        var q = Quat.identity()
+        if isfinite(rotation.x) and isfinite(rotation.y) and isfinite(rotation.z) and isfinite(rotation.w):
+            var qn = rotation.normalized()
+            if isfinite(qn.x) and isfinite(qn.y) and isfinite(qn.z) and isfinite(qn.w):
+                q = qn
+        var safe_scl = Vec3(
+            scale.x if isfinite(scale.x) else Float32(1.0),
+            scale.y if isfinite(scale.y) else Float32(1.0),
+            scale.z if isfinite(scale.z) else Float32(1.0),
+        )
+        var lt = LocalTransform(safe_pos, q, safe_scl)
         var gt = GlobalTransform.from_local(lt)
         _ = self.app.world.insert[LocalTransform](e, lt)
         _ = self.app.world.insert[GlobalTransform](e, gt.copy())
         _ = self.app.world.insert[PrevGlobalTransform](e, PrevGlobalTransform(gt^))
         _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(mesh_id, -1, True, True))
-        var clamp_r = max(Float32(0.04), min(Float32(1.0), roughness))
-        var clamp_m = max(Float32(0.0), min(Float32(1.0), metallic))
+        var safe_r = roughness if isfinite(roughness) else Float32(0.38)
+        var safe_m = metallic if isfinite(metallic) else Float32(0.10)
+        var clamp_r = max(Float32(0.04), min(Float32(1.0), safe_r))
+        var clamp_m = max(Float32(0.0), min(Float32(1.0), safe_m))
+        var safe_col = Vec3(
+            base_color.x if isfinite(base_color.x) else Float32(0.82),
+            base_color.y if isfinite(base_color.y) else Float32(0.84),
+            base_color.z if isfinite(base_color.z) else Float32(0.88),
+        )
         _ = self.app.world.insert[MaterialOverrideComponent](
-            e, MaterialOverrideComponent(-1, base_color, clamp_r, clamp_m, Vec3(), True)
+            e, MaterialOverrideComponent(-1, safe_col, clamp_r, clamp_m, Vec3(), True)
         )
         _ = self.app.world.insert[StudioEntityMetaComponent](
             e,
@@ -2637,22 +2658,54 @@ struct FlintStudioState(Movable):
                 if not pe.valid() or not set_parent(self.app.world, e, pe):
                     return False
 
+        var safe_tr = Vec3(
+            updated.translation.x if isfinite(updated.translation.x) else Float32(0.0),
+            updated.translation.y if isfinite(updated.translation.y) else Float32(0.0),
+            updated.translation.z if isfinite(updated.translation.z) else Float32(0.0),
+        )
+        var safe_rot = Quat.identity()
+        if (
+            isfinite(updated.rotation.x)
+            and isfinite(updated.rotation.y)
+            and isfinite(updated.rotation.z)
+            and isfinite(updated.rotation.w)
+        ):
+            var rn = updated.rotation.normalized()
+            if isfinite(rn.x) and isfinite(rn.y) and isfinite(rn.z) and isfinite(rn.w):
+                safe_rot = rn
+        var safe_scl = Vec3(
+            updated.scale.x if isfinite(updated.scale.x) else Float32(1.0),
+            updated.scale.y if isfinite(updated.scale.y) else Float32(1.0),
+            updated.scale.z if isfinite(updated.scale.z) else Float32(1.0),
+        )
         _ = self.app.world.insert[LocalTransform](
-            e, LocalTransform(updated.translation, updated.rotation.normalized(), updated.scale)
+            e, LocalTransform(safe_tr, safe_rot, safe_scl)
         )
         _ = self.app.world.insert[MeshRendererComponent](
             e, MeshRendererComponent(updated.mesh_id, updated.material_id, True, updated.visible)
         )
-        var clamp_r = max(Float32(0.04), min(Float32(1.0), updated.roughness))
-        var clamp_m = max(Float32(0.0), min(Float32(1.0), updated.metallic))
+        var safe_r = updated.roughness if isfinite(updated.roughness) else Float32(0.38)
+        var safe_m = updated.metallic if isfinite(updated.metallic) else Float32(0.10)
+        var clamp_r = max(Float32(0.04), min(Float32(1.0), safe_r))
+        var clamp_m = max(Float32(0.0), min(Float32(1.0), safe_m))
+        var safe_col = Vec3(
+            updated.base_color.x if isfinite(updated.base_color.x) else Float32(0.82),
+            updated.base_color.y if isfinite(updated.base_color.y) else Float32(0.84),
+            updated.base_color.z if isfinite(updated.base_color.z) else Float32(0.88),
+        )
+        var safe_em = Vec3(
+            updated.emissive.x if isfinite(updated.emissive.x) else Float32(0.0),
+            updated.emissive.y if isfinite(updated.emissive.y) else Float32(0.0),
+            updated.emissive.z if isfinite(updated.emissive.z) else Float32(0.0),
+        )
         _ = self.app.world.insert[MaterialOverrideComponent](
             e,
             MaterialOverrideComponent(
                 updated.material_id,
-                updated.base_color,
+                safe_col,
                 clamp_r,
                 clamp_m,
-                updated.emissive,
+                safe_em,
                 enabled=(updated.shading_mode == SHADING_PBR),
             ),
         )
@@ -2846,16 +2899,28 @@ struct FlintStudioState(Movable):
             var target_w_rot = sn.world_rot
             var target_local_scl = sn.local_scl
             if mode == GIZMO_MODE_TRANSLATE:
-                target_w_pos = sn.world_pos + world_delta_pos
+                if isfinite(world_delta_pos.x) and isfinite(world_delta_pos.y) and isfinite(world_delta_pos.z):
+                    target_w_pos = sn.world_pos + world_delta_pos
             elif mode == GIZMO_MODE_ROTATE:
-                var rel = sn.world_pos - pivot
-                target_w_pos = pivot + world_dq_rot.rotate(rel)
-                target_w_rot = world_dq_rot.multiply(sn.world_rot).normalized()
+                if (
+                    isfinite(pivot.x) and isfinite(pivot.y) and isfinite(pivot.z)
+                    and isfinite(world_dq_rot.x) and isfinite(world_dq_rot.y)
+                    and isfinite(world_dq_rot.z) and isfinite(world_dq_rot.w)
+                ):
+                    var rel = sn.world_pos - pivot
+                    target_w_pos = pivot + world_dq_rot.rotate(rel)
+                    target_w_rot = world_dq_rot.multiply(sn.world_rot).normalized()
             elif mode == GIZMO_MODE_SCALE:
+                var sx_f = scale_factor.x if isfinite(scale_factor.x) else Float32(1.0)
+                var sy_f = scale_factor.y if isfinite(scale_factor.y) else Float32(1.0)
+                var sz_f = scale_factor.z if isfinite(scale_factor.z) else Float32(1.0)
+                var lx = sn.local_scl.x * sx_f
+                var ly = sn.local_scl.y * sy_f
+                var lz = sn.local_scl.z * sz_f
                 target_local_scl = Vec3(
-                    max(Float32(0.01), sn.local_scl.x * scale_factor.x),
-                    max(Float32(0.01), sn.local_scl.y * scale_factor.y),
-                    max(Float32(0.01), sn.local_scl.z * scale_factor.z),
+                    max(Float32(0.01), lx) if isfinite(lx) else max(Float32(0.01), sn.local_scl.x),
+                    max(Float32(0.01), ly) if isfinite(ly) else max(Float32(0.01), sn.local_scl.y),
+                    max(Float32(0.01), lz) if isfinite(lz) else max(Float32(0.01), sn.local_scl.z),
                 )
 
             var new_lt = LocalTransform(target_w_pos, target_w_rot, target_local_scl)
@@ -2977,13 +3042,29 @@ struct FlintStudioState(Movable):
             return False
         var v = self.entities[entity_id].copy()
         v.shading_mode = SHADING_NPR_CEL
-        v.cel_shadow_tint = cel_shadow_tint
-        v.cel_outline_width_px = max(Float32(0.0), min(Float32(24.0), cel_outline_width_px))
-        v.cel_outline_color = cel_outline_color
-        v.cel_rim_color = cel_rim_color
-        v.cel_hair_halo = max(Float32(0.0), cel_hair_halo)
-        v.anim_step_hz = max(Float32(0.0), anim_step_hz)
-        v.smear_stretch = max(Float32(0.55), min(Float32(3.2), smear_stretch))
+        v.cel_shadow_tint = Vec3(
+            cel_shadow_tint.x if isfinite(cel_shadow_tint.x) else Float32(0.55),
+            cel_shadow_tint.y if isfinite(cel_shadow_tint.y) else Float32(0.38),
+            cel_shadow_tint.z if isfinite(cel_shadow_tint.z) else Float32(0.44),
+        )
+        var ow = cel_outline_width_px if isfinite(cel_outline_width_px) else Float32(2.0)
+        v.cel_outline_width_px = max(Float32(0.0), min(Float32(24.0), ow))
+        v.cel_outline_color = Vec3(
+            cel_outline_color.x if isfinite(cel_outline_color.x) else Float32(0.015),
+            cel_outline_color.y if isfinite(cel_outline_color.y) else Float32(0.012),
+            cel_outline_color.z if isfinite(cel_outline_color.z) else Float32(0.018),
+        )
+        v.cel_rim_color = Vec3(
+            cel_rim_color.x if isfinite(cel_rim_color.x) else Float32(0.45),
+            cel_rim_color.y if isfinite(cel_rim_color.y) else Float32(0.52),
+            cel_rim_color.z if isfinite(cel_rim_color.z) else Float32(0.68),
+        )
+        var hh = cel_hair_halo if isfinite(cel_hair_halo) else Float32(0.0)
+        var hz = anim_step_hz if isfinite(anim_step_hz) else Float32(0.0)
+        var sm = smear_stretch if isfinite(smear_stretch) else Float32(1.0)
+        v.cel_hair_halo = max(Float32(0.0), hh)
+        v.anim_step_hz = max(Float32(0.0), hz)
+        v.smear_stretch = max(Float32(0.55), min(Float32(3.2), sm))
         return self.commit_node_edit(entity_id, v^, "Configure NPR Cel", coalesce_key)
 
     def configure_entity_stylized_vfx(
@@ -3001,12 +3082,23 @@ struct FlintStudioState(Movable):
             return False
         var v = self.entities[entity_id].copy()
         v.shading_mode = SHADING_STYLIZED_VFX
-        v.vfx_erosion = max(Float32(0.0), min(Float32(1.0), vfx_erosion))
-        v.vfx_scroll_speed = vfx_scroll_speed
-        v.vfx_core_color = vfx_core_color
-        v.vfx_edge_color = vfx_edge_color
-        v.anim_step_hz = max(Float32(0.0), anim_step_hz)
-        v.smear_stretch = max(Float32(0.55), min(Float32(3.2), smear_stretch))
+        var er = vfx_erosion if isfinite(vfx_erosion) else Float32(0.35)
+        v.vfx_erosion = max(Float32(0.0), min(Float32(1.0), er))
+        v.vfx_scroll_speed = vfx_scroll_speed if isfinite(vfx_scroll_speed) else Float32(3.2)
+        v.vfx_core_color = Vec3(
+            vfx_core_color.x if isfinite(vfx_core_color.x) else Float32(8.5),
+            vfx_core_color.y if isfinite(vfx_core_color.y) else Float32(6.2),
+            vfx_core_color.z if isfinite(vfx_core_color.z) else Float32(2.2),
+        )
+        v.vfx_edge_color = Vec3(
+            vfx_edge_color.x if isfinite(vfx_edge_color.x) else Float32(4.2),
+            vfx_edge_color.y if isfinite(vfx_edge_color.y) else Float32(0.30),
+            vfx_edge_color.z if isfinite(vfx_edge_color.z) else Float32(0.04),
+        )
+        var hz = anim_step_hz if isfinite(anim_step_hz) else Float32(0.0)
+        var sm = smear_stretch if isfinite(smear_stretch) else Float32(1.0)
+        v.anim_step_hz = max(Float32(0.0), hz)
+        v.smear_stretch = max(Float32(0.55), min(Float32(3.2), sm))
         return self.commit_node_edit(entity_id, v^, "Configure Stylized VFX", coalesce_key)
 
     def attach_static_bvh_collider(mut self, entity_id: Int, var bvh: Bvh8MeshCollider):
@@ -3679,9 +3771,17 @@ def bake_procedural_to_glb(preset: String, output_glb_path: String, seed: Int = 
 # ============================================================================
 
 def _fmt_f32_2dp(v: Float32) -> String:
+    if isnan(v):
+        return "nan"
+    if isinf(v):
+        return "-inf" if v < Float32(0.0) else "inf"
     var neg = v < Float32(0.0)
     var av = -v if neg else v
+    if abs(Float64(av)) >= 1.0e15:
+        return ("-" if neg else "") + String(av)
     var scaled = Int(av * Float32(100.0) + Float32(0.5))
+    if scaled == 0:
+        neg = False
     var whole = scaled // 100
     var frac = scaled % 100
     var sign = "-" if neg else ""

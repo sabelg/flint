@@ -11,7 +11,7 @@ Implements:
    limits, and soft PD linear/angular drives (`make_soft`), warm-starting, and serialization.
 """
 from std.collections import List
-from std.math import sqrt, abs, min, max, floor
+from std.math import sqrt, abs, min, max, floor, isfinite
 from flint.core.math import Vec3, Quat
 from flint.core.detmath import PI, det_atan2
 from flint.core.serial import BlobWriter, BlobReader, fourcc
@@ -499,6 +499,19 @@ struct CompoundShape(Copyable, Movable):
     ) -> CompoundShape:
         """Volumetric + plane-clip V-HACD-lite approximate convex decomposition."""
         var out = CompoundShape()
+        if len(vertices) == 0:
+            return out^
+
+        var lo = vertices[0]
+        var hi = vertices[0]
+        for i in range(len(vertices)):
+            var v = vertices[i]
+            if not isfinite(v.x) or not isfinite(v.y) or not isfinite(v.z):
+                return out^
+            if i > 0:
+                lo.x = min(lo.x, v.x); lo.y = min(lo.y, v.y); lo.z = min(lo.z, v.z)
+                hi.x = max(hi.x, v.x); hi.y = max(hi.y, v.y); hi.z = max(hi.z, v.z)
+
         var n_tris = len(indices) // 3
         if len(vertices) < 4 or n_tris == 0:
             if len(vertices) >= 4:
@@ -509,13 +522,6 @@ struct CompoundShape(Copyable, Movable):
                     h.vertices[i] = h.vertices[i] - com
                 out.add_child(CompoundChild.convex(com, Quat(), h))
             return out^
-
-        var lo = vertices[0]
-        var hi = vertices[0]
-        for i in range(1, len(vertices)):
-            var v = vertices[i]
-            lo.x = min(lo.x, v.x); lo.y = min(lo.y, v.y); lo.z = min(lo.z, v.z)
-            hi.x = max(hi.x, v.x); hi.y = max(hi.y, v.y); hi.z = max(hi.z, v.z)
 
         var span = hi - lo
         var max_span = max(Float32(1.0e-3), max(span.x, max(span.y, span.z)))
@@ -533,10 +539,16 @@ struct CompoundShape(Copyable, Movable):
         var grid = List[UInt8](length=total_cells, fill=0)
 
         var root = _VhacdPart()
+        var n_verts = len(vertices)
         for t in range(n_tris):
-            var a = vertices[Int(indices[t * 3 + 0])]
-            var b = vertices[Int(indices[t * 3 + 1])]
-            var c = vertices[Int(indices[t * 3 + 2])]
+            var i0 = Int(indices[t * 3 + 0])
+            var i1 = Int(indices[t * 3 + 1])
+            var i2 = Int(indices[t * 3 + 2])
+            if i0 < 0 or i0 >= n_verts or i1 < 0 or i1 >= n_verts or i2 < 0 or i2 >= n_verts:
+                continue
+            var a = vertices[i0]
+            var b = vertices[i1]
+            var c = vertices[i2]
             root.tri_a.append(a)
             root.tri_b.append(b)
             root.tri_c.append(c)
@@ -553,6 +565,9 @@ struct CompoundShape(Copyable, Movable):
                     var iy = max(1, min(ny, Int((p.y - lo.y) / vox_size) + 1))
                     var iz = max(1, min(nz, Int((p.z - lo.z) / vox_size) + 1))
                     grid[(iz * gy + iy) * gx + ix] = UInt8(1)
+
+        if len(root.tri_a) == 0:
+            return out^
 
         # Exterior air BFS from padded border (0, 0, 0)
         var queue = List[Int](capacity=total_cells)
@@ -798,30 +813,41 @@ struct HeightfieldCollider(Copyable, Movable):
         cell_size: Float32 = 1.0,
         material_id: UInt16 = 0,
     ) -> Self:
+        comptime MAX_HF_DIM: Int = 16384
         var hf = Self()
-        if nx < 2 or nz < 2 or len(heights) < nx * nz:
+        if nx < 2 or nz < 2 or nx > MAX_HF_DIM or nz > MAX_HF_DIM or nx > len(heights) // nz:
             return hf^
+        if not isfinite(origin.x) or not isfinite(origin.y) or not isfinite(origin.z) or not isfinite(cell_size):
+            return hf^
+        var n_samples = nx * nz
+        for i in range(n_samples):
+            if not isfinite(heights[i]):
+                return hf^
+        var lo_y = heights[0]
+        var hi_y = heights[0]
+        for i in range(1, n_samples):
+            var h = heights[i]
+            if h < lo_y: lo_y = h
+            if h > hi_y: hi_y = h
+        var span_y_f64 = Float64(hi_y) - Float64(lo_y)
+        var y_scale_f64 = span_y_f64 / 65535.0 if span_y_f64 > 1.0e-7 else 0.0
+        if not isfinite(Float32(y_scale_f64)):
+            return hf^
+
         hf.nx = nx
         hf.nz = nz
         hf.origin = origin
         hf.cell_size = max(Float32(1.0e-3), cell_size)
         hf.material_id = material_id
-
-        var lo_y = heights[0]
-        var hi_y = heights[0]
-        for i in range(1, nx * nz):
-            var h = heights[i]
-            if h < lo_y: lo_y = h
-            if h > hi_y: hi_y = h
         hf.min_y = lo_y
         hf.max_y = hi_y
-        var span_y = hi_y - lo_y
-        hf.y_scale = span_y / Float32(65535.0) if span_y > Float32(1.0e-7) else Float32(0.0)
-        var inv_scale = Float32(65535.0) / span_y if span_y > Float32(1.0e-7) else Float32(0.0)
+        hf.y_scale = Float32(y_scale_f64)
+        var inv_scale_f64 = 65535.0 / span_y_f64 if span_y_f64 > 1.0e-7 else 0.0
 
-        hf.heights_u16.reserve(nx * nz)
-        for i in range(nx * nz):
-            var q = Int(max(Float32(0.0), min(Float32(65535.0), (heights[i] - lo_y) * inv_scale + Float32(0.5))))
+        hf.heights_u16.reserve(n_samples)
+        for i in range(n_samples):
+            var q_f64 = (Float64(heights[i]) - Float64(lo_y)) * inv_scale_f64 + 0.5
+            var q = Int(max(0.0, min(65535.0, q_f64)))
             hf.heights_u16.append(UInt16(q))
 
         # Build 4-level hierarchical cell min/max pyramid (2x2, 4x4, 8x8, 16x16 cells)
@@ -878,11 +904,21 @@ struct HeightfieldCollider(Copyable, Movable):
         return hf^
 
     @always_inline
+    def _dequant_y_f64(self, q: UInt16) -> Float64:
+        var span_f64 = Float64(self.max_y) - Float64(self.min_y)
+        if span_f64 > 1.0e-7:
+            var y = Float64(self.min_y) + (Float64(Int(q)) / 65535.0) * span_f64
+            return min(Float64(self.max_y), max(Float64(self.min_y), y))
+        return Float64(self.min_y) + Float64(Int(q)) * Float64(self.y_scale)
+
+    @always_inline
     def dequant_y(self, q: UInt16) -> Float32:
-        return self.min_y + Float32(Int(q)) * self.y_scale
+        return Float32(self._dequant_y_f64(q))
 
     @always_inline
     def height_at_grid(self, ix: Int, iz: Int) -> Float32:
+        if self.nx < 1 or self.nz < 1 or len(self.heights_u16) == 0:
+            return self.origin.y
         var cx = max(0, min(self.nx - 1, ix))
         var cz = max(0, min(self.nz - 1, iz))
         return self.dequant_y(self.heights_u16[cz * self.nx + cx])
@@ -890,11 +926,12 @@ struct HeightfieldCollider(Copyable, Movable):
     def bounds(self) -> Tuple[Vec3, Vec3]:
         if self.nx < 2 or self.nz < 2:
             return (self.origin, self.origin)
-        var wx = Float32(self.nx - 1) * self.cell_size
-        var wz = Float32(self.nz - 1) * self.cell_size
+        comptime F32_MAX_F64: Float64 = 3.4028234e38
+        var hx = max(-F32_MAX_F64, min(F32_MAX_F64, Float64(self.origin.x) + Float64(self.nx - 1) * Float64(self.cell_size)))
+        var hz = max(-F32_MAX_F64, min(F32_MAX_F64, Float64(self.origin.z) + Float64(self.nz - 1) * Float64(self.cell_size)))
         return (
             Vec3(self.origin.x, self.min_y, self.origin.z),
-            Vec3(self.origin.x + wx, self.max_y, self.origin.z + wz),
+            Vec3(Float32(hx), self.max_y, Float32(hz)),
         )
 
     @always_inline
@@ -924,15 +961,32 @@ struct HeightfieldCollider(Copyable, Movable):
         var z1 = z0 + cs
         var r0 = cz * self.nx + cx
         var r1 = r0 + self.nx
-        var v00 = Vec3(x0, self.dequant_y(self.heights_u16[r0]), z0)
-        var v10 = Vec3(x1, self.dequant_y(self.heights_u16[r0 + 1]), z0)
-        var v01 = Vec3(x0, self.dequant_y(self.heights_u16[r1]), z1)
-        var v11 = Vec3(x1, self.dequant_y(self.heights_u16[r1 + 1]), z1)
+        var h00 = self._dequant_y_f64(self.heights_u16[r0])
+        var h10 = self._dequant_y_f64(self.heights_u16[r0 + 1])
+        var h01 = self._dequant_y_f64(self.heights_u16[r1])
+        var h11 = self._dequant_y_f64(self.heights_u16[r1 + 1])
+        var v00 = Vec3(x0, Float32(h00), z0)
+        var v10 = Vec3(x1, Float32(h10), z0)
+        var v01 = Vec3(x0, Float32(h01), z1)
+        var v11 = Vec3(x1, Float32(h11), z1)
         # CCW upward: (v00, v01, v10) and (v10, v01, v11)
         var t0 = MeshTriangle(v00, v01, v10, self.material_id)
         var t1 = MeshTriangle(v10, v01, v11, self.material_id)
+        var cs64 = Float64(cs)
+        var n0x = -(h10 - h00)
+        var n0z = -(h01 - h00)
+        var l0 = sqrt(n0x * n0x + cs64 * cs64 + n0z * n0z)
+        if l0 > 1.0e-12:
+            t0.normal = Vec3(Float32(n0x / l0), Float32(cs64 / l0), Float32(n0z / l0))
+        var n1x = -(h11 - h01)
+        var n1z = -(h11 - h10)
+        var l1 = sqrt(n1x * n1x + cs64 * cs64 + n1z * n1z)
+        if l1 > 1.0e-12:
+            t1.normal = Vec3(Float32(n1x / l1), Float32(cs64 / l1), Float32(n1z / l1))
         # Smooth shared diagonal edge (v01 <-> v10) when concave or nearly coplanar
-        if t0.normal.dot(t1.normal) > Float32(0.996) or (v11 - v01).dot(t0.normal) >= Float32(-1.0e-4):
+        var dot_n = Float64(t0.normal.x) * Float64(t1.normal.x) + Float64(t0.normal.y) * Float64(t1.normal.y) + Float64(t0.normal.z) * Float64(t1.normal.z)
+        var dv_dot = (Float64(x1) - Float64(x0)) * Float64(t0.normal.x) + (h11 - h01) * Float64(t0.normal.y)
+        if dot_n > 0.996 or dv_dot >= -1.0e-4:
             t0.active_edges &= ~EDGE_ACTIVE_12
             t1.active_edges &= ~EDGE_ACTIVE_01
         # Smooth interior grid edges shared with neighbor cells so KCC/spheres never catch seams
@@ -947,39 +1001,62 @@ struct HeightfieldCollider(Copyable, Movable):
         return (t0, t1)
 
     def sample_height_and_normal(self, world_x: Float32, world_z: Float32) -> Tuple[Float32, Vec3]:
-        if self.nx < 2 or self.nz < 2:
+        if self.nx < 2 or self.nz < 2 or not isfinite(world_x) or not isfinite(world_z):
             return (self.origin.y, Vec3(0, 1, 0))
-        var fx = (world_x - self.origin.x) / self.cell_size
-        var fz = (world_z - self.origin.z) / self.cell_size
-        var cx = max(0, min(self.nx - 2, Int(floor(fx))))
-        var cz = max(0, min(self.nz - 2, Int(floor(fz))))
-        var u = max(Float32(0.0), min(Float32(1.0), fx - Float32(cx)))
-        var v = max(Float32(0.0), min(Float32(1.0), fz - Float32(cz)))
-        var tris = self.cell_triangles(cx, cz)
-        if u + v <= Float32(1.0):
-            var t0 = tris[0]
-            var y = t0.v0.y + v * (t0.v1.y - t0.v0.y) + u * (t0.v2.y - t0.v0.y)
-            return (y, t0.normal)
-        var t1 = tris[1]
-        var y = t1.v2.y + (Float32(1.0) - u) * (t1.v1.y - t1.v2.y) + (Float32(1.0) - v) * (t1.v0.y - t1.v2.y)
-        return (y, t1.normal)
+        var fx = (Float64(world_x) - Float64(self.origin.x)) / Float64(self.cell_size)
+        var fz = (Float64(world_z) - Float64(self.origin.z)) / Float64(self.cell_size)
+        var cx = max(0, min(self.nx - 2, Int(floor(max(-1.0e9, min(1.0e9, fx))))))
+        var cz = max(0, min(self.nz - 2, Int(floor(max(-1.0e9, min(1.0e9, fz))))))
+        var u = max(0.0, min(1.0, fx - Float64(cx)))
+        var v = max(0.0, min(1.0, fz - Float64(cz)))
+        var r0 = cz * self.nx + cx
+        var r1 = r0 + self.nx
+        var h00 = self._dequant_y_f64(self.heights_u16[r0])
+        var h10 = self._dequant_y_f64(self.heights_u16[r0 + 1])
+        var h01 = self._dequant_y_f64(self.heights_u16[r1])
+        var h11 = self._dequant_y_f64(self.heights_u16[r1 + 1])
+        var cs = Float64(self.cell_size)
+        var y64: Float64
+        var nx64: Float64
+        var nz64: Float64
+        if u + v <= 1.0:
+            y64 = h00 + v * (h01 - h00) + u * (h10 - h00)
+            nx64 = -(h10 - h00)
+            nz64 = -(h01 - h00)
+        else:
+            y64 = h11 + (1.0 - u) * (h01 - h11) + (1.0 - v) * (h10 - h11)
+            nx64 = -(h11 - h01)
+            nz64 = -(h11 - h10)
+        if self.max_y >= self.min_y:
+            y64 = min(Float64(self.max_y), max(Float64(self.min_y), y64))
+        var l = sqrt(nx64 * nx64 + cs * cs + nz64 * nz64)
+        var n = Vec3(Float32(nx64 / l), Float32(cs / l), Float32(nz64 / l)) if l > 1.0e-12 else Vec3(0, 1, 0)
+        return (Float32(y64), n)
 
     def raycast_dda(self, origin: Vec3, dir: Vec3, max_t: Float32 = 1.0e6) -> RayHit:
         """Exact Amanatides-Woo 2D grid DDA traversal with hierarchical Y-slab culling."""
         var hit = RayHit()
-        hit.t = max_t
-        if self.nx < 2 or self.nz < 2 or max_t <= Float32(0.0):
+        hit.t = max_t if isfinite(max_t) else Float32(1.0e6)
+        if (
+            self.nx < 2
+            or self.nz < 2
+            or not isfinite(max_t)
+            or max_t <= Float32(0.0)
+            or not (isfinite(origin.x) and isfinite(origin.y) and isfinite(origin.z))
+            or not (isfinite(dir.x) and isfinite(dir.y) and isfinite(dir.z))
+        ):
             return hit^
 
         var cells_x = self.nx - 1
         var cells_z = self.nz - 1
         var cs = self.cell_size
-        var inv_cs = Float32(1.0) / cs
+        var cs64 = Float64(cs)
+        comptime F32_MAX_F64: Float64 = 3.4028234e38
         var b_lo = Vec3(self.origin.x, self.min_y - Float32(1.0e-3), self.origin.z)
         var b_hi = Vec3(
-            self.origin.x + Float32(cells_x) * cs,
+            Float32(max(-F32_MAX_F64, min(F32_MAX_F64, Float64(self.origin.x) + Float64(cells_x) * cs64))),
             self.max_y + Float32(1.0e-3),
-            self.origin.z + Float32(cells_z) * cs,
+            Float32(max(-F32_MAX_F64, min(F32_MAX_F64, Float64(self.origin.z) + Float64(cells_z) * cs64))),
         )
 
         # Clip ray [0, max_t] against heightfield 3D AABB
@@ -1006,8 +1083,10 @@ struct HeightfieldCollider(Copyable, Movable):
 
         # Pure vertical ray fast-path: single cell lookup!
         if abs(dir.x) < Float32(1.0e-7) and abs(dir.z) < Float32(1.0e-7):
-            var cx = max(0, min(cells_x - 1, Int(floor((origin.x - self.origin.x) * inv_cs))))
-            var cz = max(0, min(cells_z - 1, Int(floor((origin.z - self.origin.z) * inv_cs))))
+            var fx_v = (Float64(origin.x) - Float64(self.origin.x)) / cs64
+            var fz_v = (Float64(origin.z) - Float64(self.origin.z)) / cs64
+            var cx = max(0, min(cells_x - 1, Int(floor(max(-1.0e9, min(1.0e9, fx_v))))))
+            var cz = max(0, min(cells_z - 1, Int(floor(max(-1.0e9, min(1.0e9, fz_v))))))
             var tris = self.cell_triangles(cx, cz)
             var t_arr = [tris[0], tris[1]]
             for k in range(2):
@@ -1023,10 +1102,12 @@ struct HeightfieldCollider(Copyable, Movable):
 
         # Initialize 2D Amanatides-Woo DDA at ray entry point
         var p_start = origin + dir * t_enter
-        var fx = (p_start.x - self.origin.x) * inv_cs
-        var fz = (p_start.z - self.origin.z) * inv_cs
-        var ix = max(0, min(cells_x - 1, Int(floor(fx))))
-        var iz = max(0, min(cells_z - 1, Int(floor(fz))))
+        if not (isfinite(p_start.x) and isfinite(p_start.y) and isfinite(p_start.z)):
+            return hit^
+        var fx = (Float64(p_start.x) - Float64(self.origin.x)) / cs64
+        var fz = (Float64(p_start.z) - Float64(self.origin.z)) / cs64
+        var ix = max(0, min(cells_x - 1, Int(floor(max(-1.0e9, min(1.0e9, fx))))))
+        var iz = max(0, min(cells_z - 1, Int(floor(max(-1.0e9, min(1.0e9, fz))))))
 
         var step_x = 1 if dir.x > Float32(0.0) else (-1 if dir.x < Float32(0.0) else 0)
         var step_z = 1 if dir.z > Float32(0.0) else (-1 if dir.z < Float32(0.0) else 0)
@@ -1089,15 +1170,24 @@ struct HeightfieldCollider(Copyable, Movable):
     def _query_aabb_triangles(self, q_lo: Vec3, q_hi: Vec3, mut out_tris: List[MeshTriangle], mut out_ids: List[Int]):
         if self.nx < 2 or self.nz < 2:
             return
+        if not (
+            isfinite(q_lo.x) and isfinite(q_lo.y) and isfinite(q_lo.z)
+            and isfinite(q_hi.x) and isfinite(q_hi.y) and isfinite(q_hi.z)
+        ):
+            return
         if q_hi.y < self.min_y - Float32(1.0e-4) or q_lo.y > self.max_y + Float32(1.0e-4):
             return
         var cells_x = self.nx - 1
         var cells_z = self.nz - 1
-        var inv_cs = Float32(1.0) / self.cell_size
-        var ix0 = max(0, Int(floor((q_lo.x - self.origin.x) * inv_cs)))
-        var ix1 = min(cells_x - 1, Int(floor((q_hi.x - self.origin.x) * inv_cs)))
-        var iz0 = max(0, Int(floor((q_lo.z - self.origin.z) * inv_cs)))
-        var iz1 = min(cells_z - 1, Int(floor((q_hi.z - self.origin.z) * inv_cs)))
+        var cs64 = Float64(self.cell_size)
+        var fx0 = (Float64(q_lo.x) - Float64(self.origin.x)) / cs64
+        var fx1 = (Float64(q_hi.x) - Float64(self.origin.x)) / cs64
+        var fz0 = (Float64(q_lo.z) - Float64(self.origin.z)) / cs64
+        var fz1 = (Float64(q_hi.z) - Float64(self.origin.z)) / cs64
+        var ix0 = max(0, Int(floor(max(-1.0e9, min(1.0e9, fx0)))))
+        var ix1 = min(cells_x - 1, Int(floor(max(-1.0e9, min(1.0e9, fx1)))))
+        var iz0 = max(0, Int(floor(max(-1.0e9, min(1.0e9, fz0)))))
+        var iz1 = min(cells_z - 1, Int(floor(max(-1.0e9, min(1.0e9, fz1)))))
         if ix0 > ix1 or iz0 > iz1:
             return
 

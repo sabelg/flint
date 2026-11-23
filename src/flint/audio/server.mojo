@@ -20,7 +20,7 @@ Architecture:
 from std.atomic import Atomic
 from std.collections import List
 from std.ffi import external_call
-from std.math import sin, cos, sqrt, exp, log10, floor, abs, atan2, isnan, isinf
+from std.math import sin, cos, sqrt, exp, log10, floor, abs, atan2, isnan, isinf, isfinite
 from std.memory import bitcast
 from std.sys import size_of
 from flint.core.math import Vec3
@@ -404,8 +404,14 @@ struct KWeightedLufsMeter(Copyable, Movable):
 
     @always_inline
     def process_frame(mut self, l: Float32, r: Float32):
-        var kl = self.rlb_l.process(self.pre_l.process(Float64(l)))
-        var kr = self.rlb_r.process(self.pre_r.process(Float64(r)))
+        var sl = Float64(l) if isfinite(l) else Float64(0.0)
+        var sr = Float64(r) if isfinite(r) else Float64(0.0)
+        var kl = self.rlb_l.process(self.pre_l.process(sl))
+        var kr = self.rlb_r.process(self.pre_r.process(sr))
+        if not isfinite(kl):
+            kl = 0.0
+        if not isfinite(kr):
+            kr = 0.0
         var e_pair = 0.5 * (kl * kl + kr * kr)
         self.cur_sum_l += kl * kl
         self.cur_sum_r += kr * kr
@@ -479,9 +485,16 @@ struct TruePeakLimiter(Copyable, Movable):
         self.delay_r = Array[Float32, LIMITER_LOOKAHEAD](fill=0.0)
         self.peak_buf = Array[Float32, LIMITER_LOOKAHEAD](fill=0.0)
         self.write_idx = 0
-        self.ceiling = exp(ceiling_db * Float32(0.11512925465))
+        var safe_cdb = min(Float32(0.0), ceiling_db) if isfinite(ceiling_db) else Float32(-0.1)
+        var safe_rel = max(Float32(5.0), release_ms) if isfinite(release_ms) else Float32(80.0)
+        var safe_sr = max(Float32(1000.0), sample_rate) if isfinite(sample_rate) else Float32(48000.0)
+        self.ceiling = exp(safe_cdb * Float32(0.11512925465))
+        if not isfinite(self.ceiling):
+            self.ceiling = Float32(0.988553)
         self.cur_gain = 1.0
-        self.release_coeff = exp(Float32(-1000.0) / (max(Float32(5.0), release_ms) * sample_rate))
+        self.release_coeff = exp(Float32(-1000.0) / (safe_rel * safe_sr))
+        if not isfinite(self.release_coeff):
+            self.release_coeff = Float32(0.0)
         self.hist_l0 = 0.0
         self.hist_l1 = 0.0
         self.hist_l2 = 0.0
@@ -490,7 +503,10 @@ struct TruePeakLimiter(Copyable, Movable):
         self.hist_r2 = 0.0
 
     def set_ceiling_db(mut self, ceiling_db: Float32):
-        self.ceiling = exp(min(Float32(0.0), ceiling_db) * Float32(0.11512925465))
+        var safe_cdb = min(Float32(0.0), ceiling_db) if isfinite(ceiling_db) else Float32(-0.1)
+        self.ceiling = exp(safe_cdb * Float32(0.11512925465))
+        if not isfinite(self.ceiling):
+            self.ceiling = Float32(0.988553)
 
     @staticmethod
     @always_inline
@@ -511,14 +527,20 @@ struct TruePeakLimiter(Copyable, Movable):
 
     @always_inline
     def process(mut self, in_l: Float32, in_r: Float32) -> Tuple[Float32, Float32]:
-        var tp_l = max(abs(in_l), Self._hermite_4x_peak(self.hist_l0, self.hist_l1, self.hist_l2, in_l))
-        var tp_r = max(abs(in_r), Self._hermite_4x_peak(self.hist_r0, self.hist_r1, self.hist_r2, in_r))
+        var safe_l = in_l if isfinite(in_l) else Float32(0.0)
+        var safe_r = in_r if isfinite(in_r) else Float32(0.0)
+        var tp_l = max(abs(safe_l), Self._hermite_4x_peak(self.hist_l0, self.hist_l1, self.hist_l2, safe_l))
+        var tp_r = max(abs(safe_r), Self._hermite_4x_peak(self.hist_r0, self.hist_r1, self.hist_r2, safe_r))
+        if not isfinite(tp_l):
+            tp_l = max(abs(safe_l), Float32(0.0))
+        if not isfinite(tp_r):
+            tp_r = max(abs(safe_r), Float32(0.0))
         self.hist_l0 = self.hist_l1
         self.hist_l1 = self.hist_l2
-        self.hist_l2 = in_l
+        self.hist_l2 = safe_l
         self.hist_r0 = self.hist_r1
         self.hist_r1 = self.hist_r2
-        self.hist_r2 = in_r
+        self.hist_r2 = safe_r
 
         var incoming_tp = max(tp_l, tp_r)
 
@@ -528,8 +550,8 @@ struct TruePeakLimiter(Copyable, Movable):
         var out_tp = max(self.peak_buf[self.write_idx], max(abs(out_raw_l), abs(out_raw_r)))
 
         # Store incoming sample at tail of lookahead line
-        self.delay_l[self.write_idx] = in_l
-        self.delay_r[self.write_idx] = in_r
+        self.delay_l[self.write_idx] = safe_l
+        self.delay_r[self.write_idx] = safe_r
         self.peak_buf[self.write_idx] = incoming_tp
         self.write_idx = (self.write_idx + 1) & (LIMITER_LOOKAHEAD - 1)
 
@@ -727,6 +749,18 @@ struct HrtfSpatialTargets(Copyable, ImplicitlyCopyable, Movable):
     var reverb_send: Float32
 
 
+@always_inline
+def _hrtf_fin_vec3(v: Vec3, fallback: Vec3 = Vec3()) -> Vec3:
+    if isfinite(v.x) and isfinite(v.y) and isfinite(v.z):
+        return v
+    return fallback
+
+
+@always_inline
+def _hrtf_fin_f32(v: Float32, fallback: Float32) -> Float32:
+    return v if isfinite(v) else fallback
+
+
 def compute_woodworth_hrtf(
     listener_pos: Vec3,
     listener_vel: Vec3,
@@ -744,16 +778,33 @@ def compute_woodworth_hrtf(
     """Computes physical Woodworth spherical-head ITD (`a = 0.082 m` -> `29.50` samples @ +90° right),
     frequency-dependent head-shadow ILD, rear/elevation pinna cutoffs (`listener_fwd`, `listener_up`),
     and exact wave-propagation radial Doppler shift (`f' = f * (c + v_l_toward) / (c + v_s_away)`)."""
+    var occ_cut = max(Float32(300.0), _hrtf_fin_f32(occlusion_cutoff_hz, CLEAR_CUTOFF_HZ))
+    var occ_gain = max(Float32(0.0), _hrtf_fin_f32(occlusion_gain, Float32(0.0)))
+    if not (
+        isfinite(listener_pos.x) and isfinite(listener_pos.y) and isfinite(listener_pos.z)
+        and isfinite(emitter_pos.x) and isfinite(emitter_pos.y) and isfinite(emitter_pos.z)
+    ):
+        return HrtfSpatialTargets(0.0, 0.0, 0.0, 0.0, occ_cut, occ_cut, 1.0, 0.0)
+
+    var l_vel = _hrtf_fin_vec3(listener_vel, Vec3())
+    var e_vel = _hrtf_fin_vec3(emitter_vel, Vec3())
+    var l_fwd = _hrtf_fin_vec3(listener_fwd, Vec3(0.0, 0.0, -1.0))
+    var l_right = _hrtf_fin_vec3(listener_right, Vec3(1.0, 0.0, 0.0))
+    var l_up = _hrtf_fin_vec3(listener_up, Vec3(0.0, 1.0, 0.0))
+    var sr = max(Float32(8000.0), min(Float32(384000.0), _hrtf_fin_f32(sample_rate, Float32(48000.0))))
+
     var rel = emitter_pos - listener_pos
     var dist = rel.length()
+    if not isfinite(dist):
+        return HrtfSpatialTargets(0.0, 0.0, 0.0, 0.0, occ_cut, occ_cut, 1.0, 0.0)
     if dist < Float32(0.02):
         return HrtfSpatialTargets(
-            Float32(0.70710678) * occlusion_gain,
-            Float32(0.70710678) * occlusion_gain,
+            Float32(0.70710678) * occ_gain,
+            Float32(0.70710678) * occ_gain,
             0.0,
             0.0,
-            occlusion_cutoff_hz,
-            occlusion_cutoff_hz,
+            occ_cut,
+            occ_cut,
             1.0,
             0.08,
         )
@@ -762,20 +813,24 @@ def compute_woodworth_hrtf(
     var dir = rel * inv_d
 
     # 1. Inverse-distance rolloff with smooth horizon fade
-    var rd = max(Float32(0.5), ref_dist)
-    var md = max(rd + Float32(5.0), max_dist)
+    var rd = max(Float32(0.5), _hrtf_fin_f32(ref_dist, Float32(15.0)))
+    var md = max(rd + Float32(5.0), _hrtf_fin_f32(max_dist, Float32(350.0)))
     var atten = rd / (rd + max(Float32(0.0), dist - rd))
     var horizon = Float32(1.0)
     if dist > md * Float32(0.8):
         horizon = max(Float32(0.0), Float32(1.0) - (dist - md * Float32(0.8)) / (md * Float32(0.2)))
-    var base_amp = atten * horizon * occlusion_gain
+    var base_amp = atten * horizon * occ_gain
+    if not isfinite(base_amp):
+        base_amp = Float32(0.0)
 
     # 2. Woodworth spherical-head ITD: tau = (a / c) * (|theta| + sin(|theta|))
-    var sin_az = max(Float32(-1.0), min(Float32(1.0), dir.dot(listener_right)))
+    var sin_az = max(Float32(-1.0), min(Float32(1.0), _hrtf_fin_f32(dir.dot(l_right), Float32(0.0))))
     var abs_sin = abs(sin_az)
     var cos_az = sqrt(max(Float32(0.0), Float32(1.0) - abs_sin * abs_sin))
     var abs_theta = atan2(abs_sin, cos_az)
-    var itd_samples = sample_rate * (WOODWORTH_HEAD_RADIUS_M / SPEED_OF_SOUND) * (abs_theta + abs_sin)
+    var itd_samples = sr * (WOODWORTH_HEAD_RADIUS_M / SPEED_OF_SOUND) * (abs_theta + abs_sin)
+    if not isfinite(itd_samples):
+        itd_samples = Float32(0.0)
 
     var delay_l: Float32
     var delay_r: Float32
@@ -794,8 +849,8 @@ def compute_woodworth_hrtf(
     var gain_r = (near_ear if sin_az >= Float32(0.0) else far_ear) * base_amp
 
     # 4. Pinna rear-cone & elevation spectral filtering + head-shadow HF roll-off on far ear
-    var fwd_dot = max(Float32(-1.0), min(Float32(1.0), dir.dot(listener_fwd)))
-    var up_dot = max(Float32(-1.0), min(Float32(1.0), dir.dot(listener_up)))
+    var fwd_dot = max(Float32(-1.0), min(Float32(1.0), _hrtf_fin_f32(dir.dot(l_fwd), Float32(0.0))))
+    var up_dot = max(Float32(-1.0), min(Float32(1.0), _hrtf_fin_f32(dir.dot(l_up), Float32(0.0))))
 
     var dist_norm = max(Float32(0.0), min(Float32(1.0), (dist - rd) / (md - rd)))
     var air_cutoff = Float32(20000.0) - dist_norm * Float32(11000.0)
@@ -806,20 +861,30 @@ def compute_woodworth_hrtf(
     # Subtle elevation cue (overhead sources retain brighter pinna notch ridge than below-chin)
     pinna_mul *= Float32(1.0) + Float32(0.12) * up_dot
 
-    var base_cutoff = min(occlusion_cutoff_hz, max(Float32(300.0), air_cutoff * pinna_mul))
+    var base_cutoff = min(occ_cut, max(Float32(300.0), air_cutoff * pinna_mul))
     var shadow_cut = max(Float32(300.0), base_cutoff * (Float32(1.0) - Float32(0.58) * abs_sin))
     var cut_l = shadow_cut if sin_az >= Float32(0.0) else base_cutoff
     var cut_r = base_cutoff if sin_az >= Float32(0.0) else shadow_cut
 
     # 5. Exact radial acoustic Doppler: f' = f * (c + v_listener_toward) / (c + v_source_away)
-    var v_l_toward = listener_vel.dot(dir)
-    var v_s_away = emitter_vel.dot(dir)
+    var v_l_toward = _hrtf_fin_f32(l_vel.dot(dir), Float32(0.0))
+    var v_s_away = _hrtf_fin_f32(e_vel.dot(dir), Float32(0.0))
     var c_num = max(Float32(35.0), SPEED_OF_SOUND + v_l_toward)
     var c_den = max(Float32(35.0), SPEED_OF_SOUND + v_s_away)
-    var doppler = max(Float32(0.25), min(Float32(4.0), c_num / c_den))
+    var doppler_raw = c_num / c_den
+    var doppler = max(Float32(0.25), min(Float32(4.0), doppler_raw)) if isfinite(doppler_raw) else Float32(1.0)
 
     var rev_send = Float32(0.06) + dist_norm * Float32(0.28)
-    return HrtfSpatialTargets(gain_l, gain_r, delay_l, delay_r, cut_l, cut_r, doppler, rev_send)
+    return HrtfSpatialTargets(
+        _hrtf_fin_f32(gain_l, Float32(0.0)),
+        _hrtf_fin_f32(gain_r, Float32(0.0)),
+        _hrtf_fin_f32(delay_l, Float32(0.0)),
+        _hrtf_fin_f32(delay_r, Float32(0.0)),
+        _hrtf_fin_f32(cut_l, occ_cut),
+        _hrtf_fin_f32(cut_r, occ_cut),
+        doppler,
+        _hrtf_fin_f32(rev_send, Float32(0.06)),
+    )
 
 
 # ==============================================================================

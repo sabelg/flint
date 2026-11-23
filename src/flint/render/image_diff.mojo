@@ -62,9 +62,11 @@ def compare_pixels(actual: List[UInt32], expected: List[UInt32], width: Int, hei
     var diff = ImageDiff()
     diff.width = width
     diff.height = height
-    var count = width * height
-    if len(actual) < count or len(expected) < count or count <= 0:
+    if width <= 0 or height <= 0 or width > 65536 or height > 65536:
         return diff^
+    if width > len(actual) // height or width > len(expected) // height:
+        return diff^
+    var count = width * height
     diff.same_size = True
     diff.image = List[UInt32](length=count, fill=0xFF000000)
     var total = 0

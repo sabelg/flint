@@ -9,7 +9,7 @@ Implements:
      (`RMF`) parallel-transport spline loft + `make_chamfered_girder_profile`, `make_curb_profile`,
      and `sweep_catenary_cable`.
 """
-from std.math import acos, cos, max, min, sin, sqrt
+from std.math import acos, cos, isfinite, max, min, sin, sqrt
 from flint.core.detmath import det_atan2
 from flint.core.math import Vec2, Vec3
 from flint.assets.model import NativeMesh
@@ -38,13 +38,17 @@ def _signed_area_2d(poly: List[Vec2]) -> Float32:
     return area2 * Float32(0.5)
 
 
-def _fillet_polygon_2d(poly_in: List[Vec2], radius: Float32, steps: Int) -> Tuple[List[Vec2], List[Vec2]]:
+def _fillet_polygon_2d(poly_in: List[Vec2], radius_in: Float32, steps: Int) -> Tuple[List[Vec2], List[Vec2]]:
     """Rounds polygon corners in 2D and returns `(filleted_points_ccw, outward_2d_normals)`."""
     var n_raw = len(poly_in)
     var pts = List[Vec2]()
     var nrms = List[Vec2]()
     if n_raw < 3:
         return (pts^, nrms^)
+    for i in range(n_raw):
+        if not (isfinite(poly_in[i].x) and isfinite(poly_in[i].y)):
+            return (pts^, nrms^)
+    var radius = radius_in if isfinite(radius_in) else Float32(0.0)
 
     # Ensure CCW winding in `(x, y)` so outward 2D normal of edge `d = (dx, dy)` is `(dy, -dx)`
     var poly = List[Vec2](capacity=n_raw)
@@ -121,11 +125,20 @@ def extrude_profile_beveled(
 ) -> NativeMesh:
     """Extrudes a 2D `(x, z)` polygon vertically from `y = 0` to `y = height` with smooth corner fillets
     and 2-step specular cap chamfers on both top and bottom caps."""
-    var filleted = _fillet_polygon_2d(polygon_2d, corner_fillet, fillet_steps)
+    if not isfinite(height) or height <= Float32(1e-5) or len(polygon_2d) < 3:
+        return NativeMesh()
+    for i in range(len(polygon_2d)):
+        if not (isfinite(polygon_2d[i].x) and isfinite(polygon_2d[i].y)):
+            return NativeMesh()
+    var safe_fillet = corner_fillet if isfinite(corner_fillet) else Float32(0.0)
+    var safe_chamfer = cap_chamfer if isfinite(cap_chamfer) else Float32(0.0)
+    var safe_rough = roughness if isfinite(roughness) else Float32(0.40)
+    var safe_metal = metallic if isfinite(metallic) else Float32(0.15)
+    var filleted = _fillet_polygon_2d(polygon_2d, safe_fillet, fillet_steps)
     ref prof = filleted[0]
     ref nrm2 = filleted[1]
     var m = len(prof)
-    if m < 3 or height <= Float32(1e-5):
+    if m < 3:
         return NativeMesh()
 
     # Compute centroid & conservative max inward inset sochamfer never inverts thin profiles
@@ -140,7 +153,7 @@ def extrude_profile_beveled(
         if prof[i].y > max_z: max_z = prof[i].y
     cen = cen * (Float32(1.0) / Float32(m))
     var min_span = max(Float32(0.002), min(max_x - min_x, max_z - min_z))
-    var ch = max(Float32(0.0), min(cap_chamfer, min(height * Float32(0.32), min_span * Float32(0.22))))
+    var ch = max(Float32(0.0), min(safe_chamfer, min(height * Float32(0.32), min_span * Float32(0.22))))
 
     # 6 vertical stations for 2-step specular cap chamfers:
     # 0: bottom cap rim (`y = 0, inset = ch`)
@@ -191,7 +204,7 @@ def extrude_profile_beveled(
         arc_u.append(perimeter)
     var inv_perim = Float32(1.0) / max(Float32(1e-4), perimeter)
 
-    var mb = MeshBuilder(base_color=base_color, roughness=roughness, metallic=metallic)
+    var mb = MeshBuilder(base_color=base_color, roughness=safe_rough, metallic=safe_metal)
     var stride = m + 1
     var ring_base = mb.mesh.vertex_count()
 
@@ -335,8 +348,10 @@ def build_lathed_wheel_assembly(
            twin spokes + center lug hub + recessed ventilated brake rotor disc.
     - `2`: `brake_caliper_mesh` (`~56` tris): Sculpted 6-piston Brembo caliper straddling the inner rotor.
     """
-    var r_tire = max(Float32(0.12), radius)
-    var hw = max(Float32(0.06), width * Float32(0.5))
+    var r_in = radius if isfinite(radius) else Float32(0.35)
+    var w_in = width if isfinite(width) else Float32(0.28)
+    var r_tire = max(Float32(0.12), r_in)
+    var hw = max(Float32(0.06), w_in * Float32(0.5))
     var r_rim = r_tire * Float32(0.68)
     var r_barrel_in = r_rim * Float32(0.84)
     var r_hub = r_rim * Float32(0.26)
@@ -564,6 +579,10 @@ def compute_rmf_frames(
     var tangs = List[Vec3](length=n, fill=Vec3(0.0, 0.0, 1.0))
     if n < 2:
         return (rights^, ups^, tangs^)
+    for i in range(n):
+        if not (isfinite(path_pts[i].x) and isfinite(path_pts[i].y) and isfinite(path_pts[i].z)):
+            return (rights^, ups^, tangs^)
+    var safe_up_hint = up_hint if (isfinite(up_hint.x) and isfinite(up_hint.y) and isfinite(up_hint.z)) else Vec3(0.0, 1.0, 0.0)
 
     for i in range(n):
         var t_dir: Vec3
@@ -581,7 +600,7 @@ def compute_rmf_frames(
 
     # Initial frame at station 0
     var t0 = tangs[0]
-    var ref_up = up_hint.normalized()
+    var ref_up = safe_up_hint.normalized()
     if ref_up.length_squared() < Float32(0.1) or abs(t0.dot(ref_up)) > Float32(0.95):
         ref_up = Vec3(0.0, 0.0, 1.0) if abs(t0.y) > Float32(0.9) else Vec3(0.0, 1.0, 0.0)
     var r0 = ref_up.cross(t0).normalized()
@@ -663,6 +682,15 @@ def sweep_profile_rmf_banked(
     var m_prof = len(profile_2d)
     if n_pts < 2 or m_prof < 2:
         return NativeMesh()
+    for i in range(n_pts):
+        if not (isfinite(path_pts[i].x) and isfinite(path_pts[i].y) and isfinite(path_pts[i].z)):
+            return NativeMesh()
+    for j in range(m_prof):
+        if not (isfinite(profile_2d[j].x) and isfinite(profile_2d[j].y)):
+            return NativeMesh()
+    var safe_up_hint = up_hint if (isfinite(up_hint.x) and isfinite(up_hint.y) and isfinite(up_hint.z)) else Vec3(0.0, 1.0, 0.0)
+    var safe_uv_u = uv_scale_u if isfinite(uv_scale_u) else Float32(1.0)
+    var safe_uv_v = uv_scale_v if isfinite(uv_scale_v) else Float32(1.0)
 
     # Compute 2D profile outward normals & arc-length UVs + concave pocket AO
     var prof_n2 = List[Vec2](length=m_prof, fill=Vec2(0.0, 1.0))
@@ -671,41 +699,62 @@ def sweep_profile_rmf_banked(
     prof_u.append(Float32(0.0))
 
     var ccw_sign = Float32(1.0)
-    if closed_profile and m_prof >= 3 and _signed_area_2d(profile_2d) < Float32(0.0):
-        ccw_sign = Float32(-1.0)
+    if closed_profile and m_prof >= 3:
+        var area2_64 = 0.0
+        for j in range(m_prof):
+            var a = profile_2d[j]
+            var b = profile_2d[(j + 1) % m_prof]
+            area2_64 += Float64(a.x) * Float64(b.y) - Float64(b.x) * Float64(a.y)
+        if area2_64 < 0.0:
+            ccw_sign = Float32(-1.0)
 
-    var p_cen = Vec2(0.0, 0.0)
-    var max_pr = Float32(1e-4)
+    var cen_x64 = 0.0
+    var cen_y64 = 0.0
     for j in range(m_prof):
-        p_cen = p_cen + profile_2d[j]
-    p_cen = p_cen * (Float32(1.0) / Float32(m_prof))
+        cen_x64 += Float64(profile_2d[j].x)
+        cen_y64 += Float64(profile_2d[j].y)
+    cen_x64 /= Float64(m_prof)
+    cen_y64 /= Float64(m_prof)
+    var p_cen = Vec2(Float32(cen_x64), Float32(cen_y64))
+    var max_pr64 = 1.0e-4
     for j in range(m_prof):
-        var r_j = (profile_2d[j] - p_cen).length()
-        if r_j > max_pr:
-            max_pr = r_j
+        var dx = Float64(profile_2d[j].x) - cen_x64
+        var dy = Float64(profile_2d[j].y) - cen_y64
+        var r_j64 = sqrt(dx * dx + dy * dy)
+        if r_j64 > max_pr64:
+            max_pr64 = r_j64
 
-    var acc_u = Float32(0.0)
+    var acc_u64 = 0.0
     for j in range(m_prof):
         var j_prev = (j + m_prof - 1) % m_prof if closed_profile else max(0, j - 1)
         var j_next = (j + 1) % m_prof if closed_profile else min(m_prof - 1, j + 1)
-        var e_a = _norm2d(profile_2d[j] - profile_2d[j_prev])
-        var e_b = _norm2d(profile_2d[j_next] - profile_2d[j])
+        var eax64 = Float64(profile_2d[j].x) - Float64(profile_2d[j_prev].x)
+        var eay64 = Float64(profile_2d[j].y) - Float64(profile_2d[j_prev].y)
+        var eal64 = sqrt(eax64 * eax64 + eay64 * eay64)
+        var e_a = Vec2(Float32(eax64 / eal64), Float32(eay64 / eal64)) if eal64 >= 1.0e-6 else Vec2(1.0, 0.0)
+        var ebx64 = Float64(profile_2d[j_next].x) - Float64(profile_2d[j].x)
+        var eby64 = Float64(profile_2d[j_next].y) - Float64(profile_2d[j].y)
+        var ebl64 = sqrt(ebx64 * ebx64 + eby64 * eby64)
+        var e_b = Vec2(Float32(ebx64 / ebl64), Float32(eby64 / ebl64)) if ebl64 >= 1.0e-6 else Vec2(1.0, 0.0)
         var na = Vec2(e_a.y, -e_a.x) * ccw_sign
         var nb = Vec2(e_b.y, -e_b.x) * ccw_sign
         prof_n2[j] = _norm2d(na + nb)
 
         # Recessed web cavities (closer to profile centroid & facing inward/downward) receive natural cavity AO
-        var rad_ratio = (profile_2d[j] - p_cen).length() / max_pr
-        var ao_f = Float32(0.58) + Float32(0.42) * min(Float32(1.0), rad_ratio)
+        var dx_c = Float64(profile_2d[j].x) - cen_x64
+        var dy_c = Float64(profile_2d[j].y) - cen_y64
+        var rad_ratio64 = sqrt(dx_c * dx_c + dy_c * dy_c) / max_pr64
+        var ao_f = Float32(0.58) + Float32(0.42) * min(Float32(1.0), Float32(rad_ratio64) if isfinite(rad_ratio64) else Float32(1.0))
         if prof_n2[j].y < Float32(-0.2):
             ao_f *= Float32(0.88)
-        prof_ao[j] = UInt8(max(95, min(255, Int(ao_f * Float32(255.0) + Float32(0.5)))))
+        var safe_ao = max(Float32(0.0), min(Float32(1.0), ao_f)) if isfinite(ao_f) else Float32(0.75)
+        prof_ao[j] = UInt8(max(95, min(255, Int(safe_ao * Float32(255.0) + Float32(0.5)))))
 
-        acc_u += (profile_2d[j_next] - profile_2d[j]).length()
-        prof_u.append(acc_u)
+        acc_u64 += ebl64
+        prof_u.append(Float32(min(3.4e38, acc_u64)))
 
-    var inv_perim = uv_scale_u / max(Float32(1e-4), acc_u)
-    var frames = compute_rmf_frames(path_pts, closed_loop=closed_loop, up_hint=up_hint)
+    var inv_perim64 = Float64(safe_uv_u) / max(1.0e-4, acc_u64)
+    var frames = compute_rmf_frames(path_pts, closed_loop=closed_loop, up_hint=safe_up_hint)
     ref rights = frames[0]
     ref ups = frames[1]
     ref tangs = frames[2]
@@ -715,16 +764,20 @@ def sweep_profile_rmf_banked(
     var mb = MeshBuilder(base_color=base_color, roughness=0.38, metallic=0.25)
     var base_v = mb.mesh.vertex_count()
 
-    var path_dist = Float32(0.0)
+    var path_dist64 = 0.0
     for s in range(ring_count):
         var si = s % n_pts
         if s > 0:
-            path_dist += (path_pts[si] - path_pts[(s - 1) % n_pts]).length()
+            var sip = (s - 1) % n_pts
+            var pdx = Float64(path_pts[si].x) - Float64(path_pts[sip].x)
+            var pdy = Float64(path_pts[si].y) - Float64(path_pts[sip].y)
+            var pdz = Float64(path_pts[si].z) - Float64(path_pts[sip].z)
+            path_dist64 += sqrt(pdx * pdx + pdy * pdy + pdz * pdz)
         var r_vec = rights[si]
         var u_vec = ups[si]
         if si < len(bank_angles_rad):
             var ba = bank_angles_rad[si]
-            if abs(ba) > Float32(1e-6):
+            if isfinite(ba) and abs(ba) > Float32(1e-6):
                 var cb = cos(ba)
                 var sb = sin(ba)
                 var nr = r_vec * cb + u_vec * sb
@@ -733,7 +786,8 @@ def sweep_profile_rmf_banked(
                 u_vec = nu
 
         var origin = path_pts[si]
-        var tv = path_dist * uv_scale_v
+        var tv64 = path_dist64 * Float64(safe_uv_v)
+        var tv = Float32(min(3.4e38, max(-3.4e38, tv64))) if isfinite(tv64) else Float32(0.0)
 
         for j in range(v_cols):
             var pj = j % m_prof
@@ -741,7 +795,8 @@ def sweep_profile_rmf_banked(
             var ln = prof_n2[pj]
             var wp = origin + r_vec * lp.x + u_vec * lp.y
             var wn = (r_vec * ln.x + u_vec * ln.y).normalized()
-            _ = mb.add_vertex(wp, wn, prof_u[j] * inv_perim, tv, ao=prof_ao[pj])
+            var tu = Float32(Float64(prof_u[j]) * inv_perim64)
+            _ = mb.add_vertex(wp, wn, tu, tv, ao=prof_ao[pj])
 
     var seg_u = m_prof if closed_profile else (m_prof - 1)
     for s in range(ring_count - 1):
@@ -761,21 +816,24 @@ def sweep_profile_rmf_banked(
             var u_vec = ups[si]
             if si < len(bank_angles_rad):
                 var ba = bank_angles_rad[si]
-                var cb = cos(ba); var sb = sin(ba)
-                var nr = r_vec * cb + u_vec * sb
-                var nu = u_vec * cb - r_vec * sb
-                r_vec = nr; u_vec = nu
+                if isfinite(ba):
+                    var cb = cos(ba); var sb = sin(ba)
+                    var nr = r_vec * cb + u_vec * sb
+                    var nu = u_vec * cb - r_vec * sb
+                    r_vec = nr; u_vec = nu
             var c_pos = path_pts[si] + r_vec * p_cen.x + u_vec * p_cen.y
             var c_v = mb.add_vertex(c_pos, cap_n, 0.5, 0.5, ao=UInt8(190))
             var cap_ring = List[Int](capacity=m_prof)
             for j in range(m_prof):
                 var lp = profile_2d[j]
+                var cap_u = Float32(0.5 + Float64(lp.x) / (max_pr64 * 2.0))
+                var cap_v = Float32(0.5 + Float64(lp.y) / (max_pr64 * 2.0))
                 cap_ring.append(
                     mb.add_vertex(
                         path_pts[si] + r_vec * lp.x + u_vec * lp.y,
                         cap_n,
-                        0.5 + lp.x / (max_pr * Float32(2.0)),
-                        0.5 + lp.y / (max_pr * Float32(2.0)),
+                        cap_u,
+                        cap_v,
                         ao=UInt8(210),
                     )
                 )
@@ -883,17 +941,24 @@ def sweep_catenary_cable(
     radial_sides: Int = 6,
 ) -> NativeMesh:
     """Sweeps a hanging catenary cable between `p0` and `p1` with `sag` vertical drop."""
+    if not (
+        isfinite(p0.x) and isfinite(p0.y) and isfinite(p0.z)
+        and isfinite(p1.x) and isfinite(p1.y) and isfinite(p1.z)
+    ):
+        return NativeMesh()
+    var safe_sag = sag if isfinite(sag) else Float32(0.0)
+    var safe_rad = radius if isfinite(radius) else Float32(0.018)
     var steps = max(3, segments)
     var sides = max(4, radial_sides)
     var path = List[Vec3](capacity=steps + 1)
     for i in range(steps + 1):
         var t = Float32(i) / Float32(steps)
         var base_p = p0 * (Float32(1.0) - t) + p1 * t
-        var drop = Float32(4.0) * sag * t * (Float32(1.0) - t)
+        var drop = Float32(4.0) * safe_sag * t * (Float32(1.0) - t)
         path.append(Vec3(base_p.x, base_p.y - drop, base_p.z))
 
     var circle = List[Vec2](capacity=sides)
-    var r = max(Float32(0.003), radius)
+    var r = max(Float32(0.003), safe_rad)
     for k in range(sides):
         var a = (Float32(k) / Float32(sides)) * _TAU
         circle.append(Vec2(cos(a) * r, sin(a) * r))

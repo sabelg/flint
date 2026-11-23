@@ -8,7 +8,7 @@ Implements:
      packing monotonic `[self_error_uf16, parent_error_uf16)` intervals into `meshlet_words[10]`
      for crack-free GPU screen-space pixel-error (`<= 1.0 px`) LOD selection!
 """
-from std.math import floor, max, min, sqrt
+from std.math import floor, isfinite, max, min, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.assets.model import NativeMesh
@@ -245,6 +245,12 @@ def _spatial_sort_triangles_sah(mesh: NativeMesh, in_indices: List[Int]) -> List
         var a = in_indices[ti * 3]; var b = in_indices[ti * 3 + 1]; var c = in_indices[ti * 3 + 2]
         if a < 0 or b < 0 or c < 0 or a >= v_count or b >= v_count or c >= v_count:
             continue
+        if not (
+            isfinite(mesh.positions[a * 3]) and isfinite(mesh.positions[a * 3 + 1]) and isfinite(mesh.positions[a * 3 + 2])
+            and isfinite(mesh.positions[b * 3]) and isfinite(mesh.positions[b * 3 + 1]) and isfinite(mesh.positions[b * 3 + 2])
+            and isfinite(mesh.positions[c * 3]) and isfinite(mesh.positions[c * 3 + 1]) and isfinite(mesh.positions[c * 3 + 2])
+        ):
+            continue
         valid_indices.append(a)
         valid_indices.append(b)
         valid_indices.append(c)
@@ -271,18 +277,20 @@ def _spatial_sort_triangles_sah(mesh: NativeMesh, in_indices: List[Int]) -> List
         if cen.y > bmax.y: bmax.y = cen.y
         if cen.z > bmax.z: bmax.z = cen.z
 
-    var ext = bmax - bmin
-    var sx = Float32(1023.0) / max(Float32(1e-5), ext.x)
-    var sy = Float32(1023.0) / max(Float32(1e-5), ext.y)
-    var sz = Float32(1023.0) / max(Float32(1e-5), ext.z)
+    var sx64 = 1023.0 / max(1.0e-5, Float64(bmax.x) - Float64(bmin.x))
+    var sy64 = 1023.0 / max(1.0e-5, Float64(bmax.y) - Float64(bmin.y))
+    var sz64 = 1023.0 / max(1.0e-5, Float64(bmax.z) - Float64(bmin.z))
 
     var keys = List[UInt32](length=n_tris, fill=0)
     var order = List[Int](length=n_tris, fill=0)
     for ti in range(n_tris):
         var c = centroids[ti]
-        var qx = UInt32(max(0, min(1023, Int((c.x - bmin.x) * sx))))
-        var qy = UInt32(max(0, min(1023, Int((c.y - bmin.y) * sy))))
-        var qz = UInt32(max(0, min(1023, Int((c.z - bmin.z) * sz))))
+        var fx64 = (Float64(c.x) - Float64(bmin.x)) * sx64
+        var fy64 = (Float64(c.y) - Float64(bmin.y)) * sy64
+        var fz64 = (Float64(c.z) - Float64(bmin.z)) * sz64
+        var qx = UInt32(max(0, min(1023, Int(max(0.0, min(1023.0, fx64))) if isfinite(fx64) else 0)))
+        var qy = UInt32(max(0, min(1023, Int(max(0.0, min(1023.0, fy64))) if isfinite(fy64) else 0)))
+        var qz = UInt32(max(0, min(1023, Int(max(0.0, min(1023.0, fz64))) if isfinite(fz64) else 0)))
         # Expand 10 bits -> 30-bit 3D Morton code
         qx = (qx | (qx << 16)) & 0x030000FF
         qx = (qx | (qx << 8)) & 0x0300F00F
@@ -787,6 +795,15 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
     `O(T)` canonical edge-hash boundary detection, and an indexed binary min-heap with lazy generation stamps."""
     var v_count = mesh.vertex_count()
     var raw_tris = len(mesh.indices) // 3
+    if v_count <= 0 or len(mesh.positions) < v_count * 3 or raw_tris <= 0:
+        return (NativeMesh(), Float32(0.0))
+    for vi in range(v_count):
+        if not (
+            isfinite(mesh.positions[vi * 3])
+            and isfinite(mesh.positions[vi * 3 + 1])
+            and isfinite(mesh.positions[vi * 3 + 2])
+        ):
+            return (NativeMesh(), Float32(0.0))
     if raw_tris <= target_tris or raw_tris <= 8 or v_count <= 4:
         return (mesh.copy(), Float32(0.0))
 
@@ -802,8 +819,8 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
         if py > pmax.y: pmax.y = py
         if pz > pmax.z: pmax.z = pz
 
-    var max_ext = max(Float32(1e-2), max(pmax.x - pmin.x, max(pmax.y - pmin.y, pmax.z - pmin.z)))
-    var inv_cell = Float32(4096.0) / max_ext
+    var max_ext64 = max(1.0e-2, max(Float64(pmax.x) - Float64(pmin.x), max(Float64(pmax.y) - Float64(pmin.y), Float64(pmax.z) - Float64(pmin.z))))
+    var inv_cell64 = 4096.0 / max_ext64
     var vhash_cap = _next_pow2_int(v_count * 2 + 16)
     var vhash_mask = vhash_cap - 1
     var vhash_head = List[Int](length=vhash_cap, fill=-1)
@@ -815,9 +832,9 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
 
     for vi in range(v_count):
         var p = Vec3(mesh.positions[vi * 3], mesh.positions[vi * 3 + 1], mesh.positions[vi * 3 + 2])
-        var fx = (p.x - pmin.x) * inv_cell + Float32(0.371)
-        var fy = (p.y - pmin.y) * inv_cell + Float32(0.519)
-        var fz = (p.z - pmin.z) * inv_cell + Float32(0.733)
+        var fx = Float32(max(-1.0e9, min(1.0e9, (Float64(p.x) - Float64(pmin.x)) * inv_cell64 + 0.371)))
+        var fy = Float32(max(-1.0e9, min(1.0e9, (Float64(p.y) - Float64(pmin.y)) * inv_cell64 + 0.519)))
+        var fz = Float32(max(-1.0e9, min(1.0e9, (Float64(p.z) - Float64(pmin.z)) * inv_cell64 + 0.733)))
         var qx = Int(floor(fx))
         var qy = Int(floor(fy))
         var qz = Int(floor(fz))

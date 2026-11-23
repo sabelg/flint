@@ -7,6 +7,7 @@ Combines:
 - Multi-font `FontFallbackChain` (`List[TrueTypeFont]`) with per-font `units_per_em` / ascent scaling
 """
 from std.collections import Dict
+from std.math import isfinite
 from flint.text.utf8 import decode_utf8
 from flint.text.ttf import (
     TrueTypeFont,
@@ -113,14 +114,15 @@ struct FontFallbackChain(Copyable, Movable):
         var kerning: Dict[Int, Float32],
     ):
         self.has_baked_primary = True
-        self.baked_bake_px = bake_px if bake_px > Float32(0.0) else Float32(1.0)
+        self.baked_bake_px = bake_px if (isfinite(bake_px) and bake_px > Float32(0.0)) else Float32(1.0)
         self.baked_cp_to_gid = cp_to_gid^
         self.baked_advances = advances^
         self.baked_kerning = kerning^
 
     def add_fallback_scaled(mut self, var font: TrueTypeFont, metric_scale: Float32):
+        var safe_scale = metric_scale if (isfinite(metric_scale) and metric_scale > Float32(0.0)) else Float32(1.0)
         self.fonts.append(font^)
-        self.metric_scales.append(metric_scale)
+        self.metric_scales.append(safe_scale)
 
     def add_fallback(mut self, var font: TrueTypeFont, match_ascent: Bool = False):
         var mscale: Float32 = 1.0
@@ -128,7 +130,9 @@ struct FontFallbackChain(Copyable, Movable):
             var p_asc = Float32(max(1, self.fonts[0].ascender)) / Float32(max(1, self.fonts[0].units_per_em))
             var f_asc = Float32(max(1, font.ascender)) / Float32(max(1, font.units_per_em))
             if f_asc > Float32(1.0e-5):
-                mscale = p_asc / f_asc
+                var cand = p_asc / f_asc
+                if isfinite(cand) and cand > Float32(0.0):
+                    mscale = cand
         self.fonts.append(font^)
         self.metric_scales.append(mscale)
 
@@ -156,10 +160,14 @@ struct FontFallbackChain(Copyable, Movable):
         return (0, 0)
 
     def scale_for(self, font_idx: Int, px: Float32) -> Float32:
-        if font_idx < 0 or font_idx >= len(self.fonts):
+        if font_idx < 0 or font_idx >= len(self.fonts) or not isfinite(px) or px <= Float32(0.0):
             return 0.0
         var upem = max(1, self.fonts[font_idx].units_per_em)
-        return (px * self.metric_scales[font_idx]) / Float32(upem)
+        var mscale = self.metric_scales[font_idx]
+        if not isfinite(mscale) or mscale <= Float32(0.0):
+            return 0.0
+        var s = (px * mscale) / Float32(upem)
+        return s if isfinite(s) else Float32(0.0)
 
 
 def is_bidi_format_code(code: Int) -> Bool:
@@ -243,7 +251,7 @@ struct TextShaper(Copyable, Movable):
         """Shape a single BiDi level slice `[start, end)` in logical order, then
         reverse shaped glyphs if `level` is odd (RTL) to produce visual L-to-R runs."""
         var runs = List[ShapedRun]()
-        if end <= start or self.chain.count() == 0:
+        if end <= start or self.chain.count() == 0 or not isfinite(px) or px <= Float32(0.0):
             return runs^
 
         var rtl = (level & 1) == 1
@@ -377,7 +385,10 @@ struct TextShaper(Copyable, Movable):
             var srun = ShapedRun(level, sc)
             var m = len(final_gsub)
             var use_baked_primary = (fi == 0 and (fi >= self.chain.count() or not self.chain.fonts[0].valid) and self.chain.has_baked_primary)
-            var b_scale = px / max(Float32(1.0), self.chain.baked_bake_px)
+            var safe_bake_px = self.chain.baked_bake_px if (isfinite(self.chain.baked_bake_px) and self.chain.baked_bake_px >= Float32(1.0)) else Float32(1.0)
+            var b_scale = px / safe_bake_px
+            if not isfinite(b_scale):
+                b_scale = Float32(0.0)
             for g_i in range(m):
                 var gid = final_gsub[g_i].glyph_id
                 var cl = final_gsub[g_i].cluster
@@ -407,6 +418,8 @@ struct TextShaper(Copyable, Movable):
                     adv = self.chain.fonts[fi].advance(gid) * scale if (fi >= 0 and fi < self.chain.count()) else Float32(0.0)
                     if g_i + 1 < m and fi >= 0 and fi < self.chain.count():
                         adv += self.chain.fonts[fi].kerning(gid, final_gsub[g_i + 1].glyph_id) * scale
+                if not isfinite(adv):
+                    adv = Float32(0.0)
                 srun.glyphs.append(ShapedGlyph(cp, gid, fi, cl, adv, 0.0, 0.0, 0.0, rtl))
                 srun.width += adv
 
@@ -450,7 +463,7 @@ struct TextShaper(Copyable, Movable):
         base_dir: Int = BIDI_AUTO,
     ) -> List[ShapedRun]:
         var out = List[ShapedRun]()
-        if len(codes) == 0 or self.chain.count() == 0:
+        if len(codes) == 0 or self.chain.count() == 0 or not isfinite(px) or px <= Float32(0.0):
             return out^
         var resolved = resolve_bidi(codes, base_dir)
         var arabic_forms = compute_arabic_forms(codes)

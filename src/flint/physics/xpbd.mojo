@@ -11,7 +11,7 @@ Upgrades in v4:
    and torques `r_b x J` back into rigid body linear and angular velocities.
 """
 from std.collections import List
-from std.math import sqrt, max, min, abs
+from std.math import sqrt, max, min, abs, isfinite
 from flint.core.math import Vec3, Quat
 from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.physics.solver_bodies import SolverBodies, rotate_vec
@@ -429,30 +429,39 @@ struct ParticleChain(Copyable, Movable):
         iterations: Int = 2,
     ):
         """Advances one XPBD substep of size `h` with two-way `RigidAttachment` impulse feedback."""
-        if h <= Float32(1.0e-8):
+        if not isfinite(h) or h <= Float32(1.0e-8):
             return
-        var iters = max(1, iterations)
-        var alpha_tilde = self.compliance / (h * h)
+        var safe_h = min(h, Float32(0.1))
+        var safe_sub_t = sub_t if isfinite(sub_t) else Float32(0.0)
+        var safe_gravity = gravity if isfinite(gravity) else Float32(9.81)
+        var iters = max(1, min(64, iterations))
+        var alpha_tilde = self.compliance / (safe_h * safe_h)
 
         self._ensure_lambdas()
         for a_i in range(len(attachments)):
             attachments[a_i].lam = Float32(0.0)
 
         for i in range(len(self.position)):
+            if not (isfinite(self.position[i].x) and isfinite(self.position[i].y) and isfinite(self.position[i].z)):
+                self.position[i] = Vec3()
+            if not (isfinite(self.velocity[i].x) and isfinite(self.velocity[i].y) and isfinite(self.velocity[i].z)):
+                self.velocity[i] = Vec3()
             self.previous[i] = self.position[i]
             if self.inv_mass[i] == 0:
                 continue
             var v = self.velocity[i]
-            v.y -= gravity * h
+            v.y -= safe_gravity * safe_h
             if i < len(wind):
-                v = v + (wind[i] - v) * min(Float32(1), self.wind_drag * h)
-            v = v * max(Float32(0), 1 - self.damping * h)
+                var wv = wind[i]
+                if isfinite(wv.x) and isfinite(wv.y) and isfinite(wv.z):
+                    v = v + (wv - v) * min(Float32(1), self.wind_drag * safe_h)
+            v = v * max(Float32(0), 1 - self.damping * safe_h)
             self.velocity[i] = v
-            self.position[i] = self.position[i] + v * h
+            self.position[i] = self.position[i] + v * safe_h
 
         for _ in range(iters):
             for a_i in range(len(attachments)):
-                _project_rigid_attachment(self.position, self.inv_mass, attachments[a_i], bodies, h, sub_t)
+                _project_rigid_attachment(self.position, self.inv_mass, attachments[a_i], bodies, safe_h, safe_sub_t)
 
             for i in range(len(self.rest)):
                 var wa = self.inv_mass[i]
@@ -480,11 +489,11 @@ struct ParticleChain(Copyable, Movable):
                 if _particle_attached_to_collider(i, c, attachments):
                     continue
                 var p_i = self.position[i]
-                if _collide_particle_with_collider(p_i, Float32(0.0), self.inv_mass[i], c, bodies, h, sub_t):
+                if _collide_particle_with_collider(p_i, Float32(0.0), self.inv_mass[i], c, bodies, safe_h, safe_sub_t):
                     self.position[i] = p_i
             if self.position[i].y < self.floor:
                 self.position[i].y = self.floor
-            self.velocity[i] = (self.position[i] - self.previous[i]) * (Float32(1.0) / h)
+            self.velocity[i] = (self.position[i] - self.previous[i]) * (Float32(1.0) / safe_h)
 
     def step_coupled(
         mut self,
@@ -498,10 +507,10 @@ struct ParticleChain(Copyable, Movable):
         iterations: Int = 2,
     ):
         """Advances the chain with two-way `RigidAttachment` impulse feedback into `SolverBodies`."""
-        if dt <= Float32(1.0e-8):
+        if not isfinite(dt) or dt <= Float32(1.0e-8):
             return
-        var n = max(1, substeps)
-        var h = dt / Float32(n)
+        var n = max(1, min(64, substeps))
+        var h = min(dt, Float32(1.0)) / Float32(n)
         for sub in range(n):
             self.step_substep_coupled(
                 h, Float32(sub) * h, gravity, wind, colliders, attachments, bodies, iterations
@@ -644,6 +653,8 @@ struct ParticleMesh(Copyable, Movable):
 
     def place(mut self, index: Int, at: Vec3):
         """Puts a particle somewhere at rest (a reset)."""
+        if index < 0 or index >= len(self.position):
+            return
         self.position[index] = at
         self.previous[index] = at
         self.velocity[index] = Vec3()
@@ -713,34 +724,45 @@ struct ParticleMesh(Copyable, Movable):
         iterations: Int = 2,
     ):
         """Advances one XPBD mesh substep of size `h` with two-way `RigidAttachment` impulse feedback."""
-        if h <= Float32(1.0e-8):
+        if not isfinite(h) or h <= Float32(1.0e-8):
             return
-        var iters = max(1, iterations)
-        var inv_h2 = Float32(1.0) / (h * h)
-        var g = gravity * self.gravity_scale
+        var safe_h = min(h, Float32(0.1))
+        var safe_sub_t = sub_t if isfinite(sub_t) else Float32(0.0)
+        var safe_gravity = gravity if isfinite(gravity) else Float32(9.81)
+        var iters = max(1, min(64, iterations))
+        var inv_h2 = Float32(1.0) / (safe_h * safe_h)
+        var g = safe_gravity * self.gravity_scale
 
         self._ensure_lambdas()
         for a_i in range(len(attachments)):
             attachments[a_i].lam = Float32(0.0)
 
         for i in range(len(self.position)):
+            if not (isfinite(self.position[i].x) and isfinite(self.position[i].y) and isfinite(self.position[i].z)):
+                self.position[i] = Vec3()
+            if not (isfinite(self.velocity[i].x) and isfinite(self.velocity[i].y) and isfinite(self.velocity[i].z)):
+                self.velocity[i] = Vec3()
             self.previous[i] = self.position[i]
             if self.inv_mass[i] == 0:
                 continue
-            var v = self.velocity[i] + self.accel[i] * h
-            v.y -= g * h
+            var ac = self.accel[i]
+            var safe_ac = ac if (isfinite(ac.x) and isfinite(ac.y) and isfinite(ac.z)) else Vec3()
+            var v = self.velocity[i] + safe_ac * safe_h
+            v.y -= g * safe_h
             if i < len(wind) and self.wind_drag > 0:
-                v = v + (wind[i] - v) * min(Float32(1), self.wind_drag * h)
-            v = v * max(Float32(0), 1 - self.damping * h)
+                var wv = wind[i]
+                if isfinite(wv.x) and isfinite(wv.y) and isfinite(wv.z):
+                    v = v + (wv - v) * min(Float32(1), self.wind_drag * safe_h)
+            v = v * max(Float32(0), 1 - self.damping * safe_h)
             self.velocity[i] = v
-            var p = self.position[i] + v * h
+            var p = self.position[i] + v * safe_h
             if self.power[i] > 0:
-                p = p + (self.target[i] - p) * min(Float32(1), self.power[i] * h)
+                p = p + (self.target[i] - p) * min(Float32(1), self.power[i] * safe_h)
             self.position[i] = p
 
         for _ in range(iters):
             for a_i in range(len(attachments)):
-                _project_rigid_attachment(self.position, self.inv_mass, attachments[a_i], bodies, h, sub_t)
+                _project_rigid_attachment(self.position, self.inv_mass, attachments[a_i], bodies, safe_h, safe_sub_t)
 
             for k in range(len(self.link_a)):
                 var a = self.link_a[k]
@@ -779,7 +801,7 @@ struct ParticleMesh(Copyable, Movable):
                 if _particle_attached_to_collider(i, c, attachments):
                     continue
                 var p_i = self.position[i]
-                if _collide_particle_with_collider(p_i, self.radius[i], self.inv_mass[i], c, bodies, h, sub_t):
+                if _collide_particle_with_collider(p_i, self.radius[i], self.inv_mass[i], c, bodies, safe_h, safe_sub_t):
                     self.position[i] = p_i
             var ground = self.floor[i] + self.radius[i]
             var on_floor = False
@@ -787,11 +809,11 @@ struct ParticleMesh(Copyable, Movable):
                 self.position[i].y = ground
                 on_floor = True
                 self.touching += 1
-            var v = (self.position[i] - self.previous[i]) * (Float32(1.0) / h)
+            var v = (self.position[i] - self.previous[i]) * (Float32(1.0) / safe_h)
             if on_floor:
                 var keep = max(Float32(0), 1 - self.friction)
                 v = Vec3(v.x * keep, max(Float32(0), v.y), v.z * keep)
-                self.position[i] = self.previous[i] + v * h
+                self.position[i] = self.previous[i] + v * safe_h
                 if self.position[i].y < ground:
                     self.position[i].y = ground
             self.velocity[i] = v
@@ -808,10 +830,10 @@ struct ParticleMesh(Copyable, Movable):
         iterations: Int = 2,
     ):
         """Advances the mesh with two-way `RigidAttachment` impulse feedback into `SolverBodies`."""
-        if dt <= Float32(1.0e-8):
+        if not isfinite(dt) or dt <= Float32(1.0e-8):
             return
-        var n = max(1, substeps)
-        var h = dt / Float32(n)
+        var n = max(1, min(64, substeps))
+        var h = min(dt, Float32(1.0)) / Float32(n)
         self.steps_run += 1
 
         for sub in range(n):

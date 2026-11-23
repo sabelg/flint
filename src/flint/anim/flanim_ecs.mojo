@@ -15,7 +15,7 @@ Implements:
    and re-rooting settled poses with `0.0 mm` world pelvis snap via `Inertializer`.
 """
 from std.collections import List
-from std.math import abs, floor, max, min, sqrt
+from std.math import abs, floor, isfinite, max, min, sqrt
 from flint.core.math import Vec3
 from flint.core.transform import Quat, Mat4, trs
 from flint.core.serial import BlobWriter, BlobReader, fourcc
@@ -1147,7 +1147,11 @@ def compute_volume_preserving_smear_scale(
     max_stretch: Float32 = 3.2,
 ) -> Vec3:
     """Computes volume-preserving `(sx, 1/sqrt(sx), 1/sqrt(sx))` stretch/squash along a bone's primary axis."""
-    var sx = max(min_squash, min(max_stretch, stretch_x))
-    var inv_perp = max(min_squash, Float32(1.0) / sqrt(max(Float32(0.05), sx)))
+    if not (isfinite(stretch_x) and isfinite(min_squash) and isfinite(max_stretch)):
+        return Vec3(Float32(1.0), Float32(1.0), Float32(1.0))
+    var lo = max(Float32(0.05), min_squash)
+    var hi = max(lo, max_stretch)
+    var sx = max(lo, min(hi, stretch_x))
+    var inv_perp = max(lo, Float32(1.0) / sqrt(max(Float32(0.05), sx)))
     return Vec3(sx, inv_perp, inv_perp)
 

@@ -11,7 +11,7 @@ Implements:
    zero-creep hill-hold on slopes and physically accurate transient turn-in response.
 4. Dynamic normal load sensitivity `mu(Fz)` and pneumatic trail self-aligning torque `Mz`.
 """
-from std.math import sqrt, max, min, abs
+from std.math import sqrt, max, min, abs, isfinite
 from flint.core.detmath import det_sin, det_cos, det_atan
 
 
@@ -99,36 +99,42 @@ struct PacejkaTire(Copyable, ImplicitlyCopyable, Movable):
         `Fx = (sigma_x* / sigma*) * Fx0(sigma* * kappa_p)`,
         `Fy = (sigma_y* / sigma*) * Fy0(sigma* * alpha_p)`."""
         _ = speed
-        var fz = max(Float32(0.0), normal_load)
-        if fz <= Float32(1.0):
+        if not isfinite(normal_load) or normal_load <= Float32(1.0):
             return (Float32(0.0), Float32(0.0), Float32(0.0))
+        var fz = min(Float32(1.0e12), normal_load)
+        var safe_sr = max(Float32(-1.0e4), min(Float32(1.0e4), slip_ratio)) if isfinite(slip_ratio) else Float32(0.0)
+        var safe_sa = slip_angle if isfinite(slip_angle) else Float32(0.0)
 
         var peak_force = self._peak_force(fz)
-        var clamped_alpha = max(Float32(-1.53), min(Float32(1.53), slip_angle))
+        var clamped_alpha = max(Float32(-1.53), min(Float32(1.53), safe_sa))
         var tan_alpha = det_sin(clamped_alpha) / max(Float32(1.0e-5), det_cos(clamped_alpha))
 
         var kp = max(Float32(1.0e-4), self.params.kappa_peak)
         var ap = max(Float32(1.0e-4), self.params.alpha_peak)
-        var sx = slip_ratio / kp
-        var sy = tan_alpha / ap
-        var sigma = sqrt(sx * sx + sy * sy)
+        var sx64 = Float64(safe_sr) / Float64(kp)
+        var sy64 = Float64(tan_alpha) / Float64(ap)
+        var sigma64 = sqrt(sx64 * sx64 + sy64 * sy64)
 
         var fx: Float32
         var fy: Float32
-        if sigma > Float32(1.0e-6):
-            var inv_sigma = Float32(1.0) / sigma
-            var fx0 = self._pure_magic(peak_force, sigma * kp)
-            var fy0 = self._pure_magic(peak_force, sigma * ap)
-            fx = (sx * inv_sigma) * fx0
-            fy = (sy * inv_sigma) * fy0
+        if sigma64 > 1.0e-6 and isfinite(sigma64):
+            var inv_sigma = Float32(1.0 / sigma64)
+            var sigma_clamped = Float32(min(1.0e6, sigma64))
+            var fx0 = self._pure_magic(peak_force, sigma_clamped * kp)
+            var fy0 = self._pure_magic(peak_force, sigma_clamped * ap)
+            fx = Float32(sx64 / sigma64) * fx0
+            fy = Float32(sy64 / sigma64) * fy0
+            _ = inv_sigma
         else:
             var lin_k = peak_force * self.params.B * self.params.C
-            fx = lin_k * slip_ratio
+            fx = lin_k * safe_sr
             fy = lin_k * tan_alpha
 
         var cos_trail = det_cos(Float32(1.4) * det_atan(Float32(7.5) * clamped_alpha))
         var trail = self.params.pneumatic_trail_0 * max(Float32(0.0), cos_trail)
         var mz = -trail * fy
+        if not (isfinite(fx) and isfinite(fy) and isfinite(mz)):
+            return (Float32(0.0), Float32(0.0), Float32(0.0))
         return (fx, fy, mz)
 
     def calc_forces_bristle(
@@ -143,36 +149,48 @@ struct PacejkaTire(Copyable, ImplicitlyCopyable, Movable):
     ) -> Tuple[Float32, Float32, Float32]:
         """Updates semi-implicit elastoplastic tire bristle deflection `(bristle_x, bristle_y)`
         and evaluates combined-slip `(Fx, Fy, Mz)` with zero-creep hill-hold stability."""
-        var fz = max(Float32(0.0), normal_load)
+        if not isfinite(bristle_x):
+            bristle_x = Float32(0.0)
+        if not isfinite(bristle_y):
+            bristle_y = Float32(0.0)
+        if not (
+            isfinite(normal_load) and isfinite(dt) and dt > Float32(0.0)
+            and isfinite(v_long) and isfinite(v_lat) and isfinite(tire_v)
+        ):
+            return (Float32(0.0), Float32(0.0), Float32(0.0))
+        var fz = max(Float32(0.0), min(Float32(1.0e12), normal_load))
         if fz <= Float32(1.0):
             bristle_x = Float32(0.0)
             bristle_y = Float32(0.0)
             return (Float32(0.0), Float32(0.0), Float32(0.0))
 
+        var safe_dt64 = min(0.5, Float64(dt))
         var lx = max(Float32(0.02), self.params.relaxation_len_x)
         var ly = max(Float32(0.02), self.params.relaxation_len_y)
         var kp = max(Float32(1.0e-4), self.params.kappa_peak)
         var ap = max(Float32(1.0e-4), self.params.alpha_peak)
 
-        var v_sx = tire_v - v_long
-        var v_sy = -v_lat
-        var roll_spd = abs(v_long)
+        var v_sx64 = Float64(tire_v) - Float64(v_long)
+        var v_sy64 = -Float64(v_lat)
+        var roll_spd64 = abs(Float64(v_long))
 
-        # Semi-implicit bristle advection/relaxation update (unconditionally stable for any dt & speed)
-        var bx = (bristle_x + dt * v_sx) / (Float32(1.0) + dt * (roll_spd / lx))
-        var by = (bristle_y + dt * v_sy) / (Float32(1.0) + dt * (roll_spd / ly))
+        # Semi-implicit bristle advection/relaxation update in Float64 (overflow-safe)
+        var bx64 = (Float64(bristle_x) + safe_dt64 * v_sx64) / (1.0 + safe_dt64 * (roll_spd64 / Float64(lx)))
+        var by64 = (Float64(bristle_y) + safe_dt64 * v_sy64) / (1.0 + safe_dt64 * (roll_spd64 / Float64(ly)))
 
-        # Elastoplastic saturation cap: prevents unbounded windup at standstill while allowing full slip at speed
-        var low_blend = min(Float32(1.0), roll_spd / Float32(1.5))
-        var max_sigma = Float32(1.0) + low_blend * Float32(24.0)
-        var sx_b = bx / (lx * kp)
-        var sy_b = by / (ly * ap)
+        # Elastoplastic saturation cap
+        var low_blend = min(1.0, roll_spd64 / 1.5)
+        var max_sigma = 1.0 + low_blend * 24.0
+        var sx_b = bx64 / (Float64(lx) * Float64(kp))
+        var sy_b = by64 / (Float64(ly) * Float64(ap))
         var sig_b = sqrt(sx_b * sx_b + sy_b * sy_b)
-        if sig_b > max_sigma:
+        if sig_b > max_sigma and sig_b > 0.0:
             var scale = max_sigma / sig_b
-            bx *= scale
-            by *= scale
+            bx64 *= scale
+            by64 *= scale
 
+        var bx = Float32(bx64) if isfinite(bx64) else Float32(0.0)
+        var by = Float32(by64) if isfinite(by64) else Float32(0.0)
         bristle_x = bx
         bristle_y = by
 
@@ -184,18 +202,20 @@ struct PacejkaTire(Copyable, ImplicitlyCopyable, Movable):
         var mz = forces[2]
 
         # Critical bristle structural damping near standstill for dead-zero hill-hold
-        var spd2d = sqrt(v_long * v_long + v_lat * v_lat)
-        if spd2d < Float32(1.5):
-            var damp_w = Float32(1.0) - spd2d / Float32(1.5)
-            var load_scale = fz / max(Float32(500.0), self.params.nominal_load)
-            var c_visc = Float32(3200.0) * load_scale * damp_w
-            fx += c_visc * v_sx
-            fy += c_visc * v_sy
-            var peak = self._peak_force(fz)
-            var mag2 = fx * fx + fy * fy
-            if mag2 > peak * peak:
-                var clamp_s = peak / sqrt(mag2)
-                fx *= clamp_s
-                fy *= clamp_s
+        var spd2d64 = sqrt(Float64(v_long) * Float64(v_long) + Float64(v_lat) * Float64(v_lat))
+        if spd2d64 < 1.5:
+            var damp_w = 1.0 - spd2d64 / 1.5
+            var load_scale = Float64(fz) / Float64(max(Float32(500.0), self.params.nominal_load))
+            var c_visc = 3200.0 * load_scale * damp_w
+            var fx64 = Float64(fx) + c_visc * v_sx64
+            var fy64 = Float64(fy) + c_visc * v_sy64
+            var peak = Float64(self._peak_force(fz))
+            var mag = sqrt(fx64 * fx64 + fy64 * fy64)
+            if mag > peak and mag > 0.0:
+                var clamp_s = peak / mag
+                fx64 *= clamp_s
+                fy64 *= clamp_s
+            fx = Float32(fx64) if isfinite(fx64) else Float32(0.0)
+            fy = Float32(fy64) if isfinite(fy64) else Float32(0.0)
 
         return (fx, fy, mz)

@@ -9,6 +9,7 @@ the operators listed in `op_code`. Unsupported operators fail at load time, not 
 """
 
 from std.collections import Dict
+from std.math import isfinite
 from std.time import perf_counter_ns
 from std.ffi import external_call
 from flint.core.jobs import JobPool, default_worker_count
@@ -499,7 +500,7 @@ struct OnnxModel(Movable):
                 if dim <= 0 or m > 0x7FFFFFFF // dim:
                     return Tensor()
                 m *= dim
-            if m > 0x7FFFFFFF // max(kk, n):
+            if m > 0x7FFFFFFF // max(kk, n) or m > MAX_RANGE_ELEMS // max(1, n):
                 return Tensor()
             var s = x.shape.copy()
             s[len(s) - 1] = n
@@ -521,7 +522,7 @@ struct OnnxModel(Movable):
             var n = w.shape[0] if tb else w.shape[1]
             if bk != kk or m <= 0 or kk <= 0 or n <= 0:
                 return Tensor()
-            if m > 0x7FFFFFFF // max(kk, n):
+            if m > 0x7FFFFFFF // max(kk, n) or m > MAX_RANGE_ELEMS // max(1, n):
                 return Tensor()
             var ci = self._in(k, 2)
             var bias = 0
@@ -706,9 +707,12 @@ struct OnnxModel(Movable):
                 if node.attr_i("num_outputs", 0) != 0:
                     if node.attr_i("num_outputs", 0) != count:
                         raise Error("Split: num_outputs mismatches graph outputs")
-                    var width = (x.shape[axis] + count - 1) // count
-                    sizes = List[Int](length=count, fill=width)
-                    sizes[count - 1] = x.shape[axis] - width * (count - 1)
+                    var dim = x.shape[axis]
+                    var base = dim // count
+                    var rem = dim % count
+                    sizes = List[Int](capacity=count)
+                    for si in range(count):
+                        sizes.append(base + 1 if si < rem else base)
                 elif x.shape[axis] % count != 0:
                     raise Error("Split: uneven chunks require explicit sizes")
                 else:
@@ -757,18 +761,19 @@ struct OnnxModel(Movable):
             var ai = self._in(k, 1)
             if ai >= 0:
                 axes = self.values[ai].int_list()
+            var seen = List[Bool](length=x.rank(), fill=False)
             for a in axes:
                 var na = norm_axis(a, x.rank())
                 if na < 0 or na >= x.rank():
                     raise Error("Squeeze: axis " + String(a) + " out of range for rank " + String(x.rank()))
+                if seen[na]:
+                    raise Error("Squeeze: duplicate axis " + String(a))
+                if x.shape[na] != 1:
+                    raise Error("Squeeze: axis " + String(a) + " has size " + String(x.shape[na]) + " != 1")
+                seen[na] = True
             var s = List[Int]()
             for d in range(x.rank()):
-                var drop = False
-                if len(axes) == 0:
-                    drop = x.shape[d] == 1
-                for a in axes:
-                    if norm_axis(a, x.rank()) == d:
-                        drop = True
+                var drop = (x.shape[d] == 1) if len(axes) == 0 else seen[d]
                 if not drop:
                     s.append(x.shape[d])
             out.append(x.reshaped(s^))
@@ -842,6 +847,8 @@ struct OnnxModel(Movable):
         elif op == OP_CAST:
             out.append(cast(x, node.attr_i("to", DT_F32)))
         elif op == OP_CONSTANT_OF_SHAPE:
+            if not x.has_valid_storage():
+                raise Error("ConstantOfShape: invalid shape tensor storage")
             var s = x.int_list()
             for dim in s:
                 if dim < 0:
@@ -913,24 +920,24 @@ struct OnnxModel(Movable):
             out.append(argmax(x, node.attr_i("axis", 0), node.attr_i("keepdims", 1) != 0))
         elif op == OP_TOPK:
             ref kt = self.values[self._req_in(k, 1)]
-            if kt.numel() == 0:
-                raise Error("TopK: empty k tensor")
+            if not kt.has_valid_storage() or kt.numel() == 0:
+                raise Error("TopK: empty or invalid k tensor")
             var kk = kt.int_at(0)
             var res = topk(x, kk, node.attr_i("axis", -1), node.attr_i("largest", 1) != 0)
             for t in res:
                 out.append(t.copy())
         elif op == OP_CUMSUM:
             ref at = self.values[self._req_in(k, 1)]
-            if at.numel() == 0:
-                raise Error("CumSum: empty axis tensor")
+            if not at.has_valid_storage() or at.numel() == 0:
+                raise Error("CumSum: empty or invalid axis tensor")
             out.append(cumsum(x, at.int_at(0), node.attr_i("exclusive", 0) != 0,
                               node.attr_i("reverse", 0) != 0))
         elif op == OP_ONEHOT:
             if norm_axis(node.attr_i("axis", -1), x.rank() + 1) != x.rank():
                 raise Error("OneHot: only axis=-1 is supported")
             ref dt = self.values[self._req_in(k, 1)]
-            if dt.numel() == 0:
-                raise Error("OneHot: empty depth tensor")
+            if not dt.has_valid_storage() or dt.numel() == 0:
+                raise Error("OneHot: empty or invalid depth tensor")
             out.append(onehot(x, dt.int_at(0), self.values[self._req_in(k, 2)]))
         elif op == OP_RESIZE:
             if node.attr_s("mode") != "nearest" or node.attr_s("coordinate_transformation_mode") != "asymmetric" \
@@ -940,21 +947,52 @@ struct OnnxModel(Movable):
             var zi = self._in(k, 3)
             var si = self._in(k, 2)
             if zi >= 0 and self.values[zi].numel() > 0:
-                s = self.values[zi].int_list()
+                if not self.values[zi].has_valid_storage():
+                    raise Error("Resize: sizes tensor has invalid storage")
+                if self.values[zi].numel() != x.rank():
+                    raise Error("Resize: sizes length must match input rank")
+                if self.values[zi].is_float():
+                    for d in range(x.rank()):
+                        var sz_f = self.values[zi].get(d)
+                        if not isfinite(sz_f) or sz_f < 0.0 or sz_f > Float64(MAX_RANGE_ELEMS):
+                            raise Error("Resize: invalid output size")
+                        s.append(Int(sz_f))
+                else:
+                    s = self.values[zi].int_list()
+                    for d in range(len(s)):
+                        if s[d] < 0 or s[d] > MAX_RANGE_ELEMS:
+                            raise Error("Resize: invalid output size")
             elif si >= 0 and self.values[si].numel() >= x.rank():
+                if not self.values[si].has_valid_storage():
+                    raise Error("Resize: scales tensor has invalid storage")
+                if not self.values[si].is_float():
+                    raise Error("Resize: scales must be float")
                 for d in range(x.rank()):
-                    s.append(Int(Float64(x.shape[d]) * self.values[si].get(d)))
+                    var sc = self.values[si].get(d)
+                    if not isfinite(sc) or sc <= 0.0:
+                        raise Error("Resize: scales must be finite and positive")
+                    var dim_f = Float64(x.shape[d]) * sc
+                    if not isfinite(dim_f) or dim_f < 0.0 or dim_f > Float64(MAX_RANGE_ELEMS):
+                        raise Error("Resize: invalid scaled output dimension")
+                    s.append(Int(dim_f))
             else:
                 raise Error("Resize needs scales or sizes")
+            var out_n = numel_of(s)
+            if out_n < 0 or out_n > MAX_RANGE_ELEMS:
+                raise Error("Resize: output element count overflow or exceeds maximum limit")
             out.append(resize_nearest(x, s))
         elif op == OP_CLIP:
             var lo = -3.4e38
             var hi = 3.4e38
             var a = self._in(k, 1)
             if a >= 0 and self.values[a].numel() > 0:
+                if not self.values[a].has_valid_storage():
+                    raise Error("Clip: min tensor has invalid storage")
                 lo = self.values[a].get(0)
             var b = self._in(k, 2)
             if b >= 0 and self.values[b].numel() > 0:
+                if not self.values[b].has_valid_storage():
+                    raise Error("Clip: max tensor has invalid storage")
                 hi = self.values[b].get(0)
             out.append(clip(x, lo, hi))
         else:

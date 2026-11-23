@@ -29,6 +29,7 @@ phase and since the `v5.0` baseline (`drift`); see `docs/PERF_HISTORY.md`.
 """
 
 comptime REGRESSION_LIMIT: Float64 = 0.10
+from std.math import isfinite
 # Tracked memory peaks are exact: growth past 2% fails.
 comptime MEMORY_GROWTH_LIMIT: Float64 = 0.02
 comptime BASELINE_ROWS: Int = 3
@@ -111,7 +112,10 @@ def is_number_byte(byte: UInt8) -> Bool:
 
 def parse_number(text: String) -> Tuple[Bool, Float64]:
     try:
-        return (True, Float64(text))
+        var v = Float64(text)
+        if not isfinite(v):
+            return (False, Float64(0))
+        return (True, v)
     except:
         return (False, Float64(0))
 
@@ -187,6 +191,8 @@ struct PerfTable(Movable):
         return len(self.header) - 1
 
     def cell(self, row: Int, column: Int) -> String:
+        if row < 0 or row >= len(self.rows):
+            return String()
         if column < 0 or column >= len(self.rows[row]):
             return String()
         return self.rows[row][column]
@@ -378,10 +384,15 @@ def judge_from(metric: PerfMetric, value: Float64, table: PerfTable, accepts: Li
     var finding = Finding(metric.name, value, base[1], base[0])
     if base[2] >= 0:
         finding.restart = table.cell(base[2], table.column("package"))
+    if not isfinite(value):
+        if base[0] > 0:
+            finding.worse = True
+        finding.over_budget = True
+        return finding^
     if base[0] > 0:
         var limit = base[1] * (1.0 + metric.limit)
-        finding.worse = value > limit and value - base[1] > metric.floor
-    finding.over_budget = metric.budget > 0 and value > metric.budget
+        finding.worse = (not isfinite(limit)) or (value > limit and value - base[1] > metric.floor)
+    finding.over_budget = (not isfinite(metric.budget)) or (metric.budget > 0 and value > metric.budget)
     return finding^
 
 
@@ -395,7 +406,8 @@ def settle(metric: PerfMetric, first: Finding, second: Float64, table: PerfTable
     must not fail the gate. The column keeps the better of the two measurements
     and fails only if that is still over, which is the same as both being over.
     Both measurements stay in the finding and go into the row."""
-    var finding = judge_from(metric, min(first.value, second), table, accepts, before)
+    var best = second if not isfinite(first.value) else (first.value if not isfinite(second) else min(first.value, second))
+    var finding = judge_from(metric, best, table, accepts, before)
     finding.remeasured = True
     finding.first = first.value
     finding.second = second
@@ -462,7 +474,14 @@ def package_phase(package: String) -> String:
 
 def signed_percent(fraction: Float64) -> String:
     """`+12.3%` or `-4.0%`, to a tenth of a percent."""
-    var tenths = Int(abs(fraction) * 1000.0 + 0.5)
+    if not isfinite(fraction):
+        if fraction > 0.0:
+            return String("+inf%")
+        if fraction < 0.0:
+            return String("-inf%")
+        return String("nan%")
+    var a = min(abs(fraction), Float64(1e9))
+    var tenths = Int(a * 1000.0 + 0.5)
     var sign = String("-") if fraction < 0 and tenths > 0 else String("+")
     return sign + String(tenths // 10) + "." + String(tenths % 10) + "%"
 

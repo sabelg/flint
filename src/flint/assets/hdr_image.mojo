@@ -8,12 +8,24 @@ pure Mojo 1.2 encoders and decoders for:
      predictor + even/odd byte-interleave reconstruction).
   3. Equirectangular `2:1` HDRI panorama bilinear sampler feeding `aaa_ibl.mojo` (`BC6H` + `SH9`).
 """
-from std.math import atan2, cos, exp, exp2, floor, log, log2, max, min, sin, sqrt
+from std.math import atan2, cos, exp, exp2, floor, isfinite, isnan, log, log2, max, min, sin, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.assets.bc_compress import f32_to_uf16_bits, uf16_bits_to_f32
 from flint.assets.image import inflate_zlib
 from flint.core.detmath import det_acos
+
+
+comptime EXR_MAX_FINITE_HDR: Float32 = 1.0e12
+
+
+@always_inline
+def _sanitize_hdr_sample_val(v: Float32) -> Float64:
+    if isnan(v) or v <= Float32(0.0):
+        return 0.0
+    if not isfinite(v):
+        return Float64(EXR_MAX_FINITE_HDR)
+    return Float64(v)
 
 
 struct HdrImage(Copyable, Movable):
@@ -30,7 +42,15 @@ struct HdrImage(Copyable, Movable):
 
     def sample_equirect(self, dir_unit: Vec3) -> Vec3:
         """Samples a `2:1` latitude-longitude HDRI environment map at unit world direction `dir_unit`."""
-        if not self.valid or self.width <= 0 or self.height <= 0:
+        if (
+            not self.valid
+            or self.width <= 0
+            or self.height <= 0
+            or len(self.pixels) < self.width * self.height
+            or not isfinite(dir_unit.x)
+            or not isfinite(dir_unit.y)
+            or not isfinite(dir_unit.z)
+        ):
             return Vec3(0.0, 0.0, 0.0)
         var d = dir_unit.normalized()
         var phi = atan2(d.z, d.x)  # [-pi .. +pi]
@@ -41,11 +61,13 @@ struct HdrImage(Copyable, Movable):
 
         var fx = u * Float32(self.width) - Float32(0.5)
         var fy = v * Float32(self.height) - Float32(0.5)
+        if not isfinite(fx) or not isfinite(fy):
+            return Vec3(0.0, 0.0, 0.0)
         var x0_raw = Int(floor(fx))
         var y0 = max(0, min(self.height - 1, Int(floor(fy))))
         var y1 = max(0, min(self.height - 1, y0 + 1))
-        var tx = max(Float32(0.0), min(Float32(1.0), fx - Float32(x0_raw)))
-        var ty = max(Float32(0.0), min(Float32(1.0), fy - Float32(Int(floor(fy)))))
+        var tx = Float64(max(Float32(0.0), min(Float32(1.0), fx - Float32(x0_raw))))
+        var ty = Float64(max(Float32(0.0), min(Float32(1.0), fy - Float32(Int(floor(fy))))))
 
         var x0 = x0_raw % self.width
         if x0 < 0:
@@ -56,9 +78,36 @@ struct HdrImage(Copyable, Movable):
         var c10 = self.pixels[y0 * self.width + x1]
         var c01 = self.pixels[y1 * self.width + x0]
         var c11 = self.pixels[y1 * self.width + x1]
-        var top = c00 * (Float32(1.0) - tx) + c10 * tx
-        var bot = c01 * (Float32(1.0) - tx) + c11 * tx
-        return top * (Float32(1.0) - ty) + bot * ty
+        var w00 = (1.0 - tx) * (1.0 - ty)
+        var w10 = tx * (1.0 - ty)
+        var w01 = (1.0 - tx) * ty
+        var w11 = tx * ty
+        var rx = (
+            _sanitize_hdr_sample_val(c00.x) * w00
+            + _sanitize_hdr_sample_val(c10.x) * w10
+            + _sanitize_hdr_sample_val(c01.x) * w01
+            + _sanitize_hdr_sample_val(c11.x) * w11
+        )
+        var ry = (
+            _sanitize_hdr_sample_val(c00.y) * w00
+            + _sanitize_hdr_sample_val(c10.y) * w10
+            + _sanitize_hdr_sample_val(c01.y) * w01
+            + _sanitize_hdr_sample_val(c11.y) * w11
+        )
+        var rz = (
+            _sanitize_hdr_sample_val(c00.z) * w00
+            + _sanitize_hdr_sample_val(c10.z) * w10
+            + _sanitize_hdr_sample_val(c01.z) * w01
+            + _sanitize_hdr_sample_val(c11.z) * w11
+        )
+        var out_x = Float32(rx)
+        var out_y = Float32(ry)
+        var out_z = Float32(rz)
+        return Vec3(
+            out_x if isfinite(out_x) else EXR_MAX_FINITE_HDR,
+            out_y if isfinite(out_y) else EXR_MAX_FINITE_HDR,
+            out_z if isfinite(out_z) else EXR_MAX_FINITE_HDR,
+        )
 
 
 # ============================================================================
@@ -136,21 +185,26 @@ def _read_cstr(data: List[UInt8], start: Int, max_end: Int) -> Tuple[String, Int
 
 @always_inline
 def _float3_to_rgbe(c: Vec3) -> Tuple[UInt8, UInt8, UInt8, UInt8]:
-    var r = max(Float32(0.0), c.x)
-    var g = max(Float32(0.0), c.y)
-    var b = max(Float32(0.0), c.z)
+    var r = Float32(0.0) if (isnan(c.x) or c.x <= Float32(0.0)) else c.x
+    var g = Float32(0.0) if (isnan(c.y) or c.y <= Float32(0.0)) else c.y
+    var b = Float32(0.0) if (isnan(c.z) or c.z <= Float32(0.0)) else c.z
     var v = max(r, max(g, b))
     if v < Float32(1e-32):
         return (UInt8(0), UInt8(0), UInt8(0), UInt8(0))
-    var exp_i = Int(floor(log2(v))) + 1
-    if exp_i <= -128:
-        return (UInt8(0), UInt8(0), UInt8(0), UInt8(0))
-    if exp_i > 127:
+    comptime _MAX_RGBE_EXP_VAL: Float32 = 1.7014118e38  # 2^127
+    var exp_i: Int
+    if not isfinite(v) or v >= _MAX_RGBE_EXP_VAL:
         exp_i = 127
+    else:
+        exp_i = Int(floor(log2(v))) + 1
+        if exp_i <= -128:
+            return (UInt8(0), UInt8(0), UInt8(0), UInt8(0))
+        if exp_i > 127:
+            exp_i = 127
     var scale = Float32(256.0) / exp2(Float32(exp_i))
-    var rb = UInt8(max(0, min(255, Int(r * scale))))
-    var gb = UInt8(max(0, min(255, Int(g * scale))))
-    var bb = UInt8(max(0, min(255, Int(b * scale))))
+    var rb = UInt8(255) if (not isfinite(r) or r >= _MAX_RGBE_EXP_VAL) else UInt8(max(0, min(255, Int(r * scale))))
+    var gb = UInt8(255) if (not isfinite(g) or g >= _MAX_RGBE_EXP_VAL) else UInt8(max(0, min(255, Int(g * scale))))
+    var bb = UInt8(255) if (not isfinite(b) or b >= _MAX_RGBE_EXP_VAL) else UInt8(max(0, min(255, Int(b * scale))))
     return (rb, gb, bb, UInt8(exp_i + 128))
 
 
@@ -199,6 +253,8 @@ def _encode_rle_channel(chan: List[UInt8], mut out: List[UInt8]):
 def encode_radiance_hdr(pixels: List[Vec3], width: Int, height: Int) -> List[UInt8]:
     """Encodes linear HDR `Vec3` pixels into a standard Radiance `.hdr` (`32-bit_rle_rgbe`) byte stream."""
     var out = List[UInt8]()
+    if width <= 0 or height <= 0 or width > Int.MAX // height or len(pixels) < width * height:
+        return out^
     var hdr_txt = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y " + String(height) + " +X " + String(width) + "\n"
     var hb = hdr_txt.as_bytes()
     for i in range(len(hb)):
@@ -728,13 +784,19 @@ def _exr_wav2_decode(mut buf: List[UInt16], base: Int, nx: Int, ox: Int, ny: Int
 
 @always_inline
 def _dwa_to_linear(x: Float32) -> Float32:
-    if x == Float32(0.0):
+    if isnan(x) or x == Float32(0.0):
         return Float32(0.0)
     var s = Float32(-1.0) if x < Float32(0.0) else Float32(1.0)
+    if not isfinite(x):
+        return s * EXR_MAX_FINITE_HDR
     var ax = -x if x < Float32(0.0) else x
     if ax <= Float32(1.0):
-        return s * exp(Float32(2.2) * log(ax))
-    return s * exp(Float32(2.2) * (ax - Float32(1.0)))
+        var lin = s * exp(Float32(2.2) * log(ax))
+        return lin if isfinite(lin) else Float32(0.0)
+    if ax >= Float32(13.56):
+        return s * EXR_MAX_FINITE_HDR
+    var mag = min(EXR_MAX_FINITE_HDR, exp(Float32(2.2) * (ax - Float32(1.0))))
+    return s * mag
 
 
 def _exr_dwa_idct_8x8(coeff: List[Float32], mut out_spatial: List[Float32]):
@@ -792,6 +854,14 @@ def _exr_undo_predictor_and_reorder(raw_zip: List[UInt8]) -> List[UInt8]:
 def encode_exr_fp16(pixels: List[Vec3], width: Int, height: Int) -> List[UInt8]:
     """Writes a Khronos/ILM-compliant OpenEXR v2 single-part scanline `HALF` (`FP16`) `B, G, R` image."""
     var out = List[UInt8]()
+    if width <= 0 or height <= 0:
+        return out^
+    if width > (Int.MAX - 8) // 6:
+        return out^
+    var scanline_bytes = width * 3 * 2  # 3 HALF channels * 2 bytes * width
+    var chunk_bytes = 8 + scanline_bytes
+    if height > Int.MAX // chunk_bytes or width > Int.MAX // height or len(pixels) < width * height:
+        return out^
     _put_le_u32(out, UInt32(EXR_MAGIC))
     _put_le_u32(out, UInt32(2))  # version 2, flags = 0 (single-part scanline)
 
@@ -841,8 +911,6 @@ def encode_exr_fp16(pixels: List[Vec3], width: Int, height: Int) -> List[UInt8]:
 
     # Scanline offset table: `height` UInt64 offsets
     var table_start = len(out)
-    var scanline_bytes = width * 3 * 2  # 3 HALF channels * 2 bytes * width
-    var chunk_bytes = 8 + scanline_bytes
     var first_chunk_off = table_start + height * 8
     for y in range(height):
         _put_le_u64(out, UInt64(first_chunk_off + y * chunk_bytes))
@@ -879,7 +947,13 @@ def _exr_write_channel_val(
 ):
     var idx = dst_y * img.width + dst_x
     var cur_px = img.pixels[idx]
-    var v = max(Float32(0.0), val_f)
+    var v: Float32
+    if isnan(val_f) or val_f <= Float32(0.0):
+        v = Float32(0.0)
+    elif not isfinite(val_f) or val_f > EXR_MAX_FINITE_HDR:
+        v = EXR_MAX_FINITE_HDR
+    else:
+        v = val_f
     if role == 0:
         img.pixels[idx] = Vec3(v, cur_px.y, cur_px.z)
     elif role == 1:

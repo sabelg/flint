@@ -14,7 +14,7 @@ Upgrades in Flint v4 (100% backward-compatible with `NeonDrift` & v3 callers):
    and root/hip linear & angular velocity features from `NativeModel` animations.
 """
 from std.collections import List
-from std.math import sqrt, min, max, abs, floor
+from std.math import sqrt, min, max, abs, floor, isfinite
 from flint.core.detmath import det_sin, det_cos, det_atan2, PI
 from flint.core.math import Vec3
 from flint.assets.model import NativeModel
@@ -77,42 +77,55 @@ struct MotionFeature(Copyable, ImplicitlyCopyable, Movable):
 
 
 @always_inline
+def _safe_mm_f32(v: Float32) -> Float32:
+    return v if isfinite(v) else Float32(0.0)
+
+
+@always_inline
+def _safe_mm_vec3(v: Vec3) -> Vec3:
+    return Vec3(_safe_mm_f32(v.x), _safe_mm_f32(v.y), _safe_mm_f32(v.z))
+
+
+@always_inline
 def _extract_raw_channels(f: MotionFeature, mut out: Array[Float32, MM_DIM]):
     """Flattens a `MotionFeature` into 33 continuous channels, converting facing
     angles into unit 2D `(cos, sin)` vectors."""
-    out[0] = f.traj_pos_200.x
-    out[1] = f.traj_pos_200.y
-    out[2] = f.traj_pos_200.z
-    out[3] = f.traj_pos_400.x
-    out[4] = f.traj_pos_400.y
-    out[5] = f.traj_pos_400.z
-    out[6] = f.traj_pos_800.x
-    out[7] = f.traj_pos_800.y
-    out[8] = f.traj_pos_800.z
-    out[9] = det_cos(f.traj_facing_200)
-    out[10] = det_sin(f.traj_facing_200)
-    out[11] = det_cos(f.traj_facing_400)
-    out[12] = det_sin(f.traj_facing_400)
-    out[13] = det_cos(f.traj_facing_800)
-    out[14] = det_sin(f.traj_facing_800)
-    out[15] = f.left_foot_pos.x
-    out[16] = f.left_foot_pos.y
-    out[17] = f.left_foot_pos.z
-    out[18] = f.left_foot_vel.x
-    out[19] = f.left_foot_vel.y
-    out[20] = f.left_foot_vel.z
-    out[21] = f.right_foot_pos.x
-    out[22] = f.right_foot_pos.y
-    out[23] = f.right_foot_pos.z
-    out[24] = f.right_foot_vel.x
-    out[25] = f.right_foot_vel.y
-    out[26] = f.right_foot_vel.z
-    out[27] = f.hip_vel.x
-    out[28] = f.hip_vel.y
-    out[29] = f.hip_vel.z
-    out[30] = f.ang_vel.x
-    out[31] = f.ang_vel.y
-    out[32] = f.ang_vel.z
+    out[0] = _safe_mm_f32(f.traj_pos_200.x)
+    out[1] = _safe_mm_f32(f.traj_pos_200.y)
+    out[2] = _safe_mm_f32(f.traj_pos_200.z)
+    out[3] = _safe_mm_f32(f.traj_pos_400.x)
+    out[4] = _safe_mm_f32(f.traj_pos_400.y)
+    out[5] = _safe_mm_f32(f.traj_pos_400.z)
+    out[6] = _safe_mm_f32(f.traj_pos_800.x)
+    out[7] = _safe_mm_f32(f.traj_pos_800.y)
+    out[8] = _safe_mm_f32(f.traj_pos_800.z)
+    var f200 = _safe_mm_f32(f.traj_facing_200)
+    var f400 = _safe_mm_f32(f.traj_facing_400)
+    var f800 = _safe_mm_f32(f.traj_facing_800)
+    out[9] = det_cos(f200)
+    out[10] = det_sin(f200)
+    out[11] = det_cos(f400)
+    out[12] = det_sin(f400)
+    out[13] = det_cos(f800)
+    out[14] = det_sin(f800)
+    out[15] = _safe_mm_f32(f.left_foot_pos.x)
+    out[16] = _safe_mm_f32(f.left_foot_pos.y)
+    out[17] = _safe_mm_f32(f.left_foot_pos.z)
+    out[18] = _safe_mm_f32(f.left_foot_vel.x)
+    out[19] = _safe_mm_f32(f.left_foot_vel.y)
+    out[20] = _safe_mm_f32(f.left_foot_vel.z)
+    out[21] = _safe_mm_f32(f.right_foot_pos.x)
+    out[22] = _safe_mm_f32(f.right_foot_pos.y)
+    out[23] = _safe_mm_f32(f.right_foot_pos.z)
+    out[24] = _safe_mm_f32(f.right_foot_vel.x)
+    out[25] = _safe_mm_f32(f.right_foot_vel.y)
+    out[26] = _safe_mm_f32(f.right_foot_vel.z)
+    out[27] = _safe_mm_f32(f.hip_vel.x)
+    out[28] = _safe_mm_f32(f.hip_vel.y)
+    out[29] = _safe_mm_f32(f.hip_vel.z)
+    out[30] = _safe_mm_f32(f.ang_vel.x)
+    out[31] = _safe_mm_f32(f.ang_vel.y)
+    out[32] = _safe_mm_f32(f.ang_vel.z)
 
 
 struct MotionFrame(Copyable, ImplicitlyCopyable, Movable):
@@ -171,7 +184,20 @@ struct MotionDatabase(Copyable, Movable):
         self.chunk_stance_masks = List[UInt32]()
 
     def add_frame(mut self, clip: Int, frame: Int, time_s: Float32, feature: MotionFeature):
-        self.frames.append(MotionFrame(clip, frame, time_s, feature))
+        var clean = feature
+        clean.traj_pos_200 = _safe_mm_vec3(clean.traj_pos_200)
+        clean.traj_pos_400 = _safe_mm_vec3(clean.traj_pos_400)
+        clean.traj_pos_800 = _safe_mm_vec3(clean.traj_pos_800)
+        clean.traj_facing_200 = _safe_mm_f32(clean.traj_facing_200)
+        clean.traj_facing_400 = _safe_mm_f32(clean.traj_facing_400)
+        clean.traj_facing_800 = _safe_mm_f32(clean.traj_facing_800)
+        clean.left_foot_pos = _safe_mm_vec3(clean.left_foot_pos)
+        clean.left_foot_vel = _safe_mm_vec3(clean.left_foot_vel)
+        clean.right_foot_pos = _safe_mm_vec3(clean.right_foot_pos)
+        clean.right_foot_vel = _safe_mm_vec3(clean.right_foot_vel)
+        clean.hip_vel = _safe_mm_vec3(clean.hip_vel)
+        clean.ang_vel = _safe_mm_vec3(clean.ang_vel)
+        self.frames.append(MotionFrame(clip, frame, _safe_mm_f32(time_s), clean))
         self.is_finalized = False
 
     def count(self) -> Int:
@@ -216,54 +242,65 @@ struct MotionDatabase(Copyable, Movable):
 
         var raw_flat = List[Float32](length=n * MM_DIM, fill=0.0)
         var tmp = Array[Float32, MM_DIM](fill=0.0)
+        var means64 = Array[Float64, MM_DIM](fill=0.0)
 
         for i in range(n):
             _extract_raw_channels(self.frames[i].feature, tmp)
             var base = i * MM_DIM
             for d in range(MM_DIM):
-                var v = tmp[d]
+                var v = tmp[d] if isfinite(tmp[d]) else Float32(0.0)
                 raw_flat[base + d] = v
-                self.means[d] += v
+                means64[d] += Float64(v)
 
-        var inv_n = Float32(1.0) / Float32(n)
+        var inv_n64 = 1.0 / Float64(n)
         for d in range(MM_DIM):
-            self.means[d] *= inv_n
+            means64[d] *= inv_n64
+            self.means[d] = Float32(means64[d]) if isfinite(means64[d]) else Float32(0.0)
 
-        var vars_acc = Array[Float32, MM_DIM](fill=0.0)
+        var vars_acc64 = Array[Float64, MM_DIM](fill=0.0)
         for i in range(n):
             var base = i * MM_DIM
             for d in range(MM_DIM):
-                var diff = raw_flat[base + d] - self.means[d]
-                vars_acc[d] += diff * diff
+                var diff64 = Float64(raw_flat[base + d]) - means64[d]
+                vars_acc64[d] += diff64 * diff64
+        var stds64 = Array[Float64, MM_DIM](fill=1.0)
         for d in range(MM_DIM):
-            self.stds[d] = sqrt(vars_acc[d] * inv_n)
+            var s64 = sqrt(vars_acc64[d] * inv_n64)
+            stds64[d] = s64 if isfinite(s64) else 1.0
+            self.stds[d] = Float32(stds64[d])
 
         # Pool 3D vector group standard deviations so flat axes (e.g. y=0 on flat ground)
         # share their 3D feature group's physical scale instead of amplifying noise.
         var vec_groups: Array[Int, 9] = [0, 3, 6, 15, 18, 21, 24, 27, 30]
         for g_idx in range(9):
             var d0 = vec_groups[g_idx]
-            var rms = sqrt(
-                (self.stds[d0] * self.stds[d0] + self.stds[d0 + 1] * self.stds[d0 + 1] + self.stds[d0 + 2] * self.stds[d0 + 2])
-                * Float32(1.0 / 3.0)
+            var rms64 = sqrt(
+                (stds64[d0] * stds64[d0] + stds64[d0 + 1] * stds64[d0 + 1] + stds64[d0 + 2] * stds64[d0 + 2])
+                * (1.0 / 3.0)
             )
-            var safe_s = max(Float32(0.10), rms)
-            self.stds[d0] = max(self.stds[d0], safe_s)
-            self.stds[d0 + 1] = max(self.stds[d0 + 1], safe_s)
-            self.stds[d0 + 2] = max(self.stds[d0 + 2], safe_s)
+            var safe_s64 = max(0.10, rms64 if isfinite(rms64) else 0.10)
+            stds64[d0] = max(stds64[d0], safe_s64)
+            stds64[d0 + 1] = max(stds64[d0 + 1], safe_s64)
+            stds64[d0 + 2] = max(stds64[d0 + 2], safe_s64)
+            self.stds[d0] = Float32(stds64[d0])
+            self.stds[d0 + 1] = Float32(stds64[d0 + 1])
+            self.stds[d0 + 2] = Float32(stds64[d0 + 2])
 
         # Unit 2D `(cos, sin)` pairs are already dimensionless on S^1; floor std at 0.35
         for p_idx in range(3):
             var dc = 9 + p_idx * 2
-            var pair_rms = sqrt((self.stds[dc] * self.stds[dc] + self.stds[dc + 1] * self.stds[dc + 1]) * Float32(0.5))
-            var safe_cs = max(Float32(0.35), pair_rms)
-            self.stds[dc] = max(self.stds[dc], safe_cs)
-            self.stds[dc + 1] = max(self.stds[dc + 1], safe_cs)
+            var pair_rms64 = sqrt((stds64[dc] * stds64[dc] + stds64[dc + 1] * stds64[dc + 1]) * 0.5)
+            var safe_cs64 = max(0.35, pair_rms64 if isfinite(pair_rms64) else 0.35)
+            stds64[dc] = max(stds64[dc], safe_cs64)
+            stds64[dc + 1] = max(stds64[dc + 1], safe_cs64)
+            self.stds[dc] = Float32(stds64[dc])
+            self.stds[dc + 1] = Float32(stds64[dc + 1])
 
         var w_chan = Array[Float32, MM_DIM](fill=1.0)
         self._channel_weights(w_chan)
         for d in range(MM_DIM):
-            self.scales[d] = sqrt(max(Float32(0.0), w_chan[d])) / max(Float32(0.05), self.stds[d])
+            var sc64 = sqrt(max(0.0, Float64(w_chan[d]))) / max(0.05, stds64[d])
+            self.scales[d] = Float32(sc64) if isfinite(sc64) else Float32(1.0)
 
         # Pack transposed 8-wide SIMD SoA layout: `[num_groups][MM_DIM][8]`
         var num_groups = (n + MM_LANES - 1) // MM_LANES
@@ -583,9 +620,22 @@ struct MotionDatabase(Copyable, Movable):
         if clip_index < 0 or clip_index >= len(model.animations) or len(model.nodes) == 0:
             return
         var dur = model.animations[clip_index].duration
+        if not isfinite(dur) or dur < Float32(0.0) or not isfinite(sample_fps):
+            return
+        comptime MAX_BAKE_STEPS: Int = 16384
         var fps = max(Float32(1.0), sample_fps)
-        var dt = Float32(1.0) / fps
-        var steps = max(1, Int(dur * fps)) if dur > Float32(0.0) else 1
+        var raw_steps_f64 = Float64(dur) * Float64(fps) if dur > Float32(0.0) else 1.0
+        var steps: Int
+        var dt: Float32
+        var inv_dt: Float32
+        if isfinite(raw_steps_f64) and raw_steps_f64 > Float64(MAX_BAKE_STEPS):
+            steps = MAX_BAKE_STEPS
+            dt = dur / Float32(steps)
+            inv_dt = Float32(steps) / dur
+        else:
+            steps = max(1, Int(raw_steps_f64)) if dur > Float32(0.0) else 1
+            dt = Float32(1.0) / fps
+            inv_dt = fps
 
         var skel_cur = SkeletonInstance(len(model.nodes))
         var skel_fut = SkeletonInstance(len(model.nodes))
@@ -631,9 +681,13 @@ struct MotionDatabase(Copyable, Movable):
             var vel_wraps = 0
             if dur > Float32(1.0e-4):
                 if loop:
-                    while t_vel >= dur:
-                        t_vel -= dur
-                        vel_wraps += 1
+                    var d64 = Float64(dur)
+                    var q_v = floor(Float64(t_vel) / d64)
+                    if isfinite(q_v) and q_v >= 0.0:
+                        t_vel = Float32(Float64(t_vel) - q_v * d64)
+                        if t_vel >= dur:
+                            t_vel = Float32(0.0)
+                        vel_wraps = Int(min(1.0e9, q_v))
                 else:
                     t_vel = min(dur, t_vel)
             else:
@@ -644,7 +698,6 @@ struct MotionDatabase(Copyable, Movable):
             var wrap_shift_v = cycle_delta * Float32(vel_wraps)
             var p_hip1 = skel_fut.global_position(hip) + wrap_shift_v
             var q_hip1 = skel_fut.global_rotation(hip)
-            var inv_dt = fps
 
             var v_hip_w = (p_hip1 - p_hip0) * inv_dt
             feat.hip_vel = Vec3(v_hip_w.x * cy + v_hip_w.z * sy, v_hip_w.y, -v_hip_w.x * sy + v_hip_w.z * cy)
@@ -668,9 +721,13 @@ struct MotionDatabase(Copyable, Movable):
                 var extra_t = Float32(0.0)
                 if dur > Float32(1.0e-4):
                     if loop:
-                        while th >= dur:
-                            th -= dur
-                            h_wraps += 1
+                        var d64 = Float64(dur)
+                        var q_h = floor(Float64(th) / d64)
+                        if isfinite(q_h) and q_h >= 0.0:
+                            th = Float32(Float64(th) - q_h * d64)
+                            if th >= dur:
+                                th = Float32(0.0)
+                            h_wraps = Int(min(1.0e9, q_h))
                     else:
                         if th > dur:
                             extra_t = th - dur

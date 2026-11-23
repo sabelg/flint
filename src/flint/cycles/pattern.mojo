@@ -11,7 +11,7 @@ arena and `Pattern.query` walks the tree.
     rev, every, degradeBy, signals, union `#` / `|+` ...)
   - `parse_mini`: the mini-notation ("bd*2 [~ sn] <hh oh>(3,8) a@3 b! c?")
 """
-from std.math import sin, floor
+from std.math import abs, floor, isfinite, max, min, sin
 
 comptime MAX_PATTERN_COUNT: Int = 4096
 comptime MAX_QUERY_EVENTS: Int = 16384
@@ -354,6 +354,8 @@ struct Params(Copyable, Movable):
 
 
 def _fmt(x: Float64) -> String:
+    if not isfinite(x) or abs(x) >= 9.0e14:
+        return String(x)
     var r = floor(x + 0.5)
     if (x - r) < 1.0e-9 and (r - x) < 1.0e-9:
         return String(Int(r))
@@ -987,7 +989,12 @@ def _signal_value(shape: Int, t: Frac, seed: Int) -> Float64:
     if shape == SIG_SQUARE:
         return 0.0 if ph < 0.5 else 1.0
     if shape == SIG_PERLIN:
-        var i = Int(floor(x))
+        if not isfinite(x):
+            return 0.5
+        var px = x
+        if abs(px) > 1.0e12:
+            px = px - floor(px / 65536.0) * 65536.0
+        var i = Int(floor(px))
         var a = time_hash(Frac(i, 1), seed)
         var b = time_hash(Frac(i + 1, 1), seed)
         var s = ph * ph * (3.0 - 2.0 * ph)
@@ -1634,9 +1641,14 @@ struct Pattern(Copyable, Movable):
                 var ev = inner[j].copy()
                 var deg = ev.value.num if ev.value.raw else ev.value.get(P_N, ev.value.get(P_NOTE, 0.0))
                 var steps_sc = len(table)
-                var di = Int(floor(deg))
-                var octv = di // steps_sc
-                var semis = Float64(table[di - octv * steps_sc] + octv * 12) + (deg - Float64(di))
+                var semis = Float64(0.0)
+                if steps_sc > 0 and isfinite(deg):
+                    var c_deg = max(-1.0e12, min(1.0e12, deg))
+                    var d_fl = floor(c_deg)
+                    var di = Int(d_fl)
+                    var octv = di // steps_sc
+                    var rem = max(0, min(steps_sc - 1, di - octv * steps_sc))
+                    semis = Float64(table[rem] + octv * 12) + (c_deg - d_fl)
                 if ev.value.raw:
                     ev.value = raw_number(semis)
                 else:

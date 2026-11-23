@@ -1,3 +1,4 @@
+from std.math import floor, isfinite
 from flint.platform.os import read_bytes
 
 
@@ -225,27 +226,52 @@ struct AnimationPlayback(Copyable, ImplicitlyCopyable, Movable):
     def update(mut self, clip: Int, dt: Float32, frame_count: Int, loop: Bool = True) -> Int:
         if frame_count <= 0:
             return 0
+        var safe_dt = dt if (isfinite(dt) and dt > Float32(0.0)) else Float32(0.0)
         if clip != self.clip:
             self.clip = clip
-            self.time = 0
+            self.time = Float32(0.0)
         else:
-            self.time += dt
-        var frame = Int(self.time * 30)
+            if not isfinite(self.time) or self.time < Float32(0.0):
+                self.time = Float32(0.0)
+            var nt = Float64(self.time) + Float64(safe_dt)
+            if isfinite(nt) and nt <= 1.0e30:
+                self.time = Float32(nt)
+        var dur64 = Float64(frame_count) / 30.0
+        var t64 = Float64(self.time) if (isfinite(self.time) and self.time >= Float32(0.0)) else 0.0
         if loop:
-            return frame % frame_count
-        return min(frame_count - 1, frame)
+            if dur64 > 0.0:
+                t64 = t64 - floor(t64 / dur64) * dur64
+                if t64 < 0.0 or not isfinite(t64):
+                    t64 = 0.0
+                self.time = Float32(t64)
+            return max(0, min(frame_count - 1, Int(t64 * 30.0)))
+        if t64 >= dur64:
+            self.time = Float32(dur64)
+            return frame_count - 1
+        return max(0, min(frame_count - 1, Int(t64 * 30.0)))
 
     def advance(mut self, clip: Int, dt: Float32, duration: Float32, loop: Bool = True) -> Float32:
         """Continuous clip time in seconds; no snapping to 30 fps frames."""
+        var safe_dt = dt if (isfinite(dt) and dt > Float32(0.0)) else Float32(0.0)
         if clip != self.clip:
             self.clip = clip
-            self.time = 0
+            self.time = Float32(0.0)
         else:
-            self.time += dt
-        if duration <= 0:
-            return 0
+            if not isfinite(self.time) or self.time < Float32(0.0):
+                self.time = Float32(0.0)
+            var nt = Float64(self.time) + Float64(safe_dt)
+            if isfinite(nt) and nt <= 1.0e30:
+                self.time = Float32(nt)
+        if not isfinite(duration) or duration <= Float32(0.0):
+            return Float32(0.0)
+        var dur64 = Float64(duration)
+        var t64 = Float64(self.time) if (isfinite(self.time) and self.time >= Float32(0.0)) else 0.0
         if loop:
-            while self.time >= duration:
-                self.time -= duration
+            t64 = t64 - floor(t64 / dur64) * dur64
+            if t64 < 0.0 or not isfinite(t64):
+                t64 = 0.0
+            self.time = Float32(t64)
             return self.time
-        return min(self.time, duration)
+        var clamped = min(t64, dur64)
+        self.time = Float32(clamped)
+        return self.time

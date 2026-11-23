@@ -10,7 +10,7 @@ Implements two complementary anime/stylized visual-effects stages in the unified
      Evaluates up to 4 simultaneous radial shockwave rings with independent R/G/B chromatic refraction
      plus optional high-contrast radial-streak anime impact frames (`AaaImpactFrameParams`).
 """
-from std.math import abs, atan2, floor, max, min, sin, sqrt
+from std.math import abs, atan2, floor, isfinite, max, min, sin, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.render.spirv import (
@@ -278,14 +278,22 @@ def _hash_cell_u8_cpu(ix: Int, iy: Int) -> Float32:
 
 
 def eval_value_noise_periodic_cpu(u: Float32, v: Float32) -> Float32:
-    var up = (u / Float32(256.0) - floor(u / Float32(256.0))) * Float32(256.0)
-    var vp = (v / Float32(256.0) - floor(v / Float32(256.0))) * Float32(256.0)
+    if not (isfinite(u) and isfinite(v)):
+        return Float32(0.5)
+    var u64 = Float64(u)
+    var v64 = Float64(v)
+    var up = (u64 / 256.0 - floor(u64 / 256.0)) * 256.0
+    var vp = (v64 / 256.0 - floor(v64 / 256.0)) * 256.0
+    if not isfinite(up) or up < 0.0 or up >= 256.0:
+        up = 0.0
+    if not isfinite(vp) or vp < 0.0 or vp >= 256.0:
+        vp = 0.0
     var ix0 = Int(floor(up)) & 255
     var iy0 = Int(floor(vp)) & 255
     var ix1 = (ix0 + 1) & 255
     var iy1 = (iy0 + 1) & 255
-    var fx = up - floor(up)
-    var fy = vp - floor(vp)
+    var fx = Float32(up - floor(up))
+    var fy = Float32(vp - floor(vp))
     var sx = fx * fx * (Float32(3.0) - Float32(2.0) * fx)
     var sy = fy * fy * (Float32(3.0) - Float32(2.0) * fy)
     var n00 = _hash_cell_u8_cpu(ix0, iy0)

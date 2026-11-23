@@ -12,7 +12,7 @@ Sounds are looked up in this order:
      synths: sine saw square tri supersaw bass acid pluck pad fm superpiano
      bell gong timpani noise — see `voice_kind`).
 """
-from std.math import sin, exp, floor, sqrt
+from std.math import sin, exp, floor, sqrt, isfinite
 from flint.platform.dsp import (
     CytomicSVF, ModalResonator, StereoReverbFDN, hash_white_noise, poly_blep_saw, poly_blep_pulse,
     soft_clip_tanh, tube_saturate, equal_power_gains,
@@ -114,15 +114,21 @@ struct Clip(Copyable, Movable):
         self.data = data^
 
     def frames(self) -> Int:
-        return len(self.data) // max(1, self.channels)
+        if self.channels <= 0:
+            return 0
+        return len(self.data) // self.channels
 
     @always_inline
     def at(self, pos: Float64, ch: Int) -> Float32:
-        var n = self.frames()
-        if n == 0 or pos < 0 or pos >= Float64(n - 1):
+        if self.channels <= 0 or len(self.data) <= 0 or not isfinite(pos):
+            return 0.0
+        var n = len(self.data) // self.channels
+        if n <= 1 or pos < 0.0 or pos >= Float64(n - 1):
             return 0.0
         var i = Int(pos)
-        var c = min(ch, self.channels - 1)
+        if i < 0 or i >= n - 1:
+            return 0.0
+        var c = max(0, min(ch, self.channels - 1))
         var a = Float32(self.data[i * self.channels + c]) / 32768.0
         var b = Float32(self.data[(i + 1) * self.channels + c]) / 32768.0
         return a + (b - a) * Float32(pos - Float64(i))
@@ -354,16 +360,54 @@ struct CyclesEngine(Movable):
 
     # ---- scheduling
 
+    @staticmethod
+    @always_inline
+    def _fin_clamp_f64(v: Float64, lo: Float64, hi: Float64, fallback: Float64) -> Float64:
+        if not isfinite(v):
+            return fallback
+        return max(lo, min(hi, v))
+
+    @staticmethod
+    @always_inline
+    def _fin_clamp_f32(v: Float32, lo: Float32, hi: Float32, fallback: Float32) -> Float32:
+        if not isfinite(v):
+            return fallback
+        return max(lo, min(hi, v))
+
+    @staticmethod
+    @always_inline
+    def _safe_int_f64(v: Float64, lo: Int, hi: Int, fallback: Int = 0) -> Int:
+        if not isfinite(v):
+            return fallback
+        if v <= Float64(lo):
+            return lo
+        if v >= Float64(hi):
+            return hi
+        return Int(v)
+
+    @staticmethod
+    @always_inline
+    def _safe_int_f32(v: Float32, lo: Int, hi: Int, fallback: Int = 0) -> Int:
+        if not isfinite(v):
+            return fallback
+        if v <= Float32(lo):
+            return lo
+        if v >= Float32(hi):
+            return hi
+        return Int(v)
+
     def spawn(mut self, ev: Event, offset: Int):
         ref p = ev.value
         if p.raw:
             return
         var name = p.sound if p.has_sound else String("sine")  # `n "0 3"` alone plays a sine
         var n_val = p.get(P_N, 0.0)
-        var speed = Float32(p.get(P_SPEED, 1.0))
-        var dur_sec = Float32((ev.whole_e - ev.whole_b).to_float() / self.cps)
+        var speed = Float32(Self._fin_clamp_f64(p.get(P_SPEED, 1.0), -64.0, 64.0, 1.0))
+        var dur_raw = Float32((ev.whole_e - ev.whole_b).to_float() / self.cps)
+        var dur_sec = dur_raw if (isfinite(dur_raw) and dur_raw >= Float32(0.0)) else Float32(0.5)
         var kind: Int
-        var clip = self.bank.clip(name, Int(floor(n_val)))
+        var n_idx = Self._safe_int_f64(floor(n_val) if isfinite(n_val) else 0.0, -1000000, 1000000, 0)
+        var clip = self.bank.clip(name, n_idx)
         if clip >= 0:
             kind = VK_SAMPLE
         else:
@@ -385,67 +429,55 @@ struct CyclesEngine(Movable):
         var v = Voice(kind)
         v.wait = offset
         v.noise_seed = Int(ev.whole_b.num * 7919 + ev.whole_b.den * 104729 + self.events_played * 31)
-        var gain_raw = p.get(P_GAIN, 1.0)
-        var gain = Float32(gain_raw) if gain_raw == gain_raw else Float32(1.0)
-        gain = Float32(16.0) if gain > Float32(16.0) else max(Float32(0.0), gain)
+        var gain = Float32(Self._fin_clamp_f64(p.get(P_GAIN, 1.0), 0.0, 16.0, 1.0))
         v.amp = gain * gain * 0.42
-        var pan_raw = p.get(P_PAN, 0.5)
-        var pan = Float32(pan_raw) if pan_raw == pan_raw else Float32(0.5)
-        pan = Float32(1.0) if pan > Float32(1.0) else max(Float32(0.0), pan)
+        var pan = Float32(Self._fin_clamp_f64(p.get(P_PAN, 0.5), 0.0, 1.0, 0.5))
         var g = equal_power_gains(pan * 2.0 - 1.0)
         v.gain_l = g[0]
         v.gain_r = g[1]
-        var room_raw = p.get(P_ROOM, 0.0)
-        var room_f = Float32(room_raw) if room_raw == room_raw else Float32(0.0)
-        v.room = Float32(4.0) if room_f > Float32(4.0) else max(Float32(0.0), room_f)
-        var del_raw = p.get(P_DELAY, 0.0)
-        var del_f = Float32(del_raw) if del_raw == del_raw else Float32(0.0)
-        v.delay_send = Float32(4.0) if del_f > Float32(4.0) else max(Float32(0.0), del_f)
-        var shape_raw = p.get(P_SHAPE, 0.0)
-        var shape_f = shape_raw if shape_raw == shape_raw else 0.0
-        v.shape = Float32(max(0.0, min(0.99, shape_f)))
-        var crush_raw = p.get(P_CRUSH, 0.0)
-        v.crush = Float32(crush_raw) if (crush_raw == crush_raw and crush_raw > 0.0) else Float32(0.0)
-        if v.crush > Float32(32.0):
-            v.crush = Float32(32.0)
-        v.coarse = Int(p.get(P_COARSE, 0.0))
-        if p.has(P_SIZE):
+        v.room = Float32(Self._fin_clamp_f64(p.get(P_ROOM, 0.0), 0.0, 4.0, 0.0))
+        v.delay_send = Float32(Self._fin_clamp_f64(p.get(P_DELAY, 0.0), 0.0, 4.0, 0.0))
+        v.shape = Float32(Self._fin_clamp_f64(p.get(P_SHAPE, 0.0), 0.0, 0.99, 0.0))
+        v.crush = Float32(Self._fin_clamp_f64(p.get(P_CRUSH, 0.0), 0.0, 32.0, 0.0))
+        v.coarse = Self._safe_int_f64(p.get(P_COARSE, 0.0), 0, 1024, 0)
+        if p.has(P_SIZE) and isfinite(p.vals[P_SIZE]):
             self.reverb.feedback = Float32(0.55 + 0.38 * max(0.0, min(1.0, p.vals[P_SIZE])))
-        if p.has(P_DELAYTIME):
+        if p.has(P_DELAYTIME) and isfinite(p.vals[P_DELAYTIME]):
             self.delay_time = Float32(max(0.001, min(1.99, p.vals[P_DELAYTIME])))
-        if p.has(P_DELAYFB):
+        if p.has(P_DELAYFB) and isfinite(p.vals[P_DELAYFB]):
             self.delay_fb = Float32(max(0.0, min(0.95, p.vals[P_DELAYFB])))
-        var q = Float32(0.707 + max(0.0, min(1.0, p.get(P_RESONANCE, 0.0))) * 14.0)
+        var res_norm = Self._fin_clamp_f64(p.get(P_RESONANCE, 0.0), 0.0, 1.0, 0.0)
+        var q = Float32(0.707 + res_norm * 14.0)
         v.res_q = q
-        if p.has(P_CUTOFF):
+        if p.has(P_CUTOFF) and isfinite(p.vals[P_CUTOFF]):
             v.use_lp = True
-            v.cutoff = Float32(p.vals[P_CUTOFF])
+            v.cutoff = Float32(max(20.0, min(Float64(self.sr) * 0.45, p.vals[P_CUTOFF])))
             v.lp.set_params(v.cutoff, q, self.sr)
-        if p.has(P_HCUTOFF):
+        if p.has(P_HCUTOFF) and isfinite(p.vals[P_HCUTOFF]):
             v.use_hp = True
-            v.hp.set_params(Float32(p.vals[P_HCUTOFF]), q, self.sr)
+            v.hp.set_params(Float32(max(20.0, min(Float64(self.sr) * 0.45, p.vals[P_HCUTOFF]))), q, self.sr)
         # Pitch: note 0 = C5 (261.63 Hz); for synths `n` is a note too.
         var note = p.get(P_NOTE, 0.0)
-        if kind >= VK_SINE or kind == VK_BELL or kind == VK_TIMPANI:
-            note += n_val
-        if note != note:
+        if not isfinite(note):
             note = 0.0
-        note = max(-120.0, min(120.0, note))
+        if (kind >= VK_SINE or kind == VK_BELL or kind == VK_TIMPANI) and isfinite(n_val):
+            note += n_val
+        note = Self._fin_clamp_f64(note, -120.0, 120.0, 0.0)
         var ratio = Float32(2.0 ** (note / 12.0))
         v.freq = Float32(261.6256) * ratio
         var sr = self.sr
-        var legato = Float32(p.get(P_LEGATO, 1.0))
-        var gate_sec = dur_sec * legato
+        var legato = Self._fin_clamp_f32(Float32(p.get(P_LEGATO, 1.0)), Float32(0.01), Float32(64.0), Float32(1.0))
+        var gate_sec = Self._fin_clamp_f32(dur_sec * legato, Float32(0.001), Float32(300.0), Float32(0.5))
         if p.has(P_SUSTAIN):
-            gate_sec = Float32(p.vals[P_SUSTAIN])
-        v.attack = Float32(p.get(P_ATTACK, 0.002))
-        var rel_sec = Float32(p.get(P_RELEASE, 0.06))
+            gate_sec = Self._fin_clamp_f32(Float32(p.vals[P_SUSTAIN]), Float32(0.001), Float32(300.0), gate_sec)
+        v.attack = Self._fin_clamp_f32(Float32(p.get(P_ATTACK, 0.002)), Float32(0.0), Float32(60.0), Float32(0.002))
+        var rel_sec = Self._fin_clamp_f32(Float32(p.get(P_RELEASE, 0.06)), Float32(0.001), Float32(60.0), Float32(0.06))
         if kind == VK_SAMPLE:
             ref c = self.bank.clips[clip]
             v.clip = clip
             var frames = Float64(c.frames())
-            var b = max(0.0, min(1.0, p.get(P_BEGIN, 0.0)))
-            var e = max(0.0, min(1.0, p.get(P_END, 1.0)))
+            var b = Self._fin_clamp_f64(p.get(P_BEGIN, 0.0), 0.0, 1.0, 0.0)
+            var e = Self._fin_clamp_f64(p.get(P_END, 1.0), 0.0, 1.0, 1.0)
             var rate = Float64(speed) * Float64(ratio) * Float64(c.rate) / Float64(self.sample_rate)
             v.step = rate
             if rate >= 0:
@@ -455,25 +487,26 @@ struct CyclesEngine(Movable):
                 v.pos = e * frames - 1.0
                 v.end_pos = b * frames
             var span = (v.end_pos - v.pos) / rate if rate != 0 else 0.0
-            var life = Int(span)
+            var life = Self._safe_int_f64(span, 0, MAX_WAV_FRAMES, 0)
             if p.has(P_LEGATO) or p.has(P_SUSTAIN):
-                life = min(life, Int(gate_sec * sr) + Int(0.01 * sr))
+                life = min(life, Self._safe_int_f32(gate_sec * sr, 1, MAX_WAV_FRAMES, life) + Int(0.01 * sr))
             v.gate = max(1, life - Int(0.005 * sr))
             v.release = Int(0.005 * sr)
             v.life = life
         elif kind < VK_SINE:
-            self._init_drum(v, kind, Float32(n_val), speed * ratio)
+            var n_drum = Float32(Self._fin_clamp_f64(n_val, -48.0, 48.0, 0.0))
+            self._init_drum(v, kind, n_drum, speed * ratio)
         else:
             if kind == VK_PAD:
-                v.attack = Float32(p.get(P_ATTACK, 0.25))
-                rel_sec = Float32(p.get(P_RELEASE, 0.6))
+                v.attack = Self._fin_clamp_f32(Float32(p.get(P_ATTACK, 0.25)), Float32(0.0), Float32(60.0), Float32(0.25))
+                rel_sec = Self._fin_clamp_f32(Float32(p.get(P_RELEASE, 0.6)), Float32(0.001), Float32(60.0), Float32(0.6))
             elif kind == VK_PLUCK:
-                rel_sec = Float32(p.get(P_RELEASE, 0.25))
+                rel_sec = Self._fin_clamp_f32(Float32(p.get(P_RELEASE, 0.25)), Float32(0.001), Float32(60.0), Float32(0.25))
                 gate_sec = max(gate_sec, Float32(1.2))
             elif kind == VK_FM:
-                rel_sec = Float32(p.get(P_RELEASE, 0.4))
-            v.gate = max(1, Int(gate_sec * sr))
-            v.release = max(1, Int(rel_sec * sr))
+                rel_sec = Self._fin_clamp_f32(Float32(p.get(P_RELEASE, 0.4)), Float32(0.001), Float32(60.0), Float32(0.4))
+            v.gate = Self._safe_int_f32(gate_sec * sr, 1, MAX_WAV_FRAMES, 1)
+            v.release = Self._safe_int_f32(rel_sec * sr, 1, MAX_WAV_FRAMES, 1)
             v.life = v.gate + v.release
             self._init_synth(v, kind)
         self.voices.append(v^)
@@ -728,7 +761,7 @@ struct CyclesEngine(Movable):
                 for i in range(len(evs)):
                     if not evs[i].has_onset():
                         continue
-                    var off = Int((evs[i].whole_b - begin).to_float() / span * Float64(frames))
+                    var off = Self._safe_int_f64((evs[i].whole_b - begin).to_float() / span * Float64(frames), 0, frames - 1, 0)
                     self.spawn(evs[i], max(0, min(frames - 1, off)))
         var out = List[Float32](length=frames * 2, fill=0.0)
         var send_l = List[Float32](length=frames, fill=0.0)
@@ -762,7 +795,8 @@ struct CyclesEngine(Movable):
         var dlen = len(self.delay_l)
         if dlen <= 0:
             return out^
-        var dframes = max(1, min(dlen - 1, Int(self.delay_time * self.sr)))
+        var safe_dt = Self._fin_clamp_f32(self.delay_time, Float32(0.001), Float32(1.99), Float32(0.375))
+        var dframes = max(1, min(dlen - 1, Self._safe_int_f32(safe_dt * self.sr, 1, dlen - 1, 1)))
         for f in range(frames):
             var wet = self.reverb.process_send(send_l[f], send_r[f])
             var read = (self.delay_idx - dframes + dlen) % dlen
@@ -782,7 +816,8 @@ struct CyclesEngine(Movable):
         var f = self.render(frames)
         var out = List[Int16](capacity=len(f))
         for i in range(len(f)):
-            out.append(Int16(Int(max(Float32(-1), min(Float32(1), f[i])) * 32767.0)))
+            var clamped = Self._fin_clamp_f32(f[i], Float32(-1.0), Float32(1.0), Float32(0.0))
+            out.append(Int16(Int(clamped * 32767.0)))
         return out^
 
 
@@ -823,9 +858,18 @@ def encode_wav16(samples: List[Int16], sample_rate: Int, channels: Int = 2) -> L
     return b^
 
 
+comptime MAX_WAV_FRAMES: Int = 16_777_216
+
+
 def render_to_wav(code: String, seconds: Float64, path: String, sample_rate: Int = 48000) raises -> Int:
     """Offline render of a Tidal program; returns events played."""
-    if not (seconds > 0.0) or sample_rate <= 0:
+    if not isfinite(seconds) or seconds <= 0.0 or sample_rate <= 0:
+        return 0
+    var raw_frames = seconds * Float64(sample_rate)
+    if not isfinite(raw_frames) or raw_frames <= 0.0 or raw_frames > Float64(MAX_WAV_FRAMES):
+        return 0
+    var total = Int(raw_frames)
+    if total <= 0 or total > MAX_WAV_FRAMES:
         return 0
     var engine = CyclesEngine(sample_rate)
     var errs = engine.load(code)
@@ -834,9 +878,6 @@ def render_to_wav(code: String, seconds: Float64, path: String, sample_rate: Int
         for e in errs:
             msg += "\n  " + e
         raise Error(msg)
-    var total = Int(seconds * Float64(sample_rate))
-    if total <= 0:
-        return 0
     var pcm = List[Int16](capacity=total * 2)
     var done = 0
     while done < total:
@@ -870,9 +911,15 @@ def render_loop_to_wav(code: String, cycles: Int, path: String, sample_rate: Int
     var cps = engine.cps_frac
     if cps.num <= 0 or cps.den <= 0:
         return 0
-    var warm = Int((start / cps).to_float() * Float64(sample_rate) + 0.5)
-    var loop_frames = Int(((stop - start) / cps).to_float() * Float64(sample_rate) + 0.5)
-    if warm < 0 or loop_frames <= 0:
+    var warm_f = (start / cps).to_float() * Float64(sample_rate) + 0.5
+    var loop_f = ((stop - start) / cps).to_float() * Float64(sample_rate) + 0.5
+    if not isfinite(warm_f) or not isfinite(loop_f) or warm_f < 0.0 or loop_f <= 0.0:
+        return 0
+    if warm_f > Float64(MAX_WAV_FRAMES) or loop_f > Float64(MAX_WAV_FRAMES):
+        return 0
+    var warm = Int(warm_f)
+    var loop_frames = Int(loop_f)
+    if warm < 0 or loop_frames <= 0 or loop_frames > MAX_WAV_FRAMES:
         return 0
     var done = 0
     while done < warm:
