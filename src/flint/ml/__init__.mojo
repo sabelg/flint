@@ -43,4 +43,6 @@
     for later depth / intrinsics heads; 1..50 DDIM steps, ensembling, uncertainty, tileable mode)
   - `migan`: MI-GAN fast inpainting on `OnnxModel` (windowed full-resolution repaint, sprite
     clean-up, `make_tileable` seamless textures)
+  - `realesrgan`: Real-ESRGAN x4 super-resolution (RRDBNet and compact SRVGG nets from
+    safetensors, tiled inference, PixelShuffle, denoise blend; CPU / MAX GPU)
 """
