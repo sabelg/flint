@@ -37,6 +37,14 @@
     MAX GPU, bit-exact `jax.random` sampling) and `MagentaRtStream` for the `AudioServer`
   - `metatron`: NVIDIA Metatron-v1 G1 humanoid controller (policy, ProtoMotions host port,
     `G1Sim` on `flint.physics.mjcf`)
+  - `ops_conv2d`, `ops_image`: general 2-D Conv (depthwise / grouped / strided / dilated, CPU +
+    GPU dense products) and parallel LeakyRelu / Clip / Resize / Pad (op codes 90..94 in `onnx`)
+  - `marigold`: Marigold-Normals v1.1 image -> normal map on `diffusion` (shared `MarigoldCore`
+    for later depth / intrinsics heads; 1..50 DDIM steps, ensembling, uncertainty, tileable mode)
+  - `migan`: MI-GAN fast inpainting on `OnnxModel` (windowed full-resolution repaint, sprite
+    clean-up, `make_tileable` seamless textures)
+  - `realesrgan`: Real-ESRGAN x4 super-resolution (RRDBNet and compact SRVGG nets from
+    safetensors, tiled inference, PixelShuffle, denoise blend; CPU / MAX GPU)
   - `depth`, `torch_pt`: monocular depth / geometry (Depth Anything V2 / 3 on one DINOv2 + DPT
     stack, MoGe-2 points / normals / FOV; PNG, EXR and GLB blockout output) and a `.pt` reader
 """

@@ -158,6 +158,56 @@
   used with (`g1_holo_compat.xml`, BSD-3-Clause, Unitree Robotics) is downloaded by
   `tools/metatron/fetch.sh` and not included; see `unitree-g1-LICENSE.txt`. ProtoMotions'
   demo motion clips are not used (their licence does not allow standalone redistribution).
+
+## Marigold-Normals and MI-GAN (2-D art tools)
+
+- `src/flint/ml/marigold.mojo` runs Marigold-Normals v1.1 (https://huggingface.co/prs-eth/marigold-normals-v1-1,
+  PRS ETH Zürich) on `flint.ml.diffusion`. The preprocessing, sampling loop, normals decoding and
+  ensembling follow the Marigold pipeline (https://github.com/prs-eth/Marigold, Apache-2.0, see
+  `marigold-LICENSE.txt`) and its diffusers port (`MarigoldNormalsPipeline`, Apache-2.0); they are
+  written in Mojo and checked against diffusers with `tools/marigold/reference.py`, which imports
+  diffusers at verification time; no Python code is copied. The weights are not included:
+  `tools/marigold/fetch.sh` downloads them outside the repository. Their licence is OpenRAIL++-M:
+  the model card names the CreativeML Open RAIL++-M licence of Stable Diffusion 2 (the base model);
+  the Marigold repository ships it as `LICENSE-MODEL.txt` (copied here as
+  `marigold-LICENSE-MODEL.txt`; its Attachment A is left as a template there, so the SD2 licence's
+  Attachment A use restrictions are the ones to follow). Commercial use, redistribution and hosting
+  are allowed; the use restrictions (no unlawful use, harm to minors, disinformation, harassment,
+  discrimination, fully automated decisions affecting legal rights, medical advice, law-enforcement
+  prediction, ...) must be passed on to anyone the model or its derivatives are distributed to.
+- `src/flint/ml/migan.mojo` runs MI-GAN (https://github.com/Picsart-AI-Research/MI-GAN, Copyright (c)
+  2024 Picsart AI Research, MIT; see `migan-LICENSE.txt`). Its `LICENSE-WEIGHTS` is the same MIT text,
+  so the weights allow commercial use. Flint does not include them: `tools/migan/fetch.sh`
+  downloads the authors' `migan.onnx` (Hugging Face `andraniksargsyan/migan`, MIT) outside the
+  repository; the graph runs on Flint's ONNX interpreter (`ops_conv2d` / `ops_image` are Flint's
+  own kernels). Not used: the MI-GAN repository's `torch_utils/` and `dnnlib/` folders, which are
+  NVIDIA StyleGAN2-ADA code under NVIDIA's proprietary source licence. Provenance note: the
+  released model was trained on Places365 (a dataset licensed for non-commercial research and
+  education) with a Co-Mod-GAN teacher (BSD-2-Clause code built on StyleGAN2, NVIDIA Source Code
+  License-NC); neither is a licence on MI-GAN's weights, but check them if your use depends on
+  training-data provenance.
+- `src/flint/ml/realesrgan.mojo` runs Real-ESRGAN (https://github.com/xinntao/Real-ESRGAN, code
+  BSD-3-Clause, Copyright (c) 2021 Xintao Wang; see `realesrgan-LICENSE.txt`). The networks
+  (RRDBNet from BasicSR, Apache-2.0, and SRVGGNetCompact), the tile/pad geometry, the alpha and
+  grey handling and the denoise blend (DNI) are written in Mojo from the papers and the
+  reference code; no Python code is copied. The licence of the released weights
+  (`RealESRGAN_x4plus`, `RealESRGAN_x4plus_anime_6B`, `realesr-general-x4v3`,
+  `realesr-general-wdn-x4v3`, `realesr-animevideov3`) is not stated anywhere upstream: the
+  release notes and model files carry none, and the issues asking about it (#677, #1016, #1018)
+  are unanswered. The claim in #1004 that the OpenMMLab licence applies gives no source. The
+  training data is DIV2K, Flickr2K and OST, which have their own terms. Flint therefore treats
+  the weights as a user-supplied download: `tools/upscale/fetch.sh` downloads them outside the
+  repository (sha256-checked), and `tools/upscale/convert.py` converts them to safetensors. Flint
+  ships no weights, conversions or ONNX exports. `tools/upscale/reference.py` (torch) is used
+  only for verification. The tiny test nets in `tests/fixtures/upscale/` have random weights.
+- `src/flint/render/pixel_scale.mojo` and `pixel_scale_vk.mojo` implement pixel-art
+  magnifiers. MMPX follows the MIT-licensed JCGT 10(2) 2021 supplement shader (Copyright 2020
+  Morgan McGuire & Mara Gagiu). Super-xBR follows the weights of Hyllian's MIT-licensed 3-pass
+  shaders (Copyright (c) 2015 Hyllian). Both notices are in `mmpx-LICENSE.txt`. Scale2x / EPX
+  and Scale3x / Scale4x are written from their published rules. The GPL xBRZ code and the LGPL
+  xBR / HQX implementations were not used. The JCGT test images (some CC BY-SA, one
+  no-redistribution) are not included: the golden images in `tests/fixtures/upscale/` come from
+  a synthetic sprite sheet.
 - `src/flint/ml/depth/` (`flint.ml.depth`) and `src/flint/ml/torch_pt.mojo` are original pure-Mojo
   implementations of Depth Anything V2 (https://github.com/DepthAnything/Depth-Anything-V2,
   Apache-2.0), Depth Anything 3 (https://github.com/ByteDance-Seed/Depth-Anything-3, Copyright
