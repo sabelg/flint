@@ -909,6 +909,23 @@ struct ArticulatedRagdoll(Copyable, Movable):
     var is_active: Bool
     var still_seconds: Float32
     var steps_taken: Int
+    # World-space drives (physics-driven animation blending): per limb, a mass-normalised
+    # spring toward an animated world target interpolated across the frame's substeps, with
+    # gravity compensation scaled by the limb's drive strength.
+    var drive_on: Bool
+    var drive_from_pos: List[Vec3]
+    var drive_to_pos: List[Vec3]
+    var drive_from_rot: List[Quat]
+    var drive_to_rot: List[Quat]
+    var drive_vel: List[Vec3]
+    var drive_omega: List[Vec3]
+    var drive_strength: List[Float32]
+    var limb_motor: List[Float32]
+    var drive_linear_hz: Float32
+    var drive_angular_hz: Float32
+    var drive_damping_ratio: Float32
+    var drive_max_accel: Float32
+    var drive_max_ang_accel: Float32
 
     def __init__(out self):
         self.limbs = List[ArticulatedLimbDef]()
@@ -937,6 +954,20 @@ struct ArticulatedRagdoll(Copyable, Movable):
         self.is_active = False
         self.still_seconds = Float32(0.0)
         self.steps_taken = 0
+        self.drive_on = False
+        self.drive_from_pos = List[Vec3]()
+        self.drive_to_pos = List[Vec3]()
+        self.drive_from_rot = List[Quat]()
+        self.drive_to_rot = List[Quat]()
+        self.drive_vel = List[Vec3]()
+        self.drive_omega = List[Vec3]()
+        self.drive_strength = List[Float32]()
+        self.limb_motor = List[Float32]()
+        self.drive_linear_hz = Float32(5.0)
+        self.drive_angular_hz = Float32(7.0)
+        self.drive_damping_ratio = Float32(1.0)
+        self.drive_max_accel = Float32(150.0)
+        self.drive_max_ang_accel = Float32(1200.0)
 
     def limb_count(self) -> Int:
         return len(self.limbs)
@@ -1278,9 +1309,12 @@ struct ArticulatedRagdoll(Copyable, Movable):
             var p = def_i.parent_limb
             if p < 0 or p >= len(self.limbs):
                 continue
-            var kp = def_i.active_stiffness * self.motor_scale
-            var kd = def_i.active_damping * self.motor_scale
-            var max_tau = def_i.max_torque * self.motor_scale
+            var lm = self.motor_scale
+            if i < len(self.limb_motor):
+                lm *= self.limb_motor[i]
+            var kp = def_i.active_stiffness * lm
+            var kd = def_i.active_damping * lm
+            var max_tau = def_i.max_torque * lm
             if (kp <= Float32(0.0) and kd <= Float32(0.0)) or max_tau <= Float32(0.0):
                 continue
 
@@ -1456,6 +1490,78 @@ struct ArticulatedRagdoll(Copyable, Movable):
         for i in range(len(self.limbs)):
             self.states[i].com_pos = self.states[i].com_pos + com_shift
 
+    def set_world_targets(mut self, pos: List[Vec3], rot: List[Quat], dt: Float32, reset: Bool = False):
+        """Sets each limb's animated world target (CoM `pos[i]`, rotation `rot[i]`) for the next
+        `step(dt)`. The previous targets become the start of the frame, so the drives follow the
+        animation's motion smoothly; `reset` (or a limb-count change) starts from rest instead.
+        New limbs get full drive strength and local motor scale."""
+        var n = len(self.limbs)
+        if len(pos) < n or len(rot) < n:
+            return
+        if reset or len(self.drive_to_pos) != n:
+            self.drive_from_pos = List[Vec3](length=n, fill=Vec3())
+            self.drive_to_pos = List[Vec3](length=n, fill=Vec3())
+            self.drive_from_rot = List[Quat](length=n, fill=Quat())
+            self.drive_to_rot = List[Quat](length=n, fill=Quat())
+            self.drive_vel = List[Vec3](length=n, fill=Vec3())
+            self.drive_omega = List[Vec3](length=n, fill=Vec3())
+            if len(self.drive_strength) != n:
+                self.drive_strength = List[Float32](length=n, fill=Float32(1.0))
+                self.limb_motor = List[Float32](length=n, fill=Float32(1.0))
+            for i in range(n):
+                self.drive_from_pos[i] = pos[i]
+                self.drive_to_pos[i] = pos[i]
+                self.drive_from_rot[i] = rot[i]
+                self.drive_to_rot[i] = rot[i]
+        else:
+            var inv_dt = Float32(1.0) / dt if dt > Float32(1.0e-6) else Float32(0.0)
+            for i in range(n):
+                self.drive_from_pos[i] = self.drive_to_pos[i]
+                self.drive_from_rot[i] = self.drive_to_rot[i]
+                self.drive_to_pos[i] = pos[i]
+                self.drive_to_rot[i] = rot[i]
+                self.drive_vel[i] = (pos[i] - self.drive_from_pos[i]) * inv_dt
+                var dq = rot[i].multiply(self.drive_from_rot[i].conjugate()).normalized()
+                self.drive_omega[i] = det_quat_to_scaled_angle(dq) * inv_dt
+        self.drive_on = True
+
+    def clear_world_targets(mut self):
+        self.drive_on = False
+
+    def _apply_world_drives(mut self, h: Float32, alpha: Float32):
+        """Implicit mass-normalised PD toward the targets interpolated at `alpha` of the frame."""
+        if not self.drive_on or self.is_limp or len(self.drive_to_pos) != len(self.limbs):
+            return
+        comptime TAU_F32: Float32 = 6.28318530717958647692
+        var wl = TAU_F32 * self.drive_linear_hz
+        var wa = TAU_F32 * self.drive_angular_hz
+        for i in range(len(self.limbs)):
+            var st = self.drive_strength[i] if i < len(self.drive_strength) else Float32(1.0)
+            if st <= Float32(1.0e-4):
+                continue
+            var kl = wl * wl * st
+            var dl = Float32(2.0) * self.drive_damping_ratio * wl * st
+            var ka = wa * wa * st
+            var da = Float32(2.0) * self.drive_damping_ratio * wa * st
+            var tp = self.drive_from_pos[i] + (self.drive_to_pos[i] - self.drive_from_pos[i]) * alpha
+            var tr = self.drive_from_rot[i].nlerp(self.drive_to_rot[i], alpha)
+            var e = tp - self.states[i].com_pos
+            var ev = self.drive_vel[i] - self.states[i].linear_vel
+            var dv = (e * (h * kl) + ev * (h * (dl + h * kl))) * (Float32(1.0) / (Float32(1.0) + h * dl + h * h * kl))
+            var cap = self.drive_max_accel * h
+            var dv_len = dv.length()
+            if dv_len > cap and dv_len > Float32(1.0e-9):
+                dv = dv * (cap / dv_len)
+            self.states[i].linear_vel = self.states[i].linear_vel + dv - self.gravity * (h * min(Float32(1.0), st))
+            var ea = det_quat_to_scaled_angle(tr.multiply(self.states[i].rotation.conjugate()))
+            var ew = self.drive_omega[i] - self.states[i].angular_vel
+            var dw = (ea * (h * ka) + ew * (h * (da + h * ka))) * (Float32(1.0) / (Float32(1.0) + h * da + h * h * ka))
+            var cap_w = self.drive_max_ang_accel * h
+            var dw_len = dw.length()
+            if dw_len > cap_w and dw_len > Float32(1.0e-9):
+                dw = dw * (cap_w / dw_len)
+            self.states[i].angular_vel = self.states[i].angular_vel + dw
+
     def step(mut self, dt: Float32, substeps: Int = 4):
         """Advances 6-DOF articulated rigid-capsule physics by `dt` in `substeps` steps."""
         if dt <= Float32(0.0) or len(self.limbs) == 0:
@@ -1464,8 +1570,9 @@ struct ArticulatedRagdoll(Copyable, Movable):
         var h = dt / Float32(n_sub)
         var inv_h = Float32(1.0) / h
 
-        for _ in range(n_sub):
+        for sub in range(n_sub):
             self._apply_active_pd_motors(h)
+            self._apply_world_drives(h, Float32(sub + 1) / Float32(n_sub))
 
             var lin_keep = max(Float32(0.0), Float32(1.0) - self.linear_damping * h)
             var ang_keep = max(Float32(0.0), Float32(1.0) - self.angular_damping * h)
