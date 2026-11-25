@@ -529,7 +529,7 @@ struct OnnxModel(Movable):
             if kk.shape[d] != q.shape[d] or v.shape[d] != q.shape[d]:
                 return Tensor()
             X *= q.shape[d]
-        if D > 64:
+        if D > 512:  # GpuMatmul's wide-head kernel covers 65..512
             return Tensor()
         var qshape = q.shape.copy()
         if self.resident:

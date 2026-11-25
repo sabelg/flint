@@ -60,3 +60,51 @@
 - GEM-X's YOLOX person detector is not ported and must not be added: its weights are trained on
   the Human-Art dataset, which is licensed for non-commercial use only. Person boxes come from
   the caller's detector or from `Gemx.track` (keypoint tracking from a first-frame box).
+- `src/flint/ml/make_it_animatable.mojo` ports the inference pipeline of Make-It-Animatable v1
+  (https://github.com/jasongzy/Make-It-Animatable, Copyright (c) 2025 Zhiyang Guo, MIT; its point
+  encoder follows 3DShape2VecSet, MIT; see `make-it-animatable-LICENSE.txt`): surface and hand
+  re-sampling, the Hips frame, skin-weight clean-up and the rest-pose transforms.
+  `tools/make_it_animatable/export.py` and `reference.py` import a local checkout. Flint does not
+  include the weights or the converted graphs; the v1 checkpoints (Hugging Face
+  `jasongzy/Make-It-Animatable`, `output/best/new/`) are Apache-2.0 per their model card, which
+  allows commercial use. Provenance note: upstream trained them on characters rigged by Adobe
+  Mixamo, samples of the 3DBiCar dataset, and started from a 3DShape2VecSet autoencoder
+  pre-trained on ShapeNet; those datasets' own terms are not a licence on the weights, but
+  check them if your use depends on training-data provenance. v2 is not ported: it needs the
+  Hunyuan3D 2.1 ShapeVAE (Tencent Hunyuan Community License, territory-restricted).
+- `src/flint/ml/triposg.mojo`, `triposg_gpu.mojo` and `triposg_mesh.mojo` run TripoSG
+  (https://github.com/VAST-AI-Research/TripoSG, Copyright (c) 2025 VAST-AI-Research and
+  contributors, MIT; see `triposg-LICENSE.txt`). The code and the VAST-AI/TripoSG weights are MIT.
+  Its image encoder is Meta's DINOv2-L (Apache-2.0, `dinov2-LICENSE.txt`). Flint does not include
+  any weights: `TripoSG.load` reads a downloaded Hugging Face folder. The Mojo code is written from
+  the model's math and checked against the upstream PyTorch modules with
+  `tools/triposg/reference.py`, which imports a local TripoSG checkout and Hugging Face
+  diffusers / transformers (Apache-2.0) at verification time only.
+- TripoSG's NOTICE says parts of its Python code derive from HunyuanDiT and FlashVDM, which are
+  under Tencent Hunyuan community licences that exclude the EU, UK and South Korea. Flint copies
+  none of that code: the DiT is implemented from the architecture, the coarse-to-fine SDF
+  extraction is Flint's own (a MISE-style refinement of cells near the surface), FlashVDM's top-k
+  attention is not used, and the marching cubes builds its polygons by walking cube faces
+  rather than from a lookup table.
+- TripoSG's default background remover, BRIA RMBG-1.4, is non-commercial ("bria-rmbg-1.4"
+  licence) and is not used or downloaded. Flint uses the image's alpha channel when it has one,
+  otherwise it keys out a plain background. A permissive learned matting model (BiRefNet: MIT
+  weights) could replace this later.
+- `src/flint/ml/diffusion/` (`flint.ml.diffusion`) is an original pure-Mojo latent-diffusion
+  stack: UNet, KL / VQ autoencoders, CLIP text and vision towers, CLIP BPE tokenizer, a
+  `torch.Generator`-compatible RNG and DDIM / Euler / LCM schedulers. It is written from the model
+  maths and checked against Hugging Face diffusers / transformers / PyTorch outputs
+  (`tools/diffusion/reference.py`, Apache-2.0 / BSD libraries imported at verification time; no
+  code is copied). Flint includes no weights: `tools/diffusion/fetch.py` downloads them outside
+  the repository.
+- StableMaterials (https://huggingface.co/gvecchio/StableMaterials) is published under an
+  OpenRAIL licence, with no licence file in the repository. It allows commercial use, but its
+  use-based restrictions must be passed on to anyone who runs it; see
+  `stablematerials-LICENSE.txt`. Its CLIP ViT-L/14 text and vision encoders are OpenAI CLIP
+  weights (MIT, `openai-clip-LICENSE.txt`).
+- MatFuse (https://huggingface.co/gvecchio/MatFuse, Copyright (c) 2024 Giuseppe Vecchio, MIT; see
+  `matfuse-LICENSE.txt`): UNet, VQ decoder and condition encoder. Its CLIP ViT-B/16 encoders are
+  read from `sentence-transformers/clip-ViT-B-16`, a repackaging of OpenAI's CLIP ViT-B/16
+  weights. That repository declares no licence of its own; the weights are OpenAI's
+  (MIT via github.com/openai/CLIP, `openai-clip-LICENSE.txt`), the same ones MatFuse loads with
+  `clip.load("ViT-B/16")`.
