@@ -12,4 +12,8 @@
   - `motionbricks`: the MotionBricks motion-inbetweening runtime on top of `OnnxModel`
   - `unirig`, `unirig_skin`, `unirig_rig`: UniRig automatic rigging (skeleton generation, skin
     weights, skinned glTF output)
+  - `safetensors`: memory-mapped `.safetensors` weights (zero-copy F32, F16 / BF16 converted)
+  - `moonshine`, `moonshine_gpu`, `moonshine_audio`, `moonshine_tokenizer`: Moonshine v2
+    streaming speech-to-text (encoder, KV-cached decoder, CPU / MAX GPU), its 16 kHz front end
+    (WAV reading, resampling, CMVN frames, energy VAD), BPE decoding and voice-command matching
 """
