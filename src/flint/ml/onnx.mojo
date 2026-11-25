@@ -10,6 +10,7 @@ the operators listed in `op_code`. Unsupported operators fail at load time, not 
 
 from std.collections import Dict
 from std.time import perf_counter_ns
+from std.math import floor
 from std.ffi import external_call
 from flint.core.jobs import JobPool, default_worker_count
 from flint.platform.os import open_read, close_fd, write_bytes
@@ -17,6 +18,10 @@ from std.collections import Optional
 from flint.ml.protobuf import PbReader, WIRE_LEN
 from flint.ml.gpu import GpuMatmul, FP, gpu_binary_supported, gpu_unary_supported
 from flint.ml.tensor import Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, numel_of, shape_str, norm_axis
+from flint.ml.ops_ext import (
+    reduce_mean, lstm, conv1d_ext, conv_transpose1d, pad, round_even, stft, nonzero, resize_linear,
+    conv1d_par, conv1d_gpu, row_binary_applies, par_row_binary, par_sin_cos_square, PAR_MIN,
+)
 from flint.ml.fast import par_unary, par_binary, par_gather_rows, par_layer_norm, attention
 from flint.ml.ops import (
     unary, binary, where, clip, cast, transpose, concat, gather, gather_elements, scatter_elements,
@@ -63,6 +68,16 @@ comptime OP_IDENTITY: Int = 32
 comptime OP_SPLIT: Int = 33
 comptime OP_EINSUM: Int = 34
 comptime OP_BATCH_NORM: Int = 35
+# 60..79: recurrent / transposed-conv / signal ops (kernels in `ops_ext`)
+comptime OP_REDUCE_MEAN: Int = 60
+comptime OP_LSTM: Int = 61
+comptime OP_CONV_TRANSPOSE: Int = 62
+comptime OP_PAD: Int = 63
+comptime OP_ROUND: Int = 64
+comptime OP_GREATER_EQ: Int = 65
+comptime OP_LESS_EQ: Int = 66
+comptime OP_STFT: Int = 67
+comptime OP_NONZERO: Int = 68
 comptime OP_UNARY: Int = 100   # + U_* code
 comptime OP_BINARY: Int = 200  # + B_* code
 
@@ -105,6 +120,15 @@ def op_code(name: String) -> Int:
     if name == "Split": return OP_SPLIT
     if name == "Einsum": return OP_EINSUM
     if name == "BatchNormalization": return OP_BATCH_NORM
+    if name == "ReduceMean": return OP_REDUCE_MEAN
+    if name == "LSTM": return OP_LSTM
+    if name == "ConvTranspose": return OP_CONV_TRANSPOSE
+    if name == "Pad": return OP_PAD
+    if name == "Round": return OP_ROUND
+    if name == "GreaterOrEqual": return OP_GREATER_EQ
+    if name == "LessOrEqual": return OP_LESS_EQ
+    if name == "STFT": return OP_STFT
+    if name == "NonZero": return OP_NONZERO
     if name == "Erf": return OP_UNARY + U_ERF
     if name == "Exp": return OP_UNARY + U_EXP
     if name == "Tanh": return OP_UNARY + U_TANH
@@ -1172,7 +1196,7 @@ struct OnnxModel(Movable):
         if self.gpu and op0 == OP_MATMUL and self.fuse[k] == 3:
             out.append(self._gpu_gather_matmul(k))
             return out^
-        if self.gpu and (op0 == OP_MATMUL or op0 == OP_GEMM or op0 == OP_CONV):
+        if self.gpu and (op0 == OP_MATMUL or op0 == OP_GEMM or (op0 == OP_CONV and not self._is_ext(k))):
             if op0 == OP_CONV:
                 self._ensure_host(self.nodes[k].inputs[0])
             var g = self._gpu_product(k)
@@ -1219,6 +1243,8 @@ struct OnnxModel(Movable):
             if self.fuse[k] == 2:
                 self._ensure_host(self.fuse_q[k])
                 self._ensure_host(self.fuse_k[k])
+        if self._is_ext(k):
+            return self._exec_ext(k)
         ref node = self.nodes[k]
         var op = node.op
         ref x = self.values[node.inputs[0]]
@@ -1487,6 +1513,146 @@ struct OnnxModel(Movable):
         else:
             raise Error("operator not implemented")
         return out^
+
+
+    def _is_ext(self, k: Int) -> Bool:
+        """Whether node k runs through `_exec_ext`: ops 60..79, strided / grouped Conv, linear Resize."""
+        ref node = self.nodes[k]
+        var op = node.op
+        if op >= 60 and op < 80:
+            return True
+        if op == OP_CONV:
+            return self.values[node.inputs[0]].rank() == 3
+        if op == OP_RESIZE:
+            return node.attr_s("mode") == "linear"
+        if len(node.inputs) == 2 and op >= OP_BINARY:
+            ref a = self.values[node.inputs[0]]
+            ref b = self.values[node.inputs[1]]
+            if op - OP_BINARY == B_POW:
+                return a.is_float() and a.numel() >= PAR_MIN and b.numel() == 1 and b.is_float() and b.fget(0) == 2.0
+            return row_binary_applies(op - OP_BINARY, a, b)
+        if (op == OP_UNARY + U_SIN or op == OP_UNARY + U_COS) and len(node.inputs) > 0:
+            ref a = self.values[node.inputs[0]]
+            return a.is_float() and a.numel() >= PAR_MIN
+        return False
+
+    def _exec_ext(mut self, k: Int) raises -> List[Tensor]:
+        var out = List[Tensor]()
+        ref node = self.nodes[k]
+        var op = node.op
+        ref x = self.values[node.inputs[0]]
+        if op == OP_REDUCE_MEAN:
+            var axes = node.attr_ints("axes")
+            var ai = self._in(k, 1)
+            if ai >= 0:
+                axes = self.values[ai].int_list()
+            if len(axes) == 0 and node.attr_i("noop_with_empty_axes", 0) != 0:
+                out.append(x.reshaped(x.shape.copy()))
+            else:
+                out.append(reduce_mean(x, axes, node.attr_i("keepdims", 1) != 0))
+        elif op == OP_LSTM:
+            if self._in(k, 4) >= 0 or self._in(k, 7) >= 0:
+                raise Error("LSTM: sequence_lens and peepholes are not supported")
+            if node.attr_i("input_forget", 0) != 0 or node.find("activations") >= 0 or node.find("clip") >= 0:
+                raise Error("LSTM: only the default activations are supported")
+            var bi = self._in(k, 3)
+            var hi = self._in(k, 5)
+            var ci = self._in(k, 6)
+            var dirn = node.attr_s("direction")
+            var res = lstm(self.pool, x, self.values[node.inputs[1]], self.values[node.inputs[2]],
+                           self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0,
+                           self.values[hi if hi >= 0 else node.inputs[0]], hi >= 0,
+                           self.values[ci if ci >= 0 else node.inputs[0]], ci >= 0,
+                           node.attr_i("hidden_size", 0), dirn if dirn.byte_length() > 0 else "forward",
+                           node.attr_i("layout", 0))
+            for t in res:
+                out.append(t.copy())
+        elif op == OP_CONV or op == OP_CONV_TRANSPOSE:
+            var pads = node.attr_ints("pads")
+            var dil = node.attr_ints("dilations")
+            var strides = node.attr_ints("strides")
+            var bi = self._in(k, 2)
+            if node.attr_s("auto_pad").byte_length() > 0 and node.attr_s("auto_pad") != "NOTSET":
+                raise Error("Conv: auto_pad is not supported")
+            var p0 = pads[0] if len(pads) > 0 else 0
+            var p1 = pads[1] if len(pads) > 1 else 0
+            var d0 = dil[0] if len(dil) > 0 else 1
+            var s0 = strides[0] if len(strides) > 0 else 1
+            if op == OP_CONV and self.gpu and self.static_value[node.inputs[1]] and x.numel() >= PAR_MIN:
+                out.append(conv1d_gpu(self.gpu.value(), self.pool, x, self.values[node.inputs[1]],
+                                      self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0, p0, p1, d0, s0,
+                                      node.attr_i("group", 1), node.inputs[1]))
+            elif op == OP_CONV:
+                out.append(conv1d_par(self.pool, x, self.values[node.inputs[1]], self.values[bi if bi >= 0 else node.inputs[0]],
+                                      bi >= 0, p0, p1, d0, s0, node.attr_i("group", 1)))
+            else:
+                if len(node.attr_ints("output_shape")) > 0:
+                    raise Error("ConvTranspose: output_shape is not supported")
+                var opd = node.attr_ints("output_padding")
+                out.append(conv_transpose1d(self.pool, x, self.values[node.inputs[1]],
+                                            self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0, p0, p1, d0, s0,
+                                            opd[0] if len(opd) > 0 else 0, node.attr_i("group", 1)))
+        elif op == OP_PAD:
+            var vi = self._in(k, 2)
+            var ai = self._in(k, 3)
+            var axes = List[Int]()
+            if ai >= 0:
+                axes = self.values[ai].int_list()
+            var value = 0.0
+            if vi >= 0 and self.values[vi].numel() > 0:
+                value = self.values[vi].get(0)
+            out.append(pad(x, self.values[node.inputs[1]].int_list(), axes, node.attr_s("mode"), value))
+        elif op == OP_ROUND:
+            out.append(round_even(x))
+        elif op == OP_GREATER_EQ:
+            out.append(unary(U_NOT, binary(B_LT, x, self.values[node.inputs[1]])))
+        elif op == OP_LESS_EQ:
+            out.append(unary(U_NOT, binary(B_GT, x, self.values[node.inputs[1]])))
+        elif op == OP_STFT:
+            var wi = self._in(k, 2)
+            var li = self._in(k, 3)
+            out.append(stft(x, self.values[node.inputs[1]].int_at(0), self.values[wi if wi >= 0 else node.inputs[0]],
+                            wi >= 0, self.values[li].int_at(0) if li >= 0 else 0, node.attr_i("onesided", 1) != 0))
+        elif op == OP_NONZERO:
+            out.append(nonzero(x))
+        elif op == OP_BINARY + B_POW:
+            out.append(par_sin_cos_square(self.pool, -1, x))
+        elif op >= OP_BINARY:
+            out.append(par_row_binary(self.pool, op - OP_BINARY, x, self.values[node.inputs[1]]))
+        elif op == OP_UNARY + U_SIN or op == OP_UNARY + U_COS:
+            out.append(par_sin_cos_square(self.pool, op - OP_UNARY, x))
+        elif op == OP_RESIZE:
+            var cm = node.attr_s("coordinate_transformation_mode")
+            if cm == "tf_crop_and_resize":
+                raise Error("Resize: tf_crop_and_resize is not supported")
+            var s = List[Int]()
+            var sc = List[Float64]()
+            var zi = self._in(k, 3)
+            var si = self._in(k, 2)
+            if zi >= 0 and self.values[zi].numel() > 0:
+                s = self.values[zi].int_list()
+                for _ in range(x.rank()):
+                    sc.append(0.0)
+            elif si >= 0 and self.values[si].numel() > 0:
+                for d in range(x.rank()):
+                    var f = self.values[si].get(d)
+                    sc.append(f)
+                    s.append(Int(floor(Float64(x.shape[d]) * f)))
+            else:
+                raise Error("Resize needs scales or sizes")
+            out.append(resize_linear(x, s, sc, cm if cm.byte_length() > 0 else "half_pixel"))
+        else:
+            raise Error("operator not implemented")
+        return out^
+
+    def keep_value(mut self, name: String) raises:
+        """Keep an intermediate value alive after `run()` so `output(name)` can read it."""
+        var found = self.ids.get(name)
+        if not found:
+            raise Error("ONNX: no value named " + name)
+        var v = found.value()
+        self.last_use[v] = len(self.nodes)
+        self.output_ids.append(v)
 
 
 def _attention_equations(e1: String, e2: String) -> Bool:

@@ -140,7 +140,17 @@ def _fop(op: Int, a: Float32, b: Float32) -> Float32:
             return a * a
         if b == 0.5:
             return sqrt(a)
-        return exp(b * log(a)) if a > 0 else (Float32(1.0) if b == 0 else Float32(0.0))
+        if a > 0:
+            return exp(b * log(a))
+        if b == 0:
+            return 1.0
+        if a == 0:
+            return 0.0
+        # negative base: defined for integer exponents (odd ones keep the sign)
+        if floor(b) == b:
+            var m = exp(b * log(-a))
+            return -m if Int(b) % 2 != 0 else m
+        return Float32(0.0) / Float32(0.0)
     # fmod
     return a - b * Float32(Int(a / b))
 

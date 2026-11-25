@@ -12,4 +12,8 @@
   - `motionbricks`: the MotionBricks motion-inbetweening runtime on top of `OnnxModel`
   - `unirig`, `unirig_skin`, `unirig_rig`: UniRig automatic rigging (skeleton generation, skin
     weights, skinned glTF output)
+  - `ops_ext`: LSTM, ConvTranspose, Pad, STFT, linear Resize, ReduceMean, NonZero, Round and
+    parallel / GPU 1-D convolution (op codes 60..79 in `onnx`)
+  - `phonemize`: English G2P (misaki lexicons, morphology, numbers, letter-to-sound fallback)
+  - `kokoro`: Kokoro-82M TTS, `KokoroTTS.load(dir).say(text, voice)` -> 24 kHz samples, timings
 """
