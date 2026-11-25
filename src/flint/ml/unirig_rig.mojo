@@ -180,9 +180,26 @@ def _unit(v: Vec3) -> Vec3:
     return Vec3(v.x / l, v.y / l, v.z / l)
 
 
-def rig_native_model(mut rig: UniRig, mut src: NativeModel, cfg: UrGenConfig) raises -> NativeModel:
-    """Rigs every mesh instance of a glTF scene together: meshes are baked to world space (one
-    node each, identity transform), a joint node tree is added and all meshes share one skin."""
+struct BakedScene(Movable):
+    """A glTF scene's mesh instances baked to world space: `out` holds one mesh per instance
+    (identity transform, not yet skinned), `v` / `f` the combined triangle mesh in UniRig's Z-up
+    frame, `base` each instance's first vertex in `v` and `names` its node name."""
+    var out: NativeModel
+    var v: List[Float32]
+    var f: List[Int]
+    var base: List[Int]
+    var names: List[String]
+
+    def __init__(out self):
+        self.out = NativeModel()
+        self.v = List[Float32]()
+        self.f = List[Int]()
+        self.base = List[Int]()
+        self.names = List[String]()
+
+
+def bake_native_model(mut src: NativeModel) raises -> BakedScene:
+    """Bakes every mesh instance of a glTF scene (Y-up, any node hierarchy) to world space."""
     # mesh instances: (mesh, world matrix)
     var inst_mesh = List[Int]()
     var inst_node = List[Int]()
@@ -203,15 +220,13 @@ def rig_native_model(mut rig: UniRig, mut src: NativeModel, cfg: UrGenConfig) ra
                     inst_mesh.append(mi)
                     inst_node.append(n)
                     inst_xf.append(world[n].copy())
-    var out = NativeModel()
-    out.textures = src.textures.copy()
-    var v = List[Float32]()
-    var f = List[Int]()
-    var base = List[Int]()
+    var sc = BakedScene()
+    sc.out.textures = src.textures.copy()
     for k in range(len(inst_mesh)):
         ref m = src.meshes[inst_mesh[k]]
         var nv = m.vertex_count()
-        base.append(len(v) // 3)
+        sc.base.append(len(sc.v) // 3)
+        sc.names.append(src.nodes[inst_node[k]].name if inst_node[k] >= 0 else "mesh_" + String(k))
         var mesh = m.copy()
         for i in range(nv):
             var p = inst_xf[k].transform_point(Vec3(m.positions[i * 3], m.positions[i * 3 + 1], m.positions[i * 3 + 2]))
@@ -219,9 +234,9 @@ def rig_native_model(mut rig: UniRig, mut src: NativeModel, cfg: UrGenConfig) ra
             mesh.positions[i * 3 + 1] = p.y
             mesh.positions[i * 3 + 2] = p.z
             var z = _yup_to_zup(p)
-            v.append(z.x)
-            v.append(z.y)
-            v.append(z.z)
+            sc.v.append(z.x)
+            sc.v.append(z.y)
+            sc.v.append(z.z)
             if i * 3 + 2 < len(m.normals):
                 var nn = _unit(inst_xf[k].transform_vector(Vec3(m.normals[i * 3], m.normals[i * 3 + 1], m.normals[i * 3 + 2])))
                 mesh.normals[i * 3] = nn.x
@@ -239,32 +254,36 @@ def rig_native_model(mut rig: UniRig, mut src: NativeModel, cfg: UrGenConfig) ra
             mesh.morph_normals[d * 3 + 2] = dn.z
         if len(m.indices) > 0:
             for idx in m.indices:
-                f.append(base[k] + idx)
+                sc.f.append(sc.base[k] + idx)
         else:
             for idx in range(nv - nv % 3):
-                f.append(base[k] + idx)
+                sc.f.append(sc.base[k] + idx)
         mesh.centers = List[Float32]()
         mesh.bounds_verts = 0
-        out.meshes.append(mesh^)
-    if len(v) == 0:
+        sc.out.meshes.append(mesh^)
+    if len(sc.v) == 0:
         raise Error("UniRig: the model has no mesh vertices")
+    return sc^
 
-    var r = rig.rig(v, f, cfg)
-    ref sk = r.skeleton
+
+def skin_baked_model(mut sc: BakedScene, sk: UrSkeleton, weights: List[Float32]) raises -> NativeModel:
+    """Adds a joint node tree for `sk` (Z-up, the baked mesh's space; parents may come in any
+    order but must form a forest) and one skin with the four largest of the dense weights [V, J]."""
     var J = sk.num_bones()
     var jt = List[UInt16]()
     var jw = List[Float32]()
-    top_influences(r.weights, J, jt, jw)
-
+    top_influences(weights, J, jt, jw)
+    var out = sc.out^
+    sc.out = NativeModel()
     # mesh nodes, then joint nodes
-    for k in range(len(inst_mesh)):
+    for k in range(len(sc.base)):
         var node = NativeNode()
-        node.name = src.nodes[inst_node[k]].name if inst_node[k] >= 0 else "mesh_" + String(k)
+        node.name = sc.names[k]
         node.mesh = k
         out.nodes.append(node^)
         out.roots.append(k)
         var nv = out.meshes[k].vertex_count()
-        var b = base[k]
+        var b = sc.base[k]
         out.meshes[k].joints = List[UInt16](length=nv * UR_MAX_INFLUENCES, fill=0)
         out.meshes[k].weights = List[Float32](length=nv * UR_MAX_INFLUENCES, fill=0.0)
         for e in range(nv * UR_MAX_INFLUENCES):
@@ -301,3 +320,11 @@ def rig_native_model(mut rig: UniRig, mut src: NativeModel, cfg: UrGenConfig) ra
     out.skins.append(skin^)
     out.max_influences = UR_MAX_INFLUENCES
     return out^
+
+
+def rig_native_model(mut rig: UniRig, mut src: NativeModel, cfg: UrGenConfig) raises -> NativeModel:
+    """Rigs every mesh instance of a glTF scene together: meshes are baked to world space (one
+    node each, identity transform), a joint node tree is added and all meshes share one skin."""
+    var sc = bake_native_model(src)
+    var r = rig.rig(sc.v, sc.f, cfg)
+    return skin_baked_model(sc, r.skeleton, r.weights)

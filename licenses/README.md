@@ -108,3 +108,22 @@
   weights. That repository declares no licence of its own; the weights are OpenAI's
   (MIT via github.com/openai/CLIP, `openai-clip-LICENSE.txt`), the same ones MatFuse loads with
   `clip.load("ViT-B/16")`.
+- `src/flint/ml/magicarticulate.mojo` and `magicarticulate_mesh.mojo` port the skeleton-generation
+  inference of MagicArticulate (https://github.com/Seed3D/MagicArticulate) and Puppeteer
+  (https://github.com/Seed3D/Puppeteer), Copyright (c) 2025 Bytedance Ltd. and/or its affiliates,
+  Apache-2.0 (`magicarticulate-LICENSE.txt`, `puppeteer-LICENSE.txt`): the token layout and extra
+  decoder embeddings, greedy decoding, detokenisation, joint merging / connectivity repair and
+  root choice, and MeshAnything's watertight point-cloud preprocessing. The unsigned distance
+  grid follows mesh2sdf (MIT), which uses Christopher Batty's SDFGen (MIT,
+  `sdfgen-LICENSE.txt`); the shell is extracted with Flint's own marching tetrahedra.
+  `tools/magicarticulate/export.py` imports local checkouts at conversion / verification time.
+  Flint does not include the weights or the converted graphs. The checkpoints (Hugging Face
+  `Seed3D/MagicArticulate`, `Seed3D/Puppeteer`) are Apache-2.0 per their model cards. Their shape
+  encoder is Michelangelo (code GPL-3.0, weights LGPL-3.0), so the exported
+  `magicarticulate_encoder.onnx` / `puppeteer_encoder.onnx` are GPL-derived: Flint does not
+  include them, and builds that redistribute Flint must not bundle them.
+- Puppeteer's skinning network is not ported and must not be added: it is built on NVIDIA
+  PartField (code and `partfield-ckpt` weights under the NVIDIA License, non-commercial use only).
+  Neither does MagicArticulate release a skinning model; `MagicArticulate.rig` uses the MIT UniRig
+  skin network instead. Puppeteer's animation stage (a per-video optimisation using Video Depth
+  Anything, CoTracker and PyTorch3D) is not ported either.
