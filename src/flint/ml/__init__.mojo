@@ -18,7 +18,7 @@
     (WAV reading, resampling, CMVN frames, energy VAD), BPE decoding and voice-command matching
   - `llm`: small-LLM runtime for NPC dialogue and behaviour choice (Qwen3, SmolLM3 from
     safetensors; int8 / int4 weights; grammar-constrained BehaviorTree actions)
-  - `ops_ext`: LSTM, ConvTranspose, Pad, STFT, linear Resize, ReduceMean, NonZero, Round and
+  - `ops_ext`: LSTM, ConvTranspose, Pad, STFT, linear Resize, ReduceMean / Min / Max, GatherND, NonZero, Round and
     parallel / GPU 1-D convolution (op codes 60..79 in `onnx`)
   - `phonemize`: English G2P (misaki lexicons, morphology, numbers, letter-to-sound fallback)
   - `kokoro`: Kokoro-82M TTS, `KokoroTTS.load(dir).say(text, voice)` -> 24 kHz samples, timings
@@ -35,4 +35,6 @@
   - `magenta_rt`, `musiccoca`, `audio_codec`, `audio_codec_gpu`, `jax_random`: Magenta RealTime 2
     streaming music (Depthformer LM, MusicCoCa text styles, SpectroStream 48 kHz decoder on CPU /
     MAX GPU, bit-exact `jax.random` sampling) and `MagentaRtStream` for the `AudioServer`
+  - `metatron`: NVIDIA Metatron-v1 G1 humanoid controller (policy, ProtoMotions host port,
+    `G1Sim` on `flint.physics.mjcf`)
 """

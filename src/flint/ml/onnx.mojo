@@ -26,6 +26,7 @@ from flint.ml.ops_more import (
 from flint.ml.ops_ext import (
     reduce_mean, lstm, conv1d_ext, conv_transpose1d, pad, round_even, stft, nonzero, resize_linear,
     conv1d_par, conv1d_gpu, row_binary_applies, par_row_binary, par_sin_cos_square, PAR_MIN,
+    gather_nd, reduce_min_max,
 )
 from flint.ml.gpu import GpuMatmul, FP, gpu_binary_supported, gpu_unary_supported, GU_BF16
 from flint.ml.tensor import Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, DT_BF16, numel_of, shape_str, norm_axis
@@ -91,6 +92,8 @@ comptime OP_REDUCE_MAX: Int = 81
 comptime OP_GRU: Int = 82
 comptime OP_SOFTPLUS: Int = 83
 comptime OP_CEIL: Int = 84
+comptime OP_GATHER_ND: Int = 69
+comptime OP_REDUCE_MIN: Int = 70
 comptime OP_UNARY: Int = 100   # + U_* code
 comptime OP_BINARY: Int = 200  # + B_* code
 
@@ -147,6 +150,8 @@ def op_code(name: String) -> Int:
     if name == "GRU": return OP_GRU
     if name == "Softplus": return OP_SOFTPLUS
     if name == "Ceil": return OP_CEIL
+    if name == "GatherND": return OP_GATHER_ND
+    if name == "ReduceMin": return OP_REDUCE_MIN
     if name == "Erf": return OP_UNARY + U_ERF
     if name == "Exp": return OP_UNARY + U_EXP
     if name == "Tanh": return OP_UNARY + U_TANH
@@ -1761,14 +1766,19 @@ struct OnnxModel(Movable):
                             wi >= 0, self.values[li].int_at(0) if li >= 0 else 0, node.attr_i("onesided", 1) != 0))
         elif op == OP_NONZERO:
             out.append(nonzero(x))
+        elif op == OP_GATHER_ND:
+            out.append(gather_nd(x, self.values[node.inputs[1]], node.attr_i("batch_dims", 0)))
         elif op == OP_INSTANCE_NORM:
             out.append(par_instance_norm(self.pool, x, self.values[node.inputs[1]], self.values[node.inputs[2]], node.attr_f("epsilon", 1e-5)))
-        elif op == OP_REDUCE_MAX:
+        elif op == OP_REDUCE_MIN or op == OP_REDUCE_MAX:
             var axes = node.attr_ints("axes")
             var ai = self._in(k, 1)
             if ai >= 0:
                 axes = self.values[ai].int_list()
-            out.append(reduce_max(x, axes, node.attr_i("keepdims", 1) != 0))
+            if len(axes) == 0 and node.attr_i("noop_with_empty_axes", 0) != 0:
+                out.append(x.reshaped(x.shape.copy()))
+            else:
+                out.append(reduce_min_max(x, axes, node.attr_i("keepdims", 1) != 0, op == OP_REDUCE_MAX))
         elif op == OP_GRU:
             if self._in(k, 4) >= 0:
                 raise Error("GRU: sequence_lens is not supported")
