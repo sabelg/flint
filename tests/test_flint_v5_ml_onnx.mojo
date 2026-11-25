@@ -7,9 +7,13 @@ Verifies:
      Conv, Reshape, Gemm transB, Softmax, LeakyRelu, Gather, ReduceSum, Atan, Slice, Shape, Cast,
      Concat, TopK, ArgMax, Greater, Where, Unsqueeze) reproduces onnxruntime's outputs on the CPU,
      and again with the matrix products on a MAX GPU when one is present.
-  3. MotionBricks math: Warp-compatible quaternion slerp / basis conversion, and the endpoint
+  3. `tiny_fused.onnx` (`make_tiny_fused.py`): the fusions `OnnxModel` plans — sparse-conv
+     Gather -> Reshape -> MatMul(Transpose(Reshape(weight))) as one gather-GEMM on the GPU and
+     Einsum -> Mul -> Softmax -> Einsum attention (CPU kernel and GPU kernel) — plus
+     BatchNormalization, against onnxruntime.
+  4. MotionBricks math: Warp-compatible quaternion slerp / basis conversion, and the endpoint
      correction lands the generated motion exactly on the last context and first target pose.
-  4. With `MOTIONBRICKS_DIR` set to a MotionBricks checkout: the SOMA model generates a walk from
+  5. With `MOTIONBRICKS_DIR` set to a MotionBricks checkout: the SOMA model generates a walk from
      its own BVH clip, choosing an allowed token count, with finite poses that start on the context.
 """
 from std.math import abs, isnan, sqrt
@@ -103,6 +107,41 @@ def _qclose(a: MbQuat, b: MbQuat, tol: Float32) -> Bool:
     return 1.0 - abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w) < tol
 
 
+def _run_fused(gpu: Bool) raises -> Bool:
+    var m = OnnxModel.load(FIX + "tiny_fused.onnx", 2)
+    if gpu and not m.use_gpu():
+        print("  tiny_fused on GPU: no MAX GPU device, skipped")
+        return False
+    var attn = 0
+    var gmm = 0
+    for k in range(len(m.fuse)):
+        if m.fuse[k] == 2:
+            attn += 1
+        elif m.fuse[k] == 3:
+            gmm += 1
+    assert_equal(attn, 1)
+    assert_equal(gmm, 1)
+    var x = _f32(FIX + "tiny_fused_x.f32")
+    var nbr = _i64(FIX + "tiny_fused_nbr.i64")
+    m.set_input("x", Tensor.floats([70, 8], x^))
+    m.set_input("nbr", Tensor.ints(DT_I64, [70, 27], nbr^))
+    m.run()
+    var y = m.output("y")
+    var want = _f32(FIX + "tiny_fused_y.f32")
+    assert_equal(y.numel(), len(want))
+    var worst: Float32 = 0
+    for k in range(len(want)):
+        worst = max(worst, abs(y.fget(k) - want[k]))
+    assert_true(worst < 5e-5, "tiny_fused y differs from onnxruntime by " + String(worst))
+    print("  tiny_fused (gather-GEMM, attention, BatchNorm) on", m.gpu_name(), ": max |dy| =", worst)
+    return True
+
+
+def test_fused_ops() raises:
+    _ = _run_fused(False)
+    _ = _run_fused(True)
+
+
 def test_motionbricks_math() raises:
     var qa = quat_axis_angle(MbVec3(0, 1, 0), 0.4)
     var qb = quat_axis_angle(MbVec3(0, 1, 0), 1.2)
@@ -170,6 +209,7 @@ def main() raises:
     print("=== Flint v5 flint.ml ONNX + MAX GPU + MotionBricks Suite ===")
     test_broadcasting()
     test_tiny_ops()
+    test_fused_ops()
     test_motionbricks_math()
     test_motionbricks_soma()
     print("=== ALL FLINT v5 ML TESTS PASSED ===")

@@ -7,3 +7,11 @@
 - Flint does not include the MotionBricks models or motion clips. The ONNX models are under the
   NVIDIA Open Model Agreement; the sample motions under the NVIDIA Sample Data Evaluation
   License, which allows internal evaluation only, with no redistribution.
+- `src/flint/ml/unirig.mojo`, `unirig_skin.mojo`, `unirig_rig.mojo` and `opt.mojo` port UniRig
+  (https://github.com/VAST-AI-Research/UniRig, Copyright (c) 2025 VAST-AI-Research, MIT; see
+  `unirig-LICENSE.txt`): the skeleton tokenizer and generation loop, the voxel-skin prior,
+  mesh sampling, Point Transformer V3 serialisation (Pointcept, MIT, `pointcept-LICENSE.txt`) and the reskin step.
+  `tools/unirig/export.py` converts the MIT-licensed checkpoints by importing a local UniRig
+  checkout. The shape encoders inside those checkpoints come from Michelangelo (GPL-3.0), so the
+  exported `unirig_skel_encoder.onnx` and `unirig_skin_global.onnx` are GPL-derived: Flint does
+  not include them, and builds that redistribute Flint must not bundle them.

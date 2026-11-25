@@ -37,6 +37,18 @@ struct PrimExportIds(Copyable, ImplicitlyCopyable, Movable):
     var col_acc: Int
     var idx_acc: Int
     var mat_idx: Int
+    var joints_acc: Int
+    var weights_acc: Int
+    var skin: Int
+
+
+def _prim_attrs(pe: PrimExportIds) -> String:
+    var attrs = '"POSITION": ' + String(pe.pos_acc) + ', "NORMAL": ' + String(pe.norm_acc) + ', "TEXCOORD_0": ' + String(pe.uv_acc)
+    if pe.col_acc >= 0:
+        attrs += ', "COLOR_0": ' + String(pe.col_acc)
+    if pe.joints_acc >= 0 and pe.weights_acc >= 0:
+        attrs += ', "JOINTS_0": ' + String(pe.joints_acc) + ', "WEIGHTS_0": ' + String(pe.weights_acc)
+    return attrs
 
 
 def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> List[UInt8]:
@@ -80,7 +92,7 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
         ref mesh = model.meshes[m_idx]
         var vcount = mesh.vertex_count()
         if vcount <= 0:
-            prim_exports.append(PrimExportIds(-1, -1, -1, -1, -1, -1))
+            prim_exports.append(PrimExportIds(-1, -1, -1, -1, -1, -1, -1, -1, -1))
             continue
 
         # POSITION (VEC3 float32 + min/max)
@@ -180,6 +192,39 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
                     '{"bufferView": ' + String(col_bv) + ', "componentType": 5121, "normalized": true, "count": ' + String(vcount) + ', "type": "VEC4"}'
                 )
 
+        # JOINTS_0 (VEC4 uint16 = 5123) + WEIGHTS_0 (VEC4 float), when the mesh is skinned
+        var joints_acc = -1
+        var weights_acc = -1
+        if len(model.nodes) > 0 and mesh.skin >= 0 and mesh.skin < len(model.skins) and len(mesh.joints) >= vcount * 4 and len(mesh.weights) >= vcount * 4:
+            pad4(bin_data, 0)
+            var j_off = len(bin_data)
+            for j_i in range(vcount * 4):
+                var jv = Int(mesh.joints[j_i])
+                bin_data.append(UInt8(jv & 255))
+                bin_data.append(UInt8((jv >> 8) & 255))
+            var j_len = len(bin_data) - j_off
+            var j_bv = len(buffer_views)
+            buffer_views.append(
+                '{"buffer": 0, "byteOffset": ' + String(j_off) + ', "byteLength": ' + String(j_len) + ', "target": 34962}'
+            )
+            joints_acc = len(accessors)
+            accessors.append(
+                '{"bufferView": ' + String(j_bv) + ', "componentType": 5123, "count": ' + String(vcount) + ', "type": "VEC4"}'
+            )
+            pad4(bin_data, 0)
+            var w_off = len(bin_data)
+            for w_i in range(vcount * 4):
+                append_f32_le(bin_data, mesh.weights[w_i])
+            var w_len = len(bin_data) - w_off
+            var w_bv = len(buffer_views)
+            buffer_views.append(
+                '{"buffer": 0, "byteOffset": ' + String(w_off) + ', "byteLength": ' + String(w_len) + ', "target": 34962}'
+            )
+            weights_acc = len(accessors)
+            accessors.append(
+                '{"bufferView": ' + String(w_bv) + ', "componentType": 5126, "count": ' + String(vcount) + ', "type": "VEC4"}'
+            )
+
         # INDICES (SCALAR uint32 = 5125)
         pad4(bin_data, 0)
         var idx_off = len(bin_data)
@@ -263,7 +308,8 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
         var mat_idx = len(materials_json)
         materials_json.append(mat_str)
 
-        prim_exports.append(PrimExportIds(pos_acc, norm_acc, uv_acc, col_acc, idx_acc, mat_idx))
+        prim_exports.append(PrimExportIds(pos_acc, norm_acc, uv_acc, col_acc, idx_acc, mat_idx, joints_acc, weights_acc,
+                                          mesh.skin if joints_acc >= 0 else -1))
 
     # Helper to format a primitive JSON string
     var gltf_meshes_json = List[String]()
@@ -280,9 +326,7 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
             if not first_p:
                 prims_str += ", "
             first_p = False
-            var attrs = '"POSITION": ' + String(pe.pos_acc) + ', "NORMAL": ' + String(pe.norm_acc) + ', "TEXCOORD_0": ' + String(pe.uv_acc)
-            if pe.col_acc >= 0:
-                attrs += ', "COLOR_0": ' + String(pe.col_acc)
+            var attrs = _prim_attrs(pe)
             prims_str += '{"attributes": {' + attrs + '}, "indices": ' + String(pe.idx_acc) + ', "material": ' + String(pe.mat_idx) + ', "mode": 4}'
         prims_str += "]"
         gltf_meshes_json.append('{"primitives": ' + prims_str + "}")
@@ -300,15 +344,15 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
             elif node.mesh >= 0 and node.mesh < len(prim_exports) and prim_exports[node.mesh].pos_acc >= 0:
                 node_prims.append(node.mesh)
 
+            var node_skin = -1
             if len(node_prims) > 0:
+                node_skin = prim_exports[node_prims[0]].skin
                 var prims_str = String("[")
                 for p_i in range(len(node_prims)):
                     if p_i > 0:
                         prims_str += ", "
                     var pe = prim_exports[node_prims[p_i]]
-                    var attrs = '"POSITION": ' + String(pe.pos_acc) + ', "NORMAL": ' + String(pe.norm_acc) + ', "TEXCOORD_0": ' + String(pe.uv_acc)
-                    if pe.col_acc >= 0:
-                        attrs += ', "COLOR_0": ' + String(pe.col_acc)
+                    var attrs = _prim_attrs(pe)
                     prims_str += '{"attributes": {' + attrs + '}, "indices": ' + String(pe.idx_acc) + ', "material": ' + String(pe.mat_idx) + ', "mode": 4}'
                 prims_str += "]"
                 gltf_mesh_id = len(gltf_meshes_json)
@@ -328,6 +372,8 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
                 n_str += ', "scale": [' + fmt_f32(node.scale.x) + ", " + fmt_f32(node.scale.y) + ", " + fmt_f32(node.scale.z) + "]"
             if gltf_mesh_id >= 0:
                 n_str += ', "mesh": ' + String(gltf_mesh_id)
+                if node_skin >= 0:
+                    n_str += ', "skin": ' + String(node_skin)
             if len(node.children) > 0:
                 n_str += ', "children": ['
                 for c_i in range(len(node.children)):
@@ -343,6 +389,35 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
                 roots_json.append(r)
         else:
             roots_json.append(0)
+
+    # SKINS: joint node lists + inverse bind matrices (MAT4 float, column-major)
+    var skins_json = List[String]()
+    if len(model.nodes) > 0:
+        for s_idx in range(len(model.skins)):
+            ref sk = model.skins[s_idx]
+            var sk_str = String('{"joints": [')
+            for j_i in range(len(sk.joints)):
+                if j_i > 0:
+                    sk_str += ", "
+                sk_str += String(sk.joints[j_i])
+            sk_str += "]"
+            if len(sk.inverse_bind) >= len(sk.joints) * 16 and len(sk.joints) > 0:
+                pad4(bin_data, 0)
+                var ib_off = len(bin_data)
+                for m_i in range(len(sk.joints) * 16):
+                    append_f32_le(bin_data, sk.inverse_bind[m_i])
+                var ib_len = len(bin_data) - ib_off
+                var ib_bv = len(buffer_views)
+                buffer_views.append(
+                    '{"buffer": 0, "byteOffset": ' + String(ib_off) + ', "byteLength": ' + String(ib_len) + "}"
+                )
+                var ib_acc = len(accessors)
+                accessors.append(
+                    '{"bufferView": ' + String(ib_bv) + ', "componentType": 5126, "count": ' + String(len(sk.joints)) + ', "type": "MAT4"}'
+                )
+                sk_str += ', "inverseBindMatrices": ' + String(ib_acc)
+            sk_str += "}"
+            skins_json.append(sk_str)
 
     pad4(bin_data, 0)
 
@@ -389,7 +464,15 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
         if i > 0:
             json += ", "
         json += nodes_json[i]
-    json += "]}"
+    json += "]"
+    if len(skins_json) > 0:
+        json += ', "skins": ['
+        for i in range(len(skins_json)):
+            if i > 0:
+                json += ", "
+            json += skins_json[i]
+        json += "]"
+    json += "}"
 
     var json_bytes = List[UInt8]()
     for b in json.as_bytes():
