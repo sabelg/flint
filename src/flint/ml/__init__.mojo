@@ -27,4 +27,9 @@
   - `diffusion`: latent diffusion (UNet, KL / VQ VAE, CLIP, DDIM / Euler / LCM, CFG, tileable
     wrap-mode convolutions) and `diffusion.materials`: StableMaterials / MatFuse text or photo ->
     PBR material sets
+  - `npz`: memory-mapped NumPy `.npz` archives (stored members, zip64)
+  - `ops_more`: InstanceNorm, ReduceMax, GRU, Softplus, Ceil, unit-kernel 2-D and batched GPU
+    convolution, per-channel broadcasts (op codes 80..89 in `onnx`)
+  - `audio2face`: NVIDIA Audio2Face-3D v2.3 speech -> ARKit-52 blend shapes, tongue, jaw, eyes
+    (SDK post-processing and BVLS solve, streaming, morph-target GLB output)
 """

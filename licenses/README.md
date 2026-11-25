@@ -127,3 +127,12 @@
   Neither does MagicArticulate release a skinning model; `MagicArticulate.rig` uses the MIT UniRig
   skin network instead. Puppeteer's animation stage (a per-video optimisation using Video Depth
   Anything, CoTracker and PyTorch3D) is not ported either.
+- `src/flint/ml/audio2face.mojo` ports the post-processing of the Audio2Face-3D SDK
+  (https://github.com/NVIDIA/Audio2Face-3D-SDK, Copyright (c) 2025 NVIDIA CORPORATION, MIT; see
+  `audio2face-LICENSE.txt`): audio windows, skin / tongue / teeth / eye animators and the BVLS
+  blend-shape solver are written in Mojo from the SDK sources. `flint.ml.npz` and the new ONNX
+  kernels in `flint.ml.ops_more` are Flint's own. The Audio2Face-3D v2.3 / v2.3.1 models are under
+  the NVIDIA Open Model License (commercial use allowed) and are not included: `Audio2Face.load`
+  reads a downloaded Hugging Face folder. Audio2Emotion is not used, since its licence limits it
+  to the Audio2Face project and excludes emotion recognition; emotions are caller inputs.
+  `tools/audio2face/reference.py` (numpy + onnxruntime) is only used for verification.
