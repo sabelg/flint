@@ -150,6 +150,20 @@ struct Joint(Copyable, ImplicitlyCopyable, Movable):
     # for the break check after the solve.
     var force_impulse: Vec3
     var torque_impulse: Vec3
+    # Revolute actuator (runtime-only, not serialized): an implicit joint-space PD drive
+    # tau = kp (target - q) + kd (target_velocity - qdot), capped at drive_max_torque (0: no cap),
+    # a rotor of inertia `armature` geared 1:1 to the joint angle (MJCF armature: reflected motor
+    # inertia), and Coulomb `friction_torque` (MJCF frictionloss). Applied once per substep.
+    var enable_drive: Bool
+    var drive_target: Float32
+    var drive_velocity: Float32
+    var drive_kp: Float32
+    var drive_kd: Float32
+    var drive_max_torque: Float32
+    var armature: Float32
+    var friction_torque: Float32
+    var rotor_speed: Float32       # the rotor's joint-space velocity (state)
+    var drive_impulse: Float32     # this substep's drive impulse (N m s), for torque readout
 
     def __init__(out self):
         self.id = 0
@@ -175,6 +189,16 @@ struct Joint(Copyable, ImplicitlyCopyable, Movable):
         self.upper = 0
         self.cone = 0
         self.rest = 0
+        self.enable_drive = False
+        self.drive_target = 0
+        self.drive_velocity = 0
+        self.drive_kp = 0
+        self.drive_kd = 0
+        self.drive_max_torque = 0
+        self.armature = 0
+        self.friction_torque = 0
+        self.rotor_speed = 0
+        self.drive_impulse = 0
         self.enable_limit = False
         self.enable_motor = False
         self.enable_spring = False
@@ -733,6 +757,49 @@ def solve_axis_rows(mut joint: Joint, row: AxisRow, mut m: Motion, soft: Softnes
         row.apply(m, impulse)
 
 
+def solve_revolute_actuator(mut joint: Joint, angle: Float32, axis: Vec3, mut m: Motion, h: Float32, use_bias: Bool):
+    """Armature rotor, PD drive and friction loss of a revolute joint, in joint space.
+
+    The rotor (inertia J = `armature`) is geared rigidly to the relative turn qdot: a velocity
+    row equalises them (both passes). The drive and the friction act on the combined degree of
+    freedom M = m_eff + J once per substep (bias pass), implicit in kp and kd:
+    lambda = h (kp e - (kd + h kp) (qdot - v*)) / (1 + h (kd + h kp) / M), |lambda| <= h tau_max.
+    """
+    var kinv = dot3(axis, m.ia.plus(m.ib).apply(axis))
+    if kinv <= 0:
+        return
+    var meff = 1.0 / kinv
+    var J = joint.armature
+    var qd = m.angular_cdot(axis)
+    if J > 0:
+        var lg = (joint.rotor_speed - qd) / (kinv + 1.0 / J)
+        m.angular(axis * lg)
+        joint.rotor_speed -= lg / J
+        qd += lg * kinv
+    if not use_bias:
+        return
+    var M = meff + J
+    var total = Float32(0)
+    if joint.enable_drive:
+        var e = wrap_angle(joint.drive_target - angle)
+        var c = joint.drive_kd + h * joint.drive_kp
+        var lam = h * (joint.drive_kp * e - c * (qd - joint.drive_velocity)) / (1.0 + h * c / M)
+        if joint.drive_max_torque > 0:
+            var cap = joint.drive_max_torque * h
+            lam = max(-cap, min(cap, lam))
+        joint.drive_impulse = lam
+        total += lam
+        qd += lam / M
+    if joint.friction_torque > 0:
+        var cap = joint.friction_torque * h
+        var lf = max(-cap, min(cap, -qd * M))
+        total += lf
+    if total != 0:
+        m.angular(axis * (total * meff / M))
+        if J > 0:
+            joint.rotor_speed += total / M
+
+
 def axial_total(joint: Joint) -> Float32:
     return joint.axial_impulse + joint.motor_impulse + joint.lower_impulse - joint.upper_impulse
 
@@ -766,6 +833,8 @@ def joint_solve_2_12(mut joint: Joint, row: JointRow, mut bodies: SolverBodies, 
     var force: Vec3
     if kind == JOINT_REVOLUTE:
         var angle = twist_angle(joint, f.turn_a, f.turn_b)
+        if joint.enable_drive or joint.armature > 0 or joint.friction_torque > 0:
+            solve_revolute_actuator(joint, angle, f.axis, m, h, use_bias)
         solve_axis_rows(joint, AxisRow(angle, f.axis, Vec3(), Vec3(), True), m, row.angular, h, use_bias, False)
         solve_axis_lock(joint, f, m, row.angular, use_bias)
         solve_point(joint, f, m, row.linear, use_bias)
