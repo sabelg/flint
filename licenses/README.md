@@ -158,3 +158,17 @@
   used with (`g1_holo_compat.xml`, BSD-3-Clause, Unitree Robotics) is downloaded by
   `tools/metatron/fetch.sh` and not included; see `unitree-g1-LICENSE.txt`. ProtoMotions'
   demo motion clips are not used (their licence does not allow standalone redistribution).
+- `src/flint/anim/mm_springs.mojo`, `mm_database.mojo`, `lmm.mojo`, `mm_controller.mojo` and
+  `tools/learned_mm/train.py` port Daniel Holden's Motion Matching / Learned Motion Matching
+  reference (https://github.com/orangeduck/Motion-Matching, Copyright (c) 2021 Daniel Holden,
+  MIT; see `motion-matching-LICENSE.txt`), after Holden, Kanoun, Perepichka and Popa, "Learned
+  Motion Matching", ACM TOG 39(4), 2020. The reference repository's `.bin` data is derived from
+  Ubisoft LAFAN1 (CC BY-NC-ND 4.0) and is not used; neither is the Bandai Namco motion dataset
+  (CC BY-NC 4.0).
+- The motion data used to build and train is 100STYLE (Mason, Starke and Komura, "Real-Time
+  Style Modelling of Human Locomotion via Feature-Wise Transformations and Local Motion Phases",
+  Proc. ACM CGIT 5(1), 2022, doi:10.1145/3522618; https://zenodo.org/records/8127870), licensed
+  CC BY 4.0. Flint does not include the clips, the built `database.bin` or trained networks:
+  `tools/learned_mm/fetch_100style.py` downloads them outside the repository and writes an
+  `ATTRIBUTION.txt`. Builds that ship a database or networks made from 100STYLE must credit it
+  as above and state that it was retargeted and resampled.
