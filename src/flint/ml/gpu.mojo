@@ -252,6 +252,117 @@ def _attn_kernel[DP: Int](q: Pointer[Float32, MutAnyOrigin], k: Pointer[Float32,
             o.unsafe_offset(ob + d).unsafe_store(acc[d] * inv)
 
 
+comptime AW_THREADS: Int = 128   # wide-head attention: threads (keys per tile) per block
+comptime AW_ROWS: Int = 8        # query rows sharing each K / V tile
+comptime AW_MAXD: Int = 512      # largest head dim (AW_MAXD / AW_THREADS dims per thread)
+comptime AW_PER: Int = AW_MAXD // AW_THREADS
+
+
+def _attn_wide_kernel(q: Pointer[Float32, MutAnyOrigin], k: Pointer[Float32, MutAnyOrigin],
+                      v: Pointer[Float32, MutAnyOrigin], o: Pointer[Float32, MutAnyOrigin],
+                      L: Int32, S: Int32, H: Int32, D: Int32, scale: Float32, row_blocks: Int32):
+    """softmax(scale q k^T) v for head dims 65..512 (e.g. single-head 512-wide cross-attention):
+    a block takes AW_ROWS query rows; per tile of AW_THREADS keys each thread scores one key for
+    every row, the block shares the tile's probabilities (online softmax), and each thread
+    accumulates its AW_PER output dims. Layouts as `_attn_kernel`."""
+    var Qs = stack_allocation[AW_ROWS * AW_MAXD, Float32, address_space=AddressSpace.SHARED]()
+    var Ps = stack_allocation[AW_ROWS * AW_THREADS, Float32, address_space=AddressSpace.SHARED]()
+    var Red = stack_allocation[AW_ROWS * AW_THREADS, Float32, address_space=AddressSpace.SHARED]()
+    var t = Int(thread_idx.x)
+    var blk = Int(block_idx.x)
+    var rb = blk % Int(row_blocks)
+    var xh = blk // Int(row_blocks)
+    var hh = Int(H)
+    var x = xh // hh
+    var h = xh % hh
+    var ll = Int(L)
+    var ss = Int(S)
+    var dd = Int(D)
+    var l0 = rb * AW_ROWS
+    for r in range(AW_ROWS):
+        var l = l0 + r
+        var d = t
+        while d < AW_MAXD:
+            var qv: Float32 = 0
+            if l < ll and d < dd:
+                qv = q.unsafe_offset(((x * ll + l) * hh + h) * dd + d).unsafe_load() * scale
+            Qs[unsafe_offset=r * AW_MAXD + d] = qv
+            d += AW_THREADS
+    barrier()
+    var acc = SIMD[DType.float32, AW_ROWS * AW_PER](0)
+    var mx = SIMD[DType.float32, AW_ROWS](-3.0e38)
+    var den = SIMD[DType.float32, AW_ROWS](0)
+    var s0 = 0
+    while s0 < ss:
+        var j = s0 + t
+        var sc = SIMD[DType.float32, AW_ROWS](-3.0e38)
+        if j < ss:
+            sc = SIMD[DType.float32, AW_ROWS](0)
+            var kb = ((x * ss + j) * hh + h) * dd
+            for d in range(dd):
+                var kv = k.unsafe_offset(kb + d).unsafe_load()
+                comptime for r in range(AW_ROWS):
+                    sc[r] += Qs[unsafe_offset=r * AW_MAXD + d] * kv
+        # per-row max over the tile
+        comptime for r in range(AW_ROWS):
+            Red[unsafe_offset=r * AW_THREADS + t] = sc[r]
+        barrier()
+        var w = AW_THREADS // 2
+        while w > 0:
+            if t < w:
+                comptime for r in range(AW_ROWS):
+                    var a = Red[unsafe_offset=r * AW_THREADS + t]
+                    var b = Red[unsafe_offset=r * AW_THREADS + t + w]
+                    Red[unsafe_offset=r * AW_THREADS + t] = a if a > b else b
+            barrier()
+            w //= 2
+        var nmx = SIMD[DType.float32, AW_ROWS](0)
+        comptime for r in range(AW_ROWS):
+            var m = Red[unsafe_offset=r * AW_THREADS]
+            nmx[r] = m if m > mx[r] else mx[r]
+        barrier()
+        comptime for r in range(AW_ROWS):
+            var p: Float32 = 0
+            if j < ss:
+                p = exp(sc[r] - nmx[r])
+            Ps[unsafe_offset=r * AW_THREADS + t] = p
+            Red[unsafe_offset=r * AW_THREADS + t] = p
+        barrier()
+        w = AW_THREADS // 2
+        while w > 0:
+            if t < w:
+                comptime for r in range(AW_ROWS):
+                    Red[unsafe_offset=r * AW_THREADS + t] = Red[unsafe_offset=r * AW_THREADS + t] + Red[unsafe_offset=r * AW_THREADS + t + w]
+            barrier()
+            w //= 2
+        comptime for r in range(AW_ROWS):
+            var corr = exp(mx[r] - nmx[r])
+            den[r] = den[r] * corr + Red[unsafe_offset=r * AW_THREADS]
+            comptime for i in range(AW_PER):
+                acc[r * AW_PER + i] = acc[r * AW_PER + i] * corr
+            mx[r] = nmx[r]
+        var nk = min(AW_THREADS, ss - s0)
+        for jj in range(nk):
+            var vb = ((x * ss + s0 + jj) * hh + h) * dd
+            comptime for i in range(AW_PER):
+                var d = t + i * AW_THREADS
+                if d < dd:
+                    var vv = v.unsafe_offset(vb + d).unsafe_load()
+                    comptime for r in range(AW_ROWS):
+                        acc[r * AW_PER + i] += Ps[unsafe_offset=r * AW_THREADS + jj] * vv
+        barrier()
+        s0 += AW_THREADS
+    comptime for r in range(AW_ROWS):
+        var l = l0 + r
+        if l < ll:
+            var ob = ((x * ll + l) * hh + h) * dd
+            var inv = 1.0 / den[r]
+            comptime for i in range(AW_PER):
+                var d = t + i * AW_THREADS
+                if d < dd:
+                    o.unsafe_offset(ob + d).unsafe_store(acc[r * AW_PER + i] * inv)
+
+
 comptime FP = Pointer[Float32, MutAnyOrigin]
 comptime EW_BLOCK: Int = 256
 comptime LN_THREADS: Int = 256
@@ -577,8 +688,8 @@ struct GpuMatmul(Movable):
     def attention(mut self, q: Int, k: Int, v: Int, o: Int, X: Int, L: Int, S: Int, H: Int, D: Int,
                   scale: Float32) raises -> Bool:
         """Fused softmax(scale Q K^T) V on the GPU (host addresses in and out); False when the
-        head dim is over 64."""
-        if D > 64:
+        head dim is over AW_MAXD (512)."""
+        if D > AW_MAXD:
             return False
         var nq = X * L * H * D
         var nk = X * S * H * D
@@ -600,7 +711,12 @@ struct GpuMatmul(Movable):
         self.ctx.enqueue_copy(self.att_dev[2].create_sub_buffer[DType.float32](0, nk), self.att_host[2].create_sub_buffer[DType.float32](0, nk))
         var rbk = (L + AT_ROWS - 1) // AT_ROWS
         var grid = X * H * rbk
-        if D <= 16:
+        if D > 64:
+            var wbk = (L + AW_ROWS - 1) // AW_ROWS
+            self.ctx.enqueue_function[_attn_wide_kernel](
+                _dptr(self.att_dev[0]), _dptr(self.att_dev[1]), _dptr(self.att_dev[2]), _dptr(self.att_dev[3]),
+                Int32(L), Int32(S), Int32(H), Int32(D), scale, Int32(wbk), grid_dim=X * H * wbk, block_dim=AW_THREADS)
+        elif D <= 16:
             self.ctx.enqueue_function[_attn_kernel[16]](
                 _dptr(self.att_dev[0]), _dptr(self.att_dev[1]), _dptr(self.att_dev[2]), _dptr(self.att_dev[3]),
                 Int32(L), Int32(S), Int32(H), Int32(D), scale, Int32(rbk), grid_dim=grid, block_dim=AT_ROWS)
@@ -826,11 +942,15 @@ struct GpuMatmul(Movable):
 
     def attention_dev(mut self, pq: FP, pk: FP, pv: FP, po: FP, X: Int, L: Int, S: Int, H: Int, D: Int,
                       scale: Float32) raises -> Bool:
-        if D > 64:
+        if D > AW_MAXD:
             return False
         var rbk = (L + AT_ROWS - 1) // AT_ROWS
         var grid = X * H * rbk
-        if D <= 16:
+        if D > 64:
+            var wbk = (L + AW_ROWS - 1) // AW_ROWS
+            self.ctx.enqueue_function[_attn_wide_kernel](pq, pk, pv, po, Int32(L), Int32(S), Int32(H), Int32(D), scale,
+                                                         Int32(wbk), grid_dim=X * H * wbk, block_dim=AW_THREADS)
+        elif D <= 16:
             self.ctx.enqueue_function[_attn_kernel[16]](pq, pk, pv, po, Int32(L), Int32(S), Int32(H), Int32(D), scale,
                                                         Int32(rbk), grid_dim=grid, block_dim=AT_ROWS)
         elif D <= 32:
