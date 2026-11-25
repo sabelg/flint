@@ -37,4 +37,6 @@
     MAX GPU, bit-exact `jax.random` sampling) and `MagentaRtStream` for the `AudioServer`
   - `metatron`: NVIDIA Metatron-v1 G1 humanoid controller (policy, ProtoMotions host port,
     `G1Sim` on `flint.physics.mjcf`)
+  - `depth`, `torch_pt`: monocular depth / geometry (Depth Anything V2 / 3 on one DINOv2 + DPT
+    stack, MoGe-2 points / normals / FOV; PNG, EXR and GLB blockout output) and a `.pt` reader
 """

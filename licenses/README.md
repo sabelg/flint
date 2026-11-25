@@ -158,3 +158,16 @@
   used with (`g1_holo_compat.xml`, BSD-3-Clause, Unitree Robotics) is downloaded by
   `tools/metatron/fetch.sh` and not included; see `unitree-g1-LICENSE.txt`. ProtoMotions'
   demo motion clips are not used (their licence does not allow standalone redistribution).
+- `src/flint/ml/depth/` (`flint.ml.depth`) and `src/flint/ml/torch_pt.mojo` are original pure-Mojo
+  implementations of Depth Anything V2 (https://github.com/DepthAnything/Depth-Anything-V2,
+  Apache-2.0), Depth Anything 3 (https://github.com/ByteDance-Seed/Depth-Anything-3, Copyright
+  2025 The Depth Anything 3 Team, Apache-2.0; see `depth-anything-LICENSE.txt`) and MoGe-2
+  (https://github.com/microsoft/MoGe, Copyright (c) Microsoft Corporation, MIT; see
+  `moge-LICENSE.txt`), written from the models' math and checked against the original PyTorch
+  code with `tools/depth/reference.py`, which imports local checkouts at verification time only.
+  Flint does not include any weights. Supported checkpoints, each licence read from its model
+  card: `depth-anything/Depth-Anything-V2-Small-hf`, `DA3-SMALL`, `DA3-BASE`, `DA3MONO-LARGE`,
+  `DA3METRIC-LARGE` (Apache-2.0) and `Ruicheng/moge-2-vit{s,b,l}-normal` (MIT). The DA3 Large,
+  Giant and Nested checkpoints are CC-BY-NC-4.0 (non-commercial) and are not supported;
+  Depth Anything V2 Base / Large are CC-BY-NC-4.0 as well and are not used. The DINOv2 trunk
+  these models share is Meta's (Apache-2.0, `dinov2-LICENSE.txt`).
