@@ -5,7 +5,10 @@ initializer as a zero-copy view into the mapping. `run()` interprets the nodes i
 (topological) file order on the CPU, freeing each intermediate after its last use.
 
 Supported: opset 13-17 graphs without control flow, using float32/int32/int64/bool tensors and
-the operators listed in `op_code`. Unsupported operators fail at load time, not mid-run.
+the operators listed in `op_code`. Initializers may live in external data files beside the model
+(`onnx.save(..., save_as_external_data=True)`, needed past protobuf's 2 GB limit); they are mapped,
+not copied. Cast to BFLOAT16 rounds to bfloat16 precision but keeps float32 storage, which is how
+graphs that deliberately round through bf16 (Cast -> BFLOAT16 -> FLOAT) run here. Unsupported operators fail at load time, not mid-run.
 """
 
 from std.collections import Dict
@@ -22,6 +25,8 @@ from flint.ml.ops_ext import (
     reduce_mean, lstm, conv1d_ext, conv_transpose1d, pad, round_even, stft, nonzero, resize_linear,
     conv1d_par, conv1d_gpu, row_binary_applies, par_row_binary, par_sin_cos_square, PAR_MIN,
 )
+from flint.ml.gpu import GpuMatmul, FP, gpu_binary_supported, gpu_unary_supported, GU_BF16
+from flint.ml.tensor import Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, DT_BF16, numel_of, shape_str, norm_axis
 from flint.ml.fast import par_unary, par_binary, par_gather_rows, par_layer_norm, attention
 from flint.ml.ops import (
     unary, binary, where, clip, cast, transpose, concat, gather, gather_elements, scatter_elements,
@@ -220,8 +225,60 @@ struct Node(Copyable, Movable):
         return self.attrs[k].s if k >= 0 else String()
 
 
+struct ExternalData(Movable):
+    """The side files (`<model>.onnx.data`) of a graph saved with external tensor data, each
+    memory-mapped once; tensors borrow their bytes from the mapping like raw_data."""
+    var dir: String
+    var names: List[String]
+    var addrs: List[Int]
+    var sizes: List[Int]
+
+    def __init__(out self, dir: String):
+        self.dir = dir
+        self.names = List[String]()
+        self.addrs = List[Int]()
+        self.sizes = List[Int]()
+
+    def __deinit__(deinit self):
+        for k in range(len(self.addrs)):
+            _ = external_call["munmap", Int32](self.addrs[k], Int64(self.sizes[k]))
+
+    def span(mut self, location: String, offset: Int, length: Int) raises -> Int:
+        """The address of `length` bytes at `offset` in the side file `location`."""
+        if location.find("..") >= 0 or location.startswith("/"):
+            raise Error("ONNX: external data must sit beside the model (" + location + ")")
+        var f = -1
+        for k in range(len(self.names)):
+            if self.names[k] == location:
+                f = k
+        if f < 0:
+            var path = self.dir + location
+            var fd = open_read(path)
+            if fd < 0:
+                raise Error("ONNX: cannot open external data " + path)
+            var size = Int(external_call["lseek", Int64](Int32(fd), Int64(0), Int32(2)))
+            var addr = external_call["mmap", Int](Int(0), Int64(size), Int32(1), Int32(2), Int32(fd), Int64(0))
+            close_fd(fd)
+            if addr == 0 or addr == -1:
+                raise Error("ONNX: cannot map " + path)
+            self.names.append(location)
+            self.addrs.append(addr)
+            self.sizes.append(size)
+            f = len(self.names) - 1
+        if offset < 0 or length < 0 or offset + length > self.sizes[f]:
+            raise Error("ONNX: external data range outside " + location)
+        return self.addrs[f] + offset
+
+
 def _parse_tensor(mut r: PbReader) raises -> Tuple[String, Tensor]:
-    """A TensorProto. Float raw data stays in the mapping (borrowed); the rest is copied."""
+    """A TensorProto with inline data (attributes); see `_parse_tensor_ext`."""
+    var none = ExternalData(String())
+    return _parse_tensor_ext(r, none)
+
+
+def _parse_tensor_ext(mut r: PbReader, mut ext: ExternalData) raises -> Tuple[String, Tensor]:
+    """A TensorProto. Float raw data stays in the mapping (borrowed), as does external data (a side
+    file named by `external_data`, mapped through `ext`); the rest is copied."""
     var name = String()
     var dims = List[Int]()
     var dtype = DT_F32
@@ -229,6 +286,10 @@ def _parse_tensor(mut r: PbReader) raises -> Tuple[String, Tensor]:
     var raw_end = -1
     var floats = List[Float32]()
     var ints = List[Int]()
+    var external = False
+    var location = String()
+    var ext_offset = 0
+    var ext_length = -1
     while r.more():
         r.key()
         if r.field == 1:
@@ -245,11 +306,38 @@ def _parse_tensor(mut r: PbReader) raises -> Tuple[String, Tensor]:
             var span = r.length_delimited()
             raw_start = span[0]
             raw_end = span[1]
+        elif r.field == 13:
+            # StringStringEntryProto {key = 1, value = 2}
+            var er = r.sub()
+            var key = String()
+            var value = String()
+            while er.more():
+                er.key()
+                if er.field == 1:
+                    key = er.string()
+                elif er.field == 2:
+                    value = er.string()
+                else:
+                    er.skip()
+            if key == "location":
+                location = value
+            elif key == "offset":
+                ext_offset = atol(value)
+            elif key == "length":
+                ext_length = atol(value)
         elif r.field == 14:
-            if r.varint() == 1:
-                raise Error("ONNX: external tensor data is not supported (" + name + ")")
+            external = r.varint() == 1
         else:
             r.skip()
+    if external:
+        if ext.dir.byte_length() == 0 or location.byte_length() == 0:
+            raise Error("ONNX: external tensor data is not supported here (" + name + ")")
+        var width = 4 if dtype == DT_F32 or dtype == DT_I32 else (8 if dtype == DT_I64 else 1)
+        var nbytes = numel_of(dims) * width
+        if ext_length >= 0 and ext_length != nbytes:
+            raise Error("ONNX: external size mismatch for " + name)
+        raw_start = ext.span(location, ext_offset, nbytes)
+        raw_end = raw_start + nbytes
     var n = numel_of(dims)
     if dtype == DT_F32:
         if raw_start >= 0:
@@ -319,6 +407,7 @@ struct OnnxModel(Movable):
     var pend_slot: List[Int]
     var pend_host: List[Bool]
     var split_outs: List[Tensor]
+    var ext: ExternalData        # mapped `.onnx.data` side files (graphs saved with external data)
 
     def __init__(out self):
         self.path = String()
@@ -349,6 +438,7 @@ struct OnnxModel(Movable):
         self.pend_slot = List[Int]()
         self.pend_host = List[Bool]()
         self.split_outs = List[Tensor]()
+        self.ext = ExternalData(String())
 
     def __deinit__(deinit self):
         if self.map_addr != 0:
@@ -373,6 +463,8 @@ struct OnnxModel(Movable):
     def load(path: String, workers: Int = -1) raises -> OnnxModel:
         var m = OnnxModel()
         m.path = path
+        var slash = path.rfind("/")
+        m.ext = ExternalData(String(path[byte=0:slash + 1]) if slash >= 0 else String("./"))
         var fd = open_read(path)
         if fd < 0:
             raise Error("ONNX: cannot open " + path)
@@ -588,7 +680,7 @@ struct OnnxModel(Movable):
                 self._parse_node(nr)
             elif g.field == 5:
                 var tr = g.sub()
-                var nt = _parse_tensor(tr)
+                var nt = _parse_tensor_ext(tr, self.ext)
                 var k = self._id(nt[0])
                 self.values[k] = nt[1].copy()
                 self.static_value[k] = True
@@ -804,6 +896,12 @@ struct OnnxModel(Movable):
             var out = self._dev_out(self.values[big].shape.copy())
             self.gpu.value().binary_dev(code, pa, pb, self._pend_ptr(), nbig, nsmall, mode, scalar, swap)
             return out^
+        if op == OP_CAST and self.nodes[k].attr_i("to", DT_F32) == DT_BF16 and self._on_gpu(a) \
+                and self.values[a].is_float():
+            var pc = self._dev(a)
+            var outc = self._dev_out(self.values[a].shape.copy())
+            self.gpu.value().unary_dev(GU_BF16, pc, self._pend_ptr(), self.values[a].numel())
+            return outc^
         if op >= OP_UNARY and op < OP_BINARY:
             var code = op - OP_UNARY
             if not gpu_unary_supported(code) or not self._on_gpu(a) or not self.values[a].is_float():
