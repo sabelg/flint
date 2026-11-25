@@ -419,6 +419,52 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
             sk_str += "}"
             skins_json.append(sk_str)
 
+    # ANIMATIONS: one sampler per channel (times SCALAR, values VEC3 / VEC4 by path)
+    var animations_json = List[String]()
+    if len(model.nodes) > 0:
+        for a_idx in range(len(model.animations)):
+            ref an = model.animations[a_idx]
+            var samplers = String()
+            var channels = String()
+            var count = 0
+            for c_idx in range(len(an.channels)):
+                ref ch = an.channels[c_idx]
+                var width = 4 if ch.path == 1 else 3
+                var keys = len(ch.times)
+                if ch.node < 0 or ch.node >= len(model.nodes) or keys == 0 or len(ch.values) < keys * width:
+                    continue
+                pad4(bin_data, 0)
+                var t_off = len(bin_data)
+                var t_min = ch.times[0]
+                var t_max = ch.times[0]
+                for t in ch.times:
+                    t_min = min(t_min, t)
+                    t_max = max(t_max, t)
+                    append_f32_le(bin_data, t)
+                var t_bv = len(buffer_views)
+                buffer_views.append('{"buffer": 0, "byteOffset": ' + String(t_off) + ', "byteLength": ' + String(len(bin_data) - t_off) + "}")
+                var t_acc = len(accessors)
+                accessors.append('{"bufferView": ' + String(t_bv) + ', "componentType": 5126, "count": ' + String(keys)
+                                 + ', "type": "SCALAR", "min": [' + fmt_f32(t_min) + '], "max": [' + fmt_f32(t_max) + "]}")
+                var v_off = len(bin_data)
+                for e in range(keys * width):
+                    append_f32_le(bin_data, ch.values[e])
+                var v_bv = len(buffer_views)
+                buffer_views.append('{"buffer": 0, "byteOffset": ' + String(v_off) + ', "byteLength": ' + String(len(bin_data) - v_off) + "}")
+                var v_acc = len(accessors)
+                accessors.append('{"bufferView": ' + String(v_bv) + ', "componentType": 5126, "count": ' + String(keys)
+                                 + ', "type": "' + ("VEC4" if width == 4 else "VEC3") + '"}')
+                if count > 0:
+                    samplers += ", "
+                    channels += ", "
+                var interp = "STEP" if ch.step else "LINEAR"
+                samplers += '{"input": ' + String(t_acc) + ', "output": ' + String(v_acc) + ', "interpolation": "' + interp + '"}'
+                var path = "rotation" if ch.path == 1 else ("scale" if ch.path == 2 else "translation")
+                channels += '{"sampler": ' + String(count) + ', "target": {"node": ' + String(ch.node) + ', "path": "' + path + '"}}'
+                count += 1
+            if count > 0:
+                animations_json.append('{"name": ' + json_quote(an.name) + ', "samplers": [' + samplers + '], "channels": [' + channels + "]}")
+
     pad4(bin_data, 0)
 
     var json = String('{"asset": {"version": "2.0", "generator": "Flint Pure-Mojo GLB Writer"}, "scene": 0, "scenes": [{"nodes": [')
@@ -471,6 +517,13 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
             if i > 0:
                 json += ", "
             json += skins_json[i]
+        json += "]"
+    if len(animations_json) > 0:
+        json += ', "animations": ['
+        for i in range(len(animations_json)):
+            if i > 0:
+                json += ", "
+            json += animations_json[i]
         json += "]"
     json += "}"
 

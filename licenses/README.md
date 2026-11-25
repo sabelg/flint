@@ -60,3 +60,15 @@
 - GEM-X's YOLOX person detector is not ported and must not be added: its weights are trained on
   the Human-Art dataset, which is licensed for non-commercial use only. Person boxes come from
   the caller's detector or from `Gemx.track` (keypoint tracking from a first-frame box).
+- `src/flint/ml/make_it_animatable.mojo` ports the inference pipeline of Make-It-Animatable v1
+  (https://github.com/jasongzy/Make-It-Animatable, Copyright (c) 2025 Zhiyang Guo, MIT; its point
+  encoder follows 3DShape2VecSet, MIT; see `make-it-animatable-LICENSE.txt`): surface and hand
+  re-sampling, the Hips frame, skin-weight clean-up and the rest-pose transforms.
+  `tools/make_it_animatable/export.py` and `reference.py` import a local checkout. Flint does not
+  include the weights or the converted graphs; the v1 checkpoints (Hugging Face
+  `jasongzy/Make-It-Animatable`, `output/best/new/`) are Apache-2.0 per their model card, which
+  allows commercial use. Provenance note: upstream trained them on characters rigged by Adobe
+  Mixamo, samples of the 3DBiCar dataset, and started from a 3DShape2VecSet autoencoder
+  pre-trained on ShapeNet; those datasets' own terms are not a licence on the weights, but
+  check them if your use depends on training-data provenance. v2 is not ported: it needs the
+  Hunyuan3D 2.1 ShapeVAE (Tencent Hunyuan Community License, territory-restricted).
