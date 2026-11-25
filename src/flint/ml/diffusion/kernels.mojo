@@ -6,7 +6,7 @@ GroupNorm (+ SiLU), activations, residual and per-image broadcast adds, GEGLU, h
 split / merge for attention, row softmax (optionally causal) and buffer fills.
 """
 
-from std.math import exp, erf, sqrt
+from std.math import exp, erf, sqrt, tanh
 from max.gpu import global_idx, thread_idx, block_idx, barrier
 from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
@@ -18,12 +18,15 @@ comptime DK_RED: Int = 256
 comptime ACT_SILU: Int = 0
 comptime ACT_GELU: Int = 1
 comptime ACT_QUICK_GELU: Int = 2
+comptime ACT_GELU_TANH: Int = 3   # gelu_pytorch_tanh (SigLIP)
 
 
 @always_inline
 def _act(x: Float32, mode: Int) -> Float32:
     if mode == ACT_SILU:
         return x / (1.0 + exp(-x))
+    if mode == ACT_GELU_TANH:
+        return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
     if mode == ACT_GELU:
         return 0.5 * x * (1.0 + erf(x * 0.7071067811865476))
     return x / (1.0 + exp(-1.702 * x))

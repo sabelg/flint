@@ -37,4 +37,8 @@
     MAX GPU, bit-exact `jax.random` sampling) and `MagentaRtStream` for the `AudioServer`
   - `metatron`: NVIDIA Metatron-v1 G1 humanoid controller (policy, ProtoMotions host port,
     `G1Sim` on `flint.physics.mjcf`)
+  - `sentencepiece`: SentencePiece Unigram / BPE tokenizer (`.model` protobuf or `tokenizer.json`,
+    precompiled charsmaps, byte fallback)
+  - `siglip`: SigLIP 2 image / text embeddings and sigmoid logits (CPU / MAX GPU), PIL-exact
+    preprocessing, GLB thumbnails and `AssetIndex` text-to-image asset search
 """

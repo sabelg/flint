@@ -21,6 +21,7 @@ Spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 server support
     13. `render.configure_npr_cel`
     14. `render.trigger_post_fx`
     15. `assets.process_mesh` (geometry kit: QEM LOD, meshlets, UV atlas, isotropic remesh)
+    - `assets.semantic_search` (SigLIP 2 text-to-image search over PNG / GLB files, cached embeddings)
 """
 from std.ffi import external_call
 from std.math import abs, cos, max, min, sin
@@ -34,6 +35,8 @@ from flint.assets.glb_writer import write_native_glb
 from flint.assets.json import JsonDocument, parse_json
 from flint.assets.json_write import json_quote
 from flint.assets.server import AssetServer
+from flint.ml.siglip.model import SiglipModel
+from flint.ml.siglip.search import AssetIndex, ASSET_GLB
 from flint.core.build_info import build_stamp
 from flint.core.jobs import JobPool
 from flint.core.math import Quat, Vec3
@@ -802,6 +805,7 @@ def _mcp_tools_list_json() -> String:
         + '{"name":"assets.list_and_cook","description":"Lists mounted .flpk v3 archives & live AssetServer arenas, and optionally runs incremental parallel cook_workspace inside workspace_root.","inputSchema":{"type":"object","properties":{"source_dir":{"type":"string"},"output_flpk":{"type":"string"},"cache_dir":{"type":"string"},"force_recook":{"type":"boolean"}}}},'
         + '{"name":"procedural.generate_asset","description":"Generates a Procedural Forge asset (material_orb, catmull_torus, colonnade, reference_grid, foliage_sample, oak, bollard) and bakes .glb inside workspace_root.","inputSchema":{"type":"object","required":["preset"],"properties":{"preset":{"type":"string"},"output_glb_path":{"type":"string"},"seed":{"type":"integer"},"spawn_in_scene":{"type":"boolean"},"position":{"type":"array"}}}},'
         + '{"name":"assets.process_mesh","description":"Runs the geometry kit on every mesh of a GLB inside workspace_root: stats, QEM lod (ratio), meshlets, xatlas-style UV unwrap, or isotropic remesh; writes output_glb_path and returns before/after numbers.","inputSchema":{"type":"object","required":["input_glb_path","op"],"properties":{"input_glb_path":{"type":"string"},"op":{"type":"string"},"output_glb_path":{"type":"string"},"ratio":{"type":"number"},"target_vertices":{"type":"integer"},"resolution":{"type":"integer"},"padding":{"type":"integer"}}}},'
+        + '{"name":"assets.semantic_search","description":"SigLIP 2 text-to-image search over the PNG and GLB files under assets_dir (GLBs rendered to thumbnails); embeddings are cached in cache_path and only new or changed files are embedded. Queries may be in any language. model_dir must lie inside workspace_root or come from $FLINT_SIGLIP_DIR.","inputSchema":{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"assets_dir":{"type":"string"},"k":{"type":"integer"},"model_dir":{"type":"string"},"cache_path":{"type":"string"},"update_index":{"type":"boolean"},"use_gpu":{"type":"boolean"}}}},'
         + '{"name":"physics.step_deterministic","description":"Advances deterministic IEEE-754 rigid-body physics for N fixed ticks (optional sandboxed output_path checkpoint).","inputSchema":{"type":"object","properties":{"ticks":{"type":"integer"},"dt":{"type":"number"},"output_path":{"type":"string"}}}},'
         + '{"name":"physics.raycast_query","description":"Casts a 3D analytical ray against scene colliders (Sphere, OBB Box, Capsule, Bvh8MeshCollider).","inputSchema":{"type":"object","required":["origin","direction"],"properties":{"origin":{"type":"array"},"direction":{"type":"array"},"max_distance":{"type":"number"}}}},'
         + '{"name":"studio.pie_control","description":"Controls 1-Click Play-In-Editor (play, pause, step, stop) backed by LZ4 checkpoint restoration.","inputSchema":{"type":"object","required":["action"],"properties":{"action":{"type":"string"},"ticks":{"type":"integer"}}}},'
@@ -891,6 +895,8 @@ struct McpServerV2(Movable):
     var workspace_root: String
     var auth_token: String
     var session_authenticated: Bool
+    var siglip: Optional[SiglipModel]   # loaded on the first assets.semantic_search call
+    var siglip_dir: String
 
     def __init__(out self, workspace_root: String = ".", auth_token: String = ""):
         self.initialized = False
@@ -900,6 +906,8 @@ struct McpServerV2(Movable):
         self.workspace_root = workspace_root if workspace_root.byte_length() > 0 else String(".")
         self.auth_token = auth_token
         self.session_authenticated = auth_token.byte_length() == 0
+        self.siglip = None
+        self.siglip_dir = String()
 
     @staticmethod
     def _extract_auth_token(doc: JsonDocument) -> String:
@@ -1279,6 +1287,10 @@ struct McpServerV2(Movable):
                     return (True, '{"ok":false,"error":"failed to write output_glb_path"}')
             return (False, '{"ok":true,"output_glb_path":' + json_quote(out_mesh_glb) + ',"report":' + kit_report + "}")
 
+        # 8c. assets.semantic_search (SigLIP 2; assets and cache strictly sandboxed inside `workspace_root`)
+        if tool_name == "assets.semantic_search":
+            return self._semantic_search(doc, args_node)
+
         # 9. physics.step_deterministic (optional checkpoint output strictly sandboxed inside `workspace_root`)
         if tool_name == "physics.step_deterministic":
             var ticks = max(1, min(3600, doc.integer(doc.object_get(args_node, "ticks"), 1)))
@@ -1565,6 +1577,66 @@ struct McpServerV2(Movable):
             )
 
         return (True, '{"ok":false,"error":' + json_quote("unknown tool: " + tool_name) + "}")
+
+    def _semantic_search(mut self, doc: JsonDocument, args_node: Int) -> Tuple[Bool, String]:
+        var query = doc.text(doc.object_get(args_node, "query"), "")
+        if query.byte_length() == 0:
+            return (True, '{"ok":false,"error":"query is required"}')
+        var k = max(1, min(100, doc.integer(doc.object_get(args_node, "k"), 8)))
+        var do_update = doc.boolean(doc.object_get(args_node, "update_index"), True)
+        var use_gpu = doc.boolean(doc.object_get(args_node, "use_gpu"), False)
+        var raw_assets = doc.text(doc.object_get(args_node, "assets_dir"), ".")
+        var raw_model = doc.text(doc.object_get(args_node, "model_dir"), "")
+        var raw_cache = doc.text(doc.object_get(args_node, "cache_path"), "")
+        var assets_dir: String
+        var model_dir: String
+        try:
+            assets_dir = _sanitize_workspace_path(self.workspace_root, raw_assets, allow_root_dir=True)
+            if raw_model.byte_length() > 0:
+                model_dir = _sanitize_workspace_path(self.workspace_root, raw_model, allow_root_dir=False)
+            else:
+                model_dir = env_value("FLINT_SIGLIP_DIR")
+        except e:
+            return (True, '{"ok":false,"error":' + json_quote("sandbox rejected path: " + String(e)) + "}")
+        if model_dir.byte_length() == 0:
+            return (True, '{"ok":false,"error":"no model: pass model_dir inside workspace_root or set FLINT_SIGLIP_DIR"}')
+        try:
+            if not self.siglip or self.siglip_dir != model_dir:
+                self.siglip = None
+                self.siglip = SiglipModel.load(model_dir, use_gpu)
+                self.siglip_dir = model_dir
+            var cache: String
+            if raw_cache.byte_length() > 0:
+                cache = sanitize_output_path(self.workspace_root, raw_cache)
+            else:
+                cache = assets_dir + "/.siglip_" + self.siglip.value().name + ".flsg"
+            var index = AssetIndex.open(cache, self.siglip.value())
+            var rep_json = String("null")
+            if do_update:
+                var rep = index.update(self.siglip.value(), assets_dir)
+                _ = index.save(cache)
+                rep_json = (
+                    '{"scanned":' + String(rep.scanned) + ',"embedded":' + String(rep.embedded)
+                    + ',"cached":' + String(rep.reused) + ',"removed":' + String(rep.removed)
+                    + ',"failed":' + String(rep.failed) + ',"seconds":' + String(rep.seconds) + "}"
+                )
+            var hits = index.search(self.siglip.value(), query, k)
+            var arr = String("[")
+            for i in range(len(hits)):
+                if i > 0:
+                    arr += ","
+                arr += (
+                    '{"path":' + json_quote(hits[i].path) + ',"kind":' + ('"glb"' if hits[i].kind == ASSET_GLB else '"png"')
+                    + ',"probability":' + String(Float64(hits[i].prob)) + ',"logit":' + String(Float64(hits[i].logit)) + "}"
+                )
+            arr += "]"
+            return (
+                False,
+                '{"ok":true,"model":' + json_quote(self.siglip.value().name) + ',"query":' + json_quote(query)
+                + ',"assets":' + String(index.count()) + ',"index":' + rep_json + ',"results":' + arr + "}",
+            )
+        except e:
+            return (True, '{"ok":false,"error":' + json_quote(String(e)) + "}")
 
     def _handle_request_bytes(
         mut self,

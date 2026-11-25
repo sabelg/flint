@@ -909,7 +909,7 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}', studio, assets, pool)
     var d_list = parse_json(_str_bytes(r_list))
     var tools_arr = d_list.object_get(d_list.object_get(d_list.root, "result"), "tools")
-    _assert(d_list.valid and d_list.array_size(tools_arr) == 15, "tools/list must expose all 15 MCP tools")
+    _assert(d_list.valid and d_list.array_size(tools_arr) >= 16, "tools/list must expose all MCP tools (15 + assets.semantic_search)")
     _assert(
         r_list.find('"render.configure_npr_cel"') >= 0 and r_list.find('"render.trigger_post_fx"') >= 0,
         "tools/list must include render.configure_npr_cel and render.trigger_post_fx",

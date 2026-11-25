@@ -158,3 +158,12 @@
   used with (`g1_holo_compat.xml`, BSD-3-Clause, Unitree Robotics) is downloaded by
   `tools/metatron/fetch.sh` and not included; see `unitree-g1-LICENSE.txt`. ProtoMotions'
   demo motion clips are not used (their licence does not allow standalone redistribution).
+- `src/flint/ml/siglip/` (`flint.ml.siglip`) runs Google's SigLIP 2 image-text encoders
+  (https://huggingface.co/google/siglip2-base-patch16-224 and `siglip2-so400m-patch14-224`;
+  big_vision, https://github.com/google-research/big_vision), Apache-2.0 per the model cards and
+  the big_vision repository, see `siglip2-LICENSE.txt`. Flint does not include the weights or the
+  Gemma tokenizer files shipped in those repositories: `tools/siglip/fetch.py` downloads them
+  outside the repo. The towers, the PIL-exact resampling and `flint.ml.sentencepiece` (Unigram /
+  BPE SentencePiece from `.model` or `tokenizer.json`) are original Mojo checked against
+  Transformers, `sentencepiece` and `tokenizers` (all Apache-2.0) by `tools/siglip/reference.py`
+  and `tools/siglip/tokenizer_parity.py` at verification time only; no code is copied.

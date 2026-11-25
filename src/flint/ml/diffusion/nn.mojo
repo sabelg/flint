@@ -20,7 +20,7 @@ when one is used. Values are freed explicitly with `rt.free(act^)` so device buf
 
 from std.collections import Dict
 from std.ffi import external_call
-from std.math import exp, erf, sqrt
+from std.math import exp, erf, sqrt, tanh
 from flint.core.jobs import JobPool, default_worker_count
 from flint.core.ecs import run_parallel_ctx
 from flint.ml.tensor import Tensor, fptr_at
@@ -31,7 +31,7 @@ from flint.ml.gpu import GpuMatmul, FP, _mm_tiled, TBM, TBN
 from flint.ml.diffusion.kernels import (
     _dk_act_kernel, _dk_add_kernel, _dk_scale_kernel, _dk_fill_kernel, _dk_bcast_add_kernel, _dk_geglu_kernel,
     _dk_group_norm_kernel, _dk_heads_kernel, _dk_merge_kernel, _dk_softmax_kernel, DK_EW, DK_RED,
-    ACT_SILU, ACT_GELU, ACT_QUICK_GELU,
+    ACT_SILU, ACT_GELU, ACT_QUICK_GELU, ACT_GELU_TANH,
 )
 
 comptime PAD_ZERO: Int = 0
@@ -167,6 +167,8 @@ struct _EwCtx(Movable):
 def _act_s(x: Float32, mode: Int) -> Float32:
     if mode == ACT_SILU:
         return x / (1.0 + exp(-x))
+    if mode == ACT_GELU_TANH:
+        return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
     if mode == ACT_GELU:
         return 0.5 * x * (1.0 + erf(x * 0.7071067811865476))
     return x / (1.0 + exp(-1.702 * x))
@@ -176,6 +178,8 @@ def _act_s(x: Float32, mode: Int) -> Float32:
 def _act_v(x: V8, mode: Int) -> V8:
     if mode == ACT_SILU:
         return x / (1.0 + exp(-x))
+    if mode == ACT_GELU_TANH:
+        return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
     if mode == ACT_GELU:
         return 0.5 * x * (1.0 + erf(x * 0.7071067811865476))
     return x / (1.0 + exp(-1.702 * x))
@@ -481,6 +485,7 @@ struct Runtime(Movable):
     var tables: Dict[String, Int]
     var host_tables: Dict[String, List[Int32]]
     var weight_bytes: Int
+    var fused_attention: Bool   # GPU: one fused online-softmax kernel for all (batch, head) pairs
 
     def __init__(out self, use_gpu: Bool) raises:
         self.pool = JobPool()
@@ -492,6 +497,7 @@ struct Runtime(Movable):
         self.tables = Dict[String, Int]()
         self.host_tables = Dict[String, List[Int32]]()
         self.weight_bytes = 0
+        self.fused_attention = False
 
     def __deinit__(deinit self):
         self.pool.stop()
@@ -939,6 +945,10 @@ struct Runtime(Movable):
         var D = C // heads
         var scale = Float32(1.0 / sqrt(Float64(D)))
         var o = self.alloc(q.b, q.h, q.w, C)
+        if self.gpu and self.fused_attention and not causal:
+            if self.gpu.value().attention_dev(self.ptr(q), self.ptr(k), self.ptr(v), self.ptr(o), B, L, S, heads, D,
+                                              scale):
+                return o^
         if self.gpu:
             var qh = self.gpu.value().alloc(B * L * C)
             var kt = self.gpu.value().alloc(B * S * C)
