@@ -136,3 +136,14 @@
   reads a downloaded Hugging Face folder. Audio2Emotion is not used, since its licence limits it
   to the Audio2Face project and excludes emotion recognition; emotions are caller inputs.
   `tools/audio2face/reference.py` (numpy + onnxruntime) is only used for verification.
+- `src/flint/ml/magenta_rt.mojo`, `musiccoca.mojo`, `audio_codec.mojo`, `audio_codec_gpu.mojo`
+  and `jax_random.mojo` run Magenta RealTime 2 (https://github.com/magenta/magenta-realtime,
+  Google DeepMind, Copyright 2026 Google LLC; code Apache-2.0, weights CC BY 4.0, see
+  `magenta-rt-LICENSE.txt`): the Depthformer LM, the SpectroStream decoder, the MusicCoCa text
+  encoder / mapper / style quantiser and JAX's threefry sampling stream, written in Mojo from
+  the reference and checked against it with `tools/magenta_rt/reference*.py`, which import a
+  local magenta-realtime checkout; no Python code is copied. Flint does not include the weights:
+  `tools/magenta_rt/fetch.sh` downloads them and converts MusicCoCa outside the repo. Builds
+  that ship the weights or converted files must carry the CC BY 4.0 attribution in that file and
+  the model card's usage terms (do not generate content that infringes others' rights; Google
+  claims no rights in generated outputs).

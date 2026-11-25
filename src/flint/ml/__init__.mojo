@@ -32,4 +32,7 @@
     convolution, per-channel broadcasts (op codes 80..89 in `onnx`)
   - `audio2face`: NVIDIA Audio2Face-3D v2.3 speech -> ARKit-52 blend shapes, tongue, jaw, eyes
     (SDK post-processing and BVLS solve, streaming, morph-target GLB output)
+  - `magenta_rt`, `musiccoca`, `audio_codec`, `audio_codec_gpu`, `jax_random`: Magenta RealTime 2
+    streaming music (Depthformer LM, MusicCoCa text styles, SpectroStream 48 kHz decoder on CPU /
+    MAX GPU, bit-exact `jax.random` sampling) and `MagentaRtStream` for the `AudioServer`
 """

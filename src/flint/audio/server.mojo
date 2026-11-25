@@ -39,6 +39,7 @@ from flint.platform.dsp import (
 from flint.cycles.synth import CyclesEngine
 from flint.audio.qoa import QoaAsset, QoaStreamCursor
 from flint.audio.acoustics import CLEAR_CUTOFF_HZ
+from flint.audio.pcm_stream import PcmStreamRing
 
 # Standard Mix Bus IDs
 comptime BUS_MASTER: Int = 0
@@ -78,6 +79,7 @@ comptime CMD_ADD_BUS: UInt32 = 13
 comptime CMD_ADD_STEM: UInt32 = 14
 comptime CMD_TRANSITION_STEM: UInt32 = 15
 comptime CMD_CONFIG_MASTER: UInt32 = 16
+comptime CMD_ADD_PCM_STREAM: UInt32 = 17
 
 # CMD_CONFIG_BUS sub-opcodes (carried in AudioCmd.flags)
 comptime _BUS_CFG_GAIN_MUTE: UInt32 = 1
@@ -1135,6 +1137,9 @@ struct AudioRtEngine(Movable):
     var aux_send_l: List[Float32]
     var aux_send_r: List[Float32]
     var cycles_stem: List[CyclesStemNode]
+    var pcm_streams: List[PcmStreamRing]
+    var pcm_stream_bus: List[Int]
+    var pcm_stream_gain: List[Float32]
     var lufs_meter: KWeightedLufsMeter
     var limiter: TruePeakLimiter
 
@@ -1212,6 +1217,9 @@ struct AudioRtEngine(Movable):
         )
 
         self.cycles_stem = List[CyclesStemNode]()
+        self.pcm_streams = List[PcmStreamRing]()
+        self.pcm_stream_bus = List[Int]()
+        self.pcm_stream_gain = List[Float32]()
         self.lufs_meter = KWeightedLufsMeter(self.sample_rate)
         self.limiter = TruePeakLimiter(-0.1, 80.0, self.sr_f)
 
@@ -1413,6 +1421,21 @@ struct AudioRtEngine(Movable):
                         self.aux_gains[z] = max(Float32(0.0), cmd.p0)
                 elif sub == _MASTER_CFG_LIMITER_CEIL:
                     self.limiter.set_ceiling_db(cmd.p0)
+            elif k == CMD_ADD_PCM_STREAM:
+                var ring = PcmStreamRing()
+                ring.base = _unpack_ptr_from_cmd(cmd)
+                ring.capacity = Int(cmd.slot)
+                var found = -1
+                for pi in range(len(self.pcm_streams)):
+                    if self.pcm_streams[pi].base == ring.base:
+                        found = pi
+                if found < 0:
+                    self.pcm_streams.append(ring)
+                    self.pcm_stream_bus.append(Int(cmd.bus_id))
+                    self.pcm_stream_gain.append(cmd.p2)
+                else:
+                    self.pcm_stream_bus[found] = Int(cmd.bus_id)
+                    self.pcm_stream_gain[found] = cmd.p2
             elif k == CMD_ADD_STEM:
                 var ptr_addr = _unpack_ptr_from_cmd(cmd)
                 if ptr_addr != 0:
@@ -2164,6 +2187,9 @@ struct AudioRtEngine(Movable):
         for si in range(len(self.cycles_stem)):
             var sb = max(0, min(n_buses - 1, self.cycles_stem[si].bus_id))
             self.cycles_stem[si].mix_into_bus(self.buses[sb].buf_lr, n_frames)
+        for pi in range(len(self.pcm_streams)):
+            var pb = max(0, min(n_buses - 1, self.pcm_stream_bus[pi]))
+            self.pcm_streams[pi].mix_into(self.buses[pb].buf_lr, n_frames, self.pcm_stream_gain[pi])
 
         var eq_active_eps = Float32(1.0e-5)
         for po_i in range(len(self.post_order)):
@@ -2753,6 +2779,18 @@ struct AudioServer(Movable):
         _pack_ptr_into_cmd(cmd, Int(boxed))
         self._enqueue_guaranteed(cmd)
         return sid
+
+    def add_pcm_stream(mut self, ring: PcmStreamRing, bus_id: Int = BUS_MUSIC, gain: Float32 = 1.0):
+        """Mixes a producer-fed `PcmStreamRing` (e.g. `flint.ml.magenta_rt` music) into `bus_id`;
+        calling it again for the same ring changes its bus and gain. The ring must outlive the
+        server's mixer thread."""
+        var cmd = AudioCmd()
+        cmd.kind = CMD_ADD_PCM_STREAM
+        cmd.slot = Int32(ring.capacity)
+        cmd.bus_id = Int32(bus_id)
+        cmd.p2 = gain
+        _pack_ptr_into_cmd(cmd, ring.base)
+        self._enqueue_guaranteed(cmd)
 
     def transition_cycles_stem(
         mut self,
