@@ -108,3 +108,14 @@
   weights. That repository declares no licence of its own; the weights are OpenAI's
   (MIT via github.com/openai/CLIP, `openai-clip-LICENSE.txt`), the same ones MatFuse loads with
   `clip.load("ViT-B/16")`.
+- `src/flint/ml/metatron.mojo` runs NVIDIA Metatron-v1 (https://huggingface.co/nvidia/Metatron-v1,
+  NVIDIA Open Model License, commercial use allowed). Flint does not include the model:
+  `tools/metatron/fetch.sh` downloads `demo/model.onnx` + `weights.bin` outside the repository.
+  The policy host (observation history, idle / steering goals, rest pose) ports ProtoMotions'
+  native Metatron runtime (https://github.com/NVlabs/ProtoMotions, Apache-2.0); see
+  `metatron-LICENSE.txt`. `tools/metatron/reference.py` imports MuJoCo (Apache-2.0) and
+  onnxruntime (MIT) at verification time only.
+- `src/flint/physics/mjcf.mojo` is an original MJCF reader. The Unitree G1 description it is
+  used with (`g1_holo_compat.xml`, BSD-3-Clause, Unitree Robotics) is downloaded by
+  `tools/metatron/fetch.sh` and not included; see `unitree-g1-LICENSE.txt`. ProtoMotions'
+  demo motion clips are not used (their licence does not allow standalone redistribution).

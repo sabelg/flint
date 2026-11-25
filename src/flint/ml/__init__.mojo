@@ -18,7 +18,7 @@
     (WAV reading, resampling, CMVN frames, energy VAD), BPE decoding and voice-command matching
   - `llm`: small-LLM runtime for NPC dialogue and behaviour choice (Qwen3, SmolLM3 from
     safetensors; int8 / int4 weights; grammar-constrained BehaviorTree actions)
-  - `ops_ext`: LSTM, ConvTranspose, Pad, STFT, linear Resize, ReduceMean, NonZero, Round and
+  - `ops_ext`: LSTM, ConvTranspose, Pad, STFT, linear Resize, ReduceMean / Min / Max, GatherND, NonZero, Round and
     parallel / GPU 1-D convolution (op codes 60..79 in `onnx`)
   - `phonemize`: English G2P (misaki lexicons, morphology, numbers, letter-to-sound fallback)
   - `kokoro`: Kokoro-82M TTS, `KokoroTTS.load(dir).say(text, voice)` -> 24 kHz samples, timings
@@ -27,4 +27,6 @@
   - `diffusion`: latent diffusion (UNet, KL / VQ VAE, CLIP, DDIM / Euler / LCM, CFG, tileable
     wrap-mode convolutions) and `diffusion.materials`: StableMaterials / MatFuse text or photo ->
     PBR material sets
+  - `metatron`: NVIDIA Metatron-v1 G1 humanoid controller (policy, ProtoMotions host port,
+    `G1Sim` on `flint.physics.mjcf`)
 """

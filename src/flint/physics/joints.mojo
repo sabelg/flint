@@ -762,8 +762,8 @@ def solve_revolute_actuator(mut joint: Joint, angle: Float32, axis: Vec3, mut m:
 
     The rotor (inertia J = `armature`) is geared rigidly to the relative turn qdot: a velocity
     row equalises them (both passes). The drive and the friction act on the combined degree of
-    freedom M = m_eff + J once per substep (bias pass), implicit in kp and kd:
-    lambda = h (kp e - (kd + h kp) (qdot - v*)) / (1 + h (kd + h kp) / M), |lambda| <= h tau_max.
+    freedom M = m_eff + J once per substep (bias pass); the drive impulse is explicit,
+    lambda = h (kp e - kd (qdot - v*)), |lambda| <= h tau_max, so keep h kd / J well below 2.
     """
     var kinv = dot3(axis, m.ia.plus(m.ib).apply(axis))
     if kinv <= 0:
@@ -781,9 +781,10 @@ def solve_revolute_actuator(mut joint: Joint, angle: Float32, axis: Vec3, mut m:
     var M = meff + J
     var total = Float32(0)
     if joint.enable_drive:
+        # explicit in the state, like MuJoCo's position actuator (force = kp e - kv qdot): an
+        # implicit solve against this pair's m_eff would under-drive links deep in a chain
         var e = wrap_angle(joint.drive_target - angle)
-        var c = joint.drive_kd + h * joint.drive_kp
-        var lam = h * (joint.drive_kp * e - c * (qd - joint.drive_velocity)) / (1.0 + h * c / M)
+        var lam = h * (joint.drive_kp * e - joint.drive_kd * (qd - joint.drive_velocity))
         if joint.drive_max_torque > 0:
             var cap = joint.drive_max_torque * h
             lam = max(-cap, min(cap, lam))

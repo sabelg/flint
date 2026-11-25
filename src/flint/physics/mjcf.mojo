@@ -18,8 +18,11 @@ poses / velocities without any simulator.
 
 `MjcfArticulation.build(world, model, ...)` turns the tree into Flint `PhysicsWorld` bodies
 (y up: MuJoCo (x, y, z) -> Flint (x, z, -y)) joined by `JOINT_REVOLUTE` joints with the joint
-limits, MJCF armature as a geared rotor, frictionloss, and an implicit joint-space PD drive per
-actuator (`set_command(targets, kp, kd)`, torque-capped by forcerange). Jointless bodies are
+limits, MJCF armature as a geared rotor, frictionloss, and a joint-space PD drive per actuator
+(`set_command(targets, kp, kd)`, explicit like MuJoCo's position actuator, torque-capped by
+forcerange or `set_efforts`). Drive stiff chains with small steps and stiff joint rows: the G1
+under Metatron matches MuJoCo best at 1 kHz, 8 substeps, `joint_hertz` 2000, contact_hertz 250;
+without armature the explicit kd on light links (wrists, ankles) is unstable at 1 kHz. Jointless bodies are
 welded into their parent (composite mass, COM and inertia, re-diagonalised). Each Flint body sits
 at its link's centre of mass in the principal inertia frame. Collision geoms (contype or
 conaffinity non-zero) become compound children; cylinders become capsules. Self-collision is
@@ -245,10 +248,10 @@ def mj_axis_angle(axis: Vec3, angle: Float64) -> Quat:
 
 struct Mat3(Copyable, ImplicitlyCopyable, Movable):
     """Row-major 3x3 (inertia tensors, rotation matrices)."""
-    var m: InlineArray[Float64, 9]
+    var m: SIMD[DType.float64, 16]
 
     def __init__(out self):
-        self.m = InlineArray[Float64, 9](fill=0.0)
+        self.m = SIMD[DType.float64, 16](0)
 
     @staticmethod
     def diag(x: Float64, y: Float64, z: Float64) -> Mat3:
@@ -505,7 +508,7 @@ struct MjcfModel(Movable):
     var geoms: List[MjGeom]
     var actuators: List[MjActuator]
     var tendons: List[MjTendon]
-    var pair_geom1: List[Int]
+    var pair_geom1: List[Int]      # -1: a geom not defined in the file
     var pair_geom2: List[Int]
     var pair_friction: List[Float64]
     var exclude_body1: List[Int]
@@ -580,8 +583,7 @@ struct MjcfModel(Movable):
             for p in d.children(c, "pair"):
                 var g1 = m.geom_index(d.attr(p, "geom1"))
                 var g2 = m.geom_index(d.attr(p, "geom2"))
-                if g1 < 0 or g2 < 0:
-                    raise Error("MJCF: contact pair with unknown geom")
+                # a geom the file does not define (e.g. a floor added by the host) stays -1
                 m.pair_geom1.append(g1)
                 m.pair_geom2.append(g2)
                 var fr = _floats(d.attr(p, "friction", "1"))
@@ -654,13 +656,21 @@ struct MjcfModel(Movable):
 
     # ------------------------------------------------------------------------------ defaults
 
-    def _read_defaults(mut self, d: XmlDoc, node: Int, parent: Int):
-        var k = len(self._class_names)
-        self._class_names.append(d.attr(node, "class", "main"))
-        self._class_parent.append(parent)
-        self._class_node.append(node)
-        for c in d.children(node, "default"):
-            self._read_defaults(d, c, k)
+    def _read_defaults(mut self, d: XmlDoc, root: Int, root_parent: Int):
+        var nodes = List[Int]()
+        nodes.append(root)
+        var parents = List[Int]()
+        parents.append(root_parent)
+        while len(nodes) > 0:
+            var node = nodes.pop()
+            var parent = parents.pop()
+            var k = len(self._class_names)
+            self._class_names.append(d.attr(node, "class", "main"))
+            self._class_parent.append(parent)
+            self._class_node.append(node)
+            for c in d.children(node, "default"):
+                nodes.append(c)
+                parents.append(k)
 
     def _class_index(self, name: String) -> Int:
         for k in range(len(self._class_names)):
@@ -712,7 +722,27 @@ struct MjcfModel(Movable):
 
     # -------------------------------------------------------------------------------- bodies
 
-    def _read_body(mut self, d: XmlDoc, node: Int, parent: Int, cls_in: String) raises:
+    def _read_body(mut self, d: XmlDoc, root: Int, root_parent: Int, root_cls: String) raises:
+        """Depth-first, document order (parents before children, like MuJoCo)."""
+        var nodes = List[Int]()
+        nodes.append(root)
+        var parents = List[Int]()
+        parents.append(root_parent)
+        var classes = List[String]()
+        classes.append(root_cls)
+        while len(nodes) > 0:
+            var node = nodes.pop()
+            var parent = parents.pop()
+            var cls_in = classes.pop()
+            var kids = self._read_one_body(d, node, parent, cls_in)
+            var k = len(self.bodies) - 1
+            var cls = d.attr(node, "childclass", cls_in)
+            for c in reversed(kids):
+                nodes.append(c)
+                parents.append(k)
+                classes.append(cls)
+
+    def _read_one_body(mut self, d: XmlDoc, node: Int, parent: Int, cls_in: String) raises -> List[Int]:
         var cls = d.attr(node, "childclass", cls_in)
         var b = MjBody()
         b.name = d.attr(node, "name", "body" + String(len(self.bodies)))
@@ -743,8 +773,7 @@ struct MjcfModel(Movable):
                 self._read_joint(d, j, k, cls)
         for g in d.children(node, "geom"):
             self._read_geom(d, g, k, cls)
-        for c in d.children(node, "body"):
-            self._read_body(d, c, k, cls)
+        return d.children(node, "body")
 
     def _read_joint(mut self, d: XmlDoc, node: Int, body: Int, cls: String) raises:
         var j = MjJoint()
@@ -893,8 +922,8 @@ struct MjcfModel(Movable):
     def body_velocities(self, qpos: List[Float64], qvel: List[Float64]) -> Tuple[List[Vec3], List[Vec3]]:
         """World linear velocity of every body origin and world angular velocity."""
         var fk = self.forward_kinematics(qpos)
-        ref pos = fk[0]
-        ref rot = fk[1]
+        var pos = fk[0].copy()
+        var rot = fk[1].copy()
         var v = List[Vec3](length=len(self.bodies), fill=Vec3())
         var w = List[Vec3](length=len(self.bodies), fill=Vec3())
         for b in range(1, len(self.bodies)):
@@ -947,13 +976,13 @@ def flint_to_mj(v: Vec3) -> Vec3:
 
 
 def mj_to_flint_quat(q: Quat) -> Quat:
-    var r = Quat(-_S2, 0, 0, _S2)
-    return r.multiply(q).multiply(Quat(_S2, 0, 0, _S2)).normalized()
+    """A body orientation: Flint world from the body's own (MuJoCo-axis) local frame, so local
+    offsets and inertia axes keep their MJCF values."""
+    return Quat(-_S2, 0, 0, _S2).multiply(q).normalized()
 
 
 def flint_to_mj_quat(q: Quat) -> Quat:
-    var r = Quat(_S2, 0, 0, _S2)
-    return r.multiply(q).multiply(Quat(-_S2, 0, 0, _S2)).normalized()
+    return Quat(_S2, 0, 0, _S2).multiply(q).normalized()
 
 
 # ----------------------------------------------------------------------------- articulation
@@ -1018,8 +1047,8 @@ struct MjcfArticulation(Movable):
         var art = MjcfArticulation()
         var q0 = model.qpos0()
         var fk = model.forward_kinematics(q0)
-        ref bpos = fk[0]
-        ref brot = fk[1]
+        var bpos = fk[0].copy()
+        var brot = fk[1].copy()
         var nb = len(model.bodies)
         # 1. links: every body with a joint (or a child of the world) starts one
         art.body_link = List[Int](length=nb, fill=-1)
@@ -1079,9 +1108,6 @@ struct MjcfArticulation(Movable):
                 pa.m[2] = -body.mass * dx * dz; pa.m[6] = pa.m[2]
                 pa.m[5] = -body.mass * dy * dz; pa.m[7] = pa.m[5]
                 tensor = tensor.add(local).add(pa)
-            if armature and art.links[li].mj_joint >= 0:
-                # (only the rotor row models armature; nothing is added to the link inertia)
-                pass
             var e = symmetric_eigen(tensor)
             art.links[li].mass = mass
             art.links[li].com = com
@@ -1189,13 +1215,17 @@ struct MjcfArticulation(Movable):
         """Place every link at the MuJoCo state (qpos, qvel) and sync the rotors."""
         var fk = model.forward_kinematics(qpos)
         var vel = model.body_velocities(qpos, qvel)
+        var fpos = fk[0].copy()
+        var frot = fk[1].copy()
+        var bv = vel[0].copy()
+        var bw = vel[1].copy()
         for li in range(len(self.links)):
             ref l = self.links[li]
             var b = l.body
-            var c = fk[0][b] + mj_rotate(fk[1][b], l.com)
-            var r = fk[1][b].multiply(l.frame).normalized()
-            var w = vel[1][b]
-            var v = vel[0][b] + w.cross(c - fk[0][b])
+            var c = fpos[b] + mj_rotate(frot[b], l.com)
+            var r = frot[b].multiply(l.frame).normalized()
+            var w = bw[b]
+            var v = bv[b] + w.cross(c - fpos[b])
             world.reset_body(l.slot, mj_to_flint(c), mj_to_flint_quat(r), mj_to_flint(v), mj_to_flint(w), True)
             if l.mj_joint >= 0 and l.joint >= 0:
                 world.joints[l.joint].rotor_speed = Float32(qvel[model.joints[l.mj_joint].dof_adr])
@@ -1275,6 +1305,11 @@ struct MjcfArticulation(Movable):
             world.joints[ji].drive_kp = kp[a]
             world.joints[ji].drive_kd = kd[a]
             world.joints[ji].drive_max_torque = self.act_effort[a]
+
+    def set_efforts(mut self, effort: List[Float32]):
+        """Per-actuator torque caps (N m), for files whose actuators carry no forcerange."""
+        for a in range(min(len(effort), len(self.act_effort))):
+            self.act_effort[a] = effort[a]
 
     def drive_torque(self, world: PhysicsWorld, a: Int, h: Float32) -> Float32:
         """Actuator a's torque over the last substep of length h."""

@@ -50,6 +50,9 @@ G1 MJCF, `MjcfArticulation` in `PhysicsWorld`); `examples/metatron` closes the l
 from std.math import sin, cos, atan2, exp, sqrt
 from flint.ml.onnx import OnnxModel
 from flint.ml.tensor import Tensor, DT_BOOL
+from flint.core.math import Vec3, Quat
+from flint.physics.mjcf import MjcfModel, MjcfArticulation
+from flint.physics.world import PhysicsWorld
 
 comptime MT_INPUTS: Int = 39
 comptime MT_DOF: Int = 29
@@ -521,13 +524,13 @@ struct MetatronInputs(Movable):
         self._copy(MI_DOF_VEL, r.dof_vel)
         self._copy(MI_ROOT_ANG_VEL, r.root_local_ang_vel)
         for row in range(MT_HISTORY):
-            self._copy(MI_H_ANCHOR_ROT, self.states[row].anchor_rot, row * 4)
-            self._copy(MI_H_DOF_POS, self.states[row].dof_pos, row * MT_DOF)
-            self._copy(MI_H_DOF_VEL, self.states[row].dof_vel, row * MT_DOF)
-            self._copy(MI_H_ROOT_ANG_VEL, self.states[row].root_local_ang_vel, row * 3)
-            self._copy(MI_H_RAW_ACTIONS, self.actions[row + 1], row * MT_DOF)
+            self._copy(MI_H_ANCHOR_ROT, self.states[row].anchor_rot.copy(), row * 4)
+            self._copy(MI_H_DOF_POS, self.states[row].dof_pos.copy(), row * MT_DOF)
+            self._copy(MI_H_DOF_VEL, self.states[row].dof_vel.copy(), row * MT_DOF)
+            self._copy(MI_H_ROOT_ANG_VEL, self.states[row].root_local_ang_vel.copy(), row * 3)
+            self._copy(MI_H_RAW_ACTIONS, self.actions[row + 1].copy(), row * MT_DOF)
         for row in range(MT_HISTORY + 1):
-            self._copy(MI_RAW_ACTION_HISTORY, self.actions[row], row * MT_DOF)
+            self._copy(MI_RAW_ACTION_HISTORY, self.actions[row].copy(), row * MT_DOF)
 
     def commit(mut self, before_step: MetatronReading, raw_action: List[Float32]):
         self.states.insert(0, before_step.copy())
@@ -826,3 +829,188 @@ struct MetatronTask(Movable):
             inp.put(MI_AVG_VEL, 0, 0.0)
             inp.put(MI_AVG_VEL, 1, 0.0)
             inp.set_flag(MI_VEL_CMD_MASK, 0, True)
+
+
+# ------------------------------------------------------------------------------------------ host
+
+def g1_check_model(model: MjcfModel) raises:
+    """The MJCF must be the G1 layout the policy expects: a floating pelvis, then the 29 hinge
+    joints and the 33 bodies in `g1_joint_names()` / `g1_body_names()` order."""
+    if model.nq != 7 + MT_DOF or model.nv != 6 + MT_DOF or len(model.bodies) != MT_BODIES + 1:
+        raise Error("Metatron: the MJCF is not the 29-DoF G1 (nq " + String(model.nq) + ", bodies " + String(len(model.bodies) - 1) + ")")
+    var jn = g1_joint_names()
+    for j in range(MT_DOF):
+        if model.joints[1 + j].name != jn[j]:
+            raise Error("Metatron: joint " + String(j) + " is " + model.joints[1 + j].name + ", expected " + jn[j])
+    var bn = g1_body_names()
+    for b in range(MT_BODIES):
+        if model.bodies[1 + b].name != bn[b]:
+            raise Error("Metatron: body " + String(b) + " is " + model.bodies[1 + b].name + ", expected " + bn[b])
+
+
+def metatron_reading_mj(qpos: List[Float64], qvel: List[Float64], body_pos: List[Float32], body_rot: List[Float32]) -> MetatronReading:
+    """A reading from the G1's MuJoCo-layout state (pelvis free joint xyz + wxyz, then the joints;
+    qvel: linear world, angular local, joints) and the body poses ([33*3], [33*4] xyzw, z up)."""
+    var r = MetatronReading()
+    for j in range(MT_DOF):
+        r.dof_pos[j] = Float32(qpos[7 + j])
+        r.dof_vel[j] = Float32(qvel[6 + j])
+    for c in range(3):
+        r.root_pos[c] = Float32(qpos[c])
+        r.root_local_ang_vel[c] = Float32(qvel[3 + c])
+        r.anchor_pos[c] = body_pos[MT_ANCHOR * 3 + c]
+    r.root_rot = [Float32(qpos[4]), Float32(qpos[5]), Float32(qpos[6]), Float32(qpos[3])]
+    for c in range(4):
+        r.anchor_rot[c] = body_rot[MT_ANCHOR * 4 + c]
+    return r^
+
+
+def metatron_body_flat(pos: List[Vec3], rot: List[Quat]) -> Tuple[List[Float32], List[Float32]]:
+    """`MjcfModel.forward_kinematics` / `MjcfArticulation.body_poses` output (body 0 = world) as
+    the policy's flat [33*3] / [33*4] lists."""
+    var p = List[Float32](capacity=MT_BODIES * 3)
+    var q = List[Float32](capacity=MT_BODIES * 4)
+    for b in range(1, len(pos)):
+        p.append(pos[b].x); p.append(pos[b].y); p.append(pos[b].z)
+        q.append(rot[b].x); q.append(rot[b].y); q.append(rot[b].z); q.append(rot[b].w)
+    return (p^, q^)
+
+
+def g1_rest_from_model(model: MjcfModel) -> MetatronRest:
+    """The calibrated rest pose from the G1 MJCF's forward kinematics (pelvis at the origin)."""
+    var q = List[Float64](length=model.nq, fill=0.0)
+    q[3] = 1.0
+    var rd = g1_rest_dof()
+    for j in range(MT_DOF):
+        q[7 + j] = Float64(rd[j])
+    var fk = model.forward_kinematics(q)
+    var fpos = fk[0].copy()
+    var frot = fk[1].copy()
+    var flat = metatron_body_flat(fpos, frot)
+    var bp = flat[0].copy()
+    var bq = flat[1].copy()
+    return metatron_rest_from_fk(bp, bq)
+
+
+def g1_default_qpos(model: MjcfModel, clearance: Float64 = 0.0005) -> List[Float64]:
+    """The policy's start state: the default standing joints (`g1_action_offset()`), pelvis upright,
+    lowest collision geom `clearance` above z = 0."""
+    var q = List[Float64](length=model.nq, fill=0.0)
+    q[2] = 1.0
+    q[3] = 1.0
+    var off = g1_action_offset()
+    for j in range(MT_DOF):
+        q[7 + j] = Float64(off[j])
+    var fk = model.forward_kinematics(q)
+    var fpos = fk[0].copy()
+    var frot = fk[1].copy()
+    var low = 1.0e9
+    for g in model.geoms:
+        if g.body == 0 or g.contype == 0:
+            continue
+        var c = fpos[g.body] + mt_rotate_vec(frot[g.body], g.pos)
+        var r = frot[g.body].multiply(g.quat)
+        var z = Float64(c.z)
+        if g.kind == 2:      # sphere
+            z -= Float64(g.size.x)
+        elif g.kind == 3:    # capsule
+            var ax = mt_rotate_vec(r, Vec3(0, 0, 1))
+            z -= abs(Float64(ax.z * g.size.y)) + Float64(g.size.x)
+        low = min(low, z)
+    q[2] = 1.0 - low + clearance
+    return q^
+
+
+def mt_rotate_vec(q: Quat, v: Vec3) -> Vec3:
+    var u = Vec3(q.x, q.y, q.z)
+    var t = u.cross(v) * 2.0
+    return v + t * q.w + u.cross(t)
+
+
+struct MetatronHost(Movable):
+    """Policy + persistent inputs + task: `step(reading, body_pos, body_rot)` runs one 50 Hz tick
+    (prepare, goals, network, commit of the applied target) and returns the PD command."""
+    var policy: MetatronPolicy
+    var inputs: MetatronInputs
+    var task: MetatronTask
+
+    def __init__(out self, var policy: MetatronPolicy, var rest: MetatronRest):
+        self.policy = policy^
+        self.inputs = MetatronInputs()
+        self.task = MetatronTask(rest^)
+
+    def step(mut self, r: MetatronReading, body_pos: List[Float32], body_rot: List[Float32]) raises -> MetatronOutputs:
+        self.inputs.prepare(r)
+        self.task.build(self.inputs, r, body_pos, body_rot)
+        var o = self.policy.run(self.inputs.flat)
+        self.inputs.commit(r, metatron_raw_from_action(o.action))
+        return o^
+
+
+# ------------------------------------------------------------------------------- Flint physics
+
+comptime MT_PHYSICS_DT: Float32 = 0.001      # 1 kHz steps, 20 per policy tick (as the MuJoCo host)
+comptime MT_SUBSTEPS: Int = 8                # solver substeps per step
+comptime MT_JOINT_HERTZ: Float32 = 2000.0    # stiffness of the joints' rigid rows
+comptime MT_CONTACT_HERTZ: Float32 = 250.0
+comptime MT_FOOT_FRICTION: Float32 = 0.8     # the host's foot-floor contact pairs
+
+
+struct G1Sim(Movable):
+    """The G1 from its MJCF in a Flint `PhysicsWorld` with the settings measured against MuJoCo
+    (1 kHz, 8 substeps, 2 kHz joint rows, 250 Hz contacts, armature rotors, frictionloss,
+    explicit kp / kd drives capped at the motor effort). `reading()` gives the policy's sensors,
+    `apply(outputs)` holds the PD command for one 20 ms tick."""
+    var model: MjcfModel
+    var world: PhysicsWorld
+    var art: MjcfArticulation
+
+    def __init__(out self, var model: MjcfModel, substeps: Int = MT_SUBSTEPS, joint_hertz: Float32 = MT_JOINT_HERTZ,
+                 contact_hertz: Float32 = MT_CONTACT_HERTZ, armature: Bool = True) raises:
+        g1_check_model(model)
+        self.world = PhysicsWorld()
+        self.world.settings.substeps = substeps
+        self.world.settings.contact_hertz = contact_hertz
+        self.art = MjcfArticulation.build(self.world, model, MT_FOOT_FRICTION, joint_hertz, armature, True)
+        self.art.set_efforts(G1Gains().effort)
+        self.model = model^
+        var q = g1_default_qpos(self.model)
+        var v = List[Float64](length=self.model.nv, fill=0.0)
+        self.art.set_state(self.world, self.model, q, v)
+
+    def set_state(mut self, qpos: List[Float64], qvel: List[Float64]):
+        self.art.set_state(self.world, self.model, qpos, qvel)
+
+    def qpos(self) -> List[Float64]:
+        return self.art.qpos(self.world, self.model)
+
+    def qvel(self) -> List[Float64]:
+        return self.art.qvel(self.world, self.model)
+
+    def bodies(self) -> Tuple[List[Float32], List[Float32]]:
+        var t = self.art.body_poses(self.world, self.model)
+        var p = t[0].copy()
+        var r = t[1].copy()
+        return metatron_body_flat(p, r)
+
+    def reading(self) -> MetatronReading:
+        var b = self.bodies()
+        var p = b[0].copy()
+        var r = b[1].copy()
+        return metatron_reading_mj(self.qpos(), self.qvel(), p, r)
+
+    def apply(mut self, o: MetatronOutputs, ticks: Int = 20):
+        """Hold the PD command for `ticks` physics steps (20 = one policy tick)."""
+        self.art.set_command(self.world, o.action, o.stiffness, o.damping)
+        for _ in range(ticks):
+            self.world.step(MT_PHYSICS_DT)
+
+    def tick(mut self, mut host: MetatronHost) raises -> MetatronOutputs:
+        """Read, run the policy, apply: one closed-loop 50 Hz step."""
+        var b = self.bodies()
+        var p = b[0].copy()
+        var r = b[1].copy()
+        var rd = metatron_reading_mj(self.qpos(), self.qvel(), p, r)
+        var o = host.step(rd, p, r)
+        self.apply(o)
+        return o^
