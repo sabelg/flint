@@ -19,8 +19,6 @@ from flint.core.jobs import JobPool, default_worker_count
 from flint.platform.os import open_read, close_fd, write_bytes
 from std.collections import Optional
 from flint.ml.protobuf import PbReader, WIRE_LEN
-from flint.ml.gpu import GpuMatmul, FP, gpu_binary_supported, gpu_unary_supported
-from flint.ml.tensor import Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, numel_of, shape_str, norm_axis
 from flint.ml.ops_ext import (
     reduce_mean, lstm, conv1d_ext, conv_transpose1d, pad, round_even, stft, nonzero, resize_linear,
     conv1d_par, conv1d_gpu, row_binary_applies, par_row_binary, par_sin_cos_square, PAR_MIN,
