@@ -6,6 +6,10 @@ the smallest set whose probability reaches `top_p`. A repetition penalty (Huggin
 positive logits divided, negative multiplied) applies to recently generated tokens. An optional
 `allowed` mask (from a grammar) removes every other token first. The generator is a seeded
 SplitMix64, so a seed reproduces a run.
+
+`Sampler.distribution` returns the exact distribution `sample` draws from as a `SparseDist`
+(token ids with normalised probabilities), which speculative decoding needs for its acceptance
+rule (`flint.ml.llm.speculative`).
 """
 
 from std.math import exp
@@ -93,6 +97,40 @@ def top_candidates(logits: List[Float32], allowed: List[Bool], use_mask: Bool, k
     return heap^
 
 
+struct SparseDist(Copyable, Movable):
+    """A distribution over a few token ids: `ids[i]` has probability `p[i]` (sums to 1)."""
+    var ids: List[Int]
+    var p: List[Float64]
+
+    def __init__(out self):
+        self.ids = List[Int]()
+        self.p = List[Float64]()
+
+    @staticmethod
+    def one_hot(token: Int) -> SparseDist:
+        var d = SparseDist()
+        d.ids.append(token)
+        d.p.append(1.0)
+        return d^
+
+    def prob(self, token: Int) -> Float64:
+        for i in range(len(self.ids)):
+            if self.ids[i] == token:
+                return self.p[i]
+        return 0.0
+
+    def draw(self, mut rng: Rng) -> Int:
+        """-1 when empty."""
+        if len(self.ids) == 0:
+            return -1
+        var u = rng.uniform()
+        for i in range(len(self.ids)):
+            u -= self.p[i]
+            if u < 0:
+                return self.ids[i]
+        return self.ids[len(self.ids) - 1]
+
+
 struct Sampler(Copyable, Movable):
     var temperature: Float32
     var top_k: Int
@@ -121,6 +159,53 @@ struct Sampler(Copyable, Movable):
     def sample_masked(mut self, var logits: List[Float32], recent: List[Int], allowed: List[Bool]) -> Int:
         """-1 when the mask allows nothing."""
         return self._pick(logits^, recent, allowed, True)
+
+    def is_greedy(self) -> Bool:
+        return self.temperature <= 0
+
+    def distribution(self, var logits: List[Float32], recent: List[Int]) -> SparseDist:
+        """The distribution `sample(logits, recent)` draws from: a one-hot on the argmax when
+        greedy, else the softmax at `temperature` over the top-k / top-p set, renormalised."""
+        self._penalise(logits, recent)
+        if self.temperature <= 0:
+            return SparseDist.one_hot(argmax(logits))
+        var none = List[Bool]()
+        var k = self.top_k if self.top_k > 0 else 1024
+        var cand = top_candidates(logits, none, False, k)
+        var d = SparseDist()
+        if len(cand) == 0:
+            return d^
+        var mx = logits[cand[0]]
+        var probs = List[Float64](capacity=len(cand))
+        var tot: Float64 = 0
+        for c in cand:
+            var p = exp(Float64((logits[c] - mx) / self.temperature))
+            probs.append(p)
+            tot += p
+        var keep = len(cand)
+        if self.top_p < 1.0:
+            var acc: Float64 = 0
+            for i in range(len(cand)):
+                acc += probs[i] / tot
+                if acc >= Float64(self.top_p):
+                    keep = i + 1
+                    break
+        var mass: Float64 = 0
+        for i in range(keep):
+            mass += probs[i]
+        for i in range(keep):
+            d.ids.append(cand[i])
+            d.p.append(probs[i] / mass)
+        return d^
+
+    def _penalise(self, mut logits: List[Float32], recent: List[Int]):
+        if self.repetition_penalty != 1.0:
+            var start = max(0, len(recent) - self.penalty_window)
+            for i in range(start, len(recent)):
+                var t = recent[i]
+                if t >= 0 and t < len(logits):
+                    var v = logits[t]
+                    logits[t] = v / self.repetition_penalty if v > 0 else v * self.repetition_penalty
 
     def _pick(mut self, var logits: List[Float32], recent: List[Int], allowed: List[Bool], use_mask: Bool) -> Int:
         if self.repetition_penalty != 1.0:

@@ -5,9 +5,11 @@ buffers, activations and the KV cache live in float32 buffers, and a token step 
 embedding row and downloads the logits.
 
   - `_qmv_kernel[FMT, MR]`: y[m, n] (+)= x[m, k] W^T for fp32 / int8-per-row / int4-group-32
-    weights. One warp per output row, `MR` activation rows per block (1 for decoding, 8 for
-    prefill), 16-byte vector loads, dequantisation in registers, warp-shuffle reduction. The
-    `acc` flag adds into y (fused residual).
+    weights. One warp per output row, `MR` activation rows per block (1 for decoding, 4 for
+    short batches such as speculative verification, 8 for prefill; a row's sum never depends
+    on `MR`, so batched rows are bit-identical to single-row steps), 16-byte vector loads,
+    dequantisation in registers, warp-shuffle reduction. The `acc` flag adds into y (fused
+    residual).
   - `_rmsnorm_kernel`: one block per row.
   - `_qk_rope_kernel`: per (row, head) block: optional per-head RMSNorm (Qwen3 QK-norm), rotary
     embedding from a precomputed cos/sin table (rotate-half layout), and the K / V rows written
@@ -452,6 +454,18 @@ struct LlmGpu(Movable):
             else:
                 self.ctx.enqueue_function[_qmv_kernel[Q_F32, 1]](x, w, sc, y, Int32(m), Int32(k), Int32(n), Int32(nb), a, gs,
                                                                 grid_dim=nb, block_dim=WARPS * 32)
+            return
+        if m <= 4:
+            # short batches (speculative verification): four rows per block, fewer idle registers
+            if fmt == Q_INT8:
+                self.ctx.enqueue_function[_qmv_kernel[Q_INT8, 4]](x, w, sc, y, Int32(m), Int32(k), Int32(n), Int32(nb), a,
+                                                                 gs, grid_dim=nb, block_dim=WARPS * 32)
+            elif fmt == Q_INT4:
+                self.ctx.enqueue_function[_qmv_kernel[Q_INT4, 4]](x, w, sc, y, Int32(m), Int32(k), Int32(n), Int32(nb), a,
+                                                                 gs, grid_dim=nb, block_dim=WARPS * 32)
+            else:
+                self.ctx.enqueue_function[_qmv_kernel[Q_F32, 4]](x, w, sc, y, Int32(m), Int32(k), Int32(n), Int32(nb), a,
+                                                                gs, grid_dim=nb, block_dim=WARPS * 32)
             return
         var mb = (m + 7) // 8
         if fmt == Q_INT8:

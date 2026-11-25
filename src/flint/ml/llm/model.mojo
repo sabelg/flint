@@ -13,6 +13,12 @@ row and downloads the logits. Without one, the same block runs on the CPU job po
 The model remembers the tokens in its cache: `prompt(tokens)` reuses the longest common prefix
 with what is cached (an NPC's fixed system prompt is evaluated once), and `push(token)` appends
 one token. Prompts run in chunks of `CHUNK` rows.
+
+`rewind(n)` drops every cached token past the first `n` (speculative decoding rolls rejected
+draft tokens back this way: K / V rows are addressed by position, so the next evaluation simply
+overwrites them, on the GPU as on the CPU). `eval_hidden(tokens)` returns the final-normed
+hidden state of the last token instead of logits (embedding models; `head=False` skips the
+output projection entirely, and checkpoints saved without the `model.` prefix load as well).
 """
 
 from std.math import sqrt, exp, cos, sin
@@ -300,12 +306,14 @@ struct LlmModel(Movable):
     var d_sin: Int
     var weight_bytes: Int
     var tokens_evaluated: Int
+    var prefix: String    # "model." for *ForCausalLM checkpoints, "" for bare Qwen3Model ones
+    var has_head: Bool
 
-    def __init__(out self, dir: String, fmt: Int, use_gpu: Bool, ctx: Int) raises:
+    def __init__(out self, dir: String, fmt: Int, use_gpu: Bool, ctx: Int, head: Bool = True) raises:
         self.cfg = LlmConfig.load(dir + "/config.json")
         self.fmt = fmt
         self.st = SafeTensors.open_dir(dir)
-        self.embed = self.st.get("model.embed_tokens.weight")
+        self.embed = SafeTensor("", "F32", List[Int](), 0)
         self.layers = List[LlmLayer]()
         self.lm_head = QMat()
         self.norm = 0
@@ -342,6 +350,9 @@ struct LlmModel(Movable):
         self.d_sin = -1
         self.weight_bytes = 0
         self.tokens_evaluated = 0
+        self.prefix = String("model.") if self.st.has("model.embed_tokens.weight") else String("")
+        self.has_head = head
+        self.embed = self.st.get(self.prefix + "embed_tokens.weight")
         if use_gpu:
             try:
                 self.gpu = LlmGpu()
@@ -352,8 +363,8 @@ struct LlmModel(Movable):
         self._buffers()
 
     @staticmethod
-    def load(dir: String, fmt: Int = Q_INT8, gpu: Bool = True, ctx: Int = 2048) raises -> LlmModel:
-        return LlmModel(dir, fmt, gpu, ctx)
+    def load(dir: String, fmt: Int = Q_INT8, gpu: Bool = True, ctx: Int = 2048, head: Bool = True) raises -> LlmModel:
+        return LlmModel(dir, fmt, gpu, ctx, head)
 
     def __deinit__(deinit self):
         for ref l in self.layers:
@@ -415,7 +426,7 @@ struct LlmModel(Movable):
     def _load_weights(mut self) raises:
         var c = self.cfg.copy()
         for l in range(c.layers):
-            var p = "model.layers." + String(l) + "."
+            var p = self.prefix + "layers." + String(l) + "."
             var ly = LlmLayer()
             ly.qkv = self._mat([p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
                                 p + "self_attn.v_proj.weight"], self.fmt)
@@ -435,9 +446,11 @@ struct LlmModel(Movable):
                 ly.d_qn = ly.d_ln1
                 ly.d_kn = ly.d_ln1
             self.layers.append(ly^)
-        self.norm = self._vec("model.norm.weight")
+        self.norm = self._vec(self.prefix + "norm.weight")
         self.d_norm = self._dvec(self.norm, c.hidden)
-        var head = String("lm_head.weight") if self.st.has("lm_head.weight") else String("model.embed_tokens.weight")
+        if not self.has_head:
+            return
+        var head = String("lm_head.weight") if self.st.has("lm_head.weight") else self.prefix + "embed_tokens.weight"
         self.lm_head = self._mat([head], self.fmt)
 
     def _rope_table(mut self) raises:
@@ -478,7 +491,7 @@ struct LlmModel(Movable):
             self.d_att = g.alloc(CHUNK * att_w)
             self.d_gu = g.alloc(CHUNK * 2 * c.ffn)
             self.d_act = g.alloc(CHUNK * c.ffn)
-            self.d_logits = g.alloc(CHUNK * c.vocab)
+            self.d_logits = g.alloc(CHUNK * c.vocab if self.has_head else CHUNK * c.hidden)
             g.sync()
             self.b_x = _alloc(CHUNK * c.hidden)
             return
@@ -491,13 +504,29 @@ struct LlmModel(Movable):
         self.b_att = _alloc(CHUNK * att_w)
         self.b_gu = _alloc(CHUNK * 2 * c.ffn)
         self.b_act = _alloc(CHUNK * c.ffn)
-        self.b_logits = _alloc(CHUNK * c.vocab)
+        self.b_logits = _alloc(CHUNK * c.vocab if self.has_head else 1)
         self.b_scratch = _alloc(CHUNK * c.heads * self.cap)
 
     # ------------------------------------------------------------------ evaluation
 
     def reset(mut self):
         self.past = List[Int]()
+
+    def cached(self) -> Int:
+        """How many tokens the KV cache holds."""
+        return len(self.past)
+
+    def rewind(mut self, n: Int):
+        """Keeps only the first `n` cached tokens (no-op when fewer are cached). The K / V rows
+        past `n` stay in memory but are never read again: attention only looks at positions
+        below the current length, and the next evaluation overwrites them."""
+        while len(self.past) > max(n, 0):
+            _ = self.past.pop()
+
+    def eval_hidden(mut self, tokens: List[Int]) raises -> List[Float32]:
+        """Appends `tokens` after the cached ones and returns the final RMS-normed hidden state
+        of the last one ([hidden]), the input to the output projection (last-token pooling)."""
+        return self._eval(tokens, False, True)
 
     def prompt(mut self, tokens: List[Int]) raises -> List[Float32]:
         """Makes the cache hold exactly `tokens` (reusing the longest cached prefix) and returns
@@ -524,9 +553,14 @@ struct LlmModel(Movable):
     def eval(mut self, tokens: List[Int], all_logits: Bool) raises -> List[Float32]:
         """Appends `tokens` after the cached ones; returns the logits of the last one, or of
         every one ([len, vocab]) when `all_logits`."""
+        if not self.has_head:
+            raise Error("llm: model loaded without an output head (use eval_hidden)")
+        return self._eval(tokens, all_logits, False)
+
+    def _eval(mut self, tokens: List[Int], all_logits: Bool, hidden: Bool) raises -> List[Float32]:
         if len(self.past) + len(tokens) > self.cap:
             raise Error("llm: context of " + String(self.cap) + " tokens exceeded")
-        var V = self.cfg.vocab
+        var V = self.cfg.hidden if hidden else self.cfg.vocab
         var out = List[Float32]()
         var i = 0
         while i < len(tokens):
@@ -542,12 +576,14 @@ struct LlmModel(Movable):
                 widen_to_f32(self.embed, self.b_x + r * hid * 4, t * hid, hid)
             var lg = List[Float32](length=rows_out * V, fill=0.0)
             if self.gpu:
-                self._gpu_chunk(m, pos0, rows_out, Int(lg.unsafe_ptr()))
+                self._gpu_chunk(m, pos0, rows_out, Int(lg.unsafe_ptr()), hidden)
             else:
-                self._cpu_chunk(m, pos0, rows_out, Int(lg.unsafe_ptr()))
+                self._cpu_chunk(m, pos0, rows_out, Int(lg.unsafe_ptr()), hidden)
             for r in range(m):
                 self.past.append(tokens[i + r])
-            if all_logits:
+            if all_logits and i == 0 and last:
+                out = lg^
+            elif all_logits:
                 for v in lg:
                     out.append(v)
             elif last:
@@ -556,7 +592,7 @@ struct LlmModel(Movable):
         self.tokens_evaluated += len(tokens)
         return out^
 
-    def _cpu_chunk(mut self, m: Int, pos0: Int, rows_out: Int, dst: Int) raises:
+    def _cpu_chunk(mut self, m: Int, pos0: Int, rows_out: Int, dst: Int, hidden: Bool) raises:
         var c = self.cfg.copy()
         var H = c.heads
         var KV = c.kv_heads
@@ -622,9 +658,12 @@ struct LlmModel(Movable):
             return
         var r0 = m - rows_out
         rms_norm_rows(self.b_x + r0 * hid * 4, self.b_h, rows_out, hid, self.norm, c.eps)
+        if hidden:
+            _ = external_call["memcpy", Int](dst, self.b_h, rows_out * hid * 4)
+            return
         qmatmul(self.pool, self.lm_head, self.b_h, dst, rows_out, False)
 
-    def _gpu_chunk(mut self, m: Int, pos0: Int, rows_out: Int, dst: Int) raises:
+    def _gpu_chunk(mut self, m: Int, pos0: Int, rows_out: Int, dst: Int, hidden: Bool) raises:
         var c = self.cfg.copy()
         var H = c.heads
         var KV = c.kv_heads
@@ -664,6 +703,9 @@ struct LlmModel(Movable):
             return
         var r0 = m - rows_out
         g.rmsnorm(px.unsafe_offset(r0 * hid), g.wfptr(self.d_norm), ph, rows_out, hid, c.eps)
+        if hidden:
+            g.download(self.d_h, dst, rows_out * hid)
+            return
         g.matvec(self.lm_head.fmt, ph, g.wptr(self.lm_head.dev), g.wfptr(self.lm_head.dev_scales), g.ptr(self.d_logits),
                  rows_out, hid, self.lm_head.n, False)
         g.download(self.d_logits, dst, rows_out * c.vocab)

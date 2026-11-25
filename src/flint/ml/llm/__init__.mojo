@@ -9,6 +9,10 @@
   - `chat`: chat templates (ChatML for Qwen3, SmolLM3's metadata header), `generate`
   - `constrain`: byte-level grammar masks (JSON objects with enum and string fields)
   - `npc`: `NpcBrain`, an LLM that picks one of a BehaviorTree's actions as JSON
+  - `embed`: `TextEmbedder` (Qwen3-Embedding: last-token pooling, L2 norm, MRL truncation,
+    instruct queries) and `EmbeddingIndex` (cosine top-k over assets, scripts, quests, dialogue)
+  - `speculative`: draft / verify / rollback speculative decoding (Qwen3-0.6B drafting for
+    Qwen3-1.7B and larger), greedy-exact, standard acceptance rule when sampling
 """
 
 from flint.ml.llm.safetensors import SafeTensors, SafeTensor
@@ -16,3 +20,6 @@ from flint.ml.llm.tokenizer import BpeTokenizer
 from flint.ml.llm.quant import QMat, Q_F32, Q_INT8, Q_INT4, fmt_name
 from flint.ml.llm.model import LlmModel, LlmConfig
 from flint.ml.llm.sample import Sampler, Rng, argmax, argmax_allowed
+from flint.ml.llm.sample import SparseDist
+from flint.ml.llm.embed import TextEmbedder, EmbeddingIndex, EmbeddingHit, instruct_query, mrl_truncate, l2_normalize, cosine
+from flint.ml.llm.speculative import speculative_tokens, generate_speculative, spec_accept, SpecGeneration, SpecStats
