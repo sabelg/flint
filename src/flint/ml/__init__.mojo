@@ -41,4 +41,12 @@
     precompiled charsmaps, byte fallback)
   - `siglip`: SigLIP 2 image / text embeddings and sigmoid logits (CPU / MAX GPU), PIL-exact
     preprocessing, GLB thumbnails and `AssetIndex` text-to-image asset search
+  - `ops_conv2d`, `ops_image`: general 2-D Conv (depthwise / grouped / strided / dilated, CPU +
+    GPU dense products) and parallel LeakyRelu / Clip / Resize / Pad (op codes 90..94 in `onnx`)
+  - `marigold`: Marigold-Normals v1.1 image -> normal map on `diffusion` (shared `MarigoldCore`
+    for later depth / intrinsics heads; 1..50 DDIM steps, ensembling, uncertainty, tileable mode)
+  - `migan`: MI-GAN fast inpainting on `OnnxModel` (windowed full-resolution repaint, sprite
+    clean-up, `make_tileable` seamless textures)
+  - `realesrgan`: Real-ESRGAN x4 super-resolution (RRDBNet and compact SRVGG nets from
+    safetensors, tiled inference, PixelShuffle, denoise blend; CPU / MAX GPU)
 """

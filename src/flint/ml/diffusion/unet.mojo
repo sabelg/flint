@@ -259,6 +259,27 @@ def _json_heads(doc_text: List[UInt8], n_blocks: Int) raises -> List[Int]:
     return out^
 
 
+def resize_nearest_act(mut rt: Runtime, x: Act, oh: Int, ow: Int) raises -> Act:
+    """`F.interpolate(x, size=(oh, ow), mode="nearest")` of a channels-last value (src = floor(dst
+    * in / out) in float32, as ATen). Round-trips through the host on the GPU: only used for the
+    odd-sized up-sampling of latents that are not a multiple of 8."""
+    var src = rt.download(x)
+    var c = x.c
+    var out = List[Float32](length=x.b * oh * ow * c, fill=0.0)
+    var sy = Float32(x.h) / Float32(oh)
+    var sx = Float32(x.w) / Float32(ow)
+    for b in range(x.b):
+        for y in range(oh):
+            var iy = min(Int(Float32(y) * sy), x.h - 1)
+            for xx in range(ow):
+                var ix = min(Int(Float32(xx) * sx), x.w - 1)
+                var so = ((b * x.h + iy) * x.w + ix) * c
+                var do = ((b * oh + y) * ow + xx) * c
+                for k in range(c):
+                    out[do + k] = src[so + k]
+    return rt.upload(x.b, oh, ow, c, out)
+
+
 struct UNet(Movable):
     var conv_in: Conv
     var t1: Linear
@@ -446,6 +467,16 @@ struct UNet(Movable):
                     rt.free(h^)
                     h = a^
             if self.up[i].has_sampler:
+                # latents that are not a multiple of 2^downsamplers: diffusers upsamples to the
+                # size of the next skip (`forward_upsample_size`) instead of exactly 2x
+                var sh = skips[len(skips) - 1].h if len(skips) > 0 else 2 * h.h
+                var sw = skips[len(skips) - 1].w if len(skips) > 0 else 2 * h.w
+                if sh != 2 * h.h or sw != 2 * h.w:
+                    var r = resize_nearest_act(rt, h, sh, sw)
+                    rt.free(h^)
+                    h = rt.conv2d(r, self.up[i].sampler, mode)
+                    rt.free(r^)
+                    continue
                 var u = rt.conv2d(h, self.up[i].sampler, mode, 2)
                 rt.free(h^)
                 h = u^
