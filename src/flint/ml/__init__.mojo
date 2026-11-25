@@ -12,4 +12,6 @@
   - `motionbricks`: the MotionBricks motion-inbetweening runtime on top of `OnnxModel`
   - `unirig`, `unirig_skin`, `unirig_rig`: UniRig automatic rigging (skeleton generation, skin
     weights, skinned glTF output)
+  - `llm`: small-LLM runtime for NPC dialogue and behaviour choice (Qwen3, SmolLM3 from
+    safetensors; int8 / int4 weights; grammar-constrained BehaviorTree actions)
 """

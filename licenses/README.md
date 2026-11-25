@@ -15,3 +15,11 @@
   checkout. The shape encoders inside those checkpoints come from Michelangelo (GPL-3.0), so the
   exported `unirig_skel_encoder.onnx` and `unirig_skin_global.onnx` are GPL-derived: Flint does
   not include them, and builds that redistribute Flint must not bundle them.
+- `src/flint/ml/llm/` (`flint.ml.llm`) is an original pure-Mojo implementation of the Qwen3 and
+  SmolLM3 decoder architectures, written from the published model configs and checked against
+  Hugging Face Transformers outputs (`tools/llm/reference.py`); it contains no code from either
+  project. The byte-level BPE alphabet and split regex it reproduces come from GPT-2 / tiktoken
+  and the models' `tokenizer.json`. Flint does not include any weights or tokenizer files: users
+  download them from Hugging Face. Qwen3-0.6B and Qwen3-1.7B are Apache-2.0 (Copyright 2024
+  Alibaba Cloud, `qwen3-LICENSE.txt`); SmolLM3-3B is Apache-2.0 (Hugging Face,
+  `smollm3-LICENSE.txt`). Both allow commercial use and redistribution with the notice.
