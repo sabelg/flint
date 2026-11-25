@@ -158,3 +158,25 @@
   used with (`g1_holo_compat.xml`, BSD-3-Clause, Unitree Robotics) is downloaded by
   `tools/metatron/fetch.sh` and not included; see `unitree-g1-LICENSE.txt`. ProtoMotions'
   demo motion clips are not used (their licence does not allow standalone redistribution).
+- `src/flint/ml/realesrgan.mojo` runs Real-ESRGAN (https://github.com/xinntao/Real-ESRGAN, code
+  BSD-3-Clause, Copyright (c) 2021 Xintao Wang; see `realesrgan-LICENSE.txt`). The networks
+  (RRDBNet from BasicSR, Apache-2.0, and SRVGGNetCompact), the tile/pad geometry, the alpha and
+  grey handling and the denoise blend (DNI) are written in Mojo from the papers and the
+  reference code; no Python code is copied. The licence of the released weights
+  (`RealESRGAN_x4plus`, `RealESRGAN_x4plus_anime_6B`, `realesr-general-x4v3`,
+  `realesr-general-wdn-x4v3`, `realesr-animevideov3`) is not stated anywhere upstream: the
+  release notes and model files carry none, and the issues asking about it (#677, #1016, #1018)
+  are unanswered. The claim in #1004 that the OpenMMLab licence applies gives no source. The
+  training data is DIV2K, Flickr2K and OST, which have their own terms. Flint therefore treats
+  the weights as a user-supplied download: `tools/upscale/fetch.sh` downloads them outside the
+  repository (sha256-checked), and `tools/upscale/convert.py` converts them to safetensors. Flint
+  ships no weights, conversions or ONNX exports. `tools/upscale/reference.py` (torch) is used
+  only for verification. The tiny test nets in `tests/fixtures/upscale/` have random weights.
+- `src/flint/render/pixel_scale.mojo` and `pixel_scale_vk.mojo` implement pixel-art
+  magnifiers. MMPX follows the MIT-licensed JCGT 10(2) 2021 supplement shader (Copyright 2020
+  Morgan McGuire & Mara Gagiu). Super-xBR follows the weights of Hyllian's MIT-licensed 3-pass
+  shaders (Copyright (c) 2015 Hyllian). Both notices are in `mmpx-LICENSE.txt`. Scale2x / EPX
+  and Scale3x / Scale4x are written from their published rules. The GPL xBRZ code and the LGPL
+  xBR / HQX implementations were not used. The JCGT test images (some CC BY-SA, one
+  no-redistribution) are not included: the golden images in `tests/fixtures/upscale/` come from
+  a synthetic sprite sheet.

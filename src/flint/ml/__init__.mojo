@@ -37,4 +37,6 @@
     MAX GPU, bit-exact `jax.random` sampling) and `MagentaRtStream` for the `AudioServer`
   - `metatron`: NVIDIA Metatron-v1 G1 humanoid controller (policy, ProtoMotions host port,
     `G1Sim` on `flint.physics.mjcf`)
+  - `realesrgan`: Real-ESRGAN x4 super-resolution (RRDBNet and compact SRVGG nets from
+    safetensors, tiled inference, PixelShuffle, denoise blend; CPU / MAX GPU)
 """
