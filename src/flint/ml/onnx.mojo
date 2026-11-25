@@ -19,9 +19,14 @@ from flint.core.jobs import JobPool, default_worker_count
 from flint.platform.os import open_read, close_fd, write_bytes
 from std.collections import Optional
 from flint.ml.protobuf import PbReader, WIRE_LEN
+from flint.ml.ops_more import (
+    instance_norm, reduce_max, gru, softplus, ceil_op, conv_rows_in, conv_rows_out, conv1d_gpu_batched,
+    chan_binary_applies, par_chan_binary, par_instance_norm, is_last_axis, par_reduce_sum_last,
+)
 from flint.ml.ops_ext import (
     reduce_mean, lstm, conv1d_ext, conv_transpose1d, pad, round_even, stft, nonzero, resize_linear,
     conv1d_par, conv1d_gpu, row_binary_applies, par_row_binary, par_sin_cos_square, PAR_MIN,
+    gather_nd, reduce_min_max,
 )
 from flint.ml.gpu import GpuMatmul, FP, gpu_binary_supported, gpu_unary_supported, GU_BF16
 from flint.ml.tensor import Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, DT_BF16, numel_of, shape_str, norm_axis
@@ -81,6 +86,14 @@ comptime OP_GREATER_EQ: Int = 65
 comptime OP_LESS_EQ: Int = 66
 comptime OP_STFT: Int = 67
 comptime OP_NONZERO: Int = 68
+# 80..89: normalisation / recurrent audio ops (kernels in `ops_more`)
+comptime OP_INSTANCE_NORM: Int = 80
+comptime OP_REDUCE_MAX: Int = 81
+comptime OP_GRU: Int = 82
+comptime OP_SOFTPLUS: Int = 83
+comptime OP_CEIL: Int = 84
+comptime OP_GATHER_ND: Int = 69
+comptime OP_REDUCE_MIN: Int = 70
 comptime OP_UNARY: Int = 100   # + U_* code
 comptime OP_BINARY: Int = 200  # + B_* code
 
@@ -132,6 +145,13 @@ def op_code(name: String) -> Int:
     if name == "LessOrEqual": return OP_LESS_EQ
     if name == "STFT": return OP_STFT
     if name == "NonZero": return OP_NONZERO
+    if name == "InstanceNormalization": return OP_INSTANCE_NORM
+    if name == "ReduceMax": return OP_REDUCE_MAX
+    if name == "GRU": return OP_GRU
+    if name == "Softplus": return OP_SOFTPLUS
+    if name == "Ceil": return OP_CEIL
+    if name == "GatherND": return OP_GATHER_ND
+    if name == "ReduceMin": return OP_REDUCE_MIN
     if name == "Erf": return OP_UNARY + U_ERF
     if name == "Exp": return OP_UNARY + U_EXP
     if name == "Tanh": return OP_UNARY + U_TANH
@@ -1184,6 +1204,8 @@ struct OnnxModel(Movable):
                     key = "Attention(fused)"
                 elif self.fuse[k] == 3 and self.gpu:
                     key = "GatherMatMul(fused)"
+                if key == "Conv" or key == "ReduceSum" or key == "LeakyRelu":
+                    key += " " + shape_str(self.values[self.nodes[k].inputs[0]].shape)
                 if key == "Add" or key == "Mul" or key == "MatMul" or key == "Gather":
                     key += " " + shape_str(self.values[self.nodes[k].inputs[0]].shape) + shape_str(self.values[self.nodes[k].inputs[1]].shape)
                 var dt = Int(perf_counter_ns() - t0)
@@ -1537,6 +1559,8 @@ struct OnnxModel(Movable):
                 axes = self.values[ai].int_list()
             if len(axes) == 0 and node.attr_i("noop_with_empty_axes", 0) != 0:
                 out.append(x.reshaped(x.shape.copy()))
+            elif is_last_axis(x, axes) and x.numel() >= PAR_MIN:
+                out.append(par_reduce_sum_last(self.pool, x, node.attr_i("keepdims", 1) != 0))
             else:
                 out.append(reduce(x, axes, node.attr_i("keepdims", 1) != 0, False))
         elif op == OP_ARGMAX:
@@ -1615,10 +1639,13 @@ struct OnnxModel(Movable):
         """Whether node k runs through `_exec_ext`: ops 60..79, strided / grouped Conv, linear Resize."""
         ref node = self.nodes[k]
         var op = node.op
-        if op >= 60 and op < 80:
+        if op >= 60 and op < 90:
             return True
         if op == OP_CONV:
-            return self.values[node.inputs[0]].rank() == 3
+            ref xx = self.values[node.inputs[0]]
+            ref ww = self.values[node.inputs[1]]
+            # rank 4 with a 1 x k or k x 1 kernel: lowered to 1-D (`ops_more.conv_rows_in`)
+            return xx.rank() == 3 or (xx.rank() == 4 and ww.rank() == 4 and (ww.shape[2] == 1 or ww.shape[3] == 1))
         if op == OP_RESIZE:
             return node.attr_s("mode") == "linear"
         if len(node.inputs) == 2 and op >= OP_BINARY:
@@ -1626,7 +1653,7 @@ struct OnnxModel(Movable):
             ref b = self.values[node.inputs[1]]
             if op - OP_BINARY == B_POW:
                 return a.is_float() and a.numel() >= PAR_MIN and b.numel() == 1 and b.is_float() and b.fget(0) == 2.0
-            return row_binary_applies(op - OP_BINARY, a, b)
+            return row_binary_applies(op - OP_BINARY, a, b) or chan_binary_applies(op - OP_BINARY, a, b)
         if (op == OP_UNARY + U_SIN or op == OP_UNARY + U_COS) and len(node.inputs) > 0:
             ref a = self.values[node.inputs[0]]
             return a.is_float() and a.numel() >= PAR_MIN
@@ -1674,7 +1701,35 @@ struct OnnxModel(Movable):
             var p1 = pads[1] if len(pads) > 1 else 0
             var d0 = dil[0] if len(dil) > 0 else 1
             var s0 = strides[0] if len(strides) > 0 else 1
-            if op == OP_CONV and self.gpu and self.static_value[node.inputs[1]] and x.numel() >= PAR_MIN:
+            if op == OP_CONV and x.rank() == 4:
+                # [N, C, H, W] with a 1 x k (along W) or k x 1 (along H) kernel as a 1-D Conv
+                ref w4 = self.values[node.inputs[1]]
+                var along_w = w4.shape[2] == 1
+                var ax = 1 if along_w else 0
+                var q0 = pads[ax] if len(pads) == 4 else 0
+                var q1 = pads[ax + 2] if len(pads) == 4 else 0
+                var dq = dil[ax] if len(dil) == 2 else 1
+                var sq = strides[ax] if len(strides) == 2 else 1
+                var other_pad = (pads[1 - ax] + pads[3 - ax]) if len(pads) == 4 else 0
+                var other_stride = strides[1 - ax] if len(strides) == 2 else 1
+                if other_pad != 0 or other_stride != 1:
+                    raise Error("Conv: 2-D kernels with a unit axis need stride 1 and no padding on that axis")
+                var w3 = w4.reshaped([w4.shape[0], w4.shape[1], w4.shape[3] if along_w else w4.shape[2]])
+                var rows = conv_rows_in(x, along_w)
+                var y: Tensor
+                if self.gpu and self.static_value[node.inputs[1]] and rows.numel() >= PAR_MIN:
+                    y = conv1d_gpu_batched(self.gpu.value(), self.pool, rows, w3, self.values[bi if bi >= 0 else node.inputs[0]],
+                                   bi >= 0, q0, q1, dq, sq, node.attr_i("group", 1), node.inputs[1])
+                else:
+                    y = conv1d_par(self.pool, rows, w3, self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0,
+                                   q0, q1, dq, sq, node.attr_i("group", 1))
+                out.append(conv_rows_out(y, x.shape[0], along_w))
+            elif op == OP_CONV and self.gpu and self.static_value[node.inputs[1]] and x.numel() >= PAR_MIN and x.shape[0] > 1:
+                # batched input: one device product for the whole batch (`ops_more`)
+                out.append(conv1d_gpu_batched(self.gpu.value(), self.pool, x, self.values[node.inputs[1]],
+                                              self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0, p0, p1, d0, s0,
+                                              node.attr_i("group", 1), node.inputs[1]))
+            elif op == OP_CONV and self.gpu and self.static_value[node.inputs[1]] and x.numel() >= PAR_MIN:
                 out.append(conv1d_gpu(self.gpu.value(), self.pool, x, self.values[node.inputs[1]],
                                       self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0, p0, p1, d0, s0,
                                       node.attr_i("group", 1), node.inputs[1]))
@@ -1711,8 +1766,42 @@ struct OnnxModel(Movable):
                             wi >= 0, self.values[li].int_at(0) if li >= 0 else 0, node.attr_i("onesided", 1) != 0))
         elif op == OP_NONZERO:
             out.append(nonzero(x))
+        elif op == OP_GATHER_ND:
+            out.append(gather_nd(x, self.values[node.inputs[1]], node.attr_i("batch_dims", 0)))
+        elif op == OP_INSTANCE_NORM:
+            out.append(par_instance_norm(self.pool, x, self.values[node.inputs[1]], self.values[node.inputs[2]], node.attr_f("epsilon", 1e-5)))
+        elif op == OP_REDUCE_MIN or op == OP_REDUCE_MAX:
+            var axes = node.attr_ints("axes")
+            var ai = self._in(k, 1)
+            if ai >= 0:
+                axes = self.values[ai].int_list()
+            if len(axes) == 0 and node.attr_i("noop_with_empty_axes", 0) != 0:
+                out.append(x.reshaped(x.shape.copy()))
+            else:
+                out.append(reduce_min_max(x, axes, node.attr_i("keepdims", 1) != 0, op == OP_REDUCE_MAX))
+        elif op == OP_GRU:
+            if self._in(k, 4) >= 0:
+                raise Error("GRU: sequence_lens is not supported")
+            if node.find("activations") >= 0 or node.find("clip") >= 0:
+                raise Error("GRU: only the default activations are supported")
+            var bi = self._in(k, 3)
+            var hi = self._in(k, 5)
+            var dirn = node.attr_s("direction")
+            var res = gru(self.pool, x, self.values[node.inputs[1]], self.values[node.inputs[2]],
+                          self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0,
+                          self.values[hi if hi >= 0 else node.inputs[0]], hi >= 0,
+                          node.attr_i("hidden_size", 0), dirn if dirn.byte_length() > 0 else "forward",
+                          node.attr_i("linear_before_reset", 0) != 0, node.attr_i("layout", 0))
+            for t in res:
+                out.append(t.copy())
+        elif op == OP_SOFTPLUS:
+            out.append(softplus(x))
+        elif op == OP_CEIL:
+            out.append(ceil_op(x))
         elif op == OP_BINARY + B_POW:
             out.append(par_sin_cos_square(self.pool, -1, x))
+        elif op >= OP_BINARY and not row_binary_applies(op - OP_BINARY, x, self.values[node.inputs[1]]):
+            out.append(par_chan_binary(self.pool, op - OP_BINARY, x, self.values[node.inputs[1]]))
         elif op >= OP_BINARY:
             out.append(par_row_binary(self.pool, op - OP_BINARY, x, self.values[node.inputs[1]]))
         elif op == OP_UNARY + U_SIN or op == OP_UNARY + U_COS:

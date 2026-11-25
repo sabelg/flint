@@ -806,3 +806,86 @@ def conv1d_gpu(mut gpu: GpuMatmul, mut pool: JobPool, x: Tensor, w: Tensor, b: T
     _ = tmp^
     _ = idx^
     return out^
+
+
+# ----------------------------------------------------------------------------- GatherND / ReduceMin / ReduceMax
+
+def gather_nd(x: Tensor, idx: Tensor, batch_dims: Int) raises -> Tensor:
+    """GatherND with batch_dims = 0: `idx` [..., k] picks slices x[i0, .., ik-1, :]."""
+    if batch_dims != 0:
+        raise Error("GatherND: only batch_dims = 0 is supported")
+    var r = x.rank()
+    var q = idx.rank()
+    var k = idx.shape[q - 1] if q > 0 else 0
+    if k > r:
+        raise Error("GatherND: index depth " + String(k) + " exceeds rank " + String(r))
+    var st = strides_of(x.shape)
+    var inner = 1
+    var out_shape = List[Int]()
+    for d in range(q - 1):
+        out_shape.append(idx.shape[d])
+    for d in range(k, r):
+        out_shape.append(x.shape[d])
+        inner *= x.shape[d]
+    var n = numel_of(idx.shape) // k if k > 0 else 1
+    var out = Tensor.like(x, out_shape^)
+    for j in range(n):
+        var base = 0
+        for d in range(k):
+            var v = idx.int_at(j * k + d)
+            if v < 0:
+                v += x.shape[d]
+            if v < 0 or v >= x.shape[d]:
+                raise Error("GatherND: index out of range")
+            base += v * st[d]
+        for e in range(inner):
+            if x.is_float():
+                out.f[j * inner + e] = x.fget(base + e)
+            else:
+                out.i[j * inner + e] = x.i[base + e]
+    return out^
+
+
+def reduce_min_max(x: Tensor, axes_in: List[Int], keepdims: Bool, is_max: Bool) raises -> Tensor:
+    """ReduceMin / ReduceMax over `axes_in` (all axes when empty)."""
+    var r = x.rank()
+    var red = List[Bool](length=r, fill=False)
+    if len(axes_in) == 0:
+        for d in range(r):
+            red[d] = True
+    for a in axes_in:
+        red[norm_axis(a, r)] = True
+    var out_shape = List[Int]()
+    var kept = List[Int]()
+    for d in range(r):
+        kept.append(1 if red[d] else x.shape[d])
+        if not red[d]:
+            out_shape.append(x.shape[d])
+        elif keepdims:
+            out_shape.append(1)
+    var kst = strides_of(kept)
+    var nk = numel_of(kept)
+    var acc = List[Float64](length=nk, fill=-1.0e300 if is_max else 1.0e300)
+    var ctr = List[Int](length=r, fill=0)
+    for e in range(x.numel()):
+        var o = 0
+        for d in range(r):
+            if not red[d]:
+                o += ctr[d] * kst[d]
+        var v = x.get(e)
+        if (v > acc[o]) if is_max else (v < acc[o]):
+            acc[o] = v
+        var d = r - 1
+        while d >= 0:
+            ctr[d] += 1
+            if ctr[d] < x.shape[d]:
+                break
+            ctr[d] = 0
+            d -= 1
+    var out = Tensor.like(x, out_shape^)
+    for k in range(nk):
+        if x.is_float():
+            out.f[k] = Float32(acc[k])
+        else:
+            out.i[k] = Int(acc[k])
+    return out^

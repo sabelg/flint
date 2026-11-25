@@ -108,3 +108,53 @@
   weights. That repository declares no licence of its own; the weights are OpenAI's
   (MIT via github.com/openai/CLIP, `openai-clip-LICENSE.txt`), the same ones MatFuse loads with
   `clip.load("ViT-B/16")`.
+- `src/flint/ml/magicarticulate.mojo` and `magicarticulate_mesh.mojo` port the skeleton-generation
+  inference of MagicArticulate (https://github.com/Seed3D/MagicArticulate) and Puppeteer
+  (https://github.com/Seed3D/Puppeteer), Copyright (c) 2025 Bytedance Ltd. and/or its affiliates,
+  Apache-2.0 (`magicarticulate-LICENSE.txt`, `puppeteer-LICENSE.txt`): the token layout and extra
+  decoder embeddings, greedy decoding, detokenisation, joint merging / connectivity repair and
+  root choice, and MeshAnything's watertight point-cloud preprocessing. The unsigned distance
+  grid follows mesh2sdf (MIT), which uses Christopher Batty's SDFGen (MIT,
+  `sdfgen-LICENSE.txt`); the shell is extracted with Flint's own marching tetrahedra.
+  `tools/magicarticulate/export.py` imports local checkouts at conversion / verification time.
+  Flint does not include the weights or the converted graphs. The checkpoints (Hugging Face
+  `Seed3D/MagicArticulate`, `Seed3D/Puppeteer`) are Apache-2.0 per their model cards. Their shape
+  encoder is Michelangelo (code GPL-3.0, weights LGPL-3.0), so the exported
+  `magicarticulate_encoder.onnx` / `puppeteer_encoder.onnx` are GPL-derived: Flint does not
+  include them, and builds that redistribute Flint must not bundle them.
+- Puppeteer's skinning network is not ported and must not be added: it is built on NVIDIA
+  PartField (code and `partfield-ckpt` weights under the NVIDIA License, non-commercial use only).
+  Neither does MagicArticulate release a skinning model; `MagicArticulate.rig` uses the MIT UniRig
+  skin network instead. Puppeteer's animation stage (a per-video optimisation using Video Depth
+  Anything, CoTracker and PyTorch3D) is not ported either.
+- `src/flint/ml/audio2face.mojo` ports the post-processing of the Audio2Face-3D SDK
+  (https://github.com/NVIDIA/Audio2Face-3D-SDK, Copyright (c) 2025 NVIDIA CORPORATION, MIT; see
+  `audio2face-LICENSE.txt`): audio windows, skin / tongue / teeth / eye animators and the BVLS
+  blend-shape solver are written in Mojo from the SDK sources. `flint.ml.npz` and the new ONNX
+  kernels in `flint.ml.ops_more` are Flint's own. The Audio2Face-3D v2.3 / v2.3.1 models are under
+  the NVIDIA Open Model License (commercial use allowed) and are not included: `Audio2Face.load`
+  reads a downloaded Hugging Face folder. Audio2Emotion is not used, since its licence limits it
+  to the Audio2Face project and excludes emotion recognition; emotions are caller inputs.
+  `tools/audio2face/reference.py` (numpy + onnxruntime) is only used for verification.
+- `src/flint/ml/magenta_rt.mojo`, `musiccoca.mojo`, `audio_codec.mojo`, `audio_codec_gpu.mojo`
+  and `jax_random.mojo` run Magenta RealTime 2 (https://github.com/magenta/magenta-realtime,
+  Google DeepMind, Copyright 2026 Google LLC; code Apache-2.0, weights CC BY 4.0, see
+  `magenta-rt-LICENSE.txt`): the Depthformer LM, the SpectroStream decoder, the MusicCoCa text
+  encoder / mapper / style quantiser and JAX's threefry sampling stream, written in Mojo from
+  the reference and checked against it with `tools/magenta_rt/reference*.py`, which import a
+  local magenta-realtime checkout; no Python code is copied. Flint does not include the weights:
+  `tools/magenta_rt/fetch.sh` downloads them and converts MusicCoCa outside the repo. Builds
+  that ship the weights or converted files must carry the CC BY 4.0 attribution in that file and
+  the model card's usage terms (do not generate content that infringes others' rights; Google
+  claims no rights in generated outputs).
+- `src/flint/ml/metatron.mojo` runs NVIDIA Metatron-v1 (https://huggingface.co/nvidia/Metatron-v1,
+  NVIDIA Open Model License, commercial use allowed). Flint does not include the model:
+  `tools/metatron/fetch.sh` downloads `demo/model.onnx` + `weights.bin` outside the repository.
+  The policy host (observation history, idle / steering goals, rest pose) ports ProtoMotions'
+  native Metatron runtime (https://github.com/NVlabs/ProtoMotions, Apache-2.0); see
+  `metatron-LICENSE.txt`. `tools/metatron/reference.py` imports MuJoCo (Apache-2.0) and
+  onnxruntime (MIT) at verification time only.
+- `src/flint/physics/mjcf.mojo` is an original MJCF reader. The Unitree G1 description it is
+  used with (`g1_holo_compat.xml`, BSD-3-Clause, Unitree Robotics) is downloaded by
+  `tools/metatron/fetch.sh` and not included; see `unitree-g1-LICENSE.txt`. ProtoMotions'
+  demo motion clips are not used (their licence does not allow standalone redistribution).
