@@ -24,4 +24,7 @@
   - `kokoro`: Kokoro-82M TTS, `KokoroTTS.load(dir).say(text, voice)` -> 24 kHz samples, timings
   - `gemx`: GEM-X monocular video to whole-body SOMA motion (keypoints, pose tokens, Motion
     transformer, BVH / `NativeAnimation` clips)
+  - `magenta_rt`, `musiccoca`, `audio_codec`, `audio_codec_gpu`, `jax_random`: Magenta RealTime 2
+    streaming music (Depthformer LM, MusicCoCa text styles, SpectroStream 48 kHz decoder on CPU /
+    MAX GPU, bit-exact `jax.random` sampling) and `MagentaRtStream` for the `AudioServer`
 """

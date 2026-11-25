@@ -20,16 +20,26 @@ piano roll, drums and classifier-free-guidance strengths. This module runs the 2
   - The SpectroStream decoder (`flint.ml.audio_codec`) turns each frame's codes into 1920 stereo
     samples.
 
-    var mrt = MagentaRT.load("/path/to/magenta-realtime-2")   # HF google/magenta-realtime-2 layout
-    var style = mrt.style_tokens(...)                         # 12 MusicCoCa RVQ codes (flint.ml.musiccoca)
-    mrt.set_style(style)
-    var pcm = mrt.generate(50)                                # 2 s, interleaved stereo float32
+    var music = MagentaRtStream.load("/path/to/magenta-realtime-2", Q_INT8)  # tools/magenta_rt/fetch.sh
+    _ = music.mrt.enable_gpu_codec()              # optional: SpectroStream on the MAX GPU
+    music.set_prompt("upbeat synthwave with punchy drums")
+    var ring = PcmStreamRing.create(48000)
+    server.add_pcm_stream(ring, BUS_MUSIC)       # flint.audio.server.AudioServer
+    ...
+    _ = music.pump(ring)                          # every tick / on a generator thread
+    music.set_prompt("dark ambient drone", 4.0)   # 4 s style morph on a game event
 
-Weights are kept as `flint.ml.llm.quant.QMat` (fp32 by default for parity, int8 optional), the
-same matrices and job-pool kernels as `flint.ml.llm`.
+Lower level: `MagentaRT.set_style(tokens)` (12 MusicCoCa codes from
+`flint.ml.musiccoca.MusicCoCaText.style_tokens`), `set_notes`, `set_drums`, `set_guidance`,
+`set_sampling`, `next_frame(addr)` / `generate(frames)` (interleaved stereo float32, 48 kHz).
+
+Weights are kept as `flint.ml.llm.quant.QMat` (fp32 by default for parity, int8 for speed), the
+same matrices and job-pool kernels as `flint.ml.llm`. Measured on a GB10 (DGX Spark, 20 cores,
+shared machine): LM 17 ms (fp32) / 8.6 ms (int8) per 40 ms frame on the CPU; SpectroStream
+22 ms on the CPU, 4.4 ms on the GPU; int8 LM + GPU codec runs at RTF 0.33.
 """
 
-from std.math import sqrt, exp, log, tanh
+from std.math import sqrt, exp, log, tanh, sin, cos
 from std.ffi import external_call
 from std.time import perf_counter_ns
 from flint.core.jobs import JobPool
@@ -37,6 +47,9 @@ from flint.ml.llm.safetensors import SafeTensors, SafeTensor, widen_to_f32
 from flint.ml.llm.quant import QMat, Q_F32, Q_INT8, Q_INT4, qmatmul
 from flint.ml.jax_random import JaxKey, prng_key, fold_in, gumbel
 from flint.ml.audio_codec import FBuf, fp, copy_floats, SpectroStreamDecoder, SS_FRAME_SAMPLES
+from flint.ml.audio_codec_gpu import SpectroStreamGpu
+from flint.ml.musiccoca import MusicCoCaText, blend_embeddings
+from flint.audio.pcm_stream import PcmStreamRing
 
 comptime MRT_SAMPLE_RATE: Int = 48000
 comptime MRT_FRAME_RATE: Int = 25
@@ -690,18 +703,28 @@ struct MagentaRT(Movable):
     var codec: SpectroStreamDecoder
     var cond: MrtConditioning
     var codec_pool: JobPool
+    var gpu: List[SpectroStreamGpu]   # one entry once `enable_gpu_codec` ran
     var lm_ns: Int
     var codec_ns: Int
     var frames: Int
+    var emb: FBuf
 
     def __init__(out self, var lm: DepthformerLM, var codec: SpectroStreamDecoder):
         self.lm = lm^
         self.codec = codec^
         self.cond = MrtConditioning()
         self.codec_pool = self.lm.pool.copy()
+        self.gpu = List[SpectroStreamGpu]()
         self.lm_ns = 0
         self.codec_ns = 0
         self.frames = 0
+        self.emb = FBuf(256)
+
+    def enable_gpu_codec(mut self) raises -> String:
+        """Runs the SpectroStream decoder on the MAX GPU from now on; returns the device name."""
+        if len(self.gpu) == 0:
+            self.gpu.append(SpectroStreamGpu(self.codec))
+        return self.gpu[0].name()
 
     @staticmethod
     def load(dir: String, fmt: Int = Q_F32) raises -> MagentaRT:
@@ -715,17 +738,34 @@ struct MagentaRT(Movable):
         var lm = DepthformerLM(ld^)
         return MagentaRT(lm^, codec^)
 
-    def reset(mut self, seed: Int = 0):
+    def reset(mut self, seed: Int = 0) raises:
         self.reset_key(fold_in(prng_key(seed), 0))
 
-    def reset_key(mut self, key: JaxKey):
+    def reset_key(mut self, key: JaxKey) raises:
         self.lm.reset(key)
         self.codec.reset()
+        if len(self.gpu) > 0:
+            self.gpu[0].reset()
         self.frames = 0
 
     def set_style(mut self, tokens: List[Int]):
         for i in range(MRT_STYLE_TOKENS):
             self.cond.style[i] = tokens[i] if i < len(tokens) else -1
+
+    def set_notes(mut self, notes: List[Int]):
+        """128 MIDI pitch states (-1 masked, 0 off, 1 sustain, 2 onset, 3 model's choice)."""
+        for i in range(128):
+            self.cond.notes[i] = notes[i] if i < len(notes) else -1
+
+    def set_drums(mut self, drums: Int):
+        """-1 model's choice, 0 no drums, 1 drums."""
+        self.cond.drums = drums
+
+    def set_guidance(mut self, style: Float64, notes: Float64, drums: Float64):
+        """Classifier-free-guidance strengths (-1..7; defaults 3, 1, 1)."""
+        self.cond.cfg_style = style
+        self.cond.cfg_notes = notes
+        self.cond.cfg_drums = drums
 
     def set_sampling(mut self, temperature: Float32, top_k: Int):
         self.lm.temperature = temperature
@@ -737,18 +777,133 @@ struct MagentaRT(Movable):
         self.lm_ns += Int(perf_counter_ns() - t0)
         return codes^
 
-    def decode(mut self, codes: List[Int], out_addr: Int):
+    def decode(mut self, codes: List[Int], out_addr: Int) raises:
         """Codes -> 1920 interleaved stereo samples at out_addr."""
         var t0 = perf_counter_ns()
-        var pcm = self.codec.decode_frame(self.codec_pool, codes)
+        var pcm: Int
+        if len(self.gpu) > 0:
+            self.codec.embed(codes, self.emb.addr)
+            var h = self.gpu[0].run_embedding(self.emb.addr)
+            pcm = self.codec.finish_frame(self.codec_pool, h, h + SS_FRAME_SAMPLES * 2 * 4)
+        else:
+            pcm = self.codec.decode_frame(self.codec_pool, codes)
         copy_floats(out_addr, pcm, SS_FRAME_SAMPLES * 2)
         self.codec_ns += Int(perf_counter_ns() - t0)
 
-    def generate(mut self, frames: Int) -> List[Float32]:
+    def next_frame(mut self, out_addr: Int) raises:
+        """One 40 ms frame (1920 interleaved stereo float32 samples) at out_addr."""
+        var codes = self.next_codes()
+        self.decode(codes, out_addr)
+        self.frames += 1
+
+    def generate(mut self, frames: Int) raises -> List[Float32]:
         """`frames` x 40 ms of interleaved stereo float32 at 48 kHz."""
         var out = List[Float32](length=frames * SS_FRAME_SAMPLES * 2, fill=0.0)
         for f in range(frames):
-            var codes = self.next_codes()
-            self.decode(codes, Int(out.unsafe_ptr()) + f * SS_FRAME_SAMPLES * 2 * 4)
-            self.frames += 1
+            self.next_frame(Int(out.unsafe_ptr()) + f * SS_FRAME_SAMPLES * 2 * 4)
         return out^
+
+
+# ------------------------------------------------------------------- adaptive soundtrack
+
+comptime MRT_STYLE_UPDATE_FRAMES: Int = 5   # re-quantise a morphing style every 200 ms
+
+
+struct MagentaRtStream(Movable):
+    """Adaptive game soundtrack: text-prompted Magenta RT music into an `AudioServer`.
+
+    `set_prompt(text, morph_seconds)` changes the style. Over `morph_seconds` the MusicCoCa
+    style embedding is interpolated from the current style to the new one and re-quantised
+    every 200 ms, so the change is a musical crossfade inside one continuous stream (the model
+    keeps its 20 s of context); 0 switches at the next frame. `blend(a, b, t)` mixes two
+    prompts. `pump(ring)` generates frames while `ring` has room for them; run it on a
+    generator thread or once per game tick, and give the ring to `AudioServer.add_pcm_stream`.
+    """
+    var mrt: MagentaRT
+    var coca: MusicCoCaText
+    var cur: List[Float32]
+    var src: List[Float32]
+    var dst: List[Float32]
+    var morph_total: Int
+    var morph_done: Int
+    var seed: Int
+    var frame: List[Float32]
+
+    def __init__(out self, var mrt: MagentaRT, var coca: MusicCoCaText):
+        self.mrt = mrt^
+        self.coca = coca^
+        self.cur = List[Float32]()
+        self.src = List[Float32]()
+        self.dst = List[Float32]()
+        self.morph_total = 0
+        self.morph_done = 0
+        self.seed = 0
+        self.frame = List[Float32](length=SS_FRAME_SAMPLES * 2, fill=0.0)
+
+    @staticmethod
+    def load(dir: String, fmt: Int = Q_F32) raises -> MagentaRtStream:
+        """`dir`: the magenta-realtime-2 download with
+        `resources/musiccoca/musiccoca_text.safetensors` from `tools/magenta_rt/convert_musiccoca.py`."""
+        var mrt = MagentaRT.load(dir, fmt)
+        var coca = MusicCoCaText.load(dir + "/resources/musiccoca/musiccoca_text.safetensors")
+        return MagentaRtStream(mrt^, coca^)
+
+    def style_of(mut self, text: String) -> List[Float32]:
+        """Style embedding of a prompt (through the mapper, as Magenta RT prompts are)."""
+        return self.coca.embed_style(text, True, self.seed)
+
+    def set_style_embedding(mut self, emb: List[Float32], morph_seconds: Float64 = 0.0):
+        var frames = Int(morph_seconds * 25.0 + 0.5)
+        if len(self.cur) == 0 or frames <= 0:
+            self.cur = emb.copy()
+            self.morph_total = 0
+            self.mrt.set_style(self.coca.tokenize(self.cur))
+            return
+        self.src = self.cur.copy()
+        self.dst = emb.copy()
+        self.morph_total = frames
+        self.morph_done = 0
+
+    def set_prompt(mut self, text: String, morph_seconds: Float64 = 0.0):
+        self.set_style_embedding(self.style_of(text), morph_seconds)
+
+    def blend(mut self, a: String, b: String, t: Float32, morph_seconds: Float64 = 0.0):
+        """Style (1 - t) a + t b."""
+        self.set_style_embedding(blend_embeddings(self.style_of(a), self.style_of(b), t), morph_seconds)
+
+    def morphing(self) -> Bool:
+        return self.morph_total > 0
+
+    def _advance_morph(mut self):
+        if self.morph_total <= 0:
+            return
+        self.morph_done += 1
+        if self.morph_done >= self.morph_total:
+            self.cur = self.dst.copy()
+            self.morph_total = 0
+            self.mrt.set_style(self.coca.tokenize(self.cur))
+            return
+        if self.morph_done % MRT_STYLE_UPDATE_FRAMES == 1:
+            var t = Float32(self.morph_done) / Float32(self.morph_total)
+            # equal-power path keeps the blended embedding's norm from dipping mid-way
+            var wa = cos(t * 1.5707963267948966)
+            var wb = sin(t * 1.5707963267948966)
+            var e = List[Float32](capacity=len(self.src))
+            for i in range(len(self.src)):
+                e.append(wa * self.src[i] + wb * self.dst[i])
+            self.cur = e^
+            self.mrt.set_style(self.coca.tokenize(self.cur))
+
+    def next_frame(mut self, out_addr: Int) raises:
+        self._advance_morph()
+        self.mrt.next_frame(out_addr)
+
+    def pump(mut self, ring: PcmStreamRing, max_frames: Int = 4) raises -> Int:
+        """Generates up to `max_frames` 40 ms frames into `ring` while it has room; returns
+        how many were produced."""
+        var made = 0
+        while made < max_frames and ring.free_frames() >= SS_FRAME_SAMPLES:
+            self.next_frame(Int(self.frame.unsafe_ptr()))
+            _ = ring.write(Int(self.frame.unsafe_ptr()), SS_FRAME_SAMPLES)
+            made += 1
+        return made

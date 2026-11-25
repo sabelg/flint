@@ -27,6 +27,7 @@ codec frame after `reset` decodes to silence).
 
 from std.ffi import external_call
 from std.math import cos, sin, exp, sqrt
+from std.time import perf_counter_ns
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
 from flint.ml.ops import matmul_2d
@@ -187,13 +188,57 @@ struct _Phase(Movable):
     var pt: Int
     var pf: Int
     var taps: List[_Tap]
-    var w: FBuf    # [len(taps) * cin, cout]
+    var w: FBuf      # [len(taps) * cin, cout]
+    var wt: FBuf     # [cout, len(taps) * cin] for narrow outputs (cout < 8), else empty
+    var plan_t: Int  # t the im2col plan below was built for (0 = none)
+    var src: List[Int]   # [rows * taps] input element offsets into inbuf, -1 = zero padding
+    var dst: List[Int]   # [rows] output row of each GEMM row
 
     def __init__(out self, pt: Int, pf: Int, var taps: List[_Tap], var w: FBuf):
         self.pt = pt
         self.pf = pf
         self.taps = taps^
         self.w = w^
+        self.wt = FBuf()
+        self.plan_t = 0
+        self.src = List[Int]()
+        self.dst = List[Int]()
+
+
+struct _ColCtx(Movable):
+    var col: Int
+    var inbuf: Int
+    var src: Int      # address of the phase's offset table
+    var ntap: Int
+    var cin: Int
+    var rows: Int
+    var rows_per_job: Int
+
+    def __init__(out self, col: Int, inbuf: Int, src: Int, ntap: Int, cin: Int, rows: Int, rows_per_job: Int):
+        self.col = col
+        self.inbuf = inbuf
+        self.src = src
+        self.ntap = ntap
+        self.cin = cin
+        self.rows = rows
+        self.rows_per_job = rows_per_job
+
+
+def _col_worker(ctx_addr: Int, job: Int):
+    var c = Pointer[_ColCtx, ImmutAnyOrigin](unsafe_from_address=ctx_addr)
+    var r0 = job * c[].rows_per_job
+    var r1 = min(c[].rows, r0 + c[].rows_per_job)
+    var tab = Pointer[Int, MutAnyOrigin](unsafe_from_address=c[].src)
+    var ci = c[].cin
+    var k = c[].ntap * ci
+    for r in range(r0, r1):
+        var d = c[].col + r * k * 4
+        for ti in range(c[].ntap):
+            var off = tab.unsafe_offset(r * c[].ntap + ti).unsafe_load()
+            if off < 0:
+                _ = external_call["memset", Int](d + ti * ci * 4, Int32(0), ci * 4)
+            else:
+                copy_floats(d + ti * ci * 4, c[].inbuf + off * 4, ci)
 
 
 def floor_div(a: Int, b: Int) -> Int:
@@ -228,6 +273,8 @@ struct StreamConv2D(Movable):
     var gout: FBuf
     var out: FBuf
     var max_t: Int
+    var gemm_ns: Int     # profiling: time in the GEMMs / in im2col + scatter
+    var col_ns: Int
 
     def __init__(out self, kernel: FBuf, var bias: FBuf, kt: Int, kf: Int, cin: Int, cout: Int,
                  st: Int, sf: Int, transposed: Bool, fin: Int):
@@ -250,11 +297,7 @@ struct StreamConv2D(Movable):
                 self.plf = (pad_amount + 1) // 2
             self.hist = (kt - 1) // st
         else:
-            if st != 1 or sf != 1:
-                # Only stride-1 regular convolutions are needed by the decoders here.
-                self.fout = fin
-            else:
-                self.fout = fin
+            self.fout = fin   # regular convs here are stride 1
             self.plf = (kf - 1) // 2
             self.hist = kt - 1
         self.phases = List[_Phase]()
@@ -274,8 +317,17 @@ struct StreamConv2D(Movable):
                 for ti in range(len(taps)):
                     var src = kernel.addr + ((taps[ti].a * kf + taps[ti].b) * cin * cout) * 4
                     copy_floats(w.addr + ti * cin * cout * 4, src, cin * cout)
-                self.phases.append(_Phase(pt, pf, taps^, w^))
+                var kk = len(taps) * cin
+                var ph = _Phase(pt, pf, taps^, w^)
+                if cout < 8:
+                    ph.wt = FBuf(kk * cout)
+                    for r in range(kk):
+                        for o in range(cout):
+                            ph.wt.set(o * kk + r, ph.w.at(r * cout + o))
+                self.phases.append(ph^)
         self.max_t = 0
+        self.gemm_ns = 0
+        self.col_ns = 0
         self.inbuf = FBuf()
         self.col = FBuf()
         self.gout = FBuf()
@@ -322,46 +374,68 @@ struct StreamConv2D(Movable):
         var nph_t = self.st if self.transposed else 1
         var nph_f = self.sf if self.transposed else 1
         for pi in range(len(self.phases)):
-            ref ph = self.phases[pi]
-            var ntap = len(ph.taps)
+            var ntap = len(self.phases[pi].taps)
             if ntap == 0:
                 continue
             var k = ntap * self.cin
             # rows of this phase: o_t = pt + nph_t * i, o_f = pf + nph_f * j
-            var rt = (tout - ph.pt + nph_t - 1) // nph_t
-            var rf = (self.fout - ph.pf + nph_f - 1) // nph_f
+            var rt = (tout - self.phases[pi].pt + nph_t - 1) // nph_t
+            var rf = (self.fout - self.phases[pi].pf + nph_f - 1) // nph_f
             var m = rt * rf
             if m == 0:
                 continue
-            for i in range(rt):
-                var ot = ph.pt + nph_t * i
-                for j in range(rf):
-                    var of_ = ph.pf + nph_f * j
-                    var r = i * rf + j
-                    var dst = self.col.addr + (r * k) * 4
-                    for ti in range(ntap):
-                        var it_num = ot + ph.taps[ti].a - self.plt
-                        var if_num = of_ + ph.taps[ti].b - self.plf
-                        var it = floor_div(it_num, nph_t)
-                        var if_ = floor_div(if_num, nph_f)
-                        var d = dst + ti * self.cin * 4
-                        if if_ < 0 or if_ >= self.fin or it < -self.hist or it >= t:
-                            _ = external_call["memset", Int](d, Int32(0), self.cin * 4)
-                        else:
-                            var src = self.inbuf.addr + (((self.hist + it) * self.fin + if_) * self.cin) * 4
-                            copy_floats(d, src, self.cin)
-            matmul_2d(pool, self.col.addr, ph.w.addr, self.gout.addr, self.bias.addr, m, k, self.cout, False)
-            for i in range(rt):
-                var ot = ph.pt + nph_t * i
-                for j in range(rf):
-                    var of_ = ph.pf + nph_f * j
-                    copy_floats(self.out.addr + ((ot * self.fout + of_) * self.cout) * 4,
-                                self.gout.addr + ((i * rf + j) * self.cout) * 4, self.cout)
+            if self.phases[pi].plan_t != t:
+                self._plan(pi, t, rt, rf, nph_t, nph_f)
+            ref ph = self.phases[pi]
+            var c0 = perf_counter_ns()
+            var jobs = min(32, max(1, m // 16))
+            var per = (m + jobs - 1) // jobs
+            jobs = (m + per - 1) // per
+            var ctx = _ColCtx(self.col.addr, self.inbuf.addr, Int(ph.src.unsafe_ptr()), ntap, self.cin, m, per)
+            if jobs > 1 and pool.ready():
+                run_parallel_ctx(pool, jobs, ctx, _col_worker)
+            else:
+                for j in range(jobs):
+                    _col_worker(Int(Pointer(to=ctx)), j)
+            var c1 = perf_counter_ns()
+            var direct = len(self.phases) == 1
+            var dst = self.out.addr if direct else self.gout.addr
+            if ph.wt.n > 0:
+                matmul_2d(pool, self.col.addr, ph.wt.addr, dst, self.bias.addr, m, k, self.cout, True)
+            else:
+                matmul_2d(pool, self.col.addr, ph.w.addr, dst, self.bias.addr, m, k, self.cout, False)
+            var c2 = perf_counter_ns()
+            if not direct:
+                for r in range(m):
+                    copy_floats(self.out.addr + ph.dst[r] * self.cout * 4, self.gout.addr + r * self.cout * 4, self.cout)
+            var c3 = perf_counter_ns()
+            self.gemm_ns += Int(c2 - c1)
+            self.col_ns += Int(c1 - c0 + c3 - c2)
         # keep the last `hist` input frames
         if self.hist > 0:
             _ = external_call["memmove", Int](self.inbuf.addr, self.inbuf.addr + t * row * 4,
                                               self.hist * row * 4)
         return tout
+
+    def _plan(mut self, pi: Int, t: Int, rt: Int, rf: Int, nph_t: Int, nph_f: Int):
+        """im2col source offsets and output rows of phase `pi` for steps of `t` frames."""
+        ref ph = self.phases[pi]
+        var ntap = len(ph.taps)
+        ph.src = List[Int](capacity=rt * rf * ntap)
+        ph.dst = List[Int](capacity=rt * rf)
+        for i in range(rt):
+            var ot = ph.pt + nph_t * i
+            for j in range(rf):
+                var of_ = ph.pf + nph_f * j
+                ph.dst.append(ot * self.fout + of_)
+                for ti in range(ntap):
+                    var it = floor_div(ot + ph.taps[ti].a - self.plt, nph_t)
+                    var if_ = floor_div(of_ + ph.taps[ti].b - self.plf, nph_f)
+                    if if_ < 0 or if_ >= self.fin or it < -self.hist or it >= t:
+                        ph.src.append(-1)
+                    else:
+                        ph.src.append(((self.hist + it) * self.fin + if_) * self.cin)
+        ph.plan_t = t
 
     def flops(self, t: Int) -> Int:
         var tout = t * (self.st if self.transposed else 1)
@@ -550,15 +624,12 @@ struct SpectroStreamDecoder(Movable):
     var b2: StreamConv2D
     var iru: _ResUnit             # input_layers_residual_unit (512 ch, 5 bins)
     var d0: _ResUnit              # decoder_0 (shared input of both channel groups)
-    var groups: List[_ResUnit]    # decoder_1 .. decoder_6 (weights shared by both groups)
-    var last: StreamConv2D
     var group_state: List[List[_ResUnit]]
     var last_state: List[StreamConv2D]
     var istft: InverseStft
     var lookahead_left: Int
     var emb: FBuf
     var x0: FBuf
-    var x1: FBuf
     var gin: FBuf
     var spec: FBuf
     var pcm: FBuf
@@ -573,15 +644,12 @@ struct SpectroStreamDecoder(Movable):
         self.b2 = b2^
         self.iru = iru^
         self.d0 = d0^
-        self.groups = List[_ResUnit]()
-        self.last = _no_conv()
         self.group_state = group_state^
         self.last_state = last_state^
         self.istft = InverseStft(960, SS_STFT_HOP, 960, SS_BINS, SS_CHANNELS)
         self.lookahead_left = SS_STFT_FRAMES
         self.emb = FBuf(256)
         self.x0 = FBuf(2560)
-        self.x1 = FBuf(2560)
         self.gin = FBuf(2 * 5 * 512)
         self.spec = FBuf(SS_STFT_FRAMES * SS_CHANNELS * 2 * SS_BINS)
         self.pcm = FBuf(SS_FRAME_SAMPLES * SS_CHANNELS)
@@ -674,8 +742,14 @@ struct SpectroStreamDecoder(Movable):
             var slot = self.last_state[g].input_slot(t)
             elu_into(slot, x, t * 480 * 64)
             _ = self.last_state[g].step(pool, slot, t)
-            # [4, 480, 2] (re, im) -> spec[f, g, re bins | im bins]
-            var o = self.last_state[g].out.addr
+        return self.finish_frame(pool, self.last_state[0].out.addr, self.last_state[1].out.addr)
+
+    def finish_frame(mut self, mut pool: JobPool, g0: Int, g1: Int) -> Int:
+        """Both channel groups' output-layer results ([4 STFT frames, 480 bins, re/im] each) ->
+        1920 interleaved stereo samples (lookahead masking + inverse STFT). Shared by the CPU
+        path and `flint.ml.audio_codec_gpu`."""
+        for g in range(SS_CHANNELS):
+            var o = g0 if g == 0 else g1
             for f in range(SS_STFT_FRAMES):
                 var base = self.spec.addr + ((f * SS_CHANNELS + g) * 2 * SS_BINS) * 4
                 for k in range(SS_BINS):
