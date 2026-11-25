@@ -1097,6 +1097,40 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
         if len(deg_tris) == 0:
             continue
 
+        # Link condition (Dey et al. 1999): the collapse keeps the surface manifold only when the
+        # vertices adjacent to both endpoints are exactly the apexes of the triangles on the edge.
+        cur_stamp += 1
+        var stamp_a = cur_stamp
+        cur_stamp += 1
+        var stamp_both = cur_stamp
+        var common = 0
+        for pass_ in range(2):
+            for lst in range(2):
+                var n_l = len(deg_tris) if lst == 0 else len(surv_tris)
+                for l_i in range(n_l):
+                    var ti = deg_tris[l_i] if lst == 0 else surv_tris[l_i]
+                    var lr = [0, 0, 0]
+                    var has_side = False
+                    for k in range(3):
+                        var rk = pos_rep[tri_v[ti * 3 + k]]
+                        while rep_parent[rk] != rk: rk = rep_parent[rk]
+                        lr[k] = rk
+                        if rk == (ra if pass_ == 0 else rb):
+                            has_side = True
+                    if not has_side:
+                        continue
+                    for k in range(3):
+                        var rn = lr[k]
+                        if rn == ra or rn == rb:
+                            continue
+                        if pass_ == 0:
+                            rep_stamp[rn] = stamp_a
+                        elif rep_stamp[rn] == stamp_a:
+                            rep_stamp[rn] = stamp_both
+                            common += 1
+        if common != len(deg_tris):
+            continue
+
         # Normal-flip & sliver-inversion guard across 1-ring surviving triangles
         var flipped = False
         for s_i in range(len(surv_tris)):
