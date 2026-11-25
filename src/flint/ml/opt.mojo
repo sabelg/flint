@@ -215,6 +215,8 @@ struct OptDecoder(Movable):
     var d_logit: Int
     var d_anc: Int
     var d_rows: Int
+    # post-LayerNorm blocks (OPT-350M's `do_layer_norm_before = False`: no final LayerNorm)
+    var post_ln: Bool
 
     def __init__(out self, var weights: OnnxModel, gpu: Bool) raises:
         self.weights = weights^
@@ -267,6 +269,7 @@ struct OptDecoder(Movable):
         self.d_logit = -1
         self.d_anc = -1
         self.d_rows = 0
+        self.post_ln = not self.weights.has("model.decoder.final_layer_norm.weight")
 
     @staticmethod
     def load(path: String, gpu: Bool = True) raises -> OptDecoder:
@@ -374,13 +377,16 @@ struct OptDecoder(Movable):
         var hid = self.hidden
         for l in range(self.layers):
             var pre = "model.decoder.layers." + String(l)
-            layer_norm_rows(self.buf_x, self.buf_h, rows, hid, self._w(pre + ".self_attn_layer_norm.weight"),
-                            self._w(pre + ".self_attn_layer_norm.bias"), 1e-5)
-            self._linear(pre + ".self_attn.q_proj", self.buf_h, rows, hid, hid, self.buf_q)
+            var src = self.buf_x
+            if not self.post_ln:
+                layer_norm_rows(self.buf_x, self.buf_h, rows, hid, self._w(pre + ".self_attn_layer_norm.weight"),
+                                self._w(pre + ".self_attn_layer_norm.bias"), 1e-5)
+                src = self.buf_h
+            self._linear(pre + ".self_attn.q_proj", src, rows, hid, hid, self.buf_q)
             var kdst = self.pk[l] if prefix_pass else self.buf_k
             var vdst = self.pv[l] if prefix_pass else self.buf_v
-            self._linear(pre + ".self_attn.k_proj", self.buf_h, rows, hid, hid, kdst)
-            self._linear(pre + ".self_attn.v_proj", self.buf_h, rows, hid, hid, vdst)
+            self._linear(pre + ".self_attn.k_proj", src, rows, hid, hid, kdst)
+            self._linear(pre + ".self_attn.v_proj", src, rows, hid, hid, vdst)
             if not prefix_pass:
                 for b in range(rows):
                     _ = external_call["memcpy", Int](self.gk[l] + ((step * self.beams_cap + b) * hid) * 4,
@@ -412,9 +418,15 @@ struct OptDecoder(Movable):
             run_parallel_ctx(self.pool, rows * self.heads, ctx, _attn_worker)
             self._linear(pre + ".self_attn.out_proj", self.buf_a, rows, hid, hid, self.buf_h)
             _axpy(self.buf_x, 1.0, self.buf_h, rows * hid)
-            layer_norm_rows(self.buf_x, self.buf_h, rows, hid, self._w(pre + ".final_layer_norm.weight"),
-                            self._w(pre + ".final_layer_norm.bias"), 1e-5)
-            self._linear(pre + ".fc1", self.buf_h, rows, hid, self.ffn, self.buf_f)
+            if self.post_ln:
+                # in place: each row's statistics are taken before it is rewritten
+                layer_norm_rows(self.buf_x, self.buf_x, rows, hid, self._w(pre + ".self_attn_layer_norm.weight"),
+                                self._w(pre + ".self_attn_layer_norm.bias"), 1e-5)
+                self._linear(pre + ".fc1", self.buf_x, rows, hid, self.ffn, self.buf_f)
+            else:
+                layer_norm_rows(self.buf_x, self.buf_h, rows, hid, self._w(pre + ".final_layer_norm.weight"),
+                                self._w(pre + ".final_layer_norm.bias"), 1e-5)
+                self._linear(pre + ".fc1", self.buf_h, rows, hid, self.ffn, self.buf_f)
             var pf = fptr_at(self.buf_f)
             for i in range(rows * self.ffn):
                 var v = pf.unsafe_offset(i).unsafe_load()
@@ -422,10 +434,16 @@ struct OptDecoder(Movable):
                     pf.unsafe_offset(i).unsafe_store(0)
             self._linear(pre + ".fc2", self.buf_f, rows, self.ffn, hid, self.buf_h)
             _axpy(self.buf_x, 1.0, self.buf_h, rows * hid)
+            if self.post_ln:
+                layer_norm_rows(self.buf_x, self.buf_x, rows, hid, self._w(pre + ".final_layer_norm.weight"),
+                                self._w(pre + ".final_layer_norm.bias"), 1e-5)
 
     def _logits(mut self, rows: Int, row0: Int, dst: Int) raises:
         """Final LayerNorm + LM head for rows [row0, row0 + rows) of buf_x into dst [rows, vocab]."""
         var hid = self.hidden
+        if self.post_ln:
+            self._linear("lm_head", self.buf_x + row0 * hid * 4, rows, hid, self.vocab, dst)
+            return
         layer_norm_rows(self.buf_x + row0 * hid * 4, self.buf_h, rows, hid, self._w("model.decoder.final_layer_norm.weight"),
                         self._w("model.decoder.final_layer_norm.bias"), 1e-5)
         self._linear("lm_head", self.buf_h, rows, hid, self.vocab, dst)
@@ -456,11 +474,19 @@ struct OptDecoder(Movable):
         """Feeds token `tokens[b]` to every beam b as generated position `step` (0 based) and
         returns logits [beams, vocab]. `ancestry` is [beams, step + 1]: for beam b, the slot beam
         holding each of its generated positions 0..step (its own row b at `step`)."""
+        return self.step_extra(tokens, step, ancestry, List[Float32]())
+
+    def step_extra(mut self, tokens: List[Int], step: Int, ancestry: List[Int32], extra: List[Float32]) raises -> List[Float32]:
+        """`step` with extra input embeddings [beams, hidden] added to each beam's token embedding
+        (models such as MagicArticulate add learned per-slot embeddings); empty `extra` adds none."""
         var B = len(tokens)
         var hid = self.hidden
         var emb = self.weights.weight("model.decoder.embed_tokens.weight").fptr()
         for b in range(B):
             _ = external_call["memcpy", Int](self.buf_x + b * hid * 4, emb + tokens[b] * hid * 4, hid * 4)
+        if len(extra) >= B * hid:
+            _axpy(self.buf_x, 1.0, Int(extra.unsafe_ptr()), B * hid)
+        _ = len(extra)
         self._add_positions(B, self.prefix_len + step, True)
         if self.gpu:
             return self._dev_run(B, False, step, ancestry, 0, B)
@@ -552,19 +578,22 @@ struct OptDecoder(Movable):
             var pre = "model.decoder.layers." + String(l)
             var g1 = self._dvec(pre + ".self_attn_layer_norm.weight", hid)
             var b1 = self._dvec(pre + ".self_attn_layer_norm.bias", hid)
-            self.gpu.value().layer_norm_dev(px, g1, b1, ph, rows, hid, 1e-5, True)
-            self._dlinear(pre + ".self_attn.q_proj", ph, rows, hid, hid, pq)
+            var src = px    # post-LN: attention reads the residual stream itself
+            if not self.post_ln:
+                self.gpu.value().layer_norm_dev(px, g1, b1, ph, rows, hid, 1e-5, True)
+                src = ph
+            self._dlinear(pre + ".self_attn.q_proj", src, rows, hid, hid, pq)
             var pk = self.gpu.value().ptr(self.d_pk[l])
             var pv = self.gpu.value().ptr(self.d_pv[l])
             var gk = self.gpu.value().ptr(self.d_gk[l])
             var gv = self.gpu.value().ptr(self.d_gv[l])
             if prefix_pass:
-                self._dlinear(pre + ".self_attn.k_proj", ph, rows, hid, hid, pk)
-                self._dlinear(pre + ".self_attn.v_proj", ph, rows, hid, hid, pv)
+                self._dlinear(pre + ".self_attn.k_proj", src, rows, hid, hid, pk)
+                self._dlinear(pre + ".self_attn.v_proj", src, rows, hid, hid, pv)
             else:
                 var off = step * self.beams_cap * hid
-                self._dlinear(pre + ".self_attn.k_proj", ph, rows, hid, hid, gk.unsafe_offset(off))
-                self._dlinear(pre + ".self_attn.v_proj", ph, rows, hid, hid, gv.unsafe_offset(off))
+                self._dlinear(pre + ".self_attn.k_proj", src, rows, hid, hid, gk.unsafe_offset(off))
+                self._dlinear(pre + ".self_attn.v_proj", src, rows, hid, hid, gv.unsafe_offset(off))
             var ok = self.gpu.value().decoder_attention(
                 pq, pa, pk, pv, gk, gv, self.gpu.value().ptr(self.d_anc), rows, self.prefix_len, prefix_pass,
                 0 if prefix_pass else step + 1, self.beams_cap, hid, self.heads, scale, stride)
@@ -574,11 +603,25 @@ struct OptDecoder(Movable):
             self.gpu.value().binary_dev(GB_ADD, px, ph, px, rows * hid, 1, 0, 0, False)
             var g2 = self._dvec(pre + ".final_layer_norm.weight", hid)
             var b2 = self._dvec(pre + ".final_layer_norm.bias", hid)
-            self.gpu.value().layer_norm_dev(px, g2, b2, ph, rows, hid, 1e-5, True)
-            self._dlinear(pre + ".fc1", ph, rows, hid, self.ffn, pf)
+            if self.post_ln:
+                # x = LN(x) through scratch: LN into ph, then copy back into the stream
+                self.gpu.value().layer_norm_dev(px, g1, b1, ph, rows, hid, 1e-5, True)
+                self.gpu.value().copy_dev(ph, px, 1, rows * hid, 0, 0, 0, 0)
+                self._dlinear(pre + ".fc1", px, rows, hid, self.ffn, pf)
+            else:
+                self.gpu.value().layer_norm_dev(px, g2, b2, ph, rows, hid, 1e-5, True)
+                self._dlinear(pre + ".fc1", ph, rows, hid, self.ffn, pf)
             self.gpu.value().unary_dev(GU_RELU, pf, pf, rows * self.ffn)
             self._dlinear(pre + ".fc2", pf, rows, self.ffn, hid, ph)
             self.gpu.value().binary_dev(GB_ADD, px, ph, px, rows * hid, 1, 0, 0, False)
+            if self.post_ln:
+                self.gpu.value().layer_norm_dev(px, g2, b2, ph, rows, hid, 1e-5, True)
+                self.gpu.value().copy_dev(ph, px, 1, rows * hid, 0, 0, 0, 0)
+        if self.post_ln:
+            self._dlinear("lm_head", px.unsafe_offset(row0 * hid), out_rows, hid, self.vocab, self.gpu.value().ptr(self.d_logit))
+            var lg = List[Float32](length=out_rows * self.vocab, fill=0.0)
+            self.gpu.value().download(self.d_logit, Int(lg.unsafe_ptr()), out_rows * self.vocab)
+            return lg^
         var gf = self._dvec("model.decoder.final_layer_norm.weight", hid)
         var bf = self._dvec("model.decoder.final_layer_norm.bias", hid)
         self.gpu.value().layer_norm_dev(px.unsafe_offset(row0 * hid), gf, bf, ph, out_rows, hid, 1e-5, True)
