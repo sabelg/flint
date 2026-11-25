@@ -15,7 +15,7 @@ from max.gpu import global_idx, thread_idx, block_idx, barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.memory import stack_allocation
-from flint.ml.tensor import fptr_at
+from flint.ml.tensor import fptr_at, bf16_round
 
 comptime BLOCK: Int = 128
 comptime ROWS: Int = 8
@@ -272,6 +272,7 @@ comptime GU_EXP: Int = 10
 comptime GU_TANH: Int = 11
 comptime GU_SIGMOID: Int = 12
 comptime GU_RECIP: Int = 13
+comptime GU_BF16: Int = 64  # Cast -> BFLOAT16 (rounding kept in float32); not an ONNX unary op code
 
 
 def gpu_binary_supported(code: Int) -> Bool:
@@ -339,6 +340,8 @@ def _ew_unary_kernel(a: FP, o: FP, n: Int32, code: Int32):
         r = -x
     elif c == GU_ABS:
         r = abs(x)
+    elif c == GU_BF16:
+        r = bf16_round(x)
     else:
         r = 1.0 / x
     o.unsafe_offset(i).unsafe_store(r)

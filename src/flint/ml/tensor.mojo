@@ -12,6 +12,7 @@ comptime DT_F32: Int = 1
 comptime DT_I32: Int = 6
 comptime DT_I64: Int = 7
 comptime DT_BOOL: Int = 9
+comptime DT_BF16: Int = 16  # only as a Cast target: values rounded to bfloat16, kept as float32
 
 
 @always_inline
@@ -226,3 +227,13 @@ def norm_axis(axis: Int, rank: Int) -> Int:
 
 def f32_from_bits(bits: UInt32) -> Float32:
     return bitcast[DType.float32, 1](SIMD[DType.uint32, 1](bits))[0]
+
+
+@always_inline
+def bf16_round(x: Float32) -> Float32:
+    """`x` rounded to the nearest bfloat16 (ties to even), as a float32 (NaN stays NaN)."""
+    if x != x:
+        return x
+    var u = bitcast[DType.uint32, 1](x)
+    u = (u + UInt32(0x7FFF) + ((u >> 16) & UInt32(1))) & UInt32(0xFFFF0000)
+    return bitcast[DType.float32, 1](u)
