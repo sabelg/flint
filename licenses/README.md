@@ -158,3 +158,31 @@
   used with (`g1_holo_compat.xml`, BSD-3-Clause, Unitree Robotics) is downloaded by
   `tools/metatron/fetch.sh` and not included; see `unitree-g1-LICENSE.txt`. ProtoMotions'
   demo motion clips are not used (their licence does not allow standalone redistribution).
+
+## Marigold-Normals and MI-GAN (2-D art tools)
+
+- `src/flint/ml/marigold.mojo` runs Marigold-Normals v1.1 (https://huggingface.co/prs-eth/marigold-normals-v1-1,
+  PRS ETH Zürich) on `flint.ml.diffusion`. The preprocessing, sampling loop, normals decoding and
+  ensembling follow the Marigold pipeline (https://github.com/prs-eth/Marigold, Apache-2.0, see
+  `marigold-LICENSE.txt`) and its diffusers port (`MarigoldNormalsPipeline`, Apache-2.0); they are
+  written in Mojo and checked against diffusers with `tools/marigold/reference.py`, which imports
+  diffusers at verification time; no Python code is copied. The weights are not included:
+  `tools/marigold/fetch.sh` downloads them outside the repository. Their licence is OpenRAIL++-M:
+  the model card names the CreativeML Open RAIL++-M licence of Stable Diffusion 2 (the base model);
+  the Marigold repository ships it as `LICENSE-MODEL.txt` (copied here as
+  `marigold-LICENSE-MODEL.txt`; its Attachment A is left as a template there, so the SD2 licence's
+  Attachment A use restrictions are the ones to follow). Commercial use, redistribution and hosting
+  are allowed; the use restrictions (no unlawful use, harm to minors, disinformation, harassment,
+  discrimination, fully automated decisions affecting legal rights, medical advice, law-enforcement
+  prediction, ...) must be passed on to anyone the model or its derivatives are distributed to.
+- `src/flint/ml/migan.mojo` runs MI-GAN (https://github.com/Picsart-AI-Research/MI-GAN, Copyright (c)
+  2024 Picsart AI Research, MIT; see `migan-LICENSE.txt`). Its `LICENSE-WEIGHTS` is the same MIT text,
+  so the weights allow commercial use. Flint does not include them: `tools/migan/fetch.sh`
+  downloads the authors' `migan.onnx` (Hugging Face `andraniksargsyan/migan`, MIT) outside the
+  repository; the graph runs on Flint's ONNX interpreter (`ops_conv2d` / `ops_image` are Flint's
+  own kernels). Not used: the MI-GAN repository's `torch_utils/` and `dnnlib/` folders, which are
+  NVIDIA StyleGAN2-ADA code under NVIDIA's proprietary source licence. Provenance note: the
+  released model was trained on Places365 (a dataset licensed for non-commercial research and
+  education) with a Co-Mod-GAN teacher (BSD-2-Clause code built on StyleGAN2, NVIDIA Source Code
+  License-NC); neither is a licence on MI-GAN's weights, but check them if your use depends on
+  training-data provenance.

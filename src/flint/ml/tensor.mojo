@@ -9,6 +9,7 @@ weights are never copied.
 from std.memory import bitcast
 
 comptime DT_F32: Int = 1
+comptime DT_U8: Int = 2    # uint8 values held as integers 0..255 (images in / out of a graph)
 comptime DT_I32: Int = 6
 comptime DT_I64: Int = 7
 comptime DT_BOOL: Int = 9

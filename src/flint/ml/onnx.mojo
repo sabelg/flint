@@ -28,6 +28,8 @@ from flint.ml.ops_ext import (
     conv1d_par, conv1d_gpu, row_binary_applies, par_row_binary, par_sin_cos_square, PAR_MIN,
     gather_nd, reduce_min_max,
 )
+from flint.ml.ops_conv2d import conv2d_nchw, conv2d_nchw_gpu
+from flint.ml.ops_image import par_leaky_relu, par_clip, resize2d, pad2d_constant
 from flint.ml.gpu import GpuMatmul, FP, gpu_binary_supported, gpu_unary_supported, GU_BF16
 from flint.ml.tensor import Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, DT_BF16, numel_of, shape_str, norm_axis
 from flint.ml.fast import par_unary, par_binary, par_gather_rows, par_layer_norm, attention
@@ -93,6 +95,11 @@ comptime OP_GRU: Int = 82
 comptime OP_SOFTPLUS: Int = 83
 comptime OP_CEIL: Int = 84
 comptime OP_GATHER_ND: Int = 69
+comptime OP_CONV2D: Int = 90       # rank-4 Conv lowered by `lower_conv2d` (ops_conv2d)
+comptime OP_PAR_LEAKY: Int = 91    # LeakyRelu / Clip / Resize / Pad lowered by `lower_image_ops` (ops_image)
+comptime OP_PAR_CLIP: Int = 92
+comptime OP_RESIZE2D: Int = 93
+comptime OP_PAD2D: Int = 94
 comptime OP_REDUCE_MIN: Int = 70
 comptime OP_UNARY: Int = 100   # + U_* code
 comptime OP_BINARY: Int = 200  # + B_* code
@@ -506,12 +513,14 @@ struct OnnxModel(Movable):
                 top.skip()
         if not graph_found:
             raise Error("ONNX: no graph in " + path)
+        m._axes_attr_to_input()
         for k in range(len(m.nodes)):
             for v in m.nodes[k].inputs:
                 if v >= 0:
                     m.last_use[v] = k
         for v in m.output_ids:
             m.last_use[v] = len(m.nodes)
+        m.lower_conv2d(False)
         m._plan_fusions()
         _ = m.pool.start(default_worker_count() if workers < 0 else workers)
         return m^
@@ -1641,6 +1650,8 @@ struct OnnxModel(Movable):
         var op = node.op
         if op >= 60 and op < 90:
             return True
+        if op >= OP_CONV2D and op < 100:
+            return True
         if op == OP_CONV:
             ref xx = self.values[node.inputs[0]]
             ref ww = self.values[node.inputs[1]]
@@ -1743,6 +1754,20 @@ struct OnnxModel(Movable):
                 out.append(conv_transpose1d(self.pool, x, self.values[node.inputs[1]],
                                             self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0, p0, p1, d0, s0,
                                             opd[0] if len(opd) > 0 else 0, node.attr_i("group", 1)))
+        elif op == OP_CONV2D:
+            var bi = self._in(k, 2)
+            if self.gpu and self.static_value[node.inputs[1]] and x.numel() >= PAR_MIN:
+                out.append(conv2d_nchw_gpu(self.gpu.value(), self.pool, x, self.values[node.inputs[1]],
+                                           self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0,
+                                           node.attr_ints("pads"), node.attr_ints("strides"),
+                                           node.attr_ints("dilations"), node.attr_i("group", 1), node.inputs[1]))
+            else:
+                out.append(conv2d_nchw(self.pool, x, self.values[node.inputs[1]],
+                                       self.values[bi if bi >= 0 else node.inputs[0]], bi >= 0,
+                                       node.attr_ints("pads"), node.attr_ints("strides"),
+                                       node.attr_ints("dilations"), node.attr_i("group", 1)))
+        elif op >= OP_PAR_LEAKY and op <= OP_PAD2D:
+            out.append(self._exec_image_op(k))
         elif op == OP_PAD:
             var vi = self._in(k, 2)
             var ai = self._in(k, 3)
@@ -1829,6 +1854,124 @@ struct OnnxModel(Movable):
         else:
             raise Error("operator not implemented")
         return out^
+
+    def _axes_attr_to_input(mut self):
+        """Opset <= 12 Unsqueeze / Squeeze carry `axes` as an attribute: move it to the opset-13
+        second input (a static int64 value) so one code path runs both."""
+        for k in range(len(self.nodes)):
+            var op = self.nodes[k].op
+            if (op != OP_UNSQUEEZE and op != OP_SQUEEZE) or len(self.nodes[k].inputs) != 1:
+                continue
+            if self.nodes[k].find("axes") < 0:
+                continue
+            var axes = self.nodes[k].attr_ints("axes")
+            var v = self._id("__axes_" + String(k) + "_" + self.nodes[k].name)
+            var n = len(axes)
+            self.values[v] = Tensor.ints(DT_I64, [n], axes^)
+            self.static_value[v] = True
+            self.nodes[k].inputs.append(v)
+
+    def lower_conv2d(mut self, all_kernels: Bool):
+        """Run rank-4 `Conv` nodes with a static 4-D weight through `ops_conv2d` (`OP_CONV2D`):
+        k x k kernels always (load does this), 1 x 1 and 1 x k ones too when `all_kernels`."""
+        for k in range(len(self.nodes)):
+            if self.nodes[k].op != OP_CONV or len(self.nodes[k].inputs) < 2:
+                continue
+            var wi = self.nodes[k].inputs[1]
+            if wi < 0 or not self.static_value[wi] or self.values[wi].rank() != 4:
+                continue
+            if self.nodes[k].attr_s("auto_pad").byte_length() > 0 and self.nodes[k].attr_s("auto_pad") != "NOTSET":
+                continue
+            ref ws = self.values[wi].shape
+            if all_kernels or (ws[2] > 1 and ws[3] > 1):
+                self.nodes[k].op = OP_CONV2D
+
+    def lower_image_ops(mut self):
+        """Route LeakyRelu / Clip / Resize / Pad through the parallel `ops_image` kernels (same
+        results; nodes they do not cover fall back to the generic operators at run time)."""
+        for k in range(len(self.nodes)):
+            var op = self.nodes[k].op
+            if op == OP_UNARY + U_LEAKY:
+                self.nodes[k].op = OP_PAR_LEAKY
+            elif op == OP_CLIP:
+                self.nodes[k].op = OP_PAR_CLIP
+            elif op == OP_RESIZE:
+                self.nodes[k].op = OP_RESIZE2D
+            elif op == OP_PAD:
+                self.nodes[k].op = OP_PAD2D
+
+    def _exec_image_op(mut self, k: Int) raises -> Tensor:
+        ref node = self.nodes[k]
+        var op = node.op
+        ref x = self.values[node.inputs[0]]
+        if op == OP_PAR_LEAKY:
+            if x.is_float() and x.numel() >= PAR_MIN:
+                return par_leaky_relu(self.pool, x, node.attr_f("alpha", 0.01))
+            return unary(U_LEAKY, x, node.attr_f("alpha", 0.01))
+        if op == OP_PAR_CLIP:
+            var lo = -3.4e38
+            var hi = 3.4e38
+            var a = self._in(k, 1)
+            if a >= 0:
+                lo = self.values[a].get(0)
+            var b = self._in(k, 2)
+            if b >= 0:
+                hi = self.values[b].get(0)
+            if x.is_float() and x.numel() >= PAR_MIN:
+                return par_clip(self.pool, x, Float32(lo), Float32(hi))
+            return clip(x, lo, hi)
+        if op == OP_PAD2D:
+            var vi = self._in(k, 2)
+            var ai = self._in(k, 3)
+            var axes = List[Int]()
+            if ai >= 0:
+                axes = self.values[ai].int_list()
+            var value = 0.0
+            if vi >= 0 and self.values[vi].numel() > 0:
+                value = self.values[vi].get(0)
+            var pads = self.values[node.inputs[1]].int_list()
+            var mode = node.attr_s("mode")
+            var plain = (mode.byte_length() == 0 or mode == "constant") and x.rank() == 4 and x.is_float() \
+                and len(axes) == 0 and len(pads) == 8 and pads[0] == 0 and pads[1] == 0 and pads[4] == 0 \
+                and pads[5] == 0
+            if plain:
+                return pad2d_constant(self.pool, x, pads[2], pads[3], pads[6], pads[7], Float32(value))
+            return pad(x, pads, axes, mode, value)
+        # Resize
+        var mode = node.attr_s("mode")
+        var cm = node.attr_s("coordinate_transformation_mode")
+        var linear = mode == "linear"
+        var nearest = mode.byte_length() == 0 or mode == "nearest"
+        var s = List[Int]()
+        var sc = List[Float64]()
+        var zi = self._in(k, 3)
+        var si = self._in(k, 2)
+        if zi >= 0 and self.values[zi].numel() > 0:
+            s = self.values[zi].int_list()
+            for _ in range(x.rank()):
+                sc.append(0.0)
+        elif si >= 0 and self.values[si].numel() > 0:
+            for d in range(x.rank()):
+                var f = self.values[si].get(d)
+                sc.append(f)
+                s.append(Int(floor(Float64(x.shape[d]) * f)))
+        else:
+            raise Error("Resize needs scales or sizes")
+        var fast = x.rank() == 4 and x.is_float() and len(s) == 4 and s[0] == x.shape[0] and s[1] == x.shape[1]
+        if nearest:
+            if node.attr_s("coordinate_transformation_mode") != "asymmetric" or node.attr_s("nearest_mode") != "floor":
+                raise Error("Resize: only nearest/floor/asymmetric is supported")
+            if fast:
+                return resize2d(self.pool, x, s[2], s[3], False, "asymmetric", 0.0, 0.0)
+            return resize_nearest(x, s)
+        if not linear:
+            raise Error("Resize: mode " + mode + " is not supported")
+        if cm == "tf_crop_and_resize":
+            raise Error("Resize: tf_crop_and_resize is not supported")
+        var cmode = cm if cm.byte_length() > 0 else String("half_pixel")
+        if fast and sc[0] <= 1.0 and sc[1] <= 1.0:
+            return resize2d(self.pool, x, s[2], s[3], True, cmode, sc[2], sc[3])
+        return resize_linear(x, s, sc, cmode)
 
     def keep_value(mut self, name: String) raises:
         """Keep an intermediate value alive after `run()` so `output(name)` can read it."""

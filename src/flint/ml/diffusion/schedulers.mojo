@@ -143,6 +143,8 @@ struct Scheduler(Copyable, Movable):
         var ts = doc.object_get(r, "timestep_scaling")
         if ts >= 0:
             s.timestep_scaling = doc.number(ts, 10.0)
+        if doc.boolean(doc.object_get(r, "rescale_betas_zero_snr"), False):
+            rescale_zero_terminal_snr(s, one)
         return s^
 
     # ------------------------------------------------------------------ schedule
@@ -294,6 +296,31 @@ struct Scheduler(Copyable, Movable):
             else:
                 out[k] = sap * den + sbp * noise[k]
         return out^
+
+
+def rescale_zero_terminal_snr(mut s: Scheduler, set_alpha_to_one: Bool = False):
+    """diffusers `rescale_zero_terminal_snr` (Lin et al. 2023, used by Marigold v1.1 and other
+    v-prediction fine-tunes): shift / scale sqrt(alphas_cumprod) so the last step has zero SNR,
+    then rebuild betas and alphas_cumprod, all in float32 like the PyTorch reference."""
+    var n = s.train_steps
+    var sq = List[Float32](length=n, fill=0.0)
+    for i in range(n):
+        sq[i] = sqrt(s.alphas_cumprod[i])
+    var s0 = sq[0]
+    var sT = sq[n - 1]
+    var k = s0 / (s0 - sT)
+    var bar = List[Float32](length=n, fill=0.0)
+    for i in range(n):
+        var v = (sq[i] - sT) * k
+        bar[i] = v * v
+    for i in range(n):
+        var a = bar[0] if i == 0 else bar[i] / bar[i - 1]
+        s.betas[i] = Float32(1.0) - a
+    var acc: Float64 = 1.0
+    for i in range(n):
+        acc *= Float64(Float32(1.0) - s.betas[i])
+        s.alphas_cumprod[i] = Float32(acc)
+    s.final_alpha_cumprod = Float32(1.0) if set_alpha_to_one else s.alphas_cumprod[0]
 
 
 def _round_half_even(v: Float64) -> Float64:

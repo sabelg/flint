@@ -13,6 +13,7 @@ from flint.ml.tensor import (
     Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, numel_of, strides_of, shape_str,
     broadcast_shape, broadcast_offsets, norm_axis, fptr_at, DT_BF16, bf16_round,
 )
+from flint.ml.tensor import DT_U8
 
 comptime LANES: Int = 8
 comptime F8 = SIMD[DType.float32, LANES]
@@ -334,6 +335,13 @@ def cast(x: Tensor, to: Int) raises -> Tensor:
         for e in range(n):
             o[e] = Float32(x.i[e])
         return Tensor.floats(x.shape.copy(), o^)
+    if to == DT_U8:
+        # float -> uint8 truncates toward zero (onnxruntime's static_cast); out-of-range values saturate
+        var ou = List[Int](length=n, fill=0)
+        for e in range(n):
+            var v = Int(x.fget(e)) if x.is_float() else x.i[e]
+            ou[e] = min(max(v, 0), 255)
+        return Tensor.ints(DT_U8, x.shape.copy(), ou^)
     if to != DT_I32 and to != DT_I64 and to != DT_BOOL:
         raise Error("Cast to unsupported type " + String(to))
     var o = List[Int](length=n, fill=0)
