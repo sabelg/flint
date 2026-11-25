@@ -905,11 +905,11 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     var r_notif = mcp.handle_jsonrpc('{"jsonrpc":"2.0","method":"notifications/initialized"}', studio, assets, pool)
     _assert(r_notif.byte_length() == 0, "JSON-RPC notification without id must produce empty response")
 
-    # 2. tools/list -> all 14 tools present (including render.configure_npr_cel & render.trigger_post_fx)
+    # 2. tools/list -> all 15 tools present (including render.configure_npr_cel & render.trigger_post_fx)
     var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}', studio, assets, pool)
     var d_list = parse_json(_str_bytes(r_list))
     var tools_arr = d_list.object_get(d_list.object_get(d_list.root, "result"), "tools")
-    _assert(d_list.valid and d_list.array_size(tools_arr) == 14, "tools/list must expose all 14 MCP tools")
+    _assert(d_list.valid and d_list.array_size(tools_arr) == 15, "tools/list must expose all 15 MCP tools")
     _assert(
         r_list.find('"render.configure_npr_cel"') >= 0 and r_list.find('"render.trigger_post_fx"') >= 0,
         "tools/list must include render.configure_npr_cel and render.trigger_post_fx",
@@ -1137,6 +1137,23 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     )
     var d_trav5 = parse_json(_str_bytes(r_trav5))
     _assert(d_trav5.boolean(d_trav5.object_get(d_trav5.object_get(d_trav5.root, "result"), "isError")), "step_deterministic must reject symlink escape")
+
+    # 8c. Tool 15: `assets.process_mesh` (geometry kit) - sandboxed input, QEM LOD on a baked orb
+    var r_kit_trav = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"assets.process_mesh","arguments":{"input_glb_path":"../outside.glb","op":"stats"}}}',
+        studio, assets, pool,
+    )
+    var d_kit_trav = parse_json(_str_bytes(r_kit_trav))
+    _assert(d_kit_trav.boolean(d_kit_trav.object_get(d_kit_trav.object_get(d_kit_trav.root, "result"), "isError")), "process_mesh must reject ../outside.glb")
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"procedural.generate_asset","arguments":{"preset":"material_orb","output_glb_path":"kit/orb.glb"}}}',
+        studio, assets, pool,
+    )
+    var r_kit = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"assets.process_mesh","arguments":{"input_glb_path":"kit/orb.glb","op":"lod","ratio":0.5,"output_glb_path":"kit/orb_lod.glb"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_kit.find('\\"op\\":\\"lod\\"') >= 0 and r_kit.find('\\"ok\\":true') >= 0, "process_mesh lod must succeed: " + r_kit)
 
     # 9. Verify `auth_token` enforcement on `McpServerV2`
     var auth_mcp = McpServerV2(workspace_root=tmp_root, auth_token="flint-secret-token-42")

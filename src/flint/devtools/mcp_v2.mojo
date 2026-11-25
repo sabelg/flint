@@ -5,7 +5,7 @@ Spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 server support
   - **Persistent Non-Blocking Unix Domain Sockets (`FlintMcpUnixListener`)**: Dynamic per-client stream buffers
     with multi-request session persistence and **zero** fixed `mmap` address collisions!
   - **Core Protocol**: `initialize`, `ping`, `notifications/initialized`, `tools/list`, and `tools/call`.
-  - **All 14 Engine / Studio / Asset / Physics / Render AI Tools**:
+  - **All 15 Engine / Studio / Asset / Physics / Render AI Tools**:
     1. `ecs.query_entities`
     2. `ecs.spawn_entity`
     3. `ecs.patch_components`
@@ -20,6 +20,7 @@ Spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 server support
     12. `studio.undo_redo`
     13. `render.configure_npr_cel`
     14. `render.trigger_post_fx`
+    15. `assets.process_mesh` (geometry kit: QEM LOD, meshlets, UV atlas, isotropic remesh)
 """
 from std.ffi import external_call
 from std.math import abs, cos, max, min, sin
@@ -27,6 +28,9 @@ from std.sys.info import CompilationTarget
 from flint.assets.checkpoint import pack_checkpoint_lz4
 from flint.assets.cooker_v2 import DEFAULT_COOK_CACHE_DIR, cook_workspace
 from flint.assets.image import decode_png, write_png
+from flint.assets.geometry_kit import KitOptions, process_model
+from flint.assets.glb_native import load_native_glb
+from flint.assets.glb_writer import write_native_glb
 from flint.assets.json import JsonDocument, parse_json
 from flint.assets.json_write import json_quote
 from flint.assets.server import AssetServer
@@ -783,7 +787,7 @@ def extract_next_mcp_frame(mut buf: List[UInt8]) -> Tuple[Bool, Bool, List[UInt8
 
 
 # ============================================================================
-# 2. Tool Schema Catalog (`tools/list` — All 14 Tools)
+# 2. Tool Schema Catalog (`tools/list` — All 15 Tools)
 # ============================================================================
 
 def _mcp_tools_list_json() -> String:
@@ -797,6 +801,7 @@ def _mcp_tools_list_json() -> String:
         + '{"name":"render.inspect_gpu_frame","description":"Returns GPU render-graph pass timings, VRAM aliasing savings, residency streaming stats, and memory watermarks.","inputSchema":{"type":"object","properties":{}}},'
         + '{"name":"assets.list_and_cook","description":"Lists mounted .flpk v3 archives & live AssetServer arenas, and optionally runs incremental parallel cook_workspace inside workspace_root.","inputSchema":{"type":"object","properties":{"source_dir":{"type":"string"},"output_flpk":{"type":"string"},"cache_dir":{"type":"string"},"force_recook":{"type":"boolean"}}}},'
         + '{"name":"procedural.generate_asset","description":"Generates a Procedural Forge asset (material_orb, catmull_torus, colonnade, reference_grid, foliage_sample, oak, bollard) and bakes .glb inside workspace_root.","inputSchema":{"type":"object","required":["preset"],"properties":{"preset":{"type":"string"},"output_glb_path":{"type":"string"},"seed":{"type":"integer"},"spawn_in_scene":{"type":"boolean"},"position":{"type":"array"}}}},'
+        + '{"name":"assets.process_mesh","description":"Runs the geometry kit on every mesh of a GLB inside workspace_root: stats, QEM lod (ratio), meshlets, xatlas-style UV unwrap, or isotropic remesh; writes output_glb_path and returns before/after numbers.","inputSchema":{"type":"object","required":["input_glb_path","op"],"properties":{"input_glb_path":{"type":"string"},"op":{"type":"string"},"output_glb_path":{"type":"string"},"ratio":{"type":"number"},"target_vertices":{"type":"integer"},"resolution":{"type":"integer"},"padding":{"type":"integer"}}}},'
         + '{"name":"physics.step_deterministic","description":"Advances deterministic IEEE-754 rigid-body physics for N fixed ticks (optional sandboxed output_path checkpoint).","inputSchema":{"type":"object","properties":{"ticks":{"type":"integer"},"dt":{"type":"number"},"output_path":{"type":"string"}}}},'
         + '{"name":"physics.raycast_query","description":"Casts a 3D analytical ray against scene colliders (Sphere, OBB Box, Capsule, Bvh8MeshCollider).","inputSchema":{"type":"object","required":["origin","direction"],"properties":{"origin":{"type":"array"},"direction":{"type":"array"},"max_distance":{"type":"number"}}}},'
         + '{"name":"studio.pie_control","description":"Controls 1-Click Play-In-Editor (play, pause, step, stop) backed by LZ4 checkpoint restoration.","inputSchema":{"type":"object","required":["action"],"properties":{"action":{"type":"string"},"ticks":{"type":"integer"}}}},'
@@ -1240,6 +1245,39 @@ struct McpServerV2(Movable):
                 + ',"output_glb_path":' + json_quote(out_glb)
                 + ',"spawned_entity_id":' + String(spawned_id) + "}",
             )
+
+        # 8b. assets.process_mesh (geometry kit; input and output strictly sandboxed inside `workspace_root`)
+        if tool_name == "assets.process_mesh":
+            var raw_in = doc.text(doc.object_get(args_node, "input_glb_path"), "")
+            var raw_out = doc.text(doc.object_get(args_node, "output_glb_path"), "")
+            var kit = KitOptions(doc.text(doc.object_get(args_node, "op"), "stats"))
+            kit.ratio = Float32(max(0.01, min(1.0, doc.number(doc.object_get(args_node, "ratio"), 0.5))))
+            kit.target_vertices = max(0, doc.integer(doc.object_get(args_node, "target_vertices"), 0))
+            kit.resolution = max(64, min(8192, doc.integer(doc.object_get(args_node, "resolution"), 1024)))
+            kit.padding = max(0, min(16, doc.integer(doc.object_get(args_node, "padding"), 2)))
+            var in_glb: String
+            var out_mesh_glb = String("")
+            try:
+                in_glb = sanitize_output_path(self.workspace_root, raw_in)
+                if raw_out.byte_length() > 0:
+                    out_mesh_glb = sanitize_output_path(self.workspace_root, raw_out)
+            except e:
+                return (True, '{"ok":false,"error":' + json_quote("sandbox rejected path: " + String(e)) + "}")
+            var kit_model = load_native_glb(in_glb)
+            if len(kit_model.meshes) == 0:
+                return (True, '{"ok":false,"error":' + json_quote("no meshes in " + in_glb) + "}")
+            var kit_report: String
+            try:
+                kit_report = process_model(kit_model, kit)
+            except e:
+                return (True, '{"ok":false,"error":' + json_quote(String(e)) + "}")
+            if out_mesh_glb.byte_length() > 0:
+                var odir = parent_directory(out_mesh_glb)
+                if odir.byte_length() > 0 and odir != ".":
+                    _ = make_dirs(odir)
+                if not write_native_glb(out_mesh_glb, kit_model):
+                    return (True, '{"ok":false,"error":"failed to write output_glb_path"}')
+            return (False, '{"ok":true,"output_glb_path":' + json_quote(out_mesh_glb) + ',"report":' + kit_report + "}")
 
         # 9. physics.step_deterministic (optional checkpoint output strictly sandboxed inside `workspace_root`)
         if tool_name == "physics.step_deterministic":

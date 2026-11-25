@@ -261,6 +261,19 @@ def _update_levels(mut m: _CornerMesh):
         m.level[v] = 0 if cnt[v] == 0 else (1 if cnt[v] == 2 else 2)
 
 
+def check_twins(m: _CornerMesh) -> Int:
+    """Index of the first half-edge whose twin link is inconsistent, or -1 (debug aid)."""
+    for h in range(m.nf() * 3):
+        if not m.alive[h // 3]:
+            continue
+        var o = m.tw[h]
+        if o < 0:
+            continue
+        if not m.alive[o // 3] or m.tw[o] != h or m.org(o) != m.dst(h) or m.dst(o) != m.org(h):
+            return h
+    return -1
+
+
 def _fix_vc(mut m: _CornerMesh, v: Int, hint: Int):
     if hint >= 0 and m.alive[hint // 3] and m.org(hint) == v:
         m.vc[v] = hint
@@ -367,6 +380,19 @@ def _collapse_ok(m: _CornerMesh, h: Int, keep_pos: Vec3, max_len2: Float32) -> B
         return False
     var ra = m.ring(a)
     var rb = m.ring(b)
+    # never collapse a valence-3 vertex fan away (tetrahedra / tiny components would vanish)
+    var bnd_a = m.tw[_prv(ra[0])] < 0 if len(ra) > 0 else True
+    var bnd_b = m.tw[_prv(rb[0])] < 0 if len(rb) > 0 else True
+    for i in range(len(ra)):
+        if m.tw[ra[i]] < 0 or m.tw[_prv(ra[i])] < 0:
+            bnd_a = True
+    for i in range(len(rb)):
+        if m.tw[rb[i]] < 0 or m.tw[_prv(rb[i])] < 0:
+            bnd_b = True
+    if len(ra) <= (2 if bnd_a else 3) or len(rb) <= (2 if bnd_b else 3):
+        return False
+    if len(ra) + len(rb) <= 8 and not (bnd_a or bnd_b):
+        return False
     # link condition: common neighbours must be the apexes of the faces on the edge
     var apex_c = m.dst(_nxt(h))
     var apex_d = m.dst(_nxt(o)) if o >= 0 else -1
@@ -484,18 +510,38 @@ def isotropic_remesh(mesh: NativeMesh, cfg: RemeshConfig) -> NativeMesh:
     var hi2 = (L * 4.0 / 3.0) * (L * 4.0 / 3.0)
     var lo2 = (L * 4.0 / 5.0) * (L * 4.0 / 5.0)
     for _ in range(cfg.iterations):
-        # 1. split long edges
-        var h = 0
-        while h < m.nf() * 3:
-            if m.alive[h // 3]:
-                var o = m.tw[h]
-                if o < 0 or h < o:
-                    if (m.pos(m.org(h)) - m.pos(m.dst(h))).length_squared() > hi2:
-                        _ = _split(m, h)
-            h += 1
+        # 1. split long edges: each sweep splits the edges that exist when it starts, longest
+        #    first (Rivara-style ordering; letting a sweep chase the edges it creates never ends)
+        for _sweep in range(4):
+            var cand = List[Int]()
+            var clen = List[Float32]()
+            for e in range(m.nf() * 3):
+                if m.alive[e // 3]:
+                    var o = m.tw[e]
+                    if o < 0 or e < o:
+                        var l2 = (m.pos(m.org(e)) - m.pos(m.dst(e))).length_squared()
+                        if l2 > hi2:
+                            cand.append(e)
+                            clen.append(-l2)
+            if len(cand) == 0:
+                break
+            var order = List[Int](capacity=len(cand))
+            for i in range(len(cand)):
+                order.append(i)
+            _sort_desc(order, clen)
+            var ca = List[Int](capacity=len(cand))
+            var cb = List[Int](capacity=len(cand))
+            for i in range(len(cand)):
+                ca.append(m.org(cand[i]))
+                cb.append(m.dst(cand[i]))
+            for oi in range(len(order)):
+                var i = order[oi]
+                var e = cand[i]
+                if m.alive[e // 3] and m.org(e) == ca[i] and m.dst(e) == cb[i]:
+                    _ = _split(m, e)
         _repair_vc(m)
         # 2. collapse short edges
-        h = 0
+        var h = 0
         while h < m.nf() * 3:
             if m.alive[h // 3]:
                 var o = m.tw[h]
