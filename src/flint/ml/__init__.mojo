@@ -49,4 +49,6 @@
     clean-up, `make_tileable` seamless textures)
   - `realesrgan`: Real-ESRGAN x4 super-resolution (RRDBNet and compact SRVGG nets from
     safetensors, tiled inference, PixelShuffle, denoise blend; CPU / MAX GPU)
+  - `depth`, `torch_pt`: monocular depth / geometry (Depth Anything V2 / 3 on one DINOv2 + DPT
+    stack, MoGe-2 points / normals / FOV; PNG, EXR and GLB blockout output) and a `.pt` reader
 """
