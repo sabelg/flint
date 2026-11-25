@@ -16,4 +16,6 @@
   - `moonshine`, `moonshine_gpu`, `moonshine_audio`, `moonshine_tokenizer`: Moonshine v2
     streaming speech-to-text (encoder, KV-cached decoder, CPU / MAX GPU), its 16 kHz front end
     (WAV reading, resampling, CMVN frames, energy VAD), BPE decoding and voice-command matching
+  - `llm`: small-LLM runtime for NPC dialogue and behaviour choice (Qwen3, SmolLM3 from
+    safetensors; int8 / int4 weights; grammar-constrained BehaviorTree actions)
 """
