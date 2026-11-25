@@ -90,3 +90,21 @@
   licence) and is not used or downloaded. Flint uses the image's alpha channel when it has one,
   otherwise it keys out a plain background. A permissive learned matting model (BiRefNet: MIT
   weights) could replace this later.
+- `src/flint/ml/diffusion/` (`flint.ml.diffusion`) is an original pure-Mojo latent-diffusion
+  stack: UNet, KL / VQ autoencoders, CLIP text and vision towers, CLIP BPE tokenizer, a
+  `torch.Generator`-compatible RNG and DDIM / Euler / LCM schedulers. It is written from the model
+  maths and checked against Hugging Face diffusers / transformers / PyTorch outputs
+  (`tools/diffusion/reference.py`, Apache-2.0 / BSD libraries imported at verification time; no
+  code is copied). Flint includes no weights: `tools/diffusion/fetch.py` downloads them outside
+  the repository.
+- StableMaterials (https://huggingface.co/gvecchio/StableMaterials) is published under an
+  OpenRAIL licence, with no licence file in the repository. It allows commercial use, but its
+  use-based restrictions must be passed on to anyone who runs it; see
+  `stablematerials-LICENSE.txt`. Its CLIP ViT-L/14 text and vision encoders are OpenAI CLIP
+  weights (MIT, `openai-clip-LICENSE.txt`).
+- MatFuse (https://huggingface.co/gvecchio/MatFuse, Copyright (c) 2024 Giuseppe Vecchio, MIT; see
+  `matfuse-LICENSE.txt`): UNet, VQ decoder and condition encoder. Its CLIP ViT-B/16 encoders are
+  read from `sentence-transformers/clip-ViT-B-16`, a repackaging of OpenAI's CLIP ViT-B/16
+  weights. That repository declares no licence of its own; the weights are OpenAI's
+  (MIT via github.com/openai/CLIP, `openai-clip-LICENSE.txt`), the same ones MatFuse loads with
+  `clip.load("ViT-B/16")`.

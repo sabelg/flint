@@ -24,4 +24,7 @@
   - `kokoro`: Kokoro-82M TTS, `KokoroTTS.load(dir).say(text, voice)` -> 24 kHz samples, timings
   - `gemx`: GEM-X monocular video to whole-body SOMA motion (keypoints, pose tokens, Motion
     transformer, BVH / `NativeAnimation` clips)
+  - `diffusion`: latent diffusion (UNet, KL / VQ VAE, CLIP, DDIM / Euler / LCM, CFG, tileable
+    wrap-mode convolutions) and `diffusion.materials`: StableMaterials / MatFuse text or photo ->
+    PBR material sets
 """
