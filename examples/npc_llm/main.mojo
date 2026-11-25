@@ -2,14 +2,16 @@
 
 usage:
   npc_llm chat MODEL_DIR [--cpu] [--fmt fp32|int8|int4] [--temp T] [--top-p P] [--seed N]
-                         [--max N] [--system TEXT]
+                         [--max N] [--system TEXT] [--draft DRAFT_DIR] [--k N]
   npc_llm npc  MODEL_DIR [--cpu] [--fmt fp32|int8|int4] [--temp T] [--seed N]
 
 MODEL_DIR is a Hugging Face checkpoint directory (config.json, *.safetensors, tokenizer.json)
 of Qwen3-0.6B / Qwen3-1.7B / SmolLM3-3B. Default: int8 weights on the GPU when present.
 
 `chat` streams replies; the conversation stays in the KV cache, so each turn only evaluates the
-new message. `npc` runs a guard through scripted world states: the blackboard is turned into a
+new message. With `--draft DRAFT_DIR` (e.g. Qwen3-0.6B for a Qwen3-1.7B+ MODEL_DIR) replies use
+speculative decoding (`flint.ml.llm.speculative`, `k` proposals per round, default 3) and print
+whole, with the acceptance rate; `examples/npc_llm/speculative.mojo` benchmarks it. `npc` runs a guard through scripted world states: the blackboard is turned into a
 text observation, the LLM answers with grammar-constrained JSON naming one action, the choice
 goes on the blackboard and the BehaviorTree runs it. A designer branch in front of the LLM
 (health below 15: flee) shows the tree keeps the last word.
@@ -20,6 +22,7 @@ from std.time import perf_counter_ns
 from std.ffi import external_call
 from flint.ml.llm import LlmModel, BpeTokenizer, Sampler, Q_F32, Q_INT8, Q_INT4
 from flint.ml.llm.chat import ChatTemplate, ChatMessage
+from flint.ml.llm.speculative import generate_speculative
 from flint.ml.llm.npc import NpcBrain, NpcAction
 from flint.ai.behavior_tree import Blackboard, BehaviorTree, BtExecutionState, BT_CMP_LT, BT_CMP_EQ
 
@@ -32,6 +35,8 @@ struct Opts(Copyable, Movable):
     var seed: UInt64
     var max_tokens: Int
     var system: String
+    var draft: String
+    var k: Int
 
     def __init__(out self):
         self.gpu = True
@@ -40,6 +45,8 @@ struct Opts(Copyable, Movable):
         self.top_p = 0.9
         self.seed = 1
         self.max_tokens = 256
+        self.draft = ""
+        self.k = 3
         self.system = "You are Brakka, a gruff but kind dwarven blacksmith in the village of Emberfall. Stay in character and keep answers short."
 
 
@@ -65,6 +72,12 @@ def parse(a: List[String]) raises -> Opts:
             i += 1
         elif s == "--max" and has:
             o.max_tokens = Int(a[i + 1])
+            i += 1
+        elif s == "--draft" and has:
+            o.draft = a[i + 1]
+            i += 1
+        elif s == "--k" and has:
+            o.k = Int(a[i + 1])
             i += 1
         elif s == "--system" and has:
             o.system = a[i + 1]
@@ -120,6 +133,25 @@ def chat(dir: String, o: Opts) raises:
     var sampler = Sampler(temp, o.top_p, 40, o.seed, 1.05)
     var msgs = List[ChatMessage]()
     msgs.append(ChatMessage("system", o.system))
+    if o.draft.byte_length() > 0:
+        var draft = LlmModel.load(o.draft, o.fmt, o.gpu, 4096)
+        print("[npc_llm] speculative decoding with draft ", draft.cfg.family, " (", draft.cfg.layers, " layers x ",
+              draft.cfg.hidden, "), k = ", o.k, sep="")
+        while True:
+            var got = read_line("\nyou> ")
+            if not got:
+                break
+            var line = got.value()
+            if line.byte_length() == 0:
+                break
+            msgs.append(ChatMessage("user", line))
+            var ids = tmpl.render(tok, msgs)
+            var g = generate_speculative(model, draft, tok, ids, sampler, o.max_tokens, tmpl.stops, o.k, 0.4)
+            print("npc> ", g.text, sep="")
+            print("  [", len(g.tokens), " tokens at ", g.decode_tps(), " tok/s; ", Int(g.stats.acceptance() * 100),
+                  "% of drafts accepted, ", g.stats.tokens_per_round(), " tokens per target pass]", sep="")
+            msgs.append(ChatMessage("assistant", g.text))
+        return
     while True:
         var got = read_line("\nyou> ")
         if not got:
@@ -270,7 +302,7 @@ def main() raises:
     for x in raw:
         a.append(String(x))
     if len(a) < 3 or (a[1] != "chat" and a[1] != "npc"):
-        print("usage: npc_llm chat|npc MODEL_DIR [--cpu] [--fmt fp32|int8|int4] [--temp T] [--top-p P] [--seed N] [--max N] [--system TEXT]")
+        print("usage: npc_llm chat|npc MODEL_DIR [--cpu] [--fmt fp32|int8|int4] [--temp T] [--top-p P] [--seed N] [--max N] [--system TEXT] [--draft DIR] [--k N]")
         return
     var o = parse(a)
     if a[1] == "chat":

@@ -33,6 +33,18 @@
   download them from Hugging Face. Qwen3-0.6B and Qwen3-1.7B are Apache-2.0 (Copyright 2024
   Alibaba Cloud, `qwen3-LICENSE.txt`); SmolLM3-3B is Apache-2.0 (Hugging Face,
   `smollm3-LICENSE.txt`). Both allow commercial use and redistribution with the notice.
+- `src/flint/ml/llm/embed.mojo` runs Qwen3-Embedding-0.6B (https://huggingface.co/Qwen/Qwen3-Embedding-0.6B,
+  Apache-2.0 per its model card, Copyright 2025 Alibaba Cloud; the repository ships no LICENSE
+  file, the terms are those of `qwen3-LICENSE.txt`) on Flint's own Qwen3 decoder; last-token
+  pooling, the instruction format and MRL truncation follow the model card. Flint includes no
+  weights. `tools/llm/embed_reference.py` imports sentence-transformers (Apache-2.0) and
+  Transformers at verification time only; no code is copied.
+- `src/flint/ml/llm/speculative.mojo` is an original implementation of speculative decoding as
+  published by Leviathan et al. (2023) and Chen et al. (2023); the larger targets it was measured
+  with, Qwen3-4B and Qwen3-8B, are Apache-2.0 (Alibaba Cloud) like Qwen3-0.6B / 1.7B. No EAGLE-3
+  heads are used: the AngelSlim Qwen3 heads are Tencent releases (skipped under Flint's
+  Tencent rule) and RedHatAI's Apache-2.0 `Qwen3-8B-speculator.eagle3` is trained partly on
+  ShareGPT conversations of unclear provenance, so neither is supported or downloaded.
 - `src/flint/ml/kokoro.mojo` runs Kokoro-82M (https://huggingface.co/hexgrad/Kokoro-82M,
   StyleTTS2 + iSTFTNet, Copyright (c) hexgrad, Apache-2.0 code, weights and voicepacks; see
   `kokoro-LICENSE.txt`) from the onnx-community ONNX export, also Apache-2.0. Flint includes only
