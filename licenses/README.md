@@ -60,3 +60,21 @@
 - GEM-X's YOLOX person detector is not ported and must not be added: its weights are trained on
   the Human-Art dataset, which is licensed for non-commercial use only. Person boxes come from
   the caller's detector or from `Gemx.track` (keypoint tracking from a first-frame box).
+- `src/flint/ml/triposg.mojo`, `triposg_gpu.mojo` and `triposg_mesh.mojo` run TripoSG
+  (https://github.com/VAST-AI-Research/TripoSG, Copyright (c) 2025 VAST-AI-Research and
+  contributors, MIT; see `triposg-LICENSE.txt`). The code and the VAST-AI/TripoSG weights are MIT.
+  Its image encoder is Meta's DINOv2-L (Apache-2.0, `dinov2-LICENSE.txt`). Flint does not include
+  any weights: `TripoSG.load` reads a downloaded Hugging Face folder. The Mojo code is written from
+  the model's math and checked against the upstream PyTorch modules with
+  `tools/triposg/reference.py`, which imports a local TripoSG checkout and Hugging Face
+  diffusers / transformers (Apache-2.0) at verification time only.
+- TripoSG's NOTICE says parts of its Python code derive from HunyuanDiT and FlashVDM, which are
+  under Tencent Hunyuan community licences that exclude the EU, UK and South Korea. Flint copies
+  none of that code: the DiT is implemented from the architecture, the coarse-to-fine SDF
+  extraction is Flint's own (a MISE-style refinement of cells near the surface), FlashVDM's top-k
+  attention is not used, and the marching cubes builds its polygons by walking cube faces
+  rather than from a lookup table.
+- TripoSG's default background remover, BRIA RMBG-1.4, is non-commercial ("bria-rmbg-1.4"
+  licence) and is not used or downloaded. Flint uses the image's alpha channel when it has one,
+  otherwise it keys out a plain background. A permissive learned matting model (BiRefNet: MIT
+  weights) could replace this later.
