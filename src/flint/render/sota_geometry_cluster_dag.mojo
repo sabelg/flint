@@ -29,6 +29,8 @@ from flint.core.math import Vec3
 from flint.core.detsort import stable_order
 from flint.assets.model import NativeMesh
 from flint.assets.meshlet import AaaGeometryPool, CookedMeshEntry, MeshLodSlice
+from flint.core.jobs import JobPool
+from flint.core.ecs import run_parallel_ctx
 
 comptime SOTA_DAG_MAX_VERTS: Int = 64
 comptime SOTA_DAG_MAX_TRIS: Int = 124
@@ -714,7 +716,68 @@ def simplify_group_locked(
 # ---------------------------------------------------------------------------------------------
 # DAG build
 # ---------------------------------------------------------------------------------------------
+struct _DagLevelCtx(Movable):
+    """One DAG level's independent group jobs (simplify + re-clusterize); raw addresses of lists that the
+    caller keeps alive until the barrier. Each job owns a disjoint range of output slots."""
+    var mesh: Int
+    var pid: Int
+    var n_pid: Int
+    var nv: Int
+    var locked: Int
+    var merged: Int        # List[List[Int]]
+    var out_err: Int       # List[Float32]
+    var out_parts: Int     # List[List[List[Int]]]
+    var n_groups: Int
+    var chunk: Int
+
+    def __init__(out self):
+        self.mesh = 0
+        self.pid = 0
+        self.n_pid = 0
+        self.nv = 0
+        self.locked = 0
+        self.merged = 0
+        self.out_err = 0
+        self.out_parts = 0
+        self.n_groups = 0
+        self.chunk = 1
+
+
+def _dag_level_worker(ctx_addr: Int, job: Int):
+    var c = Pointer[_DagLevelCtx, ImmutAnyOrigin](unsafe_from_address=ctx_addr)
+    var mesh = Pointer[NativeMesh, ImmutAnyOrigin](unsafe_from_address=c[].mesh)
+    var pid = Pointer[List[Int], ImmutAnyOrigin](unsafe_from_address=c[].pid)
+    var locked = Pointer[List[Bool], ImmutAnyOrigin](unsafe_from_address=c[].locked)
+    var merged = Pointer[List[List[Int]], ImmutAnyOrigin](unsafe_from_address=c[].merged)
+    var out_err = Pointer[List[Float32], MutAnyOrigin](unsafe_from_address=c[].out_err)
+    var out_parts = Pointer[List[List[List[Int]]], MutAnyOrigin](unsafe_from_address=c[].out_parts)
+    var g0 = job * c[].chunk
+    var g1 = min(c[].n_groups, g0 + c[].chunk)
+    # job-private stamp scratch: cluster output depends only on stamp equality, so it is identical to serial
+    var vstamp = List[Int](length=c[].nv, fill=0)
+    var stamp_base = 0
+    for g in range(g0, g1):
+        var n_in = len(merged[][g]) // 3
+        if n_in == 0:
+            continue
+        var simp = simplify_group_locked(mesh[], pid[], c[].n_pid, merged[][g], locked[], n_in // 2)
+        var n_out = len(simp[0]) // 3
+        out_err[][g] = simp[1]
+        if n_out == 0 or Float32(n_out) > Float32(n_in) * Float32(0.85):
+            continue
+        out_parts[][g] = clusterize_triangles(mesh[], pid[], c[].n_pid, simp[0], vstamp, stamp_base)
+
+
+def build_cluster_dag_mt(mesh: NativeMesh, mut pool: JobPool, group_size: Int = SOTA_DAG_GROUP_SIZE) -> ClusterDag:
+    """`build_cluster_dag` with each level's group simplifications spread over `pool` (bit-identical result)."""
+    return _build_cluster_dag(mesh, group_size, Int(Pointer(to=pool)))
+
+
 def build_cluster_dag(mesh: NativeMesh, group_size: Int = SOTA_DAG_GROUP_SIZE) -> ClusterDag:
+    return _build_cluster_dag(mesh, group_size, 0)
+
+
+def _build_cluster_dag(mesh: NativeMesh, group_size: Int, pool_addr: Int) -> ClusterDag:
     var dag = ClusterDag()
     var nv = mesh.vertex_count()
     var nt = len(mesh.indices) // 3
@@ -762,36 +825,74 @@ def build_cluster_dag(mesh: NativeMesh, group_size: Int = SOTA_DAG_GROUP_SIZE) -
                         locked[p] = True
         var next_pending = List[Int]()
         var any_built = False
-        for g in range(len(groups)):
+        # phase A (serial): gather each multi-cluster group's triangles, bounding sphere and child error
+        var ng = len(groups)
+        var g_merged = List[List[Int]](capacity=ng)
+        var g_center = List[Vec3](capacity=ng)
+        var g_radius = List[Float32](capacity=ng)
+        var g_cerr = List[Float32](capacity=ng)
+        for g in range(ng):
+            ref members = groups[g]
+            var merged = List[Int]()
+            var gc = dag.clusters[members[0]].self_center if len(members) > 0 else Vec3()
+            var gr = dag.clusters[members[0]].self_radius if len(members) > 0 else Float32(0.0)
+            var child_err = Float32(0.0)
+            if len(members) > 1:
+                for ci in members:
+                    ref c = dag.clusters[ci]
+                    for v in c.tris:
+                        merged.append(v)
+                    var sm = sphere_merge(gc, gr, c.self_center, c.self_radius)
+                    gc = sm[0]
+                    gr = sm[1]
+                    child_err = max(child_err, c.self_error)
+            g_merged.append(merged^)
+            g_center.append(gc)
+            g_radius.append(gr)
+            g_cerr.append(child_err)
+        # phase B (parallel over JobPool, or serial): simplify + re-clusterize every group independently
+        var o_err = List[Float32](length=ng, fill=Float32(0.0))
+        var o_parts = List[List[List[Int]]](length=ng, fill=List[List[Int]]())
+        var lctx = _DagLevelCtx()
+        lctx.mesh = Int(Pointer(to=mesh))
+        lctx.pid = Int(Pointer(to=pid))
+        lctx.n_pid = n_pid
+        lctx.nv = nv
+        lctx.locked = Int(Pointer(to=locked))
+        lctx.merged = Int(Pointer(to=g_merged))
+        lctx.out_err = Int(Pointer(to=o_err))
+        lctx.out_parts = Int(Pointer(to=o_parts))
+        lctx.n_groups = ng
+        lctx.chunk = 2
+        var n_jobs = (ng + lctx.chunk - 1) // lctx.chunk
+        if pool_addr != 0 and n_jobs > 1:
+            run_parallel_ctx(Pointer[JobPool, MutAnyOrigin](unsafe_from_address=pool_addr)[], n_jobs, lctx, _dag_level_worker)
+        else:
+            for j in range(n_jobs):
+                _dag_level_worker(Int(Pointer(to=lctx)), j)
+        # keep everything the workers read through raw addresses alive past the barrier (ASAP destructors)
+        _ = len(g_merged)
+        _ = len(pid)
+        _ = len(locked)
+        _ = lctx.n_groups
+        # phase C (serial, group order): link parents and append the new clusters exactly as the serial build
+        for g in range(ng):
             ref members = groups[g]
             if len(members) <= 1:
                 for ci in members:
                     next_pending.append(ci)
                 continue
-            var merged = List[Int]()
-            var gc = dag.clusters[members[0]].self_center
-            var gr = dag.clusters[members[0]].self_radius
-            var child_err = Float32(0.0)
-            for ci in members:
-                ref c = dag.clusters[ci]
-                for v in c.tris:
-                    merged.append(v)
-                var sm = sphere_merge(gc, gr, c.self_center, c.self_radius)
-                gc = sm[0]
-                gr = sm[1]
-                child_err = max(child_err, c.self_error)
-            var n_in = len(merged) // 3
-            var target = n_in // 2
-            var simp = simplify_group_locked(mesh, pid, n_pid, merged, locked, target)
-            var n_out = len(simp[0]) // 3
-            if n_out == 0 or Float32(n_out) > Float32(n_in) * Float32(0.85):
+            if len(o_parts[g]) == 0:
                 dag.groups_failed += 1
                 for ci in members:
                     next_pending.append(ci)
                 continue
             any_built = True
             dag.groups_built += 1
-            var gerr = child_err + simp[1]
+            var gc = g_center[g]
+            var gr = g_radius[g]
+            var child_err = g_cerr[g]
+            var gerr = child_err + o_err[g]
             # strictly above every child so the cut is unambiguous even for a zero-error simplification
             gerr = max(gerr, child_err * Float32(1.0001) + Float32(1e-7))
             for ci in members:
@@ -799,8 +900,7 @@ def build_cluster_dag(mesh: NativeMesh, group_size: Int = SOTA_DAG_GROUP_SIZE) -
                 c.parent_center = gc
                 c.parent_radius = gr
                 c.parent_error = gerr
-            var parts = clusterize_triangles(mesh, pid, n_pid, simp[0], vstamp, stamp_base)
-            for pt in parts:
+            for pt in o_parts[g]:
                 var nc = DagCluster(pt.copy(), level + 1)
                 nc.self_center = gc
                 nc.self_radius = gr
