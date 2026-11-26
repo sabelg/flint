@@ -52,6 +52,7 @@ from flint.devtools.mcp_v2 import (
     McpServerV2,
     McpUnixSessionClient,
     default_mcp_socket_path,
+    parse_next_mcp_frame,
     sanitize_output_path,
 )
 from flint.platform.input import InputState
@@ -763,7 +764,10 @@ def test_e_undo_redo_50_and_pie_120_ticks() raises:
     var stepped = studio.pie_step(120)
     _assert(stepped == 120, "pie_step(120) must simulate 120 ticks")
     _assert(studio.stepped_clock.stepped_time_sec > Float32(1.5), "stepped_clock must advance during PIE")
-    _assert(studio.entities[drop_id].translation.y < Float32(1.5), "dynamic sphere must fall under gravity during PIE")
+    _assert(
+        studio.entities[drop_id].translation.y < pre_pie_y - Float32(1.5),
+        "dynamic sphere must fall under gravity during PIE (y=" + String(studio.entities[drop_id].translation.y) + ")",
+    )
     _assert(studio.state_hash() != pre_pie_hash, "world hash must change during 120-tick PIE simulation")
 
     _assert(studio.pie_stop(), "pie_stop() failed")
@@ -1169,15 +1173,29 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     _assert(r_good_tok.find('"protocolVersion"') >= 0, "valid auth_token initialize must succeed")
 
     # 10. Default `0700` runtime dir + `0600` socket mode + `SO_PEERCRED` verification
+    # The default path belongs to a running Studio (if any): only check how it is formed and never
+    # bind it here, so the gate cannot take the live agent socket away from an open Studio.
     var def_sock = default_mcp_socket_path()
-    var def_listener = FlintMcpUnixListener(def_sock)
-    _assert(def_listener.active, "default FlintMcpUnixListener failed to start")
-    _assert(_stat_mode_octal(def_sock) == UInt32(0o600), "MCP Unix socket must have mode 0600")
-    def_listener.close()
+    _assert(def_sock.endswith("/mcp.sock") and def_sock.find("flint") >= 0, "default MCP socket path malformed")
 
     var sock_path = tmp_root + "/mcp_v2.sock"
     var listener = FlintMcpUnixListener(sock_path)
     _assert(listener.active and _stat_mode_octal(sock_path) == UInt32(0o600), "FlintMcpUnixListener failed to bind 0600 socket")
+
+    # A second listener on a live path must refuse, and closing it must not unlink the live socket
+    var live_path = tmp_root + "/mcp_live.sock"
+    var live = FlintMcpUnixListener(live_path)
+    _assert(live.active, "live FlintMcpUnixListener failed to start")
+    var rival = FlintMcpUnixListener(live_path)
+    _assert(not rival.active, "second FlintMcpUnixListener must not steal a live socket")
+    rival.close()
+    var probe_cli = McpUnixSessionClient(use_content_length=True)
+    _assert(probe_cli.connect(live_path), "live socket must survive a rival listener closing")
+    probe_cli.close()
+    live.close()
+    var stale = FlintMcpUnixListener(live_path)
+    _assert(stale.active, "a stale socket path must be reclaimed")
+    stale.close()
 
     # Test `SO_PEERCRED` peer UID mismatch rejection
     listener.expected_peer_uid = Int(external_call["getuid", UInt32]()) + 1
@@ -1308,6 +1326,69 @@ def _run_large_mcp_pair(
     xfer.keep_alive()
 
 
+def _tool_is_error(resp: String) -> Bool:
+    var d = parse_json(_str_bytes(resp))
+    return d.valid and d.boolean(d.object_get(d.object_get(d.root, "result"), "isError"))
+
+
+def test_g_agent_regressions(tmp_root: String, mut pool: JobPool) raises:
+    print("  [g] Testing agent-found regressions: wide box colliders, argument validation, recoverable bad lines...")
+    # A flat 36 m grid box used to act as an 18 m sphere proxy and fling nearby bodies onto its shell.
+    var studio = FlintStudioState()
+    _ = studio.spawn_entity(
+        "Grid", position=Vec3(0.0, 0.0, 0.0), collider_kind=COLLIDER_BOX,
+        collider_half_extents=Vec3(18.0, 0.05, 18.0), mass=0.0, record_undo=False,
+    )
+    var cube = studio.spawn_entity("Cube", position=Vec3(0.0, 3.0, 0.0), collider_kind=COLLIDER_BOX, mass=2.0, record_undo=False)
+    var ball = studio.spawn_entity(
+        "Ball", position=Vec3(5.0, 4.0, -3.0), collider_kind=COLLIDER_SPHERE,
+        collider_half_extents=Vec3(0.5, 0.5, 0.5), mass=1.0, record_undo=False,
+    )
+    _ = studio.step_physics_deterministic(120)
+    var cp = studio.entities[cube].translation
+    var bp = studio.entities[ball].translation
+    _assert(cp.y > Float32(0.5) and cp.y < Float32(0.62), "box must come to rest on the grid top, got y=" + String(cp.y))
+    _assert(abs(cp.x) < Float32(0.01) and abs(cp.z) < Float32(0.01), "box must fall straight down onto the grid")
+    _assert(bp.y > Float32(0.5) and bp.y < Float32(0.62), "sphere must come to rest on the grid top, got y=" + String(bp.y))
+
+    var assets = AssetServer(enable_watcher=False)
+    var mcp = McpServerV2(workspace_root=tmp_root)
+    _assert(
+        _tool_is_error(mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"procedural.generate_asset","arguments":{"preset":"dragon"}}}',
+            studio, assets, pool,
+        )),
+        "unknown procedural preset must be a tool error, not a silent box",
+    )
+    _assert(
+        _tool_is_error(mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"physics.step_deterministic","arguments":{"ticks":-5}}}',
+            studio, assets, pool,
+        )),
+        "negative ticks must be rejected",
+    )
+    _assert(
+        _tool_is_error(mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"physics.raycast_query","arguments":{"origin":[0,0,0],"direction":[0,0,0]}}}',
+            studio, assets, pool,
+        )),
+        "zero ray direction must be rejected",
+    )
+    var r_unknown = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"no.such_tool","arguments":{}}}', studio, assets, pool
+    )
+    _assert(r_unknown.find('"error"') >= 0 and r_unknown.find("-32602") >= 0, "unknown tool must be JSON-RPC error -32602")
+
+    # One bad newline-delimited line (a JSON-RPC batch) must not kill the session
+    var buf = List[UInt8]()
+    for b in '[{"jsonrpc":"2.0","id":9,"method":"ping"}]\n{"jsonrpc":"2.0","id":10,"method":"ping"}\n'.as_bytes():
+        buf.append(b)
+    var f1 = parse_next_mcp_frame(buf)
+    _assert(f1.protocol_error and f1.recoverable, "batch line must be a recoverable protocol error")
+    var f2 = parse_next_mcp_frame(buf)
+    _assert(f2.has_frame and not f2.protocol_error, "the next line after a bad one must still parse")
+
+
 def main() raises:
     var t0 = get_time()
     var pid = Int(external_call["getpid", Int32]())
@@ -1325,9 +1406,10 @@ def main() raises:
     test_d_analytical_3d_gizmos()
     test_e_undo_redo_50_and_pie_120_ticks()
     test_f_mcp_v2_end_to_end(tmp_root, pool)
+    test_g_agent_regressions(tmp_root, pool)
 
     pool.stop()
     _rm_rf_tmp(tmp_root)
 
     var elapsed_ms = (get_time() - t0) * 1000.0
-    print("[Flint v5 Track 5] ALL 6 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")
+    print("[Flint v5 Track 5] ALL 7 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")

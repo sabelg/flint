@@ -1015,6 +1015,101 @@ struct FlintStudioState(Movable, Serializable):
 
     # ---- Deterministic Physics Step & Analytical Raycast ----
 
+    def _collider_half(self, i: Int) -> Vec3:
+        ref e = self.entities[i]
+        return Vec3(
+            max(Float32(0.01), e.collider_half_extents.x * e.scale.x),
+            max(Float32(0.01), e.collider_half_extents.y * e.scale.y),
+            max(Float32(0.01), e.collider_half_extents.z * e.scale.z),
+        )
+
+    def _world_aabb_half(self, i: Int) -> Vec3:
+        """Half extents of the world AABB around entity `i`'s oriented collider box."""
+        var he = self._collider_half(i)
+        var q = self.entities[i].rotation
+        var ax = q.rotate(Vec3(1.0, 0.0, 0.0))
+        var ay = q.rotate(Vec3(0.0, 1.0, 0.0))
+        var az = q.rotate(Vec3(0.0, 0.0, 1.0))
+        return Vec3(
+            abs(ax.x) * he.x + abs(ay.x) * he.y + abs(az.x) * he.z,
+            abs(ax.y) * he.x + abs(ay.y) * he.y + abs(az.y) * he.z,
+            abs(ax.z) * he.x + abs(ay.z) * he.y + abs(az.z) * he.z,
+        )
+
+    def _pair_contact(self, i: Int, j: Int) -> Tuple[Bool, Vec3, Float32]:
+        """Editor-sim narrowphase: `(touching, unit normal pointing from i to j, penetration depth)`.
+        Spheres use their radius; boxes, capsules and static meshes use their oriented box, so a wide, flat
+        collider (the 36 m reference grid) no longer acts as a huge sphere that flings bodies 18 m away."""
+        var none = (False, Vec3(0.0, 1.0, 0.0), Float32(0.0))
+        var sph_i = self.entities[i].collider_kind == COLLIDER_SPHERE
+        var sph_j = self.entities[j].collider_kind == COLLIDER_SPHERE
+        var ti = self.entities[i].translation
+        var tj = self.entities[j].translation
+
+        if sph_i and sph_j:
+            var ra = max(Float32(0.05), self.entities[i].collider_half_extents.x * self.entities[i].scale.x)
+            var rb = max(Float32(0.05), self.entities[j].collider_half_extents.x * self.entities[j].scale.x)
+            var delta = tj - ti
+            var dist2 = delta.length_squared()
+            var r_sum = ra + rb
+            if dist2 >= r_sum * r_sum:
+                return none
+            var dist = sqrt(max(Float32(1.0e-8), dist2))
+            var nrm = (delta * (Float32(1.0) / dist)) if dist > Float32(1.0e-4) else Vec3(0.0, 1.0, 0.0)
+            return (True, nrm, r_sum - dist)
+
+        if sph_i or sph_j:
+            var s = i if sph_i else j
+            var b = j if sph_i else i
+            var r = max(Float32(0.05), self.entities[s].collider_half_extents.x * self.entities[s].scale.x)
+            var he = self._collider_half(b)
+            var qb = self.entities[b].rotation
+            var lc = qb.conjugate().rotate(self.entities[s].translation - self.entities[b].translation)
+            var cp = Vec3(max(-he.x, min(he.x, lc.x)), max(-he.y, min(he.y, lc.y)), max(-he.z, min(he.z, lc.z)))
+            var d = lc - cp
+            var d2 = d.length_squared()
+            var n_loc: Vec3
+            var pen: Float32
+            if d2 > Float32(1.0e-10):
+                if d2 >= r * r:
+                    return none
+                var dist = sqrt(d2)
+                n_loc = d * (Float32(1.0) / dist)
+                pen = r - dist
+            else:
+                # Sphere centre inside the box: leave through the nearest face
+                var px = he.x - abs(lc.x)
+                var py = he.y - abs(lc.y)
+                var pz = he.z - abs(lc.z)
+                if py <= px and py <= pz:
+                    n_loc = Vec3(0.0, Float32(1.0) if lc.y >= Float32(0.0) else Float32(-1.0), 0.0)
+                    pen = py + r
+                elif px <= pz:
+                    n_loc = Vec3(Float32(1.0) if lc.x >= Float32(0.0) else Float32(-1.0), 0.0, 0.0)
+                    pen = px + r
+                else:
+                    n_loc = Vec3(0.0, 0.0, Float32(1.0) if lc.z >= Float32(0.0) else Float32(-1.0))
+                    pen = pz + r
+            var n_box_to_sphere = qb.rotate(n_loc)
+            # The normal must point from i to j: box->sphere when j is the sphere, reversed otherwise
+            var nrm = n_box_to_sphere if sph_j else n_box_to_sphere * Float32(-1.0)
+            return (True, nrm, pen)
+
+        # Box vs box: separate the world AABBs of the two oriented boxes along the axis of least overlap
+        var ea = self._world_aabb_half(i)
+        var eb = self._world_aabb_half(j)
+        var delta = tj - ti
+        var ox = ea.x + eb.x - abs(delta.x)
+        var oy = ea.y + eb.y - abs(delta.y)
+        var oz = ea.z + eb.z - abs(delta.z)
+        if ox <= Float32(0.0) or oy <= Float32(0.0) or oz <= Float32(0.0):
+            return none
+        if oy <= ox and oy <= oz:
+            return (True, Vec3(0.0, Float32(1.0) if delta.y >= Float32(0.0) else Float32(-1.0), 0.0), oy)
+        if ox <= oz:
+            return (True, Vec3(Float32(1.0) if delta.x >= Float32(0.0) else Float32(-1.0), 0.0, 0.0), ox)
+        return (True, Vec3(0.0, 0.0, Float32(1.0) if delta.z >= Float32(0.0) else Float32(-1.0)), oz)
+
     def step_physics_deterministic(mut self, ticks: Int = 1, dt: Float32 = Float32(1.0 / 60.0)) -> Int:
         """Advances deterministic IEEE-754 rigid-body dynamics across `ticks` sub-stepped frames."""
         if ticks <= 0:
@@ -1075,15 +1170,10 @@ struct FlintStudioState(Movable, Serializable):
                         if not dyn_a and not dyn_b:
                             continue
 
-                        var ra = max(Float32(0.05), self.entities[i].collider_half_extents.x * self.entities[i].scale.x)
-                        var rb = max(Float32(0.05), self.entities[j].collider_half_extents.x * self.entities[j].scale.x)
-                        var delta = self.entities[j].translation - self.entities[i].translation
-                        var dist2 = delta.length_squared()
-                        var r_sum = ra + rb
-                        if dist2 < r_sum * r_sum:
-                            var dist = sqrt(max(Float32(1.0e-8), dist2))
-                            var nrm = (delta * (Float32(1.0) / dist)) if dist > Float32(1.0e-4) else Vec3(0.0, 1.0, 0.0)
-                            var pen = r_sum - dist
+                        var contact = self._pair_contact(i, j)
+                        if contact[0]:
+                            var nrm = contact[1]
+                            var pen = contact[2]
                             var inv_ma = (Float32(1.0) / self.entities[i].mass) if dyn_a else Float32(0.0)
                             var inv_mb = (Float32(1.0) / self.entities[j].mass) if dyn_b else Float32(0.0)
                             var inv_sum = inv_ma + inv_mb
@@ -1395,6 +1485,18 @@ def build_subd_catmull_torus(
             if iv == 0 or iv == (NV // 2):
                 cage.set_edge_sharpness(a, d, Float32(1.35))
     return subdivide_to_mesh(cage, levels=max(1, min(3, levels)), split_sharp_threshold=Float32(1.8))
+
+
+def is_known_procedural_preset(preset: String) -> Bool:
+    """True when `generate_procedural_forge_model` has a real generator for `preset` (it falls back to a box otherwise)."""
+    for name in [
+        "material_orb", "orb", "SubD_MaterialOrb", "catmull_torus", "torus", "SubD_CatmullTorus",
+        "arch_bay", "colonnade", "ArchKit_Colonnade", "reference_grid", "grid", "Studio_ReferenceGrid",
+        "foliage_sample", "pine", "Botanical_FoliageSample", "oak", "bollard",
+    ]:
+        if preset == name:
+            return True
+    return False
 
 
 def generate_procedural_forge_model(preset: String, seed: Int = 1) -> NativeModel:

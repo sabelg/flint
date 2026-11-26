@@ -570,7 +570,8 @@ struct OnnxModel(Movable):
         var m = ix.shape[0]
         var slots = ix.shape[1]
         if w.rank() != 2 or x.rank() != 2 or ix.rank() != 2 or w.shape[0] != slots * cin or not w.is_float():
-            raise Error("gather-matmul: shape mismatch")
+            # the plan matched Gather -> Reshape -> MatMul by op type only; shapes are known now
+            return self._gather_matmul_unfused(k)
         var n = w.shape[1]
         var idx = List[Float32](length=m * slots, fill=0.0)
         for e in range(m * slots):
@@ -590,6 +591,45 @@ struct OnnxModel(Movable):
         var out = Tensor.zeros([m, n])
         self.gpu.value().gather_matmul(self.values[self.fuse_q[k]].fptr(), rows, cin, idx, m, slots, widx, out.fptr(), n)
         return out^
+
+    def _gather_matmul_unfused(mut self, k: Int) raises -> Tensor:
+        """Runs a fused Gather -> Reshape -> MatMul chain op by op (when its runtime shapes do not fit
+        the gather-GEMM kernel, e.g. an embedding gather with 1-D indices)."""
+        var rv = self.nodes[k].inputs[0]
+        var r = -1
+        for j in range(k):
+            if len(self.nodes[j].outputs) > 0 and self.nodes[j].outputs[0] == rv:
+                r = j
+        if r < 0:
+            raise Error("gather-matmul: reshape node not found")
+        self._ensure_host(self.fuse_q[k])
+        self._ensure_host(self.fuse_k[k])
+        self._ensure_host(self.nodes[k].inputs[1])
+        var gn = -1
+        for j in range(r):
+            if len(self.nodes[j].outputs) > 0 and self.nodes[j].outputs[0] == self.nodes[r].inputs[0]:
+                gn = j
+        var axis = self.nodes[gn].attr_i("axis", 0) if gn >= 0 else 0
+        var g = gather(self.values[self.fuse_q[k]], self.values[self.fuse_k[k]], axis)
+        var want = self.values[self.nodes[r].inputs[1]].int_list()
+        var s = List[Int]()
+        var infer = -1
+        var known = 1
+        for d in range(len(want)):
+            var v = want[d]
+            if v == 0:
+                v = g.shape[d]
+            if v == -1:
+                infer = d
+                s.append(1)
+            else:
+                s.append(v)
+                known *= v
+        if infer >= 0:
+            s[infer] = g.numel() // known if known != 0 else 0
+        if numel_of(s) != g.numel():
+            raise Error("gather-matmul: Reshape " + shape_str(g.shape) + " -> " + shape_str(s))
+        return matmul(self.pool, g.reshaped(s^), self.values[self.nodes[k].inputs[1]])
 
     def _plan_gather_matmul(mut self, uses: List[Int], producer: List[Int]):
         """Gather(X [R, C], idx [N, K], axis 0) -> Reshape [N, K*C] -> MatMul(., static W [K*C, n]):

@@ -71,6 +71,7 @@ from flint.studio.studio_app import (
     SHADING_STYLIZED_VFX,
     FlintStudioState,
     bake_procedural_to_glb,
+    is_known_procedural_preset,
 )
 
 comptime MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -586,11 +587,14 @@ struct McpFrameParseResult(Movable):
     var error_code: Int
     var error_message: String
     var payload: List[UInt8]
+    var recoverable: Bool
+    """True when only the offending newline-delimited line was discarded and the stream can continue."""
 
     def __init__(out self):
         self.has_frame = False
         self.used_content_length = False
         self.protocol_error = False
+        self.recoverable = False
         self.error_code = 0
         self.error_message = String()
         self.payload = List[UInt8]()
@@ -603,6 +607,19 @@ struct McpFrameParseResult(Movable):
         r.error_code = code
         r.error_message = message
         return r^
+
+
+def _is_known_mcp_tool(name: String) -> Bool:
+    """The 16 tools advertised by `tools/list`; keep in sync with `_dispatch_tool_call`."""
+    for t in [
+        "ecs.query_entities", "ecs.spawn_entity", "ecs.patch_components", "ecs.despawn_entity",
+        "render.capture_viewport", "render.inspect_gpu_frame", "render.configure_npr_cel", "render.trigger_post_fx",
+        "assets.list_and_cook", "procedural.generate_asset", "assets.process_mesh", "assets.semantic_search",
+        "physics.step_deterministic", "physics.raycast_query", "studio.pie_control", "studio.undo_redo",
+    ]:
+        if name == t:
+            return True
+    return False
 
 
 def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
@@ -640,10 +657,25 @@ def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
                 break
 
         if not matches_cl:
-            buf.clear()
-            return McpFrameParseResult.fatal(
-                JSONRPC_PARSE_ERROR, "Malformed MCP frame header (expected Content-Length or JSON object)"
+            # Newline-delimited garbage (a JSON array batch, a stray log line): drop just that line and keep
+            # the session alive instead of tearing down an agent's connection over one bad message.
+            var nl = -1
+            for i in range(start, min(len(buf), start + MAX_MCP_MESSAGE_BYTES)):
+                if buf[i] == 10:
+                    nl = i
+                    break
+            if nl < 0:
+                return McpFrameParseResult()  # wait for the line to end (the 4 MiB cap above still applies)
+            var rest = List[UInt8](capacity=len(buf) - (nl + 1))
+            for i in range(nl + 1, len(buf)):
+                rest.append(buf[i])
+            buf = rest^
+            var soft = McpFrameParseResult.fatal(
+                JSONRPC_INVALID_REQUEST,
+                "Invalid MCP message: expected a single JSON-RPC object per line (batches are not supported)",
             )
+            soft.recoverable = True
+            return soft^
 
         if avail < len(cl_prefix):
             return McpFrameParseResult()
@@ -1225,6 +1257,14 @@ struct McpServerV2(Movable):
             var seed = max(1, doc.integer(doc.object_get(args_node, "seed"), 1))
             var do_spawn = doc.boolean(doc.object_get(args_node, "spawn_in_scene"), False)
             var pos_r = _parse_vec3_arg(doc, doc.object_get(args_node, "position"), Vec3(0.0, 0.0, 0.0))
+            if not is_known_procedural_preset(preset):
+                return (
+                    True,
+                    '{"ok":false,"error":' + json_quote(
+                        "unknown preset '" + preset
+                        + "' (expected material_orb, catmull_torus, colonnade, reference_grid, foliage_sample, oak, bollard)"
+                    ) + "}",
+                )
 
             var out_glb = String("")
             if raw_out_glb.byte_length() > 0:
@@ -1293,7 +1333,9 @@ struct McpServerV2(Movable):
 
         # 9. physics.step_deterministic (optional checkpoint output strictly sandboxed inside `workspace_root`)
         if tool_name == "physics.step_deterministic":
-            var ticks = max(1, min(3600, doc.integer(doc.object_get(args_node, "ticks"), 1)))
+            var ticks = doc.integer(doc.object_get(args_node, "ticks"), 1)
+            if ticks < 1 or ticks > 3600:
+                return (True, '{"ok":false,"error":"ticks must be between 1 and 3600"}')
             var dt = Float32(max(0.0005, min(0.1, doc.number(doc.object_get(args_node, "dt"), 1.0 / 60.0))))
             var raw_out_cp = doc.text(doc.object_get(args_node, "output_path"), "")
             var safe_out_cp = String("")
@@ -1327,6 +1369,8 @@ struct McpServerV2(Movable):
             var d_res = _parse_vec3_arg(doc, doc.object_get(args_node, "direction"), Vec3(0.0, -1.0, 0.0))
             if not (o_res[0] and d_res[0]):
                 return (True, '{"ok":false,"error":"origin and direction must be [x,y,z]"}')
+            if d_res[1].length_squared() < Float32(1.0e-12):
+                return (True, '{"ok":false,"error":"direction must be a non-zero vector"}')
             var max_d = Float32(max(0.01, doc.number(doc.object_get(args_node, "max_distance"), 1000.0)))
             var hit = studio.raycast_scene(o_res[1], d_res[1], max_d)
             var ename = String("")
@@ -1347,7 +1391,9 @@ struct McpServerV2(Movable):
         # 11. studio.pie_control
         if tool_name == "studio.pie_control":
             var act = doc.text(doc.object_get(args_node, "action"), "play")
-            var ticks = max(1, min(3600, doc.integer(doc.object_get(args_node, "ticks"), 1)))
+            var ticks = doc.integer(doc.object_get(args_node, "ticks"), 1)
+            if ticks < 1 or ticks > 3600:
+                return (True, '{"ok":false,"error":"ticks must be between 1 and 3600"}')
             var restored_exact = False
             if act == "play":
                 if not studio.pie_play():
@@ -1715,6 +1761,9 @@ struct McpServerV2(Movable):
             var tname = doc.text(doc.object_get(params_node, "name"), "")
             if tname.byte_length() == 0:
                 return _jsonrpc_err(id_raw, JSONRPC_INVALID_PARAMS, "tools/call missing tool name")
+            if not _is_known_mcp_tool(tname):
+                # MCP spec: an unknown tool name is a protocol error (-32602), not a tool result
+                return _jsonrpc_err(id_raw, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tname)
             var args_node = doc.object_get(params_node, "arguments")
             var outcome = self._dispatch_tool_call(
                 tname, doc, args_node, studio, assets, pool, has_renderer, ren_ptr
@@ -1779,6 +1828,8 @@ struct McpServerV2(Movable):
                     var err_bytes = encode_mcp_frame(err_resp, use_content_length=frame.used_content_length)
                     _ = send_all_bounded(1, Int(err_bytes.unsafe_ptr()), len(err_bytes), timeout_ms=2000, is_socket=False)
                     _ = len(err_bytes)
+                    if frame.recoverable:
+                        continue
                     fatal_err = True
                     break
                 if not frame.has_frame:
@@ -1817,6 +1868,29 @@ def _unlink_socket(path: String):
         return
     var owned = path
     _ = external_call["unlink", Int32](owned.as_c_string_span())
+
+
+def _socket_in_use(path: String) -> Bool:
+    """True when something is listening on the `AF_UNIX` socket at `path` (a live Studio or another
+    MCP host). A stale socket left by a crashed process refuses the connection and reads False."""
+    if path.byte_length() == 0 or path.byte_length() > 107:
+        return False
+    var fd = Int(external_call["socket", Int32](_AF_UNIX, _SOCK_STREAM | _SOCK_CLOEXEC, Int32(0)))
+    if fd < 0:
+        return False
+    var addr = _build_sockaddr_un(path)
+    var rc = external_call["connect", Int32](Int32(fd), addr.unsafe_ptr(), UInt32(110))
+    _ = len(addr)
+    close_fd(fd)
+    return rc == 0
+
+
+def _release_socket_path(path: String):
+    """Unlinks `path` on shutdown only if no other process is listening there, so closing one MCP
+    listener (a test, a second Studio) never takes the socket away from a running Studio."""
+    if path.byte_length() == 0 or _socket_in_use(path):
+        return
+    _unlink_socket(path)
 
 
 def _verify_peer_uid(cfd: Int, expected_uid_override: Int = -1) -> Bool:
@@ -1870,7 +1944,7 @@ struct FlintMcpUnixListener(Movable):
         if self.listen_fd >= 0:
             close_fd(self.listen_fd)
         if self.active and self.socket_path.byte_length() > 0:
-            _unlink_socket(self.socket_path)
+            _release_socket_path(self.socket_path)
 
     def start(mut self, socket_path: String = "") -> Bool:
         self.close()
@@ -1889,6 +1963,9 @@ struct FlintMcpUnixListener(Movable):
         # Refuse to unlink or bind over an existing symlink
         var existing = _lstat_mode_uid(target_sock)
         if existing[0] and (existing[1] & _S_IFMT) == _S_IFLNK:
+            return False
+        # Never steal the socket of a running Studio / MCP host; only a stale one is replaced
+        if existing[0] and _socket_in_use(target_sock):
             return False
 
         self.socket_path = target_sock
@@ -1931,7 +2008,7 @@ struct FlintMcpUnixListener(Movable):
             close_fd(self.listen_fd)
             self.listen_fd = -1
         if self.active and self.socket_path.byte_length() > 0:
-            _unlink_socket(self.socket_path)
+            _release_socket_path(self.socket_path)
         self.active = False
 
     def client_count(self) -> Int:
@@ -2011,6 +2088,8 @@ struct FlintMcpUnixListener(Movable):
                     var err_b = encode_mcp_frame(err_resp, use_content_length=frame.used_content_length)
                     _ = send_all_bounded(cfd, Int(err_b.unsafe_ptr()), len(err_b), timeout_ms=500, is_socket=True)
                     _ = len(err_b)
+                    if frame.recoverable:
+                        continue
                     self._drop_client(ci)
                     dropped_in_parse = True
                     break

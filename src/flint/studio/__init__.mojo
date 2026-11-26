@@ -65,6 +65,7 @@ from flint.studio.studio_app import (
     StudioEntityNode,
     StudioRaycastHit,
     bake_procedural_to_glb,
+    is_known_procedural_preset,
     build_studio_reference_grid_mesh,
     build_subd_catmull_torus,
     build_subd_material_orb,
