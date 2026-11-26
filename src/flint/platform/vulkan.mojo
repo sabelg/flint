@@ -554,6 +554,7 @@ struct VulkanGpu(Copyable, Movable):
     var has_sync2: Bool
     var has_bda: Bool
     var has_draw_indirect_count: Bool
+    var has_clip_distance: Bool  # --- sota:shadow hook ---
     var has_ray_query: Bool
     var timeline: Int
     # The side queue, for work beside the frames (GPU meshing): a compute-only
@@ -664,6 +665,7 @@ struct VulkanGpu(Copyable, Movable):
         self.has_sync2 = False
         self.has_bda = False
         self.has_draw_indirect_count = False
+        self.has_clip_distance = False  # --- sota:shadow hook ---
         self.has_ray_query = False
         self.timeline = 0
         self.side_family = 0
@@ -1127,6 +1129,8 @@ struct VulkanGpu(Copyable, Movable):
             put32(feat2 + 16 + 76, get32(q_feat2 + 16 + 76))
             put32(feat2 + 16 + 104, get32(q_feat2 + 16 + 104))
             put32(feat2 + 16 + 116, get32(q_feat2 + 16 + 116))  # shaderStorageImageExtendedFormats
+            put32(feat2 + 16 + 148, get32(q_feat2 + 16 + 148))  # --- sota:shadow hook --- shaderClipDistance
+            self.has_clip_distance = get32(q_feat2 + 16 + 148) != 0  # sota:shadow hook (GPU-driven VSM pages)
 
             # Vulkan 1.2 features
             put32(vk12 + 20, get32(q_vk12 + 20))   # drawIndirectCount

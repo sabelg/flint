@@ -31,6 +31,7 @@ from flint.render.aaa_visbuffer import (
     emit_vec3_normalize,
 )
 from flint.render.aaa_vsm import emit_sample_vsm_depth
+from flint.render.sota_shadow_vsm import emit_sota_shadow_cascade_uv  # --- sota:shadow hook ---
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.aaa_clustered_lights import (
     AAA_CLUSTER_COUNTS_BASE,
@@ -222,16 +223,18 @@ def froxel_inject_and_reproject_shader() -> List[UInt32]:
 
     var sun_vis = s.fvar(s.float(1.0))
     s.begin_if(s.ine(s.bit_and(r_flags, s.uint(1)), s.uint(0)))
-    var lclip = emit_mat4_mul_point(s, b_globals, s.uint(56), wx, wy, wz)
-    var lu = s.fma(lclip[0], s.float(0.5), s.float(0.5))
-    var lv = s.fma(s.fneg(lclip[1]), s.float(0.5), s.float(0.5))
+    # --- sota:shadow hook --- cascade-aware + toroidal lookup (v5 used cascade 0's matrix on the whole table)
+    var cuv = emit_sota_shadow_cascade_uv(s, b_globals, wx, wy, wz)
+    var lu = cuv[2]
+    var lv = cuv[3]
     var in_vsm = s.logical_and(
         s.logical_and(s.fgt(lu, s.float(0.002)), s.flt(lu, s.float(0.998))),
         s.logical_and(s.fgt(lv, s.float(0.002)), s.flt(lv, s.float(0.998))),
     )
-    s.begin_if(s.logical_and(in_vsm, s.flt(lclip[2], s.float(0.999))))
-    var vz_s = emit_sample_vsm_depth(s, b_vsm, vsm_samp, lu, lv)
-    s.store(sun_vis, s.select_f(s.flt(vz_s, s.fsub(lclip[2], s.float(0.0015))), s.float(0.0), s.float(1.0)))
+    s.begin_if(s.logical_and(in_vsm, s.flt(cuv[4], s.float(0.999))))
+    var vz_s = emit_sample_vsm_depth(s, b_vsm, vsm_samp, cuv[0], cuv[1], b_globals)
+    s.store(sun_vis, s.select_f(s.flt(vz_s, s.fsub(cuv[4], s.float(0.0015))), s.float(0.0), s.float(1.0)))
+    # --- end sota:shadow hook ---
     s.end_if()
     s.end_if()
 
@@ -733,12 +736,12 @@ def froxel_raymarch_integrate_shader() -> List[UInt32]:
         # Check overhead VSM occlusion so rain stops cleanly underneath highway overpasses!
         var sky_open = s.fvar(s.float(1.0))
         s.begin_if(s.ine(s.bit_and(r_flags, s.uint(1)), s.uint(0)))
-        var rclip = emit_mat4_mul_point(s, b_globals, s.uint(56), px_c, py_c, pz_c)
-        var rlu = s.fma(rclip[0], s.float(0.5), s.float(0.5))
-        var rlv = s.fma(s.fneg(rclip[1]), s.float(0.5), s.float(0.5))
+        var rcuv = emit_sota_shadow_cascade_uv(s, b_globals, px_c, py_c, pz_c)  # --- sota:shadow hook ---
+        var rlu = rcuv[2]
+        var rlv = rcuv[3]
         s.begin_if(s.logical_and(s.logical_and(s.fgt(rlu, s.float(0.01)), s.flt(rlu, s.float(0.99))), s.logical_and(s.fgt(rlv, s.float(0.01)), s.flt(rlv, s.float(0.99)))))
-        var rvz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, rlu, rlv)
-        s.store(sky_open, s.select_f(s.flt(rvz, s.fsub(rclip[2], s.float(0.008))), s.float(0.15), s.float(1.0)))
+        var rvz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, rcuv[0], rcuv[1], b_globals)
+        s.store(sky_open, s.select_f(s.flt(rvz, s.fsub(rcuv[4], s.float(0.008))), s.float(0.15), s.float(1.0)))
         s.end_if()
         s.end_if()
 

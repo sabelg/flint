@@ -1872,6 +1872,30 @@ struct AaaSpirvModule(Movable):
         emit(self.code, OP_KILL)
         self.label(carry_on)
 
+    # --- sota:shadow hook --- gl_ClipDistance[n] output (vertex stage; needs the shaderClipDistance feature)
+    def write_clip_distances(mut self, values: List[UInt32]):
+        """Declares `float gl_ClipDistance[len(values)]` (BuiltIn ClipDistance, Capability ClipDistance) and stores
+        `values` into it. Call once per vertex shader. A primitive is clipped where a distance is negative."""
+        var n = len(values)
+        if n == 0:
+            return
+        self.capabilities.append(UInt32(32))  # Capability ClipDistance
+        var arr_t = self.fresh()
+        emit(self.globals, OP_TYPE_ARRAY, arr_t, self.type_float, self.uint(UInt32(n)))
+        var ptr_arr = self.fresh()
+        emit(self.globals, OP_TYPE_POINTER, ptr_arr, STORAGE_OUTPUT, arr_t)
+        var var_id = self.fresh()
+        emit(self.globals, OP_VARIABLE, ptr_arr, var_id, STORAGE_OUTPUT)
+        emit(self.decorations, OP_DECORATE, var_id, DECORATION_BUILT_IN, UInt32(3))  # BuiltIn ClipDistance
+        self.interface_vars.append(var_id)
+        var ptr_f = self.fresh()
+        emit(self.globals, OP_TYPE_POINTER, ptr_f, STORAGE_OUTPUT, self.type_float)
+        for i in range(n):
+            var elem = self.fresh()
+            emit(self.code, OP_ACCESS_CHAIN, ptr_f, elem, var_id, self.uint(UInt32(i)))
+            emit(self.code, OP_STORE, elem, values[i])
+    # --- end sota:shadow hook ---
+
     def primitive_id(mut self) -> UInt32:
         """Loads the BuiltIn PrimitiveId (gl_PrimitiveID) for fragment stage primitive indexing."""
         if self.primitive_id_var == 0:

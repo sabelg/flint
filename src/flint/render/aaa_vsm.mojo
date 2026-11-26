@@ -66,6 +66,29 @@ comptime VSM_GLOBALS_CASCADE_1_WORD: Int = 168    # 16 floats: [168..183]
 comptime VSM_GLOBALS_CASCADE_2_WORD: Int = 184    # 16 floats: [184..199]
 comptime VSM_GLOBALS_CASCADE_3_WORD: Int = 200    # 16 floats: [200..215]
 
+# --- sota:shadow hook --- Area G `b_globals` words (in the 216..255 gap after the cascades; 236..243 is Area G's so
+# other areas can take 216..235): 236 toroidal flag, 237..240 per-cascade toroidal slot offsets `ox | oy << 8`,
+# 241..243 contact shadows (length m, thickness m, steps; 0 steps = off). See `sota_shadow_vsm.mojo`.
+comptime SOTA_SHADOW_GLOBALS_TOROIDAL_WORD: Int = 236
+comptime SOTA_SHADOW_GLOBALS_TOROIDAL_OFFSETS_WORD: Int = 237
+comptime SOTA_SHADOW_GLOBALS_CONTACT_WORD: Int = 241
+
+
+def emit_sota_shadow_toroidal_remap(
+    mut s: AaaSpirvModule, b_globals: UInt32, vx: UInt32, vy: UInt32
+) -> Tuple[UInt32, UInt32]:
+    """Table page (vx, vy) in 0..127 -> toroidal slot page when `b_globals[236] != 0` (cascade mode only):
+    slot = (window-local page + cascade offset) mod 64 inside the cascade's quadrant."""
+    var on = s.ine(s.load_word(b_globals, s.uint(UInt32(SOTA_SHADOW_GLOBALS_TOROIDAL_WORD))), s.uint(0))
+    var hx = s.bit_and(vx, s.uint(64))
+    var hy = s.bit_and(vy, s.uint(64))
+    var c = s.iadd(s.shr(hx, s.uint(6)), s.shr(hy, s.uint(5)))
+    var offw = s.load_word(b_globals, s.iadd(s.uint(UInt32(SOTA_SHADOW_GLOBALS_TOROIDAL_OFFSETS_WORD)), c))
+    var sx = s.bit_or(hx, s.bit_and(s.iadd(s.bit_and(vx, s.uint(63)), s.bit_and(offw, s.uint(63))), s.uint(63)))
+    var sy = s.bit_or(hy, s.bit_and(s.iadd(s.bit_and(vy, s.uint(63)), s.bit_and(s.shr(offw, s.uint(8)), s.uint(63))), s.uint(63)))
+    return (s.select_u(on, sx, vx), s.select_u(on, sy, vy))
+# --- end sota:shadow hook ---
+
 
 @always_inline
 def vsm_cascade_quadrant_origin(cascade: Int) -> Tuple[Int, Int]:
@@ -531,11 +554,18 @@ def vsm_mark_pages_shader() -> List[UInt32]:
     var lx_r = s.umin(s.uint(63), s.iadd(lx_u, s.uint(1)))
     var ly_u0 = s.select_u(s.ieq(ly_u, s.uint(0)), s.uint(0), s.isub(ly_u, s.uint(1)))
     var ly_d0 = s.umin(s.uint(63), s.iadd(ly_u, s.uint(1)))
-    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy_c, s.uint(128)), pvx_c)), s.uint(1))
-    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy_c, s.uint(128)), s.iadd(qx, lx_l))), s.uint(1))
-    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(pvy_c, s.uint(128)), s.iadd(qx, lx_r))), s.uint(1))
-    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(s.iadd(qy, ly_u0), s.uint(128)), pvx_c)), s.uint(1))
-    s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(s.iadd(qy, ly_d0), s.uint(128)), pvx_c)), s.uint(1))
+    # --- sota:shadow hook --- request the toroidal slots (identity when b_globals[236] == 0)
+    var mk_x = List[UInt32]()
+    var mk_y = List[UInt32]()
+    mk_x.append(pvx_c); mk_y.append(pvy_c)
+    mk_x.append(s.iadd(qx, lx_l)); mk_y.append(pvy_c)
+    mk_x.append(s.iadd(qx, lx_r)); mk_y.append(pvy_c)
+    mk_x.append(pvx_c); mk_y.append(s.iadd(qy, ly_u0))
+    mk_x.append(pvx_c); mk_y.append(s.iadd(qy, ly_d0))
+    for mk in range(5):
+        var slot = emit_sota_shadow_toroidal_remap(s, b_globals, mk_x[mk], mk_y[mk])
+        s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(slot[1], s.uint(128)), slot[0])), s.uint(1))
+    # --- end sota:shadow hook ---
     s.end_if()
     s.end_if()
 
@@ -726,6 +756,7 @@ def emit_sample_vsm_depth(
     vsm_samp: Tuple[UInt32, UInt32],
     lu: UInt32,
     lv: UInt32,
+    b_globals: UInt32 = 0,  # --- sota:shadow hook --- non-zero: toroidal slot remap (Area G)
 ) -> UInt32:
     """Translates virtual `(lu, lv) in [0..1]^2` through the `128x128` VSM Page Table into the `2048x2048` Physical Atlas."""
     var u_cl = s.nclamp(lu, s.float(0.00005), s.float(0.99995))
@@ -734,6 +765,12 @@ def emit_sample_vsm_depth(
     var sy = s.fmul(v_cl, s.float(128.0))
     var vx = s.umin(s.uint(127), s.saturate_uint(sx))
     var vy = s.umin(s.uint(127), s.saturate_uint(sy))
+    # --- sota:shadow hook ---
+    if b_globals != 0:
+        var slot = emit_sota_shadow_toroidal_remap(s, b_globals, vx, vy)
+        vx = slot[0]
+        vy = slot[1]
+    # --- end sota:shadow hook ---
     var entry = s.load_word(b_vsm, s.iadd(s.imul(vy, s.uint(128)), vx))
 
     var out_z = s.fvar(s.float(1.0))
@@ -825,7 +862,7 @@ def emit_vsm_pcss_shadow(
         var oy = s.fmul(search_r, s.float(r_norm * sin(theta)))
         var tu = s.fmul(s.fadd(q_xf, s.nclamp(s.fadd(lu, ox), s.float(0.0002), s.float(0.9998))), atlas_sc)
         var tv = s.fmul(s.fadd(q_yf, s.nclamp(s.fadd(lv, oy), s.float(0.0002), s.float(0.9998))), atlas_sc)
-        var dz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, tu, tv)
+        var dz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, tu, tv, b_globals)  # sota:shadow hook (toroidal)
         s.begin_if(s.flt(dz, s.fsub(z_rec, z_bias)))
         s.store(blk_sum, s.fadd(s.load_f(blk_sum), dz))
         s.store(blk_cnt, s.fadd(s.load_f(blk_cnt), s.float(1.0)))
@@ -847,7 +884,7 @@ def emit_vsm_pcss_shadow(
         var poy = s.fmul(filter_r, s.float(pr * sin(pth)))
         var ptu = s.fmul(s.fadd(q_xf, s.nclamp(s.fadd(lu, pox), s.float(0.0002), s.float(0.9998))), atlas_sc)
         var ptv = s.fmul(s.fadd(q_yf, s.nclamp(s.fadd(lv, poy), s.float(0.0002), s.float(0.9998))), atlas_sc)
-        var pz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, ptu, ptv)
+        var pz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, ptu, ptv, b_globals)  # sota:shadow hook (toroidal)
         var is_lit = s.select_f(s.flt(pz, s.fsub(z_rec, z_bias)), s.float(0.0), s.float(1.0))
         s.store(lit_sum, s.fadd(s.load_f(lit_sum), is_lit))
 
