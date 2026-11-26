@@ -48,6 +48,13 @@ comptime CMD_DESPAWN: UInt8 = 2
 comptime CMD_INSERT: UInt8 = 3
 comptime CMD_REMOVE: UInt8 = 4
 
+# Removal-event buffers rotate automatically past this many entries, so a World that never calls
+# `update_removal_events()` (no EngineApp) stays bounded.
+comptime REMOVAL_EVENT_SOFT_CAP: Int = 65536
+
+comptime DespawnHookFn = def(Int, Entity) thin -> None
+"""Called as `hook(world_addr, entity)` at the start of `World.despawn`, while `entity` is still alive."""
+
 comptime WORLD_BLOB_TAG: UInt32 = 0x32534345  # "ECS2"
 comptime WORLD_BLOB_VERSION: Int = 3
 
@@ -1935,6 +1942,17 @@ struct World(Movable):
     var archetypes: List[Archetype]
     var chunk_rows: Int
     var restore_epoch: UInt64
+    # One-frame removal / despawn event buffers (current frame + previous frame).
+    var _rm_cur_ent: List[Entity]
+    var _rm_cur_tid: List[Int]
+    var _rm_prev_ent: List[Entity]
+    var _rm_prev_tid: List[Int]
+    var _desp_cur: List[Entity]
+    var _desp_prev: List[Entity]
+    var track_removals: Bool
+    # Pre-despawn hooks (e.g. transform hierarchy link repair), deduplicated by key.
+    var _despawn_hooks: List[DespawnHookFn]
+    var _despawn_hook_keys: List[UInt64]
 
     def __init__(out self, chunk_rows: Int = DEFAULT_CHUNK_ROWS):
         self.entities = List[EntityRecord]()
@@ -1954,6 +1972,15 @@ struct World(Movable):
         var empty_ids = List[Int]()
         var empty_sizes = List[Int]()
         self.archetypes.append(Archetype(0, ComponentBitSet(), empty_ids, empty_sizes, self.chunk_rows))
+        self._rm_cur_ent = List[Entity]()
+        self._rm_cur_tid = List[Int]()
+        self._rm_prev_ent = List[Entity]()
+        self._rm_prev_tid = List[Int]()
+        self._desp_cur = List[Entity]()
+        self._desp_prev = List[Entity]()
+        self.track_removals = True
+        self._despawn_hooks = List[DespawnHookFn]()
+        self._despawn_hook_keys = List[UInt64]()
 
     def __deinit__(deinit self):
         self._drop_all_live_components()
@@ -2334,9 +2361,108 @@ struct World(Movable):
     def spawn(mut self) -> Entity:
         return self.spawn_empty()
 
+    # ---- Removal / Despawn Events & Despawn Hooks ----
+
+    def _record_removed(mut self, entity: Entity, tid: Int):
+        if not self.track_removals:
+            return
+        if len(self._rm_cur_ent) >= REMOVAL_EVENT_SOFT_CAP:
+            swap(self._rm_prev_ent, self._rm_cur_ent)
+            swap(self._rm_prev_tid, self._rm_cur_tid)
+            self._rm_cur_ent.clear()
+            self._rm_cur_tid.clear()
+        self._rm_cur_ent.append(entity)
+        self._rm_cur_tid.append(tid)
+
+    def _record_despawned(mut self, entity: Entity):
+        if not self.track_removals:
+            return
+        if len(self._desp_cur) >= REMOVAL_EVENT_SOFT_CAP:
+            swap(self._desp_prev, self._desp_cur)
+            self._desp_cur.clear()
+        self._desp_cur.append(entity)
+
+    def update_removal_events(mut self):
+        """Ends a frame for removal events: this frame's events become the previous frame's and the
+        previous frame's are dropped. `EngineApp.step_one_frame` calls it once per frame, so an event
+        is visible to every system for one full frame after it happened."""
+        swap(self._rm_prev_ent, self._rm_cur_ent)
+        swap(self._rm_prev_tid, self._rm_cur_tid)
+        swap(self._desp_prev, self._desp_cur)
+        self._rm_cur_ent.clear()
+        self._rm_cur_tid.clear()
+        self._desp_cur.clear()
+
+    def clear_removal_events(mut self):
+        self._rm_cur_ent.clear()
+        self._rm_cur_tid.clear()
+        self._rm_prev_ent.clear()
+        self._rm_prev_tid.clear()
+        self._desp_cur.clear()
+        self._desp_prev.clear()
+
+    def removed_by_type_id(self, tid: Int) -> List[Entity]:
+        """Entities that lost component `tid` (by `remove` or `despawn`) this frame or last frame,
+        oldest first. Despawned entities are no longer alive; removed-only ones still are."""
+        var out = List[Entity]()
+        if tid < 0:
+            return out^
+        for i in range(len(self._rm_prev_ent)):
+            if self._rm_prev_tid[i] == tid:
+                out.append(self._rm_prev_ent[i])
+        for i in range(len(self._rm_cur_ent)):
+            if self._rm_cur_tid[i] == tid:
+                out.append(self._rm_cur_ent[i])
+        return out^
+
+    def removed[C: Component](self) -> List[Entity]:
+        """`Removed<C>`: entities that lost `C` this frame or last frame (see `removed_by_type_id`)."""
+        return self.removed_by_type_id(self.find_component_by_hash(C.COMPONENT_ID))
+
+    def despawned_entities(self) -> List[Entity]:
+        """Entities despawned this frame or last frame, oldest first (handles are already dead)."""
+        var out = List[Entity](capacity=len(self._desp_prev) + len(self._desp_cur))
+        for i in range(len(self._desp_prev)):
+            out.append(self._desp_prev[i])
+        for i in range(len(self._desp_cur)):
+            out.append(self._desp_cur[i])
+        return out^
+
+    def was_despawned(self, entity: Entity) -> Bool:
+        for i in range(len(self._desp_cur)):
+            if self._desp_cur[i] == entity:
+                return True
+        for i in range(len(self._desp_prev)):
+            if self._desp_prev[i] == entity:
+                return True
+        return False
+
+    def add_despawn_hook(mut self, key: UInt64, hook: DespawnHookFn) -> Bool:
+        """Registers `hook` to run at the start of every `despawn` (while the entity is still alive).
+        Idempotent per `key`; returns False when `key` was already registered."""
+        for i in range(len(self._despawn_hook_keys)):
+            if self._despawn_hook_keys[i] == key:
+                return False
+        self._despawn_hook_keys.append(key)
+        self._despawn_hooks.append(hook)
+        return True
+
+    def has_despawn_hook(self, key: UInt64) -> Bool:
+        for i in range(len(self._despawn_hook_keys)):
+            if self._despawn_hook_keys[i] == key:
+                return True
+        return False
+
     def despawn(mut self, entity: Entity) -> Bool:
         if not self.is_alive(entity):
             return False
+        if len(self._despawn_hooks) > 0:
+            var self_addr = Int(Pointer(to=self))
+            for h in range(len(self._despawn_hooks)):
+                var hook = self._despawn_hooks[h]
+                hook(self_addr, entity)
+            if not self.is_alive(entity):
+                return False
         var idx = Int(entity.index)
         var rec_gen = self.entities[idx].generation
         var arch_id = Int(self.entities[idx].archetype_id)
@@ -2347,6 +2473,7 @@ struct World(Movable):
         # Drop table components at row, then swap-remove row in chunk
         for c in range(len(self.archetypes[arch_id].comp_type_ids)):
             var tid = self.archetypes[arch_id].comp_type_ids[c]
+            self._record_removed(entity, tid)
             var info = self.components[tid]
             if info.byte_size > 0:
                 info.drop_at(self.archetypes[arch_id].chunks[ch_idx].cell_ptr(c, row))
@@ -2367,7 +2494,9 @@ struct World(Movable):
                 var sidx = self.comp_to_sparse[stid]
                 if sidx >= 0:
                     _ = self.sparse_sets[sidx].remove(entity.index, self.components[stid])
+                    self._record_removed(entity, stid)
 
+        self._record_despawned(entity)
         var next_gen = _next_entity_gen(rec_gen)
         self.entities[idx] = EntityRecord(next_gen, False, -1, -1, -1, ComponentBitSet())
         self.free_indices.append(entity.index)
@@ -2519,7 +2648,10 @@ struct World(Movable):
                 return False
             self.entities[idx].sparse_mask.clear(tid)
             var sidx = self.comp_to_sparse[tid]
-            return self.sparse_sets[sidx].remove(entity.index, info)
+            var removed_ok = self.sparse_sets[sidx].remove(entity.index, info)
+            if removed_ok:
+                self._record_removed(entity, tid)
+            return removed_ok
 
         var src_arch = Int(self.entities[idx].archetype_id)
         var src_ch = Int(self.entities[idx].chunk_idx)
@@ -2530,6 +2662,7 @@ struct World(Movable):
         _ = self._move_entity_archetype(
             entity, src_arch, src_ch, src_row, dst_arch, tid
         )
+        self._record_removed(entity, tid)
         return True
 
     def remove[C: Component](mut self, entity: Entity) -> Bool:
@@ -3749,6 +3882,7 @@ struct World(Movable):
         self._drop_all_live_components()
         self.current_tick = saved_tick
         self.restore_epoch += 1
+        self.clear_removal_events()
         self.live_entities = saved_live
         self.entities = staged_entities^
         self.free_indices = staged_free^
