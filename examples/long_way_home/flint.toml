@@ -1,0 +1,7 @@
+[project]
+name = "long_way_home"
+version = "0.1.0"
+flint_version = "5.0.0"
+entry = "main.mojo"
+scene = "scenes/thousand_gates.flscn"
+gameplay_plugin = "src/gameplay.mojo"
