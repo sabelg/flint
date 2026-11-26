@@ -47,6 +47,7 @@ from flint.render.aaa_visbuffer import (
 from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AAA_MAT_DET_NONE, AAA_MAT_INTERIOR_PARALLAX
 from flint.render.aaa_vsm import emit_sample_vsm_depth
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
+from flint.render.sota_gi_core import emit_sota_reflection_hit_ambient  # --- sota:gi hook ---
 
 # SPIR-V RayFlagsKHR constants
 comptime RAY_FLAG_NONE_KHR: UInt32 = 0
@@ -1225,12 +1226,18 @@ def emit_rt_textured_hit_shade(
     var amb_r = s.fmul(sh_h[0], sh_scale)
     var amb_g = s.fmul(sh_h[1], sh_scale)
     var amb_b = s.fmul(sh_h[2], sh_scale)
+    # --- sota:gi hook --- (area-B WRC modes: indirect diffuse at the hit from the world radiance cache)
+    var sota_amb = emit_sota_reflection_hit_ambient(s, b_surfcache, hx, hy, hz, hnx, hny, hnz, amb_r, amb_g, amb_b, hit_ao)
+    amb_r = sota_amb[0]
+    amb_g = sota_amb[1]
+    amb_b = sota_amb[2]
+    # --- end sota:gi hook ---
 
     var tot_diff_r = s.fvar(s.fmul(kd_r, s.fadd(sun_ir_r, s.fadd(s.load_f(loc_ir_r), amb_r))))
     var tot_diff_g = s.fvar(s.fmul(kd_g, s.fadd(sun_ir_g, s.fadd(s.load_f(loc_ir_g), amb_g))))
     var tot_diff_b = s.fvar(s.fmul(kd_b, s.fadd(sun_ir_b, s.fadd(s.load_f(loc_ir_b), amb_b))))
 
-    s.begin_if(s.ine(sc_base, s.uint(0xFFFFFF)))
+    s.begin_if(s.logical_and(s.ine(sc_base, s.uint(0xFFFFFF)), sota_amb[3]))  # sota:gi hook (`sota_amb[3]`)
     var sc_w = s.imul(s.iadd(sc_base, prim_id), s.uint(4))
     var scr = s.load_float(b_surfcache, sc_w)
     var scg = s.load_float(b_surfcache, s.iadd(sc_w, s.uint(1)))
