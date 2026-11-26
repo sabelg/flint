@@ -710,12 +710,12 @@ def sota_bench_motion_ghosting(
 
 def sota_bench_geometry_mb(scene: SotaBenchScene) -> Int:
     """Geometry-pool size (MB) for `FlintAaaVulkanRenderer(geometry_mb=...)`: vertices and indices of every
-    primitive with 2x headroom for the QEM LOD levels, never below the v5 default of 32 MB."""
+    primitive with 3x headroom for the QEM LOD levels (2x overflowed the forest), never below the v5 default of 32 MB."""
     var verts = 0
     var idx = 0
     for m in scene.model.meshes:
         verts += m.vertex_count()
         idx += len(m.indices)
-    var v_mb = verts * AAA_VERTEX_BYTES * 2 // (1024 * 1024)
-    var i_mb = idx * 4 * 2 // (1024 * 1024)
+    var v_mb = verts * AAA_VERTEX_BYTES * 3 // (1024 * 1024)
+    var i_mb = idx * 4 * 3 // (1024 * 1024)
     return max(32, max(v_mb, i_mb) + 16)

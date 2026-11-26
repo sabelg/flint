@@ -810,7 +810,7 @@ struct FlintAaaVulkanRenderer(Movable):
         max_draws: Int = 131072,
         max_instances: Int = 32768,
         env_cube_dim: Int = 64,
-        geometry_mb: Int = 32,  # --- sota:perf hook --- vertex + index pools (MB each); meshlets get a quarter
+        geometry_mb: Int = 32,  # --- sota:perf hook --- vertex + index pools (MB each); meshlets get half
     ):
         self.vk = VulkanGpu()
         self.geometry_mb = max(8, geometry_mb)  # --- sota:perf hook ---
@@ -1424,7 +1424,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:perf hook --- geometry pools sized by `geometry_mb` (default 32 MB = v5 sizes)
         self.buf_vertices = self.vk.create_buffer_bda(self.geometry_mb * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
         self.buf_indices = self.vk.create_buffer_bda(self.geometry_mb * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
-        self.buf_meshlets = self.vk.create_buffer(max(8, self.geometry_mb // 4) * 1024 * 1024, local=True)
+        self.buf_meshlets = self.vk.create_buffer((8 if self.geometry_mb <= 32 else self.geometry_mb // 2) * 1024 * 1024, local=True)
         self.buf_materials = self.vk.create_buffer(1024 * AAA_MATERIAL_WORDS * 4, local=True)
         self.buf_vsm_indirect = self.vk.create_buffer(64 + self.max_draws * 16, local=True)
         self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)

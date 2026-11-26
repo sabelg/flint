@@ -164,6 +164,7 @@ def main() raises:
         _ = make_dirs(out_dir)
         var body = String("")
         var rob_all = String("")
+        var notes_all = String("")
         var t0 = get_time()
         for rh in resolutions:
             var cmd = String("'") + String(a[0]) + "'"
@@ -192,6 +193,8 @@ def main() raises:
                     continue
                 if line.startswith("## Dynamic robustness"):
                     in_rob = True
+                elif line.startswith("- "):
+                    notes_all += line + "\n"
                 elif line.startswith("| ") and not line.startswith("| scene"):
                     if in_rob:
                         rob_all += line + "\n"
@@ -204,6 +207,7 @@ def main() raises:
         mdm += "|---|---|---|---|---|---|---|---|---|---|---|\n" + body
         if robust:
             mdm += "\n## Dynamic robustness\n\n| scene | res | light-cut lag (frames) | FLIP 1st frame after cut | FLIP noise floor | ghosting FLIP (moving vs converged) | floor |\n|---|---|---|---|---|---|---|\n" + rob_all
+        mdm += "\n## Denoiser / GI per run\n\n" + notes_all
         var mpath = out_dir + "/bench_" + preset_name0 + ".md"
         var mbytes = List[UInt8](mdm.as_bytes())
         _ = write_bytes(mpath, mbytes)
@@ -216,6 +220,7 @@ def main() raises:
     md += "| scene | res (render) | variant | GPU ms med | p95 | frame period ms | CPU ms | wait ms | VRAM MB | FLIP | top passes (ms) |\n"
     md += "|---|---|---|---|---|---|---|---|---|---|---|\n"
     var rob = String("\n## Dynamic robustness\n\n| scene | res | light-cut lag (frames) | FLIP 1st frame after cut | FLIP noise floor | ghosting FLIP (moving vs converged) | floor |\n|---|---|---|---|---|---|---|\n")
+    var md_notes = String("\n## Denoiser / GI per run\n\n")
     var t_all = get_time()
     var char_path = sota_bench_scene_dir() + "/characters/CesiumMan.glb"
     for s_name in scenes:
@@ -229,6 +234,8 @@ def main() raises:
               + String(len(scene.model.textures)) + " textures, parse+decode " + sota_fmt(get_time() - t_load, 2) + " s")
         print("        bounds (" + sota_fmt(Float64(scene.bmin.x), 2) + ", " + sota_fmt(Float64(scene.bmin.y), 2) + ", " + sota_fmt(Float64(scene.bmin.z), 2)
               + ") - (" + sota_fmt(Float64(scene.bmax.x), 2) + ", " + sota_fmt(Float64(scene.bmax.y), 2) + ", " + sota_fmt(Float64(scene.bmax.z), 2) + ")")
+        print("        camera path: eye " + "(" + sota_fmt(Float64(scene.cam_eye0.x), 2) + ", " + sota_fmt(Float64(scene.cam_eye0.y), 2) + ", " + sota_fmt(Float64(scene.cam_eye0.z), 2) + ")" + " -> tgt " + "(" + sota_fmt(Float64(scene.cam_tgt0.x), 2) + ", " + sota_fmt(Float64(scene.cam_tgt0.y), 2) + ", " + sota_fmt(Float64(scene.cam_tgt0.z), 2) + ")" + "  ..  eye " + "(" + sota_fmt(Float64(scene.cam_eye1.x), 2) + ", " + sota_fmt(Float64(scene.cam_eye1.y), 2) + ", " + sota_fmt(Float64(scene.cam_eye1.z), 2) + ")" + " -> tgt " + "(" + sota_fmt(Float64(scene.cam_tgt1.x), 2) + ", " + sota_fmt(Float64(scene.cam_tgt1.y), 2) + ", " + sota_fmt(Float64(scene.cam_tgt1.z), 2) + ")"
+              + ", fov " + sota_fmt(Float64(scene.fov_deg), 1) + ", sun " + "(" + sota_fmt(Float64(scene.sun_dir.x), 2) + ", " + sota_fmt(Float64(scene.sun_dir.y), 2) + ", " + sota_fmt(Float64(scene.sun_dir.z), 2) + ")")
         var res_list = resolutions.copy()
         if preview:
             res_list.clear()
@@ -251,6 +258,10 @@ def main() raises:
             print("    " + String(rw) + "x" + String(rh) + " (render " + String(ren.render_w) + "x" + String(ren.render_h) + "): upload "
                   + sota_fmt(scene.upload_s, 2) + " s, scene VRAM " + sota_fmt(Float64(vr1[0] - vr0[0]) / 1048576.0, 0) + " MB, geometry pools "
                   + String(gmb) + " MB, overflowed meshes " + String(ren.geometry_overflow_meshes))
+            sota_bench_apply_preset(ren, preset, scene)
+            var den = String("learned (sota_ml, weights v") + String(ren.sota_ml.weights_version) + ")" if ren.sota_ml.enabled else String("SVGF + ReBLUR (sota_ml off)")
+            print("    denoiser: " + den + ", GI mode " + String(ren.sota_gi.mode) + ", rt_gi " + String(ren.enable_rt_gi))
+            md_notes += "- " + s_name + " " + String(rh) + "p: denoiser " + den + ", sota_gi mode " + String(ren.sota_gi.mode) + "\n"
             var chars = SotaBenchCharacters()
             var tag = s_name + "_" + String(rh) + "p_" + preset_name
             if preview:
@@ -317,6 +328,7 @@ def main() raises:
             ren.shutdown()
     if robust:
         md += rob
+    md += md_notes
     if preview:
         return
     var path = out_dir + "/" + (md_name if md_name.byte_length() > 0 else String("bench_") + preset_name + ".md")
