@@ -43,7 +43,17 @@ comptime AAA_CLUSTER_LIGHT_WORDS: Int = 16
 comptime AAA_CLUSTER_LIGHTS_BASE: Int = 16
 comptime AAA_CLUSTER_COUNTS_BASE: Int = 16 + AAA_MAX_CLUSTERED_LIGHTS * AAA_CLUSTER_LIGHT_WORDS  # 16400
 comptime AAA_CLUSTER_INDICES_BASE: Int = AAA_CLUSTER_COUNTS_BASE + AAA_TOTAL_CLUSTERS             # 19856
-comptime AAA_CLUSTER_BUFFER_WORDS: Int = AAA_CLUSTER_INDICES_BASE + AAA_TOTAL_CLUSTERS * AAA_MAX_LIGHTS_PER_CLUSTER  # 241040
+comptime AAA_CLUSTER_LIGHT_LIST_END: Int = AAA_CLUSTER_INDICES_BASE + AAA_TOTAL_CLUSTERS * AAA_MAX_LIGHTS_PER_CLUSTER  # 241040
+# Raster local-light shadow maps (`aaa_raster_fallbacks.mojo`): a region table, then a D32 depth atlas of
+# `AAA_LOCAL_SHADOW_TILE^2` tiles stacked vertically (6 cube faces per point light, 1 frustum per spot light).
+# A light's packed word 7 bits 16..31 hold its region (`0xFFFF` = unshadowed).
+comptime AAA_LOCAL_SHADOW_MAX_REGIONS: Int = 8
+comptime AAA_LOCAL_SHADOW_REGION_WORDS: Int = 12  # first_tile, is_point, near, far, inv_tan, A xyz, T xyz, pad
+comptime AAA_LOCAL_SHADOW_TILE: Int = 256
+comptime AAA_LOCAL_SHADOW_MAX_TILES: Int = 24
+comptime AAA_LOCAL_SHADOW_TABLE_BASE: Int = AAA_CLUSTER_LIGHT_LIST_END
+comptime AAA_LOCAL_SHADOW_ATLAS_BASE: Int = AAA_LOCAL_SHADOW_TABLE_BASE + AAA_LOCAL_SHADOW_MAX_REGIONS * AAA_LOCAL_SHADOW_REGION_WORDS
+comptime AAA_CLUSTER_BUFFER_WORDS: Int = AAA_LOCAL_SHADOW_ATLAS_BASE + AAA_LOCAL_SHADOW_MAX_TILES * AAA_LOCAL_SHADOW_TILE * AAA_LOCAL_SHADOW_TILE
 
 comptime AAA_LIGHT_POINT: UInt32 = 0
 comptime AAA_LIGHT_SPOT: UInt32 = 1
@@ -281,6 +291,174 @@ def allocate_local_light_vsm_regions(mut lights: List[AaaClusterLight], max_shad
         lights[best_i].vsm_region_id = slot
         assigned += 1
     return assigned
+
+
+def local_shadow_point_face_basis(face: Int) -> Tuple[Vec3, Vec3]:
+    """Forward axis `A` and right axis `T` of point-light cube face `face` (`+X, -X, +Y, -Y, +Z, -Z`); the
+    shadow lookup in `emit_local_shadow_visibility` picks the face by the major axis of `surface - light`."""
+    if face == 0:
+        return (Vec3(1.0, 0.0, 0.0), Vec3(0.0, 0.0, -1.0))
+    if face == 1:
+        return (Vec3(-1.0, 0.0, 0.0), Vec3(0.0, 0.0, 1.0))
+    if face == 2:
+        return (Vec3(0.0, 1.0, 0.0), Vec3(1.0, 0.0, 0.0))
+    if face == 3:
+        return (Vec3(0.0, -1.0, 0.0), Vec3(1.0, 0.0, 0.0))
+    if face == 4:
+        return (Vec3(0.0, 0.0, 1.0), Vec3(1.0, 0.0, 0.0))
+    return (Vec3(0.0, 0.0, -1.0), Vec3(-1.0, 0.0, 0.0))
+
+
+def local_shadow_spot_basis(axis: Vec3) -> Tuple[Vec3, Vec3]:
+    """Forward axis `A` (the spot direction) and a right axis `T` perpendicular to it."""
+    var a = axis.normalized() if axis.length() > Float32(1e-6) else Vec3(0.0, -1.0, 0.0)
+    var up_ref = Vec3(1.0, 0.0, 0.0) if abs(a.y) > Float32(0.95) else Vec3(0.0, 1.0, 0.0)
+    var t = up_ref.cross(a).normalized()
+    return (a, t)
+
+
+def local_shadow_light_score(light: AaaClusterLight, cam_pos: Vec3) -> Float32:
+    """Importance of a point/spot light for a shadow map: luminance x radius^2 over the squared distance from the
+    camera to its sphere of influence (`0` for area lights)."""
+    if light.kind != AAA_LIGHT_POINT and light.kind != AAA_LIGHT_SPOT:
+        return Float32(0.0)
+    var lum = light.radiance.x * Float32(0.2126) + light.radiance.y * Float32(0.7152) + light.radiance.z * Float32(0.0722)
+    var d = max(Float32(0.0), (light.position - cam_pos).length() - light.radius) + Float32(1.0)
+    return lum * light.radius * light.radius / (d * d)
+
+
+def select_local_shadow_lights(lights: List[AaaClusterLight], cam_pos: Vec3, max_lights: Int, max_tiles: Int) -> List[Int]:
+    """Indices of the most important point/spot lights that fit `max_lights` regions and `max_tiles` atlas tiles
+    (6 per point light, 1 per spot light), best first; ties keep the lower index."""
+    var out = List[Int]()
+    var tiles = 0
+    var taken = List[Bool](length=len(lights), fill=False)
+    while len(out) < max_lights:
+        var best_i = -1
+        var best_score = Float32(0.0)
+        for i in range(len(lights)):
+            if taken[i]:
+                continue
+            var need = 6 if lights[i].kind == AAA_LIGHT_POINT else 1
+            if tiles + need > max_tiles:
+                continue
+            var sc = local_shadow_light_score(lights[i], cam_pos)
+            if sc > best_score:
+                best_score = sc
+                best_i = i
+        if best_i < 0:
+            break
+        taken[best_i] = True
+        tiles += 6 if lights[best_i].kind == AAA_LIGHT_POINT else 1
+        out.append(best_i)
+    return out^
+
+
+def emit_local_shadow_visibility(
+    mut s: AaaSpirvModule,
+    b_clusters: UInt32,
+    region: UInt32,
+    lpx: UInt32,
+    lpy: UInt32,
+    lpz: UInt32,
+    wx: UInt32,
+    wy: UInt32,
+    wz: UInt32,
+    nx: UInt32,
+    ny: UInt32,
+    nz: UInt32,
+) -> UInt32:
+    """2x2 bilinear PCF visibility of world point `w` in the raster shadow map of local-light region `region`
+    (`1.0` outside the map). Depths are compared as linear distance along the face/spot axis."""
+    var t_base = s.iadd(s.uint(UInt32(AAA_LOCAL_SHADOW_TABLE_BASE)), s.imul(region, s.uint(UInt32(AAA_LOCAL_SHADOW_REGION_WORDS))))
+    var first_tile = s.load_word(b_clusters, t_base)
+    var is_point = s.ine(s.load_word(b_clusters, s.iadd(t_base, s.uint(1))), s.uint(0))
+    var near = s.load_float(b_clusters, s.iadd(t_base, s.uint(2)))
+    var far = s.load_float(b_clusters, s.iadd(t_base, s.uint(3)))
+    var inv_tan = s.load_float(b_clusters, s.iadd(t_base, s.uint(4)))
+    var sax = s.load_float(b_clusters, s.iadd(t_base, s.uint(5)))
+    var say = s.load_float(b_clusters, s.iadd(t_base, s.uint(6)))
+    var saz = s.load_float(b_clusters, s.iadd(t_base, s.uint(7)))
+    var stx = s.load_float(b_clusters, s.iadd(t_base, s.uint(8)))
+    var sty = s.load_float(b_clusters, s.iadd(t_base, s.uint(9)))
+    var stz = s.load_float(b_clusters, s.iadd(t_base, s.uint(10)))
+    var tile_f = s.float(Float32(AAA_LOCAL_SHADOW_TILE))
+
+    # Normal offset of about 1.5 shadow texels at the surface distance
+    var r0x = s.fsub(wx, lpx)
+    var r0y = s.fsub(wy, lpy)
+    var r0z = s.fsub(wz, lpz)
+    var dist = s.fsqrt(s.nmax(s.float(1e-8), s.fma(r0x, r0x, s.fma(r0y, r0y, s.fmul(r0z, r0z)))))
+    var off = s.fdiv(s.fmul(s.float(3.0), dist), s.fmul(s.nmax(inv_tan, s.float(0.1)), tile_f))
+    var rx = s.fma(nx, off, r0x)
+    var ry = s.fma(ny, off, r0y)
+    var rz = s.fma(nz, off, r0z)
+
+    # Point light: cube face by the major axis (bases match `local_shadow_point_face_basis`)
+    var ax = s.fabs(rx)
+    var ay = s.fabs(ry)
+    var az = s.fabs(rz)
+    var x_major = s.logical_and(s.fge(ax, ay), s.fge(ax, az))
+    var y_major = s.logical_and(s.logical_not(x_major), s.fge(ay, az))
+    var sx = s.select_f(s.flt(rx, s.float(0.0)), s.float(-1.0), s.float(1.0))
+    var sy = s.select_f(s.flt(ry, s.float(0.0)), s.float(-1.0), s.float(1.0))
+    var sz = s.select_f(s.flt(rz, s.float(0.0)), s.float(-1.0), s.float(1.0))
+    var pt_u = s.select_f(x_major, s.fneg(s.fmul(sx, rz)), s.select_f(y_major, rx, s.fmul(sz, rx)))
+    var pt_v = s.select_f(x_major, ry, s.select_f(y_major, s.fneg(s.fmul(sy, rz)), ry))
+    var pt_w = s.select_f(x_major, ax, s.select_f(y_major, ay, az))
+    var face = s.select_u(
+        x_major,
+        s.select_u(s.flt(rx, s.float(0.0)), s.uint(1), s.uint(0)),
+        s.select_u(y_major, s.select_u(s.flt(ry, s.float(0.0)), s.uint(3), s.uint(2)), s.select_u(s.flt(rz, s.float(0.0)), s.uint(5), s.uint(4))),
+    )
+    # Spot light: its own frustum
+    var sbx = s.fsub(s.fmul(say, stz), s.fmul(saz, sty))
+    var sby = s.fsub(s.fmul(saz, stx), s.fmul(sax, stz))
+    var sbz = s.fsub(s.fmul(sax, sty), s.fmul(say, stx))
+    var sp_u = s.fma(rx, stx, s.fma(ry, sty, s.fmul(rz, stz)))
+    var sp_v = s.fma(rx, sbx, s.fma(ry, sby, s.fmul(rz, sbz)))
+    var sp_w = s.fma(rx, sax, s.fma(ry, say, s.fmul(rz, saz)))
+
+    var u = s.select_f(is_point, pt_u, sp_u)
+    var v = s.select_f(is_point, pt_v, sp_v)
+    var w = s.select_f(is_point, pt_w, sp_w)
+    var tile = s.iadd(first_tile, s.select_u(is_point, face, s.uint(0)))
+    var vis = s.fvar(s.float(1.0))
+    var inv_w = s.fdiv(s.float(1.0), s.nmax(w, s.float(1e-5)))
+    var ndc_x = s.fmul(s.fmul(u, inv_tan), inv_w)
+    var ndc_y = s.fmul(s.fmul(v, inv_tan), inv_w)
+    var inside = s.logical_and(
+        s.logical_and(s.fgt(w, near), s.flt(w, far)),
+        s.logical_and(s.fle(s.fabs(ndc_x), s.float(1.0)), s.fle(s.fabs(ndc_y), s.float(1.0))),
+    )
+    s.begin_if(inside)
+    var tx = s.fsub(s.fmul(s.fma(ndc_x, s.float(0.5), s.float(0.5)), tile_f), s.float(0.5))
+    var ty = s.fsub(s.fmul(s.fma(ndc_y, s.float(0.5), s.float(0.5)), tile_f), s.float(0.5))
+    var fx0 = s.ffloor(tx)
+    var fy0 = s.ffloor(ty)
+    var frx = s.fsub(tx, fx0)
+    var fry = s.fsub(ty, fy0)
+    var lim = s.float(Float32(AAA_LOCAL_SHADOW_TILE - 1))
+    var x0 = s.saturate_uint(s.nclamp(fx0, s.float(0.0), lim))
+    var x1 = s.saturate_uint(s.nclamp(s.fadd(fx0, s.float(1.0)), s.float(0.0), lim))
+    var y0 = s.saturate_uint(s.nclamp(fy0, s.float(0.0), lim))
+    var y1 = s.saturate_uint(s.nclamp(s.fadd(fy0, s.float(1.0)), s.float(0.0), lim))
+    var row_base = s.iadd(s.uint(UInt32(AAA_LOCAL_SHADOW_ATLAS_BASE)), s.imul(tile, s.uint(UInt32(AAA_LOCAL_SHADOW_TILE * AAA_LOCAL_SHADOW_TILE))))
+    var k = s.fdiv(s.fsub(far, near), s.nmax(far, s.float(1e-4)))
+    var w_test = s.fsub(w, s.fma(w, s.float(0.015), s.float(0.03)))
+    var lit = List[UInt32]()
+    for j in range(2):
+        for i in range(2):
+            var xi = x0 if i == 0 else x1
+            var yi = y0 if j == 0 else y1
+            var d = s.load_float(b_clusters, s.iadd(row_base, s.iadd(s.imul(yi, s.uint(UInt32(AAA_LOCAL_SHADOW_TILE))), xi)))
+            var w_occ = s.fdiv(near, s.nmax(s.float(1e-6), s.fsub(s.float(1.0), s.fmul(d, k))))
+            lit.append(s.select_f(s.fle(w_test, w_occ), s.float(1.0), s.float(0.0)))
+    var top = s.fma(s.fsub(lit[1], lit[0]), frx, lit[0])
+    var bot = s.fma(s.fsub(lit[3], lit[2]), frx, lit[2])
+    s.store(vis, s.fma(s.fsub(bot, top), fry, top))
+    s.end_if()
+    return s.load_f(vis)
 
 
 # ============================================================================
@@ -986,6 +1164,13 @@ def emit_eval_clustered_and_ltc_lights(
     var cos_cone = s.fneg(s.fma(lx, aux_x, s.fma(ly, aux_y, s.fmul(lz, aux_z))))
     var spot_w = s.nclamp(s.fmul(s.fsub(cos_cone, p0_f), p1_f), s.float(0.0), s.float(1.0))
     s.store(atten, s.fmul(s.load_f(atten), s.fmul(spot_w, spot_w)))
+    s.end_if()
+
+    # Raster local-light shadow map (region in word 7 bits 16..31, `0xFFFF` = none)
+    var sh_region = s.shr(s.load_word(b_clusters, s.iadd(l_off, s.uint(7))), s.uint(16))
+    s.begin_if(s.logical_and(s.ult(sh_region, s.uint(UInt32(AAA_LOCAL_SHADOW_MAX_REGIONS))), s.fgt(s.load_f(atten), s.float(0.0))))
+    var sh_vis = emit_local_shadow_visibility(s, b_clusters, sh_region, lpx, lpy, lpz, wx, wy, wz, nx, ny, nz)
+    s.store(atten, s.fmul(s.load_f(atten), sh_vis))
     s.end_if()
 
     var hx = s.fadd(vx, lx); var hy = s.fadd(vy, ly); var hz = s.fadd(vz, lz)
