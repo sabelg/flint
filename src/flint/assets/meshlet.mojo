@@ -1421,13 +1421,106 @@ def simplify_mesh_qem(mesh: NativeMesh, target_tris: Int, lock_boundaries: Bool 
 # 4. Unified `AaaGeometryPool` with Continuous `LOD 0..3` Meshlet Hierarchy
 # ============================================================================
 
+struct GeomFreeList(Copyable, Movable):
+    """Sorted, coalescing free ranges `[start, start + len)` with first-fit allocation."""
+    var starts: List[Int]
+    var lens: List[Int]
+
+    def __init__(out self):
+        self.starts = List[Int]()
+        self.lens = List[Int]()
+
+    def total(self) -> Int:
+        var t = 0
+        for l in self.lens:
+            t += l
+        return t
+
+    def count(self) -> Int:
+        return len(self.starts)
+
+    def alloc(mut self, n: Int) -> Int:
+        """First fit: the start of a free run of `n` units, or -1."""
+        if n <= 0:
+            return -1
+        for i in range(len(self.starts)):
+            if self.lens[i] >= n:
+                var s = self.starts[i]
+                if self.lens[i] == n:
+                    _ = self.starts.pop(i)
+                    _ = self.lens.pop(i)
+                else:
+                    self.starts[i] = s + n
+                    self.lens[i] = self.lens[i] - n
+                return s
+        return -1
+
+    def free(mut self, start: Int, n: Int):
+        if n <= 0:
+            return
+        var pos = 0
+        while pos < len(self.starts) and self.starts[pos] < start:
+            pos += 1
+        self.starts.insert(pos, start)
+        self.lens.insert(pos, n)
+        # Merge with the next run, then with the previous one.
+        if pos + 1 < len(self.starts) and self.starts[pos] + self.lens[pos] == self.starts[pos + 1]:
+            self.lens[pos] = self.lens[pos] + self.lens[pos + 1]
+            _ = self.starts.pop(pos + 1)
+            _ = self.lens.pop(pos + 1)
+        if pos > 0 and self.starts[pos - 1] + self.lens[pos - 1] == self.starts[pos]:
+            self.lens[pos - 1] = self.lens[pos - 1] + self.lens[pos]
+            _ = self.starts.pop(pos)
+            _ = self.lens.pop(pos)
+
+    def trim_tail(mut self, end: Int) -> Int:
+        """If the last free run ends at `end`, drops it and returns its start (the new end); else `end`."""
+        var n = len(self.starts)
+        if n > 0 and self.starts[n - 1] + self.lens[n - 1] == end:
+            var s = self.starts[n - 1]
+            _ = self.starts.pop()
+            _ = self.lens.pop()
+            return s
+        return end
+
+
+struct GeomMeshSpan(Copyable, ImplicitlyCopyable, Movable):
+    """Where one mesh (all LODs) lives in the pool: vertices, index words and meshlets are each contiguous."""
+    var first_vertex: Int
+    var vertex_count: Int
+    var first_index: Int
+    var index_count: Int
+    var first_meshlet: Int
+    var meshlet_count: Int
+    var live: Bool
+
+    def __init__(out self):
+        self.first_vertex = 0
+        self.vertex_count = 0
+        self.first_index = 0
+        self.index_count = 0
+        self.first_meshlet = 0
+        self.meshlet_count = 0
+        self.live = False
+
+
 struct AaaGeometryPool(Movable):
-    """Unified CPU-side staging pool for GPU Vertex, Triangle Index & Meshlet SSBOs + BLAS inputs."""
+    """Unified CPU-side staging pool for GPU Vertex, Triangle Index & Meshlet SSBOs + BLAS inputs.
+
+    Meshes can be removed (`remove_mesh`); their ranges go to per-array free lists and
+    `append_mesh_reusing` places new meshes into freed ranges when they fit (else at the tail).
+    Mesh ids stay stable: a removed id keeps an empty entry that draws nothing."""
     var vertex_words: List[UInt32]
     var index_words: List[UInt32]
     var meshlet_words: List[UInt32]
     var meshlets: List[MeshletCluster]
     var meshes: List[CookedMeshEntry]
+    var mesh_spans: List[GeomMeshSpan]  # per mesh_id; shorter than `meshes` for pools filled by hand
+    var free_vertices: GeomFreeList  # in vertices
+    var free_indices: GeomFreeList  # in index words (multiples of 3)
+    var free_meshlets: GeomFreeList  # in meshlets
+    var last_written: GeomMeshSpan  # ranges written by the last append (what the GPU must upload)
+    var relocated_meshes: Int
 
     def __init__(out self):
         self.vertex_words = List[UInt32]()
@@ -1435,6 +1528,137 @@ struct AaaGeometryPool(Movable):
         self.meshlet_words = List[UInt32]()
         self.meshlets = List[MeshletCluster]()
         self.meshes = List[CookedMeshEntry]()
+        self.mesh_spans = List[GeomMeshSpan]()
+        self.free_vertices = GeomFreeList()
+        self.free_indices = GeomFreeList()
+        self.free_meshlets = GeomFreeList()
+        self.last_written = GeomMeshSpan()
+        self.relocated_meshes = 0
+
+    def is_mesh_live(self, mesh_id: Int) -> Bool:
+        if mesh_id < 0 or mesh_id >= len(self.meshes):
+            return False
+        if mesh_id < len(self.mesh_spans):
+            return self.mesh_spans[mesh_id].live
+        return True  # filled by hand: live, but not removable
+
+    def live_mesh_count(self) -> Int:
+        var n = 0
+        for i in range(len(self.meshes)):
+            if self.is_mesh_live(i):
+                n += 1
+        return n
+
+    def free_vertex_count(self) -> Int:
+        return self.free_vertices.total()
+
+    def _record_span(mut self, mesh_id: Int, v0: Int, i0: Int, m0: Int):
+        """Records the tail ranges appended since lengths `(v0 vertices, i0 index words, m0 meshlets)`."""
+        var sp = GeomMeshSpan()
+        sp.first_vertex = v0
+        sp.vertex_count = self.total_vertices() - v0
+        sp.first_index = i0
+        sp.index_count = len(self.index_words) - i0
+        sp.first_meshlet = m0
+        sp.meshlet_count = len(self.meshlets) - m0
+        sp.live = True
+        while len(self.mesh_spans) < mesh_id:
+            self.mesh_spans.append(GeomMeshSpan())  # hand-filled meshes before this one
+        if mesh_id == len(self.mesh_spans):
+            self.mesh_spans.append(sp)
+        elif mesh_id < len(self.mesh_spans):
+            self.mesh_spans[mesh_id] = sp
+        self.last_written = sp
+
+    def remove_mesh(mut self, mesh_id: Int) -> Bool:
+        """Frees the mesh's vertex, index and meshlet ranges for reuse and empties its entry.
+        The caller must make sure no in-flight GPU frame still reads those ranges (the renderer defers
+        this call until the frames that drew the mesh retire)."""
+        if mesh_id < 0 or mesh_id >= len(self.mesh_spans) or not self.mesh_spans[mesh_id].live:
+            return False
+        var sp = self.mesh_spans[mesh_id]
+        self.free_vertices.free(sp.first_vertex, sp.vertex_count)
+        self.free_indices.free(sp.first_index, sp.index_count)
+        self.free_meshlets.free(sp.first_meshlet, sp.meshlet_count)
+        self.mesh_spans[mesh_id].live = False
+        # Free runs at the end of an array shrink the array instead.
+        var v_end = self.free_vertices.trim_tail(self.total_vertices())
+        if v_end < self.total_vertices():
+            self.vertex_words.resize(v_end * AAA_VERTEX_WORDS, 0)
+        var i_end = self.free_indices.trim_tail(len(self.index_words))
+        if i_end < len(self.index_words):
+            self.index_words.resize(i_end, 0)
+        var m_end = self.free_meshlets.trim_tail(len(self.meshlets))
+        if m_end < len(self.meshlets):
+            while len(self.meshlets) > m_end:
+                _ = self.meshlets.pop()
+            self.meshlet_words.resize(m_end * AAA_MESHLET_WORDS, 0)
+        var empty = CookedMeshEntry()
+        empty.mesh_id = mesh_id
+        empty.material_id = self.meshes[mesh_id].material_id
+        empty.lod_count = 0
+        self.meshes[mesh_id] = empty^
+        return True
+
+    def append_mesh_reusing(mut self, mesh: NativeMesh, material_id: Int, build_lods: Bool = False) -> CookedMeshEntry:
+        """As `append_mesh`, then moves each of the mesh's three ranges into a freed range that fits.
+        `last_written` says where the data ended up (upload exactly those ranges)."""
+        var entry = self.append_mesh(mesh, material_id, build_lods)
+        if entry.vertex_count <= 0 or entry.mesh_id >= len(self.mesh_spans):
+            return entry^
+        var sp = self.mesh_spans[entry.mesh_id]
+        var moved = False
+        # Vertices: copy, rebase the mesh's index words, shrink the tail.
+        var dst_v = self.free_vertices.alloc(sp.vertex_count)
+        if dst_v >= 0:
+            var src_w = sp.first_vertex * AAA_VERTEX_WORDS
+            var dst_w = dst_v * AAA_VERTEX_WORDS
+            for k in range(sp.vertex_count * AAA_VERTEX_WORDS):
+                self.vertex_words[dst_w + k] = self.vertex_words[src_w + k]
+            for k in range(sp.first_index, sp.first_index + sp.index_count):
+                self.index_words[k] = UInt32(Int(self.index_words[k]) - sp.first_vertex + dst_v)
+            self.vertex_words.resize(src_w, 0)
+            entry.first_vertex = entry.first_vertex - sp.first_vertex + dst_v
+            sp.first_vertex = dst_v
+            moved = True
+        # Index words: copy, rebase the meshlets' first triangle, shrink the tail.
+        var dst_i = self.free_indices.alloc(sp.index_count)
+        if dst_i >= 0:
+            for k in range(sp.index_count):
+                self.index_words[dst_i + k] = self.index_words[sp.first_index + k]
+            var dt = (dst_i - sp.first_index) // 3
+            for m in range(sp.first_meshlet, sp.first_meshlet + sp.meshlet_count):
+                self.meshlets[m].first_tri += dt
+                self.meshlet_words[m * AAA_MESHLET_WORDS + 8] = UInt32(self.meshlets[m].first_tri)
+            self.index_words.resize(sp.first_index, 0)
+            entry.first_index = entry.first_index - sp.first_index + dst_i
+            sp.first_index = dst_i
+            moved = True
+        # Meshlets: copy clusters and words, rebase the entry's LOD slices, shrink the tail.
+        var dst_m = self.free_meshlets.alloc(sp.meshlet_count)
+        if dst_m >= 0:
+            for k in range(sp.meshlet_count):
+                self.meshlets[dst_m + k] = self.meshlets[sp.first_meshlet + k].copy()
+                for w in range(AAA_MESHLET_WORDS):
+                    self.meshlet_words[(dst_m + k) * AAA_MESHLET_WORDS + w] = self.meshlet_words[
+                        (sp.first_meshlet + k) * AAA_MESHLET_WORDS + w
+                    ]
+            while len(self.meshlets) > sp.first_meshlet:
+                _ = self.meshlets.pop()
+            self.meshlet_words.resize(sp.first_meshlet * AAA_MESHLET_WORDS, 0)
+            var dm = dst_m - sp.first_meshlet
+            entry.first_meshlet += dm
+            for l in range(entry.lod_count):
+                var s = entry.lods[l]
+                entry.lods[l] = MeshLodSlice(s.first_meshlet + dm, s.meshlet_count, s.triangle_count, s.object_error)
+            sp.first_meshlet = dst_m
+            moved = True
+        if moved:
+            self.relocated_meshes += 1
+        self.mesh_spans[entry.mesh_id] = sp
+        self.last_written = sp
+        self.meshes[entry.mesh_id] = entry.copy()
+        return entry^
 
     def total_vertices(self) -> Int:
         return len(self.vertex_words) // AAA_VERTEX_WORDS
@@ -1687,6 +1911,9 @@ struct AaaGeometryPool(Movable):
             return entry^
 
         var mesh_id = len(self.meshes)
+        var span_v0 = self.total_vertices()
+        var span_i0 = len(self.index_words)
+        var span_m0 = len(self.meshlets)
 
         if not build_lods or raw_tris < 32:
             var s0 = self._append_single_lod_geometry_ex(
@@ -1706,6 +1933,7 @@ struct AaaGeometryPool(Movable):
             entry.bounds_center = s0[6]
             entry.bounds_radius = s0[7]
             self.meshes.append(entry.copy())
+            self._record_span(mesh_id, span_v0, span_i0, span_m0)
             return entry^
 
         # Build continuous QEM `LOD 0..3` chain (`100% -> 50% -> 25% -> 12.5%`) with strictly monotonic errors!
@@ -1779,6 +2007,7 @@ struct AaaGeometryPool(Movable):
         entry.meshlet_count = len(self.meshlets) - first_ml_all
         entry.lod_count = n_lods
         self.meshes.append(entry.copy())
+        self._record_span(mesh_id, span_v0, span_i0, span_m0)
         return entry^
 
     def _emit_meshlet(

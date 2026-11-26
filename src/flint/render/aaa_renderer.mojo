@@ -28,7 +28,13 @@ from flint.assets.bc_compress import (
     encode_bc6h_hdr,
     encode_bc7_rgba,
 )
-from flint.assets.meshlet import AAA_VERTEX_BYTES, AAA_MESHLET_WORDS, AaaGeometryPool, CookedMeshEntry
+from flint.assets.meshlet import AAA_VERTEX_BYTES, AAA_MESHLET_WORDS, AaaGeometryPool, CookedMeshEntry, GeomMeshSpan
+from flint.render.aaa_gpu_robustness import (
+    AaaDynamicResolution,
+    AaaGpuRobustness,
+    Bc7MipChain,
+    encode_bc7_mip_chain,
+)
 from flint.platform.amdgpu import GpuBuffer
 from flint.platform.vulkan import (
     ACCESS_AS_READ_KHR,
@@ -1076,6 +1082,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var star_intensity: Float32
     var sky_zenith_clear: Vec3
     var sky_horizon_clear: Vec3
+    var gpu_robust: AaaGpuRobustness  # device loss, async uploads, deferred mesh removal (aaa_gpu_robustness.mojo)
 
     def __init__(
         out self,
@@ -1424,6 +1431,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.star_intensity = Float32(0.0)
         self.sky_zenith_clear = Vec3(0.0, 0.0, 0.0)
         self.sky_horizon_clear = Vec3(0.0, 0.0, 0.0)
+        self.gpu_robust = AaaGpuRobustness()
 
         self.active = self._init_vulkan_pipeline()
 
@@ -2528,6 +2536,8 @@ struct FlintAaaVulkanRenderer(Movable):
         var eff_w = max(1, width)
         var eff_h = max(1, height)
         var eff_mips = max(1, min(16, mip_count))
+        # Streamed textures are optional: refused over the VRAM budget instead of pushing other memory out.
+        self.vk.begin_soft_allocations()
         var img = self.vk.create_image_2d(
             eff_w,
             eff_h,
@@ -2535,7 +2545,9 @@ struct FlintAaaVulkanRenderer(Movable):
             IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED,
             mip_levels=eff_mips,
         )
+        self.vk.end_soft_allocations()
         if img.image == 0:
+            self.gpu_robust.oom_fallbacks += 1
             return -1
         var vram_sz = img.memory_bytes
         var slot: Int
@@ -2552,6 +2564,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.bindless_resident_min_mip[slot] = eff_mips
         self.bindless_vram_bytes[slot] = vram_sz
         self.bindless_layouts_init[slot] = False
+        self.gpu_robust.streamed_slots.append(slot)
         return slot
 
     def upload_bindless_mip_staged(
@@ -2720,53 +2733,47 @@ struct FlintAaaVulkanRenderer(Movable):
         srgb: Bool = True,
         generate_mips: Bool = True,
     ) -> Int:
-        """Compresses `0xAARRGGBB` pixels into a `BC7` mipmap pyramid and binds to `BIND_AAA_BINDLESS_TEX`!"""
+        """Compresses `0xAARRGGBB` pixels into a `BC7` mipmap pyramid and binds to `BIND_AAA_BINDLESS_TEX`!
+        To keep the encode off the frame thread, call `encode_bc7_mip_chain[_parallel]` on a loader
+        thread and hand the result to `upload_bc7_mip_chain`."""
         if len(self.bindless_images) >= AAA_MAX_BINDLESS:
             return -1
-        var mips = 1
-        if generate_mips:
-            var d = min(width, height)
-            while d > 4 and mips < 8:
-                d >>= 1
-                mips += 1
+        var chain = encode_bc7_mip_chain(pixels_argb, width, height, generate_mips)
+        return self.upload_bc7_mip_chain(chain, srgb)
 
-        var fmt = FORMAT_BC7_SRGB if srgb else FORMAT_BC7_UNORM
-        var img = self.vk.create_image_2d(width, height, fmt, IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED, mip_levels=mips)
-        if img.image == 0:
+    def upload_bc7_mip_chain(mut self, chain: Bc7MipChain, srgb: Bool = True) -> Int:
+        """Uploads a pre-encoded BC7 pyramid through the async upload queue (no fence wait) and binds it
+        to the next bindless slot. On out-of-memory it evicts streamed textures once and retries."""
+        if len(self.bindless_images) >= AAA_MAX_BINDLESS or not chain.valid() or self.vk.device == 0:
             return -1
-
-        var cur_px = pixels_argb.copy()
-        var cw = width
-        var ch = height
-        var mip_offsets = List[Int]()
-        var mip_dims = List[Tuple[Int, Int]]()
-        var st_off = 0
-
-        self._wait_cmd_slot0()
-        for m in range(mips):
-            var bc7 = encode_bc7_rgba(cur_px, cw, ch)
-            self.ensure_staging_capacity(st_off + len(bc7))
-            _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_off, Int(bc7.unsafe_ptr()), len(bc7))
-            mip_offsets.append(st_off)
-            mip_dims.append((cw, ch))
-            st_off += (len(bc7) + 15) & ~15
-            _ = len(bc7)
-            if m + 1 < mips:
-                var ds = downsample_argb_2x(cur_px, cw, ch)
-                cur_px = ds[0].copy()
-                cw = ds[1]
-                ch = ds[2]
-
-        if not self.vk.begin_commands(0):
+        var mips = chain.mip_count()
+        var fmt = FORMAT_BC7_SRGB if srgb else FORMAT_BC7_UNORM
+        var img = self.vk.create_image_2d(chain.width, chain.height, fmt, IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED, mip_levels=mips)
+        if img.image == 0 and self._evict_streamed_for_memory():
+            img = self.vk.create_image_2d(chain.width, chain.height, fmt, IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED, mip_levels=mips)
+        if img.image == 0:
+            self.gpu_robust.oom_fallbacks += 1
+            return -1
+        var staging = self.vk.create_buffer(len(chain.data), local=False)
+        if staging.cpu_address == 0:
+            if staging.size > 0:
+                self.vk.destroy_buffer(staging)
+            self.vk.destroy_image(img)
+            self.gpu_robust.oom_fallbacks += 1
+            return -1
+        _ = external_call["memcpy", Int](staging.cpu_address, Int(chain.data.unsafe_ptr()), len(chain.data))
+        var cmd = self.gpu_robust.uploads.begin(self.vk)
+        if cmd < 0:
+            self.vk.destroy_buffer(staging)
             self.vk.destroy_image(img)
             return -1
-        self.vk.transition_image(0, img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
+        self.vk.transition_image(cmd, img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
         for m in range(mips):
-            self.vk.upload_image_mip(0, img, self.buf_staging, mip_offsets[m], m, mip_dims[m][0], mip_dims[m][1])
-        self.vk.transition_image(0, img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
-        var f = self.vk.submit(0)
-        if f != 0:
-            _ = self.vk.wait(f)
+            self.vk.upload_image_mip(cmd, img, staging, chain.offsets[m], m, chain.widths[m], chain.heights[m])
+        self.vk.transition_image(cmd, img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
+        var retire = List[GpuBuffer]()
+        retire.append(staging^)
+        _ = self.gpu_robust.uploads.submit(self.vk, cmd, retire^)
 
         var slot = len(self.bindless_images)
         var view = img.view
@@ -3407,12 +3414,10 @@ struct FlintAaaVulkanRenderer(Movable):
         allow_update: Bool = False,
         expand_bounds: Float32 = 0.0,
     ) -> CookedMeshEntry:
-        """Partitions `mesh` into 64v/124t GPU Meshlets (and optional `QEM` `LOD 0..3` DAG), uploads SSBOs, and builds `BLAS`!"""
-        var v_words_before = len(self.geom.vertex_words)
-        var i_words_before = len(self.geom.index_words)
-        var m_words_before = len(self.geom.meshlet_words)
-
-        var entry = self.geom.append_mesh(mesh, material_id, build_lods=build_lods)
+        """Partitions `mesh` into 64v/124t GPU Meshlets (and optional `QEM` `LOD 0..3` DAG), uploads SSBOs, and builds `BLAS`!
+        Reuses geometry ranges freed by `remove_mesh`, and uploads + builds the BLAS through the async upload
+        queue: no device-wait-idle (only a storage-buffer growth, which doubles, still waits)."""
+        var entry = self.geom.append_mesh_reusing(mesh, material_id, build_lods=build_lods)
         if expand_bounds > Float32(0.0):
             for m_idx in range(entry.first_meshlet, entry.first_meshlet + entry.meshlet_count):
                 var w_rad = self.geom.meshlets[m_idx].radius + expand_bounds
@@ -3421,83 +3426,13 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.geom.meshlet_words[m_idx * 12 + 3] = bitcast[DType.uint32](w_rad)
                 self.geom.meshlet_words[m_idx * 12 + 7] = bitcast[DType.uint32](Float32(2.0))
 
-        var vb_start = v_words_before * 4
-        var vb_len = (len(self.geom.vertex_words) - v_words_before) * 4
-        var ib_start = i_words_before * 4
-        var ib_len = (len(self.geom.index_words) - i_words_before) * 4
-        var mb_start = m_words_before * 4
-        var mb_len = (len(self.geom.meshlet_words) - m_words_before) * 4
-        var ok_vb = self._grow_storage_buffer(vb_start + vb_len, BIND_AAA_VERTICES, BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
-        var ok_ib = self._grow_storage_buffer(ib_start + ib_len, BIND_AAA_INDICES, BUFFER_USAGE_INDEX | BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
-        var ok_mb = self._grow_storage_buffer(mb_start + mb_len, BIND_AAA_MESHLETS, 0, False, True)
-        var grow_ok = ok_vb and ok_ib and ok_mb
-
-        var st_vb = 0
-        var st_ib = (vb_len + 15) & ~15
-        var st_mb = st_ib + ((ib_len + 15) & ~15)
-        var total_st = st_mb + ((mb_len + 15) & ~15)
         var is_am_mesh = (mesh.alpha_mode == 1) or (
             material_id >= 0 and material_id < len(self.materials) and self.materials[material_id].is_alpha_masked()
         )
         var need_blas = self.vk.has_ray_query and entry.triangle_count > 0 and entry.vertex_count > 0
-        if grow_ok and (total_st > 0 or need_blas):
-            if need_blas:
-                self._wait_all_in_flight()
-            else:
-                self._wait_cmd_slot0()
-        if grow_ok and total_st > 0:
-            self.ensure_staging_capacity(total_st)
-            if vb_len > 0:
-                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_vb, Int(self.geom.vertex_words.unsafe_ptr()) + vb_start, vb_len)
-            if ib_len > 0:
-                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_ib, Int(self.geom.index_words.unsafe_ptr()) + ib_start, ib_len)
-            if mb_len > 0:
-                _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_mb, Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start, mb_len)
-
-        if grow_ok and (total_st > 0 or need_blas) and self.vk.begin_commands(0):
-            if vb_len > 0:
-                self.vk.copy_buffer(0, self.buf_staging, st_vb, self.buf_vertices, vb_start, vb_len)
-            if ib_len > 0:
-                self.vk.copy_buffer(0, self.buf_staging, st_ib, self.buf_indices, ib_start, ib_len)
-            if mb_len > 0:
-                self.vk.copy_buffer(0, self.buf_staging, st_mb, self.buf_meshlets, mb_start, mb_len)
-            if total_st > 0:
-                self.vk.memory_barrier2(
-                    0,
-                    PIPELINE_TRANSFER,
-                    Int(ACCESS_TRANSFER_WRITE),
-                    PIPELINE_ALL_COMMANDS,
-                    Int(ACCESS_MEMORY_READ | ACCESS_SHADER_READ | ACCESS_INDIRECT_READ | ACCESS_AS_READ_KHR),
-                )
-            if need_blas:
-                var v_addr = self.vk.buffer_device_address(self.buf_vertices)
-                var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
-                var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
-                var blas = build_blas_triangles_ex(
-                    self.vk,
-                    0,
-                    v_addr,
-                    AAA_VERTEX_BYTES,
-                    max_v,
-                    i_addr,
-                    entry.triangle_count,
-                    self.buf_as_scratch,
-                    allow_update=allow_update,
-                    opaque=not is_am_mesh,
-                )
-                self.vk.memory_barrier2(
-                    0,
-                    PIPELINE_AS_BUILD_KHR,
-                    Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR),
-                    PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
-                    Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
-                )
-                self.mesh_blas.append(blas^)
-            else:
-                self.mesh_blas.append(VulkanAccelStruct())
-            var f = self.vk.submit(0)
-            if f != 0:
-                _ = self.vk.wait(f)
+        if entry.vertex_count > 0:
+            var sp = self.geom.last_written
+            self.mesh_blas.append(self._upload_mesh_ranges(sp, entry, need_blas, allow_update, not is_am_mesh))
         else:
             self.mesh_blas.append(VulkanAccelStruct())
 
@@ -3506,6 +3441,12 @@ struct FlintAaaVulkanRenderer(Movable):
         self.mesh_double_sided_flags.append(mesh.double_sided or is_am_mesh)
         self.mesh_alpha_masked_flags.append(is_am_mesh)
         self.vsm.invalidate_all()
+        if self.gpu_robust.last_upload_failed and entry.vertex_count > 0:
+            # Out of memory: the mesh never reached the GPU. Hide it and give its ranges back;
+            # `entry.lod_count == 0` tells the caller (retry later, or use a lower LOD).
+            self._retire_mesh(entry.mesh_id)
+            entry.lod_count = 0
+            entry.meshlet_count = 0
         return entry^
 
     def add_splat_mesh(
@@ -5180,7 +5121,12 @@ struct FlintAaaVulkanRenderer(Movable):
         uniform_scale: Float32 = 1.0,
         has_prev: Bool = False,
     ):
-        if len(self.frame_instances) < self.max_instances and mesh_id >= 0 and mesh_id < len(self.geom.meshes):
+        if (
+            len(self.frame_instances) < self.max_instances
+            and mesh_id >= 0
+            and mesh_id < len(self.geom.meshes)
+            and self.geom.meshes[mesh_id].lod_count > 0  # 0 = removed (`remove_mesh`)
+        ):
             self.frame_instances.append(
                 AaaDrawInstance(mesh_id, world_mat, prev_world_mat, material_override, uniform_scale, has_prev)
             )
@@ -5663,6 +5609,8 @@ struct FlintAaaVulkanRenderer(Movable):
 
     def render_frame(mut self, capture_readback: Bool = False, force_readback: Bool = False) -> Bool:
         if not self.active:
+            return False
+        if not self._robust_frame_tick():
             return False
 
         # Deferred readback: retire the previous frame first (no-op in the default synchronous mode). Waiting here,
@@ -8494,6 +8442,466 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.destroy_buffer(rb)
         return out^
 
+    # ------------------------------------------------------------------------------------------
+    # GPU robustness: device loss + recovery, deferred mesh removal, async geometry upload,
+    # OOM fallbacks and runtime render scale. State lives in `self.gpu_robust`.
+    # ------------------------------------------------------------------------------------------
+
+    def is_device_lost(self) -> Bool:
+        """True after a submit, wait, acquire or present reported VK_ERROR_DEVICE_LOST (or the fault hook
+        simulated it). `render_frame` then returns False until `recover_from_device_loss` succeeds."""
+        return self.vk.is_device_lost()
+
+    def device_generation(self) -> Int:
+        """Bumps on every successful recovery: textures, IBL, VAT clips and skinned meshes must be
+        uploaded again by their owners (geometry and materials are restored automatically)."""
+        return self.gpu_robust.device_generation
+
+    def _robust_frame_tick(mut self) -> Bool:
+        """Per-frame upkeep: retire finished uploads and apply mesh removals whose frames retired."""
+        if self.vk.is_device_lost():
+            return False
+        self.gpu_robust.uploads.poll(self.vk)
+        if self.gpu_robust.removals.pending_count() > 0 or len(self.gpu_robust.removals.blas) > 0:
+            var done = self.vk.timeline_value()
+            var ready = self.gpu_robust.removals.take_ready(self.vk, done, False)
+            for mid in ready:
+                _ = self.geom.remove_mesh(mid)
+        return True
+
+    def flush_gpu_uploads(mut self):
+        """Waits for every async upload (mesh, BLAS, texture) and applies pending removals now."""
+        self.gpu_robust.uploads.drain(self.vk)
+        if self.vk.device != 0 and not self.vk.is_device_lost():
+            self.vk.wait_idle()
+        var ready = self.gpu_robust.removals.take_ready(self.vk, 0, True)
+        for mid in ready:
+            _ = self.geom.remove_mesh(mid)
+
+    def _upload_mesh_ranges(
+        mut self, sp: GeomMeshSpan, entry: CookedMeshEntry, need_blas: Bool, allow_update: Bool, opaque: Bool
+    ) -> VulkanAccelStruct:
+        """Copies the pool ranges in `sp` to the GPU geometry buffers and optionally builds the mesh's BLAS,
+        all in one async upload (own staging + scratch, retired by timeline value). An allocation failure
+        degrades (no BLAS / no upload) and is counted in `gpu_robust.oom_fallbacks`."""
+        var vb_start = sp.first_vertex * AAA_VERTEX_BYTES
+        var vb_len = sp.vertex_count * AAA_VERTEX_BYTES
+        var ib_start = sp.first_index * 4
+        var ib_len = sp.index_count * 4
+        var mb_start = sp.first_meshlet * AAA_MESHLET_WORDS * 4
+        var mb_len = sp.meshlet_count * AAA_MESHLET_WORDS * 4
+        var ok_vb = self._grow_storage_buffer(vb_start + vb_len, BIND_AAA_VERTICES, BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
+        var ok_ib = self._grow_storage_buffer(ib_start + ib_len, BIND_AAA_INDICES, BUFFER_USAGE_INDEX | BUFFER_USAGE_AS_BUILD_INPUT_KHR, True, True)
+        var ok_mb = self._grow_storage_buffer(mb_start + mb_len, BIND_AAA_MESHLETS, 0, False, True)
+        self.gpu_robust.last_upload_failed = True
+        if not (ok_vb and ok_ib and ok_mb):
+            self.gpu_robust.oom_fallbacks += 1
+            return VulkanAccelStruct()
+        var st_ib = (vb_len + 15) & ~15
+        var st_mb = st_ib + ((ib_len + 15) & ~15)
+        var total_st = st_mb + ((mb_len + 15) & ~15)
+        if total_st == 0 and not need_blas:
+            self.gpu_robust.last_upload_failed = False
+            return VulkanAccelStruct()
+        var staging = GpuBuffer()
+        if total_st > 0:
+            staging = self.vk.create_buffer(total_st, local=False)
+            if staging.cpu_address == 0:
+                if staging.size > 0:
+                    self.vk.destroy_buffer(staging)
+                self.gpu_robust.oom_fallbacks += 1
+                return VulkanAccelStruct()
+            if vb_len > 0:
+                _ = external_call["memcpy", Int](staging.cpu_address, Int(self.geom.vertex_words.unsafe_ptr()) + vb_start, vb_len)
+            if ib_len > 0:
+                _ = external_call["memcpy", Int](staging.cpu_address + st_ib, Int(self.geom.index_words.unsafe_ptr()) + ib_start, ib_len)
+            if mb_len > 0:
+                _ = external_call["memcpy", Int](staging.cpu_address + st_mb, Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start, mb_len)
+        var cmd = self.gpu_robust.uploads.begin(self.vk)
+        if cmd < 0:
+            if staging.size > 0:
+                self.vk.destroy_buffer(staging)
+            return VulkanAccelStruct()
+        if vb_len > 0:
+            self.vk.copy_buffer(cmd, staging, 0, self.buf_vertices, vb_start, vb_len)
+        if ib_len > 0:
+            self.vk.copy_buffer(cmd, staging, st_ib, self.buf_indices, ib_start, ib_len)
+        if mb_len > 0:
+            self.vk.copy_buffer(cmd, staging, st_mb, self.buf_meshlets, mb_start, mb_len)
+        if total_st > 0:
+            self.vk.memory_barrier2(
+                cmd,
+                PIPELINE_TRANSFER,
+                Int(ACCESS_TRANSFER_WRITE),
+                PIPELINE_ALL_COMMANDS,
+                Int(ACCESS_MEMORY_READ | ACCESS_SHADER_READ | ACCESS_INDIRECT_READ | ACCESS_AS_READ_KHR),
+            )
+        var blas = VulkanAccelStruct()
+        var scratch = GpuBuffer()
+        if need_blas:
+            var v_addr = self.vk.buffer_device_address(self.buf_vertices)
+            var i_addr = self.vk.buffer_device_address(self.buf_indices) + UInt64(entry.first_index * 4)
+            var max_v = max(0, entry.first_vertex + entry.vertex_count - 1)
+            blas = build_blas_triangles_ex(
+                self.vk,
+                cmd,
+                v_addr,
+                AAA_VERTEX_BYTES,
+                max_v,
+                i_addr,
+                entry.triangle_count,
+                scratch,
+                allow_update=allow_update,
+                opaque=opaque,
+            )
+            if blas.handle == 0:
+                self.gpu_robust.oom_fallbacks += 1  # the mesh renders, it just casts no ray-traced shadows
+            self.vk.memory_barrier2(
+                cmd,
+                PIPELINE_AS_BUILD_KHR,
+                Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR),
+                PIPELINE_AS_BUILD_KHR | PIPELINE_COMPUTE,
+                Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
+            )
+        var retire = List[GpuBuffer]()
+        if staging.size > 0:
+            retire.append(staging^)
+        if scratch.size > 0:
+            retire.append(scratch^)
+        self.gpu_robust.last_upload_failed = self.gpu_robust.uploads.submit(self.vk, cmd, retire^) == 0
+        return blas^
+
+    def _retire_mesh(mut self, mesh_id: Int):
+        """Stops drawing `mesh_id` now; its ranges and BLAS are released once every submitted frame retires."""
+        var fence: UInt64 = 0
+        if self.vk.next_signal > 1:
+            fence = self.vk.next_signal - 1
+        var blas = VulkanAccelStruct()
+        if mesh_id < len(self.mesh_blas):
+            swap(blas, self.mesh_blas[mesh_id])
+        var hidden = CookedMeshEntry()
+        hidden.mesh_id = mesh_id
+        hidden.material_id = self.geom.meshes[mesh_id].material_id
+        hidden.lod_count = 0
+        self.geom.meshes[mesh_id] = hidden^
+        var kept = List[AaaDrawInstance]()
+        for i in range(len(self.frame_instances)):
+            if self.frame_instances[i].mesh_id != mesh_id:
+                kept.append(self.frame_instances[i].copy())
+        self.frame_instances = kept^
+        self.gpu_robust.removals.push(mesh_id, fence, blas^)
+        self.vsm.invalidate_all()
+
+    def remove_mesh(mut self, mesh_id: Int) -> Bool:
+        """Unloads a mesh added with `add_mesh`: it stops drawing at once, and its vertex/index/meshlet ranges
+        return to the pool (for later `add_mesh` calls) when the frames in flight retire. Skinned meshes go
+        through `remove_skinned_mesh`. False if the id is unknown, already removed, or skinned."""
+        if mesh_id < 0 or mesh_id >= len(self.geom.mesh_spans) or not self.geom.mesh_spans[mesh_id].live:
+            return False
+        if self.geom.meshes[mesh_id].lod_count == 0:
+            return False
+        if mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[mesh_id]:
+            return False
+        self._retire_mesh(mesh_id)
+        return True
+
+    def remove_skinned_mesh(mut self, skin: AaaSkinnedMeshEntry) -> Bool:
+        """Unloads a skinned mesh and frees its bind vertices, bone palette and morph slots for reuse."""
+        var mid = skin.mesh_entry.mesh_id
+        if mid < 0 or mid >= len(self.geom.mesh_spans) or not self.geom.mesh_spans[mid].live:
+            return False
+        if self.geom.meshes[mid].lod_count == 0:
+            return False
+        self._remove_pending_skin_update(skin)
+        self.skin_arena.vertex_cursor = self.skin_bind_cursor
+        self.skin_arena.bone_cursor = self.skin_bone_cursor
+        self.skin_arena.morph_weight_cursor = self.skin_morph_weight_cursor
+        self.skin_arena.morph_delta_cursor = self.skin_morph_delta_cursor
+        self.skin_arena.free_vertices_range(skin.skin_bind_first_slot, skin.vertex_count)
+        self.skin_arena.free_bone_palette(skin.bone_palette_offset, skin.bone_count)
+        self.skin_arena.free_morph_targets(
+            skin.morph_weight_first_slot, skin.morph_delta_first_slot, skin.morph_count, skin.vertex_count
+        )
+        self.skin_bind_cursor = self.skin_arena.vertex_cursor
+        self.skin_bone_cursor = self.skin_arena.bone_cursor
+        self.skin_morph_weight_cursor = self.skin_arena.morph_weight_cursor
+        self.skin_morph_delta_cursor = self.skin_arena.morph_delta_cursor
+        var first_bone = skin.bone_palette_offset // 8
+        for b in range(first_bone, first_bone + max(1, skin.bone_count)):
+            if b >= 0 and b < len(self.skin_bones_initialized):
+                self.skin_bones_initialized[b] = False
+        if mid < len(self.skinned_mesh_flags):
+            self.skinned_mesh_flags[mid] = False
+        self._retire_mesh(mid)
+        return True
+
+    def _evict_streamed_for_memory(mut self) -> Bool:
+        """Out-of-memory fallback: evicts the largest streamed texture (it shows the fallback white until the
+        streamer brings it back), waits for the frames in flight so its memory is really freed. False if
+        there was nothing to evict."""
+        var best = -1
+        var best_bytes = 0
+        var best_i = -1
+        for i in range(len(self.gpu_robust.streamed_slots)):
+            var s = self.gpu_robust.streamed_slots[i]
+            if s >= 0 and s < len(self.bindless_vram_bytes) and s != self.fallback_white_slot:
+                if self.bindless_vram_bytes[s] > best_bytes and self.bindless_images[s].image != 0:
+                    best_bytes = self.bindless_vram_bytes[s]
+                    best = s
+                    best_i = i
+        if best < 0:
+            return False
+        _ = self.gpu_robust.streamed_slots.pop(best_i)
+        self.evict_bindless_texture_slot(best)
+        self._wait_all_in_flight()
+        self.gpu_robust.oom_fallbacks += 1
+        return True
+
+    def set_render_scale(mut self, scale: Float32) -> Bool:
+        """Changes the TSR render scale (0.5 .. 1.0) at run time, recreating the resolution-dependent targets.
+        On failure the previous scale is restored."""
+        var s = max(Float32(0.5), min(Float32(1.0), scale))
+        if abs(s - self.tsr_scale) < Float32(1e-4):
+            return True
+        if not self.active or self.vk.device == 0 or self.vk.is_device_lost():
+            return False
+        var old = self.tsr_scale
+        self.tsr_scale = s
+        if self.resize(self.output_w, self.output_h):
+            self.invalidate_temporal_history()
+            return True
+        self.tsr_scale = old
+        _ = self.resize(self.output_w, self.output_h)
+        return False
+
+    def apply_dynamic_resolution(mut self, mut controller: AaaDynamicResolution) -> Bool:
+        """Feeds the last GPU frame time to `controller` and applies the scale it picks. True if it changed."""
+        var want = controller.update(self.last_frame_gpu_ms)
+        if abs(want - self.tsr_scale) < Float32(1e-4):
+            return False
+        return self.set_render_scale(want)
+
+    def _copy_settings_from(mut self, other: Self):
+        """Scene/camera/post settings a recreated renderer inherits (no GPU handles)."""
+        self.deferred_readback = other.deferred_readback
+        self.force_readback = other.force_readback
+        self.enable_vsm_clipmap_cascades = other.enable_vsm_clipmap_cascades
+        self.ui_dpi_scale = other.ui_dpi_scale
+        self.ui_global_flags = other.ui_global_flags
+        self.ui_time_sec = other.ui_time_sec
+        self.particle_dt_sec = other.particle_dt_sec
+        self.cluster_far_z = other.cluster_far_z
+        self.enable_aerial_perspective = other.enable_aerial_perspective
+        self.aerial_sigma_ext = other.aerial_sigma_ext
+        self.aerial_r_term = other.aerial_r_term
+        self.aerial_m_term = other.aerial_m_term
+        self.aerial_mie_g = other.aerial_mie_g
+        self.cam_pos = other.cam_pos
+        self.cam_fwd = other.cam_fwd
+        self.cam_right = other.cam_right
+        self.cam_up = other.cam_up
+        self.fov_y_deg = other.fov_y_deg
+        self.near_z = other.near_z
+        self.sun_dir = other.sun_dir
+        self.sun_radiance = other.sun_radiance
+        self.sun_angular_radius = other.sun_angular_radius
+        self.sun_shadow_softness = other.sun_shadow_softness
+        self.vsm_scene_center = other.vsm_scene_center
+        self.vsm_ortho_half_extent = other.vsm_ortho_half_extent
+        self.ibl_intensity = other.ibl_intensity
+        self.exposure = other.exposure
+        self.enable_cone_cull = other.enable_cone_cull
+        self.enable_hiz_cull = other.enable_hiz_cull
+        self.enable_vsm = other.enable_vsm
+        self.enable_rt_shadows = other.enable_rt_shadows
+        self.enable_restir_di = other.enable_restir_di
+        self.enable_rt_reflections = other.enable_rt_reflections
+        self.enable_rt_gi = other.enable_rt_gi
+        self.furnace_white_dome = other.furnace_white_dome
+        self.gi_rays_per_pixel = other.gi_rays_per_pixel
+        self.svgf_passes = other.svgf_passes
+        self.svgf_sigma_luma = other.svgf_sigma_luma
+        self.display_mode = other.display_mode
+        self.tsr_history_weight = other.tsr_history_weight
+        self.tsr_sharpness = other.tsr_sharpness
+        self.max_lod_error_px = other.max_lod_error_px
+        self.camera_lens = other.camera_lens.copy()
+        self.enable_auto_exposure = other.enable_auto_exposure
+        self.auto_exposure_speed = other.auto_exposure_speed
+        self.auto_exposure_key = other.auto_exposure_key
+        self.ev_compensation = other.ev_compensation
+        self.bloom_intensity = other.bloom_intensity
+        self.bloom_threshold = other.bloom_threshold
+        self.grade_saturation = other.grade_saturation
+        self.grade_contrast = other.grade_contrast
+        self.enable_bokeh_dof = other.enable_bokeh_dof
+        self.enable_async_vsm = other.enable_async_vsm
+        self.gi_bounces = other.gi_bounces
+        self.frame_index = other.frame_index
+        self.scene_time_sec = other.scene_time_sec
+        self.enable_spec_reblur = other.enable_spec_reblur
+        self.spec_reblur_passes = other.spec_reblur_passes
+        self.enable_froxel_fog = other.enable_froxel_fog
+        self.fog_density = other.fog_density
+        self.fog_height_falloff = other.fog_height_falloff
+        self.fog_anisotropy_g = other.fog_anisotropy_g
+        self.fog_base_height_y = other.fog_base_height_y
+        self.fog_albedo = other.fog_albedo
+        self.froxel_far_z = other.froxel_far_z
+        self.enable_gpu_rain = other.enable_gpu_rain
+        self.rain_intensity = other.rain_intensity
+        self.weather_wetness = other.weather_wetness
+        self.windshield_rain = other.windshield_rain
+        self.wind_velocity = other.wind_velocity
+        self.enable_water_plane = other.enable_water_plane
+        self.water_level_y = other.water_level_y
+        self.water_absorption_rgb = other.water_absorption_rgb
+        self.water_bounds_min_xz = other.water_bounds_min_xz
+        self.water_bounds_max_xz = other.water_bounds_max_xz
+        self.water_elliptical = other.water_elliptical
+        self.water_wave_scale = other.water_wave_scale
+        self.water_foam_band = other.water_foam_band
+        self.water_foam = other.water_foam
+        self.enable_motion_blur = other.enable_motion_blur
+        self.motion_blur_shutter = other.motion_blur_shutter
+        self.motion_blur_max_px = other.motion_blur_max_px
+        self.glare_streak_strength = other.glare_streak_strength
+        self.min_auto_exposure = other.min_auto_exposure
+        self.max_auto_exposure = other.max_auto_exposure
+        self.cloud_coverage = other.cloud_coverage
+        self.cloud_wind_offset = other.cloud_wind_offset
+        self.star_intensity = other.star_intensity
+        self.sky_zenith_clear = other.sky_zenith_clear
+        self.sky_horizon_clear = other.sky_horizon_clear
+
+    def recover_from_device_loss(mut self) -> Bool:
+        """Tears down the lost device and every GPU resource this renderer owns, creates a new device (and
+        swapchain, on the window the old one presented to), then restores what it keeps on the CPU:
+        settings, materials, and all `add_mesh` geometry with its BLAS. What it cannot rebuild is dropped
+        cleanly and counted: skinned meshes (`meshes_lost_on_recovery`) and textures, whose bindless slots
+        are pointed at the fallback white (`textures_lost_on_recovery`); `device_generation()` bumps so their
+        owners re-upload. False (renderer inactive, `gpu_robust.last_recovery_error` set) when no device can
+        be created; calling it again later retries."""
+        # 1. Keep the CPU-side state.
+        var ready = self.gpu_robust.removals.take_ready(self.vk, 0, True)
+        for mid in ready:
+            _ = self.geom.remove_mesh(mid)
+        var geom = AaaGeometryPool()
+        swap(geom, self.geom)
+        var materials = self.materials.copy()
+        var glass = self.glass_materials.copy()
+        var cel = self.cel_materials.copy()
+        var vfx = self.vfx_materials.copy()
+        var free_outline = self.free_outline_mat_ids.copy()
+        var skinned = self.skinned_mesh_flags.copy()
+        var double_sided = self.mesh_double_sided_flags.copy()
+        var alpha_masked = self.mesh_alpha_masked_flags.copy()
+        var old_textures = len(self.bindless_images)
+        var surface_rec = self.vk.robust.copy()
+        var had_surface = self.vk.surface != 0 or surface_rec.surface_kind != 0
+        var generation = self.gpu_robust.device_generation
+        var recoveries = self.gpu_robust.recoveries
+        var failures = self.gpu_robust.recovery_failures
+        var oom_fallbacks = self.gpu_robust.oom_fallbacks
+
+        # 2. Tear the old device down (destroy calls are valid on a lost device).
+        self.gpu_robust.uploads.release_all(self.vk)
+        self.shutdown()
+
+        # 3. A new device with the same construction parameters and settings.
+        var fresh = FlintAaaVulkanRenderer(
+            self.output_w, self.output_h, self.tsr_scale, self.max_draws, self.max_instances, self.env_cube_dim
+        )
+        if not fresh.active:
+            swap(geom, self.geom)
+            self.gpu_robust.recovery_failures = failures + 1
+            self.gpu_robust.last_recovery_error = "device recreation failed: " + fresh.vk.error
+            return False
+        fresh._copy_settings_from(self)
+        fresh.gpu_robust.device_generation = generation + 1
+        fresh.gpu_robust.recoveries = recoveries + 1
+        fresh.gpu_robust.recovery_failures = failures
+        fresh.gpu_robust.oom_fallbacks = oom_fallbacks
+        if had_surface and surface_rec.surface_kind != 0:
+            fresh.vk.robust.surface_kind = surface_rec.surface_kind
+            fresh.vk.robust.surf_a = surface_rec.surf_a
+            fresh.vk.robust.surf_b = surface_rec.surf_b
+            fresh.vk.robust.surf_refresh_mhz = surface_rec.surf_refresh_mhz
+            fresh.vk.robust.surf_exact = surface_rec.surf_exact
+            fresh.vk.robust.prefer_mailbox = surface_rec.prefer_mailbox
+            fresh.vk.robust.prefer_hdr10 = surface_rec.prefer_hdr10
+            fresh.vk.robust.prefer_immediate = surface_rec.prefer_immediate
+            if not fresh.vk.reattach_recorded_surface(surface_rec.surf_width, surface_rec.surf_height):
+                fresh.gpu_robust.last_recovery_error = "device recreated, window re-attach failed: " + fresh.vk.error
+
+        # 4. Materials (one upload of the whole table).
+        if len(materials) > 0:
+            var words = List[UInt32]()
+            for m in materials:
+                m.append_words(words)
+            if fresh._grow_storage_buffer(len(words) * 4, BIND_AAA_MATERIALS, 0, False, True):
+                fresh._upload_to_device_local_sync(Int(words.unsafe_ptr()), len(words) * 4, BIND_AAA_MATERIALS, 0)
+            _ = len(words)
+        fresh.materials = materials^
+        fresh.glass_materials = glass^
+        fresh.cel_materials = cel^
+        fresh.vfx_materials = vfx^
+        fresh.free_outline_mat_ids = free_outline^
+
+        # 5. Geometry: skinned meshes cannot be rebuilt (their bind pose lives only on the GPU).
+        var lost_meshes = 0
+        for mid in range(len(geom.meshes)):
+            if mid < len(skinned) and skinned[mid] and geom.is_mesh_live(mid):
+                if not geom.remove_mesh(mid):
+                    var hidden = CookedMeshEntry()
+                    hidden.mesh_id = mid
+                    hidden.lod_count = 0
+                    geom.meshes[mid] = hidden^
+                lost_meshes += 1
+        swap(fresh.geom, geom)
+        var all = GeomMeshSpan()
+        all.vertex_count = fresh.geom.total_vertices()
+        all.index_count = len(fresh.geom.index_words)
+        all.meshlet_count = len(fresh.geom.meshlets)
+        var no_entry = CookedMeshEntry()
+        _ = fresh._upload_mesh_ranges(all, no_entry, False, False, True)
+        var empty_span = GeomMeshSpan()
+        for mid in range(len(fresh.geom.meshes)):
+            var live = fresh.geom.meshes[mid].lod_count > 0 and fresh.geom.meshes[mid].vertex_count > 0
+            var am = mid < len(alpha_masked) and alpha_masked[mid]
+            if live and fresh.vk.has_ray_query and fresh.geom.meshes[mid].triangle_count > 0:
+                var e = fresh.geom.meshes[mid].copy()
+                fresh.mesh_blas.append(fresh._upload_mesh_ranges(empty_span, e, True, False, not am))
+            else:
+                fresh.mesh_blas.append(VulkanAccelStruct())
+            fresh.skinned_mesh_flags.append(False)
+            fresh.skinned_mesh_bind_slots.append(0)
+            fresh.mesh_double_sided_flags.append(double_sided[mid] if mid < len(double_sided) else False)
+            fresh.mesh_alpha_masked_flags.append(am)
+        fresh.gpu_robust.meshes_lost_on_recovery = lost_meshes
+
+        # 6. Textures: point every old slot the new device does not have at the fallback white.
+        var lost_tex = 0
+        var fb_view = 0
+        if fresh.fallback_white_slot >= 0 and fresh.fallback_white_slot < len(fresh.bindless_images):
+            fb_view = fresh.bindless_images[fresh.fallback_white_slot].view
+        while len(fresh.bindless_images) < old_textures:
+            var slot = len(fresh.bindless_images)
+            fresh.bindless_images.append(VulkanImage())
+            fresh._ensure_bindless_meta(slot)
+            fresh.bindless_resident_min_mip[slot] = 16
+            fresh.bindless_vram_bytes[slot] = 0
+            fresh.bindless_layouts_init[slot] = False
+            if fb_view != 0 and fresh.samp_aniso16 != 0:
+                fresh._write_or_queue_bindless(slot, fresh.samp_aniso16, fb_view)
+            fresh.bindless_free_slots.append(slot)
+            lost_tex += 1
+        fresh.gpu_robust.textures_lost_on_recovery = lost_tex
+        fresh.vsm.invalidate_all()
+        fresh.invalidate_temporal_history()
+        self = fresh^
+        return True
+
     def shutdown(mut self):
         if not self.active and self.vk.instance == 0:
             self.vk._free_host_scratch()
@@ -8503,6 +8911,8 @@ struct FlintAaaVulkanRenderer(Movable):
             self.active = False
             return
         self.vk.wait_idle()
+        self.gpu_robust.uploads.release_all(self.vk)
+        _ = self.gpu_robust.removals.take_ready(self.vk, 0, True)
         for fi in range(len(self.frame_fences)):
             self.frame_fences[fi] = 0
         self.prev_submitted_fence = 0

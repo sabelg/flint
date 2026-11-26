@@ -21,6 +21,20 @@ from flint.core.offset_allocator import OffsetAllocator, OffsetAllocation, OA_UN
 from flint.platform.dynlib import dl_open, dl_sym, dl_close
 from flint.platform.amdgpu import GpuBuffer, ReleaseVkBufferFn, _GpuBufferControl, _buf_ctrl_ptr
 from flint.platform.os import env_flag, env_value, read_bytes, write_bytes
+from flint.platform.vk_robust import (
+    MEMORY_BUDGET_PROPERTIES_BYTES,
+    MEMORY_PROPERTIES_2_BYTES,
+    TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES,
+    TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+    VK_ERROR_DEVICE_LOST,
+    VK_ERROR_OUT_OF_DEVICE_MEMORY,
+    VK_HEAP_DEVICE_LOCAL,
+    VK_SURFACE_DRM,
+    VK_SURFACE_WAYLAND,
+    VK_SURFACE_XCB,
+    VkHeapBudget,
+    VkRobustState,
+)
 
 comptime Call1 = def(Int) thin abi("C") -> Int32
 comptime Call2 = def(Int, Int) thin abi("C") -> Int32
@@ -936,8 +950,10 @@ struct VulkanGpu(Movable):
     var overflow_slabs: List[Int]
     var aliased_heaps: List[Int]
     var ctrl_ptr: Int
+    var robust: VkRobustState  # device-lost latch, OOM counters, VRAM budget, fault hook (vk_robust.mojo)
 
     def __init__(out self):
+        self.robust = VkRobustState()
         self.device_call_cache = Dict[String, Int]()
         self.device_call_cache_device = 0
         self.overflow_slabs = List[Int]()
@@ -1187,6 +1203,7 @@ struct VulkanGpu(Movable):
         self.device_call_cache = existing.device_call_cache^
         self.overflow_slabs = existing.overflow_slabs^
         self.aliased_heaps = existing.aliased_heaps^
+        self.robust = existing.robust^
 
     def __deinit__(deinit self):
         self.close()
@@ -1197,8 +1214,167 @@ struct VulkanGpu(Movable):
 
     def check(mut self, result: Int32, what: String) -> Bool:
         if result != SUCCESS:
+            _ = self.robust.note_result(result, what)
             return self.fail(what + " returned " + String(result))
         return True
+
+    # Robustness: device loss, out-of-memory and VRAM budgets (state in `vk_robust.mojo`).
+
+    def is_device_lost(self) -> Bool:
+        return self.robust.device_lost
+
+    def mark_device_lost(mut self, reason: String):
+        """Latches the device-lost state (used by the fault hook and by callers that saw the error elsewhere)."""
+        _ = self.robust.note_result(VK_ERROR_DEVICE_LOST, reason)
+        self.error = reason + " returned " + String(VK_ERROR_DEVICE_LOST)
+
+    def _submit_blocked(mut self) -> Bool:
+        """True when a submit must not reach the queue: the device is lost, or the fault hook says so now."""
+        if self.robust.device_lost:
+            self.error = "the Vulkan device is lost; submit refused"
+            return True
+        if self.robust.fault.tick_submit():
+            self.mark_device_lost("vkQueueSubmit (injected fault)")
+            return True
+        return False
+
+    def begin_soft_allocations(mut self):
+        """Allocations until `end_soft_allocations` are optional (streamed mips, caches): they are refused
+        once a device-local heap passes `robust.soft_budget_percent` of its budget."""
+        self.robust.soft_depth += 1
+
+    def end_soft_allocations(mut self):
+        self.robust.soft_depth = max(0, self.robust.soft_depth - 1)
+
+    def memory_type_heap(self, type_index: Int) -> Int:
+        if type_index < 0 or self.memory_properties == 0:
+            return -1
+        return Int(get32(self.memory_properties + 4 + type_index * 8 + 4))
+
+    def _slab_bytes_on_heap(self, heap: Int) -> Int:
+        if self.ctrl_ptr == 0:
+            return 0
+        var total = 0
+        ref blocks = _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].mem_blocks
+        for addr in blocks:
+            if addr != 0:
+                ref blk = _vk_block_ptr(addr)[unsafe_offset=0]
+                if self.memory_type_heap(blk.memory_type_index) == heap:
+                    total += blk.size_bytes
+        return total
+
+    def query_memory_budgets(mut self) -> List[VkHeapBudget]:
+        """Used and budget bytes per memory heap. With VK_EXT_memory_budget these are the driver's
+        numbers (all processes' pressure included); without it the budget is 80% of the heap and the
+        usage counts this device's sub-allocator slabs only. Never rewinds the scratch arena, so it is
+        safe to call in the middle of an allocation."""
+        var out = List[VkHeapBudget]()
+        if self.memory_properties == 0:
+            return out^
+        var heap_count = min(16, Int(get32(self.memory_properties + 260)))
+        var budgets = List[Int](length=heap_count, fill=0)
+        var usages = List[Int](length=heap_count, fill=0)
+        var from_driver = False
+        if self.robust.has_memory_budget and self.physical != 0 and self.instance != 0:
+            var get2 = self.instance_call("vkGetPhysicalDeviceMemoryProperties2")
+            if get2 != 0:
+                var props = self.scratch(MEMORY_PROPERTIES_2_BYTES)
+                var bud = self.scratch(MEMORY_BUDGET_PROPERTIES_BYTES)
+                put32(props, TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2)
+                put64(props + 8, bud)
+                put32(bud, TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES)
+                _ = call2(get2, self.physical, props)
+                for h in range(heap_count):
+                    budgets[h] = get64(bud + 16 + h * 8)
+                    usages[h] = get64(bud + 16 + 128 + h * 8)
+                from_driver = True
+        for h in range(heap_count):
+            var b = VkHeapBudget()
+            b.heap_index = h
+            b.size = get64(self.memory_properties + 264 + h * 16)
+            b.device_local = (get32(self.memory_properties + 264 + h * 16 + 8) & VK_HEAP_DEVICE_LOCAL) != 0
+            if from_driver and budgets[h] > 0:
+                b.from_driver = True
+                b.budget = budgets[h]
+                b.usage = usages[h]
+            else:
+                b.budget = b.size // 10 * 8
+                b.usage = self._slab_bytes_on_heap(h)
+            if self.robust.fault.budget_override_bytes > 0 and b.device_local:
+                b.budget = self.robust.fault.budget_override_bytes
+            out.append(b)
+        return out^
+
+    def device_local_headroom(mut self) -> Int:
+        """Bytes left before the largest device-local heap reaches its budget (-1 if unknown)."""
+        var best = -1
+        var best_size = -1
+        var heaps = self.query_memory_budgets()
+        for h in heaps:
+            if h.device_local and h.size > best_size:
+                best_size = h.size
+                best = h.headroom()
+        return best
+
+    def _soft_allocation_refused(mut self, size: Int, type_index: Int) -> Bool:
+        if not self.robust.soft_allocations_active() or not self._is_memory_type_device_local(type_index):
+            return False
+        var heap = self.memory_type_heap(type_index)
+        var heaps = self.query_memory_budgets()
+        if heap < 0 or heap >= len(heaps):
+            return False
+        var limit = heaps[heap].budget // 100 * self.robust.soft_budget_percent
+        if heaps[heap].usage + size > limit:
+            self.robust.budget_refusals += 1
+            return True
+        return False
+
+    def timeline_value(mut self) -> UInt64:
+        """The main timeline's completed value (non-blocking; 0 if unknown)."""
+        if self.device == 0 or self.timeline == 0 or self.robust.device_lost:
+            return 0
+        var get_value = self.device_call("vkGetSemaphoreCounterValue")
+        if get_value == 0:
+            return 0
+        var slot = self.scratch(8)
+        var result = call3(get_value, self.device, self.timeline, slot)
+        if result != SUCCESS:
+            _ = self.robust.note_result(result, "vkGetSemaphoreCounterValue")
+            return 0
+        return UInt64(get64(slot))
+
+    def allocate_extra_command_buffers(mut self, count: Int) -> Int:
+        """More primary command buffers on the main queue's pool, appended to `command_buffers`;
+        the index of the first, -1 on failure (async uploads record into these)."""
+        var first = len(self.command_buffers)
+        if not self.allocate_command_buffers(count):
+            return -1
+        return first
+
+    def reattach_recorded_surface(mut self, width: Int, height: Int) -> Bool:
+        """Attaches the window the previous device presented to (see `robust.surface_kind`) and makes a
+        swapchain with the same preferences. False when nothing was recorded or the attach failed."""
+        var kind = self.robust.surface_kind
+        var w = width if width > 0 else self.robust.surf_width
+        var h = height if height > 0 else self.robust.surf_height
+        var ok = False
+        if kind == VK_SURFACE_WAYLAND:
+            ok = self.create_surface(self.robust.surf_a, self.robust.surf_b, 2)
+        elif kind == VK_SURFACE_XCB:
+            ok = self.create_xcb_surface(self.robust.surf_a, self.robust.surf_b, 2)
+        elif kind == VK_SURFACE_DRM:
+            ok = self.create_drm_display_surface(
+                self.robust.surf_a, self.robust.surf_b, w, h, self.robust.surf_refresh_mhz, 2, self.robust.surf_exact
+            )
+        if not ok:
+            return False
+        return self.create_swapchain(
+            max(1, w),
+            max(1, h),
+            prefer_mailbox=self.robust.prefer_mailbox,
+            prefer_hdr10=self.robust.prefer_hdr10,
+            prefer_immediate=self.robust.prefer_immediate,
+        )
 
     # Struct memory.
 
@@ -1541,6 +1717,9 @@ struct VulkanGpu(Movable):
         if "VK_KHR_swapchain" in offered:
             extensions.append("VK_KHR_swapchain")
             self.has_swapchain = True
+        if "VK_EXT_memory_budget" in offered:
+            extensions.append("VK_EXT_memory_budget")
+            self.robust.has_memory_budget = True
         var want_rt = (
             self.device_type != 4
             and "VK_KHR_acceleration_structure" in offered
@@ -1793,6 +1972,8 @@ struct VulkanGpu(Movable):
             if wait_semaphore != 0:
                 return self.submit_with_wait(frame, wait_semaphore, wait_value, wait_stage)
             return self.submit(frame)
+        if self._submit_blocked():
+            return 0
         if not self.check(call1(self.fn_end_commands, self.command_buffers[frame]), "vkEndCommandBuffer"):
             return 0
         self.rewind()
@@ -1844,6 +2025,8 @@ struct VulkanGpu(Movable):
         """Ends command buffer `frame` and submits on `self.queue`, optionally waiting on 1-2 timeline semaphores."""
         if wait_semaphore == 0 and wait_semaphore2 == 0:
             return self.submit(frame)
+        if self._submit_blocked():
+            return 0
         if not self.check(call1(self.fn_end_commands, self.command_buffers[frame]), "vkEndCommandBuffer"):
             return 0
         self.rewind()
@@ -1895,6 +2078,8 @@ struct VulkanGpu(Movable):
     def wait_side(mut self, fence: UInt64) -> Bool:
         if not self.has_side_queue():
             return self.wait(fence)
+        if self.robust.device_lost:
+            return self.fail("the Vulkan device is lost; wait refused")
         self.rewind()
         var semaphores = self.scratch(8)
         put64(semaphores, self.side_timeline)
@@ -1934,14 +2119,24 @@ struct VulkanGpu(Movable):
         return -1
 
     def allocation(mut self, size: Int, type_index: Int, next_struct: Int) -> Int:
-        """Device memory of this type, or 0 if the heap says no."""
+        """Device memory of this type, or 0 if the heap says no. Out-of-memory (real, injected by
+        `robust.fault`, or a soft allocation over budget) returns 0 and is counted, never raised."""
+        if self.robust.device_lost:
+            return 0
+        if self.robust.fault.take_alloc_failure():
+            _ = self.robust.note_result(VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkAllocateMemory (injected fault)")
+            return 0
+        if self._soft_allocation_refused(size, type_index):
+            return 0
         var info = self.scratch(32)
         put32(info, TYPE_MEMORY_ALLOCATE_INFO)
         put64(info + 8, next_struct)
         put64(info + 16, size)
         put32(info + 24, UInt32(type_index))
         var slot = self.scratch(8)
-        if call4(self.fn_allocate_memory, self.device, info, 0, slot) != SUCCESS:
+        var result = call4(self.fn_allocate_memory, self.device, info, 0, slot)
+        if result != SUCCESS:
+            _ = self.robust.note_result(result, "vkAllocateMemory")
             return 0
         return get64(slot)
 
@@ -2006,6 +2201,13 @@ struct VulkanGpu(Movable):
         Returns `(vk_memory, byte_offset, cpu_mapped_addr, block_idx, oa_meta)`."""
         if self.ctrl_ptr == 0:
             return (0, 0, 0, -1, OA_UNUSED)
+        if self.robust.device_lost:
+            return (0, 0, 0, -1, OA_UNUSED)
+        if self.robust.fault.take_alloc_failure():
+            _ = self.robust.note_result(VK_ERROR_OUT_OF_DEVICE_MEMORY, "memory request (injected fault)")
+            return (0, 0, 0, -1, OA_UNUSED)
+        if self._soft_allocation_refused(size, type_index):
+            return (0, 0, 0, -1, OA_UNUSED)  # optional allocation over the VRAM budget
         ref blocks = _vk_ctrl_ptr(self.ctrl_ptr)[unsafe_offset=0].mem_blocks
         var can_suballoc = (
             size <= VK_SUBALLOC_DEDICATED_THRESHOLD
@@ -2550,7 +2752,10 @@ struct VulkanGpu(Movable):
         return UInt64(get64(value))
 
     def submit(mut self, frame: Int) -> UInt64:
-        """End the frame's commands and queue them. Returns the fence, 0 on failure."""
+        """End the frame's commands and queue them. Returns the fence, 0 on failure (check
+        `is_device_lost()` to tell a lost device from an ordinary error)."""
+        if self._submit_blocked():
+            return 0
         if not self.check(call1(self.fn_end_commands, self.command_buffers[frame]), "vkEndCommandBuffer"):
             return 0
         self.rewind()
@@ -2578,6 +2783,8 @@ struct VulkanGpu(Movable):
         return value
 
     def wait(mut self, fence: UInt64) -> Bool:
+        if self.robust.device_lost:
+            return self.fail("the Vulkan device is lost; wait refused")
         self.rewind()
         var semaphores = self.scratch(8)
         put64(semaphores, self.timeline)
@@ -2616,6 +2823,9 @@ struct VulkanGpu(Movable):
         if not self.check(call4(self.instance_call("vkCreateWaylandSurfaceKHR"), self.instance, info, 0, slot), "vkCreateWaylandSurfaceKHR"):
             return False
         self.surface = get64(slot)
+        self.robust.surface_kind = VK_SURFACE_WAYLAND
+        self.robust.surf_a = display
+        self.robust.surf_b = wayland_surface
         var supported = self.scratch(8)
         if not self.check(call4(self.instance_call("vkGetPhysicalDeviceSurfaceSupportKHR"), self.physical, Int(self.family), self.surface, supported), "vkGetPhysicalDeviceSurfaceSupportKHR"):
             return False
@@ -2641,6 +2851,9 @@ struct VulkanGpu(Movable):
         if not self.check(call4(self.instance_call("vkCreateXcbSurfaceKHR"), self.instance, info, 0, slot), "vkCreateXcbSurfaceKHR"):
             return False
         self.surface = get64(slot)
+        self.robust.surface_kind = VK_SURFACE_XCB
+        self.robust.surf_a = connection
+        self.robust.surf_b = window
         var supported = self.scratch(8)
         if not self.check(call4(self.instance_call("vkGetPhysicalDeviceSurfaceSupportKHR"), self.physical, Int(self.family), self.surface, supported), "vkGetPhysicalDeviceSurfaceSupportKHR"):
             return False
@@ -2718,6 +2931,11 @@ struct VulkanGpu(Movable):
         width x height mode (the swapchain must match a renderer that cannot scale)."""
         if not self.has_display_surface or not self.has_swapchain:
             return self.fail("this driver cannot present to a display directly (VK_KHR_display / VK_EXT_acquire_drm_display)")
+        self.robust.surface_kind = VK_SURFACE_DRM
+        self.robust.surf_a = drm_fd
+        self.robust.surf_b = connector
+        self.robust.surf_refresh_mhz = refresh_mhz
+        self.robust.surf_exact = exact_size
         self.rewind()
         var slot = self.scratch(8)
         if not self.check(call4(self.instance_call("vkGetDrmDisplayEXT"), self.physical, drm_fd, connector, slot), "vkGetDrmDisplayEXT (is this the GPU behind the DRM card?)"):
@@ -2946,6 +3164,11 @@ struct VulkanGpu(Movable):
         prefer_immediate: Bool = False,
     ) -> Bool:
         """Creates swapchain supporting FIFO/MAILBOX/IMMEDIATE and SDR/HDR10 PQ/Extended Linear sRGB."""
+        self.robust.prefer_mailbox = prefer_mailbox
+        self.robust.prefer_hdr10 = prefer_hdr10
+        self.robust.prefer_immediate = prefer_immediate
+        self.robust.surf_width = width
+        self.robust.surf_height = height
         self.rewind()
         var capabilities = self.scratch(52)
         if not self.check(call3(self.instance_call("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"), self.physical, self.surface, capabilities), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"):
@@ -3121,7 +3344,11 @@ struct VulkanGpu(Movable):
             self.swapchain_image_layouts[image] = new_layout
 
     def acquire_image(mut self, frame: Int) -> Int:
-        """The next image to fill, or NO_IMAGE to skip presenting this frame."""
+        """The next image to fill, or NO_IMAGE to skip presenting this frame. A lost device or surface
+        latches `robust.device_lost` / `robust.surface_lost` for the owner to recover from."""
+        if self.robust.device_lost or self.swapchain == 0:
+            self.skipped += 1
+            return NO_IMAGE
         self.rewind()
         var slot = self.scratch(8)
         var result = call6(self.device_call("vkAcquireNextImageKHR"), self.device, self.swapchain, ACQUIRE_TIMEOUT_NS, self.acquire_semaphores[frame], 0, slot)
@@ -3130,8 +3357,10 @@ struct VulkanGpu(Movable):
         self.skipped += 1
         if result == ERROR_OUT_OF_DATE:
             self.wait_idle()
-            _ = self.create_swapchain(self.swapchain_width, self.swapchain_height)
+            if not self.robust.device_lost:
+                _ = self.create_swapchain(self.swapchain_width, self.swapchain_height)
         elif result != TIMEOUT and result != NOT_READY:
+            _ = self.robust.note_result(result, "vkAcquireNextImageKHR")
             self.error = "vkAcquireNextImageKHR returned " + String(result)
         return NO_IMAGE
 
@@ -3196,6 +3425,8 @@ struct VulkanGpu(Movable):
         extra_wait_stage: Int = PIPELINE_COMPUTE,
     ) -> UInt64:
         """As `submit`, waiting for the acquired image (and optional timeline wait) and handing it to the compositor."""
+        if self._submit_blocked():
+            return 0
         if not self.check(call1(self.fn_end_commands, self.command_buffers[frame]), "vkEndCommandBuffer"):
             return 0
         self.rewind()
@@ -3257,6 +3488,7 @@ struct VulkanGpu(Movable):
         elif result == ERROR_OUT_OF_DATE:
             self.skipped += 1
         else:
+            _ = self.robust.note_result(result, "vkQueuePresentKHR")
             self.error = "vkQueuePresentKHR returned " + String(result)
         return value
 
@@ -3296,7 +3528,9 @@ struct VulkanGpu(Movable):
     def wait_idle(mut self):
         if self.device != 0:
             self.rewind()
-            _ = call1(self.device_call("vkDeviceWaitIdle"), self.device)
+            var result = call1(self.device_call("vkDeviceWaitIdle"), self.device)
+            if result != SUCCESS:
+                _ = self.robust.note_result(result, "vkDeviceWaitIdle")
 
     def close(mut self):
         """Destroy everything but the buffers, which belong to their owner and must be
