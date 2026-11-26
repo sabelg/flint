@@ -152,6 +152,7 @@ from flint.render.sota_e_hair_shadow import SotaEHairShadow, sota_e_dom_words
 from flint.render.sota_mat_core import (
     AAA_FLAG_SOTA_MAT,
     SOTA_MAT_EXTRA_BYTES,
+    SOTA_MAT_INSTANCE_TRANS_BIT,
     SOTA_MAT_MAX_MATERIALS,
     SotaMatLayers,
     SotaMatState,
@@ -2162,6 +2163,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if mat_id < 0 or mat_id >= SOTA_MAT_MAX_MATERIALS:
             return
         sota_mat_write_layers(self.buf_materials.cpu_address, mat_id, layers)
+        self.sota_mat.set_transmissive(mat_id, layers.is_transmissive())
 
     # --- end sota:mat hook ---
     def update_material(mut self, mat_id: Int, mat: AaaMaterial):
@@ -2192,6 +2194,8 @@ struct FlintAaaVulkanRenderer(Movable):
         dim: Int = 32,
         time_sec: Float32 = 0.0,
         world_y_scale: Float32 = 24.0,
+        enable_clearcoat: Bool = True,  # --- sota:mat hook --- SpecId 0 / 1 through VkSpecializationInfo
+        domain: UInt32 = 0,
     ) -> Tuple[Int, Int]:
         """Compiles & dispatches `node` (`SurfaceMaterialNode`) on Vulkan against live `buf_materials` (`Binding 4`, stride `24`)
         and `BIND_AAA_BINDLESS_TEX`, bakes the GPU-evaluated surface response into bindless `BC7` Albedo + ORM textures,
@@ -2200,7 +2204,9 @@ struct FlintAaaVulkanRenderer(Movable):
             return (-1, -1)
         var tex_dim = max(8, min(256, (dim + 3) & ~3))
         var spv = compile_surface_material_shader(node)
-        var pipe = self.vk.create_aaa_compute_pipeline(self.pipe_layout, spv)
+        var pipe = self.vk.create_aaa_compute_pipeline_spec(  # --- sota:mat hook ---
+            self.pipe_layout, spv, [UInt32(0), UInt32(1)], [UInt32(1) if enable_clearcoat else UInt32(0), domain]
+        )
         if pipe == 0:
             return (-1, -1)
 
@@ -4502,13 +4508,15 @@ struct FlintAaaVulkanRenderer(Movable):
             if sota_e_outl:
                 self.sota_e_gpu.frame_outline_instances += 1
             # --- end sota:E hook ---
+            var sota_mt = self.sota_mat.is_transmissive(mat_final)  # --- sota:mat hook --- shadows attenuate through it
             put32(
                 dst + 39 * 4,
                 UInt32(mat_final & 0xFFFF)
                 | ((UInt32(1) if is_ds else UInt32(0)) << 16)
                 | ((UInt32(1) if is_am_inst else UInt32(0)) << 17)
                 | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0))
-                | (SOTA_E_INSTANCE_OUTLINE_BIT if sota_e_outl else UInt32(0)),  # sota:E hook
+                | (SOTA_E_INSTANCE_OUTLINE_BIT if sota_e_outl else UInt32(0))  # sota:E hook
+                | (SOTA_MAT_INSTANCE_TRANS_BIT if sota_mt else UInt32(0)),  # sota:mat hook
             )
             var my_sc_base = 0xFFFFFF
             if i < 1024:
@@ -4538,7 +4546,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     my_sc_base,
                     blas_da,
                     cull_disable=True,
-                    alpha_masked=is_am_inst,
+                    alpha_masked=is_am_inst or sota_mt,  # sota:mat hook (FORCE_NO_OPAQUE: any-hit sees it)
                     glass=is_glass_inst,
                 )
 

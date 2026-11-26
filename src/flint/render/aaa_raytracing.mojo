@@ -49,6 +49,10 @@ from flint.render.aaa_vsm import emit_sample_vsm_depth
 from flint.render.sota_shadow_vsm import emit_sota_shadow_cascade_uv  # --- sota:shadow hook ---
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.sota_gi_core import emit_sota_reflection_hit_ambient  # --- sota:gi hook ---
+# --- sota:mat hook --- (area I: transmissive shadows + layered hit shading)
+from flint.render.sota_mat_core import AAA_FLAG_SOTA_MAT, SOTA_MAT_INSTANCE_TRANS_BIT, emit_sota_mat_shadow_transmittance
+from flint.render.sota_mat_lights import emit_sota_mat_rt_hit
+# --- end sota:mat hook ---
 
 # SPIR-V RayFlagsKHR constants
 comptime RAY_FLAG_NONE_KHR: UInt32 = 0
@@ -447,6 +451,7 @@ def _emit_rt_candidate_alpha_loop(
     b_instances: UInt32 = 0,
     b_materials: UInt32 = 0,
     bindless_arr: Tuple[UInt32, UInt32] = (0, 0),
+    sota_trans_var: UInt32 = 0,  # --- sota:mat hook --- fvar: product of layered-transmissive candidates' T
 ):
     """Hardware-accelerated `SPV_KHR_ray_query` traversal loop:
     99% of opaque BLAS/instances (`FORCE_OPAQUE`) auto-commit in RT silicon; non-opaque foliage/fence
@@ -472,6 +477,14 @@ def _emit_rt_candidate_alpha_loop(
         var c_raw_sf = s.load_float(b_materials, s.iadd(c_mbase, s.uint(3)))
         var c_tex_pk = s.load_word(b_materials, s.iadd(c_mbase, s.uint(23)))
         var c_talb = s.bit_and(c_tex_pk, s.uint(0xFF))
+        # --- sota:mat hook --- transmissive layered materials (instance bit 20) attenuate instead of occluding
+        var sota_is_tr: UInt32 = 0
+        if sota_trans_var != 0:
+            sota_is_tr = s.ine(s.bit_and(c_w39, s.uint(SOTA_MAT_INSTANCE_TRANS_BIT)), s.uint(0))
+            s.begin_if(sota_is_tr)
+            s.store(sota_trans_var, s.fmul(s.load_f(sota_trans_var), emit_sota_mat_shadow_transmittance(s, b_materials, c_mat)))
+            s.end_if()
+        # --- end sota:mat hook ---
 
         var pass_alpha = s.uvar(s.uint(1))
         s.begin_if(s.logical_and(s.flt(c_raw_sf, s.float(0.0)), s.ult(c_talb, s.uint(0xFF))))
@@ -492,7 +505,10 @@ def _emit_rt_candidate_alpha_loop(
         s.store(pass_alpha, s.select_u(s.fge(ca_boost, s.float(0.48)), s.uint(1), s.uint(0)))
         s.end_if()
 
-        s.begin_if(s.ine(s.load_u(pass_alpha), s.uint(0)))
+        var conf_hit = s.ine(s.load_u(pass_alpha), s.uint(0))
+        if sota_trans_var != 0:  # --- sota:mat hook ---
+            conf_hit = s.logical_and(conf_hit, s.logical_not(sota_is_tr))
+        s.begin_if(conf_hit)
         s.ray_query_confirm_intersection(rq)
         s.end_if()
         s.end_if()
@@ -537,10 +553,18 @@ def emit_rt_shadow_query(
         rd,
         t_max,
     )
-    _emit_rt_candidate_alpha_loop(s, rq, b_verts, b_indices, b_instances, b_materials, bindless_arr)
+    # --- sota:mat hook --- transmittance through layered transmissive surfaces (1.0 when none on the ray)
+    var sota_tr: UInt32 = 0
+    if bindless_arr[1] != 0:
+        sota_tr = s.fvar(s.float(1.0))
+    _emit_rt_candidate_alpha_loop(s, rq, b_verts, b_indices, b_instances, b_materials, bindless_arr, sota_tr)
 
     var hit_kind = s.ray_query_committed_type(rq)
-    return s.select_f(s.ieq(hit_kind, s.uint(0)), s.float(1.0), s.float(0.0))
+    var vis_out = s.select_f(s.ieq(hit_kind, s.uint(0)), s.float(1.0), s.float(0.0))
+    if sota_tr != 0:
+        vis_out = s.fmul(vis_out, s.load_f(sota_tr))
+    return vis_out
+    # --- end sota:mat hook ---
 
 
 def emit_rt_surface_cache_ray(
@@ -1266,6 +1290,36 @@ def emit_rt_textured_hit_shade(
     s.store(out_r, s.fadd(s.load_f(tot_diff_r), s.fadd(sp_h_r, em_r)))
     s.store(out_g, s.fadd(s.load_f(tot_diff_g), s.fadd(sp_h_g, em_g)))
     s.store(out_b, s.fadd(s.load_f(tot_diff_b), s.fadd(sp_h_b, em_b)))
+    # --- sota:mat hook --- layered model at the hit (overwrites `out_*` when on for this material)
+    var sota_sc_ok = s.logical_and(s.ine(sc_base, s.uint(0xFFFFFF)), sota_amb[3])
+    var sota_sc = [s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0))]
+    s.begin_if(s.logical_and(sota_sc_ok, s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_SOTA_MAT)), s.uint(0))))
+    var sota_scw = s.imul(s.iadd(sc_base, prim_id), s.uint(4))
+    for c in range(3):
+        s.store(sota_sc[c], s.load_float(b_surfcache, s.iadd(sota_scw, s.uint(UInt32(c)))))
+    s.end_if()
+    var sota_t0x = s.load_float(b_verts, s.iadd(v0_off, s.uint(6))); var sota_t0y = s.load_float(b_verts, s.iadd(v0_off, s.uint(7))); var sota_t0z = s.load_float(b_verts, s.iadd(v0_off, s.uint(8)))
+    var sota_t1x = s.load_float(b_verts, s.iadd(v1_off, s.uint(6))); var sota_t1y = s.load_float(b_verts, s.iadd(v1_off, s.uint(7))); var sota_t1z = s.load_float(b_verts, s.iadd(v1_off, s.uint(8)))
+    var sota_t2x = s.load_float(b_verts, s.iadd(v2_off, s.uint(6))); var sota_t2y = s.load_float(b_verts, s.iadd(v2_off, s.uint(7))); var sota_t2z = s.load_float(b_verts, s.iadd(v2_off, s.uint(8)))
+    var sota_wt = emit_mat4_mul_dir(
+        s, b_instances, inst_base,
+        s.fma(sota_t0x, b0, s.fma(sota_t1x, b1, s.fmul(sota_t2x, b2))),
+        s.fma(sota_t0y, b0, s.fma(sota_t1y, b1, s.fmul(sota_t2y, b2))),
+        s.fma(sota_t0z, b0, s.fma(sota_t1z, b1, s.fmul(sota_t2z, b2))),
+    )
+    emit_sota_mat_rt_hit(
+        s, b_materials, r_flags, mat_id, m_base, (hnx, hny, hnz), (dx, dy, dz), sota_wt,
+        s.fmul(s.select_f(s.ieq(s.bit_and(meta0, s.uint(1)), s.uint(0)), s.float(1.0), s.float(-1.0)), flip_f),
+        (alb_r, alb_g, alb_b), hit_rough, hit_metal, (em_r, em_g, em_b),
+        (sun_x, sun_y, sun_z), (sun_r, sun_g, sun_b), s.load_f(sun_vis_h),
+        (s.load_f(loc_ir_r), s.load_f(loc_ir_g), s.load_f(loc_ir_b)),
+        (s.load_f(loc_sp_r), s.load_f(loc_sp_g), s.load_f(loc_sp_b)),
+        (amb_r, amb_g, amb_b), env_cube, max_env_mip, ibl_int, hit_ao,
+        sota_sc_ok, (s.load_f(sota_sc[0]), s.load_f(sota_sc[1]), s.load_f(sota_sc[2])),
+        s.select_f(s.ult(t_alb, s.uint(0xFF)), s.float(0.25), s.float(1.0)),
+        out_r, out_g, out_b,
+    )
+    # --- end sota:mat hook ---
     s.end_if()
 
     s.store(out_hit, s.uint(1))
