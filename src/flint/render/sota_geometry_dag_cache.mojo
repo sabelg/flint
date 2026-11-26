@@ -19,6 +19,8 @@ from flint.assets.model import NativeMesh
 from flint.core.jobs import JobPool
 from flint.core.lz4 import hash_list
 from flint.core.serial import BlobReader, BlobWriter
+from flint.platform.os import remove_file, rename_file
+from flint.render.sota_perf_dag_cache import sota_dag_cache_ensure_dir, sota_dag_cache_tmp_path  # --- sota:perf hook ---
 from flint.render.sota_geometry_cluster_dag import (
     SOTA_DAG_GROUP_SIZE,
     ClusterDag,
@@ -31,6 +33,9 @@ comptime SOTA_DAG_BLOB_TAG: UInt32 = 0x47414446      # "FDAG"
 comptime SOTA_DAG_BLOB_VERSION: Int = 1
 comptime SOTA_DAG_SUB_ID: UInt16 = 17                 # flpk sub-chunk id (16 = BVH8 collider)
 comptime SOTA_DAG_ASSET_KIND: UInt8 = 40
+# --- sota:perf hook --- bump whenever `build_cluster_dag` would emit a different DAG for the same mesh, so a
+# default-on cache never serves a stale build (1 = round-2 builder; the r3 speed-ups are bit-identical).
+comptime SOTA_DAG_BUILDER_VERSION: Int = 1
 
 
 def _append_raw(mut out: List[UInt8], addr: Int, n: Int):
@@ -49,6 +54,7 @@ def mesh_content_hash(mesh: NativeMesh, group_size: Int = SOTA_DAG_GROUP_SIZE) -
     _append_raw(b, Int(mesh.indices.unsafe_ptr()), len(mesh.indices) * 8)
     b.append(UInt8(group_size & 255))
     b.append(UInt8(SOTA_DAG_BLOB_VERSION))
+    b.append(UInt8(SOTA_DAG_BUILDER_VERSION))  # --- sota:perf hook ---
     return hash_list(b)
 
 
@@ -136,7 +142,15 @@ def write_cluster_dag_flpk(path: String, dag: ClusterDag, key: UInt64) -> Bool:
     var rel = "dag/" + _key_hex(key)
     chunks.append(FlpkBuildChunk(AssetUuid.from_path(rel), rel, SOTA_DAG_SUB_ID, SOTA_DAG_ASSET_KIND,
                                  encode_cluster_dag(dag, key), compression=CHUNK_COMP_LZ4))
-    return write_flpk_v3(path, chunks, page_align=False)
+    # --- sota:perf hook --- write a temporary file and rename it over the entry (atomic for readers)
+    var tmp = sota_dag_cache_tmp_path(path)
+    if not write_flpk_v3(tmp, chunks, page_align=False):
+        _ = remove_file(tmp)
+        return False
+    if not rename_file(tmp, path):
+        _ = remove_file(tmp)
+        return False
+    return True
 
 
 def read_cluster_dag_flpk(path: String, key: UInt64, mut dag: ClusterDag) -> Bool:
@@ -179,7 +193,7 @@ def build_cluster_dag_cached(
         dag = build_cluster_dag_mt(mesh, pool, group_size)
     else:
         dag = build_cluster_dag(mesh, group_size)
-    if cache_dir.byte_length() > 0 and len(dag.clusters) > 0:
+    if cache_dir.byte_length() > 0 and len(dag.clusters) > 0 and sota_dag_cache_ensure_dir(cache_dir):  # sota:perf hook
         if write_cluster_dag_flpk(path, dag, key):
             stats.writes += 1
     return dag^

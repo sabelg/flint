@@ -397,6 +397,7 @@ from flint.core.jobs import JobPool, default_worker_count  # --- sota:perf hook 
 from flint.render.sota_geometry_cluster_dag import ClusterDag  # --- sota:perf hook ---
 from flint.render.sota_geometry_cull import SOTA_BIND_INDIRECT  # --- sota:perf hook ---
 from flint.render.sota_perf_async import sota_pipelined_default, sota_route_capacity_for, sota_route_draws_limit  # --- sota:perf hook ---
+from flint.render.sota_perf_dag_cache import sota_dag_cache_budget_mb, sota_dag_cache_prune  # --- sota:perf hook ---
 from flint.render.sota_perf_upload import (  # --- sota:perf hook --- upload profile + parallel prepass
     SOTA_PREP_ALBEDO,
     SOTA_PREP_NORMAL,
@@ -2685,6 +2686,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_upload.prepared_jobs += self.sota_prep.jobs
         self.sota_upload.prepared_workers = self.sota_prep.workers
         self.sota_upload.dag_cache_hits += hits
+        _ = sota_dag_cache_prune(self.sota_geom.dag_cache_dir, sota_dag_cache_budget_mb())  # --- sota:perf hook --- bounded cache
         self.sota_prep.current_mesh = -1
 
     def _sota_upload_prepared_texture(mut self, role: Int, t: Int) -> Int:
