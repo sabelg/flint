@@ -4,6 +4,7 @@ Provides the CPU UI command accumulator `UiDrawList` streaming compact 64-byte
 primitives (`GpuUiPrim`) to the GPU for sub-0.04 ms tile-binned compute compositing.
 """
 from std.collections import List
+from std.math import isfinite
 from std.memory import bitcast
 from flint.render.font import SdfFont, decode_utf8
 
@@ -735,3 +736,92 @@ struct UiDrawList(Movable):
             outline_color,
             shadow,
         )
+
+    @staticmethod
+    @always_inline
+    def _scale_packed_clip(packed: UInt32, s: Float32) -> UInt32:
+        var x = Int(Float32(packed & UInt32(0xFFFF)) * s + Float32(0.5))
+        var y = Int(Float32((packed >> 16) & UInt32(0xFFFF)) * s + Float32(0.5))
+        var cx = max(0, min(65535, x))
+        var cy = max(0, min(65535, y))
+        return UInt32(cx) | (UInt32(cy) << 16)
+
+    def scale_all(mut self, scale: Float32):
+        """Uniformly scales every primitive in this draw list from logical UI coords to physical pixels.
+        Preserves razor-sharp GPU SDF rendering at arbitrary HiDPI factors (e.g. 1.5x, 2.0x)."""
+        if not isfinite(scale) or abs(scale - Float32(1.0)) < Float32(1.0e-4):
+            return
+        var s = max(Float32(0.5), min(Float32(4.0), scale))
+        for i in range(len(self.prims)):
+            ref p = self.prims[i]
+            var kind = p.header & UInt32(0xF)
+            var flags = (p.header >> 16) & UInt32(0xFFFF)
+            if kind == PRIM_POLY_DATA:
+                # 7 (x, y) vertices packed across words 0..13; preserve POLY_BREAK sentinels (< -1e20)
+                if p.x0 > Float32(-1.0e20):
+                    p.x0 *= s
+                    p.y0 *= s
+                if p.x1 > Float32(-1.0e20):
+                    p.x1 *= s
+                    p.y1 *= s
+                if p.u0 > Float32(-1.0e20):
+                    p.u0 *= s
+                    p.v0 *= s
+                if p.u1 > Float32(-1.0e20):
+                    p.u1 *= s
+                    p.v1 *= s
+                var vx4 = bitcast[DType.float32](p.clip_xy0)
+                var vy4 = bitcast[DType.float32](p.clip_xy1)
+                if vx4 > Float32(-1.0e20):
+                    p.clip_xy0 = bitcast[DType.uint32](vx4 * s)
+                    p.clip_xy1 = bitcast[DType.uint32](vy4 * s)
+                var vx5 = bitcast[DType.float32](p.fill_rgba8)
+                var vy5 = bitcast[DType.float32](p.secondary_rgba8)
+                if vx5 > Float32(-1.0e20):
+                    p.fill_rgba8 = bitcast[DType.uint32](vx5 * s)
+                    p.secondary_rgba8 = bitcast[DType.uint32](vy5 * s)
+                if p.param0 > Float32(-1.0e20):
+                    p.param0 *= s
+                    p.param1 *= s
+                continue
+
+            p.x0 *= s
+            p.y0 *= s
+            p.x1 *= s
+            p.y1 *= s
+            p.clip_xy0 = Self._scale_packed_clip(p.clip_xy0, s)
+            p.clip_xy1 = Self._scale_packed_clip(p.clip_xy1, s)
+
+            if kind == PRIM_SHAPE:
+                if (flags & UI_FLAG_PER_CORNER_RADII) != 0:
+                    p.u0 *= s
+                    p.v0 *= s
+                    p.u1 *= s
+                    p.v1 *= s
+                p.param0 *= s
+                p.param1 *= s
+                if (flags & (UI_FLAG_OUTER_GLOW | UI_FLAG_DROP_SHADOW | UI_FLAG_GLASS_SCRIM)) != 0:
+                    p.param2 *= s
+            elif kind == PRIM_GLYPH:
+                p.param0 *= s
+                p.param1 *= s
+                p.param2 *= s
+            elif kind == PRIM_LINE:
+                p.u0 *= s
+                p.v0 *= s
+                p.u1 *= s
+                p.v1 *= s
+                if (flags & UI_FLAG_QUAD_BEZIER) != 0:
+                    p.param0 *= s
+                    p.param1 *= s
+                    p.param2 *= s
+                else:
+                    p.param0 *= s
+            elif kind == PRIM_ARC:
+                p.u0 *= s
+                p.v0 *= s
+                p.param0 *= s
+                p.param1 *= s
+                p.param2 *= s
+            elif kind == PRIM_CONTROLLER_SYMBOL or kind == PRIM_IMAGE or kind == PRIM_NINE_SLICE:
+                p.param0 *= s

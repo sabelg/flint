@@ -2080,6 +2080,7 @@ struct FlintStudioState(Movable):
     var studio_theme_idx: Int
     var ui_time_sec: Float32
     var anim_mode: Int
+    var ui_scale: Float32
     var _next_tx_id: UInt64
     var _active_tx_agent_id: Int
     var _active_tx_step_id: UInt64
@@ -2230,6 +2231,7 @@ struct FlintStudioState(Movable):
         self.studio_theme_idx = THEME_FLINT_OBSIDIAN
         self.ui_time_sec = Float32(0.0)
         self.anim_mode = UI_ANIM_NORMAL
+        self.ui_scale = Float32(1.0)
         self._next_tx_id = UInt64(1)
         self._active_tx_agent_id = 0
         self._active_tx_step_id = UInt64(0)
@@ -2771,18 +2773,32 @@ struct FlintStudioState(Movable):
         self.camera_rig.update(self._cam_dummy_world, self.cam_target, dt, fly_move_local=fly_move_local, fly_speed=fly_speed)
         self._sync_from_camera_rig()
 
+    def set_ui_scale(mut self, scale: Float32):
+        if isfinite(scale):
+            self.ui_scale = max(Float32(0.75), min(Float32(3.0), scale))
+
+    @always_inline
+    def effective_ui_scale(self) -> Float32:
+        if self.anim_mode == UI_ANIM_INSTANT:
+            return Float32(1.0)
+        return max(Float32(0.75), min(Float32(3.0), self.ui_scale))
+
     def viewport_rect(mut self, screen_w: Int, screen_h: Int) -> RectF:
+        var s = self.effective_ui_scale()
+        var lw = Float32(screen_w) / s
+        var lh = Float32(screen_h) / s
         self.dock.solve_layout(
             RectF(
                 0.0,
                 STUDIO_HEADER_BAR_H,
-                Float32(screen_w),
-                max(Float32(64.0), Float32(screen_h) - STUDIO_HEADER_BAR_H),
+                lw,
+                max(Float32(64.0), lh - STUDIO_HEADER_BAR_H),
             )
         )
         var vp = self.dock.find_panel("SceneViewport")
         if vp[0] >= 0:
-            return vp[3]
+            var r = vp[3]
+            return RectF(r.x * s, r.y * s, r.w * s, r.h * s)
         return RectF(
             Float32(236.0),
             STUDIO_HEADER_BAR_H + Float32(14.0),
@@ -3120,12 +3136,15 @@ struct FlintStudioState(Movable):
     def wants_mouse_at(self, mx: Float32, my: Float32) -> Bool:
         if self.wants_mouse():
             return True
-        if self.header_bar.contains_point(mx, my):
+        var s = self.effective_ui_scale()
+        var lmx = mx / s
+        var lmy = my / s
+        if self.header_bar.contains_point(lmx, lmy):
             return True
-        if self.viewport_hud.contains_point(mx, my):
+        if self.viewport_hud.contains_point(lmx, lmy):
             return True
         for i in range(len(self._last_theatre_hits)):
-            if self._last_theatre_hits[i].contains(mx, my):
+            if self._last_theatre_hits[i].contains(lmx, lmy):
                 return True
         return False
 
@@ -4419,12 +4438,15 @@ struct FlintStudioState(Movable):
             or self.ui_ctx.wants_keyboard()
             or self.menu.bar.group >= 0
         )
+        var _sc = self.effective_ui_scale()
+        var _lmx = input.last_mouse_x / _sc
+        var _lmy = input.last_mouse_y / _sc
         var mouse_captured = (
             modal_open
             or self.command_palette.is_open
             or self.ui_ctx.wants_mouse()
-            or self.header_bar.contains_point(input.last_mouse_x, input.last_mouse_y)
-            or self.viewport_hud.contains_point(input.last_mouse_x, input.last_mouse_y)
+            or self.header_bar.contains_point(_lmx, _lmy)
+            or self.viewport_hud.contains_point(_lmx, _lmy)
             or self.menu.bar.group >= 0
         )
         var in_play = self.pie.mode != PIE_STOPPED
@@ -4444,7 +4466,16 @@ struct FlintStudioState(Movable):
                 self.open_command_palette(PALETTE_SPAWN)
                 return True
             elif ctrl_down and not shift_down and not alt_down:
-                if input.key_pressed(49):
+                if input.key_pressed(61) or input.key_pressed(334):  # Ctrl + = / + : UI Zoom In
+                    self.set_ui_scale(self.ui_scale + Float32(0.25))
+                    self.push_toast("UI Scale: " + String(Int(self.ui_scale * Float32(100.0) + Float32(0.5))) + "%", 0, 1.8)
+                elif input.key_pressed(45) or input.key_pressed(333):  # Ctrl + - : UI Zoom Out
+                    self.set_ui_scale(self.ui_scale - Float32(0.25))
+                    self.push_toast("UI Scale: " + String(Int(self.ui_scale * Float32(100.0) + Float32(0.5))) + "%", 0, 1.8)
+                elif input.key_pressed(48):  # Ctrl + 0 : Reset UI Scale 200%
+                    self.set_ui_scale(Float32(2.0))
+                    self.push_toast("UI Scale: 200%", 0, 1.8)
+                elif input.key_pressed(49):
                     _ = self.apply_workspace_preset(WORKSPACE_EDIT)
                 elif input.key_pressed(50):
                     _ = self.apply_workspace_preset(WORKSPACE_AGENT_STUDIO)
@@ -8934,8 +8965,9 @@ def emit_studio_ui_draw_list(
     studio._normalize_selection_from_primary()
     studio._prune_selection()
 
-    var sw = Float32(max(320, screen_w))
-    var sh = Float32(max(240, screen_h))
+    var ui_sc = studio.effective_ui_scale()
+    var sw = Float32(max(320, screen_w)) / ui_sc
+    var sh = Float32(max(240, screen_h)) / ui_sc
     studio._last_screen_w = sw
     studio._last_screen_h = sh
 
@@ -8948,7 +8980,11 @@ def emit_studio_ui_draw_list(
     studio.ui_ctx.theme.font_size = Float32(13.0)
     studio.ui_ctx.theme.row_height = Float32(22.0)
 
-    studio.ui_ctx.begin_frame(input, sw, sh, dt)
+    var scaled_input = input.copy()
+    if abs(ui_sc - Float32(1.0)) > Float32(1.0e-4):
+        scaled_input.last_mouse_x = input.last_mouse_x / ui_sc
+        scaled_input.last_mouse_y = input.last_mouse_y / ui_sc
+    studio.ui_ctx.begin_frame(scaled_input, sw, sh, dt)
     if studio.ui_ctx.mouse_pressed_l or studio.ui_ctx.mouse_released_l:
         studio.ui_edit_seq += 1
     if studio.input_rebind_active:
@@ -10763,7 +10799,9 @@ def emit_studio_ui_draw_list(
     studio.ui_ctx.end_frame()
 
     for i in range(len(studio.ui_ctx.draw_list.prims)):
-        var p = studio.ui_ctx.draw_list.prims[i]
-        if (p.header & 0xF) == PRIM_GLYPH and p.param0 < Float32(0.5):
-            p.param0 = max(Float32(1.5), p.param0 * Float32(255.0))
-        ui.prims.append(p)
+        if (studio.ui_ctx.draw_list.prims[i].header & 0xF) == PRIM_GLYPH and studio.ui_ctx.draw_list.prims[i].param0 < Float32(0.5):
+            studio.ui_ctx.draw_list.prims[i].param0 = max(Float32(1.5), studio.ui_ctx.draw_list.prims[i].param0 * Float32(255.0))
+    if abs(ui_sc - Float32(1.0)) > Float32(1.0e-4):
+        studio.ui_ctx.draw_list.scale_all(ui_sc)
+    for i in range(len(studio.ui_ctx.draw_list.prims)):
+        ui.prims.append(studio.ui_ctx.draw_list.prims[i])

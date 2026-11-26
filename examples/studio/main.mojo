@@ -267,6 +267,7 @@ def _run_studio() raises -> Int:
     var workspace_opt = -1
     var theme_opt = -1
     var anim_mode_opt = -1
+    var ui_scale_opt = Float32(-1.0)
 
     var args = argv()
     var exe_path = String(args[0]) if len(args) > 0 else String("flint-studio")
@@ -364,6 +365,17 @@ def _run_studio() raises -> Int:
             if anim_mode_opt < 0:
                 print("[Flint Studio] ERROR: unknown --anim-mode value: " + mraw)
                 return 1
+        elif a == "--ui-scale" and ai + 1 < len(args):
+            ai += 1
+            try:
+                ui_scale_opt = Float32(Float64(String(args[ai])))
+            except:
+                ui_scale_opt = Float32(2.0)
+        elif a.startswith("--ui-scale="):
+            try:
+                ui_scale_opt = Float32(Float64(String(a[byte=11:])))
+            except:
+                ui_scale_opt = Float32(2.0)
         ai += 1
 
     # Pure-Mojo stdio <-> AF_UNIX proxy exits immediately with zero GPU/Window initialization
@@ -408,9 +420,9 @@ def _run_studio() raises -> Int:
                 print("[Flint Studio] ERROR: " + ver_check[1])
                 return 1
 
-    var out_w = 1280
-    var out_h = 720
     var is_headless = mcp_stdio or headless_smoke or shots_mode or gallery_mode
+    var out_w = 1280 if is_headless else 1920
+    var out_h = 720 if is_headless else 1080
     var render_tier = RENDER_TIER_0_HEADLESS_SIMD if mcp_stdio else RENDER_TIER_2_AAA_VISBUFFER_RT
     var proj_arg = project_root if (has_project_flag or has_project_env) else ""
     var studio = FlintStudioState(
@@ -421,6 +433,17 @@ def _run_studio() raises -> Int:
         worker_threads=max(1, default_worker_count()),
         project_root=proj_arg,
     )
+    if not is_headless:
+        var env_sc = env_value("FLINT_UI_SCALE")
+        if ui_scale_opt > Float32(0.0):
+            studio.set_ui_scale(ui_scale_opt)
+        elif env_sc.byte_length() > 0:
+            try:
+                studio.set_ui_scale(Float32(Float64(env_sc)))
+            except:
+                studio.set_ui_scale(Float32(2.0))
+        else:
+            studio.set_ui_scale(Float32(2.0))
     if has_project_flag or has_project_env:
         studio.asset_browser_dir = project_root
     populate_default_studio_scene(studio)
@@ -691,11 +714,12 @@ def _run_studio() raises -> Int:
         var my = frame_input.last_mouse_y
         var in_vp = vp_rect.contains(mx, my)
 
+        var _ui_s = studio.effective_ui_scale()
         var ui_blocks_vp = (
             studio.dock.dragging_node >= 0
             or studio.dock.hovered_splitter_node >= 0
             or studio.wants_mouse_at(mx, my)
-            or studio.ui_ctx.wants_mouse_at(mx, my)
+            or studio.ui_ctx.wants_mouse_at(mx / _ui_s, my / _ui_s)
             or studio.menu.bar.group >= 0
             or studio.pie.mode != PIE_STOPPED
         )

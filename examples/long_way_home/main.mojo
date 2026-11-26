@@ -947,37 +947,42 @@ def main():
 
         dl.clear()
         _render_chapter(dl, game, font_slot, font)
+        var win_scale = min(Float32(out_w) / Float32(SCREEN_W), Float32(out_h) / Float32(SCREEN_H))
+        if abs(win_scale - Float32(1.0)) > Float32(0.01):
+            dl.scale_all(win_scale)
 
-        # Native Wayland client-side Minimize / Maximize / Close + top-bar drag-to-move
+        # Native Wayland client-side Minimize / Maximize / Close + top-bar drag-to-move (scaled cleanly for HiDPI)
         var csd_quit = False
         if len(w_opt.value()[unsafe_offset=0].windows) > 0:
             ref win = w_opt.value()[unsafe_offset=0].windows[0]
             if win.uses_client_decorations():
+                var csd_s = max(Float32(1.0), win_scale)
                 var mx = inp.last_mouse_x
                 var my = inp.last_mouse_y
                 var mpress = inp.mouse_pressed(0)
-                var by = Float32(14.0)
-                var bw = Float32(26.0)
-                var bh = Float32(24.0)
-                var cl_x = Float32(out_w) - Float32(14.0) - bw
-                var mx_x = cl_x - Float32(6.0) - bw
-                var mn_x = mx_x - Float32(6.0) - bw
+                var by = Float32(14.0) * csd_s
+                var bw = Float32(26.0) * csd_s
+                var bh = Float32(24.0) * csd_s
+                var gap = Float32(6.0) * csd_s
+                var cl_x = Float32(out_w) - Float32(14.0) * csd_s - bw
+                var mx_x = cl_x - gap - bw
+                var mn_x = mx_x - gap - bw
                 var cl_h = mx >= cl_x and mx <= cl_x + bw and my >= by and my <= by + bh
                 var mx_h = mx >= mx_x and mx <= mx_x + bw and my >= by and my <= by + bh
                 var mn_h = mx >= mn_x and mx <= mn_x + bw and my >= by and my <= by + bh
-                var pill_bg = _rgba(22, 18, 28, 150)
-                var pill_hov = _rgba(54, 46, 66, 210)
-                var fg = _rgba(246, 238, 224, 235)
+                var pill_bg = _rgba(22, 18, 28, 165)
+                var pill_hov = _rgba(54, 46, 66, 220)
+                var fg = _rgba(246, 238, 224, 240)
                 # Minimize
-                dl.add_rect(mn_x, by, bw, bh, pill_hov if mn_h else pill_bg, Float32(6.0))
-                dl.add_line(mn_x + Float32(8.0), by + Float32(15.0), mn_x + Float32(18.0), by + Float32(15.0), Float32(1.6), fg)
+                dl.add_rect(mn_x, by, bw, bh, pill_hov if mn_h else pill_bg, Float32(6.0) * csd_s)
+                dl.add_line(mn_x + Float32(8.0) * csd_s, by + Float32(15.0) * csd_s, mn_x + Float32(18.0) * csd_s, by + Float32(15.0) * csd_s, Float32(1.6) * csd_s, fg)
                 # Maximize / Restore
-                dl.add_rect(mx_x, by, bw, bh, pill_hov if mx_h else pill_bg, Float32(6.0))
-                dl.add_rect(mx_x + Float32(8.0), by + Float32(7.0), Float32(10.0), Float32(10.0), 0, Float32(1.5), Float32(1.5), fg)
+                dl.add_rect(mx_x, by, bw, bh, pill_hov if mx_h else pill_bg, Float32(6.0) * csd_s)
+                dl.add_rect(mx_x + Float32(8.0) * csd_s, by + Float32(7.0) * csd_s, Float32(10.0) * csd_s, Float32(10.0) * csd_s, 0, Float32(1.5) * csd_s, Float32(1.5) * csd_s, fg)
                 # Close
-                dl.add_rect(cl_x, by, bw, bh, _rgba(218, 62, 62, 225) if cl_h else pill_bg, Float32(6.0))
-                dl.add_line(cl_x + Float32(8.5), by + Float32(7.5), cl_x + Float32(17.5), by + Float32(16.5), Float32(1.6), fg)
-                dl.add_line(cl_x + Float32(17.5), by + Float32(7.5), cl_x + Float32(8.5), by + Float32(16.5), Float32(1.6), fg)
+                dl.add_rect(cl_x, by, bw, bh, _rgba(218, 62, 62, 225) if cl_h else pill_bg, Float32(6.0) * csd_s)
+                dl.add_line(cl_x + Float32(8.5) * csd_s, by + Float32(7.5) * csd_s, cl_x + Float32(17.5) * csd_s, by + Float32(16.5) * csd_s, Float32(1.6) * csd_s, fg)
+                dl.add_line(cl_x + Float32(17.5) * csd_s, by + Float32(7.5) * csd_s, cl_x + Float32(8.5) * csd_s, by + Float32(16.5) * csd_s, Float32(1.6) * csd_s, fg)
                 if mpress:
                     if cl_h:
                         csd_quit = True
@@ -985,7 +990,7 @@ def main():
                         win.toggle_maximize()
                     elif mn_h:
                         win.minimize()
-                    elif my <= Float32(44.0):
+                    elif my <= Float32(44.0) * csd_s:
                         win.start_interactive_move()
         if csd_quit:
             break
