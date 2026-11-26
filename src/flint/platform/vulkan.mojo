@@ -3066,6 +3066,55 @@ struct VulkanGpu(Copyable, Movable):
             return 0
         return pipeline
 
+    # --- sota:mat hook --- (area I: compute pipelines with VkSpecializationInfo for `OpSpecConstant`s)
+    def create_aaa_compute_pipeline_spec(
+        mut self, pipeline_layout: Int, code: List[UInt32], spec_ids: List[UInt32], spec_values: List[UInt32]
+    ) -> Int:
+        """`create_aaa_compute_pipeline` with `VkSpecializationInfo`: constant `spec_ids[i]` takes the 32-bit
+        `spec_values[i]` (VkBool32 / uint / float bits). No entries: identical to the plain call."""
+        var n = min(len(spec_ids), len(spec_values))
+        if n == 0:
+            return self.create_aaa_compute_pipeline(pipeline_layout, code)
+        self.rewind()
+        var module_info = self.scratch(40)
+        put32(module_info, TYPE_SHADER_MODULE_CREATE_INFO)
+        put64(module_info + 24, len(code) * 4)
+        put64(module_info + 32, Int(code.unsafe_ptr()))
+        self.sota_e_spirv_hashes.append(sota_e_spirv_hash(code))
+        var slot = self.scratch(8)
+        if not self.check(call4(self.device_call("vkCreateShaderModule"), self.device, module_info, 0, slot), "vkCreateShaderModule(AAA-Spec)"):
+            return 0
+        var module = get64(slot)
+        var entries = self.scratch(16 * n)
+        var data = self.scratch(4 * n)
+        for i in range(n):
+            put32(entries + i * 16, spec_ids[i])
+            put32(entries + i * 16 + 4, UInt32(i * 4))
+            put64(entries + i * 16 + 8, 4)
+            put32(data + i * 4, spec_values[i])
+        var spec_info = self.scratch(32)
+        put32(spec_info, UInt32(n))
+        put64(spec_info + 8, entries)
+        put64(spec_info + 16, 4 * n)
+        put64(spec_info + 24, data)
+        var info = self.scratch(96)
+        put32(info, TYPE_COMPUTE_PIPELINE_CREATE_INFO)
+        put32(info + 24, TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+        put32(info + 44, STAGE_COMPUTE_SHADER)
+        put64(info + 48, module)
+        put64(info + 56, self.text("main"))
+        put64(info + 64, spec_info)
+        put64(info + 72, pipeline_layout)
+        put32(info + 88, 0xFFFFFFFF)
+        var result = call6(self.device_call("vkCreateComputePipelines"), self.device, self.pipeline_cache, 1, info, 0, slot)
+        var pipeline = get64(slot)
+        _ = call3(self.device_call("vkDestroyShaderModule"), self.device, module, 0)
+        _ = len(code)
+        if not self.check(result, "vkCreateComputePipelines(AAA-Spec)"):
+            return 0
+        return pipeline
+
+    # --- end sota:mat hook ---
     def create_graphics_pipeline(
         mut self,
         pipeline_layout: Int,

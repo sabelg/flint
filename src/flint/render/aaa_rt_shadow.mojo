@@ -177,7 +177,7 @@ def emit_visbuffer_surface(
     return (wx, wy, wz, s.fmul(wn[0], flip), s.fmul(wn[1], flip), s.fmul(wn[2], flip))
 
 
-def rt_sun_shadow_trace_shader() -> List[UInt32]:
+def rt_sun_shadow_trace_shader(sota_mat_layered: Bool = False) -> List[UInt32]:
     """Per-pixel area-sun occlusion (`group = 8 x 8`). Push[0] = render_w, [1] = render_h, [2] = raw offset."""
     var s = AaaSpirvModule(
         MODEL_GL_COMPUTE,
@@ -272,7 +272,10 @@ def rt_sun_shadow_trace_shader() -> List[UInt32]:
         var rdir = s.vec3(dir[0], dir[1], dir[2])
         var rq = s.ray_query_var()
         s.ray_query_init(rq, tlas_var, s.uint(RAY_FLAG_TERMINATE_ON_FIRST_HIT_KHR), s.uint(AAA_RT_MASK_OPAQUE), ro, s.float(0.002), rdir, s.float(500.0))
-        _emit_rt_candidate_alpha_loop(s, rq, b_verts, b_indices, b_instances, b_materials, bindless_arr)
+        var sota_tr: UInt32 = 0  # --- sota:mat hook --- transmittance of layered transmissive surfaces (variant only)
+        if sota_mat_layered:
+            sota_tr = s.fvar(s.float(1.0))
+        _emit_rt_candidate_alpha_loop(s, rq, b_verts, b_indices, b_instances, b_materials, bindless_arr, sota_tr)
         var hit = s.ine(s.ray_query_committed_type(rq), s.uint(0))
         var v_k = s.fvar(s.select_f(hit, s.float(0.0), s.float(1.0)))
         s.begin_if(hit)
@@ -293,6 +296,8 @@ def rt_sun_shadow_trace_shader() -> List[UInt32]:
         s.store(occ_n, s.fadd(s.load_f(occ_n), s.float(1.0)))
         s.end_if()
         s.end_if()
+        if sota_tr != 0:  # --- sota:mat hook ---
+            s.store(v_k, s.fmul(s.load_f(v_k), s.load_f(sota_tr)))
         s.store(vis_sum, s.fadd(s.load_f(vis_sum), s.load_f(v_k)))
 
     var n_occ = s.load_f(occ_n)

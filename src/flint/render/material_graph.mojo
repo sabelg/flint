@@ -44,6 +44,7 @@ from flint.render.shader_dsl import (
     max_f,
     mix_vec3,
     normalize,
+    select_f,  # sota:mat hook
     sin_f,
 )
 from flint.render.aaa_visbuffer import (
@@ -654,6 +655,14 @@ def compile_surface_material_shader[NodeT: SurfaceMaterialNode](node: NodeT) -> 
         mat_id,
     )
     var res = node.evaluate_surface(dsl, inputs, b_mats, bindless)
+    # --- sota:mat hook --- SpecId 1 (domain override) is real now: set via VkSpecializationInfo
+    var sota_unlit = spec_mode.eq(MAT_DOMAIN_UNLIT_UI)
+    res.roughness = select_f(sota_unlit, dsl.f32(1.0), res.roughness)
+    res.metallic = select_f(sota_unlit, dsl.f32(0.0), res.metallic)
+    res.clearcoat = select_f(
+        sota_unlit, dsl.f32(0.0), select_f(spec_mode.eq(MAT_DOMAIN_CLEARCOAT), max_f(res.clearcoat, 1.0), res.clearcoat)
+    )
+    # --- end sota:mat hook ---
     var cc_out = dsl.var_f32(dsl.f32(0.0))
     dsl.if_then(spec_cc)
     cc_out.set(res.clearcoat)

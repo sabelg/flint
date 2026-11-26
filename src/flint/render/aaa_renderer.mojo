@@ -152,6 +152,7 @@ from flint.render.sota_e_hair_shadow import SotaEHairShadow, sota_e_dom_words
 from flint.render.sota_mat_core import (
     AAA_FLAG_SOTA_MAT,
     SOTA_MAT_EXTRA_BYTES,
+    SOTA_MAT_INSTANCE_TRANS_BIT,
     SOTA_MAT_MAX_MATERIALS,
     SotaMatLayers,
     SotaMatState,
@@ -2171,6 +2172,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if mat_id < 0 or mat_id >= SOTA_MAT_MAX_MATERIALS:
             return
         sota_mat_write_layers(self.buf_materials.cpu_address, mat_id, layers)
+        self.sota_mat.set_transmissive(mat_id, layers.is_transmissive())
 
     # --- end sota:mat hook ---
     def update_material(mut self, mat_id: Int, mat: AaaMaterial):
@@ -2201,6 +2203,8 @@ struct FlintAaaVulkanRenderer(Movable):
         dim: Int = 32,
         time_sec: Float32 = 0.0,
         world_y_scale: Float32 = 24.0,
+        enable_clearcoat: Bool = True,  # --- sota:mat hook --- SpecId 0 / 1 through VkSpecializationInfo
+        domain: UInt32 = 0,
     ) -> Tuple[Int, Int]:
         """Compiles & dispatches `node` (`SurfaceMaterialNode`) on Vulkan against live `buf_materials` (`Binding 4`, stride `24`)
         and `BIND_AAA_BINDLESS_TEX`, bakes the GPU-evaluated surface response into bindless `BC7` Albedo + ORM textures,
@@ -2209,7 +2213,9 @@ struct FlintAaaVulkanRenderer(Movable):
             return (-1, -1)
         var tex_dim = max(8, min(256, (dim + 3) & ~3))
         var spv = compile_surface_material_shader(node)
-        var pipe = self.vk.create_aaa_compute_pipeline(self.pipe_layout, spv)
+        var pipe = self.vk.create_aaa_compute_pipeline_spec(  # --- sota:mat hook ---
+            self.pipe_layout, spv, [UInt32(0), UInt32(1)], [UInt32(1) if enable_clearcoat else UInt32(0), domain]
+        )
         if pipe == 0:
             return (-1, -1)
 
@@ -4530,13 +4536,15 @@ struct FlintAaaVulkanRenderer(Movable):
             if sota_e_outl:
                 self.sota_e_gpu.frame_outline_instances += 1
             # --- end sota:E hook ---
+            var sota_mt = self.sota_mat.is_transmissive(mat_final)  # --- sota:mat hook --- shadows attenuate through it
             put32(
                 dst + 39 * 4,
                 UInt32(mat_final & 0xFFFF)
                 | ((UInt32(1) if is_ds else UInt32(0)) << 16)
                 | ((UInt32(1) if is_am_inst else UInt32(0)) << 17)
                 | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0))
-                | (SOTA_E_INSTANCE_OUTLINE_BIT if sota_e_outl else UInt32(0)),  # sota:E hook
+                | (SOTA_E_INSTANCE_OUTLINE_BIT if sota_e_outl else UInt32(0))  # sota:E hook
+                | (SOTA_MAT_INSTANCE_TRANS_BIT if sota_mt else UInt32(0)),  # sota:mat hook
             )
             var my_sc_base = 0xFFFFFF
             if i < 1024:
@@ -4566,7 +4574,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     my_sc_base,
                     blas_da,
                     cull_disable=True,
-                    alpha_masked=is_am_inst,
+                    alpha_masked=is_am_inst or sota_mt,  # sota:mat hook (FORCE_NO_OPAQUE: any-hit sees it)
                     glass=is_glass_inst,
                 )
 
@@ -4741,7 +4749,22 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:mat hook (layered material model; LUTs baked + uploaded on first enabled frame) ---
         if self.sota_mat.enabled:
             self.sota_mat.prepare(self.buf_materials.cpu_address)
-            if self.sota_mat.lut_uploaded:
+            if not self.sota_mat.variants_tried:  # layered pipeline variants (the defaults carry none of it)
+                self.sota_mat.variants_tried = True
+                var sota_t0 = get_time()
+                var sota_rt = self.vk.has_ray_query
+                self.sota_mat.pipe_deferred = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, aaa_deferred_shade_shader(sota_rt, sota_mat_layered=True)
+                )
+                self.sota_mat.pipe_surfcache = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, surface_cache_update_shader(sota_rt, sota_mat_layered=True)
+                )
+                if sota_rt:
+                    self.sota_mat.pipe_rt_shadow = self.vk.create_aaa_compute_pipeline(
+                        self.pipe_layout, rt_sun_shadow_trace_shader(sota_mat_layered=True)
+                    )
+                self.sota_mat.variant_build_s = get_time() - sota_t0
+            if self.sota_mat.active():
                 r_flags |= AAA_FLAG_SOTA_MAT
         # --- end sota:mat hook ---
         put32(g_addr + 99 * 4, r_flags)
@@ -5483,7 +5506,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     push_sc0[2] = UInt32(0)
                     self.vk.dispatch_aaa(
                         cur_slot,
-                        self.pipe_surfcache,
+                        self.sota_mat.pick(self.pipe_surfcache, self.sota_mat.pipe_surfcache),  # sota:mat hook
                         self.pipe_layout,
                         self.desc_set,
                         push_sc0,
@@ -5498,7 +5521,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     push_sc1[2] = UInt32(head_end)
                     self.vk.dispatch_aaa(
                         cur_slot,
-                        self.pipe_surfcache,
+                        self.sota_mat.pick(self.pipe_surfcache, self.sota_mat.pipe_surfcache),  # sota:mat hook
                         self.pipe_layout,
                         self.desc_set,
                         push_sc1,
@@ -5628,7 +5651,8 @@ struct FlintAaaVulkanRenderer(Movable):
             push_rs[2] = UInt32(rt_shadow_raw_offset(max_pix))
             push_rs[3] = UInt32(rt_sun_flt_off)
             self.vk.dispatch_aaa(
-                cur_slot, self.pipe_rt_shadow_trace, self.pipe_layout, self.desc_set, push_rs, (self.render_w + 7) // 8, (self.render_h + 7) // 8
+                cur_slot, self.sota_mat.pick(self.pipe_rt_shadow_trace, self.sota_mat.pipe_rt_shadow),  # sota:mat hook
+                self.pipe_layout, self.desc_set, push_rs, (self.render_w + 7) // 8, (self.render_h + 7) // 8
             )
             self.vk.memory_barrier2(
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
@@ -5679,7 +5703,7 @@ struct FlintAaaVulkanRenderer(Movable):
         push_sh[8] = UInt32((self.render_w + 7) // 8)  # --- sota:camera hook ---
         self.vk.dispatch_aaa(
             cur_slot,
-            self.pipe_deferred_shade,
+            self.sota_mat.pick(self.pipe_deferred_shade, self.sota_mat.pipe_deferred),  # sota:mat hook
             self.pipe_layout,
             self.desc_set,
             push_sh,
@@ -6912,6 +6936,14 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_water_refract)
         if self.pipe_rt_shadow_trace != 0:
             self.vk.destroy_pipeline(self.pipe_rt_shadow_trace)
+        # --- sota:mat hook --- layered pipeline variants
+        if self.sota_mat.pipe_deferred != 0:
+            self.vk.destroy_pipeline(self.sota_mat.pipe_deferred)
+        if self.sota_mat.pipe_surfcache != 0:
+            self.vk.destroy_pipeline(self.sota_mat.pipe_surfcache)
+        if self.sota_mat.pipe_rt_shadow != 0:
+            self.vk.destroy_pipeline(self.sota_mat.pipe_rt_shadow)
+        # --- end sota:mat hook ---
         if self.pipe_rt_shadow_filter != 0:
             self.vk.destroy_pipeline(self.pipe_rt_shadow_filter)
         if self.pipe_glass_refract != 0:

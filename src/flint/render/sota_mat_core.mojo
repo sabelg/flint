@@ -50,7 +50,17 @@ comptime AAA_FLAG_SOTA_MAT: UInt32 = 1 << 24
 comptime SOTA_MAT_PI: Float32 = 3.14159265
 comptime SOTA_MAT_INV_PI: Float32 = 0.318309886
 comptime SOTA_MAT_MAX_MATERIALS: Int = 1024
-comptime SOTA_MAT_EXT_WORDS: Int = 8
+comptime SOTA_MAT_EXT_WORDS: Int = 16
+# Extension words: 0 magic, 1 anisotropy, 2 rotation, 3 transmission, 4..6 tint (thin-walled) or attenuation
+# colour (volume), 7 coat normal mode, 8 volume attenuation distance (0 = thin-walled), 9 layer texture slot,
+# 10 coat normal texture slot, 11 coat normal strength, 12..15 reserved (0).
+comptime SOTA_MAT_NO_TEX: UInt32 = 0xFFFFFFFF
+comptime SOTA_MAT_COAT_N_SHADING: Int = 0     # coat uses the (normal-mapped) shading normal (round 2)
+comptime SOTA_MAT_COAT_N_GEOMETRIC: Int = 1   # coat uses the interpolated vertex normal (smooth coat over a bumpy base)
+comptime SOTA_MAT_COAT_N_TEXTURE: Int = 2     # coat has its own tangent-space normal map (ext word 10)
+# Instance word 39 bit set by the renderer for transmissive layered materials (TLAS instance FORCE_NO_OPAQUE), so
+# shadow rays see them as candidates and attenuate instead of stopping.
+comptime SOTA_MAT_INSTANCE_TRANS_BIT: UInt32 = 0x00100000  # bit 20
 comptime SOTA_MAT_EXT_BASE: Int = SOTA_MAT_MAX_MATERIALS * AAA_MATERIAL_WORDS
 comptime SOTA_MAT_MAGIC: UInt32 = 0x544D4153  # 'SAMT'
 comptime SOTA_MAT_LUT_N: Int = 32
@@ -70,7 +80,8 @@ comptime SOTA_MAT_LUT_A4: Int = SOTA_MAT_LUT_BAVG + SOTA_MAT_LUT_N
 comptime SOTA_MAT_LUT_B4: Int = SOTA_MAT_LUT_A4 + SOTA_MAT_L4_SIZE
 comptime SOTA_MAT_LUT_AAVG4: Int = SOTA_MAT_LUT_B4 + SOTA_MAT_L4_SIZE
 comptime SOTA_MAT_LUT_BAVG4: Int = SOTA_MAT_LUT_AAVG4 + SOTA_MAT_L4_R * SOTA_MAT_L4_K
-comptime SOTA_MAT_LUT_WORDS: Int = SOTA_MAT_LUT_BAVG4 + SOTA_MAT_L4_R * SOTA_MAT_L4_K
+comptime SOTA_MAT_LUT_SHAVG: Int = SOTA_MAT_LUT_BAVG4 + SOTA_MAT_L4_R * SOTA_MAT_L4_K  # cosine-weighted mean of E_sheen
+comptime SOTA_MAT_LUT_WORDS: Int = SOTA_MAT_LUT_SHAVG + SOTA_MAT_LUT_N
 # Extra bytes appended to `buf_materials`: extension table + LUT block.
 comptime SOTA_MAT_EXTRA_BYTES: Int = (SOTA_MAT_MAX_MATERIALS * SOTA_MAT_EXT_WORDS + SOTA_MAT_LUT_WORDS) * 4
 
@@ -86,14 +97,29 @@ struct SotaMatLayers(Copyable, Movable):
     """Per-material extension words (the layers `AaaMaterial` has no room for)."""
     var anisotropy: Float32           # KHR_materials_anisotropy strength, 0..1
     var anisotropy_rotation: Float32  # radians, rotates the stretch direction from the mesh tangent toward the bitangent
-    var transmission: Float32         # thin-walled transmission weight of the dielectric base, 0..1
-    var transmission_tint: Vec3       # colour of light passing through
+    var transmission: Float32         # transmission weight of the dielectric base, 0..1
+    var transmission_tint: Vec3       # thin-walled: colour of light passing through; volume: attenuation colour
+    var volume_distance: Float32      # 0 = thin-walled; > 0: solid volume (refracts, Beer-Lambert with the tint
+                                      # reached at this distance, KHR_materials_volume attenuationDistance)
+    var coat_normal_mode: Int         # SOTA_MAT_COAT_N_SHADING / _GEOMETRIC / _TEXTURE
+    var coat_normal_tex: Int          # bindless slot of the coat normal map (mode TEXTURE), -1 = none
+    var coat_normal_strength: Float32
+    var layer_tex: Int                # bindless slot of a layer mask (R anisotropy, G rotation / pi, B transmission,
+                                      # A clearcoat; multiplies / adds to the constants), -1 = none
 
     def __init__(out self):
         self.anisotropy = Float32(0.0)
         self.anisotropy_rotation = Float32(0.0)
         self.transmission = Float32(0.0)
         self.transmission_tint = Vec3(1.0, 1.0, 1.0)
+        self.volume_distance = Float32(0.0)
+        self.coat_normal_mode = SOTA_MAT_COAT_N_SHADING
+        self.coat_normal_tex = -1
+        self.coat_normal_strength = Float32(1.0)
+        self.layer_tex = -1
+
+    def is_transmissive(self) -> Bool:
+        return self.transmission > Float32(0.0)
 
     def append_words(self, mut out: List[UInt32]):
         out.append(SOTA_MAT_MAGIC)
@@ -103,7 +129,13 @@ struct SotaMatLayers(Copyable, Movable):
         out.append(bitcast[DType.uint32](max(Float32(0.0), self.transmission_tint.x)))
         out.append(bitcast[DType.uint32](max(Float32(0.0), self.transmission_tint.y)))
         out.append(bitcast[DType.uint32](max(Float32(0.0), self.transmission_tint.z)))
-        out.append(UInt32(0))
+        out.append(bitcast[DType.uint32](Float32(max(0, min(2, self.coat_normal_mode)))))
+        out.append(bitcast[DType.uint32](max(Float32(0.0), self.volume_distance)))
+        out.append(UInt32(self.layer_tex) if self.layer_tex >= 0 else SOTA_MAT_NO_TEX)
+        out.append(UInt32(self.coat_normal_tex) if self.coat_normal_tex >= 0 else SOTA_MAT_NO_TEX)
+        out.append(bitcast[DType.uint32](self.coat_normal_strength))
+        for _ in range(4):
+            out.append(UInt32(0))
 
 
 struct SotaMatParams(Copyable, Movable):
@@ -124,6 +156,9 @@ struct SotaMatParams(Copyable, Movable):
     var aniso_rot: Float32
     var transmission: Float32
     var tint: Vec3
+    var volume_dist: Float32   # 0 = thin-walled
+    var atten: Vec3            # volume attenuation colour (white when thin-walled)
+    var coat_mode: Int
 
     def __init__(out self):
         self.albedo = Vec3(0.8, 0.8, 0.8)
@@ -142,6 +177,9 @@ struct SotaMatParams(Copyable, Movable):
         self.aniso_rot = Float32(0.0)
         self.transmission = Float32(0.0)
         self.tint = Vec3(1.0, 1.0, 1.0)
+        self.volume_dist = Float32(0.0)
+        self.atten = Vec3(1.0, 1.0, 1.0)
+        self.coat_mode = SOTA_MAT_COAT_N_SHADING
 
 
 @always_inline
@@ -170,6 +208,11 @@ def sota_mat_params_from_words(words: List[UInt32], ext: List[UInt32]) -> SotaMa
         p.aniso_rot = _wf(ext, 2)
         p.transmission = _wf(ext, 3)
         p.tint = Vec3(_wf(ext, 4), _wf(ext, 5), _wf(ext, 6))
+        p.coat_mode = Int(_wf(ext, 7) + Float32(0.5))
+        p.volume_dist = _wf(ext, 8)
+        if p.volume_dist > Float32(0.0):
+            p.atten = p.tint
+            p.tint = Vec3(1.0, 1.0, 1.0)
     else:
         p.tint = Vec3(0.0, 0.0, 0.0)
     return p^
@@ -514,6 +557,14 @@ struct SotaMatLut(Copyable, Movable):
                 sb += dm * (b0 * (2.0 * m0 + m1) + b1 * (m0 + 2.0 * m1)) / 6.0
             lut.data[SOTA_MAT_LUT_AAVG + j] = Float32(2.0 * sa)
             lut.data[SOTA_MAT_LUT_BAVG + j] = Float32(2.0 * sb)
+            var ssh = Float64(0.0)
+            for i in range(N - 1):
+                var m0 = Float64(Float32(i) / Float32(N - 1))
+                var m1 = Float64(Float32(i + 1) / Float32(N - 1))
+                var e0 = Float64(lut.data[SOTA_MAT_LUT_SH + j * N + i])
+                var e1 = Float64(lut.data[SOTA_MAT_LUT_SH + j * N + i + 1])
+                ssh += (m1 - m0) * (e0 * (2.0 * m0 + m1) + e1 * (m0 + 2.0 * m1)) / 6.0
+            lut.data[SOTA_MAT_LUT_SHAVG + j] = Float32(2.0 * ssh)
         lut._bake_aniso(aniso_strata)
         return lut^
 
@@ -719,7 +770,8 @@ def _spec_avg(p: SotaMatParams, lut: SotaMatLut, r_eff: Float32) -> Tuple[Float3
     return (lut.fetch1(SOTA_MAT_LUT_AAVG, r_eff), lut.fetch1(SOTA_MAT_LUT_BAVG, r_eff))
 
 
-def sota_mat_lobes_cpu(p: SotaMatParams, lut: SotaMatLut, ndotv: Float32, phi_v: Float32 = 0.0) -> SotaMatLobes:
+def sota_mat_lobes_cpu(p: SotaMatParams, lut: SotaMatLut, ndotv: Float32, phi_v: Float32 = 0.0, ndotv_c: Float32 = -1.0) -> SotaMatLobes:
+    """`ndotv_c`: n_coat . v when the coat has its own normal (< 0: the base normal's `ndotv`)."""
     var o = SotaMatLobes()
     var m = p.metallic
     var diel = Float32(0.04) * p.specular
@@ -753,7 +805,8 @@ def sota_mat_lobes_cpu(p: SotaMatParams, lut: SotaMatLut, ndotv: Float32, phi_v:
     var ef_avg = _vlerp(o.f0 * o.a_avg + _vs(o.f90 * o.b_avg), o.fi_v * o.e_avg, w_i)
     o.es_avg = ef_avg + o.fms * om_eavg
     var rc = p.clearcoat_roughness
-    o.ecc_v = Float32(0.04) * lut.fetch2(SOTA_MAT_LUT_A, ndotv, rc) + lut.fetch2(SOTA_MAT_LUT_B, ndotv, rc)
+    var mu_c = ndotv if ndotv_c < Float32(0.0) else max(SOTA_MAT_MU_MIN, ndotv_c)
+    o.ecc_v = Float32(0.04) * lut.fetch2(SOTA_MAT_LUT_A, mu_c, rc) + lut.fetch2(SOTA_MAT_LUT_B, mu_c, rc)
     o.esh_v = lut.fetch2(SOTA_MAT_LUT_SH, ndotv, p.sheen_roughness)
     o.att_cc = Float32(1.0) - p.clearcoat * o.ecc_v
     var smax = max(p.sheen.x, max(p.sheen.y, p.sheen.z))
@@ -800,13 +853,23 @@ def _fresnel_v(p: SotaMatParams, o: SotaMatLobes, vh: Float32) -> Vec3:
 
 def sota_mat_eval_cpu(p: SotaMatParams, lut: SotaMatLut, n: Vec3, t_in: Vec3, b_in: Vec3, v: Vec3, l: Vec3) -> Vec3:
     """BSDF times |cos theta_l| (no wrap lobe): the integrand of the CPU path tracer and of the furnace tests."""
+    return sota_mat_eval_nc_cpu(p, lut, n, n, t_in, b_in, v, l)
+
+
+def sota_mat_eval_nc_cpu(
+    p: SotaMatParams, lut: SotaMatLut, n: Vec3, nc: Vec3, t_in: Vec3, b_in: Vec3, v: Vec3, l: Vec3, allow_back: Bool = True
+) -> Vec3:
+    """`sota_mat_eval_cpu` with a separate coat normal `nc`: the coat lobe, its albedo and the attenuation it puts
+    on the layers below use `nc`; everything under the coat uses `n`."""
     var ndotv = max(SOTA_MAT_MU_MIN, n.dot(v))
+    var ndotv_c = max(SOTA_MAT_MU_MIN, nc.dot(v))
     var fr = sota_mat_frame_cpu(n, t_in, b_in, p.aniso_rot)
     var vt = v.dot(fr.t)
     var vb = v.dot(fr.b)
-    var o = sota_mat_lobes_cpu(p, lut, ndotv, sota_mat_view_phi(vt, vb))
+    var o = sota_mat_lobes_cpu(p, lut, ndotv, sota_mat_view_phi(vt, vb), ndotv_c)
     var nl = n.dot(l)
     var m = p.metallic
+    var res = Vec3(0.0, 0.0, 0.0)
     if nl > Float32(0.0):
         var h = (v + l).normalized()
         var vh = max(Float32(0.0), v.dot(h))
@@ -829,17 +892,8 @@ def sota_mat_eval_cpu(p: SotaMatParams, lut: SotaMatLut, n: Vec3, t_in: Vec3, b_
         )
         var f_base = f_ss + f_ms + f_d
         var f_sh = p.sheen * sota_mat_sheen_dv(ndoth, ndotv, nl, p.sheen_roughness)
-        var ac = max(SOTA_MAT_ALPHA_MIN, p.clearcoat_roughness * p.clearcoat_roughness)
-        var d_cc = sota_mat_d_aniso(ac, ac, Float32(0.0), sqrt(max(Float32(0.0), Float32(1.0) - ndoth * ndoth)), ndoth)
-        var vis_cc = Float32(0.5) / max(
-            Float32(1e-12),
-            nl * sqrt(ac * ac * (Float32(1.0) - ndotv * ndotv) + ndotv * ndotv)
-            + ndotv * sqrt(ac * ac * (Float32(1.0) - nl * nl) + nl * nl),
-        )
-        var f_cc = p.clearcoat * d_cc * vis_cc * (Float32(0.04) + Float32(0.96) * _pow5(Float32(1.0) - vh))
-        var total = _vs(f_cc) + (f_sh + f_base * o.att_sh) * o.att_cc
-        return total * nl
-    elif nl < Float32(0.0) and p.transmission > Float32(0.0) and m < Float32(1.0):
+        res = (f_sh + f_base * o.att_sh) * (o.att_cc * nl)
+    elif allow_back and nl < Float32(0.0) and p.transmission > Float32(0.0) and m < Float32(1.0):
         var lm = l - n * (Float32(2.0) * nl)
         var mul = -nl
         var h = (v + lm).normalized()
@@ -848,15 +902,34 @@ def sota_mat_eval_cpu(p: SotaMatParams, lut: SotaMatLut, n: Vec3, t_in: Vec3, b_
         var vis = sota_mat_vis_aniso(o.at, o.ab, vt, vb, ndotv, lm.dot(fr.t), lm.dot(fr.b), mul)
         var k = (Float32(1.0) - m) * p.transmission * d * vis / max(Float32(1e-4), o.e_v) * o.att_cc * o.att_sh
         return _vm(p.tint, Vec3(Float32(1.0) - o.es_v.x, Float32(1.0) - o.es_v.y, Float32(1.0) - o.es_v.z)) * (k * mul)
-    return Vec3(0.0, 0.0, 0.0)
+    # Coat (its own normal): GGX, F0 0.04
+    var nl_c = nc.dot(l)
+    if nl_c > Float32(0.0) and p.clearcoat > Float32(0.0):
+        var hc = (v + l).normalized()
+        var vh_c = max(Float32(0.0), v.dot(hc))
+        var ndoth_c = max(Float32(0.0), nc.dot(hc))
+        var ac = max(SOTA_MAT_ALPHA_MIN, p.clearcoat_roughness * p.clearcoat_roughness)
+        var d_cc = sota_mat_d_aniso(ac, ac, Float32(0.0), sqrt(max(Float32(0.0), Float32(1.0) - ndoth_c * ndoth_c)), ndoth_c)
+        var vis_cc = Float32(0.5) / max(
+            Float32(1e-12),
+            nl_c * sqrt(ac * ac * (Float32(1.0) - ndotv_c * ndotv_c) + ndotv_c * ndotv_c)
+            + ndotv_c * sqrt(ac * ac * (Float32(1.0) - nl_c * nl_c) + nl_c * nl_c),
+        )
+        var f_cc = p.clearcoat * d_cc * vis_cc * (Float32(0.04) + Float32(0.96) * _pow5(Float32(1.0) - vh_c))
+        res = res + _vs(f_cc * nl_c)
+    return res
 
 
 def sota_mat_direct_cpu(p: SotaMatParams, lut: SotaMatLut, n: Vec3, t_in: Vec3, b_in: Vec3, v: Vec3, l: Vec3) -> Vec3:
     """What the GPU direct hook returns: `f |cos|` plus the legacy wrap lobe (subsurface colour words 20..22)."""
-    var r = sota_mat_eval_cpu(p, lut, n, t_in, b_in, v, l)
+    return sota_mat_direct_nc_cpu(p, lut, n, n, t_in, b_in, v, l)
+
+
+def sota_mat_direct_nc_cpu(p: SotaMatParams, lut: SotaMatLut, n: Vec3, nc: Vec3, t_in: Vec3, b_in: Vec3, v: Vec3, l: Vec3) -> Vec3:
+    var r = sota_mat_eval_nc_cpu(p, lut, n, nc, t_in, b_in, v, l)
     var ndotv = max(SOTA_MAT_MU_MIN, n.dot(v))
     var fr = sota_mat_frame_cpu(n, t_in, b_in, p.aniso_rot)
-    var o = sota_mat_lobes_cpu(p, lut, ndotv, sota_mat_view_phi(v.dot(fr.t), v.dot(fr.b)))
+    var o = sota_mat_lobes_cpu(p, lut, ndotv, sota_mat_view_phi(v.dot(fr.t), v.dot(fr.b)), max(SOTA_MAT_MU_MIN, nc.dot(v)))
     var wrap = max(Float32(0.0), (n.dot(l) + Float32(0.45)) / Float32(1.45)) * SOTA_MAT_INV_PI * o.att_cc * o.att_sh
     return r + p.sss * wrap
 
@@ -880,10 +953,11 @@ struct SotaMatAmbient(Copyable, Movable):
         return _vs(self.w_cc) + self.w_spec + self.w_diff + self.w_trans
 
 
-def sota_mat_ambient_cpu(p: SotaMatParams, lut: SotaMatLut, ndotv_in: Float32, phi_v: Float32 = 0.0) -> SotaMatAmbient:
-    """`phi_v`: view azimuth from the rotated tangent, folded to [0, pi/2] (`sota_mat_view_phi`)."""
+def sota_mat_ambient_cpu(p: SotaMatParams, lut: SotaMatLut, ndotv_in: Float32, phi_v: Float32 = 0.0, ndotv_c: Float32 = -1.0) -> SotaMatAmbient:
+    """`phi_v`: view azimuth from the rotated tangent, folded to [0, pi/2] (`sota_mat_view_phi`);
+    `ndotv_c`: coat normal . v (< 0: same as the base)."""
     var ndotv = max(SOTA_MAT_MU_MIN, ndotv_in)
-    var o = sota_mat_lobes_cpu(p, lut, ndotv, phi_v)
+    var o = sota_mat_lobes_cpu(p, lut, ndotv, phi_v, ndotv_c)
     var r = SotaMatAmbient()
     var m = p.metallic
     var one_es = Vec3(Float32(1.0) - o.es_v.x, Float32(1.0) - o.es_v.y, Float32(1.0) - o.es_v.z)
@@ -893,6 +967,35 @@ def sota_mat_ambient_cpu(p: SotaMatParams, lut: SotaMatLut, ndotv_in: Float32, p
     r.w_trans = _vm(p.tint, one_es) * ((Float32(1.0) - m) * p.transmission * o.att_cc * o.att_sh)
     r.w_em = o.att_cc
     return r^
+
+
+def sota_mat_albedo_avg_cpu(p: SotaMatParams, lut: SotaMatLut) -> Vec3:
+    """View-averaged reflectance (coat + sheen + specular + diffuse, cosine-weighted over the view hemisphere,
+    each layer's average taken separately) that the surface cache multiplies the irradiance by: the view-independent
+    radiance a cache texel stores. White materials give exactly 1 (no transmission), so the cache holds the
+    furnace. Thin-film uses F_irid at mu = 0.6."""
+    var o = sota_mat_lobes_cpu(p, lut, Float32(0.6), Float32(0.0))
+    var rc = p.clearcoat_roughness
+    var ecc = Float32(0.04) * lut.fetch1(SOTA_MAT_LUT_AAVG, rc) + lut.fetch1(SOTA_MAT_LUT_BAVG, rc)
+    var esh = lut.fetch1(SOTA_MAT_LUT_SHAVG, p.sheen_roughness)
+    var smax = max(p.sheen.x, max(p.sheen.y, p.sheen.z))
+    var a_cc = Float32(1.0) - p.clearcoat * ecc
+    var a_sh = Float32(1.0) - smax * esh
+    var kd = (Float32(1.0) - p.metallic) * (Float32(1.0) - p.transmission)
+    var one_es = Vec3(Float32(1.0) - o.es_avg.x, Float32(1.0) - o.es_avg.y, Float32(1.0) - o.es_avg.z)
+    var base = o.es_avg + _vm(p.albedo, one_es) * kd
+    return _vs(p.clearcoat * ecc) + (p.sheen * esh + base * a_sh) * a_cc
+
+
+def sota_mat_shadow_transmittance_cpu(p: SotaMatParams) -> Float32:
+    """Scalar light transmittance of one crossing of a transmissive surface by a shadow ray (luminance of the tint;
+    a volume counts each of its two crossings as sqrt(attenuation colour), i.e. a chord of one attenuation distance).
+    Normal-incidence Fresnel of the base (0.04 * specular) and of the coat (0.04) is taken off."""
+    var col = _sat(p.tint.x * Float32(0.2126) + p.tint.y * Float32(0.7152) + p.tint.z * Float32(0.0722))
+    if p.volume_dist > Float32(0.0):
+        col = sqrt(_sat(p.atten.x * Float32(0.2126) + p.atten.y * Float32(0.7152) + p.atten.z * Float32(0.0722)))
+    var t = (Float32(1.0) - p.metallic) * p.transmission * (Float32(1.0) - Float32(0.04) * p.specular) * (Float32(1.0) - Float32(0.04) * p.clearcoat)
+    return _sat(t * col)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1178,6 +1281,110 @@ struct SotaMatInputs(Copyable, Movable):
     var irid_ior: UInt32
 
 
+struct SotaMatSurfaceExtra(Copyable, Movable):
+    """Optional per-pixel inputs (round 3): coat normal and the layer-mask texture values. `ncx == 0`: the coat uses
+    the base normal; `aniso_mul == 0`: no layer mask (multipliers 1, rotation offset 0)."""
+    var ncx: UInt32
+    var ncy: UInt32
+    var ncz: UInt32
+    var aniso_mul: UInt32
+    var rot_add: UInt32
+    var trans_mul: UInt32
+    var cc_mul: UInt32
+
+    def __init__(out self):
+        self.ncx = 0
+        self.ncy = 0
+        self.ncz = 0
+        self.aniso_mul = 0
+        self.rot_add = 0
+        self.trans_mul = 0
+        self.cc_mul = 0
+
+    def __init__(out self, ncx: UInt32, ncy: UInt32, ncz: UInt32, aniso_mul: UInt32, rot_add: UInt32, trans_mul: UInt32, cc_mul: UInt32):
+        self.ncx = ncx
+        self.ncy = ncy
+        self.ncz = ncz
+        self.aniso_mul = aniso_mul
+        self.rot_add = rot_add
+        self.trans_mul = trans_mul
+        self.cc_mul = cc_mul
+
+
+# Indices into `SotaMatLobesGpu.v` (function-scope variables holding the per-pixel lobe state)
+comptime _LB_N: Int = 0          # 3: shading normal
+comptime _LB_NC: Int = 3         # 3: coat normal
+comptime _LB_V: Int = 6          # 3: view
+comptime _LB_T: Int = 9          # 3: rotated tangent
+comptime _LB_B: Int = 12         # 3: rotated bitangent
+comptime _LB_F0: Int = 15        # 3
+comptime _LB_FI: Int = 18        # 3: thin-film Fresnel at mu_v
+comptime _LB_FMS: Int = 21       # 3
+comptime _LB_ESV: Int = 24       # 3
+comptime _LB_ESAVG: Int = 27     # 3
+comptime _LB_ALB: Int = 30       # 3
+comptime _LB_TINT: Int = 33      # 3
+comptime _LB_SH: Int = 36        # 3
+comptime _LB_SSS: Int = 39       # 3
+comptime _LB_NDOTV: Int = 42
+comptime _LB_NDOTV_C: Int = 43
+comptime _LB_VT: Int = 44
+comptime _LB_VB: Int = 45
+comptime _LB_F90: Int = 46
+comptime _LB_AT: Int = 47
+comptime _LB_AB: Int = 48
+comptime _LB_REFF: Int = 49
+comptime _LB_ANISO: Int = 50
+comptime _LB_ROUGH: Int = 51
+comptime _LB_EV: Int = 52
+comptime _LB_EAVG: Int = 53
+comptime _LB_ATT_CC: Int = 54
+comptime _LB_ATT_SH: Int = 55
+comptime _LB_METAL: Int = 56
+comptime _LB_TRANS: Int = 57
+comptime _LB_CC: Int = 58
+comptime _LB_CC_ROUGH: Int = 59
+comptime _LB_SH_ROUGH: Int = 60
+comptime _LB_IRID_W: Int = 61
+comptime _LB_IRID_NM: Int = 62
+comptime _LB_IRID_IOR: Int = 63
+comptime _LB_VOL: Int = 64       # volume attenuation distance (0 = thin-walled)
+comptime _LB_ATTEN: Int = 65     # 3: volume attenuation colour
+comptime _LB_COAT_MODE: Int = 68
+comptime _LB_SPEC: Int = 69      # specular factor (dielectric F0 = 0.04 * spec)
+comptime _LB_COUNT: Int = 70
+
+
+struct SotaMatLobesGpu(Copyable, Movable):
+    """Per-pixel state of the layered model (everything that depends on the material and the view only),
+    held in function-scope variables so any later light loop (sun, clustered, RT hit, LTC) can evaluate the
+    same BSDF with `emit_sota_mat_eval_light`. `on == 0` (no SSA id): the model is not compiled in."""
+    var on: UInt32
+    var v: List[UInt32]
+
+    def __init__(out self):
+        self.on = 0
+        self.v = List[UInt32]()
+
+    def __init__(out self, mut s: AaaSpirvModule, on: UInt32):
+        self.on = on
+        self.v = List[UInt32]()
+        for _ in range(_LB_COUNT):
+            self.v.append(s.fvar(s.float(0.0)))
+
+    def active(self) -> Bool:
+        return self.on != 0
+
+    def get(self, mut s: AaaSpirvModule, i: Int) -> UInt32:
+        return s.load_f(self.v[i])
+
+    def get3(self, mut s: AaaSpirvModule, i: Int) -> List[UInt32]:
+        return [s.load_f(self.v[i]), s.load_f(self.v[i + 1]), s.load_f(self.v[i + 2])]
+
+    def put(self, mut s: AaaSpirvModule, i: Int, x: UInt32):
+        s.store(self.v[i], x)
+
+
 @fieldwise_init
 struct SotaMatShade(Copyable, Movable):
     """Function-scope variables written by the direct hook and read by the compose hook."""
@@ -1201,34 +1408,129 @@ struct SotaMatShade(Copyable, Movable):
     var bx: UInt32   # rotated bitangent (the un-stretched direction), for the anisotropic bent reflection
     var by: UInt32
     var bz: UInt32
+    var lb: SotaMatLobesGpu
+    var tr_r: UInt32   # traced transmission radiance (fvars, written by `sota_mat_rt`; tr_ok > 0.5 = valid)
+    var tr_g: UInt32
+    var tr_b: UInt32
+    var tr_ok: UInt32
 
 
 def emit_sota_mat_decode_on(mut s: AaaSpirvModule, r_flags: UInt32, e_tagged: UInt32) -> UInt32:
     return s.logical_and(s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_SOTA_MAT)), s.uint(0)), s.logical_not(e_tagged))
 
 
-def emit_sota_mat_shade(
+def emit_sota_mat_on_for_material(mut s: AaaSpirvModule, r_flags: UInt32, b_mats: UInt32, m_base: UInt32) -> UInt32:
+    """Flag set and the material is not one of area E's character models (word 13 < -0.5)."""
+    var e_tagged = s.flt(s.load_float(b_mats, s.iadd(m_base, s.uint(13))), s.float(-0.5))
+    return emit_sota_mat_decode_on(s, r_flags, e_tagged)
+
+
+def emit_sota_mat_inputs_from_words(
+    mut s: AaaSpirvModule,
+    b_mats: UInt32,
+    m_base: UInt32,
+    n: Tuple[UInt32, UInt32, UInt32],
+    v: Tuple[UInt32, UInt32, UInt32],
+    l: Tuple[UInt32, UInt32, UInt32],
+    t: Tuple[UInt32, UInt32, UInt32],
+    b: Tuple[UInt32, UInt32, UInt32],
+    alb: Tuple[UInt32, UInt32, UInt32],
+    rough: UInt32,
+    metal: UInt32,
+) -> SotaMatInputs:
+    """Inputs for passes that shade a hit from the raw material words (RT hit, surface cache): textured albedo,
+    roughness and metalness come from the caller, the rest straight from the 24 words."""
+    var w = List[UInt32]()
+    for k in range(24):
+        w.append(s.load_float(b_mats, s.iadd(m_base, s.uint(UInt32(k)))))
+    return SotaMatInputs(
+        n[0], n[1], n[2], v[0], v[1], v[2], l[0], l[1], l[2], t[0], t[1], t[2], b[0], b[1], b[2],
+        alb[0], alb[1], alb[2], metal, s.fabs(w[3]), rough, w[6], w[7],
+        w[16], w[17], w[18], w[19], w[20], w[21], w[22], w[13], w[14],
+        s.select_f(s.flt(w[15], s.float(0.0)), s.float(1.5), w[15]),
+    )
+
+
+def emit_sota_mat_surface_extra(
+    mut s: AaaSpirvModule,
+    b_mats: UInt32,
+    mat_id: UInt32,
+    on: UInt32,
+    bindless: Tuple[UInt32, UInt32],
+    uv: UInt32,
+    ddx: UInt32,
+    ddy: UInt32,
+    t: Tuple[UInt32, UInt32, UInt32],
+    b: Tuple[UInt32, UInt32, UInt32],
+    ng: Tuple[UInt32, UInt32, UInt32],
+    n: Tuple[UInt32, UInt32, UInt32],
+    flip: UInt32,
+) -> SotaMatSurfaceExtra:
+    """Per-pixel coat normal (ext word 7: shading / geometric / own normal map in word 10 with strength word 11)
+    and the layer mask texture (word 9: R anisotropy x, G rotation / pi +, B transmission x, A clearcoat x).
+    `t`, `b`, `ng` are the un-flipped tangent frame, `n` the flipped shading normal, `flip` the double-sided sign."""
+    var one = s.float(1.0)
+    var zero = s.float(0.0)
+    var ncx = s.fvar(n[0])
+    var ncy = s.fvar(n[1])
+    var ncz = s.fvar(n[2])
+    var am = s.fvar(one)
+    var ra = s.fvar(zero)
+    var tm = s.fvar(one)
+    var cm = s.fvar(one)
+    s.begin_if(on)
+    var eb = s.iadd(s.uint(UInt32(SOTA_MAT_EXT_BASE)), s.imul(mat_id, s.uint(UInt32(SOTA_MAT_EXT_WORDS))))
+    var has_ext = s.ieq(s.load_word(b_mats, eb), s.uint(SOTA_MAT_MAGIC))
+    s.begin_if(has_ext)
+    var mode = s.load_float(b_mats, s.iadd(eb, s.uint(7)))
+    s.begin_if(s.logical_and(s.fgt(mode, s.float(0.5)), s.flt(mode, s.float(1.5))))
+    s.store(ncx, s.fmul(ng[0], flip))
+    s.store(ncy, s.fmul(ng[1], flip))
+    s.store(ncz, s.fmul(ng[2], flip))
+    s.end_if()
+    var cslot = s.load_word(b_mats, s.iadd(eb, s.uint(10)))
+    s.begin_if(s.logical_and(s.fgt(mode, s.float(1.5)), s.ine(cslot, s.uint(SOTA_MAT_NO_TEX))))
+    var tx = s.sample_bindless_grad(bindless, cslot, uv, ddx, ddy)
+    var stren = s.load_float(b_mats, s.iadd(eb, s.uint(11)))
+    var mx = s.fmul(s.fma(s.extract_f(tx, 0), s.float(2.0), s.float(-1.0)), stren)
+    var my = s.fmul(s.fma(s.extract_f(tx, 1), s.float(2.0), s.float(-1.0)), stren)
+    var mz = s.fsqrt(s.nmax(s.float(0.0), s.fsub(one, s.fma(mx, mx, s.fmul(my, my)))))
+    var w = emit_vec3_normalize(
+        s,
+        s.fma(t[0], mx, s.fma(b[0], my, s.fmul(ng[0], mz))),
+        s.fma(t[1], mx, s.fma(b[1], my, s.fmul(ng[1], mz))),
+        s.fma(t[2], mx, s.fma(b[2], my, s.fmul(ng[2], mz))),
+    )
+    s.store(ncx, s.fmul(w[0], flip))
+    s.store(ncy, s.fmul(w[1], flip))
+    s.store(ncz, s.fmul(w[2], flip))
+    s.end_if()
+    var lslot = s.load_word(b_mats, s.iadd(eb, s.uint(9)))
+    s.begin_if(s.ine(lslot, s.uint(SOTA_MAT_NO_TEX)))
+    var lt = s.sample_bindless_grad(bindless, lslot, uv, ddx, ddy)
+    s.store(am, s.extract_f(lt, 0))
+    s.store(ra, s.fmul(s.extract_f(lt, 1), s.float(SOTA_MAT_PI)))
+    s.store(tm, s.extract_f(lt, 2))
+    s.store(cm, s.extract_f(lt, 3))
+    s.end_if()
+    s.end_if()
+    s.end_if()
+    return SotaMatSurfaceExtra(
+        s.load_f(ncx), s.load_f(ncy), s.load_f(ncz), s.load_f(am), s.load_f(ra), s.load_f(tm), s.load_f(cm)
+    )
+
+
+def emit_sota_mat_lobes(
     mut s: AaaSpirvModule,
     b_mats: UInt32,
     mat_id: UInt32,
     on: UInt32,
     inp: SotaMatInputs,
-    legacy_direct: Tuple[UInt32, UInt32, UInt32],
-) -> SotaMatShade:
-    """Direct sun response (BSDF * cos + legacy wrap) and the split-sum weights of the layered model.
-    Everything runs inside `if on`; with the flag off the outputs keep the legacy direct value."""
-    var out = SotaMatShade(
-        on,
-        s.fvar(legacy_direct[0]), s.fvar(legacy_direct[1]), s.fvar(legacy_direct[2]),
-        s.fvar(s.float(0.0)),
-        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0)),
-        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0)),
-        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0)),
-        s.fvar(s.float(1.0)),
-        s.fvar(s.float(0.5)),
-        s.fvar(s.float(0.0)),
-        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(1.0)),
-    )
+    extra: SotaMatSurfaceExtra,
+) -> SotaMatLobesGpu:
+    """Decodes the extension words, builds the frame and evaluates every view-only quantity (`sota_mat_lobes_cpu`),
+    inside `if on`; the results live in the returned variables."""
+    var lb = SotaMatLobesGpu(s, on)
     s.begin_if(on)
     var one = s.float(1.0)
     var zero = s.float(0.0)
@@ -1238,9 +1540,21 @@ def emit_sota_mat_shade(
     var aniso = s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(1))), zero)
     var rot = s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(2))), zero)
     var trans = s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(3))), zero)
-    var tint_r = s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(4))), zero)
-    var tint_g = s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(5))), zero)
-    var tint_b = s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(6))), zero)
+    var cc_in = inp.cc
+    if extra.aniso_mul != 0:
+        aniso = _e_sat(s, s.fmul(aniso, extra.aniso_mul))
+        rot = s.fadd(rot, extra.rot_add)
+        trans = _e_sat(s, s.fmul(trans, extra.trans_mul))
+        cc_in = _e_sat(s, s.fmul(cc_in, extra.cc_mul))
+    var vol = s.select_f(has_ext, s.nmax(zero, s.load_float(b_mats, s.iadd(eb, s.uint(8)))), zero)
+    var is_vol = s.fgt(vol, zero)
+    var tw = List[UInt32]()
+    for k in range(3):
+        var w = s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(UInt32(4 + k)))), zero)
+        lb.put(s, _LB_ATTEN + k, s.select_f(is_vol, w, one))
+        tw.append(s.select_f(is_vol, one, w))
+    lb.put(s, _LB_VOL, vol)
+    lb.put(s, _LB_COAT_MODE, s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(7))), zero))
     var irid_w = s.nmax(zero, inp.irid_w)
 
     # Frame: Gram-Schmidt tangent, bitangent with the mesh handedness, then rotate
@@ -1266,10 +1580,15 @@ def emit_sota_mat_shade(
     var vx = inp.vx
     var vy = inp.vy
     var vz = inp.vz
-    var lx = inp.lx
-    var ly = inp.ly
-    var lz = inp.lz
     var ndotv = s.nmax(s.float(SOTA_MAT_MU_MIN), emit_vec3_dot(s, nx, ny, nz, vx, vy, vz))
+    var ncx = nx
+    var ncy = ny
+    var ncz = nz
+    if extra.ncx != 0:
+        ncx = extra.ncx
+        ncy = extra.ncy
+        ncz = extra.ncz
+    var ndotv_c = s.nmax(s.float(SOTA_MAT_MU_MIN), emit_vec3_dot(s, ncx, ncy, ncz, vx, vy, vz))
     var vt = emit_vec3_dot(s, vx, vy, vz, ftx, fty, ftz)
     var vb = emit_vec3_dot(s, vx, vy, vz, fbx, fby, fbz)
     var phi_v = s.fatan2(s.fabs(vb), s.fabs(vt))
@@ -1309,63 +1628,128 @@ def emit_sota_mat_shade(
     var f0 = [f0r, f0g, f0b]
     var om_eavg = s.fsub(one, e_avg)
     var inv21 = s.float(Float32(1.0 / 21.0))
-    var fms = List[UInt32]()
-    var es_v = List[UInt32]()
-    var es_avg = List[UInt32]()
     for k in range(3):
         var favg = _e_lerp(s, s.fma(s.fsub(f90, f0[k]), inv21, f0[k]), fi[k], irid_w)
         var fm = s.fdiv(s.fmul(s.fmul(favg, favg), e_avg), s.nmax(s.float(1e-4), s.fsub(one, s.fmul(favg, om_eavg))))
-        fms.append(fm)
+        lb.put(s, _LB_FMS + k, fm)
         var ef_v = _e_lerp(s, s.fma(f0[k], a_v, s.fmul(f90, b_v)), s.fmul(fi[k], e_v), irid_w)
-        es_v.append(s.fma(fm, s.fsub(one, e_v), ef_v))
+        lb.put(s, _LB_ESV + k, s.fma(fm, s.fsub(one, e_v), ef_v))
         var ef_avg = _e_lerp(s, s.fma(f0[k], a_avg, s.fmul(f90, b_avg)), s.fmul(fi[k], e_avg), irid_w)
-        es_avg.append(s.fma(fm, om_eavg, ef_avg))
+        lb.put(s, _LB_ESAVG + k, s.fma(fm, om_eavg, ef_avg))
+        lb.put(s, _LB_F0 + k, f0[k])
+        lb.put(s, _LB_FI + k, fi[k])
+        lb.put(s, _LB_TINT + k, tw[k])
     var rc = inp.cc_rough
-    var ecc_v = s.fma(s.float(0.04), _e_lut2(s, b_mats, SOTA_MAT_LUT_A, ndotv, rc), _e_lut2(s, b_mats, SOTA_MAT_LUT_B, ndotv, rc))
+    var ecc_v = s.fma(s.float(0.04), _e_lut2(s, b_mats, SOTA_MAT_LUT_A, ndotv_c, rc), _e_lut2(s, b_mats, SOTA_MAT_LUT_B, ndotv_c, rc))
     var esh_v = _e_lut2(s, b_mats, SOTA_MAT_LUT_SH, ndotv, inp.sh_rough)
-    var att_cc = s.fsub(one, s.fmul(inp.cc, ecc_v))
     var smax = s.nmax(inp.sh_r, s.nmax(inp.sh_g, inp.sh_b))
-    var att_sh = s.fsub(one, s.fmul(smax, esh_v))
+    lb.put(s, _LB_ATT_CC, s.fsub(one, s.fmul(cc_in, ecc_v)))
+    lb.put(s, _LB_ATT_SH, s.fsub(one, s.fmul(smax, esh_v)))
+    var n3 = [nx, ny, nz]
+    var nc3 = [ncx, ncy, ncz]
+    var v3 = [vx, vy, vz]
+    var t3 = [ftx, fty, ftz]
+    var b3 = [fbx, fby, fbz]
+    var alb3 = [inp.alb_r, inp.alb_g, inp.alb_b]
+    var sh3 = [inp.sh_r, inp.sh_g, inp.sh_b]
+    var sss3 = [inp.sss_r, inp.sss_g, inp.sss_b]
+    for k in range(3):
+        lb.put(s, _LB_N + k, n3[k])
+        lb.put(s, _LB_NC + k, nc3[k])
+        lb.put(s, _LB_V + k, v3[k])
+        lb.put(s, _LB_T + k, t3[k])
+        lb.put(s, _LB_B + k, b3[k])
+        lb.put(s, _LB_ALB + k, alb3[k])
+        lb.put(s, _LB_SH + k, sh3[k])
+        lb.put(s, _LB_SSS + k, sss3[k])
+    lb.put(s, _LB_NDOTV, ndotv)
+    lb.put(s, _LB_NDOTV_C, ndotv_c)
+    lb.put(s, _LB_VT, vt)
+    lb.put(s, _LB_VB, vb)
+    lb.put(s, _LB_F90, f90)
+    lb.put(s, _LB_AT, at)
+    lb.put(s, _LB_AB, ab)
+    lb.put(s, _LB_REFF, r_eff)
+    lb.put(s, _LB_ANISO, aniso)
+    lb.put(s, _LB_ROUGH, inp.rough)
+    lb.put(s, _LB_EV, e_v)
+    lb.put(s, _LB_EAVG, e_avg)
+    lb.put(s, _LB_METAL, m)
+    lb.put(s, _LB_TRANS, trans)
+    lb.put(s, _LB_CC, cc_in)
+    lb.put(s, _LB_CC_ROUGH, rc)
+    lb.put(s, _LB_SH_ROUGH, inp.sh_rough)
+    lb.put(s, _LB_IRID_W, irid_w)
+    lb.put(s, _LB_IRID_NM, inp.irid_nm)
+    lb.put(s, _LB_IRID_IOR, inp.irid_ior)
+    lb.put(s, _LB_SPEC, inp.spec)
+    s.end_if()
+    return lb^
+
+
+def emit_sota_mat_eval_light(
+    mut s: AaaSpirvModule, b_mats: UInt32, lb: SotaMatLobesGpu, lx: UInt32, ly: UInt32, lz: UInt32, allow_back: Bool = True
+) -> Tuple[UInt32, UInt32, UInt32]:
+    """BSDF * cos for light direction `l` (`sota_mat_eval_nc_cpu`): base + sheen under the coat, the coat on its
+    own normal, thin-walled transmission for light from behind (`allow_back`). No wrap lobe. Emit it inside
+    `if lb.on`; the lobe variables are only written there."""
+    var one = s.float(1.0)
+    var zero = s.float(0.0)
+    var n = lb.get3(s, _LB_N)
+    var nc = lb.get3(s, _LB_NC)
+    var v = lb.get3(s, _LB_V)
+    var t = lb.get3(s, _LB_T)
+    var b = lb.get3(s, _LB_B)
+    var f0 = lb.get3(s, _LB_F0)
+    var fi = lb.get3(s, _LB_FI)
+    var fms = lb.get3(s, _LB_FMS)
+    var es_v = lb.get3(s, _LB_ESV)
+    var es_avg = lb.get3(s, _LB_ESAVG)
+    var alb = lb.get3(s, _LB_ALB)
+    var tint = lb.get3(s, _LB_TINT)
+    var shc = lb.get3(s, _LB_SH)
+    var ndotv = lb.get(s, _LB_NDOTV)
+    var ndotv_c = lb.get(s, _LB_NDOTV_C)
+    var vt = lb.get(s, _LB_VT)
+    var vb = lb.get(s, _LB_VB)
+    var f90 = lb.get(s, _LB_F90)
+    var at = lb.get(s, _LB_AT)
+    var ab = lb.get(s, _LB_AB)
+    var r_eff = lb.get(s, _LB_REFF)
+    var aniso = lb.get(s, _LB_ANISO)
+    var rough = lb.get(s, _LB_ROUGH)
+    var e_v = lb.get(s, _LB_EV)
+    var e_avg = lb.get(s, _LB_EAVG)
+    var att_cc = lb.get(s, _LB_ATT_CC)
+    var att_sh = lb.get(s, _LB_ATT_SH)
+    var m = lb.get(s, _LB_METAL)
+    var trans = lb.get(s, _LB_TRANS)
+    var cc = lb.get(s, _LB_CC)
+    var rc = lb.get(s, _LB_CC_ROUGH)
+    var sh_rough = lb.get(s, _LB_SH_ROUGH)
+    var irid_w = lb.get(s, _LB_IRID_W)
+    var irid_nm = lb.get(s, _LB_IRID_NM)
+    var irid_ior = lb.get(s, _LB_IRID_IOR)
+    var om_m = s.fsub(one, m)
+    var is_aniso = s.fgt(aniso, zero)
+    var has_irid = s.fgt(irid_w, zero)
     var att = s.fmul(att_cc, att_sh)
 
-    # Ambient weights (`sota_mat_ambient_cpu`)
-    var alb = [inp.alb_r, inp.alb_g, inp.alb_b]
-    var shc = [inp.sh_r, inp.sh_g, inp.sh_b]
-    var tint = [tint_r, tint_g, tint_b]
-    var kd_amb = s.fmul(s.fmul(om_m, s.fsub(one, trans)), att_sh)
-    var kt_amb = s.fmul(s.fmul(om_m, trans), att)
-    var ws_out = [out.ws_r, out.ws_g, out.ws_b]
-    var wd_out = [out.wd_r, out.wd_g, out.wd_b]
-    var wt_out = [out.wt_r, out.wt_g, out.wt_b]
-    for k in range(3):
-        var one_es = s.fsub(one, es_v[k])
-        s.store(ws_out[k], s.fmul(es_v[k], att))
-        s.store(wd_out[k], s.fmul(s.fma(shc[k], esh_v, s.fmul(s.fmul(alb[k], one_es), kd_amb)), att_cc))
-        s.store(wt_out[k], s.fmul(s.fmul(tint[k], one_es), kt_amb))
-    s.store(out.w_cc, s.fmul(inp.cc, ecc_v))
-    s.store(out.w_em, att_cc)
-    s.store(out.r_eff, r_eff)
-    s.store(out.aniso, aniso)
-    s.store(out.bx, fbx)
-    s.store(out.by, fby)
-    s.store(out.bz, fbz)
-
-    # Direct: front side (`sota_mat_eval_cpu`, nl > 0)
-    var nl_raw = emit_vec3_dot(s, nx, ny, nz, lx, ly, lz)
+    var nl_raw = emit_vec3_dot(s, n[0], n[1], n[2], lx, ly, lz)
     var front = s.fgt(nl_raw, zero)
-    var back = s.logical_and(s.flt(nl_raw, zero), s.logical_and(s.fgt(trans, zero), s.flt(m, one)))
     var res_r = s.fvar(zero)
     var res_g = s.fvar(zero)
     var res_b = s.fvar(zero)
+    var res_out = [res_r, res_g, res_b]
+    var h = emit_vec3_normalize(s, s.fadd(v[0], lx), s.fadd(v[1], ly), s.fadd(v[2], lz))
+    var vh = s.nmax(zero, emit_vec3_dot(s, v[0], v[1], v[2], h[0], h[1], h[2]))
     s.begin_if(front)
     var nl = nl_raw
-    var h = emit_vec3_normalize(s, s.fadd(vx, lx), s.fadd(vy, ly), s.fadd(vz, lz))
-    var vh = s.nmax(zero, emit_vec3_dot(s, vx, vy, vz, h[0], h[1], h[2]))
-    var ndoth = s.nmax(zero, emit_vec3_dot(s, nx, ny, nz, h[0], h[1], h[2]))
-    var d = _e_d_aniso(s, at, ab, emit_vec3_dot(s, h[0], h[1], h[2], ftx, fty, ftz), emit_vec3_dot(s, h[0], h[1], h[2], fbx, fby, fbz), ndoth)
+    var ndoth = s.nmax(zero, emit_vec3_dot(s, n[0], n[1], n[2], h[0], h[1], h[2]))
+    var d = _e_d_aniso(s, at, ab, emit_vec3_dot(s, h[0], h[1], h[2], t[0], t[1], t[2]), emit_vec3_dot(s, h[0], h[1], h[2], b[0], b[1], b[2]), ndoth)
     var vis = _e_vis_aniso(
         s, at, ab, vt, vb, ndotv,
-        emit_vec3_dot(s, lx, ly, lz, ftx, fty, ftz), emit_vec3_dot(s, lx, ly, lz, fbx, fby, fbz), nl,
+        emit_vec3_dot(s, lx, ly, lz, t[0], t[1], t[2]), emit_vec3_dot(s, lx, ly, lz, b[0], b[1], b[2]), nl,
     )
     var fc = _e_pow5(s, s.fsub(one, _e_sat(s, vh)))
     var fs = List[UInt32]()
@@ -1375,7 +1759,7 @@ def emit_sota_mat_shade(
     var fh_g = s.fvar(fs[1])
     var fh_b = s.fvar(fs[2])
     s.begin_if(has_irid)
-    var fih = emit_sota_mat_iridescence(s, vh, inp.irid_nm, inp.irid_ior, f0r, f0g, f0b)
+    var fih = emit_sota_mat_iridescence(s, vh, irid_nm, irid_ior, f0[0], f0[1], f0[2])
     s.store(fh_r, _e_lerp(s, fs[0], fih[0], irid_w))
     s.store(fh_g, _e_lerp(s, fs[1], fih[1], irid_w))
     s.store(fh_b, _e_lerp(s, fs[2], fih[2], irid_w))
@@ -1383,9 +1767,9 @@ def emit_sota_mat_shade(
     var fh = [s.load_f(fh_r), s.load_f(fh_g), s.load_f(fh_b)]
     var dvis = s.fmul(d, vis)
     var phi_l = s.fatan2(
-        s.fabs(emit_vec3_dot(s, lx, ly, lz, fbx, fby, fbz)), s.fabs(emit_vec3_dot(s, lx, ly, lz, ftx, fty, ftz))
+        s.fabs(emit_vec3_dot(s, lx, ly, lz, b[0], b[1], b[2])), s.fabs(emit_vec3_dot(s, lx, ly, lz, t[0], t[1], t[2]))
     )
-    var ab_l = _e_spec_ab(s, b_mats, is_aniso, nl, phi_l, inp.rough, aniso, r_eff)
+    var ab_l = _e_spec_ab(s, b_mats, is_aniso, nl, phi_l, rough, aniso, r_eff)
     var a_l = ab_l[0]
     var b_l = ab_l[1]
     var e_l = s.fadd(a_l, b_l)
@@ -1394,23 +1778,8 @@ def emit_sota_mat_shade(
         s.nmax(s.float(1e-4), s.fsub(one, e_avg)),
     )
     var kd = s.fmul(s.fmul(om_m, s.fsub(one, trans)), s.float(SOTA_MAT_INV_PI))
-    var sheen_dv = _e_sheen_dv(s, ndoth, ndotv, nl, inp.sh_rough)
-    var ac = s.nmax(s.float(SOTA_MAT_ALPHA_MIN), s.fmul(rc, rc))
-    var sin_h = s.fsqrt(s.nmax(zero, s.fsub(one, s.fmul(ndoth, ndoth))))
-    var d_cc = _e_d_aniso(s, ac, ac, zero, sin_h, ndoth)
-    var ac2 = s.fmul(ac, ac)
-    var vis_cc = s.fdiv(
-        s.float(0.5),
-        s.nmax(
-            s.float(1e-12),
-            s.fadd(
-                s.fmul(nl, s.fsqrt(s.fma(ac2, s.fsub(one, s.fmul(ndotv, ndotv)), s.fmul(ndotv, ndotv)))),
-                s.fmul(ndotv, s.fsqrt(s.fma(ac2, s.fsub(one, s.fmul(nl, nl)), s.fmul(nl, nl)))),
-            ),
-        ),
-    )
-    var f_cc = s.fmul(s.fmul(inp.cc, s.fmul(d_cc, vis_cc)), s.fma(s.float(0.96), _e_pow5(s, s.fsub(one, vh)), s.float(0.04)))
-    var res_out = [res_r, res_g, res_b]
+    var sheen_dv = _e_sheen_dv(s, ndoth, ndotv, nl, sh_rough)
+    var w_base = s.fmul(att_cc, nl)
     for k in range(3):
         var ef_l = _e_lerp(s, s.fma(f0[k], a_l, s.fmul(f90, b_l)), s.fmul(fi[k], e_l), irid_w)
         var es_l = s.fma(fms[k], s.fsub(one, e_l), ef_l)
@@ -1422,35 +1791,246 @@ def emit_sota_mat_shade(
         )
         var f_base = s.fadd(s.fadd(f_ss, f_ms), f_d)
         var f_sh = s.fmul(shc[k], sheen_dv)
-        var tot = s.fma(s.fma(f_base, att_sh, f_sh), att_cc, f_cc)
-        s.store(res_out[k], s.fmul(tot, nl))
+        s.store(res_out[k], s.fmul(s.fma(f_base, att_sh, f_sh), w_base))
     s.end_if()
-    # Direct: thin-walled transmission (light from behind)
-    s.begin_if(back)
-    var mul = s.fneg(nl_raw)
-    var two_nl = s.fmul(s.float(2.0), nl_raw)
-    var lmx = s.fsub(lx, s.fmul(nx, two_nl))
-    var lmy = s.fsub(ly, s.fmul(ny, two_nl))
-    var lmz = s.fsub(lz, s.fmul(nz, two_nl))
-    var hm = emit_vec3_normalize(s, s.fadd(vx, lmx), s.fadd(vy, lmy), s.fadd(vz, lmz))
-    var ndoth_m = s.nmax(zero, emit_vec3_dot(s, nx, ny, nz, hm[0], hm[1], hm[2]))
-    var d_m = _e_d_aniso(s, at, ab, emit_vec3_dot(s, hm[0], hm[1], hm[2], ftx, fty, ftz), emit_vec3_dot(s, hm[0], hm[1], hm[2], fbx, fby, fbz), ndoth_m)
-    var vis_m = _e_vis_aniso(
-        s, at, ab, vt, vb, ndotv,
-        emit_vec3_dot(s, lmx, lmy, lmz, ftx, fty, ftz), emit_vec3_dot(s, lmx, lmy, lmz, fbx, fby, fbz), mul,
+    if allow_back:
+        # Thin-walled transmission (light from behind)
+        var back = s.logical_and(s.flt(nl_raw, zero), s.logical_and(s.fgt(trans, zero), s.flt(m, one)))
+        s.begin_if(back)
+        var mul = s.fneg(nl_raw)
+        var two_nl = s.fmul(s.float(2.0), nl_raw)
+        var lmx = s.fsub(lx, s.fmul(n[0], two_nl))
+        var lmy = s.fsub(ly, s.fmul(n[1], two_nl))
+        var lmz = s.fsub(lz, s.fmul(n[2], two_nl))
+        var hm = emit_vec3_normalize(s, s.fadd(v[0], lmx), s.fadd(v[1], lmy), s.fadd(v[2], lmz))
+        var ndoth_m = s.nmax(zero, emit_vec3_dot(s, n[0], n[1], n[2], hm[0], hm[1], hm[2]))
+        var d_m = _e_d_aniso(s, at, ab, emit_vec3_dot(s, hm[0], hm[1], hm[2], t[0], t[1], t[2]), emit_vec3_dot(s, hm[0], hm[1], hm[2], b[0], b[1], b[2]), ndoth_m)
+        var vis_m = _e_vis_aniso(
+            s, at, ab, vt, vb, ndotv,
+            emit_vec3_dot(s, lmx, lmy, lmz, t[0], t[1], t[2]), emit_vec3_dot(s, lmx, lmy, lmz, b[0], b[1], b[2]), mul,
+        )
+        var kt = s.fmul(s.fdiv(s.fmul(s.fmul(om_m, trans), s.fmul(d_m, vis_m)), s.nmax(s.float(1e-4), e_v)), att)
+        for k in range(3):
+            s.store(res_out[k], s.fmul(s.fmul(tint[k], s.fsub(one, es_v[k])), s.fmul(kt, mul)))
+        s.end_if()
+    # Coat on its own normal
+    var nl_c = emit_vec3_dot(s, nc[0], nc[1], nc[2], lx, ly, lz)
+    s.begin_if(s.logical_and(s.fgt(nl_c, zero), s.fgt(cc, zero)))
+    var ndoth_c = s.nmax(zero, emit_vec3_dot(s, nc[0], nc[1], nc[2], h[0], h[1], h[2]))
+    var ac = s.nmax(s.float(SOTA_MAT_ALPHA_MIN), s.fmul(rc, rc))
+    var sin_h = s.fsqrt(s.nmax(zero, s.fsub(one, s.fmul(ndoth_c, ndoth_c))))
+    var d_cc = _e_d_aniso(s, ac, ac, zero, sin_h, ndoth_c)
+    var ac2 = s.fmul(ac, ac)
+    var vis_cc = s.fdiv(
+        s.float(0.5),
+        s.nmax(
+            s.float(1e-12),
+            s.fadd(
+                s.fmul(nl_c, s.fsqrt(s.fma(ac2, s.fsub(one, s.fmul(ndotv_c, ndotv_c)), s.fmul(ndotv_c, ndotv_c)))),
+                s.fmul(ndotv_c, s.fsqrt(s.fma(ac2, s.fsub(one, s.fmul(nl_c, nl_c)), s.fmul(nl_c, nl_c)))),
+            ),
+        ),
     )
-    var kt = s.fmul(s.fdiv(s.fmul(s.fmul(om_m, trans), s.fmul(d_m, vis_m)), s.nmax(s.float(1e-4), e_v)), att)
+    var f_cc = s.fmul(s.fmul(cc, s.fmul(d_cc, vis_cc)), s.fma(s.float(0.96), _e_pow5(s, s.fsub(one, vh)), s.float(0.04)))
+    var f_cc_nl = s.fmul(f_cc, nl_c)
     for k in range(3):
-        s.store(res_out[k], s.fmul(s.fmul(tint[k], s.fsub(one, es_v[k])), s.fmul(kt, mul)))
+        s.store(res_out[k], s.fadd(s.load_f(res_out[k]), f_cc_nl))
     s.end_if()
-    # Legacy wrap lobe (subsurface colour), under the coat and sheen
-    var wrap = s.fmul(s.fmul(s.nmax(zero, s.fdiv(s.fadd(nl_raw, s.float(0.45)), s.float(1.45))), s.float(SOTA_MAT_INV_PI)), att)
-    var sss = [inp.sss_r, inp.sss_g, inp.sss_b]
-    var dir_out = [out.dir_r, out.dir_g, out.dir_b]
-    for k in range(3):
-        s.store(dir_out[k], s.fma(sss[k], wrap, s.load_f(res_out[k])))
+    return (s.load_f(res_r), s.load_f(res_g), s.load_f(res_b))
+
+
+def emit_sota_mat_wrap(mut s: AaaSpirvModule, lb: SotaMatLobesGpu, lx: UInt32, ly: UInt32, lz: UInt32) -> Tuple[UInt32, UInt32, UInt32]:
+    """Legacy wrap lobe (subsurface colour words 20..22) under the coat and sheen."""
+    var n = lb.get3(s, _LB_N)
+    var sss = lb.get3(s, _LB_SSS)
+    var nl_raw = emit_vec3_dot(s, n[0], n[1], n[2], lx, ly, lz)
+    var att = s.fmul(lb.get(s, _LB_ATT_CC), lb.get(s, _LB_ATT_SH))
+    var wrap = s.fmul(s.fmul(s.nmax(s.float(0.0), s.fdiv(s.fadd(nl_raw, s.float(0.45)), s.float(1.45))), s.float(SOTA_MAT_INV_PI)), att)
+    return (s.fmul(sss[0], wrap), s.fmul(sss[1], wrap), s.fmul(sss[2], wrap))
+
+
+def emit_sota_mat_shade(
+    mut s: AaaSpirvModule,
+    b_mats: UInt32,
+    mat_id: UInt32,
+    on: UInt32,
+    inp: SotaMatInputs,
+    legacy_direct: Tuple[UInt32, UInt32, UInt32],
+    extra: SotaMatSurfaceExtra = SotaMatSurfaceExtra(),
+) -> SotaMatShade:
+    """Direct sun response (BSDF * cos + legacy wrap) and the split-sum weights of the layered model.
+    Everything runs inside `if on`; with the flag off the outputs keep the legacy direct value."""
+    var lb = emit_sota_mat_lobes(s, b_mats, mat_id, on, inp, extra)
+    var out = SotaMatShade(
+        on,
+        s.fvar(legacy_direct[0]), s.fvar(legacy_direct[1]), s.fvar(legacy_direct[2]),
+        s.fvar(s.float(0.0)),
+        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0)),
+        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0)),
+        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0)),
+        s.fvar(s.float(1.0)),
+        s.fvar(s.float(0.5)),
+        s.fvar(s.float(0.0)),
+        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(1.0)),
+        lb.copy(),
+        s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0)), s.fvar(s.float(0.0)),
+    )
+    s.begin_if(on)
+    emit_sota_mat_ambient_weights(s, b_mats, out)
+    var d = emit_sota_mat_eval_light(s, b_mats, lb, inp.lx, inp.ly, inp.lz, True)
+    var w = emit_sota_mat_wrap(s, lb, inp.lx, inp.ly, inp.lz)
+    s.store(out.dir_r, s.fadd(d[0], w[0]))
+    s.store(out.dir_g, s.fadd(d[1], w[1]))
+    s.store(out.dir_b, s.fadd(d[2], w[2]))
     s.end_if()
     return out^
+
+
+def emit_sota_mat_ambient_weights(mut s: AaaSpirvModule, b_mats: UInt32, sh: SotaMatShade):
+    """Split-sum weights (`sota_mat_ambient_cpu`) from the lobe variables into `out` (inside `if on`)."""
+    var lb = sh.lb.copy()
+    var one = s.float(1.0)
+    var ndotv = lb.get(s, _LB_NDOTV)
+    var m = lb.get(s, _LB_METAL)
+    var om_m = s.fsub(one, m)
+    var trans = lb.get(s, _LB_TRANS)
+    var att_cc = lb.get(s, _LB_ATT_CC)
+    var att_sh = lb.get(s, _LB_ATT_SH)
+    var att = s.fmul(att_cc, att_sh)
+    var es_v = lb.get3(s, _LB_ESV)
+    var alb = lb.get3(s, _LB_ALB)
+    var shc = lb.get3(s, _LB_SH)
+    var tint = lb.get3(s, _LB_TINT)
+    var esh_v = _e_lut2(s, b_mats, SOTA_MAT_LUT_SH, ndotv, lb.get(s, _LB_SH_ROUGH))
+    var kd_amb = s.fmul(s.fmul(om_m, s.fsub(one, trans)), att_sh)
+    var kt_amb = s.fmul(s.fmul(om_m, trans), att)
+    var ws_out = [sh.ws_r, sh.ws_g, sh.ws_b]
+    var wd_out = [sh.wd_r, sh.wd_g, sh.wd_b]
+    var wt_out = [sh.wt_r, sh.wt_g, sh.wt_b]
+    for k in range(3):
+        var one_es = s.fsub(one, es_v[k])
+        s.store(ws_out[k], s.fmul(es_v[k], att))
+        s.store(wd_out[k], s.fmul(s.fma(shc[k], esh_v, s.fmul(s.fmul(alb[k], one_es), kd_amb)), att_cc))
+        s.store(wt_out[k], s.fmul(s.fmul(tint[k], one_es), kt_amb))
+    s.store(sh.w_cc, s.fsub(one, att_cc))
+    s.store(sh.w_em, att_cc)
+    s.store(sh.r_eff, lb.get(s, _LB_REFF))
+    s.store(sh.aniso, lb.get(s, _LB_ANISO))
+    var fb = lb.get3(s, _LB_B)
+    s.store(sh.bx, fb[0])
+    s.store(sh.by, fb[1])
+    s.store(sh.bz, fb[2])
+
+
+def emit_sota_mat_shade_off() -> SotaMatShade:
+    """A shade record with no SSA ids: hooks that receive it compile nothing."""
+    return SotaMatShade(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, SotaMatLobesGpu(), 0, 0, 0, 0)
+
+
+def emit_sota_mat_albedo_avg(mut s: AaaSpirvModule, b_mats: UInt32, lb: SotaMatLobesGpu) -> Tuple[UInt32, UInt32, UInt32]:
+    """GPU twin of `sota_mat_albedo_avg_cpu` (the lobes must have been built at mu_v = 0.6, phi 0)."""
+    var one = s.float(1.0)
+    var rc = lb.get(s, _LB_CC_ROUGH)
+    var cc = lb.get(s, _LB_CC)
+    var ecc = s.fma(s.float(0.04), _e_lut1(s, b_mats, SOTA_MAT_LUT_AAVG, rc), _e_lut1(s, b_mats, SOTA_MAT_LUT_BAVG, rc))
+    var esh = _e_lut1(s, b_mats, SOTA_MAT_LUT_SHAVG, lb.get(s, _LB_SH_ROUGH))
+    var shc = lb.get3(s, _LB_SH)
+    var smax = s.nmax(shc[0], s.nmax(shc[1], shc[2]))
+    var a_cc = s.fsub(one, s.fmul(cc, ecc))
+    var a_sh = s.fsub(one, s.fmul(smax, esh))
+    var kd = s.fmul(s.fsub(one, lb.get(s, _LB_METAL)), s.fsub(one, lb.get(s, _LB_TRANS)))
+    var es = lb.get3(s, _LB_ESAVG)
+    var alb = lb.get3(s, _LB_ALB)
+    var w_cc = s.fmul(cc, ecc)
+    var o = List[UInt32]()
+    for k in range(3):
+        var base = s.fma(s.fmul(alb[k], s.fsub(one, es[k])), kd, es[k])
+        o.append(s.fma(s.fma(shc[k], esh, s.fmul(base, a_sh)), a_cc, w_cc))
+    return (o[0], o[1], o[2])
+
+
+def emit_sota_mat_shadow_transmittance(mut s: AaaSpirvModule, b_mats: UInt32, mat_id: UInt32) -> UInt32:
+    """GPU twin of `sota_mat_shadow_transmittance_cpu` from the raw words (any-hit candidates)."""
+    var one = s.float(1.0)
+    var zero = s.float(0.0)
+    var mb = s.imul(mat_id, s.uint(UInt32(AAA_MATERIAL_WORDS)))
+    var eb = s.iadd(s.uint(UInt32(SOTA_MAT_EXT_BASE)), s.imul(mat_id, s.uint(UInt32(SOTA_MAT_EXT_WORDS))))
+    var has_ext = s.ieq(s.load_word(b_mats, eb), s.uint(SOTA_MAT_MAGIC))
+    var trans = s.select_f(has_ext, s.load_float(b_mats, s.iadd(eb, s.uint(3))), zero)
+    var lum = s.fma(
+        s.load_float(b_mats, s.iadd(eb, s.uint(4))), s.float(0.2126),
+        s.fma(s.load_float(b_mats, s.iadd(eb, s.uint(5))), s.float(0.7152), s.fmul(s.load_float(b_mats, s.iadd(eb, s.uint(6))), s.float(0.0722))),
+    )
+    var col_t = _e_sat(s, lum)
+    var col = s.select_f(s.fgt(s.load_float(b_mats, s.iadd(eb, s.uint(8))), zero), s.fsqrt(col_t), col_t)
+    var m = s.load_float(b_mats, s.iadd(mb, s.uint(5)))
+    var spec = s.fabs(s.load_float(b_mats, s.iadd(mb, s.uint(3))))
+    var cc = s.load_float(b_mats, s.iadd(mb, s.uint(6)))
+    var t = s.fmul(s.fmul(s.fsub(one, m), trans), s.fmul(s.fsub(one, s.fmul(s.float(0.04), spec)), s.fsub(one, s.fmul(s.float(0.04), cc))))
+    return _e_sat(s, s.fmul(t, col))
+
+
+def sota_mat_lb_index_view() -> Int:
+    return _LB_V
+
+
+def sota_mat_lb_index_normal() -> Int:
+    return _LB_N
+
+
+def sota_mat_lb_index_coat_normal() -> Int:
+    return _LB_NC
+
+
+def sota_mat_lb_index(name: StringLiteral) -> Int:
+    """Named access to the lobe variables for the other sota:mat files."""
+    if name == "n":
+        return _LB_N
+    if name == "nc":
+        return _LB_NC
+    if name == "v":
+        return _LB_V
+    if name == "reff":
+        return _LB_REFF
+    if name == "vol":
+        return _LB_VOL
+    if name == "atten":
+        return _LB_ATTEN
+    if name == "coat_mode":
+        return _LB_COAT_MODE
+    if name == "spec":
+        return _LB_SPEC
+    if name == "metal":
+        return _LB_METAL
+    if name == "trans":
+        return _LB_TRANS
+    if name == "cc":
+        return _LB_CC
+    if name == "cc_rough":
+        return _LB_CC_ROUGH
+    if name == "att_cc":
+        return _LB_ATT_CC
+    if name == "att_sh":
+        return _LB_ATT_SH
+    if name == "ndotv":
+        return _LB_NDOTV
+    if name == "ndotv_c":
+        return _LB_NDOTV_C
+    if name == "esv":
+        return _LB_ESV
+    if name == "esavg":
+        return _LB_ESAVG
+    if name == "alb":
+        return _LB_ALB
+    if name == "sh":
+        return _LB_SH
+    if name == "sh_rough":
+        return _LB_SH_ROUGH
+    if name == "tint":
+        return _LB_TINT
+    if name == "f0":
+        return _LB_F0
+    return -1
 
 
 def _e_d_aniso(mut s: AaaSpirvModule, at: UInt32, ab: UInt32, ht: UInt32, hb: UInt32, hn: UInt32) -> UInt32:
@@ -1508,6 +2088,8 @@ struct SotaMatComposeIn(Copyable, Movable):
     var mod_r: UInt32
     var mod_g: UInt32
     var mod_b: UInt32
+    var env_cc: UInt32     # round 3: the legacy coat cubemap sample (vec4) and its occlusion, for the coat-normal resample
+    var env_occ_cc: UInt32
 
 
 def emit_sota_mat_compose(
@@ -1554,7 +2136,27 @@ def emit_sota_mat_compose(
     s.store(ref_g, s.fma(s.fsub(s.extract_f(env_a, 1), s.extract_f(c.env_sp, 1)), kk, s.load_f(ref_g)))
     s.store(ref_b, s.fma(s.fsub(s.extract_f(env_a, 2), s.extract_f(c.env_sp, 2)), kk, s.load_f(ref_b)))
     s.end_if()
-    # Thin-walled transmission sees the environment straight through (-v)
+    # Coat with its own normal: move the coat reflection to reflect(-v, n_c) (cubemap delta, RT part kept)
+    var cc_rr = s.fvar(s.load_f(c.cc_r))
+    var cc_rg = s.fvar(s.load_f(c.cc_g))
+    var cc_rb = s.fvar(s.load_f(c.cc_b))
+    var lbn = sh.lb.get3(s, _LB_NC)
+    var coat_mode = sh.lb.get(s, _LB_COAT_MODE)
+    var cc_w = sh.lb.get(s, _LB_CC)
+    s.begin_if(s.logical_and(s.logical_and(s.fgt(coat_mode, s.float(0.5)), s.fgt(cc_w, zero)), s.logical_not(c.is_furnace)))
+    var two_cv = s.fmul(s.float(2.0), emit_vec3_dot(s, lbn[0], lbn[1], lbn[2], c.vx, c.vy, c.vz))
+    var env_c2 = s.sample_cube_lod(
+        env_cube,
+        s.vec3(s.fsub(s.fmul(lbn[0], two_cv), c.vx), s.fsub(s.fmul(lbn[1], two_cv), c.vy), s.fsub(s.fmul(lbn[2], two_cv), c.vz)),
+        s.fmul(sh.lb.get(s, _LB_CC_ROUGH), c.max_mip),
+    )
+    var kc = s.fmul(c.ibl_int, c.env_occ_cc)
+    s.store(cc_rr, s.nmax(zero, s.fma(s.fsub(s.extract_f(env_c2, 0), s.extract_f(c.env_cc, 0)), kc, s.load_f(cc_rr))))
+    s.store(cc_rg, s.nmax(zero, s.fma(s.fsub(s.extract_f(env_c2, 1), s.extract_f(c.env_cc, 1)), kc, s.load_f(cc_rg))))
+    s.store(cc_rb, s.nmax(zero, s.fma(s.fsub(s.extract_f(env_c2, 2), s.extract_f(c.env_cc, 2)), kc, s.load_f(cc_rb))))
+    s.end_if()
+    # Transmission: the traced radiance through the surface when `sota_mat_rt` produced one, else the
+    # environment straight through (-v)
     var tr_rad_r = s.fvar(one)
     var tr_rad_g = s.fvar(one)
     var tr_rad_b = s.fvar(one)
@@ -1562,16 +2164,17 @@ def emit_sota_mat_compose(
     var has_t = s.fgt(s.nmax(wt[0], s.nmax(wt[1], wt[2])), zero)
     s.begin_if(s.logical_and(has_t, s.logical_not(c.is_furnace)))
     var env_t = s.sample_cube_lod(env_cube, s.vec3(s.fneg(c.vx), s.fneg(c.vy), s.fneg(c.vz)), s.fmul(r_eff, c.max_mip))
-    s.store(tr_rad_r, s.fmul(s.extract_f(env_t, 0), c.ibl_int))
-    s.store(tr_rad_g, s.fmul(s.extract_f(env_t, 1), c.ibl_int))
-    s.store(tr_rad_b, s.fmul(s.extract_f(env_t, 2), c.ibl_int))
+    var traced = s.fgt(s.load_f(sh.tr_ok), s.float(0.5))
+    s.store(tr_rad_r, s.select_f(traced, s.load_f(sh.tr_r), s.fmul(s.extract_f(env_t, 0), c.ibl_int)))
+    s.store(tr_rad_g, s.select_f(traced, s.load_f(sh.tr_g), s.fmul(s.extract_f(env_t, 1), c.ibl_int)))
+    s.store(tr_rad_b, s.select_f(traced, s.load_f(sh.tr_b), s.fmul(s.extract_f(env_t, 2), c.ibl_int)))
     s.end_if()
     var w_cc = s.load_f(sh.w_cc)
     var w_em = s.load_f(sh.w_em)
     var ws = [s.load_f(sh.ws_r), s.load_f(sh.ws_g), s.load_f(sh.ws_b)]
     var wd = [s.load_f(sh.wd_r), s.load_f(sh.wd_g), s.load_f(sh.wd_b)]
     var refl = [s.load_f(ref_r), s.load_f(ref_g), s.load_f(ref_b)]
-    var ccr = [s.load_f(c.cc_r), s.load_f(c.cc_g), s.load_f(c.cc_b)]
+    var ccr = [s.load_f(cc_rr), s.load_f(cc_rg), s.load_f(cc_rb)]
     var dirs = [s.load_f(c.dir_r), s.load_f(c.dir_g), s.load_f(c.dir_b)]
     var ems = [c.em_r, c.em_g, c.em_b]
     var aos = [c.ao_r, c.ao_g, c.ao_b]
@@ -1601,11 +2204,45 @@ struct SotaMatState(Copyable, Movable):
     var enabled: Bool
     var lut_uploaded: Bool
     var bake_s: Float64
+    var transmissive: List[Bool]  # per material: layered transmission > 0 (TLAS: non-opaque + instance bit 20)
+    # Layered pipeline variants (`sota_mat_layered=True`), built on the first enabled frame. The default
+    # pipelines contain none of the layered code, so switch-off rendering is the pre-layered shader.
+    var variants_tried: Bool
+    var pipe_deferred: Int
+    var pipe_surfcache: Int
+    var pipe_rt_shadow: Int
+    var variant_build_s: Float64
 
     def __init__(out self):
         self.enabled = env_value("FLINT_SOTA_MAT") == "1"
         self.lut_uploaded = False
         self.bake_s = Float64(0.0)
+        self.transmissive = List[Bool]()
+        self.variants_tried = False
+        self.pipe_deferred = 0
+        self.pipe_surfcache = 0
+        self.pipe_rt_shadow = 0
+        self.variant_build_s = Float64(0.0)
+
+    def active(self) -> Bool:
+        """Layered shading runs this frame: enabled, LUTs uploaded and the layered deferred variant built."""
+        return self.enabled and self.lut_uploaded and self.pipe_deferred != 0
+
+    def pick(self, legacy_pipe: Int, variant_pipe: Int) -> Int:
+        """The layered variant while `active()` (and built), else the default pipeline."""
+        if self.active() and variant_pipe != 0:
+            return variant_pipe
+        return legacy_pipe
+
+    def set_transmissive(mut self, mat_id: Int, value: Bool):
+        if mat_id < 0 or mat_id >= SOTA_MAT_MAX_MATERIALS:
+            return
+        while len(self.transmissive) <= mat_id:
+            self.transmissive.append(False)
+        self.transmissive[mat_id] = value
+
+    def is_transmissive(self, mat_id: Int) -> Bool:
+        return self.enabled and mat_id >= 0 and mat_id < len(self.transmissive) and self.transmissive[mat_id]
 
     def prepare(mut self, cpu_address: Int):
         if self.lut_uploaded or cpu_address == 0:

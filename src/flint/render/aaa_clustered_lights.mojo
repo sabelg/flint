@@ -17,6 +17,17 @@ from flint.core.math import Vec3
 from flint.assets.bc_compress import f32_to_uf16_bits
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 from flint.render.aaa_raytracing import emit_rt_shadow_query
+# --- sota:mat hook --- (area I: layered BSDF in the local-light loops)
+from flint.render.sota_mat_core import SotaMatLobesGpu
+from flint.render.sota_mat_lights import (
+    SotaMatLtcWeights,
+    emit_sota_mat_ltc_coat_cond,
+    emit_sota_mat_ltc_coat_uv,
+    emit_sota_mat_ltc_combine,
+    emit_sota_mat_ltc_weights,
+    emit_sota_mat_punctual,
+)
+# --- end sota:mat hook ---
 from flint.render.shader_dsl import (
     ShaderDsl,
     clamp_f,
@@ -745,6 +756,8 @@ def emit_eval_clustered_and_ltc_lights(
     b_instances: UInt32 = 0,
     b_materials: UInt32 = 0,
     bindless_arr: Tuple[UInt32, UInt32] = (0, 0),
+    sota_lb: SotaMatLobesGpu = SotaMatLobesGpu(),  # --- sota:mat hook --- layered lobes (inactive = legacy)
+    sota_b_mats: UInt32 = 0,
 ) -> Tuple[UInt32, UInt32, UInt32]:
     """Accumulates shading from all culled Point, Spot, Rectangular `LTC`, and Tube `LTC` lights
     in the pixel's `16 x 9 x 24` logarithmic-Z cluster, optionally tracing `<= 2` deterministic
@@ -818,6 +831,11 @@ def emit_eval_clustered_and_ltc_lights(
     var alpha = s.nmax(s.float(0.002), s.fmul(rough, rough))
     var a2 = s.fmul(alpha, alpha)
     var inv_pi = s.float(0.318309886)
+    # --- sota:mat hook ---
+    var sota_w = SotaMatLtcWeights()
+    if sota_lb.active():
+        sota_w = emit_sota_mat_ltc_weights(s, sota_b_mats, sota_lb)
+    # --- end sota:mat hook ---
 
     var k_iter = s.uvar(s.uint(0))
     s.begin_loop()
@@ -904,6 +922,23 @@ def emit_eval_clustered_and_ltc_lights(
     var c_ltc_r = s.fmul(lr_w, s.fma(kd_r, ff_diff, s.fmul(spec_w_r, ff_spec)))
     var c_ltc_g = s.fmul(lg_w, s.fma(kd_g, ff_diff, s.fmul(spec_w_g, ff_spec)))
     var c_ltc_b = s.fmul(lb_w, s.fma(kd_b, ff_diff, s.fmul(spec_w_b, ff_spec)))
+    # --- sota:mat hook --- (layered split-sum weights on the LTC form factors, coat with its own LTC fetch)
+    if sota_lb.active():
+        var sota_ffc = s.fvar(s.float(0.0))
+        s.begin_if(emit_sota_mat_ltc_coat_cond(s, sota_w))
+        var sota_cs = s.sample_2d_lod(ltc_lut, emit_sota_mat_ltc_coat_uv(s, sota_w), s.float(0.0))
+        s.store(sota_ffc, _emit_ltc_quad_form_factor_spv(
+            s, t1, t2, (nx, ny, nz), rel_x, rel_y, rel_z, aux_x, aux_y, aux_z, f_vx, f_vy, f_vz,
+            s.extract_f(sota_cs, 0), s.extract_f(sota_cs, 1), s.load_f(two_s),
+        ))
+        s.end_if()
+        var sota_c = emit_sota_mat_ltc_combine(
+            s, sota_w, (c_ltc_r, c_ltc_g, c_ltc_b), (lr_w, lg_w, lb_w), ff_diff, ff_spec, s.load_f(sota_ffc)
+        )
+        c_ltc_r = sota_c[0]
+        c_ltc_g = sota_c[1]
+        c_ltc_b = sota_c[2]
+    # --- end sota:mat hook ---
     s.store(out_r, s.fadd(c_ltc_r, s.load_f(out_r)))
     s.store(out_g, s.fadd(c_ltc_g, s.load_f(out_g)))
     s.store(out_b, s.fadd(c_ltc_b, s.load_f(out_b)))
@@ -975,6 +1010,15 @@ def emit_eval_clustered_and_ltc_lights(
     var c_pt_r = s.fmul(s.fmul(lrr, e_in), s.fma(kd_r, inv_pi, s.fmul(fr_r, dv_s)))
     var c_pt_g = s.fmul(s.fmul(lrg, e_in), s.fma(kd_g, inv_pi, s.fmul(fr_g, dv_s)))
     var c_pt_b = s.fmul(s.fmul(lrb, e_in), s.fma(kd_b, inv_pi, s.fmul(fr_b, dv_s)))
+    # --- sota:mat hook --- (layered BSDF * cos)
+    if sota_lb.active():
+        var sota_p = emit_sota_mat_punctual(
+            s, sota_b_mats, sota_lb, lx, ly, lz, s.load_f(atten), (lrr, lrg, lrb), (c_pt_r, c_pt_g, c_pt_b)
+        )
+        c_pt_r = sota_p[0]
+        c_pt_g = sota_p[1]
+        c_pt_b = sota_p[2]
+    # --- end sota:mat hook ---
     s.store(out_r, s.fadd(c_pt_r, s.load_f(out_r)))
     s.store(out_g, s.fadd(c_pt_g, s.load_f(out_g)))
     s.store(out_b, s.fadd(c_pt_b, s.load_f(out_b)))
@@ -1169,6 +1213,8 @@ def emit_eval_single_cluster_light(
     lut_b: UInt32,
     rough: UInt32,
     metal: UInt32,
+    sota_lb: SotaMatLobesGpu = SotaMatLobesGpu(),  # --- sota:mat hook --- layered lobes (inactive = legacy)
+    sota_b_mats: UInt32 = 0,
 ) -> Tuple[UInt32, UInt32, UInt32]:
     """Evaluates unshadowed multi-lobe BSDF contribution from a single clustered light index `li`."""
     var out_r = s.fvar(s.float(0.0))
@@ -1212,6 +1258,11 @@ def emit_eval_single_cluster_light(
     var alpha = s.nmax(s.float(0.002), s.fmul(rough, rough))
     var a2 = s.fmul(alpha, alpha)
     var inv_pi = s.float(0.318309886)
+    # --- sota:mat hook ---
+    var sota_w = SotaMatLtcWeights()
+    if sota_lb.active():
+        sota_w = emit_sota_mat_ltc_weights(s, sota_b_mats, sota_lb)
+    # --- end sota:mat hook ---
 
     var l_off = s.iadd(s.uint(UInt32(AAA_CLUSTER_LIGHTS_BASE)), s.imul(li, s.uint(UInt32(AAA_CLUSTER_LIGHT_WORDS))))
     var lpx = s.load_float(b_clusters, l_off)
@@ -1282,9 +1333,30 @@ def emit_eval_single_cluster_light(
     var lr_w = s.fmul(lrr, win)
     var lg_w = s.fmul(lrg, win)
     var lb_w = s.fmul(lrb, win)
+    var sota_prev = (UInt32(0), UInt32(0), UInt32(0))  # --- sota:mat hook ---
+    if sota_lb.active():
+        sota_prev = (s.load_f(out_r), s.load_f(out_g), s.load_f(out_b))
     s.store(out_r, s.fma(lr_w, s.fma(kd_r, ff_diff, s.fmul(spec_w_r, ff_spec)), s.load_f(out_r)))
     s.store(out_g, s.fma(lg_w, s.fma(kd_g, ff_diff, s.fmul(spec_w_g, ff_spec)), s.load_f(out_g)))
     s.store(out_b, s.fma(lb_w, s.fma(kd_b, ff_diff, s.fmul(spec_w_b, ff_spec)), s.load_f(out_b)))
+    # --- sota:mat hook ---
+    if sota_lb.active():
+        var sota_ffc = s.fvar(s.float(0.0))
+        s.begin_if(emit_sota_mat_ltc_coat_cond(s, sota_w))
+        var sota_cs = s.sample_2d_lod(ltc_lut, emit_sota_mat_ltc_coat_uv(s, sota_w), s.float(0.0))
+        s.store(sota_ffc, _emit_ltc_quad_form_factor_spv(
+            s, t1, t2, (nx, ny, nz), rel_x, rel_y, rel_z, aux_x, aux_y, aux_z, f_vx, f_vy, f_vz,
+            s.extract_f(sota_cs, 0), s.extract_f(sota_cs, 1), s.load_f(two_s),
+        ))
+        s.end_if()
+        var sota_z = s.float(0.0)
+        var sota_c = emit_sota_mat_ltc_combine(s, sota_w, (sota_z, sota_z, sota_z), (lr_w, lg_w, lb_w), ff_diff, ff_spec, s.load_f(sota_ffc))
+        s.begin_if(sota_lb.on)
+        s.store(out_r, s.fadd(sota_prev[0], sota_c[0]))
+        s.store(out_g, s.fadd(sota_prev[1], sota_c[1]))
+        s.store(out_b, s.fadd(sota_prev[2], sota_c[2]))
+        s.end_if()
+    # --- end sota:mat hook ---
     s.end_if()
 
     s.begin_else()
@@ -1326,9 +1398,22 @@ def emit_eval_single_cluster_light(
     var dv_s = s.fmul(d_ggx, vis_g)
 
     var e_in = s.fmul(ndotl, s.load_f(atten))
+    var sota_prev_p = (UInt32(0), UInt32(0), UInt32(0))  # --- sota:mat hook ---
+    if sota_lb.active():
+        sota_prev_p = (s.load_f(out_r), s.load_f(out_g), s.load_f(out_b))
     s.store(out_r, s.fma(s.fmul(lrr, e_in), s.fma(kd_r, inv_pi, s.fmul(fr_r, dv_s)), s.load_f(out_r)))
     s.store(out_g, s.fma(s.fmul(lrg, e_in), s.fma(kd_g, inv_pi, s.fmul(fr_g, dv_s)), s.load_f(out_g)))
     s.store(out_b, s.fma(s.fmul(lrb, e_in), s.fma(kd_b, inv_pi, s.fmul(fr_b, dv_s)), s.load_f(out_b)))
+    # --- sota:mat hook ---
+    if sota_lb.active():
+        var sota_z = s.float(0.0)
+        var sota_p = emit_sota_mat_punctual(s, sota_b_mats, sota_lb, lx, ly, lz, s.load_f(atten), (lrr, lrg, lrb), (sota_z, sota_z, sota_z))
+        s.begin_if(sota_lb.on)
+        s.store(out_r, s.fadd(sota_prev_p[0], sota_p[0]))
+        s.store(out_g, s.fadd(sota_prev_p[1], sota_p[1]))
+        s.store(out_b, s.fadd(sota_prev_p[2], sota_p[2]))
+        s.end_if()
+    # --- end sota:mat hook ---
     s.end_if()
     s.end_if()
 
