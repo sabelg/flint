@@ -190,6 +190,18 @@ from flint.render.aaa_gi_svgf import (
     svgf_atrous_shader,
     svgf_temporal_reproject_shader,
 )
+# --- sota:gi hook --- (area B: world radiance cache + path-traced GI)
+from flint.render.sota_gi_world_cache import (
+    SOTA_GI_CTRL_WORDS,
+    SOTA_GI_MODE_HYBRID,
+    SOTA_GI_MODE_LEGACY,
+    SOTA_GI_SURFCACHE_TRIS,
+    SotaGiSettings,
+    sota_gi_region_words,
+    sota_gi_resolve_shader,
+    sota_wrc_update_shader,
+)
+# --- end sota:gi hook ---
 from flint.render.aaa_clustered_lights import (
     AAA_CLUSTER_BUFFER_WORDS,
     AAA_CLUSTER_LIGHTS_BASE,
@@ -716,6 +728,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var enable_async_vsm: Bool
     var vsm_warmed_up: Bool
     var gi_bounces: Int
+    var sota_gi: SotaGiSettings  # --- sota:gi hook --- area-B GI cvars (`mode = 0` keeps the v5 path)
+    var sota_gi_region_ready: Bool  # --- sota:gi hook --- surface-cache buffer grown for the area-B region
     var frame_index: Int
     var last_culled_meshlet_draws: Int
     var prev_cam_pos: Vec3
@@ -994,6 +1008,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.enable_async_vsm = False
         self.vsm_warmed_up = False
         self.gi_bounces = 2
+        self.sota_gi = SotaGiSettings()  # --- sota:gi hook ---
+        self.sota_gi_region_ready = False  # --- sota:gi hook ---
         self.frame_index = 0
         self.last_culled_meshlet_draws = 0
         self.prev_cam_pos = self.cam_pos
@@ -1215,6 +1231,11 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_deferred_shade = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_deferred_shade_shader(use_rt))
         self.pipe_svgf_reproject = self.vk.create_aaa_compute_pipeline(self.pipe_layout, svgf_temporal_reproject_shader())
         self.pipe_svgf_atrous = self.vk.create_aaa_compute_pipeline(self.pipe_layout, svgf_atrous_shader())
+        # --- sota:gi hook --- (optional: a zero handle just disables the area-B modes)
+        if use_rt:
+            self.sota_gi.pipe_wrc = self.vk.create_aaa_compute_pipeline(self.pipe_layout, sota_wrc_update_shader(use_rt))
+            self.sota_gi.pipe_resolve = self.vk.create_aaa_compute_pipeline(self.pipe_layout, sota_gi_resolve_shader(use_rt))
+        # --- end sota:gi hook ---
         self.pipe_oit_vol = self.vk.create_aaa_compute_pipeline(self.pipe_layout, oit_and_6way_volumetric_shader())
         self.pipe_luma_hist = self.vk.create_aaa_compute_pipeline(
             self.pipe_layout, aaa_luminance_histogram_shader(BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH)
@@ -1357,7 +1378,8 @@ struct FlintAaaVulkanRenderer(Movable):
         var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
         self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
         self.buf_vsm_table = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True)
-        self.buf_surfcache = self.vk.create_buffer((4096 + self.max_surfcache_tris * 4) * 4, local=True)
+        # --- sota:gi hook --- (+ the area-B control block; the full region is allocated on first use)
+        self.buf_surfcache = self.vk.create_buffer((4096 + self.max_surfcache_tris * 4 + SOTA_GI_CTRL_WORDS) * 4, local=True)
         self.buf_oit_nodes = self.vk.create_buffer(gpu_particles_total_oit_words(max_pix) * 4, local=True)
         self.buf_skinning = self.vk.create_buffer(AAA_SKIN_BUFFER_WORDS * 4, local=True)
         # Per-pixel post regions end below word 1024 + max_pix * 10; the UI prims of each frame in flight follow.
@@ -3591,6 +3613,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.last_cpu_prev_wait_ms = (t_pack0 - t_wait0) * 1000.0
 
         _ = self.streamer.tick_streaming_budget()
+        self._sota_gi_prepare()  # --- sota:gi hook ---
 
         var cur_slot = self.frame_index % FRAMES_IN_FLIGHT
         var defer_this = self.deferred_readback and (not capture_readback) and self.vk.swapchain == 0
@@ -3981,6 +4004,22 @@ struct FlintAaaVulkanRenderer(Movable):
             or (self.enable_water_plane and not self.furnace_white_dome)
             or frame_has_glass
         )
+        # --- sota:gi hook --- (effective area-B mode + control block for this frame)
+        var sota_mode = SOTA_GI_MODE_LEGACY
+        if (
+            use_rt_frame
+            and self.enable_rt_gi
+            and not self.furnace_white_dome
+            and self.sota_gi_region_ready
+            and self.sota_gi.pipe_wrc != 0
+            and self.sota_gi.pipe_resolve != 0
+        ):
+            sota_mode = self.sota_gi.mode
+        self.sota_gi.write_ctrl(
+            self.buf_surfcache.cpu_address, sota_mode, self.frame_index, self.cam_pos, self.cam_fwd,
+            self.render_w, self.render_h, max(self.output_w * self.output_h, self.render_w * self.render_h), n_inst,
+        )
+        # --- end sota:gi hook ---
         var inst_da: UInt64 = 0
         if use_rt_frame:
             inst_da = self.vk.buffer_device_address(self.buf_as_instances)
@@ -4403,7 +4442,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.vk.write_timestamp(cur_slot, q_vr + 1, PIPELINE_BOTTOM)
 
         # Update Lumen Direct + Indirect Mesh Surface Cache (only required when RT GI multi-bounce is active!)
-        if use_rt_frame and self.enable_rt_gi and sc_inst_count > 0:
+        if use_rt_frame and self.enable_rt_gi and sc_inst_count > 0 and self.sota_gi.needs_surface_cache(sota_mode):  # sota:gi hook
             var q_sc = next_q
             if use_prof and q_sc + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_sc, PIPELINE_TOP)
@@ -4423,6 +4462,8 @@ struct FlintAaaVulkanRenderer(Movable):
                         max_tri_tail = tc
 
             var n_bounces = max(1, min(2, self.gi_bounces)) if self.enable_rt_gi else 1
+            if sota_mode == SOTA_GI_MODE_HYBRID:  # --- sota:gi hook --- the WRC supplies the bounce
+                n_bounces = 1
             for bounce in range(n_bounces):
                 if head_end > 0:
                     var push_sc0 = List[UInt32](length=16, fill=0)
@@ -4458,6 +4499,22 @@ struct FlintAaaVulkanRenderer(Movable):
                 )
             if use_prof and q_sc + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_sc + 1, PIPELINE_BOTTOM)
+
+        # --- sota:gi hook --- (world radiance cache probe update: one 64-ray workgroup per probe)
+        if self.sota_gi.uses_wrc(sota_mode):
+            var q_wrc = next_q
+            if use_prof and q_wrc + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_wrc, PIPELINE_TOP)
+                next_q += 2
+                prof_pairs.append((String("SotaWorldRadianceCache"), q_wrc))
+            var push_wrc = List[UInt32](length=16, fill=0)
+            self.vk.dispatch_aaa(cur_slot, self.sota_gi.pipe_wrc, self.pipe_layout, self.desc_set, push_wrc, self.sota_gi.probe_count(), 1)
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            if use_prof and q_wrc + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_wrc + 1, PIPELINE_BOTTOM)
+        # --- end sota:gi hook ---
 
         # `16 x 9 x 24` Logarithmic-Z GPU Clustered Punctual + Heitz `LTC` Area Light Culler (`V18`)!
         if n_cl_lights > 0 and not self.furnace_white_dome:
@@ -4609,6 +4666,32 @@ struct FlintAaaVulkanRenderer(Movable):
         if use_prof and q_sh + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_sh + 1, PIPELINE_BOTTOM)
         self.render_graph.emit_pass_barriers(self.vk, cur_slot, 4)
+
+        # --- sota:gi hook --- (area-B GI resolve: probe GI / hybrid rays / path tracer -> demodulated GI)
+        if sota_mode != SOTA_GI_MODE_LEGACY:
+            var q_sgr = next_q
+            if use_prof and q_sgr + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_sgr, PIPELINE_TOP)
+                next_q += 2
+                prof_pairs.append((String("SotaGiResolve"), q_sgr))
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            var push_sgr = List[UInt32](length=16, fill=0)
+            push_sgr[0] = UInt32(self.render_w)
+            push_sgr[1] = UInt32(self.render_h)
+            push_sgr[2] = UInt32(1) if run_svgf else UInt32(0)
+            self.vk.dispatch_aaa(
+                cur_slot, self.sota_gi.pipe_resolve, self.pipe_layout, self.desc_set, push_sgr,
+                (self.render_w + 7) // 8, (self.render_h + 7) // 8,
+            )
+            self.vk.memory_barrier2(
+                cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+            if use_prof and q_sgr + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_sgr + 1, PIPELINE_BOTTOM)
+        self.sota_gi.end_frame(sota_mode)
+        # --- end sota:gi hook ---
 
         # `SVGF` Temporal Reprojection + Moments Variance Edge-Stopping `À-Trous` Denoiser
         if run_svgf:
@@ -5454,6 +5537,28 @@ struct FlintAaaVulkanRenderer(Movable):
         self.frame_index += 1
         return True
 
+    # --- sota:gi hook ---
+    def _sota_gi_prepare(mut self):
+        """Grows the surface-cache buffer to hold the area-B region the first time a mode is enabled."""
+        if self.sota_gi.mode == SOTA_GI_MODE_LEGACY or self.sota_gi_region_ready:
+            return
+        if self.max_surfcache_tris != SOTA_GI_SURFCACHE_TRIS or self.sota_gi.pipe_wrc == 0:
+            return
+        var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
+        var words = 4096 + self.max_surfcache_tris * 4 + sota_gi_region_words(max_pix)
+        var nb = self.vk.create_buffer(words * 4, local=True)
+        if nb.cpu_address == 0:
+            return
+        self.vk.wait_idle()
+        _ = external_call["memset", Int](nb.cpu_address, Int32(0), nb.size)
+        self.vk.destroy_buffer(self.buf_surfcache)
+        self.buf_surfcache = nb^
+        for slot in range(FRAMES_IN_FLIGHT):
+            self.vk.write_descriptor(self.desc_sets[slot], BIND_AAA_SURFCACHE, self.buf_surfcache)
+        self.sota_gi.reset_cache()
+        self.sota_gi_region_ready = True
+    # --- end sota:gi hook ---
+
     def _read_gpu_timings(mut self, prof_pairs: List[Tuple[String, Int]], frame_q: Int):
         self.render_graph.pass_timings.clear()
         self.render_graph.total_gpu_ms = 0.0
@@ -5616,6 +5721,12 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_deferred_shade)
         self.vk.destroy_pipeline(self.pipe_svgf_reproject)
         self.vk.destroy_pipeline(self.pipe_svgf_atrous)
+        if self.sota_gi.pipe_wrc != 0:  # --- sota:gi hook ---
+            self.vk.destroy_pipeline(self.sota_gi.pipe_wrc)
+            self.sota_gi.pipe_wrc = 0
+        if self.sota_gi.pipe_resolve != 0:  # --- sota:gi hook ---
+            self.vk.destroy_pipeline(self.sota_gi.pipe_resolve)
+            self.sota_gi.pipe_resolve = 0
         self.vk.destroy_pipeline(self.pipe_oit_vol)
         self.vk.destroy_pipeline(self.pipe_luma_hist)
         self.vk.destroy_pipeline(self.pipe_adapt_exp)
