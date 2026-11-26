@@ -99,7 +99,7 @@ from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 # --- sota:geometry hook ---
 from flint.render.sota_geometry_cull import SotaGeometryGpu
 from flint.render.sota_geometry_vt import SotaVirtualTextures
-from flint.render.sota_geometry_cluster_dag import build_cluster_dag, cook_cluster_dag_into_pool
+from flint.render.sota_geometry_cluster_dag import cook_cluster_dag_into_pool
 # --- end sota:geometry hook ---
 from flint.render.aaa_visbuffer import (
     AAA_INSTANCE_WORDS,
@@ -2179,7 +2179,7 @@ struct FlintAaaVulkanRenderer(Movable):
     def add_mesh_cluster_dag_entry(mut self, mesh: NativeMesh, material_id: Int) -> CookedMeshEntry:
         """Cooks `mesh` as a continuous cluster-LOD DAG into the CPU pool and publishes its DAG records
         (the caller, `add_mesh`, uploads the pool range and builds the LOD0 BLAS)."""
-        var dag = build_cluster_dag(mesh)
+        var dag = self.sota_geom.build_dag(mesh)       # .flpk cache + JobPool build
         var cooked = cook_cluster_dag_into_pool(self.geom, mesh, material_id, dag)
         self.sota_geom.write_dag_records(cooked[0].first_meshlet, cooked[1])
         return cooked[0].copy()
