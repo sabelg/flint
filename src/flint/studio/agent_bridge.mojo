@@ -349,6 +349,7 @@ struct StudioAgentRuntime(Movable):
     var build_generation: Int
     var mcp_events_processed: UInt64
     var acp_events_processed: UInt64
+    var _last_mcp_toast_sec: Float64
 
     def __init__(out self):
         self.acp = AcpClient()
@@ -362,6 +363,7 @@ struct StudioAgentRuntime(Movable):
         self.build_generation = 0
         self.mcp_events_processed = 0
         self.acp_events_processed = 0
+        self._last_mcp_toast_sec = -10.0
 
     def configure_acp(
         mut self,
@@ -621,6 +623,8 @@ struct StudioAgentRuntime(Movable):
             var eid = ev.affected_entities[0] if len(ev.affected_entities) > 0 else -1
             if eid < 0 and rdoc.valid:
                 eid = rdoc.integer(rdoc.object_get(rdoc.root, "entity_id"), -1)
+            if eid < 0 and rdoc.valid:
+                eid = rdoc.integer(rdoc.object_get(rdoc.root, "spawned_entity_id"), -1)
             if eid < 0 and pdoc.valid:
                 eid = pdoc.integer(pdoc.object_get(pdoc.root, "entity_id"), -1)
 
@@ -704,7 +708,16 @@ struct StudioAgentRuntime(Movable):
             if not ev.ok:
                 _ = toasts.push(TOAST_ERROR, "MCP Tool Failed", summary, own_job=True, action_entity_id=eid)
             elif ev.is_mutating:
-                _ = toasts.push(TOAST_AGENT, summary, ev.tool_name, action_entity_id=eid)
+                var is_milestone = (
+                    ev.tool_name == "scene.save"
+                    or ev.tool_name == "scene.load"
+                    or ev.tool_name == "code.build_hot_reload"
+                    or ev.tool_name == "nav.bake"
+                    or ev.tool_name == "project.package"
+                )
+                if is_milestone or (now_sec - self._last_mcp_toast_sec) >= 1.5 or now_sec < self._last_mcp_toast_sec:
+                    _ = toasts.push(TOAST_AGENT, summary, ev.tool_name, action_entity_id=eid)
+                    self._last_mcp_toast_sec = now_sec
 
         return count
 

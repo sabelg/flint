@@ -22,7 +22,7 @@ powered by the unified Engine v5 spine (`EngineApp`, `WindowPlugin`, `TransformP
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import cos, max, min, sin
+from std.math import abs, cos, max, min, sin
 from std.sys import argv
 from flint.app.engine_app import STAGE_FIRST
 from flint.app.window_plugin import WindowStateResource
@@ -190,6 +190,18 @@ def _drain_mcp_events_to_studio(mut mcp: McpServerV2, mut studio: FlintStudioSta
             agent_id=studio.agent_bus.selected_agent_id,
         )
         b.affected_entities = r.affected_entities.copy()
+        if len(b.affected_entities) > 0:
+            var target_eid = b.affected_entities[0]
+            if target_eid >= 0 and target_eid < len(studio.entities) and studio.is_alive_id(target_eid):
+                var tpos = studio.entities[target_eid].translation
+                var tsc = studio.entities[target_eid].scale
+                b.world_pos = tpos
+                b.has_world_pos = True
+                b.half_extents = Vec3(
+                    max(Float32(0.25), abs(tsc.x) * Float32(0.5)),
+                    max(Float32(0.25), abs(tsc.y) * Float32(0.5)),
+                    max(Float32(0.25), abs(tsc.z) * Float32(0.5)),
+                )
         bridged.append(b^)
     _ = studio.ingest_mcp_events(bridged^)
 

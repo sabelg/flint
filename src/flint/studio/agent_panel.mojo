@@ -69,6 +69,7 @@ from flint.studio.agent_bus import (
 )
 from flint.ui.animator import (
     SpringConfig,
+    UI_ANIM_INSTANT,
     UI_ANIM_NORMAL,
     UiSpring,
     UiTabIndicator,
@@ -284,6 +285,8 @@ struct AgentMissionControlPanel(Copyable, Movable):
     var hovered_entity_id: Int
     var hovered_step_id: UInt64
     var anim_mode: Int
+    var auto_follow_latest: Bool
+    var _last_seen_step_count: Int
     var _scrubber_dragging: Bool
     var _caret_blink_sec: Float32
 
@@ -297,6 +300,8 @@ struct AgentMissionControlPanel(Copyable, Movable):
         self.hovered_entity_id = -1
         self.hovered_step_id = 0
         self.anim_mode = UI_ANIM_NORMAL
+        self.auto_follow_latest = True
+        self._last_seen_step_count = 0
         self._scrubber_dragging = False
         self._caret_blink_sec = Float32(0.0)
 
@@ -564,7 +569,10 @@ struct AgentMissionControlPanel(Copyable, Movable):
             dl.add_progress_ring(sp_cx, sp_cy, Float32(6.0), Float32(1.6), Float32(1.0), idle_col, rgba8_with_alpha(idle_col, 40), Float32(0.0))
 
         var st_lbl = agent_status_label(st_code)
-        _draw_text_safe(dl, font_slot, font, st_lbl, inner_x + Float32(26.0), y + Float32(7.0), Float32(11.5), theme.text_primary)
+        if active_si >= 0 and bus.sessions[active_si].active_callout.byte_length() > 0 and active_busy:
+            st_lbl = bus.sessions[active_si].active_callout
+        var st_max_chars = max(8, Int((inner_w - Float32(138.0)) / Float32(6.5)))
+        _draw_text_safe(dl, font_slot, font, _truncate_text(st_lbl, st_max_chars), inner_x + Float32(26.0), y + Float32(7.0), Float32(11.5), theme.text_primary)
 
         # Right-aligned [Follow] & [Theatre] toggles
         var th_w = Float32(26.0)
@@ -745,6 +753,8 @@ struct AgentMissionControlPanel(Copyable, Movable):
 
         var feed_hov = _hit_rect(mx, my, inner_x, feed_y, inner_w, feed_h)
         if feed_hov and isfinite(input.wheel) and input.wheel != Float32(0.0):
+            if input.wheel > Float32(0.0):
+                self.auto_follow_latest = False
             self.scroll_target_y = max(Float32(0.0), self.scroll_target_y - input.wheel * Float32(36.0))
 
         dl.add_rect(inner_x, feed_y, inner_w, feed_h, theme.l0_canvas, theme.radius_md, Float32(1.0), theme.border_subtle)
@@ -753,6 +763,7 @@ struct AgentMissionControlPanel(Copyable, Movable):
         var step_count = len(bus.sessions[active_si].steps) if active_si >= 0 else 0
 
         if step_count == 0:
+            self._last_seen_step_count = 0
             _draw_text_safe(
                 dl, font_slot, font,
                 "No steps yet - pick a role and assign a task.",
@@ -769,6 +780,13 @@ struct AgentMissionControlPanel(Copyable, Movable):
                     last_turn = st.turn_id
                 est_h += self._step_card_height(st) + Float32(6.0)
             var max_scroll = max(Float32(0.0), est_h - feed_h)
+            if step_count > self._last_seen_step_count and self.auto_follow_latest and not bus.time_travel_active:
+                self.scroll_target_y = max_scroll
+                if self.anim_mode == UI_ANIM_INSTANT:
+                    self.scroll_spring.snap(max_scroll)
+            self._last_seen_step_count = step_count
+            if self.scroll_target_y >= max_scroll - Float32(8.0):
+                self.auto_follow_latest = True
             self.scroll_target_y = max(Float32(0.0), min(max_scroll, self.scroll_target_y))
             self.scroll_spring.set_target(self.scroll_target_y, snap_if_uninit=True)
             _ = self.scroll_spring.step(safe_dt, self.anim_mode)
@@ -859,8 +877,10 @@ struct AgentMissionControlPanel(Copyable, Movable):
             var fill_col = theme.status_warn if bus.time_travel_active else active_accent
             dl.add_rect(tr_x, tr_y, max(Float32(6.0), tr_w * frac), tr_h, fill_col, Float32(3.0))
 
-            # Color-coded ticks across steps
-            for k in range(step_count):
+            # Color-coded ticks across steps (capped to 64 sampled ticks so 500+ step bursts stay crisp)
+            var tick_stride = max(1, (step_count + 63) // 64)
+            var k = 0
+            while k < step_count:
                 var u = (Float32(k) + Float32(0.5)) / Float32(step_count)
                 var tx = tr_x + u * tr_w
                 var tick_col = theme.status_ok
@@ -872,6 +892,7 @@ struct AgentMissionControlPanel(Copyable, Movable):
                 elif sk == ACT_ENTITY_SPAWN or sk == ACT_ENTITY_TRANSFORM:
                     tick_col = theme.agent_flow
                 dl.add_rect(tx - Float32(1.0), tr_y - Float32(2.0), Float32(2.0), tr_h + Float32(4.0), tick_col, Float32(1.0))
+                k += tick_stride
 
             var thumb_x = tr_x + max(Float32(0.0), min(tr_w, tr_w * frac))
             dl.add_circle(thumb_x, tr_y + tr_h * Float32(0.5), Float32(5.5), fill_col, Float32(1.5), theme.text_primary)

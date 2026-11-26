@@ -391,8 +391,9 @@ def emit_agent_viewport_3d_overlays(
             if g.kind == GHOST_TRANSFORM and g.has_from_pos:
                 emitted += _add_3d_arc(lines, g.from_pos, g.target_pos, gcol, 16, Float32(2.2), dashed=True, xray=True)
 
-    # Layer C: Recent-edit fade-out footprint rings & breadcrumb arcs
-    for ti in range(len(bus.trails)):
+    # Layer C: Recent-edit fade-out footprint rings & breadcrumb arcs (cap to 6 newest so viewport stays clean)
+    var trail_start = max(0, len(bus.trails) - 6)
+    for ti in range(trail_start, len(bus.trails)):
         ref mk = bus.trails[ti]
         if mk.heat <= Float32(0.01):
             continue
@@ -573,9 +574,14 @@ def _emit_hud_core(
         var role_icon = _role_icon_id(sess.role)
 
         # 1. Floating Frosted-Glass Agent Presence Anchor Pill (clears Top-Left Transform HUD)
-        var pres_label = sess.name + " | " + agent_status_label(sess.status)
+        var pres_detail = agent_status_label(sess.status)
+        if sess.active_callout.byte_length() > 0 and sess.status != AGENT_STATUS_WAITING_APPROVAL:
+            pres_detail = sess.active_callout
+        var pres_label = sess.name + " | " + pres_detail
+        if pres_label.byte_length() > 48:
+            pres_label = String(pres_label[byte=0:45]) + "..."
         var pres_w = (font.measure(pres_label, Float32(12.0)) + Float32(46.0)) if (has_font and font.valid) else Float32(204.0)
-        pres_w = min(pres_w, vp_w * Float32(0.48))
+        pres_w = min(pres_w, vp_w * Float32(0.56))
         var pres_h = Float32(28.0)
         var pres_x = vp_x + Float32(12.0)
         var pres_y = vp_y + Float32(54.0) + Float32(presence_slot) * Float32(34.0)

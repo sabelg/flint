@@ -1270,6 +1270,11 @@ def _extract_affected_entities(
                 var reid = rdoc.integer(reid_node, -1)
                 if reid >= 0 and reid not in out:
                     out.append(reid)
+            var seid_node = rdoc.object_get(rdoc.root, "spawned_entity_id")
+            if seid_node >= 0 and rdoc.nodes[seid_node].kind == 2:
+                var seid = rdoc.integer(seid_node, -1)
+                if seid >= 0 and seid not in out:
+                    out.append(seid)
             var arr_node = rdoc.object_get(rdoc.root, "entity_ids")
             if arr_node >= 0 and rdoc.nodes[arr_node].kind == 4:
                 for i in range(rdoc.array_size(arr_node)):
@@ -1296,6 +1301,9 @@ struct McpServerV2(Movable):
     var gate_mode: Int
     var once_allow_tools: List[String]
     var session_allow_tools: List[String]
+    var proc_mesh_cache_keys: List[String]
+    var proc_mesh_cache_mesh_ids: List[Int]
+    var proc_mesh_cache_mat_ids: List[Int]
 
     def __init__(out self, workspace_root: String = ".", auth_token: String = ""):
         self.initialized = False
@@ -1312,6 +1320,9 @@ struct McpServerV2(Movable):
         self.gate_mode = MCP_GATE_AUTO
         self.once_allow_tools = List[String]()
         self.session_allow_tools = List[String]()
+        self.proc_mesh_cache_keys = List[String]()
+        self.proc_mesh_cache_mesh_ids = List[Int]()
+        self.proc_mesh_cache_mat_ids = List[Int]()
 
     def set_gate_mode(mut self, mode: Int):
         if mode == MCP_GATE_MUTATING or mode == MCP_GATE_ALL:
@@ -1746,13 +1757,27 @@ struct McpServerV2(Movable):
             var uploaded_mat_id = -1
             var rend_opt = studio.app.resources.get_ptr_mut[ScalableRenderer]()
             if rend_opt:
-                var up = rend_opt.value()[unsafe_offset=0].upload_native_model(
-                    mdl, build_lods=False, upload_skinned=False
-                )
-                if len(up.mesh_entries) > 0:
-                    uploaded_mesh_id = up.mesh_entries[0].mesh_id
-                if len(up.material_ids) > 0:
-                    uploaded_mat_id = up.material_ids[0]
+                var cache_key = preset + "#" + String(seed)
+                var cached_idx = -1
+                for ci in range(len(self.proc_mesh_cache_keys)):
+                    if self.proc_mesh_cache_keys[ci] == cache_key:
+                        cached_idx = ci
+                        break
+                if cached_idx >= 0:
+                    uploaded_mesh_id = self.proc_mesh_cache_mesh_ids[cached_idx]
+                    uploaded_mat_id = self.proc_mesh_cache_mat_ids[cached_idx]
+                else:
+                    var up = rend_opt.value()[unsafe_offset=0].upload_native_model(
+                        mdl, build_lods=False, upload_skinned=False
+                    )
+                    if len(up.mesh_entries) > 0:
+                        uploaded_mesh_id = up.mesh_entries[0].mesh_id
+                    if len(up.material_ids) > 0:
+                        uploaded_mat_id = up.material_ids[0]
+                    if len(self.proc_mesh_cache_keys) < 64:
+                        self.proc_mesh_cache_keys.append(cache_key)
+                        self.proc_mesh_cache_mesh_ids.append(uploaded_mesh_id)
+                        self.proc_mesh_cache_mat_ids.append(uploaded_mat_id)
 
             var mesh_ref = (
                 AssetRef.from_path(rel_glb, ASSET_KIND_MESH)
@@ -2995,7 +3020,11 @@ struct McpServerV2(Movable):
                 if compiler.byte_length() == 0:
                     compiler = env_now("FLINT_MOJO_BIN")
                 if compiler.byte_length() == 0:
-                    compiler = String("mojo")
+                    var pixi_mojo = String(".pixi/envs/default/bin/mojo")
+                    if file_size(pixi_mojo) > 0:
+                        compiler = pixi_mojo
+                    else:
+                        compiler = String("mojo")
                 if _has_forbidden_path_bytes(compiler):
                     return (True, '{"ok":false,"error":"invalid compiler path"}')
 
@@ -3572,9 +3601,12 @@ struct FlintMcpUnixListener(Movable):
         mut pool: JobPool,
         has_renderer: Bool,
         ren_ptr: Int,
+        max_frames: Int = 0,
+        max_budget_sec: Float64 = 0.0,
     ) -> Int:
         if not self.active or self.listen_fd < 0:
             return 0
+        var t_start = get_time() if max_budget_sec > 0.0 else Float64(0.0)
 
         # Accept up to 8 pending non-blocking connections per tick & verify `SO_PEERCRED`!
         for _ in range(8):
@@ -3625,7 +3657,14 @@ struct FlintMcpUnixListener(Movable):
                 continue
 
             var dropped_in_parse = False
+            var budget_hit = False
             while True:
+                if max_frames > 0 and processed >= max_frames:
+                    budget_hit = True
+                    break
+                if max_budget_sec > 0.0 and processed > 0 and (get_time() - t_start) >= max_budget_sec:
+                    budget_hit = True
+                    break
                 var frame = parse_next_mcp_frame(self.client_rx_bufs[ci])
                 if frame.protocol_error:
                     var err_resp = _jsonrpc_err("null", frame.error_code, frame.error_message)
@@ -3653,9 +3692,12 @@ struct FlintMcpUnixListener(Movable):
             if dropped_in_parse:
                 continue
 
-            if peer_closed:
+            if peer_closed and not budget_hit:
                 self._drop_client(ci)
                 continue
+
+            if budget_hit:
+                break
 
             ci += 1
 
@@ -3668,7 +3710,7 @@ struct FlintMcpUnixListener(Movable):
         mut assets: AssetServer,
         mut pool: JobPool,
     ) -> Int:
-        return self._poll_internal(mcp, studio, assets, pool, False, 0)
+        return self._poll_internal(mcp, studio, assets, pool, False, 0, 0, 0.0)
 
     def poll_once_with_renderer(
         mut self,
@@ -3677,8 +3719,10 @@ struct FlintMcpUnixListener(Movable):
         mut assets: AssetServer,
         mut pool: JobPool,
         mut ren: FlintAaaVulkanRenderer,
+        max_frames: Int = 4,
+        max_budget_sec: Float64 = 0.012,
     ) -> Int:
-        return self._poll_internal(mcp, studio, assets, pool, True, Int(Pointer(to=ren)))
+        return self._poll_internal(mcp, studio, assets, pool, True, Int(Pointer(to=ren)), max_frames, max_budget_sec)
 
 
 struct McpUnixSessionClient(Movable):

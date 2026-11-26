@@ -654,7 +654,7 @@ struct CodeDrawer(Movable):
             )
         else:
             dl.add_text(
-                font_slot, font, "No file open — click a component or diagnostic to inspect source",
+                font_slot, font, "No file open - click a component or diagnostic to inspect source",
                 x + Float32(10.0), crumb_y + Float32(16.0),
                 Float32(11.0), theme.text_muted,
             )

@@ -1600,6 +1600,7 @@ def _load_studio_dockspace() -> DockSpace:
     var ok = loaded.load_json(json_text)
     if (
         ok
+        and len(loaded.nodes) >= 5
         and loaded.find_panel("SceneViewport")[0] >= 0
         and loaded.find_panel("Hierarchy")[0] >= 0
         and loaded.find_panel("Inspector")[0] >= 0
@@ -1615,6 +1616,8 @@ def _load_studio_dockspace() -> DockSpace:
 
 
 def _save_studio_dockspace(d: DockSpace):
+    if len(d.nodes) < 5:
+        return
     var path = _studio_layout_path()
     var pdir = parent_directory(path)
     if pdir.byte_length() > 0:

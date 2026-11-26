@@ -1186,11 +1186,14 @@ struct AgentTelemetryBus(Copyable, Movable):
         st.pre_hash = pre_hash
 
         self.sessions[si].status = AGENT_STATUS_WAITING_APPROVAL if awaiting_approval else _status_for_action(kind)
-        self.sessions[si].active_entity_id = entity_id
-        self.sessions[si].active_world_pos = st.world_pos
-        self.sessions[si].has_active_world_pos = has_world_pos
-        self.sessions[si].active_half_extents = st.entity_half_extents
-        self.sessions[si].active_rotation = st.entity_rotation
+        self.sessions[si].last_event_sec = self.theatre_time_sec
+        if entity_id >= 0:
+            self.sessions[si].active_entity_id = entity_id
+        if has_world_pos:
+            self.sessions[si].active_world_pos = st.world_pos
+            self.sessions[si].has_active_world_pos = True
+            self.sessions[si].active_half_extents = st.entity_half_extents
+            self.sessions[si].active_rotation = st.entity_rotation
         self.sessions[si].active_callout = summary if summary.byte_length() > 0 else tool_name
         self.sessions[si].active_progress = st.progress
 
@@ -1552,6 +1555,17 @@ struct AgentTelemetryBus(Copyable, Movable):
             else:
                 self.trails[i].heat = min(Float32(1.0), h)
                 i += 1
+        # Auto-settle MCP sessions that finished a burst (3.5s idle with no pending approval)
+        for si in range(len(self.sessions)):
+            if (
+                self.sessions[si].is_busy()
+                and self.sessions[si].status != AGENT_STATUS_WAITING_APPROVAL
+                and self.first_pending_for_agent(self.sessions[si].agent_id) < 0
+                and self.sessions[si].active_progress >= Float32(0.999)
+                and (self.theatre_time_sec - self.sessions[si].last_event_sec) > Float32(3.5)
+            ):
+                self.sessions[si].status = AGENT_STATUS_IDLE
+                self.sessions[si].has_active_world_pos = False
 
     # ---- Outliner & Viewport Queries ----
 
