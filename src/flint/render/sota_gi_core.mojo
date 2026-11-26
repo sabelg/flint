@@ -90,7 +90,7 @@ comptime SOTA_PROBE_BACKFACE: Int = 41
 comptime SOTA_GI_HIST_WORDS: Int = 4  # x, y, z, packed octahedral normal
 comptime SOTA_GI_DI_WORDS: Int = 4  # light id, W, M, unused
 comptime SOTA_GI_GI_WORDS: Int = 8  # sample x, y, z, packed normal, half(Lr, Lg), half(Lb, M), W, unused
-comptime SOTA_GI_LOWRES_WORDS: Int = 8  # reduced-res resolve sample: gi r, g, b, x, y, z, packed normal, stamp
+comptime SOTA_GI_LOWRES_WORDS: Int = 4  # f16 record: half(r, g), half(b, dx), half(dy, dz), oct normal (0 = none)
 
 comptime _PI: Float32 = 3.14159265
 
@@ -112,7 +112,9 @@ def sota_gi_region_words(max_pix: Int) -> Int:
 
 def sota_gi_lowres_words(max_pix: Int) -> Int:
     """Reduced-resolution resolve buffer: one record per 2x2 block at most (half res), plus slack for the
-    rounded-up edge blocks of odd sizes (`ceil(w/2) * ceil(h/2) <= max_pix / 4 + (w + h) / 2 + 1`)."""
+    rounded-up edge blocks of odd sizes (`ceil(w/2) * ceil(h/2) <= max_pix / 4 + (w + h) / 2 + 1`).
+    Round 4: records are f16 with the position relative to the camera, so f16 keeps a relative precision of
+    about 5e-4 of the camera distance (the upsample's plane test works at 1e-2 of it)."""
     return SOTA_GI_LOWRES_WORDS * (max_pix // 4 + 16384)
 
 

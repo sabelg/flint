@@ -10,6 +10,9 @@
 Environment: `FLINT_SOTA_GI_PNG_DIR` overrides where PNGs go (default `~/flint-models/_eval/render/B`);
 `FLINT_SOTA_GI_QUICK=1` lowers the reference sample count for iteration;
 `FLINT_SOTA_GI_ONLY=gi|mirror|di|svgf|lowres|ml` runs a single GPU suite.
+
+Round 4 (render-sota-b-r4.md): the jitter-aware SVGF reprojection test (`svgf` suite), f16 low-res records,
+and the reduced-resolution path tracer's defaults (no ReSTIR GI, 48-frame SVGF history), checked in `lowres`.
 """
 from std.ffi import external_call
 from std.math import abs, cos, exp, log, max, min, sin, sqrt, tan
@@ -19,7 +22,7 @@ from flint.core.math import Vec3
 from flint.core.transform import Quat, trs
 from flint.platform.os import env_now, get_time, make_dirs, read_bytes
 from flint.render.aaa_bsdf import AaaMaterial
-from flint.render.aaa_gi_svgf import aaa_deferred_shade_shader, surface_cache_update_shader
+from flint.render.aaa_gi_svgf import aaa_deferred_shade_shader, surface_cache_update_shader, svgf_temporal_reproject_shader
 from flint.render.aaa_post_tsr import AAA_DISPLAY_LINEAR_SRGB
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.render.aaa_clustered_lights import AaaClusterLight
@@ -39,7 +42,16 @@ from flint.render.sota_gi_world_cache import (
     sota_wrc_slot_cpu,
     sota_wrc_update_shader,
 )
-from flint.render.sota_gi_core import sota_gi_bayer_offset
+from flint.render.sota_gi_core import (
+    SOTA_CTRL_CAM_X,
+    SOTA_CTRL_FRAME,
+    SOTA_CTRL_LOWRES,
+    SOTA_GI_BASE,
+    SOTA_GI_GBUF_WORDS,
+    SOTA_GI_LOWRES_WORDS,
+    sota_gi_bayer_offset,
+    sota_gi_gbuf_offset,
+)
 from flint.render.sota_ml_denoise import SOTA_ML_GI_MODES_DEFAULT, sota_ml_default_weights_path
 
 
@@ -127,6 +139,7 @@ def test_cpu_twins() raises:
     _assert(j1[0] == 1 and j1[1] == 1, "Bayer phase 1 of 2x2 is the opposite corner")
     _validate(aaa_deferred_shade_shader(True), "aaa_deferred_shade_shader(rt) + sota hooks")
     _validate(surface_cache_update_shader(True), "surface_cache_update_shader(rt) + sota hooks")
+    _validate(svgf_temporal_reproject_shader(), "svgf_temporal_reproject_shader + round-4 jitter-aware test")
     print("  [PASS] SOTA GI CPU twins (SH9 irradiance, Chebyshev, toroidal slots) + SPIR-V validation")
 
 
@@ -458,6 +471,24 @@ def _render_frames(mut ren: FlintAaaVulkanRenderer, ids: List[Int], frames: Int,
     run.resolve_ms = _median(rs_t)
 
 
+def _render_frames_orbit(mut ren: FlintAaaVulkanRenderer, ids: List[Int], moving: Int, settle: Int, mut run: GiRun) raises:
+    """`moving` frames on a 0.4 m sideways sway of the eye (one full period), then `settle` frames at the
+    reference pose; the image of the last frame is kept (recovery after camera motion)."""
+    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
+    for f in range(moving + settle):
+        var ex = Float32(0.0)
+        var ey = Float32(0.0)
+        if f < moving:
+            var ph = Float32(6.2831853) * Float32(f) / Float32(moving)
+            ex = Float32(0.4) * sin(ph)
+            ey = Float32(0.15) * sin(ph * Float32(2.0))
+        ren.begin_frame(Vec3(ex, ey, -3.5), Vec3(Float32(0.0), Float32(0.0), Float32(2.0)), fov_y_deg=50.0)
+        for i in range(len(ids)):
+            ren.draw_instance(ids[i], ident)
+        _assert(ren.render_frame(), "render_frame failed in " + run.name)
+    run.pixels = ren.readback_pixels()
+
+
 def _warm(mut ren: FlintAaaVulkanRenderer, ids: List[Int], frames: Int) raises:
     var w = GiRun("warmup")
     _render_frames(ren, ids, frames, w)
@@ -594,25 +625,26 @@ def test_gpu_cornell_gi_modes() raises:
     _render_frames(ren, ids, 32, r_d)
     runs.append(r_d^)
 
-    # (e2) real-time path tracer: 1 path / pixel, 2 bounces + WRC termination, ReSTIR GI, SVGF + TSR
-    var r_e2 = GiRun("sota_pt1spp_restirgi_svgf_32f")
-    # The ReSTIR GI pairs below are measured at a full-resolution resolve (their thresholds date from
-    # round 2); half / quarter resolution of the path tracer is covered by `test_gpu_lowres_resolve`.
+    # (e) real-time path tracer: 1 path / pixel, 2 bounces + WRC termination, SVGF + TSR (round-4 default:
+    # no ReSTIR GI). The ReSTIR GI pairs below are measured at a full-resolution resolve (their thresholds date
+    # from round 2); half / quarter resolution of the path tracer is covered by `test_gpu_lowres_resolve`.
+    # The default runs first, so ReSTIR GI gets the longer-converged cache (conservative).
+    var r_e = GiRun("sota_pt1spp_wrc_svgf_32f")
     ren.sota_gi.resolve_scale = 1
     ren.sota_gi.mode = SOTA_GI_MODE_PATH
     ren.sota_gi.pixel_rays = 1
     ren.sota_gi.pt_bounces = 2
     ren.sota_gi.pt_wrc_terminate = True
-    ren.sota_gi.restir_gi = True
-    _warm(ren, ids, 96)
-    _render_frames(ren, ids, 32, r_e2)
-    runs.append(r_e2^)
-
-    # (e) the same without ReSTIR GI (91639b5)
-    var r_e = GiRun("sota_pt1spp_wrc_svgf_32f")
     ren.sota_gi.restir_gi = False
+    _warm(ren, ids, 96)
     _render_frames(ren, ids, 32, r_e)
     runs.append(r_e^)
+
+    # (e2) the same with ReSTIR GI (round 2's default)
+    var r_e2 = GiRun("sota_pt1spp_restirgi_svgf_32f")
+    ren.sota_gi.restir_gi = True
+    _render_frames(ren, ids, 32, r_e2)
+    runs.append(r_e2^)
 
     # (e4, e3) 1 spp path tracer before the denoiser (SVGF off, TSR on): with / without ReSTIR GI
     ren.svgf_passes = 0
@@ -687,7 +719,9 @@ def test_gpu_cornell_gi_modes() raises:
     _assert(runs[i_d].flip_full < runs[i_a].flip_full, "hybrid should beat the v5 baseline")
     # ReSTIR GI on the 1-spp path tracer: less error before the denoiser and after it
     _assert(runs[i_e4].flip_full < runs[i_e3].flip_full * 0.85, "ReSTIR GI should cut raw 1-spp path-tracer error")
-    _assert(runs[i_e2].flip_full < runs[i_e].flip_full * 0.85, "ReSTIR GI should cut denoised 1-spp path-tracer error")
+    # After the denoiser it used to (round 2: 0.115 -> 0.090), but with the round-4 jitter-aware SVGF history its
+    # temporal reuse only correlates the samples SVGF averages, so `restir_gi` is off by default now
+    _assert(runs[i_e].flip_full < runs[i_e2].flip_full + 0.003, "ReSTIR GI should no longer beat the denoised default")
     # Perf budgets at 128x128 (generous: the GPU is shared)
     _assert(runs[i_c2].resolve_ms < 2.0, "WRC + contact area-B passes " + _f3(runs[i_c2].resolve_ms) + " ms")
     _assert(runs[i_e2].resolve_ms < 3.0, "RT path tracer + ReSTIR GI area-B passes " + _f3(runs[i_e2].resolve_ms) + " ms")
@@ -989,6 +1023,9 @@ def test_gpu_svgf_history() raises:
     ren.sota_gi.svgf_history_fix = False
     var a0 = _svgf_hist_stats(ren, ids, frames, ref_v5, ref_full, "svgf_hist_v5_sc4_before")
     ren.sota_gi.svgf_history_fix = True
+    ren.sota_gi.svgf_jitter_tol = False
+    var a1r = _svgf_hist_stats(ren, ids, frames, ref_v5, ref_full, "svgf_hist_v5_sc4_after_r3tol")
+    ren.sota_gi.svgf_jitter_tol = True
     var a1 = _svgf_hist_stats(ren, ids, frames, ref_v5, ref_full, "svgf_hist_v5_sc4_after")
     # Without the TSR sub-pixel jitter every static pixel passes the reprojection test, so the history
     # must sit at the cap; with jitter, depth/normal edges and grazing walls still reject now and then.
@@ -1005,6 +1042,9 @@ def test_gpu_svgf_history() raises:
     ren.sota_gi.svgf_history_fix = False
     var b0 = _svgf_hist_stats(ren, ids, frames, ref_v5, ref_full, "svgf_hist_pt1spp_before")
     ren.sota_gi.svgf_history_fix = True
+    ren.sota_gi.svgf_jitter_tol = False
+    var b1r = _svgf_hist_stats(ren, ids, frames, ref_v5, ref_full, "svgf_hist_pt1spp_after_r3tol")
+    ren.sota_gi.svgf_jitter_tol = True
     var b1 = _svgf_hist_stats(ren, ids, frames, ref_v5, ref_full, "svgf_hist_pt1spp_after")
     ren.shutdown()
     # The bug: every surface pixel restarts at length 1 (bank A holds a-trous records, slot 3 = depth)
@@ -1020,7 +1060,13 @@ def test_gpu_svgf_history() raises:
     _assert(b1.flicker < b0.flicker * 0.8, "temporal flicker should fall with the full history (PT)")
     _assert(a1.flip_full <= a0.flip_full + 0.002, "SVGF fix must not raise FLIP (v5 GI)")
     _assert(b1.flip_full <= b0.flip_full + 0.002, "SVGF fix must not raise FLIP (PT)")
-    print("  [PASS] SVGF temporal history accumulates to the cap after static frames")
+    # Round 4: the jitter-aware depth test keeps the history under the TSR jitter (r3: half the pixels at the
+    # cap, mean length 13 / 24, flicker 1.45 between static frames)
+    _assert(a1.frac_cap > 0.9 and a1.mean_len > 20.0, "jitter-aware SVGF history: " + _f3(a1.mean_len) + ", at cap " + _f3(a1.frac_cap))
+    _assert(a1.flicker < a1r.flicker * 0.5, "jitter-aware SVGF flicker " + _f3(a1.flicker) + " vs " + _f3(a1r.flicker))
+    _assert(a1.flip_full <= a1r.flip_full + 0.002, "jitter-aware SVGF must not raise FLIP (v5 GI)")
+    _assert(b1.flip_full < b1r.flip_full - 0.01, "jitter-aware SVGF should cut the path tracer's FLIP")
+    print("  [PASS] SVGF temporal history accumulates to the cap after static frames (jitter-aware test)")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1034,6 +1080,73 @@ def _lowres_run(
     var r = GiRun(name + "_s" + String(scale))
     _render_frames(ren, ids, frames, r)
     runs.append(r^)
+
+
+def _half_to_f32(h: UInt32) -> Float32:
+    var e = Int((h >> 10) & 0x1F)
+    var m = Float32(Int(h & 0x3FF))
+    var v: Float32
+    if e == 0:
+        v = m * Float32(5.9604645e-08)
+    elif e == 31:
+        v = Float32(1e30)
+    else:
+        v = (Float32(1.0) + m / Float32(1024.0)) * Float32(2.0) ** Float32(e - 15)
+    return -v if ((h >> 15) & 1) != 0 else v
+
+
+def _check_lowres_records(ren: FlintAaaVulkanRenderer) raises -> Tuple[Int, Float64]:
+    """Decodes the f16 low-res records of the last frame and compares each record's camera-relative
+    position with the G-buffer position of its representative pixel. Returns (records checked, max error
+    relative to the camera distance)."""
+    var a = ren.buf_surfcache.cpu_address
+    var ctrl = a + SOTA_GI_BASE * 4
+    var lo = Int(_peek32(ctrl + SOTA_CTRL_LOWRES * 4))
+    var stamp = _peek32(ctrl + SOTA_CTRL_FRAME * 4) + 1
+    var cam = Vec3(_peekf(ctrl + SOTA_CTRL_CAM_X * 4), _peekf(ctrl + (SOTA_CTRL_CAM_X + 1) * 4), _peekf(ctrl + (SOTA_CTRL_CAM_X + 2) * 4))
+    var sc = ren.sota_gi.cur_scale
+    var w = ren.render_w
+    var h = ren.render_h
+    var lw = (w + sc - 1) // sc
+    var lh = (h + sc - 1) // sc
+    var gb0 = sota_gi_gbuf_offset()
+    var n = 0
+    var worst = 0.0
+    for by in range(lh):
+        for bx in range(lw):
+            var r = a + (lo + (by * lw + bx) * SOTA_GI_LOWRES_WORDS) * 4
+            if _peek32(r + 12) == 0:
+                continue
+            var rx = min(bx * sc + ren.sota_gi.cur_jx, w - 1)
+            var ry = min(by * sc + ren.sota_gi.cur_jy, h - 1)
+            var g = a + (gb0 + (ry * w + rx) * SOTA_GI_GBUF_WORDS) * 4
+            if _peek32(g + 60) != stamp:
+                continue  # sky at the rotated pixel: the record holds another pixel of the block
+            var w1 = _peek32(r + 4)
+            var w2 = _peek32(r + 8)
+            var rel = Vec3(_half_to_f32(w1 >> 16), _half_to_f32(w2 & 0xFFFF), _half_to_f32(w2 >> 16))
+            var wp = Vec3(_peekf(g), _peekf(g + 4), _peekf(g + 8))
+            var d = max(Float64((wp - cam).length()), 1e-3)
+            var err = Float64((rel - (wp - cam)).length()) / d
+            var w0 = _peek32(r)
+            var gi_r = _half_to_f32(w0 & 0xFFFF)
+            if not (gi_r >= Float32(0.0) and gi_r < Float32(1e4)):
+                err = 1.0
+            worst = max(worst, err)
+            n += 1
+    return (n, worst)
+
+
+def _peek32(addr: Int) -> UInt32:
+    var v = List[UInt32](length=1, fill=0)
+    _ = external_call["memcpy", Int](Int(v.unsafe_ptr()), addr, 4)
+    return v[0]
+
+
+def _peekf(addr: Int) -> Float32:
+    var v = List[Float32](length=1, fill=0.0)
+    _ = external_call["memcpy", Int](Int(v.unsafe_ptr()), addr, 4)
+    return v[0]
 
 
 def test_gpu_lowres_resolve() raises:
@@ -1051,17 +1164,70 @@ def test_gpu_lowres_resolve() raises:
     var ref_full = render_cornell_reference(cw, ch, 128 if quick else 512, sun_dir, sun_rad, 12)
     _wrc_grid_for_cornell(ren)
     var runs = List[GiRun]()
-    # Hybrid (the `high` preset) and the 1-spp path tracer with ReSTIR GI, SVGF + TSR, at 1/1, 1/2, 1/4
+    # Hybrid (the `high` preset) and the 1-spp path tracer, SVGF + TSR, at 1/1, 1/2, 1/4
     ren.sota_gi.mode = SOTA_GI_MODE_HYBRID
     ren.sota_gi.pixel_rays = 4
     for sc in [1, 2, 4]:
         _lowres_run(ren, ids, "lowres_hybrid_sc4", sc, 32, runs)
+        if sc == 2:
+            var rec = _check_lowres_records(ren)
+            print("    f16 low-res records: " + String(rec[0]) + " checked, max position error " + String(rec[1]) + " x camera distance")
+            _assert(rec[0] > (cw // 2) * (ch // 2) // 4, "too few low-res records checked: " + String(rec[0]))
+            _assert(rec[1] < 2e-3, "f16 low-res record position error " + String(rec[1]))
+    # Round-4 defaults for the path tracer: no ReSTIR GI, jitter-aware SVGF, 48-frame SVGF history at reduced res
     ren.sota_gi.mode = SOTA_GI_MODE_PATH
     ren.sota_gi.pixel_rays = 1
     ren.sota_gi.pt_bounces = 2
-    ren.sota_gi.restir_gi = True
+    _assert(not ren.sota_gi.restir_gi and ren.sota_gi.svgf_jitter_tol, "round-4 path tracer defaults")
+    # The path tracer ends its paths in the WRC, which restarts on the mode switch and keeps converging for a
+    # few hundred frames (multi-bounce feedback); without this the first runs below look 0.01 worse.
+    _warm(ren, ids, 320)
     for sc in [1, 2, 4]:
+        _lowres_run(ren, ids, "lowres_pt1spp", sc, 32, runs)
+    # Ablations (each restores the default)
+    ren.sota_gi.restir_gi = True
+    for sc in [1, 2]:
         _lowres_run(ren, ids, "lowres_pt1spp_restirgi", sc, 32, runs)
+    ren.sota_gi.restir_gi = False
+    var cap = ren.sota_gi.svgf_lowres_history
+    ren.sota_gi.svgf_lowres_history = Float32(0.0)
+    _lowres_run(ren, ids, "lowres_pt1spp_cap24", 2, 32, runs)
+    # Round 3's configuration: ReSTIR GI on, v5 reprojection test, 24-frame history
+    ren.sota_gi.restir_gi = True
+    ren.sota_gi.svgf_jitter_tol = False
+    for sc in [1, 2]:
+        _lowres_run(ren, ids, "lowres_pt1spp_r3cfg", sc, 32, runs)
+    ren.sota_gi.svgf_jitter_tol = True
+    ren.sota_gi.svgf_lowres_history = cap
+    # Camera motion: one sway period (24 frames), then a single frame back at the reference pose
+    for rg in [False, True]:
+        ren.sota_gi.restir_gi = rg
+        ren.sota_gi.resolve_scale = 2
+        _warm(ren, ids, 64)
+        var r_m = GiRun("lowres_pt1spp_motion" + ("_restirgi" if rg else "") + "_s2")
+        _render_frames_orbit(ren, ids, 24, 1, r_m)
+        runs.append(r_m^)
+    ren.sota_gi.restir_gi = False
+    # Light change: converge, rotate the sun, compare 6 frames later with the converged image at the new
+    # sun (GPU, same mode): the longer reduced-res history must not lag more than v5's 24 frames
+    var sun_b = Vec3(0.35, 0.50, -0.79).normalized()
+    ren.sun_dir = sun_b
+    var r_lb = GiRun("lowres_pt1spp_sunB_converged")
+    _warm(ren, ids, 96)
+    _render_frames(ren, ids, 32, r_lb)
+    var lag = List[Float64]()
+    for c in [Float32(0.0), cap]:
+        ren.sota_gi.svgf_lowres_history = c
+        ren.sun_dir = sun_dir
+        _warm(ren, ids, 96)
+        ren.sun_dir = sun_b
+        var r_l = GiRun("lag")
+        _render_frames(ren, ids, 6, r_l)
+        lag.append(flip_mean(flip_error_map(r_lb.pixels, r_l.pixels, cw, ch)))
+    ren.sota_gi.svgf_lowres_history = cap
+    ren.sun_dir = sun_dir
+    print("    light change, 6 frames later vs converged (FLIP): cap 24 " + _f3(lag[0]) + ", cap " + String(Int(cap)) + " " + _f3(lag[1]))
+    _assert(lag[1] < lag[0] + 0.01, "the reduced-res SVGF history must not lag behind a light change")
     # Photo mode always resolves at full resolution (accumulation is per pixel)
     ren.sota_gi.resolve_scale = 2
     ren.sota_gi.accumulate = True
@@ -1090,12 +1256,27 @@ def test_gpu_lowres_resolve() raises:
         print("    " + pad + _f3(runs[i].flip_full) + "          " + _f3(runs[i].resolve_ms))
     var h1 = runs[_find(runs, "lowres_hybrid_sc4_s1")].flip_full
     var h2 = runs[_find(runs, "lowres_hybrid_sc4_s2")].flip_full
-    var p1 = runs[_find(runs, "lowres_pt1spp_restirgi_s1")].flip_full
-    var p2 = runs[_find(runs, "lowres_pt1spp_restirgi_s2")].flip_full
+    var p1 = runs[_find(runs, "lowres_pt1spp_s1")].flip_full
+    var p2 = runs[_find(runs, "lowres_pt1spp_s2")].flip_full
+    var p1r = runs[_find(runs, "lowres_pt1spp_restirgi_s1")].flip_full
+    var p2r = runs[_find(runs, "lowres_pt1spp_restirgi_s2")].flip_full
+    var p2c = runs[_find(runs, "lowres_pt1spp_cap24_s2")].flip_full
+    var p1o = runs[_find(runs, "lowres_pt1spp_r3cfg_s1")].flip_full
+    var p2o = runs[_find(runs, "lowres_pt1spp_r3cfg_s2")].flip_full
+    var pm = runs[_find(runs, "lowres_pt1spp_motion_s2")].flip_full
+    var pmr = runs[_find(runs, "lowres_pt1spp_motion_restirgi_s2")].flip_full
     # Half resolution may cost a little quality (a quarter of the GI samples per frame), never much
     _assert(h2 < h1 + 0.015, "half-res hybrid FLIP " + _f3(h2) + " vs full " + _f3(h1))
-    _assert(p2 < p1 + 0.025, "half-res path tracer FLIP " + _f3(p2) + " vs full " + _f3(p1))
     _assert(h2 < 0.13, "half-res hybrid FLIP " + _f3(h2))
+    # Round 4: the half-res path tracer recovers round 3's loss (r3: 0.091 full -> 0.107 half): it now
+    # beats round 3's own full-res configuration, and the gap to full res is under 0.01
+    _assert(p2 < p1o, "half-res path tracer " + _f3(p2) + " should beat round 3's full-res " + _f3(p1o))
+    _assert(p2 < p2o - 0.015, "half-res path tracer " + _f3(p2) + " vs round 3's half-res " + _f3(p2o))
+    _assert(p2 < p1 + 0.012, "half-res path tracer FLIP " + _f3(p2) + " vs full " + _f3(p1))
+    # The defaults follow the data: ReSTIR GI off, 48-frame reduced-res history
+    _assert(p1 < p1r + 0.003 and p2 < p2r + 0.003, "ReSTIR GI should not beat the default path tracer")
+    _assert(pm < pmr + 0.005, "after camera motion ReSTIR GI should not beat the default either")
+    _assert(p2 < p2c + 0.002, "the 48-frame reduced-res history should not cost quality")
 
     # Cost: the resolve at 512x384 must get cheaper at half resolution (resolve + upsample)
     ren.shutdown()
@@ -1186,11 +1367,11 @@ def test_gpu_ml_gating() raises:
     ren.sota_gi.mode = SOTA_GI_MODE_PATH
     ren.sota_gi.pixel_rays = 1
     ren.sota_gi.pt_bounces = 2
-    ren.sota_gi.restir_gi = True
+    ren.sota_gi.restir_gi = False  # round-4 default
     ren.sota_gi.resolve_scale = 1
-    _ = _ml_pair(ren, ids, "pt1spp_restirgi_fullres_32f", 32, ref_full, cw, ch)
+    _ = _ml_pair(ren, ids, "pt1spp_fullres_32f", 32, ref_full, cw, ch)
     ren.sota_gi.resolve_scale = def_scale
-    var d3 = _ml_pair(ren, ids, "pt1spp_restirgi_32f", 32, ref_full, cw, ch)
+    var d3 = _ml_pair(ren, ids, "pt1spp_32f", 32, ref_full, cw, ch)
     deltas.append(d3[1] - d3[0])
     ren.sota_ml.enabled = False
     ren.shutdown()
