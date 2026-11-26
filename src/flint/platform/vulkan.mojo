@@ -1346,6 +1346,111 @@ struct VulkanGpu(Copyable, Movable):
             return self.fail("side queue wait timed out")
         return self.check(result, "vkWaitSemaphores")
 
+    # --- sota:perf hook --- async compute: cross-queue timeline waits and queue-family ownership transfers
+    def sota_submit_waiting(mut self, frame: Int, on_side: Bool, wait_main: UInt64, wait_side: UInt64, wait_stage: Int) -> UInt64:
+        """End `frame`'s commands and queue them on the main queue, or the side queue with `on_side`, once the
+        main timeline reaches `wait_main` and the side timeline reaches `wait_side` (0: no wait), blocking only
+        `wait_stage` (a VkPipelineStageFlags mask). Returns the fence on that queue's own timeline (`wait` /
+        `wait_side`). Without a side queue everything runs on the main queue, whose timeline every fence is on."""
+        var side = on_side and self.has_side_queue()
+        if not self.check(call1(self.fn_end_commands, self.command_buffers[frame]), "vkEndCommandBuffer"):
+            return 0
+        self.rewind()
+        var value = self.side_next if side else self.next_signal
+        var commands = self.scratch(8)
+        put64(commands, self.command_buffers[frame])
+        var signal = self.scratch(8)
+        put64(signal, self.side_timeline if side else self.timeline)
+        var signal_value = self.scratch(8)
+        put64(signal_value, Int(value))
+        var wait_sems = self.scratch(16)
+        var wait_values = self.scratch(16)
+        var wait_stages = self.scratch(8)
+        var n_wait = 0
+        var main_wait = wait_main
+        if not self.has_side_queue() and wait_side > main_wait:
+            main_wait = wait_side  # side work went to the main queue: its fence is a main one
+        if main_wait > 0:
+            put64(wait_sems, self.timeline)
+            put64(wait_values, Int(main_wait))
+            put32(wait_stages, UInt32(wait_stage))
+            n_wait += 1
+        if wait_side > 0 and self.has_side_queue():
+            put64(wait_sems + n_wait * 8, self.side_timeline)
+            put64(wait_values + n_wait * 8, Int(wait_side))
+            put32(wait_stages + n_wait * 4, UInt32(wait_stage))
+            n_wait += 1
+        var timeline = self.scratch(48)
+        put32(timeline, TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+        put32(timeline + 16, UInt32(n_wait))
+        put64(timeline + 24, wait_values)
+        put32(timeline + 32, 1)
+        put64(timeline + 40, signal_value)
+        var info = self.scratch(72)
+        put32(info, TYPE_SUBMIT_INFO)
+        put64(info + 8, timeline)
+        put32(info + 16, UInt32(n_wait))
+        put64(info + 24, wait_sems)
+        put64(info + 32, wait_stages)
+        put32(info + 40, 1)
+        put64(info + 48, commands)
+        put32(info + 56, 1)
+        put64(info + 64, signal)
+        if not self.check(call4(self.fn_queue_submit, self.side_queue if side else self.queue, 1, info, 0), "vkQueueSubmit"):
+            return 0
+        if side:
+            self.side_next += 1
+        else:
+            self.next_signal += 1
+        return value
+
+    def sota_side_family_differs(self) -> Bool:
+        """True when the side queue is in another queue family, so EXCLUSIVE resources need ownership transfers."""
+        return self.has_side_queue() and self.side_family != self.family
+
+    def sota_buffer_ownership(
+        mut self, frame: Int, buf: GpuBuffer, to_side: Bool, src_stage: Int, src_access: Int, dst_stage: Int, dst_access: Int
+    ):
+        """One half of a queue-family ownership transfer of `buf` (Vulkan 1.3, 7.7.4): record the same call in
+        the releasing queue's commands (with its src stage/access) and in the acquiring queue's (with its dst
+        stage/access), and order them with a semaphore (`sota_submit_waiting`). `to_side` moves main -> side.
+        Within one family this is a plain buffer barrier."""
+        self.rewind()
+        var src_family = UInt32(0xFFFFFFFF)  # VK_QUEUE_FAMILY_IGNORED
+        var dst_family = UInt32(0xFFFFFFFF)
+        if self.sota_side_family_differs():
+            src_family = self.family if to_side else self.side_family
+            dst_family = self.side_family if to_side else self.family
+        if self.has_sync2:
+            var bb = self.scratch(80)
+            put32(bb, 1000314001)  # VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2
+            put64(bb + 16, src_stage)
+            put64(bb + 24, src_access)
+            put64(bb + 32, dst_stage)
+            put64(bb + 40, dst_access)
+            put32(bb + 48, src_family)
+            put32(bb + 52, dst_family)
+            put64(bb + 56, buf.vk_buffer)
+            put64(bb + 64, 0)
+            put64(bb + 72, -1)  # VK_WHOLE_SIZE
+            var dep = self.scratch(64)
+            put32(dep, TYPE_DEPENDENCY_INFO)
+            put32(dep + 32, 1)
+            put64(dep + 40, bb)
+            _ = call2(self.device_call("vkCmdPipelineBarrier2"), self.command_buffers[frame], dep)
+        else:
+            var b1 = self.scratch(56)
+            put32(b1, 44)  # VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+            put32(b1 + 16, UInt32(src_access))
+            put32(b1 + 20, UInt32(dst_access))
+            put32(b1 + 24, src_family)
+            put32(b1 + 28, dst_family)
+            put64(b1 + 32, buf.vk_buffer)
+            put64(b1 + 40, 0)
+            put64(b1 + 48, -1)
+            _ = call10(self.fn_pipeline_barrier, self.command_buffers[frame], max(src_stage, PIPELINE_TOP), max(dst_stage, PIPELINE_TOP), 0, 0, 0, 1, b1, 0, 0)
+    # --- end sota:perf hook ---
+
     def create_query_pool(mut self, count: Int) -> Bool:
         self.rewind()
         var info = self.scratch(32)

@@ -47,6 +47,7 @@ from flint.render.aaa_visbuffer import (
 )
 from flint.render.sota_geometry_cluster_dag import SOTA_DAG_RECORD_WORDS, ClusterDag
 from flint.render.sota_geometry_dag_cache import DagCacheStats, build_cluster_dag_cached
+from flint.render.sota_perf_dag_cache import sota_dag_cache_default_dir  # --- sota:perf hook ---
 from flint.assets.model import NativeMesh
 from flint.core.jobs import JobPool, default_worker_count
 from flint.render.sota_geometry_visid import SOTA_MAX_GLOBAL_MESHLETS_WIDE, emit_sota_draw_first_instance, emit_sota_draw_vertex_offset
@@ -500,7 +501,7 @@ struct SotaGeometryGpu(Movable):
     var legacy_hiz_occlusion: Bool  # cvar r.sota.geometry.legacy_hiz: let the v5 5-tap culler occlusion-test (off:
                                     # it false-culls visible meshlets, e.g. the Cornell back wall from frame 2 on)
     var dag_build_threads: Int      # cvar r.sota.geometry.dag_threads: JobPool workers for DAG builds (-1 auto, 0 serial)
-    var dag_cache_dir: String       # cvar r.sota.geometry.dag_cache: directory of content-keyed DAG .flpk files ("" off)
+    var dag_cache_dir: String       # cvar r.sota.geometry.dag_cache: directory of content-keyed DAG .flpk files ("" off; default sota_dag_cache_default_dir)
     var dag_pool: JobPool
     var dag_pool_started: Bool
     var dag_cache_stats: DagCacheStats
@@ -543,7 +544,7 @@ struct SotaGeometryGpu(Movable):
         self.rt_bias_slope = Float32(0.0003)
         self.legacy_hiz_occlusion = False
         self.dag_build_threads = -1
-        self.dag_cache_dir = String()
+        self.dag_cache_dir = sota_dag_cache_default_dir()  # --- sota:perf hook --- on by default (FLINT_DAG_CACHE=0 off)
         self.dag_pool = JobPool()
         self.dag_pool_started = False
         self.dag_cache_stats = DagCacheStats()

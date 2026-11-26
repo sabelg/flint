@@ -27,6 +27,7 @@ from std.math import floor, max, min, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.core.detsort import stable_order
+from flint.render.sota_perf_sort import sota_stable_order  # --- sota:perf hook --- radix sort, same order as stable_order
 from flint.assets.model import NativeMesh
 from flint.assets.meshlet import AaaGeometryPool, CookedMeshEntry, MeshLodSlice
 from flint.core.jobs import JobPool
@@ -171,7 +172,7 @@ def weld_positions(mesh: NativeMesh) -> Tuple[List[Int], Int]:
         var bz = Int(bitcast[DType.uint32](mesh.positions[v * 3 + 2]))
         var h = (bx * 73856093) ^ (by * 19349663) ^ (bz * 83492791)
         keys.append(h & 0x3FFFFFFFFFFFFFFF)
-    var order = stable_order(keys)
+    var order = sota_stable_order(keys)
     var pid = List[Int](length=n, fill=-1)
     var next_id = 0
     var i = 0
@@ -217,7 +218,7 @@ def clusterize_triangles(
             var a = pid[tris[t * 3 + k]]
             var b = pid[tris[t * 3 + (k + 1) % 3]]
             ekeys.append(_edge_key(a, b, n_pid))
-    var eorder = stable_order(ekeys)
+    var eorder = sota_stable_order(ekeys)
     var adj_cnt = List[Int](length=nt + 1, fill=0)
     var i = 0
     var ne = len(ekeys)
@@ -251,7 +252,7 @@ def clusterize_triangles(
     var cents = List[Vec3](capacity=nt)
     for t in range(nt):
         cents.append((_pos(mesh, tris[t * 3]) + _pos(mesh, tris[t * 3 + 1]) + _pos(mesh, tris[t * 3 + 2])) * Float32(1.0 / 3.0))
-    var morder = stable_order(_morton_keys(cents))
+    var morder = sota_stable_order(_morton_keys(cents))
     var assigned = List[Bool](length=nt, fill=False)
     var cursor = 0
     var frontier = List[Int]()
@@ -331,30 +332,63 @@ def clusterize_triangles(
 def partition_clusters(
     mesh: NativeMesh, pid: List[Int], n_pid: Int, clusters: List[DagCluster], ids: List[Int], group_size: Int
 ) -> List[List[Int]]:
+    var open_pid = List[Bool]()
+    return _partition_clusters(mesh, pid, n_pid, clusters, ids, group_size, open_pid, False)
+
+
+def _partition_clusters(
+    mesh: NativeMesh, pid: List[Int], n_pid: Int, clusters: List[DagCluster], ids: List[Int], group_size: Int,
+    mut open_pid: List[Bool], want_open: Bool,
+) -> List[List[Int]]:
+    """`partition_clusters`; with `want_open` it also sets `open_pid[p]` for every pid on an edge that exactly
+    one triangle of the clusters `ids` has (length n_pid, cleared here)."""
     var nc = len(ids)
     var groups = List[List[Int]]()
+    if want_open:
+        for p in range(n_pid):
+            open_pid[p] = False
     if nc == 0:
         return groups^
-    # border edges per cluster -> (edge, cluster) pairs
-    var pkeys = List[Int]()
-    var powner = List[Int]()
+    # border edges per cluster -> (edge, cluster) pairs: an edge that appears once inside its cluster.
+    # --- sota:perf hook --- one radix sort over the level's edges instead of a merge sort per cluster; the
+    # (edge, cluster) multiset is the same, and everything below depends only on its sorted pair keys.
+    var n_corner = 0
+    for li in range(nc):
+        n_corner += len(clusters[ids[li]].tris)
+    var ek = List[Int](capacity=n_corner)
+    var eown = List[Int](capacity=n_corner)
     for li in range(nc):
         ref c = clusters[ids[li]]
-        var ek = List[Int](capacity=len(c.tris))
         for t in range(c.tri_count()):
             for k in range(3):
                 ek.append(_edge_key(pid[c.tris[t * 3 + k]], pid[c.tris[t * 3 + (k + 1) % 3]], n_pid))
-        var eo = stable_order(ek)
-        var i = 0
-        while i < len(ek):
-            var j = i
-            while j < len(ek) and ek[eo[j]] == ek[eo[i]]:
-                j += 1
-            if j - i == 1:
-                pkeys.append(ek[eo[i]])
-                powner.append(li)
-            i = j
-    var po = stable_order(pkeys)
+                eown.append(li)
+    var eo = sota_stable_order(ek)
+    var pkeys = List[Int]()
+    var powner = List[Int]()
+    var ie = 0
+    while ie < len(ek):
+        var je = ie
+        while je < len(ek) and ek[eo[je]] == ek[eo[ie]]:
+            je += 1
+        if want_open and je - ie == 1:
+            var kk = ek[eo[ie]]
+            open_pid[kk // n_pid] = True
+            open_pid[kk % n_pid] = True
+        for a in range(ie, je):
+            var own = eown[eo[a]]
+            var cnt = 0
+            for b in range(ie, je):
+                if eown[eo[b]] == own:
+                    cnt += 1
+            if cnt == 1:
+                pkeys.append(ek[eo[a]])
+                powner.append(own)
+        ie = je
+    _ = ek^
+    _ = eown^
+    _ = eo^
+    var po = sota_stable_order(pkeys)
     # neighbour pairs (li * nc + lj) with weights
     var pair_keys = List[Int]()
     var i = 0
@@ -369,7 +403,7 @@ def partition_clusters(
                 if ca != cb:
                     pair_keys.append(ca * nc + cb)
         i = j
-    var pairo = stable_order(pair_keys)
+    var pairo = sota_stable_order(pair_keys)
     var nb_cnt = List[Int](length=nc + 1, fill=0)
     var nb_list = List[Int]()
     var nb_w = List[Int]()
@@ -393,7 +427,7 @@ def partition_clusters(
     var cents = List[Vec3](capacity=nc)
     for li in range(nc):
         cents.append(clusters[ids[li]].self_center)
-    var morder = stable_order(_morton_keys(cents))
+    var morder = sota_stable_order(_morton_keys(cents))
     var gid = List[Int](length=nc, fill=-1)
     var score = List[Int](length=nc, fill=0)
     for mi in range(nc):
@@ -729,6 +763,9 @@ struct _DagLevelCtx(Movable):
     var out_parts: Int     # List[List[List[Int]]]
     var n_groups: Int
     var chunk: Int
+    var open_pid: Int      # List[Bool]: pid on an edge only one triangle of this level has (sota:perf)
+    var seen: Int          # List[Int] pid-sized scratch of `_sota_group_cannot_simplify` (sota:perf)
+    var first_wedge: Int   # List[Int]
 
     def __init__(out self):
         self.mesh = 0
@@ -741,6 +778,9 @@ struct _DagLevelCtx(Movable):
         self.out_parts = 0
         self.n_groups = 0
         self.chunk = 1
+        self.open_pid = 0
+        self.seen = 0
+        self.first_wedge = 0
 
 
 def _dag_level_worker(ctx_addr: Int, job: Int):
@@ -754,18 +794,56 @@ def _dag_level_worker(ctx_addr: Int, job: Int):
     var g0 = job * c[].chunk
     var g1 = min(c[].n_groups, g0 + c[].chunk)
     # job-private stamp scratch: cluster output depends only on stamp equality, so it is identical to serial
-    var vstamp = List[Int](length=c[].nv, fill=0)
+    # --- sota:perf hook --- allocated on first use: a wedge-sized array per job was most of a level's cost
+    var vstamp = List[Int]()
     var stamp_base = 0
     for g in range(g0, g1):
         var n_in = len(merged[][g]) // 3
         if n_in == 0:
+            continue
+        # --- sota:perf hook --- skip a group that cannot reach the 85% bar: the simplifier only removes
+        # triangles that touch an unlocked vertex, and it locks at least the group borders and level-open edges
+        if c[].open_pid != 0 and _sota_group_cannot_simplify(pid[], locked[], c[], merged[][g], n_in, g + 1):
             continue
         var simp = simplify_group_locked(mesh[], pid[], c[].n_pid, merged[][g], locked[], n_in // 2)
         var n_out = len(simp[0]) // 3
         out_err[][g] = simp[1]
         if n_out == 0 or Float32(n_out) > Float32(n_in) * Float32(0.85):
             continue
+        if len(vstamp) == 0:
+            vstamp = List[Int](length=c[].nv, fill=0)
         out_parts[][g] = clusterize_triangles(mesh[], pid[], c[].n_pid, simp[0], vstamp, stamp_base)
+
+
+def _sota_group_cannot_simplify(pid: List[Int], locked: List[Bool], ctx: _DagLevelCtx, tris: List[Int], n_in: Int, stamp: Int) -> Bool:
+    """True when the group is sure to fail (`n_out > 0.85 n_in`). A triangle whose three corners are all locked
+    is never removed by `simplify_group_locked`, and its locks include group borders (`locked`), edges open in
+    the whole level (so open in the group) and pids with more than one wedge in the group (seams).
+    The pid-sized `seen` / `first_wedge` scratch is shared by all jobs of the level: only unlocked pids are
+    written, and an unlocked pid belongs to exactly one group, so no two jobs touch the same entry."""
+    var open_pid = Pointer[List[Bool], ImmutAnyOrigin](unsafe_from_address=ctx.open_pid)
+    var seen = Pointer[List[Int], MutAnyOrigin](unsafe_from_address=ctx.seen)
+    var first_wedge = Pointer[List[Int], MutAnyOrigin](unsafe_from_address=ctx.first_wedge)
+    var seam_stamp = -stamp  # this pid has two wedges in this group
+    for c in range(n_in * 3):
+        var w = tris[c]
+        var p = pid[w]
+        if locked[p] or open_pid[][p]:
+            continue
+        var s = seen[][p]
+        if s != stamp and s != seam_stamp:
+            seen[][p] = stamp
+            first_wedge[][p] = w
+        elif s == stamp and first_wedge[][p] != w:
+            seen[][p] = seam_stamp
+    var n_free = 0
+    for t in range(n_in):
+        for k in range(3):
+            var p = pid[tris[t * 3 + k]]
+            if not locked[p] and not open_pid[][p] and seen[][p] != seam_stamp:
+                n_free += 1
+                break
+    return Float32(n_in - n_free) > Float32(n_in) * Float32(0.85)
 
 
 def build_cluster_dag_mt(mesh: NativeMesh, mut pool: JobPool, group_size: Int = SOTA_DAG_GROUP_SIZE) -> ClusterDag:
@@ -809,8 +887,11 @@ def _build_cluster_dag(mesh: NativeMesh, group_size: Int, pool_addr: Int) -> Clu
     var level = 0
     var owner = List[Int](length=n_pid, fill=-1)
     var locked = List[Bool](length=n_pid, fill=False)
+    var open_pid = List[Bool](length=n_pid, fill=False)  # --- sota:perf hook ---
+    var seen = List[Int](length=n_pid, fill=0)
+    var first_wedge = List[Int](length=n_pid, fill=0)
     while len(pending) > 1 and level < SOTA_DAG_MAX_LEVELS:
-        var groups = partition_clusters(mesh, pid, n_pid, dag.clusters, pending, group_size)
+        var groups = _partition_clusters(mesh, pid, n_pid, dag.clusters, pending, group_size, open_pid, True)  # sota:perf hook
         # vertices used by more than one group are locked
         for p in range(n_pid):
             owner[p] = -1
@@ -863,7 +944,12 @@ def _build_cluster_dag(mesh: NativeMesh, group_size: Int, pool_addr: Int) -> Clu
         lctx.out_err = Int(Pointer(to=o_err))
         lctx.out_parts = Int(Pointer(to=o_parts))
         lctx.n_groups = ng
-        lctx.chunk = 2
+        lctx.chunk = max(2, ng // 256)  # --- sota:perf hook --- ~256 jobs per level (was ng / 2)
+        lctx.open_pid = Int(Pointer(to=open_pid))
+        for p in range(n_pid):
+            seen[p] = 0
+        lctx.seen = Int(Pointer(to=seen))
+        lctx.first_wedge = Int(Pointer(to=first_wedge))
         var n_jobs = (ng + lctx.chunk - 1) // lctx.chunk
         if pool_addr != 0 and n_jobs > 1:
             run_parallel_ctx(Pointer[JobPool, MutAnyOrigin](unsafe_from_address=pool_addr)[], n_jobs, lctx, _dag_level_worker)
@@ -874,6 +960,9 @@ def _build_cluster_dag(mesh: NativeMesh, group_size: Int, pool_addr: Int) -> Clu
         _ = len(g_merged)
         _ = len(pid)
         _ = len(locked)
+        _ = len(open_pid)
+        _ = len(seen)
+        _ = len(first_wedge)
         _ = lctx.n_groups
         # phase C (serial, group order): link parents and append the new clusters exactly as the serial build
         for g in range(ng):
