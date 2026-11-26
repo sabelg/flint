@@ -514,6 +514,10 @@ def sota_e_spirv_hash(code: List[UInt32]) -> UInt64:
         h *= 0xBF58476D1CE4E5B9
         h ^= h >> 31
     return h
+
+
+comptime SOTA_E_PSO_TOKEN: Int = 0x5E50 << 48  # deferred (batched) compute pipeline handle marker
+comptime SOTA_E_PSO_TOKEN_MASK: Int = 0xFFFF << 48
 # --- end sota:E hook ---
 
 
@@ -570,6 +574,11 @@ struct VulkanGpu(Copyable, Movable):
     var pipeline_cache: Int
     # --- sota:E hook (SPIR-V hashes of every module compiled, for the pipeline-cache manifest) ---
     var sota_e_spirv_hashes: List[UInt64]
+    # Batched compute-pipeline creation (compiled in parallel by `sota_e_parallel_pso`).
+    var sota_e_batch_on: Bool
+    var sota_e_batch_layouts: List[Int]
+    var sota_e_batch_code: List[List[UInt32]]
+    var sota_e_batch_handles: List[Int]
     var descriptor_pool: Int
     var side_pools: List[Int]  # descriptor pools of passes outside the frame (GPU meshing)
     var layout_bindings: Int
@@ -671,6 +680,10 @@ struct VulkanGpu(Copyable, Movable):
         self.pipeline_layout = 0
         self.pipeline_cache = 0
         self.sota_e_spirv_hashes = List[UInt64]()  # --- sota:E hook ---
+        self.sota_e_batch_on = False
+        self.sota_e_batch_layouts = List[Int]()
+        self.sota_e_batch_code = List[List[UInt32]]()
+        self.sota_e_batch_handles = List[Int]()
         self.descriptor_pool = 0
         self.side_pools = List[Int]()
         self.layout_bindings = 0
@@ -2890,7 +2903,23 @@ struct VulkanGpu(Copyable, Movable):
         put32(write + 36, DESCRIPTOR_ACCELERATION_STRUCTURE_KHR)
         _ = call5(self.fn_update_descriptors, self.device, 1, write, 0, 0)
 
+    # --- sota:E hook (resolve a batched compute-pipeline token to its real handle) ---
+    @always_inline
+    def sota_e_resolve(self, pipeline: Int) -> Int:
+        if (pipeline & SOTA_E_PSO_TOKEN_MASK) != SOTA_E_PSO_TOKEN:
+            return pipeline
+        var idx = pipeline & 0xFFFFFFFF
+        return self.sota_e_batch_handles[idx] if idx < len(self.sota_e_batch_handles) else 0
+    # --- end sota:E hook ---
+
     def create_aaa_compute_pipeline(mut self, pipeline_layout: Int, code: List[UInt32]) -> Int:
+        # --- sota:E hook (batch mode: record now, compile in parallel at the end of the batch) ---
+        if self.sota_e_batch_on:
+            self.sota_e_spirv_hashes.append(sota_e_spirv_hash(code))
+            self.sota_e_batch_layouts.append(pipeline_layout)
+            self.sota_e_batch_code.append(code.copy())
+            return SOTA_E_PSO_TOKEN | (len(self.sota_e_batch_code) - 1)
+        # --- end sota:E hook ---
         self.rewind()
         var module_info = self.scratch(40)
         put32(module_info, TYPE_SHADER_MODULE_CREATE_INFO)
@@ -3044,7 +3073,8 @@ struct VulkanGpu(Copyable, Movable):
             return 0
         return pipe
 
-    def destroy_pipeline(mut self, pipeline: Int):
+    def destroy_pipeline(mut self, pipeline_in: Int):
+        var pipeline = self.sota_e_resolve(pipeline_in)  # --- sota:E hook ---
         if pipeline != 0:
             self.rewind()
             _ = call3(self.device_call("vkDestroyPipeline"), self.device, pipeline, 0)
@@ -3187,7 +3217,7 @@ struct VulkanGpu(Copyable, Movable):
         var sets = self.scratch(8)
         put64(sets, descriptor_set)
         var all_stages = Int(STAGE_VERTEX_SHADER | STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER)
-        _ = call3(self.fn_bind_pipeline, commands, BIND_POINT_GRAPHICS, pipeline)
+        _ = call3(self.fn_bind_pipeline, commands, BIND_POINT_GRAPHICS, self.sota_e_resolve(pipeline))  # --- sota:E hook ---
         _ = call8(self.fn_bind_descriptor_sets, commands, BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, sets, 0, 0)
         if len(push) > 0:
             _ = call6(self.fn_push_constants, commands, pipeline_layout, all_stages, 0, len(push) * 4, Int(push.unsafe_ptr()))
@@ -3208,7 +3238,7 @@ struct VulkanGpu(Copyable, Movable):
         var sets = self.scratch(8)
         put64(sets, descriptor_set)
         var all_stages = Int(STAGE_VERTEX_SHADER | STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER)
-        _ = call3(self.fn_bind_pipeline, commands, BIND_POINT_COMPUTE, pipeline)
+        _ = call3(self.fn_bind_pipeline, commands, BIND_POINT_COMPUTE, self.sota_e_resolve(pipeline))  # --- sota:E hook ---
         _ = call8(self.fn_bind_descriptor_sets, commands, BIND_POINT_COMPUTE, pipeline_layout, 0, 1, sets, 0, 0)
         if len(push) > 0:
             _ = call6(self.fn_push_constants, commands, pipeline_layout, all_stages, 0, len(push) * 4, Int(push.unsafe_ptr()))

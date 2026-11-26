@@ -79,6 +79,7 @@ from flint.render.sota_e_characters import (
     emit_sota_e_material_decode,
     emit_sota_e_skin_curvature_radius,
 )
+from flint.render.sota_e_hair_shadow import emit_sota_e_dom_transmittance
 # --- end sota:E hook ---
 from flint.render.aaa_sky_atmosphere import (
     emit_aerial_perspective_spv,
@@ -1664,6 +1665,11 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         s.select_f(sota_e_hair_v, wb_u[2], wt_u[2]),
         sota_e_curv, direct[0], direct[1], direct[2],
     )
+    # hair inside the deep opacity map: fibre transmittance replaces the opaque-ribbon sun shadow
+    s.begin_if(sota_e.is_hair)
+    var sota_e_dom = emit_sota_e_dom_transmittance(s, b_globals, b_post, wx, wy, wz)
+    s.store(sun_vis, s.select_f(sota_e_dom[1], sota_e_dom[0], s.load_f(sun_vis)))
+    s.end_if()
     # --- end sota:E hook ---
     var sv = s.load_f(sun_vis)
     var dir_r = s.fvar(s.fmul(direct[0], s.fmul(sun_rad_r, sv)))

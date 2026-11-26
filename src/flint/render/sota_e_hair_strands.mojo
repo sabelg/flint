@@ -10,7 +10,7 @@ Card fallback: the same growth produces a few wide cards with an alpha-tested st
 (`sota_e_hair_card_texture`), for distant or budget-limited characters. `sota_e_pick_hair_lod` picks
 the representation from the projected head height and a strand budget.
 """
-from std.math import cos, max, min, sin, sqrt
+from std.math import cos, max, min, sin, sqrt, tan
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.model import NativeMesh
 from flint.core.math import Vec3
@@ -156,3 +156,88 @@ def sota_e_pick_hair_lod(projected_head_px: Float32, strand_count: Int, strand_b
     if projected_head_px < Float32(160.0):
         return SOTA_E_HAIR_LOD_CARDS
     return SOTA_E_HAIR_LOD_STRANDS
+
+
+# ---------------------------------------------------------------------------------------------
+# Strand anti-aliasing: view-facing ribbons + coverage-preserving width LOD
+# ---------------------------------------------------------------------------------------------
+# A ribbon narrower than a pixel is either hit or missed by the pixel centre, so sub-pixel strands
+# alias and flicker under camera / TSR jitter (the VisBuffer has no MSAA, and alpha-to-coverage needs
+# MSAA). Instead the strand LOD keeps every ribbon at least `min_px` wide and drops strands in the same
+# ratio, so the projected coverage (strand count x width) is unchanged: wider ribbons are resolved by
+# the pixel grid (and by TSR's sub-pixel jitter) instead of being point-sampled. The kept subset is a
+# fixed hash threshold, so it is stable from frame to frame and nested across distances (no popping of
+# a random new set). Same idea as the strand-count / width LOD of shipped strand renderers (e.g.
+# Tafuri, "Strand-based Hair Rendering in Frostbite", SIGGRAPH 2019 Advances course).
+
+
+def sota_e_px_per_m(distance: Float32, fov_y_deg: Float32, render_h: Int) -> Float32:
+    """Pixels per metre at `distance` along the view axis."""
+    var t = tan(fov_y_deg * Float32(3.14159265 / 360.0))
+    return Float32(render_h) / (Float32(2.0) * max(Float32(1e-4), distance) * max(Float32(1e-4), t))
+
+
+def sota_e_hair_coverage_lod(width: Float32, px_per_m: Float32, min_px: Float32 = 1.0) -> Tuple[Float32, Float32]:
+    """(width scale >= 1, kept strand fraction <= 1) with scale * fraction == 1."""
+    var w_px = width * px_per_m
+    if w_px >= min_px or w_px <= Float32(0.0):
+        return (Float32(1.0), Float32(1.0))
+    var sc = min_px / w_px
+    return (sc, Float32(1.0) / sc)
+
+
+def sota_e_strand_kept(g: SotaHairGroom, idx: Int, keep: Float32) -> Bool:
+    return _hash01(g.seed * UInt32(40503) + UInt32(idx) * UInt32(7919) + UInt32(11)) < keep
+
+
+def _append_ribbon_facing(mut mb: MeshBuilder, pts: List[Vec3], eye: Vec3, width_root: Float32, width_tip: Float32):
+    """Ribbon expanded perpendicular to both the strand and the view ray: a fibre is a cylinder, whose
+    projected width does not depend on the view (a fixed-orientation ribbon goes edge-on, i.e. vanishes,
+    wherever it is seen side-on)."""
+    var n = len(pts)
+    var base = List[Int]()
+    for k in range(n):
+        var t = (pts[min(n - 1, k + 1)] - pts[max(0, k - 1)]).normalized()
+        var to_eye = (eye - pts[k]).normalized()
+        var side = t.cross(to_eye)
+        if side.length_squared() < Float32(1e-10):
+            side = _ortho(t)
+        side = side.normalized()
+        var face = side.cross(t).normalized()
+        var tk = Float32(k) / Float32(n - 1)
+        var w = width_root + (width_tip - width_root) * tk
+        var a = mb.add_vertex(pts[k] - side * (w * Float32(0.5)), face, tk, Float32(0.0))
+        var b = mb.add_vertex(pts[k] + side * (w * Float32(0.5)), face, tk, Float32(1.0))
+        base.append(a)
+        _ = b
+    for k in range(n - 1):
+        var a0 = base[k]
+        var b0 = a0 + 1
+        var a1 = base[k + 1]
+        var b1 = a1 + 1
+        mb.mesh.indices.append(a0); mb.mesh.indices.append(b0); mb.mesh.indices.append(b1)
+        mb.mesh.indices.append(a0); mb.mesh.indices.append(b1); mb.mesh.indices.append(a1)
+        mb.mesh.indices.append(a0); mb.mesh.indices.append(b1); mb.mesh.indices.append(b0)
+        mb.mesh.indices.append(a0); mb.mesh.indices.append(a1); mb.mesh.indices.append(b1)
+
+
+def build_hair_strand_ribbons_aa(g: SotaHairGroom, eye: Vec3, px_per_m: Float32, min_px: Float32 = 1.0, apply_lod: Bool = True) -> NativeMesh:
+    """View-facing strand ribbons for a groom seen from `eye` at `px_per_m`, with the coverage-preserving
+    width LOD (`apply_lod`). Rebuild when the view changes enough (CPU, ~ms for thousands of strands)."""
+    var lod = sota_e_hair_coverage_lod(g.width, px_per_m, min_px) if apply_lod else (Float32(1.0), Float32(1.0))
+    var mb = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.35, metallic=0.0)
+    var w = g.width * lod[0]
+    for i in range(g.strand_count):
+        if lod[1] < Float32(1.0) and not sota_e_strand_kept(g, i, lod[1]):
+            continue
+        var pts = sota_e_strand_points(g, i)
+        _append_ribbon_facing(mb, pts, eye, w, w * Float32(0.35))
+    return mb^.finish()
+
+
+def sota_e_groom_strands(g: SotaHairGroom) -> List[List[Vec3]]:
+    """Every strand's points (root to tip), e.g. for `SotaEHairShadow.set_strands`."""
+    var out = List[List[Vec3]]()
+    for i in range(g.strand_count):
+        out.append(sota_e_strand_points(g, i))
+    return out^

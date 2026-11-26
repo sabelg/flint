@@ -97,7 +97,7 @@ def _emit_proj_error(
     return s.select_f(s.fge(err, s.float(1.0e30)), s.float(3.0e38), pe2)
 
 
-def sota_cluster_cull_shader() -> List[UInt32]:
+def sota_cluster_cull_shader(route: Int = 0) -> List[UInt32]:
     """Push: [0] instance_count [1] max_draws [2] cone (1/0) [3] occlusion (1/0) [4] screen_w [5] screen_h
     [6] lod threshold px (f32) [7] phase (0/1) [8] stats (1/0) [9] RT bias base m (f32, 0 = off) [10] RT bias slope.  Phase 1 grid: X = instance / 8, Y = meshlet / 8;
     phase 2 grid: X = candidate / 64."""
@@ -158,7 +158,14 @@ def sota_cluster_cull_shader() -> List[UInt32]:
     var ml_id = s.load_u(ml_var)
     var inst_base = s.imul(inst_idx, s.uint(UInt32(AAA_INSTANCE_WORDS)))
     var inst_w39 = s.load_word(b_instances, s.iadd(inst_base, s.uint(39)))
-    s.return_if(s.ine(s.bit_and(inst_w39, s.uint(0x00020000)), s.uint(0)))   # alpha-masked: own pass
+    # --- sota:E hook --- route 1 = alpha-masked instances only, route 2 = cel-outlined (word 39 bit 19) only
+    if route == 1:
+        s.return_if(s.ieq(s.bit_and(inst_w39, s.uint(0x00020000)), s.uint(0)))
+    elif route == 2:
+        s.return_if(s.ieq(s.bit_and(inst_w39, s.uint(0x00080000)), s.uint(0)))
+    else:
+        s.return_if(s.ine(s.bit_and(inst_w39, s.uint(0x00020000)), s.uint(0)))   # alpha-masked: own pass
+    # --- end sota:E hook ---
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var lcx = s.load_float(b_meshlets, ml_base)
@@ -176,6 +183,11 @@ def sota_cluster_cull_shader() -> List[UInt32]:
     var uscale = s.load_float(b_instances, s.iadd(inst_base, s.uint(35)))
     var wc = emit_mat4_mul_point(s, b_instances, inst_base, lcx, lcy, lcz)
     var wrad = s.fmul(lrad, uscale)
+    # --- sota:E hook --- outline route: skinned bounds are stale, inflate like the CPU packer (r * 4 + 4)
+    if route == 2:
+        var sk = s.ine(s.bit_and(s.load_word(b_instances, s.iadd(inst_base, s.uint(34))), s.uint(0x00010000)), s.uint(0))
+        wrad = s.select_f(sk, s.fma(wrad, s.float(4.0), s.float(4.0)), wrad)
+    # --- end sota:E hook ---
 
     var cam_x = s.load_float(b_globals, s.uint(32))
     var cam_y = s.load_float(b_globals, s.uint(33))
