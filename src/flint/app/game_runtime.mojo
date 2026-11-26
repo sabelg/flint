@@ -23,6 +23,7 @@ from flint.app.engine_app import (
     Resources,
     STAGE_LAST,
 )
+from flint.app.settings import GameSettings
 from flint.app.window_plugin import WindowPlugin, WindowStateResource
 from flint.assets.asset_plugin import AssetPlugin
 from flint.assets.mesh_builder import MeshBuilder
@@ -112,6 +113,10 @@ struct GamePresentStateResource(Resource, Movable):
     var primitives_registered: Bool
     var frames_presented: Int
     var vsync: Bool
+    var device_recoveries: Int
+    """Times the GPU device was lost and rebuilt (textures and skinned meshes need re-uploading then)."""
+    var recovery_failed: Bool
+    var applied_render_scale: Float32
 
     def __init__(out self, vsync: Bool = True):
         self.attached = False
@@ -119,6 +124,9 @@ struct GamePresentStateResource(Resource, Movable):
         self.primitives_registered = False
         self.frames_presented = 0
         self.vsync = vsync
+        self.device_recoveries = 0
+        self.recovery_failed = False
+        self.applied_render_scale = Float32(1.0)
 
 
 def register_builtin_primitives(mut renderer: ScalableRenderer) -> Bool:
@@ -165,6 +173,23 @@ def _sys_game_present(
                 renderer.gpu_slot[0].deferred_readback = True  # no swapchain: present through read-back
         else:
             st.attach_failed = True
+    if renderer.uses_vulkan():
+        ref gpu = renderer.gpu_slot[0]
+        # A lost device (driver reset, GPU hang, eGPU unplug) is rebuilt instead of leaving a frozen window.
+        if gpu.is_device_lost() and not st.recovery_failed:
+            if gpu.recover_from_device_loss():
+                st.device_recoveries += 1
+            else:
+                st.recovery_failed = True
+        # The player's render-scale setting, applied when it changes.
+        var set_opt = resources.get_ptr[GameSettings]()
+        if set_opt:
+            var want = set_opt.value()[unsafe_offset=0].render_scale
+            if abs(want - st.applied_render_scale) > Float32(1.0e-3):
+                if gpu.set_render_scale(want):
+                    st.applied_render_scale = want
+                else:
+                    st.applied_render_scale = want  # keep the old scale; don't retry every frame
     if win_res.resized and win_res.width >= 64 and win_res.height >= 64:
         _ = renderer.resize(win_res.width, win_res.height)
     # `RenderPlugin` has drawn this frame by now (this system runs after it). With a zero-copy

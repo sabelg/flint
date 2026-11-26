@@ -2387,6 +2387,7 @@ def _run_game() -> Int:
     )
     app.insert_resource[GameStateResource](GameStateResource(effective_headless))
     app.insert_resource[GameFlow](GameFlow(game_id=cfg.app_name))
+    app.insert_resource[GameSettings](settings.copy())  # a settings menu edits this; render scale applies live
     _ = app.add_system(STAGE_UPDATE, "game.update", _sys_game_update, exclusive=True)
     _setup_input(app, settings)
 
@@ -2452,6 +2453,9 @@ def _run_game() -> Int:
         last_t = now
         app.step_one_frame(dt)
 
+    var live_opt = app.resources.get_ptr[GameSettings]()
+    if live_opt:
+        settings = live_opt.value()[unsafe_offset=0].copy()
     var im_opt = app.resources.get_ptr[InputMap]()
     if im_opt:
         _ = settings.save_bindings(im_opt.value()[unsafe_offset=0])

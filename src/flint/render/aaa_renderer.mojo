@@ -5059,6 +5059,8 @@ struct FlintAaaVulkanRenderer(Movable):
         cam_roll: Float32 = 0.0,
         slot: Int = -1,
     ):
+        if not self.active or len(self.desc_sets) == 0:
+            return  # no Vulkan device (init failed or none present): nothing to set up, `render_frame` is a no-op too
         var cur_slot = slot if (slot >= 0 and slot < len(self.ring_globals)) else (self.frame_index % FRAMES_IN_FLIGHT)
         if cur_slot < len(self.frame_fences) and self.frame_fences[cur_slot] != 0:
             _ = self.vk.wait(self.frame_fences[cur_slot])
