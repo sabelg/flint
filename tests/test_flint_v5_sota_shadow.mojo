@@ -592,7 +592,7 @@ def _r3_run(cfg: R3Cfg, W: Int, H: Int, eye: Vec3, tgt: Vec3) -> R3Run:
     sc.ren.sota_shadow.toroidal = cfg.gpu_pages  # CPU path: v5 addressing (the defaults; see test_gpu_oversubscription)
     sc.ren.sota_shadow.gpu_pages = cfg.gpu_pages
     sc.ren.sota_shadow.coarse_fallback = cfg.fallback
-    sc.ren.sota_shadow.fog_requests = cfg.fallback
+    sc.ren.sota_shadow.fog_requests = False  # default off (refresh cost, see `SotaShadowState.fog_requests`)
     sc.ren.sota_shadow.fog_soft = cfg.fallback
     out.rt_ok = sc.ren.vk.has_ray_query
     sc.ren.enable_rt_shadows = cfg.rt and out.rt_ok

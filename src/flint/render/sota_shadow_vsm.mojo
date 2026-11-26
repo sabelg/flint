@@ -74,7 +74,9 @@ struct SotaShadowState(Copyable, Movable):
     var gpu_was_active: Bool
     # r3
     var coarse_fallback: Bool  # cvar r.sota_shadow.coarse_fallback (bug fix, on): parent pages + resident lookups
-    var fog_requests: Bool  # cvar r.sota_shadow.fog_requests (bug fix, on): froxel fog requests the pages it samples
+    var fog_requests: Bool  # cvar r.sota_shadow.fog_requests (default off): froxel fog requests the pages it samples.
+    # Off by default: on the default path (CPU pages) it adds ~+40 ms VSM GPU to a Forest full refresh and to every
+    # moving-light frame (coarse pages that hold the whole forest), even with froxel fog off since the inject pass runs.
     var fog_soft: Bool  # cvar r.sota_shadow.fog_soft (on): footprint-matched cascade + 4 jittered fog taps
     var fog_footprint_scale: Float32  # fog cascade = finest whose texel >= scale x froxel width
     var tight_marks: Bool  # cvar r.sota_shadow.tight_marks: request neighbour pages only where the PCSS kernel reaches
@@ -108,7 +110,7 @@ struct SotaShadowState(Copyable, Movable):
         self.gpu_active = False
         self.gpu_was_active = False
         self.coarse_fallback = True
-        self.fog_requests = True
+        self.fog_requests = False
         self.fog_soft = True
         self.fog_footprint_scale = Float32(1.0)
         self.tight_marks = True
