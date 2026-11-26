@@ -45,7 +45,10 @@ from flint.render.aaa_visbuffer import (
     emit_vec3_dot,
     emit_vec3_normalize,
 )
-from flint.render.sota_geometry_cluster_dag import SOTA_DAG_RECORD_WORDS
+from flint.render.sota_geometry_cluster_dag import SOTA_DAG_RECORD_WORDS, ClusterDag
+from flint.render.sota_geometry_dag_cache import DagCacheStats, build_cluster_dag_cached
+from flint.assets.model import NativeMesh
+from flint.core.jobs import JobPool, default_worker_count
 
 # Own descriptor-set layout (does not touch the shared AAA layout):
 comptime SOTA_BIND_MESHLETS: Int = 0
@@ -471,6 +474,11 @@ struct SotaGeometryGpu(Movable):
     var rt_bias_slope: Float32
     var legacy_hiz_occlusion: Bool  # cvar r.sota.geometry.legacy_hiz: let the v5 5-tap culler occlusion-test (off:
                                     # it false-culls visible meshlets, e.g. the Cornell back wall from frame 2 on)
+    var dag_build_threads: Int      # cvar r.sota.geometry.dag_threads: JobPool workers for DAG builds (-1 auto, 0 serial)
+    var dag_cache_dir: String       # cvar r.sota.geometry.dag_cache: directory of content-keyed DAG .flpk files ("" off)
+    var dag_pool: JobPool
+    var dag_pool_started: Bool
+    var dag_cache_stats: DagCacheStats
     var active: Bool
     var dsl: Int
     var layout: Int
@@ -501,6 +509,11 @@ struct SotaGeometryGpu(Movable):
         self.rt_bias_base = Float32(0.002)
         self.rt_bias_slope = Float32(0.0003)
         self.legacy_hiz_occlusion = False
+        self.dag_build_threads = -1
+        self.dag_cache_dir = String()
+        self.dag_pool = JobPool()
+        self.dag_pool_started = False
+        self.dag_cache_stats = DagCacheStats()
         self.active = False
         self.dsl = 0
         self.layout = 0
@@ -714,7 +727,19 @@ struct SotaGeometryGpu(Movable):
             out.append(bitcast[DType.float32](get32(a + i * 4)))
         return out^
 
+    def build_dag(mut self, mesh: NativeMesh) -> ClusterDag:
+        """Cluster DAG for `mesh`: `.flpk` cache hit, else a JobPool-parallel build (bit-identical to serial)."""
+        if not self.dag_pool_started and self.dag_build_threads != 0:
+            var n = default_worker_count() if self.dag_build_threads < 0 else self.dag_build_threads
+            if n > 0:
+                _ = self.dag_pool.start(n)
+            self.dag_pool_started = True
+        return build_cluster_dag_cached(mesh, self.dag_cache_dir, self.dag_pool, self.dag_cache_stats)
+
     def shutdown(mut self, mut vk: VulkanGpu):
+        if self.dag_pool_started and self.dag_pool.ready():
+            self.dag_pool.stop()
+        self.dag_pool_started = False
         if self.pipe_cull != 0:
             vk.destroy_pipeline(self.pipe_cull)
         if self.pipe_hiz_copy != 0:

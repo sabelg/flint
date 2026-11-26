@@ -49,6 +49,7 @@ from flint.render.aaa_bsdf import (
     emit_rnm_blend,
 )
 from flint.render.aaa_vsm import emit_vsm_pcss_shadow
+from flint.render.sota_geometry_vt import emit_vt_albedo  # sota:geometry hook
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.aaa_raytracing import (
     RAY_FLAG_OPAQUE_KHR,
@@ -1273,6 +1274,10 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var irid_w = s.load_float(b_materials, s.iadd(m_base, s.uint(13)))
     var irid_nm = s.load_float(b_materials, s.iadd(m_base, s.uint(14)))
     var irid_ior = s.load_float(b_materials, s.iadd(m_base, s.uint(15)))
+    # --- sota:geometry hook --- word 15 < 0 marks a virtual-texture material (sota_geometry_vt.mojo)
+    var sota_vt_code = irid_ior
+    irid_ior = s.select_f(s.flt(sota_vt_code, s.float(0.0)), s.float(1.5), sota_vt_code)
+    # --- end sota:geometry hook ---
     var sh_r = s.load_float(b_materials, s.iadd(m_base, s.uint(16)))
     var sh_g = s.load_float(b_materials, s.iadd(m_base, s.uint(17)))
     var sh_b = s.load_float(b_materials, s.iadd(m_base, s.uint(18)))
@@ -1407,6 +1412,14 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(em_g_v, s.fmul(s.load_f(em_g_v), sa_g))
     s.store(em_b_v, s.fmul(s.load_f(em_b_v), sa_b))
     s.end_if()
+    # --- sota:geometry hook --- virtual-texture albedo (page table + atlas, trilinear across VT mips)
+    s.begin_if(s.flt(sota_vt_code, s.float(0.0)))
+    var sota_vt_rgb = emit_vt_albedo(s, bindless_arr, sota_vt_code, uv_u, uv_v, ddx_u, ddx_v, ddy_u, ddy_v)
+    s.store(alb_r, sota_vt_rgb[0])
+    s.store(alb_g, sota_vt_rgb[1])
+    s.store(alb_b, sota_vt_rgb[2])
+    s.end_if()
+    # --- end sota:geometry hook ---
 
     # 24-Bit sRGB Vertex Color (`vertex_words[11][8..31]`) multiplied into BOTH `alb_rgb` and `em_rgb`!
     var vc0 = emit_decode_vertex_color_rgb_spv(s, meta0, is_furnace)

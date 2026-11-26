@@ -9,6 +9,8 @@ from flint.core.math import Mat4, Vec3
 from flint.core.transform import Quat, trs
 from flint.platform.os import get_time
 from flint.assets.image import write_png
+from flint.assets.vfs import load_model
+from std.os import getenv
 from flint.render.aaa_bsdf import AaaMaterial
 from flint.render.image_diff import compare_pixels
 from flint.render.render_world import RENDER_TIER_2_AAA_VISBUFFER_RT, ScalableRenderer
@@ -19,11 +21,37 @@ from flint.render.sota_geometry_cull import (
     sota_hiz_reduce_shader,
 )
 from flint.render.spirv_validate import validate_spirv_module
+from flint.render.aaa_renderer import FlintAaaVulkanRenderer
+from flint.core.jobs import JobPool, default_worker_count
+from flint.render.sota_geometry_dag_cache import (
+    DagCacheStats,
+    build_cluster_dag_cached,
+    mesh_content_hash,
+    read_cluster_dag_flpk,
+    write_cluster_dag_flpk,
+)
+from flint.render.sota_geometry_impostor import (
+    OctImpostorBake,
+    bake_octahedral_impostor,
+    build_impostor_cards,
+    hemi_oct_cell,
+    hemi_oct_dir,
+    impostor_lod_select,
+    impostor_view_cell,
+)
+from flint.render.sota_geometry_vt import (
+    SOTA_VT_FB_STRIDE,
+    VtResidency,
+    sota_vt_feedback_shader,
+    vt_mip_offset,
+    vt_total_pages,
+)
 from flint.render.sota_geometry_cluster_dag import (
     ClusterDag,
     SOTA_DAG_MAX_TRIS,
     SOTA_DAG_MAX_VERTS,
     build_cluster_dag,
+    build_cluster_dag_mt,
     dag_check_monotonic,
     dag_cut_open_edges,
     dag_select_cut,
@@ -179,6 +207,7 @@ def test_hiz_cpu_and_spirv():
     _validate_or_fail(sota_cluster_cull_shader(), "sota_cluster_cull_shader")
     _validate_or_fail(sota_hiz_copy_shader(), "sota_hiz_copy_shader")
     _validate_or_fail(sota_hiz_reduce_shader(), "sota_hiz_reduce_shader")
+    _validate_or_fail(sota_vt_feedback_shader(), "sota_vt_feedback_shader")
     print("[PASS] sota Hi-Z CPU reference (37x23, " + String(levels) + " levels, exact footprint min) + SPIR-V validation")
 
 
@@ -469,9 +498,549 @@ def test_gpu_cornell_hiz_regression():
     print("[PASS] Cornell back-wall shadow stable with Hi-Z culling (area B regression)")
 
 
+def test_vt_cpu():
+    """Residency: coarse-first streaming, fallback page table, LRU eviction with a pinned root."""
+    var r = VtResidency(n_slots=6)
+    var vt = r.add_vt(3)                       # 8 x 8 pages at mip 0, 4 mips
+    _assert(vt_total_pages(3) == 85, "VT page count 64 + 16 + 4 + 1")
+    _assert(r.place(vt, 3, 0, 0, 0, pinned=True) >= 0, "root placed")
+    var fb = List[UInt32](length=SOTA_VT_FB_STRIDE, fill=UInt32(0))
+    # request mip-0 page (5, 6) and its mip-1 parent (2, 3)
+    fb[vt_mip_offset(3, 0) + 6 * 8 + 5] = UInt32(7)
+    fb[vt_mip_offset(3, 1) + 3 * 4 + 2] = UInt32(7)
+    var tex0 = r.indirection_texels(vt)
+    var t = tex0[6 * 16 + 5]
+    _assert(Int(t & 255) == 3, "missing mip-0 page falls back to the root mip")
+    var ups = r.process_feedback(fb, 7, 1)
+    _assert(len(ups) == 1 and ups[0].mip == 1, "streamer drains the coarser page first")
+    ups = r.process_feedback(fb, 8, 4)          # stale stamp: nothing requested
+    _assert(len(ups) == 0, "only this frame's stamps count")
+    ups = r.process_feedback(fb, 7, 4)
+    _assert(len(ups) == 1 and ups[0].mip == 0 and ups[0].px == 5 and ups[0].py == 6, "then the mip-0 page")
+    var tex1 = r.indirection_texels(vt)
+    _assert(Int(tex1[6 * 16 + 5] & 255) == 0, "resident page maps to itself")
+    var p1 = tex1[3 * 16 + 8 + 2]
+    _assert(Int(p1 & 255) == 1, "mip-1 page maps to itself")
+    # fill all 6 slots, then a new request must evict the least recently requested unpinned page
+    var fb2 = List[UInt32](length=SOTA_VT_FB_STRIDE, fill=UInt32(0))
+    for i in range(6):
+        fb2[vt_mip_offset(3, 0) + i] = UInt32(20)
+    _ = r.process_feedback(fb2, 20, 8)
+    _assert(r.resident_pages() == 6, "atlas full")
+    _assert(r.evictions_total >= 1, "eviction happened")
+    var root_ok = r.page_slot[vt][vt_mip_offset(3, 3)] >= 0
+    _assert(root_ok, "pinned root never evicted")
+    print("[PASS] sota VT residency: coarse-first, fallback page table, LRU eviction, pinned root (evictions="
+          + String(r.evictions_total) + ")")
+
+
+def _vt_pattern(dim: Int) -> List[UInt32]:
+    """Detail at every scale: 64-texel hashed colour cells, 1-texel lines every 16, a smooth gradient."""
+    var px = List[UInt32](length=dim * dim, fill=UInt32(0))
+    for y in range(dim):
+        for x in range(dim):
+            var cell = UInt32(((x >> 6) * 73856093) ^ ((y >> 6) * 19349663))
+            cell = (cell ^ (cell >> 13)) * UInt32(0x5BD1E995)
+            var r = 60 + Int((cell >> 8) & 127) + (x * 60) // dim
+            var g = 60 + Int((cell >> 16) & 127)
+            var b = 60 + Int((cell >> 24) & 127) + (y * 60) // dim
+            if (x & 15) == 0 or (y & 15) == 0:
+                r = r // 3
+                g = g // 3
+                b = b // 3
+            px[y * dim + x] = UInt32(0xFF000000) | (UInt32(min(r, 255)) << 16) | (UInt32(min(g, 255)) << 8) | UInt32(min(b, 255))
+    return px^
+
+
+def _vt_plane(mut mb: MeshBuilder):
+    _cornell_quad(mb, Vec3(-20.0, 0.0, 20.0), Vec3(20.0, 0.0, 20.0), Vec3(20.0, 0.0, -20.0), Vec3(-20.0, 0.0, -20.0), Vec3(0.0, 1.0, 0.0))
+
+
+def _vt_run(use_vt: Bool, W: Int, H: Int, dim: Int, pattern: List[UInt32], mut log: List[String], mut first_px: List[UInt32]) -> List[UInt32]:
+    var renderer = _new_renderer(W, H)
+    var px = List[UInt32]()
+    if not renderer.uses_vulkan():
+        return px^
+    ref gpu = renderer.gpu_slot[0]
+    var base = AaaMaterial(base_color=Vec3(1.0, 1.0, 1.0), roughness=0.8, metallic=0.0)
+    var mat: Int
+    var t0 = get_time()
+    if use_vt:
+        var vt = gpu.add_virtual_texture(pattern, dim)
+        _assert(vt >= 0, "add_virtual_texture")
+        mat = gpu.add_material_vt(base, vt)
+    else:
+        var slot = gpu.upload_bc7_texture(pattern, dim, dim, srgb=True, generate_mips=True)
+        _assert(slot >= 0, "reference BC7 upload")
+        var m = base.copy()
+        m.albedo_tex = slot
+        mat = gpu.add_material(m)
+    var t_load = get_time() - t0
+    var mb = MeshBuilder()
+    _vt_plane(mb)
+    var e = gpu.add_mesh(mb^.finish(), mat)
+    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
+    var fb_ms = List[Float64]()
+    var cpu_ms = List[Float64]()
+    var converged_at = -1
+    var uploads_total = 0
+    for f in range(40):
+        var cz = Float32(min(f, 30)) * Float32(0.5)   # fly low over the plane, then hold
+        gpu.begin_frame(Vec3(0.0, 0.9, -18.0 + cz), Vec3(0.0, 0.0, -9.0 + cz), fov_y_deg=60.0)
+        gpu.draw_instance(e.mesh_id, ident)
+        _ = gpu.render_frame(capture_readback=True)
+        if f == 0:
+            first_px = gpu.readback_pixels()
+        if use_vt:
+            uploads_total += gpu.sota_vt.last_uploads
+            if f >= 31 and converged_at < 0 and gpu.sota_vt.last_uploads == 0 and gpu.sota_vt.res.last_missing == 0:
+                converged_at = f
+            if f >= 4:
+                cpu_ms.append(gpu.sota_vt.last_cpu_ms)
+                for pt in gpu.get_gpu_pass_timings():
+                    if pt.pass_name == "SotaVtFeedback":
+                        fb_ms.append(pt.gpu_ms)
+    px = gpu.readback_pixels()
+    if use_vt:
+        log.append("resident=" + String(gpu.sota_vt.res.resident_pages()) + " uploads=" + String(uploads_total)
+                   + " converged@frame=" + String(converged_at) + " evictions=" + String(gpu.sota_vt.res.evictions_total)
+                   + " feedback ms=" + String(_median(fb_ms)) + " cpu ms=" + String(_median(cpu_ms))
+                   + " load s=" + String(t_load))
+        _assert(converged_at >= 0, "VT streaming converges (no missing pages) within 9 frames of the camera stopping")
+        _assert(_median(fb_ms) < 0.5, "VT feedback pass < 0.5 ms")
+    else:
+        log.append("reference BC7 load s=" + String(t_load))
+    renderer.shutdown()
+    return px^
+
+
+def test_gpu_virtual_texture():
+    var W = 640
+    var H = 360
+    var dim = 4096
+    var pattern = _vt_pattern(dim)
+    var log = List[String]()
+    var first_ref = List[UInt32]()
+    var first_vt = List[UInt32]()
+    var ref_px = _vt_run(False, W, H, dim, pattern, log, first_ref)
+    if len(ref_px) == 0:
+        print("[SKIP] Vulkan unavailable: VT GPU test skipped")
+        return
+    var vt_px = _vt_run(True, W, H, dim, pattern, log, first_vt)
+    _ = write_png(EVAL_DIR + "vt_reference_bc7.png", ref_px, W, H)
+    _ = write_png(EVAL_DIR + "vt_streamed_converged.png", vt_px, W, H)
+    _ = write_png(EVAL_DIR + "vt_frame0_root_only.png", first_vt, W, H)
+    var d_final = compare_pixels(vt_px, ref_px, W, H, 24)
+    var d_first = compare_pixels(first_vt, ref_px, W, H, 24)
+    var full_mb = Float64(dim * dim * 4) * 4.0 / 3.0 / 1048576.0
+    print("  VT " + String(dim) + "^2 (" + String(full_mb) + " MB as RGBA8 mips; atlas 18.1 MB fixed): " + log[1])
+    print("  VT vs BC7 reference: frame0 (root page only) mean_abs=" + String(d_first.mean_abs) + " >24: "
+          + String(d_first.over_tolerance) + " px | converged mean_abs=" + String(d_final.mean_abs) + " >24: "
+          + String(d_final.over_tolerance) + " px | " + log[0])
+    _assert(d_final.mean_abs * 2.0 < d_first.mean_abs, "streamed pages sharpen the root-only image")
+    _assert(d_final.mean_abs < 4.0, "converged VT matches the fully resident BC7 texture (mean_abs)")
+    print("[PASS] sota virtual texturing: GPU feedback -> residency streamer -> atlas pages, converged image == reference")
+
+
+def test_impostor_cpu():
+    """Hemi-octahedral mapping round-trips every cell; a sphere bake covers pi/4 of each cell, normals face out."""
+    var frames = 8
+    for fy in range(frames):
+        for fx in range(frames):
+            var c = hemi_oct_cell(frames, hemi_oct_dir(frames, fx, fy))
+            _assert(c[0] == fx and c[1] == fy, "hemi-oct cell round trip (" + String(fx) + "," + String(fy) + ")")
+    var top = hemi_oct_cell(frames, Vec3(0.0, 1.0, 0.0))
+    _assert(top[0] >= 3 and top[0] <= 4 and top[1] >= 3 and top[1] <= 4, "straight down lands in the grid centre")
+    var sph = _sphere(24, 48)
+    var bake = bake_octahedral_impostor(sph, Vec3(0.5, 0.5, 0.5), frames, 32)
+    _assert(abs(bake.coverage - Float32(0.7854)) < Float32(0.04), "sphere silhouette covers pi/4 of each cell (got " + String(bake.coverage) + ")")
+    # centre texel of any cell faces the viewer: tangent-space normal ~ +z; texel right of centre tilts +x
+    var cx = 3 * 32 + 16
+    var cy = 5 * 32 + 16
+    var n_c = bake.normals[cy * bake.dim + cx]
+    var n_r = bake.normals[cy * bake.dim + cx + 10]
+    var n_d = bake.normals[(cy + 10) * bake.dim + cx]
+    _assert(n_c.z > Float32(0.98), "centre normal faces the camera")
+    _assert(n_r.x > Float32(0.4), "right-of-centre normal tilts +T")
+    _assert(n_d.y > Float32(0.4), "below-centre normal tilts +B (texture v runs down)")
+    var cards = build_impostor_cards(bake)
+    _assert(len(cards) == frames * frames and len(cards[0].indices) == 6, "one 2-triangle card per cell")
+    print("[PASS] sota impostor CPU: hemi-oct round trip, sphere bake coverage=" + String(bake.coverage) + ", tangent normals")
+
+
+def _tree(seed: Int) -> NativeMesh:
+    """~5k-triangle stylised broadleaf tree: tapered trunk + clustered canopy blobs, vertex coloured."""
+    var mb = MeshBuilder(roughness=0.8, metallic=0.0)
+    mb.add_cylinder(Vec3(0.0, 0.0, 0.0), Vec3(0.0, 2.2, 0.0), 0.28, 0.16, segments=16, color=0xFF5A3E28)
+    var h = UInt32(seed * 2654435761 + 12345)
+    for i in range(7):
+        h = h * UInt32(1664525) + UInt32(1013904223)
+        var a = Float32(i) * Float32(0.8975979) + Float32(Int(h >> 24)) * Float32(0.004)
+        var rr = Float32(0.55) if i > 0 else Float32(0.0)
+        var cy = Float32(2.9) + Float32(Int((h >> 16) & 255)) * Float32(0.003) + (Float32(0.5) if i == 0 else Float32(0.0))
+        var g = 110 + Int((h >> 8) & 63)
+        var col = UInt32(0xFF000000) | (UInt32(40 + Int(h & 31)) << 16) | (UInt32(g) << 8) | UInt32(38)
+        var rad = Float32(1.05) if i == 0 else Float32(0.75)
+        mb.add_ellipsoid(Vec3(rr * cos(a), cy, rr * sin(a)), Vec3(rad, rad * 0.85, rad), rings=16, segments=24, color=col)
+    return mb^.finish()
+
+
+def _bg_mask(px: List[UInt32], bg: List[UInt32]) -> List[Bool]:
+    var m = List[Bool](length=len(px), fill=False)
+    for i in range(len(px)):
+        var a = px[i]
+        var b = bg[i]
+        var d = abs(Int((a >> 16) & 255) - Int((b >> 16) & 255)) + abs(Int((a >> 8) & 255) - Int((b >> 8) & 255)) + abs(Int(a & 255) - Int(b & 255))
+        m[i] = d > 18
+    return m^
+
+
+struct ImpostorAsset(Copyable, Movable):
+    var first_card: Int
+    var frames: Int
+    var radius: Float32
+    var center: Vec3
+
+    def __init__(out self, first_card: Int, frames: Int, radius: Float32, center: Vec3):
+        self.first_card = first_card
+        self.frames = frames
+        self.radius = radius
+        self.center = center
+
+
+def _upload_impostor(mut gpu: FlintAaaVulkanRenderer, bake: OctImpostorBake) -> ImpostorAsset:
+    var alb = gpu.upload_bc7_texture(bake.albedo, bake.dim, bake.dim, srgb=True, generate_mips=True)
+    var nrm = gpu.upload_bc5_normal_texture(bake.normals, bake.dim, bake.dim, generate_mips=True)
+    _assert(alb >= 0 and nrm >= 0, "impostor atlas upload")
+    var m = AaaMaterial(base_color=Vec3(1.0, 1.0, 1.0), roughness=0.8, metallic=0.0)
+    m.albedo_tex = alb
+    m.normal_tex = nrm
+    m.alpha_cutoff = Float32(0.5)
+    var mat = gpu.add_material(m)
+    var cards = build_impostor_cards(bake)
+    var first = -1
+    for i in range(len(cards)):
+        var e = gpu.add_mesh(cards[i], mat)
+        if i == 0:
+            first = e.mesh_id
+        _assert(e.mesh_id == first + i, "impostor cards get consecutive mesh ids")
+    return ImpostorAsset(first, bake.frames, bake.radius, bake.center)
+
+
+def _yaw_trs(p: Vec3, yaw: Float32) -> Mat4:
+    return trs(p, Quat(0.0, sin(yaw * 0.5), 0.0, cos(yaw * 0.5)), Vec3(1.0, 1.0, 1.0))
+
+
+def test_gpu_impostor_single():
+    var W = 480
+    var H = 480
+    var renderer = _new_renderer(W, H)
+    if not renderer.uses_vulkan():
+        print("[SKIP] Vulkan unavailable: impostor GPU test skipped")
+        return
+    ref gpu = renderer.gpu_slot[0]
+    var tree = _tree(1)
+    var t0 = get_time()
+    var bake = bake_octahedral_impostor(tree, Vec3(1.0, 1.0, 1.0), 8, 128)
+    var bake_ms = (get_time() - t0) * 1000.0
+    var mesh_mat = gpu.add_material(AaaMaterial(base_color=Vec3(1.0, 1.0, 1.0), roughness=0.8, metallic=0.0))
+    var mesh_e = gpu.add_mesh(tree, mesh_mat)
+    var imp = _upload_impostor(gpu, bake)
+    var a_png = List[UInt32](length=bake.dim * bake.dim, fill=UInt32(0))
+    for i in range(len(a_png)):
+        var p = bake.albedo[i]
+        a_png[i] = p if (p >> 24) != 0 else UInt32(0xFF202020)
+    _ = write_png(EVAL_DIR + "impostor_atlas_albedo.png", a_png, bake.dim, bake.dim)
+    var worst_iou = Float64(1.0)
+    var worst_mean = Float64(0.0)
+    var views = List[Float32]()
+    views.append(0.0); views.append(0.7); views.append(2.1)
+    for vi in range(len(views)):
+        var ang = views[vi]
+        var dist = Float32(14.0)
+        var eye = Vec3(dist * sin(ang), 4.0, dist * cos(ang))
+        var target = Vec3(0.0, 2.4, 0.0)
+        var imgs = List[List[UInt32]]()
+        for mode in range(3):      # 0 background, 1 mesh, 2 impostor
+            for _ in range(4):
+                gpu.begin_frame(eye, target, fov_y_deg=30.0)
+                if mode == 1:
+                    gpu.draw_instance(mesh_e.mesh_id, Mat4())
+                elif mode == 2:
+                    var k = impostor_view_cell(imp.frames, Vec3(0.0, 0.0, 0.0), 0.0, eye - imp.center)
+                    gpu.draw_instance(imp.first_card + k, Mat4())
+                _ = gpu.render_frame(capture_readback=True)
+            imgs.append(gpu.readback_pixels())
+        var m_mesh = _bg_mask(imgs[1], imgs[0])
+        var m_imp = _bg_mask(imgs[2], imgs[0])
+        var inter = 0
+        var uni = 0
+        var sum_d = Float64(0.0)
+        for i in range(len(m_mesh)):
+            if m_mesh[i] and m_imp[i]:
+                inter += 1
+                var a = imgs[1][i]
+                var b = imgs[2][i]
+                sum_d += Float64(abs(Int((a >> 16) & 255) - Int((b >> 16) & 255)) + abs(Int((a >> 8) & 255) - Int((b >> 8) & 255)) + abs(Int(a & 255) - Int(b & 255))) / 3.0
+            if m_mesh[i] or m_imp[i]:
+                uni += 1
+        var iou = Float64(inter) / Float64(max(1, uni))
+        var mean_in = sum_d / Float64(max(1, inter))
+        _ = write_png(EVAL_DIR + "impostor_v" + String(vi) + "_mesh.png", imgs[1], W, H)
+        _ = write_png(EVAL_DIR + "impostor_v" + String(vi) + "_impostor.png", imgs[2], W, H)
+        print("  impostor view " + String(vi) + " (yaw " + String(ang) + "): silhouette IoU=" + String(iou)
+              + " mean_abs inside=" + String(mean_in) + " covered px mesh/imp=" + String(uni))
+        worst_iou = min(worst_iou, iou)
+        worst_mean = max(worst_mean, mean_in)
+    _assert(worst_iou > 0.80, "impostor silhouette matches the mesh (IoU " + String(worst_iou) + ")")
+    _assert(worst_mean < 28.0, "impostor shading matches the mesh (mean_abs " + String(worst_mean) + ")")
+    print("[PASS] sota octahedral impostor: 8x8 x 128px bake in " + String(Int(bake_ms)) + " ms, " + String(len(tree.indices) // 3)
+          + " tris -> 2, worst IoU=" + String(worst_iou) + " worst mean_abs=" + String(worst_mean))
+    renderer.shutdown()
+
+
+def _forest_run(use_imp: Bool, W: Int, H: Int, mut tris_out: List[Int], mut ms_out: List[Float64], mut n_imp: List[Int], mut geo_out: List[Float64]) -> List[UInt32]:
+    var renderer = _new_renderer(W, H)
+    var px = List[UInt32]()
+    if not renderer.uses_vulkan():
+        return px^
+    ref gpu = renderer.gpu_slot[0]
+    var tree = _tree(1)
+    var mesh_mat = gpu.add_material(AaaMaterial(base_color=Vec3(1.0, 1.0, 1.0), roughness=0.8, metallic=0.0))
+    var mesh_e = gpu.add_mesh(tree, mesh_mat)
+    var imp = _upload_impostor(gpu, bake_octahedral_impostor(tree, Vec3(1.0, 1.0, 1.0), 8, 64))
+    var ground = MeshBuilder(roughness=0.9, metallic=0.0, base_color=0xFF4A5A30)
+    _cornell_quad(ground, Vec3(-200.0, 0.0, 200.0), Vec3(200.0, 0.0, 200.0), Vec3(200.0, 0.0, -200.0), Vec3(-200.0, 0.0, -200.0), Vec3(0.0, 1.0, 0.0))
+    var ground_e = gpu.add_mesh(ground^.finish(), mesh_mat)
+    var eye = Vec3(0.0, 6.0, 0.0)
+    var target = Vec3(0.0, 3.0, 60.0)
+    var tan_y = Float32(0.5773503)  # tan(60/2)
+    var n = 40                       # 40 x 40 = 1600 trees (~98k visible meshlets < max_draws 131072), 6 m spacing
+    var ms = List[Float64]()
+    var geo_ms = List[Float64]()
+    var imp_count = 0
+    for f in range(10):
+        gpu.begin_frame(eye, target, fov_y_deg=60.0)
+        gpu.draw_instance(ground_e.mesh_id, Mat4())
+        imp_count = 0
+        for gz in range(n):
+            for gx in range(n):
+                var h = UInt32((gx * 73856093) ^ (gz * 19349663))
+                h = (h ^ (h >> 13)) * UInt32(0x5BD1E995)
+                var p = Vec3(Float32(gx - n // 2) * 6.0 + Float32(Int(h & 255)) * 0.012, 0.0, Float32(gz) * 6.0 + 4.0 + Float32(Int((h >> 8) & 255)) * 0.012)
+                var yaw = Float32(Int((h >> 16) & 1023)) * Float32(0.0061359)
+                if use_imp and impostor_lod_select(imp.radius, p + imp.center, eye, H, tan_y, 90.0):
+                    var k = impostor_view_cell(imp.frames, p, yaw, eye - imp.center)
+                    gpu.draw_instance(imp.first_card + k, _yaw_trs(p, yaw))
+                    imp_count += 1
+                else:
+                    gpu.draw_instance(mesh_e.mesh_id, _yaw_trs(p, yaw))
+        _ = gpu.render_frame(capture_readback=(f == 9))
+        if f >= 3:
+            var tot = Float64(0.0)
+            var geo = Float64(0.0)
+            for pt in gpu.get_gpu_pass_timings():
+                tot += pt.gpu_ms
+                if pt.pass_name == "MeshletCull" or pt.pass_name == "VisBufferHwRaster" or pt.pass_name == "VsmTileRaster":
+                    geo += pt.gpu_ms
+            ms.append(tot)
+            geo_ms.append(geo)
+    gpu.sota_geom.read_stats(gpu.sota_geom.last_slot)
+    var tris = Int(gpu.sota_geom.last_stats[1] + gpu.sota_geom.last_stats[3])
+    px = gpu.readback_pixels()
+    tris_out.append(tris)
+    ms_out.append(_median(ms))
+    geo_out.append(_median(geo_ms))
+    n_imp.append(imp_count)
+    renderer.shutdown()
+    return px^
+
+
+def test_gpu_impostor_forest():
+    var W = 960
+    var H = 540
+    var tris = List[Int]()
+    var ms = List[Float64]()
+    var n_imp = List[Int]()
+    var geo = List[Float64]()
+    var px_mesh = _forest_run(False, W, H, tris, ms, n_imp, geo)
+    if len(px_mesh) == 0:
+        print("[SKIP] Vulkan unavailable: impostor forest test skipped")
+        return
+    var px_imp = _forest_run(True, W, H, tris, ms, n_imp, geo)
+    _ = write_png(EVAL_DIR + "forest_mesh_only.png", px_mesh, W, H)
+    _ = write_png(EVAL_DIR + "forest_impostor_lod.png", px_imp, W, H)
+    var d = compare_pixels(px_imp, px_mesh, W, H, 24)
+    print("  forest 1600 trees: mesh-only tris=" + String(tris[0]) + " gpu frame ms=" + String(ms[0]) + " geometry (cull+raster+VSM raster) ms=" + String(geo[0]) + " | impostor LOD ("
+          + String(n_imp[1]) + " impostors < 90 px) tris=" + String(tris[1]) + " gpu frame ms=" + String(ms[1]) + " geometry ms=" + String(geo[1])
+          + " | image mean_abs=" + String(d.mean_abs) + " >24: " + String(d.over_tolerance) + " px")
+    _assert(n_imp[1] > 1300, "most of the forest is distant enough for impostors")
+    _assert(tris[1] * 5 < tris[0], "impostor LOD cuts drawn triangles > 5x")
+    # the shared GB10 makes whole-frame ms noisy (3 to 12 ms); assert on the geometry passes impostors replace
+    _assert(geo[1] < geo[0], "impostor LOD makes the geometry passes faster on the GPU")
+    _assert(d.mean_abs < 6.0, "impostor forest looks like the mesh forest (mean_abs " + String(d.mean_abs) + ")")
+    print("[PASS] sota impostor forest: " + String(tris[0] // max(1, tris[1])) + "x fewer triangles, geometry GPU " + String(geo[0]) + " -> " + String(geo[1]) + " ms")
+
+
+def _dags_equal(a: ClusterDag, b: ClusterDag) -> Bool:
+    if len(a.clusters) != len(b.clusters) or a.levels != b.levels or a.groups_built != b.groups_built:
+        return False
+    for i in range(len(a.clusters)):
+        ref x = a.clusters[i]
+        ref y = b.clusters[i]
+        if x.level != y.level or len(x.tris) != len(y.tris) or x.self_error != y.self_error or x.parent_error != y.parent_error:
+            return False
+        if x.parent_radius != y.parent_radius or x.self_center.x != y.self_center.x or x.parent_center.z != y.parent_center.z:
+            return False
+        for k in range(len(x.tris)):
+            if x.tris[k] != y.tris[k]:
+                return False
+    return True
+
+
+def test_dag_mt_and_cache():
+    var mesh = _sphere(256, 512)
+    var t0 = get_time()
+    var ser = build_cluster_dag(mesh)
+    var ser_ms = (get_time() - t0) * 1000.0
+    var pool = JobPool()
+    var workers = default_worker_count()
+    _ = pool.start(workers)
+    t0 = get_time()
+    var par = build_cluster_dag_mt(mesh, pool)
+    var par_ms = (get_time() - t0) * 1000.0
+    _assert(_dags_equal(ser, par), "JobPool DAG build is bit-identical to the serial build")
+    var dir = String("build/sota_dag_cache_test")
+    var bdir = String("build")
+    _ = external_call["mkdir", Int32](bdir.as_c_string_span(), Int32(0o755))
+    _ = external_call["mkdir", Int32](dir.as_c_string_span(), Int32(0o755))
+    var key = mesh_content_hash(mesh)
+    var path = dir + "/dag_test.flpk"
+    _ = external_call["unlink", Int32](path.as_c_string_span())
+    t0 = get_time()
+    _assert(write_cluster_dag_flpk(path, par, key), "write DAG .flpk")
+    var write_ms = (get_time() - t0) * 1000.0
+    var back = ClusterDag()
+    t0 = get_time()
+    _assert(read_cluster_dag_flpk(path, key, back), "read DAG .flpk")
+    var read_ms = (get_time() - t0) * 1000.0
+    _assert(_dags_equal(ser, back), "cached DAG == built DAG")
+    var stale = ClusterDag()
+    _assert(not read_cluster_dag_flpk(path, key ^ UInt64(1), stale), "stale key is a miss")
+    # cache wrapper: miss -> write, then hit
+    var stats = DagCacheStats()
+    var cdir = dir + "/auto"
+    _ = external_call["mkdir", Int32](cdir.as_c_string_span(), Int32(0o755))
+    var d1 = build_cluster_dag_cached(mesh, cdir, pool, stats)
+    var d2 = build_cluster_dag_cached(mesh, cdir, pool, stats)
+    _assert(stats.hits >= 1 and _dags_equal(d1, d2), "build_cluster_dag_cached hits on the second load")
+    var mesh2 = mesh.copy()
+    mesh2.positions[0] += Float32(0.001)
+    _assert(mesh_content_hash(mesh2) != key, "content hash changes with the mesh")
+    pool.stop()
+    print("  DAG build " + String(len(mesh.indices) // 3) + " tris, " + String(len(ser.clusters)) + " clusters: serial "
+          + String(Int(ser_ms)) + " ms | JobPool x" + String(workers) + " " + String(Int(par_ms)) + " ms ("
+          + String(ser_ms / max(par_ms, 0.001)) + "x) | .flpk write " + String(Int(write_ms)) + " ms, cached load "
+          + String(read_ms) + " ms (" + String(ser_ms / max(read_ms, 0.001)) + "x)")
+    _assert(read_ms * 4.0 < ser_ms, "cached load is > 4x faster than a build")
+    if workers >= 2:
+        _assert(par_ms < ser_ms, "JobPool build is faster than serial")
+    print("[PASS] sota DAG build: JobPool bit-identical to serial, .flpk cache round trip + content-keyed invalidation")
+
+
+def _scene_run(path: String, mode: Int, cache_dir: String, W: Int, H: Int, mut log: List[String]) -> List[UInt32]:
+    """mode 0: legacy discrete QEM LODs, 1: cluster DAG (cold cache), 2: cluster DAG (warm .flpk cache)."""
+    var renderer = _new_renderer(W, H)
+    var px = List[UInt32]()
+    if not renderer.uses_vulkan():
+        return px^
+    ref gpu = renderer.gpu_slot[0]
+    gpu.sota_geom.cluster_lod_auto = mode > 0
+    gpu.sota_geom.dag_cache_dir = cache_dir
+    var t0 = get_time()
+    var model = load_model(path)
+    var load_s = get_time() - t0
+    t0 = get_time()
+    var up = gpu.upload_native_model(model, build_lods=True, max_tex_dim=512)
+    var cook_s = get_time() - t0
+    var c = model.bounds_center
+    var r = max(model.bounds_radius, Float32(1.0))
+    var eye = c + Vec3(r * 0.05, r * 0.12, -r * 0.75)
+    var target = c + Vec3(0.0, -r * 0.05, 0.0)
+    var ms = List[Float64]()
+    var cull_ms = List[Float64]()
+    for f in range(12):
+        gpu.begin_frame(eye, target, fov_y_deg=55.0)
+        gpu.draw_native_model(model, up)
+        _ = gpu.render_frame(capture_readback=(f == 11))
+        if f >= 4:
+            var tot = Float64(0.0)
+            for pt in gpu.get_gpu_pass_timings():
+                tot += pt.gpu_ms
+                if pt.pass_name == "MeshletCull":
+                    cull_ms.append(pt.gpu_ms)
+            ms.append(tot)
+    gpu.sota_geom.read_stats(gpu.sota_geom.last_slot)
+    var st = gpu.sota_geom.last_stats.copy()
+    px = gpu.readback_pixels()
+    log.append("mode=" + String(mode) + " meshes=" + String(len(model.meshes)) + " load s=" + String(load_s)
+               + " cook s=" + String(cook_s) + " draws=" + String(Int(st[0] + st[2])) + " tris=" + String(Int(st[1] + st[3]))
+               + " dag clusters=" + String(Int(st[8])) + " gpu ms=" + String(_median(ms)) + " cull ms=" + String(_median(cull_ms))
+               + " cache hits/misses=" + String(gpu.sota_geom.dag_cache_stats.hits) + "/" + String(gpu.sota_geom.dag_cache_stats.misses))
+    renderer.shutdown()
+    return px^
+
+
+def test_scene_bench():
+    """Area F scenes (opt-in: FLINT_SOTA_SCENES=1; models live outside the repo): legacy LODs vs cluster DAG."""
+    if getenv("FLINT_SOTA_SCENES") != "1":
+        print("[SKIP] scene bench (set FLINT_SOTA_SCENES=1; needs ~/flint-models/_scenes)")
+        return
+    var W = 1280
+    var H = 720
+    var scenes = List[String]()
+    scenes.append("forest/Forest.glb")
+    scenes.append("bistro/BistroInterior_Wine.glb")
+    var root = getenv("HOME") + "/flint-models/_scenes/"
+    var cache = String("build/sota_dag_cache_scenes")
+    var run_cache = cache + "/run" + String(Int(get_time() * 1000.0))
+    var bdir = String("build")
+    _ = external_call["mkdir", Int32](bdir.as_c_string_span(), Int32(0o755))
+    _ = external_call["mkdir", Int32](cache.as_c_string_span(), Int32(0o755))
+    for si in range(len(scenes)):
+        var log = List[String]()
+        var path = root + scenes[si]
+        var px0 = _scene_run(path, 0, String(), W, H, log)
+        if len(px0) == 0:
+            print("[SKIP] Vulkan unavailable")
+            return
+        var cdir = run_cache + "_" + String(si)
+        _ = external_call["mkdir", Int32](cdir.as_c_string_span(), Int32(0o755))
+        var px1 = _scene_run(path, 1, cdir, W, H, log)
+        var px2 = _scene_run(path, 2, cdir, W, H, log)
+        var name = String("scene_forest") if si == 0 else String("scene_bistro")
+        _ = write_png(EVAL_DIR + name + "_legacy_lod.png", px0, W, H)
+        _ = write_png(EVAL_DIR + name + "_cluster_dag.png", px1, W, H)
+        var d = compare_pixels(px1, px0, W, H, 16)
+        var d2 = compare_pixels(px2, px1, W, H, 1)
+        print("  " + scenes[si] + ":")
+        for l in log:
+            print("    " + l)
+        print("    DAG vs legacy image mean_abs=" + String(d.mean_abs) + " >16: " + String(d.over_tolerance)
+              + " px | warm-cache image == cold (>1: " + String(d2.over_tolerance) + " px)")
+    print("[PASS] sota scene bench (numbers above)")
+
+
 def main():
     test_dag_cpu()
     test_hiz_cpu_and_spirv()
     test_gpu_two_pass_occlusion()
     test_gpu_dag_lod()
     test_gpu_cornell_hiz_regression()
+    test_vt_cpu()
+    test_gpu_virtual_texture()
+    test_dag_mt_and_cache()
+    test_impostor_cpu()
+    test_gpu_impostor_single()
+    test_gpu_impostor_forest()
+    test_scene_bench()
