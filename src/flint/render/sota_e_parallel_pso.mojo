@@ -10,9 +10,10 @@ Tokens resolve to real handles at bind / destroy time (`VulkanGpu.sota_e_resolve
 keep their value. `FLINT_PARALLEL_PSO=0` turns batching off (serial creation, as before).
 """
 from std.collections import List
+from std.time import monotonic
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool, default_worker_count
-from flint.platform.os import env_value
+from flint.platform.os import env_now
 from flint.platform.vulkan import (
     VulkanGpu,
     call3,
@@ -29,7 +30,8 @@ from flint.platform.vulkan import (
 
 
 def sota_e_parallel_pso_enabled() -> Bool:
-    return env_value("FLINT_PARALLEL_PSO") != "0"
+    # --- sota:perf hook --- getenv(3), not /proc/self/environ: a switch set with setenv in this process counts
+    return env_now("FLINT_PARALLEL_PSO") != "0"
 
 
 def sota_e_pso_batch_begin(mut vk: VulkanGpu):
@@ -125,6 +127,7 @@ def sota_e_pso_batch_flush(mut vk: VulkanGpu, workers: Int = -1) -> Int:
         Int(entry.unsafe_ptr()), Int(code_ptr.unsafe_ptr()), Int(code_bytes.unsafe_ptr()),
         Int(layouts.unsafe_ptr()), Int(handles.unsafe_ptr()),
     )
+    var sota_perf_t0 = Float64(monotonic()) * 1.0e-9  # --- sota:perf hook --- batch compile wall time
     var pool = JobPool()
     var nw = default_worker_count() if workers < 0 else workers
     if nw > 1 and pool.start(min(nw, n)):
@@ -133,6 +136,7 @@ def sota_e_pso_batch_flush(mut vk: VulkanGpu, workers: Int = -1) -> Int:
     else:
         for j in range(n):
             _pso_worker(Int(Pointer(to=ctx)), j)
+    vk.sota_perf_compute_compile_s += Float64(monotonic()) * 1.0e-9 - sota_perf_t0  # --- sota:perf hook ---
     var failed = 0
     for i in range(n):
         if handles[i] == 0:
