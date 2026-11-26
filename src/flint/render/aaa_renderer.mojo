@@ -327,6 +327,9 @@ from flint.render.aaa_rt_shadow import (
     rt_sun_shadow_filter_shader,
     rt_sun_shadow_trace_shader,
 )
+# --- sota:ml hook ---
+from flint.render.sota_ml_denoise import SotaMlDenoiser
+# --- end sota:ml hook ---
 from flint.render.aaa_post_tsr import (
     AAA_DISPLAY_AGX_REC709,
     AAA_POST_ADAPTED_EXP_WORD,
@@ -749,6 +752,9 @@ struct FlintAaaVulkanRenderer(Movable):
     var has_prev_cam: Bool
     var scene_time_sec: Float32
     var enable_spec_reblur: Bool
+    # --- sota:ml hook ---
+    var sota_ml: SotaMlDenoiser  # learned GI denoiser; replaces SVGF only when weights load (`sota_ml_denoise.mojo`)
+    # --- end sota:ml hook ---
     var spec_reblur_passes: Int
     var spec_reblur_valid_frames: Int
     var enable_froxel_fog: Bool
@@ -1071,6 +1077,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sky_zenith_clear = Vec3(0.0, 0.0, 0.0)
         self.sky_horizon_clear = Vec3(0.0, 0.0, 0.0)
 
+        # --- sota:ml hook ---
+        self.sota_ml = SotaMlDenoiser()
+        # --- end sota:ml hook ---
         self.active = self._init_vulkan_pipeline()
 
     def _build_default_render_graph(mut self):
@@ -1398,6 +1407,11 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_vsm_indirect = self.vk.create_buffer(64 + self.max_draws * 16, local=True)
         self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
         var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
+        # --- sota:ml hook --- (scratch appended past every other history region; offset recorded here)
+        self.sota_ml.scratch_base = hist_words
+        self.sota_ml.scratch_max_pix = max_pix
+        hist_words += SotaMlDenoiser.scratch_words(max_pix)
+        # --- end sota:ml hook ---
         self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
         self.buf_vsm_table = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True)
         # --- sota:gi hook --- (+ the area-B control block; the full region is allocated on first use)
@@ -4791,8 +4805,23 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_gi.end_frame(sota_mode)
         # --- end sota:gi hook ---
 
+        # --- sota:ml hook --- learned denoiser replaces SVGF when its weights are present
+        var run_sota_ml = run_svgf and self.sota_ml.ready(self.vk, self.pipe_layout)
+        if run_sota_ml:
+            var q_ml = next_q
+            if use_prof and q_ml + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_ml, PIPELINE_TOP)
+                next_q += 2
+                prof_pairs.append((String("SotaMlDenoise"), q_ml))
+            self.sota_ml.record(self.vk, cur_slot, self.pipe_layout, self.desc_set, self.render_w, self.render_h)
+            if use_prof and q_ml + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_ml + 1, PIPELINE_BOTTOM)
+        else:
+            self.sota_ml.skipped()
+        # --- end sota:ml hook ---
+
         # `SVGF` Temporal Reprojection + Moments Variance Edge-Stopping `À-Trous` Denoiser
-        if run_svgf:
+        if run_svgf and not run_sota_ml:  # sota:ml
             var q_sv = next_q
             if use_prof and q_sv + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_sv, PIPELINE_TOP)
@@ -5834,6 +5863,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_dq_skinning)
         self.vk.destroy_pipeline(self.pipe_deferred_shade)
         self.vk.destroy_pipeline(self.pipe_svgf_reproject)
+        self.sota_ml.destroy(self.vk)  # sota:ml hook
         self.vk.destroy_pipeline(self.pipe_svgf_atrous)
         if self.sota_gi.pipe_wrc != 0:  # --- sota:gi hook ---
             self.vk.destroy_pipeline(self.sota_gi.pipe_wrc)
