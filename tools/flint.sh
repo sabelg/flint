@@ -192,7 +192,7 @@ cmd_lab() {
         case "$1" in
             --fast) opt="-O1"; shift ;;
             -h|--help)
-                echo "Usage: bash tools/flint.sh lab <physics|anim|render|audio_ui|net|all> [--fast] [-- args...]"
+                echo "Usage: bash tools/flint.sh lab <physics|anim|render|audio_ui|net|bench|all> [--fast] [-- args...]"
                 echo "  Compiles labs/lab_<name>.mojo (-O3 default, -O1 with --fast) and runs subsystem benchmarks."
                 return 0
                 ;;
@@ -209,20 +209,20 @@ cmd_lab() {
     done
 
     if [[ -z "$target" ]]; then
-        echo "Usage: bash tools/flint.sh lab <physics|anim|render|audio_ui|net|all> [--fast]" >&2
+        echo "Usage: bash tools/flint.sh lab <physics|anim|render|audio_ui|net|bench|all> [--fast]" >&2
         return 1
     fi
 
     local labs=()
     case "$target" in
-        physics|anim|render|audio_ui|net)
+        physics|anim|render|audio_ui|net|bench)
             labs=("$target")
             ;;
         all)
             labs=("physics" "anim" "render" "audio_ui" "net")
             ;;
         *)
-            echo "[Flint Lab] ERROR: Unknown lab '$target'. Expected one of: physics, anim, render, audio_ui, net, all." >&2
+            echo "[Flint Lab] ERROR: Unknown lab '$target'. Expected one of: physics, anim, render, audio_ui, net, bench, all." >&2
             return 1
             ;;
     esac

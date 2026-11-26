@@ -167,7 +167,54 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
     var binary = List[UInt8](length=binary_length, fill=0)
     if binary_length > 0:
         _ = external_call["memcpy", Int](Int(binary.unsafe_ptr()), Int(file.unsafe_ptr()) + binary_header + 8, binary_length)
+    return _native_model_from_document(document, binary, "")
 
+
+def _gltf_base_dir(path: String) -> String:
+    var cut = -1
+    for i in range(path.byte_length()):
+        if path[byte=i] == "/":
+            cut = i
+    if cut < 0:
+        return ""
+    return String(path[byte=0 : cut + 1])
+
+
+def load_native_gltf(path: String) -> NativeModel:
+    """Text `.gltf` with external resources (`buffers[0].uri`, `images[].uri` relative to the file).
+
+    Multi-buffer files are refused (an empty model), as are `data:` URIs; GLB stays the main path.
+    """
+    var json_bytes = read_bytes(path)
+    if len(json_bytes) == 0:
+        return NativeModel()
+    var document = parse_json(json_bytes)
+    if not document.valid:
+        return NativeModel()
+    var base = _gltf_base_dir(path)
+    var buffers = document.object_get(document.root, "buffers")
+    if document.array_size(buffers) > 1:
+        return NativeModel()
+    var binary = List[UInt8]()
+    if document.array_size(buffers) == 1:
+        var uri = document.text(document.object_get(document.at(buffers, 0), "uri"))
+        if uri.byte_length() == 0 or uri.startswith("data:"):
+            return NativeModel()
+        binary = read_bytes(base + uri)
+        if len(binary) < document.integer(document.object_get(document.at(buffers, 0), "byteLength"), 0):
+            return NativeModel()
+    return _native_model_from_document(document, binary, base)
+
+
+def load_native_model_file(path: String) -> NativeModel:
+    """Dispatch on the extension: `.gltf` -> `load_native_gltf`, anything else -> GLB."""
+    if path.endswith(".gltf"):
+        return load_native_gltf(path)
+    return load_native_glb(path)
+
+
+def _native_model_from_document(document: JsonDocument, binary: List[UInt8], base_dir: String) -> NativeModel:
+    var model = NativeModel()
     var images = document.object_get(document.root, "images")
     var textures = document.object_get(document.root, "textures")
     var views = document.object_get(document.root, "bufferViews")
@@ -177,6 +224,15 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
         var image_node = document.at(images, source)
         var view = document.at(views, document.integer(document.object_get(image_node, "bufferView"), -1))
         var texture = NativeTexture()
+        var image_uri = document.text(document.object_get(image_node, "uri"))
+        if view < 0 and image_uri.byte_length() > 0 and not image_uri.startswith("data:"):
+            var file_bytes = read_bytes(base_dir + image_uri)
+            if len(file_bytes) > 0:
+                var decoded_file = decode_image_auto(file_bytes, 4096)
+                if decoded_file.valid:
+                    texture.width = decoded_file.width
+                    texture.height = decoded_file.height
+                    swap(texture.pixels, decoded_file.pixels)
         if view >= 0:
             var offset = document.integer(document.object_get(view, "byteOffset"), 0)
             var length = document.integer(document.object_get(view, "byteLength"), 0)
@@ -264,7 +320,12 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             if indices.valid:
                 mesh.indices.reserve(indices.count)
                 for index in range(indices.count):
-                    mesh.indices.append(indices.unsigned_value(binary, index))
+                    var vi = indices.unsigned_value(binary, index)
+                    # --- sota:perf hook --- malformed files (index past the primitive's vertices) are
+                    # rejected like other malformed input instead of crashing the meshlet builder later.
+                    if vi < 0 or vi >= positions.count:
+                        return NativeModel()
+                    mesh.indices.append(vi)
             elif indices_node >= 0:
                 return NativeModel()
             else:

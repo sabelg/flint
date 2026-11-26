@@ -360,6 +360,7 @@ from flint.render.aaa_post_tsr import (
     tsr_v2_and_display_shader,
 )
 # --- sota:camera hook (import) ---
+from flint.render.sota_perf_vsm import SotaVsmCache  # --- sota:perf hook ---
 from flint.render.sota_camera_post import (
     SotaCameraPost,
     sota_camera_record_ca,
@@ -551,6 +552,9 @@ struct FlintAaaVulkanRenderer(Movable):
     var last_cpu_vsm_ms: Float64  # VSM request processing + indirect page packing
     var last_cpu_record_ms: Float64  # command-buffer recording
     var last_cpu_submit_wait_ms: Float64  # vkQueueSubmit (+ fence wait in synchronous mode)
+    var geometry_mb: Int  # --- sota:perf hook ---
+    var sota_vsm: SotaVsmCache  # --- sota:perf hook --- VSM page invalidation for light / caster motion
+    var geometry_overflow_meshes: Int  # --- sota:perf hook --- meshes rejected because the pools were full
     var last_frame_gpu_ms: Float64  # whole-frame TOP->BOTTOM timestamp pair (incl. TLAS, skin, readback copy)
     var last_vsm_dirty_pages: Int
     var last_cpu_vsm_table_ms: Float64  # part of `last_cpu_vsm_ms`: VSM table alloc + host read/write copies
@@ -823,8 +827,12 @@ struct FlintAaaVulkanRenderer(Movable):
         max_draws: Int = 131072,
         max_instances: Int = 32768,
         env_cube_dim: Int = 64,
+        geometry_mb: Int = 32,  # --- sota:perf hook --- vertex + index pools (MB each); meshlets get half
     ):
         self.vk = VulkanGpu()
+        self.geometry_mb = max(8, geometry_mb)  # --- sota:perf hook ---
+        self.geometry_overflow_meshes = 0  # --- sota:perf hook ---
+        self.sota_vsm = SotaVsmCache()  # --- sota:perf hook ---
         self.active = False
         self.output_w = max(16, width)
         self.output_h = max(16, height)
@@ -1439,9 +1447,10 @@ struct FlintAaaVulkanRenderer(Movable):
         # Allocate Storage Buffers (`local=True` places GPU SSBOs in `DEVICE_LOCAL` Resizable BAR VRAM!)
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
         var bda_flags = BUFFER_USAGE_DEVICE_ADDRESS | BUFFER_USAGE_AS_BUILD_INPUT_KHR
-        self.buf_vertices = self.vk.create_buffer_bda(32 * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
-        self.buf_indices = self.vk.create_buffer_bda(32 * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
-        self.buf_meshlets = self.vk.create_buffer(8 * 1024 * 1024, local=True)
+        # --- sota:perf hook --- geometry pools sized by `geometry_mb` (default 32 MB = v5 sizes)
+        self.buf_vertices = self.vk.create_buffer_bda(self.geometry_mb * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
+        self.buf_indices = self.vk.create_buffer_bda(self.geometry_mb * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
+        self.buf_meshlets = self.vk.create_buffer((8 if self.geometry_mb <= 32 else self.geometry_mb // 2) * 1024 * 1024, local=True)
         self.buf_materials = self.vk.create_buffer(1024 * AAA_MATERIAL_WORDS * 4, local=True)
         self.buf_vsm_indirect = self.vk.create_buffer(64 + self.max_draws * 16, local=True)
         self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
@@ -2249,6 +2258,11 @@ struct FlintAaaVulkanRenderer(Movable):
         if (len(self.geom.vertex_words) * 4 > self.buf_vertices.size or len(self.geom.index_words) * 4 > self.buf_indices.size
                 or len(self.geom.meshlet_words) * 4 > self.buf_meshlets.size):
             entry.mesh_id = -1            # did not fit on the GPU: never draw it
+            # --- sota:perf hook --- make the overflow visible instead of silently dropping geometry
+            if self.geometry_overflow_meshes == 0:
+                print("[Flint AAA] WARNING: geometry pools full (geometry_mb=" + String(self.geometry_mb)
+                      + "): buffer growth failed, meshes from here on are not drawn")
+            self.geometry_overflow_meshes += 1
             self._sota_log_once("geometry: mesh did not fit on the GPU (buffer growth failed); it will not be drawn")  # sota:geometry hook
         # --- sota:geometry hook --- the visbuffer / indirect encodings carry a 17-bit global meshlet id
         if entry.mesh_id >= 0 and entry.first_meshlet + entry.meshlet_count > SOTA_MAX_GLOBAL_MESHLETS:
@@ -4075,6 +4089,24 @@ struct FlintAaaVulkanRenderer(Movable):
         )
         if use_vsm_casc_frame:
             light_vp = self.vsm_cascade_matrices[0].copy()
+        # --- sota:perf hook --- keep cached VSM pages valid under light rotation and moving / skinned casters
+        if self.enable_vsm and self.sota_vsm.enabled:
+            self.sota_vsm.update_light(self.vsm, self.sun_dir, self.sun_radiance)
+            self.sota_vsm.begin_casters()
+            if use_vsm_casc_frame:
+                for inst_i in range(len(self.frame_instances)):
+                    ref di = self.frame_instances[inst_i]
+                    if di.mesh_id < 0 or di.mesh_id >= len(self.geom.meshes):
+                        continue
+                    var deforming = di.mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[di.mesh_id]
+                    self.sota_vsm.caster(
+                        self.vsm, self.vsm_cascade_matrices, di.world_mat, di.prev_world_mat,
+                        self.geom.meshes[di.mesh_id].bounds_center, self.geom.meshes[di.mesh_id].bounds_radius,
+                        di.uniform_scale, deforming,
+                    )
+        elif self.sota_vsm.enabled:
+            _ = self.sota_vsm.track_light(self.sun_dir, self.sun_radiance)
+        # --- end sota:perf hook ---
 
         # True 16-phase radical-inverse Halton (2, 3) sub-pixel TSR jitter across ALL `tsr_scale` values (including native 1.0x!)
         var jx_px_cur = Float32(0.0)
@@ -4361,11 +4393,17 @@ struct FlintAaaVulkanRenderer(Movable):
         ):
             sota_mode = self.sota_gi.mode
         var sota_restir_di = use_rt_frame and self.enable_restir_di and self.enable_rt_shadows and n_cl_lights > 0
+        # --- sota:perf hook --- a light change restarts photo-mode accumulation and lets the WRC re-converge fast
+        var sota_keep_hist = self.sota_gi.wrc_max_history
+        if self.sota_vsm.light_changed_frame:
+            self.sota_gi.reset_accumulation()
+        self.sota_gi.wrc_max_history = self.sota_vsm.gi_history_cap(sota_keep_hist)
         self.sota_gi.write_ctrl(
             self.buf_surfcache.cpu_address, sota_mode, self.frame_index, self.cam_pos, self.cam_fwd,
             self.render_w, self.render_h, max(self.output_w * self.output_h, self.render_w * self.render_h), n_inst,
             restir_di=sota_restir_di, region_ready=self.sota_gi_region_ready,
         )
+        self.sota_gi.wrc_max_history = sota_keep_hist
         # --- end sota:gi hook ---
         var inst_da: UInt64 = 0
         if use_rt_frame:
@@ -5489,6 +5527,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var hist_in = ping_off if (self.frame_index & 1) == 0 else pong_off
         var hist_out = pong_off if (self.frame_index & 1) == 0 else ping_off
         var eff_hist_w = Float32(0.0) if (self.frame_index == 0 or self.furnace_white_dome) else self.tsr_history_weight
+        eff_hist_w = self.sota_vsm.tsr_history_cap(eff_hist_w)  # --- sota:perf hook --- lighting cut drops stale TSR history
 
         var push_tsr = List[UInt32](length=16, fill=0)
         push_tsr[0] = UInt32(self.render_w)
