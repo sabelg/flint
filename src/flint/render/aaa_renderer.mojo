@@ -332,6 +332,9 @@ from flint.render.aaa_post_tsr import (
     srgb_u8_to_linear,
     tsr_v2_and_display_shader,
 )
+# --- sota:camera hook (import) ---
+from flint.render.sota_camera_post import SotaCameraPost, sota_camera_record_dof, sota_camera_record_lens
+# --- end sota:camera hook ---
 from flint.render.aaa_render_graph import (
     AaaGpuPassTiming,
     AaaRenderGraph,
@@ -703,6 +706,9 @@ struct FlintAaaVulkanRenderer(Movable):
     var wind_gust: Float32        # and how gusty (0..1)
     var wind_t0: Float64
     var camera_lens: AaaPhysicalCamera
+    # --- sota:camera hook (field) ---
+    var sota_cam: SotaCameraPost  # physical camera, scatter-as-gather DoF, lens flare/dirt/CA/vignette, sensor noise
+    # --- end sota:camera hook ---
     var enable_auto_exposure: Bool
     var auto_exposure_speed: Float32
     var auto_exposure_key: Float32
@@ -981,6 +987,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.wind_gust = Float32(0.3)
         self.wind_t0 = get_time()
         self.camera_lens = AaaPhysicalCamera()
+        # --- sota:camera hook (init) ---
+        self.sota_cam = SotaCameraPost()
+        # --- end sota:camera hook ---
         self.enable_auto_exposure = False
         self.auto_exposure_speed = Float32(0.45)
         self.auto_exposure_key = Float32(0.18)
@@ -1248,6 +1257,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_tsr_v3_resolve = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_tsr_v3_resolve_shader())
         self.pipe_motion_blur = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_motion_blur_shader())
         self.pipe_display_tonemap = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_display_tonemap_shader())
+        # --- sota:camera hook (pipelines; optional, features skip when not ready) ---
+        _ = self.sota_cam.create_pipelines(self.vk, self.pipe_layout)
+        # --- end sota:camera hook ---
         self.pipe_npr_cel_shade = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_cel_shade_shader())
         self.pipe_npr_post_fx = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_post_fx_shader())
         self.pipe_ui_overlay = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_ui_overlay_shader())
@@ -3592,6 +3604,22 @@ struct FlintAaaVulkanRenderer(Movable):
 
         _ = self.streamer.tick_streaming_budget()
 
+        # --- sota:camera hook (exposure triangle -> exposure, shutter, legacy lens) ---
+        if self.sota_cam.drive_renderer:
+            var ae_mul = Float32(1.0)
+            if self.enable_auto_exposure and self.frame_index > 0:
+                ae_mul = self.get_adapted_exposure()[0]
+            var cam_sync = self.sota_cam.frame_sync(ae_mul, self.enable_auto_exposure)
+            self.exposure = cam_sync[0]
+            self.motion_blur_shutter = cam_sync[1]
+            self.camera_lens.aperture_fstop = self.sota_cam.camera.fstop
+            self.camera_lens.shutter_seconds = self.sota_cam.camera.shutter_s
+            self.camera_lens.iso = self.sota_cam.camera.iso
+            self.camera_lens.focal_length_mm = self.sota_cam.camera.focal_length_mm
+            self.camera_lens.sensor_height_mm = self.sota_cam.camera.sensor_height_mm
+            self.camera_lens.focus_distance_m = self.sota_cam.camera.focus_distance_m
+        # --- end sota:camera hook ---
+
         var cur_slot = self.frame_index % FRAMES_IN_FLIGHT
         var defer_this = self.deferred_readback and (not capture_readback) and self.vk.swapchain == 0
         if defer_this and cur_slot > 0 and len(self.readback_extra) < cur_slot:
@@ -5009,8 +5037,16 @@ struct FlintAaaVulkanRenderer(Movable):
         if use_prof and q_tsr + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_tsr + 1, PIPELINE_BOTTOM)
 
+        # --- sota:camera hook (scatter-as-gather DoF replaces the legacy pass when enabled) ---
+        var sota_dof_on = self.sota_cam.enable_dof and self.sota_cam.pipelines_ready() and not self.furnace_white_dome
+        if sota_dof_on:
+            sota_camera_record_dof(
+                self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set,
+                self.output_w, self.output_h, use_prof, next_q, q_limit, prof_pairs,
+            )
+        # --- end sota:camera hook ---
         # Thin-Lens Polygonal Diaphragm Bokeh Depth-of-Field at Native `output_w x output_h`!
-        if self.enable_bokeh_dof and not self.furnace_white_dome:
+        if self.enable_bokeh_dof and not self.furnace_white_dome and not sota_dof_on:
             var q_dof = next_q
             if use_prof and q_dof + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_dof, PIPELINE_TOP)
@@ -5251,6 +5287,13 @@ struct FlintAaaVulkanRenderer(Movable):
             if use_prof and q_ae + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_ae + 1, PIPELINE_BOTTOM)
 
+        # --- sota:camera hook (lens: CA, optical vignette, ghosts, dirt; then sensor noise) ---
+        if self.sota_cam.any_lens_effect() and self.sota_cam.pipelines_ready() and not self.furnace_white_dome:
+            sota_camera_record_lens(
+                self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.buf_hdr_out,
+                self.buf_post_scratch, self.output_w, self.output_h, max_pix, use_prof, next_q, q_limit, prof_pairs,
+            )
+        # --- end sota:camera hook ---
         # Cinema Display Tonemap (`AgX` Toe + `+5.5 EV` Shoulder / `HDR10 PQ` / `Linear sRGB` + Windshield Rain)!
         var q_dt = next_q
         if use_prof and q_dt + 1 < q_limit:
