@@ -409,6 +409,9 @@ def test_gpu_cornell_gi_modes() raises:
         print("  [SKIP] SOTA GI GPU checks (no hardware ray queries)")
         return
     ren.display_mode = AAA_DISPLAY_LINEAR_SRGB
+    # Pin the shipping SVGF denoiser: these thresholds measure the GI modes, and the
+    # area-C learned denoiser switches itself on whenever its weights are on disk.
+    ren.sota_ml.enabled = False
     ren.enable_vsm = False
     ren.enable_rt_shadows = True
     ren.enable_rt_reflections = False
