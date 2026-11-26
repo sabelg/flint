@@ -72,6 +72,147 @@ comptime VSM_GLOBALS_CASCADE_3_WORD: Int = 200    # 16 floats: [200..215]
 comptime SOTA_SHADOW_GLOBALS_TOROIDAL_WORD: Int = 236
 comptime SOTA_SHADOW_GLOBALS_TOROIDAL_OFFSETS_WORD: Int = 237
 comptime SOTA_SHADOW_GLOBALS_CONTACT_WORD: Int = 241
+# r3 (taken from the shared 216..235 range): 234 flags (bit 0 coarse fallback: samplers use the finest *resident*
+# cascade; bit 1 froxel fog requests its own pages; bit 2 soft fog taps; bit 3 parent pages are requested and the pool
+# allocates coarse-first, only while it is oversubscribed),
+# 235 fog shadow footprint scale (float, fog cascade = finest whose texel >= scale x froxel width).
+comptime SOTA_SHADOW_GLOBALS_FLAGS_WORD: Int = 234
+comptime SOTA_SHADOW_GLOBALS_FOG_WORD: Int = 235
+comptime SOTA_SHADOW_FLAG_COARSE_FALLBACK: Int = 1
+comptime SOTA_SHADOW_FLAG_FOG_REQUESTS: Int = 2
+comptime SOTA_SHADOW_FLAG_FOG_SOFT: Int = 4
+comptime SOTA_SHADOW_FLAG_PARENT_MARKS: Int = 8  # set only while the pool is oversubscribed (see SotaShadowState)
+comptime SOTA_SHADOW_FLAG_TIGHT_MARKS: Int = 16  # neighbour pages only when the PCSS kernel reaches them
+
+
+def emit_sota_shadow_neighbour_needs(
+    mut s: AaaSpirvModule, b_globals: UInt32, casc: UInt32, lu: UInt32, lv: UInt32
+) -> List[UInt32]:
+    """Bools (left, right, up, down): does the PCSS kernel of a pixel at window coords (lu, lv) in cascade `casc` reach
+    that neighbour page? v5 requests all four for every pixel. With the flag the kernel reach is
+    max(search = clamp(sun radius, 0.00025, 0.012), filter <= 0.010) x 4^-cascade window uv (`emit_vsm_pcss_shadow`
+    scales its filter cap by the cascade too while the flag is on), + 0.06 page for the normal offset and texel
+    snapping. All true when flag bit 4 is off."""
+    var on = emit_sota_shadow_flag(s, b_globals, SOTA_SHADOW_FLAG_TIGHT_MARKS)
+    var sc = s.select_f(
+        s.ieq(casc, s.uint(0)),
+        s.float(1.0),
+        s.select_f(s.ieq(casc, s.uint(1)), s.float(0.25), s.select_f(s.ieq(casc, s.uint(2)), s.float(0.0625), s.float(0.015625))),
+    )
+    var search = s.nclamp(s.load_float(b_globals, s.uint(51)), s.float(0.00025), s.float(0.012))
+    var m = s.fma(s.fmul(s.nmax(search, s.float(0.010)), sc), s.float(64.0), s.float(0.06))
+    var fx = s.fract(s.fmul(lu, s.float(64.0)))
+    var fy = s.fract(s.fmul(lv, s.float(64.0)))
+    var off = s.logical_not(on)
+    var out = List[UInt32]()
+    out.append(s.logical_or(off, s.flt(fx, m)))
+    out.append(s.logical_or(off, s.fgt(fx, s.fsub(s.float(1.0), m))))
+    out.append(s.logical_or(off, s.flt(fy, m)))
+    out.append(s.logical_or(off, s.fgt(fy, s.fsub(s.float(1.0), m))))
+    return out^
+
+
+def emit_sota_shadow_flag(mut s: AaaSpirvModule, b_globals: UInt32, flag: Int) -> UInt32:
+    """Bool SSA: Area G flag `flag` is set in `b_globals[234]`."""
+    var w = s.load_word(b_globals, s.uint(UInt32(SOTA_SHADOW_GLOBALS_FLAGS_WORD)))
+    return s.ine(s.bit_and(w, s.uint(UInt32(flag))), s.uint(0))
+
+
+def emit_sota_shadow_page_slot(
+    mut s: AaaSpirvModule, b_globals: UInt32, cascade: UInt32, lu: UInt32, lv: UInt32
+) -> UInt32:
+    """Table index (0..16383, toroidal slot) of the page holding cascade-local window coords (lu, lv) in [0, 1]."""
+    var lx = s.umin(s.uint(63), s.saturate_uint(s.fmul(lu, s.float(64.0))))
+    var ly = s.umin(s.uint(63), s.saturate_uint(s.fmul(lv, s.float(64.0))))
+    var qx = s.imul(s.bit_and(cascade, s.uint(1)), s.uint(64))
+    var qy = s.imul(s.shr(cascade, s.uint(1)), s.uint(64))
+    var slot = emit_sota_shadow_toroidal_remap(s, b_globals, s.iadd(qx, lx), s.iadd(qy, ly))
+    return s.iadd(s.imul(slot[1], s.uint(128)), slot[0])
+
+
+def emit_sota_shadow_select_resident_cascade(
+    mut s: AaaSpirvModule, b_globals: UInt32, b_vsm: UInt32, wx: UInt32, wy: UInt32, wz: UInt32, min_casc: UInt32 = 0
+) -> Tuple[UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32]:
+    """`_emit_select_vsm_cascade` that skips cascades whose page at the point is not resident (pool oversubscribed,
+    or a point no visible surface requested, e.g. fog) when the coarse fallback flag is on: the finest cascade that
+    fits *and* is mapped wins; with none mapped (or the flag off) it is v5's finest fitting cascade.
+    `min_casc` (SSA uint, 0 = none) prefers cascades at least that coarse (the fog's footprint-matched cascade)."""
+    var r = emit_sota_shadow_select_resident_cascade_ex(s, b_globals, b_vsm, wx, wy, wz, min_casc)
+    return (r[0], r[1], r[2], r[3], r[4], r[5], r[6])
+
+
+def emit_sota_shadow_select_resident_cascade_ex(
+    mut s: AaaSpirvModule, b_globals: UInt32, b_vsm: UInt32, wx: UInt32, wy: UInt32, wz: UInt32, min_casc: UInt32 = 0
+) -> Tuple[UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32]:
+    """As `emit_sota_shadow_select_resident_cascade`, plus [7] = Bool: some cascade has a resident page at the point.
+    Order: the finest resident cascade >= `min_casc`; else the coarsest resident one below it; else v5's finest
+    fitting cascade >= `min_casc` (unmapped: reads lit)."""
+    var mats = List[UInt32]()
+    mats.append(s.uint(56))
+    mats.append(s.uint(UInt32(VSM_GLOBALS_CASCADE_1_WORD)))
+    mats.append(s.uint(UInt32(VSM_GLOBALS_CASCADE_2_WORD)))
+    mats.append(s.uint(UInt32(VSM_GLOBALS_CASCADE_3_WORD)))
+    var biases = List[Float32]()
+    biases.append(0.012)
+    biases.append(0.036)
+    biases.append(0.11)
+    biases.append(0.35)
+    var fb_on = emit_sota_shadow_flag(s, b_globals, SOTA_SHADOW_FLAG_COARSE_FALLBACK)
+    var lcs = List[Tuple[UInt32, UInt32, UInt32, UInt32]]()
+    var fit = List[UInt32]()  # fits and >= min
+    var ok = List[UInt32]()  # fits, >= min, resident (or fallback off)
+    var res = List[UInt32]()  # fits, resident, fallback on (any cascade)
+    for k in range(4):
+        var lc = emit_mat4_mul_point(s, b_globals, mats[k], wx, wy, wz)
+        var f_any = _emit_cascade_fits(s, lc, Float32(0.99) if k == 3 else Float32(0.95))
+        var f = f_any
+        if min_casc != 0:
+            f = s.logical_and(f_any, s.uge(s.uint(UInt32(k)), min_casc))
+        var lu = s.fma(lc[0], s.float(0.5), s.float(0.5))
+        var lv = s.fma(s.fneg(lc[1]), s.float(0.5), s.float(0.5))
+        var e = s.load_word(b_vsm, emit_sota_shadow_page_slot(s, b_globals, s.uint(UInt32(k)), lu, lv))
+        var mapped = s.ine(s.bit_and(e, s.uint(0x10000)), s.uint(0))
+        lcs.append(lc)
+        fit.append(f)
+        ok.append(s.logical_and(f, s.logical_or(s.logical_not(fb_on), mapped)))
+        res.append(s.logical_and(fb_on, s.logical_and(f_any, mapped)))
+    # finest ok, else coarsest resident, else finest fit (else 3)
+    var c_ok = s.select_u(ok[0], s.uint(0), s.select_u(ok[1], s.uint(1), s.select_u(ok[2], s.uint(2), s.select_u(ok[3], s.uint(3), s.uint(4)))))
+    var c_res = s.select_u(res[3], s.uint(3), s.select_u(res[2], s.uint(2), s.select_u(res[1], s.uint(1), s.select_u(res[0], s.uint(0), s.uint(4)))))
+    var c_fit = s.select_u(fit[0], s.uint(0), s.select_u(fit[1], s.uint(1), s.select_u(fit[2], s.uint(2), s.uint(3))))
+    var casc = s.select_u(s.ult(c_ok, s.uint(4)), c_ok, s.select_u(s.ult(c_res, s.uint(4)), c_res, c_fit))
+    var sel = List[UInt32]()
+    for k in range(4):
+        sel.append(s.ieq(casc, s.uint(UInt32(k))))
+    var mat_off = s.select_u(sel[0], mats[0], s.select_u(sel[1], mats[1], s.select_u(sel[2], mats[2], mats[3])))
+    var lcx = s.select_f(sel[0], lcs[0][0], s.select_f(sel[1], lcs[1][0], s.select_f(sel[2], lcs[2][0], lcs[3][0])))
+    var lcy = s.select_f(sel[0], lcs[0][1], s.select_f(sel[1], lcs[1][1], s.select_f(sel[2], lcs[2][1], lcs[3][1])))
+    var lcz = s.select_f(sel[0], lcs[0][2], s.select_f(sel[1], lcs[1][2], s.select_f(sel[2], lcs[2][2], lcs[3][2])))
+    var n_bias = s.select_f(
+        sel[0], s.float(biases[0]), s.select_f(sel[1], s.float(biases[1]), s.select_f(sel[2], s.float(biases[2]), s.float(biases[3])))
+    )
+    var any_fit = s.logical_or(s.logical_or(fit[0], fit[1]), s.logical_or(fit[2], fit[3]))
+    var any_res = s.logical_or(s.logical_or(res[0], res[1]), s.logical_or(res[2], res[3]))
+    any_fit = s.logical_or(any_fit, any_res)
+    return (any_fit, casc, mat_off, lcx, lcy, lcz, n_bias, any_res)
+
+
+def emit_sota_shadow_mark_parents(
+    mut s: AaaSpirvModule, b_globals: UInt32, b_vsm: UInt32, casc: UInt32, wx: UInt32, wy: UInt32, wz: UInt32
+):
+    """Coarse fallback marking (only while the pool is oversubscribed): also request the page under the point in every
+    coarser cascade (a parent page covers 4 x 4 pages of the next finer cascade: ~7 % more requests, but coarse pages
+    are the expensive ones to raster, +60 pages cost Forest ~75 ms) so a dropped fine page has a resident parent."""
+    s.begin_if(emit_sota_shadow_flag(s, b_globals, SOTA_SHADOW_FLAG_PARENT_MARKS))
+    for k in range(1, 4):
+        s.begin_if(s.ult(casc, s.uint(UInt32(k))))
+        var lc = emit_mat4_mul_point(s, b_globals, s.uint(UInt32(vsm_cascade_globals_word_offset(k))), wx, wy, wz)
+        var lu = s.fma(lc[0], s.float(0.5), s.float(0.5))
+        var lv = s.fma(s.fneg(lc[1]), s.float(0.5), s.float(0.5))
+        var idx = emit_sota_shadow_page_slot(s, b_globals, s.uint(UInt32(k)), lu, lv)
+        s.store_word(b_vsm, s.iadd(s.uint(16384), idx), s.uint(1))
+        s.end_if()
+    s.end_if()
 
 
 def emit_sota_shadow_toroidal_remap(
@@ -167,6 +308,8 @@ struct VsmPageManager(Movable):
     var current_epoch: Int
     var cached_hits_last_frame: Int
     var newly_rendered_pages_last_frame: Int
+    var sota_coarse_first: Bool  # --- sota:shadow hook --- r3: allocate cascade 3 -> 0 (coarse fallback on)
+    var sota_dropped_last: Int  # --- sota:shadow hook --- r3: requested pages left unmapped (pool exhausted)
 
     def __init__(out self):
         self.virtual_to_phys = List[Int](length=VSM_VIRTUAL_PAGE_COUNT, fill=-1)
@@ -176,6 +319,8 @@ struct VsmPageManager(Movable):
         self.current_epoch = 1
         self.cached_hits_last_frame = 0
         self.newly_rendered_pages_last_frame = 0
+        self.sota_coarse_first = False  # --- sota:shadow hook ---
+        self.sota_dropped_last = 0  # --- sota:shadow hook ---
 
     def invalidate_all(mut self):
         for i in range(VSM_VIRTUAL_PAGE_COUNT):
@@ -211,8 +356,21 @@ struct VsmPageManager(Movable):
         # rest of this call, so later scans would fail too: skip them (identical output, O(1) per extra request
         # instead of O(VSM_PHYS_TILE_COUNT) when more pages are requested than the physical atlas holds).
         var phys_exhausted = False
+        self.sota_dropped_last = 0  # --- sota:shadow hook ---
+        # --- sota:shadow hook --- r3: touch every requested resident page before any allocation, so an allocation
+        # earlier in the scan cannot evict a page that is still requested later in it (with more requests than tiles
+        # that evict/re-render churn doubled the pages rendered per frame); the GPU path does the same (alloc1 / alloc3)
+        for v_t in range(VSM_VIRTUAL_PAGE_COUNT):
+            if table_words[VSM_VIRTUAL_PAGE_COUNT + v_t] != 0 and self.virtual_to_phys[v_t] >= 0:
+                self.phys_last_used[self.virtual_to_phys[v_t]] = self.current_epoch
+        # --- end sota:shadow hook ---
 
-        for v_idx in range(VSM_VIRTUAL_PAGE_COUNT):
+        for k_idx in range(VSM_VIRTUAL_PAGE_COUNT):
+            var v_idx = k_idx
+            if self.sota_coarse_first:  # --- sota:shadow hook --- cascade 3's quadrant first, then 2, 1, 0
+                var c_k = VSM_CASCADE_COUNT - 1 - (k_idx >> 12)
+                var q_k = vsm_cascade_quadrant_origin(c_k)
+                v_idx = (q_k[1] + ((k_idx & 4095) >> 6)) * VSM_VIRTUAL_PAGES_DIM + q_k[0] + (k_idx & 63)
             var req = table_words[VSM_VIRTUAL_PAGE_COUNT + v_idx]
             table_words[VSM_VIRTUAL_PAGE_COUNT + v_idx] = 0
             if req == 0:
@@ -233,6 +391,7 @@ struct VsmPageManager(Movable):
             if chosen_p < 0:
                 if phys_exhausted:
                     table_words[v_idx] = 0
+                    self.sota_dropped_last += 1  # --- sota:shadow hook ---
                     continue
                 # Find free physical tile or LRU tile not touched this frame
                 var oldest_ep = self.current_epoch
@@ -247,6 +406,7 @@ struct VsmPageManager(Movable):
                 if best_slot < 0:
                     phys_exhausted = True
                     table_words[v_idx] = 0
+                    self.sota_dropped_last += 1  # --- sota:shadow hook ---
                     continue
                 chosen_p = best_slot
                 var evicted_v = self.phys_to_virtual[chosen_p]
@@ -562,9 +722,16 @@ def vsm_mark_pages_shader() -> List[UInt32]:
     mk_x.append(s.iadd(qx, lx_r)); mk_y.append(pvy_c)
     mk_x.append(pvx_c); mk_y.append(s.iadd(qy, ly_u0))
     mk_x.append(pvx_c); mk_y.append(s.iadd(qy, ly_d0))
+    # r3 (flag bit 4): a neighbour page is only requested when the PCSS kernel can reach it from this pixel
+    var nb_need = emit_sota_shadow_neighbour_needs(s, b_globals, casc, lu_c, lv_c)
     for mk in range(5):
+        if mk > 0:
+            s.begin_if(nb_need[mk - 1])
         var slot = emit_sota_shadow_toroidal_remap(s, b_globals, mk_x[mk], mk_y[mk])
         s.store_word(b_vsm, s.iadd(s.uint(16384), s.iadd(s.imul(slot[1], s.uint(128)), slot[0])), s.uint(1))
+        if mk > 0:
+            s.end_if()
+    emit_sota_shadow_mark_parents(s, b_globals, b_vsm, casc, wx, wy, wz)  # r3: coarse fallback pages
     # --- end sota:shadow hook ---
     s.end_if()
     s.end_if()
@@ -807,7 +974,7 @@ def emit_vsm_pcss_shadow(
     var casc_flag = s.load_word(b_globals, s.uint(UInt32(VSM_GLOBALS_CASCADE_FLAG_WORD)))
     var is_casc = s.ine(casc_flag, s.uint(0))
 
-    var sel = _emit_select_vsm_cascade(s, b_globals, wx, wy, wz)
+    var sel = emit_sota_shadow_select_resident_cascade(s, b_globals, b_vsm, wx, wy, wz)  # sota:shadow hook (r3)
     var casc_u = s.select_u(is_casc, sel[1], s.uint(0))
     var mat_off = s.select_u(is_casc, sel[2], s.uint(56))
     var n_bias = s.select_f(is_casc, sel[6], s.float(0.012))
@@ -873,7 +1040,12 @@ def emit_vsm_pcss_shadow(
     var avg_blk = s.fdiv(s.load_f(blk_sum), bcnt)
     var penumbra_ratio = s.fdiv(s.nmax(s.float(0.0), s.fsub(z_rec, avg_blk)), s.nmax(s.float(0.04), avg_blk))
     var min_flt = s.select_f(is_casc, s.float(0.00015), s.float(0.000076))
-    var filter_r = s.nclamp(s.fmul(penumbra_ratio, search_r), min_flt, s.float(0.010))
+    # --- sota:shadow hook --- r3 tight marks: the filter cap scales with the cascade like the search radius (a
+    # constant 0.32 m world penumbra cap; v5's 0.010 uv cap was 20 m in cascade 3), so the marked margin bounds it
+    var flt_cap = s.select_f(
+        emit_sota_shadow_flag(s, b_globals, SOTA_SHADOW_FLAG_TIGHT_MARKS), s.fmul(s.float(0.010), casc_uv_sc), s.float(0.010)
+    )
+    var filter_r = s.nclamp(s.fmul(penumbra_ratio, search_r), s.nmin(min_flt, flt_cap), flt_cap)
 
     # 2. 12-Tap Golden-Angle Vogel-Disk PCF
     var lit_sum = s.fvar(s.float(0.0))

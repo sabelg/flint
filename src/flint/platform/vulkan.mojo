@@ -3414,6 +3414,23 @@ struct VulkanGpu(Copyable, Movable):
             _ = call6(self.fn_push_constants, commands, pipeline_layout, all_stages, 0, len(push) * 4, Int(push.unsafe_ptr()))
         _ = call4(self.fn_dispatch, commands, max(1, groups_x), max(1, groups_y), max(1, groups_z))
 
+    # --- sota:shadow hook --- `dispatch_aaa` with the group counts read from a GPU buffer (VkDispatchIndirectCommand)
+    def dispatch_aaa_indirect(
+        mut self, frame: Int, pipeline: Int, pipeline_layout: Int, descriptor_set: Int, push: List[UInt32],
+        arguments: GpuBuffer, offset: Int,
+    ):
+        self.rewind()
+        var commands = self.command_buffers[frame]
+        var sets = self.scratch(8)
+        put64(sets, descriptor_set)
+        var all_stages = Int(STAGE_VERTEX_SHADER | STAGE_FRAGMENT_SHADER | STAGE_COMPUTE_SHADER)
+        _ = call3(self.fn_bind_pipeline, commands, BIND_POINT_COMPUTE, self.sota_e_resolve(pipeline))
+        _ = call8(self.fn_bind_descriptor_sets, commands, BIND_POINT_COMPUTE, pipeline_layout, 0, 1, sets, 0, 0)
+        if len(push) > 0:
+            _ = call6(self.fn_push_constants, commands, pipeline_layout, all_stages, 0, len(push) * 4, Int(push.unsafe_ptr()))
+        _ = call3(self.fn_dispatch_indirect, commands, arguments.vk_buffer, offset)
+    # --- end sota:shadow hook ---
+
     def draw(mut self, frame: Int, vertex_count: Int, instance_count: Int = 1, first_vertex: Int = 0, first_instance: Int = 0):
         self.rewind()
         _ = call5(

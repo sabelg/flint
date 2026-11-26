@@ -1,4 +1,4 @@
-"""Area G (shadows) render SOTA, round 2 (`test_flint_v5_sota_shadow.mojo`).
+"""Area G (shadows) render SOTA, rounds 2 and 3 (`test_flint_v5_sota_shadow.mojo`).
 
 1. CPU: toroidal clipmap page addressing (slot <-> window-local round trip, scroll invalidation = only the pages that
    enter the window, depth-snap index).
@@ -8,6 +8,14 @@
    - Toroidal VSM: a camera dolly re-renders far fewer pages than v5 cascade-relative addressing and converges to the
      same image as a cold start at the final camera.
    - Screen-space contact shadows, GPU page packing and RT-shadow comparisons (see the functions below).
+3. Round 3 (GPU):
+   - GPU page path: pre-sized draw lists + same-frame retry rounds leave no page incomplete; the instance pre-cull
+     skips most caster items on a small update.
+   - Pool oversubscription on a wide outdoor view: pages past the 1,024-tile pool fall back to a coarser resident
+     cascade instead of reading lit (lit-leak count and FLIP against RT shadows, fallback on vs off).
+   - Froxel fog under large casters: the fog's one-tap VSM lookup took the finest cascade (unmapped for fog-only
+     points -> lit) and sampled one texel per froxel (blocky volumes, a checker under big boxes); the footprint
+     cascade + resident fallback + 4 soft taps remove it (high-frequency energy of the fog, before vs after).
 """
 from std.collections import List
 from std.ffi import external_call
@@ -46,7 +54,7 @@ def _assert(cond: Bool, msg: String):
 
 def _eval_dir() -> String:
     var home = getenv("HOME", "/tmp")
-    var d = home + "/flint-models/_eval/render/G-r2"
+    var d = home + "/flint-models/_eval/render/G-r3"
     _ = make_dirs(d)
     return d + "/"
 
@@ -164,6 +172,7 @@ struct ShadowScene(Movable):
     var mat_g: Int
     var mat_p: Int
     var mat_b: Int
+    var big_casters: Bool  # r3: a 14 m roof slab and two 10 m walls (fog checker scene)
 
     def __init__(out self, W: Int, H: Int, max_draws: Int = 131072):
         self.ren = FlintAaaVulkanRenderer(width=W, height=H, max_draws=max_draws)
@@ -175,6 +184,7 @@ struct ShadowScene(Movable):
         self.mat_g = -1
         self.mat_p = -1
         self.mat_b = -1
+        self.big_casters = False
         if not self.ok:
             return
         self.ren.tsr_history_weight = Float32(0.0)
@@ -212,6 +222,10 @@ struct ShadowScene(Movable):
                     self.ren.draw_instance(self.ball, trs(Vec3(p.x, 0.75, p.z), Quat(), Vec3(0.6, 0.6, 0.6)), uniform_scale=0.6)
                 # thin contact casters: 3 cm slabs lying on the ground (the VSM bias loses most of their shadow)
                 self.ren.draw_instance(self.tile, trs(Vec3(p.x + 1.3, 0.035, p.z + 0.4), Quat(), Vec3(0.35, 0.03, 0.22)))
+        if self.big_casters:
+            self.ren.draw_instance(self.pillar, trs(Vec3(2.0, 6.0, 6.0), Quat(), Vec3(7.0, 0.25, 7.0)))
+            self.ren.draw_instance(self.pillar, trs(Vec3(-9.0, 5.0, 14.0), Quat(), Vec3(0.4, 5.0, 6.0)))
+            self.ren.draw_instance(self.pillar, trs(Vec3(12.0, 5.0, 16.0), Quat(), Vec3(5.0, 5.0, 0.4)))
 
     def frame(mut self, eye: Vec3, tgt: Vec3) -> Bool:
         self.ren.begin_frame(eye, tgt, fov_y_deg=60.0, near_z=0.05)
@@ -403,6 +417,10 @@ def test_gpu_contact_vs_rt():
 
 struct PagesRun(Copyable, Movable):
     var px: List[UInt32]
+    var overflow: Int  # page x draw pairs that did not fit pass A's lists
+    var incomplete: Int  # ... that did not fit the retry rounds either (pages left incomplete for a frame)
+    var dolly_items: Int  # caster items uploaded on the last dolly frame with dirty pages
+    var dolly_culled: Int  # ... that survived the instance pre-cull
     var cold_wall_ms: Float64  # first frame (every page dirty)
     var move_wall_ms: Float64  # median wall time of the dolly frames
     var move_cpu_vsm_ms: Float64
@@ -413,6 +431,10 @@ struct PagesRun(Copyable, Movable):
 
     def __init__(out self):
         self.px = List[UInt32]()
+        self.overflow = 0
+        self.incomplete = 0
+        self.dolly_items = 0
+        self.dolly_culled = 0
         self.cold_wall_ms = 0.0
         self.move_wall_ms = 0.0
         self.move_cpu_vsm_ms = 0.0
@@ -466,6 +488,9 @@ def _pages_run(gpu: Bool, W: Int, H: Int) -> PagesRun:
         cpu.append(sc.ren.last_cpu_vsm_ms)
         gv.append(_vsm_gpu_ms(sc))
         out.pages += sc.ren.last_vsm_dirty_pages
+        if gpu and sc.ren.sota_shadow_gpu.dirty_last > 0:
+            out.dolly_items = sc.ren.sota_shadow_gpu.items_last
+            out.dolly_culled = sc.ren.sota_shadow_gpu.culled_items_last
     # settle at the last camera, then read back
     var tl = Float32(29) * Float32(0.31)
     var eye_l = Vec3(-8.0 + tl, 2.0, -10.0 + tl * 0.6)
@@ -476,10 +501,13 @@ def _pages_run(gpu: Bool, W: Int, H: Int) -> PagesRun:
     out.move_cpu_vsm_ms = _median(cpu)
     out.move_gpu_vsm_ms = _median(gv)
     out.static_gpu_vsm_ms = _median(st)
+    out.overflow = sc.ren.sota_shadow_gpu.overflow_total
+    out.incomplete = sc.ren.sota_shadow_gpu.overflow_retry_total
     if gpu:
         print("  GPU path: buffer items " + String(sc.ren.sota_shadow_gpu.item_cap) + ", draws/list "
-              + String(sc.ren.sota_shadow_gpu.cmd_cap) + ", max wanted " + String(sc.ren.sota_shadow_gpu.wanted_max)
-              + ", overflowed page draws " + String(sc.ren.sota_shadow_gpu.overflow_total) + ", grows "
+              + String(sc.ren.sota_shadow_gpu.cap_opaque) + "/" + String(sc.ren.sota_shadow_gpu.cap_alpha) + ", max wanted " + String(sc.ren.sota_shadow_gpu.wanted_max)
+              + ", overflowed page draws " + String(sc.ren.sota_shadow_gpu.overflow_total) + " (left incomplete after the retry pass "
+              + String(sc.ren.sota_shadow_gpu.overflow_retry_total) + ", retry frames " + String(sc.ren.sota_shadow_gpu.retry_frames) + "), grows "
               + String(sc.ren.sota_shadow_gpu.grows))
     sc.shutdown()
     return out^
@@ -511,7 +539,191 @@ def test_gpu_pages():
     # path drops them in table order, the GPU path drops the coarsest cascades first. Hence a tolerance, not equality.
     _assert(d.over_tolerance <= W * H // 100 and d.flip_mean < 0.01, "GPU page path matches the CPU path: " + d.summary())
     _assert(gpu.pages > 0, "GPU page path rendered pages")
+    print("  r3: pass-A overflow " + String(gpu.overflow) + " page draws, left incomplete after the retry rounds "
+          + String(gpu.incomplete) + "; dolly pre-cull kept " + String(gpu.dolly_culled) + " of " + String(gpu.dolly_items) + " items")
+    _assert(gpu.incomplete == 0, "pre-sized lists + retry rounds: no page left incomplete")
+    _assert(gpu.dolly_items > 0 and gpu.dolly_culled * 2 < gpu.dolly_items, "instance pre-cull skips most items on a small update")
     print("[PASS] GPU-driven VSM pages match the CPU path")
+
+
+# ---------------------------------------------------------------------------------------------
+# 3. Round 3
+# ---------------------------------------------------------------------------------------------
+struct R3Cfg(Copyable, Movable):
+    var fallback: Bool  # coarse fallback + fog requests + soft fog taps (the r3 fixes)
+    var rt: Bool
+    var fog: Bool
+    var sun: Bool
+    var big: Bool
+    var gpu_pages: Bool  # GPU page path, with toroidal addressing
+
+    def __init__(
+        out self, fallback: Bool, rt: Bool = False, fog: Bool = False, sun: Bool = True, big: Bool = False,
+        gpu_pages: Bool = False,
+    ):
+        self.fallback = fallback
+        self.rt = rt
+        self.fog = fog
+        self.sun = sun
+        self.big = big
+        self.gpu_pages = gpu_pages
+
+
+struct R3Run(Copyable, Movable):
+    var px: List[UInt32]
+    var dropped: Int  # requested pages that found no physical page (max over the run)
+    var dropped_last: Int  # ... in the last frame (steady state)
+    var rt_ok: Bool
+
+    def __init__(out self):
+        self.px = List[UInt32]()
+        self.dropped = 0
+        self.dropped_last = 0
+        self.rt_ok = False
+
+
+def _r3_run(cfg: R3Cfg, W: Int, H: Int, eye: Vec3, tgt: Vec3) -> R3Run:
+    var out = R3Run()
+    var sc = ShadowScene(W, H)
+    if not sc.ok:
+        return out^
+    sc.big_casters = cfg.big
+    sc.ren.tsr_history_weight = Float32(0.9)
+    sc.ren.sota_shadow.toroidal = cfg.gpu_pages  # CPU path: v5 addressing (the defaults; see test_gpu_oversubscription)
+    sc.ren.sota_shadow.gpu_pages = cfg.gpu_pages
+    sc.ren.sota_shadow.coarse_fallback = cfg.fallback
+    sc.ren.sota_shadow.fog_requests = False  # default off (refresh cost, see `SotaShadowState.fog_requests`)
+    sc.ren.sota_shadow.fog_soft = cfg.fallback
+    out.rt_ok = sc.ren.vk.has_ray_query
+    sc.ren.enable_rt_shadows = cfg.rt and out.rt_ok
+    sc.ren.enable_froxel_fog = cfg.fog
+    if cfg.fog:
+        sc.ren.fog_density = Float32(0.03)
+    if not cfg.sun:
+        sc.ren.sun_radiance = Vec3(0.0, 0.0, 0.0)
+    var drop = 0
+    for _ in range(36):
+        _ = sc.frame(eye, tgt)
+        drop = max(drop, sc.ren.sota_shadow.pool_drops_last)
+    out.px = sc.ren.readback_pixels()
+    out.dropped = drop
+    out.dropped_last = sc.ren.sota_shadow.pool_drops_last
+    sc.shutdown()
+    return out^
+
+
+def _luma(p: UInt32) -> Float64:
+    var r = Float64(Int(p & 0xFF))
+    var g = Float64(Int((p >> 8) & 0xFF))
+    var b = Float64(Int((p >> 16) & 0xFF))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _lit_leaks(px: List[UInt32], ref_px: List[UInt32], W: Int, H: Int) -> Int:
+    """Pixels clearly brighter than the RT-shadow reference (a shadowed point that reads lit)."""
+    var n = 0
+    for i in range(W * H):
+        var a = _luma(px[i])
+        var r = _luma(ref_px[i])
+        if a > r * 1.35 + 18.0:
+            n += 1
+    return n
+
+
+def _hf_energy(px: List[UInt32], W: Int, H: Int, y0: Int, y1: Int) -> Float64:
+    """Mean |luma - 5x5 box mean| over rows [y0, y1): blockiness / checker energy."""
+    var sum = 0.0
+    var n = 0
+    for y in range(max(2, y0), min(H - 2, y1)):
+        for x in range(2, W - 2):
+            var m = 0.0
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    m += _luma(px[(y + dy) * W + x + dx])
+            sum += abs(_luma(px[y * W + x]) - m / 25.0)
+            n += 1
+    return sum / Float64(max(1, n))
+
+
+def test_gpu_oversubscription():
+    """Wide outdoor view at 1280x720: the visible cascade-0/1 pages alone outnumber the 1,024-tile pool. v5 left the
+    pages past the pool unmapped and they read lit (half the field loses its shadows). r3: under pool pressure the
+    coarser cascades are requested too and allocate first (taking requested cascade-0 tiles if they must), and the
+    samplers fall back to the finest resident cascade. Lit leaks / FLIP against RT shadows, fallback on vs off."""
+    var W = 1280
+    var H = 720
+    var eye = Vec3(-10.0, 8.0, -12.0)
+    var tgt = Vec3(6.0, 0.0, 10.0)
+    var on = _r3_run(R3Cfg(True, gpu_pages=True), W, H, eye, tgt)
+    if len(on.px) == 0:
+        print("[SKIP] Vulkan unavailable: oversubscription test skipped")
+        return
+    var off = _r3_run(R3Cfg(False, gpu_pages=True), W, H, eye, tgt)
+    var cpu_on = _r3_run(R3Cfg(True), W, H, eye, tgt)
+    var cpu_off = _r3_run(R3Cfg(False), W, H, eye, tgt)
+    _ = write_png(_eval_dir() + "oversub_gpu_fallback_on.png", on.px, W, H, stamped=False)
+    _ = write_png(_eval_dir() + "oversub_gpu_fallback_off.png", off.px, W, H, stamped=False)
+    _ = write_png(_eval_dir() + "oversub_cpu_fallback_on.png", cpu_on.px, W, H, stamped=False)
+    _ = write_png(_eval_dir() + "oversub_cpu_fallback_off.png", cpu_off.px, W, H, stamped=False)
+    print("  wide view: requested pages past the pool (last frame): GPU path off " + String(off.dropped_last) + ", on "
+          + String(on.dropped_last) + "; CPU path off " + String(cpu_off.dropped_last) + ", on " + String(cpu_on.dropped_last))
+    _assert(off.dropped_last > 0, "the wide view oversubscribes the pool (else the test proves nothing)")
+    if not on.rt_ok:
+        var d = compare_pixels(on.px, off.px, W, H, 6)
+        print("  no ray query: fallback on vs off " + d.summary())
+        print("[PASS] pool oversubscription (no RT reference)")
+        return
+    var rt = _r3_run(R3Cfg(True, rt=True), W, H, eye, tgt)
+    _ = write_png(_eval_dir() + "oversub_rt_reference.png", rt.px, W, H, stamped=False)
+    var l_on = _lit_leaks(on.px, rt.px, W, H)
+    var l_off = _lit_leaks(off.px, rt.px, W, H)
+    var l_con = _lit_leaks(cpu_on.px, rt.px, W, H)
+    var l_coff = _lit_leaks(cpu_off.px, rt.px, W, H)
+    var f_on = flip_mean(flip_error_map(rt.px, on.px, W, H))
+    var f_off = flip_mean(flip_error_map(rt.px, off.px, W, H))
+    var f_con = flip_mean(flip_error_map(rt.px, cpu_on.px, W, H))
+    var f_coff = flip_mean(flip_error_map(rt.px, cpu_off.px, W, H))
+    print("  lit leaks vs RT shadows (px): GPU path off " + String(l_off) + ", on " + String(l_on) + "; CPU path off "
+          + String(l_coff) + ", on " + String(l_con))
+    print("  FLIP vs RT shadows: GPU path off " + _fmt(f_off) + ", on " + _fmt(f_on) + "; CPU path off " + _fmt(f_coff)
+          + ", on " + _fmt(f_con))
+    # GPU page path: under pressure the parents are requested, allocate first (taking cached cascade-0 tiles if they
+    # must) and the unmapped fine pixels sample them. CPU path: only the samplers' fallback (see `update_pressure`),
+    # which can only change pixels whose page is unmapped.
+    # (the lit-leak count of the GPU path varies +-20 % run to run with the need-list order; FLIP is stable)
+    _assert(f_on + 0.004 < f_off, "GPU page path: the coarse fallback moves the image towards RT shadows")
+    _assert(f_con <= f_coff + 0.001 and l_con <= l_coff + W * H // 2000, "CPU path: the sampler fallback does not hurt")
+    print("[PASS] pool oversubscription: pages past the pool fall back to a resident coarser cascade")
+
+
+def test_gpu_fog_shadows():
+    """Froxel fog under a roof slab and walls: blocky shadow volumes / checker before the fix, smooth after."""
+    var W = 480
+    var H = 270
+    var eye = Vec3(-6.0, 1.8, -8.0)
+    var tgt = Vec3(3.0, 3.5, 10.0)
+    var fixed = _r3_run(R3Cfg(True, fog=True, big=True), W, H, eye, tgt)
+    if len(fixed.px) == 0:
+        print("[SKIP] Vulkan unavailable: fog shadow test skipped")
+        return
+    var v5 = _r3_run(R3Cfg(False, fog=True, big=True), W, H, eye, tgt)
+    var nofog = _r3_run(R3Cfg(True, fog=False, big=True), W, H, eye, tgt)
+    var sun_off = _r3_run(R3Cfg(True, fog=True, big=True, sun=False), W, H, eye, tgt)
+    _ = write_png(_eval_dir() + "fog_fixed.png", fixed.px, W, H, stamped=False)
+    _ = write_png(_eval_dir() + "fog_v5.png", v5.px, W, H, stamped=False)
+    _ = write_png(_eval_dir() + "fog_off.png", nofog.px, W, H, stamped=False)
+    _ = write_png(_eval_dir() + "fog_sun_off.png", sun_off.px, W, H, stamped=False)
+    # the upper half is mostly air (fog in front of the sky and the roof's underside), where the blocks showed
+    var e_fix = _hf_energy(fixed.px, W, H, 0, H // 2)
+    var e_v5 = _hf_energy(v5.px, W, H, 0, H // 2)
+    var e_nf = _hf_energy(nofog.px, W, H, 0, H // 2)
+    var d_sun = compare_pixels(fixed.px, sun_off.px, W, H, 6)
+    var d_v5 = compare_pixels(fixed.px, v5.px, W, H, 6)
+    print("  fog high-frequency energy (upper half): v5 " + _fmt(e_v5) + ", fixed " + _fmt(e_fix) + ", no fog " + _fmt(e_nf)
+          + "; fixed vs v5 " + d_v5.summary() + "; sun on vs off " + d_sun.summary())
+    _assert(e_fix <= e_v5, "the fix does not add fog shadow noise")
+    _assert(d_sun.over_tolerance > W * H // 50, "the sun lights the fog (in-scatter on)")
+    print("[PASS] froxel fog shadows: footprint cascade + resident fallback + soft taps")
 
 
 def main():
@@ -526,4 +738,8 @@ def main():
         test_gpu_contact_vs_rt()
     if only == "" or only == "pages":
         test_gpu_pages()
+    if only == "" or only == "oversub":
+        test_gpu_oversubscription()
+    if only == "" or only == "fog":
+        test_gpu_fog_shadows()
     print("[PASS] test_flint_v5_sota_shadow")
