@@ -57,6 +57,7 @@ from flint.render.aaa_visbuffer import (
 )
 from flint.render.aaa_render_graph import AaaResidencyStreamer
 from flint.platform.os import get_time
+from flint.render.sota_geometry_visid import emit_sota_vis_meshlet, emit_sota_vis_prim
 
 comptime SOTA_VT_PAGE: Int = 128
 comptime SOTA_VT_BORDER: Int = 4
@@ -188,9 +189,9 @@ def sota_vt_feedback_shader() -> List[UInt32]:
     var vis1 = s.extract_u(vis, 1)
     s.return_if(s.ieq(vis0, s.uint(0)))
     var inst_id = s.shr(vis0, s.uint(17))
-    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
+    var ml_id = emit_sota_vis_meshlet(s, vis0, vis1)  # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
     var mat_id = s.shr(vis1, s.uint(16))
-    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
+    var local_prim = emit_sota_vis_prim(s, vis1)
     var code_f = s.load_float(b_materials, s.iadd(s.imul(mat_id, s.uint(UInt32(SOTA_VT_MATERIAL_WORDS))), s.uint(UInt32(SOTA_VT_MATERIAL_CODE_WORD))))
     s.return_if(s.fge(code_f, s.float(0.0)))
     var code = s.uint_from_float(s.fadd(s.fsub(s.fneg(code_f), s.float(1.0)), s.float(0.5)))

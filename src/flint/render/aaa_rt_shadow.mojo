@@ -50,6 +50,7 @@ from flint.render.aaa_raytracing import (
     RAY_FLAG_TERMINATE_ON_FIRST_HIT_KHR,
     _emit_rt_candidate_alpha_loop,
 )
+from flint.render.sota_geometry_visid import emit_sota_vis_meshlet, emit_sota_vis_prim
 
 comptime AAA_SUN_SHADOW_RAYS: Int = 2  # occlusion rays per pixel over the sun's disc
 comptime AAA_RT_SHADOW_RAW_WORDS: Int = 8
@@ -142,8 +143,8 @@ def emit_visbuffer_surface(
     and returns the world position and the interpolated vertex normal turned toward the ray origin:
     `(wx, wy, wz, nx, ny, nz)`."""
     var inst_id = s.shr(vis0, s.uint(17))
-    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
-    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
+    var ml_id = emit_sota_vis_meshlet(s, vis0, vis1)  # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
+    var local_prim = emit_sota_vis_prim(s, vis1)
     var first_tri = s.load_word(b_meshlets, s.iadd(s.imul(ml_id, s.uint(12)), s.uint(8)))
     var idx_off = s.imul(s.iadd(first_tri, local_prim), s.uint(3))
     var v0_off = s.imul(s.load_word(b_indices, idx_off), s.uint(12))

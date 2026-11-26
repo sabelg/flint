@@ -26,6 +26,7 @@ from flint.render.spirv import (
     OP_STORE,
     emit,
 )
+from flint.render.sota_geometry_visid import emit_sota_draw_decode, emit_sota_vis_payload, emit_sota_draw_first_instance, emit_sota_draw_vertex_offset
 
 # Unified AAA Descriptor Set 0 Layout
 comptime BIND_AAA_VERTICES: Int = 0      # AAA_VERTEX_WORDS (12) per vertex
@@ -294,9 +295,10 @@ def meshlet_cull_shader() -> List[UInt32]:
     )
     var cand_total = s.load_word(b_candidates, s.uint(0))
     s.begin_if(s.logical_and(s.ult(cand_id, cand_total), s.ult(cand_id, max_draws)))
-    var cand_packed = s.load_word(b_candidates, s.iadd(s.uint(4), cand_id))
-    s.store(inst_idx_var, s.shr(cand_packed, s.uint(17)))
-    s.store(ml_id_var, s.bit_and(cand_packed, s.uint(0x1FFFF)))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): candidates are (inst, meshlet) word pairs
+    var cand_w = s.iadd(s.uint(4), s.imul(cand_id, s.uint(2)))
+    s.store(inst_idx_var, s.load_word(b_candidates, cand_w))
+    s.store(ml_id_var, s.load_word(b_candidates, s.iadd(cand_w, s.uint(1))))
     s.store(valid_var, s.uint(1))
     s.end_if()
     s.end_if()
@@ -430,8 +432,10 @@ def meshlet_cull_shader() -> List[UInt32]:
     s.begin_if(s.logical_and(is_occluded, is_p1))
     var cand_slot = s.atomic_add_word(b_candidates, s.uint(0), s.uint(1))
     s.begin_if(s.ult(cand_slot, max_draws))
-    var packed_cand = s.bit_or(s.shl(inst_idx, s.uint(17)), s.bit_and(ml_id, s.uint(0x1FFFF)))
-    s.store_word(b_candidates, s.iadd(s.uint(4), cand_slot), packed_cand)
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): candidates are (inst, meshlet) word pairs
+    var cand_wo = s.iadd(s.uint(4), s.imul(cand_slot, s.uint(2)))
+    s.store_word(b_candidates, cand_wo, inst_idx)
+    s.store_word(b_candidates, s.iadd(cand_wo, s.uint(1)), ml_id)
     s.end_if()
     s.end_if()
     s.return_if(is_occluded)
@@ -445,11 +449,13 @@ def meshlet_cull_shader() -> List[UInt32]:
     var cmd_base = s.iadd(s.uint(4), s.imul(slot, s.uint(5)))
     var idx_cnt = s.imul(tri_cnt, s.uint(3))
     var first_idx = s.imul(first_tri, s.uint(3))
-    var packed_first_inst = s.bit_or(s.shl(inst_idx, s.uint(17)), s.bit_and(ml_id, s.uint(0x1FFFF)))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): firstInstance carries meshlet bits 0..16, vertexOffset bits 17..23 (<< 24)
+    var packed_first_inst = emit_sota_draw_first_instance(s, inst_idx, ml_id)
+    var draw_vtx_off = emit_sota_draw_vertex_offset(s, ml_id)
     s.store_word(b_indirect, cmd_base, idx_cnt)
     s.store_word(b_indirect, s.iadd(cmd_base, s.uint(1)), s.uint(1))
     s.store_word(b_indirect, s.iadd(cmd_base, s.uint(2)), first_idx)
-    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(3)), s.uint(0))
+    s.store_word(b_indirect, s.iadd(cmd_base, s.uint(3)), draw_vtx_off)
     s.store_word(b_indirect, s.iadd(cmd_base, s.uint(4)), packed_first_inst)
     s.end_if()
 
@@ -470,10 +476,11 @@ def visbuffer_vertex_shader() -> List[UInt32]:
     _ = b_indices
     var out_vis = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec2, location=0, flat=True)
 
-    var real_vtx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): hi bits ride in vertexOffset / firstVertex
+    var draw_ids = emit_sota_draw_decode(s, s.vertex_index(), s.instance_index())
+    var real_vtx = draw_ids[0]
+    var inst_id = draw_ids[1]
+    var ml_id = draw_ids[2]
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
@@ -500,9 +507,11 @@ def visbuffer_vertex_shader() -> List[UInt32]:
     var cy_jit = s.fma(jy, clip[3], clip[1])
     s.write_clip_position(cx_jit, cy_jit, clip[2], clip[3])
 
-    # VisBuffer payload: word0 = (inst_id << 17) | min(ml_id + 1, 0x1FFFF), word1_base = (final_mat << 16)
-    var pay0 = s.bit_or(s.shl(inst_id, s.uint(17)), s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x1FFFF)))
-    var pay1_base = s.shl(final_mat, s.uint(16))
+    # VisBuffer payload: word0 = inst << 17 | (ml % 131071 + 1), word1_base = mat << 16 | (ml / 131071) << 8
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
+    var vis_pay = emit_sota_vis_payload(s, inst_id, ml_id, final_mat)
+    var pay0 = vis_pay[0]
+    var pay1_base = vis_pay[1]
     emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
 
     return s.finish()
@@ -541,10 +550,11 @@ def visbuffer_alphamask_vertex_shader() -> List[UInt32]:
     var out_uv = s.add_stage_io(STORAGE_OUTPUT, s.type_vec2, location=1, flat=False)
     var out_talb = s.add_stage_io(STORAGE_OUTPUT, s.type_uint, location=2, flat=True)
 
-    var real_vtx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): hi bits ride in vertexOffset / firstVertex
+    var draw_ids = emit_sota_draw_decode(s, s.vertex_index(), s.instance_index())
+    var real_vtx = draw_ids[0]
+    var inst_id = draw_ids[1]
+    var ml_id = draw_ids[2]
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
@@ -575,8 +585,10 @@ def visbuffer_alphamask_vertex_shader() -> List[UInt32]:
     var cy_jit = s.fma(jy, clip[3], clip[1])
     s.write_clip_position(cx_jit, cy_jit, clip[2], clip[3])
 
-    var pay0 = s.bit_or(s.shl(inst_id, s.uint(17)), s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x1FFFF)))
-    var pay1_base = s.shl(final_mat, s.uint(16))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
+    var vis_pay = emit_sota_vis_payload(s, inst_id, ml_id, final_mat)
+    var pay0 = vis_pay[0]
+    var pay1_base = vis_pay[1]
     emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
     emit(s.code, OP_STORE, out_uv[1], s.vec2(uv_u, uv_v))
     emit(s.code, OP_STORE, out_talb[1], t_alb)

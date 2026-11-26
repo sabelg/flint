@@ -38,6 +38,7 @@ from flint.render.aaa_visbuffer import (
     emit_mat4_mul_point,
     emit_instance_point,
 )
+from flint.render.sota_geometry_visid import emit_sota_draw_decode, emit_sota_vis_payload
 
 comptime VSM_VIRTUAL_PAGES_DIM: Int = 128         # 128 x 128 = 16,384 virtual pages
 comptime VSM_VIRTUAL_PAGE_COUNT: Int = 16384
@@ -577,10 +578,11 @@ def vsm_page_vertex_shader() -> List[UInt32]:
     var b_instances = s.buffer(BIND_AAA_INSTANCES)
     var b_globals = s.buffer(BIND_AAA_GLOBALS)
 
-    var v_idx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): hi bits ride in vertexOffset / firstVertex
+    var draw_ids = emit_sota_draw_decode(s, s.vertex_index(), s.instance_index())
+    var v_idx = draw_ids[0]
+    var inst_id = draw_ids[1]
+    var ml_id = draw_ids[2]
 
     var local_prim = s.udiv(v_idx, s.uint(3))
     var corner = s.umod(v_idx, s.uint(3))
@@ -626,10 +628,11 @@ def vsm_alphamask_vertex_shader() -> List[UInt32]:
     var out_uv = s.add_stage_io(STORAGE_OUTPUT, s.type_vec2, location=0, flat=False)
     var out_talb = s.add_stage_io(STORAGE_OUTPUT, s.type_uint, location=1, flat=True)
 
-    var v_idx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): hi bits ride in vertexOffset / firstVertex
+    var draw_ids = emit_sota_draw_decode(s, s.vertex_index(), s.instance_index())
+    var v_idx = draw_ids[0]
+    var inst_id = draw_ids[1]
+    var ml_id = draw_ids[2]
 
     var local_prim = s.udiv(v_idx, s.uint(3))
     var corner = s.umod(v_idx, s.uint(3))

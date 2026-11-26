@@ -21,6 +21,14 @@ from flint.render.sota_geometry_cull import (
     sota_hiz_reduce_shader,
 )
 from flint.render.spirv_validate import validate_spirv_module
+from flint.render.sota_geometry_visid import (
+    SOTA_MAX_GLOBAL_MESHLETS_WIDE,
+    sota_draw_pack,
+    sota_draw_unpack,
+    sota_vis_decode,
+    sota_vis_encode,
+)
+from flint.studio.picking import VisBufferGpuPicker
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.core.jobs import JobPool, default_worker_count
 from flint.render.sota_geometry_dag_cache import (
@@ -1061,7 +1069,8 @@ def _non_bg(px: List[UInt32], bg: List[UInt32], i: Int) -> Bool:
 
 
 def test_gpu_geometry_growth():
-    """Six 180k-vertex spheres need ~2x the 32 MB vertex buffer: it grows, every sphere draws, no frame fails."""
+    """Six 180k-vertex spheres need ~2x the 32 MB vertex buffer: it grows, every sphere draws, no frame fails
+    (an alpha-masked sphere also exercises the Area E route cull sets after the growth)."""
     var W = 640
     var H = 360
     var g = FlintAaaVulkanRenderer(width=W, height=H)
@@ -1078,6 +1087,11 @@ def test_gpu_geometry_growth():
         var e = g.add_mesh(sph, mat)
         ids.append(e.mesh_id)
     var up_s = get_time() - t0
+    # An alpha-masked instance runs Area E's GPU-driven route cull, whose descriptor sets must follow the grown buffers.
+    var am = AaaMaterial(base_color=Vec3(0.3, 0.8, 0.3), roughness=0.6, metallic=0.0)
+    am.alpha_cutoff = Float32(0.5)
+    var am_id = g.add_material(am)
+    var am_mesh = g.add_mesh(_sphere(32, 64), am_id)
     for i in range(6):
         _assert(ids[i] >= 0, "mesh " + String(i) + " uploaded (buffers grew instead of refusing it)")
     var eye = Vec3(0.0, 0.0, 14.0)
@@ -1090,6 +1104,7 @@ def test_gpu_geometry_growth():
             if mode == 1:
                 for i in range(6):
                     g.draw_instance(ids[i], trs(Vec3(Float32(i) * 2.5 - 6.25, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+                g.draw_instance(am_mesh.mesh_id, trs(Vec3(0.0, 3.0, 0.0), Quat(), Vec3(0.6, 0.6, 0.6)))
             ok_all = g.render_frame(capture_readback=True) and ok_all
         if mode == 0:
             bg = g.readback_pixels()
@@ -1253,6 +1268,94 @@ def test_gpu_impostor_blend():
     print("[PASS] sota impostor view blending reduces snapping")
 
 
+def test_wide_meshlet_id_cpu():
+    """24-bit meshlet id: exact round trips across the old 17-bit limit, bit-identical to v5 below it."""
+    var ids = List[Int]()
+    for v in [0, 1, 4096, 131069, 131070, 131071, 131072, 131073, 262141, 262142, 1000003, 8388607, SOTA_MAX_GLOBAL_MESHLETS_WIDE]:
+        ids.append(v)
+    for ml in ids:
+        for inst in [0, 1, 777, 32767]:
+            var w = sota_vis_encode(inst, ml, 513, 123)
+            _assert(w[0] != 0, "visbuffer word0 is never 0 (sky) for a drawn texel, ml=" + String(ml))
+            var d = sota_vis_decode(w[0], w[1])
+            _assert(d[0] == inst and d[1] == ml and d[2] == 513 and d[3] == 123, "visbuffer round trip ml=" + String(ml) + " inst=" + String(inst))
+            if ml < 131071:
+                _assert(w[0] == ((UInt32(inst) << 17) | UInt32(ml + 1)) and w[1] == ((UInt32(513) << 16) | UInt32(123)), "bit-identical to v5 below 131071")
+            var p = sota_draw_pack(inst, ml)
+            _assert(Int(p[1]) + 16777215 < 2147483648, "vertexOffset stays a positive int32")
+            for vtx in [0, 5, 16777215]:
+                var u = sota_draw_unpack(UInt32(vtx) + p[1], p[0])
+                _assert(u[0] == vtx and u[1] == inst and u[2] == ml, "draw round trip ml=" + String(ml) + " vtx=" + String(vtx))
+            if ml < 131072:
+                _assert(p[1] == 0 and p[0] == ((UInt32(inst) << 17) | UInt32(ml)), "draw packing unchanged below 131072")
+    print("[PASS] sota 24-bit meshlet id: CPU encode/decode exact past 131070, v5-identical below")
+
+
+def _wide_id_run(pad: Int, W: Int, H: Int, mut nums: List[Int]) -> List[UInt32]:
+    var g = FlintAaaVulkanRenderer(width=W, height=H)
+    var px = List[UInt32]()
+    if not g.active:
+        return px^
+    _tune(g)
+    var m_ground = g.add_material(AaaMaterial(base_color=Vec3(0.55, 0.55, 0.5), roughness=0.8, metallic=0.0))
+    var m_obj = g.add_material(AaaMaterial(base_color=Vec3(0.8, 0.35, 0.2), roughness=0.35, metallic=0.0))
+    var ground = g.add_mesh(_terrain(64, 40.0), m_ground)
+    var total = len(g.geom.meshlets)
+    if pad > 0:
+        total = g.sota_debug_pad_meshlets(pad)
+    var sph = g.add_mesh(_sphere(48, 96), m_obj)
+    var sph_dag = g.add_mesh(_sphere(80, 160), m_obj, build_lods=True)
+    var eye = Vec3(0.0, 3.0, 9.0)
+    var ok_all = True
+    for f in range(6):
+        g.begin_frame(eye, Vec3(0.0, 0.5, 0.0), fov_y_deg=60.0)
+        g.draw_instance(ground.mesh_id, trs(Vec3(0.0, -1.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        g.draw_instance(sph.mesh_id, trs(Vec3(0.0, 0.5, 0.0), Quat(), Vec3(1.5, 1.5, 1.5)))
+        g.draw_instance(sph_dag.mesh_id, trs(Vec3(-3.0, 0.5, -1.0), Quat(), Vec3(1.2, 1.2, 1.2)))
+        g.draw_instance(sph.mesh_id, trs(Vec3(3.0, 0.5, -1.0), Quat(), Vec3(1.2, 1.2, 1.2)))
+        ok_all = g.render_frame(capture_readback=(f == 5)) and ok_all
+    px = g.readback_pixels()
+    var picker = VisBufferGpuPicker()
+    var raw = picker.read_raw_pixel(g, W // 2, H // 2)
+    var d = sota_vis_decode(raw[0], raw[1])
+    picker.shutdown(g)
+    nums.append(total)
+    nums.append(sph.first_meshlet)
+    nums.append(sph.meshlet_count)
+    nums.append(d[1])
+    nums.append(g.sota_geom.meshlet_id_overflows)
+    nums.append(1 if ok_all and sph.mesh_id >= 0 and sph_dag.mesh_id >= 0 else 0)
+    nums.append(len(g.geom.meshlets))
+    g.shutdown()
+    return px^
+
+
+def test_gpu_wide_meshlet_ids():
+    """The same scene with its meshlets at global ids ~1.5k and ~300k renders the same image, and the VisBuffer texel
+    at the centre decodes to the exact (padded) meshlet of the centre sphere."""
+    var W = 480
+    var H = 270
+    var n0 = List[Int]()
+    var n1 = List[Int]()
+    var px0 = _wide_id_run(0, W, H, n0)
+    if len(px0) == 0:
+        print("[SKIP] Vulkan unavailable: wide meshlet id test skipped")
+        return
+    var px1 = _wide_id_run(300000, W, H, n1)
+    _ = write_png(EVAL_DIR + "wide_meshlet_ids_padded.png", px1, W, H)
+    var dd = compare_pixels(px0, px1, W, H, 0)
+    print("  wide meshlet ids: unpadded sphere meshlets " + String(n0[1]) + ".." + String(n0[1] + n0[2] - 1) + " centre texel ml=" + String(n0[3])
+          + " | padded total=" + String(n1[6]) + " sphere meshlets " + String(n1[1]) + ".." + String(n1[1] + n1[2] - 1) + " centre texel ml=" + String(n1[3])
+          + " overflows=" + String(n1[4]) + " | image diff mean_abs=" + String(dd.mean_abs) + " >0: " + String(dd.over_tolerance) + " px")
+    _assert(n1[1] > 262142, "padded sphere meshlets sit past 2 x 131071 (H >= 2)")
+    _assert(n1[4] == 0 and n1[5] == 1, "no mesh refused, no frame failure")
+    _assert(n0[3] >= n0[1] and n0[3] < n0[1] + n0[2], "unpadded centre texel decodes to the sphere's meshlet")
+    _assert(n1[3] >= n1[1] and n1[3] < n1[1] + n1[2], "padded centre texel decodes to the sphere's meshlet (> 131070, exact)")
+    _assert(n1[3] - n1[1] == n0[3] - n0[1], "same local meshlet under the centre pixel")
+    _assert(dd.over_tolerance == 0, "padded and unpadded images are bit-identical")
+    print("[PASS] sota 24-bit meshlet ids: GPU draw + VisBuffer decode exact past 131070 meshlets")
+
+
 def main():
     test_dag_cpu()
     test_hiz_cpu_and_spirv()
@@ -1269,4 +1372,6 @@ def main():
     test_gpu_impostor_blend()
     test_gpu_geometry_growth()
     test_gpu_draw_overflow()
+    test_wide_meshlet_id_cpu()
+    test_gpu_wide_meshlet_ids()
     test_scene_bench()
