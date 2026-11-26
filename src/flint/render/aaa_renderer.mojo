@@ -96,6 +96,10 @@ from flint.render.font import SdfFont
 from flint.ui.draw_list import UiDrawList, GpuUiPrim
 from flint.render.ui_overlay import aaa_ui_overlay_shader, AAA_POST_UI_PRIMS_BASE_OFFSET
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
+# --- sota:geometry hook ---
+from flint.render.sota_geometry_cull import SotaGeometryGpu
+from flint.render.sota_geometry_cluster_dag import build_cluster_dag, cook_cluster_dag_into_pool
+# --- end sota:geometry hook ---
 from flint.render.aaa_visbuffer import (
     AAA_INSTANCE_WORDS,
     AAA_MAX_BINDLESS,
@@ -738,6 +742,9 @@ struct FlintAaaVulkanRenderer(Movable):
     var sota_gi_region_ready: Bool  # --- sota:gi hook --- surface-cache buffer grown for the area-B region
     var frame_index: Int
     var last_culled_meshlet_draws: Int
+    # --- sota:geometry hook ---
+    var sota_geom: SotaGeometryGpu
+    # --- end sota:geometry hook ---
     var prev_cam_pos: Vec3
     var has_prev_cam: Bool
     var scene_time_sec: Float32
@@ -1021,6 +1028,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_gi_region_ready = False  # --- sota:gi hook ---
         self.frame_index = 0
         self.last_culled_meshlet_draws = 0
+        # --- sota:geometry hook ---
+        self.sota_geom = SotaGeometryGpu()
+        # --- end sota:geometry hook ---
         self.prev_cam_pos = self.cam_pos
         self.has_prev_cam = False
         self.scene_time_sec = Float32(0.0)
@@ -1497,6 +1507,16 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_ENV_CUBE, 0, self.samp_linear_clamp, self.env_cube_img.view)
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_BRDF_LUT, 0, self.samp_linear_clamp, self.brdf_lut_img.view)
         self.vk.write_aaa_texture(self.desc_set, BIND_AAA_LTC_LUT, 0, self.samp_linear_clamp, self.ltc_lut_img.view)
+
+        # --- sota:geometry hook ---
+        # Own layout/sets/pipelines; failure leaves `sota_geom.active = False` and the legacy culler runs.
+        if not self.sota_geom.init(
+            self.vk, FRAMES_IN_FLIGHT, self.render_w, self.render_h, self.buf_meshlets.size // (AAA_MESHLET_WORDS * 4),
+            self.buf_meshlets, self.ring_instances, self.ring_indirect, self.ring_globals,
+            self.buf_occluded_candidates, self.buf_indirect_phase2, self.depth_img.view, self.samp_nearest,
+        ):
+            self.sota_geom.active = False
+        # --- end sota:geometry hook ---
 
         # Bake & Upload 64x64 RG16F Split-Sum BRDF LUT + 64x64 RG16F Heitz LTC LUT!
         var lut_bytes = bake_split_sum_brdf_lut_rg16f(64, 128)
@@ -2078,7 +2098,13 @@ struct FlintAaaVulkanRenderer(Movable):
         var i_words_before = len(self.geom.index_words)
         var m_words_before = len(self.geom.meshlet_words)
 
-        var entry = self.geom.append_mesh(mesh, material_id, build_lods=build_lods)
+        # --- sota:geometry hook ---
+        var entry: CookedMeshEntry
+        if build_lods and self.sota_geom.cluster_lod_auto and self.sota_geom.active and len(mesh.indices) // 3 >= 256 and mesh.alpha_mode != 1:
+            entry = self.add_mesh_cluster_dag_entry(mesh, material_id)
+        else:
+            entry = self.geom.append_mesh(mesh, material_id, build_lods=build_lods)
+        # --- end sota:geometry hook ---
 
         var vb_start = v_words_before * 4
         var vb_len = (len(self.geom.vertex_words) - v_words_before) * 4
@@ -2153,6 +2179,24 @@ struct FlintAaaVulkanRenderer(Movable):
             entry.mesh_id = -1            # did not fit on the GPU: never draw it
         return entry^
 
+    # --- sota:geometry hook ---
+    def add_mesh_cluster_dag_entry(mut self, mesh: NativeMesh, material_id: Int) -> CookedMeshEntry:
+        """Cooks `mesh` as a continuous cluster-LOD DAG into the CPU pool and publishes its DAG records
+        (the caller, `add_mesh`, uploads the pool range and builds the LOD0 BLAS)."""
+        var dag = build_cluster_dag(mesh)
+        var cooked = cook_cluster_dag_into_pool(self.geom, mesh, material_id, dag)
+        self.sota_geom.write_dag_records(cooked[0].first_meshlet, cooked[1])
+        return cooked[0].copy()
+
+    def add_mesh_cluster_lod(mut self, mesh: NativeMesh, material_id: Int) -> CookedMeshEntry:
+        """Explicit cluster-LOD DAG mesh (independent of `sota_geom.cluster_lod_auto`)."""
+        var keep = self.sota_geom.cluster_lod_auto
+        self.sota_geom.cluster_lod_auto = True
+        var e = self.add_mesh(mesh, material_id, build_lods=True)
+        self.sota_geom.cluster_lod_auto = keep
+        return e^
+    # --- end sota:geometry hook ---
+
     def set_wind(mut self, dir_x: Float32, dir_z: Float32, sway_m: Float32, hz: Float32 = 0.6, gust: Float32 = 0.3):
         """The global wind for draws with wind > 0: direction (xz), how far tips sway (m), how fast
         (Hz), how gusty (0..1). Vertices sway by their uv.y (0 at the root .. 1 at the tip)."""
@@ -2220,6 +2264,10 @@ struct FlintAaaVulkanRenderer(Movable):
         if mesh_id < 0 or mesh_id >= len(self.geom.meshes) or (mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[mesh_id]):
             return bad^
         self.vk.wait_idle()
+        # --- sota:geometry hook ---
+        var old_sl = self.geom.mesh_slot(mesh_id)
+        self.sota_geom.clear_dag_range(old_sl.first_meshlet, old_sl.meshlet_cap)
+        # --- end sota:geometry hook ---
         var res = self.geom.replace_mesh(mesh_id, mesh, material_id, build_lods)
         var sl = res[1]
         if not sl.empty() and not self._upload_slot(sl):
@@ -2245,6 +2293,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var sl = self.geom.free_mesh(mesh_id)
         if sl.empty():
             return False
+        self.sota_geom.clear_dag_range(sl.first_meshlet, sl.meshlet_cap)  # sota:geometry hook
         _ = self._upload_slot(GeomSlot(sl.first_vertex, 0, sl.first_index, 0, sl.first_meshlet, sl.meshlet_cap))
         self._rebuild_blas(mesh_id, True)
         self.vsm.invalidate_all()
@@ -3644,6 +3693,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- end sota:camera hook ---
 
         var cur_slot = self.frame_index % FRAMES_IN_FLIGHT
+        self.sota_geom.begin_slot(cur_slot)  # sota:geometry hook
         var defer_this = self.deferred_readback and (not capture_readback) and self.vk.swapchain == 0
         if defer_this and cur_slot > 0 and len(self.readback_extra) < cur_slot:
             while len(self.readback_extra) < FRAMES_IN_FLIGHT - 1:
@@ -4180,15 +4230,25 @@ struct FlintAaaVulkanRenderer(Movable):
             push_cull[5] = UInt32(self.render_h)
             push_cull[6] = bitcast[DType.uint32](self.max_lod_error_px)
             push_cull[7] = 0  # Phase 1: cull_phase = 0
-            self.vk.dispatch_aaa(
-                cur_slot,
-                self.pipe_meshlet_cull,
-                self.pipe_layout,
-                self.desc_sets_cull_p1[cur_slot],
-                push_cull,
-                (n_inst + 7) // 8,
-                (max_ml_per_inst + 7) // 8,
-            )
+            # --- sota:geometry hook ---
+            if self.sota_geom.use_cull():
+                self.sota_geom.record_cull(
+                    self.vk, cur_slot, 0, n_inst, self.max_draws, max_ml_per_inst, self.enable_cone_cull,
+                    push_cull[3] != 0, self.render_w, self.render_h, self.max_lod_error_px, use_rt_frame,
+                )
+            else:
+                if not self.sota_geom.legacy_hiz_occlusion:
+                    push_cull[3] = 0  # v5 5-tap test is not conservative; nothing is queued, so phase 2 is a no-op
+                self.vk.dispatch_aaa(
+                    cur_slot,
+                    self.pipe_meshlet_cull,
+                    self.pipe_layout,
+                    self.desc_sets_cull_p1[cur_slot],
+                    push_cull,
+                    (n_inst + 7) // 8,
+                    (max_ml_per_inst + 7) // 8,
+                )
+            # --- end sota:geometry hook ---
             if use_prof:
                 self.vk.write_timestamp(cur_slot, q_mc + 1, PIPELINE_BOTTOM)
             self.render_graph.emit_pass_barriers(self.vk, cur_slot, 1)
@@ -4251,15 +4311,25 @@ struct FlintAaaVulkanRenderer(Movable):
             push_cull_p2[5] = UInt32(self.render_h)
             push_cull_p2[6] = bitcast[DType.uint32](self.max_lod_error_px)
             push_cull_p2[7] = 1  # Phase 2: cull_phase = 1
-            self.vk.dispatch_aaa(
-                cur_slot,
-                self.pipe_meshlet_cull,
-                self.pipe_layout,
-                self.desc_sets_cull_p2[cur_slot],
-                push_cull_p2,
-                (self.max_draws + 63) // 64,
-                1,
-            )
+            # --- sota:geometry hook ---
+            if self.sota_geom.use_cull():
+                # conservative Hi-Z pyramid from the phase-1 depth, then candidates vs current matrices
+                self.sota_geom.record_hiz_build(self.vk, cur_slot)
+                self.sota_geom.record_cull(
+                    self.vk, cur_slot, 1, n_inst, self.max_draws, max_ml_per_inst, self.enable_cone_cull,
+                    True, self.render_w, self.render_h, self.max_lod_error_px,
+                )
+            else:
+                self.vk.dispatch_aaa(
+                    cur_slot,
+                    self.pipe_meshlet_cull,
+                    self.pipe_layout,
+                    self.desc_sets_cull_p2[cur_slot],
+                    push_cull_p2,
+                    (self.max_draws + 63) // 64,
+                    1,
+                )
+            # --- end sota:geometry hook ---
             self.vk.memory_barrier2(
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_DRAW_INDIRECT, Int(ACCESS_INDIRECT_READ)
             )
@@ -5750,6 +5820,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_sampler(self.samp_nearest)
 
         self.vk.destroy_pipeline(self.pipe_meshlet_cull)
+        self.sota_geom.shutdown(self.vk)  # sota:geometry hook
         self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
         self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)
         if self.pipe_npr_outline_gfx != 0:
