@@ -433,7 +433,13 @@ from flint.render.sota_camera_exposure import sota_ae_record  # --- sota:camera 
 from flint.render.sota_atmo_core import rgb_luma  # --- sota:camera hook (round 4: sky calibration) ---
 # --- end sota:camera hook ---
 # --- sota:atmo hook (import) ---
-from flint.render.sota_atmo_gpu import SotaAtmosphere, sota_atmo_record_apply, sota_atmo_record_luts, sota_atmo_region_words
+from flint.render.sota_atmo_gpu import (
+    SotaAtmosphere,
+    sota_atmo_record_apply,
+    sota_atmo_record_clouds,
+    sota_atmo_record_ibl,
+    sota_atmo_record_luts,
+)
 # --- end sota:atmo hook ---
 from flint.render.aaa_render_graph import (
     AaaGpuPassTiming,
@@ -1551,8 +1557,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_ml.scratch_max_pix = max_pix
         hist_words += SotaMlDenoiser.scratch_words(max_pix)
         # --- end sota:ml hook ---
-        self.sota_atmo.region_base = hist_words  # --- sota:atmo hook --- LUTs + aerial-perspective volume (1.66 MB)
-        hist_words += sota_atmo_region_words()  # --- sota:atmo hook ---
+        # --- sota:atmo hook --- LUTs + AP volume (1.66 MB), GPU IBL staging, cloud noise (1.7 MB) + 2 quarter-res images
+        hist_words += self.sota_atmo.configure_region(hist_words, max_pix, self.env_cube_dim, self.env_mip_levels)
         self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
         self.buf_vsm_table = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True)
         # --- sota:gi hook --- (+ the area-B control block; the full region is allocated on first use)
@@ -4334,7 +4340,20 @@ struct FlintAaaVulkanRenderer(Movable):
             self.sun_dir = pl[0]
             self.sun_radiance = pl[1]
             self.sun_angular_radius = pl[2]
-        if self.sota_atmo.needs_ibl_refresh():
+        if self.sota_atmo.gpu_ibl_active():
+            # Round 3: SH9 + the BC6H cube are baked on the GPU inside the frame; keep the CPU copy of the SH one
+            # frame behind (the previous frame has retired here) for CPU-side readers.
+            if self.sota_atmo.ibl.sh_updates > 0:
+                self.sh9_irradiance = self.sota_atmo.read_gpu_sh9(self.buf_history.cpu_address)
+            if self.sota_atmo.needs_ibl_refresh():
+                self.sota_atmo.ibl_cube_pending = True
+                self.sota_atmo.ibl_sun = self.sota_atmo.lights.sun_dir
+                self.sota_atmo.ibl_moon = self.sota_atmo.lights.moon_dir
+                self.sota_atmo.ibl_valid = True
+                self.sky_zenith_clear = Vec3(0.0, 0.0, 0.0)
+                self.sky_horizon_clear = Vec3(0.0, 0.0, 0.0)
+            self.sota_atmo.last_ibl_ms = 0.0
+        elif self.sota_atmo.needs_ibl_refresh():
             var t0 = get_time()
             var ibl = self.sota_atmo.bake_ibl(self.cam_pos.y, self.env_cube_dim, self.env_mip_levels)
             self.upload_ibl_environment(ibl)
@@ -4813,10 +4832,11 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + 164 * 4, self.sky_horizon_clear.x)
         put_float(g_addr + 165 * 4, self.sky_horizon_clear.y)
         put_float(g_addr + 166 * 4, self.sky_horizon_clear.z)
-        # --- sota:atmo hook --- per-frame atmosphere constants (b_globals[3840 .. 3904))
+        # --- sota:atmo hook --- per-frame atmosphere constants (b_globals[3840 .. 3968): r2 block + r3 night / cloud block)
         if self.sota_atmo.active() and not self.furnace_white_dome:
-            self.sota_atmo.write_globals(
-                g_addr, self.cam_pos.y, self.cloud_coverage > Float32(0.01) or self.star_intensity > Float32(0.01),
+            self.sota_atmo.write_globals_r3(
+                g_addr, self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, tan_x, tan_y, self.render_w, self.render_h,
+                self.scene_time_sec, self.cloud_coverage, self.star_intensity,
                 self.enable_froxel_fog, self.fog_density, self.froxel_far_z, self.fog_height_falloff,
                 self.fog_base_height_y, self.fog_albedo, self.fog_anisotropy_g,
             )
@@ -5058,6 +5078,16 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:E hook (hair deep opacity map, read by the deferred pass) ---
         self.sota_e_hair.record(self.vk, cur_slot, self.pipe_layout, self.desc_set)
         # --- end sota:E hook ---
+        # --- sota:atmo hook --- LUTs (transmittance / MS on change, sky-view, AP) + GPU IBL (SH9 -> b_globals[72..99),
+        # BC6H GGX cube) at the start of the frame, so the surface cache, GI and shading see this frame's sky.
+        var run_sota_atmo = self.sota_atmo.active() and not self.furnace_white_dome
+        if run_sota_atmo:
+            sota_atmo_record_luts(self.sota_atmo, self.vk, cur_slot, self.pipe_layout, self.desc_set, use_prof, next_q, q_limit, prof_pairs)
+            sota_atmo_record_ibl(
+                self.sota_atmo, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.buf_globals, self.buf_history,
+                self.env_cube_img, use_prof, next_q, q_limit, prof_pairs,
+            )
+        # --- end sota:atmo hook ---
         if n_inst > 0:
             var q_mc = next_q
             if use_prof:
@@ -5523,11 +5553,6 @@ struct FlintAaaVulkanRenderer(Movable):
 
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
 
-        # --- sota:atmo hook --- transmittance / multi-scattering (on change), sky-view and aerial-perspective LUTs
-        var run_sota_atmo = self.sota_atmo.active() and not self.furnace_white_dome
-        if run_sota_atmo:
-            sota_atmo_record_luts(self.sota_atmo, self.vk, cur_slot, self.pipe_layout, self.desc_set, use_prof, next_q, q_limit, prof_pairs)
-        # --- end sota:atmo hook ---
 
         # `160 x 90 x 64` Temporal Froxel Volumetric Scattering Injection + 3D Reprojection Pass!
         var run_froxel = self.enable_froxel_fog and self.fog_density > Float32(1e-6) and not self.furnace_white_dome
@@ -5971,6 +5996,10 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # --- sota:atmo hook --- sky / sun / moon, aerial perspective, height-fog tail (before the froxel composite)
         if run_sota_atmo:
+            sota_atmo_record_clouds(
+                self.sota_atmo, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.render_w, self.render_h,
+                use_prof, next_q, q_limit, prof_pairs,
+            )
             sota_atmo_record_apply(
                 self.sota_atmo, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.render_w, self.render_h,
                 use_prof, next_q, q_limit, prof_pairs,
