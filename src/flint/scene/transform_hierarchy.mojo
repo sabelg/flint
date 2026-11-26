@@ -210,6 +210,8 @@ struct LocalTransform(SerializableComponent, ImplicitlyCopyable):
     @staticmethod
     def read_json(doc: JsonDocument, node: Int) raises -> Self:
         var t_node = doc.object_get(node, "translation")
+        if t_node < 0:
+            t_node = doc.object_get(node, "position")
         var r_node = doc.object_get(node, "rotation")
         var s_node = doc.object_get(node, "scale")
         if (
@@ -313,6 +315,8 @@ struct GlobalTransform(SerializableComponent):
     @staticmethod
     def read_json(doc: JsonDocument, node: Int) raises -> Self:
         var t_node = doc.object_get(node, "translation")
+        if t_node < 0:
+            t_node = doc.object_get(node, "position")
         var r_node = doc.object_get(node, "rotation")
         var s_node = doc.object_get(node, "scale")
         if (

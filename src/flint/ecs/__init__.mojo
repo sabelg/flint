@@ -18,6 +18,7 @@ from flint.ecs.world import (
     WORLD_BLOB_VERSION,
     NULL_ENTITY,
     comp_hash64,
+    comp_hash64_str,
     ecs_runtime_shutdown,
     Entity,
     Component,

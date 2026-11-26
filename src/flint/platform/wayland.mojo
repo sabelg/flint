@@ -1,7 +1,7 @@
 """Direct Wayland/XDG-shell client using Linux sockets and shared memory.
 
 No libwayland, XKB, EGL, OpenGL, or native compatibility shim is used. The one
-exception is SD_PRESENT=swapchain, where the Vulkan driver needs libwayland objects
+exception is FLINT_PRESENT=swapchain, where the Vulkan driver needs libwayland objects
 for this window: see platform/wayland_bridge.mojo. All this code runs the same then.
 """
 from std.ffi import external_call

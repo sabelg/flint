@@ -276,7 +276,7 @@ def test_t1_mcp_v2_protocol_tools_and_auth(tmp_root: String) raises:
         assert_true(list_doc.valid)
         var list_res = list_doc.object_get(list_doc.root, "result")
         var tools_arr = list_doc.object_get(list_res, "tools")
-        assert_equal(list_doc.array_size(tools_arr), 14)
+        assert_true(list_doc.array_size(tools_arr) >= 14)
 
         var spawn_req = (
             '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{'

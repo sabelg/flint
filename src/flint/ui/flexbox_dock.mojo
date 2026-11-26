@@ -12,7 +12,7 @@ Implements:
 """
 from std.collections import List
 from std.math import abs, isfinite
-from flint.assets.json import parse_json
+from flint.assets.json import JsonDocument, parse_json
 from flint.assets.json_write import json_quote
 
 # Flexbox Axes & Alignment
@@ -110,6 +110,18 @@ struct RectF(Copyable, ImplicitlyCopyable, Movable):
         var pt = min(max(Float32(0.0), st), self.h)
         var pb = min(max(Float32(0.0), sb), max(Float32(0.0), self.h - pt))
         return RectF(self.x + pl, self.y + pt, max(Float32(0.0), self.w - pl - pr), max(Float32(0.0), self.h - pt - pb))
+
+
+def _dock_json_int(doc: JsonDocument, node: Int) -> Tuple[Bool, Int]:
+    if node < 0 or node >= len(doc.nodes) or doc.nodes[node].kind != 2:
+        return (False, -1)
+    var num = doc.nodes[node].number
+    if not isfinite(num) or num < -9223372036854774784.0 or num > 9223372036854774784.0:
+        return (False, -1)
+    var iv = Int(num)
+    if Float64(iv) != num:
+        return (False, -1)
+    return (True, iv)
 
 
 @fieldwise_init
@@ -555,6 +567,8 @@ struct DockSpace(Copyable, Movable):
     var hovered_splitter_node: Int
     var header_height: Float32
     var min_ratio: Float32
+    var dock_style_v2: Bool
+    var collapsed_nodes: List[Bool]
 
     def __init__(out self):
         self.nodes = List[DockNode]()
@@ -563,12 +577,33 @@ struct DockSpace(Copyable, Movable):
         self.hovered_splitter_node = -1
         self.header_height = 24.0
         self.min_ratio = 0.08
+        self.dock_style_v2 = False
+        self.collapsed_nodes = List[Bool]()
 
     def clear(mut self):
         self.nodes.clear()
         self.root = -1
         self.dragging_node = -1
         self.hovered_splitter_node = -1
+        self.collapsed_nodes.clear()
+
+    def set_dock_style_v2(mut self, enabled: Bool):
+        """Enables or disables Obsidian v2 dock tabs, glass splitters, and collapse chevrons."""
+        self.dock_style_v2 = enabled
+
+    @always_inline
+    def is_node_collapsed(self, node_id: Int) -> Bool:
+        if node_id < 0 or node_id >= len(self.collapsed_nodes):
+            return False
+        return self.collapsed_nodes[node_id]
+
+    def toggle_node_collapsed(mut self, node_id: Int) -> Bool:
+        if node_id < 0 or node_id >= len(self.nodes):
+            return False
+        while len(self.collapsed_nodes) <= node_id:
+            self.collapsed_nodes.append(False)
+        self.collapsed_nodes[node_id] = not self.collapsed_nodes[node_id]
+        return self.collapsed_nodes[node_id]
 
     def add_tabs_node(mut self, tabs: List[String], active_tab: Int = 0) -> Int:
         var id = len(self.nodes)
@@ -781,6 +816,8 @@ struct DockSpace(Copyable, Movable):
                         var fw = max(Float32(0.0), full.w) if isfinite(full.w) else Float32(0.0)
                         var fh = max(Float32(0.0), full.h) if isfinite(full.h) else Float32(0.0)
                         var hh = Float32(0.0) if k == DOCK_CENTRAL_VIEWPORT else min(safe_hh, fh)
+                        if self.dock_style_v2 and k == DOCK_TABS and self.is_node_collapsed(i):
+                            return (i, t, False, RectF(fx, fy + hh, fw, Float32(0.0)))
                         var content = RectF(fx, fy + hh, fw, max(Float32(0.0), fh - hh))
                         return (i, t, self.nodes[i].active_tab == t, content)
         return (-1, -1, False, RectF())
@@ -839,12 +876,27 @@ struct DockSpace(Copyable, Movable):
         for b in json_str.as_bytes():
             bytes.append(b)
         var doc = parse_json(bytes)
-        if not doc.valid or doc.root < 0:
+        if not doc.valid or doc.root < 0 or doc.root >= len(doc.nodes):
+            return False
+        if doc.nodes[doc.root].kind != 5:
             return False
 
+        var ver_node = doc.object_get(doc.root, "version")
+        if ver_node >= 0:
+            var vr = _dock_json_int(doc, ver_node)
+            if not vr[0] or vr[1] != 1:
+                return False
+
         var root_node = doc.object_get(doc.root, "root")
+        var parsed_root = -1
+        if root_node >= 0:
+            var rr = _dock_json_int(doc, root_node)
+            if not rr[0]:
+                return False
+            parsed_root = rr[1]
+
         var nodes_arr = doc.object_get(doc.root, "nodes")
-        if nodes_arr < 0:
+        if nodes_arr < 0 or doc.nodes[nodes_arr].kind != 4:
             return False
 
         var hh_node = doc.object_get(doc.root, "header_height")
@@ -852,24 +904,46 @@ struct DockSpace(Copyable, Movable):
         var count = doc.array_size(nodes_arr)
         for i in range(count):
             var obj = doc.at(nodes_arr, i)
-            if obj < 0:
+            if obj < 0 or doc.nodes[obj].kind != 5:
+                return False
+            var kind_node = doc.object_get(obj, "kind")
+            var kr = _dock_json_int(doc, kind_node)
+            if not kr[0]:
+                return False
+            var kind = kr[1]
+            if kind < DOCK_SPLIT_H or kind > DOCK_CENTRAL_VIEWPORT:
                 return False
             var id = doc.integer(doc.object_get(obj, "id"), i)
-            var kind = doc.integer(doc.object_get(obj, "kind"), DOCK_TABS)
             var dn = DockNode(id, kind)
             dn.ratio = self._clamp_ratio(Float32(doc.number(doc.object_get(obj, "ratio"), 0.5)))
-            dn.child_a = doc.integer(doc.object_get(obj, "child_a"), -1)
-            dn.child_b = doc.integer(doc.object_get(obj, "child_b"), -1)
+            var ca_node = doc.object_get(obj, "child_a")
+            if ca_node >= 0:
+                var car = _dock_json_int(doc, ca_node)
+                if not car[0]:
+                    return False
+                dn.child_a = car[1]
+            else:
+                dn.child_a = -1
+            var cb_node = doc.object_get(obj, "child_b")
+            if cb_node >= 0:
+                var cbr = _dock_json_int(doc, cb_node)
+                if not cbr[0]:
+                    return False
+                dn.child_b = cbr[1]
+            else:
+                dn.child_b = -1
             var raw_active = doc.integer(doc.object_get(obj, "active_tab"), 0)
             var tabs_arr = doc.object_get(obj, "tabs")
             if tabs_arr >= 0:
+                if doc.nodes[tabs_arr].kind != 4:
+                    return False
                 var tc = doc.array_size(tabs_arr)
                 for ti in range(tc):
                     dn.tabs.append(doc.text(doc.at(tabs_arr, ti), ""))
             dn.active_tab = max(0, min(max(0, len(dn.tabs) - 1), raw_active))
             parsed_nodes.append(dn^)
 
-        var root_idx = doc.integer(root_node, 0 if len(parsed_nodes) > 0 else -1)
+        var root_idx = parsed_root if root_node >= 0 else (0 if len(parsed_nodes) > 0 else -1)
         var n_nodes = len(parsed_nodes)
         if n_nodes == 0:
             if root_idx != -1:
@@ -883,6 +957,9 @@ struct DockSpace(Copyable, Movable):
                     return False
                 if pn.kind == DOCK_SPLIT_H or pn.kind == DOCK_SPLIT_V:
                     if pn.child_a < 0 or pn.child_b < 0 or pn.child_a == pn.child_b:
+                        return False
+                else:
+                    if pn.child_a != -1 or pn.child_b != -1:
                         return False
             var color = List[Int](length=n_nodes, fill=0)  # 0=unvisited, 1=visiting, 2=done
             var dfs_node = List[Int]()

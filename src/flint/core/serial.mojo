@@ -245,6 +245,40 @@ struct BlobReader(Movable):
         self.offset += byte_len
         return True
 
+    def read_raw_blob(mut self) raises -> Tuple[UInt32, UInt32, List[UInt8]]:
+        """Reads a complete `(tag, version, payload)` blob without interpreting its payload."""
+        if self.offset < 0 or self.limit() - self.offset < BLOB_HEADER_BYTES:
+            self.failed = True
+            raise Error("read_raw_blob: truncated blob header")
+        var tag = self.u32()
+        var version = self.u32()
+        var length = Int(self.u32())
+        if self.failed or length < 0 or length > self.limit() - self.offset:
+            self.failed = True
+            raise Error("read_raw_blob: truncated or invalid blob payload")
+        var payload = List[UInt8](capacity=length)
+        if length > 0:
+            payload.resize(unsafe_uninit_length=length)
+            _ = external_call["memcpy", Int](
+                Int(payload.unsafe_ptr()), Int(self.data.unsafe_ptr()) + self.offset, length
+            )
+            self.offset += length
+        return (tag, version, payload^)
+
+    def skip_blob(mut self) raises -> UInt32:
+        """Validates and skips a complete blob header+payload without allocating, returning its tag."""
+        if self.offset < 0 or self.limit() - self.offset < BLOB_HEADER_BYTES:
+            self.failed = True
+            raise Error("skip_blob: truncated blob header")
+        var tag = self.u32()
+        _ = self.u32()
+        var length = Int(self.u32())
+        if self.failed or length < 0 or length > self.limit() - self.offset:
+            self.failed = True
+            raise Error("skip_blob: truncated or invalid blob payload")
+        self.offset += length
+        return tag
+
 
 trait Serializable:
     """State that writes itself as one versioned blob and reads it back.

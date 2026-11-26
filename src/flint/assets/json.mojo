@@ -68,13 +68,67 @@ struct JsonDocument(Copyable, Movable):
             return String()
         return self.nodes[node].text
 
-    def integer(self, node: Int, fallback: Int = -1) -> Int:
+    def i64(self, node: Int, fallback: Int64 = 0) -> Int64:
+        """Parses a signed 64-bit integer from the exact raw JSON number slice without Float64 precision loss."""
         if node < 0 or node >= len(self.nodes) or self.nodes[node].kind != 2:
             return fallback
+        var raw = self.nodes[node].text.as_bytes()
+        if len(raw) == 0:
+            return fallback
+        var neg = raw[0] == 45  # '-'
+        var start = 1 if neg else 0
+        var is_int_lit = start < len(raw)
+        if is_int_lit:
+            for i in range(start, len(raw)):
+                if raw[i] < 48 or raw[i] > 57:
+                    is_int_lit = False
+                    break
+        if is_int_lit:
+            comptime I64_MAX_DIV10: UInt64 = UInt64(922337203685477580)
+            var max_last = UInt64(8) if neg else UInt64(7)
+            var acc = UInt64(0)
+            for i in range(start, len(raw)):
+                var d = UInt64(raw[i] - 48)
+                if acc > I64_MAX_DIV10 or (acc == I64_MAX_DIV10 and d > max_last):
+                    return fallback
+                acc = acc * UInt64(10) + d
+            if neg:
+                if acc == (UInt64(1) << 63):
+                    return Int64.MIN
+                return -Int64(acc)
+            return Int64(acc)
         var num = self.nodes[node].number
         if not isfinite(num) or num < -9223372036854774784.0 or num > 9223372036854774784.0:
             return fallback
-        return Int(num)
+        return Int64(num)
+
+    def integer(self, node: Int, fallback: Int = -1) -> Int:
+        return Int(self.i64(node, Int64(fallback)))
+
+    def u64(self, node: Int, fallback: UInt64 = 0) -> UInt64:
+        """Parses an unsigned 64-bit integer from the exact raw JSON number slice without Float64 precision loss."""
+        if node < 0 or node >= len(self.nodes) or self.nodes[node].kind != 2:
+            return fallback
+        var raw = self.nodes[node].text.as_bytes()
+        if len(raw) == 0:
+            return fallback
+        var all_digits = True
+        for i in range(len(raw)):
+            if raw[i] < 48 or raw[i] > 57:
+                all_digits = False
+                break
+        if all_digits:
+            var acc = UInt64(0)
+            for i in range(len(raw)):
+                var d = UInt64(raw[i] - 48)
+                if acc > UInt64(1844674407370955161) or (acc == UInt64(1844674407370955161) and d > UInt64(5)):
+                    return fallback
+                acc = acc * UInt64(10) + d
+            return acc
+        var num = self.nodes[node].number
+        if not isfinite(num) or num < 0.0 or num > 18446744073709551615.0:
+            return fallback
+        return UInt64(num)
 
     def boolean(self, node: Int, fallback: Bool = False) -> Bool:
         if node < 0 or node >= len(self.nodes) or self.nodes[node].kind != 1:
@@ -334,3 +388,11 @@ def parse_json(data: List[UInt8]) -> JsonDocument:
     if document.root < 0 or document.index != len(data):
         document.valid = False
     return document^
+
+
+def json_u64(doc: JsonDocument, node: Int, fallback: UInt64 = 0) -> UInt64:
+    return doc.u64(node, fallback)
+
+
+def json_i64(doc: JsonDocument, node: Int, fallback: Int64 = 0) -> Int64:
+    return doc.i64(node, fallback)

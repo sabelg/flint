@@ -226,8 +226,6 @@ def alsa_open_pcm(rate: Int, preferred_period: Int, mut out_period: Int, mut out
     """Opens and configures the first available Linux ALSA playback node (`/dev/snd/pcmC*D*p`),
     or returns `-1` when no hardware PCM device is available."""
     var requested = env_value("FLINT_AUDIO_DEVICE")
-    if requested.byte_length() == 0:
-        requested = env_value("SD_AUDIO_DEVICE")
     if requested.byte_length() > 0:
         var owned = requested
         var fd = Int(external_call["openat", Int32](Int32(-100), owned.as_c_string_span(), Int32(1 | 2048 | 0x80000), Int32(0)))
@@ -618,13 +616,12 @@ struct NativeAudio(Movable):
             "assets/audio/punch.wav", "assets/audio/stone.wav", "assets/audio/collect.wav",
             "assets/audio/sonar.wav", "assets/audio/transform.wav", "assets/audio/explosion.wav",
             "assets/audio/hurt.wav", "assets/audio/jump.wav",
-            # Deepsong's own: 8 splash, 9 crumble, 10 launch; 11 is empty (it was
-            # Echo's song, package 3.21) so the menu sounds keep their ids.
-            "assets/deepsong/audio/splash.wav", "assets/deepsong/audio/crumble.wav",
-            "assets/deepsong/audio/launch.wav", "",
+            # 8 splash, 9 crumble, 10 launch; 11 is intentionally empty so menu sounds keep ids 12-15.
+            "assets/audio/splash.wav", "assets/audio/crumble.wav",
+            "assets/audio/launch.wav", "",
             # 12-15: menu move, confirm, back, refused.
-            "assets/deepsong/audio/menu_move.wav", "assets/deepsong/audio/menu_confirm.wav",
-            "assets/deepsong/audio/menu_back.wav", "assets/deepsong/audio/menu_error.wav",
+            "assets/audio/menu_move.wav", "assets/audio/menu_confirm.wav",
+            "assets/audio/menu_back.wav", "assets/audio/menu_error.wav",
         ]
         self.clips.clear()
         for path in paths:
@@ -748,8 +745,6 @@ struct NativeAudio(Movable):
     def initialize(mut self) -> Bool:
         self.load_assets()
         var requested = env_value("FLINT_AUDIO_DEVICE")
-        if requested.byte_length() == 0:
-            requested = env_value("SD_AUDIO_DEVICE")
         if requested.byte_length() > 0:
             return self.open_device(requested)
         # The desktop's sound server comes first: it shares the output with other

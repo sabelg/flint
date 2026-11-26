@@ -19,14 +19,26 @@ from std.collections import List
 from std.math import max, min
 from flint.ui.draw_list import (
     GpuUiPrim,
+    PRIM_ARC,
     PRIM_CONTROLLER_SYMBOL,
     PRIM_GLYPH,
+    PRIM_IMAGE,
     PRIM_LINE,
     PRIM_NINE_SLICE,
     PRIM_SHAPE,
     UI_FLAG_BORDER,
     UI_FLAG_CIRCLE,
+    UI_FLAG_DASHED_FLOW,
     UI_FLAG_DROP_SHADOW,
+    UI_FLAG_GLASS_SCRIM,
+    UI_FLAG_HORIZ_GRADIENT,
+    UI_FLAG_LINEAR_TEX,
+    UI_FLAG_MSDF,
+    UI_FLAG_MTSDF,
+    UI_FLAG_OUTER_GLOW,
+    UI_FLAG_PER_CORNER_RADII,
+    UI_FLAG_QUAD_BEZIER,
+    UI_FLAG_TOP_BEVEL,
     UI_FLAG_VERT_GRADIENT,
 )
 from flint.render.spirv import (
@@ -50,9 +62,7 @@ from flint.render.aaa_visbuffer import (
 comptime AAA_POST_UI_PRIMS_BASE_OFFSET: Int = 1024
 comptime TILE_PRIM_CAP: Int = 256  # prims composited per outer chunk (1 per invocation, zero drops across chunks)
 
-comptime PRIM_IMAGE: UInt32 = 5
-comptime UI_FLAG_QUADRATIC_BEZIER: UInt32 = 1 << 4
-comptime UI_FLAG_LINEAR_TEX: UInt32 = 1 << 5
+comptime UI_FLAG_QUADRATIC_BEZIER: UInt32 = UI_FLAG_QUAD_BEZIER
 
 # Procedural GPU SDF controller / HUD symbol IDs (`PRIM_CONTROLLER_SYMBOL`)
 comptime UI_SYMBOL_A: Int = 0
@@ -317,6 +327,12 @@ def _emit_seg_dist(
 
 
 @always_inline
+def _emit_msdf_median(mut s: AaaSpirvModule, r: UInt32, g: UInt32, b: UInt32) -> UInt32:
+    """Chlumsky 3-channel MSDF median `max(min(r, g), min(max(r, g), b))`."""
+    return s.nmax(s.nmin(r, g), s.nmin(s.nmax(r, g), b))
+
+
+@always_inline
 def _emit_rounded_box_sdf(
     mut s: AaaSpirvModule,
     px: UInt32,
@@ -406,11 +422,14 @@ def aaa_ui_overlay_shader(
     var prims_off = s.push_word(3)
     var out_ldr_off = s.push_word(4)
     var disp_mode = s.push_word(5)
+    var ui_time_sec = s.push_float(6)
+    var ui_global_flags = s.push_word(8)
 
     # Uniform early exit if draw list is empty
     s.return_if(s.ieq(prim_cnt, s.uint(0)))
 
     var is_hdr10 = s.ieq(disp_mode, s.uint(1))
+    var glass_enabled = s.ieq(s.bit_and(ui_global_flags, s.uint(1)), s.uint(0))
     var in_screen = s.logical_and(s.ult(gx, out_w), s.ult(gy, out_h))
 
     var wx = s.workgroup_axis(0)
@@ -420,15 +439,20 @@ def aaa_ui_overlay_shader(
     var local_idx = s.iadd(s.imul(ly, s.uint(16)), lx)
 
     # 16x16 Tile bounds in screen pixels
-    var tile_x0 = s.float_from_uint(s.imul(wx, s.uint(16)))
-    var tile_y0 = s.float_from_uint(s.imul(wy, s.uint(16)))
+    var tile_x0_u = s.imul(wx, s.uint(16))
+    var tile_y0_u = s.imul(wy, s.uint(16))
+    var tile_x0 = s.float_from_uint(tile_x0_u)
+    var tile_y0 = s.float_from_uint(tile_y0_u)
     var tile_x1 = s.fadd(tile_x0, s.float(16.0))
     var tile_y1 = s.fadd(tile_y0, s.float(16.0))
 
-    # Workgroup Shared Memory for chunked 256-prim binning & draw-order rank sort
+    # Workgroup Shared Memory for chunked 256-prim binning, rank sort & race-free glass backdrop LDS
     var shared_cnt = s.workgroup_array_u32(1)
     var shared_prims = s.workgroup_array_u32(TILE_PRIM_CAP)
     var ordered_prims = s.workgroup_array_u32(TILE_PRIM_CAP)
+    var bg_lds_r = s.workgroup_array_f32(256)
+    var bg_lds_g = s.workgroup_array_f32(256)
+    var bg_lds_b = s.workgroup_array_f32(256)
 
     var fgx = s.fadd(s.float_from_uint(gx), s.float(0.5))
     var fgy = s.fadd(s.float_from_uint(gy), s.float(0.5))
@@ -457,6 +481,8 @@ def aaa_ui_overlay_shader(
     var ry0 = s.load_float(b_post, s.iadd(base_w, s.uint(1)))
     var rx1 = s.load_float(b_post, s.iadd(base_w, s.uint(2)))
     var ry1 = s.load_float(b_post, s.iadd(base_w, s.uint(3)))
+    var c_cxy0 = s.load_word(b_post, s.iadd(base_w, s.uint(8)))
+    var c_cxy1 = s.load_word(b_post, s.iadd(base_w, s.uint(9)))
     var c_hdr = s.load_word(b_post, s.iadd(base_w, s.uint(15)))
     var c_kind = s.bit_and(c_hdr, s.uint(0xF))
     var c_flags = s.shr(c_hdr, s.uint(16))
@@ -464,10 +490,16 @@ def aaa_ui_overlay_shader(
     var c_p1 = s.load_float(b_post, s.iadd(base_w, s.uint(13)))
     var c_p2 = s.load_float(b_post, s.iadd(base_w, s.uint(14)))
 
-    # Compute conservative screen AABB accounting for reversed line endpoints, stroke outlines & drop shadows
+    # Compute conservative screen AABB accounting for lines, arcs, stroke outlines, shadows & outer glows
     var pad_v = s.fvar(s.float(1.5))
     s.begin_if(s.ieq(c_kind, s.uint(4)))
     s.store(pad_v, s.fadd(s.fmul(s.nmax(c_p0, s.float(1.0)), s.float(0.5)), s.float(2.5)))
+    s.begin_if(s.ine(s.bit_and(c_flags, s.uint(UI_FLAG_DASHED_FLOW)), s.uint(0)))
+    s.store(pad_v, s.fadd(s.load_f(pad_v), s.nmax(s.float(4.0), s.fmul(s.nmax(c_p0, c_p2), s.float(3.0)))))
+    s.end_if()
+    s.end_if()
+    s.begin_if(s.ieq(c_kind, s.uint(PRIM_ARC)))
+    s.store(pad_v, s.fadd(s.fmul(s.nmax(c_p1, s.float(1.0)), s.float(0.5)), s.fadd(s.nclamp(c_p2, s.float(0.0), s.float(28.0)), s.float(2.5))))
     s.end_if()
     var has_sh = s.logical_or(
         s.ine(s.bit_and(c_flags, s.uint(1)), s.uint(0)),
@@ -476,22 +508,32 @@ def aaa_ui_overlay_shader(
     s.begin_if(has_sh)
     s.store(pad_v, s.fadd(s.load_f(pad_v), s.fadd(s.nmax(c_p2, s.float(6.0)), s.float(4.0))))
     s.end_if()
+    s.begin_if(s.ine(s.bit_and(c_flags, s.uint(UI_FLAG_OUTER_GLOW)), s.uint(0)))
+    s.store(pad_v, s.fadd(s.load_f(pad_v), s.fadd(s.nclamp(c_p2, s.float(2.0), s.float(28.0)), s.float(2.0))))
+    s.end_if()
     s.begin_if(s.fgt(c_p1, s.float(0.01)))
     s.store(pad_v, s.fadd(s.load_f(pad_v), s.nmin(c_p1, s.float(16.0))))
     s.end_if()
 
     var eff_pad = s.load_f(pad_v)
-    var ax0 = s.fsub(s.nmin(rx0, rx1), eff_pad)
-    var ay0 = s.fsub(s.nmin(ry0, ry1), eff_pad)
-    var ax1 = s.fadd(s.nmax(rx0, rx1), eff_pad)
-    var ay1 = s.fadd(s.nmax(ry0, ry1), eff_pad)
+    var ccx0_f = s.float_from_uint(s.bit_and(c_cxy0, s.uint(0xFFFF)))
+    var ccy0_f = s.float_from_uint(s.shr(c_cxy0, s.uint(16)))
+    var ccx1_f = s.float_from_uint(s.bit_and(c_cxy1, s.uint(0xFFFF)))
+    var ccy1_f = s.float_from_uint(s.shr(c_cxy1, s.uint(16)))
+    var ax0 = s.nmax(s.fsub(s.nmin(rx0, rx1), eff_pad), ccx0_f)
+    var ay0 = s.nmax(s.fsub(s.nmin(ry0, ry1), eff_pad), ccy0_f)
+    var ax1 = s.nmin(s.fadd(s.nmax(rx0, rx1), eff_pad), ccx1_f)
+    var ay1 = s.nmin(s.fadd(s.nmax(ry0, ry1), eff_pad), ccy1_f)
 
     var outside = s.logical_or(
         s.logical_or(
             s.logical_or(s.fge(tile_x0, ax1), s.fge(ax0, tile_x1)),
             s.logical_or(s.fge(tile_y0, ay1), s.fge(ay0, tile_y1)),
         ),
-        s.ieq(c_kind, s.uint(7)),  # PRIM_POLY_DATA: vertex storage of the polygon before it
+        s.logical_or(
+            s.logical_or(s.fge(ax0, ax1), s.fge(ay0, ay1)),
+            s.ieq(c_kind, s.uint(7)),  # PRIM_POLY_DATA: vertex storage of the polygon before it
+        ),
     )
     s.begin_if(s.logical_not(outside))
     var slot = s.atomic_add_workgroup_u32(shared_cnt[0], shared_cnt[1], s.uint(0), s.uint(1))
@@ -535,6 +577,9 @@ def aaa_ui_overlay_shader(
         s.store(accum_g, bg_rgba[1])
         s.store(accum_b, bg_rgba[2])
         s.end_if()
+    s.store_workgroup_f32(bg_lds_r[0], bg_lds_r[1], local_idx, s.load_f(accum_r))
+    s.store_workgroup_f32(bg_lds_g[0], bg_lds_g[1], local_idx, s.load_f(accum_g))
+    s.store_workgroup_f32(bg_lds_b[0], bg_lds_b[1], local_idx, s.load_f(accum_b))
     s.store(bg_loaded, s.uint(1))
     s.end_if()
 
@@ -591,14 +636,24 @@ def aaa_ui_overlay_shader(
     var param1 = s.load_float(b_post, s.iadd(pb, s.uint(13)))
     var param2 = s.load_float(b_post, s.iadd(pb, s.uint(14)))
 
-    # Expanded pixel AABB check (supports shadow / stroke / thick-line / reversed-endpoint boxes)
+    # Expanded pixel AABB check (supports shadow / glow / arc / stroke / thick-line / flow boxes)
     var box_pad = s.fvar(s.float(0.5))
     s.begin_if(s.ieq(kind, s.uint(4)))
     s.store(box_pad, s.fadd(s.fmul(s.nmax(param0, s.float(1.0)), s.float(0.5)), s.float(2.5)))
+    s.begin_if(s.ine(s.bit_and(flags, s.uint(UI_FLAG_DASHED_FLOW)), s.uint(0)))
+    s.store(box_pad, s.fadd(s.load_f(box_pad), s.nmax(s.float(4.0), s.fmul(s.nmax(param0, param2), s.float(3.0)))))
+    s.end_if()
+    s.end_if()
+    s.begin_if(s.ieq(kind, s.uint(PRIM_ARC)))
+    s.store(box_pad, s.fadd(s.fmul(s.nmax(param1, s.float(1.0)), s.float(0.5)), s.fadd(s.nclamp(param2, s.float(0.0), s.float(28.0)), s.float(2.5))))
     s.end_if()
     var has_drop_shadow = s.ine(s.bit_and(flags, s.uint(1)), s.uint(0))
+    var has_outer_glow = s.ine(s.bit_and(flags, s.uint(UI_FLAG_OUTER_GLOW)), s.uint(0))
     s.begin_if(s.logical_or(has_drop_shadow, s.logical_and(s.ieq(kind, s.uint(1)), s.fgt(param2, s.float(0.01)))))
     s.store(box_pad, s.fadd(s.load_f(box_pad), s.fadd(s.nmax(param2, s.float(6.0)), s.float(4.0))))
+    s.end_if()
+    s.begin_if(has_outer_glow)
+    s.store(box_pad, s.fadd(s.load_f(box_pad), s.fadd(s.nclamp(param2, s.float(2.0), s.float(28.0)), s.float(2.0))))
     s.end_if()
     s.begin_if(s.fgt(param1, s.float(0.01)))
     s.store(box_pad, s.fadd(s.load_f(box_pad), s.nmin(param1, s.float(16.0))))
@@ -621,8 +676,10 @@ def aaa_ui_overlay_shader(
     var u1 = s.load_float(b_post, s.iadd(pb, s.uint(6)))
     var v1 = s.load_float(b_post, s.iadd(pb, s.uint(7)))
 
-    var fill_rgba = _emit_unpack_flint_argb(s, s.load_word(b_post, s.iadd(pb, s.uint(10))))
-    var sec_rgba = _emit_unpack_flint_argb(s, s.load_word(b_post, s.iadd(pb, s.uint(11))))
+    var fill_raw = s.load_word(b_post, s.iadd(pb, s.uint(10)))
+    var sec_raw = s.load_word(b_post, s.iadd(pb, s.uint(11)))
+    var fill_rgba = _emit_unpack_flint_argb(s, fill_raw)
+    var sec_rgba = _emit_unpack_flint_argb(s, sec_raw)
     var cr = fill_rgba[0]
     var cg = fill_rgba[1]
     var cb = fill_rgba[2]
@@ -633,7 +690,9 @@ def aaa_ui_overlay_shader(
     var sa = sec_rgba[3]
 
     # ------------------------------------------------------------------------
-    # Kind 0 (`PRIM_SHAPE`): Rounded-Rect / Circle SDF + Border + Gradient + Drop Shadow
+    # Kind 0 (`PRIM_SHAPE`): Rounded-Rect (uniform or 4-corner) / Circle SDF
+    #   + Outer Drop Shadow + Outer Glow + LDS Glass Scrim + V/H/Diag Gradient
+    #   + Border Stroke + 1px Top Specular Bevel
     # ------------------------------------------------------------------------
     s.begin_if(s.ieq(kind, s.uint(0)))
     var w_half = s.fmul(s.nmax(s.float(0.5), s.fsub(x1, x0)), s.float(0.5))
@@ -643,8 +702,29 @@ def aaa_ui_overlay_shader(
     var is_circle = s.ine(s.bit_and(flags, s.uint(4)), s.uint(0))
     var has_border = s.logical_and(s.ine(s.bit_and(flags, s.uint(2)), s.uint(0)), s.fgt(param1, s.float(0.01)))
     var has_vgrad = s.ine(s.bit_and(flags, s.uint(8)), s.uint(0))
+    var has_hgrad = s.ine(s.bit_and(flags, s.uint(UI_FLAG_HORIZ_GRADIENT)), s.uint(0))
+    var has_per_corner = s.ine(s.bit_and(flags, s.uint(UI_FLAG_PER_CORNER_RADII)), s.uint(0))
+    var has_top_bevel = s.ine(s.bit_and(flags, s.uint(UI_FLAG_TOP_BEVEL)), s.uint(0))
+    var has_glass_scrim = s.ine(s.bit_and(flags, s.uint(UI_FLAG_GLASS_SCRIM)), s.uint(0))
 
-    # Optional soft drop shadow (`UI_FLAG_DROP_SHADOW`)
+    # Resolve corner radius (uniform `param0` or IQ per-corner `(u0=TL, v0=TR, u1=BR, v1=BL)`)
+    var r_top_sel = s.select_f(s.flt(fgx, cx), u0, v0)
+    var r_bot_sel = s.select_f(s.flt(fgx, cx), v1, u1)
+    var eff_r = s.select_f(has_per_corner, s.select_f(s.flt(fgy, cy), r_top_sel, r_bot_sel), param0)
+
+    var dist_s = s.fvar(s.float(0.0))
+    s.begin_if(is_circle)
+    var dx = s.fsub(fgx, cx)
+    var dy = s.fsub(fgy, cy)
+    s.store(dist_s, s.fsub(s.fsqrt(s.fma(dx, dx, s.fmul(dy, dy))), param0))
+    s.begin_else()
+    s.store(dist_s, _emit_rounded_box_sdf(s, fgx, fgy, cx, cy, w_half, h_half, eff_r))
+    s.end_if()
+
+    var d_shape = s.load_f(dist_s)
+    var cov_outer = s.nclamp(s.fsub(s.float(0.5), d_shape), s.float(0.0), s.float(1.0))
+
+    # Optional soft drop shadow (`UI_FLAG_DROP_SHADOW`, outer-only for translucent fills)
     s.begin_if(has_drop_shadow)
     var sh_x = s.fsub(fgx, s.float(2.0))
     var sh_y = s.fsub(fgy, s.float(3.0))
@@ -654,39 +734,86 @@ def aaa_ui_overlay_shader(
     var sdy = s.fsub(sh_y, cy)
     s.store(dist_sh, s.fsub(s.fsqrt(s.fma(sdx, sdx, s.fmul(sdy, sdy))), param0))
     s.begin_else()
-    s.store(dist_sh, _emit_rounded_box_sdf(s, sh_x, sh_y, cx, cy, w_half, h_half, param0))
+    var sh_r_top = s.select_f(s.flt(sh_x, cx), u0, v0)
+    var sh_r_bot = s.select_f(s.flt(sh_x, cx), v1, u1)
+    var sh_eff_r = s.select_f(has_per_corner, s.select_f(s.flt(sh_y, cy), sh_r_top, sh_r_bot), param0)
+    s.store(dist_sh, _emit_rounded_box_sdf(s, sh_x, sh_y, cx, cy, w_half, h_half, sh_eff_r))
     s.end_if()
     var sh_soft = s.nmax(param2, s.float(5.0))
     var sh_t = s.nclamp(s.fsub(s.float(1.0), s.fdiv(s.nmax(s.load_f(dist_sh), s.float(0.0)), sh_soft)), s.float(0.0), s.float(1.0))
-    var sh_a = s.fmul(s.fmul(sh_t, sh_t), s.fmul(ca, s.float(0.45)))
+    var sh_outer_mask = s.select_f(s.flt(ca, s.float(0.995)), s.fsub(s.float(1.0), cov_outer), s.float(1.0))
+    var sh_a = s.fmul(s.fmul(s.fmul(sh_t, sh_t), s.fmul(ca, s.float(0.45))), sh_outer_mask)
     _emit_blend_over(s, accum_r, accum_g, accum_b, s.float(0.0), s.float(0.0), s.float(0.0), sh_a)
     s.end_if()
 
-    var dist_s = s.fvar(s.float(0.0))
-    s.begin_if(is_circle)
-    var dx = s.fsub(fgx, cx)
-    var dy = s.fsub(fgy, cy)
-    s.store(dist_s, s.fsub(s.fsqrt(s.fma(dx, dx, s.fmul(dy, dy))), param0))
-    s.begin_else()
-    s.store(dist_s, _emit_rounded_box_sdf(s, fgx, fgy, cx, cy, w_half, h_half, param0))
+    # Optional zero-offset analytical outer glow (`UI_FLAG_OUTER_GLOW`)
+    s.begin_if(has_outer_glow)
+    var g_soft = s.nclamp(param2, s.float(1.5), s.float(28.0))
+    var g_u = s.fdiv(s.nmax(d_shape, s.float(0.0)), g_soft)
+    var g_fall = s.fmul(s.exp2(s.fmul(s.float(-2.4), s.fmul(g_u, g_u))), s.fsub(s.float(1.0), cov_outer))
+    var use_sec_glow = s.fgt(sa, s.float(0.001))
+    var gr_c = s.select_f(use_sec_glow, sr, cr)
+    var gg_c = s.select_f(use_sec_glow, sg, cg)
+    var gb_c = s.select_f(use_sec_glow, sb, cb)
+    var ga_c = s.select_f(use_sec_glow, sa, ca)
+    var wg_col = _emit_ui_srgb_to_working(s, is_hdr10, gr_c, gg_c, gb_c)
+    _emit_blend_over(s, accum_r, accum_g, accum_b, wg_col[0], wg_col[1], wg_col[2], s.fmul(ga_c, g_fall))
     s.end_if()
 
-    var d_shape = s.load_f(dist_s)
-    var cov_outer = s.nclamp(s.fsub(s.float(0.5), d_shape), s.float(0.0), s.float(1.0))
+    # Optional 5-tap diamond Kawase frosted-glass scrim blur from race-free workgroup LDS (`UI_FLAG_GLASS_SCRIM`)
+    s.begin_if(s.logical_and(s.logical_and(has_glass_scrim, glass_enabled), s.fgt(cov_outer, s.float(0.001))))
+    var r_blur = s.umin(s.uint(4), s.umax(s.uint(1), s.saturate_uint(s.fadd(param2, s.float(0.5)))))
+    var max_lx = s.umin(s.uint(15), s.isub(s.isub(out_w, s.uint(1)), tile_x0_u))
+    var max_ly = s.umin(s.uint(15), s.isub(s.isub(out_h, s.uint(1)), tile_y0_u))
+    var lx_lo = s.select_u(s.uge(lx, r_blur), s.isub(lx, r_blur), s.uint(0))
+    var lx_hi = s.umin(max_lx, s.iadd(lx, r_blur))
+    var ly_lo = s.select_u(s.uge(ly, r_blur), s.isub(ly, r_blur), s.uint(0))
+    var ly_hi = s.umin(max_ly, s.iadd(ly, r_blur))
+    var idx0 = local_idx
+    var idx1 = s.iadd(s.imul(ly_lo, s.uint(16)), lx_lo)
+    var idx2 = s.iadd(s.imul(ly_lo, s.uint(16)), lx_hi)
+    var idx3 = s.iadd(s.imul(ly_hi, s.uint(16)), lx_lo)
+    var idx4 = s.iadd(s.imul(ly_hi, s.uint(16)), lx_hi)
+    var br0 = s.load_workgroup_f32(bg_lds_r[0], bg_lds_r[1], idx0)
+    var bg0 = s.load_workgroup_f32(bg_lds_g[0], bg_lds_g[1], idx0)
+    var bb0 = s.load_workgroup_f32(bg_lds_b[0], bg_lds_b[1], idx0)
+    var br_d = s.fadd(
+        s.fadd(s.load_workgroup_f32(bg_lds_r[0], bg_lds_r[1], idx1), s.load_workgroup_f32(bg_lds_r[0], bg_lds_r[1], idx2)),
+        s.fadd(s.load_workgroup_f32(bg_lds_r[0], bg_lds_r[1], idx3), s.load_workgroup_f32(bg_lds_r[0], bg_lds_r[1], idx4)),
+    )
+    var bg_d = s.fadd(
+        s.fadd(s.load_workgroup_f32(bg_lds_g[0], bg_lds_g[1], idx1), s.load_workgroup_f32(bg_lds_g[0], bg_lds_g[1], idx2)),
+        s.fadd(s.load_workgroup_f32(bg_lds_g[0], bg_lds_g[1], idx3), s.load_workgroup_f32(bg_lds_g[0], bg_lds_g[1], idx4)),
+    )
+    var bb_d = s.fadd(
+        s.fadd(s.load_workgroup_f32(bg_lds_b[0], bg_lds_b[1], idx1), s.load_workgroup_f32(bg_lds_b[0], bg_lds_b[1], idx2)),
+        s.fadd(s.load_workgroup_f32(bg_lds_b[0], bg_lds_b[1], idx3), s.load_workgroup_f32(bg_lds_b[0], bg_lds_b[1], idx4)),
+    )
+    var blur_r = s.fma(br0, s.float(0.28), s.fmul(br_d, s.float(0.18)))
+    var blur_g = s.fma(bg0, s.float(0.28), s.fmul(bg_d, s.float(0.18)))
+    var blur_b = s.fma(bb0, s.float(0.28), s.fmul(bb_d, s.float(0.18)))
+    _emit_blend_over(s, accum_r, accum_g, accum_b, blur_r, blur_g, blur_b, cov_outer)
+    s.end_if()
 
     var fill_r_v = s.fvar(cr)
     var fill_g_v = s.fvar(cg)
     var fill_b_v = s.fvar(cb)
     var fill_a_v = s.fvar(ca)
-    s.begin_if(has_vgrad)
+    s.begin_if(s.logical_or(has_vgrad, has_hgrad))
     var ty = s.nclamp(s.fdiv(s.fsub(fgy, y0), s.nmax(s.float(1.0), s.fsub(y1, y0))), s.float(0.0), s.float(1.0))
+    var tx = s.nclamp(s.fdiv(s.fsub(fgx, x0), s.nmax(s.float(1.0), s.fsub(x1, x0))), s.float(0.0), s.float(1.0))
+    var t_grad = s.select_f(
+        s.logical_and(has_vgrad, has_hgrad),
+        s.fmul(s.fadd(tx, ty), s.float(0.5)),
+        s.select_f(has_hgrad, tx, ty),
+    )
     s.begin_if(s.logical_and(s.logical_not(has_border), s.fgt(sa, s.float(0.001))))
-    s.store(fill_r_v, s.fma(s.fsub(sr, cr), ty, cr))
-    s.store(fill_g_v, s.fma(s.fsub(sg, cg), ty, cg))
-    s.store(fill_b_v, s.fma(s.fsub(sb, cb), ty, cb))
-    s.store(fill_a_v, s.fma(s.fsub(sa, ca), ty, ca))
+    s.store(fill_r_v, s.fma(s.fsub(sr, cr), t_grad, cr))
+    s.store(fill_g_v, s.fma(s.fsub(sg, cg), t_grad, cg))
+    s.store(fill_b_v, s.fma(s.fsub(sb, cb), t_grad, cb))
+    s.store(fill_a_v, s.fma(s.fsub(sa, ca), t_grad, ca))
     s.begin_else()
-    var shade_mul = s.fma(s.float(-0.32), ty, s.float(1.12))
+    var shade_mul = s.fma(s.float(-0.32), t_grad, s.float(1.12))
     s.store(fill_r_v, s.nclamp(s.fmul(cr, shade_mul), s.float(0.0), s.float(1.0)))
     s.store(fill_g_v, s.nclamp(s.fmul(cg, shade_mul), s.float(0.0), s.float(1.0)))
     s.store(fill_b_v, s.nclamp(s.fmul(cb, shade_mul), s.float(0.0), s.float(1.0)))
@@ -704,10 +831,20 @@ def aaa_ui_overlay_shader(
     var wf2 = _emit_ui_srgb_to_working(s, is_hdr10, s.load_f(fill_r_v), s.load_f(fill_g_v), s.load_f(fill_b_v))
     _emit_blend_over(s, accum_r, accum_g, accum_b, wf2[0], wf2[1], wf2[2], s.fmul(s.load_f(fill_a_v), cov_outer))
     s.end_if()
+
+    # Optional subtle 1px inner top specular highlight bevel (`UI_FLAG_TOP_BEVEL`)
+    s.begin_if(has_top_bevel)
+    var bev_inset = s.fadd(s.select_f(has_border, param1, s.float(0.0)), s.float(0.5))
+    var inner_band = s.nclamp(s.fsub(s.float(0.5), s.fabs(s.fadd(d_shape, bev_inset))), s.float(0.0), s.float(1.0))
+    var top_mask = s.nclamp(s.fsub(s.float(1.0), s.fdiv(s.fsub(fgy, y0), s.nmax(s.float(3.0), s.fadd(eff_r, s.float(2.0))))), s.float(0.0), s.float(1.0))
+    var bev_a = s.fmul(s.float(0.09), s.fmul(inner_band, s.fmul(top_mask, s.fmul(cov_outer, ca))))
+    var wbev = _emit_ui_srgb_to_working(s, is_hdr10, s.float(1.0), s.float(1.0), s.float(1.0))
+    _emit_blend_over(s, accum_r, accum_g, accum_b, wbev[0], wbev[1], wbev[2], bev_a)
+    s.end_if()
     s.end_if()
 
     # ------------------------------------------------------------------------
-    # Kind 1 (`PRIM_GLYPH`): SDF Font Glyph + Outer Stroke Outline + Drop Shadow
+    # Kind 1 (`PRIM_GLYPH`): SDF / MSDF / MTSDF Font Glyph + Outer Stroke + Drop Shadow
     # ------------------------------------------------------------------------
     s.begin_if(s.ieq(kind, s.uint(1)))
     var gw = s.nmax(s.float(1.0), s.fsub(x1, x0))
@@ -716,6 +853,8 @@ def aaa_ui_overlay_shader(
     var dv = s.fsub(v1, v0)
     var tu = s.fadd(u0, s.fmul(s.fdiv(s.fsub(fgx, x0), gw), du))
     var tv = s.fadd(v0, s.fmul(s.fdiv(s.fsub(fgy, y0), gh), dv))
+    var is_msdf = s.ine(s.bit_and(flags, s.uint(UI_FLAG_MSDF)), s.uint(0))
+    var is_mtsdf = s.ine(s.bit_and(flags, s.uint(UI_FLAG_MTSDF)), s.uint(0))
 
     var has_glyph_sh = s.logical_or(has_drop_shadow, s.fgt(param2, s.float(0.01)))
     s.begin_if(has_glyph_sh)
@@ -723,7 +862,10 @@ def aaa_ui_overlay_shader(
     var stu = s.nclamp(s.fsub(tu, s.fmul(s.fdiv(sh_off_px, gw), du)), s.float(0.0), s.float(1.0))
     var stv = s.nclamp(s.fsub(tv, s.fmul(s.fdiv(sh_off_px, gh), dv)), s.float(0.0), s.float(1.0))
     var sh_samp = s.sample_bindless_lod(bindless_arr, tex_slot, s.vec2(stu, stv), s.float(0.0))
-    var sh_sd = s.fmul(s.fsub(s.extract_f(sh_samp, 0), s.float(0.5)), param0)
+    var sh_r = s.extract_f(sh_samp, 0)
+    var sh_med = _emit_msdf_median(s, sh_r, s.extract_f(sh_samp, 1), s.extract_f(sh_samp, 2))
+    var sh_d_raw = s.select_f(is_mtsdf, s.extract_f(sh_samp, 3), s.select_f(is_msdf, sh_med, sh_r))
+    var sh_sd = s.fmul(s.fsub(sh_d_raw, s.float(0.5)), param0)
     var sh_cov = s.nclamp(s.fadd(sh_sd, s.float(0.5)), s.float(0.0), s.float(1.0))
     _emit_blend_over(s, accum_r, accum_g, accum_b, s.float(0.0), s.float(0.0), s.float(0.0), s.fmul(ca, s.fmul(sh_cov, s.float(0.60))))
     s.end_if()
@@ -734,11 +876,14 @@ def aaa_ui_overlay_shader(
     )
     s.begin_if(in_glyph_uv)
     var samp = s.sample_bindless_lod(bindless_arr, tex_slot, s.vec2(tu, tv), s.float(0.0))
-    var d_val = s.extract_f(samp, 0)
+    var g_r = s.extract_f(samp, 0)
+    var g_med = _emit_msdf_median(s, g_r, s.extract_f(samp, 1), s.extract_f(samp, 2))
+    var d_val = s.select_f(is_msdf, g_med, g_r)
     var sd = s.fmul(s.fsub(d_val, s.float(0.5)), param0)
     var cov = s.nclamp(s.fadd(sd, s.float(0.5)), s.float(0.0), s.float(1.0))
     s.begin_if(s.logical_and(s.fgt(param1, s.float(0.01)), s.fgt(sa, s.float(0.001))))
-    var cov_out = s.nclamp(s.fadd(s.fadd(sd, param1), s.float(0.5)), s.float(0.0), s.float(1.0))
+    var sd_stroke_base = s.select_f(is_mtsdf, s.fmul(s.fsub(s.extract_f(samp, 3), s.float(0.5)), param0), sd)
+    var cov_out = s.nclamp(s.fadd(s.fadd(sd_stroke_base, param1), s.float(0.5)), s.float(0.0), s.float(1.0))
     var stroke_w = s.nmax(s.float(0.0), s.fsub(cov_out, cov))
     var wo = _emit_ui_srgb_to_working(s, is_hdr10, sr, sg, sb)
     _emit_blend_over(s, accum_r, accum_g, accum_b, wo[0], wo[1], wo[2], s.fmul(sa, stroke_w))
@@ -909,16 +1054,18 @@ def aaa_ui_overlay_shader(
     s.end_if()
 
     # ------------------------------------------------------------------------
-    # Kind 4 (`PRIM_LINE`): Analytical Capsule Segment & Quadratic Bézier SDF
+    # Kind 4 (`PRIM_LINE`): Analytical Capsule Segment & Quadratic Bézier SDF + Dashed Flow
     # ------------------------------------------------------------------------
     s.begin_if(s.ieq(kind, s.uint(4)))
     var is_bez = s.ine(s.bit_and(flags, s.uint(16)), s.uint(0))
+    var is_flow = s.ine(s.bit_and(flags, s.uint(UI_FLAG_DASHED_FLOW)), s.uint(0))
     var uv_is_default = s.logical_and(
         s.logical_and(s.flt(s.fabs(u0), s.float(1e-5)), s.flt(s.fabs(v0), s.float(1e-5))),
         s.logical_and(s.flt(s.fabs(s.fsub(u1, s.float(1.0))), s.float(1e-5)), s.flt(s.fabs(s.fsub(v1, s.float(1.0))), s.float(1e-5))),
     )
     var half_thick = s.select_f(is_bez, s.nmax(param2, s.float(0.5)), s.nmax(param0, s.float(0.5)))
     var d_line = s.fvar(s.float(1e6))
+    var s_along = s.fvar(s.float(0.0))
 
     s.begin_if(is_bez)
     var p0x = u0
@@ -930,6 +1077,7 @@ def aaa_ui_overlay_shader(
 
     var prev_bx = s.fvar(p0x)
     var prev_by = s.fvar(p0y)
+    var cum_len = s.fvar(s.float(0.0))
     var seg_i = s.uvar(s.uint(1))
     s.begin_loop()
     var si = s.load_u(seg_i)
@@ -941,8 +1089,21 @@ def aaa_ui_overlay_shader(
     var w2_b = s.fmul(t_b, t_b)
     var cur_bx = s.fma(w0_b, p0x, s.fma(w1_b, p1x, s.fmul(w2_b, p2x)))
     var cur_by = s.fma(w0_b, p0y, s.fma(w1_b, p1y, s.fmul(w2_b, p2y)))
-    var d_ch = _emit_seg_dist(s, fgx, fgy, s.load_f(prev_bx), s.load_f(prev_by), cur_bx, cur_by)
-    s.store(d_line, s.nmin(s.load_f(d_line), d_ch))
+    var pbx = s.load_f(prev_bx)
+    var pby = s.load_f(prev_by)
+    var d_ch = _emit_seg_dist(s, fgx, fgy, pbx, pby, cur_bx, cur_by)
+    var ch_dx = s.fsub(cur_bx, pbx)
+    var ch_dy = s.fsub(cur_by, pby)
+    var ch_len = s.fsqrt(s.fma(ch_dx, ch_dx, s.fmul(ch_dy, ch_dy)))
+    s.begin_if(s.flt(d_ch, s.load_f(d_line)))
+    s.store(d_line, d_ch)
+    s.begin_if(is_flow)
+    var c_dot = s.nmax(s.float(1e-6), s.fma(ch_dx, ch_dx, s.fmul(ch_dy, ch_dy)))
+    var c_h = s.nclamp(s.fdiv(s.fma(s.fsub(fgx, pbx), ch_dx, s.fmul(s.fsub(fgy, pby), ch_dy)), c_dot), s.float(0.0), s.float(1.0))
+    s.store(s_along, s.fma(c_h, ch_len, s.load_f(cum_len)))
+    s.end_if()
+    s.end_if()
+    s.store(cum_len, s.fadd(s.load_f(cum_len), ch_len))
     s.store(prev_bx, cur_bx)
     s.store(prev_by, cur_by)
     s.store(seg_i, s.iadd(si, s.uint(1)))
@@ -953,13 +1114,106 @@ def aaa_ui_overlay_shader(
     var lbx = s.select_f(uv_is_default, x1, u1)
     var lby = s.select_f(uv_is_default, y1, v1)
     s.store(d_line, _emit_seg_dist(s, fgx, fgy, lax, lay, lbx, lby))
+    s.begin_if(is_flow)
+    var ldx = s.fsub(lbx, lax)
+    var ldy = s.fsub(lby, lay)
+    var l_sq = s.nmax(s.float(1e-6), s.fma(ldx, ldx, s.fmul(ldy, ldy)))
+    var l_len = s.fsqrt(l_sq)
+    var l_h = s.nclamp(s.fdiv(s.fma(s.fsub(fgx, lax), ldx, s.fmul(s.fsub(fgy, lay), ldy)), l_sq), s.float(0.0), s.float(1.0))
+    s.store(s_along, s.fmul(l_h, l_len))
+    s.end_if()
     s.end_if()
 
     var feather = s.select_f(is_bez, s.float(1.0), s.nmax(param2, s.float(0.5)))
     var sd_line = s.fsub(s.load_f(d_line), half_thick)
     var cov_line = s.nclamp(s.fsub(s.float(0.5), s.fdiv(sd_line, feather)), s.float(0.0), s.float(1.0))
     var wln = _emit_ui_srgb_to_working(s, is_hdr10, cr, cg, cb)
+    s.begin_if(is_flow)
+    var f_dash = s.nmax(s.float(2.0), s.float_from_uint(s.bit_and(sec_raw, s.uint(0xFF))))
+    var f_gap = s.float_from_uint(s.bit_and(s.shr(sec_raw, s.uint(8)), s.uint(0xFF)))
+    var f_spd = s.fmul(s.float_from_uint(s.bit_and(s.shr(sec_raw, s.uint(16)), s.uint(0xFF))), s.float(4.0))
+    var f_glw = s.fmul(s.float_from_uint(s.bit_and(s.shr(sec_raw, s.uint(24)), s.uint(0xFF))), s.float(1.0 / 255.0))
+    var f_per = s.nmax(s.float(2.0), s.fadd(f_dash, f_gap))
+    var f_cyc = s.fdiv(s.fsub(s.load_f(s_along), s.fmul(ui_time_sec, f_spd)), f_per)
+    var f_ph = s.fmul(s.fsub(f_cyc, s.ffloor(f_cyc)), f_per)
+    var f_mask = s.select_f(
+        s.fgt(f_gap, s.float(0.5)),
+        s.nclamp(s.fadd(s.nmin(f_ph, s.fsub(f_dash, f_ph)), s.float(0.5)), s.float(0.0), s.float(1.0)),
+        s.float(1.0),
+    )
+    s.begin_if(s.fgt(f_glw, s.float(0.01)))
+    var lg_r = s.nmax(s.float(2.0), s.fmul(half_thick, s.float(2.5)))
+    var lg_u = s.fdiv(s.nmax(sd_line, s.float(0.0)), lg_r)
+    var lg_a = s.fmul(
+        s.exp2(s.fmul(s.float(-1.8), s.fmul(lg_u, lg_u))),
+        s.fmul(f_glw, s.fmul(ca, s.fma(f_mask, s.float(0.65), s.float(0.35)))),
+    )
+    _emit_blend_over(s, accum_r, accum_g, accum_b, wln[0], wln[1], wln[2], lg_a)
+    s.end_if()
+    _emit_blend_over(s, accum_r, accum_g, accum_b, wln[0], wln[1], wln[2], s.fmul(ca, s.fmul(cov_line, f_mask)))
+    s.begin_else()
     _emit_blend_over(s, accum_r, accum_g, accum_b, wln[0], wln[1], wln[2], s.fmul(ca, cov_line))
+    s.end_if()
+    s.end_if()
+
+    # ------------------------------------------------------------------------
+    # Kind 8 (`PRIM_ARC`): Analytical SDF Ring / Rounded-Cap Arc / Progress / Spinner
+    # ------------------------------------------------------------------------
+    s.begin_if(s.ieq(kind, s.uint(PRIM_ARC)))
+    var arc_cx = u0
+    var arc_cy = v0
+    var arc_start_raw = u1
+    var arc_sweep = v1
+    var arc_r = s.nmax(s.float(0.5), param0)
+    var arc_half = s.fmul(s.nmax(s.float(0.5), param1), s.float(0.5))
+    var adx = s.fsub(fgx, arc_cx)
+    var ady = s.fsub(fgy, arc_cy)
+    var dist_c = s.fsqrt(s.fma(adx, adx, s.fmul(ady, ady)))
+    var d_arc_ring = s.fsub(s.fabs(s.fsub(dist_c, arc_r)), arc_half)
+
+    var has_arc_track = s.logical_and(s.ine(s.bit_and(flags, s.uint(UI_FLAG_BORDER)), s.uint(0)), s.fgt(sa, s.float(0.001)))
+    s.begin_if(has_arc_track)
+    var cov_tr = s.nclamp(s.fsub(s.float(0.5), d_arc_ring), s.float(0.0), s.float(1.0))
+    var wtr = _emit_ui_srgb_to_working(s, is_hdr10, sr, sg, sb)
+    _emit_blend_over(s, accum_r, accum_g, accum_b, wtr[0], wtr[1], wtr[2], s.fmul(sa, cov_tr))
+    s.end_if()
+
+    var sw_abs = s.fabs(arc_sweep)
+    s.begin_if(s.fgt(sw_abs, s.float(1e-4)))
+    var has_arc_spin = s.ine(s.bit_and(flags, s.uint(UI_FLAG_DASHED_FLOW)), s.uint(0))
+    var eff_start = s.fadd(arc_start_raw, s.select_f(has_arc_spin, s.fmul(ui_time_sec, s.float(3.0)), s.float(0.0)))
+    var d_arc = s.fvar(d_arc_ring)
+    s.begin_if(s.flt(sw_abs, s.float(6.27)))
+    var st_ang = s.select_f(s.fge(arc_sweep, s.float(0.0)), eff_start, s.fadd(eff_start, arc_sweep))
+    var ang = s.fatan2(ady, adx)
+    var two_pi = s.float(6.2831853)
+    var rel_raw = s.fsub(ang, st_ang)
+    var rel = s.fsub(rel_raw, s.fmul(two_pi, s.ffloor(s.fdiv(rel_raw, two_pi))))
+    var sx0 = s.fma(arc_r, s.fcos(st_ang), arc_cx)
+    var sy0 = s.fma(arc_r, s.fsin(st_ang), arc_cy)
+    var end_ang = s.fadd(st_ang, sw_abs)
+    var sx1 = s.fma(arc_r, s.fcos(end_ang), arc_cx)
+    var sy1 = s.fma(arc_r, s.fsin(end_ang), arc_cy)
+    var d0x = s.fsub(fgx, sx0)
+    var d0y = s.fsub(fgy, sy0)
+    var d1x = s.fsub(fgx, sx1)
+    var d1y = s.fsub(fgy, sy1)
+    var dc0 = s.fsqrt(s.fma(d0x, d0x, s.fmul(d0y, d0y)))
+    var dc1 = s.fsqrt(s.fma(d1x, d1x, s.fmul(d1y, d1y)))
+    var d_cap = s.fsub(s.nmin(dc0, dc1), arc_half)
+    s.store(d_arc, s.select_f(s.fle(rel, sw_abs), d_arc_ring, d_cap))
+    s.end_if()
+    var da_val = s.load_f(d_arc)
+    var cov_arc = s.nclamp(s.fsub(s.float(0.5), da_val), s.float(0.0), s.float(1.0))
+    var warc = _emit_ui_srgb_to_working(s, is_hdr10, cr, cg, cb)
+    s.begin_if(s.logical_and(has_outer_glow, s.fgt(param2, s.float(0.01))))
+    var ag_soft = s.nclamp(param2, s.float(1.5), s.float(28.0))
+    var ag_u = s.fdiv(s.nmax(da_val, s.float(0.0)), ag_soft)
+    var ag_a = s.fmul(s.exp2(s.fmul(s.float(-2.4), s.fmul(ag_u, ag_u))), s.fmul(s.fsub(s.float(1.0), cov_arc), s.fmul(ca, s.float(0.65))))
+    _emit_blend_over(s, accum_r, accum_g, accum_b, warc[0], warc[1], warc[2], ag_a)
+    s.end_if()
+    _emit_blend_over(s, accum_r, accum_g, accum_b, warc[0], warc[1], warc[2], s.fmul(ca, cov_arc))
+    s.end_if()
     s.end_if()
 
     # ------------------------------------------------------------------------

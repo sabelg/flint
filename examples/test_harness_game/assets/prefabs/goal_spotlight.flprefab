@@ -1,0 +1,7 @@
+{
+  "format": "flprefab",
+  "version": 1,
+  "name": "GoalSpotLight",
+  "nodes": [{"name": "GoalSpotLight", "parent_slot": -1, "components": {"LocalTransform": {"translation": [4.5, 5.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}, "SpotLightComponent": {"radiance": [8.0, 9.5, 7.0], "range": 18.0, "inner_deg": 18.0, "outer_deg": 35.0, "direction": [0.0, -1.0, 0.0], "enabled": true}}}],
+  "nested_refs": []
+}

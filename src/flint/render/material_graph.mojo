@@ -238,6 +238,10 @@ struct MaterialAsset(Copyable, Movable):
     def set_orm_slot(mut self, slot: Int):
         self.orm_slot = UInt16(min(Int(BINDLESS_SLOT_MAX), slot)) if slot >= 0 else BINDLESS_SLOT_NONE
 
+    @always_inline
+    def set_emissive_slot(mut self, slot: Int):
+        self.emissive_slot = UInt16(min(Int(BINDLESS_SLOT_MAX), slot)) if slot >= 0 else BINDLESS_SLOT_NONE
+
     def append_words(self, mut out: List[UInt32]):
         """Appends exact `24 x UInt32` (`96` bytes = `AAA_MATERIAL_WORDS`) unified GPU SSBO material representation."""
         self.to_aaa_material().append_words(out)

@@ -473,7 +473,7 @@ struct NativeModel(Copyable, Movable):
         """Keeps only the named clips, in their order here, and of those only
         the channels that leave the rest pose (as `bind_clips` does for a
         mesh). For a clip file that is sampled, never bound (package 3.23:
-        Maroon_Moves holds 107 moves, the acting plays about half, and a
+        a character clip library holds 100+ moves, the acting plays about half, and a
         glTF export keys every bone's translation, rotation and scale).
         Returns how many clips are left."""
         var kept = List[NativeAnimation]()

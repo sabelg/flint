@@ -130,6 +130,7 @@ struct Animator(Copyable, Movable):
     var root_node: Int
     # The state machine.
     var state: Int
+    var manual_state: Int
     var previous: Int
     var state_time: Float32
     var clip_time: Float32
@@ -182,6 +183,7 @@ struct Animator(Copyable, Movable):
         self.all_nodes = List[Float32]()
         self.root_node = -1
         self.state = -1
+        self.manual_state = -1
         self.previous = -1
         self.state_time = 0
         self.clip_time = 0
@@ -239,6 +241,7 @@ struct Animator(Copyable, Movable):
     def reset(mut self):
         """Start over without blending (a teleport, a seek, a new form)."""
         self.state = -1
+        self.manual_state = -1
         self.previous = -1
         self.state_time = 0
         self.clip_time = 0
@@ -266,6 +269,19 @@ struct Animator(Copyable, Movable):
         if self.state < 0 or self.state >= len(self.graph.states):
             return ""
         return self.graph.states[self.state].name
+
+    def set_manual_state(mut self, state_idx: Int):
+        self.manual_state = state_idx
+        self.state = state_idx
+        self.state_time = 0
+        self.clip_time = 0
+        self.prev_clip_time = 0
+        self.phase = 0
+        self.prev_phase = 0
+        self.inertial.reset()
+
+    def clear_manual_state(mut self):
+        self.manual_state = -1
 
     def layer_weight(self, name: String) -> Float32:
         var index = self.graph.layer(name)
@@ -325,6 +341,8 @@ struct Animator(Copyable, Movable):
         return st.holds and all_hold(st.hold_while, self.params) and self.clip_time < self.hold_time(self.state)
 
     def select(self) -> Int:
+        if self.manual_state >= 0 and self.manual_state < len(self.graph.states):
+            return self.manual_state
         var candidate = len(self.graph.states) - 1
         for index in range(len(self.graph.states)):
             if all_hold(self.graph.states[index].when, self.params):
@@ -400,6 +418,67 @@ struct Animator(Copyable, Movable):
             swap(ahead, self.ahead)
         self.inertial.apply(out, self.ahead, self.switched, self.halflife, safe_dt)
         swap(out, self.pose)
+
+    def evaluate_paused(mut self, model: NativeModel, handle: Int):
+        """Evaluates the current state/pose without advancing clocks or firing events."""
+        self.events.clear()
+        self.switched = False
+        self.root_delta = Vec3()
+        self.root_yaw_delta = Float32(0.0)
+        if not self.configured() or len(model.nodes) == 0:
+            return
+        self.bind(model, handle)
+        if self.manual_state >= 0 and self.manual_state < len(self.graph.states):
+            self.state = self.manual_state
+        elif self.state < 0 or self.state >= len(self.graph.states):
+            self.state = self.select()
+        if self.state < 0 or self.state >= len(self.graph.states):
+            return
+        ref st = self.graph.states[self.state]
+        if st.clip >= 0:
+            self.weights = List[Float32]()
+            self.leader = st.clip
+            if st.time_param >= 0 and st.time_param < len(self.params) and st.clip < len(self.clips):
+                self.clip_time = max(Float32(0), min(Float32(1), self.params[st.time_param])) * self.clips[st.clip].duration
+            self.leader_time = self.clip_time
+        elif st.blend_2d >= 0:
+            ref space2d = self.graph.blend_spaces_2d[st.blend_2d]
+            var px = self.params[space2d.param_x] if space2d.param_x >= 0 and space2d.param_x < len(self.params) else Float32(0.0)
+            var py = self.params[space2d.param_y] if space2d.param_y >= 0 and space2d.param_y < len(self.params) else Float32(0.0)
+            self.weights = space2d.weights(px, py)
+            if len(space2d.samples) > 0:
+                var lead2d = 0
+                for index in range(len(self.weights)):
+                    if self.weights[index] > self.weights[lead2d]:
+                        lead2d = index
+                self.leader = space2d.samples[lead2d].clip
+                self.leader_time = self.tracks[self.leader].time_at(self.phase) if self.leader >= 0 and self.leader < len(self.tracks) else Float32(0.0)
+        elif st.blend >= 0:
+            ref space = self.graph.blend_spaces[st.blend]
+            var pv = self.params[space.param] if space.param >= 0 and space.param < len(self.params) else Float32(0.0)
+            self.weights = space.weights(pv)
+            if len(space.samples) > 0:
+                var lead = 0
+                for index in range(len(self.weights)):
+                    if self.weights[index] > self.weights[lead]:
+                        lead = index
+                self.leader = space.samples[lead].clip
+                self.leader_time = self.tracks[self.leader].time_at(self.phase) if self.leader >= 0 and self.leader < len(self.tracks) else Float32(0.0)
+        var out = Pose()
+        swap(out, self.pose)
+        self.evaluate_base(model, out, 0)
+        self.apply_layers(model, out)
+        swap(out, self.pose)
+        if self.root_node >= 0 and self.root_node < self.pose.count():
+            var mode = self.graph.states[self.state].root_motion
+            if mode == ROOT_STRIP or mode == ROOT_EXTRACT:
+                var base = model.nodes[self.root_node].base_translation
+                self.pose.t[self.root_node] = Vec3(base.x, self.pose.t[self.root_node].y, base.z)
+                if self.extract_root_yaw:
+                    var base_yaw = _quat_yaw(model.nodes[self.root_node].base_rotation)
+                    var root_yaw = _quat_yaw(self.pose.r[self.root_node])
+                    var strip_q = Quat(0.0, det_sin((base_yaw - root_yaw) * Float32(0.5)), 0.0, det_cos((base_yaw - root_yaw) * Float32(0.5)))
+                    self.pose.r[self.root_node] = strip_q.multiply(self.pose.r[self.root_node]).normalized()
 
     def _blended_segment_length_1d(self, blend_idx: Int, leader_clip: Int, segment: Int) -> Float32:
         ref space = self.graph.blend_spaces[blend_idx]

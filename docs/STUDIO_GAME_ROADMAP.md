@@ -65,6 +65,7 @@
 | 8 | **Animation graph editor.** Edit states, transitions, conditions, blend spaces and layers, with a JSON writer and clip and socket pickers. Add hitbox/hurtbox authoring with animation event tracks inside Flint, not through game `flint.toml` entries. | L |
 | 9 | **Game flow and level scripting.** Add `entity_from_body`, OnEnter/OnExit helpers, BehaviorTree save plus a component, a game-state machine, scene transitions, save slots, and timers and tweens. | M each |
 | 10 | **Larger authoring tools.** Terrain sculpt and paint (rendering lives only in `examples/open_world`), scatter and drop-to-surface, UI documents with a HUD editor, world streaming and sub-levels, and a camera sequencer. | L |
+| 11 | **TurboMojo IDE integration.** The in-Studio IDE is the external `tmide` running in a pseudo-terminal (`studio/ide_pty.mojo`, `source_editor.mojo`, `tools/flint.sh` `FLINT_TURBOMOJO`). Its Build/Run buttons only send F-key presses, so edited code never reaches Studio. Connect it to the gameplay `.so` hot reload, compiler errors and code navigation (see M2 below). | M |
 
 ---
 
@@ -119,6 +120,20 @@ Each milestone ends with an acceptance test played on a **test-harness game**: a
 - [ ] Add a game-state machine, scene transitions, save slots, and timers and tweens.
 
 **Acceptance:** a playable loop in PIE: move, fight one enemy that uses a BehaviorTree, pick something up, reach a goal trigger. Editing gameplay code reloads it without restarting Studio.
+
+#### M2 (IDE): TurboMojo integration
+Gameplay code is written in TurboMojo (`tmide`, opened in Studio with F8). This track makes the edit → build → play loop work without leaving Studio.
+
+- [ ] **Build calls the real build.** TurboMojo's Build in a Flint project runs `flint.sh gameplay-so`. Studio hot-swaps the resulting `.so` into PIE, or into the next PIE session if it isn't running. Use the project's `.turbomojo.toml` `[run]` entries, not F-key presses sent from `source_editor.mojo`.
+- [ ] **Run plays in the editor.** TurboMojo's Run starts or restarts PIE in the open Studio instead of launching a separate program.
+- [ ] **Compiler errors.** Build output is parsed into file:line:col diagnostics. Studio shows them in a Problems list and as a toast. Clicking one opens TurboMojo at that line. A failed build keeps the last good `.so` loaded.
+- [ ] **Code navigation from the editor.** In the inspector, "Open source" on a project component or system jumps to its definition in TurboMojo. Add an MCP tool `ide.open` (path, line) so agents can do the same.
+- [ ] **Reliable launch.** Resolve `tmide` and `tmide-gui` from the project, then `FLINT_TURBOMOJO`, then the pixi env, then `PATH`. If it is missing, Studio shows a message with the install command instead of failing, and Studio stays usable.
+- [ ] **Keyboard ownership.** While the IDE panel has focus, every key goes to TurboMojo and no Studio hotkey fires, using the same capture rules as `UiContext.wants_keyboard()`.
+- [ ] **New projects come IDE-ready.** `flint.sh new` writes a `.turbomojo.toml` with `gameplay` (build `.so`), `game` (run) and `test` targets and the Flint include paths.
+- [ ] **Tests.** A headless test uses a fake `tmide` on `PATH` (extending `tests/test_studio_ide.sh`). It covers launch, Build → `.so` reload, error parsing and jump-to-line.
+
+**Acceptance:** with PIE running, change a value in a gameplay system in TurboMojo and press Build. The running game picks it up within a few seconds, with world state kept. Introduce a type error: Studio lists it, clicking it opens the line, and the game keeps running the last good build.
 
 ### M3: It ships (about 2 weeks)
 - [ ] Studio runs from the project directory; scenes live in `<project>/scenes/`.

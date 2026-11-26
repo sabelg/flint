@@ -1,0 +1,7 @@
+{
+  "format": "flprefab",
+  "version": 1,
+  "name": "Environment",
+  "nodes": [{"name": "Environment", "parent_slot": -1, "components": {"LocalTransform": {"translation": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}, "EnvironmentComponent": {"sun_dir": [0.4000000059604645, 0.8500000238418579, -0.3499999940395355], "sun_radiance": [3.200000047683716, 3.0, 2.75], "exposure": 1.0499999523162842, "ibl_intensity": 1.0, "turbidity": 2.5, "enabled": true}}}],
+  "nested_refs": []
+}

@@ -15,7 +15,7 @@ Provides:
   propagates `GlobalTransform` in `STAGE_POST_UPDATE`.
 """
 from std.collections import List
-from std.math import abs, max, min
+from std.math import abs, isfinite, max, min
 from flint.anim.animator import Animator
 from flint.anim.flanim_ecs import (
     BoneSocketAttachment,
@@ -24,7 +24,7 @@ from flint.anim.flanim_ecs import (
     solve_foot_plant_world,
 )
 from flint.anim.graph import AnimGraphDef
-from flint.anim.pose import Pose, SkeletonInstance
+from flint.anim.pose import Pose, SkeletonInstance, sample_pose
 from flint.anim.procedural import DEG, FootPlantSolver, Placement
 from flint.anim.sync import ClipInfo, FiredEvent
 from flint.app.engine_app import (
@@ -36,6 +36,7 @@ from flint.app.engine_app import (
     STAGE_PRE_UPDATE,
     STAGE_UPDATE,
 )
+from flint.assets.asset_ref import AssetRef
 from flint.assets.json import JsonDocument
 from flint.assets.json_write import json_quote
 from flint.assets.model import NativeModel
@@ -241,21 +242,24 @@ struct SkeletonComponent(SerializableComponent):
     comptime STORAGE_MODE: Int = STORAGE_TABLE
     comptime SCHEMA_NAME: StaticString = "SkeletonComponent"
     comptime SCHEMA_FOURCC: UInt32 = fourcc("ASKL")
-    comptime SCHEMA_VERSION: Int = 1
+    comptime SCHEMA_VERSION: Int = 3
 
     var model_id: UInt64
     var skeleton: SkeletonInstance
     var dirty_topology: Bool
+    var rig_ref: AssetRef
 
     def __init__(
         out self,
         model_id: UInt64 = 0,
         var skeleton: SkeletonInstance = SkeletonInstance(),
         dirty_topology: Bool = True,
+        var rig_ref: AssetRef = AssetRef(),
     ):
         self.model_id = model_id
         self.skeleton = skeleton^
         self.dirty_topology = dirty_topology
+        self.rig_ref = rig_ref^
 
     def write_bin(self, mut out: BlobWriter):
         out.u64(self.model_id)
@@ -266,10 +270,13 @@ struct SkeletonComponent(SerializableComponent):
             out.vec3(self.skeleton.pose.t[i])
             out.quat(self.skeleton.pose.r[i])
             out.vec3(self.skeleton.pose.s[i])
+        self.rig_ref.write_bin(out)
+        var par_n = min(n, len(self.skeleton.parents))
+        for i in range(n):
+            out.integer(self.skeleton.parents[i] if i < par_n else -1)
 
     @staticmethod
     def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
-        _ = version
         var mid = reader.u64()
         var dirty = reader.boolean()
         var n = reader.integer()
@@ -280,33 +287,85 @@ struct SkeletonComponent(SerializableComponent):
             skel.pose.t[i] = reader.vec3()
             skel.pose.r[i] = reader.quat()
             skel.pose.s[i] = reader.vec3()
+        var rref = AssetRef.read_bin(reader, 1) if version >= 2 else AssetRef()
+        if version >= 3:
+            for i in range(n):
+                skel.parents[i] = reader.integer()
         if reader.failed:
             raise Error("SkeletonComponent: truncated blob")
-        return Self(mid, skel^, dirty)
+        return Self(mid, skel^, dirty, rref^)
 
     def write_json(self) -> String:
+        var nc = self.skeleton.node_count
+        var par_n = min(nc, len(self.skeleton.parents))
+        var par_str = String("[")
+        for i in range(nc):
+            if i > 0:
+                par_str += ", "
+            var p = self.skeleton.parents[i] if i < par_n else -1
+            par_str += String(p)
+        par_str += "]"
+        var pose_n = self.skeleton.pose.count()
+        var pose_str = String("[")
+        for i in range(pose_n):
+            if i > 0:
+                pose_str += ", "
+            pose_str += (
+                "{\"t\": " + _vec3_json(self.skeleton.pose.t[i])
+                + ", \"r\": " + _quat_json(self.skeleton.pose.r[i])
+                + ", \"s\": " + _vec3_json(self.skeleton.pose.s[i])
+                + "}"
+            )
+        pose_str += "]"
         return (
             "{\"model_id\": " + String(self.model_id)
-            + ", \"node_count\": " + String(self.skeleton.node_count)
+            + ", \"node_count\": " + String(nc)
             + ", \"dirty_topology\": " + ("true" if self.dirty_topology else "false")
+            + ", \"rig_ref\": " + self.rig_ref.write_json()
+            + ", \"parents\": " + par_str
+            + ", \"pose\": " + pose_str
             + "}"
         )
 
     @staticmethod
     def read_json(doc: JsonDocument, node: Int) raises -> Self:
-        var mid = UInt64(doc.integer(doc.object_get(node, "model_id"), 0))
-        var nc = doc.integer(doc.object_get(node, "node_count"), 0)
+        var mid = doc.u64(doc.object_get(node, "model_id"), 0)
+        var nc_node = doc.object_get(node, "node_count")
+        var pnode = doc.object_get(node, "pose")
+        var parnode = doc.object_get(node, "parents")
+        var pose_len = doc.array_size(pnode) if pnode >= 0 else 0
+        var nc = max(0, doc.integer(nc_node, pose_len if nc_node < 0 else 0))
+        if nc > 1 << 16:
+            raise Error("SkeletonComponent: invalid node_count")
         var dirty = doc.boolean(doc.object_get(node, "dirty_topology"), True)
-        return Self(mid, SkeletonInstance(max(0, nc)), dirty)
+        var rnode = doc.object_get(node, "rig_ref")
+        var rref = AssetRef.read_json(doc, rnode) if rnode >= 0 else AssetRef()
+        var skel = SkeletonInstance(nc)
+        if parnode >= 0 and doc.array_size(parnode) == nc:
+            for i in range(nc):
+                skel.parents[i] = doc.integer(doc.at(parnode, i), -1)
+        if pnode >= 0 and doc.array_size(pnode) == nc:
+            for i in range(nc):
+                var jnode = doc.at(pnode, i)
+                var tn = doc.object_get(jnode, "t")
+                var rn = doc.object_get(jnode, "r")
+                var sn = doc.object_get(jnode, "s")
+                if tn >= 0:
+                    skel.pose.t[i] = _read_vec3_json(doc, tn, Vec3())
+                if rn >= 0:
+                    skel.pose.r[i] = _read_quat_json(doc, rn)
+                if sn >= 0:
+                    skel.pose.s[i] = _read_vec3_json(doc, sn, Vec3(1.0, 1.0, 1.0))
+        return Self(mid, skel^, dirty, rref^)
 
 
 struct AnimatorComponent(SerializableComponent):
-    """Per-entity `Animator` state machine + optional `FootPlantSolver`."""
+    """Per-entity `Animator` state machine + optional `FootPlantSolver` + direct-clip playback."""
     comptime COMPONENT_ID: UInt64 = comp_hash64("flint.anim.AnimatorComponent")
     comptime STORAGE_MODE: Int = STORAGE_TABLE
     comptime SCHEMA_NAME: StaticString = "AnimatorComponent"
     comptime SCHEMA_FOURCC: UInt32 = fourcc("AANM")
-    comptime SCHEMA_VERSION: Int = 1
+    comptime SCHEMA_VERSION: Int = 3
 
     var graph_id: UInt64
     var animator: Animator
@@ -316,6 +375,13 @@ struct AnimatorComponent(SerializableComponent):
     var foot_in_stance: List[Bool]
     var enable_foot_plant: Bool
     var ignore_body_id: Int
+    var graph_ref: AssetRef
+    var clip_index: Int
+    var clip_name: String
+    var playing: Bool
+    var loop: Bool
+    var time: Float32
+    var speed: Float32
 
     def __init__(
         out self,
@@ -323,6 +389,13 @@ struct AnimatorComponent(SerializableComponent):
         apply_root_motion: Bool = False,
         enable_foot_plant: Bool = False,
         ignore_body_id: Int = -1,
+        var graph_ref: AssetRef = AssetRef(),
+        clip_index: Int = -1,
+        clip_name: String = "",
+        playing: Bool = True,
+        loop: Bool = True,
+        time: Float32 = 0.0,
+        speed: Float32 = 1.0,
     ):
         self.graph_id = graph_id
         self.animator = Animator()
@@ -332,6 +405,13 @@ struct AnimatorComponent(SerializableComponent):
         self.foot_in_stance = List[Bool]()
         self.enable_foot_plant = enable_foot_plant
         self.ignore_body_id = ignore_body_id
+        self.graph_ref = graph_ref^
+        self.clip_index = clip_index
+        self.clip_name = clip_name
+        self.playing = playing
+        self.loop = loop
+        self.time = time
+        self.speed = speed
 
     def write_bin(self, mut out: BlobWriter):
         out.u64(self.graph_id)
@@ -361,10 +441,17 @@ struct AnimatorComponent(SerializableComponent):
         out.integer(len(self.foot_in_stance))
         for i in range(len(self.foot_in_stance)):
             out.boolean(self.foot_in_stance[i])
+        self.graph_ref.write_bin(out)
+        out.integer(self.clip_index)
+        out.text(self.clip_name)
+        out.boolean(self.playing)
+        out.boolean(self.loop)
+        out.f32(self.time)
+        out.f32(self.speed)
+        out.integer(self.animator.manual_state)
 
     @staticmethod
     def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
-        _ = version
         var gid = reader.u64()
         var rm = reader.boolean()
         var bnd = reader.boolean()
@@ -400,26 +487,125 @@ struct AnimatorComponent(SerializableComponent):
             raise Error("AnimatorComponent: invalid stance count")
         for _ in range(n_st):
             out.foot_in_stance.append(reader.boolean())
+        if version >= 2:
+            out.graph_ref = AssetRef.read_bin(reader, 1)
+            out.clip_index = reader.integer()
+            out.clip_name = reader.text()
+            out.playing = reader.boolean()
+            out.loop = reader.boolean()
+            out.time = reader.f32()
+            out.speed = reader.f32()
+        if version >= 3:
+            out.animator.manual_state = reader.integer()
         if reader.failed:
             raise Error("AnimatorComponent: truncated blob")
         return out^
 
     def write_json(self) -> String:
+        var params_str = String("[")
+        for i in range(len(self.animator.params)):
+            if i > 0:
+                params_str += ", "
+            params_str += _f32_s(self.animator.params[i])
+        params_str += "]"
+
+        var legs_str = String("[")
+        for i in range(len(self.foot_plant.legs)):
+            if i > 0:
+                legs_str += ", "
+            ref lg = self.foot_plant.legs[i]
+            legs_str += (
+                "{\"hip\": " + String(lg.hip)
+                + ", \"knee\": " + String(lg.knee)
+                + ", \"ankle\": " + String(lg.ankle)
+                + ", \"ankle_height\": " + _f32_s(lg.ankle_height)
+                + ", \"pole_local\": " + _vec3_json(lg.pole_local)
+                + "}"
+            )
+        legs_str += "]"
+
+        var stance_str = String("[")
+        for i in range(len(self.foot_in_stance)):
+            if i > 0:
+                stance_str += ", "
+            stance_str += ("true" if self.foot_in_stance[i] else "false")
+        stance_str += "]"
+
         return (
             "{\"graph_id\": " + String(self.graph_id)
             + ", \"apply_root_motion\": " + ("true" if self.apply_root_motion else "false")
+            + ", \"bound\": " + ("true" if self.bound else "false")
             + ", \"enable_foot_plant\": " + ("true" if self.enable_foot_plant else "false")
             + ", \"ignore_body_id\": " + String(self.ignore_body_id)
+            + ", \"state\": " + String(self.animator.state)
+            + ", \"previous\": " + String(self.animator.previous)
+            + ", \"state_time\": " + _f32_s(self.animator.state_time)
+            + ", \"clip_time\": " + _f32_s(self.animator.clip_time)
+            + ", \"prev_clip_time\": " + _f32_s(self.animator.prev_clip_time)
+            + ", \"phase\": " + _f32_s(self.animator.phase)
+            + ", \"prev_phase\": " + _f32_s(self.animator.prev_phase)
+            + ", \"params\": " + params_str
+            + ", \"foot_plant_pelvis\": " + String(self.foot_plant.pelvis)
+            + ", \"foot_plant_legs\": " + legs_str
+            + ", \"foot_in_stance\": " + stance_str
+            + ", \"graph_ref\": " + self.graph_ref.write_json()
+            + ", \"clip_index\": " + String(self.clip_index)
+            + ", \"clip_name\": " + json_quote(self.clip_name)
+            + ", \"playing\": " + ("true" if self.playing else "false")
+            + ", \"loop\": " + ("true" if self.loop else "false")
+            + ", \"time\": " + _f32_s(self.time)
+            + ", \"speed\": " + _f32_s(self.speed)
+            + ", \"manual_state\": " + String(self.animator.manual_state)
             + "}"
         )
 
     @staticmethod
     def read_json(doc: JsonDocument, node: Int) raises -> Self:
-        var gid = UInt64(doc.integer(doc.object_get(node, "graph_id"), 0))
+        var gid = doc.u64(doc.object_get(node, "graph_id"), 0)
         var rm = doc.boolean(doc.object_get(node, "apply_root_motion"), False)
         var efp = doc.boolean(doc.object_get(node, "enable_foot_plant"), False)
         var ign = doc.integer(doc.object_get(node, "ignore_body_id"), -1)
-        return Self(gid, rm, efp, ign)
+        var gnode = doc.object_get(node, "graph_ref")
+        var gref = AssetRef.read_json(doc, gnode) if gnode >= 0 else AssetRef()
+        var ci = doc.integer(doc.object_get(node, "clip_index"), -1)
+        var cn = doc.text(doc.object_get(node, "clip_name"), "")
+        var pl = doc.boolean(doc.object_get(node, "playing"), True)
+        var lp = doc.boolean(doc.object_get(node, "loop"), True)
+        var tm = Float32(doc.number(doc.object_get(node, "time"), 0.0))
+        var sp = Float32(doc.number(doc.object_get(node, "speed"), 1.0))
+        var out = Self(gid, rm, efp, ign, gref^, ci, cn, pl, lp, tm, sp)
+        out.bound = doc.boolean(doc.object_get(node, "bound"), False)
+        out.animator.state = doc.integer(doc.object_get(node, "state"), -1)
+        out.animator.manual_state = doc.integer(doc.object_get(node, "manual_state"), -1)
+        out.animator.previous = doc.integer(doc.object_get(node, "previous"), -1)
+        out.animator.state_time = Float32(doc.number(doc.object_get(node, "state_time"), 0.0))
+        out.animator.clip_time = Float32(doc.number(doc.object_get(node, "clip_time"), 0.0))
+        out.animator.prev_clip_time = Float32(doc.number(doc.object_get(node, "prev_clip_time"), 0.0))
+        out.animator.phase = Float32(doc.number(doc.object_get(node, "phase"), 0.0))
+        out.animator.prev_phase = Float32(doc.number(doc.object_get(node, "prev_phase"), 0.0))
+        var params_node = doc.object_get(node, "params")
+        if params_node >= 0:
+            var n_p = min(4096, doc.array_size(params_node))
+            for i in range(n_p):
+                out.animator.params.append(Float32(doc.number(doc.at(params_node, i), 0.0)))
+        out.foot_plant.pelvis = doc.integer(doc.object_get(node, "foot_plant_pelvis"), 0)
+        var legs_node = doc.object_get(node, "foot_plant_legs")
+        if legs_node >= 0:
+            var n_legs = min(64, doc.array_size(legs_node))
+            for i in range(n_legs):
+                var ln = doc.at(legs_node, i)
+                var hip = doc.integer(doc.object_get(ln, "hip"), -1)
+                var knee = doc.integer(doc.object_get(ln, "knee"), -1)
+                var ankle = doc.integer(doc.object_get(ln, "ankle"), -1)
+                var ah = Float32(doc.number(doc.object_get(ln, "ankle_height"), 0.1))
+                var pole = _read_vec3_json(doc, doc.object_get(ln, "pole_local"), Vec3(0.0, 0.5, 1.0))
+                out.foot_plant.add_leg(hip, knee, ankle, ah, pole)
+        var stance_node = doc.object_get(node, "foot_in_stance")
+        if stance_node >= 0:
+            var n_st = min(64, doc.array_size(stance_node))
+            for i in range(n_st):
+                out.foot_in_stance.append(doc.boolean(doc.at(stance_node, i), False))
+        return out^
 
 
 struct RagdollComponent(SerializableComponent):
@@ -510,24 +696,98 @@ struct RagdollComponent(SerializableComponent):
         return Self(sm^, ar, ps)
 
 
+def _ascii_lower(s: String) -> String:
+    var b = s.as_bytes()
+    var out = List[UInt8](capacity=len(b))
+    for i in range(len(b)):
+        var c = b[i]
+        if c >= 65 and c <= 90:
+            out.append(c + 32)
+        else:
+            out.append(c)
+    return String(unsafe_from_utf8=out)
+
+
+struct RigComponent(SerializableComponent):
+    """Links an entity to a `.flrig` rig asset (`rig_ref`) and tracks bound joint count."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.anim.RigComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "RigComponent"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("ARIG")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var rig_ref: AssetRef
+    var bound: Bool
+    var joint_count: Int
+
+    def __init__(
+        out self,
+        var rig_ref: AssetRef = AssetRef(),
+        bound: Bool = False,
+        joint_count: Int = 0,
+    ):
+        self.rig_ref = rig_ref^
+        self.bound = bound
+        self.joint_count = joint_count
+
+    def __init__(out self, *, copy: Self):
+        self.rig_ref = copy.rig_ref.copy()
+        self.bound = copy.bound
+        self.joint_count = copy.joint_count
+
+    def write_bin(self, mut out: BlobWriter):
+        self.rig_ref.write_bin(out)
+        out.boolean(self.bound)
+        out.integer(self.joint_count)
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        _ = version
+        var rref = AssetRef.read_bin(reader, 1)
+        var bnd = reader.boolean()
+        var jc = reader.integer()
+        if reader.failed:
+            raise Error("RigComponent: truncated blob")
+        return Self(rref^, bnd, jc)
+
+    def write_json(self) -> String:
+        return (
+            "{\"rig_ref\": " + self.rig_ref.write_json()
+            + ", \"bound\": " + ("true" if self.bound else "false")
+            + ", \"joint_count\": " + String(self.joint_count)
+            + "}"
+        )
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        var rnode = doc.object_get(node, "rig_ref")
+        var rref = AssetRef.read_json(doc, rnode) if rnode >= 0 else AssetRef()
+        var bnd = doc.boolean(doc.object_get(node, "bound"), False)
+        var jc = doc.integer(doc.object_get(node, "joint_count"), 0)
+        return Self(rref^, bnd, jc)
+
+
 struct BoneSocketComponent(SerializableComponent):
     """Attaches this entity (and optional kinematic body) to a skeleton bone."""
     comptime COMPONENT_ID: UInt64 = comp_hash64("flint.anim.BoneSocketComponent")
     comptime STORAGE_MODE: Int = STORAGE_TABLE
     comptime SCHEMA_NAME: StaticString = "BoneSocketComponent"
     comptime SCHEMA_FOURCC: UInt32 = fourcc("ABSK")
-    comptime SCHEMA_VERSION: Int = 1
+    comptime SCHEMA_VERSION: Int = 2
 
     var skeleton_entity: Entity
     var attachment: BoneSocketAttachment
+    var skeleton_slot: Int
 
     def __init__(
         out self,
         skeleton_entity: Entity = NULL_ENTITY,
         var attachment: BoneSocketAttachment = BoneSocketAttachment(),
+        skeleton_slot: Int = -1,
     ):
         self.skeleton_entity = skeleton_entity
         self.attachment = attachment^
+        self.skeleton_slot = skeleton_slot
 
     def write_bin(self, mut out: BlobWriter):
         out.u64(self.skeleton_entity.to_bits())
@@ -541,10 +801,10 @@ struct BoneSocketComponent(SerializableComponent):
         out.vec3(self.attachment.world_pos)
         out.quat(self.attachment.world_rot)
         out.vec3(self.attachment.world_scale)
+        out.integer(self.skeleton_slot)
 
     @staticmethod
     def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
-        _ = version
         var sk_e = Entity.from_bits(reader.u64())
         var name = reader.text()
         var bone_node = reader.integer()
@@ -556,34 +816,107 @@ struct BoneSocketComponent(SerializableComponent):
         var wp = reader.vec3()
         var wr = reader.quat()
         var ws = reader.vec3()
+        var sk_slot = reader.integer() if version >= 2 else -1
         var att = BoneSocketAttachment(name, bone_node, eid, lp, lr, ls, kbid)
         att.world_pos = wp
         att.world_rot = wr
         att.world_scale = ws
         if reader.failed:
             raise Error("BoneSocketComponent: truncated blob")
-        return Self(sk_e, att^)
+        return Self(sk_e, att^, sk_slot)
 
-    def write_json(self) -> String:
+    def write_json_with_slot(self, skeleton_slot: Int) -> String:
         return (
             "{\"name\": " + json_quote(self.attachment.name)
             + ", \"bone_node\": " + String(self.attachment.bone_node)
+            + ", \"entity_id\": " + String(self.attachment.entity_id)
             + ", \"kinematic_body_id\": " + String(self.attachment.kinematic_body_id)
+            + ", \"skeleton_slot\": " + String(skeleton_slot)
             + ", \"local_pos\": " + _vec3_json(self.attachment.local_pos)
             + ", \"local_rot\": " + _quat_json(self.attachment.local_rot)
             + ", \"local_scale\": " + _vec3_json(self.attachment.local_scale)
+            + ", \"world_pos\": " + _vec3_json(self.attachment.world_pos)
+            + ", \"world_rot\": " + _quat_json(self.attachment.world_rot)
+            + ", \"world_scale\": " + _vec3_json(self.attachment.world_scale)
             + "}"
         )
+
+    def write_json(self) -> String:
+        return self.write_json_with_slot(self.skeleton_slot)
 
     @staticmethod
     def read_json(doc: JsonDocument, node: Int) raises -> Self:
         var name = doc.text(doc.object_get(node, "name"), "")
         var bnode = doc.integer(doc.object_get(node, "bone_node"), -1)
+        var eid = doc.integer(doc.object_get(node, "entity_id"), -1)
         var kbid = doc.integer(doc.object_get(node, "kinematic_body_id"), -1)
+        var sk_slot = doc.integer(doc.object_get(node, "skeleton_slot"), -1)
         var lp = _read_vec3_json(doc, doc.object_get(node, "local_pos"), Vec3())
         var lr = _read_quat_json(doc, doc.object_get(node, "local_rot"))
         var ls = _read_vec3_json(doc, doc.object_get(node, "local_scale"), Vec3(1.0, 1.0, 1.0))
-        return Self(NULL_ENTITY, BoneSocketAttachment(name, bnode, -1, lp, lr, ls, kbid))
+        var wp = _read_vec3_json(doc, doc.object_get(node, "world_pos"), Vec3())
+        var wr = _read_quat_json(doc, doc.object_get(node, "world_rot"))
+        var ws = _read_vec3_json(doc, doc.object_get(node, "world_scale"), Vec3(1.0, 1.0, 1.0))
+        var att = BoneSocketAttachment(name, bnode, eid, lp, lr, ls, kbid)
+        att.world_pos = wp
+        att.world_rot = wr
+        att.world_scale = ws
+        return Self(NULL_ENTITY, att^, sk_slot)
+
+
+def _bone_socket_write_bin_slots(
+    world_addr: Int, entity: Entity, ent_to_slot_addr: Int, writer_addr: Int
+) -> Bool:
+    ref world = Pointer[World, ImmutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
+    ref ent_to_slot = Pointer[List[Int], ImmutAnyOrigin](unsafe_from_address=ent_to_slot_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    var ptr_opt = world.get_ptr[BoneSocketComponent](entity)
+    if not ptr_opt:
+        return False
+    ref bs = ptr_opt.value()[unsafe_offset=0]
+    var sk_slot = -1
+    if world.is_alive(bs.skeleton_entity) and Int(bs.skeleton_entity.index) < len(ent_to_slot):
+        sk_slot = ent_to_slot[Int(bs.skeleton_entity.index)]
+    var tmp = BoneSocketComponent(NULL_ENTITY, bs.attachment.copy(), sk_slot)
+    out.begin(BoneSocketComponent.SCHEMA_FOURCC, BoneSocketComponent.SCHEMA_VERSION)
+    tmp.write_bin(out)
+    out.end()
+    return True
+
+
+def _bone_socket_write_json_slots(
+    world_addr: Int, entity: Entity, ent_to_slot_addr: Int, str_out_addr: Int
+) -> Bool:
+    ref world = Pointer[World, ImmutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
+    ref ent_to_slot = Pointer[List[Int], ImmutAnyOrigin](unsafe_from_address=ent_to_slot_addr)[unsafe_offset=0]
+    ref s_out = Pointer[String, MutAnyOrigin](unsafe_from_address=str_out_addr)[unsafe_offset=0]
+    var ptr_opt = world.get_ptr[BoneSocketComponent](entity)
+    if not ptr_opt:
+        return False
+    ref bs = ptr_opt.value()[unsafe_offset=0]
+    var sk_slot = -1
+    if world.is_alive(bs.skeleton_entity) and Int(bs.skeleton_entity.index) < len(ent_to_slot):
+        sk_slot = ent_to_slot[Int(bs.skeleton_entity.index)]
+    s_out = bs.write_json_with_slot(sk_slot)
+    return True
+
+
+def _bone_socket_resolve_slots(world_addr: Int, entity: Entity, spawned_addr: Int):
+    ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
+    ref spawned = Pointer[List[Entity], ImmutAnyOrigin](unsafe_from_address=spawned_addr)[unsafe_offset=0]
+    var bs_opt = world.get_ptr_mut[BoneSocketComponent](entity)
+    if not bs_opt:
+        return
+    ref bs = bs_opt.value()[unsafe_offset=0]
+    if bs.skeleton_slot >= 0 and bs.skeleton_slot < len(spawned):
+        bs.skeleton_entity = spawned[bs.skeleton_slot]
+        bs.skeleton_slot = -1
+    elif not world.is_alive(bs.skeleton_entity):
+        var par_opt = world.get_ptr[Parent](entity)
+        if par_opt and world.is_alive(par_opt.value()[unsafe_offset=0].entity):
+            var pe = par_opt.value()[unsafe_offset=0].entity
+            if world.has[SkeletonComponent](pe):
+                bs.skeleton_entity = pe
 
 
 # ---------------------------------------------------------------------------
@@ -591,19 +924,26 @@ struct BoneSocketComponent(SerializableComponent):
 # ---------------------------------------------------------------------------
 
 def register_anim_components(mut world: World):
-    """Idempotently registers all 4 animation components + custom binary snapshot hooks."""
+    """Idempotently registers all 5 animation components + custom binary snapshot hooks."""
     _register_non_trivial_anim[SkeletonComponent](world)
     _register_non_trivial_anim[AnimatorComponent](world)
     _register_non_trivial_anim[RagdollComponent](world)
     _register_non_trivial_anim[BoneSocketComponent](world)
+    _register_non_trivial_anim[RigComponent](world)
 
 
 def register_anim_codecs(mut reg: ComponentRegistry):
-    """Registers all 4 animation `SerializableComponent` codecs on `ComponentRegistry`."""
+    """Registers all 5 animation `SerializableComponent` codecs on `ComponentRegistry`."""
     reg.register[SkeletonComponent]()
     reg.register[AnimatorComponent]()
     reg.register[RagdollComponent]()
     reg.register[BoneSocketComponent]()
+    reg.set_slot_hooks[BoneSocketComponent](
+        _bone_socket_write_bin_slots,
+        _bone_socket_write_json_slots,
+        _bone_socket_resolve_slots,
+    )
+    reg.register[RigComponent]()
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +1043,11 @@ def _sys_anim_update(
         if not ac.animator.configured() and ac.graph_id != 0:
             var g_idx = cache.find_graph(ac.graph_id)
             if g_idx >= 0:
+                var pre_manual = ac.animator.manual_state
                 ac.animator.configure(cache.graphs[g_idx], cache.graph_clips[g_idx])
+                if pre_manual >= 0 and pre_manual < len(ac.animator.graph.states):
+                    ac.animator.manual_state = pre_manual
+                    ac.animator.state = pre_manual
                 ac.bound = False
 
         if sk.dirty_topology:
@@ -712,7 +1056,13 @@ def _sys_anim_update(
 
         sk.skeleton.snapshot_prev_matrices()
         if ac.animator.configured():
-            ac.animator.update(model, m_idx, dt)
+            var eff_dt = Float32(0.0)
+            if ac.playing and isfinite(ac.speed) and ac.speed > Float32(0.0):
+                eff_dt = dt * ac.speed
+            if eff_dt > Float32(0.0):
+                ac.animator.update(model, m_idx, eff_dt)
+            else:
+                ac.animator.evaluate_paused(model, m_idx)
             ac.animator.apply_to_skeleton(sk.skeleton, model)
             ac.bound = True
             if ev_opt:
@@ -728,6 +1078,27 @@ def _sys_anim_update(
                         var dq = angle_axis(ac.animator.root_yaw_delta, Vec3(0.0, 1.0, 0.0))
                         lt.rotation = (dq * lt.rotation).normalized()
         else:
+            var direct_cidx = -1
+            if ac.clip_index >= 0 and ac.clip_index < len(model.animations):
+                direct_cidx = ac.clip_index
+            elif ac.clip_name.byte_length() > 0 and len(model.animations) > 0:
+                var target_lower = _ascii_lower(ac.clip_name)
+                for ci in range(len(model.animations)):
+                    if model.animations[ci].name == ac.clip_name or _ascii_lower(model.animations[ci].name) == target_lower:
+                        direct_cidx = ci
+                        break
+            if direct_cidx >= 0:
+                if ac.playing:
+                    ac.time += dt * ac.speed
+                var dur = model.animations[direct_cidx].duration
+                var sample_t = ac.time
+                if ac.loop and dur > Float32(1.0e-5):
+                    sample_t = ac.time - Float32(Int(ac.time / dur)) * dur
+                    if sample_t < Float32(0.0):
+                        sample_t += dur
+                sample_pose(model, direct_cidx, sample_t, ac.animator.pose)
+                sk.skeleton.apply_pose(ac.animator.pose, model)
+                ac.bound = True
             sk.skeleton.update_matrices(model)
 
     # Skeleton-only entities (no AnimatorComponent)

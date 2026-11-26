@@ -181,7 +181,13 @@ from flint.text.shaper import FontFallbackChain, TextShaper, shape_text
 from flint.text.line_break import wrap_shaped
 from flint.text.rich_text import parse_rich, layout_rich, layout_rich_shaped
 from flint.render.font import SdfFont
-from flint.platform.os import read_bytes
+from flint.platform.os import is_directory, make_dirs, read_bytes, remove_file, write_bytes
+from flint.app.engine_app import AppConfig, EngineApp
+from flint.assets.cooker_v2 import cook_workspace
+from flint.assets.server import AssetServer
+from flint.audio.plugin import AudioEmitterComponent, AudioListenerComponent, AudioPlugin
+from flint.core.jobs import JobPool
+from flint.scene.transform_hierarchy import GlobalTransform, LocalTransform, PrevGlobalTransform, TransformPlugin
 from flint.input import (
     EV_KEY,
     EV_ABS,
@@ -203,7 +209,10 @@ from flint.input import (
     ACTION_BOOL,
     ACTION_AXIS1D,
     ACTION_AXIS2D,
+    MOD_ALT,
     MOD_CTRL,
+    MOD_NONE,
+    MOD_SHIFT,
     INPUT_DEV_KBM,
     INPUT_DEV_XBOX,
     INPUT_DEV_SONY,
@@ -4208,6 +4217,14 @@ def test_f26_text_input_clipboard_mouse_scroll_ime() raises:
     var long_txt = String("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
     var ui_sc = UiContext()
     inp.begin_frame()
+    inp.move_mouse(4.0, 15.0)
+    inp.set_mouse(0, True)
+    ui_sc.begin_frame(inp, 800.0, 600.0)
+    _ = ui_sc.text_input("scroll_box", long_txt, 120.0)
+    ui_sc.end_frame()
+    inp.set_mouse(0, False)
+
+    inp.begin_frame()
     inp.set_logical_key(UI_KEY_END, True)
     ui_sc.begin_frame(inp, 800.0, 600.0)
     _ = ui_sc.text_input("scroll_box", long_txt, 120.0)
@@ -4226,6 +4243,14 @@ def test_f26_text_input_clipboard_mouse_scroll_ime() raises:
     # 5. IME Preedit, Inline Primitives, Shortcut Suppression, Modal Escape Guard & Commit
     var ui_ime = UiContext()
     var ime_txt = String("hello")
+    inp.begin_frame()
+    inp.move_mouse(4.0, 15.0)
+    inp.set_mouse(0, True)
+    ui_ime.begin_frame(inp, 800.0, 600.0)
+    _ = ui_ime.text_input("ime_box", ime_txt, 240.0)
+    ui_ime.end_frame()
+    inp.set_mouse(0, False)
+
     inp.begin_frame()
     inp.set_ime_preedit("nihon", 3, 2)
     ui_ime.begin_frame(inp, 800.0, 600.0)
@@ -4395,6 +4420,14 @@ def test_f26_text_input_clipboard_mouse_scroll_ime() raises:
     var ui_sim = UiContext()
     var sim_txt = String("ab")
     inp.begin_frame()
+    inp.move_mouse(4.0, 15.0)
+    inp.set_mouse(0, True)
+    ui_sim.begin_frame(inp, 800.0, 600.0)
+    _ = ui_sim.text_input("sim_box", sim_txt, 220.0)
+    ui_sim.end_frame()
+    inp.set_mouse(0, False)
+
+    inp.begin_frame()
     inp.commit_ime_preedit("漢")
     inp.set_ime_preedit("kan", 3, 0)
     ui_sim.begin_frame(inp, 800.0, 600.0)
@@ -4560,6 +4593,233 @@ def test_t5_button_drag_outside_and_qoa_bounds() raises:
     assert_equal(wrote_clamped, 2)
 
 
+def test_m3a_input_chord_specificity_os_dir_and_audio_cache_stop_all() raises:
+    # 1. InputMap chord specificity: Ctrl+Shift+Z registered AFTER Ctrl+Z must win when Shift+Ctrl+Z held
+    var imap = InputMap()
+    _ = imap.register_action("undo", ACTION_BOOL)
+    _ = imap.register_action("redo", ACTION_BOOL)
+    _ = imap.register_action("save_all", ACTION_BOOL)
+    _ = imap.register_action("save", ACTION_BOOL)
+    var ctx = InputContext("Editor", 10)
+    ctx.bind_key("undo", 90, MOD_CTRL)
+    ctx.bind_key("redo", 90, MOD_CTRL | MOD_SHIFT)
+    ctx.bind_key("save", 83, MOD_CTRL)
+    ctx.bind_key("save_all", 83, MOD_CTRL | MOD_SHIFT | MOD_ALT)
+    imap.add_context(ctx^)
+    imap.push_context("Editor")
+
+    var inp = InputState()
+    inp.begin_frame()
+    inp.set_logical_key(UI_KEY_LEFT_CTRL, True)
+    inp.set_logical_key(UI_KEY_LEFT_SHIFT, True)
+    inp.set_logical_key(90, True)  # Z
+    imap.update(inp, Float32(1.0 / 60.0))
+    assert_true(imap.just_pressed("redo"))
+    assert_false(imap.just_pressed("undo"))
+
+    inp.begin_frame()
+    inp.set_logical_key(UI_KEY_LEFT_SHIFT, False)
+    imap.update(inp, Float32(1.0 / 60.0))
+    assert_true(imap.is_down("undo"))
+    assert_false(imap.is_down("redo"))
+
+    # 3-modifier chord (Ctrl+Shift+Alt+S) registered AFTER 1-modifier (Ctrl+S)
+    inp.begin_frame()
+    inp.set_logical_key(90, False)
+    inp.set_logical_key(UI_KEY_LEFT_SHIFT, True)
+    inp.set_logical_key(342, True)  # Left Alt
+    inp.set_logical_key(83, True)   # S
+    imap.update(inp, Float32(1.0 / 60.0))
+    assert_true(imap.just_pressed("save_all"))
+    assert_false(imap.just_pressed("save"))
+
+    # 2. os.is_directory (real dir, trailing slash, regular file, nonexistent, symlink-safe)
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp_dir = "/tmp/flint_m3a_os_aud_" + String(pid)
+    var sub_dir = tmp_dir + "/real_sub"
+    var sym_dir = tmp_dir + "/sym_sub"
+    var reg_file = sub_dir + "/clip.qoa"
+    assert_true(make_dirs(sub_dir))
+    var pcm_s = List[Int16](length=64, fill=Int16(400))
+    var qoa_s = encode_qoa(pcm_s, 2, 48000)
+    assert_true(write_bytes(reg_file, qoa_s))
+    var target_rel = String("real_sub")
+    _ = external_call["symlink", Int32](target_rel.as_c_string_span(), sym_dir.as_c_string_span())
+
+    assert_true(is_directory(sub_dir))
+    assert_true(is_directory(sub_dir + "/"))
+    assert_false(is_directory(reg_file))
+    assert_false(is_directory(tmp_dir + "/nonexistent_xyz"))
+    assert_false(is_directory(sym_dir))
+    assert_false(is_directory(sym_dir + "/"))
+    assert_true(is_directory(sym_dir, follow_symlinks=True))
+
+    # 3. AudioServer.stop_all() & path_cache + AudioPlugin asset_path resolution
+    var app = EngineApp(AppConfig(title="m3a_aud_cache", headless=True, worker_threads=0))
+    app.add_plugin(TransformPlugin())
+    app.add_plugin(AudioPlugin(headless=True, sample_rate=48000, quantum_frames=256, ring_capacity=256))
+    app.startup()
+
+    var e1 = app.world.spawn()
+    _ = app.world.insert[LocalTransform](e1, LocalTransform(Vec3(0.0, 0.0, 0.0)))
+    _ = app.world.insert[GlobalTransform](e1, GlobalTransform())
+    _ = app.world.insert[PrevGlobalTransform](e1, PrevGlobalTransform())
+    _ = app.world.insert[AudioEmitterComponent](e1, AudioEmitterComponent(asset_id=-1, asset_path=reg_file, volume=0.7, play_on_spawn=True))
+    var e2 = app.world.spawn()
+    _ = app.world.insert[LocalTransform](e2, LocalTransform(Vec3(1.0, 0.0, 0.0)))
+    _ = app.world.insert[GlobalTransform](e2, GlobalTransform())
+    _ = app.world.insert[PrevGlobalTransform](e2, PrevGlobalTransform())
+    _ = app.world.insert[AudioEmitterComponent](e2, AudioEmitterComponent(asset_id=-1, asset_path=reg_file, volume=0.7, play_on_spawn=True))
+    var l1 = app.world.spawn()
+    _ = app.world.insert[LocalTransform](l1, LocalTransform())
+    _ = app.world.insert[GlobalTransform](l1, GlobalTransform())
+    _ = app.world.insert[AudioListenerComponent](l1, AudioListenerComponent(active=True))
+
+    app.step_one_frame(Float32(1.0 / 60.0))
+    var aid1 = app.world.get_ptr[AudioEmitterComponent](e1).value()[unsafe_offset=0].asset_id
+    var aid2 = app.world.get_ptr[AudioEmitterComponent](e2).value()[unsafe_offset=0].asset_id
+    assert_true(aid1 >= 0)
+    assert_equal(aid1, aid2)
+
+    var srv_ptr = app.resources.get_ptr_mut[AudioServer]()
+    assert_true(Bool(srv_ptr))
+    assert_equal(srv_ptr.value()[unsafe_offset=0].load_audio_cached(tmp_dir + "/missing.wav"), -1)
+    assert_equal(srv_ptr.value()[unsafe_offset=0].load_audio_cached(reg_file), aid1)
+    srv_ptr.value()[unsafe_offset=0].stop_all()
+    assert_equal(srv_ptr.value()[unsafe_offset=0].active_logical_count(), 0)
+    app.shutdown()
+
+    _ = remove_file(sym_dir)
+    _ = remove_file(reg_file)
+    _ = external_call["rmdir", Int32](sub_dir.as_c_string_span())
+    _ = external_call["rmdir", Int32](tmp_dir.as_c_string_span())
+
+
+def _write_le32(mut buf: List[UInt8], v: UInt32):
+    buf.append(UInt8(v & 0xFF))
+    buf.append(UInt8((v >> 8) & 0xFF))
+    buf.append(UInt8((v >> 16) & 0xFF))
+    buf.append(UInt8((v >> 24) & 0xFF))
+
+
+def _write_le16(mut buf: List[UInt8], v: UInt16):
+    buf.append(UInt8(v & 0xFF))
+    buf.append(UInt8((v >> 8) & 0xFF))
+
+
+def _make_pcm_wav(num_frames: Int = 64, sample_rate: Int = 48000) -> List[UInt8]:
+    var data_bytes = num_frames * 2
+    var out = List[UInt8](capacity=44 + data_bytes)
+    for b in "RIFF".as_bytes():
+        out.append(b)
+    _write_le32(out, UInt32(36 + data_bytes))
+    for b in "WAVE".as_bytes():
+        out.append(b)
+    for b in "fmt ".as_bytes():
+        out.append(b)
+    _write_le32(out, UInt32(16))
+    _write_le16(out, UInt16(1))
+    _write_le16(out, UInt16(1))
+    _write_le32(out, UInt32(sample_rate))
+    _write_le32(out, UInt32(sample_rate * 2))
+    _write_le16(out, UInt16(2))
+    _write_le16(out, UInt16(16))
+    for b in "data".as_bytes():
+        out.append(b)
+    _write_le32(out, UInt32(data_bytes))
+    for i in range(num_frames):
+        var s = Int16((i % 16) * 500)
+        _write_le16(out, UInt16(Int(s) & 0xFFFF))
+    return out^
+
+
+def test_t5_audio_plugin_flpk_vfs_resolution() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_t5_aud_flpk_" + String(pid)
+    var src_assets = tmp + "/src_assets"
+    var cache_dir = tmp + "/cache"
+    var empty_cwd = tmp + "/empty_cwd"
+    var pack_path = tmp + "/assets.flpk"
+    assert_true(make_dirs(src_assets + "/audio"))
+    assert_true(make_dirs(cache_dir))
+    assert_true(make_dirs(empty_cwd))
+
+    var wav_bytes = _make_pcm_wav(128, 48000)
+    assert_true(write_bytes(src_assets + "/audio/pickup.wav", wav_bytes))
+    var pcm_q = List[Int16](length=128, fill=Int16(600))
+    var qoa_bytes = encode_qoa(pcm_q, 1, 48000)
+    assert_true(write_bytes(src_assets + "/audio/sfx.qoa", qoa_bytes))
+
+    var pool = JobPool()
+    assert_true(pool.allocate())
+    var rep = cook_workspace(src_assets, pack_path, pool, cache_dir=cache_dir)
+    pool.stop()
+    assert_true(rep.ok)
+
+    var cwd_buf = List[UInt8](length=4096, fill=0)
+    var cwd_ptr = external_call["getcwd", Int](cwd_buf.unsafe_ptr(), 4096)
+    var orig_cwd = String()
+    if cwd_ptr != 0:
+        var n = 0
+        while n < len(cwd_buf) and cwd_buf[n] != 0:
+            n += 1
+        var sl = List[UInt8](capacity=n)
+        for i in range(n):
+            sl.append(cwd_buf[i])
+        orig_cwd = String(unsafe_from_utf8=sl)
+
+    assert_equal(external_call["chdir", Int32](empty_cwd.as_c_string_span()), Int32(0))
+    try:
+        var srv = AssetServer(enable_watcher=False)
+        assert_true(srv.mount_flpk(pack_path))
+
+        var app = EngineApp(AppConfig(title="t5_aud_flpk", headless=True, worker_threads=0))
+        app.resources.insert(srv^)
+        app.add_plugin(TransformPlugin())
+        app.add_plugin(AudioPlugin(headless=True, sample_rate=48000, quantum_frames=256, ring_capacity=256))
+        app.startup()
+
+        var lis_e = app.world.spawn()
+        _ = app.world.insert[LocalTransform](lis_e, LocalTransform())
+        _ = app.world.insert[GlobalTransform](lis_e, GlobalTransform())
+        _ = app.world.insert[AudioListenerComponent](lis_e, AudioListenerComponent(active=True))
+
+        var wav_e = app.world.spawn()
+        _ = app.world.insert[LocalTransform](wav_e, LocalTransform(Vec3(1.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](wav_e, GlobalTransform())
+        _ = app.world.insert[PrevGlobalTransform](wav_e, PrevGlobalTransform())
+        _ = app.world.insert[AudioEmitterComponent](
+            wav_e,
+            AudioEmitterComponent(asset_id=-1, asset_path="assets/audio/pickup.wav", volume=0.8, play_on_spawn=True),
+        )
+
+        var qoa_e = app.world.spawn()
+        _ = app.world.insert[LocalTransform](qoa_e, LocalTransform(Vec3(-1.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](qoa_e, GlobalTransform())
+        _ = app.world.insert[PrevGlobalTransform](qoa_e, PrevGlobalTransform())
+        _ = app.world.insert[AudioEmitterComponent](
+            qoa_e,
+            AudioEmitterComponent(asset_id=-1, asset_path="audio/sfx.qoa", volume=0.7, play_on_spawn=True),
+        )
+
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        ref em_wav = app.world.get_ptr[AudioEmitterComponent](wav_e).value()[unsafe_offset=0]
+        assert_true(em_wav.asset_id >= 0, "AudioPlugin must resolve .wav from mounted .flpk in empty CWD")
+        assert_true(em_wav.playing and em_wav.handle.is_valid(), "flpk wav AudioEmitterComponent must be playing")
+
+        ref em_qoa = app.world.get_ptr[AudioEmitterComponent](qoa_e).value()[unsafe_offset=0]
+        assert_true(em_qoa.asset_id >= 0, "AudioPlugin must resolve .qoa from mounted .flpk in empty CWD")
+        assert_true(em_qoa.playing and em_qoa.handle.is_valid(), "flpk qoa AudioEmitterComponent must be playing")
+
+        app.shutdown()
+    finally:
+        if orig_cwd.byte_length() > 0:
+            _ = external_call["chdir", Int32](orig_cwd.as_c_string_span())
+        var cmd = "rm -rf " + tmp
+        _ = external_call["system", Int32](cmd.as_c_string_span())
+
+
 def main() raises:
     var t_start = get_time()
     test_audio_server_mastering_and_virtualizer()
@@ -4592,6 +4852,10 @@ def main() raises:
     print("[PASS] (l) F27 Multi-OS WindowBackend / AudioBackend / UdpSocket Trait & PCM Ring Checks")
     test_t5_button_drag_outside_and_qoa_bounds()
     print("[PASS] (m) Tier 5 UiContext.button Drag-From-Outside Guard & QoaStreamCursor Bounds Safety")
+    test_m3a_input_chord_specificity_os_dir_and_audio_cache_stop_all()
+    print("[PASS] (n) M3a InputMap Chord Specificity, os.is_directory & AudioServer stop_all/path_cache")
+    test_t5_audio_plugin_flpk_vfs_resolution()
+    print("[PASS] (o) Tier 5 AudioPlugin .flpk VFS Resolution (WAV & QOA from empty CWD)")
     var elapsed = get_time() - t_start
     print("ALL FLINT V5 TRACK 4 TESTS PASSED in", elapsed, "s")
     assert_true(elapsed < 10.0)

@@ -17,6 +17,24 @@ comptime SOURCE = 12
 comptime LIBRARY = 13
 comptime KIMODO = 14
 comptime MOTION_TAKES = 15
+comptime NEW_SCENE = 16
+comptime DUPLICATE = 17
+comptime DELETE_SEL = 18
+comptime GIZMO_SPACE = 19
+comptime FRAME_SEL = 20
+comptime STEP = 21
+comptime SPAWN_EMPTY = 22
+comptime SPAWN_CUBE = 23
+comptime SPAWN_POINT_LIGHT = 24
+comptime SPAWN_SPOT_LIGHT = 25
+comptime SPAWN_CAMERA = 26
+comptime SPAWN_AUDIO = 27
+comptime BAKE_NAVMESH = 28
+comptime TOGGLE_NAV_OVERLAY = 29
+comptime TOGGLE_COL_OVERLAY = 30
+comptime RELOAD_SO = 31
+comptime PACKAGE = 32
+comptime PACKAGE_PROFILES = 33
 
 
 struct SceneMenu(Movable):
@@ -25,39 +43,60 @@ struct SceneMenu(Movable):
     var kimodo_pid: Int32
     var library_pid: Int32
     var has_project: Bool
+    var has_launcher: Bool
     var message: String
 
-    def __init__(out self):
+    def __init__(out self, project_root: String = ""):
         self.bar = CommandMenu()
         self.takes_pid = -1
         self.kimodo_pid = -1
         self.library_pid = -1
-        self.has_project = (
-            file_size(env_value("FLINT_STUDIO_PROJECT") + "/flint.toml") >= 0
-            and file_size(env_value("FLINT_STUDIO_IDE_LAUNCHER")) > 0
-        )
+        var proj = project_root if project_root.byte_length() > 0 else env_value("FLINT_STUDIO_PROJECT")
+        self.has_launcher = file_size(env_value("FLINT_STUDIO_IDE_LAUNCHER")) > 0
+        self.has_project = proj.byte_length() > 0 and file_size(proj + "/flint.toml") >= 0
         self.message = ""
         self.bar.add_group("File", 48)
         self.bar.item(SAVE, "Save scene", "Ctrl+S")
         self.bar.item(LOAD, "Load saved scene", "Ctrl+O")
+        self.bar.item(NEW_SCENE, "New scene", "Ctrl+N")
         self.bar.add_group("Edit", 48)
         self.bar.item(UNDO, "Undo", "Ctrl+Z")
-        self.bar.item(REDO, "Redo", "Ctrl+Y")
+        self.bar.item(REDO, "Redo", "Ctrl+Shift+Z")
+        self.bar.item(DUPLICATE, "Duplicate", "Ctrl+D")
+        self.bar.item(DELETE_SEL, "Delete", "Del")
         self.bar.add_group("Transform", 100)
         self.bar.item(MOVE, "Move", "W")
         self.bar.item(ROTATE, "Rotate", "E")
         self.bar.item(SCALE, "Scale", "R")
         self.bar.item(SNAP, "Snap to grid")
+        self.bar.item(GIZMO_SPACE, "Gizmo: World Space", "X")
+        self.bar.item(FRAME_SEL, "Frame selection", "F")
         self.bar.add_group("Play", 50)
-        self.bar.item(PLAY, "Play scene")
-        self.bar.item(PAUSE, "Pause simulation")
-        self.bar.item(STOP, "Stop and restore")
+        self.bar.item(PLAY, "Play scene", "F5")
+        self.bar.item(PAUSE, "Pause simulation", "F6")
+        self.bar.item(STOP, "Stop and restore", "Shift+F5")
+        self.bar.item(STEP, "Step frame", "F7")
+        self.bar.item(RELOAD_SO, "Reload .so")
         self.bar.add_group("Tools", 58)
-        self.bar.item(LIBRARY, "Move Library", "", self.has_project)
+        self.bar.item(LIBRARY, "Move Library", "", self.has_project and self.has_launcher)
         self.bar.item(SOURCE, "Source editor", "F8")
-        self.bar.item(KIMODO, "Kimodo motion", "", file_size(env_value("FLINT_STUDIO_IDE_LAUNCHER")) > 0)
+        self.bar.item(KIMODO, "Kimodo motion", "", self.has_launcher)
 
-        self.bar.item(MOTION_TAKES, "Motion takes", "", file_size(env_value("FLINT_STUDIO_IDE_LAUNCHER")) > 0)
+        self.bar.item(MOTION_TAKES, "Motion takes", "", self.has_launcher)
+        self.bar.add_group("Scene", 58)
+        self.bar.item(SPAWN_EMPTY, "Spawn Empty")
+        self.bar.item(SPAWN_CUBE, "Spawn Cube")
+        self.bar.item(SPAWN_POINT_LIGHT, "Spawn Point Light")
+        self.bar.item(SPAWN_SPOT_LIGHT, "Spawn Spot Light")
+        self.bar.item(SPAWN_CAMERA, "Spawn Camera")
+        self.bar.item(SPAWN_AUDIO, "Spawn Audio Emitter")
+        self.bar.add_group("NavMesh", 76)
+        self.bar.item(BAKE_NAVMESH, "Bake NavMesh")
+        self.bar.item(TOGGLE_NAV_OVERLAY, "Hide NavMesh Overlay")
+        self.bar.item(TOGGLE_COL_OVERLAY, "Show Collider Overlay")
+        self.bar.add_group("Build", 56)
+        self.bar.item(PACKAGE, "Package project", "", self.has_project)
+        self.bar.item(PACKAGE_PROFILES, "Package with profile...", "", self.has_project)
 
     def __moveinit__(out self, deinit existing: Self):
         self.bar = existing.bar^
@@ -67,6 +106,7 @@ struct SceneMenu(Movable):
         existing.kimodo_pid = -1
         self.library_pid = existing.library_pid
         self.has_project = existing.has_project
+        self.has_launcher = existing.has_launcher
         self.message = existing.message^
         existing.library_pid = -1
 
@@ -75,7 +115,7 @@ struct SceneMenu(Movable):
 
     def open_library(mut self):
         self.poll()
-        if not self.has_project or self.library_pid > 0:
+        if not self.has_project or not self.has_launcher or self.library_pid > 0:
             return
         self.library_pid = _launch('cd -- "$FLINT_STUDIO_PROJECT" && exec bash "$FLINT_STUDIO_IDE_LAUNCHER" studio --moves')
         self.message = "Move Library is open" if self.library_pid > 0 else "Could not open Move Library"

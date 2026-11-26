@@ -1400,7 +1400,7 @@ struct VulkanGpu(Movable):
             extensions.append("VK_EXT_acquire_drm_display")
             self.has_display_surface = True
         var layers = List[String]()
-        var checked = validate or env_flag("FLINT_VULKAN_VALIDATION") or env_flag("SD_VULKAN_VALIDATION")
+        var checked = validate or env_flag("FLINT_VULKAN_VALIDATION")
         if checked:
             if not self.layer_available(VALIDATION_LAYER):
                 return self.fail("the validation layers are not installed: sudo apt install vulkan-validationlayers")

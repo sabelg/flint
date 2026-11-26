@@ -1,0 +1,28 @@
+[project]
+name = "test_harness_game"
+entry = "src/main.mojo"
+entry_scene = "assets/main.flscn"
+gameplay_entry = "src/gameplay.mojo"
+gameplay_output = "build/gameplay.so"
+
+[engine]
+flint_version = "5.0.0"
+werror = true
+deterministic_fp = true
+
+[window]
+title = "Test Harness Game"
+width = 1280
+height = 720
+vsync = true
+
+[physics]
+fixed_hz = 60
+
+[net]
+tick_hz = 60
+max_rollback_ticks = 8
+mtu_bytes = 1180
+
+[assets]
+pack_output = "build/assets.flpk"

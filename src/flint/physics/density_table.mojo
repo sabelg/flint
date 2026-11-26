@@ -1,4 +1,4 @@
-"""Generated from assets/deepsong/materials.json by tools/tunables.mojo; edit that file, not this one.
+"""Material density table (mass per voxel in thousandths by material id).
 
 Mass per voxel in thousandths by material id (package 2.11, from the 2.4 material
 table's mass_density), and the table's solver factors. bash tools/build.sh

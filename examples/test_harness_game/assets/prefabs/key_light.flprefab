@@ -1,0 +1,7 @@
+{
+  "format": "flprefab",
+  "version": 1,
+  "name": "KeyLight",
+  "nodes": [{"name": "KeyLight", "parent_slot": -1, "components": {"LocalTransform": {"translation": [0.0, 4.5, 2.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}, "PointLightComponent": {"radiance": [6.0, 5.400000095367432, 4.400000095367432], "radius": 16.0, "enabled": true}}}],
+  "nested_refs": []
+}

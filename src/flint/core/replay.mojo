@@ -59,8 +59,8 @@ comptime INPUT_BYTES: Int = KEY_COUNT // 8 * 3 + 2 + 12 + MAX_PADS * PAD_BYTES
 comptime TICK_BYTES: Int = INPUT_BYTES + CHECK_SECTIONS * 8
 comptime DEV_MAGIC: UInt64 = 0x44524F4345525644  # "DVRECORD" in the first checksum word
 comptime DEV_PAYLOAD_BYTES: Int = INPUT_BYTES - 2
-comptime DEV_TUNES: Int = 1     # live tunables changed (gameplay/live_tunes.mojo)
-comptime DEV_TELEPORT: Int = 2  # Maroon moved to a bookmark (gameplay/dev_events.mojo)
+comptime DEV_TUNES: Int = 1     # live tunables changed
+comptime DEV_TELEPORT: Int = 2  # player moved to a bookmark
 comptime DEV_MARK: Int = 3      # a playtester marked this moment; changes nothing
 comptime DEV_DEMO: Int = 4      # a demo's test pieces were built (package 2.14: mechanics.demo)
 

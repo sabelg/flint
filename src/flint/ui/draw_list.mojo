@@ -15,6 +15,7 @@ comptime PRIM_LINE: UInt32 = 4
 comptime PRIM_IMAGE: UInt32 = 5
 comptime PRIM_POLYGON: UInt32 = 6      # header: bbox, u0 = vertex count; its data prims follow it
 comptime PRIM_POLY_DATA: UInt32 = 7    # 7 (x, y) vertices in words 0..13; never binned or drawn
+comptime PRIM_ARC: UInt32 = 8          # analytical SDF ring / rounded-cap arc / progress ring / spinner
 comptime POLY_VERTS_PER_PRIM: Int = 7
 comptime POLY_BREAK: Float32 = 3.0e38  # vertex x that separates two outlines
 
@@ -23,6 +24,25 @@ comptime UI_FLAG_BORDER: UInt32 = 1 << 1
 comptime UI_FLAG_CIRCLE: UInt32 = 1 << 2
 comptime UI_FLAG_VERT_GRADIENT: UInt32 = 1 << 3
 comptime UI_FLAG_QUAD_BEZIER: UInt32 = 1 << 4
+comptime UI_FLAG_LINEAR_TEX: UInt32 = 1 << 5
+comptime UI_FLAG_MSDF: UInt32 = 1 << 6
+comptime UI_FLAG_MTSDF: UInt32 = 1 << 7
+comptime UI_FLAG_PER_CORNER_RADII: UInt32 = 1 << 8
+comptime UI_FLAG_TOP_BEVEL: UInt32 = 1 << 9
+comptime UI_FLAG_HORIZ_GRADIENT: UInt32 = 1 << 10
+comptime UI_FLAG_OUTER_GLOW: UInt32 = 1 << 11
+comptime UI_FLAG_GLASS_SCRIM: UInt32 = 1 << 12
+comptime UI_FLAG_DASHED_FLOW: UInt32 = 1 << 13
+
+
+@always_inline
+def pack_flow_params(dash_px: Int, gap_px: Int, speed_q4: Int, glow_alpha: Int) -> UInt32:
+    """Packs `(dash_px, gap_px, speed_q4, glow_alpha)` into `secondary_rgba8` for `UI_FLAG_DASHED_FLOW`."""
+    var d = UInt32(max(2, min(255, dash_px)))
+    var g = UInt32(max(0, min(255, gap_px)))
+    var sp = UInt32(max(0, min(255, speed_q4)))
+    var gl = UInt32(max(0, min(255, glow_alpha)))
+    return d | (g << 8) | (sp << 16) | (gl << 24)
 
 
 @fieldwise_init
@@ -101,6 +121,13 @@ struct UiDrawList(Movable):
         if len(self.clip_stack) > 0:
             _ = self.clip_stack.pop()
 
+    @always_inline
+    def _clip_is_empty(self) -> Bool:
+        if len(self.clip_stack) == 0:
+            return False
+        var cur = self.clip_stack[len(self.clip_stack) - 1]
+        return cur[0] >= cur[2] or cur[1] >= cur[3]
+
     def add_rect(
         mut self,
         x: Float32,
@@ -112,6 +139,8 @@ struct UiDrawList(Movable):
         border_width: Float32 = 0.0,
         border_color: UInt32 = 0,
     ):
+        if self._clip_is_empty():
+            return
         var c = self.current_clip()
         var flags: UInt32 = (UI_FLAG_BORDER if border_width > 0.0 else 0)
         var hdr: UInt32 = (PRIM_SHAPE & 0xF) | (flags << 16)
@@ -133,6 +162,8 @@ struct UiDrawList(Movable):
         border_width: Float32 = 0.0,
         border_color: UInt32 = 0,
     ):
+        if self._clip_is_empty():
+            return
         var c = self.current_clip()
         var flags: UInt32 = UI_FLAG_CIRCLE | (UI_FLAG_BORDER if border_width > 0.0 else 0)
         var hdr: UInt32 = (PRIM_SHAPE & 0xF) | (flags << 16)
@@ -158,6 +189,8 @@ struct UiDrawList(Movable):
         outline_color: UInt32 = 0,
         shadow: Float32 = 0.0,
     ):
+        if self._clip_is_empty():
+            return
         var codes = decode_utf8(text)
         var pen = x
         var c = self.current_clip()
@@ -165,6 +198,10 @@ struct UiDrawList(Movable):
         var sdf_to_screen = font.spread * scale / 127.0
         var aw = Float32(font.atlas_width if font.atlas_width > 0 else 1)
         var ah = Float32(font.atlas_height if font.atlas_height > 0 else 1)
+        var g_flags: UInt32 = (
+            (UI_FLAG_MSDF if font.channels >= 3 else UInt32(0))
+            | (UI_FLAG_MTSDF if font.channels >= 4 else UInt32(0))
+        )
 
         for i in range(len(codes)):
             var g_idx = font.glyph_for(codes[i])
@@ -180,7 +217,7 @@ struct UiDrawList(Movable):
                 var v0 = Float32(g.y) / ah
                 var u1 = Float32(g.x + g.w) / aw
                 var v1 = Float32(g.y + g.h) / ah
-                var hdr: UInt32 = (PRIM_GLYPH & 0xF) | (UInt32(font_slot & 0xFFF) << 4)
+                var hdr: UInt32 = (PRIM_GLYPH & 0xF) | (UInt32(font_slot & 0xFFF) << 4) | (g_flags << 16)
                 self.prims.append(GpuUiPrim(
                     gx0, gy0, gx1, gy1,
                     u0, v0, u1, v1,
@@ -206,6 +243,8 @@ struct UiDrawList(Movable):
         border_bottom: Float32,
         tint_color: UInt32 = 0xFFFFFFFF,
     ):
+        if self._clip_is_empty():
+            return
         var c = self.current_clip()
         var hdr: UInt32 = (PRIM_NINE_SLICE & 0xF) | (UInt32(tex_slot & 0xFFF) << 4)
         self.prims.append(GpuUiPrim(
@@ -228,6 +267,8 @@ struct UiDrawList(Movable):
         secondary_color: UInt32 = 0xFF1A1E24,
         corner_radius: Float32 = 4.0,
     ):
+        if self._clip_is_empty():
+            return
         var c = self.current_clip()
         var hdr: UInt32 = (PRIM_CONTROLLER_SYMBOL & 0xF) | (UInt32(symbol_id & 0xFFF) << 4)
         self.prims.append(GpuUiPrim(
@@ -252,6 +293,8 @@ struct UiDrawList(Movable):
         softness: Float32 = 1.0,
         flags: UInt32 = 0,
     ):
+        if self._clip_is_empty():
+            return
         var c = self.current_clip()
         var eff_flags = flags | (UI_FLAG_BORDER if border_width > 0.0 else 0)
         var hdr: UInt32 = (PRIM_SHAPE & 0xF) | (eff_flags << 16)
@@ -264,6 +307,149 @@ struct UiDrawList(Movable):
             corner_radius, border_width, softness, hdr
         ))
 
+    def add_rounded_rect_ex(
+        mut self,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        fill_color: UInt32,
+        r_tl: Float32,
+        r_tr: Float32,
+        r_br: Float32,
+        r_bl: Float32,
+        border_width: Float32 = 0.0,
+        border_color: UInt32 = 0,
+        softness: Float32 = 1.0,
+        flags: UInt32 = 0,
+    ):
+        """Emits a rounded rectangle with independent per-corner radii `(r_tl, r_tr, r_br, r_bl)`."""
+        if self._clip_is_empty():
+            return
+        var c = self.current_clip()
+        var eff_flags = flags | UI_FLAG_PER_CORNER_RADII | (UI_FLAG_BORDER if border_width > 0.0 else UInt32(0))
+        var max_r = max(max(r_tl, r_tr), max(r_br, r_bl))
+        var hdr: UInt32 = (PRIM_SHAPE & 0xF) | (eff_flags << 16)
+        self.prims.append(GpuUiPrim(
+            x, y, x + w, y + h,
+            max(Float32(0.0), r_tl),
+            max(Float32(0.0), r_tr),
+            max(Float32(0.0), r_br),
+            max(Float32(0.0), r_bl),
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            fill_color, border_color,
+            max(Float32(0.0), max_r), border_width, softness, hdr
+        ))
+
+    def add_glass_panel(
+        mut self,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        tint_rgba8: UInt32,
+        corner_radius: Float32 = 8.0,
+        blur_radius: Float32 = 3.0,
+        border_width: Float32 = 1.0,
+        border_color: UInt32 = 0x33FFFFFF,
+        top_bevel: Bool = True,
+        drop_shadow: Bool = True,
+    ):
+        """Emits a translucent frosted-glass scrim panel with 5-tap LDS Kawase blur."""
+        var flags: UInt32 = UI_FLAG_GLASS_SCRIM
+        if top_bevel:
+            flags |= UI_FLAG_TOP_BEVEL
+        if drop_shadow:
+            flags |= UI_FLAG_DROP_SHADOW
+        self.add_rect_styled(
+            x, y, w, h,
+            tint_rgba8,
+            border_color,
+            corner_radius,
+            border_width,
+            max(Float32(1.0), blur_radius),
+            flags,
+        )
+
+    def add_glow_rect(
+        mut self,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        fill_color: UInt32,
+        glow_color: UInt32,
+        corner_radius: Float32 = 6.0,
+        glow_radius: Float32 = 8.0,
+        border_width: Float32 = 0.0,
+        flags: UInt32 = 0,
+    ):
+        """Emits a rounded rectangle with an analytical zero-offset outer glow halo."""
+        self.add_rect_styled(
+            x, y, w, h,
+            fill_color,
+            glow_color,
+            corner_radius,
+            border_width,
+            max(Float32(1.5), glow_radius),
+            flags | UI_FLAG_OUTER_GLOW,
+        )
+
+    def add_arc(
+        mut self,
+        cx: Float32,
+        cy: Float32,
+        radius: Float32,
+        stroke_width: Float32,
+        start_rad: Float32,
+        sweep_rad: Float32,
+        color: UInt32,
+        track_color: UInt32 = 0,
+        glow_softness: Float32 = 0.0,
+        flags: UInt32 = 0,
+    ):
+        """Emits a crisp analytical SDF ring, rounded-cap arc, or animated agent spinner (`PRIM_ARC`)."""
+        if self._clip_is_empty() or radius <= Float32(0.0) or stroke_width <= Float32(0.0):
+            return
+        var c = self.current_clip()
+        var half_st = max(Float32(0.5), stroke_width * Float32(0.5))
+        var eff_flags = flags
+        if (track_color >> 24) != 0:
+            eff_flags |= UI_FLAG_BORDER
+        if glow_softness > Float32(0.01):
+            eff_flags |= UI_FLAG_OUTER_GLOW
+        var pad = half_st + max(Float32(1.5), min(Float32(28.0), glow_softness)) + Float32(1.0)
+        var hdr: UInt32 = (PRIM_ARC & 0xF) | (eff_flags << 16)
+        self.prims.append(GpuUiPrim(
+            cx - radius - pad,
+            cy - radius - pad,
+            cx + radius + pad,
+            cy + radius + pad,
+            cx, cy, start_rad, sweep_rad,
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            color, track_color,
+            radius, stroke_width, glow_softness, hdr
+        ))
+
+    def add_progress_ring(
+        mut self,
+        cx: Float32,
+        cy: Float32,
+        radius: Float32,
+        stroke_width: Float32,
+        progress_01: Float32,
+        arc_color: UInt32,
+        track_color: UInt32 = 0x33FFFFFF,
+        glow_softness: Float32 = 0.0,
+    ):
+        """Emits a 12-o'clock clockwise circular progress ring (`progress_01 in [0, 1]`)."""
+        var p = max(Float32(0.0), min(Float32(1.0), progress_01))
+        var start_rad = Float32(-1.5707963)
+        var sweep_rad = p * Float32(6.2831853)
+        self.add_arc(cx, cy, radius, stroke_width, start_rad, sweep_rad, arc_color, track_color, glow_softness, 0)
+
     def add_line(
         mut self,
         x0: Float32,
@@ -274,6 +460,8 @@ struct UiDrawList(Movable):
         color: UInt32,
         softness: Float32 = 1.0,
     ):
+        if self._clip_is_empty():
+            return
         var half_t = max(Float32(0.5), thickness * Float32(0.5))
         var pad = half_t + max(Float32(0.5), softness)
         var bx0 = min(x0, x1) - pad
@@ -291,6 +479,36 @@ struct UiDrawList(Movable):
             half_t, 0.0, softness, hdr
         ))
 
+    def add_line_flow(
+        mut self,
+        x0: Float32,
+        y0: Float32,
+        x1: Float32,
+        y1: Float32,
+        thickness: Float32,
+        color: UInt32,
+        dash_px: Int = 10,
+        gap_px: Int = 6,
+        speed_q4: Int = 24,
+        glow_alpha: Int = 120,
+    ):
+        """Emits a GPU-animated flowing dashed line segment driven by `push_ui[6] = ui_time_sec`."""
+        if self._clip_is_empty():
+            return
+        var half_t = max(Float32(0.5), thickness * Float32(0.5))
+        var pad = half_t + max(Float32(4.0), half_t * Float32(3.0))
+        var c = self.current_clip()
+        var hdr: UInt32 = (PRIM_LINE & 0xF) | (UI_FLAG_DASHED_FLOW << 16)
+        self.prims.append(GpuUiPrim(
+            min(x0, x1) - pad, min(y0, y1) - pad,
+            max(x0, x1) + pad, max(y0, y1) + pad,
+            x0, y0, x1, y1,
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            color, pack_flow_params(dash_px, gap_px, speed_q4, glow_alpha),
+            half_t, 0.0, 1.0, hdr
+        ))
+
     def add_quad_bezier(
         mut self,
         x0: Float32,
@@ -303,6 +521,8 @@ struct UiDrawList(Movable):
         color: UInt32,
         softness: Float32 = 1.0,
     ):
+        if self._clip_is_empty():
+            return
         var min_x = min(x0, x1)
         var max_x = max(x0, x1)
         var min_y = min(y0, y1)
@@ -340,6 +560,58 @@ struct UiDrawList(Movable):
             cx, cy, half_t, hdr
         ))
 
+    def add_bezier_flow(
+        mut self,
+        x0: Float32,
+        y0: Float32,
+        cx: Float32,
+        cy: Float32,
+        x1: Float32,
+        y1: Float32,
+        thickness: Float32,
+        color: UInt32,
+        dash_px: Int = 12,
+        gap_px: Int = 8,
+        speed_q4: Int = 32,
+        glow_alpha: Int = 140,
+    ):
+        """Emits a GPU-animated flowing quadratic Bézier tether beam (Agent Theatre & node graphs)."""
+        if self._clip_is_empty():
+            return
+        var min_x = min(x0, x1)
+        var max_x = max(x0, x1)
+        var min_y = min(y0, y1)
+        var max_y = max(y0, y1)
+        var dx_den = x0 - Float32(2.0) * cx + x1
+        if abs(dx_den) > Float32(1.0e-6):
+            var tx = (x0 - cx) / dx_den
+            if tx > Float32(0.0) and tx < Float32(1.0):
+                var omt = Float32(1.0) - tx
+                var ex = omt * omt * x0 + Float32(2.0) * omt * tx * cx + tx * tx * x1
+                min_x = min(min_x, ex)
+                max_x = max(max_x, ex)
+        var dy_den = y0 - Float32(2.0) * cy + y1
+        if abs(dy_den) > Float32(1.0e-6):
+            var ty = (y0 - cy) / dy_den
+            if ty > Float32(0.0) and ty < Float32(1.0):
+                var omt = Float32(1.0) - ty
+                var ey = omt * omt * y0 + Float32(2.0) * omt * ty * cy + ty * ty * y1
+                min_y = min(min_y, ey)
+                max_y = max(max_y, ey)
+
+        var half_t = max(Float32(0.5), thickness * Float32(0.5))
+        var pad = half_t + max(Float32(4.0), half_t * Float32(3.0))
+        var c = self.current_clip()
+        var hdr: UInt32 = (PRIM_LINE & 0xF) | ((UI_FLAG_QUAD_BEZIER | UI_FLAG_DASHED_FLOW) << 16)
+        self.prims.append(GpuUiPrim(
+            min_x - pad, min_y - pad, max_x + pad, max_y + pad,
+            x0, y0, x1, y1,
+            UInt32(c[0]) | (UInt32(c[1]) << 16),
+            UInt32(c[2]) | (UInt32(c[3]) << 16),
+            color, pack_flow_params(dash_px, gap_px, speed_q4, glow_alpha),
+            cx, cy, half_t, hdr
+        ))
+
     def add_image(
         mut self,
         tex_slot: Int,
@@ -356,6 +628,8 @@ struct UiDrawList(Movable):
         border_width: Float32 = 0.0,
         border_color: UInt32 = 0,
     ):
+        if self._clip_is_empty():
+            return
         var c = self.current_clip()
         var flags: UInt32 = (UI_FLAG_BORDER if border_width > 0.0 else 0)
         var hdr: UInt32 = (PRIM_IMAGE & 0xF) | (UInt32(tex_slot & 0xFFF) << 4) | (flags << 16)
@@ -376,6 +650,8 @@ struct UiDrawList(Movable):
         Records one `PRIM_POLYGON` header (the bounding box) followed by its `PRIM_POLY_DATA`
         prims: the outlines closed (first point repeated) and separated by a `POLY_BREAK`
         vertex. Returns the number of prims added (0 for nothing to draw)."""
+        if self._clip_is_empty():
+            return 0
         var verts = List[Float32]()
         var bx0 = Float32(3.0e38)
         var by0 = Float32(3.0e38)

@@ -1,50 +1,68 @@
 """Flint v5 Visual Editor (`Flint Studio`, `examples/studio/main.mojo`).
 
-Standalone AAA Visual Scene Editor, Procedural Kit & AI-Native MCP v2 Host powered by
-the unified Engine v5 spine (`EngineApp`, `WindowPlugin`, `TransformPlugin`, `InputPlugin`,
+Standalone AAA Visual Scene Editor, Procedural Kit, Code-to-Scene Workspace & Visual AI Agent Host
+powered by the unified Engine v5 spine (`EngineApp`, `WindowPlugin`, `TransformPlugin`, `InputPlugin`,
 `PhysicsPlugin`, `RenderPlugin`, `flint.ecs.World`, `flint.scene.Scene`, `PhysicsWorld`,
 `ScalableRenderer`):
   - **Interactive Window Mode**:
     - Non-stalling `FRAMES_IN_FLIGHT` async 40-bit `VisBuffer` viewport entity picking (`VisBufferGpuPicker`)
     - Multi-select (`Ctrl`/`Shift`), centroid analytical 3D gizmos (`W` / `E` / `R`, grid/15° snap)
-    - `DockSpace` + `UiContext` collapsible indented hierarchy tree with drag-and-drop reparenting,
-      single/bulk `FieldVisitor` Inspector, `CameraRig` orbit/fly, and 1-Click LZ4 PIE (`F5`)
+    - `DockSpace` v2 + `StudioHeaderBar` + Floating `ViewportHud` + `CommandPalette` (`Ctrl+K`)
+    - Native GPU `CodeDrawer` (Mojo syntax highlight, unified/split diffs, Problems, 1-click Build & Hot-Reload)
+    - Visual Agent Studio (`AgentMissionControlPanel` + 3D `AgentTheatre` + live ACP/MCP v2 bridge)
     - Reversible coalesced `EditorTransaction` Undo/Redo (`Ctrl+Z` / `Ctrl+Y`) & `FlintMcpUnixListener`
   - **`--headless-smoke` / `--shots` (`--out <png>`)**:
-    Renders a crisp `1280x720` Studio editor frame (`Studio_ReferenceGrid`, `SubD_MaterialOrb`,
-    `SubD_CatmullTorus`, `ArchKit_Colonnade`, `Botanical_FoliageSample` + `Botanical_FoliageCanopy`)
-    with `DockSpace` + `UiContext` panels and 3D Gizmo overlay.
+    Renders a deterministic `1280x720` Studio editor frame (`UI_ANIM_INSTANT`, `ui_time_sec = 0.0`).
+  - **`--gallery <dir>`**:
+    Renders all 6 deterministic `1280x720` visual showcase shots (`01_edit_default.png` .. `06_play_hud.png`).
   - **`--mcp-stdio`**:
     Runs `McpServerV2` in spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 `stdio` mode.
+  - **`--mcp-connect <sock_path>`**:
+    Pure-Mojo bidirectional `stdio <-> AF_UNIX` MCP proxy for live Studio Unix socket sessions.
 """
+from std.collections import List
+from std.ffi import external_call
 from std.math import cos, max, min, sin
 from std.sys import argv
 from flint.app.engine_app import STAGE_FIRST
 from flint.app.window_plugin import WindowStateResource
+from flint.assets.asset_plugin import SceneAssetResolver
 from flint.assets.image import write_png
 from flint.assets.server import AssetServer
+from flint.core.build_info import check_flint_version_pin, parse_flint_version_from_toml_bytes
 from flint.core.jobs import JobPool, default_worker_count
 from flint.core.math import Quat, Vec3
-from flint.devtools.mcp_v2 import FlintMcpUnixListener, McpServerV2, default_mcp_socket_path
-from flint.ecs.world import Entity
+from flint.devtools.mcp_v2 import (
+    MCP_GATE_ALL,
+    MCP_GATE_AUTO,
+    MCP_GATE_MUTATING,
+    FlintMcpUnixListener,
+    McpServerV2,
+    McpToolEvent,
+    default_mcp_socket_path,
+    run_mcp_connect_stdio,
+)
 from flint.input.plugin import InputStateResource
 from flint.platform.input import InputState
-from flint.platform.os import get_time, make_dirs, parent_directory
-from flint.procedural.arch_kit import build_colonnade_arcade_bay
-from flint.procedural.foliage import build_botanical_pine
-from flint.render.aaa_post_tsr import AAA_DISPLAY_AGX_REC709
-from flint.render.aaa_sky_atmosphere import BrunetonAtmosphereParams
-from flint.render.material_graph import MaterialAsset
-from flint.render.plugin import MaterialOverrideComponent, MeshRendererComponent
+from flint.platform.os import (
+    env_value,
+    file_size,
+    get_time,
+    is_directory,
+    make_dirs,
+    parent_directory,
+    read_bytes,
+    real_path,
+)
 from flint.render.render_world import (
     RENDER_TIER_0_HEADLESS_SIMD,
     RENDER_TIER_2_AAA_VISBUFFER_RT,
     ScalableRenderer,
 )
 from flint.studio import (
-    COLLIDER_BOX,
-    COLLIDER_NONE,
-    COLLIDER_SPHERE,
+    APPROVAL_AUTO,
+    APPROVAL_EDITS,
+    APPROVAL_STEP,
     GIZMO_AXIS_NONE,
     GIZMO_AXIS_X,
     GIZMO_AXIS_Y,
@@ -55,16 +73,18 @@ from flint.studio import (
     GIZMO_PLANE_XY,
     GIZMO_PLANE_XZ,
     GIZMO_PLANE_YZ,
-    GIZMO_SCALE_UNIFORM,
     PIE_PLAYING,
+    PIE_STOPPED,
+    WORKSPACE_AGENT_STUDIO,
+    WORKSPACE_CODE_SCENE,
+    WORKSPACE_EDIT,
+    WORKSPACE_LOOKDEV,
+    WORKSPACE_PLAY,
+    BridgedMcpEvent,
     FlintStudioState,
     SelectedTransformSnap,
-    StudioStyleComponent,
     ViewportRay,
     VisBufferGpuPicker,
-    build_studio_reference_grid_mesh,
-    build_subd_catmull_torus,
-    build_subd_material_orb,
     fill_instance_entity_maps,
     gizmo_rotation_delta_rad,
     gizmo_scale_drag,
@@ -75,198 +95,17 @@ from flint.studio import (
     snap_angle_deg,
     snap_translation,
 )
-
-
-def _populate_default_studio_scene(mut studio: FlintStudioState):
-    """Populates the engine-neutral procedural SubD + ArchKit + Botanical Studio showcase into `app.world`."""
-    _ = studio.spawn_entity(
-        "Studio_ReferenceGrid",
-        position=Vec3(0.0, 0.0, 0.0),
-        scale=Vec3(1.0, 1.0, 1.0),
-        collider_kind=COLLIDER_BOX,
-        collider_half_extents=Vec3(18.0, 0.05, 18.0),
-        mass=0.0,
-        base_color=Vec3(0.26, 0.31, 0.38),
-        roughness=0.58,
-        metallic=0.05,
-        mesh_id=0,
-        record_undo=False,
-    )
-    var orb_id = studio.spawn_entity(
-        "SubD_MaterialOrb",
-        position=Vec3(0.0, 0.92, 0.0),
-        rotation=Quat(0.0, sin(Float32(-0.24)), 0.0, cos(Float32(-0.24))).normalized(),
-        scale=Vec3(1.12, 1.12, 1.12),
-        collider_kind=COLLIDER_SPHERE,
-        collider_half_extents=Vec3(0.88, 0.88, 0.88),
-        mass=0.0,
-        base_color=Vec3(0.84, 0.22, 0.18),
-        roughness=0.14,
-        metallic=0.78,
-        mesh_id=1,
-        record_undo=False,
-    )
-    var orb_e = studio.resolve_entity(orb_id)
-    if orb_e.valid():
-        var st_opt = studio.app.world.get_ptr_mut[StudioStyleComponent](orb_e)
-        if st_opt:
-            st_opt.value()[unsafe_offset=0].clearcoat = Float32(0.88)
-            st_opt.value()[unsafe_offset=0].clearcoat_roughness = Float32(0.05)
-
-    _ = studio.spawn_entity(
-        "SubD_CatmullTorus",
-        position=Vec3(3.1, 2.15, 1.2),
-        rotation=Quat(sin(Float32(0.32)), sin(Float32(0.28)), 0.0, cos(Float32(0.42))).normalized(),
-        scale=Vec3(1.05, 1.05, 1.05),
-        collider_kind=COLLIDER_SPHERE,
-        collider_half_extents=Vec3(0.85, 0.85, 0.85),
-        mass=8.0,  # Dynamic body: drops & bounces onto reference grid on 1-Click PIE (`F5`)!
-        base_color=Vec3(0.20, 0.64, 0.94),
-        roughness=0.18,
-        metallic=0.82,
-        mesh_id=2,
-        record_undo=False,
-    )
-    _ = studio.spawn_entity(
-        "ArchKit_Colonnade",
-        position=Vec3(0.0, 0.0, 6.0),
-        scale=Vec3(1.35, 1.25, 1.25),
-        collider_kind=COLLIDER_BOX,
-        collider_half_extents=Vec3(4.0, 3.0, 1.5),
-        mass=0.0,
-        base_color=Vec3(0.76, 0.73, 0.68),
-        roughness=0.48,
-        metallic=0.08,
-        mesh_id=3,
-        record_undo=False,
-    )
-    var foliage_id = studio.spawn_entity(
-        "Botanical_FoliageSample",
-        position=Vec3(-4.6, 0.0, 2.4),
-        scale=Vec3(0.92, 0.92, 0.92),
-        collider_kind=COLLIDER_BOX,
-        collider_half_extents=Vec3(0.9, 2.6, 0.9),
-        mass=0.0,
-        base_color=Vec3(0.34, 0.23, 0.14),
-        roughness=0.84,
-        metallic=0.0,
-        mesh_id=4,
-        record_undo=False,
-    )
-    _ = studio.spawn_entity(
-        "Botanical_FoliageCanopy",
-        position=Vec3(0.0, 0.0, 0.0),
-        scale=Vec3(1.0, 1.0, 1.0),
-        collider_kind=COLLIDER_NONE,
-        mass=0.0,
-        base_color=Vec3(0.18, 0.46, 0.22),
-        roughness=0.68,
-        metallic=0.0,
-        mesh_id=5,
-        parent_id=foliage_id,
-        record_undo=False,
-    )
-    studio.select_entity(orb_id)
-    studio.look_at(Vec3(-5.6, 3.75, -7.4), Vec3(0.15, 0.95, 1.1))
-
-
-def _upload_studio_gpu_assets(mut studio: FlintStudioState):
-    var rend_opt = studio.app.resources.get_ptr_mut[ScalableRenderer]()
-    if not rend_opt:
-        return
-    ref renderer = rend_opt.value()[unsafe_offset=0]
-    if not renderer.uses_vulkan():
-        return
-
-    var n_ents = len(studio.app.world.entities)
-    studio.gpu_materials.entity_pbr_mat_ids.clear()
-    studio.gpu_materials.entity_cel_mat_ids.clear()
-    studio.gpu_materials.entity_vfx_mat_ids.clear()
-
-    for i in range(n_ents):
-        if not studio.app.world.entities[i].alive:
-            studio.gpu_materials.entity_pbr_mat_ids.append(-1)
-            studio.gpu_materials.entity_cel_mat_ids.append(-1)
-            studio.gpu_materials.entity_vfx_mat_ids.append(-1)
-            continue
-        var e = Entity(UInt32(i), studio.app.world.entities[i].generation)
-        var mo_opt = studio.app.world.get_ptr_mut[MaterialOverrideComponent](e)
-        var mr_opt = studio.app.world.get_ptr_mut[MeshRendererComponent](e)
-        var mat_id = 0
-        if mo_opt:
-            ref mo = mo_opt.value()[unsafe_offset=0]
-            var ma = MaterialAsset(
-                base_color=mo.base_color,
-                roughness=mo.roughness,
-                metallic=mo.metallic,
-            )
-            ma.emissive = mo.emissive
-            var st_opt = studio.app.world.get_ptr[StudioStyleComponent](e)
-            if st_opt:
-                ma.clearcoat = st_opt.value()[unsafe_offset=0].clearcoat
-                ma.clearcoat_roughness = st_opt.value()[unsafe_offset=0].clearcoat_roughness
-            mat_id = renderer.register_material(ma)
-            mo.material_id = mat_id
-            if mr_opt:
-                mr_opt.value()[unsafe_offset=0].material_id = mat_id
-        studio.gpu_materials.entity_pbr_mat_ids.append(mat_id)
-        studio.gpu_materials.entity_cel_mat_ids.append(-1)
-        studio.gpu_materials.entity_vfx_mat_ids.append(-1)
-
-    studio.gpu_materials.mat_trunk_id = (
-        studio.gpu_materials.entity_pbr_mat_ids[4]
-        if len(studio.gpu_materials.entity_pbr_mat_ids) > 4
-        else renderer.register_material(MaterialAsset(base_color=Vec3(0.34, 0.23, 0.14), roughness=0.84, metallic=0.0))
-    )
-    studio.gpu_materials.mat_foliage_id = (
-        studio.gpu_materials.entity_pbr_mat_ids[5]
-        if len(studio.gpu_materials.entity_pbr_mat_ids) > 5
-        else renderer.register_material(MaterialAsset(base_color=Vec3(0.18, 0.46, 0.22), roughness=0.68, metallic=0.0))
-    )
-
-    studio.gpu_materials.grid_mesh_id = renderer.register_mesh(build_studio_reference_grid_mesh(36.0, 24), 0, build_lods=False)
-    studio.gpu_materials.orb_mesh_id = renderer.register_mesh(build_subd_material_orb(0.88, 3), 1, build_lods=True)
-    studio.gpu_materials.torus_mesh_id = renderer.register_mesh(build_subd_catmull_torus(0.82, 0.30, 2), 2, build_lods=True)
-    studio.gpu_materials.colonnade_mesh_id = renderer.register_mesh(build_colonnade_arcade_bay(6.0, 4.8, 2.4), 3, build_lods=True)
-    var pn = build_botanical_pine(7, 5.4)
-    studio.gpu_materials.foliage_trunk_id = renderer.register_mesh(pn[0], studio.gpu_materials.mat_trunk_id, build_lods=False)
-    studio.gpu_materials.foliage_canopy_id = renderer.register_mesh(pn[1], studio.gpu_materials.mat_foliage_id, build_lods=False)
-
-    # Bind registered GPU mesh IDs back onto each entity's MeshRendererComponent
-    var mesh_ids = [
-        studio.gpu_materials.grid_mesh_id,
-        studio.gpu_materials.orb_mesh_id,
-        studio.gpu_materials.torus_mesh_id,
-        studio.gpu_materials.colonnade_mesh_id,
-        studio.gpu_materials.foliage_trunk_id,
-        studio.gpu_materials.foliage_canopy_id,
-    ]
-    for i in range(min(n_ents, len(mesh_ids))):
-        var e = studio.resolve_entity(i)
-        if e.valid():
-            var mr_opt = studio.app.world.get_ptr_mut[MeshRendererComponent](e)
-            if mr_opt:
-                mr_opt.value()[unsafe_offset=0].mesh_id = mesh_ids[i]
-
-    ref gpu = renderer.gpu_slot[0]
-    var atm = BrunetonAtmosphereParams()
-    atm.sun_dir = Vec3(0.46, 0.58, -0.67).normalized()
-    atm.cloud_coverage = Float32(0.28)
-    _ = gpu.set_bruneton_atmosphere(atm, enable_aerial=True)
-
-    gpu.display_mode = AAA_DISPLAY_AGX_REC709
-    gpu.enable_vsm = True
-    gpu.vsm_scene_center = Vec3(0.0, 1.5, 2.0)
-    gpu.vsm_ortho_half_extent = Float32(24.0)
-    gpu.enable_rt_shadows = gpu.vk.has_ray_query
-    gpu.enable_rt_reflections = gpu.vk.has_ray_query
-    gpu.enable_rt_gi = gpu.vk.has_ray_query
-    gpu.gi_rays_per_pixel = 6
-    gpu.svgf_passes = 1
-    gpu.exposure = Float32(1.08)
-    gpu.bloom_intensity = Float32(0.08)
-    studio.gpu_materials.uploaded = True
-    studio._sync_compat_view()
+from flint.studio.studio_app import (
+    populate_default_studio_scene,
+    upload_default_studio_gpu_assets,
+)
+from flint.ui.animator import UI_ANIM_INSTANT, UI_ANIM_NORMAL, UI_ANIM_REDUCED
+from flint.ui.theme import (
+    THEME_FLINT_OBSIDIAN,
+    THEME_MIDNIGHT_STUDIO,
+    THEME_OKABE_ITO,
+    THEME_PAPER_LIGHT,
+)
 
 
 def _fill_instance_entity_maps(
@@ -277,114 +116,421 @@ def _fill_instance_entity_maps(
     fill_instance_entity_maps(studio, out_inst_to_entity, out_inst_to_bits)
 
 
-def main() raises:
+def _parse_workspace_arg(raw: String) -> Int:
+    var s = String(raw.strip()).lower()
+    if s == "agent" or s == "agent_studio" or s == "agents":
+        return WORKSPACE_AGENT_STUDIO
+    if s == "code" or s == "code_scene" or s == "code+scene":
+        return WORKSPACE_CODE_SCENE
+    if s == "lookdev" or s == "look":
+        return WORKSPACE_LOOKDEV
+    if s == "play":
+        return WORKSPACE_PLAY
+    if s == "edit" or s == "default":
+        return WORKSPACE_EDIT
+    return -1
+
+
+def _parse_theme_arg(raw: String) -> Int:
+    var s = String(raw.strip()).lower()
+    if s == "obsidian" or s == "flint_obsidian" or s == "dark":
+        return THEME_FLINT_OBSIDIAN
+    if s == "midnight" or s == "midnight_studio":
+        return THEME_MIDNIGHT_STUDIO
+    if s == "okabe" or s == "okabe_ito" or s == "cvd":
+        return THEME_OKABE_ITO
+    if s == "paper" or s == "paper_light" or s == "light":
+        return THEME_PAPER_LIGHT
+    return -1
+
+
+def _parse_anim_mode_arg(raw: String) -> Int:
+    var s = String(raw.strip()).lower()
+    if s == "normal":
+        return UI_ANIM_NORMAL
+    if s == "reduced":
+        return UI_ANIM_REDUCED
+    if s == "instant":
+        return UI_ANIM_INSTANT
+    return -1
+
+
+def _sync_mcp_gate_from_bus(mut mcp: McpServerV2, studio: FlintStudioState):
+    """Aligns `McpServerV2` approval gate mode with the selected `AgentTelemetryBus` session policy."""
+    var si = studio.agent_bus.find_session_index(studio.agent_bus.selected_agent_id)
+    if si < 0 or si >= len(studio.agent_bus.sessions):
+        mcp.set_gate_mode(MCP_GATE_AUTO)
+        return
+    var pol = studio.agent_bus.sessions[si].approval_policy
+    if pol == APPROVAL_STEP:
+        mcp.set_gate_mode(MCP_GATE_ALL)
+    elif pol == APPROVAL_EDITS:
+        mcp.set_gate_mode(MCP_GATE_MUTATING)
+    else:
+        mcp.set_gate_mode(MCP_GATE_AUTO)
+
+
+def _drain_mcp_events_to_studio(mut mcp: McpServerV2, mut studio: FlintStudioState):
+    """Bridges live `McpToolEvent`s from `McpServerV2` into `FlintStudioState`'s Visual Agent Theatre."""
+    if mcp.peek_tool_event_count() <= 0:
+        return
+    var raw = mcp.take_tool_events()
+    var bridged = List[BridgedMcpEvent](capacity=len(raw))
+    for i in range(len(raw)):
+        ref r = raw[i]
+        var b = BridgedMcpEvent(
+            seq=r.seq,
+            tool_name=r.tool_name,
+            params_json=r.params_json,
+            result_json=r.result_json,
+            elapsed_ms=r.elapsed_ms,
+            ok=r.ok,
+            is_mutating=r.is_mutating,
+            blocked_by_gate=r.blocked_by_gate,
+            agent_id=studio.agent_bus.selected_agent_id,
+        )
+        b.affected_entities = r.affected_entities.copy()
+        bridged.append(b^)
+    _ = studio.ingest_mcp_events(bridged^)
+
+
+def _render_deterministic_png(
+    mut studio: FlintStudioState,
+    assets: AssetServer,
+    out_w: Int,
+    out_h: Int,
+    target_png: String,
+    pinned_ui_time: Float32,
+) -> Tuple[Bool, Int, Int]:
+    """Renders 4 deterministic TSR-converged headless subframes and writes `target_png`."""
+    var pdir = parent_directory(target_png)
+    if pdir.byte_length() > 0 and pdir != ".":
+        _ = make_dirs(pdir)
+    var empty_input = InputState()
+    studio.set_anim_mode(UI_ANIM_INSTANT)
+    studio.ui_time_sec = pinned_ui_time
+    for sub in range(4):
+        studio.ui_time_sec = pinned_ui_time
+        studio.update_camera(Float32(0.0))
+        var rend_opt = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+        if rend_opt and rend_opt.value()[unsafe_offset=0].uses_vulkan():
+            rend_opt.value()[unsafe_offset=0].gpu_slot[0].tsr_history_weight = (
+                Float32(0.0) if sub == 0 else Float32(0.78)
+            )
+            rend_opt.value()[unsafe_offset=0].ui_time_sec = pinned_ui_time
+        var gms = 4.2
+        studio.render_editor_frame(
+            out_w,
+            out_h,
+            gpu_ms=gms,
+            mounted_packs=len(assets.mounts),
+            mcp_clients=0,
+            input=empty_input,
+            dt=Float32(1.0 / 60.0),
+        )
+
+    var rend_fin = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+    var px = List[UInt32]()
+    var culled_draws = 0
+    if rend_fin and rend_fin.value()[unsafe_offset=0].uses_vulkan():
+        ref r = rend_fin.value()[unsafe_offset=0]
+        px = r.readback_pixels()
+        culled_draws = r.gpu_slot[0].last_culled_meshlet_draws
+    var wrote = write_png(target_png, px, out_w, out_h)
+    return (wrote, len(studio.ui_ctx.draw_list.prims), culled_draws)
+
+
+def _run_studio() raises -> Int:
     var mcp_stdio = False
+    var mcp_connect_mode = False
+    var mcp_connect_sock = String("")
     var headless_smoke = False
     var shots_mode = False
+    var gallery_mode = False
+    var gallery_dir = String("")
     var out_png = String("")
+    var has_out_flag = False
+    var project_arg = String("")
+    var has_project_flag = False
+    var workspace_opt = -1
+    var theme_opt = -1
+    var anim_mode_opt = -1
 
     var args = argv()
+    var exe_path = String(args[0]) if len(args) > 0 else String("flint-studio")
     var ai = 1
     while ai < len(args):
         var a = String(args[ai])
         if a == "--mcp-stdio":
             mcp_stdio = True
+        elif a == "--mcp-connect":
+            if ai + 1 >= len(args):
+                print("[Flint Studio] ERROR: --mcp-connect requires a socket path argument.")
+                return 1
+            ai += 1
+            mcp_connect_sock = String(args[ai])
+            mcp_connect_mode = True
+        elif a.startswith("--mcp-connect="):
+            mcp_connect_sock = String(a[byte=14:])
+            mcp_connect_mode = True
         elif a == "--headless-smoke":
             headless_smoke = True
         elif a == "--shots":
             shots_mode = True
-        elif a == "--out" and ai + 1 < len(args):
-            out_png = String(args[ai + 1])
+        elif a == "--gallery":
+            if ai + 1 >= len(args):
+                print("[Flint Studio] ERROR: --gallery requires an output directory argument.")
+                return 1
             ai += 1
+            gallery_dir = String(args[ai])
+            gallery_mode = True
+        elif a.startswith("--gallery="):
+            gallery_dir = String(a[byte=10:])
+            gallery_mode = True
+        elif a == "--out":
+            if ai + 1 >= len(args):
+                print("[Flint Studio] ERROR: --out requires a file path argument.")
+                return 1
+            ai += 1
+            out_png = String(args[ai])
+            has_out_flag = True
+        elif a.startswith("--out="):
+            out_png = String(a[byte=6:])
+            has_out_flag = True
+        elif a == "--project":
+            if ai + 1 >= len(args):
+                print("[Flint Studio] ERROR: --project requires a directory argument.")
+                return 1
+            ai += 1
+            project_arg = String(args[ai])
+            has_project_flag = True
+        elif a.startswith("--project="):
+            project_arg = String(a[byte=10:])
+            has_project_flag = True
+        elif a == "--workspace":
+            if ai + 1 >= len(args):
+                print("[Flint Studio] ERROR: --workspace requires one of: edit, agent, code, lookdev, play.")
+                return 1
+            ai += 1
+            workspace_opt = _parse_workspace_arg(String(args[ai]))
+            if workspace_opt < 0:
+                print("[Flint Studio] ERROR: unknown --workspace value: " + String(args[ai]))
+                return 1
+        elif a.startswith("--workspace="):
+            var wraw = String(a[byte=12:])
+            workspace_opt = _parse_workspace_arg(wraw)
+            if workspace_opt < 0:
+                print("[Flint Studio] ERROR: unknown --workspace value: " + wraw)
+                return 1
+        elif a == "--theme":
+            if ai + 1 >= len(args):
+                print("[Flint Studio] ERROR: --theme requires one of: obsidian, midnight, okabe, paper.")
+                return 1
+            ai += 1
+            theme_opt = _parse_theme_arg(String(args[ai]))
+            if theme_opt < 0:
+                print("[Flint Studio] ERROR: unknown --theme value: " + String(args[ai]))
+                return 1
+        elif a.startswith("--theme="):
+            var traw = String(a[byte=8:])
+            theme_opt = _parse_theme_arg(traw)
+            if theme_opt < 0:
+                print("[Flint Studio] ERROR: unknown --theme value: " + traw)
+                return 1
+        elif a == "--anim-mode":
+            if ai + 1 >= len(args):
+                print("[Flint Studio] ERROR: --anim-mode requires one of: normal, reduced, instant.")
+                return 1
+            ai += 1
+            anim_mode_opt = _parse_anim_mode_arg(String(args[ai]))
+            if anim_mode_opt < 0:
+                print("[Flint Studio] ERROR: unknown --anim-mode value: " + String(args[ai]))
+                return 1
+        elif a.startswith("--anim-mode="):
+            var mraw = String(a[byte=12:])
+            anim_mode_opt = _parse_anim_mode_arg(mraw)
+            if anim_mode_opt < 0:
+                print("[Flint Studio] ERROR: unknown --anim-mode value: " + mraw)
+                return 1
         ai += 1
+
+    # Pure-Mojo stdio <-> AF_UNIX proxy exits immediately with zero GPU/Window initialization
+    if mcp_connect_mode:
+        return run_mcp_connect_stdio(mcp_connect_sock)
+
+    if has_out_flag:
+        if out_png.byte_length() == 0 or is_directory(out_png, follow_symlinks=True):
+            print("[Flint Studio] ERROR: --out path must be a file path, not empty or an existing directory: " + out_png)
+            return 1
+
+    if gallery_mode and gallery_dir.byte_length() == 0:
+        print("[Flint Studio] ERROR: --gallery directory path must be non-empty.")
+        return 1
+
+    var has_project_env = False
+    if not has_project_flag:
+        var env_proj = env_value("FLINT_STUDIO_PROJECT")
+        if env_proj.byte_length() > 0:
+            project_arg = env_proj
+            has_project_env = True
+
+    var project_root = String(".")
+    if has_project_flag or has_project_env:
+        if project_arg.byte_length() == 0 or not is_directory(project_arg, follow_symlinks=True):
+            print("[Flint Studio] ERROR: invalid --project directory: " + project_arg)
+            return 1
+        var rp = real_path(project_arg)
+        if not rp[0] or not is_directory(rp[1], follow_symlinks=True):
+            print("[Flint Studio] ERROR: invalid --project directory: " + project_arg)
+            return 1
+        var clean_p = rp[1]
+        while clean_p.byte_length() > 1 and clean_p.as_bytes()[clean_p.byte_length() - 1] == 47:
+            var trimmed = String(clean_p[byte=0 : clean_p.byte_length() - 1])
+            clean_p = trimmed^
+        project_root = clean_p
+        if file_size(project_root + "/flint.toml") > 0:
+            var toml_bytes = read_bytes(project_root + "/flint.toml")
+            var ver_pin = parse_flint_version_from_toml_bytes(toml_bytes)
+            var ver_check = check_flint_version_pin(ver_pin)
+            if not ver_check[0]:
+                print("[Flint Studio] ERROR: " + ver_check[1])
+                return 1
 
     var out_w = 1280
     var out_h = 720
-    var is_headless = mcp_stdio or headless_smoke or shots_mode
+    var is_headless = mcp_stdio or headless_smoke or shots_mode or gallery_mode
     var render_tier = RENDER_TIER_0_HEADLESS_SIMD if mcp_stdio else RENDER_TIER_2_AAA_VISBUFFER_RT
+    var proj_arg = project_root if (has_project_flag or has_project_env) else ""
     var studio = FlintStudioState(
         headless=is_headless,
         render_tier=render_tier,
         width=out_w,
         height=out_h,
         worker_threads=max(1, default_worker_count()),
+        project_root=proj_arg,
     )
-    _populate_default_studio_scene(studio)
+    if has_project_flag or has_project_env:
+        studio.asset_browser_dir = project_root
+    populate_default_studio_scene(studio)
 
-    var assets = AssetServer(enable_watcher=not is_headless)
-    var mcp = McpServerV2(workspace_root=".")
+    if theme_opt >= 0:
+        studio.set_studio_theme(theme_opt)
+    if anim_mode_opt >= 0:
+        studio.set_anim_mode(anim_mode_opt)
+    if workspace_opt >= 0:
+        _ = studio.apply_workspace_preset(workspace_opt, Float32(out_w), Float32(out_h))
+
+    var assets_ptr = studio.app.resources.get_ptr_mut[AssetServer]()
+    if not assets_ptr:
+        print("[Flint Studio] ERROR: AssetServer resource missing.")
+        studio.shutdown()
+        return 1
+    ref assets = assets_ptr.value()[unsafe_offset=0]
+    var mcp = McpServerV2(workspace_root=project_root)
 
     if mcp_stdio:
         var mcp_pool = JobPool()
         _ = mcp_pool.start(max(1, default_worker_count()))
         _ = mcp.serve_stdio_loop(studio, assets, mcp_pool)
         mcp_pool.stop()
-        assets.close()
         studio.shutdown()
-        return
+        return 0
 
     var ren_check = studio.app.resources.get_ptr[ScalableRenderer]()
     if not ren_check or not ren_check.value()[unsafe_offset=0].uses_vulkan():
         print("[Flint Studio] ERROR: Vulkan 1.3 driver unavailable.")
-        assets.close()
         studio.shutdown()
-        return
+        return 0
 
-    _upload_studio_gpu_assets(studio)
+    upload_default_studio_gpu_assets(studio)
     var picker = VisBufferGpuPicker()
     var inst_to_ent = List[Int]()
     var inst_to_bits = List[UInt64]()
 
+    if gallery_mode:
+        var clean_dir = gallery_dir
+        while clean_dir.byte_length() > 1 and clean_dir.as_bytes()[clean_dir.byte_length() - 1] == 47:
+            var trimmed = String(clean_dir[byte=0 : clean_dir.byte_length() - 1])
+            clean_dir = trimmed^
+        _ = make_dirs(clean_dir)
+        var shot_names = List[String](capacity=6)
+        shot_names.append("01_edit_default.png")
+        shot_names.append("02_command_palette.png")
+        shot_names.append("03_agent_theatre.png")
+        shot_names.append("04_code_scene_split.png")
+        shot_names.append("05_pie_running.png")
+        shot_names.append("06_play_hud.png")
+
+        for si in range(6):
+            studio.configure_gallery_shot(si, out_w, out_h)
+            if theme_opt >= 0:
+                studio.set_studio_theme(theme_opt)
+            var pinned_t = studio.ui_time_sec
+            var out_path = clean_dir + "/" + shot_names[si]
+            var res = _render_deterministic_png(studio, assets, out_w, out_h, out_path, pinned_t)
+            if not res[0]:
+                print("[Flint Studio] ERROR: Failed to write gallery PNG -> " + out_path)
+                var rf = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+                if rf and rf.value()[unsafe_offset=0].uses_vulkan():
+                    picker.shutdown(rf.value()[unsafe_offset=0].gpu_slot[0])
+                studio.shutdown()
+                return 1
+            print(
+                "[Flint Studio] Gallery ["
+                + String(si + 1)
+                + "/6] -> "
+                + out_path
+                + " (UIPrims="
+                + String(res[1])
+                + ", CulledDraws="
+                + String(res[2])
+                + ")"
+            )
+
+        var rf_done = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+        if rf_done and rf_done.value()[unsafe_offset=0].uses_vulkan():
+            picker.shutdown(rf_done.value()[unsafe_offset=0].gpu_slot[0])
+        # Restore canonical Edit layout before shutdown so --gallery never leaves Play saved on disk
+        studio.workspace_mgr.reset_preset(WORKSPACE_EDIT)
+        _ = studio.apply_workspace_preset(WORKSPACE_EDIT, Float32(out_w), Float32(out_h))
+        studio.shutdown()
+        return 0
+
     if headless_smoke or shots_mode:
         var target_png = out_png
         if target_png.byte_length() == 0:
-            target_png = "/tmp/flint_studio_smoke.png" if headless_smoke else "build/shots/flint_studio.png"
-        var pdir = parent_directory(target_png)
-        if pdir.byte_length() > 0 and pdir != ".":
-            _ = make_dirs(pdir)
+            if headless_smoke:
+                target_png = "/tmp/flint_studio_smoke.png"
+            elif has_project_flag or has_project_env:
+                target_png = project_root + "/build/shots/flint_studio.png"
+            else:
+                target_png = "build/shots/flint_studio.png"
 
-        var empty_input = InputState()
-        for sub in range(4):
-            studio.update_camera(Float32(0.0))
-            var rend_opt = studio.app.resources.get_ptr_mut[ScalableRenderer]()
-            if rend_opt and rend_opt.value()[unsafe_offset=0].uses_vulkan():
-                rend_opt.value()[unsafe_offset=0].gpu_slot[0].tsr_history_weight = (
-                    Float32(0.0) if sub == 0 else Float32(0.78)
-                )
-            var gms = 0.0
-            if rend_opt and rend_opt.value()[unsafe_offset=0].uses_vulkan():
-                gms = rend_opt.value()[unsafe_offset=0].gpu_slot[0].render_graph.total_gpu_ms
-            studio.render_editor_frame(
-                out_w,
-                out_h,
-                gpu_ms=gms,
-                mounted_packs=len(assets.mounts),
-                mcp_clients=0,
-                input=empty_input,
-                dt=Float32(1.0 / 60.0),
-            )
+        # Enforce canonical deterministic steady-state frame so `--shots` and `--headless-smoke` match
+        if workspace_opt < 0:
+            studio.workspace_mgr.reset_preset(WORKSPACE_EDIT)
+            _ = studio.apply_workspace_preset(WORKSPACE_EDIT, Float32(out_w), Float32(out_h))
+        studio.set_anim_mode(UI_ANIM_INSTANT)
+        studio.ui_time_sec = Float32(0.0)
+        var res = _render_deterministic_png(studio, assets, out_w, out_h, target_png, Float32(0.0))
 
         var rend_fin = studio.app.resources.get_ptr_mut[ScalableRenderer]()
-        var px = List[UInt32]()
-        var culled_draws = 0
         if rend_fin and rend_fin.value()[unsafe_offset=0].uses_vulkan():
-            ref r = rend_fin.value()[unsafe_offset=0]
-            px = r.readback_pixels()
-            culled_draws = r.gpu_slot[0].last_culled_meshlet_draws
-            picker.shutdown(r.gpu_slot[0])
-        _ = write_png(target_png, px, out_w, out_h)
+            picker.shutdown(rend_fin.value()[unsafe_offset=0].gpu_slot[0])
+        if not res[0]:
+            print("[Flint Studio] ERROR: Failed to write Studio frame PNG -> " + target_png)
+            studio.shutdown()
+            return 1
 
-        var ui_cnt = len(studio.ui_ctx.draw_list.prims)
         print(
             "[Flint Studio] Saved 1280x720 Studio frame -> "
             + target_png
-            + " (UIPrims=" + String(ui_cnt)
+            + " (UIPrims=" + String(res[1])
             + ", Entities=" + String(studio.live_entity_count())
-            + ", CulledDraws=" + String(culled_draws) + ")"
+            + ", CulledDraws=" + String(res[2]) + ")"
         )
-        assets.close()
         studio.shutdown()
-        return
+        return 0
 
     # Interactive Window Mode via `WindowPlugin` + `ScalableRenderer`
     var win_ok = False
@@ -400,15 +546,16 @@ def main() raises:
             win_ok = True
 
     if not win_ok:
-        print("[Flint Studio] No Wayland/X11/KMS display detected. Use '--headless-smoke' or '--shots'.")
+        print("[Flint Studio] No Wayland/X11/KMS display detected. Use '--headless-smoke', '--shots', or '--gallery'.")
         var rend_s = studio.app.resources.get_ptr_mut[ScalableRenderer]()
         if rend_s and rend_s.value()[unsafe_offset=0].uses_vulkan():
             picker.shutdown(rend_s.value()[unsafe_offset=0].gpu_slot[0])
-        assets.close()
         studio.shutdown()
-        return
+        return 0
 
     var mcp_sock = FlintMcpUnixListener(default_mcp_socket_path())
+    if mcp_sock.active and mcp_sock.socket_path.byte_length() > 0:
+        studio.agent_runtime.acp.configure_studio_mcp_socket(exe_path, mcp_sock.socket_path)
     var mcp_pool = JobPool()
     _ = mcp_pool.start(2)
     var dragging_gizmo = False
@@ -427,9 +574,21 @@ def main() raises:
         studio.app.world.flush_commands(studio.app.commands)
 
         var w_opt = studio.app.resources.get_ptr_mut[WindowStateResource]()
-        if not w_opt or not w_opt.value()[unsafe_offset=0].is_open():
+        if not w_opt or not w_opt.value()[unsafe_offset=0].initialized:
             break
         ref win_res = w_opt.value()[unsafe_offset=0]
+        if win_res.close_requested:
+            if studio.dirty and not studio.quit_requested:
+                win_res.close_requested = False
+                if len(win_res.windows) > 0:
+                    win_res.windows[0].close_requested = False
+                    win_res.windows[0].x11.close_requested = False
+                    win_res.windows[0].kms.close_requested = False
+                _ = studio.request_quit()
+            else:
+                break
+        if studio.quit_requested:
+            break
         if win_res.resized:
             out_w = max(64, win_res.width)
             out_h = max(64, win_res.height)
@@ -461,7 +620,14 @@ def main() raises:
                     _ = renderer.attach_window_surface(window)
                     resume_swapchain = False
                 _ = assets.tick(now)
+                var res_ed = studio.app.resources.get_ptr_mut[SceneAssetResolver]()
+                if res_ed and assets.hot_reloads_applied > res_ed.value()[].hot_reloads_applied:
+                    res_ed.value()[].resolve_world(studio.app.world, assets, studio.app.resources)
+                    studio.sync_flmat_studio_styles()
+                    studio.asset_browser_scanned = False
+                _sync_mcp_gate_from_bus(mcp, studio)
                 _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, renderer.gpu_slot[0])
+                _drain_mcp_events_to_studio(mcp, studio)
             dragging_gizmo = False
             studio.active_gizmo_handle = GIZMO_AXIS_NONE
             continue
@@ -500,6 +666,8 @@ def main() raises:
             frame_input = InputState()
         elif not studio.process_editor_input(frame_input, dt):
             break
+        if studio.quit_requested:
+            break
 
         var vp_rect = studio.viewport_rect(out_w, out_h)
         var vp_x = vp_rect.x
@@ -511,7 +679,16 @@ def main() raises:
         var my = frame_input.last_mouse_y
         var in_vp = vp_rect.contains(mx, my)
 
-        if frame_input.mouse_pressed(0) and in_vp and studio.dock.dragging_node < 0:
+        var ui_blocks_vp = (
+            studio.dock.dragging_node >= 0
+            or studio.dock.hovered_splitter_node >= 0
+            or studio.wants_mouse_at(mx, my)
+            or studio.ui_ctx.wants_mouse_at(mx, my)
+            or studio.menu.bar.group >= 0
+            or studio.pie.mode != PIE_STOPPED
+        )
+        var gizmo_rot = studio.selection_gizmo_rotation()
+        if frame_input.mouse_pressed(0) and in_vp and not ui_blocks_vp:
             var g_piv = studio.selection_gizmo_pivot()
             var g_hit = GIZMO_AXIS_NONE
             if g_piv[0]:
@@ -519,6 +696,7 @@ def main() raises:
                     mx, my, g_piv[1],
                     studio.gizmo_mode, vp_x, vp_y, vp_w, vp_h,
                     studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
+                    gizmo_rot=gizmo_rot,
                 )
             if g_hit != GIZMO_AXIS_NONE:
                 dragging_gizmo = True
@@ -542,6 +720,15 @@ def main() raises:
                 var req_id = picker.request_pick(Int(mx), Int(my))
                 pending_pick_ctrls.append((req_id, ctrl_down))
 
+        if (
+            studio.pie.mode != PIE_STOPPED
+            or studio.ui_ctx.modal_depth > 0
+            or studio.ui_ctx.had_modal_prev_frame
+            or (frame_input.key_pressed(256) and not studio.wants_keyboard())
+        ):
+            dragging_gizmo = False
+            studio.active_gizmo_handle = GIZMO_AXIS_NONE
+
         if dragging_gizmo and frame_input.mouse_down(0) and len(drag_snaps) > 0:
             var cur_ray = ViewportRay.from_screen(
                 mx, my, vp_x, vp_y, vp_w, vp_h,
@@ -552,13 +739,13 @@ def main() raises:
             if studio.gizmo_mode == GIZMO_MODE_TRANSLATE:
                 var delta_p = Vec3()
                 if h_id == GIZMO_AXIS_X or h_id == GIZMO_AXIS_Y or h_id == GIZMO_AXIS_Z:
-                    var ax = Vec3(1, 0, 0) if h_id == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h_id == GIZMO_AXIS_Y else Vec3(0, 0, 1))
+                    var ax = gizmo_rot.rotate(Vec3(1, 0, 0) if h_id == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h_id == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
                     var t0 = ray_axis_closest_param(drag_start_ray, drag_start_pivot, ax)
                     var t1 = ray_axis_closest_param(cur_ray, drag_start_pivot, ax)
                     if t0[0] and t1[0]:
                         delta_p = ax * (t1[1] - t0[1])
                 elif h_id == GIZMO_PLANE_XY or h_id == GIZMO_PLANE_XZ or h_id == GIZMO_PLANE_YZ:
-                    var pn = Vec3(0, 0, 1) if h_id == GIZMO_PLANE_XY else (Vec3(0, 1, 0) if h_id == GIZMO_PLANE_XZ else Vec3(1, 0, 0))
+                    var pn = gizmo_rot.rotate(Vec3(0, 0, 1) if h_id == GIZMO_PLANE_XY else (Vec3(0, 1, 0) if h_id == GIZMO_PLANE_XZ else Vec3(1, 0, 0)))
                     var p0 = ray_plane_hit(drag_start_ray, drag_start_pivot, pn)
                     var p1 = ray_plane_hit(cur_ray, drag_start_pivot, pn)
                     if p0[0] and p1[0]:
@@ -576,7 +763,7 @@ def main() raises:
                     coalesce_key=drag_seq,
                 )
             elif studio.gizmo_mode == GIZMO_MODE_ROTATE:
-                var rax = Vec3(1, 0, 0) if h_id == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h_id == GIZMO_AXIS_Y else Vec3(0, 0, 1))
+                var rax = gizmo_rot.rotate(Vec3(1, 0, 0) if h_id == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h_id == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
                 var drad = gizmo_rotation_delta_rad(drag_start_ray, cur_ray, drag_start_pivot, rax, studio.cam_fwd, wscale)
                 if studio.snap_enabled:
                     drad = snap_angle_deg(drad, studio.angle_snap_deg)
@@ -591,7 +778,7 @@ def main() raises:
                     coalesce_key=drag_seq,
                 )
             elif studio.gizmo_mode == GIZMO_MODE_SCALE:
-                var sf = gizmo_scale_drag(drag_start_ray, cur_ray, drag_start_pivot, h_id, wscale, studio.cam_fwd, studio.cam_right, Vec3(1.0, 1.0, 1.0))
+                var sf = gizmo_scale_drag(drag_start_ray, cur_ray, drag_start_pivot, h_id, wscale, studio.cam_fwd, studio.cam_right, Vec3(1.0, 1.0, 1.0), gizmo_rot=gizmo_rot)
                 _ = studio.apply_gizmo_drag_selected(
                     drag_snaps,
                     drag_start_pivot,
@@ -606,15 +793,17 @@ def main() raises:
             dragging_gizmo = False
             studio.active_gizmo_handle = GIZMO_AXIS_NONE
 
-        if studio.pie.mode == PIE_PLAYING:
-            _ = studio.pie_step(1)
-
         _ = assets.tick(now)
         var r_mcp = studio.app.resources.get_ptr_mut[ScalableRenderer]()
         var gms = 0.0
         if r_mcp and r_mcp.value()[unsafe_offset=0].uses_vulkan():
+            _sync_mcp_gate_from_bus(mcp, studio)
             _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, r_mcp.value()[unsafe_offset=0].gpu_slot[0])
+            _drain_mcp_events_to_studio(mcp, studio)
             gms = r_mcp.value()[unsafe_offset=0].gpu_slot[0].render_graph.total_gpu_ms
+
+        if studio.pie.mode == PIE_PLAYING:
+            _ = studio.step_pie_frame(dt)
 
         studio.render_editor_frame(
             out_w,
@@ -643,5 +832,11 @@ def main() raises:
     var r_end = studio.app.resources.get_ptr_mut[ScalableRenderer]()
     if r_end and r_end.value()[unsafe_offset=0].uses_vulkan():
         picker.shutdown(r_end.value()[unsafe_offset=0].gpu_slot[0])
-    assets.close()
     studio.shutdown()
+    return 0
+
+
+def main() raises:
+    var rc = _run_studio()
+    if rc != 0:
+        external_call["exit", NoneType](Int32(rc))

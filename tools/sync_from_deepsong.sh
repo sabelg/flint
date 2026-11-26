@@ -265,10 +265,18 @@ if missing:
     sys.exit(1)
 PY
 
-# Zero-Game-Leak Gate: ensure zero gameplay.* or world.* imports exist anywhere in src/flint/
+# Zero-Game-Leak Gate: ensure zero gameplay.*/world.* imports or game-name/SD_* leaks exist in src/flint/
+LEAK_FOUND=0
 if grep -rnE "^from (gameplay|world)(\.| )" "$ROOT/src/flint/"; then
     echo "[FAIL] Game-specific imports leaked into src/flint/!" >&2
+    LEAK_FOUND=1
+fi
+if grep -rnE "Maroon|maroon|deepsong|Deepsong|sharddepth|Sharddepth|SHARDDEPTH|SD_[A-Z0-9_]+" "$ROOT/src/flint/"; then
+    echo "[FAIL] Game-specific identifiers or legacy SD_* env vars leaked into src/flint/!" >&2
+    LEAK_FOUND=1
+fi
+if [[ "$LEAK_FOUND" -ne 0 ]]; then
     exit 1
 fi
 
-echo "[PASS] Zero-Game-Leak Gate: 0 gameplay/voxel imports across $(find "$ROOT/src/flint" -name '*.mojo' | wc -l) Flint modules."
+echo "[PASS] Zero-Game-Leak Gate: 0 gameplay/world imports or game-name leaks across $(find "$ROOT/src/flint" -name '*.mojo' | wc -l) Flint modules."

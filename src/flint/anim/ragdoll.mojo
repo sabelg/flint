@@ -102,7 +102,7 @@ def ragdoll_masses() -> List[Float32]:
 
 
 def ragdoll_radii() -> List[Float32]:
-    """Metres at scale 1 (Maroon's model is about 3 m long)."""
+    """Metres at scale 1 (default biped template is about 3 m long)."""
     return [
         Float32(0.32), Float32(0.32), Float32(0.34), Float32(0.34), Float32(0.22), Float32(0.24),
         Float32(0.13), Float32(0.11), Float32(0.10), Float32(0.13), Float32(0.11), Float32(0.10),

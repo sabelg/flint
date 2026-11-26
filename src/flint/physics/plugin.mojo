@@ -58,6 +58,8 @@ from flint.physics.world import (
     BODY_SHAPE_CONVEX_HULL,
     BODY_SHAPE_SPHERE,
     PhysicsWorld,
+    TRIGGER_ENTER,
+    TRIGGER_EXIT,
     TRIGGER_SHAPE_BOX,
     TRIGGER_SHAPE_CAPSULE,
     TRIGGER_SHAPE_SPHERE,
@@ -315,6 +317,25 @@ struct _TrackedTriggerSync(Copyable, ImplicitlyCopyable, Movable):
         self.trigger_id = trigger_id
 
 
+struct _TrackedKccSync(Copyable, ImplicitlyCopyable, Movable):
+    var entity_bits: UInt64
+    var proxy_id: Int
+    var last_lt_pos: Vec3
+    var last_kcc_pos: Vec3
+
+    def __init__(
+        out self,
+        entity_bits: UInt64 = 0,
+        proxy_id: Int = -1,
+        last_lt_pos: Vec3 = Vec3(),
+        last_kcc_pos: Vec3 = Vec3(),
+    ):
+        self.entity_bits = entity_bits
+        self.proxy_id = proxy_id
+        self.last_lt_pos = last_lt_pos
+        self.last_kcc_pos = last_kcc_pos
+
+
 struct _TrackedJointSync(Copyable, ImplicitlyCopyable, Movable):
     var entity_bits: UInt64
     var runtime_index: Int
@@ -343,28 +364,34 @@ struct PhysicsSyncStateResource(Resource, Movable):
     var entity_to_slot: Dict[UInt64, Int]
     var tracked: List[_TrackedRigidSync]
     var body_to_entity: Dict[Int, UInt64]
+    var trigger_to_entity: Dict[Int, UInt64]
     var tracked_vehicles: List[_TrackedVehicleSync]
     var tracked_aeros: List[_TrackedAeroSync]
     var tracked_cloths: List[_TrackedClothSync]
     var tracked_triggers: List[_TrackedTriggerSync]
     var tracked_joints: List[_TrackedJointSync]
+    var tracked_kccs: List[_TrackedKccSync]
 
     def __init__(out self):
         self.entity_to_slot = Dict[UInt64, Int]()
         self.tracked = List[_TrackedRigidSync]()
         self.body_to_entity = Dict[Int, UInt64]()
+        self.trigger_to_entity = Dict[Int, UInt64]()
         self.tracked_vehicles = List[_TrackedVehicleSync]()
         self.tracked_aeros = List[_TrackedAeroSync]()
         self.tracked_cloths = List[_TrackedClothSync]()
         self.tracked_triggers = List[_TrackedTriggerSync]()
         self.tracked_joints = List[_TrackedJointSync]()
+        self.tracked_kccs = List[_TrackedKccSync]()
 
     def record_body(mut self, entity: Entity, body_id: Int, pos: Vec3, rot: Quat):
         var bits = entity.to_bits()
-        self.body_to_entity[body_id] = bits
         var found = self.entity_to_slot.get(bits)
         if found:
             var idx = found.value()
+            var old_bid = self.tracked[idx].body_id
+            if old_bid >= 0 and old_bid != body_id:
+                _ = self.body_to_entity.pop(old_bid, 0)
             self.tracked[idx].body_id = body_id
             self.tracked[idx].last_pos = pos
             self.tracked[idx].last_rot = rot
@@ -372,6 +399,8 @@ struct PhysicsSyncStateResource(Resource, Movable):
             var idx = len(self.tracked)
             self.entity_to_slot[bits] = idx
             self.tracked.append(_TrackedRigidSync(bits, body_id, pos, rot))
+        if body_id >= 0:
+            self.body_to_entity[body_id] = bits
 
     def record_body_collider(
         mut self,
@@ -444,8 +473,13 @@ struct PhysicsSyncStateResource(Resource, Movable):
 
     def record_vehicle(mut self, entity: Entity, vehicle_slot: Int, body_id: Int):
         var bits = entity.to_bits()
+        if body_id >= 0:
+            self.body_to_entity[body_id] = bits
         for i in range(len(self.tracked_vehicles)):
             if self.tracked_vehicles[i].entity_bits == bits:
+                var old_bid = self.tracked_vehicles[i].body_id
+                if old_bid >= 0 and old_bid != body_id:
+                    _ = self.body_to_entity.pop(old_bid, 0)
                 self.tracked_vehicles[i].vehicle_slot = vehicle_slot
                 self.tracked_vehicles[i].body_id = body_id
                 return
@@ -453,8 +487,13 @@ struct PhysicsSyncStateResource(Resource, Movable):
 
     def record_aero(mut self, entity: Entity, aero_slot: Int, body_id: Int):
         var bits = entity.to_bits()
+        if body_id >= 0:
+            self.body_to_entity[body_id] = bits
         for i in range(len(self.tracked_aeros)):
             if self.tracked_aeros[i].entity_bits == bits:
+                var old_bid = self.tracked_aeros[i].body_id
+                if old_bid >= 0 and old_bid != body_id:
+                    _ = self.body_to_entity.pop(old_bid, 0)
                 self.tracked_aeros[i].aero_slot = aero_slot
                 self.tracked_aeros[i].body_id = body_id
                 return
@@ -470,11 +509,55 @@ struct PhysicsSyncStateResource(Resource, Movable):
 
     def record_trigger(mut self, entity: Entity, trigger_id: Int):
         var bits = entity.to_bits()
+        if trigger_id >= 0:
+            self.trigger_to_entity[trigger_id] = bits
         for i in range(len(self.tracked_triggers)):
             if self.tracked_triggers[i].entity_bits == bits:
+                var old_tid = self.tracked_triggers[i].trigger_id
+                if old_tid >= 0 and old_tid != trigger_id:
+                    _ = self.trigger_to_entity.pop(old_tid, 0)
                 self.tracked_triggers[i].trigger_id = trigger_id
                 return
         self.tracked_triggers.append(_TrackedTriggerSync(bits, trigger_id))
+
+    def record_kcc(
+        mut self,
+        entity: Entity,
+        proxy_id: Int,
+        last_lt_pos: Vec3 = Vec3(),
+        last_kcc_pos: Vec3 = Vec3(),
+    ):
+        var bits = entity.to_bits()
+        if proxy_id >= 0:
+            self.body_to_entity[proxy_id] = bits
+        for i in range(len(self.tracked_kccs)):
+            if self.tracked_kccs[i].entity_bits == bits:
+                var old_pid = self.tracked_kccs[i].proxy_id
+                if old_pid >= 0 and old_pid != proxy_id:
+                    _ = self.body_to_entity.pop(old_pid, 0)
+                self.tracked_kccs[i].proxy_id = proxy_id
+                self.tracked_kccs[i].last_lt_pos = last_lt_pos
+                self.tracked_kccs[i].last_kcc_pos = last_kcc_pos
+                return
+        self.tracked_kccs.append(_TrackedKccSync(bits, proxy_id, last_lt_pos, last_kcc_pos))
+
+    def find_kcc_sync(self, entity: Entity) -> Tuple[Int, Vec3, Vec3]:
+        var bits = entity.to_bits()
+        for i in range(len(self.tracked_kccs)):
+            if self.tracked_kccs[i].entity_bits == bits:
+                return (
+                    self.tracked_kccs[i].proxy_id,
+                    self.tracked_kccs[i].last_lt_pos,
+                    self.tracked_kccs[i].last_kcc_pos,
+                )
+        return (-1, Vec3(), Vec3())
+
+    def find_kcc_proxy(self, entity: Entity) -> Int:
+        var bits = entity.to_bits()
+        for i in range(len(self.tracked_kccs)):
+            if self.tracked_kccs[i].entity_bits == bits:
+                return self.tracked_kccs[i].proxy_id
+        return -1
 
     def record_joint(
         mut self,
@@ -502,7 +585,17 @@ struct PhysicsSyncStateResource(Resource, Movable):
         return None
 
     def lookup_entity(self, body_id: Int) -> Entity:
+        if body_id < 0:
+            return NULL_ENTITY
         var found = self.body_to_entity.get(body_id)
+        if found:
+            return Entity.from_bits(found.value())
+        return NULL_ENTITY
+
+    def lookup_trigger_entity(self, trigger_id: Int) -> Entity:
+        if trigger_id < 0:
+            return NULL_ENTITY
+        var found = self.trigger_to_entity.get(trigger_id)
         if found:
             return Entity.from_bits(found.value())
         return NULL_ENTITY
@@ -1700,6 +1793,7 @@ def _sys_physics_pre_update(
                 if physics.triggers[ti].id == tt.trigger_id:
                     physics.triggers[ti].active = False
                     break
+            _ = sync.trigger_to_entity.pop(tt.trigger_id, 0)
         else:
             keep_trigs.append(tt)
     sync.tracked_triggers = keep_trigs^
@@ -1778,6 +1872,31 @@ def _sys_physics_pre_update(
         else:
             keep_cloths.append(tc)
     sync.tracked_cloths = keep_cloths^
+
+    var keep_kccs = List[_TrackedKccSync]()
+    for i in range(len(sync.tracked_kccs)):
+        var tk = sync.tracked_kccs[i]
+        var e = Entity.from_bits(tk.entity_bits)
+        var alive_k = world.is_alive(e) and world.has[CharacterControllerComponent](e)
+        if not alive_k:
+            physics.unregister_kcc_proxy(tk.proxy_id)
+            _ = sync.body_to_entity.pop(tk.proxy_id, 0)
+        else:
+            keep_kccs.append(tk)
+    sync.tracked_kccs = keep_kccs^
+
+    # Prune orphaned owned KCC proxies (e.g. after PIE stop / world deserialization)
+    var ki = 0
+    while ki < len(physics.kcc_proxies):
+        var owner = physics.kcc_proxies[ki].owner_key
+        if owner != 0:
+            var oe = Entity.from_bits(owner)
+            if not world.is_alive(oe) or not world.has[CharacterControllerComponent](oe):
+                var pid = physics.kcc_proxies[ki].id
+                physics.unregister_kcc_proxy(pid)
+                _ = sync.body_to_entity.pop(pid, 0)
+                continue
+        ki += 1
 
     # 2. Materialize & pre-sync RigidBodyComponent entities
     var need_broadphase_rebuild = False
@@ -1880,6 +1999,7 @@ def _sys_physics_pre_update(
                     if physics.triggers[ti].id == col.trigger_id:
                         physics.triggers[ti].active = False
                         break
+                _ = sync.trigger_to_entity.pop(col.trigger_id, 0)
                 col.trigger_id = -1
             continue
         var pose = _entity_world_pose(world, e)
@@ -1911,6 +2031,7 @@ def _sys_physics_pre_update(
                         physics.triggers[ti].radius = col.half_extents.length()
                         physics.triggers[ti].half_height = Float32(0.0)
                     found_trig = True
+                    sync.record_trigger(e, col.trigger_id)
                     break
             if not found_trig:
                 col.trigger_id = -1
@@ -2123,6 +2244,54 @@ def _sys_physics_pre_update(
             if cc.cloth_slot >= 0:
                 sync.record_cloth(e, cc.cloth_slot)
 
+    # 8. Materialize & sync CharacterControllerComponent trigger proxies
+    var kcc_mask = world.bit_for[CharacterControllerComponent]()
+    var kcc_entities = world.query_entities(kcc_mask)
+    for i in range(len(kcc_entities)):
+        var e = kcc_entities[i]
+        var kc_opt = world.get_ptr_mut[CharacterControllerComponent](e)
+        if not kc_opt:
+            continue
+        ref kc = kc_opt.value()[unsafe_offset=0]
+        var has_pose = world.has[LocalTransform](e) or world.has[GlobalTransform](e)
+        var pose_pos = _entity_world_pose(world, e)[0] if has_pose else kc.controller.pos
+        var prev_sync = sync.find_kcc_sync(e)
+        var pid = prev_sync[0]
+        if pid < 0 or physics.find_kcc_proxy_slot(pid) < 0:
+            pid = physics.find_kcc_proxy_by_owner(e.to_bits())
+            if pid < 0:
+                if has_pose:
+                    var pose_non_zero = (pose_pos - Vec3()).length_squared() > Float32(1.0e-8)
+                    var kcc_is_default = (kc.controller.pos - Vec3(0.0, 1.0, 0.0)).length_squared() <= Float32(1.0e-8)
+                    if pose_non_zero or kcc_is_default:
+                        kc.controller.pos = pose_pos
+                pid = physics.register_kcc_proxy(
+                    kc.controller.pos,
+                    kc.controller.cfg.radius,
+                    kc.controller.cfg.half_height,
+                    kc.controller.cfg.up,
+                    kc.controller.cfg.filter,
+                    kc.active,
+                    e.to_bits(),
+                )
+            sync.record_kcc(e, pid, pose_pos, kc.controller.pos)
+        else:
+            if has_pose:
+                var lt_moved = (pose_pos - prev_sync[1]).length_squared() > Float32(1.0e-8)
+                var kcc_moved = (kc.controller.pos - prev_sync[2]).length_squared() > Float32(1.0e-8)
+                if lt_moved and not kcc_moved:
+                    kc.controller.pos = pose_pos
+            sync.record_kcc(e, pid, pose_pos, kc.controller.pos)
+        _ = physics.sync_kcc_proxy(
+            pid,
+            kc.controller.pos,
+            kc.controller.cfg.radius,
+            kc.controller.cfg.half_height,
+            kc.controller.cfg.up,
+            kc.controller.cfg.filter,
+            kc.active,
+        )
+
 
 def _sys_physics_fixed_step(
     world_ptr: Pointer[World, MutAnyOrigin],
@@ -2146,6 +2315,7 @@ def _sys_physics_fixed_step(
         return
 
     # 1. Step CharacterControllers
+    var sync_opt = resources.get_ptr_mut[PhysicsSyncStateResource]()
     var kcc_mask = world.bit_for[CharacterControllerComponent]()
     var kcc_entities = world.query_entities(kcc_mask)
     for i in range(len(kcc_entities)):
@@ -2163,6 +2333,32 @@ def _sys_physics_fixed_step(
         if lt_opt:
             rot = lt_opt.value()[unsafe_offset=0].rotation
         _write_world_pose_to_local(world, e, new_pos, rot)
+        if sync_opt:
+            ref sync = sync_opt.value()[unsafe_offset=0]
+            var pid = sync.find_kcc_proxy(e)
+            if pid < 0 or physics.find_kcc_proxy_slot(pid) < 0:
+                pid = physics.find_kcc_proxy_by_owner(e.to_bits())
+                if pid < 0:
+                    pid = physics.register_kcc_proxy(
+                        new_pos,
+                        kc.controller.cfg.radius,
+                        kc.controller.cfg.half_height,
+                        kc.controller.cfg.up,
+                        kc.controller.cfg.filter,
+                        kc.active,
+                        e.to_bits(),
+                    )
+            var lt_after = _entity_world_pose(world, e)[0] if (world.has[LocalTransform](e) or world.has[GlobalTransform](e)) else new_pos
+            sync.record_kcc(e, pid, lt_after, new_pos)
+            _ = physics.sync_kcc_proxy(
+                pid,
+                new_pos,
+                kc.controller.cfg.radius,
+                kc.controller.cfg.half_height,
+                kc.controller.cfg.up,
+                kc.controller.cfg.filter,
+                kc.active,
+            )
 
     # 2. Push controls for Vehicles, Aero6Dof, and Cloth wind
     var veh_mask = world.bit_for[VehicleComponent]()
@@ -2197,7 +2393,6 @@ def _sys_physics_fixed_step(
     physics.step(dt, Int(pool_ptr))
 
     # 4. Sync solved poses & velocities back to ECS components & LocalTransform
-    var sync_opt = resources.get_ptr_mut[PhysicsSyncStateResource]()
 
     var rb_mask = world.bit_for[RigidBodyComponent]()
     var rb_entities = world.query_entities(rb_mask)
@@ -2335,3 +2530,75 @@ struct PhysicsPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
             writes=all_phys,
             exclusive=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# KCC-Aware Trigger & Body Lookup Helpers
+# ---------------------------------------------------------------------------
+
+def entity_from_body(sync: PhysicsSyncStateResource, body_id: Int) -> Entity:
+    """Resolves a `RigidBody`, `Vehicle`, `Aero6Dof`, or KCC `proxy_id` via `PhysicsSyncStateResource`."""
+    return sync.lookup_entity(body_id)
+
+
+def entity_from_body(body_id: Int, resources: Resources) -> Entity:
+    """Resolves a `RigidBody`, `Vehicle`, `Aero6Dof`, or KCC `proxy_id` via `Resources`."""
+    if body_id < 0:
+        return NULL_ENTITY
+    var sync_opt = resources.get_ptr[PhysicsSyncStateResource]()
+    if not sync_opt:
+        return NULL_ENTITY
+    return sync_opt.value()[unsafe_offset=0].lookup_entity(body_id)
+
+
+def _trigger_matches_entity(
+    trigger_id: Int,
+    trigger_entity: Entity,
+    world: World,
+    resources: Resources,
+) -> Bool:
+    if trigger_id < 0 or not world.is_alive(trigger_entity):
+        return False
+    var sync_opt = resources.get_ptr[PhysicsSyncStateResource]()
+    if sync_opt:
+        var mapped = sync_opt.value()[unsafe_offset=0].lookup_trigger_entity(trigger_id)
+        if mapped == trigger_entity:
+            return True
+    var col_opt = world.get_ptr[ColliderComponent](trigger_entity)
+    if col_opt:
+        ref col = col_opt.value()[unsafe_offset=0]
+        if col.is_trigger and col.trigger_id == trigger_id:
+            return True
+    return False
+
+
+@always_inline
+def OnEnter(ev: TriggerEvent) -> Bool:
+    return ev.kind == TRIGGER_ENTER
+
+
+def OnEnter(
+    ev: TriggerEvent,
+    trigger_entity: Entity,
+    world: World,
+    resources: Resources,
+) -> Bool:
+    if ev.kind != TRIGGER_ENTER:
+        return False
+    return _trigger_matches_entity(ev.trigger_id, trigger_entity, world, resources)
+
+
+@always_inline
+def OnExit(ev: TriggerEvent) -> Bool:
+    return ev.kind == TRIGGER_EXIT
+
+
+def OnExit(
+    ev: TriggerEvent,
+    trigger_entity: Entity,
+    world: World,
+    resources: Resources,
+) -> Bool:
+    if ev.kind != TRIGGER_EXIT:
+        return False
+    return _trigger_matches_entity(ev.trigger_id, trigger_entity, world, resources)

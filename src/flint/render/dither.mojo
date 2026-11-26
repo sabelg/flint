@@ -1,5 +1,5 @@
 """Occluder dithering (package 3.2): what stands between the camera and
-Maroon is screen-doored away around him instead of the camera pushing in.
+the character is screen-doored away around it instead of the camera pushing in.
 
 Triangles drawn while the occluder pass is on (terrain chunks, the layer's
 procedural environment, environment and scenery models) carry
@@ -9,13 +9,13 @@ raster shaders (CPU, amdgpu, Vulkan) compute
     value = d2 * scale + offset        d2 = (x - cx)^2 + (y - cy)^2
     drop  = inverse_z > near_inverse_z and value < bayer4(x, y)
 
-where (x, y) is the integer pixel, (cx, cy) Maroon's projected chest (the
+where (x, y) is the integer pixel, (cx, cy) the character's projected chest (the
 camera target) in the same pixel convention, and bayer4 the 4x4 ordered
-dither level 0..15. `near_inverse_z` keeps everything at or behind Maroon
-(less `margin`) solid, so the floor he stands on and walls behind him never
+dither level 0..15. `near_inverse_z` keeps everything at or behind the character
+(less `margin`) solid, so the floor it stands on and walls behind it never
 dither; `scale` and `offset` make a disc whose centre keeps `keep` of the
-pixels and whose edge (at `radius` metres around him) keeps all of them.
-Dropped pixels are not drawn and write no depth, so Maroon shows through.
+pixels and whose edge (at `radius` metres around it) keeps all of them.
+Dropped pixels are not drawn and write no depth, so the character shows through.
 
 The test is the same float operations in the same order on every backend
 (two fused multiply-adds), so the three agree pixel for pixel. It is

@@ -11,7 +11,7 @@ comptime GROUP_WIDTH: Int = 8
 comptime GROUP_HEIGHT: Int = 4
 comptime TEXTURED_FLAG: UInt32 = 256
 comptime PER_PIXEL_FLAG: UInt32 = 512
-# Package 3.2: an occluder triangle, screen-doored around Maroon (render/dither.mojo).
+# Package 3.2: an occluder triangle, screen-doored around the character (render/dither.mojo).
 comptime DITHER_FLAG: UInt32 = 1024
 comptime PBR_FLAG: UInt32 = 2048
 comptime NO_DEPTH_WRITE_FLAG: UInt32 = 4096

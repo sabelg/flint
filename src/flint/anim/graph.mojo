@@ -1,6 +1,6 @@
 """The animation graph as data (package 3.3): states, 1D blend spaces, bone
 masks, override and additive layers, transition blend times and the
-runtime's settings, read from `assets/deepsong/anim/<name>.json`.
+runtime's settings, read from `assets/anim/<name>.json`.
 
 The state machine picks, each frame, the first state in file order whose
 `when` conditions all hold (the last state, with no conditions, is the
@@ -39,7 +39,7 @@ comptime WARP_GRAB: Int = 1     # hands to the piece being torn up
 comptime WARP_MANTLE: Int = 2   # hands to the ledge's lip
 comptime WARP_HUG: Int = 3      # arms round a target (3.8's bear hug)
 
-comptime ANIM_GRAPH_PATH = "assets/deepsong/anim/maroon.json"
+comptime ANIM_GRAPH_PATH = "assets/anim/default.json"
 
 
 struct Condition(Copyable, ImplicitlyCopyable, Movable):
@@ -349,7 +349,7 @@ struct TransitionDef(Copyable, ImplicitlyCopyable, Movable):
 
 
 struct FormOffsetDef(Copyable, Movable):
-    """One form's retarget offsets (package 3.9): the forms share Maroon's
+    """One form's retarget offsets (package 3.9): the forms share the base
     rig and clips, and each draws them on its own proportions. `scale`
     multiplies the draw scale, `bones` scale joints (and what hangs from
     them) on top of the clips, `stride` is how much farther a step carries

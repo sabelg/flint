@@ -1,0 +1,7 @@
+{
+  "format": "flprefab",
+  "version": 1,
+  "name": "MainCamera",
+  "nodes": [{"name": "MainCamera", "parent_slot": -1, "components": {"LocalTransform": {"translation": [0.0, 5.800000190734863, 10.5], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}, "CameraComponent": {"fov_y_deg": 52.0, "near_z": 0.10000000149011612, "far_z": 1000.0, "exposure": 1.0, "active": true, "look_target_offset": [0.5, -5.0, -10.5]}}}],
+  "nested_refs": []
+}

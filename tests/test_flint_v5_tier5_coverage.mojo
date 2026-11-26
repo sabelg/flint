@@ -6817,7 +6817,7 @@ def test_r18_partition_ab_fixes(tmp_dir: String) raises:
     var bad_flscn_path = tmp_dir + "/bad_r18.flscn"
     _write_text(
         bad_flscn_path,
-        '{"format":"flscn","version":1,"name":"Broken","entities":[{"slot":0,"parent":-1,"components":{"NoSuchComp":{}}}]}',
+        '{"format":"flscn","version":1,"name":"Broken","entities":[{"slot":0,"parent":99,"components":{"LocalTransform":{"translation":[0,0,0],"rotation":[0,0,0,1],"scale":[1,1,1]}}}]}',
     )
     assert_false(st.load_scene_file(bad_flscn_path))
     assert_equal(st.app.world.entity_count(), 2)

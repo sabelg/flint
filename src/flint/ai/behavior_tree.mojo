@@ -13,11 +13,20 @@ Implements:
 """
 from std.collections import List
 from std.math import sqrt, abs, min, max, isfinite
+from flint.app.engine_app import EngineApp, EnginePlugin, FrameTime, Resources, STAGE_UPDATE
+from flint.assets.asset_ref import AssetRef
+from flint.assets.json import JsonDocument, parse_json
+from flint.assets.json_write import json_quote
+from flint.core.jobs import JobPool
 from flint.core.math import Vec3
 from flint.core.detmath import det_cos, det_exp, det_pow
+from flint.core.serial import BlobReader, BlobWriter, fourcc
+from flint.ecs.world import ParallelCommands, STORAGE_TABLE, World, comp_hash64
 from flint.physics.filter import CollisionFilter, CAT_ALL
 from flint.physics.solver_bodies import F8, LANES
 from flint.physics.world import PhysicsWorld
+from flint.scene.scene import ComponentRegistry
+from flint.scene.transform_hierarchy import SerializableComponent
 
 comptime BT_SUCCESS: UInt8 = 0
 comptime BT_FAILURE: UInt8 = 1
@@ -644,6 +653,220 @@ struct BehaviorTree(Copyable, Movable):
         # 2. Flat DFS pre-order evaluation with O(1) `subtree_skip` jumps
         return self._eval_node(0, bb, state)
 
+    def save_json(self) -> String:
+        return _bt_to_json(self)
+
+    def load_json(mut self, json_str: String) -> Bool:
+        if json_str.byte_length() == 0:
+            return False
+        var raw = List[UInt8](capacity=json_str.byte_length())
+        for b in json_str.as_bytes():
+            raw.append(b)
+        var doc = parse_json(raw)
+        if not doc.valid:
+            return False
+        var parsed = _bt_parse_json_node(doc, doc.root)
+        if not parsed[0]:
+            return False
+        self.nodes = parsed[1].copy()
+        self.open_stack.clear()
+        self.utility_scorers = parsed[2].copy()
+        return True
+
+
+@always_inline
+def _bt_f32_s(v: Float32) -> String:
+    return String(Float64(v)) if isfinite(v) else String("0.0")
+
+
+def _bt_vec3_json(v: Vec3) -> String:
+    var x = _bt_f32_s(v.x)
+    var y = _bt_f32_s(v.y)
+    var z = _bt_f32_s(v.z)
+    return "[" + x + ", " + y + ", " + z + "]"
+
+
+def _bt_to_json(tree: BehaviorTree) -> String:
+    var out = String('{"version": 1, "nodes": [')
+    for i in range(len(tree.nodes)):
+        if i > 0:
+            out += ", "
+        ref nd = tree.nodes[i]
+        out += (
+            '{"kind": ' + String(Int(nd.kind))
+            + ', "abort_mode": ' + String(Int(nd.abort_mode))
+            + ', "cmp_op": ' + String(Int(nd.cmp_op))
+            + ', "subtree_skip": ' + String(Int(nd.subtree_skip))
+            + ', "parent_idx": ' + String(Int(nd.parent_idx))
+            + ', "bb_key": ' + String(Int(nd.bb_key))
+            + ', "action_id": ' + String(Int(nd.action_id))
+            + ', "param_f32": ' + _bt_f32_s(nd.param_f32)
+            + "}"
+        )
+    out += '], "utility_scorers": ['
+    for si in range(len(tree.utility_scorers)):
+        if si > 0:
+            out += ", "
+        ref sc = tree.utility_scorers[si]
+        out += '{"use_geometric_mean": ' + ("true" if sc.use_geometric_mean else "false") + ', "options": ['
+        for oi in range(len(sc.options)):
+            if oi > 0:
+                out += ", "
+            ref opt = sc.options[oi]
+            out += (
+                '{"option_id": ' + String(opt.option_id)
+                + ', "weight": ' + _bt_f32_s(opt.weight)
+                + ', "considerations": ['
+            )
+            for ci in range(len(opt.considerations)):
+                if ci > 0:
+                    out += ", "
+                ref c = opt.considerations[ci]
+                out += (
+                    '{"bb_key": ' + String(c.bb_key)
+                    + ', "input_min": ' + _bt_f32_s(c.input_min)
+                    + ', "input_max": ' + _bt_f32_s(c.input_max)
+                    + ', "curve_kind": ' + String(Int(c.curve_kind))
+                    + ', "exponent": ' + _bt_f32_s(c.exponent)
+                    + ', "invert": ' + ("true" if c.invert else "false")
+                    + "}"
+                )
+            out += "]}"
+        out += "]}"
+    out += "]}"
+    return out^
+
+
+def _bt_parse_json_node(
+    doc: JsonDocument, node: Int
+) -> Tuple[Bool, List[BtNode], List[UtilityAiScorer]]:
+    var empty_nodes = List[BtNode]()
+    var empty_scorers = List[UtilityAiScorer]()
+    if node < 0 or node >= len(doc.nodes) or doc.nodes[node].kind != 5:
+        return (False, empty_nodes^, empty_scorers^)
+
+    var nodes_arr = doc.object_get(node, "nodes")
+    if nodes_arr < 0 or nodes_arr >= len(doc.nodes) or doc.nodes[nodes_arr].kind != 4:
+        return (False, empty_nodes^, empty_scorers^)
+
+    var new_scorers = List[UtilityAiScorer]()
+    var scorers_arr = doc.object_get(node, "utility_scorers")
+    if scorers_arr >= 0:
+        if scorers_arr >= len(doc.nodes) or doc.nodes[scorers_arr].kind != 4:
+            return (False, empty_nodes^, empty_scorers^)
+        var n_sc = doc.array_size(scorers_arr)
+        if n_sc > 4096:
+            return (False, empty_nodes^, empty_scorers^)
+        for si in range(n_sc):
+            var sc_n = doc.at(scorers_arr, si)
+            if sc_n < 0 or doc.nodes[sc_n].kind != 5:
+                return (False, empty_nodes^, empty_scorers^)
+            var use_geo = doc.boolean(doc.object_get(sc_n, "use_geometric_mean"), True)
+            var scorer = UtilityAiScorer(use_geo)
+            var opts_n = doc.object_get(sc_n, "options")
+            if opts_n >= 0:
+                if doc.nodes[opts_n].kind != 4:
+                    return (False, empty_nodes^, empty_scorers^)
+                var n_op = doc.array_size(opts_n)
+                if n_op > 4096:
+                    return (False, empty_nodes^, empty_scorers^)
+                for oi in range(n_op):
+                    var op_n = doc.at(opts_n, oi)
+                    if op_n < 0 or doc.nodes[op_n].kind != 5:
+                        return (False, empty_nodes^, empty_scorers^)
+                    var oid = doc.integer(doc.object_get(op_n, "option_id"), 0)
+                    var w_d = doc.number(doc.object_get(op_n, "weight"), 1.0)
+                    if not isfinite(w_d) or not isfinite(Float32(w_d)):
+                        return (False, empty_nodes^, empty_scorers^)
+                    var opt = UtilityOption(oid, Float32(w_d))
+                    var cons_n = doc.object_get(op_n, "considerations")
+                    if cons_n >= 0:
+                        if doc.nodes[cons_n].kind != 4:
+                            return (False, empty_nodes^, empty_scorers^)
+                        var n_con = doc.array_size(cons_n)
+                        if n_con > 4096:
+                            return (False, empty_nodes^, empty_scorers^)
+                        for ci in range(n_con):
+                            var cn = doc.at(cons_n, ci)
+                            if cn < 0 or doc.nodes[cn].kind != 5:
+                                return (False, empty_nodes^, empty_scorers^)
+                            var c_bb = doc.integer(doc.object_get(cn, "bb_key"), -1)
+                            var c_min = doc.number(doc.object_get(cn, "input_min"), 0.0)
+                            var c_max = doc.number(doc.object_get(cn, "input_max"), 1.0)
+                            var c_kind = doc.integer(doc.object_get(cn, "curve_kind"), Int(CURVE_LINEAR))
+                            var c_exp = doc.number(doc.object_get(cn, "exponent"), 1.0)
+                            var c_inv = doc.boolean(doc.object_get(cn, "invert"), False)
+                            if (
+                                c_kind < 0
+                                or c_kind > Int(CURVE_INVERSE)
+                                or not isfinite(c_min)
+                                or not isfinite(Float32(c_min))
+                                or not isfinite(c_max)
+                                or not isfinite(Float32(c_max))
+                                or not isfinite(c_exp)
+                                or not isfinite(Float32(c_exp))
+                            ):
+                                return (False, empty_nodes^, empty_scorers^)
+                            opt.add_consideration(
+                                UtilityConsideration(
+                                    c_bb,
+                                    Float32(c_min),
+                                    Float32(c_max),
+                                    UInt8(c_kind),
+                                    Float32(c_exp),
+                                    c_inv,
+                                )
+                            )
+                    _ = scorer.add_option(opt^)
+            new_scorers.append(scorer^)
+
+    var n_nodes = doc.array_size(nodes_arr)
+    if n_nodes > 65536:
+        return (False, empty_nodes^, empty_scorers^)
+    var new_nodes = List[BtNode](capacity=n_nodes)
+    for i in range(n_nodes):
+        var nd_n = doc.at(nodes_arr, i)
+        if nd_n < 0 or doc.nodes[nd_n].kind != 5:
+            return (False, empty_nodes^, empty_scorers^)
+        var k_n = doc.object_get(nd_n, "kind")
+        if k_n < 0 or doc.nodes[k_n].kind != 2:
+            return (False, empty_nodes^, empty_scorers^)
+        var kind = doc.integer(k_n, -1)
+        if kind < 0 or kind > Int(BT_NODE_ACTION):
+            return (False, empty_nodes^, empty_scorers^)
+        var abort_mode = doc.integer(doc.object_get(nd_n, "abort_mode"), Int(BT_ABORT_NONE))
+        if abort_mode < 0 or abort_mode > Int(BT_ABORT_BOTH):
+            return (False, empty_nodes^, empty_scorers^)
+        var cmp_op = doc.integer(doc.object_get(nd_n, "cmp_op"), Int(BT_CMP_EQ))
+        if cmp_op < 0 or cmp_op > Int(BT_CMP_NE):
+            return (False, empty_nodes^, empty_scorers^)
+        var subtree_skip = doc.integer(doc.object_get(nd_n, "subtree_skip"), i + 1)
+        if subtree_skip <= i or subtree_skip > n_nodes:
+            return (False, empty_nodes^, empty_scorers^)
+        var parent_idx = doc.integer(doc.object_get(nd_n, "parent_idx"), -1)
+        if parent_idx < -1 or parent_idx >= i:
+            return (False, empty_nodes^, empty_scorers^)
+        var bb_key = doc.integer(doc.object_get(nd_n, "bb_key"), -1)
+        var action_id = doc.integer(doc.object_get(nd_n, "action_id"), -1)
+        var pf_d = doc.number(doc.object_get(nd_n, "param_f32"), 0.0)
+        if not isfinite(pf_d) or not isfinite(Float32(pf_d)):
+            return (False, empty_nodes^, empty_scorers^)
+        if kind == Int(BT_NODE_UTILITY_SELECT) and action_id >= len(new_scorers):
+            return (False, empty_nodes^, empty_scorers^)
+        new_nodes.append(
+            BtNode(
+                UInt8(kind),
+                UInt8(abort_mode),
+                UInt8(cmp_op),
+                Int32(subtree_skip),
+                Int32(parent_idx),
+                Int32(bb_key),
+                Int32(action_id),
+                Float32(pf_d),
+            )
+        )
+    return (True, new_nodes^, new_scorers^)
+
 
 # =========================================================================
 # 4. SIMD8 SpatialPerception (Vision Cones + PhysicsWorld LOS + Hearing)
@@ -820,3 +1043,475 @@ struct SpatialPerception(Copyable, Movable):
                             ))
 
         return out^
+
+
+# =========================================================================
+# 5. BehaviorTreeComponent, Codecs & AiPlugin
+# =========================================================================
+
+struct BehaviorTreeComponent(SerializableComponent):
+    """ECS component holding a `BehaviorTree`, `Blackboard`, `BtExecutionState`, and tick cadence."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.ai.BehaviorTreeComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "BehaviorTreeComponent"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("AIBT")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var tree: BehaviorTree
+    var blackboard: Blackboard
+    var state: BtExecutionState
+    var tree_ref: AssetRef
+    var enabled: Bool
+    var tick_interval_sec: Float32
+    var accum_sec: Float32
+
+    def __init__(out self):
+        self.tree = BehaviorTree()
+        self.blackboard = Blackboard()
+        self.state = BtExecutionState()
+        self.tree_ref = AssetRef()
+        self.enabled = True
+        self.tick_interval_sec = 0.0
+        self.accum_sec = 0.0
+
+    def __init__(
+        out self,
+        var tree: BehaviorTree,
+        enabled: Bool = True,
+        tick_interval_sec: Float32 = 0.0,
+    ):
+        self.tree = tree^
+        self.blackboard = Blackboard()
+        self.state = BtExecutionState()
+        self.tree_ref = AssetRef()
+        self.enabled = enabled
+        self.tick_interval_sec = tick_interval_sec if isfinite(tick_interval_sec) else Float32(0.0)
+        self.accum_sec = 0.0
+
+    def __init__(out self, *, copy: Self):
+        self.tree = copy.tree.copy()
+        self.blackboard = copy.blackboard.copy()
+        self.state = copy.state.copy()
+        self.tree_ref = copy.tree_ref.copy()
+        self.enabled = copy.enabled
+        self.tick_interval_sec = copy.tick_interval_sec
+        self.accum_sec = copy.accum_sec
+
+    def write_bin(self, mut out: BlobWriter):
+        # 1. Tree nodes & utility scorers
+        out.u32(UInt32(len(self.tree.nodes)))
+        for i in range(len(self.tree.nodes)):
+            ref nd = self.tree.nodes[i]
+            out.u8(nd.kind)
+            out.u8(nd.abort_mode)
+            out.u8(nd.cmp_op)
+            out.integer(Int(nd.subtree_skip))
+            out.integer(Int(nd.parent_idx))
+            out.integer(Int(nd.bb_key))
+            out.integer(Int(nd.action_id))
+            out.f32(nd.param_f32)
+        out.u32(UInt32(len(self.tree.utility_scorers)))
+        for si in range(len(self.tree.utility_scorers)):
+            ref sc = self.tree.utility_scorers[si]
+            out.boolean(sc.use_geometric_mean)
+            out.u32(UInt32(len(sc.options)))
+            for oi in range(len(sc.options)):
+                ref opt = sc.options[oi]
+                out.integer(opt.option_id)
+                out.f32(opt.weight)
+                out.u32(UInt32(len(opt.considerations)))
+                for ci in range(len(opt.considerations)):
+                    ref c = opt.considerations[ci]
+                    out.integer(c.bb_key)
+                    out.f32(c.input_min)
+                    out.f32(c.input_max)
+                    out.u8(c.curve_kind)
+                    out.f32(c.exponent)
+                    out.boolean(c.invert)
+
+        # 2. Blackboard
+        out.u32(UInt32(len(self.blackboard.names)))
+        for i in range(len(self.blackboard.names)):
+            out.text(self.blackboard.names[i])
+            out.f32(self.blackboard.floats[i])
+            out.integer(self.blackboard.ints[i])
+            out.vec3(self.blackboard.vecs[i])
+
+        # 3. BtExecutionState
+        out.f32(self.state.time_s)
+        out.integer(self.state.running_node)
+        out.u32(UInt32(len(self.state.node_running)))
+        for i in range(len(self.state.node_running)):
+            out.boolean(self.state.node_running[i])
+        out.integer(self.state.active_action_id)
+        out.integer(self.state.last_aborted_node)
+        out.integer(self.state.last_aborted_action_id)
+        out.integer(self.state.aborts_triggered)
+        out.u32(UInt32(len(self.state.cooldown_ready_at)))
+        for i in range(len(self.state.cooldown_ready_at)):
+            out.f32(self.state.cooldown_ready_at[i])
+        out.u32(UInt32(len(self.state.action_statuses)))
+        for i in range(len(self.state.action_statuses)):
+            out.u8(self.state.action_statuses[i])
+        out.u32(UInt32(len(self.state.action_exec_counts)))
+        for i in range(len(self.state.action_exec_counts)):
+            out.integer(self.state.action_exec_counts[i])
+
+        # 4. AssetRef & component settings
+        self.tree_ref.write_bin(out)
+        out.boolean(self.enabled)
+        out.f32(self.tick_interval_sec)
+        out.f32(self.accum_sec)
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        _ = version
+        var out = Self()
+        var n_nodes = Int(reader.u32())
+        if reader.failed or n_nodes < 0 or n_nodes > 65536 or n_nodes > max(0, reader.limit() - reader.offset) // 16:
+            raise Error("BehaviorTreeComponent: invalid node count")
+        for i in range(n_nodes):
+            var kind = reader.u8()
+            var abort_mode = reader.u8()
+            var cmp_op = reader.u8()
+            var skip = reader.integer()
+            var pidx = reader.integer()
+            var bbk = reader.integer()
+            var aid = reader.integer()
+            var pf = reader.f32()
+            if reader.failed:
+                raise Error("BehaviorTreeComponent: truncated node")
+            if kind > BT_NODE_ACTION or abort_mode > BT_ABORT_BOTH or cmp_op > BT_CMP_NE:
+                raise Error("BehaviorTreeComponent: invalid node enum")
+            if skip <= i or skip > n_nodes or pidx < -1 or pidx >= i:
+                raise Error("BehaviorTreeComponent: invalid node hierarchy bounds")
+            out.tree.nodes.append(
+                BtNode(kind, abort_mode, cmp_op, Int32(skip), Int32(pidx), Int32(bbk), Int32(aid), pf)
+            )
+
+        var n_sc = Int(reader.u32())
+        if reader.failed or n_sc < 0 or n_sc > 4096:
+            raise Error("BehaviorTreeComponent: invalid scorer count")
+        for _ in range(n_sc):
+            var use_geo = reader.boolean()
+            var sc = UtilityAiScorer(use_geo)
+            var n_op = Int(reader.u32())
+            if reader.failed or n_op < 0 or n_op > 4096:
+                raise Error("BehaviorTreeComponent: invalid option count")
+            for _ in range(n_op):
+                var oid = reader.integer()
+                var wt = reader.f32()
+                var opt = UtilityOption(oid, wt)
+                var n_con = Int(reader.u32())
+                if reader.failed or n_con < 0 or n_con > 4096:
+                    raise Error("BehaviorTreeComponent: invalid consideration count")
+                for _ in range(n_con):
+                    var cbb = reader.integer()
+                    var cmin = reader.f32()
+                    var cmax = reader.f32()
+                    var ckind = reader.u8()
+                    var cexp = reader.f32()
+                    var cinv = reader.boolean()
+                    if reader.failed:
+                        raise Error("BehaviorTreeComponent: truncated consideration")
+                    if ckind > CURVE_INVERSE:
+                        raise Error("BehaviorTreeComponent: invalid curve_kind")
+                    opt.add_consideration(UtilityConsideration(cbb, cmin, cmax, ckind, cexp, cinv))
+                _ = sc.add_option(opt^)
+            out.tree.utility_scorers.append(sc^)
+        for i in range(n_nodes):
+            if (
+                out.tree.nodes[i].kind == BT_NODE_UTILITY_SELECT
+                and Int(out.tree.nodes[i].action_id) >= len(out.tree.utility_scorers)
+            ):
+                raise Error("BehaviorTreeComponent: invalid utility_select action_id")
+
+        var n_bb = Int(reader.u32())
+        if reader.failed or n_bb < 0 or n_bb > 65536 or n_bb > max(0, reader.limit() - reader.offset) // 16:
+            raise Error("BehaviorTreeComponent: invalid blackboard count")
+        for _ in range(n_bb):
+            var bn = reader.text()
+            var bf = reader.f32()
+            var bi = reader.integer()
+            var bv = reader.vec3()
+            if reader.failed:
+                raise Error("BehaviorTreeComponent: truncated blackboard entry")
+            out.blackboard.names.append(bn)
+            out.blackboard.floats.append(bf)
+            out.blackboard.ints.append(bi)
+            out.blackboard.vecs.append(bv)
+
+        out.state.time_s = reader.f32()
+        out.state.running_node = reader.integer()
+        var n_nr = Int(reader.u32())
+        if reader.failed or n_nr < 0 or n_nr > 65536 or n_nr > max(0, reader.limit() - reader.offset):
+            raise Error("BehaviorTreeComponent: invalid node_running count")
+        out.state.node_running = List[Bool](capacity=n_nr)
+        for _ in range(n_nr):
+            out.state.node_running.append(reader.boolean())
+        out.state.active_action_id = reader.integer()
+        out.state.last_aborted_node = reader.integer()
+        out.state.last_aborted_action_id = reader.integer()
+        out.state.aborts_triggered = reader.integer()
+
+        var n_cd = Int(reader.u32())
+        if reader.failed or n_cd < 0 or n_cd > 65536 or n_cd > max(0, reader.limit() - reader.offset) // 4:
+            raise Error("BehaviorTreeComponent: invalid cooldown count")
+        out.state.cooldown_ready_at = List[Float32](capacity=n_cd)
+        for _ in range(n_cd):
+            out.state.cooldown_ready_at.append(reader.f32())
+
+        var n_as = Int(reader.u32())
+        if reader.failed or n_as < 0 or n_as > 65536 or n_as > max(0, reader.limit() - reader.offset):
+            raise Error("BehaviorTreeComponent: invalid action_statuses count")
+        out.state.action_statuses = List[UInt8](capacity=n_as)
+        for _ in range(n_as):
+            out.state.action_statuses.append(reader.u8())
+
+        var n_ae = Int(reader.u32())
+        if reader.failed or n_ae < 0 or n_ae > 65536 or n_ae > max(0, reader.limit() - reader.offset) // 8:
+            raise Error("BehaviorTreeComponent: invalid action_exec_counts count")
+        out.state.action_exec_counts = List[Int](capacity=n_ae)
+        for _ in range(n_ae):
+            out.state.action_exec_counts.append(reader.integer())
+
+        out.tree_ref = AssetRef.read_bin(reader, 1)
+        out.enabled = reader.boolean()
+        out.tick_interval_sec = reader.f32()
+        out.accum_sec = reader.f32()
+        if reader.failed:
+            raise Error("BehaviorTreeComponent: truncated tail")
+        return out^
+
+    def write_json(self) -> String:
+        var out = String('{"tree": ') + self.tree.save_json()
+        out += ', "blackboard": ['
+        for i in range(len(self.blackboard.names)):
+            if i > 0:
+                out += ", "
+            out += (
+                '{"name": ' + json_quote(self.blackboard.names[i])
+                + ', "f32": ' + _bt_f32_s(self.blackboard.floats[i])
+                + ', "int": ' + String(self.blackboard.ints[i])
+                + ', "vec3": ' + _bt_vec3_json(self.blackboard.vecs[i])
+                + "}"
+            )
+        out += '], "state": {'
+        out += '"time_s": ' + _bt_f32_s(self.state.time_s)
+        out += ', "running_node": ' + String(self.state.running_node)
+        out += ', "active_action_id": ' + String(self.state.active_action_id)
+        out += ', "last_aborted_node": ' + String(self.state.last_aborted_node)
+        out += ', "last_aborted_action_id": ' + String(self.state.last_aborted_action_id)
+        out += ', "aborts_triggered": ' + String(self.state.aborts_triggered)
+        out += ', "node_running": ['
+        for i in range(len(self.state.node_running)):
+            if i > 0:
+                out += ", "
+            out += "true" if self.state.node_running[i] else "false"
+        out += '], "cooldown_ready_at": ['
+        for i in range(len(self.state.cooldown_ready_at)):
+            if i > 0:
+                out += ", "
+            out += _bt_f32_s(self.state.cooldown_ready_at[i])
+        out += '], "action_statuses": ['
+        for i in range(len(self.state.action_statuses)):
+            if i > 0:
+                out += ", "
+            out += String(Int(self.state.action_statuses[i]))
+        out += '], "action_exec_counts": ['
+        for i in range(len(self.state.action_exec_counts)):
+            if i > 0:
+                out += ", "
+            out += String(self.state.action_exec_counts[i])
+        out += "]}"
+        out += ', "tree_ref": ' + self.tree_ref.write_json()
+        out += ', "enabled": ' + ("true" if self.enabled else "false")
+        out += ', "tick_interval_sec": ' + _bt_f32_s(self.tick_interval_sec)
+        out += ', "accum_sec": ' + _bt_f32_s(self.accum_sec)
+        out += "}"
+        return out^
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        var out = Self()
+        if node < 0 or node >= len(doc.nodes) or doc.nodes[node].kind != 5:
+            return out^
+
+        var tree_n = doc.object_get(node, "tree")
+        if tree_n >= 0:
+            var parsed = _bt_parse_json_node(doc, tree_n)
+            if not parsed[0]:
+                raise Error("BehaviorTreeComponent: invalid tree JSON")
+            out.tree.nodes = parsed[1].copy()
+            out.tree.utility_scorers = parsed[2].copy()
+
+        var bb_n = doc.object_get(node, "blackboard")
+        if bb_n >= 0 and doc.nodes[bb_n].kind == 4:
+            for i in range(doc.array_size(bb_n)):
+                var entry = doc.at(bb_n, i)
+                if entry < 0 or doc.nodes[entry].kind != 5:
+                    continue
+                var bname = doc.text(doc.object_get(entry, "name"), "")
+                var bf = Float32(doc.number(doc.object_get(entry, "f32"), 0.0))
+                var bi = doc.integer(doc.object_get(entry, "int"), 0)
+                var vn = doc.object_get(entry, "vec3")
+                var bv = Vec3()
+                if vn >= 0 and doc.nodes[vn].kind == 4 and doc.array_size(vn) >= 3:
+                    bv = Vec3(
+                        Float32(doc.number(doc.at(vn, 0), 0.0)),
+                        Float32(doc.number(doc.at(vn, 1), 0.0)),
+                        Float32(doc.number(doc.at(vn, 2), 0.0)),
+                    )
+                out.blackboard.names.append(bname)
+                out.blackboard.floats.append(bf if isfinite(bf) else Float32(0.0))
+                out.blackboard.ints.append(bi)
+                out.blackboard.vecs.append(bv)
+
+        var st_n = doc.object_get(node, "state")
+        if st_n >= 0 and doc.nodes[st_n].kind == 5:
+            var ts = Float32(doc.number(doc.object_get(st_n, "time_s"), 0.0))
+            out.state.time_s = ts if isfinite(ts) else Float32(0.0)
+            out.state.running_node = doc.integer(doc.object_get(st_n, "running_node"), -1)
+            out.state.active_action_id = doc.integer(doc.object_get(st_n, "active_action_id"), -1)
+            out.state.last_aborted_node = doc.integer(doc.object_get(st_n, "last_aborted_node"), -1)
+            out.state.last_aborted_action_id = doc.integer(doc.object_get(st_n, "last_aborted_action_id"), -1)
+            out.state.aborts_triggered = doc.integer(doc.object_get(st_n, "aborts_triggered"), 0)
+
+            var nr_n = doc.object_get(st_n, "node_running")
+            if nr_n >= 0 and doc.nodes[nr_n].kind == 4:
+                out.state.node_running = List[Bool](capacity=doc.array_size(nr_n))
+                for i in range(doc.array_size(nr_n)):
+                    out.state.node_running.append(doc.boolean(doc.at(nr_n, i), False))
+
+            var cd_n = doc.object_get(st_n, "cooldown_ready_at")
+            if cd_n >= 0 and doc.nodes[cd_n].kind == 4:
+                out.state.cooldown_ready_at = List[Float32](capacity=doc.array_size(cd_n))
+                for i in range(doc.array_size(cd_n)):
+                    var cv = Float32(doc.number(doc.at(cd_n, i), 0.0))
+                    out.state.cooldown_ready_at.append(cv if isfinite(cv) else Float32(0.0))
+
+            var as_n = doc.object_get(st_n, "action_statuses")
+            if as_n >= 0 and doc.nodes[as_n].kind == 4:
+                out.state.action_statuses = List[UInt8](capacity=doc.array_size(as_n))
+                for i in range(doc.array_size(as_n)):
+                    out.state.action_statuses.append(UInt8(max(0, min(255, doc.integer(doc.at(as_n, i), 0)))))
+
+            var ae_n = doc.object_get(st_n, "action_exec_counts")
+            if ae_n >= 0 and doc.nodes[ae_n].kind == 4:
+                out.state.action_exec_counts = List[Int](capacity=doc.array_size(ae_n))
+                for i in range(doc.array_size(ae_n)):
+                    out.state.action_exec_counts.append(doc.integer(doc.at(ae_n, i), 0))
+
+        var ref_n = doc.object_get(node, "tree_ref")
+        if ref_n >= 0:
+            out.tree_ref = AssetRef.read_json(doc, ref_n)
+        out.enabled = doc.boolean(doc.object_get(node, "enabled"), True)
+        var ti = Float32(doc.number(doc.object_get(node, "tick_interval_sec"), 0.0))
+        out.tick_interval_sec = ti if isfinite(ti) else Float32(0.0)
+        var acc = Float32(doc.number(doc.object_get(node, "accum_sec"), 0.0))
+        out.accum_sec = acc if isfinite(acc) else Float32(0.0)
+        return out^
+
+
+def _ai_bin_write[C: SerializableComponent](comp_addr: Int, writer_addr: Int):
+    ref comp = Pointer[C, ImmutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    out.begin(C.SCHEMA_FOURCC, C.SCHEMA_VERSION)
+    comp.write_bin(out)
+    out.end()
+
+
+def _ai_bin_read[C: SerializableComponent](comp_addr: Int, reader_addr: Int) -> Bool:
+    ref reader = Pointer[BlobReader, MutAnyOrigin](unsafe_from_address=reader_addr)[unsafe_offset=0]
+    try:
+        var ver = reader.enter(C.SCHEMA_FOURCC, C.SCHEMA_VERSION)
+        var val = C.read_bin(reader, ver)
+        reader.leave()
+        var dst = Pointer[C, MutAnyOrigin](unsafe_from_address=comp_addr)
+        __get_address_as_uninit_lvalue(dst._mlir_value) = val^
+        return True
+    except:
+        return False
+
+
+def _register_non_trivial_ai[C: SerializableComponent](mut world: World):
+    var tid = world.register_component[C]()
+    if tid >= 0 and not world.components[tid].has_custom_bin:
+        world.set_component_binary_hooks(tid, _ai_bin_write[C], _ai_bin_read[C])
+
+
+def register_ai_components(mut world: World):
+    """Registers `BehaviorTreeComponent` and its binary snapshot hooks in `world`."""
+    _register_non_trivial_ai[BehaviorTreeComponent](world)
+
+
+def register_ai_codecs(mut reg: ComponentRegistry):
+    """Registers `BehaviorTreeComponent` `.flscn`/`.flscnb` codecs on `ComponentRegistry`."""
+    reg.register[BehaviorTreeComponent]()
+
+
+def _sys_ai_behavior_tree_tick(
+    world_ptr: Pointer[World, MutAnyOrigin],
+    res_ptr: Pointer[Resources, MutAnyOrigin],
+    _pool_ptr: Pointer[JobPool, MutAnyOrigin],
+    _cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
+    _ctx: Int,
+):
+    ref world = world_ptr[unsafe_offset=0]
+    ref resources = res_ptr[unsafe_offset=0]
+    var dt = Float32(1.0 / 60.0)
+    var ft_opt = resources.get_ptr[FrameTime]()
+    if ft_opt:
+        var raw_dt = ft_opt.value()[unsafe_offset=0].delta_seconds
+        dt = max(Float32(0.0), raw_dt) if isfinite(raw_dt) else Float32(0.0)
+
+    var bt_mask = world.bit_for[BehaviorTreeComponent]()
+    var ents = world.query_entities(bt_mask)
+    for i in range(len(ents)):
+        var e = ents[i]
+        var btc_opt = world.get_ptr_mut[BehaviorTreeComponent](e)
+        if not btc_opt:
+            continue
+        ref btc = btc_opt.value()[unsafe_offset=0]
+        if not btc.enabled or len(btc.tree.nodes) == 0:
+            continue
+        if btc.tick_interval_sec > Float32(0.0):
+            if not isfinite(btc.accum_sec):
+                btc.accum_sec = Float32(0.0)
+            btc.accum_sec += dt
+            if btc.accum_sec < btc.tick_interval_sec:
+                continue
+            var step_dt = btc.accum_sec
+            btc.accum_sec = Float32(0.0)
+            _ = btc.tree.tick(btc.blackboard, btc.state, step_dt)
+        else:
+            _ = btc.tree.tick(btc.blackboard, btc.state, dt)
+
+
+def _has_ai_system(app: EngineApp, stage: Int, name: StaticString) -> Bool:
+    ref sys = app.schedule.stages[stage].systems
+    for i in range(len(sys)):
+        if sys[i].name == name:
+            return True
+    return False
+
+
+struct AiPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
+    """Registers `BehaviorTreeComponent` and schedules `STAGE_UPDATE` BehaviorTree ticking."""
+
+    def __init__(out self):
+        pass
+
+    def build(self, mut app: EngineApp):
+        register_ai_components(app.world)
+        if _has_ai_system(app, STAGE_UPDATE, "flint.ai.behavior_tree_tick"):
+            return
+        var b_bt = app.world.bit_for[BehaviorTreeComponent]()
+        _ = app.add_system(
+            STAGE_UPDATE,
+            "flint.ai.behavior_tree_tick",
+            _sys_ai_behavior_tree_tick,
+            reads=b_bt,
+            writes=b_bt,
+            exclusive=True,
+        )

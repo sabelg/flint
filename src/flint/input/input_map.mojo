@@ -531,12 +531,21 @@ struct InputMap(Resource, Copyable, Movable):
             var ci = ordered_ctx[oci]
             ref ctx = self.contexts[ci]
 
-            # Evaluate multi-modifier chords BEFORE unmodified keys within the context
-            for pass_mod in range(2):
+            # Evaluate modifier chords in descending popcount specificity (3 -> 2 -> 1 -> 0)
+            # so e.g. Ctrl+Shift+Z is never stolen by Ctrl+Z regardless of registration order.
+            for pass_idx in range(4):
+                var target_pop = 3 - pass_idx
                 for bi in range(len(ctx.bindings)):
                     ref b = ctx.bindings[bi]
-                    var is_chord = b.source_kind == BIND_KEY and b.modifiers != MOD_NONE
-                    if (pass_mod == 0 and not is_chord) or (pass_mod == 1 and is_chord):
+                    var mod_pop = 0
+                    if b.source_kind == BIND_KEY and b.modifiers != MOD_NONE:
+                        var m = b.modifiers
+                        while m != 0:
+                            mod_pop += m & 1
+                            m >>= 1
+                        if mod_pop > 3:
+                            mod_pop = 3
+                    if mod_pop != target_pop:
                         continue
 
                     var ai = b.action_index

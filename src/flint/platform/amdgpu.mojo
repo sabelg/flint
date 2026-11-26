@@ -44,7 +44,7 @@ comptime FAMILY_GC_12_0_0: UInt32 = 152
 comptime FAMILY_GC_10_3_3: UInt32 = 146
 comptime FAMILY_GC_10_3_6: UInt32 = 149
 comptime FAMILY_GC_10_3_7: UInt32 = 151
-comptime WAIT_TIMEOUT_NS: UInt64 = 2000000000  # the default; SD_GPU_FENCE_TIMEOUT_MS or gpu.fence_timeout_ms changes it
+comptime WAIT_TIMEOUT_NS: UInt64 = 2000000000  # the default; FLINT_GPU_FENCE_TIMEOUT_MS or gpu.fence_timeout_ms changes it
 
 # Context operations and what AMDGPU_CTX_OP_QUERY_STATE2 reports.
 comptime CTX_OP_ALLOC: UInt64 = 1
@@ -355,17 +355,17 @@ struct AmdGpu(Movable):
     def open_device(mut self) -> Bool:
         """Find a render node by asking each one who it is.
 
-        SD_GPU_NODE names one to use. Otherwise the fastest supported GPU wins, which
+        FLINT_GPU_NODE names one to use. Otherwise the fastest supported GPU wins, which
         means a discrete GFX12 card ahead of any integrated part.
         """
-        var requested = env_value("SD_GPU_NODE")
+        var requested = env_value("FLINT_GPU_NODE")
         if requested.byte_length() > 0:
             try:
                 if self.open_node(Int(requested)):
                     return True
             except:
                 pass
-            return self.fail("SD_GPU_NODE does not name a supported render node")
+            return self.fail("FLINT_GPU_NODE does not name a supported render node")
         for prefer_discrete in [True, False]:
             for minor in range(128, 136):
                 if self.open_node(minor):

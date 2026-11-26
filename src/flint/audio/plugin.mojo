@@ -24,8 +24,11 @@ from flint.app.engine_app import (
     STAGE_SHUTDOWN,
     STAGE_STARTUP,
 )
+from flint.assets.asset_ref import AssetRef
+from flint.assets.flpk_v3 import ASSET_KIND_AUDIO
 from flint.assets.json import JsonDocument
 from flint.assets.json_write import json_quote
+from flint.assets.server import AssetServer
 from flint.audio.acoustics import (
     AcousticMaterialTable,
     CLEAR_CUTOFF_HZ,
@@ -116,10 +119,12 @@ def _register_audio_bin_hooks[C: SerializableComponent](mut world: World):
 struct _TrackedAudioEmitter(Copyable, ImplicitlyCopyable, Movable):
     var entity_bits: UInt64
     var handle: SoundHandle
+    var asset_id: Int
 
-    def __init__(out self, entity_bits: UInt64 = 0, handle: SoundHandle = SoundHandle()):
+    def __init__(out self, entity_bits: UInt64 = 0, handle: SoundHandle = SoundHandle(), asset_id: Int = -1):
         self.entity_bits = entity_bits
         self.handle = handle
+        self.asset_id = asset_id
 
 
 struct AudioSyncStateResource(Resource, Movable):
@@ -146,15 +151,16 @@ struct AudioSyncStateResource(Resource, Movable):
         self.active_emitters = List[_TrackedAudioEmitter]()
         self.emitter_to_slot = Dict[UInt64, Int]()
 
-    def record_emitter(mut self, entity: Entity, handle: SoundHandle):
+    def record_emitter(mut self, entity: Entity, handle: SoundHandle, asset_id: Int = -1):
         var bits = entity.to_bits()
         var found = self.emitter_to_slot.get(bits)
         if found:
             self.active_emitters[found.value()].handle = handle
+            self.active_emitters[found.value()].asset_id = asset_id
         else:
             var idx = len(self.active_emitters)
             self.emitter_to_slot[bits] = idx
-            self.active_emitters.append(_TrackedAudioEmitter(bits, handle))
+            self.active_emitters.append(_TrackedAudioEmitter(bits, handle, asset_id))
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +235,7 @@ struct AudioEmitterComponent(SerializableComponent):
     comptime STORAGE_MODE: Int = STORAGE_TABLE
     comptime SCHEMA_NAME: StaticString = "AudioEmitterComponent"
     comptime SCHEMA_FOURCC: UInt32 = fourcc("AEMT")
-    comptime SCHEMA_VERSION: Int = 1
+    comptime SCHEMA_VERSION: Int = 2
 
     var asset_id: Int
     var asset_path: String
@@ -251,6 +257,7 @@ struct AudioEmitterComponent(SerializableComponent):
     var prev_pos: Vec3
     var has_prev_pos: Bool
     var handle: SoundHandle
+    var audio_ref: AssetRef
 
     def __init__(
         out self,
@@ -271,6 +278,7 @@ struct AudioEmitterComponent(SerializableComponent):
         occlusion_gain: Float32 = 1.0,
         cutoff_hz: Float32 = CLEAR_CUTOFF_HZ,
         obstruction: Float32 = 0.0,
+        var audio_ref: AssetRef = AssetRef(),
     ):
         self.asset_id = asset_id
         self.asset_path = asset_path
@@ -292,6 +300,11 @@ struct AudioEmitterComponent(SerializableComponent):
         self.prev_pos = Vec3()
         self.has_prev_pos = False
         self.handle = SoundHandle()
+        self.audio_ref = audio_ref^
+        if self.audio_ref.is_empty() and self.asset_path.byte_length() > 0:
+            self.audio_ref = AssetRef.from_path(self.asset_path, ASSET_KIND_AUDIO)
+        elif self.asset_path.byte_length() == 0 and self.audio_ref.rel_path.byte_length() > 0:
+            self.asset_path = self.audio_ref.rel_path
 
     def play(mut self):
         self.playing = True
@@ -321,10 +334,10 @@ struct AudioEmitterComponent(SerializableComponent):
         out.f32(self.obstruction)
         out.vec3(self.prev_pos)
         out.boolean(self.has_prev_pos)
+        self.audio_ref.write_bin(out)
 
     @staticmethod
     def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
-        _ = version
         var aid = reader.integer()
         var apath = reader.text()
         var vol = reader.f32()
@@ -344,13 +357,23 @@ struct AudioEmitterComponent(SerializableComponent):
         var obs = reader.f32()
         var pp = reader.vec3()
         var hpp = reader.boolean()
+        var aref = AssetRef()
+        if version >= 2:
+            aref = AssetRef.read_bin(reader, 1)
         if reader.failed:
             raise Error("AudioEmitterComponent: truncated blob")
+        if version < 2:
+            if aref.is_empty() and apath.byte_length() > 0:
+                aref = AssetRef.from_path(apath, ASSET_KIND_AUDIO)
+            elif apath.byte_length() == 0 and aref.rel_path.byte_length() > 0:
+                apath = aref.rel_path
         var out = Self(
             aid, apath, vol, pit, bid, loop, spat, prio, rdist, mdist,
-            pos_spawn, pl, pending or pl, occ, ogain, cut, obs,
+            pos_spawn, pl, pending, occ, ogain, cut, obs,
         )
-        out.auto_play_pending = pending or pl
+        out.asset_path = apath
+        out.audio_ref = aref^
+        out.auto_play_pending = pending
         out.prev_pos = pp
         out.has_prev_pos = hpp
         out.handle = SoundHandle()
@@ -365,10 +388,19 @@ struct AudioEmitterComponent(SerializableComponent):
             + ", \"bus_id\": " + String(self.bus_id)
             + ", \"looping\": " + ("true" if self.looping else "false")
             + ", \"spatial\": " + ("true" if self.spatial else "false")
+            + ", \"priority\": " + String(self.priority)
             + ", \"ref_dist\": " + _f32_s(self.ref_dist)
             + ", \"max_dist\": " + _f32_s(self.max_dist)
             + ", \"play_on_spawn\": " + ("true" if self.play_on_spawn else "false")
+            + ", \"playing\": " + ("true" if self.playing else "false")
+            + ", \"auto_play_pending\": " + ("true" if self.auto_play_pending else "false")
             + ", \"enable_occlusion\": " + ("true" if self.enable_occlusion else "false")
+            + ", \"occlusion_gain\": " + _f32_s(self.occlusion_gain)
+            + ", \"cutoff_hz\": " + _f32_s(self.cutoff_hz)
+            + ", \"obstruction\": " + _f32_s(self.obstruction)
+            + ", \"prev_pos\": " + _vec3_json(self.prev_pos)
+            + ", \"has_prev_pos\": " + ("true" if self.has_prev_pos else "false")
+            + ", \"audio_ref\": " + self.audio_ref.write_json()
             + "}"
         )
 
@@ -381,14 +413,32 @@ struct AudioEmitterComponent(SerializableComponent):
         var bid = doc.integer(doc.object_get(node, "bus_id"), BUS_SFX)
         var loop = doc.boolean(doc.object_get(node, "looping"), False)
         var spat = doc.boolean(doc.object_get(node, "spatial"), True)
+        var prio = doc.integer(doc.object_get(node, "priority"), 1)
         var rdist = Float32(doc.number(doc.object_get(node, "ref_dist"), 15.0))
         var mdist = Float32(doc.number(doc.object_get(node, "max_dist"), 350.0))
         var pos_spawn = doc.boolean(doc.object_get(node, "play_on_spawn"), False)
+        var pl = doc.boolean(doc.object_get(node, "playing"), False)
+        var pending = doc.boolean(doc.object_get(node, "auto_play_pending"), pos_spawn)
         var occ = doc.boolean(doc.object_get(node, "enable_occlusion"), False)
-        return Self(
-            aid, apath, vol, pit, bid, loop, spat, 1, rdist, mdist,
-            pos_spawn, pos_spawn, pos_spawn, occ,
+        var ogain = Float32(doc.number(doc.object_get(node, "occlusion_gain"), 1.0))
+        var cut = Float32(doc.number(doc.object_get(node, "cutoff_hz"), Float64(CLEAR_CUTOFF_HZ)))
+        var obs = Float32(doc.number(doc.object_get(node, "obstruction"), 0.0))
+        var pp = _read_vec3_json(doc, doc.object_get(node, "prev_pos"), Vec3())
+        var hpp = doc.boolean(doc.object_get(node, "has_prev_pos"), False)
+        var anode = doc.object_get(node, "audio_ref")
+        var aref = AssetRef.read_json(doc, anode) if anode >= 0 else AssetRef()
+        if aref.is_empty() and apath.byte_length() > 0:
+            aref = AssetRef.from_path(apath, ASSET_KIND_AUDIO)
+        elif apath.byte_length() == 0 and aref.rel_path.byte_length() > 0:
+            apath = aref.rel_path
+        var out = Self(
+            aid, apath, vol, pit, bid, loop, spat, prio, rdist, mdist,
+            pos_spawn, pl, pending, occ, ogain, cut, obs, aref^,
         )
+        out.auto_play_pending = pending
+        out.prev_pos = pp
+        out.has_prev_pos = hpp
+        return out^
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +525,7 @@ def _sys_audio_sync(
                 if rec.handle.is_valid():
                     _ = server.stop_sound(rec.handle)
                 if em.handle.is_valid():
-                    keep_emitters.append(_TrackedAudioEmitter(rec.entity_bits, em.handle))
+                    keep_emitters.append(_TrackedAudioEmitter(rec.entity_bits, em.handle, em.asset_id))
             else:
                 keep_emitters.append(rec)
     sync.active_emitters = keep_emitters^
@@ -561,7 +611,61 @@ def _sys_audio_sync(
         em.prev_pos = pos
         em.has_prev_pos = True
 
-        if em.auto_play_pending and em.asset_id >= 0:
+        if em.asset_id < 0 and (em.asset_path.byte_length() > 0 or not em.audio_ref.is_empty()):
+            var resolved_aid = -1
+            var cache_key = (
+                em.asset_path
+                if em.asset_path.byte_length() > 0
+                else em.audio_ref.rel_path
+            )
+            if cache_key.byte_length() > 0:
+                var cached = server.path_cache.get(cache_key)
+                if cached:
+                    resolved_aid = cached.value()
+            if resolved_aid < 0:
+                var asset_srv_opt = resources.get_ptr_mut[AssetServer]()
+                if asset_srv_opt:
+                    ref asset_srv = asset_srv_opt.value()[unsafe_offset=0]
+                    var auh = (
+                        asset_srv.resolve_audio(em.audio_ref)
+                        if not em.audio_ref.is_empty()
+                        else asset_srv.load_audio(em.asset_path)
+                    )
+                    if asset_srv.audios.is_loaded(auh):
+                        var dptr = asset_srv.audios.get_ptr(auh)
+                        if dptr:
+                            resolved_aid = server.register_pcm16_asset(
+                                dptr.value()[].samples,
+                                dptr.value()[].channels,
+                                dptr.value()[].sample_rate,
+                            )
+                            if resolved_aid >= 0 and cache_key.byte_length() > 0:
+                                server.path_cache[cache_key] = resolved_aid
+                    if resolved_aid < 0 and cache_key.byte_length() > 0:
+                        var rh = asset_srv.load_raw(cache_key)
+                        if asset_srv.raws.is_loaded(rh):
+                            var rptr = asset_srv.raws.get_ptr(rh)
+                            if rptr and len(rptr.value()[].bytes) > 0:
+                                resolved_aid = server.load_audio_bytes_cached(
+                                    rptr.value()[].bytes.copy(), cache_key
+                                )
+            if resolved_aid < 0 and em.asset_path.byte_length() > 0:
+                resolved_aid = server.load_audio_cached(em.asset_path)
+            if resolved_aid >= 0:
+                em.asset_id = resolved_aid
+                if em.asset_path.byte_length() == 0 and em.audio_ref.rel_path.byte_length() > 0:
+                    em.asset_path = em.audio_ref.rel_path
+
+        if em.playing and em.handle.is_valid():
+            var tracked_slot = sync.emitter_to_slot.get(e.to_bits())
+            if tracked_slot:
+                var tracked_aid = sync.active_emitters[tracked_slot.value()].asset_id
+                if tracked_aid >= 0 and em.asset_id >= 0 and tracked_aid != em.asset_id:
+                    _ = server.stop_sound(em.handle)
+                    em.handle = SoundHandle()
+                    em.auto_play_pending = True
+
+        if (em.auto_play_pending or (em.playing and not em.handle.is_valid())) and em.asset_id >= 0:
             if em.handle.is_valid():
                 _ = server.stop_sound(em.handle)
             if em.spatial:
@@ -592,7 +696,7 @@ def _sys_audio_sync(
 
         if em.handle.is_valid():
             if em.playing:
-                sync.record_emitter(e, em.handle)
+                sync.record_emitter(e, em.handle, em.asset_id)
                 if em.spatial:
                     _ = server.update_emitter(em.handle, pos, vel, em.volume, em.pitch)
                     if em.enable_occlusion:

@@ -40,8 +40,9 @@ read_flint_toml_value() {
     local file="$1"
     local section="$2"
     local key="$3"
+    local skip_empty="${4:-0}"
     [[ -f "$file" ]] || return 1
-    awk -v sec="[$section]" -v k="$key" '
+    awk -v sec="[$section]" -v k="$key" -v skip_empty="$skip_empty" '
         function strip_toml_comment(s,    i, n, ch, q, esc, sq) {
             sq = sprintf("%c", 39)
             n = length(s)
@@ -84,6 +85,9 @@ read_flint_toml_value() {
                     if (n >= 2 && ((substr(val, 1, 1) == "\"" && substr(val, n, 1) == "\"") || (substr(val, 1, 1) == q && substr(val, n, 1) == q))) {
                         val = substr(val, 2, n - 2)
                     }
+                    if (skip_empty == "1" && val == "") {
+                        next
+                    }
                     print val
                     found = 1
                     exit 0
@@ -94,6 +98,86 @@ read_flint_toml_value() {
     ' "$file"
 }
 
+validate_project_flint_version() {
+    local toml_file="$1"
+    local flint_root="${2:-$ROOT}"
+    [[ -f "$toml_file" ]] || return 0
+    local pin=""
+    pin="$(read_flint_toml_value "$toml_file" "engine" "flint_version" || true)"
+    pin="${pin#"${pin%%[![:space:]]*}"}"
+    pin="${pin%"${pin##*[![:space:]]}"}"
+    [[ -n "$pin" ]] || return 0
+
+    local engine_commit="dev"
+    if git -C "$flint_root" rev-parse --short HEAD >/dev/null 2>&1; then
+        engine_commit="$(git -C "$flint_root" rev-parse --short HEAD)"
+    elif [[ -f "${flint_root}/src/flint/core/build_stamp.mojo" ]]; then
+        engine_commit="$(awk -F'"' '/BUILD_COMMIT/{print $2; exit}' "${flint_root}/src/flint/core/build_stamp.mojo" || echo "dev")"
+    fi
+
+    local op="" rest="$pin"
+    case "$rest" in
+        ">="*|"<="*|"=="*|"~="*) op="${rest:0:2}"; rest="${rest#??}" ;;
+        ">"*|"<"*|"="*|"~"*|"^"*) op="${rest:0:1}"; rest="${rest#?}" ;;
+    esac
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ "$rest" == v* || "$rest" == V* ]]; then
+        rest="${rest#?}"
+    fi
+
+    local ver_part="$rest" commit_part=""
+    if [[ "$rest" == *"+"* ]]; then
+        ver_part="${rest%%+*}"
+        commit_part="${rest#*+}"
+    fi
+    ver_part="${ver_part%%-*}"
+
+    if [[ ! "$ver_part" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+        echo "[Flint] ERROR: flint_version invalid '${pin}' in ${toml_file}." >&2
+        return 1
+    fi
+    local maj="" min="0" pat="0" extra_ver=""
+    IFS='.' read -r maj min pat extra_ver <<<"$ver_part"
+    min="${min:-0}"
+    pat="${pat:-0}"
+    if [[ -z "$maj" || -n "$extra_ver" || ! "$maj" =~ ^[0-9]+$ || ! "$min" =~ ^[0-9]+$ || ! "$pat" =~ ^[0-9]+$ ]]; then
+        echo "[Flint] ERROR: flint_version invalid '${pin}' in ${toml_file}." >&2
+        return 1
+    fi
+
+    local eng_maj=5 eng_min=0 eng_pat=0
+    local cmp=0
+    if (( eng_maj != 10#$maj )); then
+        if (( eng_maj > 10#$maj )); then cmp=1; else cmp=-1; fi
+    elif (( eng_min != 10#$min )); then
+        if (( eng_min > 10#$min )); then cmp=1; else cmp=-1; fi
+    elif (( eng_pat != 10#$pat )); then
+        if (( eng_pat > 10#$pat )); then cmp=1; else cmp=-1; fi
+    fi
+
+    local ver_ok=0
+    case "$op" in
+        ">=") if (( cmp >= 0 )); then ver_ok=1; fi ;;
+        ">")  if (( cmp > 0 )); then ver_ok=1; fi ;;
+        "<=") if (( cmp <= 0 )); then ver_ok=1; fi ;;
+        "<")  if (( cmp < 0 )); then ver_ok=1; fi ;;
+        "^"|"~"|"~=") if (( 10#$maj == eng_maj && cmp >= 0 )); then ver_ok=1; fi ;;
+        *)    if (( cmp == 0 )); then ver_ok=1; fi ;;
+    esac
+    if [[ "$ver_ok" -ne 1 ]]; then
+        echo "[Flint] ERROR: flint_version mismatch: project requires '${pin}', incompatible with Flint Engine ${eng_maj}.${eng_min}.${eng_pat}+${engine_commit}." >&2
+        return 1
+    fi
+
+    commit_part="${commit_part#"${commit_part%%[![:space:]]*}"}"
+    commit_part="${commit_part%"${commit_part##*[![:space:]]}"}"
+    if [[ -n "$commit_part" && "$commit_part" != "dirty" && "$engine_commit" != "dev" && "$commit_part" != "$engine_commit" ]]; then
+        echo "[Flint] ERROR: flint_version commit mismatch: project pins '${pin}', engine commit is '${engine_commit}'." >&2
+        return 1
+    fi
+    return 0
+}
+
 is_binary_fresh() {
     local src="$1"
     local out="$2"
@@ -102,9 +186,10 @@ is_binary_fresh() {
     [[ "${FLINT_FORCE_BUILD:-0}" == "1" ]] && return 1
     [[ -x "$out" ]] || return 1
     [[ -f "${out}.opt" ]] || return 1
+    local opt_tag="${opt}|relinc_v1|werror=${FLINT_WERROR:-1}|fp=${FLINT_DETERMINISTIC_FP:-1}|strip=${FLINT_STRIP_SOURCE_PATHS:-0}"
     local prev_opt
     prev_opt="$(cat "${out}.opt" 2>/dev/null || true)"
-    [[ "$prev_opt" == "$opt" ]] || return 1
+    [[ "$prev_opt" == "$opt_tag" ]] || return 1
     [[ "$src" -nt "$out" ]] && return 1
     local hit
     hit="$(find "${ROOT}/src" -name '*.mojo' ! -name 'build_stamp.mojo' -newer "$out" -print -quit 2>/dev/null || true)"
@@ -139,16 +224,33 @@ compile_mojo() {
     if [[ "${FLINT_WERROR:-1}" != "0" ]]; then
         werror_args=("--Werror")
     fi
-    local inc_args=("-I" "${ROOT}/src")
+    local inc_args=("-I" "src")
     if [[ "$extra_inc" == "__DEFAULT_TESTS__" ]]; then
-        inc_args+=("-I" "${ROOT}/tests")
+        inc_args+=("-I" "tests")
     elif [[ -n "$extra_inc" ]]; then
-        inc_args+=("-I" "$extra_inc")
+        local rel_extra="$extra_inc"
+        [[ "$rel_extra" == "${ROOT}/"* ]] && rel_extra="${rel_extra#${ROOT}/}"
+        inc_args+=("-I" "$rel_extra")
     fi
-    if ! "$MOJO_BIN" build "$src" -o "$tmp" "${inc_args[@]}" "$opt" "${fp_args[@]}" "${werror_args[@]}"; then
+    local build_src="$src"
+    local entry_tmp_dir=""
+    if [[ "${FLINT_STRIP_SOURCE_PATHS:-0}" == "1" && "$src" == "${ROOT}/"* ]]; then
+        local rel_entry="${src#${ROOT}/}"
+        local rel_entry_dir
+        rel_entry_dir="$(dirname "$rel_entry")"
+        inc_args+=("-I" "$rel_entry_dir")
+        entry_tmp_dir="$(mktemp -d "/tmp/flint-entry-XXXXXX")"
+        cp "$src" "${entry_tmp_dir}/$(basename "$src")"
+        build_src="${entry_tmp_dir}/$(basename "$src")"
+    elif [[ "$build_src" == "${ROOT}/"* ]]; then
+        build_src="${build_src#${ROOT}/}"
+    fi
+    if ! "$MOJO_BIN" build "$build_src" -o "$tmp" "${inc_args[@]}" "$opt" "${fp_args[@]}" "${werror_args[@]}"; then
         rm -f "$tmp"
+        [[ -n "$entry_tmp_dir" ]] && rm -rf "$entry_tmp_dir"
         return 1  # also when called from an `if`, where `set -e` does not stop us
     fi
+    [[ -n "$entry_tmp_dir" ]] && rm -rf "$entry_tmp_dir"
     mkdir -p "$(dirname "$out")"
     rm -f "$out" "${out}.opt"
     cp "$tmp" "$out"
@@ -156,7 +258,8 @@ compile_mojo() {
     rm -f "$tmp"
     local opt_tmp
     opt_tmp="$(mktemp "${out}.opt.XXXXXX")"
-    printf '%s\n' "$opt" > "$opt_tmp"
+    local opt_tag="${opt}|relinc_v1|werror=${FLINT_WERROR:-1}|fp=${FLINT_DETERMINISTIC_FP:-1}|strip=${FLINT_STRIP_SOURCE_PATHS:-0}"
+    printf '%s\n' "$opt_tag" > "$opt_tmp"
     mv -f "$opt_tmp" "${out}.opt"
 }
 
@@ -216,6 +319,7 @@ cmd_build() {
     # If invoked inside a scaffolded game repo containing flint.toml and no engine target was given, build that project!
     if [[ -z "$target" && "$CALLER_PWD" != "$ROOT" && -f "${CALLER_PWD}/flint.toml" ]]; then
         local toml_file="${CALLER_PWD}/flint.toml"
+        validate_project_flint_version "$toml_file" || return 1
         local proj_name proj_entry toml_werror toml_det_fp eff_werror eff_det_fp
         proj_name="$(read_flint_toml_value "$toml_file" "project" "name" || true)"
         proj_entry="$(read_flint_toml_value "$toml_file" "project" "entry" || true)"
@@ -277,9 +381,9 @@ cmd_build() {
         build_labels+=("examples/pack_cli/main.mojo -> build/flint-pack")
     fi
     if [[ "$target" == "all" || "$target" == "test" || "$target" == "unit" ]]; then
-        build_srcs+=("${ROOT}/tests/test_flint.mojo" "${ROOT}/tests/test_embedded_ide.mojo")
-        build_outs+=("${ROOT}/build/flint-test" "${ROOT}/build/flint-embedded-ide-test")
-        build_labels+=("tests/test_flint.mojo -> build/flint-test" "tests/test_embedded_ide.mojo -> build/flint-embedded-ide-test")
+        build_srcs+=("${ROOT}/tests/test_flint.mojo" "${ROOT}/tests/test_embedded_ide.mojo" "${ROOT}/tests/test_hygiene_and_cooker.mojo")
+        build_outs+=("${ROOT}/build/flint-test" "${ROOT}/build/flint-embedded-ide-test" "${ROOT}/build/flint-hygiene-cooker-test")
+        build_labels+=("tests/test_flint.mojo -> build/flint-test" "tests/test_embedded_ide.mojo -> build/flint-embedded-ide-test" "tests/test_hygiene_and_cooker.mojo -> build/flint-hygiene-cooker-test")
     fi
     if [[ "$target" == "all" || "$target" == "test" || "$target" == "e2e" ]]; then
         build_srcs+=("${ROOT}/tests/test_e2e.mojo")
@@ -336,6 +440,7 @@ cmd_run() {
     resolve_mojo
     write_build_stamp "$MOJO_BIN"
     local toml_file="${CALLER_PWD}/flint.toml"
+    validate_project_flint_version "$toml_file" || return 1
     local proj_name proj_entry toml_werror toml_det_fp eff_werror eff_det_fp
     proj_name="$(read_flint_toml_value "$toml_file" "project" "name" || true)"
     proj_entry="$(read_flint_toml_value "$toml_file" "project" "entry" || true)"
@@ -359,7 +464,9 @@ cmd_pack() {
     cmd_build pack
     if [[ $# -eq 0 && -f "${CALLER_PWD}/flint.toml" ]]; then
         local pack_out
-        pack_out="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "assets" "pack_output" || true)"
+        pack_out="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "assets" "pack_output" 1 || true)"
+        [[ -z "$pack_out" ]] && pack_out="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "pak_path" 1 || true)"
+        [[ -z "$pack_out" ]] && pack_out="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "assets" "pak_path" 1 || true)"
         [[ -z "$pack_out" ]] && pack_out="build/assets.flpk"
         if [[ ! -d "${CALLER_PWD}/assets" ]]; then
             echo "[Flint Pack] ERROR: No assets/ directory found in ${CALLER_PWD}." >&2
@@ -401,6 +508,8 @@ cmd_test() {
         "${ROOT}/build/flint-test"
         echo "[Flint] Running Flint Embedded IDE test suite..."
         "${ROOT}/build/flint-embedded-ide-test"
+        echo "[Flint] Running Flint Hygiene & Cooker test suite..."
+        "${ROOT}/build/flint-hygiene-cooker-test"
     elif [[ "$sub" == "v5" ]]; then
         cmd_build v5
         run_v5_suites
@@ -410,6 +519,8 @@ cmd_test() {
         "${ROOT}/build/flint-test"
         echo "[Flint] Running Flint Embedded IDE test suite..."
         "${ROOT}/build/flint-embedded-ide-test"
+        echo "[Flint] Running Flint Hygiene & Cooker test suite..."
+        "${ROOT}/build/flint-hygiene-cooker-test"
         echo "[Flint] Running Flint Engine E2E test suite..."
         "${ROOT}/build/flint-e2e"
         run_v5_suites
@@ -668,18 +779,53 @@ cmd_studio() {
         exit 1
     fi
     local is_mcp=0
-    local arg
-    for arg in "$@"; do
-        if [[ "$arg" == "--mcp-stdio" ]]; then
+    local proj_raw=""
+    local has_proj_flag=0
+    local argv_arr=("$@")
+    local idx=0
+    while [[ "$idx" -lt ${#argv_arr[@]} ]]; do
+        local cur="${argv_arr[$idx]}"
+        if [[ "$cur" == "--mcp-stdio" ]]; then
             is_mcp=1
-            break
+        elif [[ "$cur" == "--project" ]]; then
+            if [[ $((idx + 1)) -ge ${#argv_arr[@]} ]]; then
+                echo "[Flint Studio] ERROR: --project requires a directory argument." >&2
+                return 1
+            fi
+            idx=$((idx + 1))
+            proj_raw="${argv_arr[$idx]}"
+            has_proj_flag=1
+        elif [[ "$cur" == --project=* ]]; then
+            proj_raw="${cur#--project=}"
+            has_proj_flag=1
         fi
+        idx=$((idx + 1))
     done
+    if [[ "$has_proj_flag" -eq 1 ]]; then
+        if [[ -z "$proj_raw" ]]; then
+            echo "[Flint Studio] ERROR: --project requires a non-empty directory." >&2
+            return 1
+        fi
+        local proj_cand="$proj_raw"
+        if [[ "$proj_cand" != /* ]]; then
+            proj_cand="${CALLER_PWD}/${proj_cand}"
+        fi
+        if [[ ! -d "$proj_cand" ]]; then
+            echo "[Flint Studio] ERROR: --project directory does not exist: $proj_raw" >&2
+            return 1
+        fi
+        FLINT_STUDIO_PROJECT="$(cd "$proj_cand" && pwd)"
+        export FLINT_STUDIO_PROJECT
+    fi
+    if [[ -n "${FLINT_STUDIO_PROJECT:-}" && -f "${FLINT_STUDIO_PROJECT}/flint.toml" ]]; then
+        validate_project_flint_version "${FLINT_STUDIO_PROJECT}/flint.toml" || return 1
+    fi
     if [[ "$is_mcp" -eq 1 ]]; then
         cmd_build studio >&2
         cd "$CALLER_PWD"
     else
         cmd_build studio
+        cd "$CALLER_PWD"
     fi
     exec "${ROOT}/build/flint-studio" "$@"
 }
@@ -958,6 +1104,7 @@ cmd_gate() {
     cmd_build all
     "${ROOT}/build/flint-test"
     "${ROOT}/build/flint-embedded-ide-test"
+    "${ROOT}/build/flint-hygiene-cooker-test"
     bash "${ROOT}/tests/test_studio_ide.sh"
     bash "${ROOT}/tests/test_studio_profile_compare.sh"
     # Render all showcase & Studio headless shots before E2E and FLIP checks.
@@ -1132,13 +1279,16 @@ cmd_package() {
     if [[ -z "$target" && -f "${CALLER_PWD}/flint.toml" ]]; then
         mode="project"
         local toml_file="${CALLER_PWD}/flint.toml"
+        validate_project_flint_version "$toml_file" || return 1
         local toml_name toml_ver toml_entry toml_werror toml_det_fp toml_pack
         toml_name="$(read_flint_toml_value "$toml_file" "project" "name" || true)"
         toml_ver="$(read_flint_toml_value "$toml_file" "project" "version" || true)"
         toml_entry="$(read_flint_toml_value "$toml_file" "project" "entry" || true)"
         toml_werror="$(read_flint_toml_value "$toml_file" "engine" "werror" || echo "true")"
         toml_det_fp="$(read_flint_toml_value "$toml_file" "engine" "deterministic_fp" || echo "true")"
-        toml_pack="$(read_flint_toml_value "$toml_file" "assets" "pack_output" || true)"
+        toml_pack="$(read_flint_toml_value "$toml_file" "assets" "pack_output" 1 || true)"
+        [[ -z "$toml_pack" ]] && toml_pack="$(read_flint_toml_value "$toml_file" "project" "pak_path" 1 || true)"
+        [[ -z "$toml_pack" ]] && toml_pack="$(read_flint_toml_value "$toml_file" "assets" "pak_path" 1 || true)"
 
         [[ -z "$proj_name" ]] && proj_name="${toml_name:-$(basename "$CALLER_PWD")}"
         [[ -n "$toml_ver" ]] && proj_version="$toml_ver"
@@ -1148,7 +1298,10 @@ cmd_package() {
         else
             src="${CALLER_PWD}/${entry_rel}"
         fi
-        [[ -d "${CALLER_PWD}/src" ]] && extra_inc="${CALLER_PWD}/src"
+        if [[ -d "${CALLER_PWD}/src" ]]; then
+            extra_inc="${CALLER_PWD}/src"
+            [[ "$extra_inc" == "${ROOT}/"* ]] && extra_inc="${extra_inc#${ROOT}/}"
+        fi
         [[ "$toml_werror" == "false" ]] && eff_werror="0"
         [[ "$toml_det_fp" == "false" ]] && eff_det_fp="0"
         if [[ -n "$toml_pack" ]]; then
@@ -1204,11 +1357,24 @@ cmd_package() {
 
     echo "[Flint Package] Building ${proj_name} (${src}) ..."
     mkdir -p "$(dirname "$build_bin")"
-    FLINT_WERROR="$eff_werror" FLINT_DETERMINISTIC_FP="$eff_det_fp" \
+    FLINT_WERROR="$eff_werror" FLINT_DETERMINISTIC_FP="$eff_det_fp" FLINT_STRIP_SOURCE_PATHS=1 \
         compile_mojo "$src" "$build_bin" "$opt" "$extra_inc"
 
     cp -f "$build_bin" "${out_dir}/bin/${proj_name}"
     chmod 0755 "${out_dir}/bin/${proj_name}"
+    if ! command -v chrpath >/dev/null 2>&1; then
+        echo "[Flint Package] ERROR: 'chrpath' is required to rewrite ELF RUNPATH to '\$ORIGIN/../lib'." >&2
+        return 1
+    fi
+    chrpath -r '$ORIGIN/../lib' "${out_dir}/bin/${proj_name}" >/dev/null
+    if command -v readelf >/dev/null 2>&1; then
+        local rpath_check
+        rpath_check="$(readelf -d "${out_dir}/bin/${proj_name}" 2>/dev/null | grep -E 'RUNPATH|RPATH' || true)"
+        if grep -Fq "$ROOT" <<<"$rpath_check" || grep -Fq "/.pixi/" <<<"$rpath_check"; then
+            echo "[Flint Package] ERROR: Packaged binary RUNPATH still references repo/pixi: ${rpath_check}" >&2
+            return 1
+        fi
+    fi
 
     local mojo_lib_dir=""
     if [[ -n "${MOJO_PREFIX:-}" && -d "${MOJO_PREFIX}/lib" ]]; then
@@ -1236,56 +1402,59 @@ cmd_package() {
     local has_flpk=0
     local packed_flpk="${out_dir}/${pack_output_name}"
     if [[ -n "$assets_dir" && -d "$assets_dir" ]]; then
-        local abs_assets assets_base rel_assets_prefix
+        local abs_assets cook_cache_dir
         abs_assets="$(cd "$assets_dir" && pwd)"
-        if [[ "$abs_assets" == "${CALLER_PWD}/"* ]]; then
-            assets_base="$CALLER_PWD"
+        if [[ "$mode" == "project" ]]; then
+            cook_cache_dir="${CALLER_PWD}/build/cook_cache"
         else
-            assets_base="$(dirname "$abs_assets")"
+            cook_cache_dir="${ROOT}/build/cook_cache/${proj_name}"
         fi
-        rel_assets_prefix="${abs_assets#${assets_base}/}"
 
-        local non_empty_files=()
-        local zero_files=()
+        local cookable_files=()
+        local extra_loose_files=()
+        local all_files=()
         local f
         while IFS= read -r -d '' f; do
-            local rel_f="${f#${assets_base}/}"
-            if [[ -s "$f" ]]; then
-                non_empty_files+=("$rel_f")
-            else
-                zero_files+=("$rel_f")
-            fi
+            all_files+=("$f")
+            case "$f" in
+                *.flmeta)
+                    ;;
+                *.glb|*.png|*.jpg|*.jpeg|*.hdr|*.exr|*.ttf|*.wav|*.qoa|*.flscn|*.flscnb|*.flprefab|*.flmat|*.flanim|*.flrig|*.json)
+                    cookable_files+=("$f")
+                    ;;
+                *)
+                    extra_loose_files+=("$f")
+                    ;;
+            esac
         done < <(find "$abs_assets" -type f -print0 | sort -z)
 
-        if [[ ${#non_empty_files[@]} -gt 0 ]]; then
-            echo "[Flint Package] Packing ${#non_empty_files[@]} asset file(s) -> ${packed_flpk} ..."
+        if [[ ${#cookable_files[@]} -gt 0 ]]; then
+            echo "[Flint Package] Cooking ${#cookable_files[@]} asset file(s) -> ${packed_flpk} (cache=${cook_cache_dir}) ..."
             compile_mojo "${ROOT}/examples/pack_cli/main.mojo" "${ROOT}/build/flint-pack" "-O3" "" >&2
-            rm -f "$packed_flpk"
-            (cd "$assets_base" && "${ROOT}/build/flint-pack" "$packed_flpk" "${non_empty_files[@]}")
+            "${ROOT}/build/flint-pack" --cook "$abs_assets" "$packed_flpk" --cache-dir "$cook_cache_dir"
             if [[ ! -s "$packed_flpk" ]]; then
-                echo "[Flint Package] ERROR: Failed to pack assets into ${packed_flpk}" >&2
+                echo "[Flint Package] ERROR: Failed to cook assets into ${packed_flpk}" >&2
                 return 1
             fi
             chmod 0644 "$packed_flpk"
             has_flpk=1
+        else
+            rm -f "$packed_flpk"
         fi
 
-        if [[ "$loose_assets" -eq 1 || ${#zero_files[@]} -gt 0 ]]; then
+        if [[ "$loose_assets" -eq 1 || ${#extra_loose_files[@]} -gt 0 ]]; then
             local copy_list=()
             if [[ "$loose_assets" -eq 1 ]]; then
-                copy_list=("${non_empty_files[@]}" "${zero_files[@]}")
+                copy_list=("${all_files[@]}")
             else
-                copy_list=("${zero_files[@]}")
+                copy_list=("${extra_loose_files[@]}")
             fi
-            local rf
-            for rf in "${copy_list[@]}"; do
-                [[ -n "$rf" ]] || continue
-                local dest_rel="$rf"
-                if [[ "$rf" == "${rel_assets_prefix}/"* ]]; then
-                    dest_rel="assets/${rf#${rel_assets_prefix}/}"
-                fi
+            local src_f
+            for src_f in "${copy_list[@]}"; do
+                [[ -n "$src_f" ]] || continue
+                local dest_rel="assets/${src_f#${abs_assets}/}"
                 mkdir -p "${out_dir}/$(dirname "$dest_rel")"
-                cp -f "${assets_base}/${rf}" "${out_dir}/${dest_rel}"
+                cp -f "$src_f" "${out_dir}/${dest_rel}"
                 chmod 0644 "${out_dir}/${dest_rel}"
             done
         fi
@@ -1314,13 +1483,22 @@ cmd_package() {
                     }
                     return s
                 }
-                BEGIN { in_assets = 0 }
+                BEGIN { in_assets = 0; in_project = 0 }
                 /^[[:space:]]*\[/ {
                     hdr = strip_toml_comment($0); gsub(/\r$/, "", hdr); gsub(/^[[:space:]]+|[[:space:]]+$/, "", hdr)
                     in_assets = (hdr == "[assets]")
+                    in_project = (hdr == "[project]")
                 }
-                in_assets && /^[[:space:]]*pack_output[[:space:]]*=/ {
-                    print "pack_output = \"" po "\""
+                (in_assets && /^[[:space:]]*(pack_output|pak_path)[[:space:]]*=/) || (in_project && /^[[:space:]]*pak_path[[:space:]]*=/) {
+                    match($0, /^[[:space:]]*/)
+                    indent = substr($0, 1, RLENGTH)
+                    eq = index($0, "=")
+                    k = substr($0, RLENGTH + 1, eq - RLENGTH - 1)
+                    gsub(/[[:space:]]+$/, "", k)
+                    rhs = substr($0, eq + 1)
+                    gsub(/^[[:space:]]+/, "", rhs)
+                    q = (substr(rhs, 1, 1) == sprintf("%c", 39)) ? sprintf("%c", 39) : "\""
+                    print indent k " = " q po q
                     next
                 }
                 { print }
@@ -1413,11 +1591,17 @@ WSL_README
     if command -v sha256sum >/dev/null 2>&1; then
         bin_sha="$(sha256sum "${out_dir}/bin/${proj_name}" | awk '{print $1}')"
     fi
+    local manifest_src="$src"
+    if [[ "$mode" == "project" && "$manifest_src" == "${CALLER_PWD}/"* ]]; then
+        manifest_src="${manifest_src#${CALLER_PWD}/}"
+    elif [[ "$manifest_src" == "${ROOT}/"* ]]; then
+        manifest_src="${manifest_src#${ROOT}/}"
+    fi
     cat > "${out_dir}/MANIFEST.txt" <<EOF
 name=${proj_name}
 version=${proj_version}
 mode=${mode}
-source=${src}
+source=${manifest_src}
 binary=bin/${proj_name}
 binary_sha256=${bin_sha}
 mojo_version=${mojo_ver}
@@ -1444,19 +1628,26 @@ cmd_new() {
         dest="${CALLER_PWD}/${dest}"
     fi
     mkdir -p "${dest}/src" "${dest}/assets" "${dest}/tools"
-    local abs_dest app_name safe_app_name
+    local abs_dest app_name safe_app_name engine_commit
     abs_dest="$(cd "$dest" && pwd)"
     app_name="$(basename "$abs_dest")"
     safe_app_name="$(printf '%s' "$app_name" | sed 's/[&/\\]/\\&/g')"
+    engine_commit="dev"
+    if git -C "$ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
+        engine_commit="$(git -C "$ROOT" rev-parse --short HEAD)"
+    elif [[ -f "${ROOT}/src/flint/core/build_stamp.mojo" ]]; then
+        engine_commit="$(awk -F'"' '/BUILD_COMMIT/{print $2; exit}' "${ROOT}/src/flint/core/build_stamp.mojo" || echo "dev")"
+    fi
 
     cat > "${abs_dest}/flint.toml" <<EOF
 [project]
 name = "${app_name}"
 version = "0.1.0"
 entry = "src/main.mojo"
+entry_scene = "assets/main.flscn"
 
 [engine]
-flint_version = ">=5.0"
+flint_version = "5.0.0+${engine_commit}"
 deterministic_fp = true
 werror = true
 
@@ -1476,6 +1667,73 @@ mtu_bytes = 1180
 
 [assets]
 pack_output = "build/assets.flpk"
+EOF
+
+    cat > "${abs_dest}/assets/main.flscn" <<'EOF'
+{
+  "format": "flscn",
+  "version": 2,
+  "name": "main",
+  "entities": [
+    {
+      "slot": 0,
+      "parent": -1,
+      "components": {
+        "LocalTransform": {"translation": [0.0, -0.5, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [16.0, 1.0, 16.0]},
+        "GlobalTransform": {"translation": [0.0, -0.5, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [16.0, 1.0, 16.0]},
+        "RigidBodyComponent": {"motion_mode": 0, "mass": 0.0, "can_sleep": true},
+        "ColliderComponent": {"shape": 2, "half_extents": [8.0, 0.5, 8.0], "is_trigger": false},
+        "MeshRendererComponent": {"mesh_id": 0, "material_id": 0, "cast_shadows": true, "visible": true},
+        "MaterialOverrideComponent": {"material_id": 0, "base_color": [0.18, 0.24, 0.34], "roughness": 0.82, "metallic": 0.05, "enabled": true},
+        "StudioEntityMetaComponent": {"name": "Ground", "enabled": true}
+      }
+    },
+    {
+      "slot": 1,
+      "parent": -1,
+      "components": {
+        "LocalTransform": {"translation": [0.0, 1.2, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.1, 1.1, 1.1]},
+        "GlobalTransform": {"translation": [0.0, 1.2, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.1, 1.1, 1.1]},
+        "RigidBodyComponent": {"motion_mode": 2, "mass": 1.0, "can_sleep": true},
+        "ColliderComponent": {"shape": 2, "half_extents": [0.55, 0.55, 0.55], "is_trigger": false},
+        "MeshRendererComponent": {"mesh_id": 0, "material_id": 0, "cast_shadows": true, "visible": true},
+        "MaterialOverrideComponent": {"material_id": 0, "base_color": [0.95, 0.58, 0.16], "roughness": 0.28, "metallic": 0.25, "enabled": true},
+        "StudioEntityMetaComponent": {"name": "Cube", "enabled": true}
+      }
+    },
+    {
+      "slot": 2,
+      "parent": -1,
+      "components": {
+        "LocalTransform": {"translation": [6.0, 3.6, 6.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+        "GlobalTransform": {"translation": [6.0, 3.6, 6.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+        "CameraComponent": {"fov_y_deg": 55.0, "near_z": 0.10, "far_z": 250.0, "exposure": 1.0, "active": true, "look_target_offset": [-6.0, -2.6, -6.0]},
+        "AudioListenerComponent": {"active": true},
+        "StudioEntityMetaComponent": {"name": "MainCamera", "enabled": true}
+      }
+    },
+    {
+      "slot": 3,
+      "parent": -1,
+      "components": {
+        "LocalTransform": {"translation": [4.0, 6.0, 4.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+        "GlobalTransform": {"translation": [4.0, 6.0, 4.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+        "PointLightComponent": {"radiance": [12.0, 10.0, 8.0], "radius": 28.0, "enabled": true},
+        "StudioEntityMetaComponent": {"name": "PointLight", "enabled": true}
+      }
+    },
+    {
+      "slot": 4,
+      "parent": -1,
+      "components": {
+        "LocalTransform": {"translation": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+        "GlobalTransform": {"translation": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+        "EnvironmentComponent": {"sun_dir": [0.378803, 0.797480, -0.458551], "sun_radiance": [3.2, 3.0, 2.7], "exposure": 1.0, "ibl_intensity": 1.0, "turbidity": 2.5, "enabled": true},
+        "StudioEntityMetaComponent": {"name": "Environment", "enabled": true}
+      }
+    }
+  ]
+}
 EOF
 
     cat > "${abs_dest}/pixi.toml" <<EOF
@@ -1611,10 +1869,80 @@ _read_toml() {
 
 PROJ_NAME="$(_read_toml project name || basename "$APP_ROOT")"
 PROJ_ENTRY="$(_read_toml project entry || echo "src/main.mojo")"
+TOML_FLINT_VER="$(_read_toml engine flint_version || true)"
 TOML_WERROR="$(_read_toml engine werror || echo "true")"
 TOML_DET_FP="$(_read_toml engine deterministic_fp || echo "true")"
 [[ -z "$PROJ_NAME" ]] && PROJ_NAME="$(basename "$APP_ROOT")"
 [[ -z "$PROJ_ENTRY" ]] && PROJ_ENTRY="src/main.mojo"
+
+_check_flint_version() {
+    local pin="$1"
+    pin="${pin#"${pin%%[![:space:]]*}"}"
+    pin="${pin%"${pin##*[![:space:]]}"}"
+    [[ -n "$pin" ]] || return 0
+    local engine_commit="dev"
+    if git -C "$FLINT_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
+        engine_commit="$(git -C "$FLINT_ROOT" rev-parse --short HEAD)"
+    elif [[ -f "${FLINT_ROOT}/src/flint/core/build_stamp.mojo" ]]; then
+        engine_commit="$(awk -F'"' '/BUILD_COMMIT/{print $2; exit}' "${FLINT_ROOT}/src/flint/core/build_stamp.mojo" || echo "dev")"
+    fi
+    local op="" rest="$pin"
+    case "$rest" in
+        ">="*|"<="*|"=="*|"~="*) op="${rest:0:2}"; rest="${rest#??}" ;;
+        ">"*|"<"*|"="*|"~"*|"^"*) op="${rest:0:1}"; rest="${rest#?}" ;;
+    esac
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ "$rest" == v* || "$rest" == V* ]]; then
+        rest="${rest#?}"
+    fi
+    local ver_part="$rest" commit_part=""
+    if [[ "$rest" == *"+"* ]]; then
+        ver_part="${rest%%+*}"
+        commit_part="${rest#*+}"
+    fi
+    ver_part="${ver_part%%-*}"
+    if [[ ! "$ver_part" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+        echo "[Flint] ERROR: flint_version invalid '${pin}'." >&2
+        return 1
+    fi
+    local maj="" min="0" pat="0" extra_ver=""
+    IFS='.' read -r maj min pat extra_ver <<<"$ver_part"
+    min="${min:-0}"
+    pat="${pat:-0}"
+    if [[ -z "$maj" || -n "$extra_ver" || ! "$maj" =~ ^[0-9]+$ || ! "$min" =~ ^[0-9]+$ || ! "$pat" =~ ^[0-9]+$ ]]; then
+        echo "[Flint] ERROR: flint_version invalid '${pin}'." >&2
+        return 1
+    fi
+    local eng_maj=5 eng_min=0 eng_pat=0 cmp=0
+    if (( eng_maj != 10#$maj )); then
+        if (( eng_maj > 10#$maj )); then cmp=1; else cmp=-1; fi
+    elif (( eng_min != 10#$min )); then
+        if (( eng_min > 10#$min )); then cmp=1; else cmp=-1; fi
+    elif (( eng_pat != 10#$pat )); then
+        if (( eng_pat > 10#$pat )); then cmp=1; else cmp=-1; fi
+    fi
+    local ver_ok=0
+    case "$op" in
+        ">=") if (( cmp >= 0 )); then ver_ok=1; fi ;;
+        ">")  if (( cmp > 0 )); then ver_ok=1; fi ;;
+        "<=") if (( cmp <= 0 )); then ver_ok=1; fi ;;
+        "<")  if (( cmp < 0 )); then ver_ok=1; fi ;;
+        "^"|"~"|"~=") if (( 10#$maj == eng_maj && cmp >= 0 )); then ver_ok=1; fi ;;
+        *)    if (( cmp == 0 )); then ver_ok=1; fi ;;
+    esac
+    if [[ "$ver_ok" -ne 1 ]]; then
+        echo "[Flint] ERROR: flint_version mismatch: project requires '${pin}', incompatible with Flint Engine ${eng_maj}.${eng_min}.${eng_pat}+${engine_commit}." >&2
+        return 1
+    fi
+    commit_part="${commit_part#"${commit_part%%[![:space:]]*}"}"
+    commit_part="${commit_part%"${commit_part##*[![:space:]]}"}"
+    if [[ -n "$commit_part" && "$commit_part" != "dirty" && "$engine_commit" != "dev" && "$commit_part" != "$engine_commit" ]]; then
+        echo "[Flint] ERROR: flint_version commit mismatch: project pins '${pin}', engine commit is '${engine_commit}'." >&2
+        return 1
+    fi
+    return 0
+}
+_check_flint_version "$TOML_FLINT_VER" || exit 1
 
 BUILD_FLAGS=("-O3")
 [[ "$TOML_DET_FP" != "false" ]] && BUILD_FLAGS+=("--fp-mode" "contract=off")
@@ -1631,6 +1959,7 @@ EOF
 
     sed "s/__FLINT_APP_NAME__/${safe_app_name}/g" > "${abs_dest}/src/main.mojo" <<'EOF'
 """Flint Engine v5 game: __FLINT_APP_NAME__."""
+from std.ffi import external_call
 from std.math import cos, max, min, sin
 from std.sys import argv
 from flint.app import (
@@ -1644,58 +1973,47 @@ from flint.app import (
 )
 from flint.app.window_plugin import WindowPlugin, WindowStateResource
 from flint.assets.image import write_png
-from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.server import AssetServer
-from flint.audio.plugin import AudioEmitterComponent, AudioListenerComponent, AudioPlugin
-from flint.audio.server import AudioServer, BUS_AMBIENCE
+from flint.core.build_info import check_flint_version_pin
 from flint.core.jobs import JobPool
+from flint.core.log import flush_log, start_log
 from flint.core.math import Quat, Vec3
-from flint.ecs import (
-    Component,
-    Entity,
-    ParallelCommands,
-    STORAGE_TABLE,
-    World,
-    comp_hash64,
-)
+from flint.ecs import Entity, ParallelCommands, World, comp_hash64
 from flint.input.input_map import ACTION_BOOL, InputContext, InputMap
 from flint.input.plugin import InputPlugin
-from flint.physics.plugin import ColliderComponent, PhysicsPlugin, RigidBodyComponent
-from flint.physics.world import PhysicsWorld
 from flint.platform.kms import on_virtual_console
 from flint.platform.os import (
     env_flag,
     env_value,
     file_size,
     get_time,
+    is_directory,
     make_dirs,
     parent_directory,
     read_bytes,
 )
-from flint.render.material_graph import MaterialAsset
 from flint.render.plugin import (
     CameraComponent,
+    EnvironmentComponent,
+    MaterialOverrideComponent,
     MeshRendererComponent,
     PointLightComponent,
-    RenderPlugin,
+    register_render_codecs,
 )
-from flint.render.render_world import (
-    RENDER_TIER_0_HEADLESS_SIMD,
-    RENDER_TIER_1_FORWARD_CLUSTERED,
-    ScalableRenderer,
-)
-from flint.render.swapchain_surface import PRESENT_FIFO, PRESENT_IMMEDIATE
+from flint.render.simd_canvas import Camera3D, SimdCanvas, pack_argb
 from flint.scene import (
+    ComponentRegistry,
     GlobalTransform,
     LocalTransform,
-    PrevGlobalTransform,
+    Scene,
     TransformPlugin,
-    set_parent,
 )
 
 
 struct GameConfig(Copyable, Movable):
     var app_name: String
+    var entry_scene: String
+    var flint_version: String
     var window_title: String
     var window_width: Int
     var window_height: Int
@@ -1708,6 +2026,8 @@ struct GameConfig(Copyable, Movable):
 
     def __init__(out self):
         self.app_name = "__FLINT_APP_NAME__"
+        self.entry_scene = "assets/main.flscn"
+        self.flint_version = ""
         self.window_title = "__FLINT_APP_NAME__"
         self.window_width = 1280
         self.window_height = 720
@@ -1770,6 +2090,9 @@ def _load_flint_toml() -> GameConfig:
     if len(raw) == 0:
         return cfg^
     var section = String("")
+    var assets_pack_output = String("")
+    var project_pak_path = String("")
+    var assets_pak_path = String("")
     var line_start = 0
     var n = len(raw)
     for idx in range(n + 1):
@@ -1811,8 +2134,15 @@ def _load_flint_toml() -> GameConfig:
             continue
         var key = _trim_ascii(tb, 0, eq_pos)
         var val = _unquote(_trim_ascii(tb, eq_pos + 1, len(tb)))
-        if section == "project" and key == "name" and val.byte_length() > 0:
-            cfg.app_name = val
+        if section == "project":
+            if key == "name" and val.byte_length() > 0:
+                cfg.app_name = val
+            elif key == "entry_scene" and val.byte_length() > 0:
+                cfg.entry_scene = val
+            elif key == "pak_path" and val.byte_length() > 0 and project_pak_path.byte_length() == 0:
+                project_pak_path = val
+        elif section == "engine" and key == "flint_version":
+            cfg.flint_version = val
         elif section == "window":
             if key == "title" and val.byte_length() > 0:
                 cfg.window_title = val
@@ -1831,17 +2161,18 @@ def _load_flint_toml() -> GameConfig:
                 cfg.net_max_rollback_ticks = max(0, _parse_int(val, cfg.net_max_rollback_ticks))
             elif key == "mtu_bytes":
                 cfg.net_mtu_bytes = max(256, _parse_int(val, cfg.net_mtu_bytes))
-        elif section == "assets" and key == "pack_output" and val.byte_length() > 0:
-            cfg.pack_output = val
+        elif section == "assets":
+            if key == "pack_output" and val.byte_length() > 0 and assets_pack_output.byte_length() == 0:
+                assets_pack_output = val
+            elif key == "pak_path" and val.byte_length() > 0 and assets_pak_path.byte_length() == 0:
+                assets_pak_path = val
+    if assets_pack_output.byte_length() > 0:
+        cfg.pack_output = assets_pack_output
+    elif project_pak_path.byte_length() > 0:
+        cfg.pack_output = project_pak_path
+    elif assets_pak_path.byte_length() > 0:
+        cfg.pack_output = assets_pak_path
     return cfg^
-
-
-@fieldwise_init
-struct SpinComponent(Component, ImplicitlyCopyable):
-    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.game.SpinComponent")
-    comptime STORAGE_MODE: Int = STORAGE_TABLE
-    var speed: Float32
-    var angle: Float32
 
 
 struct GameStateResource(Resource, Movable):
@@ -1849,15 +2180,127 @@ struct GameStateResource(Resource, Movable):
     var headless: Bool
     var cam_yaw: Float32
     var cam_dist: Float32
-    var camera_entity: Entity
-    var cube_entity: Entity
+    var camera_orbited: Bool
+    var canvas: SimdCanvas
 
-    def __init__(out self, headless: Bool):
+    def __init__(out self, headless: Bool, width: Int, height: Int):
         self.headless = headless
-        self.cam_yaw = Float32(0.65)
-        self.cam_dist = Float32(7.5)
-        self.camera_entity = Entity()
-        self.cube_entity = Entity()
+        self.cam_yaw = Float32(0.785398)
+        self.cam_dist = Float32(9.2)
+        self.camera_orbited = False
+        self.canvas = SimdCanvas(width, height)
+
+
+def _draw_box_3d(
+    mut canvas: SimdCanvas,
+    cam: Camera3D,
+    center: Vec3,
+    rot: Quat,
+    scale: Vec3,
+    color: UInt32,
+    sun_dir: Vec3,
+):
+    var hx = scale.x * Float32(0.5)
+    var hy = scale.y * Float32(0.5)
+    var hz = scale.z * Float32(0.5)
+    if scale.x >= Float32(4.0) or scale.z >= Float32(4.0):
+        var nx = 6
+        var nz = 6
+        var dx = scale.x / Float32(nx)
+        var dz = scale.z / Float32(nz)
+        for ix in range(nx):
+            var x0 = -hx + Float32(ix) * dx
+            var x1 = x0 + dx
+            for iz in range(nz):
+                var z0 = -hz + Float32(iz) * dz
+                var z1 = z0 + dz
+                var q0 = center + rot.rotate(Vec3(x0, hy, z0))
+                var q1 = center + rot.rotate(Vec3(x1, hy, z0))
+                var q2 = center + rot.rotate(Vec3(x1, hy, z1))
+                var q3 = center + rot.rotate(Vec3(x0, hy, z1))
+                canvas.draw_tri_3d_lit(cam, q0, q1, q2, color, sun_dir)
+                canvas.draw_tri_3d_lit(cam, q0, q2, q3, color, sun_dir)
+        return
+
+    var c0 = center + rot.rotate(Vec3(-hx, -hy, -hz))
+    var c1 = center + rot.rotate(Vec3(hx, -hy, -hz))
+    var c2 = center + rot.rotate(Vec3(hx, hy, -hz))
+    var c3 = center + rot.rotate(Vec3(-hx, hy, -hz))
+    var c4 = center + rot.rotate(Vec3(-hx, -hy, hz))
+    var c5 = center + rot.rotate(Vec3(hx, -hy, hz))
+    var c6 = center + rot.rotate(Vec3(hx, hy, hz))
+    var c7 = center + rot.rotate(Vec3(-hx, hy, hz))
+    canvas.draw_tri_3d_lit(cam, c0, c1, c2, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c0, c2, c3, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c5, c4, c7, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c5, c7, c6, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c4, c0, c3, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c4, c3, c7, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c1, c5, c6, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c1, c6, c2, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c3, c2, c6, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c3, c6, c7, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c4, c5, c1, color, sun_dir)
+    canvas.draw_tri_3d_lit(cam, c4, c1, c0, color, sun_dir)
+
+
+def _render_scene_simd(mut world: World, mut state: GameStateResource):
+    var cam = Camera3D(
+        screen_w=state.canvas.width,
+        screen_h=state.canvas.height,
+        eye=Vec3(
+            cos(state.cam_yaw) * state.cam_dist,
+            Float32(3.6),
+            sin(state.cam_yaw) * state.cam_dist,
+        ),
+        target=Vec3(0.0, 0.8, 0.0),
+        fov_deg=Float32(55.0),
+    )
+    if not state.camera_orbited:
+        var cam_ents = world.query_entities(world.bit_for[CameraComponent]())
+        for i in range(len(cam_ents)):
+            var ce = cam_ents[i]
+            var cc_opt = world.get_ptr[CameraComponent](ce)
+            var lt_opt = world.get_ptr[LocalTransform](ce)
+            if cc_opt and lt_opt and cc_opt.value()[unsafe_offset=0].active:
+                var eye = lt_opt.value()[unsafe_offset=0].translation
+                cam.eye = eye
+                cam.target = eye + cc_opt.value()[unsafe_offset=0].look_target_offset
+                cam.fov_rad = cc_opt.value()[unsafe_offset=0].fov_y_deg * Float32(0.0174532925)
+                break
+    cam.update_basis()
+
+    var sun_dir = Vec3(0.38, 0.80, -0.46)
+    var env_ents = world.query_entities(world.bit_for[EnvironmentComponent]())
+    for i in range(len(env_ents)):
+        var eo = world.get_ptr[EnvironmentComponent](env_ents[i])
+        if eo and eo.value()[unsafe_offset=0].enabled:
+            sun_dir = eo.value()[unsafe_offset=0].sun_dir
+            break
+
+    state.canvas.clear(0x0D1726, 0x1B2B44)
+    var mesh_mask = world.bit_for[LocalTransform]().union(world.bit_for[MeshRendererComponent]())
+    var mesh_ents = world.query_entities(mesh_mask)
+    for i in range(len(mesh_ents)):
+        var me = mesh_ents[i]
+        var mr_opt = world.get_ptr[MeshRendererComponent](me)
+        var lt_opt = world.get_ptr[LocalTransform](me)
+        if not mr_opt or not lt_opt or not mr_opt.value()[unsafe_offset=0].visible:
+            continue
+        var col = pack_argb(180, 195, 210)
+        var mo_opt = world.get_ptr[MaterialOverrideComponent](me)
+        if mo_opt and mo_opt.value()[unsafe_offset=0].enabled:
+            var bc = mo_opt.value()[unsafe_offset=0].base_color
+            col = pack_argb(
+                Int(max(Float32(0.0), min(Float32(255.0), bc.x * Float32(255.0)))),
+                Int(max(Float32(0.0), min(Float32(255.0), bc.y * Float32(255.0)))),
+                Int(max(Float32(0.0), min(Float32(255.0), bc.z * Float32(255.0)))),
+            )
+        var gt_opt = world.get_ptr[GlobalTransform](me)
+        var pos = gt_opt.value()[unsafe_offset=0].translation if gt_opt else lt_opt.value()[unsafe_offset=0].translation
+        var rot = gt_opt.value()[unsafe_offset=0].rotation if gt_opt else lt_opt.value()[unsafe_offset=0].rotation
+        var scl = gt_opt.value()[unsafe_offset=0].scale if gt_opt else lt_opt.value()[unsafe_offset=0].scale
+        _draw_box_3d(state.canvas, cam, pos, rot, scl, col, sun_dir)
 
 
 def _sys_game_update(
@@ -1882,11 +2325,10 @@ def _sys_game_update(
             dt = fdt
 
     var win_opt = resources.get_ptr_mut[WindowStateResource]()
-    var rend_opt = resources.get_ptr_mut[ScalableRenderer]()
-    if win_opt and rend_opt:
+    if win_opt:
         ref win_res = win_opt.value()[unsafe_offset=0]
         if win_res.resized and win_res.width > 0 and win_res.height > 0:
-            _ = rend_opt.value()[unsafe_offset=0].resize(win_res.width, win_res.height)
+            state.canvas.resize(win_res.width, win_res.height)
 
     var imap_opt = resources.get_ptr[InputMap]()
     if not state.headless and imap_opt:
@@ -1897,42 +2339,12 @@ def _sys_game_update(
             return
         if imap.is_down("orbit_left"):
             state.cam_yaw -= Float32(1.5) * dt
+            state.camera_orbited = True
         if imap.is_down("orbit_right"):
             state.cam_yaw += Float32(1.5) * dt
-        if imap.just_pressed("jump"):
-            var rb_opt = world.get_ptr[RigidBodyComponent](state.cube_entity)
-            var phys_opt = resources.get_ptr_mut[PhysicsWorld]()
-            if rb_opt and phys_opt:
-                var slot = phys_opt.value()[unsafe_offset=0].find_slot_by_id(
-                    rb_opt.value()[unsafe_offset=0].body_id
-                )
-                if slot >= 0:
-                    phys_opt.value()[unsafe_offset=0].apply_impulse(slot, Vec3(0.0, 5.5, 0.0))
+            state.camera_orbited = True
 
-    var spin_mask = world.bit_for[SpinComponent]().union(world.bit_for[LocalTransform]())
-    var spin_entities = world.query_entities(spin_mask)
-    for i in range(len(spin_entities)):
-        var se = spin_entities[i]
-        var sp_opt = world.get_ptr_mut[SpinComponent](se)
-        var lt_opt = world.get_ptr_mut[LocalTransform](se)
-        if sp_opt and lt_opt:
-            ref sp = sp_opt.value()[unsafe_offset=0]
-            sp.angle += sp.speed * dt
-            lt_opt.value()[unsafe_offset=0].rotation = Quat(
-                0.0, sin(sp.angle * Float32(0.5)), 0.0, cos(sp.angle * Float32(0.5))
-            )
-
-    var eye = Vec3(
-        cos(state.cam_yaw) * state.cam_dist,
-        Float32(3.6),
-        sin(state.cam_yaw) * state.cam_dist,
-    )
-    var target = Vec3(0.0, 1.0, 0.0)
-    var cam_lt = world.get_ptr_mut[LocalTransform](state.camera_entity)
-    var cam_c = world.get_ptr_mut[CameraComponent](state.camera_entity)
-    if cam_lt and cam_c:
-        cam_lt.value()[unsafe_offset=0].translation = eye
-        cam_c.value()[unsafe_offset=0].look_target_offset = target - eye
+    _render_scene_simd(world, state)
 
 
 def _sys_game_present(
@@ -1943,18 +2355,16 @@ def _sys_game_present(
     _ctx: Int,
 ):
     ref resources = res_ptr[unsafe_offset=0]
-    var st_opt = resources.get_ptr[GameStateResource]()
-    var rend_opt = resources.get_ptr_mut[ScalableRenderer]()
+    var st_opt = resources.get_ptr_mut[GameStateResource]()
     var win_opt = resources.get_ptr_mut[WindowStateResource]()
-    if not st_opt or not rend_opt or not win_opt:
+    if not st_opt or not win_opt:
         return
     if st_opt.value()[unsafe_offset=0].headless:
         return
-    ref renderer = rend_opt.value()[unsafe_offset=0]
+    ref state = st_opt.value()[unsafe_offset=0]
     ref win_res = win_opt.value()[unsafe_offset=0]
-    if (not renderer.surface.is_zero_copy_gpu()) and len(win_res.windows) > 0:
-        var px = renderer.readback_pixels()
-        win_res.windows[0].present(px, renderer.width, renderer.height)
+    if len(win_res.windows) > 0:
+        win_res.windows[0].present(state.canvas.pixels, state.canvas.width, state.canvas.height)
 
 
 def _setup_input(mut app: EngineApp):
@@ -1964,118 +2374,34 @@ def _setup_input(mut app: EngineApp):
     ref imap = imap_opt.value()[unsafe_offset=0]
     _ = imap.register_action("orbit_left", ACTION_BOOL)
     _ = imap.register_action("orbit_right", ACTION_BOOL)
-    _ = imap.register_action("jump", ACTION_BOOL)
     _ = imap.register_action("quit", ACTION_BOOL)
     var ctx = InputContext("gameplay", priority=10)
     ctx.bind_key("orbit_left", 65)    # A
     ctx.bind_key("orbit_left", 263)   # Left
     ctx.bind_key("orbit_right", 68)   # D
     ctx.bind_key("orbit_right", 262)  # Right
-    ctx.bind_key("jump", 32)          # Space
     ctx.bind_key("quit", 256)         # Esc
     imap.add_context(ctx^)
     imap.push_context("gameplay")
 
 
-def _setup_scene(mut app: EngineApp):
-    var rend_opt = app.resources.get_ptr_mut[ScalableRenderer]()
-    var st_opt = app.resources.get_ptr_mut[GameStateResource]()
-    var aud_opt = app.resources.get_ptr_mut[AudioServer]()
-    if not rend_opt or not st_opt:
-        return
-    ref renderer = rend_opt.value()[unsafe_offset=0]
-    ref state = st_opt.value()[unsafe_offset=0]
-
-    var mat_ground = renderer.register_material(
-        MaterialAsset(base_color=Vec3(0.12, 0.18, 0.28), roughness=0.82, metallic=0.05)
-    )
-    var mat_cube = renderer.register_material(
-        MaterialAsset(base_color=Vec3(0.95, 0.58, 0.16), roughness=0.28, metallic=0.25)
-    )
-    var mat_beacon = renderer.register_material(
-        MaterialAsset(base_color=Vec3(0.20, 0.78, 0.96), roughness=0.20, metallic=0.40)
-    )
-
-    var mb_ground = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.82, metallic=0.05)
-    mb_ground.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(8.0, 0.5, 8.0), bevel=0.04)
-    var ground_mesh = renderer.register_mesh(mb_ground^.finish(), mat_ground)
-
-    var mb_cube = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.28, metallic=0.25)
-    mb_cube.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(0.55, 0.55, 0.55), bevel=0.06)
-    var cube_mesh = renderer.register_mesh(mb_cube^.finish(), mat_cube)
-
-    var mb_beacon = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.20, metallic=0.40)
-    mb_beacon.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(0.22, 0.22, 0.22), bevel=0.03)
-    var beacon_mesh = renderer.register_mesh(mb_beacon^.finish(), mat_beacon)
-
-    var ground_e = app.world.spawn()
-    _ = app.world.insert[LocalTransform](ground_e, LocalTransform(Vec3(0.0, -0.5, 0.0)))
-    _ = app.world.insert[GlobalTransform](ground_e, GlobalTransform())
-    _ = app.world.insert[RigidBodyComponent](ground_e, RigidBodyComponent.static_body())
-    _ = app.world.insert[ColliderComponent](ground_e, ColliderComponent.box(Vec3(8.0, 0.5, 8.0)))
-    _ = app.world.insert[MeshRendererComponent](ground_e, MeshRendererComponent(ground_mesh, mat_ground))
-
-    var cube_e = app.world.spawn()
-    _ = app.world.insert[LocalTransform](cube_e, LocalTransform(Vec3(0.0, 2.5, 0.0)))
-    _ = app.world.insert[GlobalTransform](cube_e, GlobalTransform())
-    _ = app.world.insert[PrevGlobalTransform](cube_e, PrevGlobalTransform())
-    _ = app.world.insert[RigidBodyComponent](cube_e, RigidBodyComponent.dynamic(mass=Float32(1.0)))
-    _ = app.world.insert[ColliderComponent](cube_e, ColliderComponent.box(Vec3(0.55, 0.55, 0.55)))
-    _ = app.world.insert[MeshRendererComponent](cube_e, MeshRendererComponent(cube_mesh, mat_cube))
-    if aud_opt:
-        var pcm = List[Int16](capacity=12000)
-        for s in range(12000):
-            var ph = Float32(s) / Float32(48000.0) * Float32(6.2831853)
-            var wave = sin(ph * Float32(220.0)) * Float32(0.4)
-            pcm.append(Int16(Int(wave * Float32(8000.0))))
-        var aid = aud_opt.value()[unsafe_offset=0].register_pcm16_asset(pcm, channels=1, sample_rate=48000)
-        _ = app.world.insert[AudioEmitterComponent](
-            cube_e,
-            AudioEmitterComponent(
-                asset_id=aid,
-                volume=Float32(0.35),
-                bus_id=BUS_AMBIENCE,
-                looping=True,
-                spatial=True,
-                play_on_spawn=True,
-            ),
-        )
-    state.cube_entity = cube_e
-
-    var beacon_e = app.world.spawn()
-    _ = app.world.insert[LocalTransform](beacon_e, LocalTransform(Vec3(0.0, 1.05, 0.0)))
-    _ = app.world.insert[GlobalTransform](beacon_e, GlobalTransform())
-    _ = app.world.insert[SpinComponent](beacon_e, SpinComponent(Float32(2.2), Float32(0.0)))
-    _ = app.world.insert[MeshRendererComponent](beacon_e, MeshRendererComponent(beacon_mesh, mat_beacon))
-    _ = set_parent(app.world, beacon_e, cube_e)
-
-    var cam_e = app.world.spawn()
-    var eye = Vec3(cos(state.cam_yaw) * state.cam_dist, Float32(3.6), sin(state.cam_yaw) * state.cam_dist)
-    _ = app.world.insert[LocalTransform](cam_e, LocalTransform(eye))
-    _ = app.world.insert[GlobalTransform](cam_e, GlobalTransform())
-    _ = app.world.insert[CameraComponent](
-        cam_e,
-        CameraComponent(
-            fov_y_deg=Float32(55.0),
-            near_z=Float32(0.10),
-            far_z=Float32(250.0),
-            active=True,
-            look_target_offset=Vec3(0.0, 1.0, 0.0) - eye,
-        ),
-    )
-    _ = app.world.insert[AudioListenerComponent](cam_e, AudioListenerComponent(active=True))
-    state.camera_entity = cam_e
-
-    var light_e = app.world.spawn()
-    _ = app.world.insert[LocalTransform](light_e, LocalTransform(Vec3(4.0, 6.0, 4.0)))
-    _ = app.world.insert[GlobalTransform](light_e, GlobalTransform())
-    _ = app.world.insert[PointLightComponent](
-        light_e, PointLightComponent(Vec3(12.0, 10.0, 8.0), radius=Float32(28.0), enabled=True)
-    )
+def _looks_like_json_scene(raw: List[UInt8]) -> Bool:
+    for i in range(len(raw)):
+        var b = raw[i]
+        if b == 32 or b == 9 or b == 10 or b == 13:
+            continue
+        return b == 123  # '{'
+    return False
 
 
-def main():
+def _run_game() -> Int:
     var cfg = _load_flint_toml()
+    var ver_check = check_flint_version_pin(cfg.flint_version)
+    if not ver_check[0]:
+        print("[" + cfg.app_name + "] ERROR: " + ver_check[1])
+        return 1
+
+    _ = start_log(cfg.app_name)
     var headless_smoke = False
     var shots_mode = False
     var out_png = String("")
@@ -2109,18 +2435,17 @@ def main():
         _ = assets.mount_flpk(cfg.pack_output)
     elif file_size("assets.flpk") > 0:
         _ = assets.mount_flpk("assets.flpk")
-    elif not effective_headless:
-        _ = assets.watch_loose_directory("assets")
+    if is_directory("assets", follow_symlinks=True):
+        assets.loose_root = "assets"
+        assets.index_loose_directory()
 
     var app_cfg = AppConfig(
         title=cfg.window_title,
         headless=effective_headless,
         fixed_hz=Float32(cfg.fixed_hz),
+        enable_crash_handler=True,
     )
     var app = EngineApp(app_cfg^)
-    var render_tier = (
-        RENDER_TIER_0_HEADLESS_SIMD if effective_headless else RENDER_TIER_1_FORWARD_CLUSTERED
-    )
 
     app.add_plugin(TransformPlugin(snapshot_prev_in_fixed=True))
     app.add_plugin(
@@ -2132,17 +2457,46 @@ def main():
         )
     )
     app.add_plugin(InputPlugin(enable_evdev=not effective_headless))
-    app.add_plugin(PhysicsPlugin(gravity=Float32(9.81)))
-    app.add_plugin(AudioPlugin(headless=effective_headless))
-    app.add_plugin(RenderPlugin(tier=render_tier, width=cfg.window_width, height=cfg.window_height))
 
-    _ = app.register_component[SpinComponent]()
-    app.insert_resource[GameStateResource](GameStateResource(effective_headless))
+    app.insert_resource[GameStateResource](
+        GameStateResource(effective_headless, cfg.window_width, cfg.window_height)
+    )
     _ = app.add_system(STAGE_UPDATE, "game.update", _sys_game_update, exclusive=True)
     _ = app.add_system(STAGE_LAST, "game.present", _sys_game_present, exclusive=True)
 
     _setup_input(app)
-    _setup_scene(app)
+
+    var reg = ComponentRegistry.with_builtins()
+    register_render_codecs(reg)
+    reg.ensure_registered_in_world(app.world)
+
+    var scene_bytes = List[UInt8]()
+    var rh = assets.load_raw(cfg.entry_scene)
+    var rptr = assets.raws.get_ptr(rh)
+    if rptr and len(rptr.value()[unsafe_offset=0].bytes) > 0:
+        scene_bytes = rptr.value()[unsafe_offset=0].bytes.copy()
+    elif file_size(cfg.entry_scene) > 0:
+        scene_bytes = read_bytes(cfg.entry_scene)
+
+    if len(scene_bytes) == 0:
+        print("[" + cfg.app_name + "] ERROR: entry_scene not found or empty: " + cfg.entry_scene)
+        assets.close()
+        _ = flush_log()
+        app.shutdown()
+        return 1
+
+    var scene = Scene(cfg.entry_scene)
+    try:
+        if cfg.entry_scene.endswith(".flscnb") or not _looks_like_json_scene(scene_bytes):
+            _ = scene.load_flscnb_bytes(app.world, reg, scene_bytes, clear_existing=True)
+        else:
+            _ = scene.load_flscn_bytes(app.world, reg, scene_bytes, clear_existing=True)
+    except err:
+        print("[" + cfg.app_name + "] ERROR: failed to load entry_scene '" + cfg.entry_scene + "': " + String(err))
+        assets.close()
+        _ = flush_log()
+        app.shutdown()
+        return 1
 
     if headless_smoke or shots_mode or no_display:
         app.startup()
@@ -2157,16 +2511,11 @@ def main():
             var pdir = parent_directory(shot_target)
             if pdir.byte_length() > 0 and pdir != ".":
                 _ = make_dirs(pdir)
-            var rend_opt = app.resources.get_ptr[ScalableRenderer]()
-            if rend_opt:
-                ref r = rend_opt.value()[unsafe_offset=0]
-                var px = r.readback_pixels()
-                _ = write_png(shot_target, px, r.width, r.height)
+            var st_opt = app.resources.get_ptr_mut[GameStateResource]()
+            if st_opt:
+                ref st = st_opt.value()[unsafe_offset=0]
+                _ = write_png(shot_target, st.canvas.pixels, st.canvas.width, st.canvas.height)
 
-        var bodies = 0
-        var phys_opt = app.resources.get_ptr[PhysicsWorld]()
-        if phys_opt:
-            bodies = len(phys_opt.value()[unsafe_offset=0].bodies)
         print(
             "["
             + cfg.app_name
@@ -2178,32 +2527,27 @@ def main():
             + String(cfg.fixed_hz)
             + ", net_mtu="
             + String(cfg.net_mtu_bytes)
-            + ", bodies="
-            + String(bodies)
+            + ", entities="
+            + String(len(app.world.entities))
             + ")."
         )
         assets.close()
+        _ = flush_log()
         app.shutdown()
-        return
+        return 0
 
     app.startup()
     var win_open = False
-    var win_opt = app.resources.get_ptr_mut[WindowStateResource]()
-    var rend_opt = app.resources.get_ptr_mut[ScalableRenderer]()
+    var win_opt = app.resources.get_ptr[WindowStateResource]()
     if win_opt:
-        ref win_res = win_opt.value()[unsafe_offset=0]
-        win_open = win_res.is_open()
-        if win_open and rend_opt and len(win_res.windows) > 0:
-            var pmode = PRESENT_FIFO if cfg.vsync else PRESENT_IMMEDIATE
-            _ = rend_opt.value()[unsafe_offset=0].attach_window_surface(
-                win_res.windows[0], present_mode=pmode
-            )
+        win_open = win_opt.value()[unsafe_offset=0].is_open()
 
     if not win_open:
         print("[" + cfg.app_name + "] No display available; exiting cleanly. Use '--headless-smoke' or '--shots'.")
         assets.close()
+        _ = flush_log()
         app.shutdown()
-        return
+        return 0
 
     var last_t = get_time()
     while True:
@@ -2216,13 +2560,132 @@ def main():
         var now = get_time()
         var dt = Float32(min(0.05, max(0.001, now - last_t)))
         last_t = now
-        _ = assets.tick(now)
         app.step_one_frame(dt)
 
     assets.close()
+    _ = flush_log()
     app.shutdown()
+    return 0
+
+
+def main():
+    var rc = _run_game()
+    if rc != 0:
+        external_call["exit", NoneType](Int32(rc))
 EOF
     echo "[Flint] Scaffolded new standalone Flint v5 project (with flint.toml) at: ${abs_dest}"
+}
+
+cmd_gameplay_so() {
+    local opt="-O1"
+    local out_override=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --fast|--debug)
+                opt="-O0"
+                shift
+                ;;
+            --release)
+                opt="-O3"
+                shift
+                ;;
+            --out)
+                if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                    echo "[Flint] ERROR: --out requires a file path." >&2
+                    return 1
+                fi
+                out_override="$2"
+                shift 2
+                ;;
+            --out=*)
+                out_override="${1#--out=}"
+                if [[ -z "$out_override" ]]; then
+                    echo "[Flint] ERROR: --out requires a non-empty file path." >&2
+                    return 1
+                fi
+                shift
+                ;;
+            *)
+                echo "[Flint] ERROR: Unknown gameplay-so option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    local toml_file="${CALLER_PWD}/flint.toml"
+    if [[ ! -f "$toml_file" ]]; then
+        echo "[Flint] ERROR: No flint.toml found in ${CALLER_PWD}. Run from a Flint game project directory." >&2
+        return 1
+    fi
+    validate_project_flint_version "$toml_file" || return 1
+
+    local gp_entry gp_out
+    gp_entry="$(read_flint_toml_value "$toml_file" "project" "gameplay_entry" || true)"
+    gp_out="$(read_flint_toml_value "$toml_file" "project" "gameplay_output" || true)"
+    [[ -z "$gp_entry" ]] && gp_entry="src/gameplay.mojo"
+    [[ -z "$gp_out" ]] && gp_out="build/gameplay.so"
+    if [[ -n "$out_override" ]]; then
+        gp_out="$out_override"
+    fi
+
+    local src_path out_so
+    if [[ "$gp_entry" == /* ]]; then
+        src_path="$gp_entry"
+    else
+        src_path="${CALLER_PWD}/${gp_entry}"
+    fi
+    if [[ "$gp_out" == /* ]]; then
+        out_so="$gp_out"
+    else
+        out_so="${CALLER_PWD}/${gp_out}"
+    fi
+
+    if [[ ! -f "$src_path" ]]; then
+        echo "[Flint] ERROR: Gameplay plugin entry not found: ${src_path}" >&2
+        return 1
+    fi
+
+    local toml_werror toml_det_fp eff_werror eff_det_fp
+    toml_werror="$(read_flint_toml_value "$toml_file" "engine" "werror" || echo "true")"
+    toml_det_fp="$(read_flint_toml_value "$toml_file" "engine" "deterministic_fp" || echo "true")"
+    eff_werror="${FLINT_WERROR:-1}"
+    eff_det_fp="${FLINT_DETERMINISTIC_FP:-1}"
+    [[ "$toml_werror" == "false" ]] && eff_werror="0"
+    [[ "$toml_det_fp" == "false" ]] && eff_det_fp="0"
+
+    local fp_args=()
+    if [[ "$eff_det_fp" != "0" ]]; then
+        fp_args=("--fp-mode" "contract=off")
+    fi
+    local werror_args=()
+    if [[ "$eff_werror" != "0" ]]; then
+        werror_args=("--Werror")
+    fi
+    local inc_args=("-I" "${ROOT}/src")
+    if [[ -d "${CALLER_PWD}/src" ]]; then
+        inc_args+=("-I" "${CALLER_PWD}/src")
+    fi
+
+    resolve_mojo
+    write_build_stamp "$MOJO_BIN"
+
+    local out_dir tmp_base tmp_so
+    out_dir="$(dirname "$out_so")"
+    mkdir -p "$out_dir"
+    tmp_base="$(mktemp "${out_dir}/.$(basename "$out_so").tmp.XXXXXX")"
+    tmp_so="${tmp_base}.so"
+    rm -f "$tmp_base"
+
+    echo "[Flint] Building gameplay plugin ${gp_entry} -> ${out_so} (${opt}) ..."
+    if ! "$MOJO_BIN" build "$src_path" --emit shared-lib -o "$tmp_so" "${inc_args[@]}" "$opt" "${fp_args[@]}" "${werror_args[@]}"; then
+        rm -f "$tmp_so"
+        echo "[Flint] ERROR: Failed to build gameplay plugin shared library." >&2
+        return 1
+    fi
+
+    chmod 0755 "$tmp_so"
+    mv -f "$tmp_so" "$out_so"
+    echo "[Flint] Gameplay plugin built: ${out_so}"
 }
 
 subcmd="${1:-help}"
@@ -2231,6 +2694,7 @@ case "$subcmd" in
     sync)    cmd_sync "$@" ;;
     build)   cmd_build "$@" ;;
     run)     cmd_run "$@" ;;
+    gameplay-so) cmd_gameplay_so "$@" ;;
     fern)
         resolve_mojo
         compile_mojo "${ROOT}/examples/fern/main.mojo" "${ROOT}/build/flint-fern" "-O3" ""
@@ -2269,6 +2733,7 @@ case "$subcmd" in
         echo "  studio [...]         Launch the visual editor, or use --motion / --combat / --room PRESET.json"
         echo "  mcp [...]            Build and launch Flint Studio headless MCP v2 stdio server"
         echo "  build [target] [--force] [-j N] Compile standalone targets (or flint.toml project) with incremental skip"
+        echo "  gameplay-so [--fast|--debug|--release] [--out path.so]  Compile hot-reloadable gameplay .so plugin"
         echo "  run [...]            Build and run a scaffolded game project using flint.toml [project] entry"
         echo "  test [unit|e2e|v5]   Build and run standalone Flint Engine verification suites"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"

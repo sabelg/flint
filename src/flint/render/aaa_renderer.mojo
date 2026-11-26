@@ -808,6 +808,9 @@ struct FlintAaaVulkanRenderer(Movable):
     var ui_font: SdfFont
     var ui_font_img: VulkanImage
     var ui_font_atlas_slot: Int
+    var ui_time_sec: Float32
+    var ui_dpi_scale: Float32
+    var ui_global_flags: UInt32
 
     # Descriptor & Pipeline handles
     var dsl: Int
@@ -922,6 +925,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var buf_occluded_candidates: GpuBuffer
     var pending_skin_updates: List[AaaSkinnedMeshEntry]
     var pending_skin_copies: List[Tuple[Int, List[UInt32]]]
+    var pending_material_copies: List[Tuple[Int, List[UInt32]]]
     var skin_bones_initialized: List[Bool]
 
     # CPU Scene & Subsystems
@@ -929,6 +933,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var materials: List[AaaMaterial]
     var glass_materials: List[AaaGlassParams]  # optics of the transparent materials (`aaa_glass.mojo`)
     var cel_materials: List[AaaCelParams]
+    var free_outline_mat_ids: List[Int]
     var vfx_materials: List[AaaStylizedVfxParams]
     var frame_shockwaves: List[AaaShockwaveRing]
     var impact_frame: AaaImpactFrameParams
@@ -1254,6 +1259,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.ui_font = SdfFont()
         self.ui_font_img = VulkanImage()
         self.ui_font_atlas_slot = -1
+        self.ui_time_sec = 0.0
+        self.ui_dpi_scale = 1.0
+        self.ui_global_flags = 0
 
         self.mesh_blas = List[VulkanAccelStruct]()
         self.frame_tlas = VulkanAccelStruct()
@@ -1263,6 +1271,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_ldr_readback = GpuBuffer()
         self.pending_skin_updates = List[AaaSkinnedMeshEntry]()
         self.pending_skin_copies = List[Tuple[Int, List[UInt32]]]()
+        self.pending_material_copies = List[Tuple[Int, List[UInt32]]]()
         self.skin_bones_initialized = List[Bool](length=AAA_MAX_SKIN_BONES, fill=False)
 
         self.geom = AaaGeometryPool()
@@ -1337,6 +1346,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sun_shadow_softness = Float32(0.005)
         self.glass_materials = List[AaaGlassParams]()
         self.cel_materials = List[AaaCelParams]()
+        self.free_outline_mat_ids = List[Int]()
         self.vfx_materials = List[AaaStylizedVfxParams]()
         self.frame_shockwaves = List[AaaShockwaveRing]()
         self.impact_frame = AaaImpactFrameParams()
@@ -2943,6 +2953,130 @@ struct FlintAaaVulkanRenderer(Movable):
         self._write_or_queue_bindless(slot, self.samp_linear_clamp, view)
         return slot
 
+    def upload_ui_font_atlas(mut self, font: SdfFont) -> Int:
+        """Uploads a 1-channel SDF (`R8_UNORM`) or 3/4-channel MSDF/MTSDF (`RGBA8_UNORM`)
+        `SdfFont` atlas into a bindless texture slot for `PRIM_GLYPH` multi-font rendering."""
+        if not font.valid or font.atlas_width <= 0 or font.atlas_height <= 0:
+            return -1
+        if len(self.bindless_images) >= AAA_MAX_BINDLESS:
+            return -1
+        var fw = font.atlas_width
+        var fh = font.atlas_height
+        var ch = max(1, font.channels)
+        if ch >= 3:
+            var pix_cnt = fw * fh
+            var rgba = List[UInt8](length=pix_cnt * 4, fill=255)
+            if ch == 4 and len(font.atlas) >= pix_cnt * 4:
+                for i in range(pix_cnt * 4):
+                    rgba[i] = font.atlas[i]
+            elif ch == 3 and len(font.atlas) >= pix_cnt * 3:
+                for p in range(pix_cnt):
+                    rgba[p * 4 + 0] = font.atlas[p * 3 + 0]
+                    rgba[p * 4 + 1] = font.atlas[p * 3 + 1]
+                    rgba[p * 4 + 2] = font.atlas[p * 3 + 2]
+                    rgba[p * 4 + 3] = 255
+            else:
+                return -1
+            return self.upload_rgba8_texture(rgba, fw, fh)
+
+        var need_u8 = fw * fh
+        if len(font.atlas) < need_u8:
+            return -1
+        var img = self.vk.create_image_2d(
+            fw, fh, FORMAT_R8_UNORM, IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED, mip_levels=1
+        )
+        if img.image == 0:
+            return -1
+        self._wait_cmd_slot0()
+        self.ensure_staging_capacity(need_u8)
+        _ = external_call["memcpy", Int](self.buf_staging.cpu_address, Int(font.atlas.unsafe_ptr()), need_u8)
+        _ = len(font.atlas)
+        if not self.vk.begin_commands(0):
+            self.vk.destroy_image(img)
+            return -1
+        self.vk.transition_image(0, img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
+        self.vk.upload_image_mip(0, img, self.buf_staging, 0, 0, fw, fh)
+        self.vk.transition_image(
+            0, img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ
+        )
+        var f = self.vk.submit(0)
+        if f != 0:
+            _ = self.vk.wait(f)
+        var slot = len(self.bindless_images)
+        var view = img.view
+        var vram_sz = img.memory_bytes
+        self.bindless_images.append(img^)
+        self._ensure_bindless_meta(slot)
+        self.bindless_resident_min_mip[slot] = 0
+        self.bindless_vram_bytes[slot] = vram_sz
+        self.bindless_layouts_init[slot] = True
+        self._write_or_queue_bindless(slot, self.samp_linear_clamp, view)
+        return slot
+
+    def update_ui_font_atlas_slot(mut self, slot: Int, font: SdfFont) -> Bool:
+        """Re-uploads an already-registered UI font atlas slot (supports R8 SDF and RGBA8 MSDF/MTSDF)."""
+        if (
+            not font.valid
+            or slot < 0
+            or slot >= len(self.bindless_images)
+            or self.bindless_images[slot].image == 0
+            or font.atlas_width <= 0
+            or font.atlas_height <= 0
+        ):
+            return False
+        var fw = font.atlas_width
+        var fh = font.atlas_height
+        var ch = max(1, font.channels)
+        var pix_cnt = fw * fh
+        var upload_bytes = pix_cnt * (4 if ch >= 3 else 1)
+        self._wait_cmd_slot0()
+        self.ensure_staging_capacity(upload_bytes)
+        if ch >= 3:
+            var rgba = List[UInt8](length=upload_bytes, fill=255)
+            if ch == 4 and len(font.atlas) >= upload_bytes:
+                for i in range(upload_bytes):
+                    rgba[i] = font.atlas[i]
+            elif ch == 3 and len(font.atlas) >= pix_cnt * 3:
+                for p in range(pix_cnt):
+                    rgba[p * 4 + 0] = font.atlas[p * 3 + 0]
+                    rgba[p * 4 + 1] = font.atlas[p * 3 + 1]
+                    rgba[p * 4 + 2] = font.atlas[p * 3 + 2]
+                    rgba[p * 4 + 3] = 255
+            else:
+                return False
+            _ = external_call["memcpy", Int](self.buf_staging.cpu_address, Int(rgba.unsafe_ptr()), upload_bytes)
+            _ = len(rgba)
+        else:
+            if len(font.atlas) < upload_bytes:
+                return False
+            _ = external_call["memcpy", Int](self.buf_staging.cpu_address, Int(font.atlas.unsafe_ptr()), upload_bytes)
+            _ = len(font.atlas)
+        if not self.vk.begin_commands(0):
+            return False
+        self.vk.transition_image(
+            0,
+            self.bindless_images[slot],
+            LAYOUT_TRANSFER_TARGET,
+            PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER,
+            ACCESS_SHADER_READ,
+            PIPELINE_TRANSFER,
+            ACCESS_TRANSFER_WRITE,
+        )
+        self.vk.upload_image_mip(0, self.bindless_images[slot], self.buf_staging, 0, 0, fw, fh)
+        self.vk.transition_image(
+            0,
+            self.bindless_images[slot],
+            LAYOUT_SHADER_READ_ONLY,
+            PIPELINE_TRANSFER,
+            ACCESS_TRANSFER_WRITE,
+            PIPELINE_COMPUTE | PIPELINE_FRAGMENT_SHADER,
+            ACCESS_SHADER_READ,
+        )
+        var f = self.vk.submit(0)
+        if f != 0:
+            _ = self.vk.wait(f)
+        return True
+
     def upload_terrain_heightmap_rgba16f(mut self, heights: List[Float32], width: Int, height: Int) -> Int:
         """Packs scalar `[0..1]` (or normalized) terrain height samples into `RGBA16F` `(h, 0.5, 0.5, 1.0)`
         and uploads to `BIND_AAA_BINDLESS_TEX` (`samp_linear_clamp`)."""
@@ -3011,6 +3145,28 @@ struct FlintAaaVulkanRenderer(Movable):
                 return True
         return False
 
+    def _push_free_outline_mat(mut self, out_id: Int):
+        if out_id < 0 or out_id >= AAA_CEL_NO_OUTLINE_MAT or out_id >= len(self.materials):
+            return
+        for i in range(len(self.free_outline_mat_ids)):
+            if self.free_outline_mat_ids[i] == out_id:
+                return
+        self.free_outline_mat_ids.append(out_id)
+
+    def _alloc_or_reuse_outline_mat(mut self, outline_color: Vec3) -> Int:
+        var om = AaaMaterial(
+            base_color=outline_color,
+            roughness=1.0,
+            metallic=0.0,
+        )
+        om.specular_factor = Float32(0.0)
+        while len(self.free_outline_mat_ids) > 0:
+            var cand = self.free_outline_mat_ids.pop()
+            if cand >= 0 and cand < AAA_CEL_NO_OUTLINE_MAT and cand < len(self.materials):
+                self.queue_material_update(cand, om)
+                return cand
+        return self.add_material(om)
+
     def add_cel_material(mut self, mat: AaaMaterial, cel: AaaCelParams) -> Int:
         """Registers an `AaaMaterial` paired with `AaaCelParams` (`ILM`, `SSS`, `Inner-Ink`, `Hair-Halo`, `Rim`,
         and automatic hardware `CULL_MODE_FRONT` clip-space outline material allocation when `outline_width_px > 0`)."""
@@ -3022,14 +3178,10 @@ struct FlintAaaVulkanRenderer(Movable):
         var c = cel.copy()
         c.material_id = id
         if c.outline_width_px > Float32(0.001):
-            var out_mat = AaaMaterial(
-                base_color=c.outline_color,
-                roughness=1.0,
-                metallic=0.0,
+            var out_id = self._alloc_or_reuse_outline_mat(c.outline_color)
+            c.outline_material_id = (
+                out_id if (out_id >= 0 and out_id < AAA_CEL_NO_OUTLINE_MAT) else AAA_CEL_NO_OUTLINE_MAT
             )
-            out_mat.specular_factor = Float32(0.0)
-            var out_id = self.add_material(out_mat)
-            c.outline_material_id = out_id if out_id >= 0 else AAA_CEL_NO_OUTLINE_MAT
         else:
             c.outline_material_id = AAA_CEL_NO_OUTLINE_MAT
         self.cel_materials.append(c^)
@@ -3043,17 +3195,18 @@ struct FlintAaaVulkanRenderer(Movable):
                 c.material_id = mat_id
                 var prev_out = self.cel_materials[i].outline_material_id
                 if c.outline_width_px > Float32(0.001):
-                    if prev_out >= 0 and prev_out < AAA_CEL_NO_OUTLINE_MAT:
+                    if prev_out >= 0 and prev_out < AAA_CEL_NO_OUTLINE_MAT and prev_out < len(self.materials):
                         var om = self.materials[prev_out].copy()
                         om.base_color = c.outline_color
-                        self.update_material(prev_out, om)
+                        self.queue_material_update(prev_out, om)
                         c.outline_material_id = prev_out
                     else:
-                        var om = AaaMaterial(base_color=c.outline_color, roughness=1.0, metallic=0.0)
-                        om.specular_factor = Float32(0.0)
-                        var out_id = self.add_material(om)
-                        c.outline_material_id = out_id if out_id >= 0 else AAA_CEL_NO_OUTLINE_MAT
+                        var out_id = self._alloc_or_reuse_outline_mat(c.outline_color)
+                        c.outline_material_id = (
+                            out_id if (out_id >= 0 and out_id < AAA_CEL_NO_OUTLINE_MAT) else AAA_CEL_NO_OUTLINE_MAT
+                        )
                 else:
+                    self._push_free_outline_mat(prev_out)
                     c.outline_material_id = AAA_CEL_NO_OUTLINE_MAT
                 self.cel_materials[i] = c^
                 return True
@@ -3121,6 +3274,19 @@ struct FlintAaaVulkanRenderer(Movable):
     def update_material_asset(mut self, mat_id: Int, mat: MaterialAsset):
         """Updates an existing material slot in `buf_materials` (`Binding 4`) from a `MaterialAsset`."""
         self.update_material(mat_id, mat.to_aaa_material())
+
+    def queue_material_update(mut self, mat_id: Int, mat: AaaMaterial):
+        """Updates CPU `materials[mat_id]` immediately and stages a non-stalling `buf_materials` copy for `render_frame()`."""
+        if mat_id < 0 or mat_id >= len(self.materials):
+            return
+        self.materials[mat_id] = mat.copy()
+        var words = List[UInt32](capacity=AAA_MATERIAL_WORDS)
+        mat.append_words(words)
+        self.pending_material_copies.append((mat_id * AAA_MATERIAL_WORDS * 4, words^))
+
+    def queue_material_asset_update(mut self, mat_id: Int, mat: MaterialAsset):
+        """Queues a non-stalling `MaterialAsset` update into `buf_materials` (`Binding 4`)."""
+        self.queue_material_update(mat_id, mat.to_aaa_material())
 
     def evaluate_material_graph_to_bindless[
         NodeT: SurfaceMaterialNode
@@ -4113,7 +4279,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
     def upload_native_model(
         mut self,
-        mut model: NativeModel,
+        model: NativeModel,
         build_lods: Bool = True,
         max_tex_dim: Int = 2048,
         upload_skinned: Bool = False,
@@ -6098,6 +6264,18 @@ struct FlintAaaVulkanRenderer(Movable):
                     skin_stage_copies.append((w_off * 4, sl_sk))
             self.pending_skin_copies.clear()
 
+        var mat_stage_copies = List[Tuple[Int, StagingSlice]]()
+        if len(self.pending_material_copies) > 0:
+            for mc_i in range(len(self.pending_material_copies)):
+                var byte_off = self.pending_material_copies[mc_i][0]
+                ref w_arr = self.pending_material_copies[mc_i][1]
+                if len(w_arr) > 0:
+                    var sl_mt = self.staging_ring.stage_bytes(
+                        self.vk, cur_slot, Int(w_arr.unsafe_ptr()), len(w_arr) * 4
+                    )
+                    mat_stage_copies.append((byte_off, sl_mt))
+            self.pending_material_copies.clear()
+
         # 3. Ensure TLAS Capacity Before Recording (Zero per-frame `vkAllocateMemory` / `vkDestroyAccelerationStructureKHR`!)
         var use_rt_frame = self.vk.has_ray_query and n_inst > 0 and (
             self.enable_rt_shadows
@@ -6257,6 +6435,18 @@ struct FlintAaaVulkanRenderer(Movable):
         for sc_i in range(len(skin_stage_copies)):
             self.staging_ring.record_copy(
                 self.vk, vis_slot, cur_slot, skin_stage_copies[sc_i][1], self.buf_skinning, skin_stage_copies[sc_i][0]
+            )
+        if len(mat_stage_copies) > 0 and not defer_this:
+            self.vk.memory_barrier2(
+                vis_slot,
+                _AAA_STAGE_ALL_COMMANDS,
+                Int(ACCESS_SHADER_READ),
+                PIPELINE_TRANSFER,
+                Int(ACCESS_TRANSFER_WRITE),
+            )
+        for mc_i in range(len(mat_stage_copies)):
+            self.staging_ring.record_copy(
+                self.vk, vis_slot, cur_slot, mat_stage_copies[mc_i][1], self.buf_materials, mat_stage_copies[mc_i][0]
             )
         self.vk.fill_buffer(vis_slot, self.ring_indirect[cur_slot], 0, 16, 0)
         self.vk.fill_buffer(vis_slot, self.buf_indirect_phase2, 0, 16, 0)
@@ -7923,6 +8113,9 @@ struct FlintAaaVulkanRenderer(Movable):
             push_ui[3] = UInt32(prims_word_offset)
             push_ui[4] = UInt32(out_ldr_off)
             push_ui[5] = disp_tonemap_mode
+            push_ui[6] = bitcast[DType.uint32](self.ui_time_sec)
+            push_ui[7] = bitcast[DType.uint32](self.ui_dpi_scale)
+            push_ui[8] = self.ui_global_flags
             push_ui[10] = UInt32(1) if is_srgb_sw else UInt32(0)
 
             if direct_used_gfx:

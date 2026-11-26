@@ -69,6 +69,7 @@ from flint.core.jobs import (
     run_jobs,
     run_jobs_affine,
 )
+from flint.core.lz4 import lz4_pack
 from flint.core.math import Vec3, Quat, Mat4
 from flint.core.memory import (
     Arena,
@@ -87,7 +88,7 @@ from flint.core.memory import (
 from flint.core.profiler import ProfileEvent, ProfileTimeline, ZONE_COUNT, ZONE_SIM, profile_ticks
 from flint.core.serial import BlobWriter, BlobReader, fourcc, fast_hash64
 from flint.core.session_replay import SessionRecorder, FLUSH_AT
-from flint.assets.json import JsonDocument
+from flint.assets.json import JsonDocument, json_i64, parse_json
 from flint.platform.dynlib import dl_open, dl_close, dl_error
 from flint.platform.os import get_time, write_bytes, remove_file, file_size, env_now, read_stream
 
@@ -97,6 +98,7 @@ from flint.ecs import (
     STORAGE_SPARSE,
     NULL_ENTITY,
     comp_hash64,
+    comp_hash64_str,
     Entity,
     Component,
     ComponentBitSet,
@@ -124,6 +126,8 @@ from flint.scene import (
     PrefabOverride,
     NestedPrefabRef,
     Scene,
+    SceneMigrationRegistry,
+    UnknownComponentsComponent,
 )
 from flint.app import (
     STAGE_UPDATE,
@@ -136,6 +140,17 @@ from flint.app import (
     Schedule,
     AppConfig,
     EngineApp,
+    FLINT_PLUGIN_API_VERSION,
+    FlintPluginApiV2,
+    POD_FIELD_BOOL,
+    POD_FIELD_COLOR_RGB,
+    POD_FIELD_F32,
+    POD_FIELD_INT,
+    POD_FIELD_QUAT,
+    POD_FIELD_VEC3,
+    PodComponentSchema,
+    PodFieldDesc,
+    PodSchemaRegistryResource,
     HotReloadHost,
 )
 
@@ -968,12 +983,16 @@ def _discover_mojo_shell_cmd(src_v1: String, so_v1: String, src_v2: String, so_v
             + chosen_pfx
             + "; export MODULAR_HOME=${MOJO_PREFIX}/share/max; "
             + "export LD_LIBRARY_PATH=${MOJO_PREFIX}/lib:${LD_LIBRARY_PATH:-}; "
-            + "${MOJO_PREFIX}/bin/mojo build "
+            + "${MOJO_PREFIX}/bin/mojo build -I "
+            + src_dir
+            + " "
             + src_v1
             + " --emit shared-lib -o "
             + so_v1
             + " -O0 --Werror 2>/dev/null & "
-            + "${MOJO_PREFIX}/bin/mojo build "
+            + "${MOJO_PREFIX}/bin/mojo build -I "
+            + src_dir
+            + " "
             + src_v2
             + " --emit shared-lib -o "
             + so_v2
@@ -982,13 +1001,17 @@ def _discover_mojo_shell_cmd(src_v1: String, so_v1: String, src_v2: String, so_v
     var mojo_bin = env_mojo if env_mojo.byte_length() > 0 else String("mojo")
     return (
         mojo_bin
-        + " build "
+        + " build -I "
+        + src_dir
+        + " "
         + src_v1
         + " --emit shared-lib -o "
         + so_v1
         + " -O0 --Werror 2>/dev/null & "
         + mojo_bin
-        + " build "
+        + " build -I "
+        + src_dir
+        + " "
         + src_v2
         + " --emit shared-lib -o "
         + so_v2
@@ -997,27 +1020,17 @@ def _discover_mojo_shell_cmd(src_v1: String, so_v1: String, src_v2: String, so_v
 
 
 def _guest_plugin_source(rate_per_sec: String, version_tag: String, res_words: String) -> String:
-    var s = String("@fieldwise_init\n")
-    s += "struct GuestApiV1(Copyable, ImplicitlyCopyable, Movable):\n"
-    s += "    var abi_version: UInt64\n"
-    s += "    var spawn_empty: def(Int) thin abi(\"C\") -> UInt64\n"
-    s += "    var despawn: def(Int, UInt64) thin abi(\"C\") -> Int32\n"
-    s += "    var is_alive: def(Int, UInt64) thin abi(\"C\") -> Int32\n"
-    s += "    var entity_count: def(Int) thin abi(\"C\") -> Int\n"
-    s += "    var register_pod_component: def(Int, UInt64, Int, Int, Int) thin abi(\"C\") -> Int\n"
-    s += "    var insert_raw_pod: def(Int, UInt64, Int, Int) thin abi(\"C\") -> Int32\n"
-    s += "    var get_raw_ptr_mut: def(Int, UInt64, Int) thin abi(\"C\") -> Int\n"
-    s += "    var for_each_pod1: def(Int, Int, def(UInt64, Int, Float32) thin abi(\"C\") -> None, Float32) thin abi(\"C\") -> Int\n"
-    s += "    var upsert_pod_resource: def(Int, UInt64, Int, Int) thin abi(\"C\") -> Int\n"
-    s += "    var get_resource_ptr: def(Int, UInt64) thin abi(\"C\") -> Int\n\n"
+    var s = String("from flint.app import FLINT_PLUGIN_API_VERSION, FlintPluginApiV2\n\n")
     s += "@export(\"flint_plugin_api_version\")\n"
     s += "def flint_plugin_api_version() abi(\"C\") -> UInt32:\n"
-    s += "    return 1\n\n"
+    s += "    return FLINT_PLUGIN_API_VERSION\n\n"
     s += "def _step_energy(_ebits: UInt64, ptr: Int, dt: Float32) abi(\"C\"):\n"
     s += "    Pointer[Float32, MutAnyOrigin](unsafe_from_address=ptr)[unsafe_offset=0] += Float32(" + rate_per_sec + ") * dt\n\n"
     s += "@export(\"flint_plugin_on_load\")\n"
     s += "def flint_plugin_on_load(api_ptr: Int, world_ptr: Int, res_ptr: Int, is_reload: Int32) abi(\"C\") -> Int32:\n"
-    s += "    var api = Pointer[GuestApiV1, ImmutAnyOrigin](unsafe_from_address=api_ptr)[unsafe_offset=0]\n"
+    s += "    var api = Pointer[FlintPluginApiV2, ImmutAnyOrigin](unsafe_from_address=api_ptr)[unsafe_offset=0]\n"
+    s += "    if not api.is_valid():\n"
+    s += "        return -2\n"
     s += "    var tid = api.register_pod_component(world_ptr, UInt64(0xE4E2670000000001), 4, 4, 0)\n"
     s += "    if is_reload == 0:\n"
     s += "        var e = api.spawn_empty(world_ptr)\n"
@@ -1035,9 +1048,61 @@ def _guest_plugin_source(rate_per_sec: String, version_tag: String, res_words: S
     s += "    return 0\n\n"
     s += "@export(\"flint_plugin_on_step\")\n"
     s += "def flint_plugin_on_step(api_ptr: Int, world_ptr: Int, _res_ptr: Int, dt: Float32) abi(\"C\") -> Int32:\n"
-    s += "    var api = Pointer[GuestApiV1, ImmutAnyOrigin](unsafe_from_address=api_ptr)[unsafe_offset=0]\n"
+    s += "    var api = Pointer[FlintPluginApiV2, ImmutAnyOrigin](unsafe_from_address=api_ptr)[unsafe_offset=0]\n"
+    s += "    if not api.is_valid():\n"
+    s += "        return -2\n"
     s += "    var tid = api.register_pod_component(world_ptr, UInt64(0xE4E2670000000001), 4, 4, 0)\n"
-    s += "    return Int32(api.for_each_pod1(world_ptr, tid, _step_energy, dt))\n"
+    s += "    return Int32(api.for_each_pod1(world_ptr, tid, _step_energy, dt))\n\n"
+    s += "@export(\"flint_plugin_on_unload\")\n"
+    s += "def flint_plugin_on_unload(_api_ptr: Int, _world_ptr: Int, _res_ptr: Int, _is_reload: Int32) abi(\"C\") -> None:\n"
+    s += "    pass\n"
+    return s^
+
+
+def _guest_plugin_v1_source() -> String:
+    var s = String("@fieldwise_init\n")
+    s += "struct GuestApiV1(Copyable, ImplicitlyCopyable, Movable):\n"
+    s += "    var abi_version: UInt64\n"
+    s += "    var spawn_empty: def(Int) thin abi(\"C\") -> UInt64\n"
+    s += "    var despawn: def(Int, UInt64) thin abi(\"C\") -> Int32\n"
+    s += "    var is_alive: def(Int, UInt64) thin abi(\"C\") -> Int32\n"
+    s += "    var entity_count: def(Int) thin abi(\"C\") -> Int\n"
+    s += "    var register_pod_component: def(Int, UInt64, Int, Int, Int) thin abi(\"C\") -> Int\n"
+    s += "    var insert_raw_pod: def(Int, UInt64, Int, Int) thin abi(\"C\") -> Int32\n"
+    s += "    var get_raw_ptr_mut: def(Int, UInt64, Int) thin abi(\"C\") -> Int\n"
+    s += "    var for_each_pod1: def(Int, Int, def(UInt64, Int, Float32) thin abi(\"C\") -> None, Float32) thin abi(\"C\") -> Int\n"
+    s += "    var upsert_pod_resource: def(Int, UInt64, Int, Int) thin abi(\"C\") -> Int\n"
+    s += "    var get_resource_ptr: def(Int, UInt64) thin abi(\"C\") -> Int\n\n"
+    s += "@export(\"flint_plugin_api_version\")\n"
+    s += "def flint_plugin_api_version() abi(\"C\") -> UInt32:\n"
+    s += "    return 1\n\n"
+    s += "@export(\"flint_plugin_on_load\")\n"
+    s += "def flint_plugin_on_load(api_ptr: Int, _world_ptr: Int, _res_ptr: Int, _is_reload: Int32) abi(\"C\") -> Int32:\n"
+    s += "    var api = Pointer[GuestApiV1, ImmutAnyOrigin](unsafe_from_address=api_ptr)[unsafe_offset=0]\n"
+    s += "    return 0 if api.abi_version == 1 else -1\n\n"
+    s += "@export(\"flint_plugin_on_step\")\n"
+    s += "def flint_plugin_on_step(_api_ptr: Int, _world_ptr: Int, _res_ptr: Int, _dt: Float32) abi(\"C\") -> Int32:\n"
+    s += "    return 7\n"
+    return s^
+
+
+def _guest_plugin_abi_version_source(ver: Int) -> String:
+    var s = String("@export(\"flint_plugin_api_version\")\n")
+    s += "def flint_plugin_api_version() abi(\"C\") -> UInt32:\n"
+    s += "    return UInt32(" + String(ver) + ")\n\n"
+    s += "@export(\"flint_plugin_on_step\")\n"
+    s += "def flint_plugin_on_step(_api_ptr: Int, _world_ptr: Int, _res_ptr: Int, _dt: Float32) abi(\"C\") -> Int32:\n"
+    s += "    return 99\n"
+    return s^
+
+
+def _guest_plugin_missing_step_source() -> String:
+    var s = String("@export(\"flint_plugin_api_version\")\n")
+    s += "def flint_plugin_api_version() abi(\"C\") -> UInt32:\n"
+    s += "    return 2\n\n"
+    s += "@export(\"flint_plugin_on_load\")\n"
+    s += "def flint_plugin_on_load(_api_ptr: Int, _world_ptr: Int, _res_ptr: Int, _is_reload: Int32) abi(\"C\") -> Int32:\n"
+    s += "    return 0\n"
     return s^
 
 
@@ -1105,14 +1170,691 @@ def test_f_live_so_plugin_hot_reload() raises:
     )[unsafe_offset=0]
     assert_true(abs(val_after_v2 - Float32(115.0)) < Float32(1.0e-4))
 
+    var src_compat_v1 = "/tmp/flint-eng1-guest-compat-v1.mojo"
+    var so_compat_v1 = "/tmp/flint-eng1-guest-compat-v1.so"
+    var src_v99 = "/tmp/flint-eng1-guest-v99.mojo"
+    var so_v99 = "/tmp/flint-eng1-guest-v99.so"
+    var src_missing_step = "/tmp/flint-eng1-guest-missing-step.mojo"
+    var so_missing_step = "/tmp/flint-eng1-guest-missing-step.so"
+    var so_corrupt = "/tmp/flint-eng1-guest-corrupt.so"
+    assert_true(_write_text_file(src_compat_v1, _guest_plugin_v1_source()))
+    assert_true(_write_text_file(src_v99, _guest_plugin_abi_version_source(99)))
+    assert_true(_write_text_file(src_missing_step, _guest_plugin_missing_step_source()))
+    assert_true(_write_text_file(so_corrupt, "NOT_AN_ELF_SHARED_OBJECT_12345"))
+    var compat_cmd = _discover_mojo_shell_cmd(src_compat_v1, so_compat_v1, src_v99, so_v99)
+    assert_equal(Int(external_call["system", Int32](compat_cmd.as_c_string_span())), 0)
+    var missing_cmd = _discover_mojo_shell_cmd(src_missing_step, so_missing_step, src_missing_step, so_missing_step)
+    assert_equal(Int(external_call["system", Int32](missing_cmd.as_c_string_span())), 0)
+
+    # Failed reload attempts on corrupt, ABI-v1, ABI-v99, and missing-symbol .so must preserve active v2 plugin!
+    var saved_temp_path = host.active_temp_path
+    assert_true(not host.load_or_reload(so_corrupt, world, resources))
+    assert_true(host.is_loaded())
+    assert_equal(host.active_temp_path, saved_temp_path)
+    assert_equal(Int(host.step(world, resources, Float32(0.0))), 1)
+
+    assert_true(not host.load_or_reload(so_compat_v1, world, resources))
+    assert_true(host.last_error.find("mismatch") >= 0)
+    assert_true(host.is_loaded())
+    assert_equal(host.active_temp_path, saved_temp_path)
+    assert_equal(Int(host.step(world, resources, Float32(0.0))), 1)
+
+    assert_true(not host.load_or_reload(so_v99, world, resources))
+    assert_true(host.last_error.find("mismatch") >= 0)
+    assert_true(host.is_loaded())
+    assert_equal(host.active_temp_path, saved_temp_path)
+    assert_equal(Int(host.step(world, resources, Float32(0.0))), 1)
+
+    assert_true(not host.load_or_reload(so_missing_step, world, resources))
+    assert_true(host.last_error.find("flint_plugin_on_step") >= 0)
+    assert_true(host.is_loaded())
+    assert_equal(host.active_temp_path, saved_temp_path)
+    assert_equal(Int(host.step(world, resources, Float32(0.5))), 1)
+    var val_after_failed_reloads = Pointer[Float32, ImmutAnyOrigin](
+        unsafe_from_address=world.get_raw_ptr(e0, tid_energy)
+    )[unsafe_offset=0]
+    assert_true(abs(val_after_failed_reloads - Float32(165.0)) < Float32(1.0e-4))
+
     assert_true(host.unload(world, resources, is_reload=False), "Final dl_close unload must succeed cleanly")
     assert_true(not host.is_loaded())
     _ = size_of[Entity]()
+
+    # Also verify allow_v1=False rejects ABI v1 with "mismatch" while allow_v1=True accepts it
+    var strict_host = HotReloadHost("/tmp/flint-eng1-strict-stage")
+    assert_true(not strict_host.load_or_reload(so_compat_v1, world, resources))
+    assert_true(strict_host.last_error.find("mismatch") >= 0)
+
+    var compat_host = HotReloadHost("/tmp/flint-eng1-compat-stage", allow_v1=True)
+    assert_true(compat_host.load_or_reload(so_compat_v1, world, resources), compat_host.last_error)
+    assert_equal(Int(compat_host.step(world, resources, Float32(0.1))), 7)
+    assert_true(compat_host.unload(world, resources))
 
     _ = remove_file(src_v1)
     _ = remove_file(src_v2)
     _ = remove_file(so_v1)
     _ = remove_file(so_v2)
+    _ = remove_file(src_compat_v1)
+    _ = remove_file(so_compat_v1)
+    _ = remove_file(src_v99)
+    _ = remove_file(so_v99)
+    _ = remove_file(src_missing_step)
+    _ = remove_file(so_missing_step)
+    _ = remove_file(so_corrupt)
+
+
+def test_u_m5a_pod_schema_and_registry_add_remove() raises:
+    assert_equal(Int(FLINT_PLUGIN_API_VERSION), 2)
+    assert_equal(comp_hash64_str("LocalTransform"), comp_hash64("LocalTransform"))
+
+    var api = FlintPluginApiV2()
+    assert_true(api.is_valid())
+    assert_equal(Int(api.struct_size), size_of[FlintPluginApiV2]())
+
+    var schema = PodComponentSchema("M5aPodStats", 24, 4, STORAGE_TABLE)
+    assert_true(schema.add_field(PodFieldDesc("hp", POD_FIELD_F32, 0, 4)))
+    assert_true(schema.add_field(PodFieldDesc("level", POD_FIELD_INT, 4, 4)))
+    assert_true(schema.add_field(PodFieldDesc("alive", POD_FIELD_BOOL, 8, 1)))
+    assert_true(schema.add_field(PodFieldDesc("home", POD_FIELD_VEC3, 12, 12)))
+    assert_true(schema.validate())
+
+    # Out-of-bounds, duplicate field, and invalid alignment rejection
+    assert_true(not schema.add_field(PodFieldDesc("hp", POD_FIELD_F32, 0, 4)))
+    assert_true(not schema.add_field(PodFieldDesc("oob", POD_FIELD_F32, 22, 4)))
+    var bad_align = PodComponentSchema("BadAlignPod", 8, 3)
+    assert_true(not bad_align.validate())
+
+    # Value-marshal encode/decode + FlintPluginApiV2.register_schema
+    var encoded = schema.encode_bytes()
+    var decoded = PodComponentSchema.decode_bytes(encoded^)
+    assert_true(decoded.matches_layout(schema))
+
+    var w = World()
+    var res = Resources()
+    var tid = api.register_schema(Int(Pointer(to=w)), Int(Pointer(to=res)), schema)
+    assert_true(tid >= 0)
+    var psreg = res.get_ptr[PodSchemaRegistryResource]()
+    assert_true(Bool(psreg))
+    assert_equal(Int(psreg.value()[unsafe_offset=0].epoch), 1)
+    assert_equal(psreg.value()[unsafe_offset=0].find_schema("M5aPodStats"), 0)
+
+    # Zero-fill on insert_raw_pod with src_ptr=0
+    var e0 = w.spawn_empty()
+    assert_true(w.insert_raw_pod(e0, tid, 0))
+    var ptr0 = w.get_raw_ptr(e0, tid)
+    assert_true(ptr0 != 0)
+    for bi in range(24):
+        assert_equal(Int(Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=ptr0 + bi)[unsafe_offset=0]), 0)
+
+    # ComponentRegistry register_pod_schema, insert_default_on_entity, remove_from_entity, and round-trips
+    var reg = ComponentRegistry.with_builtins()
+    assert_true(reg.register_pod_schema(schema))
+    assert_true(reg.register_pod_schema(schema))  # idempotent on matching layout
+    var e1 = w.spawn_empty()
+    assert_true(reg.insert_default_on_entity(w, e1, "LocalTransform"))
+    assert_true(not reg.insert_default_on_entity(w, e1, "LocalTransform"))  # duplicate rejected
+    assert_true(w.has[LocalTransform](e1))
+    assert_true(reg.insert_default_on_entity(w, e1, "M5aPodStats"))
+    assert_true(not reg.insert_default_on_entity(w, e1, "M5aPodStats"))
+    assert_true(w.has_by_type_id(e1, tid))
+
+    var m_ptr = w.get_raw_ptr_mut(e1, tid)
+    assert_true(m_ptr != 0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=m_ptr)[unsafe_offset=0] = Float32(75.5)
+    Pointer[Int32, MutAnyOrigin](unsafe_from_address=m_ptr + 4)[unsafe_offset=0] = Int32(9)
+    Pointer[UInt8, MutAnyOrigin](unsafe_from_address=m_ptr + 8)[unsafe_offset=0] = UInt8(1)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=m_ptr + 12)[unsafe_offset=0] = Float32(3.5)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=m_ptr + 16)[unsafe_offset=0] = Float32(-1.25)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=m_ptr + 20)[unsafe_offset=0] = Float32(7.75)
+
+    var orig_csum = w.state_checksum()
+    var sc = Scene("M5aPodScene")
+    var json_str = sc.save_flscn_string(w, reg)
+    var bin_bytes = sc.save_flscnb_bytes(w, reg)
+
+    var w_j = World()
+    var j_bytes = List[UInt8](capacity=json_str.byte_length())
+    for b in json_str.as_bytes():
+        j_bytes.append(b)
+    assert_true(sc.load_flscn_bytes(w_j, reg, j_bytes))
+    var tid_j = w_j.find_component_by_hash(schema.component_hash)
+    assert_true(tid_j >= 0)
+    var ents_j = w_j.query_entities(BitSet256().with_bit(tid_j))
+    assert_equal(len(ents_j), 2)
+    assert_equal(w_j.state_checksum(), orig_csum)
+    var checked_j_pop = False
+    var checked_j_zero = False
+    for i in range(len(ents_j)):
+        var ej = ents_j[i]
+        var pj = w_j.get_raw_ptr(ej, tid_j)
+        assert_true(pj != 0)
+        if w_j.has[LocalTransform](ej):
+            assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pj)[unsafe_offset=0], Float32(75.5))
+            assert_equal(Pointer[Int32, ImmutAnyOrigin](unsafe_from_address=pj + 4)[unsafe_offset=0], Int32(9))
+            assert_equal(Int(Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=pj + 8)[unsafe_offset=0]), 1)
+            assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pj + 12)[unsafe_offset=0], Float32(3.5))
+            assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pj + 16)[unsafe_offset=0], Float32(-1.25))
+            assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pj + 20)[unsafe_offset=0], Float32(7.75))
+            checked_j_pop = True
+        else:
+            for bi in range(24):
+                assert_equal(Int(Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=pj + bi)[unsafe_offset=0]), 0)
+            checked_j_zero = True
+    assert_true(checked_j_pop and checked_j_zero)
+
+    var w_b = World()
+    assert_true(sc.load_flscnb_bytes(w_b, reg, bin_bytes))
+    var tid_b = w_b.find_component_by_hash(schema.component_hash)
+    assert_true(tid_b >= 0)
+    var ents_b = w_b.query_entities(BitSet256().with_bit(tid_b))
+    assert_equal(len(ents_b), 2)
+    assert_equal(w_b.state_checksum(), orig_csum)
+    var checked_b_pop = False
+    for i in range(len(ents_b)):
+        var eb = ents_b[i]
+        if w_b.has[LocalTransform](eb):
+            var pb = w_b.get_raw_ptr(eb, tid_b)
+            assert_true(pb != 0)
+            assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pb)[unsafe_offset=0], Float32(75.5))
+            assert_equal(Pointer[Int32, ImmutAnyOrigin](unsafe_from_address=pb + 4)[unsafe_offset=0], Int32(9))
+            assert_equal(Int(Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=pb + 8)[unsafe_offset=0]), 1)
+            assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pb + 12)[unsafe_offset=0], Float32(3.5))
+            assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pb + 16)[unsafe_offset=0], Float32(-1.25))
+            assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pb + 20)[unsafe_offset=0], Float32(7.75))
+            checked_b_pop = True
+    assert_true(checked_b_pop)
+
+    var snap = BlobWriter()
+    w.snapshot_blob(snap)
+    var w_s = World()
+    reg.ensure_registered_in_world(w_s)
+    var snap_r = BlobReader(snap.data.copy())
+    w_s.restore_blob(snap_r)
+    assert_equal(w_s.entity_count(), 2)
+    assert_equal(w_s.state_checksum(), orig_csum)
+    var tid_s = w_s.find_component_by_hash(schema.component_hash)
+    assert_true(tid_s >= 0)
+    assert_equal(len(w_s.query_entities(BitSet256().with_bit(tid_s))), 2)
+
+    assert_true(reg.remove_from_entity(w, e1, "M5aPodStats"))
+    assert_true(not reg.remove_from_entity(w, e1, "M5aPodStats"))
+    assert_true(not w.has_by_type_id(e1, tid))
+    assert_true(reg.remove_from_entity(w, e1, "LocalTransform"))
+    assert_true(not w.has[LocalTransform](e1))
+
+    # PodSchemaRegistryResource rejects hash/fourcc collisions across distinct names
+    var psreg_col = PodSchemaRegistryResource()
+    var schema_alpha = PodComponentSchema("AlphaPod", 8, 4, STORAGE_TABLE)
+    assert_true(psreg_col.register_schema(schema_alpha))
+    var dup_fourcc = PodComponentSchema("BetaPod", 8, 4, STORAGE_TABLE)
+    dup_fourcc.schema_fourcc = schema_alpha.schema_fourcc
+    assert_true(not psreg_col.register_schema(dup_fourcc))
+    var dup_hash = PodComponentSchema("GammaPod", 8, 4, STORAGE_TABLE)
+    dup_hash.component_hash = schema_alpha.component_hash
+    assert_true(not psreg_col.register_schema(dup_hash))
+
+    # Fieldless PodComponentSchema (__raw_hex__) round-trips byte-for-byte through .flscn
+    var raw_schema = PodComponentSchema("RawHexPod", 8, 4, STORAGE_TABLE)
+    assert_true(reg.register_pod_schema(raw_schema))
+    var w_raw = World()
+    reg.ensure_registered_in_world(w_raw)
+    var tid_raw = w_raw.find_component_by_hash(raw_schema.component_hash)
+    assert_true(tid_raw >= 0)
+    var e_raw = w_raw.spawn_empty()
+    assert_true(reg.insert_default_on_entity(w_raw, e_raw, "RawHexPod"))
+    var rptr_w = w_raw.get_raw_ptr_mut(e_raw, tid_raw)
+    assert_true(rptr_w != 0)
+    Pointer[UInt32, MutAnyOrigin](unsafe_from_address=rptr_w)[unsafe_offset=0] = UInt32(0xDEADBEEF)
+    Pointer[UInt32, MutAnyOrigin](unsafe_from_address=rptr_w + 4)[unsafe_offset=0] = UInt32(0xCAFEBABE)
+
+    var sc_raw = Scene("RawHexScene")
+    var raw_json = sc_raw.save_flscn_string(w_raw, reg)
+    assert_true(raw_json.find("__raw_hex__") >= 0)
+    var raw_jbytes = List[UInt8](capacity=raw_json.byte_length())
+    for b in raw_json.as_bytes():
+        raw_jbytes.append(b)
+    var w_raw_out = World()
+    _ = sc_raw.load_flscn_bytes(w_raw_out, reg, raw_jbytes)
+    var tid_raw_out = w_raw_out.find_component_by_hash(raw_schema.component_hash)
+    assert_true(tid_raw_out >= 0)
+    var ents_raw_out = w_raw_out.query_entities(BitSet256().with_bit(tid_raw_out))
+    assert_equal(len(ents_raw_out), 1)
+    var rptr_out = w_raw_out.get_raw_ptr(ents_raw_out[0], tid_raw_out)
+    assert_true(rptr_out != 0)
+    assert_equal(Pointer[UInt32, ImmutAnyOrigin](unsafe_from_address=rptr_out)[unsafe_offset=0], UInt32(0xDEADBEEF))
+    assert_equal(Pointer[UInt32, ImmutAnyOrigin](unsafe_from_address=rptr_out + 4)[unsafe_offset=0], UInt32(0xCAFEBABE))
+
+    # Full multi-field PodComponentSchema covering BOOL (1B & 4B), INT (4B & 8B),
+    # F32, VEC3, COLOR_RGB, and QUAT through .flscn and .flscnb under -O3
+    var full_schema = PodComponentSchema("FullFieldsPod", 64, 8, STORAGE_TABLE)
+    assert_true(full_schema.add_field(PodFieldDesc("flag1", POD_FIELD_BOOL, 0, 1)))
+    assert_true(full_schema.add_field(PodFieldDesc("flag4", POD_FIELD_BOOL, 4, 4)))
+    assert_true(full_schema.add_field(PodFieldDesc("i32v", POD_FIELD_INT, 8, 4)))
+    assert_true(full_schema.add_field(PodFieldDesc("f32v", POD_FIELD_F32, 12, 4)))
+    assert_true(full_schema.add_field(PodFieldDesc("i64v", POD_FIELD_INT, 16, 8)))
+    assert_true(full_schema.add_field(PodFieldDesc("vec3v", POD_FIELD_VEC3, 24, 12)))
+    assert_true(full_schema.add_field(PodFieldDesc("colv", POD_FIELD_COLOR_RGB, 36, 12)))
+    assert_true(full_schema.add_field(PodFieldDesc("quatv", POD_FIELD_QUAT, 48, 16)))
+    assert_true(full_schema.validate())
+    assert_true(reg.register_pod_schema(full_schema))
+
+    var w_full = World()
+    reg.ensure_registered_in_world(w_full)
+    var tid_full = w_full.find_component_by_hash(full_schema.component_hash)
+    assert_true(tid_full >= 0)
+
+    var ef1 = w_full.spawn_empty()
+    assert_true(reg.insert_default_on_entity(w_full, ef1, "FullFieldsPod"))
+    var fp1 = w_full.get_raw_ptr_mut(ef1, tid_full)
+    assert_true(fp1 != 0)
+    Pointer[UInt8, MutAnyOrigin](unsafe_from_address=fp1)[unsafe_offset=0] = UInt8(1)
+    Pointer[UInt32, MutAnyOrigin](unsafe_from_address=fp1 + 4)[unsafe_offset=0] = UInt32(1)
+    Pointer[Int32, MutAnyOrigin](unsafe_from_address=fp1 + 8)[unsafe_offset=0] = Int32(-42)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 12)[unsafe_offset=0] = Float32(75.5)
+    Pointer[Int64, MutAnyOrigin](unsafe_from_address=fp1 + 16)[unsafe_offset=0] = Int64(1234567890123)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 24)[unsafe_offset=0] = Float32(1.5)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 28)[unsafe_offset=0] = Float32(-2.25)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 32)[unsafe_offset=0] = Float32(3.75)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 36)[unsafe_offset=0] = Float32(0.25)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 40)[unsafe_offset=0] = Float32(0.5)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 44)[unsafe_offset=0] = Float32(0.75)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 48)[unsafe_offset=0] = Float32(0.125)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 52)[unsafe_offset=0] = Float32(-0.25)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 56)[unsafe_offset=0] = Float32(0.5)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp1 + 60)[unsafe_offset=0] = Float32(0.75)
+
+    var ef2 = w_full.spawn_empty()
+    assert_true(reg.insert_default_on_entity(w_full, ef2, "LocalTransform"))
+    assert_true(reg.insert_default_on_entity(w_full, ef2, "FullFieldsPod"))
+    var fp2 = w_full.get_raw_ptr_mut(ef2, tid_full)
+    assert_true(fp2 != 0)
+    Pointer[UInt8, MutAnyOrigin](unsafe_from_address=fp2)[unsafe_offset=0] = UInt8(0)
+    Pointer[UInt32, MutAnyOrigin](unsafe_from_address=fp2 + 4)[unsafe_offset=0] = UInt32(0)
+    Pointer[Int32, MutAnyOrigin](unsafe_from_address=fp2 + 8)[unsafe_offset=0] = Int32(0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 12)[unsafe_offset=0] = Float32(-0.5)
+    Pointer[Int64, MutAnyOrigin](unsafe_from_address=fp2 + 16)[unsafe_offset=0] = Int64(-987654321098)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 24)[unsafe_offset=0] = Float32(0.0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 28)[unsafe_offset=0] = Float32(0.0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 32)[unsafe_offset=0] = Float32(0.0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 36)[unsafe_offset=0] = Float32(1.0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 40)[unsafe_offset=0] = Float32(0.0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 44)[unsafe_offset=0] = Float32(0.5)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 48)[unsafe_offset=0] = Float32(0.0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 52)[unsafe_offset=0] = Float32(0.0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 56)[unsafe_offset=0] = Float32(0.0)
+    Pointer[Float32, MutAnyOrigin](unsafe_from_address=fp2 + 60)[unsafe_offset=0] = Float32(1.0)
+
+    var full_csum = w_full.state_checksum()
+    var sc_full = Scene("FullFieldsScene")
+    var full_json = sc_full.save_flscn_string(w_full, reg)
+    var full_bin = sc_full.save_flscnb_bytes(w_full, reg)
+
+    var full_jbytes = List[UInt8](capacity=full_json.byte_length())
+    for b in full_json.as_bytes():
+        full_jbytes.append(b)
+    var w_full_j = World()
+    assert_true(sc_full.load_flscn_bytes(w_full_j, reg, full_jbytes))
+    assert_equal(w_full_j.state_checksum(), full_csum)
+
+    var w_full_b = World()
+    assert_true(sc_full.load_flscnb_bytes(w_full_b, reg, full_bin))
+    assert_equal(w_full_b.state_checksum(), full_csum)
+
+    for pass_idx in range(2):
+        var check_ptr = Int(Pointer(to=w_full_j)) if pass_idx == 0 else Int(Pointer(to=w_full_b))
+        ref w_chk = Pointer[World, ImmutAnyOrigin](unsafe_from_address=check_ptr)[unsafe_offset=0]
+        var tid_chk = w_chk.find_component_by_hash(full_schema.component_hash)
+        assert_true(tid_chk >= 0)
+        var ents_chk = w_chk.query_entities(BitSet256().with_bit(tid_chk))
+        assert_equal(len(ents_chk), 2)
+        var saw_f1 = False
+        var saw_f2 = False
+        for ei in range(len(ents_chk)):
+            var ent = ents_chk[ei]
+            var fp = w_chk.get_raw_ptr(ent, tid_chk)
+            assert_true(fp != 0)
+            if not w_chk.has[LocalTransform](ent):
+                assert_equal(Int(Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=fp)[unsafe_offset=0]), 1)
+                assert_equal(Pointer[UInt32, ImmutAnyOrigin](unsafe_from_address=fp + 4)[unsafe_offset=0], UInt32(1))
+                assert_equal(Pointer[Int32, ImmutAnyOrigin](unsafe_from_address=fp + 8)[unsafe_offset=0], Int32(-42))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 12)[unsafe_offset=0], Float32(75.5))
+                assert_equal(Pointer[Int64, ImmutAnyOrigin](unsafe_from_address=fp + 16)[unsafe_offset=0], Int64(1234567890123))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 24)[unsafe_offset=0], Float32(1.5))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 28)[unsafe_offset=0], Float32(-2.25))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 32)[unsafe_offset=0], Float32(3.75))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 36)[unsafe_offset=0], Float32(0.25))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 40)[unsafe_offset=0], Float32(0.5))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 44)[unsafe_offset=0], Float32(0.75))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 48)[unsafe_offset=0], Float32(0.125))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 52)[unsafe_offset=0], Float32(-0.25))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 56)[unsafe_offset=0], Float32(0.5))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 60)[unsafe_offset=0], Float32(0.75))
+                saw_f1 = True
+            else:
+                assert_equal(Int(Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=fp)[unsafe_offset=0]), 0)
+                assert_equal(Pointer[UInt32, ImmutAnyOrigin](unsafe_from_address=fp + 4)[unsafe_offset=0], UInt32(0))
+                assert_equal(Pointer[Int32, ImmutAnyOrigin](unsafe_from_address=fp + 8)[unsafe_offset=0], Int32(0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 12)[unsafe_offset=0], Float32(-0.5))
+                assert_equal(Pointer[Int64, ImmutAnyOrigin](unsafe_from_address=fp + 16)[unsafe_offset=0], Int64(-987654321098))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 24)[unsafe_offset=0], Float32(0.0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 28)[unsafe_offset=0], Float32(0.0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 32)[unsafe_offset=0], Float32(0.0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 36)[unsafe_offset=0], Float32(1.0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 40)[unsafe_offset=0], Float32(0.0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 44)[unsafe_offset=0], Float32(0.5))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 48)[unsafe_offset=0], Float32(0.0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 52)[unsafe_offset=0], Float32(0.0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 56)[unsafe_offset=0], Float32(0.0))
+                assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=fp + 60)[unsafe_offset=0], Float32(1.0))
+                saw_f2 = True
+        assert_true(saw_f1 and saw_f2)
+    _ = w_full_j.entity_count()
+    _ = w_full_b.entity_count()
+
+
+def _assert_all_zero_12(ptr: Int) raises:
+    assert_true(ptr != 0)
+    for bi in range(12):
+        assert_equal(Int(Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=ptr + bi)[unsafe_offset=0]), 0)
+
+
+def test_v_m5a_pod_uaf_and_int64_regressions() raises:
+    # 0. Exact JsonDocument.i64 / JsonDocument.integer / json_i64 edge & overflow checks
+    var j_raw = String(
+        '{"min":-9223372036854775808,"max":9223372036854775807,'
+        '"p53":9007199254740993,"n53":-9007199254740993,"neg0":-0,'
+        '"dec":42.9,"sci":1e5,"ovf":9223372036854775808,'
+        '"unf":-9223372036854775809,"huge":99999999999999999999,'
+        '"big":1e999,"neg":-1e999}'
+    )
+    var jb = List[UInt8](capacity=j_raw.byte_length())
+    for ch in j_raw.as_bytes():
+        jb.append(ch)
+    var jdoc = parse_json(jb)
+    assert_true(jdoc.valid)
+    var i64_min = bitcast[DType.int64](UInt64(0x8000000000000000))
+    var i64_max = Int64(9223372036854775807)
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "min"), 0), i64_min)
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "max"), 0), i64_max)
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "p53"), 0), Int64(9007199254740993))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "n53"), 0), Int64(-9007199254740993))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "neg0"), -1), Int64(0))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "dec"), -1), Int64(42))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "sci"), -1), Int64(100000))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "ovf"), -11), Int64(-11))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "unf"), -12), Int64(-12))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "huge"), -13), Int64(-13))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "big"), -14), Int64(-14))
+    assert_equal(jdoc.i64(jdoc.object_get(jdoc.root, "neg"), -15), Int64(-15))
+    assert_equal(json_i64(jdoc, jdoc.object_get(jdoc.root, "min"), 0), i64_min)
+    assert_equal(jdoc.integer(jdoc.object_get(jdoc.root, "min"), 0), Int(i64_min))
+    assert_equal(jdoc.integer(jdoc.object_get(jdoc.root, "max"), 0), Int(i64_max))
+    assert_equal(jdoc.integer(jdoc.object_get(jdoc.root, "p53"), 0), 9007199254740993)
+    assert_equal(jdoc.integer(jdoc.object_get(jdoc.root, "big"), -1), -1)
+    assert_equal(jdoc.integer(jdoc.object_get(jdoc.root, "neg"), -7), -7)
+
+    # Subtest A: -O3 ASAP-destructor UAF on 12-byte all-zero PODs (NanPodT, NanPodS, RawZero12)
+    var nan_t = PodComponentSchema("NanPodT", 12, 4, STORAGE_TABLE)
+    assert_true(nan_t.add_field(PodFieldDesc("x", POD_FIELD_F32, 0, 4)))
+    assert_true(nan_t.add_field(PodFieldDesc("y", POD_FIELD_F32, 4, 4)))
+    assert_true(nan_t.add_field(PodFieldDesc("z", POD_FIELD_F32, 8, 4)))
+    assert_true(nan_t.validate())
+
+    var nan_s = PodComponentSchema("NanPodS", 12, 4, STORAGE_SPARSE)
+    assert_true(nan_s.add_field(PodFieldDesc("x", POD_FIELD_F32, 0, 4)))
+    assert_true(nan_s.add_field(PodFieldDesc("y", POD_FIELD_F32, 4, 4)))
+    assert_true(nan_s.add_field(PodFieldDesc("z", POD_FIELD_F32, 8, 4)))
+    assert_true(nan_s.validate())
+
+    var raw_z = PodComponentSchema("RawZero12", 12, 4, STORAGE_TABLE)
+    assert_true(raw_z.validate())
+
+    var reg_a = ComponentRegistry.with_builtins()
+    assert_true(reg_a.register_pod_schema(nan_t))
+    assert_true(reg_a.register_pod_schema(nan_s))
+    assert_true(reg_a.register_pod_schema(raw_z))
+
+    # Pre-churn glibc tcache with 12-byte List[UInt8] allocations
+    for ci in range(32):
+        var tmp_churn = List[UInt8](length=12, fill=UInt8((ci * 37 + 11) & 0xFF))
+        assert_equal(len(tmp_churn), 12)
+
+    var w_def = World()
+    reg_a.ensure_registered_in_world(w_def)
+    var tid_nt = w_def.find_component_by_hash(nan_t.component_hash)
+    var tid_ns = w_def.find_component_by_hash(nan_s.component_hash)
+    var tid_rz = w_def.find_component_by_hash(raw_z.component_hash)
+    assert_true(tid_nt >= 0 and tid_ns >= 0 and tid_rz >= 0)
+
+    var ents_def = List[Entity]()
+    for _ in range(8):
+        var e = w_def.spawn_empty()
+        assert_true(reg_a.insert_default_on_entity(w_def, e, "NanPodT"))
+        assert_true(reg_a.insert_default_on_entity(w_def, e, "NanPodS"))
+        assert_true(reg_a.insert_default_on_entity(w_def, e, "RawZero12"))
+        _assert_all_zero_12(w_def.get_raw_ptr(e, tid_nt))
+        _assert_all_zero_12(w_def.get_raw_ptr(e, tid_ns))
+        _assert_all_zero_12(w_def.get_raw_ptr(e, tid_rz))
+        ents_def.append(e)
+    var orig_zero_csum = w_def.state_checksum()
+
+    # Direct read_entity_json (both fieldful and __raw_hex__)
+    var doc_f_raw = String('{"x": 0.0, "y": 0.0, "z": 0.0}')
+    var doc_f_b = List[UInt8](capacity=doc_f_raw.byte_length())
+    for ch in doc_f_raw.as_bytes():
+        doc_f_b.append(ch)
+    var doc_f = parse_json(doc_f_b)
+    assert_true(doc_f.valid)
+
+    var doc_h_raw = String('{"__raw_hex__": "000000000000000000000000"}')
+    var doc_h_b = List[UInt8](capacity=doc_h_raw.byte_length())
+    for ch in doc_h_raw.as_bytes():
+        doc_h_b.append(ch)
+    var doc_h = parse_json(doc_h_b)
+    assert_true(doc_h.valid)
+
+    var idx_nt = reg_a.find_by_name("NanPodT")
+    var idx_ns = reg_a.find_by_name("NanPodS")
+    var idx_rz = reg_a.find_by_name("RawZero12")
+    var w_rj = World()
+    reg_a.ensure_registered_in_world(w_rj)
+    for _ in range(8):
+        var e = w_rj.spawn_empty()
+        assert_true(reg_a.read_entity_json(idx_nt, w_rj, e, doc_f, doc_f.root))
+        assert_true(reg_a.read_entity_json(idx_ns, w_rj, e, doc_f, doc_f.root))
+        assert_true(reg_a.read_entity_json(idx_rz, w_rj, e, doc_h, doc_h.root))
+        _assert_all_zero_12(w_rj.get_raw_ptr(e, w_rj.find_component_by_hash(nan_t.component_hash)))
+        _assert_all_zero_12(w_rj.get_raw_ptr(e, w_rj.find_component_by_hash(nan_s.component_hash)))
+        _assert_all_zero_12(w_rj.get_raw_ptr(e, w_rj.find_component_by_hash(raw_z.component_hash)))
+    assert_equal(w_rj.state_checksum(), orig_zero_csum)
+
+    # Direct read_entity_bin
+    var bw_direct = BlobWriter()
+    assert_true(reg_a.write_entity_bin(idx_nt, w_def, ents_def[0], bw_direct))
+    assert_true(reg_a.write_entity_bin(idx_ns, w_def, ents_def[0], bw_direct))
+    assert_true(reg_a.write_entity_bin(idx_rz, w_def, ents_def[0], bw_direct))
+    var w_rb = World()
+    reg_a.ensure_registered_in_world(w_rb)
+    for _ in range(8):
+        var br_d = BlobReader(bw_direct.data.copy())
+        var e = w_rb.spawn_empty()
+        assert_true(reg_a.read_entity_bin(idx_nt, w_rb, e, br_d))
+        assert_true(reg_a.read_entity_bin(idx_ns, w_rb, e, br_d))
+        assert_true(reg_a.read_entity_bin(idx_rz, w_rb, e, br_d))
+        _assert_all_zero_12(w_rb.get_raw_ptr(e, w_rb.find_component_by_hash(nan_t.component_hash)))
+        _assert_all_zero_12(w_rb.get_raw_ptr(e, w_rb.find_component_by_hash(nan_s.component_hash)))
+        _assert_all_zero_12(w_rb.get_raw_ptr(e, w_rb.find_component_by_hash(raw_z.component_hash)))
+    assert_equal(w_rb.state_checksum(), orig_zero_csum)
+
+    # Scene .flscn & .flscnb with both clear_existing=True and clear_existing=False
+    var sc_zero = Scene("NanZeroScene")
+    var flscn_zero = sc_zero.save_flscn_bytes(w_def, reg_a)
+    var flscnb_zero = sc_zero.save_flscnb_bytes(w_def, reg_a)
+
+    for clr_idx in range(2):
+        var clr = clr_idx == 0
+        var w_sj = World()
+        var loaded_j = sc_zero.load_flscn_bytes(w_sj, reg_a, flscn_zero, clear_existing=clr)
+        assert_equal(len(loaded_j), 8)
+        assert_equal(w_sj.state_checksum(), orig_zero_csum)
+        var j_nt = w_sj.find_component_by_hash(nan_t.component_hash)
+        var j_ns = w_sj.find_component_by_hash(nan_s.component_hash)
+        var j_rz = w_sj.find_component_by_hash(raw_z.component_hash)
+        for ei in range(len(loaded_j)):
+            _assert_all_zero_12(w_sj.get_raw_ptr(loaded_j[ei], j_nt))
+            _assert_all_zero_12(w_sj.get_raw_ptr(loaded_j[ei], j_ns))
+            _assert_all_zero_12(w_sj.get_raw_ptr(loaded_j[ei], j_rz))
+
+        var w_sb = World()
+        var loaded_b = sc_zero.load_flscnb_bytes(w_sb, reg_a, flscnb_zero, clear_existing=clr)
+        assert_equal(len(loaded_b), 8)
+        assert_equal(w_sb.state_checksum(), orig_zero_csum)
+        var b_nt = w_sb.find_component_by_hash(nan_t.component_hash)
+        var b_ns = w_sb.find_component_by_hash(nan_s.component_hash)
+        var b_rz = w_sb.find_component_by_hash(raw_z.component_hash)
+        for ei in range(len(loaded_b)):
+            _assert_all_zero_12(w_sb.get_raw_ptr(loaded_b[ei], b_nt))
+            _assert_all_zero_12(w_sb.get_raw_ptr(loaded_b[ei], b_ns))
+            _assert_all_zero_12(w_sb.get_raw_ptr(loaded_b[ei], b_rz))
+
+    # Subtest B: POD_FIELD_INT (8-byte Int64) extreme & > 2^53 precision round-trip
+    var i64_tab = PodComponentSchema("I64EdgeTable", 40, 8, STORAGE_TABLE)
+    var i64_sp = PodComponentSchema("I64EdgeSparse", 40, 1, STORAGE_SPARSE)
+    var field_names = List[String]()
+    field_names.append("i_min")
+    field_names.append("i_max")
+    field_names.append("pos53")
+    field_names.append("neg53")
+    field_names.append("neg1")
+    for fi in range(5):
+        assert_true(i64_tab.add_field(PodFieldDesc(field_names[fi], POD_FIELD_INT, fi * 8, 8)))
+        assert_true(i64_sp.add_field(PodFieldDesc(field_names[fi], POD_FIELD_INT, fi * 8, 8)))
+    assert_true(i64_tab.validate() and i64_sp.validate())
+
+    var reg_b = ComponentRegistry.with_builtins()
+    assert_true(reg_b.register_pod_schema(i64_tab))
+    assert_true(reg_b.register_pod_schema(i64_sp))
+
+    var w_edge = World()
+    reg_b.ensure_registered_in_world(w_edge)
+    var tid_it = w_edge.find_component_by_hash(i64_tab.component_hash)
+    var tid_is = w_edge.find_component_by_hash(i64_sp.component_hash)
+    var e_edge = w_edge.spawn_empty()
+    assert_true(reg_b.insert_default_on_entity(w_edge, e_edge, "I64EdgeTable"))
+    assert_true(reg_b.insert_default_on_entity(w_edge, e_edge, "I64EdgeSparse"))
+
+    var expected_i64 = List[Int64]()
+    expected_i64.append(i64_min)
+    expected_i64.append(i64_max)
+    expected_i64.append(Int64(9007199254740993))
+    expected_i64.append(Int64(-9007199254740993))
+    expected_i64.append(Int64(-1))
+
+    var p_it = w_edge.get_raw_ptr_mut(e_edge, tid_it)
+    var p_is = w_edge.get_raw_ptr_mut(e_edge, tid_is)
+    for fi in range(5):
+        Pointer[Int64, MutAnyOrigin](unsafe_from_address=p_it + fi * 8)[unsafe_offset=0] = expected_i64[fi]
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=p_is + fi * 8).unsafe_bitcast[Int64]()[unsafe_offset=0] = expected_i64[fi]
+
+    var edge_csum = w_edge.state_checksum()
+    var sc_edge = Scene("I64EdgeScene")
+    var edge_flscn = sc_edge.save_flscn_bytes(w_edge, reg_b)
+    var edge_flscnb = sc_edge.save_flscnb_bytes(w_edge, reg_b)
+
+    for clr_idx in range(2):
+        var clr = clr_idx == 0
+        var w_ej = World()
+        var lj = sc_edge.load_flscn_bytes(w_ej, reg_b, edge_flscn, clear_existing=clr)
+        assert_equal(len(lj), 1)
+        assert_equal(w_ej.state_checksum(), edge_csum)
+        var rp_t = w_ej.get_raw_ptr(lj[0], w_ej.find_component_by_hash(i64_tab.component_hash))
+        var rp_s = w_ej.get_raw_ptr(lj[0], w_ej.find_component_by_hash(i64_sp.component_hash))
+        for fi in range(5):
+            assert_equal(Pointer[Int64, ImmutAnyOrigin](unsafe_from_address=rp_t + fi * 8)[unsafe_offset=0], expected_i64[fi])
+            assert_equal(Pointer[Int64, ImmutAnyOrigin](unsafe_from_address=rp_s + fi * 8)[unsafe_offset=0], expected_i64[fi])
+
+    var w_eb = World()
+    var lb = sc_edge.load_flscnb_bytes(w_eb, reg_b, edge_flscnb)
+    assert_equal(len(lb), 1)
+    assert_equal(w_eb.state_checksum(), edge_csum)
+
+    var bw_edge = BlobWriter()
+    w_edge.snapshot_blob(bw_edge)
+    var w_es = World()
+    reg_b.ensure_registered_in_world(w_es)
+    var br_edge = BlobReader(bw_edge.data.copy())
+    w_es.restore_blob(br_edge)
+    assert_equal(w_es.state_checksum(), edge_csum)
+
+    # Subtest C: ComponentRegistry + Scene .flscn/.flscnb round-trip with tid >= 256 POD schemas
+    var reg_c = ComponentRegistry.with_builtins()
+    var pod_names_c = List[String]()
+    var pod_hashes_c = List[UInt64]()
+    for pi in range(271):
+        var pname = "PodOver256_" + String(pi)
+        var mode = STORAGE_SPARSE if (pi % 3 == 0) else STORAGE_TABLE
+        var ps = PodComponentSchema(pname, 8, 4, mode)
+        assert_true(ps.add_field(PodFieldDesc("tag_i", POD_FIELD_INT, 0, 4)))
+        assert_true(ps.add_field(PodFieldDesc("val_f", POD_FIELD_F32, 4, 4)))
+        assert_true(ps.validate())
+        assert_true(reg_c.register_pod_schema(ps))
+        pod_names_c.append(pname)
+        pod_hashes_c.append(ps.component_hash)
+
+    var w_c = World()
+    reg_c.ensure_registered_in_world(w_c)
+    var probe_tids = List[Int]()
+    probe_tids.append(255)
+    probe_tids.append(256)
+    probe_tids.append(260)
+    probe_tids.append(270)
+    probe_tids.append(274)
+    var target_names = List[String]()
+    var target_hashes = List[UInt64]()
+    for ti in range(len(probe_tids)):
+        var ptid = probe_tids[ti]
+        assert_true(ptid < len(w_c.components))
+        var h = w_c.components[ptid].component_hash
+        var found_name = String("")
+        for pi in range(len(pod_hashes_c)):
+            if pod_hashes_c[pi] == h:
+                found_name = pod_names_c[pi]
+                break
+        assert_true(found_name.byte_length() > 0)
+        target_names.append(found_name)
+        target_hashes.append(h)
+
+    var e_c = w_c.spawn_empty()
+    for ti in range(len(probe_tids)):
+        assert_true(reg_c.insert_default_on_entity(w_c, e_c, target_names[ti]))
+        var ptr = w_c.get_raw_ptr_mut(e_c, probe_tids[ti])
+        assert_true(ptr != 0)
+        Pointer[Int32, MutAnyOrigin](unsafe_from_address=ptr)[unsafe_offset=0] = Int32(1000 + probe_tids[ti])
+        Pointer[Float32, MutAnyOrigin](unsafe_from_address=ptr + 4)[unsafe_offset=0] = Float32(probe_tids[ti]) * Float32(0.25)
+
+    var c_csum = w_c.state_checksum()
+    var sc_c = Scene("Pod256Scene")
+    var c_flscn = sc_c.save_flscn_bytes(w_c, reg_c)
+    var c_flscnb = sc_c.save_flscnb_bytes(w_c, reg_c)
+
+    var w_cj = World()
+    var lcj = sc_c.load_flscn_bytes(w_cj, reg_c, c_flscn)
+    assert_equal(len(lcj), 1)
+    assert_equal(w_cj.state_checksum(), c_csum)
+    var w_cb = World()
+    var lcb = sc_c.load_flscnb_bytes(w_cb, reg_c, c_flscnb)
+    assert_equal(len(lcb), 1)
+    assert_equal(w_cb.state_checksum(), c_csum)
+
+    for ti in range(len(probe_tids)):
+        var tid_j = w_cj.find_component_by_hash(target_hashes[ti])
+        assert_true(tid_j >= 255)
+        var qj = w_cj.query_entities(ComponentBitSet().with_bit(tid_j))
+        assert_equal(len(qj), 1)
+        var pj = w_cj.get_raw_ptr(qj[0], tid_j)
+        assert_equal(Pointer[Int32, ImmutAnyOrigin](unsafe_from_address=pj)[unsafe_offset=0], Int32(1000 + probe_tids[ti]))
+        assert_equal(Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=pj + 4)[unsafe_offset=0], Float32(probe_tids[ti]) * Float32(0.25))
+        assert_true(reg_c.remove_from_entity(w_cj, qj[0], target_names[ti]))
+        assert_true(not w_cj.has_by_type_id(qj[0], tid_j))
 
 
 # ===========================================================================
@@ -2124,6 +2866,8 @@ def test_k_detmath_simd8_bit_exact() raises:
 struct _StealJobCtx(Copyable, Movable):
     var counts_ptr: Int
     var tids_ptr: Int
+    var first_tid_ptr: Int
+    var two_seen_ptr: Int
     var idx: Int
 
 
@@ -2133,12 +2877,43 @@ def _test_l_steal_job(ctx_addr: Int, chunk: Int):
     _ = cnt[unsafe_offset=0].fetch_add(1)
     var tid = Int64(external_call["pthread_self", UInt64]())
     Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=c.tids_ptr + c.idx * 8)[unsafe_offset=0] = tid
-    if c.idx % 16 == 0:
+    var ft_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.first_tid_ptr)
+    var ts_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.two_seen_ptr)
+    var expected = Int64(0)
+    if not ft_ptr[unsafe_offset=0].compare_exchange(expected, tid):
+        if expected != tid:
+            ts_ptr[unsafe_offset=0].store(1)
+    if ts_ptr[unsafe_offset=0].load() == 0 and ft_ptr[unsafe_offset=0].load() == tid:
+        var spins = 0
+        while ts_ptr[unsafe_offset=0].load() == 0 and spins < 1000000:
+            _ = external_call["sched_yield", Int32]()
+            spins += 1
+    if c.idx % 8 == 0:
         var acc = UInt64(c.idx + chunk + 1)
         for _ in range(3000):
             acc = acc * UInt64(6364136223846793005) + UInt64(1)
         if acc == UInt64(0):
             _ = cnt[unsafe_offset=0].fetch_add(0)
+
+
+@fieldwise_init
+struct _ReadyBarrierCtx(Copyable, Movable):
+    var ready_addr: Int
+    var go_addr: Int
+
+
+def _test_l_ready_barrier_job(ctx_addr: Int, chunk: Int):
+    _ = chunk
+    ref c = Pointer[_ReadyBarrierCtx, origin=MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    _ = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.ready_addr)[unsafe_offset=0].fetch_add(1)
+    var go_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=c.go_addr)
+    while go_ptr[unsafe_offset=0].load() == 0:
+        _ = external_call["sched_yield", Int32]()
+
+
+def _test_l_overflow_job(ctx_addr: Int, chunk: Int):
+    _ = chunk
+    _ = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0].fetch_add(1)
 
 
 @fieldwise_init
@@ -2226,22 +3001,46 @@ def test_l_jobpool_chase_lev_prio_raii() raises:
     assert_equal(MAX_DEPENDENTS, 16)
 
     # 1. Chase-Lev multi-worker stealing concurrency (256 asymmetric jobs on 4 workers)
+    # First synchronize all 4 OS worker pthreads so CPU contention cannot let main drain before spawn.
     var pool = JobPool()
     assert_true(pool.start(4), "JobPool.start(4) must succeed")
+    var w_ready = List[Int64](length=1, fill=0)
+    var w_go = List[Int64](length=1, fill=0)
+    var w_bctx = _ReadyBarrierCtx(Int(w_ready.unsafe_ptr()), Int(w_go.unsafe_ptr()))
+    var w_handles = List[Int](capacity=4)
+    for _ in range(4):
+        var wh = pool.create(_test_l_ready_barrier_job, Int(Pointer(to=w_bctx)), 1)
+        w_handles.append(wh)
+        pool.submit(wh)
+    var w_ready_ptr = Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=Int(w_ready.unsafe_ptr()))
+    while w_ready_ptr[unsafe_offset=0].load() < 4:
+        _ = external_call["sched_yield", Int32]()
+    Pointer[Atomic[Int64], origin=MutAnyOrigin](unsafe_from_address=Int(w_go.unsafe_ptr()))[unsafe_offset=0].store(1)
+    for i in range(4):
+        pool.wait(w_handles[i])
+    _ = w_bctx.go_addr
+    _ = len(w_ready)
+    _ = len(w_go)
+
     var n_jobs = 256
     var counts = List[Int64](length=n_jobs, fill=0)
     var tids = List[Int64](length=n_jobs, fill=0)
+    var first_tid = List[Int64](length=1, fill=0)
+    var two_seen = List[Int64](length=1, fill=0)
     var ctxs = List[_StealJobCtx](capacity=n_jobs)
     for i in range(n_jobs):
-        ctxs.append(_StealJobCtx(Int(counts.unsafe_ptr()), Int(tids.unsafe_ptr()), i))
+        ctxs.append(_StealJobCtx(Int(counts.unsafe_ptr()), Int(tids.unsafe_ptr()), Int(first_tid.unsafe_ptr()), Int(two_seen.unsafe_ptr()), i))
     var handles = List[Int](capacity=n_jobs)
     for i in range(n_jobs):
         var h = pool.create(_test_l_steal_job, Int(ctxs.unsafe_ptr()) + i * size_of[_StealJobCtx](), 1)
         handles.append(h)
     for i in range(n_jobs):
         pool.submit(handles[i])
+    pool.rouse()
     for i in range(n_jobs):
         pool.wait(handles[i])
+    _ = len(first_tid)
+    _ = len(two_seen)
     _ = len(ctxs)
     var distinct_tids = List[Int64]()
     for i in range(n_jobs):
@@ -2255,6 +3054,18 @@ def test_l_jobpool_chase_lev_prio_raii() raises:
         if not seen:
             distinct_tids.append(t)
     assert_true(len(distinct_tids) >= 2, "Chase-Lev must distribute work across >= 2 threads")
+
+    # 1b. 3000-job overflow stress (> JOB_SLOTS=1024 and > DEQUE_CAP+GLOBAL_RING=2048)
+    var n_overflow = 3000
+    var ov_done = List[Int64](length=1, fill=0)
+    var ov_handles = List[Int](capacity=n_overflow)
+    for _ in range(n_overflow):
+        var oh = pool.create(_test_l_overflow_job, Int(ov_done.unsafe_ptr()), 1)
+        ov_handles.append(oh)
+        pool.submit(oh)
+    for i in range(n_overflow):
+        pool.wait(ov_handles[i])
+    assert_equal(ov_done[0], Int64(n_overflow))
 
     # 2. pool.run_affine parity (0 workers vs 4 workers) across 1, 7, 65, 513 chunks
     var serial_pool = JobPool()
@@ -3866,6 +4677,161 @@ def test_s_tier5_r2_sparse_changed_since() raises:
     pool.stop()
 
 
+def _test_v1_to_v2_scene_migration(payload: String) raises -> String:
+    var out = payload.replace('"LegacyNameScene"', '"MigratedSceneV2"')
+    out = out.replace('"OldTransform"', '"LocalTransform"')
+    return out^
+
+
+def test_t_m4a_scene_migrations_cross_format_unknown_and_prefab_rollback() raises:
+    var reg = ComponentRegistry.with_builtins()
+
+    # 1. SceneMigrationRegistry wired into Scene (both Scene.migrations and explicit with_migrations)
+    var v1_json = (
+        '{"format": "flscn", "version": 1, "name": "LegacyNameScene", "entities": ['
+        '{"slot": 0, "parent": -1, "components": {"OldTransform": {"translation": [3.0, 4.0, 5.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}}}'
+        ']}'
+    )
+    var v1_bytes = List[UInt8]()
+    for b in v1_json.as_bytes():
+        v1_bytes.append(b)
+
+    var scn_mig = Scene("BeforeMig")
+    scn_mig.migrations.register(1, 2, _test_v1_to_v2_scene_migration)
+    var w_mig = World()
+    var ents_mig = scn_mig.load_flscn_bytes(w_mig, reg, v1_bytes)
+    assert_equal(scn_mig.name, "MigratedSceneV2")
+    assert_equal(len(ents_mig), 1)
+    var lt_mig = w_mig.get_ptr[LocalTransform](ents_mig[0])
+    assert_true(Bool(lt_mig))
+    assert_true(abs(lt_mig.value()[].translation.x - Float32(3.0)) < Float32(1.0e-5))
+
+    var mig_explicit = SceneMigrationRegistry()
+    mig_explicit.register(1, 2, _test_v1_to_v2_scene_migration)
+    var scn_mig2 = Scene("ExplicitMig")
+    var w_mig2 = World()
+    var ents_mig2 = scn_mig2.load_flscn_bytes_with_migrations(w_mig2, reg, v1_bytes, mig_explicit)
+    assert_equal(scn_mig2.name, "MigratedSceneV2")
+    assert_equal(len(ents_mig2), 1)
+    assert_true(w_mig2.has[LocalTransform](ents_mig2[0]))
+
+    # 2. Cross-format .flscn -> .flscnb -> .flscn unknown JSON preservation (clear_existing=True & False)
+    var unk_json = (
+        '{"format": "flscn", "version": 2, "name": "CrossFmt", "entities": ['
+        '{"slot": 0, "parent": -1, "components": {'
+        '"LocalTransform": {"translation": [1.0, 2.0, 3.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}, '
+        '"ThirdParty": {"hp": 100, "tags": ["a", "b"]}'
+        '}}]}'
+    )
+    var unk_bytes = List[UInt8]()
+    for b in unk_json.as_bytes():
+        unk_bytes.append(b)
+
+    var scn_cf = Scene("CrossFmt")
+    var w_cf1 = World()
+    _ = scn_cf.load_flscn_bytes(w_cf1, reg, unk_bytes)
+    var flscnb_cf = scn_cf.save_flscnb_bytes(w_cf1, reg)
+
+    var w_cf2 = World()
+    _ = scn_cf.load_flscnb_bytes(w_cf2, reg, flscnb_cf, clear_existing=True)
+    var flscn_back = scn_cf.save_flscn_string(w_cf2, reg)
+    assert_true(flscn_back.find('"ThirdParty"') >= 0)
+    assert_true(flscn_back.find('"hp": 100') >= 0)
+
+    # clear_existing=False must also restore unknown JSON from .flscnb
+    var w_cf3 = World()
+    var pre_e = w_cf3.spawn_empty()
+    var loaded_cf3 = scn_cf.load_flscnb_bytes(w_cf3, reg, flscnb_cf, clear_existing=False)
+    assert_true(w_cf3.is_alive(pre_e))
+    assert_equal(len(loaded_cf3), 1)
+    var unk_cf3 = w_cf3.get_ptr[UnknownComponentsComponent](loaded_cf3[0])
+    assert_true(Bool(unk_cf3))
+    assert_equal(len(unk_cf3.value()[].json_names), 1)
+    assert_equal(unk_cf3.value()[].json_names[0], "ThirdParty")
+
+    # 3. Cross-format .flscnb -> .flscn -> .flscnb unknown binary FourCC preservation
+    var tag_ubet = fourcc("UBET")
+    var bw_bin = BlobWriter()
+    bw_bin.begin(0x4E435346, 2)
+    bw_bin.text("CrossBin")
+    bw_bin.integer(1)
+    bw_bin.integer(-1)
+    bw_bin.integer(2)
+    bw_bin.begin(LocalTransform.SCHEMA_FOURCC, LocalTransform.SCHEMA_VERSION)
+    LocalTransform.identity().write_bin(bw_bin)
+    bw_bin.end()
+    bw_bin.begin(tag_ubet, 7)
+    bw_bin.u8(0xAA)
+    bw_bin.u8(0x55)
+    bw_bin.u8(0x01)
+    bw_bin.end()
+    bw_bin.end()
+    var packed_bin = lz4_pack(bw_bin.data)
+
+    var w_b1 = World()
+    _ = scn_cf.load_flscnb_bytes(w_b1, reg, packed_bin)
+    var json_with_bin = scn_cf.save_flscn_bytes(w_b1, reg)
+    var w_b2 = World()
+    _ = scn_cf.load_flscn_bytes(w_b2, reg, json_with_bin, clear_existing=True)
+    var packed_roundtrip = scn_cf.save_flscnb_bytes(w_b2, reg)
+    var w_b3 = World()
+    var ents_b3 = scn_cf.load_flscnb_bytes(w_b3, reg, packed_roundtrip, clear_existing=False)
+    assert_equal(len(ents_b3), 1)
+    var unk_b3 = w_b3.get_ptr[UnknownComponentsComponent](ents_b3[0])
+    assert_true(Bool(unk_b3))
+    assert_equal(len(unk_b3.value()[].bin_fourccs), 1)
+    assert_equal(unk_b3.value()[].bin_fourccs[0], tag_ubet)
+    assert_equal(unk_b3.value()[].bin_versions[0], UInt32(7))
+    assert_equal(len(unk_b3.value()[].bin_payloads[0]), 3)
+    assert_equal(unk_b3.value()[].bin_payloads[0][0], UInt8(0xAA))
+    assert_equal(unk_b3.value()[].bin_payloads[0][1], UInt8(0x55))
+    assert_equal(unk_b3.value()[].bin_payloads[0][2], UInt8(0x01))
+
+    # 4. Prefab.instantiate atomic rollback on later node component decode failure
+    var w_pf = World()
+    reg.ensure_registered_in_world(w_pf)
+    var sentinel = w_pf.spawn_empty()
+    _ = w_pf.insert[LocalTransform](sentinel, LocalTransform(Vec3(7.0, 8.0, 9.0)))
+    assert_equal(w_pf.entity_count(), 1)
+
+    var pf_bad = Prefab("PartialFail")
+    var n0 = pf_bad.add_node("Node0")
+    pf_bad.set_component(n0, LocalTransform.identity())
+    var n1 = pf_bad.add_node("Node1", n0)
+    pf_bad.nodes[n1].set_raw_component("UnregisteredBogusComponent", "{}")
+
+    var err_raised = False
+    try:
+        _ = pf_bad.instantiate(w_pf, reg)
+    except:
+        err_raised = True
+    assert_true(err_raised)
+    assert_equal(w_pf.entity_count(), 1)
+    assert_true(w_pf.is_alive(sentinel))
+
+    # Also rollback when nested child prefab node fails decode
+    var pf_child_bad = Prefab("ChildBad")
+    var cn0 = pf_child_bad.add_node("CN0")
+    pf_child_bad.set_component(cn0, LocalTransform.identity())
+    var cn1 = pf_child_bad.add_node("CN1", cn0)
+    pf_child_bad.nodes[cn1].set_raw_component("LocalTransform", "{not_valid_json")
+
+    var pf_parent = Prefab("ParentOk")
+    var pn0 = pf_parent.add_node("PN0")
+    pf_parent.set_component(pn0, LocalTransform.identity())
+    pf_parent.add_nested(NestedPrefabRef("ChildBad", pn0))
+
+    var lib_bad = List[Prefab]()
+    lib_bad.append(pf_child_bad.copy())
+    var nested_err = False
+    try:
+        _ = pf_parent.instantiate(w_pf, reg, lib_bad)
+    except:
+        nested_err = True
+    assert_true(nested_err)
+    assert_equal(w_pf.entity_count(), 1)
+
+
 def main() raises:
     var t0 = get_time()
     print("[Flint v5 Track 1] Running Core, Hybrid ECS v2, Scene/Prefab & Hot-Reload Suite...")
@@ -3927,5 +4893,14 @@ def main() raises:
     test_s_tier5_r2_sparse_changed_since()
     print("  [PASS] (s) Tier 5 R2 par_for_each1/2/3 changed_since on STORAGE_SPARSE components")
 
+    test_t_m4a_scene_migrations_cross_format_unknown_and_prefab_rollback()
+    print("  [PASS] (t) M4a SceneMigrationRegistry, .flscn<->.flscnb unknown blobs & Prefab rollback")
+
+    test_u_m5a_pod_schema_and_registry_add_remove()
+    print("  [PASS] (u) M5a FlintPluginApiV2, PodComponentSchema & ComponentRegistry add/remove")
+
+    test_v_m5a_pod_uaf_and_int64_regressions()
+    print("  [PASS] (v) M5a POD -O3 UAF, Int64 JSON precision & tid>=256 Scene POD regressions")
+
     var elapsed = get_time() - t0
-    print("[Flint v5 Track 1] ALL 19 SUITES PASSED in " + String(elapsed) + " s")
+    print("[Flint v5 Track 1] ALL 22 SUITES PASSED in " + String(elapsed) + " s")

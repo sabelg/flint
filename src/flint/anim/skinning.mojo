@@ -35,7 +35,7 @@ eigenvector of sum w q q^T), found by SKIN_AVERAGE_STEPS power iterations
 from the heaviest influence's quaternion. The usual shortcut, flipping each
 quaternion to the side of a pivot and adding, jumps where neighbouring
 vertices pick different pivots or a joint passes a half turn from the pivot;
-on Maroon, whose arms go from all fours to straight overhead, that tore the
+on wide-range rigs, whose arms go from all fours to straight overhead, that tore the
 shoulders (edges stretched 28 times in the roll, against 6 for linear
 blend). The average only becomes arbitrary where two rotations are equally
 good, and there no blended rotation means anything, so the result fades to
@@ -63,7 +63,7 @@ A vertex with one influence, or with no triangle like it, keeps its own
 position as its center, which makes the method linear blend for it. Only
 triangles that share a pair of joints with the vertex can contribute, so
 they are listed per pair once and each vertex walks the lists of its pairs;
-on Maroon's broad weights that is still 200 million terms for the 19,875
+on broad-weight rigs that is still 200 million terms for the 19,875
 vertices of LOD0 (1.2 s on one core), so a big mesh's vertices are spread
 over up to eight threads (0.14 s). Cutting small terms off was tried and
 bought nothing: with weights this smooth almost every term matters.

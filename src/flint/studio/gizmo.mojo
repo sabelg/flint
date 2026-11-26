@@ -10,12 +10,15 @@ Implements:
     (`emit_gizmo_draw_list`) of X/Y/Z arrows, XY/XZ/YZ dual-axis planes, rotation rings & scale cubes.
 """
 from std.math import abs, atan2, cos, floor, isfinite, max, min, sin, sqrt, tan
-from flint.core.math import Vec3
+from flint.core.math import Quat, Vec3
 from flint.ui.draw_list import UiDrawList
 
 comptime GIZMO_MODE_TRANSLATE: Int = 0
 comptime GIZMO_MODE_ROTATE: Int = 1
 comptime GIZMO_MODE_SCALE: Int = 2
+
+comptime GIZMO_SPACE_WORLD: Int = 0
+comptime GIZMO_SPACE_LOCAL: Int = 1
 
 comptime GIZMO_AXIS_NONE: Int = 0
 comptime GIZMO_AXIS_X: Int = 1
@@ -292,6 +295,15 @@ def gizmo_rotation_delta_rad(
     return max(Float32(-6.2831853), min(Float32(6.2831853), d_rad))
 
 
+def _sanitize_gizmo_rot(q: Quat) -> Quat:
+    if (
+        isfinite(q.x) and isfinite(q.y) and isfinite(q.z) and isfinite(q.w)
+        and q.length_squared() > Float32(1.0e-8)
+    ):
+        return q.normalized()
+    return Quat.identity()
+
+
 def gizmo_scale_drag(
     start_ray: ViewportRay,
     cur_ray: ViewportRay,
@@ -302,6 +314,7 @@ def gizmo_scale_drag(
     cam_right: Vec3,
     start_scale: Vec3,
     snap_step: Float32 = 0.0,
+    gizmo_rot: Quat = Quat.identity(),
 ) -> Vec3:
     """Solves 1D per-axis or uniform 3D scale drag relative to `start_scale`."""
     var safe_start = Vec3(
@@ -338,11 +351,12 @@ def gizmo_scale_drag(
             return safe_start
         return res_u
 
-    var ax = Vec3(1.0, 0.0, 0.0)
+    var rot = _sanitize_gizmo_rot(gizmo_rot)
+    var ax = rot.rotate(Vec3(1.0, 0.0, 0.0))
     if handle == GIZMO_AXIS_Y:
-        ax = Vec3(0.0, 1.0, 0.0)
+        ax = rot.rotate(Vec3(0.0, 1.0, 0.0))
     elif handle == GIZMO_AXIS_Z:
-        ax = Vec3(0.0, 0.0, 1.0)
+        ax = rot.rotate(Vec3(0.0, 0.0, 1.0))
     var p0 = ray_axis_closest_param(start_ray, pivot, ax)
     var p1 = ray_axis_closest_param(cur_ray, pivot, ax)
     if not p0[0] or not p1[0]:
@@ -468,6 +482,7 @@ def pick_gizmo_handle(
     cam_up: Vec3,
     fov_y_deg: Float32,
     target_px: Float32 = 96.0,
+    gizmo_rot: Quat = Quat.identity(),
 ) -> Int:
     """Screen-space handle picker returning `GIZMO_AXIS_*`, `GIZMO_PLANE_*`, or `GIZMO_SCALE_UNIFORM`."""
     if not (
@@ -481,6 +496,10 @@ def pick_gizmo_handle(
         return GIZMO_AXIS_NONE
     var vph_i = Int(max(Float32(1.0), min(Float32(16384.0), vp_h)))
     var wscale = gizmo_world_scale(pivot, cam_pos, cam_fwd, fov_y_deg, vph_i, target_px)
+    var rot = _sanitize_gizmo_rot(gizmo_rot)
+    var bx = rot.rotate(Vec3(1.0, 0.0, 0.0))
+    var by = rot.rotate(Vec3(0.0, 1.0, 0.0))
+    var bz = rot.rotate(Vec3(0.0, 0.0, 1.0))
 
     if mode == GIZMO_MODE_SCALE:
         var dc = _point_seg_dist_px(mouse_x, mouse_y, c_proj[0], c_proj[1], c_proj[0], c_proj[1])
@@ -489,9 +508,9 @@ def pick_gizmo_handle(
 
     if mode == GIZMO_MODE_TRANSLATE or mode == GIZMO_MODE_SCALE:
         if mode == GIZMO_MODE_TRANSLATE:
-            var p_xy = project_world_to_viewport(pivot + Vec3(wscale * 0.28, wscale * 0.28, 0.0), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
-            var p_xz = project_world_to_viewport(pivot + Vec3(wscale * 0.28, 0.0, wscale * 0.28), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
-            var p_yz = project_world_to_viewport(pivot + Vec3(0.0, wscale * 0.28, wscale * 0.28), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
+            var p_xy = project_world_to_viewport(pivot + (bx + by) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
+            var p_xz = project_world_to_viewport(pivot + (bx + bz) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
+            var p_yz = project_world_to_viewport(pivot + (by + bz) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             if p_xy[3] and _point_seg_dist_px(mouse_x, mouse_y, p_xy[0], p_xy[1], p_xy[0], p_xy[1]) <= Float32(11.0):
                 return GIZMO_PLANE_XY
             if p_xz[3] and _point_seg_dist_px(mouse_x, mouse_y, p_xz[0], p_xz[1], p_xz[0], p_xz[1]) <= Float32(11.0):
@@ -499,7 +518,7 @@ def pick_gizmo_handle(
             if p_yz[3] and _point_seg_dist_px(mouse_x, mouse_y, p_yz[0], p_yz[1], p_yz[0], p_yz[1]) <= Float32(11.0):
                 return GIZMO_PLANE_YZ
 
-        var axes = [Vec3(1.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0)]
+        var axes = [bx, by, bz]
         var ids = [GIZMO_AXIS_X, GIZMO_AXIS_Y, GIZMO_AXIS_Z]
         var best_id = GIZMO_AXIS_NONE
         var best_d = Float32(12.0)
@@ -513,8 +532,8 @@ def pick_gizmo_handle(
         return best_id
 
     # Rotate mode: test distance to projected 3D rings
-    var ring_u = [Vec3(0.0, 1.0, 0.0), Vec3(1.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0)]
-    var ring_v = [Vec3(0.0, 0.0, 1.0), Vec3(0.0, 0.0, 1.0), Vec3(0.0, 1.0, 0.0)]
+    var ring_u = [by, bx, bx]
+    var ring_v = [bz, bz, by]
     var r_ids = [GIZMO_AXIS_X, GIZMO_AXIS_Y, GIZMO_AXIS_Z]
     var best_r = GIZMO_AXIS_NONE
     var best_rd = Float32(11.0)
@@ -550,6 +569,7 @@ def emit_gizmo_draw_list(
     cam_up: Vec3,
     fov_y_deg: Float32,
     target_px: Float32 = 96.0,
+    gizmo_rot: Quat = Quat.identity(),
 ):
     """Emits crisp analytical 3D gizmo primitives (X/Y/Z arrows, XY/XZ/YZ dual-axis planes,
     3D rotation rings, or scale cubes) into `UiDrawList` clipped to the 3D viewport."""
@@ -566,7 +586,11 @@ def emit_gizmo_draw_list(
     ui.push_clip(cx0, cy0, cx1, cy1)
 
     var wscale = gizmo_world_scale(pivot, cam_pos, cam_fwd, fov_y_deg, vph_i, target_px)
-    var axes = [Vec3(1.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0)]
+    var rot = _sanitize_gizmo_rot(gizmo_rot)
+    var bx = rot.rotate(Vec3(1.0, 0.0, 0.0))
+    var by = rot.rotate(Vec3(0.0, 1.0, 0.0))
+    var bz = rot.rotate(Vec3(0.0, 0.0, 1.0))
+    var axes = [bx, by, bz]
     var cols = [GIZMO_COLOR_X, GIZMO_COLOR_Y, GIZMO_COLOR_Z]
     var h_ids = [GIZMO_AXIS_X, GIZMO_AXIS_Y, GIZMO_AXIS_Z]
 
@@ -574,9 +598,9 @@ def emit_gizmo_draw_list(
         if mode == GIZMO_MODE_TRANSLATE:
             # Dual-axis planar handles (XY, XZ, YZ)
             var pl_pts = [
-                pivot + Vec3(wscale * Float32(0.28), wscale * Float32(0.28), 0.0),
-                pivot + Vec3(wscale * Float32(0.28), 0.0, wscale * Float32(0.28)),
-                pivot + Vec3(0.0, wscale * Float32(0.28), wscale * Float32(0.28)),
+                pivot + (bx + by) * (wscale * Float32(0.28)),
+                pivot + (bx + bz) * (wscale * Float32(0.28)),
+                pivot + (by + bz) * (wscale * Float32(0.28)),
             ]
             var pl_cols = [UInt32(0xAA428BF5), UInt32(0xAA3DDC68), UInt32(0xAAE84848)]
             var pl_borders = [GIZMO_COLOR_Z, GIZMO_COLOR_Y, GIZMO_COLOR_X]
@@ -617,8 +641,8 @@ def emit_gizmo_draw_list(
     else:
         # 3D Rotation Rings (X=YZ plane, Y=XZ plane, Z=XY plane) + subtle outer screen-space horizon ring
         ui.add_circle(c[0], c[1], target_px * Float32(1.06), UInt32(0x14FFFFFF), Float32(1.5), UInt32(0x66DCE4F0))
-        var ring_u = [Vec3(0.0, 1.0, 0.0), Vec3(1.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0)]
-        var ring_v = [Vec3(0.0, 0.0, 1.0), Vec3(0.0, 0.0, 1.0), Vec3(0.0, 1.0, 0.0)]
+        var ring_u = [by, bx, bx]
+        var ring_v = [bz, bz, by]
         comptime RSEG: Int = 40
         for ri in range(3):
             var rcol = GIZMO_COLOR_ACTIVE if active_handle == h_ids[ri] else cols[ri]

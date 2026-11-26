@@ -320,15 +320,14 @@ def drained_look(layer_id: Int) -> LightingProfile:
     layer's own: colder, paler, a little dimmer, the fog a blue-grey of the
     same weight (lifted where it was near black). Never dark: exposure stays
     within 6% of the layer's own, and the shadows are lifted, not crushed,
-    so Maroon's back still reads. `LookDirector` blends from this to the
+    so the character's back still reads. `LookDirector` blends from this to the
     layer's own look by the hum level."""
     var own = layer_look(layer_id)
     var amount = drain_amount(layer_id)
     var profile = own
-    # The lantern-dark layers (the Silver Queen, inside Fulford, the Deep)
-    # have no brightness to give: drained, they lose colour and warmth but
-    # their light is held and the bounce lifted, so Maroon's back still
-    # reads (tools/hum_shots.mojo measures it in every drained frame).
+    # Lantern-dark layers have no brightness to give: drained, they lose
+    # colour and warmth but their light is held and the bounce lifted, so the
+    # character's back still reads in every drained frame.
     var dark = layer_id == 7 or layer_id == 105 or layer_id == 2
     profile.key_color = drain_color(own.key_color, amount, Float32(1.0) if dark else Float32(0.90))
     profile.fill_color = drain_color(own.fill_color, amount, Float32(1.25) if dark else Float32(1.10))

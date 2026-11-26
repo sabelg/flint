@@ -1,0 +1,22 @@
+{
+  "format": "flmat",
+  "version": 1,
+  "name": "WeaponSteel",
+  "shading_mode": 0,
+  "base_color": [0.8199999928474426, 0.8600000143051147, 0.9200000166893005],
+  "roughness": 0.20000000298023224,
+  "metallic": 0.9200000166893005,
+  "clearcoat": 0.0,
+  "clearcoat_roughness": 0.07999999821186066,
+  "opacity": 1.0,
+  "alpha_cutoff": 0.0,
+  "sheen": 0.0,
+  "subsurface": 0.0,
+  "emissive": [0.0, 0.0, 0.0],
+  "albedo_tex": {"uuid": "00000000-0000-0000-0000-000000000000", "rel_path": "", "kind": 0},
+  "normal_tex": {"uuid": "00000000-0000-0000-0000-000000000000", "rel_path": "", "kind": 0},
+  "orm_tex": {"uuid": "00000000-0000-0000-0000-000000000000", "rel_path": "", "kind": 0},
+  "emissive_tex": {"uuid": "00000000-0000-0000-0000-000000000000", "rel_path": "", "kind": 0},
+  "cel_params": {"sss_shadow_tint": [0.5799999833106995, 0.4000000059604645, 0.4399999976158142], "shadow_threshold": 0.5, "shadow_feather": 0.014999999664723873, "rim_color": [0.41999998688697815, 0.47999998927116394, 0.6200000047683716], "rim_power": 3.5, "rim_threshold": 0.6499999761581421, "spec_intensity": 0.3199999928474426, "spec_step_threshold": 0.8600000143051147, "hair_halo_strength": 0.0, "hair_shift": 0.11999999731779099, "outline_width_px": 2.0, "outline_color": [0.017999999225139618, 0.014000000432133675, 0.019999999552965164], "outline_z_bias": 0.0024999999441206455, "outline_fov_dist_cap": 6.0, "inner_ink_strength": 1.0, "ambient_floor": 0.2800000011920929, "use_vertex_color_channels": false, "receive_scene_shadows": true, "use_custom_light_dir": false, "custom_light_dir": [0.0, 0.5500756502151489, -0.8351148366928101], "custom_light_intensity": 1.0},
+  "vfx_params": {"uv_scroll_u": 0.0, "uv_scroll_v": -2.4000000953674316, "warp_scale": 4.5, "warp_strength": 0.2800000011920929, "erosion": 0.3499999940395355, "edge_band_width": 0.20000000298023224, "core_color": [7.5, 5.800000190734863, 2.4000000953674316], "edge_color": [3.799999952316284, 0.3199999928474426, 0.05000000074505806], "ink_rim_width": 0.04500000178813934, "ink_rim_darkness": 0.8799999952316284}
+}

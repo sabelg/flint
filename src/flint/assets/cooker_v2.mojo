@@ -23,6 +23,7 @@ from flint.assets.bc_compress import (
     encode_bc6h_hdr,
     encode_bc7_rgba,
 )
+from flint.anim.flrig import FrigJointDef, FrigRigDef, load_flrig_bytes, save_flrig_bytes
 from flint.assets.flpk_v3 import (
     ASSET_KIND_AUDIO,
     ASSET_KIND_FONT,
@@ -34,6 +35,7 @@ from flint.assets.flpk_v3 import (
     CHUNK_COMP_NONE,
     SUB_ID_BVH8_COLLIDER,
     SUB_ID_PRIMARY_OR_TAIL,
+    SUB_ID_RIG,
     TEX_FMT_BC5_UNORM,
     TEX_FMT_BC6H_UFLOAT,
     TEX_FMT_BC7_SRGB,
@@ -45,6 +47,7 @@ from flint.assets.flpk_v3 import (
     encode_audio_pcm_slab,
     encode_bvh8_collider_slab,
     encode_cooked_mesh_slab,
+    encode_cooked_rig_slab,
     encode_flpk_v3,
     encode_texture_tail_slab,
     load_or_init_flmeta,
@@ -58,11 +61,13 @@ from flint.assets.model import NativeModel
 from flint.physics.bvh import Bvh8MeshCollider
 from flint.platform.audio import decode_wav
 from flint.platform.os import (
+    close_fd,
     file_stamp,
     get_time,
     is_symlink,
     list_directory,
     make_dirs,
+    open_read,
     parent_directory,
     read_bytes,
     rename_file,
@@ -71,7 +76,7 @@ from flint.platform.os import (
 from flint.text.sdf_bake import bake_font, default_charset, dsf_bytes
 from flint.text.ttf import TrueTypeFont
 
-comptime COOKER_V2_VERSION: UInt32 = 5002
+comptime COOKER_V2_VERSION: UInt32 = 5003
 comptime DEFAULT_COOK_CACHE_DIR = "build/cook_cache"
 comptime _COOK_BUNDLE_TAG: UInt32 = 0x324B4346  # "FCK2"
 comptime _COOK_INDEX_TAG: UInt32 = 0x32584943   # "CIX2"
@@ -225,7 +230,18 @@ def _save_bundle_to_cache(cache_path: String, bundle: CookedAssetBundle) -> Bool
     return rename_file(tmp, cache_path)
 
 
-def _load_bundle_from_cache(cache_path: String) -> CookedAssetBundle:
+def _is_normal_rel_path(rel_path: String) -> Bool:
+    return (
+        rel_path.endswith("_normal.png")
+        or rel_path.endswith("_nrm.png")
+        or rel_path.endswith("_normal.jpg")
+        or rel_path.endswith("_nrm.jpg")
+        or rel_path.endswith("_normal.jpeg")
+        or rel_path.endswith("_nrm.jpeg")
+    )
+
+
+def _load_bundle_from_cache(cache_path: String, expected_rel_path: String = "") -> CookedAssetBundle:
     var b = CookedAssetBundle()
     var raw = read_bytes(cache_path)
     if len(raw) < 12:
@@ -236,7 +252,10 @@ def _load_bundle_from_cache(cache_path: String) -> CookedAssetBundle:
         var u_hi = r.u64()
         var u_lo = r.u64()
         b.uuid = AssetUuid(u_hi, u_lo)
-        b.rel_path = r.text()
+        var stored_rel_path = r.text()
+        b.rel_path = expected_rel_path if expected_rel_path.byte_length() > 0 else stored_rel_path
+        if expected_rel_path.byte_length() > 0 and _is_normal_rel_path(stored_rel_path) != _is_normal_rel_path(b.rel_path):
+            return CookedAssetBundle()
         b.asset_kind = r.u8()
         var n_ch = Int(r.u32())
         if r.failed or n_ch < 0 or n_ch > 64:
@@ -316,6 +335,31 @@ def cook_native_model_bundle(
         var bvh_slab = encode_bvh8_collider_slab(bvh)
         bundle.chunks.append(
             FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_BVH8_COLLIDER, ASSET_KIND_MESH, bvh_slab^, comp_mode)
+        )
+
+    var has_morph = len(model.morph_names) > 0
+    if not has_morph:
+        for mi in range(len(model.meshes)):
+            if model.meshes[mi].morph_count > 0 or len(model.meshes[mi].morph_positions) > 0:
+                has_morph = True
+                break
+    if len(model.skins) > 0 or len(model.animations) > 0 or has_morph:
+        var n_nodes = len(model.nodes)
+        var parents = List[Int](length=n_nodes, fill=-1)
+        for ni in range(n_nodes):
+            for ci in range(len(model.nodes[ni].children)):
+                var ch = model.nodes[ni].children[ci]
+                if ch >= 0 and ch < n_nodes:
+                    parents[ch] = ni
+        var rig = FrigRigDef(rel_path)
+        for ni in range(n_nodes):
+            ref nd = model.nodes[ni]
+            rig.joints.append(
+                FrigJointDef(nd.name, parents[ni], nd.base_translation, nd.base_rotation, nd.base_scale)
+            )
+        var rig_slab = encode_cooked_rig_slab(save_flrig_bytes(rig))
+        bundle.chunks.append(
+            FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_RIG, ASSET_KIND_MESH, rig_slab^, comp_mode)
         )
 
     bundle.valid = True
@@ -398,6 +442,7 @@ def cook_png_texture_bundle(
     png_bytes: List[UInt8],
     meta: AssetMeta,
     rel_path: String,
+    force_normal: Bool = False,
 ) -> CookedAssetBundle:
     """Cooks a `.png` / `.jpg` / `.jpeg` into streamable `BC7` (or `BC5` normal) mip sub-chunks (`sub_id = 0` tail + `1..15` high-res mips)."""
     var bundle = CookedAssetBundle()
@@ -411,7 +456,8 @@ def cook_png_texture_bundle(
         return bundle^
 
     var is_normal = (
-        rel_path.endswith("_normal.png")
+        force_normal
+        or rel_path.endswith("_normal.png")
         or rel_path.endswith("_nrm.png")
         or rel_path.endswith("_normal.jpg")
         or rel_path.endswith("_nrm.jpg")
@@ -580,13 +626,40 @@ def cook_single_source_bytes(
         return cook_ttf_font_bundle(source_bytes, meta, rel_path)
     if meta.asset_kind == ASSET_KIND_AUDIO or rel_path.endswith(".wav"):
         return cook_wav_audio_bundle(source_bytes, meta, rel_path)
+    if rel_path.endswith(".flrig"):
+        try:
+            _ = load_flrig_bytes(source_bytes)
+            var rig_bundle = CookedAssetBundle()
+            rig_bundle.uuid = meta.uuid
+            rig_bundle.rel_path = rel_path
+            rig_bundle.asset_kind = ASSET_KIND_RAW
+            var rig_comp = CHUNK_COMP_LZ4 if meta.compress_lz4 else CHUNK_COMP_NONE
+            var raw_copy = source_bytes.copy()
+            rig_bundle.chunks.append(
+                FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_PRIMARY_OR_TAIL, ASSET_KIND_RAW, raw_copy^, rig_comp)
+            )
+            var rig_slab = encode_cooked_rig_slab(source_bytes)
+            rig_bundle.chunks.append(
+                FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_RIG, ASSET_KIND_RAW, rig_slab^, rig_comp)
+            )
+            rig_bundle.valid = True
+            return rig_bundle^
+        except:
+            pass
     var raw_bundle = CookedAssetBundle()
     raw_bundle.uuid = meta.uuid
     raw_bundle.rel_path = rel_path
     raw_bundle.asset_kind = ASSET_KIND_RAW
     var copy_raw = source_bytes.copy()
+    var comp_mode = CHUNK_COMP_LZ4 if (
+        meta.compress_lz4
+        or rel_path.endswith(".flscn")
+        or rel_path.endswith(".flprefab")
+        or rel_path.endswith(".flmat")
+        or rel_path.endswith(".json")
+    ) else CHUNK_COMP_NONE
     raw_bundle.chunks.append(
-        FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_PRIMARY_OR_TAIL, ASSET_KIND_RAW, copy_raw^, CHUNK_COMP_NONE)
+        FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_PRIMARY_OR_TAIL, ASSET_KIND_RAW, copy_raw^, comp_mode)
     )
     raw_bundle.valid = True
     return raw_bundle^
@@ -718,7 +791,7 @@ def _cook_worker_body(ctx_addr: Int, task_idx: Int):
         var key = compute_cook_cache_key(sig_bytes, meta)
         var cache_file = slot.cache_dir + "/" + key + ".flcook"
         if not slot.force_recook:
-            var cached = _load_bundle_from_cache(cache_file)
+            var cached = _load_bundle_from_cache(cache_file, slot.rel_path)
             if cached.valid:
                 slot.was_cache_hit = True
                 slot.result = cached^
@@ -729,15 +802,30 @@ def _cook_worker_body(ctx_addr: Int, task_idx: Int):
         slot.result = cooked^
         return
 
-    var src_bytes = read_bytes(slot.full_path)
-    if len(src_bytes) == 0:
-        slot.result.error = "empty or unreadable file: " + slot.full_path
+    var st = file_stamp(slot.full_path)
+    if st[0] < 0:
+        slot.result.error = "unreadable file: " + slot.full_path
         return
+    var src_bytes = List[UInt8]()
+    if st[0] > 0:
+        src_bytes = read_bytes(slot.full_path)
+        if len(src_bytes) == 0:
+            slot.result.error = "failed to read file: " + slot.full_path
+            return
+    else:
+        if slot.default_kind != ASSET_KIND_RAW:
+            slot.result.error = "empty file: " + slot.full_path
+            return
+        var fd = open_read(slot.full_path)
+        if fd < 0:
+            slot.result.error = "unreadable file: " + slot.full_path
+            return
+        close_fd(fd)
     var meta = load_or_init_flmeta(slot.full_path, slot.rel_path, slot.default_kind, persist_if_missing=False)
     var key = compute_cook_cache_key(src_bytes, meta)
     var cache_file = slot.cache_dir + "/" + key + ".flcook"
     if not slot.force_recook:
-        var cached = _load_bundle_from_cache(cache_file)
+        var cached = _load_bundle_from_cache(cache_file, slot.rel_path)
         if cached.valid:
             slot.was_cache_hit = True
             slot.result = cached^
@@ -762,6 +850,17 @@ def _classify_asset_ext(name: String) -> Tuple[Bool, UInt8]:
         return (True, ASSET_KIND_FONT)
     if name.endswith(".wav"):
         return (True, ASSET_KIND_AUDIO)
+    if (
+        name.endswith(".flscn")
+        or name.endswith(".flscnb")
+        or name.endswith(".flprefab")
+        or name.endswith(".flmat")
+        or name.endswith(".flanim")
+        or name.endswith(".flrig")
+        or name.endswith(".json")
+        or name.endswith(".qoa")
+    ):
+        return (True, ASSET_KIND_RAW)
     return (False, ASSET_KIND_RAW)
 
 
@@ -816,17 +915,20 @@ def _collect_workspace_sources(
 def _compute_workspace_fast_signature(
     output_flpk: String,
     full_paths: List[String],
+    rel_paths: List[String],
     procedural_count: Int,
+    page_align: Bool = True,
 ) -> UInt64:
     var w = BlobWriter()
     w.u32(COOKER_V2_VERSION)
     w.text(output_flpk)
+    w.u8(UInt8(1 if page_align else 0))
     w.u32(UInt32(len(full_paths)))
     w.u32(UInt32(procedural_count))
     for i in range(len(full_paths)):
         var st = file_stamp(full_paths[i])
         var mst = file_stamp(full_paths[i] + ".flmeta")
-        w.text(full_paths[i])
+        w.text(rel_paths[i])
         w.integer(st[0])
         w.integer(st[1])
         w.integer(mst[0])
@@ -898,7 +1000,7 @@ def cook_workspace(
     # Fast-path stamp index check (`< 1 ms` 100% cache hit when workspace & output archive are untouched!)
     var out_u = AssetUuid.from_path(output_flpk)
     var index_path = cache_dir + "/workspace_stamp_" + String(out_u.hi) + "_" + String(out_u.lo) + ".bin"
-    var cur_sig = _compute_workspace_fast_signature(output_flpk, full_paths, len(procedural_items))
+    var cur_sig = _compute_workspace_fast_signature(output_flpk, full_paths, rel_paths, len(procedural_items), page_align)
     var out_stamp = file_stamp(output_flpk)
     if (not force_recook) and len(procedural_items) == 0 and out_stamp[0] >= 64:
         var idx_raw = read_bytes(index_path)

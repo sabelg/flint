@@ -3,7 +3,7 @@
 Each one has a `CVAR_` constant, used at every call site, and a line in the
 table in `cvar_entry`. Code reads `cvars.on(CVAR_DEBUG_DRAW)`, which is a list
 lookup, so reading one on a hot path costs nothing worth noticing; names are
-only for people, through the console and `SD_CVARS`.
+only for people, through the console and `FLINT_CVARS`.
 
 They are presentation. `NativeRuntime` owns them and nothing inside a tick may
 read them, so no console variable can change the simulation, a replay or a
@@ -12,8 +12,8 @@ the simulation, physics.serial, is copied in between ticks and only changes
 which thread solves what: the solver gives the same bits either way
 (tests/test_solver.mojo).
 
-`SD_CVARS="debug.draw=1,debug.lights=1"` sets them at start. A flag written
-alone, as in `SD_CVARS=debug.draw`, turns on.
+`FLINT_CVARS="debug.draw=1,debug.lights=1"` sets them at start. A flag written
+alone, as in `FLINT_CVARS=debug.draw`, turns on.
 """
 from std.math import abs, isfinite
 from flint.core.memory import MEM_TAGS, mem_tag_key, default_budget_mib
@@ -51,18 +51,18 @@ comptime CVAR_DEBUG_FORCES: Int = 29  # field volumes, water and ropes (package 
 comptime CVAR_DEBUG_WIND: Int = 30    # the wind field as arrows, and the vorticles
 comptime CVAR_DIG_PREVIEW: Int = 31   # what the next punch or tear would take (package 2.6)
 comptime CVAR_TERRAIN_RESET: Int = 32  # rebuild the layer's terrain from its brushes, once
-comptime CVAR_TERRAIN_RESET_HERE: Int = 33  # put the layer's own terrain back within this many metres of Maroon, once
+comptime CVAR_TERRAIN_RESET_HERE: Int = 33  # put the layer's own terrain back within this many metres of the player, once
 comptime CVAR_PARTICLES_GPU: Int = 34  # particles simulated and drawn on the GPU (package 2.7)
 comptime CVAR_PARTICLES_STATS: Int = 35  # the GPU particle counters on the debug HUD
 comptime CVAR_DEBUG_GROUND: Int = 36  # loose ground and cave-ins (package 2.8)
-comptime CVAR_GROUND_DEMO: Int = 37  # build loose-ground test pieces ahead of Maroon, once
+comptime CVAR_GROUND_DEMO: Int = 37  # build loose-ground test pieces ahead of the player, once
 comptime CVAR_DEBUG_FIELDS: Int = 38  # field blocks, burning cells, element states (package 2.9)
-comptime CVAR_FIELDS_DEMO: Int = 39  # build field test pieces ahead of Maroon, once
-comptime CVAR_CAMERA_DITHER: Int = 40  # occluders thin out around Maroon (package 3.2)
+comptime CVAR_FIELDS_DEMO: Int = 39  # build field test pieces ahead of the player, once
+comptime CVAR_CAMERA_DITHER: Int = 40  # occluders thin out around the player (package 3.2)
 comptime CVAR_SKIN_METHOD: Int = 41  # how skinned meshes deform (package 3.4)
 comptime CVAR_SKIN_GPU: Int = 42     # skin on the GPU when a GPU backend draws
-comptime CVAR_SKILLS_DEMO: Int = 43   # every bear skill owned and test pieces ahead of Maroon, once (package 3.8)
-comptime CVAR_FORMS_DEMO: Int = 44    # every form unlocked and test pieces ahead of Maroon, once (package 3.9)
+comptime CVAR_SKILLS_DEMO: Int = 43   # all traversal skills unlocked and test pieces ahead of the player, once (package 3.8)
+comptime CVAR_FORMS_DEMO: Int = 44    # every form unlocked and test pieces ahead of the player, once (package 3.9)
 # Package 2.13: the effects library, its comfort scales (3.15's options set
 # them) and its demo and debug view.
 comptime CVAR_FX: Int = 45
@@ -111,7 +111,7 @@ def cvar_entry(index: Int) -> CVarEntry:
     if index == CVAR_DEBUG_RANGE:
         return CVarEntry("debug.range", 40, False, "metres from the camera to draw")
     if index == CVAR_LOG_LEVEL:
-        return CVarEntry("log.level", CVAR_KEEP, False, "log entries kept: 0 trace .. 5 fatal, 6 off; -1 keeps SD_LOG's")
+        return CVarEntry("log.level", CVAR_KEEP, False, "log entries kept: 0 trace .. 5 fatal, 6 off; -1 keeps FLINT_LOG's")
     if index == CVAR_LOG_ECHO:
         return CVarEntry("log.echo", CVAR_KEEP, False, "log entries also printed, from this level up; -1 keeps warn")
     if index == CVAR_GPU_FENCE_MS:
@@ -151,13 +151,13 @@ def cvar_entry(index: Int) -> CVarEntry:
     if index == CVAR_DEBUG_FORCES:
         return CVarEntry("debug.physics.forces", 0, True, "field volumes by target, water surfaces blue, ropes, bodies' field pushes")
     if index == CVAR_DEBUG_WIND:
-        return CVarEntry("debug.physics.wind", 0, True, "the wind around Maroon as arrows (longer is faster), vorticles as spheres of their reach")
+        return CVarEntry("debug.physics.wind", 0, True, "the wind around the player as arrows (longer is faster), vorticles as spheres of their reach")
     if index == CVAR_DIG_PREVIEW:
         return CVarEntry("dig.preview", 1, True, "outline what the next punch would break (white), what would fall after it (orange) and what a tear would take (cyan)")
     if index == CVAR_TERRAIN_RESET:
         return CVarEntry("terrain.reset", 0, True, "rebuild this layer's terrain from its brushes, journal and wear cleared, once; not while recording")
     if index == CVAR_TERRAIN_RESET_HERE:
-        return CVarEntry("terrain.reset_here", 0, False, "put the layer's own terrain back within this many metres of Maroon (journaled), once; not while recording")
+        return CVarEntry("terrain.reset_here", 0, False, "put the layer's own terrain back within this many metres of the player (journaled), once; not while recording")
     if index == CVAR_PARTICLES_GPU:
         return CVarEntry("particles.gpu", 1, True, "simulate and draw particles on the GPU when a GPU backend draws; off: the CPU's simpler particles (package 2.7)")
     if index == CVAR_PARTICLES_STATS:
@@ -165,25 +165,25 @@ def cvar_entry(index: Int) -> CVarEntry:
     if index == CVAR_DEBUG_GROUND:
         return CVarEntry("debug.ground", 0, True, "loose ground: waiting cave-ins red with their ticks left, awake settle boxes yellow, supports green (broken red), noises, the shedding level")
     if index == CVAR_GROUND_DEMO:
-        return CVarEntry("ground.demo", 0, True, "build a sand block, a soil shelf on a post and a timber-held ceiling ahead of Maroon (journaled), once; not while recording")
+        return CVarEntry("ground.demo", 0, True, "build a sand block, a soil shelf on a post and a timber-held ceiling ahead of the player (journaled), once; not while recording")
     if index == CVAR_DEBUG_FIELDS:
         return CVarEntry("debug.fields", 0, True, "fields: active blocks (red hot, blue wet, purple gas, green growing), burning cells orange, field areas, element states over what holds them, breath")
     if index == CVAR_FIELDS_DEMO:
-        return CVarEntry("fields.demo", 0, True, "build a lit timber frame (posts, a plank roof, a stone block on it), magma under a seep, a gas pocket and a damp stone wall ahead of Maroon (journaled), once; not while recording")
+        return CVarEntry("fields.demo", 0, True, "build a lit timber frame (posts, a plank roof, a stone block on it), magma under a seep, a gas pocket and a damp stone wall ahead of the player (journaled), once; not while recording")
     if index == CVAR_CAMERA_DITHER:
-        return CVarEntry("camera.dither", 1, True, "thin out rock and props between the camera and Maroon around him (0: draw them solid, to compare)")
+        return CVarEntry("camera.dither", 1, True, "thin out rock and props between the camera and the player around them (0: draw them solid, to compare)")
     if index == CVAR_SKIN_METHOD:
         return CVarEntry("skin.method", -1, False, "how skinned meshes deform: -1 as each asset's manifest says (linear blend when it does not), 0 linear blend, 1 dual quaternions, 2 centers of rotation")
     if index == CVAR_SKIN_GPU:
         return CVarEntry("skin.gpu", 1, True, "skin on the GPU when a GPU backend draws: the pose shown is one frame old (0: skin on the CPU, this frame's pose)")
     if index == CVAR_SKILLS_DEMO:
-        return CVarEntry("skills.demo", 0, True, "own every bear skill (clap, hug, uproot, belly slide, burrow) and build snow and ice to slide on, a dirt bank to burrow and a thin stone wall three metres right to clap ahead of Maroon (journaled), once; not while recording")
+        return CVarEntry("skills.demo", 0, True, "unlock every traversal skill and build snow and ice to slide on, a dirt bank to burrow and a thin stone wall three metres right to smash ahead of the player (journaled), once; not while recording")
     if index == CVAR_FORMS_DEMO:
-        return CVarEntry("forms.demo", 0, True, "unlock every form with full energy and build a stone wall to wall run along (right), a metal block to smash (ahead), a thin-roofed box to break through (left) and an updraft to glide up (further ahead) by Maroon (journaled; the updraft is not saved), once; not while recording")
+        return CVarEntry("forms.demo", 0, True, "unlock every form with full energy and build a stone wall to wall run along (right), a metal block to smash (ahead), a thin-roofed box to break through (left) and an updraft to glide up (further ahead) by the player (journaled; the updraft is not saved), once; not while recording")
     if index == CVAR_FX:
         return CVarEntry("fx.on", 1, True, "the effects library: decals, beams, swipes, flashes, dissolves, pickups, screen effects, ambient emitters, fire (package 2.13; 0: none of them)")
     if index == CVAR_FX_VIGNETTE:
-        return CVarEntry("fx.vignette", 1, True, "comfort scale of the red vignette when Maroon is hurt, 0 to 1")
+        return CVarEntry("fx.vignette", 1, True, "comfort scale of the red vignette when the player is hurt, 0 to 1")
     if index == CVAR_FX_LOW_HEALTH:
         return CVarEntry("fx.low_health", 1, True, "comfort scale of the low-health pulse, 0 to 1")
     if index == CVAR_FX_SPEED_LINES:
@@ -191,15 +191,15 @@ def cvar_entry(index: Int) -> CVarEntry:
     if index == CVAR_FX_DROPLETS:
         return CVarEntry("fx.droplets", 1, True, "comfort scale of the drops on the lens after leaving water, 0 to 1")
     if index == CVAR_FX_DEMO:
-        return CVarEntry("fx.demo", 0, True, "show every effect of the library around Maroon for a while (decals, a light beam, lightning, ambient emitters, a pickup, the screen effects), once; presentation only")
+        return CVarEntry("fx.demo", 0, True, "show every effect of the library around the player for a while (decals, a light beam, lightning, ambient emitters, a pickup, the screen effects), once; presentation only")
     if index == CVAR_DEBUG_FX:
         return CVarEntry("debug.fx", 0, True, "the effects library: decal boxes (green live, red refused), ambient emitter areas and their counts, the budget on the debug HUD")
     if index == CVAR_MECH_DEMO:
-        return CVarEntry("mechanics.demo", 0, True, "level the ground ahead of Maroon and build the mechanics proving ground there: a lift (stand on it), a conveyor, a piston that crushes, a door that stops, a tank that floods and drains, a magnet wall with an iron staircase and a three-mirror beam puzzle that opens a gate (journaled, recorded as a dev record), once; not in scripted runs")
+        return CVarEntry("mechanics.demo", 0, True, "level the ground ahead of the player and build the mechanics proving ground there: a lift (stand on it), a conveyor, a piston that crushes, a door that stops, a tank that floods and drains, a magnet wall with an iron staircase and a three-mirror beam puzzle that opens a gate (journaled, recorded as a dev record), once; not in scripted runs")
     if index == CVAR_DEBUG_MECH:
         return CVarEntry("debug.mechanics", 0, True, "movers (box, path, blocked), conveyor areas and their direction, magnets (reach, what they hold), pools (level), beam paths and receivers, and the signals on the debug HUD")
     if index == CVAR_LOGIC_DEMO:
-        return CVarEntry("logic.demo", 0, True, "level the ground ahead of Maroon and build the gameplay logic proving ground there: a checkpoint pad, a door that opens while he stands at it, a lever (E) that opens a gate, a roar-then-clap seal, and the Frost Warden's locked arena with three ice cores and two sleeping guards (journaled, recorded as a dev record), once; not in scripted runs")
+        return CVarEntry("logic.demo", 0, True, "level the ground ahead of the player and build the gameplay logic proving ground there: a checkpoint pad, a door that opens while the player stands at it, a lever (E) that opens a gate, a trigger seal, and a locked arena with three cores and two guards (journaled, recorded as a dev record), once; not in scripted runs")
     if index >= CVAR_MEM_BUDGET and index < CVAR_COUNT:
         var tag = index - CVAR_MEM_BUDGET
         return CVarEntry("mem.budget." + mem_tag_key(tag), default_budget_mib(tag), False, "MiB the " + mem_tag_key(tag) + " memory tag may hold; 0 = no budget")

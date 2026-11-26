@@ -7,7 +7,7 @@ copyable handle:
         renderer.sync(game, 2)
 
 A handle with no block behind it (the default) reads no clock and records
-nothing, so an unprofiled run pays one branch per zone. `SD_PROFILE=1` makes
+nothing, so an unprofiled run pays one branch per zone. `FLINT_PROFILE=1` makes
 `NativeRuntime` start a `ProfileTimeline`, which owns the block.
 
 A zone is written once, when it ends, into one shared ring of fixed cells:

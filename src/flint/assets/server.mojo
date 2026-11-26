@@ -12,8 +12,12 @@ Architecture:
     while bumping `reload_epoch++`.
 """
 from std.collections import Dict, Optional
+from std.ffi import external_call
+from flint.app.engine_app import Resource
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool
+from flint.ecs.world import comp_hash64
+from flint.assets.asset_ref import AssetRef, normalize_asset_rel_path
 from flint.assets.cooker_v2 import (
     cook_hdr_texture_bundle,
     cook_png_texture_bundle,
@@ -46,12 +50,15 @@ from flint.assets.flpk_v3 import (
     decode_texture_tail_slab,
     load_or_init_flmeta,
     mip_to_sub_id,
+    parse_flmeta_bytes,
+    read_flmeta,
 )
 from flint.assets.meshlet import AaaGeometryPool
 from flint.assets.watcher import AssetWatcher
+from flint.audio.qoa import decode_qoa
 from flint.physics.bvh import Bvh8MeshCollider
 from flint.platform.audio import decode_wav
-from flint.platform.os import read_bytes
+from flint.platform.os import file_size, is_symlink, list_directory, read_bytes
 from flint.platform.vulkan import (
     FORMAT_BC5_UNORM,
     FORMAT_BC6H_UFLOAT,
@@ -300,6 +307,17 @@ struct TypedAssetStorage[T: AssetPayload](Movable):
             var s = found.value()
             if s >= 0 and s < len(self.occupied) and self.occupied[s] and self.rel_paths[s] == rel_path:
                 return s
+        var alt = String()
+        if rel_path.startswith("assets/") and rel_path.byte_length() > 7:
+            alt = String(rel_path[byte=7:])
+        elif rel_path.byte_length() > 0:
+            alt = String("assets/") + rel_path
+        if alt.byte_length() > 0:
+            var alt_found = self.path_to_slot.get(alt)
+            if alt_found:
+                var s = alt_found.value()
+                if s >= 0 and s < len(self.occupied) and self.occupied[s] and self.rel_paths[s] == alt:
+                    return s
         return -1
 
     def find_slot_by_uuid(self, uuid: AssetUuid) -> Int:
@@ -777,11 +795,24 @@ def _infer_queued_bc7_dims(byte_size: Int, mip_level: Int) -> Tuple[Int, Int, In
     return (max(4, mip_w << shift), max(4, mip_h << shift), max(1, shift + 1))
 
 
-struct AssetServer(Movable):
+def _server_is_dir(path: String) -> Bool:
+    if path.byte_length() == 0 or is_symlink(path):
+        return False
+    var owned = path
+    var d = external_call["opendir", Int](owned.as_c_string_span())
+    if d == 0:
+        return False
+    _ = external_call["closedir", Int32](Pointer[UInt8, MutAnyOrigin](unsafe_from_address=d))
+    return True
+
+
+struct AssetServer(Resource, Movable):
     """Unified Flint v5 Asset Server managing persistent `.flpk` v3 mounts, generational handles,
     progressive byte-budgeted mip streaming, LRU eviction, and live recursive `inotify` hot-reload."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.assets.AssetServer")
     var mounts: List[FlpkV3MappedArchive]
     var loose_root: String
+    var loose_uuid_to_rel: Dict[String, String]
     var watcher: AssetWatcher
     var streamer: AaaResidencyStreamer
     var renderer_ptr: Int
@@ -799,6 +830,7 @@ struct AssetServer(Movable):
 
     var pending_mesh_loads: List[_PendingMeshLoad]
     var pending_texture_loads: List[_PendingTextureLoad]
+    var texture_roles: Dict[String, Int]
 
     def __init__(
         out self,
@@ -808,6 +840,7 @@ struct AssetServer(Movable):
     ):
         self.mounts = List[FlpkV3MappedArchive]()
         self.loose_root = String()
+        self.loose_uuid_to_rel = Dict[String, String]()
         self.watcher = AssetWatcher(enabled=enable_watcher)
         self.streamer = AaaResidencyStreamer(max_textures=1024, initial_tail_mip=4)
         self.renderer_ptr = 0
@@ -825,28 +858,33 @@ struct AssetServer(Movable):
 
         self.pending_mesh_loads = List[_PendingMeshLoad]()
         self.pending_texture_loads = List[_PendingTextureLoad]()
+        self.texture_roles = Dict[String, Int]()
 
-    def __moveinit__(out self, deinit existing: Self):
-        self.mounts = existing.mounts^
-        self.loose_root = existing.loose_root^
-        self.watcher = existing.watcher^
-        self.streamer = existing.streamer^
-        self.renderer_ptr = existing.renderer_ptr
-        self.stream_budget_bytes_per_tick = existing.stream_budget_bytes_per_tick
-        self.lru_max_bytes = existing.lru_max_bytes
-        self.current_tick = existing.current_tick
-        self.hot_reloads_applied = existing.hot_reloads_applied
-        self.meshes = existing.meshes^
-        self.textures = existing.textures^
-        self.hdrs = existing.hdrs^
-        self.fonts = existing.fonts^
-        self.audios = existing.audios^
-        self.raws = existing.raws^
-        self.pending_mesh_loads = existing.pending_mesh_loads^
-        self.pending_texture_loads = existing.pending_texture_loads^
-        existing.renderer_ptr = 0
+    def __init__(out self, *, deinit move: Self):
+        self.mounts = move.mounts^
+        self.loose_root = move.loose_root^
+        self.loose_uuid_to_rel = move.loose_uuid_to_rel^
+        self.watcher = move.watcher^
+        self.streamer = move.streamer^
+        self.renderer_ptr = move.renderer_ptr
+        self.stream_budget_bytes_per_tick = move.stream_budget_bytes_per_tick
+        self.lru_max_bytes = move.lru_max_bytes
+        self.current_tick = move.current_tick
+        self.hot_reloads_applied = move.hot_reloads_applied
+        self.meshes = move.meshes^
+        self.textures = move.textures^
+        self.hdrs = move.hdrs^
+        self.fonts = move.fonts^
+        self.audios = move.audios^
+        self.raws = move.raws^
+        self.pending_mesh_loads = move.pending_mesh_loads^
+        self.pending_texture_loads = move.pending_texture_loads^
+        self.texture_roles = move.texture_roles^
         if self.textures.evict_cb:
             self.textures.evict_ctx = Int(Pointer(to=self))
+
+    def __deinit__(deinit self):
+        self.close()
 
     def close(mut self):
         self.textures.clear_evict_hook()
@@ -993,6 +1031,32 @@ struct AssetServer(Movable):
         self.mounts.append(arch^)
         return True
 
+    def _scan_loose_flmetas(mut self, cur_dir: String, rel_prefix: String, depth: Int = 0):
+        if depth >= 64 or cur_dir.byte_length() == 0:
+            return
+        var names = list_directory(cur_dir)
+        for name in names:
+            var full = (cur_dir + "/" + name) if cur_dir != "/" else ("/" + name)
+            if is_symlink(full):
+                continue
+            var rel = (rel_prefix + "/" + name) if rel_prefix.byte_length() > 0 else name
+            if _server_is_dir(full):
+                self._scan_loose_flmetas(full, rel, depth + 1)
+            elif name.endswith(".flmeta"):
+                var raw = read_bytes(full)
+                var parsed = parse_flmeta_bytes(raw)
+                if parsed[0]:
+                    var asset_rel = String(rel[byte=0 : rel.byte_length() - 7])
+                    if asset_rel.byte_length() > 0:
+                        var key = TypedAssetStorage[CookedMeshAsset]._uuid_key(parsed[1].uuid)
+                        self.loose_uuid_to_rel[key] = asset_rel
+
+    def index_loose_directory(mut self):
+        self.loose_uuid_to_rel.clear()
+        if self.loose_root.byte_length() > 0:
+            var lr = self.loose_root
+            self._scan_loose_flmetas(lr, "")
+
     def watch_loose_directory(mut self, root_dir: String) -> Int:
         """Registers `root_dir` for loose-asset fallback and recursive `inotify` live hot-reload."""
         var clean = root_dir
@@ -1000,6 +1064,7 @@ struct AssetServer(Movable):
             var trimmed = String(clean[byte=0 : clean.byte_length() - 1])
             clean = trimmed^
         self.loose_root = clean
+        self.index_loose_directory()
         return self.watcher.watch_recursive(clean)
 
     def _find_in_mounts_by_uuid(self, uuid: AssetUuid, sub_id: UInt16 = 0) -> Tuple[Int, Int]:
@@ -1011,14 +1076,47 @@ struct AssetServer(Movable):
             m_idx -= 1
         return (-1, -1)
 
+    @staticmethod
+    def _assets_prefix_alt(rel_path: String) -> String:
+        if rel_path.startswith("assets/") and rel_path.byte_length() > 7:
+            return String(rel_path[byte=7:])
+        if rel_path.byte_length() > 0:
+            return String("assets/") + rel_path
+        return String()
+
     def _find_in_mounts_by_path(self, rel_path: String, sub_id: UInt16 = 0) -> Tuple[Int, Int]:
+        var alt = Self._assets_prefix_alt(rel_path)
         var m_idx = len(self.mounts) - 1
         while m_idx >= 0:
             var toc = self.mounts[m_idx].find_by_path(rel_path, sub_id)
             if toc >= 0:
                 return (m_idx, toc)
+            if alt.byte_length() > 0:
+                var atoc = self.mounts[m_idx].find_by_path(alt, sub_id)
+                if atoc >= 0:
+                    return (m_idx, atoc)
             m_idx -= 1
         return (-1, -1)
+
+    def _resolve_loose_disk_path(self, clean_rel: String, allow_empty: Bool = False) -> String:
+        if self.loose_root.byte_length() == 0 or clean_rel.byte_length() == 0:
+            return String()
+        var prefix = (self.loose_root + "/") if self.loose_root != "/" else String("/")
+        var direct = prefix + clean_rel
+        var d_sz = file_size(direct)
+        if d_sz > 0 or (allow_empty and d_sz == 0):
+            return direct
+        if clean_rel.startswith("assets/") and clean_rel.byte_length() > 7:
+            var stripped = prefix + String(clean_rel[byte=7:])
+            var s_sz = file_size(stripped)
+            if s_sz > 0 or (allow_empty and s_sz == 0):
+                return stripped
+        elif not clean_rel.startswith("assets/"):
+            var prefixed = prefix + "assets/" + clean_rel
+            var p_sz = file_size(prefixed)
+            if p_sz > 0 or (allow_empty and p_sz == 0):
+                return prefixed
+        return String()
 
     # ---- Mesh Loading ----
 
@@ -1035,23 +1133,29 @@ struct AssetServer(Movable):
         return self._decode_and_store_mesh_from_mount(loc[0], loc[1])
 
     def load_mesh(mut self, rel_path: String) -> Handle[CookedMeshAsset]:
-        var s = self.meshes.find_slot_by_path(rel_path)
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0:
+            return Handle[CookedMeshAsset]()
+        var clean_rel = norm[1]
+        var s = self.meshes.find_slot_by_path(clean_rel)
         if s >= 0:
             var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
             _ = self.meshes.retain(h)
             self.meshes.last_used_tick[s] = self.current_tick
             return h
 
-        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        var loc = self._find_in_mounts_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
-            return self._decode_and_store_mesh_from_mount(loc[0], loc[1])
+            var h_m = self._decode_and_store_mesh_from_mount(loc[0], loc[1])
+            if self.meshes.is_loaded(h_m):
+                return h_m
 
-        if self.loose_root.byte_length() > 0:
-            var full = self.loose_root + "/" + rel_path
+        var full = self._resolve_loose_disk_path(clean_rel)
+        if full.byte_length() > 0:
             var raw = read_bytes(full)
             if len(raw) > 0:
-                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_MESH)
-                var b = cook_single_source_bytes(raw, meta, rel_path)
+                var meta = load_or_init_flmeta(full, clean_rel, ASSET_KIND_MESH)
+                var b = cook_single_source_bytes(raw, meta, clean_rel)
                 if b.valid and len(b.chunks) > 0:
                     var asset = CookedMeshAsset()
                     var dec = decode_cooked_mesh_slab_into(b.chunks[0].raw_payload, asset.geom)
@@ -1060,8 +1164,219 @@ struct AssetServer(Movable):
                             var cdec = decode_bvh8_collider_slab(b.chunks[1].raw_payload)
                             asset.has_collider = cdec[0]
                             asset.collider = cdec[1].copy()
-                        return self.meshes.insert(asset^, meta.uuid, rel_path, self.current_tick)
+                        return self.meshes.insert(asset^, meta.uuid, clean_rel, self.current_tick)
         return Handle[CookedMeshAsset]()
+
+    def resolve_mesh(mut self, aref: AssetRef) -> Handle[CookedMeshAsset]:
+        """Resolves `AssetRef` (per-mount descending priority UUID + path/'assets/' alias, then loose `.flmeta` / `rel_path` fallback)."""
+        var norm = normalize_asset_rel_path(aref.rel_path)
+        if not norm[0]:
+            return Handle[CookedMeshAsset]()
+        var clean_rel = norm[1]
+        var s = -1
+        if not aref.uuid.is_nil():
+            s = self.meshes.find_slot_by_uuid(aref.uuid)
+        if s < 0 and clean_rel.byte_length() > 0:
+            s = self.meshes.find_slot_by_path(clean_rel)
+        if s >= 0:
+            var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
+            _ = self.meshes.retain(h)
+            self.meshes.last_used_tick[s] = self.current_tick
+            return h
+
+        var alt = Self._assets_prefix_alt(clean_rel)
+        var m_idx = len(self.mounts) - 1
+        while m_idx >= 0:
+            if not aref.uuid.is_nil():
+                var u_toc = self.mounts[m_idx].find_by_uuid(aref.uuid, SUB_ID_PRIMARY_OR_TAIL)
+                if u_toc >= 0:
+                    var h_u = self._decode_and_store_mesh_from_mount(m_idx, u_toc)
+                    if self.meshes.is_loaded(h_u):
+                        return h_u
+            if clean_rel.byte_length() > 0:
+                var p_toc = self.mounts[m_idx].find_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
+                if p_toc < 0 and alt.byte_length() > 0:
+                    p_toc = self.mounts[m_idx].find_by_path(alt, SUB_ID_PRIMARY_OR_TAIL)
+                if p_toc >= 0:
+                    var h_p = self._decode_and_store_mesh_from_mount(m_idx, p_toc)
+                    if self.meshes.is_loaded(h_p):
+                        return h_p
+            m_idx -= 1
+
+        if not aref.uuid.is_nil():
+            var ukey = TypedAssetStorage[CookedMeshAsset]._uuid_key(aref.uuid)
+            var loose_hit = self.loose_uuid_to_rel.get(ukey)
+            if loose_hit:
+                var h_loose = self.load_mesh(loose_hit.value())
+                if self.meshes.is_loaded(h_loose):
+                    return h_loose
+        if clean_rel.byte_length() > 0:
+            return self.load_mesh(clean_rel)
+        return Handle[CookedMeshAsset]()
+
+    def resolve_raw(mut self, aref: AssetRef) -> Handle[RawBytesAsset]:
+        """Resolves raw `AssetRef` (per-mount descending priority UUID + path/'assets/' alias, then loose `.flmeta` / `rel_path` fallback)."""
+        var norm = normalize_asset_rel_path(aref.rel_path)
+        if not norm[0]:
+            return Handle[RawBytesAsset]()
+        var clean_rel = norm[1]
+        var s = -1
+        if not aref.uuid.is_nil():
+            s = self.raws.find_slot_by_uuid(aref.uuid)
+        if s < 0 and clean_rel.byte_length() > 0:
+            s = self.raws.find_slot_by_path(clean_rel)
+        if s >= 0:
+            var h = Handle[RawBytesAsset](UInt32(s), self.raws.generations[s])
+            _ = self.raws.retain(h)
+            self.raws.last_used_tick[s] = self.current_tick
+            return h
+
+        var alt = Self._assets_prefix_alt(clean_rel)
+        var m_idx = len(self.mounts) - 1
+        while m_idx >= 0:
+            if not aref.uuid.is_nil():
+                var u_toc = self.mounts[m_idx].find_by_uuid(aref.uuid, SUB_ID_PRIMARY_OR_TAIL)
+                if u_toc >= 0:
+                    var e = self.mounts[m_idx].toc_entry(u_toc)
+                    var rp = self.mounts[m_idx].entry_path(u_toc)
+                    var pay = self.mounts[m_idx].read_payload_by_toc(u_toc, verify_crc=True)
+                    if pay[0]:
+                        return self.raws.insert(RawBytesAsset(pay[1].copy()), e.uuid, rp, self.current_tick)
+            if clean_rel.byte_length() > 0:
+                var p_toc = self.mounts[m_idx].find_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
+                if p_toc < 0 and alt.byte_length() > 0:
+                    p_toc = self.mounts[m_idx].find_by_path(alt, SUB_ID_PRIMARY_OR_TAIL)
+                if p_toc >= 0:
+                    var e = self.mounts[m_idx].toc_entry(p_toc)
+                    var rp = self.mounts[m_idx].entry_path(p_toc)
+                    var pay = self.mounts[m_idx].read_payload_by_toc(p_toc, verify_crc=True)
+                    if pay[0]:
+                        return self.raws.insert(RawBytesAsset(pay[1].copy()), e.uuid, rp, self.current_tick)
+            m_idx -= 1
+
+        if not aref.uuid.is_nil():
+            var ukey = TypedAssetStorage[CookedMeshAsset]._uuid_key(aref.uuid)
+            var loose_hit = self.loose_uuid_to_rel.get(ukey)
+            if loose_hit:
+                var h_loose = self.load_raw(loose_hit.value())
+                if self.raws.is_loaded(h_loose):
+                    return h_loose
+        if clean_rel.byte_length() > 0:
+            return self.load_raw(clean_rel)
+        return Handle[RawBytesAsset]()
+
+    def resolve_texture(mut self, aref: AssetRef, progressive: Bool = True) -> Handle[CookedTextureAsset]:
+        return self.resolve_texture_with_role(aref, role=0, progressive=progressive)
+
+    def resolve_texture_with_role(
+        mut self, aref: AssetRef, role: Int = 0, progressive: Bool = True
+    ) -> Handle[CookedTextureAsset]:
+        """Resolves texture `AssetRef` with optional role hint (`0=albedo/sRGB`, `1=normal/BC5`, `2=orm/linear`)."""
+        var norm = normalize_asset_rel_path(aref.rel_path)
+        if not norm[0]:
+            return Handle[CookedTextureAsset]()
+        var clean_rel = norm[1]
+        var s = -1
+        if not aref.uuid.is_nil():
+            s = self.textures.find_slot_by_uuid(aref.uuid)
+        if s < 0 and clean_rel.byte_length() > 0:
+            s = self.textures.find_slot_by_path(clean_rel)
+        if s >= 0:
+            var prev_role_opt = self.texture_roles.get(clean_rel)
+            var role_changed = (role != 0) and (not prev_role_opt or prev_role_opt.value() != role)
+            if clean_rel.byte_length() > 0 and role != 0:
+                self.texture_roles[clean_rel] = role
+            if role_changed and clean_rel.byte_length() > 0 and self.loose_root.byte_length() > 0:
+                var flmeta_base = self._resolve_loose_disk_path(clean_rel)
+                if flmeta_base.byte_length() > 0 and not read_flmeta(flmeta_base + ".flmeta")[0]:
+                    _ = self._hot_reload_path(clean_rel)
+            var h = Handle[CookedTextureAsset](UInt32(s), self.textures.generations[s])
+            _ = self.textures.retain(h)
+            self.textures.last_used_tick[s] = self.current_tick
+            self.streamer._ensure_slot(s)
+            if (self.renderer_ptr != 0 or self.streamer.vk_ptr != 0) and self.streamer.slot_bindless_idx[s] < 0:
+                self._upload_resident_mips_to_gpu(h)
+            return h
+
+        var alt = Self._assets_prefix_alt(clean_rel)
+        var m_idx = len(self.mounts) - 1
+        while m_idx >= 0:
+            if not aref.uuid.is_nil():
+                var u_toc = self.mounts[m_idx].find_by_uuid(aref.uuid, SUB_ID_PRIMARY_OR_TAIL)
+                if u_toc >= 0:
+                    if clean_rel.byte_length() > 0 and role != 0:
+                        self.texture_roles[clean_rel] = role
+                    var h_u = self._decode_and_store_texture_from_mount(m_idx, u_toc, progressive)
+                    if self.textures.is_loaded(h_u):
+                        return h_u
+            if clean_rel.byte_length() > 0:
+                var p_toc = self.mounts[m_idx].find_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
+                if p_toc < 0 and alt.byte_length() > 0:
+                    p_toc = self.mounts[m_idx].find_by_path(alt, SUB_ID_PRIMARY_OR_TAIL)
+                if p_toc >= 0:
+                    if role != 0:
+                        self.texture_roles[clean_rel] = role
+                    var h_p = self._decode_and_store_texture_from_mount(m_idx, p_toc, progressive)
+                    if self.textures.is_loaded(h_p):
+                        return h_p
+            m_idx -= 1
+
+        if not aref.uuid.is_nil():
+            var ukey = TypedAssetStorage[CookedMeshAsset]._uuid_key(aref.uuid)
+            var loose_hit = self.loose_uuid_to_rel.get(ukey)
+            if loose_hit:
+                var h_loose = self.load_texture_with_role(loose_hit.value(), role=role, progressive=progressive)
+                if self.textures.is_loaded(h_loose):
+                    return h_loose
+        if clean_rel.byte_length() > 0:
+            return self.load_texture_with_role(clean_rel, role=role, progressive=progressive)
+        return Handle[CookedTextureAsset]()
+
+    def resolve_audio(mut self, aref: AssetRef) -> Handle[CookedAudioAsset]:
+        var norm = normalize_asset_rel_path(aref.rel_path)
+        if not norm[0]:
+            return Handle[CookedAudioAsset]()
+        var clean_rel = norm[1]
+        var s = -1
+        if not aref.uuid.is_nil():
+            s = self.audios.find_slot_by_uuid(aref.uuid)
+        if s < 0 and clean_rel.byte_length() > 0:
+            s = self.audios.find_slot_by_path(clean_rel)
+        if s >= 0:
+            var h = Handle[CookedAudioAsset](UInt32(s), self.audios.generations[s])
+            _ = self.audios.retain(h)
+            self.audios.last_used_tick[s] = self.current_tick
+            return h
+
+        var alt = Self._assets_prefix_alt(clean_rel)
+        var m_idx = len(self.mounts) - 1
+        while m_idx >= 0:
+            if not aref.uuid.is_nil():
+                var u_toc = self.mounts[m_idx].find_by_uuid(aref.uuid, SUB_ID_PRIMARY_OR_TAIL)
+                if u_toc >= 0:
+                    var h_u = self._decode_and_store_audio_from_mount(m_idx, u_toc)
+                    if self.audios.is_loaded(h_u):
+                        return h_u
+            if clean_rel.byte_length() > 0:
+                var p_toc = self.mounts[m_idx].find_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
+                if p_toc < 0 and alt.byte_length() > 0:
+                    p_toc = self.mounts[m_idx].find_by_path(alt, SUB_ID_PRIMARY_OR_TAIL)
+                if p_toc >= 0:
+                    var h_p = self._decode_and_store_audio_from_mount(m_idx, p_toc)
+                    if self.audios.is_loaded(h_p):
+                        return h_p
+            m_idx -= 1
+
+        if not aref.uuid.is_nil():
+            var ukey = TypedAssetStorage[CookedMeshAsset]._uuid_key(aref.uuid)
+            var loose_hit = self.loose_uuid_to_rel.get(ukey)
+            if loose_hit:
+                var h_loose = self.load_audio(loose_hit.value())
+                if self.audios.is_loaded(h_loose):
+                    return h_loose
+        if clean_rel.byte_length() > 0:
+            return self.load_audio(clean_rel)
+        return Handle[CookedAudioAsset]()
 
     def _decode_and_store_mesh_from_mount(mut self, mount_idx: Int, toc_idx: Int) -> Handle[CookedMeshAsset]:
         var entry = self.mounts[mount_idx].toc_entry(toc_idx)
@@ -1095,56 +1410,105 @@ struct AssetServer(Movable):
 
     # ---- Texture Loading & Progressive Mip Streaming ----
 
+    def _decode_and_store_texture_from_mount(
+        mut self, mount_idx: Int, toc_idx: Int, progressive: Bool
+    ) -> Handle[CookedTextureAsset]:
+        var entry = self.mounts[mount_idx].toc_entry(toc_idx)
+        var rpath = self.mounts[mount_idx].entry_path(toc_idx)
+        var pay = self.mounts[mount_idx].read_payload_by_toc(toc_idx, verify_crc=True)
+        if not pay[0]:
+            return Handle[CookedTextureAsset]()
+        var dec = decode_texture_tail_slab(pay[1])
+        if not dec[0]:
+            return Handle[CookedTextureAsset]()
+        var hdr = dec[1].copy()
+        var asset = CookedTextureAsset()
+        asset.width = Int(hdr.width)
+        asset.height = Int(hdr.height)
+        asset.mip_count = Int(hdr.mip_count)
+        asset.tail_first_mip = Int(hdr.tail_first_mip)
+        asset.resident_min_mip = Int(hdr.tail_first_mip)
+        asset.tex_format = hdr.tex_format
+        asset.mip_sizes = hdr.mip_sizes.copy()
+        asset.mips = dec[2].copy()
+
+        var h = self.textures.insert(asset^, entry.uuid, rpath, self.current_tick)
+        var slot_i = Int(h.slot())
+        self.streamer._ensure_slot(slot_i)
+        self.streamer.resident_min_mip[slot_i] = Int(hdr.tail_first_mip)
+        self.streamer.requested_min_mip[slot_i] = Int(hdr.tail_first_mip)
+        self._upload_resident_mips_to_gpu(h)
+        if progressive and Int(hdr.tail_first_mip) > 0:
+            self.request_texture_mips(h, target_min_mip=0)
+        else:
+            # Eagerly load all high-res mips immediately
+            for m in range(Int(hdr.tail_first_mip) - 1, -1, -1):
+                if self._stream_single_texture_mip(slot_i, m):
+                    if self.renderer_ptr != 0 or self.streamer.vk_ptr != 0:
+                        _ = self.upload_mip_to_gpu(h, m, 0)
+        return h
+
+    def ensure_texture_gpu_slot(mut self, h: Handle[CookedTextureAsset]) -> Int:
+        """Ensures `h` has an uploaded bindless GPU texture slot (`0..254`), returning `-1` if unavailable."""
+        var s = self.textures.valid_slot(h)
+        if s < 0:
+            return -1
+        self.streamer._ensure_slot(s)
+        var b_idx = self.streamer.slot_bindless_idx[s]
+        if b_idx < 0 and (self.renderer_ptr != 0 or self.streamer.vk_ptr != 0):
+            self._upload_resident_mips_to_gpu(h)
+            b_idx = self.streamer.slot_bindless_idx[s]
+        if b_idx >= 0 and b_idx < 255:
+            return b_idx
+        return -1
+
     def load_texture(mut self, rel_path: String, progressive: Bool = True) -> Handle[CookedTextureAsset]:
-        var s = self.textures.find_slot_by_path(rel_path)
+        return self.load_texture_with_role(rel_path, role=0, progressive=progressive)
+
+    def load_texture_with_role(
+        mut self, rel_path: String, role: Int = 0, progressive: Bool = True
+    ) -> Handle[CookedTextureAsset]:
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0:
+            return Handle[CookedTextureAsset]()
+        var clean_rel = norm[1]
+        var prev_role_opt = self.texture_roles.get(clean_rel)
+        if not prev_role_opt:
+            var alt_rel = Self._assets_prefix_alt(clean_rel)
+            if alt_rel.byte_length() > 0:
+                prev_role_opt = self.texture_roles.get(alt_rel)
+        var role_changed = (role != 0) and (not prev_role_opt or prev_role_opt.value() != role)
+        if role != 0:
+            self.texture_roles[clean_rel] = role
+        var s = self.textures.find_slot_by_path(clean_rel)
         if s >= 0:
+            if role_changed and self.loose_root.byte_length() > 0:
+                var full_r = self._resolve_loose_disk_path(clean_rel)
+                if full_r.byte_length() > 0 and not read_flmeta(full_r + ".flmeta")[0]:
+                    _ = self._hot_reload_path(clean_rel)
             var h = Handle[CookedTextureAsset](UInt32(s), self.textures.generations[s])
             _ = self.textures.retain(h)
             self.textures.last_used_tick[s] = self.current_tick
+            self.streamer._ensure_slot(s)
+            if (self.renderer_ptr != 0 or self.streamer.vk_ptr != 0) and self.streamer.slot_bindless_idx[s] < 0:
+                self._upload_resident_mips_to_gpu(h)
             return h
 
-        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        var loc = self._find_in_mounts_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
-            var entry = self.mounts[loc[0]].toc_entry(loc[1])
-            var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
-            if not pay[0]:
-                return Handle[CookedTextureAsset]()
-            var dec = decode_texture_tail_slab(pay[1])
-            if not dec[0]:
-                return Handle[CookedTextureAsset]()
-            var hdr = dec[1].copy()
-            var asset = CookedTextureAsset()
-            asset.width = Int(hdr.width)
-            asset.height = Int(hdr.height)
-            asset.mip_count = Int(hdr.mip_count)
-            asset.tail_first_mip = Int(hdr.tail_first_mip)
-            asset.resident_min_mip = Int(hdr.tail_first_mip)
-            asset.tex_format = hdr.tex_format
-            asset.mip_sizes = hdr.mip_sizes.copy()
-            asset.mips = dec[2].copy()
+            var h_t = self._decode_and_store_texture_from_mount(loc[0], loc[1], progressive)
+            if self.textures.is_loaded(h_t):
+                return h_t
 
-            var h = self.textures.insert(asset^, entry.uuid, rel_path, self.current_tick)
-            var slot_i = Int(h.slot())
-            self.streamer._ensure_slot(slot_i)
-            self.streamer.resident_min_mip[slot_i] = Int(hdr.tail_first_mip)
-            self.streamer.requested_min_mip[slot_i] = Int(hdr.tail_first_mip)
-            self._upload_resident_mips_to_gpu(h)
-            if progressive and Int(hdr.tail_first_mip) > 0:
-                self.request_texture_mips(h, target_min_mip=0)
-            else:
-                # Eagerly load all high-res mips immediately
-                for m in range(Int(hdr.tail_first_mip) - 1, -1, -1):
-                    if self._stream_single_texture_mip(slot_i, m):
-                        if self.renderer_ptr != 0 or self.streamer.vk_ptr != 0:
-                            _ = self.upload_mip_to_gpu(h, m, 0)
-            return h
-
-        if self.loose_root.byte_length() > 0:
-            var full = self.loose_root + "/" + rel_path
+        var full = self._resolve_loose_disk_path(clean_rel)
+        if full.byte_length() > 0:
             var raw = read_bytes(full)
             if len(raw) > 0:
-                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_TEXTURE)
-                var cooked = cook_png_texture_bundle(raw, meta, rel_path)
+                var has_flmeta = read_flmeta(full + ".flmeta")[0]
+                var meta = load_or_init_flmeta(full, clean_rel, ASSET_KIND_TEXTURE)
+                if not has_flmeta and (role == 1 or role == 2):
+                    meta.srgb = False
+                var cooked = cook_png_texture_bundle(raw, meta, clean_rel, force_normal=(not has_flmeta and role == 1))
                 if cooked.valid and len(cooked.chunks) > 0:
                     var dec = decode_texture_tail_slab(cooked.chunks[0].raw_payload)
                     if dec[0]:
@@ -1162,7 +1526,7 @@ struct AssetServer(Movable):
                             var sub_m = Int(cooked.chunks[ci].sub_id) - 1
                             if sub_m >= 0 and sub_m < len(asset.mips):
                                 asset.mips[sub_m] = cooked.chunks[ci].raw_payload.copy()
-                        var h = self.textures.insert(asset^, meta.uuid, rel_path, self.current_tick)
+                        var h = self.textures.insert(asset^, meta.uuid, clean_rel, self.current_tick)
                         var slot_i = Int(h.slot())
                         self.streamer._ensure_slot(slot_i)
                         self.streamer.resident_min_mip[slot_i] = 0
@@ -1219,50 +1583,52 @@ struct AssetServer(Movable):
     # ---- Font, Audio, HDR & Raw Loading ----
 
     def load_hdr(mut self, rel_path: String) -> Handle[CookedHdrAsset]:
-        var s = self.hdrs.find_slot_by_path(rel_path)
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0:
+            return Handle[CookedHdrAsset]()
+        var clean_rel = norm[1]
+        var s = self.hdrs.find_slot_by_path(clean_rel)
         if s >= 0:
             var h = Handle[CookedHdrAsset](UInt32(s), self.hdrs.generations[s])
             _ = self.hdrs.retain(h)
             self.hdrs.last_used_tick[s] = self.current_tick
             return h
 
-        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        var loc = self._find_in_mounts_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
             var entry = self.mounts[loc[0]].toc_entry(loc[1])
             var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
-            if not pay[0]:
-                return Handle[CookedHdrAsset]()
-            var dec = decode_texture_tail_slab(pay[1])
-            if not dec[0]:
-                return Handle[CookedHdrAsset]()
-            var hdr = dec[1].copy()
-            var asset = CookedHdrAsset()
-            asset.width = Int(hdr.width)
-            asset.height = Int(hdr.height)
-            asset.mip_count = Int(hdr.mip_count)
-            asset.tail_first_mip = Int(hdr.tail_first_mip)
-            asset.resident_min_mip = Int(hdr.tail_first_mip)
-            asset.mip_sizes = hdr.mip_sizes.copy()
-            asset.mips = dec[2].copy()
-            var m = Int(hdr.tail_first_mip) - 1
-            while m >= 0:
-                var mloc = self._find_in_mounts_by_uuid(entry.uuid, mip_to_sub_id(m))
-                if mloc[0] < 0:
-                    mloc = self._find_in_mounts_by_path(rel_path, mip_to_sub_id(m))
-                if mloc[0] >= 0:
-                    var mpay = self.mounts[mloc[0]].read_payload_by_toc(mloc[1], verify_crc=True)
-                    if mpay[0] and m < len(asset.mips):
-                        asset.mips[m] = mpay[1].copy()
-                        asset.resident_min_mip = m
-                m -= 1
-            return self.hdrs.insert(asset^, entry.uuid, rel_path, self.current_tick)
+            if pay[0]:
+                var dec = decode_texture_tail_slab(pay[1])
+                if dec[0]:
+                    var hdr = dec[1].copy()
+                    var asset = CookedHdrAsset()
+                    asset.width = Int(hdr.width)
+                    asset.height = Int(hdr.height)
+                    asset.mip_count = Int(hdr.mip_count)
+                    asset.tail_first_mip = Int(hdr.tail_first_mip)
+                    asset.resident_min_mip = Int(hdr.tail_first_mip)
+                    asset.mip_sizes = hdr.mip_sizes.copy()
+                    asset.mips = dec[2].copy()
+                    var m = Int(hdr.tail_first_mip) - 1
+                    while m >= 0:
+                        var mloc = self._find_in_mounts_by_uuid(entry.uuid, mip_to_sub_id(m))
+                        if mloc[0] < 0:
+                            mloc = self._find_in_mounts_by_path(clean_rel, mip_to_sub_id(m))
+                        if mloc[0] >= 0:
+                            var mpay = self.mounts[mloc[0]].read_payload_by_toc(mloc[1], verify_crc=True)
+                            if mpay[0] and m < len(asset.mips):
+                                asset.mips[m] = mpay[1].copy()
+                                asset.resident_min_mip = m
+                        m -= 1
+                    return self.hdrs.insert(asset^, entry.uuid, clean_rel, self.current_tick)
 
-        if self.loose_root.byte_length() > 0:
-            var full = self.loose_root + "/" + rel_path
+        var full = self._resolve_loose_disk_path(clean_rel)
+        if full.byte_length() > 0:
             var raw = read_bytes(full)
             if len(raw) > 0:
-                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_HDR)
-                var cooked = cook_hdr_texture_bundle(raw, meta, rel_path)
+                var meta = load_or_init_flmeta(full, clean_rel, ASSET_KIND_HDR)
+                var cooked = cook_hdr_texture_bundle(raw, meta, clean_rel)
                 if cooked.valid and len(cooked.chunks) > 0:
                     var dec = decode_texture_tail_slab(cooked.chunks[0].raw_payload)
                     if dec[0]:
@@ -1279,100 +1645,136 @@ struct AssetServer(Movable):
                             var sub_m = Int(cooked.chunks[ci].sub_id) - 1
                             if sub_m >= 0 and sub_m < len(asset.mips):
                                 asset.mips[sub_m] = cooked.chunks[ci].raw_payload.copy()
-                        return self.hdrs.insert(asset^, meta.uuid, rel_path, self.current_tick)
+                        return self.hdrs.insert(asset^, meta.uuid, clean_rel, self.current_tick)
         return Handle[CookedHdrAsset]()
 
     def load_font(mut self, rel_path: String) -> Handle[CookedFontAsset]:
-        var s = self.fonts.find_slot_by_path(rel_path)
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0:
+            return Handle[CookedFontAsset]()
+        var clean_rel = norm[1]
+        var s = self.fonts.find_slot_by_path(clean_rel)
         if s >= 0:
             var h = Handle[CookedFontAsset](UInt32(s), self.fonts.generations[s])
             _ = self.fonts.retain(h)
             self.fonts.last_used_tick[s] = self.current_tick
             return h
-        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        var loc = self._find_in_mounts_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
             var e = self.mounts[loc[0]].toc_entry(loc[1])
             var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
             if pay[0]:
                 var fa = CookedFontAsset()
                 fa.dsf_data = pay[1].copy()
-                _ = fa.font.load_bytes(fa.dsf_data)
-                return self.fonts.insert(fa^, e.uuid, rel_path, self.current_tick)
-        if self.loose_root.byte_length() > 0:
-            var full = self.loose_root + "/" + rel_path
+                if fa.font.load_bytes(fa.dsf_data):
+                    return self.fonts.insert(fa^, e.uuid, clean_rel, self.current_tick)
+        var full = self._resolve_loose_disk_path(clean_rel)
+        if full.byte_length() > 0:
             var raw = read_bytes(full)
             if len(raw) > 0:
-                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_FONT)
+                var meta = load_or_init_flmeta(full, clean_rel, ASSET_KIND_FONT)
                 var fa = CookedFontAsset()
                 if fa.font.load_bytes(raw):
                     fa.dsf_data = raw.copy()
-                    return self.fonts.insert(fa^, meta.uuid, rel_path, self.current_tick)
-                var cooked = cook_ttf_font_bundle(raw, meta, rel_path)
+                    return self.fonts.insert(fa^, meta.uuid, clean_rel, self.current_tick)
+                var cooked = cook_ttf_font_bundle(raw, meta, clean_rel)
                 if cooked.valid and len(cooked.chunks) > 0:
                     fa.dsf_data = cooked.chunks[0].raw_payload.copy()
                     if fa.font.load_bytes(fa.dsf_data):
-                        return self.fonts.insert(fa^, meta.uuid, rel_path, self.current_tick)
+                        return self.fonts.insert(fa^, meta.uuid, clean_rel, self.current_tick)
         return Handle[CookedFontAsset]()
 
+    @staticmethod
+    def _decode_audio_bytes_into(raw: List[UInt8], mut aa: CookedAudioAsset) -> Bool:
+        var dec = decode_audio_pcm_slab(raw)
+        if dec[0]:
+            aa.channels = dec[1]
+            aa.sample_rate = dec[2]
+            aa.samples = dec[3].copy()
+            return True
+        var clip = decode_wav(raw)
+        if clip.valid:
+            aa.channels = clip.channels
+            aa.sample_rate = clip.sample_rate
+            aa.samples = clip.samples.copy()
+            return True
+        var qclip = decode_qoa(raw)
+        if qclip.valid:
+            aa.channels = qclip.channels
+            aa.sample_rate = qclip.sample_rate
+            aa.samples = qclip.samples.copy()
+            return True
+        return False
+
+    def _decode_and_store_audio_from_mount(mut self, mount_idx: Int, toc_idx: Int) -> Handle[CookedAudioAsset]:
+        var e = self.mounts[mount_idx].toc_entry(toc_idx)
+        var rpath = self.mounts[mount_idx].entry_path(toc_idx)
+        var pay = self.mounts[mount_idx].read_payload_by_toc(toc_idx, verify_crc=True)
+        if pay[0]:
+            var aa = CookedAudioAsset()
+            if Self._decode_audio_bytes_into(pay[1], aa):
+                return self.audios.insert(aa^, e.uuid, rpath, self.current_tick)
+        return Handle[CookedAudioAsset]()
+
     def load_audio(mut self, rel_path: String) -> Handle[CookedAudioAsset]:
-        var s = self.audios.find_slot_by_path(rel_path)
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0:
+            return Handle[CookedAudioAsset]()
+        var clean_rel = norm[1]
+        var s = self.audios.find_slot_by_path(clean_rel)
         if s >= 0:
             var h = Handle[CookedAudioAsset](UInt32(s), self.audios.generations[s])
             _ = self.audios.retain(h)
             self.audios.last_used_tick[s] = self.current_tick
             return h
-        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        var loc = self._find_in_mounts_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
-            var e = self.mounts[loc[0]].toc_entry(loc[1])
-            var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
-            if pay[0]:
-                var dec = decode_audio_pcm_slab(pay[1])
-                if dec[0]:
-                    var aa = CookedAudioAsset()
-                    aa.channels = dec[1]
-                    aa.sample_rate = dec[2]
-                    aa.samples = dec[3].copy()
-                    return self.audios.insert(aa^, e.uuid, rel_path, self.current_tick)
-        if self.loose_root.byte_length() > 0:
-            var full = self.loose_root + "/" + rel_path
+            var h_a = self._decode_and_store_audio_from_mount(loc[0], loc[1])
+            if self.audios.is_loaded(h_a):
+                return h_a
+        var full = self._resolve_loose_disk_path(clean_rel)
+        if full.byte_length() > 0:
             var raw = read_bytes(full)
             if len(raw) > 0:
-                var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_AUDIO)
-                var dec = decode_audio_pcm_slab(raw)
-                if dec[0]:
-                    var aa = CookedAudioAsset()
-                    aa.channels = dec[1]
-                    aa.sample_rate = dec[2]
-                    aa.samples = dec[3].copy()
-                    return self.audios.insert(aa^, meta.uuid, rel_path, self.current_tick)
-                var clip = decode_wav(raw)
-                if clip.valid:
-                    var aa = CookedAudioAsset()
-                    aa.channels = clip.channels
-                    aa.sample_rate = clip.sample_rate
-                    aa.samples = clip.samples.copy()
-                    return self.audios.insert(aa^, meta.uuid, rel_path, self.current_tick)
+                var meta = load_or_init_flmeta(full, clean_rel, ASSET_KIND_AUDIO)
+                var aa = CookedAudioAsset()
+                if Self._decode_audio_bytes_into(raw, aa):
+                    return self.audios.insert(aa^, meta.uuid, clean_rel, self.current_tick)
         return Handle[CookedAudioAsset]()
 
     def load_raw(mut self, rel_path: String) -> Handle[RawBytesAsset]:
-        var s = self.raws.find_slot_by_path(rel_path)
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0:
+            return Handle[RawBytesAsset]()
+        var clean_rel = norm[1]
+        var s = self.raws.find_slot_by_path(clean_rel)
         if s >= 0:
             var h = Handle[RawBytesAsset](UInt32(s), self.raws.generations[s])
             _ = self.raws.retain(h)
             self.raws.last_used_tick[s] = self.current_tick
             return h
-        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        var loc = self._find_in_mounts_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
             var e = self.mounts[loc[0]].toc_entry(loc[1])
             var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
             if pay[0]:
-                return self.raws.insert(RawBytesAsset(pay[1].copy()), e.uuid, rel_path, self.current_tick)
-        if self.loose_root.byte_length() > 0:
-            var full = self.loose_root + "/" + rel_path
+                return self.raws.insert(RawBytesAsset(pay[1].copy()), e.uuid, clean_rel, self.current_tick)
+        var full = self._resolve_loose_disk_path(clean_rel, allow_empty=True)
+        if full.byte_length() > 0:
             var raw = read_bytes(full)
-            if len(raw) > 0:
-                return self.raws.insert(RawBytesAsset(raw^), AssetUuid.from_path(rel_path), rel_path, self.current_tick)
+            return self.raws.insert(RawBytesAsset(raw^), AssetUuid.from_path(clean_rel), clean_rel, self.current_tick)
         return Handle[RawBytesAsset]()
+
+    def reload_raw_from_disk(mut self, rel_path: String) -> Bool:
+        """Reloads `rel_path` from `loose_root` if already cached in `raws` (or loads it fresh)."""
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0 or self.loose_root.byte_length() == 0:
+            return False
+        var clean_rel = norm[1]
+        var rs = self.raws.find_slot_by_path(clean_rel)
+        if rs >= 0:
+            return self._hot_reload_path(clean_rel)
+        return self.raws.is_loaded(self.load_raw(clean_rel))
 
     # ---- Async `JobPool`-Backed Loading API ----
 
@@ -1387,20 +1789,24 @@ struct AssetServer(Movable):
 
     def load_mesh_async(mut self, rel_path: String) -> Handle[CookedMeshAsset]:
         """Queues a mesh for `JobPool`-backed async decoding, immediately returning a handle in `ASSET_STATE_LOADING`."""
-        var s = self.meshes.find_slot_by_path(rel_path)
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0:
+            return Handle[CookedMeshAsset]()
+        var clean_rel = norm[1]
+        var s = self.meshes.find_slot_by_path(clean_rel)
         if s >= 0:
             var h = Handle[CookedMeshAsset](UInt32(s), self.meshes.generations[s])
             _ = self.meshes.retain(h)
             self.meshes.last_used_tick[s] = self.current_tick
             return h
 
-        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        var loc = self._find_in_mounts_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
             var entry = self.mounts[loc[0]].toc_entry(loc[1])
-            var h = self.meshes.allocate_queued(entry.uuid, rel_path, self.current_tick)
-            var job = _PendingMeshLoad(h, rel_path)
             var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
             if pay[0]:
+                var h = self.meshes.allocate_queued(entry.uuid, clean_rel, self.current_tick)
+                var job = _PendingMeshLoad(h, clean_rel)
                 job.is_cooked_slab = True
                 job.slab_bytes = pay[1].copy()
                 job.has_source = True
@@ -1409,43 +1815,49 @@ struct AssetServer(Movable):
                     var cpay = self.mounts[col_loc[0]].read_payload_by_toc(col_loc[1], verify_crc=True)
                     if cpay[0]:
                         job.collider_bytes = cpay[1].copy()
-            self.pending_mesh_loads.append(job^)
-            return h
+                self.pending_mesh_loads.append(job^)
+                return h
 
-        var h = self.meshes.allocate_queued(AssetUuid.from_path(rel_path), rel_path, self.current_tick)
-        var job = _PendingMeshLoad(h, rel_path)
-        if self.loose_root.byte_length() > 0:
-            job.full_path = self.loose_root + "/" + rel_path
+        var h = self.meshes.allocate_queued(AssetUuid.from_path(clean_rel), clean_rel, self.current_tick)
+        var job = _PendingMeshLoad(h, clean_rel)
+        var full = self._resolve_loose_disk_path(clean_rel)
+        if full.byte_length() > 0:
+            job.full_path = full
             job.has_source = True
         self.pending_mesh_loads.append(job^)
         return h
 
     def load_texture_async(mut self, rel_path: String, progressive: Bool = True) -> Handle[CookedTextureAsset]:
         """Queues a texture for `JobPool`-backed async cooking/decoding, immediately returning a handle in `ASSET_STATE_LOADING`."""
-        var s = self.textures.find_slot_by_path(rel_path)
+        var norm = normalize_asset_rel_path(rel_path)
+        if not norm[0] or norm[1].byte_length() == 0:
+            return Handle[CookedTextureAsset]()
+        var clean_rel = norm[1]
+        var s = self.textures.find_slot_by_path(clean_rel)
         if s >= 0:
             var h = Handle[CookedTextureAsset](UInt32(s), self.textures.generations[s])
             _ = self.textures.retain(h)
             self.textures.last_used_tick[s] = self.current_tick
             return h
 
-        var loc = self._find_in_mounts_by_path(rel_path, SUB_ID_PRIMARY_OR_TAIL)
+        var loc = self._find_in_mounts_by_path(clean_rel, SUB_ID_PRIMARY_OR_TAIL)
         if loc[0] >= 0:
             var entry = self.mounts[loc[0]].toc_entry(loc[1])
-            var h = self.textures.allocate_queued(entry.uuid, rel_path, self.current_tick)
-            var job = _PendingTextureLoad(h, rel_path, progressive)
             var pay = self.mounts[loc[0]].read_payload_by_toc(loc[1], verify_crc=True)
             if pay[0]:
+                var h = self.textures.allocate_queued(entry.uuid, clean_rel, self.current_tick)
+                var job = _PendingTextureLoad(h, clean_rel, progressive)
                 job.is_cooked_tail = True
                 job.tail_bytes = pay[1].copy()
                 job.has_source = True
-            self.pending_texture_loads.append(job^)
-            return h
+                self.pending_texture_loads.append(job^)
+                return h
 
-        var h = self.textures.allocate_queued(AssetUuid.from_path(rel_path), rel_path, self.current_tick)
-        var job = _PendingTextureLoad(h, rel_path, progressive)
-        if self.loose_root.byte_length() > 0:
-            job.full_path = self.loose_root + "/" + rel_path
+        var h = self.textures.allocate_queued(AssetUuid.from_path(clean_rel), clean_rel, self.current_tick)
+        var job = _PendingTextureLoad(h, clean_rel, progressive)
+        var full = self._resolve_loose_disk_path(clean_rel)
+        if full.byte_length() > 0:
+            job.full_path = full
             job.has_source = True
         self.pending_texture_loads.append(job^)
         return h
@@ -1526,16 +1938,48 @@ struct AssetServer(Movable):
     def _hot_reload_path(mut self, rel_path: String) -> Bool:
         if self.loose_root.byte_length() == 0:
             return False
-        var full = self.loose_root + "/" + rel_path
+        var norm = normalize_asset_rel_path(rel_path)
+        var clean_rel = norm[1] if (norm[0] and norm[1].byte_length() > 0) else rel_path
+        var rs_pre = self.raws.find_slot_by_path(clean_rel)
+        var full = self._resolve_loose_disk_path(clean_rel, allow_empty=(rs_pre >= 0))
+        if full.byte_length() == 0:
+            return False
         var raw = read_bytes(full)
         if len(raw) == 0:
+            if rs_pre >= 0:
+                var h_raw = Handle[RawBytesAsset](UInt32(rs_pre), self.raws.generations[rs_pre])
+                if self.raws.replace_in_place(h_raw, RawBytesAsset(raw^), self.current_tick):
+                    self.hot_reloads_applied += 1
+                    return True
+            return False
+
+        if clean_rel.endswith(".flmeta"):
+            var parsed = parse_flmeta_bytes(raw)
+            if parsed[0]:
+                var asset_rel = String(clean_rel[byte=0 : clean_rel.byte_length() - 7])
+                if asset_rel.byte_length() > 0:
+                    var key = TypedAssetStorage[CookedMeshAsset]._uuid_key(parsed[1].uuid)
+                    self.loose_uuid_to_rel[key] = asset_rel
+                    return True
             return False
 
         # Check textures (O(1) lookup)
-        var ts = self.textures.find_slot_by_path(rel_path)
+        var ts = self.textures.find_slot_by_path(clean_rel)
         if ts >= 0:
-            var meta = load_or_init_flmeta(full, rel_path, ASSET_KIND_TEXTURE)
-            var cooked = cook_png_texture_bundle(raw, meta, rel_path)
+            var tex_rel = self.textures.rel_paths[ts]
+            var has_flmeta = read_flmeta(full + ".flmeta")[0]
+            var meta = load_or_init_flmeta(full, tex_rel, ASSET_KIND_TEXTURE)
+            var role_opt = self.texture_roles.get(clean_rel)
+            if not role_opt:
+                role_opt = self.texture_roles.get(tex_rel)
+            if not role_opt:
+                var alt_rel = Self._assets_prefix_alt(clean_rel)
+                if alt_rel.byte_length() > 0:
+                    role_opt = self.texture_roles.get(alt_rel)
+            var role = role_opt.value() if role_opt else 0
+            if not has_flmeta and (role == 1 or role == 2):
+                meta.srgb = False
+            var cooked = cook_png_texture_bundle(raw, meta, tex_rel, force_normal=(not has_flmeta and role == 1))
             if cooked.valid and len(cooked.chunks) > 0:
                 var dec = decode_texture_tail_slab(cooked.chunks[0].raw_payload)
                 if dec[0]:
@@ -1626,21 +2070,7 @@ struct AssetServer(Movable):
         var aus = self.audios.find_slot_by_path(rel_path)
         if aus >= 0:
             var aa = CookedAudioAsset()
-            var ok_aud = False
-            var dec = decode_audio_pcm_slab(raw)
-            if dec[0]:
-                aa.channels = dec[1]
-                aa.sample_rate = dec[2]
-                aa.samples = dec[3].copy()
-                ok_aud = True
-            else:
-                var clip = decode_wav(raw)
-                if clip.valid:
-                    aa.channels = clip.channels
-                    aa.sample_rate = clip.sample_rate
-                    aa.samples = clip.samples.copy()
-                    ok_aud = True
-            if ok_aud:
+            if Self._decode_audio_bytes_into(raw, aa):
                 var h = Handle[CookedAudioAsset](UInt32(aus), self.audios.generations[aus])
                 if self.audios.replace_in_place(h, aa^, self.current_tick):
                     self.hot_reloads_applied += 1

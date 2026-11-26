@@ -70,11 +70,13 @@ comptime TEX_FMT_BC6H_UFLOAT: UInt8 = 4
 comptime SUB_ID_PRIMARY_OR_TAIL: UInt16 = 0
 comptime SUB_ID_MIP_BASE: UInt16 = 1           # sub_id 1..15 -> high-res mips 0..14
 comptime SUB_ID_BVH8_COLLIDER: UInt16 = 16
+comptime SUB_ID_RIG: UInt16 = 17
 
 comptime COOKED_MESH_SLAB_MAGIC: UInt32 = 0x48534D46  # "FMSH"
 comptime COOKED_TEX_SLAB_MAGIC: UInt32 = 0x58455446   # "FTEX"
 comptime COOKED_BVH8_SLAB_MAGIC: UInt32 = 0x38485642  # "BVH8"
 comptime COOKED_AUD_SLAB_MAGIC: UInt32 = 0x44554146   # "FAUD"
+comptime COOKED_RIG_SLAB_MAGIC: UInt32 = 0x47495246   # "FRIG"
 
 
 @always_inline
@@ -869,6 +871,16 @@ struct FlpkV3MappedArchive(Movable):
         self.valid = False
         self.header = FlpkV3Header()
         self.error_note = String()
+
+    def __init__(out self, *, deinit move: Self):
+        self.path = move.path^
+        self.fd = move.fd
+        self.addr = move.addr
+        self.size = move.size
+        self.entry_count = move.entry_count
+        self.valid = move.valid
+        self.header = move.header
+        self.error_note = move.error_note^
 
     def __deinit__(deinit self):
         if self.addr != 0 and self.size > 0:
@@ -1792,3 +1804,34 @@ def decode_audio_pcm_slab(data: List[UInt8]) -> Tuple[Bool, Int, Int, List[Int16
         pcm.append(Int16(u))
     _ = len(data)
     return (True, ch, sr, pcm^)
+
+
+def encode_cooked_rig_slab(rig_bytes: List[UInt8]) -> List[UInt8]:
+    """Wraps or validates a `'FRIG'` (`COOKED_RIG_SLAB_MAGIC`) binary rig slab (`sub_id = 17`)."""
+    if len(rig_bytes) >= 12:
+        var addr = address_of(rig_bytes)
+        var magic = _ptr_u32(addr, 0)
+        _ = len(rig_bytes)
+        if magic == COOKED_RIG_SLAB_MAGIC:
+            return rig_bytes.copy()
+    var out = List[UInt8](capacity=12 + len(rig_bytes))
+    _put_u32_le(out, COOKED_RIG_SLAB_MAGIC)
+    _put_u32_le(out, UInt32(1))
+    _put_u32_le(out, UInt32(len(rig_bytes)))
+    for b in rig_bytes:
+        out.append(b)
+    return out^
+
+
+def decode_cooked_rig_slab(data: List[UInt8]) -> Tuple[Bool, List[UInt8]]:
+    """Validates a `'FRIG'` binary rig slab (`sub_id = 17`) and returns its payload bytes."""
+    if len(data) < 12:
+        return (False, List[UInt8]())
+    var addr = address_of(data)
+    var magic = _ptr_u32(addr, 0)
+    var ver = _ptr_u32(addr, 4)
+    var plen = Int(_ptr_u32(addr, 8))
+    _ = len(data)
+    if magic != COOKED_RIG_SLAB_MAGIC or ver < 1 or plen < 0 or 12 + plen > len(data):
+        return (False, List[UInt8]())
+    return (True, data.copy())

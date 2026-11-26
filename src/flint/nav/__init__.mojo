@@ -22,3 +22,12 @@ from flint.nav.orca import (
     NavCrowdAgent,
     CrowdNavBridge,
 )
+from flint.nav.plugin import (
+    NavPlugin,
+    NavPluginStateResource,
+    NavMeshComponent,
+    NavAgentComponent,
+    register_nav_components,
+    register_nav_codecs,
+    bake_from_physics,
+)

@@ -22,7 +22,7 @@ from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
 from flint.app.engine_app import Resource
 from flint.ecs.world import comp_hash64
-from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC, CAT_PROP_PIECE, CAT_SENSOR, CAT_ALL
+from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_DEBRIS, CAT_STATIC, CAT_PROP_PIECE, CAT_SENSOR, CAT_ALL
 from flint.physics.broadphase import (
     BroadphaseInput,
     BroadphaseNode8,
@@ -165,7 +165,7 @@ comptime SLEEP_LIN_SPEED: Float32 = 0.05
 comptime SLEEP_ANG_SPEED: Float32 = 0.08
 
 comptime WORLD_BLOB_TAG: UInt32 = fourcc("PHYW")
-comptime WORLD_BLOB_VERSION: Int = 2
+comptime WORLD_BLOB_VERSION: Int = 3
 
 
 @always_inline
@@ -463,6 +463,51 @@ struct TriggerVolume(Copyable, ImplicitlyCopyable, Movable):
         var wz = abs(axes[0].z) * self.half_extents.x + abs(axes[1].z) * self.half_extents.y + abs(axes[2].z) * self.half_extents.z
         var ext = Vec3(wx, wy, wz)
         return (self.pos - ext, self.pos + ext)
+
+
+struct KccTriggerProxy(Copyable, ImplicitlyCopyable, Movable):
+    """Lightweight capsule proxy allowing `CharacterController`s to fire `TriggerVolume` events
+    without polluting `PhysicsWorld.bodies` or rigid-body solver islands."""
+    var id: Int
+    var pos: Vec3
+    var up: Vec3
+    var radius: Float32
+    var half_height: Float32
+    var filter: CollisionFilter
+    var active: Bool
+    var owner_key: UInt64
+
+    def __init__(
+        out self,
+        id: Int = 0,
+        pos: Vec3 = Vec3(),
+        up: Vec3 = Vec3(0.0, 1.0, 0.0),
+        radius: Float32 = 0.35,
+        half_height: Float32 = 0.55,
+        filter: CollisionFilter = CollisionFilter(CAT_DEBRIS, CAT_ALL, 0),
+        active: Bool = True,
+        owner_key: UInt64 = 0,
+    ):
+        self.id = id
+        self.pos = pos if (isfinite(pos.x) and isfinite(pos.y) and isfinite(pos.z)) else Vec3()
+        var up_ok = isfinite(up.x) and isfinite(up.y) and isfinite(up.z)
+        var ul2 = up.length_squared() if up_ok else Float32(0.0)
+        self.up = (up * (Float32(1.0) / sqrt(ul2))) if ul2 > Float32(1.0e-12) else Vec3(0.0, 1.0, 0.0)
+        self.radius = max(Float32(0.01), radius) if isfinite(radius) else Float32(0.35)
+        self.half_height = max(Float32(0.0), half_height) if isfinite(half_height) else Float32(0.55)
+        self.filter = filter
+        self.active = active
+        self.owner_key = owner_key
+
+    def tight_aabb(self) -> Tuple[Vec3, Vec3]:
+        var ax = self.up * self.half_height
+        var a = self.pos - ax
+        var b = self.pos + ax
+        var rv = Vec3(self.radius, self.radius, self.radius)
+        return (
+            Vec3(min(a.x, b.x), min(a.y, b.y), min(a.z, b.z)) - rv,
+            Vec3(max(a.x, b.x), max(a.y, b.y), max(a.z, b.z)) + rv,
+        )
 
 
 struct RigidBody(Copyable, Movable):
@@ -866,6 +911,7 @@ struct PhysicsWorld(Resource, Movable):
     var trigger_inside_a: List[Int]
     var trigger_inside_b: List[Int]
     var trigger_events: List[TriggerEvent]
+    var kcc_proxies: List[KccTriggerProxy]
     var cache: ContactCache
     var islands: IslandSet
     var graph: ConstraintGraph
@@ -908,6 +954,7 @@ struct PhysicsWorld(Resource, Movable):
         self.trigger_inside_a = List[Int]()
         self.trigger_inside_b = List[Int]()
         self.trigger_events = List[TriggerEvent]()
+        self.kcc_proxies = List[KccTriggerProxy]()
         self.cache = ContactCache()
         self.islands = IslandSet()
         self.graph = ConstraintGraph()
@@ -1469,6 +1516,78 @@ struct PhysicsWorld(Resource, Movable):
         var idx = len(self.triggers)
         self.triggers.append(trigger^)
         return idx
+
+    def register_kcc_proxy(
+        mut self,
+        pos: Vec3,
+        radius: Float32,
+        half_height: Float32,
+        up: Vec3 = Vec3(0.0, 1.0, 0.0),
+        filter: CollisionFilter = CollisionFilter(CAT_DEBRIS, CAT_ALL, 0),
+        active: Bool = True,
+        owner_key: UInt64 = 0,
+    ) -> Int:
+        var pid = self.next_body_id
+        self.next_body_id += 1
+        self.kcc_proxies.append(KccTriggerProxy(pid, pos, up, radius, half_height, filter, active, owner_key))
+        return pid
+
+    def find_kcc_proxy_slot(self, id: Int) -> Int:
+        for i in range(len(self.kcc_proxies)):
+            if self.kcc_proxies[i].id == id:
+                return i
+        return -1
+
+    def find_kcc_proxy_by_owner(self, owner_key: UInt64) -> Int:
+        if owner_key == 0:
+            return -1
+        for i in range(len(self.kcc_proxies)):
+            if self.kcc_proxies[i].owner_key == owner_key:
+                return self.kcc_proxies[i].id
+        return -1
+
+    def update_kcc_proxy(mut self, id: Int, pos: Vec3, active: Bool = True) -> Bool:
+        var slot = self.find_kcc_proxy_slot(id)
+        if slot < 0:
+            return False
+        if isfinite(pos.x) and isfinite(pos.y) and isfinite(pos.z):
+            self.kcc_proxies[slot].pos = pos
+        self.kcc_proxies[slot].active = active
+        return True
+
+    def sync_kcc_proxy(
+        mut self,
+        id: Int,
+        pos: Vec3,
+        radius: Float32,
+        half_height: Float32,
+        up: Vec3,
+        filter: CollisionFilter,
+        active: Bool,
+    ) -> Bool:
+        var slot = self.find_kcc_proxy_slot(id)
+        if slot < 0:
+            return False
+        ref kp = self.kcc_proxies[slot]
+        if isfinite(pos.x) and isfinite(pos.y) and isfinite(pos.z):
+            kp.pos = pos
+        var up_ok = isfinite(up.x) and isfinite(up.y) and isfinite(up.z)
+        var ul2 = up.length_squared() if up_ok else Float32(0.0)
+        kp.up = (up * (Float32(1.0) / sqrt(ul2))) if ul2 > Float32(1.0e-12) else Vec3(0.0, 1.0, 0.0)
+        kp.radius = max(Float32(0.01), radius) if isfinite(radius) else Float32(0.35)
+        kp.half_height = max(Float32(0.0), half_height) if isfinite(half_height) else Float32(0.55)
+        kp.filter = filter
+        kp.active = active
+        return True
+
+    def unregister_kcc_proxy(mut self, id: Int):
+        var slot = self.find_kcc_proxy_slot(id)
+        if slot < 0:
+            return
+        var last = len(self.kcc_proxies) - 1
+        if slot < last:
+            self.kcc_proxies[slot] = self.kcc_proxies[last]
+        _ = self.kcc_proxies.pop()
 
     def set_water(mut self, level: Float32, use_waves: Bool = True, fluid_density: Float32 = RHO_SEAWATER_SI):
         self.water_enabled = level > NO_WATER + Float32(1.0)
@@ -4526,6 +4645,21 @@ struct PhysicsWorld(Resource, Movable):
         var m = collide_convex_convex(box_h, tv.pos, tv.rot, bh, b.pos, b.rot)
         return (m.has_collision, m.p0.point if m.has_collision else b.pos)
 
+    def _trigger_overlaps_kcc(self, tv: TriggerVolume, p: KccTriggerProxy) -> Tuple[Bool, Vec3]:
+        var pa = p.pos - p.up * p.half_height
+        var pb = p.pos + p.up * p.half_height
+        if tv.shape == TRIGGER_SHAPE_SPHERE:
+            var m = collide_sphere_capsule(tv.pos, tv.radius, pa, pb, p.radius)
+            return (m.has_collision, m.p0.point if m.has_collision else p.pos)
+        if tv.shape == TRIGGER_SHAPE_CAPSULE:
+            var ta = tv.pos - tv.rot.rotate(Vec3(0, tv.half_height, 0))
+            var tb = tv.pos + tv.rot.rotate(Vec3(0, tv.half_height, 0))
+            var m = collide_capsule_capsule(ta, tb, tv.radius, pa, pb, p.radius)
+            return (m.has_collision, m.p0.point if m.has_collision else p.pos)
+        # TRIGGER_SHAPE_BOX (OBB)
+        var m = collide_capsule_box(pa, pb, p.radius, tv.pos, tv.rot, tv.half_extents)
+        return (m.has_collision, m.p0.point if m.has_collision else p.pos)
+
     def _update_triggers(mut self):
         self.trigger_events.clear()
         if len(self.triggers) == 0 and len(self.trigger_inside_a) == 0:
@@ -4554,6 +4688,19 @@ struct PhysicsWorld(Resource, Movable):
                     cur_b.append(b.id)
                     cur_pt.append(ov[1])
                     keys.append(pair_key(tv.id, b.id))
+            for ki in range(len(self.kcc_proxies)):
+                ref kp = self.kcc_proxies[ki]
+                if not kp.active or not tv.filter.touches(kp.filter):
+                    continue
+                var kbb = kp.tight_aabb()
+                if not boxes_overlap(tb[0], tb[1], kbb[0], kbb[1]):
+                    continue
+                var ov = self._trigger_overlaps_kcc(tv, kp)
+                if ov[0]:
+                    cur_a.append(tv.id)
+                    cur_b.append(kp.id)
+                    cur_pt.append(ov[1])
+                    keys.append(pair_key(tv.id, kp.id))
 
         var order = stable_order(keys)
         var ta = List[Int](capacity=len(order))
@@ -5710,6 +5857,21 @@ struct PhysicsWorld(Resource, Movable):
                 w.quat(hr.axis_align_quats[k])
             w.integer(hr.filter_group)
 
+        # 8. KCC trigger proxies (WORLD_BLOB_VERSION >= 3)
+        w.integer(len(self.kcc_proxies))
+        for ki in range(len(self.kcc_proxies)):
+            ref kp = self.kcc_proxies[ki]
+            w.integer(kp.id)
+            w.vec3(kp.pos)
+            w.vec3(kp.up)
+            w.f32(kp.radius)
+            w.f32(kp.half_height)
+            w.u32(kp.filter.category)
+            w.u32(kp.filter.mask)
+            w.integer(kp.filter.group)
+            w.boolean(kp.active)
+            w.u64(kp.owner_key)
+
         w.end()
 
     def deserialize(mut self, mut r: BlobReader) raises:
@@ -5908,6 +6070,7 @@ struct PhysicsWorld(Resource, Movable):
         self.xpbd_chains.clear()
         self.xpbd_meshes.clear()
         self.ragdolls.clear()
+        self.kcc_proxies.clear()
 
         if ver >= 2:
             var n_veh = r.integer()
@@ -6035,6 +6198,28 @@ struct PhysicsWorld(Resource, Movable):
                     hr.axis_align_quats.append(r.quat())
                 hr.filter_group = r.integer()
                 self.ragdolls.append(hr^)
+
+        if ver >= 3:
+            var n_kcc = r.integer()
+            if r.failed or n_kcc < 0 or n_kcc > (1 << 16) or n_kcc > max(0, r.limit() - r.offset) // 64:
+                raise Error("physics world blob: invalid kcc_proxy count")
+            for _ in range(n_kcc):
+                var kp_id = r.integer()
+                var kp_pos = r.vec3()
+                var kp_up = r.vec3()
+                var kp_rad = r.f32()
+                var kp_hh = r.f32()
+                var kp_fc = r.u32()
+                var kp_fm = r.u32()
+                var kp_fg = r.integer()
+                var kp_act = r.boolean()
+                var kp_own = r.u64()
+                self.kcc_proxies.append(
+                    KccTriggerProxy(
+                        kp_id, kp_pos, kp_up, kp_rad, kp_hh,
+                        CollisionFilter(kp_fc, kp_fm, kp_fg), kp_act, kp_own,
+                    )
+                )
 
         r.leave()
 

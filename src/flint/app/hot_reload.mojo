@@ -1,21 +1,42 @@
 """Flint v5 `<300 ms` Gameplay `.so` Hot-Reload Host & C-ABI Bridge (`flint.app.hot_reload`).
 
 Provides:
-- `FLINT_PLUGIN_API_VERSION` (`1`) and `FlintPluginApiV1`: host-resident C-ABI vtable allowing
-  compiled `.so` gameplay modules (`--emit shared-lib`) to spawn/despawn entities, register POD
-  components, read/write component columns, and access `Resources` without embedding host drop
-  function pointers inside unmapped `.so` segments!
+- `FLINT_PLUGIN_API_VERSION` (`2`), `FLINT_PLUGIN_API_V2_MAGIC`, `FlintPluginApiV2` (with magic/version/
+  `struct_size` validation, ECS/Resource/POD-schema hooks), and `FlintPluginApiV1` (opt-in compat).
+- `PodFieldDesc`, `PodComponentSchema`, and `PodSchemaRegistryResource` for runtime gameplay POD schemas
+  marshaled by value across the `.so` boundary (zero guest heap/function pointers in host `World`).
 - `HotReloadHost`: loads, steps, hot-swaps, and unloads `.so` plugins via `dl_open` / `dl_sym` /
   `dl_close` while keeping `World` and `Resources` 100% intact across reloads.
 """
 from std.collections import List
 from std.ffi import external_call
-from flint.ecs.world import World, Entity, BitSet256
-from flint.app.engine_app import Resources
+from std.math import isfinite, max
+from std.sys import size_of
+from flint.core.serial import BlobReader, BlobWriter, fourcc
+from flint.ecs.world import (
+    BitSet256,
+    Entity,
+    STORAGE_SPARSE,
+    STORAGE_TABLE,
+    World,
+    comp_hash64,
+    comp_hash64_str,
+)
+from flint.app.engine_app import Resource, Resources
 from flint.platform.dynlib import dl_open, dl_sym, dl_close, dl_error, RTLD_NOW, RTLD_LOCAL
-from flint.platform.os import get_time, remove_file
+from flint.platform.os import close_fd, file_size, get_time, open_path_fd, open_read, remove_file
 
-comptime FLINT_PLUGIN_API_VERSION: UInt32 = 1
+comptime FLINT_PLUGIN_API_VERSION: UInt32 = 2
+comptime FLINT_PLUGIN_API_V2_MAGIC: UInt32 = 0x32415046  # "FPA2"
+
+comptime POD_FIELD_BOOL: Int = 1
+comptime POD_FIELD_INT: Int = 2
+comptime POD_FIELD_F32: Int = 3
+comptime POD_FIELD_STRING: Int = 4
+comptime POD_FIELD_VEC3: Int = 5
+comptime POD_FIELD_QUAT: Int = 6
+comptime POD_FIELD_COLOR_RGB: Int = 7
+comptime POD_SCHEMA_BLOB_FOURCC: UInt32 = fourcc("PODS")
 
 # Host C-ABI vtable function pointer types
 comptime ApiSpawnEmptyFn = def(Int) thin abi("C") -> UInt64
@@ -29,16 +50,249 @@ comptime ApiGuestRowCb = def(UInt64, Int, Float32) thin abi("C") -> None
 comptime ApiForEach1Fn = def(Int, Int, ApiGuestRowCb, Float32) thin abi("C") -> Int
 comptime ApiUpsertResFn = def(Int, UInt64, Int, Int) thin abi("C") -> Int
 comptime ApiGetResFn = def(Int, UInt64) thin abi("C") -> Int
+comptime ApiGetCompFn = def(Int, UInt64, Int) thin abi("C") -> Int
+comptime ApiHasCompFn = def(Int, UInt64, Int) thin abi("C") -> Int32
+comptime ApiRemoveCompFn = def(Int, UInt64, Int) thin abi("C") -> Int32
+comptime ApiRegisterPodSchemaFn = def(Int, Int, Int, Int) thin abi("C") -> Int
 
 def _sym_to_fn[FnT: ImplicitlyCopyable & Deinitable](sym_addr: Int) -> FnT:
-    var slot = List[Int](length=1, fill=sym_addr)
-    var res = Pointer[FnT, ImmutAnyOrigin](unsafe_from_address=Int(slot.unsafe_ptr()))[unsafe_offset=0]
-    _ = len(slot)
-    return res
+    var slot = sym_addr
+    return Pointer(to=slot).unsafe_bitcast[FnT]()[unsafe_offset=0]
 comptime GuestApiVersionFn = def() thin abi("C") -> UInt32
 comptime GuestOnLoadFn = def(Int, Int, Int, Int32) thin abi("C") -> Int32
 comptime GuestOnStepFn = def(Int, Int, Int, Float32) thin abi("C") -> Int32
 comptime GuestOnUnloadFn = def(Int, Int, Int, Int32) thin abi("C") -> None
+
+
+# ---------------------------------------------------------------------------
+# Runtime POD Component Schemas (Value-Marshaled Across `.so` Boundary)
+# ---------------------------------------------------------------------------
+
+struct PodFieldDesc(Copyable, Movable):
+    """Describes a single reflected field inside a hot-reloadable POD component."""
+    var name: String
+    var kind: Int
+    var offset: Int
+    var size: Int
+    var min_val: Float32
+    var max_val: Float32
+    var step: Float32
+
+    def __init__(
+        out self,
+        name: String = "",
+        kind: Int = POD_FIELD_F32,
+        offset: Int = 0,
+        size: Int = 4,
+        min_val: Float32 = 0.0,
+        max_val: Float32 = 0.0,
+        step: Float32 = 0.05,
+    ):
+        self.name = name
+        self.kind = kind
+        self.offset = offset
+        self.size = size
+        self.min_val = min_val
+        self.max_val = max_val
+        self.step = step
+
+    def __init__(out self, *, copy: Self):
+        self.name = copy.name
+        self.kind = copy.kind
+        self.offset = copy.offset
+        self.size = copy.size
+        self.min_val = copy.min_val
+        self.max_val = copy.max_val
+        self.step = copy.step
+
+    def is_valid(self, struct_byte_size: Int) -> Bool:
+        if self.name.byte_length() == 0 or self.offset < 0 or self.size <= 0:
+            return False
+        if self.offset + self.size > struct_byte_size:
+            return False
+        if not isfinite(self.min_val) or not isfinite(self.max_val) or not isfinite(self.step):
+            return False
+        if self.kind == POD_FIELD_BOOL:
+            return self.size == 1 or self.size == 4
+        if self.kind == POD_FIELD_INT:
+            return self.size == 4 or self.size == 8
+        if self.kind == POD_FIELD_F32:
+            return self.size == 4
+        if self.kind == POD_FIELD_VEC3:
+            return self.size == 12
+        if self.kind == POD_FIELD_QUAT:
+            return self.size == 16
+        if self.kind == POD_FIELD_COLOR_RGB:
+            return self.size == 12
+        return False
+
+
+struct PodComponentSchema(Copyable, Movable):
+    """Value-marshaled layout & reflection schema for a gameplay POD component."""
+    var name: String
+    var byte_size: Int
+    var alignment: Int
+    var storage_mode: Int
+    var component_hash: UInt64
+    var schema_fourcc: UInt32
+    var fields: List[PodFieldDesc]
+
+    def __init__(
+        out self,
+        name: String = "",
+        byte_size: Int = 0,
+        alignment: Int = 4,
+        storage_mode: Int = STORAGE_TABLE,
+    ):
+        self.name = name
+        self.byte_size = byte_size
+        self.alignment = alignment
+        self.storage_mode = storage_mode
+        if name.byte_length() > 0:
+            self.component_hash = comp_hash64_str(name)
+            self.schema_fourcc = UInt32(0x80000000) | UInt32(self.component_hash & 0x7FFFFFFF)
+        else:
+            self.component_hash = 0
+            self.schema_fourcc = 0
+        self.fields = List[PodFieldDesc]()
+
+    def __init__(out self, *, copy: Self):
+        self.name = copy.name
+        self.byte_size = copy.byte_size
+        self.alignment = copy.alignment
+        self.storage_mode = copy.storage_mode
+        self.component_hash = copy.component_hash
+        self.schema_fourcc = copy.schema_fourcc
+        self.fields = copy.fields.copy()
+
+    def add_field(mut self, desc: PodFieldDesc) -> Bool:
+        if self.byte_size < 0 or not desc.is_valid(self.byte_size):
+            return False
+        for i in range(len(self.fields)):
+            if self.fields[i].name == desc.name:
+                return False
+        self.fields.append(desc.copy())
+        return True
+
+    def validate(self) -> Bool:
+        if self.name.byte_length() == 0 or self.byte_size < 0:
+            return False
+        if self.alignment <= 0 or (self.alignment & (self.alignment - 1)) != 0:
+            return False
+        if self.storage_mode != STORAGE_TABLE and self.storage_mode != STORAGE_SPARSE:
+            return False
+        for i in range(len(self.fields)):
+            if not self.fields[i].is_valid(self.byte_size):
+                return False
+            for j in range(i + 1, len(self.fields)):
+                if self.fields[i].name == self.fields[j].name:
+                    return False
+        return True
+
+    def matches_layout(self, other: Self) -> Bool:
+        if (
+            self.name != other.name
+            or self.byte_size != other.byte_size
+            or self.alignment != other.alignment
+            or self.storage_mode != other.storage_mode
+            or len(self.fields) != len(other.fields)
+        ):
+            return False
+        for i in range(len(self.fields)):
+            ref a = self.fields[i]
+            ref b = other.fields[i]
+            if a.name != b.name or a.kind != b.kind or a.offset != b.offset or a.size != b.size:
+                return False
+        return True
+
+    def encode_bytes(self) -> List[UInt8]:
+        var out = BlobWriter()
+        out.begin(POD_SCHEMA_BLOB_FOURCC, 1)
+        out.text(self.name)
+        out.integer(self.byte_size)
+        out.integer(self.alignment)
+        out.integer(self.storage_mode)
+        out.u32(UInt32(len(self.fields)))
+        for i in range(len(self.fields)):
+            ref f = self.fields[i]
+            out.text(f.name)
+            out.integer(f.kind)
+            out.integer(f.offset)
+            out.integer(f.size)
+            out.f32(f.min_val)
+            out.f32(f.max_val)
+            out.f32(f.step)
+        out.end()
+        var result = List[UInt8]()
+        swap(result, out.data)
+        return result^
+
+    @staticmethod
+    def decode_bytes(var data: List[UInt8]) raises -> Self:
+        var reader = BlobReader(data^)
+        _ = reader.enter(POD_SCHEMA_BLOB_FOURCC, 1)
+        var name = reader.text()
+        var bsz = reader.integer()
+        var aln = reader.integer()
+        var smode = reader.integer()
+        var n_fields = Int(reader.u32())
+        if (
+            reader.failed
+            or n_fields < 0
+            or n_fields > 1024
+            or n_fields > max(0, reader.limit() - reader.offset) // 16
+        ):
+            raise Error("PodComponentSchema: invalid field count")
+        var out = Self(name, bsz, aln, smode)
+        for _ in range(n_fields):
+            var fname = reader.text()
+            var fkind = reader.integer()
+            var foff = reader.integer()
+            var fsize = reader.integer()
+            var fmin = reader.f32()
+            var fmax = reader.f32()
+            var fstep = reader.f32()
+            if reader.failed:
+                raise Error("PodComponentSchema: truncated field")
+            if not out.add_field(PodFieldDesc(fname, fkind, foff, fsize, fmin, fmax, fstep)):
+                raise Error("PodComponentSchema: invalid field in decoded schema")
+        reader.leave()
+        if reader.failed or not out.validate():
+            raise Error("PodComponentSchema: invalid schema layout")
+        return out^
+
+
+struct PodSchemaRegistryResource(Resource, Movable):
+    """Host-resident registry of POD component schemas registered by gameplay `.so` plugins."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.app.PodSchemaRegistryResource")
+    var schemas: List[PodComponentSchema]
+    var epoch: UInt64
+
+    def __init__(out self):
+        self.schemas = List[PodComponentSchema]()
+        self.epoch = 0
+
+    def find_schema(self, name: String) -> Int:
+        for i in range(len(self.schemas)):
+            if self.schemas[i].name == name:
+                return i
+        return -1
+
+    def register_schema(mut self, schema: PodComponentSchema) -> Bool:
+        if not schema.validate():
+            return False
+        var idx = self.find_schema(schema.name)
+        if idx >= 0:
+            return self.schemas[idx].matches_layout(schema)
+        for i in range(len(self.schemas)):
+            if (
+                self.schemas[i].component_hash == schema.component_hash
+                or self.schemas[i].schema_fourcc == schema.schema_fourcc
+            ):
+                return False
+        self.schemas.append(schema.copy())
+        self.epoch += 1
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +331,24 @@ def _host_insert_comp(world_addr: Int, entity_bits: UInt64, tid: Int, src_ptr: I
     return Int32(1) if world.insert_raw_pod(Entity.from_bits(entity_bits), tid, src_ptr) else Int32(0)
 
 
+def _host_get_comp(world_addr: Int, entity_bits: UInt64, tid: Int) abi("C") -> Int:
+    ref world = Pointer[World, ImmutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
+    return world.get_raw_ptr(Entity.from_bits(entity_bits), tid)
+
+
 def _host_get_comp_mut(world_addr: Int, entity_bits: UInt64, tid: Int) abi("C") -> Int:
     ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
     return world.get_raw_ptr_mut(Entity.from_bits(entity_bits), tid)
+
+
+def _host_has_comp(world_addr: Int, entity_bits: UInt64, tid: Int) abi("C") -> Int32:
+    ref world = Pointer[World, ImmutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
+    return Int32(1) if world.has_by_type_id(Entity.from_bits(entity_bits), tid) else Int32(0)
+
+
+def _host_remove_comp(world_addr: Int, entity_bits: UInt64, tid: Int) abi("C") -> Int32:
+    ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
+    return Int32(1) if world.remove_by_type_id(Entity.from_bits(entity_bits), tid) else Int32(0)
 
 
 def _host_for_each1(world_addr: Int, tid: Int, cb: ApiGuestRowCb, dt: Float32) abi("C") -> Int:
@@ -106,9 +375,41 @@ def _host_get_res(res_addr: Int, res_id: UInt64) abi("C") -> Int:
     return res.get_raw_ptr(res_id)
 
 
+def _host_register_pod_schema(
+    world_addr: Int, res_addr: Int, bytes_ptr: Int, bytes_len: Int
+) abi("C") -> Int:
+    if world_addr == 0 or bytes_ptr == 0 or bytes_len <= 0 or bytes_len > (1 << 20):
+        return -1
+    var buf = List[UInt8](capacity=bytes_len)
+    buf.resize(unsafe_uninit_length=bytes_len)
+    var src = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=bytes_ptr)
+    for bi in range(bytes_len):
+        buf[bi] = src[unsafe_offset=bi]
+    try:
+        var schema = PodComponentSchema.decode_bytes(buf^)
+        ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
+        var tid = world.register_pod_component(
+            schema.component_hash, schema.byte_size, schema.alignment, schema.storage_mode
+        )
+        if tid < 0:
+            return -1
+        if res_addr != 0:
+            ref res = Pointer[Resources, MutAnyOrigin](unsafe_from_address=res_addr)[unsafe_offset=0]
+            if not res.has[PodSchemaRegistryResource]():
+                res.insert[PodSchemaRegistryResource](PodSchemaRegistryResource())
+            var reg_ptr = res.get_ptr_mut[PodSchemaRegistryResource]()
+            if not reg_ptr:
+                return -1
+            if not reg_ptr.value()[unsafe_offset=0].register_schema(schema):
+                return -1
+        return tid
+    except:
+        return -1
+
+
 @fieldwise_init
 struct FlintPluginApiV1(Copyable, ImplicitlyCopyable, Movable):
-    """Stable C-ABI v1 host table passed to hot-reloadable `.so` gameplay plugins."""
+    """Legacy C-ABI v1 host table for opt-in `allow_v1=True` compatibility."""
     var abi_version: UInt64
     var spawn_empty: ApiSpawnEmptyFn
     var despawn: ApiDespawnFn
@@ -122,7 +423,7 @@ struct FlintPluginApiV1(Copyable, ImplicitlyCopyable, Movable):
     var get_resource_ptr: ApiGetResFn
 
     def __init__(out self):
-        self.abi_version = UInt64(FLINT_PLUGIN_API_VERSION)
+        self.abi_version = UInt64(1)
         self.spawn_empty = _host_spawn_empty
         self.despawn = _host_despawn
         self.is_alive = _host_is_alive
@@ -135,20 +436,89 @@ struct FlintPluginApiV1(Copyable, ImplicitlyCopyable, Movable):
         self.get_resource_ptr = _host_get_res
 
 
+@no_inline
+def _invoke_register_pod_schema(
+    fn_ptr: ApiRegisterPodSchemaFn, world_addr: Int, res_addr: Int, var data: List[UInt8]
+) -> Int:
+    var tid = fn_ptr(world_addr, res_addr, Int(data.unsafe_ptr()), len(data))
+    data.clear()
+    return tid
+
+
+@fieldwise_init
+struct FlintPluginApiV2(Copyable, ImplicitlyCopyable, Movable):
+    """Validated C-ABI v2 host table passed to hot-reloadable `.so` gameplay plugins."""
+    var magic: UInt32
+    var version: UInt32
+    var struct_size: UInt64
+    var spawn_empty: ApiSpawnEmptyFn
+    var despawn: ApiDespawnFn
+    var is_alive: ApiIsAliveFn
+    var entity_count: ApiEntityCountFn
+    var register_pod_component: ApiRegisterCompFn
+    var insert_raw_pod: ApiInsertCompFn
+    var get_raw_ptr_mut: ApiGetCompMutFn
+    var for_each_pod1: ApiForEach1Fn
+    var upsert_pod_resource: ApiUpsertResFn
+    var get_resource_ptr: ApiGetResFn
+    var get_raw_ptr: ApiGetCompFn
+    var has_component: ApiHasCompFn
+    var remove_component: ApiRemoveCompFn
+    var register_pod_schema: ApiRegisterPodSchemaFn
+
+    def __init__(out self):
+        self.magic = FLINT_PLUGIN_API_V2_MAGIC
+        self.version = FLINT_PLUGIN_API_VERSION
+        self.struct_size = UInt64(size_of[Self]())
+        self.spawn_empty = _host_spawn_empty
+        self.despawn = _host_despawn
+        self.is_alive = _host_is_alive
+        self.entity_count = _host_entity_count
+        self.register_pod_component = _host_register_comp
+        self.insert_raw_pod = _host_insert_comp
+        self.get_raw_ptr_mut = _host_get_comp_mut
+        self.for_each_pod1 = _host_for_each1
+        self.upsert_pod_resource = _host_upsert_res
+        self.get_resource_ptr = _host_get_res
+        self.get_raw_ptr = _host_get_comp
+        self.has_component = _host_has_comp
+        self.remove_component = _host_remove_comp
+        self.register_pod_schema = _host_register_pod_schema
+
+    @always_inline
+    def is_valid(self) -> Bool:
+        return (
+            self.magic == FLINT_PLUGIN_API_V2_MAGIC
+            and self.version == FLINT_PLUGIN_API_VERSION
+            and Int(self.struct_size) == size_of[Self]()
+        )
+
+    def register_schema(self, world_addr: Int, res_addr: Int, schema: PodComponentSchema) -> Int:
+        return _invoke_register_pod_schema(
+            self.register_pod_schema, world_addr, res_addr, schema.encode_bytes()
+        )
+
+    def register_schema_in(
+        self, mut world: World, mut res: Resources, schema: PodComponentSchema
+    ) -> Int:
+        var tid = self.register_schema(Int(Pointer(to=world)), Int(Pointer(to=res)), schema)
+        world.keep_alive()
+        _ = res.find_index(0)
+        return tid
+
+
 def _copy_file_fast(src_path: String, dst_path: String) -> Bool:
-    var s = src_path
-    var d = dst_path
-    var rfd = external_call["openat", Int32](Int32(-100), s.as_c_string_span(), Int32(0), Int32(0))
+    var rfd = open_read(src_path)
     if rfd < 0:
         return False
-    var wfd = external_call["openat", Int32](Int32(-100), d.as_c_string_span(), Int32(1 | 64 | 512), Int32(493))
+    var wfd = open_path_fd(dst_path, Int32(1 | 64 | 512), Int32(493))
     if wfd < 0:
-        _ = external_call["close", Int32](rfd)
+        close_fd(rfd)
         return False
     var buf = List[UInt8](length=65536, fill=0)
     var ok = True
     while True:
-        var n = Int(external_call["read", Int64](rfd, buf.unsafe_ptr(), Int64(65536)))
+        var n = Int(external_call["read", Int64](Int32(rfd), buf.unsafe_ptr(), Int64(65536)))
         if n < 0:
             ok = False
             break
@@ -157,7 +527,7 @@ def _copy_file_fast(src_path: String, dst_path: String) -> Bool:
         var off = 0
         while off < n:
             var w = Int(
-                external_call["write", Int64](wfd, buf.unsafe_ptr().unsafe_offset(off), Int64(n - off))
+                external_call["write", Int64](Int32(wfd), buf.unsafe_ptr().unsafe_offset(off), Int64(n - off))
             )
             if w <= 0:
                 ok = False
@@ -165,14 +535,18 @@ def _copy_file_fast(src_path: String, dst_path: String) -> Bool:
             off += w
         if not ok:
             break
-    _ = external_call["close", Int32](wfd)
-    _ = external_call["close", Int32](rfd)
+    buf.clear()
+    close_fd(wfd)
+    close_fd(rfd)
     return ok
 
 
 struct HotReloadHost(Movable):
     """Manages `<300 ms` dynamic `.so` gameplay plugin loading, stepping, and state-preserving hot-swap."""
-    var api_box: List[FlintPluginApiV1]
+    var api_v1_box: List[FlintPluginApiV1]
+    var api_v2_box: List[FlintPluginApiV2]
+    var allow_v1: Bool
+    var active_api_version: UInt32
     var lib_handle: Int
     var fn_api_version: Int
     var fn_on_load: Int
@@ -185,9 +559,17 @@ struct HotReloadHost(Movable):
     var last_error: String
     var stage_prefix: String
 
-    def __init__(out self, stage_prefix: String = "/tmp/flint-hotreload-gen"):
-        self.api_box = List[FlintPluginApiV1](capacity=1)
-        self.api_box.append(FlintPluginApiV1())
+    def __init__(
+        out self,
+        stage_prefix: String = "/tmp/flint-hotreload-gen",
+        allow_v1: Bool = False,
+    ):
+        self.api_v1_box = List[FlintPluginApiV1](capacity=1)
+        self.api_v1_box.append(FlintPluginApiV1())
+        self.api_v2_box = List[FlintPluginApiV2](capacity=1)
+        self.api_v2_box.append(FlintPluginApiV2())
+        self.allow_v1 = allow_v1
+        self.active_api_version = FLINT_PLUGIN_API_VERSION
         self.lib_handle = 0
         self.fn_api_version = 0
         self.fn_on_load = 0
@@ -210,13 +592,19 @@ struct HotReloadHost(Movable):
     def is_loaded(self) -> Bool:
         return self.lib_handle != 0
 
+    @always_inline
+    def _active_api_addr(self) -> Int:
+        if self.active_api_version == 1:
+            return Int(self.api_v1_box.unsafe_ptr())
+        return Int(self.api_v2_box.unsafe_ptr())
+
     def unload(mut self, mut world: World, mut resources: Resources, is_reload: Bool = False) -> Bool:
         if self.lib_handle == 0:
             return True
         if self.fn_on_unload != 0:
             var ufn = _sym_to_fn[GuestOnUnloadFn](self.fn_on_unload)
             ufn(
-                Int(self.api_box.unsafe_ptr()),
+                self._active_api_addr(),
                 Int(Pointer(to=world)),
                 Int(Pointer(to=resources)),
                 Int32(1) if is_reload else Int32(0),
@@ -227,6 +615,7 @@ struct HotReloadHost(Movable):
         self.fn_on_load = 0
         self.fn_on_step = 0
         self.fn_on_unload = 0
+        self.active_api_version = FLINT_PLUGIN_API_VERSION
         if self.active_temp_path.byte_length() > 0:
             _ = remove_file(self.active_temp_path)
             self.active_temp_path = ""
@@ -237,17 +626,17 @@ struct HotReloadHost(Movable):
 
     def load_or_reload(mut self, so_path: String, mut world: World, mut resources: Resources) -> Bool:
         """Loads `so_path` (or hot-swaps from a currently loaded `.so`) while keeping `World` and `Resources` intact."""
-        var t0 = get_time()
-        var was_loaded = self.is_loaded()
-        if was_loaded:
-            if not self.unload(world, resources, is_reload=True):
-                return False
+        if so_path.byte_length() == 0 or file_size(so_path) <= 0:
+            self.last_error = "shared library not found or empty: " + so_path
+            return False
 
+        var t0 = get_time()
         var next_gen = self.reload_generation + 1
         var pid = Int(external_call["getpid", Int32]())
         var staged = self.stage_prefix + "-" + String(pid) + "-" + String(next_gen) + ".so"
         if not _copy_file_fast(so_path, staged):
             self.last_error = "failed to stage shared library from " + so_path
+            _ = remove_file(staged)
             return False
 
         var handle = dl_open(staged, RTLD_NOW | RTLD_LOCAL)
@@ -257,18 +646,24 @@ struct HotReloadHost(Movable):
             return False
 
         var sym_ver = dl_sym(handle, "flint_plugin_api_version")
-        var sym_load = dl_sym(handle, "flint_plugin_on_load")
-        var sym_step = dl_sym(handle, "flint_plugin_on_step")
-        var sym_unload = dl_sym(handle, "flint_plugin_on_unload")
-        if sym_ver == 0 or sym_step == 0:
+        if sym_ver == 0:
             self.last_error = "missing required plugin entrypoints: " + dl_error()
             _ = dl_close(handle)
             _ = remove_file(staged)
             return False
+        var sym_step = dl_sym(handle, "flint_plugin_on_step")
+        if sym_step == 0:
+            self.last_error = "missing required plugin entrypoints: " + dl_error()
+            _ = dl_close(handle)
+            _ = remove_file(staged)
+            return False
+        var sym_load = dl_sym(handle, "flint_plugin_on_load")
+        var sym_unload = dl_sym(handle, "flint_plugin_on_unload")
 
         var ver_fn = _sym_to_fn[GuestApiVersionFn](sym_ver)
         var found_ver = ver_fn()
-        if found_ver != FLINT_PLUGIN_API_VERSION:
+        var ver_ok = (found_ver == FLINT_PLUGIN_API_VERSION) or (self.allow_v1 and found_ver == 1)
+        if not ver_ok:
             self.last_error = (
                 "plugin ABI mismatch: expected "
                 + String(FLINT_PLUGIN_API_VERSION)
@@ -279,6 +674,16 @@ struct HotReloadHost(Movable):
             _ = remove_file(staged)
             return False
 
+        var was_loaded = self.is_loaded()
+        if was_loaded:
+            if not self.unload(world, resources, is_reload=True):
+                _ = dl_close(handle)
+                _ = remove_file(staged)
+                return False
+
+        if not resources.has[PodSchemaRegistryResource]():
+            resources.insert[PodSchemaRegistryResource](PodSchemaRegistryResource())
+
         self.lib_handle = handle
         self.fn_api_version = sym_ver
         self.fn_on_load = sym_load
@@ -287,19 +692,21 @@ struct HotReloadHost(Movable):
         self.active_temp_path = staged
         self.source_path = so_path
         self.reload_generation = next_gen
+        self.active_api_version = found_ver
         self.last_error = ""
 
         if self.fn_on_load != 0:
             var lfn = _sym_to_fn[GuestOnLoadFn](self.fn_on_load)
             var code = lfn(
-                Int(self.api_box.unsafe_ptr()),
+                self._active_api_addr(),
                 Int(Pointer(to=world)),
                 Int(Pointer(to=resources)),
                 Int32(1) if was_loaded else Int32(0),
             )
             if code != 0:
-                self.last_error = "flint_plugin_on_load returned error code " + String(code)
+                var load_err = "flint_plugin_on_load returned error code " + String(code)
                 _ = self.unload(world, resources, is_reload=False)
+                self.last_error = load_err
                 return False
 
         self.last_reload_ms = (get_time() - t0) * 1000.0
@@ -311,7 +718,7 @@ struct HotReloadHost(Movable):
             return -1
         var sfn = _sym_to_fn[GuestOnStepFn](self.fn_on_step)
         return sfn(
-            Int(self.api_box.unsafe_ptr()),
+            self._active_api_addr(),
             Int(Pointer(to=world)),
             Int(Pointer(to=resources)),
             dt,

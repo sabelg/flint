@@ -7,13 +7,13 @@ Any thread may log. A writer claims an entry with one atomic add on the head
 counter, fills it, and publishes it by writing the entry's sequence word
 last; nobody waits for anybody. The ring holds the last `LOG_ENTRIES`
 entries. `flush_log` (the main loop calls it once a frame, and at exit)
-writes what is new to `$XDG_STATE_HOME/sharddepth/logs/sharddepth.log`; an
+writes what is new to `$XDG_STATE_HOME/<app>/logs/<app>.log` (default `flint`); an
 entry overwritten before it was flushed is counted as dropped. The crash
 handler reads the same ring, so the last lines before a crash are in its
 report even if they never reached the file.
 
 Each category has its own level (`log.<category>` console variables, or
-`SD_LOG=gpu=debug,assets=warn`); a category left at "follow" uses
+`FLINT_LOG=gpu=debug,assets=warn`); a category left at "follow" uses
 `log.level`. Entries at `log.echo` or above are also printed to stderr.
 Logging never touches the simulation: entries carry the tick only to read.
 
@@ -342,19 +342,38 @@ def format_entry(mut out: RawText, index: Int) -> Bool:
     return True
 
 
-def state_directory() -> String:
-    """SD_STATE_DIR, then $XDG_STATE_HOME/sharddepth, then ~/.local/state/sharddepth."""
-    var chosen = env_value("SD_STATE_DIR")
+def _sanitize_app_name(name: String) -> String:
+    """Returns a safe single path component for log/crash state directories."""
+    var raw = name.as_bytes()
+    var out = List[UInt8](capacity=len(raw))
+    for i in range(len(raw)):
+        var b = raw[i]
+        var is_alpha_num = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+        var is_safe_punct = b == 45 or b == 95 or b == 46
+        if is_alpha_num or is_safe_punct:
+            out.append(b)
+        else:
+            out.append(UInt8(95))
+    var clean = String(unsafe_from_utf8=out)
+    if clean.byte_length() == 0 or clean == "." or clean == "..":
+        return "flint"
+    return clean^
+
+
+def state_directory(app_name: String = "flint") -> String:
+    """FLINT_STATE_DIR, then $XDG_STATE_HOME/<app_name>, then ~/.local/state/<app_name>."""
+    var chosen = env_value("FLINT_STATE_DIR")
     if chosen.byte_length() > 0:
         return chosen
+    var folder = _sanitize_app_name(app_name)
     var state_home = env_value("XDG_STATE_HOME")
     if state_home.byte_length() > 0:
-        return state_home + "/sharddepth"
-    return env_value("HOME") + "/.local/state/sharddepth"
+        return state_home + "/" + folder
+    return env_value("HOME") + "/.local/state/" + folder
 
 
 def rotate_logs(directory: String, name: String):
-    """sharddepth.log becomes sharddepth.1.log, and so on; the oldest goes."""
+    """<name>.log becomes <name>.1.log, and so on; the oldest goes."""
     for index in range(LOG_FILES_KEPT - 1, 0, -1):
         var older = directory + "/" + name + "." + String(index) + ".log"
         if file_size(older) >= 0:
@@ -364,23 +383,24 @@ def rotate_logs(directory: String, name: String):
         _ = rename_file(current, directory + "/" + name + ".1.log")
 
 
-def start_log(name: String = "sharddepth", directory: String = "") -> Bool:
-    """Map the anchor, open the log file (rotating the old ones) and apply SD_LOG.
+def start_log(name: String = "flint", directory: String = "") -> Bool:
+    """Map the anchor, open the log file (rotating the old ones) and apply FLINT_LOG.
     False if the file cannot be opened; logging then still reaches the ring."""
     if not install_anchor():
         print("LOG_UNAVAILABLE the safety anchor could not be mapped")
         return False
-    var state = directory if directory.byte_length() > 0 else state_directory()
+    var safe_name = _sanitize_app_name(name)
+    var state = directory if directory.byte_length() > 0 else state_directory(safe_name)
     set_text(T_STATE_DIR, state)
-    var settings = env_value("SD_LOG")
+    var settings = env_value("FLINT_LOG")
     if settings.byte_length() > 0:
         _ = apply_log_settings(settings)
     var folder = state + "/logs"
     if not make_dirs(folder):
         print("LOG_FAILED cannot make " + folder)
         return False
-    rotate_logs(folder, name)
-    var path = folder + "/" + name + ".log"
+    rotate_logs(folder, safe_name)
+    var path = folder + "/" + safe_name + ".log"
     var owned = c_string(path)
     var fd = sys(SYS_OPENAT, AT_FDCWD, Int(owned.unsafe_ptr()), O_WRONLY_CREATE_APPEND, 0o644)
     _ = owned^

@@ -1,8 +1,8 @@
-"""The play loop's recorder: SD_RECORD files and the always-on session replay.
+"""The play loop's recorder: FLINT_RECORD files and the always-on session replay.
 
-Play always records (unless SD_RECORD names another file, or SD_NO_SESSION_
-REPLAY=1): every tick's input and checksums go to
-`$XDG_STATE_HOME/sharddepth/last-session.sdrp`, replaced at each start. The
+Play always records (unless FLINT_RECORD names another file, or
+FLINT_NO_SESSION_REPLAY=1): every tick's input and checksums go to
+`$XDG_STATE_HOME/flint/last-session.sdrp`, replaced at each start. The
 crash handler appends what is still in memory and links the file into the
 crash folder, so a crash report always carries the replay up to the crash
 tick.

@@ -2,12 +2,17 @@
 
 Usage:
   flint-pack <output.flpk> <asset1> [asset2 ...]
-  flint-pack --cook <source_dir> <output.flpk>
+  flint-pack --cook <source_dir> <output.flpk> [--cache-dir <dir>]
   flint-pack --inspect <pack.flpk>
 """
 from std.ffi import external_call
 from std.sys import argv
-from flint.assets.cooker_v2 import cook_single_source_bytes, cook_workspace
+from flint.assets.cooker_v2 import (
+    DEFAULT_COOK_CACHE_DIR,
+    _classify_asset_ext,
+    cook_single_source_bytes,
+    cook_workspace,
+)
 from flint.assets.flpk_v3 import (
     ASSET_KIND_AUDIO,
     ASSET_KIND_FONT,
@@ -58,16 +63,7 @@ def _is_dir(path: String) -> Bool:
 
 
 def _is_cookable_ext(name: String) -> Bool:
-    return (
-        name.endswith(".glb")
-        or name.endswith(".png")
-        or name.endswith(".jpg")
-        or name.endswith(".jpeg")
-        or name.endswith(".hdr")
-        or name.endswith(".exr")
-        or name.endswith(".ttf")
-        or name.endswith(".wav")
-    )
+    return _classify_asset_ext(name)[0]
 
 
 def _has_cookable_sources(dir_path: String, depth: Int = 0) -> Bool:
@@ -125,14 +121,23 @@ def _inspect_pack(pack_path: String) -> Int:
     return 0
 
 
-def _cook_dir(source_dir: String, output_pack: String, page_align: Bool) -> Int:
+def _cook_dir(
+    source_dir: String,
+    output_pack: String,
+    page_align: Bool,
+    cache_dir: String = DEFAULT_COOK_CACHE_DIR,
+) -> Int:
     var clean_src = _strip_trailing_slashes(source_dir)
     var clean_out = _strip_trailing_slashes(output_pack)
+    var clean_cache = _strip_trailing_slashes(cache_dir if cache_dir.byte_length() > 0 else DEFAULT_COOK_CACHE_DIR)
     if is_symlink(clean_src):
         print("[Flint Pack] ERROR: Symlink source directory rejected: " + source_dir)
         return 1
     if is_symlink(clean_out):
         print("[Flint Pack] ERROR: Symlink output path rejected: " + output_pack)
+        return 1
+    if is_symlink(clean_cache):
+        print("[Flint Pack] ERROR: Symlink cache directory rejected: " + cache_dir)
         return 1
     if _is_dir(clean_out):
         print("[Flint Pack] ERROR: Output path is a directory: " + output_pack)
@@ -150,7 +155,7 @@ def _cook_dir(source_dir: String, output_pack: String, page_align: Bool) -> Int:
     var existed_before = (not _is_dir(clean_out)) and file_stamp(clean_out)[0] >= 0
     var pool = JobPool()
     _ = pool.start(max(1, default_worker_count()))
-    var rep = cook_workspace(clean_src, output_pack, pool, page_align=page_align)
+    var rep = cook_workspace(clean_src, output_pack, pool, cache_dir=clean_cache, page_align=page_align)
     pool.stop()
     var total_bytes = file_stamp(output_pack)[0]
     if rep.ok and rep.total_assets > 0 and total_bytes > 0:
@@ -159,7 +164,11 @@ def _cook_dir(source_dir: String, output_pack: String, page_align: Bool) -> Int:
             + String(rep.total_assets)
             + " asset(s) ("
             + String(rep.total_chunks)
-            + " chunk(s)) into "
+            + " chunk(s), cooked="
+            + String(rep.cooked_count)
+            + ", cache_hits="
+            + String(rep.cache_hits)
+            + ") into "
             + output_pack
             + " ("
             + String(total_bytes)
@@ -183,9 +192,11 @@ def _run_pack() -> Int:
     var flag_page_align = True
     var flag_cook = False
     var flag_inspect = False
+    var flag_cache_dir = String("")
     var positional = List[String]()
 
-    for i in range(1, len(args)):
+    var i = 1
+    while i < len(args):
         var a = String(args[i])
         if a == "--raw":
             flag_raw = True
@@ -195,9 +206,23 @@ def _run_pack() -> Int:
             flag_cook = True
         elif a == "--inspect":
             flag_inspect = True
+        elif a == "--cache-dir":
+            if i + 1 >= len(args):
+                print("[Flint Pack] ERROR: --cache-dir requires a directory argument")
+                return 1
+            i += 1
+            flag_cache_dir = String(args[i])
+            if flag_cache_dir.byte_length() == 0:
+                print("[Flint Pack] ERROR: --cache-dir requires a non-empty directory")
+                return 1
+        elif a.startswith("--cache-dir="):
+            flag_cache_dir = String(a[byte=12:])
+            if flag_cache_dir.byte_length() == 0:
+                print("[Flint Pack] ERROR: --cache-dir requires a non-empty directory")
+                return 1
         elif a == "--help" or a == "-h":
             print("Usage: flint-pack <output.flpk> <asset1> [asset2 ...]")
-            print("       flint-pack --cook <source_dir> <output.flpk>")
+            print("       flint-pack --cook <source_dir> <output.flpk> [--cache-dir <dir>]")
             print("       flint-pack --inspect <pack.flpk>")
             return 0
         elif a.startswith("-"):
@@ -206,6 +231,7 @@ def _run_pack() -> Int:
             return 1
         else:
             positional.append(a)
+        i += 1
 
     if flag_inspect:
         if len(positional) < 1:
@@ -215,9 +241,9 @@ def _run_pack() -> Int:
 
     if flag_cook:
         if len(positional) < 2:
-            print("Usage: flint-pack --cook <source_dir> <output.flpk>")
+            print("Usage: flint-pack --cook <source_dir> <output.flpk> [--cache-dir <dir>]")
             return 1
-        return _cook_dir(positional[0], positional[1], flag_page_align)
+        return _cook_dir(positional[0], positional[1], flag_page_align, flag_cache_dir)
 
     if len(positional) < 2:
         print("Usage: flint-pack <output.flpk> <asset1> [asset2 ...]")

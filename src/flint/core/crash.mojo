@@ -4,17 +4,16 @@
 SIGILL, SIGTRAP and SIGABRT on an alternate signal stack (`sigaltstack`), so
 even a stack overflow is reported. Worker threads take their own stack with
 `install_thread_stack`. On a crash the handler writes, into
-`$XDG_STATE_HOME/sharddepth/crashes/<UTC time>-<pid>/`:
+`$XDG_STATE_HOME/<app>/crashes/<UTC time>-<pid>/` (default `flint`):
 
     crash.txt    the signal and faulting address, the reason (for a failed
                  check), build stamp and build id, tick, counters, registers,
                  the raw backtrace, console variables, the last log entries,
-                 and the executable mappings `tools/symbolize` needs
+                 and the executable mappings for address symbolization
     replay.sdrp  the session's replay: every whole tick, then the input of the
-                 tick that crashed with zero checksums (tools/replay.mojo
-                 replays the whole ticks and then runs the crashing tick)
+                 tick that crashed with zero checksums
 
-and prints `SHARDDEPTH_CRASH <folder>` to stderr. Then it restores the default
+and prints `FLINT_CRASH <folder>` to stderr. Then it restores the default
 action and lets the signal kill the process as it would have, core dump
 included.
 
@@ -375,7 +374,7 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     var fd = sys(SYS_OPENAT, AT_FDCWD, path.terminate(), O_WRONLY_CREATE_TRUNC, 0o644)
     var replay_ticks = save_replay(out, path, folder_length)
 
-    out.text("Sharddepth crash report\nsignal: ")
+    out.text("Flint crash report\nsignal: ")
     write_signal_name(out, number)
     out.text(" (")
     out.decimal(number)
@@ -472,7 +471,7 @@ def on_crash(signal: Int32, info: Int, context: Int) abi("C"):
     _ = flush_log()
 
     out.length = 0
-    out.text("SHARDDEPTH_CRASH ")
+    out.text("FLINT_CRASH ")
     write_signal_name(out, number)
     out.text(" report=")
     out.bytes_at(path.base, folder_length)

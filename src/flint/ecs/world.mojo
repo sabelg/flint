@@ -75,6 +75,20 @@ def comp_hash64(name: StaticString) -> UInt64:
     return h if h != 0 else UInt64(1)
 
 
+def comp_hash64_str(name: String) -> UInt64:
+    """Runtime `String` equivalent of `comp_hash64` (identical FNV-1a + SplitMix64 hash)."""
+    var bytes = name.as_bytes()
+    var h = UInt64(0xCBF29CE484222325)
+    for i in range(len(bytes)):
+        h = (h ^ UInt64(bytes[i])) * UInt64(0x100000001B3)
+    h ^= h >> 30
+    h *= UInt64(0xBF58476D1CE4E5B9)
+    h ^= h >> 27
+    h *= UInt64(0x94D049BB133111EB)
+    h ^= h >> 31
+    return h if h != 0 else UInt64(1)
+
+
 @always_inline
 def _next_entity_gen(gen: UInt32) -> UInt32:
     if gen >= MAX_LIVE_GENERATION or gen == 0:
@@ -2167,19 +2181,17 @@ struct World(Movable):
         self._index_component_hash(comp_hash, tid)
         return tid
 
-    def insert_raw_pod(mut self, entity: Entity, tid: Int, src_ptr: Int) -> Bool:
-        """Inserts or overwrites a POD component `tid` on `entity` from `src_ptr`."""
+    def _prepare_raw_pod_dst(mut self, entity: Entity, tid: Int) -> Tuple[Bool, Int]:
+        """Allocates or prepares destination cell for POD component `tid` on `entity`, returning `(ok, dst_ptr)`."""
         if tid < 0 or tid >= len(self.components) or not self.is_alive(entity):
-            return False
+            return (False, 0)
         var info = self.components[tid]
         var idx = Int(entity.index)
         if info.storage_mode == STORAGE_SPARSE:
             var sidx = self.comp_to_sparse[tid]
             var dst_ptr = self.sparse_sets[sidx].insert_uninit(entity, info, self.current_tick)
-            if info.byte_size > 0 and src_ptr != 0:
-                _ = external_call["memcpy", Int](dst_ptr, src_ptr, info.byte_size)
             self.entities[idx].sparse_mask.set(tid)
-            return True
+            return (True, dst_ptr if info.byte_size > 0 else 0)
         var src_arch = Int(self.entities[idx].archetype_id)
         var src_ch = Int(self.entities[idx].chunk_idx)
         var src_row = Int(self.entities[idx].row_in_chunk)
@@ -2188,17 +2200,42 @@ struct World(Movable):
             var cell = self.archetypes[src_arch].chunks[src_ch].cell_ptr(existing_col, src_row)
             if info.byte_size > 0:
                 info.drop_at(cell)
-                if src_ptr != 0:
-                    _ = external_call["memcpy", Int](cell, src_ptr, info.byte_size)
             self.archetypes[src_arch].chunks[src_ch].mark_changed(existing_col, src_row, self.current_tick)
-            return True
+            return (True, cell if info.byte_size > 0 else 0)
         var dst_arch = self._next_archetype_add(src_arch, tid)
         var dst_loc = self._move_entity_archetype(entity, src_arch, src_ch, src_row, dst_arch, -1)
         var dst_col = self.archetypes[dst_arch].col_index(tid)
-        if info.byte_size > 0 and src_ptr != 0:
-            var cell = self.archetypes[dst_arch].chunks[dst_loc[0]].cell_ptr(dst_col, dst_loc[1])
-            _ = external_call["memcpy", Int](cell, src_ptr, info.byte_size)
+        var cell = self.archetypes[dst_arch].chunks[dst_loc[0]].cell_ptr(dst_col, dst_loc[1]) if info.byte_size > 0 else 0
         self.archetypes[dst_arch].chunks[dst_loc[0]].mark_changed(dst_col, dst_loc[1], self.current_tick)
+        return (True, cell)
+
+    def insert_raw_pod(mut self, entity: Entity, tid: Int, src_ptr: Int) -> Bool:
+        """Inserts or overwrites a POD component `tid` on `entity` from `src_ptr`."""
+        var res = self._prepare_raw_pod_dst(entity, tid)
+        if not res[0]:
+            return False
+        var byte_size = self.components[tid].byte_size
+        if byte_size > 0:
+            if src_ptr != 0:
+                _ = external_call["memcpy", Int](res[1], src_ptr, byte_size)
+            else:
+                _ = external_call["memset", Int](res[1], Int32(0), byte_size)
+        return True
+
+    def insert_raw_pod_bytes(mut self, entity: Entity, tid: Int, data: Span[UInt8, _]) -> Bool:
+        """Inserts or overwrites a POD component `tid` on `entity` from an origin-tracked `Span[UInt8]`."""
+        if tid < 0 or tid >= len(self.components) or not self.is_alive(entity):
+            return False
+        var byte_size = self.components[tid].byte_size
+        if byte_size > 0 and len(data) < byte_size:
+            return False
+        var res = self._prepare_raw_pod_dst(entity, tid)
+        if not res[0]:
+            return False
+        if byte_size > 0:
+            var dst = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=res[1])
+            for i in range(byte_size):
+                dst[unsafe_offset=i] = data[i]
         return True
 
     def has_by_type_id(self, entity: Entity, tid: Int) -> Bool:

@@ -12,7 +12,7 @@ Emits 100% GPU `UiDrawList` vector primitives (`0` CPU pixel loops!):
     `begin_modal` / `end_modal` with `Tab` & Gamepad D-Pad navigation.
 """
 from std.collections import List, Dict
-from std.math import abs, isfinite, isinf, isnan
+from std.math import abs, floor, isfinite, isinf, isnan
 from flint.core.math import Vec3
 from flint.platform.input import (
     InputState,
@@ -28,6 +28,14 @@ from flint.text.utf8 import decode_utf8, encode_utf8
 from flint.text.bidi import BIDI_AUTO, BIDI_LTR
 from flint.text.shaper import ShapedGlyph
 from flint.text.rich_text import parse_rich, layout_rich, layout_rich_shaped, SPAN_BUTTON
+from flint.ui.animator import (
+    SpringConfig,
+    UI_ANIM_INSTANT,
+    UI_ANIM_NORMAL,
+    UI_ANIM_REDUCED,
+    UiAnimator,
+    lerp_rgba8,
+)
 from flint.ui.button_glyphs import pad_button, face_color
 from flint.ui.draw_list import (
     UiDrawList,
@@ -35,7 +43,21 @@ from flint.ui.draw_list import (
     PRIM_GLYPH,
     UI_FLAG_BORDER,
     UI_FLAG_DROP_SHADOW,
+    UI_FLAG_OUTER_GLOW,
+    UI_FLAG_PER_CORNER_RADII,
+    UI_FLAG_TOP_BEVEL,
     UI_FLAG_VERT_GRADIENT,
+)
+from flint.ui.icons import draw_studio_chevron, draw_studio_icon
+from flint.ui.theme import (
+    CARD_HEADER_H,
+    INSPECTOR_LABEL_RATIO,
+    INSPECTOR_ROW_H,
+    RADIUS_MD,
+    RADIUS_SM,
+    StudioTheme,
+    rgba8_scale_alpha,
+    rgba8_with_alpha,
 )
 from flint.ui.flexbox_dock import (
     RectF,
@@ -237,11 +259,14 @@ struct _BoxScope(Copyable, ImplicitlyCopyable, Movable):
     var gap: Float32
     var pad_r: Float32
     var pad_b: Float32
+    var max_x: Float32
+    var max_y: Float32
 
 
 @fieldwise_init
 struct _ScrollScope(Copyable, ImplicitlyCopyable, Movable):
     var id_hash: UInt64
+    var flex_idx: Int
     var view_rect: RectF
     var start_cursor_y: Float32
     var scroll_y: Float32
@@ -340,6 +365,29 @@ struct UiContext(Movable):
     var active_modal_id: UInt64
     var drag_drop: DragDropPayload
     var culled_items_this_frame: Int
+    # Input capture & deferred popups (M0 F09)
+    var _focused_text_id: UInt64
+    var _focused_text_seen: Bool
+    var _text_widget_ids: List[UInt64]
+    var hovered_rect: RectF
+    var _dock_splitter_active: Bool
+    var _open_popup_id: UInt64
+    var _popup_seen: Bool
+    var _popup_kind: Int
+    var _popup_rect: RectF
+    var _popup_consumed_click: Bool
+    var _popup_consumed_rect: RectF
+    var _popup_combo_items: List[String]
+    var _popup_combo_sel: Int
+    var _popup_combo_hover: Int
+    var _popup_color: Vec3
+    var _in_frame: Bool
+    var _keyboard_capture: Bool
+    # Studio v2 Design System, Micro-Animation & CSS :focus-visible
+    var studio_theme: StudioTheme
+    var animator: UiAnimator
+    var focus_visible: Bool
+    var dock_style_v2: Bool
 
     def __init__(out self, preset_hud: Bool = False):
         self.draw_list = UiDrawList()
@@ -427,6 +475,49 @@ struct UiContext(Movable):
         self.active_modal_id = 0
         self.drag_drop = DragDropPayload()
         self.culled_items_this_frame = 0
+        self._focused_text_id = 0
+        self._focused_text_seen = False
+        self._text_widget_ids = List[UInt64]()
+        self.hovered_rect = RectF()
+        self._dock_splitter_active = False
+        self._open_popup_id = 0
+        self._popup_seen = False
+        self._popup_kind = 0
+        self._popup_rect = RectF()
+        self._popup_consumed_click = False
+        self._popup_consumed_rect = RectF()
+        self._popup_combo_items = List[String]()
+        self._popup_combo_sel = -1
+        self._popup_combo_hover = -1
+        self._popup_color = Vec3()
+        self._in_frame = False
+        self._keyboard_capture = False
+        self.studio_theme = StudioTheme()
+        self.animator = UiAnimator(UI_ANIM_NORMAL)
+        self.focus_visible = False
+        self.dock_style_v2 = False
+
+    def set_studio_theme(mut self, var st: StudioTheme):
+        """Switches the active Studio v2 design-system theme (syncs reduced-motion preference)."""
+        if st.reduced_motion and self.animator.mode == UI_ANIM_NORMAL:
+            self.animator.set_mode(UI_ANIM_REDUCED)
+        elif (not st.reduced_motion) and self.animator.mode == UI_ANIM_REDUCED:
+            self.animator.set_mode(UI_ANIM_NORMAL)
+        self.studio_theme = st^
+
+    def set_anim_mode(mut self, mode: Int):
+        """Sets micro-animation mode (`UI_ANIM_NORMAL`, `UI_ANIM_REDUCED`, or `UI_ANIM_INSTANT`)."""
+        self.animator.set_mode(mode)
+
+    @always_inline
+    def is_animating(self) -> Bool:
+        """Returns `True` while any micro-animation spring, toast, or trail requires redraw."""
+        return self.animator.is_animating()
+
+    @always_inline
+    def show_focus_ring(self, wid: UInt64) -> Bool:
+        """CSS `:focus-visible` query: `True` only when `wid` is focused via keyboard/gamepad navigation."""
+        return (not self._blocked_by_modal()) and self.focused_id == wid and self.focus_visible
 
     # ---- Frame Lifecycle ----
 
@@ -437,6 +528,7 @@ struct UiContext(Movable):
         screen_h: Float32 = 720.0,
         dt: Float32 = 1.0 / 60.0,
     ):
+        self._in_frame = True
         self.frame_epoch += 1
         self.draw_list.clear()
         self.flex.clear()
@@ -454,9 +546,21 @@ struct UiContext(Movable):
         self.last_item_id = 0
         self.culled_items_this_frame = 0
         self._ime_widget_seen = False
+        self._focused_text_seen = False
+        self._text_widget_ids.clear()
+        self.hovered_rect = RectF()
+        self._dock_splitter_active = False
+        self._popup_seen = False
+        self._popup_consumed_click = False
+        self._popup_consumed_rect = RectF()
 
-        self.screen_w = max(Float32(1.0), screen_w if isfinite(screen_w) else Float32(1280.0))
-        self.screen_h = max(Float32(1.0), screen_h if isfinite(screen_h) else Float32(720.0))
+        var next_sw = max(Float32(1.0), screen_w if isfinite(screen_w) else Float32(1280.0))
+        var next_sh = max(Float32(1.0), screen_h if isfinite(screen_h) else Float32(720.0))
+        if next_sw != self.screen_w or next_sh != self.screen_h:
+            self.cached_rects.clear()
+            self.cached_rect_epochs.clear()
+        self.screen_w = next_sw
+        self.screen_h = next_sh
         if not isfinite(dt):
             self.dt = Float32(1.0 / 60.0)
         else:
@@ -464,6 +568,7 @@ struct UiContext(Movable):
         if not isfinite(self.ui_time_sec):
             self.ui_time_sec = Float32(0.0)
         self.ui_time_sec += self.dt
+        self.animator.begin_frame(self.dt)
         self.clipboard_out_dirty = False
         self.clipboard_out = ""
 
@@ -543,13 +648,27 @@ struct UiContext(Movable):
         elif input.any_key_pressed() or self.mouse_pressed_l:
             self.from_pad = False
 
+        # CSS `:focus-visible`: show keyboard/gamepad focus ring only after keyboard/pad navigation
+        if (
+            self.key_tab_pressed
+            or self.key_up_pressed
+            or self.key_down_pressed
+            or self.key_left_pressed
+            or self.key_right_pressed
+            or pd_down
+            or pd_up
+        ):
+            self.focus_visible = True
+        elif self.mouse_pressed_l:
+            self.focus_visible = False
+
         # Push root full-screen container box
         var root_style = FlexStyle.col(gap=4.0, pad=0.0)
         root_style.fixed_w = self.screen_w
         root_style.fixed_h = self.screen_h
-        var root_idx = self.flex.add_node(-1, root_style, self.screen_w, self.screen_h)
+        var f_idx = self.flex.add_node(-1, root_style, self.screen_w, self.screen_h)
         var root_rect = RectF(0.0, 0.0, self.screen_w, self.screen_h)
-        self.box_stack.append(_BoxScope(UInt64(1), root_idx, root_rect, 0.0, 0.0, FLEX_COL, 4.0, 0.0, 0.0))
+        self.box_stack.append(_BoxScope(UInt64(1), f_idx, root_rect, 0.0, 0.0, FLEX_COL, 4.0, 0.0, 0.0, 0.0, 0.0))
         self.id_stack.append(UInt64(0xCBF29CE484222325))
 
     def end_frame(mut self):
@@ -632,6 +751,27 @@ struct UiContext(Movable):
                 else:
                     self.focused_id = ring[(cur_idx - 1 + n) % n]
 
+        if self.mouse_pressed_l and self._focused_text_id != 0 and self.active_id != self._focused_text_id:
+            if self.focused_id == self._focused_text_id:
+                self.focused_id = 0
+            self._focused_text_id = 0
+        var prev_focused_text_id = self._focused_text_id
+        var resolved_text_id = UInt64(0)
+        if self.focused_id != 0:
+            for ti in range(len(self._text_widget_ids)):
+                if self._text_widget_ids[ti] == self.focused_id:
+                    resolved_text_id = self.focused_id
+                    break
+        if prev_focused_text_id != 0 and resolved_text_id == 0 and self.focused_id == prev_focused_text_id:
+            self.focused_id = 0
+        self._focused_text_id = resolved_text_id
+
+        if not self._popup_seen:
+            self._open_popup_id = 0
+            self._popup_kind = 0
+        if self._open_popup_id != 0 and self._popup_kind != 0:
+            self._draw_deferred_popup()
+
         # Render DragDrop floating badge if dragging
         if self.drag_drop.active:
             if not self.mouse_down_l:
@@ -661,6 +801,106 @@ struct UiContext(Movable):
             self.cancel_ime()
         self.ime_commit = ""
         self.active_modal_id = 0
+        self._in_frame = False
+
+    # ---- Input Capture Barrier & Deferred Popups ----
+
+    def set_keyboard_capture(mut self, active: Bool):
+        """Explicitly enables or disables keyboard capture (e.g., keybind rebind listening)."""
+        self._keyboard_capture = active
+
+    @always_inline
+    def is_in_frame(self) -> Bool:
+        return self._in_frame
+
+    def wants_keyboard(self) -> Bool:
+        """Returns `True` when UI captures keyboard input (focused editable text input,
+        active IME, open modal dialog, open popup dropdown, or explicit keyboard capture).
+        Ignores auto-focused buttons."""
+        return (
+            self._focused_text_id != 0
+            or self.ime_active
+            or self.modal_depth > 0
+            or self.had_modal_prev_frame
+            or self._open_popup_id != 0
+            or self._keyboard_capture
+        )
+
+    def wants_mouse(self) -> Bool:
+        """Returns `True` when UI captures mouse/pointer input."""
+        return (
+            self.hovered_id != 0
+            or self.active_id != 0
+            or self.modal_depth > 0
+            or self.had_modal_prev_frame
+            or self.drag_drop.active
+            or self._open_popup_id != 0
+            or self._dock_splitter_active
+        )
+
+    def wants_mouse_at(self, mx: Float32, my: Float32) -> Bool:
+        """Frame-boundary-safe mouse capture query using current pointer `(mx, my)`."""
+        if (
+            self.active_id != 0
+            or self.modal_depth > 0
+            or self.had_modal_prev_frame
+            or self.drag_drop.active
+            or self._open_popup_id != 0
+            or self._dock_splitter_active
+        ):
+            return True
+        if self.hovered_id != 0:
+            return self.hovered_rect.contains(mx, my)
+        return False
+
+    def _draw_deferred_popup(mut self):
+        var r = self._popup_rect
+        if r.w <= Float32(0.0) or r.h <= Float32(0.0):
+            return
+        self.draw_list.add_rect_styled(
+            r.x, r.y, r.w, r.h,
+            self.theme.bg_panel,
+            self.theme.accent,
+            self.theme.corner_radius,
+            1.5,
+            1.0,
+            UI_FLAG_BORDER | UI_FLAG_DROP_SHADOW,
+        )
+        if self._popup_kind == 1:
+            var row_h = self.theme.row_height
+            for i in range(len(self._popup_combo_items)):
+                var iy = r.y + Float32(2.0) + Float32(i) * row_h
+                var ir = RectF(r.x + Float32(2.0), iy, max(Float32(1.0), r.w - Float32(4.0)), row_h)
+                if i == self._popup_combo_sel:
+                    self.draw_list.add_rect(ir.x, ir.y, ir.w, ir.h, self.theme.accent_dim, 2.0)
+                elif i == self._popup_combo_hover:
+                    self.draw_list.add_rect(ir.x, ir.y, ir.w, ir.h, self.theme.bg_widget_hover, 2.0)
+                var item_txt = self._popup_combo_items[i]
+                self._draw_text(
+                    item_txt,
+                    ir.x + Float32(6.0),
+                    ir.y + Float32(3.0),
+                    self.theme.font_size * Float32(0.92),
+                    self.theme.text_primary,
+                )
+        elif self._popup_kind == 2:
+            var row_h = self.theme.row_height
+            var pad = Float32(6.0)
+            var bar_w = max(Float32(12.0), r.w - pad * Float32(2.0))
+            var ch_cols = Array[UInt32, 3](fill=0)
+            ch_cols[0] = pack_rgba8(224, 82, 82, 255)
+            ch_cols[1] = pack_rgba8(92, 198, 108, 255)
+            ch_cols[2] = pack_rgba8(78, 148, 240, 255)
+            var ch_vals = Array[Float32, 3](fill=0.0)
+            ch_vals[0] = max(Float32(0.0), min(Float32(1.0), self._popup_color.x))
+            ch_vals[1] = max(Float32(0.0), min(Float32(1.0), self._popup_color.y))
+            ch_vals[2] = max(Float32(0.0), min(Float32(1.0), self._popup_color.z))
+            for c in range(3):
+                var by = r.y + pad + Float32(c) * row_h + Float32(2.0)
+                var bh = max(Float32(6.0), row_h - Float32(6.0))
+                self.draw_list.add_rect(r.x + pad, by, bar_w, bh, self.theme.bg_widget, 3.0, 1.0, self.theme.border)
+                var fw = max(Float32(2.0), bar_w * ch_vals[c])
+                self.draw_list.add_rect(r.x + pad, by, fw, bh, ch_cols[c], 3.0)
 
     # ---- Internal Layout & State Helpers ----
 
@@ -676,19 +916,52 @@ struct UiContext(Movable):
     def _blocked_by_modal(self) -> Bool:
         return self.had_modal_prev_frame and self.modal_depth == 0
 
+    @always_inline
+    def _pointer_in_scroll_clip(self) -> Bool:
+        for i in range(len(self.scroll_stack)):
+            if not self.scroll_stack[i].view_rect.contains(self.mouse_x, self.mouse_y):
+                return False
+        return True
+
+    @always_inline
+    def _clip_hovered_rect(self, r: RectF) -> RectF:
+        var out = r
+        for i in range(len(self.scroll_stack)):
+            var vr = self.scroll_stack[i].view_rect
+            var x0 = max(out.x, vr.x)
+            var y0 = max(out.y, vr.y)
+            var x1 = min(out.right(), vr.right())
+            var y1 = min(out.bottom(), vr.bottom())
+            out = RectF(x0, y0, max(Float32(0.0), x1 - x0), max(Float32(0.0), y1 - y0))
+        return out
+
+    @always_inline
+    def _is_pointer_blocked_by_popup(self, wid: UInt64 = 0) -> Bool:
+        if not self._pointer_in_scroll_clip():
+            return True
+        if (
+            self._open_popup_id != 0
+            and self._open_popup_id != wid
+            and self._popup_rect.contains(self.mouse_x, self.mouse_y)
+        ):
+            return True
+        if self._popup_consumed_click and self._popup_consumed_rect.contains(self.mouse_x, self.mouse_y):
+            return True
+        return False
+
     def _set_focused(mut self, wid: UInt64):
         if self.ime_active and self.ime_widget_id != 0 and self.ime_widget_id != wid:
             self.cancel_ime()
         self.focused_id = wid
 
-    def _register_focusable(mut self, wid: UInt64):
+    def _register_focusable(mut self, wid: UInt64, allow_auto_focus: Bool = True):
         if wid == self.ime_widget_id:
             self._ime_widget_seen = True
         if self.modal_depth > 0:
             self.modal_focusables.append(wid)
         else:
             self.bg_focusables.append(wid)
-        if self.focused_id == 0 and not self._blocked_by_modal():
+        if allow_auto_focus and self.focused_id == 0 and not self._blocked_by_modal():
             self.focused_id = wid
 
     def _get_state(mut self, wid: UInt64) -> RetainedWidgetState:
@@ -813,6 +1086,10 @@ struct UiContext(Movable):
                 self.box_stack[top_i].cursor_y = cy + safe_ph + scope.gap
         self.last_item_id = wid
         self.last_item_rect = r
+        if r.right() > self.box_stack[top_i].max_x:
+            self.box_stack[top_i].max_x = r.right()
+        if r.bottom() > self.box_stack[top_i].max_y:
+            self.box_stack[top_i].max_y = r.bottom()
         return r
 
     # ---- Containers, Flexbox, DockSpace & Virtualized ScrollView ----
@@ -845,7 +1122,7 @@ struct UiContext(Movable):
         var parent_scope = self.box_stack[top_i]
         var box_rect: RectF
         var cached = self.cached_rects.get(wid)
-        if cached:
+        if cached and len(self.scroll_stack) == 0:
             var cr = cached.value()
             box_rect = RectF(
                 cr.x if isfinite(cr.x) else Float32(0.0),
@@ -857,7 +1134,17 @@ struct UiContext(Movable):
             var cx = parent_scope.cursor_x if isfinite(parent_scope.cursor_x) else Float32(0.0)
             var cy = parent_scope.cursor_y if isfinite(parent_scope.cursor_y) else Float32(0.0)
             var w = safe_st.fixed_w if safe_st.fixed_w > Float32(0.0) else max(Float32(0.0), parent_scope.rect.right() - parent_scope.pad_r - cx)
-            var h = safe_st.fixed_h if safe_st.fixed_h > Float32(0.0) else max(Float32(0.0), parent_scope.rect.bottom() - parent_scope.pad_b - cy)
+            var h: Float32
+            if len(self.scroll_stack) > 0:
+                if cached:
+                    var cr = cached.value()
+                    if safe_st.fixed_w <= Float32(0.0) and isfinite(cr.w) and cr.w > Float32(0.0):
+                        w = cr.w
+                    h = safe_st.fixed_h if safe_st.fixed_h > Float32(0.0) else (max(Float32(0.0), cr.h) if isfinite(cr.h) else Float32(0.0))
+                else:
+                    h = safe_st.fixed_h if safe_st.fixed_h > Float32(0.0) else Float32(0.0)
+            else:
+                h = safe_st.fixed_h if safe_st.fixed_h > Float32(0.0) else max(Float32(0.0), parent_scope.rect.bottom() - parent_scope.pad_b - cy)
             box_rect = RectF(cx, cy, w if isfinite(w) else Float32(0.0), h if isfinite(h) else Float32(0.0))
 
         self.box_stack.append(
@@ -871,6 +1158,8 @@ struct UiContext(Movable):
                 safe_st.gap,
                 safe_st.pad_r,
                 safe_st.pad_b,
+                box_rect.x + safe_st.pad_l,
+                box_rect.y + safe_st.pad_t,
             )
         )
         self.id_stack.append(wid)
@@ -881,21 +1170,42 @@ struct UiContext(Movable):
         var finished = self.box_stack.pop()
         _ = self.id_stack.pop()
         var top_i = len(self.box_stack) - 1
+        var fin_right = finished.rect.right()
+        var fin_bottom = finished.rect.bottom()
+        if len(self.scroll_stack) > 0 or finished.rect.w <= Float32(0.0):
+            fin_right = max(fin_right, finished.max_x + finished.pad_r)
+        if len(self.scroll_stack) > 0 or finished.rect.h <= Float32(0.0):
+            fin_bottom = max(fin_bottom, finished.max_y + finished.pad_b)
         if self.box_stack[top_i].direction == FLEX_ROW:
-            self.box_stack[top_i].cursor_x = max(self.box_stack[top_i].cursor_x, finished.rect.right() + self.box_stack[top_i].gap)
+            self.box_stack[top_i].cursor_x = max(self.box_stack[top_i].cursor_x, fin_right + self.box_stack[top_i].gap)
         else:
-            self.box_stack[top_i].cursor_y = max(self.box_stack[top_i].cursor_y, finished.rect.bottom() + self.box_stack[top_i].gap)
+            self.box_stack[top_i].cursor_y = max(self.box_stack[top_i].cursor_y, fin_bottom + self.box_stack[top_i].gap)
+        if fin_right > self.box_stack[top_i].max_x:
+            self.box_stack[top_i].max_x = fin_right
+        if fin_bottom > self.box_stack[top_i].max_y:
+            self.box_stack[top_i].max_y = fin_bottom
 
     def update_dock_space(mut self, mut dock: DockSpace, root_rect: RectF):
         """Solves `dock`, handles interactive splitter dragging & tab clicks, and emits DockSpace chrome."""
         dock.solve_layout(root_rect)
-        if not self._blocked_by_modal():
+        var dock_ptr_blocked = self._blocked_by_modal() or self._is_pointer_blocked_by_popup()
+        if not dock_ptr_blocked:
             _ = dock.interact_splitters(self.mouse_x, self.mouse_y, self.mouse_down_l, self.mouse_pressed_l, root_rect)
+        if dock.hovered_splitter_node >= 0 or dock.dragging_node >= 0:
+            self._dock_splitter_active = True
+
+        var use_v2 = dock.dock_style_v2 or self.dock_style_v2
+        if use_v2:
+            self._draw_dock_space_v2(dock, dock_ptr_blocked)
+            return
 
         for i in range(len(dock.nodes)):
             ref dn = dock.nodes[i]
             var r = dn.rect
             if dn.kind == DOCK_TABS:
+                if not dock_ptr_blocked and r.contains(self.mouse_x, self.mouse_y) and self.hovered_id == 0:
+                    self.hovered_id = hash_ui_id(UInt64(0xD0C47AB5), String(i))
+                    self.hovered_rect = r
                 self.draw_list.add_rect(r.x, r.y, r.w, r.h, self.theme.bg_panel, 0.0, 1.0, self.theme.border)
                 var safe_hh = max(Float32(0.0), dock.header_height) if isfinite(dock.header_height) else Float32(24.0)
                 var hh = min(safe_hh, max(Float32(0.0), r.h))
@@ -906,7 +1216,7 @@ struct UiContext(Movable):
                     var tw = max(Float32(64.0), self._measure_text(tname, self.theme.font_size * Float32(0.92)) + Float32(18.0))
                     var tab_r = RectF(tx, r.y + Float32(2.0), tw, hh - Float32(2.0))
                     var is_act = dn.active_tab == t
-                    if not self._blocked_by_modal() and self.mouse_pressed_l and tab_r.contains(self.mouse_x, self.mouse_y):
+                    if not dock_ptr_blocked and self.mouse_pressed_l and tab_r.contains(self.mouse_x, self.mouse_y):
                         dock.nodes[i].active_tab = t
                         is_act = True
                     if is_act:
@@ -937,6 +1247,165 @@ struct UiContext(Movable):
                 var sy = r.y + r.h * dock.nodes[i].ratio
                 self.draw_list.add_line(r.x, sy, r.right(), sy, Float32(2.0) if hot else Float32(1.0), col)
 
+    def _draw_dock_space_v2(mut self, mut dock: DockSpace, dock_ptr_blocked: Bool):
+        """Obsidian v2 DockSpace chrome: animated sliding tab indicator pills, collapse chevrons, and glowing glass splitters."""
+        for i in range(len(dock.nodes)):
+            var d_kind = dock.nodes[i].kind
+            var r = dock.nodes[i].rect
+            if d_kind == DOCK_TABS:
+                var node_wid = hash_ui_id(UInt64(0xD0C47AB5), String(i))
+                var collapsed = dock.is_node_collapsed(i)
+                var safe_hh = max(Float32(0.0), dock.header_height) if isfinite(dock.header_height) else Float32(28.0)
+                var hh = min(safe_hh, max(Float32(0.0), r.h))
+                var hit_r = RectF(r.x, r.y, r.w, hh) if collapsed else r
+                if not dock_ptr_blocked and hit_r.contains(self.mouse_x, self.mouse_y) and self.hovered_id == 0:
+                    self.hovered_id = node_wid
+                    self.hovered_rect = hit_r
+
+                # Panel shell + subtle hairline
+                if not collapsed:
+                    self.draw_list.add_rect(r.x, r.y, r.w, r.h, self.studio_theme.l1_shell, 0.0, 1.0, self.studio_theme.border_subtle)
+                self.draw_list.add_rect_styled(
+                    r.x, r.y, r.w, hh,
+                    self.studio_theme.l0_canvas,
+                    self.studio_theme.border_subtle,
+                    0.0, 0.0, 1.0, UI_FLAG_TOP_BEVEL,
+                )
+                self.draw_list.add_line(r.x, r.y + hh, r.right(), r.y + hh, 1.0, self.studio_theme.border_subtle)
+
+                # Right-aligned collapse chevron button (zero dict allocation while at default open rest)
+                var chev_r = RectF(max(r.x, r.right() - hh), r.y, min(hh, r.w), hh)
+                var chev_hov = (not dock_ptr_blocked) and chev_r.contains(self.mouse_x, self.mouse_y)
+                var chev_wid = hash_ui_id(node_wid, "collapse")
+                var chev_open_t = Float32(0.0) if collapsed else Float32(1.0)
+                if chev_hov and self.mouse_pressed_l:
+                    _ = self.animator.drive_expand(chev_wid, not collapsed)
+                    collapsed = dock.toggle_node_collapsed(i)
+                    chev_open_t = self.animator.drive_expand(chev_wid, not collapsed)
+                elif collapsed or (chev_wid in self.animator.widgets):
+                    chev_open_t = self.animator.drive_expand(chev_wid, not collapsed)
+                var chev_col = self.studio_theme.text_primary if chev_hov else self.studio_theme.text_muted
+                draw_studio_chevron(
+                    self.draw_list,
+                    chev_r.center_x() - Float32(6.0),
+                    chev_r.center_y() - Float32(6.0),
+                    Float32(12.0),
+                    chev_col,
+                    chev_open_t,
+                    1.5,
+                )
+
+                # Tabs + animated sliding active-tab indicator pill
+                var tx = r.x + Float32(6.0)
+                var max_tx = chev_r.x - Float32(4.0)
+                var act_x = tx
+                var act_w = Float32(0.0)
+                var tab_font_sz = self.studio_theme.font_section
+                var n_tabs = len(dock.nodes[i].tabs)
+                for t in range(n_tabs):
+                    var tname = dock.nodes[i].tabs[t]
+                    var tw = max(Float32(58.0), self._measure_text(tname, tab_font_sz) + Float32(20.0))
+                    if tx + tw > max_tx and max_tx > tx + Float32(24.0):
+                        tw = max_tx - tx
+                    var tab_r = RectF(tx, r.y + Float32(3.0), tw, max(Float32(4.0), hh - Float32(4.0)))
+                    var is_act = dock.nodes[i].active_tab == t
+                    var tab_hov = (not dock_ptr_blocked) and tab_r.contains(self.mouse_x, self.mouse_y)
+                    if tab_hov and self.mouse_pressed_l:
+                        dock.nodes[i].active_tab = t
+                        is_act = True
+                        if collapsed:
+                            _ = dock.toggle_node_collapsed(i)
+                            collapsed = False
+                    var tab_wid = hash_ui_id(node_wid, tname)
+                    var anim_h = self.animator.drive_widget(tab_wid, tab_hov, tab_hov and self.mouse_down_l, False)
+                    if is_act:
+                        act_x = tab_r.x
+                        act_w = tab_r.w
+                        self.draw_list.add_rounded_rect_ex(
+                            tab_r.x, tab_r.y, tab_r.w, tab_r.h,
+                            self.studio_theme.l2_card,
+                            RADIUS_SM, RADIUS_SM, 0.0, 0.0,
+                            1.0, self.studio_theme.border_subtle, 1.0, UI_FLAG_TOP_BEVEL,
+                        )
+                    elif anim_h[0] > Float32(0.01):
+                        self.draw_list.add_rounded_rect_ex(
+                            tab_r.x, tab_r.y, tab_r.w, tab_r.h,
+                            rgba8_scale_alpha(self.studio_theme.l3_raised, anim_h[0] * Float32(0.65)),
+                            RADIUS_SM, RADIUS_SM, 0.0, 0.0,
+                        )
+                    var disp_txt = self._truncate_text_ellipsis(tname, max(Float32(16.0), tab_r.w - Float32(14.0)), tab_font_sz)
+                    var txt_col = (
+                        self.studio_theme.text_primary
+                        if is_act
+                        else lerp_rgba8(self.studio_theme.text_secondary, self.studio_theme.text_primary, anim_h[0])
+                    )
+                    self._draw_text(
+                        disp_txt,
+                        tab_r.x + Float32(8.0),
+                        tab_r.y + max(Float32(1.0), (tab_r.h - tab_font_sz) * Float32(0.5)),
+                        tab_font_sz,
+                        txt_col,
+                    )
+                    tx += tw + Float32(4.0)
+
+                if act_w > Float32(1.0):
+                    var pill = self.animator.drive_tab_pill(node_wid, act_x, act_w)
+                    self.draw_list.add_glow_rect(
+                        pill[0] + Float32(4.0),
+                        r.y + hh - Float32(2.5),
+                        max(Float32(4.0), pill[1] - Float32(8.0)),
+                        Float32(2.5),
+                        self.studio_theme.accent_primary,
+                        rgba8_scale_alpha(self.studio_theme.accent_primary, 0.65),
+                        1.25,
+                        5.0,
+                    )
+            elif d_kind == DOCK_CENTRAL_VIEWPORT:
+                self.draw_list.add_rect(r.x, r.y, r.w, r.h, 0, 0.0, 1.0, self.studio_theme.border_subtle)
+
+        # Glass/Obsidian splitters with smooth hover highlight
+        for i in range(len(dock.nodes)):
+            var k = dock.nodes[i].kind
+            var r = dock.nodes[i].rect
+            if k != DOCK_SPLIT_H and k != DOCK_SPLIT_V:
+                continue
+            var hot = dock.dragging_node == i or dock.hovered_splitter_node == i
+            var swid = hash_ui_id(UInt64(0x5B1177E2), String(i))
+            var sa = self.animator.drive_widget(swid, hot, dock.dragging_node == i, False)
+            var t_hot = max(sa[0], sa[1])
+            var col = lerp_rgba8(self.studio_theme.border_subtle, self.studio_theme.accent_primary, t_hot)
+            var thick = Float32(1.0) + Float32(1.5) * t_hot
+            if k == DOCK_SPLIT_H:
+                var sx = r.x + r.w * dock.nodes[i].ratio
+                self.draw_list.add_line(sx, r.y, sx, r.bottom(), thick, col)
+                if t_hot > Float32(0.05):
+                    var gh = min(Float32(36.0), r.h * Float32(0.3))
+                    self.draw_list.add_glow_rect(
+                        sx - Float32(1.5),
+                        r.center_y() - gh * Float32(0.5),
+                        Float32(3.0),
+                        gh,
+                        self.studio_theme.accent_primary,
+                        rgba8_scale_alpha(self.studio_theme.accent_primary, t_hot * Float32(0.7)),
+                        1.5,
+                        6.0,
+                    )
+            else:
+                var sy = r.y + r.h * dock.nodes[i].ratio
+                self.draw_list.add_line(r.x, sy, r.right(), sy, thick, col)
+                if t_hot > Float32(0.05):
+                    var gw = min(Float32(36.0), r.w * Float32(0.3))
+                    self.draw_list.add_glow_rect(
+                        r.center_x() - gw * Float32(0.5),
+                        sy - Float32(1.5),
+                        gw,
+                        Float32(3.0),
+                        self.studio_theme.accent_primary,
+                        rgba8_scale_alpha(self.studio_theme.accent_primary, t_hot * Float32(0.7)),
+                        1.5,
+                        6.0,
+                    )
+
     def begin_dock_panel(mut self, dock: DockSpace, panel_name: String) -> Bool:
         var found = dock.find_panel(panel_name)
         if found[0] < 0 or not found[2]:
@@ -966,6 +1435,8 @@ struct UiContext(Movable):
                 4.0,
                 6.0,
                 6.0,
+                content.x + Float32(6.0),
+                content.y + Float32(6.0),
             )
         )
         self.id_stack.append(wid)
@@ -996,10 +1467,14 @@ struct UiContext(Movable):
         self.last_item_rect = rect
         var st = self._get_state(wid)
 
-        if not self._blocked_by_modal() and rect.contains(self.mouse_x, self.mouse_y) and self.mouse_wheel != Float32(0.0):
-            var mw = self.mouse_wheel if isfinite(self.mouse_wheel) else Float32(0.0)
-            st.scroll_y = max(Float32(0.0), min(st.scroll_max_y, st.scroll_y - mw * Float32(36.0)))
-            self.state_map[wid] = st
+        if not self._blocked_by_modal() and not self._is_pointer_blocked_by_popup(wid) and rect.contains(self.mouse_x, self.mouse_y):
+            if self.hovered_id == 0:
+                self.hovered_id = wid
+                self.hovered_rect = self._clip_hovered_rect(rect)
+            if self.mouse_wheel != Float32(0.0):
+                var mw = self.mouse_wheel if isfinite(self.mouse_wheel) else Float32(0.0)
+                st.scroll_y = max(Float32(0.0), min(st.scroll_max_y, st.scroll_y - mw * Float32(36.0)))
+                self.state_map[wid] = st
 
         self.draw_list.add_rect(rect.x, rect.y, rect.w, rect.h, self.theme.bg_window, self.theme.corner_radius, 1.0, self.theme.border)
         var cx0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.x)))
@@ -1010,8 +1485,8 @@ struct UiContext(Movable):
 
         var inner_w = max(Float32(0.0), rect.w - self.theme.scrollbar_width - Float32(8.0))
         var box_st = FlexStyle.col(gap=2.0, pad=4.0)
-        box_st.fixed_w = inner_w
-        var f_idx = self.flex.add_node(self.box_stack[len(self.box_stack) - 1].flex_idx, box_st, inner_w, rect.h)
+        box_st.fixed_w = inner_w + Float32(8.0)
+        var f_idx = self.flex.add_node(-1, box_st, inner_w + Float32(8.0), rect.h)
 
         var start_y = rect.y + Float32(4.0) - st.scroll_y
         self.box_stack.append(
@@ -1025,10 +1500,12 @@ struct UiContext(Movable):
                 2.0,
                 Float32(4.0),
                 Float32(4.0),
+                rect.x + Float32(4.0),
+                start_y,
             )
         )
         self.id_stack.append(wid)
-        self.scroll_stack.append(_ScrollScope(wid, rect, start_y, st.scroll_y, safe_content_h))
+        self.scroll_stack.append(_ScrollScope(wid, f_idx, rect, start_y, st.scroll_y, safe_content_h))
 
     def end_scroll_view(mut self):
         if len(self.scroll_stack) == 0 or len(self.box_stack) <= 1:
@@ -1039,14 +1516,20 @@ struct UiContext(Movable):
 
         var span_y = inner_scope.cursor_y - sc.start_cursor_y
         var auto_h = max(Float32(0.0), span_y) if isfinite(span_y) else Float32(0.0)
+        if sc.flex_idx >= 0:
+            var root_w = max(Float32(8.0), sc.view_rect.w - self.theme.scrollbar_width)
+            var root_h = max(sc.view_rect.h, auto_h + Float32(8.0))
+            self.dock_flex_root_idxs.append(sc.flex_idx)
+            self.dock_flex_root_rects.append(RectF(sc.view_rect.x, sc.start_cursor_y - Float32(4.0), root_w, root_h))
         var measured_h = (
             sc.explicit_content_h
             if (isfinite(sc.explicit_content_h) and sc.explicit_content_h >= Float32(0.0))
             else auto_h
         )
         var view_h = sc.view_rect.h if isfinite(sc.view_rect.h) else Float32(0.0)
-        var max_scroll = max(Float32(0.0), measured_h - (view_h - Float32(8.0)))
-        if not isfinite(max_scroll):
+        var inner_view_h = max(Float32(0.0), view_h - Float32(8.0))
+        var max_scroll = max(Float32(0.0), measured_h - inner_view_h)
+        if measured_h <= Float32(0.0) or view_h <= Float32(8.0) or not isfinite(max_scroll):
             max_scroll = Float32(0.0)
         var st = self._get_state(sc.id_hash)
         st.scroll_max_y = max_scroll
@@ -1064,7 +1547,7 @@ struct UiContext(Movable):
             var thumb_y = track_y + (st.scroll_y / max_scroll) * travel
             var track_rect = RectF(track_x, track_y, sb_w, track_h)
 
-            if not self._blocked_by_modal() and self.mouse_pressed_l and track_rect.contains(self.mouse_x, self.mouse_y):
+            if not self._blocked_by_modal() and not self._is_pointer_blocked_by_popup(sc.id_hash) and self.mouse_pressed_l and track_rect.contains(self.mouse_x, self.mouse_y):
                 self.active_id = sc.id_hash
             if self.active_id == sc.id_hash and self.mouse_down_l and isfinite(self.mouse_y):
                 var rel_t = max(Float32(0.0), min(Float32(1.0), (self.mouse_y - track_y - thumb_h * Float32(0.5)) / travel))
@@ -1123,7 +1606,7 @@ struct UiContext(Movable):
             var sc = self.scroll_stack[len(self.scroll_stack) - 1]
             var cy = self.box_stack[top_i].cursor_y
             if cy + h < sc.view_rect.y or cy > sc.view_rect.bottom():
-                self.box_stack[top_i].cursor_y += h + self.box_stack[top_i].gap
+                _ = self._alloc_item_rect(0, Float32(0.0), h)
                 self.culled_items_this_frame += 1
                 return
         var w = self._measure_text(text, self.theme.font_size) + Float32(6.0)
@@ -1192,9 +1675,11 @@ struct UiContext(Movable):
         self._register_focusable(wid)
 
         var blocked = self._blocked_by_modal()
-        var hovered = (not blocked) and r.contains(self.mouse_x, self.mouse_y)
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var hovered = (not ptr_blocked) and r.contains(self.mouse_x, self.mouse_y)
         if hovered:
             self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(r)
             if self.mouse_pressed_l:
                 self.active_id = wid
                 self._set_focused(wid)
@@ -1212,7 +1697,7 @@ struct UiContext(Movable):
         elif hovered:
             bg = self.theme.bg_widget_hover
 
-        var focused = (not blocked) and self.focused_id == wid
+        var focused = (not blocked) and self.focused_id == wid and ((not self.dock_style_v2) or self.focus_visible)
         var b_col = self.theme.focus_ring if focused else self.theme.border
         var b_w = Float32(2.0) if focused else Float32(1.0)
         self.draw_list.add_rect_styled(
@@ -1236,10 +1721,12 @@ struct UiContext(Movable):
         self._register_focusable(wid)
 
         var blocked = self._blocked_by_modal()
-        var hovered = (not blocked) and r.contains(self.mouse_x, self.mouse_y)
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var hovered = (not ptr_blocked) and r.contains(self.mouse_x, self.mouse_y)
         var toggled = False
         if hovered:
             self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(r)
             if self.mouse_pressed_l:
                 self._set_focused(wid)
                 checked = not checked
@@ -1248,7 +1735,7 @@ struct UiContext(Movable):
             checked = not checked
             toggled = True
 
-        var focused = (not blocked) and self.focused_id == wid
+        var focused = (not blocked) and self.focused_id == wid and ((not self.dock_style_v2) or self.focus_visible)
         var bx = r.x + Float32(2.0)
         var by = r.y + Float32(2.0)
         self.draw_list.add_rect(
@@ -1280,12 +1767,16 @@ struct UiContext(Movable):
         self._register_focusable(wid)
 
         var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
         var track_w = r.w * Float32(0.58)
         var track = RectF(r.x, r.y + Float32(3.0), track_w, r.h - Float32(6.0))
-        var hovered = (not blocked) and track.contains(self.mouse_x, self.mouse_y)
-        if hovered and self.mouse_pressed_l:
-            self.active_id = wid
-            self._set_focused(wid)
+        var hovered = (not ptr_blocked) and track.contains(self.mouse_x, self.mouse_y)
+        if hovered:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(track)
+            if self.mouse_pressed_l:
+                self.active_id = wid
+                self._set_focused(wid)
 
         var lo64 = Float64(min_val) if isfinite(min_val) else 0.0
         var hi64 = Float64(max_val) if isfinite(max_val) else (lo64 + 1.0)
@@ -1327,7 +1818,7 @@ struct UiContext(Movable):
 
         var cur_v64 = Float64(value) if isfinite(value) else lo64
         var norm = Float32(max(0.0, min(1.0, (cur_v64 - lo64) / span64)))
-        var focused = (not blocked) and self.focused_id == wid
+        var focused = (not blocked) and self.focused_id == wid and ((not self.dock_style_v2) or self.focus_visible)
         self.draw_list.add_rect(
             track.x, track.y, track.w, track.h,
             self.theme.bg_widget,
@@ -1354,6 +1845,7 @@ struct UiContext(Movable):
         var safe_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(260.0)
         var r = self._alloc_item_rect(self.widget_id(id), safe_w, self.theme.row_height)
         var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup()
         var comp_w = max(Float32(1.0), (r.w * Float32(0.68) - Float32(8.0)) / Float32(3.0))
         var lo64 = Float64(min_val) if isfinite(min_val) else -1.0e6
         var hi64 = Float64(max_val) if isfinite(max_val) else 1.0e6
@@ -1376,10 +1868,13 @@ struct UiContext(Movable):
         for c in range(3):
             var cid = self.widget_id(id + "#" + String(c))
             var cr = RectF(r.x + Float32(c) * (comp_w + Float32(4.0)), r.y + Float32(2.0), comp_w, r.h - Float32(4.0))
-            if not blocked and cr.contains(self.mouse_x, self.mouse_y) and self.mouse_pressed_l:
-                self.active_id = cid
-                self._set_focused(cid)
-            if not blocked and self.active_id == cid and self.mouse_down_l and isfinite(self.mouse_delta_x) and self.mouse_delta_x != Float32(0.0):
+            if not ptr_blocked and cr.contains(self.mouse_x, self.mouse_y):
+                self.hovered_id = cid
+                self.hovered_rect = self._clip_hovered_rect(cr)
+                if self.mouse_pressed_l:
+                    self.active_id = cid
+                    self._set_focused(cid)
+            if not blocked and self.active_id == cid and self.mouse_down_l and (not self.mouse_pressed_l) and isfinite(self.mouse_delta_x) and self.mouse_delta_x != Float32(0.0):
                 var nv = Float32(max(lo64, min(hi64, Float64(vals[c]) + Float64(self.mouse_delta_x) * sp64)))
                 if isfinite(nv):
                     vals[c] = nv
@@ -1392,6 +1887,313 @@ struct UiContext(Movable):
         if changed or had_non_finite:
             v.x = vals[0]; v.y = vals[1]; v.z = vals[2]
         self._draw_text(label_text, r.x + r.w * Float32(0.68) + Float32(6.0), r.y + Float32(3.0), self.theme.font_size, self.theme.text_primary)
+        return changed
+
+    def drag_float(
+        mut self,
+        id: String,
+        label_text: String,
+        mut value: Float32,
+        speed: Float32 = 0.05,
+        min_val: Float32 = -1.0e6,
+        max_val: Float32 = 1.0e6,
+        w: Float32 = 220.0,
+    ) -> Bool:
+        var wid = self.widget_id(id)
+        var safe_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(220.0)
+        var r = self._alloc_item_rect(wid, safe_w, self.theme.row_height)
+        self._register_focusable(wid)
+
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var field_r = RectF(r.x, r.y + Float32(2.0), max(Float32(20.0), r.w * Float32(0.58)), r.h - Float32(4.0))
+        var hovered = (not ptr_blocked) and field_r.contains(self.mouse_x, self.mouse_y)
+        if hovered:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(field_r)
+            if self.mouse_pressed_l:
+                self.active_id = wid
+                self._set_focused(wid)
+
+        var lo64 = Float64(min_val) if isfinite(min_val) else -1.0e6
+        var hi64 = Float64(max_val) if isfinite(max_val) else 1.0e6
+        if hi64 < lo64:
+            var tmp_b = lo64
+            lo64 = hi64
+            hi64 = tmp_b
+        var sp64 = Float64(speed) if (isfinite(speed) and speed > Float32(0.0)) else 0.05
+        var was_finite = isfinite(value)
+        var val64 = Float64(value) if was_finite else lo64
+        var clamped64 = max(lo64, min(hi64, val64))
+        if (not was_finite) or abs(clamped64 - val64) > 1.0e-7:
+            value = Float32(clamped64)
+
+        var changed = False
+        if (not blocked) and self.active_id == wid and self.mouse_down_l and (not self.mouse_pressed_l) and isfinite(self.mouse_delta_x) and self.mouse_delta_x != Float32(0.0):
+            var scale = 0.2 if self.key_shift else 1.0
+            var nv64 = max(lo64, min(hi64, clamped64 + Float64(self.mouse_delta_x) * sp64 * scale))
+            var nv = Float32(nv64)
+            if isfinite(nv) and abs(Float64(nv) - clamped64) > 1.0e-7:
+                value = nv
+                changed = True
+        elif (not blocked) and self.focused_id == wid:
+            if self.key_left_pressed:
+                var nv = Float32(max(lo64, clamped64 - sp64))
+                if isfinite(nv):
+                    value = nv
+                    changed = True
+            elif self.key_right_pressed:
+                var nv = Float32(min(hi64, clamped64 + sp64))
+                if isfinite(nv):
+                    value = nv
+                    changed = True
+
+        var focused = (not blocked) and self.focused_id == wid and ((not self.dock_style_v2) or self.focus_visible)
+        var bg = self.theme.bg_widget_active if (self.active_id == wid and self.mouse_down_l) else (self.theme.bg_widget_hover if hovered else self.theme.bg_widget)
+        self.draw_list.add_rect(
+            field_r.x, field_r.y, field_r.w, field_r.h,
+            bg, 3.0,
+            Float32(2.0) if focused else Float32(1.0),
+            self.theme.focus_ring if focused else self.theme.border,
+        )
+        self._draw_text(format_float2(value), field_r.x + Float32(6.0), field_r.y + Float32(2.0), self.theme.font_size * Float32(0.88), self.theme.text_primary)
+        self._draw_text(label_text, field_r.right() + Float32(8.0), r.y + Float32(3.0), self.theme.font_size, self.theme.text_primary)
+        return changed
+
+    def combo_box(
+        mut self,
+        id: String,
+        label_text: String,
+        mut selected_idx: Int,
+        items: List[String],
+        w: Float32 = 220.0,
+    ) -> Bool:
+        var wid = self.widget_id(id)
+        var safe_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(220.0)
+        var r = self._alloc_item_rect(wid, safe_w, self.theme.row_height)
+        self._register_focusable(wid)
+
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var box_r = RectF(r.x, r.y + Float32(2.0), max(Float32(24.0), r.w * Float32(0.58)), r.h - Float32(4.0))
+        var hovered = (not ptr_blocked) and box_r.contains(self.mouse_x, self.mouse_y)
+        var just_opened_popup = False
+        var toggled_by_click = False
+        if hovered:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(box_r)
+            if self.mouse_pressed_l:
+                self._set_focused(wid)
+                toggled_by_click = True
+                if len(items) > 0:
+                    if self._open_popup_id == wid:
+                        self._open_popup_id = 0
+                        self._popup_kind = 0
+                    else:
+                        self._open_popup_id = wid
+                        self._popup_kind = 1
+                        just_opened_popup = True
+
+        if (not blocked) and (not toggled_by_click) and self.focused_id == wid and (self.key_enter_pressed or self.key_space_pressed or self.pad_confirm):
+            if len(items) > 0:
+                if self._open_popup_id == wid:
+                    self._open_popup_id = 0
+                    self._popup_kind = 0
+                else:
+                    self._open_popup_id = wid
+                    self._popup_kind = 1
+                    just_opened_popup = True
+
+        var changed = False
+        if not blocked and self._open_popup_id == wid and len(items) > 0:
+            self._popup_seen = True
+            var row_h = self.theme.row_height
+            var drop_h = Float32(len(items)) * row_h + Float32(4.0)
+            var drop_y = box_r.bottom() + Float32(2.0)
+            if drop_y + drop_h > self.screen_h and box_r.y - drop_h - Float32(2.0) >= Float32(0.0):
+                drop_y = box_r.y - drop_h - Float32(2.0)
+            var drop_r = RectF(box_r.x, drop_y, box_r.w, drop_h)
+
+            var hover_row = -1
+            if not just_opened_popup:
+                if drop_r.contains(self.mouse_x, self.mouse_y):
+                    self.hovered_id = wid
+                    self.hovered_rect = drop_r
+                    self._popup_consumed_click = True
+                    self._popup_consumed_rect = drop_r
+                    var rel_y = self.mouse_y - (drop_r.y + Float32(2.0))
+                    var idx = Int(rel_y / max(Float32(1.0), row_h))
+                    if idx >= 0 and idx < len(items):
+                        hover_row = idx
+                        if self.mouse_pressed_l:
+                            if selected_idx != idx:
+                                selected_idx = idx
+                                changed = True
+                            self._open_popup_id = 0
+                            self._popup_kind = 0
+                elif self.mouse_pressed_l and not hovered:
+                    self._open_popup_id = 0
+                    self._popup_kind = 0
+
+                if self._open_popup_id == wid:
+                    if self.key_esc_pressed:
+                        self._open_popup_id = 0
+                        self._popup_kind = 0
+                    elif self.key_down_pressed:
+                        selected_idx = (selected_idx + 1) % len(items) if selected_idx >= 0 else 0
+                        changed = True
+                    elif self.key_up_pressed:
+                        selected_idx = (selected_idx - 1 + len(items)) % len(items) if selected_idx >= 0 else 0
+                        changed = True
+                    elif self.key_enter_pressed and not hovered:
+                        self._open_popup_id = 0
+                        self._popup_kind = 0
+
+            if self._open_popup_id == wid:
+                self._popup_kind = 1
+                self._popup_rect = drop_r
+                self._popup_combo_items = items.copy()
+                self._popup_combo_sel = selected_idx
+                self._popup_combo_hover = hover_row
+
+        var focused = (not blocked) and self.focused_id == wid
+        self.draw_list.add_rect(
+            box_r.x, box_r.y, box_r.w, box_r.h,
+            self.theme.bg_widget_hover if hovered else self.theme.bg_widget,
+            3.0,
+            Float32(2.0) if focused else Float32(1.0),
+            self.theme.focus_ring if focused else self.theme.border,
+        )
+        var preview = items[selected_idx] if (selected_idx >= 0 and selected_idx < len(items)) else String("")
+        self._draw_text(preview, box_r.x + Float32(6.0), box_r.y + Float32(2.0), self.theme.font_size * Float32(0.88), self.theme.text_primary)
+        var ax = box_r.right() - Float32(10.0)
+        var ay = box_r.center_y()
+        self.draw_list.add_line(ax - Float32(4.0), ay - Float32(2.0), ax, ay + Float32(2.5), 1.5, self.theme.text_muted)
+        self.draw_list.add_line(ax, ay + Float32(2.5), ax + Float32(4.0), ay - Float32(2.0), 1.5, self.theme.text_muted)
+        self._draw_text(label_text, box_r.right() + Float32(8.0), r.y + Float32(3.0), self.theme.font_size, self.theme.text_primary)
+        return changed
+
+    def color_edit3(
+        mut self,
+        id: String,
+        label_text: String,
+        mut color: Vec3,
+        min_val: Float32 = 0.0,
+        max_val: Float32 = 1.0,
+        w: Float32 = 260.0,
+    ) -> Bool:
+        var wid = self.widget_id(id)
+        var safe_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(260.0)
+        var r = self._alloc_item_rect(wid, safe_w, self.theme.row_height)
+        self._register_focusable(wid)
+
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var lo64 = Float64(min_val) if isfinite(min_val) else 0.0
+        var hi64 = Float64(max_val) if isfinite(max_val) else 1.0
+        if hi64 < lo64:
+            var tmp_b = lo64
+            lo64 = hi64
+            hi64 = tmp_b
+        var span64 = max(1.0e-6, hi64 - lo64)
+
+        var had_non_finite = (not isfinite(color.x)) or (not isfinite(color.y)) or (not isfinite(color.z))
+        var vals = Array[Float32, 3](fill=0.0)
+        vals[0] = Float32(max(lo64, min(hi64, Float64(color.x)))) if isfinite(color.x) else Float32(max(lo64, min(hi64, 0.0)))
+        vals[1] = Float32(max(lo64, min(hi64, Float64(color.y)))) if isfinite(color.y) else Float32(max(lo64, min(hi64, 0.0)))
+        vals[2] = Float32(max(lo64, min(hi64, Float64(color.z)))) if isfinite(color.z) else Float32(max(lo64, min(hi64, 0.0)))
+
+        var sw_sz = max(Float32(12.0), r.h - Float32(4.0))
+        var sw_r = RectF(r.x, r.y + Float32(2.0), sw_sz, sw_sz)
+        var sw_hov = (not ptr_blocked) and sw_r.contains(self.mouse_x, self.mouse_y)
+        if sw_hov:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(sw_r)
+            if self.mouse_pressed_l:
+                self._set_focused(wid)
+                if self._open_popup_id == wid:
+                    self._open_popup_id = 0
+                    self._popup_kind = 0
+                else:
+                    self._open_popup_id = wid
+                    self._popup_kind = 2
+
+        var field_start = sw_r.right() + Float32(4.0)
+        var field_end = r.x + r.w * Float32(0.68)
+        var comp_w = max(Float32(16.0), (field_end - field_start - Float32(8.0)) / Float32(3.0))
+        var axis_cols = Array[UInt32, 3](fill=0)
+        axis_cols[0] = pack_rgba8(224, 82, 82, 255)
+        axis_cols[1] = pack_rgba8(92, 198, 108, 255)
+        axis_cols[2] = pack_rgba8(78, 148, 240, 255)
+
+        var changed = False
+        for c in range(3):
+            var cid = self.widget_id(id + "#c" + String(c))
+            var cr = RectF(field_start + Float32(c) * (comp_w + Float32(4.0)), r.y + Float32(2.0), comp_w, r.h - Float32(4.0))
+            if not ptr_blocked and cr.contains(self.mouse_x, self.mouse_y):
+                self.hovered_id = cid
+                self.hovered_rect = self._clip_hovered_rect(cr)
+                if self.mouse_pressed_l:
+                    self.active_id = cid
+                    self._set_focused(cid)
+            if not blocked and self.active_id == cid and self.mouse_down_l and (not self.mouse_pressed_l) and isfinite(self.mouse_delta_x) and self.mouse_delta_x != Float32(0.0):
+                var nv = Float32(max(lo64, min(hi64, Float64(vals[c]) + Float64(self.mouse_delta_x) * 0.005)))
+                if isfinite(nv) and abs(Float64(nv) - Float64(vals[c])) > 1.0e-7:
+                    vals[c] = nv
+                    changed = True
+            self.draw_list.add_rect(cr.x, cr.y, cr.w, cr.h, self.theme.bg_widget, 3.0, 1.0, self.theme.border)
+            self.draw_list.add_rect(cr.x, cr.y, 3.0, cr.h, axis_cols[c], 1.5)
+            self._draw_text(format_float2(vals[c]), cr.x + Float32(6.0), cr.y + Float32(2.0), self.theme.font_size * Float32(0.84), self.theme.text_primary)
+
+        if not blocked and self._open_popup_id == wid:
+            self._popup_seen = True
+            var row_h = self.theme.row_height
+            var pad = Float32(6.0)
+            var pop_h = Float32(3.0) * row_h + pad * Float32(2.0)
+            var pop_y = sw_r.bottom() + Float32(2.0)
+            if pop_y + pop_h > self.screen_h and sw_r.y - pop_h - Float32(2.0) >= Float32(0.0):
+                pop_y = sw_r.y - pop_h - Float32(2.0)
+            var pop_r = RectF(sw_r.x, pop_y, Float32(180.0), pop_h)
+            if pop_r.contains(self.mouse_x, self.mouse_y):
+                self.hovered_id = wid
+                self.hovered_rect = pop_r
+                self._popup_consumed_click = True
+                self._popup_consumed_rect = pop_r
+            elif self.mouse_pressed_l and not sw_hov:
+                self._open_popup_id = 0
+                self._popup_kind = 0
+            if self.key_esc_pressed:
+                self._open_popup_id = 0
+                self._popup_kind = 0
+            if self._open_popup_id == wid:
+                var bar_w = max(Float32(12.0), pop_r.w - pad * Float32(2.0))
+                for c in range(3):
+                    var pid = self.widget_id(id + "#pop" + String(c))
+                    var br = RectF(pop_r.x + pad, pop_r.y + pad + Float32(c) * row_h + Float32(2.0), bar_w, max(Float32(6.0), row_h - Float32(6.0)))
+                    if br.contains(self.mouse_x, self.mouse_y) and self.mouse_pressed_l:
+                        self.active_id = pid
+                    if self.active_id == pid and self.mouse_down_l and isfinite(self.mouse_x):
+                        var t64 = max(0.0, min(1.0, (Float64(self.mouse_x) - Float64(br.x)) / Float64(bar_w)))
+                        var nv = Float32(max(lo64, min(hi64, lo64 + t64 * span64)))
+                        if isfinite(nv) and abs(Float64(nv) - Float64(vals[c])) > 1.0e-7:
+                            vals[c] = nv
+                            changed = True
+                self._popup_kind = 2
+                self._popup_rect = pop_r
+                self._popup_color = Vec3(
+                    Float32((Float64(vals[0]) - lo64) / span64),
+                    Float32((Float64(vals[1]) - lo64) / span64),
+                    Float32((Float64(vals[2]) - lo64) / span64),
+                )
+
+        if changed or had_non_finite or color.x != vals[0] or color.y != vals[1] or color.z != vals[2]:
+            color.x = vals[0]; color.y = vals[1]; color.z = vals[2]
+
+        var r8 = Int(max(Float32(0.0), min(Float32(1.0), color.x)) * Float32(255.0) + Float32(0.5))
+        var g8 = Int(max(Float32(0.0), min(Float32(1.0), color.y)) * Float32(255.0) + Float32(0.5))
+        var b8 = Int(max(Float32(0.0), min(Float32(1.0), color.z)) * Float32(255.0) + Float32(0.5))
+        self.draw_list.add_rect(sw_r.x, sw_r.y, sw_r.w, sw_r.h, pack_rgba8(r8, g8, b8, 255), 3.0, 1.0, self.theme.border)
+        self._draw_text(label_text, field_end + Float32(6.0), r.y + Float32(3.0), self.theme.font_size, self.theme.text_primary)
         return changed
 
     # ---- Clipboard & IME API ----
@@ -1573,12 +2375,15 @@ struct UiContext(Movable):
         var wid = self.widget_id(id)
         var safe_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(220.0)
         var r = self._alloc_item_rect(wid, safe_w, self.theme.row_height + Float32(4.0))
-        self._register_focusable(wid)
+        self._register_focusable(wid, allow_auto_focus=False)
+        self._text_widget_ids.append(wid)
 
         var blocked = self._blocked_by_modal()
-        var hovered = (not blocked) and r.contains(self.mouse_x, self.mouse_y)
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var hovered = (not ptr_blocked) and r.contains(self.mouse_x, self.mouse_y)
         if hovered:
             self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(r)
             if self.mouse_pressed_l:
                 self._set_focused(wid)
                 self.active_id = wid
@@ -1596,6 +2401,9 @@ struct UiContext(Movable):
 
         var edited = False
         var focused = (not blocked) and self.focused_id == wid
+        if focused:
+            self._focused_text_id = wid
+            self._focused_text_seen = True
 
         if not focused and self.ime_active and self.ime_widget_id == wid:
             self.cancel_ime()
@@ -1805,6 +2613,11 @@ struct UiContext(Movable):
                         st.select_anchor_cp = -1
                         edited = True
 
+                if self.key_esc_pressed and self.modal_depth == 0:
+                    self._focused_text_id = 0
+                    self.focused_id = 0
+                    focused = False
+
         if edited:
             text = encode_utf8(codes)
 
@@ -1910,7 +2723,9 @@ struct UiContext(Movable):
         var r = RectF(cx, cy, rw, row_h)
         self.box_stack[top_i].cursor_y = cy + row_h + self.box_stack[top_i].gap
 
-        if not self._blocked_by_modal() and r.contains(self.mouse_x, self.mouse_y):
+        if not self._blocked_by_modal() and not self._is_pointer_blocked_by_popup() and r.contains(self.mouse_x, self.mouse_y):
+            self.hovered_id = UInt64(0x9E3779B97F4A7C15) ^ UInt64(row_index)
+            self.hovered_rect = self._clip_hovered_rect(r)
             self.draw_list.add_rect(r.x, r.y, r.w, r.h, self.theme.bg_widget_hover, 3.0)
             if self.mouse_pressed_l:
                 is_open = not is_open
@@ -1943,7 +2758,7 @@ struct UiContext(Movable):
         if len(self.scroll_stack) > 0:
             var sc = self.scroll_stack[len(self.scroll_stack) - 1]
             if cy + row_h < sc.view_rect.y or cy > sc.view_rect.bottom():
-                self.box_stack[top_i].cursor_y = cy + row_h + self.box_stack[top_i].gap
+                _ = self._alloc_item_rect(wid, Float32(0.0), row_h)
                 self.culled_items_this_frame += 1
                 if st.tree_open:
                     self.box_stack[top_i].cursor_x += Float32(16.0)
@@ -1951,8 +2766,9 @@ struct UiContext(Movable):
                 return st.tree_open
 
         var r = self._alloc_item_rect(wid, 0.0, row_h)
-        if not self._blocked_by_modal() and r.contains(self.mouse_x, self.mouse_y):
+        if not self._blocked_by_modal() and not self._is_pointer_blocked_by_popup(wid) and r.contains(self.mouse_x, self.mouse_y):
             self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(r)
             self.draw_list.add_rect(r.x, r.y, r.w, r.h, self.theme.bg_widget_hover, 3.0)
             if self.mouse_pressed_l:
                 st.tree_open = not st.tree_open
@@ -2021,21 +2837,26 @@ struct UiContext(Movable):
             cy = plot.bottom()
 
         var changed = False
-        if not self._blocked_by_modal():
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        if not ptr_blocked:
+            if r.contains(self.mouse_x, self.mouse_y):
+                self.hovered_id = wid
+                self.hovered_rect = self._clip_hovered_rect(r)
             var dx = self.mouse_x - cx
             var dy = self.mouse_y - cy
             if isfinite(dx) and isfinite(dy):
                 if self.mouse_pressed_l and (dx * dx + dy * dy <= Float32(100.0) or plot.contains(self.mouse_x, self.mouse_y)):
                     self.active_id = wid
-                if self.active_id == wid and self.mouse_down_l and plot.w > Float32(1.0) and plot.h > Float32(1.0):
-                    var nx = (self.mouse_x - plot.x) / plot.w
-                    var ny = (plot.bottom() - self.mouse_y) / plot.h
-                    if isfinite(nx) and isfinite(ny):
-                        tx = max(Float32(0.0), min(Float32(1.0), nx))
-                        ty = max(Float32(0.0), min(Float32(1.0), ny))
-                        cx = plot.x + tx * plot.w
-                        cy = plot.bottom() - ty * plot.h
-                        changed = True
+        if (not blocked) and self.active_id == wid and self.mouse_down_l and plot.w > Float32(1.0) and plot.h > Float32(1.0):
+            var nx = (self.mouse_x - plot.x) / plot.w
+            var ny = (plot.bottom() - self.mouse_y) / plot.h
+            if isfinite(nx) and isfinite(ny):
+                tx = max(Float32(0.0), min(Float32(1.0), nx))
+                ty = max(Float32(0.0), min(Float32(1.0), ny))
+                cx = plot.x + tx * plot.w
+                cy = plot.bottom() - ty * plot.h
+                changed = True
         if changed or had_non_finite:
             ctrl_x = tx
             ctrl_y = ty
@@ -2050,7 +2871,7 @@ struct UiContext(Movable):
 
     def begin_drag_source(mut self, payload_kind: String, int_val: Int = 0, str_val: String = "") -> Bool:
         """Starts a drag operation from the immediately preceding widget when dragged."""
-        if self._blocked_by_modal() or self.last_item_id == 0:
+        if self._blocked_by_modal() or self._is_pointer_blocked_by_popup() or self.last_item_id == 0:
             return False
         if not self.drag_drop.active and self.mouse_down_l and self.last_item_rect.contains(self.mouse_x, self.mouse_y):
             if abs(self.mouse_delta_x) + abs(self.mouse_delta_y) > Float32(0.5) or self.mouse_pressed_l:
@@ -2063,11 +2884,12 @@ struct UiContext(Movable):
                 return True
         return self.drag_drop.active and self.drag_drop.source_id == self.last_item_id
 
-    def accept_drag_target(mut self, payload_kind: String) -> Tuple[Bool, Int, String]:
-        """Highlights the preceding widget when hovered with matching `payload_kind` and delivers on mouse release."""
+    def accept_drag_target_rect(mut self, payload_kind: String, r: RectF) -> Tuple[Bool, Int, String]:
+        """Highlights `r` when hovered with matching `payload_kind` and delivers on mouse release."""
         if not self.drag_drop.active or self.drag_drop.kind != payload_kind:
             return (False, 0, "")
-        var r = self.last_item_rect
+        if self._blocked_by_modal() or self._is_pointer_blocked_by_popup():
+            return (False, 0, "")
         if r.contains(self.mouse_x, self.mouse_y):
             self.draw_list.add_rect(r.x, r.y, r.w, r.h, 0, self.theme.corner_radius, 2.0, self.theme.focus_ring)
             if self.mouse_released_l or not self.mouse_down_l:
@@ -2076,6 +2898,11 @@ struct UiContext(Movable):
                 self.drag_drop = DragDropPayload()
                 return (True, iv, sv)
         return (False, 0, "")
+
+    def accept_drag_target(mut self, payload_kind: String) -> Tuple[Bool, Int, String]:
+        """Highlights the preceding widget when hovered with matching `payload_kind` and delivers on mouse release."""
+        var r = self.last_item_rect
+        return self.accept_drag_target_rect(payload_kind, r)
 
     # ---- Focus-Trapping Modal Dialog ----
 
@@ -2090,8 +2917,9 @@ struct UiContext(Movable):
         if (self.key_esc_pressed and not self.ime_active) or self.pad_cancel:
             is_open = False
             self.modal_depth -= 1
-            self.active_modal_id = 0
-            self.had_modal_prev_frame = False
+            if self.modal_depth == 0:
+                self.active_modal_id = 0
+                self.had_modal_prev_frame = False
             return False
 
         # Full-screen dim backdrop
@@ -2122,8 +2950,10 @@ struct UiContext(Movable):
         var st = FlexStyle.col(gap=6.0, pad=0.0)
         st.fixed_w = body.w
         st.fixed_h = body.h
-        var f_idx = self.flex.add_node(0, st, body.w, body.h)
-        self.box_stack.append(_BoxScope(wid, f_idx, body, body.x, body.y, FLEX_COL, 6.0, 0.0, 0.0))
+        var f_idx = self.flex.add_node(-1, st, body.w, body.h)
+        self.dock_flex_root_idxs.append(f_idx)
+        self.dock_flex_root_rects.append(body)
+        self.box_stack.append(_BoxScope(wid, f_idx, body, body.x, body.y, FLEX_COL, 6.0, 0.0, 0.0, body.x, body.y))
         self.id_stack.append(wid)
         return True
 
@@ -2133,3 +2963,729 @@ struct UiContext(Movable):
             if len(self.box_stack) > 1:
                 _ = self.box_stack.pop()
                 _ = self.id_stack.pop()
+
+    # =========================================================================
+    # Studio v2 Tactile Widgets (`StudioTheme` + `UiAnimator` + `:focus-visible`)
+    # =========================================================================
+
+    def _truncate_text_ellipsis(self, text: String, max_w: Float32, size_px: Float32) -> String:
+        """Truncates UTF-8 text cleanly on codepoint boundaries with `'...'` to fit `max_w`."""
+        if not isfinite(max_w) or max_w <= Float32(0.0):
+            return ""
+        if self._measure_text(text, size_px) <= max_w:
+            return text
+        var dots = String("...")
+        var dots_w = self._measure_text(dots, size_px)
+        if dots_w >= max_w:
+            return dots
+        var codes = decode_utf8(text)
+        var n = len(codes)
+        var lo = 0
+        var hi = n
+        while lo < hi:
+            var mid = (lo + hi + 1) // 2
+            var sub = List[Int](capacity=mid)
+            for i in range(mid):
+                sub.append(codes[i])
+            if self._measure_text(encode_utf8(sub) + dots, size_px) <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        var out = List[Int](capacity=lo)
+        for i in range(lo):
+            out.append(codes[i])
+        return encode_utf8(out) + dots
+
+    def glass_pill(
+        mut self,
+        id: String,
+        rect: RectF,
+        corner_radius: Float32 = 8.0,
+        blur_radius: Float32 = 3.0,
+        drop_shadow: Bool = True,
+    ) -> Bool:
+        """Emits a floating translucent frosted-glass HUD pill (`L4_overlay` + 5-tap LDS blur + top bevel).
+        Returns `True` when hovered (capturing pointer so clicks don't fall through to the 3D viewport)."""
+        var wid = self.widget_id(id)
+        var r = RectF(
+            rect.x if isfinite(rect.x) else Float32(0.0),
+            rect.y if isfinite(rect.y) else Float32(0.0),
+            max(Float32(0.0), rect.w) if isfinite(rect.w) else Float32(0.0),
+            max(Float32(0.0), rect.h) if isfinite(rect.h) else Float32(0.0),
+        )
+        self.last_item_id = wid
+        self.last_item_rect = r
+        var ptr_blocked = self._blocked_by_modal() or self._is_pointer_blocked_by_popup(wid)
+        var hovered = (not ptr_blocked) and r.contains(self.mouse_x, self.mouse_y)
+        if hovered:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(r)
+        self.draw_list.add_glass_panel(
+            r.x, r.y, r.w, r.h,
+            self.studio_theme.l4_overlay,
+            max(Float32(0.0), corner_radius) if isfinite(corner_radius) else Float32(8.0),
+            max(Float32(1.0), blur_radius) if isfinite(blur_radius) else Float32(3.0),
+            1.0,
+            self.studio_theme.border_strong,
+            True,
+            drop_shadow,
+        )
+        return hovered
+
+    def icon_button(
+        mut self,
+        id: String,
+        icon_id: Int,
+        label_text: String = "",
+        active: Bool = False,
+        w: Float32 = 0.0,
+        h: Float32 = 26.0,
+        accent_override: UInt32 = 0,
+    ) -> Bool:
+        """Tactile Studio v2 icon/text button with spring hover lift, press inset & `:focus-visible` bloom."""
+        var wid = self.widget_id(id)
+        var bh = h if (isfinite(h) and h > Float32(0.0)) else Float32(26.0)
+        var icon_sz = max(Float32(12.0), min(Float32(18.0), bh - Float32(10.0)))
+        var font_sz = self.studio_theme.font_body
+        var has_lbl = label_text.byte_length() > 0
+        var auto_w = (
+            icon_sz + Float32(14.0) + (self._measure_text(label_text, font_sz) + Float32(6.0) if has_lbl else Float32(0.0))
+        )
+        var bw = w if (isfinite(w) and w > Float32(0.0)) else max(bh, auto_w)
+        var r = self._alloc_item_rect(wid, bw, bh)
+        self._register_focusable(wid)
+
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var hovered = (not ptr_blocked) and r.contains(self.mouse_x, self.mouse_y)
+        if hovered:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(r)
+            if self.mouse_pressed_l:
+                self.active_id = wid
+                self._set_focused(wid)
+
+        var clicked = False
+        if not blocked:
+            if hovered and self.mouse_released_l and self.active_id == wid:
+                clicked = True
+            elif self.focused_id == wid and (self.key_enter_pressed or self.key_space_pressed or self.pad_confirm):
+                clicked = True
+
+        var pressed = (not blocked) and self.active_id == wid and self.mouse_down_l
+        var f_vis = self.show_focus_ring(wid)
+        var sp = self.animator.drive_widget(wid, hovered, pressed, f_vis)
+        var h_t = sp[0]
+        var p_t = sp[1]
+        var f_t = sp[2]
+
+        var acc = accent_override if accent_override != 0 else self.studio_theme.accent_primary
+        var base_bg = rgba8_scale_alpha(acc, 0.22) if active else self.studio_theme.l3_raised
+        var hov_bg = rgba8_scale_alpha(acc, 0.34) if active else self.studio_theme.l3_hover
+        var bg = lerp_rgba8(lerp_rgba8(base_bg, hov_bg, h_t), self.studio_theme.l3_press, p_t)
+        var brd = acc if active else lerp_rgba8(self.studio_theme.border_control, self.studio_theme.border_strong, h_t)
+
+        # Spring visual offset (hit-testing strictly stays on logical rect `r`)
+        var lift_y = Float32(-0.75) * h_t + Float32(0.75) * p_t
+        var inset = Float32(0.5) * p_t
+        var vr = RectF(r.x + inset, r.y + lift_y + inset, max(Float32(2.0), r.w - inset * Float32(2.0)), max(Float32(2.0), r.h - inset * Float32(2.0)))
+
+        if f_t > Float32(0.02):
+            self.draw_list.add_glow_rect(
+                vr.x, vr.y, vr.w, vr.h,
+                bg,
+                rgba8_scale_alpha(self.studio_theme.focus_ring, f_t),
+                RADIUS_SM,
+                Float32(2.5) + Float32(4.0) * f_t,
+                1.5,
+                UI_FLAG_TOP_BEVEL,
+            )
+        else:
+            self.draw_list.add_rect_styled(
+                vr.x, vr.y, vr.w, vr.h,
+                bg, brd,
+                RADIUS_SM,
+                1.0,
+                1.0,
+                UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+            )
+
+        var fg = acc if active else lerp_rgba8(self.studio_theme.text_secondary, self.studio_theme.text_primary, max(h_t, Float32(0.5) if has_lbl else Float32(0.0)))
+        if has_lbl:
+            var tw = self._measure_text(label_text, font_sz)
+            var total = icon_sz + Float32(6.0) + tw
+            var sx = vr.x + max(Float32(6.0), (vr.w - total) * Float32(0.5))
+            draw_studio_icon(self.draw_list, icon_id, sx, vr.center_y() - icon_sz * Float32(0.5), icon_sz, fg, 1.5)
+            var avail_tw = max(Float32(8.0), vr.right() - (sx + icon_sz + Float32(6.0)) - Float32(4.0))
+            var txt = self._truncate_text_ellipsis(label_text, avail_tw, font_sz)
+            self._draw_text(txt, sx + icon_sz + Float32(6.0), vr.center_y() - font_sz * Float32(0.5), font_sz, self.studio_theme.text_primary if active else fg)
+        else:
+            draw_studio_icon(self.draw_list, icon_id, vr.center_x() - icon_sz * Float32(0.5), vr.center_y() - icon_sz * Float32(0.5), icon_sz, fg, 1.5)
+        return clicked
+
+    def collapsible_card(
+        mut self,
+        id: String,
+        title: String,
+        icon_id: Int = -1,
+        default_open: Bool = True,
+        w: Float32 = 0.0,
+    ) -> Tuple[Bool, Float32]:
+        """Obsidian `L2_card` collapsible section header with smooth spring chevron & expand factor `(is_open, expand_t)`."""
+        var wid = self.widget_id(id)
+        var top_i = len(self.box_stack) - 1
+        var avail_w = max(Float32(60.0), self.box_stack[top_i].rect.w - self.box_stack[top_i].pad_r)
+        var cw = w if (isfinite(w) and w > Float32(0.0)) else avail_w
+        var r = self._alloc_item_rect(wid, cw, CARD_HEADER_H)
+        self._register_focusable(wid)
+
+        var st = self._get_state(wid)
+        if not st.tree_initialized:
+            st.tree_open = default_open
+            st.tree_initialized = True
+            self.state_map[wid] = st
+
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var hovered = (not ptr_blocked) and r.contains(self.mouse_x, self.mouse_y)
+        if hovered:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(r)
+            if self.mouse_pressed_l:
+                self._set_focused(wid)
+                st.tree_open = not st.tree_open
+                self.state_map[wid] = st
+        elif (not blocked) and self.focused_id == wid and (self.key_enter_pressed or self.key_space_pressed or self.pad_confirm):
+            st.tree_open = not st.tree_open
+            self.state_map[wid] = st
+
+        var sp = self.animator.drive_widget(wid, hovered, hovered and self.mouse_down_l, self.show_focus_ring(wid))
+        var expand_t = self.animator.drive_expand(wid, st.tree_open)
+        var bg = lerp_rgba8(self.studio_theme.l2_card, self.studio_theme.l3_raised, sp[0])
+        var brd = self.studio_theme.focus_ring if sp[2] > Float32(0.05) else self.studio_theme.border_subtle
+
+        self.draw_list.add_rounded_rect_ex(
+            r.x, r.y, r.w, r.h,
+            bg,
+            RADIUS_MD, RADIUS_MD,
+            Float32(0.0) if st.tree_open else RADIUS_MD,
+            Float32(0.0) if st.tree_open else RADIUS_MD,
+            1.0, brd, 1.0, UI_FLAG_TOP_BEVEL,
+        )
+        draw_studio_chevron(
+            self.draw_list,
+            r.x + Float32(8.0),
+            r.center_y() - Float32(6.0),
+            Float32(12.0),
+            self.studio_theme.text_primary if st.tree_open else self.studio_theme.text_muted,
+            expand_t,
+            1.5,
+        )
+        var tx = r.x + Float32(24.0)
+        if icon_id >= 0:
+            draw_studio_icon(
+                self.draw_list,
+                icon_id,
+                tx,
+                r.center_y() - Float32(7.0),
+                Float32(14.0),
+                self.studio_theme.accent_primary if st.tree_open else self.studio_theme.text_secondary,
+                1.4,
+            )
+            tx += Float32(20.0)
+        var lbl = self._truncate_text_ellipsis(title, max(Float32(20.0), r.right() - tx - Float32(8.0)), self.studio_theme.font_section)
+        self._draw_text(lbl, tx, r.center_y() - self.studio_theme.font_section * Float32(0.5), self.studio_theme.font_section, self.studio_theme.text_primary)
+        return (st.tree_open, expand_t)
+
+    def property_row_label(
+        mut self,
+        label_text: String,
+        w: Float32 = 0.0,
+        label_ratio: Float32 = INSPECTOR_LABEL_RATIO,
+    ) -> Tuple[RectF, RectF]:
+        """Allocates a Studio v2 left-label / right-control Inspector row with clean ellipsis truncation.
+        Returns `(full_row_rect, right_control_rect)`."""
+        var wid = self.widget_id("prow:" + label_text)
+        var top_i = len(self.box_stack) - 1
+        var avail_w = max(Float32(100.0), self.box_stack[top_i].rect.w - self.box_stack[top_i].pad_r)
+        var rw = w if (isfinite(w) and w > Float32(0.0)) else avail_w
+        var r = self._alloc_item_rect(wid, rw, INSPECTOR_ROW_H)
+        var ratio = max(Float32(0.12), min(Float32(0.65), label_ratio if isfinite(label_ratio) else INSPECTOR_LABEL_RATIO))
+        var lbl_w = max(Float32(24.0), r.w * ratio - Float32(4.0))
+        var disp = self._truncate_text_ellipsis(label_text, lbl_w, self.studio_theme.font_body)
+        self._draw_text(
+            disp,
+            r.x + Float32(2.0),
+            r.center_y() - self.studio_theme.font_body * Float32(0.5),
+            self.studio_theme.font_body,
+            self.studio_theme.text_secondary,
+        )
+        var ctrl_x = r.x + r.w * ratio
+        var ctrl_r = RectF(ctrl_x, r.y, max(Float32(24.0), r.right() - ctrl_x), r.h)
+        return (r, ctrl_r)
+
+    def drag_float3_v2(
+        mut self,
+        id: String,
+        label_text: String,
+        mut v: Vec3,
+        speed: Float32 = 0.05,
+        min_val: Float32 = -1.0e6,
+        max_val: Float32 = 1.0e6,
+        w: Float32 = 0.0,
+        snap_step: Float32 = 0.25,
+    ) -> Bool:
+        """Left-label Studio v2 XYZ scrubber with color-coded X `#E85B5B` / Y `#4BC47D` / Z `#4E8FF7` capsules,
+        `Shift = 0.1x` fine scrub, `Ctrl = snap_step` quantization, and spring hover/active bloom."""
+        var top_i = len(self.box_stack) - 1
+        var avail_w = max(Float32(100.0), self.box_stack[top_i].rect.w - self.box_stack[top_i].pad_r)
+        var eff_w = w if (isfinite(w) and w > Float32(0.0)) else avail_w
+        var lbl_ratio = min(INSPECTOR_LABEL_RATIO, Float32(44.0) / max(Float32(100.0), eff_w))
+        var row_pair = self.property_row_label(label_text, w, label_ratio=lbl_ratio)
+        var ctrl = row_pair[1]
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup()
+        var gap = Float32(3.0)
+        var cap_w = max(Float32(28.0), (ctrl.w - gap * Float32(2.0)) / Float32(3.0))
+
+        var lo64 = Float64(min_val) if isfinite(min_val) else -1.0e6
+        var hi64 = Float64(max_val) if isfinite(max_val) else 1.0e6
+        if hi64 < lo64:
+            var tmp_b = lo64
+            lo64 = hi64
+            hi64 = tmp_b
+        var sp64 = Float64(speed) if (isfinite(speed) and speed > Float32(0.0)) else 0.05
+        var snap64 = Float64(snap_step) if (isfinite(snap_step) and snap_step > Float32(1.0e-5)) else 0.25
+        var had_non_finite = (not isfinite(v.x)) or (not isfinite(v.y)) or (not isfinite(v.z))
+        var vals = Array[Float32, 3](fill=0.0)
+        vals[0] = v.x if isfinite(v.x) else Float32(max(lo64, min(hi64, 0.0)))
+        vals[1] = v.y if isfinite(v.y) else Float32(max(lo64, min(hi64, 0.0)))
+        vals[2] = v.z if isfinite(v.z) else Float32(max(lo64, min(hi64, 0.0)))
+
+        var axis_cols = Array[UInt32, 3](fill=0)
+        axis_cols[0] = pack_rgba8(232, 91, 91, 255)   # X #E85B5B
+        axis_cols[1] = pack_rgba8(75, 196, 125, 255)  # Y #4BC47D
+        axis_cols[2] = pack_rgba8(78, 143, 247, 255)  # Z #4E8FF7
+        var axis_lbls = [String("X"), String("Y"), String("Z")]
+        var changed = False
+
+        for c in range(3):
+            var cid = self.widget_id(id + "#v2_" + String(c))
+            self._register_focusable(cid)
+            var cr = RectF(ctrl.x + Float32(c) * (cap_w + gap), ctrl.y + Float32(1.0), cap_w, max(Float32(16.0), ctrl.h - Float32(2.0)))
+            var hov = (not ptr_blocked) and cr.contains(self.mouse_x, self.mouse_y)
+            if hov:
+                self.hovered_id = cid
+                self.hovered_rect = self._clip_hovered_rect(cr)
+                if self.mouse_pressed_l:
+                    self.active_id = cid
+                    self._set_focused(cid)
+
+            var is_drag = (not blocked) and self.active_id == cid and self.mouse_down_l
+            if is_drag and (not self.mouse_pressed_l) and isfinite(self.mouse_delta_x) and self.mouse_delta_x != Float32(0.0):
+                var fine = 0.1 if self.key_shift else 1.0
+                var raw64 = Float64(vals[c]) + Float64(self.mouse_delta_x) * sp64 * fine
+                if self.key_ctrl:
+                    raw64 = floor(raw64 / snap64 + 0.5) * snap64
+                var nv = Float32(max(lo64, min(hi64, raw64)))
+                if isfinite(nv) and abs(Float64(nv) - Float64(vals[c])) > 1.0e-7:
+                    vals[c] = nv
+                    changed = True
+            elif (not blocked) and self.focused_id == cid:
+                var step_mul = 0.1 if self.key_shift else (snap64 / max(1.0e-6, sp64) if self.key_ctrl else 1.0)
+                if self.key_left_pressed:
+                    var nv = Float32(max(lo64, Float64(vals[c]) - sp64 * step_mul))
+                    if isfinite(nv):
+                        vals[c] = nv
+                        changed = True
+                elif self.key_right_pressed:
+                    var nv = Float32(min(hi64, Float64(vals[c]) + sp64 * step_mul))
+                    if isfinite(nv):
+                        vals[c] = nv
+                        changed = True
+
+            var sp_a = self.animator.drive_widget(cid, hov, is_drag, self.show_focus_ring(cid))
+            var bloom = max(sp_a[1], sp_a[2])
+            var bg = lerp_rgba8(self.studio_theme.l0_canvas, self.studio_theme.l2_card, max(sp_a[0], sp_a[1]))
+            var brd = lerp_rgba8(self.studio_theme.border_control, axis_cols[c], max(sp_a[0] * Float32(0.55), bloom))
+
+            if bloom > Float32(0.02):
+                self.draw_list.add_glow_rect(
+                    cr.x, cr.y, cr.w, cr.h,
+                    bg,
+                    rgba8_scale_alpha(axis_cols[c], bloom * Float32(0.75)),
+                    RADIUS_SM,
+                    Float32(2.0) + Float32(4.0) * bloom,
+                    1.2,
+                )
+            else:
+                self.draw_list.add_rect_styled(
+                    cr.x, cr.y, cr.w, cr.h,
+                    bg, brd,
+                    RADIUS_SM, 1.0, 1.0, UI_FLAG_BORDER,
+                )
+
+            # Axis color pill cap on left edge of capsule
+            var tag_w = Float32(13.0)
+            self.draw_list.add_rounded_rect_ex(
+                cr.x + Float32(1.0), cr.y + Float32(1.0), tag_w, max(Float32(4.0), cr.h - Float32(2.0)),
+                rgba8_scale_alpha(axis_cols[c], Float32(0.24) + Float32(0.26) * max(sp_a[0], sp_a[1])),
+                RADIUS_SM - Float32(1.0), 0.0, 0.0, RADIUS_SM - Float32(1.0),
+            )
+            self._draw_text(
+                axis_lbls[c],
+                cr.x + Float32(3.5),
+                cr.center_y() - self.studio_theme.font_caption * Float32(0.5),
+                self.studio_theme.font_caption,
+                axis_cols[c],
+            )
+            var val_txt = format_float2(vals[c])
+            var disp_val = self._truncate_text_ellipsis(val_txt, max(Float32(10.0), cr.w - tag_w - Float32(4.0)), self.studio_theme.font_mono)
+            self._draw_text(
+                disp_val,
+                cr.x + tag_w + Float32(3.0),
+                cr.center_y() - self.studio_theme.font_mono * Float32(0.5),
+                self.studio_theme.font_mono,
+                self.studio_theme.text_primary,
+            )
+
+        if changed or had_non_finite:
+            v.x = vals[0]; v.y = vals[1]; v.z = vals[2]
+        return changed
+
+    def slider_float_v2(
+        mut self,
+        id: String,
+        label_text: String,
+        mut value: Float32,
+        min_val: Float32,
+        max_val: Float32,
+        w: Float32 = 0.0,
+    ) -> Bool:
+        """Left-label Studio v2 slider with recessed pill track, bounded spring-scaled thumb & right numeric readout."""
+        var wid = self.widget_id(id)
+        var row_pair = self.property_row_label(label_text, w)
+        var ctrl = row_pair[1]
+        self._register_focusable(wid)
+
+        var readout_w = Float32(44.0)
+        var track_w = max(Float32(36.0), ctrl.w - readout_w - Float32(6.0))
+        var track = RectF(ctrl.x, ctrl.center_y() - Float32(3.0), track_w, Float32(6.0))
+        var hit_r = RectF(ctrl.x, ctrl.y, track_w, ctrl.h)
+
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var hovered = (not ptr_blocked) and hit_r.contains(self.mouse_x, self.mouse_y)
+        if hovered:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(hit_r)
+            if self.mouse_pressed_l:
+                self.active_id = wid
+                self._set_focused(wid)
+
+        var lo64 = Float64(min_val) if isfinite(min_val) else 0.0
+        var hi64 = Float64(max_val) if isfinite(max_val) else (lo64 + 1.0)
+        if hi64 < lo64:
+            var tmp_b = lo64
+            lo64 = hi64
+            hi64 = tmp_b
+        var span64 = max(1.0e-6, hi64 - lo64)
+        var was_finite = isfinite(value)
+        var val64 = max(lo64, min(hi64, Float64(value) if was_finite else lo64))
+        if not was_finite:
+            value = Float32(val64)
+
+        var changed = False
+        var dragging = (not blocked) and self.active_id == wid and self.mouse_down_l
+        if dragging and isfinite(self.mouse_x):
+            var t64 = max(0.0, min(1.0, (Float64(self.mouse_x) - Float64(track.x)) / max(1.0, Float64(track.w))))
+            var nv = Float32(max(lo64, min(hi64, lo64 + t64 * span64)))
+            if isfinite(nv) and abs(Float64(nv) - Float64(value)) > 1.0e-6:
+                value = nv
+                changed = True
+        elif (not blocked) and self.focused_id == wid:
+            var step = span64 * (0.01 if self.key_shift else 0.05)
+            if self.key_left_pressed:
+                value = Float32(max(lo64, val64 - step))
+                changed = True
+            elif self.key_right_pressed:
+                value = Float32(min(hi64, val64 + step))
+                changed = True
+
+        var cur_v64 = Float64(value) if isfinite(value) else lo64
+        var norm = Float32(max(0.0, min(1.0, (cur_v64 - lo64) / span64)))
+        var sp = self.animator.drive_widget(wid, hovered, dragging, self.show_focus_ring(wid))
+        var hot_t = max(sp[0], sp[1])
+
+        # Recessed track + glowing accent fill + bounded thumb (never clips past track edges!)
+        self.draw_list.add_rect_styled(
+            track.x, track.y, track.w, track.h,
+            self.studio_theme.l0_canvas,
+            self.studio_theme.border_control,
+            3.0, 1.0, 1.0, UI_FLAG_BORDER,
+        )
+        var fill_w = track.w * norm
+        if fill_w > Float32(1.0):
+            self.draw_list.add_rect(track.x, track.y, fill_w, track.h, self.studio_theme.accent_primary, 3.0)
+
+        var thumb_r = Float32(5.0) + Float32(1.5) * hot_t
+        var knob_x = max(track.x + thumb_r, min(track.right() - thumb_r, track.x + track.w * norm))
+        if max(sp[1], sp[2]) > Float32(0.02):
+            self.draw_list.add_glow_rect(
+                knob_x - thumb_r, track.center_y() - thumb_r,
+                thumb_r * Float32(2.0), thumb_r * Float32(2.0),
+                self.studio_theme.text_primary,
+                rgba8_scale_alpha(self.studio_theme.focus_ring, max(sp[1], sp[2])),
+                thumb_r,
+                Float32(3.0) + Float32(3.0) * max(sp[1], sp[2]),
+            )
+        self.draw_list.add_circle(
+            knob_x, track.center_y(), thumb_r,
+            self.studio_theme.text_primary,
+            1.5,
+            self.studio_theme.accent_primary,
+        )
+
+        var val_txt = format_float2(value)
+        self._draw_text(
+            val_txt,
+            track.right() + Float32(6.0),
+            ctrl.center_y() - self.studio_theme.font_mono * Float32(0.5),
+            self.studio_theme.font_mono,
+            self.studio_theme.text_primary if hot_t > Float32(0.1) else self.studio_theme.text_secondary,
+        )
+        return changed
+
+    def toggle_switch(
+        mut self,
+        id: String,
+        label_text: String,
+        mut checked: Bool,
+        w: Float32 = 0.0,
+    ) -> Bool:
+        """Left-label Studio v2 pill toggle switch with spring-gliding thumb & `:focus-visible` bloom."""
+        var wid = self.widget_id(id)
+        var row_pair = self.property_row_label(label_text, w)
+        var ctrl = row_pair[1]
+        self._register_focusable(wid)
+
+        var sw_w = Float32(34.0)
+        var sw_h = Float32(18.0)
+        var sw_r = RectF(ctrl.x, ctrl.center_y() - sw_h * Float32(0.5), sw_w, sw_h)
+
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var hovered = (not ptr_blocked) and sw_r.contains(self.mouse_x, self.mouse_y)
+        var toggled = False
+        if hovered:
+            self.hovered_id = wid
+            self.hovered_rect = self._clip_hovered_rect(sw_r)
+            if self.mouse_pressed_l:
+                self._set_focused(wid)
+                checked = not checked
+                toggled = True
+        elif (not blocked) and self.focused_id == wid and (self.key_enter_pressed or self.key_space_pressed or self.pad_confirm):
+            checked = not checked
+            toggled = True
+
+        var sp = self.animator.drive_widget(wid, hovered, hovered and self.mouse_down_l, self.show_focus_ring(wid))
+        var slide_t = self.animator.drive_aux(wid, Float32(1.0) if checked else Float32(0.0), SpringConfig.snappy())
+        var off_col = lerp_rgba8(self.studio_theme.l3_raised, self.studio_theme.l3_hover, sp[0])
+        var track_col = lerp_rgba8(off_col, self.studio_theme.accent_primary, slide_t)
+
+        if sp[2] > Float32(0.02):
+            self.draw_list.add_glow_rect(
+                sw_r.x, sw_r.y, sw_r.w, sw_r.h,
+                track_col,
+                rgba8_scale_alpha(self.studio_theme.focus_ring, sp[2]),
+                sw_h * Float32(0.5),
+                Float32(3.0) + Float32(3.0) * sp[2],
+                1.0,
+            )
+        else:
+            self.draw_list.add_rect_styled(
+                sw_r.x, sw_r.y, sw_r.w, sw_r.h,
+                track_col,
+                self.studio_theme.border_control,
+                sw_h * Float32(0.5), 1.0, 1.0, UI_FLAG_BORDER,
+            )
+        var thumb_r = Float32(6.5)
+        var cx_lo = sw_r.x + Float32(2.5) + thumb_r
+        var cx_hi = sw_r.right() - Float32(2.5) - thumb_r
+        var thumb_cx = cx_lo + (cx_hi - cx_lo) * slide_t
+        self.draw_list.add_circle(thumb_cx, sw_r.center_y(), thumb_r, self.studio_theme.text_primary)
+        return toggled
+
+    def tab_bar_animated(
+        mut self,
+        id: String,
+        labels: List[String],
+        mut active_idx: Int,
+        w: Float32 = 0.0,
+        h: Float32 = 28.0,
+    ) -> Bool:
+        """Horizontal tab strip with spring-gliding `UiTabIndicator` active pill. Returns `True` if `active_idx` changed."""
+        var wid = self.widget_id(id)
+        var top_i = len(self.box_stack) - 1
+        var avail_w = max(Float32(80.0), self.box_stack[top_i].rect.w - self.box_stack[top_i].pad_r)
+        var bw = w if (isfinite(w) and w > Float32(0.0)) else avail_w
+        var bh = h if (isfinite(h) and h > Float32(0.0)) else Float32(28.0)
+        var r = self._alloc_item_rect(wid, bw, bh)
+        var n = len(labels)
+        if n == 0:
+            return False
+        if active_idx < 0 or active_idx >= n:
+            active_idx = 0
+
+        self.draw_list.add_rect_styled(
+            r.x, r.y, r.w, r.h,
+            self.studio_theme.l0_canvas,
+            self.studio_theme.border_subtle,
+            RADIUS_SM, 1.0, 1.0, UI_FLAG_BORDER,
+        )
+
+        var blocked = self._blocked_by_modal()
+        var ptr_blocked = blocked or self._is_pointer_blocked_by_popup(wid)
+        var changed = False
+        var tx = r.x + Float32(3.0)
+        var act_x = tx
+        var act_w = Float32(0.0)
+        var font_sz = self.studio_theme.font_section
+
+        for i in range(n):
+            var tw = max(Float32(48.0), self._measure_text(labels[i], font_sz) + Float32(18.0))
+            if tx + tw > r.right() - Float32(3.0):
+                tw = max(Float32(24.0), r.right() - Float32(3.0) - tx)
+            var tr = RectF(tx, r.y + Float32(3.0), tw, max(Float32(8.0), r.h - Float32(6.0)))
+            var hov = (not ptr_blocked) and tr.contains(self.mouse_x, self.mouse_y)
+            if hov:
+                self.hovered_id = hash_ui_id(wid, String(i))
+                self.hovered_rect = self._clip_hovered_rect(tr)
+                if self.mouse_pressed_l and active_idx != i:
+                    active_idx = i
+                    changed = True
+            if active_idx == i:
+                act_x = tr.x
+                act_w = tr.w
+            tx += tw + Float32(3.0)
+
+        # Glide active pill behind labels
+        if act_w > Float32(1.0):
+            var pill = self.animator.drive_tab_pill(wid, act_x, act_w)
+            self.draw_list.add_rect_styled(
+                pill[0], r.y + Float32(3.0), pill[1], max(Float32(8.0), r.h - Float32(6.0)),
+                self.studio_theme.l3_raised,
+                self.studio_theme.border_control,
+                RADIUS_SM - Float32(1.0), 1.0, 1.0, UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+            )
+            self.draw_list.add_glow_rect(
+                pill[0] + Float32(6.0),
+                r.bottom() - Float32(3.0),
+                max(Float32(4.0), pill[1] - Float32(12.0)),
+                Float32(2.0),
+                self.studio_theme.accent_primary,
+                rgba8_scale_alpha(self.studio_theme.accent_primary, 0.65),
+                1.0, 5.0,
+            )
+
+        # Draw tab labels on top of sliding pill
+        tx = r.x + Float32(3.0)
+        for i in range(n):
+            var tw = max(Float32(48.0), self._measure_text(labels[i], font_sz) + Float32(18.0))
+            if tx + tw > r.right() - Float32(3.0):
+                tw = max(Float32(24.0), r.right() - Float32(3.0) - tx)
+            var tr = RectF(tx, r.y + Float32(3.0), tw, max(Float32(8.0), r.h - Float32(6.0)))
+            var disp = self._truncate_text_ellipsis(labels[i], max(Float32(12.0), tr.w - Float32(10.0)), font_sz)
+            var tw_m = self._measure_text(disp, font_sz)
+            var col = self.studio_theme.text_primary if active_idx == i else self.studio_theme.text_secondary
+            self._draw_text(
+                disp,
+                tr.x + max(Float32(4.0), (tr.w - tw_m) * Float32(0.5)),
+                tr.center_y() - font_sz * Float32(0.5),
+                font_sz,
+                col,
+            )
+            tx += tw + Float32(3.0)
+        return changed
+
+    def badge_pill(
+        mut self,
+        text: String,
+        bg_color: UInt32,
+        fg_color: UInt32,
+        x: Float32,
+        y: Float32,
+        h: Float32 = 20.0,
+        glow: Bool = False,
+    ) -> Float32:
+        """Emits a compact pill status badge at `(x, y)` and returns its rendered width."""
+        var bh = max(Float32(14.0), h if isfinite(h) else Float32(20.0))
+        var font_sz = self.studio_theme.font_caption
+        var tw = self._measure_text(text, font_sz)
+        var bw = max(bh, tw + Float32(14.0))
+        var rad = bh * Float32(0.5)
+        if glow:
+            self.draw_list.add_glow_rect(
+                x, y, bw, bh, bg_color, rgba8_scale_alpha(fg_color, 0.45), rad, 6.0, 1.0, UI_FLAG_TOP_BEVEL
+            )
+        else:
+            self.draw_list.add_rect_styled(
+                x, y, bw, bh, bg_color, rgba8_with_alpha(fg_color, 64), rad, 1.0, 1.0, UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL
+            )
+        self._draw_text(text, x + (bw - tw) * Float32(0.5), y + (bh - font_sz) * Float32(0.5), font_sz, fg_color)
+        return bw
+
+    def sparkline(
+        mut self,
+        samples: List[Float32],
+        rect: RectF,
+        line_color: UInt32,
+        bg_color: UInt32 = 0,
+        min_val: Float32 = 0.0,
+        max_val: Float32 = 0.0,
+    ):
+        """Renders a crisp GPU SDF polyline sparkline (e.g., 60-frame GPU ms trace) inside `rect`."""
+        var r = RectF(
+            rect.x if isfinite(rect.x) else Float32(0.0),
+            rect.y if isfinite(rect.y) else Float32(0.0),
+            max(Float32(0.0), rect.w) if isfinite(rect.w) else Float32(0.0),
+            max(Float32(0.0), rect.h) if isfinite(rect.h) else Float32(0.0),
+        )
+        if r.w < Float32(4.0) or r.h < Float32(4.0):
+            return
+        if (bg_color >> 24) != 0:
+            self.draw_list.add_rect_styled(
+                r.x, r.y, r.w, r.h, bg_color, self.studio_theme.border_subtle, RADIUS_SM, 1.0, 1.0, UI_FLAG_BORDER
+            )
+        var n = len(samples)
+        if n < 2:
+            return
+        var lo = min_val if isfinite(min_val) else Float32(0.0)
+        var hi = max_val if isfinite(max_val) else Float32(0.0)
+        if hi <= lo:
+            lo = Float32(1.0e30)
+            hi = Float32(-1.0e30)
+            for i in range(n):
+                if isfinite(samples[i]):
+                    lo = min(lo, samples[i])
+                    hi = max(hi, samples[i])
+            if not isfinite(lo) or not isfinite(hi) or hi <= lo:
+                lo = Float32(0.0)
+                hi = Float32(1.0)
+        var span = max(Float32(1.0e-5), hi - lo)
+        var pad = Float32(2.0)
+        var iw = max(Float32(2.0), r.w - pad * Float32(2.0))
+        var ih = max(Float32(2.0), r.h - pad * Float32(2.0))
+        var step_x = iw / Float32(n - 1)
+
+        var prev_x = r.x + pad
+        var s0 = samples[0] if isfinite(samples[0]) else lo
+        var prev_y = r.bottom() - pad - max(Float32(0.0), min(Float32(1.0), (s0 - lo) / span)) * ih
+        for i in range(1, n):
+            var si = samples[i] if isfinite(samples[i]) else lo
+            var cx = r.x + pad + Float32(i) * step_x
+            var cy = r.bottom() - pad - max(Float32(0.0), min(Float32(1.0), (si - lo) / span)) * ih
+            self.draw_list.add_line(prev_x, prev_y, cx, cy, 1.5, line_color)
+            prev_x = cx
+            prev_y = cy
+        self.draw_list.add_circle(prev_x, prev_y, 2.2, line_color)

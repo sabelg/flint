@@ -23,6 +23,13 @@ from std.math import abs, cos, exp, log, max, min, pow, sin
 from std.memory import bitcast
 from std.sys.info import CompilationTarget
 from std.time import monotonic
+from flint.anim.flanim_ecs import BoneSocketAttachment
+from flint.anim.graph import AnimGraphDef, Condition, OP_GT, OP_LE, StateDef
+from flint.anim.plugin import AnimAssetCache, AnimatorComponent, BoneSocketComponent, RigComponent, SkeletonComponent
+from flint.anim.pose import SkeletonInstance
+from flint.anim.sync import ClipInfo
+from flint.assets.asset_plugin import SceneAssetResolver
+from flint.assets.asset_ref import AssetRef
 from flint.assets.bc_compress import (
     bake_toksvig_normal_orm_pyramid,
     downsample_normals_and_orm_toksvig_2x,
@@ -46,7 +53,7 @@ from flint.assets.flpk_v3 import (
     write_flmeta,
 )
 from flint.assets.glb_native import parse_native_glb
-from flint.assets.glb_writer import encode_native_glb
+from flint.assets.glb_writer import encode_native_glb, write_native_glb
 from flint.assets.hdr_image import (
     EXR_DWAA_COMPRESSION,
     EXR_DWAB_COMPRESSION,
@@ -63,7 +70,8 @@ from flint.assets.json import parse_json
 from flint.assets.ktx2 import decode_ktx2, decompress_zstd
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.meshlet import AaaGeometryPool, MeshLodSlice, _SymQuadric, simplify_mesh_qem
-from flint.assets.model import NativeMesh, NativeModel, NativeTexture
+from flint.assets.model import NativeAnimation, NativeChannel, NativeMesh, NativeModel, NativeNode, NativeTexture
+from flint.audio.qoa import QoaAsset, encode_qoa
 from flint.assets.server import (
     ASSET_STATE_FAILED,
     ASSET_STATE_LOADING,
@@ -79,12 +87,15 @@ from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool
 from flint.core.lz4 import address_of
 from flint.core.math import Quat, Vec2, Vec3
+from flint.core.serial import BlobReader, BlobWriter
 from flint.core.transform import Mat4
 from flint.devtools.mcp_v2 import (
     FlintMcpUnixListener,
     McpServerV2,
     McpUnixSessionClient,
     default_mcp_socket_path,
+    encode_mcp_frame,
+    parse_next_mcp_frame,
     sanitize_output_path,
 )
 from flint.physics.world import (
@@ -95,7 +106,7 @@ from flint.physics.world import (
 )
 from flint.physics.plugin import ColliderComponent, RigidBodyComponent
 from flint.platform.input import InputState
-from flint.platform.os import file_size, get_time, make_dirs, read_bytes, remove_file, write_bytes
+from flint.platform.os import file_size, get_time, is_directory, make_dirs, read_bytes, remove_file, write_bytes
 from flint.platform.vulkan import LAYOUT_SHADER_READ_ONLY, LAYOUT_UNDEFINED, VulkanGpu
 from flint.procedural import (
     ENFORCER_BONE_COUNT,
@@ -145,7 +156,8 @@ from flint.render.aaa_renderer import FRAMES_IN_FLIGHT, FlintAaaVulkanRenderer
 from flint.render.font import SdfFont
 from flint.render.material_graph import MaterialAsset
 from flint.render.plugin import MaterialOverrideComponent, MeshRendererComponent
-from flint.render.render_world import RENDER_TIER_0_HEADLESS_SIMD, RENDER_TIER_2_AAA_VISBUFFER_RT, ScalableRenderer
+from flint.render.render_world import RENDER_TIER_0_HEADLESS_SIMD, RENDER_TIER_2_AAA_VISBUFFER_RT, RenderWorld, ScalableRenderer
+from flint.scene.scene import PrefabInstanceComponent
 from flint.scene.transform_hierarchy import Children, GlobalTransform, HierarchyDepth, LocalTransform, Parent
 from flint.studio import (
     COLLIDER_BOX,
@@ -190,6 +202,8 @@ from flint.studio import (
     snap_angle_deg,
     snap_translation,
 )
+from flint.studio import scene_menu
+from flint.studio.studio_app import _resolve_flint_launcher_path, populate_default_studio_scene
 from flint.ui.context import UiContext, format_float2, pack_rgba8
 from flint.ui.draw_list import UiDrawList
 
@@ -1183,7 +1197,7 @@ def test_e_undo_redo_50_and_pie_120_ticks() raises:
     )
     var fvis = FieldVisitor()
     studio.entities[drop_id].inspect(fvis)
-    _assert(len(fvis.fields) == 26, "FieldVisitor must reflect all 26 StudioEntityView properties")
+    _assert(len(fvis.fields) == 36, "FieldVisitor must reflect all 36 StudioEntityView properties")
 
     # Verify configure_entity_npr_cel, configure_entity_stylized_vfx & patch_entity_field Undo/Redo fnv64 invertibility
     var h_npr_base = studio.state_hash()
@@ -1370,11 +1384,11 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     var r_notif = mcp.handle_jsonrpc('{"jsonrpc":"2.0","method":"notifications/initialized"}', studio, assets, pool)
     _assert(r_notif.byte_length() == 0, "JSON-RPC notification without id must produce empty response")
 
-    # 2. tools/list -> all 14 tools present (including render.configure_npr_cel & render.trigger_post_fx)
+    # 2. tools/list -> all baseline 14 + M0 tools present (18 total)
     var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}', studio, assets, pool)
     var d_list = parse_json(_str_bytes(r_list))
     var tools_arr = d_list.object_get(d_list.object_get(d_list.root, "result"), "tools")
-    _assert(d_list.valid and d_list.array_size(tools_arr) == 14, "tools/list must expose all 14 MCP tools")
+    _assert(d_list.valid and d_list.array_size(tools_arr) >= 18, "tools/list must expose all 14 baseline + 4 M0 MCP tools")
     _assert(
         r_list.find('"render.configure_npr_cel"') >= 0 and r_list.find('"render.trigger_post_fx"') >= 0,
         "tools/list must include render.configure_npr_cel and render.trigger_post_fx",
@@ -4108,6 +4122,1570 @@ def test_n_os_read_bytes_dir_and_cooker_trailing_slash(tmp_root: String, mut poo
     print("    [OK] os.read_bytes/file_size dir guard & cooker_v2 trailing-slash symlink guard passed!")
 
 
+def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPool) raises:
+    var proj = tmp_root + "/mcp_m0_proj"
+    _ = make_dirs(proj + "/scenes")
+    var studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=160, height=120)
+    var assets = AssetServer(enable_watcher=False)
+    var mcp = McpServerV2(workspace_root=proj)
+
+    var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}', studio, assets, pool)
+    _assert(r_list.find('"scene.save"') >= 0, "tools/list missing scene.save")
+    _assert(r_list.find('"scene.load"') >= 0, "tools/list missing scene.load")
+    _assert(r_list.find('"scene.set_entity_enabled"') >= 0, "tools/list missing scene.set_entity_enabled")
+    _assert(r_list.find('"entity.set_transform"') >= 0, "tools/list missing entity.set_transform")
+
+    var r_sp = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ecs.spawn_entity","arguments":{"name":"M0Box","position":[0.0,1.0,0.0]}}}',
+        studio, assets, pool,
+    )
+    _assert(r_sp.find('"entity_id":0') >= 0, "spawn_entity failed: " + r_sp)
+
+    var r_xf = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"entity.set_transform","arguments":{"entity_id":0,"position":[4.0,2.0,-1.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,2.0,2.0]}}}',
+        studio, assets, pool,
+    )
+    _assert(r_xf.find('\\"ok\\":true') >= 0, "entity.set_transform failed: " + r_xf)
+    _assert(abs(studio.entities[0].translation.x - Float32(4.0)) < Float32(1.0e-4), "entity.set_transform did not move x")
+
+    var r_dis = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"scene.set_entity_enabled","arguments":{"entity_id":0,"enabled":false}}}',
+        studio, assets, pool,
+    )
+    _assert(r_dis.find('\\"ok\\":true') >= 0 and not studio.entities[0].visible, "scene.set_entity_enabled false failed")
+
+    var r_qv = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{"visible_only":true}}}',
+        studio, assets, pool,
+    )
+    _assert(r_qv.find('\\"count\\":0') >= 0, "visible_only query should exclude disabled entity: " + r_qv)
+
+    _ = studio.undo()
+    _assert(studio.entities[0].visible, "undo did not re-enable entity")
+    _ = studio.redo()
+    _assert(not studio.entities[0].visible, "redo did not re-disable entity")
+
+    var r_sv = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/m0_unit.flscn"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_sv.find('\\"ok\\":true') >= 0 and file_size(proj + "/scenes/m0_unit.flscn") > 0, "scene.save failed")
+
+    # Negative / traversal boundary checks
+    var r_bad1 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"../escape.flscn"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_bad1.find('"isError":true') >= 0, "scene.save must reject traversal")
+    var r_bad2 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"entity.set_transform","arguments":{"entity_id":0,"position":[1.0,2.0]}}}',
+        studio, assets, pool,
+    )
+    _assert(r_bad2.find('"isError":true') >= 0, "entity.set_transform must reject 2-element position")
+    var r_bad3 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"scene.set_entity_enabled","arguments":{"entity_id":0}}}',
+        studio, assets, pool,
+    )
+    _assert(r_bad3.find('"isError":true') >= 0, "scene.set_entity_enabled must require enabled bool")
+
+    # Reject fractional / non-finite entity_id and empty-stem .flscn paths
+    var r_frac1 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"entity.set_transform","arguments":{"entity_id":0.5,"position":[9.0,9.0,9.0]}}}',
+        studio, assets, pool,
+    )
+    _assert(r_frac1.find('"isError":true') >= 0, "entity.set_transform must reject fractional entity_id 0.5")
+    var r_frac2 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"scene.set_entity_enabled","arguments":{"entity_id":0.5,"enabled":false}}}',
+        studio, assets, pool,
+    )
+    _assert(r_frac2.find('"isError":true') >= 0, "scene.set_entity_enabled must reject fractional entity_id 0.5")
+    var r_frac3 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"entity.set_transform","arguments":{"entity_id":1.5,"position":[9.0,9.0,9.0]}}}',
+        studio, assets, pool,
+    )
+    _assert(r_frac3.find('"isError":true') >= 0, "entity.set_transform must reject fractional entity_id 1.5")
+    var r_stem1 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":94,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":".flscn"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_stem1.find('"isError":true') >= 0, "scene.save must reject empty stem .flscn")
+    var r_stem2 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":95,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/.flscn"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_stem2.find('"isError":true') >= 0, "scene.save must reject empty stem scenes/.flscn")
+    var r_stem3 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":96,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/.flscn"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_stem3.find('"isError":true') >= 0, "scene.load must reject empty stem scenes/.flscn")
+
+    # Relative ../ workspace_root must work for sandboxed tools while still rejecting user_path ../escape.flscn
+    var rel_caller = tmp_root + "/mcp_m0_caller"
+    var rel_proj = tmp_root + "/mcp_m0_rel_proj"
+    _ = make_dirs(rel_caller)
+    _ = make_dirs(rel_proj + "/scenes")
+    var cwd_buf = List[UInt8](length=4096, fill=0)
+    var got_cwd = external_call["getcwd", Int](cwd_buf.unsafe_ptr(), Int64(4096))
+    var orig_cwd_bytes = List[UInt8]()
+    if got_cwd != 0:
+        for ci in range(4096):
+            if cwd_buf[ci] == 0:
+                break
+            orig_cwd_bytes.append(cwd_buf[ci])
+    var orig_cwd = String(unsafe_from_utf8=orig_cwd_bytes)
+    _ = len(cwd_buf)
+    var ch_rc = external_call["chdir", Int32](rel_caller.as_c_string_span())
+    _assert(ch_rc == 0, "chdir to rel_caller failed")
+    var rel_mcp = McpServerV2(workspace_root="../mcp_m0_rel_proj")
+    var r_rel_sv = rel_mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":97,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/rel.flscn"}}}',
+        studio, assets, pool,
+    )
+    var r_rel_ld = rel_mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":98,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/rel.flscn"}}}',
+        studio, assets, pool,
+    )
+    var r_rel_esc = rel_mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"../escape.flscn"}}}',
+        studio, assets, pool,
+    )
+    if orig_cwd.byte_length() > 0:
+        _ = external_call["chdir", Int32](orig_cwd.as_c_string_span())
+    _assert(r_rel_sv.find('\\"ok\\":true') >= 0 and file_size(rel_proj + "/scenes/rel.flscn") > 0, "relative ../ workspace_root scene.save failed: " + r_rel_sv)
+    _assert(r_rel_ld.find('\\"ok\\":true') >= 0, "relative ../ workspace_root scene.load failed: " + r_rel_ld)
+    _assert(r_rel_esc.find('"isError":true') >= 0, "relative ../ workspace_root must still reject user_path ../escape.flscn")
+
+    _ = studio.despawn_entity(0, record_undo=False)
+    var r_ld = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/m0_unit.flscn"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_ld.find('\\"ok\\":true') >= 0 and studio.live_entity_count() == 1 and not studio.entities[0].visible, "scene.load failed to restore disabled entity")
+
+    assets.close()
+    studio.shutdown()
+    print("    [OK] McpServerV2 M0 tools (scene.save/load, scene.set_entity_enabled, entity.set_transform) passed!")
+
+
+def _mcp_write_text_p(path: String, text: String) -> Bool:
+    var b = List[UInt8]()
+    for c in text.as_bytes():
+        b.append(c)
+    return write_bytes(path, b)
+
+
+def test_p_mcp_v2_m1_assets_prefab_material_and_upload(tmp_root: String, mut pool: JobPool) raises:
+    var proj = tmp_root + "/mcp_m1_proj"
+    var ext = tmp_root + "/mcp_m1_ext"
+    _ = make_dirs(proj)
+    _ = make_dirs(ext)
+
+    # Prepare valid external source assets
+    var mdl = NativeModel()
+    var m = NativeMesh()
+    m.positions.append(Float32(-0.5)); m.positions.append(Float32(-0.5)); m.positions.append(Float32(0.0))
+    m.positions.append(Float32(0.5)); m.positions.append(Float32(-0.5)); m.positions.append(Float32(0.0))
+    m.positions.append(Float32(0.0)); m.positions.append(Float32(0.5)); m.positions.append(Float32(0.0))
+    m.normals.append(Float32(0.0)); m.normals.append(Float32(0.0)); m.normals.append(Float32(1.0))
+    m.normals.append(Float32(0.0)); m.normals.append(Float32(0.0)); m.normals.append(Float32(1.0))
+    m.normals.append(Float32(0.0)); m.normals.append(Float32(0.0)); m.normals.append(Float32(1.0))
+    m.texcoords.append(Float32(0.0)); m.texcoords.append(Float32(0.0))
+    m.texcoords.append(Float32(1.0)); m.texcoords.append(Float32(0.0))
+    m.texcoords.append(Float32(0.5)); m.texcoords.append(Float32(1.0))
+    m.indices.append(0); m.indices.append(1); m.indices.append(2)
+    mdl.meshes.append(m^)
+    _assert(write_native_glb(ext + "/ext_crate.glb", mdl), "write ext_crate.glb")
+    _assert(
+        _mcp_write_text_p(
+            ext + "/crate.flmat",
+            '{"format":"flmat","version":1,"name":"CrateMat","base_color":[0.8,0.4,0.2],"roughness":0.35,"metallic":0.2}',
+        ),
+        "write crate.flmat",
+    )
+    _assert(
+        _mcp_write_text_p(
+            ext + "/crate.flprefab",
+            '{"format":"flprefab","version":1,"name":"CratePF","entities":['
+            '{"name":"CrateRoot","position":[0.0,1.0,0.0],"mass":3.5,"mesh_ref":"assets/models/ext_crate.glb","material_ref":"assets/materials/crate.flmat"}]}',
+        ),
+        "write crate.flprefab",
+    )
+    _assert(_mcp_write_text_p(ext + "/corrupt.glb", "BAD_GLB_DATA"), "write corrupt.glb")
+    _assert(_mcp_write_text_p(ext + "/bad.flmat", "{not_json"), "write bad.flmat")
+    _assert(_mcp_write_text_p(ext + "/bad.flprefab", "{not_json"), "write bad.flprefab")
+
+    var studio = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_0_HEADLESS_SIMD,
+        width=160,
+        height=120,
+        worker_threads=0,
+        project_root=proj,
+    )
+    var mcp = McpServerV2(workspace_root=proj)
+
+    def _call_mcp(
+        mut s_mcp: McpServerV2,
+        mut st: FlintStudioState,
+        mut pl: JobPool,
+        req: String,
+    ) raises -> String:
+        ref assets_srv = st.app.resources.get_ptr_mut[AssetServer]().value()[unsafe_offset=0]
+        return s_mcp.handle_jsonrpc(req, st, assets_srv, pl)
+
+    # 1. tools/list has all 22 tools including the 4 new M1 tools
+    var r_tl = _call_mcp(mcp, studio, pool, '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+    _assert(r_tl.find('"asset.import"') >= 0, "tools/list missing asset.import")
+    _assert(r_tl.find('"asset.list"') >= 0, "tools/list missing asset.list")
+    _assert(r_tl.find('"material.assign"') >= 0, "tools/list missing material.assign")
+    _assert(r_tl.find('"prefab.spawn"') >= 0, "tools/list missing prefab.spawn")
+
+    # 2. Empty project asset.list returns count=0
+    var r_empty = _call_mcp(
+        mcp, studio, pool, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"asset.list","arguments":{}}}'
+    )
+    _assert(r_empty.find('\\"count\\":0') >= 0, "empty project asset.list must return count=0: " + r_empty)
+
+    # 3. Boundary rejections: system file, traversal, corrupt payloads write ZERO bytes to disk
+    var r_sys = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"/etc/passwd","dest_path":"assets/passwd"}}}',
+    )
+    _assert(r_sys.find('"isError":true') >= 0 and file_size(proj + "/assets/passwd") < 0, "must reject /etc/passwd with zero disk write")
+    var r_trav = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"'
+        + ext
+        + '/ext_crate.glb","dest_path":"../escape.glb"}}}',
+    )
+    _assert(r_trav.find('"isError":true') >= 0, "must reject traversal dest_path")
+    var r_cglb = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"'
+        + ext
+        + '/corrupt.glb","dest_path":"assets/models/corrupt.glb"}}}',
+    )
+    _assert(r_cglb.find('"isError":true') >= 0 and file_size(proj + "/assets/models/corrupt.glb") < 0, "must reject corrupt GLB before disk write")
+
+    # 4. Valid asset.import + asset.list
+    var r_i1 = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"'
+        + ext
+        + '/ext_crate.glb","dest_path":"assets/models/ext_crate.glb"}}}',
+    )
+    var r_i2 = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"'
+        + ext
+        + '/crate.flmat","dest_path":"assets/materials/crate.flmat"}}}',
+    )
+    var r_i3 = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"'
+        + ext
+        + '/crate.flprefab","dest_path":"assets/prefabs/crate.flprefab"}}}',
+    )
+    _assert(r_i1.find('\\"ok\\":true') >= 0 and r_i1.find('assets/models/ext_crate.glb') >= 0, "asset.import glb failed: " + r_i1)
+    _assert(r_i2.find('\\"ok\\":true') >= 0 and r_i3.find('\\"ok\\":true') >= 0, "asset.import flmat/flprefab failed")
+
+    var r_ls = _call_mcp(
+        mcp, studio, pool, '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"asset.list","arguments":{}}}'
+    )
+    _assert(r_ls.find('\\"count\\":3') >= 0 and r_ls.find('assets/models/ext_crate.glb') >= 0, "asset.list failed: " + r_ls)
+
+    # 5. procedural.generate_asset uploads real mesh_id >= 0 & binds relative MeshRendererComponent.mesh_ref
+    var r_gen = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"procedural.generate_asset","arguments":{"preset":"crate","seed":7,"spawn_in_scene":true,"output_glb_path":"assets/models/proc_crate.glb"}}}',
+    )
+    _assert(r_gen.find('\\"ok\\":true') >= 0, "procedural.generate_asset failed: " + r_gen)
+    _assert(r_gen.find('\\"mesh_id\\":-1') < 0, "procedural.generate_asset must produce mesh_id >= 0: " + r_gen)
+    _assert(r_gen.find('assets/models/proc_crate.glb') >= 0, "procedural.generate_asset output_glb_path must be relative: " + r_gen)
+    _assert(file_size(proj + "/assets/models/proc_crate.glb") > 0, "procedural.generate_asset did not write GLB")
+    var gen_eid = -1
+    for i in range(len(studio.entities)):
+        if studio.entities[i].alive:
+            gen_eid = i
+            break
+    _assert(gen_eid >= 0, "procedural.generate_asset did not spawn entity")
+    var gen_e = studio.resolve_entity(gen_eid)
+    _assert(
+        studio.app.world.get_ptr[MeshRendererComponent](gen_e).value()[].mesh_ref.rel_path == "assets/models/proc_crate.glb",
+        "procedural.generate_asset did not bind MeshRendererComponent.mesh_ref",
+    )
+    _assert(studio.app.world.get_ptr[MeshRendererComponent](gen_e).value()[].mesh_id >= 0, "generated entity mesh_id < 0")
+
+    # 6. material.assign + invalid assign non-mutating check
+    var r_ma = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"material.assign","arguments":{"entity_id":'
+        + String(gen_eid)
+        + ',"material_path":"assets/materials/crate.flmat"}}}',
+    )
+    _assert(r_ma.find('\\"ok\\":true') >= 0 and r_ma.find('assets/materials/crate.flmat') >= 0, "material.assign failed: " + r_ma)
+    _assert(studio.app.world.has[MaterialOverrideComponent](gen_e), "material.assign missing MaterialOverrideComponent")
+    var h_before_bad = studio.state_hash()
+    var bad_flmat_b = read_bytes(ext + "/bad.flmat")
+    _ = write_bytes(proj + "/assets/materials/bad.flmat", bad_flmat_b)
+    var r_ma_bad = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"material.assign","arguments":{"entity_id":'
+        + String(gen_eid)
+        + ',"material_path":"assets/materials/bad.flmat"}}}',
+    )
+    _assert(r_ma_bad.find('"isError":true') >= 0 and studio.state_hash() == h_before_bad, "invalid material.assign must fail without mutating state")
+
+    # 7. prefab.spawn materializes PrefabInstanceComponent + RigidBodyComponent from "mass"
+    var r_pf = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"prefab.spawn","arguments":{"prefab_path":"assets/prefabs/crate.flprefab","position":[3.0,4.0,-2.0]}}}',
+    )
+    _assert(r_pf.find('\\"ok\\":true') >= 0, "prefab.spawn failed: " + r_pf)
+    var found_pf = False
+    for i in range(len(studio.entities)):
+        if studio.entities[i].alive and studio.entities[i].name == "CrateRoot":
+            var pe = studio.resolve_entity(i)
+            _assert(studio.app.world.has[PrefabInstanceComponent](pe), "prefab.spawn missing PrefabInstanceComponent")
+            _assert(studio.app.world.has[RigidBodyComponent](pe), "prefab.spawn missing RigidBodyComponent from mass")
+            _assert(abs(studio.entities[i].translation.x - Float32(3.0)) < Float32(1.0e-4), "prefab.spawn position override failed")
+            found_pf = True
+    _assert(found_pf, "prefab.spawn CrateRoot not found")
+
+    # 8. ecs.query_entities emits material_ref/mesh_ref/mesh_id & scene.save -> restart -> scene.load preserves state_hash()
+    var r_q = _call_mcp(
+        mcp, studio, pool, '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{}}}'
+    )
+    _assert(r_q.find('assets/models/proc_crate.glb') >= 0 and r_q.find('assets/materials/crate.flmat') >= 0, "ecs.query_entities missing refs: " + r_q)
+
+    var r_sv = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/m1_unit.flscn"}}}',
+    )
+    _assert(r_sv.find('\\"ok\\":true') >= 0 and file_size(proj + "/scenes/m1_unit.flscn") > 0, "scene.save failed: " + r_sv)
+    studio.shutdown()
+
+    var studio2 = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_0_HEADLESS_SIMD,
+        width=160,
+        height=120,
+        worker_threads=0,
+        project_root=proj,
+    )
+    var r_ld = _call_mcp(
+        mcp,
+        studio2,
+        pool,
+        '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/m1_unit.flscn"}}}',
+    )
+    _assert(r_ld.find('\\"ok\\":true') >= 0, "scene.load failed: " + r_ld)
+    _assert(studio2.live_entity_count() == 2, "restarted scene.load entity count mismatch")
+    var h2 = studio2.state_hash()
+    var found_proc2 = False
+    var found_pf2 = False
+    for i in range(len(studio2.entities)):
+        if not studio2.entities[i].alive:
+            continue
+        var e2 = studio2.resolve_entity(i)
+        if studio2.entities[i].name == "Proc_crate":
+            ref mr2 = studio2.app.world.get_ptr[MeshRendererComponent](e2).value()[unsafe_offset=0]
+            _assert(mr2.mesh_ref.rel_path == "assets/models/proc_crate.glb" and mr2.mesh_id >= 0, "reloaded Proc_crate mesh missing")
+            _assert(mr2.material_ref.rel_path == "assets/materials/crate.flmat" and mr2.material_id >= 0, "reloaded Proc_crate material missing")
+            found_proc2 = True
+        elif studio2.entities[i].name == "CrateRoot":
+            _assert(studio2.app.world.has[PrefabInstanceComponent](e2), "reloaded CrateRoot missing PrefabInstanceComponent")
+            _assert(studio2.app.world.has[RigidBodyComponent](e2), "reloaded CrateRoot missing RigidBodyComponent")
+            _assert(abs(studio2.entities[i].translation.x - Float32(3.0)) < Float32(1.0e-4), "reloaded CrateRoot position mismatch")
+            found_pf2 = True
+    _assert(found_proc2 and found_pf2, "reloaded scene missing expected entities")
+    _ = _call_mcp(
+        mcp,
+        studio2,
+        pool,
+        '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/m1_unit2.flscn"}}}',
+    )
+    studio2.shutdown()
+
+    var studio3 = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_0_HEADLESS_SIMD,
+        width=160,
+        height=120,
+        worker_threads=0,
+        project_root=proj,
+    )
+    var r_ld3 = _call_mcp(
+        mcp,
+        studio3,
+        pool,
+        '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/m1_unit2.flscn"}}}',
+    )
+    _assert(r_ld3.find('\\"ok\\":true') >= 0, "scene.load 2 failed: " + r_ld3)
+    _assert(studio3.state_hash() == h2, "canonical asset-resolved scene.save/load state_hash mismatch across restart")
+    studio3.shutdown()
+    # 9. Gate 1 Remediation: Tier-0 mesh_id >= 6 (no collision with default 0..5), canonical material cache,
+    # UInt64 SkeletonComponent.model_id round-trip, state_hash() invariance s1 == s2, and Tier-0 3D render parity
+    var proj_g1 = tmp_root + "/mcp_g1_proj"
+    _ = make_dirs(proj_g1 + "/assets/models")
+    _ = make_dirs(proj_g1 + "/assets/materials")
+    _ = make_dirs(proj_g1 + "/assets/prefabs")
+    _ = make_dirs(proj_g1 + "/scenes")
+    _ = write_native_glb(proj_g1 + "/assets/models/ext_crate.glb", mdl)
+    _assert(
+        _mcp_write_text_p(
+            proj_g1 + "/assets/materials/canon.flmat",
+            '{"format":"flmat","version":1,"name":"Canon","base_color":[0.25,0.65,0.85],"roughness":0.4,"metallic":0.1}',
+        ),
+        "write canon.flmat",
+    )
+    _assert(
+        _mcp_write_text_p(
+            proj_g1 + "/assets/materials/alt.flmat",
+            '{"format":"flmat","version":1,"name":"Alt","base_color":[0.85,0.25,0.15],"roughness":0.7,"metallic":0.0}',
+        ),
+        "write alt.flmat",
+    )
+    # Canonical prefab omitting uuid in material_ref
+    _assert(
+        _mcp_write_text_p(
+            proj_g1 + "/assets/prefabs/nil_uuid.flprefab",
+            '{"format":"flprefab","version":1,"name":"NilUuidPF","nodes":['
+            '{"name":"CanonBox","parent_slot":-1,"components":{'
+            '"LocalTransform":{"translation":[2.0,0.5,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},'
+            '"MeshRendererComponent":{"mesh_id":0,"material_id":-1,"cast_shadows":true,"visible":true,'
+            '"mesh_ref":{"rel_path":"assets/models/ext_crate.glb","kind":1},'
+            '"material_ref":{"rel_path":"assets/materials/canon.flmat","kind":0}},'
+            '"MaterialOverrideComponent":{"material_id":-1,"enabled":true,"material_ref":{"rel_path":"assets/materials/canon.flmat","kind":0}}'
+            '}}]}',
+        ),
+        "write nil_uuid.flprefab",
+    )
+
+    var s1 = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_0_HEADLESS_SIMD,
+        width=160,
+        height=120,
+        worker_threads=0,
+        project_root=proj_g1,
+    )
+    var mcp_g1 = McpServerV2(workspace_root=proj_g1)
+    populate_default_studio_scene(s1)
+    _assert(
+        s1.app.resources.get_ptr[ScalableRenderer]().value()[].cpu_meshes.__len__() >= 6,
+        "populate_default_studio_scene must reserve 6 default CPU meshes in Tier 0",
+    )
+    var r_g1 = _call_mcp(
+        mcp_g1,
+        s1,
+        pool,
+        '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"procedural.generate_asset","arguments":{"preset":"material_orb","seed":3,"spawn_in_scene":true,"position":[1.5,1.0,-0.5],"output_glb_path":"assets/models/g1_orb.glb"}}}',
+    )
+    _assert(r_g1.find('\\"ok\\":true') >= 0, "g1 procedural.generate_asset failed: " + r_g1)
+    _assert(r_g1.find('\\"mesh_id\\":0') < 0, "Tier-0 procedural.generate_asset collided with mesh_id=0: " + r_g1)
+    var orb_eid = -1
+    for i in range(len(s1.entities)):
+        if s1.entities[i].alive and s1.entities[i].name == "Proc_material_orb":
+            orb_eid = i
+            break
+    _assert(orb_eid >= 0, "missing Proc_material_orb")
+    ref orb_mr = s1.app.world.get_ptr[MeshRendererComponent](s1.resolve_entity(orb_eid)).value()[unsafe_offset=0]
+    _assert(orb_mr.mesh_id >= 6, "Proc_material_orb mesh_id must be >= 6 in Tier 0, got " + String(orb_mr.mesh_id))
+
+    # Material reassignment history + nil-UUID prefab must hit same material cache key
+    var r_ma1 = _call_mcp(
+        mcp_g1,
+        s1,
+        pool,
+        '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"material.assign","arguments":{"entity_id":'
+        + String(orb_eid)
+        + ',"material_path":"assets/materials/canon.flmat"}}}',
+    )
+    _assert(r_ma1.find('\\"ok\\":true') >= 0, "g1 material.assign 1 failed: " + r_ma1)
+    var r_ma2 = _call_mcp(
+        mcp_g1,
+        s1,
+        pool,
+        '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"material.assign","arguments":{"entity_id":'
+        + String(orb_eid)
+        + ',"material_path":"assets/materials/alt.flmat"}}}',
+    )
+    _assert(r_ma2.find('\\"ok\\":true') >= 0, "g1 material.assign 2 failed: " + r_ma2)
+    var r_ma3 = _call_mcp(
+        mcp_g1,
+        s1,
+        pool,
+        '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"material.assign","arguments":{"entity_id":'
+        + String(orb_eid)
+        + ',"material_path":"assets/materials/canon.flmat"}}}',
+    )
+    _assert(r_ma3.find('\\"ok\\":true') >= 0, "g1 material.assign 3 failed: " + r_ma3)
+    var r_pf_nil = _call_mcp(
+        mcp_g1,
+        s1,
+        pool,
+        '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"prefab.spawn","arguments":{"prefab_path":"assets/prefabs/nil_uuid.flprefab"}}}',
+    )
+    _assert(r_pf_nil.find('\\"ok\\":true') >= 0, "g1 prefab.spawn nil_uuid failed: " + r_pf_nil)
+    var cbox_eid = -1
+    for i in range(len(s1.entities)):
+        if s1.entities[i].alive and s1.entities[i].name == "CanonBox":
+            cbox_eid = i
+            break
+    _assert(cbox_eid >= 0, "missing CanonBox")
+    var orb_mat_id = s1.app.world.get_ptr[MaterialOverrideComponent](s1.resolve_entity(orb_eid)).value()[].material_id
+    var cbox_mat_id = s1.app.world.get_ptr[MaterialOverrideComponent](s1.resolve_entity(cbox_eid)).value()[].material_id
+    _assert(
+        orb_mat_id >= 0 and orb_mat_id == cbox_mat_id,
+        "nil-UUID and populated-UUID AssetRef for same .flmat must share canonical material_id",
+    )
+
+    # Rigged SkeletonComponent with UInt64 > Int64.MAX (high bit set) + BoneSocketComponent
+    var rig_eid = s1.spawn_entity("RiggedHero", position=Vec3(-1.5, 0.5, 0.0), record_undo=False)
+    var rig_e = s1.resolve_entity(rig_eid)
+    var high_u64 = UInt64(15352672342455569117)
+    var sk_inst = SkeletonInstance(2)
+    sk_inst.parents[0] = -1
+    sk_inst.parents[1] = 0
+    sk_inst.pose.t[1] = Vec3(0.0, 0.8, 0.0)
+    _ = s1.app.world.insert[SkeletonComponent](rig_e, SkeletonComponent(high_u64, sk_inst^, False, AssetRef()))
+    var mr_rig = s1.app.world.get_ptr_mut[MeshRendererComponent](rig_e)
+    if mr_rig:
+        mr_rig.value()[].mesh_ref = AssetRef.from_path("assets/models/ext_crate.glb", ASSET_KIND_MESH)
+        mr_rig.value()[].material_ref = AssetRef.from_path("assets/materials/canon.flmat", ASSET_KIND_RAW)
+    _ = s1.app.world.insert[MaterialOverrideComponent](
+        rig_e,
+        MaterialOverrideComponent(
+            -1,
+            Vec3(0.25, 0.65, 0.85),
+            Float32(0.4),
+            Float32(0.1),
+            Vec3(),
+            enabled=True,
+            material_ref=AssetRef.from_path("assets/materials/canon.flmat", ASSET_KIND_RAW),
+        ),
+    )
+    var sock_eid = s1.spawn_entity("HeroSocket", position=Vec3(0.0, 0.0, 0.0), record_undo=False)
+    var sock_e = s1.resolve_entity(sock_eid)
+    _ = s1.app.world.insert[BoneSocketComponent](
+        sock_e, BoneSocketComponent(rig_e, BoneSocketAttachment("Hand", 1), -1)
+    )
+    s1.look_at(Vec3(-5.6, 3.75, -7.4), Vec3(0.15, 0.95, 1.1))
+    s1._sync_ecs_and_physics()
+    s1.render_editor_frame(160, 120)
+    var rw1_ptr = s1.app.resources.get_ptr_mut[RenderWorld]().value()
+    var ren1_ptr = s1.app.resources.get_ptr_mut[ScalableRenderer]().value()
+    var empty_ui1 = UiDrawList()
+    _ = ren1_ptr[unsafe_offset=0].render_world(
+        rw1_ptr[unsafe_offset=0], empty_ui1, capture_readback=True, force_readback=True
+    )
+    var px1 = ren1_ptr[unsafe_offset=0].readback_pixels()
+    var h_s1 = s1.state_hash()
+
+    var r_sv_g1 = _call_mcp(
+        mcp_g1,
+        s1,
+        pool,
+        '{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/g1_roundtrip.flscn"}}}',
+    )
+    _assert(r_sv_g1.find('\\"ok\\":true') >= 0, "g1 scene.save failed: " + r_sv_g1)
+    s1.shutdown()
+
+    var s2 = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_0_HEADLESS_SIMD,
+        width=160,
+        height=120,
+        worker_threads=0,
+        project_root=proj_g1,
+    )
+    var r_ld_g1 = _call_mcp(
+        mcp_g1,
+        s2,
+        pool,
+        '{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/g1_roundtrip.flscn"}}}',
+    )
+    _assert(r_ld_g1.find('\\"ok\\":true') >= 0, "g1 scene.load failed: " + r_ld_g1)
+    _assert(s2.state_hash() == h_s1, "s2.state_hash() must equal h1 directly across scene.save -> restart -> scene.load")
+    var found_rig2 = False
+    for i in range(len(s2.entities)):
+        if s2.entities[i].alive and s2.entities[i].name == "RiggedHero":
+            var re2 = s2.resolve_entity(i)
+            _assert(
+                s2.app.world.get_ptr[SkeletonComponent](re2).value()[].model_id == high_u64,
+                "SkeletonComponent UInt64 model_id lost precision on .flscn JSON roundtrip",
+            )
+            found_rig2 = True
+        elif s2.entities[i].alive and s2.entities[i].name == "Proc_material_orb":
+            var pe2 = s2.resolve_entity(i)
+            _assert(
+                s2.app.world.get_ptr[MeshRendererComponent](pe2).value()[].mesh_id >= 6,
+                "reloaded Proc_material_orb mesh_id collided with default showcase slots",
+            )
+    _assert(found_rig2, "RiggedHero missing after scene.load")
+
+    s2.look_at(Vec3(-5.6, 3.75, -7.4), Vec3(0.15, 0.95, 1.1))
+    s2.select_entity(1)
+    s2.render_editor_frame(160, 120)
+    var rw2_ptr = s2.app.resources.get_ptr_mut[RenderWorld]().value()
+    var ren2_ptr = s2.app.resources.get_ptr_mut[ScalableRenderer]().value()
+    var empty_ui2 = UiDrawList()
+    _ = ren2_ptr[unsafe_offset=0].render_world(
+        rw2_ptr[unsafe_offset=0], empty_ui2, capture_readback=True, force_readback=True
+    )
+    var px2 = ren2_ptr[unsafe_offset=0].readback_pixels()
+    _assert(len(px1) == len(px2) and len(px1) > 0, "Tier-0 framebuffer size mismatch")
+    var nonzero_px = 0
+    var diff_px = 0
+    for k in range(len(px2)):
+        if px2[k] != UInt32(0):
+            nonzero_px += 1
+        if px1[k] != px2[k]:
+            diff_px += 1
+    _assert(nonzero_px > 100, "reloaded Tier-0 scene rendered empty framebuffer")
+    _assert(diff_px == 0, "reloaded Tier-0 3D scene had pixel diffs: " + String(diff_px))
+    s2.shutdown()
+    print("    [OK] McpServerV2 M1 tools (asset.import/list, material.assign, prefab.spawn, procedural upload, scene roundtrip, Gate 1 hash/mesh_id/u64 parity) passed!")
+
+
+def test_q_glb_unoverridden_material_reload_parity(tmp_root: String) raises:
+    var proj = tmp_root + "/glb_default_mat_proj"
+    _ = make_dirs(proj + "/assets/models")
+    _ = make_dirs(proj + "/assets/materials")
+    _ = make_dirs(proj + "/scenes")
+
+    var mdl = NativeModel()
+    var m = NativeMesh()
+    m.base_color = 0xFFFFFFFF
+    m.positions.append(Float32(-0.7)); m.positions.append(Float32(-0.7)); m.positions.append(Float32(0.0))
+    m.positions.append(Float32(0.7)); m.positions.append(Float32(-0.7)); m.positions.append(Float32(0.0))
+    m.positions.append(Float32(0.0)); m.positions.append(Float32(0.7)); m.positions.append(Float32(0.0))
+    for _ in range(3):
+        m.normals.append(Float32(0.0)); m.normals.append(Float32(0.0)); m.normals.append(Float32(1.0))
+    m.texcoords.append(Float32(0.0)); m.texcoords.append(Float32(0.0))
+    m.texcoords.append(Float32(1.0)); m.texcoords.append(Float32(0.0))
+    m.texcoords.append(Float32(0.5)); m.texcoords.append(Float32(1.0))
+    m.indices.append(0); m.indices.append(1); m.indices.append(2)
+    mdl.meshes.append(m^)
+    _assert(write_native_glb(proj + "/assets/models/prop.glb", mdl), "write prop.glb")
+    _assert(write_native_glb(proj + "/assets/models/hero.glb", mdl), "write hero.glb")
+    _assert(
+        _mcp_write_text_p(
+            proj + "/assets/materials/hero.flmat",
+            '{"format":"flmat","version":1,"name":"Hero","base_color":[0.05,0.25,0.95],"roughness":0.3,"metallic":0.1}',
+        ),
+        "write hero.flmat",
+    )
+
+    var s1 = FlintStudioState(
+        headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=160, height=120, worker_threads=0, project_root=proj
+    )
+    var hero_id = s1.activate_asset_entry("assets/models/hero.glb", drop_pos=Vec3(-1.0, 0.0, 0.0), from_drop=True)
+    _assert(hero_id >= 0, "spawn hero.glb failed")
+    _assert(s1.activate_asset_entry("assets/materials/hero.flmat", target_entity_id=hero_id, from_drop=True) == hero_id, "assign hero.flmat failed")
+    var prop_id = s1.activate_asset_entry("assets/models/prop.glb", drop_pos=Vec3(1.0, 0.0, 0.0), from_drop=True)
+    _assert(prop_id >= 0, "spawn prop.glb failed")
+
+    s1.look_at(Vec3(0.0, 1.0, 4.5), Vec3(0.0, 0.0, 0.0))
+    s1.render_editor_frame(160, 120)
+    var rw1 = s1.app.resources.get_ptr_mut[RenderWorld]().value()
+    var ren1 = s1.app.resources.get_ptr_mut[ScalableRenderer]().value()
+    var ui1 = UiDrawList()
+    _ = ren1[unsafe_offset=0].render_world(rw1[unsafe_offset=0], ui1, capture_readback=True, force_readback=True)
+    var px1 = ren1[unsafe_offset=0].readback_pixels()
+    var h1 = s1.state_hash()
+    _assert(s1.save_scene_file("scenes/mixed_assets.flscn"), "save mixed_assets.flscn")
+    _assert(s1.save_scene_file("scenes/mixed_assets.flscnb"), "save mixed_assets.flscnb")
+    s1.shutdown()
+
+    for fmt in range(2):
+        var s2 = FlintStudioState(
+            headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=160, height=120, worker_threads=0, project_root=proj
+        )
+        var spath = "scenes/mixed_assets.flscn" if fmt == 0 else "scenes/mixed_assets.flscnb"
+        _assert(s2.load_scene_file(spath), "load " + spath)
+        _assert(s2.state_hash() == h1, "state_hash mismatch on " + spath)
+        s2.look_at(Vec3(0.0, 1.0, 4.5), Vec3(0.0, 0.0, 0.0))
+        s2.render_editor_frame(160, 120)
+        var rw2 = s2.app.resources.get_ptr_mut[RenderWorld]().value()
+        var ren2 = s2.app.resources.get_ptr_mut[ScalableRenderer]().value()
+        var ui2 = UiDrawList()
+        _ = ren2[unsafe_offset=0].render_world(rw2[unsafe_offset=0], ui2, capture_readback=True, force_readback=True)
+        var px2 = ren2[unsafe_offset=0].readback_pixels()
+        var diffs = 0
+        for k in range(len(px1)):
+            if px1[k] != px2[k]:
+                diffs += 1
+        _assert(diffs == 0, "3D pixel diff on " + spath + ": " + String(diffs))
+        ref h_mr = s2.app.world.get_ptr[MeshRendererComponent](s2.resolve_entity(hero_id)).value()[unsafe_offset=0]
+        ref p_mr = s2.app.world.get_ptr[MeshRendererComponent](s2.resolve_entity(prop_id)).value()[unsafe_offset=0]
+        _assert(p_mr.material_id >= 0 and p_mr.material_id != h_mr.material_id, "prop.glb aliased hero.flmat slot")
+        var p_bc = ren2[unsafe_offset=0].materials[p_mr.material_id].base_color
+        _assert(
+            abs(p_bc.x - Float32(1.0)) < Float32(1.0e-4)
+            and abs(p_bc.y - Float32(1.0)) < Float32(1.0e-4)
+            and abs(p_bc.z - Float32(1.0)) < Float32(1.0e-4),
+            "prop.glb GLB default base_color mismatch",
+        )
+        s2.shutdown()
+    print("    [OK] GLB un-overridden default material non-aliasing & 0-diff reload parity passed!")
+
+
+def test_r_mcp_v2_m2_runtime_tools(tmp_root: String, mut pool: JobPool) raises:
+    print("  [r] Testing McpServerV2 M2 runtime tools (physics.trigger_events, anim.set_state, audio.play, nav.query_path)...")
+    var ws = tmp_root + "/m2_mcp_ws"
+    _rm_rf_tmp(ws)
+    _ = make_dirs(ws + "/assets")
+    _ = make_dirs(ws + "/scenes")
+    var sfx_wav = _make_minimal_wav_16bit()
+    _assert(write_bytes(ws + "/assets/sfx.wav", sfx_wav), "write sfx.wav")
+    _assert(_mcp_write_text_p(ws + "/assets/not_audio.txt", "hello"), "write not_audio.txt")
+
+    var studio = FlintStudioState(
+        headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=160, height=120, worker_threads=0, project_root=ws
+    )
+    var assets = AssetServer(enable_watcher=False)
+    var mcp = McpServerV2(workspace_root=ws)
+
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m2-test"}}}',
+        studio, assets, pool,
+    )
+
+    # 1. tools/list contains all 26 tools including the 4 M2 runtime tools
+    var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}', studio, assets, pool)
+    var d_list = parse_json(_str_bytes(r_list))
+    var t_arr = d_list.object_get(d_list.object_get(d_list.root, "result"), "tools")
+    _assert(d_list.valid and d_list.array_size(t_arr) >= 26, "tools/list must expose 26 tools")
+    _assert(
+        r_list.find('"physics.trigger_events"') >= 0
+        and r_list.find('"anim.set_state"') >= 0
+        and r_list.find('"audio.play"') >= 0
+        and r_list.find('"nav.query_path"') >= 0,
+        "tools/list missing M2 runtime tools",
+    )
+
+    # Spawn floor, trigger zone, falling crate, and anim actor
+    var floor_id = studio.spawn_entity(
+        "M2_Floor", position=Vec3(0.0, -0.5, 0.0), scale=Vec3(12.0, 1.0, 12.0), collider_kind=COLLIDER_BOX,
+        collider_half_extents=Vec3(6.0, 0.5, 6.0), mass=0.0,
+    )
+    var trig_id = studio.spawn_entity(
+        "M2_Trigger", position=Vec3(0.0, 1.0, 0.0), collider_kind=COLLIDER_BOX,
+        collider_half_extents=Vec3(2.0, 2.0, 2.0), mass=0.0,
+    )
+    var trig_e = studio.resolve_entity(trig_id)
+    var trig_col = studio.app.world.get_ptr_mut[ColliderComponent](trig_e)
+    _assert(Bool(trig_col), "trigger collider missing")
+    trig_col.value()[unsafe_offset=0].is_trigger = True
+    studio._sync_ecs_and_physics()
+
+    var mover_id = studio.spawn_entity(
+        "M2_Mover", position=Vec3(0.0, 1.5, 0.0), collider_kind=COLLIDER_BOX,
+        collider_half_extents=Vec3(0.5, 0.5, 0.5), mass=1.0,
+    )
+    var actor_id = studio.spawn_entity(
+        "M2_AnimActor", position=Vec3(3.0, 1.0, 0.0), collider_kind=COLLIDER_BOX,
+        collider_half_extents=Vec3(0.5, 0.5, 0.5), mass=0.0,
+    )
+    _assert(floor_id >= 0 and trig_id >= 0 and mover_id >= 0 and actor_id >= 0, "spawn entities failed")
+    var pre_pie_hash = String(studio.state_hash())
+
+    # 2. PIE_STOPPED negative guard on all 4 tools (no stub error strings)
+    var stopped_reqs = [
+        '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":{}}}',
+        '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"anim.set_state","arguments":{"entity_id":' + String(actor_id) + ',"state":"idle"}}}',
+        '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"audio.play","arguments":{"asset_path":"assets/sfx.wav"}}}',
+        '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"nav.query_path","arguments":{"start":[0.0,0.0,0.0],"goal":[4.0,0.0,4.0]}}}',
+    ]
+    for si in range(len(stopped_reqs)):
+        var rs = mcp.handle_jsonrpc(stopped_reqs[si], studio, assets, pool)
+        _assert(rs.find('"isError":true') >= 0 and rs.find('\\"ok\\":false') >= 0, "PIE_STOPPED guard failed: " + rs)
+        _assert(
+            rs.find("unknown tool") < 0 and rs.find("not implemented") < 0 and rs.find("unimplemented") < 0 and rs.find("unsupported") < 0,
+            "stub error string leaked in PIE_STOPPED guard: " + rs,
+        )
+
+    # 3. Enter PIE & step to generate trigger events
+    var r_play = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"play"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_play.find('\\"pie_mode\\":\\"playing\\"') >= 0, "pie play failed: " + r_play)
+    var r_step = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"step","ticks":1}}}',
+        studio, assets, pool,
+    )
+    _assert(r_step.find('\\"ok\\":true') >= 0, "pie step failed: " + r_step)
+
+    var r_trig = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":{}}}',
+        studio, assets, pool,
+    )
+    _assert(r_trig.find('\\"ok\\":true') >= 0 and r_trig.find('\\"events\\":[') >= 0 and r_trig.find('\\"enter\\"') >= 0, "trigger_events enter failed: " + r_trig)
+    var r_step2 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":220,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"step","ticks":1}}}',
+        studio, assets, pool,
+    )
+    _assert(r_step2.find('\\"ok\\":true') >= 0, "pie step 2 failed: " + r_step2)
+    var r_trig2 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":221,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":{"entity_id":' + String(trig_id) + '}}}',
+        studio, assets, pool,
+    )
+    _assert(r_trig2.find('\\"ok\\":true') >= 0 and r_trig2.find('\\"stay\\"') >= 0, "trigger_events stay filter failed: " + r_trig2)
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":{"entity_id":-1}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "trigger_events invalid entity_id must fail",
+    )
+
+    # 4. anim.set_state auto-attaches AnimatorComponent on live entity & updates existing
+    var r_anim1 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"anim.set_state","arguments":{"entity_id":' + String(actor_id) + ',"state":"idle"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_anim1.find('\\"ok\\":true') >= 0 and r_anim1.find('\\"state\\":\\"idle\\"') >= 0, "anim.set_state idle failed: " + r_anim1)
+    _assert(studio.app.world.has[AnimatorComponent](studio.resolve_entity(actor_id)), "AnimatorComponent must be auto-attached")
+    var r_anim2 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"anim.set_state","arguments":{"entity_id":' + String(actor_id) + ',"state":"run","playing":false,"speed":1.5}}}',
+        studio, assets, pool,
+    )
+    _assert(r_anim2.find('\\"ok\\":true') >= 0 and r_anim2.find('\\"playing\\":false') >= 0, "anim.set_state update failed: " + r_anim2)
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"anim.set_state","arguments":{"entity_id":999999,"state":"idle"}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "anim.set_state dead entity must fail",
+    )
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"anim.set_state","arguments":{"entity_id":' + String(actor_id) + ',"state":""}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "anim.set_state empty state must fail",
+    )
+
+    # 5. audio.play positive + negative sandbox/missing/ext checks
+    var r_aud = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"audio.play","arguments":{"asset_path":"assets/sfx.wav","volume":0.8}}}',
+        studio, assets, pool,
+    )
+    _assert(r_aud.find('\\"ok\\":true') >= 0 and r_aud.find('\\"asset_id\\":') >= 0, "audio.play failed: " + r_aud)
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"audio.play","arguments":{"asset_path":"assets/does_not_exist.wav"}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "audio.play missing file must fail",
+    )
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"audio.play","arguments":{"asset_path":"../escape.wav"}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "audio.play traversal must fail",
+    )
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"audio.play","arguments":{"asset_path":"assets/not_audio.txt"}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "audio.play non-audio ext must fail",
+    )
+
+    # 6. nav.query_path positive (auto-bake) + negative validation
+    var r_nav = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"nav.query_path","arguments":{"start":[0.0,0.0,0.0],"goal":[4.0,0.0,4.0]}}}',
+        studio, assets, pool,
+    )
+    _assert(r_nav.find('\\"ok\\":true') >= 0 and r_nav.find('\\"found\\":true') >= 0 and r_nav.find('\\"waypoints\\":[[') >= 0, "nav.query_path failed: " + r_nav)
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"nav.query_path","arguments":{"start":[1.0,2.0],"goal":"bad"}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "nav.query_path malformed args must fail",
+    )
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"nav.query_path","arguments":{"start":[0.0,0.0,0.0]}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "nav.query_path missing goal must fail",
+    )
+
+    # 7. CL & NDJSON framing parity via encode_mcp_frame / parse_next_mcp_frame while PIE is active
+    var req_nd = '{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"nav.query_path","arguments":{"start":[0.0,0.0,0.0],"goal":[2.0,0.0,2.0]}}}'
+    for mode in range(2):
+        var use_cl = mode == 0
+        var wire = encode_mcp_frame(req_nd, use_content_length=use_cl)
+        var parsed = parse_next_mcp_frame(wire)
+        _assert(parsed.has_frame and parsed.used_content_length == use_cl, "frame parse mismatch")
+        var resp_s = mcp._handle_request_bytes(parsed.payload, studio, assets, pool, False, 0)
+        var resp_wire = encode_mcp_frame(resp_s, use_content_length=use_cl)
+        var parsed_resp = parse_next_mcp_frame(resp_wire)
+        _assert(parsed_resp.has_frame, "response frame parse mismatch")
+        var resp_txt = String(unsafe_from_utf8=parsed_resp.payload)
+        _assert(resp_txt.find('\\"found\\":true') >= 0, "CL/NDJSON parity nav response mismatch: " + resp_txt)
+
+    # 8. Stop PIE restores exact pre_pie_hash and re-enables PIE_STOPPED guard
+    var r_stop = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"stop"}}}',
+        studio, assets, pool,
+    )
+    _assert(
+        r_stop.find('\\"restored_exact\\":true') >= 0 and r_stop.find(pre_pie_hash) >= 0,
+        "pie_stop hash parity failed: " + r_stop,
+    )
+    _assert(
+        mcp.handle_jsonrpc(stopped_reqs[0], studio, assets, pool).find('"isError":true') >= 0,
+        "post-stop PIE_STOPPED guard failed",
+    )
+
+    studio.shutdown()
+    _rm_rf_tmp(ws)
+    print("    [OK] McpServerV2 M2 runtime tools, PIE_STOPPED guard, and CL/NDJSON parity passed!")
+
+
+def test_s_mcp_v2_m5b_r2_regressions(tmp_root: String, mut pool: JobPool) raises:
+    print("  [s] Testing M5b r2 regressions (AnimGraphDef anim.set_state, trigger_events ring, QOA validation, asset.import JSON)...")
+    var ws = tmp_root + "/m5b_r2_ws"
+    _rm_rf_tmp(ws)
+    _ = make_dirs(ws + "/assets")
+    _ = make_dirs(ws + "/scenes")
+
+    # 1. QoaAsset.from_bytes validation: 16B truncated header rejected, real encode_qoa accepted
+    var trunc_qoa = List[UInt8](length=16, fill=0)
+    trunc_qoa[0] = UInt8(0x71)  # 'q'
+    trunc_qoa[1] = UInt8(0x6F)  # 'o'
+    trunc_qoa[2] = UInt8(0x61)  # 'a'
+    trunc_qoa[3] = UInt8(0x66)  # 'f'
+    trunc_qoa[7] = UInt8(100)   # 100 samples
+    trunc_qoa[8] = UInt8(1)     # 1 ch
+    trunc_qoa[10] = UInt8(0xBB) # 48000 Hz (0x00BB80)
+    trunc_qoa[11] = UInt8(0x80)
+    _assert(not QoaAsset.from_bytes(trunc_qoa.copy()).valid, "16B truncated QOA must be invalid")
+    _assert(write_bytes(ws + "/assets/corrupt.qoa", trunc_qoa), "write corrupt.qoa")
+
+    var pcm = List[Int16](length=64, fill=Int16(1200))
+    var good_qoa = encode_qoa(pcm, 1, 48000)
+    _assert(QoaAsset.from_bytes(good_qoa.copy()).valid, "valid encode_qoa must pass QoaAsset.from_bytes")
+    _assert(write_bytes(ws + "/assets/good.qoa", good_qoa), "write good.qoa")
+    _assert(_mcp_write_text_p(ws + "/assets/src_bad.txt", "hello"), "write src_bad.txt")
+
+    var studio = FlintStudioState(
+        headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=160, height=120, worker_threads=0, project_root=ws
+    )
+    var assets = AssetServer(enable_watcher=False)
+    var mcp = McpServerV2(workspace_root=ws)
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"r2-test"}}}',
+        studio, assets, pool,
+    )
+
+    # 2. asset.import invalid destination extension produces valid JSON with isError=true and no "unsupported"
+    var r_imp = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"assets/src_bad.txt","dest_path":"assets/out.badext"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_imp.find('"isError":true') >= 0, "asset.import bad ext must fail: " + r_imp)
+    _assert(r_imp.find("unsupported") < 0, "asset.import must not leak unsupported: " + r_imp)
+    var d_imp = parse_json(_str_bytes(r_imp))
+    _assert(d_imp.valid, "asset.import error response must be valid JSON: " + r_imp)
+    var imp_txt = d_imp.text(
+        d_imp.object_get(d_imp.at(d_imp.object_get(d_imp.object_get(d_imp.root, "result"), "content"), 0), "text"),
+        "",
+    )
+    _assert(parse_json(_str_bytes(imp_txt)).valid, "asset.import content[0].text must be valid JSON: " + imp_txt)
+
+    # 3. AnimatorComponent v1/v2 binary compat & legacy JSON compat (manual_state defaults to -1)
+    var ac_compat = AnimatorComponent(graph_id=77, clip_name="Run")
+    ac_compat.animator.manual_state = 2
+    var bw = BlobWriter()
+    ac_compat.write_bin(bw)
+    var br_v3 = BlobReader(bw.data.copy())
+    var rd_v3 = AnimatorComponent.read_bin(br_v3, 3)
+    _assert(rd_v3.animator.manual_state == 2, "AnimatorComponent v3 must roundtrip manual_state")
+    var br_v1 = BlobReader(bw.data.copy())
+    var rd_v1 = AnimatorComponent.read_bin(br_v1, 1)
+    _assert(rd_v1.animator.manual_state == -1, "AnimatorComponent v1 read_bin must default manual_state=-1")
+    var br_v2 = BlobReader(bw.data.copy())
+    var rd_v2 = AnimatorComponent.read_bin(br_v2, 2)
+    _assert(rd_v2.animator.manual_state == -1, "AnimatorComponent v2 read_bin must default manual_state=-1")
+    var leg_doc = parse_json(_str_bytes('{"graph_id":88,"clip_name":"Idle"}'))
+    var rd_leg = AnimatorComponent.read_json(leg_doc, leg_doc.root)
+    _assert(rd_leg.animator.manual_state == -1, "AnimatorComponent legacy JSON must default manual_state=-1")
+
+    # 4. AnimGraphDef anim.set_state: pre-tick configure + playing=false + mid-PIE + pie_stop
+    var mdl = NativeModel()
+    var nd0 = NativeNode()
+    nd0.name = "Root"
+    nd0.base_scale = Vec3(1.0, 1.0, 1.0)
+    nd0.scale = Vec3(1.0, 1.0, 1.0)
+    var nd1 = NativeNode()
+    nd1.name = "Spine"
+    nd1.translation = Vec3(0.0, 1.0, 0.0)
+    nd1.base_translation = Vec3(0.0, 1.0, 0.0)
+    nd1.base_scale = Vec3(1.0, 1.0, 1.0)
+    nd1.scale = Vec3(1.0, 1.0, 1.0)
+    nd0.children.append(1)
+    mdl.nodes.append(nd0^)
+    mdl.nodes.append(nd1^)
+    mdl.roots.append(0)
+
+    var an_idle = NativeAnimation()
+    an_idle.name = "Idle"
+    an_idle.duration = Float32(1.0)
+    var ch_i = NativeChannel()
+    ch_i.node = 1
+    ch_i.path = 0
+    ch_i.times.append(Float32(0.0)); ch_i.times.append(Float32(1.0))
+    ch_i.values.append(Float32(0.0)); ch_i.values.append(Float32(1.0)); ch_i.values.append(Float32(0.0))
+    ch_i.values.append(Float32(0.0)); ch_i.values.append(Float32(1.0)); ch_i.values.append(Float32(0.0))
+    an_idle.channels.append(ch_i^)
+    mdl.animations.append(an_idle^)
+
+    var an_run = NativeAnimation()
+    an_run.name = "Run"
+    an_run.duration = Float32(1.0)
+    var ch_r = NativeChannel()
+    ch_r.node = 1
+    ch_r.path = 0
+    ch_r.times.append(Float32(0.0)); ch_r.times.append(Float32(1.0))
+    ch_r.values.append(Float32(0.0)); ch_r.values.append(Float32(2.5)); ch_r.values.append(Float32(0.0))
+    ch_r.values.append(Float32(0.0)); ch_r.values.append(Float32(3.5)); ch_r.values.append(Float32(0.0))
+    an_run.channels.append(ch_r^)
+    mdl.animations.append(an_run^)
+
+    var graph = AnimGraphDef()
+    graph.name = "HeroGraph"
+    graph.params.append("speed")
+    var st_idle = StateDef()
+    st_idle.name = "Idle"
+    st_idle.clip = 0
+    st_idle.when.append(Condition(0, OP_LE, Float32(0.5)))
+    graph.states.append(st_idle^)
+    var st_run = StateDef()
+    st_run.name = "Run"
+    st_run.clip = 1
+    st_run.when.append(Condition(0, OP_GT, Float32(0.5)))
+    graph.states.append(st_run^)
+    var clips = List[ClipInfo]()
+    clips.append(ClipInfo("Idle", Float32(1.0), True, Float32(0.0)))
+    clips.append(ClipInfo("Run", Float32(1.0), True, Float32(0.0)))
+
+    var ac_cache = studio.app.resources.get_ptr_mut[AnimAssetCache]()
+    _assert(Bool(ac_cache), "AnimAssetCache missing")
+    var mid = UInt64(9501)
+    var gid = UInt64(9601)
+    ac_cache.value()[unsafe_offset=0].register_model(mid, mdl^)
+    ac_cache.value()[unsafe_offset=0].register_graph(gid, graph^, clips^)
+
+    var g_eid = studio.spawn_entity("GraphActor")
+    var g_ent = studio.resolve_entity(g_eid)
+    _ = studio.app.world.insert[SkeletonComponent](g_ent, SkeletonComponent(mid))
+    _ = studio.app.world.insert[AnimatorComponent](g_ent, AnimatorComponent(graph_id=gid))
+
+    # 5. Trigger scene entities for multi-tick & render-interleaved buffering
+    var floor_id = studio.spawn_entity(
+        "R2_Floor", position=Vec3(0.0, -0.5, 0.0), scale=Vec3(12.0, 1.0, 12.0), collider_kind=COLLIDER_BOX,
+        collider_half_extents=Vec3(6.0, 0.5, 6.0), mass=0.0,
+    )
+    var trig_id = studio.spawn_entity(
+        "R2_Trigger", position=Vec3(0.0, 1.0, 0.0), collider_kind=COLLIDER_BOX,
+        collider_half_extents=Vec3(2.0, 2.0, 2.0), mass=0.0,
+    )
+    studio.app.world.get_ptr_mut[ColliderComponent](studio.resolve_entity(trig_id)).value()[unsafe_offset=0].is_trigger = True
+    studio._sync_ecs_and_physics()
+    var mover_id = studio.spawn_entity(
+        "R2_Mover", position=Vec3(0.0, 1.5, 0.0), collider_kind=COLLIDER_BOX,
+        collider_half_extents=Vec3(0.5, 0.5, 0.5), mass=1.0,
+    )
+    _assert(floor_id >= 0 and trig_id >= 0 and mover_id >= 0, "spawn r2 trigger scene failed")
+    var pre_pie_hash = String(studio.state_hash())
+
+    # Enter PIE -> pre-tick anim.set_state(Run, playing=false) must survive configure() + 3 steps
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"play"}}}',
+        studio, assets, pool,
+    )
+    var r_pre = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"anim.set_state","arguments":{"entity_id":' + String(g_eid) + ',"state":"Run","playing":false}}}',
+        studio, assets, pool,
+    )
+    _assert(r_pre.find('\\"ok\\":true') >= 0 and r_pre.find('\\"playing\\":false') >= 0, "pre-tick anim.set_state failed: " + r_pre)
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"step","ticks":3}}}',
+        studio, assets, pool,
+    )
+    ref ac_post1 = studio.app.world.get_ptr[AnimatorComponent](g_ent).value()[unsafe_offset=0]
+    ref sk_post1 = studio.app.world.get_ptr[SkeletonComponent](g_ent).value()[unsafe_offset=0]
+    _assert(ac_post1.animator.state == 1 and ac_post1.animator.manual_state == 1, "AnimGraphDef reverted after pre-tick set_state")
+    _assert(ac_post1.animator.clip_time == Float32(0.0), "clip_time must stay 0.0 while playing=false")
+    _assert(abs(sk_post1.skeleton.pose.t[1].y - Float32(2.5)) < Float32(1.0e-3), "skeleton pose must reflect Run t=0 while paused")
+
+    # audio.play rejects 16B corrupt.qoa and accepts valid good.qoa
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"audio.play","arguments":{"asset_path":"assets/corrupt.qoa"}}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "audio.play must reject 16B corrupt.qoa",
+    )
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"audio.play","arguments":{"asset_path":"assets/good.qoa"}}}',
+            studio, assets, pool,
+        ).find('\\"ok\\":true') >= 0,
+        "audio.play must accept valid good.qoa",
+    )
+
+    # physics.trigger_events rejects arguments: []
+    _assert(
+        mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":[]}}',
+            studio, assets, pool,
+        ).find('"isError":true') >= 0,
+        "physics.trigger_events must reject array arguments",
+    )
+
+    # Query after 3 ticks (enter on tick 1 + stay on ticks 2,3) -> must preserve enter, zero duplicates on re-query
+    var r_tev1 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":{}}}',
+        studio, assets, pool,
+    )
+    _assert(r_tev1.find('\\"enter\\"') >= 0 and r_tev1.find('\\"stay\\"') >= 0, "multi-tick trigger_events dropped enter/stay: " + r_tev1)
+    var r_tev1_dup = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":{}}}',
+        studio, assets, pool,
+    )
+    _assert(r_tev1_dup.find('\\"count\\":0') >= 0, "immediate re-query must return 0 events: " + r_tev1_dup)
+
+    # Move mover out of trigger -> exit on tick 1 + 4 more ticks via pie_control(step, ticks=5)
+    studio.app.world.get_ptr_mut[LocalTransform](studio.resolve_entity(mover_id)).value()[unsafe_offset=0].translation = Vec3(50.0, 1.5, 0.0)
+    studio._sync_ecs_and_physics()
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"step","ticks":5}}}',
+        studio, assets, pool,
+    )
+    var r_tev_exit = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":{}}}',
+        studio, assets, pool,
+    )
+    _assert(r_tev_exit.find('\\"exit\\"') >= 0, "pie_step(5) dropped exit event: " + r_tev_exit)
+
+    # Stop PIE -> exact hash & manual_state == -1, then fresh PIE session tests mid-PIE set_state & 3x render_editor_frame
+    var r_stop1 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"stop"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_stop1.find('\\"restored_exact\\":true') >= 0 and r_stop1.find(pre_pie_hash) >= 0, "stop1 hash mismatch: " + r_stop1)
+    _assert(studio.app.world.get_ptr[AnimatorComponent](g_ent).value()[].animator.manual_state == -1, "pie_stop must restore manual_state=-1")
+
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"play"}}}',
+        studio, assets, pool,
+    )
+    # Step 2 ticks so GraphActor starts in Idle (0), and Mover emits enter
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"step","ticks":2}}}',
+        studio, assets, pool,
+    )
+    _assert(studio.app.world.get_ptr[AnimatorComponent](g_ent).value()[].animator.state == 0, "expected Idle before mid-PIE set_state")
+    # 3x render_editor_frame swaps must NOT evict buffered trigger events
+    studio.render_editor_frame(160, 120)
+    studio.render_editor_frame(160, 120)
+    studio.render_editor_frame(160, 120)
+    var r_tev_ren = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"physics.trigger_events","arguments":{}}}',
+        studio, assets, pool,
+    )
+    _assert(r_tev_ren.find('\\"enter\\"') >= 0, "3x render_editor_frame dropped enter event: " + r_tev_ren)
+
+    # Mid-PIE anim.set_state(Run, playing=true) -> stays Run and advances clip_time
+    var r_mid = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"anim.set_state","arguments":{"entity_id":' + String(g_eid) + ',"state":"Run","playing":true}}}',
+        studio, assets, pool,
+    )
+    _assert(r_mid.find('\\"ok\\":true') >= 0, "mid-PIE set_state failed: " + r_mid)
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"step","ticks":3}}}',
+        studio, assets, pool,
+    )
+    ref ac_mid = studio.app.world.get_ptr[AnimatorComponent](g_ent).value()[unsafe_offset=0]
+    _assert(ac_mid.animator.state == 1 and ac_mid.animator.manual_state == 1, "mid-PIE AnimGraphDef reverted")
+    _assert(ac_mid.animator.clip_time > Float32(0.0), "playing=true must advance clip_time")
+
+    var r_stop2 = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"stop"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_stop2.find('\\"restored_exact\\":true') >= 0 and r_stop2.find(pre_pie_hash) >= 0, "stop2 hash mismatch: " + r_stop2)
+
+    studio.shutdown()
+    _rm_rf_tmp(ws)
+    print("    [OK] M5b r2 regressions (AnimGraphDef anim.set_state, trigger_events ring, QOA validation, asset.import JSON) passed!")
+
+
+def test_t_m3_studio_menu_and_mcp_project_package(tmp_root: String, mut pool: JobPool) raises:
+    print("  [t] Testing F27b Studio Build->Package menu, SceneAssetResolver fallback & MCP project.package...")
+    var proj = tmp_root + "/m3_pkg_proj"
+    var no_toml = tmp_root + "/no_toml_dir"
+    var outside = tmp_root + "/outside_pkg"
+    _rm_rf_tmp(proj)
+    _rm_rf_tmp(no_toml)
+    _rm_rf_tmp(outside)
+    _ = make_dirs(proj + "/src")
+    _ = make_dirs(proj + "/assets")
+    _ = make_dirs(no_toml)
+    _ = make_dirs(outside)
+
+    _assert(
+        _mcp_write_text_p(
+            proj + "/flint.toml",
+            '[project]\nname = "m3_pkg_proj"\nversion = "0.1.0"\nentry = "src/main.mojo"\n\n[engine]\nflint_version = ">=5.0"\ndeterministic_fp = true\nwerror = true\n\n[assets]\npack_output = "build/assets.flpk"\n',
+        ),
+        "write flint.toml",
+    )
+    _assert(_mcp_write_text_p(proj + "/assets/hello.json", '{"hello":"m3"}\n'), "write hello.json")
+    _assert(_mcp_write_text_p(proj + "/src/main.mojo", "def main():\n    pass\n"), "write minimal main.mojo")
+
+    # 1. SceneMenu detects flint.toml without FLINT_STUDIO_IDE_LAUNCHER
+    _assert(not scene_menu.SceneMenu(no_toml).has_project, "empty dir must have has_project=False")
+    var studio = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_0_HEADLESS_SIMD,
+        width=1280,
+        height=720,
+        worker_threads=0,
+        project_root=proj,
+    )
+    _assert(studio.menu.has_project, "SceneMenu(project_root) must detect flint.toml")
+    _assert(len(studio.menu.bar.groups) >= 8, "SceneMenu must have Build group index 7")
+    _assert(studio.menu.bar.groups[7].title == "Build", "group 7 must be Build")
+    _assert(studio.menu.bar.groups[7].items[0].command == scene_menu.PACKAGE, "Build item 0 must be PACKAGE")
+
+    var inp = InputState()
+    inp.begin_frame()
+    _ = studio.handle_command_menu(inp, 1280, 720)
+    _assert(studio.menu.bar.groups[7].items[0].enabled, "Build->Package must be enabled in edit mode")
+    _assert(studio.pie_play(), "pie_play must start")
+    _ = studio.handle_command_menu(inp, 1280, 720)
+    _assert(not studio.menu.bar.groups[7].items[0].enabled, "Build->Package must be disabled during PIE")
+    _ = studio.pie_stop()
+
+    # 2. _resolve_flint_launcher_path & package_project validation
+    var launcher = _resolve_flint_launcher_path()
+    _assert(launcher.endswith("/tools/flint.sh") and file_size(launcher) > 0, "launcher path not found: " + launcher)
+    _assert(not studio.package_project(profile="bad;name")[0], "invalid profile name must fail")
+    _assert(not studio.package_project(profile="release", target="spark")[0], "profile+target must fail")
+
+    # 3. SceneAssetResolver._read_glb_bytes_for_ref with loose_root ending in /assets
+    var mb_glb = MeshBuilder()
+    mb_glb.add_beveled_box(Vec3(0.0, 0.0, 0.0), Vec3(0.4, 0.4, 0.4))
+    var mdl_glb = NativeModel()
+    mdl_glb.meshes.append(mb_glb^.finish())
+    var raw_glb = encode_native_glb(mdl_glb)
+    _assert(write_bytes(proj + "/assets/prop.glb", raw_glb), "write prop.glb")
+
+    var assets = AssetServer(enable_watcher=False)
+    _ = assets.watch_loose_directory(proj + "/assets")
+    var got_glb = SceneAssetResolver._read_glb_bytes_for_ref(assets, AssetRef.from_path("assets/prop.glb", ASSET_KIND_MESH))
+    _assert(len(got_glb) == len(raw_glb), "SceneAssetResolver._read_glb_bytes_for_ref failed with /assets loose_root")
+
+    # 4. MCP project.package tool registration, traversal/symlink sandboxing, and valid package
+    var mcp = McpServerV2(workspace_root=proj)
+    _ = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m3-test"}}}',
+        studio, assets, pool,
+    )
+    var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}', studio, assets, pool)
+    _assert(r_list.find('"project.package"') >= 0, "tools/list missing project.package")
+    _assert(r_list.find('"scene.save"') >= 0 and r_list.find('"scene.load"') >= 0, "tools/list missing scene.save/load")
+
+    var sym_src = outside
+    var sym_dst = proj + "/sym_escape"
+    _assert(
+        external_call["symlink", Int32](sym_src.as_c_string_span(), sym_dst.as_c_string_span()) == Int32(0),
+        "symlink setup failed",
+    )
+
+    var bad_outs = List[String]()
+    bad_outs.append('"../escape_pkg"')
+    bad_outs.append('"' + outside + '/abs_escape"')
+    bad_outs.append('"sym_escape"')
+    bad_outs.append('"sym_escape/via_symlink"')
+    bad_outs.append('"."')
+    bad_outs.append('""')
+    bad_outs.append('"assets/hello.json"')
+    bad_outs.append("123")
+    for bi in range(len(bad_outs)):
+        var req = (
+            '{"jsonrpc":"2.0","id":'
+            + String(10 + bi)
+            + ',"method":"tools/call","params":{"name":"project.package","arguments":{"output_dir":'
+            + bad_outs[bi]
+            + "}}}"
+        )
+        var r_bad = mcp.handle_jsonrpc(req, studio, assets, pool)
+        _assert(
+            r_bad.find('"isError":true') >= 0 and r_bad.find('\\"ok\\":false') >= 0,
+            "bad output_dir must be rejected: " + bad_outs[bi] + " -> " + r_bad,
+        )
+    var r_bad_prof = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"project.package","arguments":{"output_dir":"dist/badp","profile":"bad$prof"}}}',
+        studio, assets, pool,
+    )
+    _assert(r_bad_prof.find('"isError":true') >= 0, "bad profile must be rejected")
+
+    var r_bad_tgt = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"project.package","arguments":{"output_dir":"dist/bad_tgt","target":"/etc/passwd"}}}',
+        studio, assets, pool,
+    )
+    _assert(
+        r_bad_tgt.find('"isError":true') >= 0 and r_bad_tgt.find('\\"ok\\":false') >= 0,
+        "target /etc/passwd must be rejected: " + r_bad_tgt,
+    )
+    _assert(not is_directory(proj + "/dist/bad_tgt/bin"), "bad target must not create output_dir/bin")
+
+    var r_no_args = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"project.package"}}',
+        studio, assets, pool,
+    )
+    _assert(
+        r_no_args.find('"isError":false') >= 0 and r_no_args.find('\\"ok\\":true') >= 0 and r_no_args.find("dist/package") >= 0,
+        "omitted arguments project.package failed: " + r_no_args,
+    )
+    _assert(file_size(proj + "/dist/package/run.sh") > 0, "missing default dist/package/run.sh")
+
+    var r_pkg = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"project.package","arguments":{"output_dir":"dist/unit_pkg"}}}',
+        studio, assets, pool,
+    )
+    _assert(
+        r_pkg.find('"isError":false') >= 0 and r_pkg.find('\\"ok\\":true') >= 0 and r_pkg.find("dist/unit_pkg") >= 0,
+        "valid project.package failed: " + r_pkg,
+    )
+    _assert(file_size(proj + "/dist/unit_pkg/run.sh") > 0, "missing packaged run.sh")
+    _assert(file_size(proj + "/dist/unit_pkg/assets.flpk") > 0, "missing packaged assets.flpk")
+    _assert(file_size(proj + "/dist/unit_pkg/MANIFEST.txt") > 0, "missing packaged MANIFEST.txt")
+    _assert(file_size(proj + "/build/package.log") > 0, "missing build/package.log")
+
+    # 5. Custom [assets] pak_path reporting in MCP project.package
+    var proj_custom = tmp_root + "/m3_custom_pak_proj"
+    _rm_rf_tmp(proj_custom)
+    _ = make_dirs(proj_custom + "/src")
+    _ = make_dirs(proj_custom + "/assets")
+    _assert(
+        _mcp_write_text_p(
+            proj_custom + "/flint.toml",
+            '[project]\nname = "m3_custom_pak_proj"\nversion = "0.1.0"\nentry = "src/main.mojo"\n\n[engine]\nflint_version = ">=5.0"\ndeterministic_fp = true\nwerror = true\n\n[assets]\npak_path = "build/custom_mcp.flpk"\n',
+        ),
+        "write custom pak flint.toml",
+    )
+    _assert(_mcp_write_text_p(proj_custom + "/assets/hello.json", '{"hello":"custom"}\n'), "write custom hello.json")
+    _assert(_mcp_write_text_p(proj_custom + "/src/main.mojo", "def main():\n    pass\n"), "write custom main.mojo")
+
+    var studio_c = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_0_HEADLESS_SIMD,
+        width=1280,
+        height=720,
+        worker_threads=0,
+        project_root=proj_custom,
+    )
+    var assets_c = AssetServer(enable_watcher=False)
+    var mcp_c = McpServerV2(workspace_root=proj_custom)
+    _ = mcp_c.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m3-custom-pak"}}}',
+        studio_c, assets_c, pool,
+    )
+    var r_custom = mcp_c.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"project.package","arguments":{"output_dir":"dist/custom_pkg"}}}',
+        studio_c, assets_c, pool,
+    )
+    _assert(
+        r_custom.find('"isError":false') >= 0
+        and r_custom.find('\\"ok\\":true') >= 0
+        and r_custom.find('\\"has_assets_flpk\\":true') >= 0
+        and r_custom.find("dist/custom_pkg/custom_mcp.flpk") >= 0,
+        "custom pak_path project.package must report has_assets_flpk:true and custom_mcp.flpk: " + r_custom,
+    )
+    _assert(file_size(proj_custom + "/dist/custom_pkg/custom_mcp.flpk") > 0, "missing custom_mcp.flpk")
+    _assert(file_size(proj_custom + "/dist/custom_pkg/run.sh") > 0, "missing custom run.sh")
+    _assert(file_size(proj_custom + "/dist/custom_pkg/MANIFEST.txt") > 0, "missing custom MANIFEST.txt")
+    assets_c.close()
+    studio_c.shutdown()
+    _rm_rf_tmp(proj_custom)
+
+    assets.close()
+    studio.shutdown()
+    _rm_rf_tmp(proj)
+    _rm_rf_tmp(no_toml)
+    _rm_rf_tmp(outside)
+    print("    [OK] F27b Studio Build->Package menu, SceneAssetResolver fallback & MCP project.package passed!")
+
+
+def _t5_str_bytes(s: String) -> List[UInt8]:
+    var src = s.as_bytes()
+    var out = List[UInt8](capacity=len(src))
+    for i in range(len(src)):
+        out.append(src[i])
+    return out^
+
+
+def test_u_mcp_pie_isolation_and_material_assign_ext(
+    tmp_root: String, mut pool: JobPool
+) raises:
+    var ws = tmp_root + "/mcp_pie_iso_ws"
+    _rm_rf_tmp(ws)
+    _ = make_dirs(ws + "/assets")
+    _ = make_dirs(ws + "/scenes")
+
+    var mat_bytes = _t5_str_bytes('{"format":"flmat","version":1,"base_color":[0.2,0.7,0.3],"roughness":0.4}')
+    _assert(write_bytes(ws + "/assets/valid.flmat", mat_bytes), "write valid.flmat")
+    var sneaky_bytes = _t5_str_bytes('{"name":"Sneaky"}')
+    _assert(write_bytes(ws + "/assets/sneaky.json", sneaky_bytes), "write sneaky.json")
+    var pf_bytes = _t5_str_bytes(
+        '{"format":"flprefab","version":1,"name":"PieBox","nodes":[{"name":"PieBox","parent_slot":-1,"components":{"LocalTransform":{"translation":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]}}}]}'
+    )
+    _assert(write_bytes(ws + "/assets/box.flprefab", pf_bytes), "write box.flprefab")
+
+    var studio = FlintStudioState(
+        headless=True,
+        render_tier=RENDER_TIER_0_HEADLESS_SIMD,
+        width=160,
+        height=120,
+        worker_threads=0,
+        project_root=ws,
+    )
+    var assets = AssetServer(enable_watcher=False)
+    assets.loose_root = ws
+    var mcp = McpServerV2(ws)
+
+    var r_sp = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ecs.spawn_entity","arguments":{"name":"Hero","position":[0.0,10.0,0.0],"mass":1.0}}}',
+        studio,
+        assets,
+        pool,
+    )
+    _assert(r_sp.find('\\"ok\\":true') >= 0, "spawn Hero failed: " + r_sp)
+    var hero_id = 0
+    _assert(len(studio.undo_stack) == 1, "expected undo_stack len == 1 after Hero spawn")
+
+    # 1. material.assign rejects non-.flmat extension while accepting valid .flmat
+    var r_bad_mat = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"material.assign","arguments":{"entity_id":0,"material_path":"assets/sneaky.json"}}}',
+        studio,
+        assets,
+        pool,
+    )
+    _assert(
+        r_bad_mat.find('"isError":true') >= 0 and r_bad_mat.find('\\"ok\\":false') >= 0,
+        "material.assign must reject .json extension: " + r_bad_mat,
+    )
+    var r_good_mat = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"material.assign","arguments":{"entity_id":0,"material_path":"assets/valid.flmat"}}}',
+        studio,
+        assets,
+        pool,
+    )
+    _assert(r_good_mat.find('\\"ok\\":true') >= 0, "material.assign valid .flmat failed: " + r_good_mat)
+    var pre_pie_hash = String(studio.state_hash())
+    var pre_undo_len = len(studio.undo_stack)
+
+    # 2. Enter PIE & step gravity so Hero falls
+    var r_play = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"play"}}}',
+        studio,
+        assets,
+        pool,
+    )
+    _assert(r_play.find('\\"pie_mode\\":\\"playing\\"') >= 0, "pie play failed")
+    var r_step = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"step","ticks":20}}}',
+        studio,
+        assets,
+        pool,
+    )
+    _assert(r_step.find('\\"ok\\":true') >= 0, "pie step failed")
+    _assert(studio.entities[hero_id].translation.y < Float32(9.8), "Hero did not fall during PIE")
+
+    # 3. All Edit-world mutating/saving/packaging MCP tools must fail cleanly during PIE
+    var pie_blocked_reqs: List[String] = [
+        '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"ecs.spawn_entity","arguments":{"name":"PieLeak"}}}',
+        '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"ecs.patch_components","arguments":{"entity_id":0,"name":"PieMutated"}}}',
+        '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"ecs.despawn_entity","arguments":{"entity_id":0}}}',
+        '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"procedural.generate_asset","arguments":{"preset":"crate","spawn_in_scene":true}}}',
+        '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"physics.step_deterministic","arguments":{"ticks":5}}}',
+        '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"studio.undo_redo","arguments":{"action":"undo","steps":1}}}',
+        '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"render.configure_npr_cel","arguments":{"entity_id":0,"shading_mode":"npr_cel"}}}',
+        '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/pie_leaked.flscn"}}}',
+        '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/pie_leaked.flscn"}}}',
+        '{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"scene.set_entity_enabled","arguments":{"entity_id":0,"enabled":false}}}',
+        '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"entity.set_transform","arguments":{"entity_id":0,"position":[99.0,0.0,0.0]}}}',
+        '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"material.assign","arguments":{"entity_id":0,"material_path":"assets/valid.flmat"}}}',
+        '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"prefab.spawn","arguments":{"prefab_path":"assets/box.flprefab"}}}',
+        '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"project.package","arguments":{"output_dir":"dist/pie_pkg"}}}',
+    ]
+    for ri in range(len(pie_blocked_reqs)):
+        var resp = mcp.handle_jsonrpc(pie_blocked_reqs[ri], studio, assets, pool)
+        _assert(
+            resp.find('"isError":true') >= 0 and resp.find('\\"ok\\":false') >= 0,
+            "PIE isolation failed for req " + String(ri) + ": " + resp,
+        )
+
+    _assert(file_size(ws + "/scenes/pie_leaked.flscn") < 0, "PIE scene.save leaked file to disk")
+    _assert(len(studio.undo_stack) == pre_undo_len, "PIE leaked entries into undo_stack")
+
+    # 4. Stop PIE -> exact state_hash restored & undo_stack uncorrupted
+    var r_stop = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"studio.pie_control","arguments":{"action":"stop"}}}',
+        studio,
+        assets,
+        pool,
+    )
+    _assert(
+        r_stop.find('\\"restored_exact\\":true') >= 0 and r_stop.find(pre_pie_hash) >= 0,
+        "pie_stop hash mismatch: " + r_stop,
+    )
+    _assert(len(studio.undo_stack) == pre_undo_len, "undo_stack length changed across PIE")
+    _assert(studio.undo(), "post-PIE undo() failed")
+    _assert(studio.live_entity_count() == 1 and studio.entities[hero_id].translation.y > Float32(9.9), "post-PIE undo corrupted Hero position")
+
+    assets.close()
+    studio.shutdown()
+    _rm_rf_tmp(ws)
+    print("    [OK] McpServerV2 PIE isolation & material.assign .flmat extension check passed!")
+
+
 def main() raises:
     var t0 = get_time()
     var pid = Int(external_call["getpid", Int32]())
@@ -4133,9 +5711,16 @@ def main() raises:
     test_l_cook_workspace_symlink_loop_bomb(tmp_root, pool)
     test_m_mcp_socket_path_stdlib_open_coexistence()
     test_n_os_read_bytes_dir_and_cooker_trailing_slash(tmp_root, pool)
+    test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root, pool)
+    test_p_mcp_v2_m1_assets_prefab_material_and_upload(tmp_root, pool)
+    test_q_glb_unoverridden_material_reload_parity(tmp_root)
+    test_r_mcp_v2_m2_runtime_tools(tmp_root, pool)
+    test_s_mcp_v2_m5b_r2_regressions(tmp_root, pool)
+    test_t_m3_studio_menu_and_mcp_project_package(tmp_root, pool)
+    test_u_mcp_pie_isolation_and_material_assign_ext(tmp_root, pool)
 
     pool.stop()
     _rm_rf_tmp(tmp_root)
 
     var elapsed_ms = (get_time() - t0) * 1000.0
-    print("[Flint v5 Track 5] ALL 14 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")
+    print("[Flint v5 Track 5] ALL 21 SUITES PASSED in " + String(Int(elapsed_ms)) + " ms!")

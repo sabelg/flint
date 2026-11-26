@@ -13,6 +13,9 @@ Provides:
   VAT crowd instances in `STAGE_LAST`, calls `renderer.render_world(...)` and
   clears `ui_draw_list`; calls `renderer.shutdown()` deterministically in `STAGE_SHUTDOWN`.
 """
+from std.collections import Dict, List
+from std.math import isfinite, max, min
+from flint.anim.plugin import AnimAssetCache, SkeletonComponent
 from flint.app.engine_app import (
     EngineApp,
     EnginePlugin,
@@ -23,10 +26,11 @@ from flint.app.engine_app import (
     STAGE_LAST,
     STAGE_SHUTDOWN,
 )
+from flint.assets.asset_ref import AssetRef
 from flint.assets.json import JsonDocument
 from flint.core.jobs import JobPool
 from flint.core.math import Mat4, Vec3
-from flint.core.serial import BlobReader, BlobWriter, fourcc
+from flint.core.serial import BlobReader, BlobWriter, fnv64, fourcc
 from flint.ecs.world import (
     Entity,
     ParallelCommands,
@@ -35,6 +39,19 @@ from flint.ecs.world import (
     comp_hash64,
 )
 from flint.render.aaa_clustered_lights import AaaClusterLight
+from flint.render.aaa_renderer import AaaSkinnedMeshEntry
+from flint.render.aaa_skinning_rt import DualQuat
+from flint.render.material_graph import (
+    MaterialAsset,
+    MAT_DOMAIN_CLEARCOAT,
+    MAT_DOMAIN_STANDARD_PBR,
+    MAT_DOMAIN_SUBSURFACE_SKIN,
+    MAT_FLAG_ALPHA_MASKED,
+    MAT_FLAG_CLEARCOAT,
+    MAT_FLAG_EMISSIVE_BLOOM,
+    MAT_FLAG_SHEEN,
+    MAT_FLAG_SUBSURFACE,
+)
 from flint.render.render_world import (
     RENDER_TIER_2_AAA_VISBUFFER_RT,
     RenderCameraPacket,
@@ -77,8 +94,67 @@ def _read_vec3_json(doc: JsonDocument, node: Int, fallback: Vec3 = Vec3()) -> Ve
 
 
 # ---------------------------------------------------------------------------
-# Resource
+# Resource & Binary Hook Helpers
 # ---------------------------------------------------------------------------
+
+def _render_bin_write[C: SerializableComponent](comp_addr: Int, writer_addr: Int):
+    ref comp = Pointer[C, ImmutAnyOrigin](unsafe_from_address=comp_addr)[unsafe_offset=0]
+    ref out = Pointer[BlobWriter, MutAnyOrigin](unsafe_from_address=writer_addr)[unsafe_offset=0]
+    out.begin(C.SCHEMA_FOURCC, C.SCHEMA_VERSION)
+    comp.write_bin(out)
+    out.end()
+
+
+def _render_bin_read[C: SerializableComponent](comp_addr: Int, reader_addr: Int) -> Bool:
+    ref reader = Pointer[BlobReader, MutAnyOrigin](unsafe_from_address=reader_addr)[unsafe_offset=0]
+    try:
+        var ver = reader.enter(C.SCHEMA_FOURCC, C.SCHEMA_VERSION)
+        var val = C.read_bin(reader, ver)
+        reader.leave()
+        var dst = Pointer[C, MutAnyOrigin](unsafe_from_address=comp_addr)
+        __get_address_as_uninit_lvalue(dst._mlir_value) = val^
+        return True
+    except:
+        return False
+
+
+def _register_non_trivial_render[C: SerializableComponent](mut world: World):
+    var tid = world.register_component[C]()
+    comptime is_triv = C.__copy_ctor_is_trivial and C.__move_ctor_is_trivial and C.__del__is_trivial
+    if not is_triv and tid >= 0 and not world.components[tid].has_custom_bin:
+        world.set_component_binary_hooks(
+            tid, _render_bin_write[C], _render_bin_read[C]
+        )
+
+
+struct _OverrideSlotCacheEntry(Copyable, Movable):
+    var slot_id: Int
+    var base_mat_id: Int
+    var last_base_mat_sig: UInt64
+    var last_ov: MaterialOverrideComponent
+    var last_seen_frame: UInt64
+
+    def __init__(
+        out self,
+        slot_id: Int,
+        base_mat_id: Int,
+        last_base_mat_sig: UInt64,
+        var last_ov: MaterialOverrideComponent,
+        last_seen_frame: UInt64,
+    ):
+        self.slot_id = slot_id
+        self.base_mat_id = base_mat_id
+        self.last_base_mat_sig = last_base_mat_sig
+        self.last_ov = last_ov^
+        self.last_seen_frame = last_seen_frame
+
+    def __init__(out self, *, copy: Self):
+        self.slot_id = copy.slot_id
+        self.base_mat_id = copy.base_mat_id
+        self.last_base_mat_sig = copy.last_base_mat_sig
+        self.last_ov = copy.last_ov.copy()
+        self.last_seen_frame = copy.last_seen_frame
+
 
 struct RenderPluginStateResource(Resource, Movable):
     """Owns `RenderExtractor`, `UiDrawList`, optional `TerrainClipmapPacket`, and stats."""
@@ -88,6 +164,21 @@ struct RenderPluginStateResource(Resource, Movable):
     var terrain_clipmap: TerrainClipmapPacket
     var rendered_frames: UInt64
     var last_render_ok: Bool
+    var extra_lights: List[AaaClusterLight]
+    var override_slots: Dict[UInt64, _OverrideSlotCacheEntry]
+    var free_override_slots: List[Int]
+    var editor_camera_override: Bool
+    var editor_camera: RenderCameraPacket
+    var has_editor_camera: Bool
+    var studio_override_mat_ids: Dict[UInt64, Int]
+    var entity_smear_scales: Dict[UInt64, Vec3]
+    var skinned_sync_count: Int
+    var skinned_entries: Dict[UInt64, AaaSkinnedMeshEntry]
+    var skinned_model_ids: Dict[UInt64, UInt64]
+    var skinned_invalidated: Dict[UInt64, Bool]
+    var preview_bone_palettes: Dict[UInt64, List[DualQuat]]
+    var preview_prev_bone_palettes: Dict[UInt64, List[DualQuat]]
+    var preview_world_transforms: Dict[UInt64, Mat4]
 
     def __init__(out self):
         self.extractor = RenderExtractor()
@@ -95,24 +186,41 @@ struct RenderPluginStateResource(Resource, Movable):
         self.terrain_clipmap = TerrainClipmapPacket()
         self.rendered_frames = 0
         self.last_render_ok = True
+        self.extra_lights = List[AaaClusterLight]()
+        self.override_slots = Dict[UInt64, _OverrideSlotCacheEntry]()
+        self.free_override_slots = List[Int]()
+        self.editor_camera_override = False
+        self.editor_camera = RenderCameraPacket()
+        self.has_editor_camera = False
+        self.studio_override_mat_ids = Dict[UInt64, Int]()
+        self.entity_smear_scales = Dict[UInt64, Vec3]()
+        self.skinned_sync_count = 0
+        self.skinned_entries = Dict[UInt64, AaaSkinnedMeshEntry]()
+        self.skinned_model_ids = Dict[UInt64, UInt64]()
+        self.skinned_invalidated = Dict[UInt64, Bool]()
+        self.preview_bone_palettes = Dict[UInt64, List[DualQuat]]()
+        self.preview_prev_bone_palettes = Dict[UInt64, List[DualQuat]]()
+        self.preview_world_transforms = Dict[UInt64, Mat4]()
 
 
 # ---------------------------------------------------------------------------
 # 5 Serializable ECS Render Components
 # ---------------------------------------------------------------------------
 
-struct MeshRendererComponent(SerializableComponent, ImplicitlyCopyable):
-    """Renderable mesh instance referencing registered `mesh_id` & `material_id`."""
+struct MeshRendererComponent(SerializableComponent):
+    """Renderable mesh instance referencing registered `mesh_id` & `material_id` + `AssetRef`s."""
     comptime COMPONENT_ID: UInt64 = comp_hash64("flint.render.MeshRendererComponent")
     comptime STORAGE_MODE: Int = STORAGE_TABLE
     comptime SCHEMA_NAME: StaticString = "MeshRendererComponent"
     comptime SCHEMA_FOURCC: UInt32 = fourcc("RMSH")
-    comptime SCHEMA_VERSION: Int = 1
+    comptime SCHEMA_VERSION: Int = 2
 
     var mesh_id: Int
     var material_id: Int
     var cast_shadows: Bool
     var visible: Bool
+    var mesh_ref: AssetRef
+    var material_ref: AssetRef
 
     def __init__(
         out self,
@@ -120,28 +228,46 @@ struct MeshRendererComponent(SerializableComponent, ImplicitlyCopyable):
         material_id: Int = -1,
         cast_shadows: Bool = True,
         visible: Bool = True,
+        var mesh_ref: AssetRef = AssetRef(),
+        var material_ref: AssetRef = AssetRef(),
     ):
         self.mesh_id = mesh_id
         self.material_id = material_id
         self.cast_shadows = cast_shadows
         self.visible = visible
+        self.mesh_ref = mesh_ref^
+        self.material_ref = material_ref^
+
+    def __init__(out self, *, copy: Self):
+        self.mesh_id = copy.mesh_id
+        self.material_id = copy.material_id
+        self.cast_shadows = copy.cast_shadows
+        self.visible = copy.visible
+        self.mesh_ref = copy.mesh_ref.copy()
+        self.material_ref = copy.material_ref.copy()
 
     def write_bin(self, mut out: BlobWriter):
         out.integer(self.mesh_id)
         out.integer(self.material_id)
         out.boolean(self.cast_shadows)
         out.boolean(self.visible)
+        self.mesh_ref.write_bin(out)
+        self.material_ref.write_bin(out)
 
     @staticmethod
     def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
-        _ = version
         var mid = reader.integer()
         var mat = reader.integer()
         var cs = reader.boolean()
         var vis = reader.boolean()
+        var mref = AssetRef()
+        var matref = AssetRef()
+        if version >= 2:
+            mref = AssetRef.read_bin(reader, 1)
+            matref = AssetRef.read_bin(reader, 1)
         if reader.failed:
             raise Error("MeshRendererComponent: truncated blob")
-        return Self(mid, mat, cs, vis)
+        return Self(mid, mat, cs, vis, mref^, matref^)
 
     def write_json(self) -> String:
         return (
@@ -149,6 +275,8 @@ struct MeshRendererComponent(SerializableComponent, ImplicitlyCopyable):
             + ", \"material_id\": " + String(self.material_id)
             + ", \"cast_shadows\": " + ("true" if self.cast_shadows else "false")
             + ", \"visible\": " + ("true" if self.visible else "false")
+            + ", \"mesh_ref\": " + self.mesh_ref.write_json()
+            + ", \"material_ref\": " + self.material_ref.write_json()
             + "}"
         )
 
@@ -158,7 +286,11 @@ struct MeshRendererComponent(SerializableComponent, ImplicitlyCopyable):
         var mat = doc.integer(doc.object_get(node, "material_id"), -1)
         var cs = doc.boolean(doc.object_get(node, "cast_shadows"), True)
         var vis = doc.boolean(doc.object_get(node, "visible"), True)
-        return Self(mid, mat, cs, vis)
+        var mr_node = doc.object_get(node, "mesh_ref")
+        var mref = AssetRef.read_json(doc, mr_node) if mr_node >= 0 else AssetRef()
+        var mat_node = doc.object_get(node, "material_ref")
+        var matref = AssetRef.read_json(doc, mat_node) if mat_node >= 0 else AssetRef()
+        return Self(mid, mat, cs, vis, mref^, matref^)
 
 
 struct CameraComponent(SerializableComponent, ImplicitlyCopyable):
@@ -288,13 +420,13 @@ struct PointLightComponent(SerializableComponent, ImplicitlyCopyable):
         return Self(rad, r, en)
 
 
-struct MaterialOverrideComponent(SerializableComponent, ImplicitlyCopyable):
+struct MaterialOverrideComponent(SerializableComponent):
     """Per-entity material ID and PBR parameter override."""
     comptime COMPONENT_ID: UInt64 = comp_hash64("flint.render.MaterialOverrideComponent")
     comptime STORAGE_MODE: Int = STORAGE_TABLE
     comptime SCHEMA_NAME: StaticString = "MaterialOverrideComponent"
     comptime SCHEMA_FOURCC: UInt32 = fourcc("RMAT")
-    comptime SCHEMA_VERSION: Int = 1
+    comptime SCHEMA_VERSION: Int = 3
 
     var material_id: Int
     var base_color: Vec3
@@ -302,6 +434,13 @@ struct MaterialOverrideComponent(SerializableComponent, ImplicitlyCopyable):
     var metallic: Float32
     var emissive: Vec3
     var enabled: Bool
+    var opacity: Float32
+    var alpha_cutoff: Float32
+    var clearcoat: Float32
+    var clearcoat_roughness: Float32
+    var sheen: Float32
+    var subsurface: Float32
+    var material_ref: AssetRef
 
     def __init__(
         out self,
@@ -311,6 +450,13 @@ struct MaterialOverrideComponent(SerializableComponent, ImplicitlyCopyable):
         metallic: Float32 = 0.0,
         emissive: Vec3 = Vec3(),
         enabled: Bool = True,
+        opacity: Float32 = 1.0,
+        alpha_cutoff: Float32 = 0.0,
+        clearcoat: Float32 = 0.0,
+        clearcoat_roughness: Float32 = 0.08,
+        sheen: Float32 = 0.0,
+        subsurface: Float32 = 0.0,
+        var material_ref: AssetRef = AssetRef(),
     ):
         self.material_id = material_id
         self.base_color = base_color
@@ -318,6 +464,28 @@ struct MaterialOverrideComponent(SerializableComponent, ImplicitlyCopyable):
         self.metallic = metallic
         self.emissive = emissive
         self.enabled = enabled
+        self.opacity = opacity
+        self.alpha_cutoff = alpha_cutoff
+        self.clearcoat = clearcoat
+        self.clearcoat_roughness = clearcoat_roughness
+        self.sheen = sheen
+        self.subsurface = subsurface
+        self.material_ref = material_ref^
+
+    def __init__(out self, *, copy: Self):
+        self.material_id = copy.material_id
+        self.base_color = copy.base_color
+        self.roughness = copy.roughness
+        self.metallic = copy.metallic
+        self.emissive = copy.emissive
+        self.enabled = copy.enabled
+        self.opacity = copy.opacity
+        self.alpha_cutoff = copy.alpha_cutoff
+        self.clearcoat = copy.clearcoat
+        self.clearcoat_roughness = copy.clearcoat_roughness
+        self.sheen = copy.sheen
+        self.subsurface = copy.subsurface
+        self.material_ref = copy.material_ref.copy()
 
     def write_bin(self, mut out: BlobWriter):
         out.integer(self.material_id)
@@ -326,19 +494,41 @@ struct MaterialOverrideComponent(SerializableComponent, ImplicitlyCopyable):
         out.f32(self.metallic)
         out.vec3(self.emissive)
         out.boolean(self.enabled)
+        out.f32(self.opacity)
+        out.f32(self.alpha_cutoff)
+        out.f32(self.clearcoat)
+        out.f32(self.clearcoat_roughness)
+        out.f32(self.sheen)
+        out.f32(self.subsurface)
+        self.material_ref.write_bin(out)
 
     @staticmethod
     def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
-        _ = version
         var mid = reader.integer()
         var bc = reader.vec3()
         var rg = reader.f32()
         var mt = reader.f32()
         var em = reader.vec3()
         var en = reader.boolean()
+        var op = Float32(1.0)
+        var ac = Float32(0.0)
+        var cc = Float32(0.0)
+        var ccr = Float32(0.08)
+        var sh = Float32(0.0)
+        var sss = Float32(0.0)
+        var mref = AssetRef()
+        if version >= 2:
+            op = reader.f32()
+            ac = reader.f32()
+            cc = reader.f32()
+            ccr = reader.f32()
+            sh = reader.f32()
+            sss = reader.f32()
+        if version >= 3:
+            mref = AssetRef.read_bin(reader, 1)
         if reader.failed:
             raise Error("MaterialOverrideComponent: truncated blob")
-        return Self(mid, bc, rg, mt, em, en)
+        return Self(mid, bc, rg, mt, em, en, op, ac, cc, ccr, sh, sss, mref^)
 
     def write_json(self) -> String:
         return (
@@ -348,6 +538,13 @@ struct MaterialOverrideComponent(SerializableComponent, ImplicitlyCopyable):
             + ", \"metallic\": " + _f32_s(self.metallic)
             + ", \"emissive\": " + _vec3_json(self.emissive)
             + ", \"enabled\": " + ("true" if self.enabled else "false")
+            + ", \"opacity\": " + _f32_s(self.opacity)
+            + ", \"alpha_cutoff\": " + _f32_s(self.alpha_cutoff)
+            + ", \"clearcoat\": " + _f32_s(self.clearcoat)
+            + ", \"clearcoat_roughness\": " + _f32_s(self.clearcoat_roughness)
+            + ", \"sheen\": " + _f32_s(self.sheen)
+            + ", \"subsurface\": " + _f32_s(self.subsurface)
+            + ", \"material_ref\": " + self.material_ref.write_json()
             + "}"
         )
 
@@ -359,7 +556,15 @@ struct MaterialOverrideComponent(SerializableComponent, ImplicitlyCopyable):
         var mt = Float32(doc.number(doc.object_get(node, "metallic"), 0.0))
         var em = _read_vec3_json(doc, doc.object_get(node, "emissive"), Vec3())
         var en = doc.boolean(doc.object_get(node, "enabled"), True)
-        return Self(mid, bc, rg, mt, em, en)
+        var op = Float32(doc.number(doc.object_get(node, "opacity"), 1.0))
+        var ac = Float32(doc.number(doc.object_get(node, "alpha_cutoff"), 0.0))
+        var cc = Float32(doc.number(doc.object_get(node, "clearcoat"), 0.0))
+        var ccr = Float32(doc.number(doc.object_get(node, "clearcoat_roughness"), 0.08))
+        var sh = Float32(doc.number(doc.object_get(node, "sheen"), 0.0))
+        var sss = Float32(doc.number(doc.object_get(node, "subsurface"), 0.0))
+        var mat_node = doc.object_get(node, "material_ref")
+        var mref = AssetRef.read_json(doc, mat_node) if mat_node >= 0 else AssetRef()
+        return Self(mid, bc, rg, mt, em, en, op, ac, cc, ccr, sh, sss, mref^)
 
 
 struct VatCrowdComponent(SerializableComponent, ImplicitlyCopyable):
@@ -427,26 +632,182 @@ struct VatCrowdComponent(SerializableComponent, ImplicitlyCopyable):
         return Self(cid, ph, ph, mat, vis)
 
 
+struct EnvironmentComponent(SerializableComponent, ImplicitlyCopyable):
+    """Directional sun, atmosphere, IBL intensity, and camera exposure settings."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.render.EnvironmentComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "EnvironmentComponent"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("RENV")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var sun_dir: Vec3
+    var sun_radiance: Vec3
+    var exposure: Float32
+    var ibl_intensity: Float32
+    var turbidity: Float32
+    var enabled: Bool
+
+    def __init__(
+        out self,
+        sun_dir: Vec3 = Vec3(0.378803, 0.797480, -0.458551),
+        sun_radiance: Vec3 = Vec3(3.2, 3.0, 2.7),
+        exposure: Float32 = 1.0,
+        ibl_intensity: Float32 = 1.0,
+        turbidity: Float32 = 2.5,
+        enabled: Bool = True,
+    ):
+        self.sun_dir = sun_dir
+        self.sun_radiance = sun_radiance
+        self.exposure = exposure
+        self.ibl_intensity = ibl_intensity
+        self.turbidity = turbidity
+        self.enabled = enabled
+
+    def write_bin(self, mut out: BlobWriter):
+        out.vec3(self.sun_dir)
+        out.vec3(self.sun_radiance)
+        out.f32(self.exposure)
+        out.f32(self.ibl_intensity)
+        out.f32(self.turbidity)
+        out.boolean(self.enabled)
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        _ = version
+        var sd = reader.vec3()
+        var sr = reader.vec3()
+        var exp = reader.f32()
+        var ibl = reader.f32()
+        var turb = reader.f32()
+        var en = reader.boolean()
+        if reader.failed:
+            raise Error("EnvironmentComponent: truncated blob")
+        return Self(sd, sr, exp, ibl, turb, en)
+
+    def write_json(self) -> String:
+        return (
+            "{\"sun_dir\": " + _vec3_json(self.sun_dir)
+            + ", \"sun_radiance\": " + _vec3_json(self.sun_radiance)
+            + ", \"exposure\": " + _f32_s(self.exposure)
+            + ", \"ibl_intensity\": " + _f32_s(self.ibl_intensity)
+            + ", \"turbidity\": " + _f32_s(self.turbidity)
+            + ", \"enabled\": " + ("true" if self.enabled else "false")
+            + "}"
+        )
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        var sd = _read_vec3_json(
+            doc, doc.object_get(node, "sun_dir"), Vec3(0.378803, 0.797480, -0.458551)
+        )
+        var sr = _read_vec3_json(
+            doc, doc.object_get(node, "sun_radiance"), Vec3(3.2, 3.0, 2.7)
+        )
+        var exp = Float32(doc.number(doc.object_get(node, "exposure"), 1.0))
+        var ibl = Float32(doc.number(doc.object_get(node, "ibl_intensity"), 1.0))
+        var turb = Float32(doc.number(doc.object_get(node, "turbidity"), 2.5))
+        var en = doc.boolean(doc.object_get(node, "enabled"), True)
+        return Self(sd, sr, exp, ibl, turb, en)
+
+
+struct SpotLightComponent(SerializableComponent, ImplicitlyCopyable):
+    """Clustered spot light extracted as `AaaClusterLight.spot`."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.render.SpotLightComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "SpotLightComponent"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("RSPT")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var radiance: Vec3
+    var range: Float32
+    var inner_deg: Float32
+    var outer_deg: Float32
+    var direction: Vec3
+    var enabled: Bool
+
+    def __init__(
+        out self,
+        radiance: Vec3 = Vec3(8.0, 6.0, 4.0),
+        range: Float32 = 18.0,
+        inner_deg: Float32 = 18.0,
+        outer_deg: Float32 = 35.0,
+        direction: Vec3 = Vec3(0.0, 0.0, -1.0),
+        enabled: Bool = True,
+    ):
+        self.radiance = radiance
+        self.range = range
+        self.inner_deg = inner_deg
+        self.outer_deg = outer_deg
+        self.direction = direction
+        self.enabled = enabled
+
+    def write_bin(self, mut out: BlobWriter):
+        out.vec3(self.radiance)
+        out.f32(self.range)
+        out.f32(self.inner_deg)
+        out.f32(self.outer_deg)
+        out.vec3(self.direction)
+        out.boolean(self.enabled)
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        _ = version
+        var rad = reader.vec3()
+        var rng = reader.f32()
+        var inn = reader.f32()
+        var out_d = reader.f32()
+        var dir = reader.vec3()
+        var en = reader.boolean()
+        if reader.failed:
+            raise Error("SpotLightComponent: truncated blob")
+        return Self(rad, rng, inn, out_d, dir, en)
+
+    def write_json(self) -> String:
+        return (
+            "{\"radiance\": " + _vec3_json(self.radiance)
+            + ", \"range\": " + _f32_s(self.range)
+            + ", \"inner_deg\": " + _f32_s(self.inner_deg)
+            + ", \"outer_deg\": " + _f32_s(self.outer_deg)
+            + ", \"direction\": " + _vec3_json(self.direction)
+            + ", \"enabled\": " + ("true" if self.enabled else "false")
+            + "}"
+        )
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        var rad = _read_vec3_json(doc, doc.object_get(node, "radiance"), Vec3(8.0, 6.0, 4.0))
+        var rng = Float32(doc.number(doc.object_get(node, "range"), 18.0))
+        var inn = Float32(doc.number(doc.object_get(node, "inner_deg"), 18.0))
+        var out_d = Float32(doc.number(doc.object_get(node, "outer_deg"), 35.0))
+        var dir = _read_vec3_json(doc, doc.object_get(node, "direction"), Vec3(0.0, 0.0, -1.0))
+        var en = doc.boolean(doc.object_get(node, "enabled"), True)
+        return Self(rad, rng, inn, out_d, dir, en)
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
 def register_render_components(mut world: World):
-    """Idempotently registers all 5 render components on `world`."""
-    _ = world.register_component[MeshRendererComponent]()
+    """Idempotently registers all 7 render components + custom binary hooks on `world`."""
+    _register_non_trivial_render[MeshRendererComponent](world)
     _ = world.register_component[CameraComponent]()
     _ = world.register_component[PointLightComponent]()
-    _ = world.register_component[MaterialOverrideComponent]()
+    _register_non_trivial_render[MaterialOverrideComponent](world)
     _ = world.register_component[VatCrowdComponent]()
+    _ = world.register_component[EnvironmentComponent]()
+    _ = world.register_component[SpotLightComponent]()
 
 
 def register_render_codecs(mut reg: ComponentRegistry):
-    """Registers all 5 render `SerializableComponent` codecs on `ComponentRegistry`."""
+    """Registers all 7 render `SerializableComponent` codecs on `ComponentRegistry`."""
     reg.register[MeshRendererComponent]()
     reg.register[CameraComponent]()
     reg.register[PointLightComponent]()
     reg.register[MaterialOverrideComponent]()
     reg.register[VatCrowdComponent]()
+    reg.register[EnvironmentComponent]()
+    reg.register[SpotLightComponent]()
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +823,117 @@ def _interpolated_gt(world: World, entity: Entity, alpha: Float32) -> GlobalTran
     if prev_opt:
         return interpolate_global_transform(prev_opt.value()[unsafe_offset=0].value, curr, alpha)
     return curr.copy()
+
+
+def _ov_equals(a: MaterialOverrideComponent, b: MaterialOverrideComponent) -> Bool:
+    return (
+        a.material_id == b.material_id
+        and a.base_color.x == b.base_color.x
+        and a.base_color.y == b.base_color.y
+        and a.base_color.z == b.base_color.z
+        and a.roughness == b.roughness
+        and a.metallic == b.metallic
+        and a.emissive.x == b.emissive.x
+        and a.emissive.y == b.emissive.y
+        and a.emissive.z == b.emissive.z
+        and a.enabled == b.enabled
+        and a.opacity == b.opacity
+        and a.alpha_cutoff == b.alpha_cutoff
+        and a.clearcoat == b.clearcoat
+        and a.clearcoat_roughness == b.clearcoat_roughness
+        and a.sheen == b.sheen
+        and a.subsurface == b.subsurface
+        and a.material_ref == b.material_ref
+    )
+
+
+def _material_asset_sig(renderer: ScalableRenderer, base_mat_id: Int) -> UInt64:
+    if base_mat_id < 0 or base_mat_id >= len(renderer.materials):
+        return 0
+    ref m = renderer.materials[base_mat_id]
+    var w = BlobWriter()
+    w.integer(Int(m.albedo_slot))
+    w.integer(Int(m.normal_slot))
+    w.integer(Int(m.orm_slot))
+    w.integer(Int(m.emissive_slot))
+    w.integer(Int(m.detail_normal_slot))
+    w.u32(m.domain)
+    w.u32(m.flags)
+    w.vec3(m.base_color)
+    w.f32(m.roughness)
+    w.f32(m.metallic)
+    w.vec3(m.emissive)
+    w.f32(m.opacity)
+    w.f32(m.alpha_cutoff)
+    w.f32(m.clearcoat)
+    w.f32(m.clearcoat_roughness)
+    w.vec3(m.sheen_color)
+    w.f32(m.subsurface_amount)
+    var h = fnv64(w.data)
+    return h if h != 0 else UInt64(1)
+
+
+def build_overridden_material(
+    renderer: ScalableRenderer, base_mat_id: Int, ov: MaterialOverrideComponent
+) -> MaterialAsset:
+    var mat = (
+        renderer.materials[base_mat_id].copy()
+        if (base_mat_id >= 0 and base_mat_id < len(renderer.materials))
+        else MaterialAsset()
+    )
+    mat.base_color = Vec3(
+        ov.base_color.x if isfinite(ov.base_color.x) else mat.base_color.x,
+        ov.base_color.y if isfinite(ov.base_color.y) else mat.base_color.y,
+        ov.base_color.z if isfinite(ov.base_color.z) else mat.base_color.z,
+    )
+    if isfinite(ov.roughness):
+        mat.roughness = max(Float32(0.04), min(Float32(1.0), ov.roughness))
+    if isfinite(ov.metallic):
+        mat.metallic = max(Float32(0.0), min(Float32(1.0), ov.metallic))
+    mat.emissive = Vec3(
+        max(Float32(0.0), ov.emissive.x) if isfinite(ov.emissive.x) else mat.emissive.x,
+        max(Float32(0.0), ov.emissive.y) if isfinite(ov.emissive.y) else mat.emissive.y,
+        max(Float32(0.0), ov.emissive.z) if isfinite(ov.emissive.z) else mat.emissive.z,
+    )
+    if isfinite(ov.opacity):
+        mat.opacity = max(Float32(0.0), min(Float32(1.0), ov.opacity))
+    if isfinite(ov.alpha_cutoff):
+        mat.alpha_cutoff = max(Float32(0.0), min(Float32(1.0), ov.alpha_cutoff))
+    if isfinite(ov.clearcoat):
+        mat.clearcoat = max(Float32(0.0), min(Float32(1.0), ov.clearcoat))
+    if isfinite(ov.clearcoat_roughness):
+        mat.clearcoat_roughness = max(Float32(0.04), min(Float32(1.0), ov.clearcoat_roughness))
+    if isfinite(ov.sheen):
+        var sh = max(Float32(0.0), min(Float32(1.0), ov.sheen))
+        mat.sheen_color = Vec3(sh, sh, sh)
+        if sh > Float32(0.01):
+            mat.flags |= MAT_FLAG_SHEEN
+        else:
+            mat.flags &= ~MAT_FLAG_SHEEN
+    if isfinite(ov.subsurface):
+        var sss = max(Float32(0.0), min(Float32(1.0), ov.subsurface))
+        mat.subsurface_amount = sss
+        if sss > Float32(0.01):
+            mat.flags |= MAT_FLAG_SUBSURFACE
+            if mat.domain == MAT_DOMAIN_STANDARD_PBR:
+                mat.domain = MAT_DOMAIN_SUBSURFACE_SKIN
+        else:
+            mat.flags &= ~MAT_FLAG_SUBSURFACE
+    if mat.alpha_cutoff > Float32(0.01):
+        mat.flags |= MAT_FLAG_ALPHA_MASKED
+    else:
+        mat.flags &= ~MAT_FLAG_ALPHA_MASKED
+    if mat.clearcoat > Float32(0.01):
+        mat.flags |= MAT_FLAG_CLEARCOAT
+        if mat.domain == MAT_DOMAIN_STANDARD_PBR:
+            mat.domain = MAT_DOMAIN_CLEARCOAT
+    else:
+        mat.flags &= ~MAT_FLAG_CLEARCOAT
+    if mat.emissive.x + mat.emissive.y + mat.emissive.z > Float32(0.01):
+        mat.flags |= MAT_FLAG_EMISSIVE_BLOOM
+    else:
+        mat.flags &= ~MAT_FLAG_EMISSIVE_BLOOM
+    return mat^
 
 
 def _sys_render_extract_and_draw(
@@ -499,28 +971,154 @@ def _sys_render_extract_and_draw(
     if state.terrain_clipmap.active:
         render_world.terrain_clipmap = state.terrain_clipmap.copy()
 
-    # 1. Extract active CameraComponent
-    var cam_mask = world.bit_for[CameraComponent]().union(world.bit_for[GlobalTransform]())
-    var cam_entities = world.query_entities(cam_mask)
-    for i in range(len(cam_entities)):
-        var e = cam_entities[i]
-        var cam_opt = world.get_ptr[CameraComponent](e)
-        if not cam_opt or not cam_opt.value()[unsafe_offset=0].active:
-            continue
-        ref cam = cam_opt.value()[unsafe_offset=0]
-        var gt = _interpolated_gt(world, e, alpha)
-        var eye = gt.translation
-        var off = cam.look_target_offset
-        if off.length_squared() <= Float32(1.0e-8):
-            off = Vec3(0.0, 0.0, -1.0)
-        var target = eye + gt.rotation.rotate(off)
-        var up = gt.rotation.rotate(Vec3(0.0, 1.0, 0.0)).normalized()
-        render_world.camera = RenderCameraPacket(
-            eye, target, up, cam.fov_y_deg, cam.near_z, cam.far_z, cam.exposure
-        )
-        break
+    # 1. Extract active CameraComponent (unless Edit-mode camera override is active)
+    if state.editor_camera_override:
+        if state.has_editor_camera:
+            render_world.camera = state.editor_camera
+    else:
+        var cam_mask = world.bit_for[CameraComponent]().union(world.bit_for[GlobalTransform]())
+        var cam_entities = world.query_entities(cam_mask)
+        for i in range(len(cam_entities)):
+            var e = cam_entities[i]
+            var cam_opt = world.get_ptr[CameraComponent](e)
+            if not cam_opt or not cam_opt.value()[unsafe_offset=0].active:
+                continue
+            ref cam = cam_opt.value()[unsafe_offset=0]
+            var gt = _interpolated_gt(world, e, alpha)
+            var eye = gt.translation
+            var off = cam.look_target_offset
+            if off.length_squared() <= Float32(1.0e-8):
+                off = Vec3(0.0, 0.0, -1.0)
+            var target = eye + gt.rotation.rotate(off)
+            var up = gt.rotation.rotate(Vec3(0.0, 1.0, 0.0)).normalized()
+            render_world.camera = RenderCameraPacket(
+                eye, target, up, cam.fov_y_deg, cam.near_z, cam.far_z, cam.exposure
+            )
+            break
 
-    # 2. Extract MeshRendererComponents (+ MaterialOverrideComponent)
+    # 1.5 Sync Skinned Meshes (SkeletonComponent -> per-entity DualQuat bone palette)
+    if world.component_id[SkeletonComponent]() >= 0:
+        var anim_cache_opt = resources.get_ptr[AnimAssetCache]()
+        if anim_cache_opt:
+            ref anim_cache = anim_cache_opt.value()[unsafe_offset=0]
+            var sk_mask = world.bit_for[SkeletonComponent]()
+            var sk_entities = world.query_entities(sk_mask)
+            for si in range(len(sk_entities)):
+                var se = sk_entities[si]
+                var sk_opt = world.get_ptr[SkeletonComponent](se)
+                if not sk_opt:
+                    continue
+                ref sk = sk_opt.value()[unsafe_offset=0]
+                var skey = se.to_bits()
+                var prev_pal_opt = state.preview_bone_palettes.get(skey)
+                if sk.model_id == 0:
+                    continue
+                var m_idx = anim_cache.find_model(sk.model_id)
+                if m_idx < 0:
+                    continue
+                ref model = anim_cache.models[m_idx]
+                if len(model.skins) == 0 or len(model.meshes) == 0:
+                    continue
+                ref skin = model.skins[0]
+                var nj = len(skin.joints)
+                if nj == 0:
+                    continue
+                var inv_opt = state.skinned_invalidated.get(skey)
+                var is_invalidated = Bool(inv_opt) and inv_opt.value()
+                var need_alloc = True
+                var cur_mid_opt = state.skinned_model_ids.get(skey)
+                if (
+                    (not is_invalidated)
+                    and cur_mid_opt
+                    and cur_mid_opt.value() == sk.model_id
+                    and state.skinned_entries.get(skey)
+                ):
+                    need_alloc = False
+                if is_invalidated:
+                    state.skinned_invalidated[skey] = False
+                if need_alloc:
+                    var src_mesh_idx = 0
+                    for mi in range(len(model.meshes)):
+                        var mv = model.meshes[mi].vertex_count()
+                        if mv > 0 and len(model.meshes[mi].joints) >= mv * 4 and len(model.meshes[mi].weights) >= mv * 4:
+                            src_mesh_idx = mi
+                            break
+                    var mat_id = 0
+                    var mc_mut = world.get_ptr_mut[MeshRendererComponent](se)
+                    if mc_mut and mc_mut.value()[unsafe_offset=0].material_id >= 0:
+                        mat_id = mc_mut.value()[unsafe_offset=0].material_id
+                    elif len(renderer.materials) == 0:
+                        mat_id = renderer.register_material(MaterialAsset())
+                    var sk_entry = renderer.add_skinned_mesh(
+                        model.meshes[src_mesh_idx], mat_id, bone_count=nj
+                    )
+                    if mc_mut:
+                        mc_mut.value()[unsafe_offset=0].mesh_id = sk_entry.mesh_entry.mesh_id
+                    state.skinned_entries[skey] = sk_entry^
+                    state.skinned_model_ids[skey] = sk.model_id
+
+                var sk_entry_opt = state.skinned_entries.get(skey)
+                if sk_entry_opt:
+                    var mc_mut = world.get_ptr_mut[MeshRendererComponent](se)
+                    if mc_mut:
+                        mc_mut.value()[unsafe_offset=0].mesh_id = sk_entry_opt.value().mesh_entry.mesh_id
+                    if prev_pal_opt:
+                        var prev_p_opt = state.preview_prev_bone_palettes.get(skey)
+                        var prev_list = prev_p_opt.value().copy() if prev_p_opt else prev_pal_opt.value().copy()
+                        renderer.update_skinned_mesh_bones(
+                            sk_entry_opt.value(),
+                            prev_pal_opt.value(),
+                            prev_list,
+                            defer_to_frame=True,
+                        )
+                        state.skinned_sync_count += 1
+                    else:
+                        var cur_bones = List[DualQuat](capacity=nj)
+                        var prev_bones = List[DualQuat](capacity=nj)
+                        var n_wm = len(sk.skeleton.world_matrices)
+                        if n_wm > 0:
+                            var has_prev_wm = len(sk.skeleton.prev_world_matrices) == n_wm
+                            for j in range(nj):
+                                var jn = skin.joints[j]
+                                var wm = sk.skeleton.world_matrices[jn].copy() if (jn >= 0 and jn < n_wm) else Mat4()
+                                var pm = (
+                                    sk.skeleton.prev_world_matrices[jn].copy()
+                                    if (has_prev_wm and jn >= 0 and jn < n_wm)
+                                    else wm.copy()
+                                )
+                                var ibm = Mat4()
+                                if (j + 1) * 16 <= len(skin.inverse_bind):
+                                    for k in range(16):
+                                        ibm.values[k] = skin.inverse_bind[j * 16 + k]
+                                cur_bones.append(DualQuat.from_mat4(wm.multiply(ibm)))
+                                prev_bones.append(DualQuat.from_mat4(pm.multiply(ibm)))
+                        elif sk.skeleton.node_count > 0 and len(model.nodes) > 0:
+                            var tmp_skel = sk.skeleton.copy()
+                            tmp_skel.ensure_topology(model)
+                            tmp_skel.update_matrices(model)
+                            var tn_wm = len(tmp_skel.world_matrices)
+                            for j in range(nj):
+                                var jn = skin.joints[j]
+                                var wm = tmp_skel.world_matrices[jn].copy() if (jn >= 0 and jn < tn_wm) else Mat4()
+                                var ibm = Mat4()
+                                if (j + 1) * 16 <= len(skin.inverse_bind):
+                                    for k in range(16):
+                                        ibm.values[k] = skin.inverse_bind[j * 16 + k]
+                                var dq = DualQuat.from_mat4(wm.multiply(ibm))
+                                cur_bones.append(dq)
+                                prev_bones.append(dq)
+                        else:
+                            for _ in range(nj):
+                                var dq = DualQuat()
+                                cur_bones.append(dq)
+                                prev_bones.append(dq)
+                        renderer.update_skinned_mesh_bones(
+                            sk_entry_opt.value(), cur_bones, prev_bones, defer_to_frame=True
+                        )
+                        state.skinned_sync_count += 1
+
+    # 2. Extract MeshRendererComponents (+ isolated per-entity MaterialOverrideComponent slots)
+    var frame_tag = state.rendered_frames + 1
     var mesh_mask = world.bit_for[MeshRendererComponent]().union(world.bit_for[GlobalTransform]())
     var mesh_entities = world.query_entities(mesh_mask)
     for i in range(len(mesh_entities)):
@@ -529,29 +1127,86 @@ def _sys_render_extract_and_draw(
         if not mc_opt or not mc_opt.value()[unsafe_offset=0].visible:
             continue
         ref mc = mc_opt.value()[unsafe_offset=0]
+        var key = e.to_bits()
         var eff_mat = mc.material_id
-        var ov_opt = world.get_ptr[MaterialOverrideComponent](e)
-        if ov_opt and ov_opt.value()[unsafe_offset=0].enabled:
-            ref ov = ov_opt.value()[unsafe_offset=0]
-            if ov.material_id >= 0:
-                eff_mat = ov.material_id
-            if eff_mat >= 0 and eff_mat < len(renderer.materials):
-                renderer.materials[eff_mat].base_color = ov.base_color
-                renderer.materials[eff_mat].roughness = ov.roughness
-                renderer.materials[eff_mat].metallic = ov.metallic
-                renderer.materials[eff_mat].emissive = ov.emissive
-                if renderer.uses_vulkan():
-                    renderer.gpu_slot[0].update_material_asset(eff_mat, renderer.materials[eff_mat])
+        var studio_mat_opt = state.studio_override_mat_ids.get(key)
+        if studio_mat_opt:
+            eff_mat = studio_mat_opt.value()
+        else:
+            var ov_opt = world.get_ptr[MaterialOverrideComponent](e)
+            if ov_opt and ov_opt.value()[unsafe_offset=0].enabled:
+                ref ov = ov_opt.value()[unsafe_offset=0]
+                var base_mat_id = ov.material_id if ov.material_id >= 0 else mc.material_id
+                if base_mat_id < 0 and mc.mesh_id >= 0 and mc.mesh_id < len(renderer.cpu_mesh_materials):
+                    base_mat_id = renderer.cpu_mesh_materials[mc.mesh_id]
+                var base_mat_sig = _material_asset_sig(renderer, base_mat_id)
+                var cached_opt = state.override_slots.get(key)
+                if (
+                    cached_opt
+                    and cached_opt.value().slot_id >= 0
+                    and cached_opt.value().slot_id < len(renderer.materials)
+                ):
+                    var entry = cached_opt.value().copy()
+                    entry.last_seen_frame = frame_tag
+                    if (
+                        entry.base_mat_id != base_mat_id
+                        or entry.last_base_mat_sig != base_mat_sig
+                        or not _ov_equals(entry.last_ov, ov)
+                    ):
+                        var mat = build_overridden_material(renderer, base_mat_id, ov)
+                        renderer.update_material_asset_deferred(entry.slot_id, mat)
+                        entry.base_mat_id = base_mat_id
+                        entry.last_base_mat_sig = base_mat_sig
+                        entry.last_ov = ov.copy()
+                    eff_mat = entry.slot_id
+                    state.override_slots[key] = entry^
+                else:
+                    var mat = build_overridden_material(renderer, base_mat_id, ov)
+                    var slot_id = -1
+                    while len(state.free_override_slots) > 0:
+                        var cand = state.free_override_slots.pop()
+                        if cand >= 0 and cand < len(renderer.materials):
+                            slot_id = cand
+                            renderer.update_material_asset_deferred(slot_id, mat)
+                            break
+                    if slot_id < 0:
+                        slot_id = renderer.register_material(mat)
+                    if slot_id >= 0:
+                        state.override_slots[key] = _OverrideSlotCacheEntry(
+                            slot_id, base_mat_id, base_mat_sig, ov.copy(), frame_tag
+                        )
+                        eff_mat = slot_id
 
         var gt = _interpolated_gt(world, e, alpha)
+        var prev_wm_opt = state.preview_world_transforms.get(key)
+        var world_mat = prev_wm_opt.value().copy() if prev_wm_opt else gt.matrix.copy()
+        var sm_opt = state.entity_smear_scales.get(key)
+        if sm_opt:
+            var sm = sm_opt.value()
+            var sm_mat = Mat4()
+            sm_mat.set(0, 0, sm.x)
+            sm_mat.set(1, 1, sm.y)
+            sm_mat.set(2, 2, sm.z)
+            world_mat = world_mat.multiply(sm_mat)
         state.extractor.extract_entity(
             render_world,
-            e.to_bits(),
+            key,
             mc.mesh_id,
-            gt.matrix.copy(),
+            world_mat,
             eff_mat,
             mc.cast_shadows,
         )
+
+    var stale_ov_keys = List[UInt64]()
+    for item in state.override_slots.items():
+        if item.value.last_seen_frame != frame_tag:
+            stale_ov_keys.append(item.key)
+    for ki in range(len(stale_ov_keys)):
+        var popped = state.override_slots.pop(
+            stale_ov_keys[ki], _OverrideSlotCacheEntry(-1, -1, 0, MaterialOverrideComponent(), 0)
+        )
+        if popped.slot_id >= 0:
+            state.free_override_slots.append(popped.slot_id)
 
     # 3. Extract VatCrowdComponents
     var vat_mask = world.bit_for[VatCrowdComponent]().union(world.bit_for[GlobalTransform]())
@@ -573,7 +1228,27 @@ def _sys_render_extract_and_draw(
             vc.material_id,
         )
 
-    # 4. Extract PointLightComponents
+    # 4. Extract PointLightComponents, SpotLightComponents & EnvironmentComponent
+    var env_mask = world.bit_for[EnvironmentComponent]()
+    var env_entities = world.query_entities(env_mask)
+    for i in range(len(env_entities)):
+        var ec_opt = world.get_ptr[EnvironmentComponent](env_entities[i])
+        if not ec_opt or not ec_opt.value()[unsafe_offset=0].enabled:
+            continue
+        ref ec = ec_opt.value()[unsafe_offset=0]
+        if ec.sun_dir.length_squared() > Float32(1.0e-8):
+            render_world.sun_dir = ec.sun_dir.normalized()
+        render_world.sun_radiance = Vec3(
+            max(Float32(0.0), ec.sun_radiance.x) if isfinite(ec.sun_radiance.x) else render_world.sun_radiance.x,
+            max(Float32(0.0), ec.sun_radiance.y) if isfinite(ec.sun_radiance.y) else render_world.sun_radiance.y,
+            max(Float32(0.0), ec.sun_radiance.z) if isfinite(ec.sun_radiance.z) else render_world.sun_radiance.z,
+        )
+        if isfinite(ec.ibl_intensity):
+            render_world.ibl_intensity = max(Float32(0.0), ec.ibl_intensity)
+        if isfinite(ec.exposure):
+            render_world.camera.exposure = max(Float32(0.01), ec.exposure)
+        break
+
     var lgt_mask = world.bit_for[PointLightComponent]().union(world.bit_for[GlobalTransform]())
     var lgt_entities = world.query_entities(lgt_mask)
     for i in range(len(lgt_entities)):
@@ -587,10 +1262,44 @@ def _sys_render_extract_and_draw(
             AaaClusterLight.point(gt.translation, lc.radiance, lc.radius)
         )
 
+    var spot_mask = world.bit_for[SpotLightComponent]().union(world.bit_for[GlobalTransform]())
+    var spot_entities = world.query_entities(spot_mask)
+    for i in range(len(spot_entities)):
+        var e = spot_entities[i]
+        var sc_opt = world.get_ptr[SpotLightComponent](e)
+        if not sc_opt or not sc_opt.value()[unsafe_offset=0].enabled:
+            continue
+        ref sc = sc_opt.value()[unsafe_offset=0]
+        var gt = _interpolated_gt(world, e, alpha)
+        var local_dir = (
+            sc.direction if sc.direction.length_squared() > Float32(1.0e-8) else Vec3(0.0, 0.0, -1.0)
+        )
+        var world_dir = gt.rotation.rotate(local_dir).normalized()
+        render_world.cluster_lights.append(
+            AaaClusterLight.spot(
+                gt.translation,
+                world_dir,
+                sc.radiance,
+                sc.range,
+                sc.inner_deg,
+                sc.outer_deg,
+            )
+        )
+
+    for li in range(len(state.extra_lights)):
+        render_world.cluster_lights.append(state.extra_lights[li].copy())
+
     state.extractor.end_extraction()
     state.last_render_ok = renderer.render_world(render_world, state.ui_draw_list)
     state.rendered_frames += 1
     state.ui_draw_list.clear()
+    state.extra_lights.clear()
+    state.studio_override_mat_ids.clear()
+    state.entity_smear_scales.clear()
+    state.preview_bone_palettes.clear()
+    state.preview_prev_bone_palettes.clear()
+    state.preview_world_transforms.clear()
+    render_world.overlay_lines.clear()
 
 
 def _sys_render_shutdown(
@@ -654,11 +1363,13 @@ struct RenderPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
         var b_mesh = app.world.bit_for[MeshRendererComponent]()
         var b_cam = app.world.bit_for[CameraComponent]()
         var b_lgt = app.world.bit_for[PointLightComponent]()
+        var b_spot = app.world.bit_for[SpotLightComponent]()
+        var b_env = app.world.bit_for[EnvironmentComponent]()
         var b_mat = app.world.bit_for[MaterialOverrideComponent]()
         var b_vat = app.world.bit_for[VatCrowdComponent]()
         var all_reads = (
             b_gt.union(b_prev).union(b_mesh).union(b_cam)
-            .union(b_lgt).union(b_mat).union(b_vat)
+            .union(b_lgt).union(b_spot).union(b_env).union(b_mat).union(b_vat)
         )
 
         if not _has_render_system(app, STAGE_LAST, "flint.render.extract_and_draw"):

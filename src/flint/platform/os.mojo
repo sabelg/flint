@@ -1,4 +1,4 @@
-"""Native Linux operating-system services used by SHARDDEPTH.
+"""Native Linux operating-system services used by Flint Engine.
 
 Only system calls and the C ABI exported by the host C runtime are touched here.
 No third-party compatibility library is linked into the game.
@@ -186,10 +186,8 @@ def write_file_durable(path: String, mut data: List[UInt8], fault: Int = FAULT_N
 
 
 def player_save_directory() -> String:
-    """FLINT_SAVE_DIR (with legacy SD_SAVE_DIR fallback), then $XDG_DATA_HOME/flint, then ~/.local/share/flint."""
+    """FLINT_SAVE_DIR, then $XDG_DATA_HOME/flint, then ~/.local/share/flint."""
     var chosen = env_value("FLINT_SAVE_DIR")
-    if chosen.byte_length() == 0:
-        chosen = env_value("SD_SAVE_DIR")
     if chosen.byte_length() > 0:
         return chosen
     var data_home = env_value("XDG_DATA_HOME")
@@ -201,6 +199,119 @@ def player_save_directory() -> String:
 def close_fd(fd: Int):
     if fd >= 0:
         _ = external_call["close", Int32](Int32(fd))
+
+
+def run_process_redirected(
+    args: List[String],
+    cwd: String = "",
+    log_path: String = "",
+) -> Int32:
+    """Forks and executes `args[0]` via `execv(3)`, optionally changing to `cwd`,
+    redirecting stdin to `/dev/null` and stdout/stderr to `log_path` (fallback `/dev/null`),
+    and waiting synchronously. Returns exit code (0..255), 128+sig on signal, or -1 on error."""
+    if len(args) == 0 or args[0].byte_length() == 0:
+        return Int32(-1)
+
+    var arg_buf = List[UInt8]()
+    var offsets = List[Int](capacity=len(args))
+    for i in range(len(args)):
+        offsets.append(len(arg_buf))
+        var sb = args[i].as_bytes()
+        for j in range(len(sb)):
+            arg_buf.append(sb[j])
+        arg_buf.append(0)
+
+    var base_addr = Int(arg_buf.unsafe_ptr())
+    var ptrs = List[Int](capacity=len(args) + 1)
+    for i in range(len(args)):
+        ptrs.append(base_addr + offsets[i])
+    ptrs.append(0)
+
+    var cwd_buf = List[UInt8]()
+    if cwd.byte_length() > 0:
+        var cb = cwd.as_bytes()
+        for i in range(len(cb)):
+            cwd_buf.append(cb[i])
+        cwd_buf.append(0)
+
+    var log_buf = List[UInt8]()
+    if log_path.byte_length() > 0:
+        var lb = log_path.as_bytes()
+        for i in range(len(lb)):
+            log_buf.append(lb[i])
+        log_buf.append(0)
+
+    var devnull_buf = List[UInt8](capacity=10)
+    var dn = String("/dev/null")
+    var dnb = dn.as_bytes()
+    for i in range(len(dnb)):
+        devnull_buf.append(dnb[i])
+    devnull_buf.append(0)
+
+    var status_buf = List[Int32](length=1, fill=0)
+    var pid = external_call["fork", Int32]()
+    if pid == Int32(0):
+        if len(cwd_buf) > 0:
+            if external_call["chdir", Int32](cwd_buf.unsafe_ptr()) != Int32(0):
+                external_call["_exit", NoneType](Int32(126))
+        var in_fd = external_call["openat", Int32](Int32(-100), devnull_buf.unsafe_ptr(), Int32(0), Int32(0))
+        if in_fd >= Int32(0):
+            _ = external_call["dup2", Int32](in_fd, Int32(0))
+            if in_fd > Int32(2):
+                _ = external_call["close", Int32](in_fd)
+        var out_fd = Int32(-1)
+        if len(log_buf) > 0:
+            out_fd = external_call["openat", Int32](
+                Int32(-100), log_buf.unsafe_ptr(), Int32(1 | 64 | 512), Int32(420)
+            )
+        if out_fd < Int32(0):
+            out_fd = external_call["openat", Int32](Int32(-100), devnull_buf.unsafe_ptr(), Int32(1), Int32(0))
+        if out_fd >= Int32(0):
+            _ = external_call["dup2", Int32](out_fd, Int32(1))
+            _ = external_call["dup2", Int32](out_fd, Int32(2))
+            if out_fd > Int32(2):
+                _ = external_call["close", Int32](out_fd)
+        _ = external_call["close_range", Int32](UInt32(3), UInt32(0xFFFFFFFF), UInt32(0))
+        _ = external_call["execv", Int32](arg_buf.unsafe_ptr(), ptrs.unsafe_ptr())
+        external_call["_exit", NoneType](Int32(127))
+
+    if pid < Int32(0):
+        _ = len(arg_buf)
+        _ = len(offsets)
+        _ = len(ptrs)
+        _ = len(cwd_buf)
+        _ = len(log_buf)
+        _ = len(devnull_buf)
+        _ = len(status_buf)
+        return Int32(-1)
+
+    while True:
+        var w = external_call["waitpid", Int32](pid, status_buf.unsafe_ptr(), Int32(0))
+        if w == pid:
+            break
+        if w < Int32(0) and last_errno() == EINTR:
+            continue
+        _ = len(arg_buf)
+        _ = len(offsets)
+        _ = len(ptrs)
+        _ = len(cwd_buf)
+        _ = len(log_buf)
+        _ = len(devnull_buf)
+        _ = len(status_buf)
+        return Int32(-1)
+
+    var st = status_buf[0]
+    _ = len(arg_buf)
+    _ = len(offsets)
+    _ = len(ptrs)
+    _ = len(cwd_buf)
+    _ = len(log_buf)
+    _ = len(devnull_buf)
+    _ = len(status_buf)
+    var sig = st & Int32(0x7F)
+    if sig == Int32(0):
+        return (st >> Int32(8)) & Int32(0xFF)
+    return Int32(128) + sig
 
 
 def _fstat_regular_size(fd: Int) -> Int:
@@ -255,6 +366,53 @@ def is_symlink(path: String) -> Bool:
     )[unsafe_offset=0]
     _ = len(buf)
     return (mode & S_IFMT) == S_IFLNK
+
+
+def is_directory(path: String, follow_symlinks: Bool = False) -> Bool:
+    """Returns True if `path` is a directory (`S_IFMT == S_IFDIR`).
+    By default uses `lstat` (symlink-safe: returns False for symlinks to avoid traversal cycles)."""
+    if path.byte_length() == 0:
+        return False
+    var clean = path
+    while clean.byte_length() > 1 and clean.as_bytes()[clean.byte_length() - 1] == 47:
+        var trimmed = String(clean[byte=0 : clean.byte_length() - 1])
+        clean = trimmed^
+    comptime STAT_MODE_OFF: Int = 24 if CompilationTarget.is_x86() else 16
+    comptime S_IFMT: UInt32 = 0o170000
+    comptime S_IFDIR: UInt32 = 0o040000
+    var buf = List[UInt8](length=256, fill=0)
+    var rc = (
+        external_call["stat", Int32](clean.as_c_string_span(), buf.unsafe_ptr())
+        if follow_symlinks
+        else external_call["lstat", Int32](clean.as_c_string_span(), buf.unsafe_ptr())
+    )
+    if rc != 0:
+        return False
+    var mode = Pointer[UInt32, ImmutAnyOrigin](
+        unsafe_from_address=Int(buf.unsafe_ptr()) + STAT_MODE_OFF
+    )[unsafe_offset=0]
+    _ = len(buf)
+    return (mode & S_IFMT) == S_IFDIR
+
+
+def real_path(path: String) -> Tuple[Bool, String]:
+    """Resolves `path` via `realpath(3)` (requires `path` to exist). Returns `(ok, resolved)`."""
+    if path.byte_length() == 0:
+        return (False, String())
+    var owned = path
+    var resolved = List[UInt8](length=4096, fill=0)
+    var got = external_call["realpath", Int](owned.as_c_string_span(), resolved.unsafe_ptr())
+    if got == 0:
+        return (False, String())
+    var out = List[UInt8]()
+    var p = resolved.unsafe_ptr()
+    for i in range(4096):
+        var b = p[unsafe_offset=i]
+        if b == 0:
+            break
+        out.append(b)
+    _ = len(resolved)
+    return (True, String(unsafe_from_utf8=out))
 
 
 def file_stamp(path: String) -> Tuple[Int, Int]:

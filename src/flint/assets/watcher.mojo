@@ -95,6 +95,17 @@ struct AssetWatcher(Movable):
         if enabled and root_dir.byte_length() > 0:
             _ = self.watch_recursive(root_dir)
 
+    def __init__(out self, *, deinit move: Self):
+        self.fd = move.fd
+        self.watch_descriptors = move.watch_descriptors^
+        self.watch_folders = move.watch_folders^
+        self.watch_roots = move.watch_roots^
+        self.extensions = move.extensions^
+        self.pending_paths = move.pending_paths^
+        self.first_event_at = move.first_event_at
+        self.last_event_at = move.last_event_at
+        self.enabled = move.enabled
+
     def __deinit__(deinit self):
         if self.fd >= 0:
             close_fd(Int(self.fd))

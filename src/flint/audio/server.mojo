@@ -18,7 +18,7 @@ Architecture:
     headless `render_offline_quantum(mut out_lr, frames)`.
 """
 from std.atomic import Atomic
-from std.collections import List
+from std.collections import Dict, List
 from std.ffi import external_call
 from std.math import sin, cos, sqrt, exp, log10, floor, abs, atan2, isnan, isinf, isfinite
 from std.memory import bitcast
@@ -26,9 +26,9 @@ from std.sys import size_of
 from flint.core.math import Vec3
 from flint.app.engine_app import Resource
 from flint.ecs.world import comp_hash64
-from flint.platform.os import close_fd
+from flint.platform.os import close_fd, read_bytes
 from flint.platform.pulse import PulseClient
-from flint.platform.audio import WavClip, alsa_open_pcm, alsa_write_interleaved, alsa_close_pcm
+from flint.platform.audio import WavClip, alsa_open_pcm, alsa_write_interleaved, alsa_close_pcm, decode_wav
 from flint.platform.dsp import (
     CytomicSVF,
     StereoReverbFDN,
@@ -1765,6 +1765,10 @@ struct AudioRtEngine(Movable):
                     self.emitters[i].active = False
                 for v in range(MAX_PHYSICAL_VOICES):
                     self.voices[v].active = False
+                self.active_logical_local = 0
+                self.active_physical_local = 0
+                self._telem_ptr(_TELEM_LOGICAL)[unsafe_offset=0].store(0)
+                self._telem_ptr(_TELEM_PHYSICAL)[unsafe_offset=0].store(0)
 
     def _free_unconsumed_ring_payloads(mut self):
         var cmd = AudioCmd()
@@ -2654,6 +2658,7 @@ struct AudioServer(Resource, Movable):
     var caller_next_asset_id: Int
     var caller_next_bus_id: Int
     var caller_next_stem_id: Int
+    var path_cache: Dict[String, Int]
 
     def __init__(
         out self,
@@ -2679,6 +2684,7 @@ struct AudioServer(Resource, Movable):
         self.caller_next_asset_id = 0
         self.caller_next_bus_id = DEFAULT_BUS_COUNT
         self.caller_next_stem_id = 0
+        self.path_cache = Dict[String, Int]()
 
     def __moveinit__(out self, deinit existing: Self):
         """Relocates ONLY the 8-byte `rt_core_addr` pointer and caller counters;
@@ -2694,6 +2700,7 @@ struct AudioServer(Resource, Movable):
         self.caller_next_asset_id = existing.caller_next_asset_id
         self.caller_next_bus_id = existing.caller_next_bus_id
         self.caller_next_stem_id = existing.caller_next_stem_id
+        self.path_cache = existing.path_cache^
 
     @always_inline
     def _rt_core(self) -> Pointer[AudioRtEngine, MutAnyOrigin]:
@@ -2835,7 +2842,11 @@ struct AudioServer(Resource, Movable):
         self._enqueue_guaranteed(cmd)
         return aid
 
-    def register_wav_asset(mut self, wav: WavClip) -> Int:
+    def register_wav_asset(mut self, wav: WavClip, path: String = "") -> Int:
+        if path.byte_length() > 0:
+            var cached = self.path_cache.get(path)
+            if cached:
+                return cached.value()
         if not wav.valid:
             var aid = self.caller_next_asset_id
             self.caller_next_asset_id += 1
@@ -2846,16 +2857,24 @@ struct AudioServer(Resource, Movable):
             _pack_ptr_into_cmd(cmd, Int(boxed))
             self._enqueue_guaranteed(cmd)
             return aid
-        return self.register_pcm16_asset(
+        var aid = self.register_pcm16_asset(
             wav.samples, wav.channels, wav.sample_rate
         )
+        if path.byte_length() > 0:
+            self.path_cache[path] = aid
+        return aid
 
-    def register_qoa_asset(mut self, var qoa_bytes: List[UInt8]) -> Int:
+    def register_qoa_asset(mut self, var qoa_bytes: List[UInt8], path: String = "") -> Int:
+        if path.byte_length() > 0:
+            var cached = self.path_cache.get(path)
+            if cached:
+                return cached.value()
         var aid = self.caller_next_asset_id
         self.caller_next_asset_id += 1
 
         var slot = AudioAssetSlot()
         var qa = QoaAsset.from_bytes(qoa_bytes^)
+        var is_ok = qa.valid
         if qa.valid:
             slot.valid = True
             slot.kind = ASSET_KIND_QOA
@@ -2870,7 +2889,44 @@ struct AudioServer(Resource, Movable):
         cmd.asset_id = Int32(aid)
         _pack_ptr_into_cmd(cmd, Int(boxed))
         self._enqueue_guaranteed(cmd)
+        if is_ok and path.byte_length() > 0:
+            self.path_cache[path] = aid
         return aid
+
+    def load_audio_bytes_cached(mut self, var raw: List[UInt8], path: String = "") -> Int:
+        """Decodes and caches raw `.wav` or `.qoa` audio bytes, returning `-1` on failure."""
+        if len(raw) == 0:
+            return -1
+        if path.byte_length() > 0:
+            var cached = self.path_cache.get(path)
+            if cached:
+                return cached.value()
+        var is_qoa = (
+            path.endswith(".qoa")
+            or path.endswith(".QOA")
+            or (len(raw) >= 4 and raw[0] == 113 and raw[1] == 111 and raw[2] == 97 and raw[3] == 102)
+        )
+        if is_qoa:
+            var probe = QoaAsset.from_bytes(raw.copy())
+            if not probe.valid:
+                return -1
+            return self.register_qoa_asset(raw^, path)
+        var wav = decode_wav(raw)
+        if not wav.valid:
+            return -1
+        return self.register_wav_asset(wav, path)
+
+    def load_audio_cached(mut self, path: String) -> Int:
+        """Loads and caches a `.wav` or `.qoa` audio asset by file path, returning `-1` on failure."""
+        if path.byte_length() == 0:
+            return -1
+        var cached = self.path_cache.get(path)
+        if cached:
+            return cached.value()
+        var raw = read_bytes(path)
+        if len(raw) == 0:
+            return -1
+        return self.load_audio_bytes_cached(raw^, path)
 
     # ---- Race-Free Bus & Stem Configuration (`CMD_ADD_BUS`, `CMD_CONFIG_BUS`) ----
 
@@ -3111,6 +3167,30 @@ struct AudioServer(Resource, Movable):
         cmd.slot = handle.slot
         cmd.generation = handle.generation
         return self._rt_core()[].cmd_ring.push(cmd)
+
+    def stop_all(mut self):
+        """Stops all active logical emitters and physical voices immediately (`active_logical_count() == 0`)."""
+        if self.rt_core_addr == 0:
+            return
+        var cmd = AudioCmd()
+        cmd.kind = ACMD_STOP_ALL
+        self._enqueue_guaranteed(cmd)
+        if self.rt_running:
+            if self._rt_core()[].headless_rt_mode:
+                var target_q = self.quantums_rendered() + 2
+                var ts = Array[Int64, 2](fill=0)
+                ts[1] = 200_000  # 0.2 ms
+                for _ in range(30):
+                    if self.quantums_rendered() >= target_q:
+                        break
+                    _ = external_call["nanosleep", Int32](Pointer(to=ts), Int(0))
+                    _ = ts[1]
+        else:
+            self._rt_core()[]._drain_commands()
+        self._rt_core()[].active_logical_local = 0
+        self._rt_core()[].active_physical_local = 0
+        self._rt_core()[]._telem_ptr(_TELEM_LOGICAL)[unsafe_offset=0].store(0)
+        self._rt_core()[]._telem_ptr(_TELEM_PHYSICAL)[unsafe_offset=0].store(0)
 
     def update_emitter(
         self,

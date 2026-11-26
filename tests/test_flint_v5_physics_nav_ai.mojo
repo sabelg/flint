@@ -106,6 +106,9 @@ from flint.physics.world import (
     TRIGGER_EXIT,
 )
 from flint.physics.character import CharacterController, CharacterControllerConfig
+from flint.app.engine_app import AppConfig, EngineApp
+from flint.physics.plugin import CharacterControllerComponent, PhysicsPlugin
+from flint.scene.transform_hierarchy import GlobalTransform, LocalTransform, PrevGlobalTransform, TransformPlugin
 from flint.nav import (
     NavMesh,
     NavMeshConfig,
@@ -3129,6 +3132,65 @@ def test_t_v4_phys_5_aero6dof_mecha_cobra_gerwalk_and_zem_apn_simd8() raises:
         assert_true(batch.min_range[lane] < Float32(4.0))
 
 
+def test_t5_kcc_local_transform_sync_no_teleport() raises:
+    var app = EngineApp(AppConfig(title="t5_kcc_lt_sync", headless=True, worker_threads=0))
+    app.add_plugin(TransformPlugin())
+    app.add_plugin(PhysicsPlugin(gravity=0.0))
+    app.startup()
+
+    var cfg = CharacterControllerConfig()
+    cfg.gravity = 0.0
+
+    # 1. Spawn with LocalTransform=(10, 1, 0) & default CharacterControllerComponent() -> must NOT teleport to (0, 1, 0)
+    var e1 = app.world.spawn()
+    _ = app.world.insert[LocalTransform](e1, LocalTransform(Vec3(10.0, 1.0, 0.0)))
+    _ = app.world.insert[GlobalTransform](e1, GlobalTransform())
+    _ = app.world.insert[PrevGlobalTransform](e1, PrevGlobalTransform())
+    var kc1_init = CharacterControllerComponent()
+    kc1_init.controller.cfg.gravity = 0.0
+    _ = app.world.insert[CharacterControllerComponent](e1, kc1_init^)
+
+    # 2. Spawn with LocalTransform=(0, 0, 0) & default CharacterControllerComponent() -> must stay at (0, 0, 0)
+    var e2 = app.world.spawn()
+    _ = app.world.insert[LocalTransform](e2, LocalTransform(Vec3(0.0, 0.0, 0.0)))
+    _ = app.world.insert[GlobalTransform](e2, GlobalTransform())
+    _ = app.world.insert[PrevGlobalTransform](e2, PrevGlobalTransform())
+    var kc2_init = CharacterControllerComponent()
+    kc2_init.controller.cfg.gravity = 0.0
+    _ = app.world.insert[CharacterControllerComponent](e2, kc2_init^)
+
+    # 3. Spawn with default LocalTransform=(0, 0, 0) & explicit non-default controller.pos=(5, 2, 0) -> preserves (5, 2, 0)
+    var e3 = app.world.spawn()
+    _ = app.world.insert[LocalTransform](e3, LocalTransform(Vec3(0.0, 0.0, 0.0)))
+    _ = app.world.insert[GlobalTransform](e3, GlobalTransform())
+    _ = app.world.insert[PrevGlobalTransform](e3, PrevGlobalTransform())
+    _ = app.world.insert[CharacterControllerComponent](
+        e3, CharacterControllerComponent(Vec3(5.0, 2.0, 0.0), cfg, Vec3())
+    )
+
+    app.step_one_frame(Float32(1.0 / 60.0))
+
+    var lt1 = app.world.get[LocalTransform](e1)
+    var kc1 = app.world.get_ptr[CharacterControllerComponent](e1).value()[unsafe_offset=0].controller.pos
+    assert_true(abs(lt1.translation.x - Float32(10.0)) < Float32(1.0e-4), "KCC teleported away from LocalTransform x=10")
+    assert_true(abs(lt1.translation.y - Float32(1.0)) < Float32(1.0e-2))
+    assert_true(abs(kc1.x - Float32(10.0)) < Float32(1.0e-4))
+
+    var lt2 = app.world.get[LocalTransform](e2)
+    assert_true(abs(lt2.translation.y) < Float32(1.0e-2), "KCC at origin teleported to default y=1.0")
+
+    var lt3 = app.world.get[LocalTransform](e3)
+    assert_true(abs(lt3.translation.x - Float32(5.0)) < Float32(1.0e-4), "Explicit controller.pos=(5,2,0) lost")
+
+    # 4. External LocalTransform teleport between frames propagates into KCC
+    app.world.get_ptr_mut[LocalTransform](e1).value()[unsafe_offset=0].translation = Vec3(25.0, 2.0, 0.0)
+    app.step_one_frame(Float32(1.0 / 60.0))
+    var lt1_tp = app.world.get[LocalTransform](e1)
+    assert_true(abs(lt1_tp.translation.x - Float32(25.0)) < Float32(1.0e-4), "External LocalTransform move failed to sync KCC")
+
+    app.shutdown()
+
+
 def main() raises:
     var t0 = monotonic()
     test_a_snapshot_determinism_queries_triggers_ccd()
@@ -3171,5 +3233,7 @@ def main() raises:
     print("[PASS] (s) v4 phys 4: XPBD capsule push-out, step_coupled SolverBodies & Beaufort Archimedes/metacentric water")
     test_t_v4_phys_5_aero6dof_mecha_cobra_gerwalk_and_zem_apn_simd8()
     print("[PASS] (t) v4 phys 5: Aero6DOF ISA/GE/transonic, Cobra, GERWALK hover, 200km LEO RCS & 8-lane MissileBatch8")
+    test_t5_kcc_local_transform_sync_no_teleport()
+    print("[PASS] (u) Tier 5 PhysicsPlugin KCC LocalTransform Registration & External Sync (No Teleport)")
     var ms = Float64(monotonic() - t0) / 1.0e6
     print("ALL FLINT V5 PHYSICS / KCC / NAVMESH / ORCA / AI / CAMERA / FLANIM_ECS TESTS PASSED in", ms, "ms!")

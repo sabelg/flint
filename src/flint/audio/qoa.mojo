@@ -255,7 +255,19 @@ struct QoaAsset(Copyable, Movable):
         var total_samples = Int(_get_be32(raw, 4))
         var ch = Int(raw[8])
         var sr = (Int(raw[9]) << 16) | (Int(raw[10]) << 8) | Int(raw[11])
-        if total_samples <= 0 or ch < 1 or ch > QOA_MAX_CHANNELS or sr <= 0:
+        if total_samples <= 0 or total_samples > 200_000_000 or ch < 1 or ch > QOA_MAX_CHANNELS or sr <= 0:
+            return a^
+        var min_frames = (total_samples + 65534) // 65535
+        var min_slices = (total_samples + QOA_SLICE_LEN - 1) // QOA_SLICE_LEN
+        var min_bytes = 8 + min_frames * (8 + 16 * ch) + min_slices * (8 * ch)
+        if len(raw) < min_bytes:
+            return a^
+        var fsamples = _get_be16_u(raw, 12)
+        var fsize = _get_be16_u(raw, 14)
+        if fsamples <= 0 or fsize < 8 + ch * 16 or 8 + fsize > len(raw):
+            return a^
+        var need_slices = (fsamples + QOA_SLICE_LEN - 1) // QOA_SLICE_LEN
+        if fsize < 8 + ch * 16 + need_slices * ch * 8:
             return a^
         a.valid = True
         a.channels = ch

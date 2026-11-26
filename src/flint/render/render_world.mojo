@@ -19,14 +19,23 @@ Architecture:
 """
 from std.collections import Dict, List
 from std.math import abs, cos, isfinite, isnan, max, min, pi, sin, sqrt, tan
-from flint.assets.model import NativeMesh
+from std.memory import bitcast
+from flint.assets.bc_compress import downsample_argb_2x
+from flint.assets.meshlet import AAA_VERTEX_WORDS, AaaGeometryPool, CookedMeshEntry
+from flint.assets.model import NativeMesh, NativeModel
 from flint.core.math import Mat4, Vec3
 from flint.core.transform import Quat
 from flint.app.engine_app import Resource
 from flint.ecs.world import comp_hash64
 from flint.platform.wayland import WaylandWindow
 from flint.render.aaa_clustered_lights import AaaClusterLight
-from flint.render.aaa_renderer import FlintAaaVulkanRenderer
+from flint.render.aaa_renderer import (
+    AaaSkinnedMeshEntry,
+    AaaUploadedModel,
+    FlintAaaVulkanRenderer,
+    srgb_u8_to_linear,
+)
+from flint.render.aaa_skinning_rt import DualQuat
 from flint.render.debug_draw import (
     DebugDraw,
     SHAPE_BOX,
@@ -39,19 +48,28 @@ from flint.render.debug_draw import (
 from flint.render.material_graph import (
     BakedVatCrowdClip,
     GpuDecalVolume,
+    MAT_DOMAIN_CLEARCOAT,
+    MAT_FLAG_ALPHA_MASKED,
+    MAT_FLAG_CLEARCOAT,
+    MAT_FLAG_DOUBLE_SIDED,
+    MAT_FLAG_EMISSIVE_BLOOM,
+    MAT_FLAG_IRIDESCENCE,
+    MAT_FLAG_SHEEN,
     MaterialAsset,
     SurfaceMaterialNode,
     TerrainClipmapDesc,
     sample_vat_vertex_cpu,
 )
+from flint.render.font import SdfFont
 from flint.render.simd_canvas import Camera3D, SimdCanvas, pack_argb
 from flint.render.swapchain_surface import (
     DISPLAY_SDR_SRGB,
     PRESENT_MAILBOX,
     SwapchainSurface,
 )
+from flint.render.ui_cpu_raster import rasterize_ui_draw_list_cpu
 from flint.render.ui_overlay import make_ui_line_prim
-from flint.ui.draw_list import PRIM_LINE, PRIM_SHAPE, UiDrawList
+from flint.ui.draw_list import UiDrawList
 
 # ============================================================================
 # 1. Unified Right-Handed `-Z` Forward View & Reverse-Z Projection Math
@@ -680,6 +698,7 @@ struct RenderWorld(Resource, Copyable, Movable):
     var cluster_lights: List[AaaClusterLight]
     var decals: List[GpuDecalVolume]
     var debug_lines: DebugLineBatch
+    var overlay_lines: DebugLineBatch
 
     def __init__(out self):
         self.frame_number = 0
@@ -694,8 +713,14 @@ struct RenderWorld(Resource, Copyable, Movable):
         self.cluster_lights = List[AaaClusterLight]()
         self.decals = List[GpuDecalVolume]()
         self.debug_lines = DebugLineBatch()
+        self.overlay_lines = DebugLineBatch()
 
-    def clear_frame(mut self, frame_number: UInt64 = 0, delta_time: Float32 = 1.0 / 60.0):
+    def clear_frame(
+        mut self,
+        frame_number: UInt64 = 0,
+        delta_time: Float32 = 1.0 / 60.0,
+        clear_overlay: Bool = False,
+    ):
         self.frame_number = frame_number
         self.delta_time = delta_time
         self.instances.clear()
@@ -703,6 +728,8 @@ struct RenderWorld(Resource, Copyable, Movable):
         self.cluster_lights.clear()
         self.decals.clear()
         self.debug_lines.clear()
+        if clear_overlay:
+            self.overlay_lines.clear()
 
     @always_inline
     def instance_count(self) -> Int:
@@ -908,6 +935,41 @@ comptime RENDER_TIER_1_FORWARD_CLUSTERED: UInt32 = 1
 comptime RENDER_TIER_2_AAA_VISBUFFER_RT: UInt32 = 2
 
 
+def material_asset_from_native_mesh(m: NativeMesh) -> MaterialAsset:
+    """Constructs a `MaterialAsset` matching `NativeMesh` GLB PBR/emissive/clearcoat/sheen properties."""
+    var bc = m.base_color
+    var lin_bc = Vec3(
+        srgb_u8_to_linear(Int((bc >> 16) & 0xFF)),
+        srgb_u8_to_linear(Int((bc >> 8) & 0xFF)),
+        srgb_u8_to_linear(Int(bc & 0xFF)),
+    )
+    var ma = MaterialAsset(base_color=lin_bc, roughness=m.roughness, metallic=m.metallic)
+    if m.emissive_strength > Float32(1e-4):
+        ma.emissive = m.emissive_color * m.emissive_strength
+        ma.flags |= MAT_FLAG_EMISSIVE_BLOOM
+    ma.clearcoat = m.clearcoat
+    ma.clearcoat_roughness = m.clearcoat_roughness
+    if m.clearcoat > Float32(0.001):
+        ma.flags |= MAT_FLAG_CLEARCOAT
+        ma.domain = MAT_DOMAIN_CLEARCOAT
+    ma.specular_factor = m.specular_factor
+    ma.iridescence = m.iridescence
+    ma.iridescence_thickness_nm = m.iridescence_thickness_nm
+    ma.iridescence_ior = m.iridescence_ior
+    if m.iridescence > Float32(0.001):
+        ma.flags |= MAT_FLAG_IRIDESCENCE
+    ma.sheen_color = m.sheen_color
+    ma.sheen_roughness = m.sheen_roughness
+    if m.sheen_color.x + m.sheen_color.y + m.sheen_color.z > Float32(0.001):
+        ma.flags |= MAT_FLAG_SHEEN
+    if m.alpha_mode == 1:
+        ma.alpha_cutoff = Float32(0.48)
+        ma.flags |= MAT_FLAG_ALPHA_MASKED
+    if m.double_sided:
+        ma.flags |= MAT_FLAG_DOUBLE_SIDED
+    return ma^
+
+
 struct ScalableRenderer(Resource, Movable):
     """Unified 3-Tier Flint v5 Renderer scaling seamlessly from `<4 MiB` CPU SIMD CI (`Tier 0`)
     to Clustered Forward/VisBuffer+VSM (`Tier 1`) to Flagship Hardware RT+SVGF+TSR (`Tier 2`)."""
@@ -920,6 +982,7 @@ struct ScalableRenderer(Resource, Movable):
     var cpu_canvas: SimdCanvas
     var cpu_meshes: List[NativeMesh]
     var cpu_mesh_materials: List[Int]
+    var cpu_skin_bind_positions: Dict[Int, List[Float32]]
     var cpu_vat_clips: List[BakedVatCrowdClip]
     var cpu_vat_meshes: List[NativeMesh]
     var cpu_vat_materials: List[Int]
@@ -929,6 +992,10 @@ struct ScalableRenderer(Resource, Movable):
     var cpu_terrain_heights: List[Float32]
     var cpu_terrain_hm_w: Int
     var cpu_terrain_hm_h: Int
+    var cpu_ui_fonts: List[SdfFont]
+    var ui_time_sec: Float32
+    var ui_dpi_scale: Float32
+    var ui_global_flags: UInt32
     var materials: List[MaterialAsset]
     var gpu_slot: List[FlintAaaVulkanRenderer]
 
@@ -948,6 +1015,7 @@ struct ScalableRenderer(Resource, Movable):
         self.cpu_canvas = SimdCanvas(self.width, self.height)
         self.cpu_meshes = List[NativeMesh]()
         self.cpu_mesh_materials = List[Int]()
+        self.cpu_skin_bind_positions = Dict[Int, List[Float32]]()
         self.cpu_vat_clips = List[BakedVatCrowdClip]()
         self.cpu_vat_meshes = List[NativeMesh]()
         self.cpu_vat_materials = List[Int]()
@@ -957,6 +1025,10 @@ struct ScalableRenderer(Resource, Movable):
         self.cpu_terrain_heights = List[Float32]()
         self.cpu_terrain_hm_w = 0
         self.cpu_terrain_hm_h = 0
+        self.cpu_ui_fonts = List[SdfFont]()
+        self.ui_time_sec = 0.0
+        self.ui_dpi_scale = 1.0
+        self.ui_global_flags = 0
         self.materials = List[MaterialAsset]()
         self.gpu_slot = List[FlintAaaVulkanRenderer]()
 
@@ -1003,6 +1075,19 @@ struct ScalableRenderer(Resource, Movable):
     def uses_vulkan(self) -> Bool:
         return self.tier != RENDER_TIER_0_HEADLESS_SIMD and len(self.gpu_slot) > 0 and self.gpu_slot[0].active
 
+    def register_ui_font(mut self, font: SdfFont) -> Int:
+        """Registers an `SdfFont` atlas on both Vulkan bindless storage and Tier-0 CPU parity slots."""
+        if self.uses_vulkan():
+            var slot = self.gpu_slot[0].upload_ui_font_atlas(font)
+            if slot >= 0:
+                while len(self.cpu_ui_fonts) <= slot:
+                    self.cpu_ui_fonts.append(SdfFont())
+                self.cpu_ui_fonts[slot] = font.copy()
+            return slot
+        var slot = len(self.cpu_ui_fonts)
+        self.cpu_ui_fonts.append(font.copy())
+        return slot
+
     def attach_window_surface(
         mut self,
         mut window: WaylandWindow,
@@ -1018,6 +1103,8 @@ struct ScalableRenderer(Resource, Movable):
     def register_material(mut self, mat: MaterialAsset) -> Int:
         if self.uses_vulkan():
             var gpu_id = self.gpu_slot[0].add_material_asset(mat)
+            if gpu_id < 0:
+                return -1
             while len(self.materials) < gpu_id:
                 self.materials.append(MaterialAsset())
             self.materials.append(mat.copy())
@@ -1025,6 +1112,14 @@ struct ScalableRenderer(Resource, Movable):
         var id = len(self.materials)
         self.materials.append(mat.copy())
         return id
+
+    def update_material_asset_deferred(mut self, mat_id: Int, mat: MaterialAsset):
+        """Updates CPU `materials[mat_id]` immediately and queues a non-stalling GPU SSBO upload."""
+        if mat_id < 0 or mat_id >= len(self.materials):
+            return
+        self.materials[mat_id] = mat.copy()
+        if self.uses_vulkan():
+            self.gpu_slot[0].queue_material_asset_update(mat_id, mat)
 
     def evaluate_material_graph[
         NodeT: SurfaceMaterialNode
@@ -1061,6 +1156,351 @@ struct ScalableRenderer(Resource, Movable):
         self.cpu_meshes.append(mesh.copy())
         self.cpu_mesh_materials.append(mat_id)
         return id
+
+    def register_cooked_mesh_asset(mut self, geom: AaaGeometryPool, mat_id: Int = -1) -> Int:
+        """Uploads a cooked `AaaGeometryPool` (reconstructed `NativeMesh`) into Tier 0/1/2."""
+        if len(geom.meshes) == 0:
+            return -1
+        ref gm = geom.meshes[0]
+        var vc = gm.vertex_count
+        if vc <= 0 or (gm.first_vertex + vc) * AAA_VERTEX_WORDS > len(geom.vertex_words):
+            return -1
+        var nm = NativeMesh()
+        nm.positions.reserve(vc * 3)
+        nm.normals.reserve(vc * 3)
+        nm.texcoords.reserve(vc * 2)
+        for vi in range(vc):
+            var base_w = (gm.first_vertex + vi) * AAA_VERTEX_WORDS
+            nm.positions.append(bitcast[DType.float32](geom.vertex_words[base_w + 0]))
+            nm.positions.append(bitcast[DType.float32](geom.vertex_words[base_w + 1]))
+            nm.positions.append(bitcast[DType.float32](geom.vertex_words[base_w + 2]))
+            nm.normals.append(bitcast[DType.float32](geom.vertex_words[base_w + 3]))
+            nm.normals.append(bitcast[DType.float32](geom.vertex_words[base_w + 4]))
+            nm.normals.append(bitcast[DType.float32](geom.vertex_words[base_w + 5]))
+            nm.texcoords.append(bitcast[DType.float32](geom.vertex_words[base_w + 9]))
+            nm.texcoords.append(bitcast[DType.float32](geom.vertex_words[base_w + 10]))
+        var n_idx = gm.triangle_count * 3
+        if gm.first_index + n_idx <= len(geom.index_words):
+            nm.indices.reserve(n_idx)
+            for ii in range(n_idx):
+                var g_v = Int(geom.index_words[gm.first_index + ii]) - gm.first_vertex
+                if g_v >= 0 and g_v < vc:
+                    nm.indices.append(g_v)
+        var eff_mat = mat_id
+        if eff_mat < 0:
+            eff_mat = self.register_material(material_asset_from_native_mesh(NativeMesh()))
+        return self.register_mesh(nm, eff_mat, build_lods=False)
+
+    def build_native_mesh_material(
+        mut self,
+        m: NativeMesh,
+        model: NativeModel = NativeModel(),
+        max_tex_dim: Int = 2048,
+    ) -> MaterialAsset:
+        """Builds a `MaterialAsset` from `NativeMesh`, uploading embedded GLB textures on Vulkan tiers."""
+        var ma = material_asset_from_native_mesh(m)
+        if not self.uses_vulkan():
+            return ma^
+        var n_tex = len(model.textures)
+        if n_tex <= 0:
+            return ma^
+        var cap_dim = max(16, max_tex_dim)
+        if m.texture >= 0 and m.texture < n_tex:
+            ref tx = model.textures[m.texture]
+            if tx.width > 0 and tx.height > 0 and len(tx.pixels) >= tx.width * tx.height:
+                var cur_px = tx.pixels.copy()
+                var cw = tx.width
+                var ch = tx.height
+                while (cw > cap_dim or ch > cap_dim) and cw >= 8 and ch >= 8:
+                    var ds = downsample_argb_2x(cur_px, cw, ch)
+                    cur_px = ds[0].copy()
+                    cw = ds[1]
+                    ch = ds[2]
+                var alb_slot = self.gpu_slot[0].upload_bc7_texture(cur_px, cw, ch, srgb=True, generate_mips=True)
+                if alb_slot >= 0:
+                    ma.set_albedo_slot(alb_slot)
+        if m.normal_orm_texture >= 0 and m.normal_orm_texture < n_tex:
+            ref ntx = model.textures[m.normal_orm_texture]
+            if ntx.width > 0 and ntx.height > 0 and len(ntx.pixels) >= ntx.width * ntx.height:
+                var cur_np = ntx.pixels.copy()
+                var nw = ntx.width
+                var nh = ntx.height
+                while (nw > cap_dim or nh > cap_dim) and nw >= 8 and nh >= 8:
+                    var ds = downsample_argb_2x(cur_np, nw, nh)
+                    cur_np = ds[0].copy()
+                    nw = ds[1]
+                    nh = ds[2]
+                var n_vecs = List[Vec3](capacity=nw * nh)
+                for p in cur_np:
+                    var nx = (Float32((p >> 16) & 0xFF) / Float32(255.0)) * Float32(2.0) - Float32(1.0)
+                    var ny = (Float32((p >> 8) & 0xFF) / Float32(255.0)) * Float32(2.0) - Float32(1.0)
+                    var nz = (Float32(p & 0xFF) / Float32(255.0)) * Float32(2.0) - Float32(1.0)
+                    n_vecs.append(Vec3(nx, ny, max(Float32(0.05), nz)).normalized())
+                var nrm_slot = self.gpu_slot[0].upload_bc5_normal_texture(n_vecs, nw, nh, generate_mips=True)
+                if nrm_slot >= 0:
+                    ma.set_normal_slot(nrm_slot)
+        if m.orm_texture >= 0 and m.orm_texture < n_tex:
+            ref otx = model.textures[m.orm_texture]
+            if otx.width > 0 and otx.height > 0 and len(otx.pixels) >= otx.width * otx.height:
+                var cur_op = otx.pixels.copy()
+                var ow = otx.width
+                var oh = otx.height
+                while (ow > cap_dim or oh > cap_dim) and ow >= 8 and oh >= 8:
+                    var ds = downsample_argb_2x(cur_op, ow, oh)
+                    cur_op = ds[0].copy()
+                    ow = ds[1]
+                    oh = ds[2]
+                var has_sep_occ = (
+                    m.occlusion_texture >= 0
+                    and m.occlusion_texture < n_tex
+                    and m.occlusion_texture != m.orm_texture
+                    and model.textures[m.occlusion_texture].width > 0
+                    and model.textures[m.occlusion_texture].height > 0
+                    and len(model.textures[m.occlusion_texture].pixels)
+                    >= model.textures[m.occlusion_texture].width * model.textures[m.occlusion_texture].height
+                )
+                var orm_px = List[UInt32](capacity=ow * oh)
+                if has_sep_occ:
+                    ref octx = model.textures[m.occlusion_texture]
+                    for py in range(oh):
+                        var sy = min(octx.height - 1, (py * octx.height) // oh)
+                        for px in range(ow):
+                            var p = cur_op[py * ow + px]
+                            var sx = min(octx.width - 1, (px * octx.width) // ow)
+                            var r_ao = Float32((octx.pixels[sy * octx.width + sx] >> 16) & 0xFF)
+                            var scaled_ao = UInt32(
+                                max(
+                                    0,
+                                    min(
+                                        255,
+                                        Int(
+                                            Float32(255.0) * (Float32(1.0) - m.occlusion_strength)
+                                            + r_ao * m.occlusion_strength
+                                            + Float32(0.5)
+                                        ),
+                                    ),
+                                )
+                            )
+                            orm_px.append(UInt32(0xFF000000) | (scaled_ao << 16) | (p & 0x0000FFFF))
+                else:
+                    for p in cur_op:
+                        var r_ao = (p >> 16) & 0xFF
+                        var use_ao: UInt32
+                        if m.occlusion_texture == m.orm_texture:
+                            use_ao = UInt32(
+                                max(
+                                    0,
+                                    min(
+                                        255,
+                                        Int(
+                                            Float32(255.0) * (Float32(1.0) - m.occlusion_strength)
+                                            + Float32(r_ao) * m.occlusion_strength
+                                            + Float32(0.5)
+                                        ),
+                                    ),
+                                )
+                            )
+                        else:
+                            use_ao = UInt32(255) if r_ao == 0 else r_ao
+                        orm_px.append(UInt32(0xFF000000) | (use_ao << 16) | (p & 0x0000FFFF))
+                var orm_slot = self.gpu_slot[0].upload_bc7_texture(orm_px, ow, oh, srgb=False, generate_mips=True)
+                if orm_slot >= 0:
+                    ma.set_orm_slot(orm_slot)
+        elif m.occlusion_texture >= 0 and m.occlusion_texture < n_tex:
+            ref octx = model.textures[m.occlusion_texture]
+            if octx.width > 0 and octx.height > 0 and len(octx.pixels) >= octx.width * octx.height:
+                var cur_op = octx.pixels.copy()
+                var ow = octx.width
+                var oh = octx.height
+                while (ow > cap_dim or oh > cap_dim) and ow >= 8 and oh >= 8:
+                    var ds = downsample_argb_2x(cur_op, ow, oh)
+                    cur_op = ds[0].copy()
+                    ow = ds[1]
+                    oh = ds[2]
+                var rough_u8 = UInt32(max(12, min(255, Int(m.roughness * Float32(255.0) + Float32(0.5)))))
+                var metal_u8 = UInt32(max(0, min(255, Int(m.metallic * Float32(255.0) + Float32(0.5)))))
+                var orm_px = List[UInt32](capacity=ow * oh)
+                for p in cur_op:
+                    var r_ao = Float32((p >> 16) & 0xFF)
+                    var scaled_ao = UInt32(
+                        max(
+                            0,
+                            min(
+                                255,
+                                Int(
+                                    Float32(255.0) * (Float32(1.0) - m.occlusion_strength)
+                                    + r_ao * m.occlusion_strength
+                                    + Float32(0.5)
+                                ),
+                            ),
+                        )
+                    )
+                    orm_px.append(UInt32(0xFF000000) | (scaled_ao << 16) | (rough_u8 << 8) | metal_u8)
+                var orm_slot = self.gpu_slot[0].upload_bc7_texture(orm_px, ow, oh, srgb=False, generate_mips=True)
+                if orm_slot >= 0:
+                    ma.set_orm_slot(orm_slot)
+        if m.emissive_texture >= 0 and m.emissive_texture < n_tex:
+            ref etx = model.textures[m.emissive_texture]
+            if etx.width > 0 and etx.height > 0 and len(etx.pixels) >= etx.width * etx.height:
+                var cur_ep = etx.pixels.copy()
+                var ew = etx.width
+                var eh = etx.height
+                while (ew > cap_dim or eh > cap_dim) and ew >= 8 and eh >= 8:
+                    var ds = downsample_argb_2x(cur_ep, ew, eh)
+                    cur_ep = ds[0].copy()
+                    ew = ds[1]
+                    eh = ds[2]
+                var emi_slot = self.gpu_slot[0].upload_bc7_texture(cur_ep, ew, eh, srgb=True, generate_mips=True)
+                if emi_slot >= 0:
+                    ma.set_emissive_slot(emi_slot)
+        return ma^
+
+    def upload_native_model(
+        mut self,
+        model: NativeModel,
+        build_lods: Bool = True,
+        max_tex_dim: Int = 2048,
+        upload_skinned: Bool = False,
+    ) -> AaaUploadedModel:
+        """Uploads a `NativeModel` across Tier 0 CPU and Tier 1/2 Vulkan, keeping `materials` & `cpu_meshes` aligned."""
+        if len(model.meshes) == 0:
+            return AaaUploadedModel()
+        if self.uses_vulkan():
+            var out = self.gpu_slot[0].upload_native_model(
+                model, build_lods=build_lods, max_tex_dim=max_tex_dim, upload_skinned=upload_skinned
+            )
+            for mi in range(len(out.material_ids)):
+                var mat_id = out.material_ids[mi]
+                if mat_id >= 0:
+                    while len(self.materials) <= mat_id:
+                        self.materials.append(MaterialAsset())
+                    if mi < len(model.meshes):
+                        var ma = material_asset_from_native_mesh(model.meshes[mi])
+                        if mat_id < len(self.gpu_slot[0].materials):
+                            ref gm = self.gpu_slot[0].materials[mat_id]
+                            ma.set_albedo_slot(gm.albedo_tex)
+                            ma.set_normal_slot(gm.normal_tex)
+                            ma.set_orm_slot(gm.orm_tex)
+                        self.materials[mat_id] = ma^
+            for mi in range(len(out.mesh_entries)):
+                var mesh_id = out.mesh_entries[mi].mesh_id
+                var mat_id = out.material_ids[mi] if mi < len(out.material_ids) else -1
+                if mesh_id >= 0:
+                    while len(self.cpu_meshes) <= mesh_id:
+                        self.cpu_meshes.append(NativeMesh())
+                        self.cpu_mesh_materials.append(0)
+                    if mi < len(model.meshes):
+                        self.cpu_meshes[mesh_id] = model.meshes[mi].copy()
+                        self.cpu_mesh_materials[mesh_id] = mat_id
+            for si in range(len(out.skinned_entries)):
+                var sm_id = out.skinned_entries[si].mesh_entry.mesh_id
+                if sm_id >= 0 and sm_id < len(self.cpu_meshes):
+                    self.cpu_skin_bind_positions[sm_id] = self.cpu_meshes[sm_id].positions.copy()
+            return out^
+
+        var out = AaaUploadedModel()
+        for mi in range(len(model.meshes)):
+            ref m = model.meshes[mi]
+            var ma = material_asset_from_native_mesh(m)
+            var mat_id = self.register_material(ma)
+            out.material_ids.append(mat_id)
+
+            var mesh_id = self.register_mesh(m, mat_id, build_lods=build_lods)
+            var entry = CookedMeshEntry()
+            entry.mesh_id = mesh_id
+            entry.material_id = mat_id
+            entry.vertex_count = m.vertex_count()
+            entry.triangle_count = m.triangle_count()
+            entry.bounds_center = m.bounds_center
+            entry.bounds_radius = m.bounds_radius
+            out.mesh_entries.append(entry.copy())
+
+            var mv_cnt = m.vertex_count()
+            if upload_skinned and mv_cnt > 0 and len(m.joints) >= mv_cnt * 4 and len(m.weights) >= mv_cnt * 4:
+                var b_cnt = 64
+                if m.skin >= 0 and m.skin < len(model.skins) and len(model.skins[m.skin].joints) > 0:
+                    b_cnt = len(model.skins[m.skin].joints)
+                self.cpu_skin_bind_positions[mesh_id] = m.positions.copy()
+                var sk_entry = AaaSkinnedMeshEntry()
+                sk_entry.mesh_entry = entry^
+                sk_entry.vertex_count = mv_cnt
+                sk_entry.bone_count = b_cnt
+                out.skinned_entries.append(sk_entry^)
+        return out^
+
+    def add_skinned_mesh(
+        mut self, mesh: NativeMesh, mat_id: Int, bone_count: Int = 64
+    ) -> AaaSkinnedMeshEntry:
+        """Allocates an independent skinned mesh entry (and bone palette) across Tier 0/1/2."""
+        if self.uses_vulkan():
+            var empty_jp = List[UInt32]()
+            var empty_jw = List[Vec3]()
+            var sk = self.gpu_slot[0].add_skinned_mesh(mesh, empty_jp, empty_jw, mat_id, bone_count=bone_count)
+            var mid = sk.mesh_entry.mesh_id
+            if mid >= 0:
+                while len(self.cpu_meshes) <= mid:
+                    self.cpu_meshes.append(NativeMesh())
+                    self.cpu_mesh_materials.append(0)
+                self.cpu_meshes[mid] = mesh.copy()
+                self.cpu_mesh_materials[mid] = mat_id
+                self.cpu_skin_bind_positions[mid] = mesh.positions.copy()
+            return sk^
+
+        var mid = self.register_mesh(mesh, mat_id, build_lods=False)
+        self.cpu_skin_bind_positions[mid] = mesh.positions.copy()
+        var entry = CookedMeshEntry()
+        entry.mesh_id = mid
+        entry.material_id = mat_id
+        entry.vertex_count = mesh.vertex_count()
+        entry.triangle_count = mesh.triangle_count()
+        entry.bounds_center = mesh.bounds_center
+        entry.bounds_radius = mesh.bounds_radius
+        var sk_entry = AaaSkinnedMeshEntry()
+        sk_entry.mesh_entry = entry^
+        sk_entry.vertex_count = mesh.vertex_count()
+        sk_entry.bone_count = bone_count
+        return sk_entry^
+
+    def update_skinned_mesh_bones(
+        mut self,
+        skin_entry: AaaSkinnedMeshEntry,
+        cur_bones: List[DualQuat],
+        prev_bones: List[DualQuat],
+        defer_to_frame: Bool = True,
+    ):
+        """Updates DualQuat bone palettes on GPU (Tier 1/2) and CPU (Tier 0)."""
+        if self.uses_vulkan():
+            _ = self.gpu_slot[0].update_skinned_mesh_bones(
+                skin_entry, cur_bones, prev_bones, invalidate_vsm=False, defer_to_frame=defer_to_frame
+            )
+            return
+        var mid = skin_entry.mesh_entry.mesh_id
+        if mid < 0 or mid >= len(self.cpu_meshes) or len(cur_bones) == 0:
+            return
+        var bind_opt = self.cpu_skin_bind_positions.get(mid)
+        if not bind_opt:
+            return
+        ref bind_pos = bind_opt.value()
+        ref m = self.cpu_meshes[mid]
+        var vc = len(bind_pos) // 3
+        if len(m.joints) < vc * 4 or len(m.weights) < vc * 4 or len(m.positions) < vc * 3:
+            return
+        var nb = len(cur_bones)
+        for vi in range(vc):
+            var p = Vec3(bind_pos[vi * 3], bind_pos[vi * 3 + 1], bind_pos[vi * 3 + 2])
+            var out_p = Vec3()
+            var w_sum = Float32(0.0)
+            for k in range(4):
+                var w = m.weights[vi * 4 + k]
+                var ji = Int(m.joints[vi * 4 + k])
+                if w > Float32(0.0) and ji >= 0 and ji < nb:
+                    out_p = out_p + cur_bones[ji].transform_point(p) * w
+                    w_sum += w
+            if w_sum > Float32(1.0e-5):
+                var inv_w = Float32(1.0) / w_sum
+                m.positions[vi * 3 + 0] = out_p.x * inv_w
+                m.positions[vi * 3 + 1] = out_p.y * inv_w
+                m.positions[vi * 3 + 2] = out_p.z * inv_w
 
     def register_vat_crowd_clip(
         mut self,
@@ -1126,6 +1566,20 @@ struct ScalableRenderer(Resource, Movable):
             return pack_argb(r, g, b, 255)
         return 0xFFCCCCCC
 
+    @staticmethod
+    @always_inline
+    def _modulate_env_argb(col: UInt32, sun_radiance: Vec3, exposure: Float32) -> UInt32:
+        var exp_s = max(Float32(0.02), min(Float32(4.0), exposure)) if isfinite(exposure) else Float32(1.0)
+        var rx = max(Float32(0.02), min(Float32(4.0), sun_radiance.x * Float32(1.0 / 3.2) * exp_s)) if isfinite(sun_radiance.x) else exp_s
+        var ry = max(Float32(0.02), min(Float32(4.0), sun_radiance.y * Float32(1.0 / 3.0) * exp_s)) if isfinite(sun_radiance.y) else exp_s
+        var rz = max(Float32(0.02), min(Float32(4.0), sun_radiance.z * Float32(1.0 / 2.75) * exp_s)) if isfinite(sun_radiance.z) else exp_s
+        if rx == Float32(1.0) and ry == Float32(1.0) and rz == Float32(1.0):
+            return col
+        var r = min(255, max(0, Int(Float32((col >> 16) & 0xFF) * rx)))
+        var g = min(255, max(0, Int(Float32((col >> 8) & 0xFF) * ry)))
+        var b = min(255, max(0, Int(Float32(col & 0xFF) * rz)))
+        return pack_argb(r, g, b, Int((col >> 24) & 0xFF))
+
     def _render_tier0_simd(mut self, world: RenderWorld, ui: UiDrawList) -> Bool:
         self.cpu_canvas.clear(0x101828, 0x1E2D46)
         var cam = Camera3D(
@@ -1145,7 +1599,7 @@ struct ScalableRenderer(Resource, Movable):
                 continue
             ref m = self.cpu_meshes[inst.mesh_id]
             var mat_idx = inst.material_id if inst.material_id >= 0 else self.cpu_mesh_materials[inst.mesh_id]
-            var col = self._material_color_argb(mat_idx)
+            var col = Self._modulate_env_argb(self._material_color_argb(mat_idx), world.sun_radiance, world.camera.exposure)
             var n_tris = len(m.indices) // 3
             var n_verts = len(m.positions) // 3
             for t in range(n_tris):
@@ -1172,7 +1626,7 @@ struct ScalableRenderer(Resource, Movable):
             ref clip = self.cpu_vat_clips[vi.clip_id]
             ref vm = self.cpu_vat_meshes[vi.clip_id]
             var mat_idx = vi.material_id if vi.material_id >= 0 else self.cpu_vat_materials[vi.clip_id]
-            var col = self._material_color_argb(mat_idx)
+            var col = Self._modulate_env_argb(self._material_color_argb(mat_idx), world.sun_radiance, world.camera.exposure)
             var n_tris = len(vm.indices) // 3
             var n_verts = vm.vertex_count()
             for t in range(n_tris):
@@ -1191,7 +1645,11 @@ struct ScalableRenderer(Resource, Movable):
 
         if world.terrain_clipmap.active:
             var td = world.terrain_clipmap.desc.copy()
-            var col = self._material_color_argb(world.terrain_clipmap.material_id)
+            var col = Self._modulate_env_argb(
+                self._material_color_argb(world.terrain_clipmap.material_id),
+                world.sun_radiance,
+                world.camera.exposure,
+            )
             var ox = td.snapped_ring_origin_xz(world.camera.eye, 0)[0]
             var oz = td.snapped_ring_origin_xz(world.camera.eye, 0)[1]
             var step = td.ring_cell_size(0) * Float32(4.0)
@@ -1224,90 +1682,20 @@ struct ScalableRenderer(Resource, Movable):
             var thick = Int(min(Float32(64.0), max(Float32(1.0), v0.thickness_px + Float32(0.5)))) if isfinite(v0.thickness_px) else 1
             self.cpu_canvas.draw_line_3d(cam, v0.pos, v1.pos, v0.rgba8, thick)
 
-        var max_dim = max(self.width, self.height)
-        var max_steps_cap = max(64, max_dim * 2 + 128)
-        for p_i in range(ui.count()):
-            var pr = ui.prims[p_i]
-            var kind = pr.header & UInt32(0xF)
-            if kind == PRIM_SHAPE:
-                if isfinite(pr.x0) and isfinite(pr.y0) and isfinite(pr.x1) and isfinite(pr.y1):
-                    var rx0 = max(Float32(-1.0e6), min(Float32(1.0e6), pr.x0))
-                    var ry0 = max(Float32(-1.0e6), min(Float32(1.0e6), pr.y0))
-                    var rx1 = max(Float32(-1.0e6), min(Float32(1.0e6), pr.x1))
-                    var ry1 = max(Float32(-1.0e6), min(Float32(1.0e6), pr.y1))
-                    self.cpu_canvas.draw_rect(
-                        Int(rx0),
-                        Int(ry0),
-                        max(1, Int(rx1 - rx0)),
-                        max(1, Int(ry1 - ry0)),
-                        pr.fill_rgba8,
-                    )
-            elif kind == PRIM_LINE:
-                if not (isfinite(pr.u0) and isfinite(pr.v0) and isfinite(pr.u1) and isfinite(pr.v1)):
-                    continue
-                var u0 = Float64(pr.u0)
-                var v0 = Float64(pr.v0)
-                var u1 = Float64(pr.u1)
-                var v1 = Float64(pr.v1)
-                var dx = u1 - u0
-                var dy = v1 - v0
-                if (
-                    abs(u0) > 1.0e6
-                    or abs(v0) > 1.0e6
-                    or abs(u1) > 1.0e6
-                    or abs(v1) > 1.0e6
-                    or abs(dx) > Float64(max_dim * 2 + 64)
-                    or abs(dy) > Float64(max_dim * 2 + 64)
-                ):
-                    # Liang-Barsky clip in Float64 against padded viewport [-1, W+1] x [-1, H+1]
-                    var t0 = 0.0
-                    var t1 = 1.0
-                    var xmin = -1.0
-                    var xmax = Float64(self.width) + 1.0
-                    var ymin = -1.0
-                    var ymax = Float64(self.height) + 1.0
-                    var p_edges = [-dx, dx, -dy, dy]
-                    var q_edges = [u0 - xmin, xmax - u0, v0 - ymin, ymax - v0]
-                    var visible = True
-                    for ei in range(4):
-                        var pe = p_edges[ei]
-                        var qe = q_edges[ei]
-                        if pe == 0.0:
-                            if qe < 0.0:
-                                visible = False
-                                break
-                        else:
-                            var r = qe / pe
-                            if pe < 0.0:
-                                if r > t1:
-                                    visible = False
-                                    break
-                                if r > t0:
-                                    t0 = r
-                            else:
-                                if r < t0:
-                                    visible = False
-                                    break
-                                if r < t1:
-                                    t1 = r
-                    if not visible or t0 > t1:
-                        continue
-                    var nu0 = max(xmin, min(xmax, u0 + t0 * dx))
-                    var nv0 = max(ymin, min(ymax, v0 + t0 * dy))
-                    var nu1 = max(xmin, min(xmax, u0 + t1 * dx))
-                    var nv1 = max(ymin, min(ymax, v0 + t1 * dy))
-                    u0 = nu0
-                    v0 = nv0
-                    dx = nu1 - nu0
-                    dy = nv1 - nv0
-                var span = max(abs(dx), abs(dy))
-                var steps = min(max_steps_cap, max(1, Int(min(Float64(max_steps_cap), span))))
-                var inv_s = 1.0 / Float64(steps)
-                for st in range(steps + 1):
-                    var px = Int(u0 + dx * Float64(st) * inv_s)
-                    var py = Int(v0 + dy * Float64(st) * inv_s)
-                    if px >= 0 and px < self.width and py >= 0 and py < self.height:
-                        self.cpu_canvas.pixels[py * self.width + px] = pr.fill_rgba8 | UInt32(0xFF000000)
+        var n_ov = world.overlay_lines.segment_count()
+        for s_i in range(n_ov):
+            var v0 = world.overlay_lines.vertices[s_i * 2]
+            var v1 = world.overlay_lines.vertices[s_i * 2 + 1]
+            var thick = Int(min(Float32(64.0), max(Float32(1.0), v0.thickness_px + Float32(0.5)))) if isfinite(v0.thickness_px) else 1
+            self.cpu_canvas.draw_line_3d(cam, v0.pos, v1.pos, v0.rgba8, thick)
+
+        rasterize_ui_draw_list_cpu(
+            self.cpu_canvas,
+            ui,
+            self.cpu_ui_fonts,
+            self.ui_time_sec,
+            self.ui_global_flags,
+        )
 
         return True
 
@@ -1404,6 +1792,9 @@ struct ScalableRenderer(Resource, Movable):
         gpu.sun_radiance = world.sun_radiance
         gpu.ibl_intensity = world.ibl_intensity
         gpu.exposure = world.camera.exposure
+        gpu.ui_time_sec = self.ui_time_sec
+        gpu.ui_dpi_scale = self.ui_dpi_scale
+        gpu.ui_global_flags = self.ui_global_flags
 
         gpu.begin_frame(
             cam_pos=world.camera.eye,
@@ -1442,6 +1833,16 @@ struct ScalableRenderer(Resource, Movable):
         for p_i in range(ui.count()):
             gpu.ui_draw_list.prims.append(ui.prims[p_i])
         _ = world.debug_lines.emit_to_ui_draw_list(
+            gpu.ui_draw_list,
+            world.camera.eye,
+            world.camera.target,
+            world.camera.fov_y_deg,
+            world.camera.near_z,
+            self.width,
+            self.height,
+            world.camera.up,
+        )
+        _ = world.overlay_lines.emit_to_ui_draw_list(
             gpu.ui_draw_list,
             world.camera.eye,
             world.camera.target,

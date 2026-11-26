@@ -23,9 +23,36 @@ Verifies all 7 EngineApp plugins (`WindowPlugin`, `InputPlugin`, `PhysicsPlugin`
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import abs, sin
+from std.math import abs, isfinite, sin
+from std.memory import bitcast
 from std.testing import assert_equal, assert_true
 
+from flint.ai import (
+    AiPlugin,
+    BT_ABORT_LOWER_PRIORITY,
+    BT_CMP_GT,
+    BT_FAILURE,
+    BT_NODE_ACTION,
+    BT_RUNNING,
+    BT_SUCCESS,
+    BehaviorTree,
+    BehaviorTreeComponent,
+    Blackboard,
+    BtExecutionState,
+    CURVE_LINEAR,
+    SpatialPerception,
+    UtilityAiScorer,
+    UtilityConsideration,
+    UtilityOption,
+    register_ai_codecs,
+    register_ai_components,
+)
+
+from flint.anim.flrig import (
+    FrigJointDef,
+    FrigRigDef,
+    save_flrig_file,
+)
 from flint.anim.flanim_ecs import (
     BoneSocketAttachment,
     RAGDOLL_SM_LIMP,
@@ -39,6 +66,7 @@ from flint.anim.plugin import (
     AnimatorComponent,
     BoneSocketComponent,
     RagdollComponent,
+    RigComponent,
     SkeletonComponent,
     register_anim_codecs,
     register_anim_components,
@@ -50,6 +78,9 @@ from flint.anim.sync import ClipInfo
 from flint.app import (
     AppConfig,
     EngineApp,
+    GameFlow,
+    GameStateMachine,
+    GameTimer,
     STAGE_FIRST,
     STAGE_FIXED_UPDATE,
     STAGE_LAST,
@@ -58,13 +89,45 @@ from flint.app import (
     STAGE_SHUTDOWN,
     STAGE_STARTUP,
     STAGE_UPDATE,
+    SaveSlotStore,
+    Tween,
 )
 from flint.app.engine_app import Resource, Resources
 from flint.app.window_plugin import WindowPlugin, WindowStateResource
+from flint.assets import (
+    ASSET_KIND_AUDIO,
+    ASSET_KIND_MESH,
+    ASSET_KIND_RAW,
+    ASSET_KIND_TEXTURE,
+    AssetPlugin,
+    AssetRef,
+    AssetServer,
+    AssetUuid,
+    SceneAssetResolver,
+)
+from flint.assets.cooker_v2 import cook_workspace
+from flint.assets.flmat import FlmatAsset, load_flmat_bytes, save_flmat_file
+from flint.assets.flpk_v3 import (
+    FlpkBuildChunk,
+    FlpkV3MappedArchive,
+    TEX_FMT_BC5_UNORM,
+    TEX_FMT_BC7_SRGB,
+    TEX_FMT_BC7_UNORM,
+    write_flpk_v3,
+)
+from flint.assets.glb_writer import write_native_glb
+from flint.assets.image import write_png
 from flint.assets.json import parse_json
 from flint.assets.mesh_builder import MeshBuilder
-from flint.assets.model import NativeAnimation, NativeChannel, NativeModel, NativeNode
-from flint.audio import AudioServer
+from flint.assets.model import NativeAnimation, NativeChannel, NativeMesh, NativeModel, NativeNode, NativeSkin
+from flint.assets.server import (
+    CookedTextureAsset,
+    Handle,
+    _asset_server_evict_texture_slot,
+)
+from flint.assets.watcher import AssetWatcher
+from flint.platform.os import list_directory, make_dirs, read_bytes, write_bytes
+from flint.audio import AudioServer, CLEAR_CUTOFF_HZ, encode_qoa
 from flint.audio.plugin import (
     AudioEmitterComponent,
     AudioListenerComponent,
@@ -75,7 +138,18 @@ from flint.audio.plugin import (
 )
 from flint.core.jobs import JobPool
 from flint.core.math import Vec3, Quat
-from flint.ecs import ComponentBitSet, Entity, ParallelCommands, World, comp_hash64
+from flint.core.serial import BlobReader, BlobWriter
+from flint.ecs import ComponentBitSet, Entity, NULL_ENTITY, ParallelCommands, World, comp_hash64
+from flint.nav import (
+    NavAgentComponent,
+    NavMeshComponent,
+    NavMeshConfig,
+    NavPlugin,
+    NavPluginStateResource,
+    bake_from_physics,
+    register_nav_codecs,
+    register_nav_components,
+)
 from flint.input import ACTION_BOOL, InputContext, InputMap
 from flint.input.plugin import InputPlugin, InputStateResource
 from flint.net import (
@@ -113,11 +187,15 @@ from flint.physics.plugin import (
     ClothMeshComponent,
     ColliderComponent,
     JointComponent,
+    OnEnter,
+    OnExit,
     PhysicsEventsResource,
     PhysicsPlugin,
+    PhysicsSyncStateResource,
     RigidBodyComponent,
     TriggerEventsResource,
     VehicleComponent,
+    entity_from_body,
     register_physics_codecs,
     register_physics_components,
 )
@@ -143,8 +221,10 @@ from flint.render.plugin import (
     register_render_codecs,
     register_render_components,
 )
+from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.render.render_world import (
     RENDER_TIER_0_HEADLESS_SIMD,
+    RENDER_TIER_2_AAA_VISBUFFER_RT,
     RenderWorld,
     ScalableRenderer,
 )
@@ -160,6 +240,12 @@ from flint.scene import (
     propagate_transforms_parallel_cached,
     set_parent,
 )
+from flint.studio.studio_app import FlintStudioState
+from flint.platform.input import InputState
+from flint.render.font import DSF_MAGIC
+from flint.ui.context import UiContext
+from flint.ui.draw_list import PRIM_GLYPH
+from flint.ui.hud import game_hud
 
 
 def _make_biped_model() -> NativeModel:
@@ -2554,9 +2640,2100 @@ def test_schedule_conflict_with_explicit_dependency() raises:
     assert_equal(log[2], 2)  # s1
 
 
+def test_m3a_nav_plugin_lifecycle_and_overlay() raises:
+    # 1. Component & codec registration + binary/JSON round-trip
+    var reg = ComponentRegistry.with_builtins()
+    register_nav_codecs(reg)
+    assert_true(reg.find_by_name("NavMeshComponent") >= 0)
+    assert_true(reg.find_by_name("NavAgentComponent") >= 0)
+
+    var nmc = NavMeshComponent(cell_size=0.3, draw_debug=True, auto_bake=True)
+    var bw_nm = BlobWriter()
+    nmc.write_bin(bw_nm)
+    var br_nm = BlobReader(bw_nm.data.copy())
+    var nmc2 = NavMeshComponent.read_bin(br_nm, NavMeshComponent.SCHEMA_VERSION)
+    assert_true(abs(nmc2.cell_size - Float32(0.3)) < Float32(1.0e-5))
+    assert_true(nmc2.auto_bake)
+
+    var nac = NavAgentComponent(goal=Vec3(5.0, 0.0, 0.0), has_goal=True, max_speed=4.0)
+    var bw_na = BlobWriter()
+    nac.write_bin(bw_na)
+    var br_na = BlobReader(bw_na.data.copy())
+    var nac2 = NavAgentComponent.read_bin(br_na, NavAgentComponent.SCHEMA_VERSION)
+    assert_true(nac2.has_goal and abs(nac2.goal.x - Float32(5.0)) < Float32(1.0e-5))
+    assert_equal(nac2.agent_id, -1)
+
+    # 2. EngineApp + NavPlugin + PhysicsPlugin + RenderWorld overlay_lines + crowd step
+    var app = EngineApp(AppConfig(title="m3a_nav_plugin", headless=True, worker_threads=0, fixed_hz=60.0))
+    app.add_plugin(TransformPlugin())
+    app.add_plugin(PhysicsPlugin(gravity=0.0))
+    app.add_plugin(NavPlugin(draw_debug=True))
+    app.insert_resource[RenderWorld](RenderWorld())
+    app.startup()
+
+    var has_nav_sys = False
+    ref fixed_sys = app.schedule.stages[STAGE_FIXED_UPDATE].systems
+    for i in range(len(fixed_sys)):
+        if String(fixed_sys[i].name).find("nav") >= 0:
+            has_nav_sys = True
+            break
+    assert_true(has_nav_sys)
+
+    var floor_e = app.world.spawn()
+    _ = app.world.insert[LocalTransform](floor_e, LocalTransform(Vec3(0.0, -0.5, 0.0)))
+    _ = app.world.insert[GlobalTransform](floor_e, GlobalTransform())
+    _ = app.world.insert[PrevGlobalTransform](floor_e, PrevGlobalTransform())
+    _ = app.world.insert[ColliderComponent](floor_e, ColliderComponent.box(Vec3(10.0, 0.5, 10.0)))
+    _ = app.world.insert[RigidBodyComponent](floor_e, RigidBodyComponent.static_body())
+
+    var nav_e = app.world.spawn()
+    _ = app.world.insert[NavMeshComponent](nav_e, NavMeshComponent(draw_debug=True, auto_bake=True))
+
+    var ag_e = app.world.spawn()
+    _ = app.world.insert[LocalTransform](ag_e, LocalTransform(Vec3(-4.0, 0.0, 0.0)))
+    _ = app.world.insert[GlobalTransform](ag_e, GlobalTransform())
+    _ = app.world.insert[PrevGlobalTransform](ag_e, PrevGlobalTransform())
+    _ = app.world.insert[NavAgentComponent](ag_e, NavAgentComponent(goal=Vec3(4.0, 0.0, 0.0), has_goal=True))
+
+    assert_true(bake_from_physics(app.world) > 0)
+
+    for _ in range(15):
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+    var nav_res = app.resources.get_ptr[NavPluginStateResource]()
+    assert_true(Bool(nav_res) and nav_res.value()[unsafe_offset=0].baked)
+    assert_true(nav_res.value()[unsafe_offset=0].last_poly_count > 0)
+
+    var rw_ptr = app.resources.get_ptr[RenderWorld]()
+    assert_true(Bool(rw_ptr) and rw_ptr.value()[unsafe_offset=0].overlay_lines.segment_count() > 0)
+
+    var ag_pos = app.world.get_ptr[LocalTransform](ag_e).value()[unsafe_offset=0].translation
+    assert_true(ag_pos.x > Float32(-3.8))
+    app.shutdown()
+
+
+def _plug_str_bytes(s: String) -> List[UInt8]:
+    var out = List[UInt8](capacity=s.byte_length())
+    for b in s.as_bytes():
+        out.append(b)
+    return out^
+
+
+def _plug_rm_rf(path: String):
+    var cmd = "rm -rf '" + path + "'"
+    _ = external_call["system", Int32](cmd.as_c_string_span())
+
+
+def _make_cube_mesh_for_plug() -> NativeMesh:
+    var mb = MeshBuilder()
+    mb.add_beveled_box(Vec3(), Vec3(0.5, 0.5, 0.5), Float32(0.02))
+    return mb^.finish()
+
+
+def _make_skinned_biped_for_asset_plugin() -> NativeModel:
+    var m = _make_biped_model()
+    var cube = _make_cube_mesh_for_plug()
+    var nv = cube.vertex_count()
+    for _ in range(nv):
+        cube.joints.append(UInt16(0))
+        cube.joints.append(UInt16(1))
+        cube.joints.append(UInt16(0))
+        cube.joints.append(UInt16(0))
+        cube.weights.append(Float32(0.5))
+        cube.weights.append(Float32(0.5))
+        cube.weights.append(Float32(0.0))
+        cube.weights.append(Float32(0.0))
+    m.meshes.append(cube^)
+    m.nodes[0].mesh = 0
+    var skin = NativeSkin()
+    for j in range(4):
+        skin.joints.append(j)
+        for k in range(16):
+            skin.inverse_bind.append(Float32(1.0) if (k % 5 == 0) else Float32(0.0))
+    m.skins.append(skin^)
+    return m^
+
+
+def test_m4a_asset_server_traversal_and_asset_ref_unsafe_path() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_trav_" + String(pid)
+    _plug_rm_rf(tmp)
+    var ws = tmp + "/ws"
+    _ = make_dirs(ws + "/meshes")
+    try:
+        # Outside files in parent directory (must NOT be reachable via ../ traversal)
+        var b_txt = _plug_str_bytes("SECRET_TEXT")
+        _ = write_bytes(tmp + "/outside.txt", b_txt)
+        var px = List[UInt32](length=4, fill=0xFFFFFFFF)
+        _ = write_png(tmp + "/outside.png", px, 2, 2, stamped=False)
+        var b_wav = _plug_str_bytes("RIFF0000WAVEfmt ")
+        _ = write_bytes(tmp + "/outside.wav", b_wav)
+        var b_hdr = _plug_str_bytes("#?RADIANCE\n\n-Y 1 +X 1\n")
+        _ = write_bytes(tmp + "/outside.hdr", b_hdr)
+        var b_ttf = _plug_str_bytes("TTF_STUB_BYTES")
+        _ = write_bytes(tmp + "/outside.ttf", b_ttf)
+        var m_out = NativeModel()
+        m_out.meshes.append(_make_cube_mesh_for_plug())
+        _ = write_native_glb(tmp + "/outside.glb", m_out)
+
+        # Valid inside mesh with valid UUID
+        var m_in = NativeModel()
+        m_in.meshes.append(_make_cube_mesh_for_plug())
+        _ = write_native_glb(ws + "/meshes/valid.glb", m_in)
+
+        var srv = AssetServer(enable_watcher=False)
+        _ = srv.watch_loose_directory(ws)
+
+        # Every load_* method must reject traversal paths
+        assert_true(not srv.raws.is_loaded(srv.load_raw("../outside.txt")))
+        assert_true(not srv.textures.is_loaded(srv.load_texture("../outside.png")))
+        assert_true(not srv.audios.is_loaded(srv.load_audio("../outside.wav")))
+        assert_true(not srv.hdrs.is_loaded(srv.load_hdr("../outside.hdr")))
+        assert_true(not srv.fonts.is_loaded(srv.load_font("../outside.ttf")))
+        assert_true(not srv.meshes.is_alive(srv.load_mesh_async("../outside.glb")))
+        assert_true(not srv.textures.is_alive(srv.load_texture_async("../outside.png")))
+
+        # Valid UUID + unsafe rel_path in AssetRef must be rejected by resolve_mesh
+        var h_valid = srv.load_mesh("meshes/valid.glb")
+        assert_true(srv.meshes.is_loaded(h_valid))
+        var valid_uuid = srv.meshes.uuids[Int(h_valid.slot())]
+        var bad_ref = AssetRef(valid_uuid, "../outside.glb", ASSET_KIND_MESH)
+        assert_equal(bad_ref.rel_path, "../outside.glb")
+        assert_true(not srv.meshes.is_loaded(srv.resolve_mesh(bad_ref)))
+        srv.close()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4a_asset_plugin_skinned_frame2_and_flrig_hot_reload() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_m4a_" + String(pid)
+    _plug_rm_rf(tmp)
+    var ws = tmp + "/ws"
+    _ = make_dirs(ws + "/meshes")
+    _ = make_dirs(ws + "/rigs")
+    try:
+        var m_char = _make_skinned_biped_for_asset_plugin()
+        _ = write_native_glb(ws + "/meshes/char.glb", m_char)
+
+        var rig3 = FrigRigDef("HeroRig")
+        rig3.joints.append(FrigJointDef("Root", -1, Vec3(), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig3.joints.append(FrigJointDef("Spine", 0, Vec3(0.0, 1.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig3.joints.append(FrigJointDef("Head", 1, Vec3(0.0, 0.5, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        _ = save_flrig_file(ws + "/rigs/hero.flrig", rig3)
+
+        var app = EngineApp(AppConfig(title="M4aSkinHot", headless=True, worker_threads=0))
+        app.add_plugin(TransformPlugin())
+        app.add_plugin(AssetPlugin(loose_root=ws, enable_watcher=True))
+        app.add_plugin(AnimPlugin())
+        app.add_plugin(RenderPlugin(tier=RENDER_TIER_0_HEADLESS_SIMD, width=64, height=64))
+        app.startup()
+
+        var model_id = UInt64(101)
+        app.resources.get_ptr_mut[AnimAssetCache]().value()[unsafe_offset=0].register_model(
+            model_id, _make_skinned_biped_for_asset_plugin()
+        )
+
+        var mesh_ref = AssetRef.from_path("meshes/char.glb", ASSET_KIND_MESH)
+        var rig_ref = AssetRef.from_path("rigs/hero.flrig", ASSET_KIND_RAW)
+
+        var e_a = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_a, LocalTransform(Vec3(-1.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_a, GlobalTransform())
+        _ = app.world.insert[MeshRendererComponent](e_a, MeshRendererComponent(-1, -1, True, True, mesh_ref.copy()))
+        _ = app.world.insert[SkeletonComponent](e_a, SkeletonComponent(model_id))
+
+        var e_b = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_b, LocalTransform(Vec3(1.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_b, GlobalTransform())
+        _ = app.world.insert[MeshRendererComponent](e_b, MeshRendererComponent(-1, -1, True, True, mesh_ref.copy()))
+        _ = app.world.insert[SkeletonComponent](e_b, SkeletonComponent(model_id))
+
+        var e_rig = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_rig, LocalTransform(Vec3(0.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_rig, GlobalTransform())
+        _ = app.world.insert[SkeletonComponent](e_rig, SkeletonComponent(0, rig_ref=rig_ref.copy()))
+        _ = app.world.insert[RigComponent](e_rig, RigComponent(rig_ref.copy()))
+
+        # Frame 1..3: distinct skinned mesh_ids persist (AssetPlugin must NOT clobber back to static mesh)
+        app.step_one_frame(Float32(1.0 / 60.0))
+        var mid_a1 = app.world.get_ptr[MeshRendererComponent](e_a).value()[].mesh_id
+        var mid_b1 = app.world.get_ptr[MeshRendererComponent](e_b).value()[].mesh_id
+        assert_true(mid_a1 >= 0 and mid_b1 >= 0 and mid_a1 != mid_b1)
+        assert_equal(app.world.get_ptr[RigComponent](e_rig).value()[].joint_count, 3)
+        assert_equal(app.world.get_ptr[SkeletonComponent](e_rig).value()[].skeleton.node_count, 3)
+
+        for _ in range(2):
+            app.step_one_frame(Float32(1.0 / 60.0))
+            assert_equal(app.world.get_ptr[MeshRendererComponent](e_a).value()[].mesh_id, mid_a1)
+            assert_equal(app.world.get_ptr[MeshRendererComponent](e_b).value()[].mesh_id, mid_b1)
+
+        # Hot-reload hero.flrig (3 -> 4 joints) -> BOTH RigComponent & SkeletonComponent update
+        var rig4 = FrigRigDef("HeroRig")
+        rig4.joints.append(FrigJointDef("Root", -1, Vec3(), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig4.joints.append(FrigJointDef("Spine", 0, Vec3(0.0, 1.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig4.joints.append(FrigJointDef("Neck", 1, Vec3(0.0, 0.4, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig4.joints.append(FrigJointDef("Head", 2, Vec3(0.0, 0.3, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        _ = save_flrig_file(ws + "/rigs/hero.flrig", rig4)
+        # Also hot-reload char.glb -> skinned_entries must re-allocate with distinct skinned mesh_ids
+        var m_char2 = _make_skinned_biped_for_asset_plugin()
+        _ = write_native_glb(ws + "/meshes/char.glb", m_char2)
+
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1000.0)
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1001.0)
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        assert_equal(app.world.get_ptr[RigComponent](e_rig).value()[].joint_count, 4)
+        assert_equal(app.world.get_ptr[SkeletonComponent](e_rig).value()[].skeleton.node_count, 4)
+
+        var mid_a_rel = app.world.get_ptr[MeshRendererComponent](e_a).value()[].mesh_id
+        var mid_b_rel = app.world.get_ptr[MeshRendererComponent](e_b).value()[].mesh_id
+        assert_true(mid_a_rel > mid_a1 and mid_b_rel > mid_b1 and mid_a_rel != mid_b_rel)
+
+        app.shutdown()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def _count_open_fds() -> Int:
+    return len(list_directory("/proc/self/fd"))
+
+
+@no_inline
+def _overwrite_stack_frames(depth: Int) -> Int:
+    var junk = Array[UInt64, 512](fill=0xDEADBEEFCAFEBABE)
+    var acc = Int(junk[0] & 1)
+    if depth > 0:
+        acc += _overwrite_stack_frames(depth - 1)
+    return acc
+
+
+@no_inline
+def _make_and_move_watcher(dir_path: String) -> AssetWatcher:
+    var w = AssetWatcher(enabled=True)
+    _ = w.watch_recursive(dir_path)
+    return w^
+
+
+@no_inline
+def _open_and_move_archive(pack_path: String) -> FlpkV3MappedArchive:
+    var arch = FlpkV3MappedArchive.open(pack_path)
+    return arch^
+
+
+@no_inline
+def _setup_moved_server_mock_bridge(mut out_res: Resources) -> Tuple[Int, Handle[CookedTextureAsset]]:
+    var srv = AssetServer(lru_max_bytes=65536, enable_watcher=False)
+    srv.textures.set_evict_hook(Int(Pointer(to=srv)), _asset_server_evict_texture_slot)
+    var tex = CookedTextureAsset()
+    tex.width = 64
+    tex.height = 64
+    tex.mip_count = 1
+    tex.mips.append(List[UInt8](length=128 * 1024, fill=UInt8(0x7F)))
+    var h = srv.textures.insert(tex^, AssetUuid.from_path("tex/mock_lru.png"), "tex/mock_lru.png", 1)
+    var slot = Int(h.slot())
+    srv.streamer._ensure_slot(slot)
+    srv.streamer.slot_bindless_idx[slot] = 7
+    var old_addr = Int(Pointer(to=srv))
+    out_res.insert(srv^)
+    return (old_addr, h)
+
+
+@no_inline
+def _setup_moved_server_vk_bridge(
+    mut ren: FlintAaaVulkanRenderer, mut out_res: Resources
+) -> Tuple[Int, Handle[CookedTextureAsset]]:
+    var srv = AssetServer(lru_max_bytes=65536, enable_watcher=False)
+    srv.attach_renderer_residency_bridge(ren)
+    var h = srv.textures.allocate_queued(
+        AssetUuid.from_path("tex/vk_move_evict.png"), "tex/vk_move_evict.png", 1
+    )
+    _ = srv.upload_mip_to_gpu(h, mip_level=0, byte_size=4096)
+    srv.lru_max_bytes = 512
+    var old_addr = Int(Pointer(to=srv))
+    out_res.insert(srv^)
+    return (old_addr, h)
+
+
+def test_m4a_move_constructors_residency_bridge_and_fd_leaks() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_moves_" + String(pid)
+    _plug_rm_rf(tmp)
+    _ = make_dirs(tmp + "/watch")
+    try:
+        # 1. AssetWatcher multi-move (function return + List reallocation) fd-leak check
+        var fd_base_w = _count_open_fds()
+        var watchers = List[AssetWatcher]()
+        for _ in range(4):
+            watchers.append(_make_and_move_watcher(tmp + "/watch"))
+        for wi in range(len(watchers)):
+            assert_true(watchers[wi].fd >= 0)
+            assert_true(len(watchers[wi].watch_descriptors) >= 1)
+        assert_equal(_count_open_fds(), fd_base_w + 4)
+        watchers.clear()
+        assert_equal(_count_open_fds(), fd_base_w)
+
+        # 2. FlpkV3MappedArchive multi-move (function return + List reallocation) fd/mmap leak check
+        var pack_path = tmp + "/test.flpk"
+        var chunks = List[FlpkBuildChunk]()
+        var payload = _plug_str_bytes("FLPK_MOVE_TEST_PAYLOAD")
+        chunks.append(FlpkBuildChunk(AssetUuid.from_path("data/p.txt"), "data/p.txt", 0, ASSET_KIND_RAW, payload^))
+        assert_true(write_flpk_v3(pack_path, chunks, page_align=True))
+
+        var fd_base_a = _count_open_fds()
+        var arches = List[FlpkV3MappedArchive]()
+        for _ in range(4):
+            arches.append(_open_and_move_archive(pack_path))
+        for ai in range(len(arches)):
+            assert_true(arches[ai].valid)
+            assert_equal(arches[ai].toc_count(), 1)
+            assert_true(arches[ai].addr != 0)
+            assert_true(arches[ai].fd >= 0)
+        assert_equal(_count_open_fds(), fd_base_a + 4)
+        arches.clear()
+        assert_equal(_count_open_fds(), fd_base_a)
+
+        # 3. AssetServer move across stack frames -> overwrite dead stack -> enforce_lru_budget() (mock bridge)
+        var mock_res = Resources()
+        var mock_setup = _setup_moved_server_mock_bridge(mock_res)
+        var old_mock_addr = mock_setup[0]
+        var h_mock = mock_setup[1]
+        _ = _overwrite_stack_frames(4)
+        ref srv_mock = mock_res.get_ptr_mut[AssetServer]().value()[unsafe_offset=0]
+        var moved_mock_addr = Int(Pointer(to=srv_mock))
+        assert_true(moved_mock_addr != old_mock_addr)
+        assert_equal(srv_mock.textures.evict_ctx, moved_mock_addr)
+        assert_true(srv_mock.textures.release(h_mock))
+        var evicted_mock = srv_mock.enforce_lru_budget()
+        assert_equal(evicted_mock, 1)
+        assert_true(not srv_mock.textures.is_alive(h_mock))
+        assert_equal(srv_mock.streamer.slot_bindless_idx[Int(h_mock.slot())], -1)
+        srv_mock.close()
+
+        # 4. Live Tier 2 Vulkan attach_renderer_residency_bridge + move into Resources + stack overwrite + LRU evict
+        var ren = ScalableRenderer(RENDER_TIER_2_AAA_VISBUFFER_RT, width=64, height=64)
+        if ren.uses_vulkan():
+            var vk_res = Resources()
+            var vk_setup = _setup_moved_server_vk_bridge(ren.gpu_slot[0], vk_res)
+            var old_vk_addr = vk_setup[0]
+            var h_vk = vk_setup[1]
+            _ = _overwrite_stack_frames(4)
+            ref srv_vk = vk_res.get_ptr_mut[AssetServer]().value()[unsafe_offset=0]
+            var moved_vk_addr = Int(Pointer(to=srv_vk))
+            assert_true(moved_vk_addr != old_vk_addr)
+            assert_equal(srv_vk.textures.evict_ctx, moved_vk_addr)
+            var slot_vk = Int(h_vk.slot())
+            var b_idx = srv_vk.streamer.slot_bindless_idx[slot_vk]
+            assert_true(b_idx >= 0)
+            assert_true(srv_vk.total_vram_live_bytes() > 0)
+            assert_true(srv_vk.textures.release(h_vk))
+            var evicted_vk = srv_vk.enforce_lru_budget()
+            assert_equal(evicted_vk, 1)
+            assert_true(not srv_vk.textures.is_alive(h_vk))
+            assert_equal(srv_vk.total_vram_live_bytes(), 0)
+            assert_equal(ren.gpu_slot[0].bindless_vram_bytes[b_idx], 0)
+            srv_vk.close()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def _make_test_wav_16bit(freq_step: Float32, n_samples: Int = 64) -> List[UInt8]:
+    var data_bytes = n_samples * 2
+    var riff_size = 36 + data_bytes
+    var out = List[UInt8](capacity=44 + data_bytes)
+    for b in "RIFF".as_bytes():
+        out.append(b)
+    for s in range(4):
+        out.append(UInt8((riff_size >> (s * 8)) & 0xFF))
+    for b in "WAVEfmt ".as_bytes():
+        out.append(b)
+    for b in [UInt8(16), 0, 0, 0, 1, 0, 1, 0]:
+        out.append(b)
+    var sr = 48000
+    for s in range(4):
+        out.append(UInt8((sr >> (s * 8)) & 0xFF))
+    var br = sr * 2
+    for s in range(4):
+        out.append(UInt8((br >> (s * 8)) & 0xFF))
+    for b in [UInt8(2), 0, 16, 0]:
+        out.append(b)
+    for b in "data".as_bytes():
+        out.append(b)
+    for s in range(4):
+        out.append(UInt8((data_bytes >> (s * 8)) & 0xFF))
+    for i in range(n_samples):
+        var v = Int16(Int(sin(Float32(i) * freq_step) * Float32(10000.0)))
+        var u = UInt16(v)
+        out.append(UInt8(u & 0xFF))
+        out.append(UInt8((u >> 8) & 0xFF))
+    return out^
+
+
+def test_m4a_scene_asset_resolver_shared_flmat_and_audio_hot_reload() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_flmat_au_" + String(pid)
+    _plug_rm_rf(tmp)
+    var ws = tmp + "/ws"
+    _ = make_dirs(ws + "/meshes")
+    _ = make_dirs(ws + "/materials")
+    _ = make_dirs(ws + "/audio")
+    try:
+        var m_cube = NativeModel()
+        m_cube.meshes.append(_make_cube_mesh_for_plug())
+        _ = write_native_glb(ws + "/meshes/cube.glb", m_cube)
+
+        var mat1 = FlmatAsset("SharedMat")
+        mat1.base_color = Vec3(0.2, 0.5, 0.8)
+        mat1.roughness = Float32(0.65)
+        mat1.metallic = Float32(0.25)
+        mat1.clearcoat = Float32(0.4)
+        mat1.opacity = Float32(0.85)
+        mat1.emissive = Vec3(0.1, 0.2, 0.3)
+        _ = save_flmat_file(ws + "/materials/shared.flmat", mat1)
+
+        var wav1 = _make_test_wav_16bit(Float32(0.2), 64)
+        _ = write_bytes(ws + "/audio/beep.wav", wav1)
+
+        var app = EngineApp(AppConfig(title="M4aSharedFlmatAu", headless=True, worker_threads=0))
+        app.add_plugin(TransformPlugin())
+        app.add_plugin(AssetPlugin(loose_root=ws, enable_watcher=True))
+        app.add_plugin(AudioPlugin(headless=True))
+        app.add_plugin(RenderPlugin(tier=RENDER_TIER_0_HEADLESS_SIMD, width=64, height=64))
+        app.startup()
+
+        var mesh_ref = AssetRef.from_path("meshes/cube.glb", ASSET_KIND_MESH)
+        var mat_ref = AssetRef.from_path("materials/shared.flmat", ASSET_KIND_RAW)
+        var au_ref = AssetRef.from_path("audio/beep.wav", ASSET_KIND_AUDIO)
+
+        # Two MaterialOverrideComponent entities sharing mat_ref
+        var e_mo1 = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_mo1, LocalTransform(Vec3(-2.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_mo1, GlobalTransform())
+        _ = app.world.insert[MeshRendererComponent](e_mo1, MeshRendererComponent(-1, -1, True, True, mesh_ref.copy()))
+        _ = app.world.insert[MaterialOverrideComponent](e_mo1, MaterialOverrideComponent(material_ref=mat_ref.copy()))
+
+        var e_mo2 = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_mo2, LocalTransform(Vec3(0.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_mo2, GlobalTransform())
+        _ = app.world.insert[MeshRendererComponent](e_mo2, MeshRendererComponent(-1, -1, True, True, mesh_ref.copy()))
+        _ = app.world.insert[MaterialOverrideComponent](e_mo2, MaterialOverrideComponent(material_ref=mat_ref.copy()))
+
+        # Third entity with BOTH MeshRendererComponent(material_ref=mat_ref) and MaterialOverrideComponent(material_ref=mat_ref)
+        var e_both = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_both, LocalTransform(Vec3(2.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_both, GlobalTransform())
+        _ = app.world.insert[MeshRendererComponent](
+            e_both, MeshRendererComponent(-1, -1, True, True, mesh_ref.copy(), mat_ref.copy())
+        )
+        _ = app.world.insert[MaterialOverrideComponent](e_both, MaterialOverrideComponent(material_ref=mat_ref.copy()))
+
+        # Two AudioEmitterComponent entities sharing audio_ref
+        var e_au1 = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_au1, LocalTransform(Vec3(-1.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_au1, GlobalTransform())
+        _ = app.world.insert[AudioEmitterComponent](
+            e_au1, AudioEmitterComponent(asset_id=-1, audio_ref=au_ref.copy(), play_on_spawn=False)
+        )
+
+        var e_au2 = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_au2, LocalTransform(Vec3(1.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_au2, GlobalTransform())
+        _ = app.world.insert[AudioEmitterComponent](
+            e_au2, AudioEmitterComponent(asset_id=-1, audio_ref=au_ref.copy(), play_on_spawn=False)
+        )
+
+        # Frame 1: ALL three MaterialOverrideComponent entities and override_slots receive initial .flmat properties
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        ref ren = app.resources.get_ptr[ScalableRenderer]().value()[unsafe_offset=0]
+        ref rstate = app.resources.get_ptr[RenderPluginStateResource]().value()[unsafe_offset=0]
+        var shared_mr_mat = app.world.get_ptr[MeshRendererComponent](e_both).value()[].material_id
+        assert_true(shared_mr_mat >= 0)
+
+        var mo_ents = [e_mo1, e_mo2, e_both]
+        for idx in range(len(mo_ents)):
+            var ee = mo_ents[idx]
+            ref mo = app.world.get_ptr[MaterialOverrideComponent](ee).value()[unsafe_offset=0]
+            assert_equal(mo.material_id, shared_mr_mat)
+            assert_true(abs(mo.base_color.x - Float32(0.2)) < Float32(1.0e-4))
+            assert_true(abs(mo.base_color.y - Float32(0.5)) < Float32(1.0e-4))
+            assert_true(abs(mo.base_color.z - Float32(0.8)) < Float32(1.0e-4))
+            assert_true(abs(mo.roughness - Float32(0.65)) < Float32(1.0e-4))
+            assert_true(abs(mo.metallic - Float32(0.25)) < Float32(1.0e-4))
+            assert_true(abs(mo.clearcoat - Float32(0.4)) < Float32(1.0e-4))
+            assert_true(abs(mo.opacity - Float32(0.85)) < Float32(1.0e-4))
+            assert_true(abs(mo.emissive.x - Float32(0.1)) < Float32(1.0e-4))
+
+            var ov_slot_opt = rstate.override_slots.get(ee.to_bits())
+            assert_true(Bool(ov_slot_opt))
+            var ov_slot = ov_slot_opt.value().slot_id
+            assert_true(ov_slot >= 0 and ov_slot < len(ren.materials))
+            assert_true(abs(ren.materials[ov_slot].base_color.x - Float32(0.2)) < Float32(1.0e-4))
+            assert_true(abs(ren.materials[ov_slot].roughness - Float32(0.65)) < Float32(1.0e-4))
+
+        var aid1 = app.world.get_ptr[AudioEmitterComponent](e_au1).value()[].asset_id
+        var aid2 = app.world.get_ptr[AudioEmitterComponent](e_au2).value()[].asset_id
+        assert_true(aid1 >= 0)
+        assert_equal(aid2, aid1)
+
+        # Late-spawned MaterialOverrideComponent reusing cached mat_ref also populates .flmat properties
+        var e_late = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_late, LocalTransform(Vec3(4.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_late, GlobalTransform())
+        _ = app.world.insert[MeshRendererComponent](e_late, MeshRendererComponent(-1, -1, True, True, mesh_ref.copy()))
+        _ = app.world.insert[MaterialOverrideComponent](e_late, MaterialOverrideComponent(material_ref=mat_ref.copy()))
+        app.step_one_frame(Float32(1.0 / 60.0))
+        ref mo_late = app.world.get_ptr[MaterialOverrideComponent](e_late).value()[unsafe_offset=0]
+        assert_equal(mo_late.material_id, shared_mr_mat)
+        assert_true(abs(mo_late.base_color.x - Float32(0.2)) < Float32(1.0e-4))
+        assert_true(abs(mo_late.roughness - Float32(0.65)) < Float32(1.0e-4))
+
+        # Hot-reload shared.flmat AND audio/beep.wav -> ALL entities and override_slots update
+        var mat2 = FlmatAsset("SharedMat")
+        mat2.base_color = Vec3(0.9, 0.15, 0.25)
+        mat2.roughness = Float32(0.12)
+        mat2.metallic = Float32(0.9)
+        mat2.clearcoat = Float32(0.8)
+        mat2.opacity = Float32(0.5)
+        mat2.emissive = Vec3(0.4, 0.5, 0.6)
+        _ = save_flmat_file(ws + "/materials/shared.flmat", mat2)
+        var wav2 = _make_test_wav_16bit(Float32(0.4), 96)
+        _ = write_bytes(ws + "/audio/beep.wav", wav2)
+
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1000.0)
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1001.0)
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        var all_mo_ents = [e_mo1, e_mo2, e_both, e_late]
+        for idx in range(len(all_mo_ents)):
+            var ee = all_mo_ents[idx]
+            ref mo = app.world.get_ptr[MaterialOverrideComponent](ee).value()[unsafe_offset=0]
+            assert_true(abs(mo.base_color.x - Float32(0.9)) < Float32(1.0e-4))
+            assert_true(abs(mo.base_color.y - Float32(0.15)) < Float32(1.0e-4))
+            assert_true(abs(mo.base_color.z - Float32(0.25)) < Float32(1.0e-4))
+            assert_true(abs(mo.roughness - Float32(0.12)) < Float32(1.0e-4))
+            assert_true(abs(mo.metallic - Float32(0.9)) < Float32(1.0e-4))
+            assert_true(abs(mo.clearcoat - Float32(0.8)) < Float32(1.0e-4))
+            assert_true(abs(mo.opacity - Float32(0.5)) < Float32(1.0e-4))
+            assert_true(abs(mo.emissive.x - Float32(0.4)) < Float32(1.0e-4))
+
+            var ov_slot_opt = rstate.override_slots.get(ee.to_bits())
+            assert_true(Bool(ov_slot_opt))
+            var ov_slot = ov_slot_opt.value().slot_id
+            assert_true(abs(ren.materials[ov_slot].base_color.x - Float32(0.9)) < Float32(1.0e-4))
+            assert_true(abs(ren.materials[ov_slot].roughness - Float32(0.12)) < Float32(1.0e-4))
+
+        assert_true(abs(ren.materials[shared_mr_mat].base_color.x - Float32(0.9)) < Float32(1.0e-4))
+        assert_true(abs(ren.materials[shared_mr_mat].roughness - Float32(0.12)) < Float32(1.0e-4))
+
+        var aid1_rel = app.world.get_ptr[AudioEmitterComponent](e_au1).value()[].asset_id
+        var aid2_rel = app.world.get_ptr[AudioEmitterComponent](e_au2).value()[].asset_id
+        assert_true(aid1_rel > aid1)
+        assert_equal(aid2_rel, aid1_rel)
+
+        app.shutdown()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4a_skeleton_and_animator_flscn_state_hash_parity() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_skel_hash_" + String(pid)
+    _plug_rm_rf(tmp)
+    _ = make_dirs(tmp)
+    try:
+        var s1 = FlintStudioState(headless=True)
+        var s2 = FlintStudioState(headless=True)
+        var flscn_path = tmp + "/anim_pose.flscn"
+
+        var e = s1.app.world.spawn_empty()
+        _ = s1.app.world.insert[LocalTransform](
+            e, LocalTransform(Vec3(1.5, 2.0, -3.0), Quat(), Vec3(1.0, 1.0, 1.0))
+        )
+
+        var sk = SkeletonInstance(3)
+        sk.parents[0] = -1
+        sk.parents[1] = 0
+        sk.parents[2] = 1
+        sk.pose.t[0] = Vec3(0.0, 1.2, 0.0)
+        sk.pose.t[1] = Vec3(0.1, 0.5, -0.2)
+        sk.pose.t[2] = Vec3(0.0, 0.4, 0.3)
+        sk.pose.r[1] = Quat.from_axis_angle(Vec3(0.0, 1.0, 0.0), Float32(0.5))
+        sk.pose.r[2] = Quat.from_axis_angle(Vec3(1.0, 0.0, 0.0), Float32(-0.35))
+        sk.pose.s[2] = Vec3(1.2, 1.0, 0.8)
+        _ = s1.app.world.insert[SkeletonComponent](
+            e,
+            SkeletonComponent(
+                UInt64(101),
+                sk^,
+                False,
+                AssetRef.from_path("rigs/hero.flrig", ASSET_KIND_RAW),
+            ),
+        )
+
+        var ac = AnimatorComponent(
+            UInt64(202),
+            apply_root_motion=True,
+            enable_foot_plant=True,
+            ignore_body_id=7,
+            graph_ref=AssetRef.from_path("anims/hero.flanim", ASSET_KIND_RAW),
+            clip_index=1,
+            clip_name="Run",
+            playing=False,
+            loop=False,
+            time=Float32(0.6),
+            speed=Float32(1.5),
+        )
+        ac.bound = True
+        ac.animator.state = 2
+        ac.animator.previous = 1
+        ac.animator.state_time = Float32(0.75)
+        ac.animator.clip_time = Float32(0.35)
+        ac.animator.prev_clip_time = Float32(0.25)
+        ac.animator.phase = Float32(0.4)
+        ac.animator.prev_phase = Float32(0.3)
+        ac.animator.params.append(Float32(0.8))
+        ac.animator.params.append(Float32(-0.5))
+        ac.foot_plant.pelvis = 1
+        ac.foot_plant.add_leg(1, 2, 3, Float32(0.12), Vec3(0.0, 0.5, 1.0))
+        ac.foot_in_stance.append(True)
+        ac.foot_in_stance.append(False)
+        _ = s1.app.world.insert[AnimatorComponent](e, ac^)
+
+        assert_true(s1.save_scene_file(flscn_path))
+        assert_true(s2.load_scene_file(flscn_path))
+        assert_equal(s1.state_hash(), s2.state_hash())
+
+        var sk_ents = s2.app.world.query_entities(s2.app.world.bit_for[SkeletonComponent]())
+        assert_equal(len(sk_ents), 1)
+        var e2 = sk_ents[0]
+        ref sk2 = s2.app.world.get_ptr[SkeletonComponent](e2).value()[unsafe_offset=0]
+        assert_equal(sk2.skeleton.node_count, 3)
+        assert_equal(sk2.skeleton.parents[0], -1)
+        assert_equal(sk2.skeleton.parents[1], 0)
+        assert_equal(sk2.skeleton.parents[2], 1)
+        assert_true(abs(sk2.skeleton.pose.t[1].y - Float32(0.5)) < Float32(1.0e-5))
+        assert_true(abs(sk2.skeleton.pose.s[2].x - Float32(1.2)) < Float32(1.0e-5))
+        assert_true(not sk2.dirty_topology)
+
+        ref ac2 = s2.app.world.get_ptr[AnimatorComponent](e2).value()[unsafe_offset=0]
+        assert_true(ac2.bound)
+        assert_equal(ac2.animator.state, 2)
+        assert_equal(ac2.animator.previous, 1)
+        assert_equal(len(ac2.animator.params), 2)
+        assert_equal(ac2.foot_plant.pelvis, 1)
+        assert_equal(len(ac2.foot_plant.legs), 1)
+        assert_equal(len(ac2.foot_in_stance), 2)
+        assert_true(ac2.foot_in_stance[0] and (not ac2.foot_in_stance[1]))
+
+        # Legacy minimal .flscn omitting parents/pose/runtime Animator fields still loads cleanly
+        var legacy_json = (
+            '{"format":"flscn","version":2,"name":"LegacySkel","entities":[{"slot":0,"parent":-1,'
+            '"components":{"SkeletonComponent":{"model_id":77,"node_count":2,"dirty_topology":false},'
+            '"AnimatorComponent":{"graph_id":88,"clip_name":"Idle"}}}]}'
+        )
+        var legacy_bytes = _plug_str_bytes(legacy_json)
+        var w_leg = World()
+        var reg_leg = ComponentRegistry.with_builtins()
+        register_anim_codecs(reg_leg)
+        var scn_leg = Scene("Legacy")
+        var ents_leg = scn_leg.load_flscn_bytes(w_leg, reg_leg, legacy_bytes)
+        assert_equal(len(ents_leg), 1)
+        ref sk_leg = w_leg.get_ptr[SkeletonComponent](ents_leg[0]).value()[unsafe_offset=0]
+        assert_equal(sk_leg.skeleton.node_count, 2)
+        assert_equal(sk_leg.skeleton.parents[0], -1)
+        assert_equal(sk_leg.skeleton.parents[1], -1)
+        assert_true(abs(sk_leg.skeleton.pose.s[0].x - Float32(1.0)) < Float32(1.0e-5))
+        ref ac_leg = w_leg.get_ptr[AnimatorComponent](ents_leg[0]).value()[unsafe_offset=0]
+        assert_equal(ac_leg.graph_id, UInt64(88))
+        assert_equal(ac_leg.clip_name, "Idle")
+        assert_equal(ac_leg.animator.state, -1)
+        assert_equal(len(ac_leg.animator.params), 0)
+
+        s1.shutdown()
+        s2.shutdown()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4a_asset_server_flpk_uuid_resolve_audio_and_texture() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_flpk_uuid_" + String(pid)
+    _plug_rm_rf(tmp)
+    var ws = tmp + "/ws"
+    _ = make_dirs(ws + "/textures")
+    _ = make_dirs(ws + "/audio")
+    try:
+        var pixels = List[UInt32](length=16 * 16, fill=UInt32(0xFF4080C0))
+        assert_true(write_png(ws + "/textures/hero_alb.png", pixels, 16, 16, stamped=False))
+        var wav_bytes = _make_test_wav_16bit(Float32(0.25), 64)
+        assert_true(write_bytes(ws + "/audio/hit.wav", wav_bytes))
+
+        var pcm = List[Int16](capacity=160)
+        for i in range(160):
+            pcm.append(Int16(Int(sin(Float32(i) * Float32(0.15)) * Float32(12000.0))))
+        var qoa_bytes = encode_qoa(pcm, 1, 48000)
+        assert_true(len(qoa_bytes) > 16)
+        assert_true(write_bytes(ws + "/audio/sfx.qoa", qoa_bytes))
+
+        var flpk_path = tmp + "/game.flpk"
+        var pool = JobPool()
+        var rep = cook_workspace(ws, flpk_path, pool, cache_dir=tmp + "/cache", page_align=True)
+        assert_true(rep.ok)
+        assert_equal(rep.failed_count, 0)
+
+        var tex_uuid = AssetUuid()
+        var wav_uuid = AssetUuid()
+        var qoa_uuid = AssetUuid()
+        for i in range(len(rep.rel_paths)):
+            if rep.rel_paths[i] == "textures/hero_alb.png":
+                tex_uuid = rep.uuids[i]
+            elif rep.rel_paths[i] == "audio/hit.wav":
+                wav_uuid = rep.uuids[i]
+            elif rep.rel_paths[i] == "audio/sfx.qoa":
+                qoa_uuid = rep.uuids[i]
+        assert_true(not tex_uuid.is_nil())
+        assert_true(not wav_uuid.is_nil())
+        assert_true(not qoa_uuid.is_nil())
+
+        # Cold AssetServer with ONLY mounted .flpk (no loose directory): UUID resolves even when rel_path moved
+        var srv = AssetServer(enable_watcher=False)
+        assert_true(srv.mount_flpk(flpk_path))
+
+        var h_tex = srv.resolve_texture(
+            AssetRef(tex_uuid, "textures/renamed_alb.png", ASSET_KIND_TEXTURE),
+            progressive=False,
+        )
+        assert_true(srv.textures.is_loaded(h_tex))
+        var tptr = srv.textures.get_ptr(h_tex)
+        assert_true(Bool(tptr))
+        assert_equal(tptr.value()[].width, 16)
+        assert_equal(tptr.value()[].height, 16)
+
+        var h_wav = srv.resolve_audio(AssetRef(wav_uuid, "audio/moved_hit.wav", ASSET_KIND_AUDIO))
+        assert_true(srv.audios.is_loaded(h_wav))
+        var aptr = srv.audios.get_ptr(h_wav)
+        assert_true(Bool(aptr))
+        assert_equal(aptr.value()[].sample_rate, 48000)
+        assert_equal(len(aptr.value()[].samples), 64)
+
+        var h_qoa_flpk = srv.resolve_audio(AssetRef(qoa_uuid, "audio/moved_sfx.qoa", ASSET_KIND_AUDIO))
+        assert_true(srv.audios.is_loaded(h_qoa_flpk))
+        var qptr = srv.audios.get_ptr(h_qoa_flpk)
+        assert_true(Bool(qptr))
+        assert_equal(qptr.value()[].sample_rate, 48000)
+        assert_equal(len(qptr.value()[].samples), 160)
+
+        # Security parity: traversal / absolute rel_path rejected even when UUID is valid
+        assert_true(
+            not srv.textures.is_loaded(
+                srv.resolve_texture(AssetRef(tex_uuid, "../escape.png", ASSET_KIND_TEXTURE))
+            )
+        )
+        assert_true(
+            not srv.textures.is_loaded(
+                srv.resolve_texture(AssetRef(tex_uuid, "/etc/passwd", ASSET_KIND_TEXTURE))
+            )
+        )
+        assert_true(
+            not srv.audios.is_loaded(
+                srv.resolve_audio(AssetRef(wav_uuid, "../escape.wav", ASSET_KIND_AUDIO))
+            )
+        )
+        assert_true(
+            not srv.audios.is_loaded(
+                srv.resolve_audio(AssetRef(wav_uuid, "/etc/passwd", ASSET_KIND_AUDIO))
+            )
+        )
+        srv.close()
+
+        # Loose .qoa loading & hot-reload via AssetServer
+        var srv_loose = AssetServer(enable_watcher=True)
+        _ = srv_loose.watch_loose_directory(ws)
+        var h_qoa_loose = srv_loose.resolve_audio(AssetRef.from_path("audio/sfx.qoa", ASSET_KIND_AUDIO))
+        assert_true(srv_loose.audios.is_loaded(h_qoa_loose))
+        var ep0 = srv_loose.audios.reload_epoch(h_qoa_loose)
+
+        var pcm2 = List[Int16](capacity=200)
+        for i in range(200):
+            pcm2.append(Int16(Int(sin(Float32(i) * Float32(0.3)) * Float32(15000.0))))
+        var qoa_bytes2 = encode_qoa(pcm2, 1, 48000)
+        assert_true(write_bytes(ws + "/audio/sfx.qoa", qoa_bytes2))
+        _ = srv_loose.tick(10.0)
+        _ = srv_loose.tick(11.0)
+        assert_true(srv_loose.audios.reload_epoch(h_qoa_loose) > ep0)
+        assert_equal(len(srv_loose.audios.get_ptr(h_qoa_loose).value()[].samples), 200)
+        srv_loose.close()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4a_audio_emitter_flscn_state_hash_parity() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_audio_hash_" + String(pid)
+    _plug_rm_rf(tmp)
+    _ = make_dirs(tmp)
+    try:
+        var s1 = FlintStudioState(headless=True)
+        var s2 = FlintStudioState(headless=True)
+        var s3 = FlintStudioState(headless=True)
+        var flscn_path = tmp + "/audio.flscn"
+        var flscnb_path = tmp + "/audio.flscnb"
+
+        # 1. audio_ref provided with omitted asset_path -> synchronized on __init__
+        var e1 = s1.app.world.spawn_empty()
+        var ref1 = AssetRef(AssetUuid.from_path("audio/step.qoa"), "audio/step.qoa", ASSET_KIND_AUDIO)
+        var em1 = AudioEmitterComponent(asset_id=-1, audio_ref=ref1.copy())
+        assert_equal(em1.asset_path, "audio/step.qoa")
+        _ = s1.app.world.insert[AudioEmitterComponent](e1, em1^)
+
+        # 2. All non-default runtime/authored fields (including priority, playing=True with auto_play_pending=False, occlusion, prev_pos)
+        var e2 = s1.app.world.spawn_empty()
+        var ref2 = AssetRef.from_path("audio/amb.wav", ASSET_KIND_AUDIO)
+        var em2 = AudioEmitterComponent(
+            asset_id=7,
+            volume=Float32(0.625),
+            pitch=Float32(1.15),
+            bus_id=2,
+            looping=True,
+            spatial=False,
+            priority=9,
+            ref_dist=Float32(4.5),
+            max_dist=Float32(120.0),
+            play_on_spawn=False,
+            playing=True,
+            auto_play_pending=False,
+            enable_occlusion=True,
+            occlusion_gain=Float32(0.35),
+            cutoff_hz=Float32(2400.0),
+            obstruction=Float32(0.72),
+            audio_ref=ref2.copy(),
+        )
+        em2.prev_pos = Vec3(3.25, -1.5, 8.75)
+        em2.has_prev_pos = True
+        assert_equal(em2.asset_path, "audio/amb.wav")
+        _ = s1.app.world.insert[AudioEmitterComponent](e2, em2^)
+
+        # 3. asset_path provided with omitted audio_ref -> synchronized on __init__
+        var e3 = s1.app.world.spawn_empty()
+        var em3 = AudioEmitterComponent(asset_id=-1, asset_path="audio/legacy_ctor.wav")
+        assert_equal(em3.audio_ref.rel_path, "audio/legacy_ctor.wav")
+        _ = s1.app.world.insert[AudioEmitterComponent](e3, em3^)
+
+        assert_true(s1.save_scene_file(flscn_path))
+        assert_true(s2.load_scene_file(flscn_path))
+        assert_equal(s1.state_hash(), s2.state_hash())
+
+        assert_true(s2.save_scene_file(flscnb_path))
+        assert_true(s3.load_scene_file(flscnb_path))
+        assert_equal(s2.state_hash(), s3.state_hash())
+
+        var au_ents = s2.app.world.query_entities(s2.app.world.bit_for[AudioEmitterComponent]())
+        assert_equal(len(au_ents), 3)
+        var found_e2 = False
+        for i in range(len(au_ents)):
+            ref em = s2.app.world.get_ptr[AudioEmitterComponent](au_ents[i]).value()[unsafe_offset=0]
+            if em.asset_id == 7:
+                found_e2 = True
+                assert_equal(em.asset_path, "audio/amb.wav")
+                assert_equal(em.priority, 9)
+                assert_true(em.playing)
+                assert_true(not em.auto_play_pending)
+                assert_true(em.enable_occlusion)
+                assert_true(abs(em.occlusion_gain - Float32(0.35)) < Float32(1.0e-5))
+                assert_true(abs(em.cutoff_hz - Float32(2400.0)) < Float32(1.0e-3))
+                assert_true(abs(em.obstruction - Float32(0.72)) < Float32(1.0e-5))
+                assert_true(em.has_prev_pos)
+                assert_true(abs(em.prev_pos.x - Float32(3.25)) < Float32(1.0e-5))
+                assert_true(abs(em.prev_pos.y - Float32(-1.5)) < Float32(1.0e-5))
+                assert_true(abs(em.prev_pos.z - Float32(8.75)) < Float32(1.0e-5))
+        assert_true(found_e2)
+
+        # Legacy minimal JSON omitting priority/playing/auto_play_pending/occlusion/prev_pos
+        var legacy_json = (
+            '{"format":"flscn","version":2,"name":"LegacyAudio","entities":[{"slot":0,"parent":-1,'
+            '"components":{"AudioEmitterComponent":{"asset_id":-1,"asset_path":"audio/minimal.wav",'
+            '"volume":0.5,"play_on_spawn":true}}}]}'
+        )
+        var w_leg = World()
+        var reg_leg = ComponentRegistry.with_builtins()
+        register_audio_codecs(reg_leg)
+        var scn_leg = Scene("LegacyAudio")
+        var ents_leg = scn_leg.load_flscn_bytes(w_leg, reg_leg, _plug_str_bytes(legacy_json))
+        assert_equal(len(ents_leg), 1)
+        ref em_leg = w_leg.get_ptr[AudioEmitterComponent](ents_leg[0]).value()[unsafe_offset=0]
+        assert_equal(em_leg.asset_path, "audio/minimal.wav")
+        assert_equal(em_leg.audio_ref.rel_path, "audio/minimal.wav")
+        assert_equal(em_leg.priority, 1)
+        assert_true(not em_leg.playing)
+        assert_true(em_leg.auto_play_pending)
+        assert_true(abs(em_leg.occlusion_gain - Float32(1.0)) < Float32(1.0e-5))
+        assert_true(abs(em_leg.cutoff_hz - CLEAR_CUTOFF_HZ) < Float32(1.0e-2))
+        assert_true(abs(em_leg.obstruction) < Float32(1.0e-5))
+        assert_true(not em_leg.has_prev_pos)
+
+        s1.shutdown()
+        s2.shutdown()
+        s3.shutdown()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4a_scene_asset_resolver_preserves_loaded_skeleton_pose() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_skel_preserve_" + String(pid)
+    _plug_rm_rf(tmp)
+    var ws = tmp + "/ws"
+    _ = make_dirs(ws + "/rigs")
+    try:
+        var rig3 = FrigRigDef("HeroRig")
+        rig3.joints.append(FrigJointDef("Root", -1, Vec3(), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig3.joints.append(FrigJointDef("Spine", 0, Vec3(0.0, 1.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig3.joints.append(FrigJointDef("Head", 1, Vec3(0.0, 0.5, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        _ = save_flrig_file(ws + "/rigs/hero.flrig", rig3)
+
+        var rig_ref = AssetRef.from_path("rigs/hero.flrig", ASSET_KIND_RAW)
+        var scn_path = tmp + "/posed.flscn"
+
+        # Save posed SkeletonComponent (with rig_ref set) into .flscn via FlintStudioState
+        var s_save = FlintStudioState(headless=True)
+        var e_save = s_save.app.world.spawn_empty()
+        var custom_sk = SkeletonInstance(3)
+        custom_sk.parents[0] = -1
+        custom_sk.parents[1] = 0
+        custom_sk.parents[2] = 1
+        custom_sk.pose.t[1] = Vec3(0.25, 2.5, -0.5)
+        var custom_q = Quat.from_axis_angle(Vec3(0.0, 1.0, 0.0), Float32(0.75))
+        custom_sk.pose.r[2] = custom_q
+        _ = s_save.app.world.insert[SkeletonComponent](
+            e_save, SkeletonComponent(0, custom_sk^, False, rig_ref.copy())
+        )
+        assert_true(s_save.save_scene_file(scn_path))
+        s_save.shutdown()
+
+        # Load into fresh EngineApp with AssetPlugin (empty entity FIRST, loaded posed entity SECOND)
+        var app = EngineApp(AppConfig(title="SkelPosePreserve", headless=True, worker_threads=0))
+        app.add_plugin(TransformPlugin())
+        app.add_plugin(AssetPlugin(loose_root=ws, enable_watcher=True))
+        app.add_plugin(AnimPlugin())
+        app.startup()
+
+        var e_empty = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_empty, LocalTransform())
+        _ = app.world.insert[GlobalTransform](e_empty, GlobalTransform())
+        _ = app.world.insert[SkeletonComponent](e_empty, SkeletonComponent(0, rig_ref=rig_ref.copy()))
+
+        var reg = ComponentRegistry.with_builtins()
+        register_anim_codecs(reg)
+        var scn_load = Scene("PosedLoad")
+        var loaded_ents = scn_load.load_flscn_file(scn_path, app.world, reg, clear_existing=False)
+        assert_equal(len(loaded_ents), 1)
+        var e_posed = loaded_ents[0]
+
+        # Frame 1 & Frame 2: e_empty populates from .flrig, while e_posed keeps its saved custom pose!
+        app.step_one_frame(Float32(1.0 / 60.0))
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        ref sk_empty = app.world.get_ptr[SkeletonComponent](e_empty).value()[unsafe_offset=0].skeleton
+        assert_equal(sk_empty.node_count, 3)
+        assert_true(abs(sk_empty.pose.t[1].y - Float32(1.0)) < Float32(1.0e-5))
+
+        ref sk_posed = app.world.get_ptr[SkeletonComponent](e_posed).value()[unsafe_offset=0].skeleton
+        assert_equal(sk_posed.node_count, 3)
+        assert_true(abs(sk_posed.pose.t[1].x - Float32(0.25)) < Float32(1.0e-5))
+        assert_true(abs(sk_posed.pose.t[1].y - Float32(2.5)) < Float32(1.0e-5))
+        assert_true(abs(sk_posed.pose.t[1].z - Float32(-0.5)) < Float32(1.0e-5))
+        assert_true(abs(sk_posed.pose.r[2].y - custom_q.y) < Float32(1.0e-4))
+        assert_true(abs(sk_posed.pose.r[2].w - custom_q.w) < Float32(1.0e-4))
+
+        # Also test reverse entity order in a fresh EngineApp (posed entity FIRST, empty entity SECOND)
+        var app_rev = EngineApp(AppConfig(title="SkelPosePreserveRev", headless=True, worker_threads=0))
+        app_rev.add_plugin(TransformPlugin())
+        app_rev.add_plugin(AssetPlugin(loose_root=ws, enable_watcher=False))
+        app_rev.add_plugin(AnimPlugin())
+        app_rev.startup()
+        var loaded_rev = scn_load.load_flscn_file(scn_path, app_rev.world, reg, clear_existing=False)
+        assert_equal(len(loaded_rev), 1)
+        var e_rev_posed = loaded_rev[0]
+        var e_rev_empty = app_rev.world.spawn()
+        _ = app_rev.world.insert[LocalTransform](e_rev_empty, LocalTransform())
+        _ = app_rev.world.insert[GlobalTransform](e_rev_empty, GlobalTransform())
+        _ = app_rev.world.insert[SkeletonComponent](e_rev_empty, SkeletonComponent(0, rig_ref=rig_ref.copy()))
+        app_rev.step_one_frame(Float32(1.0 / 60.0))
+        ref sk_rev_posed = app_rev.world.get_ptr[SkeletonComponent](e_rev_posed).value()[unsafe_offset=0].skeleton
+        ref sk_rev_empty = app_rev.world.get_ptr[SkeletonComponent](e_rev_empty).value()[unsafe_offset=0].skeleton
+        assert_true(abs(sk_rev_posed.pose.t[1].y - Float32(2.5)) < Float32(1.0e-5))
+        assert_equal(sk_rev_empty.node_count, 3)
+        assert_true(abs(sk_rev_empty.pose.t[1].y - Float32(1.0)) < Float32(1.0e-5))
+        app_rev.shutdown()
+
+        # Hot-reload hero.flrig (3 -> 4 joints) -> BOTH e_empty AND e_posed update!
+        var rig4 = FrigRigDef("HeroRig")
+        rig4.joints.append(FrigJointDef("Root", -1, Vec3(), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig4.joints.append(FrigJointDef("Spine", 0, Vec3(0.0, 1.25, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig4.joints.append(FrigJointDef("Neck", 1, Vec3(0.0, 0.4, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        rig4.joints.append(FrigJointDef("Head", 2, Vec3(0.0, 0.3, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        _ = save_flrig_file(ws + "/rigs/hero.flrig", rig4)
+
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1000.0)
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1001.0)
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        ref sk_empty_hr = app.world.get_ptr[SkeletonComponent](e_empty).value()[unsafe_offset=0].skeleton
+        ref sk_posed_hr = app.world.get_ptr[SkeletonComponent](e_posed).value()[unsafe_offset=0].skeleton
+        assert_equal(sk_empty_hr.node_count, 4)
+        assert_equal(sk_posed_hr.node_count, 4)
+        assert_true(abs(sk_empty_hr.pose.t[1].y - Float32(1.25)) < Float32(1.0e-5))
+        assert_true(abs(sk_posed_hr.pose.t[1].y - Float32(1.25)) < Float32(1.0e-5))
+
+        app.shutdown()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4a_bone_socket_flscn_state_hash_parity() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_bonesock_hash_" + String(pid)
+    _plug_rm_rf(tmp)
+    _ = make_dirs(tmp)
+    try:
+        # (a) Non-default entity_id, world_pos, world_rot, world_scale (including non-power-of-2 floats)
+        var s1 = FlintStudioState(headless=True)
+        var s2 = FlintStudioState(headless=True)
+        var s3 = FlintStudioState(headless=True)
+        var flscn_path = tmp + "/bonesock.flscn"
+        var flscnb_path = tmp + "/bonesock.flscnb"
+
+        var e_sk = s1.app.world.spawn_empty()
+        _ = s1.app.world.insert[LocalTransform](e_sk, LocalTransform.identity())
+        _ = s1.app.world.insert[GlobalTransform](e_sk, GlobalTransform())
+        var sk_inst = SkeletonInstance(2)
+        sk_inst.parents[0] = -1
+        sk_inst.parents[1] = 0
+        _ = s1.app.world.insert[SkeletonComponent](e_sk, SkeletonComponent(17, sk_inst^))
+
+        var e_sock = s1.app.world.spawn_empty()
+        _ = s1.app.world.insert[LocalTransform](e_sock, LocalTransform.identity())
+        _ = s1.app.world.insert[GlobalTransform](e_sock, GlobalTransform())
+        var lrot = Quat.from_axis_angle(Vec3(0.0, 1.0, 0.0), Float32(0.65)).normalized()
+        var wrot = Quat.from_axis_angle(Vec3(0.0, 0.0, 1.0), Float32(0.95)).normalized()
+        var att = BoneSocketAttachment(
+            "HandWeapon",
+            1,
+            42,
+            Vec3(Float32(0.15), Float32(-0.35), Float32(1.0 / 3.0)),
+            lrot,
+            Vec3(Float32(1.15), Float32(0.85), Float32(1.3)),
+            7,
+        )
+        att.world_pos = Vec3(Float32(2.35), Float32(-1.15), Float32(4.7))
+        att.world_rot = wrot
+        att.world_scale = Vec3(Float32(1.2), Float32(0.9), Float32(1.4))
+        _ = s1.app.world.insert[BoneSocketComponent](e_sock, BoneSocketComponent(e_sk, att^, -1))
+
+        assert_true(s1.save_scene_file(flscn_path))
+        assert_true(s2.load_scene_file(flscn_path))
+        assert_equal(s1.state_hash(), s2.state_hash())
+
+        assert_true(s2.save_scene_file(flscnb_path))
+        assert_true(s3.load_scene_file(flscnb_path))
+        assert_equal(s2.state_hash(), s3.state_hash())
+
+        var sock_ents = s2.app.world.query_entities(s2.app.world.bit_for[BoneSocketComponent]())
+        assert_equal(len(sock_ents), 1)
+        ref bs2 = s2.app.world.get_ptr[BoneSocketComponent](sock_ents[0]).value()[unsafe_offset=0]
+        assert_true(s2.app.world.is_alive(bs2.skeleton_entity))
+        assert_true(s2.app.world.has[SkeletonComponent](bs2.skeleton_entity))
+        assert_equal(bs2.skeleton_slot, -1)
+        assert_equal(bs2.attachment.name, "HandWeapon")
+        assert_equal(bs2.attachment.bone_node, 1)
+        assert_equal(bs2.attachment.entity_id, 42)
+        assert_equal(bs2.attachment.kinematic_body_id, 7)
+        assert_true(abs(bs2.attachment.local_pos.x - Float32(0.15)) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.local_pos.z - Float32(1.0 / 3.0)) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.local_rot.y - lrot.y) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.local_scale.x - Float32(1.15)) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.world_pos.x - Float32(2.35)) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.world_pos.y - Float32(-1.15)) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.world_pos.z - Float32(4.7)) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.world_rot.z - wrot.z) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.world_rot.w - wrot.w) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.world_scale.x - Float32(1.2)) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.world_scale.y - Float32(0.9)) < Float32(1.0e-5))
+        assert_true(abs(bs2.attachment.world_scale.z - Float32(1.4)) < Float32(1.0e-5))
+
+        s1.shutdown()
+        s2.shutdown()
+        s3.shutdown()
+
+        # (b) Natural simulation via step_simulation(1) updating world_pos/world_rot/world_scale
+        var s_sim = FlintStudioState(headless=True)
+        var s_sim_json = FlintStudioState(headless=True)
+        var s_sim_bin = FlintStudioState(headless=True)
+        var sim_flscn = tmp + "/bonesock_sim.flscn"
+        var sim_flscnb = tmp + "/bonesock_sim.flscnb"
+
+        var e_sk_sim = s_sim.app.world.spawn_empty()
+        var sk_rot = Quat.from_axis_angle(Vec3(0.0, 1.0, 0.0), Float32(0.4))
+        _ = s_sim.app.world.insert[LocalTransform](
+            e_sk_sim,
+            LocalTransform(
+                Vec3(Float32(3.15), Float32(1.2), Float32(-2.35)),
+                sk_rot,
+                Vec3(Float32(1.1), Float32(1.1), Float32(1.1)),
+            ),
+        )
+        _ = s_sim.app.world.insert[GlobalTransform](e_sk_sim, GlobalTransform())
+        var sk_sim = SkeletonInstance(2)
+        sk_sim.parents[0] = -1
+        sk_sim.parents[1] = 0
+        _ = s_sim.app.world.insert[SkeletonComponent](e_sk_sim, SkeletonComponent(0, sk_sim^))
+
+        var e_sock_sim = s_sim.app.world.spawn_empty()
+        _ = s_sim.app.world.insert[LocalTransform](e_sock_sim, LocalTransform.identity())
+        _ = s_sim.app.world.insert[GlobalTransform](e_sock_sim, GlobalTransform())
+        var sim_att = BoneSocketAttachment(
+            "ShieldSocket",
+            1,
+            99,
+            Vec3(Float32(0.15), Float32(0.25), Float32(-0.35)),
+            Quat.from_axis_angle(Vec3(0.0, 1.0, 0.0), Float32(0.3)),
+            Vec3(Float32(1.05), Float32(1.05), Float32(1.05)),
+        )
+        _ = s_sim.app.world.insert[BoneSocketComponent](e_sock_sim, BoneSocketComponent(e_sk_sim, sim_att^, -1))
+
+        assert_true(s_sim.step_simulation(1))
+        ref bs_after = s_sim.app.world.get_ptr[BoneSocketComponent](e_sock_sim).value()[unsafe_offset=0]
+        assert_true(abs(bs_after.attachment.world_pos.x) > Float32(1.0))
+
+        assert_true(s_sim.save_scene_file(sim_flscn))
+        assert_true(s_sim.save_scene_file(sim_flscnb))
+        assert_true(s_sim_json.load_scene_file(sim_flscn))
+        assert_true(s_sim_bin.load_scene_file(sim_flscnb))
+        assert_equal(s_sim_json.state_hash(), s_sim_bin.state_hash())
+
+        var sim_json_ents = s_sim_json.app.world.query_entities(s_sim_json.app.world.bit_for[BoneSocketComponent]())
+        var sim_bin_ents = s_sim_bin.app.world.query_entities(s_sim_bin.app.world.bit_for[BoneSocketComponent]())
+        assert_equal(len(sim_json_ents), 1)
+        assert_equal(len(sim_bin_ents), 1)
+        ref bs_j = s_sim_json.app.world.get_ptr[BoneSocketComponent](sim_json_ents[0]).value()[unsafe_offset=0]
+        ref bs_b = s_sim_bin.app.world.get_ptr[BoneSocketComponent](sim_bin_ents[0]).value()[unsafe_offset=0]
+        assert_equal(bs_j.attachment.entity_id, bs_b.attachment.entity_id)
+        assert_true(abs(bs_j.attachment.world_pos.x - bs_b.attachment.world_pos.x) < Float32(1.0e-5))
+        assert_true(abs(bs_j.attachment.world_pos.y - bs_b.attachment.world_pos.y) < Float32(1.0e-5))
+        assert_true(abs(bs_j.attachment.world_pos.z - bs_b.attachment.world_pos.z) < Float32(1.0e-5))
+        assert_true(abs(bs_j.attachment.world_rot.y - bs_b.attachment.world_rot.y) < Float32(1.0e-5))
+        assert_true(abs(bs_j.attachment.world_scale.x - bs_b.attachment.world_scale.x) < Float32(1.0e-5))
+
+        s_sim.shutdown()
+        s_sim_json.shutdown()
+        s_sim_bin.shutdown()
+
+        # (c) Legacy minimal .flscn JSON omitting entity_id/world_pos/world_rot/world_scale
+        var legacy_json = (
+            '{"format":"flscn","version":2,"name":"LegacySock","entities":['
+            '{"slot":0,"parent":-1,"components":{"SkeletonComponent":{"model_id":11,"node_count":2,"dirty_topology":false}}},'
+            '{"slot":1,"parent":0,"components":{"BoneSocketComponent":{"name":"BackSlot","bone_node":1,'
+            '"kinematic_body_id":-1,"skeleton_slot":0,"local_pos":[0.1,0.2,0.3],'
+            '"local_rot":[0.0,0.0,0.0,1.0],"local_scale":[1.0,1.0,1.0]}}}]}'
+        )
+        var w_leg = World()
+        var reg_leg = ComponentRegistry.with_builtins()
+        register_anim_codecs(reg_leg)
+        var scn_leg = Scene("LegacySock")
+        var ents_leg = scn_leg.load_flscn_bytes(w_leg, reg_leg, _plug_str_bytes(legacy_json))
+        assert_equal(len(ents_leg), 2)
+        ref bs_leg = w_leg.get_ptr[BoneSocketComponent](ents_leg[1]).value()[unsafe_offset=0]
+        assert_equal(bs_leg.attachment.name, "BackSlot")
+        assert_equal(bs_leg.attachment.bone_node, 1)
+        assert_equal(bs_leg.attachment.entity_id, -1)
+        assert_equal(bs_leg.skeleton_entity.to_bits(), ents_leg[0].to_bits())
+        assert_equal(bs_leg.skeleton_slot, -1)
+        assert_true(abs(bs_leg.attachment.local_pos.y - Float32(0.2)) < Float32(1.0e-5))
+        assert_true(abs(bs_leg.attachment.world_pos.x) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_pos.y) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_pos.z) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_rot.x) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_rot.y) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_rot.z) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_rot.w - Float32(1.0)) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_scale.x - Float32(1.0)) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_scale.y - Float32(1.0)) < Float32(1.0e-6))
+        assert_true(abs(bs_leg.attachment.world_scale.z - Float32(1.0)) < Float32(1.0e-6))
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def _plug_push_u32_le(mut out: List[UInt8], v: UInt32):
+    out.append(UInt8(v & 0xFF))
+    out.append(UInt8((v >> 8) & 0xFF))
+    out.append(UInt8((v >> 16) & 0xFF))
+    out.append(UInt8((v >> 24) & 0xFF))
+
+
+def _plug_push_f32_le(mut out: List[UInt8], v: Float32):
+    _plug_push_u32_le(out, bitcast[DType.uint32](v))
+
+
+def _make_rigged_glb_for_plug(n_clips: Int) -> List[UInt8]:
+    """Builds a minimal valid glTF 2.0 rigged GLB with 1 skin (2 joints) and `n_clips` animations."""
+    var bin_data = List[UInt8]()
+    # 0: 3 vertex positions (VEC3 float32, 36 bytes)
+    var pos_off = len(bin_data)
+    _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 0.0)
+    _plug_push_f32_le(bin_data, 1.0); _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 0.0)
+    _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 1.0); _plug_push_f32_le(bin_data, 0.0)
+    var pos_len = len(bin_data) - pos_off
+
+    # 1: 3 vertex normals (VEC3 float32, 36 bytes)
+    var norm_off = len(bin_data)
+    for _ in range(3):
+        _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 1.0)
+    var norm_len = len(bin_data) - norm_off
+
+    # 2: 3 vertex JOINTS_0 (VEC4 uint8 = 12 bytes)
+    var jnt_off = len(bin_data)
+    for _ in range(3):
+        bin_data.append(0); bin_data.append(1); bin_data.append(0); bin_data.append(0)
+    var jnt_len = len(bin_data) - jnt_off
+
+    # 3: 3 vertex WEIGHTS_0 (VEC4 float32 = 48 bytes)
+    var wgt_off = len(bin_data)
+    for _ in range(3):
+        _plug_push_f32_le(bin_data, 0.75); _plug_push_f32_le(bin_data, 0.25)
+        _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 0.0)
+    var wgt_len = len(bin_data) - wgt_off
+
+    # 4: 2 inverseBindMatrices (MAT4 float32 = 128 bytes)
+    var ibm_off = len(bin_data)
+    for _ in range(2):
+        for r in range(4):
+            for c in range(4):
+                _plug_push_f32_le(bin_data, Float32(1.0) if r == c else Float32(0.0))
+    var ibm_len = len(bin_data) - ibm_off
+
+    # 5: animation keyframe times (SCALAR float32, 2 keyframes = 8 bytes)
+    var t_off = len(bin_data)
+    _plug_push_f32_le(bin_data, 0.0)
+    _plug_push_f32_le(bin_data, 1.0)
+    var t_len = len(bin_data) - t_off
+
+    # 6: animation keyframe translations (VEC3 float32, 2 keyframes = 24 bytes)
+    var v_off = len(bin_data)
+    _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 0.5); _plug_push_f32_le(bin_data, 0.0)
+    _plug_push_f32_le(bin_data, 0.0); _plug_push_f32_le(bin_data, 0.75); _plug_push_f32_le(bin_data, 0.0)
+    var v_len = len(bin_data) - v_off
+
+    while len(bin_data) % 4 != 0:
+        bin_data.append(0)
+
+    var anims_json = String("[")
+    var clip_names = ["Idle", "Walk", "Run"]
+    for ci in range(n_clips):
+        if ci > 0:
+            anims_json += ","
+        var nm = clip_names[ci] if ci < len(clip_names) else ("Clip" + String(ci))
+        anims_json += (
+            '{"name":"' + nm + '","samplers":[{"input":5,"output":6,"interpolation":"LINEAR"}],'
+            '"channels":[{"sampler":0,"target":{"node":1,"path":"translation"}}]}'
+        )
+    anims_json += "]"
+
+    var json = (
+        '{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0,2]}],'
+        '"buffers":[{"byteLength":' + String(len(bin_data)) + '}],'
+        '"bufferViews":['
+        '{"buffer":0,"byteOffset":' + String(pos_off) + ',"byteLength":' + String(pos_len) + '},'
+        '{"buffer":0,"byteOffset":' + String(norm_off) + ',"byteLength":' + String(norm_len) + '},'
+        '{"buffer":0,"byteOffset":' + String(jnt_off) + ',"byteLength":' + String(jnt_len) + '},'
+        '{"buffer":0,"byteOffset":' + String(wgt_off) + ',"byteLength":' + String(wgt_len) + '},'
+        '{"buffer":0,"byteOffset":' + String(ibm_off) + ',"byteLength":' + String(ibm_len) + '},'
+        '{"buffer":0,"byteOffset":' + String(t_off) + ',"byteLength":' + String(t_len) + '},'
+        '{"buffer":0,"byteOffset":' + String(v_off) + ',"byteLength":' + String(v_len) + '}'
+        '],"accessors":['
+        '{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]},'
+        '{"bufferView":1,"componentType":5126,"count":3,"type":"VEC3"},'
+        '{"bufferView":2,"componentType":5121,"count":3,"type":"VEC4"},'
+        '{"bufferView":3,"componentType":5126,"count":3,"type":"VEC4"},'
+        '{"bufferView":4,"componentType":5126,"count":2,"type":"MAT4"},'
+        '{"bufferView":5,"componentType":5126,"count":2,"type":"SCALAR","min":[0],"max":[1]},'
+        '{"bufferView":6,"componentType":5126,"count":2,"type":"VEC3"}'
+        '],"meshes":[{"primitives":[{"attributes":{"POSITION":0,"NORMAL":1,"JOINTS_0":2,"WEIGHTS_0":3}}]}],'
+        '"nodes":['
+        '{"name":"Root","children":[1]},'
+        '{"name":"Arm","translation":[0,0.5,0]},'
+        '{"name":"BodyMesh","mesh":0,"skin":0}'
+        '],'
+        '"skins":[{"joints":[0,1],"inverseBindMatrices":4}],'
+        '"animations":' + anims_json + '}'
+    )
+    var json_bytes = List[UInt8]()
+    for b in json.as_bytes():
+        json_bytes.append(b)
+    while len(json_bytes) % 4 != 0:
+        json_bytes.append(0x20)
+
+    var total_len = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
+    var out = List[UInt8](capacity=total_len)
+    _plug_push_u32_le(out, 0x46546C67)
+    _plug_push_u32_le(out, 2)
+    _plug_push_u32_le(out, UInt32(total_len))
+    _plug_push_u32_le(out, UInt32(len(json_bytes)))
+    _plug_push_u32_le(out, 0x4E4F534A)
+    for b in json_bytes:
+        out.append(b)
+    _plug_push_u32_le(out, UInt32(len(bin_data)))
+    _plug_push_u32_le(out, 0x004E4942)
+    for b in bin_data:
+        out.append(b)
+    return out^
+
+
+def test_m4b_flmat_nested_textures_role_cooking_and_hot_reload() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_m4b_flmat_" + String(pid)
+    _plug_rm_rf(tmp)
+    var ws = tmp + "/ws"
+    _ = make_dirs(ws + "/meshes")
+    _ = make_dirs(ws + "/materials")
+    _ = make_dirs(ws + "/textures")
+    try:
+        var m_cube = NativeModel()
+        m_cube.meshes.append(_make_cube_mesh_for_plug())
+        _ = write_native_glb(ws + "/meshes/cube.glb", m_cube)
+
+        var px_alb = List[UInt32](length=8 * 8, fill=UInt32(0xFF3366CC))
+        var px_nrm = List[UInt32](length=8 * 8, fill=UInt32(0xFFFF8080))
+        var px_orm = List[UInt32](length=8 * 8, fill=UInt32(0xFF00C0FF))
+        var px_emi = List[UInt32](length=8 * 8, fill=UInt32(0xFF102030))
+        assert_true(write_png(ws + "/textures/albedo.png", px_alb, 8, 8, stamped=False))
+        assert_true(write_png(ws + "/textures/normal.png", px_nrm, 8, 8, stamped=False))
+        assert_true(write_png(ws + "/textures/orm.png", px_orm, 8, 8, stamped=False))
+        assert_true(write_png(ws + "/textures/emissive.png", px_emi, 8, 8, stamped=False))
+
+        var nested_flmat = (
+            '{"format":"flmat","version":1,"name":"NestedPbr",'
+            '"base_color":[0.25,0.6,0.9],"roughness":0.42,"metallic":0.15,"emissive":[0.1,0.2,0.0], '
+            '"textures":{"albedo":"textures/albedo.png","normal":"textures/normal.png",'
+            '"orm":"textures/orm.png","emissive":"textures/emissive.png"}}'
+        )
+        var nested_flmat_b = _plug_str_bytes(nested_flmat)
+        assert_true(write_bytes(ws + "/materials/nested.flmat", nested_flmat_b))
+
+        # 1. Dual-schema load_flmat_bytes parses nested "textures" map cleanly
+        var parsed_mat = load_flmat_bytes(nested_flmat_b)
+        assert_equal(parsed_mat.albedo_tex.rel_path, "textures/albedo.png")
+        assert_equal(parsed_mat.normal_tex.rel_path, "textures/normal.png")
+        assert_equal(parsed_mat.orm_tex.rel_path, "textures/orm.png")
+        assert_equal(parsed_mat.emissive_tex.rel_path, "textures/emissive.png")
+
+        # 2. AssetServer texture role hints cook sRGB / BC5 normal / linear BC7_UNORM ORM
+        var srv_role = AssetServer(enable_watcher=False)
+        srv_role.loose_root = ws
+        var h_alb = srv_role.resolve_texture_with_role(AssetRef.from_path("textures/albedo.png", ASSET_KIND_TEXTURE), role=0)
+        var h_nrm = srv_role.resolve_texture_with_role(AssetRef.from_path("textures/normal.png", ASSET_KIND_TEXTURE), role=1)
+        var h_orm = srv_role.resolve_texture_with_role(AssetRef.from_path("textures/orm.png", ASSET_KIND_TEXTURE), role=2)
+        var h_emi = srv_role.resolve_texture_with_role(AssetRef.from_path("textures/emissive.png", ASSET_KIND_TEXTURE), role=3)
+        assert_true(srv_role.textures.is_loaded(h_alb))
+        assert_true(srv_role.textures.is_loaded(h_nrm))
+        assert_true(srv_role.textures.is_loaded(h_orm))
+        assert_true(srv_role.textures.is_loaded(h_emi))
+        assert_equal(Int(srv_role.textures.get_ptr(h_alb).value()[].tex_format), Int(TEX_FMT_BC7_SRGB))
+        assert_equal(Int(srv_role.textures.get_ptr(h_nrm).value()[].tex_format), Int(TEX_FMT_BC5_UNORM))
+        assert_equal(Int(srv_role.textures.get_ptr(h_orm).value()[].tex_format), Int(TEX_FMT_BC7_UNORM))
+        assert_equal(Int(srv_role.textures.get_ptr(h_emi).value()[].tex_format), Int(TEX_FMT_BC7_SRGB))
+        srv_role.close()
+
+        # 3. EngineApp + AssetPlugin + RenderPlugin resolves nested textures and hot-reloads MaterialOverrideComponent
+        var app = EngineApp(AppConfig(title="M4bNestedFlmat", headless=True, worker_threads=0))
+        app.add_plugin(TransformPlugin())
+        app.add_plugin(AssetPlugin(loose_root=ws, enable_watcher=True))
+        app.add_plugin(RenderPlugin(tier=RENDER_TIER_0_HEADLESS_SIMD, width=64, height=64))
+        app.startup()
+
+        var e = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e, LocalTransform(Vec3(0.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e, GlobalTransform())
+        _ = app.world.insert[MeshRendererComponent](
+            e,
+            MeshRendererComponent(
+                -1,
+                -1,
+                True,
+                True,
+                AssetRef.from_path("meshes/cube.glb", ASSET_KIND_MESH),
+                AssetRef.from_path("materials/nested.flmat", ASSET_KIND_RAW),
+            ),
+        )
+        _ = app.world.insert[MaterialOverrideComponent](
+            e, MaterialOverrideComponent(material_ref=AssetRef.from_path("materials/nested.flmat", ASSET_KIND_RAW))
+        )
+
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        ref srv = app.resources.get_ptr[AssetServer]().value()[unsafe_offset=0]
+        ref ren = app.resources.get_ptr[ScalableRenderer]().value()[unsafe_offset=0]
+        ref rstate = app.resources.get_ptr[RenderPluginStateResource]().value()[unsafe_offset=0]
+        var base_mat_id = app.world.get_ptr[MeshRendererComponent](e).value()[].material_id
+        assert_true(base_mat_id >= 0)
+        assert_true(abs(ren.materials[base_mat_id].roughness - Float32(0.42)) < Float32(1.0e-4))
+        var ov_slot0 = rstate.override_slots.get(e.to_bits()).value().slot_id
+        assert_true(abs(ren.materials[ov_slot0].base_color.x - Float32(0.25)) < Float32(1.0e-4))
+        # Referenced texture handles are live in AssetServer
+        var s_nrm = srv.textures.find_slot_by_path("textures/normal.png")
+        assert_true(s_nrm >= 0)
+
+        # Hot-reload normal texture AND nested .flmat -> base material + MaterialOverrideComponent update
+        var px_nrm2 = List[UInt32](length=8 * 8, fill=UInt32(0xFF7090FF))
+        assert_true(write_png(ws + "/textures/normal.png", px_nrm2, 8, 8, stamped=False))
+        var nested_flmat2 = (
+            '{"format":"flmat","version":1,"name":"NestedPbr",'
+            '"base_color":[0.85,0.2,0.3],"roughness":0.88,"metallic":0.75,"emissive":[0.5,0.1,0.0], '
+            '"textures":{"albedo":"textures/albedo.png","normal":"textures/normal.png",'
+            '"orm":"textures/orm.png","emissive":"textures/emissive.png"}}'
+        )
+        var nested_flmat2_b = _plug_str_bytes(nested_flmat2)
+        assert_true(write_bytes(ws + "/materials/nested.flmat", nested_flmat2_b))
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1000.0)
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1001.0)
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        ref mo_after = app.world.get_ptr[MaterialOverrideComponent](e).value()[unsafe_offset=0]
+        assert_true(abs(mo_after.base_color.x - Float32(0.85)) < Float32(1.0e-4))
+        assert_true(abs(mo_after.roughness - Float32(0.88)) < Float32(1.0e-4))
+        var ov_slot1 = rstate.override_slots.get(e.to_bits()).value().slot_id
+        assert_true(abs(ren.materials[ov_slot1].base_color.x - Float32(0.85)) < Float32(1.0e-4))
+        assert_true(abs(ren.materials[ov_slot1].roughness - Float32(0.88)) < Float32(1.0e-4))
+        assert_true(abs(ren.materials[base_mat_id].roughness - Float32(0.88)) < Float32(1.0e-4))
+
+        app.shutdown()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4b_glb_anim_cache_initial_load_and_hot_reload() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_m4b_glb_anim_" + String(pid)
+    _plug_rm_rf(tmp)
+    var ws = tmp + "/ws"
+    _ = make_dirs(ws + "/models")
+    try:
+        var glb3 = _make_rigged_glb_for_plug(3)
+        assert_true(write_bytes(ws + "/models/char.glb", glb3))
+
+        var app = EngineApp(AppConfig(title="M4bGlbAnimSync", headless=True, worker_threads=0))
+        app.add_plugin(TransformPlugin())
+        app.add_plugin(AssetPlugin(loose_root=ws, enable_watcher=True))
+        app.add_plugin(AnimPlugin())
+        app.add_plugin(RenderPlugin(tier=RENDER_TIER_0_HEADLESS_SIMD, width=64, height=64))
+        app.startup()
+
+        var e = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e, LocalTransform(Vec3(0.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e, GlobalTransform())
+        _ = app.world.insert[MeshRendererComponent](
+            e,
+            MeshRendererComponent(
+                -1,
+                -1,
+                True,
+                True,
+                AssetRef.from_path("models/char.glb", ASSET_KIND_MESH),
+            ),
+        )
+        # Pre-set non-zero model_id=101 must be preserved, clip_index=2 active
+        _ = app.world.insert[SkeletonComponent](e, SkeletonComponent(UInt64(101)))
+        _ = app.world.insert[AnimatorComponent](
+            e, AnimatorComponent(UInt64(0), clip_index=2, clip_name="Run", playing=True)
+        )
+
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        ref acache = app.resources.get_ptr[AnimAssetCache]().value()[unsafe_offset=0]
+        var mi1 = acache.find_model(UInt64(101))
+        assert_true(mi1 >= 0)
+        assert_equal(len(acache.models[mi1].skins), 1)
+        assert_equal(len(acache.models[mi1].animations), 3)
+        ref sk1 = app.world.get_ptr[SkeletonComponent](e).value()[unsafe_offset=0]
+        assert_equal(Int(sk1.model_id), 101)
+        assert_true(sk1.skeleton.node_count >= 2)
+        assert_equal(app.world.get_ptr[AnimatorComponent](e).value()[].clip_index, 2)
+
+        # Hot-reload GLB with only 1 clip ("Idle"): AnimAssetCache reloads, clip_index clamps to 0
+        var glb1 = _make_rigged_glb_for_plug(1)
+        assert_true(write_bytes(ws + "/models/char.glb", glb1))
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1000.0)
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1001.0)
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        var mi2 = acache.find_model(UInt64(101))
+        assert_true(mi2 >= 0)
+        assert_equal(len(acache.models[mi2].animations), 1)
+        assert_equal(app.world.get_ptr[AnimatorComponent](e).value()[].clip_index, 0)
+        assert_true(app.resources.get_ptr[RenderPluginStateResource]().value()[].skinned_sync_count >= 1)
+
+        app.shutdown()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4b_audio_emitter_hot_reload_restarts_playing_voice() raises:
+    var pid = Int(external_call["getpid", Int32]())
+    var tmp = "/tmp/flint_v5_plug_m4b_au_restart_" + String(pid)
+    _plug_rm_rf(tmp)
+    var ws = tmp + "/ws"
+    _ = make_dirs(ws + "/audio")
+    try:
+        var wav1 = _make_test_wav_16bit(Float32(0.15), 2400)
+        assert_true(write_bytes(ws + "/audio/voice.wav", wav1))
+
+        var app = EngineApp(AppConfig(title="M4bAudioRestart", headless=True, worker_threads=0))
+        app.add_plugin(TransformPlugin())
+        app.add_plugin(AssetPlugin(loose_root=ws, enable_watcher=True))
+        app.add_plugin(AudioPlugin(headless=True))
+        app.startup()
+
+        var e_lis = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_lis, LocalTransform())
+        _ = app.world.insert[GlobalTransform](e_lis, GlobalTransform())
+        _ = app.world.insert[AudioListenerComponent](e_lis, AudioListenerComponent())
+
+        var e_em = app.world.spawn()
+        _ = app.world.insert[LocalTransform](e_em, LocalTransform(Vec3(1.0, 0.0, 0.0)))
+        _ = app.world.insert[GlobalTransform](e_em, GlobalTransform())
+        _ = app.world.insert[AudioEmitterComponent](
+            e_em,
+            AudioEmitterComponent(
+                asset_id=-1,
+                looping=True,
+                play_on_spawn=True,
+                audio_ref=AssetRef.from_path("audio/voice.wav", ASSET_KIND_AUDIO),
+            ),
+        )
+
+        # Frame 1 starts playing old voice
+        app.step_one_frame(Float32(1.0 / 60.0))
+        ref em1 = app.world.get_ptr[AudioEmitterComponent](e_em).value()[unsafe_offset=0]
+        var aid1 = em1.asset_id
+        var h1 = em1.handle
+        assert_true(aid1 >= 0)
+        assert_true(em1.playing)
+        assert_true(h1.is_valid())
+
+        # Overwrite audio/voice.wav -> SceneAssetResolver updates asset_id -> AudioPlugin stops old & restarts new
+        var wav2 = _make_test_wav_16bit(Float32(0.35), 2400)
+        assert_true(write_bytes(ws + "/audio/voice.wav", wav2))
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1000.0)
+        _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1001.0)
+        # First frame triggers asset_id change -> stop old voice & queue auto_play_pending; second starts new handle cleanly
+        app.step_one_frame(Float32(1.0 / 60.0))
+        app.step_one_frame(Float32(1.0 / 60.0))
+
+        ref em2 = app.world.get_ptr[AudioEmitterComponent](e_em).value()[unsafe_offset=0]
+        var aid2 = em2.asset_id
+        assert_true(aid2 > aid1)
+        assert_true(em2.playing)
+        assert_true(em2.handle.is_valid())
+        assert_true(em2.handle.slot != h1.slot or em2.handle.generation != h1.generation)
+        ref aus = app.resources.get_ptr[AudioSyncStateResource]().value()[unsafe_offset=0]
+        assert_equal(len(aus.active_emitters), 1)
+        assert_equal(aus.active_emitters[0].asset_id, aid2)
+
+        app.shutdown()
+    finally:
+        _plug_rm_rf(tmp)
+
+
+def test_m4b_audio_emitter_read_bin_v2_lossless_and_v1_migration() raises:
+    # v2 binary round-trip with audio_ref set and asset_path == "" must remain lossless
+    var src1 = AudioEmitterComponent()
+    src1.audio_ref = AssetRef.from_path("audio/sfx.wav", ASSET_KIND_AUDIO)
+    src1.asset_path = ""
+    var w1 = BlobWriter()
+    src1.write_bin(w1)
+    var r1 = BlobReader(w1.data.copy())
+    var dst1 = AudioEmitterComponent.read_bin(r1, 2)
+    assert_equal(dst1.asset_path, "")
+    assert_equal(dst1.audio_ref.rel_path, "audio/sfx.wav")
+
+    # v2 binary round-trip with asset_path set and audio_ref cleared must also remain lossless
+    var src2 = AudioEmitterComponent()
+    src2.asset_path = "audio/sfx.wav"
+    src2.audio_ref = AssetRef()
+    var w2 = BlobWriter()
+    src2.write_bin(w2)
+    var r2 = BlobReader(w2.data.copy())
+    var dst2 = AudioEmitterComponent.read_bin(r2, 2)
+    assert_equal(dst2.asset_path, "audio/sfx.wav")
+    assert_true(dst2.audio_ref.is_empty())
+
+    # v1 legacy migration (asset_path -> audio_ref) must still work when version < 2
+    var src_v1 = AudioEmitterComponent()
+    src_v1.asset_path = "audio/legacy.wav"
+    src_v1.audio_ref = AssetRef()
+    var w_v1 = BlobWriter()
+    src_v1.write_bin(w_v1)
+    var r_v1 = BlobReader(w_v1.data.copy())
+    var dst_v1 = AudioEmitterComponent.read_bin(r_v1, 1)
+    assert_equal(dst_v1.asset_path, "audio/legacy.wav")
+    assert_equal(dst_v1.audio_ref.rel_path, "audio/legacy.wav")
+
+
+def test_m5a_component_registry_default_insert_remove_all_builtins() raises:
+    var reg = ComponentRegistry.with_builtins()
+    register_physics_codecs(reg)
+    register_render_codecs(reg)
+    register_anim_codecs(reg)
+    register_audio_codecs(reg)
+    register_nav_codecs(reg)
+    register_net_codecs(reg)
+    register_ai_codecs(reg)
+
+    var w = World()
+    reg.ensure_registered_in_world(w)
+    var e = w.spawn_empty()
+    assert_true(not reg.insert_default_on_entity(w, NULL_ENTITY, "LocalTransform"))
+    assert_true(not reg.insert_default_on_entity(w, e, "DoesNotExist"))
+
+    var n_entries = len(reg.entries)
+    assert_true(n_entries >= 31)
+    for i in range(n_entries):
+        var cname = reg.entries[i].schema_name
+        assert_true(reg.insert_default_on_entity(w, e, cname), "insert_default failed for " + cname)
+        assert_true(not reg.insert_default_on_entity(w, e, cname), "duplicate insert succeeded for " + cname)
+        assert_true(reg.has_on_entity(i, w, e))
+
+    var snap = BlobWriter()
+    w.snapshot_blob(snap)
+    var w2 = World()
+    reg.ensure_registered_in_world(w2)
+    var rdr = BlobReader(snap.data.copy())
+    w2.restore_blob(rdr)
+    assert_equal(w2.entity_count(), 1)
+
+    for i in range(n_entries):
+        var cname = reg.entries[i].schema_name
+        assert_true(reg.remove_from_entity(w, e, cname), "remove failed for " + cname)
+        assert_true(not reg.remove_from_entity(w, e, cname), "double remove succeeded for " + cname)
+        assert_true(not reg.has_on_entity(i, w, e))
+
+
+def test_m5a_physics_trigger_helpers_and_despawn_safety() raises:
+    var app = EngineApp(AppConfig(title="m5a_trig", headless=True, fixed_hz=60.0))
+    app.add_plugin(TransformPlugin())
+    app.add_plugin(PhysicsPlugin(gravity=0.0))
+    app.startup()
+
+    var trig_e = app.world.spawn_empty()
+    _ = app.world.insert[LocalTransform](trig_e, LocalTransform(Vec3(2.0, 1.0, 0.0)))
+    _ = app.world.insert[GlobalTransform](trig_e, GlobalTransform.from_local(LocalTransform(Vec3(2.0, 1.0, 0.0))))
+    _ = app.world.insert[PrevGlobalTransform](trig_e, PrevGlobalTransform())
+    _ = app.world.insert[ColliderComponent](trig_e, ColliderComponent.box(Vec3(0.8, 1.5, 0.8), is_trigger=True))
+
+    var kcc_e = app.world.spawn_empty()
+    _ = app.world.insert[LocalTransform](kcc_e, LocalTransform(Vec3(0.0, 1.0, 0.0)))
+    _ = app.world.insert[GlobalTransform](kcc_e, GlobalTransform.from_local(LocalTransform(Vec3(0.0, 1.0, 0.0))))
+    _ = app.world.insert[PrevGlobalTransform](kcc_e, PrevGlobalTransform())
+    _ = app.world.insert[CharacterControllerComponent](
+        kcc_e,
+        CharacterControllerComponent(Vec3(0.0, 1.0, 0.0), CharacterControllerConfig(), Vec3(6.0, 0.0, 0.0)),
+    )
+
+    var dead_e = app.world.spawn_empty()
+    _ = app.world.despawn(dead_e)
+
+    var cursor = 0
+    var enters = 0
+    var exits = 0
+    var matched_4 = False
+    var matched_res = False
+    var sync_mapped_trig = False
+    for _ in range(60):
+        app.step_one_frame(Float32(1.0 / 60.0))
+        var tev_opt = app.resources.get_ptr[TriggerEventsResource]()
+        var sync_opt = app.resources.get_ptr[PhysicsSyncStateResource]()
+        if tev_opt and sync_opt:
+            ref sync = sync_opt.value()[unsafe_offset=0]
+            assert_true(entity_from_body(sync, -1) == NULL_ENTITY)
+            assert_true(entity_from_body(-1, app.resources) == NULL_ENTITY)
+            var evs = tev_opt.value()[unsafe_offset=0].events.read_since(cursor)
+            for i in range(len(evs)):
+                var ev = evs[i]
+                if OnEnter(ev):
+                    enters += 1
+                    assert_true(not OnEnter(ev, NULL_ENTITY, app.world, app.resources))
+                    assert_true(not OnEnter(ev, dead_e, app.world, app.resources))
+                    if OnEnter(ev, trig_e, app.world, app.resources):
+                        matched_4 = True
+                    if entity_from_body(sync, ev.body_id) == kcc_e and entity_from_body(ev.body_id, app.resources) == kcc_e:
+                        matched_res = True
+                    if sync.lookup_trigger_entity(ev.trigger_id) == trig_e:
+                        sync_mapped_trig = True
+                if OnExit(ev) and OnExit(ev, trig_e, app.world, app.resources):
+                    exits += 1
+
+    assert_equal(enters, 1)
+    assert_equal(exits, 1)
+    assert_true(matched_4)
+    assert_true(matched_res)
+    assert_true(sync_mapped_trig)
+
+    # Toggle trigger off and verify trigger_to_entity is cleaned up
+    var col_mut = app.world.get_ptr_mut[ColliderComponent](trig_e)
+    assert_true(Bool(col_mut))
+    var old_tid = col_mut.value()[unsafe_offset=0].trigger_id
+    col_mut.value()[unsafe_offset=0].is_trigger = False
+    app.step_one_frame(Float32(1.0 / 60.0))
+    var sync_after = app.resources.get_ptr[PhysicsSyncStateResource]()
+    assert_true(Bool(sync_after))
+    assert_true(sync_after.value()[unsafe_offset=0].lookup_trigger_entity(old_tid) == NULL_ENTITY)
+    app.shutdown()
+
+
+def test_m5a_ai_behavior_tree_component_json_codecs_and_plugin() raises:
+    var bb = Blackboard()
+    var k_alert = bb.def_key("alert", Float32(0.0))
+
+    var scorer = UtilityAiScorer(True)
+    var opt0 = UtilityOption(1, Float32(1.0))
+    opt0.add_consideration(UtilityConsideration(k_alert, Float32(0.0), Float32(1.0), CURVE_LINEAR, Float32(1.0), False))
+    _ = scorer.add_option(opt0^)
+
+    var bt = BehaviorTree()
+    _ = bt.begin_selector()
+    _ = bt.begin_sequence()
+    _ = bt.add_blackboard_cmp(k_alert, BT_CMP_GT, Float32(0.5), BT_ABORT_LOWER_PRIORITY)
+    _ = bt.add_action(10)
+    bt.end_composite()
+    _ = bt.add_action(2)
+    bt.end_composite()
+
+    var js = bt.save_json()
+    var bt2 = BehaviorTree()
+    assert_true(bt2.load_json(js))
+    assert_true(not bt2.load_json(""))
+    assert_true(not bt2.load_json("{bad json"))
+    assert_true(not bt2.load_json('{"nodes":"not_a_list"}'))
+    assert_true(not bt2.load_json('{"nodes":[{"kind":99}]}'))
+
+    # Corrupt load_json calls must leave bt2 valid and functional
+    var st = BtExecutionState()
+    st.set_action_status(2, BT_RUNNING)
+    st.set_action_status(10, BT_SUCCESS)
+    assert_equal(Int(bt2.tick(bb, st, Float32(1.0 / 60.0))), Int(BT_RUNNING))
+    bb.set_float(k_alert, Float32(1.0))
+    assert_equal(Int(bt2.tick(bb, st, Float32(1.0 / 60.0))), Int(BT_SUCCESS))
+    assert_equal(st.aborts_triggered, 1)
+
+    var reg = ComponentRegistry.with_builtins()
+    register_ai_codecs(reg)
+    var app = EngineApp(AppConfig(title="m5a_ai_plugin", headless=True, worker_threads=0))
+    app.add_plugin(AiPlugin())
+    app.add_plugin(AiPlugin())  # idempotent
+    app.startup()
+
+    var e0 = app.world.spawn_empty()
+    _ = app.world.insert[BehaviorTreeComponent](e0, BehaviorTreeComponent())
+    var e1 = app.world.spawn_empty()
+    var btc1 = BehaviorTreeComponent(bt2.copy())
+    var k1 = btc1.blackboard.def_key("alert", Float32(1.0))
+    _ = k1
+    btc1.state.set_action_status(10, BT_SUCCESS)
+    _ = app.world.insert[BehaviorTreeComponent](e1, btc1^)
+
+    app.step_one_frame(Float32(1.0 / 60.0))
+    var ptr1 = app.world.get_ptr[BehaviorTreeComponent](e1)
+    assert_true(Bool(ptr1))
+    assert_equal(ptr1.value()[unsafe_offset=0].state.active_action_id, 10)
+
+    # .flscn + .flscnb + World.snapshot_blob parity
+    var sc = Scene("AiScene")
+    var sc_json = sc.save_flscn_string(app.world, reg)
+    var sc_bin = sc.save_flscnb_bytes(app.world, reg)
+    var w_j = World()
+    var jbytes = List[UInt8](capacity=sc_json.byte_length())
+    for b in sc_json.as_bytes():
+        jbytes.append(b)
+    _ = sc.load_flscn_bytes(w_j, reg, jbytes)
+    var w_b = World()
+    _ = sc.load_flscnb_bytes(w_b, reg, sc_bin)
+    assert_equal(w_j.entity_count(), 2)
+    assert_equal(w_b.entity_count(), 2)
+
+    var bw = BlobWriter()
+    app.world.snapshot_blob(bw)
+    var w_s = World()
+    register_ai_components(w_s)
+    var br = BlobReader(bw.data.copy())
+    w_s.restore_blob(br)
+    assert_equal(w_s.entity_count(), 2)
+    app.shutdown()
+
+    # Corrupt BehaviorTreeComponent.read_bin rejection (invalid kind, subtree_skip, parent_idx)
+    var bad_blobs = List[List[UInt8]]()
+    var bw_kind = BlobWriter()
+    bw_kind.u32(1)
+    bw_kind.u8(255)
+    bw_kind.u8(0)
+    bw_kind.u8(0)
+    bw_kind.integer(1)
+    bw_kind.integer(-1)
+    bw_kind.integer(-1)
+    bw_kind.integer(-1)
+    bw_kind.f32(0.0)
+    bad_blobs.append(bw_kind.data.copy())
+
+    var bw_skip = BlobWriter()
+    bw_skip.u32(1)
+    bw_skip.u8(BT_NODE_ACTION)
+    bw_skip.u8(0)
+    bw_skip.u8(0)
+    bw_skip.integer(0)  # invalid subtree_skip <= i
+    bw_skip.integer(-1)
+    bw_skip.integer(-1)
+    bw_skip.integer(1)
+    bw_skip.f32(0.0)
+    bad_blobs.append(bw_skip.data.copy())
+
+    var bw_pidx = BlobWriter()
+    bw_pidx.u32(1)
+    bw_pidx.u8(BT_NODE_ACTION)
+    bw_pidx.u8(0)
+    bw_pidx.u8(0)
+    bw_pidx.integer(1)
+    bw_pidx.integer(0)  # invalid parent_idx >= i
+    bw_pidx.integer(-1)
+    bw_pidx.integer(1)
+    bw_pidx.f32(0.0)
+    bad_blobs.append(bw_pidx.data.copy())
+
+    for bi in range(len(bad_blobs)):
+        var br_bad = BlobReader(bad_blobs[bi].copy())
+        var rejected = False
+        try:
+            _ = BehaviorTreeComponent.read_bin(br_bad, 1)
+        except:
+            rejected = True
+        assert_true(rejected)
+
+    # SpatialPerception + AiPlugin interoperability check
+    var pw = PhysicsWorld()
+    var perc = SpatialPerception()
+    var s0 = perc.add_stimulus(Vec3(0.0, 0.0, 5.0), Float32(1.0), 10, 1)
+    var s1 = perc.add_stimulus(Vec3(0.0, 0.0, 6.0), Float32(0.5), 20, 2)
+    perc.active[s1] = False
+    # Zero forward falls back to +Z; hearing_threshold=0.0 must not leak padded lanes
+    var res_all = perc.query_perceiver(
+        pw,
+        Vec3(0.0, 0.0, 0.0),
+        Vec3(0.0, 0.0, 0.0),
+        fov_deg=Float32(90.0),
+        max_vision_dist=Float32(20.0),
+        hearing_threshold=Float32(0.0),
+    )
+    assert_equal(len(res_all), 1)
+    assert_equal(res_all[0].stimulus_index, s0)
+    assert_true(res_all[0].visible and res_all[0].audible)
+    assert_equal(
+        len(perc.query_perceiver(pw, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 1.0), ignore_body_id=10)),
+        0,
+    )
+    assert_equal(
+        len(perc.query_perceiver(pw, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 1.0), ignore_team_id=1)),
+        0,
+    )
+
+
+def test_m5a_game_flow_fsm_saves_timers_tweens() raises:
+    var fsm = GameStateMachine("Menu")
+    fsm.allow_transition("Menu", "Play")
+    fsm.allow_transition("Play", "Victory")
+    assert_true(not fsm.transition_to("Victory"))
+    assert_equal(fsm.current_state(), "Menu")
+    assert_true(fsm.transition_to("Play"))
+    assert_true(fsm.transition_to("Victory"))
+    assert_equal(fsm.current_state(), "Victory")
+
+    var tmp = "/tmp/flint_v5_m5a_flow_test"
+    var save_dir = tmp + "/saves"
+    assert_true(make_dirs(save_dir))
+    var store = SaveSlotStore(save_dir)
+    assert_true(not store.save_slot("../escape", "{}"))
+    assert_true(not store.save_slot(".hidden", "{}"))
+    assert_equal(store.load_slot("missing").byte_length(), 0)
+    assert_true(store.save_slot("slot_a", '{"hp":95}'))
+    assert_true(make_dirs(save_dir + "/bogus_dir.json"))
+    var slots = store.list_slots()
+    assert_equal(len(slots), 1)
+    assert_equal(slots[0], "slot_a")
+    assert_true(not store.has_slot("bogus_dir"))
+    assert_equal(store.load_slot("slot_a"), '{"hp":95}')
+
+    var flow = GameFlow(save_dir, "Menu")
+    assert_true(flow.save_slot(0, "ckpt_0"))
+    assert_equal(flow.load_slot(0), "ckpt_0")
+    assert_true(store.delete_slot("slot_a"))
+    assert_true(store.delete_slot("slot_0"))
+
+    # Scene transition A -> B
+    var reg = ComponentRegistry.with_builtins()
+    var w1 = World()
+    reg.ensure_registered_in_world(w1)
+    var e1 = w1.spawn_empty()
+    _ = w1.insert[LocalTransform](e1, LocalTransform(Vec3(1.0, 2.0, 3.0)))
+    var path_a = tmp + "/scene_a.flscn"
+    assert_true(Scene("A").save_flscn_file(path_a, w1, reg))
+
+    var live_w = World()
+    assert_true(flow.transition_to_scene(live_w, reg, path_a))
+    assert_equal(live_w.entity_count(), 1)
+    assert_true(not flow.transition_to_scene(live_w, reg, tmp + "/missing.flscn"))
+    assert_equal(live_w.entity_count(), 1)
+
+    var nan_dt = Float32(0.0) / Float32(0.0)
+    var t_rep = GameTimer(Float32(0.2), repeating=True)
+    assert_true(not t_rep.step(Float32(-0.1)))
+    assert_true(not t_rep.step(nan_dt))
+    var fires = 0
+    for _ in range(5):
+        if t_rep.step(Float32(0.1)):
+            fires += 1
+    assert_equal(fires, 2)
+
+    var t_huge1 = GameTimer(Float32(0.1), repeating=True)
+    assert_true(t_huge1.step(Float32(1.0e7)))
+    assert_true(isfinite(t_huge1.elapsed_sec))
+    assert_true(t_huge1.elapsed_sec >= Float32(0.0) and t_huge1.elapsed_sec < t_huge1.duration_sec)
+
+    var t_huge2 = GameTimer(Float32(1.0e-6), repeating=True)
+    assert_true(t_huge2.step(Float32(100.0)))
+    assert_true(isfinite(t_huge2.elapsed_sec))
+    assert_true(t_huge2.elapsed_sec >= Float32(0.0) and t_huge2.elapsed_sec < t_huge2.duration_sec)
+
+    var t_huge3 = GameTimer(Float32(0.1), repeating=True)
+    assert_true(t_huge3.step(Float32(1.0e30)))
+    assert_true(isfinite(t_huge3.elapsed_sec))
+    assert_true(t_huge3.elapsed_sec >= Float32(0.0) and t_huge3.elapsed_sec < t_huge3.duration_sec)
+
+    var tw = Tween(Float32(0.0), Float32(10.0), Float32(0.5))
+    assert_true(isfinite(tw.step(nan_dt)))
+    assert_true(not tw.is_finished())
+    var mid = tw.step(Float32(0.25))
+    assert_true(abs(mid - Float32(5.0)) < Float32(0.1))
+    var fin = tw.step(Float32(0.5))
+    assert_true(abs(fin - Float32(10.0)) < Float32(1.0e-4))
+    assert_true(tw.is_finished())
+
+    var rm_cmd = "rm -rf " + tmp
+    _ = external_call["system", Int32](rm_cmd.as_c_string_span())
+
+
+def test_m5a_game_hud_and_ui_keyboard_capture() raises:
+    var ctx = UiContext()
+    assert_true(not ctx.wants_keyboard())
+    assert_true(not ctx.is_in_frame())
+
+    # Safe outside begin_frame/end_frame even with empty box_stack
+    var added_outside = game_hud(ctx, 75, 100, 1200)
+    assert_true(added_outside > 0)
+    var count_after_outside = len(ctx.draw_list.prims)
+
+    # Safe inside begin_frame/end_frame while preserving prior draw_list prims
+    ctx.set_keyboard_capture(True)
+    var inp = InputState()
+    inp.begin_frame()
+    ctx.begin_frame(inp, Float32(640.0), Float32(480.0), Float32(1.0 / 60.0))
+    assert_true(ctx.is_in_frame())
+    assert_true(ctx.wants_keyboard())
+    ctx.draw_list.add_rect(Float32(0.0), Float32(0.0), Float32(10.0), Float32(10.0), UInt32(0xFFFFFFFF))
+    var pre_hud = len(ctx.draw_list.prims)
+    var added_inside = game_hud(ctx, 20, 100, 50)
+    assert_true(added_inside > 0)
+    assert_equal(len(ctx.draw_list.prims), pre_hud + added_inside)
+    ctx.end_frame()
+    assert_true(not ctx.is_in_frame())
+    _ = count_after_outside
+
+    ctx.set_keyboard_capture(False)
+    assert_true(not ctx.wants_keyboard())
+
+    # font.valid == True (DSF v2 in-memory atlas -> PRIM_GLYPH emission)
+    var dsf = List[UInt8]()
+    def _push_i32(mut dst: List[UInt8], v: Int):
+        var uv = UInt32(Int32(v))
+        dst.append(UInt8(uv & 0xFF))
+        dst.append(UInt8((uv >> 8) & 0xFF))
+        dst.append(UInt8((uv >> 16) & 0xFF))
+        dst.append(UInt8((uv >> 24) & 0xFF))
+
+    var first_cp = 32
+    var last_cp = 122
+    var glyph_cnt = last_cp - first_cp + 1
+    _push_i32(dsf, DSF_MAGIC)
+    _push_i32(dsf, 2)
+    _push_i32(dsf, 32)
+    _push_i32(dsf, 32)
+    _push_i32(dsf, 24)
+    _push_i32(dsf, 4)
+    _push_i32(dsf, 20 * 64)
+    _push_i32(dsf, -4 * 64)
+    _push_i32(dsf, 26 * 64)
+    _push_i32(dsf, glyph_cnt)
+    _push_i32(dsf, 0)
+    _push_i32(dsf, 1)
+    for cp in range(first_cp, last_cp + 1):
+        _push_i32(dsf, cp)
+        _push_i32(dsf, 0)
+        _push_i32(dsf, 0)
+        _push_i32(dsf, 8)
+        _push_i32(dsf, 12)
+        _push_i32(dsf, 0)
+        _push_i32(dsf, 0)
+        _push_i32(dsf, 12 * 64)
+    for _ in range(32 * 32):
+        dsf.append(UInt8(128))
+
+    var ctx_font = UiContext()
+    assert_true(ctx_font.font.load_bytes(dsf))
+    assert_true(ctx_font.font.valid)
+    assert_true(not ctx_font.font.has_source)
+    _ = game_hud(ctx_font, 75, 100, 1200)
+    var dsf_glyphs = 0
+    for pi in range(len(ctx_font.draw_list.prims)):
+        ref pr = ctx_font.draw_list.prims[pi]
+        if (pr.header & 0xF) == PRIM_GLYPH:
+            assert_true(
+                isfinite(pr.x0)
+                and isfinite(pr.y0)
+                and isfinite(pr.x1)
+                and isfinite(pr.y1)
+                and isfinite(pr.u0)
+                and isfinite(pr.v0)
+                and isfinite(pr.u1)
+                and isfinite(pr.v1)
+            )
+            dsf_glyphs += 1
+    assert_true(dsf_glyphs >= 10)
+
+    # Guard-test shaped TTF branch when system DejaVuSans.ttf is present
+    var ttf_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    if len(read_bytes(ttf_path)) > 0:
+        var ctx_ttf = UiContext()
+        if ctx_ttf.font.load_ttf(ttf_path, bake_px=24, spread=4):
+            assert_true(ctx_ttf.font.valid and ctx_ttf.font.has_source)
+            _ = game_hud(ctx_ttf, 42, 100, 777)
+            var ttf_glyphs = 0
+            for pi in range(len(ctx_ttf.draw_list.prims)):
+                ref pr = ctx_ttf.draw_list.prims[pi]
+                if (pr.header & 0xF) == PRIM_GLYPH:
+                    assert_true(isfinite(pr.x0) and isfinite(pr.y0) and isfinite(pr.x1) and isfinite(pr.y1))
+                    ttf_glyphs += 1
+            assert_true(ttf_glyphs >= 10)
+
+
 def main() raises:
     var passed = 0
-    var total = 21
+    var total = 40
 
     test_window_and_input_plugin_ordering_and_actions()
     print("[PASS] test_window_and_input_plugin_ordering_and_actions")
@@ -2640,6 +4817,82 @@ def main() raises:
 
     test_schedule_conflict_with_explicit_dependency()
     print("[PASS] test_schedule_conflict_with_explicit_dependency")
+    passed += 1
+
+    test_m3a_nav_plugin_lifecycle_and_overlay()
+    print("[PASS] test_m3a_nav_plugin_lifecycle_and_overlay")
+    passed += 1
+
+    test_m4a_asset_server_traversal_and_asset_ref_unsafe_path()
+    print("[PASS] test_m4a_asset_server_traversal_and_asset_ref_unsafe_path")
+    passed += 1
+
+    test_m4a_asset_plugin_skinned_frame2_and_flrig_hot_reload()
+    print("[PASS] test_m4a_asset_plugin_skinned_frame2_and_flrig_hot_reload")
+    passed += 1
+
+    test_m4a_move_constructors_residency_bridge_and_fd_leaks()
+    print("[PASS] test_m4a_move_constructors_residency_bridge_and_fd_leaks")
+    passed += 1
+
+    test_m4a_scene_asset_resolver_shared_flmat_and_audio_hot_reload()
+    print("[PASS] test_m4a_scene_asset_resolver_shared_flmat_and_audio_hot_reload")
+    passed += 1
+
+    test_m4a_skeleton_and_animator_flscn_state_hash_parity()
+    print("[PASS] test_m4a_skeleton_and_animator_flscn_state_hash_parity")
+    passed += 1
+
+    test_m4a_asset_server_flpk_uuid_resolve_audio_and_texture()
+    print("[PASS] test_m4a_asset_server_flpk_uuid_resolve_audio_and_texture")
+    passed += 1
+
+    test_m4a_audio_emitter_flscn_state_hash_parity()
+    print("[PASS] test_m4a_audio_emitter_flscn_state_hash_parity")
+    passed += 1
+
+    test_m4a_scene_asset_resolver_preserves_loaded_skeleton_pose()
+    print("[PASS] test_m4a_scene_asset_resolver_preserves_loaded_skeleton_pose")
+    passed += 1
+
+    test_m4a_bone_socket_flscn_state_hash_parity()
+    print("[PASS] test_m4a_bone_socket_flscn_state_hash_parity")
+    passed += 1
+
+    test_m4b_flmat_nested_textures_role_cooking_and_hot_reload()
+    print("[PASS] test_m4b_flmat_nested_textures_role_cooking_and_hot_reload")
+    passed += 1
+
+    test_m4b_glb_anim_cache_initial_load_and_hot_reload()
+    print("[PASS] test_m4b_glb_anim_cache_initial_load_and_hot_reload")
+    passed += 1
+
+    test_m4b_audio_emitter_hot_reload_restarts_playing_voice()
+    print("[PASS] test_m4b_audio_emitter_hot_reload_restarts_playing_voice")
+    passed += 1
+
+    test_m4b_audio_emitter_read_bin_v2_lossless_and_v1_migration()
+    print("[PASS] test_m4b_audio_emitter_read_bin_v2_lossless_and_v1_migration")
+    passed += 1
+
+    test_m5a_component_registry_default_insert_remove_all_builtins()
+    print("[PASS] test_m5a_component_registry_default_insert_remove_all_builtins")
+    passed += 1
+
+    test_m5a_physics_trigger_helpers_and_despawn_safety()
+    print("[PASS] test_m5a_physics_trigger_helpers_and_despawn_safety")
+    passed += 1
+
+    test_m5a_ai_behavior_tree_component_json_codecs_and_plugin()
+    print("[PASS] test_m5a_ai_behavior_tree_component_json_codecs_and_plugin")
+    passed += 1
+
+    test_m5a_game_flow_fsm_saves_timers_tweens()
+    print("[PASS] test_m5a_game_flow_fsm_saves_timers_tweens")
+    passed += 1
+
+    test_m5a_game_hud_and_ui_keyboard_capture()
+    print("[PASS] test_m5a_game_hud_and_ui_keyboard_capture")
     passed += 1
 
     print("[SUMMARY] " + String(passed) + "/" + String(total) + " passed")
