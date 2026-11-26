@@ -1,24 +1,22 @@
 """Engine-Generic Synchronous Speech & Giant-Robot AI OS DSP Synthesizer (`flint.platform.speech`).
 
 Synthesizes intelligible spoken tactical guidance into 48 kHz Stereo `WavClip`s:
-  1. Uses `libespeak-ng.so.1` via runtime `dlopen` in synchronous memory-only PCM mode
-     (`AUDIO_OUTPUT_SYNCHRONOUS`, zero subprocesses, zero audio-daemon blocking) when
-     available on Linux (`aarch64` / `x86_64`), tuned to a calm, composed British/RP
-     male baritone (`en-gb-x-rp+m3`, `F0 ~ 105-118 Hz`, flat `range = 20` OS prosody).
-  2. Automatically falls back to a pure-Mojo 3-formant (`F1`/`F2`/`F3` `CytomicSVF`)
-     baritone (`112 Hz`) Klatt vocal-tract synthesizer if `libespeak-ng` is absent.
-  3. Masters dry speech through a 48 kHz Stereo Giant-Robot / Spaceship OS DSP chain:
+  1. Renders dry 24 kHz speech with Flint's pure-Mojo rule-based formant voice
+     (`flint.audio.formant_tts`: misaki G2P, Klatt-style duration / F0 rules, cascade-parallel
+     formant synthesizer with an LF glottal source). Each `VOICE_*` profile maps to one
+     `formant_voice` preset (vocal-tract scale, F0 register, range, rate and voice quality).
+     G2P is rules-only by default; set `FLINT_G2P_DIR` to a misaki lexicon directory
+     (`us_gold.json` / `us_silver.json`, `gb_*` for British presets) for dictionary
+     pronunciations.
+  2. Masters dry speech through a 48 kHz Stereo Giant-Robot / Spaceship OS DSP chain:
      cubic Hermite upsampling, dual-head raised-cosine granular 3-voice harmonizer
      (`-26 cents` Left @ `6.5 ms` Haas, `+26 cents` Right @ `10.5 ms` Haas, and
      `-4.6 st` `0.765x` deep chest sub-voice), dual short-lag (`0.78 ms` & `2.38 ms`)
      titanium vocal-box comb resonance, warm `CytomicSVF` studio vocal-body sculpting,
      and dark-titanium `StereoReverbFDN` cockpit spatialization.
 """
-from std.ffi import external_call
-from flint.platform.dynlib import dl_open, dl_sym
 from std.math import sin, cos, exp, floor, abs
 from flint.platform.os import env_value
-from flint.platform.vulkan import get64, put64
 from flint.platform.audio import WavClip
 from flint.platform.dsp import (
     DSP_TAU,
@@ -26,272 +24,43 @@ from flint.platform.dsp import (
     CytomicSVF,
     StereoReverbFDN,
     hash_white_noise,
-    poly_blep_saw,
     soft_clip_tanh,
     tube_saturate,
     wrap_phase01,
 )
+from flint.audio.formant_tts.api import FormantTTS, FORMANT_TTS_SAMPLE_RATE
+from flint.audio.formant_tts.voices import formant_voice, FV_DEFAULT
 
 comptime SPEECH_OUT_RATE: Int = 48000
 comptime SPEECH_OUT_SR_F: Float32 = 48000.0
 
-# C Capture State Block layout (3 x 64-bit words):
-#   word 0: data_ptr (Int16* malloc buffer)
-#   word 1: count    (number of Int16 samples written)
-#   word 2: capacity (allocated Int16 sample slots)
-comptime CAP_PTR: Int = 0
-comptime CAP_LEN: Int = 8
-comptime CAP_CAP: Int = 16
+
+def _formant_speech_mono(text: String, voice_id: Int, rate_wpm: Int = 0) -> List[Float32]:
+    """Dry 24 kHz mono speech from the formant voice preset `voice_id` (`FV_*`).
+
+    `rate_wpm > 0` overrides the preset's speaking rate. Uses the misaki lexicon in
+    `FLINT_G2P_DIR` when it is set and loads, else the rules-only G2P. Never raises: a G2P
+    failure returns an empty buffer."""
+    var v = formant_voice(voice_id)
+    if rate_wpm > 0:
+        v.rate_wpm = Float32(rate_wpm)
+    var lex = env_value("FLINT_G2P_DIR")
+    try:
+        if lex.byte_length() > 0:
+            try:
+                var tts_lex = FormantTTS.load(lex, v.british)
+                return tts_lex.synthesize(text, v)
+            except:
+                pass
+        var tts = FormantTTS(v.british)
+        return tts.synthesize(text, v)
+    except:
+        return List[Float32]()
 
 
-def _espeak_pcm_callback(wav_ptr: Int, num_samples: Int32, events_ptr: Int) abi("C") -> Int32:
-    """Synchronous `t_espeak_callback` appending 16-bit mono PCM chunks into `user_data`."""
-    if wav_ptr == 0 or num_samples <= 0 or events_ptr == 0:
-        return 0
-    # In 64-bit Linux `espeak_EVENT`, `void* user_data` sits at byte offset 24.
-    var state = get64(events_ptr + 24)
-    if state == 0:
-        return 0
-    var n = Int(num_samples)
-    var cur_ptr = get64(state + CAP_PTR)
-    var cur_len = get64(state + CAP_LEN)
-    var cur_cap = get64(state + CAP_CAP)
-    if cur_len + n > cur_cap:
-        var new_cap = max(65536, (cur_cap * 2) + n)
-        var new_ptr = external_call["realloc", Int](cur_ptr, new_cap * 2)
-        if new_ptr == 0:
-            return 0
-        cur_ptr = new_ptr
-        cur_cap = new_cap
-        put64(state + CAP_PTR, cur_ptr)
-        put64(state + CAP_CAP, cur_cap)
-    _ = external_call["memcpy", Int](cur_ptr + cur_len * 2, wav_ptr, n * 2)
-    put64(state + CAP_LEN, cur_len + n)
-    return 0
-
-
-def _c_str(text: String) -> List[UInt8]:
-    var out = List[UInt8](capacity=text.byte_length() + 1)
-    for b in text.as_bytes():
-        out.append(b)
-    out.append(0)
-    return out^
-
-
-def _parse_pos_int(s: String) -> Int:
-    var v = 0
-    for i in range(s.byte_length()):
-        var d = Int(s.as_bytes()[i]) - 48
-        if d >= 0 and d <= 9:
-            v = v * 10 + d
-    return v
-
-
-def _try_espeak_mono(
-    text: String,
-    voice_name: String,
-    rate_wpm: Int,
-    pitch_0_99: Int,
-    range_0_99: Int = 20,
-) -> Tuple[List[Float32], Int]:
-    """Attempts synchronous in-memory phoneme synthesis via `libespeak-ng.so.1`."""
-    var empty = List[Float32]()
-    if text.byte_length() == 0:
-        return (empty^, 0)
-
-    var candidates = [
-        String("libespeak-ng.so.1"),
-        String("/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1"),
-        String("/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1"),
-        String("libespeak-ng.so"),
-    ]
-    var lib = 0
-    for i in range(len(candidates)):
-        var cname = candidates[i]
-        lib = dl_open(cname)
-        _ = cname.byte_length()
-        if lib != 0:
-            break
-    if lib == 0:
-        return (empty^, 0)
-
-    var s_init = String("espeak_Initialize")
-    var s_cb = String("espeak_SetSynthCallback")
-    var s_voice = String("espeak_SetVoiceByName")
-    var s_param = String("espeak_SetParameter")
-    var s_synth = String("espeak_Synth")
-    var s_sync = String("espeak_Synchronize")
-
-    var fn_init = dl_sym(lib, s_init)
-    var fn_cb = dl_sym(lib, s_cb)
-    var fn_voice = dl_sym(lib, s_voice)
-    var fn_param = dl_sym(lib, s_param)
-    var fn_synth = dl_sym(lib, s_synth)
-    var fn_sync = dl_sym(lib, s_sync)
-    _ = s_init.byte_length()
-    _ = s_cb.byte_length()
-    _ = s_voice.byte_length()
-    _ = s_param.byte_length()
-    _ = s_synth.byte_length()
-    _ = s_sync.byte_length()
-
-    if fn_init == 0 or fn_cb == 0 or fn_voice == 0 or fn_param == 0 or fn_synth == 0 or fn_sync == 0:
-        return (empty^, 0)
-
-    # Guard `espeak_Initialize` once per process via process env (`FLINT_ESPEAK_SR`)
-    var cached_sr = _parse_pos_int(env_value("FLINT_ESPEAK_SR"))
-    if cached_sr <= 0:
-        comptime InitFn = def(Int32, Int32, Int, Int32) thin abi("C") -> Int32
-        var slot_init = fn_init
-        var sr_ret = Int(Pointer(to=slot_init).unsafe_bitcast[InitFn]()[unsafe_offset=0](Int32(2), Int32(0), Int(0), Int32(0)))
-        if sr_ret <= 0:
-            return (empty^, 0)
-        cached_sr = sr_ret
-        var env_k = String("FLINT_ESPEAK_SR")
-        var env_v = String(cached_sr)
-        _ = external_call["setenv", Int32](env_k.as_c_string_span(), env_v.as_c_string_span(), Int32(1))
-        _ = env_k.byte_length()
-        _ = env_v.byte_length()
-
-    comptime SetCbFn = def(def(Int, Int32, Int) thin abi("C") -> Int32) thin abi("C") -> NoneType
-    var slot_cb = fn_cb
-    Pointer(to=slot_cb).unsafe_bitcast[SetCbFn]()[unsafe_offset=0](_espeak_pcm_callback)
-
-    comptime SetVoiceFn = def(Int) thin abi("C") -> Int32
-    var slot_v = fn_voice
-    var v_primary_c = _c_str(voice_name)
-    var v_rc = Pointer(to=slot_v).unsafe_bitcast[SetVoiceFn]()[unsafe_offset=0](Int(v_primary_c.unsafe_ptr()))
-    _ = len(v_primary_c)
-    if v_rc != 0:
-        var v_fb1 = _c_str("en-gb+m3")
-        v_rc = Pointer(to=slot_v).unsafe_bitcast[SetVoiceFn]()[unsafe_offset=0](Int(v_fb1.unsafe_ptr()))
-        _ = len(v_fb1)
-    if v_rc != 0:
-        var v_fb2 = _c_str("en-us+m3")
-        _ = Pointer(to=slot_v).unsafe_bitcast[SetVoiceFn]()[unsafe_offset=0](Int(v_fb2.unsafe_ptr()))
-        _ = len(v_fb2)
-
-    comptime SetParamFn = def(Int32, Int32, Int32) thin abi("C") -> Int32
-    var slot_p = fn_param
-    # speak_lib.h: espeakRATE=1, espeakVOLUME=2, espeakPITCH=3, espeakRANGE=4
-    _ = Pointer(to=slot_p).unsafe_bitcast[SetParamFn]()[unsafe_offset=0](Int32(1), Int32(rate_wpm), Int32(0))
-    _ = Pointer(to=slot_p).unsafe_bitcast[SetParamFn]()[unsafe_offset=0](Int32(2), Int32(125), Int32(0))
-    _ = Pointer(to=slot_p).unsafe_bitcast[SetParamFn]()[unsafe_offset=0](Int32(3), Int32(pitch_0_99), Int32(0))
-    _ = Pointer(to=slot_p).unsafe_bitcast[SetParamFn]()[unsafe_offset=0](Int32(4), Int32(range_0_99), Int32(0))
-
-    var state = external_call["calloc", Int](Int(3), Int(8))
-    if state == 0:
-        return (empty^, 0)
-    var init_cap = 65536
-    var pcm_buf = external_call["malloc", Int](init_cap * 2)
-    if pcm_buf == 0:
-        external_call["free", NoneType](state)
-        return (empty^, 0)
-    put64(state + CAP_PTR, pcm_buf)
-    put64(state + CAP_LEN, 0)
-    put64(state + CAP_CAP, init_cap)
-
-    comptime SynthFn = def(Int, Int, UInt32, Int32, UInt32, UInt32, Int, Int) thin abi("C") -> Int32
-    comptime SyncFn = def() thin abi("C") -> Int32
-    var slot_syn = fn_synth
-    var slot_sync = fn_sync
-    var txt_c = _c_str(text)
-    # espeakCHARS_UTF8 = 1
-    _ = Pointer(to=slot_syn).unsafe_bitcast[SynthFn]()[unsafe_offset=0](
-        Int(txt_c.unsafe_ptr()),
-        len(txt_c),
-        UInt32(0),
-        Int32(0),
-        UInt32(0),
-        UInt32(1),
-        Int(0),
-        state,
-    )
-    _ = len(txt_c)
-    _ = Pointer(to=slot_sync).unsafe_bitcast[SyncFn]()[unsafe_offset=0]()
-
-    var final_ptr = get64(state + CAP_PTR)
-    var final_len = get64(state + CAP_LEN)
-    var out = List[Float32](capacity=max(1, final_len))
-    if final_ptr != 0 and final_len > 0:
-        var i16_ptr = Pointer[Int16, origin=MutAnyOrigin](unsafe_from_address=final_ptr)
-        for i in range(final_len):
-            out.append(Float32(i16_ptr[unsafe_offset=i]) / Float32(32768.0))
-    if final_ptr != 0:
-        external_call["free", NoneType](final_ptr)
-    external_call["free", NoneType](state)
-    return (out^, cached_sr)
-
-
-def _synth_klatt_fallback_mono(
-    text: String,
-    base_f0: Float32 = 112.0,
-    formant_scale: Float32 = 1.0,
-    char_dur_sec: Float32 = 0.056,
-) -> List[Float32]:
-    """Pure-Mojo 3-formant (`F1`/`F2`/`F3`) Klatt fallback synthesizer (`24 kHz` mono)
-    with configurable vocal-tract `formant_scale` and `base_f0` pitch."""
-    var sr = Float32(24000.0)
-    var n_chars = max(4, min(96, text.byte_length()))
-    var char_dur = max(Float32(0.038), min(Float32(0.075), char_dur_sec))
-    var total = Int(Float32(n_chars) * char_dur * sr)
-    var out = List[Float32](capacity=total)
-
-    var f1 = CytomicSVF(460.0 * formant_scale, 4.5, sr)
-    var f2 = CytomicSVF(1420.0 * formant_scale, 5.5, sr)
-    var f3 = CytomicSVF(2420.0 * formant_scale, 6.0, sr)
-    var fric_hp = CytomicSVF(3400.0, 2.2, sr)
-    var pink = PinkNoise(719 + Int(base_f0 * 3.0))
-    var ph = Float32(0.0)
-    var prev_idx = -1
-    var voiced = True
-
-    for i in range(total):
-        var t = Float32(i) / sr
-        var idx = min(n_chars - 1, Int(t / char_dur))
-        var local_t = t - Float32(idx) * char_dur
-        if idx != prev_idx:
-            prev_idx = idx
-            var ch = Int(text.as_bytes()[idx]) if idx < text.byte_length() else 32
-            if ch >= 97 and ch <= 122:
-                ch -= 32
-            voiced = ch != 32 and ch != 44 and ch != 46 and ch != 83 and ch != 70 and ch != 84 and ch != 75 and ch != 80
-            var t_f1 = Float32(460.0)
-            var t_f2 = Float32(1420.0)
-            var t_f3 = Float32(2420.0)
-            if ch == 65:  # A
-                t_f1 = 680.0
-                t_f2 = 1180.0
-            elif ch == 69 or ch == 73 or ch == 89:  # E / I / Y
-                t_f1 = 330.0
-                t_f2 = 1980.0
-            elif ch == 79 or ch == 85 or ch == 87:  # O / U / W
-                t_f1 = 380.0
-                t_f2 = 880.0
-            f1.set_params(min(Float32(1150.0), t_f1 * formant_scale), Float32(4.8), sr)
-            f2.set_params(min(Float32(3100.0), t_f2 * formant_scale), Float32(5.8), sr)
-            f3.set_params(min(Float32(3900.0), t_f3 * formant_scale), Float32(6.2), sr)
-
-        var ch_cur = Int(text.as_bytes()[idx]) if idx < text.byte_length() else 32
-        if ch_cur == 32 or ch_cur == 44 or ch_cur == 46:
-            out.append(Float32(0.0))
-            continue
-
-        var prosody = Float32(1.0) + Float32(0.035) * sin(t * Float32(4.2)) - (t / max(Float32(0.4), Float32(total) / sr)) * Float32(0.05)
-        var f0 = base_f0 * prosody
-        var dt_p = f0 / sr
-        ph = wrap_phase01(ph + dt_p)
-        var env = min(Float32(1.0), local_t * Float32(140.0)) * min(Float32(1.0), (char_dur - local_t) * Float32(95.0))
-        if voiced:
-            var glot = poly_blep_saw(ph, dt_p) * Float32(0.78) + pink.next() * Float32(0.06)
-            _ = f1.process(glot)
-            _ = f2.process(glot)
-            _ = f3.process(glot)
-            out.append((f1.bp * Float32(0.74) + f2.bp * Float32(0.48) + f3.bp * Float32(0.24)) * env)
-        else:
-            _ = fric_hp.process(hash_white_noise(i * 13 + 7))
-            out.append(fric_hp.hp * Float32(0.25) * env)
-    return out^
+def _synth_klatt_fallback_mono(text: String, voice_id: Int = FV_DEFAULT) -> List[Float32]:
+    """Dry 24 kHz mono formant speech (kept under its historical name for tools and evals)."""
+    return _formant_speech_mono(text, voice_id)
 
 
 @always_inline
@@ -360,12 +129,15 @@ def synth_ai_copilot_clip(
     """Synthesizes a 48 kHz Stereo Giant-Robot / Spaceship OS AI Co-Pilot voice `WavClip`.
     Includes `lead_in_sec` pre-roll so the simultaneous Guidance Start Alert Chime rings
     cleanly while `NativeAudio` smoothly auto-ducks BGM before the first spoken word."""
-    var raw_res = _try_espeak_mono(text, voice_name, rate_wpm, pitch_0_99, range_0_99)
-    var mono = raw_res[0].copy()
-    var src_sr = raw_res[1]
-    if len(mono) < 64 or src_sr <= 0:
-        mono = _synth_klatt_fallback_mono(text)
-        src_sr = 24000
+    # `voice_name` / `pitch_0_99` / `range_0_99` were espeak-ng controls; the AI OS formant preset
+    # (calm RP baritone, 104 Hz, 2.5 st range) now carries voice, register and range.
+    _ = voice_name
+    _ = pitch_0_99
+    _ = range_0_99
+    var mono = _formant_speech_mono(text, VOICE_AI_OS, rate_wpm)
+    var src_sr = FORMANT_TTS_SAMPLE_RATE
+    if len(mono) < 64:
+        mono = List[Float32](length=64, fill=0.0)
 
     # Trim trailing digital silence (`|s| < 0.0025`) so `is_speech_playing()` releases promptly
     var end_idx = len(mono)
@@ -488,78 +260,40 @@ def synth_radio_comms_clip(
     radio_bandpass: Bool = True,
 ) -> WavClip:
     """Synthesizes a 48 kHz Stereo character radio voice clip with distinct vocal-tract formants,
-    fundamental pitch, `espeak-ng` voice variant, military UHF `320–3350 Hz` bandpass, PTT click,
-    and two-tone tactical squelch tail."""
+    fundamental pitch and voice quality (one `formant_voice` preset per profile), military UHF
+    `320–3350 Hz` bandpass, PTT click, and two-tone tactical squelch tail."""
     if profile_id == VOICE_AI_OS:
         return synth_ai_copilot_clip(text, lead_in_sec)
 
-    var v_name = String("en-us+m2")
-    var rate_wpm = 150
-    var pitch_0_99 = 32
-    var range_0_99 = 46
-    var klatt_f0 = Float32(110.0)
-    var klatt_formant = Float32(0.96)
-    var klatt_dur = Float32(0.055)
+    # Each profile's register, vocal-tract scale and speaking rate live in its formant preset
+    # (`flint.audio.formant_tts.voices`), so the dry voice is not pitch-shifted afterwards.
     var pitch_shift = Float32(1.0)
     var pan_bias = Float32(0.0)
     var roger_hi = Float32(1174.66)
     var roger_lo = Float32(880.0)
 
     if profile_id == VOICE_BRIDGE_FEMALE:
-        v_name = "en-us+f3"
-        rate_wpm = 160
-        pitch_0_99 = 66
-        range_0_99 = 52
-        klatt_f0 = 214.0
-        klatt_formant = 1.20
-        klatt_dur = 0.050
-        pitch_shift = 1.04
         pan_bias = -0.10
         roger_hi = 1318.51
         roger_lo = 987.77
     elif profile_id == VOICE_ACE_BARITONE:
-        v_name = "en-us+m2"
-        rate_wpm = 145
-        pitch_0_99 = 26
-        range_0_99 = 44
-        klatt_f0 = 104.0
-        klatt_formant = 0.94
-        klatt_dur = 0.058
-        pitch_shift = 0.95
         pan_bias = -0.16
         roger_hi = 1046.50
         roger_lo = 783.99
     elif profile_id == VOICE_ACE_TENOR:
-        v_name = "en-us+m4"
-        rate_wpm = 166
-        pitch_0_99 = 48
-        range_0_99 = 55
-        klatt_f0 = 144.0
-        klatt_formant = 1.06
-        klatt_dur = 0.048
-        pitch_shift = 1.03
         pan_bias = 0.16
         roger_hi = 1174.66
         roger_lo = 987.77
     elif profile_id == VOICE_ACE_CRIMSON:
-        v_name = "en-gb-x-rp+f2"
-        rate_wpm = 156
-        pitch_0_99 = 58
-        range_0_99 = 58
-        klatt_f0 = 192.0
-        klatt_formant = 1.14
-        klatt_dur = 0.052
-        pitch_shift = 1.02
         pan_bias = 0.20
         roger_hi = 1396.91
         roger_lo = 698.46
 
-    var raw_res = _try_espeak_mono(text, v_name, rate_wpm, pitch_0_99, range_0_99)
-    var mono = raw_res[0].copy()
-    var src_sr = raw_res[1]
-    if len(mono) < 64 or src_sr <= 0:
-        mono = _synth_klatt_fallback_mono(text, klatt_f0, klatt_formant, klatt_dur)
-        src_sr = 24000
+    var voice_id = profile_id if (profile_id >= VOICE_BRIDGE_FEMALE and profile_id <= VOICE_ACE_CRIMSON) else FV_DEFAULT
+    var mono = _formant_speech_mono(text, voice_id)
+    var src_sr = FORMANT_TTS_SAMPLE_RATE
+    if len(mono) < 64:
+        mono = List[Float32](length=64, fill=0.0)
 
     var end_idx = len(mono)
     while end_idx > 256 and abs(mono[end_idx - 1]) < Float32(0.0025):
