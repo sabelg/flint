@@ -278,3 +278,53 @@ def _cos(x: Float32) -> Float32:
 def _sin(x: Float32) -> Float32:
     from std.math import sin
     return sin(x)
+
+
+def hemi_oct_blend(frames: Int, view_dir: Vec3) -> Tuple[Int, Int, Int, Float32, Float32, Float32]:
+    """The 3 grid cells around `view_dir` and their barycentric weights (sum 1). Cell centres sit on an
+    integer lattice in grid space; the containing lattice square is split along its diagonal."""
+    var d = Vec3(view_dir.x, max(view_dir.y, Float32(0.0)), view_dir.z)
+    var s = abs(d.x) + abs(d.y) + abs(d.z)
+    if s < Float32(1e-8):
+        d = Vec3(0.0, 1.0, 0.0)
+        s = Float32(1.0)
+    var u = d.x / s + d.z / s
+    var v = d.x / s - d.z / s
+    var gu = (u * Float32(0.5) + Float32(0.5)) * Float32(frames) - Float32(0.5)
+    var gv = (v * Float32(0.5) + Float32(0.5)) * Float32(frames) - Float32(0.5)
+    gu = max(Float32(0.0), min(Float32(frames - 1), gu))
+    gv = max(Float32(0.0), min(Float32(frames - 1), gv))
+    var x0 = min(frames - 2, Int(gu)) if frames > 1 else 0
+    var y0 = min(frames - 2, Int(gv)) if frames > 1 else 0
+    var a = gu - Float32(x0)
+    var b = gv - Float32(y0)
+    var x1 = min(frames - 1, x0 + 1)
+    var y1 = min(frames - 1, y0 + 1)
+    if a + b <= Float32(1.0):
+        return (y0 * frames + x0, y0 * frames + x1, y1 * frames + x0, Float32(1.0) - a - b, a, b)
+    return (y1 * frames + x1, y1 * frames + x0, y0 * frames + x1, a + b - Float32(1.0), Float32(1.0) - a, Float32(1.0) - b)
+
+
+def impostor_view_blend(frames: Int, obj_pos: Vec3, yaw: Float32, eye: Vec3) -> Tuple[Int, Int, Int, Float32, Float32, Float32]:
+    """`hemi_oct_blend` for an instance at `obj_pos` rotated by `yaw` seen from `eye`."""
+    var d = eye - obj_pos
+    var cs = _cos(yaw)
+    var sn = _sin(yaw)
+    return hemi_oct_blend(frames, Vec3(cs * d.x - sn * d.z, d.y, sn * d.x + cs * d.z).normalized())
+
+
+def impostor_view_cell_dithered(frames: Int, obj_pos: Vec3, yaw: Float32, eye: Vec3, frame_index: Int, instance_key: Int) -> Int:
+    """Stochastic 3-cell blend: picks one of the 3 barycentric cells with probability = its weight, decorrelated
+    per instance and per frame (golden-ratio sequence). Temporal accumulation (TSR) turns it into the
+    weighted blend, so impostors no longer snap when the view crosses a cell boundary."""
+    var bl = impostor_view_blend(frames, obj_pos, yaw, eye)
+    var h = UInt32(instance_key) * UInt32(2654435761)
+    h = (h ^ (h >> 15)) * UInt32(0x2C1B3C6D)
+    var base = Float32(Int(h >> 8)) / Float32(16777216.0)
+    var r = base + Float32(frame_index % 4096) * Float32(0.61803398875)
+    r = r - Float32(Int(r))
+    if r < bl[3]:
+        return bl[0]
+    if r < bl[3] + bl[4]:
+        return bl[1]
+    return bl[2]
