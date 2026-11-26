@@ -298,8 +298,12 @@ def test_gpu_fallback_equivalence_and_quality() raises:
         _assert(d_ln < Float32(5e-3), "trained GPU cascade matches CPU")
         var q_ln = _quality(r_ln, sc_r_ln, frames, motion)
         r_ln.shutdown()
+        print("    trained weights: PSNR " + _fmt(q_ln.psnr_db) + " SSIM " + _fmt(q_ln.ssim) + " FLIP " + _fmt(q_ln.flip))
         _assert(q_ln.psnr_db > q_an.psnr_db and q_ln.flip < q_an.flip, "trained weights beat analytic weights")
-        _assert(q_ln.psnr_db > q_svgf.psnr_db + 2.5 and q_ln.flip < q_svgf.flip - 0.015, "trained weights beat shipping SVGF by 2.5 dB PSNR and 0.015 FLIP")
+        # Area B round 4 made the shipping SVGF keep its history under the TSR jitter (31.68 dB / 0.088 FLIP ->
+        # 34.79 / 0.075 here; the learned path's temporal pass got the same fix: 36.33 / 0.059 -> 36.59 / 0.058),
+        # so the margin over SVGF shrank from 4.65 dB / 0.029 to about 1.8 dB / 0.016.
+        _assert(q_ln.psnr_db > q_svgf.psnr_db + 1.2 and q_ln.flip < q_svgf.flip - 0.010, "trained weights beat shipping SVGF by 1.2 dB PSNR and 0.010 FLIP")
         print("  [PASS] sota:ml trained weights: PSNR " + _fmt(q_ln.psnr_db) + " SSIM " + _fmt(q_ln.ssim) + " FLIP " + _fmt(q_ln.flip) + " (vs SVGF +" + _fmt(q_ln.psnr_db - q_svgf.psnr_db) + " dB)")
     else:
         print("  [INFO] sota:ml no trained weights at " + wpath + " (learned-quality check skipped)")

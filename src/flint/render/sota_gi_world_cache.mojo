@@ -186,6 +186,8 @@ struct SotaGiSettings(Copyable, Movable):
     var restir_gi_radius: Float32
     var restir_gi_max_m: Float32
     var svgf_history_fix: Bool  # SVGF a-trous ping-pongs through its own scratch, not history bank A (default on)
+    var svgf_jitter_tol: Bool  # round 4: SVGF reprojection depth test widened by the local depth slope (TSR jitter)
+    var svgf_lowres_history: Float32  # round 4: SVGF history cap of the reduced-res path tracer (0 = v5's 24)
     var resolve_scale: Int  # round 3: GI resolve traces one pixel per `scale x scale` block (1, 2 or 4) + upsample
     var upsample_tent: Float32  # upsample tent radius in blocks (1 = bilinear between representative pixels)
     var resolve_jitter: Bool  # rotate the traced pixel of each block every frame (Bayer order) so history sees all
@@ -233,12 +235,24 @@ struct SotaGiSettings(Copyable, Movable):
         self.restir_di_spatial = 0  # static Cornell, 128 lights: temporal 0.107 FLIP, +2 spatial (r 6) 0.115
         self.restir_di_radius = Float32(6.0)  # r 16 measured -4% dark and 0.140 FLIP
         self.restir_di_max_m = Float32(80.0)
-        self.restir_gi = True
+        # Round 4: off by default. With the jitter-aware SVGF history (`svgf_jitter_tol`) ReSTIR GI's temporal
+        # reuse correlates the samples SVGF averages: Cornell PT 1 spp 0.084 -> 0.066 FLIP (full res) and
+        # 0.093 -> 0.075 (half res) without it, also right after camera motion (render-sota-b-r4.md).
+        self.restir_gi = env_now("FLINT_SOTA_GI_RESTIR_GI") == "1"
         self.restir_gi_hybrid = False
         self.restir_gi_spatial = 2
         self.restir_gi_radius = Float32(12.0)
         self.restir_gi_max_m = Float32(30.0)
         self.svgf_history_fix = True
+        self.svgf_jitter_tol = env_now("FLINT_SOTA_GI_SVGF_JITTER_TOL") != "0"
+        self.svgf_lowres_history = Float32(48.0)
+        var env_cap = env_now("FLINT_SOTA_GI_SVGF_LOWRES_CAP")
+        if env_cap == "0" or env_cap == "24":
+            self.svgf_lowres_history = Float32(0.0)
+        elif env_cap == "32":
+            self.svgf_lowres_history = Float32(32.0)
+        elif env_cap == "64":
+            self.svgf_lowres_history = Float32(64.0)
         self.resolve_scale = 2
         var env_scale = env_now("FLINT_SOTA_GI_RESOLVE_SCALE")
         if env_scale == "1":
@@ -312,6 +326,15 @@ struct SotaGiSettings(Copyable, Movable):
         if self.resolve_scale >= 4:
             return 4
         return 2 if self.resolve_scale >= 2 else 1
+
+    def svgf_history_cap(self, mode: Int, light_changed: Bool = False) -> Float32:
+        """SVGF temporal history cap for this frame (0 = the v5 default of 24 frames). The reduced-resolution
+        path tracer traces each pixel once per `scale^2` frames, so a longer history keeps its sample count
+        up (measured: the half-res loss is sample count, see render-sota-b-r4.md). In the GI boost window after
+        a light change the cap falls back to 24, which immediately puts every pixel back on v5's blend weight."""
+        if light_changed or mode != SOTA_GI_MODE_PATH or self.cur_scale <= 1:
+            return Float32(0.0)
+        return self.svgf_lowres_history if self.svgf_lowres_history > Float32(1.0) else Float32(0.0)
 
     def resolve_grid(self, render_w: Int, render_h: Int) -> Tuple[Int, Int]:
         """Dispatch size (in pixels) of the resolve pass this frame."""
@@ -1046,10 +1069,11 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(k_s, s.iadd(ks, s.uint(1)))
     s.end_loop()
     s.end_if()
+    # Round 4: 4-word f16 record (word 3 = 0 marks "no record")
     var lo = s.iadd(_ctrl(s, b_sc, SOTA_CTRL_LOWRES), s.imul(s.iadd(s.imul(ly, lw), lx), s.uint(UInt32(SOTA_GI_LOWRES_WORDS))))
     var found = s.ine(s.load_u(found_v), s.uint(0))
     s.begin_if(s.logical_and(lowres, s.logical_not(found)))
-    s.store_word(b_sc, s.iadd(lo, s.uint(7)), s.uint(0))
+    s.store_word(b_sc, s.iadd(lo, s.uint(3)), s.uint(0))
     s.end_if()
     s.return_if(s.logical_not(found))
     s.return_if(s.ieq(mode, s.uint(0)))
@@ -1315,14 +1339,14 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
     var g_g = s.load_f(gi_g)
     var g_b = s.load_f(gi_b)
     s.begin_if(lowres)
-    s.store_float(b_sc, lo, g_r)
-    s.store_float(b_sc, s.iadd(lo, s.uint(1)), g_g)
-    s.store_float(b_sc, s.iadd(lo, s.uint(2)), g_b)
-    s.store_float(b_sc, s.iadd(lo, s.uint(3)), wx)
-    s.store_float(b_sc, s.iadd(lo, s.uint(4)), wy)
-    s.store_float(b_sc, s.iadd(lo, s.uint(5)), wz)
-    s.store_word(b_sc, s.iadd(lo, s.uint(6)), emit_sota_oct_pack(s, nx, ny, nz))
-    s.store_word(b_sc, s.iadd(lo, s.uint(7)), stamp_want)
+    # Position relative to this frame's camera: f16 then keeps ~5e-4 of the camera distance
+    var rdx = s.fsub(wx, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X))
+    var rdy = s.fsub(wy, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X + 1))
+    var rdz = s.fsub(wz, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X + 2))
+    s.store_word(b_sc, lo, s.pack_f16x2(g_r, g_g))
+    s.store_word(b_sc, s.iadd(lo, s.uint(1)), s.pack_f16x2(g_b, rdx))
+    s.store_word(b_sc, s.iadd(lo, s.uint(2)), s.pack_f16x2(rdy, rdz))
+    s.store_word(b_sc, s.iadd(lo, s.uint(3)), emit_sota_oct_pack(s, nx, ny, nz))
     s.begin_else()
     _emit_sota_gi_store_hdr(s, b_sc, b_hdr, gb, pix, demod, g_r, g_g, g_b)
     s.end_if()
@@ -1335,15 +1359,22 @@ def _emit_sota_gi_store_hdr(
     """Writes the GI of one pixel to `BIND_AAA_HDR_OUT`: demodulated for SVGF, else remodulated with
     the crisp (direct + specular) term and the diffuse weight from the G-buffer record at `gb`."""
     var ob = s.imul(pix, s.uint(8))
+    # Round 4: the demodulated path (SVGF on, the usual case) no longer loads the 6 remodulation words
+    s.begin_if(demod)
+    s.store_float(b_hdr, ob, g_r)
+    s.store_float(b_hdr, s.iadd(ob, s.uint(1)), g_g)
+    s.store_float(b_hdr, s.iadd(ob, s.uint(2)), g_b)
+    s.begin_else()
     var crisp_r = s.load_float(b_sc, s.iadd(gb, s.uint(9)))
     var crisp_g = s.load_float(b_sc, s.iadd(gb, s.uint(10)))
     var crisp_b = s.load_float(b_sc, s.iadd(gb, s.uint(11)))
     var dw_r = s.load_float(b_sc, s.iadd(gb, s.uint(12)))
     var dw_g = s.load_float(b_sc, s.iadd(gb, s.uint(13)))
     var dw_b = s.load_float(b_sc, s.iadd(gb, s.uint(14)))
-    s.store_float(b_hdr, ob, s.select_f(demod, g_r, s.fma(dw_r, g_r, crisp_r)))
-    s.store_float(b_hdr, s.iadd(ob, s.uint(1)), s.select_f(demod, g_g, s.fma(dw_g, g_g, crisp_g)))
-    s.store_float(b_hdr, s.iadd(ob, s.uint(2)), s.select_f(demod, g_b, s.fma(dw_b, g_b, crisp_b)))
+    s.store_float(b_hdr, ob, s.fma(dw_r, g_r, crisp_r))
+    s.store_float(b_hdr, s.iadd(ob, s.uint(1)), s.fma(dw_g, g_g, crisp_g))
+    s.store_float(b_hdr, s.iadd(ob, s.uint(2)), s.fma(dw_b, g_b, crisp_b))
+    s.end_if()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1362,12 +1393,14 @@ def sota_gi_upsample_shader() -> List[UInt32]:
     radiance cache at their own position when it is valid, else to the plain tent average.
 
     An 8x8 workgroup first stages the `(8 / scale + 2)^2` low-res records it touches in shared memory
-    (36 at half res), so each record is read from memory once per workgroup instead of 9x per pixel."""
+    (36 at half res), so each record is read from memory once per workgroup instead of 9x per pixel.
+    Round 4: the records are 4-word f16 (`SOTA_GI_LOWRES_WORDS`, half the round-3 traffic) and are
+    unpacked once while staging, so the 9 taps per pixel read plain floats (normal included)."""
     var s = AaaSpirvModule(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
     var b_hdr = s.buffer(BIND_AAA_HDR_OUT)
     var b_sc = s.buffer(BIND_AAA_SURFCACHE)
     comptime TILE_MAX = 36  # (8 / 2 + 2)^2
-    comptime REC = 8  # r, g, b, x, y, z, packed normal (as float bits), valid (1 / 0)
+    comptime REC = 10  # r, g, b, x, y, z (relative to the camera), nx, ny, nz, valid (1 / 0)
     var lds = s.workgroup_array_f32(TILE_MAX * REC)
     var px = s.invocation_axis(0)
     var py = s.invocation_axis(1)
@@ -1395,11 +1428,16 @@ def sota_gi_upsample_shader() -> List[UInt32]:
     var tbx = s.umin(s.isub(s.umax(s.iadd(wgbx, s.umod(li, tile_w)), s.uint(1)), s.uint(1)), s.isub(lw, s.uint(1)))
     var tby = s.umin(s.isub(s.umax(s.iadd(wgby, s.udiv(li, tile_w)), s.uint(1)), s.uint(1)), s.isub(lh, s.uint(1)))
     var lo = s.iadd(lo_base, s.imul(s.iadd(s.imul(tby, lw), tbx), s.uint(UInt32(SOTA_GI_LOWRES_WORDS))))
+    var w0 = s.unpack_f16x2(s.load_word(b_sc, lo))
+    var w1 = s.unpack_f16x2(s.load_word(b_sc, s.iadd(lo, s.uint(1))))
+    var w2 = s.unpack_f16x2(s.load_word(b_sc, s.iadd(lo, s.uint(2))))
+    var nw = s.load_word(b_sc, s.iadd(lo, s.uint(3)))
+    var sn = emit_sota_oct_unpack(s, nw)
+    var valid_t = s.ine(nw, s.uint(0))
+    var vals = [w0[0], w0[1], w1[0], w1[1], w2[0], w2[1], sn[0], sn[1], sn[2], s.select_f(valid_t, s.float(1.0), s.float(0.0))]
     var lb = s.imul(li, s.uint(UInt32(REC)))
-    for k in range(7):
-        s.store_workgroup_f32(lds[0], lds[1], s.iadd(lb, s.uint(UInt32(k))), s.load_float(b_sc, s.iadd(lo, s.uint(UInt32(k)))))
-    var valid_t = s.ieq(s.load_word(b_sc, s.iadd(lo, s.uint(7))), stamp_want)
-    s.store_workgroup_f32(lds[0], lds[1], s.iadd(lb, s.uint(7)), s.select_f(valid_t, s.float(1.0), s.float(0.0)))
+    for k in range(REC):
+        s.store_workgroup_f32(lds[0], lds[1], s.iadd(lb, s.uint(UInt32(k))), vals[k])
     s.end_if()
     s.workgroup_barrier()
 
@@ -1414,6 +1452,7 @@ def sota_gi_upsample_shader() -> List[UInt32]:
     var nx = s.load_float(b_sc, s.iadd(gb, s.uint(3)))
     var ny = s.load_float(b_sc, s.iadd(gb, s.uint(4)))
     var nz = s.load_float(b_sc, s.iadd(gb, s.uint(5)))
+    # Camera-relative position (the records store theirs relative to the same camera)
     var cdx = s.fsub(wx, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X))
     var cdy = s.fsub(wy, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X + 1))
     var cdz = s.fsub(wz, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X + 2))
@@ -1443,7 +1482,7 @@ def sota_gi_upsample_shader() -> List[UInt32]:
             var tx = s.iadd(tx0, s.uint(UInt32(ox)))
             var ty = s.iadd(ty0, s.uint(UInt32(oy)))
             var tb = s.imul(s.iadd(s.imul(ty, tile_w), tx), s.uint(UInt32(REC)))
-            var valid = s.fgt(s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(7))), s.float(0.5))
+            var valid = s.fgt(s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(9))), s.float(0.5))
             s.begin_if(valid)
             var r = s.load_workgroup_f32(lds[0], lds[1], tb)
             var g = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(1)))
@@ -1451,7 +1490,9 @@ def sota_gi_upsample_shader() -> List[UInt32]:
             var sx = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(3)))
             var sy = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(4)))
             var sz = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(5)))
-            var sn = emit_sota_oct_unpack(s, s.bitcast_uint(s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(6)))))
+            var snx = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(6)))
+            var sny = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(7)))
+            var snz = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(8)))
             # Tent around the representative pixel of that (clamped) block
             var bxi = s.umin(s.isub(s.umax(s.iadd(cbx, s.uint(UInt32(ox))), s.uint(1)), s.uint(1)), s.isub(lw, s.uint(1)))
             var byi = s.umin(s.isub(s.umax(s.iadd(cby, s.uint(UInt32(oy))), s.uint(1)), s.uint(1)), s.isub(lh, s.uint(1)))
@@ -1460,9 +1501,9 @@ def sota_gi_upsample_shader() -> List[UInt32]:
             var tx_w = s.nmax(s.float(0.0), s.fsub(s.float(1.0), s.fmul(s.fabs(s.fsub(fpx, rpx)), inv_sc)))
             var ty_w = s.nmax(s.float(0.0), s.fsub(s.float(1.0), s.fmul(s.fabs(s.fsub(fpy, rpy)), inv_sc)))
             var tent = s.fadd(s.fmul(tx_w, ty_w), s.float(0.02))
-            var plane = s.fmul(s.fabs(emit_vec3_dot(s, nx, ny, nz, s.fsub(sx, wx), s.fsub(sy, wy), s.fsub(sz, wz))), inv_plane)
+            var plane = s.fmul(s.fabs(emit_vec3_dot(s, nx, ny, nz, s.fsub(sx, cdx), s.fsub(sy, cdy), s.fsub(sz, cdz))), inv_plane)
             var w_p = s.fdiv(s.float(1.0), s.fadd(s.float(1.0), s.fmul(plane, plane)))
-            var nd = s.nmax(s.float(0.0), emit_vec3_dot(s, nx, ny, nz, sn[0], sn[1], sn[2]))
+            var nd = s.nmax(s.float(0.0), emit_vec3_dot(s, nx, ny, nz, snx, sny, snz))
             var nd2 = s.fmul(nd, nd)
             var nd4 = s.fmul(nd2, nd2)
             var w_g = s.fmul(tent, s.fmul(w_p, s.fmul(nd4, nd4)))

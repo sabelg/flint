@@ -5746,6 +5746,8 @@ struct FlintAaaVulkanRenderer(Movable):
             push_rep[2] = UInt32(svgf_hist_in)
             push_rep[3] = UInt32(svgf_hist_out)
             push_rep[4] = UInt32(self.frame_index)
+            push_rep[5] = UInt32(1) if self.sota_gi.svgf_jitter_tol else UInt32(0)  # --- sota:gi hook --- (round 4)
+            push_rep[6] = bitcast[DType.uint32](self.sota_gi.svgf_history_cap(sota_mode, self.sota_vsm.gi_boost_left > 0))  # sota:gi hook
             self.vk.dispatch_aaa(
                 cur_slot,
                 self.pipe_svgf_reproject,

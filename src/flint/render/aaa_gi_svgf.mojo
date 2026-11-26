@@ -2243,7 +2243,8 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
 
 def svgf_temporal_reproject_shader() -> List[UInt32]:
     """Pass 1: SVGF Temporal Reprojection & Moments Accumulation authored in Pure-Mojo ShaderDsl.
-    Push[0] = w_u, Push[1] = h_u, Push[2] = hist_in_words, Push[3] = hist_out_words, Push[4] = frame_index.
+    Push[0] = w_u, Push[1] = h_u, Push[2] = hist_in_words, Push[3] = hist_out_words, Push[4] = frame_index,
+    Push[5] = 1 for the jitter-aware depth tolerance (sota:gi round 4; 0 = the v5 test).
     """
     from flint.render.shader_dsl import (
         GpuVec3,
@@ -2259,6 +2260,7 @@ def svgf_temporal_reproject_shader() -> List[UInt32]:
         select_vec3,
         sqrt_f,
     )
+    from flint.render.sota_gi_svgf_reproject import emit_svgf_jitter_depth_ok  # sota:gi hook (round 4)
 
     var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
     var b_hdr = dsl.buffer[8](BIND_AAA_HDR_OUT)
@@ -2312,7 +2314,12 @@ def svgf_temporal_reproject_shader() -> List[UInt32]:
 
     var depth_diff = abs_f(cur_z - prev_z) / max_f(cur_z * 0.1, 0.08)
     var norm_diff = abs_f(cur_nx - prev_nx)
-    var is_consistent = in_bounds & depth_diff.lt(0.12) & norm_diff.lt(0.25) & cur_z.lt(1e5)
+    # --- sota:gi hook --- (round 4: jitter-aware depth tolerance when Push[5] != 0, `sota_gi_svgf_reproject.mojo`)
+    var jit_tol = dsl.push_u32(5).ne(0)
+    var jit_ok = emit_svgf_jitter_depth_ok(dsl, b_hdr, px, py, w_u, h_u, cur_z, prev_z)
+    var depth_ok = (jit_tol & jit_ok) | (jit_tol.not_() & depth_diff.lt(0.12))
+    var is_consistent = in_bounds & depth_ok & norm_diff.lt(0.25) & cur_z.lt(1e5)
+    # --- end sota:gi hook ---
 
     var res_rgb = dsl.var_vec3(cur_rgb)
     var res_m1 = dsl.var_f32(cur_luma)
@@ -2320,7 +2327,11 @@ def svgf_temporal_reproject_shader() -> List[UInt32]:
     var res_len = dsl.var_f32_const(1.0)
 
     dsl.if_then(is_consistent)
-    var new_len = min_f(prev_len + dsl.f32(1.0), 24.0)
+    # --- sota:gi hook --- (round 4: Push[6] = history cap as float bits, 0 = the v5 cap of 24 frames)
+    var cap_p = dsl.push_f32(6)
+    var hist_cap = select_f(cap_p.gt(1.0), cap_p, dsl.f32(24.0))
+    var new_len = min_f(prev_len + dsl.f32(1.0), hist_cap)
+    # --- end sota:gi hook ---
     var alpha = dsl.f32(1.0) / new_len
     var om_a = dsl.f32(1.0) - alpha
     res_rgb.set(cur_rgb * alpha + prev_rgb * om_a)

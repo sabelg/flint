@@ -78,6 +78,7 @@ from flint.render.shader_dsl import (
     select_u,
     sqrt_f,
 )
+from flint.render.sota_gi_svgf_reproject import emit_svgf_jitter_depth_ok  # --- sota:gi hook --- (round 4)
 
 comptime SOTA_ML_NF: Int = 7
 # Workgroup shape of the separate temporal / a-trous passes: wide rows keep each warp on one row of the
@@ -379,8 +380,11 @@ def _temporal_eval(
     var prev_m2 = b_hist.load_f32(p_base + 5)
     var prev_z = b_hist.load_f32(p_base + 6)
     var prev_nx = b_hist.load_f32(p_base + 7)
-    var dz = abs_f(cur_z - prev_z) / max_f(cur_z * 0.1, 0.08)
-    var ok = in_bounds & dz.lt(0.12) & abs_f(cur_nx - prev_nx).lt(0.25) & cur_z.lt(1e5) & prev_len.ge(1.0)
+    # --- sota:gi hook --- (area B round 4: the same jitter-aware depth test as the SVGF reprojection; the
+    # v5 test `|dz| / max(0.1 z, 0.08) < 0.12` dropped the history of slanted surfaces under the TSR jitter)
+    var dz_ok = emit_svgf_jitter_depth_ok(dsl, b_hdr, px, py, w_u, h_u, cur_z, prev_z)
+    var ok = in_bounds & dz_ok & abs_f(cur_nx - prev_nx).lt(0.25) & cur_z.lt(1e5) & prev_len.ge(1.0)
+    # --- end sota:gi hook ---
 
     var r_rgb = dsl.var_vec3(cur_rgb)
     var r_m1 = dsl.var_f32(cur_l)
