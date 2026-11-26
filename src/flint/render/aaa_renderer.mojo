@@ -4250,7 +4250,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if n_inst > 0:
             var q_mc = next_q
             if use_prof:
-                self.vk.write_timestamp(cur_slot, q_mc, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_mc, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("MeshletCull"), q_mc))
             var push_cull = List[UInt32](length=16, fill=0)
@@ -4292,7 +4292,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # Hardware `VK_KHR_dynamic_rendering` 64-Bit Visibility Buffer + Reverse-Z Depth (Phase 1 Draw)
         var q_vb = next_q
         if use_prof:
-            self.vk.write_timestamp(cur_slot, q_vb, PIPELINE_TOP)
+            self.vk.write_timestamp(cur_slot, q_vb, PIPELINE_BOTTOM)
             next_q += 2
             prof_pairs.append((String("VisBufferHwRaster"), q_vb))
         self.vk.transition_image(
@@ -4465,7 +4465,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if vsm_active:
             var q_vm = next_q
             if use_prof:
-                self.vk.write_timestamp(cur_slot, q_vm, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_vm, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("VsmMarkPages"), q_vm))
             var push_vm = List[UInt32](length=16, fill=0)
@@ -4519,7 +4519,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if len(vsm_allocs) > 0:
             var q_vr = next_q
             if use_prof and q_vr + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_vr, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_vr, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("VsmTileRaster"), q_vr))
             self.vk.transition_image(
@@ -4575,7 +4575,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if use_rt_frame and self.enable_rt_gi and sc_inst_count > 0 and self.sota_gi.needs_surface_cache(sota_mode):  # sota:gi hook
             var q_sc = next_q
             if use_prof and q_sc + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_sc, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_sc, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("LumenSurfaceCache"), q_sc))
 
@@ -4634,7 +4634,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.sota_gi.uses_wrc(sota_mode):
             var q_wrc = next_q
             if use_prof and q_wrc + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_wrc, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_wrc, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("SotaWorldRadianceCache"), q_wrc))
             var push_wrc = List[UInt32](length=16, fill=0)
@@ -4650,7 +4650,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if n_cl_lights > 0 and not self.furnace_white_dome:
             var q_cl = next_q
             if use_prof and q_cl + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_cl, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_cl, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("ClusterLightCull"), q_cl))
             var push_cl = List[UInt32](length=16, fill=0)
@@ -4681,7 +4681,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if run_froxel or run_rain:
             var q_fi = next_q
             if use_prof and q_fi + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_fi, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_fi, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("FroxelInjectAndReproject"), q_fi))
             var eff_frox_fr = 0 if (self.froxel_valid_frames == 0 or self.tsr_history_weight <= Float32(0.01)) else self.froxel_valid_frames
@@ -4736,7 +4736,7 @@ struct FlintAaaVulkanRenderer(Movable):
         ):
             var q_rs = next_q
             if use_prof and q_rs + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_rs, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_rs, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("RtSoftSunShadows"), q_rs))
             rt_sun_flt_off = rt_shadow_filtered_offset(max_pix)
@@ -4773,7 +4773,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var spec_in_off = spec_reblur_raw_offset(max_pix)
         var q_sh = next_q
         if use_prof and q_sh + 1 < q_limit:
-            self.vk.write_timestamp(cur_slot, q_sh, PIPELINE_TOP)
+            self.vk.write_timestamp(cur_slot, q_sh, PIPELINE_BOTTOM)
             next_q += 2
             prof_pairs.append((String("DeferredMultiLobeRtShade"), q_sh))
         var push_sh = List[UInt32](length=16, fill=0)
@@ -4801,7 +4801,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if sota_mode != SOTA_GI_MODE_LEGACY:
             var q_sgr = next_q
             if use_prof and q_sgr + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_sgr, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_sgr, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("SotaGiResolve"), q_sgr))
             self.vk.memory_barrier2(
@@ -4828,7 +4828,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if run_sota_ml:
             var q_ml = next_q
             if use_prof and q_ml + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_ml, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_ml, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("SotaMlDenoise"), q_ml))
             self.sota_ml.record(self.vk, cur_slot, self.pipe_layout, self.desc_set, self.render_w, self.render_h)
@@ -4842,7 +4842,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if run_svgf and not run_sota_ml:  # sota:ml
             var q_sv = next_q
             if use_prof and q_sv + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_sv, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_sv, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("SvgfTemporalAndAtrous"), q_sv))
 
@@ -4895,7 +4895,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if run_spec_reblur:
             var q_rb = next_q
             if use_prof and q_rb + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_rb, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_rb, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("SpecReblurTemporalAtrous"), q_rb))
             var spec_h_in = spec_reblur_hist_ping_offset(max_pix) if (self.frame_index & 1) == 0 else spec_reblur_hist_pong_offset(max_pix)
@@ -4959,7 +4959,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if (n_cel > 0 or n_vfx > 0) and self.pipe_npr_cel_shade != 0:
             var q_cel = next_q
             if use_prof and q_cel + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_cel, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_cel, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("NprCelAndStylizedVfxShade"), q_cel))
             var push_cel = List[UInt32](length=16, fill=0)
@@ -4985,7 +4985,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if frame_has_glass and use_rt_frame and self.pipe_glass_refract != 0 and not self.furnace_white_dome:
             var q_gl = next_q
             if use_prof and q_gl + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_gl, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_gl, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("RtRefractiveGlass"), q_gl))
             var push_gl = List[UInt32](length=16, fill=0)
@@ -5026,7 +5026,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if run_water:
             var q_wt = next_q
             if use_prof and q_wt + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_wt, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_wt, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("DielectricBeerLambertWater"), q_wt))
             self.vk.memory_barrier2(
@@ -5067,7 +5067,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if run_froxel or run_rain:
             var q_fm = next_q
             if use_prof and q_fm + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_fm, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_fm, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("FroxelRaymarchAndRain"), q_fm))
             var push_fm = List[UInt32](length=16, fill=0)
@@ -5095,7 +5095,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if len(self.frame_plumes) > 0 or not (run_water or run_rain):
             var q_oit = next_q
             if use_prof and q_oit + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_oit, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_oit, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("Oit6WayVolumetrics"), q_oit))
             var push_oit = List[UInt32](length=16, fill=0)
@@ -5122,7 +5122,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.particles_ever_active and not self.furnace_white_dome:
             var q_pt = next_q
             if use_prof and q_pt + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_pt, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_pt, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("GpuComputeParticles64K"), q_pt))
             var em_off = gpu_particles_emitters_word_offset(max_pix)
@@ -5191,7 +5191,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # `FlintTSR v3` Pre-Bloom Temporal Upscale & 16-Phase Halton Anti-Aliasing (`render_w x render_h -> output_w x output_h`)!
         var q_tsr = next_q
         if use_prof and q_tsr + 1 < q_limit:
-            self.vk.write_timestamp(cur_slot, q_tsr, PIPELINE_TOP)
+            self.vk.write_timestamp(cur_slot, q_tsr, PIPELINE_BOTTOM)
             next_q += 2
             prof_pairs.append((String("FlintTsrV3Resolve"), q_tsr))
         var ping_off = max_pix * 16
@@ -5249,7 +5249,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.enable_bokeh_dof and not self.furnace_white_dome and not sota_dof_on:
             var q_dof = next_q
             if use_prof and q_dof + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_dof, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_dof, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("PolygonalBokehDoF"), q_dof))
             var dof_off = dof_scratch_word_offset(max_pix)
@@ -5283,7 +5283,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if (n_sw > 0 or imp_blend > Float32(0.001)) and self.pipe_npr_post_fx != 0:
             var q_npf = next_q
             if use_prof and q_npf + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_npf, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_npf, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("NprShockwaveAndImpactPostFx"), q_npf))
             self.vk.memory_barrier2(
@@ -5327,7 +5327,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.bloom_intensity > Float32(1e-4) and not self.furnace_white_dome:
             var q_bl = next_q
             if use_prof and q_bl + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_bl, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_bl, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("DualKawaseBloom5Mip"), q_bl))
             var mip_w = List[Int]()
@@ -5413,7 +5413,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.enable_motion_blur and self.motion_blur_shutter > Float32(0.001) and not self.furnace_white_dome:
             var q_mb = next_q
             if use_prof and q_mb + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_mb, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_mb, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("TileMaxMotionBlur"), q_mb))
             self.vk.memory_barrier2(
@@ -5455,7 +5455,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.enable_auto_exposure and not self.furnace_white_dome:
             var q_ae = next_q
             if use_prof and q_ae + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_ae, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_ae, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("LuminanceAutoExposure"), q_ae))
             var push_lh = List[UInt32](length=16, fill=0)
@@ -5497,7 +5497,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # Cinema Display Tonemap (`AgX` Toe + `+5.5 EV` Shoulder / `HDR10 PQ` / `Linear sRGB` + Windshield Rain)!
         var q_dt = next_q
         if use_prof and q_dt + 1 < q_limit:
-            self.vk.write_timestamp(cur_slot, q_dt, PIPELINE_TOP)
+            self.vk.write_timestamp(cur_slot, q_dt, PIPELINE_BOTTOM)
             next_q += 2
             prof_pairs.append((String("CinemaDisplayTonemap"), q_dt))
         var disp_tonemap_mode = UInt32(2) if self.display_mode == AAA_DISPLAY_SCRGB_FP16 else self.display_mode
@@ -5528,7 +5528,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.ui_draw_list.count() > 0:
             var q_ui = next_q
             if use_prof and q_ui + 1 < q_limit:
-                self.vk.write_timestamp(cur_slot, q_ui, PIPELINE_TOP)
+                self.vk.write_timestamp(cur_slot, q_ui, PIPELINE_BOTTOM)
                 next_q += 2
                 prof_pairs.append((String("UiSdfOverlay"), q_ui))
 
