@@ -108,6 +108,7 @@ from flint.render.sota_camera_bokeh import (
     sota_pupil_clip,
 )
 from flint.render.sota_camera_hdr import SotaHdrOutput, sota_hdr_scrgb_shader
+from flint.render.sota_camera_exposure import SotaAutoExposure
 from flint.render.sota_camera_vrs import (
     SotaVrsAuto,
     sota_vrs_classify_shader,
@@ -208,6 +209,7 @@ struct SotaCameraPost(Copyable, Movable):
     var hdr: SotaHdrOutput  # HDR10 PQ / scRGB display mapping after AgX (sota_camera_hdr)
     var pipe_hdr_scrgb: Int
     var frame_counter: UInt32
+    var ae: SotaAutoExposure  # round 4: EV100 auto exposure for day / twilight / night (sota_camera_exposure)
 
     def __init__(out self):
         self.camera = PhysicalCameraModel()
@@ -275,6 +277,7 @@ struct SotaCameraPost(Copyable, Movable):
         self.hdr = SotaHdrOutput()
         self.pipe_hdr_scrgb = 0
         self.frame_counter = 0
+        self.ae = SotaAutoExposure()
 
     def pupil_clip(self) -> SotaPupilClip:
         """This frame's barrel clips in aperture units (they grow relative to the aperture as it stops down)."""
@@ -303,6 +306,7 @@ struct SotaCameraPost(Copyable, Movable):
         self.pipe_vrs_classify = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_classify_shader())
         self.pipe_vrs_fill = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_fill_shader())
         self.pipe_hdr_scrgb = vk.create_aaa_compute_pipeline(pipe_layout, sota_hdr_scrgb_shader())
+        _ = self.ae.create_pipelines(vk, pipe_layout)
         return self.pipelines_ready()
 
     def pipelines_ready(self) -> Bool:

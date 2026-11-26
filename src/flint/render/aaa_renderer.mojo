@@ -428,6 +428,8 @@ from flint.render.sota_camera_hdr import (  # --- sota:camera hook ---
     sota_hdr_ui_paper_push,
     sota_hdr_update_metadata,
 )
+from flint.render.sota_camera_exposure import sota_ae_record  # --- sota:camera hook (round 4) ---
+from flint.render.sota_atmo_core import rgb_luma  # --- sota:camera hook (round 4: sky calibration) ---
 # --- end sota:camera hook ---
 # --- sota:atmo hook (import) ---
 from flint.render.sota_atmo_gpu import SotaAtmosphere, sota_atmo_record_apply, sota_atmo_record_luts, sota_atmo_region_words
@@ -4409,6 +4411,11 @@ struct FlintAaaVulkanRenderer(Movable):
         self._sota_atmo_prepare()  # --- sota:atmo hook ---
 
         # --- sota:camera hook (exposure triangle -> exposure, shutter, legacy lens) ---
+        if self.sota_cam.ae.enable:  # round 4: photometric calibration of the EV100 meter (sky) and the camera
+            if self.sota_atmo.active():
+                self.sota_cam.ae.calibrate_to_sky(rgb_luma(self.sota_atmo.params.solar_irradiance))
+            if self.sota_cam.ae.calibrate_camera:
+                self.sota_cam.camera.ev100_unity = self.sota_cam.ae.ev100_unity()
         if self.sota_cam.drive_renderer:
             var ae_mul = Float32(1.0)
             if self.enable_auto_exposure and self.frame_index > 0:
@@ -6364,8 +6371,16 @@ struct FlintAaaVulkanRenderer(Movable):
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
             )
 
+        # --- sota:camera hook (round 4: EV100 auto exposure replaces the v5 meter when enabled) ---
+        var sota_ae_on = self.sota_cam.ae.active(self.enable_auto_exposure) and not self.furnace_white_dome
+        if sota_ae_on:
+            sota_ae_record(
+                self.sota_cam.ae, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.output_w, self.output_h,
+                self.sota_cam.frame_dt_s, self.ev_compensation, use_prof, next_q, q_limit, prof_pairs,
+            )
+        # --- end sota:camera hook ---
         # GPU 64-Bin Log-Luminance Histogram & Bounded 95%-Trimmed Auto-Exposure!
-        if self.enable_auto_exposure and not self.furnace_white_dome:
+        if self.enable_auto_exposure and not self.furnace_white_dome and not sota_ae_on:
             var q_ae = next_q
             if use_prof and q_ae + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_ae, PIPELINE_BOTTOM)
