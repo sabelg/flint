@@ -160,6 +160,17 @@ def _emit_disk_offset(
     return s.iadd(s.imul(qy, w_u), qx)
 
 
+def _emit_snap_pix(
+    mut s: AaaSpirvModule, qx: UInt32, qy: UInt32, w_u: UInt32, h_u: UInt32, snap: UInt32, jx: UInt32, jy: UInt32
+) -> UInt32:
+    """Pixel index of the representative pixel of the `snap x snap` block holding `(qx, qy)`: the
+    reduced-resolution resolve (round 3) only writes reservoirs there, at sub-pixel `(jx, jy)` of each
+    block on the previous frame. `snap = 1, j = 0` is the identity (full-resolution resolve)."""
+    var sx = s.umin(s.iadd(s.imul(s.udiv(qx, snap), snap), jx), s.isub(w_u, s.uint(1)))
+    var sy = s.umin(s.iadd(s.imul(s.udiv(qy, snap), snap), jy), s.isub(h_u, s.uint(1)))
+    return s.iadd(s.imul(sy, w_u), sx)
+
+
 # ---------------------------------------------------------------------------------------------
 # ReSTIR DI
 # ---------------------------------------------------------------------------------------------
@@ -554,9 +565,15 @@ def emit_sota_restir_gi_reuse(
     b_instances: UInt32,
     b_materials: UInt32,
     bindless_arr: Tuple[UInt32, UInt32],
+    snap: UInt32 = 0,
+    snap_jx: UInt32 = 0,
+    snap_jy: UInt32 = 0,
 ) -> Tuple[UInt32, UInt32, UInt32]:
     """Temporal reuse (stored for the next frame), then fused spatial reuse of previous-frame
-    neighbours for this frame's estimate. Returns the GI estimate `f(y) W` in E/pi units."""
+    neighbours for this frame's estimate. Returns the GI estimate `f(y) W` in E/pi units.
+    `snap / snap_jx / snap_jy` (SPIR-V uint ids, 0 = not given): previous-frame reservoirs only exist at
+    the representative pixel of each `snap x snap` block (reduced-resolution resolve), so reprojected and
+    neighbour pixels are moved to that pixel."""
     var pix = s.iadd(s.imul(py, w_u), px)
     var flags = _ctrl(s, b_sc, SOTA_CTRL_RESTIR_FLAGS)
     var frame = _ctrl(s, b_sc, SOTA_CTRL_FRAME)
@@ -568,8 +585,11 @@ def emit_sota_restir_gi_reuse(
     var hist_ok = s.ine(s.bit_and(flags, s.uint(SOTA_RESTIR_HIST_VALID)), s.uint(0))
     var m_cap = _ctrl_f(s, b_sc, SOTA_CTRL_GI_MCAP)
     var prev_base = _ctrl(s, b_sc, SOTA_CTRL_GI_PREV)
+    var has_snap = snap != 0
     s.begin_if(s.logical_and(hist_ok, rp[0]))
     var q_pix = s.iadd(s.imul(rp[2], w_u), rp[1])
+    if has_snap:
+        q_pix = _emit_snap_pix(s, rp[1], rp[2], w_u, h_u, snap, snap_jx, snap_jy)
     var sim = emit_sota_hist_similar(s, b_sc, q_pix, vx, vy, vz, vnx, vny, vnz, Float32(0.9))
     s.begin_if(sim[0])
     var h0 = _emit_hash(s, s.load_u(seed_v))
@@ -613,6 +633,8 @@ def emit_sota_restir_gi_reuse(
     var hc = _emit_hash(s, hb[0])
     s.store(seed_v, hc[0])
     var nb = _emit_disk_offset(s, rp[1], rp[2], w_u, h_u, radius, ha[1], hb[1])
+    if has_snap:
+        nb = _emit_snap_pix(s, s.umod(nb, w_u), s.udiv(nb, w_u), w_u, h_u, snap, snap_jx, snap_jy)
     var sim_n = emit_sota_hist_similar(s, b_sc, nb, vx, vy, vz, vnx, vny, vnz, Float32(0.8))
     s.begin_if(sim_n[0])
     _emit_gi_merge_stored(

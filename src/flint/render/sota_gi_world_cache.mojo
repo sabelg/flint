@@ -27,6 +27,7 @@ descriptor-layout change is needed. Layout of the region is described by the `SO
 """
 from std.math import max, min, sqrt
 from flint.core.math import Vec3
+from flint.platform.os import env_now
 from flint.platform.vulkan import put32, put_float
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 from flint.render.aaa_visbuffer import (
@@ -83,6 +84,7 @@ from flint.render.sota_gi_core import (
     SOTA_CTRL_GI_SPATIAL,
     SOTA_CTRL_HIST_CUR,
     SOTA_CTRL_HIST_PREV,
+    SOTA_CTRL_LOWRES,
     SOTA_CTRL_MAX_HISTORY,
     SOTA_CTRL_MODE,
     SOTA_CTRL_PIXEL_RAYS,
@@ -104,6 +106,7 @@ from flint.render.sota_gi_core import (
     SOTA_GI_CELL_BIAS,
     SOTA_GI_CTRL_WORDS,
     SOTA_GI_GBUF_WORDS,
+    SOTA_GI_LOWRES_WORDS,
     SOTA_GI_MAX_PROBES,
     SOTA_GI_MODE_HYBRID,
     SOTA_GI_MODE_LEGACY,
@@ -135,12 +138,16 @@ from flint.render.sota_gi_core import (
     sota_gi_gbuf_offset,
     sota_gi_gi_offset,
     sota_gi_hist_offset,
+    sota_gi_lowres_offset,
+    sota_gi_bayer_offset,
     sota_gi_region_words,
     sota_sh9_band_weight,
 )
 from flint.render.sota_gi_restir import (
     SotaGiReservoir,
     emit_sota_gi_stream_candidate,
+    emit_sota_oct_pack,
+    emit_sota_oct_unpack,
     emit_sota_hist_write,
     emit_sota_restir_gi_reuse,
 )
@@ -179,9 +186,19 @@ struct SotaGiSettings(Copyable, Movable):
     var restir_gi_radius: Float32
     var restir_gi_max_m: Float32
     var svgf_history_fix: Bool  # SVGF a-trous ping-pongs through its own scratch, not history bank A (default on)
+    var resolve_scale: Int  # round 3: GI resolve traces one pixel per `scale x scale` block (1, 2 or 4) + upsample
+    var upsample_tent: Float32  # upsample tent radius in blocks (1 = bilinear between representative pixels)
+    var resolve_jitter: Bool  # rotate the traced pixel of each block every frame (Bayer order) so history sees all
     # Runtime state (not cvars)
     var pipe_wrc: Int
     var pipe_resolve: Int
+    var pipe_upsample: Int
+    var cur_scale: Int  # effective resolve scale of the frame being recorded
+    var cur_jx: Int
+    var cur_jy: Int
+    var prev_jx: Int  # representative sub-pixel of the previous frame (ReSTIR GI reservoirs live there)
+    var prev_jy: Int
+    var last_scale: Int
     var accum_frames: Int
     var wrc_frames: Int
     var last_cam_pos: Vec3
@@ -222,8 +239,28 @@ struct SotaGiSettings(Copyable, Movable):
         self.restir_gi_radius = Float32(12.0)
         self.restir_gi_max_m = Float32(30.0)
         self.svgf_history_fix = True
+        self.resolve_scale = 2
+        var env_scale = env_now("FLINT_SOTA_GI_RESOLVE_SCALE")
+        if env_scale == "1":
+            self.resolve_scale = 1
+        elif env_scale == "4":
+            self.resolve_scale = 4
+        self.resolve_jitter = env_now("FLINT_SOTA_GI_RESOLVE_JITTER") != "0"
+        self.upsample_tent = Float32(0.5)
+        var env_tent = env_now("FLINT_SOTA_GI_UPS_TENT")
+        if env_tent == "0.25":
+            self.upsample_tent = Float32(0.25)
+        elif env_tent == "1":
+            self.upsample_tent = Float32(1.0)
         self.pipe_wrc = 0
         self.pipe_resolve = 0
+        self.pipe_upsample = 0
+        self.cur_scale = 1
+        self.cur_jx = 0
+        self.cur_jy = 0
+        self.prev_jx = 0
+        self.prev_jy = 0
+        self.last_scale = 1
         self.accum_frames = 0
         self.wrc_frames = 0
         self.last_cam_pos = Vec3(1e30, 0.0, 0.0)
@@ -264,6 +301,22 @@ struct SotaGiSettings(Copyable, Movable):
 
     def needs_surface_cache(self, mode: Int) -> Bool:
         return mode == SOTA_GI_MODE_LEGACY or mode == SOTA_GI_MODE_HYBRID
+
+    def effective_resolve_scale(self, mode: Int) -> Int:
+        """Resolve scale for `mode`: photo-mode accumulation and the probe-only mode without contact rays
+        (no per-pixel rays, so nothing to save) stay at full resolution."""
+        if self.accumulate or mode == SOTA_GI_MODE_LEGACY:
+            return 1
+        if mode == SOTA_GI_MODE_WRC and self.contact_rays == 0:
+            return 1
+        if self.resolve_scale >= 4:
+            return 4
+        return 2 if self.resolve_scale >= 2 else 1
+
+    def resolve_grid(self, render_w: Int, render_h: Int) -> Tuple[Int, Int]:
+        """Dispatch size (in pixels) of the resolve pass this frame."""
+        var sc = self.cur_scale
+        return ((render_w + sc - 1) // sc, (render_h + sc - 1) // sc)
 
     def reset_accumulation(mut self):
         self.accum_frames = 0
@@ -361,8 +414,23 @@ struct SotaGiSettings(Copyable, Movable):
                 (mode == SOTA_GI_MODE_PATH and self.restir_gi) or (mode == SOTA_GI_MODE_HYBRID and self.restir_gi_hybrid)
             ):
                 rflags |= SOTA_RESTIR_GI
-        if rflags != self.last_restir:
+        # Reduced-resolution resolve: pick this frame's representative sub-pixel of every block
+        var scale = self.effective_resolve_scale(mode)
+        var phase = frame_index if self.resolve_jitter else 0
+        var j = sota_gi_bayer_offset(scale, phase)
+        if scale == self.last_scale:
+            self.prev_jx = self.cur_jx
+            self.prev_jy = self.cur_jy
+        else:
+            self.prev_jx = j[0]
+            self.prev_jy = j[1]
+        self.cur_scale = scale
+        self.cur_jx = j[0]
+        self.cur_jy = j[1]
+        put32(a + SOTA_CTRL_LOWRES * 4, UInt32(sota_gi_lowres_offset(max_pix)))
+        if rflags != self.last_restir or scale != self.last_scale:
             self.restir_frames = 0
+        self.last_scale = scale
         self.last_restir = rflags
         self.restir_active = rflags
         if rflags != 0:
@@ -930,21 +998,65 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
     if enable_ray_query:
         tlas_var = s.acceleration_structure(BIND_AAA_TLAS)
 
-    var px = s.invocation_axis(0)
-    var py = s.invocation_axis(1)
+    var lx = s.invocation_axis(0)
+    var ly = s.invocation_axis(1)
     var w_u = s.push_word(0)
     var h_u = s.push_word(1)
     var demod = s.ine(s.push_word(2), s.uint(0))
-    s.return_if(s.logical_or(s.uge(px, w_u), s.uge(py, h_u)))
-    var pix = s.iadd(s.imul(py, w_u), px)
+    # Round 3: reduced-resolution resolve. One thread per `sc x sc` block traces for one
+    # representative pixel (sub-pixel `(jx, jy)`, rotated per frame) and writes a low-res record that
+    # `sota_gi_upsample_shader` spreads back with depth / normal weights. `sc <= 1` is the full-res path.
+    var sc = s.umax(s.push_word(3), s.uint(1))
+    var lowres = s.uge(sc, s.uint(2))
+    var jx = s.push_word(4)
+    var jy = s.push_word(5)
+    var lw = s.udiv(s.iadd(w_u, s.isub(sc, s.uint(1))), sc)
+    var lh = s.udiv(s.iadd(h_u, s.isub(sc, s.uint(1))), sc)
+    s.return_if(s.logical_or(s.uge(lx, lw), s.uge(ly, lh)))
 
     var mode = _ctrl(s, b_sc, SOTA_CTRL_MODE)
     var flags = _ctrl(s, b_sc, SOTA_CTRL_FLAGS)
     var frame = _ctrl(s, b_sc, SOTA_CTRL_FRAME)
-    var gb = s.iadd(_ctrl(s, b_sc, SOTA_CTRL_GBUF), s.imul(pix, s.uint(UInt32(SOTA_GI_GBUF_WORDS))))
-    var stamp = s.load_word(b_sc, s.iadd(gb, s.uint(15)))
-    s.return_if(s.ine(stamp, s.iadd(frame, s.uint(1))))
+    var gb_base = _ctrl(s, b_sc, SOTA_CTRL_GBUF)
+    var stamp_want = s.iadd(frame, s.uint(1))
+    var bx0 = s.imul(lx, sc)
+    var by0 = s.imul(ly, sc)
+    var px_v = s.uvar(s.umin(s.iadd(bx0, jx), s.isub(w_u, s.uint(1))))
+    var py_v = s.uvar(s.umin(s.iadd(by0, jy), s.isub(h_u, s.uint(1))))
+    var st0 = s.load_word(
+        b_sc,
+        s.iadd(s.iadd(gb_base, s.imul(s.iadd(s.imul(s.load_u(py_v), w_u), s.load_u(px_v)), s.uint(UInt32(SOTA_GI_GBUF_WORDS)))), s.uint(15)),
+    )
+    var found_v = s.uvar(s.select_u(s.ieq(st0, stamp_want), s.uint(1), s.uint(0)))
+    # The rotated pixel is sky / not shaded: take the first shaded pixel of the block instead
+    s.begin_if(s.logical_and(lowres, s.ieq(s.load_u(found_v), s.uint(0))))
+    var k_s = s.uvar(s.uint(0))
+    var n_s = s.imul(sc, sc)
+    s.begin_loop()
+    var ks = s.load_u(k_s)
+    s.break_if(s.logical_or(s.uge(ks, n_s), s.ine(s.load_u(found_v), s.uint(0))))
+    var cx = s.umin(s.iadd(bx0, s.umod(ks, sc)), s.isub(w_u, s.uint(1)))
+    var cy = s.umin(s.iadd(by0, s.udiv(ks, sc)), s.isub(h_u, s.uint(1)))
+    var st_c = s.load_word(b_sc, s.iadd(s.iadd(gb_base, s.imul(s.iadd(s.imul(cy, w_u), cx), s.uint(UInt32(SOTA_GI_GBUF_WORDS)))), s.uint(15)))
+    s.begin_if(s.ieq(st_c, stamp_want))
+    s.store(px_v, cx)
+    s.store(py_v, cy)
+    s.store(found_v, s.uint(1))
+    s.end_if()
+    s.store(k_s, s.iadd(ks, s.uint(1)))
+    s.end_loop()
+    s.end_if()
+    var lo = s.iadd(_ctrl(s, b_sc, SOTA_CTRL_LOWRES), s.imul(s.iadd(s.imul(ly, lw), lx), s.uint(UInt32(SOTA_GI_LOWRES_WORDS))))
+    var found = s.ine(s.load_u(found_v), s.uint(0))
+    s.begin_if(s.logical_and(lowres, s.logical_not(found)))
+    s.store_word(b_sc, s.iadd(lo, s.uint(7)), s.uint(0))
+    s.end_if()
+    s.return_if(s.logical_not(found))
     s.return_if(s.ieq(mode, s.uint(0)))
+    var px = s.load_u(px_v)
+    var py = s.load_u(py_v)
+    var pix = s.iadd(s.imul(py, w_u), px)
+    var gb = s.iadd(gb_base, s.imul(pix, s.uint(UInt32(SOTA_GI_GBUF_WORDS))))
 
     var wx = s.load_float(b_sc, gb)
     var wy = s.load_float(b_sc, s.iadd(gb, s.uint(1)))
@@ -1171,6 +1283,7 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
         var rg = emit_sota_restir_gi_reuse(
             s, b_sc, b_hdr, res, px, py, w_u, h_u, wx, wy, wz, nx, ny, nz, gnx, gny, gnz,
             tlas_var, b_verts, b_indices, b_instances, b_materials, bindless_arr,
+            snap=sc, snap_jx=s.push_word(6), snap_jy=s.push_word(7),
         )
         s.store(gi_r, rg[0])
         s.store(gi_g, rg[1])
@@ -1198,10 +1311,30 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(gi_b, m_b)
     s.end_if()
 
-    var ob = s.imul(pix, s.uint(8))
     var g_r = s.load_f(gi_r)
     var g_g = s.load_f(gi_g)
     var g_b = s.load_f(gi_b)
+    s.begin_if(lowres)
+    s.store_float(b_sc, lo, g_r)
+    s.store_float(b_sc, s.iadd(lo, s.uint(1)), g_g)
+    s.store_float(b_sc, s.iadd(lo, s.uint(2)), g_b)
+    s.store_float(b_sc, s.iadd(lo, s.uint(3)), wx)
+    s.store_float(b_sc, s.iadd(lo, s.uint(4)), wy)
+    s.store_float(b_sc, s.iadd(lo, s.uint(5)), wz)
+    s.store_word(b_sc, s.iadd(lo, s.uint(6)), emit_sota_oct_pack(s, nx, ny, nz))
+    s.store_word(b_sc, s.iadd(lo, s.uint(7)), stamp_want)
+    s.begin_else()
+    _emit_sota_gi_store_hdr(s, b_sc, b_hdr, gb, pix, demod, g_r, g_g, g_b)
+    s.end_if()
+    return s.finish()
+
+
+def _emit_sota_gi_store_hdr(
+    mut s: AaaSpirvModule, b_sc: UInt32, b_hdr: UInt32, gb: UInt32, pix: UInt32, demod: UInt32, g_r: UInt32, g_g: UInt32, g_b: UInt32
+):
+    """Writes the GI of one pixel to `BIND_AAA_HDR_OUT`: demodulated for SVGF, else remodulated with
+    the crisp (direct + specular) term and the diffuse weight from the G-buffer record at `gb`."""
+    var ob = s.imul(pix, s.uint(8))
     var crisp_r = s.load_float(b_sc, s.iadd(gb, s.uint(9)))
     var crisp_g = s.load_float(b_sc, s.iadd(gb, s.uint(10)))
     var crisp_b = s.load_float(b_sc, s.iadd(gb, s.uint(11)))
@@ -1211,6 +1344,152 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store_float(b_hdr, ob, s.select_f(demod, g_r, s.fma(dw_r, g_r, crisp_r)))
     s.store_float(b_hdr, s.iadd(ob, s.uint(1)), s.select_f(demod, g_g, s.fma(dw_g, g_g, crisp_g)))
     s.store_float(b_hdr, s.iadd(ob, s.uint(2)), s.select_f(demod, g_b, s.fma(dw_b, g_b, crisp_b)))
+
+
+# ---------------------------------------------------------------------------------------------
+# Pass 3 (round 3): depth / normal-aware upsample of the reduced-resolution resolve
+# ---------------------------------------------------------------------------------------------
+def sota_gi_upsample_shader() -> List[UInt32]:
+    """Push[0..2] as the resolve; Push[3] = scale (2 or 4), Push[4], Push[5] = this frame's sub-pixel of
+    the representative pixel in each block, Push[8] = tent radius in blocks (float, 0 = 1).
+
+    Joint-bilateral upsample (Kopf et al. 2007 "Joint Bilateral Upsampling"; depth / normal weights
+    as in the usual geometry-aware upsampling of half-res GI, e.g. the AMD GI-1.0 paper, Boisse et al.
+    2023): every full-res pixel gathers the 3x3 low-res records around its block. Each weight is a
+    tent around the block's representative pixel (plus a small floor so the whole 3x3 ring takes part)
+    x a plane-distance weight relative to the camera distance x `max(0, n . n_s)^8`. Pixels with no
+    geometrically similar record (thin features, a whole block disoccluded) fall back to the world
+    radiance cache at their own position when it is valid, else to the plain tent average.
+
+    An 8x8 workgroup first stages the `(8 / scale + 2)^2` low-res records it touches in shared memory
+    (36 at half res), so each record is read from memory once per workgroup instead of 9x per pixel."""
+    var s = AaaSpirvModule(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
+    var b_hdr = s.buffer(BIND_AAA_HDR_OUT)
+    var b_sc = s.buffer(BIND_AAA_SURFCACHE)
+    comptime TILE_MAX = 36  # (8 / 2 + 2)^2
+    comptime REC = 8  # r, g, b, x, y, z, packed normal (as float bits), valid (1 / 0)
+    var lds = s.workgroup_array_f32(TILE_MAX * REC)
+    var px = s.invocation_axis(0)
+    var py = s.invocation_axis(1)
+    var w_u = s.push_word(0)
+    var h_u = s.push_word(1)
+    var demod = s.ine(s.push_word(2), s.uint(0))
+    var sc = s.umax(s.push_word(3), s.uint(2))
+    var jx = s.push_word(4)
+    var jy = s.push_word(5)
+    var mode = _ctrl(s, b_sc, SOTA_CTRL_MODE)
+    var flags = _ctrl(s, b_sc, SOTA_CTRL_FLAGS)
+    var frame = _ctrl(s, b_sc, SOTA_CTRL_FRAME)
+    var stamp_want = s.iadd(frame, s.uint(1))
+    var lw = s.udiv(s.iadd(w_u, s.isub(sc, s.uint(1))), sc)
+    var lh = s.udiv(s.iadd(h_u, s.isub(sc, s.uint(1))), sc)
+    var lo_base = _ctrl(s, b_sc, SOTA_CTRL_LOWRES)
+
+    # Stage the tile: blocks [wgb - 1, wgb + 8 / sc] in x and y, clamped to the low-res grid
+    var tile_w = s.iadd(s.udiv(s.uint(8), sc), s.uint(2))
+    var tile_n = s.imul(tile_w, tile_w)
+    var wgbx = s.udiv(s.imul(s.workgroup_axis(0), s.uint(8)), sc)
+    var wgby = s.udiv(s.imul(s.workgroup_axis(1), s.uint(8)), sc)
+    var li = s.iadd(s.local_axis(0), s.imul(s.local_axis(1), s.uint(8)))
+    s.begin_if(s.ult(li, tile_n))
+    var tbx = s.umin(s.isub(s.umax(s.iadd(wgbx, s.umod(li, tile_w)), s.uint(1)), s.uint(1)), s.isub(lw, s.uint(1)))
+    var tby = s.umin(s.isub(s.umax(s.iadd(wgby, s.udiv(li, tile_w)), s.uint(1)), s.uint(1)), s.isub(lh, s.uint(1)))
+    var lo = s.iadd(lo_base, s.imul(s.iadd(s.imul(tby, lw), tbx), s.uint(UInt32(SOTA_GI_LOWRES_WORDS))))
+    var lb = s.imul(li, s.uint(UInt32(REC)))
+    for k in range(7):
+        s.store_workgroup_f32(lds[0], lds[1], s.iadd(lb, s.uint(UInt32(k))), s.load_float(b_sc, s.iadd(lo, s.uint(UInt32(k)))))
+    var valid_t = s.ieq(s.load_word(b_sc, s.iadd(lo, s.uint(7))), stamp_want)
+    s.store_workgroup_f32(lds[0], lds[1], s.iadd(lb, s.uint(7)), s.select_f(valid_t, s.float(1.0), s.float(0.0)))
+    s.end_if()
+    s.workgroup_barrier()
+
+    s.return_if(s.logical_or(s.uge(px, w_u), s.uge(py, h_u)))
+    var pix = s.iadd(s.imul(py, w_u), px)
+    var gb = s.iadd(_ctrl(s, b_sc, SOTA_CTRL_GBUF), s.imul(pix, s.uint(UInt32(SOTA_GI_GBUF_WORDS))))
+    s.return_if(s.ine(s.load_word(b_sc, s.iadd(gb, s.uint(15))), stamp_want))
+    s.return_if(s.ieq(mode, s.uint(0)))
+    var wx = s.load_float(b_sc, gb)
+    var wy = s.load_float(b_sc, s.iadd(gb, s.uint(1)))
+    var wz = s.load_float(b_sc, s.iadd(gb, s.uint(2)))
+    var nx = s.load_float(b_sc, s.iadd(gb, s.uint(3)))
+    var ny = s.load_float(b_sc, s.iadd(gb, s.uint(4)))
+    var nz = s.load_float(b_sc, s.iadd(gb, s.uint(5)))
+    var cdx = s.fsub(wx, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X))
+    var cdy = s.fsub(wy, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X + 1))
+    var cdz = s.fsub(wz, _ctrl_f(s, b_sc, SOTA_CTRL_CAM_X + 2))
+    var cam_d = s.fsqrt(s.nmax(s.float(1e-8), emit_vec3_dot(s, cdx, cdy, cdz, cdx, cdy, cdz)))
+    var inv_plane = s.fdiv(s.float(1.0), s.fmul(cam_d, s.float(0.01)))
+
+    var tent_k = s.push_float(8)
+    var tent_r = s.fmul(s.float_from_uint(sc), s.select_f(s.fgt(tent_k, s.float(0.0)), tent_k, s.float(1.0)))
+    var inv_sc = s.fdiv(s.float(1.0), tent_r)
+    var fpx = s.float_from_uint(px)
+    var fpy = s.float_from_uint(py)
+    var cbx = s.udiv(px, sc)
+    var cby = s.udiv(py, sc)
+    # Tile coordinate of block (cbx + ox - 1) is (cbx - wgb + ox)
+    var tx0 = s.isub(cbx, wgbx)
+    var ty0 = s.isub(cby, wgby)
+    var acc_r = s.fvar(s.float(0.0))
+    var acc_g = s.fvar(s.float(0.0))
+    var acc_b = s.fvar(s.float(0.0))
+    var acc_w = s.fvar(s.float(0.0))
+    var tnt_r = s.fvar(s.float(0.0))
+    var tnt_g = s.fvar(s.float(0.0))
+    var tnt_b = s.fvar(s.float(0.0))
+    var tnt_w = s.fvar(s.float(0.0))
+    for oy in range(3):
+        for ox in range(3):
+            var tx = s.iadd(tx0, s.uint(UInt32(ox)))
+            var ty = s.iadd(ty0, s.uint(UInt32(oy)))
+            var tb = s.imul(s.iadd(s.imul(ty, tile_w), tx), s.uint(UInt32(REC)))
+            var valid = s.fgt(s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(7))), s.float(0.5))
+            s.begin_if(valid)
+            var r = s.load_workgroup_f32(lds[0], lds[1], tb)
+            var g = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(1)))
+            var b = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(2)))
+            var sx = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(3)))
+            var sy = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(4)))
+            var sz = s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(5)))
+            var sn = emit_sota_oct_unpack(s, s.bitcast_uint(s.load_workgroup_f32(lds[0], lds[1], s.iadd(tb, s.uint(6)))))
+            # Tent around the representative pixel of that (clamped) block
+            var bxi = s.umin(s.isub(s.umax(s.iadd(cbx, s.uint(UInt32(ox))), s.uint(1)), s.uint(1)), s.isub(lw, s.uint(1)))
+            var byi = s.umin(s.isub(s.umax(s.iadd(cby, s.uint(UInt32(oy))), s.uint(1)), s.uint(1)), s.isub(lh, s.uint(1)))
+            var rpx = s.float_from_uint(s.iadd(s.imul(bxi, sc), jx))
+            var rpy = s.float_from_uint(s.iadd(s.imul(byi, sc), jy))
+            var tx_w = s.nmax(s.float(0.0), s.fsub(s.float(1.0), s.fmul(s.fabs(s.fsub(fpx, rpx)), inv_sc)))
+            var ty_w = s.nmax(s.float(0.0), s.fsub(s.float(1.0), s.fmul(s.fabs(s.fsub(fpy, rpy)), inv_sc)))
+            var tent = s.fadd(s.fmul(tx_w, ty_w), s.float(0.02))
+            var plane = s.fmul(s.fabs(emit_vec3_dot(s, nx, ny, nz, s.fsub(sx, wx), s.fsub(sy, wy), s.fsub(sz, wz))), inv_plane)
+            var w_p = s.fdiv(s.float(1.0), s.fadd(s.float(1.0), s.fmul(plane, plane)))
+            var nd = s.nmax(s.float(0.0), emit_vec3_dot(s, nx, ny, nz, sn[0], sn[1], sn[2]))
+            var nd2 = s.fmul(nd, nd)
+            var nd4 = s.fmul(nd2, nd2)
+            var w_g = s.fmul(tent, s.fmul(w_p, s.fmul(nd4, nd4)))
+            s.store(acc_r, s.fma(w_g, r, s.load_f(acc_r)))
+            s.store(acc_g, s.fma(w_g, g, s.load_f(acc_g)))
+            s.store(acc_b, s.fma(w_g, b, s.load_f(acc_b)))
+            s.store(acc_w, s.fadd(s.load_f(acc_w), w_g))
+            s.store(tnt_r, s.fma(tent, r, s.load_f(tnt_r)))
+            s.store(tnt_g, s.fma(tent, g, s.load_f(tnt_g)))
+            s.store(tnt_b, s.fma(tent, b, s.load_f(tnt_b)))
+            s.store(tnt_w, s.fadd(s.load_f(tnt_w), tent))
+            s.end_if()
+    var aw = s.load_f(acc_w)
+    var ok = s.fgt(aw, s.float(1e-3))
+    var inv_aw = s.fdiv(s.float(1.0), s.nmax(aw, s.float(1e-8)))
+    var inv_tw = s.fdiv(s.float(1.0), s.nmax(s.load_f(tnt_w), s.float(1e-8)))
+    var o_r = s.fvar(s.select_f(ok, s.fmul(s.load_f(acc_r), inv_aw), s.fmul(s.load_f(tnt_r), inv_tw)))
+    var o_g = s.fvar(s.select_f(ok, s.fmul(s.load_f(acc_g), inv_aw), s.fmul(s.load_f(tnt_g), inv_tw)))
+    var o_b = s.fvar(s.select_f(ok, s.fmul(s.load_f(acc_b), inv_aw), s.fmul(s.load_f(tnt_b), inv_tw)))
+    var wrc_on = s.ine(s.bit_and(flags, s.uint(SOTA_FLAG_WRC_VALID)), s.uint(0))
+    s.begin_if(s.logical_and(s.logical_not(ok), wrc_on))
+    var wi = emit_sota_wrc_irradiance(s, b_sc, _ctrl(s, b_sc, SOTA_CTRL_CUR_BANK), wx, wy, wz, nx, ny, nz)
+    s.store(o_r, wi[0])
+    s.store(o_g, wi[1])
+    s.store(o_b, wi[2])
+    s.end_if()
+    _emit_sota_gi_store_hdr(s, b_sc, b_hdr, gb, pix, demod, s.load_f(o_r), s.load_f(o_g), s.load_f(o_b))
     return s.finish()
 
 

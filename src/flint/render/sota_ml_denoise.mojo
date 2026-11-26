@@ -88,7 +88,10 @@ comptime SOTA_ML_TILE_W: Int = 16  # fused temporal + level-0 tile (`sota_ml_fus
 comptime SOTA_ML_TILE_H: Int = 16
 # `sota_gi` modes (area B, `sota_gi_world_cache.mojo`): 0 legacy surface cache, 1 world cache only,
 # 2 hybrid, 3 path tracer. Learned weights are trained on the noisy per-pixel estimators (0 and 3).
-comptime SOTA_ML_GI_MODES_DEFAULT: Int = (1 << 0) | (1 << 3)
+# Area B round 3 re-measured every mode against the fixed SVGF (Cornell, FLIP vs the converged 512-spp
+# reference, `FLINT_SOTA_GI_ONLY=ml`): legacy -0.011, WRC-only +0.004 (worse: probe GI is already smooth),
+# hybrid -0.003 / -0.004 (full / half-res resolve), path tracer -0.009 / -0.001. So WRC-only keeps SVGF.
+comptime SOTA_ML_GI_MODES_DEFAULT: Int = (1 << 0) | (1 << 2) | (1 << 3)
 comptime SOTA_ML_MODE_LEARNED: Int = 0
 comptime SOTA_ML_MODE_ANALYTIC: Int = 1  # SVGF weights inside this path (ablation, and GPU tests without weights)
 comptime SOTA_ML_ANALYTIC_LEVELS: Int = 4
@@ -736,8 +739,8 @@ struct SotaMlDenoiser(Movable):
       learned path when weights load and the GI mode is in `gi_modes`; otherwise the renderer runs SVGF
       unchanged. Weights on disk alone never change the image, so tests and labs stay deterministic.
     - `gi_modes` (default `SOTA_ML_GI_MODES_DEFAULT`): bit `1 << mode` per `sota_gi` mode the learned
-      path may take over. The default is the noisy per-pixel modes it was trained on (legacy surface
-      cache and the real-time path tracer); world-cache-only and hybrid GI keep SVGF (see the notes).
+      path may take over. The default is legacy surface-cache, hybrid and path-traced GI, where it
+      measures at least as good as SVGF; world-cache-only GI keeps SVGF (see the comment on the mask).
     - `mode`: `SOTA_ML_MODE_LEARNED` (default) or `SOTA_ML_MODE_ANALYTIC` (SVGF weights inside this
       path; for ablations and for GPU tests on machines without weights).
     - `weights_path`: `.flmlw` file (default from `sota_ml_default_weights_path()`).
