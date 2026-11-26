@@ -18,6 +18,8 @@ comptime GIZMO_TARGET_PX: Float32 = 96.0
 comptime GIZMO_MODE_TRANSLATE: Int = 0
 comptime GIZMO_MODE_ROTATE: Int = 1
 comptime GIZMO_MODE_SCALE: Int = 2
+comptime GIZMO_MODE_SELECT: Int = 3
+"""Select tool (Q): no gizmo is drawn or picked; clicks only select."""
 
 comptime GIZMO_SPACE_WORLD: Int = 0
 comptime GIZMO_SPACE_LOCAL: Int = 1
@@ -30,6 +32,9 @@ comptime GIZMO_PLANE_XY: Int = 4
 comptime GIZMO_PLANE_XZ: Int = 5
 comptime GIZMO_PLANE_YZ: Int = 6
 comptime GIZMO_SCALE_UNIFORM: Int = 7
+comptime GIZMO_AXIS_VIEW: Int = 8
+"""Rotate mode's outer screen ring: turns the selection about the camera's view axis."""
+comptime GIZMO_VIEW_RING_SCALE: Float32 = 1.06
 
 comptime GIZMO_COLOR_X: UInt32 = 0xFFE84848
 comptime GIZMO_COLOR_Y: UInt32 = 0xFF3DDC68
@@ -573,8 +578,13 @@ def pick_gizmo_handle(
     fov_y_deg: Float32,
     target_px: Float32 = 96.0,
     gizmo_rot: Quat = Quat.identity(),
+    px_scale: Float32 = 1.0,
 ) -> Int:
-    """Screen-space handle picker returning `GIZMO_AXIS_*`, `GIZMO_PLANE_*`, or `GIZMO_SCALE_UNIFORM`."""
+    """Screen-space handle picker returning `GIZMO_AXIS_*`, `GIZMO_PLANE_*`, `GIZMO_SCALE_UNIFORM` or
+    `GIZMO_AXIS_VIEW`. `px_scale` (physical pixels per UI point) scales every hit tolerance, so handles
+    are as easy to grab at 200% UI scale as at 100%. Rotate rings only accept hits on the half facing
+    the camera: the far half is behind the selection and grabbing it turns the object the wrong way."""
+    var tol = Float32(11.0) * (px_scale if (isfinite(px_scale) and px_scale > Float32(0.0)) else Float32(1.0))
     if not (
         isfinite(mouse_x) and isfinite(mouse_y)
         and isfinite(vp_x) and isfinite(vp_y) and isfinite(vp_w) and isfinite(vp_h)
@@ -595,7 +605,7 @@ def pick_gizmo_handle(
 
     if mode == GIZMO_MODE_SCALE:
         var dc = _point_seg_dist_px(mouse_x, mouse_y, c_proj[0], c_proj[1], c_proj[0], c_proj[1])
-        if dc <= Float32(11.0):
+        if dc <= tol:
             return GIZMO_SCALE_UNIFORM
 
     if mode == GIZMO_MODE_TRANSLATE or mode == GIZMO_MODE_SCALE:
@@ -603,17 +613,17 @@ def pick_gizmo_handle(
             var p_xy = project_world_to_viewport(pivot + (bx + by) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             var p_xz = project_world_to_viewport(pivot + (bx + bz) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             var p_yz = project_world_to_viewport(pivot + (by + bz) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
-            if p_xy[3] and gizmo_plane_usable(bz, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_xy[0], p_xy[1], p_xy[0], p_xy[1]) <= Float32(11.0):
+            if p_xy[3] and gizmo_plane_usable(bz, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_xy[0], p_xy[1], p_xy[0], p_xy[1]) <= tol:
                 return GIZMO_PLANE_XY
-            if p_xz[3] and gizmo_plane_usable(by, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_xz[0], p_xz[1], p_xz[0], p_xz[1]) <= Float32(11.0):
+            if p_xz[3] and gizmo_plane_usable(by, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_xz[0], p_xz[1], p_xz[0], p_xz[1]) <= tol:
                 return GIZMO_PLANE_XZ
-            if p_yz[3] and gizmo_plane_usable(bx, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_yz[0], p_yz[1], p_yz[0], p_yz[1]) <= Float32(11.0):
+            if p_yz[3] and gizmo_plane_usable(bx, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_yz[0], p_yz[1], p_yz[0], p_yz[1]) <= tol:
                 return GIZMO_PLANE_YZ
 
         var axes = [bx, by, bz]
         var ids = [GIZMO_AXIS_X, GIZMO_AXIS_Y, GIZMO_AXIS_Z]
         var best_id = GIZMO_AXIS_NONE
-        var best_d = Float32(12.0)
+        var best_d = tol + Float32(1.0)
         for a in range(3):
             if not gizmo_axis_usable(axes[a], vdir):
                 continue
@@ -630,7 +640,8 @@ def pick_gizmo_handle(
     var ring_v = [bz, bz, by]
     var r_ids = [GIZMO_AXIS_X, GIZMO_AXIS_Y, GIZMO_AXIS_Z]
     var best_r = GIZMO_AXIS_NONE
-    var best_rd = Float32(11.0)
+    var best_rd = tol
+    var to_cam = cam_pos - pivot
     comptime SEG: Int = 32
     for ri in range(3):
         for s in range(SEG):
@@ -638,6 +649,8 @@ def pick_gizmo_handle(
             var a1 = Float32(s + 1) * Float32(6.2831853 / Float32(SEG))
             var p0 = pivot + (ring_u[ri] * cos(a0) + ring_v[ri] * sin(a0)) * wscale
             var p1 = pivot + (ring_u[ri] * cos(a1) + ring_v[ri] * sin(a1)) * wscale
+            if ((p0 + p1) * Float32(0.5) - pivot).dot(to_cam) < -Float32(0.05) * wscale * to_cam.length():
+                continue  # far half of the ring
             var s0 = project_world_to_viewport(p0, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             var s1 = project_world_to_viewport(p1, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             if s0[3] and s1[3]:
@@ -645,7 +658,29 @@ def pick_gizmo_handle(
                 if d < best_rd:
                     best_rd = d
                     best_r = r_ids[ri]
+    if best_r == GIZMO_AXIS_NONE:
+        var view_r = target_px * GIZMO_VIEW_RING_SCALE
+        var dxv = mouse_x - c_proj[0]
+        var dyv = mouse_y - c_proj[1]
+        if abs(sqrt(dxv * dxv + dyv * dyv) - view_r) <= tol:
+            return GIZMO_AXIS_VIEW
     return best_r
+
+
+def gizmo_uniform_scale_screen(
+    start_x: Float32, start_y: Float32, cur_x: Float32, cur_y: Float32, center_x: Float32, center_y: Float32
+) -> Float32:
+    """Uniform scale factor from a drag on the centre handle: how much farther the mouse is from the
+    pivot on screen than where the drag started. Moving in any direction away from the pivot grows the
+    selection and moving toward it shrinks it (the old solver only read the camera-right component)."""
+    var d0 = sqrt((start_x - center_x) * (start_x - center_x) + (start_y - center_y) * (start_y - center_y))
+    var d1 = sqrt((cur_x - center_x) * (cur_x - center_x) + (cur_y - center_y) * (cur_y - center_y))
+    if not (isfinite(d0) and isfinite(d1)):
+        return Float32(1.0)
+    # A press right on the pivot has no lever arm: measure from a small minimum radius instead.
+    var base = max(Float32(12.0), d0)
+    var f = Float32(1.0) + (d1 - d0) / base
+    return max(Float32(0.05), min(Float32(100.0), f)) if isfinite(f) else Float32(1.0)
 
 
 def emit_gizmo_draw_list(
@@ -741,7 +776,9 @@ def emit_gizmo_draw_list(
             ui.add_circle(c[0], c[1], Float32(5.5), center_col)
     else:
         # 3D Rotation Rings (X=YZ plane, Y=XZ plane, Z=XY plane) + subtle outer screen-space horizon ring
-        ui.add_circle(c[0], c[1], target_px * Float32(1.06), UInt32(0x14FFFFFF), Float32(1.5), UInt32(0x66DCE4F0))
+        var view_col = GIZMO_COLOR_ACTIVE if active_handle == GIZMO_AXIS_VIEW else UInt32(0x66DCE4F0)
+        ui.add_circle(c[0], c[1], target_px * GIZMO_VIEW_RING_SCALE, UInt32(0x14FFFFFF), Float32(1.5), view_col)
+        var to_cam_e = cam_pos - pivot
         var ring_u = [by, bx, bx]
         var ring_v = [bz, bz, by]
         comptime RSEG: Int = 40
@@ -755,7 +792,10 @@ def emit_gizmo_draw_list(
                 var s0 = project_world_to_viewport(p0, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
                 var s1 = project_world_to_viewport(p1, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
                 if s0[3] and s1[3]:
-                    _emit_thick_line_ui(ui, s0[0], s0[1], s1[0], s1[1], Float32(3.0), rcol)
+                    var back = ((p0 + p1) * Float32(0.5) - pivot).dot(to_cam_e) < -Float32(0.05) * wscale * to_cam_e.length()
+                    # The far half is drawn thin and faded: it cannot be grabbed (see `pick_gizmo_handle`).
+                    var seg_col = (rcol & UInt32(0x00FFFFFF)) | UInt32(0x55000000) if back else rcol
+                    _emit_thick_line_ui(ui, s0[0], s0[1], s1[0], s1[1], Float32(1.4) if back else Float32(3.0), seg_col)
         ui.add_circle(c[0], c[1], Float32(4.5), GIZMO_COLOR_CENTER)
 
     ui.pop_clip()

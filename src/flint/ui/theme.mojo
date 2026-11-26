@@ -516,7 +516,7 @@ struct StudioTheme(Copyable, Movable):
         # Text hierarchy
         self.text_primary = rgba8(237, 241, 247, 255)   # #EDF1F7
         self.text_secondary = rgba8(155, 165, 184, 255) # #9BA5B8
-        self.text_muted = rgba8(110, 122, 144, 255)     # #6E7A90
+        self.text_muted = rgba8(138, 149, 171, 255)     # #8A95AB (>= 4.5:1 on the panel background)
         self.text_on_accent = rgba8(11, 14, 20, 255)    # #0B0E14
 
         # Typography & geometry rhythm

@@ -107,6 +107,8 @@ struct BridgedMcpEvent(Copyable, Movable):
     var mcp_client_key: Int
     """MCP connection that made the call (0 = in-process / stdio)."""
     var mcp_client_name: String
+    var replay_step_id: UInt64
+    """Non-zero when this is Studio re-running an approved call: the waiting step it completes."""
 
     # Optional spatial hints supplied by Studio when entity world positions are known
     var world_pos: Vec3
@@ -139,6 +141,7 @@ struct BridgedMcpEvent(Copyable, Movable):
         self.blocked_by_gate = blocked_by_gate
         self.mcp_client_key = 0
         self.mcp_client_name = String("")
+        self.replay_step_id = 0
         self.world_pos = Vec3()
         self.has_world_pos = False
         self.prev_world_pos = Vec3()
@@ -647,6 +650,22 @@ struct StudioAgentRuntime(Movable):
                         wpos = sv[1]
 
             var summary = _summarize_mcp_event(ev, pdoc, rdoc)
+            if ev.replay_step_id != 0:
+                # The approved call ran: finish the step that has been waiting on the user.
+                _ = bus.complete_mcp_tool_step(
+                    agent_id=aid,
+                    step_id=ev.replay_step_id,
+                    ok=ev.ok,
+                    result_json=ev.result_json,
+                    elapsed_ms=Float32(ev.elapsed_ms),
+                    entity_id=eid,
+                    world_pos=wpos,
+                    has_world_pos=has_pos,
+                    half_extents=ev.half_extents,
+                )
+                if not ev.ok:
+                    _ = toasts.push(TOAST_ERROR, "Approved Call Failed", summary, own_job=True, action_entity_id=eid)
+                continue
             var sid = bus.begin_mcp_tool_step(
                 agent_id=aid,
                 tool_name=ev.tool_name,

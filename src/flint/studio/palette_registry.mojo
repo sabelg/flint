@@ -311,7 +311,7 @@ def populate_studio_palette(
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_TOGGLE_NAVMESH_OVERLAY, "Hide NavMesh Overlay" if show_navmesh else "Show NavMesh Overlay", "View", "", ICON_GRID, "cmd:nav_ov", False, True, "Toggle NavMesh Debug Overlay"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_TOGGLE_COLLIDER_OVERLAY, "Hide Collider Overlay" if show_colliders else "Show Collider Overlay", "View", "", ICON_COLLIDER, "cmd:col_ov", False, True, "Toggle Physics Collider Overlay"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_TOGGLE_GRID_OVERLAY, "Toggle Reference Grid", "View", "", ICON_GRID, "cmd:grid_ov", False, True, "Toggle Viewport Reference Grid"))
-    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_TOGGLE_ORTHO_CAMERA, "Toggle Perspective / Orthographic", "Camera", "5", ICON_CAMERA, "cmd:cam_ortho", False, True, "Toggle Perspective Orthographic Projection"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_TOGGLE_ORTHO_CAMERA, "Toggle Perspective / Orthographic", "Camera", "", ICON_CAMERA, "cmd:cam_ortho", False, True, "Toggle Perspective Orthographic Projection"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_TOGGLE_PERF_SPARKLINE, "Toggle GPU Performance Details", "View", "", ICON_CLOCK, "cmd:perf", False, True, "GPU Perf FPS Sparkline Stats"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_RESET_CAMERA, "Reset Viewport Camera", "Camera", "", ICON_CAMERA, "cmd:cam_reset", False, True, "Reset Orbit Camera Default"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_SNAP_VIEW_FRONT, "Snap Camera: Front View", "Camera", "", ICON_FOCUS_CAM, "cmd:view_front", False, True, "Camera Snap Front View Z"))

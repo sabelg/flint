@@ -20,7 +20,7 @@ Implements:
 from flint.studio.source_editor import EmbeddedIde
 from flint.studio import scene_menu
 from std.collections import Dict
-from std.math import abs, asin, cos, isfinite, isinf, isnan, max, min, sin, sqrt
+from std.math import abs, asin, cos, isfinite, isinf, isnan, max, min, sin, sqrt, tan
 from std.memory import bitcast
 from flint.ai import AiPlugin, BehaviorTreeComponent, register_ai_codecs
 from flint.ai.behavior_tree import BtExecutionState
@@ -112,7 +112,7 @@ from flint.assets.flpk_v3 import (
 from flint.assets.glb_native import parse_native_glb
 from flint.assets.image import decode_png
 from flint.assets.jpeg import decode_image_auto
-from flint.assets.json import JsonDocument
+from flint.assets.json import JsonDocument, parse_json
 from flint.assets.json_write import json_quote
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.model import NativeMesh, NativeModel
@@ -175,6 +175,8 @@ from flint.platform.input import InputState
 from flint.platform.os import (
     env_value,
     file_size,
+    file_stamp,
+    remove_file,
     is_directory,
     is_symlink,
     list_directory,
@@ -324,15 +326,34 @@ from flint.studio.code_drawer import (
 from flint.studio.viewport_transform import ViewportTransform
 from flint.studio.gizmo import (
     GIZMO_AXIS_NONE,
+    GIZMO_AXIS_VIEW,
+    GIZMO_AXIS_X,
+    GIZMO_AXIS_Y,
+    GIZMO_AXIS_Z,
     GIZMO_MODE_ROTATE,
     GIZMO_MODE_SCALE,
+    GIZMO_MODE_SELECT,
     GIZMO_MODE_TRANSLATE,
+    GIZMO_PLANE_XY,
+    GIZMO_PLANE_XZ,
+    GIZMO_PLANE_YZ,
+    GIZMO_SCALE_UNIFORM,
     GIZMO_TARGET_PX,
     GIZMO_SPACE_LOCAL,
     GIZMO_SPACE_WORLD,
     ViewportRay,
     emit_gizmo_draw_list,
+    gizmo_rotation_delta_rad,
+    gizmo_scale_drag,
+    gizmo_uniform_scale_screen,
+    gizmo_world_scale,
+    pick_gizmo_handle,
+    project_world_to_viewport,
+    ray_axis_closest_param,
     ray_plane_hit,
+    snap_angle_deg,
+    snap_constrained_delta,
+    snap_scalar,
 )
 from flint.studio.notifications import (
     JobProgressTracker,
@@ -491,6 +512,7 @@ from flint.studio.viewport_hud import (
     HDR_ACT_WIN_MINIMIZE,
     HDR_ACT_WORKSPACE,
     STUDIO_HEADER_BAR_H,
+    STUDIO_STATUS_BAR_H,
     StudioHeaderBar,
     VHUD_ACT_CAM_MODE,
     VHUD_ACT_NONE,
@@ -568,6 +590,12 @@ from flint.ui.flexbox_dock import (
     RectF as _RectF,
 )
 
+comptime PIVOT_BOUNDS_CENTER: Int = 0
+comptime PIVOT_ACTIVE: Int = 1
+comptime GIZMO_DRAG_SEQ_TAG: UInt64 = 0x4000000000000000
+comptime STUDIO_CONSOLE_CAP: Int = 300
+comptime STUDIO_RECENT_SCENES_CAP: Int = 10
+"""High bit marking gizmo-drag coalesce keys, so they never collide with UI-widget coalesce keys."""
 comptime COLLIDER_NONE: Int = 0
 comptime COLLIDER_SPHERE: Int = 1
 comptime COLLIDER_BOX: Int = 2
@@ -1385,6 +1413,15 @@ struct EditorTransaction(Copyable, Movable):
     var tx_id: UInt64
     var agent_id: Int
     var step_id: UInt64
+    var changes_scene_path: Bool
+    """A scene load: undo / redo also switch `scene_file_path`, so a save after undoing a load writes
+    the scene the user is looking at to *its* file, never over the file that was loaded."""
+    var prev_scene_path: String
+    var next_scene_path: String
+    var prev_saved_tx_id: UInt64
+    """The save point before a load, so undoing the load knows whether the old file is clean again."""
+    var load_leaves_clean: Bool
+    """A plain load (not an autosave recovery) leaves the scene matching its file, so redo is clean."""
 
     def __init__(out self, op: Int = TX_PATCH_ENTITY, entity_id: Int = 0, label: String = "Edit"):
         self.op = op
@@ -1404,6 +1441,11 @@ struct EditorTransaction(Copyable, Movable):
         self.tx_id = UInt64(0)
         self.agent_id = 0
         self.step_id = UInt64(0)
+        self.changes_scene_path = False
+        self.prev_scene_path = String()
+        self.next_scene_path = String()
+        self.prev_saved_tx_id = UInt64(0xFFFFFFFFFFFFFFFF)
+        self.load_leaves_clean = False
 
     def __init__(out self, *, copy: Self):
         self.op = copy.op
@@ -1423,6 +1465,11 @@ struct EditorTransaction(Copyable, Movable):
         self.tx_id = copy.tx_id
         self.agent_id = copy.agent_id
         self.step_id = copy.step_id
+        self.changes_scene_path = copy.changes_scene_path
+        self.prev_scene_path = copy.prev_scene_path
+        self.next_scene_path = copy.next_scene_path
+        self.prev_saved_tx_id = copy.prev_saved_tx_id
+        self.load_leaves_clean = copy.load_leaves_clean
 
     def approx_bytes(self) -> Int:
         return len(self.before_world_blob) + len(self.after_world_blob) + 128
@@ -1781,6 +1828,14 @@ def _create_studio_input_map() -> InputMap:
     _ = imap.register_action("pie_release_cursor", ACTION_BOOL)
     _ = imap.register_action("pie_toggle_camera", ACTION_BOOL)
     _ = imap.register_action("editor_quit", ACTION_BOOL)
+    _ = imap.register_action("editor_rename", ACTION_BOOL)
+    _ = imap.register_action("editor_select_all", ACTION_BOOL)
+    _ = imap.register_action("tool_select", ACTION_BOOL)
+    _ = imap.register_action("toggle_snap", ACTION_BOOL)
+    _ = imap.register_action("build_reload", ACTION_BOOL)
+    _ = imap.register_action("editor_save_as", ACTION_BOOL)
+    _ = imap.register_action("editor_open", ACTION_BOOL)
+    _ = imap.register_action("editor_help", ACTION_BOOL)
     _ = imap.register_action("cam_orbit", ACTION_AXIS2D)
 
     var ctx = InputContext("StudioEditor", priority=10)
@@ -1804,6 +1859,14 @@ def _create_studio_input_map() -> InputMap:
     ctx.bind_key("pie_pause", 295)                       # F6
     ctx.bind_key("pie_step", 296)                        # F7
     ctx.bind_key("editor_quit", 81, modifiers=MOD_CTRL)  # Ctrl+Q (bare Esc never quits!)
+    ctx.bind_key("editor_rename", 291)                   # F2
+    ctx.bind_key("editor_select_all", 65, modifiers=MOD_CTRL)  # Ctrl+A
+    ctx.bind_key("tool_select", 81)                      # Q (select tool, no gizmo)
+    ctx.bind_key("toggle_snap", 71)                      # G (grid snap)
+    ctx.bind_key("build_reload", 66, modifiers=MOD_CTRL) # Ctrl+B (reload gameplay .so)
+    ctx.bind_key("editor_save_as", 83, modifiers=MOD_CTRL | MOD_SHIFT)  # Ctrl+Shift+S
+    ctx.bind_key("editor_open", 79, modifiers=MOD_CTRL | MOD_SHIFT)     # Ctrl+Shift+O
+    ctx.bind_key("editor_help", 290)                     # F1
     ctx.bind_key("cam_orbit", 263, scale_x=-1.0, scale_y=0.0, consume=False)  # Left
     ctx.bind_key("cam_orbit", 262, scale_x=1.0, scale_y=0.0, consume=False)   # Right
     ctx.bind_key("cam_orbit", 265, scale_x=0.0, scale_y=-1.0, consume=False)  # Up (look up)
@@ -2063,6 +2126,34 @@ struct FlintStudioState(Movable):
     var gizmo_mode: Int
     var gizmo_local_space: Bool
     var active_gizmo_handle: Int
+    var viewport_xf: ViewportTransform
+    """This frame's viewport transform in physical pixels (set by the host each frame); gizmo picks,
+    drags, marquee selection and framing all project through it."""
+    var pivot_mode: Int
+    """`PIVOT_BOUNDS_CENTER` (centre of the selection's bounds) or `PIVOT_ACTIVE` (the primary entity)."""
+    var scale_snap: Float32
+    """Scale-factor step used when snapping is on (0.1 = 10%)."""
+    var gz_dragging: Bool
+    var gz_handle: Int
+    var gz_mode: Int
+    var gz_seq: UInt64
+    var gz_seq_counter: UInt64
+    var gz_start_ray: ViewportRay
+    var gz_prev_ray: ViewportRay
+    var gz_start_pivot: Vec3
+    var gz_rot: Quat
+    var gz_snaps: List[SelectedTransformSnap]
+    var gz_angle: Float32
+    """Rotation accumulated frame by frame, so one drag can turn past +-180 degrees."""
+    var gz_start_mx: Float32
+    var gz_start_my: Float32
+    var marquee_active: Bool
+    var viewport_hovered: Bool
+    """Set by the host each frame: the mouse is over the scene panel (wheel / middle / Alt navigation)."""
+    var marquee_x0: Float32
+    var marquee_y0: Float32
+    var marquee_x1: Float32
+    var marquee_y1: Float32
     var snap_enabled: Bool
     var grid_snap_m: Float32
     var angle_snap_deg: Float32
@@ -2128,15 +2219,32 @@ struct FlintStudioState(Movable):
     var confirm_modal_open: Bool
     var confirm_modal_action: Int  # 0=none, 1=quit, 2=new_scene, 3=load_scene (`pending_load_path`)
     var pending_load_path: String
+    var file_modal_open: Bool
+    var file_modal_save_as: Bool
+    """True for File -> Save As, False for File -> Open."""
+    var file_modal_path: String
+    var recent_scenes: List[String]
+    var console_open: Bool
+    var console_log: List[String]
+    """Every toast message (newest last, capped) so a missed toast can be read again."""
+    var help_open: Bool
+    var welcome_open: Bool
+    var rename_focus_requested: Bool
     var next_editor_id: UInt64
     var autosave_interval_sec: Float32
     """Seconds of dirty editing between autosaves (0 disables)."""
     var _autosave_accum_sec: Float32
     var last_autosave_path: String
     var editor_id_slots: Dict[UInt64, Int]
-    var mcp_grant_once: List[String]
-    var mcp_grant_once_client: List[Int]
-    """MCP connection each `mcp_grant_once` entry is for (0 = in-process / stdio)."""
+    var _saved_tx_id: UInt64
+    """Top undo entry when the scene was last saved / loaded (`_refresh_dirty_from_history`)."""
+    var mcp_replay_client: List[Int]
+    var mcp_replay_tool: List[String]
+    var mcp_replay_args: List[String]
+    var mcp_replay_step: List[UInt64]
+    var mcp_replay_editor_id: List[UInt64]
+    """Gated MCP calls the user approved, queued for the host to re-run exactly as the agent sent them
+    (connection, tool, arguments, the agent step they complete, and the entity the user saw)."""
     var mcp_client_agents: Dict[Int, UInt32]
     """MCP connection key -> its own agent session in the Agents panel."""
     var flmat_pending_path: String
@@ -2144,7 +2252,12 @@ struct FlintStudioState(Movable):
     var flmat_pending: FlmatAsset
     var flmat_pending_eid: Int
     var flmat_pending_ref: String
-    """Tool names approved in the Agents panel; the host drains them into `McpServerV2.allow_tool_once`."""
+    var flmat_pending_editor_id: UInt64
+    """Stable id of the entity the pending material edit is for (the slot may be reused)."""
+    var flmat_pending_stamp: Tuple[Int, Int]
+    """(size, mtime) of the .flmat when the edit began: a file changed on disk is never overwritten."""
+    var flmat_pending_touch_sec: Float32
+    """Last time the Inspector showed the pending edit; once it is gone from view the edit is saved."""
     var toasts: List[StudioToast]
     var clipboard_entity_ids: List[Int]
     var show_navmesh_overlay: Bool
@@ -2185,7 +2298,6 @@ struct FlintStudioState(Movable):
     var show_grid_overlay: Bool
     var cam_ortho: Bool
     var gallery_play_hud_active: Bool
-    var entity_locked: Dict[Int, Bool]
     var _last_screen_w: Float32
     var _last_screen_h: Float32
 
@@ -2263,6 +2375,33 @@ struct FlintStudioState(Movable):
         self.gizmo_mode = GIZMO_MODE_TRANSLATE
         self.gizmo_local_space = False
         self.active_gizmo_handle = GIZMO_AXIS_NONE
+        self.viewport_xf = ViewportTransform(
+            RectF(0.0, 0.0, Float32(max(1, width)), Float32(max(1, height))),
+            Float32(max(1, width)),
+            Float32(max(1, height)),
+            Float32(1.0),
+        )
+        self.pivot_mode = PIVOT_BOUNDS_CENTER
+        self.scale_snap = Float32(0.1)
+        self.gz_dragging = False
+        self.gz_handle = GIZMO_AXIS_NONE
+        self.gz_mode = GIZMO_MODE_TRANSLATE
+        self.gz_seq = UInt64(0)
+        self.gz_seq_counter = UInt64(0)
+        self.gz_start_ray = ViewportRay()
+        self.gz_prev_ray = ViewportRay()
+        self.gz_start_pivot = Vec3()
+        self.gz_rot = Quat.identity()
+        self.gz_snaps = List[SelectedTransformSnap]()
+        self.gz_angle = Float32(0.0)
+        self.gz_start_mx = Float32(0.0)
+        self.gz_start_my = Float32(0.0)
+        self.marquee_active = False
+        self.viewport_hovered = False
+        self.marquee_x0 = Float32(0.0)
+        self.marquee_y0 = Float32(0.0)
+        self.marquee_x1 = Float32(0.0)
+        self.marquee_y1 = Float32(0.0)
         self.snap_enabled = True
         self.grid_snap_m = Float32(0.25)
         self.angle_snap_deg = Float32(15.0)
@@ -2340,10 +2479,12 @@ struct FlintStudioState(Movable):
         self.show_grid_overlay = True
         self.cam_ortho = False
         self.gallery_play_hud_active = False
-        self.entity_locked = Dict[Int, Bool]()
         self._last_screen_w = Float32(max(320, width))
         self._last_screen_h = Float32(max(240, height))
         self.camera_rig = CameraRig(CAM_MODE_ORBIT_FOLLOW)
+        # Editor views must reach straight top-down / bottom-up (Top view used to stop at 85 degrees).
+        self.camera_rig.min_pitch_deg = Float32(-89.5)
+        self.camera_rig.max_pitch_deg = Float32(89.5)
         self.camera_rig.fov_deg = Float32(52.0)
         self.camera_rig.look_offset = Vec3(0.0, 0.0, 0.0)
         self._cam_dummy_world = PhysicsWorld()
@@ -2364,18 +2505,34 @@ struct FlintStudioState(Movable):
         self.confirm_modal_open = False
         self.confirm_modal_action = 0
         self.pending_load_path = String("")
+        self.file_modal_open = False
+        self.file_modal_save_as = False
+        self.file_modal_path = String("")
+        self.recent_scenes = List[String]()
+        self.console_open = False
+        self.console_log = List[String]()
+        self.help_open = False
+        self.welcome_open = False
+        self.rename_focus_requested = False
+        self._saved_tx_id = UInt64(0)
         self.next_editor_id = UInt64(1)
         self.autosave_interval_sec = Float32(120.0)
         self._autosave_accum_sec = Float32(0.0)
         self.last_autosave_path = String("")
         self.editor_id_slots = Dict[UInt64, Int]()
-        self.mcp_grant_once = List[String]()
-        self.mcp_grant_once_client = List[Int]()
+        self.mcp_replay_client = List[Int]()
+        self.mcp_replay_tool = List[String]()
+        self.mcp_replay_args = List[String]()
+        self.mcp_replay_step = List[UInt64]()
+        self.mcp_replay_editor_id = List[UInt64]()
         self.mcp_client_agents = Dict[Int, UInt32]()
         self.flmat_pending_path = String("")
         self.flmat_pending = FlmatAsset()
         self.flmat_pending_eid = -1
         self.flmat_pending_ref = String("")
+        self.flmat_pending_editor_id = UInt64(0)
+        self.flmat_pending_stamp = (-1, 0)
+        self.flmat_pending_touch_sec = Float32(0.0)
         self.toasts = List[StudioToast]()
         self.clipboard_entity_ids = List[Int]()
         self.show_navmesh_overlay = True
@@ -2960,7 +3117,7 @@ struct FlintStudioState(Movable):
                 0.0,
                 STUDIO_HEADER_BAR_H,
                 lw,
-                max(Float32(64.0), lh - STUDIO_HEADER_BAR_H),
+                max(Float32(64.0), lh - STUDIO_HEADER_BAR_H - STUDIO_STATUS_BAR_H),
             )
         )
         var vp = self.dock.find_panel("SceneViewport")
@@ -3065,6 +3222,7 @@ struct FlintStudioState(Movable):
         depth: Int,
         mut out: List[HierarchyRow],
         mut visited: List[Bool],
+        ignore_collapse: Bool = False,
     ):
         if entity_id < 0 or entity_id >= len(visited) or visited[entity_id] or depth >= 64:
             return
@@ -3073,11 +3231,44 @@ struct FlintStudioState(Movable):
         var has_ch = len(ch) > 0
         var exp = self.is_hierarchy_expanded(entity_id)
         out.append(HierarchyRow(entity_id, parent_id, depth, has_ch, exp))
-        if has_ch and exp:
+        if has_ch and (exp or ignore_collapse):
             for i in range(len(ch)):
-                self._collect_hierarchy_dfs(ch[i], entity_id, depth + 1, out, visited)
+                self._collect_hierarchy_dfs(ch[i], entity_id, depth + 1, out, visited, ignore_collapse)
 
-    def hierarchy_visible_rows(self) -> List[HierarchyRow]:
+    def hierarchy_key_nav(mut self, up: Bool, down: Bool, left: Bool, right: Bool) -> Bool:
+        """Arrow keys in the Hierarchy: Up/Down move the selection through the visible rows,
+        Left collapses (or jumps to the parent), Right expands (or steps into the first child)."""
+        if not (up or down or left or right):
+            return False
+        var rows = self.hierarchy_visible_rows()
+        if len(rows) == 0:
+            return False
+        var cur = -1
+        for i in range(len(rows)):
+            if rows[i].entity_id == self.selected_entity_id:
+                cur = i
+                break
+        if cur < 0:
+            self.select_entity(rows[0].entity_id)
+            return True
+        var row = rows[cur]
+        if up and cur > 0:
+            self.select_entity(rows[cur - 1].entity_id)
+        elif down and cur + 1 < len(rows):
+            self.select_entity(rows[cur + 1].entity_id)
+        elif left:
+            if row.has_children and row.expanded:
+                self.hierarchy_expanded[row.entity_id] = False
+            elif row.parent_id >= 0:
+                self.select_entity(row.parent_id)
+        elif right and row.has_children:
+            if not row.expanded:
+                self.hierarchy_expanded[row.entity_id] = True
+            elif cur + 1 < len(rows):
+                self.select_entity(rows[cur + 1].entity_id)
+        return True
+
+    def hierarchy_visible_rows(self, ignore_collapse: Bool = False) -> List[HierarchyRow]:
         var out = List[HierarchyRow]()
         var n = len(self.app.world.entities)
         if n == 0:
@@ -3085,12 +3276,44 @@ struct FlintStudioState(Movable):
         var visited = List[Bool](length=n, fill=False)
         for i in range(n):
             if self.app.world.entities[i].alive and self.parent_of(i) < 0:
-                self._collect_hierarchy_dfs(i, -1, 0, out, visited)
+                self._collect_hierarchy_dfs(i, -1, 0, out, visited, ignore_collapse)
         # Fallback for any orphan whose parent died externally (never emit children of collapsed live parents)
         for i in range(n):
             if self.app.world.entities[i].alive and not visited[i] and self.parent_of(i) < 0:
-                self._collect_hierarchy_dfs(i, -1, 0, out, visited)
+                self._collect_hierarchy_dfs(i, -1, 0, out, visited, ignore_collapse)
         return out^
+
+    def hierarchy_rows_for_query(self, query: String) -> List[HierarchyRow]:
+        """Outliner rows for a search: every entity whose name matches, including children of collapsed
+        parents (a search that skips collapsed branches hides exactly what the user is looking for)."""
+        var q = Self._ascii_lower(String(query.strip()))
+        if q.byte_length() == 0:
+            return self.hierarchy_visible_rows()
+        var all_rows = self.hierarchy_visible_rows(ignore_collapse=True)
+        var out = List[HierarchyRow]()
+        for i in range(len(all_rows)):
+            var eid = all_rows[i].entity_id
+            if eid < len(self.entities) and Self._ascii_lower(self.entities[eid].name).find(q) >= 0:
+                out.append(all_rows[i])
+        return out^
+
+    def set_entity_locked(mut self, entity_id: Int, locked: Bool) -> Bool:
+        """Locks an entity against viewport picking, marquee and gizmo moves. Stored on the entity's
+        metadata component, so it is saved with the scene and follows the entity (never a reused slot)."""
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return False
+        var m = self.app.world.get_ptr_mut[StudioEntityMetaComponent](e)
+        if not m:
+            return False
+        m.value()[unsafe_offset=0].locked = locked
+        if entity_id < len(self.entities):
+            self.entities[entity_id].locked = locked
+        self.mark_dirty(True)
+        return True
+
+    def is_entity_locked(self, entity_id: Int) -> Bool:
+        return entity_id >= 0 and entity_id < len(self.entities) and self.is_alive_id(entity_id) and self.entities[entity_id].locked
 
     def hierarchy_display_order(self) -> List[Int]:
         var rows = self.hierarchy_visible_rows()
@@ -3201,29 +3424,57 @@ struct FlintStudioState(Movable):
         return top^
 
     def selection_gizmo_pivot(self) -> Tuple[Bool, Vec3]:
+        """Gizmo pivot: the centre of the selection's bounding box (not the mean of positions, which a
+        cluster of objects on one side pulls off-centre), or the primary entity with `PIVOT_ACTIVE`."""
         var ents = self.selected_entities()
         if len(ents) == 0:
             return (False, Vec3())
-        var sum_p = Vec3()
+        if self.pivot_mode == PIVOT_ACTIVE and self.is_alive_id(self.selected_entity_id):
+            var pe = self.resolve_entity(self.selected_entity_id)
+            var pgt = self.app.world.get_ptr[GlobalTransform](pe)
+            if pgt:
+                return (True, pgt.value()[unsafe_offset=0].translation)
+        var lo = Vec3(Float32(1.0e30), Float32(1.0e30), Float32(1.0e30))
+        var hi = Vec3(Float32(-1.0e30), Float32(-1.0e30), Float32(-1.0e30))
         var cnt = 0
         for i in range(len(ents)):
+            var p = Vec3()
             var gt_opt = self.app.world.get_ptr[GlobalTransform](ents[i])
             if gt_opt:
-                sum_p = sum_p + gt_opt.value()[unsafe_offset=0].translation
-                cnt += 1
+                p = gt_opt.value()[unsafe_offset=0].translation
             else:
                 var lt_opt = self.app.world.get_ptr[LocalTransform](ents[i])
-                if lt_opt:
-                    sum_p = sum_p + lt_opt.value()[unsafe_offset=0].translation
-                    cnt += 1
+                if not lt_opt:
+                    continue
+                p = lt_opt.value()[unsafe_offset=0].translation
+            lo = Vec3(min(lo.x, p.x), min(lo.y, p.y), min(lo.z, p.z))
+            hi = Vec3(max(hi.x, p.x), max(hi.y, p.y), max(hi.z, p.z))
+            cnt += 1
         if cnt == 0:
             return (False, Vec3())
-        return (True, sum_p * (Float32(1.0) / Float32(cnt)))
+        return (True, (lo + hi) * Float32(0.5))
+
+    def toggle_pivot_mode(mut self):
+        self.pivot_mode = PIVOT_ACTIVE if self.pivot_mode == PIVOT_BOUNDS_CENTER else PIVOT_BOUNDS_CENTER
+        self.push_toast("Pivot: Active Entity" if self.pivot_mode == PIVOT_ACTIVE else "Pivot: Bounds Centre", 0, 1.8)
 
     # ---- Editor UX Helpers (Dirty, Toasts, Space, Clipboard, NavBake, Spawn) ----
 
+    def _top_tx_id(self) -> UInt64:
+        return self.undo_stack[len(self.undo_stack) - 1].tx_id if len(self.undo_stack) > 0 else UInt64(0)
+
+    def _refresh_dirty_from_history(mut self):
+        """After undo / redo the scene is clean exactly when history is back at the last save or load
+        (undoing your edits back to the saved state no longer leaves a bogus unsaved-changes mark)."""
+        var clean = self._top_tx_id() == self._saved_tx_id
+        var keep_saved = self._saved_tx_id
+        self.mark_dirty(not clean)
+        self._saved_tx_id = keep_saved
+
     def mark_dirty(mut self, dirty_val: Bool = True):
         self.dirty = dirty_val
+        if not dirty_val:
+            self._saved_tx_id = self._top_tx_id()
         var base_title = "FLINT STUDIO v5 — AAA VISUAL EDITOR"
         var full_title = base_title + " *" if dirty_val else base_title
         self.app.config.title = full_title
@@ -3234,6 +3485,10 @@ struct FlintStudioState(Movable):
                 win_res.value()[unsafe_offset=0].windows[wi].set_title(full_title)
 
     def push_toast(mut self, message: String, severity: Int = 0, ttl_sec: Float32 = 3.0):
+        var tag = String("[error] ") if severity == 2 else (String("[warn] ") if severity == 1 else String(""))
+        self.console_log.append(tag + message)
+        while len(self.console_log) > STUDIO_CONSOLE_CAP:
+            _ = self.console_log.pop(0)
         self.toasts.append(StudioToast(message, severity, ttl_sec))
         while len(self.toasts) > 5:
             _ = self.toasts.pop(0)
@@ -3276,7 +3531,7 @@ struct FlintStudioState(Movable):
     ) -> Bool:
         var sw = screen_w if screen_w > Float32(100.0) else self._last_screen_w
         var sh = screen_h if screen_h > Float32(100.0) else self._last_screen_h
-        var dock_r = RectF(Float32(0.0), STUDIO_HEADER_BAR_H, sw, max(Float32(64.0), sh - STUDIO_HEADER_BAR_H))
+        var dock_r = RectF(Float32(0.0), STUDIO_HEADER_BAR_H, sw, max(Float32(64.0), sh - STUDIO_HEADER_BAR_H - STUDIO_STATUS_BAR_H))
         return self.workspace_mgr.apply_preset(preset_id, self.dock, dock_r)
 
     def wants_keyboard(self) -> Bool:
@@ -3487,20 +3742,14 @@ struct FlintStudioState(Movable):
                 return self.despawn_entity(self.selected_entity_id, record_undo=True)
             return False
         if cmd_id == PAL_CMD_RENAME:
-            _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_INSPECTOR)
+            self.begin_rename_selected()
             return True
         if cmd_id == PAL_CMD_COPY:
             return self.copy_selected() > 0
         if cmd_id == PAL_CMD_PASTE and not in_play:
             return len(self.paste_clipboard(record_undo=True)) > 0
         if cmd_id == PAL_CMD_SELECT_ALL:
-            self.selected_entity_ids.clear()
-            for i in range(len(self.entities)):
-                if self.entities[i].alive:
-                    self.selected_entity_ids.append(i)
-            if len(self.selected_entity_ids) > 0:
-                self.selected_entity_id = self.selected_entity_ids[0]
-                self.selection_anchor_id = self.selected_entity_id
+            self.select_all_entities()
             return True
         if cmd_id == PAL_CMD_CLEAR_SELECTION:
             self.selected_entity_ids.clear()
@@ -3639,7 +3888,7 @@ struct FlintStudioState(Movable):
             self.show_grid_overlay = not self.show_grid_overlay
             return True
         if cmd_id == PAL_CMD_TOGGLE_ORTHO_CAMERA:
-            self.cam_ortho = not self.cam_ortho
+            self.toggle_ortho_camera()
             return True
         if cmd_id == PAL_CMD_TOGGLE_PERF_SPARKLINE:
             self.viewport_hud.perf_expanded = not self.viewport_hud.perf_expanded
@@ -3858,48 +4107,51 @@ struct FlintStudioState(Movable):
             if res[0]:
                 var pa = res[1].copy()
                 if pa.source == APPROVAL_SRC_MCP_TOOL:
-                    if approved and pa.tool_name.byte_length() > 0:
-                        # The gated call was already answered `approval_required`; let the agent's retry through.
-                        self.mcp_grant_once.append(pa.tool_name)
-                        self.mcp_grant_once_client.append(pa.mcp_client_key)
-                    # Re-resolve through the stable editor id: the slot may have been reused since queueing.
-                    var ghost_slot = (
-                        self.slot_for_editor_id(pa.ghost.editor_id) if pa.ghost.editor_id != 0 else pa.ghost.entity_id
-                    )
-                    if approved and pa.ghost.kind == GHOST_TRANSFORM and pa.ghost.entity_id >= 0 and ghost_slot < 0:
+                    # Approving runs the agent's exact call (same tool, same arguments, same client),
+                    # re-targeted through the stable editor id at the entity the user saw. Nothing is
+                    # granted by tool name, so the approval can never wave through a different call.
+                    var target_eid = pa.ghost.editor_id if pa.ghost.editor_id != 0 else pa.target_editor_id
+                    if approved and target_eid != 0 and self.slot_for_editor_id(target_eid) < 0:
                         self.push_toast("Approval target no longer exists", 1, 3.0)
-                    if (
-                        approved
-                        and pa.ghost.kind == GHOST_TRANSFORM
-                        and ghost_slot >= 0
-                        and self.is_alive_id(ghost_slot)
-                    ):
-                        var cur = self.entities[ghost_slot].copy()
-                        var pre_raw = self._capture_world_blob()
-                        cur.translation = pa.ghost.target_pos
-                        var prev_origin = self._active_tx_agent_id
-                        self._active_tx_agent_id = Int(pa.agent_id)
-                        var committed = self.commit_node_edit(ghost_slot, cur^, "Agent: " + pa.title)
-                        self._active_tx_agent_id = prev_origin
-                        if committed:
-                            var post_raw = self._capture_world_blob()
-                            var tx_id = self.undo_stack[len(self.undo_stack) - 1].tx_id if len(self.undo_stack) > 0 else UInt64(0)
-                            _ = self.record_agent_step_checkpoint(
-                                tx_id, Int(pa.agent_id), 1, Int(pa.step_id), pre_raw, post_raw, pa.title
-                            )
-                            _ = self.agent_bus.complete_mcp_tool_step(
-                                pa.agent_id,
-                                pa.step_id,
-                                True,
-                                '{"ok":true,"approved":true}',
-                                Float32(1.0),
-                                tx_id,
-                                entity_id=ghost_slot,
-                                world_pos=pa.ghost.target_pos,
-                                has_world_pos=True,
-                                post_world_lz4=post_raw,
-                                post_hash=self.state_hash(),
-                            )
+                        _ = self.agent_bus.complete_mcp_tool_step(
+                            pa.agent_id, pa.step_id, False, '{"ok":false,"error":"approval target no longer exists"}', Float32(0.0)
+                        )
+                    elif approved and pa.tool_name.byte_length() > 0:
+                        self.mcp_replay_client.append(pa.mcp_client_key)
+                        self.mcp_replay_tool.append(pa.tool_name)
+                        self.mcp_replay_args.append(pa.raw_payload_json)
+                        self.mcp_replay_step.append(pa.step_id)
+                        self.mcp_replay_editor_id.append(target_eid)
+                    elif approved and pa.ghost.kind == GHOST_TRANSFORM:
+                        # A preview-only approval (no tool call to replay): apply the previewed move.
+                        var ghost_slot = self.slot_for_editor_id(target_eid) if target_eid != 0 else pa.ghost.entity_id
+                        if ghost_slot >= 0 and self.is_alive_id(ghost_slot):
+                            var cur = self.entities[ghost_slot].copy()
+                            var pre_raw = self._capture_world_blob()
+                            cur.translation = pa.ghost.target_pos
+                            var prev_origin = self._active_tx_agent_id
+                            self._active_tx_agent_id = Int(pa.agent_id)
+                            var committed = self.commit_node_edit(ghost_slot, cur^, "Agent: " + pa.title)
+                            self._active_tx_agent_id = prev_origin
+                            if committed:
+                                var post_raw = self._capture_world_blob()
+                                var tx_id = self.undo_stack[len(self.undo_stack) - 1].tx_id if len(self.undo_stack) > 0 else UInt64(0)
+                                _ = self.record_agent_step_checkpoint(
+                                    tx_id, Int(pa.agent_id), 1, Int(pa.step_id), pre_raw, post_raw, pa.title
+                                )
+                                _ = self.agent_bus.complete_mcp_tool_step(
+                                    pa.agent_id,
+                                    pa.step_id,
+                                    True,
+                                    '{"ok":true,"approved":true}',
+                                    Float32(1.0),
+                                    tx_id,
+                                    entity_id=ghost_slot,
+                                    world_pos=pa.ghost.target_pos,
+                                    has_world_pos=True,
+                                    post_world_lz4=post_raw,
+                                    post_hash=self.state_hash(),
+                                )
                     _ = self.toast_mgr.push(
                         TOAST_SUCCESS if approved else TOAST_INFO,
                         ("Approved: " if approved else "Rejected: ") + pa.title,
@@ -4019,6 +4271,14 @@ struct FlintStudioState(Movable):
             if first_tx == UInt64(0) or st.tx_id < first_tx:
                 first_tx = st.tx_id
         if first_tx == UInt64(0):
+            # Ordinary MCP / ACP steps do not record their transaction. Fall back to the undo history's
+            # origin tags: the agent's earliest entry still on the stack bounds where its work starts.
+            # This can only over-count (block a revert that was safe), never miss a user edit.
+            for i in range(len(self.undo_stack)):
+                ref tx = self.undo_stack[i]
+                if tx.agent_id == Int(agent_id) and (first_tx == UInt64(0) or tx.tx_id < first_tx):
+                    first_tx = tx.tx_id
+        if first_tx == UInt64(0):
             return 0
         var n = 0
         for i in range(len(self.undo_stack)):
@@ -4040,16 +4300,18 @@ struct FlintStudioState(Movable):
         self._edit_focus_id = f
         self.ui_edit_seq += 1
 
-    def agent_for_mcp_client(mut self, client_key: Int, client_name: String) -> UInt32:
-        """The agent session that owns an MCP connection. The first connection adopts the Studio-launched
-        ACP agent (it is that agent calling back); every other connection gets its own session, so
-        approvals, gate policy and theatre attribution never leak between agents."""
+    def agent_for_mcp_client(mut self, client_key: Int, client_name: String, from_acp_agent: Bool = False) -> UInt32:
+        """The agent session that owns an MCP connection. A connection adopts the Studio-launched ACP
+        agent only when the host proved it comes from that agent's process tree (`from_acp_agent`, via
+        `SO_PEERCRED`); any other connection gets its own session, so approvals, gate policy and theatre
+        attribution never leak between agents. A new session starts with the approval policy of the
+        agent selected in the Agents panel (Edits when none is), never with no gate at all."""
         var known = self.mcp_client_agents.get(client_key, UInt32(0))
         if known != 0 and self.agent_bus.find_session_index(known) >= 0:
             return known
         var aid = UInt32(0)
         var acp = self.agent_runtime.acp_agent_id
-        if acp != 0 and self.agent_bus.find_session_index(acp) >= 0:
+        if from_acp_agent and acp != 0 and self.agent_bus.find_session_index(acp) >= 0:
             var claimed = False
             for item in self.mcp_client_agents.items():
                 if item.value == acp and item.key != client_key:
@@ -4060,17 +4322,69 @@ struct FlintStudioState(Movable):
             var nm = client_name if client_name.byte_length() > 0 and client_name != "unknown-mcp-client" else (
                 "MCP client " + String(client_key)
             )
-            aid = self.agent_bus.create_session(ROLE_EXTERNAL_MCP, nm, APPROVAL_AUTO)
+            var policy = APPROVAL_EDITS
+            var sel = self.agent_bus.find_session_index(self.agent_bus.selected_agent_id)
+            if sel >= 0:
+                policy = self.agent_bus.sessions[sel].approval_policy
+            aid = self.agent_bus.create_session(ROLE_EXTERNAL_MCP, nm, policy)
         self.mcp_client_agents[client_key] = aid
         return aid
+
+    def release_mcp_client(mut self, client_key: Int):
+        """A connection closed: its pending approvals are rejected (there is nobody to answer), its key
+        stops claiming an agent (so Studio's ACP agent is adopted again when it reconnects), and its
+        session is removed from the Agents panel if it never did anything."""
+        var aid = self.mcp_client_agents.get(client_key, UInt32(0))
+        try:
+            if client_key in self.mcp_client_agents:
+                _ = self.mcp_client_agents.pop(client_key)
+        except:
+            pass
+        var i = len(self.agent_bus.pending_approvals) - 1
+        while i >= 0:
+            ref pa = self.agent_bus.pending_approvals[i]
+            if pa.source == APPROVAL_SRC_MCP_TOOL and pa.mcp_client_key == client_key and not pa.resolved:
+                _ = self.agent_bus.resolve_approval(pa.approval_id, False, False, "Agent disconnected")
+            i -= 1
+        if aid == 0 or aid == self.agent_runtime.acp_agent_id:
+            return
+        var si = self.agent_bus.find_session_index(aid)
+        if si >= 0 and len(self.agent_bus.sessions[si].steps) == 0:
+            _ = self.agent_bus.sessions.pop(si)
+            if self.agent_bus.selected_agent_id == aid:
+                self.agent_bus.selected_agent_id = self.agent_bus.sessions[0].agent_id if len(self.agent_bus.sessions) > 0 else UInt32(0)
+
+    def reject_all_mcp_approvals(mut self, reason: String):
+        """Rejects every queued MCP approval (used when the scene they were made against is replaced)."""
+        var i = len(self.agent_bus.pending_approvals) - 1
+        while i >= 0:
+            ref pa = self.agent_bus.pending_approvals[i]
+            if pa.source == APPROVAL_SRC_MCP_TOOL and not pa.resolved:
+                _ = self.agent_bus.resolve_approval(pa.approval_id, False, False, reason)
+            i -= 1
+        self.mcp_replay_client.clear()
+        self.mcp_replay_tool.clear()
+        self.mcp_replay_args.clear()
+        self.mcp_replay_step.clear()
+        self.mcp_replay_editor_id.clear()
 
     def _stamp_approval_editor_ids(mut self):
         """Pins each newly queued approval ghost to its entity's stable `editor_id`, so approving it
         later cannot act on a different entity that reused the slot in the meantime."""
         for i in range(len(self.agent_bus.pending_approvals)):
-            ref g = self.agent_bus.pending_approvals[i].ghost
-            if g.editor_id == 0 and g.entity_id >= 0:
-                g.editor_id = self.editor_id_of(g.entity_id)
+            ref pa = self.agent_bus.pending_approvals[i]
+            if pa.ghost.editor_id == 0 and pa.ghost.entity_id >= 0:
+                pa.ghost.editor_id = self.editor_id_of(pa.ghost.entity_id)
+            if pa.target_editor_id == 0 and pa.source == APPROVAL_SRC_MCP_TOOL and pa.raw_payload_json.byte_length() > 0:
+                # Non-ghost calls aimed at an entity are pinned too (an explicit editor_id is kept as is).
+                var raw = List[UInt8](capacity=pa.raw_payload_json.byte_length())
+                for b in pa.raw_payload_json.as_bytes():
+                    raw.append(b)
+                var d = parse_json(raw)
+                if d.valid and d.object_get(d.root, "editor_id") < 0:
+                    var e = d.integer(d.object_get(d.root, "entity_id"), -1)
+                    if e >= 0 and self.is_alive_id(e):
+                        pa.target_editor_id = self.editor_id_of(e)
 
     def update_follow_agent_camera(mut self, dt: Float32):
         if not self.agent_bus.should_follow_camera():
@@ -4182,8 +4496,13 @@ struct FlintStudioState(Movable):
                 win_res.value()[unsafe_offset=0].windows[wi].set_pointer_lock(False)
 
     def selection_gizmo_rotation(self) -> Quat:
-        if not self.gizmo_local_space:
+        """Gizmo axes for the current mode. Scale always uses the primary entity's own axes: a world-axis
+        scale of a rotated object is a shear the transform cannot hold, so it would scale the wrong way."""
+        if not self.gizmo_local_space and self.gizmo_mode != GIZMO_MODE_SCALE:
             return Quat.identity()
+        return self._primary_world_rotation()
+
+    def _primary_world_rotation(self) -> Quat:
         var eid = self.selected_entity_id
         if not self.is_alive_id(eid) and len(self.selected_entity_ids) > 0:
             for i in range(len(self.selected_entity_ids)):
@@ -4211,25 +4530,38 @@ struct FlintStudioState(Movable):
         self.push_toast("Gizmo: Local Space" if self.gizmo_local_space else "Gizmo: World Space", 0, 1.8)
 
     def frame_selection(mut self):
-        var piv = self.selection_gizmo_pivot()
-        if not piv[0]:
+        """Frames the selection's bounds so it fills the viewport panel and sits at the panel's centre.
+        The renderer's projection is centred on the whole window, so the camera is offset to put the
+        selection on the ray through the panel centre, at the distance that fits its bounding sphere."""
+        var b = self.selection_bounds()
+        if not b[0]:
             return
-        var target = piv[1]
-        var offset = self.cam_pos - self.cam_target
-        var dist = offset.length()
-        if not isfinite(dist) or dist < Float32(0.05):
-            offset = Vec3(Float32(-4.5), Float32(2.8), Float32(-6.0))
-        else:
-            var dir = offset * (Float32(1.0) / dist)
-            var clamped_dist = max(Float32(3.0), min(Float32(20.0), dist))
-            offset = dir * clamped_dist
-        self.cam_target = target
-        self.cam_pos = target + offset
-        self.camera_rig.look_offset = Vec3()
-        self.camera_rig.pivot_spring.value = target
-        var eye = self.cam_pos
-        var tgt = self.cam_target
-        self.look_at(eye, tgt)
+        var center = (b[1] + b[2]) * Float32(0.5)
+        var radius = max(Float32(0.3), (b[2] - b[1]).length() * Float32(0.5))
+        var fwd = self.cam_target - self.cam_pos
+        var flen = fwd.length()
+        if not isfinite(flen) or flen < Float32(1.0e-4):
+            fwd = Vec3(Float32(0.6), Float32(-0.37), Float32(0.71))
+        fwd = fwd.normalized()
+        var right = fwd.cross(Vec3(0.0, 1.0, 0.0))
+        if right.length_squared() < Float32(1.0e-6):
+            right = Vec3(1.0, 0.0, 0.0)
+        right = right.normalized()
+        var up = right.cross(fwd).normalized()
+        var vx = self.viewport_xf
+        var tan_y = tan(self.fov_y_deg * Float32(3.14159265 / 360.0))
+        var tan_x = tan_y * (vx.target_w / max(Float32(1.0), vx.target_h))
+        # Fit the sphere inside the panel's share of the frustum (the panel may be much smaller than
+        # the window the projection covers).
+        var pan_tan_y = tan_y * (vx.panel.h / max(Float32(1.0), vx.target_h))
+        var pan_tan_x = tan_x * (vx.panel.w / max(Float32(1.0), vx.target_w))
+        var fit_tan = max(Float32(0.02), min(pan_tan_x, pan_tan_y))
+        var dist = max(Float32(1.0), min(Float32(500.0), radius * Float32(1.15) / fit_tan + radius))
+        var ndc_x = ((vx.panel.x + vx.panel.w * Float32(0.5)) / max(Float32(1.0), vx.target_w)) * Float32(2.0) - Float32(1.0)
+        var ndc_y = Float32(1.0) - ((vx.panel.y + vx.panel.h * Float32(0.5)) / max(Float32(1.0), vx.target_h)) * Float32(2.0)
+        var ray_dir = (fwd + right * (ndc_x * tan_x) + up * (ndc_y * tan_y)).normalized()
+        var eye = center - ray_dir * dist
+        self.look_at(eye, eye + fwd * dist)
         var rps_opt = self.app.resources.get_ptr_mut[RenderPluginStateResource]()
         if rps_opt:
             ref rps = rps_opt.value()[unsafe_offset=0]
@@ -4330,15 +4662,29 @@ struct FlintStudioState(Movable):
             return False
         var path = self.flmat_pending_path
         var ref_path = self.flmat_pending_ref
-        var eid = self.flmat_pending_eid
+        var eid = (
+            self.slot_for_editor_id(self.flmat_pending_editor_id) if self.flmat_pending_editor_id != 0 else self.flmat_pending_eid
+        )
         var asset = self.flmat_pending.copy()
+        var stamp = self.flmat_pending_stamp
         self.flmat_pending_path = String("")
         self.flmat_pending_ref = String("")
         self.flmat_pending_eid = -1
+        self.flmat_pending_editor_id = UInt64(0)
+        self.flmat_pending_stamp = (-1, 0)
+        var now_stamp = file_stamp(path)
+        if stamp[0] >= 0 and (now_stamp[0] != stamp[0] or now_stamp[1] != stamp[1]):
+            self.push_toast("Material changed on disk; your unsaved edit to it was not written", 1, 4.0)
+            return False
         _ = save_flmat_file(path, asset)
         if eid >= 0 and self.is_alive_id(eid):
             _ = self._assign_flmat_to_entity(eid, ref_path)
         return True
+
+    def flush_stale_flmat_edit(mut self):
+        """Saves a pending material edit the Inspector no longer shows (deselected, collapsed, closed)."""
+        if self.flmat_pending_path.byte_length() > 0 and self.ui_time_sec - self.flmat_pending_touch_sec > Float32(0.3):
+            _ = self.commit_pending_flmat_edit()
 
     def request_load_scene(mut self, path: String = "", force: Bool = False) -> Bool:
         """Interactive scene load: asks Save / Discard / Cancel first when the current scene is dirty,
@@ -4351,6 +4697,7 @@ struct FlintStudioState(Movable):
         return self.load_scene_file(path)
 
     def new_scene(mut self, force: Bool = False) -> Bool:
+        _ = self.commit_pending_flmat_edit()
         if not force and self.dirty:
             self.confirm_modal_open = True
             self.confirm_modal_action = 2
@@ -4380,6 +4727,7 @@ struct FlintStudioState(Movable):
 
     def request_quit(mut self) -> Bool:
         """Returns True if quit was deferred by an unsaved-changes modal; False if clean to quit immediately."""
+        _ = self.commit_pending_flmat_edit()  # a half-typed material path is still the user's edit
         if self.dirty:
             self.confirm_modal_open = True
             self.confirm_modal_action = 1
@@ -4536,7 +4884,7 @@ struct FlintStudioState(Movable):
         var lw = Float32(width) / ui_s
         var lh = Float32(height) / ui_s
         self.dock.solve_layout(
-            RectF(0.0, STUDIO_HEADER_BAR_H, lw, max(Float32(64.0), lh - STUDIO_HEADER_BAR_H))
+            RectF(0.0, STUDIO_HEADER_BAR_H, lw, max(Float32(64.0), lh - STUDIO_HEADER_BAR_H - STUDIO_STATUS_BAR_H))
         )
         var panel = self.dock.find_panel("Toolbar")
         var has_toolbar = panel[0] >= 0 and panel[2]
@@ -4595,6 +4943,29 @@ struct FlintStudioState(Movable):
             self.menu.message = "Scene loaded" if ok else ("" if self.confirm_modal_open else "Could not load scene")
         elif action==scene_menu.NEW_SCENE and not in_play:
             _ = self.new_scene(force=False)
+        elif action==scene_menu.OPEN_SCENE and not in_play:
+            self.open_file_modal(False)
+        elif action==scene_menu.SAVE_AS and not in_play:
+            self.open_file_modal(True)
+        elif action==scene_menu.RECOVER_AUTOSAVE and not in_play:
+            if self.autosave_available():
+                _ = self.recover_autosave()
+            else:
+                self.push_toast("No autosave newer than the scene file", 0, 2.5)
+        elif action==scene_menu.SELECT_ALL and not in_play:
+            self.select_all_entities()
+        elif action==scene_menu.RENAME and not in_play:
+            self.begin_rename_selected()
+        elif action==scene_menu.PIVOT_MODE:
+            self.toggle_pivot_mode()
+        elif action==scene_menu.WINDOW_RESET_LAYOUT:
+            self.reset_layout()
+        elif action==scene_menu.WINDOW_CONSOLE:
+            self.console_open = True
+        elif action==scene_menu.HELP_SHORTCUTS:
+            self.help_open = True
+        elif action==scene_menu.HELP_PALETTE:
+            self.open_command_palette(PALETTE_ALL)
         elif action==scene_menu.UNDO and not in_play:
             _ = self.undo()
         elif action==scene_menu.REDO and not in_play:
@@ -4847,6 +5218,22 @@ struct FlintStudioState(Movable):
                     _ = self.request_load_scene()
                 if self.input_map.just_pressed("editor_new"):
                     _ = self.new_scene(force=False)
+                if self.input_map.just_pressed("editor_save_as"):
+                    self.open_file_modal(True)
+                if self.input_map.just_pressed("editor_open"):
+                    self.open_file_modal(False)
+                if self.input_map.just_pressed("editor_help"):
+                    self.help_open = True
+                if self.input_map.just_pressed("editor_rename"):
+                    self.begin_rename_selected()
+                if self.input_map.just_pressed("editor_select_all"):
+                    self.select_all_entities()
+                if self.input_map.just_pressed("build_reload"):
+                    var ok_so = self.reload_gameplay_plugin()
+                    if ok_so:
+                        self.push_toast("Reloaded gameplay .so", 0, 2.0)
+                    else:
+                        self.push_toast("Reload failed: " + self.hot_reload_host.last_error, 2, 4.0)
                 if self.input_map.just_pressed("editor_copy") and self.selected_count() > 0:
                     _ = self.copy_selected()
                 if self.input_map.just_pressed("editor_paste") and len(self.clipboard_entity_ids) > 0:
@@ -4872,6 +5259,18 @@ struct FlintStudioState(Movable):
                 if self.input_map.just_pressed("pie_step"):
                     _ = self.pie_step(1, Float32(1.0 / 60.0))
 
+        # Arrow keys drive the Hierarchy while the pointer is over it (they orbit the camera elsewhere).
+        var hier_hover = False
+        if not kbd_captured and not in_play:
+            var h_info = self.dock.find_panel("Hierarchy")
+            if h_info[0] >= 0 and h_info[2] and h_info[3].contains(_lmx, _lmy):
+                hier_hover = True
+                _ = self.hierarchy_key_nav(
+                    input.key_pressed(UI_KEY_UP),
+                    input.key_pressed(UI_KEY_DOWN),
+                    input.key_pressed(263),
+                    input.key_pressed(262),
+                )
         var editor_cam_controllable = (self.pie.mode != PIE_PLAYING) or self.pie_camera_ejected
         if (
             not editor_cam_controllable
@@ -4891,9 +5290,14 @@ struct FlintStudioState(Movable):
                 self.gizmo_mode = GIZMO_MODE_ROTATE
             if self.input_map.just_pressed("gizmo_scale"):
                 self.gizmo_mode = GIZMO_MODE_SCALE
+            if self.input_map.just_pressed("tool_select"):
+                self.gizmo_mode = GIZMO_MODE_SELECT
+            if self.input_map.just_pressed("toggle_snap"):
+                self.snap_enabled = not self.snap_enabled
+                self.push_toast("Grid snap on" if self.snap_enabled else "Grid snap off", 0, 1.2)
 
         if editor_cam_controllable:
-            var orb = self.input_map.axis_2d("cam_orbit") if not kbd_captured else (Float32(0.0), Float32(0.0))
+            var orb = self.input_map.axis_2d("cam_orbit") if not (kbd_captured or hier_hover) else (Float32(0.0), Float32(0.0))
             var dyaw = orb[0] * Float32(80.0) * dt
             var dpitch = orb[1] * Float32(65.0) * dt
             var fly_move = Vec3()
@@ -4914,6 +5318,37 @@ struct FlintStudioState(Movable):
                 self.camera_rig.pivot_spring.value = self.cam_target
             else:
                 self.camera_rig.mode = CAM_MODE_ORBIT_FOLLOW
+                # Mouse navigation over the viewport: wheel dolly, middle-drag pan, Alt+left orbit,
+                # Alt+right dolly (the DCC conventions; right-drag stays fly mode).
+                if self.viewport_hovered and not mouse_captured:
+                    var arm = max(Float32(0.35), self.camera_rig.spring_arm.target_length)
+                    var wheel = input.mouse_wheel()
+                    var dolly = Float32(1.0)
+                    if wheel != Float32(0.0) and isfinite(wheel):
+                        dolly = Float32(0.88) if wheel > Float32(0.0) else Float32(1.0 / 0.88)
+                        var steps = min(Float32(10.0), abs(wheel))
+                        var k = Float32(1.0)
+                        for _ in range(Int(steps + Float32(0.5))):
+                            k *= dolly
+                        dolly = k
+                    if alt_down and input.mouse_down(1):
+                        dolly *= max(Float32(0.5), min(Float32(2.0), Float32(1.0) + input.mouse_delta_y() * Float32(0.01)))
+                    if dolly != Float32(1.0):
+                        var new_arm = max(Float32(0.35), min(Float32(800.0), arm * dolly))
+                        self.camera_rig.spring_arm.target_length = new_arm
+                        self.camera_rig.spring_arm.current_length.value = new_arm
+                        self.agent_bus.notify_user_camera_input()
+                    if input.mouse_down(2):
+                        var k_pan = arm * Float32(0.0016) / max(Float32(0.5), self.effective_ui_scale())
+                        var pan = (self.cam_right * (-input.mouse_delta_x()) + self.cam_up * input.mouse_delta_y()) * k_pan
+                        if isfinite(pan.x) and isfinite(pan.y) and isfinite(pan.z):
+                            self.cam_target = self.cam_target + pan
+                            self.camera_rig.pivot_spring.value = self.cam_target
+                            self.camera_rig.pivot_spring.velocity = Vec3()
+                            self.agent_bus.notify_user_camera_input()
+                    if alt_down and input.mouse_down(0):
+                        dyaw += input.mouse_delta_x() * Float32(0.25)
+                        dpitch += input.mouse_delta_y() * Float32(0.25)
                 self.update_camera(dt, dyaw, dpitch)
         return True
 
@@ -5286,6 +5721,107 @@ struct FlintStudioState(Movable):
             target = self.project_root + "/" + path
         return target
 
+    def recent_scenes_path(self) -> String:
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        return root + "/.flint/recent_scenes.txt"
+
+    def load_recent_scenes(mut self):
+        """Reads `<project>/.flint/recent_scenes.txt` (one path per line, newest first)."""
+        self.recent_scenes.clear()
+        var raw = read_bytes(self.recent_scenes_path())
+        var line = List[UInt8]()
+        for i in range(len(raw) + 1):
+            if i == len(raw) or raw[i] == 10:
+                if len(line) > 0 and len(self.recent_scenes) < STUDIO_RECENT_SCENES_CAP:
+                    self.recent_scenes.append(String(unsafe_from_utf8=line))
+                line.clear()
+            elif raw[i] != 13:
+                line.append(raw[i])
+
+    def note_recent_scene(mut self, path: String):
+        """Moves `path` to the front of the recent-scenes list and writes the list back."""
+        if path.byte_length() == 0:
+            return
+        var out_list = List[String]()
+        out_list.append(path)
+        for i in range(len(self.recent_scenes)):
+            if self.recent_scenes[i] != path and len(out_list) < STUDIO_RECENT_SCENES_CAP:
+                out_list.append(self.recent_scenes[i])
+        self.recent_scenes = out_list^
+        if self.project_root.byte_length() == 0:
+            return  # no project: keep the list in memory, never write into whatever the cwd is
+        var buf = List[UInt8]()
+        for i in range(len(self.recent_scenes)):
+            for b in self.recent_scenes[i].as_bytes():
+                buf.append(b)
+            buf.append(10)
+        var dst = self.recent_scenes_path()
+        _ = make_dirs(parent_directory(dst))
+        _ = write_bytes(dst, buf)
+
+    def open_file_modal(mut self, save_as: Bool):
+        self.file_modal_open = True
+        self.file_modal_save_as = save_as
+        self.file_modal_path = self.scene_file_path
+        self.load_recent_scenes()
+
+    def submit_file_modal(mut self) -> Bool:
+        """Runs the Open / Save As the file dialog was opened for; keeps the dialog open on failure."""
+        var path = self.file_modal_path
+        if path.byte_length() == 0:
+            self.push_toast("Enter a scene path", 1, 2.5)
+            return False
+        if self.file_modal_save_as:
+            if not (path.endswith(".flscn") or path.endswith(".flscnb") or path.endswith(".flscene")):
+                path += ".flscnb"
+            var ok = self.save_scene_file(path)
+            if ok:
+                self.file_modal_open = False
+                self.push_toast("Saved " + self.scene_file_path, 0, 2.5)
+            return ok
+        self.file_modal_open = False
+        var ok = self.request_load_scene(path)
+        if not ok and not self.confirm_modal_open:
+            self.file_modal_open = True  # the load failed: let the user fix the path
+        return ok
+
+    def reset_layout(mut self):
+        self.workspace_mgr.reset_preset(WORKSPACE_EDIT)
+        _ = self.apply_workspace_preset(WORKSPACE_EDIT)
+        self.push_toast("Layout reset", 0, 1.8)
+
+    def select_all_entities(mut self):
+        self.selected_entity_ids.clear()
+        for i in range(len(self.entities)):
+            if self.entities[i].alive and not self.is_entity_locked(i):
+                self.selected_entity_ids.append(i)
+        if len(self.selected_entity_ids) > 0:
+            self.selected_entity_id = self.selected_entity_ids[0]
+            self.selection_anchor_id = self.selected_entity_id
+
+    def welcome_marker_path(self) -> String:
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        return root + "/.flint/welcome_seen"
+
+    def maybe_show_welcome(mut self):
+        """First run in a project shows the Welcome dialog once (interactive sessions only)."""
+        if file_size(self.welcome_marker_path()) < 0:
+            self.welcome_open = True
+
+    def dismiss_welcome(mut self):
+        self.welcome_open = False
+        var dst = self.welcome_marker_path()
+        _ = make_dirs(parent_directory(dst))
+        var one = List[UInt8]()
+        one.append(49)
+        _ = write_bytes(dst, one)
+
+    def begin_rename_selected(mut self):
+        if self.selected_entity_id < 0:
+            return
+        _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_INSPECTOR)
+        self.rename_focus_requested = True
+
     def autosave_path(self) -> String:
         """`<project>/.flint/autosave/<scene>.autosave.flscnb`: next to the project, never the user's file."""
         var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
@@ -5303,7 +5839,28 @@ struct FlintStudioState(Movable):
                     break
             if stop > start:
                 name = String(unsafe_from_utf8=b[start:stop])
+        # Never stack suffixes (`level.autosave.autosave`) if a path ever points at an autosave.
+        while name.endswith(".autosave"):
+            var trimmed = String(name[byte=0 : name.byte_length() - 9])
+            name = trimmed^
+        if name.byte_length() == 0:
+            name = String("untitled")
         return root + "/.flint/autosave/" + name + ".autosave.flscnb"
+
+    def autosave_available(self) -> Bool:
+        """True when an autosave newer than the scene file exists (offered for recovery at startup)."""
+        var a = file_stamp(self.autosave_path())
+        if a[0] <= 0:
+            return False
+        if self.scene_file_path.byte_length() == 0:
+            return True
+        var f = file_stamp(self.scene_file_path)
+        return f[0] < 0 or a[1] > f[1]
+
+    def discard_autosave(mut self):
+        var p = self.autosave_path()
+        if file_size(p) > 0:
+            _ = remove_file(p)
 
     def write_autosave(mut self) -> Bool:
         """Writes the current world to `autosave_path()` without touching `scene_file_path` or the dirty
@@ -5318,9 +5875,13 @@ struct FlintStudioState(Movable):
         return True
 
     def tick_autosave(mut self, dt: Float32) -> Bool:
-        """Call once per frame. Autosaves after `autosave_interval_sec` of dirty, stopped (not Play) time."""
-        if self.autosave_interval_sec <= Float32(0.0) or not self.dirty or self.pie.mode != PIE_STOPPED:
+        """Call once per frame. Autosaves after `autosave_interval_sec` of dirty, stopped (not Play) time.
+        Play pauses the timer (the world is the Play world then); it does not reset it."""
+        self.flush_stale_flmat_edit()
+        if self.autosave_interval_sec <= Float32(0.0) or not self.dirty:
             self._autosave_accum_sec = Float32(0.0)
+            return False
+        if self.pie.mode != PIE_STOPPED:
             return False
         if isfinite(dt) and dt > Float32(0.0):
             self._autosave_accum_sec += min(dt, Float32(1.0))
@@ -5330,15 +5891,17 @@ struct FlintStudioState(Movable):
         return self.write_autosave()
 
     def recover_autosave(mut self) -> Bool:
-        """Loads the autosave for the current scene (behind the dirty prompt, as an undoable load)."""
+        """Brings back the autosave as one undoable step. The scene keeps its own file path and stays
+        dirty, so the recovered work is saved to the real scene file (and quitting still prompts)."""
         var p = self.autosave_path()
         if file_size(p) <= 0:
             self.push_toast("No autosave found", 1, 3.0)
             return False
-        return self.request_load_scene(p)
+        return self.load_scene_file(p, recovery=True)
 
     def save_scene_file(mut self, path: String = "") -> Bool:
         """Saves the Studio scene via `Scene.save_flscnb_file` (`.flscnb`/`.flscene`) or `Scene.save_flscn_file` (`.flscn`)."""
+        _ = self.commit_pending_flmat_edit()
         var target = self._resolve_scene_io_path(path)
         if target.byte_length() == 0:
             self.push_toast("Save failed: empty path", 2, 3.0)
@@ -5358,7 +5921,9 @@ struct FlintStudioState(Movable):
             self.push_toast("Failed to save scene", 2, 3.5)
             return False
         self.scene_file_path = target
+        self.note_recent_scene(target)
         self.mark_dirty(False)
+        self.discard_autosave()  # the real file is now newer than any autosave
         self.push_toast("Saved " + target, 0, 2.5)
         return True
 
@@ -5501,8 +6066,10 @@ struct FlintStudioState(Movable):
             return b == UInt8(123)  # '{'
         return False
 
-    def load_scene_file(mut self, path: String = "") -> Bool:
-        """Loads a `.flscn`, `.flscnb`, or `.flscene` file into `app.world` and syncs transforms/physics."""
+    def load_scene_file(mut self, path: String = "", recovery: Bool = False) -> Bool:
+        """Loads a `.flscn`, `.flscnb`, or `.flscene` file into `app.world` and syncs transforms/physics.
+        `recovery` (autosave restore) keeps the current scene path and leaves the scene dirty."""
+        _ = self.commit_pending_flmat_edit()  # before the entity it belongs to is replaced
         var target = self._resolve_scene_io_path(path)
         if target.byte_length() == 0:
             self.push_toast("Load failed: empty path", 2, 3.0)
@@ -5512,6 +6079,7 @@ struct FlintStudioState(Movable):
             self.push_toast("Load failed: " + target, 2, 3.5)
             return False
         var is_json = target.endswith(".flscn") or Self._raw_starts_with_json_object(raw)
+        var pie_world_unknown = False
         if self.pie.mode != PIE_STOPPED:
             # A file that does not parse must leave Play running untouched: test-parse it into a
             # scratch world before stopping anything.
@@ -5527,12 +6095,16 @@ struct FlintStudioState(Movable):
                 return False
             # Back to the edit world first, so the load (and its undo entry) starts from the scene the
             # user was editing, not from a mid-simulation Play world.
+            var restored = True
             try:
                 _ = self.pie_stop()
             except:
-                pass  # restore-hash mismatch: the edit world is back anyway; aborting below is safe
+                # Either a restore-hash mismatch (the edit world is back) or the checkpoint failed to
+                # deserialize (mode is still Play, the world may be the Play world).
+                restored = self.pie.mode == PIE_STOPPED
             if self.pie.mode != PIE_STOPPED:
                 self._abort_pie_session()
+            pie_world_unknown = not restored
         # Scene load is an undoable command: the world before the load is kept as its undo state,
         # instead of the old behaviour of wiping the user's whole undo/redo history.
         var before_blob = self._capture_world_blob()
@@ -5553,7 +6125,12 @@ struct FlintStudioState(Movable):
         self.clear_selection()
         if len(self.app.world.entities) > 0 and self.app.world.entities[0].alive:
             self.select_entity(0)
-        self.scene_file_path = target
+        var prev_scene_path = self.scene_file_path
+        if not recovery:
+            self.scene_file_path = target
+            self.note_recent_scene(target)
+        # Approvals were queued against the old scene; its editor ids mean other entities now.
+        self.reject_all_mcp_approvals("Scene changed before approval")
         self.gpu_materials.clear_entity_slots()
         self._pie_frame_updated = False
         self._int_edit_wid = UInt64(0)
@@ -5574,12 +6151,29 @@ struct FlintStudioState(Movable):
         if self._has_default_showcase_entities():
             upload_default_studio_gpu_assets(self)
         self._reset_physics_world_and_sync()
-        if len(before_blob) > 0:
+        if pie_world_unknown:
+            # The pre-load world is a broken Play restore, not the user's scene: do not offer it as undo.
+            self.push_toast("Play could not be restored; this load cannot be undone", 1, 4.0)
+        elif len(before_blob) > 0:
+            var top_before = self._top_tx_id()
+            var prev_saved = self._saved_tx_id
             self._record_world_tx(
-                TX_BATCH_EDIT, -1, List[Int](), before_blob^, prev_ids, prev_primary, prev_anchor, "Load " + target
+                TX_BATCH_EDIT, -1, List[Int](), before_blob^, prev_ids, prev_primary, prev_anchor,
+                ("Recover autosave" if recovery else "Load " + target),
             )
-        self.mark_dirty(False)
-        self.push_toast("Loaded " + target, 0, 2.5)
+            if self._top_tx_id() != top_before:
+                ref top = self.undo_stack[len(self.undo_stack) - 1]
+                top.changes_scene_path = True
+                top.prev_scene_path = prev_scene_path
+                top.next_scene_path = self.scene_file_path
+                top.prev_saved_tx_id = prev_saved
+                top.load_leaves_clean = not recovery
+        if recovery:
+            self.mark_dirty(True)
+            self.push_toast("Recovered autosave. Save to keep it in " + self.scene_file_path, 0, 4.0)
+        else:
+            self.mark_dirty(False)
+            self.push_toast("Loaded " + target, 0, 2.5)
         return True
 
     @staticmethod
@@ -6160,6 +6754,7 @@ struct FlintStudioState(Movable):
                         au_p.value()[].auto_play_pending = True
                     _ = self.commit_ecs_edit(target_entity_id, "Assign Audio " + base_name, before_blob^)
                     return target_entity_id
+            var top_before_spawn = self._top_tx_id()
             var eid = self.spawn_card_entity(5)
             var e = self.resolve_entity(eid)
             if e.valid():
@@ -6173,8 +6768,10 @@ struct FlintStudioState(Movable):
                     au_p.value()[].playing = True
                     au_p.value()[].auto_play_pending = True
                 self._sync_ecs_and_physics()
-                if len(self.undo_stack) > 0:
-                    self.undo_stack[len(self.undo_stack) - 1].after_world_blob = self._capture_world_blob()
+                # Fold the emitter setup into the spawn's own undo entry, and only if the spawn made one
+                # (during Play it does not, and the top entry is then an unrelated user edit).
+                if self._top_tx_id() != top_before_spawn and len(self.undo_stack) > 0:
+                    self.undo_stack[len(self.undo_stack) - 1].after_world_blob = Self._pack_undo_blob(self._capture_world_blob())
             return eid
 
         if lower.endswith(".flrig"):
@@ -6354,6 +6951,8 @@ struct FlintStudioState(Movable):
                 top.next_selected_ids = self.selected_entity_ids.copy()
                 top.next_anchor_id = self.selection_anchor_id
                 top.external_mat_reload_epochs = ext_snap^
+                if top.tx_id == self._saved_tx_id:
+                    self._saved_tx_id = UInt64(0xFFFFFFFFFFFFFFFF)  # the saved entry now holds newer edits
                 self.mark_dirty(True)
                 return
 
@@ -7381,14 +7980,246 @@ struct FlintStudioState(Movable):
                 return False
         return self.commit_node_edit(entity_id, v^, "Patch " + field_name, coalesce_key)
 
+    # ---- Viewport gizmo drag controller (host feeds mouse in physical pixels) ----
+
+    def gizmo_pick(self, mx: Float32, my: Float32) -> Int:
+        """The gizmo handle under the mouse, using this frame's `viewport_xf`."""
+        var piv = self.selection_gizmo_pivot()
+        if not piv[0] or self.pie.mode != PIE_STOPPED or self.gizmo_mode == GIZMO_MODE_SELECT:
+            return GIZMO_AXIS_NONE
+        var vx = self.viewport_xf
+        var s = vx.ui_scale
+        return pick_gizmo_handle(
+            mx, my, piv[1], self.gizmo_mode, Float32(0.0), Float32(0.0), vx.proj_phys_w(), vx.proj_phys_h(),
+            self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
+            target_px=GIZMO_TARGET_PX * s, gizmo_rot=self.selection_gizmo_rotation(), px_scale=s,
+        )
+
+    def gizmo_try_begin(mut self, mx: Float32, my: Float32) -> Bool:
+        """Starts a gizmo drag if the press hit a handle. The drag is one undo step (coalesced) and can be
+        cancelled with `gizmo_drag_cancel`, which puts every selected object back where it started."""
+        var h = self.gizmo_pick(mx, my)
+        if h == GIZMO_AXIS_NONE:
+            return False
+        var piv = self.selection_gizmo_pivot()
+        self.gz_dragging = True
+        self.gz_handle = h
+        self.gz_mode = self.gizmo_mode
+        self.gz_seq_counter += 1
+        self.gz_seq = GIZMO_DRAG_SEQ_TAG | self.gz_seq_counter
+        self.gz_start_ray = self.viewport_xf.ray_phys(mx, my, self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg)
+        self.gz_prev_ray = self.gz_start_ray
+        self.gz_start_pivot = piv[1]
+        self.gz_rot = self.selection_gizmo_rotation()
+        self.gz_snaps = self.capture_selected_transforms()
+        self.gz_angle = Float32(0.0)
+        self.gz_start_mx = mx
+        self.gz_start_my = my
+        self.active_gizmo_handle = h
+        return True
+
+    def gizmo_drag_update(mut self, mx: Float32, my: Float32) -> Bool:
+        if not self.gz_dragging or len(self.gz_snaps) == 0:
+            return False
+        if self.gizmo_mode != self.gz_mode or self.pie.mode != PIE_STOPPED:
+            # Switching W/E/R (or entering Play) mid-drag abandons the drag instead of mixing modes.
+            self.gizmo_drag_cancel()
+            return False
+        var snaps = self.gz_snaps.copy()
+        var vx = self.viewport_xf
+        var cur = vx.ray_phys(mx, my, self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg)
+        var piv = self.gz_start_pivot
+        var rot = self.gz_rot
+        var h = self.gz_handle
+        var wscale = gizmo_world_scale(piv, self.cam_pos, self.cam_fwd, self.fov_y_deg, Int(vx.proj_phys_h()), GIZMO_TARGET_PX * vx.ui_scale)
+        if self.gz_mode == GIZMO_MODE_TRANSLATE:
+            var delta_p = Vec3()
+            if h == GIZMO_AXIS_X or h == GIZMO_AXIS_Y or h == GIZMO_AXIS_Z:
+                var ax = rot.rotate(Vec3(1, 0, 0) if h == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
+                var t0 = ray_axis_closest_param(self.gz_start_ray, piv, ax)
+                var t1 = ray_axis_closest_param(cur, piv, ax)
+                if t0[0] and t1[0]:
+                    delta_p = ax * (t1[1] - t0[1])
+            elif h == GIZMO_PLANE_XY or h == GIZMO_PLANE_XZ or h == GIZMO_PLANE_YZ:
+                var pn = rot.rotate(Vec3(0, 0, 1) if h == GIZMO_PLANE_XY else (Vec3(0, 1, 0) if h == GIZMO_PLANE_XZ else Vec3(1, 0, 0)))
+                var p0 = ray_plane_hit(self.gz_start_ray, piv, pn)
+                var p1 = ray_plane_hit(cur, piv, pn)
+                if p0[0] and p1[0]:
+                    delta_p = p1[1] - p0[1]
+            if self.snap_enabled:
+                delta_p = snap_constrained_delta(piv, delta_p, h, self.grid_snap_m, rot)
+            return self.apply_gizmo_drag_selected(
+                snaps, piv, delta_p, Quat.identity(), Vec3(1.0, 1.0, 1.0), GIZMO_MODE_TRANSLATE,
+                coalesce_key=self.gz_seq, gizmo_rot=rot,
+            )
+        if self.gz_mode == GIZMO_MODE_ROTATE:
+            var rax: Vec3
+            if h == GIZMO_AXIS_VIEW:
+                rax = self.cam_fwd * Float32(-1.0)
+            else:
+                rax = rot.rotate(Vec3(1, 0, 0) if h == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
+            # Accumulate frame-to-frame deltas: a single start-to-current angle wraps at +-180 degrees.
+            self.gz_angle += gizmo_rotation_delta_rad(self.gz_prev_ray, cur, piv, rax, self.cam_fwd, wscale)
+            self.gz_prev_ray = cur
+            var drad = self.gz_angle
+            if self.snap_enabled:
+                drad = snap_angle_deg(drad, self.angle_snap_deg)
+            var hs = sin(drad * Float32(0.5))
+            var dq = Quat(rax.x * hs, rax.y * hs, rax.z * hs, cos(drad * Float32(0.5)))
+            return self.apply_gizmo_drag_selected(
+                snaps, piv, Vec3(), dq, Vec3(1.0, 1.0, 1.0), GIZMO_MODE_ROTATE,
+                coalesce_key=self.gz_seq, gizmo_rot=rot,
+            )
+        # Scale
+        var sf: Vec3
+        if h == GIZMO_SCALE_UNIFORM:
+            var c = project_world_to_viewport(
+                piv, Float32(0.0), Float32(0.0), vx.proj_phys_w(), vx.proj_phys_h(),
+                self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
+            )
+            var f = gizmo_uniform_scale_screen(self.gz_start_mx, self.gz_start_my, mx, my, c[0], c[1]) if c[3] else Float32(1.0)
+            sf = Vec3(f, f, f)
+        else:
+            sf = gizmo_scale_drag(
+                self.gz_start_ray, cur, piv, h, wscale, self.cam_fwd, self.cam_right, Vec3(1.0, 1.0, 1.0), gizmo_rot=rot
+            )
+        if self.snap_enabled and self.scale_snap > Float32(0.0):
+            sf = Vec3(
+                max(self.scale_snap, snap_scalar(sf.x, self.scale_snap)),
+                max(self.scale_snap, snap_scalar(sf.y, self.scale_snap)),
+                max(self.scale_snap, snap_scalar(sf.z, self.scale_snap)),
+            )
+        return self.apply_gizmo_drag_selected(
+            snaps, piv, Vec3(), Quat.identity(), sf, GIZMO_MODE_SCALE, coalesce_key=self.gz_seq, gizmo_rot=rot
+        )
+
+    def gizmo_drag_cancel(mut self):
+        """Esc / right-click / mode switch during a drag: everything goes back to where it was and the
+        drag leaves no undo entry behind."""
+        if not self.gz_dragging:
+            return
+        var restored = False
+        if len(self.undo_stack) > 0 and len(self.redo_stack) == 0:
+            ref top = self.undo_stack[len(self.undo_stack) - 1]
+            if top.coalesce_key == self.gz_seq and top.op == TX_BATCH_EDIT:
+                var tx = self.undo_stack.pop()
+                restored = self._restore_world_blob(tx.before_world_blob, tx.external_mat_reload_epochs)
+                if not restored:
+                    self.undo_stack.append(tx^)
+                else:
+                    self._restore_selection(tx.prev_selected_ids, tx.prev_selected_id, tx.prev_anchor_id)
+                    self._refresh_dirty_from_history()
+        if not restored and len(self.gz_snaps) > 0:
+            # Nothing coalesced (no motion yet, or Play swallowed the entry): re-apply the start pose.
+            var start_snaps = self.gz_snaps.copy()
+            var start_piv = self.gz_start_pivot
+            _ = self.apply_gizmo_drag_selected(
+                start_snaps, start_piv, Vec3(), Quat.identity(), Vec3(1.0, 1.0, 1.0), GIZMO_MODE_TRANSLATE,
+                coalesce_key=self.gz_seq,
+            )
+        self._end_gizmo_drag_state()
+
+    def gizmo_drag_end(mut self):
+        self._end_gizmo_drag_state()
+
+    def _end_gizmo_drag_state(mut self):
+        self.gz_dragging = False
+        self.gz_handle = GIZMO_AXIS_NONE
+        self.gz_snaps.clear()
+        self.active_gizmo_handle = GIZMO_AXIS_NONE
+
+    # ---- Marquee selection, nudging and framing ----
+
+    def entities_in_screen_rect(self, x0: Float32, y0: Float32, x1: Float32, y1: Float32) -> List[Int]:
+        """Entities whose origin projects inside the rect (physical pixels) and inside the viewport panel."""
+        var out = List[Int]()
+        var vx = self.viewport_xf
+        var pnl = vx.panel_phys()
+        var lx = max(min(x0, x1), pnl.x)
+        var hx = min(max(x0, x1), pnl.x + pnl.w)
+        var ly = max(min(y0, y1), pnl.y)
+        var hy = min(max(y0, y1), pnl.y + pnl.h)
+        if hx <= lx or hy <= ly:
+            return out^
+        for i in range(len(self.entities)):
+            if not self.is_alive_id(i) or self.entities[i].locked:
+                continue
+            var p = self.entities[i].translation
+            var gt = self.app.world.get_ptr[GlobalTransform](self.resolve_entity(i))
+            if gt:
+                p = gt.value()[unsafe_offset=0].translation
+            var sp = project_world_to_viewport(
+                p, Float32(0.0), Float32(0.0), vx.proj_phys_w(), vx.proj_phys_h(),
+                self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
+            )
+            if sp[3] and sp[0] >= lx and sp[0] <= hx and sp[1] >= ly and sp[1] <= hy:
+                out.append(i)
+        return out^
+
+    def marquee_select(mut self, x0: Float32, y0: Float32, x1: Float32, y1: Float32, additive: Bool) -> Int:
+        var hits = self.entities_in_screen_rect(x0, y0, x1, y1)
+        if not additive:
+            self.clear_selection()
+        for k in range(len(hits)):
+            self.select_entity(hits[k], multi_select=True)
+        return len(hits)
+
+    def nudge_selection(mut self, dir_x: Int, dir_y: Int, dir_z: Int) -> Bool:
+        """Arrow-key nudge by one grid step. X/Z follow the camera's heading (snapped to the nearest
+        world axis) so "left" on screen moves left; PageUp/PageDown move along world Y."""
+        var snaps = self.capture_selected_transforms()
+        if len(snaps) == 0:
+            return False
+        var step = self.grid_snap_m if self.grid_snap_m > Float32(1.0e-4) else Float32(0.25)
+        var right = Vec3(self.cam_right.x, 0.0, self.cam_right.z)
+        var fwd = Vec3(self.cam_fwd.x, 0.0, self.cam_fwd.z)
+        var one = Float32(1.0)
+        var zero = Float32(0.0)
+        var r_ax = Vec3(one if right.x >= zero else -one, zero, zero) if abs(right.x) >= abs(right.z) else Vec3(zero, zero, one if right.z >= zero else -one)
+        var f_ax = Vec3(one if fwd.x >= zero else -one, zero, zero) if abs(fwd.x) > abs(fwd.z) else Vec3(zero, zero, one if fwd.z >= zero else -one)
+        var d = (r_ax * Float32(dir_x) + Vec3(0.0, Float32(dir_y), 0.0) + f_ax * Float32(dir_z)) * step
+        var piv = self.selection_gizmo_pivot()
+        return self.apply_gizmo_drag_selected(snaps, piv[1], d, Quat.identity(), Vec3(1.0, 1.0, 1.0), GIZMO_MODE_TRANSLATE)
+
+    def selection_bounds(self) -> Tuple[Bool, Vec3, Vec3]:
+        """World AABB of the selection from each entity's position and scaled collider extents."""
+        var lo = Vec3(Float32(1.0e30), Float32(1.0e30), Float32(1.0e30))
+        var hi = Vec3(Float32(-1.0e30), Float32(-1.0e30), Float32(-1.0e30))
+        var any = False
+        var ids = self.selected_entity_ids.copy()
+        if len(ids) == 0 and self.is_alive_id(self.selected_entity_id):
+            ids.append(self.selected_entity_id)
+        for k in range(len(ids)):
+            var i = ids[k]
+            if not self.is_alive_id(i):
+                continue
+            var p = self.entities[i].translation
+            var gt = self.app.world.get_ptr[GlobalTransform](self.resolve_entity(i))
+            if gt:
+                p = gt.value()[unsafe_offset=0].translation
+            var he = self.entities[i].collider_half_extents
+            var sc = self.entities[i].scale
+            var ext = Vec3(abs(he.x * sc.x), abs(he.y * sc.y), abs(he.z * sc.z))
+            var r = max(Float32(0.25), max(ext.x, max(ext.y, ext.z)))
+            lo = Vec3(min(lo.x, p.x - r), min(lo.y, p.y - r), min(lo.z, p.z - r))
+            hi = Vec3(max(hi.x, p.x + r), max(hi.y, p.y + r), max(hi.z, p.z + r))
+            any = True
+        return (any, lo, hi)
+
+    def toggle_ortho_camera(mut self):
+        """The renderer has no orthographic path yet: say so instead of flipping a flag that changes
+        nothing on screen."""
+        self.cam_ortho = False
+        self.push_toast("Orthographic view is not supported by the renderer yet", 1, 3.0)
+
     def capture_selected_transforms(self) -> List[SelectedTransformSnap]:
         var top_ids = self._top_level_selected_ids()
         var snaps = List[SelectedTransformSnap](capacity=len(top_ids))
         for i in range(len(top_ids)):
             var eid = top_ids[i]
             var e = self.resolve_entity(eid)
-            if not e.valid():
-                continue
+            if not e.valid() or self.is_entity_locked(eid):
+                continue  # locked entities never move with the gizmo or nudges
             var lt = self.app.world.get[LocalTransform](e) if self.app.world.has[LocalTransform](e) else LocalTransform()
             var gt = self.app.world.get[GlobalTransform](e) if self.app.world.has[GlobalTransform](e) else GlobalTransform.from_local(lt)
             snaps.append(
@@ -7414,9 +8245,12 @@ struct FlintStudioState(Movable):
         scale_factor: Vec3,
         mode: Int,
         coalesce_key: UInt64 = 0,
+        gizmo_rot: Quat = Quat.identity(),
     ) -> Bool:
         if len(snaps) == 0:
             return False
+        var g_rot = gizmo_rot.normalized() if gizmo_rot.length_squared() > Float32(1.0e-8) else Quat.identity()
+        var g_inv = g_rot.conjugate()
 
         var primary_id = self.selected_entity_id if self.selected_entity_id >= 0 else snaps[0].entity_id
         var can_coalesce = (
@@ -7467,6 +8301,13 @@ struct FlintStudioState(Movable):
                     max(Float32(0.01), ly) if isfinite(ly) else max(Float32(0.01), sn.local_scl.y),
                     max(Float32(0.01), lz) if isfinite(lz) else max(Float32(0.01), sn.local_scl.z),
                 )
+                if len(snaps) > 1 and isfinite(pivot.x) and isfinite(pivot.y) and isfinite(pivot.z):
+                    # A multi-selection scales as a group: positions spread from the pivot along the
+                    # gizmo axes, instead of every object growing in place.
+                    var rel_g = g_inv.rotate(sn.world_pos - pivot)
+                    var moved = pivot + g_rot.rotate(Vec3(rel_g.x * sx_f, rel_g.y * sy_f, rel_g.z * sz_f))
+                    if isfinite(moved.x) and isfinite(moved.y) and isfinite(moved.z):
+                        target_w_pos = moved
 
             var new_lt = LocalTransform(target_w_pos, target_w_rot, target_local_scl)
             if sn.parent_id >= 0:
@@ -7675,8 +8516,11 @@ struct FlintStudioState(Movable):
             self.undo_stack.append(tx^)
             return False
         self._restore_selection(tx.prev_selected_ids, tx.prev_selected_id, tx.prev_anchor_id)
+        if tx.changes_scene_path:
+            self.scene_file_path = tx.prev_scene_path
+            self._saved_tx_id = tx.prev_saved_tx_id  # clean again only if it was clean before the load
         self.redo_stack.append(tx^)
-        self.mark_dirty(True)
+        self._refresh_dirty_from_history()
         return True
 
     def redo(mut self) -> Bool:
@@ -7690,8 +8534,21 @@ struct FlintStudioState(Movable):
             self.redo_stack.append(tx^)
             return False
         self._restore_selection(tx.next_selected_ids, tx.next_selected_id, tx.next_anchor_id)
+        var redo_clean = tx.changes_scene_path and tx.load_leaves_clean
+        if tx.changes_scene_path:
+            self.scene_file_path = tx.next_scene_path
+        # Redo keeps the entry's original origin: whoever triggers the redo, it is still the edit of
+        # whoever made it (an agent's MCP redo must not relabel the user's work as the agent's).
+        var keep_agent = self._active_tx_agent_id
+        var keep_step = self._active_tx_step_id
+        self._active_tx_agent_id = 0
+        self._active_tx_step_id = UInt64(0)
         self._push_undo(tx^)
-        self.mark_dirty(True)
+        self._active_tx_agent_id = keep_agent
+        self._active_tx_step_id = keep_step
+        if redo_clean:
+            self._saved_tx_id = self._top_tx_id()  # re-applying a load matches the loaded file again
+        self._refresh_dirty_from_history()
         return True
 
     # ---- Deterministic `PhysicsWorld` Step, Editor Frame Render & Analytical/Physics Raycast ----
@@ -8662,9 +9519,12 @@ struct FlintStudioState(Movable):
             self.pie.mode = PIE_STOPPED
             self.pie.checkpoint_lz4.clear()
             return False
+        var play_end_hash = self.state_hash()
         var reader = unpack_checkpoint_lz4(self.pie.checkpoint_lz4)
         self.deserialize(reader)
         self.gpu_materials.clear_entity_slots()
+        if play_end_hash != self.pie.pre_play_hash:
+            self.push_toast("Stopped: changes made during Play were discarded", 0, 2.5)
         self.pie.mode = PIE_STOPPED
         self.pie.checkpoint_lz4.clear()
         self.scene.has_pie_snapshot = False
@@ -9385,6 +10245,172 @@ def upload_default_studio_gpu_assets(mut studio: FlintStudioState):
     studio._sync_compat_view()
 
 
+def _scene_display_name(path: String) -> String:
+    if path.byte_length() == 0:
+        return String("Untitled")
+    var start = 0
+    for i in range(path.byte_length()):
+        if path.as_bytes()[i] == 47:
+            start = i + 1
+    return String(path[byte=start:])
+
+
+def _emit_play_banner(mut studio: FlintStudioState, vp: RectF):
+    """A strip across the top of the viewport while Play runs, so edits made now are never a surprise."""
+    if studio.pie.mode == PIE_STOPPED:
+        return
+    var th = studio.studio_theme.copy()
+    var paused = studio.pie.mode == PIE_PAUSED
+    var col = th.play_paused if paused else th.play_mode
+    var bh = Float32(22.0)
+    studio.ui_ctx.draw_list.add_rect(vp.x, vp.y, vp.w, bh, col)
+    var msg = String("PAUSED") if paused else String("PLAYING")
+    msg += "  -  changes made during Play are discarded on Stop (Shift+F5)"
+    studio.ui_ctx._draw_text(msg, vp.x + Float32(10.0), vp.y + Float32(4.0), Float32(13.0), th.text_on_accent)
+
+
+def _emit_status_bar(mut studio: FlintStudioState, sw: Float32, sh: Float32):
+    """Bottom status bar: scene + dirty state, mode, selection, tool, and the latest message
+    (click it to open the console)."""
+    var th = studio.studio_theme.copy()
+    var y = sh - STUDIO_STATUS_BAR_H
+    studio.ui_ctx.draw_list.add_rect(Float32(0.0), y, sw, STUDIO_STATUS_BAR_H, th.l1_shell, 0.0, 1.0, th.border_subtle)
+    var fs = Float32(12.0)
+    var ty = y + Float32(4.0)
+    var left = _scene_display_name(studio.scene_file_path)
+    if studio.dirty:
+        left += "  *unsaved"
+    var mode = String("Editing")
+    if studio.pie.mode == PIE_PLAYING:
+        mode = "Playing"
+    elif studio.pie.mode == PIE_PAUSED:
+        mode = "Paused"
+    var tool = String("Move")
+    if studio.gizmo_mode == GIZMO_MODE_ROTATE:
+        tool = "Rotate"
+    elif studio.gizmo_mode == GIZMO_MODE_SCALE:
+        tool = "Scale"
+    elif studio.gizmo_mode == GIZMO_MODE_SELECT:
+        tool = "Select"
+    var mid = mode + "   |   " + String(studio.selected_count()) + " selected   |   " + tool
+    mid += " (" + ("Local" if studio.gizmo_local_space else "World") + ")"
+    if studio.snap_enabled:
+        mid += "   |   Snap " + String(studio.grid_snap_m) + " m"
+    var x = Float32(10.0)
+    studio.ui_ctx._draw_text(left, x, ty, fs, th.text_primary if studio.dirty else th.text_secondary)
+    x += studio.ui_ctx._measure_text(left, fs) + Float32(24.0)
+    studio.ui_ctx._draw_text(mid, x, ty, fs, th.text_secondary)
+    x += studio.ui_ctx._measure_text(mid, fs) + Float32(24.0)
+    var last = String("Console (F1 for shortcuts)")
+    var last_col = th.text_muted
+    if len(studio.console_log) > 0:
+        last = studio.console_log[len(studio.console_log) - 1]
+        if last.startswith("[error]"):
+            last_col = th.status_danger
+        elif last.startswith("[warn]"):
+            last_col = th.status_warn
+    var lw = studio.ui_ctx._measure_text(last, fs)
+    var lx = max(x, sw - lw - Float32(12.0))
+    studio.ui_ctx._draw_text(last, lx, ty, fs, last_col)
+    var blocked = studio.ui_ctx.modal_depth > 0 or studio.ui_ctx.had_modal_prev_frame or studio.confirm_modal_open
+    if (
+        not blocked
+        and studio.ui_ctx.mouse_pressed_l
+        and studio.ui_ctx.mouse_y >= y
+        and studio.ui_ctx.mouse_x >= lx - Float32(6.0)
+    ):
+        studio.console_open = True
+
+
+def _emit_studio_modals(mut studio: FlintStudioState):
+    """File (Open / Save As), Console, Keyboard shortcuts and first-run Welcome dialogs."""
+    if studio.file_modal_open and not studio.confirm_modal_open:
+        var title = String("Save Scene As") if studio.file_modal_save_as else String("Open Scene")
+        if studio.ui_ctx.begin_modal("file_modal", title, Float32(520.0), Float32(330.0), studio.file_modal_open):
+            studio.ui_ctx.label("Scene path (relative to the project, or absolute):", studio.studio_theme.text_secondary)
+            var path_buf = studio.file_modal_path
+            _ = studio.ui_ctx.text_input("file_modal_path", path_buf, Float32(488.0), "scenes/level.flscnb")
+            studio.file_modal_path = path_buf
+            if len(studio.recent_scenes) > 0:
+                studio.ui_ctx.label("Recent:", studio.studio_theme.text_muted)
+                var pick = -1
+                for i in range(min(6, len(studio.recent_scenes))):
+                    if studio.ui_ctx.button("recent_" + String(i), studio.recent_scenes[i], 488.0, 22.0):
+                        pick = i
+                if pick >= 0:
+                    studio.file_modal_path = studio.recent_scenes[pick]
+            studio.ui_ctx.begin_box("file_modal_btns", FlexStyle.row(gap=8.0, pad=2.0))
+            var go = studio.ui_ctx.button("file_modal_ok", "Save" if studio.file_modal_save_as else "Open", 96.0, 26.0)
+            if go or studio.ui_ctx.key_enter_pressed:
+                _ = studio.submit_file_modal()
+            if studio.ui_ctx.button("file_modal_cancel", "Cancel", 86.0, 26.0):
+                studio.file_modal_open = False
+            studio.ui_ctx.end_box()
+            studio.ui_ctx.end_modal()
+
+    if studio.console_open:
+        if studio.ui_ctx.begin_modal("console_modal", "Console", Float32(640.0), Float32(380.0), studio.console_open):
+            var n = len(studio.console_log)
+            var row_h = studio.ui_ctx.theme.row_height
+            studio.ui_ctx.begin_scroll_view("console_scroll", Float32(608.0), Float32(280.0), row_h * Float32(max(1, n)))
+            if n == 0:
+                studio.ui_ctx.label("No messages yet.", studio.studio_theme.text_muted)
+            var i = n - 1
+            while i >= 0:  # newest first
+                var line = studio.console_log[i]
+                var col = studio.studio_theme.text_primary
+                if line.startswith("[error]"):
+                    col = studio.studio_theme.status_danger
+                elif line.startswith("[warn]"):
+                    col = studio.studio_theme.status_warn
+                studio.ui_ctx.label(line, col)
+                i -= 1
+            studio.ui_ctx.end_scroll_view()
+            studio.ui_ctx.begin_box("console_btns", FlexStyle.row(gap=8.0, pad=2.0))
+            if studio.ui_ctx.button("console_clear", "Clear", 86.0, 26.0):
+                studio.console_log.clear()
+            if studio.ui_ctx.button("console_close", "Close", 86.0, 26.0):
+                studio.console_open = False
+            studio.ui_ctx.end_box()
+            studio.ui_ctx.end_modal()
+
+    if studio.help_open or studio.welcome_open:
+        var welcome = studio.welcome_open and not studio.help_open
+        var open_flag = True
+        var title = String("Welcome to Flint Studio") if welcome else String("Keyboard Shortcuts")
+        if studio.ui_ctx.begin_modal("help_modal", title, Float32(560.0), Float32(470.0), open_flag):
+            var mc = studio.studio_theme.text_muted
+            if welcome:
+                studio.ui_ctx.label("Build a scene, press F5 to play it, Shift+F5 to stop.")
+                studio.ui_ctx.label("Ctrl+K opens the command palette: every command is there.", mc)
+            var lines = List[String]()
+            lines.append("Q / W / E / R      Select / Move / Rotate / Scale tool")
+            lines.append("X                  Local / World gizmo space")
+            lines.append("G                  Grid snap on/off")
+            lines.append("F                  Frame selection")
+            lines.append("Esc / right-click  Cancel a gizmo drag")
+            lines.append("Click / drag       Select / marquee select (Shift or Ctrl adds)")
+            lines.append("Arrows             Nudge selection; walk the Hierarchy when hovered")
+            lines.append("Wheel / MMB drag   Dolly / pan     Alt+LMB orbit     RMB+WASDQE fly")
+            lines.append("Ctrl+Z / Ctrl+Y    Undo / Redo")
+            lines.append("Ctrl+D  Ctrl+C  Ctrl+V  Del   Duplicate  Copy  Paste  Delete")
+            lines.append("Ctrl+A / F2        Select all / Rename")
+            lines.append("Ctrl+S  Ctrl+Shift+S  Ctrl+O  Ctrl+Shift+O  Ctrl+N   Save / Save As / Load / Open / New")
+            lines.append("F5 / F6 / F7 / Shift+F5   Play / Pause / Step / Stop")
+            lines.append("Ctrl+B             Reload gameplay .so")
+            lines.append("Ctrl+K             Command palette        F1  This list")
+            for i in range(len(lines)):
+                studio.ui_ctx.label(lines[i], mc if (welcome and i > 6) else studio.studio_theme.text_secondary)
+            if studio.ui_ctx.button("help_close", "Got it" if welcome else "Close", 96.0, 26.0):
+                open_flag = False
+            studio.ui_ctx.end_modal()
+        if not open_flag:
+            if welcome:
+                studio.dismiss_welcome()
+            studio.help_open = False
+            studio.welcome_open = False
+
+
 def emit_studio_ui_draw_list(
     mut ui: UiDrawList,
     mut studio: FlintStudioState,
@@ -9537,7 +10563,7 @@ def emit_studio_ui_draw_list(
         Float32(0.0),
         STUDIO_HEADER_BAR_H,
         sw,
-        max(Float32(64.0), sh - STUDIO_HEADER_BAR_H),
+        max(Float32(64.0), sh - STUDIO_HEADER_BAR_H - STUDIO_STATUS_BAR_H),
     )
     studio.ui_ctx.update_dock_space(studio.dock, dock_rect)
 
@@ -9553,7 +10579,7 @@ def emit_studio_ui_draw_list(
     # 2. 3D Viewport Active Selection Gizmo + Visual Agent Theatre HUD + Floating ViewportHud
     var show_edit_gizmo = (studio.pie.mode != PIE_PLAYING) or studio.pie_camera_ejected
     var giz_piv = studio.selection_gizmo_pivot()
-    if show_edit_gizmo and giz_piv[0]:
+    if show_edit_gizmo and giz_piv[0] and studio.gizmo_mode != GIZMO_MODE_SELECT:
         # `ui` is in physical pixels (only `ui_ctx.draw_list` is scaled later), so emit the gizmo
         # in physical space with a scaled target size; `main.mojo` picks with the same numbers.
         var gvx = vp.x * ui_sc
@@ -9578,6 +10604,17 @@ def emit_studio_ui_draw_list(
             target_px=GIZMO_TARGET_PX * ui_sc,
             gizmo_rot=studio.selection_gizmo_rotation(),
         )
+        ui.pop_clip()
+
+    # Marquee selection rectangle (physical pixels, clipped to the scene panel).
+    if studio.marquee_active:
+        var mq_x = min(studio.marquee_x0, studio.marquee_x1)
+        var mq_y = min(studio.marquee_y0, studio.marquee_y1)
+        var mq_w = abs(studio.marquee_x1 - studio.marquee_x0)
+        var mq_h = abs(studio.marquee_y1 - studio.marquee_y0)
+        var pclip = studio.viewport_xf.panel_phys()
+        ui.push_clip(Int(pclip.x), Int(pclip.y), Int(pclip.x + pclip.w), Int(pclip.y + pclip.h))
+        ui.add_rect(mq_x, mq_y, mq_w, mq_h, UInt32(0x22428BF5), Float32(0.0), Float32(1.5), UInt32(0xCC428BF5))
         ui.pop_clip()
 
     # Visual Agent Theatre 2D Viewport Overlays (presence pills, Bezier flow beams, PRIM_ARC reticles, inline [✓]/[✗])
@@ -9633,7 +10670,11 @@ def emit_studio_ui_draw_list(
     var vhud_tool = (
         VHUD_TOOL_ROTATE
         if studio.gizmo_mode == GIZMO_MODE_ROTATE
-        else (VHUD_TOOL_SCALE if studio.gizmo_mode == GIZMO_MODE_SCALE else VHUD_TOOL_MOVE)
+        else (
+            VHUD_TOOL_SCALE
+            if studio.gizmo_mode == GIZMO_MODE_SCALE
+            else (VHUD_TOOL_SELECT if studio.gizmo_mode == GIZMO_MODE_SELECT else VHUD_TOOL_MOVE)
+        )
     )
     var vhud_act = studio.viewport_hud.draw(
         studio.ui_ctx.draw_list,
@@ -9665,6 +10706,7 @@ def emit_studio_ui_draw_list(
     )
     if vhud_act.kind == VHUD_ACT_TOOL_SELECT:
         studio.active_gizmo_handle = GIZMO_AXIS_NONE
+        studio.gizmo_mode = GIZMO_MODE_SELECT
     elif vhud_act.kind == VHUD_ACT_TOOL_MOVE:
         studio.gizmo_mode = GIZMO_MODE_TRANSLATE
     elif vhud_act.kind == VHUD_ACT_TOOL_ROTATE:
@@ -9703,7 +10745,7 @@ def emit_studio_ui_draw_list(
     elif vhud_act.kind == VHUD_ACT_SNAP_VIEW:
         studio._snap_camera_direction(vhud_act.snap_dir)
     elif vhud_act.kind == VHUD_ACT_TOGGLE_ORTHO:
-        studio.cam_ortho = not studio.cam_ortho
+        studio.toggle_ortho_camera()
 
     # Optional Gameplay HUD overlay (`WORKSPACE_PLAY` / `--gallery 06_play_hud`) inside SceneViewport below header & transform HUD
     if studio.gallery_play_hud_active and vp.w >= Float32(180.0) and vp.h >= Float32(130.0):
@@ -9770,7 +10812,9 @@ def emit_studio_ui_draw_list(
     # 3. Left Scene Hierarchy Outliner (`DockSpace` -> `"Hierarchy"`, Obsidian v2 Outliner + Agent Badges)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Hierarchy"):
         var h_info = studio.dock.find_panel("Hierarchy")
-        var rows = studio.hierarchy_visible_rows()
+        # Search covers collapsed branches, and range-select (Shift+click) walks the filtered rows the
+        # user sees, not the whole tree.
+        var rows = studio.hierarchy_rows_for_query(studio.outliner_state.search_query)
         var disp_order = List[Int](capacity=len(rows))
         var out_rows = List[OutlinerRowView](capacity=len(rows))
         for ri in range(len(rows)):
@@ -9787,7 +10831,7 @@ def emit_studio_ui_draw_list(
             v_row.is_selected = studio.is_selected(eid)
             v_row.is_primary = studio.selected_entity_id == eid
             v_row.visible = studio.entities[eid].visible if eid < len(studio.entities) else True
-            v_row.locked = studio.entity_locked.get(eid, False)
+            v_row.locked = studio.is_entity_locked(eid)
             out_rows.append(v_row^)
 
         var sel_has_parent = False
@@ -9820,12 +10864,11 @@ def emit_studio_ui_draw_list(
         if out_act.toggle_visible_entity_id >= 0 and studio.is_alive_id(out_act.toggle_visible_entity_id):
             var vid = out_act.toggle_visible_entity_id
             var vc = studio.entities[vid].copy()
-            vc.visible = not vc.visible
-            vc.enabled = vc.visible
+            vc.visible = not vc.visible  # editor visibility only: it no longer disables gameplay logic
             _ = studio.commit_node_edit(vid, vc^, "Toggle Visibility")
         if out_act.toggle_lock_entity_id >= 0:
             var lid = out_act.toggle_lock_entity_id
-            studio.entity_locked[lid] = not studio.entity_locked.get(lid, False)
+            _ = studio.set_entity_locked(lid, not studio.is_entity_locked(lid))
         if out_act.select_entity_id >= 0:
             studio.select_entity(
                 out_act.select_entity_id,
@@ -9926,6 +10969,9 @@ def emit_studio_ui_draw_list(
                 else ("Stylized VFX" if cur.shading_mode == SHADING_STYLIZED_VFX else "PBR")
             )
             var name_w = max(Float32(140.0), panel_w - Float32(24.0))
+            if studio.rename_focus_requested:
+                studio.rename_focus_requested = False
+                studio.ui_ctx.focused_id = studio.ui_ctx.widget_id("insp_name")
             if studio.ui_ctx.text_input("insp_name", cur.name, name_w, "Entity Name"):
                 changed = True
             if studio.ui_ctx.toggle_switch("ent_enabled", "Enabled (#" + String(eid) + ")", cur.enabled, w=name_w):
@@ -10125,6 +11171,7 @@ def emit_studio_ui_draw_list(
                             if studio.flmat_pending_path == mat_disk:
                                 flm = studio.flmat_pending.copy()
                                 flm_loaded = True
+                                studio.flmat_pending_touch_sec = studio.ui_time_sec
                             else:
                                 try:
                                     flm = load_flmat_file(mat_disk)
@@ -10197,10 +11244,14 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.focused_id == studio.ui_ctx.widget_id(tex_field_ids[fi]):
                                         tex_field_focused = True
                                 if flm_text_dirty or (flm_dirty and studio.flmat_pending_path == mat_disk):
+                                    if studio.flmat_pending_path != mat_disk:
+                                        studio.flmat_pending_stamp = file_stamp(mat_disk)
                                     studio.flmat_pending = flm.copy()
                                     studio.flmat_pending_path = mat_disk
                                     studio.flmat_pending_eid = eid
+                                    studio.flmat_pending_editor_id = studio.editor_id_of(eid)
                                     studio.flmat_pending_ref = act_mat_ref.rel_path
+                                    studio.flmat_pending_touch_sec = studio.ui_time_sec
                                 if flm_dirty or (studio.flmat_pending_path == mat_disk and not tex_field_focused):
                                     if studio.flmat_pending_path == mat_disk:
                                         _ = studio.commit_pending_flmat_edit()
@@ -11219,6 +12270,10 @@ def emit_studio_ui_draw_list(
     )
     if pal_res.executed:
         _ = studio.execute_palette_action(pal_res)
+
+    _emit_play_banner(studio, vp)
+    _emit_status_bar(studio, sw, sh)
+    _emit_studio_modals(studio)
 
     # Unsaved changes confirmation modal (`Ctrl+Q`, window close, or `File -> New scene`)
     if studio.confirm_modal_open:

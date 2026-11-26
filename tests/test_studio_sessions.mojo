@@ -21,6 +21,13 @@ from flint.studio import FlintStudioState
 from flint.studio.agent_bus import AgentStep
 
 
+def _run_dir(tag: String) -> String:
+    """Per-run scratch folder, so parallel or repeated runs never share files."""
+    var d = "build/test_studio_sessions_" + String(Int(external_call["getpid", Int32]())) + "/" + tag
+    _ = make_dirs(d)
+    return d
+
+
 def _init(mut mcp: McpServerV2, mut studio: FlintStudioState, mut assets: AssetServer, mut pool: JobPool, name: String):
     _ = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"'
@@ -82,7 +89,7 @@ def test_each_client_gets_its_own_agent() raises:
 def test_scene_load_is_undoable() raises:
     var studio = FlintStudioState()
     _ = studio.spawn_entity("Saved")
-    var path = "/tmp/flint_test_phase3_load_undo.flscn"
+    var path = _run_dir("load_undo") + "/scene.flscn"
     assert_true(studio.save_scene_file(path))
     _ = studio.spawn_entity("Unsaved")
     var before = studio.live_entity_count()
@@ -183,14 +190,15 @@ def test_revert_never_wipes_later_user_edits() raises:
 
 def test_autosave_keeps_user_file_and_dirty_flag() raises:
     var studio = FlintStudioState()
-    studio.project_root = "build/phase7_autosave_proj"
+    var proj = _run_dir("autosave")
+    studio.project_root = proj
     studio.scene_file_path = "scenes/level_one.flscn"
     _ = studio.spawn_entity("Unsaved work")
     studio.mark_dirty(True)
     studio.autosave_interval_sec = Float32(1.0)
     assert_true(not studio.tick_autosave(Float32(0.5)))
     assert_true(studio.tick_autosave(Float32(0.6)), "autosaves after the interval of dirty time")
-    assert_equal(studio.last_autosave_path, "build/phase7_autosave_proj/.flint/autosave/level_one.autosave.flscnb")
+    assert_equal(studio.last_autosave_path, proj + "/.flint/autosave/level_one.autosave.flscnb")
     assert_true(file_size(studio.last_autosave_path) > 0)
     assert_true(studio.dirty, "an autosave is not a save: the scene stays dirty")
     assert_equal(studio.scene_file_path, "scenes/level_one.flscn", "the user's file path is untouched")

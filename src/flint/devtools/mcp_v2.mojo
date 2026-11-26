@@ -251,6 +251,33 @@ def _resolve_packaged_flpk_name(manifest_path: String) -> String:
     return String("assets.flpk")
 
 
+def _canonical_args_json(args_json: String) -> String:
+    """The arguments as the gate sees them (`json_text` of the parsed object), so a grant or a replay
+    key matches the call however the client or the UI formatted the JSON."""
+    var t = String(args_json.strip())
+    if t.byte_length() == 0:
+        return t^
+    var raw = List[UInt8](capacity=t.byte_length())
+    for b in t.as_bytes():
+        raw.append(b)
+    var doc = parse_json(raw)
+    if not doc.valid or doc.root < 0:
+        return t^
+    return json_text(doc, doc.root)
+
+
+def _is_protected_segment(seg: String) -> Bool:
+    """Hidden path components (`.git`, `.pixi`, `.claude`, `.vscode`, `.mcp.json`, ...) hold version
+    control, toolchains and agent/editor configuration. MCP tools never read or write them; the one
+    exception is Studio's own `.flint` project folder (autosaves)."""
+    return seg.startswith(".") and seg != "." and seg != ".flint"
+
+
+def _abs_path_has_hidden_segment(abs_path: String) -> Bool:
+    """True when an absolute path walks through any hidden directory or names a hidden file."""
+    return abs_path.find("/.") >= 0
+
+
 def _split_and_reject_dotdot(raw_path: String) raises -> List[String]:
     """Splits `raw_path` on `'/'` and raises immediately if any `'..'` segment is present."""
     var segs = List[String]()
@@ -359,6 +386,10 @@ def _sanitize_workspace_rel_and_abs(
 
     if not allow_root_dir and len(rel_segs) == 0:
         raise Error("output path must specify a file inside workspace_root")
+    if canon_root != "/":
+        for si in range(len(rel_segs)):
+            if _is_protected_segment(rel_segs[si]):
+                raise Error("hidden or tool-config path rejected: " + rel_segs[si])
 
     # Walk every prefix under `canon_root` and reject symlinks (`S_ISLNK`) & non-dir parents!
     var root_ls = _lstat_mode_uid(canon_root)
@@ -1089,7 +1120,7 @@ def _mcp_tools_list_json() -> String:
         + '{"name":"assets.list_and_cook","description":"Lists mounted .flpk v3 archives & live AssetServer arenas, and optionally runs incremental parallel cook_workspace inside workspace_root.","inputSchema":{"type":"object","properties":{"source_dir":{"type":"string"},"output_flpk":{"type":"string"},"cache_dir":{"type":"string"},"force_recook":{"type":"boolean"}}}},'
         + '{"name":"procedural.generate_asset","description":"Generates a Procedural Forge asset (material_orb, catmull_torus, colonnade, reference_grid, foliage_sample, oak, bollard) and bakes .glb inside workspace_root.","inputSchema":{"type":"object","required":["preset"],"properties":{"preset":{"type":"string"},"output_glb_path":{"type":"string"},"seed":{"type":"integer"},"spawn_in_scene":{"type":"boolean"},"position":{"type":"array"}}}},'
         + '{"name":"physics.step_deterministic","description":"Advances deterministic IEEE-754 rigid-body physics for N fixed ticks (optional sandboxed output_path checkpoint).","inputSchema":{"type":"object","properties":{"ticks":{"type":"integer"},"dt":{"type":"number"},"output_path":{"type":"string"}}}},'
-        + '{"name":"physics.raycast_query","description":"Casts a 3D analytical ray against scene colliders (Sphere, OBB Box, Capsule, Bvh8MeshCollider).","inputSchema":{"type":"object","required":["origin","direction"],"properties":{"origin":{"type":"array"},"direction":{"type":"array"},"max_distance":{"type":"number"}}}},'
+        + '{"name":"physics.raycast_query","description":"Casts a 3D analytical ray against scene colliders (Sphere, OBB Box, Capsule, Bvh8MeshCollider). Give origin+direction, or screen_u/screen_v (0..1 across the Studio scene viewport, as in a viewport capture) to cast from the editor camera through that point.","inputSchema":{"type":"object","properties":{"origin":{"type":"array"},"direction":{"type":"array"},"screen_u":{"type":"number"},"screen_v":{"type":"number"},"max_distance":{"type":"number"}}}},'
         + '{"name":"studio.pie_control","description":"Controls 1-Click Play-In-Editor (play, pause, step, stop) backed by LZ4 checkpoint restoration.","inputSchema":{"type":"object","required":["action"],"properties":{"action":{"type":"string"},"ticks":{"type":"integer"}}}},'
         + '{"name":"studio.undo_redo","description":"Executes algebraic undo or redo transactions on FlintStudioState.","inputSchema":{"type":"object","required":["action"],"properties":{"action":{"type":"string"},"steps":{"type":"integer"}}}},'
         + '{"name":"render.configure_npr_cel","description":"Configures PBR / NPR Cel / Stylized VFX shading, outlines, rim/SSS/hair-halo, UV-scroll erosion, stepped anime Hz, and volume-preserving smear stretch on an entity with reversible Undo/Redo recording.","inputSchema":{"type":"object","required":["entity_id"],"properties":{"entity_id":{"type":"integer"},"shading_mode":{"type":"string"},"cel_shadow_tint":{"type":"array"},"cel_outline_width_px":{"type":"number"},"cel_outline_color":{"type":"array"},"cel_rim_color":{"type":"array"},"cel_hair_halo":{"type":"number"},"vfx_erosion":{"type":"number"},"vfx_scroll_speed":{"type":"number"},"vfx_core_color":{"type":"array"},"vfx_edge_color":{"type":"array"},"anim_step_hz":{"type":"number"},"smear_stretch":{"type":"number"},"coalesce_key":{"type":"integer"}}}},'
@@ -1196,6 +1227,11 @@ def _render_studio_software_preview(studio: FlintStudioState, width: Int, height
 # ============================================================================
 
 comptime MCP_ASYNC_BUILD_TIMEOUT_SEC: Float64 = 600.0
+comptime MCP_MAX_PENDING_BUILDS: Int = 4
+comptime MCP_MAX_FINISHED_BUILDS: Int = 32
+comptime MCP_APPROVED_REPLAY_TTL_SEC: Float64 = 120.0
+comptime MCP_ONCE_GRANT_TTL_SEC: Float64 = 120.0
+comptime MCP_MAX_CAPTURE_DIM: Int = 4096
 comptime MCP_GATE_AUTO: Int = 0       # All MCP tool calls execute immediately
 comptime MCP_GATE_MUTATING: Int = 1   # Mutating tools require explicit approval
 comptime MCP_GATE_ALL: Int = 2        # All tool calls require explicit approval
@@ -1216,6 +1252,8 @@ struct McpToolEvent(Copyable, Movable):
     var client_key: Int
     """MCP connection that made the call (0 = in-process / stdio)."""
     var client_name: String
+    var replay_step_id: UInt64
+    """Non-zero when Studio re-ran this call after the user approved it: the agent step it completes."""
 
     def __init__(
         out self,
@@ -1239,6 +1277,20 @@ struct McpToolEvent(Copyable, Movable):
         self.blocked_by_gate = blocked_by_gate
         self.client_key = 0
         self.client_name = String("")
+        self.replay_step_id = 0
+
+
+def _capture_writes_outside_scratch(doc: JsonDocument, args_node: Int) -> Bool:
+    """A viewport capture into `build/` or `captures/` is a read-only look at the scene; one that
+    writes anywhere else can overwrite project files, so the gate treats it as an edit."""
+    var p = String("build/mcp_capture.png")
+    if args_node >= 0:
+        p = doc.text(doc.object_get(args_node, "output_path"), p)
+    var q = p
+    while q.startswith("./"):
+        var nq = String(q[byte=2 : q.byte_length()])
+        q = nq^
+    return not (q.startswith("build/") or q.startswith("captures/"))
 
 
 def mcp_tool_is_mutating(tool_name: String) -> Bool:
@@ -1304,6 +1356,8 @@ struct McpClientSession(Copyable, Movable):
     var gate_mode: Int
     var once_allow_tools: List[String]
     var session_allow_tools: List[String]
+    var trigger_event_cursor: Int
+    """Each client reads `physics.trigger_events` from its own cursor, so one agent never eats another's."""
 
     def __init__(out self, client_key: Int, gate_mode: Int):
         self.client_key = client_key
@@ -1312,6 +1366,7 @@ struct McpClientSession(Copyable, Movable):
         self.gate_mode = gate_mode
         self.once_allow_tools = List[String]()
         self.session_allow_tools = List[String]()
+        self.trigger_event_cursor = 0
 
 
 struct McpServerV2(Movable):
@@ -1338,8 +1393,25 @@ struct McpServerV2(Movable):
     var pending_build_rel_so: List[String]
     var pending_build_abs_so: List[String]
     var pending_build_deadline: List[Float64]
+    var pending_build_owner: List[Int]
     var finished_build_results: Dict[Int, String]
     var finished_build_failed: Dict[Int, Bool]
+    var finished_build_owner: Dict[Int, Int]
+    var finished_build_order: List[Int]
+    """Oldest-first ids of remembered results; only the last `MCP_MAX_FINISHED_BUILDS` are kept."""
+    var client_peer_pids: Dict[Int, Int]
+    """`SO_PEERCRED` pid of each socket connection (used to recognise Studio's own ACP agent)."""
+    var dropped_client_keys: List[Int]
+    """Connections closed since the host last called `take_dropped_clients`."""
+    var approved_replay_keys: List[String]
+    var approved_replay_results: List[String]
+    var approved_replay_at: List[Float64]
+    """Results of calls Studio re-ran after the user approved them, so the agent's identical retry
+    gets the result instead of running the call a second time."""
+    var _gate_bypass: Bool
+    var _replay_step_id: UInt64
+    var _last_outcome_json: String
+    var _last_outcome_failed: Bool
     var client_sessions: List[McpClientSession]
     """Stored state of every client except the active one, whose state lives in the fields above."""
     var active_client_key: Int
@@ -1368,8 +1440,20 @@ struct McpServerV2(Movable):
         self.pending_build_rel_so = List[String]()
         self.pending_build_abs_so = List[String]()
         self.pending_build_deadline = List[Float64]()
+        self.pending_build_owner = List[Int]()
         self.finished_build_results = Dict[Int, String]()
         self.finished_build_failed = Dict[Int, Bool]()
+        self.finished_build_owner = Dict[Int, Int]()
+        self.finished_build_order = List[Int]()
+        self.client_peer_pids = Dict[Int, Int]()
+        self.dropped_client_keys = List[Int]()
+        self.approved_replay_keys = List[String]()
+        self.approved_replay_results = List[String]()
+        self.approved_replay_at = List[Float64]()
+        self._gate_bypass = False
+        self._replay_step_id = 0
+        self._last_outcome_json = String()
+        self._last_outcome_failed = False
         self.client_sessions = List[McpClientSession]()
         self.active_client_key = 0
         self.default_gate_mode = MCP_GATE_AUTO
@@ -1395,6 +1479,7 @@ struct McpServerV2(Movable):
         var cur = McpClientSession(self.active_client_key, self.gate_mode)
         cur.client_name = self.client_name
         cur.initialized = self.initialized
+        cur.trigger_event_cursor = self.trigger_event_cursor
         swap(cur.once_allow_tools, self.once_allow_tools)
         swap(cur.session_allow_tools, self.session_allow_tools)
         var si = self._find_stored(key)
@@ -1404,6 +1489,7 @@ struct McpServerV2(Movable):
         self.client_name = nxt.client_name
         self.initialized = nxt.initialized
         self.gate_mode = nxt.gate_mode
+        self.trigger_event_cursor = nxt.trigger_event_cursor
         swap(self.once_allow_tools, nxt.once_allow_tools)
         swap(self.session_allow_tools, nxt.session_allow_tools)
 
@@ -1416,6 +1502,174 @@ struct McpServerV2(Movable):
         var si = self._find_stored(key)
         if si >= 0:
             _ = self.client_sessions.pop(si)
+        try:
+            if key in self.client_peer_pids:
+                _ = self.client_peer_pids.pop(key)
+        except:
+            pass
+        # Its approved-call results and in-flight builds die with it.
+        var prefix = String(key) + "\x1f"
+        var ri = len(self.approved_replay_keys) - 1
+        while ri >= 0:
+            if self.approved_replay_keys[ri].startswith(prefix):
+                _ = self.approved_replay_keys.pop(ri)
+                _ = self.approved_replay_results.pop(ri)
+                _ = self.approved_replay_at.pop(ri)
+            ri -= 1
+        var bi = len(self.pending_build_ids) - 1
+        while bi >= 0:
+            if self.pending_build_owner[bi] == key:
+                _ = self.build_jobs.cancel(self.pending_build_ids[bi])
+                _ = self.pending_build_ids.pop(bi)
+                _ = self.pending_build_rel_so.pop(bi)
+                _ = self.pending_build_abs_so.pop(bi)
+                _ = self.pending_build_deadline.pop(bi)
+                _ = self.pending_build_owner.pop(bi)
+            bi -= 1
+        self.dropped_client_keys.append(key)
+
+    def take_dropped_clients(mut self) -> List[Int]:
+        """Connection keys closed since the last call, so the host can release their agent sessions."""
+        var out = List[Int]()
+        swap(out, self.dropped_client_keys)
+        return out^
+
+    def set_client_peer_pid(mut self, key: Int, pid: Int):
+        self.client_peer_pids[key] = pid
+
+    def peer_pid_of(self, key: Int) -> Int:
+        return self.client_peer_pids.get(key, -1)
+
+    def _remember_build_result(mut self, bid: Int, failed: Bool, res: String):
+        self.finished_build_results[bid] = res
+        self.finished_build_failed[bid] = failed
+        self.finished_build_owner[bid] = self.active_client_key
+        self.finished_build_order.append(bid)
+        while len(self.finished_build_order) > MCP_MAX_FINISHED_BUILDS:
+            var old = self.finished_build_order.pop(0)
+            try:
+                if old in self.finished_build_results:
+                    _ = self.finished_build_results.pop(old)
+                if old in self.finished_build_failed:
+                    _ = self.finished_build_failed.pop(old)
+                if old in self.finished_build_owner:
+                    _ = self.finished_build_owner.pop(old)
+            except:
+                pass
+
+    def tick_builds(mut self):
+        """Called once per editor frame: drains build pipes (a chatty compiler can never stall on a
+        full pipe while nobody polls) and cancels builds past their deadline."""
+        if len(self.pending_build_ids) == 0:
+            return
+        _ = self.build_jobs.poll_all()
+        var now = get_time()
+        for k in range(len(self.pending_build_ids)):
+            if now > self.pending_build_deadline[k]:
+                var bj = self.build_jobs.find_index(self.pending_build_ids[k])
+                if bj >= 0 and self.build_jobs.jobs[bj].is_running():
+                    _ = self.build_jobs.cancel(self.pending_build_ids[k])
+
+    @staticmethod
+    def call_fingerprint(client_key: Int, tool_name: String, args_json: String) -> String:
+        """Identity of one exact call by one client: approvals are bound to it, never to the tool name."""
+        return String(client_key) + "\x1f" + tool_name + "\x1f" + _canonical_args_json(args_json)
+
+    def _take_replayed_result(mut self, fp: String) -> Tuple[Bool, String]:
+        var now = get_time()
+        var i = len(self.approved_replay_keys) - 1
+        while i >= 0:
+            if now - self.approved_replay_at[i] > MCP_APPROVED_REPLAY_TTL_SEC:
+                _ = self.approved_replay_keys.pop(i)
+                _ = self.approved_replay_results.pop(i)
+                _ = self.approved_replay_at.pop(i)
+            i -= 1
+        for k in range(len(self.approved_replay_keys)):
+            if self.approved_replay_keys[k] == fp:
+                var res = self.approved_replay_results[k]
+                _ = self.approved_replay_keys.pop(k)
+                _ = self.approved_replay_results.pop(k)
+                _ = self.approved_replay_at.pop(k)
+                return (True, res^)
+        return (False, String(""))
+
+    def replay_approved_call(
+        mut self,
+        client_key: Int,
+        tool_name: String,
+        args_json: String,
+        step_id: UInt64,
+        target_editor_id: UInt64,
+        mut studio: FlintStudioState,
+        mut assets: AssetServer,
+        mut pool: JobPool,
+    ) -> String:
+        return self._replay_approved(client_key, tool_name, args_json, step_id, target_editor_id, studio, assets, pool, False, 0)
+
+    def replay_approved_call_with_renderer(
+        mut self,
+        client_key: Int,
+        tool_name: String,
+        args_json: String,
+        step_id: UInt64,
+        target_editor_id: UInt64,
+        mut studio: FlintStudioState,
+        mut assets: AssetServer,
+        mut pool: JobPool,
+        mut ren: FlintAaaVulkanRenderer,
+    ) -> String:
+        return self._replay_approved(
+            client_key, tool_name, args_json, step_id, target_editor_id, studio, assets, pool, True, Int(Pointer(to=ren))
+        )
+
+    def _replay_approved(
+        mut self,
+        client_key: Int,
+        tool_name: String,
+        args_json: String,
+        step_id: UInt64,
+        target_editor_id: UInt64,
+        mut studio: FlintStudioState,
+        mut assets: AssetServer,
+        mut pool: JobPool,
+        has_renderer: Bool,
+        ren_ptr: Int,
+    ) -> String:
+        """Runs a call the user approved in the Agents panel exactly as the agent sent it, attributed to
+        that agent, and remembers the result so the agent's identical retry does not run it twice.
+        `target_editor_id` re-targets the call at the entity the user saw, even if its slot moved."""
+        var prev_key = self.active_client_key
+        var prev_auth = self.session_authenticated
+        self.select_client(client_key)
+        self.session_authenticated = True
+        var call_args = String(args_json.strip())
+        if call_args.byte_length() < 2 or not call_args.startswith("{"):
+            call_args = String("{}")
+        if target_editor_id != 0:
+            var ab = call_args.as_bytes()
+            var body = String(unsafe_from_utf8=ab[1 : len(ab) - 1])
+            var sep = "," if body.strip().byte_length() > 0 else ""
+            call_args = '{"editor_id":' + String(target_editor_id) + sep + body + "}"
+        var req = (
+            '{"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":'
+            + json_quote(tool_name) + ',"arguments":' + call_args + "}}"
+        )
+        var raw = List[UInt8](capacity=req.byte_length())
+        for b in req.as_bytes():
+            raw.append(b)
+        self._gate_bypass = True
+        self._replay_step_id = step_id
+        self._last_outcome_json = String("")
+        var resp = self._handle_request_bytes(raw, studio, assets, pool, has_renderer, ren_ptr)
+        self._gate_bypass = False
+        self._replay_step_id = 0
+        if self._last_outcome_json.byte_length() > 0:
+            self.approved_replay_keys.append(Self.call_fingerprint(client_key, tool_name, args_json))
+            self.approved_replay_results.append(self._last_outcome_json)
+            self.approved_replay_at.append(get_time())
+        self.select_client(prev_key)
+        self.session_authenticated = prev_auth
+        return resp^
 
     def client_keys(self) -> List[Int]:
         var out = List[Int]()
@@ -1445,15 +1699,22 @@ struct McpServerV2(Movable):
         if si >= 0:
             self.client_sessions[si].gate_mode = m
 
-    def allow_tool_once_for_client(mut self, key: Int, tool_name: String):
+    def allow_tool_once_for_client(mut self, key: Int, tool_name: String, args_json: String = ""):
+        """One-shot grant for `key`. With `args_json` it only lets that exact call through; it always
+        expires after `MCP_ONCE_GRANT_TTL_SEC`, so a forgotten grant cannot wave a later call through."""
         if tool_name.byte_length() == 0:
             return
+        var grant = Self._grant_token(tool_name, args_json, get_time())
         if key == self.active_client_key:
-            self.once_allow_tools.append(tool_name)
+            self.once_allow_tools.append(grant)
             return
         var si = self._find_stored(key)
         if si >= 0:
-            self.client_sessions[si].once_allow_tools.append(tool_name)
+            self.client_sessions[si].once_allow_tools.append(grant)
+
+    @staticmethod
+    def _grant_token(tool_name: String, args_json: String, now: Float64) -> String:
+        return String(Int(now)) + "\x1e" + tool_name + "\x1f" + _canonical_args_json(args_json)
 
     def set_gate_mode(mut self, mode: Int):
         """Sets the gate for every client (and for clients that connect later)."""
@@ -1463,9 +1724,9 @@ struct McpServerV2(Movable):
         for i in range(len(self.client_sessions)):
             self.client_sessions[i].gate_mode = m
 
-    def allow_tool_once(mut self, tool_name: String):
+    def allow_tool_once(mut self, tool_name: String, args_json: String = ""):
         if tool_name.byte_length() > 0:
-            self.once_allow_tools.append(tool_name)
+            self.once_allow_tools.append(Self._grant_token(tool_name, args_json, get_time()))
 
     def allow_tool_session(mut self, tool_name: String):
         if tool_name.byte_length() > 0 and tool_name not in self.session_allow_tools:
@@ -1475,17 +1736,41 @@ struct McpServerV2(Movable):
         self.once_allow_tools.clear()
         self.session_allow_tools.clear()
 
-    def _consume_gate_allowance(mut self, tool_name: String, is_mutating: Bool) -> Bool:
+    def _consume_gate_allowance(mut self, tool_name: String, is_mutating: Bool, args_json: String = "") -> Bool:
+        if self._gate_bypass:
+            return True
         if self.gate_mode == MCP_GATE_AUTO:
             return True
         if self.gate_mode == MCP_GATE_MUTATING and not is_mutating:
             return True
         if tool_name in self.session_allow_tools:
             return True
-        for i in range(len(self.once_allow_tools)):
-            if self.once_allow_tools[i] == tool_name:
+        var now = get_time()
+        var want_args = _canonical_args_json(args_json)
+        var i = len(self.once_allow_tools) - 1
+        while i >= 0:
+            var g = self.once_allow_tools[i]
+            var sep_t = g.find("\x1e")
+            var sep_a = g.find("\x1f")
+            if sep_t < 0 or sep_a < sep_t:
+                _ = self.once_allow_tools.pop(i)  # malformed
+                i -= 1
+                continue
+            var issued: Float64
+            try:
+                issued = Float64(atol(String(g[byte=0:sep_t])))
+            except:
+                issued = Float64(0.0)
+            if now - issued > MCP_ONCE_GRANT_TTL_SEC:
+                _ = self.once_allow_tools.pop(i)
+                i -= 1
+                continue
+            var g_tool = String(g[byte = sep_t + 1 : sep_a])
+            var g_args = String(g[byte = sep_a + 1 : g.byte_length()])
+            if g_tool == tool_name and (g_args.byte_length() == 0 or g_args == want_args):
                 _ = self.once_allow_tools.pop(i)
                 return True
+            i -= 1
         return False
 
     def _record_tool_event(mut self, var ev: McpToolEvent):
@@ -1809,9 +2094,11 @@ struct McpServerV2(Movable):
         if tool_name == "render.capture_viewport":
             var raw_out_path = doc.text(doc.object_get(args_node, "output_path"), "build/mcp_capture.png")
             var raw_ref_path = doc.text(doc.object_get(args_node, "reference_path"), "")
-            var req_w = max(64, min(8192, doc.integer(doc.object_get(args_node, "width"), 320)))
-            var req_h = max(64, min(8192, doc.integer(doc.object_get(args_node, "height"), 180)))
+            var req_w = max(64, min(MCP_MAX_CAPTURE_DIM, doc.integer(doc.object_get(args_node, "width"), 320)))
+            var req_h = max(64, min(MCP_MAX_CAPTURE_DIM, doc.integer(doc.object_get(args_node, "height"), 180)))
 
+            if not FlintStudioState._ascii_lower(raw_out_path).endswith(".png"):
+                return (True, '{"ok":false,"error":"output_path must be a .png file"}')
             var out_path: String
             try:
                 out_path = sanitize_output_path(self.workspace_root, raw_out_path)
@@ -2092,6 +2379,22 @@ struct McpServerV2(Movable):
         if tool_name == "physics.raycast_query":
             var o_res = _parse_vec3_arg(doc, doc.object_get(args_node, "origin"), Vec3(0.0, 5.0, 0.0))
             var d_res = _parse_vec3_arg(doc, doc.object_get(args_node, "direction"), Vec3(0.0, -1.0, 0.0))
+            var su_node = doc.object_get(args_node, "screen_u") if args_node >= 0 else -1
+            var sv_node = doc.object_get(args_node, "screen_v") if args_node >= 0 else -1
+            if su_node >= 0 or sv_node >= 0:
+                # Screen-space query: a point in the scene panel (what a capture shows), cast from the
+                # editor camera exactly as a mouse click there would be.
+                var su = _parse_finite_f32_arg(doc, su_node, Float32(0.5))
+                var sv = _parse_finite_f32_arg(doc, sv_node, Float32(0.5))
+                if not (su[0] and sv[0]) or su[1] < 0.0 or su[1] > 1.0 or sv[1] < 0.0 or sv[1] > 1.0:
+                    return (True, '{"ok":false,"error":"screen_u and screen_v must be numbers in 0..1"}')
+                var pnl = studio.viewport_xf.panel_phys()
+                var ray = studio.viewport_xf.ray_phys(
+                    pnl.x + su[1] * pnl.w, pnl.y + sv[1] * pnl.h,
+                    studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
+                )
+                o_res = (True, ray.origin)
+                d_res = (True, ray.dir)
             if not (o_res[0] and d_res[0]):
                 return (True, '{"ok":false,"error":"origin and direction must be [x,y,z]"}')
             var md_res = _parse_finite_f32_arg(doc, doc.object_get(args_node, "max_distance"), Float32(1000.0))
@@ -2156,20 +2459,33 @@ struct McpServerV2(Movable):
             var act = doc.text(doc.object_get(args_node, "action"), "undo")
             var steps = max(1, min(1024, doc.integer(doc.object_get(args_node, "steps"), 1)))
             var applied = 0
+            # A socket agent may only undo / redo its own entries: stepping over the user's (or another
+            # agent's) edits would silently throw their work away. It stops at the first foreign entry.
+            var caller = studio._active_tx_agent_id
+            var own_only = self.active_client_key != 0 and caller > 0
+            var stopped_at_foreign = False
             if act == "undo":
                 for _ in range(steps):
+                    if own_only and len(studio.undo_stack) > 0 and studio.undo_stack[len(studio.undo_stack) - 1].agent_id != caller:
+                        stopped_at_foreign = True
+                        break
                     if studio.undo():
                         applied += 1
                     else:
                         break
             elif act == "redo":
                 for _ in range(steps):
+                    if own_only and len(studio.redo_stack) > 0 and studio.redo_stack[len(studio.redo_stack) - 1].agent_id != caller:
+                        stopped_at_foreign = True
+                        break
                     if studio.redo():
                         applied += 1
                     else:
                         break
             else:
                 return (True, '{"ok":false,"error":"action must be undo or redo"}')
+            if stopped_at_foreign and applied == 0:
+                return (True, '{"ok":false,"error":"the next entry was made by the user or another agent; only your own edits can be undone or redone"}')
             return (
                 False,
                 '{"ok":true,"action":' + json_quote(act)
@@ -2555,7 +2871,7 @@ struct McpServerV2(Movable):
                 if _is_forbidden_abs_src(raw_src):
                     return (True, '{"ok":false,"error":"forbidden system source path rejected"}')
                 abs_src = _normalize_abs_lexical(raw_src)
-                if _is_forbidden_abs_src(abs_src):
+                if _is_forbidden_abs_src(abs_src) or _abs_path_has_hidden_segment(abs_src):
                     return (True, '{"ok":false,"error":"forbidden system source path rejected"}')
                 var lower_src = FlintStudioState._ascii_lower(abs_src)
                 if not _is_supported_asset_ext(lower_src):
@@ -2577,7 +2893,8 @@ struct McpServerV2(Movable):
                 var src_rp = _realpath_existing(abs_src)
                 if not src_rp[0]:
                     return (True, '{"ok":false,"error":"source asset file not found"}')
-                if _is_forbidden_abs_src(_strip_trailing_slashes(src_rp[1])):
+                var real_src = _strip_trailing_slashes(src_rp[1])
+                if _is_forbidden_abs_src(real_src) or _abs_path_has_hidden_segment(real_src):
                     return (True, '{"ok":false,"error":"forbidden system source path rejected"}')
 
             var raw_data = read_bytes(abs_src)
@@ -3223,6 +3540,13 @@ struct McpServerV2(Movable):
                     True,
                     '{"ok":false,"error":' + json_quote("sandbox rejected path: " + String(e)) + "}",
                 )
+            # Only build products are written or loaded: a `.so` under `build/`, compiled from a `.mojo`
+            # source. Anything else would let a tool call overwrite workspace files (or the toolchain)
+            # with compiler output, or `dlopen` an arbitrary library.
+            if not rel_so.startswith("build/") or not rel_so.endswith(".so"):
+                return (True, '{"ok":false,"error":"output_so must be a .so file under build/"}')
+            if not reload_only and not raw_entry.endswith(".mojo"):
+                return (True, '{"ok":false,"error":"entry_path must be a .mojo source file"}')
 
             var opt_level = _first_str_arg(doc, args_node, "opt_level")
             if opt_level.byte_length() == 0:
@@ -3277,14 +3601,18 @@ struct McpServerV2(Movable):
 
                 # Socket clients default to an async build: the UI thread must not stall for a whole
                 # compile. The call returns a `build_id`; `code.build_status` finishes the reload.
+                # A socket client can never ask for a blocking build: `async:false` would freeze the
+                # editor for the whole compile. Only the in-process / stdio client may build inline.
                 var want_async = self.active_client_key != 0
-                if args_node >= 0:
+                if args_node >= 0 and self.active_client_key == 0:
                     var as_node = doc.object_get(args_node, "async")
                     if as_node >= 0:
                         if doc.nodes[as_node].kind != 1:
                             return (True, '{"ok":false,"error":"async must be a boolean"}')
                         want_async = doc.boolean(as_node, want_async)
                 if want_async:
+                    if len(self.pending_build_ids) >= MCP_MAX_PENDING_BUILDS:
+                        return (True, '{"ok":false,"compiled":false,"reloaded":false,"error":"too many builds in flight; poll code.build_status first"}')
                     var ajid = self.build_jobs.start_gameplay_so_build(
                         proj_root, abs_entry, abs_so, inc, compiler=compiler, opt_flag=opt_level, werror=True
                     )
@@ -3294,6 +3622,7 @@ struct McpServerV2(Movable):
                     self.pending_build_rel_so.append(rel_so)
                     self.pending_build_abs_so.append(abs_so)
                     self.pending_build_deadline.append(get_time() + MCP_ASYNC_BUILD_TIMEOUT_SEC)
+                    self.pending_build_owner.append(self.active_client_key)
                     return (
                         False,
                         '{"ok":true,"pending":true,"build_id":' + String(ajid)
@@ -3332,12 +3661,13 @@ struct McpServerV2(Movable):
             if not bid_parsed[0]:
                 return (True, '{"ok":false,"error":"build_id must be an integer"}')
             var bid = bid_parsed[1]
+            # A build belongs to the client that started it: others see it as unknown.
             var done_res = self.finished_build_results.get(bid, String(""))
-            if done_res.byte_length() > 0:
+            if done_res.byte_length() > 0 and self.finished_build_owner.get(bid, -1) == self.active_client_key:
                 return (self.finished_build_failed.get(bid, False), done_res)
             var pi = -1
             for k in range(len(self.pending_build_ids)):
-                if self.pending_build_ids[k] == bid:
+                if self.pending_build_ids[k] == bid and self.pending_build_owner[k] == self.active_client_key:
                     pi = k
             if pi < 0:
                 return (True, '{"ok":false,"error":"unknown build_id","build_id":' + String(bid) + "}")
@@ -3356,6 +3686,7 @@ struct McpServerV2(Movable):
             _ = self.pending_build_rel_so.pop(pi)
             _ = self.pending_build_abs_so.pop(pi)
             _ = self.pending_build_deadline.pop(pi)
+            _ = self.pending_build_owner.pop(pi)
             var res: Tuple[Bool, String]
             if running:
                 _ = self.build_jobs.cancel(bid)
@@ -3368,8 +3699,7 @@ struct McpServerV2(Movable):
                 var b_diags = self.build_jobs.jobs[bj].diagnostics.copy()
                 self.diagnostics_store.replace_source(DIAG_SRC_BUILD, b_diags)
                 res = self._finish_gameplay_build(studio, b_ok, b_ok, b_out, b_diags, rel_so_b, abs_so_b)
-            self.finished_build_results[bid] = res[1]
-            self.finished_build_failed[bid] = res[0]
+            self._remember_build_result(bid, res[0], res[1])
             return res
 
         # 29. code.diagnostics
@@ -3600,11 +3930,21 @@ struct McpServerV2(Movable):
         has_renderer: Bool,
         ren_ptr: Int,
     ) -> String:
-        var mutating = mcp_tool_is_mutating(tname)
+        var mutating = mcp_tool_is_mutating(tname) or (
+            tname == "render.capture_viewport" and _capture_writes_outside_scratch(doc, args_node)
+        )
         var ev_seq = self.next_event_seq
         self.next_event_seq += 1
 
-        if not self._consume_gate_allowance(tname, mutating):
+        # The agent retrying a call the user approved (Studio already ran it): hand back that result.
+        if not self._gate_bypass:
+            var replayed = self._take_replayed_result(Self.call_fingerprint(self.active_client_key, tname, args_str))
+            if replayed[0]:
+                return _jsonrpc_ok(id_raw, _mcp_tool_result(replayed[1], is_error=False))
+
+        # `code.build_status` only finishes a build the gate already let through.
+        var gate_ok = tname == "code.build_status" or self._consume_gate_allowance(tname, mutating, args_str)
+        if not gate_ok:
             var blocked_json = (
                 '{"ok":false,"approval_required":true,"gate_seq":'
                 + String(ev_seq)
@@ -3637,6 +3977,8 @@ struct McpServerV2(Movable):
             tname, doc, args_node, studio, assets, pool, has_renderer, ren_ptr
         )
         studio._active_tx_agent_id = prev_origin
+        self._last_outcome_json = outcome[1]
+        self._last_outcome_failed = outcome[0]
         var elapsed_ms = max(0.0, (get_time() - t0) * 1000.0)
         var ev = McpToolEvent(
             seq=ev_seq,
@@ -3648,6 +3990,7 @@ struct McpServerV2(Movable):
             is_mutating=mutating,
             blocked_by_gate=False,
         )
+        ev.replay_step_id = self._replay_step_id
         ev.affected_entities = _extract_affected_entities(doc, args_node, outcome[1])
         self._record_tool_event(ev^)
         return _jsonrpc_ok(id_raw, _mcp_tool_result(outcome[1], is_error=outcome[0]))
@@ -3753,6 +4096,55 @@ def _unlink_socket(path: String):
         return
     var owned = path
     _ = external_call["unlink", Int32](owned.as_c_string_span())
+
+
+def _peer_pid(cfd: Int) -> Int:
+    """`SO_PEERCRED` pid of a connected `AF_UNIX` peer, or -1."""
+    var ucred = Array[UInt32, 3](fill=0xFFFFFFFF)
+    var optlen = Array[UInt32, 1](fill=12)
+    var rc = external_call["getsockopt", Int32](
+        Int32(cfd), _SOL_SOCKET, _SO_PEERCRED, Pointer(to=ucred[0]), Pointer(to=optlen[0])
+    )
+    if rc != 0 or optlen[0] != UInt32(12):
+        return -1
+    return Int(Int32(ucred[0]))
+
+
+def pid_is_descendant_of(pid: Int, ancestor: Int) -> Bool:
+    """True when `ancestor` is `pid` or one of its parents (walks `/proc/<pid>/stat` ppid links).
+    Used to recognise the MCP bridge that Studio's own ACP agent spawned."""
+    if pid <= 0 or ancestor <= 0:
+        return False
+    var cur = pid
+    for _ in range(64):
+        if cur == ancestor:
+            return True
+        if cur <= 1:
+            return False
+        var raw = read_bytes("/proc/" + String(cur) + "/stat")
+        if len(raw) == 0:
+            return False
+        # Format: `pid (comm) state ppid ...`; comm may hold spaces/parens, so parse after the last ')'.
+        var close_at = -1
+        for i in range(len(raw)):
+            if raw[i] == 41:
+                close_at = i
+        if close_at < 0:
+            return False
+        var i = close_at + 2  # skip ") "
+        while i < len(raw) and raw[i] != 32:
+            i += 1  # state
+        i += 1
+        var ppid = 0
+        var got = False
+        while i < len(raw) and raw[i] >= 48 and raw[i] <= 57:
+            ppid = ppid * 10 + Int(raw[i] - 48)
+            got = True
+            i += 1
+        if not got:
+            return False
+        cur = ppid
+    return False
 
 
 def _verify_peer_uid(cfd: Int, expected_uid_override: Int = -1) -> Bool:
@@ -3922,7 +4314,11 @@ struct FlintMcpUnixListener(Movable):
             self.client_rx_bufs.append(List[UInt8]())
             self.client_authed.append(mcp.auth_token.byte_length() == 0)
             self.client_conn_ids.append(self.next_conn_id)
+            mcp.set_client_peer_pid(self.next_conn_id, _peer_pid(cfd))
             self.next_conn_id += 1
+
+        # Socket frames swap their own auth flag in; the in-process / stdio client's flag is put back after.
+        var key0_auth = mcp.session_authenticated
 
         # Phase 1: drain readable bytes from every client (non-blocking) and note closed/broken peers.
         var n_clients = len(self.client_fds)
@@ -3988,7 +4384,7 @@ struct FlintMcpUnixListener(Movable):
                     processed += 1
                     if resp.byte_length() > 0:
                         var out_b = encode_mcp_frame(resp, use_content_length=frame.used_content_length)
-                        if not send_span_bounded(cfd, Span(out_b), timeout_ms=2000, is_socket=True):
+                        if not send_span_bounded(cfd, Span(out_b), timeout_ms=250, is_socket=True):
                             drop[ci] = True
 
         # A closed peer is dropped once its buffered requests are done (or right away if it broke).
@@ -4004,6 +4400,7 @@ struct FlintMcpUnixListener(Movable):
                     resume_at -= 1
             i -= 1
         self.rr_cursor = resume_at if budget_hit else 0
+        mcp.session_authenticated = key0_auth
 
         return processed
 

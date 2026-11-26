@@ -535,7 +535,9 @@ struct PendingApproval(Copyable, Movable):
     var tool_kind: String
 
     var mcp_client_key: Int
-    """MCP connection whose gated call this is; an approval grants the retry to that client only."""
+    """MCP connection whose gated call this is; approving re-runs the call for that client only."""
+    var target_editor_id: UInt64
+    """Stable id of the entity a non-ghost gated call targets, pinned when the approval is queued."""
     # Deferred MCP socket response framing (for APPROVAL_SRC_MCP_TOOL)
     var client_fd: Int
     var request_id_raw: String
@@ -579,6 +581,7 @@ struct PendingApproval(Copyable, Movable):
         self.client_fd = -1
         self.request_id_raw = String()
         self.use_content_length = False
+        self.target_editor_id = 0
         self.raw_payload_json = String()
         self.file_path = String()
         self.old_text = String()

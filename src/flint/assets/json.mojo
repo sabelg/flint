@@ -5,6 +5,25 @@ from std.math import isfinite
 comptime MAX_EXPONENT: Int = 400
 
 
+def _hex4(data: List[UInt8], at: Int) -> Int:
+    """Value of the 4 hex digits at `data[at:at+4]`, or -1 if they are not all hex."""
+    if at < 0 or at + 4 > len(data):
+        return -1
+    var code = 0
+    for k in range(4):
+        var digit = data[at + k]
+        code = code * 16
+        if digit >= 48 and digit <= 57:
+            code += Int(digit - 48)
+        elif digit >= 65 and digit <= 70:
+            code += Int(digit - 55)
+        elif digit >= 97 and digit <= 102:
+            code += Int(digit - 87)
+        else:
+            return -1
+    return code
+
+
 struct JsonNode(Copyable, Movable):
     var kind: Int
     var text: String
@@ -176,24 +195,34 @@ struct JsonDocument(Copyable, Movable):
                 if self.index + 4 > len(data):
                     self.valid = False
                     return ""
-                var code = 0
-                for _ in range(4):
-                    var digit = data[self.index]
-                    self.index += 1
-                    code = code * 16
-                    if digit >= 48 and digit <= 57:
-                        code += Int(digit - 48)
-                    elif digit >= 65 and digit <= 70:
-                        code += Int(digit - 55)
-                    elif digit >= 97 and digit <= 102:
-                        code += Int(digit - 87)
+                var code = _hex4(data, self.index)
+                self.index += 4
+                if code < 0:
+                    self.valid = False
+                    return ""
+                # A UTF-16 surrogate pair (`\uD83D\uDE00`) is one code point: decode it to 4-byte
+                # UTF-8, never to two 3-byte surrogate halves (CESU-8, which is not valid UTF-8).
+                # A lone surrogate becomes U+FFFD.
+                if code >= 0xD800 and code <= 0xDBFF:
+                    var lo = -1
+                    if self.index + 6 <= len(data) and data[self.index] == 92 and data[self.index + 1] == 117:
+                        lo = _hex4(data, self.index + 2)
+                    if lo >= 0xDC00 and lo <= 0xDFFF:
+                        self.index += 6
+                        code = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00)
                     else:
-                        self.valid = False
-                        return ""
+                        code = 0xFFFD
+                elif code >= 0xDC00 and code <= 0xDFFF:
+                    code = 0xFFFD
                 if code < 128:
                     result.append(UInt8(code))
                 elif code < 2048:
                     result.append(UInt8(192 | (code >> 6)))
+                    result.append(UInt8(128 | (code & 63)))
+                elif code >= 0x10000:
+                    result.append(UInt8(240 | (code >> 18)))
+                    result.append(UInt8(128 | ((code >> 12) & 63)))
+                    result.append(UInt8(128 | ((code >> 6) & 63)))
                     result.append(UInt8(128 | (code & 63)))
                 else:
                     result.append(UInt8(224 | (code >> 12)))

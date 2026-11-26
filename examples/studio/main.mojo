@@ -22,7 +22,7 @@ powered by the unified Engine v5 spine (`EngineApp`, `WindowPlugin`, `TransformP
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import abs, cos, max, min, sin
+from std.math import abs, max, min
 from std.sys import argv
 from flint.app.engine_app import STAGE_FIRST
 from flint.app.window_plugin import WindowStateResource
@@ -31,7 +31,7 @@ from flint.assets.image import write_png
 from flint.assets.server import AssetServer
 from flint.core.build_info import check_flint_version_pin, parse_flint_version_from_toml_bytes
 from flint.core.jobs import JobPool, default_worker_count
-from flint.core.math import Quat, Vec3
+from flint.core.math import Vec3
 from flint.devtools.mcp_v2 import (
     MCP_GATE_ALL,
     MCP_GATE_AUTO,
@@ -40,8 +40,10 @@ from flint.devtools.mcp_v2 import (
     McpServerV2,
     McpToolEvent,
     default_mcp_socket_path,
+    pid_is_descendant_of,
     run_mcp_connect_stdio,
 )
+from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.input.plugin import InputStateResource
 from flint.platform.input import InputState
 from flint.platform.os import (
@@ -63,16 +65,6 @@ from flint.studio import (
     APPROVAL_AUTO,
     APPROVAL_EDITS,
     APPROVAL_STEP,
-    GIZMO_AXIS_NONE,
-    GIZMO_AXIS_X,
-    GIZMO_AXIS_Y,
-    GIZMO_AXIS_Z,
-    GIZMO_MODE_ROTATE,
-    GIZMO_MODE_SCALE,
-    GIZMO_MODE_TRANSLATE,
-    GIZMO_PLANE_XY,
-    GIZMO_PLANE_XZ,
-    GIZMO_PLANE_YZ,
     PIE_PLAYING,
     PIE_STOPPED,
     WORKSPACE_AGENT_STUDIO,
@@ -82,19 +74,8 @@ from flint.studio import (
     WORKSPACE_PLAY,
     BridgedMcpEvent,
     FlintStudioState,
-    SelectedTransformSnap,
-    ViewportRay,
     VisBufferGpuPicker,
     fill_instance_entity_maps,
-    gizmo_rotation_delta_rad,
-    gizmo_scale_drag,
-    GIZMO_TARGET_PX,
-    gizmo_world_scale,
-    pick_gizmo_handle,
-    ray_axis_closest_param,
-    ray_plane_hit,
-    snap_angle_deg,
-    snap_constrained_delta,
 )
 from flint.studio.viewport_transform import ViewportTransform
 from flint.studio.studio_app import (
@@ -168,24 +149,49 @@ def _gate_mode_for_session(studio: FlintStudioState, si: Int) -> Int:
     return MCP_GATE_AUTO
 
 
+def _is_acp_agent_client(mcp: McpServerV2, studio: FlintStudioState, key: Int) -> Bool:
+    """True when connection `key` comes from the process tree of the ACP agent Studio launched (its
+    `flint --mcp-connect` bridge), proven by the socket's `SO_PEERCRED` pid, not by who connects first."""
+    var acp_pid = Int(studio.agent_runtime.acp.proc.pid)
+    return acp_pid > 0 and pid_is_descendant_of(mcp.peer_pid_of(key), acp_pid)
+
+
+def _run_mcp_replays(
+    mut mcp: McpServerV2,
+    mut studio: FlintStudioState,
+    mut assets: AssetServer,
+    mut pool: JobPool,
+    mut ren: FlintAaaVulkanRenderer,
+):
+    """Re-runs the gated calls the user approved in the Agents panel, exactly as the agent sent them."""
+    var keys = List[Int]()
+    var tools = List[String]()
+    var args = List[String]()
+    var steps = List[UInt64]()
+    var eids = List[UInt64]()
+    swap(keys, studio.mcp_replay_client)
+    swap(tools, studio.mcp_replay_tool)
+    swap(args, studio.mcp_replay_args)
+    swap(steps, studio.mcp_replay_step)
+    swap(eids, studio.mcp_replay_editor_id)
+    for i in range(len(tools)):
+        _ = mcp.replay_approved_call_with_renderer(keys[i], tools[i], args[i], steps[i], eids[i], studio, assets, pool, ren)
+
+
 def _sync_mcp_gate_from_bus(mut mcp: McpServerV2, mut studio: FlintStudioState):
-    """Aligns `McpServerV2` approval gate mode with the selected `AgentTelemetryBus` session policy,
-    and hands tools the user approved in the Agents panel to the gate as one-shot allowances."""
-    for gi in range(len(studio.mcp_grant_once)):
-        var gkey = studio.mcp_grant_once_client[gi] if gi < len(studio.mcp_grant_once_client) else 0
-        if gkey > 0:
-            mcp.allow_tool_once_for_client(gkey, studio.mcp_grant_once[gi])
-        else:
-            mcp.allow_tool_once(studio.mcp_grant_once[gi])
-    studio.mcp_grant_once.clear()
-    studio.mcp_grant_once_client.clear()
+    """Aligns each MCP client's approval gate with its agent session's policy, releases the sessions
+    of closed connections, and lets builds make progress."""
+    var dropped = mcp.take_dropped_clients()
+    for di in range(len(dropped)):
+        studio.release_mcp_client(dropped[di])
+    mcp.tick_builds()
     # Socket clients: each follows the policy of its own agent session, not the one selected in the UI.
     var keys = mcp.client_keys()
     for ki in range(len(keys)):
         var ck = keys[ki]
         if ck <= 0 or not mcp.client_initialized(ck):
             continue
-        var caid = studio.agent_for_mcp_client(ck, mcp.client_name_of(ck))
+        var caid = studio.agent_for_mcp_client(ck, mcp.client_name_of(ck), _is_acp_agent_client(mcp, studio, ck))
         var csi = studio.agent_bus.find_session_index(caid)
         if csi >= 0:
             mcp.set_client_gate_mode(ck, _gate_mode_for_session(studio, csi))
@@ -220,7 +226,8 @@ def _drain_mcp_events_to_studio(mut mcp: McpServerV2, mut studio: FlintStudioSta
         b.mcp_client_name = r.client_name
         if r.client_key != 0:
             # Socket clients each have their own agent session; key 0 keeps the selected agent.
-            b.agent_id = studio.agent_for_mcp_client(r.client_key, r.client_name)
+            b.agent_id = studio.agent_for_mcp_client(r.client_key, r.client_name, _is_acp_agent_client(mcp, studio, r.client_key))
+        b.replay_step_id = r.replay_step_id
         if len(b.affected_entities) > 0:
             var target_eid = b.affected_entities[0]
             if target_eid >= 0 and target_eid < len(studio.entities) and studio.is_alive_id(target_eid):
@@ -474,10 +481,25 @@ def _run_studio() raises -> Int:
             except:
                 studio.set_ui_scale(Float32(2.0))
         else:
-            studio.set_ui_scale(Float32(2.0))
+            # Follow the compositor's scale when it reports one (Wayland preferred / fractional scale);
+            # otherwise keep Studio's 200% HiDPI default (X11 does not report a scale).
+            var cs = Float32(1.0)
+            var wres = studio.app.resources.get_ptr[WindowStateResource]()
+            if wres:
+                cs = wres.value()[unsafe_offset=0].content_scale
+            studio.set_ui_scale(cs if cs > Float32(1.0) else Float32(2.0))
     if has_project_flag or has_project_env:
         studio.asset_browser_dir = project_root
     populate_default_studio_scene(studio)
+    if not is_headless:
+        studio.maybe_show_welcome()
+    if not is_headless and studio.autosave_available():
+        # A crash or kill left unsaved work behind: offer it instead of silently keeping it on disk.
+        studio.push_toast(
+            "Unsaved work from an earlier session was found: File -> Recover autosave restores it.",
+            1,
+            15.0,
+        )
 
     if theme_opt >= 0:
         studio.set_studio_theme(theme_opt)
@@ -624,12 +646,12 @@ def _run_studio() raises -> Int:
         studio.agent_runtime.acp.configure_studio_mcp_socket(exe_path, mcp_sock.socket_path)
     var mcp_pool = JobPool()
     _ = mcp_pool.start(2)
-    var dragging_gizmo = False
-    var drag_start_ray = ViewportRay()
-    var drag_start_pivot = Vec3()
-    var drag_snaps = List[SelectedTransformSnap]()
-    var drag_seq = UInt64(100)
     var pending_pick_ctrls = List[Tuple[UInt64, Bool]]()
+    # Left press on empty viewport space: a click picks on release, a drag becomes a marquee.
+    var press_pending = False
+    var press_x = Float32(0.0)
+    var press_y = Float32(0.0)
+    var press_additive = False
     var resume_swapchain = False
     var t_last = get_time()
 
@@ -693,10 +715,12 @@ def _run_studio() raises -> Int:
                     studio.sync_flmat_studio_styles()
                     studio.asset_browser_scanned = False
                 _sync_mcp_gate_from_bus(mcp, studio)
+                _run_mcp_replays(mcp, studio, assets, mcp_pool, renderer.gpu_slot[0])
                 _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, renderer.gpu_slot[0])
                 _drain_mcp_events_to_studio(mcp, studio)
-            dragging_gizmo = False
-            studio.active_gizmo_handle = GIZMO_AXIS_NONE
+            studio.gizmo_drag_cancel()
+            press_pending = False
+            studio.marquee_active = False
             continue
 
         # Harvest completed non-stalling async GPU viewport picks from previous frames
@@ -722,6 +746,7 @@ def _run_studio() raises -> Int:
                     and pres.entity_id >= 0
                     and studio.is_alive_id(pres.entity_id)
                     and (pres.entity_bits == 0 or studio.resolve_entity(pres.entity_id).to_bits() == pres.entity_bits)
+                    and not studio.is_entity_locked(pres.entity_id)
                 ):
                     studio.select_entity(pres.entity_id, multi_select=pick_ctrl)
                 elif not pick_ctrl:
@@ -753,111 +778,87 @@ def _run_studio() raises -> Int:
             or studio.menu.bar.group >= 0
             or studio.pie.mode != PIE_STOPPED
         )
-        var gizmo_rot = studio.selection_gizmo_rotation()
-        if frame_input.mouse_pressed(0) and in_vp and not ui_blocks_vp:
-            var g_piv = studio.selection_gizmo_pivot()
-            var g_hit = GIZMO_AXIS_NONE
-            if g_piv[0]:
-                g_hit = pick_gizmo_handle(
-                    mx, my, g_piv[1],
-                    studio.gizmo_mode, Float32(0.0), Float32(0.0), vxf.proj_phys_w(), vxf.proj_phys_h(),
-                    studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
-                    target_px=GIZMO_TARGET_PX * _ui_s,
-                    gizmo_rot=gizmo_rot,
-                )
-            if g_hit != GIZMO_AXIS_NONE:
-                dragging_gizmo = True
-                studio.active_gizmo_handle = g_hit
-                drag_seq += 1
-                drag_start_ray = vxf.ray_phys(mx, my, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
-                drag_start_pivot = g_piv[1]
-                drag_snaps = studio.capture_selected_transforms()
-            else:
-                var ctrl_down = frame_input.key_down(341) or frame_input.key_down(345)
-                if picker.has_pending_pick:
-                    var stale_id = picker.queued_request_id
-                    var kept = List[Tuple[UInt64, Bool]](capacity=len(pending_pick_ctrls))
-                    for pi in range(len(pending_pick_ctrls)):
-                        if pending_pick_ctrls[pi][0] != stale_id:
-                            kept.append(pending_pick_ctrls[pi])
-                    pending_pick_ctrls = kept^
-                var req_id = picker.request_pick(Int(mx), Int(my))
-                pending_pick_ctrls.append((req_id, ctrl_down))
-
-        if (
+        studio.viewport_xf = vxf
+        studio.viewport_hovered = in_vp and not ui_blocks_vp
+        var alt_down = frame_input.key_down(342) or frame_input.key_down(346)
+        var ctrl_down = frame_input.key_down(341) or frame_input.key_down(345)
+        var shift_down = frame_input.key_down(340) or frame_input.key_down(344)
+        var cancel_pressed = (
             studio.pie.mode != PIE_STOPPED
             or studio.ui_ctx.modal_depth > 0
             or studio.ui_ctx.had_modal_prev_frame
+            or frame_input.mouse_pressed(1)
             or (frame_input.key_pressed(256) and not studio.wants_keyboard())
-        ):
-            dragging_gizmo = False
-            studio.active_gizmo_handle = GIZMO_AXIS_NONE
+        )
+        if cancel_pressed:
+            # Esc / right-click / a modal / Play abandon the drag: the selection goes back to its start pose.
+            studio.gizmo_drag_cancel()
+            press_pending = False
+            studio.marquee_active = False
 
-        if dragging_gizmo and frame_input.mouse_down(0) and len(drag_snaps) > 0:
-            var cur_ray = vxf.ray_phys(mx, my, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
-            var h_id = studio.active_gizmo_handle
-            var wscale = gizmo_world_scale(drag_start_pivot, studio.cam_pos, studio.cam_fwd, studio.fov_y_deg, Int(vxf.proj_phys_h()), GIZMO_TARGET_PX * _ui_s)
-            if studio.gizmo_mode == GIZMO_MODE_TRANSLATE:
-                var delta_p = Vec3()
-                if h_id == GIZMO_AXIS_X or h_id == GIZMO_AXIS_Y or h_id == GIZMO_AXIS_Z:
-                    var ax = gizmo_rot.rotate(Vec3(1, 0, 0) if h_id == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h_id == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
-                    var t0 = ray_axis_closest_param(drag_start_ray, drag_start_pivot, ax)
-                    var t1 = ray_axis_closest_param(cur_ray, drag_start_pivot, ax)
-                    if t0[0] and t1[0]:
-                        delta_p = ax * (t1[1] - t0[1])
-                elif h_id == GIZMO_PLANE_XY or h_id == GIZMO_PLANE_XZ or h_id == GIZMO_PLANE_YZ:
-                    var pn = gizmo_rot.rotate(Vec3(0, 0, 1) if h_id == GIZMO_PLANE_XY else (Vec3(0, 1, 0) if h_id == GIZMO_PLANE_XZ else Vec3(1, 0, 0)))
-                    var p0 = ray_plane_hit(drag_start_ray, drag_start_pivot, pn)
-                    var p1 = ray_plane_hit(cur_ray, drag_start_pivot, pn)
-                    if p0[0] and p1[0]:
-                        delta_p = p1[1] - p0[1]
-                if studio.snap_enabled:
-                    delta_p = snap_constrained_delta(drag_start_pivot, delta_p, h_id, studio.grid_snap_m, gizmo_rot)
-                _ = studio.apply_gizmo_drag_selected(
-                    drag_snaps,
-                    drag_start_pivot,
-                    delta_p,
-                    Quat(0.0, 0.0, 0.0, 1.0),
-                    Vec3(1.0, 1.0, 1.0),
-                    GIZMO_MODE_TRANSLATE,
-                    coalesce_key=drag_seq,
-                )
-            elif studio.gizmo_mode == GIZMO_MODE_ROTATE:
-                var rax = gizmo_rot.rotate(Vec3(1, 0, 0) if h_id == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h_id == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
-                var drad = gizmo_rotation_delta_rad(drag_start_ray, cur_ray, drag_start_pivot, rax, studio.cam_fwd, wscale)
-                if studio.snap_enabled:
-                    drad = snap_angle_deg(drad, studio.angle_snap_deg)
-                var dq = Quat(rax.x * sin(drad * Float32(0.5)), rax.y * sin(drad * Float32(0.5)), rax.z * sin(drad * Float32(0.5)), cos(drad * Float32(0.5)))
-                _ = studio.apply_gizmo_drag_selected(
-                    drag_snaps,
-                    drag_start_pivot,
-                    Vec3(),
-                    dq,
-                    Vec3(1.0, 1.0, 1.0),
-                    GIZMO_MODE_ROTATE,
-                    coalesce_key=drag_seq,
-                )
-            elif studio.gizmo_mode == GIZMO_MODE_SCALE:
-                var sf = gizmo_scale_drag(drag_start_ray, cur_ray, drag_start_pivot, h_id, wscale, studio.cam_fwd, studio.cam_right, Vec3(1.0, 1.0, 1.0), gizmo_rot=gizmo_rot)
-                _ = studio.apply_gizmo_drag_selected(
-                    drag_snaps,
-                    drag_start_pivot,
-                    Vec3(),
-                    Quat(0.0, 0.0, 0.0, 1.0),
-                    sf,
-                    GIZMO_MODE_SCALE,
-                    coalesce_key=drag_seq,
-                )
+        if frame_input.mouse_pressed(0) and in_vp and not ui_blocks_vp and not alt_down:
+            if not studio.gizmo_try_begin(mx, my):
+                press_pending = True
+                press_x = mx
+                press_y = my
+                press_additive = ctrl_down or shift_down
+
+        if studio.gz_dragging and frame_input.mouse_down(0):
+            _ = studio.gizmo_drag_update(mx, my)
+
+        if press_pending and frame_input.mouse_down(0):
+            if not studio.marquee_active and abs(mx - press_x) + abs(my - press_y) > Float32(5.0) * _ui_s:
+                studio.marquee_active = True
+            if studio.marquee_active:
+                studio.marquee_x0 = press_x
+                studio.marquee_y0 = press_y
+                studio.marquee_x1 = mx
+                studio.marquee_y1 = my
 
         if not frame_input.mouse_down(0):
-            dragging_gizmo = False
-            studio.active_gizmo_handle = GIZMO_AXIS_NONE
+            if studio.gz_dragging:
+                studio.gizmo_drag_end()
+            if press_pending:
+                if studio.marquee_active:
+                    _ = studio.marquee_select(press_x, press_y, mx, my, press_additive)
+                else:
+                    # Click (no drag): pick what is under the release point.
+                    var r_rel = studio.app.resources.get_ptr[ScalableRenderer]()
+                    if r_rel and r_rel.value()[unsafe_offset=0].uses_vulkan():
+                        if picker.has_pending_pick:
+                            var stale_id = picker.queued_request_id
+                            var kept = List[Tuple[UInt64, Bool]](capacity=len(pending_pick_ctrls))
+                            for pi in range(len(pending_pick_ctrls)):
+                                if pending_pick_ctrls[pi][0] != stale_id:
+                                    kept.append(pending_pick_ctrls[pi])
+                            pending_pick_ctrls = kept^
+                        var req_id = picker.request_pick(Int(press_x), Int(press_y))
+                        pending_pick_ctrls.append((req_id, press_additive))
+                    else:
+                        # Software renderer: pick with the CPU scene raycast instead of the GPU id buffer.
+                        var ray = vxf.ray_phys(press_x, press_y, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
+                        var hit = studio.raycast_scene(ray.origin, ray.dir)
+                        if hit.hit and studio.is_alive_id(hit.entity_id) and not studio.is_entity_locked(hit.entity_id):
+                            studio.select_entity(hit.entity_id, multi_select=press_additive)
+                        elif not press_additive:
+                            studio.clear_selection()
+                press_pending = False
+                studio.marquee_active = False
+
+        # Arrow-key nudges (one grid step) when the viewport has focus and no text field does.
+        if studio.viewport_hovered and not studio.wants_keyboard() and studio.selected_count() > 0 and not studio.gz_dragging:
+            var nx = (1 if frame_input.key_pressed(262) else 0) - (1 if frame_input.key_pressed(263) else 0)
+            var nz = (1 if frame_input.key_pressed(265) else 0) - (1 if frame_input.key_pressed(264) else 0)
+            var ny = (1 if frame_input.key_pressed(266) else 0) - (1 if frame_input.key_pressed(267) else 0)
+            if nx != 0 or ny != 0 or nz != 0:
+                _ = studio.nudge_selection(nx, ny, nz)
 
         _ = assets.tick(now)
         var r_mcp = studio.app.resources.get_ptr_mut[ScalableRenderer]()
         var gms = 0.0
         if r_mcp and r_mcp.value()[unsafe_offset=0].uses_vulkan():
             _sync_mcp_gate_from_bus(mcp, studio)
+            _run_mcp_replays(mcp, studio, assets, mcp_pool, r_mcp.value()[unsafe_offset=0].gpu_slot[0])
             _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, r_mcp.value()[unsafe_offset=0].gpu_slot[0])
             _drain_mcp_events_to_studio(mcp, studio)
             gms = r_mcp.value()[unsafe_offset=0].gpu_slot[0].render_graph.total_gpu_ms
