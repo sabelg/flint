@@ -27,17 +27,23 @@ Lens and sensor (one pass at full res right before the display tonemap, plus a q
                                  coating model).
   7. `sota_flare_blur_shader`    aperture-polygon blur of the ghosts (ghosts are defocused images of the
                                  aperture, so they take its shape).
-  8. `sota_lens_composite_shader` lateral chromatic aberration (per-channel magnification), optical
-                                 (f-stop dependent) vignetting, ghosts, procedural lens dirt lit by a wide
+  7b. `sota_streak_shader`       optional anamorphic horizontal streak (exponential line kernel).
+  8. `sota_lens_composite_shader` optical (f-stop dependent) vignetting, ghosts, anamorphic streak,
+                                 lens dirt (procedural texture from `sota_camera_dirt.mojo`) lit by a wide
                                  average of the bright pass, then sensor noise: Poisson shot noise +
                                  read noise from ISO and the full-well capacity, in exposure-normalised
                                  signal units (applied last: it happens on the sensor).
+  9. `sota_ca_shader`            lateral chromatic aberration (per-channel magnification), recorded right
+                                 after DoF: the lens images each wavelength at its own magnification
+                                 before any later scattering (bloom) or temporal smear (motion blur).
 
-Physical order in the frame: TSR -> DoF -> (NPR fx) -> bloom -> motion blur -> auto exposure meter ->
-lens (CA, vignette, ghosts, dirt) -> sensor noise -> display (exposure, cos^4, tone curve).
+Compute VRS for the shading pass lives in `sota_camera_vrs.mojo`.
+
+Physical order in the frame: TSR -> DoF -> lateral CA -> (NPR fx) -> bloom -> motion blur -> auto exposure
+meter -> lens (vignette, ghosts, streak, dirt) -> sensor noise -> display (exposure, cos^4, tone curve).
 """
 from std.collections import List
-from std.math import atan2, cos, floor, max, min, sin, sqrt
+from std.math import atan2, cos, exp, floor, max, min, sin, sqrt
 from std.memory import bitcast
 from flint.core.math import Vec3
 from flint.camera.physical import PhysicalCameraModel, PHYS_EXPOSURE_MANUAL
@@ -63,6 +69,7 @@ from flint.render.shader_dsl import (
     ShaderDsl,
     abs_f,
     clamp_f,
+    exp2_f,
     cos_f,
     dot,
     floor_f,
@@ -71,11 +78,28 @@ from flint.render.shader_dsl import (
     min_f,
     min_u,
     select_f,
+    select_u,
     select_vec3,
     sin_f,
     sqrt_f,
 )
 from flint.render.aaa_visbuffer import AAA_PUSH_WORDS, BIND_AAA_GLOBALS, BIND_AAA_HDR_OUT, BIND_AAA_POST_SCRATCH
+from flint.render.sota_camera_dirt import (
+    SOTA_DIRT_H,
+    SOTA_DIRT_W,
+    sota_dirt_offset,
+    sota_lens_dirt_texture_cpu,
+    sota_pack_dirt_u8,
+    sota_upload_dirt,
+)
+from flint.render.sota_camera_vrs import (
+    sota_vrs_classify_shader,
+    sota_vrs_fill_shader,
+    sota_vrs_rate_shader,
+    sota_vrs_record_classify,
+    sota_vrs_record_fill,
+    sota_vrs_record_rate,
+)
 
 comptime SOTA_POST_BASE: Int = 1024            # == AAA_POST_BLOOM_BASE (post scratch words below are histogram/exposure)
 comptime SOTA_POST_ADAPTED_EXP_WORD: Int = 64  # == AAA_POST_ADAPTED_EXP_WORD
@@ -109,6 +133,16 @@ struct SotaCameraPost(Copyable, Movable):
 
     var enable_dirt: Bool
     var dirt_intensity: Float32
+    var dirt_use_texture: Bool      # procedural dirt texture (`sota_camera_dirt.mojo`); False: inline specks
+    var dirt_seed: UInt32
+    var dirt_words: List[UInt32]    # packed 8-bit texture, generated on first use
+    var dirt_words_seed: UInt32
+    var dirt_uploaded_off: Int      # post-scratch word offset + buffer address of the uploaded copy
+    var dirt_uploaded_addr: Int
+
+    var enable_anamorphic_streak: Bool
+    var anamorphic_streak_intensity: Float32
+    var anamorphic_streak_length: Float32  # kernel reach as a fraction of the frame width
 
     var enable_chromatic_aberration: Bool
     var ca_strength: Float32        # lateral CA: relative magnification difference R vs B
@@ -128,7 +162,19 @@ struct SotaCameraPost(Copyable, Movable):
     var pipe_flare_bright: Int
     var pipe_flare_ghost: Int
     var pipe_flare_blur: Int
+    var pipe_streak: Int
     var pipe_lens_composite: Int
+    var pipe_ca: Int
+    # Compute VRS for the shading pass (`sota_camera_vrs.mojo`): rate map from the finished previous frame.
+    var enable_vrs: Bool
+    var vrs_threshold: Float32  # mean |error| of the coarse reconstruction in l/(1+l) display units
+    var vrs_motion_px: Float32  # on-screen speed (output px / frame) at which the tolerance doubles
+    var vrs_allow_4x4: Bool
+    var vrs_rate_w: Int  # render size the current rate map was computed for (0: none yet)
+    var vrs_rate_h: Int
+    var pipe_vrs_rate: Int
+    var pipe_vrs_classify: Int
+    var pipe_vrs_fill: Int
     var frame_counter: UInt32
 
     def __init__(out self):
@@ -148,6 +194,15 @@ struct SotaCameraPost(Copyable, Movable):
         self.coating_thickness_nm = Float32(99.6)  # quarter wave of MgF2 (n = 1.38) at 550 nm
         self.enable_dirt = False
         self.dirt_intensity = Float32(0.25)
+        self.dirt_use_texture = True
+        self.dirt_seed = UInt32(0x5D17)
+        self.dirt_words = List[UInt32]()
+        self.dirt_words_seed = UInt32(0)
+        self.dirt_uploaded_off = 0
+        self.dirt_uploaded_addr = 0
+        self.enable_anamorphic_streak = False
+        self.anamorphic_streak_intensity = Float32(0.08)
+        self.anamorphic_streak_length = Float32(0.25)
         self.enable_chromatic_aberration = False
         self.ca_strength = Float32(0.003)
         self.enable_optical_vignette = False
@@ -163,17 +218,24 @@ struct SotaCameraPost(Copyable, Movable):
         self.pipe_flare_bright = 0
         self.pipe_flare_ghost = 0
         self.pipe_flare_blur = 0
+        self.pipe_streak = 0
         self.pipe_lens_composite = 0
+        self.pipe_ca = 0
+        self.enable_vrs = False
+        self.vrs_threshold = Float32(0.006)
+        self.vrs_motion_px = Float32(8.0)
+        self.vrs_allow_4x4 = True
+        self.vrs_rate_w = 0
+        self.vrs_rate_h = 0
+        self.pipe_vrs_rate = 0
+        self.pipe_vrs_classify = 0
+        self.pipe_vrs_fill = 0
         self.frame_counter = 0
 
     def any_lens_effect(self) -> Bool:
-        return (
-            self.enable_flare
-            or self.enable_dirt
-            or self.enable_chromatic_aberration
-            or self.enable_optical_vignette
-            or self.enable_grain
-        )
+        """Effects of the late lens + sensor pass (after bloom / motion blur / metering). Lateral CA is
+        recorded separately and earlier (`sota_camera_record_ca`, right after DoF)."""
+        return self.enable_flare or self.enable_dirt or self.enable_optical_vignette or self.enable_grain or self.enable_anamorphic_streak
 
     def create_pipelines(mut self, mut vk: VulkanGpu, pipe_layout: Int) -> Bool:
         self.pipe_dof_setup = vk.create_aaa_compute_pipeline(pipe_layout, sota_dof_setup_shader())
@@ -185,7 +247,12 @@ struct SotaCameraPost(Copyable, Movable):
         self.pipe_flare_bright = vk.create_aaa_compute_pipeline(pipe_layout, sota_flare_bright_shader())
         self.pipe_flare_ghost = vk.create_aaa_compute_pipeline(pipe_layout, sota_flare_ghost_shader())
         self.pipe_flare_blur = vk.create_aaa_compute_pipeline(pipe_layout, sota_flare_blur_shader())
+        self.pipe_streak = vk.create_aaa_compute_pipeline(pipe_layout, sota_streak_shader())
         self.pipe_lens_composite = vk.create_aaa_compute_pipeline(pipe_layout, sota_lens_composite_shader())
+        self.pipe_ca = vk.create_aaa_compute_pipeline(pipe_layout, sota_ca_shader())
+        self.pipe_vrs_rate = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_rate_shader())
+        self.pipe_vrs_classify = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_classify_shader())
+        self.pipe_vrs_fill = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_fill_shader())
         return self.pipelines_ready()
 
     def pipelines_ready(self) -> Bool:
@@ -199,8 +266,17 @@ struct SotaCameraPost(Copyable, Movable):
             and self.pipe_flare_bright != 0
             and self.pipe_flare_ghost != 0
             and self.pipe_flare_blur != 0
+            and self.pipe_streak != 0
             and self.pipe_lens_composite != 0
+            and self.pipe_ca != 0
         )
+
+    def vrs_pipelines_ready(self) -> Bool:
+        return self.pipe_vrs_rate != 0 and self.pipe_vrs_classify != 0 and self.pipe_vrs_fill != 0
+
+    def vrs_active(self, render_w: Int, render_h: Int) -> Bool:
+        """VRS shades this frame only with a rate map from the previous frame at the same render size."""
+        return self.enable_vrs and self.vrs_pipelines_ready() and self.vrs_rate_w == render_w and self.vrs_rate_h == render_h
 
     def frame_sync(mut self, adapted_exposure: Float32, auto_exposure_on: Bool) -> Tuple[Float32, Float32]:
         """Exposure triangle for this frame. Returns `(base_exposure, motion_blur_shutter_fraction)`.
@@ -377,14 +453,14 @@ def eval_dof_cpu(
                     var d_eff = d / poly
                     var col = rgb[sy * w + sx]
                     var eff = min(max(sc, Float32(0.0)), max(c, Float32(0.0)))
-                    var wf = max(Float32(0.0), min(Float32(1.0), eff - d_eff + Float32(1.0))) / max(eff * eff, Float32(1.0))
+                    var wf = max(Float32(0.0), min(Float32(1.0), eff - d_eff + Float32(0.5))) / max(eff * eff, Float32(1.0))
                     if wf > Float32(0.0):
                         far_acc = far_acc + col * wf
                         far_w += wf
                     if sc < Float32(-0.5):
                         var r = -sc
                         var gate = max(Float32(0.0), min(Float32(1.0), (r - Float32(0.5)) * Float32(2.0)))
-                        var wn = max(Float32(0.0), min(Float32(1.0), r - d_eff + Float32(1.0))) / max(r * r, Float32(1.0)) * gate
+                        var wn = max(Float32(0.0), min(Float32(1.0), r - d_eff + Float32(0.5))) / max(r * r, Float32(1.0)) * gate
                         near_acc = near_acc + col * wn
                         near_w += wn
                     near_cnt += Float32(1.0)
@@ -640,6 +716,10 @@ def _dof_gather_taps(
             # Per-pixel rotation `phi` and radial jitter `jr` (ring k spans ((k-1)/K, k/K]) turn the
             # residual tap structure into fine noise that the 3x3 post-filter removes.
             var r_norm = (dsl.f32(Float32(ring)) - jr) * Float32(1.0 / Float32(SOTA_DOF_RINGS))
+            # Area each tap stands for (unit-disc units, sums to ~pi): ring k has 8k taps over an annulus of
+            # area pi (2k-1) / K^2, so without this the inner rings are oversampled and a highlight's bokeh
+            # peaks in the middle (smaller half-max disc, +16 % energy).
+            var area = r_norm * Float32(6.283185307 / Float32(8 * ring * SOTA_DOF_RINGS))
             var poly = _poly_factor_dsl_rt(dsl, dsl.f32(theta) + phi, blades, rot, curv)
             var bx = r_norm * cos(theta)
             var by = r_norm * sin(theta)
@@ -667,14 +747,14 @@ def _dof_gather_taps(
                 s_c = b_post.load_f32(s_off + UInt32(3))
             # Far field: background never spreads further than the centre's own CoC.
             var eff = min_f(max_f(s_c, 0.0), c_far)
-            var wf = _saturate(eff - d + Float32(1.0)) / max_f(eff * eff, 1.0) * cat_w
+            var wf = _saturate(eff - d + Float32(0.5)) / max_f(eff * eff, 1.0) * cat_w * area
             far_acc.set(far_acc.get() + s_rgb * wf)
             far_w.set(far_w.get() + wf)
             # Near field: foreground spreads by its own CoC; density-normalised coverage.
             # Only real defocus belongs to the near layer: a CoC under 0.5 px is in focus (gate ramps to 1 at 1 px).
             var nr = max_f(-s_c, 0.0)
             var gate = _saturate((nr - Float32(0.5)) * Float32(2.0))
-            var wn = _saturate(nr - d + Float32(1.0)) * big_r * big_r / max_f(nr * nr, 1.0) * gate * cat_w
+            var wn = _saturate(nr - d + Float32(0.5)) * big_r * big_r / max_f(nr * nr, 1.0) * gate * cat_w * area
             near_acc.set(near_acc.get() + s_rgb * wn)
             near_w.set(near_w.get() + wn)
 
@@ -733,10 +813,11 @@ def sota_dof_gather_shader() -> List[UInt32]:
                 (ty_c.to_f32() + Float32(dj)).lt(0.0), dsl.f32(0.0), min_f(ty_c.to_f32() + Float32(dj), tiles_y.to_f32() - Float32(1.0))
             ).saturate_u32()
             near_reach.set(max_f(near_reach.get(), b_post.load_f32(tile_off + (ty_s * tiles_x + tx_s) * UInt32(2))))
-    var big_r = min_f(max_f(abs_f(c), near_reach.get()), max_r)
+    # +0.5: the tap weights ramp over [CoC - 0.5, CoC + 0.5], so the kernel must reach CoC + 0.5.
+    var big_r = min_f(max_f(abs_f(c), near_reach.get()), max_r) + Float32(0.5)
 
     var o = out_off + (py * hw + px) * UInt32(8)
-    dsl.if_then(big_r.lt(0.5))
+    dsl.if_then(big_r.lt(1.0))
     b_post.store_vec3(o, c_rgb)
     b_post.store_f32(o + UInt32(3), c)
     b_post.store_vec3(o + UInt32(4), dsl.vec3_const(0.0, 0.0, 0.0))
@@ -755,17 +836,21 @@ def sota_dof_gather_shader() -> List[UInt32]:
     var phi = ign * Float32(6.283185307 / 8.0)
     var rot_c = cos_f(phi)
     var rot_s = sin_f(phi)
-    var jr = fract_f(Float32(52.9829189) * fract_f((fpx + Float32(5.588238)) * Float32(0.00583715) + (fpy + Float32(17.31)) * Float32(0.06711056))) * Float32(0.9)
+    var jr = fract_f(Float32(52.9829189) * fract_f((fpx + Float32(5.588238)) * Float32(0.00583715) + (fpy + Float32(17.31)) * Float32(0.06711056)))
 
     # The centre tap must come from the same (prefiltered) level as the ring taps, or a highlight keeps
     # an unfiltered hot dot in the middle of its bokeh disc.
     var c_l1 = _bilerp_post(dsl, b_post, l1, UInt32(4), qw, qh, fpx * Float32(0.5) - Float32(0.25), fpy * Float32(0.5) - Float32(0.25), UInt32(0))
     var c_src = select_vec3(big_r.gt(6.0), c_l1, c_rgb)
-    var w_c = dsl.f32(1.0) / max_f(c_far * c_far, 1.0)
+    # Ring 1 (radially jittered down to r = 0) already covers the kernel centre, so the centre tap only
+    # needs a token weight: it keeps the weights non-zero when every ring tap is rejected. A real area
+    # weight double-counts the centre and puts a hot spot in every highlight's bokeh disc.
+    var a_c = Float32(1.0e-3)
+    var w_c = dsl.f32(a_c) / max_f(c_far * c_far, 1.0)
     var far_acc = dsl.var_vec3(c_src * w_c)
     var far_w = dsl.var_f32(w_c)
     var near_r_c = max_f(-c, 0.0)
-    var wn_c = big_r * big_r / max_f(near_r_c * near_r_c, 1.0) * _saturate((near_r_c - Float32(0.5)) * Float32(2.0))
+    var wn_c = big_r * big_r / max_f(near_r_c * near_r_c, 1.0) * _saturate((near_r_c - Float32(0.5)) * Float32(2.0)) * a_c
     var near_acc = dsl.var_vec3(c_src * wn_c)
     var near_w = dsl.var_f32(wn_c)
     dsl.if_then(big_r.gt(6.0))
@@ -774,12 +859,10 @@ def sota_dof_gather_shader() -> List[UInt32]:
     _dof_gather_taps(dsl, b_post, False, src, l1, hw, hh, qw, qh, fpx, fpy, big_r, c_far, rot_c, rot_s, phi, jr, blades, rot, curv, cat, cat_x, cat_y, far_acc, far_w, near_acc, near_w)
     dsl.end_if()
 
-    var n_taps = 1
-    for ring in range(1, SOTA_DOF_RINGS + 1):
-        n_taps += 8 * ring
-    var far_col = far_acc.get() / max_f(far_w.get(), 1.0e-6)
+    var far_col = far_acc.get() / max_f(far_w.get(), 1.0e-12)
     var nw = near_w.get()
-    var alpha = _saturate(nw * Float32(1.0 / Float32(n_taps)))
+    # Coverage: the area-weighted near weights sum to ~pi over a fully covered kernel.
+    var alpha = _saturate(nw * Float32(1.0 / 3.14159265))
     var near_pm = near_acc.get() * (alpha / max_f(nw, 1.0e-6))
     b_post.store_vec3(o, far_col)
     b_post.store_f32(o + UInt32(3), c)
@@ -1048,13 +1131,55 @@ def sota_flare_blur_shader() -> List[UInt32]:
 
 
 # ============================================================================
+# 7b. Anamorphic streak (quarter res)
+# ============================================================================
+
+def sota_streak_shader() -> List[UInt32]:
+    """The cylindrical front group of an anamorphic lens spreads every bright source into a long
+    horizontal line. Push: 0 qw, 1 qh, 2 bright_off, 3 streak_off, 4 reach (quarter px).
+    Exponential line kernel `exp(-4 |dx| / reach)`, normalised to unit sum, over the bright pass."""
+    var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
+    var b_post = dsl.buffer[1](BIND_AAA_POST_SCRATCH)
+    var qx = dsl.global_id_x()
+    var qy = dsl.global_id_y()
+    var qw = dsl.push_u32(0)
+    var qh = dsl.push_u32(1)
+    var bright_off = dsl.push_u32(2)
+    var streak_off = dsl.push_u32(3)
+    var reach = max_f(dsl.push_u32(4).to_f32(), 1.0)
+    dsl.return_if(qx.ge(qw) | qy.ge(qh))
+    var r_i = dsl.push_u32(4)
+    var x_lo = select_u(qx.lt(r_i), dsl.u32(0), qx - r_i)
+    var x_hi = min_u(qw - UInt32(1), qx + r_i)
+    var acc = dsl.var_vec3(dsl.vec3_const(0.0, 0.0, 0.0))
+    var w_acc = dsl.var_f32_const(0.0)
+    var row = bright_off + qy * qw * UInt32(4)
+    var xi = dsl.var_u32(x_lo)
+    var k = Float32(-4.0 * 1.442695) / reach  # exp(-4 d / reach) = exp2(k d)
+    dsl.begin_loop()
+    var x = xi.get()
+    dsl.break_if(x.ge(x_hi + UInt32(1)))
+    var d = abs_f(x.to_f32() - qx.to_f32())
+    var wgt = exp2_f(k * d)
+    acc.set(acc.get() + b_post.load_vec3(row + x * UInt32(4)) * wgt)
+    w_acc.set(w_acc.get() + wgt)
+    xi.set(x + UInt32(1))
+    dsl.end_loop()
+    # Normalise by the full (unclipped) kernel so the frame edge does not brighten the line.
+    var w_full = dsl.f32(1.0) + (dsl.f32(1.0) - exp2_f(k * reach)) / max_f(dsl.f32(1.0) - exp2_f(k), 1.0e-6) * Float32(2.0) * exp2_f(k)
+    b_post.store_vec3(streak_off + (qy * qw + qx) * UInt32(4), acc.get() / max_f(w_full, w_acc.get()))
+    return dsl.finish()
+
+
+# ============================================================================
 # 8. Lens + sensor composite (full res, writes the HDR buffer)
 # ============================================================================
 
 def sota_lens_composite_shader() -> List[UInt32]:
-    """Push: 0 W, 1 H, 2 ca_src_off (8 words/px copy; used when ca != 0), 3 flags (1 flare, 2 dirt, 4 ca,
-    8 vignette, 16 grain), 4 qw, 5 qh, 6 ghost_off, 7 glow_off (wide bright average), 8 flare_intensity, 9 dirt_intensity,
-    10 ca_strength, 11 optical vignette strength, 12 grain photons per unit signal (Q), 13 read noise^2,
+    """Push: 0 W, 1 H, 2 anamorphic streak intensity, 3 flags (1 flare, 2 dirt, 8 vignette, 16 grain,
+    32 anamorphic streak; lateral CA is its own earlier pass), 4 qw, 5 qh, 6 ghost_off, 7 glow_off (wide
+    bright average), 8 flare_intensity, 9 dirt_intensity, 10 dirt texture offset (0: inline procedural
+    fallback), 11 optical vignette strength, 12 grain photons per unit signal (Q), 13 read noise^2,
     14 grain strength, 15 frame counter."""
     var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
     var b_hdr = dsl.buffer[8](BIND_AAA_HDR_OUT)
@@ -1064,7 +1189,6 @@ def sota_lens_composite_shader() -> List[UInt32]:
     var py = dsl.global_id_y()
     var w_u = dsl.push_u32(0)
     var h_u = dsl.push_u32(1)
-    var ca_src = dsl.push_u32(2)
     var flags = dsl.push_u32(3)
     var qw = dsl.push_u32(4)
     var qh = dsl.push_u32(5)
@@ -1072,7 +1196,8 @@ def sota_lens_composite_shader() -> List[UInt32]:
     var bright_off = dsl.push_u32(7)
     var flare_i = dsl.push_f32(8)
     var dirt_i = dsl.push_f32(9)
-    var ca = dsl.push_f32(10)
+    var dirt_off = dsl.push_u32(10)
+    var streak_i = dsl.push_f32(2)
     var vig = dsl.push_f32(11)
     var grain_q = max_f(dsl.push_f32(12), 1.0)
     var read2 = dsl.push_f32(13)
@@ -1086,18 +1211,6 @@ def sota_lens_composite_shader() -> List[UInt32]:
     var v = (py.to_f32() + Float32(0.5)) / fh
     var base = b_hdr.base_word(py * w_u + px)
     var col = dsl.var_vec3(b_hdr.load_vec3(base))
-
-    # Lateral chromatic aberration: per-channel magnification about the optical centre.
-    dsl.if_then((flags & UInt32(4)).ne(UInt32(0)))
-    var g = b_post.load_f32(ca_src + (py * w_u + px) * UInt32(8) + UInt32(1))
-    var ur = (u - Float32(0.5)) * (dsl.f32(1.0) + ca) + Float32(0.5)
-    var vr = (v - Float32(0.5)) * (dsl.f32(1.0) + ca) + Float32(0.5)
-    var ub = (u - Float32(0.5)) * (dsl.f32(1.0) - ca) + Float32(0.5)
-    var vb = (v - Float32(0.5)) * (dsl.f32(1.0) - ca) + Float32(0.5)
-    var r = _bilerp_post_f(dsl, b_post, ca_src, UInt32(8), w_u, h_u, ur * fw - Float32(0.5), vr * fh - Float32(0.5), UInt32(0))
-    var b = _bilerp_post_f(dsl, b_post, ca_src, UInt32(8), w_u, h_u, ub * fw - Float32(0.5), vb * fh - Float32(0.5), UInt32(2))
-    col.set(dsl.vec3(r, g, b))
-    dsl.end_if()
 
     # Optical (cat's-eye) vignetting, strength already scaled by the f-stop on the CPU.
     dsl.if_then((flags & UInt32(8)).ne(UInt32(0)))
@@ -1117,9 +1230,33 @@ def sota_lens_composite_shader() -> List[UInt32]:
     col.set(col.get() + gh * flare_i)
     dsl.end_if()
 
-    # Lens dirt: procedural smudges + specks on the front element, lit by the wide-angle bright energy.
+    # Anamorphic streak (`sota_streak_shader`, quarter res right after the glow buffer: push 6 is the blurred
+    # ghost buffer, so the streak sits 8 qw qh words after it), tinted by the coatings.
+    dsl.if_then((flags & UInt32(32)).ne(UInt32(0)))
+    var stk = _bilerp_post(dsl, b_post, ghost_off + qw * qh * UInt32(8), UInt32(4), qw, qh, qx_f, qy_f, UInt32(0))
+    col.set(col.get() + stk * dsl.vec3_const(0.45, 0.62, 1.0) * streak_i)
+    dsl.end_if()
+
+    # Lens dirt on the front element, lit by the wide-angle bright energy: the procedural dirt texture
+    # (`sota_camera_dirt.mojo`) when uploaded, else inline smudges + specks.
     dsl.if_then((flags & UInt32(2)).ne(UInt32(0)))
     var mask = dsl.var_f32_const(0.0)
+    dsl.if_then(dirt_off.ne(UInt32(0)))
+    var dtx = clamp_f(u * Float32(SOTA_DIRT_W) - Float32(0.5), dsl.f32(0.0), dsl.f32(Float32(SOTA_DIRT_W - 1)))
+    var dty = clamp_f(v * Float32(SOTA_DIRT_H) - Float32(0.5), dsl.f32(0.0), dsl.f32(Float32(SOTA_DIRT_H - 1)))
+    var dx0 = min_u(dsl.u32(UInt32(SOTA_DIRT_W - 2)), floor_f(dtx).saturate_u32())
+    var dy0 = min_u(dsl.u32(UInt32(SOTA_DIRT_H - 2)), floor_f(dty).saturate_u32())
+    var dfx = clamp_f(dtx - dx0.to_f32(), 0.0, 1.0)
+    var dfy = clamp_f(dty - dy0.to_f32(), 0.0, 1.0)
+    var taps = List[GpuF32]()
+    for j in range(2):
+        for i in range(2):
+            var ti = (dy0 + UInt32(j)) * UInt32(SOTA_DIRT_W) + dx0 + UInt32(i)
+            var wd = b_post.load_u32(dirt_off + (ti >> UInt32(2)))
+            taps.append(((wd >> ((ti & UInt32(3)) * UInt32(8))) & UInt32(255)).to_f32() * Float32(1.0 / 255.0))
+    var one_d = dsl.f32(1.0)
+    mask.set((taps[0] * (one_d - dfx) + taps[1] * dfx) * (one_d - dfy) + (taps[2] * (one_d - dfx) + taps[3] * dfx) * dfy)
+    dsl.else_branch()
     for layer in range(2):
         var gs = Float32(7.0) if layer == 0 else Float32(19.0)
         var su = u * gs * (fw / fh)
@@ -1139,6 +1276,7 @@ def sota_lens_composite_shader() -> List[UInt32]:
         var blob = _saturate(dsl.f32(1.0) - dist / rad)
         blob = blob * blob * (dsl.f32(0.6) + _u01(h2) * Float32(0.8))
         mask.set(mask.get() + select_f(present, blob, dsl.f32(0.0)))
+    dsl.end_if()
     var glow = _bilerp_post(dsl, b_post, bright_off, UInt32(4), qw, qh, qx_f, qy_f, UInt32(0))
     col.set(col.get() + glow * (mask.get() * dirt_i))
     dsl.end_if()
@@ -1163,6 +1301,60 @@ def sota_lens_composite_shader() -> List[UInt32]:
     dsl.end_if()
 
     b_hdr.store_vec3(base, col.get())
+    return dsl.finish()
+
+
+# ============================================================================
+# 9. Lateral chromatic aberration (full res, before bloom / motion blur)
+# ============================================================================
+
+def _hdr_channel_bilerp(mut dsl: ShaderDsl, b_hdr: BufferRef[8], w: GpuU32, h: GpuU32, fx_in: GpuF32, fy_in: GpuF32, ch: UInt32) -> GpuF32:
+    var fx = clamp_f(fx_in, dsl.f32(0.0), w.to_f32() - Float32(1.0))
+    var fy = clamp_f(fy_in, dsl.f32(0.0), h.to_f32() - Float32(1.0))
+    var x0 = min_u(w - UInt32(1), floor_f(fx).saturate_u32())
+    var y0 = min_u(h - UInt32(1), floor_f(fy).saturate_u32())
+    var x1 = min_u(w - UInt32(1), x0 + UInt32(1))
+    var y1 = min_u(h - UInt32(1), y0 + UInt32(1))
+    var tx = clamp_f(fx - x0.to_f32(), 0.0, 1.0)
+    var ty = clamp_f(fy - y0.to_f32(), 0.0, 1.0)
+    var c00 = b_hdr.load_f32(b_hdr.base_word(y0 * w + x0) + ch)
+    var c10 = b_hdr.load_f32(b_hdr.base_word(y0 * w + x1) + ch)
+    var c01 = b_hdr.load_f32(b_hdr.base_word(y1 * w + x0) + ch)
+    var c11 = b_hdr.load_f32(b_hdr.base_word(y1 * w + x1) + ch)
+    var one = dsl.f32(1.0)
+    return (c00 * (one - tx) + c10 * tx) * (one - ty) + (c01 * (one - tx) + c11 * tx) * ty
+
+
+def sota_ca_shader() -> List[UInt32]:
+    """Push: 0 W, 1 H, 2 scratch_off (4 words/px), 3 ca_strength, 4 mode (0: resample HDR -> scratch with
+    per-channel magnification about the optical centre, R magnified / B minified; 1: scratch rgb -> HDR)."""
+    var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
+    var b_hdr = dsl.buffer[8](BIND_AAA_HDR_OUT)
+    var b_post = dsl.buffer[1](BIND_AAA_POST_SCRATCH)
+    var px = dsl.global_id_x()
+    var py = dsl.global_id_y()
+    var w_u = dsl.push_u32(0)
+    var h_u = dsl.push_u32(1)
+    var off = dsl.push_u32(2)
+    var ca = dsl.push_f32(3)
+    var mode = dsl.push_u32(4)
+    dsl.return_if(px.ge(w_u) | py.ge(h_u))
+    var base = b_hdr.base_word(py * w_u + px)
+    var so = off + (py * w_u + px) * UInt32(4)
+    dsl.if_then(mode.eq(UInt32(0)))
+    var fw = w_u.to_f32()
+    var fh = h_u.to_f32()
+    var u = (px.to_f32() + Float32(0.5)) / fw - Float32(0.5)
+    var v = (py.to_f32() + Float32(0.5)) / fh - Float32(0.5)
+    var kr = dsl.f32(1.0) + ca
+    var kb = dsl.f32(1.0) - ca
+    var r = _hdr_channel_bilerp(dsl, b_hdr, w_u, h_u, (u * kr + Float32(0.5)) * fw - Float32(0.5), (v * kr + Float32(0.5)) * fh - Float32(0.5), UInt32(0))
+    var g = b_hdr.load_f32(base + UInt32(1))
+    var b = _hdr_channel_bilerp(dsl, b_hdr, w_u, h_u, (u * kb + Float32(0.5)) * fw - Float32(0.5), (v * kb + Float32(0.5)) * fh - Float32(0.5), UInt32(2))
+    b_post.store_vec3(so, dsl.vec3(r, g, b))
+    dsl.else_branch()
+    b_hdr.store_vec3(base, b_post.load_vec3(so))
+    dsl.end_if()
     return dsl.finish()
 
 
@@ -1276,7 +1468,23 @@ def sota_camera_record_lens(
     var qw = lay[0]
     var qh = lay[1]
     var cam = post.camera
-    var need_bright = post.enable_flare or post.enable_dirt
+    var need_bright = post.enable_flare or post.enable_dirt or post.enable_anamorphic_streak
+    # Procedural dirt texture: generated once per seed, uploaded once per buffer / offset (it lives in a
+    # persistent post-scratch region nothing else writes, so later frames just read it).
+    var dirt_off = 0
+    if post.enable_dirt and post.dirt_use_texture:
+        dirt_off = sota_dirt_offset(out_w, out_h, max_pix)
+        if dirt_off != 0:
+            if len(post.dirt_words) == 0 or post.dirt_words_seed != post.dirt_seed:
+                post.dirt_words = sota_pack_dirt_u8(sota_lens_dirt_texture_cpu(post.dirt_seed))
+                post.dirt_words_seed = post.dirt_seed
+                post.dirt_uploaded_off = 0
+            if post.dirt_uploaded_off != dirt_off or post.dirt_uploaded_addr != buf_post.cpu_address:
+                if sota_upload_dirt(post.dirt_words, buf_post, dirt_off):
+                    post.dirt_uploaded_off = dirt_off
+                    post.dirt_uploaded_addr = buf_post.cpu_address
+                else:
+                    dirt_off = 0
     _barrier(vk, slot)
     if need_bright:
         var pb = _push()
@@ -1304,26 +1512,28 @@ def sota_camera_record_lens(
         pz[9] = UInt32(lay[3]); pz[10] = UInt32(lay[6]); pz[11] = _fb(Float32(out_w) / Float32(max(1, out_h)))
         vk.dispatch_aaa(slot, post.pipe_flare_blur, pipe_layout, desc_set, pz, (qw + 7) // 8, (qh + 7) // 8)
         _barrier(vk, slot)
-    if post.enable_chromatic_aberration:
-        vk.memory_barrier2(slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_READ))
-        vk.copy_buffer(slot, buf_hdr, 0, buf_post, lay[2] * 4, out_w * out_h * 8 * 4)
-        vk.memory_barrier2(slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE))
+    if post.enable_anamorphic_streak:
+        var ps = _push()
+        ps[0] = UInt32(qw); ps[1] = UInt32(qh); ps[2] = UInt32(lay[3]); ps[3] = UInt32(lay[6] + qw * qh * 4)
+        ps[4] = UInt32(max(2, Int(Float32(qw) * max(Float32(0.02), min(Float32(1.0), post.anamorphic_streak_length)))))
+        vk.dispatch_aaa(slot, post.pipe_streak, pipe_layout, desc_set, ps, (qw + 7) // 8, (qh + 7) // 8)
+        _barrier(vk, slot)
     var flags = UInt32(0)
     if post.enable_flare:
         flags |= 1
     if post.enable_dirt:
         flags |= 2
-    if post.enable_chromatic_aberration:
-        flags |= 4
     if post.enable_optical_vignette:
         flags |= 8
     if post.enable_grain:
         flags |= 16
+    if post.enable_anamorphic_streak:
+        flags |= 32
     var q_ph = cam.full_well_photons * Float32(100.0) / cam.iso
     var pl = _push()
-    pl[0] = UInt32(out_w); pl[1] = UInt32(out_h); pl[2] = UInt32(lay[2]); pl[3] = flags
+    pl[0] = UInt32(out_w); pl[1] = UInt32(out_h); pl[2] = _fb(post.anamorphic_streak_intensity); pl[3] = flags
     pl[4] = UInt32(qw); pl[5] = UInt32(qh); pl[6] = UInt32(lay[5]); pl[7] = UInt32(lay[6])
-    pl[8] = _fb(post.flare_intensity); pl[9] = _fb(post.dirt_intensity); pl[10] = _fb(post.ca_strength)
+    pl[8] = _fb(post.flare_intensity); pl[9] = _fb(post.dirt_intensity); pl[10] = UInt32(dirt_off)
     pl[11] = _fb(cam.optical_vignette_strength() * post.optical_vignette_amount)
     pl[12] = _fb(q_ph); pl[13] = _fb(cam.read_noise_photons * cam.read_noise_photons); pl[14] = _fb(post.grain_strength)
     pl[15] = post.frame_counter
@@ -1332,3 +1542,111 @@ def sota_camera_record_lens(
     _barrier(vk, slot)
     if use_prof and q + 1 < q_limit:
         vk.write_timestamp(slot, q + 1, PIPELINE_BOTTOM)
+
+
+def sota_camera_record_ca(
+    mut post: SotaCameraPost,
+    mut vk: VulkanGpu,
+    slot: Int,
+    pipe_layout: Int,
+    desc_set: Int,
+    out_w: Int,
+    out_h: Int,
+    max_pix: Int,
+    use_prof: Bool,
+    mut next_q: Int,
+    q_limit: Int,
+    mut prof_pairs: List[Tuple[String, Int]],
+):
+    """Lateral chromatic aberration on the scene-referred image, right after DoF: the lens images each
+    wavelength at its own magnification before any later scattering (bloom, glare) or the temporal
+    integration of the shutter (motion blur), so those must see the already split image. Copies the HDR
+    frame: resample into scratch (rgb), then write rgb back (no full 8-word HDR copy)."""
+    var q = next_q
+    if use_prof and q + 1 < q_limit:
+        vk.write_timestamp(slot, q, PIPELINE_BOTTOM)
+        next_q += 2
+        prof_pairs.append((String("SotaChromaticAberration"), q))
+    var lay = sota_lens_layout(out_w, out_h, max_pix)
+    _barrier(vk, slot)
+    for mode in range(2):
+        var pc = _push()
+        pc[0] = UInt32(out_w); pc[1] = UInt32(out_h); pc[2] = UInt32(lay[2]); pc[3] = _fb(post.ca_strength); pc[4] = UInt32(mode)
+        vk.dispatch_aaa(slot, post.pipe_ca, pipe_layout, desc_set, pc, (out_w + 7) // 8, (out_h + 7) // 8)
+        _barrier(vk, slot)
+    if use_prof and q + 1 < q_limit:
+        vk.write_timestamp(slot, q + 1, PIPELINE_BOTTOM)
+
+
+def sota_camera_record_vrs_rate(
+    mut post: SotaCameraPost,
+    mut vk: VulkanGpu,
+    slot: Int,
+    pipe_layout: Int,
+    desc_set: Int,
+    out_w: Int,
+    out_h: Int,
+    render_w: Int,
+    render_h: Int,
+    max_pix: Int,
+    use_prof: Bool,
+    mut next_q: Int,
+    q_limit: Int,
+    mut prof_pairs: List[Tuple[String, Int]],
+):
+    """End of the post chain (before lens noise): the rate map the next frame's shading uses."""
+    if not (post.enable_vrs and post.vrs_pipelines_ready()):
+        post.vrs_rate_w = 0
+        post.vrs_rate_h = 0
+        return
+    sota_vrs_record_rate(
+        vk, slot, post.pipe_vrs_rate, pipe_layout, desc_set, out_w, out_h, render_w, render_h, max_pix,
+        post.vrs_threshold, post.vrs_motion_px, post.vrs_allow_4x4, use_prof, next_q, q_limit, prof_pairs,
+    )
+    post.vrs_rate_w = render_w
+    post.vrs_rate_h = render_h
+
+
+def sota_camera_record_vrs_classify(
+    mut post: SotaCameraPost,
+    mut vk: VulkanGpu,
+    slot: Int,
+    pipe_layout: Int,
+    desc_set: Int,
+    render_w: Int,
+    render_h: Int,
+    max_pix: Int,
+    use_prof: Bool,
+    mut next_q: Int,
+    q_limit: Int,
+    mut prof_pairs: List[Tuple[String, Int]],
+) -> Int:
+    """Before shading: returns the shade-list offset for the shading pass (0 = VRS off this frame)."""
+    if not post.vrs_active(render_w, render_h):
+        return 0
+    return sota_vrs_record_classify(
+        vk, slot, post.pipe_vrs_classify, pipe_layout, desc_set, render_w, render_h, max_pix, use_prof, next_q, q_limit, prof_pairs
+    )
+
+
+def sota_camera_record_vrs_fill(
+    mut post: SotaCameraPost,
+    mut vk: VulkanGpu,
+    slot: Int,
+    pipe_layout: Int,
+    desc_set: Int,
+    render_w: Int,
+    render_h: Int,
+    max_pix: Int,
+    demod_gi: Bool,
+    demod_spec: Bool,
+    spec_off: Int,
+    use_prof: Bool,
+    mut next_q: Int,
+    q_limit: Int,
+    mut prof_pairs: List[Tuple[String, Int]],
+):
+    sota_vrs_record_fill(
+        vk, slot, post.pipe_vrs_fill, pipe_layout, desc_set, render_w, render_h, max_pix, demod_gi, demod_spec, spec_off,
+        use_prof, next_q, q_limit, prof_pairs,
+    )

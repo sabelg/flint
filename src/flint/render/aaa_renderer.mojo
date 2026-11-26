@@ -333,7 +333,15 @@ from flint.render.aaa_post_tsr import (
     tsr_v2_and_display_shader,
 )
 # --- sota:camera hook (import) ---
-from flint.render.sota_camera_post import SotaCameraPost, sota_camera_record_dof, sota_camera_record_lens
+from flint.render.sota_camera_post import (
+    SotaCameraPost,
+    sota_camera_record_ca,
+    sota_camera_record_dof,
+    sota_camera_record_lens,
+    sota_camera_record_vrs_classify,
+    sota_camera_record_vrs_fill,
+    sota_camera_record_vrs_rate,
+)
 # --- end sota:camera hook ---
 from flint.render.aaa_render_graph import (
     AaaGpuPassTiming,
@@ -4612,6 +4620,14 @@ struct FlintAaaVulkanRenderer(Movable):
             and n_inst > 0
         )
         var spec_in_off = spec_reblur_raw_offset(max_pix)
+        # --- sota:camera hook (compute VRS: classify + compact the pixels to shade) ---
+        var sota_vrs_list = 0
+        if not self.furnace_white_dome:
+            sota_vrs_list = sota_camera_record_vrs_classify(
+                self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set,
+                self.render_w, self.render_h, max_pix, use_prof, next_q, q_limit, prof_pairs,
+            )
+        # --- end sota:camera hook ---
         var q_sh = next_q
         if use_prof and q_sh + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_sh, PIPELINE_TOP)
@@ -4625,6 +4641,8 @@ struct FlintAaaVulkanRenderer(Movable):
         push_sh[4] = UInt32(1) if run_spec_reblur else UInt32(0)
         push_sh[5] = UInt32(spec_in_off)
         push_sh[6] = UInt32(rt_sun_flt_off)
+        push_sh[7] = UInt32(sota_vrs_list)  # --- sota:camera hook (compute VRS shade list) ---
+        push_sh[8] = UInt32((self.render_w + 7) // 8)  # --- sota:camera hook ---
         self.vk.dispatch_aaa(
             cur_slot,
             self.pipe_deferred_shade,
@@ -4636,6 +4654,13 @@ struct FlintAaaVulkanRenderer(Movable):
         )
         if use_prof and q_sh + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_sh + 1, PIPELINE_BOTTOM)
+        # --- sota:camera hook (compute VRS: rebuild the skipped pixels from their anchors) ---
+        if sota_vrs_list != 0:
+            sota_camera_record_vrs_fill(
+                self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.render_w, self.render_h,
+                max_pix, run_svgf, run_spec_reblur, spec_in_off, use_prof, next_q, q_limit, prof_pairs,
+            )
+        # --- end sota:camera hook ---
         self.render_graph.emit_pass_barriers(self.vk, cur_slot, 4)
 
         # `SVGF` Temporal Reprojection + Moments Variance Edge-Stopping `À-Trous` Denoiser
@@ -5044,6 +5069,11 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set,
                 self.output_w, self.output_h, use_prof, next_q, q_limit, prof_pairs,
             )
+        if self.sota_cam.enable_chromatic_aberration and self.sota_cam.pipelines_ready() and not self.furnace_white_dome:
+            sota_camera_record_ca(  # lateral CA before bloom / motion blur (physical order)
+                self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set,
+                self.output_w, self.output_h, max_pix, use_prof, next_q, q_limit, prof_pairs,
+            )
         # --- end sota:camera hook ---
         # Thin-Lens Polygonal Diaphragm Bokeh Depth-of-Field at Native `output_w x output_h`!
         if self.enable_bokeh_dof and not self.furnace_white_dome and not sota_dof_on:
@@ -5287,6 +5317,13 @@ struct FlintAaaVulkanRenderer(Movable):
             if use_prof and q_ae + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_ae + 1, PIPELINE_BOTTOM)
 
+        # --- sota:camera hook (compute VRS rate map for the next frame, from the finished image before lens noise) ---
+        if not self.furnace_white_dome:
+            sota_camera_record_vrs_rate(
+                self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.output_w, self.output_h,
+                self.render_w, self.render_h, max_pix, use_prof, next_q, q_limit, prof_pairs,
+            )
+        # --- end sota:camera hook ---
         # --- sota:camera hook (lens: CA, optical vignette, ghosts, dirt; then sensor noise) ---
         if self.sota_cam.any_lens_effect() and self.sota_cam.pipelines_ready() and not self.furnace_white_dome:
             sota_camera_record_lens(

@@ -4,15 +4,17 @@ sensor noise (`test_flint_v5_sota_camera.mojo`). Zero external assets.
 1. SPIR-V validation of every new shader.
 2. CPU references: EV100 / exposure triangle / FOV / thin-lens CoC / hyperfocal / sensor noise / thin-film
    coating / aperture polygon, and the full-res CPU DoF reference (energy conservation, disc radius,
-   near-field spread, no far-field bleed).
+   near-field spread, no far-field bleed), the VRS tile-rate reference and the procedural dirt texture.
 3. Live GPU (skips without Vulkan): in-focus identity, bokeh disc radius vs the thin lens, energy
    conservation, image diff of the GPU DoF against the CPU reference on the same input, near-field spread,
    foreground protection, physical exposure (EV100), lateral CA, optical vignetting vs f-stop, ISO noise
-   vs the photon model, lens ghosts at the mirrored position, and GPU time budgets (1280x720).
+   vs the photon model, lens ghosts at the mirrored position, procedural dirt texture, anamorphic streak,
+   compute VRS (coarse rate on flat regions, full rate on edges, output vs full-rate shading), and GPU
+   time budgets (1280x720).
 """
 from std.collections import List
 from std.ffi import external_call
-from std.math import abs, max, min, sqrt
+from std.math import abs, acos, log10, max, min, sqrt
 from flint.assets.image import write_png
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.model import NativeMesh
@@ -46,9 +48,32 @@ from flint.render.sota_camera_post import (
     sota_flare_blur_shader,
     sota_flare_bright_shader,
     sota_flare_ghost_shader,
+    sota_ca_shader,
     sota_lens_composite_shader,
     sota_lens_layout,
+    sota_streak_shader,
     thin_film_reflectance_cpu,
+)
+from flint.render.sota_camera_dirt import (
+    SOTA_DIRT_H,
+    SOTA_DIRT_W,
+    SOTA_DIRT_WORDS,
+    sota_dirt_offset,
+    sota_lens_dirt_texture_cpu,
+    sota_pack_dirt_u8,
+)
+from flint.render.sota_camera_vrs import (
+    SOTA_VRS_RATE_1X1,
+    SOTA_VRS_RATE_2X2,
+    SOTA_VRS_RATE_4X4,
+    SotaVrsLayout,
+    sota_vrs_classify_shader,
+    sota_vrs_fill_shader,
+    sota_vrs_rate_shader,
+    vrs_block_error_cpu,
+    vrs_perceptual_cpu,
+    vrs_shaded_fraction,
+    vrs_tile_rate_cpu,
 )
 from flint.render.spirv_validate import validate_spirv_module
 
@@ -119,7 +144,12 @@ def test_spirv():
     _validate("sota_flare_ghost_shader", sota_flare_ghost_shader())
     _validate("sota_flare_blur_shader", sota_flare_blur_shader())
     _validate("sota_lens_composite_shader", sota_lens_composite_shader())
-    print("  [PASS] Suite 1: 10 sota:camera compute shaders pass SPIR-V validation")
+    _validate("sota_ca_shader", sota_ca_shader())
+    _validate("sota_streak_shader", sota_streak_shader())
+    _validate("sota_vrs_rate_shader", sota_vrs_rate_shader())
+    _validate("sota_vrs_classify_shader", sota_vrs_classify_shader())
+    _validate("sota_vrs_fill_shader", sota_vrs_fill_shader())
+    print("  [PASS] Suite 1: 15 sota:camera compute shaders pass SPIR-V validation")
 
 
 # ============================================================================
@@ -227,6 +257,120 @@ def test_cpu_optics():
     print("  [PASS] Suite 2b: thin-film ghosts, aperture polygon, CA, optical vignette, scratch layout")
 
 
+def test_cpu_vrs_reference():
+    var w = 24
+    var h = 16
+    # Tiles 0-1: affine ramp (bilinear-exact; the anchor grid of a tile reaches one pixel into its right
+    # and bottom neighbours); tile 2: checkerboard (nothing can be interpolated).
+    var p = List[Float32](length=w * h, fill=0.0)
+    for y in range(h):
+        for x in range(w):
+            if x < 16:
+                p[y * w + x] = Float32(0.2) + Float32(0.01) * Float32(x) + Float32(0.02) * Float32(y)
+            else:
+                p[y * w + x] = Float32(0.8) if ((x + y) & 1) == 0 else Float32(0.1)
+    var e_ramp = vrs_block_error_cpu(p, w, h, 0, 0, 4)
+    _assert(e_ramp[1] < 1.0e-5, "bilinear reconstruction of an affine ramp is exact")
+    _assert(vrs_tile_rate_cpu(p, w, h, 0, 0, 0.006, 0.0, 8.0, True) == SOTA_VRS_RATE_4X4, "smooth tile -> 4x4")
+    _assert(vrs_tile_rate_cpu(p, w, h, 0, 0, 0.006, 0.0, 8.0, False) == SOTA_VRS_RATE_2X2, "4x4 disallowed -> 2x2")
+    _assert(vrs_tile_rate_cpu(p, w, h, 2, 0, 0.006, 0.0, 8.0, True) == SOTA_VRS_RATE_1X1, "checkerboard -> full rate")
+    # A soft texture: 2x2 fails at rest and passes once motion blur hides it (tolerance x (1 + v / motion_px)).
+    var q = List[Float32](length=64, fill=0.0)
+    for y in range(8):
+        for x in range(8):
+            q[y * 8 + x] = Float32(0.5) + Float32(0.02) * Float32(((x * 7 + y * 3) % 5) - 2)
+    var rest = vrs_tile_rate_cpu(q, 8, 8, 0, 0, 0.006, 0.0, 8.0, True)
+    var moving = vrs_tile_rate_cpu(q, 8, 8, 0, 0, 0.006, 64.0, 8.0, True)
+    _assert(rest == SOTA_VRS_RATE_1X1, "fine texture at rest stays full rate")
+    _assert(moving > rest, "motion relaxes the rate")
+    _near(vrs_perceptual_cpu(1.0, 1.0), 0.5, 1.0e-6, "perceptual encoding l/(1+l)")
+    var rates = List[Int]()
+    rates.append(SOTA_VRS_RATE_1X1)
+    rates.append(SOTA_VRS_RATE_2X2)
+    rates.append(SOTA_VRS_RATE_4X4)
+    rates.append(SOTA_VRS_RATE_4X4)
+    _near(vrs_shaded_fraction(rates), (1.0 + 0.25 + 0.0625 * 2.0) / 4.0, 1.0e-6, "shaded fraction")
+    # Layout: shade list and the persistent rate map + skip masks sit inside the post region, apart from
+    # each other, below the UI prims at 1024 + 10 * max_pix.
+    for res in [(1920, 1080), (1280, 720), (640, 360), (333, 197)]:
+        var mp = res[0] * res[1]
+        var lay = SotaVrsLayout(res[0], res[1], mp)
+        var tiles = lay.tiles_x * lay.tiles_y
+        _assert(lay.list_off >= 1024 + 8 * mp + mp // 4, "VRS list after the saved bloom mip")
+        _assert(lay.list_end <= lay.rate_off, "VRS list below the rate map")
+        _assert(lay.mask_off >= lay.rate_off + tiles, "skip masks after the rate map")
+        _assert(lay.mask_off + 2 * tiles <= 1024 + 10 * mp, "skip masks below the UI prims")
+    print("  [PASS] Suite 2d: CPU VRS rate reference (ramp exact, checkerboard full rate, motion relax), layout")
+
+
+def test_cpu_dirt_texture():
+    var img = sota_lens_dirt_texture_cpu()
+    var again = sota_lens_dirt_texture_cpu()
+    var other = sota_lens_dirt_texture_cpu(1234)
+    _assert(len(img) == SOTA_DIRT_W * SOTA_DIRT_H, "dirt texture size")
+    var mean = Float32(0.0)
+    var mx = Float32(0.0)
+    var n_film = 0
+    var n_dense = 0
+    var same = True
+    var diff = 0
+    for i in range(len(img)):
+        var v = img[i]
+        mean += v
+        mx = max(mx, v)
+        if v > 0.02:
+            n_film += 1
+        if v > 0.3:
+            n_dense += 1
+        if v != again[i]:
+            same = False
+        if abs(v - other[i]) > 0.05:
+            diff += 1
+    var n = Float32(len(img))
+    mean /= n
+    var f_film = Float32(n_film) / n
+    var f_dense = Float32(n_dense) / n
+    print("    dirt texture " + String(SOTA_DIRT_W) + "x" + String(SOTA_DIRT_H) + ": mean " + String(mean) + ", max " + String(mx) + ", film coverage " + String(f_film) + ", dense " + String(f_dense))
+    _assert(same, "dirt texture is deterministic per seed")
+    _assert(Float32(diff) / n > 0.1, "another seed gives another lens")
+    _assert(mean > 0.02 and mean < 0.25, "dirt is a light film, not an opaque layer")
+    _assert(mx > 0.9, "dust specks reach full density")
+    _assert(f_film > 0.3, "haze / smudges cover a good part of the element")
+    _assert(f_dense > 0.003 and f_dense < 0.2, "dense marks (specks, smudge cores) are sparse")
+    # Spatial structure: smudges are low-frequency, so neighbouring texels correlate strongly.
+    var num = Float32(0.0)
+    var den = Float32(0.0)
+    for y in range(SOTA_DIRT_H):
+        for x in range(SOTA_DIRT_W - 1):
+            var a = img[y * SOTA_DIRT_W + x] - mean
+            var b = img[y * SOTA_DIRT_W + x + 1] - mean
+            num += a * b
+            den += a * a
+    _assert(num / den > 0.5, "dirt has spatial structure (lag-1 autocorrelation > 0.5)")
+    var packed = sota_pack_dirt_u8(img)
+    _assert(len(packed) == SOTA_DIRT_WORDS, "packed 4 texels / word")
+    var t = 12345
+    var q = Int((packed[t >> 2] >> UInt32((t & 3) * 8)) & 0xFF)
+    _near(Float32(q) / 255.0, img[t], 0.003, "8-bit packing")
+    # Layout: the persistent texture sits above the lens buffers and the VRS shade list, below the rate map.
+    for res in [(1920, 1080), (1280, 720), (640, 360), (320, 180)]:
+        var mp = res[0] * res[1]
+        var off = sota_dirt_offset(res[0], res[1], mp)
+        var vrs = SotaVrsLayout(res[0], res[1], mp)
+        var lens = sota_lens_layout(res[0], res[1], mp)
+        _assert(off != 0, "dirt texture fits")
+        _assert(off >= lens[6] + lens[0] * lens[1] * 8, "dirt after the lens buffers (incl. the streak)")
+        _assert(off >= vrs.list_end, "dirt after the VRS shade list")
+        _assert(off + SOTA_DIRT_WORDS <= vrs.rate_off, "dirt below the VRS rate map")
+    _assert(sota_dirt_offset(64, 64, 64 * 64) == 0, "tiny frames fall back to inline dirt")
+    var png = List[UInt32](length=len(img), fill=0)
+    for i in range(len(img)):
+        var g = UInt32(Int(img[i] * 255.0))
+        png[i] = UInt32(0xFF000000) | (g << 16) | (g << 8) | g
+    _save("build/sota_camera_dirt_texture.png", png, SOTA_DIRT_W, SOTA_DIRT_H)
+    print("  [PASS] Suite 2e: procedural lens-dirt texture: deterministic, film + specks + structure, layout")
+
+
 def test_cpu_dof_reference():
     var w = 48
     var h = 48
@@ -248,8 +392,9 @@ def test_cpu_dof_reference():
         if out[i].x > peak * Float32(0.5):
             area += 1
     var r_eq = sqrt(Float32(area) / Float32(3.14159265))
-    _near(e_out / e_in, 1.0, 0.12, "CPU DoF conserves the energy of a point light")
-    _near(r_eq, 7.5, 1.3, "CPU DoF disc radius = thin-lens CoC")
+    _near(e_out / e_in, 1.0, 0.02, "CPU DoF conserves the energy of a point light")
+    _near(r_eq, 7.5, 0.3, "CPU DoF disc radius = thin-lens CoC")
+    _near(peak, Float32(100.0) / (Float32(3.14159265) * 7.5 * 7.5), Float32(0.06), "CPU DoF disc brightness = energy / (pi r^2)")
 
     # (b) near field: an out-of-focus near half-plane (z = 1) spreads over the in-focus background (z = S).
     var rgb2 = List[Vec3](length=w * h, fill=Vec3(0.2, 0.2, 0.2))
@@ -355,6 +500,28 @@ def _frame(mut ren: FlintAaaVulkanRenderer, cam: PhysicalCameraModel, sc: _Scene
     return ren.readback_pixels()
 
 
+def _circle_overlap(a: Float32, b: Float32, d: Float32) -> Float32:
+    """Area of the intersection of circles of radii `a` and `b` whose centres are `d` apart."""
+    if d >= a + b:
+        return 0.0
+    if d <= abs(a - b):
+        var m = min(a, b)
+        return Float32(3.14159265) * m * m
+    var ca = (d * d + a * a - b * b) / (Float32(2.0) * d * a)
+    var cb = (d * d + b * b - a * a) / (Float32(2.0) * d * b)
+    var k = (-d + a + b) * (d + a - b) * (d - a + b) * (d + a + b)
+    return a * a * acos(ca) + b * b * acos(cb) - Float32(0.5) * sqrt(max(k, Float32(0.0)))
+
+
+def _disc_conv_half_max_radius(a: Float32, b: Float32) -> Float32:
+    """Radius at which disc(a) (*) disc(b) falls to half its peak (peak = area of the smaller disc)."""
+    var peak = _circle_overlap(a, b, 0.0)
+    var d = Float32(0.0)
+    while d < a + b and _circle_overlap(a, b, d) > peak * Float32(0.5):
+        d += Float32(0.005)
+    return d
+
+
 def _save(path: String, mut px: List[UInt32], w: Int, h: Int):
     _ = write_png(path, px, w, h)
 
@@ -421,9 +588,16 @@ def test_gpu_dof():
         if _luma(_lin(dot_dof[i])) > peak * Float32(0.5):
             area += 1
     var r_eq = sqrt(Float32(area) / Float32(3.14159265))
-    print("    bokeh: K=" + String(k) + " px, thin-lens r=" + String(want_r) + " px, GPU r_eq=" + String(r_eq) + ", energy ratio=" + String(e_dof / e_sharp))
-    _near(r_eq, want_r + 1.0, want_r * Float32(0.25) + 1.5, "GPU bokeh disc radius follows the thin lens")
-    _near(e_dof / e_sharp, 1.0, 0.2, "GPU bokeh conserves energy")
+    # The sharp dot is itself a disc (radius from its energy / peak); its bokeh is that disc convolved with
+    # the thin-lens CoC disc, whose half-maximum radius is solved analytically from the circle overlap.
+    var peak_sharp = Float32(0.0)
+    for i in range(w * h):
+        peak_sharp = max(peak_sharp, _luma(_lin(dot_sharp[i])))
+    var dot_r = sqrt(e_sharp / peak_sharp / Float32(3.14159265))
+    var want_half = _disc_conv_half_max_radius(dot_r, want_r)
+    print("    bokeh: K=" + String(k) + " px, thin-lens r=" + String(want_r) + " px, dot r=" + String(dot_r) + ", analytic half-max r=" + String(want_half) + ", GPU r_eq=" + String(r_eq) + ", energy ratio=" + String(e_dof / e_sharp))
+    _near(r_eq, want_half, 0.45, "GPU bokeh disc radius = thin-lens CoC disc (*) sharp dot, at half maximum")
+    _near(e_dof / e_sharp, 1.0, 0.04, "GPU bokeh conserves energy (+-4 %)")
 
     # Image diff vs the CPU reference on a 64x64 crop around the dot.
     var cw = 64
@@ -447,8 +621,57 @@ def test_gpu_dof():
             err += abs(g - c)
             norm += c
     var rel = err / max(norm, Float32(1e-6))
-    print("    GPU vs CPU-reference DoF relative L1 = " + String(rel))
-    _assert(rel < Float32(0.45), "GPU DoF matches the CPU reference (rel L1 " + String(rel) + ")")
+    var cpu_peak = Float32(0.0)
+    var cpu_e = Float32(0.0)
+    for i in range(cw * cw):
+        cpu_peak = max(cpu_peak, _luma(cpu_ref[i]))
+        cpu_e += _luma(cpu_ref[i])
+    var cpu_area = 0
+    for i in range(cw * cw):
+        if _luma(cpu_ref[i]) > cpu_peak * Float32(0.5):
+            cpu_area += 1
+    var cpu_r_eq = sqrt(Float32(cpu_area) / Float32(3.14159265))
+    print("    GPU vs CPU-reference DoF relative L1 = " + String(rel) + ", CPU r_eq=" + String(cpu_r_eq) + " peak GPU/CPU=" + String(peak / cpu_peak))
+    _assert(rel < Float32(0.2), "GPU DoF matches the CPU reference (rel L1 " + String(rel) + ")")
+    _near(cpu_r_eq, want_half, 0.45, "CPU reference disc radius at half maximum")
+    _near(r_eq, cpu_r_eq, 0.4, "GPU and CPU bokeh disc radius agree")
+    _near(peak / cpu_peak, 1.0, 0.06, "GPU and CPU bokeh disc brightness agree (+-6 %)")
+    _near(cpu_e / e_sharp, 1.0, 0.03, "CPU reference conserves energy")
+
+    # (c2) Large CoC (focus 1 m -> r = 18.5 px, taps from the prefiltered quarter-res level): still a flat,
+    # energy-conserving disc of the thin-lens size (no hot centre from a double-counted centre tap).
+    var cam_c2 = cam
+    cam_c2.focus_distance_m = 1.0
+    ren.sota_cam.camera = cam_c2
+    var big = _frame(ren, cam_c2, sc, 1)
+    var want_r2 = eval_coc_px_cpu(cam_c2.coc_infinity_radius_px(h), 1.0, 8.0 - 0.05, 32.0)
+    var want_half2 = _disc_conv_half_max_radius(dot_r, want_r2)
+    var e_big = Float32(0.0)
+    var peak_big = Float32(0.0)
+    var ring_sum = Float32(0.0)
+    var ring_n = 0
+    for y in range(h):
+        for x in range(w):
+            var l = _luma(_lin(big[y * w + x]))
+            e_big += l
+            peak_big = max(peak_big, l)
+            var dx = Float32(x - w // 2) + 0.5
+            var dy = Float32(y - h // 2) + 0.5
+            var rr = sqrt(dx * dx + dy * dy)
+            if rr > want_r2 * Float32(0.3) and rr < want_r2 * Float32(0.6):
+                ring_sum += l
+                ring_n += 1
+    var centre = _luma(_lin(big[(h // 2) * w + w // 2]))
+    var area_big = 0
+    for i in range(w * h):
+        if _luma(_lin(big[i])) > peak_big * Float32(0.5):
+            area_big += 1
+    var r_eq2 = sqrt(Float32(area_big) / Float32(3.14159265))
+    var flat = centre / (ring_sum / Float32(max(ring_n, 1)))
+    print("    large bokeh: thin-lens r=" + String(want_r2) + " analytic half-max r=" + String(want_half2) + " GPU r_eq=" + String(r_eq2) + " energy=" + String(e_big / e_sharp) + " centre/mid-disc=" + String(flat))
+    _near(r_eq2, want_half2, 0.8, "large GPU bokeh disc radius at half maximum")
+    _near(e_big / e_sharp, 1.0, 0.04, "large GPU bokeh conserves energy (+-4 %)")
+    _near(flat, 1.0, 0.08, "large GPU bokeh disc is flat (no hot centre)")
 
     # (d) Near field: red box at 1 m (focus 4 m) spreads over the sharp stripes beside it.
     ren.sota_cam.camera = cam
@@ -526,7 +749,6 @@ def test_gpu_lens_and_exposure():
     ren.sota_cam.enable_chromatic_aberration = True
     ren.sota_cam.ca_strength = 0.01
     var bar_ca = _frame(ren, cam, sc, 4)
-    ren.sota_cam.enable_chromatic_aberration = False
     var max_split = Float32(0.0)
     var max_split_ref = Float32(0.0)
     for x in range(160, w):
@@ -536,6 +758,36 @@ def test_gpu_lens_and_exposure():
         max_split_ref = max(max_split_ref, abs(r.x - r.z))
     _assert(max_split_ref < Float32(0.02), "no colour split without CA")
     _assert(max_split > Float32(0.25), "lateral CA splits R and B at the off-axis bar (" + String(max_split) + ")")
+
+    # Physical order: CA is part of the lens image, so it runs right after DoF and before bloom (lens
+    # scatter) and motion blur (shutter integration) see the image.
+    ren.sota_cam.enable_chromatic_aberration = True
+    ren.sota_cam.enable_dof = True
+    ren.bloom_intensity = 0.05
+    ren.enable_motion_blur = True
+    _ = _frame(ren, cam, sc, 4)
+    var names = List[String]()
+    for t in ren.get_gpu_pass_timings():
+        names.append(t.pass_name)
+    var i_dof = -1
+    var i_ca = -1
+    var i_bloom = -1
+    var i_mb = -1
+    for i in range(len(names)):
+        if names[i] == "SotaBokehDoF":
+            i_dof = i
+        elif names[i] == "SotaChromaticAberration":
+            i_ca = i
+        elif names[i] == "DualKawaseBloom5Mip":
+            i_bloom = i
+        elif names[i] == "TileMaxMotionBlur":
+            i_mb = i
+    print("    pass order: DoF " + String(i_dof) + ", CA " + String(i_ca) + ", bloom " + String(i_bloom) + ", motion blur " + String(i_mb))
+    _assert(i_dof >= 0 and i_ca > i_dof and i_bloom > i_ca and i_mb > i_ca, "CA runs after DoF and before bloom and motion blur")
+    ren.sota_cam.enable_chromatic_aberration = False
+    ren.sota_cam.enable_dof = False
+    ren.bloom_intensity = 0.0
+    ren.enable_motion_blur = False
 
     # Optical vignetting: strong wide open, none 2 stops down.
     ren.sota_cam.enable_optical_vignette = True
@@ -629,22 +881,95 @@ def test_gpu_lens_and_exposure():
         e_flare += _luma(_lin(flare[i]))
         e_dirty += _luma(_lin(dirty[i]))
     _assert(e_dirty > e_flare, "lens dirt adds scattered light")
+    _assert(ren.sota_cam.dirt_uploaded_off != 0, "procedural dirt texture uploaded")
+    ren.sota_cam.dirt_use_texture = False
+    var dirty_inline = _frame(ren, cam, sc, 5)
+    var n_differ = 0
+    for i in range(w * h):
+        if dirty_inline[i] != dirty[i]:
+            n_differ += 1
+    _assert(n_differ > w * h // 50, "the dirt texture (not the inline fallback) shapes the scattered light")
+    ren.sota_cam.dirt_use_texture = True
     _save("build/sota_camera_flare_dirt.png", dirty, w, h)
+    # Anamorphic streak: the bright source spreads along the horizontal, not the vertical.
+    ren.sota_cam.enable_dirt = False
+    ren.sota_cam.enable_flare = False
+    ren.sota_cam.enable_anamorphic_streak = True
+    ren.sota_cam.anamorphic_streak_intensity = 0.5
+    var streak = _frame(ren, cam, sc, 5)
+    ren.sota_cam.enable_anamorphic_streak = False
+    var off_h = Float32(0.0)
+    var off_v = Float32(0.0)
+    var off_h0 = Float32(0.0)
+    for d in [-60, -40, 40, 60]:
+        var xh = max(0, min(w - 1, sx + d))
+        var yv = max(0, min(h - 1, sy + d // 2))
+        off_h += _luma(_lin(streak[sy * w + xh]))
+        off_h0 += _luma(_lin(src_only[sy * w + xh]))
+        off_v += _luma(_lin(streak[yv * w + sx]))
+    _save("build/sota_camera_anamorphic_streak.png", streak, w, h)
+    print("    anamorphic streak: horizontal " + String(off_h) + " (without " + String(off_h0) + "), vertical " + String(off_v))
+    _assert(off_h > off_h0 + Float32(0.01), "anamorphic streak spreads light horizontally")
+    _assert(off_h > off_v * Float32(4.0), "anamorphic streak is horizontal")
     ren.shutdown()
-    print("  [PASS] Suite 3b: GPU EV100 exposure, lateral CA, optical vignette, ISO noise model, ghosts, dirt")
+    print("  [PASS] Suite 3b: GPU EV100 exposure, lateral CA, optical vignette, ISO noise model, ghosts, dirt texture, anamorphic streak")
 
 
-def _min_pass_ms(mut ren: FlintAaaVulkanRenderer, name: String, frames: Int, cam: PhysicalCameraModel, sc: _Scene) -> Tuple[Float64, Float64]:
-    var best = Float64(1e9)
-    var tsr_best = Float64(1e9)
+struct _Paired(Copyable, Movable):
+    """Paired timing samples: the measured pass and the contention probe (legacy 10-dispatch bloom,
+    ~0.5-0.7 ms at 720p on an idle GB10) recorded in the same frame."""
+    var pass_min: Float64   # best absolute pass time
+    var ratio_min: Float64  # best pass / probe ratio of one frame
+    var probe_min: Float64
+
+    def __init__(out self):
+        self.pass_min = 1.0e9
+        self.ratio_min = 1.0e9
+        self.probe_min = 1.0e9
+
+
+def _paired_sample(mut ren: FlintAaaVulkanRenderer, name: String, frames: Int, cam: PhysicalCameraModel, sc: _Scene) -> _Paired:
+    var r = _Paired()
     for _ in range(frames):
         _ = _frame(ren, cam, sc, 2)
+        var p = Float64(-1.0)
+        var q = Float64(-1.0)
         for t in ren.get_gpu_pass_timings():
             if t.pass_name == name:
-                best = min(best, t.gpu_ms)
-            if t.pass_name == "FlintTsrV3Resolve":
-                tsr_best = min(tsr_best, t.gpu_ms)
-    return (best, tsr_best)
+                p = t.gpu_ms
+            elif t.pass_name == "DualKawaseBloom5Mip":
+                q = t.gpu_ms
+        if p < 0.0 or q <= 0.0:
+            continue
+        r.pass_min = min(r.pass_min, p)
+        r.probe_min = min(r.probe_min, q)
+        r.ratio_min = min(r.ratio_min, p / q)
+    return r^
+
+
+def _budget(mut ren: FlintAaaVulkanRenderer, name: String, budget_ms: Float64, cam: PhysicalCameraModel, sc: _Scene) -> Bool:
+    """Shared-GPU budget check. Other clients time-slice the GPU in bursts; a burst inflates every
+    multi-dispatch pass of the frame it lands in, and a separately measured probe misses it. So each
+    sample frame carries the pass and the probe together, and a round passes when either the best absolute
+    time is within budget or the best same-frame pass/probe ratio is within `budget / 0.5 ms` (the idle
+    probe cost). Up to 4 rounds of 16 paired frames; only a miss that persists through all of them with
+    a quiet probe fails. A persistent miss with a busy probe is reported as a contention skip."""
+    var ratio_budget = budget_ms / 0.5
+    var best = _Paired()
+    for round in range(4):
+        var r = _paired_sample(ren, name, 16, cam, sc)
+        best.pass_min = min(best.pass_min, r.pass_min)
+        best.ratio_min = min(best.ratio_min, r.ratio_min)
+        best.probe_min = min(best.probe_min, r.probe_min)
+        if r.pass_min < budget_ms or r.ratio_min < ratio_budget:
+            print("    " + name + ": min " + String(best.pass_min) + " ms (budget " + String(budget_ms) + "), min pass/probe "
+                + String(best.ratio_min) + " (budget " + String(ratio_budget) + "), probe min " + String(best.probe_min) + " ms, round " + String(round + 1))
+            return True
+    print("    " + name + ": min " + String(best.pass_min) + " ms, min pass/probe " + String(best.ratio_min) + ", probe min " + String(best.probe_min) + " ms over 4 rounds")
+    if best.probe_min > 1.0:
+        print("  [WARN] " + name + " over budget while the GPU was time-sliced (probe " + String(best.probe_min) + " ms): not enforced")
+        return True
+    return False
 
 
 def test_gpu_budgets():
@@ -658,32 +983,82 @@ def test_gpu_budgets():
     var sc = _Scene(ren)
     var cam = PhysicalCameraModel(focal_length_mm=85.0, fstop=1.4, focus_distance_m=4.0, aperture_blades=7)
     ren.sota_cam.camera = cam
-    # Contention probe: the legacy 10-dispatch bloom costs ~0.6 ms at 720p on an idle GB10. When other
-    # processes time-slice the GPU, every multi-dispatch pass inflates to the slice length (~9 ms).
-    ren.bloom_intensity = 0.05
-    var bloom = _min_pass_ms(ren, "DualKawaseBloom5Mip", 12, cam, sc)
-    ren.bloom_intensity = 0.0
+    ren.bloom_intensity = 0.05  # the contention probe runs in every sample frame
     ren.sota_cam.enable_dof = True
-    var dof = _min_pass_ms(ren, "SotaBokehDoF", 24, cam, sc)
+    _assert(_budget(ren, "SotaBokehDoF", 2.0, cam, sc), "DoF within 2.0 ms at 720p")
     ren.sota_cam.enable_dof = False
     ren.sota_cam.enable_flare = True
     ren.sota_cam.enable_dirt = True
-    ren.sota_cam.enable_chromatic_aberration = True
     ren.sota_cam.enable_optical_vignette = True
     ren.sota_cam.enable_grain = True
-    var lens = _min_pass_ms(ren, "SotaLensSensor", 24, cam, sc)
-    print(
-        "    1280x720 GPU min ms: SotaBokehDoF=" + String(dof[0]) + " SotaLensSensor=" + String(lens[0])
-        + " (probe: legacy bloom " + String(bloom[0]) + ", TSR " + String(dof[1]) + ")"
-    )
-    if bloom[0] > 1.5:
-        print("  [WARN] GPU time-sliced with other processes (bloom probe " + String(bloom[0]) + " ms): budgets not enforced")
-    else:
-        # The GPU is shared with other apps; the budgets apply to the best (least contended) frame.
-        _assert(dof[0] < 2.0, "DoF within 2.0 ms at 720p")
-        _assert(lens[0] < 1.5, "lens + sensor within 1.5 ms at 720p")
+    _assert(_budget(ren, "SotaLensSensor", 1.5, cam, sc), "lens + sensor within 1.5 ms at 720p")
+    ren.sota_cam.enable_chromatic_aberration = True
+    _assert(_budget(ren, "SotaChromaticAberration", 0.6, cam, sc), "lateral CA within 0.6 ms at 720p")
     ren.shutdown()
-    print("  [PASS] Suite 3c: GPU time budgets at 1280x720")
+    print("  [PASS] Suite 3c: GPU time budgets at 1280x720 (paired with a same-frame contention probe)")
+
+
+def _read_post_word(ren: FlintAaaVulkanRenderer, word: Int) -> UInt32:
+    var out = List[UInt32](length=1, fill=0)
+    _ = external_call["memcpy", Int](Int(out.unsafe_ptr()), ren.buf_post_scratch.cpu_address + word * 4, 4)
+    return out[0]
+
+
+def _psnr(a: List[UInt32], b: List[UInt32]) -> Float64:
+    var se = Float64(0.0)
+    for i in range(len(a)):
+        for sh in [0, 8, 16]:
+            var d = Float64(Int((a[i] >> UInt32(sh)) & 0xFF)) - Float64(Int((b[i] >> UInt32(sh)) & 0xFF))
+            se += d * d
+    var mse = se / Float64(max(1, len(a) * 3))
+    if mse <= 1.0e-12:
+        return 200.0
+    return 10.0 * log10(255.0 * 255.0 / mse)
+
+
+def test_gpu_vrs():
+    var w = 640
+    var h = 360
+    var ren = FlintAaaVulkanRenderer(width=w, height=h, tsr_scale=1.0)
+    if not ren.active:
+        print("  [SKIP] Vulkan renderer unavailable")
+        return
+    _setup(ren)
+    var sc = _Scene(ren)
+    var cam = PhysicalCameraModel(focal_length_mm=35.0, fstop=8.0, focus_distance_m=4.0)
+    var lay = SotaVrsLayout(ren.render_w, ren.render_h, max(ren.output_w * ren.output_h, ren.render_w * ren.render_h))
+    var n_px = ren.render_w * ren.render_h
+    for kind in [3, 0]:
+        ren.sota_cam.enable_vrs = False
+        var full = List[UInt32]()
+        for _ in range(3):
+            full = _frame(ren, cam, sc, kind)
+        ren.sota_cam.enable_vrs = True
+        var on = List[UInt32]()
+        for _ in range(3):
+            on = _frame(ren, cam, sc, kind)
+        _assert(ren.sota_cam.vrs_active(ren.render_w, ren.render_h), "VRS pipelines active")
+        var shaded = Int(_read_post_word(ren, lay.list_off))
+        var rates = List[Int]()
+        for t in range(lay.tiles_x * lay.tiles_y):
+            rates.append(Int(_read_post_word(ren, lay.rate_off + t)))
+        var frac_rate = vrs_shaded_fraction(rates)
+        var frac = Float32(shaded) / Float32(n_px)
+        var q = _psnr(full, on)
+        print("    VRS " + ("flat wall" if kind == 3 else "stripes") + ": shaded " + String(frac) + " of pixels (rate map " + String(frac_rate) + "), PSNR vs full rate " + String(q) + " dB")
+        _assert(shaded > 0 and shaded <= n_px, "shade-list count in range")
+        _assert(frac >= frac_rate - Float32(0.01), "classify never shades fewer pixels than the rate map allows")
+        _assert(q > 45.0, "VRS output matches full-rate shading (PSNR > 45 dB)")
+        if kind == 3:
+            _assert(frac < 0.15, "flat wall shades mostly at 4x4 (< 15 % of pixels)")
+        else:
+            _assert(frac > 0.15 and frac < 0.9, "stripes keep full rate on the edges only")
+        if kind == 0:
+            _save("build/sota_camera_vrs_stripes.png", on, w, h)
+    ren.sota_cam.enable_vrs = False
+    _assert(not ren.sota_cam.vrs_active(ren.render_w, ren.render_h), "VRS off by setting")
+    ren.shutdown()
+    print("  [PASS] Suite 3d: compute VRS (rate map, compaction, fill): flat wall coarse, edges full rate, PSNR")
 
 
 def main():
@@ -691,8 +1066,11 @@ def main():
     test_spirv()
     test_cpu_camera_model()
     test_cpu_optics()
+    test_cpu_vrs_reference()
+    test_cpu_dirt_texture()
     test_cpu_dof_reference()
     test_gpu_dof()
     test_gpu_lens_and_exposure()
+    test_gpu_vrs()
     test_gpu_budgets()
     print("=== ALL sota:camera TESTS PASSED ===")
