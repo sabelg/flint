@@ -894,7 +894,14 @@ def main():
         app.shutdown()
         return
     _ = renderer.attach_window_surface(win_opt.value()[unsafe_offset=0].windows[0])
+    if renderer.uses_vulkan():
+        ref gpu = renderer.gpu_slot[0]
+        if gpu.vk.swapchain == 0:
+            gpu.deferred_readback = True
 
+    var out_w = SCREEN_W
+    var out_h = SCREEN_H
+    var frame_idx = 0
     var last_t = get_time()
     while True:
         var now = get_time()
@@ -905,6 +912,10 @@ def main():
         var w_opt = app.resources.get_ptr_mut[WindowStateResource]()
         if not w_opt or not w_opt.value()[unsafe_offset=0].is_open():
             break
+        if w_opt.value()[unsafe_offset=0].resized:
+            out_w = max(64, w_opt.value()[unsafe_offset=0].width)
+            out_h = max(64, w_opt.value()[unsafe_offset=0].height)
+            _ = renderer.resize(out_w, out_h)
 
         var inp_opt = app.resources.get_ptr[InputStateResource]()
         var inp = inp_opt.value()[unsafe_offset=0].input.copy() if inp_opt else InputState()
@@ -936,11 +947,22 @@ def main():
 
         dl.clear()
         _render_chapter(dl, game, font_slot, font)
-        _ = renderer.render_world(world, dl, capture_readback=False, force_readback=False)
-        if not renderer.uses_vulkan():
+        var need_rb = not renderer.surface.is_zero_copy_gpu()
+        _ = renderer.render_world(world, dl, capture_readback=need_rb, force_readback=False)
+        if need_rb:
+            var frame_px = renderer.readback_pixels()
             ref win_res = w_opt.value()[unsafe_offset=0]
             if len(win_res.windows) > 0:
-                win_res.windows[0].present(renderer.cpu_canvas.pixels, SCREEN_W, SCREEN_H)
+                win_res.windows[0].present(frame_px, renderer.width, renderer.height)
+        if frame_idx == 0:
+            print(
+                "[LongWayHome] Window live ("
+                + String(renderer.width) + "x" + String(renderer.height)
+                + ", vulkan=" + String(renderer.uses_vulkan())
+                + ", zero_copy=" + String(renderer.surface.is_zero_copy_gpu())
+                + ", prims=" + String(dl.count()) + ")"
+            )
+        frame_idx += 1
 
     renderer.shutdown()
     app.shutdown()
