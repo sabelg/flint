@@ -61,6 +61,7 @@ from flint.platform.vulkan import (
 from flint.render.spirv import MODEL_GL_COMPUTE
 from flint.render.shader_dsl import (
     BufferRef,
+    GpuBool,
     GpuF32,
     GpuU32,
     GpuVarF32,
@@ -92,7 +93,23 @@ from flint.render.sota_camera_dirt import (
     sota_pack_dirt_u8,
     sota_upload_dirt,
 )
+from flint.render.aaa_render_graph import AaaGpuPassTiming
+from flint.render.sota_camera_bokeh import (
+    SOTA_PUPIL_RADIUS_SCALE,
+    SOTA_PUPIL_SHIFT_SCALE,
+    SOTA_SQUEEZE_SCALE,
+    SotaPupilClip,
+    pupil_area_fraction_cpu,
+    pupil_area_fraction_dsl,
+    pupil_image_pos_cpu,
+    pupil_clip_mask_dsl,
+    sota_pack_pupil_radius_squeeze,
+    sota_pack_pupil_shifts,
+    sota_pupil_clip,
+)
+from flint.render.sota_camera_hdr import SotaHdrOutput, sota_hdr_scrgb_shader
 from flint.render.sota_camera_vrs import (
+    SotaVrsAuto,
     sota_vrs_classify_shader,
     sota_vrs_fill_shader,
     sota_vrs_rate_shader,
@@ -120,7 +137,11 @@ struct SotaCameraPost(Copyable, Movable):
 
     var enable_dof: Bool
     var dof_max_radius_px: Float32  # full-res px cap on CoC radius (<= 32)
-    var dof_cat_eye: Float32        # 0 = off, ~0.3 = strong cat's-eye bokeh towards the frame edge
+    # Optical vignetting of the pupil (`sota_camera_bokeh.mojo`), lens properties in wide-open pupil radii:
+    var dof_cat_eye: Float32        # front-rim clip shift per unit image radius (0 = off, 0.4-0.8 = fast prime)
+    var dof_cat_eye_rear: Float32   # rear-rim clip shift (opposite side; 0 = single clip)
+    var dof_clip_radius: Float32    # radius of the rim clips (>= 1: no clip on axis)
+    var dof_anamorphic_squeeze: Float32  # 1 = spherical; 1.33 / 1.5 / 2 = oval bokeh (taller than wide)
 
     var enable_flare: Bool
     var flare_intensity: Float32
@@ -149,6 +170,7 @@ struct SotaCameraPost(Copyable, Movable):
 
     var enable_optical_vignette: Bool
     var optical_vignette_amount: Float32
+    var optical_vignette_from_pupil: Bool  # brightness = transmitted pupil area of the cat's-eye model
 
     var enable_grain: Bool
     var grain_strength: Float32     # 1.0 = physical sensor noise for the camera's ISO
@@ -173,8 +195,18 @@ struct SotaCameraPost(Copyable, Movable):
     var vrs_rate_w: Int  # render size the current rate map was computed for (0: none yet)
     var vrs_rate_h: Int
     var pipe_vrs_rate: Int
+    # Round 3: rate map from the display word (1 word / px, after the display transform, before the UI)
+    # instead of the 8-word HDR buffer, and measured auto gating (`SotaVrsAuto`).
+    var vrs_rate_from_display: Bool
+    var vrs_display_threshold: Float32  # mean |error| in display code values (AgX sRGB / PQ), 0..1
+    var vrs_auto: Bool
+    var vrs_ctl: SotaVrsAuto
+    var vrs_rate_pending: Bool  # a rate map for the next frame was recorded this frame
+    var pipe_vrs_rate_disp: Int
     var pipe_vrs_classify: Int
     var pipe_vrs_fill: Int
+    var hdr: SotaHdrOutput  # HDR10 PQ / scRGB display mapping after AgX (sota_camera_hdr)
+    var pipe_hdr_scrgb: Int
     var frame_counter: UInt32
 
     def __init__(out self):
@@ -184,6 +216,9 @@ struct SotaCameraPost(Copyable, Movable):
         self.enable_dof = False
         self.dof_max_radius_px = Float32(32.0)
         self.dof_cat_eye = Float32(0.0)
+        self.dof_cat_eye_rear = Float32(0.0)
+        self.dof_clip_radius = Float32(1.1)
+        self.dof_anamorphic_squeeze = Float32(1.0)
         self.enable_flare = False
         self.flare_intensity = Float32(1.0)  # 1 = physical coated-lens ghost energy; games often use 30-300
         self.flare_threshold = Float32(2.0)
@@ -207,6 +242,7 @@ struct SotaCameraPost(Copyable, Movable):
         self.ca_strength = Float32(0.003)
         self.enable_optical_vignette = False
         self.optical_vignette_amount = Float32(1.0)
+        self.optical_vignette_from_pupil = False
         self.enable_grain = False
         self.grain_strength = Float32(1.0)
         self.pipe_dof_setup = 0
@@ -228,9 +264,21 @@ struct SotaCameraPost(Copyable, Movable):
         self.vrs_rate_w = 0
         self.vrs_rate_h = 0
         self.pipe_vrs_rate = 0
+        self.vrs_rate_from_display = True
+        self.vrs_display_threshold = Float32(0.008)
+        self.vrs_auto = True
+        self.vrs_ctl = SotaVrsAuto()
+        self.vrs_rate_pending = False
+        self.pipe_vrs_rate_disp = 0
         self.pipe_vrs_classify = 0
         self.pipe_vrs_fill = 0
+        self.hdr = SotaHdrOutput()
+        self.pipe_hdr_scrgb = 0
         self.frame_counter = 0
+
+    def pupil_clip(self) -> SotaPupilClip:
+        """This frame's barrel clips in aperture units (they grow relative to the aperture as it stops down)."""
+        return sota_pupil_clip(self.dof_cat_eye, self.dof_cat_eye_rear, self.dof_clip_radius, self.camera.fstop, self.camera.max_aperture_fstop)
 
     def any_lens_effect(self) -> Bool:
         """Effects of the late lens + sensor pass (after bloom / motion blur / metering). Lateral CA is
@@ -251,8 +299,10 @@ struct SotaCameraPost(Copyable, Movable):
         self.pipe_lens_composite = vk.create_aaa_compute_pipeline(pipe_layout, sota_lens_composite_shader())
         self.pipe_ca = vk.create_aaa_compute_pipeline(pipe_layout, sota_ca_shader())
         self.pipe_vrs_rate = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_rate_shader())
+        self.pipe_vrs_rate_disp = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_rate_shader(True))
         self.pipe_vrs_classify = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_classify_shader())
         self.pipe_vrs_fill = vk.create_aaa_compute_pipeline(pipe_layout, sota_vrs_fill_shader())
+        self.pipe_hdr_scrgb = vk.create_aaa_compute_pipeline(pipe_layout, sota_hdr_scrgb_shader())
         return self.pipelines_ready()
 
     def pipelines_ready(self) -> Bool:
@@ -272,11 +322,25 @@ struct SotaCameraPost(Copyable, Movable):
         )
 
     def vrs_pipelines_ready(self) -> Bool:
-        return self.pipe_vrs_rate != 0 and self.pipe_vrs_classify != 0 and self.pipe_vrs_fill != 0
+        return self.pipe_vrs_rate != 0 and self.pipe_vrs_rate_disp != 0 and self.pipe_vrs_classify != 0 and self.pipe_vrs_fill != 0
 
     def vrs_active(self, render_w: Int, render_h: Int) -> Bool:
-        """VRS shades this frame only with a rate map from the previous frame at the same render size."""
-        return self.enable_vrs and self.vrs_pipelines_ready() and self.vrs_rate_w == render_w and self.vrs_rate_h == render_h
+        """VRS shades this frame only with a rate map from the previous frame at the same render size (and,
+        with `vrs_auto`, only while the measured gain is positive or on a probe frame)."""
+        var on = self.enable_vrs and self.vrs_pipelines_ready() and self.vrs_rate_pending and self.vrs_rate_w == render_w and self.vrs_rate_h == render_h
+        if self.vrs_auto:
+            on = on and self.vrs_ctl.this_frame_vrs
+        return on
+
+    def vrs_rate_wanted(self) -> Bool:
+        """Record a rate map at the end of this frame (the next frame will shade with VRS)."""
+        if not (self.enable_vrs and self.vrs_pipelines_ready()):
+            return False
+        return (not self.vrs_auto) or self.vrs_ctl.next_frame_vrs()
+
+    def vrs_display_source(self) -> Bool:
+        """Rate map from the display word: on unless sensor grain would read as detail everywhere."""
+        return self.vrs_rate_from_display and not self.enable_grain
 
     def frame_sync(mut self, adapted_exposure: Float32, auto_exposure_on: Bool) -> Tuple[Float32, Float32]:
         """Exposure triangle for this frame. Returns `(base_exposure, motion_blur_shutter_fraction)`.
@@ -422,11 +486,40 @@ def optical_vignette_cpu(ndc_x: Float32, ndc_y: Float32, aspect: Float32, streng
     return Float32(1.0) - strength * Float32(0.6) * s
 
 
+def _pupil_soft_cpu(qx: Float32, qy: Float32, px: Float32, py: Float32, clip: SotaPupilClip, edge: Float32) -> Float32:
+    """CPU twin of `pupil_clip_mask_dsl` (front / rear rim clips, ramped over 1 / edge)."""
+    var fx = qx + clip.front_shift * px
+    var fy = qy + clip.front_shift * py
+    var rx = qx - clip.rear_shift * px
+    var ry = qy - clip.rear_shift * py
+    var mf = max(Float32(0.0), min(Float32(1.0), (clip.radius - sqrt(fx * fx + fy * fy)) * edge + Float32(0.5)))
+    var mr = max(Float32(0.0), min(Float32(1.0), (clip.radius - sqrt(rx * rx + ry * ry)) * edge + Float32(0.5)))
+    return mf * mr
+
+
 def eval_dof_cpu(
-    rgb: List[Vec3], depth_m: List[Float32], w: Int, h: Int, k_inf_px: Float32, focus_m: Float32, max_coc: Float32, blades: Int
+    rgb: List[Vec3],
+    depth_m: List[Float32],
+    w: Int,
+    h: Int,
+    k_inf_px: Float32,
+    focus_m: Float32,
+    max_coc: Float32,
+    blades: Int,
+    clip: SotaPupilClip = SotaPupilClip(Float32(1.0), Float32(0.0), Float32(0.0)),
+    squeeze: Float32 = 1.0,
+    frame_w: Int = 0,
+    frame_h: Int = 0,
+    crop_x0: Int = 0,
+    crop_y0: Int = 0,
 ) -> List[Vec3]:
     """Full-resolution CPU reference of the scatter-as-gather DoF (no half-res, no tiles: exhaustive
-    neighbourhood within `max_coc`). Used to validate disc radius and energy conservation."""
+    neighbourhood within `max_coc`). Used to validate disc radius and energy conservation.
+    Round 3: optional vignetted pupil (`clip`, cat's eye; the image position of a crop comes from
+    `frame_w x frame_h` and `crop_x0, crop_y0`) and anamorphic `squeeze` (oval bokeh)."""
+    var fw_all = frame_w if frame_w > 0 else w
+    var fh_all = frame_h if frame_h > 0 else h
+    var cat_on = clip.active()
     var coc = List[Float32](length=w * h, fill=0.0)
     for i in range(w * h):
         coc[i] = eval_coc_px_cpu(k_inf_px, focus_m, depth_m[i], max_coc)
@@ -445,22 +538,29 @@ def eval_dof_cpu(
                     var sx = max(0, min(w - 1, x + dx))
                     var sy = max(0, min(h - 1, y + dy))
                     var sc = coc[sy * w + sx]
-                    var d = sqrt(Float32(dx * dx + dy * dy))
+                    var dxs = Float32(dx) * squeeze  # pupil-space offset (the image is squeezed horizontally)
+                    var d = sqrt(dxs * dxs + Float32(dy * dy))
                     var theta = Float32(0.0)
                     if dx != 0 or dy != 0:
-                        theta = atan2(Float32(dy), Float32(dx))
+                        theta = atan2(Float32(dy), dxs)
                     var poly = aperture_poly_factor_cpu(theta, blades, 0.0, 0.0)
                     var d_eff = d / poly
                     var col = rgb[sy * w + sx]
                     var eff = min(max(sc, Float32(0.0)), max(c, Float32(0.0)))
-                    var wf = max(Float32(0.0), min(Float32(1.0), eff - d_eff + Float32(0.5))) / max(eff * eff, Float32(1.0))
+                    var m_far = Float32(1.0)
+                    var m_near = Float32(1.0)
+                    if cat_on:
+                        var ip = pupil_image_pos_cpu(Float32(crop_x0 + x) + Float32(0.5), Float32(crop_y0 + y) + Float32(0.5), fw_all, fh_all)
+                        m_far = _pupil_soft_cpu(-dxs / max(eff, Float32(1.0)), -Float32(dy) / max(eff, Float32(1.0)), ip[0], ip[1], clip, max(eff, Float32(1.0)))
+                        m_near = _pupil_soft_cpu(dxs / max(-sc, Float32(1.0)), Float32(dy) / max(-sc, Float32(1.0)), ip[0], ip[1], clip, max(-sc, Float32(1.0)))
+                    var wf = max(Float32(0.0), min(Float32(1.0), eff - d_eff + Float32(0.5))) / max(eff * eff, Float32(1.0)) * m_far
                     if wf > Float32(0.0):
                         far_acc = far_acc + col * wf
                         far_w += wf
                     if sc < Float32(-0.5):
                         var r = -sc
                         var gate = max(Float32(0.0), min(Float32(1.0), (r - Float32(0.5)) * Float32(2.0)))
-                        var wn = max(Float32(0.0), min(Float32(1.0), r - d_eff + Float32(0.5))) / max(r * r, Float32(1.0)) * gate
+                        var wn = max(Float32(0.0), min(Float32(1.0), r - d_eff + Float32(0.5))) / max(r * r, Float32(1.0)) * gate * m_near
                         near_acc = near_acc + col * wn
                         near_w += wn
                     near_cnt += Float32(1.0)
@@ -470,7 +570,11 @@ def eval_dof_cpu(
             var res = sharp * (Float32(1.0) - fb) + far_col * fb
             if near_w > Float32(0.0):
                 # coverage: sum of 1/r^2 weights over the pi r^2 footprint ~= pi when fully covered
-                var alpha = max(Float32(0.0), min(Float32(1.0), near_w / Float32(3.14159265)))
+                var cover = Float32(3.14159265)
+                if cat_on:
+                    var ipc = pupil_image_pos_cpu(Float32(crop_x0 + x) + Float32(0.5), Float32(crop_y0 + y) + Float32(0.5), fw_all, fh_all)
+                    cover *= pupil_area_fraction_cpu(ipc[0], ipc[1], clip, 48)
+                var alpha = max(Float32(0.0), min(Float32(1.0), near_w / max(cover, Float32(1.0e-3))))
                 var near_col = near_acc * (Float32(1.0) / near_w)
                 res = res * (Float32(1.0) - alpha) + near_col * alpha
             out[y * w + x] = res
@@ -699,13 +803,19 @@ def _dof_gather_taps(
     blades: GpuF32,
     rot: GpuF32,
     curv: GpuF32,
-    cat: GpuF32,
-    cat_x: GpuF32,
-    cat_y: GpuF32,
+    cat_on: GpuBool,
+    cfx: GpuF32,
+    cfy: GpuF32,
+    crx: GpuF32,
+    cry: GpuF32,
+    clip_r: GpuF32,
+    inv_squeeze: GpuF32,
     far_acc: GpuVarVec3,
     far_w: GpuVarF32,
     near_acc: GpuVarVec3,
     near_w: GpuVarF32,
+    k_full: GpuVarF32,
+    k_masked: GpuVarF32,
 ):
     var fw1 = hw.to_f32() - Float32(1.0)
     var fh1 = hh.to_f32() - Float32(1.0)
@@ -725,11 +835,8 @@ def _dof_gather_taps(
             var by = r_norm * sin(theta)
             var ux = (bx * rot_c - by * rot_s) * poly
             var uy = (bx * rot_s + by * rot_c) * poly
-            var cx = ux + cat_x
-            var cy = uy + cat_y
-            var cat_w = _saturate((dsl.f32(1.0) - sqrt_f(cx * cx + cy * cy)) * Float32(6.0) + Float32(1.0))
-            cat_w = select_f(cat.gt(0.001), cat_w, dsl.f32(1.0))
-            var ox = ux * big_r
+            # Oval (anamorphic) bokeh: the pupil image is squeezed horizontally.
+            var ox = ux * big_r * inv_squeeze
             var oy = uy * big_r
             var d = r_norm * big_r
             var s_rgb: GpuVec3
@@ -747,16 +854,25 @@ def _dof_gather_taps(
                 s_c = b_post.load_f32(s_off + UInt32(3))
             # Far field: background never spreads further than the centre's own CoC.
             var eff = min_f(max_f(s_c, 0.0), c_far)
-            var wf = _saturate(eff - d + Float32(0.5)) / max_f(eff * eff, 1.0) * cat_w * area
+            # Cat's eye (`sota_camera_bokeh.mojo`): the source's own vignetted pupil must contain this pixel,
+            # i.e. the pupil point -u, in units of the source's CoC (far field: inverted through focus).
+            var far_scale = big_r / max_f(eff, 1.0)
+            var m_far = select_f(cat_on, pupil_clip_mask_dsl(dsl, -ux * far_scale, -uy * far_scale, cfx, cfy, crx, cry, clip_r, max_f(eff, 1.0)), dsl.f32(1.0))
+            var wf = _saturate(eff - d + Float32(0.5)) / max_f(eff * eff, 1.0) * m_far * area
             far_acc.set(far_acc.get() + s_rgb * wf)
             far_w.set(far_w.get() + wf)
             # Near field: foreground spreads by its own CoC; density-normalised coverage.
             # Only real defocus belongs to the near layer: a CoC under 0.5 px is in focus (gate ramps to 1 at 1 px).
             var nr = max_f(-s_c, 0.0)
             var gate = _saturate((nr - Float32(0.5)) * Float32(2.0))
-            var wn = _saturate(nr - d + Float32(0.5)) * big_r * big_r / max_f(nr * nr, 1.0) * gate * cat_w * area
+            var near_scale = big_r / max_f(nr, 1.0)
+            var m_near = select_f(cat_on, pupil_clip_mask_dsl(dsl, ux * near_scale, uy * near_scale, cfx, cfy, crx, cry, clip_r, max_f(nr, 1.0)), dsl.f32(1.0))
+            var wn = _saturate(nr - d + Float32(0.5)) * big_r * big_r / max_f(nr * nr, 1.0) * gate * m_near * area
             near_acc.set(near_acc.get() + s_rgb * wn)
             near_w.set(near_w.get() + wn)
+            # Kernel area with and without the clip (for the near-field coverage normalisation).
+            k_full.set(k_full.get() + area)
+            k_masked.set(k_masked.get() + area * select_f(cat_on, pupil_clip_mask_dsl(dsl, ux, uy, cfx, cfy, crx, cry, clip_r, max_f(big_r, 1.0)), dsl.f32(1.0)))
 
 
 @always_inline
@@ -770,8 +886,9 @@ def _poly_factor_dsl_rt(mut dsl: ShaderDsl, theta: GpuF32, blades: GpuF32, rot: 
 
 def sota_dof_gather_shader() -> List[UInt32]:
     """Push: 0 hw, 1 hh, 2 src_off, 3 tile_off, 4 tiles_x, 5 tiles_y, 6 out_off, 7 max_r (half px),
-    8 blades (f, >= 3; 64 = round), 9 blade rotation (rad), 10 cat's-eye amount, 11 blade curvature,
-    12 level1_off, 13 qw, 14 qh. Taps come from the prefiltered quarter-res level once the kernel radius
+    8 blades (f, >= 3; 64 = round), 9 blade rotation (rad), 10 pupil clip shifts (u16 front | u16 rear << 16,
+    x 4096, aperture units; 0 = no cat's eye), 11 blade curvature, 12 level1_off, 13 qw, 14 qh,
+    15 clip radius (u16, x 2048) | anamorphic squeeze (u16 x 16384) << 16 (0 = 1). Taps come from the prefiltered quarter-res level once the kernel radius
     exceeds 6 half px (tap spacing > 2 px).
     Output per half pixel (8 words): far.rgb, centre CoC, near.rgb * alpha, alpha."""
     var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
@@ -788,8 +905,9 @@ def sota_dof_gather_shader() -> List[UInt32]:
     var max_r = max_f(dsl.push_f32(7), 1.0)
     var blades = dsl.push_f32(8)
     var rot = dsl.push_f32(9)
-    var cat = dsl.push_f32(10)
+    var pupil_shift = dsl.push_u32(10)
     var curv = clamp_f(dsl.push_f32(11), 0.0, 1.0)
+    var pupil_rs = dsl.push_u32(15)
     var l1 = dsl.push_u32(12)
     var qw = dsl.push_u32(13)
     var qh = dsl.push_u32(14)
@@ -826,11 +944,21 @@ def sota_dof_gather_shader() -> List[UInt32]:
 
     var fpx = px.to_f32()
     var fpy = py.to_f32()
-    # Cat's eye: exit pupil clipped by the lens barrel; the clip circle slides with the image position.
-    var ndc_x = (fpx + Float32(0.5)) / hw.to_f32() * Float32(2.0) - Float32(1.0)
-    var ndc_y = (fpy + Float32(0.5)) / hh.to_f32() * Float32(2.0) - Float32(1.0)
-    var cat_x = ndc_x * cat
-    var cat_y = ndc_y * cat
+    # Cat's eye: the pupil is clipped by the front / rear barrel rims, whose images slide with the image
+    # position `p` (|p| = 1 at the frame corner, aspect-correct). Shifts / radius are in aperture units.
+    var half_diag = sqrt_f(hw.to_f32() * hw.to_f32() + hh.to_f32() * hh.to_f32()) * Float32(0.5)
+    var img_x = (fpx + Float32(0.5) - hw.to_f32() * Float32(0.5)) / half_diag
+    var img_y = (fpy + Float32(0.5) - hh.to_f32() * Float32(0.5)) / half_diag
+    var sh_f = (pupil_shift & UInt32(0xFFFF)).to_f32() * Float32(1.0 / SOTA_PUPIL_SHIFT_SCALE)
+    var sh_r = (pupil_shift >> UInt32(16)).to_f32() * Float32(1.0 / SOTA_PUPIL_SHIFT_SCALE)
+    var clip_r = (pupil_rs & UInt32(0xFFFF)).to_f32() * Float32(1.0 / SOTA_PUPIL_RADIUS_SCALE)
+    var sq_raw = (pupil_rs >> UInt32(16)).to_f32() * Float32(1.0 / SOTA_SQUEEZE_SCALE)
+    var inv_squeeze = select_f(sq_raw.gt(0.2), dsl.f32(1.0) / max_f(sq_raw, 0.2), dsl.f32(1.0))
+    var cat_on = pupil_shift.ne(UInt32(0))
+    var cfx = -sh_f * img_x
+    var cfy = -sh_f * img_y
+    var crx = sh_r * img_x
+    var cry = sh_r * img_y
     # Interleaved gradient noise (Jimenez 2014) -> per-pixel pattern rotation.
     var ign = fract_f(Float32(52.9829189) * fract_f(fpx * Float32(0.06711056) + fpy * Float32(0.00583715)))
     var phi = ign * Float32(6.283185307 / 8.0)
@@ -853,16 +981,21 @@ def sota_dof_gather_shader() -> List[UInt32]:
     var wn_c = big_r * big_r / max_f(near_r_c * near_r_c, 1.0) * _saturate((near_r_c - Float32(0.5)) * Float32(2.0)) * a_c
     var near_acc = dsl.var_vec3(c_src * wn_c)
     var near_w = dsl.var_f32(wn_c)
+    var k_full = dsl.var_f32_const(0.0)
+    var k_masked = dsl.var_f32_const(0.0)
     dsl.if_then(big_r.gt(6.0))
-    _dof_gather_taps(dsl, b_post, True, src, l1, hw, hh, qw, qh, fpx, fpy, big_r, c_far, rot_c, rot_s, phi, jr, blades, rot, curv, cat, cat_x, cat_y, far_acc, far_w, near_acc, near_w)
+    _dof_gather_taps(dsl, b_post, True, src, l1, hw, hh, qw, qh, fpx, fpy, big_r, c_far, rot_c, rot_s, phi, jr, blades, rot, curv, cat_on, cfx, cfy, crx, cry, clip_r, inv_squeeze, far_acc, far_w, near_acc, near_w, k_full, k_masked)
     dsl.else_branch()
-    _dof_gather_taps(dsl, b_post, False, src, l1, hw, hh, qw, qh, fpx, fpy, big_r, c_far, rot_c, rot_s, phi, jr, blades, rot, curv, cat, cat_x, cat_y, far_acc, far_w, near_acc, near_w)
+    _dof_gather_taps(dsl, b_post, False, src, l1, hw, hh, qw, qh, fpx, fpy, big_r, c_far, rot_c, rot_s, phi, jr, blades, rot, curv, cat_on, cfx, cfy, crx, cry, clip_r, inv_squeeze, far_acc, far_w, near_acc, near_w, k_full, k_masked)
     dsl.end_if()
 
     var far_col = far_acc.get() / max_f(far_w.get(), 1.0e-12)
     var nw = near_w.get()
-    # Coverage: the area-weighted near weights sum to ~pi over a fully covered kernel.
-    var alpha = _saturate(nw * Float32(1.0 / 3.14159265))
+    # Coverage: the area-weighted near weights sum to ~pi over a fully covered kernel. With the pupil
+    # clipped, a fully covered kernel only reaches the clipped area, so rescale by full / masked area
+    # (exactly 1 without the cat's eye) or a clipped foreground would turn translucent.
+    var clip_norm = select_f(cat_on, k_full.get() / max_f(k_masked.get(), 1.0e-3), dsl.f32(1.0))
+    var alpha = _saturate(nw * clip_norm * Float32(1.0 / 3.14159265))
     var near_pm = near_acc.get() * (alpha / max_f(nw, 1.0e-6))
     b_post.store_vec3(o, far_col)
     b_post.store_f32(o + UInt32(3), c)
@@ -1177,9 +1310,10 @@ def sota_streak_shader() -> List[UInt32]:
 
 def sota_lens_composite_shader() -> List[UInt32]:
     """Push: 0 W, 1 H, 2 anamorphic streak intensity, 3 flags (1 flare, 2 dirt, 8 vignette, 16 grain,
-    32 anamorphic streak; lateral CA is its own earlier pass), 4 qw, 5 qh, 6 ghost_off, 7 glow_off (wide
+    32 anamorphic streak, 64 pupil-model vignette with the clip radius (u16 x 2048) in bits 16-31; lateral CA
+    is its own earlier pass), 4 qw, 5 qh, 6 ghost_off, 7 glow_off (wide
     bright average), 8 flare_intensity, 9 dirt_intensity, 10 dirt texture offset (0: inline procedural
-    fallback), 11 optical vignette strength, 12 grain photons per unit signal (Q), 13 read noise^2,
+    fallback), 11 optical vignette strength (flag 64: packed pupil clip shifts), 12 grain photons per unit signal (Q), 13 read noise^2,
     14 grain strength, 15 frame counter."""
     var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
     var b_hdr = dsl.buffer[8](BIND_AAA_HDR_OUT)
@@ -1212,6 +1346,18 @@ def sota_lens_composite_shader() -> List[UInt32]:
     var base = b_hdr.base_word(py * w_u + px)
     var col = dsl.var_vec3(b_hdr.load_vec3(base))
 
+    # Optical vignetting from the pupil model (flag 64): transmitted area of the cat's-eye pupil, the same
+    # clips the DoF gather uses (push 11 = packed shifts, flags bits 16-31 = clip radius).
+    dsl.if_then((flags & UInt32(64)).ne(UInt32(0)))
+    var pw = vig.bitcast_u32()
+    var p_front = (pw & UInt32(0xFFFF)).to_f32() * Float32(1.0 / SOTA_PUPIL_SHIFT_SCALE)
+    var p_rear = (pw >> UInt32(16)).to_f32() * Float32(1.0 / SOTA_PUPIL_SHIFT_SCALE)
+    var p_rad = (flags >> UInt32(16)).to_f32() * Float32(1.0 / SOTA_PUPIL_RADIUS_SCALE)
+    var hd = sqrt_f(fw * fw + fh * fh) * Float32(0.5)
+    var ipx = (px.to_f32() + Float32(0.5) - fw * Float32(0.5)) / hd
+    var ipy = (py.to_f32() + Float32(0.5) - fh * Float32(0.5)) / hd
+    col.set(col.get() * pupil_area_fraction_dsl(dsl, ipx, ipy, p_front, p_rear, p_rad))
+    dsl.end_if()
     # Optical (cat's-eye) vignetting, strength already scaled by the f-stop on the CPU.
     dsl.if_then((flags & UInt32(8)).ne(UInt32(0)))
     var aspect = fw / fh
@@ -1423,8 +1569,11 @@ def sota_camera_record_dof(
     var p2 = _push()
     p2[0] = UInt32(hw); p2[1] = UInt32(hh); p2[2] = UInt32(lay.setup_off); p2[3] = UInt32(lay.tile_off)
     p2[4] = UInt32(lay.tx); p2[5] = UInt32(lay.ty); p2[6] = UInt32(lay.gather_off); p2[7] = _fb(max_coc * Float32(0.5))
-    p2[8] = _fb(blades); p2[9] = _fb(cam.blade_rotation_deg * Float32(0.017453293)); p2[10] = _fb(post.dof_cat_eye); p2[11] = _fb(curv)
+    p2[8] = _fb(blades); p2[9] = _fb(cam.blade_rotation_deg * Float32(0.017453293)); p2[11] = _fb(curv)
     p2[12] = UInt32(lay.level1_off); p2[13] = UInt32(lay.qw); p2[14] = UInt32(lay.qh)
+    var clip = post.pupil_clip()
+    p2[10] = sota_pack_pupil_shifts(clip) if clip.active() else UInt32(0)
+    p2[15] = sota_pack_pupil_radius_squeeze(clip, post.dof_anamorphic_squeeze)
     vk.dispatch_aaa(slot, post.pipe_dof_gather, pipe_layout, desc_set, p2, (hw + 7) // 8, (hh + 7) // 8)
     _barrier(vk, slot)
 
@@ -1523,8 +1672,12 @@ def sota_camera_record_lens(
         flags |= 1
     if post.enable_dirt:
         flags |= 2
-    if post.enable_optical_vignette:
+    var clip = post.pupil_clip()
+    var pupil_vig = post.enable_optical_vignette and post.optical_vignette_from_pupil
+    if post.enable_optical_vignette and not pupil_vig:
         flags |= 8
+    if pupil_vig:
+        flags |= 64 | (UInt32(max(Float32(0.0), min(Float32(65535.0), clip.radius * SOTA_PUPIL_RADIUS_SCALE + Float32(0.5)))) << 16)
     if post.enable_grain:
         flags |= 16
     if post.enable_anamorphic_streak:
@@ -1534,7 +1687,7 @@ def sota_camera_record_lens(
     pl[0] = UInt32(out_w); pl[1] = UInt32(out_h); pl[2] = _fb(post.anamorphic_streak_intensity); pl[3] = flags
     pl[4] = UInt32(qw); pl[5] = UInt32(qh); pl[6] = UInt32(lay[5]); pl[7] = UInt32(lay[6])
     pl[8] = _fb(post.flare_intensity); pl[9] = _fb(post.dirt_intensity); pl[10] = UInt32(dirt_off)
-    pl[11] = _fb(cam.optical_vignette_strength() * post.optical_vignette_amount)
+    pl[11] = sota_pack_pupil_shifts(clip) if pupil_vig else _fb(cam.optical_vignette_strength() * post.optical_vignette_amount)
     pl[12] = _fb(q_ph); pl[13] = _fb(cam.read_noise_photons * cam.read_noise_photons); pl[14] = _fb(post.grain_strength)
     pl[15] = post.frame_counter
     post.frame_counter += 1
@@ -1593,18 +1746,38 @@ def sota_camera_record_vrs_rate(
     mut next_q: Int,
     q_limit: Int,
     mut prof_pairs: List[Tuple[String, Int]],
+    disp_off: Int = 0,
+    disp_pq: Bool = False,
 ):
-    """End of the post chain (before lens noise): the rate map the next frame's shading uses."""
-    if not (post.enable_vrs and post.vrs_pipelines_ready()):
-        post.vrs_rate_w = 0
-        post.vrs_rate_h = 0
+    """Rate map the next frame's shading uses. Called twice per frame: from the hook before the lens pass
+    (`disp_off == 0`, HDR source: only when the display source is off, e.g. with sensor grain) and from the
+    hook right after the display transform (`disp_off > 0`, display source, the round-3 default)."""
+    if disp_off == 0:
+        post.vrs_rate_pending = False
+    if not post.vrs_rate_wanted():
+        if not (post.enable_vrs and post.vrs_pipelines_ready()):
+            post.vrs_rate_w = 0
+            post.vrs_rate_h = 0
+            post.vrs_ctl.reset()
         return
+    var from_disp = disp_off > 0
+    if from_disp != post.vrs_display_source():
+        return
+    var pipe = post.pipe_vrs_rate_disp if from_disp else post.pipe_vrs_rate
+    var thr = post.vrs_display_threshold if from_disp else post.vrs_threshold
     sota_vrs_record_rate(
-        vk, slot, post.pipe_vrs_rate, pipe_layout, desc_set, out_w, out_h, render_w, render_h, max_pix,
-        post.vrs_threshold, post.vrs_motion_px, post.vrs_allow_4x4, use_prof, next_q, q_limit, prof_pairs,
+        vk, slot, pipe, pipe_layout, desc_set, out_w, out_h, render_w, render_h, max_pix,
+        thr, post.vrs_motion_px, post.vrs_allow_4x4, disp_off, disp_pq, use_prof, next_q, q_limit, prof_pairs,
     )
     post.vrs_rate_w = render_w
     post.vrs_rate_h = render_h
+    post.vrs_rate_pending = True
+
+
+def sota_camera_vrs_begin_frame(mut post: SotaCameraPost, timings: List[AaaGpuPassTiming]):
+    """Start of the shading part of a frame: feed the auto controller the last completed frame's timings."""
+    if post.enable_vrs and post.vrs_auto:
+        post.vrs_ctl.observe(timings)
 
 
 def sota_camera_record_vrs_classify(

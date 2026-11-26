@@ -541,6 +541,7 @@ struct VulkanGpu(Copyable, Movable):
     var has_dma_buf: Bool
     var has_calibration: Bool
     var has_swapchain: Bool
+    var has_hdr_metadata: Bool  # --- sota:camera hook (VK_EXT_hdr_metadata enabled) ---
     var has_wayland_surface: Bool
     var has_xcb_surface: Bool
     var has_xlib_surface: Bool
@@ -652,6 +653,7 @@ struct VulkanGpu(Copyable, Movable):
         self.has_dma_buf = False
         self.has_calibration = False
         self.has_swapchain = False
+        self.has_hdr_metadata = False  # --- sota:camera hook ---
         self.has_display_surface = False
         self.display = 0
         self.has_wayland_surface = False
@@ -1064,6 +1066,11 @@ struct VulkanGpu(Copyable, Movable):
         if "VK_KHR_swapchain" in offered:
             extensions.append("VK_KHR_swapchain")
             self.has_swapchain = True
+            # --- sota:camera hook (HDR mastering metadata for HDR10 / scRGB swapchains) ---
+            if "VK_EXT_hdr_metadata" in offered:
+                extensions.append("VK_EXT_hdr_metadata")
+                self.has_hdr_metadata = True
+            # --- end sota:camera hook ---
         var want_rt = (
             self.device_type != 4
             and "VK_KHR_acceleration_structure" in offered

@@ -396,6 +396,16 @@ from flint.render.sota_camera_post import (
     sota_camera_record_vrs_classify,
     sota_camera_record_vrs_fill,
     sota_camera_record_vrs_rate,
+    sota_camera_vrs_begin_frame,
+)
+from flint.render.sota_camera_hdr import (  # --- sota:camera hook ---
+    SOTA_DISPLAY_AGX_HDR,
+    sota_hdr_record_scrgb,
+    sota_hdr_tonemap_mode,
+    sota_hdr_tonemap_push,
+    sota_hdr_ui_mode,
+    sota_hdr_ui_paper_push,
+    sota_hdr_update_metadata,
 )
 # --- end sota:camera hook ---
 # --- sota:atmo hook (import) ---
@@ -5352,6 +5362,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:camera hook (compute VRS: classify + compact the pixels to shade) ---
         var sota_vrs_list = 0
         if not self.furnace_white_dome:
+            sota_camera_vrs_begin_frame(self.sota_cam, self.render_graph.pass_timings)
             sota_vrs_list = sota_camera_record_vrs_classify(
                 self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set,
                 self.render_w, self.render_h, max_pix, use_prof, next_q, q_limit, prof_pairs,
@@ -6124,6 +6135,9 @@ struct FlintAaaVulkanRenderer(Movable):
             next_q += 2
             prof_pairs.append((String("CinemaDisplayTonemap"), q_dt))
         var disp_tonemap_mode = UInt32(2) if self.display_mode == AAA_DISPLAY_SCRGB_FP16 else self.display_mode
+        # --- sota:camera hook (HDR display mapping after AgX when the output is HDR10 / scRGB) ---
+        disp_tonemap_mode = sota_hdr_tonemap_mode(self.sota_cam.hdr, self.display_mode, disp_tonemap_mode)
+        # --- end sota:camera hook ---
         var push_dt = List[UInt32](length=16, fill=0)
         push_dt[0] = UInt32(self.output_w)
         push_dt[1] = UInt32(self.output_h)
@@ -6135,6 +6149,7 @@ struct FlintAaaVulkanRenderer(Movable):
         push_dt[7] = UInt32(safe_bloom_mip_off)
         push_dt[8] = bitcast[DType.uint32](self.grade_saturation - Float32(1.0))
         push_dt[9] = bitcast[DType.uint32](self.grade_contrast - Float32(1.0))
+        sota_hdr_tonemap_push(self.sota_cam.hdr, push_dt)  # --- sota:camera hook (Push[10..12]) ---
         self.vk.dispatch_aaa(
             cur_slot,
             self.pipe_display_tonemap,
@@ -6146,6 +6161,14 @@ struct FlintAaaVulkanRenderer(Movable):
         )
         if use_prof and q_dt + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_dt + 1, PIPELINE_BOTTOM)
+        # --- sota:camera hook (compute VRS rate map from the display words, before the UI overlay) ---
+        if not self.furnace_white_dome:
+            sota_camera_record_vrs_rate(
+                self.sota_cam, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.output_w, self.output_h,
+                self.render_w, self.render_h, max_pix, use_prof, next_q, q_limit, prof_pairs,
+                out_ldr_off, sota_hdr_ui_mode(disp_tonemap_mode) == UInt32(1),
+            )
+        # --- end sota:camera hook ---
 
         # Feature 15: Tile-Binned GPU UiSdfOverlayPass (<0.04 ms GPU UI rendering)
         if self.ui_draw_list.count() > 0:
@@ -6188,7 +6211,8 @@ struct FlintAaaVulkanRenderer(Movable):
             push_ui[2] = UInt32(prim_cnt)
             push_ui[3] = UInt32(prims_word_offset)
             push_ui[4] = UInt32(out_ldr_off)
-            push_ui[5] = disp_tonemap_mode
+            push_ui[5] = sota_hdr_ui_mode(disp_tonemap_mode)  # --- sota:camera hook (mapped HDR composes in PQ) ---
+            push_ui[6] = sota_hdr_ui_paper_push(self.sota_cam.hdr, disp_tonemap_mode)
             self.vk.dispatch_aaa(
                 cur_slot,
                 self.pipe_ui_overlay,
@@ -6207,6 +6231,14 @@ struct FlintAaaVulkanRenderer(Movable):
         # Extended Linear scRGB `R16G16B16A16_SFLOAT` (`8` bytes/pixel `RGBA16F`, `1.0 = 80 nits`) Output Pack!
         var scrgb_swapchain = self.vk.swapchain != 0 and self.vk.swapchain_format == FORMAT_R16G16B16A16_SFLOAT
         var want_scrgb_fp16 = (self.display_mode == AAA_DISPLAY_SCRGB_FP16) or scrgb_swapchain
+        # --- sota:camera hook (mapped HDR: PQ word incl. UI -> scRGB fp16; replaces the raw linear pack) ---
+        if want_scrgb_fp16 and disp_tonemap_mode == SOTA_DISPLAY_AGX_HDR and self.sota_cam.pipe_hdr_scrgb != 0:
+            sota_hdr_record_scrgb(
+                self.vk, cur_slot, self.sota_cam.pipe_hdr_scrgb, self.pipe_layout, self.desc_set,
+                self.output_w, self.output_h, out_ldr_off, AAA_POST_BLOOM_BASE,
+            )
+            want_scrgb_fp16 = False
+        # --- end sota:camera hook ---
         if want_scrgb_fp16:
             var push_scrgb = List[UInt32](length=16, fill=0)
             push_scrgb[0] = UInt32(self.output_w)
@@ -6254,6 +6286,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var t_submit0 = get_time()
         self.last_cpu_record_ms = (t_submit0 - t_record0) * 1000.0
         if self.vk.swapchain != 0:
+            _ = sota_hdr_update_metadata(self.sota_cam.hdr, self.vk)  # --- sota:camera hook (VK_EXT_hdr_metadata) ---
             var img_idx = self.vk.acquire_image(cur_slot)
             if img_idx != NO_IMAGE:
                 var copy_w = min(self.output_w, self.vk.swapchain_width)
