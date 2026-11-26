@@ -148,6 +148,17 @@ from flint.render.sota_e_parallel_pso import sota_e_pso_batch_begin, sota_e_pso_
 from flint.render.sota_e_gpu_driven import SotaEGpuDriven, SOTA_E_INSTANCE_OUTLINE_BIT, SOTA_E_ROUTE_MAX_DRAWS
 from flint.render.sota_e_hair_shadow import SotaEHairShadow, sota_e_dom_words
 # --- end sota:E hook ---
+# --- sota:mat hook --- (area I: layered material model, cvar r.sota_mat.layered / FLINT_SOTA_MAT=1)
+from flint.render.sota_mat_core import (
+    AAA_FLAG_SOTA_MAT,
+    SOTA_MAT_EXTRA_BYTES,
+    SOTA_MAT_MAX_MATERIALS,
+    SotaMatLayers,
+    SotaMatState,
+    sota_mat_clear_layers,
+    sota_mat_write_layers,
+)
+# --- end sota:mat hook ---
 from flint.render.material_graph import (
     MaterialAsset,
     SurfaceMaterialNode,
@@ -734,6 +745,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var sota_e_gpu: SotaEGpuDriven  # GPU-packed alpha-mask / outline draw lists (cvar r.sota_e.gpu_driven)
     var sota_e_hair: SotaEHairShadow  # strand-hair deep opacity shadow map (cvar r.sota_e.hair_dom)
     # --- end sota:E hook ---
+    var sota_mat: SotaMatState  # --- sota:mat hook --- layered material model (cvar r.sota_mat.layered, default off)
     var enable_rt_shadows: Bool
     var enable_restir_di: Bool
     var enable_rt_reflections: Bool
@@ -1035,6 +1047,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_e_gpu = SotaEGpuDriven()
         self.sota_e_hair = SotaEHairShadow()
         # --- end sota:E hook ---
+        self.sota_mat = SotaMatState()  # --- sota:mat hook ---
         self.enable_rt_shadows = False
         self.enable_restir_di = False
         self.enable_rt_reflections = False
@@ -1453,7 +1466,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_vertices = self.vk.create_buffer_bda(self.geometry_mb * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
         self.buf_indices = self.vk.create_buffer_bda(self.geometry_mb * 1024 * 1024, extra_usage=bda_flags, host_visible=True)
         self.buf_meshlets = self.vk.create_buffer((8 if self.geometry_mb <= 32 else self.geometry_mb // 2) * 1024 * 1024, local=True)
-        self.buf_materials = self.vk.create_buffer(1024 * AAA_MATERIAL_WORDS * 4, local=True)
+        self.buf_materials = self.vk.create_buffer(1024 * AAA_MATERIAL_WORDS * 4 + SOTA_MAT_EXTRA_BYTES, local=True)  # sota:mat hook: + layer words + LUTs
+        sota_mat_clear_layers(self.buf_materials.cpu_address)  # --- sota:mat hook ---
         self.buf_vsm_indirect = self.vk.create_buffer(64 + self.max_draws * 16, local=True)
         self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
         var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
@@ -1893,7 +1907,7 @@ struct FlintAaaVulkanRenderer(Movable):
         return slot
 
     def add_material(mut self, mat: AaaMaterial) -> Int:
-        var max_mats = self.buf_materials.size // (AAA_MATERIAL_WORDS * 4)
+        var max_mats = min(SOTA_MAT_MAX_MATERIALS, self.buf_materials.size // (AAA_MATERIAL_WORDS * 4))  # sota:mat hook
         if len(self.materials) >= max_mats:
             return -1
         var id = len(self.materials)
@@ -2056,6 +2070,15 @@ struct FlintAaaVulkanRenderer(Movable):
     def clear_impact_frame(mut self):
         self.impact_frame = AaaImpactFrameParams()
 
+    # --- sota:mat hook ---
+    def sota_mat_set_layers(mut self, mat_id: Int, layers: SotaMatLayers):
+        """Attaches the layered-model extension (anisotropy, rotation, thin-walled transmission + tint) to `mat_id`.
+        Only read when `sota_mat.enabled` (`FLINT_SOTA_MAT=1`); materials without it keep their legacy parameters."""
+        if mat_id < 0 or mat_id >= SOTA_MAT_MAX_MATERIALS:
+            return
+        sota_mat_write_layers(self.buf_materials.cpu_address, mat_id, layers)
+
+    # --- end sota:mat hook ---
     def update_material(mut self, mat_id: Int, mat: AaaMaterial):
         if mat_id < 0 or mat_id >= len(self.materials):
             return
@@ -4258,6 +4281,12 @@ struct FlintAaaVulkanRenderer(Movable):
             r_flags |= AAA_FLAG_SOTA_E_CHARACTERS
         self.sota_e_hair.write_globals(g_addr, self.sun_dir)
         # --- end sota:E hook ---
+        # --- sota:mat hook (layered material model; LUTs baked + uploaded on first enabled frame) ---
+        if self.sota_mat.enabled:
+            self.sota_mat.prepare(self.buf_materials.cpu_address)
+            if self.sota_mat.lut_uploaded:
+                r_flags |= AAA_FLAG_SOTA_MAT
+        # --- end sota:mat hook ---
         put32(g_addr + 99 * 4, r_flags)
         put32(g_addr + 100 * 4, UInt32(self.frame_index))
         put_float(g_addr + 101 * 4, jx_clip)

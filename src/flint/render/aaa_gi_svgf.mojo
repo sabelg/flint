@@ -94,6 +94,15 @@ from flint.render.sota_gi_world_cache import (
 )
 from flint.render.sota_geometry_visid import emit_sota_vis_meshlet, emit_sota_vis_prim
 # --- end sota:gi hook ---
+# --- sota:mat hook --- (area I: layered material model, `sota_mat_core.mojo`)
+from flint.render.sota_mat_core import (
+    SotaMatComposeIn,
+    SotaMatInputs,
+    emit_sota_mat_compose,
+    emit_sota_mat_decode_on,
+    emit_sota_mat_shade,
+)
+# --- end sota:mat hook ---
 
 # Render feature flags in `BIND_AAA_GLOBALS[99]`
 comptime AAA_FLAG_VSM: UInt32 = 1
@@ -1652,6 +1661,19 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         sss_r, sss_g, sss_b,
         lut_a, lut_b,
     )
+    # --- sota:mat hook (layered model: direct sun response + split-sum weights; legacy values when off) ---
+    var sota_mat = emit_sota_mat_shade(
+        s, b_materials, mat_id, emit_sota_mat_decode_on(s, r_flags, sota_e.tagged),
+        SotaMatInputs(
+            nx, ny, nz, vx, vy, vz, sun_x, sun_y, sun_z,
+            wt_u[0], wt_u[1], wt_u[2], wb_u[0], wb_u[1], wb_u[2],
+            cur_alb_r, cur_alb_g, cur_alb_b, cur_metal, spec_fac, cur_rough, ccoat, ccoat_r,
+            sh_r, sh_g, sh_b, sh_rough, sss_r, sss_g, sss_b, irid_w, irid_nm, irid_ior,
+        ),
+        direct,
+    )
+    direct = (s.load_f(sota_mat.dir_r), s.load_f(sota_mat.dir_g), s.load_f(sota_mat.dir_b))
+    # --- end sota:mat hook ---
     # --- sota:E hook (skin / eye / hair direct sun response) ---
     var sota_e_curv = emit_sota_e_skin_curvature_radius(
         s, wn_geom[0], wn_geom[1], wn_geom[2], wn_dx[0], wn_dx[1], wn_dx[2], wn_dy[0], wn_dy[1], wn_dy[2],
@@ -2106,6 +2128,22 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var dw_r = s.fvar(s.fmul(s.fmul(kd_gi_r, cur_alb_r), s.fmul(om_rc, mb_ao[0])))
     var dw_g = s.fvar(s.fmul(s.fmul(kd_gi_g, cur_alb_g), s.fmul(om_rc, mb_ao[1])))
     var dw_b = s.fvar(s.fmul(s.fmul(kd_gi_b, cur_alb_b), s.fmul(om_rc, mb_ao[2])))
+
+    # --- sota:mat hook (layered split-sum composition: overwrites crisp / diffuse weight / spec modulation) ---
+    var sota_mat_dm = emit_sota_mat_compose(
+        s, sota_mat,
+        SotaMatComposeIn(
+            nx, ny, nz, vx, vy, vz, cur_rough, refl_r, refl_g, refl_b, ccoat_env_r, ccoat_env_g, ccoat_env_b,
+            env_sp, env_occ_sub, ibl_int, max_env_mip, is_furnace, dir_r, dir_g, dir_b, em_r, em_g, em_b,
+            mb_ao[0], mb_ao[1], mb_ao[2], demod_spec, crisp_r, crisp_g, crisp_b, dw_r, dw_g, dw_b,
+            mod_r_v, mod_g_v, mod_b_v,
+        ),
+        env_cube, (demod_sr, demod_sg, demod_sb),
+    )
+    demod_sr = sota_mat_dm[0]
+    demod_sg = sota_mat_dm[1]
+    demod_sb = sota_mat_dm[2]
+    # --- end sota:mat hook ---
 
     # 5. Bruneton / Hillaire Distance Aerial Perspective (`V18`, evaluated ONLY beyond `froxel_far_z` when Froxels are active!)
     s.begin_if(s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_AERIAL_PERSPECTIVE)), s.uint(0)))
