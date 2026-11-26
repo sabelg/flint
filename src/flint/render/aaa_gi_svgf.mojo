@@ -71,6 +71,13 @@ from flint.render.aaa_sky_atmosphere import (
     emit_aerial_perspective_spv,
     emit_nubis_sky_clouds_and_celestial_spv,
 )
+# --- sota:gi hook --- (area B: world radiance cache + path-traced GI, `sota_gi_world_cache.mojo`)
+from flint.render.sota_gi_world_cache import (
+    emit_sota_gi_mode,
+    emit_sota_gi_write_gbuffer,
+    emit_sota_surfcache_wrc_bounce,
+)
+# --- end sota:gi hook ---
 
 # Render feature flags in `BIND_AAA_GLOBALS[99]`
 comptime AAA_FLAG_VSM: UInt32 = 1
@@ -842,9 +849,16 @@ def surface_cache_update_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(out_b, s.fma(kd_b, loc_sc[2], s.load_f(out_b)))
     s.end_if()
 
+    # --- sota:gi hook --- (hybrid mode: the bounce comes from the world radiance cache, zero rays)
+    var sota_sc = emit_sota_surfcache_wrc_bounce(s, b_surfcache, cx, cy, cz, wn[0], wn[1], wn[2])
+    s.store(out_r, s.fma(kd_r, sota_sc[1], s.load_f(out_r)))
+    s.store(out_g, s.fma(kd_g, sota_sc[2], s.load_f(out_g)))
+    s.store(out_b, s.fma(kd_b, sota_sc[3], s.load_f(out_b)))
+    # --- end sota:gi hook ---
+
     if enable_ray_query:
         # Bounce 1+: gather multi-bounce indirect diffuse radiance from other Surface-Cache triangles!
-        s.begin_if(s.ine(bounce_pass, s.uint(0)))
+        s.begin_if(s.logical_and(s.ine(bounce_pass, s.uint(0)), s.logical_not(sota_sc[0])))
         var sky_sh = emit_eval_sh9_irradiance(s, b_globals, 72, wn[0], wn[1], wn[2])
         var ibl_int = s.load_float(b_globals, s.uint(55))
         var miss_r = s.fmul(sky_sh[0], ibl_int)
@@ -1709,6 +1723,9 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
             s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_RT_SURFACE_GI)), s.uint(0)),
             s.ult(s.uint(0), gi_rays_u),
         )
+        # --- sota:gi hook --- (area-B modes replace the per-pixel surface-cache loop)
+        has_rt_gi = s.logical_and(has_rt_gi, s.ieq(emit_sota_gi_mode(s, b_surfcache), s.uint(0)))
+        # --- end sota:gi hook ---
         s.begin_if(has_rt_gi)
         var miss_r = s.load_f(gi_r)
         var miss_g = s.load_f(gi_g)
@@ -1823,6 +1840,12 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         s.store(gi_b, s.fmul(sh_bent[2], ibl_int))
         s.end_if()
         s.end_if()
+
+    # --- sota:gi hook --- (area-B GI carries its own occlusion: keep RTAO out of the diffuse weight)
+    s.begin_if(s.ine(emit_sota_gi_mode(s, b_surfcache), s.uint(0)))
+    s.store(diff_ao_v, s.load_f(mat_ao))
+    s.end_if()
+    # --- end sota:gi hook ---
 
     # 3. Specular Reflections (`BC6H` Split-Sum Cubemap Occluded by `GTSO` + Bounded `VNDF` Textured RT!)
     var spec_ao = s.select_f(is_furnace, s.float(1.0), s.fmul(s.load_f(mat_ao), s.load_f(rt_ao_v)))
@@ -2052,6 +2075,15 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var g_fin_r = s.load_f(gi_r)
     var g_fin_g = s.load_f(gi_g)
     var g_fin_b = s.load_f(gi_b)
+
+    # --- sota:gi hook --- (G-buffer for the area-B GI resolve pass; inert in mode 0)
+    emit_sota_gi_write_gbuffer(
+        s, b_surfcache, pix_idx_u, frame_idx,
+        wx, wy, wz, nx, ny, nz,
+        s.fmul(wn_geom[0], flip_n), s.fmul(wn_geom[1], flip_n), s.fmul(wn_geom[2], flip_n),
+        c_fin_r, c_fin_g, c_fin_b, d_fin_r, d_fin_g, d_fin_b,
+    )
+    # --- end sota:gi hook ---
 
     s.begin_if(demod_gi)
     s.store_float(b_post, post_pix_base, c_fin_r)
