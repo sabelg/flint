@@ -5,7 +5,7 @@ from flint.platform.os import read_bytes
 from flint.core.math import Vec3
 from flint.core.transform import Quat
 from flint.assets.json import JsonDocument, parse_json
-from flint.assets.jpeg import decode_image_auto
+from flint.assets.sota_perf_decode import sota_decode_images  # --- sota:perf hook ---
 from flint.anim.skinning import compute_cor
 from flint.assets.model import NativeModel, NativeNode, NativeMesh, NativeTexture, NativeSkin, NativeAnimation, NativeChannel
 
@@ -218,33 +218,38 @@ def _native_model_from_document(document: JsonDocument, binary: List[UInt8], bas
     var images = document.object_get(document.root, "images")
     var textures = document.object_get(document.root, "textures")
     var views = document.object_get(document.root, "bufferViews")
+    var sota_blobs = List[List[UInt8]]()  # --- sota:perf hook --- two slots per texture
     for texture_index in range(document.array_size(textures)):
         var texture_node = document.at(textures, texture_index)
         var source = document.integer(document.object_get(texture_node, "source"), -1)
         var image_node = document.at(images, source)
         var view = document.at(views, document.integer(document.object_get(image_node, "bufferView"), -1))
-        var texture = NativeTexture()
+        # --- sota:perf hook --- gather the encoded bytes (file URI, then buffer view); decoded in parallel below
         var image_uri = document.text(document.object_get(image_node, "uri"))
+        var file_bytes = List[UInt8]()
         if view < 0 and image_uri.byte_length() > 0 and not image_uri.startswith("data:"):
-            var file_bytes = read_bytes(base_dir + image_uri)
-            if len(file_bytes) > 0:
-                var decoded_file = decode_image_auto(file_bytes, 4096)
-                if decoded_file.valid:
-                    texture.width = decoded_file.width
-                    texture.height = decoded_file.height
-                    swap(texture.pixels, decoded_file.pixels)
+            file_bytes = read_bytes(base_dir + image_uri)
+        sota_blobs.append(file_bytes^)
+        var bytes = List[UInt8]()
         if view >= 0:
             var offset = document.integer(document.object_get(view, "byteOffset"), 0)
             var length = document.integer(document.object_get(view, "byteLength"), 0)
             if offset >= 0 and length > 0 and length <= len(binary) - offset:
-                var bytes = List[UInt8](length=length, fill=0)
+                bytes = List[UInt8](length=length, fill=0)
                 _ = external_call["memcpy", Int](Int(bytes.unsafe_ptr()), Int(binary.unsafe_ptr()) + offset, length)
-                var decoded = decode_image_auto(bytes, 4096)
-                if decoded.valid:
-                    texture.width = decoded.width
-                    texture.height = decoded.height
-                    swap(texture.pixels, decoded.pixels)
+        sota_blobs.append(bytes^)
+    var sota_decoded = sota_decode_images(sota_blobs, 4096)
+    for texture_index in range(document.array_size(textures)):
+        var texture = NativeTexture()
+        for k in range(2):  # same override order as the serial loop: file URI, then buffer view
+            ref decoded = sota_decoded[texture_index * 2 + k]
+            if decoded.valid:
+                texture.width = decoded.width
+                texture.height = decoded.height
+                texture.pixels = List[UInt32]()
+                swap(texture.pixels, decoded.pixels)
         model.textures.append(texture^)
+    # --- end sota:perf hook ---
 
     var materials = document.object_get(document.root, "materials")
     var meshes = document.object_get(document.root, "meshes")

@@ -37,8 +37,15 @@ def env_value(name: String) -> String:
 def env_now(name: String) -> String:
     """`env_value`, but as the environment is now (getenv(3)), changes made
     in this process with setenv included: for switches a test flips."""
-    var owned = name
-    var address = external_call["getenv", Int](owned.as_c_string_span())
+    # --- sota:perf hook --- an explicit NUL-terminated copy that is provably alive until getenv returns
+    # (`owned.as_c_string_span()` passed to external_call relied on ASAP destruction not ending `owned` early).
+    var c_name = List[UInt8](capacity=name.byte_length() + 1)
+    for b in name.as_bytes():
+        c_name.append(b)
+    c_name.append(0)
+    var address = external_call["getenv", Int](c_name.unsafe_ptr())
+    _ = len(c_name)
+    # --- end sota:perf hook ---
     if address == 0:
         return ""
     var bytes = List[UInt8]()
@@ -59,18 +66,23 @@ def env_flag(name: String) -> Bool:
 
 def open_read(path: String) -> Int:
     var owned = path
-    return Int(external_call["open", Int32](owned.as_c_string_span(), Int32(0), Int32(0)))
+    var fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(0), Int32(0)))
+    _ = owned.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
+    return fd
 
 
 def open_write(path: String) -> Int:
     var owned = path
-    return Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 64 | 512), Int32(438)))
+    var fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 64 | 512), Int32(438)))
+    _ = owned.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
+    return fd
 
 
 def append_bytes(path: String, mut data: List[UInt8]) -> Bool:
     """Appends to a file, creating it if needed (O_WRONLY | O_CREAT | O_APPEND)."""
     var owned = path
     var fd = Int(external_call["open", Int32](owned.as_c_string_span(), Int32(1 | 64 | 1024), Int32(438)))
+    _ = owned.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
     if fd < 0:
         return False
     var offset = 0
@@ -97,6 +109,7 @@ def make_dirs(path: String) -> Bool:
         if owned == "/":
             continue
         var result = external_call["mkdir", Int32](owned.as_c_string_span(), Int32(511))
+        _ = owned.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
         if result != 0:
             var error_pointer = external_call["__errno_location", Pointer[Int32, origin=MutAnyOrigin]]()
             if Int(error_pointer[unsafe_offset=0]) != 17:  # EEXIST
@@ -107,7 +120,9 @@ def make_dirs(path: String) -> Bool:
 def rename_file(source: String, destination: String) -> Bool:
     var old_path = source
     var new_path = destination
-    return external_call["rename", Int32](old_path.as_c_string_span(), new_path.as_c_string_span()) == 0
+    var ok = external_call["rename", Int32](old_path.as_c_string_span(), new_path.as_c_string_span()) == 0
+    _ = old_path.byte_length() + new_path.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
+    return ok
 
 
 comptime DURABLE_OK: Int = 0
@@ -118,7 +133,9 @@ comptime FAULT_BEFORE_RENAME: Int = 2  # written and synced, then "the power fai
 
 def remove_file(path: String) -> Bool:
     var owned = path
-    return external_call["unlink", Int32](owned.as_c_string_span()) == 0
+    var ok = external_call["unlink", Int32](owned.as_c_string_span()) == 0
+    _ = owned.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
+    return ok
 
 
 def fsync_path(path: String, directory: Bool) -> Bool:
@@ -127,6 +144,7 @@ def fsync_path(path: String, directory: Bool) -> Bool:
     var owned = path
     var flags = O_DIRECTORY_FLAG if directory else Int32(0)  # O_RDONLY | O_DIRECTORY
     var fd = Int(external_call["open", Int32](owned.as_c_string_span(), flags, Int32(0)))
+    _ = owned.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
     if fd < 0:
         return False
     var ok = external_call["fsync", Int32](Int32(fd)) == 0
@@ -226,7 +244,9 @@ def file_stamp(path: String) -> Tuple[Int, Int]:
     (-1, 0) if it is missing. The layout is x86-64 Linux's struct stat."""
     var owned = path
     var buffer = List[UInt8](length=256, fill=0)
-    if external_call["stat", Int32](owned.as_c_string_span(), buffer.unsafe_ptr()) != 0:
+    var rc = external_call["stat", Int32](owned.as_c_string_span(), buffer.unsafe_ptr())
+    _ = owned.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
+    if rc != 0:
         return (-1, 0)
     var words = Pointer[Int64, origin=MutAnyOrigin](unsafe_from_address=Int(buffer.unsafe_ptr()))
     var size = Int(words[unsafe_offset=6])  # st_size at byte 48
@@ -242,6 +262,7 @@ def list_directory(path: String) -> List[String]:
     var names = List[String]()
     var owned = path
     var directory = external_call["opendir", Int](owned.as_c_string_span())
+    _ = owned.byte_length()  # --- sota:perf hook --- keep the C string alive past the call (ASAP destructor)
     if directory == 0:
         return names^
     while True:

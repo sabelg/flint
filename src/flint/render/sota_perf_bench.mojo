@@ -30,6 +30,7 @@ from flint.platform.vulkan import VulkanGpu, call2, get32, get64, put32, put64
 from flint.render.aaa_renderer import AaaUploadedModel, FlintAaaVulkanRenderer
 from flint.render.aaa_skinning_rt import DualQuat
 from flint.render.flip import flip_error_map, flip_mean
+from flint.render.sota_perf_async import SotaFramePacing, sota_overlap_fraction
 from flint.render.sota_gi_world_cache import SOTA_GI_MODE_HYBRID, SOTA_GI_MODE_LEGACY, SOTA_GI_MODE_PATH
 
 comptime SOTA_BENCH_STATIC = 0
@@ -238,6 +239,16 @@ def sota_bench_load_scene(name: String, path: String) -> SotaBenchScene:
     return scene^
 
 
+def sota_bench_scene_drawable(scene: SotaBenchScene) -> Bool:
+    """Loaded, uploaded and with at least one drawable mesh: every probe refuses to measure otherwise."""
+    if not scene.loaded or len(scene.uploaded.mesh_entries) == 0:
+        return False
+    for e in scene.uploaded.mesh_entries:
+        if e.mesh_id >= 0:
+            return True
+    return False
+
+
 def sota_bench_upload_scene(
     mut ren: FlintAaaVulkanRenderer, mut scene: SotaBenchScene, max_tex_dim: Int = 1024, build_lods: Bool = True
 ) -> Bool:
@@ -365,6 +376,12 @@ struct SotaBenchResult(Copyable, Movable):
     var cpu_ms: Float64  # median draw-list + render_frame wall time (excludes the fence wait)
     var wait_ms: Float64  # median begin_frame fence wait
     var vram_mb: Float64
+    var record_ms: Float64  # median command-buffer record time (render_frame internal)
+    var submit_ms: Float64  # median vkQueueSubmit + own-fence wait (synchronous) inside render_frame
+    var retire_ms: Float64  # median wait on the previous frame's fence (pipelined mode)
+    var interval_p99_ms: Float64  # p99 wall-clock frame interval
+    var hitch: Float64  # p99 / median frame interval
+    var pipelined: Bool
     var passes: List[SotaPassStat]  # sorted, most expensive first
     var flip: Float64  # mean FLIP vs the photo-mode path tracer (static variant only, -1 otherwise)
     var pixels: List[UInt32]  # final frame (sRGB/AgX display output)
@@ -385,6 +402,12 @@ struct SotaBenchResult(Copyable, Movable):
         self.cpu_ms = 0.0
         self.wait_ms = 0.0
         self.vram_mb = 0.0
+        self.record_ms = 0.0
+        self.submit_ms = 0.0
+        self.retire_ms = 0.0
+        self.interval_p99_ms = 0.0
+        self.hitch = 0.0
+        self.pipelined = False
         self.passes = List[SotaPassStat]()
         self.flip = -1.0
         self.pixels = List[UInt32]()
@@ -498,6 +521,11 @@ def sota_bench_run(
     var gpu = List[Float64]()
     var cpu = List[Float64]()
     var wait = List[Float64]()
+    var rec = List[Float64]()
+    var sub = List[Float64]()
+    var ret = List[Float64]()
+    var pacing = SotaFramePacing()
+    res.pipelined = ren.deferred_readback
     var total = warmup + frames
     var char_origin = _lerp(scene.cam_eye0, scene.cam_tgt0, Float32(0.12))
     var t_measure = 0.0
@@ -518,8 +546,12 @@ def sota_bench_run(
         var t2 = get_time()
         if f < warmup:
             continue
+        pacing.mark(t2)
         wait.append((t1 - t0) * 1000.0)
         cpu.append((t2 - t1) * 1000.0)
+        rec.append(ren.last_cpu_record_ms)
+        sub.append(ren.last_cpu_submit_wait_ms)
+        ret.append(ren.last_cpu_prev_wait_ms)
         gpu.append(ren.last_frame_gpu_ms)
         for t in ren.get_gpu_pass_timings():
             var idx = -1
@@ -538,6 +570,12 @@ def sota_bench_run(
     res.gpu_p95_ms = sota_percentile(gpu, 0.95)
     res.cpu_ms = sota_median(cpu)
     res.wait_ms = sota_median(wait)
+    res.record_ms = sota_median(rec)
+    res.submit_ms = sota_median(sub)
+    res.retire_ms = sota_median(ret)
+    res.interval_p99_ms = pacing.p99_ms()
+    res.hitch = pacing.hitch_ratio()
+    ren.flush_deferred_frame()  # pipelined mode: the last frame is still in flight
     var vr = sota_perf_vram_usage(ren.vk)
     res.vram_mb = Float64(vr[0]) / (1024.0 * 1024.0)
     for k in range(len(names)):
@@ -657,6 +695,12 @@ def sota_bench_light_lag(
     converged under B from scratch. A high lag means stale GI caches / denoiser history (light lag);
     a curve that settles above the floor means a cache never fully re-converges."""
     var out = SotaLagResult()
+    if not sota_bench_scene_drawable(scene):
+        # round 2: an unloaded scene renders sky only, identical for every sun direction; that is what the
+        # round-1 "no sunlight in a fresh process" lag of exactly 1 frame with a ~0 floor was
+        out.failed_frames = frames + 1
+        out.lag_frames = -1
+        return out^
     var eye = scene.cam_eye0
     var tgt = scene.cam_tgt0
     # reference: B converged (history from A is flushed by `converge` frames under B)
@@ -719,3 +763,72 @@ def sota_bench_geometry_mb(scene: SotaBenchScene) -> Int:
     var v_mb = verts * AAA_VERTEX_BYTES * 3 // (1024 * 1024)
     var i_mb = idx * 4 * 3 // (1024 * 1024)
     return max(32, max(v_mb, i_mb) + 16)
+
+
+def sota_bench_side_queue_overlap(
+    mut ren: FlintAaaVulkanRenderer, mut scene: SotaBenchScene, reps: Int = 7, mb: Int = 256, copies: Int = 6
+) -> Tuple[Float64, Float64, Float64, Float64]:
+    """Round 2 async-compute probe: does work on `VulkanGpu`'s side queue (a compute-only family on NVIDIA)
+    run beside a frame? Times (median wall ms) a synchronous frame alone, a side-queue job alone (`copies`
+    buffer copies of `mb` MB) and both submitted together; returns (frame, side, both, overlap fraction,
+    see `sota_overlap_fraction`). Returns all -1 without a side queue."""
+    if not ren.active or not ren.vk.has_side_queue() or not scene.loaded:
+        return (-1.0, -1.0, -1.0, -1.0)
+    var idx = ren.vk.allocate_side_command_buffers(1)
+    if idx < 0:
+        return (-1.0, -1.0, -1.0, -1.0)
+    var bytes = mb * 1024 * 1024
+    var a = ren.vk.create_buffer(bytes, local=True)
+    var b = ren.vk.create_buffer(bytes, local=True)
+    if a.size == 0 or b.size == 0:
+        ren.vk.destroy_buffer(a)
+        ren.vk.destroy_buffer(b)
+        return (-1.0, -1.0, -1.0, -1.0)
+    var keep_defer = ren.deferred_readback
+    ren.deferred_readback = False
+    var t_frame = List[Float64]()
+    var t_side = List[Float64]()
+    var t_both = List[Float64]()
+    for r in range(reps + 1):
+        # frame alone
+        var t0 = get_time()
+        ren.begin_frame(scene.cam_eye0, scene.cam_tgt0, fov_y_deg=scene.fov_deg, near_z=scene.near_z)
+        sota_bench_draw_scene(ren, scene)
+        _ = ren.render_frame()
+        var t1 = get_time()
+        # side job alone
+        _ = ren.vk.begin_commands(idx)
+        for c in range(copies):
+            if c % 2 == 0:
+                ren.vk.copy_buffer(idx, a, 0, b, 0, bytes)
+            else:
+                ren.vk.copy_buffer(idx, b, 0, a, 0, bytes)
+        var f = ren.vk.submit_side(idx)
+        _ = ren.vk.wait_side(f)
+        var t2 = get_time()
+        # both: side job first, then the frame; wait for both
+        _ = ren.vk.begin_commands(idx)
+        for c in range(copies):
+            if c % 2 == 0:
+                ren.vk.copy_buffer(idx, a, 0, b, 0, bytes)
+            else:
+                ren.vk.copy_buffer(idx, b, 0, a, 0, bytes)
+        var f2 = ren.vk.submit_side(idx)
+        ren.begin_frame(scene.cam_eye0, scene.cam_tgt0, fov_y_deg=scene.fov_deg, near_z=scene.near_z)
+        sota_bench_draw_scene(ren, scene)
+        _ = ren.render_frame()
+        _ = ren.vk.wait_side(f2)
+        var t3 = get_time()
+        if r == 0:
+            continue  # warm-up
+        t_frame.append((t1 - t0) * 1000.0)
+        t_side.append((t2 - t1) * 1000.0)
+        t_both.append((t3 - t2) * 1000.0)
+    ren.deferred_readback = keep_defer
+    ren.vk.wait_idle()
+    ren.vk.destroy_buffer(a)
+    ren.vk.destroy_buffer(b)
+    var mf = sota_median(t_frame)
+    var ms = sota_median(t_side)
+    var mbth = sota_median(t_both)
+    return (mf, ms, mbth, sota_overlap_fraction(mf, ms, mbth))
