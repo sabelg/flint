@@ -98,6 +98,7 @@ from flint.render.ui_overlay import aaa_ui_overlay_shader, AAA_POST_UI_PRIMS_BAS
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 # --- sota:geometry hook ---
 from flint.render.sota_geometry_cull import SotaGeometryGpu
+from flint.render.sota_geometry_vt import SotaVirtualTextures
 from flint.render.sota_geometry_cluster_dag import build_cluster_dag, cook_cluster_dag_into_pool
 # --- end sota:geometry hook ---
 from flint.render.aaa_visbuffer import (
@@ -724,6 +725,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var last_culled_meshlet_draws: Int
     # --- sota:geometry hook ---
     var sota_geom: SotaGeometryGpu
+    var sota_vt: SotaVirtualTextures
     # --- end sota:geometry hook ---
     var prev_cam_pos: Vec3
     var has_prev_cam: Bool
@@ -1005,6 +1007,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.last_culled_meshlet_draws = 0
         # --- sota:geometry hook ---
         self.sota_geom = SotaGeometryGpu()
+        self.sota_vt = SotaVirtualTextures()
         # --- end sota:geometry hook ---
         self.prev_cam_pos = self.cam_pos
         self.has_prev_cam = False
@@ -1482,6 +1485,11 @@ struct FlintAaaVulkanRenderer(Movable):
             self.buf_occluded_candidates, self.buf_indirect_phase2, self.depth_img.view, self.samp_nearest,
         ):
             self.sota_geom.active = False
+        if not self.sota_vt.init(
+            self.vk, FRAMES_IN_FLIGHT, self.buf_vertices, self.buf_indices, self.buf_meshlets, self.ring_instances,
+            self.buf_materials, self.ring_globals, self.vis_img.view, self.samp_nearest,
+        ):
+            self.sota_vt.active = False
         # --- end sota:geometry hook ---
 
         # Bake & Upload 64x64 RG16F Split-Sum BRDF LUT + 64x64 RG16F Heitz LTC LUT!
@@ -2146,6 +2154,28 @@ struct FlintAaaVulkanRenderer(Movable):
         return entry^
 
     # --- sota:geometry hook ---
+    def add_virtual_texture(mut self, pixels_argb: List[UInt32], dim: Int) -> Int:
+        """Registers a square power-of-two (128..16384) sRGB ARGB image as a streamed virtual texture (only the
+        pages the camera needs become resident; see sota_geometry_vt.mojo). Returns the VT index or -1."""
+        return self.sota_vt.add_virtual_texture(
+            self.vk, pixels_argb, dim, self.desc_sets, self.samp_nearest, self.samp_linear_clamp, self.bindless_images,
+            AAA_MAX_BINDLESS,
+        )
+
+    def add_material_vt(mut self, mat: AaaMaterial, vt: Int) -> Int:
+        """`mat` with its albedo from virtual texture `vt`. Base colour becomes the texture mean (used by RT/GI
+        hits); `update_material` on the returned id drops the VT binding."""
+        if vt < 0 or vt >= self.sota_vt.count():
+            return -1
+        var m = mat.copy()
+        var mean = self.sota_vt.mean_rgb[vt]
+        m.base_color = Vec3(mean[0], mean[1], mean[2])
+        m.iridescence = Float32(0.0)
+        var id = self.add_material(m)
+        if id >= 0 and self.buf_materials.cpu_address != 0:
+            put32(self.buf_materials.cpu_address + (id * AAA_MATERIAL_WORDS + 15) * 4, bitcast[DType.uint32](self.sota_vt.material_code(vt)))
+        return id
+
     def add_mesh_cluster_dag_entry(mut self, mesh: NativeMesh, material_id: Int) -> CookedMeshEntry:
         """Cooks `mesh` as a continuous cluster-LOD DAG into the CPU pool and publishes its DAG records
         (the caller, `add_mesh`, uploads the pool range and builds the LOD0 BLAS)."""
@@ -3643,6 +3673,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         var cur_slot = self.frame_index % FRAMES_IN_FLIGHT
         self.sota_geom.begin_slot(cur_slot)  # sota:geometry hook
+        self.sota_vt.begin_frame(cur_slot, (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT)  # sota:geometry hook
         var defer_this = self.deferred_readback and (not capture_readback) and self.vk.swapchain == 0
         if defer_this and cur_slot > 0 and len(self.readback_extra) < cur_slot:
             while len(self.readback_extra) < FRAMES_IN_FLIGHT - 1:
@@ -4121,6 +4152,7 @@ struct FlintAaaVulkanRenderer(Movable):
             return False
         if use_prof:
             self.vk.reset_queries(cur_slot, q_base, AAA_QUERY_SLOT_STRIDE)
+        self.sota_vt.record_uploads(self.vk, cur_slot)  # sota:geometry hook
         if defer_this:
             # The CPU no longer waits between frames, so serialise this frame's GPU work behind the previous one
             # (single-instance buffers/images: history, post scratch, VSM atlas, surface cache, TLAS scratch...).
@@ -4361,6 +4393,17 @@ struct FlintAaaVulkanRenderer(Movable):
         )
         if use_prof:
             self.vk.write_timestamp(cur_slot, q_vb + 1, PIPELINE_BOTTOM)
+        # --- sota:geometry hook --- virtual-texture feedback (1/16 of the visbuffer pixels)
+        if self.sota_vt.count() > 0:
+            var q_vt = next_q
+            if use_prof and q_vt + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_vt, PIPELINE_TOP)
+                next_q += 2
+                prof_pairs.append((String("SotaVtFeedback"), q_vt))
+            self.sota_vt.record_feedback(self.vk, cur_slot, self.render_w, self.render_h, self.frame_index + 1)
+            if use_prof and q_vt + 1 < q_limit:
+                self.vk.write_timestamp(cur_slot, q_vt + 1, PIPELINE_BOTTOM)
+        # --- end sota:geometry hook ---
 
         # VSM Mark Visible Virtual Shadow Pages (16k x 16k)
         if vsm_active:
@@ -5673,6 +5716,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         self.vk.destroy_pipeline(self.pipe_meshlet_cull)
         self.sota_geom.shutdown(self.vk)  # sota:geometry hook
+        self.sota_vt.shutdown(self.vk)  # sota:geometry hook
         self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
         self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)
         if self.pipe_npr_outline_gfx != 0:

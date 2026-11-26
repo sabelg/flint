@@ -19,6 +19,13 @@ from flint.render.sota_geometry_cull import (
     sota_hiz_reduce_shader,
 )
 from flint.render.spirv_validate import validate_spirv_module
+from flint.render.sota_geometry_vt import (
+    SOTA_VT_FB_STRIDE,
+    VtResidency,
+    sota_vt_feedback_shader,
+    vt_mip_offset,
+    vt_total_pages,
+)
 from flint.render.sota_geometry_cluster_dag import (
     ClusterDag,
     SOTA_DAG_MAX_TRIS,
@@ -179,6 +186,7 @@ def test_hiz_cpu_and_spirv():
     _validate_or_fail(sota_cluster_cull_shader(), "sota_cluster_cull_shader")
     _validate_or_fail(sota_hiz_copy_shader(), "sota_hiz_copy_shader")
     _validate_or_fail(sota_hiz_reduce_shader(), "sota_hiz_reduce_shader")
+    _validate_or_fail(sota_vt_feedback_shader(), "sota_vt_feedback_shader")
     print("[PASS] sota Hi-Z CPU reference (37x23, " + String(levels) + " levels, exact footprint min) + SPIR-V validation")
 
 
@@ -469,9 +477,155 @@ def test_gpu_cornell_hiz_regression():
     print("[PASS] Cornell back-wall shadow stable with Hi-Z culling (area B regression)")
 
 
+def test_vt_cpu():
+    """Residency: coarse-first streaming, fallback page table, LRU eviction with a pinned root."""
+    var r = VtResidency(n_slots=6)
+    var vt = r.add_vt(3)                       # 8 x 8 pages at mip 0, 4 mips
+    _assert(vt_total_pages(3) == 85, "VT page count 64 + 16 + 4 + 1")
+    _assert(r.place(vt, 3, 0, 0, 0, pinned=True) >= 0, "root placed")
+    var fb = List[UInt32](length=SOTA_VT_FB_STRIDE, fill=UInt32(0))
+    # request mip-0 page (5, 6) and its mip-1 parent (2, 3)
+    fb[vt_mip_offset(3, 0) + 6 * 8 + 5] = UInt32(7)
+    fb[vt_mip_offset(3, 1) + 3 * 4 + 2] = UInt32(7)
+    var tex0 = r.indirection_texels(vt)
+    var t = tex0[6 * 16 + 5]
+    _assert(Int(t & 255) == 3, "missing mip-0 page falls back to the root mip")
+    var ups = r.process_feedback(fb, 7, 1)
+    _assert(len(ups) == 1 and ups[0].mip == 1, "streamer drains the coarser page first")
+    ups = r.process_feedback(fb, 8, 4)          # stale stamp: nothing requested
+    _assert(len(ups) == 0, "only this frame's stamps count")
+    ups = r.process_feedback(fb, 7, 4)
+    _assert(len(ups) == 1 and ups[0].mip == 0 and ups[0].px == 5 and ups[0].py == 6, "then the mip-0 page")
+    var tex1 = r.indirection_texels(vt)
+    _assert(Int(tex1[6 * 16 + 5] & 255) == 0, "resident page maps to itself")
+    var p1 = tex1[3 * 16 + 8 + 2]
+    _assert(Int(p1 & 255) == 1, "mip-1 page maps to itself")
+    # fill all 6 slots, then a new request must evict the least recently requested unpinned page
+    var fb2 = List[UInt32](length=SOTA_VT_FB_STRIDE, fill=UInt32(0))
+    for i in range(6):
+        fb2[vt_mip_offset(3, 0) + i] = UInt32(20)
+    _ = r.process_feedback(fb2, 20, 8)
+    _assert(r.resident_pages() == 6, "atlas full")
+    _assert(r.evictions_total >= 1, "eviction happened")
+    var root_ok = r.page_slot[vt][vt_mip_offset(3, 3)] >= 0
+    _assert(root_ok, "pinned root never evicted")
+    print("[PASS] sota VT residency: coarse-first, fallback page table, LRU eviction, pinned root (evictions="
+          + String(r.evictions_total) + ")")
+
+
+def _vt_pattern(dim: Int) -> List[UInt32]:
+    """Detail at every scale: 64-texel hashed colour cells, 1-texel lines every 16, a smooth gradient."""
+    var px = List[UInt32](length=dim * dim, fill=UInt32(0))
+    for y in range(dim):
+        for x in range(dim):
+            var cell = UInt32(((x >> 6) * 73856093) ^ ((y >> 6) * 19349663))
+            cell = (cell ^ (cell >> 13)) * UInt32(0x5BD1E995)
+            var r = 60 + Int((cell >> 8) & 127) + (x * 60) // dim
+            var g = 60 + Int((cell >> 16) & 127)
+            var b = 60 + Int((cell >> 24) & 127) + (y * 60) // dim
+            if (x & 15) == 0 or (y & 15) == 0:
+                r = r // 3
+                g = g // 3
+                b = b // 3
+            px[y * dim + x] = UInt32(0xFF000000) | (UInt32(min(r, 255)) << 16) | (UInt32(min(g, 255)) << 8) | UInt32(min(b, 255))
+    return px^
+
+
+def _vt_plane(mut mb: MeshBuilder):
+    _cornell_quad(mb, Vec3(-20.0, 0.0, 20.0), Vec3(20.0, 0.0, 20.0), Vec3(20.0, 0.0, -20.0), Vec3(-20.0, 0.0, -20.0), Vec3(0.0, 1.0, 0.0))
+
+
+def _vt_run(use_vt: Bool, W: Int, H: Int, dim: Int, pattern: List[UInt32], mut log: List[String], mut first_px: List[UInt32]) -> List[UInt32]:
+    var renderer = _new_renderer(W, H)
+    var px = List[UInt32]()
+    if not renderer.uses_vulkan():
+        return px^
+    ref gpu = renderer.gpu_slot[0]
+    var base = AaaMaterial(base_color=Vec3(1.0, 1.0, 1.0), roughness=0.8, metallic=0.0)
+    var mat: Int
+    var t0 = get_time()
+    if use_vt:
+        var vt = gpu.add_virtual_texture(pattern, dim)
+        _assert(vt >= 0, "add_virtual_texture")
+        mat = gpu.add_material_vt(base, vt)
+    else:
+        var slot = gpu.upload_bc7_texture(pattern, dim, dim, srgb=True, generate_mips=True)
+        _assert(slot >= 0, "reference BC7 upload")
+        var m = base.copy()
+        m.albedo_tex = slot
+        mat = gpu.add_material(m)
+    var t_load = get_time() - t0
+    var mb = MeshBuilder()
+    _vt_plane(mb)
+    var e = gpu.add_mesh(mb^.finish(), mat)
+    var ident = trs(Vec3(0.0, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0))
+    var fb_ms = List[Float64]()
+    var cpu_ms = List[Float64]()
+    var converged_at = -1
+    var uploads_total = 0
+    for f in range(40):
+        var cz = Float32(min(f, 30)) * Float32(0.5)   # fly low over the plane, then hold
+        gpu.begin_frame(Vec3(0.0, 0.9, -18.0 + cz), Vec3(0.0, 0.0, -9.0 + cz), fov_y_deg=60.0)
+        gpu.draw_instance(e.mesh_id, ident)
+        _ = gpu.render_frame(capture_readback=True)
+        if f == 0:
+            first_px = gpu.readback_pixels()
+        if use_vt:
+            uploads_total += gpu.sota_vt.last_uploads
+            if f >= 31 and converged_at < 0 and gpu.sota_vt.last_uploads == 0 and gpu.sota_vt.res.last_missing == 0:
+                converged_at = f
+            if f >= 4:
+                cpu_ms.append(gpu.sota_vt.last_cpu_ms)
+                for pt in gpu.get_gpu_pass_timings():
+                    if pt.pass_name == "SotaVtFeedback":
+                        fb_ms.append(pt.gpu_ms)
+    px = gpu.readback_pixels()
+    if use_vt:
+        log.append("resident=" + String(gpu.sota_vt.res.resident_pages()) + " uploads=" + String(uploads_total)
+                   + " converged@frame=" + String(converged_at) + " evictions=" + String(gpu.sota_vt.res.evictions_total)
+                   + " feedback ms=" + String(_median(fb_ms)) + " cpu ms=" + String(_median(cpu_ms))
+                   + " load s=" + String(t_load))
+        _assert(converged_at >= 0, "VT streaming converges (no missing pages) within 9 frames of the camera stopping")
+        _assert(_median(fb_ms) < 0.5, "VT feedback pass < 0.5 ms")
+    else:
+        log.append("reference BC7 load s=" + String(t_load))
+    renderer.shutdown()
+    return px^
+
+
+def test_gpu_virtual_texture():
+    var W = 640
+    var H = 360
+    var dim = 4096
+    var pattern = _vt_pattern(dim)
+    var log = List[String]()
+    var first_ref = List[UInt32]()
+    var first_vt = List[UInt32]()
+    var ref_px = _vt_run(False, W, H, dim, pattern, log, first_ref)
+    if len(ref_px) == 0:
+        print("[SKIP] Vulkan unavailable: VT GPU test skipped")
+        return
+    var vt_px = _vt_run(True, W, H, dim, pattern, log, first_vt)
+    _ = write_png(EVAL_DIR + "vt_reference_bc7.png", ref_px, W, H)
+    _ = write_png(EVAL_DIR + "vt_streamed_converged.png", vt_px, W, H)
+    _ = write_png(EVAL_DIR + "vt_frame0_root_only.png", first_vt, W, H)
+    var d_final = compare_pixels(vt_px, ref_px, W, H, 24)
+    var d_first = compare_pixels(first_vt, ref_px, W, H, 24)
+    var full_mb = Float64(dim * dim * 4) * 4.0 / 3.0 / 1048576.0
+    print("  VT " + String(dim) + "^2 (" + String(full_mb) + " MB as RGBA8 mips; atlas 18.1 MB fixed): " + log[1])
+    print("  VT vs BC7 reference: frame0 (root page only) mean_abs=" + String(d_first.mean_abs) + " >24: "
+          + String(d_first.over_tolerance) + " px | converged mean_abs=" + String(d_final.mean_abs) + " >24: "
+          + String(d_final.over_tolerance) + " px | " + log[0])
+    _assert(d_final.mean_abs * 2.0 < d_first.mean_abs, "streamed pages sharpen the root-only image")
+    _assert(d_final.mean_abs < 4.0, "converged VT matches the fully resident BC7 texture (mean_abs)")
+    print("[PASS] sota virtual texturing: GPU feedback -> residency streamer -> atlas pages, converged image == reference")
+
+
 def main():
     test_dag_cpu()
     test_hiz_cpu_and_spirv()
     test_gpu_two_pass_occlusion()
     test_gpu_dag_lod()
     test_gpu_cornell_hiz_regression()
+    test_vt_cpu()
+    test_gpu_virtual_texture()
