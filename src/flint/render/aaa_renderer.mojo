@@ -165,7 +165,9 @@ from flint.render.material_graph import (
     AAA_GLOBALS_TERRAIN_CLIPMAP_WORD,
     AAA_GLOBALS_TERRAIN_META_WORD,
     AAA_GLOBALS_TERRAIN_ORIGINS_WORD,
+    AAA_GLOBALS_TOTAL_WORDS,
     AAA_MAX_DECALS,
+    MAT_FLAG_ALPHA_BLEND,
     BakedVatCrowdClip,
     GPU_DECAL_VOLUME_WORDS,
     GpuDecalVolume,
@@ -352,6 +354,7 @@ from flint.render.aaa_npr_vfx import (
     aaa_npr_post_fx_shader,
     visbuffer_alphamask_vfx_fragment_shader,
 )
+from flint.render.aaa_raster_fallbacks import AaaRasterFallbacks, raster_fallback_history_words
 from flint.render.aaa_rt_shadow import (
     rt_shadow_filtered_offset,
     rt_shadow_raw_offset,
@@ -1076,6 +1079,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var star_intensity: Float32
     var sky_zenith_clear: Vec3
     var sky_horizon_clear: Vec3
+    # GTAO / SSR / local-light shadow maps / alpha-blended meshes without ray tracing (`aaa_raster_fallbacks.mojo`)
+    var raster_fallbacks: AaaRasterFallbacks
 
     def __init__(
         out self,
@@ -1208,6 +1213,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.ring_alphamask_indirect = List[GpuBuffer]()
         self.ring_outline_indirect = List[GpuBuffer]()
         self.ring_clusters = List[GpuBuffer]()
+        self.raster_fallbacks = AaaRasterFallbacks()
         self.ring_surfcache = List[GpuBuffer]()
         self.ring_vsm_table = List[GpuBuffer]()
         self.ring_oit_staging = List[GpuBuffer]()
@@ -1993,7 +1999,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_meshlets = self.vk.create_buffer_device_local(1 * 1024 * 1024)
         self.buf_materials = self.vk.create_buffer_device_local(256 * AAA_MATERIAL_WORDS * 4)
         self.buf_vsm_indirect = self.vk.create_buffer_device_local(64 + self.max_draws * 16)
-        var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
+        var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix) + raster_fallback_history_words(max_pix)
         self.buf_history = self.vk.create_buffer_device_local(hist_words * 4)
         self.buf_oit_nodes = self.vk.create_buffer_device_local(gpu_particles_total_oit_words(max_pix) * 4)
         self.buf_skinning = self.vk.create_buffer_device_local(AAA_SKIN_BUFFER_WORDS * 4)
@@ -2009,7 +2015,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var oit_stage_bytes = (AAA_MAX_OIT_PRIMS * 16 + AAA_MAX_PARTICLE_EMITTERS * AAA_EMITTER_WORDS + 64) * 4
         var vsm_conc = self.vk.has_side_queue()
         for _ in range(FRAMES_IN_FLIGHT):
-            var b_glob = self.vk.create_buffer_device_local(16384, concurrent=vsm_conc)
+            var b_glob = self.vk.create_buffer_device_local(AAA_GLOBALS_TOTAL_WORDS * 4, concurrent=vsm_conc)
             var b_inst = self.vk.create_buffer_device_local(self.max_instances * AAA_INSTANCE_WORDS * 4)
             var b_ind = self.vk.create_buffer_device_local(64 + self.max_draws * 20)
             var b_am_ind = self.vk.create_buffer_device_local(64 + 16384 * 20)
@@ -2305,7 +2311,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.vis_img.image == 0 or self.depth_img.image == 0 or self.hiz_img.image == 0:
             return False
 
-        var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
+        var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix) + raster_fallback_history_words(max_pix)
         self.buf_history = self.vk.create_buffer_device_local(hist_words * 4)
         self.buf_oit_nodes = self.vk.create_buffer_device_local(gpu_particles_total_oit_words(max_pix) * 4)
         var scratch_words = AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + FRAMES_IN_FLIGHT * AAA_UI_PRIM_REGION_WORDS
@@ -3268,8 +3274,24 @@ struct FlintAaaVulkanRenderer(Movable):
         _ = len(words)
 
     def add_material_asset(mut self, mat: MaterialAsset) -> Int:
-        """Uploads a unified `24`-word (`AAA_MATERIAL_WORDS`) `MaterialAsset` directly into `buf_materials` (`Binding 4`)."""
-        return self.add_material(mat.to_aaa_material())
+        """Uploads a unified `24`-word (`AAA_MATERIAL_WORDS`) `MaterialAsset` directly into `buf_materials` (`Binding 4`).
+        `MAT_FLAG_ALPHA_BLEND` materials render in the sorted forward blended pass with their `opacity`."""
+        var aaa = mat.to_aaa_material()
+        var opacity = aaa.opacity
+        var mat_id = self.add_material(aaa)
+        if (mat.flags & MAT_FLAG_ALPHA_BLEND) != 0:
+            self.raster_fallbacks.set_material_alpha_blend(mat_id, opacity)
+        return mat_id
+
+    def add_transparent_material(mut self, mat: AaaMaterial, opacity: Float32) -> Int:
+        """Adds a material drawn by the sorted, depth-tested forward blended pass with `opacity` (times albedo alpha)."""
+        var mat_id = self.add_material(mat)
+        self.raster_fallbacks.set_material_alpha_blend(mat_id, opacity)
+        return mat_id
+
+    def set_material_alpha_blend(mut self, mat_id: Int, opacity: Float32):
+        """Moves `mat_id` into (`opacity >= 0`) or out of (`opacity < 0`) the forward blended pass."""
+        self.raster_fallbacks.set_material_alpha_blend(mat_id, opacity)
 
     def update_material_asset(mut self, mat_id: Int, mat: MaterialAsset):
         """Updates an existing material slot in `buf_materials` (`Binding 4`) from a `MaterialAsset`."""
@@ -5842,11 +5864,19 @@ struct FlintAaaVulkanRenderer(Movable):
         var host_worklist = List[UInt32]()
         var worklist_count = 0
         var frame_has_glass = False
+        self.raster_fallbacks.clear_frame()
+        var rf_cam = self.cam_pos
         for i in range(n_inst):
             ref di = self.frame_instances[i]
             ref me = self.geom.meshes[di.mesh_id]
             var mat_final = me.material_id if di.material_override < 0 else di.material_override
             var is_am_inst = self._is_instance_alpha_masked(di, mat_final)
+            var is_sk_rf = di.mesh_id < len(self.skinned_mesh_flags) and self.skinned_mesh_flags[di.mesh_id]
+            var is_blend_inst = not is_am_inst and not is_sk_rf and self.raster_fallbacks.is_alpha_blend_material(mat_final)
+            if is_blend_inst:
+                self.raster_fallbacks.add_blend_draw(i, me.first_index, me.triangle_count, mat_final, di.world_mat, rf_cam)
+            elif not is_sk_rf:
+                self.raster_fallbacks.add_shadow_caster(i, me.first_index, me.triangle_count)
             var is_glass_inst = len(self.glass_materials) > 0 and self.is_glass_material(mat_final)
             if is_glass_inst:
                 frame_has_glass = True
@@ -5875,7 +5905,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0)),
                 )
             # Compact opaque `(inst_idx, ml_id)` pairs into flat 2-word 1D meshlet cull worklist
-            if not is_am_inst and i <= Int(AAA_MAX_PACKED_INSTANCES):
+            if not is_am_inst and not is_blend_inst and i <= Int(AAA_MAX_PACKED_INSTANCES):
                 var first_ml = me.first_meshlet
                 var ml_cnt = me.meshlet_count
                 for m_loc in range(ml_cnt):
@@ -5994,7 +6024,7 @@ struct FlintAaaVulkanRenderer(Movable):
             jy_clip = (jy_px_cur * Float32(2.0)) / Float32(self.render_h)
             mip_bias = Float32(-0.42)
 
-        var sl_glob = self.staging_ring.alloc(self.vk, cur_slot, 16384)
+        var sl_glob = self.staging_ring.alloc(self.vk, cur_slot, AAA_GLOBALS_TOTAL_WORDS * 4)
         var g_addr = sl_glob.cpu_address
         if g_addr == 0:
             return False
@@ -6044,6 +6074,9 @@ struct FlintAaaVulkanRenderer(Movable):
             put_float(g_addr + (72 + k * 3 + 1) * 4, self.sh9_irradiance[k].y)
             put_float(g_addr + (72 + k * 3 + 2) * 4, self.sh9_irradiance[k].z)
 
+        self.raster_fallbacks.plan_local_shadows(
+            self.frame_cluster_lights, self.cam_pos, self.vk.has_ray_query, not self.furnace_white_dome and n_inst > 0
+        )
         var n_cl_lights = len(self.frame_cluster_lights)
         var sl_clust = StagingSlice()
         if n_cl_lights > 0:
@@ -7050,6 +7083,8 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.memory_barrier2(
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
             )
+            # Raster local-light shadow maps for the planned point/spot lights (no-op when none are planned)
+            self.raster_fallbacks.record_local_shadows(self.vk, cur_slot, self.pipe_layout, self.desc_set, self.ring_clusters[cur_slot])
 
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
 
@@ -7365,6 +7400,12 @@ struct FlintAaaVulkanRenderer(Movable):
         else:
             self.spec_reblur_valid_frames = 0
 
+        # Raster GTAO + Hi-Z screen-space reflections (default: only on GPUs without ray query)
+        if not self.furnace_white_dome:
+            self.raster_fallbacks.record_gtao_ssr(
+                self.vk, cur_slot, self.pipe_layout, self.desc_set, self.buf_history, max_pix, self.render_w, self.render_h, self.vk.has_ray_query
+            )
+
         # Stylized Anime NPR Cel, Outline & Eroding 3D Mesh VFX Resolve (`aaa_npr_cel.mojo`, `aaa_npr_vfx.mojo`)
         if (n_cel > 0 or n_vfx > 0) and self._ensure_npr_cel_pipeline() != 0:
             var q_cel = next_q
@@ -7473,6 +7514,12 @@ struct FlintAaaVulkanRenderer(Movable):
                 self.vk.write_timestamp(cur_slot, q_wt + 1, PIPELINE_BOTTOM)
             self.vk.memory_barrier2(
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+            )
+
+        # Sorted alpha-blended meshes over the lit opaque frame, depth tested against the opaque depth
+        if len(self.raster_fallbacks.frame_blend_draws) > 0:
+            self.raster_fallbacks.record_blend(
+                self.vk, cur_slot, self.pipe_layout, self.desc_set, self.depth_img, self.buf_history, max_pix, self.render_w, self.render_h
             )
 
         # 64-Slice Hillaire Froxel Prefix-LUT Composite + GPU Froxel-Lit 3D Rain Streaks!
@@ -8503,6 +8550,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.active = False
             return
         self.vk.wait_idle()
+        self.raster_fallbacks.shutdown(self.vk)
         for fi in range(len(self.frame_fences)):
             self.frame_fences[fi] = 0
         self.prev_submitted_fence = 0
