@@ -1171,7 +1171,7 @@ def emit_rt_textured_hit_shade(
     s.begin_if(use_vsm_hit)
     # --- sota:shadow hook --- cascade-aware + toroidal lookup (v5 used cascade 0's matrix on the whole table)
     var cuv = emit_sota_shadow_cascade_uv(
-        s, b_globals, s.fma(hnx, s.float(0.02), hx), s.fma(hny, s.float(0.02), hy), s.fma(hnz, s.float(0.02), hz)
+        s, b_globals, s.fma(hnx, s.float(0.02), hx), s.fma(hny, s.float(0.02), hy), s.fma(hnz, s.float(0.02), hz), b_vsm
     )
     var lu = cuv[2]
     var lv = cuv[3]

@@ -381,6 +381,8 @@ from flint.render.aaa_post_tsr import (
 from flint.render.sota_perf_vsm import SotaVsmCache  # --- sota:perf hook ---
 from flint.render.sota_shadow_vsm import (  # --- sota:shadow hook ---
     SOTA_SHADOW_GLOBALS_CONTACT_WORD,
+    SOTA_SHADOW_GLOBALS_FLAGS_WORD,
+    SOTA_SHADOW_GLOBALS_FOG_WORD,
     SOTA_SHADOW_GLOBALS_TOROIDAL_OFFSETS_WORD,
     SOTA_SHADOW_GLOBALS_TOROIDAL_WORD,
     SotaShadowState,
@@ -390,6 +392,8 @@ from flint.render.sota_shadow_vsm import (  # --- sota:shadow hook ---
 )
 from flint.render.sota_shadow_gpu import (  # --- sota:shadow hook ---
     SOTA_SHADOW_ITEM_MESHLETS,
+    SOTA_SHADOW_ITEM_WORDS,
+    sota_shadow_append_items,
     SotaShadowGpu,
     sota_shadow_reset_tables,
 )
@@ -4344,6 +4348,8 @@ struct FlintAaaVulkanRenderer(Movable):
         if want:
             # caster items: same caster set / LOD choice / glass skip / alpha split as `_pack_vsm_indirect_commands`
             var items = List[UInt32]()
+            var ml_op = 0
+            var ml_al = 0
             for i_idx in range(min(n_inst, 32767)):
                 ref di = self.frame_instances[i_idx]
                 ref me = self.geom.meshes[di.mesh_id]
@@ -4361,19 +4367,31 @@ struct FlintAaaVulkanRenderer(Movable):
                 var lod_idx = 0
                 if me.lod_count > 1 and wr < Float32(5.5):
                     lod_idx = min(me.lod_count - 1, 2)
-                var sl = me.lods[lod_idx]
-                var first_ml = sl.first_meshlet if sl.meshlet_count > 0 else me.first_meshlet
-                var ml_cnt = sl.meshlet_count if sl.meshlet_count > 0 else me.lod0_meshlet_count
-                var m0 = 0
-                while m0 < ml_cnt:
-                    items.append(UInt32(i_idx) | am_bit)
-                    items.append(UInt32(first_ml + m0))
-                    items.append(UInt32(min(SOTA_SHADOW_ITEM_MESHLETS, ml_cnt - m0)))
-                    m0 += SOTA_SHADOW_ITEM_MESHLETS
+                # r3: instance world sphere for the GPU pre-cull; per-cascade LOD (coarse cascades cast a coarse LOD)
+                var wc = di.world_mat.transform_point(me.bounds_center)
+                var lod_split = self.sota_shadow.cascade_lod_from
+                var split = lod_idx == 0 and me.lod_count > 1 and lod_split > 0 and lod_split < 4
+                var fine_mask = ((1 << lod_split) - 1) if split else 15
+                var n_ml = sota_shadow_append_items(
+                    items, UInt32(i_idx) | am_bit, me.lods[lod_idx], me.first_meshlet, me.lod0_meshlet_count, fine_mask, wc, wr
+                )
+                if split:
+                    n_ml += sota_shadow_append_items(
+                        items, UInt32(i_idx) | am_bit, me.lods[min(me.lod_count - 1, 2)], me.first_meshlet,
+                        me.lod0_meshlet_count, 15 - fine_mask, wc, wr,
+                    )
+                if am_bit != 0:
+                    ml_al += n_ml
+                else:
+                    ml_op += n_ml
             self.sota_shadow_gpu.read_stats()
-            var cmd_need = max(131072, self.sota_shadow_gpu.wanted_max)
+            self.sota_shadow_gpu.meshlets_opaque_last = ml_op
+            self.sota_shadow_gpu.meshlets_alpha_last = ml_al
+            var list_need = self.sota_shadow_gpu.list_needs()
             var switched = not self.sota_shadow.gpu_was_active
-            if self.sota_shadow_gpu.ensure_buffer(self.vk, len(items) // 3, cmd_need) or switched:
+            if self.sota_shadow_gpu.ensure_buffer(
+                self.vk, len(items) // SOTA_SHADOW_ITEM_WORDS, list_need[0], list_need[1]
+            ) or switched:
                 self.vk.wait_idle()
                 if switched:
                     sota_shadow_reset_tables(self.sota_shadow_gpu.buf)
@@ -4824,6 +4842,14 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + SOTA_SHADOW_GLOBALS_CONTACT_WORD * 4, self.sota_shadow.contact_length_m)
         put_float(g_addr + (SOTA_SHADOW_GLOBALS_CONTACT_WORD + 1) * 4, self.sota_shadow.contact_thickness_m)
         put32(g_addr + (SOTA_SHADOW_GLOBALS_CONTACT_WORD + 2) * 4, UInt32(1) if self.sota_shadow.contact else UInt32(0))
+        # r3: coarse fallback / fog page requests / soft fog taps / parent marks under pool pressure (globals 234..235)
+        self.sota_shadow.update_pressure(
+            self.sota_shadow_gpu.unmapped_last if self.sota_shadow.gpu_was_active else self.vsm.sota_dropped_last,
+            self.sota_shadow.gpu_was_active,
+        )
+        put32(g_addr + SOTA_SHADOW_GLOBALS_FLAGS_WORD * 4, self.sota_shadow.globals_flags() if use_vsm_casc_frame else UInt32(0))
+        put_float(g_addr + SOTA_SHADOW_GLOBALS_FOG_WORD * 4, self.sota_shadow.fog_footprint_scale)
+        self.vsm.sota_coarse_first = use_vsm_casc_frame and self.sota_shadow.parent_marks_active
         # --- end sota:shadow hook ---
         if use_vsm_casc_frame:
             for k in range(16):

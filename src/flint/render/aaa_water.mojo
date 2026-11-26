@@ -343,7 +343,7 @@ def aaa_water_refract_shader(enable_ray_query: Bool) -> List[UInt32]:
     var sun_vis_w = s.fvar(s.float(1.0))
     s.begin_if(s.ine(s.bit_and(r_flags, s.uint(1)), s.uint(0)))
     # --- sota:shadow hook --- cascade-aware + toroidal lookup (v5 used cascade 0's matrix on the whole table)
-    var wcuv = emit_sota_shadow_cascade_uv(s, b_globals, wx, water_y, wz)
+    var wcuv = emit_sota_shadow_cascade_uv(s, b_globals, wx, water_y, wz, b_vsm)
     var wlu = wcuv[2]
     var wlv = wcuv[3]
     var in_wv = s.logical_and(

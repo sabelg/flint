@@ -31,7 +31,7 @@ from flint.render.aaa_visbuffer import (
     emit_vec3_normalize,
 )
 from flint.render.aaa_vsm import emit_sample_vsm_depth
-from flint.render.sota_shadow_vsm import emit_sota_shadow_cascade_uv  # --- sota:shadow hook ---
+from flint.render.sota_shadow_vsm import emit_sota_shadow_cascade_uv, emit_sota_shadow_fog_visibility  # --- sota:shadow hook ---
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.aaa_clustered_lights import (
     AAA_CLUSTER_COUNTS_BASE,
@@ -223,19 +223,11 @@ def froxel_inject_and_reproject_shader() -> List[UInt32]:
 
     var sun_vis = s.fvar(s.float(1.0))
     s.begin_if(s.ine(s.bit_and(r_flags, s.uint(1)), s.uint(0)))
-    # --- sota:shadow hook --- cascade-aware + toroidal lookup (v5 used cascade 0's matrix on the whole table)
-    var cuv = emit_sota_shadow_cascade_uv(s, b_globals, wx, wy, wz)
-    var lu = cuv[2]
-    var lv = cuv[3]
-    var in_vsm = s.logical_and(
-        s.logical_and(s.fgt(lu, s.float(0.002)), s.flt(lu, s.float(0.998))),
-        s.logical_and(s.fgt(lv, s.float(0.002)), s.flt(lv, s.float(0.998))),
-    )
-    s.begin_if(s.logical_and(in_vsm, s.flt(cuv[4], s.float(0.999))))
-    var vz_s = emit_sample_vsm_depth(s, b_vsm, vsm_samp, cuv[0], cuv[1], b_globals)
-    s.store(sun_vis, s.select_f(s.flt(vz_s, s.fsub(cuv[4], s.float(0.0015))), s.float(0.0), s.float(1.0)))
+    # --- sota:shadow hook --- r3: footprint-matched cascade, resident fallback, jittered taps, fog page requests
+    var frox_w = s.fmul(s.fmul(tan_x, z_view), s.float(2.0 / 160.0))
+    var has_fog = s.fgt(sigma_ext, s.float(0.0))
+    s.store(sun_vis, emit_sota_shadow_fog_visibility(s, b_globals, b_vsm, vsm_samp, wx, wy, wz, frox_w, ign_z, has_fog))
     # --- end sota:shadow hook ---
-    s.end_if()
     s.end_if()
 
     var cos_sun = emit_vec3_dot(s, view_dir[0], view_dir[1], view_dir[2], sun_x, sun_y, sun_z)
@@ -736,7 +728,7 @@ def froxel_raymarch_integrate_shader() -> List[UInt32]:
         # Check overhead VSM occlusion so rain stops cleanly underneath highway overpasses!
         var sky_open = s.fvar(s.float(1.0))
         s.begin_if(s.ine(s.bit_and(r_flags, s.uint(1)), s.uint(0)))
-        var rcuv = emit_sota_shadow_cascade_uv(s, b_globals, px_c, py_c, pz_c)  # --- sota:shadow hook ---
+        var rcuv = emit_sota_shadow_cascade_uv(s, b_globals, px_c, py_c, pz_c, b_vsm)  # --- sota:shadow hook ---
         var rlu = rcuv[2]
         var rlv = rcuv[3]
         s.begin_if(s.logical_and(s.logical_and(s.fgt(rlu, s.float(0.01)), s.flt(rlu, s.float(0.99))), s.logical_and(s.fgt(rlv, s.float(0.01)), s.flt(rlv, s.float(0.99)))))
