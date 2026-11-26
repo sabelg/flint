@@ -477,6 +477,10 @@ from flint.studio.viewport_hud import (
     HDR_ACT_NONE,
     HDR_ACT_SAVE,
     HDR_ACT_THEME_CYCLE,
+    HDR_ACT_WIN_CLOSE,
+    HDR_ACT_WIN_DRAG_MOVE,
+    HDR_ACT_WIN_MAXIMIZE,
+    HDR_ACT_WIN_MINIMIZE,
     HDR_ACT_WORKSPACE,
     STUDIO_HEADER_BAR_H,
     StudioHeaderBar,
@@ -8993,6 +8997,13 @@ def emit_studio_ui_draw_list(
         if studio.code_drawer.build_status == BUILD_STATUS_ERROR
         else (1 if studio.code_drawer.build_status == BUILD_STATUS_BUILDING else 0)
     )
+    var show_win_ctrls = False
+    var win_is_max = False
+    if studio.anim_mode != UI_ANIM_INSTANT:
+        var wc_opt = studio.app.resources.get_ptr[WindowStateResource]()
+        if wc_opt and wc_opt.value()[unsafe_offset=0].initialized and len(wc_opt.value()[unsafe_offset=0].windows) > 0:
+            show_win_ctrls = wc_opt.value()[unsafe_offset=0].windows[0].uses_client_decorations()
+            win_is_max = wc_opt.value()[unsafe_offset=0].windows[0].maximized
     var hdr_act = studio.header_bar.draw(
         studio.ui_ctx.draw_list,
         font_slot,
@@ -9011,6 +9022,8 @@ def emit_studio_ui_draw_list(
         studio.ui_ctx.mouse_down_l and (not overlay_blocked),
         studio.ui_ctx.mouse_pressed_l and (not overlay_blocked),
         Float32(0.0),
+        show_window_controls=show_win_ctrls,
+        window_maximized=win_is_max,
     )
     if hdr_act.kind == HDR_ACT_WORKSPACE:
         _ = studio.apply_workspace_preset(hdr_act.int_val, sw, sh)
@@ -9026,6 +9039,20 @@ def emit_studio_ui_draw_list(
         _ = studio.execute_palette_command(PAL_CMD_BUILD_HOT_RELOAD)
     elif hdr_act.kind == HDR_ACT_MENU:
         studio.menu.bar.group = 0 if studio.menu.bar.group < 0 else -1
+    elif hdr_act.kind == HDR_ACT_WIN_MINIMIZE:
+        var wm_opt = studio.app.resources.get_ptr_mut[WindowStateResource]()
+        if wm_opt and len(wm_opt.value()[unsafe_offset=0].windows) > 0:
+            wm_opt.value()[unsafe_offset=0].windows[0].minimize()
+    elif hdr_act.kind == HDR_ACT_WIN_MAXIMIZE:
+        var wm_opt = studio.app.resources.get_ptr_mut[WindowStateResource]()
+        if wm_opt and len(wm_opt.value()[unsafe_offset=0].windows) > 0:
+            wm_opt.value()[unsafe_offset=0].windows[0].toggle_maximize()
+    elif hdr_act.kind == HDR_ACT_WIN_DRAG_MOVE:
+        var wm_opt = studio.app.resources.get_ptr_mut[WindowStateResource]()
+        if wm_opt and len(wm_opt.value()[unsafe_offset=0].windows) > 0:
+            wm_opt.value()[unsafe_offset=0].windows[0].start_interactive_move()
+    elif hdr_act.kind == HDR_ACT_WIN_CLOSE:
+        _ = studio.request_quit()
 
     # 1. Obsidian v2 DockSpace below Header Bar
     var dock_rect = RectF(

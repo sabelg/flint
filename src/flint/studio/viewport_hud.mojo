@@ -70,6 +70,10 @@ comptime HDR_ACT_THEME_CYCLE: Int = 4
 comptime HDR_ACT_SAVE: Int = 5
 comptime HDR_ACT_BUILD: Int = 6
 comptime HDR_ACT_MENU: Int = 7
+comptime HDR_ACT_WIN_MINIMIZE: Int = 8
+comptime HDR_ACT_WIN_MAXIMIZE: Int = 9
+comptime HDR_ACT_WIN_CLOSE: Int = 10
+comptime HDR_ACT_WIN_DRAG_MOVE: Int = 11
 
 # Viewport HUD Actions
 comptime VHUD_ACT_NONE: Int = 0
@@ -237,12 +241,14 @@ struct StudioHeaderBar(Copyable, Movable):
     var active_workspace: Int
     var hovered: Bool
     var last_hit_rect: RectF
+    var _last_bar_click_sec: Float32
 
     def __init__(out self):
         self.rect = RectF(0.0, 0.0, 1280.0, STUDIO_HEADER_BAR_H)
         self.active_workspace = WORKSPACE_EDIT
         self.hovered = False
         self.last_hit_rect = RectF()
+        self._last_bar_click_sec = Float32(-10.0)
 
     def contains_point(self, mx: Float32, my: Float32) -> Bool:
         return self.rect.contains(mx, my)
@@ -266,6 +272,8 @@ struct StudioHeaderBar(Copyable, Movable):
         mouse_down: Bool,
         mouse_pressed: Bool,
         y_offset: Float32 = 0.0,
+        show_window_controls: Bool = False,
+        window_maximized: Bool = False,
     ) -> HeaderBarAction:
         """Emits the `32 px` Studio header bar and returns any triggered `HeaderBarAction`."""
         var action = HeaderBarAction()
@@ -313,7 +321,65 @@ struct StudioHeaderBar(Copyable, Movable):
             dl.add_circle(lx + title_w + Float32(8.0), cy, Float32(3.2), theme.play_paused)
 
         # ---- Right Zone (laid out right-to-left so center workspace pill never overlaps) ----
-        var rx = self.rect.right() - Float32(10.0)
+        var rx = self.rect.right() - Float32(8.0)
+
+        # 0. Native Wayland Client-Side Window Controls (Minimize / Maximize / Close)
+        if show_window_controls:
+            var wb_w = Float32(26.0)
+            var wb_h = Float32(22.0)
+            var wb_y = self.rect.y + Float32(5.0)
+
+            # Close (X)
+            rx -= wb_w
+            var cl_r = RectF(rx, wb_y, wb_w, wb_h)
+            var cl_hov = cl_r.contains(mouse_x, mouse_y)
+            var cl_bg = rgba8_with_alpha(theme.status_danger, 225 if (cl_hov and mouse_down) else (195 if cl_hov else 0))
+            if cl_hov:
+                dl.add_rect(cl_r.x, cl_r.y, cl_r.w, cl_r.h, cl_bg, theme.radius_xs)
+            var cl_fg = theme.text_on_accent if cl_hov else theme.text_secondary
+            var cx0 = cl_r.center_x()
+            var cy0 = cl_r.center_y()
+            dl.add_line(cx0 - Float32(4.0), cy0 - Float32(4.0), cx0 + Float32(4.0), cy0 + Float32(4.0), Float32(1.5), cl_fg)
+            dl.add_line(cx0 + Float32(4.0), cy0 - Float32(4.0), cx0 - Float32(4.0), cy0 + Float32(4.0), Float32(1.5), cl_fg)
+            if cl_hov and mouse_pressed:
+                action = HeaderBarAction(HDR_ACT_WIN_CLOSE, 0)
+            rx -= Float32(3.0)
+
+            # Maximize / Restore
+            rx -= wb_w
+            var mx_r = RectF(rx, wb_y, wb_w, wb_h)
+            var mx_hov = mx_r.contains(mouse_x, mouse_y)
+            if mx_hov:
+                dl.add_rect(mx_r.x, mx_r.y, mx_r.w, mx_r.h, theme.l3_hover, theme.radius_xs)
+            var mx_fg = theme.text_primary if mx_hov else theme.text_secondary
+            var mx_cx = mx_r.center_x()
+            var mx_cy = mx_r.center_y()
+            if window_maximized:
+                dl.add_rect(mx_cx - Float32(2.5), mx_cy - Float32(5.0), Float32(7.0), Float32(7.0), 0, Float32(1.0), Float32(1.3), mx_fg)
+                dl.add_rect(mx_cx - Float32(5.0), mx_cy - Float32(2.5), Float32(7.0), Float32(7.0), theme.l1_shell, Float32(1.0), Float32(1.3), mx_fg)
+            else:
+                dl.add_rect(mx_cx - Float32(4.5), mx_cy - Float32(4.5), Float32(9.0), Float32(9.0), 0, Float32(1.5), Float32(1.4), mx_fg)
+            if mx_hov and mouse_pressed:
+                action = HeaderBarAction(HDR_ACT_WIN_MAXIMIZE, 0)
+            rx -= Float32(3.0)
+
+            # Minimize (—)
+            rx -= wb_w
+            var mn_r = RectF(rx, wb_y, wb_w, wb_h)
+            var mn_hov = mn_r.contains(mouse_x, mouse_y)
+            if mn_hov:
+                dl.add_rect(mn_r.x, mn_r.y, mn_r.w, mn_r.h, theme.l3_hover, theme.radius_xs)
+            var mn_fg = theme.text_primary if mn_hov else theme.text_secondary
+            dl.add_line(mn_r.center_x() - Float32(4.5), mn_r.center_y() + Float32(2.0), mn_r.center_x() + Float32(4.5), mn_r.center_y() + Float32(2.0), Float32(1.5), mn_fg)
+            if mn_hov and mouse_pressed:
+                action = HeaderBarAction(HDR_ACT_WIN_MINIMIZE, 0)
+            rx -= Float32(6.0)
+
+            # Divider between window controls and Build chip
+            dl.add_line(rx, self.rect.y + Float32(7.0), rx, self.rect.bottom() - Float32(7.0), Float32(1.0), theme.border_subtle)
+            rx -= Float32(8.0)
+        else:
+            rx -= Float32(2.0)
 
         # 1. Build status chip
         var bld_w = Float32(58.0)
@@ -470,6 +536,16 @@ struct StudioHeaderBar(Copyable, Movable):
                 )
                 if thov and mouse_pressed:
                     action = HeaderBarAction(HDR_ACT_WORKSPACE, pi)
+
+        # Clicking empty draggable area of the HeaderBar initiates native Wayland move (or double-click maximize)
+        if show_window_controls and action.kind == HDR_ACT_NONE and self.hovered and mouse_pressed:
+            var dt_click = anim.time_sec - self._last_bar_click_sec
+            if dt_click > Float32(0.0) and dt_click < Float32(0.38):
+                action = HeaderBarAction(HDR_ACT_WIN_MAXIMIZE, 0)
+                self._last_bar_click_sec = Float32(-10.0)
+            else:
+                self._last_bar_click_sec = anim.time_sec
+                action = HeaderBarAction(HDR_ACT_WIN_DRAG_MOVE, 0)
 
         return action
 

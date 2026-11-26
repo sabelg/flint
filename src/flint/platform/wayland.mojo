@@ -243,6 +243,7 @@ struct WaylandWindow(WindowBackend):
     var configured: Bool
     var focused: Bool
     var fullscreen: Bool
+    var maximized: Bool
     var next_id: Int
     var registry: Int
     var compositor: Int
@@ -350,6 +351,7 @@ struct WaylandWindow(WindowBackend):
         self.configured = False
         self.focused = False
         self.fullscreen = False
+        self.maximized = False
         self.next_id = 2
         self.registry = 0
         self.compositor = 0
@@ -456,6 +458,7 @@ struct WaylandWindow(WindowBackend):
         self.configured = existing.configured
         self.focused = existing.focused
         self.fullscreen = existing.fullscreen
+        self.maximized = existing.maximized
         self.next_id = existing.next_id
         self.registry = existing.registry
         self.compositor = existing.compositor
@@ -585,6 +588,64 @@ struct WaylandWindow(WindowBackend):
             var body = List[UInt8]()
             wl_append_string(body, title)
             _ = self.request(self.toplevel, 2, body)
+
+    def uses_client_decorations(self) -> Bool:
+        """Returns True on native Wayland when the compositor did not grant server-side borders."""
+        return (
+            (not self.using_x11)
+            and (not self.using_kms)
+            and self.fd >= 0
+            and self.toplevel > 0
+            and self.decoration_mode != 2
+        )
+
+    def minimize(mut self):
+        """Requests native Wayland `xdg_toplevel.set_minimized` (opcode 13)."""
+        if (not self.using_x11) and (not self.using_kms) and self.fd >= 0 and self.toplevel > 0:
+            var body = List[UInt8]()
+            _ = self.request(self.toplevel, 13, body)
+
+    def set_maximized(mut self, enabled: Bool):
+        """Requests native Wayland `xdg_toplevel.set_maximized` (9) or `unset_maximized` (10)."""
+        if (not self.using_x11) and (not self.using_kms) and self.fd >= 0 and self.toplevel > 0:
+            var body = List[UInt8]()
+            _ = self.request(self.toplevel, 9 if enabled else 10, body)
+            self.maximized = enabled
+
+    def toggle_maximize(mut self):
+        """Toggles native Wayland maximized state."""
+        self.set_maximized(not self.maximized)
+
+    def start_interactive_move(mut self):
+        """Starts native Wayland compositor drag-move (`xdg_toplevel.move`, opcode 5)."""
+        if (
+            (not self.using_x11)
+            and (not self.using_kms)
+            and self.fd >= 0
+            and self.toplevel > 0
+            and self.seat > 0
+            and self.last_input_serial != 0
+        ):
+            var body = List[UInt8]()
+            wl_append32(body, self.seat)
+            wl_append32(body, self.last_input_serial)
+            _ = self.request(self.toplevel, 5, body)
+
+    def start_interactive_resize(mut self, edges: Int):
+        """Starts native Wayland compositor interactive resize (`xdg_toplevel.resize`, opcode 6)."""
+        if (
+            (not self.using_x11)
+            and (not self.using_kms)
+            and self.fd >= 0
+            and self.toplevel > 0
+            and self.seat > 0
+            and self.last_input_serial != 0
+        ):
+            var body = List[UInt8]()
+            wl_append32(body, self.seat)
+            wl_append32(body, self.last_input_serial)
+            wl_append32(body, edges)
+            _ = self.request(self.toplevel, 6, body)
 
     def backend_name(self) -> String:
         if self.using_kms:
@@ -1042,13 +1103,16 @@ struct WaylandWindow(WindowBackend):
                 self.width = width
                 self.height = height
             self.fullscreen = False
+            self.maximized = False
             self.focused = False
             if size >= 20:
                 var states_length = wl_get32(pkt, 16)
                 var count = min((size - 20) // 4, states_length // 4)
                 for index in range(count):
                     var state = wl_get32(pkt, 20 + index * 4)
-                    if state == 2:
+                    if state == 1:
+                        self.maximized = True
+                    elif state == 2:
                         self.fullscreen = True
                     elif state == 4:
                         self.focused = True

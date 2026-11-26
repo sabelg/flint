@@ -768,9 +768,9 @@ def _render_chapter(mut dl: UiDrawList, game: StoryGame, font_slot: Int, font: S
     dl.add_rect(bar_x, bar_y, max(Float32(6.0), bar_w * prog), Float32(3.5), _rgba(248, 198, 96, 235), Float32(2.0))
     dl.add_circle(bar_x + bar_w * prog, bar_y + Float32(1.8), Float32(4.5), _rgba(255, 226, 134, 250))
 
-    # Top-right faint SOUND ON indicator
+    # Top-right faint SOUND ON indicator (shifted left cleanly when native Wayland window controls are shown)
     var snd_lbl = String("SOUND ON") if game.sound_on else String("SOUND OFF")
-    dl.add_text(font_slot, font, snd_lbl, w - Float32(102.0), Float32(34.0), Float32(11.0), _rgba(246, 236, 216, 170), Float32(1.0), _rgba(20, 14, 18, 120))
+    dl.add_text(font_slot, font, snd_lbl, w - Float32(196.0), Float32(34.0), Float32(11.0), _rgba(246, 236, 216, 170), Float32(1.0), _rgba(20, 14, 18, 120))
 
     # Whisper-soft bottom control hint
     dl.add_text(
@@ -947,6 +947,49 @@ def main():
 
         dl.clear()
         _render_chapter(dl, game, font_slot, font)
+
+        # Native Wayland client-side Minimize / Maximize / Close + top-bar drag-to-move
+        var csd_quit = False
+        if len(w_opt.value()[unsafe_offset=0].windows) > 0:
+            ref win = w_opt.value()[unsafe_offset=0].windows[0]
+            if win.uses_client_decorations():
+                var mx = inp.last_mouse_x
+                var my = inp.last_mouse_y
+                var mpress = inp.mouse_pressed(0)
+                var by = Float32(14.0)
+                var bw = Float32(26.0)
+                var bh = Float32(24.0)
+                var cl_x = Float32(out_w) - Float32(14.0) - bw
+                var mx_x = cl_x - Float32(6.0) - bw
+                var mn_x = mx_x - Float32(6.0) - bw
+                var cl_h = mx >= cl_x and mx <= cl_x + bw and my >= by and my <= by + bh
+                var mx_h = mx >= mx_x and mx <= mx_x + bw and my >= by and my <= by + bh
+                var mn_h = mx >= mn_x and mx <= mn_x + bw and my >= by and my <= by + bh
+                var pill_bg = _rgba(22, 18, 28, 150)
+                var pill_hov = _rgba(54, 46, 66, 210)
+                var fg = _rgba(246, 238, 224, 235)
+                # Minimize
+                dl.add_rect(mn_x, by, bw, bh, pill_hov if mn_h else pill_bg, Float32(6.0))
+                dl.add_line(mn_x + Float32(8.0), by + Float32(15.0), mn_x + Float32(18.0), by + Float32(15.0), Float32(1.6), fg)
+                # Maximize / Restore
+                dl.add_rect(mx_x, by, bw, bh, pill_hov if mx_h else pill_bg, Float32(6.0))
+                dl.add_rect(mx_x + Float32(8.0), by + Float32(7.0), Float32(10.0), Float32(10.0), 0, Float32(1.5), Float32(1.5), fg)
+                # Close
+                dl.add_rect(cl_x, by, bw, bh, _rgba(218, 62, 62, 225) if cl_h else pill_bg, Float32(6.0))
+                dl.add_line(cl_x + Float32(8.5), by + Float32(7.5), cl_x + Float32(17.5), by + Float32(16.5), Float32(1.6), fg)
+                dl.add_line(cl_x + Float32(17.5), by + Float32(7.5), cl_x + Float32(8.5), by + Float32(16.5), Float32(1.6), fg)
+                if mpress:
+                    if cl_h:
+                        csd_quit = True
+                    elif mx_h:
+                        win.toggle_maximize()
+                    elif mn_h:
+                        win.minimize()
+                    elif my <= Float32(44.0):
+                        win.start_interactive_move()
+        if csd_quit:
+            break
+
         var need_rb = not renderer.surface.is_zero_copy_gpu()
         _ = renderer.render_world(world, dl, capture_readback=need_rb, force_readback=False)
         if need_rb:
