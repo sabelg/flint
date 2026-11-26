@@ -98,6 +98,8 @@ from flint.render.ui_overlay import aaa_ui_overlay_shader, AAA_POST_UI_PRIMS_BAS
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 # --- sota:geometry hook ---
 from flint.render.sota_geometry_cull import SOTA_MAX_GLOBAL_MESHLETS, SotaGeometryGpu, sota_geometry_grow_size
+from flint.render.sota_geometry_visid import SOTA_MAX_GLOBAL_VERTICES, sota_draw_pack
+from flint.render.sota_geometry_cull import SOTA_BIND_CANDIDATES, SOTA_BIND_DAG, SOTA_BIND_MESHLETS
 from flint.render.sota_geometry_vt import SotaVirtualTextures
 from flint.render.sota_geometry_cluster_dag import cook_cluster_dag_into_pool
 # --- end sota:geometry hook ---
@@ -1468,7 +1470,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_ldr_readback = self.vk.create_buffer(64 + self.output_w * self.output_h * 4, local=False, cpu_reads=True)
         self.buf_staging = self.vk.create_buffer(8 * 1024 * 1024, local=False)
         self.buf_indirect_phase2 = self.vk.create_buffer(64 + self.max_draws * 20, local=True)
-        self.buf_occluded_candidates = self.vk.create_buffer(64 + self.max_draws * 4, local=True)
+        self.buf_occluded_candidates = self.vk.create_buffer(64 + self.max_draws * 8, local=True)  # sota:geometry hook: (inst, meshlet) pairs
 
         # Ring-Buffered CPU-to-GPU Dynamic Buffers (Feature 14: FRAMES_IN_FLIGHT = 2)
         for _ in range(FRAMES_IN_FLIGHT):
@@ -2250,16 +2252,43 @@ struct FlintAaaVulkanRenderer(Movable):
                 or len(self.geom.meshlet_words) * 4 > self.buf_meshlets.size):
             entry.mesh_id = -1            # did not fit on the GPU: never draw it
             self._sota_log_once("geometry: mesh did not fit on the GPU (buffer growth failed); it will not be drawn")  # sota:geometry hook
-        # --- sota:geometry hook --- the visbuffer / indirect encodings carry a 17-bit global meshlet id
-        if entry.mesh_id >= 0 and entry.first_meshlet + entry.meshlet_count > SOTA_MAX_GLOBAL_MESHLETS:
+        # --- sota:geometry hook --- draws and the visbuffer carry a 24-bit global meshlet id and a 24-bit vertex index
+        if entry.mesh_id >= 0 and (len(self.geom.meshlet_words) // 12 > SOTA_MAX_GLOBAL_MESHLETS
+                                   or len(self.geom.vertex_words) // 12 > SOTA_MAX_GLOBAL_VERTICES):
             entry.mesh_id = -1
             self.sota_geom.meshlet_id_overflows += 1
-            self._sota_log_once("geometry: meshlet ids beyond " + String(SOTA_MAX_GLOBAL_MESHLETS)
-                                + " do not fit the 17-bit visbuffer encoding; further meshes are not drawn")
+            self._sota_log_once("geometry: more than " + String(SOTA_MAX_GLOBAL_MESHLETS) + " meshlets or "
+                                + String(SOTA_MAX_GLOBAL_VERTICES) + " vertices do not fit the 24-bit draw ids; further meshes are not drawn")
         # --- end sota:geometry hook ---
         return entry^
 
     # --- sota:geometry hook ---
+    def sota_debug_pad_meshlets(mut self, count: Int) -> Int:
+        """Test hook: appends `count` copies of the last meshlet record (never referenced by any mesh), so the next
+        uploaded mesh gets global meshlet ids past `count`. Returns the new global meshlet count (-1 on failure)."""
+        var n0 = len(self.geom.meshlets)
+        if n0 == 0 or count <= 0 or len(self.geom.meshlet_words) < 12:
+            return -1
+        var m_words_before = len(self.geom.meshlet_words)
+        var last = List[UInt32]()
+        for k in range(12):
+            last.append(self.geom.meshlet_words[m_words_before - 12 + k])
+        var rec = self.geom.meshlets[n0 - 1].copy()
+        for _ in range(count):
+            for k in range(12):
+                self.geom.meshlet_words.append(last[k])
+            self.geom.meshlets.append(rec.copy())
+        if not self._sota_ensure_geometry_capacity():
+            return -1
+        var mb_start = m_words_before * 4
+        var mb_len = (len(self.geom.meshlet_words) - m_words_before) * 4
+        if mb_start + mb_len > self.buf_meshlets.size:
+            return -1
+        _ = external_call["memcpy", Int](
+            self.buf_meshlets.cpu_address + mb_start, Int(self.geom.meshlet_words.unsafe_ptr()) + mb_start, mb_len
+        )
+        return len(self.geom.meshlets)
+
     def _sota_log_once(mut self, msg: String):
         """Prints a renderer warning once per distinct message (no silent failures, no log spam)."""
         for m in self.sota_geom.logged:
@@ -2330,10 +2359,23 @@ struct FlintAaaVulkanRenderer(Movable):
         if not self.sota_geom.rebind_meshlets(self.vk, self.buf_meshlets, ml_cap):
             self._sota_log_once("geometry: could not grow the DAG record buffer; cluster LOD falls back to LOD0 for new meshes")
         self.sota_vt.rebind_geometry(self.vk, self.buf_vertices, self.buf_indices, self.buf_meshlets)
+        self._sota_rebind_e_routes()
         self.sota_geom.grow_events += 1
         print("[flint render] geometry buffers grown: vertices " + String(self.buf_vertices.size // 1048576) + " MB, indices "
               + String(self.buf_indices.size // 1048576) + " MB, meshlets " + String(self.buf_meshlets.size // 1048576) + " MB")
         return True
+
+    def _sota_rebind_e_routes(mut self):
+        """Area E's GPU-driven alpha-mask / outline cull sets hold the meshlet, candidate and DAG buffers that
+        geometry / draw growth replaces: point them at the live buffers (a stale set reads freed memory)."""
+        for ds in self.sota_e_gpu.sets_alpha:
+            self.vk.write_descriptor(ds, SOTA_BIND_MESHLETS, self.buf_meshlets)
+            self.vk.write_descriptor(ds, SOTA_BIND_CANDIDATES, self.buf_occluded_candidates)
+            self.vk.write_descriptor(ds, SOTA_BIND_DAG, self.sota_geom.buf_dag)
+        for ds in self.sota_e_gpu.sets_outline:
+            self.vk.write_descriptor(ds, SOTA_BIND_MESHLETS, self.buf_meshlets)
+            self.vk.write_descriptor(ds, SOTA_BIND_CANDIDATES, self.buf_occluded_candidates)
+            self.vk.write_descriptor(ds, SOTA_BIND_DAG, self.sota_geom.buf_dag)
 
     def _sota_grow_draws(mut self, new_max: Int) -> Bool:
         """Grows every buffer sized by `max_draws` (indirect rings, phase-2 indirect, occluded candidates,
@@ -2343,7 +2385,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.wait_idle()
         var n_vsm = self.vk.create_buffer(64 + new_max * 16, local=True)
         var n_p2 = self.vk.create_buffer(64 + new_max * 20, local=True)
-        var n_cand = self.vk.create_buffer(64 + new_max * 4, local=True)
+        var n_cand = self.vk.create_buffer(64 + new_max * 8, local=True)
         var n_ring = List[GpuBuffer]()
         var ok = n_vsm.size > 0 and n_p2.size > 0 and n_cand.size > 0
         for _ in range(FRAMES_IN_FLIGHT):
@@ -2376,6 +2418,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(self.desc_sets_cull_p2[slot], BIND_AAA_INDIRECT, self.buf_indirect_phase2)
             self.vk.write_descriptor(self.desc_sets_cull_p2[slot], BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
         self.sota_geom.rebind_draws(self.vk, self.ring_indirect, self.buf_indirect_phase2, self.buf_occluded_candidates)
+        self._sota_rebind_e_routes()
         self.sota_geom.draw_grow_events += 1
         print("[flint render] max_draws grown to " + String(new_max))
         return True
@@ -3587,8 +3630,9 @@ struct FlintAaaVulkanRenderer(Movable):
                 put32(dst + 0, UInt32(ml.tri_count * 3))
                 put32(dst + 4, UInt32(1))
                 put32(dst + 8, UInt32(ml.first_tri * 3))
-                put32(dst + 12, UInt32(0))
-                put32(dst + 16, UInt32((i_idx << 17) | (ml_id & 0x1FFFF)))
+                var dpk = sota_draw_pack(i_idx, ml_id)  # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
+                put32(dst + 12, dpk[1])
+                put32(dst + 16, dpk[0])
                 cmd_cnt += 1
 
         put32(base_ptr, UInt32(cmd_cnt))
@@ -3653,8 +3697,9 @@ struct FlintAaaVulkanRenderer(Movable):
                 put32(dst + 0, UInt32(ml.tri_count * 3))
                 put32(dst + 4, UInt32(1))
                 put32(dst + 8, UInt32(ml.first_tri * 3))
-                put32(dst + 12, UInt32(0))
-                put32(dst + 16, UInt32((i_idx << 17) | (ml_id & 0x1FFFF)))
+                var dpk = sota_draw_pack(i_idx, ml_id)  # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
+                put32(dst + 12, dpk[1])
+                put32(dst + 16, dpk[0])
                 cmd_cnt += 1
 
         put32(base_ptr, UInt32(cmd_cnt))
@@ -3801,7 +3846,7 @@ struct FlintAaaVulkanRenderer(Movable):
                         continue
                     for m_loc in range(ml_cnt):
                         var ml_id = first_ml + m_loc
-                        var v_cnt_u = UInt32(self.geom.meshlets[ml_id].tri_count * 3)
+                        var v_cnt_u = UInt32(self.geom.meshlets[ml_id].tri_count * 3) | ((UInt32(ml_id) >> 17) << 16)  # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): meshlet hi bits
                         var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
                         for hp in hit_pages:
                             if is_am_v:
@@ -3840,7 +3885,7 @@ struct FlintAaaVulkanRenderer(Movable):
                         var mvy1 = min(vy1, Int(mfy + mfr))
                         if mvx0 > mvx1 or mvy0 > mvy1:
                             continue
-                        var v_cnt_u = UInt32(ml.tri_count * 3)
+                        var v_cnt_u = UInt32(ml.tri_count * 3) | ((UInt32(ml_id) >> 17) << 16)  # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): meshlet hi bits
                         var pk_u = UInt32((i_idx << 17) | (ml_id & 0x1FFFF))
                         for py_i in range(mvy0, mvy1 + 1):
                             var row_off = py_i * 128
@@ -3862,9 +3907,9 @@ struct FlintAaaVulkanRenderer(Movable):
                 if cmd_cnt >= self.max_draws:
                     break
                 var dst = base_ptr + cmd_cnt * 16
-                put32(dst + 0, cmd[0])
+                put32(dst + 0, cmd[0] & UInt32(0xFFFF))
                 put32(dst + 4, UInt32(1))
-                put32(dst + 8, UInt32(0))
+                put32(dst + 8, (cmd[0] >> 16) << 24)  # sota:geometry hook: firstVertex carries meshlet bits 17..23
                 put32(dst + 12, cmd[1])
                 cmd_cnt += 1
                 written += 1
@@ -3877,9 +3922,9 @@ struct FlintAaaVulkanRenderer(Movable):
                 if cmd_cnt >= self.max_draws:
                     break
                 var dst = base_ptr + cmd_cnt * 16
-                put32(dst + 0, cmd[0])
+                put32(dst + 0, cmd[0] & UInt32(0xFFFF))
                 put32(dst + 4, UInt32(1))
-                put32(dst + 8, UInt32(0))
+                put32(dst + 8, (cmd[0] >> 16) << 24)  # sota:geometry hook: firstVertex carries meshlet bits 17..23
                 put32(dst + 12, cmd[1])
                 cmd_cnt += 1
                 written_am += 1

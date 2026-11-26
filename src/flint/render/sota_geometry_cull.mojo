@@ -49,6 +49,7 @@ from flint.render.sota_geometry_cluster_dag import SOTA_DAG_RECORD_WORDS, Cluste
 from flint.render.sota_geometry_dag_cache import DagCacheStats, build_cluster_dag_cached
 from flint.assets.model import NativeMesh
 from flint.core.jobs import JobPool, default_worker_count
+from flint.render.sota_geometry_visid import SOTA_MAX_GLOBAL_MESHLETS_WIDE, emit_sota_draw_first_instance, emit_sota_draw_vertex_offset
 
 # Own descriptor-set layout (does not touch the shared AAA layout):
 comptime SOTA_BIND_MESHLETS: Int = 0
@@ -146,9 +147,9 @@ def sota_cluster_cull_shader(route: Int = 0) -> List[UInt32]:
     var cand_id = s.iadd(s.imul(s.workgroup_axis(0), s.uint(64)), s.iadd(s.imul(s.local_axis(1), s.uint(8)), s.local_axis(0)))
     var cand_total = s.load_word(b_cand, s.uint(0))
     s.begin_if(s.logical_and(s.ult(cand_id, cand_total), s.ult(cand_id, max_draws)))
-    var packed = s.load_word(b_cand, s.iadd(s.uint(4), cand_id))
-    s.store(inst_var, s.shr(packed, s.uint(17)))
-    s.store(ml_var, s.bit_and(packed, s.uint(0x1FFFF)))
+    var cand_w = s.iadd(s.uint(4), s.imul(cand_id, s.uint(2)))   # (inst, meshlet) word pairs
+    s.store(inst_var, s.load_word(b_cand, cand_w))
+    s.store(ml_var, s.load_word(b_cand, s.iadd(cand_w, s.uint(1))))
     s.store(valid_var, s.uint(1))
     s.end_if()
     s.end_if()
@@ -370,7 +371,9 @@ def sota_cluster_cull_shader(route: Int = 0) -> List[UInt32]:
     s.begin_if(is_p1)
     var cs = s.atomic_add_word(b_cand, s.uint(0), s.uint(1))
     s.begin_if(s.ult(cs, max_draws))
-    s.store_word(b_cand, s.iadd(s.uint(4), cs), s.bit_or(s.shl(inst_idx, s.uint(17)), s.bit_and(ml_id, s.uint(0x1FFFF))))
+    var cand_wo = s.iadd(s.uint(4), s.imul(cs, s.uint(2)))
+    s.store_word(b_cand, cand_wo, inst_idx)
+    s.store_word(b_cand, s.iadd(cand_wo, s.uint(1)), ml_id)
     s.end_if()
     s.end_if()
     s.begin_if(stats_on)
@@ -389,8 +392,8 @@ def sota_cluster_cull_shader(route: Int = 0) -> List[UInt32]:
     s.store_word(b_indirect, cmd, s.imul(tri_cnt, s.uint(3)))
     s.store_word(b_indirect, s.iadd(cmd, s.uint(1)), s.uint(1))
     s.store_word(b_indirect, s.iadd(cmd, s.uint(2)), s.imul(first_tri, s.uint(3)))
-    s.store_word(b_indirect, s.iadd(cmd, s.uint(3)), s.uint(0))
-    s.store_word(b_indirect, s.iadd(cmd, s.uint(4)), s.bit_or(s.shl(inst_idx, s.uint(17)), s.bit_and(ml_id, s.uint(0x1FFFF))))
+    s.store_word(b_indirect, s.iadd(cmd, s.uint(3)), emit_sota_draw_vertex_offset(s, ml_id))
+    s.store_word(b_indirect, s.iadd(cmd, s.uint(4)), emit_sota_draw_first_instance(s, inst_idx, ml_id))
     s.end_if()
     s.begin_if(stats_on)
     _ = s.atomic_add_word(b_stats, s.select_u(is_p1, s.uint(0), s.uint(2)), s.uint(1))
@@ -476,7 +479,7 @@ def hiz_build_cpu(depth: List[Float32], w: Int, h: Int) -> Tuple[List[Float32], 
 # ---------------------------------------------------------------------------------------------
 # Renderer-side state
 # ---------------------------------------------------------------------------------------------
-comptime SOTA_MAX_GLOBAL_MESHLETS: Int = 131070   # visbuffer word0 = inst << 17 | (meshlet + 1), capped at 0x1FFFF
+comptime SOTA_MAX_GLOBAL_MESHLETS: Int = SOTA_MAX_GLOBAL_MESHLETS_WIDE   # 24-bit id, see sota_geometry_visid
 
 
 def sota_geometry_grow_size(old: Int, need: Int) -> Int:

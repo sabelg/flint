@@ -92,6 +92,7 @@ from flint.render.sota_gi_world_cache import (
     emit_sota_gi_write_gbuffer,
     emit_sota_surfcache_wrc_bounce,
 )
+from flint.render.sota_geometry_visid import emit_sota_vis_meshlet, emit_sota_vis_prim
 # --- end sota:gi hook ---
 
 # Render feature flags in `BIND_AAA_GLOBALS[99]`
@@ -1089,9 +1090,9 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
 
     # Decode 64-bit VisBuffer payload
     var inst_id = s.shr(vis0, s.uint(17))
-    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
+    var ml_id = emit_sota_vis_meshlet(s, vis0, vis1)  # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
     var mat_id = s.shr(vis1, s.uint(16))
-    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
+    var local_prim = emit_sota_vis_prim(s, vis1)
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var first_tri = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(8)))

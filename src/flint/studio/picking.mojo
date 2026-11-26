@@ -1,7 +1,8 @@
 """Flint Studio $O(1)$ 64-Bit VisBuffer Viewport Entity Picking (`picking.mojo`).
 
 Decodes `FlintAaaVulkanRenderer`'s hardware `VK_FORMAT_R32G32_UINT` VisBuffer (`vis_img`:
-`word0 = (inst_id << 17) | (meshlet_id + 1)`, `word1 = (mat_id << 16) | prim_id`) and
+`word0 = (inst_id << 17) | (meshlet_id % 131071 + 1)`, `word1 = (mat_id << 16) | (meshlet_id / 131071) << 8 | prim_id`,
+see `flint.render.sota_geometry_visid`) and
 Reverse-Z `VK_FORMAT_D32_SFLOAT` depth (`depth_img`: `d = near_z / z_view`) into exact
 `(entity_id, instance_id, meshlet_id, material_id, local_prim_id, world_pos)` in $O(1)$,
 plus a zero-modification 1-pixel GPU compute readback helper for `FlintAaaVulkanRenderer`.
@@ -9,6 +10,7 @@ plus a zero-modification 1-pixel GPU compute readback helper for `FlintAaaVulkan
 from std.math import max, min, tan
 from std.memory import bitcast
 from flint.core.math import Vec3
+from flint.render.sota_geometry_visid import sota_vis_decode, sota_vis_encode
 from flint.platform.vulkan import (
     ACCESS_HOST_READ,
     ACCESS_SHADER_WRITE,
@@ -63,9 +65,7 @@ def encode_visbuffer_words(
     local_prim_id: Int,
 ) -> Tuple[UInt32, UInt32]:
     """Packs `(instance_id, meshlet_id, material_id, local_prim_id)` using the exact `visbuffer_vertex_shader` layout."""
-    var w0 = (UInt32(max(0, instance_id)) << 17) | min(UInt32(max(0, meshlet_id) + 1), UInt32(0x1FFFF))
-    var w1 = (UInt32(material_id & 0xFFFF) << 16) | UInt32(local_prim_id & 0xFFFF)
-    return (w0, w1)
+    return sota_vis_encode(max(0, instance_id), max(0, meshlet_id), material_id & 0xFFFF, local_prim_id)
 
 
 def decode_visbuffer_pick(
@@ -96,10 +96,11 @@ def decode_visbuffer_pick(
     if raw_ml == 0:
         return res
 
-    var inst_id = Int(vis_word0 >> 17)
-    var ml_id = raw_ml - 1
-    var mat_id = Int(vis_word1 >> 16)
-    var prim_id = Int(vis_word1 & UInt32(0xFFFF))
+    var ids = sota_vis_decode(vis_word0, vis_word1)   # 24-bit meshlet id (sota:geometry)
+    var inst_id = ids[0]
+    var ml_id = ids[1]
+    var mat_id = ids[2]
+    var prim_id = ids[3]
     var ent_id = instance_to_entity[inst_id] if (inst_id >= 0 and inst_id < len(instance_to_entity)) else inst_id
 
     var aspect = Float32(width) / Float32(max(1, height))

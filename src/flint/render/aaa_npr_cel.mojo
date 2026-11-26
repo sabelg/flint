@@ -67,6 +67,7 @@ from flint.render.aaa_npr_vfx import (
     emit_eval_vfx_excess_and_color_spv,
     emit_find_vfx_entry_spv,
 )
+from flint.render.sota_geometry_visid import emit_sota_draw_decode, emit_sota_vis_payload, emit_sota_vis_meshlet, emit_sota_vis_prim
 
 # `BIND_AAA_GLOBALS` Cel companion table (`640`, `704 .. 2495`)
 comptime AAA_GLOBALS_CEL_COUNT_WORD: Int = 640
@@ -408,10 +409,11 @@ def npr_outline_vertex_shader() -> List[UInt32]:
     _ = b_indices
     var out_vis = s.add_stage_io(STORAGE_OUTPUT, s.type_uvec2, location=0, flat=True)
 
-    var real_vtx = s.vertex_index()
-    var packed_inst = s.instance_index()
-    var inst_id = s.shr(packed_inst, s.uint(17))
-    var ml_id = s.bit_and(packed_inst, s.uint(0x1FFFF))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid): hi bits ride in vertexOffset / firstVertex
+    var draw_ids = emit_sota_draw_decode(s, s.vertex_index(), s.instance_index())
+    var real_vtx = draw_ids[0]
+    var inst_id = draw_ids[1]
+    var ml_id = draw_ids[2]
 
     var ml_base = s.imul(ml_id, s.uint(12))
     var ml_mat = s.load_word(b_meshlets, s.iadd(ml_base, s.uint(11)))
@@ -530,8 +532,10 @@ def npr_outline_vertex_shader() -> List[UInt32]:
     var final_cw = s.select_f(valid_out, clip[3], s.float(1.0))
     s.write_clip_position(final_cx, final_cy, final_cz, final_cw)
 
-    var pay0 = s.bit_or(s.shl(inst_id, s.uint(17)), s.umin(s.iadd(ml_id, s.uint(1)), s.uint(0x1FFFF)))
-    var pay1_base = s.shl(out_mat, s.uint(16))
+    # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
+    var vis_pay = emit_sota_vis_payload(s, inst_id, ml_id, out_mat)
+    var pay0 = vis_pay[0]
+    var pay1_base = vis_pay[1]
     emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
     return s.finish()
 
@@ -687,8 +691,8 @@ def aaa_npr_cel_shade_shader() -> List[UInt32]:
     )
 
     var inst_id = s.shr(vis0, s.uint(17))
-    var ml_id = s.isub(s.bit_and(vis0, s.uint(0x1FFFF)), s.uint(1))
-    var local_prim = s.bit_and(vis1, s.uint(0xFFFF))
+    var ml_id = emit_sota_vis_meshlet(s, vis0, vis1)  # --- sota:geometry hook --- 24-bit meshlet id (sota_geometry_visid)
+    var local_prim = emit_sota_vis_prim(s, vis1)
     var first_tri = s.load_word(b_meshlets, s.iadd(s.imul(ml_id, s.uint(12)), s.uint(8)))
     var idx_off = s.imul(s.iadd(first_tri, local_prim), s.uint(3))
     var v0_off = s.imul(s.load_word(b_indices, idx_off), s.uint(12))
