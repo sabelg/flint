@@ -1356,9 +1356,11 @@ struct CrowdNavBridge(Copyable, Movable):
     """Connects `NavMesh` A*/SSFA paths directly to `CrowdSimulator` preferred velocities
     and projects agent elevation `py` onto the walkable navmesh surface each tick."""
     var agents: List[NavCrowdAgent]
+    var nav_epoch: Int  # `NavMesh.epoch` the agents' paths were planned against
 
     def __init__(out self):
         self.agents = List[NavCrowdAgent]()
+        self.nav_epoch = -1
 
     def add_agent(
         mut self,
@@ -1407,7 +1409,12 @@ struct CrowdNavBridge(Copyable, Movable):
         return dx * dx + dz * dz <= ag.arrival_radius * ag.arrival_radius
 
     def update_preferred_velocities(mut self, mut crowd: CrowdSimulator, nav: NavMesh):
-        """Computes per-agent ORCA preferred velocities along each agent's `NavMesh` corridor."""
+        """Computes per-agent ORCA preferred velocities along each agent's `NavMesh` corridor.
+        Paths are re-planned automatically when the navmesh was rebuilt / carved since planning."""
+        if nav.epoch != self.nav_epoch:
+            if self.nav_epoch >= 0:
+                self.mark_all_repath()
+            self.nav_epoch = nav.epoch
         for i in range(len(self.agents)):
             ref ag = self.agents[i]
             var aid = ag.agent_id
