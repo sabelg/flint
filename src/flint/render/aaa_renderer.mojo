@@ -97,7 +97,7 @@ from flint.ui.draw_list import UiDrawList, GpuUiPrim
 from flint.render.ui_overlay import aaa_ui_overlay_shader, AAA_POST_UI_PRIMS_BASE_OFFSET
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
 # --- sota:geometry hook ---
-from flint.render.sota_geometry_cull import SotaGeometryGpu
+from flint.render.sota_geometry_cull import SOTA_MAX_GLOBAL_MESHLETS, SotaGeometryGpu, sota_geometry_grow_size
 from flint.render.sota_geometry_vt import SotaVirtualTextures
 from flint.render.sota_geometry_cluster_dag import cook_cluster_dag_into_pool
 # --- end sota:geometry hook ---
@@ -2141,6 +2141,7 @@ struct FlintAaaVulkanRenderer(Movable):
         else:
             entry = self.geom.append_mesh(mesh, material_id, build_lods=build_lods)
         # --- end sota:geometry hook ---
+        _ = self._sota_ensure_geometry_capacity()  # sota:geometry hook: grow buffers to the scene
 
         var vb_start = v_words_before * 4
         var vb_len = (len(self.geom.vertex_words) - v_words_before) * 4
@@ -2213,9 +2214,137 @@ struct FlintAaaVulkanRenderer(Movable):
         if (len(self.geom.vertex_words) * 4 > self.buf_vertices.size or len(self.geom.index_words) * 4 > self.buf_indices.size
                 or len(self.geom.meshlet_words) * 4 > self.buf_meshlets.size):
             entry.mesh_id = -1            # did not fit on the GPU: never draw it
+            self._sota_log_once("geometry: mesh did not fit on the GPU (buffer growth failed); it will not be drawn")  # sota:geometry hook
+        # --- sota:geometry hook --- the visbuffer / indirect encodings carry a 17-bit global meshlet id
+        if entry.mesh_id >= 0 and entry.first_meshlet + entry.meshlet_count > SOTA_MAX_GLOBAL_MESHLETS:
+            entry.mesh_id = -1
+            self.sota_geom.meshlet_id_overflows += 1
+            self._sota_log_once("geometry: meshlet ids beyond " + String(SOTA_MAX_GLOBAL_MESHLETS)
+                                + " do not fit the 17-bit visbuffer encoding; further meshes are not drawn")
+        # --- end sota:geometry hook ---
         return entry^
 
     # --- sota:geometry hook ---
+    def _sota_log_once(mut self, msg: String):
+        """Prints a renderer warning once per distinct message (no silent failures, no log spam)."""
+        for m in self.sota_geom.logged:
+            if m == msg:
+                return
+        self.sota_geom.logged.append(msg)
+        print("[flint render] " + msg)
+
+    def _sota_frame_fail(mut self, reason: String) -> Bool:
+        self.sota_geom.frame_failures += 1
+        self.sota_geom.last_frame_error = reason
+        self._sota_log_once("render_frame failed: " + reason)
+        return False
+
+    def _sota_ensure_geometry_capacity(mut self) -> Bool:
+        """Grows the vertex / index / meshlet buffers (and the DAG records) to fit the CPU geometry pool:
+        waits for the GPU, copies the old contents, rebinds every descriptor set that holds them. Logs and
+        returns False when the allocation fails (the caller then marks the mesh undrawable)."""
+        var need_v = len(self.geom.vertex_words) * 4
+        var need_i = len(self.geom.index_words) * 4
+        var need_m = len(self.geom.meshlet_words) * 4
+        if need_v <= self.buf_vertices.size and need_i <= self.buf_indices.size and need_m <= self.buf_meshlets.size:
+            return True
+        if not self.active:
+            return False
+        self.vk.wait_idle()
+        var bda_flags = BUFFER_USAGE_DEVICE_ADDRESS | BUFFER_USAGE_AS_BUILD_INPUT_KHR
+        if need_v > self.buf_vertices.size:
+            var sz = sota_geometry_grow_size(self.buf_vertices.size, need_v)
+            var nb = self.vk.create_buffer_bda(sz, extra_usage=bda_flags, host_visible=True)
+            if nb.size == 0 or nb.cpu_address == 0:
+                self.vk.destroy_buffer(nb)
+                self._sota_log_once("geometry: out of memory growing the vertex buffer to " + String(sz // 1048576) + " MB")
+                return False
+            _ = external_call["memcpy", Int](nb.cpu_address, self.buf_vertices.cpu_address, self.buf_vertices.size)
+            self.vk.destroy_buffer(self.buf_vertices)
+            self.buf_vertices = nb^
+        if need_i > self.buf_indices.size:
+            var sz = sota_geometry_grow_size(self.buf_indices.size, need_i)
+            var nb = self.vk.create_buffer_bda(sz, extra_usage=bda_flags, host_visible=True)
+            if nb.size == 0 or nb.cpu_address == 0:
+                self.vk.destroy_buffer(nb)
+                self._sota_log_once("geometry: out of memory growing the index buffer to " + String(sz // 1048576) + " MB")
+                return False
+            _ = external_call["memcpy", Int](nb.cpu_address, self.buf_indices.cpu_address, self.buf_indices.size)
+            self.vk.destroy_buffer(self.buf_indices)
+            self.buf_indices = nb^
+        if need_m > self.buf_meshlets.size:
+            var sz = sota_geometry_grow_size(self.buf_meshlets.size, need_m)
+            var nb = self.vk.create_buffer(sz, local=True)
+            if nb.size == 0 or nb.cpu_address == 0:
+                self.vk.destroy_buffer(nb)
+                self._sota_log_once("geometry: out of memory growing the meshlet buffer to " + String(sz // 1048576) + " MB")
+                return False
+            _ = external_call["memcpy", Int](nb.cpu_address, self.buf_meshlets.cpu_address, self.buf_meshlets.size)
+            self.vk.destroy_buffer(self.buf_meshlets)
+            self.buf_meshlets = nb^
+        for slot in range(FRAMES_IN_FLIGHT):
+            var sets = List[Int]()
+            sets.append(self.desc_sets[slot])
+            sets.append(self.desc_sets_cull_p1[slot])
+            sets.append(self.desc_sets_cull_p2[slot])
+            for ds in sets:
+                self.vk.write_descriptor(ds, BIND_AAA_VERTICES, self.buf_vertices)
+                self.vk.write_descriptor(ds, BIND_AAA_INDICES, self.buf_indices)
+                self.vk.write_descriptor(ds, BIND_AAA_MESHLETS, self.buf_meshlets)
+        var ml_cap = self.buf_meshlets.size // (AAA_MESHLET_WORDS * 4)
+        if not self.sota_geom.rebind_meshlets(self.vk, self.buf_meshlets, ml_cap):
+            self._sota_log_once("geometry: could not grow the DAG record buffer; cluster LOD falls back to LOD0 for new meshes")
+        self.sota_vt.rebind_geometry(self.vk, self.buf_vertices, self.buf_indices, self.buf_meshlets)
+        self.sota_geom.grow_events += 1
+        print("[flint render] geometry buffers grown: vertices " + String(self.buf_vertices.size // 1048576) + " MB, indices "
+              + String(self.buf_indices.size // 1048576) + " MB, meshlets " + String(self.buf_meshlets.size // 1048576) + " MB")
+        return True
+
+    def _sota_grow_draws(mut self, new_max: Int) -> Bool:
+        """Grows every buffer sized by `max_draws` (indirect rings, phase-2 indirect, occluded candidates,
+        VSM indirect) and rebinds them. Old contents are per-frame scratch, so nothing is copied."""
+        if new_max <= self.max_draws or not self.active:
+            return False
+        self.vk.wait_idle()
+        var n_vsm = self.vk.create_buffer(64 + new_max * 16, local=True)
+        var n_p2 = self.vk.create_buffer(64 + new_max * 20, local=True)
+        var n_cand = self.vk.create_buffer(64 + new_max * 4, local=True)
+        var n_ring = List[GpuBuffer]()
+        var ok = n_vsm.size > 0 and n_p2.size > 0 and n_cand.size > 0
+        for _ in range(FRAMES_IN_FLIGHT):
+            var b = self.vk.create_buffer(64 + new_max * 20, local=True)
+            ok = ok and b.size > 0
+            n_ring.append(b^)
+        if not ok:
+            self.vk.destroy_buffer(n_vsm)
+            self.vk.destroy_buffer(n_p2)
+            self.vk.destroy_buffer(n_cand)
+            for b in n_ring:
+                self.vk.destroy_buffer(b)
+            self._sota_log_once("out of memory growing max_draws to " + String(new_max) + "; extra meshlets stay dropped (counted in sota_geom.draws_dropped_total)")
+            return False
+        self.vk.destroy_buffer(self.buf_vsm_indirect)
+        self.vk.destroy_buffer(self.buf_indirect_phase2)
+        self.vk.destroy_buffer(self.buf_occluded_candidates)
+        for i in range(FRAMES_IN_FLIGHT):
+            self.vk.destroy_buffer(self.ring_indirect[i])
+        self.buf_vsm_indirect = n_vsm^
+        self.buf_indirect_phase2 = n_p2^
+        self.buf_occluded_candidates = n_cand^
+        self.ring_indirect = n_ring^
+        self.buf_indirect = self.ring_indirect[0].copy()
+        self.max_draws = new_max
+        for slot in range(FRAMES_IN_FLIGHT):
+            self.vk.write_descriptor(self.desc_sets[slot], BIND_AAA_INDIRECT, self.ring_indirect[slot])
+            self.vk.write_descriptor(self.desc_sets_cull_p1[slot], BIND_AAA_INDIRECT, self.ring_indirect[slot])
+            self.vk.write_descriptor(self.desc_sets_cull_p1[slot], BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
+            self.vk.write_descriptor(self.desc_sets_cull_p2[slot], BIND_AAA_INDIRECT, self.buf_indirect_phase2)
+            self.vk.write_descriptor(self.desc_sets_cull_p2[slot], BIND_AAA_CANDIDATES, self.buf_occluded_candidates)
+        self.sota_geom.rebind_draws(self.vk, self.ring_indirect, self.buf_indirect_phase2, self.buf_occluded_candidates)
+        self.sota_geom.draw_grow_events += 1
+        print("[flint render] max_draws grown to " + String(new_max))
+        return True
+
     def add_virtual_texture(mut self, pixels_argb: List[UInt32], dim: Int) -> Int:
         """Registers a square power-of-two (128..16384) sRGB ARGB image as a streamed virtual texture (only the
         pages the camera needs become resident; see sota_geometry_vt.mojo). Returns the VT index or -1."""
@@ -2381,6 +2510,7 @@ struct FlintAaaVulkanRenderer(Movable):
         var m_words_before = len(self.geom.meshlet_words)
 
         var entry = self.geom.append_splat_mesh(mesh, material_id, splat_weights_u24, build_lods=build_lods)
+        _ = self._sota_ensure_geometry_capacity()  # sota:geometry hook: grow buffers to the scene
 
         var vb_start = v_words_before * 4
         var vb_len = (len(self.geom.vertex_words) - v_words_before) * 4
@@ -2564,6 +2694,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.geom.meshlets[m_idx].cone_sin = Float32(2.0)
             self.geom.meshlet_words[m_idx * 12 + 3] = bitcast[DType.uint32](w_rad)
             self.geom.meshlet_words[m_idx * 12 + 7] = bitcast[DType.uint32](Float32(2.0))
+        _ = self._sota_ensure_geometry_capacity()  # sota:geometry hook: grow buffers to the scene
 
         var vb_start = v_words_before * 4
         var vb_len = (len(self.geom.vertex_words) - v_words_before) * 4
@@ -3048,10 +3179,20 @@ struct FlintAaaVulkanRenderer(Movable):
         out.normal_bindless_slots = List[Int](length=n_tex, fill=-1)
         out.orm_bindless_slots = List[Int](length=n_tex, fill=-1)
 
+        var sota_vt_of_tex = List[Int](length=n_tex, fill=-1)  # sota:geometry hook (VT albedo per texture)
         for m_idx in range(len(model.meshes)):
             ref m = model.meshes[m_idx]
             var alb_slot = -1
-            if m.texture >= 0 and m.texture < n_tex:
+            # --- sota:geometry hook --- big square albedo maps stream through virtual texturing (r.sota.vt.models)
+            var sota_vt_idx = -1
+            if m.texture >= 0 and m.texture < n_tex and m.alpha_mode != 1:
+                if sota_vt_of_tex[m.texture] < 0 and out.albedo_bindless_slots[m.texture] < 0:
+                    ref vtx = model.textures[m.texture]
+                    if self.sota_vt.wants_model_texture(vtx.width, vtx.height) and len(vtx.pixels) >= vtx.width * vtx.height:
+                        sota_vt_of_tex[m.texture] = self.add_virtual_texture(vtx.pixels, vtx.width)
+                sota_vt_idx = sota_vt_of_tex[m.texture]
+            # --- end sota:geometry hook ---
+            if m.texture >= 0 and m.texture < n_tex and sota_vt_idx < 0:
                 if out.albedo_bindless_slots[m.texture] < 0:
                     ref tx = model.textures[m.texture]
                     if tx.width > 0 and tx.height > 0 and len(tx.pixels) >= tx.width * tx.height:
@@ -3139,7 +3280,7 @@ struct FlintAaaVulkanRenderer(Movable):
             mat.sheen_roughness = m.sheen_roughness
             if m.alpha_mode == 1:
                 mat.alpha_cutoff = Float32(0.48)
-            var mat_id = self.add_material(mat)
+            var mat_id = self.add_material_vt(mat, sota_vt_idx) if sota_vt_idx >= 0 else self.add_material(mat)  # sota:geometry hook
             var mv_cnt = m.vertex_count()
             if upload_skinned and mv_cnt > 0 and len(m.joints) >= mv_cnt * 4 and len(m.weights) >= mv_cnt * 4:
                 var b_cnt = 64
@@ -3722,7 +3863,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
     def render_frame(mut self, capture_readback: Bool = False, force_readback: Bool = False) -> Bool:
         if not self.active:
-            return False
+            return self._sota_frame_fail("renderer is not active (Vulkan init failed or shut down)")  # sota:geometry hook
 
         # Deferred readback: retire the previous frame first (no-op in the default synchronous mode). Waiting here,
         # before any host write, keeps every single-instance HOST_VISIBLE buffer race-free (Phase A).
@@ -3752,6 +3893,13 @@ struct FlintAaaVulkanRenderer(Movable):
 
         var cur_slot = self.frame_index % FRAMES_IN_FLIGHT
         self.sota_geom.begin_slot(cur_slot)  # sota:geometry hook
+        # --- sota:geometry hook --- visible meshlets over max_draws are counted, logged and the buffers grow
+        var sota_need_draws = self.sota_geom.check_draw_overflow(self.max_draws)
+        if sota_need_draws > 0:
+            self._sota_log_once("visible meshlets exceeded max_draws " + String(self.max_draws) + " (needed "
+                                + String(sota_need_draws) + "); growing the draw buffers")
+            _ = self._sota_grow_draws(sota_need_draws + sota_need_draws // 4)
+        # --- end sota:geometry hook ---
         self.sota_vt.begin_frame(cur_slot, (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT)  # sota:geometry hook
         var defer_this = self.deferred_readback and (not capture_readback) and self.vk.swapchain == 0
         if defer_this and cur_slot > 0 and len(self.readback_extra) < cur_slot:
@@ -4250,7 +4398,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.last_cpu_vsm_ms = (t_record0 - t_vsm0) * 1000.0
 
         if not self.vk.begin_commands(cur_slot):
-            return False
+            return self._sota_frame_fail("begin_commands failed (device lost or fence timeout)")  # sota:geometry hook
         if use_prof:
             self.vk.reset_queries(cur_slot, q_base, AAA_QUERY_SLOT_STRIDE)
         self.sota_vt.record_uploads(self.vk, cur_slot)  # sota:geometry hook
@@ -4528,7 +4676,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.memory_barrier2(cur_slot, PIPELINE_TRANSFER, Int(ACCESS_TRANSFER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
             var f_group_a = self.vk.submit(cur_slot)
             if f_group_a == 0 or not self.vk.wait(f_group_a):
-                return False
+                return self._sota_frame_fail("VSM readback submit/wait failed (device lost?)")  # sota:geometry hook
             self.last_culled_meshlet_draws = Int(get32(self.buf_ldr_readback.cpu_address))
             self.vsm_warmed_up = True
 
@@ -4554,7 +4702,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 vsm_page_am_counts = packed_vsm[4].copy()
 
             if not self.vk.begin_commands(cur_slot):
-                return False
+                return self._sota_frame_fail("begin_commands (pass group B) failed")  # sota:geometry hook
 
         # ====================================================================
         # PASS GROUP B: VSM Indirect Tile Raster + 2-Tier Lumen Surface-Cache +

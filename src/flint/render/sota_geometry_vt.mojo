@@ -536,6 +536,8 @@ struct SotaVirtualTextures(Movable):
     the first `add_virtual_texture`."""
     var enabled: Bool                  # cvar r.sota.vt: feedback + streaming (off = keep what is resident)
     var budget_pages: Int              # cvar r.sota.vt.budget: page uploads per frame (16 = 1.2 MB)
+    var model_textures: Bool           # cvar r.sota.vt.models: upload_native_model streams big square albedo maps via VT
+    var model_min_dim: Int             # cvar r.sota.vt.models_min: smallest albedo side that goes through VT
     var active: Bool
     var res: VtResidency
     var mips: List[List[List[UInt32]]]
@@ -561,6 +563,8 @@ struct SotaVirtualTextures(Movable):
     def __init__(out self):
         self.enabled = True
         self.budget_pages = 16
+        self.model_textures = False
+        self.model_min_dim = 1024
         self.active = False
         self.res = VtResidency()
         self.mips = List[List[List[UInt32]]]()
@@ -582,6 +586,14 @@ struct SotaVirtualTextures(Movable):
         self.pipe_fb = 0
         self.last_cpu_ms = 0.0
         self.last_uploads = 0
+
+    def wants_model_texture(self, width: Int, height: Int) -> Bool:
+        """Square power-of-two albedo maps of at least `model_min_dim`, while VT slots remain."""
+        if not (self.model_textures and self.active and self.enabled) or width != height:
+            return False
+        if width < max(SOTA_VT_PAGE, self.model_min_dim) or width > 16384 or (width & (width - 1)) != 0:
+            return False
+        return self.count() < SOTA_VT_MAX_TEXTURES
 
     def count(self) -> Int:
         return len(self.mips)
@@ -632,6 +644,13 @@ struct SotaVirtualTextures(Movable):
             self.pending_ind.append(List[Int]())
         self.active = True
         return True
+
+    def rebind_geometry(mut self, mut vk: VulkanGpu, buf_vertices: GpuBuffer, buf_indices: GpuBuffer, buf_meshlets: GpuBuffer):
+        """The renderer grew its geometry buffers: point the feedback pass at the new ones."""
+        for ds in self.sets:
+            vk.write_descriptor(ds, SOTA_VT_BIND_VERTS, buf_vertices)
+            vk.write_descriptor(ds, SOTA_VT_BIND_INDICES, buf_indices)
+            vk.write_descriptor(ds, SOTA_VT_BIND_MESHLETS, buf_meshlets)
 
     def _register_bindless(
         mut self, mut vk: VulkanGpu, img: VulkanImage, sampler: Int, desc_sets: List[Int], mut bindless_images: List[VulkanImage],
