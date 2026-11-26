@@ -363,6 +363,20 @@ from flint.render.aaa_post_tsr import (
 )
 # --- sota:camera hook (import) ---
 from flint.render.sota_perf_vsm import SotaVsmCache  # --- sota:perf hook ---
+from flint.render.sota_shadow_vsm import (  # --- sota:shadow hook ---
+    SOTA_SHADOW_GLOBALS_CONTACT_WORD,
+    SOTA_SHADOW_GLOBALS_TOROIDAL_OFFSETS_WORD,
+    SOTA_SHADOW_GLOBALS_TOROIDAL_WORD,
+    SotaShadowState,
+    sota_shadow_depth_snap_index,
+    sota_shadow_local_from_slot,
+    sota_shadow_vsm_cmd_target,
+)
+from flint.render.sota_shadow_gpu import (  # --- sota:shadow hook ---
+    SOTA_SHADOW_ITEM_MESHLETS,
+    SotaShadowGpu,
+    sota_shadow_reset_tables,
+)
 from flint.render.sota_camera_post import (
     SotaCameraPost,
     sota_camera_record_ca,
@@ -556,6 +570,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var last_cpu_submit_wait_ms: Float64  # vkQueueSubmit (+ fence wait in synchronous mode)
     var geometry_mb: Int  # --- sota:perf hook ---
     var sota_vsm: SotaVsmCache  # --- sota:perf hook --- VSM page invalidation for light / caster motion
+    var sota_shadow: SotaShadowState  # --- sota:shadow hook --- Area G (VSM command sizing, toroidal pages, contact shadows)
+    var sota_shadow_gpu: SotaShadowGpu  # --- sota:shadow hook --- GPU page allocation / cull / raster
     var geometry_overflow_meshes: Int  # --- sota:perf hook --- meshes rejected because the pools were full
     var last_frame_gpu_ms: Float64  # whole-frame TOP->BOTTOM timestamp pair (incl. TLAS, skin, readback copy)
     var last_vsm_dirty_pages: Int
@@ -835,6 +851,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.geometry_mb = max(8, geometry_mb)  # --- sota:perf hook ---
         self.geometry_overflow_meshes = 0  # --- sota:perf hook ---
         self.sota_vsm = SotaVsmCache()  # --- sota:perf hook ---
+        self.sota_shadow = SotaShadowState()  # --- sota:shadow hook ---
+        self.sota_shadow_gpu = SotaShadowGpu()  # --- sota:shadow hook ---
         self.active = False
         self.output_w = max(16, width)
         self.output_h = max(16, height)
@@ -1455,6 +1473,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_meshlets = self.vk.create_buffer((8 if self.geometry_mb <= 32 else self.geometry_mb // 2) * 1024 * 1024, local=True)
         self.buf_materials = self.vk.create_buffer(1024 * AAA_MATERIAL_WORDS * 4, local=True)
         self.buf_vsm_indirect = self.vk.create_buffer(64 + self.max_draws * 16, local=True)
+        self.sota_shadow.vsm_cmd_capacity = self.max_draws  # --- sota:shadow hook ---
         self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
         var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
         hist_words += sota_svgf_scratch_words(max_pix)  # --- sota:gi hook --- SVGF a-trous scratch
@@ -2397,7 +2416,8 @@ struct FlintAaaVulkanRenderer(Movable):
         if new_max <= self.max_draws or not self.active:
             return False
         self.vk.wait_idle()
-        var n_vsm = self.vk.create_buffer(64 + new_max * 16, local=True)
+        var n_vsm_cmds = max(new_max, self.sota_shadow.vsm_cmd_capacity)  # --- sota:shadow hook --- never shrink
+        var n_vsm = self.vk.create_buffer(64 + n_vsm_cmds * 16, local=True)
         var n_p2 = self.vk.create_buffer(64 + new_max * 20, local=True)
         var n_cand = self.vk.create_buffer(64 + new_max * 8, local=True)
         var n_ring = List[GpuBuffer]()
@@ -2420,6 +2440,7 @@ struct FlintAaaVulkanRenderer(Movable):
         for i in range(FRAMES_IN_FLIGHT):
             self.vk.destroy_buffer(self.ring_indirect[i])
         self.buf_vsm_indirect = n_vsm^
+        self.sota_shadow.vsm_cmd_capacity = n_vsm_cmds  # --- sota:shadow hook ---
         self.buf_indirect_phase2 = n_p2^
         self.buf_occluded_candidates = n_cand^
         self.ring_indirect = n_ring^
@@ -3750,6 +3771,11 @@ struct FlintAaaVulkanRenderer(Movable):
         for p_i in range(n_pages):
             var pvx = vsm_allocs[p_i][0]
             var pvy = vsm_allocs[p_i][1]
+            if use_vsm_casc and self.sota_shadow.toroidal_active and pvx >= 0 and pvx < 128 and pvy >= 0 and pvy < 128:
+                # --- sota:shadow hook --- toroidal slot -> window-local page (the culling below is window-relative)
+                var loc_p = sota_shadow_local_from_slot(pvx, pvy, self.sota_shadow.offsets)
+                pvx = (pvx & 64) | loc_p[0]
+                pvy = (pvy & 64) | loc_p[1]
             if pvx >= 0 and pvx < 128 and pvy >= 0 and pvy < 128:
                 page_slot[pvy * 128 + pvx] = p_i
                 if pvx < min_pvx: min_pvx = pvx
@@ -3911,6 +3937,14 @@ struct FlintAaaVulkanRenderer(Movable):
                                     else:
                                         per_page[ps].append((v_cnt_u, pk_u))
 
+        # --- sota:shadow hook --- size the command buffer by what this frame needs. It was capped at `max_draws`
+        # (visible meshlets), truncated pages were cleared to lit and then cached as valid: Forest lost its shadows.
+        var need_cmds = 0
+        for p_i in range(n_pages):
+            need_cmds += len(per_page[p_i]) + len(per_page_am[p_i])
+        self.sota_shadow.vsm_cmds_last = need_cmds
+        var cap_cmds = self._sota_shadow_ensure_vsm_cmds(need_cmds)
+        # --- end sota:shadow hook ---
         var cmd_cnt = 0
         var base_ptr = self.buf_vsm_indirect.cpu_address
         for p_i in range(n_pages):
@@ -3918,7 +3952,7 @@ struct FlintAaaVulkanRenderer(Movable):
             ref plist = per_page[p_i]
             var written = 0
             for cmd in plist:
-                if cmd_cnt >= self.max_draws:
+                if cmd_cnt >= cap_cmds:  # sota:shadow hook (was max_draws)
                     break
                 var dst = base_ptr + cmd_cnt * 16
                 put32(dst + 0, cmd[0] & UInt32(0xFFFF))
@@ -3933,7 +3967,7 @@ struct FlintAaaVulkanRenderer(Movable):
             ref am_list = per_page_am[p_i]
             var written_am = 0
             for cmd in am_list:
-                if cmd_cnt >= self.max_draws:
+                if cmd_cnt >= cap_cmds:  # sota:shadow hook (was max_draws)
                     break
                 var dst = base_ptr + cmd_cnt * 16
                 put32(dst + 0, cmd[0] & UInt32(0xFFFF))
@@ -3943,8 +3977,38 @@ struct FlintAaaVulkanRenderer(Movable):
                 cmd_cnt += 1
                 written_am += 1
             page_am_counts[p_i] = written_am
+            # --- sota:shadow hook --- a page missing casters must not be cached: leave it invalid, retry next frame
+            if written + written_am < len(plist) + len(am_list):
+                self.sota_shadow.vsm_cmds_dropped_total += len(plist) + len(am_list) - written - written_am
+                self.sota_shadow.vsm_pages_retried_total += 1
+                var tvx = vsm_allocs[p_i][0]
+                var tvy = vsm_allocs[p_i][1]
+                if tvx >= 0 and tvx < 128 and tvy >= 0 and tvy < 128:
+                    self.vsm.virtual_valid[tvy * 128 + tvx] = False
+            # --- end sota:shadow hook ---
 
         return (cmd_cnt, page_offsets^, page_counts^, page_am_offsets^, page_am_counts^)
+
+    # --- sota:shadow hook ---
+    def _sota_shadow_ensure_vsm_cmds(mut self, need: Int) -> Int:
+        """Grows `buf_vsm_indirect` to hold `need` commands (+25 %); returns the capacity actually available.
+        Waits for the GPU (the previous frame may still read the old buffer); growth is rare (first big frame)."""
+        var cap = self.sota_shadow.vsm_cmd_capacity
+        if need <= cap or not self.active:
+            return cap
+        var target = sota_shadow_vsm_cmd_target(need)
+        self.vk.wait_idle()
+        var nb = self.vk.create_buffer(64 + target * 16, local=True)
+        if nb.size == 0:
+            self._sota_log_once("out of memory growing the VSM command buffer to " + String(target) + " commands; "
+                                + "pages that do not fit stay invalid and are retried")
+            return cap
+        self.vk.destroy_buffer(self.buf_vsm_indirect)
+        self.buf_vsm_indirect = nb^
+        self.sota_shadow.vsm_cmd_capacity = target
+        self.sota_shadow.vsm_cmd_grows += 1
+        return target
+    # --- end sota:shadow hook ---
 
     def ui_prims_word_offset(self, slot: Int) -> Int:
         """Where a frame slot's GPU UI prims live in `buf_post_scratch`: past every per-pixel post
@@ -3954,6 +4018,62 @@ struct FlintAaaVulkanRenderer(Movable):
         frame never rewrites prims the GPU is still drawing."""
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
         return AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + (slot % FRAMES_IN_FLIGHT) * AAA_UI_PRIM_REGION_WORDS
+
+    def _sota_shadow_gpu_prepare(mut self, slot: Int, n_inst: Int, eligible: Bool) -> Bool:
+        """--- sota:shadow hook --- `ren.sota_shadow.gpu_pages`: switches `BIND_AAA_VSM_TABLE` between the v5 table
+        and the GPU path's buffer, uploads this frame's caster items + invalidations. False = run the CPU path."""
+        var want = self.sota_shadow.gpu_pages and eligible and self.sota_shadow_gpu.init(self.vk, self.pipe_layout)
+        if want:
+            # caster items: same caster set / LOD choice / glass skip / alpha split as `_pack_vsm_indirect_commands`
+            var items = List[UInt32]()
+            for i_idx in range(min(n_inst, 32767)):
+                ref di = self.frame_instances[i_idx]
+                ref me = self.geom.meshes[di.mesh_id]
+                if me.lod0_meshlet_count <= 0:
+                    continue
+                var mat_final_v = me.material_id if di.material_override < 0 else di.material_override
+                if len(self.glass_materials) > 0 and self.is_glass_material(mat_final_v):
+                    continue
+                var am_bit = UInt32(0x80000000) if self._is_instance_alpha_masked(di, mat_final_v) else UInt32(0)
+                ref wm = di.world_mat.values
+                var s0 = wm[0] * wm[0] + wm[1] * wm[1] + wm[2] * wm[2]
+                var s1 = wm[4] * wm[4] + wm[5] * wm[5] + wm[6] * wm[6]
+                var s2 = wm[8] * wm[8] + wm[9] * wm[9] + wm[10] * wm[10]
+                var wr = me.bounds_radius * sqrt(max(Float32(1e-6), max(s0, max(s1, s2))))
+                var lod_idx = 0
+                if me.lod_count > 1 and wr < Float32(5.5):
+                    lod_idx = min(me.lod_count - 1, 2)
+                var sl = me.lods[lod_idx]
+                var first_ml = sl.first_meshlet if sl.meshlet_count > 0 else me.first_meshlet
+                var ml_cnt = sl.meshlet_count if sl.meshlet_count > 0 else me.lod0_meshlet_count
+                var m0 = 0
+                while m0 < ml_cnt:
+                    items.append(UInt32(i_idx) | am_bit)
+                    items.append(UInt32(first_ml + m0))
+                    items.append(UInt32(min(SOTA_SHADOW_ITEM_MESHLETS, ml_cnt - m0)))
+                    m0 += SOTA_SHADOW_ITEM_MESHLETS
+            self.sota_shadow_gpu.read_stats()
+            var cmd_need = max(131072, self.sota_shadow_gpu.wanted_max)
+            var switched = not self.sota_shadow.gpu_was_active
+            if self.sota_shadow_gpu.ensure_buffer(self.vk, len(items) // 3, cmd_need) or switched:
+                self.vk.wait_idle()
+                if switched:
+                    sota_shadow_reset_tables(self.sota_shadow_gpu.buf)
+                    self.vsm.invalidate_all()
+                for ds_i in range(len(self.desc_sets)):
+                    self.vk.write_descriptor(self.desc_sets[ds_i], BIND_AAA_VSM_TABLE, self.sota_shadow_gpu.buf)
+            self.sota_shadow_gpu.upload(slot, items, self.vsm.virtual_valid)
+            self.last_vsm_dirty_pages = self.sota_shadow_gpu.dirty_last
+        elif self.sota_shadow.gpu_was_active:
+            # back to the CPU path: the v5 table / allocator start empty
+            self.vk.wait_idle()
+            self.vsm = VsmPageManager()
+            _ = external_call["memset", Int](self.buf_vsm_table.cpu_address, Int32(0), self.buf_vsm_table.size)
+            for ds_i in range(len(self.desc_sets)):
+                self.vk.write_descriptor(self.desc_sets[ds_i], BIND_AAA_VSM_TABLE, self.buf_vsm_table)
+        self.sota_shadow.gpu_was_active = want
+        self.sota_shadow.gpu_active = want
+        return want
 
     def render_frame(mut self, capture_readback: Bool = False, force_readback: Bool = False) -> Bool:
         if not self.active:
@@ -4134,6 +4254,18 @@ struct FlintAaaVulkanRenderer(Movable):
         )
         if use_vsm_casc_frame:
             light_vp = self.vsm_cascade_matrices[0].copy()
+        # --- sota:shadow hook --- cascade window moves: toroidal scroll / depth-snap invalidation, this frame's offsets
+        if self.enable_vsm and use_vsm_casc_frame:
+            var sh_origins = compute_vsm_cascade_page_origins(self.sun_dir, self.cam_pos, base_vsm_ext)
+            self.sota_shadow.update_cascades(
+                self.vsm, self.vsm_cascade_page_origins, sh_origins,
+                sota_shadow_depth_snap_index(self.sun_dir, self.cam_pos), True,
+            )
+            if self.sota_shadow.toroidal_active:
+                self.vsm_cascade_page_origins = sh_origins^
+        else:
+            self.sota_shadow.update_cascades(self.vsm, self.vsm_cascade_page_origins, self.vsm_cascade_page_origins, 0, False)
+        # --- end sota:shadow hook ---
         # --- sota:perf hook --- keep cached VSM pages valid under light rotation and moving / skinned casters
         if self.enable_vsm and self.sota_vsm.enabled:
             self.sota_vsm.update_light(self.vsm, self.sun_dir, self.sun_radiance)
@@ -4147,7 +4279,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     self.sota_vsm.caster(
                         self.vsm, self.vsm_cascade_matrices, di.world_mat, di.prev_world_mat,
                         self.geom.meshes[di.mesh_id].bounds_center, self.geom.meshes[di.mesh_id].bounds_radius,
-                        di.uniform_scale, deforming,
+                        di.uniform_scale, deforming, self.sota_shadow.offsets,  # sota:shadow hook (toroidal slots)
                     )
         elif self.sota_vsm.enabled:
             _ = self.sota_vsm.track_light(self.sun_dir, self.sun_radiance)
@@ -4349,6 +4481,16 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # Extended v5 4-Cascade VSM Globals (`b_globals[167..215]` — `0..166` untouched!):
         put32(g_addr + VSM_GLOBALS_CASCADE_FLAG_WORD * 4, UInt32(1) if use_vsm_casc_frame else UInt32(0))
+        # --- sota:shadow hook --- toroidal page addressing flag + per-cascade slot offsets
+        var sh_tor = use_vsm_casc_frame and self.sota_shadow.toroidal_active
+        put32(g_addr + SOTA_SHADOW_GLOBALS_TOROIDAL_WORD * 4, UInt32(1) if sh_tor else UInt32(0))
+        for c_t in range(VSM_CASCADE_COUNT):
+            var o_t = self.sota_shadow.offsets[c_t] if sh_tor else (0, 0)
+            put32(g_addr + (SOTA_SHADOW_GLOBALS_TOROIDAL_OFFSETS_WORD + c_t) * 4, UInt32(o_t[0] | (o_t[1] << 8)))
+        put_float(g_addr + SOTA_SHADOW_GLOBALS_CONTACT_WORD * 4, self.sota_shadow.contact_length_m)
+        put_float(g_addr + (SOTA_SHADOW_GLOBALS_CONTACT_WORD + 1) * 4, self.sota_shadow.contact_thickness_m)
+        put32(g_addr + (SOTA_SHADOW_GLOBALS_CONTACT_WORD + 2) * 4, UInt32(1) if self.sota_shadow.contact else UInt32(0))
+        # --- end sota:shadow hook ---
         if use_vsm_casc_frame:
             for k in range(16):
                 put_float(g_addr + (VSM_GLOBALS_CASCADE_1_WORD + k) * 4, self.vsm_cascade_matrices[1][k])
@@ -4485,9 +4627,11 @@ struct FlintAaaVulkanRenderer(Movable):
         var vsm_page_counts = List[Int]()
         var vsm_page_am_offsets = List[Int]()
         var vsm_page_am_counts = List[Int]()
-        if vsm_active:
-            var origin_shifted = False
-            if use_vsm_casc_frame:
+        # --- sota:shadow hook --- GPU page path: no request readback, no CPU allocation / packing / sync submit
+        var sh_gpu = self._sota_shadow_gpu_prepare(cur_slot, n_inst, vsm_active and use_vsm_casc_frame)
+        if vsm_active and not sh_gpu:
+            var origin_shifted = self.sota_shadow.forced_sync_frame  # --- sota:shadow hook ---
+            if use_vsm_casc_frame and not self.sota_shadow.toroidal_active:  # sota:shadow hook (toroidal: done above)
                 var next_origins = compute_vsm_cascade_page_origins(self.sun_dir, self.cam_pos, base_vsm_ext)
                 if len(self.vsm_cascade_page_origins) >= VSM_CASCADE_COUNT:
                     for c_i in range(VSM_CASCADE_COUNT):
@@ -4825,6 +4969,17 @@ struct FlintAaaVulkanRenderer(Movable):
             if use_prof:
                 self.vk.write_timestamp(cur_slot, q_vm + 1, PIPELINE_BOTTOM)
             self.vk.memory_barrier2(cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_HOST, Int(ACCESS_HOST_READ))
+            if sh_gpu:  # --- sota:shadow hook --- allocation + cull + one-pass atlas raster
+                var q_sg = next_q
+                if use_prof and q_sg + 1 < q_limit:
+                    self.vk.write_timestamp(cur_slot, q_sg, PIPELINE_BOTTOM)
+                    next_q += 2
+                    prof_pairs.append((String("SotaShadowVsmGpu"), q_sg))
+                self.sota_shadow_gpu.record(
+                    self.vk, cur_slot, cur_slot, self.pipe_layout, self.desc_set, self.vsm_img, VSM_PAGE_TEXELS * 32
+                )
+                if use_prof and q_sg + 1 < q_limit:
+                    self.vk.write_timestamp(cur_slot, q_sg + 1, PIPELINE_BOTTOM)
 
         # Synchronous Frame-0 / Camera-Teleport VSM Page Readback (skipped in warmed-up single-command-buffer gameplay!)
         if not single_cmd_buf:
@@ -4863,7 +5018,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # PASS GROUP B: VSM Indirect Tile Raster + 2-Tier Lumen Surface-Cache +
         #               Deferred Multi-Lobe RT Shade + SVGF + OIT + Post + TSR v2!
         # ====================================================================
-        self.last_vsm_dirty_pages = len(vsm_allocs)
+        self.last_vsm_dirty_pages = len(vsm_allocs) if not sh_gpu else self.sota_shadow_gpu.dirty_last  # sota:shadow hook
         if len(vsm_allocs) > 0:
             var q_vr = next_q
             if use_prof and q_vr + 1 < q_limit:
@@ -4886,6 +5041,10 @@ struct FlintAaaVulkanRenderer(Movable):
                     var casc = vsm_cascade_from_virtual_page(vx, vy)
                     var loc_vx = vx & (VSM_CASCADE_PAGES_DIM - 1)
                     var loc_vy = vy & (VSM_CASCADE_PAGES_DIM - 1)
+                    if self.sota_shadow.toroidal_active:  # --- sota:shadow hook --- slot -> window-local page
+                        var loc_t = sota_shadow_local_from_slot(vx, vy, self.sota_shadow.offsets)
+                        loc_vx = loc_t[0]
+                        loc_vy = loc_t[1]
                     sc_f = Float32(VSM_CASCADE_PAGES_DIM)
                     bx_f = Float32((VSM_CASCADE_PAGES_DIM - 1) - 2 * loc_vx)
                     by_f = -Float32((VSM_CASCADE_PAGES_DIM - 1) - 2 * loc_vy)
@@ -6265,6 +6424,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.destroy_pipeline(self.pipe_npr_outline_gfx)
             self.pipe_npr_outline_gfx = 0
         self.vk.destroy_pipeline(self.pipe_vsm_mark)
+        self.sota_shadow_gpu.destroy(self.vk)  # --- sota:shadow hook ---
         self.vk.destroy_pipeline(self.pipe_vsm_gfx)
         self.vk.destroy_pipeline(self.pipe_vsm_alphamask_gfx)
         self.vk.destroy_pipeline(self.pipe_surfcache)

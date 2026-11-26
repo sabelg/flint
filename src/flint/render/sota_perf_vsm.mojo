@@ -39,7 +39,11 @@ def sota_vsm_light_uv(m: List[Float32], p: Vec3) -> Tuple[Float32, Float32]:
 
 
 def sota_vsm_invalidate_sphere(
-    mut vsm: VsmPageManager, cascade_mats: List[List[Float32]], center: Vec3, radius: Float32
+    mut vsm: VsmPageManager,
+    cascade_mats: List[List[Float32]],
+    center: Vec3,
+    radius: Float32,
+    toroidal_offsets: List[Tuple[Int, Int]] = List[Tuple[Int, Int]](),  # --- sota:shadow hook --- Area G slots
 ) -> Int:
     """Invalidates, in every cascade, the pages covering a world sphere (+1 page of padding).
     Returns the number of virtual pages marked invalid."""
@@ -64,11 +68,15 @@ def sota_vsm_invalidate_sphere(
         var x1 = min(VSM_CASCADE_PAGES_DIM - 1, Int(min(Float32(0.99999), u1) * Float32(VSM_CASCADE_PAGES_DIM)))
         var y0 = max(0, Int(max(Float32(0.0), v0) * Float32(VSM_CASCADE_PAGES_DIM)))
         var y1 = min(VSM_CASCADE_PAGES_DIM - 1, Int(min(Float32(0.99999), v1) * Float32(VSM_CASCADE_PAGES_DIM)))
+        # --- sota:shadow hook --- toroidal addressing: window page (px, py) lives in slot (px + ox, py + oy) mod 64
+        var tox = toroidal_offsets[c][0] if c < len(toroidal_offsets) else 0
+        var toy = toroidal_offsets[c][1] if c < len(toroidal_offsets) else 0
         for py in range(y0, y1 + 1):
-            var row = (q[1] + py) * VSM_VIRTUAL_PAGES_DIM + q[0]
+            var row = (q[1] + (py + toy) % VSM_CASCADE_PAGES_DIM) * VSM_VIRTUAL_PAGES_DIM + q[0]
             for px in range(x0, x1 + 1):
-                if vsm.virtual_valid[row + px]:
-                    vsm.virtual_valid[row + px] = False
+                var col = (px + tox) % VSM_CASCADE_PAGES_DIM
+                if vsm.virtual_valid[row + col]:
+                    vsm.virtual_valid[row + col] = False
                     marked += 1
     return marked
 
@@ -189,6 +197,7 @@ struct SotaVsmCache(Copyable, Movable):
         local_radius: Float32,
         scale: Float32,
         deforming: Bool,
+        toroidal_offsets: List[Tuple[Int, Int]] = List[Tuple[Int, Int]](),  # --- sota:shadow hook ---
     ):
         """One draw instance: invalidates its old + new footprint if it moved or deforms (skinned)."""
         if not self.enabled:
@@ -198,6 +207,6 @@ struct SotaVsmCache(Copyable, Movable):
             return
         self.moved_casters_last_frame += 1
         var r = local_radius * max(Float32(1e-3), scale)
-        self.caster_pages_last_frame += sota_vsm_invalidate_sphere(vsm, cascade_mats, world.transform_point(local_center), r)
+        self.caster_pages_last_frame += sota_vsm_invalidate_sphere(vsm, cascade_mats, world.transform_point(local_center), r, toroidal_offsets)
         if moved:
-            self.caster_pages_last_frame += sota_vsm_invalidate_sphere(vsm, cascade_mats, prev_world.transform_point(local_center), r)
+            self.caster_pages_last_frame += sota_vsm_invalidate_sphere(vsm, cascade_mats, prev_world.transform_point(local_center), r, toroidal_offsets)

@@ -52,6 +52,7 @@ from flint.render.aaa_bsdf import (
     emit_rnm_blend,
 )
 from flint.render.aaa_vsm import emit_vsm_pcss_shadow
+from flint.render.sota_shadow_contact import emit_sota_shadow_contact  # --- sota:shadow hook ---
 from flint.render.sota_geometry_vt import emit_vt_albedo  # sota:geometry hook
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.aaa_raytracing import (
@@ -1632,7 +1633,12 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     ) if enable_ray_query else s.ieq(s.uint(1), s.uint(0))
     s.begin_if(s.logical_and(s.logical_not(use_rt_sun), s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_VSM)), s.uint(0))))
     var vsm_v = emit_vsm_pcss_shadow(s, b_globals, b_vsm, vsm_samp, wx, wy, wz, nx, ny, nz, sun_ang_r)
-    s.store(sun_vis, vsm_v)
+    # --- sota:shadow hook --- screen-space contact shadows on the raster sun path (b_globals[243] != 0)
+    var sota_cs = emit_sota_shadow_contact(
+        s, b_globals, _depth_samp, px, py, w_u, h_u, wx, wy, wz, wn_geom[0], wn_geom[1], wn_geom[2], sun_x, sun_y, sun_z
+    )
+    s.store(sun_vis, s.nmin(vsm_v, sota_cs))
+    # --- end sota:shadow hook ---
     s.end_if()
     if enable_ray_query:
         s.begin_if(use_rt_sun)

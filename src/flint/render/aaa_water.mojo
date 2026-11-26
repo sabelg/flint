@@ -36,6 +36,7 @@ from flint.render.aaa_visbuffer import (
     emit_vec3_normalize,
 )
 from flint.render.aaa_vsm import emit_sample_vsm_depth
+from flint.render.sota_shadow_vsm import emit_sota_shadow_cascade_uv  # --- sota:shadow hook ---
 from flint.render.aaa_ibl import emit_eval_sh9_irradiance
 from flint.render.aaa_raytracing import emit_rt_textured_hit_shade
 from flint.render.aaa_oit_volumetrics import AAA_OIT_REACTIVE_BASE_WORDS
@@ -341,16 +342,18 @@ def aaa_water_refract_shader(enable_ray_query: Bool) -> List[UInt32]:
     # VSM Sun Shadow on Water Surface (modulates both shallow caustics & specular sun glints!)
     var sun_vis_w = s.fvar(s.float(1.0))
     s.begin_if(s.ine(s.bit_and(r_flags, s.uint(1)), s.uint(0)))
-    var wclip = emit_mat4_mul_point(s, b_globals, s.uint(56), wx, water_y, wz)
-    var wlu = s.fma(wclip[0], s.float(0.5), s.float(0.5))
-    var wlv = s.fma(s.fneg(wclip[1]), s.float(0.5), s.float(0.5))
+    # --- sota:shadow hook --- cascade-aware + toroidal lookup (v5 used cascade 0's matrix on the whole table)
+    var wcuv = emit_sota_shadow_cascade_uv(s, b_globals, wx, water_y, wz)
+    var wlu = wcuv[2]
+    var wlv = wcuv[3]
     var in_wv = s.logical_and(
         s.logical_and(s.fgt(wlu, s.float(0.002)), s.flt(wlu, s.float(0.998))),
         s.logical_and(s.fgt(wlv, s.float(0.002)), s.flt(wlv, s.float(0.998))),
     )
-    s.begin_if(s.logical_and(in_wv, s.flt(wclip[2], s.float(0.999))))
-    var wvz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, wlu, wlv)
-    s.store(sun_vis_w, s.select_f(s.flt(wvz, s.fsub(wclip[2], s.float(0.002))), s.float(0.0), s.float(1.0)))
+    s.begin_if(s.logical_and(in_wv, s.flt(wcuv[4], s.float(0.999))))
+    var wvz = emit_sample_vsm_depth(s, b_vsm, vsm_samp, wcuv[0], wcuv[1], b_globals)
+    s.store(sun_vis_w, s.select_f(s.flt(wvz, s.fsub(wcuv[4], s.float(0.002))), s.float(0.0), s.float(1.0)))
+    # --- end sota:shadow hook ---
     s.end_if()
     s.end_if()
 
