@@ -6,6 +6,9 @@ from std.math import cos, exp, max, min, sin, sqrt
 from flint.core.math import Vec2, Vec3
 from flint.core.transform import Mat4
 from flint.render.spirv import AaaSpirvModule, MODEL_GL_COMPUTE
+# --- sota:camera hook (import) ---
+from flint.render.sota_camera_vrs import emit_sota_vrs_remap
+# --- end sota:camera hook ---
 from flint.render.aaa_visbuffer import (
     AAA_INSTANCE_WORDS,
     AAA_MAX_BINDLESS,
@@ -964,6 +967,11 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
 
     var px = s.invocation_axis(0)
     var py = s.invocation_axis(1)
+    # --- sota:camera hook (compute VRS: pixel from the compacted shade list when push[7] != 0) ---
+    var sota_vrs_xy = emit_sota_vrs_remap(s, b_post, px, py, s.push_word(7), s.push_word(8))
+    px = sota_vrs_xy[0]
+    py = sota_vrs_xy[1]
+    # --- end sota:camera hook ---
     var w_u = s.push_word(0)
     var h_u = s.push_word(1)
     var gi_rays_u = s.push_word(2)
