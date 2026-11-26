@@ -308,6 +308,13 @@ def _spatial_sort_triangles_sah(mesh: NativeMesh, in_indices: List[Int]) -> List
     var chunk_tris = MESHLET_MAX_TRIS * 2
     var start = 0
     var vc = mesh.vertex_count()
+    # --- sota:perf hook --- Forsyth per chunk on a compact, order-preserving local vertex numbering.
+    # Calling it with the whole mesh's `vc` allocated and scanned O(vc) arrays per 248-tri chunk, which made
+    # cooking O(tris * verts) (88 s of the 92 s Forest upload). The local ids are the chunk's distinct
+    # vertices in ascending global order, so every index comparison inside Forsyth (first fanning vertex,
+    # `scan_v` order) is unchanged and the output is bit-identical.
+    var local_of = List[Int](length=max(0, vc), fill=-1)
+    var uniq = List[Int](capacity=chunk_tris * 3)
     while start < n_tris:
         var end = min(n_tris, start + chunk_tris)
         var sub_idx = List[Int](capacity=(end - start) * 3)
@@ -316,7 +323,34 @@ def _spatial_sort_triangles_sah(mesh: NativeMesh, in_indices: List[Int]) -> List
             sub_idx.append(in_indices[ti * 3])
             sub_idx.append(in_indices[ti * 3 + 1])
             sub_idx.append(in_indices[ti * 3 + 2])
-        var opt_sub = optimize_vertex_cache_forsyth(sub_idx, vc)
+        uniq.clear()
+        var has_invalid = False
+        for v in sub_idx:
+            if v < 0 or v >= vc:
+                has_invalid = True
+            elif local_of[v] < 0:
+                local_of[v] = 0
+                uniq.append(v)
+        if has_invalid:  # rare (loaders reject such files): keep the exact legacy call
+            for v in uniq:
+                local_of[v] = -1
+            var opt_legacy = optimize_vertex_cache_forsyth(sub_idx, vc)
+            for v in opt_legacy:
+                out.append(v)
+            start = end
+            continue
+        sort(uniq)
+        for li in range(len(uniq)):
+            local_of[uniq[li]] = li
+        var loc_idx = List[Int](capacity=len(sub_idx))
+        for v in sub_idx:
+            loc_idx.append(local_of[v])
+        for v in uniq:
+            local_of[v] = -1
+        var opt_sub = optimize_vertex_cache_forsyth(loc_idx, len(uniq))
+        for oi in range(len(opt_sub)):
+            opt_sub[oi] = uniq[opt_sub[oi]]
+        # --- end sota:perf hook ---
         for v in opt_sub:
             out.append(v)
         start = end
@@ -1425,6 +1459,10 @@ struct AaaGeometryPool(Movable):
     var meshes: List[CookedMeshEntry]
     var slots: List[GeomSlot]       # per mesh: its room in the pool
     var holes: List[GeomSlot]       # room freed by free_mesh / a replace that moved
+    # --- sota:perf hook --- one-shot `_spatial_sort_triangles_sah` result computed by the parallel upload
+    # prepass; the next `_append_single_lod_geometry_ex` uses it instead of sorting again, then clears it
+    var sota_next_sorted: List[Int]
+    var sota_next_sorted_valid: Bool
 
     def __init__(out self):
         self.vertex_words = List[UInt32]()
@@ -1434,6 +1472,8 @@ struct AaaGeometryPool(Movable):
         self.meshes = List[CookedMeshEntry]()
         self.slots = List[GeomSlot]()
         self.holes = List[GeomSlot]()
+        self.sota_next_sorted = List[Int]()  # --- sota:perf hook ---
+        self.sota_next_sorted_valid = False  # --- sota:perf hook ---
 
     def total_vertices(self) -> Int:
         return len(self.vertex_words) // AAA_VERTEX_WORDS
@@ -1458,7 +1498,15 @@ struct AaaGeometryPool(Movable):
         """Appends one LOD level's vertices, spatially/Forsyth-ordered indices, and 64v/124t meshlets.
         Packs `vertex_words[11]` = `sign_neg | (is_splat << 1) | (ao_u6 << 2) | (splat_u24 << 8)`."""
         var v_count = len(mesh.positions) // 3
-        var opt_indices = _spatial_sort_triangles_sah(mesh, mesh.indices)
+        # --- sota:perf hook --- prepass-sorted indices (bit-identical to sorting here)
+        var opt_indices: List[Int]
+        if self.sota_next_sorted_valid:
+            opt_indices = self.sota_next_sorted^
+            self.sota_next_sorted = List[Int]()
+            self.sota_next_sorted_valid = False
+        else:
+            opt_indices = _spatial_sort_triangles_sah(mesh, mesh.indices)
+        # --- end sota:perf hook ---
         var raw_tris = len(opt_indices) // 3
         var base_v = self.total_vertices()
         var base_idx = len(self.index_words)

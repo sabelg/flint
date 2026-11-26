@@ -140,13 +140,14 @@ struct SotaEGpuDriven(Movable):
     def record(
         mut self, mut vk: VulkanGpu, geom: SotaGeometryGpu, slot: Int, n_inst: Int, max_ml_per_inst: Int,
         render_w: Int, render_h: Int, lod_px: Float32, do_alpha: Bool, do_outline: Bool,
+        max_draws: Int = SOTA_E_ROUTE_MAX_DRAWS,  # --- sota:perf hook --- ring capacity (grows with the scene)
     ):
         """Records the route dispatches; the caller's compute -> DRAW_INDIRECT barrier covers them."""
         if n_inst <= 0 or max_ml_per_inst <= 0:
             return
         var push = List[UInt32](length=SOTA_PUSH_WORDS, fill=0)
         push[0] = UInt32(n_inst)
-        push[1] = UInt32(SOTA_E_ROUTE_MAX_DRAWS)
+        push[1] = UInt32(max_draws)  # --- sota:perf hook ---
         push[4] = UInt32(render_w)
         push[5] = UInt32(render_h)
         push[6] = bitcast[DType.uint32](lod_px)

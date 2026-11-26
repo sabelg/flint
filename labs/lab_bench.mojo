@@ -258,6 +258,7 @@ def main() raises:
             print("    " + String(rw) + "x" + String(rh) + " (render " + String(ren.render_w) + "x" + String(ren.render_h) + "): upload "
                   + sota_fmt(scene.upload_s, 2) + " s, scene VRAM " + sota_fmt(Float64(vr1[0] - vr0[0]) / 1048576.0, 0) + " MB, geometry pools "
                   + String(gmb) + " MB, overflowed meshes " + String(ren.geometry_overflow_meshes))
+            print("        upload phases: " + ren.sota_upload.summary())  # round 2: where the load goes
             sota_bench_apply_preset(ren, preset, scene)
             var den = String("learned (sota_ml, weights v") + String(ren.sota_ml.weights_version) + ")" if ren.sota_ml.enabled else String("SVGF + ReBLUR (sota_ml off)")
             print("    denoiser: " + den + ", GI mode " + String(ren.sota_gi.mode) + ", rt_gi " + String(ren.enable_rt_gi))
@@ -296,7 +297,9 @@ def main() raises:
                 var flip_s = sota_fmt(r.flip, 3) if r.flip >= 0.0 else String("-")
                 print("    " + _pad(sota_bench_variant_name(v), 13) + " GPU " + sota_fmt(r.gpu_ms, 2) + " ms (p95 " + sota_fmt(r.gpu_p95_ms, 2)
                       + ")  period " + sota_fmt(r.period_ms, 2) + "  CPU " + sota_fmt(r.cpu_ms, 2) + "  wait " + sota_fmt(r.wait_ms, 2) + "  VRAM " + sota_fmt(r.vram_mb, 0)
-                      + " MB  FLIP " + flip_s + "  | " + r.top_passes(5))
+                      + " MB  record " + sota_fmt(r.record_ms, 2) + " retire " + sota_fmt(r.retire_ms, 2) + " hitch " + sota_fmt(r.hitch, 2)  # round 2 pacing
+                      + (" (pipelined)" if r.pipelined else "")
+                      + "  FLIP " + flip_s + "  | " + r.top_passes(5))
                 md += "| " + s_name + " | " + String(rh) + "p (" + String(r.render_w) + "x" + String(r.render_h) + ") | " + sota_bench_variant_name(v)
                 md += " | " + sota_fmt(r.gpu_ms, 2) + " | " + sota_fmt(r.gpu_p95_ms, 2) + " | " + sota_fmt(r.period_ms, 2) + " | " + sota_fmt(r.cpu_ms, 2) + " | " + sota_fmt(r.wait_ms, 2)
                 md += " | " + sota_fmt(r.vram_mb, 0) + " | " + flip_s + " | " + r.top_passes(3) + " |\n"

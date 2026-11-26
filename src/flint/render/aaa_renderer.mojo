@@ -363,6 +363,22 @@ from flint.render.aaa_post_tsr import (
 )
 # --- sota:camera hook (import) ---
 from flint.render.sota_perf_vsm import SotaVsmCache  # --- sota:perf hook ---
+from flint.core.jobs import JobPool, default_worker_count  # --- sota:perf hook ---
+from flint.render.sota_geometry_cluster_dag import ClusterDag  # --- sota:perf hook ---
+from flint.render.sota_geometry_cull import SOTA_BIND_INDIRECT  # --- sota:perf hook ---
+from flint.render.sota_perf_async import sota_pipelined_default, sota_route_capacity_for, sota_route_draws_limit  # --- sota:perf hook ---
+from flint.render.sota_perf_upload import (  # --- sota:perf hook --- upload profile + parallel prepass
+    SOTA_PREP_ALBEDO,
+    SOTA_PREP_NORMAL,
+    SOTA_PREP_ORM,
+    SotaPreparedModel,
+    SotaUploadStats,
+    sota_now,
+    sota_append_mesh_prepared,
+    sota_prepare_model,
+    sota_upload_parallel_enabled,
+    sota_upload_worker_count,
+)
 from flint.render.sota_camera_post import (
     SotaCameraPost,
     sota_camera_record_ca,
@@ -557,6 +573,13 @@ struct FlintAaaVulkanRenderer(Movable):
     var geometry_mb: Int  # --- sota:perf hook ---
     var sota_vsm: SotaVsmCache  # --- sota:perf hook --- VSM page invalidation for light / caster motion
     var geometry_overflow_meshes: Int  # --- sota:perf hook --- meshes rejected because the pools were full
+    var sota_upload: SotaUploadStats  # --- sota:perf hook --- per-phase upload wall time
+    var sota_prep: SotaPreparedModel  # --- sota:perf hook --- parallel upload prepass results
+    var sota_upload_pool: JobPool  # --- sota:perf hook ---
+    var sota_upload_pool_started: Bool  # --- sota:perf hook ---
+    var sota_route_draws: Int  # --- sota:perf hook --- capacity of the alpha-mask / outline indirect rings (was a fixed 16384)
+    var sota_route_cpu_need: Int  # --- sota:perf hook --- draws the CPU packers wanted last frame (beyond capacity = dropped)
+    var sota_route_grow_events: Int  # --- sota:perf hook ---
     var last_frame_gpu_ms: Float64  # whole-frame TOP->BOTTOM timestamp pair (incl. TLAS, skin, readback copy)
     var last_vsm_dirty_pages: Int
     var last_cpu_vsm_table_ms: Float64  # part of `last_cpu_vsm_ms`: VSM table alloc + host read/write copies
@@ -835,6 +858,13 @@ struct FlintAaaVulkanRenderer(Movable):
         self.geometry_mb = max(8, geometry_mb)  # --- sota:perf hook ---
         self.geometry_overflow_meshes = 0  # --- sota:perf hook ---
         self.sota_vsm = SotaVsmCache()  # --- sota:perf hook ---
+        self.sota_upload = SotaUploadStats()  # --- sota:perf hook ---
+        self.sota_prep = SotaPreparedModel()  # --- sota:perf hook ---
+        self.sota_upload_pool = JobPool()  # --- sota:perf hook ---
+        self.sota_upload_pool_started = False  # --- sota:perf hook ---
+        self.sota_route_draws = SOTA_E_ROUTE_MAX_DRAWS  # --- sota:perf hook ---
+        self.sota_route_cpu_need = 0  # --- sota:perf hook ---
+        self.sota_route_grow_events = 0  # --- sota:perf hook ---
         self.active = False
         self.output_w = max(16, width)
         self.output_h = max(16, height)
@@ -942,7 +972,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.last_vsm_dirty_pages = 0
         self.last_cpu_vsm_table_ms = 0.0
         self.last_cpu_vsm_requests_ms = 0.0
-        self.deferred_readback = False
+        self.deferred_readback = sota_pipelined_default()  # --- sota:perf hook --- cvar r.sota_perf.pipelined (default off)
         self.force_readback = False
         self.enable_vsm_clipmap_cascades = True
         self.vsm_cascade_matrices = List[List[Float32]]()
@@ -1487,8 +1517,8 @@ struct FlintAaaVulkanRenderer(Movable):
             _ = external_call["memset", Int](b_glob.cpu_address, Int32(0), b_glob.size)
             var b_inst = self.vk.create_buffer(self.max_instances * AAA_INSTANCE_WORDS * 4, local=True)
             var b_ind = self.vk.create_buffer(64 + self.max_draws * 20, local=True)
-            var b_am_ind = self.vk.create_buffer(64 + 16384 * 20, local=True)
-            var b_out_ind = self.vk.create_buffer(64 + 16384 * 20, local=True)
+            var b_am_ind = self.vk.create_buffer(64 + self.sota_route_draws * 20, local=True)  # --- sota:perf hook ---
+            var b_out_ind = self.vk.create_buffer(64 + self.sota_route_draws * 20, local=True)  # --- sota:perf hook ---
             var b_clust = self.vk.create_buffer(AAA_CLUSTER_BUFFER_WORDS * 4, local=True)
             _ = external_call["memset", Int](b_clust.cpu_address, Int32(0), b_clust.size)
             self.ring_globals.append(b_glob^)
@@ -1770,6 +1800,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if img.image == 0:
             return -1
 
+        var sota_t0 = sota_now()  # --- sota:perf hook ---
         var cur_px = pixels_argb.copy()
         var cw = width
         var ch = height
@@ -1791,6 +1822,8 @@ struct FlintAaaVulkanRenderer(Movable):
                 cw = ds[1]
                 ch = ds[2]
 
+        var sota_t1 = sota_now()  # --- sota:perf hook ---
+        self.sota_upload.tex_cpu_s += sota_t1 - sota_t0  # --- sota:perf hook ---
         if not self.vk.begin_commands(0):
             self.vk.destroy_image(img)
             return -1
@@ -1806,6 +1839,9 @@ struct FlintAaaVulkanRenderer(Movable):
         for ds_i in range(len(self.desc_sets)):
             self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, slot, self.samp_aniso16, img.view)
         self.bindless_images.append(img^)
+        self.sota_upload.tex_gpu_s += sota_now() - sota_t1  # --- sota:perf hook ---
+        self.sota_upload.textures += 1  # --- sota:perf hook ---
+        self.sota_upload.submits += 1  # --- sota:perf hook ---
         return slot
 
     def upload_bc5_normal_texture(
@@ -1829,6 +1865,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if img.image == 0:
             return -1
 
+        var sota_t0 = sota_now()  # --- sota:perf hook ---
         var cur_n = normals.copy()
         var cw = width
         var ch = height
@@ -1850,6 +1887,8 @@ struct FlintAaaVulkanRenderer(Movable):
                 cw = ds[1]
                 ch = ds[2]
 
+        var sota_t1 = sota_now()  # --- sota:perf hook ---
+        self.sota_upload.tex_cpu_s += sota_t1 - sota_t0  # --- sota:perf hook ---
         if not self.vk.begin_commands(0):
             self.vk.destroy_image(img)
             return -1
@@ -1865,6 +1904,9 @@ struct FlintAaaVulkanRenderer(Movable):
         for ds_i in range(len(self.desc_sets)):
             self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, slot, self.samp_aniso16, img.view)
         self.bindless_images.append(img^)
+        self.sota_upload.tex_gpu_s += sota_now() - sota_t1  # --- sota:perf hook ---
+        self.sota_upload.textures += 1  # --- sota:perf hook ---
+        self.sota_upload.submits += 1  # --- sota:perf hook ---
         return slot
 
     def upload_bc6h_texture(mut self, hdr_pixels: List[Vec3], width: Int, height: Int) -> Int:
@@ -2180,13 +2222,22 @@ struct FlintAaaVulkanRenderer(Movable):
         var i_words_before = len(self.geom.index_words)
         var m_words_before = len(self.geom.meshlet_words)
 
+        var sota_m0 = sota_now()  # --- sota:perf hook ---
         # --- sota:geometry hook ---
         var entry: CookedMeshEntry
         if build_lods and self.sota_geom.cluster_lod_auto and self.sota_geom.active and len(mesh.indices) // 3 >= 256 and mesh.alpha_mode != 1:
+            if self.sota_prep.has_sorted(self.sota_prep.current_mesh):  # --- sota:perf hook --- prepass vertex-pack order
+                self.geom.sota_next_sorted = self.sota_prep.take_sorted(self.sota_prep.current_mesh)
+                self.geom.sota_next_sorted_valid = True
             entry = self.add_mesh_cluster_dag_entry(mesh, material_id)
+            self.geom.sota_next_sorted_valid = False  # --- sota:perf hook ---
+        elif build_lods and self.sota_prep.has_lods(self.sota_prep.current_mesh):  # --- sota:perf hook --- prepass LOD chain
+            entry = sota_append_mesh_prepared(self.geom, mesh, material_id, self.sota_prep, self.sota_prep.current_mesh)
         else:
             entry = self.geom.append_mesh(mesh, material_id, build_lods=build_lods)
         # --- end sota:geometry hook ---
+        var sota_m1 = sota_now()  # --- sota:perf hook ---
+        self.sota_upload.mesh_cook_s += sota_m1 - sota_m0  # --- sota:perf hook ---
         _ = self._sota_ensure_geometry_capacity()  # sota:geometry hook: grow buffers to the scene
 
         var vb_start = v_words_before * 4
@@ -2216,6 +2267,8 @@ struct FlintAaaVulkanRenderer(Movable):
                 mb_len,
             )
 
+        var sota_m2 = sota_now()  # --- sota:perf hook ---
+        self.sota_upload.mesh_copy_s += sota_m2 - sota_m1  # --- sota:perf hook ---
         var is_am_mesh = (mesh.alpha_mode == 1) or (
             material_id >= 0 and material_id < len(self.materials) and self.materials[material_id].is_alpha_masked()
         )
@@ -2247,11 +2300,15 @@ struct FlintAaaVulkanRenderer(Movable):
                 if f != 0:
                     _ = self.vk.wait(f)
                 self.mesh_blas.append(blas^)
+                self.sota_upload.blas_builds += 1  # --- sota:perf hook ---
+                self.sota_upload.submits += 1  # --- sota:perf hook ---
             else:
                 self.mesh_blas.append(VulkanAccelStruct())
         else:
             self.mesh_blas.append(VulkanAccelStruct())
 
+        self.sota_upload.blas_s += sota_now() - sota_m2  # --- sota:perf hook ---
+        self.sota_upload.meshes += 1  # --- sota:perf hook ---
         self.skinned_mesh_flags.append(False)
         self.skinned_mesh_bind_slots.append(0)
         self.mesh_double_sided_flags.append(mesh.double_sided or is_am_mesh)
@@ -2391,6 +2448,68 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.write_descriptor(ds, SOTA_BIND_CANDIDATES, self.buf_occluded_candidates)
             self.vk.write_descriptor(ds, SOTA_BIND_DAG, self.sota_geom.buf_dag)
 
+    # --- sota:perf hook --- alpha-mask / outline indirect rings grow with the scene (fixed 16384 before)
+    def _sota_check_route_overflow(mut self, slot: Int):
+        """The GPU routes count every visible meshlet in word 0 (even past capacity) and the CPU packers
+        report what they wanted: grow both rings when last frame's need passed the capacity. Runs after the
+        slot's fence has signalled, so word 0 is that slot's last frame."""
+        var need = self.sota_route_cpu_need
+        self.sota_route_cpu_need = 0
+        if slot < len(self.ring_alphamask_indirect) and self.ring_alphamask_indirect[slot].cpu_address != 0:
+            need = max(need, Int(get32(self.ring_alphamask_indirect[slot].cpu_address)))
+        if slot < len(self.ring_outline_indirect) and self.ring_outline_indirect[slot].cpu_address != 0:
+            need = max(need, Int(get32(self.ring_outline_indirect[slot].cpu_address)))
+        if need <= self.sota_route_draws or need > sota_route_draws_limit():
+            return
+        var new_cap = sota_route_capacity_for(need)
+        self._sota_log_once("visible alpha-masked / outlined meshlets exceeded " + String(self.sota_route_draws)
+                            + " (needed " + String(need) + "); growing the route rings")
+        _ = self._sota_grow_route_draws(new_cap)
+
+    def _sota_grow_route_draws(mut self, new_cap: Int) -> Bool:
+        if new_cap <= self.sota_route_draws or not self.active:
+            return False
+        self.vk.wait_idle()
+        var n_am = List[GpuBuffer]()
+        var n_out = List[GpuBuffer]()
+        var ok = True
+        for _ in range(FRAMES_IN_FLIGHT):
+            var a = self.vk.create_buffer(64 + new_cap * 20, local=True)
+            var b = self.vk.create_buffer(64 + new_cap * 20, local=True)
+            ok = ok and a.size > 0 and b.size > 0 and a.cpu_address != 0 and b.cpu_address != 0
+            if a.cpu_address != 0:
+                put32(a.cpu_address, 0)
+            if b.cpu_address != 0:
+                put32(b.cpu_address, 0)
+            n_am.append(a^)
+            n_out.append(b^)
+        if not ok:
+            for b in n_am:
+                self.vk.destroy_buffer(b)
+            for b in n_out:
+                self.vk.destroy_buffer(b)
+            self._sota_log_once("out of memory growing the alpha-mask / outline rings to " + String(new_cap))
+            return False
+        for i in range(len(self.ring_alphamask_indirect)):
+            self.vk.destroy_buffer(self.ring_alphamask_indirect[i])
+        for i in range(len(self.ring_outline_indirect)):
+            self.vk.destroy_buffer(self.ring_outline_indirect[i])
+        self.ring_alphamask_indirect = n_am^
+        self.ring_outline_indirect = n_out^
+        self.buf_alphamask_indirect = self.ring_alphamask_indirect[0].copy()
+        self.buf_outline_indirect = self.ring_outline_indirect[0].copy()
+        self.sota_route_draws = new_cap
+        for f in range(len(self.sota_e_gpu.sets_alpha)):
+            if f < len(self.ring_alphamask_indirect):
+                self.vk.write_descriptor(self.sota_e_gpu.sets_alpha[f], SOTA_BIND_INDIRECT, self.ring_alphamask_indirect[f])
+        for f in range(len(self.sota_e_gpu.sets_outline)):
+            if f < len(self.ring_outline_indirect):
+                self.vk.write_descriptor(self.sota_e_gpu.sets_outline[f], SOTA_BIND_INDIRECT, self.ring_outline_indirect[f])
+        self.sota_route_grow_events += 1
+        print("[flint render] alpha-mask / outline route capacity grown to " + String(new_cap))
+        return True
+    # --- end sota:perf hook ---
+
     def _sota_grow_draws(mut self, new_max: Int) -> Bool:
         """Grows every buffer sized by `max_draws` (indirect rings, phase-2 indirect, occluded candidates,
         VSM indirect) and rebinds them. Old contents are per-frame scratch, so nothing is copied."""
@@ -2437,6 +2556,109 @@ struct FlintAaaVulkanRenderer(Movable):
         print("[flint render] max_draws grown to " + String(new_max))
         return True
 
+    # --- sota:perf hook --- parallel upload prepass (sota_perf_upload.mojo)
+    def _sota_prepare_upload(mut self, model: NativeModel, cap_dim: Int, build_lods: Bool, upload_skinned: Bool):
+        """Encodes every texture role and builds every cluster DAG that the serial walk of
+        `upload_native_model` is about to need, on a JobPool. The decisions mirror the walk; anything not
+        prepared (VT albedo, skinned meshes, legacy-LOD and alpha-masked meshes) still runs inline."""
+        self.sota_prep.clear()
+        if not self.active or not sota_upload_parallel_enabled():
+            return
+        if not self.sota_upload_pool_started:
+            self.sota_upload_pool_started = True
+            var n = sota_upload_worker_count()
+            if n > 0:
+                _ = self.sota_upload_pool.start(n)
+        if not self.sota_upload_pool.ready():
+            return
+        var n_tex = len(model.textures)
+        var want_alb = List[Bool](length=n_tex, fill=False)
+        var want_nrm = List[Bool](length=n_tex, fill=False)
+        var want_orm = List[Bool](length=n_tex, fill=False)
+        var vt_alb = List[Bool](length=n_tex, fill=False)
+        var want_dag = List[Bool](length=len(model.meshes), fill=False)
+        var want_lods = List[Bool](length=len(model.meshes), fill=False)
+        var dag_ok = build_lods and self.sota_geom.cluster_lod_auto and self.sota_geom.active and len(self.geom.holes) == 0
+        for m_idx in range(len(model.meshes)):
+            ref m = model.meshes[m_idx]
+            if m.texture >= 0 and m.texture < n_tex:
+                ref tx = model.textures[m.texture]
+                if (m.alpha_mode != 1 and self.sota_vt.wants_model_texture(tx.width, tx.height)
+                        and len(tx.pixels) >= tx.width * tx.height):
+                    vt_alb[m.texture] = True  # may stream through VT: leave it to the walk
+                else:
+                    want_alb[m.texture] = True
+            if m.normal_orm_texture >= 0 and m.normal_orm_texture < n_tex:
+                want_nrm[m.normal_orm_texture] = True
+            if m.orm_texture >= 0 and m.orm_texture < n_tex:
+                want_orm[m.orm_texture] = True
+            var mv_cnt = m.vertex_count()
+            var skinned = upload_skinned and mv_cnt > 0 and len(m.joints) >= mv_cnt * 4 and len(m.weights) >= mv_cnt * 4
+            if dag_ok and not skinned and len(m.indices) // 3 >= 256 and m.alpha_mode != 1:
+                want_dag[m_idx] = True
+            elif build_lods and not skinned and len(self.geom.holes) == 0 and len(m.indices) // 3 >= 1024 and mv_cnt > 0:
+                want_lods[m_idx] = True  # legacy QEM LOD chain (alpha-masked and small meshes)
+        for t in range(n_tex):
+            if vt_alb[t]:
+                want_alb[t] = False
+        var mt_addr = 0
+        if not self.sota_geom.dag_pool_started and self.sota_geom.dag_build_threads != 0:
+            var nd = default_worker_count() if self.sota_geom.dag_build_threads < 0 else self.sota_geom.dag_build_threads
+            if nd > 0:
+                _ = self.sota_geom.dag_pool.start(nd)
+            self.sota_geom.dag_pool_started = True
+        if self.sota_geom.dag_pool.ready():
+            mt_addr = Int(Pointer(to=self.sota_geom.dag_pool))
+        var hits = sota_prepare_model(
+            model, self.sota_prep, self.sota_upload_pool, want_alb, want_nrm, want_orm, want_dag, want_lods, cap_dim,
+            self.sota_geom.dag_cache_dir, mt_addr,
+        )
+        self.sota_upload.prepare_s += self.sota_prep.prepare_s
+        self.sota_upload.prepared_jobs += self.sota_prep.jobs
+        self.sota_upload.prepared_workers = self.sota_prep.workers
+        self.sota_upload.dag_cache_hits += hits
+        self.sota_prep.current_mesh = -1
+
+    def _sota_upload_prepared_texture(mut self, role: Int, t: Int) -> Int:
+        """GPU half of `upload_bc7_texture` / `upload_bc5_normal_texture` for a prepass-encoded mip chain."""
+        var prep = self.sota_prep.take_texture(role, t)
+        if len(self.bindless_images) >= AAA_MAX_BINDLESS or len(prep.blobs) == 0:
+            return -1
+        var sota_t1 = sota_now()
+        var mips = len(prep.blobs)
+        var fmt = FORMAT_BC5_UNORM if prep.bc5 else (FORMAT_BC7_SRGB if prep.srgb else FORMAT_BC7_UNORM)
+        var img = self.vk.create_image_2d(prep.widths[0], prep.heights[0], fmt, IMAGE_USAGE_TRANSFER_TARGET | IMAGE_USAGE_SAMPLED, mip_levels=mips)
+        if img.image == 0:
+            return -1
+        var mip_offsets = List[Int]()
+        var st_off = 0
+        for m in range(mips):
+            var n = len(prep.blobs[m])
+            self.ensure_staging_capacity(st_off + n)
+            _ = external_call["memcpy", Int](self.buf_staging.cpu_address + st_off, Int(prep.blobs[m].unsafe_ptr()), n)
+            mip_offsets.append(st_off)
+            st_off += (n + 15) & ~15
+        if not self.vk.begin_commands(0):
+            self.vk.destroy_image(img)
+            return -1
+        self.vk.transition_image(0, img, LAYOUT_TRANSFER_TARGET, PIPELINE_TOP, 0, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE)
+        for m in range(mips):
+            self.vk.upload_image_mip(0, img, self.buf_staging, mip_offsets[m], m, prep.widths[m], prep.heights[m])
+        self.vk.transition_image(0, img, LAYOUT_SHADER_READ_ONLY, PIPELINE_TRANSFER, ACCESS_TRANSFER_WRITE, PIPELINE_COMPUTE, ACCESS_SHADER_READ)
+        var f = self.vk.submit(0)
+        if f != 0:
+            _ = self.vk.wait(f)
+        _ = len(prep.blobs)
+        var slot = len(self.bindless_images)
+        for ds_i in range(len(self.desc_sets)):
+            self.vk.write_aaa_texture(self.desc_sets[ds_i], BIND_AAA_BINDLESS_TEX, slot, self.samp_aniso16, img.view)
+        self.bindless_images.append(img^)
+        self.sota_upload.tex_gpu_s += sota_now() - sota_t1
+        self.sota_upload.textures += 1
+        self.sota_upload.submits += 1
+        return slot
+    # --- end sota:perf hook ---
+
     def add_virtual_texture(mut self, pixels_argb: List[UInt32], dim: Int) -> Int:
         """Registers a square power-of-two (128..16384) sRGB ARGB image as a streamed virtual texture (only the
         pages the camera needs become resident; see sota_geometry_vt.mojo). Returns the VT index or -1."""
@@ -2462,7 +2684,13 @@ struct FlintAaaVulkanRenderer(Movable):
     def add_mesh_cluster_dag_entry(mut self, mesh: NativeMesh, material_id: Int) -> CookedMeshEntry:
         """Cooks `mesh` as a continuous cluster-LOD DAG into the CPU pool and publishes its DAG records
         (the caller, `add_mesh`, uploads the pool range and builds the LOD0 BLAS)."""
-        var dag = self.sota_geom.build_dag(mesh)       # .flpk cache + JobPool build
+        var sota_d0 = sota_now()  # --- sota:perf hook ---
+        var dag: ClusterDag
+        if self.sota_prep.has_dag(self.sota_prep.current_mesh):  # built by the parallel upload prepass
+            dag = self.sota_prep.take_dag(self.sota_prep.current_mesh)
+        else:
+            dag = self.sota_geom.build_dag(mesh)       # .flpk cache + JobPool build
+        self.sota_upload.dag_build_s += sota_now() - sota_d0  # --- sota:perf hook ---
         var cooked = cook_cluster_dag_into_pool(self.geom, mesh, material_id, dag)
         self.sota_geom.write_dag_records(cooked[0].first_meshlet, cooked[1])
         return cooked[0].copy()
@@ -3272,8 +3500,10 @@ struct FlintAaaVulkanRenderer(Movable):
         out.orm_bindless_slots = List[Int](length=n_tex, fill=-1)
 
         var sota_vt_of_tex = List[Int](length=n_tex, fill=-1)  # sota:geometry hook (VT albedo per texture)
+        self._sota_prepare_upload(model, cap_dim, build_lods, upload_skinned)  # --- sota:perf hook ---
         for m_idx in range(len(model.meshes)):
             ref m = model.meshes[m_idx]
+            self.sota_prep.current_mesh = m_idx  # --- sota:perf hook ---
             var alb_slot = -1
             # --- sota:geometry hook --- big square albedo maps stream through virtual texturing (r.sota.vt.models)
             var sota_vt_idx = -1
@@ -3284,6 +3514,11 @@ struct FlintAaaVulkanRenderer(Movable):
                         sota_vt_of_tex[m.texture] = self.add_virtual_texture(vtx.pixels, vtx.width)
                 sota_vt_idx = sota_vt_of_tex[m.texture]
             # --- end sota:geometry hook ---
+            # --- sota:perf hook --- albedo encoded by the parallel prepass
+            if (m.texture >= 0 and m.texture < n_tex and sota_vt_idx < 0 and out.albedo_bindless_slots[m.texture] < 0
+                    and self.sota_prep.has_texture(SOTA_PREP_ALBEDO, m.texture)):
+                out.albedo_bindless_slots[m.texture] = self._sota_upload_prepared_texture(SOTA_PREP_ALBEDO, m.texture)
+            # --- end sota:perf hook ---
             if m.texture >= 0 and m.texture < n_tex and sota_vt_idx < 0:
                 if out.albedo_bindless_slots[m.texture] < 0:
                     ref tx = model.textures[m.texture]
@@ -3301,6 +3536,11 @@ struct FlintAaaVulkanRenderer(Movable):
                     alb_slot = out.albedo_bindless_slots[m.texture]
 
             var nrm_slot = -1
+            # --- sota:perf hook --- normal map encoded by the parallel prepass
+            if (m.normal_orm_texture >= 0 and m.normal_orm_texture < n_tex and out.normal_bindless_slots[m.normal_orm_texture] < 0
+                    and self.sota_prep.has_texture(SOTA_PREP_NORMAL, m.normal_orm_texture)):
+                out.normal_bindless_slots[m.normal_orm_texture] = self._sota_upload_prepared_texture(SOTA_PREP_NORMAL, m.normal_orm_texture)
+            # --- end sota:perf hook ---
             if m.normal_orm_texture >= 0 and m.normal_orm_texture < n_tex:
                 if out.normal_bindless_slots[m.normal_orm_texture] < 0:
                     ref ntx = model.textures[m.normal_orm_texture]
@@ -3324,6 +3564,11 @@ struct FlintAaaVulkanRenderer(Movable):
                     nrm_slot = out.normal_bindless_slots[m.normal_orm_texture]
 
             var orm_slot = -1
+            # --- sota:perf hook --- ORM encoded by the parallel prepass
+            if (m.orm_texture >= 0 and m.orm_texture < n_tex and out.orm_bindless_slots[m.orm_texture] < 0
+                    and self.sota_prep.has_texture(SOTA_PREP_ORM, m.orm_texture)):
+                out.orm_bindless_slots[m.orm_texture] = self._sota_upload_prepared_texture(SOTA_PREP_ORM, m.orm_texture)
+            # --- end sota:perf hook ---
             if m.orm_texture >= 0 and m.orm_texture < n_tex:
                 if out.orm_bindless_slots[m.orm_texture] < 0:
                     ref otx = model.textures[m.orm_texture]
@@ -3389,6 +3634,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 out.material_ids.append(mat_id)
                 out.mesh_entries.append(entry^)
 
+        self.sota_prep.clear()  # --- sota:perf hook ---
         return out^
 
     def draw_native_model(
@@ -3592,6 +3838,7 @@ struct FlintAaaVulkanRenderer(Movable):
         """Packs frustum-visible alpha-masked meshlets (`VkDrawIndexedIndirectCommand`, stride 20) into `buf_alphamask_indirect`
         for Bucket 2 (`pipe_visbuffer_alphamask_gfx`), keeping Bucket 1 (`pipe_visbuffer_gfx`, `EarlyFragmentTests`) 100% pure!"""
         var cmd_cnt = 0
+        var sota_want = 0  # --- sota:perf hook ---
         var base_ptr = self.buf_alphamask_indirect.cpu_address
         if base_ptr == 0 or n_inst <= 0:
             return 0
@@ -3635,8 +3882,9 @@ struct FlintAaaVulkanRenderer(Movable):
             var first_ml = sl.first_meshlet if sl.meshlet_count > 0 else me.first_meshlet
             var ml_cnt = sl.meshlet_count if sl.meshlet_count > 0 else me.lod0_meshlet_count
 
+            sota_want += ml_cnt  # --- sota:perf hook ---
             for m_loc in range(ml_cnt):
-                if cmd_cnt >= 16384:
+                if cmd_cnt >= self.sota_route_draws:  # --- sota:perf hook --- was a fixed 16384
                     break
                 var ml_id = first_ml + m_loc
                 ref ml = self.geom.meshlets[ml_id]
@@ -3650,6 +3898,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 cmd_cnt += 1
 
         put32(base_ptr, UInt32(cmd_cnt))
+        self.sota_route_cpu_need = max(self.sota_route_cpu_need, sota_want)  # --- sota:perf hook ---
         return cmd_cnt
 
     def _pack_outline_visbuffer_commands(mut self, n_inst: Int, tan_x: Float32, tan_y: Float32) -> Int:
@@ -3661,6 +3910,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if base_ptr == 0:
             return 0
         var cmd_cnt = 0
+        var sota_want = 0  # --- sota:perf hook ---
         var sec_x = sqrt(Float32(1.0) + tan_x * tan_x)
         var sec_y = sqrt(Float32(1.0) + tan_y * tan_y)
         var f_h = Float32(self.render_h)
@@ -3702,8 +3952,9 @@ struct FlintAaaVulkanRenderer(Movable):
             var first_ml = sl.first_meshlet if sl.meshlet_count > 0 else me.first_meshlet
             var ml_cnt = sl.meshlet_count if sl.meshlet_count > 0 else me.lod0_meshlet_count
 
+            sota_want += ml_cnt  # --- sota:perf hook ---
             for m_loc in range(ml_cnt):
-                if cmd_cnt >= 16384:
+                if cmd_cnt >= self.sota_route_draws:  # --- sota:perf hook --- was a fixed 16384
                     break
                 var ml_id = first_ml + m_loc
                 ref ml = self.geom.meshlets[ml_id]
@@ -3717,6 +3968,7 @@ struct FlintAaaVulkanRenderer(Movable):
                 cmd_cnt += 1
 
         put32(base_ptr, UInt32(cmd_cnt))
+        self.sota_route_cpu_need = max(self.sota_route_cpu_need, sota_want)  # --- sota:perf hook ---
         return cmd_cnt
 
     def _pack_vsm_indirect_commands(
@@ -3994,6 +4246,7 @@ struct FlintAaaVulkanRenderer(Movable):
                                 + String(sota_need_draws) + "); growing the draw buffers")
             _ = self._sota_grow_draws(sota_need_draws + sota_need_draws // 4)
         # --- end sota:geometry hook ---
+        self._sota_check_route_overflow(cur_slot)  # --- sota:perf hook --- alpha-mask / outline ring growth
         self.sota_vt.begin_frame(cur_slot, (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT)  # sota:geometry hook
         var defer_this = self.deferred_readback and (not capture_readback) and self.vk.swapchain == 0
         if defer_this and cur_slot > 0 and len(self.readback_extra) < cur_slot:
@@ -4403,9 +4656,9 @@ struct FlintAaaVulkanRenderer(Movable):
         var outline_vis_draws: Int
         if sota_e_gpu_lists:
             self.sota_e_gpu.reset_counters(self.buf_alphamask_indirect, self.buf_outline_indirect)
-            am_vis_draws = SOTA_E_ROUTE_MAX_DRAWS if self.sota_e_gpu.frame_alpha_instances > 0 else 0
+            am_vis_draws = self.sota_route_draws if self.sota_e_gpu.frame_alpha_instances > 0 else 0  # sota:perf hook
             var outl_on = not self.furnace_white_dome and self.sota_e_gpu.frame_outline_instances > 0
-            outline_vis_draws = SOTA_E_ROUTE_MAX_DRAWS if outl_on else 0
+            outline_vis_draws = self.sota_route_draws if outl_on else 0  # sota:perf hook
         else:
             am_vis_draws = self._pack_alphamask_visbuffer_commands(n_inst, tan_x, tan_y)
             outline_vis_draws = 0 if self.furnace_white_dome else self._pack_outline_visbuffer_commands(n_inst, tan_x, tan_y)
@@ -4597,6 +4850,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     self.sota_e_gpu.record(
                         self.vk, self.sota_geom, cur_slot, n_inst, max_ml_per_inst, self.render_w, self.render_h,
                         self.max_lod_error_px, am_vis_draws > 0, outline_vis_draws > 0 and self.pipe_npr_outline_gfx != 0,
+                        max_draws=self.sota_route_draws,  # --- sota:perf hook ---
                     )
                 # --- end sota:E hook ---
             else:
@@ -6258,6 +6512,9 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_e_gpu.shutdown(self.vk)  # sota:E hook
         self.sota_e_hair.shutdown(self.vk)  # sota:E hook
         self.sota_geom.shutdown(self.vk)  # sota:geometry hook
+        if self.sota_upload_pool_started and self.sota_upload_pool.ready():  # --- sota:perf hook ---
+            self.sota_upload_pool.stop()
+        self.sota_upload_pool_started = False  # --- sota:perf hook ---
         self.sota_vt.shutdown(self.vk)  # sota:geometry hook
         self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
         self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)
