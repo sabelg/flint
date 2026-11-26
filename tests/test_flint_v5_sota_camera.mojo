@@ -14,6 +14,7 @@ sensor noise (`test_flint_v5_sota_camera.mojo`). Zero external assets.
 """
 from std.collections import List
 from std.ffi import external_call
+from std.memory import bitcast
 from std.math import abs, acos, log10, max, min, sqrt
 from flint.assets.image import write_png
 from flint.assets.mesh_builder import MeshBuilder
@@ -28,7 +29,8 @@ from flint.core.math import Vec3
 from flint.core.transform import Mat4, Quat, trs
 from flint.render.aaa_bsdf import AaaMaterial
 from flint.render.aaa_ibl import SkyDomeParams, bake_bc6h_ibl_cubemap_and_sh9
-from flint.render.aaa_post_tsr import AAA_DISPLAY_LINEAR_SRGB, srgb_u8_to_linear
+from flint.render.aaa_post_tsr import AAA_DISPLAY_AGX_REC709, AAA_DISPLAY_HDR10_PQ, AAA_DISPLAY_LINEAR_SRGB, srgb_u8_to_linear
+from flint.render.aaa_renderer import AAA_DISPLAY_SCRGB_FP16
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.render.sota_camera_post import (
     SotaCameraPost,
@@ -54,6 +56,29 @@ from flint.render.sota_camera_post import (
     sota_streak_shader,
     thin_film_reflectance_cpu,
 )
+from flint.render.sota_camera_bokeh import (
+    pupil_area_fraction_cpu,
+    pupil_area_fraction_fast_cpu,
+    pupil_image_pos_cpu,
+    pupil_shape_moments_cpu,
+)
+from flint.render.sota_camera_hdr import (
+    SOTA_DISPLAY_AGX_HDR,
+    SotaHdrOutput,
+    f16_to_f32_cpu,
+    pq_eotf_cpu,
+    pq_oetf_cpu,
+    pq_word_decode_nits_cpu,
+    rec2020_to_rec709_cpu,
+    rec709_to_rec2020_cpu,
+    sota_hdr_expand_cpu,
+    sota_hdr_map_nits_cpu,
+    sota_hdr_metadata_words,
+    sota_hdr_scrgb_shader,
+    sota_hdr_tonemap_mode,
+    srgb_eotf_cpu,
+    srgb_oetf_cpu,
+)
 from flint.render.sota_camera_dirt import (
     SOTA_DIRT_H,
     SOTA_DIRT_W,
@@ -62,7 +87,9 @@ from flint.render.sota_camera_dirt import (
     sota_lens_dirt_texture_cpu,
     sota_pack_dirt_u8,
 )
+from flint.render.aaa_render_graph import AaaGpuPassTiming
 from flint.render.sota_camera_vrs import (
+    SotaVrsAuto,
     SOTA_VRS_RATE_1X1,
     SOTA_VRS_RATE_2X2,
     SOTA_VRS_RATE_4X4,
@@ -149,7 +176,8 @@ def test_spirv():
     _validate("sota_vrs_rate_shader", sota_vrs_rate_shader())
     _validate("sota_vrs_classify_shader", sota_vrs_classify_shader())
     _validate("sota_vrs_fill_shader", sota_vrs_fill_shader())
-    print("  [PASS] Suite 1: 15 sota:camera compute shaders pass SPIR-V validation")
+    _validate("sota_hdr_scrgb_shader", sota_hdr_scrgb_shader())
+    print("  [PASS] Suite 1: 16 sota:camera compute shaders pass SPIR-V validation")
 
 
 # ============================================================================
@@ -493,6 +521,16 @@ def _frame(mut ren: FlintAaaVulkanRenderer, cam: PhysicalCameraModel, sc: _Scene
     elif kind == 4:
         ren.draw_instance(sc.wall, trs(Vec3(0.0, 0.0, 4.0), Quat(), Vec3(1.0, 1.0, 1.0)))
         ren.draw_instance(sc.white_bar, trs(Vec3(0.55, 0.0, 4.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+    elif kind == 6:
+        # dot towards the frame corner (85 mm at 12 m: about 0.75 of the half diagonal)
+        ren.draw_instance(sc.wall, trs(Vec3(0.0, 0.0, 12.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        ren.draw_instance(sc.bright_dot, trs(Vec3(2.25, 1.1, 12.0 - 0.1), Quat(), Vec3(1.0, 1.0, 1.0)))
+    elif kind == 7:
+        # 9 x 5 grid of point lights filling the frame (cat's-eye swirl showcase)
+        ren.draw_instance(sc.wall, trs(Vec3(0.0, 0.0, 12.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+        for gy in range(5):
+            for gx in range(9):
+                ren.draw_instance(sc.bright_dot, trs(Vec3(Float32(gx - 4) * 0.68, Float32(gy - 2) * 0.66, 12.0 - 0.1), Quat(), Vec3(1.0, 1.0, 1.0)))
     else:
         ren.draw_instance(sc.wall, trs(Vec3(0.0, 0.0, 12.0), Quat(), Vec3(1.0, 1.0, 1.0)))
         ren.draw_instance(sc.bright_dot, trs(Vec3(0.9, 0.45, 12.0 - 0.1), Quat(), Vec3(1.0, 1.0, 1.0)))
@@ -998,6 +1036,442 @@ def test_gpu_budgets():
     print("  [PASS] Suite 3c: GPU time budgets at 1280x720 (paired with a same-frame contention probe)")
 
 
+struct _Blob(Copyable, Movable):
+    var cx: Float32
+    var cy: Float32
+    var energy: Float32
+    var sd_radial: Float32
+    var sd_tangential: Float32
+    var sd_x: Float32
+    var sd_y: Float32
+
+    def __init__(out self):
+        self.cx = 0.0
+        self.cy = 0.0
+        self.energy = 0.0
+        self.sd_radial = 0.0
+        self.sd_tangential = 0.0
+        self.sd_x = 0.0
+        self.sd_y = 0.0
+
+
+def _blob(px: List[UInt32], w: Int, h: Int, x0: Int, y0: Int, x1: Int, y1: Int) -> _Blob:
+    """Luminance moments of the bokeh blob in a window (black background). Radial = towards the frame centre."""
+    var b = _Blob()
+    var sx = Float64(0.0)
+    var sy = Float64(0.0)
+    var e = Float64(0.0)
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            var l = Float64(_luma(_lin(px[y * w + x])))
+            e += l
+            sx += l * Float64(x)
+            sy += l * Float64(y)
+    if e <= 0.0:
+        return b^
+    var mx = sx / e
+    var my = sy / e
+    var rx = mx + 0.5 - Float64(w) * 0.5
+    var ry = my + 0.5 - Float64(h) * 0.5
+    var rl = sqrt(rx * rx + ry * ry)
+    var ux = rx / rl if rl > 1.0e-6 else 1.0
+    var uy = ry / rl if rl > 1.0e-6 else 0.0
+    var srr = Float64(0.0)
+    var stt = Float64(0.0)
+    var sxx = Float64(0.0)
+    var syy = Float64(0.0)
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            var l = Float64(_luma(_lin(px[y * w + x])))
+            var dx = Float64(x) - mx
+            var dy = Float64(y) - my
+            var a = dx * ux + dy * uy
+            var t = -dx * uy + dy * ux
+            srr += l * a * a
+            stt += l * t * t
+            sxx += l * dx * dx
+            syy += l * dy * dy
+    b.cx = Float32(mx)
+    b.cy = Float32(my)
+    b.energy = Float32(e)
+    b.sd_radial = Float32(sqrt(srr / e))
+    b.sd_tangential = Float32(sqrt(stt / e))
+    b.sd_x = Float32(sqrt(sxx / e))
+    b.sd_y = Float32(sqrt(syy / e))
+    return b^
+
+
+def test_gpu_bokeh_r3():
+    """Round 3: optical vignetting of the pupil (cat's-eye bokeh, f-stop dependent), oval anamorphic bokeh,
+    near-field opacity under the clip, and the pupil-area brightness vignette."""
+    var w = 320
+    var h = 180
+    var ren = FlintAaaVulkanRenderer(width=w, height=h, tsr_scale=1.0)
+    if not ren.active:
+        print("  [SKIP] Vulkan renderer unavailable")
+        return
+    _setup(ren)
+    var sc = _Scene(ren)
+    var cam = PhysicalCameraModel(focal_length_mm=85.0, fstop=1.4, focus_distance_m=1.0, aperture_blades=0)
+    ren.sota_cam.camera = cam
+    ren.sota_cam.dof_max_radius_px = 32.0
+    ren.sota_cam.enable_dof = True
+
+    # (a) Corner highlight, round pupil vs cat's eye (front clip 0.6, rear 0.3, rim radius 1.1).
+    var off = _frame(ren, cam, sc, 6)
+    var b_off = _blob(off, w, h, 200, 0, w, 110)
+    ren.sota_cam.dof_cat_eye = 0.6
+    ren.sota_cam.dof_cat_eye_rear = 0.3
+    ren.sota_cam.dof_clip_radius = 1.1
+    var on = _frame(ren, cam, sc, 6)
+    var b_on = _blob(on, w, h, 200, 0, w, 110)
+    var clip = ren.sota_cam.pupil_clip()
+    var ip = pupil_image_pos_cpu(b_off.cx + 0.5, b_off.cy + 0.5, w, h)
+    var mom = pupil_shape_moments_cpu(ip[0], ip[1], clip)
+    var f_cpu = pupil_area_fraction_cpu(ip[0], ip[1], clip)
+    var ratio_off = b_off.sd_radial / b_off.sd_tangential
+    var ratio_on = b_on.sd_radial / b_on.sd_tangential
+    var ratio_cpu = mom[0] / mom[1]
+    print("    cat's eye at |p|=" + String(sqrt(ip[0] * ip[0] + ip[1] * ip[1])) + ": radial/tangential sd off " + String(ratio_off) + ", on " + String(ratio_on) + " (pupil model " + String(ratio_cpu) + "), tangential sd on/off " + String(b_on.sd_tangential / b_off.sd_tangential) + " (model " + String(mom[1] / 0.5) + "), energy on/off " + String(b_on.energy / b_off.energy) + " (transmitted area " + String(f_cpu) + ")")
+    _near(ratio_off, 1.0, 0.06, "round pupil: corner bokeh stays round")
+    _assert(ratio_cpu < 0.8, "pupil model clips radially at the corner")
+    _near(ratio_on, ratio_cpu, 0.08, "GPU cat's-eye bokeh matches the vignetted pupil's radial/tangential ratio")
+    _near(b_on.sd_tangential / b_off.sd_tangential, mom[1] / 0.5, 0.08, "tangential width = vignetted pupil's")
+    _near(b_on.energy / b_off.energy, f_cpu, 0.08, "cat's-eye bokeh energy = transmitted pupil area")
+
+    # CPU reference of the clipped DoF on the GPU's own sharp corner crop.
+    ren.sota_cam.enable_dof = False
+    var sharp = _frame(ren, cam, sc, 6)
+    ren.sota_cam.enable_dof = True
+    var cw = 64
+    var cx0 = min(w - cw, Int(b_off.cx) - cw // 2)
+    var cy0 = max(0, Int(b_off.cy) - cw // 2)
+    var crop = List[Vec3](length=cw * cw, fill=Vec3(0.0, 0.0, 0.0))
+    var dep = List[Float32](length=cw * cw, fill=12.0)
+    for y in range(cw):
+        for x in range(cw):
+            var c = _lin(sharp[(cy0 + y) * w + cx0 + x])
+            crop[y * cw + x] = c
+            if _luma(c) > Float32(0.02):
+                dep[y * cw + x] = 11.9
+    var k = cam.coc_infinity_radius_px(h)
+    var cpu = eval_dof_cpu(crop, dep, cw, cw, k, 1.0, 32.0, 0, clip, 1.0, w, h, cx0, cy0)
+    # The sharp 8-bit dot is clipped at 1.0 while the HDR source is 400x brighter, so after AgX the GPU
+    # bokeh saturates over the whole support (pupil disc swept by the 4 px dot) and the CPU one does not.
+    # Compare the supports: GPU pixels at > 50 % luma vs CPU pixels above 1 % of the CPU peak (IoU).
+    var c_max = Float32(0.0)
+    for i in range(cw * cw):
+        c_max = max(c_max, _luma(cpu[i]))
+    var n_and = 0
+    var n_or = 0
+    var cmp = List[UInt32](length=cw * cw * 2, fill=0)
+    for y in range(cw):
+        for x in range(cw):
+            var g_in = _luma(_lin(on[(cy0 + y) * w + cx0 + x])) > Float32(0.5)
+            var c_in = _luma(cpu[y * cw + x]) > Float32(0.01) * c_max
+            if g_in and c_in:
+                n_and += 1
+            if g_in or c_in:
+                n_or += 1
+            cmp[y * cw * 2 + x] = UInt32(0xFFFFFFFF) if g_in else UInt32(0xFF000000)
+            cmp[y * cw * 2 + cw + x] = UInt32(0xFFFFFFFF) if c_in else UInt32(0xFF000000)
+    _save("build/sota_camera_r3_cateye_support_gpu_vs_cpu.png", cmp, cw * 2, cw)
+    var iou = Float32(n_and) / Float32(max(1, n_or))
+    print("    GPU vs CPU-reference cat's-eye DoF: support IoU " + String(iou) + " (" + String(n_and) + " / " + String(n_or) + " px)")
+    _assert(iou > Float32(0.75), "GPU cat's-eye DoF support matches the CPU reference")
+
+    # (b) Two stops down (f/2.8): the aperture clears the rims, the corner bokeh is round again.
+    var cam28 = cam
+    cam28.fstop = 2.8
+    ren.sota_cam.camera = cam28
+    var st = _frame(ren, cam28, sc, 6)
+    var b_st = _blob(st, w, h, 200, 0, w, 110)
+    print("    f/2.8: radial/tangential " + String(b_st.sd_radial / b_st.sd_tangential) + ", transmitted area " + String(pupil_area_fraction_cpu(ip[0], ip[1], ren.sota_cam.pupil_clip())))
+    _near(b_st.sd_radial / b_st.sd_tangential, 1.0, 0.07, "stopped down two stops: no cat's eye")
+    ren.sota_cam.camera = cam
+
+    # (c) Oval anamorphic bokeh (squeeze 1.6) at the centre: taller than wide by the squeeze, same energy.
+    ren.sota_cam.dof_cat_eye = 0.0
+    ren.sota_cam.dof_cat_eye_rear = 0.0
+    var ro = _frame(ren, cam, sc, 1)
+    var b_ro = _blob(ro, w, h, 100, 30, 220, 150)
+    ren.sota_cam.dof_anamorphic_squeeze = 1.6
+    var ov = _frame(ren, cam, sc, 1)
+    var b_ov = _blob(ov, w, h, 100, 30, 220, 150)
+    print("    oval: sd_y/sd_x round " + String(b_ro.sd_y / b_ro.sd_x) + ", squeeze 1.6 -> " + String(b_ov.sd_y / b_ov.sd_x) + ", energy " + String(b_ov.energy / b_ro.energy))
+    _near(b_ro.sd_y / b_ro.sd_x, 1.0, 0.05, "spherical lens: round bokeh")
+    _near(b_ov.sd_y / b_ov.sd_x, 1.6, 0.12, "anamorphic squeeze 1.6: oval bokeh")
+    _near(b_ov.energy / b_ro.energy, 1.0, 0.05, "oval bokeh conserves energy")
+    ren.sota_cam.dof_anamorphic_squeeze = 1.0
+    var cat_grid_off = _frame(ren, cam, sc, 7)
+    ren.sota_cam.dof_cat_eye = 0.6
+    ren.sota_cam.dof_cat_eye_rear = 0.3
+    var cat_grid_on = _frame(ren, cam, sc, 7)
+    ren.sota_cam.dof_anamorphic_squeeze = 1.5
+    var cat_grid_oval = _frame(ren, cam, sc, 7)
+    ren.sota_cam.dof_anamorphic_squeeze = 1.0
+
+    # (d) Near field under a strong clip stays opaque (coverage renormalised by the clipped kernel area):
+    # red box at 1 m (focus 4 m) covering the left of the frame, pixels near the left frame edge.
+    var cam_n = cam
+    cam_n.focus_distance_m = 4.0
+    ren.sota_cam.camera = cam_n
+    ren.sota_cam.dof_cat_eye = 0.8
+    ren.sota_cam.dof_cat_eye_rear = 0.4
+    ren.sota_cam.enable_dof = False
+    var n_sharp = _frame(ren, cam_n, sc, 2)
+    ren.sota_cam.enable_dof = True
+    var n_on = _frame(ren, cam_n, sc, 2)
+    var worst = Float32(0.0)
+    for y in [20, 90, 160]:
+        for x in [6, 14, 24]:
+            worst = max(worst, abs(_lin(n_on[y * w + x]).x - _lin(n_sharp[y * w + x]).x) + abs(_lin(n_on[y * w + x]).y - _lin(n_sharp[y * w + x]).y))
+    print("    near field under the clip: max |defocused - sharp| inside the red box " + String(worst))
+    _assert(worst < Float32(0.06), "clipped near field stays opaque (no background showing through)")
+
+    # (e) Brightness from the same pupil: in-focus grey wall, corner / centre = transmitted area.
+    ren.sota_cam.dof_cat_eye = 0.6
+    ren.sota_cam.dof_cat_eye_rear = 0.3
+    ren.sota_cam.enable_dof = False
+    ren.sota_cam.enable_optical_vignette = True
+    ren.sota_cam.optical_vignette_from_pupil = True
+    var v_on = _frame(ren, cam_n, sc, 3)
+    ren.sota_cam.enable_optical_vignette = False
+    var v_off = _frame(ren, cam_n, sc, 3)
+    var clip_v = ren.sota_cam.pupil_clip()
+    var worst_v = Float32(0.0)
+    var worst_fast = Float32(0.0)
+    var pts_x: List[Int] = [6, 300, 160, 60, 240, 316]
+    var pts_y: List[Int] = [6, 20, 90, 150, 120, 176]
+    for i in range(len(pts_x)):
+        var gx = pts_x[i]
+        var gy = pts_y[i]
+        var ipv = pupil_image_pos_cpu(Float32(gx) + 0.5, Float32(gy) + 0.5, w, h)
+        var want = pupil_area_fraction_cpu(ipv[0], ipv[1], clip_v)
+        var fast = pupil_area_fraction_fast_cpu(ipv[0], ipv[1], clip_v)
+        var got = _luma(_lin(v_on[gy * w + gx])) / max(_luma(_lin(v_off[gy * w + gx])), Float32(1e-4))
+        worst_v = max(worst_v, abs(got - want))
+        worst_fast = max(worst_fast, abs(fast - want))
+    print("    pupil vignette: max |GPU ratio - transmitted area| " + String(worst_v) + ", 64-point estimate error " + String(worst_fast) + " (corner area " + String(pupil_area_fraction_cpu(0.87, 0.49, clip_v)) + ")")
+    _assert(worst_fast < Float32(0.03), "64-point pupil estimate matches the exact area")
+    _assert(worst_v < Float32(0.04), "pupil-model vignette = transmitted pupil area")
+    ren.sota_cam.optical_vignette_from_pupil = False
+    ren.sota_cam.dof_cat_eye = 0.0
+    ren.sota_cam.dof_cat_eye_rear = 0.0
+
+    _save("build/sota_camera_r3_cateye_grid_round.png", cat_grid_off, w, h)
+    _save("build/sota_camera_r3_cateye_grid.png", cat_grid_on, w, h)
+    _save("build/sota_camera_r3_cateye_grid_oval.png", cat_grid_oval, w, h)
+    _save("build/sota_camera_r3_corner_round.png", off, w, h)
+    _save("build/sota_camera_r3_corner_cateye.png", on, w, h)
+    _save("build/sota_camera_r3_oval.png", ov, w, h)
+    _save("build/sota_camera_r3_pupil_vignette.png", v_on, w, h)
+    ren.shutdown()
+    print("  [PASS] Suite 3e: cat's-eye bokeh from the vignetted pupil (shape, energy, CPU ref, f-stop), oval bokeh, clipped near field, pupil vignette")
+
+
+def _hdr_frame(mut ren: FlintAaaVulkanRenderer, cam: PhysicalCameraModel, sc: _Scene, kind: Int, exposure: Float32) -> List[UInt32]:
+    ren.exposure = exposure
+    return _frame(ren, cam, sc, kind)
+
+
+def _pq_word_nits709(word: UInt32) -> Vec3:
+    var n2020 = pq_word_decode_nits_cpu(word)
+    var n = rec2020_to_rec709_cpu(n2020[0], n2020[1], n2020[2])
+    return Vec3(n[0], n[1], n[2])
+
+
+def _ch8(argb: UInt32, sh: Int) -> Float32:
+    return Float32(Int((argb >> UInt32(sh)) & 0xFF)) / Float32(255.0)
+
+
+def test_cpu_hdr_reference():
+    var hdr = SotaHdrOutput()
+    # PQ anchors of ST.2084 (100 nits ~ 0.508, 1000 nits ~ 0.752, 10000 nits = 1) and the round trip.
+    _near(pq_oetf_cpu(100.0), 0.5081, 0.001, "PQ(100 nits)")
+    _near(pq_oetf_cpu(1000.0), 0.7518, 0.001, "PQ(1000 nits)")
+    _near(pq_oetf_cpu(10000.0), 1.0, 1.0e-5, "PQ(10000 nits)")
+    var worst = Float32(0.0)
+    for i in range(1, 200):
+        var nits = Float32(i) * Float32(i) * Float32(0.25)
+        worst = max(worst, abs(pq_eotf_cpu(pq_oetf_cpu(nits)) - nits) / nits)
+    _assert(worst < Float32(1.0e-3), "PQ EOTF inverts the OETF (rel " + String(worst) + ")")
+    # Expansion: identity below the knee, C1 at the knee, E(1) = P, monotonic, identity for P = 1.
+    var p = hdr.peak_ratio()
+    var k = hdr.knee_clamped()
+    _near(sota_hdr_expand_cpu(k * 0.5, p, k), k * 0.5, 1.0e-6, "identity below the knee")
+    _near(sota_hdr_expand_cpu(1.0, p, k), p, 1.0e-4, "AgX white maps to the peak")
+    _near(sota_hdr_expand_cpu(0.9, 1.0, k), 0.9, 1.0e-6, "P = 1 is the identity")
+    var d_lo = (sota_hdr_expand_cpu(k, p, k) - sota_hdr_expand_cpu(k - 1.0e-3, p, k)) / Float32(1.0e-3)
+    var d_hi = (sota_hdr_expand_cpu(k + 1.0e-3, p, k) - sota_hdr_expand_cpu(k, p, k)) / Float32(1.0e-3)
+    _near(d_hi, d_lo, 0.05, "C1 at the knee")
+    var prev = Float32(-1.0)
+    var mono = True
+    for i in range(101):
+        var e = sota_hdr_expand_cpu(Float32(i) * Float32(0.01), p, k)
+        mono = mono and e >= prev
+        prev = e
+    _assert(mono, "expansion is monotonic")
+    # SDR white -> peak, midtones at the paper white scale, channel ratios kept.
+    var white = sota_hdr_map_nits_cpu(1.0, 1.0, 1.0, hdr)
+    _near(white[0], hdr.peak_nits, 0.5, "AgX white -> peak nits")
+    var mid = sota_hdr_map_nits_cpu(0.5, 0.25, 0.1, hdr)
+    _near(mid[0], srgb_eotf_cpu(0.5) * hdr.paper_white_nits, 0.01, "midtones at paper white scale")
+    var hi = sota_hdr_map_nits_cpu(0.95, 0.6, 0.3, hdr)
+    _near(hi[1] / hi[0], srgb_eotf_cpu(0.6) / srgb_eotf_cpu(0.95), 1.0e-4, "highlight expansion keeps channel ratios")
+    # Gamut round trip and the metadata payload.
+    var rt = rec709_to_rec2020_cpu(0.2, 0.5, 0.9)
+    var back = rec2020_to_rec709_cpu(rt[0], rt[1], rt[2])
+    _near(back[2], 0.9, 1.0e-3, "Rec.709 <-> Rec.2020 round trip")
+    var meta = sota_hdr_metadata_words(hdr)
+    _assert(len(meta) == 12, "metadata payload has 12 floats")
+    _near(bitcast[DType.float32](meta[8]), hdr.peak_nits, 0.01, "metadata max luminance = peak")
+    _near(bitcast[DType.float32](meta[11]), hdr.paper_white_nits, 0.01, "metadata MaxFALL = paper white")
+    # Mode resolution: only HDR10 / scRGB outputs are mapped; SDR stays SDR (clean fallback).
+    _assert(sota_hdr_tonemap_mode(hdr, 1, 1) == 1, "disabled: legacy HDR10 path unchanged")
+    hdr.enable = True
+    _assert(sota_hdr_tonemap_mode(hdr, 1, 1) == SOTA_DISPLAY_AGX_HDR, "HDR10 output -> AgX + display mapping")
+    _assert(sota_hdr_tonemap_mode(hdr, 3, 2) == SOTA_DISPLAY_AGX_HDR, "scRGB output -> AgX + display mapping")
+    _assert(sota_hdr_tonemap_mode(hdr, 0, 0) == 0, "SDR output -> SDR AgX (fallback)")
+    print("  [PASS] Suite 2f: HDR display mapping CPU reference (ST.2084, highlight expansion, gamut, metadata, mode fallback)")
+
+
+def test_gpu_hdr_output():
+    """Round 3: HDR10 PQ and scRGB output as a display mapping after AgX (headless: the PQ / fp16 words are
+    read back), plus the SDR fallback and the UI paper white."""
+    var w = 320
+    var h = 180
+    var ren = FlintAaaVulkanRenderer(width=w, height=h, tsr_scale=1.0)
+    if not ren.active:
+        print("  [SKIP] Vulkan renderer unavailable")
+        return
+    _setup(ren)
+    var sc = _Scene(ren)
+    var cam = PhysicalCameraModel(focal_length_mm=50.0, fstop=8.0, focus_distance_m=4.0)
+    ren.sota_cam.camera = cam
+    print("    device: VK_EXT_swapchain_colorspace " + String(ren.vk.has_swapchain_colorspace) + ", VK_EXT_hdr_metadata " + String(ren.vk.has_hdr_metadata) + " (headless: no swapchain, metadata not sent)")
+    var exposures = List[Float32]()
+    exposures.append(0.5)
+    exposures.append(4.0)
+    exposures.append(32.0)
+    var kinds = List[Int]()
+    kinds.append(0)
+    kinds.append(0)
+    kinds.append(6)
+    var max_code_err = 0
+    var sum_code_err = Float64(0.0)
+    var n_px = 0
+    var worst_rel = Float32(0.0)
+    var sum_rel = Float64(0.0)
+    var n_rel = 0
+    var below_knee_same = True
+    var max_nits = Float32(0.0)
+    var sdr_same = True
+    var scrgb_words_same = True
+    var scrgb_worst = Float32(0.0)
+    var last_sdr = List[UInt32]()
+    var last_hdr = List[UInt32]()
+    for ci in range(len(exposures)):
+        var ex = exposures[ci]
+        var kind = kinds[ci]
+        ren.display_mode = AAA_DISPLAY_AGX_REC709
+        ren.sota_cam.hdr.enable = False
+        var sdr = _hdr_frame(ren, cam, sc, kind, ex)
+        # SDR fallback: enabling HDR on an SDR output changes nothing.
+        ren.sota_cam.hdr.enable = True
+        var sdr_on = _hdr_frame(ren, cam, sc, kind, ex)
+        for i in range(len(sdr)):
+            if sdr[i] != sdr_on[i]:
+                sdr_same = False
+        # HDR10 at peak = paper white: the PQ image is the SDR image at paper white.
+        ren.display_mode = AAA_DISPLAY_HDR10_PQ
+        ren.sota_cam.hdr.peak_nits = ren.sota_cam.hdr.paper_white_nits
+        var flat = _hdr_frame(ren, cam, sc, kind, ex)
+        ren.sota_cam.hdr.peak_nits = 1000.0
+        var pq = _hdr_frame(ren, cam, sc, kind, ex)
+        # scRGB: same mapping, fp16 linear Rec.709 at 80 nits per unit.
+        ren.display_mode = AAA_DISPLAY_SCRGB_FP16
+        var sc_ldr = _hdr_frame(ren, cam, sc, kind, ex)
+        var sc_words = ren.readback_scrgb_rgba16f_words()
+        var hdr = ren.sota_cam.hdr
+        var knee_lin = hdr.knee_clamped()
+        for i in range(len(sdr)):
+            var a = sdr[i]
+            var f = _pq_word_nits709(flat[i])
+            for c in range(3):
+                var sh = 16 - 8 * c
+                var nits_c = f.x if c == 0 else (f.y if c == 1 else f.z)
+                var code = Int(srgb_oetf_cpu(nits_c / hdr.paper_white_nits) * Float32(255.0) + Float32(0.5))
+                var err = abs(code - Int((a >> UInt32(sh)) & 0xFF))
+                max_code_err = max(max_code_err, err)
+                sum_code_err += Float64(err)
+            n_px += 1
+            var rf = sota_hdr_map_nits_cpu(_ch8(a, 16), _ch8(a, 8), _ch8(a, 0), hdr)
+            var g = _pq_word_nits709(pq[i])
+            var m_lin = max(srgb_eotf_cpu(_ch8(a, 16)), max(srgb_eotf_cpu(_ch8(a, 8)), srgb_eotf_cpu(_ch8(a, 0))))
+            var ref_m = max(rf[0], max(rf[1], rf[2]))
+            var g_m = max(g.x, max(g.y, g.z))
+            max_nits = max(max_nits, g_m)
+            if ref_m > Float32(2.0):
+                var rel = abs(g_m - ref_m) / ref_m
+                worst_rel = max(worst_rel, rel)
+                sum_rel += Float64(rel)
+                n_rel += 1
+            if m_lin < knee_lin * Float32(0.95) and pq[i] != flat[i]:
+                below_knee_same = False
+            if sc_ldr[i] != pq[i]:
+                scrgb_words_same = False
+            var s_r = f16_to_f32_cpu(sc_words[i * 2] & 0xFFFF) * Float32(80.0)
+            var s_g = f16_to_f32_cpu(sc_words[i * 2] >> 16) * Float32(80.0)
+            var s_b = f16_to_f32_cpu(sc_words[i * 2 + 1] & 0xFFFF) * Float32(80.0)
+            var d = max(abs(s_r - g.x), max(abs(s_g - g.y), abs(s_b - g.z))) / max(Float32(1.0), g_m)
+            scrgb_worst = max(scrgb_worst, d)
+        last_sdr = sdr.copy()
+        last_hdr = pq.copy()
+    var mean_code = sum_code_err / Float64(max(1, n_px * 3))
+    var mean_rel = sum_rel / Float64(max(1, n_rel))
+    print("    HDR10 at peak = paper white vs SDR AgX: max " + String(max_code_err) + " 8-bit codes, mean " + String(mean_code))
+    print("    HDR10 1000 nits vs CPU mapping of the SDR frame: max rel " + String(worst_rel) + ", mean rel " + String(mean_rel) + " over " + String(n_rel) + " px; brightest " + String(max_nits) + " nits")
+    print("    scRGB fp16 vs PQ decode: max rel " + String(scrgb_worst) + ", display words equal " + String(scrgb_words_same))
+    _assert(sdr_same, "SDR output with HDR enabled is bit-identical (fallback)")
+    _assert(max_code_err <= 2 and mean_code < 0.3, "PQ at peak = paper white reproduces the SDR AgX image")
+    _assert(below_knee_same, "below the knee the 1000-nit output equals the paper-white output")
+    _assert(mean_rel < 0.02 and worst_rel < 0.12, "GPU HDR mapping matches the CPU reference")
+    _assert(max_nits <= Float32(1012.0) and max_nits > Float32(800.0), "highlights reach but do not exceed the peak")
+    _assert(scrgb_words_same and scrgb_worst < Float32(0.01), "scRGB output = the PQ output in linear Rec.709 / 80 nits")
+
+    # UI at the chosen paper white: a white UI rect decodes to paper white nits.
+    ren.display_mode = AAA_DISPLAY_HDR10_PQ
+    ren.sota_cam.hdr.paper_white_nits = 300.0
+    ren.exposure = 1.0
+    ren.begin_frame(cam_pos=Vec3(0.0, 0.0, 0.0), cam_target=Vec3(0.0, 0.0, 1.0), fov_y_deg=cam.fov_y_deg(), near_z=0.05)
+    ren.draw_instance(sc.grey_wall, trs(Vec3(0.0, 0.0, 4.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+    _ = ren.ui_draw_list.add_rect(8.0, 8.0, 24.0, 24.0, 0xFFFFFFFF)
+    _assert(ren.render_frame(capture_readback=True), "rendered UI frame")
+    var ui = ren.readback_pixels()
+    var ui_n = _pq_word_nits709(ui[20 * w + 20])
+    print("    UI white at paper white 300: " + String(ui_n.y) + " nits")
+    _near(ui_n.y, 300.0, 9.0, "UI composites at the configured paper white")
+    ren.sota_cam.hdr.paper_white_nits = 203.0
+
+    # False-colour PNG of the last HDR frame (log10 nits, 1..1000) next to its SDR frame.
+    var fc = List[UInt32](length=w * h * 2, fill=0)
+    for y in range(h):
+        for x in range(w):
+            fc[y * w * 2 + x] = last_sdr[y * w + x]
+            var n = _pq_word_nits709(last_hdr[y * w + x])
+            var lg = Float32(log10(Float64(max(Float32(1.0), max(n.x, max(n.y, n.z))))))
+            var t = max(Float32(0.0), min(Float32(1.0), lg / Float32(3.0)))
+            var r8 = UInt32(Int(min(Float32(255.0), t * Float32(2.0) * Float32(255.0))))
+            var g8 = UInt32(Int(max(Float32(0.0), min(Float32(255.0), (t * Float32(2.0) - Float32(0.5)) * Float32(255.0)))))
+            var b8 = UInt32(Int(max(Float32(0.0), min(Float32(255.0), (t * Float32(2.0) - Float32(1.0)) * Float32(255.0)))))
+            fc[y * w * 2 + w + x] = 0xFF000000 | (r8 << 16) | (g8 << 8) | b8
+    _save("build/sota_camera_r3_hdr_sdr_vs_nits.png", fc, w * 2, h)
+    ren.display_mode = AAA_DISPLAY_LINEAR_SRGB
+    ren.sota_cam.hdr.enable = False
+    print("  [PASS] Suite 3f: HDR10 PQ / scRGB display mapping after AgX (CPU ref, paper white = SDR, knee identity, peak, UI paper white, SDR fallback)")
+
+
 def _read_post_word(ren: FlintAaaVulkanRenderer, word: Int) -> UInt32:
     var out = List[UInt32](length=1, fill=0)
     _ = external_call["memcpy", Int](Int(out.unsafe_ptr()), ren.buf_post_scratch.cpu_address + word * 4, 4)
@@ -1028,7 +1502,11 @@ def test_gpu_vrs():
     var cam = PhysicalCameraModel(focal_length_mm=35.0, fstop=8.0, focus_distance_m=4.0)
     var lay = SotaVrsLayout(ren.render_w, ren.render_h, max(ren.output_w * ren.output_h, ren.render_w * ren.render_h))
     var n_px = ren.render_w * ren.render_h
-    for kind in [3, 0]:
+    ren.sota_cam.vrs_auto = False  # functional checks: VRS every frame (the auto gate is tested below)
+    for ci in range(4):
+        var kind = 3 if (ci & 1) == 0 else 0
+        ren.sota_cam.vrs_rate_from_display = ci < 2
+        var src_name = String("display-word rate map") if ci < 2 else String("HDR rate map")
         ren.sota_cam.enable_vrs = False
         var full = List[UInt32]()
         for _ in range(3):
@@ -1045,7 +1523,7 @@ def test_gpu_vrs():
         var frac_rate = vrs_shaded_fraction(rates)
         var frac = Float32(shaded) / Float32(n_px)
         var q = _psnr(full, on)
-        print("    VRS " + ("flat wall" if kind == 3 else "stripes") + ": shaded " + String(frac) + " of pixels (rate map " + String(frac_rate) + "), PSNR vs full rate " + String(q) + " dB")
+        print("    VRS " + src_name + ", " + ("flat wall" if kind == 3 else "stripes") + ": shaded " + String(frac) + " of pixels (rate map " + String(frac_rate) + "), PSNR vs full rate " + String(q) + " dB")
         _assert(shaded > 0 and shaded <= n_px, "shade-list count in range")
         _assert(frac >= frac_rate - Float32(0.01), "classify never shades fewer pixels than the rate map allows")
         _assert(q > 45.0, "VRS output matches full-rate shading (PSNR > 45 dB)")
@@ -1053,12 +1531,67 @@ def test_gpu_vrs():
             _assert(frac < 0.15, "flat wall shades mostly at 4x4 (< 15 % of pixels)")
         else:
             _assert(frac > 0.15 and frac < 0.9, "stripes keep full rate on the edges only")
-        if kind == 0:
+        if kind == 0 and ci < 2:
             _save("build/sota_camera_vrs_stripes.png", on, w, h)
     ren.sota_cam.enable_vrs = False
     _assert(not ren.sota_cam.vrs_active(ren.render_w, ren.render_h), "VRS off by setting")
+
+    # Measured auto gate: the controller only engages while full-rate shading costs more than VRS shading +
+    # classify + fill + rate map. CPU-side state machine on synthetic timings first, then live on the GPU.
+    var ctl = SotaVrsAuto()
+    ctl.probe_interval = 8
+    var t_full = List[AaaGpuPassTiming]()
+    t_full.append(AaaGpuPassTiming(String("DeferredMultiLobeRtShade"), 0, 1.0))
+    var t_cheap = List[AaaGpuPassTiming]()  # VRS frame that saves 0.6 ms of shading for 0.3 ms overhead
+    t_cheap.append(AaaGpuPassTiming(String("DeferredMultiLobeRtShade"), 0, 0.4))
+    t_cheap.append(AaaGpuPassTiming(String("SotaVrsClassify"), 0, 0.05))
+    t_cheap.append(AaaGpuPassTiming(String("SotaVrsFill"), 0, 0.2))
+    t_cheap.append(AaaGpuPassTiming(String("SotaVrsRateMap"), 0, 0.05))
+    var t_loss = List[AaaGpuPassTiming]()  # VRS frame whose overhead exceeds the saving
+    t_loss.append(AaaGpuPassTiming(String("DeferredMultiLobeRtShade"), 0, 0.9))
+    t_loss.append(AaaGpuPassTiming(String("SotaVrsClassify"), 0, 0.05))
+    t_loss.append(AaaGpuPassTiming(String("SotaVrsFill"), 0, 0.2))
+    t_loss.append(AaaGpuPassTiming(String("SotaVrsRateMap"), 0, 0.05))
+    var n_on = 0
+    for f in range(32):
+        ctl.observe(t_cheap if ctl.this_frame_vrs and f > 0 else t_full)
+        if ctl.this_frame_vrs:
+            n_on += 1
+    _assert(ctl.engaged and n_on >= 24, "auto gate engages when VRS saves time (" + String(n_on) + "/32 VRS frames)")
+    var n_on2 = 0
+    for _ in range(32):
+        ctl.observe(t_loss if ctl.this_frame_vrs else t_full)
+        if ctl.this_frame_vrs:
+            n_on2 += 1
+    _assert(not ctl.engaged and n_on2 <= 8, "auto gate disengages when VRS costs time (" + String(n_on2) + "/32 VRS frames)")
+    var n_on3 = 0
+    for _ in range(48):
+        ctl.observe(t_cheap if ctl.this_frame_vrs else t_full)
+        if ctl.this_frame_vrs:
+            n_on3 += 1
+    _assert(ctl.engaged, "auto gate re-engages through its probe frames once VRS pays again")
+    print("    auto gate: engaged with gain (" + String(n_on) + "/32), off with loss (" + String(n_on2) + "/32 probe frames), re-engaged (" + String(n_on3) + "/48)")
+    # Live: unlit flat wall (shading costs next to nothing): the measured gate must settle, and every frame it
+    # renders must stay identical to full rate.
+    ren.sota_cam.vrs_auto = True
+    ren.sota_cam.vrs_rate_from_display = True
+    ren.sota_cam.enable_vrs = True
+    ren.sota_cam.vrs_ctl.probe_interval = 8
+    var n_live = 0
+    var full_live = _frame(ren, cam, sc, 3)
+    var worst = Float64(200.0)
+    for _ in range(24):
+        var px = _frame(ren, cam, sc, 3)
+        worst = min(worst, _psnr(full_live, px))
+        for t in ren.get_gpu_pass_timings():
+            if t.pass_name == "SotaVrsClassify":
+                n_live += 1
+    print("    live auto gate on the unlit wall: " + String(n_live) + "/24 VRS frames, full-rate avg " + String(ren.sota_cam.vrs_ctl.ema_full_ms) + " ms, VRS avg " + String(ren.sota_cam.vrs_ctl.ema_vrs_ms) + " ms, engaged " + String(ren.sota_cam.vrs_ctl.engaged) + ", worst PSNR " + String(worst))
+    _assert(ren.sota_cam.vrs_ctl.samples_full > 0 and ren.sota_cam.vrs_ctl.samples_vrs > 0, "live gate sampled both modes")
+    _assert(worst > 45.0, "frames under the auto gate match full rate")
+    ren.sota_cam.enable_vrs = False
     ren.shutdown()
-    print("  [PASS] Suite 3d: compute VRS (rate map, compaction, fill): flat wall coarse, edges full rate, PSNR")
+    print("  [PASS] Suite 3d: compute VRS (display / HDR rate maps, compaction, coalesced fill, measured auto gate)")
 
 
 def main():
@@ -1069,8 +1602,11 @@ def main():
     test_cpu_vrs_reference()
     test_cpu_dirt_texture()
     test_cpu_dof_reference()
+    test_cpu_hdr_reference()
     test_gpu_dof()
+    test_gpu_bokeh_r3()
     test_gpu_lens_and_exposure()
     test_gpu_vrs()
+    test_gpu_hdr_output()
     test_gpu_budgets()
     print("=== ALL sota:camera TESTS PASSED ===")

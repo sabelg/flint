@@ -36,6 +36,7 @@ from flint.render.aaa_visbuffer import (
     BIND_AAA_POST_SCRATCH,
 )
 from flint.render.aaa_oit_volumetrics import AAA_OIT_REACTIVE_BASE_WORDS
+from flint.render.sota_camera_hdr import sota_hdr_emit_tonemap_hdr  # --- sota:camera hook ---
 
 comptime AAA_DISPLAY_AGX_REC709: UInt32 = 0
 comptime AAA_DISPLAY_HDR10_PQ: UInt32 = 1
@@ -1635,6 +1636,9 @@ def aaa_display_tonemap_shader() -> List[UInt32]:
     var ug = s.umin(s.uint(255), s.saturate_uint(s.fma(s.load_f(dg), s.float(255.0), s.float(0.5))))
     var ub = s.umin(s.uint(255), s.saturate_uint(s.fma(s.load_f(db), s.float(255.0), s.float(0.5))))
     s.store(packed_px, s.bit_or(s.uint(0xFF000000), s.bit_or(s.shl(ur, s.uint(16)), s.bit_or(s.shl(ug, s.uint(8)), ub))))
+    # --- sota:camera hook (HDR10 PQ / scRGB display mapping after AgX, Push[10..12]) ---
+    sota_hdr_emit_tonemap_hdr(s, disp_mode, s.load_f(dr), s.load_f(dg), s.load_f(db), packed_px)
+    # --- end sota:camera hook ---
     s.end_if()
 
     s.store_word(b_hist, s.iadd(out_ldr_off, dst_pix), s.load_u(packed_px))

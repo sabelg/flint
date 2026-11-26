@@ -29,6 +29,7 @@ from flint.ui.draw_list import (
     UI_FLAG_DROP_SHADOW,
     UI_FLAG_VERT_GRADIENT,
 )
+from flint.render.sota_camera_hdr import sota_hdr_emit_ui_paper_white  # --- sota:camera hook ---
 from flint.render.spirv import (
     AaaSpirvModule,
     MODEL_GL_COMPUTE,
@@ -259,7 +260,7 @@ def _emit_ui_srgb_to_working(
     var lr = _emit_srgb_eotf(s, sr)
     var lg = _emit_srgb_eotf(s, sg)
     var lb = _emit_srgb_eotf(s, sb)
-    var pw = s.float(2.03)  # ITU-R BT.2408 203 nits reference UI paper-white
+    var pw = sota_hdr_emit_ui_paper_white(s)  # --- sota:camera hook (Push[6] paper white, 0 = 203 nits) ---
     var r2020 = s.fmul(pw, s.fma(lr, s.float(0.627404), s.fma(lg, s.float(0.329283), s.fmul(lb, s.float(0.043313)))))
     var g2020 = s.fmul(pw, s.fma(lr, s.float(0.069097), s.fma(lg, s.float(0.919540), s.fmul(lb, s.float(0.011362)))))
     var b2020 = s.fmul(pw, s.fma(lr, s.float(0.016391), s.fma(lg, s.float(0.088013), s.fmul(lb, s.float(0.895595)))))
