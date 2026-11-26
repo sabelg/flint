@@ -19,7 +19,7 @@ from std.collections import List
 from std.math import abs, isfinite, max, min
 from flint.core.math import Vec3
 from flint.studio.agent_bus import AgentTelemetryBus
-from flint.ui.context import UiContext, format_float2, hash_ui_id, pack_rgba8
+from flint.ui.context import UiContext, format_float2, hash_ui_id, pack_rgba8, utf8_drop_last_char
 from flint.ui.draw_list import (
     UI_FLAG_BORDER,
     UI_FLAG_DASHED_FLOW,
@@ -897,8 +897,7 @@ def draw_outliner_panel_v2(
             ui.focused_id = 0
             ui._focused_text_id = 0
         elif ui.key_bs_pressed and state.search_query.byte_length() > 0:
-            var bl = state.search_query.byte_length()
-            var next_q = String(state.search_query[byte=0 : bl - 1])
+            var next_q = utf8_drop_last_char(state.search_query)
             state.search_query = next_q
         elif ui.text_utf8.byte_length() > 0 and not ui.key_ctrl:
             state.search_query += ui.text_utf8
@@ -1238,7 +1237,7 @@ def draw_inspector_panel_v2(
             ui.focused_id = 0
             ui._focused_text_id = 0
         elif ui.key_bs_pressed and edit_name.byte_length() > 0:
-            var next_n = String(edit_name[byte=0 : edit_name.byte_length() - 1])
+            var next_n = utf8_drop_last_char(edit_name)
             edit_name = next_n
             act.changed_name = True
             act.new_name = edit_name

@@ -98,6 +98,7 @@ from flint.app.engine_app import (
 from flint.app.window_plugin import WindowPlugin, WindowStateResource
 from flint.core.log import state_directory
 from flint.assets.checkpoint import pack_checkpoint_lz4, unpack_checkpoint_lz4
+from flint.core.lz4 import lz4_pack, lz4_packed_raw_size, lz4_unpack
 from flint.assets.flpk_v3 import (
     ASSET_KIND_AUDIO,
     ASSET_KIND_MESH,
@@ -182,6 +183,7 @@ from flint.platform.os import (
     read_bytes,
     real_path,
     run_process_redirected,
+    unix_time_sec,
     write_bytes,
 )
 from flint.procedural.arch_kit import (
@@ -266,7 +268,9 @@ from flint.studio.agent_bus import (
     APPROVAL_AUTO,
     APPROVAL_EDITS,
     APPROVAL_SRC_MCP_TOOL,
+    GHOST_TRANSFORM,
     APPROVAL_STEP,
+    ROLE_EXTERNAL_MCP,
     ROLE_GAMEPLAY_CODER,
     ROLE_LOOKDEV_ARTIST,
     ROLE_QA_PLAYTESTER,
@@ -309,6 +313,7 @@ from flint.studio.code_drawer import (
     CODE_ACT_ACCEPT_HUNK,
     CODE_ACT_ASK_AGENT_FIX,
     CODE_ACT_BUILD_HOT_RELOAD,
+    CODE_ACT_CLOSE_TAB,
     CODE_ACT_JUMP_DIAGNOSTIC,
     CODE_ACT_OPEN_EXTERNAL_IDE,
     CODE_ACT_REJECT_ALL_DIFF,
@@ -316,11 +321,13 @@ from flint.studio.code_drawer import (
     CODE_MODE_DIFF_UNIFIED,
     CodeDrawer,
 )
+from flint.studio.viewport_transform import ViewportTransform
 from flint.studio.gizmo import (
     GIZMO_AXIS_NONE,
     GIZMO_MODE_ROTATE,
     GIZMO_MODE_SCALE,
     GIZMO_MODE_TRANSLATE,
+    GIZMO_TARGET_PX,
     GIZMO_SPACE_LOCAL,
     GIZMO_SPACE_WORLD,
     ViewportRay,
@@ -389,6 +396,7 @@ from flint.studio.palette_registry import (
     PAL_CMD_PIE_STOP,
     PAL_CMD_REDO,
     PAL_CMD_RELOAD_SCENE,
+    PAL_CMD_RECOVER_AUTOSAVE,
     PAL_CMD_RENAME,
     PAL_CMD_RESCAN_ASSETS,
     PAL_CMD_RESET_CAMERA,
@@ -520,6 +528,7 @@ from flint.studio.viewport_hud import (
 )
 from flint.ui.animator import UI_ANIM_INSTANT, UI_ANIM_NORMAL, UI_ANIM_REDUCED
 from flint.ui.context import (
+    utf8_drop_last_char,
     UI_KEY_BACKSPACE,
     UI_KEY_DOWN,
     UI_KEY_ENTER,
@@ -942,6 +951,59 @@ struct StudioStyleComponent(SerializableComponent, ImplicitlyCopyable):
         s.clearcoat = Float32(doc.number(doc.object_get(node, "clearcoat"), Float64(s.clearcoat)))
         s.clearcoat_roughness = Float32(doc.number(doc.object_get(node, "clearcoat_roughness"), Float64(s.clearcoat_roughness)))
         return s
+
+
+struct StudioEditorIdComponent(SerializableComponent, ImplicitlyCopyable):
+    """Stable editor identity for an entity (`editor_id`), saved with the scene and with undo blobs.
+
+    ECS slot indices are reused after a despawn, so a slot remembered by a deferred action (an agent
+    approval, an MCP client, a pending inspector edit) can silently point at a different entity later.
+    `editor_id` is never reused within a scene: references hold it (see `EntityRef`) and resolve it
+    back to the current slot through `FlintStudioState.slot_for_editor_id`."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.studio.StudioEditorIdComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "StudioEditorIdComponent"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("SEID")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var editor_id: UInt64
+
+    def __init__(out self, editor_id: UInt64 = 0):
+        self.editor_id = editor_id
+
+    def write_bin(self, mut out: BlobWriter):
+        out.u64(self.editor_id)
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        var v = reader.u64()
+        if reader.failed:
+            raise Error("Truncated StudioEditorIdComponent")
+        return Self(v)
+
+    def write_json(self) -> String:
+        return "{\"editor_id\": " + String(self.editor_id) + "}"
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        return Self(doc.u64(doc.object_get(node, "editor_id"), 0))
+
+
+@fieldwise_init
+struct EntityRef(Copyable, ImplicitlyCopyable, Movable):
+    """A reference to an entity that survives slot reuse: the stable `editor_id` plus the slot and
+    generation it had when the reference was taken (a fast path, re-checked on resolve)."""
+    var editor_id: UInt64
+    var slot: Int
+    var generation: UInt32
+
+    @staticmethod
+    def null() -> Self:
+        return Self(UInt64(0), -1, UInt32(0))
+
+    @always_inline
+    def is_null(self) -> Bool:
+        return self.editor_id == 0 and self.slot < 0
 
 
 struct StudioEntityView(Copyable, Movable, Inspectable):
@@ -1894,6 +1956,7 @@ def _is_internal_structural_component(name: String) -> Bool:
         or name == "Children"
         or name == "HierarchyDepth"
         or name == "StudioEntityMetaComponent"
+        or name == "StudioEditorIdComponent"
         or name == "UnknownComponentsComponent"
     )
 
@@ -2050,6 +2113,7 @@ struct FlintStudioState(Movable):
     var input_map: InputMap
     var cam_target: Vec3
     var ui_edit_seq: UInt64
+    var _edit_focus_id: UInt64
     var menu: scene_menu.SceneMenu
     var source_editor: EmbeddedIde
     var scene_file_path: String
@@ -2062,7 +2126,25 @@ struct FlintStudioState(Movable):
     var dirty: Bool
     var quit_requested: Bool
     var confirm_modal_open: Bool
-    var confirm_modal_action: Int  # 0=none, 1=quit, 2=new_scene
+    var confirm_modal_action: Int  # 0=none, 1=quit, 2=new_scene, 3=load_scene (`pending_load_path`)
+    var pending_load_path: String
+    var next_editor_id: UInt64
+    var autosave_interval_sec: Float32
+    """Seconds of dirty editing between autosaves (0 disables)."""
+    var _autosave_accum_sec: Float32
+    var last_autosave_path: String
+    var editor_id_slots: Dict[UInt64, Int]
+    var mcp_grant_once: List[String]
+    var mcp_grant_once_client: List[Int]
+    """MCP connection each `mcp_grant_once` entry is for (0 = in-process / stdio)."""
+    var mcp_client_agents: Dict[Int, UInt32]
+    """MCP connection key -> its own agent session in the Agents panel."""
+    var flmat_pending_path: String
+    """Disk path of a .flmat whose Inspector text fields are being edited; saved once on blur, not per keystroke."""
+    var flmat_pending: FlmatAsset
+    var flmat_pending_eid: Int
+    var flmat_pending_ref: String
+    """Tool names approved in the Agents panel; the host drains them into `McpServerV2.allow_tool_once`."""
     var toasts: List[StudioToast]
     var clipboard_entity_ids: List[Int]
     var show_navmesh_overlay: Bool
@@ -2152,6 +2234,7 @@ struct FlintStudioState(Movable):
         register_ai_codecs(self.registry)
         self.registry.register[StudioEntityMetaComponent]()
         self.registry.register[StudioStyleComponent]()
+        self.registry.register[StudioEditorIdComponent]()
         self.registry.ensure_registered_in_world(self.app.world)
         self.app.startup()
         var asset_pre_sid = -1
@@ -2267,6 +2350,7 @@ struct FlintStudioState(Movable):
         self.input_map = _create_studio_input_map()
         self.cam_target = Vec3(0.0, 0.9, 1.0)
         self.ui_edit_seq = UInt64(50000)
+        self._edit_focus_id = UInt64(0)
         self.source_editor = EmbeddedIde()
         self.menu = scene_menu.SceneMenu(project_root)
         self.project_root = project_root
@@ -2279,6 +2363,19 @@ struct FlintStudioState(Movable):
         self.quit_requested = False
         self.confirm_modal_open = False
         self.confirm_modal_action = 0
+        self.pending_load_path = String("")
+        self.next_editor_id = UInt64(1)
+        self.autosave_interval_sec = Float32(120.0)
+        self._autosave_accum_sec = Float32(0.0)
+        self.last_autosave_path = String("")
+        self.editor_id_slots = Dict[UInt64, Int]()
+        self.mcp_grant_once = List[String]()
+        self.mcp_grant_once_client = List[Int]()
+        self.mcp_client_agents = Dict[Int, UInt32]()
+        self.flmat_pending_path = String("")
+        self.flmat_pending = FlmatAsset()
+        self.flmat_pending_eid = -1
+        self.flmat_pending_ref = String("")
         self.toasts = List[StudioToast]()
         self.clipboard_entity_ids = List[Int]()
         self.show_navmesh_overlay = True
@@ -2433,7 +2530,79 @@ struct FlintStudioState(Movable):
         self._ground_body_id = -1
         self._sync_ecs_and_physics()
 
+    def _ensure_editor_ids(mut self):
+        """Gives every live entity a unique `editor_id` and rebuilds the id -> slot map. Entities from
+        older scenes get fresh ids; a duplicated id (copied components) is reassigned on the later slot."""
+        var seen = Dict[UInt64, Int]()
+        var max_id = UInt64(0)
+        var missing = List[Int]()
+        for i in range(len(self.app.world.entities)):
+            if not self.app.world.entities[i].alive:
+                continue
+            var e = Entity(UInt32(i), self.app.world.entities[i].generation)
+            var id_opt = self.app.world.get_ptr[StudioEditorIdComponent](e)
+            if not id_opt:
+                missing.append(i)
+                continue
+            var eid_v = id_opt.value()[unsafe_offset=0].editor_id
+            if eid_v == 0 or eid_v in seen:
+                missing.append(i)
+                continue
+            seen[eid_v] = i
+            if eid_v > max_id:
+                max_id = eid_v
+        if self.next_editor_id <= max_id:
+            self.next_editor_id = max_id + 1
+        for mi in range(len(missing)):
+            var slot = missing[mi]
+            var e = Entity(UInt32(slot), self.app.world.entities[slot].generation)
+            var nid = self.next_editor_id
+            self.next_editor_id += 1
+            _ = self.app.world.insert[StudioEditorIdComponent](e, StudioEditorIdComponent(nid))
+            seen[nid] = slot
+        self.editor_id_slots = seen^
+
+    def editor_id_of(self, entity_id: Int) -> UInt64:
+        """Stable `editor_id` of a live slot, or 0."""
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return UInt64(0)
+        var id_opt = self.app.world.get_ptr[StudioEditorIdComponent](e)
+        if not id_opt:
+            return UInt64(0)
+        return id_opt.value()[unsafe_offset=0].editor_id
+
+    def slot_for_editor_id(self, editor_id: UInt64) -> Int:
+        """Current slot of the entity with this `editor_id`, or -1 when it no longer exists."""
+        if editor_id == 0:
+            return -1
+        var slot = self.editor_id_slots.get(editor_id, -1)
+        if slot >= 0 and self.editor_id_of(slot) == editor_id:
+            return slot
+        # Map is stale (restore/load since the last sync): scan once.
+        for i in range(len(self.app.world.entities)):
+            if self.app.world.entities[i].alive and self.editor_id_of(i) == editor_id:
+                return i
+        return -1
+
+    def entity_ref(self, entity_id: Int) -> EntityRef:
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return EntityRef.null()
+        return EntityRef(self.editor_id_of(entity_id), entity_id, e.generation)
+
+    def resolve_ref(self, r: EntityRef) -> Int:
+        """Slot the reference points at now, or -1. A slot that was reused by another entity never
+        resolves: the generation (and `editor_id`, when the ref has one) must still match."""
+        if r.editor_id != 0:
+            return self.slot_for_editor_id(r.editor_id)
+        var e = self.resolve_entity(r.slot)
+        if e.valid() and e.generation == r.generation:
+            return r.slot
+        return -1
+
     def _sync_compat_view(mut self):
+        self._ensure_editor_ids()
         var cap = len(self.app.world.entities)
         while len(self.entities) < cap:
             self.entities.append(StudioEntityView(len(self.entities), "Entity", alive=False))
@@ -2672,7 +2841,8 @@ struct FlintStudioState(Movable):
         if len(data) == 0:
             return False
         try:
-            var r = BlobReader(data.copy())
+            # Undo entries are stored LZ4-packed (`_pack_undo_blob`); checkpoints and captures are raw.
+            var r = BlobReader(lz4_unpack(data) if lz4_packed_raw_size(data) >= 0 else data.copy())
             self.app.world.restore_blob(r)
             if r.failed:
                 return False
@@ -2779,8 +2949,6 @@ struct FlintStudioState(Movable):
 
     @always_inline
     def effective_ui_scale(self) -> Float32:
-        if self.anim_mode == UI_ANIM_INSTANT:
-            return Float32(1.0)
         return max(Float32(0.75), min(Float32(3.0), self.ui_scale))
 
     def viewport_rect(mut self, screen_w: Int, screen_h: Int) -> RectF:
@@ -3244,7 +3412,11 @@ struct FlintStudioState(Movable):
 
     def open_command_palette(mut self, mode: Int = PALETTE_ALL, initial_query: String = ""):
         self.refresh_command_palette()
-        self.command_palette.open(mode, initial_query)
+        # `open()` defaults would reset the PIE gate set by `refresh_command_palette` and pin the
+        # frecency clock to 0 (no decay), so pass both explicitly.
+        self.command_palette.open(
+            mode, initial_query, pie_active=self.pie.mode != PIE_STOPPED, now_sec=unix_time_sec()
+        )
 
     def _snap_camera_direction(mut self, view_fwd: Vec3):
         var fwd = view_fwd.normalized()
@@ -3291,11 +3463,13 @@ struct FlintStudioState(Movable):
             self.push_toast("Scene saved" if ok else "Save failed", 0 if ok else 2, 2.5)
             return ok
         if cmd_id == PAL_CMD_LOAD_SCENE and not in_play:
-            return self.load_scene_file()
+            return self.request_load_scene()
         if cmd_id == PAL_CMD_NEW_SCENE and not in_play:
             return self.new_scene(force=False)
         if cmd_id == PAL_CMD_RELOAD_SCENE and not in_play:
-            return self.load_scene_file()
+            return self.request_load_scene()
+        if cmd_id == PAL_CMD_RECOVER_AUTOSAVE and not in_play:
+            return self.recover_autosave()
         if cmd_id == PAL_CMD_UNDO and not in_play:
             return self.undo()
         if cmd_id == PAL_CMD_REDO and not in_play:
@@ -3684,11 +3858,30 @@ struct FlintStudioState(Movable):
             if res[0]:
                 var pa = res[1].copy()
                 if pa.source == APPROVAL_SRC_MCP_TOOL:
-                    if approved and pa.ghost.entity_id >= 0 and self.is_alive_id(pa.ghost.entity_id):
-                        var cur = self.entities[pa.ghost.entity_id].copy()
+                    if approved and pa.tool_name.byte_length() > 0:
+                        # The gated call was already answered `approval_required`; let the agent's retry through.
+                        self.mcp_grant_once.append(pa.tool_name)
+                        self.mcp_grant_once_client.append(pa.mcp_client_key)
+                    # Re-resolve through the stable editor id: the slot may have been reused since queueing.
+                    var ghost_slot = (
+                        self.slot_for_editor_id(pa.ghost.editor_id) if pa.ghost.editor_id != 0 else pa.ghost.entity_id
+                    )
+                    if approved and pa.ghost.kind == GHOST_TRANSFORM and pa.ghost.entity_id >= 0 and ghost_slot < 0:
+                        self.push_toast("Approval target no longer exists", 1, 3.0)
+                    if (
+                        approved
+                        and pa.ghost.kind == GHOST_TRANSFORM
+                        and ghost_slot >= 0
+                        and self.is_alive_id(ghost_slot)
+                    ):
+                        var cur = self.entities[ghost_slot].copy()
                         var pre_raw = self._capture_world_blob()
                         cur.translation = pa.ghost.target_pos
-                        if self.commit_node_edit(pa.ghost.entity_id, cur^, "Agent: " + pa.title):
+                        var prev_origin = self._active_tx_agent_id
+                        self._active_tx_agent_id = Int(pa.agent_id)
+                        var committed = self.commit_node_edit(ghost_slot, cur^, "Agent: " + pa.title)
+                        self._active_tx_agent_id = prev_origin
+                        if committed:
                             var post_raw = self._capture_world_blob()
                             var tx_id = self.undo_stack[len(self.undo_stack) - 1].tx_id if len(self.undo_stack) > 0 else UInt64(0)
                             _ = self.record_agent_step_checkpoint(
@@ -3701,7 +3894,7 @@ struct FlintStudioState(Movable):
                                 '{"ok":true,"approved":true}',
                                 Float32(1.0),
                                 tx_id,
-                                entity_id=pa.ghost.entity_id,
+                                entity_id=ghost_slot,
                                 world_pos=pa.ghost.target_pos,
                                 has_world_pos=True,
                                 post_world_lz4=post_raw,
@@ -3759,7 +3952,16 @@ struct FlintStudioState(Movable):
                 if act.kind == PANEL_ACT_REVERT_STEP
                 else self.agent_bus.plan_revert_turn(act.agent_id, act.turn_id)
             )
-            if plan.valid:
+            var later_user_edits = self.user_edits_after_agent_steps(act.agent_id, plan.reverted_step_ids) if plan.valid else 0
+            if plan.valid and later_user_edits > 0:
+                # A revert restores a whole-world checkpoint; doing it now would silently throw away
+                # edits the user made after the agent acted. Refuse and say why instead.
+                _ = self.toast_mgr.push(
+                    TOAST_WARN,
+                    "Revert blocked",
+                    "It would discard " + String(later_user_edits) + " of your later edits. Undo those first.",
+                )
+            elif plan.valid:
                 var restored_world = False
                 if act.kind == PANEL_ACT_REVERT_STEP:
                     var cp = self.agent_checkpoints.get_step_pre_bytes(Int(act.step_id))
@@ -3793,9 +3995,82 @@ struct FlintStudioState(Movable):
                     events[i].world_pos = self.entities[eid].translation
                     events[i].has_world_pos = True
                     events[i].half_extents = self.entities[eid].collider_half_extents
-        return self.agent_runtime.drain_mcp_events(
+        var n = self.agent_runtime.drain_mcp_events(
             self.agent_bus, events, self.toast_mgr, Float64(self.ui_time_sec)
         )
+        self._stamp_approval_editor_ids()
+        return n
+
+    def user_edits_after_agent_steps(self, agent_id: UInt32, step_ids: List[UInt64]) -> Int:
+        """How many of the user's own undo entries (origin 0) come after the earliest transaction of
+        these agent steps. Those edits would be lost by a whole-world checkpoint revert."""
+        var si = self.agent_bus.find_session_index(agent_id)
+        if si < 0:
+            return 0
+        var first_tx = UInt64(0)
+        var agent_txs = List[UInt64]()
+        for k in range(len(self.agent_bus.sessions[si].steps)):
+            ref st = self.agent_bus.sessions[si].steps[k]
+            if st.tx_id == UInt64(0):
+                continue
+            agent_txs.append(st.tx_id)  # the agent's own steps are never "user edits"
+            if st.step_id not in step_ids:
+                continue
+            if first_tx == UInt64(0) or st.tx_id < first_tx:
+                first_tx = st.tx_id
+        if first_tx == UInt64(0):
+            return 0
+        var n = 0
+        for i in range(len(self.undo_stack)):
+            ref tx = self.undo_stack[i]
+            if tx.tx_id > first_tx and tx.agent_id == 0 and tx.tx_id not in agent_txs:
+                n += 1
+        return n
+
+    def begin_edit_interaction(mut self):
+        """Called by a panel when one of its fields changed. Starts a new undo step only when a new
+        interaction starts: a mouse drag is one interaction (the seq also moves on press/release), and
+        so is a typing session in one focused text field, so typing a name is one undo step, not one
+        per keystroke."""
+        if self.ui_ctx.mouse_down_l:
+            return
+        var f = self.ui_ctx.focused_id
+        if f != 0 and f == self._edit_focus_id:
+            return
+        self._edit_focus_id = f
+        self.ui_edit_seq += 1
+
+    def agent_for_mcp_client(mut self, client_key: Int, client_name: String) -> UInt32:
+        """The agent session that owns an MCP connection. The first connection adopts the Studio-launched
+        ACP agent (it is that agent calling back); every other connection gets its own session, so
+        approvals, gate policy and theatre attribution never leak between agents."""
+        var known = self.mcp_client_agents.get(client_key, UInt32(0))
+        if known != 0 and self.agent_bus.find_session_index(known) >= 0:
+            return known
+        var aid = UInt32(0)
+        var acp = self.agent_runtime.acp_agent_id
+        if acp != 0 and self.agent_bus.find_session_index(acp) >= 0:
+            var claimed = False
+            for item in self.mcp_client_agents.items():
+                if item.value == acp and item.key != client_key:
+                    claimed = True
+            if not claimed:
+                aid = acp
+        if aid == 0:
+            var nm = client_name if client_name.byte_length() > 0 and client_name != "unknown-mcp-client" else (
+                "MCP client " + String(client_key)
+            )
+            aid = self.agent_bus.create_session(ROLE_EXTERNAL_MCP, nm, APPROVAL_AUTO)
+        self.mcp_client_agents[client_key] = aid
+        return aid
+
+    def _stamp_approval_editor_ids(mut self):
+        """Pins each newly queued approval ghost to its entity's stable `editor_id`, so approving it
+        later cannot act on a different entity that reused the slot in the meantime."""
+        for i in range(len(self.agent_bus.pending_approvals)):
+            ref g = self.agent_bus.pending_approvals[i].ghost
+            if g.editor_id == 0 and g.entity_id >= 0:
+                g.editor_id = self.editor_id_of(g.entity_id)
 
     def update_follow_agent_camera(mut self, dt: Float32):
         if not self.agent_bus.should_follow_camera():
@@ -4049,6 +4324,32 @@ struct FlintStudioState(Movable):
             sync_style_opt.value()[unsafe_offset=0].known_internal_mat_epochs.clear()
             sync_style_opt.value()[unsafe_offset=0].external_mat_reload_epochs.clear()
 
+    def commit_pending_flmat_edit(mut self) -> Bool:
+        """Saves a buffered .flmat text edit (one disk write and one undo step for the whole edit)."""
+        if self.flmat_pending_path.byte_length() == 0:
+            return False
+        var path = self.flmat_pending_path
+        var ref_path = self.flmat_pending_ref
+        var eid = self.flmat_pending_eid
+        var asset = self.flmat_pending.copy()
+        self.flmat_pending_path = String("")
+        self.flmat_pending_ref = String("")
+        self.flmat_pending_eid = -1
+        _ = save_flmat_file(path, asset)
+        if eid >= 0 and self.is_alive_id(eid):
+            _ = self._assign_flmat_to_entity(eid, ref_path)
+        return True
+
+    def request_load_scene(mut self, path: String = "", force: Bool = False) -> Bool:
+        """Interactive scene load: asks Save / Discard / Cancel first when the current scene is dirty,
+        because `load_scene_file` replaces the world (the load itself is one undo step)."""
+        if not force and self.dirty:
+            self.pending_load_path = path
+            self.confirm_modal_open = True
+            self.confirm_modal_action = 3
+            return False
+        return self.load_scene_file(path)
+
     def new_scene(mut self, force: Bool = False) -> Bool:
         if not force and self.dirty:
             self.confirm_modal_open = True
@@ -4230,8 +4531,12 @@ struct FlintStudioState(Movable):
             self.menu.bar.group = -1
             return False
         self.menu.poll()
+        # The menu bar is drawn into the scaled `ui_ctx` list, so lay it out and hit-test it in logical pixels.
+        var ui_s = self.effective_ui_scale()
+        var lw = Float32(width) / ui_s
+        var lh = Float32(height) / ui_s
         self.dock.solve_layout(
-            RectF(0.0, STUDIO_HEADER_BAR_H, Float32(width), max(Float32(64.0), Float32(height) - STUDIO_HEADER_BAR_H))
+            RectF(0.0, STUDIO_HEADER_BAR_H, lw, max(Float32(64.0), lh - STUDIO_HEADER_BAR_H))
         )
         var panel = self.dock.find_panel("Toolbar")
         var has_toolbar = panel[0] >= 0 and panel[2]
@@ -4244,8 +4549,8 @@ struct FlintStudioState(Movable):
             bar.x = 4
             bar.y = 0
             bar.height = Int(STUDIO_HEADER_BAR_H)
-        bar.screen_w = width
-        bar.screen_h = height
+        bar.screen_w = Int(lw)
+        bar.screen_h = Int(lh)
         var in_play = self.pie.mode != PIE_STOPPED
         bar.groups[0].items[0].enabled = not in_play
         bar.groups[0].items[1].enabled = not in_play
@@ -4281,13 +4586,13 @@ struct FlintStudioState(Movable):
             bar.groups[7].items[1].enabled = can_pkg
         if not has_toolbar and bar.group < 0:
             return False
-        var action = bar.input(inp,Int(inp.last_mouse_x),Int(inp.last_mouse_y))
+        var action = bar.input(inp, Int(inp.last_mouse_x / ui_s), Int(inp.last_mouse_y / ui_s))
         if action==scene_menu.SAVE and not in_play:
             var ok = self.save_scene_file()
             self.menu.message = "Scene saved" if ok else "Could not save scene"
         elif action==scene_menu.LOAD and not in_play:
-            var ok = self.load_scene_file()
-            self.menu.message = "Scene loaded" if ok else "Could not load scene"
+            var ok = self.request_load_scene()
+            self.menu.message = "Scene loaded" if ok else ("" if self.confirm_modal_open else "Could not load scene")
         elif action==scene_menu.NEW_SCENE and not in_play:
             _ = self.new_scene(force=False)
         elif action==scene_menu.UNDO and not in_play:
@@ -4408,7 +4713,7 @@ struct FlintStudioState(Movable):
                 return True
             if self.command_palette.is_open:
                 if input.key_pressed(UI_KEY_BACKSPACE) and self.command_palette.raw_query.byte_length() > 0:
-                    var nq = String(self.command_palette.raw_query[byte=0 : self.command_palette.raw_query.byte_length() - 1])
+                    var nq = utf8_drop_last_char(self.command_palette.raw_query)
                     self.command_palette.set_query(nq)
                 elif input.text_input_utf8.byte_length() > 0:
                     var q_acc = self.command_palette.raw_query
@@ -4465,6 +4770,9 @@ struct FlintStudioState(Movable):
             elif shift_down and not ctrl_down and not alt_down and not in_play and input.key_pressed(65):  # Shift+A: Quick Spawn
                 self.open_command_palette(PALETTE_SPAWN)
                 return True
+            elif ctrl_down and shift_down and not alt_down and input.key_pressed(61):  # Ctrl + '+' (Shift+= on US)
+                self.set_ui_scale(self.ui_scale + Float32(0.25))
+                self.push_toast("UI Scale: " + String(Int(self.ui_scale * Float32(100.0) + Float32(0.5))) + "%", 0, 1.8)
             elif ctrl_down and not shift_down and not alt_down:
                 if input.key_pressed(61) or input.key_pressed(334):  # Ctrl + = / + : UI Zoom In
                     self.set_ui_scale(self.ui_scale + Float32(0.25))
@@ -4536,7 +4844,7 @@ struct FlintStudioState(Movable):
                 if self.input_map.just_pressed("editor_save"):
                     _ = self.save_scene_file()
                 if self.input_map.just_pressed("editor_load"):
-                    _ = self.load_scene_file()
+                    _ = self.request_load_scene()
                 if self.input_map.just_pressed("editor_new"):
                     _ = self.new_scene(force=False)
                 if self.input_map.just_pressed("editor_copy") and self.selected_count() > 0:
@@ -4701,33 +5009,35 @@ struct FlintStudioState(Movable):
         out.end()
 
     def deserialize(mut self, mut input: BlobReader) raises:
+        # Read and validate the whole checkpoint into locals first; editor state is only assigned once
+        # the blob is known to be complete (a truncated blob used to leave selection/clock/gravity from
+        # the checkpoint paired with the old world).
         _ = input.enter(STUDIO_CHECKPOINT_FOURCC, 1)
-        self.selected_entity_id = input.integer()
+        var sel_primary = input.integer()
         var n_sel = Int(input.u32())
-        self.selected_entity_ids.clear()
         var rem_sel = max(0, input.limit() - input.offset)
         if input.failed or n_sel < 0 or n_sel > rem_sel // 8:
             input.failed = True
             input.leave()
             raise Error("Failed to read Studio checkpoint blob")
-        self.selected_entity_ids.reserve(n_sel)
+        var sel_ids = List[Int](capacity=n_sel)
         for _ in range(n_sel):
-            self.selected_entity_ids.append(input.integer())
-        self.selection_anchor_id = input.integer()
-        self.sim_tick = input.integer()
-        self.gravity = input.vec3()
-        self.ground_plane_y = input.f32()
-        self.has_ground_plane = input.boolean()
-        self._ground_body_id = input.integer()
-        self.stepped_clock.raw_time_sec = input.f32()
-        self.stepped_clock.stepped_time_sec = input.f32()
-        self.stepped_clock.step_hz = input.f32()
-        self.stepped_clock.hitstop_remaining_sec = input.f32()
-        self.stepped_clock.pose_changed_this_tick = input.boolean()
-        self.preview_impact_blend = input.f32()
-        self.preview_impact_invert = input.boolean()
-        self.preview_shockwave_active = input.boolean()
-        self.preview_shockwave_radius = input.f32()
+            sel_ids.append(input.integer())
+        var sel_anchor = input.integer()
+        var r_sim_tick = input.integer()
+        var r_gravity = input.vec3()
+        var r_ground_y = input.f32()
+        var r_has_ground = input.boolean()
+        var r_ground_body = input.integer()
+        var r_raw_time = input.f32()
+        var r_stepped_time = input.f32()
+        var r_step_hz = input.f32()
+        var r_hitstop = input.f32()
+        var r_pose_changed = input.boolean()
+        var r_impact_blend = input.f32()
+        var r_impact_invert = input.boolean()
+        var r_shock_active = input.boolean()
+        var r_shock_radius = input.f32()
 
         var w_bytes = _read_blob_bytes(input)
         var p_bytes = _read_blob_bytes(input)
@@ -4746,6 +5056,24 @@ struct FlintStudioState(Movable):
         input.leave()
         if input.failed:
             raise Error("Failed to read Studio checkpoint blob")
+
+        self.selected_entity_id = sel_primary
+        self.selected_entity_ids = sel_ids^
+        self.selection_anchor_id = sel_anchor
+        self.sim_tick = r_sim_tick
+        self.gravity = r_gravity
+        self.ground_plane_y = r_ground_y
+        self.has_ground_plane = r_has_ground
+        self._ground_body_id = r_ground_body
+        self.stepped_clock.raw_time_sec = r_raw_time
+        self.stepped_clock.stepped_time_sec = r_stepped_time
+        self.stepped_clock.step_hz = r_step_hz
+        self.stepped_clock.hitstop_remaining_sec = r_hitstop
+        self.stepped_clock.pose_changed_this_tick = r_pose_changed
+        self.preview_impact_blend = r_impact_blend
+        self.preview_impact_invert = r_impact_invert
+        self.preview_shockwave_active = r_shock_active
+        self.preview_shockwave_radius = r_shock_radius
 
         if len(w_bytes) > 0:
             var wr = BlobReader(w_bytes^)
@@ -4802,6 +5130,9 @@ struct FlintStudioState(Movable):
         var ae_hash = AudioEmitterComponent.COMPONENT_ID
         var prev_gt_hash = PrevGlobalTransform.COMPONENT_ID
         var gt_hash = GlobalTransform.COMPONENT_ID
+        # Editor identity is metadata, not scene state: ids are assigned lazily (load, restore, sync),
+        # and that must not change the hash PIE and replay checks compare.
+        var edid_hash = StudioEditorIdComponent.COMPONENT_ID
 
         for slot in range(len(ents)):
             var e = ents[slot]
@@ -4817,7 +5148,7 @@ struct FlintStudioState(Movable):
             for ci in range(len(sorted_codecs)):
                 var cidx = sorted_codecs[ci]
                 var chash = self.registry.entries[cidx].component_hash
-                if chash == prev_gt_hash or (has_local_tf and chash == gt_hash):
+                if chash == prev_gt_hash or chash == edid_hash or (has_local_tf and chash == gt_hash):
                     continue
                 if not self.registry.has_on_entity(cidx, self.app.world, e):
                     continue
@@ -4954,6 +5285,57 @@ struct FlintStudioState(Movable):
         ):
             target = self.project_root + "/" + path
         return target
+
+    def autosave_path(self) -> String:
+        """`<project>/.flint/autosave/<scene>.autosave.flscnb`: next to the project, never the user's file."""
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        var name = String("untitled")
+        if self.scene_file_path.byte_length() > 0:
+            var b = self.scene_file_path.as_bytes()
+            var start = 0
+            var stop = len(b)
+            for i in range(len(b)):
+                if b[i] == 47:  # '/'
+                    start = i + 1
+            for i in range(len(b) - 1, start - 1, -1):
+                if b[i] == 46:  # '.'
+                    stop = i
+                    break
+            if stop > start:
+                name = String(unsafe_from_utf8=b[start:stop])
+        return root + "/.flint/autosave/" + name + ".autosave.flscnb"
+
+    def write_autosave(mut self) -> Bool:
+        """Writes the current world to `autosave_path()` without touching `scene_file_path` or the dirty
+        flag, so a crash loses at most one autosave interval of work."""
+        var target = self.autosave_path()
+        var parent = parent_directory(target)
+        if parent.byte_length() > 0 and parent != ".":
+            _ = make_dirs(parent)
+        if not self.scene.save_flscnb_file(target, self.app.world, self.registry):
+            return False
+        self.last_autosave_path = target
+        return True
+
+    def tick_autosave(mut self, dt: Float32) -> Bool:
+        """Call once per frame. Autosaves after `autosave_interval_sec` of dirty, stopped (not Play) time."""
+        if self.autosave_interval_sec <= Float32(0.0) or not self.dirty or self.pie.mode != PIE_STOPPED:
+            self._autosave_accum_sec = Float32(0.0)
+            return False
+        if isfinite(dt) and dt > Float32(0.0):
+            self._autosave_accum_sec += min(dt, Float32(1.0))
+        if self._autosave_accum_sec < self.autosave_interval_sec:
+            return False
+        self._autosave_accum_sec = Float32(0.0)
+        return self.write_autosave()
+
+    def recover_autosave(mut self) -> Bool:
+        """Loads the autosave for the current scene (behind the dirty prompt, as an undoable load)."""
+        var p = self.autosave_path()
+        if file_size(p) <= 0:
+            self.push_toast("No autosave found", 1, 3.0)
+            return False
+        return self.request_load_scene(p)
 
     def save_scene_file(mut self, path: String = "") -> Bool:
         """Saves the Studio scene via `Scene.save_flscnb_file` (`.flscnb`/`.flscene`) or `Scene.save_flscn_file` (`.flscn`)."""
@@ -5129,18 +5511,45 @@ struct FlintStudioState(Movable):
         if len(raw) == 0:
             self.push_toast("Load failed: " + target, 2, 3.5)
             return False
+        var is_json = target.endswith(".flscn") or Self._raw_starts_with_json_object(raw)
+        if self.pie.mode != PIE_STOPPED:
+            # A file that does not parse must leave Play running untouched: test-parse it into a
+            # scratch world before stopping anything.
+            var probe = World()
+            self.registry.ensure_registered_in_world(probe)
+            try:
+                if is_json:
+                    _ = self.scene.load_flscn_bytes(probe, self.registry, raw, clear_existing=True)
+                else:
+                    _ = self.scene.load_flscnb_bytes(probe, self.registry, raw, clear_existing=True)
+            except:
+                self.push_toast("Failed to parse " + target, 2, 3.5)
+                return False
+            # Back to the edit world first, so the load (and its undo entry) starts from the scene the
+            # user was editing, not from a mid-simulation Play world.
+            try:
+                _ = self.pie_stop()
+            except:
+                pass  # restore-hash mismatch: the edit world is back anyway; aborting below is safe
+            if self.pie.mode != PIE_STOPPED:
+                self._abort_pie_session()
+        # Scene load is an undoable command: the world before the load is kept as its undo state,
+        # instead of the old behaviour of wiping the user's whole undo/redo history.
+        var before_blob = self._capture_world_blob()
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
         try:
-            if target.endswith(".flscn") or Self._raw_starts_with_json_object(raw):
+            if is_json:
                 _ = self.scene.load_flscn_bytes(self.app.world, self.registry, raw, clear_existing=True)
             else:
                 _ = self.scene.load_flscnb_bytes(self.app.world, self.registry, raw, clear_existing=True)
         except:
+            # `clear_existing` may have emptied the world before the parse failed: put the scene back.
+            _ = self._restore_world_blob(before_blob)
+            self._sync_ecs_and_physics()
             self.push_toast("Failed to parse " + target, 2, 3.5)
             return False
-        if self.pie.mode != PIE_STOPPED:
-            self._abort_pie_session()
-        self.undo_stack.clear()
-        self.redo_stack.clear()
         self.clear_selection()
         if len(self.app.world.entities) > 0 and self.app.world.entities[0].alive:
             self.select_entity(0)
@@ -5165,6 +5574,10 @@ struct FlintStudioState(Movable):
         if self._has_default_showcase_entities():
             upload_default_studio_gpu_assets(self)
         self._reset_physics_world_and_sync()
+        if len(before_blob) > 0:
+            self._record_world_tx(
+                TX_BATCH_EDIT, -1, List[Int](), before_blob^, prev_ids, prev_primary, prev_anchor, "Load " + target
+            )
         self.mark_dirty(False)
         self.push_toast("Loaded " + target, 0, 2.5)
         return True
@@ -5449,10 +5862,8 @@ struct FlintStudioState(Movable):
 
     def _compute_viewport_drop_pos(self, px: Float32, py: Float32, vp: RectF) -> Vec3:
         if vp.w > Float32(1.0) and vp.h > Float32(1.0) and vp.contains(px, py):
-            var ray = ViewportRay.from_screen(
-                px, py, vp.x, vp.y, vp.w, vp.h,
-                self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
-            )
+            var vxf = ViewportTransform.from_logical(vp, self._last_screen_w, self._last_screen_h, Float32(1.0))
+            var ray = vxf.ray_logical(px, py, self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg)
             var hit = self.raycast_scene(ray.origin, ray.dir, Float32(250.0))
             if hit.hit:
                 return hit.point
@@ -5534,7 +5945,7 @@ struct FlintStudioState(Movable):
 
         if lower.endswith(".flscn") or lower.endswith(".flscnb") or lower.endswith(".flscene"):
             if not from_drop:
-                _ = self.load_scene_file(full_path)
+                _ = self.request_load_scene(full_path)
             return -1
 
         if lower.endswith(".glb"):
@@ -5868,7 +6279,20 @@ struct FlintStudioState(Movable):
 
     # ---- Reversible Coalesced Transaction Stack ----
 
+    @staticmethod
+    def _pack_undo_blob(var raw: List[UInt8]) -> List[UInt8]:
+        """Undo keeps two world blobs per step; LZ4-packing them (with an integrity hash) cuts undo memory
+        several-fold. Already-packed and tiny blobs are kept as they are."""
+        if len(raw) < 1024 or lz4_packed_raw_size(raw) >= 0:
+            return raw^
+        var packed = lz4_pack(raw)
+        if len(packed) >= len(raw):
+            return raw^
+        return packed^
+
     def _push_undo(mut self, var tx: EditorTransaction):
+        tx.before_world_blob = Self._pack_undo_blob(tx.before_world_blob^)
+        tx.after_world_blob = Self._pack_undo_blob(tx.after_world_blob^)
         if tx.tx_id == UInt64(0):
             tx.tx_id = self._next_tx_id
             self._next_tx_id += UInt64(1)
@@ -5910,6 +6334,11 @@ struct FlintStudioState(Movable):
         label: String,
         coalesce_key: UInt64 = 0,
     ):
+        self._ensure_editor_ids()  # new entities get their id before the after-blob is captured
+        if self.pie.mode != PIE_STOPPED:
+            # Play-In-Editor edits are thrown away by `pie_stop` (it restores the pre-play world), so
+            # they must not enter undo/redo: an entry here would replay a mid-simulation world after Stop.
+            return
         var after_blob = self._capture_world_blob()
         var sync_tx_opt = self.app.resources.get_ptr[StudioFlmatStyleSyncResource]()
         var ext_snap = (
@@ -5920,7 +6349,7 @@ struct FlintStudioState(Movable):
         if coalesce_key != 0 and len(self.undo_stack) > 0 and len(self.redo_stack) == 0:
             ref top = self.undo_stack[len(self.undo_stack) - 1]
             if top.op == op and top.entity_id == primary_id and top.coalesce_key == coalesce_key:
-                top.after_world_blob = after_blob^
+                top.after_world_blob = Self._pack_undo_blob(after_blob^)
                 top.next_selected_id = self.selected_entity_id
                 top.next_selected_ids = self.selected_entity_ids.copy()
                 top.next_anchor_id = self.selection_anchor_id
@@ -6324,12 +6753,16 @@ struct FlintStudioState(Movable):
         var e = self.resolve_entity(entity_id)
         if not e.valid():
             return False
-        # Detach live children and parent BEFORE World.despawn(e) so no dangling Children/Parent links remain!
+        # Detach live children and parent BEFORE World.despawn(e) so no dangling Children/Parent links remain.
+        # Children move up to the deleted entity's parent and keep their world transform (they used to
+        # snap to their parent-relative LocalTransform interpreted as world space).
+        var grand_parent = self.parent_of(entity_id)
         var ch = self.children_of(entity_id)
         for ci in range(len(ch)):
             var ce = self.resolve_entity(ch[ci])
             if ce.valid():
-                _ = clear_parent(self.app.world, ce)
+                if not self._reparent_entity_raw(ch[ci], grand_parent, True):
+                    _ = clear_parent(self.app.world, ce)
         _ = clear_parent(self.app.world, e)
         _ = self.app.world.despawn(e)
         self.gpu_materials.invalidate_entity(entity_id)
@@ -7587,7 +8020,10 @@ struct FlintStudioState(Movable):
             if renderer.uses_vulkan():
                 ref gpu = renderer.gpu_slot[0]
                 font_slot = gpu.ui_font_atlas_slot
-                font_copy = gpu.ui_font.copy()
+                # `emit_studio_ui_draw_list` only reads this font until `ui_ctx.font` is set, so copy the
+                # multi-MB SdfFont (atlas, glyph/kerning tables, TTF source) once instead of every frame.
+                if not self.ui_ctx.font.valid:
+                    font_copy = gpu.ui_font.copy()
 
                 if self.preview_shockwave_active:
                     gpu.submit_shockwave(
@@ -8085,6 +8521,7 @@ struct FlintStudioState(Movable):
             return True
         self.pie_camera_ejected = False
         self._reset_pie_trigger_buffer()
+        self._ensure_editor_ids()  # the Play checkpoint carries every id, so Stop restores the same ones
         self.pie.pre_play_hash = self.state_hash()
         var srv_entry = self.app.resources.get_ptr[AssetServer]()
         self._pie_entry_hot_reloads = (
@@ -8232,10 +8669,10 @@ struct FlintStudioState(Movable):
         self.pie.checkpoint_lz4.clear()
         self.scene.has_pie_snapshot = False
         self.scene.pie_snapshot.clear()
+        # Hash the restored world now, but raise on a mismatch only after the material-style and asset
+        # epochs are restored too: raising here used to skip them, leaving PIE-era bindings in Edit mode.
         var restored_hash = self.state_hash()
         self.pie.last_restore_verified = restored_hash == self.pie.pre_play_hash
-        if not self.pie.last_restore_verified:
-            raise Error("PIE LZ4 world restore hash mismatch")
         var style_sync_opt = self.app.resources.get_ptr_mut[StudioFlmatStyleSyncResource]()
         if style_sync_opt:
             style_sync_opt.value()[unsafe_offset=0].synced_entity_epochs = _copy_u64_style_epoch_dict(
@@ -8256,6 +8693,8 @@ struct FlintStudioState(Movable):
             self._sync_compat_view()
         self._pie_entry_hot_reloads = 0
         self._pie_entry_style_epochs.clear()
+        if not self.pie.last_restore_verified:
+            raise Error("PIE LZ4 world restore hash mismatch")
         return True
 
     def _resolve_default_gameplay_so_path(self) -> String:
@@ -8984,9 +9423,12 @@ def emit_studio_ui_draw_list(
     if abs(ui_sc - Float32(1.0)) > Float32(1.0e-4):
         scaled_input.last_mouse_x = input.last_mouse_x / ui_sc
         scaled_input.last_mouse_y = input.last_mouse_y / ui_sc
+        scaled_input.delta_x = input.delta_x / ui_sc
+        scaled_input.delta_y = input.delta_y / ui_sc
     studio.ui_ctx.begin_frame(scaled_input, sw, sh, dt)
     if studio.ui_ctx.mouse_pressed_l or studio.ui_ctx.mouse_released_l:
         studio.ui_edit_seq += 1
+        studio._edit_focus_id = UInt64(0)  # a click ends any typing interaction
     if studio.input_rebind_active:
         if input.key_pressed(UI_KEY_ESCAPE):
             studio.cancel_input_rebind()
@@ -9035,11 +9477,11 @@ def emit_studio_ui_draw_list(
     )
     var show_win_ctrls = False
     var win_is_max = False
-    if studio.anim_mode != UI_ANIM_INSTANT:
-        var wc_opt = studio.app.resources.get_ptr[WindowStateResource]()
-        if wc_opt and wc_opt.value()[unsafe_offset=0].initialized and len(wc_opt.value()[unsafe_offset=0].windows) > 0:
-            show_win_ctrls = wc_opt.value()[unsafe_offset=0].windows[0].uses_client_decorations()
-            win_is_max = wc_opt.value()[unsafe_offset=0].windows[0].maximized
+    # Window controls depend only on client-side decorations, not on the reduced-motion setting.
+    var wc_opt = studio.app.resources.get_ptr[WindowStateResource]()
+    if wc_opt and wc_opt.value()[unsafe_offset=0].initialized and len(wc_opt.value()[unsafe_offset=0].windows) > 0:
+        show_win_ctrls = wc_opt.value()[unsafe_offset=0].windows[0].uses_client_decorations()
+        win_is_max = wc_opt.value()[unsafe_offset=0].windows[0].maximized
     var hdr_act = studio.header_bar.draw(
         studio.ui_ctx.draw_list,
         font_slot,
@@ -9105,26 +9547,35 @@ def emit_studio_ui_draw_list(
         if vp_info[0] >= 0
         else RectF(Float32(240.0), STUDIO_HEADER_BAR_H + Float32(12.0), sw - Float32(520.0), sh - Float32(190.0))
     )
+    # The scene renders over the whole window; `vp` is only the clip/input hole (see `viewport_transform`).
+    var vxf = ViewportTransform.from_logical(vp, sw, sh, ui_sc)
 
     # 2. 3D Viewport Active Selection Gizmo + Visual Agent Theatre HUD + Floating ViewportHud
     var show_edit_gizmo = (studio.pie.mode != PIE_PLAYING) or studio.pie_camera_ejected
     var giz_piv = studio.selection_gizmo_pivot()
     if show_edit_gizmo and giz_piv[0]:
-        ui.push_clip(Int(vp.x), Int(vp.y), Int(vp.right()), Int(vp.bottom()))
+        # `ui` is in physical pixels (only `ui_ctx.draw_list` is scaled later), so emit the gizmo
+        # in physical space with a scaled target size; `main.mojo` picks with the same numbers.
+        var gvx = vp.x * ui_sc
+        var gvy = vp.y * ui_sc
+        var gvw = vp.w * ui_sc
+        var gvh = vp.h * ui_sc
+        ui.push_clip(Int(gvx), Int(gvy), Int(gvx + gvw), Int(gvy + gvh))
         emit_gizmo_draw_list(
             ui,
             giz_piv[1],
             studio.gizmo_mode,
             studio.active_gizmo_handle,
-            vp.x,
-            vp.y,
-            vp.w,
-            vp.h,
+            Float32(0.0),
+            Float32(0.0),
+            vxf.proj_phys_w(),
+            vxf.proj_phys_h(),
             studio.cam_pos,
             studio.cam_fwd,
             studio.cam_right,
             studio.cam_up,
             studio.fov_y_deg,
+            target_px=GIZMO_TARGET_PX * ui_sc,
             gizmo_rot=studio.selection_gizmo_rotation(),
         )
         ui.pop_clip()
@@ -9132,12 +9583,7 @@ def emit_studio_ui_draw_list(
     # Visual Agent Theatre 2D Viewport Overlays (presence pills, Bezier flow beams, PRIM_ARC reticles, inline [✓]/[✗])
     studio._last_theatre_hits.clear()
     if studio.agent_bus.has_active_visuals() and vp.w > Float32(40.0) and vp.h > Float32(40.0):
-        var fov_rad = studio.fov_y_deg * (PI / Float32(180.0))
-        var view_m = make_rh_look_at(studio.cam_pos, studio.cam_pos + studio.cam_fwd, Vec3(0.0, 1.0, 0.0))
-        var proj_m = make_rh_reverse_z_perspective(
-            fov_rad, vp.w / max(Float32(1.0), vp.h), studio.near_z, Float32(1000.0)
-        )
-        var vp_mat = proj_m.multiply(view_m)
+        var vp_mat = vxf.hud_view_proj(studio.cam_pos, studio.cam_fwd, studio.fov_y_deg, studio.near_z, Float32(1000.0))
         _ = emit_agent_viewport_hud_overlays_with_font(
             studio.agent_bus,
             studio.ui_ctx.draw_list,
@@ -9310,8 +9756,8 @@ def emit_studio_ui_draw_list(
         var tgt_eid = -1
         if d_low.endswith(".flmat") or d_low.endswith(".flrig") or d_low.endswith(".flanim"):
             if vp.w > Float32(1.0) and vp.h > Float32(1.0) and vp.contains(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y):
-                var ray = ViewportRay.from_screen(
-                    studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y, vp.x, vp.y, vp.w, vp.h,
+                var ray = vxf.ray_logical(
+                    studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y,
                     studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
                 )
                 var hit = studio.raycast_scene(ray.origin, ray.dir, Float32(250.0))
@@ -9423,30 +9869,26 @@ def emit_studio_ui_draw_list(
             var bulk_delta = Vec3()
             var mat_w = max(Float32(160.0), panel_w - Float32(20.0))
             if studio.ui_ctx.drag_float3("bulk_delta", "Move Delta", bulk_delta, speed=0.05, w=mat_w):
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
+                studio.begin_edit_interaction()
                 _ = studio.bulk_translate_selected(bulk_delta, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_delta"))
 
             var b_col = pri_view.base_color
             if studio.ui_ctx.drag_float3("bulk_col", "Bulk Albedo", b_col, speed=0.01, min_val=0.0, max_val=1.0, w=mat_w):
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
+                studio.begin_edit_interaction()
                 var f_col = InspectedField("base_color", FIELD_COLOR_RGB)
                 f_col.v3_val = b_col
                 _ = studio.bulk_patch_field("base_color", f_col, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_col"))
 
             var b_rgh = pri_view.roughness
             if studio.ui_ctx.slider_float("bulk_rgh", "Bulk Rough", b_rgh, Float32(0.04), Float32(1.0), w=mat_w):
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
+                studio.begin_edit_interaction()
                 var f_rgh = InspectedField("roughness", FIELD_F32)
                 f_rgh.f_val = b_rgh
                 _ = studio.bulk_patch_field("roughness", f_rgh, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_rgh"))
 
             var b_met = pri_view.metallic
             if studio.ui_ctx.slider_float("bulk_met", "Bulk Metal", b_met, Float32(0.0), Float32(1.0), w=mat_w):
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
+                studio.begin_edit_interaction()
                 var f_met = InspectedField("metallic", FIELD_F32)
                 f_met.f_val = b_met
                 _ = studio.bulk_patch_field("metallic", f_met, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_met"))
@@ -9636,8 +10078,7 @@ def emit_studio_ui_draw_list(
                 studio.ui_ctx.tree_pop()
 
             if changed:
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
+                studio.begin_edit_interaction()
                 _ = studio.commit_node_edit(eid, cur^, "Inspector UI Edit", coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "insp_main"))
                 cur = studio.entities[eid].copy()
 
@@ -9675,15 +10116,24 @@ def emit_studio_ui_draw_list(
 
                         if not act_mat_ref.is_empty():
                             var mat_disk = studio._resolve_asset_disk_path(act_mat_ref.rel_path)
+                            if studio.flmat_pending_path.byte_length() > 0 and (
+                                studio.flmat_pending_path != mat_disk or studio.flmat_pending_eid != eid
+                            ):
+                                _ = studio.commit_pending_flmat_edit()  # selection moved on mid-edit
                             var flm_loaded = False
                             var flm = FlmatAsset()
-                            try:
-                                flm = load_flmat_file(mat_disk)
+                            if studio.flmat_pending_path == mat_disk:
+                                flm = studio.flmat_pending.copy()
                                 flm_loaded = True
-                            except:
-                                pass
+                            else:
+                                try:
+                                    flm = load_flmat_file(mat_disk)
+                                    flm_loaded = True
+                                except:
+                                    pass
                             if flm_loaded:
                                 var flm_dirty = False
+                                var flm_text_dirty = False
                                 var sh_items = List[String]()
                                 sh_items.append("PBR")
                                 sh_items.append("NPR Cel")
@@ -9696,7 +10146,7 @@ def emit_studio_ui_draw_list(
                                 var alb_s = flm.albedo_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_alb_tex", alb_s, insp_w, "albedo_tex (.png/.jpg)"):
                                     flm.albedo_tex = AssetRef.from_path(alb_s, ASSET_KIND_TEXTURE) if alb_s.byte_length() > 0 else AssetRef()
-                                    flm_dirty = True
+                                    flm_text_dirty = True
                                 var d_alb = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_alb[0]:
                                     var dl = FlintStudioState._ascii_lower(d_alb[2])
@@ -9707,7 +10157,7 @@ def emit_studio_ui_draw_list(
                                 var nrm_s = flm.normal_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_nrm_tex", nrm_s, insp_w, "normal_tex (.png/.jpg)"):
                                     flm.normal_tex = AssetRef.from_path(nrm_s, ASSET_KIND_TEXTURE) if nrm_s.byte_length() > 0 else AssetRef()
-                                    flm_dirty = True
+                                    flm_text_dirty = True
                                 var d_nrm = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_nrm[0]:
                                     var dl = FlintStudioState._ascii_lower(d_nrm[2])
@@ -9718,7 +10168,7 @@ def emit_studio_ui_draw_list(
                                 var orm_s = flm.orm_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_orm_tex", orm_s, insp_w, "orm_tex (.png/.jpg)"):
                                     flm.orm_tex = AssetRef.from_path(orm_s, ASSET_KIND_TEXTURE) if orm_s.byte_length() > 0 else AssetRef()
-                                    flm_dirty = True
+                                    flm_text_dirty = True
                                 var d_orm = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_orm[0]:
                                     var dl = FlintStudioState._ascii_lower(d_orm[2])
@@ -9729,7 +10179,7 @@ def emit_studio_ui_draw_list(
                                 var emi_s = flm.emissive_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_emi_tex", emi_s, insp_w, "emissive_tex (.png/.jpg)"):
                                     flm.emissive_tex = AssetRef.from_path(emi_s, ASSET_KIND_TEXTURE) if emi_s.byte_length() > 0 else AssetRef()
-                                    flm_dirty = True
+                                    flm_text_dirty = True
                                 var d_emi = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_emi[0]:
                                     var dl = FlintStudioState._ascii_lower(d_emi[2])
@@ -9737,9 +10187,26 @@ def emit_studio_ui_draw_list(
                                         flm.emissive_tex = AssetRef.from_path(studio._project_rel_for_entry(d_emi[2]), ASSET_KIND_TEXTURE)
                                         flm_dirty = True
 
-                                if flm_dirty:
-                                    _ = save_flmat_file(mat_disk, flm)
-                                    _ = studio._assign_flmat_to_entity(eid, act_mat_ref.rel_path)
+                                var tex_field_focused = False
+                                var tex_field_ids = List[String]()
+                                tex_field_ids.append("flmat_alb_tex")
+                                tex_field_ids.append("flmat_nrm_tex")
+                                tex_field_ids.append("flmat_orm_tex")
+                                tex_field_ids.append("flmat_emi_tex")
+                                for fi in range(len(tex_field_ids)):
+                                    if studio.ui_ctx.focused_id == studio.ui_ctx.widget_id(tex_field_ids[fi]):
+                                        tex_field_focused = True
+                                if flm_text_dirty or (flm_dirty and studio.flmat_pending_path == mat_disk):
+                                    studio.flmat_pending = flm.copy()
+                                    studio.flmat_pending_path = mat_disk
+                                    studio.flmat_pending_eid = eid
+                                    studio.flmat_pending_ref = act_mat_ref.rel_path
+                                if flm_dirty or (studio.flmat_pending_path == mat_disk and not tex_field_focused):
+                                    if studio.flmat_pending_path == mat_disk:
+                                        _ = studio.commit_pending_flmat_edit()
+                                    else:
+                                        _ = save_flmat_file(mat_disk, flm)
+                                        _ = studio._assign_flmat_to_entity(eid, act_mat_ref.rel_path)
                         studio.ui_ctx.tree_pop()
 
                 if cur.has_animator or cur.has_skeleton:
@@ -10140,8 +10607,7 @@ def emit_studio_ui_draw_list(
                                         var hi_f = f.max_val if f.max_val > f.min_val else Float32(1.0e6)
                                         var sp_f = f.step if f.step > Float32(0.0) else Float32(0.05)
                                         if studio.ui_ctx.drag_float(fid, f.name, fv, speed=sp_f, min_val=lo_f, max_val=hi_f, w=insp_w):
-                                            if not studio.ui_ctx.mouse_down_l:
-                                                studio.ui_edit_seq += 1
+                                            studio.begin_edit_interaction()
                                             var before_blob = studio._capture_world_blob()
                                             var mptr = studio.app.world.get_raw_ptr_mut(sel_e, tid)
                                             if mptr != 0:
@@ -10158,8 +10624,7 @@ def emit_studio_ui_draw_list(
                                         var hi_v = f.max_val if f.max_val > f.min_val else Float32(1.0e6)
                                         var sp_v = f.step if f.step > Float32(0.0) else Float32(0.05)
                                         if studio.ui_ctx.drag_float3(fid, f.name, vv, speed=sp_v, min_val=lo_v, max_val=hi_v, w=insp_w):
-                                            if not studio.ui_ctx.mouse_down_l:
-                                                studio.ui_edit_seq += 1
+                                            studio.begin_edit_interaction()
                                             var before_blob = studio._capture_world_blob()
                                             var mptr = studio.app.world.get_raw_ptr_mut(sel_e, tid)
                                             if mptr != 0:
@@ -10177,8 +10642,7 @@ def emit_studio_ui_draw_list(
                                         var lo_c = f.min_val if f.max_val > f.min_val else Float32(0.0)
                                         var hi_c = f.max_val if f.max_val > f.min_val else Float32(1.0)
                                         if studio.ui_ctx.color_edit3(fid, f.name, cv, min_val=lo_c, max_val=hi_c, w=insp_w):
-                                            if not studio.ui_ctx.mouse_down_l:
-                                                studio.ui_edit_seq += 1
+                                            studio.begin_edit_interaction()
                                             var before_blob = studio._capture_world_blob()
                                             var mptr = studio.app.world.get_raw_ptr_mut(sel_e, tid)
                                             if mptr != 0:
@@ -10196,8 +10660,7 @@ def emit_studio_ui_draw_list(
                                         )
                                         var edeg = _quat_to_euler_deg(qv)
                                         if studio.ui_ctx.drag_float3(fid, f.name, edeg, speed=0.5, min_val=-360.0, max_val=360.0, w=insp_w):
-                                            if not studio.ui_ctx.mouse_down_l:
-                                                studio.ui_edit_seq += 1
+                                            studio.begin_edit_interaction()
                                             var nq = _euler_deg_to_quat(edeg)
                                             var before_blob = studio._capture_world_blob()
                                             var mptr = studio.app.world.get_raw_ptr_mut(sel_e, tid)
@@ -10285,8 +10748,7 @@ def emit_studio_ui_draw_list(
                                             bb_dirty_idx = bbi
                                             bt_dirty = True
                                     if bt_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var bt_m = studio.app.world.get_ptr_mut[BehaviorTreeComponent](sel_e)
                                         if bt_m:
@@ -10314,8 +10776,7 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.drag_float("insp_pl_rng", "Radius", pl_rng, speed=0.1, min_val=0.1, max_val=500.0, w=insp_w):
                                         pl_dirty = True
                                     if pl_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var pl_m = studio.app.world.get_ptr_mut[PointLightComponent](sel_e)
                                         if pl_m:
@@ -10347,8 +10808,7 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.drag_float3("insp_sl_dir", "Direction", sl_dir, speed=0.02, min_val=-1.0, max_val=1.0, w=insp_w):
                                         sl_dirty = True
                                     if sl_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var sl_m = studio.app.world.get_ptr_mut[SpotLightComponent](sel_e)
                                         if sl_m:
@@ -10380,8 +10840,7 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.drag_float("insp_cm_exp", "Exposure", cm_exp, speed=0.02, min_val=0.05, max_val=20.0, w=insp_w):
                                         cm_dirty = True
                                     if cm_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var cm_m = studio.app.world.get_ptr_mut[CameraComponent](sel_e)
                                         if cm_m:
@@ -10415,8 +10874,7 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.drag_float("insp_env_turb", "Turbidity", ev_turb, speed=0.05, min_val=1.0, max_val=20.0, w=insp_w):
                                         ev_dirty = True
                                     if ev_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var ev_m = studio.app.world.get_ptr_mut[EnvironmentComponent](sel_e)
                                         if ev_m:
@@ -10484,7 +10942,7 @@ def emit_studio_ui_draw_list(
             ag_r.y,
             ag_r.w,
             ag_r.h,
-            input,
+            scaled_input,
             dt,
             studio.ui_time_sec,
         )
@@ -10513,10 +10971,12 @@ def emit_studio_ui_draw_list(
             cd_r.y,
             cd_r.w,
             cd_r.h,
-            input,
+            scaled_input,
             studio.ui_time_sec,
         )
-        if cd_act.kind == CODE_ACT_BUILD_HOT_RELOAD:
+        if cd_act.kind == CODE_ACT_CLOSE_TAB:
+            studio.code_drawer.close_tab(cd_act.tab_index)
+        elif cd_act.kind == CODE_ACT_BUILD_HOT_RELOAD:
             _ = studio.execute_palette_command(PAL_CMD_BUILD_HOT_RELOAD)
         elif cd_act.kind == CODE_ACT_OPEN_EXTERNAL_IDE:
             studio.source_editor.requested = True
@@ -10692,8 +11152,8 @@ def emit_studio_ui_draw_list(
             bar.x = 4
             bar.y = 0
             bar.height = Int(STUDIO_HEADER_BAR_H)
-        bar.screen_w = screen_w
-        bar.screen_h = screen_h
+        bar.screen_w = Int(sw)
+        bar.screen_h = Int(sh)
         bar.draw(studio.ui_ctx.draw_list, studio.ui_ctx.font, font_slot)
 
     # Frosted-glass Toast Stack + Background Job Progress Pills (anchored top-right / bottom-right inside vp)
@@ -10780,6 +11240,9 @@ def emit_studio_ui_draw_list(
                         studio.quit_requested = True
                     elif act == 2:
                         _ = studio.new_scene(force=True)
+                    elif act == 3:
+                        var pend_path = studio.pending_load_path
+                        _ = studio.request_load_scene(pend_path, force=True)
             if studio.ui_ctx.button("modal_discard", "Discard", 96.0, 26.0):
                 var act = studio.confirm_modal_action
                 studio.confirm_modal_open = False
@@ -10788,6 +11251,9 @@ def emit_studio_ui_draw_list(
                     studio.quit_requested = True
                 elif act == 2:
                     _ = studio.new_scene(force=True)
+                elif act == 3:
+                    var pend_path = studio.pending_load_path
+                    _ = studio.request_load_scene(pend_path, force=True)
             if studio.ui_ctx.button("modal_cancel", "Cancel", 86.0, 26.0):
                 studio.confirm_modal_open = False
                 studio.confirm_modal_action = 0

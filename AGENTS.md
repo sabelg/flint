@@ -31,7 +31,7 @@ bash tools/flint.sh doctor                           # Check Mojo 1.2, Vulkan IC
 bash tools/flint.sh lab <physics|anim|render|audio_ui|net|all> [--fast]  # Compile & run <2s subsystem labs (-O1 with --fast)
 bash tools/flint.sh studio [--headless-smoke|--mcp-stdio]                # Build & launch Flint Studio visual editor / MCP v2 host
 bash tools/flint.sh gate                             # Standalone zero-leak + --Werror build + unit/e2e/v5 tests + headless PNG
-bash tools/flint.sh test [unit|e2e|v5]               # Run standalone unit, E2E, or v5 subsystem verification suites
+bash tools/flint.sh test [unit|e2e|v5|studio]        # Run standalone unit, E2E, v5 subsystem, or Studio regression suites
 bash tools/flint.sh play                             # Run interactive minimal_spark 2D+3D showcase
 bash tools/flint.sh preview <spark|world|studio|dir> # Live preview: rebuild on .mojo save and hot-swap window
 bash tools/flint.sh kms [--probe]                    # Bare-display DRM/KMS demo from a text console (no X11/Wayland)

@@ -23,6 +23,7 @@ from flint.studio.gizmo import (
     GIZMO_MODE_ROTATE,
     GIZMO_MODE_SCALE,
     GIZMO_MODE_TRANSLATE,
+    GIZMO_TARGET_PX,
     GIZMO_PLANE_XY,
     GIZMO_PLANE_XZ,
     GIZMO_PLANE_YZ,
@@ -41,6 +42,7 @@ from flint.studio.gizmo import (
     snap_angle,
     snap_angle_deg,
     snap_scalar,
+    snap_constrained_delta,
     snap_translation,
 )
 from flint.studio.studio_app import (
@@ -245,3 +247,5 @@ from flint.studio.code_drawer import (
     CodeDrawerAction,
     CodeTab,
 )
+from flint.studio.viewport_transform import ViewportTransform
+from flint.studio.studio_app import EntityRef, StudioEditorIdComponent

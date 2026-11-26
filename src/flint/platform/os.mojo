@@ -13,6 +13,11 @@ def get_time() -> Float64:
     return Float64(monotonic()) / 1000000000.0
 
 
+def unix_time_sec() -> Int:
+    """Wall-clock seconds since the Unix epoch (time(2)); for persisted timestamps such as frecency."""
+    return Int(external_call["time", Int64](Int(0)))
+
+
 def env_value(name: String) -> String:
     return env_now(name)
 

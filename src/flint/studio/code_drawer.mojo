@@ -283,6 +283,9 @@ struct CodeDrawer(Movable):
         _ = self.tabs.pop(idx)
         if len(self.tabs) == 0:
             self.active_tab = -1
+        elif idx < self.active_tab:
+            # A tab left of the active one closed: keep showing the same file.
+            self.active_tab -= 1
         elif self.active_tab >= len(self.tabs):
             self.active_tab = len(self.tabs) - 1
 

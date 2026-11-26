@@ -89,7 +89,10 @@ struct EmbeddedIde(Movable):
 
     def forward(mut self, inp: InputState, mx: Int, my: Int):
         var ctrl = inp.key_down(341) or inp.key_down(345)
-        var alt = inp.key_down(342) or inp.key_down(346)
+        # Right Alt is AltGr on international layouts (`{ [ @ \\ |` on German, etc.): when it produced text,
+        # forward that text instead of treating it as Meta (which sent ESC+letter and dropped the char).
+        var altgr_text = inp.key_down(346) and inp.text_input_utf8.byte_length() > 0
+        var alt = inp.key_down(342) or (inp.key_down(346) and not altgr_text)
         var shift = inp.key_down(340) or inp.key_down(344)
         var modifier = 1 + Int(shift) + 2 * Int(alt) + 4 * Int(ctrl)
         if ctrl or alt:

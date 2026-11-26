@@ -13,6 +13,8 @@ from std.math import abs, atan2, cos, floor, isfinite, max, min, sin, sqrt, tan
 from flint.core.math import Quat, Vec3
 from flint.ui.draw_list import UiDrawList
 
+comptime GIZMO_TARGET_PX: Float32 = 96.0
+"""Gizmo handle length in UI points (multiply by the UI scale for physical pixels)."""
 comptime GIZMO_MODE_TRANSLATE: Int = 0
 comptime GIZMO_MODE_ROTATE: Int = 1
 comptime GIZMO_MODE_SCALE: Int = 2
@@ -283,9 +285,21 @@ def gizmo_rotation_delta_rad(
     var vp1 = ray_plane_hit(cur_ray, pivot, view_n)
     if not vp0[0] or not vp1[0]:
         return Float32(0.0)
-    var raw_tan = axis.cross(view_n)
-    var tangent = raw_tan.normalized() if raw_tan.length_squared() > Float32(1.0e-8) else Vec3(1.0, 0.0, 0.0)
+    # Edge-on ring: it projects to a line, so the grab point on screen is the x coordinate along
+    # e1 = axis x view_n; take the ring point on the half nearer the camera (the one users grab).
+    # The drag tangent there is axis x r (using axis x view_n alone turned the ring against the cursor).
     var eff_r = max(Float32(0.05), ring_world_radius)
+    var e1_raw = axis.cross(view_n)
+    var tangent = Vec3(1.0, 0.0, 0.0)
+    if e1_raw.length_squared() > Float32(1.0e-8):
+        var e1 = e1_raw.normalized()
+        var e2_raw = view_n - axis * view_n.dot(axis)
+        var e2 = e2_raw.normalized() if e2_raw.length_squared() > Float32(1.0e-8) else view_n
+        var gx = max(-eff_r, min(eff_r, (vp0[1] - pivot).dot(e1)))
+        var gz = sqrt(max(Float32(0.0), eff_r * eff_r - gx * gx))
+        var r = e1 * gx - e2 * gz
+        var t_raw = axis.cross(r)
+        tangent = t_raw.normalized() if t_raw.length_squared() > Float32(1.0e-10) else e1
     var disp = (vp1[1] - vp0[1]).dot(tangent)
     if not isfinite(disp):
         return Float32(0.0)
@@ -398,6 +412,57 @@ def snap_scalar(val: Float32, step: Float32) -> Float32:
 
 
 @always_inline
+def snap_constrained_delta(
+    pivot: Vec3,
+    delta: Vec3,
+    handle: Int,
+    grid_step: Float32,
+    gizmo_rot: Quat = Quat.identity(),
+) -> Vec3:
+    """Grid-snaps a translate-gizmo drag along only the handle's constrained gizmo axes.
+
+    An axis handle snaps one component and a plane handle two; the free components stay exactly where
+    they were (snapping the whole pivot used to pull Y/Z onto the grid during an X drag). A gizmo axis
+    that is world-aligned snaps the absolute world coordinate; a rotated (local) axis snaps the offset."""
+    if not isfinite(grid_step) or grid_step <= Float32(1.0e-6):
+        return delta
+    var rot = _sanitize_gizmo_rot(gizmo_rot)
+    var bx = rot.rotate(Vec3(1.0, 0.0, 0.0))
+    var by = rot.rotate(Vec3(0.0, 1.0, 0.0))
+    var bz = rot.rotate(Vec3(0.0, 0.0, 1.0))
+    var axes = List[Vec3]()
+    if handle == GIZMO_AXIS_X:
+        axes.append(bx)
+    elif handle == GIZMO_AXIS_Y:
+        axes.append(by)
+    elif handle == GIZMO_AXIS_Z:
+        axes.append(bz)
+    elif handle == GIZMO_PLANE_XY:
+        axes.append(bx)
+        axes.append(by)
+    elif handle == GIZMO_PLANE_XZ:
+        axes.append(bx)
+        axes.append(bz)
+    elif handle == GIZMO_PLANE_YZ:
+        axes.append(by)
+        axes.append(bz)
+    else:
+        return snap_translation(pivot + delta, grid_step) - pivot
+    var out = delta
+    for i in range(len(axes)):
+        var a = axes[i]
+        var t = delta.dot(a)
+        var world_aligned = max(abs(a.x), max(abs(a.y), abs(a.z))) > Float32(0.9999)
+        var snapped: Float32
+        if world_aligned:
+            var p = pivot.dot(a)
+            snapped = snap_scalar(p + t, grid_step) - p
+        else:
+            snapped = snap_scalar(t, grid_step)
+        out = out + a * (snapped - t)
+    return out
+
+
 def snap_translation(pos: Vec3, grid_step: Float32) -> Vec3:
     if not isfinite(grid_step) or grid_step <= Float32(1.0e-6):
         return pos
@@ -467,6 +532,31 @@ def _emit_thick_line_ui(
             ui.add_circle(px, py, rad, color)
 
 
+comptime GIZMO_AXIS_MIN_VIEW_DEG: Float32 = 6.0
+"""Axis/plane handles closer than this to edge-on (axis along the view ray, plane seen side-on) are hidden
+and unpickable: dragging them divides by ~sin^2(angle), so a pixel of mouse motion moved objects metres."""
+
+
+def _gizmo_view_dir(pivot: Vec3, cam_pos: Vec3, cam_fwd: Vec3) -> Vec3:
+    var to_p = pivot - cam_pos
+    var l2 = to_p.length_squared()
+    if isfinite(l2) and l2 > Float32(1.0e-10):
+        return to_p.normalized()
+    return cam_fwd.normalized()
+
+
+def gizmo_axis_usable(axis: Vec3, view_dir: Vec3) -> Bool:
+    """True when a translate/scale axis handle is far enough from the view ray to drag stably."""
+    var c = abs(axis.dot(view_dir))
+    return isfinite(c) and c < cos(GIZMO_AXIS_MIN_VIEW_DEG * Float32(0.017453292))
+
+
+def gizmo_plane_usable(normal: Vec3, view_dir: Vec3) -> Bool:
+    """True when a dual-axis plane handle is not seen (nearly) edge-on."""
+    var c = abs(normal.dot(view_dir))
+    return isfinite(c) and c > sin(GIZMO_AXIS_MIN_VIEW_DEG * Float32(0.017453292))
+
+
 def pick_gizmo_handle(
     mouse_x: Float32,
     mouse_y: Float32,
@@ -501,6 +591,8 @@ def pick_gizmo_handle(
     var by = rot.rotate(Vec3(0.0, 1.0, 0.0))
     var bz = rot.rotate(Vec3(0.0, 0.0, 1.0))
 
+    var vdir = _gizmo_view_dir(pivot, cam_pos, cam_fwd)
+
     if mode == GIZMO_MODE_SCALE:
         var dc = _point_seg_dist_px(mouse_x, mouse_y, c_proj[0], c_proj[1], c_proj[0], c_proj[1])
         if dc <= Float32(11.0):
@@ -511,11 +603,11 @@ def pick_gizmo_handle(
             var p_xy = project_world_to_viewport(pivot + (bx + by) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             var p_xz = project_world_to_viewport(pivot + (bx + bz) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             var p_yz = project_world_to_viewport(pivot + (by + bz) * (wscale * Float32(0.28)), vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
-            if p_xy[3] and _point_seg_dist_px(mouse_x, mouse_y, p_xy[0], p_xy[1], p_xy[0], p_xy[1]) <= Float32(11.0):
+            if p_xy[3] and gizmo_plane_usable(bz, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_xy[0], p_xy[1], p_xy[0], p_xy[1]) <= Float32(11.0):
                 return GIZMO_PLANE_XY
-            if p_xz[3] and _point_seg_dist_px(mouse_x, mouse_y, p_xz[0], p_xz[1], p_xz[0], p_xz[1]) <= Float32(11.0):
+            if p_xz[3] and gizmo_plane_usable(by, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_xz[0], p_xz[1], p_xz[0], p_xz[1]) <= Float32(11.0):
                 return GIZMO_PLANE_XZ
-            if p_yz[3] and _point_seg_dist_px(mouse_x, mouse_y, p_yz[0], p_yz[1], p_yz[0], p_yz[1]) <= Float32(11.0):
+            if p_yz[3] and gizmo_plane_usable(bx, vdir) and _point_seg_dist_px(mouse_x, mouse_y, p_yz[0], p_yz[1], p_yz[0], p_yz[1]) <= Float32(11.0):
                 return GIZMO_PLANE_YZ
 
         var axes = [bx, by, bz]
@@ -523,6 +615,8 @@ def pick_gizmo_handle(
         var best_id = GIZMO_AXIS_NONE
         var best_d = Float32(12.0)
         for a in range(3):
+            if not gizmo_axis_usable(axes[a], vdir):
+                continue
             var tip = project_world_to_viewport(pivot + axes[a] * wscale, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             if tip[3]:
                 var d = _point_seg_dist_px(mouse_x, mouse_y, c_proj[0], c_proj[1], tip[0], tip[1])
@@ -605,13 +699,20 @@ def emit_gizmo_draw_list(
             var pl_cols = [UInt32(0xAA428BF5), UInt32(0xAA3DDC68), UInt32(0xAAE84848)]
             var pl_borders = [GIZMO_COLOR_Z, GIZMO_COLOR_Y, GIZMO_COLOR_X]
             var pl_ids = [GIZMO_PLANE_XY, GIZMO_PLANE_XZ, GIZMO_PLANE_YZ]
+            var pl_normals = [bz, by, bx]
+            var vdir_pl = _gizmo_view_dir(pivot, cam_pos, cam_fwd)
             for pi in range(3):
+                if not gizmo_plane_usable(pl_normals[pi], vdir_pl):
+                    continue
                 var pp = project_world_to_viewport(pl_pts[pi], vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
                 if pp[3]:
                     var fc = GIZMO_COLOR_ACTIVE if active_handle == pl_ids[pi] else pl_cols[pi]
                     ui.add_rect(pp[0] - Float32(7.0), pp[1] - Float32(7.0), Float32(14.0), Float32(14.0), fc, Float32(2.0), Float32(1.5), pl_borders[pi])
 
+        var vdir_ax = _gizmo_view_dir(pivot, cam_pos, cam_fwd)
         for a in range(3):
+            if not gizmo_axis_usable(axes[a], vdir_ax):
+                continue  # matches `pick_gizmo_handle`: no handle is shown that cannot be dragged
             var tip = project_world_to_viewport(pivot + axes[a] * wscale, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             if not tip[3]:
                 continue

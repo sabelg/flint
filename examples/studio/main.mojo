@@ -88,13 +88,15 @@ from flint.studio import (
     fill_instance_entity_maps,
     gizmo_rotation_delta_rad,
     gizmo_scale_drag,
+    GIZMO_TARGET_PX,
     gizmo_world_scale,
     pick_gizmo_handle,
     ray_axis_closest_param,
     ray_plane_hit,
     snap_angle_deg,
-    snap_translation,
+    snap_constrained_delta,
 )
+from flint.studio.viewport_transform import ViewportTransform
 from flint.studio.studio_app import (
     populate_default_studio_scene,
     upload_default_studio_gpu_assets,
@@ -155,19 +157,43 @@ def _parse_anim_mode_arg(raw: String) -> Int:
     return -1
 
 
-def _sync_mcp_gate_from_bus(mut mcp: McpServerV2, studio: FlintStudioState):
-    """Aligns `McpServerV2` approval gate mode with the selected `AgentTelemetryBus` session policy."""
-    var si = studio.agent_bus.find_session_index(studio.agent_bus.selected_agent_id)
-    if si < 0 or si >= len(studio.agent_bus.sessions):
-        mcp.set_gate_mode(MCP_GATE_AUTO)
-        return
+def _gate_mode_for_session(studio: FlintStudioState, si: Int) -> Int:
+    if studio.agent_bus.sessions[si].paused:
+        return MCP_GATE_ALL
     var pol = studio.agent_bus.sessions[si].approval_policy
     if pol == APPROVAL_STEP:
-        mcp.set_gate_mode(MCP_GATE_ALL)
-    elif pol == APPROVAL_EDITS:
-        mcp.set_gate_mode(MCP_GATE_MUTATING)
-    else:
-        mcp.set_gate_mode(MCP_GATE_AUTO)
+        return MCP_GATE_ALL
+    if pol == APPROVAL_EDITS:
+        return MCP_GATE_MUTATING
+    return MCP_GATE_AUTO
+
+
+def _sync_mcp_gate_from_bus(mut mcp: McpServerV2, mut studio: FlintStudioState):
+    """Aligns `McpServerV2` approval gate mode with the selected `AgentTelemetryBus` session policy,
+    and hands tools the user approved in the Agents panel to the gate as one-shot allowances."""
+    for gi in range(len(studio.mcp_grant_once)):
+        var gkey = studio.mcp_grant_once_client[gi] if gi < len(studio.mcp_grant_once_client) else 0
+        if gkey > 0:
+            mcp.allow_tool_once_for_client(gkey, studio.mcp_grant_once[gi])
+        else:
+            mcp.allow_tool_once(studio.mcp_grant_once[gi])
+    studio.mcp_grant_once.clear()
+    studio.mcp_grant_once_client.clear()
+    # Socket clients: each follows the policy of its own agent session, not the one selected in the UI.
+    var keys = mcp.client_keys()
+    for ki in range(len(keys)):
+        var ck = keys[ki]
+        if ck <= 0 or not mcp.client_initialized(ck):
+            continue
+        var caid = studio.agent_for_mcp_client(ck, mcp.client_name_of(ck))
+        var csi = studio.agent_bus.find_session_index(caid)
+        if csi >= 0:
+            mcp.set_client_gate_mode(ck, _gate_mode_for_session(studio, csi))
+    # The in-process / stdio client (key 0) and clients not yet mapped follow the selected agent.
+    var si = studio.agent_bus.find_session_index(studio.agent_bus.selected_agent_id)
+    var m = MCP_GATE_AUTO if (si < 0 or si >= len(studio.agent_bus.sessions)) else _gate_mode_for_session(studio, si)
+    mcp.default_gate_mode = m
+    mcp.set_client_gate_mode(0, m)
 
 
 def _drain_mcp_events_to_studio(mut mcp: McpServerV2, mut studio: FlintStudioState):
@@ -190,6 +216,11 @@ def _drain_mcp_events_to_studio(mut mcp: McpServerV2, mut studio: FlintStudioSta
             agent_id=studio.agent_bus.selected_agent_id,
         )
         b.affected_entities = r.affected_entities.copy()
+        b.mcp_client_key = r.client_key
+        b.mcp_client_name = r.client_name
+        if r.client_key != 0:
+            # Socket clients each have their own agent session; key 0 keeps the selected agent.
+            b.agent_id = studio.agent_for_mcp_client(r.client_key, r.client_name)
         if len(b.affected_entities) > 0:
             var target_eid = b.affected_entities[0]
             if target_eid >= 0 and target_eid < len(studio.entities) and studio.is_alive_id(target_eid):
@@ -634,6 +665,7 @@ def _run_studio() raises -> Int:
         var now = get_time()
         var dt = Float32(min(0.05, max(0.001, now - t_last)))
         t_last = now
+        _ = studio.tick_autosave(dt)
 
         var inp_opt = studio.app.resources.get_ptr[InputStateResource]()
         var frame_input = inp_opt.value()[unsafe_offset=0].input.copy() if inp_opt else InputState()
@@ -705,16 +737,14 @@ def _run_studio() raises -> Int:
             break
 
         var vp_rect = studio.viewport_rect(out_w, out_h)
-        var vp_x = vp_rect.x
-        var vp_y = vp_rect.y
-        var vp_w = vp_rect.w
-        var vp_h = vp_rect.h
 
         var mx = frame_input.last_mouse_x
         var my = frame_input.last_mouse_y
         var in_vp = vp_rect.contains(mx, my)
 
         var _ui_s = studio.effective_ui_scale()
+        # The renderer projects over the whole window; the panel rect is only the clip/input region.
+        var vxf = ViewportTransform.from_physical(vp_rect, out_w, out_h, _ui_s)
         var ui_blocks_vp = (
             studio.dock.dragging_node >= 0
             or studio.dock.hovered_splitter_node >= 0
@@ -730,18 +760,16 @@ def _run_studio() raises -> Int:
             if g_piv[0]:
                 g_hit = pick_gizmo_handle(
                     mx, my, g_piv[1],
-                    studio.gizmo_mode, vp_x, vp_y, vp_w, vp_h,
+                    studio.gizmo_mode, Float32(0.0), Float32(0.0), vxf.proj_phys_w(), vxf.proj_phys_h(),
                     studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
+                    target_px=GIZMO_TARGET_PX * _ui_s,
                     gizmo_rot=gizmo_rot,
                 )
             if g_hit != GIZMO_AXIS_NONE:
                 dragging_gizmo = True
                 studio.active_gizmo_handle = g_hit
                 drag_seq += 1
-                drag_start_ray = ViewportRay.from_screen(
-                    mx, my, vp_x, vp_y, vp_w, vp_h,
-                    studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
-                )
+                drag_start_ray = vxf.ray_phys(mx, my, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
                 drag_start_pivot = g_piv[1]
                 drag_snaps = studio.capture_selected_transforms()
             else:
@@ -766,12 +794,9 @@ def _run_studio() raises -> Int:
             studio.active_gizmo_handle = GIZMO_AXIS_NONE
 
         if dragging_gizmo and frame_input.mouse_down(0) and len(drag_snaps) > 0:
-            var cur_ray = ViewportRay.from_screen(
-                mx, my, vp_x, vp_y, vp_w, vp_h,
-                studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
-            )
+            var cur_ray = vxf.ray_phys(mx, my, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
             var h_id = studio.active_gizmo_handle
-            var wscale = gizmo_world_scale(drag_start_pivot, studio.cam_pos, studio.cam_fwd, studio.fov_y_deg, Int(vp_h))
+            var wscale = gizmo_world_scale(drag_start_pivot, studio.cam_pos, studio.cam_fwd, studio.fov_y_deg, Int(vxf.proj_phys_h()), GIZMO_TARGET_PX * _ui_s)
             if studio.gizmo_mode == GIZMO_MODE_TRANSLATE:
                 var delta_p = Vec3()
                 if h_id == GIZMO_AXIS_X or h_id == GIZMO_AXIS_Y or h_id == GIZMO_AXIS_Z:
@@ -787,8 +812,7 @@ def _run_studio() raises -> Int:
                     if p0[0] and p1[0]:
                         delta_p = p1[1] - p0[1]
                 if studio.snap_enabled:
-                    var snapped_piv = snap_translation(drag_start_pivot + delta_p, studio.grid_snap_m)
-                    delta_p = snapped_piv - drag_start_pivot
+                    delta_p = snap_constrained_delta(drag_start_pivot, delta_p, h_id, studio.grid_snap_m, gizmo_rot)
                 _ = studio.apply_gizmo_drag_selected(
                     drag_snaps,
                     drag_start_pivot,

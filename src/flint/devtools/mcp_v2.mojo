@@ -42,6 +42,7 @@ from flint.assets.server import AssetServer
 from flint.audio.qoa import decode_qoa
 from flint.audio.server import AudioServer, BUS_SFX
 from flint.core.build_info import build_stamp
+from std.collections import Dict
 from flint.devtools.job_runner import JOB_SUCCEEDED, JobRunner
 from flint.devtools.problems import (
     DIAG_ERROR,
@@ -1106,7 +1107,8 @@ def _mcp_tools_list_json() -> String:
         + '{"name":"audio.play","description":"Plays a workspace-sandboxed .wav or .qoa sound via AudioServer during active PIE.","inputSchema":{"type":"object","required":["asset_path"],"properties":{"asset_path":{"type":"string"},"volume":{"type":"number"},"pitch":{"type":"number"},"looping":{"type":"boolean"},"position":{"type":"array"}}}},'
         + '{"name":"nav.query_path","description":"Queries a deterministic NavMesh A* path between start and goal during active PIE (auto-baking NavMesh if needed).","inputSchema":{"type":"object","required":["start","goal"],"properties":{"start":{"type":"array"},"goal":{"type":"array"},"search_radius":{"type":"number"}}}},'
         + '{"name":"project.package","description":"Packages the open Flint project into a self-contained distribution bundle inside workspace_root via tools/flint.sh package.","inputSchema":{"type":"object","properties":{"output_dir":{"type":"string"},"profile":{"type":"string"},"loose_assets":{"type":"boolean"},"target":{"type":"string"}}}},'
-        + '{"name":"code.build_hot_reload","description":"Compiles project gameplay Mojo code into a shared library inside workspace_root, parses compiler diagnostics, and hot-reloads it via HotReloadHost without resetting World state.","inputSchema":{"type":"object","properties":{"entry_path":{"type":"string"},"output_so":{"type":"string"},"reload_only":{"type":"boolean"},"opt_level":{"type":"string"},"compiler":{"type":"string"}}}},'
+        + '{"name":"code.build_hot_reload","description":"Compiles project gameplay Mojo code into a shared library inside workspace_root, parses compiler diagnostics, and hot-reloads it via HotReloadHost without resetting World state.","inputSchema":{"type":"object","properties":{"entry_path":{"type":"string"},"output_so":{"type":"string"},"reload_only":{"type":"boolean"},"opt_level":{"type":"string"},"compiler":{"type":"string"},"async":{"type":"boolean"}}}},'
+        + '{"name":"code.build_status","description":"Polls an async code.build_hot_reload (socket clients build async by default). Returns pending:true until the build finishes, then the build result and hot-reload outcome.","inputSchema":{"type":"object","required":["build_id"],"properties":{"build_id":{"type":"integer"}}}},'
         + '{"name":"code.diagnostics","description":"Returns merged Mojo LSP, build, test, and agent diagnostics currently tracked by Studio.","inputSchema":{"type":"object","properties":{"file":{"type":"string"},"severity":{"type":"string"},"max_items":{"type":"integer"}}}},'
         + '{"name":"nav.bake","description":"Rebuilds the deterministic scene NavMesh from live static colliders and returns baked polygon count.","inputSchema":{"type":"object","properties":{}}}'
         + "]}"
@@ -1193,6 +1195,7 @@ def _render_studio_software_preview(studio: FlintStudioState, width: Int, height
 # 4. Observable Tool Telemetry Hook, Gate & `McpServerV2` Dispatcher
 # ============================================================================
 
+comptime MCP_ASYNC_BUILD_TIMEOUT_SEC: Float64 = 600.0
 comptime MCP_GATE_AUTO: Int = 0       # All MCP tool calls execute immediately
 comptime MCP_GATE_MUTATING: Int = 1   # Mutating tools require explicit approval
 comptime MCP_GATE_ALL: Int = 2        # All tool calls require explicit approval
@@ -1210,6 +1213,9 @@ struct McpToolEvent(Copyable, Movable):
     var ok: Bool
     var is_mutating: Bool
     var blocked_by_gate: Bool
+    var client_key: Int
+    """MCP connection that made the call (0 = in-process / stdio)."""
+    var client_name: String
 
     def __init__(
         out self,
@@ -1231,6 +1237,8 @@ struct McpToolEvent(Copyable, Movable):
         self.ok = ok
         self.is_mutating = is_mutating
         self.blocked_by_gate = blocked_by_gate
+        self.client_key = 0
+        self.client_name = String("")
 
 
 def mcp_tool_is_mutating(tool_name: String) -> Bool:
@@ -1244,6 +1252,7 @@ def mcp_tool_is_mutating(tool_name: String) -> Bool:
         or tool_name == "physics.trigger_events"
         or tool_name == "nav.query_path"
         or tool_name == "code.diagnostics"
+        or tool_name == "code.build_status"
     ):
         return False
     return True
@@ -1286,6 +1295,25 @@ def _extract_affected_entities(
     return out^
 
 
+struct McpClientSession(Copyable, Movable):
+    """Per-connection MCP state: who the client is and what the user has approved for it.
+    Key 0 is the in-process / stdio client; socket clients get a unique connection id."""
+    var client_key: Int
+    var client_name: String
+    var initialized: Bool
+    var gate_mode: Int
+    var once_allow_tools: List[String]
+    var session_allow_tools: List[String]
+
+    def __init__(out self, client_key: Int, gate_mode: Int):
+        self.client_key = client_key
+        self.client_name = String("unknown-mcp-client")
+        self.initialized = False
+        self.gate_mode = gate_mode
+        self.once_allow_tools = List[String]()
+        self.session_allow_tools = List[String]()
+
+
 struct McpServerV2(Movable):
     var initialized: Bool
     var requests_handled: Int
@@ -1304,6 +1332,18 @@ struct McpServerV2(Movable):
     var proc_mesh_cache_keys: List[String]
     var proc_mesh_cache_mesh_ids: List[Int]
     var proc_mesh_cache_mat_ids: List[Int]
+    var build_jobs: JobRunner
+    """Async `code.build_hot_reload` jobs; finished by `code.build_status` on the UI thread."""
+    var pending_build_ids: List[Int]
+    var pending_build_rel_so: List[String]
+    var pending_build_abs_so: List[String]
+    var pending_build_deadline: List[Float64]
+    var finished_build_results: Dict[Int, String]
+    var finished_build_failed: Dict[Int, Bool]
+    var client_sessions: List[McpClientSession]
+    """Stored state of every client except the active one, whose state lives in the fields above."""
+    var active_client_key: Int
+    var default_gate_mode: Int
 
     def __init__(out self, workspace_root: String = ".", auth_token: String = ""):
         self.initialized = False
@@ -1323,12 +1363,105 @@ struct McpServerV2(Movable):
         self.proc_mesh_cache_keys = List[String]()
         self.proc_mesh_cache_mesh_ids = List[Int]()
         self.proc_mesh_cache_mat_ids = List[Int]()
+        self.build_jobs = JobRunner()
+        self.pending_build_ids = List[Int]()
+        self.pending_build_rel_so = List[String]()
+        self.pending_build_abs_so = List[String]()
+        self.pending_build_deadline = List[Float64]()
+        self.finished_build_results = Dict[Int, String]()
+        self.finished_build_failed = Dict[Int, Bool]()
+        self.client_sessions = List[McpClientSession]()
+        self.active_client_key = 0
+        self.default_gate_mode = MCP_GATE_AUTO
+
+    # ---- Per-client sessions ----
+    @staticmethod
+    def _sanitize_gate(mode: Int) -> Int:
+        if mode == MCP_GATE_MUTATING or mode == MCP_GATE_ALL:
+            return mode
+        return MCP_GATE_AUTO
+
+    def _find_stored(self, key: Int) -> Int:
+        for i in range(len(self.client_sessions)):
+            if self.client_sessions[i].client_key == key:
+                return i
+        return -1
+
+    def select_client(mut self, key: Int):
+        """Makes `key` the active client: its name, init flag, gate mode and approvals are swapped into
+        the server fields, so approvals for one agent never let another agent's calls through."""
+        if key == self.active_client_key:
+            return
+        var cur = McpClientSession(self.active_client_key, self.gate_mode)
+        cur.client_name = self.client_name
+        cur.initialized = self.initialized
+        swap(cur.once_allow_tools, self.once_allow_tools)
+        swap(cur.session_allow_tools, self.session_allow_tools)
+        var si = self._find_stored(key)
+        var nxt = self.client_sessions.pop(si) if si >= 0 else McpClientSession(key, self.default_gate_mode)
+        self.client_sessions.append(cur^)
+        self.active_client_key = key
+        self.client_name = nxt.client_name
+        self.initialized = nxt.initialized
+        self.gate_mode = nxt.gate_mode
+        swap(self.once_allow_tools, nxt.once_allow_tools)
+        swap(self.session_allow_tools, nxt.session_allow_tools)
+
+    def forget_client(mut self, key: Int):
+        """Drops a disconnected client's session; a later connection never inherits its approvals."""
+        if key == 0:
+            return
+        if key == self.active_client_key:
+            self.select_client(0)
+        var si = self._find_stored(key)
+        if si >= 0:
+            _ = self.client_sessions.pop(si)
+
+    def client_keys(self) -> List[Int]:
+        var out = List[Int]()
+        out.append(self.active_client_key)
+        for i in range(len(self.client_sessions)):
+            out.append(self.client_sessions[i].client_key)
+        return out^
+
+    def client_name_of(self, key: Int) -> String:
+        if key == self.active_client_key:
+            return self.client_name
+        var si = self._find_stored(key)
+        return self.client_sessions[si].client_name if si >= 0 else String("")
+
+    def client_initialized(self, key: Int) -> Bool:
+        if key == self.active_client_key:
+            return self.initialized
+        var si = self._find_stored(key)
+        return self.client_sessions[si].initialized if si >= 0 else False
+
+    def set_client_gate_mode(mut self, key: Int, mode: Int):
+        var m = Self._sanitize_gate(mode)
+        if key == self.active_client_key:
+            self.gate_mode = m
+            return
+        var si = self._find_stored(key)
+        if si >= 0:
+            self.client_sessions[si].gate_mode = m
+
+    def allow_tool_once_for_client(mut self, key: Int, tool_name: String):
+        if tool_name.byte_length() == 0:
+            return
+        if key == self.active_client_key:
+            self.once_allow_tools.append(tool_name)
+            return
+        var si = self._find_stored(key)
+        if si >= 0:
+            self.client_sessions[si].once_allow_tools.append(tool_name)
 
     def set_gate_mode(mut self, mode: Int):
-        if mode == MCP_GATE_MUTATING or mode == MCP_GATE_ALL:
-            self.gate_mode = mode
-        else:
-            self.gate_mode = MCP_GATE_AUTO
+        """Sets the gate for every client (and for clients that connect later)."""
+        var m = Self._sanitize_gate(mode)
+        self.default_gate_mode = m
+        self.gate_mode = m
+        for i in range(len(self.client_sessions)):
+            self.client_sessions[i].gate_mode = m
 
     def allow_tool_once(mut self, tool_name: String):
         if tool_name.byte_length() > 0:
@@ -1356,6 +1489,8 @@ struct McpServerV2(Movable):
         return False
 
     def _record_tool_event(mut self, var ev: McpToolEvent):
+        ev.client_key = self.active_client_key
+        ev.client_name = self.client_name
         if len(self.tool_events) >= MAX_MCP_TOOL_EVENTS:
             _ = self.tool_events.pop(0)
         self.tool_events.append(ev^)
@@ -1382,6 +1517,99 @@ struct McpServerV2(Movable):
         if r0.byte_length() > 0:
             return r0
         return doc.text(doc.object_get(doc.root, "authToken"), "")
+
+    def _finish_gameplay_build(
+        mut self,
+        mut studio: FlintStudioState,
+        compiled: Bool,
+        build_ok: Bool,
+        build_output: String,
+        build_diags: List[Diagnostic],
+        rel_so: String,
+        abs_so: String,
+    ) -> Tuple[Bool, String]:
+        """Diagnostics JSON + hot-reload once a gameplay build is done (sync or async)."""
+        var err_cnt = 0
+        var warn_cnt = 0
+        var diags_json = String("[")
+        for di in range(len(build_diags)):
+            ref d = build_diags[di]
+            if d.severity == DIAG_ERROR:
+                err_cnt += 1
+            elif d.severity == DIAG_WARNING:
+                warn_cnt += 1
+            if di > 0:
+                diags_json += ","
+            diags_json += (
+                '{"severity":'
+                + json_quote(severity_label(d.severity))
+                + ',"path":'
+                + json_quote(d.path)
+                + ',"line":'
+                + String(d.line)
+                + ',"col":'
+                + String(d.col)
+                + ',"message":'
+                + json_quote(d.message)
+                + "}"
+            )
+        diags_json += "]"
+
+        if not build_ok:
+            return (
+                True,
+                '{"ok":false,"compiled":false,"reloaded":false,"so_path":'
+                + json_quote(rel_so)
+                + ',"error_count":'
+                + String(err_cnt)
+                + ',"warning_count":'
+                + String(warn_cnt)
+                + ',"diagnostics":'
+                + diags_json
+                + ',"output":'
+                + json_quote(build_output)
+                + "}",
+            )
+
+        var reloaded = studio.load_gameplay_plugin(abs_so)
+        if not reloaded:
+            return (
+                True,
+                '{"ok":false,"compiled":'
+                + ("true" if compiled else "false")
+                + ',"reloaded":false,"so_path":'
+                + json_quote(rel_so)
+                + ',"error":'
+                + json_quote(studio.hot_reload_host.last_error)
+                + ',"error_count":'
+                + String(err_cnt)
+                + ',"warning_count":'
+                + String(warn_cnt)
+                + ',"diagnostics":'
+                + diags_json
+                + "}",
+            )
+
+        return (
+            False,
+            '{"ok":true,"compiled":'
+            + ("true" if compiled else "false")
+            + ',"reloaded":true,"so_path":'
+            + json_quote(rel_so)
+            + ',"reload_generation":'
+            + String(studio.hot_reload_host.reload_generation)
+            + ',"reload_ms":'
+            + _fmt_json_f64(studio.hot_reload_host.last_reload_ms)
+            + ',"error_count":'
+            + String(err_cnt)
+            + ',"warning_count":'
+            + String(warn_cnt)
+            + ',"diagnostics":'
+            + diags_json
+            + ',"state_hash":'
+            + json_quote(String(studio.state_hash()))
+            + "}",
+        )
 
     def _dispatch_tool_call(
         mut self,
@@ -1429,6 +1657,7 @@ struct McpServerV2(Movable):
                         mat_ref = mo_opt.value()[].material_ref.copy()
                 items += (
                     '{"entity_id":' + String(e.entity_id)
+                    + ',"editor_id":' + String(studio.editor_id_of(e.entity_id))
                     + ',"name":' + json_quote(e.name)
                     + ',"parent_id":' + String(e.parent_id)
                     + ',"position":' + _fmt_vec3_json(e.translation)
@@ -1491,6 +1720,7 @@ struct McpServerV2(Movable):
             return (
                 False,
                 '{"ok":true,"entity_id":' + String(eid)
+                + ',"editor_id":' + String(studio.editor_id_of(eid))
                 + ',"name":' + json_quote(name)
                 + ',"undo_depth":' + String(len(studio.undo_stack))
                 + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}",
@@ -3016,12 +3246,19 @@ struct McpServerV2(Movable):
                 var so_parent = parent_directory(abs_so)
                 if so_parent.byte_length() > 0 and so_parent != ".":
                     _ = make_dirs(so_parent)
-                var compiler = _first_str_arg(doc, args_node, "compiler")
+                # The agent may only *name* the toolchain: any other `compiler` value would let a tool call
+                # exec an arbitrary binary (`make`, `/usr/bin/env`, ...). The real binary comes from the
+                # user's environment (`FLINT_MOJO_BIN`) or the workspace / engine pixi env.
+                var req_compiler = _first_str_arg(doc, args_node, "compiler")
+                if req_compiler.byte_length() > 0 and req_compiler != "mojo":
+                    return (True, '{"ok":false,"error":"compiler must be \\"mojo\\" (other executables are not allowed)"}')
+                var compiler = env_now("FLINT_MOJO_BIN")
                 if compiler.byte_length() == 0:
-                    compiler = env_now("FLINT_MOJO_BIN")
-                if compiler.byte_length() == 0:
+                    var ws_mojo = self.workspace_root + "/.pixi/envs/default/bin/mojo"
                     var pixi_mojo = String(".pixi/envs/default/bin/mojo")
-                    if file_size(pixi_mojo) > 0:
+                    if self.workspace_root.byte_length() > 0 and file_size(ws_mojo) > 0:
+                        compiler = ws_mojo
+                    elif file_size(pixi_mojo) > 0:
                         compiler = pixi_mojo
                     else:
                         compiler = String("mojo")
@@ -3038,6 +3275,30 @@ struct McpServerV2(Movable):
                 if is_directory("src") and proj_root + "/src" != _normalize_abs_lexical(_getcwd_str() + "/src"):
                     inc.append("src")
 
+                # Socket clients default to an async build: the UI thread must not stall for a whole
+                # compile. The call returns a `build_id`; `code.build_status` finishes the reload.
+                var want_async = self.active_client_key != 0
+                if args_node >= 0:
+                    var as_node = doc.object_get(args_node, "async")
+                    if as_node >= 0:
+                        if doc.nodes[as_node].kind != 1:
+                            return (True, '{"ok":false,"error":"async must be a boolean"}')
+                        want_async = doc.boolean(as_node, want_async)
+                if want_async:
+                    var ajid = self.build_jobs.start_gameplay_so_build(
+                        proj_root, abs_entry, abs_so, inc, compiler=compiler, opt_flag=opt_level, werror=True
+                    )
+                    if ajid < 0:
+                        return (True, '{"ok":false,"compiled":false,"reloaded":false,"error":"failed to start mojo build"}')
+                    self.pending_build_ids.append(ajid)
+                    self.pending_build_rel_so.append(rel_so)
+                    self.pending_build_abs_so.append(abs_so)
+                    self.pending_build_deadline.append(get_time() + MCP_ASYNC_BUILD_TIMEOUT_SEC)
+                    return (
+                        False,
+                        '{"ok":true,"pending":true,"build_id":' + String(ajid)
+                        + ',"so_path":' + json_quote(rel_so) + ',"poll":"code.build_status"}',
+                    )
                 var runner = JobRunner()
                 var jid = runner.start_gameplay_so_build(
                     proj_root, abs_entry, abs_so, inc, compiler=compiler, opt_flag=opt_level, werror=True
@@ -3063,87 +3324,53 @@ struct McpServerV2(Movable):
                 compiled = build_ok
                 self.diagnostics_store.replace_source(DIAG_SRC_BUILD, build_diags)
 
-            var err_cnt = 0
-            var warn_cnt = 0
-            var diags_json = String("[")
-            for di in range(len(build_diags)):
-                ref d = build_diags[di]
-                if d.severity == DIAG_ERROR:
-                    err_cnt += 1
-                elif d.severity == DIAG_WARNING:
-                    warn_cnt += 1
-                if di > 0:
-                    diags_json += ","
-                diags_json += (
-                    '{"severity":'
-                    + json_quote(severity_label(d.severity))
-                    + ',"path":'
-                    + json_quote(d.path)
-                    + ',"line":'
-                    + String(d.line)
-                    + ',"col":'
-                    + String(d.col)
-                    + ',"message":'
-                    + json_quote(d.message)
-                    + "}"
-                )
-            diags_json += "]"
+            return self._finish_gameplay_build(studio, compiled, build_ok, build_output, build_diags, rel_so, abs_so)
 
-            if not build_ok:
+        # 28b. code.build_status (async `code.build_hot_reload`)
+        if tool_name == "code.build_status":
+            var bid_parsed = _parse_strict_json_int(doc, doc.object_get(args_node, "build_id") if args_node >= 0 else -1)
+            if not bid_parsed[0]:
+                return (True, '{"ok":false,"error":"build_id must be an integer"}')
+            var bid = bid_parsed[1]
+            var done_res = self.finished_build_results.get(bid, String(""))
+            if done_res.byte_length() > 0:
+                return (self.finished_build_failed.get(bid, False), done_res)
+            var pi = -1
+            for k in range(len(self.pending_build_ids)):
+                if self.pending_build_ids[k] == bid:
+                    pi = k
+            if pi < 0:
+                return (True, '{"ok":false,"error":"unknown build_id","build_id":' + String(bid) + "}")
+            _ = self.build_jobs.poll_all()
+            var bj = self.build_jobs.find_index(bid)
+            var running = bj >= 0 and self.build_jobs.jobs[bj].is_running()
+            if running and get_time() < self.pending_build_deadline[pi]:
                 return (
-                    True,
-                    '{"ok":false,"compiled":false,"reloaded":false,"so_path":'
-                    + json_quote(rel_so)
-                    + ',"error_count":'
-                    + String(err_cnt)
-                    + ',"warning_count":'
-                    + String(warn_cnt)
-                    + ',"diagnostics":'
-                    + diags_json
-                    + ',"output":'
-                    + json_quote(build_output)
-                    + "}",
+                    False,
+                    '{"ok":true,"pending":true,"build_id":' + String(bid)
+                    + ',"elapsed_s":' + _fmt_json_f64(self.build_jobs.jobs[bj].elapsed_sec()) + "}",
                 )
-
-            var reloaded = studio.load_gameplay_plugin(abs_so)
-            if not reloaded:
-                return (
-                    True,
-                    '{"ok":false,"compiled":'
-                    + ("true" if compiled else "false")
-                    + ',"reloaded":false,"so_path":'
-                    + json_quote(rel_so)
-                    + ',"error":'
-                    + json_quote(studio.hot_reload_host.last_error)
-                    + ',"error_count":'
-                    + String(err_cnt)
-                    + ',"warning_count":'
-                    + String(warn_cnt)
-                    + ',"diagnostics":'
-                    + diags_json
-                    + "}",
-                )
-
-            return (
-                False,
-                '{"ok":true,"compiled":'
-                + ("true" if compiled else "false")
-                + ',"reloaded":true,"so_path":'
-                + json_quote(rel_so)
-                + ',"reload_generation":'
-                + String(studio.hot_reload_host.reload_generation)
-                + ',"reload_ms":'
-                + _fmt_json_f64(studio.hot_reload_host.last_reload_ms)
-                + ',"error_count":'
-                + String(err_cnt)
-                + ',"warning_count":'
-                + String(warn_cnt)
-                + ',"diagnostics":'
-                + diags_json
-                + ',"state_hash":'
-                + json_quote(String(studio.state_hash()))
-                + "}",
-            )
+            var rel_so_b = self.pending_build_rel_so[pi]
+            var abs_so_b = self.pending_build_abs_so[pi]
+            _ = self.pending_build_ids.pop(pi)
+            _ = self.pending_build_rel_so.pop(pi)
+            _ = self.pending_build_abs_so.pop(pi)
+            _ = self.pending_build_deadline.pop(pi)
+            var res: Tuple[Bool, String]
+            if running:
+                _ = self.build_jobs.cancel(bid)
+                res = (True, '{"ok":false,"compiled":false,"reloaded":false,"error":"gameplay.so build timed out"}')
+            elif bj < 0:
+                res = (True, '{"ok":false,"compiled":false,"reloaded":false,"error":"build job lost"}')
+            else:
+                var b_ok = self.build_jobs.jobs[bj].state == JOB_SUCCEEDED
+                var b_out = self.build_jobs.jobs[bj].output_text()
+                var b_diags = self.build_jobs.jobs[bj].diagnostics.copy()
+                self.diagnostics_store.replace_source(DIAG_SRC_BUILD, b_diags)
+                res = self._finish_gameplay_build(studio, b_ok, b_ok, b_out, b_diags, rel_so_b, abs_so_b)
+            self.finished_build_results[bid] = res[1]
+            self.finished_build_failed[bid] = res[0]
+            return res
 
         # 29. code.diagnostics
         if tool_name == "code.diagnostics":
@@ -3320,52 +3547,110 @@ struct McpServerV2(Movable):
                 return _jsonrpc_err(id_raw, JSONRPC_INVALID_PARAMS, "tools/call missing tool name")
             var args_node = doc.object_get(params_node, "arguments")
             var args_str = json_text(doc, args_node) if args_node >= 0 else String("{}")
-            var mutating = mcp_tool_is_mutating(tname)
-            var ev_seq = self.next_event_seq
-            self.next_event_seq += 1
-
-            if not self._consume_gate_allowance(tname, mutating):
-                var blocked_json = (
-                    '{"ok":false,"approval_required":true,"gate_seq":'
-                    + String(ev_seq)
-                    + ',"tool":'
-                    + json_quote(tname)
-                    + ',"message":"Tool call requires user approval in Studio Agent Mission Control"}'
+            # Stable identity: `editor_id` (never reused) resolves to the current slot and wins over a
+            # legacy integer `entity_id`, which may point at a different entity after a slot is reused.
+            var ed_node = doc.object_get(args_node, "editor_id") if args_node >= 0 else -1
+            if ed_node >= 0:
+                var ed_parsed = _parse_strict_json_int(doc, ed_node)
+                if not ed_parsed[0] or ed_parsed[1] <= 0:
+                    return _jsonrpc_ok(id_raw, _mcp_tool_result('{"ok":false,"error":"editor_id must be a positive integer"}', is_error=True))
+                var slot = studio.slot_for_editor_id(UInt64(ed_parsed[1]))
+                if slot < 0:
+                    return _jsonrpc_ok(
+                        id_raw,
+                        _mcp_tool_result(
+                            '{"ok":false,"error":"unknown editor_id","editor_id":' + String(ed_parsed[1]) + "}", is_error=True
+                        ),
+                    )
+                var inner = args_str
+                var ib = inner.as_bytes()
+                var body = String("")
+                if len(ib) >= 2:
+                    body = String(unsafe_from_utf8=ib[1 : len(ib) - 1])
+                var sep = "," if body.strip().byte_length() > 0 else ""
+                # Keys are looked up first-match, so the resolved slot goes in front of any old `entity_id`.
+                var new_args = '{"entity_id":' + String(slot) + sep + body + "}"
+                var new_req = (
+                    '{"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":'
+                    + json_quote(tname) + ',"arguments":' + new_args + "}}"
                 )
-                var bev = McpToolEvent(
-                    seq=ev_seq,
-                    tool_name=tname,
-                    params_json=args_str,
-                    result_json=blocked_json,
-                    elapsed_ms=0.0,
-                    ok=False,
-                    is_mutating=mutating,
-                    blocked_by_gate=True,
-                )
-                bev.affected_entities = _extract_affected_entities(doc, args_node, "")
-                self._record_tool_event(bev^)
-                return _jsonrpc_ok(id_raw, _mcp_tool_result(blocked_json, is_error=True))
+                var nb = List[UInt8](capacity=new_req.byte_length())
+                for b in new_req.as_bytes():
+                    nb.append(b)
+                var ndoc = parse_json(nb)
+                if not ndoc.valid:
+                    return _jsonrpc_err(id_raw, JSONRPC_INVALID_PARAMS, "could not rewrite arguments for editor_id")
+                var np = ndoc.object_get(ndoc.root, "params")
+                var na = ndoc.object_get(np, "arguments")
+                return self._finish_tool_call(id_raw, tname, new_args, ndoc, na, studio, assets, pool, has_renderer, ren_ptr)
+            return self._finish_tool_call(id_raw, tname, args_str, doc, args_node, studio, assets, pool, has_renderer, ren_ptr)
 
-            var t0 = get_time()
-            var outcome = self._dispatch_tool_call(
-                tname, doc, args_node, studio, assets, pool, has_renderer, ren_ptr
+        return _jsonrpc_err(id_raw, JSONRPC_METHOD_NOT_FOUND, "Method not found: " + method)
+
+    def _finish_tool_call(
+        mut self,
+        id_raw: String,
+        tname: String,
+        args_str: String,
+        doc: JsonDocument,
+        args_node: Int,
+        mut studio: FlintStudioState,
+        mut assets: AssetServer,
+        mut pool: JobPool,
+        has_renderer: Bool,
+        ren_ptr: Int,
+    ) -> String:
+        var mutating = mcp_tool_is_mutating(tname)
+        var ev_seq = self.next_event_seq
+        self.next_event_seq += 1
+
+        if not self._consume_gate_allowance(tname, mutating):
+            var blocked_json = (
+                '{"ok":false,"approval_required":true,"gate_seq":'
+                + String(ev_seq)
+                + ',"tool":'
+                + json_quote(tname)
+                + ',"message":"Tool call requires user approval in Studio Agent Mission Control"}'
             )
-            var elapsed_ms = max(0.0, (get_time() - t0) * 1000.0)
-            var ev = McpToolEvent(
+            var bev = McpToolEvent(
                 seq=ev_seq,
                 tool_name=tname,
                 params_json=args_str,
-                result_json=outcome[1],
-                elapsed_ms=elapsed_ms,
-                ok=not outcome[0],
+                result_json=blocked_json,
+                elapsed_ms=0.0,
+                ok=False,
                 is_mutating=mutating,
-                blocked_by_gate=False,
+                blocked_by_gate=True,
             )
-            ev.affected_entities = _extract_affected_entities(doc, args_node, outcome[1])
-            self._record_tool_event(ev^)
-            return _jsonrpc_ok(id_raw, _mcp_tool_result(outcome[1], is_error=outcome[0]))
+            bev.affected_entities = _extract_affected_entities(doc, args_node, "")
+            self._record_tool_event(bev^)
+            return _jsonrpc_ok(id_raw, _mcp_tool_result(blocked_json, is_error=True))
 
-        return _jsonrpc_err(id_raw, JSONRPC_METHOD_NOT_FOUND, "Method not found: " + method)
+        var t0 = get_time()
+        # Undo entries made by this call are tagged with the calling agent (Phase 6 origin): socket
+        # clients map to their own agent session, the in-process / stdio client to -1 ("external").
+        var prev_origin = studio._active_tx_agent_id
+        studio._active_tx_agent_id = (
+            Int(studio.agent_for_mcp_client(self.active_client_key, self.client_name)) if self.active_client_key != 0 else -1
+        )
+        var outcome = self._dispatch_tool_call(
+            tname, doc, args_node, studio, assets, pool, has_renderer, ren_ptr
+        )
+        studio._active_tx_agent_id = prev_origin
+        var elapsed_ms = max(0.0, (get_time() - t0) * 1000.0)
+        var ev = McpToolEvent(
+            seq=ev_seq,
+            tool_name=tname,
+            params_json=args_str,
+            result_json=outcome[1],
+            elapsed_ms=elapsed_ms,
+            ok=not outcome[0],
+            is_mutating=mutating,
+            blocked_by_gate=False,
+        )
+        ev.affected_entities = _extract_affected_entities(doc, args_node, outcome[1])
+        self._record_tool_event(ev^)
+        return _jsonrpc_ok(id_raw, _mcp_tool_result(outcome[1], is_error=outcome[0]))
 
     def handle_jsonrpc(
         mut self,
@@ -3500,7 +3785,12 @@ struct FlintMcpUnixListener(Movable):
     var client_fds: List[Int]
     var client_rx_bufs: List[List[UInt8]]
     var client_authed: List[Bool]
+    var client_conn_ids: List[Int]
+    """Unique per-connection key for `McpServerV2.select_client` (fds are reused; these never are)."""
+    var next_conn_id: Int
     var _io_scratch: List[UInt8]
+    var rr_cursor: Int
+    """Client index the next budgeted dispatch pass starts at, so one busy client cannot starve the rest."""
 
     def __init__(out self, socket_path: String = ""):
         self.socket_path = String()
@@ -3511,7 +3801,10 @@ struct FlintMcpUnixListener(Movable):
         self.client_fds = List[Int]()
         self.client_rx_bufs = List[List[UInt8]]()
         self.client_authed = List[Bool]()
+        self.client_conn_ids = List[Int]()
+        self.next_conn_id = 1
         self._io_scratch = List[UInt8](length=8192, fill=0)
+        self.rr_cursor = 0
         var effective_path = socket_path if socket_path.byte_length() > 0 else default_mcp_socket_path()
         _ = self.start(effective_path)
 
@@ -3577,6 +3870,7 @@ struct FlintMcpUnixListener(Movable):
         self.client_fds.clear()
         self.client_rx_bufs.clear()
         self.client_authed.clear()
+        self.client_conn_ids.clear()
         if self.listen_fd >= 0:
             close_fd(self.listen_fd)
             self.listen_fd = -1
@@ -3592,6 +3886,7 @@ struct FlintMcpUnixListener(Movable):
         _ = self.client_fds.pop(idx)
         _ = self.client_rx_bufs.pop(idx)
         _ = self.client_authed.pop(idx)
+        _ = self.client_conn_ids.pop(idx)
 
     def _poll_internal(
         mut self,
@@ -3626,14 +3921,15 @@ struct FlintMcpUnixListener(Movable):
             self.client_fds.append(cfd)
             self.client_rx_bufs.append(List[UInt8]())
             self.client_authed.append(mcp.auth_token.byte_length() == 0)
+            self.client_conn_ids.append(self.next_conn_id)
+            self.next_conn_id += 1
 
-        var processed = 0
-        var ci = 0
-        while ci < len(self.client_fds):
+        # Phase 1: drain readable bytes from every client (non-blocking) and note closed/broken peers.
+        var n_clients = len(self.client_fds)
+        var closed = List[Bool](length=n_clients, fill=False)
+        var drop = List[Bool](length=n_clients, fill=False)
+        for ci in range(n_clients):
             var cfd = self.client_fds[ci]
-            var peer_closed = False
-            var peer_error = False
-
             while len(self.client_rx_bufs[ci]) <= MAX_MCP_MESSAGE_BYTES:
                 var ask = min(8192, (MAX_MCP_MESSAGE_BYTES + 1) - len(self.client_rx_bufs[ci]))
                 var n = Int(external_call["read", Int64](Int32(cfd), self._io_scratch.unsafe_ptr(), Int64(ask)))
@@ -3641,7 +3937,7 @@ struct FlintMcpUnixListener(Movable):
                     for k in range(n):
                         self.client_rx_bufs[ci].append(self._io_scratch[k])
                 elif n == 0:
-                    peer_closed = True
+                    closed[ci] = True
                     break
                 else:
                     var err = last_errno()
@@ -3649,57 +3945,65 @@ struct FlintMcpUnixListener(Movable):
                         continue
                     if err == _EAGAIN:
                         break
-                    peer_error = True
+                    drop[ci] = True
                     break
 
-            if peer_error:
-                self._drop_client(ci)
-                continue
-
-            var dropped_in_parse = False
-            var budget_hit = False
-            while True:
-                if max_frames > 0 and processed >= max_frames:
-                    budget_hit = True
-                    break
-                if max_budget_sec > 0.0 and processed > 0 and (get_time() - t_start) >= max_budget_sec:
-                    budget_hit = True
-                    break
-                var frame = parse_next_mcp_frame(self.client_rx_bufs[ci])
-                if frame.protocol_error:
-                    var err_resp = _jsonrpc_err("null", frame.error_code, frame.error_message)
-                    var err_b = encode_mcp_frame(err_resp, use_content_length=frame.used_content_length)
-                    _ = send_span_bounded(cfd, Span(err_b), timeout_ms=500, is_socket=True)
-                    self._drop_client(ci)
-                    dropped_in_parse = True
-                    break
-                if not frame.has_frame:
-                    break
-
-                mcp.session_authenticated = self.client_authed[ci]
-                var resp = mcp._handle_request_bytes(frame.payload, studio, assets, pool, has_renderer, ren_ptr)
-                self.client_authed[ci] = mcp.session_authenticated
-                processed += 1
-
-                if resp.byte_length() > 0:
-                    var out_b = encode_mcp_frame(resp, use_content_length=frame.used_content_length)
-                    var ok_send = send_span_bounded(cfd, Span(out_b), timeout_ms=2000, is_socket=True)
-                    if not ok_send:
-                        self._drop_client(ci)
-                        dropped_in_parse = True
+        # Phase 2: dispatch round-robin, one frame per client per pass, starting where the last
+        # budgeted tick stopped. Clients are only removed after the loop so indices stay stable.
+        var processed = 0
+        var budget_hit = False
+        var resume_at = 0
+        if n_clients > 0:
+            var start = self.rr_cursor % n_clients
+            var progress = True
+            while progress and not budget_hit:
+                progress = False
+                for k in range(n_clients):
+                    var ci = (start + k) % n_clients
+                    if drop[ci]:
+                        continue
+                    if max_frames > 0 and processed >= max_frames:
+                        budget_hit = True
+                    elif max_budget_sec > 0.0 and processed > 0 and (get_time() - t_start) >= max_budget_sec:
+                        budget_hit = True
+                    if budget_hit:
+                        resume_at = ci
                         break
+                    var frame = parse_next_mcp_frame(self.client_rx_bufs[ci])
+                    var cfd = self.client_fds[ci]
+                    if frame.protocol_error:
+                        var err_resp = _jsonrpc_err("null", frame.error_code, frame.error_message)
+                        var err_b = encode_mcp_frame(err_resp, use_content_length=frame.used_content_length)
+                        _ = send_span_bounded(cfd, Span(err_b), timeout_ms=500, is_socket=True)
+                        drop[ci] = True
+                        continue
+                    if not frame.has_frame:
+                        continue
+                    progress = True
+                    mcp.select_client(self.client_conn_ids[ci])
+                    mcp.session_authenticated = self.client_authed[ci]
+                    var resp = mcp._handle_request_bytes(frame.payload, studio, assets, pool, has_renderer, ren_ptr)
+                    self.client_authed[ci] = mcp.session_authenticated
+                    mcp.select_client(0)
+                    processed += 1
+                    if resp.byte_length() > 0:
+                        var out_b = encode_mcp_frame(resp, use_content_length=frame.used_content_length)
+                        if not send_span_bounded(cfd, Span(out_b), timeout_ms=2000, is_socket=True):
+                            drop[ci] = True
 
-            if dropped_in_parse:
-                continue
-
-            if peer_closed and not budget_hit:
-                self._drop_client(ci)
-                continue
-
-            if budget_hit:
-                break
-
-            ci += 1
+        # A closed peer is dropped once its buffered requests are done (or right away if it broke).
+        for ci in range(n_clients):
+            if closed[ci] and not budget_hit:
+                drop[ci] = True
+        var i = n_clients - 1
+        while i >= 0:
+            if drop[i]:
+                mcp.forget_client(self.client_conn_ids[i])
+                self._drop_client(i)
+                if resume_at > i:
+                    resume_at -= 1
+            i -= 1
+        self.rr_cursor = resume_at if budget_hit else 0
 
         return processed
 

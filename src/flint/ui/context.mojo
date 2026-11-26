@@ -126,6 +126,19 @@ def format_float2(v: Float32) -> String:
 
 
 @always_inline
+def utf8_drop_last_char(text: String) -> String:
+    """Returns `text` without its last UTF-8 code point (Backspace), never splitting a multibyte sequence."""
+    var n = text.byte_length()
+    if n == 0:
+        return String("")
+    var bytes = text.as_bytes()
+    var cut = n - 1
+    # Step back over continuation bytes (10xxxxxx), at most 3 of them.
+    while cut > 0 and n - cut < 4 and (Int(bytes[cut]) & 0xC0) == 0x80:
+        cut -= 1
+    return String(text[byte=0:cut])
+
+
 def hash_ui_id(parent_seed: UInt64, text: String) -> UInt64:
     """FNV-1a 64-bit hierarchical widget ID hash (non-zero)."""
     var h = parent_seed if parent_seed != 0 else UInt64(0xCBF29CE484222325)

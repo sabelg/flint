@@ -301,6 +301,8 @@ struct AgentGhostPreview(Copyable, Movable):
     var agent_id: UInt32
     var step_id: UInt64
     var entity_id: Int
+    var editor_id: UInt64
+    """Stable `editor_id` of `entity_id` when the preview was queued (0 = not stamped yet)."""
     var label: String
     var from_pos: Vec3
     var has_from_pos: Bool
@@ -327,6 +329,7 @@ struct AgentGhostPreview(Copyable, Movable):
         self.agent_id = agent_id
         self.step_id = step_id
         self.entity_id = entity_id
+        self.editor_id = UInt64(0)
         self.label = label
         self.from_pos = _safe_vec3(from_pos)
         self.has_from_pos = has_from_pos
@@ -531,6 +534,8 @@ struct PendingApproval(Copyable, Movable):
     var tool_name: String
     var tool_kind: String
 
+    var mcp_client_key: Int
+    """MCP connection whose gated call this is; an approval grants the retry to that client only."""
     # Deferred MCP socket response framing (for APPROVAL_SRC_MCP_TOOL)
     var client_fd: Int
     var request_id_raw: String
@@ -570,6 +575,7 @@ struct PendingApproval(Copyable, Movable):
         self.summary = summary
         self.tool_name = String()
         self.tool_kind = String()
+        self.mcp_client_key = 0
         self.client_fd = -1
         self.request_id_raw = String()
         self.use_content_length = False

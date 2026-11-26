@@ -104,6 +104,9 @@ struct BridgedMcpEvent(Copyable, Movable):
     var ok: Bool
     var is_mutating: Bool
     var blocked_by_gate: Bool
+    var mcp_client_key: Int
+    """MCP connection that made the call (0 = in-process / stdio)."""
+    var mcp_client_name: String
 
     # Optional spatial hints supplied by Studio when entity world positions are known
     var world_pos: Vec3
@@ -134,6 +137,8 @@ struct BridgedMcpEvent(Copyable, Movable):
         self.ok = ok
         self.is_mutating = is_mutating
         self.blocked_by_gate = blocked_by_gate
+        self.mcp_client_key = 0
+        self.mcp_client_name = String("")
         self.world_pos = Vec3()
         self.has_world_pos = False
         self.prev_world_pos = Vec3()
@@ -661,6 +666,7 @@ struct StudioAgentRuntime(Movable):
                 var pa = PendingApproval(0, aid, sid, APPROVAL_SRC_MCP_TOOL, summary, "Gated MCP tool: " + ev.tool_name)
                 pa.tool_name = ev.tool_name
                 pa.raw_payload_json = ev.params_json
+                pa.mcp_client_key = ev.mcp_client_key
                 var gk = _ghost_kind_for_mcp_tool(ev.tool_name)
                 if gk != GHOST_NONE and has_pos:
                     var accent = agent_role_accent_rgba8(ROLE_SCENE_BUILDER)

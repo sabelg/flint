@@ -69,6 +69,22 @@ def x11_evdev_key(key: Int) -> Int:
     for index in range(26):
         if key == letters[index]:
             return 65 + index
+    # Keypad (GLFW slots): KP_0..KP_9 = 320..329, KP_DECIMAL 330, KP_DIVIDE 331, KP_MULTIPLY 332,
+    # KP_SUBTRACT 333, KP_ADD 334 (KP_ENTER stays Enter, 257).
+    var keypad = [82, 79, 80, 81, 75, 76, 77, 71, 72, 73]
+    for index in range(10):
+        if key == keypad[index]:
+            return 320 + index
+    if key == 83:
+        return 330
+    if key == 98:
+        return 331
+    if key == 55:
+        return 332
+    if key == 74:
+        return 333
+    if key == 78:
+        return 334
     var digits = [11, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     for index in range(10):
         if key == digits[index]:

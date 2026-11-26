@@ -487,6 +487,34 @@ cmd_pack() {
     (cd "$CALLER_PWD" && "${ROOT}/build/flint-pack" "$@")
 }
 
+# Studio editor-model suites. They each import the whole Studio app, so they build at -O1
+# (an -O3 build of each takes 4-8 min); `FLINT_STUDIO_TEST_OPT=-O3` restores full optimisation.
+STUDIO_TEST_SUITES=(test_studio_phase0 test_studio_viewport test_studio_identity test_studio_sessions test_studio_core_bugs test_studio_redesign_ui test_studio_agent_theatre)
+
+build_studio_suites() {
+    local opt="${FLINT_STUDIO_TEST_OPT:--O1}"
+    local name
+    mkdir -p "${ROOT}/build/studio-tests"
+    for name in "${STUDIO_TEST_SUITES[@]}"; do
+        [[ -f "${ROOT}/tests/${name}.mojo" ]] || continue
+        echo "[Flint] Building tests/${name}.mojo -> build/studio-tests/${name} (${opt}) ..."
+        compile_mojo "${ROOT}/tests/${name}.mojo" "${ROOT}/build/studio-tests/${name}" "$opt"
+    done
+}
+
+run_studio_suites() {
+    local name state_dir
+    for name in "${STUDIO_TEST_SUITES[@]}"; do
+        [[ -x "${ROOT}/build/studio-tests/${name}" ]] || continue
+        echo "[Flint] Running ${name}..."
+        # Each suite gets an empty XDG state dir: Studio saves its dock layout on shutdown, and a
+        # layout left behind by one suite (or by the user's own Studio) changes panel sizes in the next.
+        state_dir="$(mktemp -d "${TMPDIR:-/tmp}/flint-studio-test-state.XXXXXX")"
+        XDG_STATE_HOME="$state_dir" "${ROOT}/build/studio-tests/${name}"
+        rm -rf "$state_dir"
+    done
+}
+
 run_v5_suites() {
     local v5_bin
     for v5_bin in "${ROOT}"/build/v5/test_flint_v5_*; do
@@ -513,6 +541,11 @@ cmd_test() {
     elif [[ "$sub" == "v5" ]]; then
         cmd_build v5
         run_v5_suites
+    elif [[ "$sub" == "studio" ]]; then
+        build_studio_suites
+        run_studio_suites
+        bash "${ROOT}/tests/test_studio_ide.sh"
+        bash "${ROOT}/tests/test_studio_profile_compare.sh"
     else
         cmd_build test
         echo "[Flint] Running Flint Engine test suite..."
@@ -1107,6 +1140,8 @@ cmd_gate() {
     "${ROOT}/build/flint-hygiene-cooker-test"
     bash "${ROOT}/tests/test_studio_ide.sh"
     bash "${ROOT}/tests/test_studio_profile_compare.sh"
+    build_studio_suites
+    run_studio_suites
     # Render all showcase & Studio headless shots before E2E and FLIP checks.
     mkdir -p "${ROOT}/build/shots"
     "${ROOT}/build/flint-spark" --shots

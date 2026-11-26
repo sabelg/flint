@@ -1,5 +1,6 @@
 """A seekable two-clip move, with a ledge-relative contact, camera and cue track."""
 from std.ffi import external_call
+from std.math import isfinite
 from flint.anim.pose import Pose, SkeletonInstance, blend_into, sample_pose
 from flint.anim.procedural import Placement, smooth01
 from flint.assets.json import JsonDocument, parse_json
@@ -205,7 +206,10 @@ struct MotionPlayer(Movable):
     def duration(self, model: NativeModel, sequence: MotionSequence) -> Float32:
         var a = model.animations[self.first].duration
         var b = model.animations[self.second].duration
-        return a + b - min(a, b) * sequence.overlap
+        var d = a + b - min(a, b) * sequence.overlap
+        # Callers divide by this (phase = t / duration): two pose-only (zero-length) clips must not give
+        # 0 and turn the playhead into NaN. One 30 fps frame is the shortest meaningful sequence.
+        return d if (isfinite(d) and d > Float32(1.0 / 30.0)) else Float32(1.0 / 30.0)
 
     def can_catch(self, wall: Placement, hand: Vec3, velocity: Vec3, reach: Float32) -> Bool:
         """Test a descending hand on the approach side. The wall faces local -Z."""

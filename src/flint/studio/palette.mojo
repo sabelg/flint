@@ -203,6 +203,9 @@ struct StudioCommandPalette(Copyable, Movable):
     var visible_rows: Int
     var frecency: FrecencyStore
     var now_sec: Int
+    var hover_mx: Float32
+    """Mouse position at the last hover-driven selection; hover only steals the selection after the mouse moves."""
+    var hover_my: Float32
 
     def __init__(out self, visible_rows: Int = 9):
         self.is_open = False
@@ -218,6 +221,8 @@ struct StudioCommandPalette(Copyable, Movable):
         self.visible_rows = max(1, visible_rows)
         self.frecency = FrecencyStore()
         self.now_sec = 0
+        self.hover_mx = Float32(-1.0e9)
+        self.hover_my = Float32(-1.0e9)
 
     def __init__(out self, *, copy: Self):
         self.is_open = copy.is_open
@@ -233,6 +238,8 @@ struct StudioCommandPalette(Copyable, Movable):
         self.visible_rows = copy.visible_rows
         self.frecency = copy.frecency.copy()
         self.now_sec = copy.now_sec
+        self.hover_mx = copy.hover_mx
+        self.hover_my = copy.hover_my
 
     def open(
         mut self,
@@ -249,6 +256,8 @@ struct StudioCommandPalette(Copyable, Movable):
         self.now_sec = max(0, now_sec)
         self.selected_idx = 0
         self.scroll_top = 0
+        self.hover_mx = Float32(-1.0e9)  # re-anchored on the first drawn frame; a resting cursor never selects
+        self.hover_my = Float32(-1.0e9)
         if initial_query.byte_length() > 0:
             self.set_query(initial_query)
         else:
@@ -686,6 +695,9 @@ def draw_command_palette(
     dl.add_rect(Float32(0.0), Float32(0.0), sw, sh, rgba8_scale_alpha(theme.l4_scrim, alpha))
 
     var pal_w = min(Float32(560.0), sw - Float32(40.0))
+    if palette.hover_mx < Float32(-1.0e8):
+        palette.hover_mx = mouse_x
+        palette.hover_my = mouse_y
     var n_res = len(palette.results)
     var shown_rows = max(1, min(palette.visible_rows, n_res))
     var row_h = Float32(34.0)
@@ -786,6 +798,11 @@ def draw_command_palette(
             palette.raw_query = palette_mode_prefix(mi) + palette.filter_query
             palette.refilter()
 
+    # A mode-tab click above re-filters mid-draw: re-read the result count so the loop below never
+    # indexes past the (possibly shrunk) `results` list. Keep the panel height chosen for this frame.
+    n_res = len(palette.results)
+    shown_rows = max(1, min(shown_rows, n_res))
+
     # ---- Results List ----
     var list_y = pal_r.y + header_h + tabs_h + Float32(4.0)
     if n_res == 0:
@@ -854,7 +871,11 @@ def draw_command_palette(
                     _pal_draw_text(dl, font_slot, font, sub_disp, sub_x, rr.center_y() - Float32(6.0), Float32(11.5), rgba8_scale_alpha(theme.text_muted, alpha))
 
             if rhov:
-                palette.selected_idx = ri
+                var moved = abs(mouse_x - palette.hover_mx) + abs(mouse_y - palette.hover_my) > Float32(0.5)
+                if moved or mouse_pressed:
+                    palette.selected_idx = ri
+                    palette.hover_mx = mouse_x
+                    palette.hover_my = mouse_y
                 if mouse_pressed:
                     return palette.accept_index(ri, secondary=key_shift)
 
