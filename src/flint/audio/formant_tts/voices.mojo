@@ -129,8 +129,10 @@ def formant_voice(id: Int) -> FormantVoice:
     elif id == FV_ACE_BARITONE:
         v.shelf_db = 10.0
         v.presence_db = 9.0
-        # relaxed veteran, phrase-final creak; mean 99 Hz
-        v.f0_base = 90.0
+        # relaxed veteran, phrase-final creak; mean ~121 Hz. At 90 Hz (mean 99) the radio chain's
+        # 320 Hz high-pass left only harmonics 4+ and Moonshine WER sat at 40 % whatever the EQ;
+        # 105 -> 30.5 %, 112 -> 25.9 % (tuning log r3)
+        v.f0_base = 112.0
         v.range_st = 5.5
         v.rate_wpm = 145.0
         v.set_scales(0.90, 0.90, 0.91, 0.92, 0.93)
@@ -159,7 +161,7 @@ def formant_voice(id: Int) -> FormantVoice:
     elif id == FV_ACE_CRIMSON:
         v.shelf_db = 10.0
         v.presence_db = 9.0
-        # pressed, confident warrior, GB; mean 196 Hz
+        # pressed, confident warrior; mean 196 Hz
         v.f0_base = 178.0
         v.range_st = 7.0
         v.rate_wpm = 156.0
@@ -173,7 +175,8 @@ def formant_voice(id: Int) -> FormantVoice:
         v.flutter = 15.0
         v.df1 = 30.0
         v.db1 = 100.0
-        v.british = True
+        # US lexicon: with GB G2P the chain WER was 49 %, with US 37 % (tuning log r3)
+        v.british = False
         v.f0_floor = 110.0
     return v^
 
