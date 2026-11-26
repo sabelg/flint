@@ -28,7 +28,9 @@ from flint.platform.vulkan import (
     ACCESS_SHADER_WRITE,
     PIPELINE_BOTTOM,
     PIPELINE_COMPUTE,
+    GpuBuffer,
     VulkanGpu,
+    VulkanImage,
     put32,
     put_float,
 )
@@ -82,16 +84,66 @@ from flint.render.sota_atmo_core import (
     sample_transmittance,
     sun_visibility,
 )
-
-comptime SOTA_ATMO_G: Int = 3840  # b_globals words [3840, 3904) (free in the v5 layout; E uses 3072..3099)
-comptime SOTA_ATMO_FLAG_SKY: UInt32 = 1
-comptime SOTA_ATMO_FLAG_AP: UInt32 = 2
-comptime SOTA_ATMO_FLAG_FOG: UInt32 = 4
-comptime SOTA_ATMO_FLAG_SUN_DISC: UInt32 = 8
-comptime SOTA_ATMO_FLAG_MOON_DISC: UInt32 = 16
-
-comptime _LOG2E: Float32 = 1.44269504
-comptime _PI: Float32 = 3.14159265358979
+from flint.render.sota_atmo_clouds import (
+    CW_ALPHA,
+    CW_DIV,
+    CW_DWIND_X,
+    CW_DWIND_Z,
+    CW_FRAME,
+    CW_HIST_VALID,
+    CW_JITTER,
+    CW_PREV_CAM,
+    SOTA_CLOUD_BASE_N,
+    SOTA_CLOUD_DETAIL_N,
+    SOTA_CLOUD_WEATHER_N,
+    SotaClouds,
+    cloud_buffer_words,
+    cloud_region_words,
+    emit_cloud_composite,
+    sota_cloud_weather_shader,
+)
+from flint.render.sota_atmo_ibl import SotaAtmoIblGpu, ibl_region_words
+from flint.render.sota_atmo_night import (
+    SOTA_NIGHT_W_BG,
+    SOTA_NIGHT_W_E0,
+    SOTA_NIGHT_W_FLAGS,
+    SOTA_NIGHT_W_MLIM,
+    SOTA_NIGHT_W_MW,
+    SOTA_NIGHT_W_PSF,
+    SOTA_NIGHT_W_SEED,
+    SOTA_NIGHT_W_STARS,
+    SotaNightSky,
+    emit_night_sky,
+    surface_brightness_radiance,
+    world_to_equatorial_rows,
+)
+from flint.render.sota_atmo_dsl import (
+    SOTA_ATMO_FLAG_AP,
+    SOTA_ATMO_FLAG_FOG,
+    SOTA_ATMO_FLAG_MOON_DISC,
+    SOTA_ATMO_FLAG_SKY,
+    SOTA_ATMO_FLAG_SUN_DISC,
+    SOTA_ATMO_G,
+    SOTA_ATMO_G2,
+    _Atmo,
+    _ap_fetch,
+    _bilerp_buf,
+    _cs,
+    _gacos,
+    _gatan2,
+    _ground_dist,
+    _height_fog_od,
+    _march_segment,
+    _sample_trans,
+    _step_integral,
+    _light_term,
+    _Medium,
+    _gexp,
+    _gexp3,
+    _top_dist,
+    _sun_vis,
+    _sky_view_radiance,
+)
 
 
 # ============================================================================
@@ -119,246 +171,15 @@ def sota_atmo_ap_words() -> Int:
 
 
 @always_inline
-def sota_atmo_region_words() -> Int:
-    return sota_atmo_trans_words() + sota_atmo_ms_words() + sota_atmo_sky_words() + sota_atmo_ap_words()
+def sota_atmo_region_words(max_pix: Int = 0, env_dim: Int = 64, env_mips: Int = 5) -> Int:
+    """LUTs + aerial-perspective volume (1.66 MB), the GPU IBL staging (SH9 + BC6H blocks, about 0.1 MB for a 64^2
+    cube), the cloud noise volumes + weather map (1.7 MB) and two cloud images (`max_pix / 4` pixels each)."""
+    var w = sota_atmo_trans_words() + sota_atmo_ms_words() + sota_atmo_sky_words() + sota_atmo_ap_words() + 4
+    w += ibl_region_words(env_dim, env_mips)
+    if max_pix > 0:
+        w += cloud_region_words(max_pix)
+    return w
 
-
-# ============================================================================
-# DSL helpers (each mirrors a CPU function of sota_atmo_core)
-# ============================================================================
-
-@always_inline
-def _gexp(x: GpuF32) -> GpuF32:
-    return exp2_f(x * _LOG2E)
-
-
-@always_inline
-def _gexp3(v: GpuVec3) -> GpuVec3:
-    return GpuVec3(_gexp(v.x()), _gexp(v.y()), _gexp(v.z()))
-
-
-def _gatan2(mut dsl: ShaderDsl, y: GpuF32, x: GpuF32) -> GpuF32:
-    return GpuF32(dsl.mod_addr, dsl.raw_module()[].fatan2(y.id, x.id))
-
-
-def _gacos(mut dsl: ShaderDsl, c: GpuF32) -> GpuF32:
-    var cc = clamp_f(c, -1.0, 1.0)
-    return _gatan2(dsl, sqrt_f(max_f(1.0 - cc * cc, 0.0)), cc)
-
-
-struct _Atmo(Copyable, Movable):
-    var ray: GpuVec3
-    var h_r: GpuF32
-    var mie_s: GpuVec3
-    var h_m: GpuF32
-    var mie_e: GpuVec3
-    var g: GpuF32
-    var oz: GpuVec3
-    var oz_c: GpuF32
-    var oz_hw: GpuF32
-    var rb: GpuF32
-    var rt: GpuF32
-    var kpu: GpuF32
-    var albedo: GpuVec3
-    var r_cam: GpuF32
-    var sun_d: GpuVec3
-    var sun_ar: GpuF32
-    var sun_e: GpuVec3
-    var ap_max: GpuF32
-    var moon_d: GpuVec3
-    var moon_ar: GpuF32
-    var moon_e: GpuVec3
-    var moon_alb: GpuF32
-
-    def __init__(out self, mut dsl: ShaderDsl, b: BufferRef[1]):
-        var w = SOTA_ATMO_G
-        self.ray = b.load_vec3(dsl.u32(UInt32(w + 0)))
-        self.h_r = b.load_f32(dsl.u32(UInt32(w + 3)))
-        self.mie_s = b.load_vec3(dsl.u32(UInt32(w + 4)))
-        self.h_m = b.load_f32(dsl.u32(UInt32(w + 7)))
-        self.mie_e = b.load_vec3(dsl.u32(UInt32(w + 8)))
-        self.g = b.load_f32(dsl.u32(UInt32(w + 11)))
-        self.oz = b.load_vec3(dsl.u32(UInt32(w + 12)))
-        self.oz_c = b.load_f32(dsl.u32(UInt32(w + 15)))
-        self.oz_hw = b.load_f32(dsl.u32(UInt32(w + 16)))
-        self.rb = b.load_f32(dsl.u32(UInt32(w + 17)))
-        self.rt = b.load_f32(dsl.u32(UInt32(w + 18)))
-        self.kpu = b.load_f32(dsl.u32(UInt32(w + 19)))
-        self.albedo = b.load_vec3(dsl.u32(UInt32(w + 20)))
-        self.r_cam = b.load_f32(dsl.u32(UInt32(w + 23)))
-        self.sun_d = b.load_vec3(dsl.u32(UInt32(w + 24)))
-        self.sun_ar = b.load_f32(dsl.u32(UInt32(w + 27)))
-        self.sun_e = b.load_vec3(dsl.u32(UInt32(w + 28)))
-        self.ap_max = b.load_f32(dsl.u32(UInt32(w + 31)))
-        self.moon_d = b.load_vec3(dsl.u32(UInt32(w + 32)))
-        self.moon_ar = b.load_f32(dsl.u32(UInt32(w + 35)))
-        self.moon_e = b.load_vec3(dsl.u32(UInt32(w + 36)))
-        self.moon_alb = b.load_f32(dsl.u32(UInt32(w + 39)))
-
-
-struct _Medium(Copyable, Movable):
-    var sig_r: GpuVec3
-    var sig_m: GpuVec3
-    var sig_t: GpuVec3
-
-    def __init__(out self, a: _Atmo, h: GpuF32):
-        var hc = max_f(h, 0.0)
-        var rr = _gexp(-(hc / a.h_r))
-        var rm = _gexp(-(hc / a.h_m))
-        var ro = max_f(1.0 - abs_f(hc - a.oz_c) / a.oz_hw, 0.0)
-        self.sig_r = a.ray * rr
-        self.sig_m = a.mie_s * rm
-        self.sig_t = self.sig_r + a.mie_e * rm + a.oz * ro
-
-
-@always_inline
-def _top_dist(r: GpuF32, mu: GpuF32, rt: GpuF32) -> GpuF32:
-    var disc = r * r * (mu * mu - 1.0) + rt * rt
-    return max_f(sqrt_f(max_f(disc, 0.0)) - r * mu, 0.0)
-
-
-@always_inline
-def _ground_dist(r: GpuF32, mu: GpuF32, rb: GpuF32) -> GpuF32:
-    """Distance to the ground or -1."""
-    var disc = r * r * (mu * mu - 1.0) + rb * rb
-    var d = -(r * mu) - sqrt_f(max_f(disc, 0.0))
-    return select_f(mu.lt(0.0) & disc.ge(0.0) & d.gt(0.0), d, d * 0.0 - 1.0)
-
-
-@always_inline
-def _horizon_mu(r: GpuF32, rb: GpuF32) -> GpuF32:
-    var s = min_f(rb / max_f(r, rb), 1.0)
-    return -sqrt_f(max_f(1.0 - s * s, 0.0))
-
-
-@always_inline
-def _sun_vis(r: GpuF32, mu: GpuF32, a: _Atmo) -> GpuF32:
-    var mh = _horizon_mu(r, a.rb)
-    var w = a.sun_ar * sqrt_f(max_f(1.0 - mh * mh, 0.0))
-    return saturate((mu - mh + w) / max_f(w * 2.0, 1e-6))
-
-
-@always_inline
-def _rayleigh(mu: GpuF32) -> GpuF32:
-    return (mu * mu + 1.0) * Float32(3.0 / (16.0 * 3.14159265358979))
-
-
-@always_inline
-def _cs(mu: GpuF32, g: GpuF32) -> GpuF32:
-    var g2 = g * g
-    var num = (1.0 - g2) * (mu * mu + 1.0) * Float32(3.0 / (8.0 * 3.14159265358979))
-    var base = max_f(g2 + 1.0 - g * mu * 2.0, 1e-4)
-    return num / ((g2 + 2.0) * base * sqrt_f(base))
-
-
-def _bilerp_buf(
-    mut dsl: ShaderDsl, b: BufferRef[1], off: GpuU32, w: Int, h: Int, fx_in: GpuF32, fy_in: GpuF32, wrap: Bool
-) -> GpuVec3:
-    """Bilinear fetch of a vec3 LUT stored as 4 words per texel (texel centres at integer coordinates)."""
-    var fw = Float32(w)
-    var fx: GpuF32
-    if wrap:
-        fx = fx_in - floor_f(fx_in / fw) * fw
-    else:
-        fx = clamp_f(fx_in, 0.0, Float32(w - 1))
-    var fy = clamp_f(fy_in, 0.0, Float32(h - 1))
-    var wm1 = dsl.u32(UInt32(w - 1))
-    var x0 = min_u(floor_f(fx).saturate_u32(), wm1)
-    var y0 = min_u(floor_f(fy).saturate_u32(), dsl.u32(UInt32(h - 1)))
-    var x1: GpuU32
-    if wrap:
-        x1 = (x0 + UInt32(1)) % UInt32(w)
-    else:
-        x1 = min_u(x0 + UInt32(1), wm1)
-    var y1 = min_u(y0 + UInt32(1), dsl.u32(UInt32(h - 1)))
-    var tx = saturate(fx - x0.to_f32())
-    var ty = saturate(fy - y0.to_f32())
-    var c00 = b.load_vec3(off + (y0 * UInt32(w) + x0) * UInt32(4))
-    var c10 = b.load_vec3(off + (y0 * UInt32(w) + x1) * UInt32(4))
-    var c01 = b.load_vec3(off + (y1 * UInt32(w) + x0) * UInt32(4))
-    var c11 = b.load_vec3(off + (y1 * UInt32(w) + x1) * UInt32(4))
-    var one_tx = 1.0 - tx
-    var top = c00 * one_tx + c10 * tx
-    var bot = c01 * one_tx + c11 * tx
-    return top * (1.0 - ty) + bot * ty
-
-
-def _sample_trans(mut dsl: ShaderDsl, b: BufferRef[1], off: GpuU32, a: _Atmo, r_in: GpuF32, mu_in: GpuF32) -> GpuVec3:
-    var r = clamp_f(r_in, a.rb, a.rt)
-    var mu = max_f(mu_in, _horizon_mu(r, a.rb))
-    var hh = sqrt_f(a.rt * a.rt - a.rb * a.rb)
-    var rho = sqrt_f(max_f(r * r - a.rb * a.rb, 0.0))
-    var d = _top_dist(r, mu, a.rt)
-    var d_min = a.rt - r
-    var d_max = rho + hh
-    var x_mu = saturate((d - d_min) / max_f(d_max - d_min, 1e-6))
-    var x_r = saturate(rho / hh)
-    return _bilerp_buf(dsl, b, off, SOTA_ATMO_TRANS_W, SOTA_ATMO_TRANS_H, x_mu * Float32(SOTA_ATMO_TRANS_W - 1), x_r * Float32(SOTA_ATMO_TRANS_H - 1), False)
-
-
-def _sample_ms(mut dsl: ShaderDsl, b: BufferRef[1], off: GpuU32, a: _Atmo, r: GpuF32, mu_s: GpuF32) -> GpuVec3:
-    var u = saturate(mu_s * 0.5 + 0.5)
-    var v = saturate((r - a.rb) / (a.rt - a.rb))
-    var n = Float32(SOTA_ATMO_MS_DIM)
-    return _bilerp_buf(dsl, b, off, SOTA_ATMO_MS_DIM, SOTA_ATMO_MS_DIM, u * n - 0.5, v * n - 0.5, False)
-
-
-def _light_term(
-    mut dsl: ShaderDsl, b: BufferRef[1], t_off: GpuU32, m_off: GpuU32, a: _Atmo,
-    ri: GpuF32, mu_l: GpuF32, cos_vl: GpuF32, med: _Medium, e: GpuVec3,
-) -> GpuVec3:
-    var t_l = _sample_trans(dsl, b, t_off, a, ri, mu_l) * _sun_vis(ri, mu_l, a)
-    var ph = med.sig_r * _rayleigh(cos_vl) + med.sig_m * _cs(cos_vl, a.g)
-    var ms = _sample_ms(dsl, b, m_off, a, ri, mu_l)
-    return (ph * t_l + (med.sig_r + med.sig_m) * ms) * e
-
-
-def _step_integral(src: GpuVec3, sig_t: GpuVec3, tr_step: GpuVec3) -> GpuVec3:
-    return GpuVec3(
-        src.x() * (1.0 - tr_step.x()) / max_f(sig_t.x(), 1e-9),
-        src.y() * (1.0 - tr_step.y()) / max_f(sig_t.y(), 1e-9),
-        src.z() * (1.0 - tr_step.z()) / max_f(sig_t.z(), 1e-9),
-    )
-
-
-def _march_segment(
-    mut dsl: ShaderDsl, b: BufferRef[1], t_off: GpuU32, m_off: GpuU32, a: _Atmo,
-    r0: GpuF32, d: GpuVec3, t_max: GpuF32, steps: Int,
-) -> Tuple[GpuVec3, GpuVec3]:
-    """GPU twin of `integrate_segment` (sun + moon, quadratic steps)."""
-    var l_v = dsl.var_vec3(dsl.vec3_const(0.0, 0.0, 0.0))
-    var thr_v = dsl.var_vec3(dsl.vec3_const(1.0, 1.0, 1.0))
-    var cvs = d.dot(a.sun_d)
-    var cvm = d.dot(a.moon_d)
-    var has_moon = (a.moon_e.x() + a.moon_e.y() + a.moon_e.z()).gt(0.0)
-    var i_v = dsl.var_u32(dsl.u32(0))
-    dsl.begin_loop()
-    var i = i_v.get()
-    dsl.break_if(i.ge(UInt32(steps)))
-    var u0 = i.to_f32() * (1.0 / Float32(steps))
-    var u1 = (i + UInt32(1)).to_f32() * (1.0 / Float32(steps))
-    var t0 = t_max * u0 * u0
-    var t1 = t_max * u1 * u1
-    var t = (t0 + t1) * 0.5
-    var dt = t1 - t0
-    var px = d.x() * t
-    var py = r0 + d.y() * t
-    var pz = d.z() * t
-    var ri = sqrt_f(px * px + py * py + pz * pz)
-    var med = _Medium(a, ri - a.rb)
-    var mu_s = (px * a.sun_d.x() + py * a.sun_d.y() + pz * a.sun_d.z()) / ri
-    var src_v = dsl.var_vec3(_light_term(dsl, b, t_off, m_off, a, ri, mu_s, cvs, med, a.sun_e))
-    dsl.if_then(has_moon)
-    var mu_m = (px * a.moon_d.x() + py * a.moon_d.y() + pz * a.moon_d.z()) / ri
-    src_v.set(src_v.get() + _light_term(dsl, b, t_off, m_off, a, ri, mu_m, cvm, med, a.moon_e))
-    dsl.end_if()
-    var tr_step = _gexp3(med.sig_t * (-dt))
-    var thr = thr_v.get()
-    l_v.set(l_v.get() + thr * _step_integral(src_v.get(), med.sig_t, tr_step))
-    thr_v.set(thr * tr_step)
-    i_v.set(i + UInt32(1))
-    dsl.end_loop()
-    return (l_v.get(), thr_v.get())
 
 
 # ============================================================================
@@ -606,54 +427,9 @@ def sota_atmo_aerial_shader() -> List[UInt32]:
 # 5. Apply (sky / sun / moon, aerial perspective, height-fog tail)
 # ============================================================================
 
-def _ap_fetch(mut dsl: ShaderDsl, b: BufferRef[1], ap_off: GpuU32, fx: GpuF32, fy: GpuF32, s: GpuU32) -> Tuple[GpuVec3, GpuVec3]:
-    comptime N = SOTA_ATMO_AP_DIM
-    var cx = clamp_f(fx, 0.0, Float32(N - 1))
-    var cy = clamp_f(fy, 0.0, Float32(N - 1))
-    var nm1 = dsl.u32(UInt32(N - 1))
-    var x0 = min_u(floor_f(cx).saturate_u32(), nm1)
-    var y0 = min_u(floor_f(cy).saturate_u32(), nm1)
-    var x1 = min_u(x0 + UInt32(1), nm1)
-    var y1 = min_u(y0 + UInt32(1), nm1)
-    var tx = saturate(cx - x0.to_f32())
-    var ty = saturate(cy - y0.to_f32())
-    var base = ap_off + s * UInt32(N * N * 8)
-    var i00 = base + (y0 * UInt32(N) + x0) * UInt32(8)
-    var i10 = base + (y0 * UInt32(N) + x1) * UInt32(8)
-    var i01 = base + (y1 * UInt32(N) + x0) * UInt32(8)
-    var i11 = base + (y1 * UInt32(N) + x1) * UInt32(8)
-    var w00 = (1.0 - tx) * (1.0 - ty)
-    var w10 = tx * (1.0 - ty)
-    var w01 = (1.0 - tx) * ty
-    var w11 = tx * ty
-    var sc = b.load_vec3(i00) * w00 + b.load_vec3(i10) * w10 + b.load_vec3(i01) * w01 + b.load_vec3(i11) * w11
-    var tr = b.load_vec3(i00 + UInt32(4)) * w00 + b.load_vec3(i10 + UInt32(4)) * w10 + b.load_vec3(i01 + UInt32(4)) * w01 + b.load_vec3(i11 + UInt32(4)) * w11
-    return (sc, tr)
-
-
-def _hf_piece(dens: GpuF32, k: GpuF32, base_y: GpuF32, cam_y: GpuF32, dir_y: GpuF32, a: GpuF32, b: GpuF32) -> GpuF32:
-    var ym = cam_y + dir_y * ((a + b) * 0.5)
-    var e0 = _gexp(-(k * (cam_y + dir_y * a - base_y)))
-    var kd = k * dir_y
-    var len = max_f(b - a, 0.0)
-    var small = abs_f(kd * len).lt(1e-4)
-    var safe_kd = select_f(small, kd * 0.0 + 1.0, kd)
-    var expo = select_f(small, dens * e0 * len, dens * e0 * (1.0 - _gexp(-(kd * len))) / safe_kd)
-    return select_f(ym.gt(base_y), expo, dens * len)
-
-
-def _height_fog_od(dens: GpuF32, k_in: GpuF32, base_y: GpuF32, cam_y: GpuF32, dir_y: GpuF32, t0: GpuF32, t1: GpuF32) -> GpuF32:
-    """GPU twin of `height_fog_optical_depth` (split at the crossing of the base height)."""
-    var k = max_f(k_in, 1e-6)
-    var tc = (base_y - cam_y) / select_f(abs_f(dir_y).gt(1e-6), dir_y, dir_y * 0.0 + 1e-6)
-    var split = tc.gt(t0) & t1.gt(tc) & abs_f(dir_y).gt(1e-6)
-    var mid = select_f(split, tc, t0)
-    var od = _hf_piece(dens, k, base_y, cam_y, dir_y, t0, mid) + _hf_piece(dens, k, base_y, cam_y, dir_y, mid, t1)
-    return select_f(t1.gt(t0), od, dens * 0.0)
-
 
 def sota_atmo_apply_shader() -> List[UInt32]:
-    """Push: 0 W, 1 H, 2 trans_off, 3 sky_off, 4 ap_off."""
+    """Push: 0 W, 1 H, 2 trans_off, 3 sky_off, 4 ap_off, 5 cloud image offset, 6 cloud w, 7 cloud h, 8 cloud div."""
     var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=8, group_height=8, push_words=AAA_PUSH_WORDS)
     var b_glob = dsl.buffer[1](BIND_AAA_GLOBALS)
     var b_hdr = dsl.buffer[1](BIND_AAA_HDR_OUT)
@@ -665,6 +441,10 @@ def sota_atmo_apply_shader() -> List[UInt32]:
     var t_off = dsl.push_u32(2)
     var s_off = dsl.push_u32(3)
     var ap_off = dsl.push_u32(4)
+    var cl_off = dsl.push_u32(5)
+    var cl_w = dsl.push_u32(6)
+    var cl_h = dsl.push_u32(7)
+    var cl_div = dsl.push_u32(8)
     dsl.return_if(px.ge(w_u) | py.ge(h_u))
     var a = _Atmo(dsl, b_glob)
     var flags = b_glob.load_u32(dsl.u32(UInt32(SOTA_ATMO_G + 41)))
@@ -694,15 +474,7 @@ def sota_atmo_apply_shader() -> List[UInt32]:
 
     # --- sky: LUT + sun disc + moon disc ---
     dsl.if_then(is_sky & (flags & SOTA_ATMO_FLAG_SKY).ne(UInt32(0)))
-    var half_pi = Float32(1.5707963268)
-    var el_h = -_gacos(dsl, min_f(a.rb / a.r_cam, 1.0))
-    var horiz = sqrt_f(max_f(d.x() * d.x() + d.z() * d.z(), 0.0))
-    var el = _gatan2(dsl, d.y(), horiz)
-    var v_up = 0.5 - sqrt_f(saturate((el - el_h) / (half_pi - el_h))) * 0.5
-    var v_dn = sqrt_f(saturate((el_h - el) / (el_h + half_pi))) * 0.5 + 0.5
-    var v = select_f(el.ge(el_h), v_up, v_dn)
-    var u = _gatan2(dsl, d.z(), d.x()) * Float32(0.159154943) + 0.5
-    var sky = _bilerp_buf(dsl, b_hist, s_off, SOTA_ATMO_SKY_W, SOTA_ATMO_SKY_H, u * Float32(SOTA_ATMO_SKY_W) - 0.5, v * Float32(SOTA_ATMO_SKY_H) - 0.5, True)
+    var sky = _sky_view_radiance(dsl, b_hist, s_off, a, d)
     var sky_v = dsl.var_vec3(sky)
     var above = _ground_dist(a.r_cam, d.y(), a.rb).lt(0.0)
     var t_view = _sample_trans(dsl, b_hist, t_off, a, a.r_cam, d.y())
@@ -722,10 +494,12 @@ def sota_atmo_apply_shader() -> List[UInt32]:
     dsl.end_if()
     dsl.end_if()
     # Moon disc (Lommel-Seeliger, lit from the sun direction: the phase follows the geometry).
+    var occ_v = dsl.var_f32_const(0.0)
     dsl.if_then(above & (flags & SOTA_ATMO_FLAG_MOON_DISC).ne(UInt32(0)))
     var c_m = d.dot(a.moon_d)
     var ang_m = _gacos(dsl, c_m)
     var cov_m = saturate((a.moon_ar - ang_m) / pix_ang + 0.5)
+    occ_v.set(cov_m)
     dsl.if_then(cov_m.gt(0.0))
     var s_m = min_f(sin_f(ang_m) / sin_f(a.moon_ar), 1.0)
     var off = d - a.moon_d * c_m
@@ -737,6 +511,15 @@ def sota_atmo_apply_shader() -> List[UInt32]:
     var ls = a.moon_alb * mu0 / (mu0 + max_f(nz, 1e-3))
     sky_v.set(sky_v.get() + a.sun_e * t_view * (ls * cov_m))  # lit by the sun's top-of-atmosphere irradiance
     dsl.end_if()
+    dsl.end_if()
+    # --- sota:atmo r3: night sky (stars, Milky Way, airglow) behind the moon, then the cloud layer in front ---
+    var nflags = b_glob.load_u32(dsl.u32(UInt32(SOTA_ATMO_G2 + SOTA_NIGHT_W_FLAGS)))
+    dsl.if_then(above & (nflags & UInt32(1)).ne(UInt32(0)))
+    var night = emit_night_sky(dsl, b_glob, d, pix_ang)
+    sky_v.set(sky_v.get() + night * t_view * (1.0 - occ_v.get()))
+    dsl.end_if()
+    dsl.if_then((nflags & UInt32(2)).ne(UInt32(0)))
+    sky_v.set(emit_cloud_composite(dsl, b_hist, cl_off, cl_w, cl_h, cl_div, fx0, fy0, sky_v.get()))
     dsl.end_if()
     col_v.set(sky_v.get())
     dsl.end_if()
@@ -870,6 +653,17 @@ struct SotaAtmosphere(Movable):
     var last_ibl_ms: Float64
     var lights: SotaAtmoLights
     var moon_phase_angle: Float32
+    # --- round 3 ---
+    var night: SotaNightSky
+    var clouds: SotaClouds
+    var ibl_gpu: Bool             # bake SH9 + the BC6H GGX cube on the GPU (no CPU work, no stall)
+    var ibl_gpu_update_deg: Float32
+    var ibl: SotaAtmoIblGpu
+    var ibl_cube_pending: Bool
+    var max_pix: Int
+    var cloud_cw: Int
+    var cloud_ch: Int
+    var cloud_div_used: Int
 
     def __init__(out self):
         self.enabled = False
@@ -908,6 +702,16 @@ struct SotaAtmosphere(Movable):
         self.last_ibl_ms = 0.0
         self.lights = SotaAtmoLights(Vec3(0.0, 1.0, 0.0), RGB(0.0))
         self.moon_phase_angle = 0.0
+        self.night = SotaNightSky()
+        self.clouds = SotaClouds()
+        self.ibl_gpu = True
+        self.ibl_gpu_update_deg = 0.05
+        self.ibl = SotaAtmoIblGpu()
+        self.ibl_cube_pending = False
+        self.max_pix = 0
+        self.cloud_cw = 0
+        self.cloud_ch = 0
+        self.cloud_div_used = 2
 
     def create_pipelines(mut self, mut vk: VulkanGpu, pipe_layout: Int) -> Bool:
         self.pipe_trans = vk.create_aaa_compute_pipeline(pipe_layout, sota_atmo_transmittance_shader())
@@ -915,6 +719,8 @@ struct SotaAtmosphere(Movable):
         self.pipe_sky = vk.create_aaa_compute_pipeline(pipe_layout, sota_atmo_skyview_shader())
         self.pipe_ap = vk.create_aaa_compute_pipeline(pipe_layout, sota_atmo_aerial_shader())
         self.pipe_apply = vk.create_aaa_compute_pipeline(pipe_layout, sota_atmo_apply_shader())
+        self.ibl.create(vk, pipe_layout)
+        self.clouds.create(vk, pipe_layout)
         return self.pipelines_ready()
 
     def destroy_pipelines(mut self, mut vk: VulkanGpu):
@@ -926,6 +732,8 @@ struct SotaAtmosphere(Movable):
         self.pipe_sky = 0
         self.pipe_ap = 0
         self.pipe_apply = 0
+        self.ibl.destroy(vk)
+        self.clouds.destroy(vk)
 
     def pipelines_ready(self) -> Bool:
         return self.pipe_trans != 0 and self.pipe_ms != 0 and self.pipe_sky != 0 and self.pipe_ap != 0 and self.pipe_apply != 0
@@ -944,6 +752,45 @@ struct SotaAtmosphere(Movable):
 
     def ap_off(self) -> Int:
         return self.sky_off() + sota_atmo_sky_words()
+
+    def configure_region(mut self, base: Int, max_pix: Int, env_dim: Int, env_mips: Int) -> Int:
+        """Places the area-H region at word `base` of the history buffer; returns its size in words."""
+        self.region_base = base
+        self.max_pix = max_pix
+        self.ibl.base_dim = env_dim
+        self.ibl.mips = env_mips
+        self.ibl.region_base = (self.ap_off() + sota_atmo_ap_words() + 3) & ~3
+        return sota_atmo_region_words(max_pix, env_dim, env_mips)
+
+    def cloud_base_off(self) -> Int:
+        return self.ibl.region_base + ibl_region_words(self.ibl.base_dim, self.ibl.mips)
+
+    def cloud_detail_off(self) -> Int:
+        return self.cloud_base_off() + SOTA_CLOUD_BASE_N * SOTA_CLOUD_BASE_N * SOTA_CLOUD_BASE_N
+
+    def cloud_weather_off(self) -> Int:
+        return self.cloud_detail_off() + SOTA_CLOUD_DETAIL_N * SOTA_CLOUD_DETAIL_N * SOTA_CLOUD_DETAIL_N
+
+    def cloud_image_off(self, parity: Int) -> Int:
+        return self.cloud_weather_off() + SOTA_CLOUD_WEATHER_N * SOTA_CLOUD_WEATHER_N * 2 + (parity & 1) * cloud_buffer_words(self.max_pix)
+
+    def cloud_cur_off(self) -> Int:
+        return self.cloud_image_off(self.clouds.parity)
+
+    def clouds_active(self) -> Bool:
+        return self.clouds.enabled and self.clouds.ready() and self.max_pix > 0 and self.sky
+
+    def gpu_ibl_active(self) -> Bool:
+        return self.update_ibl and self.ibl_gpu and self.ibl.ready()
+
+    def read_gpu_sh9(self, hist_addr: Int) -> List[Vec3]:
+        """The SH9 the GPU wrote last (`b_globals[72..99)` of that frame), from the history region."""
+        var out = List[Vec3](length=9, fill=Vec3(0.0, 0.0, 0.0))
+        var a = hist_addr + self.ibl.sh_off() * 4
+        var p = Pointer[Float32, MutAnyOrigin](unsafe_from_address=a)
+        for k in range(9):
+            out[k] = Vec3(p[unsafe_offset=k * 3], p[unsafe_offset=k * 3 + 1], p[unsafe_offset=k * 3 + 2])
+        return out^
 
     def replaces_legacy_ap(self) -> Bool:
         return self.active() and self.aerial_perspective
@@ -995,7 +842,8 @@ struct SotaAtmosphere(Movable):
             return False
         if not self.ibl_valid:
             return True
-        var c = cos(self.ibl_update_deg * Float32(0.0174532925))
+        var deg = self.ibl_gpu_update_deg if self.gpu_ibl_active() else self.ibl_update_deg
+        var c = cos(deg * Float32(0.0174532925))
         return self.lights.sun_dir.dot(self.ibl_sun) < c or self.lights.moon_dir.dot(self.ibl_moon) < c
 
     def bake_ibl(mut self, cam_y: Float32, base_dim: Int, mip_levels: Int) -> BakedIblEnvironment:
@@ -1083,7 +931,131 @@ struct SotaAtmosphere(Movable):
         fog_g: Float32,
     ):
         """Per-frame constants (`b_globals[SOTA_ATMO_G ..]`). `legacy_sky_fx`: v5 clouds or stars are on, so
-        sky pixels keep the v5 sky (only aerial perspective and fog run)."""
+        sky pixels keep the v5 sky (only aerial perspective and fog run). Round 3 uses `write_globals_r3`."""
+        self._write_globals_r2(g_addr, cam_y, legacy_sky_fx, froxel_on, fog_density, froxel_far_z, fog_falloff, fog_base_y, fog_albedo, fog_g)
+
+    def write_globals_r3(
+        mut self,
+        g_addr: Int,
+        cam_pos: Vec3,
+        cam_fwd: Vec3,
+        cam_right: Vec3,
+        cam_up: Vec3,
+        tan_x: Float32,
+        tan_y: Float32,
+        render_w: Int,
+        render_h: Int,
+        scene_time_sec: Float32,
+        legacy_cloud_coverage: Float32,
+        legacy_star_intensity: Float32,
+        froxel_on: Bool,
+        fog_density: Float32,
+        froxel_far_z: Float32,
+        fog_falloff: Float32,
+        fog_base_y: Float32,
+        fog_albedo: Vec3,
+        fog_g: Float32,
+    ):
+        """Round 3: the r2 block plus the night sky and cloud block (`b_globals[SOTA_ATMO_G2 .. +64)`). The legacy v5
+        clouds keep the v5 sky only while the volumetric clouds are off; the legacy stars only while the night sky
+        is off."""
+        var clouds_on = self.clouds_active()
+        var legacy = (legacy_cloud_coverage > Float32(0.01) and not clouds_on) or (legacy_star_intensity > Float32(0.01) and not self.night.enabled)
+        self._write_globals_r2(g_addr, cam_pos.y, legacy, froxel_on, fog_density, froxel_far_z, fog_falloff, fog_base_y, fog_albedo, fog_g)
+        var g = SOTA_ATMO_G2
+        var rows = world_to_equatorial_rows(self.time_of_day)
+        _put_v3(g_addr, g + 0, rows[0])
+        _put_v3(g_addr, g + 3, rows[1])
+        _put_v3(g_addr, g + 6, rows[2])
+        var nt = self.night.copy()
+        var e0 = nt.e0(rgb_luma(self.params.solar_irradiance))
+        _put_f(g_addr, g + SOTA_NIGHT_W_STARS, nt.star_brightness)
+        _put_f(g_addr, g + SOTA_NIGHT_W_MLIM, nt.limiting_magnitude)
+        _put_f(g_addr, g + SOTA_NIGHT_W_BG, surface_brightness_radiance(e0, nt.airglow_mag_arcsec2) * nt.airglow_scale)
+        _put_f(g_addr, g + SOTA_NIGHT_W_MW, surface_brightness_radiance(e0, nt.milky_way_mag_arcsec2) * nt.milky_way_scale)
+        _put_f(g_addr, g + SOTA_NIGHT_W_PSF, max(Float32(0.5), nt.star_psf_px))
+        _put_u(g_addr, g + SOTA_NIGHT_W_SEED, nt.seed)
+        _put_f(g_addr, g + SOTA_NIGHT_W_E0, e0)
+        var nflags = UInt32(0)
+        var sky_on = self.sky and not legacy
+        if nt.enabled and sky_on:
+            nflags |= 1
+        if clouds_on and sky_on:
+            nflags |= 2
+        _put_u(g_addr, g + SOTA_NIGHT_W_FLAGS, nflags)
+        if not clouds_on:
+            self.clouds.hist_valid = False
+            return
+        # --- clouds ---
+        var cp = self.clouds.params
+        var wx = -self.clouds.wind_mps.x * scene_time_sec * Float32(0.001)
+        var wz = -self.clouds.wind_mps.z * scene_time_sec * Float32(0.001)
+        _put_f(g_addr, g + 20, cp.bottom_km)
+        _put_f(g_addr, g + 21, max(cp.bottom_km + Float32(0.05), cp.top_km))
+        _put_f(g_addr, g + 22, max(Float32(0.0), min(Float32(1.0), cp.coverage)))
+        _put_f(g_addr, g + 23, cp.density_per_km)
+        _put_f(g_addr, g + 24, wx)
+        _put_f(g_addr, g + 25, wz)
+        _put_f(g_addr, g + 26, max(Float32(0.1), cp.tile_km))
+        _put_f(g_addr, g + 27, max(Float32(0.01), cp.base_scale_km))
+        _put_f(g_addr, g + 28, max(Float32(0.01), cp.detail_scale_km))
+        _put_f(g_addr, g + 29, cp.detail_strength)
+        _put_u(g_addr, g + 30, UInt32(max(1, cp.steps)))
+        _put_u(g_addr, g + 31, UInt32(max(0, cp.light_steps)))
+        _put_f(g_addr, g + 32, cp.light_step_km)
+        _put_f(g_addr, g + 33, cp.max_dist_km)
+        _put_f(g_addr, g + 34, cp.g_fwd)
+        _put_f(g_addr, g + 35, cp.g_back)
+        _put_f(g_addr, g + 36, cp.g_mix)
+        _put_f(g_addr, g + 37, cp.ms_a)
+        _put_f(g_addr, g + 38, cp.ms_b)
+        _put_f(g_addr, g + 39, cp.ms_c)
+        _put_f(g_addr, g + 40, cp.ambient)
+        _put_f(g_addr, g + 41, cp.type_bias)
+        _put_f(g_addr, g + CW_ALPHA, max(Float32(0.01), min(Float32(1.0), self.clouds.temporal_alpha)))
+        _put_u(g_addr, g + CW_FRAME, UInt32(self.clouds.frame & 0xFFFF))
+        _put_f(g_addr, g + CW_DWIND_X, (wx - self.clouds.last_wind_x_km) / self.km_per_unit)
+        _put_f(g_addr, g + CW_DWIND_Z, (wz - self.clouds.last_wind_z_km) / self.km_per_unit)
+        _put_u(g_addr, g + CW_JITTER, UInt32(1) if self.clouds.jitter else UInt32(0))
+        _put_u(g_addr, g + 47, UInt32(0) if self.clouds.aerial_perspective else UInt32(1))  # CW_NO_AP
+        # Resolution: raise the divisor until the cloud image fits its region.
+        var dv = self.clouds.div()
+        var cap = cloud_buffer_words(self.max_pix) // 4
+        while dv < 8 and ((render_w + dv - 1) // dv) * ((render_h + dv - 1) // dv) > cap:
+            dv *= 2
+        var cw = (render_w + dv - 1) // dv
+        var ch = (render_h + dv - 1) // dv
+        var valid = self.clouds.hist_valid and cw == self.clouds.last_cw and ch == self.clouds.last_ch
+        for k in range(14):
+            _put_f(g_addr, g + CW_PREV_CAM + k, self.clouds.prev_cam[k])
+        _put_u(g_addr, g + CW_HIST_VALID, UInt32(1) if valid else UInt32(0))
+        _put_u(g_addr, g + CW_DIV, UInt32(dv))
+        self.cloud_cw = cw
+        self.cloud_ch = ch
+        self.cloud_div_used = dv
+        # The next frame's history: this frame's camera, wind and image size.
+        var pc: List[Float32] = [cam_pos.x, cam_pos.y, cam_pos.z, cam_fwd.x, cam_fwd.y, cam_fwd.z, cam_right.x, cam_right.y,
+                                 cam_right.z, cam_up.x, cam_up.y, cam_up.z, tan_x, tan_y]
+        for k in range(14):
+            self.clouds.prev_cam[k] = pc[k]
+        self.clouds.last_wind_x_km = wx
+        self.clouds.last_wind_z_km = wz
+        self.clouds.last_cw = cw
+        self.clouds.last_ch = ch
+
+    def _write_globals_r2(
+        mut self,
+        g_addr: Int,
+        cam_y: Float32,
+        legacy_sky_fx: Bool,
+        froxel_on: Bool,
+        fog_density: Float32,
+        froxel_far_z: Float32,
+        fog_falloff: Float32,
+        fog_base_y: Float32,
+        fog_albedo: Vec3,
+        fog_g: Float32,
+    ):
         var p = self.params
         var w = SOTA_ATMO_G
         _put_rgb(g_addr, w + 0, p.rayleigh_scat)
@@ -1210,7 +1182,107 @@ def sota_atmo_record_apply(
     push[2] = UInt32(atmo.trans_off())
     push[3] = UInt32(atmo.sky_off())
     push[4] = UInt32(atmo.ap_off())
+    push[5] = UInt32(atmo.cloud_cur_off()) if atmo.clouds_active() else UInt32(0)
+    push[6] = UInt32(max(1, atmo.cloud_cw))
+    push[7] = UInt32(max(1, atmo.cloud_ch))
+    push[8] = UInt32(atmo.cloud_div_used)
     vk.dispatch_aaa(slot, atmo.pipe_apply, pipe_layout, desc_set, push, (render_w + 7) // 8, (render_h + 7) // 8)
     _barrier(vk, slot)
+    if use_prof and q + 1 < q_limit:
+        vk.write_timestamp(slot, q + 1, PIPELINE_BOTTOM)
+
+
+def sota_atmo_record_ibl(
+    mut atmo: SotaAtmosphere,
+    mut vk: VulkanGpu,
+    slot: Int,
+    pipe_layout: Int,
+    desc_set: Int,
+    globals_buf: GpuBuffer,
+    history_buf: GpuBuffer,
+    mut env_cube: VulkanImage,
+    use_prof: Bool,
+    mut next_q: Int,
+    q_limit: Int,
+    mut prof_pairs: List[Tuple[String, Int]],
+):
+    """GPU IBL (after the sky-view LUT): SH9 every frame into `b_globals[72..99)`, the BC6H GGX cube when a light
+    moved more than `ibl_gpu_update_deg` (flagged by `_sota_atmo_prepare`)."""
+    if not atmo.gpu_ibl_active():
+        return
+    var q = next_q
+    if use_prof and q + 1 < q_limit:
+        vk.write_timestamp(slot, q, PIPELINE_BOTTOM)
+        next_q += 2
+        prof_pairs.append((String("SotaAtmoIbl"), q))
+    atmo.ibl.record(vk, slot, pipe_layout, desc_set, atmo.sky_off(), globals_buf, history_buf, env_cube, atmo.ibl_cube_pending)
+    atmo.ibl_cube_pending = False
+    if use_prof and q + 1 < q_limit:
+        vk.write_timestamp(slot, q + 1, PIPELINE_BOTTOM)
+
+
+def sota_atmo_record_clouds(
+    mut atmo: SotaAtmosphere,
+    mut vk: VulkanGpu,
+    slot: Int,
+    pipe_layout: Int,
+    desc_set: Int,
+    render_w: Int,
+    render_h: Int,
+    use_prof: Bool,
+    mut next_q: Int,
+    q_limit: Int,
+    mut prof_pairs: List[Tuple[String, Int]],
+):
+    """Cloud noise (once), weather map (on seed change), then the march + reprojection into this frame's image.
+    Runs after the HDR buffer holds this frame's depth (sky test) and before the apply pass."""
+    if not atmo.clouds_active():
+        return
+    var q = next_q
+    if use_prof and q + 1 < q_limit:
+        vk.write_timestamp(slot, q, PIPELINE_BOTTOM)
+        next_q += 2
+        prof_pairs.append((String("SotaAtmoClouds"), q))
+    if not atmo.clouds.noise_ready:
+        var pn = List[UInt32](length=16, fill=0)
+        pn[0] = 0
+        pn[1] = UInt32(atmo.cloud_base_off())
+        vk.dispatch_aaa(slot, atmo.clouds.pipe_noise, pipe_layout, desc_set, pn, SOTA_CLOUD_BASE_N // 8, SOTA_CLOUD_BASE_N // 8)
+        var pd = List[UInt32](length=16, fill=0)
+        pd[0] = 1
+        pd[1] = UInt32(atmo.cloud_detail_off())
+        vk.dispatch_aaa(slot, atmo.clouds.pipe_noise, pipe_layout, desc_set, pd, SOTA_CLOUD_DETAIL_N // 8, SOTA_CLOUD_DETAIL_N // 8)
+        atmo.clouds.noise_ready = True
+    if atmo.clouds.weather_seed_built != atmo.clouds.weather_seed or atmo.clouds.pipe_weather == 0:
+        if atmo.clouds.pipe_weather != 0:
+            vk.destroy_pipeline(atmo.clouds.pipe_weather)
+        atmo.clouds.pipe_weather = vk.create_aaa_compute_pipeline(pipe_layout, sota_cloud_weather_shader(atmo.clouds.weather_seed))
+        atmo.clouds.weather_seed_built = atmo.clouds.weather_seed
+        atmo.clouds.weather_ready = False
+    if not atmo.clouds.weather_ready and atmo.clouds.pipe_weather != 0:
+        var pw = List[UInt32](length=16, fill=0)
+        pw[0] = UInt32(atmo.cloud_weather_off())
+        vk.dispatch_aaa(slot, atmo.clouds.pipe_weather, pipe_layout, desc_set, pw, SOTA_CLOUD_WEATHER_N // 8, SOTA_CLOUD_WEATHER_N // 8)
+        atmo.clouds.weather_ready = True
+    _barrier(vk, slot)
+    atmo.clouds.parity = atmo.clouds.parity ^ 1
+    var push = List[UInt32](length=16, fill=0)
+    push[0] = UInt32(atmo.cloud_cw)
+    push[1] = UInt32(atmo.cloud_ch)
+    push[2] = UInt32(atmo.cloud_div_used)
+    push[3] = UInt32(atmo.cloud_image_off(atmo.clouds.parity))
+    push[4] = UInt32(atmo.cloud_image_off(atmo.clouds.parity ^ 1))
+    push[5] = UInt32(atmo.trans_off())
+    push[6] = UInt32(atmo.ap_off())
+    push[7] = UInt32(atmo.cloud_base_off())
+    push[8] = UInt32(atmo.cloud_detail_off())
+    push[9] = UInt32(atmo.cloud_weather_off())
+    push[10] = UInt32(render_w)
+    push[11] = UInt32(render_h)
+    push[12] = bitcast[DType.uint32](atmo.ap_max_km)
+    vk.dispatch_aaa(slot, atmo.clouds.pipe_march, pipe_layout, desc_set, push, (atmo.cloud_cw + 7) // 8, (atmo.cloud_ch + 7) // 8)
+    _barrier(vk, slot)
+    atmo.clouds.frame += 1
+    atmo.clouds.hist_valid = True
     if use_prof and q + 1 < q_limit:
         vk.write_timestamp(slot, q + 1, PIPELINE_BOTTOM)
