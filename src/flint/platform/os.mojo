@@ -201,6 +201,17 @@ def player_save_directory() -> String:
     return env_value("HOME") + "/.local/share/flint"
 
 
+def player_save_directory_for(game_id: String) -> String:
+    """`player_save_directory()/<game_id>`: each game gets its own folder (games used to share one).
+    The id is reduced to `[A-Za-z0-9._-]`; an empty or unusable id becomes `default`."""
+    var clean = List[UInt8]()
+    for b in game_id.as_bytes():
+        if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 45 or b == 95 or (b == 46 and len(clean) > 0):
+            clean.append(b)
+    var name = String(unsafe_from_utf8=clean) if len(clean) > 0 else String("default")
+    return player_save_directory() + "/" + name
+
+
 def close_fd(fd: Int):
     if fd >= 0:
         _ = external_call["close", Int32](Int32(fd))
