@@ -143,6 +143,7 @@ from flint.render.sota_e_characters import AAA_FLAG_SOTA_E_CHARACTERS
 from flint.render.sota_e_pipeline_cache import SotaEPsoCache, sota_e_pso_cache_open, sota_e_pso_cache_save
 from flint.render.sota_e_parallel_pso import sota_e_pso_batch_begin, sota_e_pso_batch_flush
 from flint.render.sota_e_gpu_driven import SotaEGpuDriven, SOTA_E_INSTANCE_OUTLINE_BIT, SOTA_E_ROUTE_MAX_DRAWS
+from flint.render.sota_e_hair_shadow import SotaEHairShadow, sota_e_dom_words
 # --- end sota:E hook ---
 from flint.render.material_graph import (
     MaterialAsset,
@@ -716,6 +717,7 @@ struct FlintAaaVulkanRenderer(Movable):
     var sota_e_character_shading: Bool  # skin / eye / hair material models in the deferred pass
     var sota_e_pso: SotaEPsoCache  # validated on-disk pipeline cache (`FLINT_PSO_CACHE=0` disables)
     var sota_e_gpu: SotaEGpuDriven  # GPU-packed alpha-mask / outline draw lists (cvar r.sota_e.gpu_driven)
+    var sota_e_hair: SotaEHairShadow  # strand-hair deep opacity shadow map (cvar r.sota_e.hair_dom)
     # --- end sota:E hook ---
     var enable_rt_shadows: Bool
     var enable_restir_di: Bool
@@ -1010,6 +1012,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_e_character_shading = True
         self.sota_e_pso = SotaEPsoCache()
         self.sota_e_gpu = SotaEGpuDriven()
+        self.sota_e_hair = SotaEHairShadow()
         # --- end sota:E hook ---
         self.enable_rt_shadows = False
         self.enable_restir_di = False
@@ -1443,6 +1446,10 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_skinning = self.vk.create_buffer(AAA_SKIN_BUFFER_WORDS * 4, local=True)
         # Per-pixel post regions end below word 1024 + max_pix * 10; the UI prims of each frame in flight follow.
         var scratch_words = AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + FRAMES_IN_FLIGHT * AAA_UI_PRIM_REGION_WORDS
+        # --- sota:E hook --- hair deep opacity map region after the UI prims
+        self.sota_e_hair.base_word = scratch_words
+        scratch_words += sota_e_dom_words(self.sota_e_hair.res)
+        # --- end sota:E hook ---
         self.buf_post_scratch = self.vk.create_buffer(scratch_words * 4, local=True)
         self.buf_ldr_readback = self.vk.create_buffer(64 + self.output_w * self.output_h * 4, local=False, cpu_reads=True)
         self.buf_staging = self.vk.create_buffer(8 * 1024 * 1024, local=False)
@@ -1560,6 +1567,7 @@ struct FlintAaaVulkanRenderer(Movable):
             self.ring_alphamask_indirect, self.ring_outline_indirect, self.ring_globals,
             self.buf_occluded_candidates, self.depth_img.view, self.samp_nearest,
         )
+        _ = self.sota_e_hair.init(self.vk, self.pipe_layout, self.sota_e_hair.base_word)
         # --- end sota:E hook ---
 
         # Bake & Upload 64x64 RG16F Split-Sum BRDF LUT + 64x64 RG16F Heitz LTC LUT!
@@ -3981,6 +3989,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:E hook ---
         if self.sota_e_character_shading:
             r_flags |= AAA_FLAG_SOTA_E_CHARACTERS
+        self.sota_e_hair.write_globals(g_addr, self.sun_dir)
         # --- end sota:E hook ---
         put32(g_addr + 99 * 4, r_flags)
         put32(g_addr + 100 * 4, UInt32(self.frame_index))
@@ -4283,6 +4292,9 @@ struct FlintAaaVulkanRenderer(Movable):
                 Int(ACCESS_AS_WRITE_KHR | ACCESS_AS_READ_KHR | ACCESS_SHADER_READ),
             )
 
+        # --- sota:E hook (hair deep opacity map, read by the deferred pass) ---
+        self.sota_e_hair.record(self.vk, cur_slot, self.pipe_layout, self.desc_set)
+        # --- end sota:E hook ---
         if n_inst > 0:
             var q_mc = next_q
             if use_prof:
@@ -5917,6 +5929,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         self.vk.destroy_pipeline(self.pipe_meshlet_cull)
         self.sota_e_gpu.shutdown(self.vk)  # sota:E hook
+        self.sota_e_hair.shutdown(self.vk)  # sota:E hook
         self.sota_geom.shutdown(self.vk)  # sota:geometry hook
         self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
         self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)

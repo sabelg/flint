@@ -15,6 +15,9 @@ belongs to the main pass), so they keep the per-meshlet frustum test + continuou
 `vkCmdDrawIndexedIndirectCount` with the GPU-written counter (word 0), so the CPU only zeroes two words.
 Needs `drawIndirectCount` (Vulkan 1.2 core feature); otherwise the CPU packers run as before.
 
+The VSM page packer (`_pack_vsm_indirect_commands`) stays on the CPU: its per-page offsets drive per-page
+viewport draws, so it needs per-page GPU slabs with their own count words first.
+
 cvar: `r.sota_e.gpu_driven` = `SotaEGpuDriven.enabled` (default on); env `FLINT_SOTA_E_GPU_DRIVEN=0` turns it off.
 
 Sources: Haar & Aaltonen "GPU-Driven Rendering Pipelines" (SIGGRAPH 2015); Wihlidal "Optimizing the
