@@ -373,6 +373,9 @@ from flint.render.sota_camera_post import (
     sota_camera_record_vrs_rate,
 )
 # --- end sota:camera hook ---
+# --- sota:atmo hook (import) ---
+from flint.render.sota_atmo_gpu import SotaAtmosphere, sota_atmo_record_apply, sota_atmo_record_luts, sota_atmo_region_words
+# --- end sota:atmo hook ---
 from flint.render.aaa_render_graph import (
     AaaGpuPassTiming,
     AaaRenderGraph,
@@ -756,6 +759,7 @@ struct FlintAaaVulkanRenderer(Movable):
     # --- sota:camera hook (field) ---
     var sota_cam: SotaCameraPost  # physical camera, scatter-as-gather DoF, lens flare/dirt/CA/vignette, sensor noise
     # --- end sota:camera hook ---
+    var sota_atmo: SotaAtmosphere  # --- sota:atmo hook --- physical sky / aerial perspective / height fog / time of day
     var enable_auto_exposure: Bool
     var auto_exposure_speed: Float32
     var auto_exposure_key: Float32
@@ -1057,6 +1061,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:camera hook (init) ---
         self.sota_cam = SotaCameraPost()
         # --- end sota:camera hook ---
+        self.sota_atmo = SotaAtmosphere()  # --- sota:atmo hook ---
         self.enable_auto_exposure = False
         self.auto_exposure_speed = Float32(0.45)
         self.auto_exposure_key = Float32(0.18)
@@ -1345,6 +1350,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:camera hook (pipelines; optional, features skip when not ready) ---
         _ = self.sota_cam.create_pipelines(self.vk, self.pipe_layout)
         # --- end sota:camera hook ---
+        _ = self.sota_atmo.create_pipelines(self.vk, self.pipe_layout)  # --- sota:atmo hook --- (optional)
         self.pipe_npr_cel_shade = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_cel_shade_shader())
         self.pipe_npr_post_fx = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_post_fx_shader())
         self.pipe_ui_overlay = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_ui_overlay_shader())
@@ -1463,6 +1469,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_ml.scratch_max_pix = max_pix
         hist_words += SotaMlDenoiser.scratch_words(max_pix)
         # --- end sota:ml hook ---
+        self.sota_atmo.region_base = hist_words  # --- sota:atmo hook --- LUTs + aerial-perspective volume (1.66 MB)
+        hist_words += sota_atmo_region_words()  # --- sota:atmo hook ---
         self.buf_history = self.vk.create_buffer(hist_words * 4, local=True)
         self.buf_vsm_table = self.vk.create_buffer(VSM_TABLE_WORDS * 4, local=False, cpu_reads=True)
         # --- sota:gi hook --- (+ the area-B control block; the full region is allocated on first use)
@@ -3955,6 +3963,25 @@ struct FlintAaaVulkanRenderer(Movable):
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
         return AAA_POST_UI_PRIMS_BASE_OFFSET + max_pix * 10 + (slot % FRAMES_IN_FLIGHT) * AAA_UI_PRIM_REGION_WORDS
 
+    # --- sota:atmo hook ---
+    def _sota_atmo_prepare(mut self):
+        """Area H: sun / moon for this frame, the renderer's directional light from the atmosphere, and the IBL
+        (SH9 + GGX cube) re-baked from the physical sky when a light moved more than `ibl_update_deg`."""
+        if not self.sota_atmo.active() or self.furnace_white_dome:
+            return
+        self.sota_atmo.update_lights()
+        if self.sota_atmo.drive_renderer_light:
+            var pl = self.sota_atmo.primary_light(self.cam_pos.y)
+            self.sun_dir = pl[0]
+            self.sun_radiance = pl[1]
+            self.sun_angular_radius = pl[2]
+        if self.sota_atmo.needs_ibl_refresh():
+            var t0 = get_time()
+            var ibl = self.sota_atmo.bake_ibl(self.cam_pos.y, self.env_cube_dim, self.env_mip_levels)
+            self.upload_ibl_environment(ibl)
+            self.sota_atmo.last_ibl_ms = (get_time() - t0) * 1000.0
+    # --- end sota:atmo hook ---
+
     def render_frame(mut self, capture_readback: Bool = False, force_readback: Bool = False) -> Bool:
         if not self.active:
             return self._sota_frame_fail("renderer is not active (Vulkan init failed or shut down)")  # sota:geometry hook
@@ -3968,6 +3995,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         _ = self.streamer.tick_streaming_budget()
         self._sota_gi_prepare()  # --- sota:gi hook ---
+        self._sota_atmo_prepare()  # --- sota:atmo hook ---
 
         # --- sota:camera hook (exposure triangle -> exposure, shutter, legacy lens) ---
         if self.sota_cam.drive_renderer:
@@ -4251,7 +4279,7 @@ struct FlintAaaVulkanRenderer(Movable):
             r_flags |= AAA_FLAG_GLASS
         if n_cl_lights > 0 and not self.furnace_white_dome:
             r_flags |= AAA_FLAG_CLUSTERED_LIGHTS
-        if self.enable_aerial_perspective and not self.furnace_white_dome:
+        if self.enable_aerial_perspective and not self.furnace_white_dome and not self.sota_atmo.replaces_legacy_ap():  # sota:atmo hook
             r_flags |= AAA_FLAG_AERIAL_PERSPECTIVE
         # --- sota:E hook ---
         if self.sota_e_character_shading:
@@ -4346,6 +4374,14 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + 164 * 4, self.sky_horizon_clear.x)
         put_float(g_addr + 165 * 4, self.sky_horizon_clear.y)
         put_float(g_addr + 166 * 4, self.sky_horizon_clear.z)
+        # --- sota:atmo hook --- per-frame atmosphere constants (b_globals[3840 .. 3904))
+        if self.sota_atmo.active() and not self.furnace_white_dome:
+            self.sota_atmo.write_globals(
+                g_addr, self.cam_pos.y, self.cloud_coverage > Float32(0.01) or self.star_intensity > Float32(0.01),
+                self.enable_froxel_fog, self.fog_density, self.froxel_far_z, self.fog_height_falloff,
+                self.fog_base_height_y, self.fog_albedo, self.fog_anisotropy_g,
+            )
+        # --- end sota:atmo hook ---
 
         # Extended v5 4-Cascade VSM Globals (`b_globals[167..215]` — `0..166` untouched!):
         put32(g_addr + VSM_GLOBALS_CASCADE_FLAG_WORD * 4, UInt32(1) if use_vsm_casc_frame else UInt32(0))
@@ -5020,6 +5056,12 @@ struct FlintAaaVulkanRenderer(Movable):
 
         var max_pix = max(self.output_w * self.output_h, self.render_w * self.render_h)
 
+        # --- sota:atmo hook --- transmittance / multi-scattering (on change), sky-view and aerial-perspective LUTs
+        var run_sota_atmo = self.sota_atmo.active() and not self.furnace_white_dome
+        if run_sota_atmo:
+            sota_atmo_record_luts(self.sota_atmo, self.vk, cur_slot, self.pipe_layout, self.desc_set, use_prof, next_q, q_limit, prof_pairs)
+        # --- end sota:atmo hook ---
+
         # `160 x 90 x 64` Temporal Froxel Volumetric Scattering Injection + 3D Reprojection Pass!
         var run_froxel = self.enable_froxel_fog and self.fog_density > Float32(1e-6) and not self.furnace_white_dome
         var run_rain = self.enable_gpu_rain and self.rain_intensity > Float32(0.001) and not self.furnace_white_dome
@@ -5430,6 +5472,14 @@ struct FlintAaaVulkanRenderer(Movable):
             self.vk.memory_barrier2(
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
             )
+
+        # --- sota:atmo hook --- sky / sun / moon, aerial perspective, height-fog tail (before the froxel composite)
+        if run_sota_atmo:
+            sota_atmo_record_apply(
+                self.sota_atmo, self.vk, cur_slot, self.pipe_layout, self.desc_set, self.render_w, self.render_h,
+                use_prof, next_q, q_limit, prof_pairs,
+            )
+        # --- end sota:atmo hook ---
 
         # 64-Slice Hillaire Froxel Prefix-LUT Composite + GPU Froxel-Lit 3D Rain Streaks!
         if run_froxel or run_rain:
@@ -6274,6 +6324,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_svgf_reproject)
         self.sota_ml.destroy(self.vk)  # sota:ml hook
         self.sota_ml_up.destroy(self.vk)  # sota:ml hook
+        self.sota_atmo.destroy_pipelines(self.vk)  # sota:atmo hook
         self.vk.destroy_pipeline(self.pipe_svgf_atrous)
         if self.sota_gi.pipe_wrc != 0:  # --- sota:gi hook ---
             self.vk.destroy_pipeline(self.sota_gi.pipe_wrc)
