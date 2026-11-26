@@ -16,6 +16,7 @@ slot, so one family of call helpers taking Int fits all of them.
 """
 from std.collections import Dict
 from std.ffi import external_call
+from std.time import monotonic  # --- sota:perf hook ---
 from flint.platform.dynlib import dl_open, dl_sym
 from flint.platform.amdgpu import GpuBuffer
 from flint.platform.os import env_flag, env_value, read_bytes, write_bytes
@@ -581,6 +582,7 @@ struct VulkanGpu(Copyable, Movable):
     var sota_e_batch_layouts: List[Int]
     var sota_e_batch_code: List[List[UInt32]]
     var sota_e_batch_handles: List[Int]
+    var sota_perf_compute_compile_s: Float64  # --- sota:perf hook --- wall time spent creating compute pipelines
     var descriptor_pool: Int
     var side_pools: List[Int]  # descriptor pools of passes outside the frame (GPU meshing)
     var layout_bindings: Int
@@ -688,6 +690,7 @@ struct VulkanGpu(Copyable, Movable):
         self.sota_e_batch_layouts = List[Int]()
         self.sota_e_batch_code = List[List[UInt32]]()
         self.sota_e_batch_handles = List[Int]()
+        self.sota_perf_compute_compile_s = 0.0  # --- sota:perf hook ---
         self.descriptor_pool = 0
         self.side_pools = List[Int]()
         self.layout_bindings = 0
@@ -2931,6 +2934,7 @@ struct VulkanGpu(Copyable, Movable):
             self.sota_e_batch_code.append(code.copy())
             return SOTA_E_PSO_TOKEN | (len(self.sota_e_batch_code) - 1)
         # --- end sota:E hook ---
+        var sota_perf_t0 = Float64(monotonic()) * 1.0e-9  # --- sota:perf hook --- serial compile time
         self.rewind()
         var module_info = self.scratch(40)
         put32(module_info, TYPE_SHADER_MODULE_CREATE_INFO)
@@ -2952,6 +2956,7 @@ struct VulkanGpu(Copyable, Movable):
         var result = call6(self.device_call("vkCreateComputePipelines"), self.device, self.pipeline_cache, 1, info, 0, slot)
         var pipeline = get64(slot)
         _ = call3(self.device_call("vkDestroyShaderModule"), self.device, module, 0)
+        self.sota_perf_compute_compile_s += Float64(monotonic()) * 1.0e-9 - sota_perf_t0  # --- sota:perf hook ---
         if not self.check(result, "vkCreateComputePipelines(AAA)"):
             return 0
         return pipeline
