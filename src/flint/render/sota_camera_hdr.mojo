@@ -21,6 +21,19 @@ the Purkinje shadow treatment and the grade) is authored once and is identical o
 below the knee; HDR only adds highlight headroom, which is what BT.2408 sec. 5 and BT.2390 sec. 5.4 suggest
 for mixing SDR-graded content into HDR (SDR white mapped to the reference white, highlights expanded).
 
+Round 4: luminance-aware expansion (`expansion_mode = SOTA_HDR_EXPAND_LUMINANCE`), after the structure of
+ITU-R BT.2446-1 method C (inverse direction): a crosstalk matrix with parameter alpha is applied to the
+display-linear AgX RGB to estimate the driving luminance Yc = luma(X rgb), X = (1 - 2a) I + a 1 1^T (a
+little of the other channels, so saturated colours are not judged by their luminance alone); Yc is expanded
+with a linear segment up to the knee and an exponential segment above it (the inverse of method C's
+logarithmic segment), C1 at the knee and solved so E(1) = P:
+       E(y) = y                                  for y <= k
+       E(y) = k + (exp(b (y - k)) - 1) / b       for y >  k,   b > 0 from k + (exp(b (1 - k)) - 1) / b = P
+and the colour is scaled by E(Yc) / Yc (chromaticity kept), limited so no channel exceeds the peak. Bright
+saturated colours (a red tail light, a blue sky patch) keep their SDR luminance instead of being pushed to
+the display peak on their max channel, while near-white highlights (sun, specular, clouds) get the full
+range. The default stays the round-3 max-channel curve, so existing HDR output is unchanged.
+
 Display metadata: with `VK_EXT_hdr_metadata` the swapchain gets ST.2086 mastering primaries (BT.2020,
 D65), max luminance = peak, MaxCLL = peak (the mapping never exceeds it) and MaxFALL = paper white.
 
@@ -34,7 +47,7 @@ reference white, sec. 5 SDR <-> HDR mapping); ITU-R BT.2390-11 sec. 5.4 (display
 specifications; Sobotka, AgX (MIT/CC0 reference configs) for the SDR look the mapping starts from.
 """
 from std.collections import List
-from std.math import max, min, pow
+from std.math import exp, max, min, pow
 from std.memory import bitcast
 from flint.platform.vulkan import (
     ACCESS_HOST_READ,
@@ -60,6 +73,11 @@ comptime SOTA_HDR_LEGACY_SCRGB: UInt32 = 3  # AAA_DISPLAY_SCRGB_FP16
 comptime SOTA_HDR_PUSH_PAPER: Int = 10
 comptime SOTA_HDR_PUSH_PEAK_RATIO: Int = 11
 comptime SOTA_HDR_PUSH_KNEE: Int = 12
+comptime SOTA_HDR_PUSH_MODE: Int = 13       # round 4: 0 max channel, 1 luminance (BT.2446-C style)
+comptime SOTA_HDR_PUSH_CROSSTALK: Int = 14
+comptime SOTA_HDR_PUSH_EXP_B: Int = 15
+comptime SOTA_HDR_EXPAND_MAX_CHANNEL: Int = 0
+comptime SOTA_HDR_EXPAND_LUMINANCE: Int = 1
 # UI overlay push word carrying the paper white in nits (0 = legacy 203 nits).
 comptime SOTA_HDR_UI_PUSH_PAPER: Int = 6
 
@@ -72,6 +90,8 @@ struct SotaHdrOutput(Copyable, ImplicitlyCopyable, Movable):
     var peak_nits: Float32         # display peak; AgX white maps here
     var knee: Float32              # display-linear AgX value where the highlight expansion starts
     var min_nits: Float32          # ST.2086 mastering min luminance
+    var expansion_mode: Int        # SOTA_HDR_EXPAND_MAX_CHANNEL (round 3 default) | SOTA_HDR_EXPAND_LUMINANCE
+    var crosstalk: Float32         # BT.2446-C crosstalk alpha (0 .. 0.33) for the luminance mode
     var meta_swapchain: Int        # swapchain the metadata was last sent for
     var meta_key: UInt64           # settings the metadata was last sent with
     var meta_sent: Int             # number of vkSetHdrMetadataEXT calls (tests / diagnostics)
@@ -82,6 +102,8 @@ struct SotaHdrOutput(Copyable, ImplicitlyCopyable, Movable):
         self.peak_nits = Float32(1000.0)
         self.knee = Float32(0.6)
         self.min_nits = Float32(0.005)
+        self.expansion_mode = SOTA_HDR_EXPAND_MAX_CHANNEL
+        self.crosstalk = Float32(0.05)
         self.meta_swapchain = 0
         self.meta_key = 0
         self.meta_sent = 0
@@ -95,6 +117,13 @@ struct SotaHdrOutput(Copyable, ImplicitlyCopyable, Movable):
 
     def knee_clamped(self) -> Float32:
         return max(Float32(0.0), min(Float32(0.95), self.knee))
+
+    def crosstalk_clamped(self) -> Float32:
+        return max(Float32(0.0), min(Float32(0.33), self.crosstalk))
+
+    def exp_b(self) -> Float32:
+        """Exponential-segment rate of the luminance mode, solved so E(1) = P (0 = identity)."""
+        return sota_hdr_solve_exp_b(self.peak_ratio(), self.knee_clamped())
 
 
 def sota_hdr_tonemap_mode(hdr: SotaHdrOutput, display_mode: UInt32, legacy_mode: UInt32) -> UInt32:
@@ -118,6 +147,10 @@ def sota_hdr_tonemap_push(hdr: SotaHdrOutput, mut push: List[UInt32]):
     push[SOTA_HDR_PUSH_PAPER] = bitcast[DType.uint32](hdr.paper())
     push[SOTA_HDR_PUSH_PEAK_RATIO] = bitcast[DType.uint32](hdr.peak_ratio())
     push[SOTA_HDR_PUSH_KNEE] = bitcast[DType.uint32](hdr.knee_clamped())
+    if hdr.expansion_mode == SOTA_HDR_EXPAND_LUMINANCE:
+        push[SOTA_HDR_PUSH_MODE] = UInt32(1)
+        push[SOTA_HDR_PUSH_CROSSTALK] = bitcast[DType.uint32](hdr.crosstalk_clamped())
+        push[SOTA_HDR_PUSH_EXP_B] = bitcast[DType.uint32](hdr.exp_b())
 
 
 # ----------------------------------------------------------------------------------------------
@@ -167,6 +200,54 @@ def sota_hdr_expand_cpu(m: Float32, peak_ratio: Float32, knee: Float32) -> Float
     return m + (peak_ratio - Float32(1.0)) * t * t
 
 
+def _exp_seg(t: Float32, b: Float32) -> Float32:
+    """(exp(b t) - 1) / b, with the b -> 0 limit t."""
+    if b < Float32(1.0e-4):
+        return t
+    return (exp(b * t) - Float32(1.0)) / b
+
+
+def sota_hdr_solve_exp_b(peak_ratio: Float32, knee: Float32) -> Float32:
+    """b > 0 with knee + (exp(b (1 - knee)) - 1) / b = P (bisection; monotonic in b). 0 when P <= 1."""
+    var k = max(Float32(0.0), min(Float32(0.95), knee))
+    var target = peak_ratio - k
+    var span = Float32(1.0) - k
+    if target <= span * Float32(1.0001):
+        return Float32(0.0)
+    var lo = Float32(0.0)
+    var hi = Float32(1.0)
+    while _exp_seg(span, hi) < target and hi < Float32(1.0e4):
+        hi *= Float32(2.0)
+    for _ in range(60):
+        var mid = (lo + hi) * Float32(0.5)
+        if _exp_seg(span, mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) * Float32(0.5)
+
+
+def sota_hdr_expand_lum_cpu(y: Float32, knee: Float32, b: Float32) -> Float32:
+    if y <= knee:
+        return y
+    return knee + _exp_seg(y - knee, b)
+
+
+def sota_hdr_lum_scale_cpu(r: Float32, g: Float32, b: Float32, hdr: SotaHdrOutput) -> Float32:
+    """Scale factor of the luminance mode for display-linear AgX rgb (0..1)."""
+    var a = hdr.crosstalk_clamped()
+    var sum = r + g + b
+    var cr = (Float32(1.0) - Float32(3.0) * a) * r + a * sum
+    var cg = (Float32(1.0) - Float32(3.0) * a) * g + a * sum
+    var cb = (Float32(1.0) - Float32(3.0) * a) * b + a * sum
+    var yc = Float32(0.2126) * cr + Float32(0.7152) * cg + Float32(0.0722) * cb
+    if yc <= Float32(1.0e-6):
+        return Float32(1.0)
+    var sc = sota_hdr_expand_lum_cpu(yc, hdr.knee_clamped(), hdr.exp_b()) / yc
+    var m = max(r, max(g, b))
+    return max(Float32(1.0), min(sc, hdr.peak_ratio() / max(m, Float32(1.0e-6))))
+
+
 def sota_hdr_map_nits_cpu(r_srgb: Float32, g_srgb: Float32, b_srgb: Float32, hdr: SotaHdrOutput) -> Tuple[Float32, Float32, Float32]:
     """Display-referred AgX (sRGB encoded, 0..1) -> absolute Rec.709 luminance per channel (nits)."""
     var r = srgb_eotf_cpu(r_srgb)
@@ -174,7 +255,9 @@ def sota_hdr_map_nits_cpu(r_srgb: Float32, g_srgb: Float32, b_srgb: Float32, hdr
     var b = srgb_eotf_cpu(b_srgb)
     var m = max(r, max(g, b))
     var s = Float32(1.0)
-    if m > Float32(1.0e-6):
+    if hdr.expansion_mode == SOTA_HDR_EXPAND_LUMINANCE:
+        s = sota_hdr_lum_scale_cpu(r, g, b, hdr)
+    elif m > Float32(1.0e-6):
         s = sota_hdr_expand_cpu(m, hdr.peak_ratio(), hdr.knee_clamped()) / m
     var pw = hdr.paper()
     return (r * s * pw, g * s * pw, b * s * pw)
@@ -303,7 +386,21 @@ def sota_hdr_emit_tonemap_hdr(mut s: AaaSpirvModule, disp_mode: UInt32, dr: UInt
     var m = s.nmax(r, s.nmax(g, b))
     var t = s.fdiv(s.nmax(s.float(0.0), s.fsub(m, knee)), s.nmax(s.float(1e-6), s.fsub(s.float(1.0), knee)))
     var e = s.fma(s.fsub(peak_ratio, s.float(1.0)), s.fmul(t, t), m)
-    var scale = s.fmul(s.select_f(s.fgt(m, s.float(1e-6)), s.fdiv(e, s.nmax(m, s.float(1e-6))), s.float(1.0)), paper)
+    var scale_max = s.select_f(s.fgt(m, s.float(1e-6)), s.fdiv(e, s.nmax(m, s.float(1e-6))), s.float(1.0))
+    # Round 4: luminance-aware (BT.2446-C style) expansion, selected by push word 13.
+    var lum_on = s.ine(s.push_word(SOTA_HDR_PUSH_MODE), s.uint(0))
+    var xa = s.push_float(SOTA_HDR_PUSH_CROSSTALK)
+    var xb = s.push_float(SOTA_HDR_PUSH_EXP_B)
+    var xsum = s.fmul(s.fadd(r, s.fadd(g, b)), xa)
+    var xk = s.fsub(s.float(1.0), s.fmul(xa, s.float(3.0)))
+    var yc = s.fma(s.fma(r, xk, xsum), s.float(0.2126), s.fma(s.fma(g, xk, xsum), s.float(0.7152), s.fmul(s.fma(b, xk, xsum), s.float(0.0722))))
+    var yt = s.nmax(s.float(0.0), s.fsub(yc, knee))
+    var seg_exp = s.fdiv(s.fsub(s.exp2(s.fmul(s.fmul(xb, yt), s.float(1.4426950408889634))), s.float(1.0)), s.nmax(xb, s.float(1e-4)))
+    var seg = s.select_f(s.fgt(xb, s.float(1e-4)), seg_exp, yt)
+    var ey = s.select_f(s.fgt(yc, knee), s.fadd(knee, seg), yc)
+    var s_lum = s.select_f(s.fgt(yc, s.float(1e-6)), s.fdiv(ey, s.nmax(yc, s.float(1e-6))), s.float(1.0))
+    s_lum = s.nmax(s.float(1.0), s.nmin(s_lum, s.fdiv(peak_ratio, s.nmax(m, s.float(1e-6)))))
+    var scale = s.fmul(s.select_f(lum_on, s_lum, scale_max), paper)
     var nr = s.fmul(r, scale)
     var ng = s.fmul(g, scale)
     var nb = s.fmul(b, scale)
