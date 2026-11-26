@@ -1333,7 +1333,9 @@ def emit_eval_single_cluster_light(
     var lr_w = s.fmul(lrr, win)
     var lg_w = s.fmul(lrg, win)
     var lb_w = s.fmul(lrb, win)
-    var sota_prev = (s.load_f(out_r), s.load_f(out_g), s.load_f(out_b))  # --- sota:mat hook ---
+    var sota_prev = (UInt32(0), UInt32(0), UInt32(0))  # --- sota:mat hook ---
+    if sota_lb.active():
+        sota_prev = (s.load_f(out_r), s.load_f(out_g), s.load_f(out_b))
     s.store(out_r, s.fma(lr_w, s.fma(kd_r, ff_diff, s.fmul(spec_w_r, ff_spec)), s.load_f(out_r)))
     s.store(out_g, s.fma(lg_w, s.fma(kd_g, ff_diff, s.fmul(spec_w_g, ff_spec)), s.load_f(out_g)))
     s.store(out_b, s.fma(lb_w, s.fma(kd_b, ff_diff, s.fmul(spec_w_b, ff_spec)), s.load_f(out_b)))
@@ -1396,7 +1398,9 @@ def emit_eval_single_cluster_light(
     var dv_s = s.fmul(d_ggx, vis_g)
 
     var e_in = s.fmul(ndotl, s.load_f(atten))
-    var sota_prev_p = (s.load_f(out_r), s.load_f(out_g), s.load_f(out_b))  # --- sota:mat hook ---
+    var sota_prev_p = (UInt32(0), UInt32(0), UInt32(0))  # --- sota:mat hook ---
+    if sota_lb.active():
+        sota_prev_p = (s.load_f(out_r), s.load_f(out_g), s.load_f(out_b))
     s.store(out_r, s.fma(s.fmul(lrr, e_in), s.fma(kd_r, inv_pi, s.fmul(fr_r, dv_s)), s.load_f(out_r)))
     s.store(out_g, s.fma(s.fmul(lrg, e_in), s.fma(kd_g, inv_pi, s.fmul(fr_g, dv_s)), s.load_f(out_g)))
     s.store(out_b, s.fma(s.fmul(lrb, e_in), s.fma(kd_b, inv_pi, s.fmul(fr_b, dv_s)), s.load_f(out_b)))

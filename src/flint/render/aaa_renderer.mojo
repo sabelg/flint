@@ -4721,7 +4721,22 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:mat hook (layered material model; LUTs baked + uploaded on first enabled frame) ---
         if self.sota_mat.enabled:
             self.sota_mat.prepare(self.buf_materials.cpu_address)
-            if self.sota_mat.lut_uploaded:
+            if not self.sota_mat.variants_tried:  # layered pipeline variants (the defaults carry none of it)
+                self.sota_mat.variants_tried = True
+                var sota_t0 = get_time()
+                var sota_rt = self.vk.has_ray_query
+                self.sota_mat.pipe_deferred = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, aaa_deferred_shade_shader(sota_rt, sota_mat_layered=True)
+                )
+                self.sota_mat.pipe_surfcache = self.vk.create_aaa_compute_pipeline(
+                    self.pipe_layout, surface_cache_update_shader(sota_rt, sota_mat_layered=True)
+                )
+                if sota_rt:
+                    self.sota_mat.pipe_rt_shadow = self.vk.create_aaa_compute_pipeline(
+                        self.pipe_layout, rt_sun_shadow_trace_shader(sota_mat_layered=True)
+                    )
+                self.sota_mat.variant_build_s = get_time() - sota_t0
+            if self.sota_mat.active():
                 r_flags |= AAA_FLAG_SOTA_MAT
         # --- end sota:mat hook ---
         put32(g_addr + 99 * 4, r_flags)
@@ -5452,7 +5467,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     push_sc0[2] = UInt32(0)
                     self.vk.dispatch_aaa(
                         cur_slot,
-                        self.pipe_surfcache,
+                        self.sota_mat.pick(self.pipe_surfcache, self.sota_mat.pipe_surfcache),  # sota:mat hook
                         self.pipe_layout,
                         self.desc_set,
                         push_sc0,
@@ -5467,7 +5482,7 @@ struct FlintAaaVulkanRenderer(Movable):
                     push_sc1[2] = UInt32(head_end)
                     self.vk.dispatch_aaa(
                         cur_slot,
-                        self.pipe_surfcache,
+                        self.sota_mat.pick(self.pipe_surfcache, self.sota_mat.pipe_surfcache),  # sota:mat hook
                         self.pipe_layout,
                         self.desc_set,
                         push_sc1,
@@ -5602,7 +5617,8 @@ struct FlintAaaVulkanRenderer(Movable):
             push_rs[2] = UInt32(rt_shadow_raw_offset(max_pix))
             push_rs[3] = UInt32(rt_sun_flt_off)
             self.vk.dispatch_aaa(
-                cur_slot, self.pipe_rt_shadow_trace, self.pipe_layout, self.desc_set, push_rs, (self.render_w + 7) // 8, (self.render_h + 7) // 8
+                cur_slot, self.sota_mat.pick(self.pipe_rt_shadow_trace, self.sota_mat.pipe_rt_shadow),  # sota:mat hook
+                self.pipe_layout, self.desc_set, push_rs, (self.render_w + 7) // 8, (self.render_h + 7) // 8
             )
             self.vk.memory_barrier2(
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
@@ -5653,7 +5669,7 @@ struct FlintAaaVulkanRenderer(Movable):
         push_sh[8] = UInt32((self.render_w + 7) // 8)  # --- sota:camera hook ---
         self.vk.dispatch_aaa(
             cur_slot,
-            self.pipe_deferred_shade,
+            self.sota_mat.pick(self.pipe_deferred_shade, self.sota_mat.pipe_deferred),  # sota:mat hook
             self.pipe_layout,
             self.desc_set,
             push_sh,
@@ -6872,6 +6888,14 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_water_refract)
         if self.pipe_rt_shadow_trace != 0:
             self.vk.destroy_pipeline(self.pipe_rt_shadow_trace)
+        # --- sota:mat hook --- layered pipeline variants
+        if self.sota_mat.pipe_deferred != 0:
+            self.vk.destroy_pipeline(self.sota_mat.pipe_deferred)
+        if self.sota_mat.pipe_surfcache != 0:
+            self.vk.destroy_pipeline(self.sota_mat.pipe_surfcache)
+        if self.sota_mat.pipe_rt_shadow != 0:
+            self.vk.destroy_pipeline(self.sota_mat.pipe_rt_shadow)
+        # --- end sota:mat hook ---
         if self.pipe_rt_shadow_filter != 0:
             self.vk.destroy_pipeline(self.pipe_rt_shadow_filter)
         if self.pipe_glass_refract != 0:

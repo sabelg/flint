@@ -211,12 +211,22 @@ def _tilt(n: Vec3, axis: Vec3, ang: Float32) -> Vec3:
 # ---------------------------------------------------------------------------------------------
 def test_spirv():
     for rq in range(2):
-        var r1 = validate_spirv_module(aaa_deferred_shade_shader(rq == 1))
-        _assert(r1.valid, "deferred shader validates (ray query " + String(rq) + ")")
-        var r2 = validate_spirv_module(surface_cache_update_shader(rq == 1))
-        _assert(r2.valid, "surface cache shader validates (ray query " + String(rq) + ")")
-    var r3 = validate_spirv_module(rt_sun_shadow_trace_shader())
-    _assert(r3.valid, "RT sun shadow shader validates")
+        for lay in range(2):
+            var tag = " (ray query " + String(rq) + ", layered variant " + String(lay) + ")"
+            var d = aaa_deferred_shade_shader(rq == 1, sota_mat_layered=lay == 1)
+            var r1 = validate_spirv_module(d)
+            _assert(r1.valid, "deferred shader validates" + tag)
+            var r2 = validate_spirv_module(surface_cache_update_shader(rq == 1, sota_mat_layered=lay == 1))
+            _assert(r2.valid, "surface cache shader validates" + tag)
+        # The default pipelines carry none of the layered code: the variant is strictly larger
+        var d_off = len(aaa_deferred_shade_shader(rq == 1))
+        var d_on = len(aaa_deferred_shade_shader(rq == 1, sota_mat_layered=True))
+        print("    deferred shader words: default", d_off, " layered variant", d_on)
+        _assert(d_on > d_off + 1000, "layered code compiled out of the default deferred shader")
+    for lay in range(2):
+        var r3 = validate_spirv_module(rt_sun_shadow_trace_shader(sota_mat_layered=lay == 1))
+        _assert(r3.valid, "RT sun shadow shader validates (layered variant " + String(lay) + ")")
+    _assert(len(rt_sun_shadow_trace_shader(sota_mat_layered=True)) > len(rt_sun_shadow_trace_shader()), "shadow variant differs")
     var g = compile_sota_layered_material_shader(BrushedSpunMetalNode())
     var r4 = validate_spirv_module(g)
     _assert(r4.valid, "layered material graph validates")

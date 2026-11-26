@@ -102,6 +102,7 @@ from flint.render.sota_mat_core import (
     emit_sota_mat_compose,
     emit_sota_mat_decode_on,
     emit_sota_mat_shade,
+    emit_sota_mat_shade_off,
     emit_sota_mat_surface_extra,
 )
 from flint.render.sota_mat_lights import emit_sota_mat_surface_cache_albedo
@@ -690,7 +691,7 @@ def _emit_forzatech_road_wetness_spv(
     return s.fmul(damp_t, s.fmul(s.fsub(s.float(1.0), film_s), om_paint))
 
 
-def surface_cache_update_shader(enable_ray_query: Bool) -> List[UInt32]:
+def surface_cache_update_shader(enable_ray_query: Bool, sota_mat_layered: Bool = False) -> List[UInt32]:
     """Lumen-Class Direct + Multi-Bounce Mesh Surface-Cache Updater (`BIND_AAA_SURFCACHE`).
     Invocation X = instance_idx, Invocation Y = instance_local_tri_idx!
     Push[0] = instance_count, Push[1] = bounce_pass (0 = direct sun + emissive, 1 = +1 indirect bounce!).
@@ -707,6 +708,7 @@ def surface_cache_update_shader(enable_ray_query: Bool) -> List[UInt32]:
         enable_bindless=True,
         enable_ray_query=enable_ray_query,
     )
+    s.sota_mat_layered = sota_mat_layered  # --- sota:mat hook --- layered pipeline variant
     var b_verts = s.buffer(BIND_AAA_VERTICES)
     var b_indices = s.buffer(BIND_AAA_INDICES)
     var b_instances = s.buffer(BIND_AAA_INSTANCES)
@@ -825,12 +827,13 @@ def surface_cache_update_shader(enable_ray_query: Bool) -> List[UInt32]:
     var kd_g = s.fmul(alb_g, diff_Scale)
     var kd_b = s.fmul(alb_b, diff_Scale)
     # --- sota:mat hook --- (layered hemispherical albedo as the bounce albedo; legacy when off)
-    var sota_sc_kd = emit_sota_mat_surface_cache_albedo(
-        s, b_materials, r_flags_sc, mat_id, m_base, (kd_r, kd_g, kd_b), (alb_r, alb_g, alb_b), met
-    )
-    kd_r = sota_sc_kd[0]
-    kd_g = sota_sc_kd[1]
-    kd_b = sota_sc_kd[2]
+    if s.sota_mat_layered:
+        var sota_sc_kd = emit_sota_mat_surface_cache_albedo(
+            s, b_materials, r_flags_sc, mat_id, m_base, (kd_r, kd_g, kd_b), (alb_r, alb_g, alb_b), met
+        )
+        kd_r = sota_sc_kd[0]
+        kd_g = sota_sc_kd[1]
+        kd_b = sota_sc_kd[2]
     # --- end sota:mat hook ---
 
     var sun_x = s.load_float(b_globals, s.uint(48))
@@ -946,7 +949,7 @@ def surface_cache_update_shader(enable_ray_query: Bool) -> List[UInt32]:
     return s.finish()
 
 
-def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
+def aaa_deferred_shade_shader(enable_ray_query: Bool, sota_mat_layered: Bool = False) -> List[UInt32]:
     """Unified AAA Deferred `VisBuffer` Compute Material & Lighting Shader:
     - Analytic 3-Ray Möller-Trumbore perspective-correct barycentrics + `ddx/ddy` UV gradients
     - Bindless `16x` anisotropic `BC7` Albedo/ORM + `BC5` Macro & Micro-Detail `RNM` Normals
@@ -963,6 +966,7 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         enable_bindless=True,
         enable_ray_query=enable_ray_query,
     )
+    s.sota_mat_layered = sota_mat_layered  # --- sota:mat hook --- layered pipeline variant (default: none of it)
     var b_verts = s.buffer(BIND_AAA_VERTICES)
     var b_indices = s.buffer(BIND_AAA_INDICES)
     var b_meshlets = s.buffer(BIND_AAA_MESHLETS)
@@ -1678,24 +1682,26 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         sss_r, sss_g, sss_b,
         lut_a, lut_b,
     )
-    # --- sota:mat hook (layered model: direct sun response + split-sum weights; legacy values when off) ---
-    var sota_mat_on = emit_sota_mat_decode_on(s, r_flags, sota_e.tagged)
-    var sota_mat_x = emit_sota_mat_surface_extra(  # coat normal + layer mask texture (round 3)
-        s, b_materials, mat_id, sota_mat_on, bindless_arr, uv_vec, ddx_vec, ddy_vec,
-        wt_u, wb_u, (wn_geom[0], wn_geom[1], wn_geom[2]), (nx, ny, nz), flip_n,
-    )
-    var sota_mat = emit_sota_mat_shade(
-        s, b_materials, mat_id, sota_mat_on,
-        SotaMatInputs(
-            nx, ny, nz, vx, vy, vz, sun_x, sun_y, sun_z,
-            wt_u[0], wt_u[1], wt_u[2], wb_u[0], wb_u[1], wb_u[2],
-            cur_alb_r, cur_alb_g, cur_alb_b, cur_metal, spec_fac, cur_rough, ccoat, ccoat_r,
-            sh_r, sh_g, sh_b, sh_rough, sss_r, sss_g, sss_b, irid_w, irid_nm, irid_ior,
-        ),
-        direct,
-        sota_mat_x,
-    )
-    direct = (s.load_f(sota_mat.dir_r), s.load_f(sota_mat.dir_g), s.load_f(sota_mat.dir_b))
+    # --- sota:mat hook (layered model: direct sun response + split-sum weights; only in the layered variant) ---
+    var sota_mat = emit_sota_mat_shade_off()
+    if s.sota_mat_layered:
+        var sota_mat_on = emit_sota_mat_decode_on(s, r_flags, sota_e.tagged)
+        var sota_mat_x = emit_sota_mat_surface_extra(  # coat normal + layer mask texture (round 3)
+            s, b_materials, mat_id, sota_mat_on, bindless_arr, uv_vec, ddx_vec, ddy_vec,
+            wt_u, wb_u, (wn_geom[0], wn_geom[1], wn_geom[2]), (nx, ny, nz), flip_n,
+        )
+        sota_mat = emit_sota_mat_shade(
+            s, b_materials, mat_id, sota_mat_on,
+            SotaMatInputs(
+                nx, ny, nz, vx, vy, vz, sun_x, sun_y, sun_z,
+                wt_u[0], wt_u[1], wt_u[2], wb_u[0], wb_u[1], wb_u[2],
+                cur_alb_r, cur_alb_g, cur_alb_b, cur_metal, spec_fac, cur_rough, ccoat, ccoat_r,
+                sh_r, sh_g, sh_b, sh_rough, sss_r, sss_g, sss_b, irid_w, irid_nm, irid_ior,
+            ),
+            direct,
+            sota_mat_x,
+        )
+        direct = (s.load_f(sota_mat.dir_r), s.load_f(sota_mat.dir_g), s.load_f(sota_mat.dir_b))
     # --- end sota:mat hook ---
     # --- sota:E hook (skin / eye / hair direct sun response) ---
     var sota_e_curv = emit_sota_e_skin_curvature_radius(
@@ -2156,27 +2162,28 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var dw_b = s.fvar(s.fmul(s.fmul(kd_gi_b, cur_alb_b), s.fmul(om_rc, mb_ao[2])))
 
     # --- sota:mat hook (layered split-sum composition: overwrites crisp / diffuse weight / spec modulation) ---
-    if enable_ray_query:  # traced transmission (refraction / Beer-Lambert for volumes) into sota_mat.tr_*
-        emit_sota_mat_transmission_trace(
-            s, sota_mat, s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_RT_REFLECTIONS)), s.uint(0)),
-            tlas_var, b_verts, b_indices, b_instances, b_materials, b_globals, b_vsm, b_surfcache, b_clusters,
-            vsm_samp, env_cube, bindless_arr, wx, wy, wz,
-            (s.fmul(wn_geom[0], flip_n), s.fmul(wn_geom[1], flip_n), s.fmul(wn_geom[2], flip_n)),
-            cam_dist, ibl_int, max_env_mip,
+    if s.sota_mat_layered:
+        if enable_ray_query:  # traced transmission (refraction / Beer-Lambert for volumes) into sota_mat.tr_*
+            emit_sota_mat_transmission_trace(
+                s, sota_mat, s.ine(s.bit_and(r_flags, s.uint(AAA_FLAG_RT_REFLECTIONS)), s.uint(0)),
+                tlas_var, b_verts, b_indices, b_instances, b_materials, b_globals, b_vsm, b_surfcache, b_clusters,
+                vsm_samp, env_cube, bindless_arr, wx, wy, wz,
+                (s.fmul(wn_geom[0], flip_n), s.fmul(wn_geom[1], flip_n), s.fmul(wn_geom[2], flip_n)),
+                cam_dist, ibl_int, max_env_mip,
+            )
+        var sota_mat_dm = emit_sota_mat_compose(
+            s, sota_mat,
+            SotaMatComposeIn(
+                nx, ny, nz, vx, vy, vz, cur_rough, refl_r, refl_g, refl_b, ccoat_env_r, ccoat_env_g, ccoat_env_b,
+                env_sp, env_occ_sub, ibl_int, max_env_mip, is_furnace, dir_r, dir_g, dir_b, em_r, em_g, em_b,
+                mb_ao[0], mb_ao[1], mb_ao[2], demod_spec, crisp_r, crisp_g, crisp_b, dw_r, dw_g, dw_b,
+                mod_r_v, mod_g_v, mod_b_v, env_cc, env_occ_cc,
+            ),
+            env_cube, (demod_sr, demod_sg, demod_sb),
         )
-    var sota_mat_dm = emit_sota_mat_compose(
-        s, sota_mat,
-        SotaMatComposeIn(
-            nx, ny, nz, vx, vy, vz, cur_rough, refl_r, refl_g, refl_b, ccoat_env_r, ccoat_env_g, ccoat_env_b,
-            env_sp, env_occ_sub, ibl_int, max_env_mip, is_furnace, dir_r, dir_g, dir_b, em_r, em_g, em_b,
-            mb_ao[0], mb_ao[1], mb_ao[2], demod_spec, crisp_r, crisp_g, crisp_b, dw_r, dw_g, dw_b,
-            mod_r_v, mod_g_v, mod_b_v, env_cc, env_occ_cc,
-        ),
-        env_cube, (demod_sr, demod_sg, demod_sb),
-    )
-    demod_sr = sota_mat_dm[0]
-    demod_sg = sota_mat_dm[1]
-    demod_sb = sota_mat_dm[2]
+        demod_sr = sota_mat_dm[0]
+        demod_sg = sota_mat_dm[1]
+        demod_sb = sota_mat_dm[2]
     # --- end sota:mat hook ---
 
     # 5. Bruneton / Hillaire Distance Aerial Perspective (`V18`, evaluated ONLY beyond `froxel_far_z` when Froxels are active!)

@@ -901,6 +901,7 @@ struct AaaSpirvModule(Movable):
     var group_width: UInt32
     var group_height: UInt32
     var early_depth: Bool
+    var sota_mat_layered: Bool  # --- sota:mat hook --- emit the layered-material code (pipeline variant)
 
     def __init__(
         out self,
@@ -979,6 +980,7 @@ struct AaaSpirvModule(Movable):
         self.group_width = UInt32(group_width)
         self.group_height = UInt32(group_height)
         self.early_depth = early_depth
+        self.sota_mat_layered = False  # --- sota:mat hook ---
         self._declare_core_types(push_words, enable_ray_query)
         var first = self.fresh()
         emit(self.code, OP_LABEL, first)

@@ -2205,12 +2205,34 @@ struct SotaMatState(Copyable, Movable):
     var lut_uploaded: Bool
     var bake_s: Float64
     var transmissive: List[Bool]  # per material: layered transmission > 0 (TLAS: non-opaque + instance bit 20)
+    # Layered pipeline variants (`sota_mat_layered=True`), built on the first enabled frame. The default
+    # pipelines contain none of the layered code, so switch-off rendering is the pre-layered shader.
+    var variants_tried: Bool
+    var pipe_deferred: Int
+    var pipe_surfcache: Int
+    var pipe_rt_shadow: Int
+    var variant_build_s: Float64
 
     def __init__(out self):
         self.enabled = env_value("FLINT_SOTA_MAT") == "1"
         self.lut_uploaded = False
         self.bake_s = Float64(0.0)
         self.transmissive = List[Bool]()
+        self.variants_tried = False
+        self.pipe_deferred = 0
+        self.pipe_surfcache = 0
+        self.pipe_rt_shadow = 0
+        self.variant_build_s = Float64(0.0)
+
+    def active(self) -> Bool:
+        """Layered shading runs this frame: enabled, LUTs uploaded and the layered deferred variant built."""
+        return self.enabled and self.lut_uploaded and self.pipe_deferred != 0
+
+    def pick(self, legacy_pipe: Int, variant_pipe: Int) -> Int:
+        """The layered variant while `active()` (and built), else the default pipeline."""
+        if self.active() and variant_pipe != 0:
+            return variant_pipe
+        return legacy_pipe
 
     def set_transmissive(mut self, mat_id: Int, value: Bool):
         if mat_id < 0 or mat_id >= SOTA_MAT_MAX_MATERIALS:
