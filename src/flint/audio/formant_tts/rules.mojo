@@ -25,6 +25,7 @@ from flint.audio.formant_tts.voices import FormantVoice
 
 comptime R_NOM: Float32 = 178.0       # nominal rate the Klatt 1979 durations represent (wpm, calibrated)
 comptime LEAD_MS: Float32 = 30.0
+comptime VBAR_DB: Float32 = 44.0   # voice-bar AVS at closure onset (K80 50; at 50 intervocalic /b d g/ read as nasals or vanished, tuning log r2)
 comptime TAIL_MS: Float32 = 90.0
 
 # word flags (per codepoint of the phoneme string, from the G2P word list)
@@ -430,6 +431,9 @@ def _durations(mut segs: List[Seg], tab: List[PhonemeDef], phrases: List[Phrase]
             prc *= Float32(1.4) if pfs else Float32(0.6)
         elif pfs and i > nuc and (d.has(FL_LIQ) or d.has(FL_NASAL)):
             prc *= 1.4
+        # secondary stress: between full and reduced (MITalk)
+        if syl and segs[i].stress == 2:
+            prc *= 0.85
         # rule 4: non-word-final syllabics
         if syl and not wfs:
             prc *= 0.85
@@ -1381,7 +1385,7 @@ def build_track(ps: String, wflags: List[Int], voice: FormantVoice, tab: List[Ph
                     split = Float32(0.55) if segs[s].ph == PH_CH else Float32(0.7)
                 if frac < split or not segs[s].released:
                     if segs[s].voicebar:
-                        avs = Float32(50.0) - Float32(10.0) * (frac / split)
+                        avs = Float32(VBAR_DB) - Float32(10.0) * (frac / split)
                 else:
                     # affricate frication: abrupt (< 20 ms) rise for ʧ, decays over the last 10 ms
                     af = d.af

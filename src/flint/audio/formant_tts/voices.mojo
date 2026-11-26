@@ -16,6 +16,9 @@ comptime FV_ACE_TENOR: Int = 3
 comptime FV_ACE_CRIMSON: Int = 4
 
 
+from flint.core.detmath import det_exp, det_cos, det_sin
+
+
 struct FormantVoice(Copyable, Movable):
     var id: Int
     var f0_base: Float32      # F_b: phrase baseline (Hz)
@@ -40,6 +43,8 @@ struct FormantVoice(Copyable, Movable):
     var tracheal: Bool        # subglottal pole / zero pair (breathy voices)
     var british: Bool         # GB lexicon
     var f0_floor: Float32
+    var shelf_db: Float32     # first-order high shelf (corner ~1.6 kHz), dB at the top of the band
+    var presence_db: Float32  # peaking boost at 2.8 kHz (Q 1.2): consonant cues inside a 3.4 kHz radio band
 
     def __init__(out self):
         self.id = FV_DEFAULT
@@ -65,6 +70,8 @@ struct FormantVoice(Copyable, Movable):
         self.tracheal = False
         self.british = False
         self.f0_floor = 65.0
+        self.shelf_db = 0.0
+        self.presence_db = 0.0
 
     def set_scales(mut self, a: Float32, b: Float32, c: Float32, d: Float32, e: Float32):
         self.fs1 = a
@@ -83,6 +90,8 @@ def formant_voice(id: Int) -> FormantVoice:
     var v = FormantVoice()
     v.id = id
     if id == FV_AI_OS:
+        v.shelf_db = 6.0
+        v.presence_db = 6.0
         # calm machine RP baritone, steady (4.5 st: at 2.5 st words ran together, tuning log); mean 112 Hz
         v.f0_base = 104.0
         v.range_st = 4.5
@@ -99,6 +108,8 @@ def formant_voice(id: Int) -> FormantVoice:
         v.db1 = 30.0
         v.british = True
     elif id == FV_BRIDGE_FEMALE:
+        v.shelf_db = 10.0
+        v.presence_db = 9.0
         # composed officer: crisp, slightly breathy; mean 222 Hz
         v.f0_base = 200.0
         v.range_st = 6.5
@@ -116,6 +127,8 @@ def formant_voice(id: Int) -> FormantVoice:
         v.tracheal = True
         v.f0_floor = 120.0
     elif id == FV_ACE_BARITONE:
+        v.shelf_db = 10.0
+        v.presence_db = 9.0
         # relaxed veteran, phrase-final creak; mean 99 Hz
         v.f0_base = 90.0
         v.range_st = 5.5
@@ -129,6 +142,8 @@ def formant_voice(id: Int) -> FormantVoice:
         v.flutter = 25.0
         v.creak = True
     elif id == FV_ACE_TENOR:
+        v.shelf_db = 10.0
+        v.presence_db = 9.0
         # young, fast, bright; mean 148 Hz
         v.f0_base = 136.0
         v.range_st = 6.5
@@ -142,6 +157,8 @@ def formant_voice(id: Int) -> FormantVoice:
         v.flutter = 20.0
         v.f0_floor = 80.0
     elif id == FV_ACE_CRIMSON:
+        v.shelf_db = 10.0
+        v.presence_db = 9.0
         # pressed, confident warrior, GB; mean 196 Hz
         v.f0_base = 178.0
         v.range_st = 7.0
@@ -159,3 +176,48 @@ def formant_voice(id: Int) -> FormantVoice:
         v.british = True
         v.f0_floor = 110.0
     return v^
+
+
+def voice_eq(var pcm: List[Float32], voice: FormantVoice) -> List[Float32]:
+    """The preset's output EQ (identity when both gains are 0): a first-order high shelf and an RBJ
+    peaking biquad at 2.8 kHz, then a gain trim so the peak stays <= 0.98."""
+    if voice.shelf_db == Float32(0.0) and voice.presence_db == Float32(0.0):
+        return pcm^
+    var sr = Float64(24000.0)
+    # high shelf: y = x + g * hp(x), hp = one-pole high-pass at 1.6 kHz
+    var g = Float64(det_exp(Float32(voice.shelf_db) * Float32(0.11512925))) - 1.0
+    var a = Float64(det_exp(Float32(-6.283185307 * 1600.0 / 24000.0)))
+    var lp = Float64(0.0)
+    # peaking biquad (RBJ cookbook)
+    var A = Float64(det_exp(Float32(voice.presence_db) * Float32(0.057564627)))
+    var w0 = 6.283185307179586 * 2800.0 / sr
+    var cw = Float64(det_cos(Float32(w0)))
+    var sw = Float64(det_sin(Float32(w0)))
+    var alpha = sw / (2.0 * 1.2)
+    var a0 = 1.0 + alpha / A
+    var b0 = (1.0 + alpha * A) / a0
+    var b1 = (-2.0 * cw) / a0
+    var b2 = (1.0 - alpha * A) / a0
+    var a1 = (-2.0 * cw) / a0
+    var a2 = (1.0 - alpha / A) / a0
+    var x1 = Float64(0.0)
+    var x2 = Float64(0.0)
+    var y1 = Float64(0.0)
+    var y2 = Float64(0.0)
+    var pk = Float32(0.0)
+    for i in range(len(pcm)):
+        var x = Float64(pcm[i])
+        lp = (1.0 - a) * x + a * lp
+        var xs = x + g * (x - lp)
+        var y = b0 * xs + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2 = x1
+        x1 = xs
+        y2 = y1
+        y1 = y
+        pcm[i] = Float32(y)
+        pk = max(pk, abs(Float32(y)))
+    if pk > Float32(0.98):
+        var k = Float32(0.98) / pk
+        for i in range(len(pcm)):
+            pcm[i] *= k
+    return pcm^

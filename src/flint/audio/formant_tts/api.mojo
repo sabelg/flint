@@ -12,7 +12,7 @@ from flint.ml.phonemize import G2P, G2PResult
 from flint.text.utf8 import decode_utf8
 from flint.audio.formant_tts.phonemes import PhonemeDef, Locus, build_phoneme_table, build_locus_table
 from flint.audio.formant_tts.synth import KlattSynth, KlattTrack, KLATT_SR
-from flint.audio.formant_tts.voices import FormantVoice, formant_voice, FV_DEFAULT
+from flint.audio.formant_tts.voices import FormantVoice, formant_voice, FV_DEFAULT, voice_eq
 from flint.audio.formant_tts.rules import build_track, WF_FUNCTION, WF_WH
 
 comptime FORMANT_TTS_SAMPLE_RATE: Int = KLATT_SR
@@ -106,7 +106,7 @@ struct FormantTTS(Movable):
         """Raw misaki phonemes (stress marks before vowels, punctuation kept)."""
         var wf = List[Int]()
         var tr = build_track(phonemes, wf, voice, self.tab, self.loci)
-        return self.synth.render(tr)
+        return voice_eq(self.synth.render(tr), voice)
 
     def synthesize(mut self, text: String, voice: FormantVoice) raises -> List[Float32]:
         """English text through the G2P. Text wrapped in `/.../` is taken as raw phonemes."""
@@ -116,7 +116,7 @@ struct FormantTTS(Movable):
         var r = self.g2p.phonemize(text)
         var wf = word_flags(r)
         var tr = build_track(r.phonemes, wf, voice, self.tab, self.loci)
-        return self.synth.render(tr)
+        return voice_eq(self.synth.render(tr), voice)
 
 
 def synthesize(text: String, voice: FormantVoice) raises -> List[Float32]:

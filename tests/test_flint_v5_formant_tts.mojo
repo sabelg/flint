@@ -6,15 +6,17 @@ No model or lexicon files needed (rules-only G2P):
   3. Acoustics: /s/ carries far more high-band energy than a vowel.
   4. Intonation: a yes/no question ends rising, a declarative ends falling (F0 track).
   5. Coverage: every misaki phoneme symbol renders finite, non-silent audio in every preset.
-  6. `flint.platform.speech`: AI OS and the four radio profiles still produce 48 kHz stereo clips.
+  6. Preset EQ: `voice_eq` is the identity at 0 dB and lifts a 2.8 kHz tone far more than a 300 Hz one.
+  7. `flint.platform.speech`: AI OS and the four radio profiles still produce 48 kHz stereo clips.
 Prints the real-time factor of the dry synthesiser.
 """
-from std.math import abs, isnan, isinf
+from std.math import abs, isnan, isinf, sin
 from std.time import perf_counter_ns
 from std.testing import assert_true, assert_equal
 from flint.audio.formant_tts.api import FormantTTS, word_flags, FORMANT_TTS_SAMPLE_RATE
 from flint.audio.formant_tts.voices import (
     formant_voice, FV_DEFAULT, FV_AI_OS, FV_BRIDGE_FEMALE, FV_ACE_BARITONE, FV_ACE_TENOR, FV_ACE_CRIMSON,
+    voice_eq,
 )
 from flint.audio.formant_tts.synth import KlattTrack, P_F0, P_AV
 from flint.platform.speech import (
@@ -131,6 +133,34 @@ def test_phoneme_coverage() raises:
     print("✓", len(syms), "misaki phonemes x", len(ids), "presets render (", n, "clips )")
 
 
+def _tone(hz: Float64) -> List[Float32]:
+    var o = List[Float32]()
+    for i in range(4800):
+        o.append(Float32(0.1 * sin(6.283185307179586 * hz * Float64(i) / 24000.0)))
+    return o^
+
+
+def _rms_tail(x: List[Float32]) -> Float64:
+    var e = Float64(0.0)
+    for i in range(2400, len(x)):
+        e += Float64(x[i]) * Float64(x[i])
+    return e / Float64(len(x) - 2400)
+
+
+def test_voice_eq() raises:
+    var flat = formant_voice(FV_DEFAULT)
+    var t = _tone(1000.0)
+    var y = voice_eq(t.copy(), flat)
+    for i in range(len(t)):
+        assert_equal(y[i], t[i])
+    var v = formant_voice(FV_ACE_TENOR)
+    assert_true(v.presence_db > 0.0, "radio preset without presence boost")
+    var lo = _rms_tail(voice_eq(_tone(300.0), v)) / _rms_tail(_tone(300.0))
+    var hi = _rms_tail(voice_eq(_tone(2800.0), v)) / _rms_tail(_tone(2800.0))
+    assert_true(hi > 4.0 * lo, "preset EQ does not lift the 2-4 kHz band")
+    print("✓ preset EQ power gain 300 Hz", lo, "/ 2.8 kHz", hi)
+
+
 def test_speech_clips() raises:
     var ai = synth_ai_copilot_clip("Guidance online. Turn left.")
     assert_true(ai.valid)
@@ -171,6 +201,7 @@ def main() raises:
     test_fricative_spectrum()
     test_intonation()
     test_phoneme_coverage()
+    test_voice_eq()
     test_speech_clips()
     test_real_time_factor()
     print("test_flint_v5_formant_tts: all passed")
