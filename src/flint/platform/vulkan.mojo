@@ -505,6 +505,18 @@ def on_debug_message(severity: UInt32, types: UInt32, data: Int, user: Int) abi(
     return 0  # never abort the call that was being checked
 
 
+# --- sota:E hook (pipeline-cache manifest key) ---
+def sota_e_spirv_hash(code: List[UInt32]) -> UInt64:
+    """64-bit hash of a SPIR-V word stream (splitmix-style mix per word)."""
+    var h = UInt64(0x9E3779B97F4A7C15) ^ UInt64(len(code))
+    for i in range(len(code)):
+        h ^= UInt64(code[i])
+        h *= 0xBF58476D1CE4E5B9
+        h ^= h >> 31
+    return h
+# --- end sota:E hook ---
+
+
 struct VulkanGpu(Copyable, Movable):
     var library: Int
     var instance: Int
@@ -556,6 +568,8 @@ struct VulkanGpu(Copyable, Movable):
     var descriptor_layout: Int
     var pipeline_layout: Int
     var pipeline_cache: Int
+    # --- sota:E hook (SPIR-V hashes of every module compiled, for the pipeline-cache manifest) ---
+    var sota_e_spirv_hashes: List[UInt64]
     var descriptor_pool: Int
     var side_pools: List[Int]  # descriptor pools of passes outside the frame (GPU meshing)
     var layout_bindings: Int
@@ -656,6 +670,7 @@ struct VulkanGpu(Copyable, Movable):
         self.descriptor_layout = 0
         self.pipeline_layout = 0
         self.pipeline_cache = 0
+        self.sota_e_spirv_hashes = List[UInt64]()  # --- sota:E hook ---
         self.descriptor_pool = 0
         self.side_pools = List[Int]()
         self.layout_bindings = 0
@@ -1467,6 +1482,7 @@ struct VulkanGpu(Copyable, Movable):
         put32(module_info, TYPE_SHADER_MODULE_CREATE_INFO)
         put64(module_info + 24, len(code) * 4)
         put64(module_info + 32, Int(code.unsafe_ptr()))
+        self.sota_e_spirv_hashes.append(sota_e_spirv_hash(code))  # --- sota:E hook ---
         var slot = self.scratch(8)
         if not self.check(call4(self.device_call("vkCreateShaderModule"), self.device, module_info, 0, slot), "vkCreateShaderModule"):
             return False
@@ -2880,6 +2896,7 @@ struct VulkanGpu(Copyable, Movable):
         put32(module_info, TYPE_SHADER_MODULE_CREATE_INFO)
         put64(module_info + 24, len(code) * 4)
         put64(module_info + 32, Int(code.unsafe_ptr()))
+        self.sota_e_spirv_hashes.append(sota_e_spirv_hash(code))  # --- sota:E hook ---
         var slot = self.scratch(8)
         if not self.check(call4(self.device_call("vkCreateShaderModule"), self.device, module_info, 0, slot), "vkCreateShaderModule(AAA-Comp)"):
             return 0
@@ -2920,6 +2937,7 @@ struct VulkanGpu(Copyable, Movable):
         put32(v_mod_info, TYPE_SHADER_MODULE_CREATE_INFO)
         put64(v_mod_info + 24, len(vert_spv) * 4)
         put64(v_mod_info + 32, Int(vert_spv.unsafe_ptr()))
+        self.sota_e_spirv_hashes.append(sota_e_spirv_hash(vert_spv) ^ (sota_e_spirv_hash(frag_spv) * 3))  # --- sota:E hook ---
         if not self.check(call4(self.device_call("vkCreateShaderModule"), self.device, v_mod_info, 0, slot), "vkCreateShaderModule(Vert)"):
             return 0
         var v_mod = get64(slot)

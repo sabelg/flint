@@ -67,6 +67,15 @@ from flint.render.aaa_clustered_lights import (
     emit_restir_candidate_selection_spv,
 )
 from flint.render.aaa_skinning_rt import AAA_SKIN_PREV_POS_BASE
+# --- sota:E hook ---
+from flint.render.sota_e_characters import (
+    SotaEDirectInputs,
+    emit_sota_e_direct_override,
+    emit_sota_e_eye_surface,
+    emit_sota_e_material_decode,
+    emit_sota_e_skin_curvature_radius,
+)
+# --- end sota:E hook ---
 from flint.render.aaa_sky_atmosphere import (
     emit_aerial_perspective_spv,
     emit_nubis_sky_clouds_and_celestial_spv,
@@ -1272,6 +1281,18 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var sss_b = s.load_float(b_materials, s.iadd(m_base, s.uint(22)))
     var tex_pack = s.load_word(b_materials, s.iadd(m_base, s.uint(23)))
 
+    # --- sota:E hook (character material models: decode; tagged materials carry no film / sheen) ---
+    var sota_e = emit_sota_e_material_decode(s, b_materials, m_base, irid_w, r_flags)
+    irid_w = s.select_f(sota_e.tagged, s.float(0.0), irid_w)
+    sh_r = s.select_f(sota_e.tagged, s.float(0.0), sh_r)
+    sh_g = s.select_f(sota_e.tagged, s.float(0.0), sh_g)
+    sh_b = s.select_f(sota_e.tagged, s.float(0.0), sh_b)
+    var sota_e_no_wrap = s.logical_and(sota_e.tagged, s.fgt(sota_e.model_f, s.float(1.5)))
+    sss_r = s.select_f(sota_e_no_wrap, s.float(0.0), sss_r)
+    sss_g = s.select_f(sota_e_no_wrap, s.float(0.0), sss_g)
+    sss_b = s.select_f(sota_e_no_wrap, s.float(0.0), sss_b)
+    # --- end sota:E hook ---
+
     var t_alb = s.bit_and(tex_pack, s.uint(0xFF))
     var t_nrm = s.bit_and(s.shr(tex_pack, s.uint(8)), s.uint(0xFF))
     var t_orm = s.bit_and(s.shr(tex_pack, s.uint(16)), s.uint(0xFF))
@@ -1521,6 +1542,17 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(em_b_v, s.fadd(s.load_f(em_b_v), win_rgb[2]))
     s.end_if()
 
+    # --- sota:E hook (eye: cornea refraction + iris parallax replaces the albedo) ---
+    var sota_e_eye = emit_sota_e_eye_surface(
+        s, sota_e, bindless_arr, t_alb, uv_u, uv_v, ddx_vec, ddy_vec,
+        wn_geom[0], wn_geom[1], wn_geom[2], wt_u[0], wt_u[1], wt_u[2], wb_u[0], wb_u[1], wb_u[2],
+        nx_v, ny_v, nz_v, vx, vy, vz, alb_r, alb_g, alb_b,
+        s.load_float(b_materials, m_base),
+        s.load_float(b_materials, s.iadd(m_base, s.uint(1))),
+        s.load_float(b_materials, s.iadd(m_base, s.uint(2))),
+    )
+    # --- end sota:E hook ---
+
     var nx = s.load_f(nx_v)
     var ny = s.load_f(ny_v)
     var nz = s.load_f(nz_v)
@@ -1596,6 +1628,21 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         sss_r, sss_g, sss_b,
         lut_a, lut_b,
     )
+    # --- sota:E hook (skin / eye / hair direct sun response) ---
+    var sota_e_curv = emit_sota_e_skin_curvature_radius(
+        s, wn_geom[0], wn_geom[1], wn_geom[2], wn_dx[0], wn_dx[1], wn_dx[2], wn_dy[0], wn_dy[1], wn_dy[2],
+        z_lin, tan_x, fw, ndotv,
+    )
+    var sota_e_hair_v = s.fgt(sota_e.p16, s.float(0.5))
+    direct = emit_sota_e_direct_override(
+        s, sota_e, sota_e_eye,
+        SotaEDirectInputs(nx, ny, nz, vx, vy, vz, sun_x, sun_y, sun_z, cur_alb_r, cur_alb_g, cur_alb_b, f0[0], cur_rough),
+        s.select_f(sota_e_hair_v, wb_u[0], wt_u[0]),
+        s.select_f(sota_e_hair_v, wb_u[1], wt_u[1]),
+        s.select_f(sota_e_hair_v, wb_u[2], wt_u[2]),
+        sota_e_curv, direct[0], direct[1], direct[2],
+    )
+    # --- end sota:E hook ---
     var sv = s.load_f(sun_vis)
     var dir_r = s.fvar(s.fmul(direct[0], s.fmul(sun_rad_r, sv)))
     var dir_g = s.fvar(s.fmul(direct[1], s.fmul(sun_rad_g, sv)))

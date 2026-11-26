@@ -138,6 +138,10 @@ from flint.render.aaa_visbuffer import (
     visbuffer_vertex_shader,
 )
 from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AaaMaterial
+# --- sota:E hook ---
+from flint.render.sota_e_characters import AAA_FLAG_SOTA_E_CHARACTERS
+from flint.render.sota_e_pipeline_cache import SotaEPsoCache, sota_e_pso_cache_open, sota_e_pso_cache_save
+# --- end sota:E hook ---
 from flint.render.material_graph import (
     MaterialAsset,
     SurfaceMaterialNode,
@@ -706,6 +710,10 @@ struct FlintAaaVulkanRenderer(Movable):
     var enable_cone_cull: Bool
     var enable_hiz_cull: Bool
     var enable_vsm: Bool
+    # --- sota:E hook ---
+    var sota_e_character_shading: Bool  # skin / eye / hair material models in the deferred pass
+    var sota_e_pso: SotaEPsoCache  # validated on-disk pipeline cache (`FLINT_PSO_CACHE=0` disables)
+    # --- end sota:E hook ---
     var enable_rt_shadows: Bool
     var enable_restir_di: Bool
     var enable_rt_reflections: Bool
@@ -995,6 +1003,10 @@ struct FlintAaaVulkanRenderer(Movable):
         self.enable_cone_cull = True
         self.enable_hiz_cull = True
         self.enable_vsm = True
+        # --- sota:E hook ---
+        self.sota_e_character_shading = True
+        self.sota_e_pso = SotaEPsoCache()
+        # --- end sota:E hook ---
         self.enable_rt_shadows = False
         self.enable_restir_di = False
         self.enable_rt_reflections = False
@@ -1179,7 +1191,9 @@ struct FlintAaaVulkanRenderer(Movable):
             self.desc_sets_cull_p2.append(all_sets[FRAMES_IN_FLIGHT * 2 + i])
         self.desc_set = self.desc_sets[0]
 
-        _ = self.vk.init_pipeline_cache("build/vk_pso.cache")
+        # --- sota:E hook (validated, XDG-located, atomically saved pipeline cache) ---
+        self.sota_e_pso = sota_e_pso_cache_open(self.vk)
+        # --- end sota:E hook ---
 
         # Compile all 10 AAA Hardware Graphics & Compute SPIR-V 1.5 Pipelines!
         self.pipe_meshlet_cull = self.vk.create_aaa_compute_pipeline(self.pipe_layout, meshlet_cull_shader())
@@ -3939,6 +3953,10 @@ struct FlintAaaVulkanRenderer(Movable):
             r_flags |= AAA_FLAG_CLUSTERED_LIGHTS
         if self.enable_aerial_perspective and not self.furnace_white_dome:
             r_flags |= AAA_FLAG_AERIAL_PERSPECTIVE
+        # --- sota:E hook ---
+        if self.sota_e_character_shading:
+            r_flags |= AAA_FLAG_SOTA_E_CHARACTERS
+        # --- end sota:E hook ---
         put32(g_addr + 99 * 4, r_flags)
         put32(g_addr + 100 * 4, UInt32(self.frame_index))
         put_float(g_addr + 101 * 4, jx_clip)
@@ -5972,8 +5990,10 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_buffer(self.buf_indirect_phase2)
         self.vk.destroy_buffer(self.buf_occluded_candidates)
 
+        # --- sota:E hook ---
         if self.vk.pipeline_cache != 0:
-            _ = self.vk.save_pipeline_cache("build/vk_pso.cache")
+            _ = sota_e_pso_cache_save(self.vk, self.sota_e_pso)
+        # --- end sota:E hook ---
         self.vk.close()
         self.active = False
 
