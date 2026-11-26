@@ -34,10 +34,13 @@ from flint.render.sota_geometry_impostor import (
     OctImpostorBake,
     bake_octahedral_impostor,
     build_impostor_cards,
+    hemi_oct_blend,
     hemi_oct_cell,
     hemi_oct_dir,
     impostor_lod_select,
+    impostor_view_blend,
     impostor_view_cell,
+    impostor_view_cell_dithered,
 )
 from flint.render.sota_geometry_vt import (
     SOTA_VT_FB_STRIDE,
@@ -957,6 +960,8 @@ def _scene_run(path: String, mode: Int, cache_dir: String, W: Int, H: Int, mut l
     ref gpu = renderer.gpu_slot[0]
     gpu.sota_geom.cluster_lod_auto = mode > 0
     gpu.sota_geom.dag_cache_dir = cache_dir
+    gpu.sota_vt.model_textures = mode == 2
+    gpu.sota_vt.model_min_dim = 512
     var t0 = get_time()
     var model = load_model(path)
     var load_s = get_time() - t0
@@ -969,16 +974,21 @@ def _scene_run(path: String, mode: Int, cache_dir: String, W: Int, H: Int, mut l
     var target = c + Vec3(0.0, -r * 0.05, 0.0)
     var ms = List[Float64]()
     var cull_ms = List[Float64]()
-    for f in range(12):
+    var fb_ms = List[Float64]()
+    var vt_uploads = 0
+    for f in range(40):
         gpu.begin_frame(eye, target, fov_y_deg=55.0)
         gpu.draw_native_model(model, up)
-        _ = gpu.render_frame(capture_readback=(f == 11))
+        _ = gpu.render_frame(capture_readback=(f == 39))
+        vt_uploads += gpu.sota_vt.last_uploads
         if f >= 4:
             var tot = Float64(0.0)
             for pt in gpu.get_gpu_pass_timings():
                 tot += pt.gpu_ms
                 if pt.pass_name == "MeshletCull":
                     cull_ms.append(pt.gpu_ms)
+                if pt.pass_name == "SotaVtFeedback":
+                    fb_ms.append(pt.gpu_ms)
             ms.append(tot)
     gpu.sota_geom.read_stats(gpu.sota_geom.last_slot)
     var st = gpu.sota_geom.last_stats.copy()
@@ -986,7 +996,12 @@ def _scene_run(path: String, mode: Int, cache_dir: String, W: Int, H: Int, mut l
     log.append("mode=" + String(mode) + " meshes=" + String(len(model.meshes)) + " load s=" + String(load_s)
                + " cook s=" + String(cook_s) + " draws=" + String(Int(st[0] + st[2])) + " tris=" + String(Int(st[1] + st[3]))
                + " dag clusters=" + String(Int(st[8])) + " gpu ms=" + String(_median(ms)) + " cull ms=" + String(_median(cull_ms))
-               + " cache hits/misses=" + String(gpu.sota_geom.dag_cache_stats.hits) + "/" + String(gpu.sota_geom.dag_cache_stats.misses))
+               + " cache hits/misses=" + String(gpu.sota_geom.dag_cache_stats.hits) + "/" + String(gpu.sota_geom.dag_cache_stats.misses)
+               + " grows=" + String(gpu.sota_geom.grow_events) + " vtx MB=" + String(gpu.buf_vertices.size // 1048576)
+               + " frame failures=" + String(gpu.sota_geom.frame_failures) + " dropped draws=" + String(gpu.sota_geom.draws_dropped_total)
+               + " | VT textures=" + String(gpu.sota_vt.count()) + " resident pages=" + String(gpu.sota_vt.res.resident_pages())
+               + " uploads=" + String(vt_uploads) + " evictions=" + String(gpu.sota_vt.res.evictions_total)
+               + " feedback ms=" + String(_median(fb_ms)) + " vt cpu ms=" + String(gpu.sota_vt.last_cpu_ms))
     renderer.shutdown()
     return px^
 
@@ -1021,14 +1036,221 @@ def test_scene_bench():
         var name = String("scene_forest") if si == 0 else String("scene_bistro")
         _ = write_png(EVAL_DIR + name + "_legacy_lod.png", px0, W, H)
         _ = write_png(EVAL_DIR + name + "_cluster_dag.png", px1, W, H)
+        _ = write_png(EVAL_DIR + name + "_dag_vt.png", px2, W, H)
         var d = compare_pixels(px1, px0, W, H, 16)
-        var d2 = compare_pixels(px2, px1, W, H, 1)
+        var d2 = compare_pixels(px2, px1, W, H, 24)
         print("  " + scenes[si] + ":")
         for l in log:
             print("    " + l)
         print("    DAG vs legacy image mean_abs=" + String(d.mean_abs) + " >16: " + String(d.over_tolerance)
-              + " px | warm-cache image == cold (>1: " + String(d2.over_tolerance) + " px)")
+              + " px | warm cache + VT albedo vs BC7 albedo: mean_abs=" + String(d2.mean_abs) + " >24: " + String(d2.over_tolerance) + " px")
     print("[PASS] sota scene bench (numbers above)")
+
+
+def _tune(mut g: FlintAaaVulkanRenderer):
+    g.tsr_history_weight = Float32(0.0)
+    g.enable_auto_exposure = False
+    g.bloom_intensity = Float32(0.0)
+    g.camera_lens.vignette_strength = Float32(0.0)
+
+
+def _non_bg(px: List[UInt32], bg: List[UInt32], i: Int) -> Bool:
+    var a = px[i]
+    var b = bg[i]
+    return abs(Int((a >> 16) & 255) - Int((b >> 16) & 255)) + abs(Int((a >> 8) & 255) - Int((b >> 8) & 255)) + abs(Int(a & 255) - Int(b & 255)) > 18
+
+
+def test_gpu_geometry_growth():
+    """Six 180k-vertex spheres need ~2x the 32 MB vertex buffer: it grows, every sphere draws, no frame fails."""
+    var W = 640
+    var H = 360
+    var g = FlintAaaVulkanRenderer(width=W, height=H)
+    if not g.active:
+        print("[SKIP] Vulkan unavailable: geometry growth test skipped")
+        return
+    _tune(g)
+    var v0 = g.buf_vertices.size
+    var mat = g.add_material(AaaMaterial(base_color=Vec3(0.8, 0.5, 0.3), roughness=0.5, metallic=0.0))
+    var ids = List[Int]()
+    var sph = _sphere(300, 600)
+    var t0 = get_time()
+    for _ in range(6):
+        var e = g.add_mesh(sph, mat)
+        ids.append(e.mesh_id)
+    var up_s = get_time() - t0
+    for i in range(6):
+        _assert(ids[i] >= 0, "mesh " + String(i) + " uploaded (buffers grew instead of refusing it)")
+    var eye = Vec3(0.0, 0.0, 14.0)
+    var bg = List[UInt32]()
+    var px = List[UInt32]()
+    var ok_all = True
+    for mode in range(2):
+        for _ in range(3):
+            g.begin_frame(eye, Vec3(0.0, 0.0, 0.0), fov_y_deg=60.0)
+            if mode == 1:
+                for i in range(6):
+                    g.draw_instance(ids[i], trs(Vec3(Float32(i) * 2.5 - 6.25, 0.0, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
+            ok_all = g.render_frame(capture_readback=True) and ok_all
+        if mode == 0:
+            bg = g.readback_pixels()
+        else:
+            px = g.readback_pixels()
+    _ = write_png(EVAL_DIR + "geometry_growth_6_spheres.png", px, W, H)
+    var half_w = Float32(14.0) * Float32(0.57735) * Float32(W) / Float32(H)
+    var covered = List[Int]()
+    for i in range(6):
+        var cx = Int((Float32(i) * 2.5 - 6.25) / half_w * Float32(W) * 0.5 + Float32(W) * 0.5)
+        var n = 0
+        for y in range(H // 2 - 10, H // 2 + 10):
+            for x in range(cx - 10, cx + 10):
+                if _non_bg(px, bg, y * W + x):
+                    n += 1
+        covered.append(n)
+        _assert(n > 300, "sphere " + String(i) + " is drawn (" + String(n) + "/400 px)")
+    print("  geometry growth: vertex buffer " + String(v0 // 1048576) + " -> " + String(g.buf_vertices.size // 1048576)
+          + " MB, index " + String(g.buf_indices.size // 1048576) + " MB, grow events=" + String(g.sota_geom.grow_events)
+          + " upload s=" + String(up_s) + " frame failures=" + String(g.sota_geom.frame_failures))
+    _assert(g.sota_geom.grow_events >= 1 and g.buf_vertices.size > v0, "vertex buffer grew")
+    _assert(ok_all and g.sota_geom.frame_failures == 0, "no render_frame failure after growth")
+    g.shutdown()
+    print("[PASS] sota geometry buffers grow to the scene (6 x 180k-vertex spheres all drawn)")
+
+
+def _overflow_run(max_draws: Int, W: Int, H: Int, mut log: List[String], mut nums: List[Int]) -> List[UInt32]:
+    var g = FlintAaaVulkanRenderer(width=W, height=H, max_draws=max_draws)
+    var px = List[UInt32]()
+    if not g.active:
+        return px^
+    _tune(g)
+    var mat = g.add_material(AaaMaterial(base_color=Vec3(0.6, 0.7, 0.8), roughness=0.4, metallic=0.0))
+    var e = g.add_mesh(_sphere(64, 128), mat)
+    var dropped_seen = 0
+    for f in range(10):
+        g.begin_frame(Vec3(0.0, 4.0, 16.0), Vec3(0.0, 0.0, 0.0), fov_y_deg=60.0)
+        for z in range(5):
+            for x in range(8):
+                g.draw_instance(e.mesh_id, trs(Vec3(Float32(x) * 2.4 - 8.4, 0.0, Float32(z) * -2.4), Quat(), Vec3(1.0, 1.0, 1.0)))
+        _ = g.render_frame(capture_readback=(f == 9))
+        dropped_seen = max(dropped_seen, g.sota_geom.draws_dropped_last)
+    px = g.readback_pixels()
+    log.append(String(max_draws) + "->" + String(g.max_draws) + " dropped_total=" + String(g.sota_geom.draws_dropped_total)
+               + " last=" + String(g.sota_geom.draws_dropped_last) + " grows=" + String(g.sota_geom.draw_grow_events))
+    nums.append(g.sota_geom.draws_dropped_total)
+    nums.append(g.sota_geom.draws_dropped_last)
+    nums.append(g.max_draws)
+    g.shutdown()
+    return px^
+
+
+def test_gpu_draw_overflow():
+    """40 spheres x ~70 meshlets against max_draws=1024: the overflow is counted, the buffers grow, the final
+    image equals a renderer that never overflowed."""
+    var W = 480
+    var H = 270
+    var log_small = List[String]()
+    var log_big = List[String]()
+    var n_small = List[Int]()
+    var n_big = List[Int]()
+    var px_small = _overflow_run(1024, W, H, log_small, n_small)
+    if len(px_small) == 0:
+        print("[SKIP] Vulkan unavailable: draw overflow test skipped")
+        return
+    var px_big = _overflow_run(131072, W, H, log_big, n_big)
+    var d = compare_pixels(px_small, px_big, W, H, 8)
+    print("  draw overflow: " + log_small[0] + " | reference " + log_big[0] + " | final image diff mean_abs="
+          + String(d.mean_abs) + " >8: " + String(d.over_tolerance) + " px")
+    _assert(n_small[0] > 0, "overflow is detected and counted (sota_geom.draws_dropped_total)")
+    _assert(n_small[1] == 0, "no meshlet is dropped after the draw buffers grew")
+    _assert(n_small[2] > 1024, "max_draws grew")
+    _assert(n_big[0] == 0, "the big renderer never overflows")
+    _assert(d.over_tolerance < 50, "after growth the image equals the never-overflowing renderer")
+    print("[PASS] sota max_draws overflow: counted, logged, buffers grow, no silent drops")
+
+
+def test_impostor_blend_cpu():
+    var frames = 8
+    # at a cell centre the cell gets (almost) all the weight
+    for fy in range(frames):
+        for fx in range(frames):
+            var b = hemi_oct_blend(frames, hemi_oct_dir(frames, fx, fy))
+            _assert(abs(b[3] + b[4] + b[5] - Float32(1.0)) < Float32(1e-4), "weights sum to 1")
+            var w_cell = Float32(0.0)
+            if b[0] == fy * frames + fx:
+                w_cell += b[3]
+            if b[1] == fy * frames + fx:
+                w_cell += b[4]
+            if b[2] == fy * frames + fx:
+                w_cell += b[5]
+            _assert(w_cell > Float32(0.97), "cell centre maps to its own cell (" + String(fx) + "," + String(fy) + ")")
+    # continuity: the weighted cell position moves smoothly with the view direction (no jump > 0.2 cell per step)
+    var prev_x = Float32(-1.0)
+    var max_jump = Float32(0.0)
+    var steps = 400
+    for i in range(steps + 1):
+        var a = Float32(i) / Float32(steps) * Float32(3.14159265)
+        var b = hemi_oct_blend(frames, Vec3(cos(a), 0.35, sin(a)).normalized())
+        var x = (Float32(b[0] % frames) * b[3] + Float32(b[1] % frames) * b[4] + Float32(b[2] % frames) * b[5])
+        var y = (Float32(b[0] // frames) * b[3] + Float32(b[1] // frames) * b[4] + Float32(b[2] // frames) * b[5])
+        var pos = x + y * Float32(0.001)
+        if prev_x >= Float32(0.0):
+            max_jump = max(max_jump, abs(pos - prev_x))
+        prev_x = pos
+    _assert(max_jump < Float32(0.2), "blend weights are continuous across cell boundaries (max jump " + String(max_jump) + ")")
+    # the dithered pick follows the weights
+    var hits = List[Int](length=frames * frames, fill=0)
+    var bl = impostor_view_blend(frames, Vec3(0.0, 0.0, 0.0), 0.0, Vec3(3.0, 2.0, 1.0))
+    for f in range(4000):
+        hits[impostor_view_cell_dithered(frames, Vec3(0.0, 0.0, 0.0), 0.0, Vec3(3.0, 2.0, 1.0), f, 17)] += 1
+    var err = abs(Float32(hits[bl[0]]) / 4000.0 - bl[3]) + abs(Float32(hits[bl[1]]) / 4000.0 - bl[4]) + abs(Float32(hits[bl[2]]) / 4000.0 - bl[5])
+    _assert(err < Float32(0.05), "dithered cell frequencies match the barycentric weights (L1 " + String(err) + ")")
+    print("[PASS] sota impostor 3-cell blend: weights sum 1, continuous (max jump " + String(max_jump) + "), dither L1 " + String(err))
+
+
+def _impostor_sweep(dither: Bool, W: Int, H: Int) -> Tuple[Float64, Float64]:
+    """Camera orbits a single impostor in 24 small yaw steps (crossing cell boundaries) with TSR history on.
+    Returns (max, median) of the mean image change between consecutive steps."""
+    var g = FlintAaaVulkanRenderer(width=W, height=H)
+    if not g.active:
+        return (-1.0, -1.0)
+    g.enable_auto_exposure = False
+    g.bloom_intensity = Float32(0.0)
+    var tree = _tree(1)
+    var imp = _upload_impostor(g, bake_octahedral_impostor(tree, Vec3(1.0, 1.0, 1.0), 8, 64))
+    var deltas = List[Float64]()
+    var prev = List[UInt32]()
+    var fidx = 0
+    for st in range(24):
+        var ang = Float32(0.3) + Float32(st) * Float32(0.035)
+        var eye = Vec3(14.0 * sin(ang), 4.0, 14.0 * cos(ang))
+        for f in range(8):
+            g.begin_frame(eye, Vec3(0.0, 2.4, 0.0), fov_y_deg=30.0)
+            var k = impostor_view_cell_dithered(imp.frames, Vec3(0.0, 0.0, 0.0), 0.0, eye - imp.center, fidx, 1) if dither else impostor_view_cell(imp.frames, Vec3(0.0, 0.0, 0.0), 0.0, eye - imp.center)
+            g.draw_instance(imp.first_card + k, Mat4())
+            _ = g.render_frame(capture_readback=(f == 7))
+            fidx += 1
+        var px = g.readback_pixels()
+        if len(prev) > 0:
+            deltas.append(compare_pixels(px, prev, W, H, 255).mean_abs)
+        prev = px^
+    g.shutdown()
+    var mx = Float64(0.0)
+    for d in deltas:
+        mx = max(mx, d)
+    return (mx, _median(deltas))
+
+
+def test_gpu_impostor_blend():
+    var W = 320
+    var H = 320
+    var near = _impostor_sweep(False, W, H)
+    if near[0] < 0.0:
+        print("[SKIP] Vulkan unavailable: impostor blend GPU test skipped")
+        return
+    var blend = _impostor_sweep(True, W, H)
+    print("  impostor orbit, per-step image change max/median: nearest cell " + String(near[0]) + "/" + String(near[1])
+          + " | 3-cell dithered blend + TSR " + String(blend[0]) + "/" + String(blend[1]))
+    _assert(blend[0] < near[0], "blending lowers the worst per-step change (cell snapping)")
+    print("[PASS] sota impostor view blending reduces snapping")
 
 
 def main():
@@ -1043,4 +1265,8 @@ def main():
     test_impostor_cpu()
     test_gpu_impostor_single()
     test_gpu_impostor_forest()
+    test_impostor_blend_cpu()
+    test_gpu_impostor_blend()
+    test_gpu_geometry_growth()
+    test_gpu_draw_overflow()
     test_scene_bench()

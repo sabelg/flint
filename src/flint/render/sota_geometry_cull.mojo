@@ -476,6 +476,16 @@ def hiz_build_cpu(depth: List[Float32], w: Int, h: Int) -> Tuple[List[Float32], 
 # ---------------------------------------------------------------------------------------------
 # Renderer-side state
 # ---------------------------------------------------------------------------------------------
+comptime SOTA_MAX_GLOBAL_MESHLETS: Int = 131070   # visbuffer word0 = inst << 17 | (meshlet + 1), capped at 0x1FFFF
+
+
+def sota_geometry_grow_size(old: Int, need: Int) -> Int:
+    """Next geometry-buffer size: at least 1.5x the old one and 1.25x the need, rounded up to 4 MB."""
+    var target = max(old + old // 2, need + need // 4)
+    var mb4 = 4 * 1024 * 1024
+    return (target + mb4 - 1) // mb4 * mb4
+
+
 struct SotaGeometryGpu(Movable):
     """Area A GPU state owned by `FlintAaaVulkanRenderer` (field `sota_geom`)."""
     var enabled: Bool               # cvar r.sota.geometry.cull: conservative Hi-Z two-pass + DAG cut (default on)
@@ -491,6 +501,14 @@ struct SotaGeometryGpu(Movable):
     var dag_pool: JobPool
     var dag_pool_started: Bool
     var dag_cache_stats: DagCacheStats
+    var logged: List[String]        # renderer warnings already printed once
+    var frame_failures: Int         # render_frame calls that returned False (each one is logged)
+    var last_frame_error: String
+    var grow_events: Int            # geometry buffer growths
+    var draws_dropped_total: Int    # visible meshlets / candidates the GPU could not record (over max_draws)
+    var draws_dropped_last: Int
+    var draw_grow_events: Int
+    var meshlet_id_overflows: Int   # meshes refused because their meshlet ids exceed the 17-bit encoding
     var active: Bool
     var dsl: Int
     var layout: Int
@@ -526,6 +544,14 @@ struct SotaGeometryGpu(Movable):
         self.dag_pool = JobPool()
         self.dag_pool_started = False
         self.dag_cache_stats = DagCacheStats()
+        self.logged = List[String]()
+        self.frame_failures = 0
+        self.last_frame_error = String()
+        self.grow_events = 0
+        self.draws_dropped_total = 0
+        self.draws_dropped_last = 0
+        self.draw_grow_events = 0
+        self.meshlet_id_overflows = 0
         self.active = False
         self.dsl = 0
         self.layout = 0
@@ -644,6 +670,41 @@ struct SotaGeometryGpu(Movable):
         self.active = True
         return True
 
+    def rebind_meshlets(mut self, mut vk: VulkanGpu, buf_meshlets: GpuBuffer, meshlet_capacity: Int) -> Bool:
+        """The renderer grew its meshlet buffer: rebind it and grow the DAG records to match (contents kept)."""
+        if not self.active:
+            return True
+        var ok = True
+        if meshlet_capacity > self.dag_capacity:
+            var nb = vk.create_buffer(max(4096, meshlet_capacity * SOTA_DAG_RECORD_WORDS * 4), local=True)
+            if nb.size == 0 or nb.cpu_address == 0:
+                vk.destroy_buffer(nb)
+                ok = False
+            else:
+                _ = external_call["memset", Int](nb.cpu_address, Int32(0), nb.size)
+                _ = external_call["memcpy", Int](nb.cpu_address, self.buf_dag.cpu_address, self.buf_dag.size)
+                vk.destroy_buffer(self.buf_dag)
+                self.buf_dag = nb^
+                self.dag_capacity = meshlet_capacity
+        for ds in self.sets_p1:
+            vk.write_descriptor(ds, SOTA_BIND_MESHLETS, buf_meshlets)
+            vk.write_descriptor(ds, SOTA_BIND_DAG, self.buf_dag)
+        for ds in self.sets_p2:
+            vk.write_descriptor(ds, SOTA_BIND_MESHLETS, buf_meshlets)
+            vk.write_descriptor(ds, SOTA_BIND_DAG, self.buf_dag)
+        return ok
+
+    def rebind_draws(mut self, mut vk: VulkanGpu, ring_indirect: List[GpuBuffer], buf_indirect_phase2: GpuBuffer, buf_candidates: GpuBuffer):
+        """The renderer grew its draw buffers (max_draws): rebind them."""
+        if not self.active:
+            return
+        for f in range(len(self.sets_p1)):
+            vk.write_descriptor(self.sets_p1[f], SOTA_BIND_INDIRECT, ring_indirect[f])
+            vk.write_descriptor(self.sets_p1[f], SOTA_BIND_CANDIDATES, buf_candidates)
+        for f in range(len(self.sets_p2)):
+            vk.write_descriptor(self.sets_p2[f], SOTA_BIND_INDIRECT, buf_indirect_phase2)
+            vk.write_descriptor(self.sets_p2[f], SOTA_BIND_CANDIDATES, buf_candidates)
+
     # -- DAG records ---------------------------------------------------------------------------------------
     def write_dag_records(mut self, first_meshlet: Int, records: List[UInt32]):
         if self.buf_dag.size == 0:
@@ -674,6 +735,22 @@ struct SotaGeometryGpu(Movable):
         for i in range(SOTA_STATS_WORDS):
             self.last_stats[i] = get32(a + i * 4)
         _ = external_call["memset", Int](a, Int32(0), SOTA_STATS_WORDS * 4)
+
+    def check_draw_overflow(mut self, max_draws: Int) -> Int:
+        """From the stats just harvested: meshlets that did not fit the indirect / candidate buffers
+        (phase-1 draws, phase-2 draws and occluded candidates each have `max_draws` slots). Returns the
+        `max_draws` the scene needs (0 = no overflow)."""
+        if not self.collect_stats or len(self.last_stats) < 9:
+            return 0
+        var p1 = Int(self.last_stats[0])
+        var p2 = Int(self.last_stats[2])
+        var cand = Int(self.last_stats[6])
+        var dropped = max(0, p1 - max_draws) + max(0, p2 - max_draws) + max(0, cand - max_draws)
+        self.draws_dropped_last = dropped
+        if dropped == 0:
+            return 0
+        self.draws_dropped_total += dropped
+        return max(p1, max(p2, cand))
 
     def read_stats(mut self, slot: Int):
         """CPU: after the slot's frame completed (synchronous readback frames)."""
