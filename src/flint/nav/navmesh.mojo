@@ -8,10 +8,17 @@ Implements:
    - Exact standing-wall `walkable_radius` cell-AABB clearance erosion + 8-neighbor open-ledge
      Chamfer distance erosion (`base_area` vs live `area`).
    - Spatial `(tx, tz)` `NavTile` partitioning with cached per-tile span lists, unlimited `Int32`
-     region IDs, greedy maximal coplanar convex rectangle decomposition, and incremental swap-pop
-     polygon & border-portal splicing for `< 0.25 ms` dynamic `NavObstacle` carving on large maps.
+     region IDs, and incremental swap-pop polygon & border-portal splicing for `< 0.25 ms` dynamic
+     `NavObstacle` carving on large maps.
+   - `NAV_POLY_CONTOUR` (default): per-tile Recast monotone regions (split by area) -> contour
+     tracing -> `max_simplification_error` / `max_edge_len` simplification -> ear clipping -> convex
+     merge up to `max_verts_per_poly`; `NAV_POLY_RECT`: legacy greedy coplanar rectangles (also the
+     per-region fallback when a contour fails to triangulate).
+   - Area ids per span/poly, `mark_area(NavConvexVolume)`, `area_flags`, and `NavQueryFilter`
+     (per-area costs, include/exclude flags, excluded areas) honoured by A* and nearest-poly queries.
 2. `OffMeshLink`s (`OFFMESH_JUMP`, `OFFMESH_DROP`, `OFFMESH_CLIMB`) integrated into A* search.
-3. Deterministic `MinHeap` binary-heap A* (`O(E log V)`) with portal-projected entry anchors +
+3. Deterministic binary-heap A* (`O(E log V)`), time-sliceable via `NavPathQuery`
+   (`begin_path_query` / `update_path_query(max_iters)` / `finish_path_query`), with portal-projected entry anchors +
    Mikko Mononen's Simple Stupid Funnel Algorithm (SSFA) + exact `NavPoly` portal-graph line-of-sight
    string-pulling producing taut Euclidean shortest paths.
 """
@@ -38,7 +45,7 @@ from flint.physics.world import (
 
 comptime NAV_DEG_TO_RAD: Float32 = 0.01745329252
 comptime NAVMESH_BLOB_TAG: UInt32 = fourcc("NAVM")
-comptime NAVMESH_BLOB_VERSION: Int = 1
+comptime NAVMESH_BLOB_VERSION: Int = 2
 
 comptime OFFMESH_JUMP: UInt8 = 0
 comptime OFFMESH_DROP: UInt8 = 1
@@ -46,6 +53,23 @@ comptime OFFMESH_CLIMB: UInt8 = 2
 
 comptime OBSTACLE_BOX: UInt8 = 0
 comptime OBSTACLE_CYLINDER: UInt8 = 1
+
+# Polygon build modes (`NavMeshConfig.poly_mode`)
+comptime NAV_POLY_RECT: Int = 0  # legacy greedy voxel rectangles
+comptime NAV_POLY_CONTOUR: Int = 1  # Recast monotone regions -> traced contours -> simplified convex polys
+
+# Area ids (`CompactSpan.area`, `NavPoly.area`): 0 = unwalkable, 1 = default ground, 2..63 = user areas
+comptime NAV_AREA_NULL: UInt8 = 0
+comptime NAV_AREA_WALKABLE: UInt8 = 1
+comptime NAV_MAX_AREAS: Int = 64
+comptime NAV_FLAG_WALK: UInt16 = 1
+comptime NAV_FLAG_ALL: UInt16 = 0xFFFF
+
+# Sliced path query status
+comptime NAV_QUERY_IDLE: Int = 0
+comptime NAV_QUERY_IN_PROGRESS: Int = 1
+comptime NAV_QUERY_SUCCESS: Int = 2
+comptime NAV_QUERY_FAILED: Int = 3
 
 
 @always_inline
@@ -193,6 +217,7 @@ struct NavMeshConfig(Copyable, ImplicitlyCopyable, Movable):
     var min_region_cells: Int
     var tile_size: Int
     var max_verts_per_poly: Int
+    var poly_mode: Int
 
     def __init__(out self):
         self.cell_size = 0.25
@@ -206,6 +231,7 @@ struct NavMeshConfig(Copyable, ImplicitlyCopyable, Movable):
         self.min_region_cells = 3
         self.tile_size = 16
         self.max_verts_per_poly = 6
+        self.poly_mode = NAV_POLY_CONTOUR
 
 
 @fieldwise_init
@@ -347,6 +373,7 @@ struct NavPoly(Copyable, Movable):
     var portal_right: List[Vec3]
     var area_cost: Float32
     var region_id: Int32
+    var area: UInt8
 
     def __init__(out self):
         self.verts = List[Vec3]()
@@ -358,6 +385,7 @@ struct NavPoly(Copyable, Movable):
         self.portal_right = List[Vec3]()
         self.area_cost = 1.0
         self.region_id = 0
+        self.area = NAV_AREA_WALKABLE
 
     def sample_y(self, x: Float32, z: Float32) -> Float32:
         if abs(self.plane_n.y) > Float32(1.0e-4):
@@ -431,6 +459,8 @@ struct NavPath(Copyable, Movable):
     var poly_corridor: List[Int]
     var used_off_mesh_links: List[Int]
     var total_length: Float32
+    var link_waypoint_idx: List[Int]  # waypoint index where each used off-mesh link starts (link spans wp[i] -> wp[i+1])
+    var link_kinds: List[UInt8]
 
     def __init__(out self):
         self.found = False
@@ -438,6 +468,8 @@ struct NavPath(Copyable, Movable):
         self.poly_corridor = List[Int]()
         self.used_off_mesh_links = List[Int]()
         self.total_length = 0.0
+        self.link_waypoint_idx = List[Int]()
+        self.link_kinds = List[UInt8]()
 
 
 def _append_box_tris(
@@ -558,6 +590,492 @@ def _portal_best_crossing_xz(p_from: Vec3, p_goal: Vec3, l_pt: Vec3, r_pt: Vec3)
     return l_pt + (r_pt - l_pt) * max(Float32(0.02), min(Float32(0.98), u_proj))
 
 
+# =========================================================================
+# Areas, Query Filters & Convex Area Volumes
+# =========================================================================
+
+struct NavConvexVolume(Copyable, Movable):
+    """Convex XZ prism (`verts` in any winding, `[hmin, hmax]` world Y band) that stamps `area`
+    onto every walkable span whose cell centre lies inside it (Recast `rcMarkConvexPolyArea`)."""
+    var verts: List[Vec3]
+    var hmin: Float32
+    var hmax: Float32
+    var area: UInt8
+
+    def __init__(out self, verts: List[Vec3], hmin: Float32, hmax: Float32, area: UInt8):
+        self.verts = verts.copy()
+        self.hmin = hmin
+        self.hmax = hmax
+        self.area = area
+
+    @staticmethod
+    def box(lo: Vec3, hi: Vec3, area: UInt8) -> NavConvexVolume:
+        var v = List[Vec3]()
+        v.append(Vec3(lo.x, lo.y, lo.z))
+        v.append(Vec3(hi.x, lo.y, lo.z))
+        v.append(Vec3(hi.x, lo.y, hi.z))
+        v.append(Vec3(lo.x, lo.y, hi.z))
+        return NavConvexVolume(v, lo.y, hi.y, area)
+
+    def contains_xz(self, x: Float32, z: Float32) -> Bool:
+        var n = len(self.verts)
+        if n < 3:
+            return False
+        var pos_cnt = 0
+        var neg_cnt = 0
+        for i in range(n):
+            var a = self.verts[i]
+            var b = self.verts[(i + 1) % n]
+            var c = (b.x - a.x) * (z - a.z) - (b.z - a.z) * (x - a.x)
+            if c > Float32(0.0):
+                pos_cnt += 1
+            elif c < Float32(0.0):
+                neg_cnt += 1
+        return pos_cnt == 0 or neg_cnt == 0
+
+
+struct NavQueryFilter(Copyable, ImplicitlyCopyable, Movable):
+    """Detour-style query filter: per-area traversal cost multipliers, poly-flag include/exclude masks
+    (flags come from `NavMesh.area_flags[area]`), and an explicit excluded-area bitmask."""
+    var area_cost: SIMD[DType.float32, 64]
+    var include_flags: UInt16
+    var exclude_flags: UInt16
+    var excluded_areas: UInt64
+
+    def __init__(out self):
+        self.area_cost = SIMD[DType.float32, 64](1.0)
+        self.include_flags = NAV_FLAG_ALL
+        self.exclude_flags = 0
+        self.excluded_areas = 0
+
+    def set_area_cost(mut self, area: Int, cost: Float32):
+        if area >= 0 and area < NAV_MAX_AREAS and isfinite(cost):
+            self.area_cost[area] = max(Float32(0.01), cost)
+
+    def exclude_area(mut self, area: Int, excluded: Bool = True):
+        if area < 0 or area >= NAV_MAX_AREAS:
+            return
+        var bit = UInt64(1) << UInt64(area)
+        if excluded:
+            self.excluded_areas |= bit
+        else:
+            self.excluded_areas &= ~bit
+
+    @always_inline
+    def cost(self, area: UInt8) -> Float32:
+        return self.area_cost[Int(area) & 63]
+
+    @always_inline
+    def passes(self, area: UInt8, flags: UInt16) -> Bool:
+        if (self.excluded_areas >> UInt64(Int(area) & 63)) & 1 != 0:
+            return False
+        return (flags & self.include_flags) != 0 and (flags & self.exclude_flags) == 0
+
+    def is_uniform(self) -> Bool:
+        """True when every area costs 1 and nothing is excluded (corridor-free LOS smoothing is then exact)."""
+        if self.excluded_areas != 0 or self.exclude_flags != 0 or self.include_flags != NAV_FLAG_ALL:
+            return False
+        for a in range(NAV_MAX_AREAS):
+            if self.area_cost[a] != Float32(1.0):
+                return False
+        return True
+
+
+struct _NavHeapEntry(Copyable, ImplicitlyCopyable, Movable):
+    var key: Int
+    var seq: Int
+    var value: Int
+
+    def __init__(out self, key: Int, seq: Int, value: Int):
+        self.key = key
+        self.seq = seq
+        self.value = value
+
+    @always_inline
+    def before(self, other: Self) -> Bool:
+        if self.key != other.key:
+            return self.key < other.key
+        return self.seq < other.seq
+
+
+struct _NavHeap(Copyable, Movable, Sized):
+    """Copyable deterministic binary min-heap (same ordering contract as `detsort.MinHeap`)."""
+    var entries: List[_NavHeapEntry]
+    var pushed: Int
+
+    def __init__(out self):
+        self.entries = List[_NavHeapEntry]()
+        self.pushed = 0
+
+    def __len__(self) -> Int:
+        return len(self.entries)
+
+    def clear(mut self):
+        self.entries.clear()
+        self.pushed = 0
+
+    def push(mut self, key: Int, value: Int):
+        self.entries.append(_NavHeapEntry(key, self.pushed, value))
+        self.pushed += 1
+        var at = len(self.entries) - 1
+        while at > 0:
+            var parent = (at - 1) // 2
+            if not self.entries[at].before(self.entries[parent]):
+                break
+            var swap = self.entries[at]
+            self.entries[at] = self.entries[parent]
+            self.entries[parent] = swap
+            at = parent
+
+    def pop_value(mut self) -> Int:
+        var top = self.entries[0]
+        var last = self.entries.pop()
+        var count = len(self.entries)
+        if count == 0:
+            return top.value
+        self.entries[0] = last
+        var at = 0
+        while True:
+            var left = at * 2 + 1
+            if left >= count:
+                break
+            var child = left
+            var right = left + 1
+            if right < count and self.entries[right].before(self.entries[left]):
+                child = right
+            if not self.entries[child].before(self.entries[at]):
+                break
+            var swap = self.entries[at]
+            self.entries[at] = self.entries[child]
+            self.entries[child] = swap
+            at = child
+        return top.value
+
+
+struct NavPathQuery(Copyable, Movable):
+    """Time-sliced A* query state (`NavMesh.begin_path_query` / `update_path_query` / `finish_path_query`).
+    Each `update_path_query(q, max_iters)` expands at most `max_iters` polygons so a game can bound
+    per-frame pathfinding cost; a navmesh rebuild between slices (`NavMesh.epoch`) fails the query."""
+    var status: Int
+    var filter: NavQueryFilter
+    var start_poly: Int
+    var goal_poly: Int
+    var start_snapped: Vec3
+    var goal_snapped: Vec3
+    var g_score: List[Float32]
+    var f_score: List[Float32]
+    var entry_pt: List[Vec3]
+    var came_from: List[Int]
+    var came_link: List[Int]
+    var closed: List[Bool]
+    var heap: _NavHeap
+    var epoch: Int
+    var iterations: Int
+    var slices: Int
+
+    def __init__(out self):
+        self.status = NAV_QUERY_IDLE
+        self.filter = NavQueryFilter()
+        self.start_poly = -1
+        self.goal_poly = -1
+        self.start_snapped = Vec3()
+        self.goal_snapped = Vec3()
+        self.g_score = List[Float32]()
+        self.f_score = List[Float32]()
+        self.entry_pt = List[Vec3]()
+        self.came_from = List[Int]()
+        self.came_link = List[Int]()
+        self.closed = List[Bool]()
+        self.heap = _NavHeap()
+        self.epoch = -1
+        self.iterations = 0
+        self.slices = 0
+
+    @always_inline
+    def in_progress(self) -> Bool:
+        return self.status == NAV_QUERY_IN_PROGRESS
+
+    @always_inline
+    def done(self) -> Bool:
+        return self.status == NAV_QUERY_SUCCESS or self.status == NAV_QUERY_FAILED
+
+
+# =========================================================================
+# Recast contour helpers (integer cell-corner coordinates, exact predicates)
+# =========================================================================
+
+comptime _NAV_EDGE_SAME: Int = 1 << 40
+
+
+@always_inline
+def _nav_cross_i(ax: Int, az: Int, bx: Int, bz: Int, cx: Int, cz: Int) -> Int:
+    return (bx - ax) * (cz - az) - (bz - az) * (cx - ax)
+
+
+def _nav_seg_dist2_i(px: Int, pz: Int, ax: Int, az: Int, bx: Int, bz: Int) -> Float32:
+    return _pt_seg_dist2_xz(Float32(px), Float32(pz), Float32(ax), Float32(az), Float32(bx), Float32(bz))
+
+
+def _nav_simplify_contour(
+    rx: List[Int], rz: List[Int], rcode: List[Int], max_err_cells: Float32, max_edge_cells: Float32
+) -> List[Int]:
+    """Recast `simplifyContour`: keeps every vertex where the neighbour code changes (region portals,
+    tile-border sides), Douglas-Peucker refines every run to `max_err_cells` (in canonical
+    lexicographic order, so shared portal chains stay identical on both sides and area borders keep
+    their shape), then splits wall edges longer than `max_edge_cells`. Returns raw-contour indices."""
+    var n = len(rx)
+    var simp = List[Int]()
+    if n < 3:
+        return simp^
+    for i in range(n):
+        if rcode[i] != rcode[(i + 1) % n]:
+            simp.append(i)
+    if len(simp) == 0:
+        var ll = 0
+        var ur = 0
+        for i in range(1, n):
+            if rx[i] < rx[ll] or (rx[i] == rx[ll] and rz[i] < rz[ll]):
+                ll = i
+            if rx[i] > rx[ur] or (rx[i] == rx[ur] and rz[i] > rz[ur]):
+                ur = i
+        if ll == ur:
+            return simp^
+        simp.append(min(ll, ur))
+        simp.append(max(ll, ur))
+
+    var err2 = max_err_cells * max_err_cells
+    var i = 0
+    var guard = 0
+    while i < len(simp) and guard < n * 4 + 16:
+        guard += 1
+        var ii = (i + 1) % len(simp)
+        var a = simp[i]
+        var b = simp[ii]
+        var maxd = Float32(0.0)
+        var maxi = -1
+        # Lexicographic traversal order so both regions sharing a portal chain refine it identically
+        var ax = rx[a]
+        var az = rz[a]
+        var bx = rx[b]
+        var bz = rz[b]
+        var ci: Int
+        var endi: Int
+        var cinc: Int
+        if bx > ax or (bx == ax and bz > az):
+            cinc = 1
+            ci = (a + 1) % n
+            endi = b
+        else:
+            cinc = n - 1
+            ci = (b + n - 1) % n
+            endi = a
+            var tx = ax
+            ax = bx
+            bx = tx
+            var tz = az
+            az = bz
+            bz = tz
+        while ci != endi:
+            var d = _nav_seg_dist2_i(rx[ci], rz[ci], ax, az, bx, bz)
+            if d > maxd:
+                maxd = d
+                maxi = ci
+            ci = (ci + cinc) % n
+        if maxi >= 0 and maxd > err2:
+            simp.insert(i + 1, maxi)
+        else:
+            i += 1
+
+    if max_edge_cells > Float32(0.0):
+        var me2 = max_edge_cells * max_edge_cells
+        i = 0
+        guard = 0
+        while i < len(simp) and guard < n * 4 + 16:
+            guard += 1
+            var ii = (i + 1) % len(simp)
+            var a = simp[i]
+            var b = simp[ii]
+            if rcode[(a + 1) % n] == 0:
+                var dx = Float32(rx[b] - rx[a])
+                var dz = Float32(rz[b] - rz[a])
+                var cnt = (b - a + n) % n
+                if dx * dx + dz * dz > me2 and cnt > 1:
+                    simp.insert(i + 1, (a + cnt // 2) % n)
+                    continue
+            i += 1
+    return simp^
+
+
+def _nav_remove_degenerate(mut px: List[Int], mut pz: List[Int], mut py: List[Int]):
+    """Drops duplicate and collinear (incl. zero-area spike) vertices of a closed polygon."""
+    var changed = True
+    while changed and len(px) >= 3:
+        changed = False
+        var n = len(px)
+        for i in range(n):
+            var a = (i + n - 1) % n
+            var c = (i + 1) % n
+            var dup = px[i] == px[c] and pz[i] == pz[c]
+            if dup or _nav_cross_i(px[a], pz[a], px[i], pz[i], px[c], pz[c]) == 0:
+                _ = px.pop(i)
+                _ = pz.pop(i)
+                _ = py.pop(i)
+                changed = True
+                break
+
+
+def _nav_triangulate(px: List[Int], pz: List[Int]) -> List[Int]:
+    """Ear-clipping (shortest-diagonal ear first) of a simple CCW polygon; empty list on failure."""
+    var tris = List[Int]()
+    var n = len(px)
+    if n < 3:
+        return tris^
+    var idx = List[Int](capacity=n)
+    for i in range(n):
+        idx.append(i)
+    var guard = 0
+    while len(idx) > 3 and guard < n * n + 8:
+        guard += 1
+        var m = len(idx)
+        # Drop vertices that became collinear after earlier ear removals
+        var removed = False
+        for k in range(m):
+            var a = idx[(k + m - 1) % m]
+            var b = idx[k]
+            var c = idx[(k + 1) % m]
+            if _nav_cross_i(px[a], pz[a], px[b], pz[b], px[c], pz[c]) == 0:
+                _ = idx.pop(k)
+                removed = True
+                break
+        if removed:
+            continue
+        var best = -1
+        var best_len = Int(1) << 60
+        for k in range(m):
+            var a = idx[(k + m - 1) % m]
+            var b = idx[k]
+            var c = idx[(k + 1) % m]
+            if _nav_cross_i(px[a], pz[a], px[b], pz[b], px[c], pz[c]) <= 0:
+                continue
+            var ok = True
+            for t in range(m):
+                var v = idx[t]
+                if v == a or v == b or v == c:
+                    continue
+                if (px[v] == px[a] and pz[v] == pz[a]) or (px[v] == px[b] and pz[v] == pz[b]) or (px[v] == px[c] and pz[v] == pz[c]):
+                    continue
+                if (
+                    _nav_cross_i(px[a], pz[a], px[b], pz[b], px[v], pz[v]) >= 0
+                    and _nav_cross_i(px[b], pz[b], px[c], pz[c], px[v], pz[v]) >= 0
+                    and _nav_cross_i(px[c], pz[c], px[a], pz[a], px[v], pz[v]) >= 0
+                ):
+                    ok = False
+                    break
+            if ok:
+                var dx = px[c] - px[a]
+                var dz = pz[c] - pz[a]
+                var dl = dx * dx + dz * dz
+                if dl < best_len:
+                    best_len = dl
+                    best = k
+        if best < 0:
+            return List[Int]()
+        var mm = len(idx)
+        tris.append(idx[(best + mm - 1) % mm])
+        tris.append(idx[best])
+        tris.append(idx[(best + 1) % mm])
+        _ = idx.pop(best)
+    if len(idx) == 3:
+        if _nav_cross_i(px[idx[0]], pz[idx[0]], px[idx[1]], pz[idx[1]], px[idx[2]], pz[idx[2]]) > 0:
+            tris.append(idx[0])
+            tris.append(idx[1])
+            tris.append(idx[2])
+    elif len(idx) > 3:
+        return List[Int]()
+    return tris^
+
+
+def _nav_merge_value(px: List[Int], pz: List[Int], pa: List[Int], pb: List[Int], nvp: Int) -> Tuple[Int, Int, Int]:
+    """Recast `getPolyMergeValue`: squared shared-edge length if `pa ∪ pb` stays convex with `<= nvp` verts."""
+    var na = len(pa)
+    var nb = len(pb)
+    if na + nb - 2 > nvp:
+        return (-1, -1, -1)
+    var ea = -1
+    var eb = -1
+    for i in range(na):
+        var u = pa[i]
+        var w = pa[(i + 1) % na]
+        for j in range(nb):
+            if pb[j] == w and pb[(j + 1) % nb] == u:
+                ea = i
+                eb = j
+                break
+        if ea >= 0:
+            break
+    if ea < 0:
+        return (-1, -1, -1)
+    var u = pa[ea]
+    var w = pa[(ea + 1) % na]
+    var a_prev = pa[(ea + na - 1) % na]
+    var b_next = pb[(eb + 2) % nb]
+    if _nav_cross_i(px[a_prev], pz[a_prev], px[u], pz[u], px[b_next], pz[b_next]) <= 0:
+        return (-1, -1, -1)
+    var b_prev = pb[(eb + nb - 1) % nb]
+    var a_next = pa[(ea + 2) % na]
+    if _nav_cross_i(px[b_prev], pz[b_prev], px[w], pz[w], px[a_next], pz[a_next]) <= 0:
+        return (-1, -1, -1)
+    var dx = px[w] - px[u]
+    var dz = pz[w] - pz[u]
+    return (dx * dx + dz * dz, ea, eb)
+
+
+def _nav_merge_polys(px: List[Int], pz: List[Int], tris: List[Int], nvp: Int) -> List[List[Int]]:
+    """Greedy longest-shared-edge convex merge of triangles into polygons of at most `nvp` vertices."""
+    var polys = List[List[Int]]()
+    var nt = len(tris) // 3
+    for t in range(nt):
+        var p = List[Int]()
+        p.append(tris[t * 3 + 0])
+        p.append(tris[t * 3 + 1])
+        p.append(tris[t * 3 + 2])
+        polys.append(p^)
+    if nvp <= 3:
+        return polys^
+    var guard = 0
+    while len(polys) > 1 and guard < nt + 4:
+        guard += 1
+        var best_v = 0
+        var bi = -1
+        var bj = -1
+        var bea = -1
+        var beb = -1
+        for i in range(len(polys)):
+            for j in range(i + 1, len(polys)):
+                var r = _nav_merge_value(px, pz, polys[i], polys[j], nvp)
+                if r[0] > best_v:
+                    best_v = r[0]
+                    bi = i
+                    bj = j
+                    bea = r[1]
+                    beb = r[2]
+        if bi < 0:
+            break
+        var merged = List[Int]()
+        var na = len(polys[bi])
+        var nb = len(polys[bj])
+        for k in range(na):
+            merged.append(polys[bi][(bea + 1 + k) % na])
+        for k in range(nb - 2):
+            merged.append(polys[bj][(beb + 2 + k) % nb])
+        polys[bi] = merged^
+        var last = len(polys) - 1
+        if bj != last:
+            polys[bj] = polys[last].copy()
+        _ = polys.pop()
+    return polys^
+
+
 struct NavMesh(Copyable, Movable):
     var cfg: NavMeshConfig
     var chf: CompactHeightfield
@@ -570,6 +1088,9 @@ struct NavMesh(Copyable, Movable):
     var next_region_id: Int32
     var obstacles: List[NavObstacle]
     var off_mesh_links: List[OffMeshLink]
+    var area_flags: SIMD[DType.uint16, 64]
+    var area_volumes: List[NavConvexVolume]
+    var epoch: Int  # bumped on every (re)build / carve / area mark; invalidates sliced queries & corridors
 
     def __init__(out self, cfg: NavMeshConfig = NavMeshConfig()):
         self.cfg = cfg
@@ -583,6 +1104,10 @@ struct NavMesh(Copyable, Movable):
         self.next_region_id = 1
         self.obstacles = List[NavObstacle]()
         self.off_mesh_links = List[OffMeshLink]()
+        self.area_flags = SIMD[DType.uint16, 64](NAV_FLAG_WALK)
+        self.area_flags[0] = 0
+        self.area_volumes = List[NavConvexVolume]()
+        self.epoch = 0
 
     def poly_count(self) -> Int:
         return len(self.polys)
@@ -1003,6 +1528,7 @@ struct NavMesh(Copyable, Movable):
         self.tile_size = max(8, self.cfg.tile_size)
         self.tiles_x = (self.chf.width + self.tile_size - 1) // self.tile_size
         self.tiles_z = (self.chf.depth + self.tile_size - 1) // self.tile_size
+        self.epoch += 1
         self.tiles.clear()
         self.polys.clear()
         self.poly_owner_tile.clear()
@@ -1204,6 +1730,17 @@ struct NavMesh(Copyable, Movable):
                 if self.chf.spans[s].reg == Int32(-2):
                     self.chf.spans[s].reg = Int32(-1)
 
+        if self.cfg.poly_mode == NAV_POLY_CONTOUR:
+            self._mesh_tile_contours(tid, out)
+        self._mesh_tile_rects(tid, out)
+        return out^
+
+    def _mesh_tile_rects(mut self, tid: Int, mut out: List[NavPoly]):
+        """Legacy greedy maximal coplanar rectangle decomposition of every remaining `reg == -1` span
+        (same-area only). Also the fallback for contour regions that fail to triangulate."""
+        var x1 = self.tiles[tid].x1
+        var z1 = self.tiles[tid].z1
+        var n_ts = len(self.tiles[tid].span_indices)
         var cs = self.chf.cell_size
         var ch = self.chf.cell_height
         var orig = self.chf.origin
@@ -1217,6 +1754,7 @@ struct NavMesh(Copyable, Movable):
 
             var reg_id = self.next_region_id
             self.next_region_id += 1
+            var seed_area = self.chf.spans[s00].area
 
             var sx0 = Int(self.chf.spans[s00].x)
             var sz0 = Int(self.chf.spans[s00].z)
@@ -1229,7 +1767,7 @@ struct NavMesh(Copyable, Movable):
                 var nb_x = self.chf.spans[last_s].get_neighbor(2)
                 if nb_x < 0 or Int(self.chf.spans[nb_x].x) >= x1 or self.chf.spans[nb_x].reg != Int32(-1):
                     break
-                if self.chf.spans[nb_x].get_neighbor(0) != last_s:
+                if self.chf.spans[nb_x].get_neighbor(0) != last_s or self.chf.spans[nb_x].area != seed_area:
                     break
                 var rc = len(cur_row)
                 if rc >= 2:
@@ -1256,7 +1794,7 @@ struct NavMesh(Copyable, Movable):
                     if nb_z < 0 or Int(self.chf.spans[nb_z].z) >= z1 or self.chf.spans[nb_z].reg != Int32(-1):
                         row_ok = False
                         break
-                    if self.chf.spans[nb_z].get_neighbor(3) != cur_s:
+                    if self.chf.spans[nb_z].get_neighbor(3) != cur_s or self.chf.spans[nb_z].area != seed_area:
                         row_ok = False
                         break
                     if ri > 0:
@@ -1311,9 +1849,329 @@ struct NavMesh(Copyable, Movable):
             var pnl = pn.length()
             np.plane_n = pn * (Float32(1.0) / pnl) if pnl > Float32(1.0e-7) else Vec3(0, 1, 0)
             np.plane_d = np.plane_n.dot(np.center)
+            np.area = seed_area
             out.append(np^)
 
-        return out^
+    # =========================================================================
+    # Recast region -> contour -> simplified convex polygon build path
+    # =========================================================================
+
+    def _contour_code(self, s: Int, dir: Int, reg: Int32, x0: Int, x1: Int, z0: Int, z1: Int) -> Int:
+        """Neighbour code of span `s` edge `dir`: `_NAV_EDGE_SAME` (interior), region id (portal to a
+        sibling region in this tile), `-1 - dir` (walkable across the tile border), or 0 (wall)."""
+        var nb = self.chf.spans[s].get_neighbor(dir)
+        if nb < 0:
+            return 0
+        var nx = Int(self.chf.spans[nb].x)
+        var nz = Int(self.chf.spans[nb].z)
+        if nx < x0 or nx >= x1 or nz < z0 or nz >= z1:
+            return (-1 - dir) if self.chf.spans[nb].area > 0 else 0
+        var r = self.chf.spans[nb].reg
+        if r == reg:
+            return _NAV_EDGE_SAME
+        if r > 0:
+            return Int(r)
+        return 0
+
+    def _make_contour_poly(
+        self,
+        px: List[Int],
+        pz: List[Int],
+        py: List[Int],
+        idxs: List[Int],
+        reg: Int32,
+        area: UInt8,
+    ) -> NavPoly:
+        var cs = self.chf.cell_size
+        var ch = self.chf.cell_height
+        var orig = self.chf.origin
+        var np = NavPoly()
+        np.region_id = reg
+        np.area = area
+        var csum = Vec3()
+        for k in range(len(idxs)):
+            var v = idxs[k]
+            var wv = Vec3(
+                orig.x + Float32(px[v]) * cs,
+                orig.y + Float32(max(0, py[v] - 1)) * ch,
+                orig.z + Float32(pz[v]) * cs,
+            )
+            np.verts.append(wv)
+            csum = csum + wv
+        var nv = len(np.verts)
+        np.center = csum * (Float32(1.0) / Float32(max(1, nv)))
+        var nrm = Vec3()
+        for k in range(nv):
+            var a = np.verts[k]
+            var b = np.verts[(k + 1) % nv]
+            nrm.x += (a.y - b.y) * (a.z + b.z)
+            nrm.y += (a.z - b.z) * (a.x + b.x)
+            nrm.z += (a.x - b.x) * (a.y + b.y)
+        if nrm.y < Float32(0.0):
+            nrm = -nrm
+        var nl = nrm.length()
+        np.plane_n = nrm * (Float32(1.0) / nl) if nl > Float32(1.0e-7) else Vec3(0, 1, 0)
+        np.plane_d = np.plane_n.dot(np.center)
+        return np^
+
+    def _mesh_tile_contours(mut self, tid: Int, mut out: List[NavPoly]):
+        """Recast monotone partition of unassigned (`reg == -1`) tile spans, contour tracing,
+        `max_simplification_error` / `max_edge_len` simplification, ear clipping and convex merge up
+        to `max_verts_per_poly`. Regions that fail to triangulate are reset to `-1` (rect fallback)."""
+        var x0 = self.tiles[tid].x0
+        var x1 = self.tiles[tid].x1
+        var z0 = self.tiles[tid].z0
+        var z1 = self.tiles[tid].z1
+        var w = self.chf.width
+        var first_reg = Int(self.next_region_id)
+
+        # 1. Monotone row-sweep partition (hole-free regions)
+        var prev_count = List[Int]()
+        var sw_nei = List[Int]()
+        var sw_ns = List[Int]()
+        var sw_rid = List[Int]()
+        var row_spans = List[Int]()
+        for iz in range(z0, z1):
+            sw_nei.clear()
+            sw_ns.clear()
+            sw_rid.clear()
+            row_spans.clear()
+            for k in range(len(prev_count)):
+                prev_count[k] = 0
+            for ix in range(x0, x1):
+                var c = iz * w + ix
+                var f = Int(self.chf.col_first[c])
+                var cnt = Int(self.chf.col_count[c])
+                for s in range(f, f + cnt):
+                    if self.chf.spans[s].reg != Int32(-1):
+                        continue
+                    var area = self.chf.spans[s].area
+                    var previd = -1
+                    var ax = self.chf.spans[s].get_neighbor(0)
+                    if ax >= 0 and Int(self.chf.spans[ax].x) >= x0 and self.chf.spans[ax].area == area:
+                        var ar = Int(self.chf.spans[ax].reg)
+                        if ar <= -10:
+                            previd = -(ar + 10)
+                    if previd < 0:
+                        previd = len(sw_nei)
+                        sw_nei.append(0)
+                        sw_ns.append(0)
+                        sw_rid.append(0)
+                    var az = self.chf.spans[s].get_neighbor(3)
+                    if az >= 0 and Int(self.chf.spans[az].z) >= z0 and self.chf.spans[az].area == area:
+                        var nr = Int(self.chf.spans[az].reg)
+                        if nr >= first_reg:
+                            if sw_nei[previd] == 0 or sw_nei[previd] == nr:
+                                sw_nei[previd] = nr
+                                sw_ns[previd] += 1
+                                var pk = nr - first_reg
+                                while len(prev_count) <= pk:
+                                    prev_count.append(0)
+                                prev_count[pk] += 1
+                            else:
+                                sw_nei[previd] = -1
+                    self.chf.spans[s].reg = Int32(-(previd + 10))
+                    row_spans.append(s)
+            for k in range(len(sw_nei)):
+                var nei = sw_nei[k]
+                if nei > 0 and nei - first_reg < len(prev_count) and prev_count[nei - first_reg] == sw_ns[k]:
+                    sw_rid[k] = nei
+                else:
+                    sw_rid[k] = Int(self.next_region_id)
+                    self.next_region_id += 1
+            for k in range(len(row_spans)):
+                var s = row_spans[k]
+                var tmp = -(Int(self.chf.spans[s].reg) + 10)
+                self.chf.spans[s].reg = Int32(sw_rid[tmp])
+
+        var n_regions = Int(self.next_region_id) - first_reg
+        if n_regions <= 0:
+            return
+        var reg_start = List[Int](length=n_regions, fill=-1)
+        var reg_count = List[Int](length=n_regions, fill=0)
+        var n_ts = len(self.tiles[tid].span_indices)
+        for k in range(n_ts):
+            var s = Int(self.tiles[tid].span_indices[k])
+            var r = Int(self.chf.spans[s].reg)
+            if r >= first_reg and r - first_reg < n_regions:
+                var ri = r - first_reg
+                if reg_start[ri] < 0:
+                    reg_start[ri] = s
+                reg_count[ri] += 1
+
+        var cs = self.chf.cell_size
+        var max_err_cells = max(Float32(0.0), self.cfg.max_simplification_error) / max(Float32(1.0e-5), cs)
+        var max_edge_cells = max(Float32(0.0), self.cfg.max_edge_len) / max(Float32(1.0e-5), cs)
+        var nvp = max(3, min(12, self.cfg.max_verts_per_poly))
+
+        var rx = List[Int]()
+        var rz = List[Int]()
+        var ry = List[Int]()
+        var rcode = List[Int]()
+        for ri in range(n_regions):
+            var start = reg_start[ri]
+            if start < 0:
+                continue
+            var reg = Int32(first_reg + ri)
+            var area = self.chf.spans[start].area
+            var sdir = -1
+            for d in range(4):
+                if self._contour_code(start, d, reg, x0, x1, z0, z1) != _NAV_EDGE_SAME:
+                    sdir = d
+                    break
+            var ok = sdir >= 0
+            rx.clear()
+            rz.clear()
+            ry.clear()
+            rcode.clear()
+            if ok:
+                # 2. Walk the region outline (Recast `walkContour`, region kept on the right / CW)
+                var cur = start
+                var dir = sdir
+                var guard = 0
+                var max_guard = reg_count[ri] * 8 + 16
+                var closed_loop = False
+                while guard < max_guard:
+                    guard += 1
+                    var code = self._contour_code(cur, dir, reg, x0, x1, z0, z1)
+                    if code != _NAV_EDGE_SAME:
+                        var cpx = Int(self.chf.spans[cur].x)
+                        var cpz = Int(self.chf.spans[cur].z)
+                        if dir == 0:
+                            cpz += 1
+                        elif dir == 1:
+                            cpx += 1
+                            cpz += 1
+                        elif dir == 2:
+                            cpx += 1
+                        rx.append(cpx)
+                        rz.append(cpz)
+                        ry.append(Int(self.chf.spans[cur].y))
+                        rcode.append(code)
+                        dir = (dir + 1) & 3
+                    else:
+                        cur = self.chf.spans[cur].get_neighbor(dir)
+                        dir = (dir + 3) & 3
+                    if cur == start and dir == sdir:
+                        closed_loop = True
+                        break
+                ok = closed_loop and len(rx) >= 4
+
+            var tris = List[Int]()
+            var px = List[Int]()
+            var pz = List[Int]()
+            var py = List[Int]()
+            if ok:
+                # 3. Simplify, reverse to CCW (+shoelace, matching legacy rect winding), clean, triangulate
+                var simp = _nav_simplify_contour(rx, rz, rcode, max_err_cells, max_edge_cells)
+                var ns = len(simp)
+                for k in range(ns):
+                    var v = simp[ns - 1 - k]
+                    px.append(rx[v])
+                    pz.append(rz[v])
+                    py.append(ry[v])
+                _nav_remove_degenerate(px, pz, py)
+                ok = len(px) >= 3
+                if ok:
+                    tris = _nav_triangulate(px, pz)
+                    ok = len(tris) >= 3
+
+            if not ok:
+                for k in range(n_ts):
+                    var s = Int(self.tiles[tid].span_indices[k])
+                    if self.chf.spans[s].reg == reg:
+                        self.chf.spans[s].reg = Int32(-1)
+                continue
+
+            # 4. Convex merge up to `max_verts_per_poly`
+            var cpolys = _nav_merge_polys(px, pz, tris, nvp)
+            for pi in range(len(cpolys)):
+                out.append(self._make_contour_poly(px, pz, py, cpolys[pi], reg, area))
+
+    # =========================================================================
+    # Area marking, area flags & multi-radius helpers
+    # =========================================================================
+
+    def set_area_flags(mut self, area: Int, flags: UInt16):
+        if area >= 0 and area < NAV_MAX_AREAS:
+            self.area_flags[area] = flags
+
+    def poly_flags(self, pid: Int) -> UInt16:
+        if pid < 0 or pid >= len(self.polys):
+            return 0
+        return self.area_flags[Int(self.polys[pid].area) & 63]
+
+    def poly_passes(self, pid: Int, filter: NavQueryFilter) -> Bool:
+        if pid < 0 or pid >= len(self.polys):
+            return False
+        var a = self.polys[pid].area
+        return filter.passes(a, self.area_flags[Int(a) & 63])
+
+    def _apply_volume_to_spans(mut self, vol: NavConvexVolume) -> Tuple[Int, Int, Int, Int]:
+        """Stamps `vol.area` onto walkable spans' `base_area`; returns touched cell bounds `(ix0, ix1, iz0, iz1)`."""
+        var nv = len(vol.verts)
+        if nv < 3 or self.chf.width == 0 or self.chf.depth == 0:
+            return (0, -1, 0, -1)
+        var minx = vol.verts[0].x
+        var maxx = vol.verts[0].x
+        var minz = vol.verts[0].z
+        var maxz = vol.verts[0].z
+        for i in range(1, nv):
+            minx = min(minx, vol.verts[i].x)
+            maxx = max(maxx, vol.verts[i].x)
+            minz = min(minz, vol.verts[i].z)
+            maxz = max(maxz, vol.verts[i].z)
+        var cs = self.chf.cell_size
+        var ch = self.chf.cell_height
+        var orig = self.chf.origin
+        var inv_cs64 = 1.0 / Float64(max(Float32(1.0e-5), cs))
+        var ix0 = max(0, _nav_safe_floor_clamped((Float64(minx) - Float64(orig.x)) * inv_cs64, -1, self.chf.width))
+        var ix1 = min(self.chf.width - 1, _nav_safe_floor_clamped((Float64(maxx) - Float64(orig.x)) * inv_cs64, -1, self.chf.width))
+        var iz0 = max(0, _nav_safe_floor_clamped((Float64(minz) - Float64(orig.z)) * inv_cs64, -1, self.chf.depth))
+        var iz1 = min(self.chf.depth - 1, _nav_safe_floor_clamped((Float64(maxz) - Float64(orig.z)) * inv_cs64, -1, self.chf.depth))
+        if ix0 > ix1 or iz0 > iz1:
+            return (0, -1, 0, -1)
+        for iz in range(iz0, iz1 + 1):
+            var wz = orig.z + (Float32(iz) + Float32(0.5)) * cs
+            for ix in range(ix0, ix1 + 1):
+                var wx = orig.x + (Float32(ix) + Float32(0.5)) * cs
+                if not vol.contains_xz(wx, wz):
+                    continue
+                var c = iz * self.chf.width + ix
+                var f = Int(self.chf.col_first[c])
+                var cnt = Int(self.chf.col_count[c])
+                for s in range(f, f + cnt):
+                    if self.chf.spans[s].base_area == 0:
+                        continue
+                    var sy = orig.y + Float32(max(0, Int(self.chf.spans[s].y) - 1)) * ch
+                    if sy >= vol.hmin and sy <= vol.hmax:
+                        self.chf.spans[s].base_area = vol.area
+                        self.chf.spans[s].area = vol.area
+        return (ix0, ix1, iz0, iz1)
+
+    def mark_area(mut self, var vol: NavConvexVolume) -> Int:
+        """Marks a convex area volume (Recast `rcMarkConvexPolyArea`) and incrementally rebuilds the
+        touched tiles so new polygons carry `vol.area`. Marking is cumulative (later volumes win);
+        `area == NAV_AREA_NULL` permanently removes the walkable surface. Returns the volume index."""
+        var b = self._apply_volume_to_spans(vol)
+        var idx = len(self.area_volumes)
+        self.area_volumes.append(vol^)
+        if b[0] > b[1] or len(self.tiles) == 0:
+            return idx
+        var mask = List[Bool](length=len(self.tiles), fill=False)
+        var ts = max(1, self.tile_size)
+        for tz in range(b[2] // ts, min(self.tiles_z - 1, b[3] // ts) + 1):
+            for tx in range(b[0] // ts, min(self.tiles_x - 1, b[1] // ts) + 1):
+                mask[tz * self.tiles_x + tx] = True
+        self._rebuild_dirty_tiles(mask)
+        return idx
+
+    def polys_with_area(self, area: UInt8) -> Int:
+        var n = 0
+        for i in range(len(self.polys)):
+            if self.polys[i].area == area:
+                n += 1
+        return n
 
     def _remove_neighbor_ref(mut self, pid: Int, target_nb: Int):
         ref p = self.polys[pid]
@@ -1438,6 +2296,7 @@ struct NavMesh(Copyable, Movable):
                 dirty_tids.append(tid)
         if len(dirty_tids) == 0:
             return
+        self.epoch += 1
 
         # 1. Sever all outgoing/incoming neighbor portal links on dirty tiles' existing polygons
         for di in range(len(dirty_tids)):
@@ -1596,6 +2455,13 @@ struct NavMesh(Copyable, Movable):
     # =========================================================================
 
     def find_nearest_poly(self, p: Vec3, max_search_dist: Float32 = 10.0) -> Tuple[Int, Vec3]:
+        return self._nearest_poly_impl(p, max_search_dist, NavQueryFilter(), False)
+
+    def find_nearest_poly_filtered(self, p: Vec3, filter: NavQueryFilter, max_search_dist: Float32 = 10.0) -> Tuple[Int, Vec3]:
+        """Nearest polygon accepted by `filter` (include/exclude flags, excluded areas)."""
+        return self._nearest_poly_impl(p, max_search_dist, filter, not filter.is_uniform())
+
+    def _nearest_poly_impl(self, p: Vec3, max_search_dist: Float32, filter: NavQueryFilter, use_filter: Bool) -> Tuple[Int, Vec3]:
         if not _nav_vec3_isfinite(p) or not isfinite(max_search_dist) or max_search_dist < Float32(0.0):
             return (-1, p)
         var best_idx = -1
@@ -1619,6 +2485,8 @@ struct NavMesh(Copyable, Movable):
             ref c_pids = self.tiles[ctz * self.tiles_x + ctx].poly_ids
             for k in range(len(c_pids)):
                 var pid = c_pids[k]
+                if use_filter and not self.poly_passes(pid, filter):
+                    continue
                 var cp = self.polys[pid].closest_point_xz(p)
                 var d2 = (cp - p).length_squared()
                 if d2 < best_d2 or (d2 == best_d2 and (best_idx < 0 or pid < best_idx)):
@@ -1652,6 +2520,8 @@ struct NavMesh(Copyable, Movable):
                     ref pids = self.tiles[tz * self.tiles_x + tx].poly_ids
                     for k in range(len(pids)):
                         var pid = pids[k]
+                        if use_filter and not self.poly_passes(pid, filter):
+                            continue
                         var cp = self.polys[pid].closest_point_xz(p)
                         var d2 = (cp - p).length_squared()
                         if d2 < best_d2 or (d2 == best_d2 and (best_idx < 0 or pid < best_idx)):
@@ -1661,6 +2531,8 @@ struct NavMesh(Copyable, Movable):
             return (best_idx, best_pt)
 
         for i in range(len(self.polys)):
+            if use_filter and not self.poly_passes(i, filter):
+                continue
             var cp = self.polys[i].closest_point_xz(p)
             var d2 = (cp - p).length_squared()
             if d2 < best_d2:
@@ -1913,77 +2785,102 @@ struct NavMesh(Copyable, Movable):
     def find_path(self, start: Vec3, goal: Vec3, max_search_dist: Float32 = 10.0) -> NavPath:
         """Deterministic Binary-Heap A* (`O(E log V)`) over convex `NavPoly`s + `OffMeshLink`s,
         followed by SSFA funnel string-pulling and exact `NavPoly` visibility smoothing."""
-        var res = NavPath()
+        return self.find_path_filtered(start, goal, NavQueryFilter(), max_search_dist)
+
+    def find_path_filtered(
+        self, start: Vec3, goal: Vec3, filter: NavQueryFilter, max_search_dist: Float32 = 10.0
+    ) -> NavPath:
+        """Synchronous A* honouring `filter` area costs / include-exclude flags (runs one unbounded slice)."""
+        var q = self.begin_path_query(start, goal, filter, max_search_dist)
+        _ = self.update_path_query(q, Int(1) << 40)
+        return self.finish_path_query(q)
+
+    def begin_path_query(
+        self, start: Vec3, goal: Vec3, filter: NavQueryFilter, max_search_dist: Float32 = 10.0
+    ) -> NavPathQuery:
+        """Starts a time-sliced A* query; advance with `update_path_query`, then `finish_path_query`."""
+        var q = NavPathQuery()
+        q.filter = filter
+        q.epoch = self.epoch
         var n_polys = len(self.polys)
         if n_polys == 0:
-            return res^
+            q.status = NAV_QUERY_FAILED
+            return q^
+        var sp = self.find_nearest_poly_filtered(start, filter, max_search_dist)
+        var gp = self.find_nearest_poly_filtered(goal, filter, max_search_dist)
+        q.start_poly = sp[0]
+        q.goal_poly = gp[0]
+        q.start_snapped = sp[1]
+        q.goal_snapped = gp[1]
+        if q.start_poly < 0 or q.goal_poly < 0:
+            q.status = NAV_QUERY_FAILED
+            return q^
+        if q.start_poly == q.goal_poly:
+            q.status = NAV_QUERY_SUCCESS
+            return q^
+        q.g_score = List[Float32](length=n_polys, fill=Float32(1.0e30))
+        q.f_score = List[Float32](length=n_polys, fill=Float32(1.0e30))
+        q.entry_pt = List[Vec3](length=n_polys, fill=Vec3())
+        q.came_from = List[Int](length=n_polys, fill=-1)
+        q.came_link = List[Int](length=n_polys, fill=-1)
+        q.closed = List[Bool](length=n_polys, fill=False)
+        q.g_score[q.start_poly] = Float32(0.0)
+        q.entry_pt[q.start_poly] = q.start_snapped
+        q.f_score[q.start_poly] = (q.goal_snapped - q.start_snapped).length()
+        q.heap.push(Self._heap_key_f32_node(q.f_score[q.start_poly], q.start_poly), q.start_poly)
+        q.status = NAV_QUERY_IN_PROGRESS
+        return q^
 
-        var sp = self.find_nearest_poly(start, max_search_dist)
-        var gp = self.find_nearest_poly(goal, max_search_dist)
-        var start_poly = sp[0]
-        var goal_poly = gp[0]
-        if start_poly < 0 or goal_poly < 0:
-            return res^
-
-        var start_snapped = sp[1]
-        var goal_snapped = gp[1]
-
-        if start_poly == goal_poly:
-            res.found = True
-            res.poly_corridor.append(start_poly)
-            res.waypoints.append(start_snapped)
-            if (goal_snapped - start_snapped).length_squared() > Float32(1.0e-6):
-                res.waypoints.append(goal_snapped)
-            res.total_length = (goal_snapped - start_snapped).length()
-            return res^
-
-        var g_score = List[Float32](length=n_polys, fill=Float32(1.0e30))
-        var f_score = List[Float32](length=n_polys, fill=Float32(1.0e30))
-        var entry_pt = List[Vec3](length=n_polys, fill=Vec3())
-        var came_from = List[Int](length=n_polys, fill=-1)
-        var came_link = List[Int](length=n_polys, fill=-1)
-        var closed = List[Bool](length=n_polys, fill=False)
-
-        var open_heap = MinHeap()
-        g_score[start_poly] = Float32(0.0)
-        entry_pt[start_poly] = start_snapped
-        f_score[start_poly] = (goal_snapped - start_snapped).length()
-        open_heap.push(Self._heap_key_f32_node(f_score[start_poly], start_poly), start_poly)
-
-        var reached = False
-        while len(open_heap) > 0:
-            var best_u = open_heap.pop().value
-            if closed[best_u]:
+    def update_path_query(self, mut q: NavPathQuery, max_iters: Int) -> Int:
+        """Expands at most `max_iters` polygons; returns the query status."""
+        if q.status != NAV_QUERY_IN_PROGRESS:
+            return q.status
+        if q.epoch != self.epoch or len(q.g_score) != len(self.polys):
+            q.status = NAV_QUERY_FAILED
+            return q.status
+        q.slices += 1
+        var goal_poly = q.goal_poly
+        var goal_snapped = q.goal_snapped
+        var it = 0
+        while len(q.heap) > 0 and it < max(1, max_iters):
+            var best_u = q.heap.pop_value()
+            if q.closed[best_u]:
                 continue
-            closed[best_u] = True
-
+            it += 1
+            q.iterations += 1
+            q.closed[best_u] = True
             if best_u == goal_poly:
-                reached = True
-                break
+                q.status = NAV_QUERY_SUCCESS
+                return q.status
 
-            var u_anchor = entry_pt[best_u]
+            var u_anchor = q.entry_pt[best_u]
+            var g_u = q.g_score[best_u]
 
             # 1. Standard portal neighbors with portal-projected Euclidean entry point
             ref u_poly = self.polys[best_u]
             for ni in range(len(u_poly.neighbors)):
                 var v = u_poly.neighbors[ni]
-                if closed[v]:
+                if q.closed[v]:
                     continue
+                var v_area = self.polys[v].area
+                if not q.filter.passes(v_area, self.area_flags[Int(v_area) & 63]):
+                    continue
+                var cost_mul = self.polys[v].area_cost * q.filter.cost(v_area)
                 var p_cross = _portal_best_crossing_xz(
                     u_anchor, goal_snapped, u_poly.portal_left[ni], u_poly.portal_right[ni]
                 )
-                var step_cost = (p_cross - u_anchor).length() * self.polys[v].area_cost
+                var step_cost = (p_cross - u_anchor).length() * cost_mul
                 if v == goal_poly:
-                    step_cost += (goal_snapped - p_cross).length() * self.polys[v].area_cost
-                var cand_g = g_score[best_u] + step_cost
-                if cand_g < g_score[v]:
-                    g_score[v] = cand_g
-                    entry_pt[v] = p_cross
+                    step_cost += (goal_snapped - p_cross).length() * cost_mul
+                var cand_g = g_u + step_cost
+                if cand_g < q.g_score[v]:
+                    q.g_score[v] = cand_g
+                    q.entry_pt[v] = p_cross
                     var h_v = Float32(0.0) if v == goal_poly else (goal_snapped - p_cross).length()
-                    f_score[v] = cand_g + h_v
-                    came_from[v] = best_u
-                    came_link[v] = -1
-                    open_heap.push(Self._heap_key_f32_node(f_score[v], v), v)
+                    q.f_score[v] = cand_g + h_v
+                    q.came_from[v] = best_u
+                    q.came_link[v] = -1
+                    q.heap.push(Self._heap_key_f32_node(q.f_score[v], v), v)
 
             # 2. Off-Mesh Links
             for li in range(len(self.off_mesh_links)):
@@ -2001,32 +2898,61 @@ struct NavMesh(Copyable, Movable):
                     v_lnk = lnk.start_poly
                     p_enter = lnk.end_pos
                     p_exit = lnk.start_pos
-                if v_lnk >= 0 and not closed[v_lnk]:
+                if v_lnk >= 0 and not q.closed[v_lnk]:
+                    var l_area = self.polys[v_lnk].area
+                    if not q.filter.passes(l_area, self.area_flags[Int(l_area) & 63]):
+                        continue
+                    var l_mul = self.polys[v_lnk].area_cost * q.filter.cost(l_area)
                     var lnk_cost = (p_enter - u_anchor).length() + (p_exit - p_enter).length() * lnk.cost_scale
                     if v_lnk == goal_poly:
-                        lnk_cost += (goal_snapped - p_exit).length() * self.polys[v_lnk].area_cost
-                    var cand_g = g_score[best_u] + lnk_cost
-                    if cand_g < g_score[v_lnk]:
-                        g_score[v_lnk] = cand_g
-                        entry_pt[v_lnk] = p_exit
+                        lnk_cost += (goal_snapped - p_exit).length() * l_mul
+                    var cand_g = g_u + lnk_cost
+                    if cand_g < q.g_score[v_lnk]:
+                        q.g_score[v_lnk] = cand_g
+                        q.entry_pt[v_lnk] = p_exit
                         var h_lnk = Float32(0.0) if v_lnk == goal_poly else (goal_snapped - p_exit).length()
-                        f_score[v_lnk] = cand_g + h_lnk
-                        came_from[v_lnk] = best_u
-                        came_link[v_lnk] = li
-                        open_heap.push(Self._heap_key_f32_node(f_score[v_lnk], v_lnk), v_lnk)
+                        q.f_score[v_lnk] = cand_g + h_lnk
+                        q.came_from[v_lnk] = best_u
+                        q.came_link[v_lnk] = li
+                        q.heap.push(Self._heap_key_f32_node(q.f_score[v_lnk], v_lnk), v_lnk)
 
-        if not reached:
+        if len(q.heap) == 0:
+            q.status = NAV_QUERY_FAILED
+        return q.status
+
+    def finish_path_query(self, q: NavPathQuery) -> NavPath:
+        """Builds the corridor + SSFA string-pulled `NavPath` of a successful query (empty otherwise).
+        LOS smoothing beyond the corridor is only applied for uniform filters (costs/exclusions respected)."""
+        var res = NavPath()
+        if q.status != NAV_QUERY_SUCCESS or q.start_poly < 0 or q.goal_poly < 0:
+            return res^
+        if q.epoch != self.epoch:
+            return res^
+        var start_poly = q.start_poly
+        var goal_poly = q.goal_poly
+        var start_snapped = q.start_snapped
+        var goal_snapped = q.goal_snapped
+        if start_poly == goal_poly:
+            res.found = True
+            res.poly_corridor.append(start_poly)
+            res.waypoints.append(start_snapped)
+            if (goal_snapped - start_snapped).length_squared() > Float32(1.0e-6):
+                res.waypoints.append(goal_snapped)
+            res.total_length = (goal_snapped - start_snapped).length()
             return res^
 
+        var smooth = q.filter.is_uniform()
         var rev_corridor = List[Int]()
         var rev_links = List[Int]()
         var cur = goal_poly
-        while cur >= 0:
+        var guard = 0
+        while cur >= 0 and guard <= len(self.polys):
+            guard += 1
             rev_corridor.append(cur)
-            rev_links.append(came_link[cur])
+            rev_links.append(q.came_link[cur])
             if cur == start_poly:
                 break
-            cur = came_from[cur]
+            cur = q.came_from[cur]
 
         var clen = len(rev_corridor)
         var step_links = List[Int](capacity=clen)
@@ -2050,10 +2976,16 @@ struct NavMesh(Copyable, Movable):
                 var p_exit = lnk.end_pos if lnk.start_poly == u else lnk.start_pos
                 var seg_wps = List[Vec3]()
                 Self._run_ssfa(seg_start, p_enter, seg_lefts, seg_rights, seg_wps)
-                var smooth_seg = self._smooth_chain_los(seg_wps)
+                var smooth_seg: List[Vec3]
+                if smooth:
+                    smooth_seg = self._smooth_chain_los(seg_wps)
+                else:
+                    smooth_seg = seg_wps^
                 for si in range(len(smooth_seg)):
                     if len(res.waypoints) == 0 or (res.waypoints[len(res.waypoints) - 1] - smooth_seg[si]).length_squared() > Float32(1.0e-6):
                         res.waypoints.append(smooth_seg[si])
+                res.link_waypoint_idx.append(len(res.waypoints) - 1)
+                res.link_kinds.append(lnk.kind)
                 res.waypoints.append(p_exit)
                 res.used_off_mesh_links.append(lnk.id)
                 seg_start = p_exit
@@ -2068,7 +3000,11 @@ struct NavMesh(Copyable, Movable):
 
         var final_wps = List[Vec3]()
         Self._run_ssfa(seg_start, goal_snapped, seg_lefts, seg_rights, final_wps)
-        var smooth_final = self._smooth_chain_los(final_wps)
+        var smooth_final: List[Vec3]
+        if smooth:
+            smooth_final = self._smooth_chain_los(final_wps)
+        else:
+            smooth_final = final_wps^
         for si in range(len(smooth_final)):
             if len(res.waypoints) == 0 or (res.waypoints[len(res.waypoints) - 1] - smooth_final[si]).length_squared() > Float32(1.0e-6):
                 res.waypoints.append(smooth_final[si])
@@ -2199,12 +3135,27 @@ struct NavMesh(Copyable, Movable):
             w.integer(lnk.start_poly)
             w.integer(lnk.end_poly)
 
+        # 7. v2: poly build mode, per-poly areas, area flags & convex area volumes
+        w.integer(self.cfg.poly_mode)
+        for pi in range(len(self.polys)):
+            w.u8(self.polys[pi].area)
+        for a in range(NAV_MAX_AREAS):
+            w.integer(Int(self.area_flags[a]))
+        w.integer(len(self.area_volumes))
+        for vi in range(len(self.area_volumes)):
+            ref vol = self.area_volumes[vi]
+            w.integer(len(vol.verts))
+            for k in range(len(vol.verts)):
+                w.vec3(vol.verts[k])
+            w.f32(vol.hmin)
+            w.f32(vol.hmax)
+            w.u8(vol.area)
+
         w.end()
 
     def deserialize(mut self, mut r: BlobReader) raises:
         """Restores a `NavMesh` from a `'NAVM'` binary blob."""
         var ver = r.enter(NAVMESH_BLOB_TAG, NAVMESH_BLOB_VERSION)
-        _ = ver
 
         # 1. Config
         self.cfg = NavMeshConfig()
@@ -2394,5 +3345,35 @@ struct NavMesh(Copyable, Movable):
             ):
                 raise Error("navmesh blob: off_mesh_link poly index out of bounds")
             self.off_mesh_links.append(OffMeshLink(lid, sp, ep, lrad, lkind, lbi, lcs, lenb, lstart, lend))
+
+        # 7. v2 extension (v1 blobs keep legacy rect mode + default areas)
+        self.area_flags = SIMD[DType.uint16, 64](NAV_FLAG_WALK)
+        self.area_flags[0] = 0
+        self.area_volumes = List[NavConvexVolume]()
+        if ver >= 2:
+            self.cfg.poly_mode = r.integer()
+            for pi in range(n_polys):
+                self.polys[pi].area = r.u8()
+            for a in range(NAV_MAX_AREAS):
+                self.area_flags[a] = UInt16(r.integer() & 0xFFFF)
+            var n_vol = r.integer()
+            if r.failed or n_vol < 0 or n_vol > (1 << 16):
+                raise Error("navmesh blob: invalid area volume count")
+            for _ in range(n_vol):
+                var nvv = r.integer()
+                if r.failed or nvv < 0 or nvv > 256:
+                    raise Error("navmesh blob: invalid area volume vertex count")
+                var vv = List[Vec3](capacity=nvv)
+                for _ in range(nvv):
+                    vv.append(r.vec3())
+                var hmn = r.f32()
+                var hmx = r.f32()
+                var va = r.u8()
+                self.area_volumes.append(NavConvexVolume(vv, hmn, hmx, va))
+            if r.failed:
+                raise Error("navmesh blob: truncated v2 extension")
+        else:
+            self.cfg.poly_mode = NAV_POLY_RECT
+        self.epoch += 1
 
         r.leave()
