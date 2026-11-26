@@ -1,4 +1,5 @@
-"""`flint.audio` — Flint v5 Real-Time AudioServer, QOA Codec & Raycast Spatial Acoustics."""
+"""`flint.audio` — Flint v5 Real-Time AudioServer, QOA Codec, Disk Streaming, Sound-Design
+Layer & Raycast Spatial Acoustics."""
 from flint.audio.qoa import (
     QOA_MAGIC,
     QOA_SLICE_LEN,
@@ -61,5 +62,50 @@ from flint.audio.server import (
     AudioBus,
     CyclesStemNode,
     AudioServer,
+    AudioDeviceInfo,
+    enumerate_output_devices,
+    next_reconnect_backoff_ms,
     compute_woodworth_hrtf,
+    AUDIO_BACKEND_NONE,
+    AUDIO_BACKEND_PULSE,
+    AUDIO_BACKEND_ALSA,
+    AUDIO_BACKEND_HEADLESS,
+)
+from flint.audio.attenuation import (
+    ATTEN_INVERSE,
+    ATTEN_LINEAR,
+    ATTEN_LOG,
+    ATTEN_CUSTOM,
+    AttenuationPreset,
+    attenuation_curve_from_name,
+)
+from flint.audio.stream import (
+    STREAM_MAX_CHANNELS,
+    STREAM_RING_FRAMES,
+    StreamSourceInfo,
+    probe_stream_source,
+)
+from flint.audio.vorbis import (
+    VorbisClip,
+    VorbisPcmF32,
+    decode_ogg_vorbis,
+    decode_ogg_vorbis_f32,
+    is_ogg_vorbis,
+)
+from flint.audio.design import (
+    CONTAINER_SINGLE,
+    CONTAINER_RANDOM,
+    CONTAINER_SEQUENCE,
+    CONTAINER_SWITCH,
+    RTPC_VOLUME,
+    RTPC_VOLUME_DB,
+    RTPC_PITCH,
+    RTPC_LOWPASS,
+    ParamCurve,
+    GameParameter,
+    RtpcBinding,
+    SoundEntry,
+    SoundEvent,
+    MixerSnapshot,
+    SoundBank,
 )
