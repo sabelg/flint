@@ -58,79 +58,92 @@ from flint.render.aaa_raytracing import (
     emit_froxel_local_lighting_at_hit,
     emit_rt_shadow_query,
 )
-
-# ---------------------------------------------------------------------------------------------
-# Region layout (word offsets inside `BIND_AAA_SURFCACHE`)
-# ---------------------------------------------------------------------------------------------
-comptime SOTA_GI_SURFCACHE_TRIS: Int = 262144  # must equal `FlintAaaVulkanRenderer.max_surfcache_tris`
-comptime SOTA_GI_BASE: Int = 4096 + SOTA_GI_SURFCACHE_TRIS * 4
-comptime SOTA_GI_CTRL_WORDS: Int = 64
-comptime SOTA_GI_PROBE_WORDS: Int = 48
-comptime SOTA_GI_MAX_PROBES: Int = 32 * 16 * 32
-comptime SOTA_GI_GBUF_WORDS: Int = 16
-comptime SOTA_GI_ACCUM_WORDS: Int = 4
-comptime SOTA_GI_PROBE_RAYS: Int = 64  # rays per probe per frame == update workgroup width
-comptime SOTA_GI_CELL_BIAS: Int = 1 << 20  # cell coordinates are stored biased so they stay unsigned
-
-# GI modes (`SotaGiSettings.mode`)
-comptime SOTA_GI_MODE_LEGACY: Int = 0  # unchanged Flint v5 surface-cache GI (default)
-comptime SOTA_GI_MODE_WRC: Int = 1  # probe-only diffuse GI, zero per-pixel GI rays
-comptime SOTA_GI_MODE_HYBRID: Int = 2  # per-pixel surface-cache rays with the WRC as fallback + bounce source
-comptime SOTA_GI_MODE_PATH: Int = 3  # per-pixel diffuse path tracer (+ WRC termination / progressive accumulation)
-
-# Control-block words (relative to `SOTA_GI_BASE`)
-comptime SOTA_CTRL_MODE: Int = 0
-comptime SOTA_CTRL_FLAGS: Int = 1
-comptime SOTA_CTRL_PT_BOUNCES: Int = 2
-comptime SOTA_CTRL_PIXEL_RAYS: Int = 3
-comptime SOTA_CTRL_ACCUM_N: Int = 4
-comptime SOTA_CTRL_FRAME: Int = 5
-comptime SOTA_CTRL_MAX_HISTORY: Int = 6
-comptime SOTA_CTRL_CLAMP: Int = 7
-comptime SOTA_CTRL_BASE_X: Int = 8
-comptime SOTA_CTRL_SPACING: Int = 11
-comptime SOTA_CTRL_DIM_X: Int = 12
-comptime SOTA_CTRL_PROBE_COUNT: Int = 15
-comptime SOTA_CTRL_PREV_BANK: Int = 16
-comptime SOTA_CTRL_CUR_BANK: Int = 17
-comptime SOTA_CTRL_GBUF: Int = 18
-comptime SOTA_CTRL_ACCUM: Int = 19
-comptime SOTA_CTRL_RENDER_W: Int = 20
-comptime SOTA_CTRL_RENDER_H: Int = 21
-
-# Control flags
-comptime SOTA_FLAG_WRC_VALID: UInt32 = 1  # the read bank holds at least one frame of probe data
-comptime SOTA_FLAG_ACCUMULATE: UInt32 = 2  # progressive accumulation (photo mode)
-comptime SOTA_FLAG_PT_WRC_TERMINATE: UInt32 = 4  # path tracer ends paths in the WRC instead of truncating
-comptime SOTA_FLAG_WRC_FEEDS_SURFCACHE: UInt32 = 8  # surface-cache bounce comes from the WRC (hybrid)
-comptime SOTA_FLAG_PROBE_USE_SURFCACHE: UInt32 = 16  # probe ray hits read the surface cache when a slot exists
-
-# Probe words
-comptime SOTA_PROBE_SH: Int = 0  # 9 SH coefficients x RGB: word = k * 3 + c
-comptime SOTA_PROBE_VIS: Int = 27  # 6 axes x (E[t], E[t^2])
-comptime SOTA_PROBE_KEY: Int = 39
-comptime SOTA_PROBE_HIST: Int = 40
-comptime SOTA_PROBE_BACKFACE: Int = 41
-
-comptime _PI: Float32 = 3.14159265
-
-
-def sota_gi_region_words(max_pix: Int) -> Int:
-    """Words the area-B region needs at the end of the surface-cache buffer."""
-    return SOTA_GI_CTRL_WORDS + 2 * SOTA_GI_MAX_PROBES * SOTA_GI_PROBE_WORDS + max_pix * (SOTA_GI_GBUF_WORDS + SOTA_GI_ACCUM_WORDS)
-
-
-def sota_gi_bank_offset(bank: Int) -> Int:
-    return SOTA_GI_BASE + SOTA_GI_CTRL_WORDS + bank * SOTA_GI_MAX_PROBES * SOTA_GI_PROBE_WORDS
-
-
-def sota_gi_gbuf_offset() -> Int:
-    return SOTA_GI_BASE + SOTA_GI_CTRL_WORDS + 2 * SOTA_GI_MAX_PROBES * SOTA_GI_PROBE_WORDS
-
-
-def sota_gi_accum_offset(max_pix: Int) -> Int:
-    return sota_gi_gbuf_offset() + max_pix * SOTA_GI_GBUF_WORDS
-
+from flint.render.sota_gi_core import (
+    SOTA_CTRL_ACCUM,
+    SOTA_CTRL_ACCUM_N,
+    SOTA_CTRL_BASE_X,
+    SOTA_CTRL_CAM_X,
+    SOTA_CTRL_CLAMP,
+    SOTA_CTRL_CONTACT_RADIUS,
+    SOTA_CTRL_CONTACT_RAYS,
+    SOTA_CTRL_CUR_BANK,
+    SOTA_CTRL_DI_CUR,
+    SOTA_CTRL_DI_MCAP,
+    SOTA_CTRL_DI_PREV,
+    SOTA_CTRL_DI_RADIUS,
+    SOTA_CTRL_DI_SPATIAL,
+    SOTA_CTRL_DIM_X,
+    SOTA_CTRL_FLAGS,
+    SOTA_CTRL_FRAME,
+    SOTA_CTRL_GBUF,
+    SOTA_CTRL_GI_CUR,
+    SOTA_CTRL_GI_MCAP,
+    SOTA_CTRL_GI_PREV,
+    SOTA_CTRL_GI_RADIUS,
+    SOTA_CTRL_GI_SPATIAL,
+    SOTA_CTRL_HIST_CUR,
+    SOTA_CTRL_HIST_PREV,
+    SOTA_CTRL_MAX_HISTORY,
+    SOTA_CTRL_MODE,
+    SOTA_CTRL_PIXEL_RAYS,
+    SOTA_CTRL_PREV_BANK,
+    SOTA_CTRL_PROBE_COUNT,
+    SOTA_CTRL_PT_BOUNCES,
+    SOTA_CTRL_RENDER_H,
+    SOTA_CTRL_RENDER_W,
+    SOTA_CTRL_RESTIR_FLAGS,
+    SOTA_CTRL_SPACING,
+    SOTA_FLAG_ACCUMULATE,
+    SOTA_FLAG_PROBE_USE_SURFCACHE,
+    SOTA_FLAG_PT_WRC_TERMINATE,
+    SOTA_FLAG_REFL_WRC,
+    SOTA_FLAG_WRC_FEEDS_SURFCACHE,
+    SOTA_FLAG_WRC_VALID,
+    SOTA_GI_ACCUM_WORDS,
+    SOTA_GI_BASE,
+    SOTA_GI_CELL_BIAS,
+    SOTA_GI_CTRL_WORDS,
+    SOTA_GI_GBUF_WORDS,
+    SOTA_GI_MAX_PROBES,
+    SOTA_GI_MODE_HYBRID,
+    SOTA_GI_MODE_LEGACY,
+    SOTA_GI_MODE_PATH,
+    SOTA_GI_MODE_WRC,
+    SOTA_GI_PROBE_RAYS,
+    SOTA_GI_PROBE_WORDS,
+    SOTA_GI_SURFCACHE_TRIS,
+    SOTA_PROBE_BACKFACE,
+    SOTA_PROBE_HIST,
+    SOTA_PROBE_KEY,
+    SOTA_PROBE_SH,
+    SOTA_PROBE_VIS,
+    SOTA_RESTIR_DI,
+    SOTA_RESTIR_GI,
+    SOTA_RESTIR_HIST_VALID,
+    SOTA_RESTIR_HIST_WRITE,
+    _PI,
+    _ctrl,
+    _ctrl_f,
+    _emit_cosine_dir,
+    _emit_hash,
+    _emit_sh9_basis,
+    emit_sota_gi_mode,
+    emit_sota_wrc_irradiance,
+    sota_gi_accum_offset,
+    sota_gi_bank_offset,
+    sota_gi_di_offset,
+    sota_gi_gbuf_offset,
+    sota_gi_gi_offset,
+    sota_gi_hist_offset,
+    sota_gi_region_words,
+    sota_sh9_band_weight,
+)
+from flint.render.sota_gi_restir import (
+    SotaGiReservoir,
+    emit_sota_gi_stream_candidate,
+    emit_sota_hist_write,
+    emit_sota_restir_gi_reuse,
+)
 
 # ---------------------------------------------------------------------------------------------
 # Settings (the renderer owns one; every field is a cvar)
@@ -153,6 +166,19 @@ struct SotaGiSettings(Copyable, Movable):
     var wrc_center: Vec3
     var wrc_max_history: Int  # hysteresis: blend weight is 1 / min(history + 1, max_history)
     var wrc_probe_use_surfcache: Bool  # hybrid mode: probe hits read the surface cache when a slot exists
+    var contact_rays: Int  # WRC-only mode: short near-field rays per pixel in front of the probes (0 = off, default)
+    var contact_radius: Float32  # metres; <= 0 means one probe spacing
+    var refl_use_wrc: Bool  # RT reflection hits take their indirect diffuse from the WRC in WRC modes
+    var restir_di_reuse: Bool  # temporal + spatial reuse for `enable_restir_di` (needs RT shadows)
+    var restir_di_spatial: Int  # previous-frame neighbours per pixel (0..8; default 0: no gain on static views)
+    var restir_di_radius: Float32  # pixels
+    var restir_di_max_m: Float32  # temporal confidence cap (in candidates; 4 candidates per frame)
+    var restir_gi: Bool  # ReSTIR GI in the path-traced mode (off while accumulating)
+    var restir_gi_hybrid: Bool  # ReSTIR GI in the hybrid mode too (measured slightly worse there: off)
+    var restir_gi_spatial: Int
+    var restir_gi_radius: Float32
+    var restir_gi_max_m: Float32
+    var svgf_history_fix: Bool  # SVGF a-trous ping-pongs through its own scratch, not history bank A (default on)
     # Runtime state (not cvars)
     var pipe_wrc: Int
     var pipe_resolve: Int
@@ -164,6 +190,9 @@ struct SotaGiSettings(Copyable, Movable):
     var last_inst_count: Int
     var last_base: Tuple[Int, Int, Int]
     var last_sig: Int
+    var restir_frames: Int
+    var last_restir: UInt32
+    var restir_active: UInt32
 
     def __init__(out self):
         self.mode = SOTA_GI_MODE_LEGACY
@@ -180,6 +209,19 @@ struct SotaGiSettings(Copyable, Movable):
         self.wrc_center = Vec3(0.0, 0.0, 0.0)
         self.wrc_max_history = 32
         self.wrc_probe_use_surfcache = True
+        self.contact_rays = 0
+        self.contact_radius = Float32(0.0)
+        self.refl_use_wrc = True
+        self.restir_di_reuse = True
+        self.restir_di_spatial = 0  # static Cornell, 128 lights: temporal 0.107 FLIP, +2 spatial (r 6) 0.115
+        self.restir_di_radius = Float32(6.0)  # r 16 measured -4% dark and 0.140 FLIP
+        self.restir_di_max_m = Float32(80.0)
+        self.restir_gi = True
+        self.restir_gi_hybrid = False
+        self.restir_gi_spatial = 2
+        self.restir_gi_radius = Float32(12.0)
+        self.restir_gi_max_m = Float32(30.0)
+        self.svgf_history_fix = True
         self.pipe_wrc = 0
         self.pipe_resolve = 0
         self.accum_frames = 0
@@ -190,6 +232,9 @@ struct SotaGiSettings(Copyable, Movable):
         self.last_inst_count = -1
         self.last_base = (0, 0, 0)
         self.last_sig = -1
+        self.restir_frames = 0
+        self.last_restir = 0
+        self.restir_active = 0
 
     def signature(self) -> Int:
         """Everything besides camera / scene that changes the converged image."""
@@ -208,6 +253,9 @@ struct SotaGiSettings(Copyable, Movable):
         self.pt_bounces = max(1, min(8, self.pt_bounces))
         self.pixel_rays = max(1, min(64, self.pixel_rays))
         self.wrc_max_history = max(1, min(1024, self.wrc_max_history))
+        self.contact_rays = max(0, min(16, self.contact_rays))
+        self.restir_di_spatial = max(0, min(8, self.restir_di_spatial))
+        self.restir_gi_spatial = max(0, min(8, self.restir_gi_spatial))
 
     def uses_wrc(self, mode: Int) -> Bool:
         if mode == SOTA_GI_MODE_WRC or mode == SOTA_GI_MODE_HYBRID:
@@ -235,8 +283,12 @@ struct SotaGiSettings(Copyable, Movable):
         render_h: Int,
         max_pix: Int,
         inst_count: Int,
+        restir_di: Bool = False,
+        region_ready: Bool = False,
     ):
-        """Packs the control block for this frame (call once per frame before recording)."""
+        """Packs the control block for this frame (call once per frame before recording).
+        `restir_di`: the renderer runs ReSTIR DI this frame and wants reuse; `region_ready`: the
+        area-B region (history and reservoir banks) is allocated."""
         self.clamp_dims()
         var base = SOTA_GI_BASE
         var c = self.wrc_center
@@ -255,6 +307,7 @@ struct SotaGiSettings(Copyable, Movable):
         self.last_sig = sig
         if mode != self.last_mode:
             self.wrc_frames = 0
+            self.restir_frames = 0
         self.last_cam_pos = cam_pos
         self.last_cam_fwd = cam_fwd
         self.last_mode = mode
@@ -262,8 +315,10 @@ struct SotaGiSettings(Copyable, Movable):
         self.last_base = (bx, by, bz)
 
         var flags: UInt32 = 0
-        if self.wrc_frames > 0:
+        if self.wrc_frames > 0 and self.uses_wrc(mode):
             flags |= SOTA_FLAG_WRC_VALID
+        if self.refl_use_wrc:
+            flags |= SOTA_FLAG_REFL_WRC
         if self.accumulate:
             flags |= SOTA_FLAG_ACCUMULATE
         if self.pt_wrc_terminate:
@@ -297,12 +352,51 @@ struct SotaGiSettings(Copyable, Movable):
         put32(a + SOTA_CTRL_RENDER_W * 4, UInt32(render_w))
         put32(a + SOTA_CTRL_RENDER_H * 4, UInt32(render_h))
 
+        # ReSTIR + contact words
+        var rflags: UInt32 = 0
+        if region_ready:
+            if restir_di and self.restir_di_reuse:
+                rflags |= SOTA_RESTIR_DI
+            if not self.accumulate and (
+                (mode == SOTA_GI_MODE_PATH and self.restir_gi) or (mode == SOTA_GI_MODE_HYBRID and self.restir_gi_hybrid)
+            ):
+                rflags |= SOTA_RESTIR_GI
+        if rflags != self.last_restir:
+            self.restir_frames = 0
+        self.last_restir = rflags
+        self.restir_active = rflags
+        if rflags != 0:
+            rflags |= SOTA_RESTIR_HIST_WRITE
+            if self.restir_frames > 0:
+                rflags |= SOTA_RESTIR_HIST_VALID
+        var cur = frame_index & 1
+        put32(a + SOTA_CTRL_RESTIR_FLAGS * 4, rflags)
+        put32(a + SOTA_CTRL_HIST_PREV * 4, UInt32(sota_gi_hist_offset(max_pix, 1 - cur)))
+        put32(a + SOTA_CTRL_HIST_CUR * 4, UInt32(sota_gi_hist_offset(max_pix, cur)))
+        put32(a + SOTA_CTRL_DI_PREV * 4, UInt32(sota_gi_di_offset(max_pix, 1 - cur)))
+        put32(a + SOTA_CTRL_DI_CUR * 4, UInt32(sota_gi_di_offset(max_pix, cur)))
+        put32(a + SOTA_CTRL_GI_PREV * 4, UInt32(sota_gi_gi_offset(max_pix, 1 - cur)))
+        put32(a + SOTA_CTRL_GI_CUR * 4, UInt32(sota_gi_gi_offset(max_pix, cur)))
+        put32(a + SOTA_CTRL_DI_SPATIAL * 4, UInt32(self.restir_di_spatial))
+        put_float(a + SOTA_CTRL_DI_RADIUS * 4, self.restir_di_radius)
+        put_float(a + SOTA_CTRL_DI_MCAP * 4, max(Float32(1.0), self.restir_di_max_m))
+        put32(a + SOTA_CTRL_GI_SPATIAL * 4, UInt32(self.restir_gi_spatial))
+        put_float(a + SOTA_CTRL_GI_RADIUS * 4, self.restir_gi_radius)
+        put_float(a + SOTA_CTRL_GI_MCAP * 4, max(Float32(1.0), self.restir_gi_max_m))
+        put32(a + SOTA_CTRL_CONTACT_RAYS * 4, UInt32(self.contact_rays))
+        put_float(a + SOTA_CTRL_CONTACT_RADIUS * 4, self.contact_radius if self.contact_radius > Float32(0.0) else self.wrc_spacing)
+        put_float(a + (SOTA_CTRL_CAM_X + 0) * 4, cam_pos.x)
+        put_float(a + (SOTA_CTRL_CAM_X + 1) * 4, cam_pos.y)
+        put_float(a + (SOTA_CTRL_CAM_X + 2) * 4, cam_pos.z)
+
     def end_frame(mut self, mode: Int):
         """Advance the WRC bank / accumulation counters after a frame using `mode` was recorded."""
         if self.uses_wrc(mode):
             self.wrc_frames += 1
         if self.accumulate and mode != SOTA_GI_MODE_LEGACY:
             self.accum_frames += 1
+        if self.restir_active != 0:
+            self.restir_frames += 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -320,15 +414,6 @@ def sota_sh9_basis_cpu(d: Vec3) -> List[Float32]:
     out[7] = Float32(1.092548) * d.x * d.z
     out[8] = Float32(0.546274) * (d.x * d.x - d.y * d.y)
     return out^
-
-
-def sota_sh9_band_weight(k: Int) -> Float32:
-    """`A_l / pi` of the clamped-cosine convolution: 1, 2/3, 1/4."""
-    if k == 0:
-        return Float32(1.0)
-    if k < 4:
-        return Float32(2.0 / 3.0)
-    return Float32(0.25)
 
 
 def sota_fib_dir_cpu(i: Int, n: Int, u: Float32, v: Float32) -> Vec3:
@@ -376,206 +461,6 @@ def sota_chebyshev_cpu(mean: Float32, mean2: Float32, dist: Float32) -> Float32:
 def sota_wrc_slot_cpu(cell: Int, dim: Int) -> Int:
     """Toroidal storage slot of a (biased, non-negative) cell coordinate."""
     return cell % dim
-
-
-# ---------------------------------------------------------------------------------------------
-# SPIR-V helpers
-# ---------------------------------------------------------------------------------------------
-def _emit_hash(mut s: AaaSpirvModule, seed: UInt32) -> Tuple[UInt32, UInt32]:
-    """PCG hash: `(next_state, uniform [0, 1))`."""
-    var st = s.iadd(s.imul(seed, s.uint(747796405)), s.uint(2891336453))
-    var wd = s.imul(s.bit_xor(s.shr(st, s.iadd(s.shr(st, s.uint(28)), s.uint(4))), st), s.uint(277803737))
-    var res = s.bit_xor(s.shr(wd, s.uint(22)), wd)
-    return (res, s.fmul(s.float_from_uint(s.bit_and(res, s.uint(0x00FFFFFF))), s.float(1.0 / 16777216.0)))
-
-
-def _emit_cosine_dir(mut s: AaaSpirvModule, nx: UInt32, ny: UInt32, nz: UInt32, u1: UInt32, u2: UInt32) -> Tuple[UInt32, UInt32, UInt32]:
-    var r = s.fsqrt(s.nclamp(u1, s.float(0.0), s.float(1.0)))
-    var phi = s.fmul(u2, s.float(6.283185307))
-    var lx = s.fmul(r, s.fcos(phi))
-    var ly = s.fmul(r, s.fsin(phi))
-    var lz = s.fsqrt(s.nmax(s.float(0.0001), s.fsub(s.float(1.0), u1)))
-    var up_is_y = s.flt(s.fabs(ny), s.float(0.92))
-    var t_raw = emit_vec3_cross(s, s.select_f(up_is_y, s.float(0.0), s.float(1.0)), s.select_f(up_is_y, s.float(1.0), s.float(0.0)), s.float(0.0), nx, ny, nz)
-    var tang = emit_vec3_normalize(s, t_raw[0], t_raw[1], t_raw[2])
-    var bitan = emit_vec3_cross(s, nx, ny, nz, tang[0], tang[1], tang[2])
-    return emit_vec3_normalize(
-        s,
-        s.fma(tang[0], lx, s.fma(bitan[0], ly, s.fmul(nx, lz))),
-        s.fma(tang[1], lx, s.fma(bitan[1], ly, s.fmul(ny, lz))),
-        s.fma(tang[2], lx, s.fma(bitan[2], ly, s.fmul(nz, lz))),
-    )
-
-
-def _emit_sh9_basis(mut s: AaaSpirvModule, x: UInt32, y: UInt32, z: UInt32) -> List[UInt32]:
-    var out = List[UInt32]()
-    out.append(s.float(0.282095))
-    out.append(s.fmul(s.float(0.488603), y))
-    out.append(s.fmul(s.float(0.488603), z))
-    out.append(s.fmul(s.float(0.488603), x))
-    out.append(s.fmul(s.float(1.092548), s.fmul(x, y)))
-    out.append(s.fmul(s.float(1.092548), s.fmul(y, z)))
-    out.append(s.fmul(s.float(0.315392), s.fma(s.float(3.0), s.fmul(z, z), s.float(-1.0))))
-    out.append(s.fmul(s.float(1.092548), s.fmul(x, z)))
-    out.append(s.fmul(s.float(0.546274), s.fsub(s.fmul(x, x), s.fmul(y, y))))
-    return out^
-
-
-def _ctrl(mut s: AaaSpirvModule, b_sc: UInt32, word: Int) -> UInt32:
-    return s.load_word(b_sc, s.uint(UInt32(SOTA_GI_BASE + word)))
-
-
-def _ctrl_f(mut s: AaaSpirvModule, b_sc: UInt32, word: Int) -> UInt32:
-    return s.load_float(b_sc, s.uint(UInt32(SOTA_GI_BASE + word)))
-
-
-def emit_sota_gi_mode(mut s: AaaSpirvModule, b_surfcache: UInt32) -> UInt32:
-    """Current area-B GI mode (uint) from the control block."""
-    return _ctrl(s, b_surfcache, SOTA_CTRL_MODE)
-
-
-def emit_sota_wrc_irradiance(
-    mut s: AaaSpirvModule,
-    b_sc: UInt32,
-    bank_off: UInt32,
-    px: UInt32,
-    py: UInt32,
-    pz: UInt32,
-    nx: UInt32,
-    ny: UInt32,
-    nz: UInt32,
-) -> Tuple[UInt32, UInt32, UInt32, UInt32]:
-    """Trilinear, backface- and Chebyshev-weighted WRC lookup at `P` with normal `N`.
-    Returns `(E_r / pi, E_g / pi, E_b / pi, weight_sum)`; `weight_sum ~ 0` means no valid probe."""
-    var spacing = _ctrl_f(s, b_sc, SOTA_CTRL_SPACING)
-    var inv_sp = s.fdiv(s.float(1.0), spacing)
-    var base_x = _ctrl(s, b_sc, SOTA_CTRL_BASE_X)
-    var base_y = _ctrl(s, b_sc, SOTA_CTRL_BASE_X + 1)
-    var base_z = _ctrl(s, b_sc, SOTA_CTRL_BASE_X + 2)
-    var dim_x = _ctrl(s, b_sc, SOTA_CTRL_DIM_X)
-    var dim_y = _ctrl(s, b_sc, SOTA_CTRL_DIM_X + 1)
-    var dim_z = _ctrl(s, b_sc, SOTA_CTRL_DIM_X + 2)
-    var bias_f = s.float(Float32(SOTA_GI_CELL_BIAS))
-
-    # Normal bias keeps the lookup point off the surface (DDGI surface bias)
-    var nb = s.fmul(spacing, s.float(0.25))
-    var qx = s.fma(nx, nb, px)
-    var qy = s.fma(ny, nb, py)
-    var qz = s.fma(nz, nb, pz)
-    var gx = s.fadd(s.fsub(s.fmul(qx, inv_sp), s.float(0.5)), bias_f)
-    var gy = s.fadd(s.fsub(s.fmul(qy, inv_sp), s.float(0.5)), bias_f)
-    var gz = s.fadd(s.fsub(s.fmul(qz, inv_sp), s.float(0.5)), bias_f)
-    var flx = s.ffloor(gx)
-    var fly = s.ffloor(gy)
-    var flz = s.ffloor(gz)
-    var fx = s.fsub(gx, flx)
-    var fy = s.fsub(gy, fly)
-    var fz = s.fsub(gz, flz)
-    var c0x = s.uint_from_float(flx)
-    var c0y = s.uint_from_float(fly)
-    var c0z = s.uint_from_float(flz)
-
-    var nyb = _emit_sh9_basis(s, nx, ny, nz)
-    var acc_r = s.fvar(s.float(0.0))
-    var acc_g = s.fvar(s.float(0.0))
-    var acc_b = s.fvar(s.float(0.0))
-    var acc_w = s.fvar(s.float(0.0))
-
-    for corner in range(8):
-        var ox = corner & 1
-        var oy = (corner >> 1) & 1
-        var oz = (corner >> 2) & 1
-        var cx = s.iadd(c0x, s.uint(UInt32(ox)))
-        var cy = s.iadd(c0y, s.uint(UInt32(oy)))
-        var cz = s.iadd(c0z, s.uint(UInt32(oz)))
-        # Inside the scrolled window [base, base + dim)?
-        var rx = s.isub(cx, base_x)
-        var ry = s.isub(cy, base_y)
-        var rz = s.isub(cz, base_z)
-        var inside = s.logical_and(s.ult(rx, dim_x), s.logical_and(s.ult(ry, dim_y), s.ult(rz, dim_z)))
-        s.begin_if(inside)
-        var slot = s.iadd(s.umod(cx, dim_x), s.imul(dim_x, s.iadd(s.umod(cy, dim_y), s.imul(dim_y, s.umod(cz, dim_z)))))
-        var pb = s.iadd(bank_off, s.imul(slot, s.uint(UInt32(SOTA_GI_PROBE_WORDS))))
-        var key_exp = s.bit_or(
-            s.bit_or(s.bit_and(cx, s.uint(0x3FF)), s.shl(s.bit_and(cy, s.uint(0x3FF)), s.uint(10))),
-            s.bit_or(s.shl(s.bit_and(cz, s.uint(0x3FF)), s.uint(20)), s.uint(0x40000000)),
-        )
-        var key = s.load_word(b_sc, s.iadd(pb, s.uint(UInt32(SOTA_PROBE_KEY))))
-        var bf = s.load_float(b_sc, s.iadd(pb, s.uint(UInt32(SOTA_PROBE_BACKFACE))))
-        s.begin_if(s.logical_and(s.ieq(key, key_exp), s.flt(bf, s.float(0.25))))
-        # Probe world position
-        var ppx = s.fmul(s.fadd(s.fsub(s.float_from_uint(cx), bias_f), s.float(0.5)), spacing)
-        var ppy = s.fmul(s.fadd(s.fsub(s.float_from_uint(cy), bias_f), s.float(0.5)), spacing)
-        var ppz = s.fmul(s.fadd(s.fsub(s.float_from_uint(cz), bias_f), s.float(0.5)), spacing)
-        var tri = s.fmul(
-            s.select_f(s.ieq(s.uint(UInt32(ox)), s.uint(1)), fx, s.fsub(s.float(1.0), fx)),
-            s.fmul(
-                s.select_f(s.ieq(s.uint(UInt32(oy)), s.uint(1)), fy, s.fsub(s.float(1.0), fy)),
-                s.select_f(s.ieq(s.uint(UInt32(oz)), s.uint(1)), fz, s.fsub(s.float(1.0), fz)),
-            ),
-        )
-        # Smooth backface weight from the true surface point
-        var tpx = s.fsub(ppx, px)
-        var tpy = s.fsub(ppy, py)
-        var tpz = s.fsub(ppz, pz)
-        var tp_n = emit_vec3_normalize(s, tpx, tpy, tpz)
-        var wrap = s.fmul(s.fadd(emit_vec3_dot(s, tp_n[0], tp_n[1], tp_n[2], nx, ny, nz), s.float(1.0)), s.float(0.5))
-        var w_bf = s.fadd(s.fmul(wrap, wrap), s.float(0.2))
-        # Chebyshev visibility with six-axis moments, from the probe towards the biased point
-        var dvx = s.fsub(qx, ppx)
-        var dvy = s.fsub(qy, ppy)
-        var dvz = s.fsub(qz, ppz)
-        var dist = s.fsqrt(s.nmax(s.float(1e-8), emit_vec3_dot(s, dvx, dvy, dvz, dvx, dvy, dvz)))
-        var inv_d = s.fdiv(s.float(1.0), dist)
-        var ux = s.fmul(dvx, inv_d)
-        var uy = s.fmul(dvy, inv_d)
-        var uz = s.fmul(dvz, inv_d)
-        var ax_x = s.select_u(s.fge(ux, s.float(0.0)), s.uint(0), s.uint(1))
-        var ax_y = s.select_u(s.fge(uy, s.float(0.0)), s.uint(2), s.uint(3))
-        var ax_z = s.select_u(s.fge(uz, s.float(0.0)), s.uint(4), s.uint(5))
-        var vis_b = s.iadd(pb, s.uint(UInt32(SOTA_PROBE_VIS)))
-        var wx2 = s.fmul(ux, ux)
-        var wy2 = s.fmul(uy, uy)
-        var wz2 = s.fmul(uz, uz)
-        var m1 = s.fma(
-            wx2, s.load_float(b_sc, s.iadd(vis_b, s.imul(ax_x, s.uint(2)))),
-            s.fma(wy2, s.load_float(b_sc, s.iadd(vis_b, s.imul(ax_y, s.uint(2)))), s.fmul(wz2, s.load_float(b_sc, s.iadd(vis_b, s.imul(ax_z, s.uint(2)))))),
-        )
-        var m2 = s.fma(
-            wx2, s.load_float(b_sc, s.iadd(vis_b, s.iadd(s.imul(ax_x, s.uint(2)), s.uint(1)))),
-            s.fma(
-                wy2, s.load_float(b_sc, s.iadd(vis_b, s.iadd(s.imul(ax_y, s.uint(2)), s.uint(1)))),
-                s.fmul(wz2, s.load_float(b_sc, s.iadd(vis_b, s.iadd(s.imul(ax_z, s.uint(2)), s.uint(1))))),
-            ),
-        )
-        var variance = s.nmax(s.fabs(s.fsub(m2, s.fmul(m1, m1))), s.float(1e-4))
-        var dd = s.nmax(s.float(0.0), s.fsub(dist, m1))
-        var cheb = s.fdiv(variance, s.fadd(variance, s.fmul(dd, dd)))
-        var cheb3 = s.select_f(s.fle(dist, m1), s.float(1.0), s.fmul(cheb, s.fmul(cheb, cheb)))
-        var w_raw = s.fmul(tri, s.fmul(w_bf, s.nmax(cheb3, s.float(0.0))))
-        # Crush tiny weights (DDGI) so leaking probes do not dominate
-        var w_cr = s.select_f(s.flt(w_raw, s.float(0.2)), s.fmul(w_raw, s.fmul(s.fmul(w_raw, w_raw), s.float(25.0))), w_raw)
-        var w = s.nmax(w_cr, s.float(1e-6))
-        # SH9 irradiance / pi
-        var e_r = s.fvar(s.float(0.0))
-        var e_g = s.fvar(s.float(0.0))
-        var e_b = s.fvar(s.float(0.0))
-        for k in range(9):
-            var wk = s.fmul(nyb[k], s.float(sota_sh9_band_weight(k)))
-            var cw = s.iadd(pb, s.uint(UInt32(SOTA_PROBE_SH + k * 3)))
-            s.store(e_r, s.fma(s.load_float(b_sc, cw), wk, s.load_f(e_r)))
-            s.store(e_g, s.fma(s.load_float(b_sc, s.iadd(cw, s.uint(1))), wk, s.load_f(e_g)))
-            s.store(e_b, s.fma(s.load_float(b_sc, s.iadd(cw, s.uint(2))), wk, s.load_f(e_b)))
-        s.store(acc_r, s.fma(s.nmax(s.load_f(e_r), s.float(0.0)), w, s.load_f(acc_r)))
-        s.store(acc_g, s.fma(s.nmax(s.load_f(e_g), s.float(0.0)), w, s.load_f(acc_g)))
-        s.store(acc_b, s.fma(s.nmax(s.load_f(e_b), s.float(0.0)), w, s.load_f(acc_b)))
-        s.store(acc_w, s.fadd(s.load_f(acc_w), w))
-        s.end_if()
-        s.end_if()
-
-    var wsum = s.load_f(acc_w)
-    var inv_w = s.fdiv(s.float(1.0), s.nmax(wsum, s.float(1e-5)))
-    return (s.fmul(s.load_f(acc_r), inv_w), s.fmul(s.load_f(acc_g), inv_w), s.fmul(s.load_f(acc_b), inv_w), wsum)
 
 
 struct SotaHit(Copyable, Movable):
@@ -1090,6 +975,62 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(gi_r, wi[0])
     s.store(gi_g, wi[1])
     s.store(gi_b, wi[2])
+    if enable_ray_query:
+        # Near-field contact rays: probes cannot resolve occluders closer than about one probe
+        # spacing, so short rays that hit something use that surface (direct + albedo * WRC there)
+        # and unoccluded rays keep the probe irradiance (near-field / far-field split).
+        var n_c = _ctrl(s, b_sc, SOTA_CTRL_CONTACT_RAYS)
+        s.begin_if(s.ine(n_c, s.uint(0)))
+        var c_rad = _ctrl_f(s, b_sc, SOTA_CTRL_CONTACT_RADIUS)
+        var inv_c = s.fdiv(s.float(1.0), s.float_from_uint(n_c))
+        var ca_r = s.fvar(s.float(0.0))
+        var ca_g = s.fvar(s.float(0.0))
+        var ca_b = s.fvar(s.float(0.0))
+        var c_seed = s.uvar(s.iadd(s.imul(pix, s.uint(7919)), s.imul(frame, s.uint(104729))))
+        var c_o_x = s.fma(gnx, s.float(0.004), wx)
+        var c_o_y = s.fma(gny, s.float(0.004), wy)
+        var c_o_z = s.fma(gnz, s.float(0.004), wz)
+        var ck_v = s.uvar(s.uint(0))
+        s.begin_loop()
+        var ck = s.load_u(ck_v)
+        s.break_if(s.uge(ck, n_c))
+        var ch1 = _emit_hash(s, s.load_u(c_seed))
+        var ch2 = _emit_hash(s, ch1[0])
+        s.store(c_seed, ch2[0])
+        var cu1 = s.fmul(s.fadd(s.float_from_uint(ck), ch1[1]), inv_c)
+        var cdir = _emit_cosine_dir(s, nx, ny, nz, cu1, ch2[1])
+        var chh = emit_sota_trace_surface(
+            s, tlas_var, b_verts, b_indices, b_instances, b_materials, bindless_arr,
+            c_o_x, c_o_y, c_o_z, cdir[0], cdir[1], cdir[2], c_rad,
+        )
+        var cl_r = s.fvar(wi[0])
+        var cl_g = s.fvar(wi[1])
+        var cl_b = s.fvar(wi[2])
+        s.begin_if(chh.hit)
+        s.begin_if(chh.backface)
+        s.store(cl_r, s.float(0.0))
+        s.store(cl_g, s.float(0.0))
+        s.store(cl_b, s.float(0.0))
+        s.begin_else()
+        var chx = s.fma(chh.nx, s.float(0.002), chh.px)
+        var chy = s.fma(chh.ny, s.float(0.002), chh.py)
+        var chz = s.fma(chh.nz, s.float(0.002), chh.pz)
+        var cdl = emit_sota_direct_at(s, tlas_var, b_verts, b_indices, b_instances, b_materials, b_globals, b_clusters, bindless_arr, chx, chy, chz, chh.nx, chh.ny, chh.nz)
+        var cwh = emit_sota_wrc_irradiance(s, b_sc, cur_bank, chh.px, chh.py, chh.pz, chh.nx, chh.ny, chh.nz)
+        s.store(cl_r, s.fma(chh.kd_r, s.fadd(cdl[0], cwh[0]), chh.em_r))
+        s.store(cl_g, s.fma(chh.kd_g, s.fadd(cdl[1], cwh[1]), chh.em_g))
+        s.store(cl_b, s.fma(chh.kd_b, s.fadd(cdl[2], cwh[2]), chh.em_b))
+        s.end_if()
+        s.end_if()
+        s.store(ca_r, s.fadd(s.load_f(ca_r), s.load_f(cl_r)))
+        s.store(ca_g, s.fadd(s.load_f(ca_g), s.load_f(cl_g)))
+        s.store(ca_b, s.fadd(s.load_f(ca_b), s.load_f(cl_b)))
+        s.store(ck_v, s.iadd(ck, s.uint(1)))
+        s.end_loop()
+        s.store(gi_r, s.fmul(s.load_f(ca_r), inv_c))
+        s.store(gi_g, s.fmul(s.load_f(ca_g), inv_c))
+        s.store(gi_b, s.fmul(s.load_f(ca_b), inv_c))
+        s.end_if()
     s.end_if()
     s.end_if()
 
@@ -1099,6 +1040,9 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
         var max_b = s.select_u(is_hybrid, s.uint(1), n_bounce)
         var inv_n = s.fdiv(s.float(1.0), s.float_from_uint(n_rays))
         var seed0 = s.iadd(s.imul(pix, s.uint(1973)), s.imul(frame, s.uint(9277)))
+        var restir_on = s.ine(s.bit_and(_ctrl(s, b_sc, SOTA_CTRL_RESTIR_FLAGS), s.uint(SOTA_RESTIR_GI)), s.uint(0))
+        var res = SotaGiReservoir(s)
+        var r_seed = s.uvar(s.iadd(s.imul(pix, s.uint(48271)), s.imul(frame, s.uint(69621))))
         var k_v = s.uvar(s.uint(0))
         s.begin_loop()
         var k_c = s.load_u(k_v)
@@ -1117,6 +1061,13 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
         var lp_g = s.fvar(s.float(0.0))
         var lp_b = s.fvar(s.float(0.0))
         var alive = s.uvar(s.uint(1))
+        # ReSTIR GI candidate: the first vertex of this path (a far point for sky rays)
+        var cs_x = s.fvar(s.float(0.0))
+        var cs_y = s.fvar(s.float(0.0))
+        var cs_z = s.fvar(s.float(0.0))
+        var cn_x = s.fvar(s.float(0.0))
+        var cn_y = s.fvar(s.float(1.0))
+        var cn_z = s.fvar(s.float(0.0))
         var seed_v = s.uvar(s.iadd(seed0, s.imul(k_c, s.uint(26699))))
         var b_v = s.uvar(s.uint(0))
         s.begin_loop()
@@ -1132,6 +1083,14 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
             s, tlas_var, b_verts, b_indices, b_instances, b_materials, bindless_arr,
             s.load_f(o_x), s.load_f(o_y), s.load_f(o_z), dvec[0], dvec[1], dvec[2], s.float(1000.0),
         )
+        s.begin_if(s.ieq(b_c, s.uint(0)))
+        s.store(cs_x, s.select_f(h.hit, h.px, s.fma(dvec[0], s.float(10000.0), wx)))
+        s.store(cs_y, s.select_f(h.hit, h.py, s.fma(dvec[1], s.float(10000.0), wy)))
+        s.store(cs_z, s.select_f(h.hit, h.pz, s.fma(dvec[2], s.float(10000.0), wz)))
+        s.store(cn_x, s.select_f(h.hit, h.nx, s.fneg(dvec[0])))
+        s.store(cn_y, s.select_f(h.hit, h.ny, s.fneg(dvec[1])))
+        s.store(cn_z, s.select_f(h.hit, h.nz, s.fneg(dvec[2])))
+        s.end_if()
         s.begin_if(h.hit)
         s.begin_if(h.backface)
         s.store(alive, s.uint(0))
@@ -1196,8 +1155,27 @@ def sota_gi_resolve_shader(enable_ray_query: Bool) -> List[UInt32]:
         s.store(gi_r, s.fma(pr, s.fmul(cl, inv_n), s.load_f(gi_r)))
         s.store(gi_g, s.fma(pg, s.fmul(cl, inv_n), s.load_f(gi_g)))
         s.store(gi_b, s.fma(pbv, s.fmul(cl, inv_n), s.load_f(gi_b)))
+        s.begin_if(restir_on)
+        var rh = _emit_hash(s, s.load_u(r_seed))
+        s.store(r_seed, rh[0])
+        emit_sota_gi_stream_candidate(
+            s, res, rh[1], wx, wy, wz, nx, ny, nz,
+            s.load_f(cs_x), s.load_f(cs_y), s.load_f(cs_z), s.load_f(cn_x), s.load_f(cn_y), s.load_f(cn_z),
+            s.fmul(pr, cl), s.fmul(pg, cl), s.fmul(pbv, cl),
+        )
+        s.end_if()
         s.store(k_v, s.iadd(k_c, s.uint(1)))
         s.end_loop()
+        # ReSTIR GI: temporal + spatial reuse replaces the plain per-pixel average
+        s.begin_if(restir_on)
+        var rg = emit_sota_restir_gi_reuse(
+            s, b_sc, b_hdr, res, px, py, w_u, h_u, wx, wy, wz, nx, ny, nz, gnx, gny, gnz,
+            tlas_var, b_verts, b_indices, b_instances, b_materials, bindless_arr,
+        )
+        s.store(gi_r, rg[0])
+        s.store(gi_g, rg[1])
+        s.store(gi_b, rg[2])
+        s.end_if()
         s.end_if()
 
     # Progressive accumulation (photo mode)
@@ -1260,7 +1238,9 @@ def emit_sota_gi_write_gbuffer(
     dw_g: UInt32,
     dw_b: UInt32,
 ):
-    """Deferred-shade hook: store this pixel's GI inputs when an area-B mode is active."""
+    """Deferred-shade hook: store this pixel's GI inputs when an area-B mode is active, and the
+    surface history used by the ReSTIR passes when they run."""
+    emit_sota_hist_write(s, b_surfcache, pix, wx, wy, wz, nx, ny, nz)
     var mode = emit_sota_gi_mode(s, b_surfcache)
     s.begin_if(s.ine(mode, s.uint(0)))
     var gb = s.iadd(_ctrl(s, b_surfcache, SOTA_CTRL_GBUF), s.imul(pix, s.uint(UInt32(SOTA_GI_GBUF_WORDS))))

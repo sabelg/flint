@@ -199,16 +199,15 @@ from flint.render.aaa_gi_svgf import (
     svgf_temporal_reproject_shader,
 )
 # --- sota:gi hook --- (area B: world radiance cache + path-traced GI)
-from flint.render.sota_gi_world_cache import (
+from flint.render.sota_gi_core import (
     SOTA_GI_CTRL_WORDS,
     SOTA_GI_MODE_HYBRID,
     SOTA_GI_MODE_LEGACY,
     SOTA_GI_SURFCACHE_TRIS,
-    SotaGiSettings,
     sota_gi_region_words,
-    sota_gi_resolve_shader,
-    sota_wrc_update_shader,
+    sota_svgf_scratch_words,
 )
+from flint.render.sota_gi_world_cache import SotaGiSettings, sota_gi_resolve_shader, sota_wrc_update_shader
 # --- end sota:gi hook ---
 from flint.render.aaa_clustered_lights import (
     AAA_CLUSTER_BUFFER_WORDS,
@@ -1421,6 +1420,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.buf_vsm_indirect = self.vk.create_buffer(64 + self.max_draws * 16, local=True)
         self.buf_hdr_out = self.vk.create_buffer(max_pix * 8 * 4, local=True)
         var hist_words = rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix)
+        hist_words += sota_svgf_scratch_words(max_pix)  # --- sota:gi hook --- SVGF a-trous scratch
         # --- sota:ml hook --- (scratch appended past every other history region; offset recorded here)
         self.sota_ml.scratch_base = hist_words
         self.sota_ml.scratch_max_pix = max_pix
@@ -4125,9 +4125,11 @@ struct FlintAaaVulkanRenderer(Movable):
             and self.sota_gi.pipe_resolve != 0
         ):
             sota_mode = self.sota_gi.mode
+        var sota_restir_di = use_rt_frame and self.enable_restir_di and self.enable_rt_shadows and n_cl_lights > 0
         self.sota_gi.write_ctrl(
             self.buf_surfcache.cpu_address, sota_mode, self.frame_index, self.cam_pos, self.cam_fwd,
             self.render_w, self.render_h, max(self.output_w * self.output_h, self.render_w * self.render_h), n_inst,
+            restir_di=sota_restir_di, region_ready=self.sota_gi_region_ready,
         )
         # --- end sota:gi hook ---
         var inst_da: UInt64 = 0
@@ -4876,6 +4878,9 @@ struct FlintAaaVulkanRenderer(Movable):
                 push_sv[3] = UInt32(st_i & 1)
                 push_sv[4] = bitcast[DType.uint32](self.svgf_sigma_luma)
                 push_sv[5] = UInt32(1) if (st_i + 1 == n_steps) else UInt32(0)
+                # --- sota:gi hook --- a-trous ping-pong scratch past the history regions (0 = legacy bank A)
+                if self.sota_gi.svgf_history_fix:
+                    push_sv[6] = UInt32(rt_shadow_raw_offset(max_pix) + rt_shadow_total_words(max_pix))
                 self.vk.dispatch_aaa(
                     cur_slot,
                     self.pipe_svgf_atrous,
@@ -5700,7 +5705,10 @@ struct FlintAaaVulkanRenderer(Movable):
     # --- sota:gi hook ---
     def _sota_gi_prepare(mut self):
         """Grows the surface-cache buffer to hold the area-B region the first time a mode is enabled."""
-        if self.sota_gi.mode == SOTA_GI_MODE_LEGACY or self.sota_gi_region_ready:
+        if self.sota_gi_region_ready:
+            return
+        var wants_restir_di = self.enable_restir_di and self.sota_gi.restir_di_reuse and self.enable_rt_shadows
+        if self.sota_gi.mode == SOTA_GI_MODE_LEGACY and not wants_restir_di:
             return
         if self.max_surfcache_tris != SOTA_GI_SURFCACHE_TRIS or self.sota_gi.pipe_wrc == 0:
             return
