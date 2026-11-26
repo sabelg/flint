@@ -209,7 +209,7 @@ struct FlintDevOverlays(Movable):
         self.gpu_stats.geom_kib = (ren.buf_vertices.size + ren.buf_indices.size + ren.buf_meshlets.size) // 1024
         self.gpu_stats.pso_cache_active = ren.vk.pipeline_cache != 0
         self.gpu_stats.pipeline_count = len(ren.vk.pipelines)
-        self.gpu_stats.pso_cache_file_bytes = file_size("build/vk_pso.cache")
+        self.gpu_stats.pso_cache_file_bytes = file_size(ren.sota_e_pso.path)  # --- sota:E hook ---
         self.gpu_stats.validation_errors = ren.vk.validation_errors() if ren.vk.messages != 0 else 0
         self.gpu_stats.vk_error = ren.vk.error
         if ren.active:
@@ -398,8 +398,8 @@ struct FlintDevOverlays(Movable):
                     status_col, 1,
                 )
             else:
-                var pso_disk_bytes = file_size("build/vk_pso.cache")
-                var pso_disk_str = String(pso_disk_bytes // 1024) + " KIB" if pso_disk_bytes >= 0 else String("NOT FOUND (build/vk_pso.cache)")
+                var pso_disk_bytes = self.gpu_stats.pso_cache_file_bytes  # --- sota:E hook ---
+                var pso_disk_str = String(pso_disk_bytes // 1024) + " KIB" if pso_disk_bytes >= 0 else String("NOT FOUND (pso cache)")
                 var vram_kib = mem_total(W_VRAM_LIVE) // 1024
                 var tgt_kib = mem_live(MEM_GPU_TARGETS) // 1024
                 var tex_kib = mem_live(MEM_GPU_TEXTURES) // 1024

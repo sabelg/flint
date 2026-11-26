@@ -67,11 +67,21 @@ from flint.render.aaa_clustered_lights import (
     emit_restir_candidate_selection_spv,
 )
 from flint.render.aaa_skinning_rt import AAA_SKIN_PREV_POS_BASE
+# --- sota:E hook ---
+from flint.render.sota_e_characters import (
+    SotaEDirectInputs,
+    emit_sota_e_direct_override,
+    emit_sota_e_eye_surface,
+    emit_sota_e_material_decode,
+    emit_sota_e_skin_curvature_radius,
+)
+# --- end sota:E hook ---
 from flint.render.aaa_sky_atmosphere import (
     emit_aerial_perspective_spv,
     emit_nubis_sky_clouds_and_celestial_spv,
 )
 # --- sota:gi hook --- (area B: world radiance cache + path-traced GI, `sota_gi_world_cache.mojo`)
+from flint.render.sota_gi_restir import emit_sota_restir_di_reuse, emit_sota_restir_di_visibility
 from flint.render.sota_gi_world_cache import (
     emit_sota_gi_mode,
     emit_sota_gi_write_gbuffer,
@@ -1272,6 +1282,18 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     var sss_b = s.load_float(b_materials, s.iadd(m_base, s.uint(22)))
     var tex_pack = s.load_word(b_materials, s.iadd(m_base, s.uint(23)))
 
+    # --- sota:E hook (character material models: decode; tagged materials carry no film / sheen) ---
+    var sota_e = emit_sota_e_material_decode(s, b_materials, m_base, irid_w, r_flags)
+    irid_w = s.select_f(sota_e.tagged, s.float(0.0), irid_w)
+    sh_r = s.select_f(sota_e.tagged, s.float(0.0), sh_r)
+    sh_g = s.select_f(sota_e.tagged, s.float(0.0), sh_g)
+    sh_b = s.select_f(sota_e.tagged, s.float(0.0), sh_b)
+    var sota_e_no_wrap = s.logical_and(sota_e.tagged, s.fgt(sota_e.model_f, s.float(1.5)))
+    sss_r = s.select_f(sota_e_no_wrap, s.float(0.0), sss_r)
+    sss_g = s.select_f(sota_e_no_wrap, s.float(0.0), sss_g)
+    sss_b = s.select_f(sota_e_no_wrap, s.float(0.0), sss_b)
+    # --- end sota:E hook ---
+
     var t_alb = s.bit_and(tex_pack, s.uint(0xFF))
     var t_nrm = s.bit_and(s.shr(tex_pack, s.uint(8)), s.uint(0xFF))
     var t_orm = s.bit_and(s.shr(tex_pack, s.uint(16)), s.uint(0xFF))
@@ -1521,6 +1543,17 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
     s.store(em_b_v, s.fadd(s.load_f(em_b_v), win_rgb[2]))
     s.end_if()
 
+    # --- sota:E hook (eye: cornea refraction + iris parallax replaces the albedo) ---
+    var sota_e_eye = emit_sota_e_eye_surface(
+        s, sota_e, bindless_arr, t_alb, uv_u, uv_v, ddx_vec, ddy_vec,
+        wn_geom[0], wn_geom[1], wn_geom[2], wt_u[0], wt_u[1], wt_u[2], wb_u[0], wb_u[1], wb_u[2],
+        nx_v, ny_v, nz_v, vx, vy, vz, alb_r, alb_g, alb_b,
+        s.load_float(b_materials, m_base),
+        s.load_float(b_materials, s.iadd(m_base, s.uint(1))),
+        s.load_float(b_materials, s.iadd(m_base, s.uint(2))),
+    )
+    # --- end sota:E hook ---
+
     var nx = s.load_f(nx_v)
     var ny = s.load_f(ny_v)
     var nz = s.load_f(nz_v)
@@ -1596,6 +1629,21 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
         sss_r, sss_g, sss_b,
         lut_a, lut_b,
     )
+    # --- sota:E hook (skin / eye / hair direct sun response) ---
+    var sota_e_curv = emit_sota_e_skin_curvature_radius(
+        s, wn_geom[0], wn_geom[1], wn_geom[2], wn_dx[0], wn_dx[1], wn_dx[2], wn_dy[0], wn_dy[1], wn_dy[2],
+        z_lin, tan_x, fw, ndotv,
+    )
+    var sota_e_hair_v = s.fgt(sota_e.p16, s.float(0.5))
+    direct = emit_sota_e_direct_override(
+        s, sota_e, sota_e_eye,
+        SotaEDirectInputs(nx, ny, nz, vx, vy, vz, sun_x, sun_y, sun_z, cur_alb_r, cur_alb_g, cur_alb_b, f0[0], cur_rough),
+        s.select_f(sota_e_hair_v, wb_u[0], wt_u[0]),
+        s.select_f(sota_e_hair_v, wb_u[1], wt_u[1]),
+        s.select_f(sota_e_hair_v, wb_u[2], wt_u[2]),
+        sota_e_curv, direct[0], direct[1], direct[2],
+    )
+    # --- end sota:E hook ---
     var sv = s.load_f(sun_vis)
     var dir_r = s.fvar(s.fmul(direct[0], s.fmul(sun_rad_r, sv)))
     var dir_g = s.fvar(s.fmul(direct[1], s.fmul(sun_rad_g, sv)))
@@ -1619,6 +1667,11 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
             frame_idx,
             num_candidates=4,
         )
+        # --- sota:gi hook --- (ReSTIR DI temporal + fused spatial reuse; pass-through when off)
+        restir_res = emit_sota_restir_di_reuse(
+            s, b_surfcache, b_clusters, restir_res, px, py, w_u, h_u, vel_u, vel_v, wx, wy, wz, nx, ny, nz
+        )
+        # --- end sota:gi hook ---
         var final_light_id = restir_res[0]
         var restir_w_sum = restir_res[1]
         var restir_m = restir_res[2]
@@ -1645,6 +1698,7 @@ def aaa_deferred_shade_shader(enable_ray_query: Bool) -> List[UInt32]:
             s.nmax(s.float(0.05), s.fsub(ldist, s.float(0.22))),
             b_verts=b_verts, b_indices=b_indices, b_instances=b_instances, b_materials=b_materials, bindless_arr=bindless_arr,
         )
+        emit_sota_restir_di_visibility(s, b_surfcache, pix_idx_u, final_light_id, vis)  # --- sota:gi hook --- (visibility reuse)
 
         s.begin_if(s.fgt(vis, s.float(0.0)))
         var unshadowed_rgb = emit_eval_single_cluster_light(
@@ -2264,15 +2318,20 @@ def svgf_atrous_shader_specialized[ENABLE_EDGE_STOP: Bool = True]() -> List[UInt
     var from_hist = dsl.push_u32(3).ne(0)
     var sigma_luma = dsl.push_f32(4)
     var remodulate = dsl.push_u32(5).ne(0)
+    # --- sota:gi hook --- ping-pong scratch base in BIND_AAA_HISTORY (was 0 = the SVGF history bank A,
+    # which clobbered the temporal history every other frame)
+    var hist_scr = dsl.push_u32(6)
+    # --- end sota:gi hook ---
     dsl.return_if(px.ge(w_u) | py.ge(h_u))
 
     var pix_idx = py * w_u + px
     var c_base = b_hdr.base_word(pix_idx)
-    var c_rgb = select_vec3(from_hist, b_hist.load_vec3(c_base), b_hdr.load_vec3(c_base))
-    var cz = select_f(from_hist, b_hist.load_f32(c_base + 3), b_hdr.load_f32(c_base + 3))
-    var cvv = select_f(from_hist, b_hist.load_f32(c_base + 5), b_hdr.load_f32(c_base + 5))
-    var cnx = select_f(from_hist, b_hist.load_f32(c_base + 6), b_hdr.load_f32(c_base + 6))
-    var cny = select_f(from_hist, b_hist.load_f32(c_base + 7), b_hdr.load_f32(c_base + 7))
+    var h_c = c_base + hist_scr  # sota:gi hook
+    var c_rgb = select_vec3(from_hist, b_hist.load_vec3(h_c), b_hdr.load_vec3(c_base))
+    var cz = select_f(from_hist, b_hist.load_f32(h_c + 3), b_hdr.load_f32(c_base + 3))
+    var cvv = select_f(from_hist, b_hist.load_f32(h_c + 5), b_hdr.load_f32(c_base + 5))
+    var cnx = select_f(from_hist, b_hist.load_f32(h_c + 6), b_hdr.load_f32(c_base + 6))
+    var cny = select_f(from_hist, b_hist.load_f32(h_c + 7), b_hdr.load_f32(c_base + 7))
     var cnz = sqrt_f(max_f(dsl.f32(1.0) - fma_f(cnx, cnx, cny * cny), 0.0))
     var c_nrm = GpuVec3(cnx, cny, cnz)
     var luma_weights = dsl.vec3_const(0.2126, 0.7152, 0.0722)
@@ -2284,7 +2343,7 @@ def svgf_atrous_shader_specialized[ENABLE_EDGE_STOP: Bool = True]() -> List[UInt
 
     dsl.if_then(cz.gt(1e5))
     sum_rgb.set(c_rgb)
-    var c_var_init = select_f(from_hist, b_hist.load_f32(c_base + 4), b_hdr.load_f32(c_base + 4))
+    var c_var_init = select_f(from_hist, b_hist.load_f32(h_c + 4), b_hdr.load_f32(c_base + 4))
     sum_var.set(c_var_init)
     sum_w.set(dsl.f32(1.0))
     dsl.else_branch()
@@ -2304,18 +2363,19 @@ def svgf_atrous_shader_specialized[ENABLE_EDGE_STOP: Bool = True]() -> List[UInt
                 sy_u = min_u(h_u - 1, py + step_u)
 
             var n_base = b_hdr.base_word(sy_u * w_u + sx_u)
-            var n_rgb = select_vec3(from_hist, b_hist.load_vec3(n_base), b_hdr.load_vec3(n_base))
+            var h_n = n_base + hist_scr  # sota:gi hook
+            var n_rgb = select_vec3(from_hist, b_hist.load_vec3(h_n), b_hdr.load_vec3(n_base))
             var w_tot = kw
             if ENABLE_EDGE_STOP:
-                var nz_l = select_f(from_hist, b_hist.load_f32(n_base + 3), b_hdr.load_f32(n_base + 3))
-                var nnx = select_f(from_hist, b_hist.load_f32(n_base + 6), b_hdr.load_f32(n_base + 6))
-                var nny = select_f(from_hist, b_hist.load_f32(n_base + 7), b_hdr.load_f32(n_base + 7))
+                var nz_l = select_f(from_hist, b_hist.load_f32(h_n + 3), b_hdr.load_f32(n_base + 3))
+                var nnx = select_f(from_hist, b_hist.load_f32(h_n + 6), b_hdr.load_f32(n_base + 6))
+                var nny = select_f(from_hist, b_hist.load_f32(h_n + 7), b_hdr.load_f32(n_base + 7))
                 var nnz = sqrt_f(max_f(dsl.f32(1.0) - fma_f(nnx, nnx, nny * nny), 0.0))
                 var n_nrm = GpuVec3(nnx, nny, nnz)
                 var ndot = max_f(dot(c_nrm, n_nrm), 0.0)
                 var w_n = pow_f(ndot, 32.0)
                 var dz = abs_f(cz - nz_l) / max_f(cz * 0.08, 0.05)
-                var c_var = select_f(from_hist, b_hist.load_f32(c_base + 4), b_hdr.load_f32(c_base + 4))
+                var c_var = select_f(from_hist, b_hist.load_f32(h_c + 4), b_hdr.load_f32(c_base + 4))
                 var n_luma = dot(n_rgb, luma_weights)
                 var l_diff = abs_f(c_luma - n_luma)
                 var s_scaled = fma_f(sigma_luma, sqrt_f(max_f(c_var, 1e-5)), dsl.f32(0.001))
@@ -2331,7 +2391,7 @@ def svgf_atrous_shader_specialized[ENABLE_EDGE_STOP: Bool = True]() -> List[UInt
                     fma_f(n_rgb.z(), w_tot, cur_acc.z()),
                 )
             )
-            var n_var = select_f(from_hist, b_hist.load_f32(n_base + 4), b_hdr.load_f32(n_base + 4))
+            var n_var = select_f(from_hist, b_hist.load_f32(h_n + 4), b_hdr.load_f32(n_base + 4))
             sum_var.set(fma_f(n_var, w_tot * w_tot, sum_var.get()))
             sum_w.set(sum_w.get() + w_tot)
     dsl.end_if()
@@ -2369,12 +2429,12 @@ def svgf_atrous_shader_specialized[ENABLE_EDGE_STOP: Bool = True]() -> List[UInt
     b_hdr.store_f32(c_base + 6, cnx)
     b_hdr.store_f32(c_base + 7, cny)
     dsl.else_branch()
-    b_hist.store_vec3(c_base, w_rgb)
-    b_hist.store_f32(c_base + 3, cz)
-    b_hist.store_f32(c_base + 4, w_s4)
-    b_hist.store_f32(c_base + 5, w_s5)
-    b_hist.store_f32(c_base + 6, cnx)
-    b_hist.store_f32(c_base + 7, cny)
+    b_hist.store_vec3(h_c, w_rgb)
+    b_hist.store_f32(h_c + 3, cz)
+    b_hist.store_f32(h_c + 4, w_s4)
+    b_hist.store_f32(h_c + 5, w_s5)
+    b_hist.store_f32(h_c + 6, cnx)
+    b_hist.store_f32(h_c + 7, cny)
     dsl.end_if()
 
     return dsl.finish()

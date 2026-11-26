@@ -1,24 +1,44 @@
 """Engine-Generic Synchronous Speech & Giant-Robot AI OS DSP Synthesizer (`flint.platform.speech`).
 
 Synthesizes intelligible spoken tactical guidance into 48 kHz Stereo `WavClip`s:
-  1. Uses `libespeak-ng.so.1` via runtime `dlopen` in synchronous memory-only PCM mode
-     (`AUDIO_OUTPUT_SYNCHRONOUS`, zero subprocesses, zero audio-daemon blocking) when
-     available on Linux (`aarch64` / `x86_64`), tuned to a calm, composed British/RP
-     male baritone (`en-gb-x-rp+m3`, `F0 ~ 105-118 Hz`, flat `range = 20` OS prosody).
-  2. Automatically falls back to a pure-Mojo 3-formant (`F1`/`F2`/`F3` `CytomicSVF`)
-     baritone (`112 Hz`) Klatt vocal-tract synthesizer if `libespeak-ng` is absent.
-  3. Masters dry speech through a 48 kHz Stereo Giant-Robot / Spaceship OS DSP chain:
+  1. Renders dry 24 kHz speech with one of two backends:
+     - **Kokoro** (default when its weights load): `flint.ml.kokoro`, the 82M-parameter neural
+       TTS, with one voice pack / speed / pitch per `VOICE_*` profile (`kokoro_voice_preset`).
+       Moonshine word error ~2 % dry (Klatt: ~24 %). It runs at ~0.3-0.5 RTF, so finished clips
+       are cached on disk (below) and can be generated ahead of time (`pregenerate_speech_lines`).
+     - **Klatt** (fallback): Flint's pure-Mojo rule-based formant voice
+       (`flint.audio.formant_tts`: misaki G2P, Klatt-style duration / F0 rules, cascade-parallel
+       formant synthesizer with an LF glottal source). Each `VOICE_*` profile maps to one
+       `formant_voice` preset (vocal-tract scale, F0 register, range, rate and voice quality).
+       G2P is rules-only by default; set `FLINT_G2P_DIR` to a misaki lexicon directory
+       (`us_gold.json` / `us_silver.json`, `gb_*` for British presets) for dictionary
+       pronunciations.
+  2. Masters dry speech through a 48 kHz Stereo Giant-Robot / Spaceship OS DSP chain:
      cubic Hermite upsampling, dual-head raised-cosine granular 3-voice harmonizer
      (`-26 cents` Left @ `6.5 ms` Haas, `+26 cents` Right @ `10.5 ms` Haas, and
      `-4.6 st` `0.765x` deep chest sub-voice), dual short-lag (`0.78 ms` & `2.38 ms`)
      titanium vocal-box comb resonance, warm `CytomicSVF` studio vocal-body sculpting,
      and dark-titanium `StereoReverbFDN` cockpit spatialization.
+
+Backend selection (`active_speech_backend`):
+  - `FLINT_SPEECH_BACKEND` = `auto` (default) | `kokoro` | `klatt`. `auto` and `kokoro` use Kokoro
+    when its weights load and fall back to Klatt otherwise (a clip is never lost).
+  - Kokoro weights: `$FLINT_KOKORO_DIR`, else `~/flint-models/kokoro` (`tools/kokoro/fetch.sh`:
+    `model.onnx`, `voices/*.bin`, `lexicon/*.json`), else none. The model loads once per process
+    (on the first Kokoro clip) and stays cached; it runs on the CPU (`FLINT_KOKORO_GPU=1` moves it
+    to the MAX GPU: ~1 s slower to load, similar speed for short lines).
+
+Clip cache (Kokoro clips only; Klatt renders far faster than real time): finished 48 kHz clips live
+in `$FLINT_SPEECH_CACHE_DIR`, else `$XDG_CACHE_HOME/flint/speech`, else `~/.cache/flint/speech`, one
+file per hash(backend, voice preset, text, profile / chain parameters, model). The full key is stored
+in the file and checked on load. Entries are only ever added, never deleted.
+`FLINT_SPEECH_CACHE_DIR=off` disables the cache.
 """
-from std.ffi import external_call
-from flint.platform.dynlib import dl_open, dl_sym
-from std.math import sin, cos, exp, floor, abs
-from flint.platform.os import env_value
-from flint.platform.vulkan import get64, put64
+from std.math import sin, cos, exp, floor, abs, sqrt
+from std.ffi import external_call, _get_global
+from std.time import perf_counter_ns
+from std.sys import size_of
+from flint.platform.os import env_now, file_size, read_bytes, write_bytes, make_dirs, rename_file
 from flint.platform.audio import WavClip
 from flint.platform.dsp import (
     DSP_TAU,
@@ -26,272 +46,533 @@ from flint.platform.dsp import (
     CytomicSVF,
     StereoReverbFDN,
     hash_white_noise,
-    poly_blep_saw,
     soft_clip_tanh,
     tube_saturate,
     wrap_phase01,
 )
+from flint.audio.formant_tts.api import FormantTTS, FORMANT_TTS_SAMPLE_RATE
+from flint.audio.formant_tts.voices import formant_voice, FV_DEFAULT
+from flint.core.serial import fnv64
+from flint.ml.kokoro import KokoroTTS, KOKORO_SAMPLE_RATE, KOKORO_STYLE_DIM
+from flint.ml.phonemize import G2P
 
 comptime SPEECH_OUT_RATE: Int = 48000
 comptime SPEECH_OUT_SR_F: Float32 = 48000.0
 
-# C Capture State Block layout (3 x 64-bit words):
-#   word 0: data_ptr (Int16* malloc buffer)
-#   word 1: count    (number of Int16 samples written)
-#   word 2: capacity (allocated Int16 sample slots)
-comptime CAP_PTR: Int = 0
-comptime CAP_LEN: Int = 8
-comptime CAP_CAP: Int = 16
+comptime SPEECH_BACKEND_KLATT: Int = 0
+comptime SPEECH_BACKEND_KOKORO: Int = 1
+comptime SPEECH_BACKEND_AUTO: Int = 2
+
+# Bump when a chain, gain or preset change alters cached clips (it is part of every cache key).
+comptime SPEECH_CACHE_REVISION: Int = 1
+comptime _CACHE_MAGIC = "FLSPCH01"
+
+# Kokoro dry level into the chains. Kokoro's crest factor is ~6.5-7 against Klatt's ~3-4, so peak
+# normalisation (Klatt) would leave it ~6 dB quieter and barely touch the saturation stages; Kokoro
+# is RMS-normalised instead, with a soft knee on the sparse plosive peaks.
+comptime _KOKORO_DRY_RMS: Float32 = 0.24
+comptime _KOKORO_PEAK_CAP: Float32 = 1.6
 
 
-def _espeak_pcm_callback(wav_ptr: Int, num_samples: Int32, events_ptr: Int) abi("C") -> Int32:
-    """Synchronous `t_espeak_callback` appending 16-bit mono PCM chunks into `user_data`."""
-    if wav_ptr == 0 or num_samples <= 0 or events_ptr == 0:
-        return 0
-    # In 64-bit Linux `espeak_EVENT`, `void* user_data` sits at byte offset 24.
-    var state = get64(events_ptr + 24)
-    if state == 0:
-        return 0
-    var n = Int(num_samples)
-    var cur_ptr = get64(state + CAP_PTR)
-    var cur_len = get64(state + CAP_LEN)
-    var cur_cap = get64(state + CAP_CAP)
-    if cur_len + n > cur_cap:
-        var new_cap = max(65536, (cur_cap * 2) + n)
-        var new_ptr = external_call["realloc", Int](cur_ptr, new_cap * 2)
-        if new_ptr == 0:
-            return 0
-        cur_ptr = new_ptr
-        cur_cap = new_cap
-        put64(state + CAP_PTR, cur_ptr)
-        put64(state + CAP_CAP, cur_cap)
-    _ = external_call["memcpy", Int](cur_ptr + cur_len * 2, wav_ptr, n * 2)
-    put64(state + CAP_LEN, cur_len + n)
-    return 0
+def _formant_speech_mono(text: String, voice_id: Int, rate_wpm: Int = 0) -> List[Float32]:
+    """Dry 24 kHz mono speech from the formant voice preset `voice_id` (`FV_*`).
+
+    `rate_wpm > 0` overrides the preset's speaking rate. Uses the misaki lexicon in
+    `FLINT_G2P_DIR` when it is set and loads, else the rules-only G2P. Never raises: a G2P
+    failure returns an empty buffer."""
+    var v = formant_voice(voice_id)
+    if rate_wpm > 0:
+        v.rate_wpm = Float32(rate_wpm)
+    var lex = env_now("FLINT_G2P_DIR")
+    try:
+        if lex.byte_length() > 0:
+            try:
+                var tts_lex = FormantTTS.load(lex, v.british)
+                return tts_lex.synthesize(text, v)
+            except:
+                pass
+        var tts = FormantTTS(v.british)
+        return tts.synthesize(text, v)
+    except:
+        return List[Float32]()
 
 
-def _c_str(text: String) -> List[UInt8]:
-    var out = List[UInt8](capacity=text.byte_length() + 1)
-    for b in text.as_bytes():
-        out.append(b)
-    out.append(0)
+def _synth_klatt_fallback_mono(text: String, voice_id: Int = FV_DEFAULT) -> List[Float32]:
+    """Dry 24 kHz mono formant speech (kept under its historical name for tools and evals)."""
+    return _formant_speech_mono(text, voice_id)
+
+
+# ==============================================================================
+# Kokoro voice presets
+# ==============================================================================
+
+@fieldwise_init
+struct KokoroVoicePreset(Copyable, Movable):
+    """Kokoro rendering of one `VOICE_*` profile.
+
+    `voice` is a pack name (`voices/<name>.bin`) or a style blend `"a*0.7+b*0.3"`. `speed` is
+    Kokoro's duration scale (>1 faster), `pitch` the chain's granular pitch ratio (1 = none),
+    `british` selects the misaki GB lexicon (the b* packs were trained on it)."""
+    var voice: String
+    var speed: Float64
+    var pitch: Float32
+    var british: Bool
+
+
+def kokoro_voice_preset(profile_id: Int) -> KokoroVoicePreset:
+    """Voice pack / speed / pitch per `VOICE_*` profile (packs from `tools/kokoro/fetch.sh`)."""
+    if profile_id == VOICE_AI_OS:
+        # calm synthetic RP male (the espeak preset was en-gb RP); unhurried, the harmonizer adds the machine
+        return KokoroVoicePreset("bm_george", 0.94, 1.0, True)
+    if profile_id == VOICE_BRIDGE_FEMALE:
+        # composed US bridge officer, crisp and a touch brisk
+        return KokoroVoicePreset("af_heart", 1.05, 1.0, False)
+    if profile_id == VOICE_ACE_BARITONE:
+        # relaxed veteran: Michael's natural register, slightly unhurried
+        return KokoroVoicePreset("am_michael", 0.97, 1.0, False)
+    if profile_id == VOICE_ACE_TENOR:
+        # young, fast, bright: Michael +1.3 st through the chain's pitch stage, quicker delivery
+        return KokoroVoicePreset("am_michael", 1.08, 1.08, False)
+    if profile_id == VOICE_ACE_CRIMSON:
+        # confident British female ace; the chain adds the alien chorus
+        return KokoroVoicePreset("bf_emma", 1.02, 1.0, True)
+    return KokoroVoicePreset("af_heart", 1.0, 1.0, False)
+
+
+# ==============================================================================
+# Backend selection & the process-wide Kokoro model
+# ==============================================================================
+
+struct _KokoroSlot(Movable):
+    """Process-wide Kokoro state, behind `mutex` (a calloc'd, zero-initialised pthread mutex)."""
+    var tts: Optional[KokoroTTS]
+    var gb: Optional[G2P]
+    var dir: String          # the directory `tts` was loaded from (or last failed to load)
+    var tried: Bool
+    var load_seconds: Float64
+    var cache_hits: Int
+    var cache_misses: Int
+    var kokoro_clips: Int
+    var mutex: Int
+
+    def __init__(out self):
+        self.tts = None
+        self.gb = None
+        self.dir = String()
+        self.tried = False
+        self.load_seconds = 0.0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.kokoro_clips = 0
+        self.mutex = external_call["calloc", Int](Int(1), Int(128))
+
+
+def _slot_init() -> Optional[Pointer[NoneType, MutUntrackedOrigin]]:
+    var raw = external_call["calloc", Int](Int(1), max(64, size_of[_KokoroSlot]()))
+    var p = Pointer[_KokoroSlot, MutAnyOrigin](unsafe_from_address=raw)
+    __get_address_as_uninit_lvalue(p._mlir_value) = _KokoroSlot()
+    return Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=raw)
+
+
+def _slot_destroy(p: Optional[Pointer[NoneType, MutUntrackedOrigin]]):
+    # The model lives until the process exits.
+    pass
+
+
+def _slot() -> Pointer[_KokoroSlot, MutAnyOrigin]:
+    var g = _get_global["FLINT_SPEECH_KOKORO_SLOT", _slot_init, _slot_destroy]()
+    return Pointer[_KokoroSlot, MutAnyOrigin](unsafe_from_address=Int(g.value()))
+
+
+def _lock(s: Pointer[_KokoroSlot, MutAnyOrigin]):
+    _ = external_call["pthread_mutex_lock", Int32](s[].mutex)
+
+
+def _unlock(s: Pointer[_KokoroSlot, MutAnyOrigin]):
+    _ = external_call["pthread_mutex_unlock", Int32](s[].mutex)
+
+
+def speech_backend_request() -> Int:
+    """`FLINT_SPEECH_BACKEND`: `klatt` / `kokoro` / anything else (default) = `auto`."""
+    var v = env_now("FLINT_SPEECH_BACKEND").lower()
+    if v == "klatt" or v == "formant":
+        return SPEECH_BACKEND_KLATT
+    if v == "kokoro":
+        return SPEECH_BACKEND_KOKORO
+    return SPEECH_BACKEND_AUTO
+
+
+def speech_backend_name(backend: Int) -> String:
+    if backend == SPEECH_BACKEND_KOKORO:
+        return "kokoro"
+    if backend == SPEECH_BACKEND_KLATT:
+        return "klatt"
+    return "auto"
+
+
+def _kokoro_dir_ok(dir: String) -> Bool:
+    """`dir` holds the Kokoro graph and at least one of the preset voice packs."""
+    if dir.byte_length() == 0:
+        return False
+    if file_size(dir + "/model.onnx") <= 0 and file_size(dir + "/onnx/model.onnx") <= 0:
+        return False
+    var packs: List[String] = ["af_heart", "am_michael", "bm_george", "bf_emma"]
+    for p in packs:
+        if file_size(dir + "/voices/" + p + ".bin") > 0:
+            return True
+    return False
+
+
+def kokoro_weights_dir() -> String:
+    """`$FLINT_KOKORO_DIR`, then `~/flint-models/kokoro`, then "" (no weights)."""
+    var e = env_now("FLINT_KOKORO_DIR")
+    if _kokoro_dir_ok(e):
+        return e
+    var home = env_now("HOME")
+    if home.byte_length() > 0 and _kokoro_dir_ok(home + "/flint-models/kokoro"):
+        return home + "/flint-models/kokoro"
+    return String()
+
+
+def _ensure_kokoro_locked(s: Pointer[_KokoroSlot, MutAnyOrigin], dir: String) -> Bool:
+    """Load (once per weights directory) the model into the slot. Caller holds the lock."""
+    if s[].tried and s[].dir == dir:
+        return True if s[].tts else False
+    s[].tried = True
+    s[].dir = dir
+    s[].tts = None
+    s[].gb = None
+    var t0 = perf_counter_ns()
+    try:
+        var gpu = env_now("FLINT_KOKORO_GPU") == "1"
+        var tts = KokoroTTS.load(dir, gpu)
+        s[].tts = tts^
+        if file_size(dir + "/lexicon/gb_gold.json") > 0:
+            s[].gb = G2P.load(dir + "/lexicon", True)
+    except e:
+        print("[flint.speech] Kokoro failed to load from", dir, "(", e, "), using the Klatt voice")
+        s[].tts = None
+    s[].load_seconds = Float64(perf_counter_ns() - t0) / 1e9
+    return True if s[].tts else False
+
+
+def active_speech_backend() -> Int:
+    """The backend the next clip will use (loads Kokoro on first use in `auto` / `kokoro`)."""
+    if speech_backend_request() == SPEECH_BACKEND_KLATT:
+        return SPEECH_BACKEND_KLATT
+    var dir = kokoro_weights_dir()
+    if dir.byte_length() == 0:
+        return SPEECH_BACKEND_KLATT
+    var s = _slot()
+    _lock(s)
+    var ok = _ensure_kokoro_locked(s, dir)
+    _unlock(s)
+    return SPEECH_BACKEND_KOKORO if ok else SPEECH_BACKEND_KLATT
+
+
+def kokoro_load_seconds() -> Float64:
+    """Wall time of the (single) Kokoro model load, 0 before it."""
+    var s = _slot()
+    return s[].load_seconds
+
+
+def speech_cache_stats() -> Tuple[Int, Int]:
+    """(hits, misses) of the on-disk clip cache in this process."""
+    var s = _slot()
+    return (s[].cache_hits, s[].cache_misses)
+
+
+def kokoro_clips_rendered() -> Int:
+    """Clips this process synthesised with Kokoro (cache hits excluded)."""
+    var s = _slot()
+    return s[].kokoro_clips
+
+
+def _blend_voice(mut tts: KokoroTTS, spec: String) raises:
+    """Register the style blend `"a*0.7+b*0.3"` under its own name in `tts.voices`."""
+    if spec in tts.voices:
+        return
+    var acc = List[Float32]()
+    var total = Float32(0.0)
+    for part in spec.split("+"):
+        var p = String(part)
+        var w = Float32(1.0)
+        var name = p
+        var star = p.find("*")
+        if star >= 0:
+            name = String(p[byte=0:star])
+            w = Float32(Float64(String(p[byte=star + 1:])))
+        var pack = tts.voice(name)
+        if len(acc) == 0:
+            acc = List[Float32](length=len(pack), fill=0.0)
+        for k in range(min(len(acc), len(pack))):
+            acc[k] += pack[k] * w
+        total += w
+    if total > Float32(0.0) and total != Float32(1.0):
+        for k in range(len(acc)):
+            acc[k] /= total
+    tts.voices[spec] = acc^
+
+
+def _kokoro_dry_mono(text: String, preset: KokoroVoicePreset, speed: Float64) -> List[Float32]:
+    """Dry 24 kHz Kokoro speech; empty when the model is unavailable or synthesis fails."""
+    var dir = kokoro_weights_dir()
+    if dir.byte_length() == 0:
+        return List[Float32]()
+    var s = _slot()
+    _lock(s)
+    var out = List[Float32]()
+    if _ensure_kokoro_locked(s, dir):
+        try:
+            ref tts = s[].tts.value()
+            if preset.voice.find("+") >= 0:
+                _blend_voice(tts, preset.voice)
+            var phonemes: String
+            if preset.british and s[].gb:
+                phonemes = s[].gb.value().phonemize(text).phonemes
+            else:
+                phonemes = tts.g2p.phonemize(text).phonemes
+            var sp = tts.speak_phonemes(phonemes, preset.voice, speed)
+            out = sp.samples.copy()
+            s[].kokoro_clips += 1
+        except e:
+            print("[flint.speech] Kokoro synthesis failed (", e, "), using the Klatt voice")
+            out = List[Float32]()
+    _unlock(s)
     return out^
 
 
-def _parse_pos_int(s: String) -> Int:
-    var v = 0
-    for i in range(s.byte_length()):
-        var d = Int(s.as_bytes()[i]) - 48
-        if d >= 0 and d <= 9:
-            v = v * 10 + d
-    return v
+# ==============================================================================
+# On-disk clip cache
+# ==============================================================================
+
+def speech_cache_dir() -> String:
+    """`$FLINT_SPEECH_CACHE_DIR` (`off` / `0` disables), else `$XDG_CACHE_HOME/flint/speech`,
+    else `~/.cache/flint/speech`; "" when none can be formed."""
+    var o = env_now("FLINT_SPEECH_CACHE_DIR")
+    if o.byte_length() > 0:
+        if o == "off" or o == "0" or o == "none":
+            return String()
+        return o
+    var x = env_now("XDG_CACHE_HOME")
+    if x.byte_length() > 0:
+        return x + "/flint/speech"
+    var home = env_now("HOME")
+    if home.byte_length() > 0:
+        return home + "/.cache/flint/speech"
+    return String()
 
 
-def _try_espeak_mono(
-    text: String,
-    voice_name: String,
-    rate_wpm: Int,
-    pitch_0_99: Int,
-    range_0_99: Int = 20,
-) -> Tuple[List[Float32], Int]:
-    """Attempts synchronous in-memory phoneme synthesis via `libespeak-ng.so.1`."""
-    var empty = List[Float32]()
-    if text.byte_length() == 0:
-        return (empty^, 0)
-
-    var candidates = [
-        String("libespeak-ng.so.1"),
-        String("/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1"),
-        String("/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1"),
-        String("libespeak-ng.so"),
-    ]
-    var lib = 0
-    for i in range(len(candidates)):
-        var cname = candidates[i]
-        lib = dl_open(cname)
-        _ = cname.byte_length()
-        if lib != 0:
-            break
-    if lib == 0:
-        return (empty^, 0)
-
-    var s_init = String("espeak_Initialize")
-    var s_cb = String("espeak_SetSynthCallback")
-    var s_voice = String("espeak_SetVoiceByName")
-    var s_param = String("espeak_SetParameter")
-    var s_synth = String("espeak_Synth")
-    var s_sync = String("espeak_Synchronize")
-
-    var fn_init = dl_sym(lib, s_init)
-    var fn_cb = dl_sym(lib, s_cb)
-    var fn_voice = dl_sym(lib, s_voice)
-    var fn_param = dl_sym(lib, s_param)
-    var fn_synth = dl_sym(lib, s_synth)
-    var fn_sync = dl_sym(lib, s_sync)
-    _ = s_init.byte_length()
-    _ = s_cb.byte_length()
-    _ = s_voice.byte_length()
-    _ = s_param.byte_length()
-    _ = s_synth.byte_length()
-    _ = s_sync.byte_length()
-
-    if fn_init == 0 or fn_cb == 0 or fn_voice == 0 or fn_param == 0 or fn_synth == 0 or fn_sync == 0:
-        return (empty^, 0)
-
-    # Guard `espeak_Initialize` once per process via process env (`FLINT_ESPEAK_SR`)
-    var cached_sr = _parse_pos_int(env_value("FLINT_ESPEAK_SR"))
-    if cached_sr <= 0:
-        comptime InitFn = def(Int32, Int32, Int, Int32) thin abi("C") -> Int32
-        var slot_init = fn_init
-        var sr_ret = Int(Pointer(to=slot_init).unsafe_bitcast[InitFn]()[unsafe_offset=0](Int32(2), Int32(0), Int(0), Int32(0)))
-        if sr_ret <= 0:
-            return (empty^, 0)
-        cached_sr = sr_ret
-        var env_k = String("FLINT_ESPEAK_SR")
-        var env_v = String(cached_sr)
-        _ = external_call["setenv", Int32](env_k.as_c_string_span(), env_v.as_c_string_span(), Int32(1))
-        _ = env_k.byte_length()
-        _ = env_v.byte_length()
-
-    comptime SetCbFn = def(def(Int, Int32, Int) thin abi("C") -> Int32) thin abi("C") -> NoneType
-    var slot_cb = fn_cb
-    Pointer(to=slot_cb).unsafe_bitcast[SetCbFn]()[unsafe_offset=0](_espeak_pcm_callback)
-
-    comptime SetVoiceFn = def(Int) thin abi("C") -> Int32
-    var slot_v = fn_voice
-    var v_primary_c = _c_str(voice_name)
-    var v_rc = Pointer(to=slot_v).unsafe_bitcast[SetVoiceFn]()[unsafe_offset=0](Int(v_primary_c.unsafe_ptr()))
-    _ = len(v_primary_c)
-    if v_rc != 0:
-        var v_fb1 = _c_str("en-gb+m3")
-        v_rc = Pointer(to=slot_v).unsafe_bitcast[SetVoiceFn]()[unsafe_offset=0](Int(v_fb1.unsafe_ptr()))
-        _ = len(v_fb1)
-    if v_rc != 0:
-        var v_fb2 = _c_str("en-us+m3")
-        _ = Pointer(to=slot_v).unsafe_bitcast[SetVoiceFn]()[unsafe_offset=0](Int(v_fb2.unsafe_ptr()))
-        _ = len(v_fb2)
-
-    comptime SetParamFn = def(Int32, Int32, Int32) thin abi("C") -> Int32
-    var slot_p = fn_param
-    # speak_lib.h: espeakRATE=1, espeakVOLUME=2, espeakPITCH=3, espeakRANGE=4
-    _ = Pointer(to=slot_p).unsafe_bitcast[SetParamFn]()[unsafe_offset=0](Int32(1), Int32(rate_wpm), Int32(0))
-    _ = Pointer(to=slot_p).unsafe_bitcast[SetParamFn]()[unsafe_offset=0](Int32(2), Int32(125), Int32(0))
-    _ = Pointer(to=slot_p).unsafe_bitcast[SetParamFn]()[unsafe_offset=0](Int32(3), Int32(pitch_0_99), Int32(0))
-    _ = Pointer(to=slot_p).unsafe_bitcast[SetParamFn]()[unsafe_offset=0](Int32(4), Int32(range_0_99), Int32(0))
-
-    var state = external_call["calloc", Int](Int(3), Int(8))
-    if state == 0:
-        return (empty^, 0)
-    var init_cap = 65536
-    var pcm_buf = external_call["malloc", Int](init_cap * 2)
-    if pcm_buf == 0:
-        external_call["free", NoneType](state)
-        return (empty^, 0)
-    put64(state + CAP_PTR, pcm_buf)
-    put64(state + CAP_LEN, 0)
-    put64(state + CAP_CAP, init_cap)
-
-    comptime SynthFn = def(Int, Int, UInt32, Int32, UInt32, UInt32, Int, Int) thin abi("C") -> Int32
-    comptime SyncFn = def() thin abi("C") -> Int32
-    var slot_syn = fn_synth
-    var slot_sync = fn_sync
-    var txt_c = _c_str(text)
-    # espeakCHARS_UTF8 = 1
-    _ = Pointer(to=slot_syn).unsafe_bitcast[SynthFn]()[unsafe_offset=0](
-        Int(txt_c.unsafe_ptr()),
-        len(txt_c),
-        UInt32(0),
-        Int32(0),
-        UInt32(0),
-        UInt32(1),
-        Int(0),
-        state,
-    )
-    _ = len(txt_c)
-    _ = Pointer(to=slot_sync).unsafe_bitcast[SyncFn]()[unsafe_offset=0]()
-
-    var final_ptr = get64(state + CAP_PTR)
-    var final_len = get64(state + CAP_LEN)
-    var out = List[Float32](capacity=max(1, final_len))
-    if final_ptr != 0 and final_len > 0:
-        var i16_ptr = Pointer[Int16, origin=MutAnyOrigin](unsafe_from_address=final_ptr)
-        for i in range(final_len):
-            out.append(Float32(i16_ptr[unsafe_offset=i]) / Float32(32768.0))
-    if final_ptr != 0:
-        external_call["free", NoneType](final_ptr)
-    external_call["free", NoneType](state)
-    return (out^, cached_sr)
-
-
-def _synth_klatt_fallback_mono(
-    text: String,
-    base_f0: Float32 = 112.0,
-    formant_scale: Float32 = 1.0,
-    char_dur_sec: Float32 = 0.056,
-) -> List[Float32]:
-    """Pure-Mojo 3-formant (`F1`/`F2`/`F3`) Klatt fallback synthesizer (`24 kHz` mono)
-    with configurable vocal-tract `formant_scale` and `base_f0` pitch."""
-    var sr = Float32(24000.0)
-    var n_chars = max(4, min(96, text.byte_length()))
-    var char_dur = max(Float32(0.038), min(Float32(0.075), char_dur_sec))
-    var total = Int(Float32(n_chars) * char_dur * sr)
-    var out = List[Float32](capacity=total)
-
-    var f1 = CytomicSVF(460.0 * formant_scale, 4.5, sr)
-    var f2 = CytomicSVF(1420.0 * formant_scale, 5.5, sr)
-    var f3 = CytomicSVF(2420.0 * formant_scale, 6.0, sr)
-    var fric_hp = CytomicSVF(3400.0, 2.2, sr)
-    var pink = PinkNoise(719 + Int(base_f0 * 3.0))
-    var ph = Float32(0.0)
-    var prev_idx = -1
-    var voiced = True
-
-    for i in range(total):
-        var t = Float32(i) / sr
-        var idx = min(n_chars - 1, Int(t / char_dur))
-        var local_t = t - Float32(idx) * char_dur
-        if idx != prev_idx:
-            prev_idx = idx
-            var ch = Int(text.as_bytes()[idx]) if idx < text.byte_length() else 32
-            if ch >= 97 and ch <= 122:
-                ch -= 32
-            voiced = ch != 32 and ch != 44 and ch != 46 and ch != 83 and ch != 70 and ch != 84 and ch != 75 and ch != 80
-            var t_f1 = Float32(460.0)
-            var t_f2 = Float32(1420.0)
-            var t_f3 = Float32(2420.0)
-            if ch == 65:  # A
-                t_f1 = 680.0
-                t_f2 = 1180.0
-            elif ch == 69 or ch == 73 or ch == 89:  # E / I / Y
-                t_f1 = 330.0
-                t_f2 = 1980.0
-            elif ch == 79 or ch == 85 or ch == 87:  # O / U / W
-                t_f1 = 380.0
-                t_f2 = 880.0
-            f1.set_params(min(Float32(1150.0), t_f1 * formant_scale), Float32(4.8), sr)
-            f2.set_params(min(Float32(3100.0), t_f2 * formant_scale), Float32(5.8), sr)
-            f3.set_params(min(Float32(3900.0), t_f3 * formant_scale), Float32(6.2), sr)
-
-        var ch_cur = Int(text.as_bytes()[idx]) if idx < text.byte_length() else 32
-        if ch_cur == 32 or ch_cur == 44 or ch_cur == 46:
-            out.append(Float32(0.0))
-            continue
-
-        var prosody = Float32(1.0) + Float32(0.035) * sin(t * Float32(4.2)) - (t / max(Float32(0.4), Float32(total) / sr)) * Float32(0.05)
-        var f0 = base_f0 * prosody
-        var dt_p = f0 / sr
-        ph = wrap_phase01(ph + dt_p)
-        var env = min(Float32(1.0), local_t * Float32(140.0)) * min(Float32(1.0), (char_dur - local_t) * Float32(95.0))
-        if voiced:
-            var glot = poly_blep_saw(ph, dt_p) * Float32(0.78) + pink.next() * Float32(0.06)
-            _ = f1.process(glot)
-            _ = f2.process(glot)
-            _ = f3.process(glot)
-            out.append((f1.bp * Float32(0.74) + f2.bp * Float32(0.48) + f3.bp * Float32(0.24)) * env)
-        else:
-            _ = fric_hp.process(hash_white_noise(i * 13 + 7))
-            out.append(fric_hp.hp * Float32(0.25) * env)
+def _hex64(v: UInt64) -> String:
+    var digits = "0123456789abcdef"
+    var out = String()
+    for i in range(16):
+        var nib = Int((v >> UInt64(60 - 4 * i)) & UInt64(15))
+        out += String(digits[byte=nib])
     return out^
+
+
+def _kokoro_model_tag(dir: String) -> String:
+    var m = file_size(dir + "/model.onnx")
+    if m <= 0:
+        m = file_size(dir + "/onnx/model.onnx")
+    return dir + "#" + String(m)
+
+
+def _clip_cache_key(chain: String, text: String, preset: KokoroVoicePreset, speed: Float64,
+                    profile_id: Int, lead_in_sec: Float32, radio_bandpass: Bool) -> String:
+    var k = String("rev=") + String(SPEECH_CACHE_REVISION)
+    k += "|backend=kokoro|model=" + _kokoro_model_tag(kokoro_weights_dir())
+    k += "|chain=" + chain + "|profile=" + String(profile_id)
+    k += "|voice=" + preset.voice + "|speed=" + String(speed) + "|pitch=" + String(preset.pitch)
+    k += "|gb=" + ("1" if preset.british else "0")
+    k += "|lead=" + String(lead_in_sec) + "|band=" + ("1" if radio_bandpass else "0")
+    k += "|text=" + text
+    return k^
+
+
+def _cache_path(key: String) -> String:
+    var dir = speech_cache_dir()
+    if dir.byte_length() == 0:
+        return String()
+    var b = List[UInt8]()
+    for c in key.as_bytes():
+        b.append(c)
+    return dir + "/" + _hex64(fnv64(b)) + ".flspeech"
+
+
+def _u32_at(d: List[UInt8], o: Int) -> Int:
+    return Int(d[o]) | (Int(d[o + 1]) << 8) | (Int(d[o + 2]) << 16) | (Int(d[o + 3]) << 24)
+
+
+def _put_u32(mut d: List[UInt8], v: Int):
+    d.append(UInt8(v & 255))
+    d.append(UInt8((v >> 8) & 255))
+    d.append(UInt8((v >> 16) & 255))
+    d.append(UInt8((v >> 24) & 255))
+
+
+def _cache_load(key: String) -> WavClip:
+    var clip = WavClip()
+    var path = _cache_path(key)
+    if path.byte_length() == 0 or file_size(path) <= 0:
+        return clip^
+    var d = read_bytes(path)
+    var magic = String(_CACHE_MAGIC)
+    var mb = magic.as_bytes()
+    if len(d) < 8 + 16:
+        return clip^
+    for i in range(8):
+        if d[i] != mb[i]:
+            return clip^
+    var klen = _u32_at(d, 8)
+    var kb = key.as_bytes()
+    if klen != len(kb) or len(d) < 12 + klen + 12:
+        return clip^
+    for i in range(klen):
+        if d[12 + i] != kb[i]:
+            return clip^
+    var o = 12 + klen
+    var ch = _u32_at(d, o)
+    var sr = _u32_at(d, o + 4)
+    var n = _u32_at(d, o + 8)
+    o += 12
+    if ch < 1 or ch > 2 or sr <= 0 or len(d) < o + 2 * n:
+        return clip^
+    clip.samples.reserve(n)
+    for i in range(n):
+        var u = Int(d[o + 2 * i]) | (Int(d[o + 2 * i + 1]) << 8)
+        clip.samples.append(Int16(u - 65536 if u >= 32768 else u))
+    clip.channels = ch
+    clip.sample_rate = sr
+    clip.valid = True
+    return clip^
+
+
+def _cache_store(key: String, clip: WavClip):
+    var path = _cache_path(key)
+    if path.byte_length() == 0 or not clip.valid:
+        return
+    if not make_dirs(speech_cache_dir()):
+        return
+    var d = List[UInt8](capacity=12 + key.byte_length() + 12 + 2 * len(clip.samples))
+    for c in String(_CACHE_MAGIC).as_bytes():
+        d.append(c)
+    _put_u32(d, key.byte_length())
+    for c in key.as_bytes():
+        d.append(c)
+    _put_u32(d, clip.channels)
+    _put_u32(d, clip.sample_rate)
+    _put_u32(d, len(clip.samples))
+    for v in clip.samples:
+        var u = Int(v)
+        if u < 0:
+            u += 65536
+        d.append(UInt8(u & 255))
+        d.append(UInt8((u >> 8) & 255))
+    # write a private temp file, then rename over: readers never see a partial clip
+    var tmp = path + ".tmp" + String(Int(external_call["getpid", Int32]()))
+    if write_bytes(tmp, d):
+        _ = rename_file(tmp, path)
+
+
+def _cache_count(hit: Bool):
+    var s = _slot()
+    _lock(s)
+    if hit:
+        s[].cache_hits += 1
+    else:
+        s[].cache_misses += 1
+    _unlock(s)
+
+
+# ==============================================================================
+# Shared dry-voice staging
+# ==============================================================================
+
+struct _Dry(Movable):
+    """Dry mono voice handed to a chain: samples, rate, backend and the chain pitch ratio."""
+    var mono: List[Float32]
+    var sample_rate: Int
+    var backend: Int
+    var pitch: Float32
+
+    def __init__(out self, var mono: List[Float32], sample_rate: Int, backend: Int, pitch: Float32):
+        self.mono = mono^
+        self.sample_rate = sample_rate
+        self.backend = backend
+        self.pitch = pitch
+
+
+def _kokoro_dry(text: String, profile_id: Int, rate_scale: Float64) -> _Dry:
+    var preset = kokoro_voice_preset(profile_id)
+    var mono = _kokoro_dry_mono(text, preset, preset.speed * rate_scale)
+    return _Dry(mono^, KOKORO_SAMPLE_RATE, SPEECH_BACKEND_KOKORO, preset.pitch)
+
+
+def _stage_dry48(dry: _Dry, peak_target: Float32, fade_in_len: Float32, fade_out_len: Float32) -> List[Float32]:
+    """Trim, level and Hermite-upsample a dry voice to 48 kHz.
+
+    Klatt: trailing-silence trim and peak normalisation to `peak_target` (unchanged).
+    Kokoro: leading / trailing silence trim (the lead-in is the chain's job), RMS normalisation to
+    `_KOKORO_DRY_RMS` with the gain capped at `_KOKORO_PEAK_CAP / peak` and a soft knee above 0.7."""
+    var mono = dry.mono.copy()
+    if len(mono) < 64:
+        mono = List[Float32](length=64, fill=0.0)
+    var kok = dry.backend == SPEECH_BACKEND_KOKORO
+    var src_sr = dry.sample_rate
+
+    var end_idx = len(mono)
+    var thr = Float32(0.0025)
+    var start_idx = 0
+    if kok:
+        var pk0 = Float32(0.0)
+        for x in mono:
+            pk0 = max(pk0, abs(x))
+        thr = max(Float32(0.0025), pk0 * Float32(0.006))
+        while start_idx < end_idx - 256 and abs(mono[start_idx]) < thr:
+            start_idx += 1
+        start_idx = max(0, start_idx - src_sr // 100)    # keep 10 ms before the onset
+    while end_idx > start_idx + 256 and abs(mono[end_idx - 1]) < thr:
+        end_idx -= 1
+    if kok:
+        end_idx = min(len(mono), end_idx + src_sr // 50)  # 20 ms release
+
+    var peak = Float32(0.05)
+    var e = Float64(0.0)
+    var ne = 0
+    for i in range(start_idx, end_idx):
+        var a = abs(mono[i])
+        if a > peak:
+            peak = a
+    var gain = peak_target / peak
+    if kok:
+        # RMS over the active samples (> -40 dB re peak) so pauses do not dilute it
+        for i in range(start_idx, end_idx):
+            var a = abs(mono[i])
+            if a > peak * Float32(0.01):
+                e += Float64(a) * Float64(a)
+                ne += 1
+        var rms = Float32(sqrt(e / Float64(max(1, ne)))) if ne > 0 else Float32(0.05)
+        gain = min(_KOKORO_DRY_RMS / max(rms, Float32(1e-4)), _KOKORO_PEAK_CAP / peak)
+
+    var n_src = end_idx - start_idx
+    var voice_frames = max(64, Int(Float64(n_src) * Float64(SPEECH_OUT_RATE) / Float64(src_sr)))
+    var step_src = Float64(src_sr) / Float64(SPEECH_OUT_RATE)
+    var dry48 = List[Float32](capacity=voice_frames)
+    for vf in range(voice_frames):
+        var src_pos = Float64(start_idx) + Float64(vf) * step_src
+        var fade_in = min(Float32(1.0), Float32(vf) / fade_in_len)
+        var fade_out = min(Float32(1.0), Float32(voice_frames - vf) / fade_out_len)
+        var x = _hermite_sample(mono, src_pos) * gain
+        if kok:
+            var ax = abs(x)
+            if ax > Float32(0.7):
+                # soft knee: 0.7 + 0.3 * tanh((|x| - 0.7) / 0.3), never above 1.0
+                var over = soft_clip_tanh((ax - Float32(0.7)) / Float32(0.3)) * Float32(0.3)
+                x = (Float32(0.7) + over) if x > 0 else -(Float32(0.7) + over)
+        dry48.append(x * fade_in * fade_out)
+    return dry48^
 
 
 @always_inline
@@ -349,6 +630,10 @@ def _pitch_shift_ola(x: List[Float32], ratio: Float32, grain: Int) -> List[Float
     return out^
 
 
+# ==============================================================================
+# AI OS (Giant-Robot / Spaceship OS) chain
+# ==============================================================================
+
 def synth_ai_copilot_clip(
     text: String,
     lead_in_sec: Float32 = 0.24,
@@ -359,40 +644,39 @@ def synth_ai_copilot_clip(
 ) -> WavClip:
     """Synthesizes a 48 kHz Stereo Giant-Robot / Spaceship OS AI Co-Pilot voice `WavClip`.
     Includes `lead_in_sec` pre-roll so the simultaneous Guidance Start Alert Chime rings
-    cleanly while `NativeAudio` smoothly auto-ducks BGM before the first spoken word."""
-    var raw_res = _try_espeak_mono(text, voice_name, rate_wpm, pitch_0_99, range_0_99)
-    var mono = raw_res[0].copy()
-    var src_sr = raw_res[1]
-    if len(mono) < 64 or src_sr <= 0:
-        mono = _synth_klatt_fallback_mono(text)
-        src_sr = 24000
+    cleanly while `NativeAudio` smoothly auto-ducks BGM before the first spoken word.
+    With Kokoro, `rate_wpm` scales the preset speed (148 = preset)."""
+    # `voice_name` / `pitch_0_99` / `range_0_99` were espeak-ng controls; the AI OS preset
+    # (Kokoro voice pack, or the calm RP baritone formant voice) now carries voice, register and range.
+    _ = voice_name
+    _ = pitch_0_99
+    _ = range_0_99
+    if active_speech_backend() == SPEECH_BACKEND_KOKORO:
+        var rate_scale = Float64(rate_wpm) / 148.0 if rate_wpm > 0 else 1.0
+        var preset = kokoro_voice_preset(VOICE_AI_OS)
+        var key = _clip_cache_key("ai_os", text, preset, preset.speed * rate_scale, VOICE_AI_OS, lead_in_sec, False)
+        var hit = _cache_load(key)
+        if hit.valid:
+            _cache_count(True)
+            return hit^
+        var dry = _kokoro_dry(text, VOICE_AI_OS, rate_scale)
+        if len(dry.mono) >= 64:
+            _cache_count(False)
+            var clip = _ai_os_chain(dry, lead_in_sec)
+            _cache_store(key, clip)
+            return clip^
+    var mono = _formant_speech_mono(text, VOICE_AI_OS, rate_wpm)
+    return _ai_os_chain(_Dry(mono^, FORMANT_TTS_SAMPLE_RATE, SPEECH_BACKEND_KLATT, 1.0), lead_in_sec)
 
-    # Trim trailing digital silence (`|s| < 0.0025`) so `is_speech_playing()` releases promptly
-    var end_idx = len(mono)
-    while end_idx > 256 and abs(mono[end_idx - 1]) < Float32(0.0025):
-        end_idx -= 1
 
-    # Peak-normalize dry mono buffer to consistent studio vocal level (`0.82`)
-    var peak = Float32(0.05)
-    for i in range(end_idx):
-        var a = abs(mono[i])
-        if a > peak:
-            peak = a
-    var norm_gain = Float32(0.82) / peak
-
+def _ai_os_chain(dry: _Dry, lead_in_sec: Float32) -> WavClip:
+    var kok = dry.backend == SPEECH_BACKEND_KOKORO
+    # Peak-normalize dry mono buffer to consistent studio vocal level (`0.82`; Kokoro: RMS staging)
+    var dry48 = _stage_dry48(dry, 0.82, 384.0, 480.0)
+    var voice_frames = len(dry48)
     var lead_frames = max(0, Int(lead_in_sec * SPEECH_OUT_SR_F))
-    var voice_frames = max(64, Int(Float64(end_idx) * Float64(SPEECH_OUT_RATE) / Float64(src_sr)))
     var tail_frames = Int(Float32(0.095) * SPEECH_OUT_SR_F)
     var total_frames = lead_frames + voice_frames + tail_frames
-
-    # Upsample dry baritone speech to 48 kHz mono for multi-voice granular pitch harmonization
-    var step_src = Float64(src_sr) / Float64(SPEECH_OUT_RATE)
-    var dry48 = List[Float32](capacity=voice_frames)
-    for vf in range(voice_frames):
-        var src_pos = Float64(vf) * step_src
-        var fade_in = min(Float32(1.0), Float32(vf) / Float32(384.0))
-        var fade_out = min(Float32(1.0), Float32(voice_frames - vf) / Float32(480.0))
-        dry48.append(_hermite_sample(mono, src_pos) * norm_gain * fade_in * fade_out)
 
     # 3-Voice Binaural Giant-Robot OS Harmonizer:
     #   - Left micro-pitch (`0.985x`, `-26 cents`) @ `6.5 ms` (`312` samples) Haas offset
@@ -403,6 +687,10 @@ def synth_ai_copilot_clip(
     var v_sub = _pitch_shift_ola(dry48, 0.765, 1920)
     var haas_l = 312
     var haas_r = 504
+
+    # Kokoro: natural voices are already bright in 2-4 kHz (Klatt's were dark), so the presence lift
+    # is halved; the harmonizer / comb / reverb character is unchanged.
+    var presence_amt = Float32(0.14) if kok else Float32(0.28)
 
     var clip = WavClip()
     clip.valid = True
@@ -455,8 +743,8 @@ def synth_ai_copilot_clip(
 
         _ = presence_l.process(res_l)
         _ = presence_r.process(res_r)
-        var eq_l = warm_lp_l.process(res_l + presence_l.bp * Float32(0.28)) + pip
-        var eq_r = warm_lp_r.process(res_r + presence_r.bp * Float32(0.28)) + pip
+        var eq_l = warm_lp_l.process(res_l + presence_l.bp * presence_amt) + pip
+        var eq_r = warm_lp_r.process(res_r + presence_r.bp * presence_amt) + pip
 
         var sat_l = tube_saturate(eq_l, Float32(1.22))
         var sat_r = tube_saturate(eq_r, Float32(1.22))
@@ -488,105 +776,70 @@ def synth_radio_comms_clip(
     radio_bandpass: Bool = True,
 ) -> WavClip:
     """Synthesizes a 48 kHz Stereo character radio voice clip with distinct vocal-tract formants,
-    fundamental pitch, `espeak-ng` voice variant, military UHF `320–3350 Hz` bandpass, PTT click,
-    and two-tone tactical squelch tail."""
+    fundamental pitch and voice quality (one Kokoro voice preset or `formant_voice` preset per
+    profile), military UHF `320–3350 Hz` bandpass, PTT click, and two-tone tactical squelch tail."""
     if profile_id == VOICE_AI_OS:
         return synth_ai_copilot_clip(text, lead_in_sec)
 
-    var v_name = String("en-us+m2")
-    var rate_wpm = 150
-    var pitch_0_99 = 32
-    var range_0_99 = 46
-    var klatt_f0 = Float32(110.0)
-    var klatt_formant = Float32(0.96)
-    var klatt_dur = Float32(0.055)
-    var pitch_shift = Float32(1.0)
+    if active_speech_backend() == SPEECH_BACKEND_KOKORO:
+        var preset = kokoro_voice_preset(profile_id)
+        var key = _clip_cache_key("radio", text, preset, preset.speed, profile_id, lead_in_sec, radio_bandpass)
+        var hit = _cache_load(key)
+        if hit.valid:
+            _cache_count(True)
+            return hit^
+        var dry = _kokoro_dry(text, profile_id, 1.0)
+        if len(dry.mono) >= 64:
+            _cache_count(False)
+            var clip = _radio_chain(dry, profile_id, lead_in_sec, radio_bandpass)
+            _cache_store(key, clip)
+            return clip^
+
+    # Each profile's register, vocal-tract scale and speaking rate live in its formant preset
+    # (`flint.audio.formant_tts.voices`), so the dry voice is not pitch-shifted afterwards.
+    var voice_id = profile_id if (profile_id >= VOICE_BRIDGE_FEMALE and profile_id <= VOICE_ACE_CRIMSON) else FV_DEFAULT
+    var mono = _formant_speech_mono(text, voice_id)
+    return _radio_chain(_Dry(mono^, FORMANT_TTS_SAMPLE_RATE, SPEECH_BACKEND_KLATT, 1.0), profile_id, lead_in_sec, radio_bandpass)
+
+
+def _radio_chain(dry: _Dry, profile_id: Int, lead_in_sec: Float32, radio_bandpass: Bool) -> WavClip:
+    var kok = dry.backend == SPEECH_BACKEND_KOKORO
+    var pitch_shift = dry.pitch
     var pan_bias = Float32(0.0)
     var roger_hi = Float32(1174.66)
     var roger_lo = Float32(880.0)
 
     if profile_id == VOICE_BRIDGE_FEMALE:
-        v_name = "en-us+f3"
-        rate_wpm = 160
-        pitch_0_99 = 66
-        range_0_99 = 52
-        klatt_f0 = 214.0
-        klatt_formant = 1.20
-        klatt_dur = 0.050
-        pitch_shift = 1.04
         pan_bias = -0.10
         roger_hi = 1318.51
         roger_lo = 987.77
     elif profile_id == VOICE_ACE_BARITONE:
-        v_name = "en-us+m2"
-        rate_wpm = 145
-        pitch_0_99 = 26
-        range_0_99 = 44
-        klatt_f0 = 104.0
-        klatt_formant = 0.94
-        klatt_dur = 0.058
-        pitch_shift = 0.95
         pan_bias = -0.16
         roger_hi = 1046.50
         roger_lo = 783.99
     elif profile_id == VOICE_ACE_TENOR:
-        v_name = "en-us+m4"
-        rate_wpm = 166
-        pitch_0_99 = 48
-        range_0_99 = 55
-        klatt_f0 = 144.0
-        klatt_formant = 1.06
-        klatt_dur = 0.048
-        pitch_shift = 1.03
         pan_bias = 0.16
         roger_hi = 1174.66
         roger_lo = 987.77
     elif profile_id == VOICE_ACE_CRIMSON:
-        v_name = "en-gb-x-rp+f2"
-        rate_wpm = 156
-        pitch_0_99 = 58
-        range_0_99 = 58
-        klatt_f0 = 192.0
-        klatt_formant = 1.14
-        klatt_dur = 0.052
-        pitch_shift = 1.02
         pan_bias = 0.20
         roger_hi = 1396.91
         roger_lo = 698.46
 
-    var raw_res = _try_espeak_mono(text, v_name, rate_wpm, pitch_0_99, range_0_99)
-    var mono = raw_res[0].copy()
-    var src_sr = raw_res[1]
-    if len(mono) < 64 or src_sr <= 0:
-        mono = _synth_klatt_fallback_mono(text, klatt_f0, klatt_formant, klatt_dur)
-        src_sr = 24000
-
-    var end_idx = len(mono)
-    while end_idx > 256 and abs(mono[end_idx - 1]) < Float32(0.0025):
-        end_idx -= 1
-
-    var peak = Float32(0.05)
-    for i in range(end_idx):
-        var a = abs(mono[i])
-        if a > peak:
-            peak = a
-    var norm_gain = Float32(0.84) / peak
-
+    var dry48 = _stage_dry48(dry, 0.84, 320.0, 384.0)
+    var voice_frames = len(dry48)
     var lead_frames = max(0, Int(lead_in_sec * SPEECH_OUT_SR_F))
-    var voice_frames = max(64, Int(Float64(end_idx) * Float64(SPEECH_OUT_RATE) / Float64(src_sr)))
     var tail_frames = Int(Float32(0.11) * SPEECH_OUT_SR_F)
     var total_frames = lead_frames + voice_frames + tail_frames
 
-    var step_src = Float64(src_sr) / Float64(SPEECH_OUT_RATE)
-    var dry48 = List[Float32](capacity=voice_frames)
-    for vf in range(voice_frames):
-        var src_pos = Float64(vf) * step_src
-        var fade_in = min(Float32(1.0), Float32(vf) / Float32(320.0))
-        var fade_out = min(Float32(1.0), Float32(voice_frames - vf) / Float32(384.0))
-        dry48.append(_hermite_sample(mono, src_pos) * norm_gain * fade_in * fade_out)
-
     var voiced48 = _pitch_shift_ola(dry48, pitch_shift, 1536)
     var alien_chorus = _pitch_shift_ola(dry48, pitch_shift * Float32(0.985), 1440) if profile_id == VOICE_ACE_CRIMSON else List[Float32]()
+
+    # Kokoro gain staging: the mid "bite" peak was there to lift Klatt's dark 2-4 kHz band and is
+    # halved for Kokoro; the radio band, saturation, noise bed and squelch are unchanged.
+    var bite_amt = Float32(0.55) if radio_bandpass else Float32(0.22)
+    if kok:
+        bite_amt = Float32(0.28) if radio_bandpass else Float32(0.12)
 
     var clip = WavClip()
     clip.valid = True
@@ -616,7 +869,7 @@ def synth_radio_comms_clip(
                 v = v * Float32(0.76) + alien_chorus[vf] * Float32(0.30)
             _ = hp_uhf.process(v)
             _ = mid_bite.process(hp_uhf.hp)
-            var shaped = lp_uhf.process(hp_uhf.hp + mid_bite.bp * (Float32(0.55) if radio_bandpass else Float32(0.22)))
+            var shaped = lp_uhf.process(hp_uhf.hp + mid_bite.bp * bite_amt)
             if radio_bandpass:
                 shaped = tube_saturate(shaped + pink.next() * Float32(0.012), Float32(1.48))
             sig += shaped
@@ -636,3 +889,35 @@ def synth_radio_comms_clip(
         clip.samples.append(Int16(Int(out_r * Float32(29000.0))))
 
     return clip^
+
+
+# ==============================================================================
+# Ahead-of-time generation
+# ==============================================================================
+
+def pregenerate_speech_lines(
+    lines: List[String],
+    profile_id: Int,
+    lead_in_sec: Float32 = 0.14,
+    radio_bandpass: Bool = True,
+) -> Int:
+    """Render `lines` for `profile_id` into the on-disk clip cache (loading screens, level start),
+    so the later `synth_radio_comms_clip(line, profile_id, lead_in_sec, radio_bandpass)` calls are
+    cache hits. Returns how many lines were newly synthesised (0 when all were cached, or with the
+    Klatt backend, which needs no cache)."""
+    if active_speech_backend() != SPEECH_BACKEND_KOKORO:
+        return 0
+    var before = kokoro_clips_rendered()
+    for l in lines:
+        _ = synth_radio_comms_clip(l, profile_id, lead_in_sec, radio_bandpass)
+    return kokoro_clips_rendered() - before
+
+
+def pregenerate_copilot_lines(lines: List[String], lead_in_sec: Float32 = 0.24, rate_wpm: Int = 148) -> Int:
+    """`pregenerate_speech_lines` for `synth_ai_copilot_clip(line, lead_in_sec, rate_wpm=rate_wpm)`."""
+    if active_speech_backend() != SPEECH_BACKEND_KOKORO:
+        return 0
+    var before = kokoro_clips_rendered()
+    for l in lines:
+        _ = synth_ai_copilot_clip(l, lead_in_sec, rate_wpm=rate_wpm)
+    return kokoro_clips_rendered() - before
