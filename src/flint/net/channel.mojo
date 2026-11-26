@@ -236,6 +236,7 @@ struct NetChannel(Movable):
     # Optional ChaCha20-Poly1305 AEAD with 64-bit replay-protected nonces
     var crypto_enabled: Bool
     var aead_key: AeadKey
+    var aead_rx_key: AeadKey
     var tx_nonce: UInt64
     var rx_replay: ReplayWindow64
     var crypto_auth_failures: Int
@@ -313,6 +314,7 @@ struct NetChannel(Movable):
 
         self.crypto_enabled = False
         self.aead_key = AeadKey()
+        self.aead_rx_key = AeadKey()
         self.tx_nonce = 1
         self.rx_replay = ReplayWindow64()
         self.crypto_auth_failures = 0
@@ -376,6 +378,16 @@ struct NetChannel(Movable):
         """Enables ChaCha20-Poly1305 AEAD encryption with 64-bit replay-protected nonces."""
         self.crypto_enabled = True
         self.aead_key = key
+        self.aead_rx_key = key
+        self.tx_nonce = 1
+        self.rx_replay.reset()
+
+    def enable_session_encryption(mut self, tx_key: AeadKey, rx_key: AeadKey):
+        """Enables AEAD with distinct per-direction keys (X25519 + HKDF session keys), so the two
+        directions never share a (key, nonce) pair."""
+        self.crypto_enabled = True
+        self.aead_key = tx_key
+        self.aead_rx_key = rx_key
         self.tx_nonce = 1
         self.rx_replay.reset()
 
@@ -984,7 +996,7 @@ struct NetChannel(Movable):
             var n1 = UInt32(nonce & 0xFFFFFFFF)
             var n2 = UInt32(nonce >> 32)
             var ok_dec = aead_open_raw(
-                self.aead_key,
+                self.aead_rx_key,
                 UInt32(0),
                 n1,
                 n2,
