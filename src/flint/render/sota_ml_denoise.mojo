@@ -58,6 +58,8 @@ from flint.platform.vulkan import ACCESS_SHADER_READ, ACCESS_SHADER_WRITE, PIPEL
 from flint.render.spirv import MODEL_GL_COMPUTE
 from flint.render.aaa_visbuffer import AAA_PUSH_WORDS, BIND_AAA_HDR_OUT, BIND_AAA_HISTORY, BIND_AAA_POST_SCRATCH
 from flint.render.shader_dsl import (
+    BufferRef,
+    GpuBool,
     GpuF32,
     GpuU32,
     GpuVec3,
@@ -78,10 +80,15 @@ from flint.render.shader_dsl import (
 )
 
 comptime SOTA_ML_NF: Int = 7
-# Workgroup shape. Wide rows keep each warp inside one 4 KiB page per buffer row: on the GB10 the large
-# per-pixel records of this renderer thrash the GPU TLB at 1080p with 8x8 tiles (see the notes).
+# Workgroup shape of the separate temporal / a-trous passes: wide rows keep each warp on one row of the
+# renderer's 8-word per-pixel records (coalesced loads); the fused pass uses 16x16 tiles instead.
 comptime SOTA_ML_GROUP_W: Int = 32
 comptime SOTA_ML_GROUP_H: Int = 2
+comptime SOTA_ML_TILE_W: Int = 16  # fused temporal + level-0 tile (`sota_ml_fused_shader`)
+comptime SOTA_ML_TILE_H: Int = 16
+# `sota_gi` modes (area B, `sota_gi_world_cache.mojo`): 0 legacy surface cache, 1 world cache only,
+# 2 hybrid, 3 path tracer. Learned weights are trained on the noisy per-pixel estimators (0 and 3).
+comptime SOTA_ML_GI_MODES_DEFAULT: Int = (1 << 0) | (1 << 3)
 comptime SOTA_ML_MODE_LEARNED: Int = 0
 comptime SOTA_ML_MODE_ANALYTIC: Int = 1  # SVGF weights inside this path (ablation, and GPU tests without weights)
 comptime SOTA_ML_ANALYTIC_LEVELS: Int = 4
@@ -319,24 +326,31 @@ def _unpack2(mut dsl: ShaderDsl, u: GpuU32) -> Tuple[GpuF32, GpuF32]:
     return (GpuF32(dsl.mod_addr, t[0]), GpuF32(dsl.mod_addr, t[1]))
 
 
-def sota_ml_temporal_shader(group_w: Int = SOTA_ML_GROUP_W, group_h: Int = SOTA_ML_GROUP_H) -> List[UInt32]:
-    """Reprojection + luma moments with a private history (8 words/pixel: rgb, len, m1, m2, z, nx).
-    Push: 0 w, 1 h, 2 hist_in, 3 hist_out, 4 reset, 5 A offset, 6 G offset, 7 max history (f32)."""
-    var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=group_w, group_height=group_h, push_words=AAA_PUSH_WORDS)
-    var b_hdr = dsl.buffer[8](BIND_AAA_HDR_OUT)
-    var b_hist = dsl.buffer[1](BIND_AAA_HISTORY)
-    var px = dsl.global_id_x()
-    var py = dsl.global_id_y()
-    var w_u = dsl.push_u32(0)
-    var h_u = dsl.push_u32(1)
-    var hist_in = dsl.push_u32(2)
-    var hist_out = dsl.push_u32(3)
-    var reset = dsl.push_u32(4).ne(0)
-    var a_off = dsl.push_u32(5)
-    var g_off = dsl.push_u32(6)
-    var max_len = dsl.push_f32(7)
-    dsl.return_if(px.ge(w_u) | py.ge(h_u))
+@fieldwise_init
+struct _TemporalOut(Copyable, Movable):
+    var rgb: GpuVec3
+    var len: GpuF32
+    var m1: GpuF32
+    var m2: GpuF32
+    var var_l: GpuF32
+    var z: GpuF32
+    var nx: GpuF32
+    var ny: GpuF32
 
+
+def _temporal_eval(
+    mut dsl: ShaderDsl,
+    b_hdr: BufferRef[8],
+    b_hist: BufferRef[1],
+    px: GpuU32,
+    py: GpuU32,
+    w_u: GpuU32,
+    h_u: GpuU32,
+    hist_in: GpuU32,
+    reset: GpuBool,
+    max_len: GpuF32,
+) -> _TemporalOut:
+    """Reprojects and accumulates one pixel (no stores)."""
     var pix = py * w_u + px
     var c_base = b_hdr.base_word(pix)
     var cur_rgb = b_hdr.load_vec3(c_base)
@@ -384,58 +398,75 @@ def sota_ml_temporal_shader(group_w: Int = SOTA_ML_GROUP_W, group_h: Int = SOTA_
     var f_len = r_len.get()
     var raw_var = max_f(f_m2 - f_m1 * f_m1, 0.0)
     var var_l = select_f(f_len.lt(4.0), raw_var * (dsl.f32(4.0) / f_len), raw_var)
+    return _TemporalOut(f_rgb, f_len, f_m1, f_m2, var_l, cur_z, cur_nx, cur_ny)
 
+
+def _temporal_store(mut dsl: ShaderDsl, b_hist: BufferRef[1], pix: GpuU32, hist_out: GpuU32, g_off: GpuU32, t: _TemporalOut):
+    """History record (rgb, len, m1, m2, z, nx) and G-buffer copy (z, packed n, 1/len)."""
     var o_base = hist_out + pix * dsl.u32(8)
-    b_hist.store_vec3(o_base, f_rgb)
-    b_hist.store_f32(o_base + 3, f_len)
-    b_hist.store_f32(o_base + 4, f_m1)
-    b_hist.store_f32(o_base + 5, f_m2)
-    b_hist.store_f32(o_base + 6, cur_z)
-    b_hist.store_f32(o_base + 7, cur_nx)
-
-    var a_base = a_off + pix * dsl.u32(2)
-    b_hist.store_u32(a_base, _pack2(dsl, f_rgb.x(), f_rgb.y()))
-    b_hist.store_u32(a_base + 1, _pack2(dsl, f_rgb.z(), var_l))
+    b_hist.store_vec3(o_base, t.rgb)
+    b_hist.store_f32(o_base + 3, t.len)
+    b_hist.store_f32(o_base + 4, t.m1)
+    b_hist.store_f32(o_base + 5, t.m2)
+    b_hist.store_f32(o_base + 6, t.z)
+    b_hist.store_f32(o_base + 7, t.nx)
     var g_base = g_off + pix * dsl.u32(3)
-    b_hist.store_f32(g_base, cur_z)
-    b_hist.store_u32(g_base + 1, _pack2(dsl, cur_nx, cur_ny))
-    b_hist.store_f32(g_base + 2, dsl.f32(1.0) / f_len)
-    return dsl.finish()
+    b_hist.store_f32(g_base, t.z)
+    b_hist.store_u32(g_base + 1, _pack2(dsl, t.nx, t.ny))
+    b_hist.store_f32(g_base + 2, dsl.f32(1.0) / t.len)
 
 
-def sota_ml_atrous_shader(
-    w: SotaMlWeights, level: Int, analytic: Bool, sigma_luma: Float32 = 0.65, group_w: Int = SOTA_ML_GROUP_W, group_h: Int = SOTA_ML_GROUP_H
-) -> List[UInt32]:
-    """One dilated 3x3 level with learned (or, `analytic`, SVGF) tap weights baked in as constants.
-    Push: 0 w, 1 h, 2 step, 3 src offset, 4 dst offset, 5 G offset, 6 final (remodulate into HDR_OUT),
-    7 capture (final pass also stores crisp + albedo as f16 at push 8 = D offset)."""
+def _store_a(mut dsl: ShaderDsl, b_hist: BufferRef[1], pix: GpuU32, a_off: GpuU32, t: _TemporalOut):
+    var a_base = a_off + pix * dsl.u32(2)
+    b_hist.store_u32(a_base, _pack2(dsl, t.rgb.x(), t.rgb.y()))
+    b_hist.store_u32(a_base + 1, _pack2(dsl, t.rgb.z(), t.var_l))
+
+
+def sota_ml_temporal_shader(group_w: Int = SOTA_ML_GROUP_W, group_h: Int = SOTA_ML_GROUP_H) -> List[UInt32]:
+    """Reprojection + luma moments with a private history (8 words/pixel: rgb, len, m1, m2, z, nx).
+    Push: 0 w, 1 h, 2 hist_in, 3 hist_out, 4 reset, 5 A offset, 6 G offset, 7 max history (f32)."""
     var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=group_w, group_height=group_h, push_words=AAA_PUSH_WORDS)
     var b_hdr = dsl.buffer[8](BIND_AAA_HDR_OUT)
     var b_hist = dsl.buffer[1](BIND_AAA_HISTORY)
-    var b_post = dsl.buffer[1](BIND_AAA_POST_SCRATCH)
     var px = dsl.global_id_x()
     var py = dsl.global_id_y()
     var w_u = dsl.push_u32(0)
     var h_u = dsl.push_u32(1)
-    var step_u = dsl.push_u32(2)
-    var src_off = dsl.push_u32(3)
-    var dst_off = dsl.push_u32(4)
-    var g_off = dsl.push_u32(5)
-    var final_pass = dsl.push_u32(6).ne(0)
-    var capture = dsl.push_u32(7).ne(0)
-    var d_off = dsl.push_u32(8)
+    var hist_in = dsl.push_u32(2)
+    var hist_out = dsl.push_u32(3)
+    var reset = dsl.push_u32(4).ne(0)
+    var a_off = dsl.push_u32(5)
+    var g_off = dsl.push_u32(6)
+    var max_len = dsl.push_f32(7)
     dsl.return_if(px.ge(w_u) | py.ge(h_u))
-
+    var t = _temporal_eval(dsl, b_hdr, b_hist, px, py, w_u, h_u, hist_in, reset, max_len)
     var pix = py * w_u + px
-    var s0 = _unpack2(dsl, b_hist.load_u32(src_off + pix * dsl.u32(2)))
-    var s1 = _unpack2(dsl, b_hist.load_u32(src_off + pix * dsl.u32(2) + 1))
-    var c_rgb = GpuVec3(s0[0], s0[1], s1[0])
-    var c_var = s1[1]
-    var g_base = g_off + pix * dsl.u32(3)
-    var cz = b_hist.load_f32(g_base)
-    var cn2 = _unpack2(dsl, b_hist.load_u32(g_base + 1))
-    var c_inv_len = b_hist.load_f32(g_base + 2)
-    var cnz = sqrt_f(max_f(dsl.f32(1.0) - fma_f(cn2[0], cn2[0], cn2[1] * cn2[1]), 0.0))
+    _temporal_store(dsl, b_hist, pix, hist_out, g_off, t)
+    _store_a(dsl, b_hist, pix, a_off, t)
+    return dsl.finish()
+
+
+def _level_filter(
+    mut dsl: ShaderDsl,
+    w: SotaMlWeights,
+    level: Int,
+    analytic: Bool,
+    sigma_luma: Float32,
+    c_inv_len: GpuF32,
+    t_rgb: List[GpuVec3],
+    t_var: List[GpuF32],
+    t_z: List[GpuF32],
+    t_n0: List[GpuF32],
+    t_n1: List[GpuF32],
+) -> Tuple[GpuVec3, GpuF32]:
+    """One dilated 3x3 level for one pixel from its 9 taps (index `(ky + 1) * 3 + kx + 1`, the centre is
+    tap 4). Sky pixels (`z > 1e5`) pass through. Returns the demodulated `(rgb, var)` before f16 storage."""
+    var c_rgb = t_rgb[4]
+    var c_var = t_var[4]
+    var cz = t_z[4]
+    var cn0 = t_n0[4]
+    var cn1 = t_n1[4]
+    var cnz = sqrt_f(max_f(dsl.f32(1.0) - fma_f(cn0, cn0, cn1 * cn1), 0.0))
     var luma_w = dsl.vec3_const(0.2126, 0.7152, 0.0722)
     var cl = dot(c_rgb, luma_w)
     var std_c = sqrt_f(max_f(c_var, 0.0))
@@ -451,40 +482,21 @@ def sota_ml_atrous_shader(
         var b = fma_f(f4, dsl.f32(w.w1(level, j, 4)), dsl.f32(w.b1(level, j)))
         base.append(fma_f(c_inv_len, dsl.f32(w.w1(level, j, 5)), b))
 
-    var sum_rgb = dsl.var_vec3(dsl.vec3_const(0.0, 0.0, 0.0))
-    var sum_var = dsl.var_f32_const(0.0)
-    var sum_w = dsl.var_f32_const(0.0)
-    dsl.if_then(cz.gt(1e5))
-    sum_rgb.set(c_rgb)
-    sum_var.set(c_var)
-    sum_w.set(dsl.f32(1.0))
-    dsl.else_branch()
+    var acc_r = dsl.f32(0.0)
+    var acc_g = dsl.f32(0.0)
+    var acc_b = dsl.f32(0.0)
+    var acc_v = dsl.f32(0.0)
+    var acc_w = dsl.f32(0.0)
     var kw1 = [Float32(0.25), Float32(0.5), Float32(0.25)]
     for ky in range(-1, 2):
         for kx in range(-1, 2):
-            var sx = px
-            if kx < 0:
-                sx = select_u(px.ge(step_u), px - step_u, dsl.u32(0))
-            elif kx > 0:
-                sx = min_u(w_u - 1, px + step_u)
-            var sy = py
-            if ky < 0:
-                sy = select_u(py.ge(step_u), py - step_u, dsl.u32(0))
-            elif ky > 0:
-                sy = min_u(h_u - 1, py + step_u)
-            var npix = sy * w_u + sx
-            var n0 = _unpack2(dsl, b_hist.load_u32(src_off + npix * dsl.u32(2)))
-            var n1 = _unpack2(dsl, b_hist.load_u32(src_off + npix * dsl.u32(2) + 1))
-            var n_rgb = GpuVec3(n0[0], n0[1], n1[0])
-            var n_var = n1[1]
-            var ng = g_off + npix * dsl.u32(3)
-            var nz_l = b_hist.load_f32(ng)
-            var nn2 = _unpack2(dsl, b_hist.load_u32(ng + 1))
-            var nnz = sqrt_f(max_f(dsl.f32(1.0) - fma_f(nn2[0], nn2[0], nn2[1] * nn2[1]), 0.0))
-            var ndot = fma_f(cn2[0], nn2[0], fma_f(cn2[1], nn2[1], cnz * nnz))
+            var ti = (ky + 1) * 3 + kx + 1
+            var n_rgb = t_rgb[ti]
+            var nnz = sqrt_f(max_f(dsl.f32(1.0) - fma_f(t_n0[ti], t_n0[ti], t_n1[ti] * t_n1[ti]), 0.0))
+            var ndot = fma_f(cn0, t_n0[ti], fma_f(cn1, t_n1[ti], cnz * nnz))
             var nl = dot(n_rgb, luma_w)
             var dl_raw = abs_f(cl - nl)
-            var dz = abs_f(cz - nz_l) / dz_den
+            var dz = abs_f(cz - t_z[ti]) / dz_den
             var kw = kw1[ky + 1] * kw1[kx + 1]
             var w_tap: GpuF32
             if analytic:
@@ -510,19 +522,37 @@ def sota_ml_atrous_shader(
                     o = fma_f(max_f(pre, 0.0), dsl.f32(w.w2(level, j)), o)
                 var sig = dsl.f32(1.0) / (dsl.f32(1.0) + exp2_f(o * -1.442695))
                 w_tap = sig * kw
-            var acc = sum_rgb.get()
-            sum_rgb.set(GpuVec3(fma_f(n_rgb.x(), w_tap, acc.x()), fma_f(n_rgb.y(), w_tap, acc.y()), fma_f(n_rgb.z(), w_tap, acc.z())))
-            sum_var.set(fma_f(n_var, w_tap * w_tap, sum_var.get()))
-            sum_w.set(sum_w.get() + w_tap)
-    dsl.end_if()
+            acc_r = fma_f(n_rgb.x(), w_tap, acc_r)
+            acc_g = fma_f(n_rgb.y(), w_tap, acc_g)
+            acc_b = fma_f(n_rgb.z(), w_tap, acc_b)
+            acc_v = fma_f(t_var[ti], w_tap * w_tap, acc_v)
+            acc_w = acc_w + w_tap
+    var inv_sw = dsl.f32(1.0) / max_f(acc_w, 1e-5)
+    var sky = cz.gt(1e5)
+    var f_rgb = GpuVec3(
+        select_f(sky, c_rgb.x(), acc_r * inv_sw), select_f(sky, c_rgb.y(), acc_g * inv_sw), select_f(sky, c_rgb.z(), acc_b * inv_sw)
+    )
+    var f_var = select_f(sky, c_var, acc_v * (inv_sw * inv_sw))
+    return (f_rgb, f_var)
 
-    var inv_sw = dsl.f32(1.0) / max_f(sum_w.get(), 1e-5)
-    var f_rgb = sum_rgb.get() * inv_sw
-    var f_var = sum_var.get() * (inv_sw * inv_sw)
+
+def _level_store(
+    mut dsl: ShaderDsl,
+    b_hdr: BufferRef[8],
+    b_hist: BufferRef[1],
+    b_post: BufferRef[1],
+    pix: GpuU32,
+    dst_off: GpuU32,
+    final_pass: GpuBool,
+    capture: GpuBool,
+    d_off: GpuU32,
+    f_rgb: GpuVec3,
+    f_var: GpuF32,
+):
+    """Packed f16 level output; the final level also remodulates into HDR_OUT (and captures D)."""
     var d_base = dst_off + pix * dsl.u32(2)
     b_hist.store_u32(d_base, _pack2(dsl, f_rgb.x(), f_rgb.y()))
     b_hist.store_u32(d_base + 1, _pack2(dsl, f_rgb.z(), f_var))
-
     dsl.if_then(final_pass)
     var c_base = b_hdr.base_word(pix)
     var p_base = dsl.u32(UInt32(SOTA_ML_POST_BASE)) + c_base
@@ -538,6 +568,159 @@ def sota_ml_atrous_shader(
     b_hist.store_u32(dd + 2, _pack2(dsl, alb.y(), alb.z()))
     dsl.end_if()
     dsl.end_if()
+
+
+def sota_ml_atrous_shader(
+    w: SotaMlWeights, level: Int, analytic: Bool, sigma_luma: Float32 = 0.65, group_w: Int = SOTA_ML_GROUP_W, group_h: Int = SOTA_ML_GROUP_H
+) -> List[UInt32]:
+    """One dilated 3x3 level with learned (or, `analytic`, SVGF) tap weights baked in as constants.
+    Push: 0 w, 1 h, 2 step, 3 src offset, 4 dst offset, 5 G offset, 6 final (remodulate into HDR_OUT),
+    7 capture (final pass also stores crisp + albedo as f16 at push 8 = D offset)."""
+    var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=group_w, group_height=group_h, push_words=AAA_PUSH_WORDS)
+    var b_hdr = dsl.buffer[8](BIND_AAA_HDR_OUT)
+    var b_hist = dsl.buffer[1](BIND_AAA_HISTORY)
+    var b_post = dsl.buffer[1](BIND_AAA_POST_SCRATCH)
+    var px = dsl.global_id_x()
+    var py = dsl.global_id_y()
+    var w_u = dsl.push_u32(0)
+    var h_u = dsl.push_u32(1)
+    var step_u = dsl.push_u32(2)
+    var src_off = dsl.push_u32(3)
+    var dst_off = dsl.push_u32(4)
+    var g_off = dsl.push_u32(5)
+    var final_pass = dsl.push_u32(6).ne(0)
+    var capture = dsl.push_u32(7).ne(0)
+    var d_off = dsl.push_u32(8)
+    dsl.return_if(px.ge(w_u) | py.ge(h_u))
+
+    var t_rgb = List[GpuVec3]()
+    var t_var = List[GpuF32]()
+    var t_z = List[GpuF32]()
+    var t_n0 = List[GpuF32]()
+    var t_n1 = List[GpuF32]()
+    for ky in range(-1, 2):
+        for kx in range(-1, 2):
+            var sx = px
+            if kx < 0:
+                sx = select_u(px.ge(step_u), px - step_u, dsl.u32(0))
+            elif kx > 0:
+                sx = min_u(w_u - 1, px + step_u)
+            var sy = py
+            if ky < 0:
+                sy = select_u(py.ge(step_u), py - step_u, dsl.u32(0))
+            elif ky > 0:
+                sy = min_u(h_u - 1, py + step_u)
+            var npix = sy * w_u + sx
+            var n0 = _unpack2(dsl, b_hist.load_u32(src_off + npix * dsl.u32(2)))
+            var n1 = _unpack2(dsl, b_hist.load_u32(src_off + npix * dsl.u32(2) + 1))
+            t_rgb.append(GpuVec3(n0[0], n0[1], n1[0]))
+            t_var.append(n1[1])
+            var ng = g_off + npix * dsl.u32(3)
+            t_z.append(b_hist.load_f32(ng))
+            var nn2 = _unpack2(dsl, b_hist.load_u32(ng + 1))
+            t_n0.append(nn2[0])
+            t_n1.append(nn2[1])
+    var pix = py * w_u + px
+    var c_inv_len = b_hist.load_f32(g_off + pix * dsl.u32(3) + 2)
+    var f = _level_filter(dsl, w, level, analytic, sigma_luma, c_inv_len, t_rgb, t_var, t_z, t_n0, t_n1)
+    _level_store(dsl, b_hdr, b_hist, b_post, pix, dst_off, final_pass, capture, d_off, f[0], f[1])
+    return dsl.finish()
+
+
+def sota_ml_fused_shader[TW: Int, TH: Int](w: SotaMlWeights, analytic: Bool, sigma_luma: Float32 = 0.65) -> List[UInt32]:
+    """Temporal pass fused with level 0 (step 1) through a `(TW + 2) x (TH + 2)` workgroup tile: every
+    thread reprojects one or two tile cells (the 1-pixel halo is recomputed, never stored), keeps the
+    f16-rounded result in shared memory, and filters its own pixel from there. Same numbers as the
+    separate temporal + level-0 dispatches, without the A round trip and level 0's 9-tap global gathers.
+    Push: 0 w, 1 h, 2 hist_in, 3 hist_out, 4 reset, 5 A offset (written only with capture), 6 G offset,
+    7 max history (f32), 8 dst offset, 9 final, 10 capture, 11 D offset."""
+    comptime CW = TW + 2
+    comptime CELLS = (TW + 2) * (TH + 2)
+    comptime THREADS = TW * TH
+    var dsl = ShaderDsl(MODEL_GL_COMPUTE, group_width=TW, group_height=TH, push_words=AAA_PUSH_WORDS)
+    var b_hdr = dsl.buffer[8](BIND_AAA_HDR_OUT)
+    var b_hist = dsl.buffer[1](BIND_AAA_HISTORY)
+    var b_post = dsl.buffer[1](BIND_AAA_POST_SCRATCH)
+    var sh = dsl.shared_array_f32[CELLS * 8]()
+    var w_u = dsl.push_u32(0)
+    var h_u = dsl.push_u32(1)
+    var hist_in = dsl.push_u32(2)
+    var hist_out = dsl.push_u32(3)
+    var reset = dsl.push_u32(4).ne(0)
+    var a_off = dsl.push_u32(5)
+    var g_off = dsl.push_u32(6)
+    var max_len = dsl.push_f32(7)
+    var dst_off = dsl.push_u32(8)
+    var final_pass = dsl.push_u32(9).ne(0)
+    var capture = dsl.push_u32(10).ne(0)
+    var d_off = dsl.push_u32(11)
+    var lx = GpuU32(dsl.mod_addr, dsl.raw_module()[].local_axis(0))
+    var ly = GpuU32(dsl.mod_addr, dsl.raw_module()[].local_axis(1))
+    var gx0 = GpuU32(dsl.mod_addr, dsl.raw_module()[].workgroup_axis(0)) * UInt32(TW)
+    var gy0 = GpuU32(dsl.mod_addr, dsl.raw_module()[].workgroup_axis(1)) * UInt32(TH)
+    var lid = ly * UInt32(TW) + lx
+
+    # Phase 1: temporal pass for every tile cell (own pixels store their history, G and optional A)
+    for it in range((CELLS + THREADS - 1) // THREADS):
+        var c = lid + UInt32(it * THREADS)
+        var partial = (it + 1) * THREADS > CELLS
+        if partial:
+            dsl.if_then(c.lt(dsl.u32(UInt32(CELLS))))
+        var cx = c % UInt32(CW)
+        var cy = c // UInt32(CW)
+        var rx = gx0 + cx
+        var ry = gy0 + cy
+        var gx = select_u(rx.ge(dsl.u32(1)), min_u(rx - 1, w_u - 1), dsl.u32(0))
+        var gy = select_u(ry.ge(dsl.u32(1)), min_u(ry - 1, h_u - 1), dsl.u32(0))
+        var t = _temporal_eval(dsl, b_hdr, b_hist, gx, gy, w_u, h_u, hist_in, reset, max_len)
+        var own = cx.ge(dsl.u32(1)) & cx.lt(dsl.u32(UInt32(TW + 1))) & cy.ge(dsl.u32(1)) & cy.lt(dsl.u32(UInt32(TH + 1)))
+        own = own & (rx - 1).lt(w_u) & (ry - 1).lt(h_u)
+        dsl.if_then(own)
+        var pix = gy * w_u + gx
+        _temporal_store(dsl, b_hist, pix, hist_out, g_off, t)
+        dsl.if_then(capture)
+        _store_a(dsl, b_hist, pix, a_off, t)
+        dsl.end_if()
+        dsl.end_if()
+        # f16 rounding exactly as the A / G round trip of the unfused path
+        var r0 = _unpack2(dsl, _pack2(dsl, t.rgb.x(), t.rgb.y()))
+        var r1 = _unpack2(dsl, _pack2(dsl, t.rgb.z(), t.var_l))
+        var nn = _unpack2(dsl, _pack2(dsl, t.nx, t.ny))
+        var sb = c * UInt32(8)
+        sh.store(sb, r0[0])
+        sh.store(sb + 1, r0[1])
+        sh.store(sb + 2, r1[0])
+        sh.store(sb + 3, r1[1])
+        sh.store(sb + 4, t.z)
+        sh.store(sb + 5, nn[0])
+        sh.store(sb + 6, nn[1])
+        sh.store(sb + 7, dsl.f32(1.0) / t.len)
+        if partial:
+            dsl.end_if()
+    dsl.workgroup_barrier()
+
+    # Phase 2: level 0 (step 1) for the thread's own pixel, taps from shared memory
+    var px = gx0 + lx
+    var py = gy0 + ly
+    dsl.if_then(px.lt(w_u) & py.lt(h_u))
+    var t_rgb = List[GpuVec3]()
+    var t_var = List[GpuF32]()
+    var t_z = List[GpuF32]()
+    var t_n0 = List[GpuF32]()
+    var t_n1 = List[GpuF32]()
+    for ky in range(-1, 2):
+        for kx in range(-1, 2):
+            var cell = (ly + UInt32(1 + ky)) * UInt32(CW) + lx + UInt32(1 + kx)
+            var sb = cell * UInt32(8)
+            t_rgb.append(GpuVec3(sh.load(sb), sh.load(sb + 1), sh.load(sb + 2)))
+            t_var.append(sh.load(sb + 3))
+            t_z.append(sh.load(sb + 4))
+            t_n0.append(sh.load(sb + 5))
+            t_n1.append(sh.load(sb + 6))
+    var c_inv_len = sh.load(((ly + 1) * UInt32(CW) + lx + 1) * UInt32(8) + 7)
+    var f = _level_filter(dsl, w, 0, analytic, sigma_luma, c_inv_len, t_rgb, t_var, t_z, t_n0, t_n1)
+    _level_store(dsl, b_hdr, b_hist, b_post, py * w_u + px, dst_off, final_pass, capture, d_off, f[0], f[1])
+    dsl.end_if()
     return dsl.finish()
 
 
@@ -549,25 +732,34 @@ def sota_ml_atrous_shader(
 struct SotaMlDenoiser(Movable):
     """Renderer settings and GPU state of the learned denoiser (`FlintAaaVulkanRenderer.sota_ml`).
 
-    - `enabled` (default True; `FLINT_SOTA_ML_DENOISE=0` turns it off at start): use the learned path
-      whenever weights load; otherwise the renderer runs SVGF unchanged.
+    - `enabled` (default False, opt-in: the app sets it, or `FLINT_SOTA_ML_DENOISE=1` at start): use the
+      learned path when weights load and the GI mode is in `gi_modes`; otherwise the renderer runs SVGF
+      unchanged. Weights on disk alone never change the image, so tests and labs stay deterministic.
+    - `gi_modes` (default `SOTA_ML_GI_MODES_DEFAULT`): bit `1 << mode` per `sota_gi` mode the learned
+      path may take over. The default is the noisy per-pixel modes it was trained on (legacy surface
+      cache and the real-time path tracer); world-cache-only and hybrid GI keep SVGF (see the notes).
     - `mode`: `SOTA_ML_MODE_LEARNED` (default) or `SOTA_ML_MODE_ANALYTIC` (SVGF weights inside this
       path; for ablations and for GPU tests on machines without weights).
     - `weights_path`: `.flmlw` file (default from `sota_ml_default_weights_path()`).
     - `max_history` (default 32): temporal accumulation cap in frames.
     - `capture` (default False): keep the remodulation terms in scratch D for training-data dumps.
+    - `fused` (default True; `FLINT_SOTA_ML_FUSED=0` turns it off at start): run the temporal pass and
+      level 0 as one shared-memory-tiled dispatch (`sota_ml_fused_shader`); same output.
     """
     var enabled: Bool
     var mode: Int
     var weights_path: String
     var max_history: Float32
     var capture: Bool
+    var fused: Bool
+    var gi_modes: Int
     var group_w: Int
     var group_h: Int
     var weights: SotaMlWeights
     var weights_tried: Bool
     var weights_version: Int
     var pipe_temporal: Int
+    var pipe_fused: Int
     var pipes_level: List[Int]
     var built_mode: Int
     var built_version: Int
@@ -579,17 +771,20 @@ struct SotaMlDenoiser(Movable):
     var status: String
 
     def __init__(out self):
-        self.enabled = env_now("FLINT_SOTA_ML_DENOISE") != "0"
+        self.enabled = env_now("FLINT_SOTA_ML_DENOISE") == "1"
         self.mode = SOTA_ML_MODE_LEARNED
         self.weights_path = sota_ml_default_weights_path()
         self.max_history = Float32(32.0)
         self.capture = False
+        self.fused = env_now("FLINT_SOTA_ML_FUSED") != "0"
+        self.gi_modes = SOTA_ML_GI_MODES_DEFAULT
         self.group_w = SOTA_ML_GROUP_W
         self.group_h = SOTA_ML_GROUP_H
         self.weights = SotaMlWeights()
         self.weights_tried = False
         self.weights_version = 0
         self.pipe_temporal = 0
+        self.pipe_fused = 0
         self.pipes_level = List[Int]()
         self.built_mode = -1
         self.built_version = -1
@@ -657,6 +852,9 @@ struct SotaMlDenoiser(Movable):
         if self.pipe_temporal != 0:
             vk.destroy_pipeline(self.pipe_temporal)
             self.pipe_temporal = 0
+        if self.pipe_fused != 0:
+            vk.destroy_pipeline(self.pipe_fused)
+            self.pipe_fused = 0
         for i in range(len(self.pipes_level)):
             if self.pipes_level[i] != 0:
                 vk.destroy_pipeline(self.pipes_level[i])
@@ -664,9 +862,12 @@ struct SotaMlDenoiser(Movable):
         self.built_mode = -1
         self.built_version = -1
 
-    def ready(mut self, mut vk: VulkanGpu, pipe_layout: Int) -> Bool:
-        """True when this frame should take the learned path (weights present and pipelines built)."""
+    def ready(mut self, mut vk: VulkanGpu, pipe_layout: Int, gi_mode: Int = 0) -> Bool:
+        """True when this frame should take the learned path (enabled, GI mode allowed, weights present,
+        pipelines built)."""
         if not self.enabled or self.scratch_base < 0 or self.scratch_max_pix <= 0:
+            return False
+        if gi_mode < 0 or gi_mode > 30 or ((self.gi_modes >> gi_mode) & 1) == 0:
             return False
         if self.mode == SOTA_ML_MODE_LEARNED:
             self._try_load()
@@ -677,11 +878,14 @@ struct SotaMlDenoiser(Movable):
             self._destroy_pipes(vk)
             self.pipe_temporal = vk.create_aaa_compute_pipeline(pipe_layout, sota_ml_temporal_shader(self.group_w, self.group_h))
             var analytic = self.mode == SOTA_ML_MODE_ANALYTIC
+            self.pipe_fused = vk.create_aaa_compute_pipeline(
+                pipe_layout, sota_ml_fused_shader[SOTA_ML_TILE_W, SOTA_ML_TILE_H](self.weights, analytic, 0.65)
+            )
             for k in range(self.levels()):
                 self.pipes_level.append(vk.create_aaa_compute_pipeline(pipe_layout, sota_ml_atrous_shader(self.weights, k, analytic, 0.65, self.group_w, self.group_h)))
             self.built_mode = self.mode
             self.built_version = ver
-            var ok = self.pipe_temporal != 0
+            var ok = self.pipe_temporal != 0 and self.pipe_fused != 0
             for p in self.pipes_level:
                 ok = ok and p != 0
             if not ok:
@@ -696,6 +900,31 @@ struct SotaMlDenoiser(Movable):
         var gx = (w + self.group_w - 1) // self.group_w
         var gy = (h + self.group_h - 1) // self.group_h
         var hist = self.history_offsets()
+        var n = len(self.pipes_level)
+        if self.fused:
+            var push_f = List[UInt32](length=16, fill=0)
+            push_f[0] = UInt32(w)
+            push_f[1] = UInt32(h)
+            push_f[2] = UInt32(hist[0])
+            push_f[3] = UInt32(hist[1])
+            push_f[4] = UInt32(1) if self.valid_frames == 0 else UInt32(0)
+            push_f[5] = UInt32(self.a_offset())
+            push_f[6] = UInt32(self.g_offset())
+            push_f[7] = bitcast[DType.uint32](self.max_history)
+            push_f[8] = UInt32(self.b_offset())
+            push_f[9] = UInt32(1) if n == 1 else UInt32(0)
+            push_f[10] = UInt32(1) if self.capture else UInt32(0)
+            push_f[11] = UInt32(self.d_offset())
+            vk.dispatch_aaa(
+                slot, self.pipe_fused, pipe_layout, desc_set, push_f, (w + SOTA_ML_TILE_W - 1) // SOTA_ML_TILE_W, (h + SOTA_ML_TILE_H - 1) // SOTA_ML_TILE_H
+            )
+            vk.memory_barrier2(slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE))
+            for k in range(1, n):
+                self._record_level(vk, slot, pipe_layout, desc_set, w, h, k, n, gx, gy)
+            self.parity += 1
+            self.valid_frames += 1
+            self.ran_last_frame = True
+            return
         var push_t = List[UInt32](length=16, fill=0)
         push_t[0] = UInt32(w)
         push_t[1] = UInt32(h)
@@ -707,25 +936,27 @@ struct SotaMlDenoiser(Movable):
         push_t[7] = bitcast[DType.uint32](self.max_history)
         vk.dispatch_aaa(slot, self.pipe_temporal, pipe_layout, desc_set, push_t, gx, gy)
         vk.memory_barrier2(slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE))
-        var n = len(self.pipes_level)
         for k in range(n):
-            var src = self.a_offset() if k == 0 else (self.b_offset() if ((k - 1) & 1) == 0 else self.c_offset())
-            var dst = self.b_offset() if (k & 1) == 0 else self.c_offset()
-            var push_a = List[UInt32](length=16, fill=0)
-            push_a[0] = UInt32(w)
-            push_a[1] = UInt32(h)
-            push_a[2] = UInt32(1 << k)
-            push_a[3] = UInt32(src)
-            push_a[4] = UInt32(dst)
-            push_a[5] = UInt32(self.g_offset())
-            push_a[6] = UInt32(1) if k + 1 == n else UInt32(0)
-            push_a[7] = UInt32(1) if self.capture else UInt32(0)
-            push_a[8] = UInt32(self.d_offset())
-            vk.dispatch_aaa(slot, self.pipes_level[k], pipe_layout, desc_set, push_a, gx, gy)
-            vk.memory_barrier2(slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE))
+            self._record_level(vk, slot, pipe_layout, desc_set, w, h, k, n, gx, gy)
         self.parity += 1
         self.valid_frames += 1
         self.ran_last_frame = True
+
+    def _record_level(mut self, mut vk: VulkanGpu, slot: Int, pipe_layout: Int, desc_set: Int, w: Int, h: Int, k: Int, n: Int, gx: Int, gy: Int):
+        var src = self.a_offset() if k == 0 else (self.b_offset() if ((k - 1) & 1) == 0 else self.c_offset())
+        var dst = self.b_offset() if (k & 1) == 0 else self.c_offset()
+        var push_a = List[UInt32](length=16, fill=0)
+        push_a[0] = UInt32(w)
+        push_a[1] = UInt32(h)
+        push_a[2] = UInt32(1 << k)
+        push_a[3] = UInt32(src)
+        push_a[4] = UInt32(dst)
+        push_a[5] = UInt32(self.g_offset())
+        push_a[6] = UInt32(1) if k + 1 == n else UInt32(0)
+        push_a[7] = UInt32(1) if self.capture else UInt32(0)
+        push_a[8] = UInt32(self.d_offset())
+        vk.dispatch_aaa(slot, self.pipes_level[k], pipe_layout, desc_set, push_a, gx, gy)
+        vk.memory_barrier2(slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE))
 
     def skipped(mut self):
         """Called on frames where the path did not run, so the next run starts a fresh history."""
