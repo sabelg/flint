@@ -333,6 +333,7 @@ from flint.render.aaa_rt_shadow import (
 )
 # --- sota:ml hook ---
 from flint.render.sota_ml_denoise import SotaMlDenoiser
+from flint.render.sota_ml_upscale import SotaMlUpscaler
 # --- end sota:ml hook ---
 from flint.render.aaa_post_tsr import (
     AAA_DISPLAY_AGX_REC709,
@@ -761,7 +762,8 @@ struct FlintAaaVulkanRenderer(Movable):
     var scene_time_sec: Float32
     var enable_spec_reblur: Bool
     # --- sota:ml hook ---
-    var sota_ml: SotaMlDenoiser  # learned GI denoiser; replaces SVGF only when weights load (`sota_ml_denoise.mojo`)
+    var sota_ml: SotaMlDenoiser  # learned GI denoiser; opt-in (`enabled`), replaces SVGF when weights load (`sota_ml_denoise.mojo`)
+    var sota_ml_up: SotaMlUpscaler  # learned TSR resolve; opt-in (`enabled`), TSR v3 fallback (`sota_ml_upscale.mojo`)
     # --- end sota:ml hook ---
     var spec_reblur_passes: Int
     var spec_reblur_valid_frames: Int
@@ -1091,6 +1093,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # --- sota:ml hook ---
         self.sota_ml = SotaMlDenoiser()
+        self.sota_ml_up = SotaMlUpscaler()
         # --- end sota:ml hook ---
         self.active = self._init_vulkan_pipeline()
 
@@ -4823,8 +4826,8 @@ struct FlintAaaVulkanRenderer(Movable):
         self.sota_gi.end_frame(sota_mode)
         # --- end sota:gi hook ---
 
-        # --- sota:ml hook --- learned denoiser replaces SVGF when its weights are present
-        var run_sota_ml = run_svgf and self.sota_ml.ready(self.vk, self.pipe_layout)
+        # --- sota:ml hook --- opt-in learned denoiser replaces SVGF (weights present, GI mode allowed)
+        var run_sota_ml = run_svgf and self.sota_ml.ready(self.vk, self.pipe_layout, self.sota_gi.mode)
         if run_sota_ml:
             var q_ml = next_q
             if use_prof and q_ml + 1 < q_limit:
@@ -5189,11 +5192,15 @@ struct FlintAaaVulkanRenderer(Movable):
             )
 
         # `FlintTSR v3` Pre-Bloom Temporal Upscale & 16-Phase Halton Anti-Aliasing (`render_w x render_h -> output_w x output_h`)!
+        # --- sota:ml hook --- learned resolve (same bindings and push layout as TSR v3)
+        var use_ml_up = self.sota_ml_up.ready(self.vk, self.pipe_layout, self.render_w < self.output_w)
+        self.sota_ml_up.record_capture(self.vk, cur_slot, self.buf_hdr_out, max_pix, self.render_w, self.render_h)
+        # --- end sota:ml hook ---
         var q_tsr = next_q
         if use_prof and q_tsr + 1 < q_limit:
             self.vk.write_timestamp(cur_slot, q_tsr, PIPELINE_BOTTOM)
             next_q += 2
-            prof_pairs.append((String("FlintTsrV3Resolve"), q_tsr))
+            prof_pairs.append((String("SotaMlUpscale") if use_ml_up else String("FlintTsrV3Resolve"), q_tsr))  # sota:ml
         var ping_off = max_pix * 16
         var pong_off = max_pix * 20
         var out_ldr_off = max_pix * 24
@@ -5213,7 +5220,7 @@ struct FlintAaaVulkanRenderer(Movable):
         push_tsr[8] = bitcast[DType.uint32](self.tsr_sharpness)
         self.vk.dispatch_aaa(
             cur_slot,
-            self.pipe_tsr_v3_resolve,
+            self.sota_ml_up.pipe if use_ml_up else self.pipe_tsr_v3_resolve,  # sota:ml
             self.pipe_layout,
             self.desc_set,
             push_tsr,
@@ -5882,6 +5889,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_pipeline(self.pipe_deferred_shade)
         self.vk.destroy_pipeline(self.pipe_svgf_reproject)
         self.sota_ml.destroy(self.vk)  # sota:ml hook
+        self.sota_ml_up.destroy(self.vk)  # sota:ml hook
         self.vk.destroy_pipeline(self.pipe_svgf_atrous)
         if self.sota_gi.pipe_wrc != 0:  # --- sota:gi hook ---
             self.vk.destroy_pipeline(self.sota_gi.pipe_wrc)

@@ -3,32 +3,48 @@
 Passes with or without trained weights on the machine:
   1. CPU: `.flmlw` round trip and rejection of bad blobs; the CPU cascade keeps a constant image,
      passes sky pixels through, and does not blur across a depth step.
-  2. SPIR-V: temporal and a-trous shaders (learned with synthetic weights, analytic) validate.
+  2. SPIR-V: temporal, a-trous and fused temporal + level-0 tile shaders (learned with synthetic
+     weights, analytic) validate.
   3. GPU (ray-query hardware only): with no weights the renderer runs SVGF bit-for-bit as before
      (clean fallback); the learned path with synthetic weights and the analytic path match the CPU
-     cascade; the analytic path beats the shipping SVGF against the renderer's 256-spp reference
+     cascade, both through the fused tile and the separate passes; the analytic path beats the shipping SVGF against the renderer's 256-spp reference
      (PSNR, SSIM, FLIP) on the Cornell box; pass-time budgets at 960x540 (absolute) and 1080p
      (relative to SVGF on alternating frames, since the GPU is shared with the desktop).
   4. When trained weights are installed (`FLINT_SOTA_ML_WEIGHTS` or the default path), the learned
      path must beat both SVGF and the analytic weights on the held-out Cornell scene.
 """
 from std.ffi import external_call
+from std.os import getenv
 from std.math import abs, max, min
+from std.memory import bitcast
 from flint.core.math import Vec3
+from flint.platform.vulkan import get32
 from flint.platform.os import file_size
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.render.spirv_validate import validate_spirv_module
 from flint.render.sota_ml_denoise import (
     SOTA_ML_MODE_ANALYTIC,
     SOTA_ML_MODE_LEARNED,
+    SOTA_ML_TILE_H,
+    SOTA_ML_TILE_W,
     SotaMlWeights,
     sota_ml_atrous_shader,
     sota_ml_default_weights_path,
     sota_ml_f16,
     sota_ml_filter_cpu,
+    sota_ml_fused_shader,
     sota_ml_parse_weights,
     sota_ml_serialize_weights,
     sota_ml_temporal_shader,
+)
+from flint.render.sota_ml_upscale import (
+    SotaMlUpFrame,
+    SotaMlUpWeights,
+    sota_ml_up_default_weights_path,
+    sota_ml_up_parse_weights,
+    sota_ml_up_serialize_weights,
+    sota_ml_upscale_cpu_pixel,
+    sota_ml_upscale_shader,
 )
 from flint.render.sota_ml_eval import (
     SOTA_ML_SCENE_CORNELL,
@@ -136,11 +152,14 @@ def test_spirv_shaders():
     shaders.append(sota_ml_atrous_shader(w, 0, False))
     shaders.append(sota_ml_atrous_shader(w, 3, False))
     shaders.append(sota_ml_atrous_shader(w, 1, True))
+    shaders.append(sota_ml_fused_shader[SOTA_ML_TILE_W, SOTA_ML_TILE_H](w, False))
+    shaders.append(sota_ml_fused_shader[SOTA_ML_TILE_W, SOTA_ML_TILE_H](w, True))
+    shaders.append(sota_ml_fused_shader[32, 8](w, False))
     for i in range(len(shaders)):
         var rep = validate_spirv_module(shaders[i])
         if not rep.valid:
             _fail("sota:ml shader " + String(i) + " SPIR-V invalid: " + rep.errors[0])
-    print("  [PASS] sota:ml temporal + learned/analytic a-trous SPIR-V validates")
+    print("  [PASS] sota:ml temporal, learned/analytic a-trous and fused tile SPIR-V validate")
 
 
 def _gpu_vs_cpu(ren: FlintAaaVulkanRenderer, analytic: Bool) -> Float32:
@@ -189,6 +208,7 @@ def test_gpu_fallback_equivalence_and_quality() raises:
     var r_off = FlintAaaVulkanRenderer(width=W, height=H)
     r_off.gi_rays_per_pixel = 1
     var sc_r_off = sota_ml_build_scene(r_off, SOTA_ML_SCENE_CORNELL, 0)
+    _assert(not r_off.sota_ml.enabled or getenv("FLINT_SOTA_ML_DENOISE") == "1", "learned path is opt-in (off by default)")
     r_off.sota_ml.enabled = False
     var ms_svgf = _run_sequence(r_off, sc_r_off, frames, motion)
     var q_svgf = _quality(r_off, sc_r_off, frames, motion)
@@ -197,6 +217,7 @@ def test_gpu_fallback_equivalence_and_quality() raises:
     var r_fb = FlintAaaVulkanRenderer(width=W, height=H)
     r_fb.gi_rays_per_pixel = 1
     var sc_r_fb = sota_ml_build_scene(r_fb, SOTA_ML_SCENE_CORNELL, 0)
+    r_fb.sota_ml.enabled = True
     r_fb.sota_ml.weights_path = String("/nonexistent/sota_ml_denoise.flmlw")
     var ms_fb = _run_sequence(r_fb, sc_r_fb, frames, motion)
     _assert(not r_fb.sota_ml.ran_last_frame and not r_fb.sota_ml.has_weights(), "no weights -> learned path stays off")
@@ -214,7 +235,9 @@ def test_gpu_fallback_equivalence_and_quality() raises:
     var r_an = FlintAaaVulkanRenderer(width=W, height=H)
     r_an.gi_rays_per_pixel = 1
     var sc_r_an = sota_ml_build_scene(r_an, SOTA_ML_SCENE_CORNELL, 0)
+    r_an.sota_ml.enabled = True
     r_an.sota_ml.mode = SOTA_ML_MODE_ANALYTIC
+    r_an.sota_ml.capture = True
     var ms_an = _run_sequence(r_an, sc_r_an, frames, motion)
     _assert(r_an.sota_ml.ran_last_frame, "analytic path runs in the live frame")
     var d_an = _gpu_vs_cpu(r_an, True)
@@ -229,11 +252,23 @@ def test_gpu_fallback_equivalence_and_quality() raises:
     var r_sy = FlintAaaVulkanRenderer(width=W, height=H)
     r_sy.gi_rays_per_pixel = 1
     var sc_r_sy = sota_ml_build_scene(r_sy, SOTA_ML_SCENE_CORNELL, 0)
+    r_sy.sota_ml.enabled = True
     r_sy.sota_ml.set_weights(_synthetic_weights(4, 12, 11))
+    r_sy.sota_ml.capture = True
+    r_sy.sota_ml.fused = True
     _ = _run_sequence(r_sy, sc_r_sy, 6, motion)
     _assert(r_sy.sota_ml.ran_last_frame, "learned path runs with injected weights")
     var d_sy = _gpu_vs_cpu(r_sy, False)
-    _assert(d_sy < Float32(5e-3), "learned GPU cascade matches CPU (max rel " + String(d_sy) + ")")
+    _assert(d_sy < Float32(5e-3), "learned GPU cascade (fused tile) matches CPU (max rel " + String(d_sy) + ")")
+    # unfused temporal + level 0 must give the same numbers
+    r_sy.sota_ml.fused = False
+    _ = _run_sequence(r_sy, sc_r_sy, 3, motion)
+    var d_sy2 = _gpu_vs_cpu(r_sy, False)
+    _assert(d_sy2 < Float32(5e-3), "learned GPU cascade (separate passes) matches CPU (max rel " + String(d_sy2) + ")")
+    # GI-mode gate: on by default only for the legacy and 1-spp path-traced inputs (it regresses the
+    # already-smooth world-cache-only and hybrid modes), so `ready` refuses modes 1 and 2.
+    _assert(r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 0) and r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 3), "learned path allowed for legacy and path-traced GI")
+    _assert(not r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 1) and not r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 2), "learned path gated off for world-cache-only and hybrid GI")
     r_sy.shutdown()
 
     print(
@@ -249,6 +284,8 @@ def test_gpu_fallback_equivalence_and_quality() raises:
         var r_ln = FlintAaaVulkanRenderer(width=W, height=H)
         r_ln.gi_rays_per_pixel = 1
         var sc_r_ln = sota_ml_build_scene(r_ln, SOTA_ML_SCENE_CORNELL, 0)
+        r_ln.sota_ml.capture = True
+        r_ln.sota_ml.enabled = True
         _ = _run_sequence(r_ln, sc_r_ln, frames, motion)
         _assert(r_ln.sota_ml.ran_last_frame, "trained weights load: " + r_ln.sota_ml.status)
         var d_ln = _gpu_vs_cpu(r_ln, False)
@@ -307,10 +344,155 @@ def test_gpu_perf_budget() raises:
     )
 
 
+def _synthetic_up_weights(hidden: Int, seed: UInt32) -> SotaMlUpWeights:
+    var w = SotaMlUpWeights(hidden)
+    var s = seed
+    for i in range(len(w.data)):
+        s = s * UInt32(1664525) + UInt32(1013904223)
+        w.data[i] = (Float32(s >> 8) / Float32(16777216.0) - Float32(0.5)) * Float32(2.0)
+    return w^
+
+
+def test_upscale_cpu_and_spirv():
+    var w = _synthetic_up_weights(8, 21)
+    var back = sota_ml_up_parse_weights(sota_ml_up_serialize_weights(w))
+    _assert(back.valid() and back.hidden == 8 and len(back.data) == len(w.data), "upscaler weights round trip")
+    for i in range(len(w.data)):
+        _assert(back.data[i] == w.data[i], "upscaler weights round trip value")
+    _assert(not sota_ml_up_parse_weights(List[UInt8](length=12, fill=0)).valid(), "truncated upscaler blob rejected")
+    var rep = validate_spirv_module(sota_ml_upscale_shader(w))
+    if not rep.valid:
+        _fail("sota:ml upscale SPIR-V invalid: " + rep.errors[0])
+    print("  [PASS] sota:ml upscaler weights blob + SPIR-V validate")
+
+
+def _up_pass_names(ren: FlintAaaVulkanRenderer) -> Tuple[Bool, Bool]:
+    var tsr = False
+    var ml = False
+    for t in ren.get_gpu_pass_timings():
+        tsr = tsr or t.pass_name == "FlintTsrV3Resolve"
+        ml = ml or t.pass_name == "SotaMlUpscale"
+    return (tsr, ml)
+
+
+def _up_gpu_vs_cpu(ren: FlintAaaVulkanRenderer) -> Float32:
+    """Last frame's learned resolve (history out) against the CPU reference on its captured inputs."""
+    var fr = SotaMlUpFrame(ren.render_w, ren.render_h, ren.output_w, ren.output_h)
+    var cap = ren.sota_ml_up.cap_buf.cpu_address
+    for i in range(len(fr.hdr)):
+        fr.hdr[i] = bitcast[DType.float32](get32(cap + i * 4))
+    var max_pix = max(ren.output_w * ren.output_h, ren.render_w * ren.render_h)
+    var last = ren.frame_index - 1
+    var hist_in = max_pix * 16 if (last & 1) == 0 else max_pix * 20
+    var hist_out = max_pix * 20 if (last & 1) == 0 else max_pix * 16
+    var hb = ren.buf_history.cpu_address
+    for i in range(len(fr.hist)):
+        fr.hist[i] = bitcast[DType.float32](get32(hb + (hist_in + i) * 4))
+    var g = ren.buf_globals.cpu_address
+    fr.jx = bitcast[DType.float32](get32(g + 151 * 4))
+    fr.jy = bitcast[DType.float32](get32(g + 152 * 4))
+    fr.sharp = ren.tsr_sharpness
+    fr.hist_on = ren.tsr_history_weight > Float32(0.001)
+    var maxd = Float32(0.0)
+    var y = 1
+    while y < ren.output_h - 1:
+        var x = 1
+        while x < ren.output_w - 1:
+            var c = sota_ml_upscale_cpu_pixel(ren.sota_ml_up.weights, fr, x, y)
+            var o = (hist_out + (y * ren.output_w + x) * 4) * 4
+            var gr = [bitcast[DType.float32](get32(hb + o)), bitcast[DType.float32](get32(hb + o + 4)), bitcast[DType.float32](get32(hb + o + 8))]
+            var cr = [c[0], c[1], c[2]]
+            for k in range(3):
+                maxd = max(maxd, abs(gr[k] - cr[k]) / (abs(cr[k]) + Float32(0.02)))
+            x += 3
+        y += 3
+    return maxd
+
+
+def _up_run(mut ren: FlintAaaVulkanRenderer, scene: SotaMlScene, frames: Int, motion: Float32) -> List[Float64]:
+    var ms = List[Float64]()
+    for f in range(frames):
+        sota_ml_draw_scene(ren, scene, f, motion)
+        _assert(ren.render_frame(), "render_frame")
+        for t in ren.get_gpu_pass_timings():
+            if t.pass_name == "SotaMlUpscale" or t.pass_name == "FlintTsrV3Resolve":
+                ms.append(t.gpu_ms)
+    return ms^
+
+
+def test_gpu_upscale() raises:
+    var W = 320
+    var H = 180
+    var motion = Float32(0.6)
+    var frames = 16
+    var probe = FlintAaaVulkanRenderer(width=W, height=H, tsr_scale=0.5)
+    if not probe.active or not probe.vk.has_ray_query:
+        probe.shutdown()
+        print("  [PASS] sota:ml upscaler GPU checks skipped (no hardware ray query)")
+        return
+    _assert(not probe.sota_ml_up.enabled or getenv("FLINT_SOTA_ML_UPSCALE") == "1", "learned upscaler is opt-in")
+    probe.shutdown()
+
+    # 1. Fallback: enabled but no weights -> the TSR v3 resolve records.
+    var r_fb = FlintAaaVulkanRenderer(width=W, height=H, tsr_scale=0.5)
+    r_fb.gi_rays_per_pixel = 1
+    var sc_fb = sota_ml_build_scene(r_fb, SOTA_ML_SCENE_CORNELL, 0)
+    r_fb.sota_ml_up.enabled = True
+    r_fb.sota_ml_up.weights_path = String("/nonexistent/sota_ml_upscale.flmlw")
+    _ = _up_run(r_fb, sc_fb, 4, motion)
+    var pn = _up_pass_names(r_fb)
+    _assert(not r_fb.sota_ml_up.ran_last_frame and pn[0] and not pn[1], "no upscaler weights -> TSR v3 resolve")
+    r_fb.shutdown()
+
+    # 2. Synthetic weights: the learned resolve records and matches the CPU reference.
+    var r_sy = FlintAaaVulkanRenderer(width=W, height=H, tsr_scale=0.5)
+    r_sy.gi_rays_per_pixel = 1
+    var sc_sy = sota_ml_build_scene(r_sy, SOTA_ML_SCENE_CORNELL, 0)
+    r_sy.sota_ml_up.enabled = True
+    r_sy.sota_ml_up.capture = True
+    r_sy.sota_ml_up.set_weights(_synthetic_up_weights(8, 5))
+    _ = _up_run(r_sy, sc_sy, 6, motion)
+    pn = _up_pass_names(r_sy)
+    _assert(r_sy.sota_ml_up.ran_last_frame and pn[1] and not pn[0], "learned resolve replaces TSR v3")
+    var d = _up_gpu_vs_cpu(r_sy)
+    _assert(d < Float32(5e-3), "learned resolve GPU matches CPU (max rel " + String(d) + ")")
+    r_sy.shutdown()
+    print("  [PASS] sota:ml upscaler fallback = TSR v3; learned resolve GPU == CPU (max rel " + _fmt(Float64(d)) + ")")
+
+    # 3. Trained weights, when installed: compare with TSR v3 at the same input resolution.
+    var wpath = sota_ml_up_default_weights_path()
+    if file_size(wpath) <= 0:
+        print("  [INFO] sota:ml no upscaler weights at " + wpath + " (quality check skipped)")
+        return
+    var full = FlintAaaVulkanRenderer(width=W, height=H)
+    var sc_full = sota_ml_build_scene(full, SOTA_ML_SCENE_CORNELL, 0)
+    var refi = sota_ml_render_reference(full, sc_full, frames - 1, motion, 256, 32)
+    full.shutdown()
+    var q = List[SotaMlQuality]()
+    var ms = List[Float64]()
+    for v in range(2):
+        var ren = FlintAaaVulkanRenderer(width=W, height=H, tsr_scale=0.5)
+        ren.gi_rays_per_pixel = 1
+        var sc = sota_ml_build_scene(ren, SOTA_ML_SCENE_CORNELL, 0)
+        ren.sota_ml_up.enabled = v == 1
+        var t = _up_run(ren, sc, frames, motion)
+        _assert(v == 0 or ren.sota_ml_up.ran_last_frame, "trained upscaler loads: " + ren.sota_ml_up.status)
+        q.append(sota_ml_quality(refi, ren.readback_resolved_hdr(), W, H))
+        ms.append(_median(t))
+        ren.shutdown()
+    _assert(q[1].flip < q[0].flip + 0.005, "trained upscaler is not worse than TSR v3 (FLIP)")
+    print(
+        "  [PASS] sota:ml 2x upscale 160x90->320x180 vs 256-spp ref: TSR v3 PSNR " + _fmt(q[0].psnr_db) + " FLIP " + _fmt(q[0].flip)
+        + " | learned PSNR " + _fmt(q[1].psnr_db) + " FLIP " + _fmt(q[1].flip) + " | ms " + _fmt(ms[0]) + " / " + _fmt(ms[1])
+    )
+
+
 def main() raises:
-    print("[Flint v5] sota:ml learned GI denoiser")
+    print("[Flint v5] sota:ml learned GI denoiser + upscaler")
     test_cpu_weights_and_cascade()
     test_spirv_shaders()
+    test_upscale_cpu_and_spirv()
     test_gpu_fallback_equivalence_and_quality()
+    test_gpu_upscale()
     test_gpu_perf_budget()
     print("[Flint v5] sota:ml PASSED")

@@ -410,7 +410,8 @@ def _half2(u: UInt32) -> Tuple[Float32, Float32]:
 
 
 def sota_ml_read_capture(ren: FlintAaaVulkanRenderer) -> SotaMlCapture:
-    """Reads the learned path's scratch (host-visible unified memory) after a synchronous frame."""
+    """Reads the learned path's scratch (host-visible unified memory) after a synchronous frame. Needs
+    `ren.sota_ml.capture = True` (the fused path writes A, the temporal output, and D only then)."""
     var w = ren.render_w
     var h = ren.render_h
     var cap = SotaMlCapture(w, h)
