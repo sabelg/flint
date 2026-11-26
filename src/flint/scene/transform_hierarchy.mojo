@@ -6,6 +6,9 @@ Provides:
 - `LocalTransform`, `GlobalTransform`, `PrevGlobalTransform`
 - `Parent`, `Children` (inline 4-child array + overflow list with binary snapshot hooks), `HierarchyDepth`
 - Cycle-guarded reparenting (`set_parent`, `clear_parent`)
+- Despawn safety: a `World` despawn hook (installed by `register_transform_components`) unlinks a
+  despawned entity from its parent's `Children` and orphans its children (no dangling links);
+  `despawn_recursive` despawns a whole subtree.
 - Depth-bucketed level-synchronous parallel `JobPool` `GlobalTransform` propagation
   (`propagate_transforms_parallel`, `snapshot_prev_global_transforms`)
 - `interpolate_global_transform(prev, curr, alpha)` (TRS lerp + `Quat.slerp`)
@@ -479,8 +482,40 @@ struct HierarchyDepth(Component, ImplicitlyCopyable):
     var depth: Int32
 
 
+comptime _HIERARCHY_DESPAWN_HOOK_KEY: UInt64 = comp_hash64("flint.scene.hierarchy_despawn_hook")
+
+
+def _hierarchy_despawn_hook(world_addr: Int, entity: Entity):
+    """Pre-despawn link repair: detach `entity` from its parent and turn its live children into roots."""
+    ref world = Pointer[World, MutAnyOrigin](unsafe_from_address=world_addr)[unsafe_offset=0]
+    var p_opt = world.get_ptr[Parent](entity)
+    if p_opt:
+        var parent_e = p_opt.value()[unsafe_offset=0].entity
+        if world.is_alive(parent_e):
+            var pch = world.get_ptr_mut[Children](parent_e)
+            if pch:
+                _ = pch.value()[unsafe_offset=0].remove(entity)
+    var kids = List[Entity]()
+    var ch_opt = world.get_ptr[Children](entity)
+    if ch_opt:
+        var n = ch_opt.value()[unsafe_offset=0].len()
+        for i in range(n):
+            kids.append(ch_opt.value()[unsafe_offset=0].at(i))
+    for i in range(len(kids)):
+        var kid = kids[i]
+        if not world.is_alive(kid):
+            continue
+        var kp = world.get_ptr[Parent](kid)
+        if kp and kp.value()[unsafe_offset=0].entity == entity:
+            _ = world.remove[Parent](kid)
+            _update_subtree_depths(world, kid, 0)
+
+
 def register_transform_components(mut world: World):
-    """Idempotently registers all transform hierarchy components + custom `Children` snapshot hooks."""
+    """Idempotently registers all transform hierarchy components + custom `Children` snapshot hooks
+    and the hierarchy despawn hook (so `World.despawn` never leaves dangling `Parent`/`Children`)."""
+    if not world.has_despawn_hook(_HIERARCHY_DESPAWN_HOOK_KEY):
+        _ = world.add_despawn_hook(_HIERARCHY_DESPAWN_HOOK_KEY, _hierarchy_despawn_hook)
     _ = world.register_component[LocalTransform]()
     _ = world.register_component[GlobalTransform]()
     _ = world.register_component[PrevGlobalTransform]()
@@ -589,6 +624,52 @@ def clear_parent(mut world: World, child: Entity) -> Bool:
     _ = world.remove[Parent](child)
     _update_subtree_depths(world, child, 0)
     return True
+
+
+def collect_subtree(world: World, root: Entity) -> List[Entity]:
+    """`root` and all its live descendants in breadth-first order (bounded by the live entity count,
+    so a corrupt cyclic link cannot loop forever)."""
+    var out = List[Entity]()
+    if not world.is_alive(root):
+        return out^
+    out.append(root)
+    var head = 0
+    var max_nodes = world.entity_count()
+    while head < len(out) and len(out) <= max_nodes:
+        var cur = out[head]
+        head += 1
+        var ch_opt = world.get_ptr[Children](cur)
+        if not ch_opt:
+            continue
+        var n = ch_opt.value()[unsafe_offset=0].len()
+        for i in range(n):
+            var kid = ch_opt.value()[unsafe_offset=0].at(i)
+            if world.is_alive(kid):
+                out.append(kid)
+    return out^
+
+
+def despawn_recursive(mut world: World, root: Entity) -> Int:
+    """Despawns `root` and its whole subtree (children first) and unlinks `root` from its parent.
+    Returns the number of entities despawned."""
+    register_transform_components(world)
+    var nodes = collect_subtree(world, root)
+    var count = 0
+    var i = len(nodes) - 1
+    while i >= 0:
+        if world.despawn(nodes[i]):
+            count += 1
+        i -= 1
+    return count
+
+
+def despawn_recursive_deferred(world: World, mut cmds: ParallelCommands, lane: Int, root: Entity):
+    """Queues despawns for `root`'s subtree (children first) on a `ParallelCommands` lane."""
+    var nodes = collect_subtree(world, root)
+    var i = len(nodes) - 1
+    while i >= 0:
+        cmds.despawn(lane, nodes[i])
+        i -= 1
 
 
 # ---------------------------------------------------------------------------
