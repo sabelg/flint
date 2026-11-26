@@ -835,11 +835,19 @@ def test_gpu_pso_cache():
     _ = make_dirs(dir)
     _setenv("FLINT_PSO_CACHE_DIR", dir)
     var path = sota_e_pso_cache_path()
+    # Cold start, serial compile (the pre-round-2 behaviour) vs parallel JobPool compile.
+    _setenv("FLINT_PARALLEL_PSO", "0")
     _ = remove_file(path)
-    var cold = _construct_ms()
-    if cold[1] < 0:
+    var cold_serial = _construct_ms()
+    if cold_serial[1] < 0:
         print("  [SKIP] Suite 4b: Vulkan renderer unavailable")
         return
+    _setenv("FLINT_PARALLEL_PSO", "1")
+    _ = remove_file(path)
+    var cold = _construct_ms()
+    print("    cold construct serial", cold_serial[0], "ms -> parallel", cold[0], "ms (", cold[2], "modules )")
+    _assert(cold[1] == SOTA_E_PSO_COLD_MISSING, "parallel cold start compiles")
+    _assert(cold[0] < cold_serial[0] * 0.8, "parallel pipeline compile beats serial cold start")
     var size = Int(len(read_bytes(path)))
     var warm = List[Float64]()
     var w_last = _construct_ms()
@@ -862,7 +870,7 @@ def test_gpu_pso_cache():
     _assert(torn[1] == SOTA_E_PSO_COLD_REJECTED, "torn cache file is rejected")
     var healed = _construct_ms()
     _assert(healed[1] == SOTA_E_PSO_WARM, "cache is rewritten after a rejected load")
-    print("  [PASS] Suite 4b: on-disk pipeline cache cold", Int(cold[0]), "ms -> warm", Int(warm_med), "ms")
+    print("  [PASS] Suite 4b: cold serial", Int(cold_serial[0]), "ms -> cold parallel", Int(cold[0]), "ms -> warm", Int(warm_med), "ms")
 
 
 def main():

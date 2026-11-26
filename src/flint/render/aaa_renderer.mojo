@@ -141,6 +141,7 @@ from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AaaMaterial
 # --- sota:E hook ---
 from flint.render.sota_e_characters import AAA_FLAG_SOTA_E_CHARACTERS
 from flint.render.sota_e_pipeline_cache import SotaEPsoCache, sota_e_pso_cache_open, sota_e_pso_cache_save
+from flint.render.sota_e_parallel_pso import sota_e_pso_batch_begin, sota_e_pso_batch_flush
 # --- end sota:E hook ---
 from flint.render.material_graph import (
     MaterialAsset,
@@ -1193,6 +1194,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # --- sota:E hook (validated, XDG-located, atomically saved pipeline cache) ---
         self.sota_e_pso = sota_e_pso_cache_open(self.vk)
+        sota_e_pso_batch_begin(self.vk)  # compute pipelines below compile in parallel at the flush
         # --- end sota:E hook ---
 
         # Compile all 10 AAA Hardware Graphics & Compute SPIR-V 1.5 Pipelines!
@@ -1318,6 +1320,10 @@ struct FlintAaaVulkanRenderer(Movable):
         self.pipe_npr_post_fx = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_npr_post_fx_shader())
         self.pipe_ui_overlay = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_ui_overlay_shader())
         self.pipe_scrgb_pack = self.vk.create_aaa_compute_pipeline(self.pipe_layout, aaa_pack_scrgb_rgba16f_shader())
+        # --- sota:E hook (parallel compile of the batched compute pipelines) ---
+        if sota_e_pso_batch_flush(self.vk) > 0:
+            return False
+        # --- end sota:E hook ---
 
         if (
             self.pipe_meshlet_cull == 0
