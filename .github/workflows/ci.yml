@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, v5]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_gate:
+        description: "Also run the full `tools/flint.sh gate` on the self-hosted GPU runner"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: CPU subset (tools/ci.sh)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FLINT_CI_JOBS: "4"
+    steps:
+      - uses: actions/checkout@v4
+
+      # pixi.lock is not committed, so cache the environment by pixi.toml instead of letting
+      # setup-pixi key its cache on the lock file.
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          run-install: false
+
+      - name: Cache pixi environment
+        uses: actions/cache@v4
+        with:
+          path: |
+            .pixi
+            ~/.cache/rattler
+          key: pixi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.toml') }}
+          restore-keys: |
+            pixi-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Mojo 1.2 toolchain
+        run: pixi install
+
+      # Mesa lavapipe: a CPU Vulkan driver, so test_flint and test_e2e (which need a Vulkan
+      # device) run here too. Without it tools/ci.sh only builds those two.
+      - name: Install lavapipe (software Vulkan)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+
+      - name: Run CPU-only CI subset
+        run: bash tools/ci.sh
+
+      - name: Upload suite logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: build/ci-logs/
+          if-no-files-found: ignore
+
+  gate:
+    name: Full gate (self-hosted GPU)
+    if: github.event_name == 'workflow_dispatch' && inputs.full_gate
+    # Register a runner with these labels on a Linux machine with a Vulkan GPU and pixi installed.
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Mojo 1.2 toolchain
+        run: pixi install
+
+      - name: Environment report
+        run: bash tools/flint.sh doctor
+
+      - name: Full verification gate
+        run: bash tools/flint.sh gate
+
+      - name: Upload shots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-shots
+          path: build/shots/
+          if-no-files-found: ignore
