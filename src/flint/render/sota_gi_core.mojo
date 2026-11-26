@@ -64,6 +64,7 @@ comptime SOTA_CTRL_GI_MCAP: Int = 34
 comptime SOTA_CTRL_CONTACT_RAYS: Int = 35  # WRC-only mode: near-field rays per pixel
 comptime SOTA_CTRL_CONTACT_RADIUS: Int = 36  # float, metres
 comptime SOTA_CTRL_CAM_X: Int = 37  # float x3: camera position (history validation scale)
+comptime SOTA_CTRL_LOWRES: Int = 40  # word offset of the reduced-resolution resolve buffer (round 3)
 
 # Control flags
 comptime SOTA_FLAG_WRC_VALID: UInt32 = 1  # the read bank holds at least one frame of probe data
@@ -89,6 +90,7 @@ comptime SOTA_PROBE_BACKFACE: Int = 41
 comptime SOTA_GI_HIST_WORDS: Int = 4  # x, y, z, packed octahedral normal
 comptime SOTA_GI_DI_WORDS: Int = 4  # light id, W, M, unused
 comptime SOTA_GI_GI_WORDS: Int = 8  # sample x, y, z, packed normal, half(Lr, Lg), half(Lb, M), W, unused
+comptime SOTA_GI_LOWRES_WORDS: Int = 8  # reduced-res resolve sample: gi r, g, b, x, y, z, packed normal, stamp
 
 comptime _PI: Float32 = 3.14159265
 
@@ -105,7 +107,13 @@ def sota_svgf_scratch_words(max_pix: Int) -> Int:
 def sota_gi_region_words(max_pix: Int) -> Int:
     """Words the area-B region needs at the end of the surface-cache buffer."""
     var per_pix = SOTA_GI_GBUF_WORDS + SOTA_GI_ACCUM_WORDS + 2 * (SOTA_GI_HIST_WORDS + SOTA_GI_DI_WORDS + SOTA_GI_GI_WORDS)
-    return SOTA_GI_CTRL_WORDS + 2 * SOTA_GI_MAX_PROBES * SOTA_GI_PROBE_WORDS + max_pix * per_pix
+    return SOTA_GI_CTRL_WORDS + 2 * SOTA_GI_MAX_PROBES * SOTA_GI_PROBE_WORDS + max_pix * per_pix + sota_gi_lowres_words(max_pix)
+
+
+def sota_gi_lowres_words(max_pix: Int) -> Int:
+    """Reduced-resolution resolve buffer: one record per 2x2 block at most (half res), plus slack for the
+    rounded-up edge blocks of odd sizes (`ceil(w/2) * ceil(h/2) <= max_pix / 4 + (w + h) / 2 + 1`)."""
+    return SOTA_GI_LOWRES_WORDS * (max_pix // 4 + 16384)
 
 
 def sota_gi_bank_offset(bank: Int) -> Int:
@@ -130,6 +138,39 @@ def sota_gi_di_offset(max_pix: Int, bank: Int) -> Int:
 
 def sota_gi_gi_offset(max_pix: Int, bank: Int) -> Int:
     return sota_gi_di_offset(max_pix, 2) + bank * max_pix * SOTA_GI_GI_WORDS
+
+
+def sota_gi_lowres_offset(max_pix: Int) -> Int:
+    return sota_gi_gi_offset(max_pix, 2)
+
+
+def sota_gi_bayer_offset(scale: Int, k: Int) -> Tuple[Int, Int]:
+    """Sub-pixel `(x, y)` of the representative pixel of a `scale x scale` block on frame phase `k`:
+    the inverse of the ordered-dither (Bayer) matrix, so `scale * scale` consecutive frames visit every
+    pixel of the block once and consecutive phases are far apart (scale must be a power of two)."""
+    var n = scale * scale
+    var want = k % max(1, n)
+    for y in range(scale):
+        for x in range(scale):
+            # Bayer value M_2n(x, y) = 4 M_n(x mod n, y mod n) + M_2(x / n, y / n), M_2 = [[0, 2], [3, 1]]:
+            # the finest level is the most significant base-4 digit
+            var v = 0
+            var bit = 1
+            while bit < scale:
+                var bx = (x & bit) != 0
+                var by = (y & bit) != 0
+                var d = 0
+                if bx and not by:
+                    d = 2
+                elif by and not bx:
+                    d = 3
+                elif bx and by:
+                    d = 1
+                v = v * 4 + d
+                bit <<= 1
+            if v == want:
+                return (x, y)
+    return (0, 0)
 
 
 def sota_sh9_band_weight(k: Int) -> Float32:

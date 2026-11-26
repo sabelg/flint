@@ -268,10 +268,13 @@ def test_gpu_fallback_equivalence_and_quality() raises:
     _ = _run_sequence(r_sy, sc_r_sy, 3, motion)
     var d_sy2 = _gpu_vs_cpu(r_sy, False)
     _assert(d_sy2 < Float32(5e-3), "learned GPU cascade (separate passes) matches CPU (max rel " + String(d_sy2) + ")")
-    # GI-mode gate: on by default only for the legacy and 1-spp path-traced inputs (it regresses the
-    # already-smooth world-cache-only and hybrid modes), so `ready` refuses modes 1 and 2.
-    _assert(r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 0) and r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 3), "learned path allowed for legacy and path-traced GI")
-    _assert(not r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 1) and not r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 2), "learned path gated off for world-cache-only and hybrid GI")
+    # GI-mode gate (re-measured against the fixed SVGF in area B round 3, `test_flint_v5_sota_gi` ml suite):
+    # on for legacy, hybrid and path-traced GI; the already-smooth world-cache-only mode keeps SVGF.
+    _assert(
+        r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 0) and r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 2) and r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 3),
+        "learned path allowed for legacy, hybrid and path-traced GI",
+    )
+    _assert(not r_sy.sota_ml.ready(r_sy.vk, r_sy.pipe_layout, 1), "learned path gated off for world-cache-only GI")
     r_sy.shutdown()
 
     print(

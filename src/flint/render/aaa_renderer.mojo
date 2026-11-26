@@ -224,7 +224,12 @@ from flint.render.sota_gi_core import (
     sota_gi_region_words,
     sota_svgf_scratch_words,
 )
-from flint.render.sota_gi_world_cache import SotaGiSettings, sota_gi_resolve_shader, sota_wrc_update_shader
+from flint.render.sota_gi_world_cache import (
+    SotaGiSettings,
+    sota_gi_resolve_shader,
+    sota_gi_upsample_shader,
+    sota_wrc_update_shader,
+)
 # --- end sota:gi hook ---
 from flint.render.aaa_clustered_lights import (
     AAA_CLUSTER_BUFFER_WORDS,
@@ -1354,6 +1359,7 @@ struct FlintAaaVulkanRenderer(Movable):
         if use_rt:
             self.sota_gi.pipe_wrc = self.vk.create_aaa_compute_pipeline(self.pipe_layout, sota_wrc_update_shader(use_rt))
             self.sota_gi.pipe_resolve = self.vk.create_aaa_compute_pipeline(self.pipe_layout, sota_gi_resolve_shader(use_rt))
+            self.sota_gi.pipe_upsample = self.vk.create_aaa_compute_pipeline(self.pipe_layout, sota_gi_upsample_shader())
         # --- end sota:gi hook ---
         self.pipe_oit_vol = self.vk.create_aaa_compute_pipeline(self.pipe_layout, oit_and_6way_volumetric_shader())
         self.pipe_luma_hist = self.vk.create_aaa_compute_pipeline(
@@ -5417,15 +5423,41 @@ struct FlintAaaVulkanRenderer(Movable):
             push_sgr[0] = UInt32(self.render_w)
             push_sgr[1] = UInt32(self.render_h)
             push_sgr[2] = UInt32(1) if run_svgf else UInt32(0)
+            # round 3: reduced-resolution resolve (scale, this / previous frame's block sub-pixel)
+            var sgr_lowres = self.sota_gi.cur_scale > 1 and self.sota_gi.pipe_upsample != 0
+            push_sgr[3] = UInt32(self.sota_gi.cur_scale) if sgr_lowres else UInt32(1)
+            push_sgr[4] = UInt32(self.sota_gi.cur_jx) if sgr_lowres else UInt32(0)
+            push_sgr[5] = UInt32(self.sota_gi.cur_jy) if sgr_lowres else UInt32(0)
+            push_sgr[6] = UInt32(self.sota_gi.prev_jx) if sgr_lowres else UInt32(0)
+            push_sgr[7] = UInt32(self.sota_gi.prev_jy) if sgr_lowres else UInt32(0)
+            push_sgr[8] = bitcast[DType.uint32](self.sota_gi.upsample_tent)
+            var sgr_sc = Int(push_sgr[3])
+            var sgr_w = (self.render_w + sgr_sc - 1) // sgr_sc
+            var sgr_h = (self.render_h + sgr_sc - 1) // sgr_sc
             self.vk.dispatch_aaa(
                 cur_slot, self.sota_gi.pipe_resolve, self.pipe_layout, self.desc_set, push_sgr,
-                (self.render_w + 7) // 8, (self.render_h + 7) // 8,
+                (sgr_w + 7) // 8, (sgr_h + 7) // 8,
             )
             self.vk.memory_barrier2(
                 cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
             )
             if use_prof and q_sgr + 1 < q_limit:
                 self.vk.write_timestamp(cur_slot, q_sgr + 1, PIPELINE_BOTTOM)
+            if sgr_lowres:
+                var q_sgu = next_q
+                if use_prof and q_sgu + 1 < q_limit:
+                    self.vk.write_timestamp(cur_slot, q_sgu, PIPELINE_BOTTOM)
+                    next_q += 2
+                    prof_pairs.append((String("SotaGiUpsample"), q_sgu))
+                self.vk.dispatch_aaa(
+                    cur_slot, self.sota_gi.pipe_upsample, self.pipe_layout, self.desc_set, push_sgr,
+                    (self.render_w + 7) // 8, (self.render_h + 7) // 8,
+                )
+                self.vk.memory_barrier2(
+                    cur_slot, PIPELINE_COMPUTE, Int(ACCESS_SHADER_WRITE), PIPELINE_COMPUTE, Int(ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
+                )
+                if use_prof and q_sgu + 1 < q_limit:
+                    self.vk.write_timestamp(cur_slot, q_sgu + 1, PIPELINE_BOTTOM)
         self.sota_gi.end_frame(sota_mode)
         # --- end sota:gi hook ---
 
@@ -6554,6 +6586,9 @@ struct FlintAaaVulkanRenderer(Movable):
         if self.sota_gi.pipe_resolve != 0:  # --- sota:gi hook ---
             self.vk.destroy_pipeline(self.sota_gi.pipe_resolve)
             self.sota_gi.pipe_resolve = 0
+        if self.sota_gi.pipe_upsample != 0:  # --- sota:gi hook --- (round 3 upsample)
+            self.vk.destroy_pipeline(self.sota_gi.pipe_upsample)
+            self.sota_gi.pipe_upsample = 0
         self.vk.destroy_pipeline(self.pipe_oit_vol)
         self.vk.destroy_pipeline(self.pipe_luma_hist)
         self.vk.destroy_pipeline(self.pipe_adapt_exp)

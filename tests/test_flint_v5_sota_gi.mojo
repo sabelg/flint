@@ -8,8 +8,8 @@
    one and a converged multi-bounce one), with GPU pass timings and before/after PNGs.
 
 Environment: `FLINT_SOTA_GI_PNG_DIR` overrides where PNGs go (default `~/flint-models/_eval/render/B`);
-`FLINT_SOTA_GI_QUICK=1` lowers the reference sample count for iteration; `FLINT_SOTA_GI_ONLY=gi|mirror|di`
-runs a single GPU suite.
+`FLINT_SOTA_GI_QUICK=1` lowers the reference sample count for iteration;
+`FLINT_SOTA_GI_ONLY=gi|mirror|di|svgf|lowres|ml` runs a single GPU suite.
 """
 from std.ffi import external_call
 from std.math import abs, cos, exp, log, max, min, sin, sqrt, tan
@@ -17,7 +17,7 @@ from flint.assets.image import write_png
 from flint.assets.mesh_builder import MeshBuilder
 from flint.core.math import Vec3
 from flint.core.transform import Quat, trs
-from flint.platform.os import env_now, get_time, make_dirs
+from flint.platform.os import env_now, get_time, make_dirs, read_bytes
 from flint.render.aaa_bsdf import AaaMaterial
 from flint.render.aaa_gi_svgf import aaa_deferred_shade_shader, surface_cache_update_shader
 from flint.render.aaa_post_tsr import AAA_DISPLAY_LINEAR_SRGB
@@ -33,11 +33,14 @@ from flint.render.sota_gi_world_cache import (
     sota_chebyshev_cpu,
     sota_fib_dir_cpu,
     sota_gi_resolve_shader,
+    sota_gi_upsample_shader,
     sota_sh9_irradiance_over_pi_cpu,
     sota_sh9_project_cpu,
     sota_wrc_slot_cpu,
     sota_wrc_update_shader,
 )
+from flint.render.sota_gi_core import sota_gi_bayer_offset
+from flint.render.sota_ml_denoise import SOTA_ML_GI_MODES_DEFAULT, sota_ml_default_weights_path
 
 
 def _assert(cond: Bool, msg: String) raises:
@@ -53,6 +56,8 @@ def _validate(words: List[UInt32], name: String) raises:
 
 
 def _f3(x: Float64) -> String:
+    if x < 0.0:
+        return "-" + _f3(-x)
     var v = Int(x * 1000.0 + 0.5)
     var frac = String(v % 1000)
     while frac.byte_length() < 3:
@@ -109,6 +114,17 @@ def test_cpu_twins() raises:
     _validate(sota_wrc_update_shader(False), "sota_wrc_update_shader(no rt)")
     _validate(sota_gi_resolve_shader(True), "sota_gi_resolve_shader(rt)")
     _validate(sota_gi_resolve_shader(False), "sota_gi_resolve_shader(no rt)")
+    _validate(sota_gi_upsample_shader(), "sota_gi_upsample_shader")
+    # Reduced-res resolve: the Bayer phases visit every pixel of a block once per scale^2 frames
+    for sc in [1, 2, 4]:
+        var seen = List[Int](length=sc * sc, fill=0)
+        for k in range(sc * sc):
+            var j = sota_gi_bayer_offset(sc, k)
+            seen[j[1] * sc + j[0]] += 1
+        for i in range(sc * sc):
+            _assert(seen[i] == 1, "Bayer phase cover, scale " + String(sc))
+    var j1 = sota_gi_bayer_offset(2, 1)
+    _assert(j1[0] == 1 and j1[1] == 1, "Bayer phase 1 of 2x2 is the opposite corner")
     _validate(aaa_deferred_shade_shader(True), "aaa_deferred_shade_shader(rt) + sota hooks")
     _validate(surface_cache_update_shader(True), "surface_cache_update_shader(rt) + sota hooks")
     print("  [PASS] SOTA GI CPU twins (SH9 irradiance, Chebyshev, toroidal slots) + SPIR-V validation")
@@ -430,7 +446,7 @@ def _render_frames(mut ren: FlintAaaVulkanRenderer, ids: List[Int], frames: Int,
                 var nm = t.pass_name
                 if nm == "LumenSurfaceCache" or nm == "DeferredMultiLobeRtShade" or nm == "SvgfTemporalAndAtrous":
                     gi += t.gpu_ms
-                if nm == "SotaWorldRadianceCache" or nm == "SotaGiResolve":
+                if nm == "SotaWorldRadianceCache" or nm == "SotaGiResolve" or nm == "SotaGiUpsample":
                     gi += t.gpu_ms
                     rs += t.gpu_ms
             gi_t.append(gi)
@@ -580,6 +596,9 @@ def test_gpu_cornell_gi_modes() raises:
 
     # (e2) real-time path tracer: 1 path / pixel, 2 bounces + WRC termination, ReSTIR GI, SVGF + TSR
     var r_e2 = GiRun("sota_pt1spp_restirgi_svgf_32f")
+    # The ReSTIR GI pairs below are measured at a full-resolution resolve (their thresholds date from
+    # round 2); half / quarter resolution of the path tracer is covered by `test_gpu_lowres_resolve`.
+    ren.sota_gi.resolve_scale = 1
     ren.sota_gi.mode = SOTA_GI_MODE_PATH
     ren.sota_gi.pixel_rays = 1
     ren.sota_gi.pt_bounces = 2
@@ -1004,10 +1023,192 @@ def test_gpu_svgf_history() raises:
     print("  [PASS] SVGF temporal history accumulates to the cap after static frames")
 
 
+# ---------------------------------------------------------------------------------------------
+# 6. Round 3: reduced-resolution GI resolve + depth / normal-aware upsample
+# ---------------------------------------------------------------------------------------------
+def _lowres_run(
+    mut ren: FlintAaaVulkanRenderer, ids: List[Int], name: String, scale: Int, frames: Int, mut runs: List[GiRun]
+) raises:
+    ren.sota_gi.resolve_scale = scale
+    _warm(ren, ids, 96)
+    var r = GiRun(name + "_s" + String(scale))
+    _render_frames(ren, ids, frames, r)
+    runs.append(r^)
+
+
+def test_gpu_lowres_resolve() raises:
+    var cw = 128
+    var ch = 128
+    var sun_dir = Vec3(-0.32, 0.42, -0.849).normalized()
+    var sun_rad = Vec3(3.1, 3.0, 2.9)
+    var ren = _new_cornell_renderer(cw, ch, sun_dir, sun_rad)
+    if not ren.active or not ren.vk.has_ray_query:
+        ren.shutdown()
+        print("  [SKIP] SOTA GI reduced-res resolve (no hardware ray queries)")
+        return
+    var ids = _build_cornell(ren)
+    var quick = env_now("FLINT_SOTA_GI_QUICK").byte_length() > 0
+    var ref_full = render_cornell_reference(cw, ch, 128 if quick else 512, sun_dir, sun_rad, 12)
+    _wrc_grid_for_cornell(ren)
+    var runs = List[GiRun]()
+    # Hybrid (the `high` preset) and the 1-spp path tracer with ReSTIR GI, SVGF + TSR, at 1/1, 1/2, 1/4
+    ren.sota_gi.mode = SOTA_GI_MODE_HYBRID
+    ren.sota_gi.pixel_rays = 4
+    for sc in [1, 2, 4]:
+        _lowres_run(ren, ids, "lowres_hybrid_sc4", sc, 32, runs)
+    ren.sota_gi.mode = SOTA_GI_MODE_PATH
+    ren.sota_gi.pixel_rays = 1
+    ren.sota_gi.pt_bounces = 2
+    ren.sota_gi.restir_gi = True
+    for sc in [1, 2, 4]:
+        _lowres_run(ren, ids, "lowres_pt1spp_restirgi", sc, 32, runs)
+    # Photo mode always resolves at full resolution (accumulation is per pixel)
+    ren.sota_gi.resolve_scale = 2
+    ren.sota_gi.accumulate = True
+    ren.sota_gi.pixel_rays = 4
+    var r_ph = GiRun("lowres_photo_2b_s2")
+    ren.sota_gi.pt_wrc_terminate = False
+    ren.svgf_passes = 0
+    _render_frames(ren, ids, 64, r_ph)
+    _assert(ren.sota_gi.cur_scale == 1, "photo mode must resolve at full resolution")
+    ren.sota_gi.accumulate = False
+    ren.sota_gi.pt_wrc_terminate = True
+    ren.svgf_passes = 2
+    ren.sota_gi.pixel_rays = 1
+
+    var dir = _png_dir()
+    print("    reduced-res resolve (Cornell 128x128, SVGF + TSR)   FLIP(12b ref)  area-B ms")
+    for i in range(len(runs)):
+        var fmap = flip_error_map(ref_full, runs[i].pixels, cw, ch)
+        runs[i].flip_full = flip_mean(fmap)
+        _ = write_png(dir + "/" + runs[i].name + ".png", runs[i].pixels, cw, ch, stamped=False)
+        var heat = flip_heat_image(fmap)
+        _ = write_png(dir + "/" + runs[i].name + "_flip12b.png", heat, cw, ch, stamped=False)
+        var pad = runs[i].name
+        while pad.byte_length() < 52:
+            pad += " "
+        print("    " + pad + _f3(runs[i].flip_full) + "          " + _f3(runs[i].resolve_ms))
+    var h1 = runs[_find(runs, "lowres_hybrid_sc4_s1")].flip_full
+    var h2 = runs[_find(runs, "lowres_hybrid_sc4_s2")].flip_full
+    var p1 = runs[_find(runs, "lowres_pt1spp_restirgi_s1")].flip_full
+    var p2 = runs[_find(runs, "lowres_pt1spp_restirgi_s2")].flip_full
+    # Half resolution may cost a little quality (a quarter of the GI samples per frame), never much
+    _assert(h2 < h1 + 0.015, "half-res hybrid FLIP " + _f3(h2) + " vs full " + _f3(h1))
+    _assert(p2 < p1 + 0.025, "half-res path tracer FLIP " + _f3(p2) + " vs full " + _f3(p1))
+    _assert(h2 < 0.13, "half-res hybrid FLIP " + _f3(h2))
+
+    # Cost: the resolve at 512x384 must get cheaper at half resolution (resolve + upsample)
+    ren.shutdown()
+    var big = _new_cornell_renderer(512, 384, sun_dir, sun_rad)
+    var ids_b = _build_cornell(big)
+    _wrc_grid_for_cornell(big)
+    big.sota_gi.mode = SOTA_GI_MODE_HYBRID
+    big.sota_gi.pixel_rays = 4
+    var t = List[Float64]()
+    for sc in [1, 2, 1, 2]:
+        big.sota_gi.resolve_scale = sc
+        _warm(big, ids_b, 8)
+        var r = GiRun("timing")
+        _render_frames(big, ids_b, 24, r)
+        t.append(r.resolve_ms)
+    var t1 = min(t[0], t[2])
+    var t2 = min(t[1], t[3])
+    print("    512x384 hybrid sc4: area-B passes " + _f3(t1) + " ms full res -> " + _f3(t2) + " ms half res")
+    _assert(t2 < t1 * 0.95, "half-res resolve should be cheaper: " + _f3(t2) + " vs " + _f3(t1) + " ms")
+    big.shutdown()
+    print("  [PASS] SOTA GI reduced-resolution resolve + depth/normal-aware upsample")
+
+
+# ---------------------------------------------------------------------------------------------
+# 7. Round 3: area-C learned denoiser vs the (fixed) SVGF per GI mode -> `SOTA_ML_GI_MODES_DEFAULT`
+# ---------------------------------------------------------------------------------------------
+def _ml_pair(
+    mut ren: FlintAaaVulkanRenderer, ids: List[Int], name: String, frames: Int, refimg: List[UInt32], cw: Int, ch: Int
+) raises -> Tuple[Float64, Float64]:
+    """Learned first (the conservative order: SVGF gets the longer-converged caches), then SVGF."""
+    var dir = _png_dir()
+    _warm(ren, ids, 96)
+    ren.sota_ml.enabled = True
+    var r_ml = GiRun(name + "_learned")
+    _render_frames(ren, ids, frames, r_ml)
+    ren.sota_ml.enabled = False
+    var r_sv = GiRun(name + "_svgf")
+    _render_frames(ren, ids, frames, r_sv)
+    var f_ml = flip_mean(flip_error_map(refimg, r_ml.pixels, cw, ch))
+    var f_sv = flip_mean(flip_error_map(refimg, r_sv.pixels, cw, ch))
+    _ = write_png(dir + "/ml_" + r_ml.name + ".png", r_ml.pixels, cw, ch, stamped=False)
+    _ = write_png(dir + "/ml_" + r_sv.name + ".png", r_sv.pixels, cw, ch, stamped=False)
+    var pad = name
+    while pad.byte_length() < 40:
+        pad += " "
+    print("    " + pad + _f3(f_sv) + "     " + _f3(f_ml) + "      " + _f3(f_ml - f_sv))
+    return (f_sv, f_ml)
+
+
+def test_gpu_ml_gating() raises:
+    var wpath = sota_ml_default_weights_path()
+    if len(read_bytes(wpath)) == 0:
+        print("  [SKIP] learned-denoiser gating (no weights at " + wpath + ")")
+        return
+    var cw = 128
+    var ch = 128
+    var sun_dir = Vec3(-0.32, 0.42, -0.849).normalized()
+    var sun_rad = Vec3(3.1, 3.0, 2.9)
+    var ren = _new_cornell_renderer(cw, ch, sun_dir, sun_rad)
+    if not ren.active or not ren.vk.has_ray_query:
+        ren.shutdown()
+        print("  [SKIP] learned-denoiser gating (no hardware ray queries)")
+        return
+    var ids = _build_cornell(ren)
+    var quick = env_now("FLINT_SOTA_GI_QUICK").byte_length() > 0
+    var ref_full = render_cornell_reference(cw, ch, 128 if quick else 512, sun_dir, sun_rad, 12)
+    ren.sota_ml.gi_modes = 0xF  # measure every mode; the shipped mask is checked against the data below
+    ren.svgf_passes = 2
+    print("    GI mode (Cornell 128x128, FLIP vs 12b)    SVGF      learned    delta")
+    var deltas = List[Float64]()  # legacy, WRC, hybrid, path (at the default resolve scale)
+    ren.sota_gi.mode = SOTA_GI_MODE_LEGACY
+    ren.gi_rays_per_pixel = 4
+    var d0 = _ml_pair(ren, ids, "legacy_sc4_16f", 16, ref_full, cw, ch)
+    deltas.append(d0[1] - d0[0])
+    _wrc_grid_for_cornell(ren)
+    ren.sota_gi.mode = SOTA_GI_MODE_WRC
+    ren.sota_gi.contact_rays = 0
+    var d1 = _ml_pair(ren, ids, "wrc_only_32f", 32, ref_full, cw, ch)
+    deltas.append(d1[1] - d1[0])
+    ren.sota_gi.mode = SOTA_GI_MODE_HYBRID
+    ren.sota_gi.pixel_rays = 4
+    var def_scale = ren.sota_gi.resolve_scale
+    ren.sota_gi.resolve_scale = 1
+    _ = _ml_pair(ren, ids, "hybrid_sc4_fullres_32f", 32, ref_full, cw, ch)
+    ren.sota_gi.resolve_scale = def_scale
+    var d2 = _ml_pair(ren, ids, "hybrid_sc4_32f", 32, ref_full, cw, ch)
+    deltas.append(d2[1] - d2[0])
+    ren.sota_gi.mode = SOTA_GI_MODE_PATH
+    ren.sota_gi.pixel_rays = 1
+    ren.sota_gi.pt_bounces = 2
+    ren.sota_gi.restir_gi = True
+    ren.sota_gi.resolve_scale = 1
+    _ = _ml_pair(ren, ids, "pt1spp_restirgi_fullres_32f", 32, ref_full, cw, ch)
+    ren.sota_gi.resolve_scale = def_scale
+    var d3 = _ml_pair(ren, ids, "pt1spp_restirgi_32f", 32, ref_full, cw, ch)
+    deltas.append(d3[1] - d3[0])
+    ren.sota_ml.enabled = False
+    ren.shutdown()
+    # The shipped gating must follow the data: a mode where the learned path is clearly better
+    # (FLIP lower by > 0.005) is enabled by default, one where it is clearly worse is not.
+    for m in range(4):
+        var on = ((SOTA_ML_GI_MODES_DEFAULT >> m) & 1) != 0
+        if deltas[m] < -0.005:
+            _assert(on, "learned denoiser is better in GI mode " + String(m) + " but gated off")
+        if deltas[m] > 0.005:
+            _assert(not on, "learned denoiser is worse in GI mode " + String(m) + " but gated on")
+    print("  [PASS] learned-denoiser GI-mode gating matches the measurements (mask " + String(SOTA_ML_GI_MODES_DEFAULT) + ")")
+
+
 def main() raises:
     var t0 = get_time()
     print("=== Flint v5 Area B (GI) SOTA Suite ===")
-    var only = env_now("FLINT_SOTA_GI_ONLY")  # "gi", "mirror", "di" or "svgf" runs one GPU suite
+    var only = env_now("FLINT_SOTA_GI_ONLY")  # "gi", "mirror", "di", "svgf", "lowres" or "ml" runs one GPU suite
     test_cpu_twins()
     if only.byte_length() == 0 or only == "gi":
         test_gpu_cornell_gi_modes()
@@ -1017,4 +1218,8 @@ def main() raises:
         test_gpu_restir_di()
     if only.byte_length() == 0 or only == "svgf":
         test_gpu_svgf_history()
+    if only.byte_length() == 0 or only == "lowres":
+        test_gpu_lowres_resolve()
+    if only.byte_length() == 0 or only == "ml":
+        test_gpu_ml_gating()
     print("=== ALL FLINT V5 SOTA GI TESTS PASSED in " + _f3(get_time() - t0) + "s ===")
