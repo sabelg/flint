@@ -17,6 +17,7 @@ from flint.core.detsort import mix64
 from flint.core.springs import SpringFloat, SpringVec3
 from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC
 from flint.physics.world import PhysicsWorld
+from flint.camera.physical import PhysicalCameraModel  # sota:camera hook
 
 comptime CAM_MODE_FIRST_PERSON: UInt8 = 0
 comptime CAM_MODE_ORBIT_FOLLOW: UInt8 = 1
@@ -184,6 +185,10 @@ struct CameraRig(Copyable, Movable):
     var unshaken_pos: Vec3
     var unshaken_rot: Quat
 
+    # --- sota:camera hook (physical lens) ---
+    var lens: PhysicalCameraModel  # focal length, f-stop, shutter, ISO, sensor, focus (renderer: ren.sota_cam.camera)
+    # --- end sota:camera hook ---
+
     def __init__(out self, mode: UInt8 = CAM_MODE_ORBIT_FOLLOW):
         self.mode = mode
         self.yaw_deg = 0.0
@@ -220,6 +225,19 @@ struct CameraRig(Copyable, Movable):
         self.world_rot = Quat()
         self.unshaken_pos = self.world_pos
         self.unshaken_rot = Quat()
+        # --- sota:camera hook (physical lens) ---
+        self.lens = PhysicalCameraModel()
+        # --- end sota:camera hook ---
+
+    # --- sota:camera hook (physical lens) ---
+    def use_lens_fov(mut self):
+        """Vertical FOV from the lens' focal length and sensor height."""
+        self.fov_deg = self.lens.fov_y_deg()
+
+    def focus_on(mut self, world_point: Vec3):
+        """Pull focus to a world point (thin-lens focus distance along the optical axis)."""
+        self.lens.focus_distance_m = max(Float32(0.05), (world_point - self.world_pos).dot(self.forward()))
+    # --- end sota:camera hook ---
 
     def add_trauma(mut self, amount: Float32):
         self.trauma = max(Float32(0.0), min(Float32(1.0), self.trauma + amount))
