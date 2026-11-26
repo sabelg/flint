@@ -142,6 +142,7 @@ from flint.render.aaa_bsdf import AAA_MATERIAL_WORDS, AaaMaterial
 from flint.render.sota_e_characters import AAA_FLAG_SOTA_E_CHARACTERS
 from flint.render.sota_e_pipeline_cache import SotaEPsoCache, sota_e_pso_cache_open, sota_e_pso_cache_save
 from flint.render.sota_e_parallel_pso import sota_e_pso_batch_begin, sota_e_pso_batch_flush
+from flint.render.sota_e_gpu_driven import SotaEGpuDriven, SOTA_E_INSTANCE_OUTLINE_BIT, SOTA_E_ROUTE_MAX_DRAWS
 # --- end sota:E hook ---
 from flint.render.material_graph import (
     MaterialAsset,
@@ -714,6 +715,7 @@ struct FlintAaaVulkanRenderer(Movable):
     # --- sota:E hook ---
     var sota_e_character_shading: Bool  # skin / eye / hair material models in the deferred pass
     var sota_e_pso: SotaEPsoCache  # validated on-disk pipeline cache (`FLINT_PSO_CACHE=0` disables)
+    var sota_e_gpu: SotaEGpuDriven  # GPU-packed alpha-mask / outline draw lists (cvar r.sota_e.gpu_driven)
     # --- end sota:E hook ---
     var enable_rt_shadows: Bool
     var enable_restir_di: Bool
@@ -1007,6 +1009,7 @@ struct FlintAaaVulkanRenderer(Movable):
         # --- sota:E hook ---
         self.sota_e_character_shading = True
         self.sota_e_pso = SotaEPsoCache()
+        self.sota_e_gpu = SotaEGpuDriven()
         # --- end sota:E hook ---
         self.enable_rt_shadows = False
         self.enable_restir_di = False
@@ -1551,6 +1554,13 @@ struct FlintAaaVulkanRenderer(Movable):
         ):
             self.sota_geom.active = False
         # --- end sota:geometry hook ---
+        # --- sota:E hook (GPU-driven alpha-mask / outline packing on Area A's culler) ---
+        _ = self.sota_e_gpu.init(
+            self.vk, self.sota_geom, FRAMES_IN_FLIGHT, self.buf_meshlets, self.ring_instances,
+            self.ring_alphamask_indirect, self.ring_outline_indirect, self.ring_globals,
+            self.buf_occluded_candidates, self.depth_img.view, self.samp_nearest,
+        )
+        # --- end sota:E hook ---
 
         # Bake & Upload 64x64 RG16F Split-Sum BRDF LUT + 64x64 RG16F Heitz LTC LUT!
         var lut_bytes = bake_split_sum_brdf_lut_rg16f(64, 128)
@@ -3759,6 +3769,7 @@ struct FlintAaaVulkanRenderer(Movable):
 
         # 1. Upload Instance SSBO + Surface-Cache Headers + TLAS Instance Records
         var frame_has_glass = False
+        self.sota_e_gpu.begin_frame()  # sota:E hook
         for i in range(n_inst):
             ref di = self.frame_instances[i]
             ref me = self.geom.meshes[di.mesh_id]
@@ -3787,12 +3798,20 @@ struct FlintAaaVulkanRenderer(Movable):
                 frame_has_glass = True
             var is_ds = (di.mesh_id < len(self.mesh_double_sided_flags) and self.mesh_double_sided_flags[di.mesh_id]) or is_am_inst
             put32(dst + 38 * 4, UInt32(me.first_index))
+            # --- sota:E hook --- bit 19 routes cel-outlined instances to the GPU outline packer
+            var sota_e_outl = len(self.cel_materials) > 0 and self.is_cel_outlined_material(mat_final)
+            if is_am_inst:
+                self.sota_e_gpu.frame_alpha_instances += 1
+            if sota_e_outl:
+                self.sota_e_gpu.frame_outline_instances += 1
+            # --- end sota:E hook ---
             put32(
                 dst + 39 * 4,
                 UInt32(mat_final & 0xFFFF)
                 | ((UInt32(1) if is_ds else UInt32(0)) << 16)
                 | ((UInt32(1) if is_am_inst else UInt32(0)) << 17)
-                | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0)),
+                | (AAA_INSTANCE_GLASS_BIT if is_glass_inst else UInt32(0))
+                | (SOTA_E_INSTANCE_OUTLINE_BIT if sota_e_outl else UInt32(0)),  # sota:E hook
             )
             var my_sc_base = 0xFFFFFF
             if i < 1024:
@@ -4102,8 +4121,19 @@ struct FlintAaaVulkanRenderer(Movable):
         put_float(g_addr + (AAA_GLOBALS_IMPACT_FRAME_WORD + 11) * 4, self.impact_frame.accent_color.z)
 
         # Pack Bucket 2 alpha-masked VisBuffer draws & hardware `CULL_MODE_FRONT` clip-space outline draws
-        var am_vis_draws = self._pack_alphamask_visbuffer_commands(n_inst, tan_x, tan_y)
-        var outline_vis_draws = 0 if self.furnace_white_dome else self._pack_outline_visbuffer_commands(n_inst, tan_x, tan_y)
+        # --- sota:E hook --- GPU-driven: the counts become max draw counts for vkCmdDrawIndexedIndirectCount
+        var sota_e_gpu_lists = self.sota_e_gpu.use(self.sota_geom) and n_inst > 0
+        var am_vis_draws: Int
+        var outline_vis_draws: Int
+        if sota_e_gpu_lists:
+            self.sota_e_gpu.reset_counters(self.buf_alphamask_indirect, self.buf_outline_indirect)
+            am_vis_draws = SOTA_E_ROUTE_MAX_DRAWS if self.sota_e_gpu.frame_alpha_instances > 0 else 0
+            var outl_on = not self.furnace_white_dome and self.sota_e_gpu.frame_outline_instances > 0
+            outline_vis_draws = SOTA_E_ROUTE_MAX_DRAWS if outl_on else 0
+        else:
+            am_vis_draws = self._pack_alphamask_visbuffer_commands(n_inst, tan_x, tan_y)
+            outline_vis_draws = 0 if self.furnace_white_dome else self._pack_outline_visbuffer_commands(n_inst, tan_x, tan_y)
+        # --- end sota:E hook ---
 
         # Reset indirect draw counters and candidate queue = 0
         put32(self.buf_indirect.cpu_address, 0)
@@ -4274,6 +4304,13 @@ struct FlintAaaVulkanRenderer(Movable):
                     self.vk, cur_slot, 0, n_inst, self.max_draws, max_ml_per_inst, self.enable_cone_cull,
                     push_cull[3] != 0, self.render_w, self.render_h, self.max_lod_error_px, use_rt_frame,
                 )
+                # --- sota:E hook ---
+                if sota_e_gpu_lists:
+                    self.sota_e_gpu.record(
+                        self.vk, self.sota_geom, cur_slot, n_inst, max_ml_per_inst, self.render_w, self.render_h,
+                        self.max_lod_error_px, am_vis_draws > 0, outline_vis_draws > 0 and self.pipe_npr_outline_gfx != 0,
+                    )
+                # --- end sota:E hook ---
             else:
                 if not self.sota_geom.legacy_hiz_occlusion:
                     push_cull[3] = 0  # v5 5-tap test is not conservative; nothing is queued, so phase 2 is a no-op
@@ -4419,13 +4456,16 @@ struct FlintAaaVulkanRenderer(Movable):
             push_vb_am[2] = bitcast[DType.uint32](jy_clip)
             self.vk.bind_graphics_pipeline(cur_slot, self.pipe_visbuffer_alphamask_gfx, self.pipe_layout, self.desc_set, push_vb_am)
             self.vk.bind_index_buffer(cur_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
-            self.vk.draw_indexed_indirect(
-                cur_slot,
-                self.buf_alphamask_indirect,
-                16,
-                am_vis_draws,
-                stride=20,
-            )
+            if sota_e_gpu_lists:  # sota:E hook
+                self.vk.draw_indexed_indirect_count(cur_slot, self.buf_alphamask_indirect, 16, self.buf_alphamask_indirect, 0, am_vis_draws, stride=20)
+            else:
+                self.vk.draw_indexed_indirect(
+                    cur_slot,
+                    self.buf_alphamask_indirect,
+                    16,
+                    am_vis_draws,
+                    stride=20,
+                )
             self.vk.end_rendering(cur_slot)
 
         # Hardware Clip-Space Variable-Width Per-Vertex Outline Pass (`pipe_npr_outline_gfx`, `CULL_MODE_FRONT`, Reverse-Z)
@@ -4449,13 +4489,16 @@ struct FlintAaaVulkanRenderer(Movable):
             push_out[4] = UInt32(self.render_h)
             self.vk.bind_graphics_pipeline(cur_slot, self.pipe_npr_outline_gfx, self.pipe_layout, self.desc_set, push_out)
             self.vk.bind_index_buffer(cur_slot, self.buf_indices, 0, INDEX_TYPE_UINT32)
-            self.vk.draw_indexed_indirect(
-                cur_slot,
-                self.buf_outline_indirect,
-                16,
-                outline_vis_draws,
-                stride=20,
-            )
+            if sota_e_gpu_lists:  # sota:E hook
+                self.vk.draw_indexed_indirect_count(cur_slot, self.buf_outline_indirect, 16, self.buf_outline_indirect, 0, outline_vis_draws, stride=20)
+            else:
+                self.vk.draw_indexed_indirect(
+                    cur_slot,
+                    self.buf_outline_indirect,
+                    16,
+                    outline_vis_draws,
+                    stride=20,
+                )
             self.vk.end_rendering(cur_slot)
 
         self.vk.transition_image(
@@ -5873,6 +5916,7 @@ struct FlintAaaVulkanRenderer(Movable):
         self.vk.destroy_sampler(self.samp_nearest)
 
         self.vk.destroy_pipeline(self.pipe_meshlet_cull)
+        self.sota_e_gpu.shutdown(self.vk)  # sota:E hook
         self.sota_geom.shutdown(self.vk)  # sota:geometry hook
         self.vk.destroy_pipeline(self.pipe_visbuffer_gfx)
         self.vk.destroy_pipeline(self.pipe_visbuffer_alphamask_gfx)
