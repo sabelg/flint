@@ -810,11 +810,13 @@ struct StudioEntityMetaComponent(SerializableComponent):
     comptime STORAGE_MODE: Int = STORAGE_TABLE
     comptime SCHEMA_NAME: StaticString = "StudioEntityMetaComponent"
     comptime SCHEMA_FOURCC: UInt32 = fourcc("SMET")
-    comptime SCHEMA_VERSION: Int = 2
+    # v2 adds `enabled`; v3 adds `visible` (the user's Visible switch, kept apart from `enabled`).
+    comptime SCHEMA_VERSION: Int = 3
 
     var name: String
     var locked: Bool
     var enabled: Bool
+    var visible: Bool
     var mesh_handle_packed: UInt64
     var material_handle_packed: UInt64
     var collider_kind: Int
@@ -835,10 +837,12 @@ struct StudioEntityMetaComponent(SerializableComponent):
         friction: Float32 = 0.55,
         bvh_slot: Int = -1,
         enabled: Bool = True,
+        visible: Bool = True,
     ):
         self.name = name
         self.locked = locked
         self.enabled = enabled
+        self.visible = visible
         self.mesh_handle_packed = mesh_handle_packed
         self.material_handle_packed = material_handle_packed
         self.collider_kind = collider_kind
@@ -858,6 +862,7 @@ struct StudioEntityMetaComponent(SerializableComponent):
         out.f32(self.friction)
         out.integer(self.bvh_slot)
         out.boolean(self.enabled)
+        out.boolean(self.visible)
 
     @staticmethod
     def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
@@ -871,9 +876,12 @@ struct StudioEntityMetaComponent(SerializableComponent):
         var fric = reader.f32()
         var bvh = reader.integer()
         var en = reader.boolean() if version >= 2 else True
+        # Pre-v3 files have no Visible flag: True, and `_sync_compat_view` takes an enabled
+        # entity's Visible from its mesh renderer (which those files did store).
+        var vis = reader.boolean() if version >= 3 else True
         if reader.failed:
             raise Error("Truncated StudioEntityMetaComponent")
-        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh, en)
+        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh, en, vis)
 
     def write_json(self) -> String:
         return (
@@ -887,6 +895,7 @@ struct StudioEntityMetaComponent(SerializableComponent):
             + ", \"friction\": " + _f32_s(self.friction)
             + ", \"bvh_slot\": " + String(self.bvh_slot)
             + ", \"enabled\": " + ("true" if self.enabled else "false")
+            + ", \"visible\": " + ("true" if self.visible else "false")
             + "}"
         )
 
@@ -902,7 +911,8 @@ struct StudioEntityMetaComponent(SerializableComponent):
         var fric = Float32(doc.number(doc.object_get(node, "friction"), 0.55))
         var bvh = doc.integer(doc.object_get(node, "bvh_slot"), -1)
         var en = doc.boolean(doc.object_get(node, "enabled"), True)
-        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh, en)
+        var vis = doc.boolean(doc.object_get(node, "visible"), True)  # absent in pre-v3 scenes
+        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh, en, vis)
 
 
 struct StudioStyleComponent(SerializableComponent, ImplicitlyCopyable):
@@ -2382,6 +2392,7 @@ struct FlintStudioState(Movable):
     var anim_mode: Int
     var ui_scale: Float32
     var _next_tx_id: UInt64
+    var undo_byte_budget: Int  # undo + redo history cap in bytes (default `MAX_UNDO_BLOB_BYTES`)
     var _active_tx_agent_id: Int
     var _active_tx_step_id: UInt64
     var workspace_mgr: WorkspacePresetManager
@@ -2568,6 +2579,7 @@ struct FlintStudioState(Movable):
         self.anim_mode = UI_ANIM_NORMAL
         self.ui_scale = Float32(1.0)
         self._next_tx_id = UInt64(1)
+        self.undo_byte_budget = MAX_UNDO_BLOB_BYTES
         self._active_tx_agent_id = 0
         self._active_tx_step_id = UInt64(0)
         self.ui_ctx.dock_style_v2 = True
@@ -2973,9 +2985,12 @@ struct FlintStudioState(Movable):
                 v.name = meta.name
                 v.locked = meta.locked
                 v.enabled = meta.enabled
-                if not meta.enabled:
-                    # A disabled entity's mesh is hidden, but its own Visible switch keeps its value.
-                    v.visible = prev_visible
+                if not meta.enabled or not v.has_mesh_renderer:
+                    # Visible is persisted on the meta component: a disabled entity's mesh is hidden
+                    # but its own Visible switch keeps its value, and a light has no mesh to hide.
+                    # An enabled mesh draws exactly when Visible is on, so the renderer flag stands
+                    # (it is also the only record of Visible in pre-v3 scenes).
+                    v.visible = meta.visible
                 v.mesh_handle = UntypedHandle(meta.mesh_handle_packed)
                 v.material_handle = UntypedHandle(meta.material_handle_packed)
                 v.collider_kind = meta.collider_kind
@@ -7432,15 +7447,20 @@ struct FlintStudioState(Movable):
         for _ in range(min(n, count)):
             _ = stack.pop()
 
+    def set_undo_byte_budget(mut self, budget_bytes: Int):
+        """Sets the undo + redo byte cap (default `MAX_UNDO_BLOB_BYTES`) and enforces it right away."""
+        self.undo_byte_budget = max(0, budget_bytes)
+        self._enforce_undo_budget()
+
     def _enforce_undo_budget(mut self):
-        """Keeps history within `MAX_UNDO_STACK` entries and `MAX_UNDO_BLOB_BYTES` (undo + redo), evicting
+        """Keeps history within `MAX_UNDO_STACK` entries and `undo_byte_budget` (undo + redo), evicting
         the oldest undo entries first, then the furthest redo entries. The newest undo entry is always
         kept. When the saved state's entry is evicted, the save point moves to wherever it is still
         reachable (the bottom of the stack), or becomes unreachable so undo never fakes a clean scene."""
         var total = self.undo_history_bytes()
         var n = len(self.undo_stack)
         var drop = 0
-        while n - drop > 1 and (n - drop > MAX_UNDO_STACK or total > MAX_UNDO_BLOB_BYTES):
+        while n - drop > 1 and (n - drop > MAX_UNDO_STACK or total > self.undo_byte_budget):
             total -= self.undo_stack[drop].approx_bytes()
             drop += 1
         if drop > 0:
@@ -7455,7 +7475,7 @@ struct FlintStudioState(Movable):
                 self._saved_tx_id = UInt64(0xFFFFFFFFFFFFFFFF)
             Self._drop_front(self.undo_stack, drop)
         var rdrop = 0
-        while rdrop < len(self.redo_stack) and total > MAX_UNDO_BLOB_BYTES:
+        while rdrop < len(self.redo_stack) and total > self.undo_byte_budget:
             total -= self.redo_stack[rdrop].approx_bytes()
             rdrop += 1
         Self._drop_front(self.redo_stack, rdrop)
@@ -8236,6 +8256,7 @@ struct FlintStudioState(Movable):
                 updated.friction,
                 bvh_s,
                 eff_en,
+                updated.visible,
             ),
         )
 
