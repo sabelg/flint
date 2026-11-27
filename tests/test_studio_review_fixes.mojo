@@ -280,6 +280,9 @@ def test_recover_autosave_keeps_path_and_stays_dirty() raises:
     studio.scene_file_path = d + "/scenes/level.flscnb"
     _ = studio.spawn_entity("Saved")
     assert_true(studio.save_scene_file())
+    # File mtimes tick with the kernel's coarse clock (a few ms): without a gap the autosave
+    # can get the scene file's exact mtime and not count as "newer", which made this flaky.
+    _ = external_call["usleep", Int32](UInt32(50000))
     _ = studio.spawn_entity("Unsaved 1")
     _ = studio.spawn_entity("Unsaved 2")
     studio._sync_ecs_and_physics()
