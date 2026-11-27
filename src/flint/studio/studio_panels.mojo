@@ -957,8 +957,10 @@ def draw_outliner_panel_v2(
         elif ui.key_bs_pressed and state.search_query.byte_length() > 0:
             var next_q = utf8_drop_last_char(state.search_query)
             state.search_query = next_q
-        elif ui.text_utf8.byte_length() > 0 and not ui.key_ctrl:
-            state.search_query += ui.text_utf8
+        elif (ui.text_utf8.byte_length() > 0 or ui.ime_commit.byte_length() > 0) and not ui.key_ctrl:
+            state.search_query += ui.text_utf8 + ui.ime_commit
+            ui.ime_commit = ""
+        ui.text_caret_rect = RectF(search_r.right() - Float32(4.0), search_r.y + Float32(2.0), Float32(2.0), max(Float32(1.0), search_r.h - Float32(4.0)))
 
     ui.draw_list.add_rect_styled(
         search_r.x, search_r.y, search_r.w, search_r.h,
@@ -1296,6 +1298,7 @@ def draw_inspector_panel_v2(
     var name_foc = (not blocked) and ui.focused_id == name_wid
     var edit_name = entity.name
     if name_foc:
+        ui.text_caret_rect = RectF(name_r.right() - Float32(4.0), name_r.y + Float32(2.0), Float32(2.0), Float32(18.0))
         ui._focused_text_id = name_wid
         ui._focused_text_seen = True
         ui._text_widget_ids.append(name_wid)
@@ -1307,8 +1310,9 @@ def draw_inspector_panel_v2(
             edit_name = next_n
             act.changed_name = True
             act.new_name = edit_name
-        elif ui.text_utf8.byte_length() > 0 and not ui.key_ctrl:
-            edit_name += ui.text_utf8
+        elif (ui.text_utf8.byte_length() > 0 or ui.ime_commit.byte_length() > 0) and not ui.key_ctrl:
+            edit_name += ui.text_utf8 + ui.ime_commit
+            ui.ime_commit = ""
             act.changed_name = True
             act.new_name = edit_name
     if name_foc or name_hov:

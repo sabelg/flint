@@ -394,6 +394,10 @@ struct InputState(Copyable, Movable):
     var ime_sel_len: Int
     var ime_active: Bool
     var ime_commit: String
+    # IME `delete_surrounding_text` this frame: UTF-8 bytes to remove before / after the caret
+    # (applied before `ime_commit` is inserted). Cleared by `begin_frame`.
+    var ime_delete_before: Int
+    var ime_delete_after: Int
     # Typematic key repeat (`key_pressed_or_repeat`): the last non-modifier key pressed repeats after
     # `repeat_delay_ms`, `repeat_rate_hz` times a second while it is held. Rate 0 turns synthesis off
     # (repeat disabled, or the platform sends its own repeat presses, as X11 does).
@@ -442,6 +446,8 @@ struct InputState(Copyable, Movable):
         self.ime_sel_len = 0
         self.ime_active = False
         self.ime_commit = String()
+        self.ime_delete_before = 0
+        self.ime_delete_after = 0
         self.repeat_rate_hz = KEY_REPEAT_RATE_HZ
         self.repeat_delay_ms = KEY_REPEAT_DELAY_MS
         self.repeat_key = -1
@@ -468,6 +474,8 @@ struct InputState(Copyable, Movable):
         self.text_input_utf8 = String()
         self.dropped_files.clear()
         self.ime_commit = String()
+        self.ime_delete_before = 0
+        self.ime_delete_after = 0
         self.repeat_fired_key = -1
         self.repeat_fired_count = 0
 
@@ -580,12 +588,19 @@ struct InputState(Copyable, Movable):
         self.ime_sel_len = 0
         self.ime_active = False
 
+    def delete_ime_surrounding(mut self, before_bytes: Int, after_bytes: Int):
+        """IME `delete_surrounding_text`: UTF-8 bytes around the caret to remove before the commit."""
+        self.ime_delete_before += max(0, before_bytes)
+        self.ime_delete_after += max(0, after_bytes)
+
     def clear_ime_preedit(mut self):
         self.ime_preedit = String()
         self.ime_cursor_cp = 0
         self.ime_sel_len = 0
         self.ime_active = False
         self.ime_commit = String()
+        self.ime_delete_before = 0
+        self.ime_delete_after = 0
 
     def push_dropped_file(mut self, path: String):
         self.dropped_files.append(path)
