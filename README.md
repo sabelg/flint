@@ -47,6 +47,14 @@ bash tools/flint.sh new ../my-flint-game
 
 ---
 
+## Edit a scene in Flint Studio
+
+Run `bash tools/flint.sh studio` to open the editor. Use the workspace tabs across the top, or click the current workspace name in a narrow window. **Ctrl+K** opens the command palette.
+
+- Search the hierarchy by name, including objects inside collapsed branches. Use the arrow keys to navigate and **Home** or **End** to reach either end of the visible tree.
+- Select an object to edit its transform, surface and collision properties in the Inspector. **Frame** brings the selection into view. **Q** switches to selection, and **W**, **E** and **R** switch to move, rotate and scale.
+- In **Assets**, choose **Import** to copy a file into the project. Filter the resulting list by name. **Create** exposes scene objects when the drawer is compact.
+
 ## Open source in TurboMojo
 
 To open the project in its own graphical IDE window, run `bash ~/flint/tools/flint.sh studio --ide-gui` from the game directory. You can append a file or `FILE:LINE:COLUMN`. Build the desktop frontend with `pixi run build-gui` in the TurboMojo checkout. Flint looks for `tmide-gui` on PATH or in `~/IDE/build`. Set `FLINT_TURBOMOJO_GUI` to select another build.

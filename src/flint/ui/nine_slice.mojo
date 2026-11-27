@@ -89,9 +89,9 @@ def mix(a: Int, b: Int, t: Float32) -> Int:
 
 
 def slate_panel() -> NineSlice:
-    """The carved slate tablet of `panel()` in render/interface.mojo: a dark
-    body, a lighter upper face, a teal-lit top edge and a groove along the
-    bottom, with rounded corners."""
+    """Obsidian slate tablet for `panel()` fallback rendering: matte graphite
+    body, subtly lit upper face, hairline specular top edge, and a recessed
+    bottom groove with rounded corners."""
     comptime SIZE = 48
     comptime BORDER = 16
     var image = NineSlice(SIZE, SIZE, BORDER, BORDER, BORDER, BORDER)
@@ -100,33 +100,33 @@ def slate_panel() -> NineSlice:
             var coverage = rounded_coverage(x, y, SIZE, SIZE, 11)
             if coverage <= 0:
                 continue
-            var red = 12
-            var green = 24
-            var blue = 36
-            # The upper face catches light, fading out by the end of the border.
+            var red = 22
+            var green = 26
+            var blue = 32
+            # Subtle upper-face sheen matching Flint Obsidian L1->L2 elevation.
             if y < BORDER:
-                var t = Float32(BORDER - y) / Float32(BORDER) * 0.32
+                var t = Float32(BORDER - y) / Float32(BORDER) * 0.28
                 red = mix(red, 40, t)
-                green = mix(green, 62, t)
-                blue = mix(blue, 74, t)
-            # Teal-lit top edge, inset from the corners.
+                green = mix(green, 47, t)
+                blue = mix(blue, 58, t)
+            # Crisp neutral specular top edge, inset from the corners.
             if (y == 2 or y == 3) and x >= 6 and x < SIZE - 6:
-                var t = Float32(0.55) if y == 2 else Float32(0.3)
-                red = mix(red, 98, t)
-                green = mix(green, 178, t)
-                blue = mix(blue, 170, t)
-            # A deep groove along the bottom.
+                var t = Float32(0.24) if y == 2 else Float32(0.10)
+                red = mix(red, 238, t)
+                green = mix(green, 242, t)
+                blue = mix(blue, 247, t)
+            # Deep obsidian groove along the bottom.
             if (y == SIZE - 5 or y == SIZE - 4) and x >= 8 and x < SIZE - 8:
-                red = mix(red, 2, 0.6)
-                green = mix(green, 6, 0.6)
-                blue = mix(blue, 10, 0.6)
+                red = mix(red, 8, 0.55)
+                green = mix(green, 10, 0.55)
+                blue = mix(blue, 14, 0.55)
             image.set(x, y, argb(Int(coverage * 255.0 + 0.5), red, green, blue))
     return image^
 
 
 def focus_frame() -> NineSlice:
-    """A gold ring that glows inward, drawn over the focused widget. The
-    centre is empty, so it stretches to any size for free."""
+    """Flint Ember focus ring that glows inward, drawn over the focused widget.
+    The centre is empty, so it stretches to any size for free."""
     comptime SIZE = 40
     comptime BORDER = 14
     var image = NineSlice(SIZE, SIZE, BORDER, BORDER, BORDER, BORDER)
@@ -140,11 +140,11 @@ def focus_frame() -> NineSlice:
             if depth <= 3:
                 alpha = 1.0          # the ring itself
             else:
-                alpha = max(Float32(0), 0.45 * (1.0 - (depth - 3.0) / 8.0))   # inner glow
+                alpha = max(Float32(0), 0.42 * (1.0 - (depth - 3.0) / 8.0))   # inner glow
             alpha *= coverage
             if alpha <= 0:
                 continue
-            image.set(x, y, argb(Int(alpha * 255.0 + 0.5), 255, 211 if depth <= 3 else 236, 112 if depth <= 3 else 150))
+            image.set(x, y, argb(Int(alpha * 255.0 + 0.5), 255 if depth <= 3 else 245, 184 if depth <= 3 else 155, 117 if depth <= 3 else 76))
     return image^
 
 

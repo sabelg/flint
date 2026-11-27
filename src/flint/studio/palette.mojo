@@ -18,6 +18,8 @@ from flint.ui.draw_list import UI_FLAG_BORDER, UI_FLAG_TOP_BEVEL, UiDrawList
 from flint.ui.flexbox_dock import RectF
 from flint.ui.icons import draw_studio_icon
 from flint.ui.theme import (
+    ICON_CLOCK,
+    ICON_CLOSE,
     ICON_CODE,
     ICON_CUBE,
     ICON_FILE,
@@ -201,6 +203,7 @@ struct StudioCommandPalette(Copyable, Movable):
     var selected_idx: Int
     var scroll_top: Int
     var visible_rows: Int
+    var viewport_rows: Int
     var frecency: FrecencyStore
     var now_sec: Int
 
@@ -216,6 +219,7 @@ struct StudioCommandPalette(Copyable, Movable):
         self.selected_idx = 0
         self.scroll_top = 0
         self.visible_rows = max(1, visible_rows)
+        self.viewport_rows = self.visible_rows
         self.frecency = FrecencyStore()
         self.now_sec = 0
 
@@ -231,6 +235,7 @@ struct StudioCommandPalette(Copyable, Movable):
         self.selected_idx = copy.selected_idx
         self.scroll_top = copy.scroll_top
         self.visible_rows = copy.visible_rows
+        self.viewport_rows = copy.viewport_rows
         self.frecency = copy.frecency.copy()
         self.now_sec = copy.now_sec
 
@@ -358,11 +363,12 @@ struct StudioCommandPalette(Copyable, Movable):
             self.scroll_top = 0
             return
         self.selected_idx = max(0, min(n - 1, self.selected_idx))
-        var max_top = max(0, n - self.visible_rows)
+        var rows = max(1, min(self.viewport_rows, self.visible_rows))
+        var max_top = max(0, n - rows)
         if self.selected_idx < self.scroll_top:
             self.scroll_top = self.selected_idx
-        elif self.selected_idx >= self.scroll_top + self.visible_rows:
-            self.scroll_top = self.selected_idx - self.visible_rows + 1
+        elif self.selected_idx >= self.scroll_top + rows:
+            self.scroll_top = self.selected_idx - rows + 1
         self.scroll_top = max(0, min(max_top, self.scroll_top))
 
     def move_selection(mut self, delta: Int):
@@ -380,7 +386,7 @@ struct StudioCommandPalette(Copyable, Movable):
         var n = len(self.results)
         if n == 0:
             return
-        var step = max(1, self.visible_rows - 1) * delta_pages
+        var step = max(1, min(self.visible_rows, self.viewport_rows) - 1) * delta_pages
         self.selected_idx = max(0, min(n - 1, self.selected_idx + step))
         self._sync_scroll()
 
@@ -560,31 +566,129 @@ def _pal_measure_text(font: SdfFont, text: String, size_px: Float32) -> Float32:
     return Float32(len(decode_utf8(text))) * size_px * Float32(0.56)
 
 
-def _pal_draw_text(
+def _pal_draw_text_cy(
     mut dl: UiDrawList,
     font_slot: Int,
     font: SdfFont,
     text: String,
     x: Float32,
-    y: Float32,
+    center_y: Float32,
     size_px: Float32,
     color: UInt32,
 ):
+    """Optically centers `text` vertically around `center_y` using cap-height metrics."""
     if text.byte_length() == 0:
         return
     if font.valid:
-        dl.add_text(font_slot, font, text, x, y + size_px * Float32(0.82), size_px, color)
+        var cap_ratio = (
+            font.cap_height / font.bake_px
+            if (font.bake_px > Float32(0.0) and font.cap_height > Float32(0.0))
+            else Float32(0.72)
+        )
+        var baseline = center_y + Float32(0.5) * cap_ratio * size_px
+        dl.add_text(font_slot, font, text, x, baseline, size_px, color)
     else:
         var n_cp = len(decode_utf8(text))
         if n_cp > 0:
             dl.add_rect(
                 x,
-                y + size_px * Float32(0.20),
+                center_y - size_px * Float32(0.30),
                 Float32(n_cp) * size_px * Float32(0.54),
                 size_px * Float32(0.60),
                 rgba8_scale_alpha(color, Float32(0.45)),
                 Float32(2.0),
             )
+
+
+def _pal_split_shortcut(shortcut: String) -> List[String]:
+    """Splits compound shortcuts like `"Ctrl+Shift+Z"` into `["Ctrl", "Shift", "Z"]`."""
+    var out = List[String]()
+    var n = shortcut.byte_length()
+    if n == 0:
+        return out^
+    var bytes = shortcut.as_bytes()
+    var start = 0
+    for i in range(n):
+        if bytes[i] == 43 and i > start and i + 1 < n:  # '+'
+            var tok = String(String(shortcut[byte=start:i]).strip())
+            if tok.byte_length() > 0:
+                out.append(tok)
+            start = i + 1
+    var tail = String(String(shortcut[byte=start:n]).strip())
+    if tail.byte_length() > 0:
+        out.append(tail)
+    return out^
+
+
+def _pal_draw_keycap(
+    mut dl: UiDrawList,
+    font_slot: Int,
+    font: SdfFont,
+    theme: StudioTheme,
+    label: String,
+    x: Float32,
+    center_y: Float32,
+    cap_h: Float32,
+    font_sz: Float32,
+    alpha: Float32,
+    fg_col: UInt32,
+    hovered: Bool = False,
+) -> Float32:
+    """Draws one tactile beveled keycap chip and returns its width."""
+    var tw = _pal_measure_text(font, label, font_sz)
+    var cw = max(cap_h, tw + Float32(10.0))
+    var cy0 = center_y - cap_h * Float32(0.5)
+    dl.add_rect(
+        x, cy0 + Float32(1.0), cw, cap_h,
+        rgba8_scale_alpha(rgba8_with_alpha(0x000000, 96), alpha),
+        theme.radius_xs,
+    )
+    var fill = theme.l3_hover if hovered else theme.l2_card
+    var bdr = theme.border_strong if hovered else theme.border_control
+    dl.add_rect_styled(
+        x, cy0, cw, cap_h,
+        rgba8_scale_alpha(fill, alpha),
+        rgba8_scale_alpha(bdr, alpha),
+        theme.radius_xs, Float32(1.0), Float32(1.0),
+        UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+    )
+    _pal_draw_text_cy(
+        dl, font_slot, font, label,
+        x + (cw - tw) * Float32(0.5), center_y, font_sz,
+        rgba8_scale_alpha(fg_col, alpha),
+    )
+    return cw
+
+
+def _pal_draw_keycaps_rtl(
+    mut dl: UiDrawList,
+    font_slot: Int,
+    font: SdfFont,
+    theme: StudioTheme,
+    shortcut: String,
+    right_x: Float32,
+    center_y: Float32,
+    alpha: Float32,
+    enabled: Bool,
+) -> Float32:
+    """Draws split shortcut keycaps right-to-left from `right_x` and returns the new left edge."""
+    var tokens = _pal_split_shortcut(shortcut)
+    if len(tokens) == 0:
+        return right_x
+    var sz = Float32(10.0)
+    var cap_h = Float32(18.0)
+    var pen = right_x
+    var fg = theme.text_secondary if enabled else theme.text_muted
+    var k = len(tokens) - 1
+    while k >= 0:
+        var tok = tokens[k]
+        var tw = _pal_measure_text(font, tok, sz)
+        var cw = max(Float32(18.0), tw + Float32(10.0))
+        pen -= cw
+        _ = _pal_draw_keycap(dl, font_slot, font, theme, tok, pen, center_y, cap_h, sz, alpha, fg, False)
+        pen -= Float32(4.0)
+        k -= 1
+    return pen
 
 
 def _pal_truncate(font: SdfFont, text: String, size_px: Float32, max_w: Float32) -> String:
@@ -625,13 +729,14 @@ def _pal_draw_highlighted_title(
     title: String,
     byte_spans: List[FuzzySpan],
     x: Float32,
-    y: Float32,
+    center_y: Float32,
     size_px: Float32,
     base_col: UInt32,
     hi_col: UInt32,
+    hi_bg_col: UInt32,
 ):
     if len(byte_spans) == 0:
-        _pal_draw_text(dl, font_slot, font, title, x, y, size_px, base_col)
+        _pal_draw_text_cy(dl, font_slot, font, title, x, center_y, size_px, base_col)
         return
     var n_bytes = title.byte_length()
     var pen = x
@@ -641,16 +746,26 @@ def _pal_draw_highlighted_title(
         var s1 = max(s0, min(n_bytes, byte_spans[si].end))
         if s0 > cursor:
             var seg = String(title[byte=cursor:s0])
-            _pal_draw_text(dl, font_slot, font, seg, pen, y, size_px, base_col)
+            _pal_draw_text_cy(dl, font_slot, font, seg, pen, center_y, size_px, base_col)
             pen += _pal_measure_text(font, seg, size_px)
         if s1 > s0:
             var hseg = String(title[byte=s0:s1])
-            _pal_draw_text(dl, font_slot, font, hseg, pen, y, size_px, hi_col)
-            pen += _pal_measure_text(font, hseg, size_px)
+            var hw = _pal_measure_text(font, hseg, size_px)
+            if (hi_bg_col >> 24) > 0 and hw > Float32(1.0):
+                dl.add_rect(
+                    pen - Float32(1.5),
+                    center_y - size_px * Float32(0.56),
+                    hw + Float32(3.0),
+                    size_px * Float32(1.16),
+                    hi_bg_col,
+                    Float32(3.0),
+                )
+            _pal_draw_text_cy(dl, font_slot, font, hseg, pen, center_y, size_px, hi_col)
+            pen += hw
         cursor = s1
     if cursor < n_bytes:
         var tail = String(title[byte=cursor:n_bytes])
-        _pal_draw_text(dl, font_slot, font, tail, pen, y, size_px, base_col)
+        _pal_draw_text_cy(dl, font_slot, font, tail, pen, center_y, size_px, base_col)
 
 
 def draw_command_palette(
@@ -667,36 +782,51 @@ def draw_command_palette(
     mouse_down: Bool,
     mouse_pressed: Bool,
     key_shift: Bool = False,
+    mouse_wheel: Float32 = 0,
+    mouse_moved: Bool = True,
+    mono_slot: Int = -1,
+    mono_font: SdfFont = SdfFont(),
 ) -> PaletteActionResult:
-    """Renders the frosted-glass Command Palette modal with animated reveal, sliding mode tabs,
-    matched-span highlighting, shortcut keycaps, and mouse click selection."""
+    """Renders the frosted-glass Command Palette modal with animated reveal, sliding scope tabs,
+    right-aligned category pills, matched-span highlighting, split beveled keycaps, and scrollbar."""
     var action = PaletteActionResult()
     var target_open = Float32(1.0) if palette.is_open else Float32(0.0)
-    var reveal = anim.drive_aux(UInt64(0x50414C4554544501), target_open, SpringConfig.snappy())
-    if anim.mode == UI_ANIM_INSTANT:
-        reveal = target_open
+    var reveal = anim.drive_reveal(
+        UInt64(0x50414C4554544501), target_open, Float32(0.0), SpringConfig.snappy()
+    )
     if (not palette.is_open) and reveal <= Float32(0.01):
         return action^
 
-    var sw = max(Float32(360.0), screen_w if isfinite(screen_w) else Float32(1280.0))
-    var sh = max(Float32(240.0), screen_h if isfinite(screen_h) else Float32(720.0))
+    var use_mono = mono_slot >= 0 and mono_font.valid
+    var k_slot = mono_slot if use_mono else font_slot
+    ref k_font = mono_font if use_mono else font
+
+    var sw = max(Float32(1), screen_w if isfinite(screen_w) else Float32(1280))
+    var sh = max(Float32(1), screen_h if isfinite(screen_h) else Float32(720))
     var alpha = max(Float32(0.0), min(Float32(1.0), reveal))
 
     # Full-screen translucent scrim
     dl.add_rect(Float32(0.0), Float32(0.0), sw, sh, rgba8_scale_alpha(theme.l4_scrim, alpha))
 
-    var pal_w = min(Float32(560.0), sw - Float32(40.0))
+    var compact_h = sh < Float32(400.0)
+    var margin = Float32(8.0) if (sw < Float32(480.0) or compact_h) else Float32(20.0)
+    var pal_w = max(Float32(1.0), min(Float32(600.0), sw - Float32(2.0) * margin))
     var n_res = len(palette.results)
-    var shown_rows = max(1, min(palette.visible_rows, n_res))
     var row_h = Float32(34.0)
-    var header_h = Float32(44.0)
-    var tabs_h = Float32(30.0)
-    var footer_h = Float32(26.0)
-    var pal_h = header_h + tabs_h + Float32(shown_rows) * row_h + footer_h + Float32(12.0)
+    var header_h = Float32(44.0) if compact_h else Float32(48.0)
+    var tabs_h = Float32(30.0) if compact_h else Float32(34.0)
+    var footer_h = Float32(26.0) if compact_h else Float32(28.0)
+    var chrome_h = header_h + tabs_h + footer_h + Float32(12.0)
+    palette.viewport_rows = max(
+        1, min(palette.visible_rows, Int((sh - Float32(2.0) * margin - chrome_h) / row_h))
+    )
+    palette._sync_scroll()
+    var shown_rows = max(1, min(palette.viewport_rows, n_res)) if n_res > 0 else (2 if not compact_h else 1)
+    var pal_h = chrome_h + Float32(shown_rows) * row_h
 
-    var lift_y = (Float32(1.0) - alpha) * Float32(-14.0)
+    var lift_y = (Float32(1.0) - alpha) * Float32(-12.0)
     var px = (sw - pal_w) * Float32(0.5)
-    var py = max(Float32(48.0), sh * Float32(0.14)) + lift_y
+    var py = max(margin, min(sh - pal_h - margin, max(Float32(48.0), sh * Float32(0.13))) + lift_y)
     var pal_r = RectF(px, py, pal_w, pal_h)
 
     if palette.is_open and mouse_pressed and (not pal_r.contains(mouse_x, mouse_y)):
@@ -704,7 +834,11 @@ def draw_command_palette(
         action.closed = True
         return action^
 
-    # Main frosted-glass palette container
+    # Two-layer elevation: ambient drop shadow + frosted-glass palette container
+    dl.add_ambient_shadow(
+        pal_r.x, pal_r.y, pal_r.w, pal_r.h,
+        theme.radius_lg, Float32(18.0), Int(Float32(165.0) * alpha), Float32(6.0),
+    )
     dl.add_glass_panel(
         pal_r.x, pal_r.y, pal_r.w, pal_r.h,
         rgba8_scale_alpha(theme.l4_overlay, alpha),
@@ -717,44 +851,117 @@ def draw_command_palette(
     )
 
     # ---- Search Input Row ----
-    var search_y = pal_r.y + Float32(10.0)
-    draw_studio_icon(dl, ICON_SEARCH, pal_r.x + Float32(14.0), search_y + Float32(5.0), Float32(16.0), rgba8_scale_alpha(theme.accent_primary, alpha), Float32(1.6))
-    var q_x = pal_r.x + Float32(38.0)
-    if palette.raw_query.byte_length() > 0:
-        _pal_draw_text(dl, font_slot, font, palette.raw_query, q_x, search_y + Float32(4.0), Float32(14.5), rgba8_scale_alpha(theme.text_primary, alpha))
-        var qw = _pal_measure_text(font, palette.raw_query, Float32(14.5))
-        var blink_on = (anim.mode == UI_ANIM_INSTANT) or ((Int(anim.time_sec * Float32(2.0)) % 2) == 0)
-        if blink_on:
-            dl.add_rect(q_x + qw + Float32(2.0), search_y + Float32(4.0), Float32(1.8), Float32(17.0), rgba8_scale_alpha(theme.accent_primary, alpha), Float32(0.8))
-    else:
-        _pal_draw_text(
-            dl, font_slot, font,
-            "Type command, +spawn, @entity, #asset...",
-            q_x, search_y + Float32(4.5), Float32(13.5),
-            rgba8_scale_alpha(theme.text_muted, alpha),
-        )
-    # ESC keycap pill
-    var esc_r = RectF(pal_r.right() - Float32(44.0), search_y + Float32(3.0), Float32(32.0), Float32(20.0))
-    dl.add_rect(esc_r.x, esc_r.y, esc_r.w, esc_r.h, rgba8_scale_alpha(theme.l2_card, alpha), Float32(4.0), Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha))
-    _pal_draw_text(dl, font_slot, font, "ESC", esc_r.x + Float32(6.0), esc_r.y + Float32(4.0), Float32(10.0), rgba8_scale_alpha(theme.text_muted, alpha))
-    if palette.is_open and esc_r.contains(mouse_x, mouse_y) and mouse_pressed:
+    var hdr_cy = pal_r.y + header_h * Float32(0.5)
+    draw_studio_icon(
+        dl, ICON_SEARCH,
+        pal_r.x + Float32(15.0), hdr_cy - Float32(8.0), Float32(16.0),
+        rgba8_scale_alpha(theme.accent_primary, alpha), Float32(1.6),
+    )
+
+    # Right header controls laid out RTL: [ESC] [× clear] [N matches]
+    var hdr_right = pal_r.right() - Float32(12.0)
+    var esc_sz = Float32(10.0)
+    var esc_w = max(Float32(34.0), _pal_measure_text(k_font, "ESC", esc_sz) + Float32(12.0))
+    var esc_r = RectF(hdr_right - esc_w, hdr_cy - Float32(11.0), esc_w, Float32(22.0))
+    var esc_hov = palette.is_open and esc_r.contains(mouse_x, mouse_y)
+    _ = _pal_draw_keycap(
+        dl, k_slot, k_font, theme, "ESC",
+        esc_r.x, hdr_cy, Float32(22.0), esc_sz, alpha,
+        theme.text_primary if esc_hov else theme.text_secondary, esc_hov,
+    )
+    if esc_hov and mouse_pressed:
         palette.close()
         action.closed = True
         return action^
+    hdr_right = esc_r.x - Float32(6.0)
 
-    dl.add_line(pal_r.x + Float32(1.0), pal_r.y + header_h, pal_r.right() - Float32(1.0), pal_r.y + header_h, Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha))
+    if palette.raw_query.byte_length() > 0:
+        var clr_r = RectF(hdr_right - Float32(22.0), hdr_cy - Float32(11.0), Float32(22.0), Float32(22.0))
+        var clr_hov = palette.is_open and clr_r.contains(mouse_x, mouse_y)
+        if clr_hov:
+            dl.add_rect(clr_r.x, clr_r.y, clr_r.w, clr_r.h, rgba8_scale_alpha(theme.l3_hover, alpha), theme.radius_xs)
+        draw_studio_icon(
+            dl, ICON_CLOSE,
+            clr_r.center_x() - Float32(5.0), clr_r.center_y() - Float32(5.0), Float32(10.0),
+            rgba8_scale_alpha(theme.text_primary if clr_hov else theme.text_muted, alpha), Float32(1.5),
+        )
+        if clr_hov and mouse_pressed:
+            palette.base_mode = PALETTE_ALL
+            palette.set_query("")
+        hdr_right = clr_r.x - Float32(6.0)
 
-    # ---- Mode Filter Tabs with Sliding Pill ----
-    var tab_y = pal_r.y + header_h + Float32(4.0)
+    if pal_w >= Float32(460.0):
+        var cnt_txt = String(n_res) + (" match" if n_res == 1 else " matches")
+        var cnt_w = _pal_measure_text(k_font, cnt_txt, Float32(10.5))
+        _pal_draw_text_cy(
+            dl, k_slot, k_font, cnt_txt,
+            hdr_right - cnt_w, hdr_cy, Float32(10.5),
+            rgba8_scale_alpha(theme.text_muted, alpha),
+        )
+        hdr_right -= cnt_w + Float32(10.0)
+
+    var q_x = pal_r.x + Float32(40.0)
+    var q_sz = Float32(14.0) if compact_h else Float32(15.0)
+    dl.push_clip(Int(q_x), Int(pal_r.y), Int(max(q_x, hdr_right)), Int(pal_r.y + header_h))
+    if palette.raw_query.byte_length() > 0:
+        _pal_draw_text_cy(
+            dl, font_slot, font, palette.raw_query,
+            q_x, hdr_cy, q_sz, rgba8_scale_alpha(theme.text_primary, alpha),
+        )
+        var qw = _pal_measure_text(font, palette.raw_query, q_sz)
+        var blink_on = (anim.mode == UI_ANIM_INSTANT) or ((Int(anim.time_sec * Float32(2.0)) % 2) == 0)
+        if blink_on:
+            dl.add_rect(
+                q_x + qw + Float32(2.0), hdr_cy - Float32(9.0),
+                Float32(1.8), Float32(18.0),
+                rgba8_scale_alpha(theme.accent_primary, alpha), Float32(0.9),
+            )
+    else:
+        _pal_draw_text_cy(
+            dl, font_slot, font,
+            "Type command, +spawn, @entity, #asset...",
+            q_x, hdr_cy, Float32(13.5),
+            rgba8_scale_alpha(theme.text_muted, alpha),
+        )
+    dl.pop_clip()
+    dl.add_line(
+        pal_r.x + Float32(1.0), pal_r.y + header_h,
+        pal_r.right() - Float32(1.0), pal_r.y + header_h,
+        Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha),
+    )
+
+    # ---- Mode Scope Filter Tabs Strip (cleanly separated from results) ----
+    var strip_y = pal_r.y + header_h
+    dl.add_rect(
+        pal_r.x + Float32(1.0), strip_y + Float32(0.5),
+        pal_r.w - Float32(2.0), tabs_h - Float32(1.0),
+        rgba8_scale_alpha(theme.l0_canvas, alpha * Float32(0.42)),
+    )
+    var tab_h = Float32(22.0) if compact_h else Float32(24.0)
+    var tab_y = strip_y + (tabs_h - tab_h) * Float32(0.5)
+    var tab_cy = tab_y + tab_h * Float32(0.5)
     var tab_x = pal_r.x + Float32(12.0)
     var tab_xs = List[Float32](capacity=PALETTE_MODE_COUNT)
     var tab_ws = List[Float32](capacity=PALETTE_MODE_COUNT)
+    var tab_prefs = List[String](capacity=PALETTE_MODE_COUNT)
+    var tab_names = List[String](capacity=PALETTE_MODE_COUNT)
     var tgt_tx = tab_x
     var tgt_tw = Float32(42.0)
+    var tab_sz = Float32(11.5)
     for mi in range(PALETTE_MODE_COUNT):
         var pref = palette_mode_prefix(mi)
-        var lbl = (pref + " " + palette_mode_label(mi)) if pref.byte_length() > 0 else palette_mode_label(mi)
-        var tw = max(Float32(40.0), _pal_measure_text(font, lbl, Float32(11.5)) + Float32(16.0))
+        var name_s = palette_mode_label(mi)
+        var full_lbl = (pref + " " + name_s) if pref.byte_length() > 0 else name_s
+        var tw = max(Float32(40.0), _pal_measure_text(font, full_lbl, tab_sz) + Float32(18.0))
+        if pal_w < Float32(450.0):
+            tw = max(Float32(1.0), (pal_w - Float32(24.0) - Float32(4 * (PALETTE_MODE_COUNT - 1))) / Float32(PALETTE_MODE_COUNT))
+            name_s = String("Cmds") if mi == PALETTE_COMMANDS else (String("Spawn") if mi == PALETTE_SPAWN else name_s)
+            if _pal_measure_text(font, name_s, tab_sz) > tw - Float32(10.0) and pref.byte_length() > 0:
+                name_s = ""
+            else:
+                pref = ""
+        tab_prefs.append(pref)
+        tab_names.append(name_s)
         tab_xs.append(tab_x)
         tab_ws.append(tw)
         if mi == palette.mode:
@@ -762,111 +969,303 @@ def draw_command_palette(
             tgt_tw = tw
         tab_x += tw + Float32(4.0)
 
+    # Neutral elevated sliding active tab pill (never clashes with selected row below)
     var ind = anim.drive_tab_pill(UInt64(0x50414C4D4F4445), tgt_tx, tgt_tw)
     dl.add_rect_styled(
-        ind[0], tab_y, ind[1], Float32(22.0),
-        rgba8_scale_alpha(theme.accent_soft, alpha),
-        rgba8_scale_alpha(theme.accent_primary, alpha * Float32(0.75)),
-        Float32(5.0), Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+        ind[0], tab_y, ind[1], tab_h,
+        rgba8_scale_alpha(theme.l3_raised, alpha),
+        rgba8_scale_alpha(theme.border_control, alpha),
+        theme.radius_xs, Float32(1.0), Float32(1.0),
+        UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
     )
+    dl.add_accent_bar(
+        ind[0] + Float32(7.0), tab_y + tab_h - Float32(2.0),
+        max(Float32(4.0), ind[1] - Float32(14.0)), Float32(2.0),
+        rgba8_scale_alpha(theme.accent_primary, alpha), True,
+    )
+
     for mi in range(PALETTE_MODE_COUNT):
-        var pref = palette_mode_prefix(mi)
-        var lbl = (pref + " " + palette_mode_label(mi)) if pref.byte_length() > 0 else palette_mode_label(mi)
-        var tr = RectF(tab_xs[mi], tab_y, tab_ws[mi], Float32(22.0))
-        var thov = tr.contains(mouse_x, mouse_y)
+        var tr = RectF(tab_xs[mi], tab_y, tab_ws[mi], tab_h)
+        var thov = palette.is_open and tr.contains(mouse_x, mouse_y)
         var is_act = mi == palette.mode
-        _pal_draw_text(
-            dl, font_slot, font, lbl,
-            tr.x + Float32(8.0), tr.y + Float32(4.5), Float32(11.5),
-            rgba8_scale_alpha(theme.text_primary if (is_act or thov) else theme.text_secondary, alpha),
-        )
-        if palette.is_open and thov and mouse_pressed:
+        if thov and not is_act:
+            dl.add_rect(tr.x, tr.y, tr.w, tr.h, rgba8_scale_alpha(theme.l3_hover, alpha * Float32(0.55)), theme.radius_xs)
+        var pref = tab_prefs[mi]
+        var name_s = tab_names[mi]
+        var full_s = (pref + " " + name_s) if (pref.byte_length() > 0 and name_s.byte_length() > 0) else (pref if pref.byte_length() > 0 else name_s)
+        var fw = _pal_measure_text(font, full_s, tab_sz)
+        var tx0 = tr.x + max(Float32(5.0), (tr.w - fw) * Float32(0.5))
+        if pref.byte_length() > 0 and name_s.byte_length() > 0:
+            var pref_col = rgba8_scale_alpha(
+                theme.accent_primary, alpha if (is_act or thov) else alpha * Float32(0.75)
+            )
+            _pal_draw_text_cy(dl, k_slot, k_font, pref, tx0, tab_cy, tab_sz, pref_col)
+            var pw = _pal_measure_text(k_font, pref + " ", tab_sz)
+            _pal_draw_text_cy(
+                dl, font_slot, font, name_s, tx0 + pw, tab_cy, tab_sz,
+                rgba8_scale_alpha(theme.text_primary if (is_act or thov) else theme.text_secondary, alpha),
+            )
+        else:
+            _pal_draw_text_cy(
+                dl, font_slot, font, full_s, tx0, tab_cy, tab_sz,
+                rgba8_scale_alpha(theme.text_primary if (is_act or thov) else theme.text_secondary, alpha),
+            )
+        if thov and mouse_pressed:
             palette.base_mode = mi
             palette.mode = mi
             palette.raw_query = palette_mode_prefix(mi) + palette.filter_query
             palette.refilter()
 
+    dl.add_line(
+        pal_r.x + Float32(1.0), strip_y + tabs_h,
+        pal_r.right() - Float32(1.0), strip_y + tabs_h,
+        Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha),
+    )
+
     # ---- Results List ----
-    var list_y = pal_r.y + header_h + tabs_h + Float32(4.0)
+    var list_y = strip_y + tabs_h + Float32(6.0)
+    var list_h = Float32(shown_rows) * row_h
     if n_res == 0:
-        _pal_draw_text(
-            dl, font_slot, font,
-            "No matching commands, entities, or assets",
-            pal_r.x + Float32(16.0), list_y + Float32(9.0), Float32(12.5),
-            rgba8_scale_alpha(theme.text_muted, alpha),
+        var empty_cy = list_y + list_h * Float32(0.5)
+        var msg = (
+            ("No matches for \"" + palette.filter_query + "\"")
+            if palette.filter_query.byte_length() > 0
+            else String("No matching commands, entities, or assets")
         )
+        var msg_disp = _pal_truncate(font, msg, Float32(12.5), pal_r.w - Float32(56.0))
+        var mw = _pal_measure_text(font, msg_disp, Float32(12.5))
+        var line1_y = empty_cy - (Float32(8.0) if not compact_h else Float32(0.0))
+        var icon_x = pal_r.center_x() - (mw + Float32(20.0)) * Float32(0.5)
+        draw_studio_icon(
+            dl, ICON_SEARCH, icon_x, line1_y - Float32(7.0), Float32(14.0),
+            rgba8_scale_alpha(theme.text_muted, alpha * Float32(0.85)), Float32(1.4),
+        )
+        _pal_draw_text_cy(
+            dl, font_slot, font, msg_disp,
+            icon_x + Float32(20.0), line1_y, Float32(12.5),
+            rgba8_scale_alpha(theme.text_secondary, alpha),
+        )
+        if not compact_h:
+            var hint = String("Try >, +, @, # prefixes or press Tab to switch scope")
+            var hw = _pal_measure_text(font, hint, Float32(11.0))
+            _pal_draw_text_cy(
+                dl, font_slot, font, hint,
+                pal_r.center_x() - hw * Float32(0.5), empty_cy + Float32(11.0), Float32(11.0),
+                rgba8_scale_alpha(theme.text_muted, alpha),
+            )
     else:
+        var has_scroll = n_res > shown_rows
+        var row_pad_r = Float32(14.0) if has_scroll else Float32(8.0)
+        var list_rect = RectF(pal_r.x, list_y, pal_r.w, list_h)
+        if palette.is_open and mouse_wheel != 0 and list_rect.contains(mouse_x, mouse_y):
+            var delta = max(1, Int(min(Float32(n_res), abs(mouse_wheel))))
+            palette.scroll_top = max(
+                0, min(n_res - shown_rows, palette.scroll_top + (delta if mouse_wheel < 0 else -delta))
+            )
+            palette.selected_idx = max(
+                palette.scroll_top, min(palette.scroll_top + shown_rows - 1, palette.selected_idx)
+            )
         var start_i = max(0, min(palette.scroll_top, max(0, n_res - shown_rows)))
         var end_i = min(n_res, start_i + shown_rows)
+        var is_empty_query = palette.filter_query.byte_length() == 0
         for ri in range(start_i, end_i):
             ref res = palette.results[ri]
             if res.item_index < 0 or res.item_index >= len(palette.items):
                 continue
             ref it = palette.items[res.item_index]
             var ry = list_y + Float32(ri - start_i) * row_h
-            var rr = RectF(pal_r.x + Float32(8.0), ry, pal_r.w - Float32(16.0), row_h - Float32(2.0))
+            var rr = RectF(
+                pal_r.x + Float32(8.0), ry,
+                pal_r.w - Float32(8.0) - row_pad_r, row_h - Float32(2.0),
+            )
+            var rcy = rr.center_y()
             var is_sel = ri == palette.selected_idx
             var rhov = palette.is_open and rr.contains(mouse_x, mouse_y)
-            var r_anim = anim.drive_widget(UInt64(0x50414C524F5700) ^ UInt64(ri), rhov, rhov and mouse_down, False)
+            var r_anim = anim.drive_widget(
+                UInt64(0x50414C524F5700) ^ UInt64(ri), rhov, rhov and mouse_down, False
+            )
             if is_sel:
-                dl.add_rect(rr.x, rr.y, rr.w, rr.h, rgba8_scale_alpha(theme.accent_soft, alpha), theme.radius_sm)
-                dl.add_rect(rr.x, rr.y + Float32(5.0), Float32(2.5), rr.h - Float32(10.0), rgba8_scale_alpha(theme.accent_primary, alpha), Float32(1.2))
+                dl.add_rect_styled(
+                    rr.x, rr.y, rr.w, rr.h,
+                    rgba8_scale_alpha(lerp_rgba8(theme.l3_raised, theme.accent_primary, Float32(0.13)), alpha),
+                    rgba8_scale_alpha(rgba8_with_alpha(theme.accent_primary, 96), alpha),
+                    theme.radius_sm, Float32(1.0), Float32(1.0),
+                    UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+                )
+                dl.add_accent_bar(
+                    rr.x + Float32(2.5), rr.y + Float32(6.0),
+                    Float32(2.5), rr.h - Float32(12.0),
+                    rgba8_scale_alpha(theme.accent_primary, alpha), True,
+                )
             elif rhov or r_anim[0] > Float32(0.01):
-                dl.add_rect(rr.x, rr.y, rr.w, rr.h, rgba8_scale_alpha(theme.l3_hover, alpha * Float32(0.55) * r_anim[0]), theme.radius_sm)
+                dl.add_rect(
+                    rr.x, rr.y, rr.w, rr.h,
+                    rgba8_scale_alpha(theme.l3_hover, alpha * Float32(0.55) * r_anim[0]),
+                    theme.radius_sm,
+                )
 
             var icon_col = (
                 theme.agent_active
                 if it.kind == PALETTE_ITEM_AGENT
-                else (theme.accent_primary if is_sel else theme.text_secondary)
+                else (
+                    theme.agent_flow
+                    if it.kind == PALETTE_ITEM_ENTITY
+                    else (
+                        theme.status_ok
+                        if it.kind == PALETTE_ITEM_ASSET
+                        else (theme.accent_primary if is_sel else theme.text_secondary)
+                    )
+                )
             )
             if not res.effective_enabled:
                 icon_col = theme.text_muted
-            draw_studio_icon(dl, _pal_default_icon(it), rr.x + Float32(10.0), rr.center_y() - Float32(7.0), Float32(14.0), rgba8_scale_alpha(icon_col, alpha), Float32(1.4))
 
-            # Right-side badge: shortcut keycap or disabled reason
+            # Tinted 22x22 icon badge backing
+            var ib_x = rr.x + Float32(10.0)
+            var ib_y = rcy - Float32(11.0)
+            dl.add_rect(
+                ib_x, ib_y, Float32(22.0), Float32(22.0),
+                rgba8_scale_alpha(rgba8_with_alpha(icon_col, 26 if is_sel else 16), alpha),
+                theme.radius_xs,
+            )
+            draw_studio_icon(
+                dl, _pal_default_icon(it),
+                ib_x + Float32(4.5), ib_y + Float32(4.5), Float32(13.0),
+                rgba8_scale_alpha(icon_col, alpha), Float32(1.4),
+            )
+
+            # Right-side metadata laid out RTL: [Shortcut Keycaps / Disabled Reason] [Category Pill] [Frecency Clock]
             var right_edge = rr.right() - Float32(10.0)
             if not res.effective_enabled and res.disabled_reason.byte_length() > 0:
-                var dr_w = _pal_measure_text(font, res.disabled_reason, Float32(10.5)) + Float32(12.0)
+                var dr_sz = Float32(10.0)
+                var dr_tw = _pal_measure_text(font, res.disabled_reason, dr_sz)
+                var dr_w = dr_tw + Float32(12.0)
                 var dr_x = right_edge - dr_w
-                dl.add_rect(dr_x, rr.center_y() - Float32(9.0), dr_w, Float32(18.0), rgba8_scale_alpha(rgba8_with_alpha(theme.status_warn, 36), alpha), Float32(4.0))
-                _pal_draw_text(dl, font_slot, font, res.disabled_reason, dr_x + Float32(6.0), rr.center_y() - Float32(5.5), Float32(10.5), rgba8_scale_alpha(theme.status_warn, alpha))
+                dl.add_rect(
+                    dr_x, rcy - Float32(9.0), dr_w, Float32(18.0),
+                    rgba8_scale_alpha(rgba8_with_alpha(theme.status_warn, 36), alpha),
+                    theme.radius_xs, Float32(1.0),
+                    rgba8_scale_alpha(rgba8_with_alpha(theme.status_warn, 96), alpha),
+                )
+                _pal_draw_text_cy(
+                    dl, font_slot, font, res.disabled_reason,
+                    dr_x + Float32(6.0), rcy, dr_sz,
+                    rgba8_scale_alpha(theme.status_warn, alpha),
+                )
                 right_edge = dr_x - Float32(8.0)
             elif it.shortcut.byte_length() > 0:
-                var sc_w = _pal_measure_text(font, it.shortcut, Float32(10.5)) + Float32(12.0)
-                var sc_x = right_edge - sc_w
-                dl.add_rect(sc_x, rr.center_y() - Float32(9.0), sc_w, Float32(18.0), rgba8_scale_alpha(theme.l2_card, alpha), Float32(4.0), Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha))
-                _pal_draw_text(dl, font_slot, font, it.shortcut, sc_x + Float32(6.0), rr.center_y() - Float32(5.5), Float32(10.5), rgba8_scale_alpha(theme.text_secondary, alpha))
-                right_edge = sc_x - Float32(8.0)
+                right_edge = _pal_draw_keycaps_rtl(
+                    dl, k_slot, k_font, theme, it.shortcut, right_edge, rcy, alpha, res.effective_enabled
+                ) - Float32(4.0)
 
-            var title_x = rr.x + Float32(32.0)
-            var title_base_col = rgba8_scale_alpha(theme.text_primary if res.effective_enabled else theme.text_muted, alpha)
+            # Quiet right-aligned category pill (fixes ragged inline run-on text)
+            if pal_w >= Float32(420.0) and it.subtitle.byte_length() > 0:
+                var cat_sz = Float32(10.5)
+                var cat_disp = _pal_truncate(font, it.subtitle, cat_sz, Float32(118.0))
+                var cat_tw = _pal_measure_text(font, cat_disp, cat_sz)
+                var cat_w = cat_tw + Float32(12.0)
+                var cat_x = right_edge - cat_w
+                if cat_x > rr.x + Float32(140.0):
+                    dl.add_rect(
+                        cat_x, rcy - Float32(9.0), cat_w, Float32(18.0),
+                        rgba8_scale_alpha(theme.l2_card, alpha * (Float32(0.85) if is_sel else Float32(0.62))),
+                        theme.radius_xs, Float32(1.0),
+                        rgba8_scale_alpha(theme.border_subtle, alpha),
+                    )
+                    _pal_draw_text_cy(
+                        dl, font_slot, font, cat_disp,
+                        cat_x + Float32(6.0), rcy, cat_sz,
+                        rgba8_scale_alpha(theme.text_secondary if is_sel else theme.text_muted, alpha),
+                    )
+                    right_edge = cat_x - Float32(8.0)
+
+            # Subtle frecency clock cue on recently used items when query is empty
+            if is_empty_query and it.frecency_key.byte_length() > 0 and palette.frecency.has_recent(it.frecency_key, palette.now_sec):
+                if right_edge - Float32(18.0) > rr.x + Float32(120.0):
+                    draw_studio_icon(
+                        dl, ICON_CLOCK,
+                        right_edge - Float32(12.0), rcy - Float32(5.5), Float32(11.0),
+                        rgba8_scale_alpha(theme.accent_primary if is_sel else theme.text_muted, alpha * Float32(0.85)),
+                        Float32(1.3),
+                    )
+                    right_edge -= Float32(18.0)
+
+            var title_x = rr.x + Float32(40.0)
+            dl.push_clip(Int(title_x), Int(rr.y), Int(max(title_x, right_edge)), Int(rr.bottom()))
+            var title_base_col = rgba8_scale_alpha(
+                theme.text_primary if res.effective_enabled else theme.text_muted, alpha
+            )
             var title_hi_col = rgba8_scale_alpha(theme.accent_primary, alpha)
+            var title_hi_bg = rgba8_scale_alpha(rgba8_with_alpha(theme.accent_primary, 32), alpha)
             _pal_draw_highlighted_title(
                 dl, font_slot, font, it.title, res.title_byte_spans,
-                title_x, rr.center_y() - Float32(7.0), Float32(13.0),
-                title_base_col, title_hi_col,
+                title_x, rcy, Float32(12.5),
+                title_base_col, title_hi_col, title_hi_bg,
             )
-            if it.subtitle.byte_length() > 0:
-                var sub_x = title_x + _pal_measure_text(font, it.title, Float32(13.0)) + Float32(10.0)
-                var avail_sub = right_edge - sub_x
-                if avail_sub > Float32(32.0):
-                    var sub_disp = _pal_truncate(font, it.subtitle, Float32(11.5), avail_sub)
-                    _pal_draw_text(dl, font_slot, font, sub_disp, sub_x, rr.center_y() - Float32(6.0), Float32(11.5), rgba8_scale_alpha(theme.text_muted, alpha))
-
-            if rhov:
+            dl.pop_clip()
+            if rhov and (mouse_moved or mouse_pressed or mouse_wheel != 0):
                 palette.selected_idx = ri
                 if mouse_pressed:
                     return palette.accept_index(ri, secondary=key_shift)
 
-    # ---- Footer Hint Bar ----
+        # Floating 3px scrollbar thumb when results overflow visible rows
+        if has_scroll:
+            var track_h = max(Float32(16.0), list_h - Float32(8.0))
+            var thumb_h = max(Float32(20.0), track_h * Float32(shown_rows) / Float32(n_res))
+            var max_top = max(1, n_res - shown_rows)
+            var thumb_y = list_y + Float32(3.0) + (track_h - thumb_h) * Float32(start_i) / Float32(max_top)
+            dl.add_rect(
+                pal_r.right() - Float32(6.5), thumb_y,
+                Float32(3.0), thumb_h,
+                rgba8_scale_alpha(rgba8_with_alpha(theme.text_muted, 130), alpha),
+                Float32(1.5),
+            )
+
+    # ---- Micro-Keycap Footer Hint Bar ----
     var fy = pal_r.bottom() - footer_h
-    dl.add_line(pal_r.x + Float32(1.0), fy, pal_r.right() - Float32(1.0), fy, Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha))
-    _pal_draw_text(
-        dl, font_slot, font,
-        "Up/Down Navigate   Tab Mode   Enter Run   Shift+Enter Focus",
-        pal_r.x + Float32(14.0), fy + Float32(6.5), Float32(11.0),
-        rgba8_scale_alpha(theme.text_muted, alpha),
+    dl.add_rounded_rect_ex(
+        pal_r.x + Float32(1.0), fy,
+        pal_r.w - Float32(2.0), footer_h - Float32(1.0),
+        rgba8_scale_alpha(theme.l0_canvas, alpha * Float32(0.48)),
+        Float32(0.0), Float32(0.0), max(Float32(0.0), theme.radius_lg - Float32(1.0)), max(Float32(0.0), theme.radius_lg - Float32(1.0)),
     )
+    dl.add_line(
+        pal_r.x + Float32(1.0), fy,
+        pal_r.right() - Float32(1.0), fy,
+        Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha),
+    )
+    var fcy = fy + footer_h * Float32(0.5)
+    var fx = pal_r.x + Float32(12.0)
+    var f_k_sz = Float32(9.5)
+    var f_lbl_sz = Float32(10.5)
+    var f_cap_h = Float32(16.0)
+    var f_fg_k = theme.text_secondary
+    var f_fg_l = rgba8_scale_alpha(theme.text_muted, alpha)
+
+    # Right-aligned position counter (e.g. "1 / 13")
+    var f_max_x = pal_r.right() - Float32(12.0)
+    if n_res > 0:
+        var pos_txt = String(palette.selected_idx + 1) + " / " + String(n_res)
+        var pos_w = _pal_measure_text(k_font, pos_txt, Float32(10.5))
+        _pal_draw_text_cy(dl, k_slot, k_font, pos_txt, f_max_x - pos_w, fcy, Float32(10.5), f_fg_l)
+        f_max_x -= pos_w + Float32(12.0)
+
+    dl.push_clip(Int(fx), Int(fy), Int(max(fx, f_max_x)), Int(pal_r.bottom()))
+    fx += _pal_draw_keycap(dl, k_slot, k_font, theme, "Up/Dn", fx, fcy, f_cap_h, f_k_sz, alpha, f_fg_k) + Float32(5.0)
+    _pal_draw_text_cy(dl, font_slot, font, "Navigate", fx, fcy, f_lbl_sz, f_fg_l)
+    fx += _pal_measure_text(font, "Navigate", f_lbl_sz) + Float32(12.0)
+    if pal_w >= Float32(430.0):
+        fx += _pal_draw_keycap(dl, k_slot, k_font, theme, "Tab", fx, fcy, f_cap_h, f_k_sz, alpha, f_fg_k) + Float32(5.0)
+        _pal_draw_text_cy(dl, font_slot, font, "Scope", fx, fcy, f_lbl_sz, f_fg_l)
+        fx += _pal_measure_text(font, "Scope", f_lbl_sz) + Float32(12.0)
+    fx += _pal_draw_keycap(dl, k_slot, k_font, theme, "Enter", fx, fcy, f_cap_h, f_k_sz, alpha, f_fg_k) + Float32(5.0)
+    _pal_draw_text_cy(dl, font_slot, font, "Run", fx, fcy, f_lbl_sz, f_fg_l)
+    fx += _pal_measure_text(font, "Run", f_lbl_sz) + Float32(12.0)
+    if pal_w >= Float32(520.0):
+        fx += _pal_draw_keycap(dl, k_slot, k_font, theme, "Shift", fx, fcy, f_cap_h, f_k_sz, alpha, f_fg_k) + Float32(3.0)
+        fx += _pal_draw_keycap(dl, k_slot, k_font, theme, "Enter", fx, fcy, f_cap_h, f_k_sz, alpha, f_fg_k) + Float32(5.0)
+        _pal_draw_text_cy(dl, font_slot, font, "Focus", fx, fcy, f_lbl_sz, f_fg_l)
+    dl.pop_clip()
     return action^
 
 
@@ -878,43 +1277,111 @@ def draw_key_chord_hud(
     theme: StudioTheme,
     mut anim: UiAnimator,
     vp: RectF,
+    mono_slot: Int = -1,
+    mono_font: SdfFont = SdfFont(),
 ):
     """Renders the delayed non-focus-stealing `KeyChordHud` box in the bottom-left viewport corner."""
     var target_v = Float32(1.0) if (hud.active and hud.visible and len(hud.entries) > 0) else Float32(0.0)
-    var alpha = anim.drive_aux(UInt64(0x4B455943484F5244), target_v, SpringConfig.snappy())
-    if anim.mode == UI_ANIM_INSTANT:
-        alpha = target_v
+    var alpha = anim.drive_reveal(
+        UInt64(0x4B455943484F5244), target_v, Float32(0.0), SpringConfig.snappy()
+    )
     if target_v <= Float32(0.0) and alpha <= Float32(0.01):
         return
     if len(hud.entries) == 0:
         return
 
+    var use_mono = mono_slot >= 0 and mono_font.valid
+    var k_slot = mono_slot if use_mono else font_slot
+    ref k_font = mono_font if use_mono else font
+
     var n = len(hud.entries)
-    var row_h = Float32(22.0)
-    var box_w = Float32(248.0)
-    var box_h = Float32(28.0) + Float32(n) * row_h + Float32(8.0)
+    var row_h = Float32(24.0)
+    var box_w = Float32(262.0)
+    var box_h = Float32(30.0) + Float32(n) * row_h + Float32(8.0)
     var bx = vp.x + Float32(12.0)
     var by = vp.bottom() - box_h - Float32(12.0) + (Float32(1.0) - alpha) * Float32(8.0)
 
+    dl.add_ambient_shadow(
+        bx, by, box_w, box_h, theme.radius_md, Float32(12.0), Int(Float32(130.0) * alpha), Float32(4.0)
+    )
     dl.add_glass_panel(
         bx, by, box_w, box_h,
         rgba8_scale_alpha(theme.l4_overlay, alpha),
         theme.radius_md, Float32(3.0), Float32(1.0),
         rgba8_scale_alpha(theme.border_strong, alpha), True, True,
     )
-    _pal_draw_text(
-        dl, font_slot, font,
-        hud.prefix_label + " ...  (Esc cancels)",
-        bx + Float32(10.0), by + Float32(7.0), Float32(11.5),
+    var hcy = by + Float32(15.0)
+    _pal_draw_text_cy(
+        dl, font_slot, font, hud.prefix_label + " ...",
+        bx + Float32(12.0), hcy, Float32(11.5),
         rgba8_scale_alpha(theme.accent_primary, alpha),
     )
-    dl.add_line(bx + Float32(1.0), by + Float32(26.0), bx + box_w - Float32(1.0), by + Float32(26.0), Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha))
+    var esc_hint = String("Esc cancels")
+    var esc_w = _pal_measure_text(font, esc_hint, Float32(10.0))
+    _pal_draw_text_cy(
+        dl, font_slot, font, esc_hint,
+        bx + box_w - esc_w - Float32(10.0), hcy, Float32(10.0),
+        rgba8_scale_alpha(theme.text_muted, alpha),
+    )
+    dl.add_line(
+        bx + Float32(1.0), by + Float32(29.0),
+        bx + box_w - Float32(1.0), by + Float32(29.0),
+        Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha),
+    )
+
+    # Measure uniform keycap column width so labels align vertically even with multi-char keys
+    var max_kw = Float32(26.0)
+    for i in range(n):
+        var kw = _pal_measure_text(k_font, hud.entries[i].second_key, Float32(10.5)) + Float32(12.0)
+        if kw > max_kw:
+            max_kw = min(Float32(52.0), kw)
+
     for i in range(n):
         ref e = hud.entries[i]
-        var ry = by + Float32(30.0) + Float32(i) * row_h
-        dl.add_rect(bx + Float32(10.0), ry + Float32(2.0), Float32(26.0), Float32(18.0), rgba8_scale_alpha(theme.l2_card, alpha), Float32(4.0), Float32(1.0), rgba8_scale_alpha(theme.border_control, alpha))
-        _pal_draw_text(dl, font_slot, font, e.second_key, bx + Float32(16.0), ry + Float32(5.0), Float32(11.0), rgba8_scale_alpha(theme.accent_primary, alpha))
-        _pal_draw_text(dl, font_slot, font, e.label, bx + Float32(44.0), ry + Float32(4.5), Float32(11.5), rgba8_scale_alpha(theme.text_primary, alpha))
+        var ry = by + Float32(33.0) + Float32(i) * row_h
+        var rcy = ry + row_h * Float32(0.5)
+        var cap_y = rcy - Float32(9.0)
+        dl.add_rect(
+            bx + Float32(10.0), cap_y + Float32(1.0), max_kw, Float32(18.0),
+            rgba8_scale_alpha(rgba8_with_alpha(0x000000, 88), alpha), theme.radius_xs,
+        )
+        dl.add_rect_styled(
+            bx + Float32(10.0), cap_y, max_kw, Float32(18.0),
+            rgba8_scale_alpha(theme.l2_card, alpha),
+            rgba8_scale_alpha(theme.border_control, alpha),
+            theme.radius_xs, Float32(1.0), Float32(1.0),
+            UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+        )
+        var ktw = _pal_measure_text(k_font, e.second_key, Float32(10.5))
+        _pal_draw_text_cy(
+            dl, k_slot, k_font, e.second_key,
+            bx + Float32(10.0) + (max_kw - ktw) * Float32(0.5), rcy, Float32(10.5),
+            rgba8_scale_alpha(theme.accent_primary, alpha),
+        )
+        var lbl_x = bx + Float32(18.0) + max_kw
+        var lbl_max_x = bx + box_w - (Float32(42.0) if (e.toggle_state == 0 or e.toggle_state == 1) else Float32(10.0))
+        var lbl_disp = _pal_truncate(font, e.label, Float32(11.5), max(Float32(20.0), lbl_max_x - lbl_x))
+        _pal_draw_text_cy(
+            dl, font_slot, font, lbl_disp,
+            lbl_x, rcy, Float32(11.5),
+            rgba8_scale_alpha(theme.text_primary, alpha),
+        )
         if e.toggle_state == 0 or e.toggle_state == 1:
-            var dot_col = theme.status_ok if e.toggle_state == 1 else theme.text_muted
-            dl.add_circle(bx + box_w - Float32(16.0), ry + Float32(11.0), Float32(3.5), rgba8_scale_alpha(dot_col, alpha))
+            var is_on = e.toggle_state == 1
+            var pill_txt = String("ON") if is_on else String("OFF")
+            var pill_w = Float32(28.0)
+            var pill_x = bx + box_w - pill_w - Float32(10.0)
+            var p_fill = rgba8_with_alpha(theme.status_ok, 38) if is_on else theme.l2_card
+            var p_bdr = rgba8_with_alpha(theme.status_ok, 115) if is_on else theme.border_subtle
+            var p_fg = theme.status_ok if is_on else theme.text_muted
+            dl.add_rect(
+                pill_x, rcy - Float32(8.0), pill_w, Float32(16.0),
+                rgba8_scale_alpha(p_fill, alpha), theme.radius_xs, Float32(1.0),
+                rgba8_scale_alpha(p_bdr, alpha),
+            )
+            var ptw = _pal_measure_text(k_font, pill_txt, Float32(9.5))
+            _pal_draw_text_cy(
+                dl, k_slot, k_font, pill_txt,
+                pill_x + (pill_w - ptw) * Float32(0.5), rcy, Float32(9.5),
+                rgba8_scale_alpha(p_fg, alpha),
+            )

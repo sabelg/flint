@@ -60,45 +60,55 @@ struct SceneMenu(Movable):
         self.bar.item(SAVE, "Save scene", "Ctrl+S")
         self.bar.item(LOAD, "Load saved scene", "Ctrl+O")
         self.bar.item(NEW_SCENE, "New scene", "Ctrl+N")
-        self.bar.item(RECOVER_AUTOSAVE, "Recover autosave")
+        self.bar.item(RECOVER_AUTOSAVE, "Recover autosave", "", True, True)
         self.bar.add_group("Edit", 48)
         self.bar.item(UNDO, "Undo", "Ctrl+Z")
         self.bar.item(REDO, "Redo", "Ctrl+Shift+Z")
-        self.bar.item(DUPLICATE, "Duplicate", "Ctrl+D")
+        self.bar.item(DUPLICATE, "Duplicate", "Ctrl+D", True, True)
         self.bar.item(DELETE_SEL, "Delete", "Del")
-        self.bar.add_group("Transform", 100)
+        self.bar.add_group("Transform", 88)
         self.bar.item(MOVE, "Move", "W")
         self.bar.item(ROTATE, "Rotate", "E")
         self.bar.item(SCALE, "Scale", "R")
-        self.bar.item(SNAP, "Snap to grid")
+        self.bar.item(SNAP, "Snap to grid", "G", True, True, 1)
         self.bar.item(GIZMO_SPACE, "Gizmo: World Space", "X")
-        self.bar.item(FRAME_SEL, "Frame selection", "F")
+        self.bar.item(FRAME_SEL, "Frame selection", "F", True, True)
         self.bar.add_group("Play", 50)
         self.bar.item(PLAY, "Play scene", "F5")
         self.bar.item(PAUSE, "Pause simulation", "F6")
         self.bar.item(STOP, "Stop and restore", "Shift+F5")
         self.bar.item(STEP, "Step frame", "F7")
-        self.bar.item(RELOAD_SO, "Reload .so")
+        self.bar.item(RELOAD_SO, "Reload .so", "Ctrl+B", True, True)
         self.bar.add_group("Tools", 58)
         self.bar.item(LIBRARY, "Move Library", "", self.has_project and self.has_launcher)
         self.bar.item(SOURCE, "Source editor", "F8")
-        self.bar.item(KIMODO, "Kimodo motion", "", self.has_launcher)
-
+        self.bar.item(KIMODO, "Kimodo motion", "", self.has_launcher, True)
         self.bar.item(MOTION_TAKES, "Motion takes", "", self.has_launcher)
         self.bar.add_group("Scene", 58)
         self.bar.item(SPAWN_EMPTY, "Spawn Empty")
         self.bar.item(SPAWN_CUBE, "Spawn Cube")
-        self.bar.item(SPAWN_POINT_LIGHT, "Spawn Point Light")
+        self.bar.item(SPAWN_POINT_LIGHT, "Spawn Point Light", "", True, True)
         self.bar.item(SPAWN_SPOT_LIGHT, "Spawn Spot Light")
-        self.bar.item(SPAWN_CAMERA, "Spawn Camera")
+        self.bar.item(SPAWN_CAMERA, "Spawn Camera", "", True, True)
         self.bar.item(SPAWN_AUDIO, "Spawn Audio Emitter")
         self.bar.add_group("NavMesh", 76)
         self.bar.item(BAKE_NAVMESH, "Bake NavMesh")
-        self.bar.item(TOGGLE_NAV_OVERLAY, "Hide NavMesh Overlay")
-        self.bar.item(TOGGLE_COL_OVERLAY, "Show Collider Overlay")
+        self.bar.item(TOGGLE_NAV_OVERLAY, "Hide NavMesh Overlay", "", True, True, 1)
+        self.bar.item(TOGGLE_COL_OVERLAY, "Show Collider Overlay", "", True, False, 0)
         self.bar.add_group("Build", 56)
         self.bar.item(PACKAGE, "Package project", "", self.has_project)
         self.bar.item(PACKAGE_PROFILES, "Package with profile...", "", self.has_project)
+
+    def sync_toggle_states(
+        mut self,
+        snap_enabled: Bool,
+        show_navmesh: Bool,
+        show_colliders: Bool,
+    ):
+        """Syncs visual checkmarks on toggle items (`Snap`, `NavMesh`, `Colliders`)."""
+        self.bar.set_item_checked(SNAP, snap_enabled)
+        self.bar.set_item_checked(TOGGLE_NAV_OVERLAY, show_navmesh)
+        self.bar.set_item_checked(TOGGLE_COL_OVERLAY, show_colliders)
 
     def __moveinit__(out self, deinit existing: Self):
         self.bar = existing.bar^

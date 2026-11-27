@@ -27,6 +27,7 @@ from flint.ui.theme import (
     ICON_CUBE,
     ICON_DIFF,
     ICON_EMPTY,
+    ICON_ERROR_CIRCLE,
     ICON_EYE,
     ICON_EYE_OFF,
     ICON_FILE,

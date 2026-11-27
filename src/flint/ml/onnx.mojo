@@ -183,8 +183,60 @@ struct Node(Copyable, Movable):
         return self.attrs[k].s if k >= 0 else String()
 
 
+struct ExternalData(Movable):
+    """The side files (`<model>.onnx.data`) of a graph saved with external tensor data, each
+    memory-mapped once; tensors borrow their bytes from the mapping like raw_data."""
+    var dir: String
+    var names: List[String]
+    var addrs: List[Int]
+    var sizes: List[Int]
+
+    def __init__(out self, dir: String):
+        self.dir = dir
+        self.names = List[String]()
+        self.addrs = List[Int]()
+        self.sizes = List[Int]()
+
+    def __deinit__(deinit self):
+        for k in range(len(self.addrs)):
+            _ = external_call["munmap", Int32](self.addrs[k], Int64(self.sizes[k]))
+
+    def span(mut self, location: String, offset: Int, length: Int) raises -> Int:
+        """The address of `length` bytes at `offset` in the side file `location`."""
+        if location.find("..") >= 0 or location.startswith("/"):
+            raise Error("ONNX: external data must sit beside the model (" + location + ")")
+        var f = -1
+        for k in range(len(self.names)):
+            if self.names[k] == location:
+                f = k
+        if f < 0:
+            var path = self.dir + location
+            var fd = open_read(path)
+            if fd < 0:
+                raise Error("ONNX: cannot open external data " + path)
+            var size = Int(external_call["lseek", Int64](Int32(fd), Int64(0), Int32(2)))
+            var addr = external_call["mmap", Int](Int(0), Int64(size), Int32(1), Int32(2), Int32(fd), Int64(0))
+            close_fd(fd)
+            if addr == 0 or addr == -1:
+                raise Error("ONNX: cannot map " + path)
+            self.names.append(location)
+            self.addrs.append(addr)
+            self.sizes.append(size)
+            f = len(self.names) - 1
+        if offset < 0 or length < 0 or offset + length > self.sizes[f]:
+            raise Error("ONNX: external data range outside " + location)
+        return self.addrs[f] + offset
+
+
 def _parse_tensor(mut r: PbReader) raises -> Tuple[String, Tensor]:
-    """A TensorProto. Float raw data stays in the mapping (borrowed); the rest is copied."""
+    """A TensorProto with inline data (attributes); see `_parse_tensor_ext`."""
+    var none = ExternalData(String())
+    return _parse_tensor_ext(r, none)
+
+
+def _parse_tensor_ext(mut r: PbReader, mut ext: ExternalData) raises -> Tuple[String, Tensor]:
+    """A TensorProto. Float raw data stays in the mapping (borrowed), as does external data (a side
+    file named by `external_data`, mapped through `ext`); the rest is copied."""
     var name = String()
     var dims = List[Int]()
     var dtype = DT_F32
@@ -192,6 +244,10 @@ def _parse_tensor(mut r: PbReader) raises -> Tuple[String, Tensor]:
     var raw_end = -1
     var floats = List[Float32]()
     var ints = List[Int]()
+    var external = False
+    var location = String()
+    var ext_offset = 0
+    var ext_length = -1
     while r.more():
         r.key()
         if r.field == 1:
@@ -208,14 +264,41 @@ def _parse_tensor(mut r: PbReader) raises -> Tuple[String, Tensor]:
             var span = r.length_delimited()
             raw_start = span[0]
             raw_end = span[1]
+        elif r.field == 13:
+            # StringStringEntryProto {key = 1, value = 2}
+            var er = r.sub()
+            var key = String()
+            var value = String()
+            while er.more():
+                er.key()
+                if er.field == 1:
+                    key = er.string()
+                elif er.field == 2:
+                    value = er.string()
+                else:
+                    er.skip()
+            if key == "location":
+                location = value
+            elif key == "offset":
+                ext_offset = atol(value)
+            elif key == "length":
+                ext_length = atol(value)
         elif r.field == 14:
-            if r.varint() == 1:
-                raise Error("ONNX: external tensor data is not supported (" + name + ")")
+            external = r.varint() == 1
         else:
             r.skip()
     var n = numel_of(dims)
     if n < 0:
         raise Error("ONNX: tensor shape overflow for " + name)
+    if external:
+        if ext.dir.byte_length() == 0 or location.byte_length() == 0:
+            raise Error("ONNX: external tensor data is not supported here (" + name + ")")
+        var width = 4 if dtype == DT_F32 or dtype == DT_I32 else (8 if dtype == DT_I64 else 1)
+        var nbytes = n * width
+        if ext_length >= 0 and ext_length != nbytes:
+            raise Error("ONNX: external size mismatch for " + name)
+        raw_start = ext.span(location, ext_offset, nbytes)
+        raw_end = raw_start + nbytes
     if dtype == DT_F32:
         if raw_start >= 0:
             var raw_bytes = raw_end - raw_start
@@ -275,6 +358,7 @@ struct OnnxModel(Movable):
     var gpu: Optional[GpuMatmul]
     var profile: Dict[String, Int]
     var profiling: Bool
+    var ext: ExternalData        # mapped `.onnx.data` side files (graphs saved with external data)
 
     def __init__(out self):
         self.path = String()
@@ -293,6 +377,7 @@ struct OnnxModel(Movable):
         self.gpu = None
         self.profile = Dict[String, Int]()
         self.profiling = False
+        self.ext = ExternalData(String())
 
     def __deinit__(deinit self):
         if self.map_addr != 0:
@@ -317,6 +402,8 @@ struct OnnxModel(Movable):
     def load(path: String, workers: Int = -1) raises -> OnnxModel:
         var m = OnnxModel()
         m.path = path
+        var slash = path.rfind("/")
+        m.ext = ExternalData(String(path[byte=0:slash + 1]) if slash >= 0 else String("./"))
         var fd = open_read(path)
         if fd < 0:
             raise Error("ONNX: cannot open " + path)
@@ -360,7 +447,7 @@ struct OnnxModel(Movable):
                 self._parse_node(nr)
             elif g.field == 5:
                 var tr = g.sub()
-                var nt = _parse_tensor(tr)
+                var nt = _parse_tensor_ext(tr, self.ext)
                 var k = self._id(nt[0])
                 if k < 0:
                     raise Error("ONNX: initializer has empty name")
@@ -620,6 +707,17 @@ struct OnnxModel(Movable):
         if not found:
             raise Error("ONNX: no output named " + name)
         return self.values[found.value()].copy()
+
+    def weight(self, name: String) raises -> Tensor:
+        """A named initializer or value without copying a mapped one (a weights-only model's
+        tensors are borrowed from the file mapping)."""
+        var found = self.ids.get(name)
+        if not found:
+            raise Error("ONNX: no tensor named " + name + " in " + self.path)
+        ref t = self.values[found.value()]
+        if t.ext != 0:
+            return t.reshaped(t.shape.copy())
+        return t.copy()
 
     def run(mut self) raises:
         var trace = self.trace_path.byte_length() > 0

@@ -397,6 +397,112 @@ struct UiDrawList(Movable):
             flags | UI_FLAG_OUTER_GLOW,
         )
 
+    def add_ambient_shadow(
+        mut self,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        corner_radius: Float32 = 8.0,
+        spread_px: Float32 = 14.0,
+        alpha: Int = 140,
+        y_offset: Float32 = 2.0,
+    ):
+        """Emits an analytical Gaussian dark ambient shadow behind elevated glass overlays or modals."""
+        var ca = UInt32(max(0, min(255, alpha)))
+        if ca == 0:
+            return
+        var sh_col = ca << 24  # 0xAA000000 pure black shadow
+        self.add_rect_styled(
+            x,
+            y + y_offset,
+            w,
+            h,
+            UInt32(0),
+            sh_col,
+            corner_radius,
+            Float32(0.0),
+            max(Float32(1.5), min(Float32(28.0), spread_px)),
+            UI_FLAG_OUTER_GLOW,
+        )
+
+    def add_recessed_well(
+        mut self,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        fill_color: UInt32,
+        border_color: UInt32,
+        corner_radius: Float32 = 4.0,
+        border_width: Float32 = 1.0,
+        focused: Bool = False,
+        focus_color: UInt32 = 0,
+    ):
+        """Emits a physically recessed input/track well with crisp hairline rim and optional focus halo."""
+        var eff_border = border_color
+        if focused and (focus_color >> 24) != 0:
+            var halo_a = UInt32(min(96, Int((focus_color >> 24) // 3)))
+            var halo_col = (focus_color & UInt32(0x00FFFFFF)) | (halo_a << 24)
+            self.add_rect_styled(
+                x, y, w, h,
+                UInt32(0), halo_col,
+                corner_radius, Float32(0.0), Float32(4.5),
+                UI_FLAG_OUTER_GLOW,
+            )
+            eff_border = focus_color
+        self.add_rect_styled(
+            x, y, w, h,
+            fill_color,
+            eff_border,
+            corner_radius,
+            border_width,
+            Float32(1.0),
+            UI_FLAG_BORDER if border_width > Float32(0.0) else UInt32(0),
+        )
+
+    def add_card_surface(
+        mut self,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        fill_color: UInt32,
+        border_color: UInt32,
+        corner_radius: Float32 = 8.0,
+        border_width: Float32 = 1.0,
+        top_bevel: Bool = True,
+        drop_shadow: Bool = False,
+    ):
+        """Emits an elevated matte card/control surface with crisp hairline border and top specular bevel."""
+        var flags: UInt32 = UI_FLAG_BORDER if border_width > Float32(0.0) else UInt32(0)
+        if top_bevel:
+            flags |= UI_FLAG_TOP_BEVEL
+        if drop_shadow:
+            flags |= UI_FLAG_DROP_SHADOW
+        self.add_rect_styled(
+            x, y, w, h,
+            fill_color,
+            border_color,
+            corner_radius,
+            border_width,
+            Float32(6.0) if drop_shadow else Float32(1.0),
+            flags,
+        )
+
+    def add_accent_bar(
+        mut self,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        color: UInt32,
+        pill: Bool = True,
+    ):
+        """Emits a crisp rounded vertical or horizontal semantic accent indicator bar."""
+        var rad = Float32(999.0) if pill else min(w, h) * Float32(0.5)
+        self.add_rect(x, y, w, h, color, rad)
+
     def add_arc(
         mut self,
         cx: Float32,

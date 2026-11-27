@@ -53,13 +53,14 @@ from flint.devtools.problems import (
 from flint.platform.input import InputState
 from flint.platform.os import read_bytes
 from flint.render.font import SdfFont
-from flint.ui.draw_list import UI_FLAG_TOP_BEVEL, UiDrawList
+from flint.ui.draw_list import UI_FLAG_BORDER, UI_FLAG_TOP_BEVEL, UiDrawList
 from flint.ui.icons import draw_studio_chevron, draw_studio_icon
 from flint.ui.theme import (
     ICON_CHECK,
     ICON_CLOSE,
     ICON_CODE,
     ICON_DIFF,
+    ICON_ERROR_CIRCLE,
     ICON_PLAY,
     ICON_REVERT,
     ICON_SPARK,
@@ -124,15 +125,37 @@ def _hit_rect(mx: Float32, my: Float32, x: Float32, y: Float32, w: Float32, h: F
 
 
 def _truncate_text(text: String, max_chars: Int) -> String:
-    if max_chars <= 3:
+    if max_chars <= 4:
         return ""
     if text.byte_length() <= max_chars:
         return text
     var b = text.as_bytes()
-    var cut = min(len(b), max_chars - 2)
+    var cut = min(len(b), max_chars - 3)
     while cut > 0 and (b[cut] & 0xC0) == 0x80:
         cut -= 1
-    return String(text[byte=0:cut]) + ".."
+    return String(text[byte=0:cut]) + "..."
+
+
+def _measure_cd(font: SdfFont, text: String, px: Float32) -> Float32:
+    if font.valid:
+        return font.measure(text, px)
+    return Float32(text.byte_length()) * px * Float32(0.56)
+
+
+def _draw_cd_mid(
+    mut dl: UiDrawList,
+    font_slot: Int,
+    font: SdfFont,
+    text: String,
+    x: Float32,
+    rect_y: Float32,
+    rect_h: Float32,
+    px: Float32,
+    color: UInt32,
+):
+    if font.valid and text.byte_length() > 0:
+        var base_y = rect_y + (rect_h + px * Float32(0.66)) * Float32(0.5)
+        dl.add_text(font_slot, font, text, x, base_y, px, color)
 
 
 @fieldwise_init
@@ -357,7 +380,7 @@ struct CodeDrawer(Movable):
         if label.byte_length() > 0:
             self.build_label = label
         elif status == BUILD_STATUS_BUILDING:
-            self.build_label = "Building .so…"
+            self.build_label = "Building .so..."
         elif status == BUILD_STATUS_OK:
             self.build_label = "Reloaded gen " + String(generation)
         elif status == BUILD_STATUS_ERROR:
@@ -429,12 +452,18 @@ struct CodeDrawer(Movable):
         h: Float32,
         inp: InputState,
         time_sec: Float32 = 0.0,
+        mono_font_slot: Int = -1,
+        mono_font: SdfFont = SdfFont(),
     ) -> CodeDrawerAction:
         """Draws the complete GPU-rendered Code/Diff/Problems drawer and processes pointer/keyboard input."""
         var action = CodeDrawerAction(CODE_ACT_NONE)
         self.last_hit_count = 0
         if w < Float32(64.0) or h < Float32(64.0):
             return action^
+
+        var use_mono = mono_font_slot >= 0 and mono_font.valid
+        var code_slot = mono_font_slot if use_mono else font_slot
+        var code_font_valid = mono_font.valid if use_mono else font.valid
 
         var mx = inp.last_mouse_x
         var my = inp.last_mouse_y
@@ -469,151 +498,152 @@ struct CodeDrawer(Movable):
             prob_total_h = prob_hdr_h
 
         # --------------------------------------------------------------------
-        # 1. Top Tab Bar + View Mode Pills + [Build & Hot-Reload] Status Pill
+        # 1. Top Tab Bar + External IDE Button + Dynamic [Build & Hot-Reload] Pill
         # --------------------------------------------------------------------
         dl.add_rect(x, y, w, tab_bar_h, theme.l0_canvas)
         dl.add_rect(x, y + tab_bar_h - Float32(1.0), w, Float32(1.0), theme.border_subtle)
 
-        # Right-aligned Build & Hot-Reload pill + Mode pills
         var pill_h = Float32(22.0)
         var pill_y = y + Float32(4.0)
-        var build_w = Float32(138.0)
+        var build_disp = self.build_label
+        if w < Float32(390.0):
+            if self.build_status == BUILD_STATUS_OK:
+                build_disp = "Gen " + String(self.build_generation)
+            elif self.build_status == BUILD_STATUS_BUILDING:
+                build_disp = "Building..."
+            elif self.build_status == BUILD_STATUS_ERROR:
+                build_disp = String(self.build_error_count) + " Err"
+            else:
+                build_disp = "Reload"
+        var build_tw = _measure_cd(font, build_disp, Float32(11.0))
+        var build_w = max(Float32(72.0), min(Float32(142.0), build_tw + Float32(32.0)))
         var build_x = x + w - build_w - Float32(8.0)
         var build_hov = _hit_rect(mx, my, build_x, pill_y, build_w, pill_h)
         self.last_hit_count += 1
 
         var build_bg = theme.l3_hover if build_hov else theme.l3_raised
         var build_accent = theme.accent_primary
+        var build_bdr = theme.border_strong if build_hov else theme.border_control
         if self.build_status == BUILD_STATUS_BUILDING:
             build_bg = rgba8_with_alpha(theme.accent_primary, 42)
             build_accent = theme.accent_primary
+            build_bdr = rgba8_with_alpha(theme.accent_primary, 175)
         elif self.build_status == BUILD_STATUS_OK:
-            build_bg = rgba8_with_alpha(theme.status_ok, 38)
+            build_bg = rgba8_with_alpha(theme.status_ok, 48 if build_hov else 32)
             build_accent = theme.status_ok
+            build_bdr = rgba8_with_alpha(theme.status_ok, 185 if build_hov else 135)
         elif self.build_status == BUILD_STATUS_ERROR:
-            build_bg = rgba8_with_alpha(theme.status_danger, 44)
+            build_bg = rgba8_with_alpha(theme.status_danger, 56 if build_hov else 40)
             build_accent = theme.status_danger
+            build_bdr = rgba8_with_alpha(theme.status_danger, 200 if build_hov else 155)
 
         dl.add_rect_styled(
             build_x, pill_y, build_w, pill_h,
-            build_bg, build_accent,
-            theme.radius_sm, Float32(1.0), Float32(0.0), UI_FLAG_TOP_BEVEL,
+            build_bg, build_bdr,
+            theme.radius_xs, Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
         )
         if self.build_status == BUILD_STATUS_BUILDING:
             var spin_a = time_sec * Float32(5.2)
             dl.add_arc(
                 build_x + Float32(13.0),
                 pill_y + pill_h * Float32(0.5),
-                Float32(5.5),
-                Float32(1.8),
+                Float32(5.2),
+                Float32(1.7),
                 spin_a,
                 Float32(4.2),
                 build_accent,
                 rgba8_with_alpha(build_accent, 55),
             )
         elif self.build_status == BUILD_STATUS_ERROR:
-            draw_studio_icon(dl, ICON_WARN, build_x + Float32(7.0), pill_y + Float32(4.0), Float32(13.0), build_accent)
+            draw_studio_icon(dl, ICON_ERROR_CIRCLE, build_x + Float32(7.0), pill_y + Float32(5.0), Float32(12.0), build_accent)
         elif self.build_status == BUILD_STATUS_OK:
-            draw_studio_icon(dl, ICON_CHECK, build_x + Float32(7.0), pill_y + Float32(4.0), Float32(13.0), build_accent)
+            draw_studio_icon(dl, ICON_CHECK, build_x + Float32(7.0), pill_y + Float32(5.0), Float32(12.0), build_accent)
         else:
-            draw_studio_icon(dl, ICON_PLAY, build_x + Float32(7.0), pill_y + Float32(4.0), Float32(13.0), build_accent)
-        dl.add_text(
-            font_slot, font,
-            _truncate_text(self.build_label, 16),
-            build_x + Float32(25.0), pill_y + Float32(15.0),
-            Float32(11.5), theme.text_primary,
+            draw_studio_icon(dl, ICON_PLAY, build_x + Float32(7.0), pill_y + Float32(5.0), Float32(12.0), build_accent)
+        _draw_cd_mid(
+            dl, font_slot, font,
+            _truncate_text(build_disp, 18),
+            build_x + Float32(23.0), pill_y, pill_h,
+            Float32(11.0), theme.text_primary,
         )
         if click and build_hov:
             action = CodeDrawerAction(CODE_ACT_BUILD_HOT_RELOAD)
 
-        # Mode segmented pills (Code | Diff | Split) + External IDE button
+        # Subtle vertical divider + External TurboMojo IDE button (`</>`)
         var ext_w = Float32(26.0)
-        var ext_x = build_x - ext_w - Float32(6.0)
+        var ext_x = build_x - ext_w - Float32(8.0)
+        dl.add_rect(build_x - Float32(4.5), pill_y + Float32(3.0), Float32(1.0), pill_h - Float32(6.0), theme.border_subtle)
         var ext_hov = _hit_rect(mx, my, ext_x, pill_y, ext_w, pill_h)
         self.last_hit_count += 1
-        dl.add_rect(
+        dl.add_rect_styled(
             ext_x, pill_y, ext_w, pill_h,
             theme.l3_hover if ext_hov else theme.l2_card,
-            theme.radius_xs, Float32(1.0), theme.border_control,
+            theme.border_strong if ext_hov else theme.border_control,
+            theme.radius_xs, Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
         )
-        draw_studio_icon(dl, ICON_CODE, ext_x + Float32(6.0), pill_y + Float32(4.0), Float32(13.0), theme.text_secondary)
+        draw_studio_icon(dl, ICON_CODE, ext_x + Float32(6.5), pill_y + Float32(4.5), Float32(13.0), theme.text_primary if ext_hov else theme.text_secondary)
         if click and ext_hov and action.kind == CODE_ACT_NONE:
             action = CodeDrawerAction(CODE_ACT_OPEN_EXTERNAL_IDE)
 
-        var mode_labels = List[String]()
-        mode_labels.append("Code")
-        mode_labels.append("Diff")
-        mode_labels.append("Split")
-        var seg_w = Float32(44.0)
-        var seg_total_w = seg_w * Float32(3.0)
-        var seg_x0 = ext_x - seg_total_w - Float32(8.0)
-        if seg_x0 > x + Float32(120.0):
-            dl.add_rect(
-                seg_x0, pill_y, seg_total_w, pill_h,
-                theme.l2_card, theme.radius_xs, Float32(1.0), theme.border_subtle,
-            )
-            for mi in range(3):
-                var sx = seg_x0 + Float32(mi) * seg_w
-                var shov = _hit_rect(mx, my, sx, pill_y, seg_w, pill_h)
-                var active_m = self.view_mode == mi
-                self.last_hit_count += 1
-                if active_m or shov:
-                    dl.add_rect(
-                        sx + Float32(1.0), pill_y + Float32(1.0),
-                        seg_w - Float32(2.0), pill_h - Float32(2.0),
-                        theme.accent_soft if active_m else theme.l3_hover,
-                        theme.radius_xs,
-                    )
-                dl.add_text(
-                    font_slot, font, mode_labels[mi],
-                    sx + Float32(8.0), pill_y + Float32(15.0),
-                    Float32(11.0),
-                    theme.accent_primary if active_m else theme.text_secondary,
-                )
-                if click and shov and action.kind == CODE_ACT_NONE:
-                    self.view_mode = mi
-
-        # Left-aligned File Tabs
-        var tabs_limit_x = seg_x0 - Float32(8.0) if seg_x0 > x + Float32(120.0) else ext_x - Float32(6.0)
+        # Left-aligned Dynamic-Width File Tabs (measured via font.measure so filenames never truncate prematurely!)
+        var tabs_limit_x = ext_x - Float32(8.0)
         var tx = x + Float32(4.0)
-        for ti in range(len(self.tabs)):
-            var tw = Float32(146.0)
+        var n_tabs = len(self.tabs)
+        var avail_tabs_w = max(Float32(64.0), tabs_limit_x - tx)
+        var per_tab_cap = avail_tabs_w / Float32(max(1, n_tabs))
+        for ti in range(n_tabs):
+            var title_w = _measure_cd(font, self.tabs[ti].title, Float32(11.5))
+            var extra_w = Float32(64.0) if self.tabs[ti].dirty else Float32(54.0)
+            var desired_tw = max(Float32(96.0), min(Float32(236.0), title_w + extra_w))
+            var tw = min(desired_tw, max(Float32(72.0), per_tab_cap))
             if tx + Float32(60.0) > tabs_limit_x:
                 break
             tw = min(tw, tabs_limit_x - tx)
             var is_act = ti == self.active_tab
             var thov = _hit_rect(mx, my, tx, y + Float32(2.0), tw, tab_bar_h - Float32(2.0))
-            var close_x = tx + tw - Float32(19.0)
-            var close_y = y + Float32(8.0)
-            var chov = _hit_rect(mx, my, close_x, close_y, Float32(14.0), Float32(14.0))
+            var close_x = tx + tw - Float32(20.0)
+            var close_y = y + Float32(7.0)
+            var chov = _hit_rect(mx, my, close_x, close_y, Float32(16.0), Float32(16.0))
             self.last_hit_count += 2
 
-            dl.add_rect(
-                tx, y + Float32(3.0), tw - Float32(2.0), tab_bar_h - Float32(3.0),
-                theme.l1_shell if is_act else (theme.l2_card if thov else theme.l0_canvas),
-                theme.radius_xs, Float32(1.0) if is_act else Float32(0.0), theme.border_subtle,
-            )
             if is_act:
-                dl.add_rect(tx + Float32(2.0), y + Float32(3.0), tw - Float32(6.0), Float32(2.0), theme.accent_primary)
+                dl.add_rect(
+                    tx, y + Float32(2.0), tw - Float32(2.0), tab_bar_h - Float32(1.0),
+                    theme.l1_shell, theme.radius_xs, Float32(1.0), theme.border_subtle,
+                )
+                # Seamlessly merge active tab bottom into l1_shell breadcrumb bar
+                dl.add_rect(tx + Float32(1.0), y + tab_bar_h - Float32(2.0), tw - Float32(4.0), Float32(3.0), theme.l1_shell)
+                dl.add_accent_bar(tx + Float32(4.0), y + Float32(2.0), tw - Float32(10.0), Float32(2.0), theme.accent_primary, pill=True)
+            elif thov:
+                dl.add_rect(
+                    tx, y + Float32(3.0), tw - Float32(2.0), tab_bar_h - Float32(4.0),
+                    theme.l2_card, theme.radius_xs,
+                )
 
             var ic = icon_for_path(self.tabs[ti].path)
             draw_studio_icon(
-                dl, ic, tx + Float32(7.0), y + Float32(9.0), Float32(13.0),
+                dl, ic, tx + Float32(8.0), y + Float32(9.0), Float32(13.0),
                 theme.accent_primary if is_act else theme.text_muted,
             )
-            var label_x = tx + Float32(24.0)
+            var label_x = tx + Float32(25.0)
             if self.tabs[ti].dirty:
-                dl.add_circle(label_x + Float32(3.0), y + Float32(15.0), Float32(3.0), theme.status_warn)
-                label_x += Float32(10.0)
-            var max_ch = max(4, Int((close_x - label_x) / Float32(7.0)))
-            dl.add_text(
-                font_slot, font,
-                _truncate_text(self.tabs[ti].title, max_ch),
-                label_x, y + Float32(19.0), Float32(11.5),
+                dl.add_circle(label_x + Float32(3.0), y + Float32(15.5), Float32(2.8), theme.status_warn)
+                label_x += Float32(9.0)
+            var avail_lbl_w = max(Float32(16.0), close_x - label_x - Float32(4.0))
+            var tab_disp = self.tabs[ti].title
+            if title_w > avail_lbl_w:
+                var max_ch = max(5, Int(avail_lbl_w / Float32(6.2)))
+                tab_disp = _truncate_text(tab_disp, max_ch)
+            _draw_cd_mid(
+                dl, font_slot, font,
+                tab_disp,
+                label_x, y + Float32(3.0), tab_bar_h - Float32(3.0), Float32(11.5),
                 theme.text_primary if is_act else theme.text_secondary,
             )
+            if chov:
+                dl.add_rect(close_x, close_y, Float32(16.0), Float32(16.0), theme.l3_hover, theme.radius_xs)
             draw_studio_icon(
-                dl, ICON_CLOSE, close_x + Float32(2.0), close_y + Float32(2.0), Float32(10.0),
+                dl, ICON_CLOSE, close_x + Float32(3.0), close_y + Float32(3.0), Float32(10.0),
                 theme.text_primary if chov else theme.text_muted,
             )
 
@@ -629,56 +659,121 @@ struct CodeDrawer(Movable):
             tx += tw
 
         # --------------------------------------------------------------------
-        # 2. Scope Breadcrumb Bar
+        # 2. Scope Breadcrumb Bar + ALWAYS-VISIBLE `Code | Diff | Split` Switcher
         # --------------------------------------------------------------------
         var crumb_y = y + tab_bar_h
         dl.add_rect(x, crumb_y, w, crumb_h, theme.l1_shell)
         dl.add_rect(x, crumb_y + crumb_h - Float32(1.0), w, Float32(1.0), theme.border_subtle)
+
+        # Compact Code | Diff | Split segmented control pinned on right of Breadcrumb bar
+        var mode_labels = List[String]()
+        mode_labels.append("Code")
+        mode_labels.append("Diff")
+        mode_labels.append("Split")
+        var seg_w = Float32(38.0)
+        var seg_total_w = seg_w * Float32(3.0)
+        var seg_h = Float32(18.0)
+        var seg_y = crumb_y + Float32(3.0)
+        var seg_x0 = x + w - seg_total_w - Float32(8.0)
+        var right_reserve_x = seg_x0 - Float32(8.0)
+
+        if seg_x0 > x + Float32(60.0):
+            dl.add_rect(
+                seg_x0, seg_y, seg_total_w, seg_h,
+                theme.l0_canvas, theme.radius_xs, Float32(1.0), theme.border_subtle,
+            )
+            for mi in range(3):
+                var sx = seg_x0 + Float32(mi) * seg_w
+                var shov = _hit_rect(mx, my, sx, seg_y, seg_w, seg_h)
+                var active_m = self.view_mode == mi
+                self.last_hit_count += 1
+                if active_m:
+                    dl.add_rect_styled(
+                        sx + Float32(1.0), seg_y + Float32(1.0),
+                        seg_w - Float32(2.0), seg_h - Float32(2.0),
+                        theme.l3_raised, rgba8_with_alpha(theme.accent_primary, 130),
+                        theme.radius_xs, Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+                    )
+                elif shov:
+                    dl.add_rect(
+                        sx + Float32(1.0), seg_y + Float32(1.0),
+                        seg_w - Float32(2.0), seg_h - Float32(2.0),
+                        theme.l2_card, theme.radius_xs,
+                    )
+                var mtw = _measure_cd(font, mode_labels[mi], Float32(10.5))
+                _draw_cd_mid(
+                    dl, font_slot, font, mode_labels[mi],
+                    sx + max(Float32(3.0), (seg_w - mtw) * Float32(0.5)),
+                    seg_y, seg_h, Float32(10.5),
+                    theme.accent_primary if active_m else (theme.text_primary if shov else theme.text_secondary),
+                )
+                if click and shov and action.kind == CODE_ACT_NONE:
+                    self.view_mode = mi
+
         if self.active_tab >= 0 and self.active_tab < len(self.tabs):
             ref tab = self.tabs[self.active_tab]
+            # Optional compact Ln readout to the left of the mode toggle when space permits
+            if w >= Float32(430.0):
+                var loc_txt = "Ln " + String(tab.cursor_line + 1)
+                var loc_w = _measure_cd(mono_font if use_mono else font, loc_txt, Float32(10.5))
+                var loc_x = right_reserve_x - loc_w - Float32(4.0)
+                _draw_cd_mid(
+                    dl, code_slot, mono_font if use_mono else font, loc_txt,
+                    loc_x, crumb_y, crumb_h, Float32(10.5), theme.text_muted,
+                )
+                right_reserve_x = loc_x - Float32(8.0)
+
             var scope = scope_breadcrumbs(tab.symbols, tab.cursor_line)
             var crumb_txt = tab.path if tab.path.byte_length() > 0 else tab.title
             if scope.byte_length() > 0:
                 crumb_txt += "  >  " + scope
-            dl.add_text(
-                font_slot, font,
-                _truncate_text(crumb_txt, max(12, Int((w - Float32(140.0)) / Float32(7.0)))),
-                x + Float32(10.0), crumb_y + Float32(16.0),
+            var max_crumb_ch = max(10, Int((right_reserve_x - (x + Float32(10.0))) / Float32(6.3)))
+            _draw_cd_mid(
+                dl, font_slot, font,
+                _truncate_text(crumb_txt, max_crumb_ch),
+                x + Float32(10.0), crumb_y, crumb_h,
                 Float32(11.0), theme.text_secondary,
             )
-            var loc_txt = "Ln " + String(tab.cursor_line + 1) + "  (" + String(len(tab.symbols)) + " syms)"
-            dl.add_text(
-                font_slot, font, loc_txt,
-                x + w - Float32(130.0), crumb_y + Float32(16.0),
-                Float32(11.0), theme.text_muted,
-            )
         else:
-            dl.add_text(
-                font_slot, font, "No file open - click a component or diagnostic to inspect source",
-                x + Float32(10.0), crumb_y + Float32(16.0),
+            var max_empty_ch = max(12, Int((right_reserve_x - (x + Float32(10.0))) / Float32(6.3)))
+            _draw_cd_mid(
+                dl, font_slot, font,
+                _truncate_text("No file open - click a component or diagnostic to inspect source", max_empty_ch),
+                x + Float32(10.0), crumb_y, crumb_h,
                 Float32(11.0), theme.text_muted,
             )
 
         # --------------------------------------------------------------------
-        # 3. Optional Agent Proposal Banner ([Accept All] / [Reject All])
+        # 3. Optional Agent Proposal Banner (Dynamic-Width [Accept All] / [Reject All])
         # --------------------------------------------------------------------
         var body_y = crumb_y + crumb_h
         if has_active_prop:
             dl.add_rect(x, body_y, w, prop_bar_h, theme.agent_soft)
-            dl.add_rect(x, body_y + prop_bar_h - Float32(1.0), w, Float32(1.0), rgba8_with_alpha(theme.agent_active, 90))
+            dl.add_rect(x, body_y, Float32(3.0), prop_bar_h, theme.agent_active)
+            dl.add_rect(x, body_y + prop_bar_h - Float32(1.0), w, Float32(1.0), rgba8_with_alpha(theme.agent_active, 95))
             draw_studio_icon(dl, ICON_SPARK, x + Float32(10.0), body_y + Float32(7.0), Float32(14.0), theme.agent_active)
             var pending_hunks = self.tabs[self.active_tab].diff_doc.pending_count()
-            var rej_w = Float32(76.0)
-            var acc_w = Float32(78.0)
+
+            var acc_lbl = String("Accept All")
+            var rej_lbl = String("Reject All")
+            var acc_tw = _measure_cd(font, acc_lbl, Float32(10.5))
+            var rej_tw = _measure_cd(font, rej_lbl, Float32(10.5))
+            var acc_w = max(Float32(72.0), acc_tw + Float32(18.0))
+            var rej_w = max(Float32(70.0), rej_tw + Float32(18.0))
             var rej_x = x + w - rej_w - Float32(8.0)
             var acc_x = rej_x - acc_w - Float32(6.0)
-            var prop_label = "Agent Proposed Edit (" + String(pending_hunks) + " hunks)"
-            var prop_max_ch = max(8, Int((acc_x - (x + Float32(34.0))) / Float32(7.0)))
-            dl.add_text(
-                font_slot, font,
+
+            var prop_label = (
+                "Agent Edit (" + String(pending_hunks) + " hunks)"
+                if w >= Float32(375.0)
+                else (String(pending_hunks) + " pending hunks")
+            )
+            var prop_max_ch = max(8, Int((acc_x - (x + Float32(32.0))) / Float32(6.4)))
+            _draw_cd_mid(
+                dl, font_slot, font,
                 _truncate_text(prop_label, prop_max_ch),
-                x + Float32(28.0), body_y + Float32(18.0),
-                Float32(11.5), theme.text_primary,
+                x + Float32(28.0), body_y, prop_bar_h,
+                Float32(11.0), theme.text_primary,
             )
             var by_btn = body_y + Float32(4.0)
             var bh_btn = Float32(20.0)
@@ -686,19 +781,29 @@ struct CodeDrawer(Movable):
             var rej_hov = _hit_rect(mx, my, rej_x, by_btn, rej_w, bh_btn)
             self.last_hit_count += 2
 
-            dl.add_rect(
+            dl.add_rect_styled(
                 acc_x, by_btn, acc_w, bh_btn,
-                rgba8_with_alpha(theme.status_ok, 70 if acc_hov else 46),
-                theme.radius_xs, Float32(1.0), theme.status_ok,
+                rgba8_with_alpha(theme.status_ok, 235 if acc_hov else 205),
+                theme.status_ok,
+                theme.radius_xs, Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
             )
-            dl.add_text(font_slot, font, "Accept All", acc_x + Float32(9.0), by_btn + Float32(14.0), Float32(11.0), theme.text_primary)
+            _draw_cd_mid(
+                dl, font_slot, font, acc_lbl,
+                acc_x + max(Float32(4.0), (acc_w - acc_tw) * Float32(0.5)),
+                by_btn, bh_btn, Float32(10.5), theme.text_on_accent,
+            )
 
-            dl.add_rect(
+            dl.add_rect_styled(
                 rej_x, by_btn, rej_w, bh_btn,
-                rgba8_with_alpha(theme.status_danger, 70 if rej_hov else 44),
-                theme.radius_xs, Float32(1.0), theme.status_danger,
+                rgba8_with_alpha(theme.status_danger, 95 if rej_hov else 52),
+                rgba8_with_alpha(theme.status_danger, 235 if rej_hov else 190),
+                theme.radius_xs, Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
             )
-            dl.add_text(font_slot, font, "Reject All", rej_x + Float32(10.0), by_btn + Float32(14.0), Float32(11.0), theme.text_primary)
+            _draw_cd_mid(
+                dl, font_slot, font, rej_lbl,
+                rej_x + max(Float32(4.0), (rej_w - rej_tw) * Float32(0.5)),
+                by_btn, bh_btn, Float32(10.5), theme.text_primary,
+            )
 
             if click and acc_hov and action.kind == CODE_ACT_NONE:
                 action = CodeDrawerAction(CODE_ACT_ACCEPT_ALL_DIFF)
@@ -741,19 +846,22 @@ struct CodeDrawer(Movable):
 
             if self.view_mode == CODE_MODE_SOURCE:
                 self._draw_source_canvas(
-                    dl, font_slot, font, theme, x, body_y, w, body_h, line_h, mono_px, visible_rows, mx, my, click
+                    dl, code_slot, mono_font if use_mono else font, theme,
+                    x, body_y, w, body_h, line_h, mono_px, visible_rows, mx, my, click,
                 )
             else:
                 var diff_act = self._draw_diff_canvas(
-                    dl, font_slot, font, theme, x, body_y, w, body_h, line_h, mono_px, visible_rows, mx, my, click
+                    dl, font_slot, font, code_slot, mono_font if use_mono else font, theme,
+                    x, body_y, w, body_h, line_h, mono_px, visible_rows, mx, my, click,
                 )
                 if diff_act.kind != CODE_ACT_NONE and action.kind == CODE_ACT_NONE:
                     action = diff_act^
 
+        _ = code_font_valid
         dl.pop_clip()
 
         # --------------------------------------------------------------------
-        # 5. Collapsible Problems Strip
+        # 5. Collapsible Problems Strip (Semantic Count Pills + Message-First Rows)
         # --------------------------------------------------------------------
         dl.add_rect(x, prob_y, w, prob_total_h, theme.l1_shell)
         dl.add_rect(x, prob_y, w, Float32(1.0), theme.border_strong)
@@ -767,12 +875,35 @@ struct CodeDrawer(Movable):
         )
         var errs = self.problems.error_count()
         var warns = self.problems.warning_count()
-        dl.add_text(
-            font_slot, font,
-            "Problems   E:" + String(errs) + "  W:" + String(warns),
-            x + Float32(26.0), prob_y + Float32(16.0),
-            Float32(11.5), theme.status_danger if errs > 0 else theme.text_secondary,
+        _draw_cd_mid(
+            dl, font_slot, font, "Problems",
+            x + Float32(25.0), prob_y, prob_hdr_h, Float32(11.5), theme.text_primary,
         )
+
+        # Semantic pill badges for Errors & Warnings (generous icon-to-digit gap + padding)
+        var pb_x = x + Float32(25.0) + _measure_cd(font, "Problems", Float32(11.5)) + Float32(10.0)
+        var pb_y = prob_y + Float32(4.0)
+        var pb_h = Float32(16.0)
+
+        var err_s = String(errs)
+        var err_w = max(Float32(34.0), _measure_cd(mono_font if use_mono else font, err_s, Float32(10.0)) + Float32(27.0))
+        var err_bg = rgba8_with_alpha(theme.status_danger, 44) if errs > 0 else theme.l2_card
+        var err_bdr = rgba8_with_alpha(theme.status_danger, 150) if errs > 0 else theme.border_subtle
+        var err_fg = theme.status_danger if errs > 0 else theme.text_muted
+        dl.add_rect(pb_x, pb_y, err_w, pb_h, err_bg, Float32(8.0), Float32(1.0), err_bdr)
+        draw_studio_icon(dl, ICON_ERROR_CIRCLE, pb_x + Float32(6.0), pb_y + Float32(3.0), Float32(10.0), err_fg, Float32(1.3))
+        _draw_cd_mid(dl, code_slot, mono_font if use_mono else font, err_s, pb_x + Float32(20.0), pb_y, pb_h, Float32(10.0), err_fg)
+        pb_x += err_w + Float32(6.0)
+
+        var warn_s = String(warns)
+        var warn_w = max(Float32(34.0), _measure_cd(mono_font if use_mono else font, warn_s, Float32(10.0)) + Float32(27.0))
+        var warn_bg = rgba8_with_alpha(theme.status_warn, 40) if warns > 0 else theme.l2_card
+        var warn_bdr = rgba8_with_alpha(theme.status_warn, 145) if warns > 0 else theme.border_subtle
+        var warn_fg = theme.status_warn if warns > 0 else theme.text_muted
+        dl.add_rect(pb_x, pb_y, warn_w, pb_h, warn_bg, Float32(8.0), Float32(1.0), warn_bdr)
+        draw_studio_icon(dl, ICON_WARN, pb_x + Float32(6.0), pb_y + Float32(3.0), Float32(10.0), warn_fg, Float32(1.3))
+        _draw_cd_mid(dl, code_slot, mono_font if use_mono else font, warn_s, pb_x + Float32(20.0), pb_y, pb_h, Float32(10.0), warn_fg)
+
         if click and phdr_hov and action.kind == CODE_ACT_NONE:
             self.problems_open = not self.problems_open
             action = CodeDrawerAction(CODE_ACT_TOGGLE_PROBLEMS)
@@ -781,50 +912,74 @@ struct CodeDrawer(Movable):
             var list_y = prob_y + prob_hdr_h
             var list_h = prob_total_h - prob_hdr_h
             dl.push_clip(Int(x), Int(list_y), Int(x + w), Int(list_y + list_h))
+            dl.add_rect(x, list_y, w, Float32(1.0), theme.border_subtle)
             var cur_path = self.tabs[self.active_tab].path if (self.active_tab >= 0 and self.active_tab < len(self.tabs)) else String("")
             var diags = self.problems.query(ProblemFilter(), cur_path)
-            var row_h = Float32(20.0)
+            var row_h = Float32(22.0)
             var max_rows = max(1, Int(list_h / row_h))
             if len(diags) == 0:
-                dl.add_text(
-                    font_slot, font, "No compiler or LSP diagnostics.",
-                    x + Float32(14.0), list_y + Float32(15.0),
+                _draw_cd_mid(
+                    dl, font_slot, font, "No compiler or LSP diagnostics.",
+                    x + Float32(14.0), list_y + Float32(2.0), Float32(20.0),
                     Float32(11.0), theme.text_muted,
                 )
             else:
                 for di in range(min(max_rows, len(diags))):
                     ref d = diags[di]
-                    var ry = list_y + Float32(di) * row_h
+                    var ry = list_y + Float32(1.0) + Float32(di) * row_h
                     var rhov = _hit_rect(mx, my, x, ry, w, row_h)
-                    var ask_w = Float32(72.0)
+                    var ask_w = Float32(50.0)
                     var ask_x = x + w - ask_w - Float32(8.0)
-                    var ask_hov = _hit_rect(mx, my, ask_x, ry + Float32(2.0), ask_w, row_h - Float32(4.0))
+                    var ask_y = ry + Float32(2.0)
+                    var ask_h = row_h - Float32(4.0)
+                    var ask_hov = _hit_rect(mx, my, ask_x, ask_y, ask_w, ask_h)
                     self.last_hit_count += 2
                     if rhov:
-                        dl.add_rect(x, ry, w, row_h, theme.l3_raised)
+                        dl.add_rect(x, ry, w, row_h, theme.l2_card)
+                    var is_err = d.severity == DIAG_ERROR
                     var sev_col = (
                         theme.status_danger
-                        if d.severity == DIAG_ERROR
+                        if is_err
                         else (theme.status_warn if d.severity == DIAG_WARNING else theme.accent_primary)
                     )
-                    dl.add_circle(x + Float32(12.0), ry + row_h * Float32(0.5), Float32(3.5), sev_col)
-                    var loc = _basename(d.path) + ":" + String(d.line) + ":" + String(d.col) + "  " + d.message
-                    var max_c = max(10, Int((ask_x - (x + Float32(26.0))) / Float32(6.8)))
-                    dl.add_text(
-                        font_slot, font, _truncate_text(loc, max_c),
-                        x + Float32(24.0), ry + Float32(14.0),
-                        Float32(11.0), theme.text_primary if d.severity == DIAG_ERROR else theme.text_secondary,
+                    draw_studio_icon(
+                        dl, ICON_ERROR_CIRCLE if is_err else ICON_WARN,
+                        x + Float32(9.0), ry + Float32(5.5), Float32(11.0), sev_col, Float32(1.35),
                     )
+
+                    # Compact right-aligned file:line tag so the diagnostic MESSAGE gets priority!
+                    var loc_tag = (
+                        (_basename(d.path) + ":" + String(d.line))
+                        if w >= Float32(480.0)
+                        else ("L" + String(d.line) + ":" + String(d.col))
+                    )
+                    var loc_w = _measure_cd(mono_font if use_mono else font, loc_tag, Float32(10.0))
+                    var loc_x = ask_x - loc_w - Float32(8.0)
+                    _draw_cd_mid(
+                        dl, code_slot, mono_font if use_mono else font, loc_tag,
+                        loc_x, ry, row_h, Float32(10.0), theme.text_muted,
+                    )
+
+                    var msg_x = x + Float32(25.0)
+                    var max_c = max(10, Int((loc_x - msg_x - Float32(6.0)) / Float32(6.3)))
+                    _draw_cd_mid(
+                        dl, font_slot, font, _truncate_text(d.message, max_c),
+                        msg_x, ry, row_h,
+                        Float32(11.0), theme.text_primary if is_err else theme.text_secondary,
+                    )
+
+                    # Compact [✦ Fix] pill
                     dl.add_rect(
-                        ask_x, ry + Float32(2.0), ask_w, row_h - Float32(4.0),
-                        theme.agent_soft if ask_hov else theme.l2_card,
+                        ask_x, ask_y, ask_w, ask_h,
+                        rgba8_with_alpha(theme.agent_active, 56 if ask_hov else 26),
                         theme.radius_xs, Float32(1.0),
-                        theme.agent_active if ask_hov else theme.border_subtle,
+                        theme.agent_active if ask_hov else rgba8_with_alpha(theme.agent_active, 115),
                     )
-                    dl.add_text(
-                        font_slot, font, "Ask Agent",
-                        ask_x + Float32(9.0), ry + Float32(13.5),
-                        Float32(10.5), theme.agent_active if ask_hov else theme.text_secondary,
+                    draw_studio_icon(dl, ICON_SPARK, ask_x + Float32(5.0), ask_y + Float32(4.0), Float32(10.0), theme.agent_active, Float32(1.3))
+                    _draw_cd_mid(
+                        dl, font_slot, font, "Fix",
+                        ask_x + Float32(18.0), ask_y, ask_h,
+                        Float32(10.5), theme.text_primary if ask_hov else theme.agent_active,
                     )
                     if click and ask_hov and action.kind == CODE_ACT_NONE:
                         action = CodeDrawerAction(CODE_ACT_ASK_AGENT_FIX)
@@ -863,7 +1018,7 @@ struct CodeDrawer(Movable):
         click: Bool,
     ):
         ref tab = self.tabs[self.active_tab]
-        var gutter_w = Float32(48.0)
+        var gutter_w = Float32(46.0)
         var marks = tab.diff_doc.gutter_marks()
         var file_diags = self.problems.for_file(tab.path)
         var n_lines = len(tab.lines)
@@ -880,7 +1035,7 @@ struct CodeDrawer(Movable):
             var ry = y + Float32(vi) * line_h
             var is_cur = ln == tab.cursor_line
             if is_cur:
-                dl.add_rect(x + gutter_w + Float32(1.0), ry, w - gutter_w - Float32(1.0), line_h, rgba8_with_alpha(theme.accent_primary, 24))
+                dl.add_rect(x + gutter_w + Float32(1.0), ry, w - gutter_w - Float32(1.0), line_h, rgba8_with_alpha(theme.accent_primary, 22))
 
             if click and _hit_rect(mx, my, x, ry, w, line_h):
                 self.tabs[self.active_tab].cursor_line = ln
@@ -895,42 +1050,57 @@ struct CodeDrawer(Movable):
                 elif mk == GUTTER_DELETED_ABOVE or mk == GUTTER_DELETED_BELOW:
                     dl.add_rect(x + gutter_w - Float32(4.0), ry, Float32(4.0), Float32(3.0), theme.status_danger)
 
-            # Line number
-            dl.add_text(
-                font_slot, font, String(ln + 1),
-                x + Float32(8.0), ry + Float32(13.5),
-                Float32(11.0), theme.text_primary if is_cur else theme.text_muted,
+            # Right-aligned line number
+            var ln_s = String(ln + 1)
+            var ln_w = _measure_cd(font, ln_s, Float32(10.5))
+            _draw_cd_mid(
+                dl, font_slot, font, ln_s,
+                x + max(Float32(4.0), gutter_w - Float32(9.0) - ln_w), ry, line_h,
+                Float32(10.5), theme.text_primary if is_cur else theme.text_muted,
             )
 
-            # Syntax-highlighted code line
+            # Syntax-highlighted code line (4px+ right inset clip so glyphs never kiss right dock border)
             var code_x = x + gutter_w + Float32(10.0)
-            var base_y = ry + Float32(13.5)
+            var base_y = ry + (line_h + mono_px * Float32(0.66)) * Float32(0.5)
+            dl.push_clip(Int(x + gutter_w + Float32(1.0)), Int(ry), Int(x + w - Float32(8.0)), Int(ry + line_h))
             if ln < len(tab.spans):
                 self._draw_syntax_text(dl, font_slot, font, theme, tab.lines[ln], tab.spans[ln], code_x, base_y, mono_px)
             else:
                 dl.add_text(font_slot, font, tab.lines[ln], code_x, base_y, mono_px, theme.text_primary)
+            dl.pop_clip()
 
             # Inline diagnostic squiggle & badge for diagnostics on this line
             for di in range(len(file_diags)):
                 ref d = file_diags[di]
                 if d.line == ln + 1:
                     var dcol = theme.status_danger if d.severity == DIAG_ERROR else theme.status_warn
-                    var char_w = max(Float32(6.5), font.measure("m", mono_px))
+                    var char_w = max(Float32(6.5), _measure_cd(font, "m", mono_px))
                     var sq_x = code_x + Float32(max(0, d.col - 1)) * char_w
                     var sq_w = max(Float32(24.0), char_w * Float32(6.0))
                     self._draw_squiggle(dl, sq_x, ry + line_h - Float32(2.0), sq_w, dcol)
                     var badge = _truncate_text(d.message, 32)
-                    var bx = max(code_x + font.measure(tab.lines[ln], mono_px) + Float32(16.0), x + w - Float32(220.0))
+                    var bx = max(code_x + _measure_cd(font, tab.lines[ln], mono_px) + Float32(16.0), x + w - Float32(220.0))
                     if bx + Float32(60.0) < x + w:
-                        dl.add_rect(bx, ry + Float32(2.0), x + w - bx - Float32(6.0), line_h - Float32(4.0), rgba8_with_alpha(dcol, 34), theme.radius_xs)
-                        dl.add_text(font_slot, font, badge, bx + Float32(6.0), ry + Float32(13.0), Float32(10.5), dcol)
+                        dl.add_rect(bx, ry + Float32(2.0), x + w - bx - Float32(10.0), line_h - Float32(4.0), rgba8_with_alpha(dcol, 34), theme.radius_xs)
+                        _draw_cd_mid(dl, font_slot, font, badge, bx + Float32(6.0), ry, line_h, Float32(10.0), dcol)
                     break
+
+        # Sleek 4px vertical scrollbar thumb when file exceeds viewport
+        if n_lines > visible_rows and h > Float32(24.0):
+            var track_h = h - Float32(8.0)
+            var thumb_h = max(Float32(20.0), track_h * (Float32(visible_rows) / Float32(max(1, n_lines))))
+            var max_top = max(1, n_lines - visible_rows)
+            var frac = Float32(top) / Float32(max_top)
+            var sb_y = y + Float32(4.0) + min(Float32(1.0), frac) * max(Float32(0.0), track_h - thumb_h)
+            dl.add_rect(x + w - Float32(6.0), sb_y, Float32(3.5), thumb_h, theme.border_control, Float32(2.0))
 
     def _draw_diff_canvas(
         mut self,
         mut dl: UiDrawList,
-        font_slot: Int,
-        font: SdfFont,
+        ui_slot: Int,
+        ui_font: SdfFont,
+        code_slot: Int,
+        code_font: SdfFont,
         theme: StudioTheme,
         x: Float32,
         y: Float32,
@@ -951,9 +1121,9 @@ struct CodeDrawer(Movable):
             else self.tabs[self.active_tab].diff_doc.unified_rows(3)
         )
         if len(rows) == 0:
-            dl.add_text(
-                font_slot, font, "No changes (file matches base).",
-                x + Float32(16.0), y + Float32(24.0),
+            _draw_cd_mid(
+                dl, ui_slot, ui_font, "No changes (file matches base).",
+                x + Float32(16.0), y + Float32(12.0), Float32(24.0),
                 Float32(12.0), theme.text_muted,
             )
             return act^
@@ -963,50 +1133,75 @@ struct CodeDrawer(Movable):
 
         var old_bg = theme.diff_del_bg
         var new_bg = theme.diff_add_bg
-        var hdr_bg = theme.diff_hunk_bg
         var half_w = w * Float32(0.5)
+        var gutter_w = Float32(44.0)
+        var split_gutter_w = Float32(34.0)
+        var start_y = y
 
-        if is_split:
-            dl.add_rect(x + half_w, y, Float32(1.0), h, theme.border_subtle)
+        if not is_split:
+            # Unified diff gutter surface & vertical hairline divider
+            dl.add_rect(x, y, gutter_w, h, theme.l1_shell)
+            dl.add_rect(x + gutter_w, y, Float32(1.0), h, theme.border_subtle)
+        else:
+            # Split diff Original / Proposed mini header + per-pane gutters
+            var sh_h = Float32(20.0)
+            dl.add_rect(x, y, w, sh_h, theme.l1_shell)
+            dl.add_rect(x, y + sh_h - Float32(1.0), w, Float32(1.0), theme.border_subtle)
+            _draw_cd_mid(dl, ui_slot, ui_font, "Original", x + Float32(10.0), y, sh_h, Float32(10.5), theme.diff_del_fg)
+            _draw_cd_mid(dl, ui_slot, ui_font, "Proposed", x + half_w + Float32(10.0), y, sh_h, Float32(10.5), theme.diff_add_fg)
+            start_y = y + sh_h
+            var body_sub_h = max(Float32(0.0), h - sh_h)
+            dl.add_rect(x, start_y, split_gutter_w, body_sub_h, theme.l1_shell)
+            dl.add_rect(x + split_gutter_w, start_y, Float32(1.0), body_sub_h, theme.border_subtle)
+            dl.add_rect(x + half_w + Float32(1.0), start_y, split_gutter_w, body_sub_h, theme.l1_shell)
+            dl.add_rect(x + half_w + Float32(1.0) + split_gutter_w, start_y, Float32(1.0), body_sub_h, theme.border_subtle)
+            dl.add_rect(x + half_w, y, Float32(1.0), h, theme.border_control)
 
-        for vi in range(visible_rows):
-            var ri = top + vi
-            if ri >= len(rows):
-                break
+        var cur_y = start_y
+        var ri = top
+        while ri < len(rows) and cur_y < y + h:
             ref row = rows[ri]
-            var ry = y + Float32(vi) * line_h
-            var base_y = ry + Float32(13.5)
+            ri += 1
 
             if row.kind == DIFF_ROW_HEADER:
-                dl.add_rect(x, ry, w, line_h, hdr_bg)
-                draw_studio_icon(dl, ICON_DIFF, x + Float32(8.0), ry + Float32(3.0), Float32(12.0), theme.accent_primary)
-                dl.add_text(font_slot, font, row.text, x + Float32(26.0), base_y, Float32(11.0), theme.accent_primary)
+                # Neutral elevated L2 hunk header (22px height, zero amber-on-blue clash; hunk-0 Accept covers (535,91) at w=640)
+                var hunk_h = Float32(22.0)
+                dl.add_rect(x, cur_y, w, hunk_h, theme.l2_card)
+                dl.add_rect(x, cur_y, w, hunk_h, theme.diff_hunk_bg)
+                dl.add_rect(x, cur_y, w, Float32(1.0), theme.border_subtle)
+                dl.add_rect(x, cur_y + hunk_h - Float32(1.0), w, Float32(1.0), theme.border_subtle)
+                draw_studio_icon(dl, ICON_DIFF, x + Float32(8.0), cur_y + Float32(5.0), Float32(12.0), theme.agent_active)
+                _draw_cd_mid(dl, code_slot, code_font, row.text, x + Float32(25.0), cur_y, hunk_h, Float32(10.5), theme.text_secondary)
 
                 # Clickable per-hunk [Accept] / [Reject] buttons
                 var hi = row.hunk
                 if hi >= 0 and hi < len(self.tabs[self.active_tab].diff_doc.decisions):
                     var dec = self.tabs[self.active_tab].diff_doc.decisions[hi]
                     var bw = Float32(58.0)
+                    var bh = Float32(18.0)
+                    var by = cur_y + Float32(2.0)
                     var rbx = x + w - bw - Float32(8.0)
                     var abx = rbx - bw - Float32(6.0)
-                    var ahov = _hit_rect(mx, my, abx, ry + Float32(1.0), bw, line_h - Float32(2.0))
-                    var rhov = _hit_rect(mx, my, rbx, ry + Float32(1.0), bw, line_h - Float32(2.0))
+                    var ahov = _hit_rect(mx, my, abx, by, bw, bh)
+                    var rhov = _hit_rect(mx, my, rbx, by, bw, bh)
                     self.last_hit_count += 2
 
                     var acc_fill = (
-                        rgba8_with_alpha(theme.status_ok, 92)
+                        rgba8_with_alpha(theme.status_ok, 110)
                         if dec == HUNK_ACCEPTED
-                        else rgba8_with_alpha(theme.status_ok, 60 if ahov else 32)
+                        else rgba8_with_alpha(theme.status_ok, 68 if ahov else 36)
                     )
                     var rej_fill = (
-                        rgba8_with_alpha(theme.status_danger, 92)
+                        rgba8_with_alpha(theme.status_danger, 110)
                         if dec == HUNK_REJECTED
-                        else rgba8_with_alpha(theme.status_danger, 60 if rhov else 32)
+                        else rgba8_with_alpha(theme.status_danger, 68 if rhov else 36)
                     )
-                    dl.add_rect(abx, ry + Float32(1.0), bw, line_h - Float32(2.0), acc_fill, theme.radius_xs, Float32(1.0), theme.status_ok)
-                    dl.add_text(font_slot, font, "Accept", abx + Float32(9.0), ry + Float32(13.0), Float32(10.5), theme.text_primary)
-                    dl.add_rect(rbx, ry + Float32(1.0), bw, line_h - Float32(2.0), rej_fill, theme.radius_xs, Float32(1.0), theme.status_danger)
-                    dl.add_text(font_slot, font, "Reject", rbx + Float32(10.0), ry + Float32(13.0), Float32(10.5), theme.text_primary)
+                    dl.add_rect(abx, by, bw, bh, acc_fill, theme.radius_xs, Float32(1.0), rgba8_with_alpha(theme.status_ok, 215 if (ahov or dec == HUNK_ACCEPTED) else 155))
+                    var acc_w_t = _measure_cd(ui_font, "Accept", Float32(10.5))
+                    _draw_cd_mid(dl, ui_slot, ui_font, "Accept", abx + max(Float32(4.0), (bw - acc_w_t) * Float32(0.5)), by, bh, Float32(10.5), theme.text_primary)
+                    dl.add_rect(rbx, by, bw, bh, rej_fill, theme.radius_xs, Float32(1.0), rgba8_with_alpha(theme.status_danger, 215 if (rhov or dec == HUNK_REJECTED) else 155))
+                    var rej_w_t = _measure_cd(ui_font, "Reject", Float32(10.5))
+                    _draw_cd_mid(dl, ui_slot, ui_font, "Reject", rbx + max(Float32(4.0), (bw - rej_w_t) * Float32(0.5)), by, bh, Float32(10.5), theme.text_primary)
 
                     if click and ahov and act.kind == CODE_ACT_NONE:
                         act = CodeDrawerAction(CODE_ACT_ACCEPT_HUNK)
@@ -1018,7 +1213,10 @@ struct CodeDrawer(Movable):
                         act.hunk_index = hi
                         act.path = self.tabs[self.active_tab].path
                         _ = self.apply_hunk_decision(hi, False)
+                cur_y += hunk_h
                 continue
+
+            var base_y = cur_y + (line_h + mono_px * Float32(0.66)) * Float32(0.5)
 
             if not is_split:
                 var bg = UInt32(0)
@@ -1030,14 +1228,21 @@ struct CodeDrawer(Movable):
                     bg = new_bg
                     bar_col = theme.status_ok
                 if (bg >> 24) != 0:
-                    dl.add_rect(x, ry, w, line_h, bg)
-                    dl.add_rect(x, ry, Float32(3.0), line_h, bar_col)
+                    dl.add_rect(x, cur_y, w, line_h, bg)
+                    dl.add_rect(x, cur_y, Float32(3.0), line_h, bar_col)
                 var ln_str = (
                     String(row.new_line + 1)
                     if row.new_line >= 0 and row.kind != DIFF_ROW_OLD
                     else (String(row.old_line + 1) if row.old_line >= 0 else String(""))
                 )
-                dl.add_text(font_slot, font, ln_str, x + Float32(8.0), base_y, Float32(10.5), theme.text_muted)
+                if ln_str.byte_length() > 0:
+                    var ln_w = _measure_cd(code_font, ln_str, Float32(10.0))
+                    _draw_cd_mid(
+                        dl, code_slot, code_font, ln_str,
+                        x + max(Float32(5.0), gutter_w - Float32(7.0) - ln_w), cur_y, line_h,
+                        Float32(10.0),
+                        theme.diff_del_fg if row.kind == DIFF_ROW_OLD else (theme.diff_add_fg if row.kind == DIFF_ROW_NEW else theme.text_muted),
+                    )
                 var prefix = String(row.text[byte=0:1]) if row.text.byte_length() > 0 else String(" ")
                 var body = String(row.text[byte=1 : row.text.byte_length()]) if row.text.byte_length() > 1 else String("")
                 var pcol = (
@@ -1045,33 +1250,53 @@ struct CodeDrawer(Movable):
                     if row.kind == DIFF_ROW_OLD
                     else (theme.status_ok if row.kind == DIFF_ROW_NEW else theme.text_muted)
                 )
-                dl.add_text(font_slot, font, prefix, x + Float32(42.0), base_y, mono_px, pcol)
+                dl.push_clip(Int(x + gutter_w + Float32(1.0)), Int(cur_y), Int(x + w - Float32(8.0)), Int(cur_y + line_h))
+                dl.add_text(code_slot, code_font, prefix, x + gutter_w + Float32(6.0), base_y, mono_px, pcol)
                 var hl_u = self.highlighter.highlight_line(body, 0, self.tabs[self.active_tab].lang)
-                self._draw_syntax_text(dl, font_slot, font, theme, body, hl_u[0], x + Float32(56.0), base_y, mono_px)
+                self._draw_syntax_text(dl, code_slot, code_font, theme, body, hl_u[0], x + gutter_w + Float32(18.0), base_y, mono_px)
+                dl.pop_clip()
             else:
-                # Split side-by-side rendering
+                # Split side-by-side rendering with strict per-pane clipping & right-aligned line numbers
                 var left_bg = old_bg if (row.kind == DIFF_ROW_OLD or row.kind == DIFF_ROW_SPLIT_CHG) else UInt32(0)
                 var right_bg = new_bg if (row.kind == DIFF_ROW_NEW or row.kind == DIFF_ROW_SPLIT_CHG) else UInt32(0)
                 if (left_bg >> 24) != 0:
-                    dl.add_rect(x, ry, half_w, line_h, left_bg)
-                    dl.add_rect(x, ry, Float32(3.0), line_h, theme.status_danger)
+                    dl.add_rect(x, cur_y, half_w, line_h, left_bg)
+                    dl.add_rect(x, cur_y, Float32(3.0), line_h, theme.status_danger)
                 if (right_bg >> 24) != 0:
-                    dl.add_rect(x + half_w + Float32(1.0), ry, half_w - Float32(1.0), line_h, right_bg)
-                    dl.add_rect(x + half_w + Float32(1.0), ry, Float32(3.0), line_h, theme.status_ok)
+                    dl.add_rect(x + half_w + Float32(1.0), cur_y, half_w - Float32(1.0), line_h, right_bg)
+                    dl.add_rect(x + half_w + Float32(1.0), cur_y, Float32(3.0), line_h, theme.status_ok)
 
-                var max_col_chars = max(8, Int((half_w - Float32(44.0)) / Float32(7.0)))
+                # Left pane (clipped cleanly to half_w)
+                dl.push_clip(Int(x), Int(cur_y), Int(x + half_w - Float32(2.0)), Int(cur_y + line_h))
                 if row.old_line >= 0:
-                    dl.add_text(font_slot, font, String(row.old_line + 1), x + Float32(6.0), base_y, Float32(10.5), theme.text_muted)
+                    var ol_s = String(row.old_line + 1)
+                    var ol_w = _measure_cd(code_font, ol_s, Float32(10.0))
+                    _draw_cd_mid(dl, code_slot, code_font, ol_s, x + max(Float32(4.0), split_gutter_w - Float32(5.0) - ol_w), cur_y, line_h, Float32(10.0), theme.text_muted)
                 if row.left_text.byte_length() > 0:
-                    var lt = _truncate_text(row.left_text, max_col_chars)
-                    var hl_l = self.highlighter.highlight_line(lt, 0, self.tabs[self.active_tab].lang)
-                    self._draw_syntax_text(dl, font_slot, font, theme, lt, hl_l[0], x + Float32(38.0), base_y, mono_px)
+                    var hl_l = self.highlighter.highlight_line(row.left_text, 0, self.tabs[self.active_tab].lang)
+                    self._draw_syntax_text(dl, code_slot, code_font, theme, row.left_text, hl_l[0], x + split_gutter_w + Float32(6.0), base_y, mono_px)
+                dl.pop_clip()
 
+                # Right pane (clipped cleanly to right half)
+                dl.push_clip(Int(x + half_w + Float32(1.0)), Int(cur_y), Int(x + w - Float32(8.0)), Int(cur_y + line_h))
                 if row.new_line >= 0:
-                    dl.add_text(font_slot, font, String(row.new_line + 1), x + half_w + Float32(8.0), base_y, Float32(10.5), theme.text_muted)
+                    var nl_s = String(row.new_line + 1)
+                    var nl_w = _measure_cd(code_font, nl_s, Float32(10.0))
+                    _draw_cd_mid(dl, code_slot, code_font, nl_s, x + half_w + Float32(1.0) + max(Float32(4.0), split_gutter_w - Float32(5.0) - nl_w), cur_y, line_h, Float32(10.0), theme.text_muted)
                 if row.right_text.byte_length() > 0:
-                    var rt = _truncate_text(row.right_text, max_col_chars)
-                    var hl_r = self.highlighter.highlight_line(rt, 0, self.tabs[self.active_tab].lang)
-                    self._draw_syntax_text(dl, font_slot, font, theme, rt, hl_r[0], x + half_w + Float32(40.0), base_y, mono_px)
+                    var hl_r = self.highlighter.highlight_line(row.right_text, 0, self.tabs[self.active_tab].lang)
+                    self._draw_syntax_text(dl, code_slot, code_font, theme, row.right_text, hl_r[0], x + half_w + split_gutter_w + Float32(7.0), base_y, mono_px)
+                dl.pop_clip()
+
+            cur_y += line_h
+
+        # Sleek 4px vertical scrollbar thumb when diff exceeds viewport
+        if len(rows) > visible_rows and h > Float32(24.0):
+            var track_h = max(Float32(16.0), (y + h) - start_y - Float32(8.0))
+            var thumb_h = max(Float32(20.0), track_h * (Float32(visible_rows) / Float32(max(1, len(rows)))))
+            var max_top = max(1, len(rows) - visible_rows)
+            var frac = Float32(top) / Float32(max_top)
+            var sb_y = start_y + Float32(4.0) + min(Float32(1.0), frac) * max(Float32(0.0), track_h - thumb_h)
+            dl.add_rect(x + w - Float32(6.0), sb_y, Float32(3.5), thumb_h, theme.border_control, Float32(2.0))
 
         return act^

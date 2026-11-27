@@ -32,6 +32,7 @@ from flint.studio.agent_bus import (
     ROLE_SCENE_BUILDER,
     TRAIL_ARC_DURATION_SEC,
     AgentTelemetryBus,
+    agent_role_short_tag,
     agent_status_label,
 )
 from flint.ui.context import pack_rgba8
@@ -47,6 +48,8 @@ from flint.ui.theme import (
     ICON_REVERT,
     ICON_SPARK,
     ICON_WARN,
+    StudioTheme,
+    rgba8_with_alpha,
 )
 
 comptime HIT_KIND_CALLOUT_FOCUS: UInt8 = 1
@@ -382,9 +385,9 @@ def emit_agent_viewport_3d_overlays(
                 lines, g.target_pos, g.half_extents, g.target_rot, Float32(0.32), gcol, Float32(2.2), xray=True
             )
             var axis_len = max(Float32(0.25), min(g.half_extents.x, min(g.half_extents.y, g.half_extents.z)) * Float32(0.85))
-            lines.add_line(g.target_pos, g.target_pos + g.target_rot.rotate(Vec3(axis_len, 0.0, 0.0)), _with_alpha(0xFFE55B64, g_alpha), Float32(1.75), xray=True)
-            lines.add_line(g.target_pos, g.target_pos + g.target_rot.rotate(Vec3(0.0, axis_len, 0.0)), _with_alpha(0xFF52C77A, g_alpha), Float32(1.75), xray=True)
-            lines.add_line(g.target_pos, g.target_pos + g.target_rot.rotate(Vec3(0.0, 0.0, axis_len)), _with_alpha(0xFF4E9AF1, g_alpha), Float32(1.75), xray=True)
+            lines.add_line(g.target_pos, g.target_pos + g.target_rot.rotate(Vec3(axis_len, 0.0, 0.0)), _with_alpha(0xFFE85A66, g_alpha), Float32(1.75), xray=True)
+            lines.add_line(g.target_pos, g.target_pos + g.target_rot.rotate(Vec3(0.0, axis_len, 0.0)), _with_alpha(0xFF4FC478, g_alpha), Float32(1.75), xray=True)
+            lines.add_line(g.target_pos, g.target_pos + g.target_rot.rotate(Vec3(0.0, 0.0, axis_len)), _with_alpha(0xFF4C96F0, g_alpha), Float32(1.75), xray=True)
             emitted += 3
             var drop_r = max(g.half_extents.x, g.half_extents.z) * Float32(1.25)
             emitted += _add_ground_ring(lines, g.target_pos, drop_r, -g.half_extents.y, _with_alpha(g.accent_rgba8, g_alpha * Float32(0.65)), 20, Float32(1.6), dashed=True, phase_rad=t * Float32(1.2), xray=False)
@@ -449,41 +452,55 @@ def _emit_bezier_beam_with_beads(
     x1: Float32,
     y1: Float32,
     accent_rgba8: UInt32,
+    socket_bg: UInt32,
     time_sec: Float32,
+    launch_down: Bool = False,
 ):
-    """Emits a GPU-animated flowing dashed Bezier tether (`add_bezier_flow`) with soft glow
-    and 3 luminous energy beads travelling along `B(u)`."""
+    """Emits a GPU-animated flowing dashed Bezier tether (`add_bezier_flow`) with an engineered
+    anchor socket, soft glow, and distance-scaled luminous energy beads travelling along `B(u)`."""
     var dx = x1 - x0
     var dy = y1 - y0
     var dist = sqrt(dx * dx + dy * dy)
     if not isfinite(dist) or dist < Float32(12.0):
         return
-    var arc_lift = min(Float32(90.0), max(Float32(22.0), dist * Float32(0.18)))
-    var cx = (x0 + x1) * Float32(0.5)
-    var cy = min(y0, y1) - arc_lift
+    var cx: Float32
+    var cy: Float32
+    if launch_down:
+        # Smooth downward sweep from bottom edge of presence pill without looping upward over the pill
+        cx = x0 + dx * Float32(0.25)
+        cy = y0 + dy * Float32(0.55)
+    else:
+        var arc_lift = min(Float32(72.0), max(Float32(18.0), dist * Float32(0.16)))
+        cx = (x0 + x1) * Float32(0.5)
+        cy = min(y0, y1) - arc_lift
 
     # Subtle continuous guide filament + GPU-animated flowing glowing dashes (`UI_FLAG_DASHED_FLOW`)
-    dl.add_quad_bezier(x0, y0, cx, cy, x1, y1, Float32(1.0), _with_alpha(accent_rgba8, Float32(0.24)), Float32(1.0))
+    dl.add_quad_bezier(x0, y0, cx, cy, x1, y1, Float32(1.0), _with_alpha(accent_rgba8, Float32(0.22)), Float32(1.0))
     dl.add_bezier_flow(
         x0, y0, cx, cy, x1, y1,
-        Float32(2.4),
-        _with_alpha(accent_rgba8, Float32(0.92)),
+        Float32(2.2),
+        _with_alpha(accent_rgba8, Float32(0.90)),
         dash_px=12,
         gap_px=8,
-        speed_q4=36,
-        glow_alpha=155,
+        speed_q4=32,
+        glow_alpha=125,
     )
 
-    # 3 luminous pulse beads travelling along B(u)
-    var base_phase = _fract(time_sec * Float32(0.65))
-    for k in range(3):
-        var u = _fract(base_phase + Float32(k) * Float32(0.333333))
+    # Distance-scaled luminous pulse beads travelling along B(u) (prevents stacking on short tethers)
+    var bead_count = 1 if dist < Float32(130.0) else (2 if dist < Float32(260.0) else 3)
+    var base_phase = _fract(time_sec * Float32(0.62))
+    for k in range(bead_count):
+        var u = _fract(base_phase + Float32(k) / Float32(bead_count))
         var om = Float32(1.0) - u
         var bx = om * om * x0 + Float32(2.0) * om * u * cx + u * u * x1
         var by = om * om * y0 + Float32(2.0) * om * u * cy + u * u * y1
         var edge_fade = min(Float32(1.0), min(u * Float32(5.0), (Float32(1.0) - u) * Float32(5.0)))
-        dl.add_circle(bx, by, Float32(4.6), _with_alpha(accent_rgba8, Float32(0.26) * edge_fade))
-        dl.add_circle(bx, by, Float32(2.2), _with_alpha(0xFFFFFFFF, Float32(0.95) * edge_fade))
+        dl.add_circle(bx, by, Float32(3.4), _with_alpha(accent_rgba8, Float32(0.22) * edge_fade))
+        dl.add_circle(bx, by, Float32(1.8), _with_alpha(0xFFFFFFFF, Float32(0.92) * edge_fade))
+
+    # Engineered port socket ring at tether origin so it attaches cleanly to the presence pill
+    dl.add_circle(x0, y0, Float32(3.8), socket_bg, Float32(1.0), _with_alpha(accent_rgba8, Float32(0.72)))
+    dl.add_circle(x0, y0, Float32(1.9), accent_rgba8)
 
 
 def _resolve_pill_y(
@@ -517,6 +534,11 @@ def _resolve_pill_y(
     return y
 
 
+@always_inline
+def _theatre_hit(mx: Float32, my: Float32, x: Float32, y: Float32, w: Float32, h: Float32) -> Bool:
+    return mx >= x and mx <= x + w and my >= y and my <= y + h
+
+
 def _emit_hud_core(
     bus: AgentTelemetryBus,
     mut dl: UiDrawList,
@@ -530,6 +552,9 @@ def _emit_hud_core(
     vp_h: Float32,
     time_sec: Float32,
     mut out_hits: List[TheatrePillHit],
+    theme: StudioTheme,
+    mouse_x: Float32,
+    mouse_y: Float32,
 ) -> Int:
     if not bus.has_active_visuals() or vp_w < Float32(40.0) or vp_h < Float32(40.0):
         return 0
@@ -537,29 +562,43 @@ def _emit_hud_core(
     var before_prims = dl.count()
     var t = time_sec if isfinite(time_sec) else Float32(0.0)
     var pulse = Float32(0.5) + Float32(0.5) * sin(t * Float32(5.0))
-    var glass_bg = pack_rgba8(18, 22, 31, 214)
-    var text_pri = pack_rgba8(237, 241, 247, 255)
+    var glass_bg = theme.l4_overlay
+    var text_pri = theme.text_primary
+    var text_sec = theme.text_secondary
+    var text_mut = theme.text_muted
+    var warn_col = theme.status_warn
+    var ok_col = theme.status_ok
+    var no_col = theme.status_danger
     var placed_pills = List[Tuple[Float32, Float32, Float32, Float32]]()
+
+    # Count active sessions so single-agent world callouts stay compact (no duplicate agent name prefix)
+    var active_sess_count = 0
+    for si in range(len(bus.sessions)):
+        if bus.sessions[si].is_busy() or bus.sessions[si].has_active_world_pos:
+            active_sess_count += 1
 
     dl.push_clip(Int(vp_x), Int(vp_y), Int(vp_x + vp_w), Int(vp_y + vp_h))
 
     # Time-Travel amber rim & top-center frosted-glass indicator pill
     if bus.time_travel_active:
-        var amber = pack_rgba8(245, 183, 79, 235)
+        var amber = rgba8_with_alpha(warn_col, 235)
         dl.add_rect(vp_x + Float32(1.0), vp_y + Float32(1.0), vp_w - Float32(2.0), vp_h - Float32(2.0), 0, Float32(2.0), Float32(2.0), amber)
-        var tt_txt = "TIME-TRAVEL PREVIEW  |  Step #" + String(bus.time_travel_step_idx + 1)
-        var tt_w = (font.measure(tt_txt, Float32(12.0)) + Float32(42.0)) if (has_font and font.valid) else Float32(252.0)
+        var tt_txt = "TIME-TRAVEL  |  Step #" + String(bus.time_travel_step_idx + 1)
+        var tt_w = (font.measure(tt_txt, Float32(11.5)) + Float32(42.0)) if (has_font and font.valid) else Float32(236.0)
         var tt_x = vp_x + (vp_w - tt_w) * Float32(0.5)
         var tt_y = vp_y + Float32(10.0)
+        if theme.is_dark:
+            dl.add_ambient_shadow(tt_x, tt_y, tt_w, Float32(26.0), Float32(13.0), Float32(10.0), 92, Float32(2.0))
         dl.add_glass_panel(
             tt_x, tt_y, tt_w, Float32(26.0),
-            pack_rgba8(34, 24, 12, 224),
-            Float32(13.0), Float32(3.5), Float32(1.2), amber,
+            rgba8_with_alpha(theme.l2_card, 224),
+            Float32(13.0), Float32(4.0), Float32(1.2), amber,
             top_bevel=True, drop_shadow=True,
         )
         draw_studio_icon(dl, ICON_REVERT, tt_x + Float32(9.0), tt_y + Float32(6.0), Float32(14.0), amber, Float32(1.5))
         if has_font and font.valid:
-            _draw_theatre_text(dl, font_slot, font, tt_txt, tt_x + Float32(28.0), tt_y + Float32(7.0), Float32(12.0), amber)
+            _draw_theatre_text(dl, font_slot, font, tt_txt, tt_x + Float32(28.0), tt_y + Float32(7.0), Float32(11.5), amber)
+        placed_pills.append((tt_x, tt_y, tt_w, Float32(26.0)))
 
     # Render each active agent's Presence Pill, Bezier Flow tether, PRIM_ARC reticle & callout pill
     var presence_slot = 0
@@ -572,44 +611,64 @@ def _emit_hud_core(
         var pending_idx = bus.first_pending_for_agent(sess.agent_id)
         var has_approval = pending_idx >= 0
         var role_icon = _role_icon_id(sess.role)
+        var is_waiting = sess.status == AGENT_STATUS_WAITING_APPROVAL
 
         # 1. Floating Frosted-Glass Agent Presence Anchor Pill (clears Top-Left Transform HUD)
         var pres_detail = agent_status_label(sess.status)
-        if sess.active_callout.byte_length() > 0 and sess.status != AGENT_STATUS_WAITING_APPROVAL:
+        if sess.active_callout.byte_length() > 0 and not is_waiting:
             pres_detail = sess.active_callout
-        var pres_label = sess.name + " | " + pres_detail
-        if pres_label.byte_length() > 48:
-            pres_label = String(pres_label[byte=0:45]) + "..."
-        var pres_w = (font.measure(pres_label, Float32(12.0)) + Float32(46.0)) if (has_font and font.valid) else Float32(204.0)
-        pres_w = min(pres_w, vp_w * Float32(0.56))
+        if pres_detail.byte_length() > 28:
+            pres_detail = String(pres_detail[byte=0:25]) + "..."
+        var font_px = Float32(11.5)
+        var name_w = font.measure(sess.name, font_px) if (has_font and font.valid) else Float32(sess.name.byte_length() * 6)
+        var sep_w = Float32(14.0)
+        var det_w = font.measure(pres_detail, font_px) if (has_font and font.valid) else Float32(pres_detail.byte_length() * 6)
+        var pres_w = min(vp_w * Float32(0.54), name_w + sep_w + det_w + Float32(44.0))
         var pres_h = Float32(28.0)
         var pres_x = vp_x + Float32(12.0)
         var pres_y = vp_y + Float32(54.0) + Float32(presence_slot) * Float32(34.0)
         presence_slot += 1
 
+        var pres_hov = _theatre_hit(mouse_x, mouse_y, pres_x, pres_y, pres_w, pres_h)
+        var pres_rim = warn_col if is_waiting else accent
+        var pres_bdr = _with_alpha(pres_rim, Float32(0.95) if pres_hov else Float32(0.68))
+
+        if theme.is_dark:
+            dl.add_ambient_shadow(pres_x, pres_y, pres_w, pres_h, Float32(14.0), Float32(10.0), 90, Float32(2.0))
         dl.add_glass_panel(
             pres_x, pres_y, pres_w, pres_h,
             glass_bg,
-            Float32(14.0), Float32(3.5), Float32(1.2), _with_alpha(accent, Float32(0.72)),
+            Float32(14.0), Float32(4.0), Float32(1.1), pres_bdr,
             top_bevel=True, drop_shadow=True,
         )
-        # Animated PRIM_ARC status spinner around role icon
+
+        # Clean badge housing + crisp PRIM_ARC status spinner around role/warn icon (no muddy glow bleed)
         var spin_cx = pres_x + Float32(15.0)
         var spin_cy = pres_y + pres_h * Float32(0.5)
-        if sess.status == AGENT_STATUS_WAITING_APPROVAL:
-            var warn_col = pack_rgba8(245, 183, 79, 255)
-            dl.add_progress_ring(spin_cx, spin_cy, Float32(8.5), Float32(1.8), Float32(1.0), warn_col, _with_alpha(warn_col, Float32(0.25)), Float32(3.5))
-            draw_studio_icon(dl, ICON_WARN, spin_cx - Float32(5.5), spin_cy - Float32(5.5), Float32(11.0), warn_col, Float32(1.4))
+        if is_waiting:
+            dl.add_circle(spin_cx, spin_cy, Float32(8.5), rgba8_with_alpha(warn_col, 32))
+            dl.add_progress_ring(spin_cx, spin_cy, Float32(8.8), Float32(1.5), Float32(1.0), warn_col, rgba8_with_alpha(warn_col, 48), Float32(1.0))
+            draw_studio_icon(dl, ICON_WARN, spin_cx - Float32(5.25), spin_cy - Float32(5.25), Float32(10.5), warn_col, Float32(1.4))
         else:
+            dl.add_circle(spin_cx, spin_cy, Float32(8.2), _with_alpha(accent, Float32(0.14)))
             dl.add_arc(
-                spin_cx, spin_cy, Float32(8.5), Float32(1.8),
+                spin_cx, spin_cy, Float32(8.8), Float32(1.6),
                 t * Float32(4.4) + Float32(si), Float32(4.1),
-                accent, _with_alpha(accent, Float32(0.22)), Float32(3.0), 0,
+                accent, _with_alpha(accent, Float32(0.22)), Float32(1.6), 0,
             )
-            draw_studio_icon(dl, role_icon, spin_cx - Float32(5.5), spin_cy - Float32(5.5), Float32(11.0), accent, Float32(1.3))
+            draw_studio_icon(dl, role_icon, spin_cx - Float32(5.25), spin_cy - Float32(5.25), Float32(10.5), accent, Float32(1.3))
+
         if has_font and font.valid:
-            _draw_theatre_text(dl, font_slot, font, pres_label, pres_x + Float32(30.0), pres_y + Float32(8.0), Float32(12.0), text_pri)
+            var text_y = pres_y + (pres_h - font_px) * Float32(0.5) - Float32(0.5)
+            var tx_pen = pres_x + Float32(30.0)
+            _draw_theatre_text(dl, font_slot, font, sess.name, tx_pen, text_y, font_px, text_pri)
+            tx_pen += name_w
+            dl.add_circle(tx_pen + sep_w * Float32(0.5), pres_y + pres_h * Float32(0.5), Float32(1.5), text_mut)
+            tx_pen += sep_w
+            _draw_theatre_text(dl, font_slot, font, pres_detail, tx_pen, text_y, font_px, warn_col if is_waiting else text_sec)
+
         out_hits.append(TheatrePillHit(HIT_KIND_PRESENCE, sess.agent_id, 0, sess.active_entity_id, pres_x, pres_y, pres_w, pres_h))
+        placed_pills.append((pres_x, pres_y, pres_w, pres_h))
 
         # 2. Target projection + GPU Bezier Flow Tether + PRIM_ARC Target Reticle + World Callout
         if not sess.has_active_world_pos:
@@ -619,22 +678,29 @@ def _emit_hud_core(
         var ty = proj[1]
         var on_screen = proj[2]
 
+        # Dynamic nearest-edge tether anchor (prevents stray right-edge dot & upward loop)
+        var launch_down = (ty > pres_y + pres_h + Float32(12.0)) and (tx <= pres_x + pres_w + Float32(18.0))
+        var anchor_start_x = max(pres_x + Float32(28.0), min(pres_x + pres_w - Float32(18.0), tx)) if launch_down else (pres_x + pres_w)
+        var anchor_start_y = (pres_y + pres_h) if launch_down else (pres_y + pres_h * Float32(0.5))
+
         _emit_bezier_beam_with_beads(
             dl,
-            pres_x + pres_w - Float32(2.0),
-            pres_y + pres_h * Float32(0.5),
+            anchor_start_x,
+            anchor_start_y,
             tx,
             ty,
             accent,
+            theme.l0_canvas,
             t + Float32(si) * Float32(0.37),
+            launch_down,
         )
 
         if on_screen:
             # Analytical PRIM_ARC progress ring landing reticle
-            var ret_r = Float32(10.5) + Float32(1.8) * pulse
+            var ret_r = Float32(9.5) + Float32(1.5) * pulse
             var ret_prog = max(Float32(0.22), min(Float32(1.0), sess.active_progress))
-            dl.add_progress_ring(tx, ty, ret_r, Float32(2.0), ret_prog, accent, _with_alpha(accent, Float32(0.22)), Float32(4.0))
-            dl.add_circle(tx, ty, Float32(2.8), accent)
+            dl.add_progress_ring(tx, ty, ret_r, Float32(1.8), ret_prog, accent, _with_alpha(accent, Float32(0.22)), Float32(2.8))
+            dl.add_circle(tx, ty, Float32(2.6), accent)
         else:
             _emit_offscreen_chevron(dl, tx, ty, proj[3], proj[4], accent)
 
@@ -645,52 +711,64 @@ def _emit_hud_core(
         if has_approval and raw_callout.startswith("Approve: "):
             var trimmed_c = String(raw_callout[byte=9:])
             raw_callout = trimmed_c^
-        var callout_text = sess.name + ": " + raw_callout
-        var approval_extra_w = Float32(70.0) if has_approval else Float32(0.0)
-        var text_w = font.measure(callout_text, Float32(11.5)) if (has_font and font.valid) else Float32(min(220, max(96, callout_text.byte_length() * 6)))
-        var pill_w = min(vp_w - Float32(24.0), text_w + Float32(42.0) + approval_extra_w)
+        # Omit redundant full agent name prefix when single agent is active (reduces scene occlusion ~85px)
+        var callout_text = (agent_role_short_tag(sess.role) + " - " + raw_callout) if active_sess_count > 1 else raw_callout
+        var approval_extra_w = Float32(66.0) if has_approval else Float32(0.0)
+        var c_px = Float32(11.5)
+        var text_w = font.measure(callout_text, c_px) if (has_font and font.valid) else Float32(min(200, max(84, callout_text.byte_length() * 6)))
+        var pill_w = min(vp_w - Float32(24.0), text_w + Float32(38.0) + approval_extra_w)
         var pill_h = Float32(28.0)
         var anchor_x = top_proj[0] if top_proj[2] else tx
         var anchor_y = (top_proj[1] - pill_h - Float32(10.0)) if top_proj[2] else (ty - pill_h - Float32(10.0))
         var pill_x = max(vp_x + Float32(10.0), min(vp_x + vp_w - pill_w - Float32(10.0), anchor_x - pill_w * Float32(0.5)))
         var pill_y = _resolve_pill_y(anchor_y, pill_x, pill_w, pill_h, vp_y, vp_h, placed_pills)
 
-        var border_col = pack_rgba8(245, 183, 79, 225) if sess.status == AGENT_STATUS_WAITING_APPROVAL else _with_alpha(accent, Float32(0.75))
+        var pill_hov = _theatre_hit(mouse_x, mouse_y, pill_x, pill_y, pill_w - approval_extra_w, pill_h)
+        var border_col = rgba8_with_alpha(warn_col, 235 if pill_hov else 195) if is_waiting else _with_alpha(accent, Float32(0.95) if pill_hov else Float32(0.70))
+        if theme.is_dark:
+            dl.add_ambient_shadow(pill_x, pill_y, pill_w, pill_h, Float32(8.0), Float32(10.0), 96, Float32(2.0))
         dl.add_glass_panel(
             pill_x, pill_y, pill_w, pill_h,
             glass_bg,
-            Float32(9.0), Float32(3.0), Float32(1.2), border_col,
+            Float32(8.0), Float32(4.0), Float32(1.1), border_col,
             top_bevel=True, drop_shadow=True,
         )
-        # Left role / warning SDF icon
-        var badge_icon = ICON_WARN if sess.status == AGENT_STATUS_WAITING_APPROVAL else role_icon
-        var badge_col = pack_rgba8(245, 183, 79, 255) if sess.status == AGENT_STATUS_WAITING_APPROVAL else accent
-        draw_studio_icon(dl, badge_icon, pill_x + Float32(8.0), pill_y + Float32(7.0), Float32(14.0), badge_col, Float32(1.4))
+        # Left role / warning SDF icon inside subtle tinted circle
+        var badge_icon = ICON_WARN if is_waiting else role_icon
+        var badge_col = warn_col if is_waiting else accent
+        dl.add_circle(pill_x + Float32(14.0), pill_y + pill_h * Float32(0.5), Float32(8.0), rgba8_with_alpha(badge_col, 30))
+        draw_studio_icon(dl, badge_icon, pill_x + Float32(8.5), pill_y + Float32(8.5), Float32(11.0), badge_col, Float32(1.4))
         if has_font and font.valid:
-            _draw_theatre_text(dl, font_slot, font, callout_text, pill_x + Float32(27.0), pill_y + Float32(8.0), Float32(11.5), text_pri)
+            var c_ty = pill_y + (pill_h - c_px) * Float32(0.5) - Float32(0.5)
+            _draw_theatre_text(dl, font_slot, font, callout_text, pill_x + Float32(27.0), c_ty, c_px, text_pri)
 
-        # Slim bottom progress bar on active step callout
+        # Slim bottom progress bar ONLY when actively executing (never bleeds under [Y]/[N] approval buttons)
         var prog = max(Float32(0.0), min(Float32(1.0), sess.active_progress))
-        if prog > Float32(0.01):
-            var bar_w = max(Float32(6.0), (pill_w - Float32(14.0)) * prog)
-            dl.add_rect(pill_x + Float32(7.0), pill_y + pill_h - Float32(3.0), bar_w, Float32(2.0), accent, Float32(1.0))
+        if (not has_approval) and prog > Float32(0.01):
+            var bar_w = max(Float32(6.0), (pill_w - Float32(16.0)) * prog)
+            dl.add_rect(pill_x + Float32(8.0), pill_y + pill_h - Float32(3.0), bar_w, Float32(2.0), accent, Float32(1.0))
 
         out_hits.append(TheatrePillHit(HIT_KIND_CALLOUT_FOCUS, sess.agent_id, 0, sess.active_entity_id, pill_x, pill_y, pill_w - approval_extra_w, pill_h))
 
-        # Inline clickable [Y] [N] approval micro-pills directly inside 3D viewport
+        # Inline clickable [✓] [✕] approval micro-pills with vertical divider & crisp hover states
         if has_approval:
             var aid = bus.pending_approvals[pending_idx].approval_id
             var btn_y = pill_y + Float32(4.0)
             var btn_h = Float32(20.0)
-            var btn_w = Float32(25.0)
-            var y_x = pill_x + pill_w - Float32(58.0)
+            var btn_w = Float32(24.0)
+            var y_x = pill_x + pill_w - Float32(57.0)
             var n_x = pill_x + pill_w - Float32(29.0)
-            var ok_col = pack_rgba8(52, 211, 153, 235)
-            var no_col = pack_rgba8(248, 113, 113, 235)
-            dl.add_rect(y_x, btn_y, btn_w, btn_h, pack_rgba8(18, 58, 44, 235), Float32(6.0), Float32(1.0), ok_col)
-            dl.add_rect(n_x, btn_y, btn_w, btn_h, pack_rgba8(66, 20, 24, 235), Float32(6.0), Float32(1.0), no_col)
-            draw_studio_icon(dl, ICON_CHECK, y_x + Float32(6.5), btn_y + Float32(4.0), Float32(12.0), ok_col, Float32(1.6))
-            draw_studio_icon(dl, ICON_CLOSE, n_x + Float32(6.5), btn_y + Float32(4.0), Float32(12.0), no_col, Float32(1.6))
+            var div_x = y_x - Float32(6.0)
+            dl.add_rect(div_x, pill_y + Float32(6.0), Float32(1.0), pill_h - Float32(12.0), theme.border_subtle)
+
+            var y_hov = _theatre_hit(mouse_x, mouse_y, y_x, btn_y, btn_w, btn_h)
+            var n_hov = _theatre_hit(mouse_x, mouse_y, n_x, btn_y, btn_w, btn_h)
+            var ok_fill = rgba8_with_alpha(ok_col, 95 if y_hov else 46)
+            var no_fill = rgba8_with_alpha(no_col, 95 if n_hov else 46)
+            dl.add_rect(y_x, btn_y, btn_w, btn_h, ok_fill, Float32(5.0), Float32(1.0), rgba8_with_alpha(ok_col, 245 if y_hov else 195))
+            dl.add_rect(n_x, btn_y, btn_w, btn_h, no_fill, Float32(5.0), Float32(1.0), rgba8_with_alpha(no_col, 245 if n_hov else 195))
+            draw_studio_icon(dl, ICON_CHECK, y_x + Float32(6.5), btn_y + Float32(4.5), Float32(11.0), text_pri if y_hov else ok_col, Float32(1.6))
+            draw_studio_icon(dl, ICON_CLOSE, n_x + Float32(6.5), btn_y + Float32(4.5), Float32(11.0), text_pri if n_hov else no_col, Float32(1.6))
             out_hits.append(TheatrePillHit(HIT_KIND_APPROVE, sess.agent_id, aid, sess.active_entity_id, y_x, btn_y, btn_w, btn_h))
             out_hits.append(TheatrePillHit(HIT_KIND_REJECT, sess.agent_id, aid, sess.active_entity_id, n_x, btn_y, btn_w, btn_h))
 
@@ -713,7 +791,7 @@ def emit_agent_viewport_hud_overlays(
     offscreen chevrons, and world-space step callout cards."""
     var dummy_font = SdfFont()
     var hits = List[TheatrePillHit]()
-    return _emit_hud_core(bus, dl, False, 0, dummy_font, view_proj, vp_x, vp_y, vp_w, vp_h, time_sec, hits)
+    return _emit_hud_core(bus, dl, False, 0, dummy_font, view_proj, vp_x, vp_y, vp_w, vp_h, time_sec, hits, StudioTheme(), Float32(-1.0), Float32(-1.0))
 
 
 def emit_agent_viewport_hud_overlays_with_font(
@@ -728,6 +806,9 @@ def emit_agent_viewport_hud_overlays_with_font(
     vp_h: Float32,
     time_sec: Float32,
     mut out_hits: List[TheatrePillHit],
+    theme: StudioTheme = StudioTheme(),
+    mouse_x: Float32 = -1.0,
+    mouse_y: Float32 = -1.0,
 ) -> Int:
     """Full text + interactive hit-region variant of `emit_agent_viewport_hud_overlays`."""
-    return _emit_hud_core(bus, dl, True, font_slot, font, view_proj, vp_x, vp_y, vp_w, vp_h, time_sec, out_hits)
+    return _emit_hud_core(bus, dl, True, font_slot, font, view_proj, vp_x, vp_y, vp_w, vp_h, time_sec, out_hits, theme, mouse_x, mouse_y)

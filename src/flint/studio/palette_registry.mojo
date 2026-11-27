@@ -164,6 +164,11 @@ comptime PAL_CMD_AGENT_PAUSE_RESUME: Int = 510
 comptime PAL_CMD_AGENT_REVERT_LAST_STEP: Int = 511
 comptime PAL_CMD_AGENT_EXIT_TIME_TRAVEL: Int = 512
 
+# RGBMocap Studio (530..539)
+comptime PAL_CMD_MOCAP_OPEN: Int = 530
+comptime PAL_CMD_MOCAP_LOAD_DEMO: Int = 531
+comptime PAL_CMD_MOCAP_EXPORT_BVH: Int = 532
+
 # Chord-only utility actions
 comptime PAL_CMD_OPEN_PALETTE: Int = 600
 comptime PAL_CMD_OPEN_QUICK_SPAWN: Int = 601
@@ -347,6 +352,11 @@ def populate_studio_palette(
     pal.add_item(PaletteItem(PALETTE_ITEM_AGENT, PAL_CMD_AGENT_PAUSE_RESUME, "Agent: Pause / Resume Run", "Agent Studio", "", ICON_PAUSE, "agent:pause", False, True, "AI Agent Pause Resume Execution"))
     pal.add_item(PaletteItem(PALETTE_ITEM_AGENT, PAL_CMD_AGENT_REVERT_LAST_STEP, "Agent: Revert Last Step", "Agent Studio", "", ICON_REVERT, "agent:revert", True, True, "AI Agent Undo Revert Last Step Checkpoint"))
     pal.add_item(PaletteItem(PALETTE_ITEM_AGENT, PAL_CMD_AGENT_EXIT_TIME_TRAVEL, "Agent: Return to Live Tip", "Agent Studio", "", ICON_CLOCK, "agent:live", False, True, "AI Agent Exit Time Travel Scrubber Live"))
+
+    # ---- RGBMocap Studio ----
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_MOCAP_OPEN, "MoCap: Open RGBMocap Studio", "MoCap", "", ICON_CAMERA, "mocap:open", False, True, "MoCap RGBMocap Video Motion Capture GEM-X SOMA Skeleton Panel"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_MOCAP_LOAD_DEMO, "MoCap: Load Demo Capture", "MoCap", "", ICON_PLAY, "mocap:demo", False, True, "MoCap Load Demo Capture Take 90f SOMA Skeleton"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_MOCAP_EXPORT_BVH, "MoCap: Export Cleaned BVH", "MoCap", "", ICON_SCENE, "mocap:export_bvh", False, True, "MoCap Export Cleaned BVH Motion Animation File"))
 
     # ---- Live Scene Entities (`@`) ----
     var n_ent = min(len(entity_names), len(entity_ids))

@@ -386,7 +386,7 @@ struct UiTabIndicator(Copyable, ImplicitlyCopyable, Movable):
 
 @fieldwise_init
 struct UiToastAnim(Copyable, ImplicitlyCopyable, Movable):
-    """Animated toast slide-in / hold / fade-out entry."""
+    """Animated toast slide-in / hold / fade-out entry (supports hover-to-pause)."""
     var id: UInt64
     var slide: UiSpring
     var alpha: Float32
@@ -395,6 +395,7 @@ struct UiToastAnim(Copyable, ImplicitlyCopyable, Movable):
     var enter_sec: Float32
     var exit_sec: Float32
     var state: Int
+    var paused: Bool
 
     @staticmethod
     def create(id: UInt64, ttl_sec: Float32 = 3.5) -> Self:
@@ -409,6 +410,7 @@ struct UiToastAnim(Copyable, ImplicitlyCopyable, Movable):
             0.22,
             0.16,
             TOAST_ANIM_ENTERING,
+            False,
         )
 
     def step(mut self, dt_in: Float32, mode: Int):
@@ -421,7 +423,7 @@ struct UiToastAnim(Copyable, ImplicitlyCopyable, Movable):
                 self.slide.snap(0.0)
                 self.alpha = 0.0
                 self.state = TOAST_ANIM_DONE
-            if isfinite(dt_in) and dt_in > Float32(0.0):
+            if (not self.paused) and isfinite(dt_in) and dt_in > Float32(0.0):
                 self.age_sec += dt_in
                 if self.state == TOAST_ANIM_HOLDING and self.age_sec >= self.ttl_sec:
                     self.slide.snap(0.0)
@@ -432,10 +434,10 @@ struct UiToastAnim(Copyable, ImplicitlyCopyable, Movable):
         if not isfinite(dt_in) or dt_in <= Float32(0.0):
             return
         var dt = min(Float32(0.25), dt_in)
-        self.age_sec += dt
         _ = self.slide.step(dt, mode)
 
         if self.state == TOAST_ANIM_ENTERING:
+            self.age_sec += dt
             var u = min(Float32(1.0), self.age_sec / max(Float32(1.0e-3), self.enter_sec))
             self.alpha = CubicBezier.emphasized_decel().sample(u)
             if u >= Float32(1.0):
@@ -444,11 +446,14 @@ struct UiToastAnim(Copyable, ImplicitlyCopyable, Movable):
                 self.age_sec = 0.0
         elif self.state == TOAST_ANIM_HOLDING:
             self.alpha = 1.0
-            if self.age_sec >= self.ttl_sec:
-                self.state = TOAST_ANIM_EXITING
-                self.age_sec = 0.0
-                self.slide.set_target(0.0)
+            if not self.paused:
+                self.age_sec += dt
+                if self.age_sec >= self.ttl_sec:
+                    self.state = TOAST_ANIM_EXITING
+                    self.age_sec = 0.0
+                    self.slide.set_target(0.0)
         elif self.state == TOAST_ANIM_EXITING:
+            self.age_sec += dt
             var u = min(Float32(1.0), self.age_sec / max(Float32(1.0e-3), self.exit_sec))
             self.alpha = Float32(1.0) - CubicBezier.emphasized_accel().sample(u)
             if u >= Float32(1.0):
@@ -749,6 +754,54 @@ struct UiAnimator(Movable):
         st.aux.set_target(tgt, snap_if_uninit=not found)
         if self.mode == UI_ANIM_INSTANT:
             st.aux.snap(tgt)
+        elif not st.aux.is_settled():
+            self.active_springs_count = max(self.active_springs_count, 1)
+        st.last_epoch = self.frame_epoch
+        self.widgets[wid] = st
+        return st.aux.value
+
+    def drive_reveal(
+        mut self,
+        wid: UInt64,
+        target: Float32,
+        initial: Float32 = 0.0,
+        config: SpringConfig = SpringConfig.drawer(),
+    ) -> Float32:
+        """Animates enter/exit reveal transitions starting from `initial` (never snaps on frame 1 in live mode).
+
+        In `UI_ANIM_INSTANT` mode, snaps immediately to `target` for deterministic golden captures.
+        Hidden steady-state calls (`target == initial == 0.0`) allocate nothing (`O(0)`).
+        """
+        var tgt = _safe_f32(target, 0.0)
+        var init_v = _safe_f32(initial, 0.0)
+        var found = self.widgets.get(wid)
+        if not found:
+            if self.mode == UI_ANIM_INSTANT:
+                if abs(tgt) <= config.eps:
+                    return 0.0
+                var st_i = UiAnimState()
+                st_i.aux = UiSpring.create(tgt, config)
+                st_i.last_epoch = self.frame_epoch
+                self.widgets[wid] = st_i
+                return tgt
+            if abs(tgt - init_v) <= config.eps and abs(tgt) <= config.eps:
+                return 0.0
+            var st_new = UiAnimState()
+            st_new.aux = UiSpring.create(init_v, config)
+            st_new.aux.set_target(tgt, snap_if_uninit=False)
+            if not st_new.aux.is_settled():
+                self.active_springs_count = max(self.active_springs_count, 1)
+            st_new.last_epoch = self.frame_epoch
+            self.widgets[wid] = st_new
+            return st_new.aux.value
+
+        var st = found.value()
+        st.aux.set_config(config)
+        st.aux.set_target(tgt, snap_if_uninit=False)
+        if self.mode == UI_ANIM_INSTANT:
+            st.aux.snap(tgt)
+        elif not st.aux.is_settled():
+            self.active_springs_count = max(self.active_springs_count, 1)
         st.last_epoch = self.frame_epoch
         self.widgets[wid] = st
         return st.aux.value
@@ -806,6 +859,7 @@ struct UiAnimator(Movable):
         for i in range(len(self.toasts)):
             if self.toasts[i].id == id and self.toasts[i].state < TOAST_ANIM_EXITING:
                 self.toasts[i].state = TOAST_ANIM_EXITING
+                self.toasts[i].paused = False
                 self.toasts[i].age_sec = 0.0
                 self.toasts[i].slide.set_target(0.0)
                 if self.mode == UI_ANIM_INSTANT:
@@ -813,6 +867,66 @@ struct UiAnimator(Movable):
                     self.toasts[i].alpha = 0.0
                     self.toasts[i].state = TOAST_ANIM_DONE
                 return
+
+    def sync_toast(
+        mut self,
+        id: UInt64,
+        active: Bool,
+        ttl_sec: Float32 = 5.0,
+        hovered: Bool = False,
+    ) -> Tuple[Float32, Float32]:
+        """Synchronizes a toast's 3-phase `UiToastAnim` lifecycle and returns `(slide, alpha)` in `[0, 1]`.
+
+        In `UI_ANIM_INSTANT` mode, active toasts snap cleanly to `(1.0, 1.0)` and inactive toasts to `(0.0, 0.0)`.
+        """
+        for i in range(len(self.toasts)):
+            if self.toasts[i].id == id:
+                if active:
+                    self.toasts[i].paused = hovered
+                    if self.toasts[i].state == TOAST_ANIM_EXITING:
+                        self.toasts[i].state = TOAST_ANIM_ENTERING
+                        self.toasts[i].age_sec = 0.0
+                        self.toasts[i].slide.set_target(1.0)
+                    if self.mode == UI_ANIM_INSTANT:
+                        self.toasts[i].slide.snap(1.0)
+                        self.toasts[i].alpha = 1.0
+                        self.toasts[i].state = TOAST_ANIM_HOLDING
+                else:
+                    self.toasts[i].paused = False
+                    if self.toasts[i].state < TOAST_ANIM_EXITING:
+                        self.toasts[i].state = TOAST_ANIM_EXITING
+                        self.toasts[i].age_sec = 0.0
+                        self.toasts[i].slide.set_target(0.0)
+                    if self.mode == UI_ANIM_INSTANT:
+                        self.toasts[i].slide.snap(0.0)
+                        self.toasts[i].alpha = 0.0
+                        self.toasts[i].state = TOAST_ANIM_DONE
+                var sl = max(Float32(0.0), min(Float32(1.0), self.toasts[i].slide.value))
+                var al = max(Float32(0.0), min(Float32(1.0), self.toasts[i].alpha))
+                return (sl, al)
+
+        if not active:
+            return (Float32(0.0), Float32(0.0))
+
+        var entry = UiToastAnim.create(id, ttl_sec)
+        entry.paused = hovered
+        if self.mode == UI_ANIM_INSTANT:
+            entry.slide.snap(1.0)
+            entry.alpha = 1.0
+            entry.state = TOAST_ANIM_HOLDING
+        var out_sl = max(Float32(0.0), min(Float32(1.0), entry.slide.value))
+        var out_al = max(Float32(0.0), min(Float32(1.0), entry.alpha))
+        self.toasts.append(entry)
+        return (out_sl, out_al)
+
+    def toast_slide_alpha(self, id: UInt64) -> Tuple[Float32, Float32]:
+        """Read-only query of a tracked toast's `(slide, alpha)` pair (`(0, 0)` if untracked)."""
+        for i in range(len(self.toasts)):
+            if self.toasts[i].id == id:
+                var sl = max(Float32(0.0), min(Float32(1.0), self.toasts[i].slide.value))
+                var al = max(Float32(0.0), min(Float32(1.0), self.toasts[i].alpha))
+                return (sl, al)
+        return (Float32(0.0), Float32(0.0))
 
     def drive_agent_ring(mut self, agent_id: UInt64, target_progress: Float32) -> Float32:
         """Smoothly drives an agent activity progress / beam-extend scalar in `[0, 1]`."""

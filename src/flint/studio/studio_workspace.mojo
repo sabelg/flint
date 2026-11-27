@@ -40,6 +40,7 @@ comptime PANEL_ASSET_BROWSER: String = "AssetBrowser"
 comptime PANEL_AGENTS: String = "Agents"
 comptime PANEL_CODE_DRAWER: String = "CodeDrawer"
 comptime PANEL_INPUT_MAP: String = "InputMap"
+comptime PANEL_MOCAP: String = "MoCap"
 
 comptime DEFAULT_CHECKPOINT_CAP: Int = 256
 
@@ -96,27 +97,38 @@ def _str_list5(a: String, b: String, c: String, d_s: String, e: String) -> List[
     return out^
 
 
+def _str_list6(a: String, b: String, c: String, d_s: String, e: String, f: String) -> List[String]:
+    var out = List[String](capacity=6)
+    out.append(a)
+    out.append(b)
+    out.append(c)
+    out.append(d_s)
+    out.append(e)
+    out.append(f)
+    return out^
+
+
 def build_workspace_dockspace(preset_id: Int, dock_style_v2: Bool = True) -> DockSpace:
     """Builds a zero-gap `DockSpace` layout for the requested `WORKSPACE_*` preset.
 
     Every preset preserves canonical panel IDs (`Hierarchy`, `Inspector`, `AssetBrowser`,
-    `SceneViewport`/`Viewport`, `Agents`, `CodeDrawer`) so layout switching never breaks
+    `SceneViewport`/`Viewport`, `Agents`, `MoCap`, `CodeDrawer`) so layout switching never breaks
     panel queries or tests.
     """
     var d = DockSpace()
-    d.header_height = Float32(26.0) if dock_style_v2 else Float32(22.0)
+    d.header_height = Float32(28.0) if dock_style_v2 else Float32(22.0)
     d.min_ratio = Float32(0.06)
     d.set_dock_style_v2(dock_style_v2)
 
     var vp = _add_dual_viewport(d)
 
     if preset_id == WORKSPACE_AGENT_STUDIO:
-        # Left Hierarchy (17%) | Center (Viewport 70% / CodeDrawer+Assets 30%) | Right Agents+Inspector (32%)
+        # Left Hierarchy (17%) | Center (Viewport 70% / CodeDrawer+Assets 30%) | Right Agents+Inspector+MoCap (32%)
         var s_left = d.split_node(
             vp, DOCK_SPLIT_H, Float32(0.17), _str_list2(PANEL_HIERARCHY, PANEL_OUTLINER), place_new_first=True
         )
         var s_right = d.split_node(
-            s_left[1], DOCK_SPLIT_H, Float32(0.61), _str_list2(PANEL_AGENTS, PANEL_INSPECTOR), place_new_first=False
+            s_left[1], DOCK_SPLIT_H, Float32(0.61), _str_list3(PANEL_AGENTS, PANEL_INSPECTOR, PANEL_MOCAP), place_new_first=False
         )
         _ = d.split_node(
             s_right[0],
@@ -128,42 +140,44 @@ def build_workspace_dockspace(preset_id: Int, dock_style_v2: Bool = True) -> Doc
         return d^
 
     if preset_id == WORKSPACE_CODE_SCENE:
-        # Left Hierarchy+Assets (16%) | Center-Left Live 3D Viewport (42%) | Center-Right CodeDrawer (36%) | Far-Right Inspector+Agents (22%)
+        # Left Hierarchy+Assets (15%) | Live 3D Viewport (35%) | CodeDrawer (29%) | Inspector+Agents+MoCap (21%, >=260px @ 1280w)
         var s_left = d.split_node(
-            vp, DOCK_SPLIT_H, Float32(0.16), _str_list2(PANEL_HIERARCHY, PANEL_ASSET_BROWSER), place_new_first=True
+            vp, DOCK_SPLIT_H, Float32(0.15), _str_list2(PANEL_HIERARCHY, PANEL_ASSET_BROWSER), place_new_first=True
         )
         var s_code = d.split_node(
-            s_left[1], DOCK_SPLIT_H, Float32(0.46), _str_list2(PANEL_CODE_DRAWER, PANEL_INPUT_MAP), place_new_first=False
+            s_left[1], DOCK_SPLIT_H, Float32(0.412), _str_list2(PANEL_CODE_DRAWER, PANEL_INPUT_MAP), place_new_first=False
         )
         _ = d.split_node(
-            s_code[1], DOCK_SPLIT_H, Float32(0.62), _str_list2(PANEL_INSPECTOR, PANEL_AGENTS), place_new_first=False
+            s_code[1], DOCK_SPLIT_H, Float32(0.58), _str_list3(PANEL_INSPECTOR, PANEL_AGENTS, PANEL_MOCAP), place_new_first=False
         )
         return d^
 
     if preset_id == WORKSPACE_LOOKDEV:
-        # Slim Left Hierarchy (14%) | Wide 3D Viewport (78% h) / Assets+Code (22% h) | Right Inspector+Agents (24%)
+        # Left Hierarchy (16.5%) | Full-height Lookdev 3D Viewport + collapsed bottom drawer | Right Material Inspector+Agents+MoCap (23.4%)
         var s_left = d.split_node(
-            vp, DOCK_SPLIT_H, Float32(0.14), _str_list2(PANEL_HIERARCHY, PANEL_OUTLINER), place_new_first=True
+            vp, DOCK_SPLIT_H, Float32(0.165), _str_list2(PANEL_HIERARCHY, PANEL_OUTLINER), place_new_first=True
         )
         var s_right = d.split_node(
-            s_left[1], DOCK_SPLIT_H, Float32(0.72), _str_list2(PANEL_INSPECTOR, PANEL_AGENTS), place_new_first=False
+            s_left[1], DOCK_SPLIT_H, Float32(0.72), _str_list3(PANEL_INSPECTOR, PANEL_AGENTS, PANEL_MOCAP), place_new_first=False
         )
-        _ = d.split_node(
+        var s_bot = d.split_node(
             s_right[0],
             DOCK_SPLIT_V,
             Float32(0.78),
             _str_list3(PANEL_ASSET_BROWSER, PANEL_CODE_DRAWER, PANEL_INPUT_MAP),
             place_new_first=False,
         )
+        if dock_style_v2 and s_bot[1] >= 0:
+            _ = d.toggle_node_collapsed(s_bot[1])
         return d^
 
     if preset_id == WORKSPACE_PLAY:
-        # Maximized 3D Viewport (92% height) with a collapsed compact drawer tray at the bottom
+        # Maximized 3D Viewport with a collapsed compact drawer tray at the bottom
         var s_bot = d.split_node(
             vp,
             DOCK_SPLIT_V,
             Float32(0.92),
-            _str_list5(PANEL_ASSET_BROWSER, PANEL_HIERARCHY, PANEL_INSPECTOR, PANEL_AGENTS, PANEL_CODE_DRAWER),
+            _str_list6(PANEL_ASSET_BROWSER, PANEL_HIERARCHY, PANEL_INSPECTOR, PANEL_AGENTS, PANEL_CODE_DRAWER, PANEL_MOCAP),
             place_new_first=False,
         )
         if dock_style_v2 and s_bot[1] >= 0:
@@ -171,17 +185,17 @@ def build_workspace_dockspace(preset_id: Int, dock_style_v2: Bool = True) -> Doc
         return d^
 
     # Default: WORKSPACE_EDIT
-    # Left Hierarchy (18%) | Center (Viewport 74% / AssetBrowser+CodeDrawer+InputMap 26%) | Right Inspector+Agents (24%)
+    # Left Hierarchy (19%) | Center (Viewport 73% / AssetBrowser+CodeDrawer+InputMap 27%) | Right Inspector+Agents+MoCap (23.9%)
     var s_left = d.split_node(
-        vp, DOCK_SPLIT_H, Float32(0.18), _str_list2(PANEL_HIERARCHY, PANEL_OUTLINER), place_new_first=True
+        vp, DOCK_SPLIT_H, Float32(0.19), _str_list2(PANEL_HIERARCHY, PANEL_OUTLINER), place_new_first=True
     )
     var s_right = d.split_node(
-        s_left[1], DOCK_SPLIT_H, Float32(0.70), _str_list2(PANEL_INSPECTOR, PANEL_AGENTS), place_new_first=False
+        s_left[1], DOCK_SPLIT_H, Float32(0.705), _str_list3(PANEL_INSPECTOR, PANEL_AGENTS, PANEL_MOCAP), place_new_first=False
     )
     _ = d.split_node(
         s_right[0],
         DOCK_SPLIT_V,
-        Float32(0.74),
+        Float32(0.73),
         _str_list3(PANEL_ASSET_BROWSER, PANEL_CODE_DRAWER, PANEL_INPUT_MAP),
         place_new_first=False,
     )

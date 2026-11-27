@@ -19,7 +19,19 @@ from std.collections import List
 from std.math import abs, isfinite, max, min
 from flint.core.math import Vec3
 from flint.studio.agent_bus import AgentTelemetryBus
-from flint.ui.context import UiContext, format_float2, hash_ui_id, pack_rgba8
+from flint.text.utf8 import decode_utf8, encode_utf8
+from flint.ui.context import (
+    UI_ALIGN_CENTER,
+    UI_ALIGN_LEFT,
+    UI_ALIGN_RIGHT,
+    UI_FONT_BOLD,
+    UI_FONT_MONO,
+    UI_FONT_REGULAR,
+    UiContext,
+    format_float2,
+    hash_ui_id,
+    pack_rgba8,
+)
 from flint.ui.draw_list import (
     UI_FLAG_BORDER,
     UI_FLAG_DASHED_FLOW,
@@ -32,6 +44,7 @@ from flint.ui.theme import (
     ASSET_CARD_W,
     ICON_AUDIO,
     ICON_CAMERA,
+    ICON_CLOSE,
     ICON_COLLIDER,
     ICON_CUBE,
     ICON_EMPTY,
@@ -51,7 +64,9 @@ from flint.ui.theme import (
     ICON_REVERT,
     ICON_SEARCH,
     ICON_SPARK,
+    OUTLINER_ROW_H,
     RADIUS_MD,
+    RADIUS_PILL,
     RADIUS_SM,
     RADIUS_XS,
     StudioTheme,
@@ -241,6 +256,7 @@ struct OutlinerRowView(Copyable, Movable):
     var is_primary: Bool
     var visible: Bool
     var locked: Bool
+    var child_count: Int
 
     def __init__(out self, entity_id: Int = -1, name: String = "Entity"):
         self.entity_id = entity_id
@@ -254,12 +270,14 @@ struct OutlinerRowView(Copyable, Movable):
         self.is_primary = False
         self.visible = True
         self.locked = False
+        self.child_count = 0
 
 
 struct OutlinerPanelState(Copyable, Movable):
     var search_query: String
     var scroll_y: Float32
     var world_root_open: Bool
+    var keyboard_entity_id: Int
     var hovered_entity_id: Int
     var last_click_entity_id: Int
     var last_click_time: Float32
@@ -268,6 +286,7 @@ struct OutlinerPanelState(Copyable, Movable):
         self.search_query = String("")
         self.scroll_y = Float32(0.0)
         self.world_root_open = True
+        self.keyboard_entity_id = -1
         self.hovered_entity_id = -1
         self.last_click_entity_id = -1
         self.last_click_time = Float32(-10.0)
@@ -514,6 +533,8 @@ struct AssetTileItem(Copyable, Movable):
 struct AssetBrowserPanelState(Copyable, Movable):
     var active_filter: Int
     var active_folder: String
+    var dialog: Int
+    var import_folder: String
     var search_query: String
     var selected_path: String
     var scroll_y: Float32
@@ -523,6 +544,8 @@ struct AssetBrowserPanelState(Copyable, Movable):
     def __init__(out self):
         self.active_filter = ASSET_FILTER_ALL
         self.active_folder = String("")
+        self.dialog = 0
+        self.import_folder = String("")
         self.search_query = String("")
         self.selected_path = String("")
         self.scroll_y = Float32(0.0)
@@ -562,8 +585,10 @@ def _click_rect_button(
     active: Bool = False,
     accent: UInt32 = 0,
     compact_font: Bool = True,
+    tint_icon: Bool = False,
 ) -> Bool:
-    """Direct-rect tactile pill/button with spring hover/press & strict zero idle focus box."""
+    """Direct-rect button with pointer, keyboard and gamepad activation and optical typography."""
+    ui._register_focusable(wid, allow_auto_focus=False)
     var blocked = ui._blocked_by_modal()
     var ptr_blocked = blocked or ui._is_pointer_blocked_by_popup(wid)
     var hov = (not ptr_blocked) and r.contains(ui.mouse_x, ui.mouse_y)
@@ -572,42 +597,93 @@ def _click_rect_button(
         ui.hovered_rect = ui._clip_hovered_rect(r)
         if ui.mouse_pressed_l:
             ui.active_id = wid
-    var clicked = (not blocked) and hov and ui.mouse_released_l and ui.active_id == wid
+            ui._set_focused(wid)
+    var clicked = (not blocked) and ((hov and ui.mouse_released_l and ui.active_id == wid) or (ui.focused_id == wid and (ui.key_enter_pressed or ui.key_space_pressed or ui.pad_confirm)))
     var pressed = (not blocked) and ui.active_id == wid and ui.mouse_down_l
     var sp = ui.animator.drive_widget(wid, hov, pressed, False)
     var h_t = sp[0]
     var p_t = sp[1]
 
     var acc = accent if accent != 0 else theme.accent_primary
-    var base_bg = rgba8_scale_alpha(acc, Float32(0.20)) if active else theme.l3_raised
-    var hov_bg = rgba8_scale_alpha(acc, Float32(0.32)) if active else theme.l3_hover
+    var base_bg = rgba8_scale_alpha(acc, Float32(0.18)) if active else theme.l3_raised
+    var hov_bg = rgba8_scale_alpha(acc, Float32(0.28)) if active else theme.l3_hover
     var bg = lerp_rgba8(lerp_rgba8(base_bg, hov_bg, h_t), theme.l3_press, p_t)
-    var brd = rgba8_with_alpha(acc, 165) if active else lerp_rgba8(theme.border_control, theme.border_strong, h_t)
-
-    ui.draw_list.add_rect_styled(
-        r.x, r.y, r.w, r.h,
-        bg, brd,
-        RADIUS_SM, 1.0, 1.0, UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+    var brd = rgba8_with_alpha(acc, 170) if active else lerp_rgba8(
+        theme.border_control,
+        rgba8_with_alpha(acc, 128) if tint_icon else theme.border_strong,
+        h_t,
     )
 
+    ui.draw_list.add_card_surface(
+        r.x, r.y, r.w, r.h,
+        bg, brd,
+        RADIUS_SM, 1.0, True, False,
+    )
+
+    if ui.show_focus_ring(wid):
+        ui.draw_list.add_rect(r.x, r.y, r.w, r.h, 0, RADIUS_SM, 2.0, theme.focus_ring)
+
     var font_sz = theme.font_caption if compact_font else theme.font_body
+    var font_style = UI_FONT_BOLD if active else UI_FONT_REGULAR
     var has_lbl = label.byte_length() > 0
-    var fg = acc if active else lerp_rgba8(theme.text_secondary, theme.text_primary, max(h_t, Float32(0.6) if has_lbl else Float32(0.0)))
+    var ico_fg = acc if (active or tint_icon) else lerp_rgba8(theme.text_secondary, theme.text_primary, max(h_t, Float32(0.55) if has_lbl else Float32(0.0)))
+    var txt_fg = theme.text_primary if active else lerp_rgba8(theme.text_secondary, theme.text_primary, max(h_t, Float32(0.65)))
     if icon_id >= 0 and has_lbl:
-        var isz = max(Float32(11.0), min(Float32(14.0), r.h - Float32(8.0)))
-        var sx = r.x + Float32(6.0)
-        draw_studio_icon(ui.draw_list, icon_id, sx, r.center_y() - isz * Float32(0.5), isz, fg, Float32(1.4))
-        var tx = sx + isz + Float32(4.0)
-        var disp = ui._truncate_text_ellipsis(label, max(Float32(10.0), r.right() - tx - Float32(5.0)), font_sz)
-        ui._draw_text(disp, tx, r.center_y() - font_sz * Float32(0.5), font_sz, theme.text_primary if active else fg)
+        var isz = max(Float32(11.0), min(Float32(13.5), r.h - Float32(10.0)))
+        var tw = ui._measure_text_styled(label, font_sz, font_style)
+        var content_w = isz + Float32(5.0) + tw
+        var sx = r.x + max(Float32(6.0), (r.w - content_w) * Float32(0.5))
+        draw_studio_icon(ui.draw_list, icon_id, sx, r.center_y() - isz * Float32(0.5), isz, ico_fg, Float32(1.4))
+        var tx = sx + isz + Float32(5.0)
+        var text_r = RectF(tx, r.y, max(Float32(8.0), r.right() - tx - Float32(5.0)), r.h)
+        ui.draw_text_in_rect(text_r, label, font_sz, txt_fg, UI_ALIGN_LEFT, font_style, Float32(0.0), True, False)
     elif icon_id >= 0:
-        var isz = max(Float32(12.0), min(Float32(15.0), r.h - Float32(8.0)))
-        draw_studio_icon(ui.draw_list, icon_id, r.center_x() - isz * Float32(0.5), r.center_y() - isz * Float32(0.5), isz, fg, Float32(1.4))
+        var isz = max(Float32(12.0), min(Float32(15.0), r.h - Float32(9.0)))
+        draw_studio_icon(ui.draw_list, icon_id, r.center_x() - isz * Float32(0.5), r.center_y() - isz * Float32(0.5), isz, ico_fg, Float32(1.4))
     elif has_lbl:
-        var disp = ui._truncate_text_ellipsis(label, max(Float32(10.0), r.w - Float32(10.0)), font_sz)
-        var tw = ui._measure_text(disp, font_sz)
-        ui._draw_text(disp, r.x + max(Float32(5.0), (r.w - tw) * Float32(0.5)), r.center_y() - font_sz * Float32(0.5), font_sz, theme.text_primary if active else fg)
+        ui.draw_text_in_rect(r, label, font_sz, txt_fg, UI_ALIGN_CENTER, font_style, Float32(6.0), True, False)
     return clicked
+
+
+def _draw_slim_scrollbar(
+    mut ui: UiContext,
+    wid: UInt64,
+    area_rect: RectF,
+    content_h: Float32,
+    mut scroll_y: Float32,
+    theme: StudioTheme,
+    ptr_blocked: Bool,
+):
+    """Interactive 4px -> 6px rounded scrollbar with 10px hit band along `area_rect.right()`."""
+    var max_scroll = max(Float32(0.0), content_h - area_rect.h)
+    if max_scroll <= Float32(0.5):
+        return
+    var hit_w = Float32(10.0)
+    var track_y = area_rect.y + Float32(4.0)
+    var track_h = max(Float32(16.0), area_rect.h - Float32(8.0))
+    var thumb_h = max(Float32(22.0), track_h * (area_rect.h / max(Float32(1.0), content_h)))
+    var travel = max(Float32(1.0), track_h - thumb_h)
+    var hit_r = RectF(area_rect.right() - hit_w, track_y, hit_w, track_h)
+    var hov = (not ptr_blocked) and hit_r.contains(ui.mouse_x, ui.mouse_y)
+    if hov and ui.mouse_pressed_l:
+        ui.active_id = wid
+    var drag = ui.active_id == wid and ui.mouse_down_l and (not ui._blocked_by_modal())
+    if drag and isfinite(ui.mouse_y):
+        var rel = max(Float32(0.0), min(Float32(1.0), (ui.mouse_y - track_y - thumb_h * Float32(0.5)) / travel))
+        scroll_y = rel * max_scroll
+    var sp = ui.animator.drive_widget(wid, hov, drag, False)
+    var hot_t = max(sp[0], sp[1])
+    var sb_w = Float32(4.0) + Float32(2.0) * hot_t
+    var thumb_y = track_y + (scroll_y / max_scroll) * travel
+    var thumb_x = area_rect.right() - sb_w - Float32(2.0)
+    if hot_t > Float32(0.02):
+        ui.draw_list.add_rect(
+            thumb_x, track_y, sb_w, track_h,
+            rgba8_scale_alpha(theme.l2_card, hot_t * Float32(0.55)),
+            sb_w * Float32(0.5),
+        )
+    var thumb_col = theme.accent_primary if drag else lerp_rgba8(theme.border_strong, theme.text_secondary, hot_t)
+    ui.draw_list.add_rect(thumb_x, thumb_y, sb_w, thumb_h, thumb_col, sb_w * Float32(0.5))
 
 
 def _draw_compact_toggle(
@@ -772,8 +848,482 @@ def _draw_card_body_bg(mut ui: UiContext, card_x: Float32, body_y: Float32, card
         card_x, body_y, card_w, body_h,
         theme.l2_card,
         Float32(0.0), Float32(0.0), RADIUS_MD, RADIUS_MD,
-        1.0, theme.border_subtle, 1.0, 0,
+        1.0, theme.border_subtle, 1.0, UI_FLAG_BORDER,
     )
+
+
+def begin_inspector_card_body(
+    mut ui: UiContext,
+    card_x: Float32,
+    card_w: Float32,
+    body_top_y: Float32,
+    joined_to_header: Bool = True,
+) -> Int:
+    """Reserves a dynamic-height `L2_card` background primitive behind subsequent widgets.
+    Pair with `end_inspector_card_body(ui, idx, bottom_y)` once child widgets finish."""
+    if card_w <= Float32(1.0):
+        return -1
+    ref theme = ui.studio_theme
+    var prim_idx = len(ui.draw_list.prims)
+    if joined_to_header:
+        ui.draw_list.add_rounded_rect_ex(
+            card_x, body_top_y, card_w, Float32(8.0),
+            theme.l2_card,
+            Float32(0.0), Float32(0.0), RADIUS_MD, RADIUS_MD,
+            1.0, theme.border_subtle, 1.0, UI_FLAG_BORDER,
+        )
+    else:
+        ui.draw_list.add_card_surface(
+            card_x, body_top_y, card_w, Float32(8.0),
+            theme.l2_card, theme.border_subtle,
+            RADIUS_MD, 1.0, True, False,
+        )
+    return prim_idx
+
+
+def end_inspector_card_body(
+    mut ui: UiContext,
+    prim_idx: Int,
+    body_bottom_y: Float32,
+    pad_bottom: Float32 = 6.0,
+):
+    """Finalizes a `begin_inspector_card_body` primitive to exact dynamic bottom height."""
+    if prim_idx < 0 or prim_idx >= len(ui.draw_list.prims):
+        return
+    var y0 = ui.draw_list.prims[prim_idx].y0
+    var target_y1 = body_bottom_y + max(Float32(0.0), pad_bottom)
+    if isfinite(target_y1):
+        ui.draw_list.prims[prim_idx].y1 = max(y0 + Float32(2.0), target_y1)
+
+
+def draw_inspector_empty_state(mut ui: UiContext, width: Float32, avail_h: Float32) -> Bool:
+    """Renders a polished `L2_card` empty-selection card inside the active Inspector box.
+    Returns True if the primary `+ Spawn Entity` CTA was clicked."""
+    var theme = ui.studio_theme.copy()
+    var card_w = max(Float32(140.0), min(width, Float32(264.0)))
+    var card_h = Float32(158.0)
+    var alloc_h = max(card_h + Float32(12.0), min(avail_h, card_h + Float32(48.0)))
+    var slot = ui._alloc_item_rect(ui.widget_id("insp_empty_card_slot"), width, alloc_h)
+    var card_x = slot.x + (slot.w - card_w) * Float32(0.5)
+    var card_y = slot.y + min(Float32(36.0), max(Float32(6.0), (slot.h - card_h) * Float32(0.32)))
+
+    ui.draw_list.add_card_surface(
+        card_x, card_y, card_w, card_h,
+        theme.l2_card, theme.border_subtle,
+        RADIUS_MD, 1.0, True, False,
+    )
+    var badge_sz = Float32(36.0)
+    var bx = card_x + (card_w - badge_sz) * Float32(0.5)
+    var by = card_y + Float32(18.0)
+    ui.draw_list.add_card_surface(
+        bx, by, badge_sz, badge_sz,
+        theme.accent_soft, rgba8_with_alpha(theme.accent_primary, 96),
+        RADIUS_MD, 1.0, True, False,
+    )
+    draw_studio_icon(ui.draw_list, ICON_CUBE, bx + Float32(9.0), by + Float32(9.0), Float32(18.0), theme.accent_primary, Float32(1.5))
+
+    ui.draw_text_in_rect(
+        RectF(card_x + Float32(10.0), by + badge_sz + Float32(8.0), card_w - Float32(20.0), Float32(20.0)),
+        "No Entity Selected",
+        theme.font_title,
+        theme.text_primary,
+        UI_ALIGN_CENTER,
+        UI_FONT_BOLD,
+        Float32(0.0),
+        True,
+        False,
+    )
+    ui.draw_text_in_rect(
+        RectF(card_x + Float32(10.0), by + badge_sz + Float32(28.0), card_w - Float32(20.0), Float32(16.0)),
+        "Select in Viewport or press Ctrl+K",
+        theme.font_caption,
+        theme.text_secondary,
+        UI_ALIGN_CENTER,
+        UI_FONT_REGULAR,
+        Float32(0.0),
+        True,
+        False,
+    )
+
+    var cta_w = min(Float32(152.0), card_w - Float32(32.0))
+    var cta_r = RectF(card_x + (card_w - cta_w) * Float32(0.5), card_y + card_h - Float32(38.0), cta_w, Float32(26.0))
+    return _click_rect_button(ui, ui.widget_id("insp_empty_spawn"), cta_r, "Spawn Entity", theme, ICON_PLUS, True, theme.accent_primary, False, True)
+
+
+def draw_studio_stats_panel(
+    mut ui: UiContext,
+    panel_rect: RectF,
+    theme: StudioTheme,
+    live_entities: Int,
+    selected_count: Int,
+    state_hash: UInt64,
+    ui_prims: Int = 0,
+    culled_items: Int = 0,
+):
+    """Renders cohesive `L2_card` telemetry tiles and metric rows for the Outliner `Stats` tab."""
+    if panel_rect.w < Float32(60.0) or panel_rect.h < Float32(40.0):
+        return
+    ui.set_studio_theme(theme.copy())
+    ui.draw_list.push_clip(Int(panel_rect.x), Int(panel_rect.y), Int(panel_rect.right()), Int(panel_rect.bottom()))
+    ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
+
+    var pad = Float32(8.0)
+    var cw = max(Float32(44.0), panel_rect.w - pad * Float32(2.0))
+    var cx = panel_rect.x + pad
+    var cy = panel_rect.y + pad
+
+    # Section title
+    ui.draw_text_in_rect(
+        RectF(cx, cy, cw, Float32(18.0)),
+        "Scene Telemetry",
+        theme.font_section,
+        theme.text_primary,
+        UI_ALIGN_LEFT,
+        UI_FONT_BOLD,
+        Float32(2.0),
+        True,
+        False,
+    )
+    cy += Float32(24.0)
+
+    # 2-column KPI tiles (`Entities` | `Selected`)
+    var gap = Float32(6.0)
+    var tile_w = max(Float32(40.0), (cw - gap) * Float32(0.5))
+    var tile_h = Float32(48.0)
+    if cy + tile_h <= panel_rect.bottom():
+        var kpi_labels = [String("ENTITIES"), String("SELECTED")]
+        var kpi_vals = [String(live_entities), String(selected_count)]
+        var kpi_cols = [theme.accent_primary, theme.status_ok if selected_count > 0 else theme.text_secondary]
+        for ki in range(2):
+            var tx = cx + Float32(ki) * (tile_w + gap)
+            ui.draw_list.add_card_surface(tx, cy, tile_w, tile_h, theme.l2_card, theme.border_subtle, RADIUS_MD, 1.0, True, False)
+            ui.draw_list.add_accent_bar(tx + Float32(1.0), cy + Float32(10.0), Float32(2.5), tile_h - Float32(20.0), kpi_cols[ki], True)
+            ui.draw_text_in_rect(
+                RectF(tx + Float32(10.0), cy + Float32(6.0), tile_w - Float32(14.0), Float32(14.0)),
+                kpi_labels[ki],
+                Float32(10.0),
+                theme.text_muted,
+                UI_ALIGN_LEFT,
+                UI_FONT_BOLD,
+                Float32(0.0),
+                True,
+                False,
+            )
+            ui.draw_text_in_rect(
+                RectF(tx + Float32(10.0), cy + Float32(22.0), tile_w - Float32(14.0), Float32(20.0)),
+                kpi_vals[ki],
+                theme.font_title,
+                theme.text_primary,
+                UI_ALIGN_LEFT,
+                UI_FONT_MONO,
+                Float32(0.0),
+                True,
+                False,
+            )
+        cy += tile_h + Float32(8.0)
+
+    # Key-value detail card (`State Hash`, `UI Prims`, `Culled`)
+    var row_h = Float32(24.0)
+    var n_rows = 3 if (ui_prims > 0 or culled_items > 0) else 1
+    var card_h = Float32(n_rows) * row_h + Float32(8.0)
+    if cy + Float32(28.0) <= panel_rect.bottom():
+        ui.draw_list.add_card_surface(cx, cy, cw, card_h, theme.l2_card, theme.border_subtle, RADIUS_MD, 1.0, True, False)
+        var ry = cy + Float32(4.0)
+        var keys = List[String](capacity=3)
+        var vals = List[String](capacity=3)
+        keys.append("State Hash")
+        vals.append(String(state_hash))
+        if n_rows == 3:
+            keys.append("UI Prims")
+            vals.append(String(ui_prims))
+            keys.append("Culled")
+            vals.append(String(culled_items))
+        for ri in range(len(keys)):
+            if ri > 0:
+                ui.draw_list.add_line(cx + Float32(8.0), ry, cx + cw - Float32(8.0), ry, Float32(1.0), theme.border_subtle)
+            var lbl_w = min(cw * Float32(0.46), Float32(88.0))
+            ui.draw_text_in_rect(
+                RectF(cx + Float32(8.0), ry, lbl_w, row_h),
+                keys[ri],
+                theme.font_caption,
+                theme.text_secondary,
+                UI_ALIGN_LEFT,
+                UI_FONT_REGULAR,
+                Float32(0.0),
+                True,
+                False,
+            )
+            var vx = cx + Float32(8.0) + lbl_w + Float32(4.0)
+            ui.draw_text_in_rect(
+                RectF(vx, ry, max(Float32(16.0), cx + cw - Float32(8.0) - vx), row_h),
+                vals[ri],
+                theme.font_mono,
+                theme.text_primary,
+                UI_ALIGN_RIGHT,
+                UI_FONT_MONO,
+                Float32(0.0),
+                True,
+                True,
+            )
+            ry += row_h
+    ui.draw_list.pop_clip()
+
+
+def draw_asset_empty_deck(
+    mut ui: UiContext,
+    rect: RectF,
+    theme: StudioTheme,
+    has_any_assets: Bool,
+) -> Tuple[Bool, Int]:
+    """Renders the crafted Asset Browser empty state directly on `l1_shell` (no hollow scroll box):
+      - `rect.h < 84`: single-line Compact HiDPI Fallback (zero vertical clipping or phantom scrollbar)
+      - `rect.h >= 84` & `rect.w >= 480` & empty project: Two-Zone Studio Deck (Left Hero Drop-Well +
+        Right 3x2 Quick Create shelf preserving canonical `card_*` widget IDs).
+    Returns `(import_clicked, spawn_preset_kind)` where `spawn_preset_kind == -1` if none clicked."""
+    var import_clicked = False
+    var spawn_kind = -1
+    if rect.w < Float32(40.0) or rect.h < Float32(16.0):
+        return (False, -1)
+
+    var icon_id = ICON_SEARCH if has_any_assets else ICON_FOLDER
+    var title_txt = "No matching assets" if has_any_assets else "No project assets yet"
+
+    # ---- Compact HiDPI / Short-Pane Fallback (`rect.h < 84px`) ----
+    if rect.h < Float32(84.0):
+        var bar_h = min(rect.h, Float32(40.0))
+        var bar_y = rect.y + (rect.h - bar_h) * Float32(0.5)
+        ui.draw_list.add_recessed_well(
+            rect.x, bar_y, rect.w, bar_h,
+            rgba8_scale_alpha(theme.l0_canvas, Float32(0.75)), theme.border_subtle,
+            RADIUS_MD, 1.0, False, 0,
+        )
+        var badge_sz = min(Float32(22.0), max(Float32(14.0), bar_h - Float32(8.0)))
+        var bx = rect.x + Float32(10.0)
+        var by = bar_y + (bar_h - badge_sz) * Float32(0.5)
+        ui.draw_list.add_rect(bx, by, badge_sz, badge_sz, theme.accent_soft, RADIUS_XS)
+        var isz = max(Float32(10.0), badge_sz - Float32(8.0))
+        draw_studio_icon(ui.draw_list, icon_id, bx + (badge_sz - isz) * Float32(0.5), by + (badge_sz - isz) * Float32(0.5), isz, theme.accent_primary, Float32(1.4))
+        var tx = bx + badge_sz + Float32(8.0)
+        var hint_suffix = "  ·  Try a different filter" if has_any_assets else "  ·  Use Create or Import above"
+        var full_line = title_txt + hint_suffix if rect.w >= Float32(340.0) else title_txt
+        ui.draw_text_in_rect(
+            RectF(tx, bar_y, max(Float32(16.0), rect.right() - tx - Float32(10.0)), bar_h),
+            full_line,
+            theme.font_caption,
+            theme.text_primary if rect.w < Float32(340.0) else theme.text_secondary,
+            UI_ALIGN_LEFT,
+            UI_FONT_REGULAR,
+            Float32(0.0),
+            True,
+            False,
+        )
+        return (False, -1)
+
+    # ---- Two-Zone Studio Deck (Left Hero Drop-Well + Right 3x2 Quick Create Shelf) ----
+    var show_quick_shelf = (not has_any_assets) and rect.w >= Float32(480.0)
+    var gap = Float32(10.0)
+    var hero_w = (rect.w - gap) * Float32(0.52) if show_quick_shelf else rect.w
+    var hero_r = RectF(rect.x, rect.y, hero_w, rect.h)
+
+    # Left Hero Drop-Well
+    ui.draw_list.add_recessed_well(
+        hero_r.x, hero_r.y, hero_r.w, hero_r.h,
+        theme.l0_canvas, theme.border_control,
+        RADIUS_MD, 1.0, False, 0,
+    )
+    ui.draw_list.add_accent_bar(
+        hero_r.x + Float32(1.5),
+        hero_r.y + Float32(14.0),
+        Float32(2.5),
+        max(Float32(16.0), hero_r.h - Float32(28.0)),
+        rgba8_with_alpha(theme.accent_primary, 150),
+        True,
+    )
+
+    var show_cta = (not has_any_assets) and hero_r.h >= Float32(98.0) and hero_r.w >= Float32(230.0)
+    var block_h = Float32(66.0) if show_cta else Float32(42.0)
+    var top_y = hero_r.y + max(Float32(10.0), (hero_r.h - block_h) * Float32(0.5))
+    var badge_sz = Float32(36.0)
+    var bx = hero_r.x + Float32(16.0)
+    ui.draw_list.add_card_surface(
+        bx, top_y, badge_sz, badge_sz,
+        theme.accent_soft, rgba8_with_alpha(theme.accent_primary, 96),
+        RADIUS_MD, 1.0, True, False,
+    )
+    draw_studio_icon(ui.draw_list, icon_id, bx + Float32(9.0), top_y + Float32(9.0), Float32(18.0), theme.accent_primary, Float32(1.5))
+
+    var tx = bx + badge_sz + Float32(12.0)
+    var text_w = max(Float32(24.0), hero_r.right() - tx - Float32(14.0))
+    var hero_title = "No matching assets" if has_any_assets else "Project library is empty"
+    var hero_sub = (
+        "Try a different name, file extension, or clear your filter."
+        if has_any_assets
+        else "Import .glb, .flmat, .mojo, or .wav files to start."
+    )
+    ui.draw_text_in_rect(
+        RectF(tx, top_y + Float32(1.0), text_w, Float32(18.0)),
+        hero_title,
+        theme.font_section,
+        theme.text_primary,
+        UI_ALIGN_LEFT,
+        UI_FONT_BOLD,
+        Float32(0.0),
+        True,
+        False,
+    )
+    ui.draw_text_in_rect(
+        RectF(tx, top_y + Float32(20.0), text_w, Float32(16.0)),
+        hero_sub,
+        theme.font_caption,
+        theme.text_secondary,
+        UI_ALIGN_LEFT,
+        UI_FONT_REGULAR,
+        Float32(0.0),
+        True,
+        False,
+    )
+    if show_cta:
+        var cta_r = RectF(tx, top_y + Float32(42.0), min(Float32(114.0), text_w), Float32(24.0))
+        if _click_rect_button(ui, ui.widget_id("ab_empty_import_cta"), cta_r, "Import Asset", theme, ICON_PLUS, True, theme.accent_primary, True, True):
+            import_clicked = True
+
+    # Right 3x2 Quick Create Shelf
+    if show_quick_shelf:
+        var shelf_x = hero_r.right() + gap
+        var shelf_w = max(Float32(60.0), rect.right() - shelf_x)
+        var shelf_r = RectF(shelf_x, rect.y, shelf_w, rect.h)
+        ui.draw_list.add_card_surface(
+            shelf_r.x, shelf_r.y, shelf_r.w, shelf_r.h,
+            rgba8_scale_alpha(theme.l2_card, Float32(0.55)), theme.border_subtle,
+            RADIUS_MD, 1.0, True, False,
+        )
+        var pad_s = Float32(10.0)
+        var hdr_r = RectF(shelf_r.x + pad_s, shelf_r.y + Float32(6.0), shelf_r.w - pad_s * Float32(2.0), Float32(16.0))
+        ui.draw_text_in_rect(hdr_r, "QUICK CREATE", Float32(10.0), theme.text_muted, UI_ALIGN_LEFT, UI_FONT_BOLD, Float32(0.0), True, False)
+        ui.draw_text_in_rect(hdr_r, "6 primitives", Float32(10.0), theme.text_muted, UI_ALIGN_RIGHT, UI_FONT_MONO, Float32(0.0), True, False)
+
+        var grid_x = shelf_r.x + pad_s
+        var grid_y = hdr_r.bottom() + Float32(6.0)
+        var grid_w = max(Float32(40.0), shelf_r.w - pad_s * Float32(2.0))
+        var grid_h = max(Float32(24.0), shelf_r.bottom() - grid_y - Float32(10.0))
+        var cols = 3
+        var rows_n = 2
+        var cell_gap = Float32(6.0)
+        var cell_w = max(Float32(36.0), (grid_w - cell_gap * Float32(cols - 1)) / Float32(cols))
+        var cell_h = min(Float32(32.0), max(Float32(22.0), (grid_h - cell_gap * Float32(rows_n - 1)) / Float32(rows_n)))
+        var total_grid_h = cell_h * Float32(rows_n) + cell_gap * Float32(rows_n - 1)
+        var start_gy = grid_y + max(Float32(0.0), (grid_h - total_grid_h) * Float32(0.5))
+
+        var ids = [
+            String("card_empty"),
+            String("card_cube"),
+            String("card_point_light"),
+            String("card_spot_light"),
+            String("card_camera"),
+            String("card_audio_emitter"),
+        ]
+        var labels = [String("Empty"), String("Cube"), String("Point"), String("Spot"), String("Camera"), String("Audio")]
+        var icons = [ICON_EMPTY, ICON_CUBE, ICON_LIGHT_POINT, ICON_LIGHT_SPOT, ICON_CAMERA, ICON_AUDIO]
+        var tints = [
+            theme.text_secondary,
+            theme.accent_primary,
+            theme.status_warn,
+            theme.status_warn,
+            theme.agent_flow,
+            theme.play_mode,
+        ]
+        for si in range(6):
+            var r_i = si // cols
+            var c_i = si % cols
+            var cr = RectF(
+                grid_x + Float32(c_i) * (cell_w + cell_gap),
+                start_gy + Float32(r_i) * (cell_h + cell_gap),
+                cell_w,
+                cell_h,
+            )
+            var swid = ui.widget_id(ids[si])
+            if _click_rect_button(ui, swid, cr, labels[si], theme, icons[si], False, tints[si], True, True):
+                spawn_kind = si
+            if ui.hovered_id == swid:
+                ui.queue_tooltip_rect(swid, cr, "Spawn " + labels[si] + " entity")
+
+    return (import_clicked, spawn_kind)
+
+
+def draw_asset_card_tile(
+    mut ui: UiContext,
+    wid: UInt64,
+    r: RectF,
+    item: AssetTileItem,
+    is_selected: Bool,
+    theme: StudioTheme,
+) -> Tuple[Bool, Bool]:
+    """Renders a polished visual `L2_card` asset tile with inset 2px semantic top bar, recessed
+    preview well, mono extension pill, and optical centered filename. Returns `(clicked, hovered)`."""
+    ui._register_focusable(wid, allow_auto_focus=False)
+    var blocked = ui._blocked_by_modal()
+    var ptr_blocked = blocked or ui._is_pointer_blocked_by_popup(wid)
+    var hov = (not ptr_blocked) and r.contains(ui.mouse_x, ui.mouse_y)
+    if hov:
+        ui.hovered_id = wid
+        ui.hovered_rect = ui._clip_hovered_rect(r)
+        if ui.mouse_pressed_l:
+            ui.active_id = wid
+            ui._set_focused(wid)
+    var clicked = (not blocked) and (hov and ui.mouse_pressed_l)
+
+    var accent = asset_filter_accent(item.filter_kind, theme)
+    var sp = ui.animator.drive_widget(wid, hov, is_selected, False)
+    var h_t = sp[0]
+    var bg = theme.l3_raised if is_selected else lerp_rgba8(theme.l2_card, theme.l3_raised, h_t * Float32(0.75))
+    var brd = accent if is_selected else lerp_rgba8(theme.border_subtle, theme.border_strong, h_t)
+
+    ui.draw_list.add_card_surface(r.x, r.y, r.w, r.h, bg, brd, RADIUS_MD, 1.0, True, False)
+    if ui.show_focus_ring(wid):
+        ui.draw_list.add_rect(r.x, r.y, r.w, r.h, 0, RADIUS_MD, 2.0, theme.focus_ring)
+
+    # Inset 2px top semantic accent pill bar
+    ui.draw_list.add_accent_bar(r.x + Float32(10.0), r.y + Float32(2.0), max(Float32(12.0), r.w - Float32(20.0)), Float32(2.0), accent, True)
+
+    # Recessed `l0_canvas` preview well
+    var well_h = max(Float32(34.0), r.h - Float32(44.0))
+    var well = RectF(r.x + Float32(6.0), r.y + Float32(8.0), max(Float32(24.0), r.w - Float32(12.0)), well_h)
+    ui.draw_list.add_recessed_well(well.x, well.y, well.w, well.h, theme.l0_canvas, theme.border_subtle, RADIUS_SM, 1.0, False, 0)
+    if (item.swatch_rgba8 >> 24) != 0:
+        var sr = min(Float32(14.0), well.h * Float32(0.32))
+        ui.draw_list.add_circle(well.center_x(), well.center_y(), sr, item.swatch_rgba8, Float32(1.2), theme.border_strong)
+        ui.draw_list.add_circle(well.center_x() - sr * Float32(0.32), well.center_y() - sr * Float32(0.32), max(Float32(2.0), sr * Float32(0.24)), rgba8(255, 255, 255, 110))
+    else:
+        var isz = min(Float32(26.0), max(Float32(16.0), well.h - Float32(18.0)))
+        draw_studio_icon(ui.draw_list, item.icon_id, well.center_x() - isz * Float32(0.5), well.center_y() - isz * Float32(0.5) - Float32(2.0), isz, accent, Float32(1.55))
+
+    # Bottom-right translucent mono extension pill inside preview well
+    var ext_sz = Float32(9.5)
+    var ext_tw = ui._measure_text_styled(item.ext, ext_sz, UI_FONT_MONO)
+    var ext_w = max(Float32(22.0), min(well.w - Float32(6.0), ext_tw + Float32(8.0)))
+    var ext_r = RectF(well.right() - ext_w - Float32(3.0), well.bottom() - Float32(16.0), ext_w, Float32(13.0))
+    ui.draw_list.add_rect(ext_r.x, ext_r.y, ext_r.w, ext_r.h, rgba8_scale_alpha(theme.l1_shell, Float32(0.88)), RADIUS_XS, Float32(1.0), theme.border_subtle)
+    ui.draw_text_in_rect(ext_r, item.ext, ext_sz, accent, UI_ALIGN_CENTER, UI_FONT_MONO, Float32(2.0), True, False)
+
+    # Centered truncated filename footer
+    var foot_r = RectF(r.x + Float32(5.0), well.bottom() + Float32(4.0), max(Float32(16.0), r.w - Float32(10.0)), max(Float32(16.0), r.bottom() - well.bottom() - Float32(7.0)))
+    ui.draw_text_in_rect(
+        foot_r,
+        item.display_name,
+        theme.font_caption,
+        theme.text_primary if (is_selected or hov) else theme.text_secondary,
+        UI_ALIGN_CENTER,
+        UI_FONT_BOLD if is_selected else UI_FONT_REGULAR,
+        Float32(1.0),
+        True,
+        True,
+    )
+    if hov:
+        ui.queue_tooltip_rect(wid, r, item.rel_path)
+
+    ui.last_item_id = wid
+    ui.last_item_rect = r
+    return (clicked, hov)
 
 
 def _push_panel_box(mut ui: UiContext, id: String, content_rect: RectF, gap: Float32 = 4.0, pad: Float32 = 8.0):
@@ -827,10 +1377,11 @@ def draw_outliner_panel_v2(
     bus: AgentTelemetryBus,
     mut state: OutlinerPanelState,
 ) -> OutlinerAction:
-    """Renders the Obsidian v2 Scene Outliner with search bar, contextual `[Unparent]`
-    at `(panel.x+28, panel.y+16)` compatibility rect, `24 px` rows, semantic icons,
-    UTF-8 ellipsis truncation, cyan selection bar, visibility/lock toggles, and live
-    pulsing Agent Activity Badges."""
+    """Renders the Obsidian & Flint Ember Scene Outliner with symmetric toolbar, inline search
+    clear, contextual `[Unparent]` at `(panel.x+28, panel.y+16)` compatibility rect, distinct
+    world-root header band with mono count pill, `OUTLINER_ROW_H` rows with continuous tree
+    guides + L-ticks, reclaimed leaf padding, bordered selection pill, `+N` collapsed badges,
+    visibility/lock hover wells, draggable 4->6px scrollbar, and live Agent Activity Badges."""
     var act = OutlinerAction()
     if panel_rect.w < Float32(40.0) or panel_rect.h < Float32(40.0):
         return act^
@@ -847,10 +1398,10 @@ def draw_outliner_panel_v2(
     ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
 
     var pad = Float32(8.0)
-    var top_h = Float32(34.0)
+    var top_h = Float32(36.0)
+    var ctrl_h = Float32(24.0)
     var top_y = panel_rect.y + Float32(6.0)
-    var ctrl_h = Float32(22.0)
-    var cur_x = panel_rect.x + Float32(6.0)
+    var cur_x = panel_rect.x + pad
 
     # Compatibility contract (`test_flint_v5_assets_studio_mcp.mojo:3379-3391`):
     # When a selected entity has a parent, keep a clickable `[Unparent]` button covering
@@ -860,29 +1411,37 @@ def draw_outliner_panel_v2(
         var unp_wid = ui.widget_id("outliner_v2_unparent")
         if _click_rect_button(ui, unp_wid, unp_r, "Unparent", theme, -1, False, theme.accent_primary, True):
             act.unparent_selected = True
-        cur_x = unp_r.right() + Float32(4.0)
+        cur_x = unp_r.right() + Float32(6.0)
     elif selected_count >= 2:
         var par_r = RectF(cur_x, top_y, Float32(72.0), ctrl_h)
         var par_wid = ui.widget_id("outliner_v2_parent_pri")
         if _click_rect_button(ui, par_wid, par_r, "Parent", theme, -1, False, theme.accent_primary, True):
             act.parent_to_primary = True
-        cur_x = par_r.right() + Float32(4.0)
+        cur_x = par_r.right() + Float32(6.0)
 
-    # Right-side `+` quick-spawn icon button & entity count pill
-    var plus_w = Float32(24.0)
-    var plus_r = RectF(panel_rect.right() - pad - plus_w, top_y, plus_w, ctrl_h)
-    var cnt_txt = String(total_entity_count)
-    var cnt_w = max(Float32(22.0), ui._measure_text(cnt_txt, theme.font_caption) + Float32(12.0))
-    var cnt_x = plus_r.x - Float32(4.0) - cnt_w
-
-    # Slim recessed search box filling remaining width between cur_x and cnt_x
-    var search_w = max(Float32(36.0), cnt_x - Float32(4.0) - cur_x)
+    var right = panel_rect.right() - pad
+    var label_add = right - cur_x >= Float32(140.0)
+    var plus_w = Float32(56.0) if label_add else Float32(26.0)
+    var plus_r = RectF(right - plus_w, top_y, plus_w, ctrl_h)
+    var search_w = max(Float32(0.0), plus_r.x - Float32(6.0) - cur_x)
     var search_r = RectF(cur_x, top_y, search_w, ctrl_h)
     var search_wid = ui.widget_id("outliner_v2_search")
+    ui._register_focusable(search_wid, allow_auto_focus=False)
+    ui._text_widget_ids.append(search_wid)
     var blocked = ui._blocked_by_modal()
     var ptr_blocked = blocked or ui._is_pointer_blocked_by_popup(search_wid)
+    var has_query_raw = state.search_query.byte_length() > 0
+    var clear_r = RectF(search_r.right() - Float32(20.0), search_r.y + Float32(2.0), Float32(18.0), max(Float32(12.0), search_r.h - Float32(4.0)))
+    var clear_hov = has_query_raw and search_w >= Float32(56.0) and (not ptr_blocked) and clear_r.contains(ui.mouse_x, ui.mouse_y)
     var search_hov = (not ptr_blocked) and search_r.contains(ui.mouse_x, ui.mouse_y)
-    if search_hov:
+    if clear_hov:
+        ui.hovered_id = ui.widget_id("outliner_v2_search_clear")
+        ui.hovered_rect = ui._clip_hovered_rect(clear_r)
+        if ui.mouse_pressed_l:
+            state.search_query = String("")
+            state.scroll_y = Float32(0.0)
+            has_query_raw = False
+    elif search_hov:
         ui.hovered_id = search_wid
         ui.hovered_rect = ui._clip_hovered_rect(search_r)
         if ui.mouse_pressed_l:
@@ -891,58 +1450,79 @@ def draw_outliner_panel_v2(
     if search_foc:
         ui._focused_text_id = search_wid
         ui._focused_text_seen = True
-        ui._text_widget_ids.append(search_wid)
         if ui.key_esc_pressed:
             state.search_query = String("")
             ui.focused_id = 0
             ui._focused_text_id = 0
+            has_query_raw = False
         elif ui.key_bs_pressed and state.search_query.byte_length() > 0:
-            var bl = state.search_query.byte_length()
-            var next_q = String(state.search_query[byte=0 : bl - 1])
-            state.search_query = next_q
+            var codepoints = decode_utf8(state.search_query)
+            state.search_query = encode_utf8(codepoints, 0, max(0, len(codepoints) - 1))
+            has_query_raw = state.search_query.byte_length() > 0
         elif ui.text_utf8.byte_length() > 0 and not ui.key_ctrl:
             state.search_query += ui.text_utf8
+            has_query_raw = True
 
-    ui.draw_list.add_rect_styled(
+    ui.draw_list.push_clip(Int(search_r.x), Int(search_r.y), Int(search_r.right()), Int(search_r.bottom()))
+    ui.draw_list.add_recessed_well(
         search_r.x, search_r.y, search_r.w, search_r.h,
         theme.l0_canvas,
-        theme.focus_ring if search_foc else (theme.border_strong if search_hov else theme.border_subtle),
-        RADIUS_SM, 1.0, 1.0, UI_FLAG_BORDER,
+        theme.border_strong if search_hov else theme.border_subtle,
+        RADIUS_SM, 1.0, search_foc, theme.focus_ring,
     )
     draw_studio_icon(
         ui.draw_list,
         ICON_SEARCH,
-        search_r.x + Float32(5.0),
+        search_r.x + Float32(7.0),
         search_r.center_y() - Float32(6.0),
         Float32(12.0),
-        theme.text_muted,
-        Float32(1.3),
+        theme.accent_primary if search_foc else theme.text_muted,
+        Float32(1.35),
     )
-    var q_x = search_r.x + Float32(20.0)
-    var q_avail = max(Float32(12.0), search_r.right() - q_x - Float32(4.0))
-    if state.search_query.byte_length() > 0:
+    var q_x = search_r.x + Float32(23.0)
+    var clear_reserve = Float32(22.0) if (has_query_raw and search_w >= Float32(56.0)) else Float32(6.0)
+    var q_avail = max(Float32(12.0), search_r.right() - q_x - clear_reserve)
+    var q_rect = RectF(q_x, search_r.y, q_avail, search_r.h)
+    var caret_x = q_x
+    if has_query_raw:
         var q_disp = ui._truncate_text_ellipsis(state.search_query, q_avail, theme.font_caption)
-        ui._draw_text(q_disp, q_x, search_r.center_y() - theme.font_caption * Float32(0.5), theme.font_caption, theme.text_primary)
+        ui.draw_text_in_rect(q_rect, q_disp, theme.font_caption, theme.text_primary, UI_ALIGN_LEFT, UI_FONT_REGULAR, Float32(0.0), False, False)
+        caret_x = min(q_rect.right() - Float32(1.0), q_x + ui._measure_text_styled(q_disp, theme.font_caption, UI_FONT_REGULAR) + Float32(1.0))
+        if search_w >= Float32(56.0):
+            if clear_hov:
+                ui.draw_list.add_rect(clear_r.x, clear_r.y, clear_r.w, clear_r.h, theme.l3_raised, RADIUS_XS)
+            draw_studio_icon(
+                ui.draw_list,
+                ICON_CLOSE,
+                clear_r.center_x() - Float32(5.0),
+                clear_r.center_y() - Float32(5.0),
+                Float32(10.0),
+                theme.text_primary if clear_hov else theme.text_muted,
+                Float32(1.3),
+            )
     else:
-        var ph = ui._truncate_text_ellipsis("Filter...", q_avail, theme.font_caption)
-        ui._draw_text(ph, q_x, search_r.center_y() - theme.font_caption * Float32(0.5), theme.font_caption, theme.text_muted)
+        ui.draw_text_in_rect(q_rect, "Find entity", theme.font_caption, theme.text_muted, UI_ALIGN_LEFT, UI_FONT_REGULAR, Float32(0.0), True, False)
+    if search_foc:
+        ui.draw_list.add_line(caret_x, top_y + Float32(5.0), caret_x, top_y + ctrl_h - Float32(5.0), Float32(1.2), theme.focus_ring)
+    ui.draw_list.pop_clip()
 
-    # Entity count pill
-    _ = ui.badge_pill(cnt_txt, theme.l2_card, theme.text_secondary, cnt_x, top_y + Float32(1.0), Float32(20.0), False)
-
-    # `+` quick-spawn button
-    if _click_rect_button(ui, ui.widget_id("outliner_v2_plus"), plus_r, "", theme, ICON_PLUS, False, theme.accent_primary, True):
+    # `+ Add` quick-spawn button (accent-tinted icon + crisp hover border)
+    var plus_wid = ui.widget_id("outliner_v2_plus")
+    if _click_rect_button(ui, plus_wid, plus_r, "Add" if label_add else "", theme, ICON_PLUS, False, theme.accent_primary, True, True):
         act.quick_spawn_clicked = True
+    if ui.hovered_id == plus_wid:
+        ui.queue_tooltip_rect(plus_wid, plus_r, "Quick Spawn Entity", "Ctrl+K")
 
     # Subtle header divider hairline
     var list_y = panel_rect.y + top_h
     ui.draw_list.add_line(panel_rect.x, list_y, panel_rect.right(), list_y, Float32(1.0), theme.border_subtle)
 
     # Scrollable entity list region
-    var list_rect = RectF(panel_rect.x, list_y + Float32(2.0), panel_rect.w, max(Float32(16.0), panel_rect.bottom() - list_y - Float32(4.0)))
-    var row_h = Float32(24.0)
-    var row_gap = Float32(2.0)
+    var list_rect = RectF(panel_rect.x, list_y + Float32(1.0), panel_rect.w, max(Float32(16.0), panel_rect.bottom() - list_y - Float32(2.0)))
+    var row_h = OUTLINER_ROW_H
+    var row_gap = Float32(1.0)
     var stride = row_h + row_gap
+    var root_extra_gap = Float32(4.0)
     var filter_l = _ascii_lower_panel(String(state.search_query.strip()))
     var has_filter = filter_l.byte_length() > 0
 
@@ -952,48 +1532,113 @@ def draw_outliner_panel_v2(
         if (not has_filter) or _ascii_lower_panel(rows[i].name).find(filter_l) >= 0:
             vis_indices.append(i)
 
-    var total_rows = 1 + (len(vis_indices) if state.world_root_open else 0)
-    var content_h = Float32(total_rows) * stride + Float32(8.0)
+    var tree_open = state.world_root_open or has_filter
+    var total_rows = 1 + (len(vis_indices) if tree_open else 0)
+    var content_h = Float32(total_rows) * stride + root_extra_gap + Float32(10.0)
     var max_scroll = max(Float32(0.0), content_h - list_rect.h)
     if (not ptr_blocked) and list_rect.contains(ui.mouse_x, ui.mouse_y) and ui.mouse_wheel != Float32(0.0):
         state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y - ui.mouse_wheel * Float32(36.0)))
+    var tree_id = ui.widget_id("outliner_v2_world_root")
+    ui._register_focusable(tree_id, allow_auto_focus=False)
+    var tree_focused = not blocked and ui.focused_id == tree_id
+    if search_foc and ui.key_enter_pressed and has_filter and len(vis_indices) > 0:
+        var first_entity_id = rows[vis_indices[0]].entity_id
+        act.select_entity_id = first_entity_id
+        state.keyboard_entity_id = first_entity_id
+        state.scroll_y = Float32(0.0)
+        ui._set_focused(tree_id)
+        ui._focused_text_id = 0
+    if tree_focused and (ui.key_up_pressed or ui.key_down_pressed or ui.key_home_pressed or ui.key_end_pressed):
+        # One Tab stop for the tree; arrow keys traverse all rows, including offscreen rows.
+        var current = -1
+        for vi in range(len(vis_indices)):
+            if rows[vis_indices[vi]].entity_id == state.keyboard_entity_id:
+                current = vi
+                break
+        var last = len(vis_indices) - 1 if tree_open else -1
+        var target = min(last, current + 1) if ui.key_down_pressed else max(-1, current - 1)
+        if ui.key_home_pressed or ui.key_end_pressed:
+            target = last if ui.key_end_pressed else -1
+        state.keyboard_entity_id = rows[vis_indices[target]].entity_id if target >= 0 else -1
+        if target >= 0:
+            act.select_entity_id = state.keyboard_entity_id
+            act.select_range = ui.key_shift
+        var offset = Float32(target + 1) * stride + root_extra_gap + Float32(4.0)
+        state.scroll_y = min(state.scroll_y, offset)
+        state.scroll_y = max(state.scroll_y, offset + row_h - list_rect.h)
     state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y))
 
     ui.draw_list.push_clip(Int(list_rect.x), Int(list_rect.y), Int(list_rect.right()), Int(list_rect.bottom()))
 
-    var sb_reserve = Float32(8.0) if max_scroll > Float32(0.5) else Float32(0.0)
+    var sb_reserve = Float32(9.0) if max_scroll > Float32(0.5) else Float32(0.0)
     var row_x = list_rect.x + Float32(6.0)
     var row_w = max(Float32(60.0), list_rect.w - Float32(12.0) - sb_reserve)
-    var cur_y = list_rect.y + Float32(4.0) - state.scroll_y
+    var cur_y = list_rect.y + Float32(6.0) - state.scroll_y
 
-    # World Root Header Row
+    # ---- Distinct World Root Header Band ----
     var root_r = RectF(row_x, cur_y, row_w, row_h)
     if root_r.bottom() >= list_rect.y and root_r.y <= list_rect.bottom():
-        var root_wid = ui.widget_id("outliner_v2_world_root")
-        var root_hov = (not ptr_blocked) and root_r.contains(ui.mouse_x, ui.mouse_y)
+        var root_wid = tree_id
+        var root_hov = (not ptr_blocked) and list_rect.contains(ui.mouse_x, ui.mouse_y) and root_r.contains(ui.mouse_x, ui.mouse_y)
+        var root_bg = theme.l2_card if root_hov else rgba8_scale_alpha(theme.l2_card, Float32(0.72))
+        var root_brd = theme.border_control if root_hov else theme.border_subtle
+        ui.draw_list.add_card_surface(root_r.x, root_r.y, root_r.w, root_r.h, root_bg, root_brd, RADIUS_SM, 1.0, True, False)
         if root_hov:
             ui.hovered_id = root_wid
             ui.hovered_rect = ui._clip_hovered_rect(root_r)
-            ui.draw_list.add_rect(root_r.x, root_r.y, root_r.w, root_r.h, theme.l2_card, RADIUS_SM)
             if ui.mouse_pressed_l:
-                state.world_root_open = not state.world_root_open
+                ui._set_focused(tree_id)
+                state.keyboard_entity_id = -1
+                if not has_filter:
+                    state.world_root_open = not state.world_root_open
+        if tree_focused and state.keyboard_entity_id < 0:
+            if ui.show_focus_ring(tree_id):
+                ui.draw_list.add_rect(root_r.x, root_r.y, root_r.w, root_r.h, 0, RADIUS_SM, 2.0, theme.focus_ring)
+            if not has_filter:
+                if ui.key_enter_pressed or ui.key_space_pressed or ui.pad_confirm:
+                    state.world_root_open = not state.world_root_open
+                elif ui.key_left_pressed or ui.key_right_pressed:
+                    state.world_root_open = ui.key_right_pressed
         var root_drop = ui.accept_drag_target_rect("STUDIO_ENTITY", root_r)
         if root_drop[0]:
             act.reparent_child_id = root_drop[1]
             act.reparent_target_id = -1
-        var root_exp_t = ui.animator.drive_expand(root_wid, state.world_root_open)
-        draw_studio_chevron(ui.draw_list, root_r.x + Float32(4.0), root_r.center_y() - Float32(6.0), Float32(12.0), theme.text_secondary, root_exp_t, Float32(1.4))
-        draw_studio_icon(ui.draw_list, ICON_GRID, root_r.x + Float32(20.0), root_r.center_y() - Float32(6.5), Float32(13.0), theme.accent_primary, Float32(1.3))
-        var r_lbl = ui._truncate_text_ellipsis(world_name, max(Float32(24.0), root_r.w - Float32(42.0)), theme.font_section)
-        ui._draw_text(r_lbl, root_r.x + Float32(38.0), root_r.center_y() - theme.font_section * Float32(0.5), theme.font_section, theme.text_primary)
-    cur_y += stride
+        var root_exp_t = ui.animator.drive_expand(root_wid, tree_open)
+        draw_studio_chevron(ui.draw_list, root_r.x + Float32(6.0), root_r.center_y() - Float32(5.5), Float32(11.0), theme.text_secondary, root_exp_t, Float32(1.4))
+        draw_studio_icon(ui.draw_list, ICON_GRID, root_r.x + Float32(21.0), root_r.center_y() - Float32(6.5), Float32(13.0), theme.accent_primary, Float32(1.35))
+
+        # Mono count pill badge on right edge
+        var count = String(len(vis_indices)) + "/" + String(total_entity_count) if has_filter else String(total_entity_count)
+        var count_tw = ui._measure_text_styled(count, theme.font_mono, UI_FONT_MONO)
+        var pill_w = max(Float32(20.0), count_tw + Float32(10.0))
+        var pill_h = Float32(16.0)
+        var pill_r = RectF(root_r.right() - pill_w - Float32(5.0), root_r.center_y() - pill_h * Float32(0.5), pill_w, pill_h)
+        ui.draw_list.add_rect(pill_r.x, pill_r.y, pill_r.w, pill_r.h, theme.l0_canvas, RADIUS_PILL, Float32(1.0), theme.border_subtle)
+        ui.draw_text_in_rect(pill_r, count, theme.font_mono, theme.text_secondary, UI_ALIGN_CENTER, UI_FONT_MONO, Float32(2.0), False, False)
+
+        var lbl_r = RectF(root_r.x + Float32(39.0), root_r.y, max(Float32(12.0), pill_r.x - (root_r.x + Float32(43.0))), root_r.h)
+        ui.draw_text_in_rect(lbl_r, world_name, theme.font_section, theme.text_primary, UI_ALIGN_LEFT, UI_FONT_BOLD, Float32(0.0), True, False)
+    cur_y += stride + root_extra_gap
 
     state.hovered_entity_id = -1
 
     # Entity rows (strict O(visible) culling; zero idle spring dict allocations!)
-    if state.world_root_open:
-        var indent_step = Float32(14.0)
-        for vi in range(len(vis_indices)):
+    if has_filter and len(vis_indices) == 0:
+        ui.draw_text_in_rect(
+            RectF(row_x + Float32(8.0), cur_y, max(Float32(40.0), row_w - Float32(16.0)), Float32(24.0)),
+            "No matching entities",
+            theme.font_caption,
+            theme.text_muted,
+            UI_ALIGN_LEFT,
+            UI_FONT_REGULAR,
+            Float32(0.0),
+            True,
+            False,
+        )
+    if tree_open:
+        var indent_step = Float32(13.0)
+        var n_vis = len(vis_indices)
+        for vi in range(n_vis):
             var row = rows[vis_indices[vi]].copy()
             var ry = cur_y + Float32(vi) * stride
             if ry + row_h < list_rect.y or ry > list_rect.bottom():
@@ -1002,30 +1647,46 @@ def draw_outliner_panel_v2(
 
             var rr = RectF(row_x, ry, row_w, row_h)
             var rwid = ui.widget_id("outliner_row_" + String(row.entity_id))
-            var hov = (not ptr_blocked) and rr.contains(ui.mouse_x, ui.mouse_y)
+            var hov = (not ptr_blocked) and list_rect.contains(ui.mouse_x, ui.mouse_y) and rr.contains(ui.mouse_x, ui.mouse_y)
             if hov:
                 state.hovered_entity_id = row.entity_id
                 ui.hovered_id = rwid
                 ui.hovered_rect = ui._clip_hovered_rect(rr)
 
-            # Row selection / hover surface (2px left cyan/accent bar + soft tinted fill; NO idle focus box)
+            # Row selection / hover surface (bordered selection pill + inset 3px pill bar)
             if row.is_selected:
-                ui.draw_list.add_rect(rr.x, rr.y, rr.w, rr.h, theme.accent_soft, RADIUS_SM)
-                var bar_col = theme.play_mode if row.is_primary else theme.accent_primary
-                ui.draw_list.add_rect(rr.x + Float32(1.0), rr.y + Float32(3.0), Float32(2.5), rr.h - Float32(6.0), bar_col, Float32(1.25))
+                var sel_brd = rgba8_with_alpha(theme.accent_primary if row.is_primary else theme.border_strong, 84)
+                ui.draw_list.add_rect_styled(rr.x, rr.y, rr.w, rr.h, theme.accent_soft, sel_brd, RADIUS_SM, 1.0, 1.0, UI_FLAG_BORDER)
+                var bar_col = theme.accent_primary if row.is_primary else theme.text_secondary
+                ui.draw_list.add_accent_bar(rr.x + Float32(3.0), rr.y + Float32(4.0), Float32(3.0), rr.h - Float32(8.0), bar_col, True)
             elif hov:
-                ui.draw_list.add_rect(rr.x, rr.y, rr.w, rr.h, theme.l2_card, RADIUS_SM)
+                ui.draw_list.add_rect_styled(rr.x, rr.y, rr.w, rr.h, theme.l2_card, theme.border_subtle, RADIUS_SM, 1.0, 1.0, UI_FLAG_BORDER)
+            if tree_focused and state.keyboard_entity_id == row.entity_id:
+                if ui.show_focus_ring(tree_id):
+                    ui.draw_list.add_rect(rr.x, rr.y, rr.w, rr.h, 0, RADIUS_SM, 2.0, theme.focus_ring)
+                if row.has_children and not has_filter and ((ui.key_left_pressed and row.is_expanded) or (ui.key_right_pressed and not row.is_expanded)):
+                    act.toggle_expand_entity_id = row.entity_id
+                elif ui.key_enter_pressed or ui.key_space_pressed or ui.pad_confirm:
+                    act.select_entity_id = row.entity_id
+                    if ui.key_enter_pressed:
+                        act.focus_entity_id = row.entity_id
 
-            # Indent guide hairlines
-            var base_indent_x = rr.x + Float32(10.0)
-            for d in range(row.depth):
-                var gx = base_indent_x + Float32(d) * indent_step + Float32(6.0)
-                ui.draw_list.add_line(gx, rr.y, gx, rr.bottom(), Float32(1.0), theme.border_subtle)
+            # Continuous depth >= 1 tree guide hairlines + crisp horizontal L-tick
+            var base_indent_x = rr.x + Float32(8.0)
+            var shown_depth = min(row.depth, max(0, Int((row_w - Float32(96.0)) / indent_step)))
+            var next_depth = rows[vis_indices[vi + 1]].depth if (vi + 1 < n_vis) else -1
+            for d in range(shown_depth):
+                var gx = base_indent_x + Float32(d) * indent_step + Float32(7.0)
+                var is_last_at_d = (d == shown_depth - 1) and (next_depth <= d)
+                var gy_bot = rr.center_y() if is_last_at_d else rr.bottom()
+                ui.draw_list.add_line(gx, rr.y - row_gap, gx, gy_bot, Float32(1.0), theme.border_control if (row.is_selected or hov) else theme.border_subtle)
+                if d == shown_depth - 1:
+                    ui.draw_list.add_line(gx, rr.center_y(), gx + Float32(6.0), rr.center_y(), Float32(1.0), theme.border_control if (row.is_selected or hov) else theme.border_subtle)
 
-            var ix = base_indent_x + Float32(row.depth) * indent_step
-            var chev_r = RectF(ix, rr.y, Float32(16.0), rr.h)
+            var ix = base_indent_x + Float32(shown_depth) * indent_step
             var clicked_sub = False
-            if row.has_children:
+            if row.has_children and not has_filter:
+                var chev_r = RectF(ix, rr.y, Float32(15.0), rr.h)
                 var chev_hov = hov and chev_r.contains(ui.mouse_x, ui.mouse_y)
                 if chev_hov and ui.mouse_pressed_l:
                     act.toggle_expand_entity_id = row.entity_id
@@ -1039,45 +1700,68 @@ def draw_outliner_panel_v2(
                     Float32(1.0) if row.is_expanded else Float32(0.0),
                     Float32(1.4),
                 )
-            ix += Float32(16.0)
+                ix += Float32(15.0)
+            else:
+                # Reclaim 8px of unused chevron slot on leaf rows so deep names fit untruncated!
+                ix += Float32(7.0) if shown_depth > 0 else Float32(10.0)
 
             # Semantic entity icon
             var ico_col = entity_kind_color(row.kind, theme)
             if not row.visible:
                 ico_col = rgba8_scale_alpha(ico_col, Float32(0.45))
             draw_studio_icon(ui.draw_list, entity_kind_icon(row.kind), ix, rr.center_y() - Float32(6.5), Float32(13.0), ico_col, Float32(1.35))
-            ix += Float32(18.0)
+            ix += Float32(17.0)
 
-            # Trailing right-aligned action slots: [Agent Badge] [Visibility Eye] [Lock]
+            # Trailing right-aligned action slots: [Collapsed +N Badge] [Agent Badge] [Eye] [Lock]
+            var badge = bus.entity_badge_info(row.entity_id)
             var right_edge = rr.right() - Float32(4.0)
-            var lock_r = RectF(right_edge - Float32(16.0), rr.y + Float32(4.0), Float32(16.0), Float32(16.0))
-            var eye_r = RectF(lock_r.x - Float32(18.0), rr.y + Float32(4.0), Float32(16.0), Float32(16.0))
-            var badge_edge = eye_r.x - Float32(4.0)
+            var badge_edge = right_edge
+            var slot_w = Float32(22.0)
+            var show_lock = hov or row.locked
+            var show_eye = hov or (not row.visible) or (row.is_selected and row_w >= Float32(195.0) and (not badge[0]))
+            var lock_r = RectF(right_edge - slot_w, rr.y, slot_w, rr.h)
+            if show_lock:
+                badge_edge = lock_r.x
+            var eye_r = RectF(badge_edge - slot_w, rr.y, slot_w, rr.h)
+            if show_eye:
+                badge_edge = eye_r.x
 
-            if hov or row.locked:
+            if show_lock:
                 var lock_hov = hov and lock_r.contains(ui.mouse_x, ui.mouse_y)
-                if lock_hov and ui.mouse_pressed_l:
-                    act.toggle_lock_entity_id = row.entity_id
-                    clicked_sub = True
+                if lock_hov:
+                    ui.draw_list.add_rect(lock_r.center_x() - Float32(10.0), lock_r.center_y() - Float32(10.0), Float32(20.0), Float32(20.0), theme.l3_raised, RADIUS_XS)
+                    ui.queue_tooltip_rect(hash_ui_id(rwid, "lock"), lock_r, "Unlock entity" if row.locked else "Lock entity")
+                    if ui.mouse_pressed_l:
+                        act.toggle_lock_entity_id = row.entity_id
+                        clicked_sub = True
                 var lcol = theme.status_warn if row.locked else (theme.text_primary if lock_hov else theme.text_muted)
-                draw_studio_icon(ui.draw_list, ICON_LOCK, lock_r.x + Float32(2.0), lock_r.y + Float32(2.0), Float32(12.0), lcol, Float32(1.3))
+                draw_studio_icon(ui.draw_list, ICON_LOCK, lock_r.center_x() - Float32(6.0), lock_r.center_y() - Float32(6.0), Float32(12.0), lcol, Float32(1.3))
 
-            if hov or (not row.visible):
+            if show_eye:
                 var eye_hov = hov and eye_r.contains(ui.mouse_x, ui.mouse_y)
-                if eye_hov and ui.mouse_pressed_l:
-                    act.toggle_visible_entity_id = row.entity_id
-                    clicked_sub = True
-                var ecol = theme.text_muted if (not row.visible) else (theme.text_primary if eye_hov else theme.text_secondary)
-                draw_studio_icon(ui.draw_list, ICON_EYE if row.visible else ICON_EYE_OFF, eye_r.x + Float32(2.0), eye_r.y + Float32(2.0), Float32(12.0), ecol, Float32(1.3))
+                if eye_hov:
+                    ui.draw_list.add_rect(eye_r.center_x() - Float32(10.0), eye_r.center_y() - Float32(10.0), Float32(20.0), Float32(20.0), theme.l3_raised, RADIUS_XS)
+                    ui.queue_tooltip_rect(hash_ui_id(rwid, "eye"), eye_r, "Show entity" if (not row.visible) else "Hide entity")
+                    if ui.mouse_pressed_l:
+                        act.toggle_visible_entity_id = row.entity_id
+                        clicked_sub = True
+                var ecol = (
+                    theme.text_muted
+                    if (not row.visible)
+                    else (
+                        theme.text_primary
+                        if eye_hov
+                        else (theme.text_secondary if hov else rgba8_scale_alpha(theme.text_secondary, Float32(0.36)))
+                    )
+                )
+                draw_studio_icon(ui.draw_list, ICON_EYE if row.visible else ICON_EYE_OFF, eye_r.center_x() - Float32(6.0), eye_r.center_y() - Float32(6.0), Float32(12.0), ecol, Float32(1.3))
 
             # Live Agent Activity Badge (`bus.entity_badge_info`)
-            var badge = bus.entity_badge_info(row.entity_id)
             if badge[0]:
-                var bcx = badge_edge - Float32(7.0)
+                var bcx = badge_edge - Float32(8.0)
                 var bcy = rr.center_y()
                 var bcol = badge[1]
                 if badge[2]:
-                    # Actively being mutated by an agent: glowing pulsing PRIM_ARC halo + dot
                     ui.draw_list.add_arc(
                         bcx, bcy, Float32(6.0), Float32(1.5),
                         Float32(0.0), Float32(4.6),
@@ -1089,15 +1773,32 @@ def draw_outliner_panel_v2(
                     ui.draw_list.add_circle(bcx, bcy, Float32(3.0), rgba8_scale_alpha(bcol, Float32(0.75)))
                 badge_edge = bcx - Float32(10.0)
 
-            # Truncated entity label (zero text clipping!)
+            # Collapsed parent `+N` child-count pill badge
+            if row.has_children and (not row.is_expanded) and (not has_filter):
+                var c_txt = ("+" + String(row.child_count)) if row.child_count > 0 else String("···")
+                var c_tw = ui._measure_text_styled(c_txt, Float32(10.0), UI_FONT_MONO)
+                var c_w = max(Float32(18.0), c_tw + Float32(8.0))
+                if badge_edge - c_w > ix + Float32(32.0):
+                    var c_r = RectF(badge_edge - c_w - Float32(3.0), rr.center_y() - Float32(7.5), c_w, Float32(15.0))
+                    ui.draw_list.add_rect(c_r.x, c_r.y, c_r.w, c_r.h, theme.l0_canvas, RADIUS_PILL, Float32(1.0), theme.border_subtle)
+                    ui.draw_text_in_rect(c_r, c_txt, Float32(10.0), theme.text_muted, UI_ALIGN_CENTER, UI_FONT_MONO, Float32(1.0), False, False)
+                    badge_edge = c_r.x - Float32(3.0)
+
+            # Truncated entity label (optical cap-height centered + full-name tooltip when truncated!)
             var text_max_w = max(Float32(16.0), badge_edge - ix - Float32(4.0))
+            var name_style = UI_FONT_BOLD if row.is_primary else UI_FONT_REGULAR
             var name_disp = ui._truncate_text_ellipsis(row.name, text_max_w, theme.font_body)
             var name_col = theme.text_primary if (row.is_selected or hov) else (theme.text_secondary if row.visible else theme.text_muted)
-            ui._draw_text(name_disp, ix, rr.center_y() - theme.font_body * Float32(0.5), theme.font_body, name_col)
+            ui.draw_text_in_rect(RectF(ix, rr.y, text_max_w, rr.h), name_disp, theme.font_body, name_col, UI_ALIGN_LEFT, name_style, Float32(0.0), False, False)
+            if hov and name_disp != row.name:
+                ui.queue_tooltip_rect(rwid, rr, row.name)
 
             # Selection, double-click camera focus & drag-drop reparenting
             ui.last_item_id = rwid
             ui.last_item_rect = rr
+            if hov and ui.mouse_pressed_l:
+                ui._set_focused(tree_id)
+                state.keyboard_entity_id = row.entity_id
             if hov and ui.mouse_pressed_l and not clicked_sub:
                 act.select_entity_id = row.entity_id
                 act.select_additive = ui.key_ctrl
@@ -1115,13 +1816,8 @@ def draw_outliner_panel_v2(
                 act.reparent_child_id = drop_hit[1]
                 act.reparent_target_id = row.entity_id
 
-    # Slim rounded scrollbar
-    if max_scroll > Float32(0.5):
-        var sb_w = Float32(4.0)
-        var track_h = max(Float32(16.0), list_rect.h - Float32(8.0))
-        var thumb_h = max(Float32(20.0), track_h * (list_rect.h / max(Float32(1.0), content_h)))
-        var thumb_y = list_rect.y + Float32(4.0) + (state.scroll_y / max_scroll) * max(Float32(1.0), track_h - thumb_h)
-        ui.draw_list.add_rect(list_rect.right() - sb_w - Float32(2.0), thumb_y, sb_w, thumb_h, theme.border_strong, Float32(2.0))
+    # Draggable sleek 4px -> 6px rounded scrollbar
+    _draw_slim_scrollbar(ui, ui.widget_id("outliner_v2_scrollbar"), list_rect, content_h, state.scroll_y, theme, ptr_blocked)
 
     ui.draw_list.pop_clip()
     ui.draw_list.pop_clip()
@@ -1131,6 +1827,69 @@ def draw_outliner_panel_v2(
 # ============================================================================
 # 5. Panel 2: Redesigned Card-Based Inspector (`draw_inspector_panel_v2`)
 # ============================================================================
+
+
+def draw_inspector_identity(mut ui: UiContext, kind: Int, entity_id: Int, parent_name: String, width: Float32):
+    """Show unified semantic icon badge, Bold archetype, mono `#id` chip, and muted parent context."""
+    var types = ["Entity", "Mesh", "Point light", "Spot light", "Camera", "Audio emitter", "Prefab", "Foliage", "Collider"]
+    ref theme = ui.studio_theme
+    var row = ui._alloc_item_rect(ui.widget_id("insp_identity"), width, Float32(26.0))
+    var accent = entity_kind_color(kind, theme)
+
+    # 24x24 tinted semantic icon badge
+    var badge_sz = Float32(24.0)
+    var by = row.center_y() - badge_sz * Float32(0.5)
+    ui.draw_list.add_card_surface(
+        row.x, by, badge_sz, badge_sz,
+        rgba8_scale_alpha(accent, Float32(0.16)),
+        rgba8_with_alpha(accent, 92),
+        RADIUS_SM, 1.0, True, False,
+    )
+    draw_studio_icon(ui.draw_list, entity_kind_icon(kind), row.x + Float32(5.0), by + Float32(5.0), Float32(14.0), accent, Float32(1.5))
+
+    var type_lbl = String(types[max(0, min(kind, len(types) - 1))])
+    var id_lbl = "#" + String(entity_id)
+    var tx = row.x + badge_sz + Float32(8.0)
+    var type_w = ui._measure_text_styled(type_lbl, theme.font_caption, UI_FONT_BOLD)
+    var id_w = max(Float32(22.0), ui._measure_text_styled(id_lbl, theme.font_mono, UI_FONT_MONO) + Float32(10.0))
+
+    # Right-aligned parent context if room permits
+    var right_lim = row.right() - Float32(2.0)
+    var parent_room = right_lim - (tx + type_w + Float32(6.0) + id_w + Float32(10.0))
+    if parent_name.byte_length() > 0 and parent_room >= Float32(52.0):
+        var p_w = min(parent_room, ui._measure_text_styled(parent_name, theme.font_caption, UI_FONT_REGULAR) + Float32(4.0))
+        ui.draw_text_in_rect(
+            RectF(right_lim - p_w, row.y, p_w, row.h),
+            parent_name,
+            theme.font_caption,
+            theme.text_muted,
+            UI_ALIGN_RIGHT,
+            UI_FONT_REGULAR,
+            Float32(0.0),
+            True,
+            False,
+        )
+        right_lim -= p_w + Float32(8.0)
+
+    var avail_type = max(Float32(20.0), right_lim - tx - id_w - Float32(6.0))
+    var actual_type_w = min(type_w, avail_type)
+    ui.draw_text_in_rect(
+        RectF(tx, row.y, actual_type_w, row.h),
+        type_lbl,
+        theme.font_caption,
+        theme.text_primary,
+        UI_ALIGN_LEFT,
+        UI_FONT_BOLD,
+        Float32(0.0),
+        True,
+        False,
+    )
+    var id_x = tx + actual_type_w + Float32(6.0)
+    if id_x + Float32(18.0) <= right_lim:
+        var cw = min(id_w, right_lim - id_x)
+        var chip_r = RectF(id_x, row.center_y() - Float32(8.0), cw, Float32(16.0))
+        ui.draw_list.add_rect(chip_r.x, chip_r.y, chip_r.w, chip_r.h, theme.l0_canvas, RADIUS_XS, Float32(1.0), theme.border_subtle)
+        ui.draw_text_in_rect(chip_r, id_lbl, theme.font_mono, theme.text_secondary, UI_ALIGN_CENTER, UI_FONT_MONO, Float32(2.0), True, False)
 
 
 def draw_inspector_panel_v2(
@@ -1157,33 +1916,11 @@ def draw_inspector_panel_v2(
 
     # ---- Empty Selection State Card ----
     if not entity.has_selection:
-        var card_w = max(Float32(140.0), min(panel_rect.w - pad * Float32(2.0), Float32(260.0)))
-        var card_h = Float32(156.0)
-        var card_x = panel_rect.x + (panel_rect.w - card_w) * Float32(0.5)
-        var card_y = panel_rect.y + min(Float32(48.0), max(Float32(14.0), (panel_rect.h - card_h) * Float32(0.28)))
-        ui.draw_list.add_rect_styled(
-            card_x, card_y, card_w, card_h,
-            theme.l2_card, theme.border_subtle,
-            RADIUS_MD, 1.0, 1.0, UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
-        )
-        var badge_sz = Float32(36.0)
-        var bx = card_x + (card_w - badge_sz) * Float32(0.5)
-        var by = card_y + Float32(18.0)
-        ui.draw_list.add_rect_styled(bx, by, badge_sz, badge_sz, theme.accent_soft, rgba8_with_alpha(theme.accent_primary, 96), RADIUS_MD, 1.0, 1.0, UI_FLAG_BORDER)
-        draw_studio_icon(ui.draw_list, ICON_CUBE, bx + Float32(9.0), by + Float32(9.0), Float32(18.0), theme.accent_primary, Float32(1.5))
-
-        var t1 = "No Entity Selected"
-        var tw1 = ui._measure_text(t1, theme.font_title)
-        ui._draw_text(t1, card_x + max(Float32(8.0), (card_w - tw1) * Float32(0.5)), by + badge_sz + Float32(10.0), theme.font_title, theme.text_primary)
-        var t2 = ui._truncate_text_ellipsis("Select in Viewport or press Ctrl+K", card_w - Float32(20.0), theme.font_caption)
-        var tw2 = ui._measure_text(t2, theme.font_caption)
-        ui._draw_text(t2, card_x + max(Float32(8.0), (card_w - tw2) * Float32(0.5)), by + badge_sz + Float32(30.0), theme.font_caption, theme.text_muted)
-
-        var cta_w = min(Float32(148.0), card_w - Float32(32.0))
-        var cta_r = RectF(card_x + (card_w - cta_w) * Float32(0.5), card_y + card_h - Float32(38.0), cta_w, Float32(26.0))
-        if _click_rect_button(ui, ui.widget_id("insp_empty_spawn"), cta_r, "Spawn Entity", theme, ICON_PLUS, True, theme.accent_primary, False):
+        var empty_box = RectF(panel_rect.x + pad, panel_rect.y + pad, max(Float32(120.0), panel_rect.w - pad * Float32(2.0)), max(Float32(40.0), panel_rect.h - pad * Float32(2.0)))
+        _push_panel_box(ui, "insp_v2_empty", empty_box, gap=Float32(0.0), pad=Float32(0.0))
+        if draw_inspector_empty_state(ui, empty_box.w, empty_box.h):
             act.spawn_entity_clicked = True
-
+        _pop_panel_box(ui)
         ui.draw_list.pop_clip()
         return act^
 
@@ -1194,33 +1931,29 @@ def draw_inspector_panel_v2(
     var inner_rect = RectF(panel_rect.x + pad, content_top, card_w, Float32(4000.0))
     _push_panel_box(ui, "insp_v2_body", inner_rect, gap=Float32(8.0), pad=Float32(0.0))
 
-    # ---- 1. Entity Header Card ----
+    # ---- 1. Unified Entity Header Card ----
     var hdr_y = ui.box_stack[len(ui.box_stack) - 1].cursor_y
-    var hdr_h = Float32(66.0)
+    var hdr_h = Float32(68.0)
     var hdr_r = RectF(inner_rect.x, hdr_y, card_w, hdr_h)
-    ui.draw_list.add_rect_styled(
-        hdr_r.x, hdr_r.y, hdr_r.w, hdr_r.h,
-        theme.l2_card, theme.border_subtle,
-        RADIUS_MD, 1.0, 1.0, UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
-    )
+    ui.draw_list.add_card_surface(hdr_r.x, hdr_r.y, hdr_r.w, hdr_r.h, theme.l2_card, theme.border_subtle, RADIUS_MD, 1.0, True, False)
 
-    # Large entity semantic icon badge
+    # 28x28 entity semantic icon badge
     var ico_col = entity_kind_color(entity.entity_kind, theme)
-    var ib_r = RectF(hdr_r.x + Float32(10.0), hdr_r.y + Float32(10.0), Float32(30.0), Float32(30.0))
-    ui.draw_list.add_rect_styled(ib_r.x, ib_r.y, ib_r.w, ib_r.h, rgba8_scale_alpha(ico_col, Float32(0.18)), rgba8_with_alpha(ico_col, 90), RADIUS_SM, 1.0, 1.0, UI_FLAG_BORDER)
-    draw_studio_icon(ui.draw_list, entity_kind_icon(entity.entity_kind), ib_r.x + Float32(7.0), ib_r.y + Float32(7.0), Float32(16.0), ico_col, Float32(1.5))
+    var ib_r = RectF(hdr_r.x + Float32(10.0), hdr_r.y + Float32(10.0), Float32(28.0), Float32(28.0))
+    ui.draw_list.add_card_surface(ib_r.x, ib_r.y, ib_r.w, ib_r.h, rgba8_scale_alpha(ico_col, Float32(0.18)), rgba8_with_alpha(ico_col, 96), RADIUS_SM, 1.0, True, False)
+    draw_studio_icon(ui.draw_list, entity_kind_icon(entity.entity_kind), ib_r.x + Float32(6.0), ib_r.y + Float32(6.0), Float32(16.0), ico_col, Float32(1.5))
 
     # Active toggle switch at top-right of Entity Header Card
     var en_val = entity.enabled
-    var tog_r = RectF(hdr_r.right() - Float32(44.0), hdr_r.y + Float32(14.0), Float32(34.0), Float32(18.0))
+    var tog_r = RectF(hdr_r.right() - Float32(42.0), hdr_r.y + Float32(15.0), Float32(32.0), Float32(17.0))
     if _draw_compact_toggle(ui, ui.widget_id("insp_v2_enabled"), tog_r, en_val, theme):
         act.changed_enabled = True
         act.new_enabled = en_val
 
-    # Editable name field (clean borderless look until hovered/focused)
+    # Editable Bold name field (clean borderless look until hovered/focused, UTF-8 safe)
     var name_x = ib_r.right() + Float32(8.0)
     var name_w = max(Float32(60.0), tog_r.x - name_x - Float32(8.0))
-    var name_r = RectF(name_x, hdr_r.y + Float32(10.0), name_w, Float32(22.0))
+    var name_r = RectF(name_x, hdr_r.y + Float32(11.0), name_w, Float32(24.0))
     var name_wid = ui.widget_id("insp_v2_name")
     var name_hov = (not ptr_blocked) and name_r.contains(ui.mouse_x, ui.mouse_y)
     if name_hov:
@@ -1238,8 +1971,8 @@ def draw_inspector_panel_v2(
             ui.focused_id = 0
             ui._focused_text_id = 0
         elif ui.key_bs_pressed and edit_name.byte_length() > 0:
-            var next_n = String(edit_name[byte=0 : edit_name.byte_length() - 1])
-            edit_name = next_n
+            var cps = decode_utf8(edit_name)
+            edit_name = encode_utf8(cps, 0, max(0, len(cps) - 1))
             act.changed_name = True
             act.new_name = edit_name
         elif ui.text_utf8.byte_length() > 0 and not ui.key_ctrl:
@@ -1247,27 +1980,35 @@ def draw_inspector_panel_v2(
             act.changed_name = True
             act.new_name = edit_name
     if name_foc or name_hov:
-        ui.draw_list.add_rect_styled(
+        ui.draw_list.add_recessed_well(
             name_r.x, name_r.y, name_r.w, name_r.h,
             theme.l0_canvas if name_foc else theme.l3_raised,
-            theme.focus_ring if name_foc else theme.border_control,
-            RADIUS_XS, 1.0, 1.0, UI_FLAG_BORDER,
+            theme.border_control,
+            RADIUS_XS, 1.0, name_foc, theme.focus_ring,
         )
-    var name_disp = ui._truncate_text_ellipsis(edit_name, max(Float32(20.0), name_r.w - Float32(8.0)), theme.font_title)
-    ui._draw_text(name_disp, name_r.x + Float32(4.0), name_r.center_y() - theme.font_title * Float32(0.5), theme.font_title, theme.text_primary)
+    ui.draw_text_in_rect(name_r, edit_name, theme.font_title, theme.text_primary, UI_ALIGN_LEFT, UI_FONT_BOLD, Float32(4.0), True, False)
 
-    # Subtitle pills: Entity ID + Archetype + Parent (or Multi-Select badge)
-    var pill_y = hdr_r.y + Float32(40.0)
+    # Subtitle pills: `#id · Archetype · Parent` (or Multi-Select badge)
+    var pill_y = hdr_r.y + Float32(43.0)
     var px_cur = hdr_r.x + Float32(10.0)
     if entity.selected_count > 1:
-        px_cur += ui.badge_pill("Multi (" + String(entity.selected_count) + ")", theme.accent_soft, theme.accent_primary, px_cur, pill_y, Float32(18.0), False) + Float32(5.0)
+        px_cur += ui.badge_pill("Multi (" + String(entity.selected_count) + ")", theme.accent_soft, theme.accent_primary, px_cur, pill_y, Float32(17.0), False) + Float32(5.0)
     else:
-        px_cur += ui.badge_pill("#" + String(entity.entity_id), theme.l3_raised, theme.text_secondary, px_cur, pill_y, Float32(18.0), False) + Float32(5.0)
+        px_cur += ui.badge_pill("#" + String(entity.entity_id), theme.l0_canvas, theme.text_secondary, px_cur, pill_y, Float32(17.0), False) + Float32(5.0)
     if px_cur + Float32(54.0) < hdr_r.right() - Float32(8.0):
-        px_cur += ui.badge_pill(entity.archetype_label, theme.l3_raised, ico_col, px_cur, pill_y, Float32(18.0), False) + Float32(5.0)
-    if entity.parent_name.byte_length() > 0 and px_cur + Float32(44.0) < hdr_r.right() - Float32(8.0):
-        var p_txt = ui._truncate_text_ellipsis(entity.parent_name, max(Float32(20.0), hdr_r.right() - px_cur - Float32(16.0)), theme.font_caption)
-        ui._draw_text(p_txt, px_cur, pill_y + Float32(3.0), theme.font_caption, theme.text_muted)
+        px_cur += ui.badge_pill(entity.archetype_label, theme.l3_raised, ico_col, px_cur, pill_y, Float32(17.0), False) + Float32(6.0)
+    if entity.parent_name.byte_length() > 0 and px_cur + Float32(40.0) < hdr_r.right() - Float32(8.0):
+        ui.draw_text_in_rect(
+            RectF(px_cur, pill_y, max(Float32(20.0), hdr_r.right() - px_cur - Float32(10.0)), Float32(17.0)),
+            entity.parent_name,
+            theme.font_caption,
+            theme.text_muted,
+            UI_ALIGN_LEFT,
+            UI_FONT_REGULAR,
+            Float32(0.0),
+            True,
+            False,
+        )
 
     ui.box_stack[len(ui.box_stack) - 1].cursor_y = hdr_r.bottom() + Float32(8.0)
 
@@ -1551,17 +2292,12 @@ def draw_inspector_panel_v2(
     var total_content_h = ui.box_stack[len(ui.box_stack) - 1].cursor_y - content_top + Float32(12.0)
     _pop_panel_box(ui)
 
-    # Wheel scroll & slim scrollbar
+    # Wheel scroll & draggable sleek 4px -> 6px scrollbar
     var max_scroll = max(Float32(0.0), total_content_h - max(Float32(1.0), panel_rect.h - pad * Float32(2.0)))
     if (not ptr_blocked) and panel_rect.contains(ui.mouse_x, ui.mouse_y) and ui.mouse_wheel != Float32(0.0):
         state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y - ui.mouse_wheel * Float32(36.0)))
     state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y))
-
-    if max_scroll > Float32(0.5):
-        var track_h = max(Float32(16.0), panel_rect.h - Float32(12.0))
-        var thumb_h = max(Float32(24.0), track_h * (panel_rect.h / max(Float32(1.0), total_content_h)))
-        var thumb_y = panel_rect.y + Float32(6.0) + (state.scroll_y / max_scroll) * max(Float32(1.0), track_h - thumb_h)
-        ui.draw_list.add_rect(panel_rect.right() - Float32(6.0), thumb_y, Float32(4.0), thumb_h, theme.border_strong, Float32(2.0))
+    _draw_slim_scrollbar(ui, ui.widget_id("insp_v2_scrollbar"), panel_rect, total_content_h + pad * Float32(2.0), state.scroll_y, theme, ptr_blocked)
 
     ui.draw_list.pop_clip()
     return act^
@@ -1581,12 +2317,16 @@ def draw_asset_browser_panel_v2(
     mcp_clients: Int,
     mut state: AssetBrowserPanelState,
 ) -> AssetBrowserAction:
-    """Renders the Obsidian v2 Asset & Content Drawer with breadcrumbs, type filter pills,
-    left folder tree, quick-spawn strip, and responsive `L2_card` visual asset tiles
-    (double-click `.mojo` routes to `CodeDrawer`)."""
+    """Renders the Obsidian & Flint Ember Asset & Content Drawer with unified 34px toolbar
+    (interactive breadcrumb + count chip + type filter pills + Create/Refresh/+Import),
+    conditional folder rail when subfolders exist, crafted Two-Zone Empty State / Compact HiDPI
+    Fallback, and responsive 92x100 `L2_card` visual asset tiles (double-click `.mojo` routes
+    to `CodeDrawer`)."""
     var act = AssetBrowserAction()
-    if panel_rect.w < Float32(120.0) or panel_rect.h < Float32(60.0):
+    if panel_rect.w < Float32(120.0) or panel_rect.h < Float32(52.0):
         return act^
+    _ = mounted_packs
+    _ = mcp_clients
 
     ui.set_studio_theme(theme.copy())
     ui.draw_list.push_clip(Int(panel_rect.x), Int(panel_rect.y), Int(panel_rect.right()), Int(panel_rect.bottom()))
@@ -1595,100 +2335,103 @@ def draw_asset_browser_panel_v2(
     var blocked = ui._blocked_by_modal()
     var ptr_blocked = blocked or ui._is_pointer_blocked_by_popup()
 
-    # ---- Top Bar (32px): Breadcrumb + Type Filter Pills + Actions ----
-    var bar_h = Float32(32.0)
+    # ---- Top Bar (34px): Breadcrumb + Count + Type Filter Pills + Actions ----
+    var bar_h = Float32(34.0)
+    var pill_h = Float32(24.0)
     var bar_y = panel_rect.y + Float32(5.0)
-    var pill_h = Float32(22.0)
     var cx = panel_rect.x + Float32(8.0)
 
-    # Breadcrumb root pill
-    var root_bc_w = Float32(58.0)
-    if _click_rect_button(ui, ui.widget_id("ab_v2_bc_root"), RectF(cx, bar_y, root_bc_w, pill_h), "Assets", theme, ICON_FOLDER, state.active_folder.byte_length() == 0, theme.accent_primary, True):
+    # Interactive breadcrumb root pill (`Project`)
+    var root_bc_w = Float32(72.0)
+    if _click_rect_button(ui, ui.widget_id("ab_v2_bc_root"), RectF(cx, bar_y, root_bc_w, pill_h), "Project", theme, ICON_FOLDER, state.active_folder.byte_length() == 0, theme.accent_primary, True, True):
         state.active_folder = String("")
-    cx += root_bc_w + Float32(4.0)
+    cx += root_bc_w + Float32(5.0)
 
     if state.active_folder.byte_length() > 0:
-        ui._draw_text("/", cx, bar_y + Float32(4.0), theme.font_caption, theme.text_muted)
+        ui.draw_text_in_rect(RectF(cx, bar_y, Float32(8.0), pill_h), "/", theme.font_caption, theme.text_muted, UI_ALIGN_CENTER, UI_FONT_REGULAR, Float32(0.0), False, False)
         cx += Float32(9.0)
-        var f_lbl = ui._truncate_text_ellipsis(state.active_folder, Float32(90.0), theme.font_caption)
-        var fw = max(Float32(42.0), ui._measure_text(f_lbl, theme.font_caption) + Float32(14.0))
-        _ = ui.badge_pill(f_lbl, theme.accent_soft, theme.accent_primary, cx, bar_y + Float32(1.0), Float32(20.0), False)
+        var f_lbl = ui._truncate_text_ellipsis(state.active_folder, Float32(96.0), theme.font_caption)
+        var fw = max(Float32(42.0), ui._measure_text_styled(f_lbl, theme.font_caption, UI_FONT_REGULAR) + Float32(14.0))
+        _ = ui.badge_pill(f_lbl, theme.accent_soft, theme.accent_primary, cx, bar_y + Float32(2.0), Float32(20.0), False)
         cx += fw + Float32(6.0)
+    elif len(tiles) > 0 and panel_rect.w >= Float32(360.0):
+        var cnt_txt = String(len(tiles))
+        var cnt_w = max(Float32(22.0), ui._measure_text_styled(cnt_txt, theme.font_mono, UI_FONT_MONO) + Float32(10.0))
+        var cnt_r = RectF(cx, bar_y + Float32(3.0), cnt_w, Float32(18.0))
+        ui.draw_list.add_rect(cnt_r.x, cnt_r.y, cnt_r.w, cnt_r.h, theme.l0_canvas, RADIUS_PILL, Float32(1.0), theme.border_subtle)
+        ui.draw_text_in_rect(cnt_r, cnt_txt, theme.font_mono, theme.text_secondary, UI_ALIGN_CENTER, UI_FONT_MONO, Float32(2.0), False, False)
+        cx += cnt_w + Float32(8.0)
 
-    # Right-side action buttons (`Import`, `Rescan`, subtle pack/MCP pill)
+    # Right-side action buttons (`+ Import`, `Refresh`)
     var right_x = panel_rect.right() - Float32(8.0)
-    var imp_w = Float32(58.0)
+    var imp_w = Float32(76.0) if panel_rect.w >= Float32(290.0) else Float32(26.0)
     var imp_r = RectF(right_x - imp_w, bar_y, imp_w, pill_h)
-    if _click_rect_button(ui, ui.widget_id("ab_v2_import"), imp_r, "Import", theme, ICON_PLUS, False, theme.accent_primary, True):
+    if _click_rect_button(ui, ui.widget_id("ab_v2_import"), imp_r, "Import" if imp_w > Float32(30.0) else "", theme, ICON_PLUS, True, theme.accent_primary, True, True):
         act.import_clicked = True
-    right_x = imp_r.x - Float32(4.0)
+    right_x = imp_r.x - Float32(5.0)
 
-    var res_w = Float32(24.0)
+    var res_w = Float32(26.0)
     var res_r = RectF(right_x - res_w, bar_y, res_w, pill_h)
-    if _click_rect_button(ui, ui.widget_id("ab_v2_rescan"), res_r, "", theme, ICON_REFRESH, False, theme.accent_primary, True):
+    var res_wid = ui.widget_id("ab_v2_rescan")
+    if _click_rect_button(ui, res_wid, res_r, "", theme, ICON_REFRESH, False, theme.accent_primary, True):
         act.rescan_clicked = True
-    right_x = res_r.x - Float32(6.0)
-
-    if panel_rect.w >= Float32(580.0):
-        var status_txt = "pk:" + String(mounted_packs) + " · mcp:" + String(mcp_clients)
-        var st_w = max(Float32(68.0), ui._measure_text(status_txt, theme.font_caption) + Float32(14.0))
-        var st_col = theme.agent_active if mcp_clients > 0 else theme.text_muted
-        _ = ui.badge_pill(status_txt, theme.l2_card, st_col, right_x - st_w, bar_y + Float32(1.0), Float32(20.0), False)
-        right_x -= st_w + Float32(6.0)
+    if ui.hovered_id == res_wid:
+        ui.queue_tooltip_rect(res_wid, res_r, "Rescan project assets")
+    right_x = res_r.x - Float32(8.0)
 
     # Type filter pills (`All | Scenes | Meshes | Materials | Audio | Scripts | Prefabs`)
-    var filter_names = [
-        String("All"),
-        String("Scenes"),
-        String("Meshes"),
-        String("Materials"),
-        String("Audio"),
-        String("Scripts"),
-        String("Prefabs"),
-    ]
-    for fi in range(len(filter_names)):
-        var fw = max(Float32(34.0), ui._measure_text(filter_names[fi], theme.font_caption) + Float32(14.0))
-        if cx + fw > right_x - Float32(4.0):
-            break
-        var fr = RectF(cx, bar_y, fw, pill_h)
-        var f_acc = asset_filter_accent(fi, theme) if fi > 0 else theme.accent_primary
-        if _click_rect_button(ui, ui.widget_id("ab_v2_f_" + String(fi)), fr, filter_names[fi], theme, -1, state.active_filter == fi, f_acc, True):
-            state.active_filter = fi
-        cx += fw + Float32(3.0)
+    if panel_rect.w >= Float32(460.0):
+        var filter_names = [
+            String("All"),
+            String("Scenes"),
+            String("Meshes"),
+            String("Materials"),
+            String("Audio"),
+            String("Scripts"),
+            String("Prefabs"),
+        ]
+        for fi in range(len(filter_names)):
+            var fw = max(Float32(34.0), ui._measure_text_styled(filter_names[fi], theme.font_caption, UI_FONT_BOLD if state.active_filter == fi else UI_FONT_REGULAR) + Float32(14.0))
+            if cx + fw > right_x - Float32(4.0):
+                break
+            var fr = RectF(cx, bar_y, fw, pill_h)
+            var f_acc = asset_filter_accent(fi, theme) if fi > 0 else theme.accent_primary
+            if _click_rect_button(ui, ui.widget_id("ab_v2_f_" + String(fi)), fr, filter_names[fi], theme, -1, state.active_filter == fi, f_acc, True):
+                state.active_filter = fi
+            cx += fw + Float32(4.0)
 
     var body_y = panel_rect.y + bar_h
     ui.draw_list.add_line(panel_rect.x, body_y, panel_rect.right(), body_y, Float32(1.0), theme.border_subtle)
 
-    # ---- Left Folder Tree (when wide enough) ----
-    var show_tree = panel_rect.w >= Float32(420.0)
-    var tree_w = Float32(132.0) if show_tree else Float32(0.0)
+    # Collect unique folders; show Left Folder Tree ONLY when subfolders actually exist!
+    var folders = List[String]()
+    folders.append(String(""))
+    for ti in range(len(tiles)):
+        var f = tiles[ti].folder
+        if f.byte_length() == 0:
+            continue
+        var seen = False
+        for fj in range(len(folders)):
+            if folders[fj] == f:
+                seen = True
+                break
+        if not seen:
+            folders.append(f)
+
+    var show_tree = len(folders) > 1 and panel_rect.w >= Float32(460.0)
+    var tree_w = Float32(136.0) if show_tree else Float32(0.0)
     if show_tree:
         var tree_r = RectF(panel_rect.x, body_y, tree_w, max(Float32(10.0), panel_rect.bottom() - body_y))
         ui.draw_list.add_rect(tree_r.x, tree_r.y, tree_r.w, tree_r.h, theme.l0_canvas)
         ui.draw_list.add_line(tree_r.right(), tree_r.y, tree_r.right(), tree_r.bottom(), Float32(1.0), theme.border_subtle)
 
-        # Unique folders from tiles
-        var folders = List[String]()
-        folders.append(String(""))
-        for ti in range(len(tiles)):
-            var f = tiles[ti].folder
-            if f.byte_length() == 0:
-                continue
-            var seen = False
-            for fj in range(len(folders)):
-                if folders[fj] == f:
-                    seen = True
-                    break
-            if not seen:
-                folders.append(f)
-
         var fy = tree_r.y + Float32(6.0)
         for fi in range(len(folders)):
-            if fy + Float32(22.0) > tree_r.bottom():
+            if fy + Float32(24.0) > tree_r.bottom():
                 break
             var f_key = folders[fi]
             var f_lbl = String("All Assets") if f_key.byte_length() == 0 else f_key
-            var fr = RectF(tree_r.x + Float32(4.0), fy, tree_r.w - Float32(8.0), Float32(22.0))
+            var fr = RectF(tree_r.x + Float32(5.0), fy, tree_r.w - Float32(10.0), Float32(22.0))
             var is_sel = state.active_folder == f_key
             var hov = (not ptr_blocked) and fr.contains(ui.mouse_x, ui.mouse_y)
             if hov:
@@ -1697,38 +2440,22 @@ def draw_asset_browser_panel_v2(
                 if ui.mouse_pressed_l:
                     state.active_folder = f_key
             if is_sel:
-                ui.draw_list.add_rect(fr.x, fr.y, fr.w, fr.h, theme.accent_soft, RADIUS_XS)
+                ui.draw_list.add_rect_styled(fr.x, fr.y, fr.w, fr.h, theme.accent_soft, rgba8_with_alpha(theme.accent_primary, 76), RADIUS_XS, 1.0, 1.0, UI_FLAG_BORDER)
             elif hov:
                 ui.draw_list.add_rect(fr.x, fr.y, fr.w, fr.h, theme.l2_card, RADIUS_XS)
-            draw_studio_icon(ui.draw_list, ICON_FOLDER, fr.x + Float32(5.0), fr.center_y() - Float32(6.0), Float32(12.0), theme.accent_primary if is_sel else theme.text_muted, Float32(1.3))
-            var d_txt = ui._truncate_text_ellipsis(f_lbl, max(Float32(20.0), fr.w - Float32(24.0)), theme.font_caption)
-            ui._draw_text(d_txt, fr.x + Float32(21.0), fr.center_y() - theme.font_caption * Float32(0.5), theme.font_caption, theme.text_primary if is_sel else theme.text_secondary)
+            draw_studio_icon(ui.draw_list, ICON_FOLDER, fr.x + Float32(6.0), fr.center_y() - Float32(6.0), Float32(12.0), theme.accent_primary if is_sel else theme.text_muted, Float32(1.3))
+            ui.draw_text_in_rect(
+                RectF(fr.x + Float32(22.0), fr.y, max(Float32(16.0), fr.w - Float32(26.0)), fr.h),
+                f_lbl,
+                theme.font_caption,
+                theme.text_primary if is_sel else theme.text_secondary,
+                UI_ALIGN_LEFT,
+                UI_FONT_BOLD if is_sel else UI_FONT_REGULAR,
+                Float32(0.0),
+                True,
+                False,
+            )
             fy += Float32(24.0)
-
-    # ---- Right Content Area: Quick-Spawn Strip + Responsive Visual Asset Tile Grid ----
-    var grid_area = RectF(
-        panel_rect.x + tree_w + Float32(8.0),
-        body_y + Float32(6.0),
-        max(Float32(80.0), panel_rect.w - tree_w - Float32(16.0)),
-        max(Float32(20.0), panel_rect.bottom() - body_y - Float32(10.0)),
-    )
-
-    # Compact Quick-Spawn Strip (1-click entity presets with crisp semantic icons)
-    var spawn_h = Float32(24.0)
-    var sp_labels = [String("Empty"), String("Cube"), String("Point"), String("Spot"), String("Camera"), String("Audio")]
-    var sp_icons = [ICON_EMPTY, ICON_CUBE, ICON_LIGHT_POINT, ICON_LIGHT_SPOT, ICON_CAMERA, ICON_AUDIO]
-    var sx = grid_area.x
-    for si in range(len(sp_labels)):
-        var sw = max(Float32(56.0), ui._measure_text(sp_labels[si], theme.font_caption) + Float32(28.0))
-        if sx + sw > grid_area.right():
-            break
-        var sr = RectF(sx, grid_area.y, sw, Float32(22.0))
-        if _click_rect_button(ui, ui.widget_id("ab_v2_spawn_" + String(si)), sr, sp_labels[si], theme, sp_icons[si], False, theme.accent_primary, True):
-            act.spawn_preset_kind = si
-        sx += sw + Float32(4.0)
-
-    var tiles_rect = RectF(grid_area.x, grid_area.y + spawn_h + Float32(4.0), grid_area.w, max(Float32(16.0), grid_area.h - spawn_h - Float32(4.0)))
-    ui.draw_list.push_clip(Int(tiles_rect.x), Int(tiles_rect.y), Int(tiles_rect.right()), Int(tiles_rect.bottom()))
 
     # Filter matching tiles
     var filtered = List[Int](capacity=len(tiles))
@@ -1740,35 +2467,42 @@ def draw_asset_browser_panel_v2(
             continue
         filtered.append(ti)
 
+    var content_area = RectF(
+        panel_rect.x + tree_w + Float32(8.0),
+        body_y + Float32(8.0),
+        max(Float32(80.0), panel_rect.w - tree_w - Float32(16.0)),
+        max(Float32(16.0), panel_rect.bottom() - body_y - Float32(16.0)),
+    )
+
     if len(filtered) == 0:
-        # Clean empty state guidance
-        var ey = tiles_rect.y + min(Float32(16.0), max(Float32(4.0), (tiles_rect.h - Float32(40.0)) * Float32(0.3)))
-        var ex = tiles_rect.x + Float32(4.0)
-        draw_studio_icon(ui.draw_list, ICON_SPARK, ex, ey, Float32(16.0), theme.text_muted, Float32(1.3))
-        var msg = ui._truncate_text_ellipsis(
-            "No assets in this view — spawn a primitive above, import .glb/.flmat/.mojo, or ask an Agent",
-            max(Float32(60.0), tiles_rect.w - Float32(28.0)),
-            theme.font_caption,
-        )
-        ui._draw_text(msg, ex + Float32(22.0), ey + Float32(2.0), theme.font_caption, theme.text_muted)
+        # Deliberately crafted Two-Zone Empty State (or Compact HiDPI Fallback when short!)
+        var deck_res = draw_asset_empty_deck(ui, content_area, theme, len(tiles) > 0)
+        if deck_res[0]:
+            act.import_clicked = True
+        if deck_res[1] >= 0:
+            act.spawn_preset_kind = deck_res[1]
     else:
-        var tile_w = ASSET_CARD_W
-        var tile_h = ASSET_CARD_H
+        # Responsive 92x100 Visual Asset Card Grid
+        var tile_w = max(ASSET_CARD_W, Float32(92.0))
+        var tile_h = max(ASSET_CARD_H, Float32(100.0))
         var gap = Float32(8.0)
-        var cols = max(1, Int((tiles_rect.w + gap) / (tile_w + gap)))
+        var sb_pad = Float32(10.0)
+        var grid_w = max(tile_w, content_area.w - sb_pad)
+        var cols = max(1, Int((grid_w + gap) / (tile_w + gap)))
         var n_rows = (len(filtered) + cols - 1) // cols
-        var content_h = Float32(n_rows) * (tile_h + gap) + Float32(8.0)
-        var max_scroll = max(Float32(0.0), content_h - tiles_rect.h)
-        if (not ptr_blocked) and tiles_rect.contains(ui.mouse_x, ui.mouse_y) and ui.mouse_wheel != Float32(0.0):
+        var content_h = Float32(n_rows) * (tile_h + gap) + Float32(4.0)
+        var max_scroll = max(Float32(0.0), content_h - content_area.h)
+        if (not ptr_blocked) and content_area.contains(ui.mouse_x, ui.mouse_y) and ui.mouse_wheel != Float32(0.0):
             state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y - ui.mouse_wheel * Float32(36.0)))
         state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y))
 
+        ui.draw_list.push_clip(Int(content_area.x), Int(content_area.y), Int(content_area.right()), Int(content_area.bottom()))
         for idx in range(len(filtered)):
             var r_idx = idx // cols
             var c_idx = idx % cols
-            var tx = tiles_rect.x + Float32(c_idx) * (tile_w + gap)
-            var ty = tiles_rect.y + Float32(r_idx) * (tile_h + gap) - state.scroll_y
-            if ty + tile_h < tiles_rect.y or ty > tiles_rect.bottom():
+            var tx = content_area.x + Float32(c_idx) * (tile_w + gap)
+            var ty = content_area.y + Float32(r_idx) * (tile_h + gap) - state.scroll_y
+            if ty + tile_h < content_area.y or ty > content_area.bottom():
                 ui.culled_items_this_frame += 1
                 continue
 
@@ -1776,50 +2510,9 @@ def draw_asset_browser_panel_v2(
             var tr = RectF(tx, ty, tile_w, tile_h)
             var twid = ui.widget_id("ab_tile_" + item.rel_path)
             var is_sel = state.selected_path == item.rel_path
-            var hov = (not ptr_blocked) and tr.contains(ui.mouse_x, ui.mouse_y)
-            if hov:
-                ui.hovered_id = twid
-                ui.hovered_rect = ui._clip_hovered_rect(tr)
-
-            var accent = asset_filter_accent(item.filter_kind, theme)
-            var bg = theme.l3_raised if (is_sel or hov) else theme.l2_card
-            var brd = accent if is_sel else (theme.border_strong if hov else theme.border_subtle)
-
-            # L2_card tile shell + top bevel
-            ui.draw_list.add_rect_styled(
-                tr.x, tr.y, tr.w, tr.h,
-                bg, brd,
-                RADIUS_MD, 1.0, 1.0, UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
-            )
-            # Colored 3px top accent strip
-            ui.draw_list.add_rounded_rect_ex(
-                tr.x + Float32(1.0), tr.y + Float32(1.0), tr.w - Float32(2.0), Float32(3.0),
-                accent, RADIUS_MD - Float32(1.0), RADIUS_MD - Float32(1.0), Float32(0.0), Float32(0.0),
-            )
-            # Recessed preview well + large semantic icon
-            var well = RectF(tr.x + Float32(6.0), tr.y + Float32(9.0), tr.w - Float32(12.0), Float32(48.0))
-            ui.draw_list.add_rect(well.x, well.y, well.w, well.h, theme.l1_shell, RADIUS_SM)
-            if (item.swatch_rgba8 >> 24) != 0:
-                ui.draw_list.add_circle(well.center_x(), well.center_y(), Float32(14.0), item.swatch_rgba8, Float32(1.5), theme.border_strong)
-            else:
-                draw_studio_icon(ui.draw_list, item.icon_id, well.center_x() - Float32(13.0), well.center_y() - Float32(13.0), Float32(26.0), accent, Float32(1.6))
-
-            # Compact extension badge inside top-right of preview well
-            var ext_w = max(Float32(24.0), ui._measure_text(item.ext, Float32(9.5)) + Float32(6.0))
-            var ext_r = RectF(well.right() - ext_w - Float32(3.0), well.y + Float32(3.0), ext_w, Float32(13.0))
-            ui.draw_list.add_rect(ext_r.x, ext_r.y, ext_r.w, ext_r.h, rgba8_scale_alpha(theme.l0_canvas, Float32(0.82)), Float32(3.0))
-            var ext_tw = ui._measure_text(item.ext, Float32(9.5))
-            ui._draw_text(item.ext, ext_r.x + max(Float32(2.0), (ext_r.w - ext_tw) * Float32(0.5)), ext_r.y + Float32(1.5), Float32(9.5), accent)
-
-            # Truncated filename label
-            var lbl = ui._truncate_text_ellipsis(item.display_name, tr.w - Float32(10.0), theme.font_caption)
-            ui._draw_text(lbl, tr.x + Float32(6.0), well.bottom() + Float32(8.0), theme.font_caption, theme.text_primary)
-
-            # Click, double-click (`.mojo` -> CodeDrawer), and viewport drag-drop source
-            ui.last_item_id = twid
-            ui.last_item_rect = tr
+            var tile_res = draw_asset_card_tile(ui, twid, tr, item, is_sel, theme)
             _ = ui.begin_drag_source("ASSET_ENTRY", filtered[idx], item.rel_path)
-            if hov and ui.mouse_pressed_l:
+            if tile_res[0]:
                 state.selected_path = item.rel_path
                 act.selected_path = item.rel_path
                 var is_dbl = state.last_click_path == item.rel_path and (ui.ui_time_sec - state.last_click_time) <= Float32(0.40)
@@ -1833,6 +2526,8 @@ def draw_asset_browser_panel_v2(
                     state.last_click_path = item.rel_path
                     state.last_click_time = ui.ui_time_sec
 
-    ui.draw_list.pop_clip()
+        _draw_slim_scrollbar(ui, ui.widget_id("ab_v2_scrollbar"), content_area, content_h, state.scroll_y, theme, ptr_blocked)
+        ui.draw_list.pop_clip()
+
     ui.draw_list.pop_clip()
     return act^

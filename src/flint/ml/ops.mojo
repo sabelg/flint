@@ -10,7 +10,7 @@ from std.memory import bitcast
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
 from flint.ml.tensor import (
-    Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, numel_of, strides_of, shape_str,
+    Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, DT_BF16, bf16_round, numel_of, strides_of, shape_str,
     broadcast_shape, broadcast_offsets, norm_axis, fptr_at,
 )
 
@@ -430,6 +430,14 @@ def cast(x: Tensor, to: Int) raises -> Tensor:
     var n = x.numel()
     if n < 0 or n > MAX_RANGE_ELEMS:
         raise Error("cast: tensor shape overflow or exceeds maximum limit")
+    if to == DT_BF16:
+        # float32 storage rounded to bfloat16 precision (a Cast -> BFLOAT16 -> FLOAT round trip)
+        if not x.is_float():
+            raise Error("Cast to bfloat16 needs a float tensor")
+        var o = List[Float32](length=n, fill=0.0)
+        for e in range(n):
+            o[e] = bf16_round(x.fget(e))
+        return Tensor.floats(x.shape.copy(), o^)
     if to == DT_F32:
         if x.is_float():
             return x.reshaped(x.shape.copy())

@@ -12,13 +12,19 @@ from std.collections import List
 from std.math import isfinite
 from flint.render.font import SdfFont
 from flint.text.utf8 import decode_utf8, encode_utf8
-from flint.ui.animator import SpringConfig, UI_ANIM_INSTANT, UiAnimator
+from flint.ui.animator import (
+    SpringConfig,
+    TOAST_ANIM_EXITING,
+    UI_ANIM_INSTANT,
+    UiAnimator,
+)
 from flint.ui.draw_list import UI_FLAG_BORDER, UI_FLAG_TOP_BEVEL, UiDrawList
 from flint.ui.flexbox_dock import RectF
 from flint.ui.icons import draw_studio_icon
 from flint.ui.theme import (
     ICON_CHECK,
     ICON_CLOSE,
+    ICON_ERROR_CIRCLE,
     ICON_SPARK,
     ICON_WARN,
     StudioTheme,
@@ -134,6 +140,7 @@ struct ToastManager(Copyable, Movable):
     var next_id: UInt64
     var max_visible: Int
     var history_limit: Int
+    var paused_toast_id: UInt64
 
     def __init__(
         out self,
@@ -148,6 +155,7 @@ struct ToastManager(Copyable, Movable):
         self.next_id = UInt64(1)
         self.max_visible = max(1, max_visible)
         self.history_limit = max(1, history_limit)
+        self.paused_toast_id = UInt64(0)
 
     def __init__(out self, *, copy: Self):
         self.items = copy.items.copy()
@@ -158,6 +166,11 @@ struct ToastManager(Copyable, Movable):
         self.next_id = copy.next_id
         self.max_visible = copy.max_visible
         self.history_limit = copy.history_limit
+        self.paused_toast_id = copy.paused_toast_id
+
+    def set_hovered_toast(mut self, toast_id: UInt64):
+        """Pauses TTL countdown for `toast_id` while the pointer hovers it (`0` clears)."""
+        self.paused_toast_id = toast_id
 
     def note_user_typing(mut self):
         """Records active text/scrubber input so non-urgent background toasts wait for a pause."""
@@ -242,6 +255,8 @@ struct ToastManager(Copyable, Movable):
 
         for i in range(len(self.items)):
             if self.items[i].visible and (not self.items[i].held):
+                if self.items[i].id == self.paused_toast_id:
+                    continue
                 self.items[i].remaining_sec -= dt
                 if self.items[i].remaining_sec <= Float32(0.0):
                     self.items[i].remaining_sec = Float32(0.0)
@@ -268,6 +283,8 @@ struct ToastManager(Copyable, Movable):
         return cnt
 
     def dismiss(mut self, toast_id: UInt64):
+        if self.paused_toast_id == toast_id:
+            self.paused_toast_id = UInt64(0)
         for i in range(len(self.items)):
             if self.items[i].id == toast_id:
                 self.items[i].visible = False
@@ -275,6 +292,7 @@ struct ToastManager(Copyable, Movable):
                 return
 
     def dismiss_all(mut self):
+        self.paused_toast_id = UInt64(0)
         for i in range(len(self.items)):
             self.items[i].visible = False
             self.items[i].held = False
@@ -285,6 +303,7 @@ struct ToastManager(Copyable, Movable):
     def clear_history(mut self):
         self.items.clear()
         self.unread_count = 0
+        self.paused_toast_id = UInt64(0)
 
 
 # ============================================================================
@@ -650,98 +669,198 @@ def draw_toast_stack(
     mouse_y: Float32,
     mouse_pressed: Bool,
     top_offset: Float32 = 48.0,
+    hud_reserved_top: Float32 = 0.0,
 ) -> ToastDrawAction:
-    """Renders up to `max_visible` frosted-glass toasts anchored top-right inside `vp`."""
+    """Renders up to `max_visible` frosted-glass toasts anchored top-right inside `vp`.
+
+    Uses `UiAnimator.sync_toast` for 3-phase enter/hold/exit motion (`UI_ANIM_INSTANT`
+    snaps cleanly), pauses TTL while hovered, uses `ICON_ERROR_CIRCLE` + `22x22` tinted
+    severity badges, keeps all interactive hit targets >= `24x24 px`, and shifts cleanly
+    below wrapped viewport HUD rows / perf popovers.
+    """
     var act = ToastDrawAction()
     var vis = manager.visible_toasts()
-    if len(vis) == 0:
+
+    # Build render queue: active toasts + live-mode exiting toasts sliding out cleanly
+    var render_indices = List[Int](capacity=len(vis) + 2)
+    var render_active = List[Bool](capacity=len(vis) + 2)
+    for vi in range(len(vis)):
+        render_indices.append(vis[vi])
+        render_active.append(True)
+
+    if anim.mode != UI_ANIM_INSTANT and len(anim.toasts) > 0:
+        for ti in range(len(anim.toasts)):
+            var tid = anim.toasts[ti].id
+            var is_vis = False
+            for vi in range(len(vis)):
+                if manager.items[vis[vi]].id == tid:
+                    is_vis = True
+                    break
+            if is_vis:
+                continue
+            if anim.toasts[ti].state < TOAST_ANIM_EXITING:
+                _ = anim.sync_toast(tid, False)
+            if anim.toasts[ti].state == TOAST_ANIM_EXITING and len(render_indices) < manager.max_visible + 2:
+                for mi in range(len(manager.items) - 1, -1, -1):
+                    if manager.items[mi].id == tid:
+                        render_indices.append(mi)
+                        render_active.append(False)
+                        break
+
+    if len(render_indices) == 0:
+        manager.set_hovered_toast(UInt64(0))
         return act
 
-    var toast_w = min(Float32(316.0), max(Float32(180.0), vp.w - Float32(24.0)))
-    var cur_y = vp.y + top_offset
+    var toast_w = min(Float32(324.0), max(Float32(192.0), vp.w - Float32(24.0)))
+    var eff_top = top_offset if isfinite(top_offset) else Float32(48.0)
+    if isfinite(hud_reserved_top) and hud_reserved_top > Float32(0.0):
+        eff_top = max(eff_top, hud_reserved_top + Float32(8.0))
+    if vp.w < Float32(760.0):
+        # Clear wrapped 2nd-row viewport HUD cluster at narrow / 2x HiDPI widths
+        eff_top = max(eff_top, Float32(84.0))
+    var cur_y = vp.y + eff_top
+    var hovered_toast_id = UInt64(0)
 
-    for vi in range(len(vis)):
-        var idx = vis[vi]
+    for ri in range(len(render_indices)):
+        var idx = render_indices[ri]
+        var is_active = render_active[ri]
         ref item = manager.items[idx]
-        var wid = UInt64(0x544F4153540000) ^ item.id
-        var slide = anim.drive_aux(wid, Float32(1.0), SpringConfig.drawer())
-        if anim.mode == UI_ANIM_INSTANT:
-            slide = Float32(1.0)
-        var alpha = max(Float32(0.0), min(Float32(1.0), slide))
         var has_msg = item.message.byte_length() > 0
         var has_btn = item.action_label.byte_length() > 0
-        var toast_h = Float32(54.0) if (has_msg or has_btn) else Float32(36.0)
-        var tx = vp.right() - toast_w - Float32(12.0) + (Float32(1.0) - slide) * Float32(28.0)
+        var toast_h = Float32(64.0) if (has_msg and has_btn) else (Float32(56.0) if (has_msg or has_btn) else Float32(42.0))
+        if cur_y + toast_h > vp.bottom() - Float32(8.0):
+            break
+
+        # Pre-check hover against resting rect so hover-to-pause stays rock-steady
+        var rest_tx = vp.right() - toast_w - Float32(12.0)
+        var rest_tr = RectF(rest_tx, cur_y, toast_w, toast_h)
+        var hov = is_active and rest_tr.contains(mouse_x, mouse_y)
+        var anim_st = anim.sync_toast(item.id, is_active, item.ttl_sec, hov)
+        var slide = anim_st[0]
+        var alpha = anim_st[1]
+        if alpha <= Float32(0.01) and (not is_active):
+            continue
+
+        var tx = rest_tx + (Float32(1.0) - slide) * Float32(28.0)
         var tr = RectF(tx, cur_y, toast_w, toast_h)
-        var hov = tr.contains(mouse_x, mouse_y)
         if hov:
             act.hovered = True
+            hovered_toast_id = item.id
 
         var sev_col = toast_severity_color(theme, item.severity)
+        var base_fill = theme.l4_overlay
+        if item.severity == TOAST_ERROR or item.severity == TOAST_WARN:
+            base_fill = lerp_rgba8(theme.l4_overlay, rgba8_with_alpha(sev_col, 224), Float32(0.07))
+
+        # Ambient elevation shadow + frosted glass card + semantic left accent bar
+        dl.add_ambient_shadow(
+            tr.x, tr.y, tr.w, tr.h,
+            theme.radius_md, Float32(14.0), Int(Float32(130.0) * alpha), Float32(3.0),
+        )
         dl.add_glass_panel(
             tr.x, tr.y, tr.w, tr.h,
-            rgba8_scale_alpha(theme.l4_overlay, alpha),
+            rgba8_scale_alpha(base_fill, alpha),
             theme.radius_md, Float32(3.0), Float32(1.0),
             rgba8_scale_alpha(theme.border_strong if hov else theme.border_control, alpha),
             True, True,
         )
-        # Left semantic accent stripe
-        dl.add_rect(tr.x + Float32(1.0), tr.y + Float32(6.0), Float32(3.0), tr.h - Float32(12.0), rgba8_scale_alpha(sev_col, alpha), Float32(1.5))
+        dl.add_accent_bar(
+            tr.x + Float32(1.5), tr.y + Float32(7.0), Float32(3.0), max(Float32(6.0), tr.h - Float32(14.0)),
+            rgba8_scale_alpha(sev_col, alpha), True,
+        )
 
-        # Severity icon
-        var ix = tr.x + Float32(12.0)
-        var iy = tr.y + Float32(10.0)
+        # 22x22 tinted severity icon badge pill
+        var badge_sz = Float32(22.0)
+        var bx = tr.x + Float32(11.0)
+        var by = tr.y + Float32(9.0)
+        dl.add_rect_styled(
+            bx, by, badge_sz, badge_sz,
+            rgba8_scale_alpha(rgba8_with_alpha(sev_col, 36), alpha),
+            rgba8_scale_alpha(rgba8_with_alpha(sev_col, 96), alpha),
+            Float32(5.0), Float32(1.0), Float32(1.0), UI_FLAG_BORDER,
+        )
+        var ix = bx + Float32(4.0)
+        var iy = by + Float32(4.0)
         if item.severity == TOAST_SUCCESS:
             draw_studio_icon(dl, ICON_CHECK, ix, iy, Float32(14.0), rgba8_scale_alpha(sev_col, alpha), Float32(1.6))
         elif item.severity == TOAST_WARN:
             draw_studio_icon(dl, ICON_WARN, ix, iy, Float32(14.0), rgba8_scale_alpha(sev_col, alpha), Float32(1.5))
         elif item.severity == TOAST_ERROR:
-            draw_studio_icon(dl, ICON_CLOSE, ix, iy, Float32(14.0), rgba8_scale_alpha(sev_col, alpha), Float32(1.6))
+            draw_studio_icon(dl, ICON_ERROR_CIRCLE, ix, iy, Float32(14.0), rgba8_scale_alpha(sev_col, alpha), Float32(1.6))
         elif item.severity == TOAST_AGENT:
             draw_studio_icon(dl, ICON_SPARK, ix, iy, Float32(14.0), rgba8_scale_alpha(sev_col, alpha), Float32(1.5))
         else:
-            dl.add_circle(ix + Float32(7.0), iy + Float32(7.0), Float32(5.5), rgba8_scale_alpha(rgba8_with_alpha(sev_col, 50), alpha), Float32(1.4), rgba8_scale_alpha(sev_col, alpha))
+            dl.add_circle(ix + Float32(7.0), iy + Float32(7.0), Float32(5.5), rgba8_scale_alpha(rgba8_with_alpha(sev_col, 48), alpha), Float32(1.4), rgba8_scale_alpha(sev_col, alpha))
             dl.add_circle(ix + Float32(7.0), iy + Float32(7.0), Float32(1.8), rgba8_scale_alpha(sev_col, alpha))
 
-        # Close button
-        var cls_r = RectF(tr.right() - Float32(24.0), tr.y + Float32(7.0), Float32(18.0), Float32(18.0))
-        var cls_hov = cls_r.contains(mouse_x, mouse_y)
+        # Dismiss close button (>= 24x24 WCAG 2.2 SC 2.5.8 hit target)
+        var cls_r = RectF(tr.right() - Float32(28.0), tr.y + Float32(6.0), Float32(24.0), Float32(24.0))
+        var cls_hov = is_active and cls_r.contains(mouse_x, mouse_y)
         if cls_hov:
-            dl.add_rect(cls_r.x, cls_r.y, cls_r.w, cls_r.h, rgba8_scale_alpha(theme.l3_hover, alpha), Float32(4.0))
-        draw_studio_icon(dl, ICON_CLOSE, cls_r.x + Float32(3.5), cls_r.y + Float32(3.5), Float32(11.0), rgba8_scale_alpha(theme.text_primary if cls_hov else theme.text_muted, alpha), Float32(1.4))
+            dl.add_rect(cls_r.x + Float32(1.0), cls_r.y + Float32(1.0), cls_r.w - Float32(2.0), cls_r.h - Float32(2.0), rgba8_scale_alpha(theme.l3_hover, alpha), Float32(5.0))
+        draw_studio_icon(
+            dl, ICON_CLOSE,
+            cls_r.center_x() - Float32(5.5), cls_r.center_y() - Float32(5.5),
+            Float32(11.0),
+            rgba8_scale_alpha(theme.text_primary if cls_hov else theme.text_muted, alpha),
+            Float32(1.4),
+        )
         if cls_hov and mouse_pressed:
             act.dismissed_id = item.id
 
         # Title + message
-        var content_x = tr.x + Float32(32.0)
+        var content_x = bx + badge_sz + Float32(8.0)
         var max_text_w = max(Float32(40.0), cls_r.x - content_x - Float32(6.0))
         var title_disp = _ntf_truncate(font, item.display_title(), Float32(12.5), max_text_w)
-        _ntf_draw_text(dl, font_slot, font, title_disp, content_x, tr.y + Float32(9.0), Float32(12.5), rgba8_scale_alpha(theme.text_primary, alpha))
+        _ntf_draw_text(dl, font_slot, font, title_disp, content_x, tr.y + Float32(10.0), Float32(12.5), rgba8_scale_alpha(theme.text_primary, alpha))
+
+        var ab_w = Float32(0.0)
+        if has_btn:
+            ab_w = min(Float32(86.0), max(Float32(54.0), _ntf_measure_text(font, item.action_label, Float32(11.0)) + Float32(16.0)))
 
         if has_msg:
-            var msg_max_w = max_text_w - (Float32(64.0) if has_btn else Float32(0.0))
+            var msg_max_w = max_text_w - (ab_w + Float32(8.0) if has_btn else Float32(0.0))
             var msg_disp = _ntf_truncate(font, item.message, Float32(11.5), max(Float32(24.0), msg_max_w))
-            _ntf_draw_text(dl, font_slot, font, msg_disp, content_x, tr.y + Float32(27.0), Float32(11.5), rgba8_scale_alpha(theme.text_secondary, alpha))
+            _ntf_draw_text(dl, font_slot, font, msg_disp, content_x, tr.y + Float32(28.0), Float32(11.5), rgba8_scale_alpha(theme.text_secondary, alpha))
 
         if has_btn:
-            var ab_w = min(Float32(68.0), _ntf_measure_text(font, item.action_label, Float32(11.0)) + Float32(12.0))
-            var ab_r = RectF(tr.right() - ab_w - Float32(8.0), tr.bottom() - Float32(24.0), ab_w, Float32(18.0))
-            var ab_hov = ab_r.contains(mouse_x, mouse_y)
-            dl.add_rect(ab_r.x, ab_r.y, ab_r.w, ab_r.h, rgba8_scale_alpha(theme.l3_hover if ab_hov else theme.l2_card, alpha), Float32(4.0), Float32(1.0), rgba8_scale_alpha(sev_col, alpha * Float32(0.7)))
-            _ntf_draw_text(dl, font_slot, font, item.action_label, ab_r.x + Float32(6.0), ab_r.y + Float32(3.5), Float32(10.5), rgba8_scale_alpha(theme.text_primary, alpha))
+            var ab_r = RectF(tr.right() - ab_w - Float32(8.0), tr.bottom() - Float32(30.0), ab_w, Float32(24.0))
+            var ab_hov = is_active and ab_r.contains(mouse_x, mouse_y)
+            dl.add_rect_styled(
+                ab_r.x, ab_r.y, ab_r.w, ab_r.h,
+                rgba8_scale_alpha(theme.l3_hover if ab_hov else theme.l2_card, alpha),
+                rgba8_scale_alpha(sev_col if ab_hov else rgba8_with_alpha(sev_col, 165), alpha),
+                Float32(5.0), Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+            )
+            var ab_disp = _ntf_truncate(font, item.action_label, Float32(11.0), ab_r.w - Float32(10.0))
+            var ab_tw = _ntf_measure_text(font, ab_disp, Float32(11.0))
+            _ntf_draw_text(
+                dl, font_slot, font, ab_disp,
+                ab_r.x + max(Float32(5.0), (ab_r.w - ab_tw) * Float32(0.5)),
+                ab_r.center_y() - Float32(5.5),
+                Float32(11.0),
+                rgba8_scale_alpha(theme.text_primary, alpha),
+            )
             if ab_hov and mouse_pressed:
                 act.clicked_action_id = item.id
                 act.action_entity_id = item.action_entity_id
 
-        # Slim bottom TTL countdown bar
+        # Slim bottom TTL countdown bar (freezes bright when hovered/paused)
+        var track_x = tr.x + Float32(8.0)
+        var track_w = max(Float32(4.0), tr.w - Float32(16.0))
+        var track_y = tr.bottom() - Float32(4.0)
+        dl.add_rect(track_x, track_y, track_w, Float32(2.0), rgba8_scale_alpha(theme.l0_canvas, alpha * Float32(0.8)), Float32(1.0))
         var frac = max(Float32(0.0), min(Float32(1.0), item.remaining_sec / max(Float32(0.1), item.ttl_sec)))
-        var bar_w = max(Float32(2.0), (tr.w - Float32(12.0)) * frac)
-        dl.add_rect(tr.x + Float32(6.0), tr.bottom() - Float32(3.0), bar_w, Float32(2.0), rgba8_scale_alpha(sev_col, alpha * Float32(0.75)), Float32(1.0))
+        var bar_w = max(Float32(2.0), track_w * frac)
+        var bar_a = alpha * (Float32(1.0) if hov else Float32(0.78))
+        dl.add_rect(track_x, track_y, bar_w, Float32(2.0), rgba8_scale_alpha(sev_col, bar_a), Float32(1.0))
 
         cur_y += toast_h + Float32(8.0)
 
+    manager.set_hovered_toast(hovered_toast_id)
     if act.dismissed_id != 0:
         manager.dismiss(act.dismissed_id)
+        anim.dismiss_toast(act.dismissed_id)
     return act
 
 
@@ -774,7 +893,7 @@ def draw_job_progress_pills(
     if len(pills) == 0:
         return act
 
-    var card_w = min(Float32(276.0), max(Float32(180.0), vp.w - Float32(24.0)))
+    var card_w = min(Float32(288.0), max(Float32(192.0), vp.w - Float32(24.0)))
     var bottom_y = vp.bottom() - bottom_offset
 
     for pi in range(len(pills)):
@@ -782,11 +901,9 @@ def draw_job_progress_pills(
         ref job = tracker.jobs[idx]
         var stage = job.stage()
         var is_exp = stage >= PROGRESS_STAGE_EXPANDED
-        var card_h = Float32(58.0) if is_exp else Float32(32.0)
+        var card_h = Float32(64.0) if is_exp else Float32(36.0)
         var wid = UInt64(0x4A4F4250524F4700) ^ job.id
-        var reveal = anim.drive_aux(wid, Float32(1.0), SpringConfig.drawer())
-        if anim.mode == UI_ANIM_INSTANT:
-            reveal = Float32(1.0)
+        var reveal = anim.drive_reveal(wid, Float32(1.0), Float32(0.0), SpringConfig.drawer())
         var alpha = max(Float32(0.0), min(Float32(1.0), reveal))
 
         var cx = vp.right() - card_w - Float32(12.0)
@@ -797,6 +914,10 @@ def draw_job_progress_pills(
             act.hovered = True
 
         var accent = theme.agent_active if job.kind == JOB_KIND_AGENT else theme.accent_primary
+        dl.add_ambient_shadow(
+            cr.x, cr.y, cr.w, cr.h,
+            theme.radius_md, Float32(12.0), Int(Float32(120.0) * alpha), Float32(2.5),
+        )
         dl.add_glass_panel(
             cr.x, cr.y, cr.w, cr.h,
             rgba8_scale_alpha(theme.l4_overlay, alpha),
@@ -807,7 +928,7 @@ def draw_job_progress_pills(
 
         # Progress ring (determinate sweep or animated SDF arc spinner)
         var ring_x = cr.x + Float32(18.0)
-        var ring_y = cr.y + Float32(16.0)
+        var ring_y = cr.y + Float32(18.0)
         if job.progress >= Float32(0.0):
             dl.add_progress_ring(
                 ring_x, ring_y, Float32(7.5), Float32(2.2),
@@ -826,40 +947,47 @@ def draw_job_progress_pills(
                 Float32(2.0),
             )
 
-        # Right-side elapsed readout (+ Cancel chip when expanded & cancellable)
+        # Right-side elapsed readout (+ >= 24px-tall Cancel chip when expanded & cancellable)
         var right_x = cr.right() - Float32(10.0)
         if is_exp and job.cancellable and not job.cancel_requested:
-            var can_w = Float32(48.0)
-            var can_r = RectF(right_x - can_w, cr.y + Float32(7.0), can_w, Float32(18.0))
+            var can_w = Float32(56.0)
+            var can_r = RectF(right_x - can_w, cr.y + Float32(6.0), can_w, Float32(24.0))
             var can_hov = can_r.contains(mouse_x, mouse_y)
             dl.add_rect_styled(
                 can_r.x, can_r.y, can_r.w, can_r.h,
                 rgba8_scale_alpha(lerp_rgba8(theme.l2_card, theme.l3_hover, Float32(1.0) if can_hov else Float32(0.0)), alpha),
                 rgba8_scale_alpha(theme.status_danger if can_hov else theme.border_control, alpha),
-                Float32(4.0), Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+                Float32(5.0), Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
             )
-            _ntf_draw_text(dl, font_slot, font, "Cancel", can_r.x + Float32(6.0), can_r.y + Float32(3.5), Float32(10.5), rgba8_scale_alpha(theme.text_primary, alpha))
+            var can_tw = _ntf_measure_text(font, "Cancel", Float32(11.0))
+            _ntf_draw_text(
+                dl, font_slot, font, "Cancel",
+                can_r.x + max(Float32(6.0), (can_r.w - can_tw) * Float32(0.5)),
+                can_r.center_y() - Float32(5.5),
+                Float32(11.0),
+                rgba8_scale_alpha(theme.status_danger if can_hov else theme.text_primary, alpha),
+            )
             if can_hov and mouse_pressed:
                 act.cancel_job_id = job.id
             right_x = can_r.x - Float32(6.0)
 
         var el_str = job.elapsed_label()
         var el_w = _ntf_measure_text(font, el_str, Float32(11.0))
-        _ntf_draw_text(dl, font_slot, font, el_str, right_x - el_w, cr.y + Float32(10.0), Float32(11.0), rgba8_scale_alpha(theme.text_muted, alpha))
+        _ntf_draw_text(dl, font_slot, font, el_str, right_x - el_w, cr.y + Float32(12.0), Float32(11.0), rgba8_scale_alpha(theme.text_muted, alpha))
 
         var title_x = cr.x + Float32(34.0)
         var title_max_w = max(Float32(40.0), right_x - el_w - title_x - Float32(8.0))
         var title_disp = _ntf_truncate(font, job.title, Float32(12.0), title_max_w)
-        _ntf_draw_text(dl, font_slot, font, title_disp, title_x, cr.y + Float32(9.5), Float32(12.0), rgba8_scale_alpha(theme.text_primary, alpha))
+        _ntf_draw_text(dl, font_slot, font, title_disp, title_x, cr.y + Float32(11.5), Float32(12.0), rgba8_scale_alpha(theme.text_primary, alpha))
 
         if is_exp:
             var det_txt = job.detail if job.detail.byte_length() > 0 else (job_kind_label(job.kind) + " in progress...")
             var det_disp = _ntf_truncate(font, det_txt, Float32(11.0), cr.w - Float32(22.0))
-            _ntf_draw_text(dl, font_slot, font, det_disp, cr.x + Float32(11.0), cr.y + Float32(31.0), Float32(11.0), rgba8_scale_alpha(theme.text_secondary, alpha))
+            _ntf_draw_text(dl, font_slot, font, det_disp, cr.x + Float32(11.0), cr.y + Float32(35.0), Float32(11.0), rgba8_scale_alpha(theme.text_secondary, alpha))
 
             # Bottom progress track
             var tr_x = cr.x + Float32(11.0)
-            var tr_y = cr.bottom() - Float32(8.0)
+            var tr_y = cr.bottom() - Float32(9.0)
             var tr_w = cr.w - Float32(22.0)
             dl.add_rect(tr_x, tr_y, tr_w, Float32(3.0), rgba8_scale_alpha(theme.l0_canvas, alpha), Float32(1.5))
             if job.progress >= Float32(0.0):

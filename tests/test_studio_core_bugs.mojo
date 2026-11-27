@@ -2347,6 +2347,115 @@ def test_m3b_f11_input_context_hotkeys_dirty_modal_and_layout() raises:
         _m3b_rm_rf(tmp)
 
 
+def test_inspector_sections_and_frame_selection() raises:
+    var studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=1280, height=720, worker_threads=0)
+    var target = Vec3(7.0, 2.0, -3.0)
+    var eid = studio.spawn_entity("Bridge support", position=target, record_undo=False)
+    studio.select_entity(eid)
+    var input = InputState()
+    for _ in range(2):
+        input.begin_frame()
+        studio.render_editor_frame(1280, 720, input=input)
+    var dock = hash_ui_id(UInt64(0xCBF29CE484222325), "dock:Inspector")
+    var scroll = hash_ui_id(dock, "insp_scroll")
+    var header = hash_ui_id(scroll, "insp_header_actions")
+    var frame = studio.ui_ctx.cached_rects[hash_ui_id(header, "insp_frame_entity")]
+    var view = studio.ui_ctx.cached_rects[scroll]
+    assert_true(frame.x >= view.x and frame.right() <= view.right())
+    assert_true((studio.cam_target - target).length() > Float32(0.1))
+    input.begin_frame()
+    input.move_mouse(frame.center_x(), frame.center_y())
+    input.set_mouse(0, True)
+    studio.render_editor_frame(1280, 720, input=input)
+    input.begin_frame()
+    input.set_mouse(0, False)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_true((studio.cam_target - target).length() < Float32(0.001))
+
+    var kind_id = hash_ui_id(scroll, "col_kind")
+    var kind = studio.ui_ctx.cached_rects[kind_id]
+    input.begin_frame()
+    input.move_mouse(kind.x + 5, kind.center_y())
+    input.set_mouse(0, True)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_true(studio.ui_ctx._open_popup_id != kind_id)
+    input.begin_frame()
+    input.set_mouse(0, False)
+    studio.render_editor_frame(1280, 720, input=input)
+    input.begin_frame()
+    input.move_mouse(kind.right() - 12, kind.center_y())
+    input.set_mouse(0, True)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_equal(studio.ui_ctx._open_popup_id, kind_id)
+    var menu = studio.ui_ctx._popup_rect
+    input.begin_frame()
+    input.set_mouse(0, False)
+    studio.render_editor_frame(1280, 720, input=input)
+    input.begin_frame()
+    input.move_mouse(menu.center_x(), menu.y + 2 + studio.ui_ctx.theme.row_height * 1.5)
+    input.set_mouse(0, True)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_equal(studio.entities[eid].collider_kind, 1)
+    assert_true(studio.undo())
+    assert_equal(studio.entities[eid].collider_kind, 2)
+    input.begin_frame()
+    input.set_mouse(0, False)
+    studio.render_editor_frame(1280, 720, input=input)
+
+    var transform = hash_ui_id(scroll, "insp_trs")
+    var section = studio.ui_ctx.cached_rects[transform]
+    assert_true(studio.ui_ctx.state_map[transform].tree_open)
+    input.begin_frame()
+    input.move_mouse(section.center_x(), section.center_y())
+    input.set_mouse(0, True)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_false(studio.ui_ctx.state_map[transform].tree_open)
+    assert_equal(studio.selected_entity_id, eid)
+
+    studio.set_ui_scale(1.5)
+    for _ in range(2):
+        input.begin_frame()
+        input.set_mouse(0, False)
+        studio.render_editor_frame(1280, 720, input=input)
+    var albedo = studio.ui_ctx.cached_rects[hash_ui_id(scroll, "mat_col")]
+    assert_true(albedo.h >= studio.ui_ctx.theme.row_height * 2)
+    var ui_scale = studio.effective_ui_scale()
+    input.begin_frame()
+    input.move_mouse((albedo.right() - 12) * ui_scale, (albedo.bottom() - 10) * ui_scale)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_equal(studio.ui_ctx.hovered_id, hash_ui_id(scroll, "mat_col#c2"))
+    var blue = studio.ui_ctx.hovered_rect
+    assert_true(blue.w >= studio.ui_ctx._measure_text("1.00", studio.ui_ctx.theme.font_size * 0.84) + 8)
+    assert_true(blue.right() <= albedo.right() + 0.01)
+
+    section = studio.ui_ctx.cached_rects[transform]
+    input.begin_frame()
+    input.move_mouse(section.center_x() * ui_scale, section.center_y() * ui_scale)
+    input.set_mouse(0, True)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_true(studio.ui_ctx.state_map[transform].tree_open)
+    input.begin_frame()
+    input.set_mouse(0, False)
+    studio.render_editor_frame(1280, 720, input=input)
+    var position = studio.ui_ctx.cached_rects[hash_ui_id(scroll, "prow:Position")]
+    assert_true(position.h > 24)
+    var z_x = (position.right() - 12) * ui_scale
+    var z_y = (position.bottom() - 10) * ui_scale
+    input.begin_frame()
+    input.move_mouse(z_x, z_y)
+    input.set_mouse(0, True)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_equal(studio.ui_ctx.active_id, hash_ui_id(scroll, "tr_pos#v2_2"))
+    assert_true(studio.ui_ctx.hovered_rect.w >= studio.ui_ctx._measure_text("-3.00", studio.studio_theme.font_mono) + 17)
+    input.begin_frame()
+    input.move_mouse(z_x + 12, z_y)
+    studio.render_editor_frame(1280, 720, input=input)
+    assert_true(studio.entities[eid].translation.z > target.z)
+    assert_equal(studio.entities[eid].translation.x, target.x)
+    assert_equal(studio.entities[eid].translation.y, target.y)
+    studio.shutdown()
+
+
 def test_m3b_f12_inspector_guards_and_enabled_sync() raises:
     var s = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=1280, height=720, worker_threads=0)
     var eid = s.spawn_entity("GuardTarget", position=Vec3(0.0, 1.0, 0.0), record_undo=False)
@@ -2405,6 +2514,10 @@ def test_m3b_f13_recursive_asset_browser_and_spawn_cards() raises:
     _ = make_dirs(tmp + "/.git")
     _ = make_dirs(tmp + "/build")
     try:
+        for metadata in [".claude", ".codex", ".gemini"]:
+            var checkout = tmp + "/" + metadata + "/worktrees/editor"
+            _ = make_dirs(checkout)
+            _m3b_write_text(checkout + "/duplicate.flscn", "{}")
         for i in range(8):
             _m3b_write_text(tmp + "/materials/sub/mat_" + String(i) + ".flmat", "{}")
         for i in range(4):
@@ -2440,6 +2553,68 @@ def test_m3b_f13_recursive_asset_browser_and_spawn_cards() raises:
     finally:
         _m3b_rm_rf(tmp)
 
+
+
+def _click_library_control(mut studio: FlintStudioState, mut input: InputState, id: UInt64) raises:
+    var rect = studio.ui_ctx.cached_rects[id]
+    assert_true(rect.w > 0 and rect.h > 0)
+    for down in [True, False]:
+        input.begin_frame()
+        input.move_mouse(rect.center_x(), rect.center_y())
+        input.set_mouse(0, down)
+        studio.render_editor_frame(1280, 720, input=input)
+
+
+def test_project_assets_import_search_and_create() raises:
+    var tmp = "/tmp/flint-library-ui-" + String(external_call["getpid", Int32]())
+    _m3b_rm_rf(tmp)
+    _ = make_dirs(tmp + "/project")
+    _m3b_write_text(tmp + "/palette.json", "{}")
+    try:
+        var studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=1280, height=720, worker_threads=0)
+        var input = InputState()
+        var root = UInt64(0xCBF29CE484222325)
+        var dock = hash_ui_id(root, "dock:AssetBrowser")
+        var bar = hash_ui_id(dock, "ab_toolbar")
+        var modal = hash_ui_id(root, "modal:ab_dialog")
+        for _ in range(3):
+            studio.render_editor_frame(1280, 720, input=input)
+        _click_library_control(studio, input, hash_ui_id(bar, "ab_import"))
+        assert_true(studio.asset_browser_state.dialog != 0)
+        input.begin_frame()
+        studio.render_editor_frame(1280, 720, input=input)
+        _click_library_control(studio, input, hash_ui_id(modal, "ab_source"))
+        input.begin_frame()
+        input.push_text_utf8(tmp + "/palette.json")
+        studio.render_editor_frame(1280, 720, input=input)
+        _click_library_control(studio, input, hash_ui_id(modal, "ab_project"))
+        input.begin_frame()
+        input.push_text_utf8(tmp + "/project")
+        studio.render_editor_frame(1280, 720, input=input)
+        _click_library_control(studio, input, hash_ui_id(hash_ui_id(modal, "ab_dialog_actions"), "ab_confirm"))
+        assert_equal(studio.asset_browser_state.dialog, 0)
+        assert_equal(file_size(tmp + "/project/assets/palette.json"), 2)
+        assert_equal(len(studio.asset_browser_entries), 1)
+        input.begin_frame()
+        studio.render_editor_frame(1280, 720, input=input)
+        _click_library_control(studio, input, hash_ui_id(bar, "ab_search"))
+        input.begin_frame()
+        input.push_text_utf8("unmatched")
+        studio.render_editor_frame(1280, 720, input=input)
+        assert_equal(studio.asset_browser_state.search_query, "unmatched")
+        var entry_id = hash_ui_id(hash_ui_id(dock, "ab_entries_scroll"), "ab_item_0")
+        for id in studio.ui_ctx.bg_focusables:
+            assert_true(id != entry_id)
+        _click_library_control(studio, input, hash_ui_id(bar, "ab_create"))
+        input.begin_frame()
+        studio.render_editor_frame(1280, 720, input=input)
+        var count = studio.live_entity_count()
+        _click_library_control(studio, input, hash_ui_id(hash_ui_id(modal, "ab_create_row_0"), "card_cube"))
+        assert_equal(studio.live_entity_count(), count + 1)
+        assert_equal(studio.asset_browser_state.dialog, 0)
+        studio.shutdown()
+    finally:
+        _m3b_rm_rf(tmp)
 
 
 def test_m3b_f13_28_assets_spawn_cards_layout_and_clicks() raises:
@@ -5152,6 +5327,8 @@ def test_t5_inspector_drag_coalesce_skinned_preview_off_and_text_focus() raises:
         sk_mdl.meshes.append(smesh^)
         var rnode = NativeNode()
         rnode.name = "Root"
+        rnode.mesh = 0
+        rnode.skin = 0
         sk_mdl.nodes.append(rnode^)
         var skn = NativeSkin()
         skn.joints.append(0)
@@ -5208,10 +5385,12 @@ def main() raises:
     print("[PASS] test_m3a_dockspace_json_validation_and_env_spotlight_tier0")
     test_m3b_f11_input_context_hotkeys_dirty_modal_and_layout()
     print("[PASS] test_m3b_f11_input_context_hotkeys_dirty_modal_and_layout")
+    test_inspector_sections_and_frame_selection()
     test_m3b_f12_inspector_guards_and_enabled_sync()
     print("[PASS] test_m3b_f12_inspector_guards_and_enabled_sync")
     test_m3b_f13_recursive_asset_browser_and_spawn_cards()
     print("[PASS] test_m3b_f13_recursive_asset_browser_and_spawn_cards")
+    test_project_assets_import_search_and_create()
     test_m3b_f13_28_assets_spawn_cards_layout_and_clicks()
     print("[PASS] test_m3b_f13_28_assets_spawn_cards_layout_and_clicks")
     test_m3b_f14_f15_plugins_navbake_overlays_spotlight_and_scenes_root()

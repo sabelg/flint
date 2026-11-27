@@ -1,15 +1,8 @@
-"""Button glyphs for prompts and rich text (package 3.12).
+"""Button glyphs for keyboard keycap and gamepad prompts (`flint.ui.button_glyphs`).
 
-One table maps every action the game prompts for to its keyboard key and
-its controller button, as bound in src/gameplay/game.mojo (where it reads
-keys and pad buttons for the player's moves). Rich text names an action
-(`[btn=jump]`) and the glyph follows the last device used: a keycap with the
-key's label for the keyboard, a round face button (A/B/X/Y in their Xbox
-colours, or the PlayStation shapes), a pill for shoulders and triggers, a
-cross for the d-pad and a ring for the sticks.
-
-The drawing itself is in `SoftwareFramebuffer.draw_button_glyph`
-(render/rasterizer.mojo); this module only knows names, labels and widths.
+Maps standard input actions to keyboard keycap labels and controller button shapes
+(Xbox A/B/X/Y or PlayStation symbols, shoulder/trigger pills, d-pad cross, and stick
+rings) rendered via `UiDrawList.add_controller_symbol` and `UiContext.kbd_pill`.
 """
 
 comptime ACTION_NONE: Int = -1

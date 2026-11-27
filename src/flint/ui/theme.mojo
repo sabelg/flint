@@ -177,22 +177,22 @@ comptime RADIUS_MD: Float32 = 8.0
 comptime RADIUS_LG: Float32 = 12.0
 comptime RADIUS_PILL: Float32 = 999.0
 
-comptime TYPE_TITLE_PX: Float32 = 15.0
-comptime TYPE_BODY_PX: Float32 = 13.0
-comptime TYPE_SECTION_PX: Float32 = 12.0
-comptime TYPE_MONO_PX: Float32 = 12.0
-comptime TYPE_CAPTION_PX: Float32 = 11.5
+comptime TYPE_TITLE_PX: Float32 = 14.5
+comptime TYPE_BODY_PX: Float32 = 12.5
+comptime TYPE_SECTION_PX: Float32 = 12.5
+comptime TYPE_MONO_PX: Float32 = 11.5
+comptime TYPE_CAPTION_PX: Float32 = 11.0
 
 comptime LINE_TITLE_PX: Float32 = 20.0
 comptime LINE_BODY_PX: Float32 = 18.0
-comptime LINE_SECTION_PX: Float32 = 16.0
+comptime LINE_SECTION_PX: Float32 = 17.0
 comptime LINE_CAPTION_PX: Float32 = 15.0
 
 comptime HEADER_BAR_H: Float32 = 40.0
 comptime OUTLINER_ROW_H: Float32 = 26.0
 comptime CARD_HEADER_H: Float32 = 28.0
 comptime INSPECTOR_ROW_H: Float32 = 24.0
-comptime INSPECTOR_LABEL_RATIO: Float32 = 0.38
+comptime INSPECTOR_LABEL_RATIO: Float32 = 0.34
 comptime ASSET_CARD_W: Float32 = 88.0
 comptime ASSET_CARD_H: Float32 = 96.0
 comptime SIDEBAR_RAIL_W: Float32 = 44.0
@@ -288,18 +288,19 @@ comptime ICON_MATERIAL: Int = 36
 comptime ICON_SCENE: Int = 37
 comptime ICON_FILE: Int = 38
 
-# Additional Studio HUD & Utility Curved Icons (39..43)
+# Additional Studio HUD & Utility Curved Icons (39..44)
 comptime ICON_REFRESH: Int = 39
 comptime ICON_CLOCK: Int = 40
 comptime ICON_BELL: Int = 41
 comptime ICON_SUN: Int = 42
 comptime ICON_MOON: Int = 43
+comptime ICON_ERROR_CIRCLE: Int = 44
 
 # Semantic Icon Aliases
 comptime ICON_AGENT_SPARK: Int = ICON_SPARK
 comptime ICON_GLOBE: Int = ICON_WORLD
 
-comptime ICON_COUNT: Int = 44
+comptime ICON_COUNT: Int = 45
 
 
 @fieldwise_init
@@ -480,26 +481,26 @@ struct StudioTheme(Copyable, Movable):
         self.is_dark = True
         self.reduced_motion = False
 
-        # L0-L4 obsidian slate elevation ladder
-        self.l0_canvas = rgba8(11, 13, 17, 255)        # #0B0D11
-        self.l1_shell = rgba8(18, 21, 27, 255)         # #12151B
-        self.l2_card = rgba8(25, 29, 38, 255)          # #191D26
-        self.l3_raised = rgba8(34, 40, 53, 255)        # #222835
-        self.l3_hover = rgba8(43, 51, 68, 255)         # #2B3344
-        self.l3_press = rgba8(31, 37, 49, 255)         # #1F2531
-        self.l4_overlay = rgba8(20, 24, 33, 224)       # #141821E0
-        self.l4_scrim = rgba8(7, 9, 13, 184)           # #07090DB8
+        # L0-L4 neutral graphite-obsidian elevation ladder (physical depth model)
+        self.l0_canvas = rgba8(13, 16, 20, 255)        # #0D1014 recessed wells & dock seams
+        self.l1_shell = rgba8(22, 26, 32, 255)         # #161A20 dock panels & chrome
+        self.l2_card = rgba8(30, 35, 43, 255)          # #1E232B section & agent cards
+        self.l3_raised = rgba8(40, 47, 58, 255)        # #282F3A interactive controls
+        self.l3_hover = rgba8(51, 60, 74, 255)         # #333C4A tactile hover lift
+        self.l3_press = rgba8(34, 40, 50, 255)         # #222832 pressed recess
+        self.l4_overlay = rgba8(24, 28, 36, 212)       # #181C24D4 frosted glass (~83% alpha)
+        self.l4_scrim = rgba8(7, 9, 13, 168)           # #07090DA8 modal scrim
 
-        # Hairlines & 1px inner top highlight
-        self.border_subtle = rgba8(255, 255, 255, 18)  # #FFFFFF12
-        self.border_control = rgba8(255, 255, 255, 31) # #FFFFFF1F
-        self.border_strong = rgba8(255, 255, 255, 51)  # #FFFFFF33
-        self.bevel_top = rgba8(255, 255, 255, 20)      # #FFFFFF14
+        # Hairlines & 1px inner top specular bevel (WCAG 1.4.11 non-text boundaries)
+        self.border_subtle = rgba8(255, 255, 255, 20)  # #FFFFFF14
+        self.border_control = rgba8(255, 255, 255, 46) # #FFFFFF2E
+        self.border_strong = rgba8(255, 255, 255, 82)  # #FFFFFF52
+        self.bevel_top = rgba8(255, 255, 255, 26)      # #FFFFFF1A
 
-        # Semantic accents
-        self.accent_primary = rgba8(76, 155, 255, 255) # #4C9BFF
-        self.accent_soft = rgba8(76, 155, 255, 36)     # #4C9BFF24
-        self.focus_ring = rgba8(120, 183, 255, 204)    # #78B7FFCC
+        # Semantic accents — Flint Ember brand identity
+        self.accent_primary = rgba8(245, 155, 76, 255) # #F59B4C (8.9:1 AAA on #0B0E14)
+        self.accent_soft = rgba8(245, 155, 76, 34)     # #F59B4C22
+        self.focus_ring = rgba8(255, 184, 117, 235)    # #FFB875EB
         self.play_mode = rgba8(45, 212, 191, 255)      # #2DD4BF
         self.play_tint = rgba8(45, 212, 191, 34)       # #2DD4BF22
         self.play_paused = rgba8(245, 183, 79, 255)    # #F5B74F
@@ -507,16 +508,16 @@ struct StudioTheme(Copyable, Movable):
         self.agent_flow = rgba8(56, 189, 248, 255)     # #38BDF8
         self.agent_soft = rgba8(167, 139, 250, 38)     # #A78BFA26
         self.status_ok = rgba8(52, 211, 153, 255)      # #34D399
-        self.status_warn = rgba8(251, 191, 36, 255)    # #FBBF24
-        self.status_danger = rgba8(248, 113, 113, 255) # #F87171
-        self.axis_x = rgba8(229, 91, 100, 255)         # #E55B64
-        self.axis_y = rgba8(82, 199, 122, 255)         # #52C77A
-        self.axis_z = rgba8(78, 154, 241, 255)         # #4E9AF1
+        self.status_warn = rgba8(245, 183, 79, 255)    # #F5B74F
+        self.status_danger = rgba8(240, 106, 114, 255) # #F06A72
+        self.axis_x = rgba8(232, 90, 102, 255)         # #E85A66
+        self.axis_y = rgba8(79, 196, 120, 255)         # #4FC478
+        self.axis_z = rgba8(76, 150, 240, 255)         # #4C96F0
 
-        # Text hierarchy
-        self.text_primary = rgba8(237, 241, 247, 255)   # #EDF1F7
-        self.text_secondary = rgba8(155, 165, 184, 255) # #9BA5B8
-        self.text_muted = rgba8(110, 122, 144, 255)     # #6E7A90
+        # Text hierarchy (WCAG AA/AAA verified on L0-L2)
+        self.text_primary = rgba8(238, 242, 247, 255)   # #EEF2F7 (13.6:1 on L2)
+        self.text_secondary = rgba8(169, 180, 196, 255) # #A9B4C4 (7.3:1 on L2)
+        self.text_muted = rgba8(132, 145, 163, 255)     # #8491A3 (4.93:1 AA on L2)
         self.text_on_accent = rgba8(11, 14, 20, 255)    # #0B0E14
 
         # Typography & geometry rhythm
@@ -527,7 +528,7 @@ struct StudioTheme(Copyable, Movable):
         self.font_mono = TYPE_MONO_PX
         self.row_height = INSPECTOR_ROW_H
         self.header_height = HEADER_BAR_H
-        self.scrollbar_width = Float32(8.0)
+        self.scrollbar_width = Float32(4.0)
         self.radius_xs = RADIUS_XS
         self.radius_sm = RADIUS_SM
         self.radius_md = RADIUS_MD
@@ -537,19 +538,19 @@ struct StudioTheme(Copyable, Movable):
         self.space_md = SPACE_MD
         self.space_lg = SPACE_LG
 
-        # CVD-safe 14-class dark syntax palette
+        # CVD-safe 14-class dark syntax palette harmonized with Flint Ember & diff tones
         self.syntax = _make_syntax_list(
             rgb_hex(0xDCE4F2),  # text
             rgb_hex(0xA78BFA),  # keyword
             rgb_hex(0x38BDF8),  # type
-            rgb_hex(0x738199),  # comment
+            rgb_hex(0x7D8DA6),  # comment
             rgb_hex(0x6EE7B7),  # string
-            rgb_hex(0xFB7185),  # number
-            rgb_hex(0xFBBF24),  # decorator
+            rgb_hex(0xF09D65),  # number (warm coral — distinct from diff deletion red)
+            rgb_hex(0xF5B74F),  # decorator
             rgb_hex(0x94A3B8),  # symbol
             rgb_hex(0x67E8F9),  # builtin
             rgb_hex(0xF472B6),  # self
-            rgb_hex(0xFDE047),  # def
+            rgb_hex(0xF6D06F),  # def (warm champagne)
             rgb_hex(0xE2E8F0),  # param
             rgb_hex(0x5EEAD4),  # property
             rgb_hex(0x38BDF8),  # namespace
@@ -563,10 +564,10 @@ struct StudioTheme(Copyable, Movable):
         self.syntax_macro = self.syntax[SYN_DECORATOR]
         self.syntax_operator = self.syntax[SYN_SYMBOL]
         self.diff_add_bg = rgba8(52, 211, 153, 34)
-        self.diff_del_bg = rgba8(248, 113, 113, 36)
+        self.diff_del_bg = rgba8(240, 106, 114, 36)
         self.diff_add_fg = rgb_hex(0x6EE7B7)
         self.diff_del_fg = rgb_hex(0xFCA5A5)
-        self.diff_hunk_bg = rgba8(76, 155, 255, 28)
+        self.diff_hunk_bg = rgba8(148, 163, 184, 24)
 
     def _sync_syntax_fields(mut self):
         if len(self.syntax) >= SYN_COUNT:
@@ -597,13 +598,13 @@ struct StudioTheme(Copyable, Movable):
         t.l3_raised = rgb_hex(0x24283B)
         t.l3_hover = rgb_hex(0x2F354F)
         t.l3_press = rgb_hex(0x1F2335)
-        t.l4_overlay = rgb_hex(0x1A1C2B, 232)
-        t.l4_scrim = rgb_hex(0x0B0B10, 192)
+        t.l4_overlay = rgb_hex(0x1A1C2B, 212)
+        t.l4_scrim = rgb_hex(0x0B0B10, 176)
 
         t.border_subtle = rgba8(192, 202, 245, 22)
-        t.border_control = rgba8(192, 202, 245, 38)
-        t.border_strong = rgba8(122, 162, 247, 88)
-        t.bevel_top = rgba8(192, 202, 245, 22)
+        t.border_control = rgba8(192, 202, 245, 50)
+        t.border_strong = rgba8(122, 162, 247, 102)
+        t.bevel_top = rgba8(192, 202, 245, 24)
 
         t.accent_primary = rgb_hex(0x7AA2F7)
         t.accent_soft = rgb_hex(0x7AA2F7, 42)
@@ -623,14 +624,14 @@ struct StudioTheme(Copyable, Movable):
 
         t.text_primary = rgb_hex(0xD5DDF8)
         t.text_secondary = rgb_hex(0xA9B1D6)
-        t.text_muted = rgb_hex(0x767D9F)
+        t.text_muted = rgb_hex(0x8890B4)
         t.text_on_accent = rgb_hex(0x16161E)
 
         t.syntax = _make_syntax_list(
             rgb_hex(0xC0CAF5),  # text
             rgb_hex(0xBB9AF7),  # keyword
             rgb_hex(0x2AC3DE),  # type
-            rgb_hex(0x767D9F),  # comment
+            rgb_hex(0x8890B4),  # comment
             rgb_hex(0x9ECE6A),  # string
             rgb_hex(0xFF7A93),  # number
             rgb_hex(0xE0AF68),  # decorator
@@ -664,13 +665,13 @@ struct StudioTheme(Copyable, Movable):
         t.l3_raised = rgb_hex(0x1F2730)
         t.l3_hover = rgb_hex(0x2A3542)
         t.l3_press = rgb_hex(0x1B222A)
-        t.l4_overlay = rgb_hex(0x141A20, 232)
-        t.l4_scrim = rgb_hex(0x06080A, 196)
+        t.l4_overlay = rgb_hex(0x141A20, 212)
+        t.l4_scrim = rgb_hex(0x06080A, 180)
 
         t.border_subtle = rgba8(230, 236, 242, 22)
-        t.border_control = rgba8(230, 236, 242, 42)
-        t.border_strong = rgb_hex(0x56B4E9, 110)
-        t.bevel_top = rgba8(255, 255, 255, 22)
+        t.border_control = rgba8(230, 236, 242, 50)
+        t.border_strong = rgb_hex(0x56B4E9, 120)
+        t.bevel_top = rgba8(255, 255, 255, 24)
 
         t.accent_primary = rgb_hex(0x56B4E9)  # Sky blue
         t.accent_soft = rgb_hex(0x56B4E9, 44)
@@ -734,10 +735,10 @@ struct StudioTheme(Copyable, Movable):
         t.l4_overlay = rgb_hex(0xFFFFFF, 236)
         t.l4_scrim = rgb_hex(0x141821, 115)
 
-        t.border_subtle = rgba8(15, 23, 42, 20)
-        t.border_control = rgba8(15, 23, 42, 36)
-        t.border_strong = rgba8(15, 23, 42, 62)
-        t.bevel_top = rgba8(255, 255, 255, 210)
+        t.border_subtle = rgba8(15, 23, 42, 22)
+        t.border_control = rgba8(15, 23, 42, 46)
+        t.border_strong = rgba8(15, 23, 42, 82)
+        t.bevel_top = rgba8(255, 255, 255, 215)
 
         t.accent_primary = rgb_hex(0x2563EB)
         t.accent_soft = rgb_hex(0x2563EB, 30)
@@ -798,6 +799,13 @@ struct StudioTheme(Copyable, Movable):
         if token_kind >= 0 and token_kind < len(self.syntax):
             return self.syntax[token_kind]
         return self.text_primary
+
+    def axis_label_fg(self, axis_index: Int) -> UInt32:
+        """Returns WCAG AA (>=5.5:1) foreground for X/Y/Z axis badges on tinted dark wells."""
+        var base = self.axis_x if axis_index == 0 else (self.axis_y if axis_index == 1 else self.axis_z)
+        if not self.is_dark:
+            return base
+        return lerp_rgba8(base, rgba8(255, 255, 255, 255), Float32(0.28))
 
     def agent_status_color(self, status_code: Int) -> UInt32:
         """Maps `AgentStatus` codes to semantic Studio tokens."""

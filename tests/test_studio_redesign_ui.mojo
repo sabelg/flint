@@ -99,6 +99,8 @@ from flint.studio.code_drawer import (
     CodeDrawer,
 )
 from flint.studio.frecency import FrecencyStore, fuzzy_score
+from flint.studio.gizmo import GIZMO_AXIS_NONE, GIZMO_AXIS_X, GIZMO_MODE_SELECT, GIZMO_MODE_TRANSLATE
+from flint.studio.studio_panels import OutlinerPanelState, OutlinerRowView, draw_outliner_panel_v2
 from flint.studio.notifications import (
     JOB_KIND_BUILD_SO,
     JobProgressTracker,
@@ -121,18 +123,23 @@ from flint.studio.palette import (
     StudioCommandPalette,
     draw_command_palette,
 )
-from flint.studio.studio_app import FlintStudioState, _resolve_flint_launcher_path
+from flint.studio.studio_app import FlintStudioState, _resolve_flint_launcher_path, emit_studio_ui_draw_list
 from flint.studio.viewport_hud import (
     HDR_ACT_COMMAND_PALETTE,
+    HDR_ACT_WORKSPACE,
+    HDR_ACT_WORKSPACE_PICKER,
     STUDIO_HEADER_BAR_H,
     StudioHeaderBar,
     VHUD_ACT_SNAP_VIEW,
+    VHUD_ACT_CAM_MODE,
+    VHUD_ACT_PIE_PLAY,
     VHUD_PIE_PLAYING,
     VHUD_PIE_STOPPED,
     VHUD_TOOL_MOVE,
     ViewportHud,
     WORKSPACE_AGENT_STUDIO,
     WORKSPACE_EDIT,
+    WORKSPACE_LOOKDEV,
 )
 from flint.ui.animator import (
     SpringConfig,
@@ -143,6 +150,7 @@ from flint.ui.animator import (
     UiSpring,
 )
 from flint.ui.context import (
+    UI_KEY_ENTER,
     UI_KEY_TAB,
     UiContext,
 )
@@ -275,10 +283,54 @@ def test_gpu_prim_abi_and_springs() raises:
 # 2. CSS `:focus-visible` vs. M0 `focused_id != 0` Compatibility
 # ---------------------------------------------------------------------------
 
+def test_outliner_keyboard_navigation() raises:
+    var ui = UiContext()
+    var inp = InputState()
+    var theme = StudioTheme()
+    var bus = AgentTelemetryBus()
+    var state = OutlinerPanelState()
+    var rows = List[OutlinerRowView]()
+    for i in range(24):
+        rows.append(OutlinerRowView(i, "Child " + String(i)))
+    var rect = RectF(0, 0, 220, 160)
+    inp.begin_frame()
+    inp.move_mouse(400, 300)
+    ui.begin_frame(inp, 640, 360)
+    ui._set_focused(ui.widget_id("outliner_v2_world_root"))
+    ui.key_end_pressed = True
+    var last = draw_outliner_panel_v2(ui, rect, theme, rows, "Scene", 24, 0, False, bus, state)
+    assert_equal(last.select_entity_id, 23)
+    assert_true(state.scroll_y > 0)
+    ui.end_frame()
+
+    inp.begin_frame()
+    ui.begin_frame(inp, 640, 360)
+    ui._set_focused(ui.widget_id("outliner_v2_search"))
+    state.search_query = "語é"
+    ui.key_bs_pressed = True
+    _ = draw_outliner_panel_v2(ui, rect, theme, rows, "Scene", 24, 0, False, bus, state)
+    assert_equal(state.search_query, "語")
+    assert_equal(state.scroll_y, Float32(0))
+    ui.end_frame()
+
+    inp.begin_frame()
+    ui.begin_frame(inp, 640, 360)
+    ui._set_focused(ui.widget_id("outliner_v2_plus"))
+    ui.key_enter_pressed = True
+    var add = draw_outliner_panel_v2(ui, rect, theme, rows, "Scene", 24, 0, False, bus, state)
+    assert_true(add.quick_spawn_clicked)
+    ui.end_frame()
+
+
 def test_focus_visible_compatibility() raises:
     print("  [2/7] CSS :focus-visible vs M0 focused_id!=0 compatibility...")
     var ui = UiContext()
     var inp = InputState()
+    ui.set_studio_theme(StudioTheme.paper_light())
+    assert_equal(ui.theme.bg_window, ui.studio_theme.l0_canvas)
+    assert_equal(ui.theme.bg_widget, ui.studio_theme.l3_raised)
+    assert_equal(ui.theme.text_primary, ui.studio_theme.text_primary)
+    assert_equal(ui.theme.focus_ring, ui.studio_theme.focus_ring)
 
     # Frame 0: mouse away from button -> M0 auto-focus sets focused_id != 0,
     # yet focus_visible & show_focus_ring MUST be False (no idle blue ring!).
@@ -391,8 +443,8 @@ def test_tier0_cpu_raster_and_all_44_icons() raises:
     assert_equal(c_pc.pixels[9 * 64 + 9], bg)
     assert_true(c_pc.pixels[9 * 64 + 54] != bg)
 
-    # F. All 44 Studio SDF icons render non-empty crisp pixels
-    assert_equal(ICON_COUNT, 44)
+    # F. All 45 Studio SDF icons render non-empty crisp pixels
+    assert_equal(ICON_COUNT, 45)
     for icon_id in range(ICON_COUNT):
         var c_ic = SimdCanvas(32, 32)
         c_ic.clear(bg, bg)
@@ -505,6 +557,20 @@ def test_ux_palette_notifications_header_and_hud() raises:
     )
     assert_true(dl_hdr2.count() > 15)
 
+    # Native window controls and a long title must leave a reachable workspace control.
+    var workspace_reachable = False
+    for x in range(4, 740, 8):
+        var probe = UiDrawList()
+        var hit = hdr.draw(
+            probe, 0, font, theme, anim_inst, 740, "mountain_survey_lighting_preview.flscn", True,
+            WORKSPACE_EDIT, AGENT_STATE_EDITING_SCENE, 1, 0,
+            Float32(x), STUDIO_HEADER_BAR_H / 2, True, True, show_window_controls=True,
+        )
+        if hit.kind == HDR_ACT_WORKSPACE_PICKER or hit.kind == HDR_ACT_WORKSPACE:
+            workspace_reachable = True
+            break
+    assert_true(workspace_reachable)
+
     var vhud = ViewportHud()
     for fi in range(60):
         vhud.push_gpu_ms(Float32(4.0 + Float32(fi % 5) * Float32(0.4)))
@@ -543,6 +609,24 @@ def test_ux_palette_notifications_header_and_hud() raises:
     )
     assert_equal(act_s.kind, VHUD_ACT_SNAP_VIEW)
     assert_true(act_s.snap_dir.x < Float32(-0.9))
+
+    # In a narrow viewport, wrapped tools must use the same row for painting and input.
+    var narrow = RectF(100, 50, 365, 350)
+    for cluster in range(1, 3):
+        var wrapped = UiDrawList()
+        _ = vhud.draw(
+            wrapped, 0, font, theme, anim_inst, narrow, VHUD_TOOL_MOVE, False, True, 0.5,
+            VHUD_PIE_STOPPED, False, False, False, False, False, True,
+            cam_r, cam_u, cam_f, 1, "", 0, 0, False, False,
+        )
+        var row = vhud.hit_rects[cluster]
+        assert_true(row.y > vhud.hit_rects[cluster - 1].y)
+        var pressed = vhud.draw(
+            wrapped, 0, font, theme, anim_inst, narrow, VHUD_TOOL_MOVE, False, True, 0.5,
+            VHUD_PIE_STOPPED, False, False, False, False, False, True,
+            cam_r, cam_u, cam_f, 1, "", row.x + 15, row.center_y(), True, True,
+        )
+        assert_equal(pressed.kind, VHUD_ACT_PIE_PLAY if cluster == 1 else VHUD_ACT_CAM_MODE)
 
     # PIE active draws perimeter border
     var dl_pie = UiDrawList()
@@ -916,14 +1000,79 @@ def test_agent_bus_theatre_3d_and_panel() raises:
     _ = STEP_COMPLETED
 
 
+def test_compact_workspace_and_select() raises:
+    var studio = FlintStudioState(headless=True, width=640, height=480, worker_threads=0)
+    studio.set_anim_mode(UI_ANIM_INSTANT)
+    studio.set_ui_scale(2)
+    var input = InputState()
+    var dt = Float32(1.0 / 60.0)
+
+    # A text field owns Q while editing. A fresh Q press in the viewport selects.
+    studio.ui_ctx._focused_text_id = UInt64(123)
+    input.begin_frame()
+    input.set_logical_key(81, True)
+    _ = studio.process_editor_input(input, dt)
+    assert_equal(studio.gizmo_mode, GIZMO_MODE_TRANSLATE)
+    studio.ui_ctx._focused_text_id = 0
+    input.begin_frame()
+    input.set_logical_key(81, False)
+    _ = studio.process_editor_input(input, dt)
+    studio.active_gizmo_handle = GIZMO_AXIS_X
+    input.begin_frame()
+    input.set_logical_key(81, True)
+    _ = studio.process_editor_input(input, dt)
+    assert_equal(studio.gizmo_mode, GIZMO_MODE_SELECT)
+    assert_equal(studio.active_gizmo_handle, GIZMO_AXIS_NONE)
+    input.begin_frame()
+    input.set_logical_key(81, False)
+    input.set_logical_key(87, True)
+    _ = studio.process_editor_input(input, dt)
+    assert_equal(studio.gizmo_mode, GIZMO_MODE_TRANSLATE)
+
+    # Click the compact workspace switcher at physical coordinates on a 2x screen.
+    var dl = UiDrawList()
+    var font = SdfFont()
+    input.begin_frame()
+    input.set_logical_key(87, False)
+    input.move_mouse(240, 40)
+    input.set_mouse(0, True)
+    emit_studio_ui_draw_list(dl, studio, 0, font, 640, 720, input=input)
+    assert_true(studio.command_palette.is_open)
+    assert_equal(studio.command_palette.raw_query, String("Workspace:"))
+
+    # On a shorter window, wheel through results that no longer fit on screen.
+    input.begin_frame()
+    input.set_mouse(0, False)
+    input.move_mouse(260, 260)
+    input.wheel = -5
+    emit_studio_ui_draw_list(dl, studio, 0, font, 640, 480, input=input)
+    assert_equal(studio.ui_ctx.mouse_delta_x, Float32(10))
+    assert_equal(studio.ui_ctx.mouse_delta_y, Float32(110))
+    assert_equal(studio.command_palette.viewport_rows, 3)
+    assert_true(studio.command_palette.scroll_top > 0)
+
+    input.begin_frame()
+    emit_studio_ui_draw_list(dl, studio, 0, font, 640, 960, input=input)
+    assert_true(studio.command_palette.viewport_rows >= 5)
+    studio.command_palette.set_query("Workspace: Lookdev")
+    input.begin_frame()
+    input.set_mouse(0, False)
+    input.set_logical_key(UI_KEY_ENTER, True)
+    _ = studio.process_editor_input(input, dt)
+    assert_false(studio.command_palette.is_open)
+    assert_equal(studio.workspace_mgr.active_preset, WORKSPACE_LOOKDEV)
+
+
 def main() raises:
     print("============================================================")
     print(" FLINT STUDIO REDESIGN — PHASE 2 FOUNDATION GATE SUITE")
     print("============================================================")
     test_gpu_prim_abi_and_springs()
     test_focus_visible_compatibility()
+    test_outliner_keyboard_navigation()
     test_tier0_cpu_raster_and_all_44_icons()
     test_ux_palette_notifications_header_and_hud()
+    test_compact_workspace_and_select()
     test_devtools_harvest_and_code_drawer()
     test_mcp_v2_hooks_gate_and_new_tools()
     test_agent_bus_theatre_3d_and_panel()

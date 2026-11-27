@@ -21,7 +21,7 @@ from flint.studio.source_editor import EmbeddedIde
 from flint.studio import scene_menu
 from flint.studio.autosave import discard_snapshot, recovery_directory, recovery_original, snapshot_original, snapshot_path, write_snapshot
 from std.collections import Dict
-from std.math import abs, asin, cos, isfinite, isinf, isnan, max, min, sin, sqrt
+from std.math import abs, acos, asin, cos, isfinite, isinf, isnan, max, min, sin, sqrt
 from std.memory import bitcast
 from flint.ai import AiPlugin, BehaviorTreeComponent, register_ai_codecs
 from flint.ai.behavior_tree import BtExecutionState
@@ -319,9 +319,11 @@ from flint.studio.code_drawer import (
     CODE_ACT_REJECT_HUNK,
     CODE_MODE_DIFF_UNIFIED,
     CodeDrawer,
+    CodeDrawerAction,
 )
 from flint.studio.gizmo import (
     GIZMO_AXIS_NONE,
+    GIZMO_MODE_SELECT,
     GIZMO_MODE_ROTATE,
     GIZMO_MODE_SCALE,
     GIZMO_MODE_TRANSLATE,
@@ -329,9 +331,20 @@ from flint.studio.gizmo import (
     GIZMO_SPACE_WORLD,
     ViewportRay,
     emit_gizmo_draw_list,
+    pick_gizmo_handle,
     ray_plane_hit,
 )
+from flint.ml.rgbmocap import (
+    export_mocap_take_bvh,
+    mocap_take_to_native_animation,
+)
+from flint.studio.mocap_panel import (
+    MocapStudioState,
+    draw_mocap_panel,
+    emit_mocap_viewport_overlay,
+)
 from flint.studio.notifications import (
+    JOB_KIND_ASSET_IMPORT,
     JobProgressTracker,
     TOAST_AGENT,
     TOAST_ERROR,
@@ -379,6 +392,9 @@ from flint.studio.palette_registry import (
     PAL_CMD_DUPLICATE,
     PAL_CMD_FRAME_SELECTION,
     PAL_CMD_LOAD_SCENE,
+    PAL_CMD_MOCAP_EXPORT_BVH,
+    PAL_CMD_MOCAP_LOAD_DEMO,
+    PAL_CMD_MOCAP_OPEN,
     PAL_CMD_RECOVER_AUTOSAVE,
     PAL_CMD_NEW_SCENE,
     PAL_CMD_OPEN_PALETTE,
@@ -460,7 +476,10 @@ from flint.studio.studio_panels import (
     OutlinerRowView,
     asset_filter_accent,
     classify_asset_filter,
+    draw_asset_empty_deck,
+    draw_inspector_identity,
     draw_outliner_panel_v2,
+    draw_studio_stats_panel,
 )
 from flint.studio.studio_workspace import (
     AgentCheckpointLog,
@@ -470,6 +489,7 @@ from flint.studio.studio_workspace import (
     PANEL_HIERARCHY,
     PANEL_INPUT_MAP,
     PANEL_INSPECTOR,
+    PANEL_MOCAP,
     PANEL_SCENE_VIEWPORT,
     WorkspacePresetManager,
     build_workspace_dockspace,
@@ -487,6 +507,7 @@ from flint.studio.viewport_hud import (
     HDR_ACT_WIN_MAXIMIZE,
     HDR_ACT_WIN_MINIMIZE,
     HDR_ACT_WORKSPACE,
+    HDR_ACT_WORKSPACE_PICKER,
     STUDIO_HEADER_BAR_H,
     StudioHeaderBar,
     VHUD_ACT_CAM_MODE,
@@ -525,6 +546,16 @@ from flint.studio.viewport_hud import (
 )
 from flint.ui.animator import UI_ANIM_INSTANT, UI_ANIM_NORMAL, UI_ANIM_REDUCED
 from flint.ui.context import (
+    BTN_DANGER,
+    BTN_GHOST,
+    BTN_PRIMARY,
+    BTN_SECONDARY,
+    UI_ALIGN_CENTER,
+    UI_ALIGN_LEFT,
+    UI_ALIGN_RIGHT,
+    UI_FONT_BOLD,
+    UI_FONT_MONO,
+    UI_FONT_REGULAR,
     UI_KEY_BACKSPACE,
     UI_KEY_DOWN,
     UI_KEY_ENTER,
@@ -535,9 +566,12 @@ from flint.ui.context import (
     hash_ui_id,
     pack_rgba8,
 )
-from flint.ui.draw_list import PRIM_GLYPH, UiDrawList
-from flint.ui.hud import hud_bar
+from flint.ui.draw_list import PRIM_GLYPH, UI_FLAG_BORDER, UI_FLAG_TOP_BEVEL, UiDrawList
+from flint.ui.hud import game_hud
+from flint.ui.icons import draw_studio_chevron, draw_studio_icon
 from flint.ui.theme import (
+    ICON_AUDIO, ICON_CAMERA, ICON_CUBE, ICON_EMPTY, ICON_FOLDER, ICON_LIGHT_POINT,
+    ICON_LIGHT_SPOT, ICON_PLUS, ICON_REFRESH, ICON_SEARCH, icon_for_path,
     AGENT_STATE_BUILDING,
     AGENT_STATE_EDITING_SCENE,
     AGENT_STATE_ERROR,
@@ -547,11 +581,22 @@ from flint.ui.theme import (
     AGENT_STATE_THINKING,
     AGENT_STATE_WAITING_APPROVAL,
     AGENT_STATE_WRITING_CODE,
+    ICON_COLLIDER,
+    ICON_FOCUS_CAM,
+    ICON_GRID,
+    ICON_MATERIAL,
+    ICON_MOVE,
+    ICON_REVERT,
+    ICON_SPARK,
+    RADIUS_MD,
+    RADIUS_SM,
+    RADIUS_XS,
     StudioTheme,
     THEME_FLINT_OBSIDIAN,
     THEME_MIDNIGHT_STUDIO,
     THEME_OKABE_ITO,
     THEME_PAPER_LIGHT,
+    rgba8_scale_alpha,
     rgba8_with_alpha,
 )
 from flint.ui.flexbox_dock import (
@@ -1620,6 +1665,7 @@ def _load_studio_dockspace() -> DockSpace:
         _ensure_dock_panel_tab(loaded, "CodeDrawer", "AssetBrowser")
         _ensure_dock_panel_tab(loaded, "InputMap", "AssetBrowser")
         _ensure_dock_panel_tab(loaded, "MCP v2", "AssetBrowser")
+        _ensure_dock_panel_tab(loaded, PANEL_MOCAP, PANEL_INSPECTOR)
         return loaded^
     return d^
 
@@ -1702,6 +1748,7 @@ def _resolve_default_scene_path(project_root: String) -> String:
 def _create_studio_input_map() -> InputMap:
     """Declarative `InputMap` for `Flint Studio`: split `StudioEditor` (prio 10) and `StudioPlay` (prio 20)."""
     var imap = InputMap()
+    _ = imap.register_action("gizmo_select", ACTION_BOOL)
     _ = imap.register_action("gizmo_translate", ACTION_BOOL)
     _ = imap.register_action("gizmo_rotate", ACTION_BOOL)
     _ = imap.register_action("gizmo_scale", ACTION_BOOL)
@@ -1727,6 +1774,7 @@ def _create_studio_input_map() -> InputMap:
     _ = imap.register_action("cam_orbit", ACTION_AXIS2D)
 
     var ctx = InputContext("StudioEditor", priority=10)
+    ctx.bind_key("gizmo_select", 81)
     ctx.bind_key("gizmo_translate", 87)                  # W
     ctx.bind_key("gizmo_rotate", 69)                     # E
     ctx.bind_key("gizmo_scale", 82)                      # R
@@ -2005,6 +2053,8 @@ struct FlintStudioState(Movable):
     var gizmo_mode: Int
     var gizmo_local_space: Bool
     var active_gizmo_handle: Int
+    var hovered_gizmo_handle: Int
+    var gizmo_drag_delta_text: String
     var snap_enabled: Bool
     var grid_snap_m: Float32
     var angle_snap_deg: Float32
@@ -2049,6 +2099,9 @@ struct FlintStudioState(Movable):
     var import_dst_subdir: String
 
     var dock: DockSpace
+    var editor_font_slot: Int
+    var editor_font_bold_slot: Int
+    var editor_font_mono_slot: Int
     var ui_ctx: UiContext
     var camera_rig: CameraRig
     var _cam_dummy_world: PhysicsWorld
@@ -2108,6 +2161,8 @@ struct FlintStudioState(Movable):
     var agent_checkpoints: AgentCheckpointLog
     var _last_theatre_hits: List[TheatrePillHit]
     var code_drawer: CodeDrawer
+    var mocap: MocapStudioState
+    var _mocap_initialized: Bool
     var show_grid_overlay: Bool
     var cam_ortho: Bool
     var gallery_play_hud_active: Bool
@@ -2188,6 +2243,8 @@ struct FlintStudioState(Movable):
         self.gizmo_mode = GIZMO_MODE_TRANSLATE
         self.gizmo_local_space = False
         self.active_gizmo_handle = GIZMO_AXIS_NONE
+        self.hovered_gizmo_handle = GIZMO_AXIS_NONE
+        self.gizmo_drag_delta_text = String("")
         self.snap_enabled = True
         self.grid_snap_m = Float32(0.25)
         self.angle_snap_deg = Float32(15.0)
@@ -2232,6 +2289,9 @@ struct FlintStudioState(Movable):
         self.import_dst_subdir = "assets"
 
         self.dock = _load_studio_dockspace()
+        self.editor_font_slot = -2
+        self.editor_font_bold_slot = -2
+        self.editor_font_mono_slot = -2
         self.ui_ctx = UiContext(preset_hud=False)
         self.ui_ctx.theme.font_size = Float32(13.0)
         self.ui_ctx.theme.row_height = Float32(22.0)
@@ -2262,6 +2322,8 @@ struct FlintStudioState(Movable):
         self.agent_checkpoints = AgentCheckpointLog()
         self._last_theatre_hits = List[TheatrePillHit]()
         self.code_drawer = CodeDrawer()
+        self.mocap = MocapStudioState()
+        self._mocap_initialized = False
         self.show_grid_overlay = True
         self.cam_ortho = False
         self.gallery_play_hud_active = False
@@ -2790,8 +2852,6 @@ struct FlintStudioState(Movable):
 
     @always_inline
     def effective_ui_scale(self) -> Float32:
-        if self.anim_mode == UI_ANIM_INSTANT:
-            return Float32(1.0)
         return max(Float32(0.75), min(Float32(3.0), self.ui_scale))
 
     def viewport_rect(mut self, screen_w: Int, screen_h: Int) -> RectF:
@@ -2908,6 +2968,7 @@ struct FlintStudioState(Movable):
         depth: Int,
         mut out: List[HierarchyRow],
         mut visited: List[Bool],
+        include_collapsed: Bool,
     ):
         if entity_id < 0 or entity_id >= len(visited) or visited[entity_id] or depth >= 64:
             return
@@ -2916,11 +2977,11 @@ struct FlintStudioState(Movable):
         var has_ch = len(ch) > 0
         var exp = self.is_hierarchy_expanded(entity_id)
         out.append(HierarchyRow(entity_id, parent_id, depth, has_ch, exp))
-        if has_ch and exp:
+        if has_ch and (exp or include_collapsed):
             for i in range(len(ch)):
-                self._collect_hierarchy_dfs(ch[i], entity_id, depth + 1, out, visited)
+                self._collect_hierarchy_dfs(ch[i], entity_id, depth + 1, out, visited, include_collapsed)
 
-    def hierarchy_visible_rows(self) -> List[HierarchyRow]:
+    def hierarchy_visible_rows(self, include_collapsed: Bool = False) -> List[HierarchyRow]:
         var out = List[HierarchyRow]()
         var n = len(self.app.world.entities)
         if n == 0:
@@ -2928,11 +2989,11 @@ struct FlintStudioState(Movable):
         var visited = List[Bool](length=n, fill=False)
         for i in range(n):
             if self.app.world.entities[i].alive and self.parent_of(i) < 0:
-                self._collect_hierarchy_dfs(i, -1, 0, out, visited)
+                self._collect_hierarchy_dfs(i, -1, 0, out, visited, include_collapsed)
         # Fallback for any orphan whose parent died externally (never emit children of collapsed live parents)
         for i in range(n):
             if self.app.world.entities[i].alive and not visited[i] and self.parent_of(i) < 0:
-                self._collect_hierarchy_dfs(i, -1, 0, out, visited)
+                self._collect_hierarchy_dfs(i, -1, 0, out, visited, include_collapsed)
         return out^
 
     def hierarchy_display_order(self) -> List[Int]:
@@ -3357,6 +3418,7 @@ struct FlintStudioState(Movable):
             return False
 
         if cmd_id == PAL_CMD_TOOL_SELECT:
+            self.gizmo_mode = GIZMO_MODE_SELECT
             self.active_gizmo_handle = GIZMO_AXIS_NONE
             return True
         if cmd_id == PAL_CMD_TOOL_MOVE:
@@ -3613,8 +3675,141 @@ struct FlintStudioState(Movable):
             var a = AgentPanelAction(PANEL_ACT_TIME_TRAVEL_EXIT)
             self.apply_agent_panel_action(a)
             return True
+        if cmd_id == PAL_CMD_MOCAP_OPEN:
+            return self.open_dock_panel(PANEL_MOCAP)
+        if cmd_id == PAL_CMD_MOCAP_LOAD_DEMO:
+            self.ensure_mocap_initialized()
+            self.mocap.load_demo_take()
+            _ = self.open_dock_panel(PANEL_MOCAP)
+            self.push_toast("Loaded 90f SOMA-77 RGBMocap demo take", 0, 2.5)
+            return True
+        if cmd_id == PAL_CMD_MOCAP_EXPORT_BVH:
+            return self._export_mocap_take(False)
 
         return False
+
+    def ensure_mocap_initialized(mut self):
+        """Lazily initializes `self.mocap` (probes commercial-safe model caches + deterministic demo take)."""
+        if not self._mocap_initialized:
+            self._mocap_initialized = True
+            self.mocap.init_default()
+
+    def open_dock_panel(mut self, panel_name: String) -> Bool:
+        """Activates a dock panel by canonical ID or friendly CLI alias (e.g. `'mocap'`, `'agents'`)."""
+        var low = FlintStudioState._ascii_lower(String(panel_name.strip()))
+        var canon = String(panel_name.strip())
+        if low == "mocap" or low == "rgbmocap":
+            canon = PANEL_MOCAP
+        elif low == "inspector":
+            canon = PANEL_INSPECTOR
+        elif low == "agents" or low == "agent":
+            canon = PANEL_AGENTS
+        elif low == "hierarchy" or low == "outliner":
+            canon = PANEL_HIERARCHY
+        elif low == "assets" or low == "assetbrowser":
+            canon = PANEL_ASSET_BROWSER
+        elif low == "code" or low == "codedrawer":
+            canon = PANEL_CODE_DRAWER
+        elif low == "input" or low == "inputmap":
+            canon = PANEL_INPUT_MAP
+        if canon == PANEL_MOCAP:
+            self.ensure_mocap_initialized()
+            _ensure_dock_panel_tab(self.dock, PANEL_MOCAP, PANEL_INSPECTOR)
+        return WorkspacePresetManager.ensure_panel_visible(self.dock, canon)
+
+    def _trigger_mocap_capture(mut self):
+        self.ensure_mocap_initialized()
+        var b_idx = max(0, min(len(self.mocap.backends) - 1, self.mocap.selected_backend))
+        var has_weights = len(self.mocap.backends) > 0 and self.mocap.backends[b_idx].weights_present
+        var b_name = self.mocap.backends[b_idx].name if len(self.mocap.backends) > 0 else String("GEM-X")
+        var jid = self.job_tracker.start_job(
+            JOB_KIND_ASSET_IMPORT,
+            "RGBMocap: " + b_name,
+            cancellable=False,
+            always_show_pill=False,
+        )
+        if not has_weights:
+            self.mocap.status_message = "Cache empty — run python tools/gemx/export.py (demo take active)"
+            if not self.mocap.has_take:
+                self.mocap.load_demo_take()
+            _ = self.job_tracker.complete_job(jid, True, "Demo take active (weights missing)")
+            self.push_toast(
+                "Model cache empty — run python tools/gemx/export.py (using 90f demo take)",
+                1,
+                4.0,
+            )
+            return
+        self.job_tracker.update_job(jid, Float32(0.5), "Cleaning SOMA-77 take...")
+        if not self.mocap.has_take:
+            self.mocap.load_demo_take()
+        else:
+            self.mocap.recompute_cleanup()
+        self.mocap.status_message = "Cleaned " + String(self.mocap.clean_take.num_frames()) + "f via " + b_name
+        _ = self.job_tracker.complete_job(jid, True, self.mocap.status_message)
+        self.push_toast("RGBMocap capture ready (" + String(self.mocap.clean_take.num_frames()) + " frames)", 0, 3.0)
+
+    def _apply_mocap_to_selected_entity(mut self) -> Bool:
+        self.ensure_mocap_initialized()
+        if not self.mocap.has_take or self.mocap.clean_take.num_frames() <= 0:
+            self.push_toast("No MoCap take loaded", 1, 2.5)
+            return False
+        var clip = mocap_take_to_native_animation(self.mocap.clean_take, name=self.mocap.clean_take.name)
+        var nf = self.mocap.clean_take.num_frames()
+        var fi = max(0, min(nf - 1, self.mocap.current_frame))
+        var target_id = self.selected_entity_id
+        if target_id >= 0 and self.is_alive_id(target_id):
+            var before = self._capture_world_blob()
+            var target_e = self.resolve_entity(target_id)
+            if target_e.valid():
+                var tr_ptr = self.app.world.get_ptr_mut[LocalTransform](target_e)
+                if tr_ptr:
+                    tr_ptr.value()[unsafe_offset=0].translation = self.mocap.clean_take.frames[fi].root_pos
+                _ = self.commit_ecs_edit(target_id, "Apply RGBMocap Pose", before^)
+            var ename = self.entities[target_id].name if target_id < len(self.entities) else ("Entity #" + String(target_id))
+            self.mocap.status_message = "Applied " + String(len(clip.channels)) + "ch clip -> " + ename
+            self.push_toast(
+                "Applied MoCap '" + clip.name + "' (" + String(len(clip.channels)) + " ch, " + String(nf) + "f) to " + ename,
+                0,
+                3.0,
+            )
+            return True
+        self.mocap.status_message = "Prepared " + String(len(clip.channels)) + "ch NativeAnimation (" + String(nf) + "f)"
+        self.push_toast(
+            "Converted MoCap to NativeAnimation (" + String(len(clip.channels)) + " ch, " + String(nf) + "f) — select an entity to apply",
+            0,
+            3.0,
+        )
+        return True
+
+    def _export_mocap_take(mut self, as_glb: Bool) -> Bool:
+        self.ensure_mocap_initialized()
+        if not self.mocap.has_take or self.mocap.clean_take.num_frames() <= 0:
+            self.push_toast("No MoCap take loaded to export", 1, 2.5)
+            return False
+        var out_path = String(self.mocap.output_bvh_path.strip())
+        if out_path.byte_length() == 0:
+            out_path = "build/mocap_export.bvh"
+        var pdir = parent_directory(out_path)
+        if pdir.byte_length() > 0 and pdir != ".":
+            _ = make_dirs(pdir)
+        try:
+            export_mocap_take_bvh(self.mocap.clean_take, out_path)
+            if as_glb:
+                var clip = mocap_take_to_native_animation(self.mocap.clean_take, name=self.mocap.clean_take.name)
+                self.mocap.status_message = "Exported BVH + " + String(len(clip.channels)) + "ch clip -> " + out_path
+                self.push_toast(
+                    "Exported cleaned MoCap (" + String(len(clip.channels)) + " ch) -> " + out_path,
+                    0,
+                    3.0,
+                )
+            else:
+                self.mocap.status_message = "Exported BVH -> " + out_path
+                self.push_toast("Exported cleaned BVH -> " + out_path, 0, 3.0)
+            return True
+        except e:
+            self.mocap.status_message = "Export failed: " + String(e)
+            self.push_toast("MoCap export failed: " + String(e), 2, 3.5)
+            return False
 
     def record_agent_step_checkpoint(
         mut self,
@@ -4607,6 +4802,8 @@ struct FlintStudioState(Movable):
             self._rmb_fly_active = True
         var rmb_fly = self._rmb_fly_active
         if not rmb_fly and not kbd_captured and not in_play:
+            if self.input_map.just_pressed("gizmo_select"):
+                _ = self.execute_palette_command(PAL_CMD_TOOL_SELECT)
             if self.input_map.just_pressed("gizmo_translate"):
                 self.gizmo_mode = GIZMO_MODE_TRANSLATE
             if self.input_map.just_pressed("gizmo_rotate"):
@@ -5321,6 +5518,9 @@ struct FlintStudioState(Movable):
                         or name == ".pixi"
                         or name == "__pycache__"
                         or name == ".agents"
+                        or name == ".claude"
+                        or name == ".codex"
+                        or name == ".gemini"
                     ):
                         continue
                     var full = cur_dir + "/" + name
@@ -7161,6 +7361,21 @@ struct FlintStudioState(Movable):
         if len(aff) == 0:
             return False
 
+        if mode == GIZMO_MODE_TRANSLATE:
+            var mag = world_delta_pos.length()
+            if isfinite(mag) and mag > Float32(1.0e-4):
+                var sgn = String("+") if (world_delta_pos.x + world_delta_pos.y + world_delta_pos.z) >= Float32(0.0) else String("-")
+                self.gizmo_drag_delta_text = sgn + _fmt_f32_2dp(mag) + "m"
+        elif mode == GIZMO_MODE_ROTATE:
+            var w_clamped = max(Float32(-1.0), min(Float32(1.0), abs(world_dq_rot.w)))
+            var ang_deg = Float32(2.0) * Float32(acos(Float64(w_clamped))) * (Float32(180.0) / PI)
+            if isfinite(ang_deg) and ang_deg > Float32(0.05):
+                self.gizmo_drag_delta_text = _fmt_f32_2dp(ang_deg) + "°"
+        elif mode == GIZMO_MODE_SCALE:
+            var avg_s = (scale_factor.x + scale_factor.y + scale_factor.z) / Float32(3.0)
+            if isfinite(avg_s) and abs(avg_s - Float32(1.0)) > Float32(1.0e-3):
+                self.gizmo_drag_delta_text = _fmt_f32_2dp(avg_s) + "x"
+
         self._sync_ecs_and_physics()
         self._record_world_tx(
             TX_BATCH_EDIT,
@@ -7672,6 +7887,47 @@ struct FlintStudioState(Movable):
         var font_copy = SdfFont()
         if rend_opt:
             ref renderer = rend_opt.value()[unsafe_offset=0]
+            if self.editor_font_slot == -2:
+                self.editor_font_slot = -1
+                var face = SdfFont()
+                var reg_ok = (
+                    face.load_msdf("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 48, 6)
+                    or face.load_msdf("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 48, 6)
+                    or face.load_ttf("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 48, 6)
+                )
+                if reg_ok:
+                    self.editor_font_slot = renderer.register_ui_font(face)
+                    if self.editor_font_slot >= 0:
+                        face.mark_clean()
+                        self.ui_ctx.font = face^
+            if self.editor_font_bold_slot == -2:
+                self.editor_font_bold_slot = -1
+                var bold_face = SdfFont()
+                var bold_ok = (
+                    bold_face.load_msdf("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48, 6)
+                    or bold_face.load_msdf("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 48, 6)
+                    or bold_face.load_ttf("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48, 6)
+                )
+                if bold_ok:
+                    self.editor_font_bold_slot = renderer.register_ui_font(bold_face)
+                    if self.editor_font_bold_slot >= 0:
+                        bold_face.mark_clean()
+                        self.ui_ctx.set_bold_font(bold_face^, self.editor_font_bold_slot)
+            if self.editor_font_mono_slot == -2:
+                self.editor_font_mono_slot = -1
+                var mono_face = SdfFont()
+                var mono_ok = (
+                    mono_face.load_msdf("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 48, 6)
+                    or mono_face.load_msdf("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 48, 6)
+                    or mono_face.load_msdf("/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf", 48, 6)
+                    or mono_face.load_ttf("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 48, 6)
+                )
+                if mono_ok:
+                    self.editor_font_mono_slot = renderer.register_ui_font(mono_face)
+                    if self.editor_font_mono_slot >= 0:
+                        mono_face.mark_clean()
+                        self.ui_ctx.set_mono_font(mono_face^, self.editor_font_mono_slot)
+            font_slot = self.editor_font_slot
             var n_ents = len(self.app.world.entities)
             while len(self.gpu_materials.entity_pbr_mat_ids) < n_ents:
                 self.gpu_materials.entity_pbr_mat_ids.append(-1)
@@ -7691,8 +7947,10 @@ struct FlintStudioState(Movable):
 
             if renderer.uses_vulkan():
                 ref gpu = renderer.gpu_slot[0]
-                font_slot = gpu.ui_font_atlas_slot
-                font_copy = gpu.ui_font.copy()
+                if font_slot < 0:
+                    font_slot = gpu.ui_font_atlas_slot
+                    if not self.ui_ctx.font.valid:
+                        font_copy = gpu.ui_font.copy()
 
                 if self.preview_shockwave_active:
                     gpu.submit_shockwave(
@@ -8023,6 +8281,23 @@ struct FlintStudioState(Movable):
             input=input,
             dt=dt,
         )
+        if rend_time_opt:
+            ref font_renderer = rend_time_opt.value()[]
+            if self.editor_font_slot >= 0 and self.ui_ctx.font.is_dirty():
+                if (not font_renderer.uses_vulkan() or
+                    font_renderer.gpu_slot[0].update_ui_font_atlas_slot(self.editor_font_slot, self.ui_ctx.font)):
+                    self.ui_ctx.font.mark_clean()
+                    font_renderer.cpu_ui_fonts[self.editor_font_slot] = self.ui_ctx.font.copy()
+            if self.editor_font_bold_slot >= 0 and self.ui_ctx.font_bold.is_dirty():
+                if (not font_renderer.uses_vulkan() or
+                    font_renderer.gpu_slot[0].update_ui_font_atlas_slot(self.editor_font_bold_slot, self.ui_ctx.font_bold)):
+                    self.ui_ctx.font_bold.mark_clean()
+                    font_renderer.cpu_ui_fonts[self.editor_font_bold_slot] = self.ui_ctx.font_bold.copy()
+            if self.editor_font_mono_slot >= 0 and self.ui_ctx.font_mono.is_dirty():
+                if (not font_renderer.uses_vulkan() or
+                    font_renderer.gpu_slot[0].update_ui_font_atlas_slot(self.editor_font_mono_slot, self.ui_ctx.font_mono)):
+                    self.ui_ctx.font_mono.mark_clean()
+                    font_renderer.cpu_ui_fonts[self.editor_font_mono_slot] = self.ui_ctx.font_mono.copy()
         var nav_res = self.app.resources.get_ptr_mut[NavPluginStateResource]()
         if nav_res:
             nav_res.value()[unsafe_offset=0].draw_debug = self.show_navmesh_overlay
@@ -9053,6 +9328,350 @@ def upload_default_studio_gpu_assets(mut studio: FlintStudioState):
     studio._sync_compat_view()
 
 
+comptime ASSET_DIALOG_IMPORT = 1
+comptime ASSET_DIALOG_CREATE = 2
+
+
+def _asset_spawn_controls(mut studio: FlintStudioState, first: Int, last: Int, button_w: Float32):
+    var ids = [String("card_empty"), String("card_cube"), String("card_point_light"), String("card_spot_light"), String("card_camera"), String("card_audio_emitter")]
+    var labels = [String("Empty"), String("Cube"), String("Point Light"), String("Spot Light"), String("Camera"), String("Audio Emitter")]
+    var icons = [ICON_EMPTY, ICON_CUBE, ICON_LIGHT_POINT, ICON_LIGHT_SPOT, ICON_CAMERA, ICON_AUDIO]
+    for i in range(first, last):
+        var w = button_w if button_w > 0 else studio.ui_ctx._measure_text(labels[i], studio.studio_theme.font_body) + Float32(32)
+        if studio.ui_ctx.icon_button(ids[i], icons[i], labels[i], w=w, h=24):
+            _ = studio.spawn_card_entity(i)
+            studio.asset_browser_state.dialog = 0
+
+
+def _begin_insp_card_body(
+    mut ui: UiContext,
+    hdr_r: RectF,
+    theme: StudioTheme,
+    inset: Float32 = 6.0,
+) -> Tuple[Int, Float32, Float32]:
+    """Starts a joined lower `L2_card` body under a `collapsible_card` header without altering `id_stack`."""
+    var top_i = len(ui.box_stack) - 1
+    var orig_x = ui.box_stack[top_i].cursor_x
+    var body_y = hdr_r.bottom() - Float32(1.0)
+    ui.draw_list.add_rounded_rect_ex(
+        hdr_r.x,
+        body_y,
+        hdr_r.w,
+        Float32(4.0),
+        theme.l2_card,
+        Float32(0.0),
+        Float32(0.0),
+        RADIUS_MD,
+        RADIUS_MD,
+        Float32(1.0),
+        theme.border_subtle,
+        Float32(1.0),
+        0,
+    )
+    var bg_idx = len(ui.draw_list.prims) - 1
+    ui.box_stack[top_i].cursor_x = hdr_r.x + inset
+    ui.box_stack[top_i].cursor_y = hdr_r.bottom() + Float32(5.0)
+    return (bg_idx, orig_x, max(Float32(60.0), hdr_r.w - inset * Float32(2.0)))
+
+
+def _end_insp_card_body(
+    mut ui: UiContext,
+    bg_idx: Int,
+    orig_x: Float32,
+    bottom_gap: Float32 = 6.0,
+):
+    """Patches the joined `L2_card` body height in-place and restores the parent cursor."""
+    var top_i = len(ui.box_stack) - 1
+    var end_y = ui.box_stack[top_i].cursor_y + Float32(4.0)
+    if bg_idx >= 0 and bg_idx < len(ui.draw_list.prims):
+        ui.draw_list.prims[bg_idx].y1 = max(ui.draw_list.prims[bg_idx].y0 + Float32(4.0), end_y)
+    ui.box_stack[top_i].cursor_x = orig_x
+    ui.box_stack[top_i].cursor_y = end_y + bottom_gap
+
+
+def _draw_insp_header_badge(
+    mut ui: UiContext,
+    hdr_r: RectF,
+    text: String,
+    bg: UInt32,
+    fg: UInt32,
+):
+    """Draws a compact right-aligned semantic pill inside a `collapsible_card` header bar."""
+    var fsz = ui.studio_theme.font_caption
+    var tw = ui._measure_text_styled(text, fsz, UI_FONT_BOLD)
+    var pw = max(Float32(34.0), tw + Float32(12.0))
+    var ph = Float32(18.0)
+    if hdr_r.w < pw + Float32(72.0):
+        return
+    var px = hdr_r.right() - pw - Float32(6.0)
+    var py = hdr_r.center_y() - ph * Float32(0.5)
+    ui.draw_list.add_rect_styled(
+        px, py, pw, ph,
+        bg, rgba8_with_alpha(fg, 96),
+        RADIUS_XS, Float32(1.0), Float32(1.0), UI_FLAG_BORDER,
+    )
+    ui.draw_text_in_rect(RectF(px, py, pw, ph), text, fsz, fg, UI_ALIGN_CENTER, UI_FONT_BOLD)
+
+
+def _draw_insp_sub_disclosure(
+    mut ui: UiContext,
+    id: String,
+    label_text: String,
+    width: Float32,
+    theme: StudioTheme,
+    default_open: Bool = False,
+) -> Bool:
+    """Subtle in-card sub-disclosure (1px top hairline + smooth chevron + muted caption) compatible with `tree_pop()`."""
+    var top_i = len(ui.box_stack) - 1
+    var row_h = Float32(22.0)
+    var wid = ui.widget_id(id)
+    var st = ui._get_state(wid)
+    if not st.tree_initialized:
+        st.tree_open = default_open
+        st.tree_initialized = True
+        ui.state_map[wid] = st
+    var r = ui._alloc_item_rect(wid, width, row_h)
+    ui._register_focusable(wid, allow_auto_focus=False)
+    ui.draw_list.add_line(r.x, r.y + Float32(0.5), r.right(), r.y + Float32(0.5), Float32(1.0), theme.border_subtle)
+    var blocked = ui._blocked_by_modal()
+    var ptr_blocked = blocked or ui._is_pointer_blocked_by_popup(wid)
+    var hov = (not ptr_blocked) and r.contains(ui.mouse_x, ui.mouse_y)
+    if hov:
+        ui.hovered_id = wid
+        ui.hovered_rect = ui._clip_hovered_rect(r)
+        ui.draw_list.add_rect(r.x, r.y + Float32(2.0), r.w, r.h - Float32(2.0), theme.l3_raised, RADIUS_XS)
+        if ui.mouse_pressed_l:
+            ui._set_focused(wid)
+            st.tree_open = not st.tree_open
+            ui.state_map[wid] = st
+    elif (not blocked) and ui.focused_id == wid and (ui.key_enter_pressed or ui.key_space_pressed or ui.pad_confirm):
+        st.tree_open = not st.tree_open
+        ui.state_map[wid] = st
+    var exp_t = ui.animator.drive_expand(wid, st.tree_open)
+    draw_studio_chevron(
+        ui.draw_list,
+        r.x + Float32(2.0),
+        r.center_y() - Float32(5.0) + Float32(1.0),
+        Float32(10.0),
+        theme.text_primary if (st.tree_open or hov) else theme.text_muted,
+        exp_t,
+        Float32(1.35),
+    )
+    ui.draw_text_in_rect(
+        RectF(r.x + Float32(16.0), r.y + Float32(1.0), max(Float32(16.0), r.w - Float32(18.0)), r.h - Float32(1.0)),
+        label_text,
+        theme.font_caption,
+        theme.text_primary if (st.tree_open or hov) else theme.text_secondary,
+        UI_ALIGN_LEFT,
+        UI_FONT_BOLD if st.tree_open else UI_FONT_REGULAR,
+        truncate=True,
+    )
+    if st.tree_open:
+        ui.box_stack[top_i].cursor_x += Float32(16.0)
+        ui.id_stack.append(wid)
+    return st.tree_open
+
+
+def _draw_insp_segmented_3(
+    mut ui: UiContext,
+    id: String,
+    label_text: String,
+    opt0: String,
+    opt1: String,
+    opt2: String,
+    mut selected_idx: Int,
+    theme: StudioTheme,
+    row_w: Float32,
+) -> Bool:
+    """Obsidian v2 left-label 3-way segmented pill control."""
+    var row_pair = ui.property_row_label(label_text, row_w)
+    var ctrl = row_pair[1]
+    ui.draw_list.add_recessed_well(
+        ctrl.x, ctrl.y + Float32(1.0), ctrl.w, max(Float32(18.0), ctrl.h - Float32(2.0)),
+        theme.l0_canvas, theme.border_subtle, RADIUS_SM, Float32(1.0),
+    )
+    var opts = [opt0, opt1, opt2]
+    var gap = Float32(2.0)
+    var seg_w = max(Float32(18.0), (ctrl.w - Float32(4.0) - gap * Float32(2.0)) / Float32(3.0))
+    var changed = False
+    var blocked = ui._blocked_by_modal()
+    var ptr_blocked = blocked or ui._is_pointer_blocked_by_popup()
+    for i in range(3):
+        var sr = RectF(
+            ctrl.x + Float32(2.0) + Float32(i) * (seg_w + gap),
+            ctrl.y + Float32(3.0),
+            seg_w,
+            max(Float32(14.0), ctrl.h - Float32(6.0)),
+        )
+        var sid = ui.widget_id(id + "#seg_" + String(i))
+        ui._register_focusable(sid, allow_auto_focus=False)
+        var is_sel = selected_idx == i
+        var hov = (not ptr_blocked) and sr.contains(ui.mouse_x, ui.mouse_y)
+        if hov:
+            ui.hovered_id = sid
+            ui.hovered_rect = ui._clip_hovered_rect(sr)
+            if ui.mouse_pressed_l and selected_idx != i:
+                selected_idx = i
+                changed = True
+        if is_sel:
+            ui.draw_list.add_rect_styled(
+                sr.x, sr.y, sr.w, sr.h,
+                theme.l3_raised, theme.border_control,
+                RADIUS_XS, Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+            )
+        elif hov:
+            ui.draw_list.add_rect(sr.x, sr.y, sr.w, sr.h, theme.l2_card, RADIUS_XS)
+        ui.draw_text_in_rect(
+            sr, opts[i], theme.font_caption,
+            theme.accent_primary if is_sel else (theme.text_primary if hov else theme.text_secondary),
+            UI_ALIGN_CENTER, UI_FONT_BOLD if is_sel else UI_FONT_REGULAR, pad_x=Float32(2.0), truncate=True,
+        )
+    return changed
+
+
+def _draw_project_assets(mut studio: FlintStudioState, panel: RectF):
+    if not studio.asset_browser_scanned and (studio.asset_browser_dir or studio.asset_browser_pack):
+        _ = studio.scan_asset_browser()
+    ref ui = studio.ui_ctx
+    ref theme = studio.studio_theme
+    var width = max(Float32(1), panel.w - 16)
+    var total = len(studio.asset_browser_entries)
+    var wide = width >= 800
+    var toolbar = FlexStyle.row(gap=5, pad=0)
+    toolbar.fixed_h = 28
+    toolbar.min_h = 28
+    toolbar.shrink = 0
+    ui.begin_box("ab_toolbar", toolbar)
+    var import_w = Float32(92) if width >= 295 else Float32(27)
+    var create_w = Float32(79) if width >= 295 else Float32(27)
+    var search_w = min(Float32(180), width * Float32(0.29)) if total > 0 and width >= 390 else Float32(0)
+    var context_w = max(Float32(0), width - import_w - (Float32(0) if wide else create_w + 5) - 40 - (search_w + 5 if search_w > 0 else Float32(0)))
+    var context = ui._alloc_item_rect(ui.widget_id("ab_context"), context_w, 26)
+    if context.w > 27:
+        draw_studio_icon(ui.draw_list, ICON_FOLDER, context.x + 2, context.center_y() - 8, 16, theme.accent_primary, 1.5)
+    if context.w > 62:
+        var name = "Project"
+        if total > 0:
+            name += "  /  " + String(total) + (" asset" if total == 1 else " assets")
+        ui._draw_text(ui._truncate_text_ellipsis(name, context.w - 26, theme.font_body), context.x + 25, context.center_y() - theme.font_body * 0.5, theme.font_body, theme.text_secondary)
+    if search_w > 0:
+        _ = ui.text_input("ab_search", studio.asset_browser_state.search_query, search_w, "Find assets")
+    if not wide and ui.icon_button("ab_create", ICON_CUBE, "Create" if create_w > 30 else "", w=create_w, h=26):
+        studio.asset_browser_state.dialog = ASSET_DIALOG_CREATE
+    if ui.icon_button("ab_rescan", ICON_REFRESH, w=27, h=26):
+        _ = studio.scan_asset_browser()
+    if ui.icon_button("ab_import", ICON_PLUS, "Import" if import_w > 30 else "", active=True, w=import_w, h=26):
+        studio.asset_browser_state.dialog = ASSET_DIALOG_IMPORT
+    ui.end_box()
+
+    var controls_h = Float32(34)
+    if wide:
+        ui.begin_box("ab_spawn_cards", toolbar)
+        _asset_spawn_controls(studio, 0, 6, 0)
+        ui.end_box()
+        controls_h += 32
+    elif total > 0 and search_w == 0:
+        _ = ui.text_input("ab_search_compact", studio.asset_browser_state.search_query, max(Float32(40), width - 4), "Find assets")
+        controls_h += 32
+
+    var query = FlintStudioState._ascii_lower(String(studio.asset_browser_state.search_query.strip()))
+    var match_count = 0
+    for i in range(len(studio.asset_browser_entries)):
+        if (not query) or FlintStudioState._ascii_lower(studio.asset_browser_entries[i]).find(query) >= 0:
+            match_count += 1
+
+    if match_count == 0:
+        # Render empty deck directly on l1_shell (no phantom scrollbar / zero 2x HiDPI bottom clip)
+        # while still registering `ab_entries_scroll` in `cached_rects` for layout contracts.
+        var deck_h = max(Float32(24.0), panel.h - controls_h - Float32(10.0))
+        var empty_rect = ui._alloc_item_rect(ui.widget_id("ab_entries_scroll"), width, deck_h)
+        var deck_act = draw_asset_empty_deck(ui, empty_rect, theme, total > 0)
+        if deck_act[0]:
+            studio.asset_browser_state.dialog = ASSET_DIALOG_IMPORT
+        elif deck_act[1] >= 0:
+            _ = studio.spawn_card_entity(deck_act[1])
+    else:
+        var scroll_h = max(Float32(24), panel.h - controls_h - 18)
+        ui.begin_scroll_view("ab_entries_scroll", 0.0, scroll_h, frameless=True)
+        var entry_w = max(Float32(24), width - 16)
+        for i in range(len(studio.asset_browser_entries)):
+            var path = studio.asset_browser_entries[i]
+            if query and FlintStudioState._ascii_lower(path).find(query) < 0:
+                continue
+            var clicked = ui.button("ab_item_" + String(i), "", entry_w, 26)
+            var r = ui.last_item_rect
+            if r.h > 0 and r.bottom() >= ui.scroll_stack[len(ui.scroll_stack) - 1].view_rect.y and r.y <= ui.scroll_stack[len(ui.scroll_stack) - 1].view_rect.bottom():
+                var accent = asset_filter_accent(classify_asset_filter(path), theme)
+                ui.draw_list.add_accent_bar(r.x + Float32(2.0), r.y + Float32(4.0), Float32(2.5), max(Float32(4.0), r.h - Float32(8.0)), accent, True)
+                draw_studio_icon(ui.draw_list, icon_for_path(path, False), r.x + Float32(10.0), r.center_y() - Float32(7.0), Float32(14.0), accent, Float32(1.4))
+                var dot_idx = path.rfind(".")
+                var ext_w = Float32(0.0)
+                if dot_idx >= 0 and dot_idx + 1 < path.byte_length() and r.w >= Float32(140.0):
+                    var ext_s = String(path[byte=dot_idx + 1 :])
+                    var e_tw = ui._measure_text_styled(ext_s, Float32(10.0), UI_FONT_MONO)
+                    ext_w = max(Float32(28.0), e_tw + Float32(10.0))
+                    var er = RectF(r.right() - ext_w - Float32(6.0), r.center_y() - Float32(8.0), ext_w, Float32(16.0))
+                    ui.draw_list.add_rect_styled(er.x, er.y, er.w, er.h, theme.l0_canvas, rgba8_with_alpha(accent, 90), RADIUS_XS, Float32(1.0), Float32(1.0), UI_FLAG_BORDER)
+                    ui.draw_text_in_rect(er, ext_s, Float32(10.0), accent, UI_ALIGN_CENTER, UI_FONT_MONO)
+                    ext_w += Float32(10.0)
+                ui.draw_text_in_rect(
+                    RectF(r.x + Float32(30.0), r.y, max(Float32(16.0), r.w - Float32(36.0) - ext_w), r.h),
+                    path, theme.font_body, theme.text_primary, UI_ALIGN_LEFT, UI_FONT_REGULAR, truncate=True, middle_ellipsis=True,
+                )
+            _ = ui.begin_drag_source("ASSET_ENTRY", i, path)
+            if clicked:
+                var low = FlintStudioState._ascii_lower(path)
+                var target = studio.selected_entity_id if (low.endswith(".flmat") or low.endswith(".flrig") or low.endswith(".flanim")) else -1
+                _ = studio.activate_asset_entry(path, target_entity_id=target, drop_pos=Vec3(Float32(i % 6) * Float32(0.5), 0, 0), from_drop=False)
+        ui.end_scroll_view()
+
+
+def _draw_asset_dialog(mut studio: FlintStudioState):
+    ref ui = studio.ui_ctx
+    var is_import = studio.asset_browser_state.dialog == ASSET_DIALOG_IMPORT
+    var needs_folder = not studio.project_root and not studio.asset_browser_dir
+    var open = True
+    var width = min(Float32(420), max(Float32(96), ui.screen_w - 20))
+    var height = Float32(268 if needs_folder else 210) if is_import else Float32(162)
+    if ui.begin_modal("ab_dialog", "Import asset" if is_import else "Create scene object", width, height, open):
+        if is_import:
+            ui.label("Source file")
+            _ = ui.text_input("ab_source", studio.import_src_input, width - 36, "File path")
+            if needs_folder:
+                ui.label("Project folder")
+                _ = ui.text_input("ab_project", studio.asset_browser_state.import_folder, width - 36, "Existing project directory")
+            ui.label("Destination in project")
+            _ = ui.text_input("ab_destination", studio.import_dst_subdir, width - 36, "assets")
+            ui.begin_box("ab_dialog_actions", FlexStyle.row(gap=6, pad=0))
+            if ui.icon_button("ab_confirm", ICON_PLUS, "Import", active=True, w=84, h=25):
+                var folder = String(studio.asset_browser_state.import_folder.strip())
+                if needs_folder and not is_directory(folder, follow_symlinks=True):
+                    studio.push_toast("Choose an existing project folder", 1, 3)
+                else:
+                    if needs_folder:
+                        studio.asset_browser_dir = folder
+                    var src = studio.import_src_input
+                    var dst = studio.import_dst_subdir
+                    var result = studio.import_asset_to_project(src, dst)
+                    if result[0]:
+                        studio.asset_browser_state.search_query = ""
+                        studio.import_src_input = ""
+                        open = False
+                    elif needs_folder:
+                        studio.asset_browser_dir = ""
+            if ui.button("ab_cancel", "Cancel", 72, 25):
+                open = False
+            ui.end_box()
+        else:
+            for row in range(3):
+                ui.begin_box("ab_create_row_" + String(row), FlexStyle.row(gap=6, pad=0))
+                _asset_spawn_controls(studio, row * 2, row * 2 + 2, (width - 42) * Float32(0.5))
+                ui.end_box()
+        ui.end_modal()
+    if not open:
+        studio.asset_browser_state.dialog = 0
+
+
 def emit_studio_ui_draw_list(
     mut ui: UiDrawList,
     mut studio: FlintStudioState,
@@ -9084,13 +9703,15 @@ def emit_studio_ui_draw_list(
     studio.ui_ctx.dock_style_v2 = True
     studio.ui_ctx.set_studio_theme(studio.studio_theme.copy())
     studio.ui_ctx.set_anim_mode(studio.anim_mode)
-    studio.ui_ctx.theme.font_size = Float32(13.0)
-    studio.ui_ctx.theme.row_height = Float32(22.0)
+    studio.ui_ctx.theme.font_size = studio.studio_theme.font_body
+    studio.ui_ctx.theme.row_height = Float32(24.0)
 
     var scaled_input = input.copy()
     if abs(ui_sc - Float32(1.0)) > Float32(1.0e-4):
         scaled_input.last_mouse_x = input.last_mouse_x / ui_sc
         scaled_input.last_mouse_y = input.last_mouse_y / ui_sc
+        scaled_input.delta_x = input.delta_x / ui_sc
+        scaled_input.delta_y = input.delta_y / ui_sc
     studio.ui_ctx.begin_frame(scaled_input, sw, sh, dt, studio.input_map)
     if studio.ui_ctx.mouse_pressed_l or studio.ui_ctx.mouse_released_l:
         studio.ui_edit_seq += 1
@@ -9122,6 +9743,7 @@ def emit_studio_ui_draw_list(
         or studio.code_drawer.has_keyboard_focus
     )
 
+    var palette_was_open = studio.command_palette.is_open
     var overlay_blocked = (
         studio.confirm_modal_open
         or studio.ui_ctx.modal_depth > 0
@@ -9167,9 +9789,12 @@ def emit_studio_ui_draw_list(
         Float32(0.0),
         show_window_controls=show_win_ctrls,
         window_maximized=win_is_max,
+        pie_active=(studio.pie.mode == PIE_PLAYING),
     )
     if hdr_act.kind == HDR_ACT_WORKSPACE:
         _ = studio.apply_workspace_preset(hdr_act.int_val, sw, sh)
+    elif hdr_act.kind == HDR_ACT_WORKSPACE_PICKER:
+        studio.open_command_palette(PALETTE_ALL, "Workspace:")
     elif hdr_act.kind == HDR_ACT_COMMAND_PALETTE:
         studio.open_command_palette(PALETTE_ALL)
     elif hdr_act.kind == HDR_ACT_AGENT_TOGGLE:
@@ -9216,10 +9841,31 @@ def emit_studio_ui_draw_list(
     # 2. 3D Viewport Active Selection Gizmo + Visual Agent Theatre HUD + Floating ViewportHud
     var show_edit_gizmo = (studio.pie.mode != PIE_PLAYING) or studio.pie_camera_ejected
     var giz_piv = studio.selection_gizmo_pivot()
+    if studio.active_gizmo_handle == GIZMO_AXIS_NONE:
+        studio.gizmo_drag_delta_text = String("")
+    studio.hovered_gizmo_handle = GIZMO_AXIS_NONE
     if show_edit_gizmo and giz_piv[0]:
-        ui.push_clip(Int(vp.x), Int(vp.y), Int(vp.right()), Int(vp.bottom()))
+        var giz_rot = studio.selection_gizmo_rotation()
+        if (not overlay_blocked) and vp.contains(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y) and not studio.viewport_hud.contains_point(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y):
+            studio.hovered_gizmo_handle = pick_gizmo_handle(
+                studio.ui_ctx.mouse_x,
+                studio.ui_ctx.mouse_y,
+                giz_piv[1],
+                studio.gizmo_mode,
+                vp.x,
+                vp.y,
+                vp.w,
+                vp.h,
+                studio.cam_pos,
+                studio.cam_fwd,
+                studio.cam_right,
+                studio.cam_up,
+                studio.fov_y_deg,
+                gizmo_rot=giz_rot,
+            )
+        studio.ui_ctx.draw_list.push_clip(Int(vp.x), Int(vp.y), Int(vp.right()), Int(vp.bottom()))
         emit_gizmo_draw_list(
-            ui,
+            studio.ui_ctx.draw_list,
             giz_piv[1],
             studio.gizmo_mode,
             studio.active_gizmo_handle,
@@ -9232,9 +9878,14 @@ def emit_studio_ui_draw_list(
             studio.cam_right,
             studio.cam_up,
             studio.fov_y_deg,
-            gizmo_rot=studio.selection_gizmo_rotation(),
+            gizmo_rot=giz_rot,
+            hovered_handle=studio.hovered_gizmo_handle,
+            axis_x_color=studio.studio_theme.axis_x,
+            axis_y_color=studio.studio_theme.axis_y,
+            axis_z_color=studio.studio_theme.axis_z,
+            active_color=studio.studio_theme.play_paused,
         )
-        ui.pop_clip()
+        studio.ui_ctx.draw_list.pop_clip()
 
     # Visual Agent Theatre 2D Viewport Overlays (presence pills, Bezier flow beams, PRIM_ARC reticles, inline [✓]/[✗])
     studio._last_theatre_hits.clear()
@@ -9257,6 +9908,9 @@ def emit_studio_ui_draw_list(
             vp.h,
             studio.ui_time_sec,
             studio._last_theatre_hits,
+            studio.studio_theme,
+            studio.ui_ctx.mouse_x,
+            studio.ui_ctx.mouse_y,
         )
         if studio.ui_ctx.mouse_pressed_l and (not overlay_blocked):
             for hi in range(len(studio._last_theatre_hits)):
@@ -9281,6 +9935,29 @@ def emit_studio_ui_draw_list(
                         _ = WorkspacePresetManager.ensure_panel_visible(studio.dock, PANEL_AGENTS)
                     break
 
+    # RGBMocap 3D Viewport Overlay (SOMA skeleton, camera frustum & ground contact rings — ONLY when MoCap tab is active!)
+    var mocap_tab_info = studio.dock.find_panel(PANEL_MOCAP)
+    var mocap_tab_active = mocap_tab_info[0] >= 0 and mocap_tab_info[2]
+    if mocap_tab_active and vp.w > Float32(40.0) and vp.h > Float32(40.0):
+        studio.ensure_mocap_initialized()
+        if studio.anim_mode != UI_ANIM_INSTANT:
+            studio.mocap.step_playback(dt)
+        var mc_fov_rad = studio.fov_y_deg * (PI / Float32(180.0))
+        var mc_view = make_rh_look_at(studio.cam_pos, studio.cam_pos + studio.cam_fwd, Vec3(0.0, 1.0, 0.0))
+        var mc_proj = make_rh_reverse_z_perspective(
+            mc_fov_rad, vp.w / max(Float32(1.0), vp.h), studio.near_z, Float32(1000.0)
+        )
+        var mc_vp_mat = mc_proj.multiply(mc_view)
+        emit_mocap_viewport_overlay(
+            studio.ui_ctx.draw_list,
+            studio.ui_ctx.font,
+            font_slot,
+            studio.mocap,
+            vp,
+            mc_vp_mat,
+            studio.studio_theme,
+        )
+
     # Floating 4-Cluster Translucent Viewport HUD + 3D OrientationGizmo + GPU Sparkline
     if studio.anim_mode == UI_ANIM_INSTANT and studio.viewport_hud.ring_count == 0:
         var base_ms = Float32(gpu_ms) if gpu_ms > 0.1 else Float32(4.2)
@@ -9294,7 +9971,7 @@ def emit_studio_ui_draw_list(
     var vhud_tool = (
         VHUD_TOOL_ROTATE
         if studio.gizmo_mode == GIZMO_MODE_ROTATE
-        else (VHUD_TOOL_SCALE if studio.gizmo_mode == GIZMO_MODE_SCALE else VHUD_TOOL_MOVE)
+        else (VHUD_TOOL_SCALE if studio.gizmo_mode == GIZMO_MODE_SCALE else (VHUD_TOOL_SELECT if studio.gizmo_mode == GIZMO_MODE_SELECT else VHUD_TOOL_MOVE))
     )
     var vhud_act = studio.viewport_hud.draw(
         studio.ui_ctx.draw_list,
@@ -9318,14 +9995,15 @@ def emit_studio_ui_draw_list(
         studio.cam_up,
         studio.cam_fwd,
         studio.selected_count(),
-        "",
+        studio.gizmo_drag_delta_text if studio.active_gizmo_handle != GIZMO_AXIS_NONE else String(""),
         studio.ui_ctx.mouse_x,
         studio.ui_ctx.mouse_y,
         studio.ui_ctx.mouse_down_l and (not overlay_blocked),
         studio.ui_ctx.mouse_pressed_l and (not overlay_blocked),
+        play_workspace=(studio.workspace_mgr.active_preset == WORKSPACE_PLAY),
     )
     if vhud_act.kind == VHUD_ACT_TOOL_SELECT:
-        studio.active_gizmo_handle = GIZMO_AXIS_NONE
+        _ = studio.execute_palette_command(PAL_CMD_TOOL_SELECT)
     elif vhud_act.kind == VHUD_ACT_TOOL_MOVE:
         studio.gizmo_mode = GIZMO_MODE_TRANSLATE
     elif vhud_act.kind == VHUD_ACT_TOOL_ROTATE:
@@ -9366,49 +10044,9 @@ def emit_studio_ui_draw_list(
     elif vhud_act.kind == VHUD_ACT_TOGGLE_ORTHO:
         studio.cam_ortho = not studio.cam_ortho
 
-    # Optional Gameplay HUD overlay (`WORKSPACE_PLAY` / `--gallery 06_play_hud`) inside SceneViewport below header & transform HUD
+    # Optional Gameplay HUD overlay (`WORKSPACE_PLAY` / `--gallery 06_play_hud`) inside SceneViewport
     if studio.gallery_play_hud_active and vp.w >= Float32(180.0) and vp.h >= Float32(130.0):
-        var hud_w = min(Float32(252.0), max(Float32(160.0), vp.w - Float32(32.0)))
-        var hud_h = Float32(66.0)
-        var hx = vp.x + Float32(16.0)
-        var hy = vp.y + Float32(52.0)
-        studio.ui_ctx.draw_list.add_glass_panel(
-            hx,
-            hy,
-            hud_w,
-            hud_h,
-            studio.studio_theme.l4_overlay,
-            studio.studio_theme.radius_md,
-            Float32(3.0),
-            Float32(1.2),
-            rgba8_with_alpha(studio.studio_theme.play_mode, 185),
-            True,
-            True,
-        )
-        studio.ui_ctx._draw_text(
-            "HP 84/100",
-            hx + Float32(12.0),
-            hy + Float32(9.0),
-            Float32(13.5),
-            studio.studio_theme.text_primary,
-        )
-        studio.ui_ctx._draw_text(
-            "SCORE 1250",
-            hx + hud_w * Float32(0.54),
-            hy + Float32(9.0),
-            Float32(13.5),
-            studio.studio_theme.accent_primary,
-        )
-        hud_bar(
-            studio.ui_ctx,
-            hx + Float32(12.0),
-            hy + Float32(34.0),
-            hud_w - Float32(24.0),
-            Float32(18.0),
-            84,
-            100,
-            studio.studio_theme.play_mode,
-        )
+        _ = game_hud(studio.ui_ctx, 84, 100, 1250, vp.x, vp.y, vp.w, vp.h, show_controls_hint=True)
 
     var vp_drop = studio.ui_ctx.accept_drag_target_rect("ASSET_ENTRY", vp)
     if vp_drop[0]:
@@ -9431,19 +10069,27 @@ def emit_studio_ui_draw_list(
     # 3. Left Scene Hierarchy Outliner (`DockSpace` -> `"Hierarchy"`, Obsidian v2 Outliner + Agent Badges)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Hierarchy"):
         var h_info = studio.dock.find_panel("Hierarchy")
-        var rows = studio.hierarchy_visible_rows()
+        var query = FlintStudioState._ascii_lower(String(studio.outliner_state.search_query.strip()))
+        var rows = studio.hierarchy_visible_rows(include_collapsed=query.byte_length() > 0)
         var disp_order = List[Int](capacity=len(rows))
         var out_rows = List[OutlinerRowView](capacity=len(rows))
         for ri in range(len(rows)):
             var row = rows[ri]
             var eid = row.entity_id
-            disp_order.append(eid)
             var ename = studio.entities[eid].name if eid < len(studio.entities) else ("Entity_" + String(eid))
+            if query.byte_length() == 0 or FlintStudioState._ascii_lower(ename).find(query) >= 0:
+                disp_order.append(eid)
             var v_row = OutlinerRowView(eid, ename)
             v_row.parent_id = studio.parent_of(eid)
             v_row.depth = row.depth
             v_row.kind = studio._classify_entity_kind(eid)
             v_row.has_children = row.has_children
+            if row.has_children:
+                var ch_cnt = 0
+                for ci_k in range(len(studio.entities)):
+                    if studio.entities[ci_k].alive and studio.entities[ci_k].parent_id == eid:
+                        ch_cnt += 1
+                v_row.child_count = ch_cnt
             v_row.is_expanded = row.expanded
             v_row.is_selected = studio.is_selected(eid)
             v_row.is_primary = studio.selected_entity_id == eid
@@ -9465,7 +10111,7 @@ def emit_studio_ui_draw_list(
             h_info[3],
             studio.studio_theme,
             out_rows,
-            "StudioWorld",
+            studio.scene.name,
             studio.live_entity_count(),
             studio.selected_count(),
             sel_has_parent,
@@ -9508,114 +10154,155 @@ def emit_studio_ui_draw_list(
         studio.ui_ctx.end_dock_panel()
 
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Outliner"):
-        studio.ui_ctx.label("Live Entities: " + String(studio.live_entity_count()))
-        studio.ui_ctx.label("Selected: " + String(studio.selected_count()))
-        studio.ui_ctx.label("State Hash: " + String(studio.state_hash()), studio.ui_ctx.theme.text_muted)
+        var st_info = studio.dock.find_panel("Outliner")
+        draw_studio_stats_panel(
+            studio.ui_ctx,
+            st_info[3],
+            studio.studio_theme,
+            studio.live_entity_count(),
+            studio.selected_count(),
+            studio.state_hash(),
+            len(studio.ui_ctx.draw_list.prims),
+            studio.ui_ctx.culled_items_this_frame,
+        )
         studio.ui_ctx.end_dock_panel()
 
     # 4. Right Inspector (`DockSpace` -> `"Inspector"`, single or bulk multi-select)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Inspector"):
         var i_info = studio.dock.find_panel("Inspector")
-        var panel_w = max(Float32(180.0), i_info[3].w - Float32(16.0))
-        var insp_h = max(Float32(100.0), i_info[3].h - Float32(28.0))
-        studio.ui_ctx.begin_scroll_view("insp_scroll", 0.0, insp_h)
+        var panel_w = max(Float32(80.0), i_info[3].w - Float32(16.0))
+        var insp_h = max(Float32(100.0), i_info[3].h - Float32(10.0))
+        studio.ui_ctx.begin_scroll_view("insp_scroll", 0.0, insp_h, frameless=True)
+        ref inspector_box = studio.ui_ctx.box_stack[len(studio.ui_ctx.box_stack) - 1]
+        var field_w = max(Float32(60.0), inspector_box.rect.w - inspector_box.pad_r)
         var sel_cnt = studio.selected_count()
         if sel_cnt > 1 and studio.selected_entity_id >= 0 and studio.is_alive_id(studio.selected_entity_id):
             var pri_id = studio.selected_entity_id
             var pri_view = studio.entities[pri_id].copy()
-            studio.ui_ctx.label(
-                "Multi-Select: " + String(sel_cnt) + " entities (Primary #" + String(pri_id) + ": " + pri_view.name + ")",
-                studio.ui_ctx.theme.accent,
+            var ms_top_i = len(studio.ui_ctx.box_stack) - 1
+            var ms_orig_x = studio.ui_ctx.box_stack[ms_top_i].cursor_x
+            var ms_hdr_y = studio.ui_ctx.box_stack[ms_top_i].cursor_y
+            studio.ui_ctx.draw_list.add_card_surface(
+                ms_orig_x, ms_hdr_y, field_w, Float32(4.0),
+                studio.studio_theme.l2_card, studio.studio_theme.border_subtle,
+                RADIUS_MD, Float32(1.0), True, False,
             )
+            var ms_bg_idx = len(studio.ui_ctx.draw_list.prims) - 1
+            studio.ui_ctx.box_stack[ms_top_i].cursor_x = ms_orig_x + Float32(8.0)
+            studio.ui_ctx.box_stack[ms_top_i].cursor_y = ms_hdr_y + Float32(6.0)
+            var ms_inner_w = max(Float32(60.0), field_w - Float32(16.0))
+            var ms_r = studio.ui_ctx._alloc_item_rect(studio.ui_ctx.widget_id("bulk_hdr"), ms_inner_w, Float32(22.0))
+            studio.ui_ctx.draw_text_in_rect(ms_r, String(sel_cnt) + " Entities Selected", studio.studio_theme.font_title, studio.studio_theme.text_primary, UI_ALIGN_LEFT, UI_FONT_BOLD, truncate=True)
+            studio.ui_ctx.label(studio.ui_ctx._truncate_text_ellipsis("Primary  ·  " + pri_view.name, ms_inner_w, studio.studio_theme.font_caption), studio.studio_theme.text_secondary)
+            _end_insp_card_body(studio.ui_ctx, ms_bg_idx, ms_orig_x, Float32(6.0))
+
             var bulk_delta = Vec3()
-            var mat_w = max(Float32(160.0), panel_w - Float32(20.0))
-            if studio.ui_ctx.drag_float3("bulk_delta", "Move Delta", bulk_delta, speed=0.05, w=mat_w):
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
-                _ = studio.bulk_translate_selected(bulk_delta, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_delta"))
+            if studio.ui_ctx.collapsible_card("bulk_card_tr", "Bulk Transform & Material", ICON_MOVE, True, field_w)[0]:
+                var b_hdr = studio.ui_ctx.last_item_rect
+                var b_card = _begin_insp_card_body(studio.ui_ctx, b_hdr, studio.studio_theme)
+                var bw = b_card[2]
+                if studio.ui_ctx.drag_float3_v2("bulk_delta", "Move Delta", bulk_delta, speed=0.05, w=bw, align_property_column=True):
+                    if not studio.ui_ctx.mouse_down_l:
+                        studio.ui_edit_seq += 1
+                    _ = studio.bulk_translate_selected(bulk_delta, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_delta"))
 
-            var b_col = pri_view.base_color
-            if studio.ui_ctx.drag_float3("bulk_col", "Bulk Albedo", b_col, speed=0.01, min_val=0.0, max_val=1.0, w=mat_w):
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
-                var f_col = InspectedField("base_color", FIELD_COLOR_RGB)
-                f_col.v3_val = b_col
-                _ = studio.bulk_patch_field("base_color", f_col, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_col"))
+                var b_col = pri_view.base_color
+                if studio.ui_ctx.color_edit3("bulk_col", "Albedo", b_col, min_val=0.0, max_val=1.0, w=bw, leading_label=True):
+                    if not studio.ui_ctx.mouse_down_l:
+                        studio.ui_edit_seq += 1
+                    var f_col = InspectedField("base_color", FIELD_COLOR_RGB)
+                    f_col.v3_val = b_col
+                    _ = studio.bulk_patch_field("base_color", f_col, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_col"))
 
-            var b_rgh = pri_view.roughness
-            if studio.ui_ctx.slider_float("bulk_rgh", "Bulk Rough", b_rgh, Float32(0.04), Float32(1.0), w=mat_w):
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
-                var f_rgh = InspectedField("roughness", FIELD_F32)
-                f_rgh.f_val = b_rgh
-                _ = studio.bulk_patch_field("roughness", f_rgh, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_rgh"))
+                var b_rgh = pri_view.roughness
+                if studio.ui_ctx.slider_float_v2("bulk_rgh", "Roughness", b_rgh, Float32(0.04), Float32(1.0), w=bw):
+                    if not studio.ui_ctx.mouse_down_l:
+                        studio.ui_edit_seq += 1
+                    var f_rgh = InspectedField("roughness", FIELD_F32)
+                    f_rgh.f_val = b_rgh
+                    _ = studio.bulk_patch_field("roughness", f_rgh, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_rgh"))
 
-            var b_met = pri_view.metallic
-            if studio.ui_ctx.slider_float("bulk_met", "Bulk Metal", b_met, Float32(0.0), Float32(1.0), w=mat_w):
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
-                var f_met = InspectedField("metallic", FIELD_F32)
-                f_met.f_val = b_met
-                _ = studio.bulk_patch_field("metallic", f_met, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_met"))
+                var b_met = pri_view.metallic
+                if studio.ui_ctx.slider_float_v2("bulk_met", "Metallic", b_met, Float32(0.0), Float32(1.0), w=bw):
+                    if not studio.ui_ctx.mouse_down_l:
+                        studio.ui_edit_seq += 1
+                    var f_met = InspectedField("metallic", FIELD_F32)
+                    f_met.f_val = b_met
+                    _ = studio.bulk_patch_field("metallic", f_met, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_met"))
 
-            var b_vis = pri_view.visible
-            if studio.ui_ctx.checkbox("bulk_vis", "Bulk Visible", b_vis):
-                var f_vis = InspectedField("visible", FIELD_BOOL)
-                f_vis.b_val = b_vis
-                _ = studio.bulk_patch_field("visible", f_vis)
+                var b_vis = pri_view.visible
+                if studio.ui_ctx.toggle_switch("bulk_vis", "Visible", b_vis, w=bw):
+                    var f_vis = InspectedField("visible", FIELD_BOOL)
+                    f_vis.b_val = b_vis
+                    _ = studio.bulk_patch_field("visible", f_vis)
+                _end_insp_card_body(studio.ui_ctx, b_card[0], b_card[1], Float32(6.0))
 
             studio.ui_ctx.begin_box("bulk_rep_row", FlexStyle.row(gap=6.0, pad=0.0))
-            var act_w = max(Float32(80.0), (panel_w - Float32(12.0)) * Float32(0.5))
-            if studio.ui_ctx.button("bulk_parent_pri", "Parent->Pri", act_w, 22.0):
+            var act_w = max(Float32(64.0), (field_w - Float32(6.0)) * Float32(0.5))
+            if studio.ui_ctx.button_v2("bulk_parent_pri", "Parent to primary", BTN_SECONDARY, -1, act_w, 24.0):
                 _ = studio.reparent_selected_to(pri_id, preserve_world_transform=True, record_undo=True)
-            if studio.ui_ctx.button("bulk_unparent", "Unparent", act_w, 22.0):
+            if studio.ui_ctx.button_v2("bulk_unparent", "Unparent", BTN_SECONDARY, -1, act_w, 24.0):
                 _ = studio.reparent_selected_to(-1, preserve_world_transform=True, record_undo=True)
             studio.ui_ctx.end_box()
 
             studio.ui_ctx.begin_box("bulk_actions_row", FlexStyle.row(gap=6.0, pad=0.0))
-            if studio.ui_ctx.button("btn_dup_sel", "Dup Selected", act_w, 24.0):
+            if studio.ui_ctx.button_v2("btn_dup_sel", "Duplicate", BTN_SECONDARY, -1, act_w, 24.0):
                 _ = studio.duplicate_selected(record_undo=True)
-            if studio.ui_ctx.button("btn_del_sel", "Del Selected", act_w, 24.0):
+            if studio.ui_ctx.button_v2("btn_del_sel", "Delete", BTN_DANGER, -1, act_w, 24.0):
                 _ = studio.despawn_selected(record_undo=True)
             studio.ui_ctx.end_box()
         elif studio.selected_entity_id >= 0 and studio.is_alive_id(studio.selected_entity_id):
             var eid = studio.selected_entity_id
-            var vis = FieldVisitor()
-            studio.entities[eid].inspect_fields(vis)
             var cur = studio.entities[eid].copy()
             var changed = False
-
             var shd_lbl = (
-                "NPR Cel"
-                if cur.shading_mode == SHADING_NPR_CEL
-                else ("Stylized VFX" if cur.shading_mode == SHADING_STYLIZED_VFX else "PBR")
+                "Cel" if cur.shading_mode == SHADING_NPR_CEL
+                else ("VFX" if cur.shading_mode == SHADING_STYLIZED_VFX else "PBR")
             )
-            var name_w = max(Float32(140.0), panel_w - Float32(24.0))
-            if studio.ui_ctx.text_input("insp_name", cur.name, name_w, "Entity Name"):
+            var parent_label = String("Scene root")
+            if cur.parent_id >= 0 and cur.parent_id < len(studio.entities) and studio.entities[cur.parent_id].alive:
+                parent_label = "Parent  " + studio.entities[cur.parent_id].name
+
+            # Unified L2_card Entity Header Card (preserves exact insp_name & insp_header_actions->insp_frame_entity IDs)
+            var hdr_top_i = len(studio.ui_ctx.box_stack) - 1
+            var hdr_orig_x = studio.ui_ctx.box_stack[hdr_top_i].cursor_x
+            var hdr_y0 = studio.ui_ctx.box_stack[hdr_top_i].cursor_y
+            studio.ui_ctx.draw_list.add_card_surface(
+                hdr_orig_x, hdr_y0, field_w, Float32(4.0),
+                studio.studio_theme.l2_card, studio.studio_theme.border_subtle,
+                RADIUS_MD, Float32(1.0), True, False,
+            )
+            var hdr_bg_idx = len(studio.ui_ctx.draw_list.prims) - 1
+            studio.ui_ctx.box_stack[hdr_top_i].cursor_x = hdr_orig_x + Float32(6.0)
+            studio.ui_ctx.box_stack[hdr_top_i].cursor_y = hdr_y0 + Float32(4.0)
+            var hdr_inner_w = max(Float32(60.0), field_w - Float32(12.0))
+            draw_inspector_identity(studio.ui_ctx, studio._classify_entity_kind(eid), eid, parent_label, hdr_inner_w)
+            var body_font = studio.ui_ctx.theme.font_size
+            studio.ui_ctx.theme.font_size = studio.studio_theme.font_title
+            if studio.ui_ctx.text_input("insp_name", cur.name, hdr_inner_w, "Entity name"):
                 changed = True
-            if studio.ui_ctx.toggle_switch("ent_enabled", "Enabled (#" + String(eid) + ")", cur.enabled, w=name_w):
+            studio.ui_ctx.theme.font_size = body_font
+            var header_actions = FlexStyle.row(gap=4.0, pad=0.0)
+            var stack_actions = hdr_inner_w < 140
+            if stack_actions:
+                header_actions = FlexStyle.col(gap=3.0, pad=0.0)
+            header_actions.fixed_h = 52 if stack_actions else 26
+            header_actions.shrink = 0
+            studio.ui_ctx.begin_box("insp_header_actions", header_actions)
+            var frame_w = hdr_inner_w if stack_actions else min(Float32(76), hdr_inner_w * 0.34)
+            var toggle_w = hdr_inner_w if stack_actions else hdr_inner_w - frame_w - 4
+            if studio.ui_ctx.toggle_switch("ent_enabled", "Enabled", cur.enabled, w=toggle_w, fit_label=True):
                 cur.visible = cur.enabled
                 changed = True
-            var par_lbl = (
-                studio.entities[cur.parent_id].name
-                if (cur.parent_id >= 0 and cur.parent_id < len(studio.entities) and studio.entities[cur.parent_id].alive)
-                else "Root"
-            )
-            studio.ui_ctx.label("Parent: " + par_lbl, studio.ui_ctx.theme.text_muted)
+            if studio.ui_ctx.button_v2("insp_frame_entity", "Frame", BTN_SECONDARY, ICON_FOCUS_CAM, frame_w, 24.0):
+                studio.frame_selection()
+            studio.ui_ctx.end_box()
             if cur.parent_id >= 0:
-                if studio.ui_ctx.button("insp_unparent", "Unparent to Root", 136.0, 20.0):
+                if studio.ui_ctx.button_v2("insp_unparent", "Unparent to root", BTN_GHOST, -1, min(hdr_inner_w, Float32(148)), 22.0):
                     _ = studio.reparent_entity(eid, -1, preserve_world_transform=True, record_undo=True)
                     cur = studio.entities[eid].copy()
+            _end_insp_card_body(studio.ui_ctx, hdr_bg_idx, hdr_orig_x, Float32(6.0))
 
-            var shd_summary = studio.ui_ctx._truncate_text_ellipsis(
-                "Shading: " + shd_lbl + " | " + String(len(vis.fields)) + " fields",
-                max(Float32(80.0), panel_w - Float32(18.0)),
-                studio.ui_ctx.theme.font_size,
-            )
-            studio.ui_ctx.label(
-                shd_summary,
-                studio.ui_ctx.theme.accent if cur.shading_mode != SHADING_PBR else studio.ui_ctx.theme.text_muted,
-            )
             if (
                 cur.shading_mode != SHADING_PBR
                 or cur.anim_step_hz > Float32(0.0)
@@ -9630,52 +10317,119 @@ def emit_studio_ui_draw_list(
                     + " Hz | Hitstop "
                     + _fmt_f32_2dp(studio.stepped_clock.hitstop_remaining_sec)
                     + "s",
-                    studio.ui_ctx.theme.accent,
+                    studio.studio_theme.accent_primary,
                 )
 
-            if studio.ui_ctx.tree_node("insp_trs", "Transform", default_open=True):
-                var tr_w = max(Float32(160.0), panel_w - Float32(28.0))
-                if studio.ui_ctx.drag_float3_v2("tr_pos", "Pos", cur.translation, speed=0.04, w=tr_w):
+            # ---- Transform Card ----
+            var trs_reserve = Float32(26.0) if field_w >= Float32(148.0) else Float32(8.0)
+            var trs_open = studio.ui_ctx.collapsible_card("insp_trs", "Transform", ICON_MOVE, True, field_w, right_reserve=trs_reserve)[0]
+            var trs_hdr = studio.ui_ctx.last_item_rect
+            var trs_at_id = (
+                abs(cur.translation.x) < Float32(1.0e-4) and abs(cur.translation.y) < Float32(1.0e-4) and abs(cur.translation.z) < Float32(1.0e-4)
+                and abs(cur.scale.x - Float32(1.0)) < Float32(1.0e-4) and abs(cur.scale.y - Float32(1.0)) < Float32(1.0e-4) and abs(cur.scale.z - Float32(1.0)) < Float32(1.0e-4)
+                and abs(abs(cur.rotation.w) - Float32(1.0)) < Float32(1.0e-4)
+            )
+            if trs_hdr.w >= Float32(148.0):
+                var rst_r = RectF(trs_hdr.right() - Float32(26.0), trs_hdr.center_y() - Float32(10.0), Float32(20.0), Float32(20.0))
+                var rst_wid = studio.ui_ctx.widget_id("insp_trs_reset")
+                var rst_hov = (not studio.ui_ctx._blocked_by_modal()) and (not studio.ui_ctx._is_pointer_blocked_by_popup(rst_wid)) and rst_r.contains(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y)
+                if rst_hov:
+                    studio.ui_ctx.hovered_id = rst_wid
+                    studio.ui_ctx.hovered_rect = studio.ui_ctx._clip_hovered_rect(rst_r)
+                    studio.ui_ctx.draw_list.add_rect(rst_r.x, rst_r.y, rst_r.w, rst_r.h, studio.studio_theme.l3_raised, RADIUS_XS)
+                    studio.ui_ctx.queue_tooltip_rect(rst_wid, rst_r, "Reset Transform")
+                    if studio.ui_ctx.mouse_pressed_l:
+                        cur.translation = Vec3(0.0, 0.0, 0.0)
+                        cur.rotation = Quat(0.0, 0.0, 0.0, 1.0)
+                        cur.scale = Vec3(1.0, 1.0, 1.0)
+                        changed = True
+                draw_studio_icon(
+                    studio.ui_ctx.draw_list,
+                    ICON_REVERT,
+                    rst_r.center_x() - Float32(6.0),
+                    rst_r.center_y() - Float32(6.0),
+                    Float32(12.0),
+                    studio.studio_theme.accent_primary if rst_hov else (rgba8_scale_alpha(studio.studio_theme.text_muted, Float32(0.45)) if trs_at_id else studio.studio_theme.text_secondary),
+                    Float32(1.35),
+                )
+            if trs_open:
+                var tr_card = _begin_insp_card_body(studio.ui_ctx, trs_hdr, studio.studio_theme)
+                var cw = tr_card[2]
+                if studio.ui_ctx.drag_float3_v2("tr_pos", "Position", cur.translation, speed=0.04, w=cw, align_property_column=True):
                     changed = True
                 var rot_deg = _quat_to_euler_deg(cur.rotation)
-                if studio.ui_ctx.drag_float3_v2("tr_rot", "Rot", rot_deg, speed=0.5, min_val=-360.0, max_val=360.0, w=tr_w):
+                if studio.ui_ctx.drag_float3_v2("tr_rot", "Rotation", rot_deg, speed=0.5, min_val=-360.0, max_val=360.0, w=cw, align_property_column=True):
                     cur.rotation = _euler_deg_to_quat(rot_deg)
                     changed = True
-                if studio.ui_ctx.drag_float3_v2("tr_scl", "Scale", cur.scale, speed=0.02, min_val=0.05, max_val=50.0, w=tr_w):
+                if studio.ui_ctx.drag_float3_v2("tr_scl", "Scale", cur.scale, speed=0.02, min_val=0.05, max_val=50.0, w=cw, align_property_column=True):
                     changed = True
-                studio.ui_ctx.tree_pop()
+                _end_insp_card_body(studio.ui_ctx, tr_card[0], tr_card[1], Float32(6.0))
+            else:
+                studio.ui_ctx.box_stack[len(studio.ui_ctx.box_stack) - 1].cursor_y += Float32(4.0)
 
-            if studio.ui_ctx.tree_node("insp_pbr", "PBR Material & Physics", default_open=True):
-                var mat_w = max(Float32(160.0), panel_w - Float32(28.0))
-                if studio.ui_ctx.color_edit3("mat_col", "Albedo", cur.base_color, min_val=0.0, max_val=1.0, w=mat_w):
+            # ---- Material Card (shortened header + PBR/Cel/VFX pill + segmented mode + Shadows + indented sub-disclosure) ----
+            var pbr_reserve = Float32(46.0) if field_w >= Float32(148.0) else Float32(8.0)
+            var pbr_open = studio.ui_ctx.collapsible_card("insp_pbr", "Material", ICON_MATERIAL, True, field_w, right_reserve=pbr_reserve)[0]
+            var pbr_hdr = studio.ui_ctx.last_item_rect
+            var shd_pill_fg = (
+                studio.studio_theme.agent_active if cur.shading_mode == SHADING_STYLIZED_VFX
+                else (studio.studio_theme.play_mode if cur.shading_mode == SHADING_NPR_CEL else studio.studio_theme.accent_primary)
+            )
+            if pbr_hdr.w >= Float32(148.0):
+                _draw_insp_header_badge(studio.ui_ctx, pbr_hdr, shd_lbl, rgba8_scale_alpha(shd_pill_fg, Float32(0.18)), shd_pill_fg)
+            if pbr_open:
+                var mat_card = _begin_insp_card_body(studio.ui_ctx, pbr_hdr, studio.studio_theme)
+                var cw = mat_card[2]
+                var sh_mode_val = cur.shading_mode
+                if _draw_insp_segmented_3(studio.ui_ctx, "mat_shd_seg", "Shading", "PBR", "Cel", "VFX", sh_mode_val, studio.studio_theme, cw):
+                    cur.shading_mode = sh_mode_val
                     changed = True
-                if studio.ui_ctx.color_edit3("mat_emissive", "Emissive", cur.emissive, min_val=0.0, max_val=20.0, w=mat_w):
+                if studio.ui_ctx.color_edit3("mat_col", "Albedo", cur.base_color, min_val=0.0, max_val=1.0, w=cw, leading_label=True):
                     changed = True
-                if studio.ui_ctx.slider_float_v2("mat_rgh", "Rough", cur.roughness, Float32(0.04), Float32(1.0), w=mat_w):
+                if studio.ui_ctx.color_edit3("mat_emissive", "Emissive", cur.emissive, min_val=0.0, max_val=20.0, w=cw, leading_label=True):
                     changed = True
-                if studio.ui_ctx.slider_float_v2("mat_met", "Metal", cur.metallic, Float32(0.0), Float32(1.0), w=mat_w):
+                if studio.ui_ctx.slider_float_v2("mat_rgh", "Roughness", cur.roughness, Float32(0.04), Float32(1.0), w=cw):
                     changed = True
-                if studio.ui_ctx.slider_float_v2("mat_opacity", "Opacity", cur.opacity, Float32(0.0), Float32(1.0), w=mat_w):
+                if studio.ui_ctx.slider_float_v2("mat_met", "Metallic", cur.metallic, Float32(0.0), Float32(1.0), w=cw):
                     changed = True
-                if studio.ui_ctx.slider_float_v2("mat_alpha_cut", "Alpha Cutoff", cur.alpha_cutoff, Float32(0.0), Float32(1.0), w=mat_w):
+                if studio.ui_ctx.slider_float_v2("mat_opacity", "Opacity", cur.opacity, Float32(0.0), Float32(1.0), w=cw):
                     changed = True
-                if studio.ui_ctx.slider_float_v2("mat_clearcoat", "Clearcoat", cur.clearcoat, Float32(0.0), Float32(1.0), w=mat_w):
-                    changed = True
-                if studio.ui_ctx.slider_float_v2("mat_cc_rough", "CC Rough", cur.clearcoat_roughness, Float32(0.04), Float32(1.0), w=mat_w):
-                    changed = True
-                if studio.ui_ctx.slider_float_v2("mat_sheen", "Sheen", cur.sheen, Float32(0.0), Float32(1.0), w=mat_w):
-                    changed = True
-                if studio.ui_ctx.slider_float_v2("mat_sss", "Subsurface", cur.subsurface, Float32(0.0), Float32(1.0), w=mat_w):
-                    changed = True
-                if studio.ui_ctx.slider_float_v2("phy_mass", "Mass", cur.mass, Float32(0.0), Float32(100.0), w=mat_w):
-                    changed = True
-                if studio.ui_ctx.toggle_switch("ent_vis", "Visible", cur.visible, w=mat_w):
-                    cur.enabled = cur.visible
-                    changed = True
-                studio.ui_ctx.tree_pop()
+                var cast_sh_e = studio.resolve_entity(eid)
+                if cast_sh_e.valid():
+                    var mr_sh_ptr = studio.app.world.get_ptr[MeshRendererComponent](cast_sh_e)
+                    if mr_sh_ptr:
+                        var cast_sh = mr_sh_ptr.value()[unsafe_offset=0].cast_shadows
+                        if studio.ui_ctx.toggle_switch("mat_cast_shadows", "Shadows", cast_sh, w=cw):
+                            var before_sh = studio._capture_world_blob()
+                            var mr_sh_m = studio.app.world.get_ptr_mut[MeshRendererComponent](cast_sh_e)
+                            if mr_sh_m:
+                                mr_sh_m.value()[unsafe_offset=0].cast_shadows = cast_sh
+                            _ = studio.commit_ecs_edit(eid, "Toggle Cast Shadows", before_sh^)
+                if _draw_insp_sub_disclosure(studio.ui_ctx, "insp_surface_detail", "Advanced surface", cw, studio.studio_theme, default_open=False):
+                    var sub_w = max(Float32(60.0), cw - Float32(16.0))
+                    if studio.ui_ctx.slider_float_v2("mat_alpha_cut", "Alpha Cutoff", cur.alpha_cutoff, Float32(0.0), Float32(1.0), w=sub_w):
+                        changed = True
+                    if studio.ui_ctx.slider_float_v2("mat_clearcoat", "Clearcoat", cur.clearcoat, Float32(0.0), Float32(1.0), w=sub_w):
+                        changed = True
+                    if studio.ui_ctx.slider_float_v2("mat_cc_rough", "Coat rough", cur.clearcoat_roughness, Float32(0.04), Float32(1.0), w=sub_w):
+                        changed = True
+                    if studio.ui_ctx.slider_float_v2("mat_sheen", "Sheen", cur.sheen, Float32(0.0), Float32(1.0), w=sub_w):
+                        changed = True
+                    if studio.ui_ctx.slider_float_v2("mat_sss", "Subsurface", cur.subsurface, Float32(0.0), Float32(1.0), w=sub_w):
+                        changed = True
+                    studio.ui_ctx.tree_pop()
+                _end_insp_card_body(studio.ui_ctx, mat_card[0], mat_card[1], Float32(6.0))
+            else:
+                studio.ui_ctx.box_stack[len(studio.ui_ctx.box_stack) - 1].cursor_y += Float32(4.0)
 
-            if studio.ui_ctx.tree_node("insp_col", "Collider", default_open=True):
-                var col_w = max(Float32(160.0), panel_w - Float32(28.0))
+            # ---- Physics & Collider Card ----
+            var col_open = studio.ui_ctx.collapsible_card("insp_col", "Physics & collider", ICON_COLLIDER, True, field_w)[0]
+            var col_hdr = studio.ui_ctx.last_item_rect
+            if col_open:
+                var phy_card = _begin_insp_card_body(studio.ui_ctx, col_hdr, studio.studio_theme)
+                var cw = phy_card[2]
+                if studio.ui_ctx.slider_float_v2("phy_mass", "Mass", cur.mass, Float32(0.0), Float32(100.0), w=cw):
+                    changed = True
                 var col_kinds = List[String]()
                 col_kinds.append("None")
                 col_kinds.append("Sphere")
@@ -9683,64 +10437,77 @@ def emit_studio_ui_draw_list(
                 col_kinds.append("Capsule")
                 col_kinds.append("Static Mesh")
                 var ck_idx = max(0, min(4, cur.collider_kind))
-                if studio.ui_ctx.combo_box("col_kind", "Kind", ck_idx, col_kinds, w=col_w):
+                if studio.ui_ctx.combo_box("col_kind", "Kind", ck_idx, col_kinds, w=cw, leading_label=True):
                     cur.collider_kind = ck_idx
                     changed = True
                 if cur.collider_kind == COLLIDER_SPHERE:
-                    if studio.ui_ctx.drag_float("col_radius", "Radius", cur.collider_half_extents.x, speed=0.02, min_val=0.01, max_val=500.0, w=col_w):
+                    if studio.ui_ctx.drag_float("col_radius", "Radius", cur.collider_half_extents.x, speed=0.02, min_val=0.01, max_val=500.0, w=cw, leading_label=True, unit="m"):
                         cur.collider_half_extents.y = cur.collider_half_extents.x
                         cur.collider_half_extents.z = cur.collider_half_extents.x
                         changed = True
                 elif cur.collider_kind == COLLIDER_CAPSULE:
-                    if studio.ui_ctx.drag_float("col_radius", "Radius", cur.collider_half_extents.x, speed=0.02, min_val=0.01, max_val=500.0, w=col_w):
+                    if studio.ui_ctx.drag_float("col_radius", "Radius", cur.collider_half_extents.x, speed=0.02, min_val=0.01, max_val=500.0, w=cw, leading_label=True, unit="m"):
                         cur.collider_half_extents.z = cur.collider_half_extents.x
                         changed = True
-                    if studio.ui_ctx.drag_float("col_half_h", "Half Height", cur.collider_half_extents.y, speed=0.02, min_val=0.01, max_val=500.0, w=col_w):
+                    if studio.ui_ctx.drag_float("col_half_h", "Half Height", cur.collider_half_extents.y, speed=0.02, min_val=0.01, max_val=500.0, w=cw, leading_label=True, unit="m"):
                         changed = True
                 elif cur.collider_kind != COLLIDER_NONE:
-                    if studio.ui_ctx.drag_float3("col_he", "Half Extents", cur.collider_half_extents, speed=0.02, min_val=0.01, max_val=500.0, w=col_w):
+                    if studio.ui_ctx.drag_float3_v2("col_he", "Half extents", cur.collider_half_extents, speed=0.02, min_val=0.01, max_val=500.0, w=cw, align_property_column=True):
                         changed = True
                 if cur.collider_kind != COLLIDER_NONE:
-                    if studio.ui_ctx.checkbox("col_trigger", "Is Trigger", cur.is_trigger):
+                    if studio.ui_ctx.toggle_switch("col_trigger", "Trigger", cur.is_trigger, w=cw):
                         changed = True
-                    if studio.ui_ctx.drag_float("col_friction", "Friction", cur.friction, speed=0.01, min_val=0.0, max_val=2.0, w=col_w):
+                    if studio.ui_ctx.drag_float("col_friction", "Friction", cur.friction, speed=0.01, min_val=0.0, max_val=2.0, w=cw, leading_label=True):
                         changed = True
-                    if studio.ui_ctx.drag_float("col_rest", "Restitution", cur.restitution, speed=0.01, min_val=0.0, max_val=1.0, w=col_w):
+                    if studio.ui_ctx.drag_float("col_rest", "Restitution", cur.restitution, speed=0.01, min_val=0.0, max_val=1.0, w=cw, leading_label=True):
                         changed = True
-                studio.ui_ctx.tree_pop()
+                _end_insp_card_body(studio.ui_ctx, phy_card[0], phy_card[1], Float32(6.0))
+            else:
+                studio.ui_ctx.box_stack[len(studio.ui_ctx.box_stack) - 1].cursor_y += Float32(4.0)
 
+            # ---- Stylization & Timing Card (pushes exact npr_node_id onto id_stack to preserve #22 shd_vfx hash!) ----
             var npr_open = cur.shading_mode != SHADING_PBR or cur.anim_step_hz > Float32(0.0)
             var npr_node_id = "insp_npr_on" if npr_open else "insp_npr_off"
-            if studio.ui_ctx.tree_node(npr_node_id, "NPR Cel / Stylized VFX & Timeline", default_open=npr_open):
-                var npr_w = max(Float32(160.0), panel_w - Float32(20.0))
+            var npr_wid = studio.ui_ctx.widget_id(npr_node_id)
+            if studio.ui_ctx.collapsible_card(npr_node_id, "Stylization & timing", ICON_SPARK, npr_open, field_w)[0]:
+                var npr_hdr = studio.ui_ctx.last_item_rect
+                var npr_card = _begin_insp_card_body(studio.ui_ctx, npr_hdr, studio.studio_theme)
+                studio.ui_ctx.id_stack.append(npr_wid)
+                var npr_w = npr_card[2]
                 studio.ui_ctx.begin_box("npr_mode_row", FlexStyle.row(gap=4.0, pad=0.0))
-                if studio.ui_ctx.button("shd_pbr", "PBR", 58.0, 20.0):
+                var btn_pbr_w = max(Float32(44.0), (npr_w - Float32(8.0)) * Float32(0.26))
+                var btn_cel_w = max(Float32(54.0), (npr_w - Float32(8.0)) * Float32(0.32))
+                var btn_vfx_w = max(Float32(64.0), npr_w - btn_pbr_w - btn_cel_w - Float32(8.0))
+                if studio.ui_ctx.button_v2("shd_pbr", "PBR", BTN_PRIMARY if cur.shading_mode == SHADING_PBR else BTN_SECONDARY, -1, btn_pbr_w, 22.0):
                     cur.shading_mode = SHADING_PBR
                     changed = True
-                if studio.ui_ctx.button("shd_cel", "NPR Cel", 74.0, 20.0):
+                if studio.ui_ctx.button_v2("shd_cel", "NPR Cel", BTN_PRIMARY if cur.shading_mode == SHADING_NPR_CEL else BTN_SECONDARY, -1, btn_cel_w, 22.0):
                     cur.shading_mode = SHADING_NPR_CEL
                     changed = True
-                if studio.ui_ctx.button("shd_vfx", "Stylized VFX", 94.0, 20.0):
+                if studio.ui_ctx.button_v2("shd_vfx", "Stylized VFX", BTN_PRIMARY if cur.shading_mode == SHADING_STYLIZED_VFX else BTN_SECONDARY, -1, btn_vfx_w, 22.0):
                     cur.shading_mode = SHADING_STYLIZED_VFX
                     changed = True
                 studio.ui_ctx.end_box()
                 if cur.shading_mode == SHADING_NPR_CEL:
-                    if studio.ui_ctx.slider_float("cel_out_w", "Outline px", cur.cel_outline_width_px, Float32(0.0), Float32(8.0), w=npr_w):
+                    if studio.ui_ctx.slider_float_v2("cel_out_w", "Outline px", cur.cel_outline_width_px, Float32(0.0), Float32(8.0), w=npr_w):
                         changed = True
-                    if studio.ui_ctx.slider_float("cel_halo", "Hair Halo", cur.cel_hair_halo, Float32(0.0), Float32(1.5), w=npr_w):
+                    if studio.ui_ctx.slider_float_v2("cel_halo", "Hair Halo", cur.cel_hair_halo, Float32(0.0), Float32(1.5), w=npr_w):
                         changed = True
-                    if studio.ui_ctx.drag_float3("cel_shd", "SSS Tint", cur.cel_shadow_tint, speed=0.01, min_val=0.0, max_val=1.5, w=npr_w):
+                    if studio.ui_ctx.color_edit3("cel_shd", "SSS Tint", cur.cel_shadow_tint, min_val=0.0, max_val=1.5, w=npr_w, leading_label=True):
                         changed = True
                 elif cur.shading_mode == SHADING_STYLIZED_VFX:
-                    if studio.ui_ctx.slider_float("vfx_ero", "Erosion", cur.vfx_erosion, Float32(0.0), Float32(1.0), w=npr_w):
+                    if studio.ui_ctx.slider_float_v2("vfx_ero", "Erosion", cur.vfx_erosion, Float32(0.0), Float32(1.0), w=npr_w):
                         changed = True
-                    if studio.ui_ctx.slider_float("vfx_scr", "Scroll", cur.vfx_scroll_speed, Float32(0.0), Float32(12.0), w=npr_w):
+                    if studio.ui_ctx.slider_float_v2("vfx_scr", "Scroll", cur.vfx_scroll_speed, Float32(0.0), Float32(12.0), w=npr_w):
                         changed = True
-                if studio.ui_ctx.slider_float("anm_hz", "Step Hz", cur.anim_step_hz, Float32(0.0), Float32(30.0), w=npr_w):
+                if studio.ui_ctx.slider_float_v2("anm_hz", "Step Hz", cur.anim_step_hz, Float32(0.0), Float32(30.0), w=npr_w):
                     changed = True
-                if studio.ui_ctx.slider_float("anm_smr", "Smear X", cur.smear_stretch, Float32(0.55), Float32(3.2), w=npr_w):
+                if studio.ui_ctx.slider_float_v2("anm_smr", "Smear X", cur.smear_stretch, Float32(0.55), Float32(3.2), w=npr_w):
                     changed = True
-                studio.ui_ctx.tree_pop()
+                _ = studio.ui_ctx.id_stack.pop()
+                _end_insp_card_body(studio.ui_ctx, npr_card[0], npr_card[1], Float32(6.0))
+            else:
+                studio.ui_ctx.box_stack[len(studio.ui_ctx.box_stack) - 1].cursor_y += Float32(4.0)
 
             if changed:
                 if not studio.ui_ctx.mouse_down_l:
@@ -9758,9 +10525,13 @@ def emit_studio_ui_draw_list(
                         or (not cur.material_ref.is_empty())
                         or (not cur.override_material_ref.is_empty())
                     )
-                    if studio.ui_ctx.tree_node("insp_asset_mr", "Mesh & .flmat Material", default_open=show_asset_open):
+                    var mr_wid = studio.ui_ctx.widget_id("insp_asset_mr")
+                    if studio.ui_ctx.collapsible_card("insp_asset_mr", "Mesh assets", ICON_CUBE, show_asset_open, field_w)[0]:
+                        var mr_hdr = studio.ui_ctx.last_item_rect
+                        var mr_card = _begin_insp_card_body(studio.ui_ctx, mr_hdr, studio.studio_theme)
+                        studio.ui_ctx.id_stack.append(mr_wid)
                         var mref_txt = cur.mesh_ref.rel_path if not cur.mesh_ref.is_empty() else String("(none)")
-                        studio.ui_ctx.label("MeshRef: " + mref_txt + " (id=" + String(cur.mesh_id) + ")", studio.ui_ctx.theme.text_muted)
+                        studio.ui_ctx.label("MeshRef: " + mref_txt + " (id=" + String(cur.mesh_id) + ")", studio.studio_theme.text_muted)
                         var mdrop = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                         if mdrop[0] and FlintStudioState._ascii_lower(mdrop[2]).endswith(".glb"):
                             var rel_glb = studio._project_rel_for_entry(mdrop[2])
@@ -9774,7 +10545,7 @@ def emit_studio_ui_draw_list(
 
                         var act_mat_ref = cur.override_material_ref.copy() if not cur.override_material_ref.is_empty() else cur.material_ref.copy()
                         var mat_txt = act_mat_ref.rel_path if not act_mat_ref.is_empty() else String("(none)")
-                        studio.ui_ctx.label("MaterialRef: " + mat_txt, studio.ui_ctx.theme.text_muted)
+                        studio.ui_ctx.label("MaterialRef: " + mat_txt, studio.studio_theme.text_muted)
                         var mat_drop = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                         if mat_drop[0] and FlintStudioState._ascii_lower(mat_drop[2]).endswith(".flmat"):
                             _ = studio._assign_flmat_to_entity(eid, studio._project_rel_for_entry(mat_drop[2]))
@@ -9796,12 +10567,12 @@ def emit_studio_ui_draw_list(
                                 sh_items.append("NPR Cel")
                                 sh_items.append("Stylized VFX")
                                 var sh_idx = max(0, min(2, flm.shading_mode))
-                                if studio.ui_ctx.combo_box("flmat_shading", ".flmat Shading", sh_idx, sh_items, w=insp_w):
+                                if studio.ui_ctx.combo_box("flmat_shading", ".flmat Shading", sh_idx, sh_items, w=mr_card[2], leading_label=True):
                                     flm.shading_mode = sh_idx
                                     flm_dirty = True
 
                                 var alb_s = flm.albedo_tex.rel_path
-                                if studio.ui_ctx.text_input("flmat_alb_tex", alb_s, insp_w, "albedo_tex (.png/.jpg)"):
+                                if studio.ui_ctx.text_input("flmat_alb_tex", alb_s, mr_card[2], "albedo_tex (.png/.jpg)"):
                                     flm.albedo_tex = studio._authored_asset_ref(alb_s, ASSET_KIND_TEXTURE) if alb_s.byte_length() > 0 else AssetRef()
                                     flm_dirty = True
                                 var d_alb = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
@@ -9812,7 +10583,7 @@ def emit_studio_ui_draw_list(
                                         flm_dirty = True
 
                                 var nrm_s = flm.normal_tex.rel_path
-                                if studio.ui_ctx.text_input("flmat_nrm_tex", nrm_s, insp_w, "normal_tex (.png/.jpg)"):
+                                if studio.ui_ctx.text_input("flmat_nrm_tex", nrm_s, mr_card[2], "normal_tex (.png/.jpg)"):
                                     flm.normal_tex = studio._authored_asset_ref(nrm_s, ASSET_KIND_TEXTURE) if nrm_s.byte_length() > 0 else AssetRef()
                                     flm_dirty = True
                                 var d_nrm = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
@@ -9823,7 +10594,7 @@ def emit_studio_ui_draw_list(
                                         flm_dirty = True
 
                                 var orm_s = flm.orm_tex.rel_path
-                                if studio.ui_ctx.text_input("flmat_orm_tex", orm_s, insp_w, "orm_tex (.png/.jpg)"):
+                                if studio.ui_ctx.text_input("flmat_orm_tex", orm_s, mr_card[2], "orm_tex (.png/.jpg)"):
                                     flm.orm_tex = studio._authored_asset_ref(orm_s, ASSET_KIND_TEXTURE) if orm_s.byte_length() > 0 else AssetRef()
                                     flm_dirty = True
                                 var d_orm = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
@@ -9834,7 +10605,7 @@ def emit_studio_ui_draw_list(
                                         flm_dirty = True
 
                                 var emi_s = flm.emissive_tex.rel_path
-                                if studio.ui_ctx.text_input("flmat_emi_tex", emi_s, insp_w, "emissive_tex (.png/.jpg)"):
+                                if studio.ui_ctx.text_input("flmat_emi_tex", emi_s, mr_card[2], "emissive_tex (.png/.jpg)"):
                                     flm.emissive_tex = studio._authored_asset_ref(emi_s, ASSET_KIND_TEXTURE) if emi_s.byte_length() > 0 else AssetRef()
                                     flm_dirty = True
                                 var d_emi = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
@@ -9847,10 +10618,13 @@ def emit_studio_ui_draw_list(
                                 if flm_dirty:
                                     _ = save_flmat_file(mat_disk, flm)
                                     _ = studio._assign_flmat_to_entity(eid, act_mat_ref.rel_path)
-                        studio.ui_ctx.tree_pop()
+                        _ = studio.ui_ctx.id_stack.pop()
+                        _end_insp_card_body(studio.ui_ctx, mr_card[0], mr_card[1], Float32(6.0))
+                    else:
+                        studio.ui_ctx.box_stack[len(studio.ui_ctx.box_stack) - 1].cursor_y += Float32(4.0)
 
                 if cur.has_animator or cur.has_skeleton:
-                    if studio.ui_ctx.tree_node("insp_animator", "Animator & Viewport Preview", default_open=True):
+                    if studio.ui_ctx.tree_node("insp_animator", "Animation", default_open=True):
                         _ = studio.ui_ctx.checkbox("insp_vp_anim_prev", "Viewport Idle Preview", studio.viewport_anim_preview)
                         if cur.has_animator:
                             var ac_opt = studio.app.world.get_ptr[AnimatorComponent](sel_e)
@@ -9926,7 +10700,7 @@ def emit_studio_ui_draw_list(
                         studio.ui_ctx.tree_pop()
 
                 if cur.has_rig or cur.has_skeleton or cur.has_bone_socket:
-                    if studio.ui_ctx.tree_node("insp_rig_skel", "Rig, Skeleton & BoneSocket", default_open=True):
+                    if studio.ui_ctx.tree_node("insp_rig_skel", "Rig & sockets", default_open=True):
                         if cur.has_rig or cur.has_skeleton:
                             var r_txt = cur.rig_ref.rel_path if not cur.rig_ref.is_empty() else String("(none)")
                             studio.ui_ctx.label(
@@ -10023,7 +10797,7 @@ def emit_studio_ui_draw_list(
                         studio.ui_ctx.tree_pop()
 
                 if cur.has_audio:
-                    if studio.ui_ctx.tree_node("insp_audio", "Audio Emitter", default_open=True):
+                    if studio.ui_ctx.tree_node("insp_audio", "Audio emitter", default_open=True):
                         var au_p = studio.app.world.get_ptr[AudioEmitterComponent](sel_e)
                         if au_p:
                             ref au = au_p.value()[unsafe_offset=0]
@@ -10076,7 +10850,7 @@ def emit_studio_ui_draw_list(
                         studio.ui_ctx.tree_pop()
 
                 if cur.has_prefab:
-                    if studio.ui_ctx.tree_node("insp_prefab", "Prefab Instance", default_open=True):
+                    if studio.ui_ctx.tree_node("insp_prefab", "Prefab instance", default_open=True):
                         var pf_p = studio.app.world.get_ptr[PrefabInstanceComponent](sel_e)
                         if pf_p:
                             ref pf = pf_p.value()[unsafe_offset=0]
@@ -10116,7 +10890,11 @@ def emit_studio_ui_draw_list(
                             _ = studio.commit_ecs_edit(eid, "Assign MeshRef", before_blob^)
 
                 # M2 Generic Reflection Inspector (Add Component, POD Schemas, Built-ins & UnknownComponents)
-                if studio.ui_ctx.tree_node("insp_reflect_add", "Components (Reflection)", default_open=True):
+                var ref_wid = studio.ui_ctx.widget_id("insp_reflect_add")
+                if studio.ui_ctx.collapsible_card("insp_reflect_add", "Components", ICON_PLUS, True, field_w)[0]:
+                    var ref_hdr = studio.ui_ctx.last_item_rect
+                    var ref_card = _begin_insp_card_body(studio.ui_ctx, ref_hdr, studio.studio_theme)
+                    studio.ui_ctx.id_stack.append(ref_wid)
                     var addable_names = List[String]()
                     var sorted_cidx = studio.registry.sorted_entry_indices()
                     for si in range(len(sorted_cidx)):
@@ -10128,8 +10906,8 @@ def emit_studio_ui_draw_list(
                             addable_names.append(cname)
                     if len(addable_names) > 0:
                         studio._insp_add_comp_idx = max(0, min(len(addable_names) - 1, studio._insp_add_comp_idx))
-                        _ = studio.ui_ctx.combo_box("insp_add_comp_combo", "Add", studio._insp_add_comp_idx, addable_names, w=insp_w)
-                        if studio.ui_ctx.button("insp_add_comp_btn", "Add Component", insp_w, 22.0):
+                        _ = studio.ui_ctx.combo_box("insp_add_comp_combo", "Add", studio._insp_add_comp_idx, addable_names, w=ref_card[2], leading_label=True)
+                        if studio.ui_ctx.button_v2("insp_add_comp_btn", "Add Component", BTN_SECONDARY, ICON_PLUS, ref_card[2], 24.0):
                             var add_nm = addable_names[studio._insp_add_comp_idx]
                             if studio.add_component_by_name(eid, add_nm, record_undo=True):
                                 if eid < len(studio.entities):
@@ -10549,7 +11327,7 @@ def emit_studio_ui_draw_list(
                         or len(unk_p.value()[unsafe_offset=0].bin_fourccs) > 0
                     ):
                         ref unk = unk_p.value()[unsafe_offset=0]
-                        if studio.ui_ctx.tree_node("insp_unk", "Unknown Components (Preserved)", default_open=True):
+                        if studio.ui_ctx.tree_node("insp_unk", "Unrecognized components", default_open=True):
                             studio.ui_ctx.label(
                                 "Preserved: " + String(len(unk.json_names)) + " JSON, " + String(len(unk.bin_fourccs)) + " Bin",
                                 studio.ui_ctx.theme.text_muted,
@@ -10564,17 +11342,53 @@ def emit_studio_ui_draw_list(
                                 )
                             studio.ui_ctx.tree_pop()
 
-                    studio.ui_ctx.tree_pop()
+                    _ = studio.ui_ctx.id_stack.pop()
+                    _end_insp_card_body(studio.ui_ctx, ref_card[0], ref_card[1], Float32(6.0))
+                else:
+                    studio.ui_ctx.box_stack[len(studio.ui_ctx.box_stack) - 1].cursor_y += Float32(4.0)
 
             studio.ui_ctx.begin_box("ent_actions_row", FlexStyle.row(gap=6.0, pad=0.0))
-            var act_w = max(Float32(80.0), (panel_w - Float32(12.0)) * Float32(0.5))
-            if studio.ui_ctx.button("btn_dup_ent", "Duplicate [Ctrl+D]", act_w, 24.0):
+            var act_w = max(Float32(64.0), (field_w - Float32(6.0)) * Float32(0.5))
+            if studio.ui_ctx.button_v2("btn_dup_ent", "Duplicate", BTN_SECONDARY, -1, act_w, 24.0):
                 _ = studio.duplicate_entity(eid, record_undo=True)
-            if studio.ui_ctx.button("btn_del_ent", "Delete [Del]", act_w, 24.0):
+            if studio.ui_ctx.button_v2("btn_del_ent", "Delete", BTN_DANGER, -1, act_w, 24.0):
                 _ = studio.despawn_entity(eid, record_undo=True)
             studio.ui_ctx.end_box()
         else:
-            studio.ui_ctx.label("No entity selected", studio.ui_ctx.theme.text_muted)
+            var emp_top_i = len(studio.ui_ctx.box_stack) - 1
+            var emp_x = studio.ui_ctx.box_stack[emp_top_i].cursor_x
+            var emp_y = studio.ui_ctx.box_stack[emp_top_i].cursor_y + Float32(8.0)
+            var emp_h = Float32(142.0)
+            studio.ui_ctx.draw_list.add_card_surface(
+                emp_x, emp_y, field_w, emp_h,
+                studio.studio_theme.l2_card, studio.studio_theme.border_subtle,
+                RADIUS_MD, Float32(1.0), True, False,
+            )
+            var badge_sz = Float32(34.0)
+            var bx = emp_x + (field_w - badge_sz) * Float32(0.5)
+            var by = emp_y + Float32(16.0)
+            studio.ui_ctx.draw_list.add_rect_styled(
+                bx, by, badge_sz, badge_sz,
+                studio.studio_theme.accent_soft,
+                rgba8_with_alpha(studio.studio_theme.accent_primary, 100),
+                RADIUS_MD, Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+            )
+            draw_studio_icon(studio.ui_ctx.draw_list, ICON_CUBE, bx + Float32(8.0), by + Float32(8.0), Float32(18.0), studio.studio_theme.accent_primary, Float32(1.5))
+            studio.ui_ctx.draw_text_in_rect(
+                RectF(emp_x + Float32(8.0), by + badge_sz + Float32(8.0), max(Float32(20.0), field_w - Float32(16.0)), Float32(18.0)),
+                "No Entity Selected", studio.studio_theme.font_title, studio.studio_theme.text_primary, UI_ALIGN_CENTER, UI_FONT_BOLD, truncate=True,
+            )
+            studio.ui_ctx.draw_text_in_rect(
+                RectF(emp_x + Float32(8.0), by + badge_sz + Float32(26.0), max(Float32(20.0), field_w - Float32(16.0)), Float32(16.0)),
+                "Pick in Viewport or press Ctrl+K", studio.studio_theme.font_caption, studio.studio_theme.text_muted, UI_ALIGN_CENTER, UI_FONT_REGULAR, truncate=True,
+            )
+            var cta_w = min(Float32(142.0), max(Float32(72.0), field_w - Float32(28.0)))
+            studio.ui_ctx.box_stack[emp_top_i].cursor_x = emp_x + (field_w - cta_w) * Float32(0.5)
+            studio.ui_ctx.box_stack[emp_top_i].cursor_y = emp_y + emp_h - Float32(36.0)
+            if studio.ui_ctx.button_v2("insp_create_entity", "Create entity", BTN_PRIMARY, ICON_PLUS, cta_w, 26.0):
+                studio.open_command_palette(PALETTE_SPAWN)
+            studio.ui_ctx.box_stack[emp_top_i].cursor_x = emp_x
+            studio.ui_ctx.box_stack[emp_top_i].cursor_y = emp_y + emp_h + Float32(8.0)
         studio.ui_ctx.end_scroll_view()
         studio.ui_ctx.end_dock_panel()
 
@@ -10591,9 +11405,13 @@ def emit_studio_ui_draw_list(
             ag_r.y,
             ag_r.w,
             ag_r.h,
-            input,
+            scaled_input,
             dt,
             studio.ui_time_sec,
+            bold_font_slot=studio.ui_ctx.font_bold_slot,
+            bold_font=studio.ui_ctx.font_bold,
+            mono_font_slot=studio.ui_ctx.font_mono_slot,
+            mono_font=studio.ui_ctx.font_mono,
         )
         if studio.agent_panel.hovered_entity_id >= 0 and studio.is_alive_id(studio.agent_panel.hovered_entity_id):
             var hid = studio.agent_panel.hovered_entity_id
@@ -10608,6 +11426,28 @@ def emit_studio_ui_draw_list(
             studio.apply_agent_panel_action(ag_acts[ai])
         studio.ui_ctx.end_dock_panel()
 
+    if studio.ui_ctx.begin_dock_panel(studio.dock, PANEL_MOCAP):
+        studio.ensure_mocap_initialized()
+        var mc_info = studio.dock.find_panel(PANEL_MOCAP)
+        var mc_res = draw_mocap_panel(
+            studio.ui_ctx,
+            studio.mocap,
+            mc_info[3],
+            studio.studio_theme,
+        )
+        if mc_res.run_capture_clicked:
+            studio._trigger_mocap_capture()
+        if mc_res.load_demo_clicked:
+            studio.mocap.load_demo_take()
+            studio.push_toast("Loaded 90f SOMA-77 RGBMocap demo take", 0, 2.5)
+        if mc_res.apply_to_scene_clicked:
+            _ = studio._apply_mocap_to_selected_entity()
+        if mc_res.export_bvh_clicked:
+            _ = studio._export_mocap_take(False)
+        if mc_res.export_glb_clicked:
+            _ = studio._export_mocap_take(True)
+        studio.ui_ctx.end_dock_panel()
+
     if studio.ui_ctx.begin_dock_panel(studio.dock, "CodeDrawer"):
         var cd_info = studio.dock.find_panel("CodeDrawer")
         var cd_r = cd_info[3]
@@ -10620,8 +11460,10 @@ def emit_studio_ui_draw_list(
             cd_r.y,
             cd_r.w,
             cd_r.h,
-            input,
+            scaled_input,
             studio.ui_time_sec,
+            mono_font_slot=studio.ui_ctx.font_mono_slot,
+            mono_font=studio.ui_ctx.font_mono,
         )
         if cd_act.kind == CODE_ACT_BUILD_HOT_RELOAD:
             _ = studio.execute_palette_command(PAL_CMD_BUILD_HOT_RELOAD)
@@ -10658,69 +11500,8 @@ def emit_studio_ui_draw_list(
             studio.update_camera(Float32(0.0))
         studio.ui_ctx.end_dock_panel()
 
-    # 5. Bottom Asset Server, Spawn Cards & Recursive Workspace/Pack Browser (`DockSpace` -> `"AssetBrowser"`)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "AssetBrowser"):
-        if (not studio.asset_browser_scanned) and (
-            studio.asset_browser_dir.byte_length() > 0 or studio.asset_browser_pack.byte_length() > 0
-        ):
-            _ = studio.scan_asset_browser()
-        var ab_info = studio.dock.find_panel("AssetBrowser")
-        var ab_w = max(Float32(220.0), ab_info[3].w - Float32(16.0))
-        var ab_h = max(Float32(90.0), ab_info[3].h - Float32(16.0))
-        studio.ui_ctx.label(
-            "ASSET BROWSER (.flpk v3="
-            + String(mounted_packs)
-            + ", items="
-            + String(len(studio.asset_browser_entries))
-            + ")  |  MCP v2 CLIENTS="
-            + String(mcp_clients),
-            studio.ui_ctx.theme.accent,
-        )
-        var ab_cards_style = FlexStyle.row(gap=4.0, pad=1.0)
-        ab_cards_style.fixed_h = Float32(26.0)
-        ab_cards_style.min_h = Float32(26.0)
-        ab_cards_style.shrink = Float32(0.0)
-        studio.ui_ctx.begin_box("ab_spawn_cards", ab_cards_style)
-        if studio.ui_ctx.button("card_empty", "Empty", 62.0, 24.0):
-            _ = studio.spawn_card_entity(0)
-        if studio.ui_ctx.button("card_cube", "Cube", 58.0, 24.0):
-            _ = studio.spawn_card_entity(1)
-        if studio.ui_ctx.button("card_point_light", "Point Light", 92.0, 24.0):
-            _ = studio.spawn_card_entity(2)
-        if studio.ui_ctx.button("card_spot_light", "Spot Light", 88.0, 24.0):
-            _ = studio.spawn_card_entity(3)
-        if studio.ui_ctx.button("card_camera", "Camera", 74.0, 24.0):
-            _ = studio.spawn_card_entity(4)
-        if studio.ui_ctx.button("card_audio_emitter", "Audio Emitter", 116.0, 24.0):
-            _ = studio.spawn_card_entity(5)
-        if studio.ui_ctx.button("ab_rescan", "Rescan", 66.0, 24.0):
-            _ = studio.scan_asset_browser()
-        if studio.ui_ctx.button("ab_import", "Import", 62.0, 24.0):
-            if studio.import_src_input.byte_length() > 0:
-                var imp_src = studio.import_src_input
-                var imp_dst = studio.import_dst_subdir
-                _ = studio.import_asset_to_project(imp_src, imp_dst)
-            else:
-                studio.push_toast("Set import_src_input or use MCP asset.import", 1, 2.5)
-        studio.ui_ctx.end_box()
-
-        var ab_scroll_h = max(Float32(40.0), ab_h - Float32(66.0))
-        studio.ui_ctx.begin_scroll_view("ab_entries_scroll", 0.0, ab_scroll_h)
-        var entry_bw = max(Float32(180.0), ab_w - Float32(28.0))
-        for ai in range(len(studio.asset_browser_entries)):
-            var entry_name = studio.asset_browser_entries[ai]
-            var ab_clicked = studio.ui_ctx.button("ab_item_" + String(ai), entry_name, entry_bw, 22.0)
-            _ = studio.ui_ctx.begin_drag_source("ASSET_ENTRY", ai, entry_name)
-            if ab_clicked:
-                var e_low = FlintStudioState._ascii_lower(entry_name)
-                var tgt = studio.selected_entity_id if (e_low.endswith(".flmat") or e_low.endswith(".flrig") or e_low.endswith(".flanim")) else -1
-                _ = studio.activate_asset_entry(
-                    entry_name,
-                    target_entity_id=tgt,
-                    drop_pos=Vec3(Float32(ai % 6) * Float32(0.5), Float32(0.0), Float32(0.0)),
-                    from_drop=False,
-                )
-        studio.ui_ctx.end_scroll_view()
+        _draw_project_assets(studio, studio.dock.find_panel("AssetBrowser")[3])
         studio.ui_ctx.end_dock_panel()
 
     if studio.ui_ctx.begin_dock_panel(studio.dock, "MCP v2"):
@@ -10735,38 +11516,43 @@ def emit_studio_ui_draw_list(
         if studio.input_rebind_active:
             studio.ui_ctx.label(
                 "Press key for " + studio.input_rebind_context + "." + studio.input_rebind_action + " (Esc cancels)",
-                studio.ui_ctx.theme.accent,
+                studio.studio_theme.accent_primary,
             )
         else:
             studio.ui_ctx.label(
-                "InputMap (" + String(len(studio.input_map.contexts)) + " contexts, " + String(len(studio.input_map.actions)) + " actions)",
-                studio.ui_ctx.theme.text_muted,
+                "Input Map  ·  " + String(len(studio.input_map.contexts)) + " contexts  ·  " + String(len(studio.input_map.actions)) + " actions",
+                studio.studio_theme.text_secondary,
             )
         var im_bar = FlexStyle.row(gap=6.0, pad=0.0)
-        im_bar.fixed_h = Float32(24.0)
-        im_bar.min_h = Float32(24.0)
+        im_bar.fixed_h = Float32(26.0)
+        im_bar.min_h = Float32(26.0)
         im_bar.shrink = Float32(0.0)
         studio.ui_ctx.begin_box("imap_actions_bar", im_bar)
-        if studio.ui_ctx.button("imap_save_btn", "Save JSON", 86.0, 22.0):
+        if studio.ui_ctx.button_v2("imap_save_btn", "Save JSON", BTN_PRIMARY, -1, 88.0, 24.0):
             _ = studio.save_input_map_file()
-        if studio.ui_ctx.button("imap_load_btn", "Load JSON", 86.0, 22.0):
+        if studio.ui_ctx.button_v2("imap_load_btn", "Load JSON", BTN_SECONDARY, -1, 88.0, 24.0):
             _ = studio.load_input_map_file()
         if studio.input_rebind_active:
-            if studio.ui_ctx.button("imap_cancel_btn", "Cancel", 68.0, 22.0):
+            if studio.ui_ctx.button_v2("imap_cancel_btn", "Cancel", BTN_GHOST, -1, 70.0, 24.0):
                 studio.cancel_input_rebind()
         studio.ui_ctx.end_box()
 
-        var im_scroll_h = max(Float32(30.0), im_h - Float32(52.0))
-        studio.ui_ctx.begin_scroll_view("imap_scroll", 0.0, im_scroll_h)
-        var row_lbl_w = max(Float32(110.0), im_w - Float32(118.0))
+        var im_scroll_h = max(Float32(30.0), im_h - Float32(56.0))
+        studio.ui_ctx.begin_scroll_view("imap_scroll", 0.0, im_scroll_h, frameless=True)
+        var im_field_w = max(Float32(160.0), im_w - Float32(14.0))
         for ci in range(len(studio.input_map.contexts)):
             var ctx_name = studio.input_map.contexts[ci].name
             var ctx_pri = studio.input_map.contexts[ci].priority
             var n_b = len(studio.input_map.contexts[ci].bindings)
-            if studio.ui_ctx.tree_node("imap_ctx_" + String(ci), ctx_name + " (prio " + String(ctx_pri) + ")", default_open=True):
+            var ctx_wid = studio.ui_ctx.widget_id("imap_ctx_" + String(ci))
+            if studio.ui_ctx.collapsible_card("imap_ctx_" + String(ci), ctx_name, ICON_GRID, True, im_field_w)[0]:
+                var ctx_hdr = studio.ui_ctx.last_item_rect
+                _draw_insp_header_badge(studio.ui_ctx, ctx_hdr, "P" + String(ctx_pri), studio.studio_theme.l3_raised, studio.studio_theme.text_secondary)
+                var im_card = _begin_insp_card_body(studio.ui_ctx, ctx_hdr, studio.studio_theme)
+                studio.ui_ctx.id_stack.append(ctx_wid)
+                var row_w = im_card[2]
                 for bi in range(n_b):
                     var b = studio.input_map.contexts[ci].bindings[bi]
-                    studio.ui_ctx.begin_box("imap_row_" + String(ci) + "_" + String(bi), FlexStyle.row(gap=6.0, pad=0.0))
                     var key_str = _studio_format_input_binding(b)
                     var is_rebinding = (
                         studio.input_rebind_active
@@ -10774,36 +11560,74 @@ def emit_studio_ui_draw_list(
                         and studio.input_rebind_action == b.action_name
                         and b.source_kind == BIND_KEY
                     )
-                    studio.ui_ctx.label(
-                        b.action_name + ": " + key_str,
-                        studio.ui_ctx.theme.accent if is_rebinding else studio.ui_ctx.theme.text_primary,
+                    var rr = studio.ui_ctx._alloc_item_rect(studio.ui_ctx.widget_id("imap_row_" + String(ci) + "_" + String(bi)), row_w, Float32(24.0))
+                    var reb_w = Float32(72.0) if b.source_kind == BIND_KEY else Float32(0.0)
+                    var kbd_w = max(Float32(28.0), studio.ui_ctx._measure_text_styled(key_str, studio.studio_theme.font_caption, UI_FONT_MONO) + Float32(14.0))
+                    var act_avail = max(Float32(48.0), row_w - reb_w - kbd_w - Float32(16.0))
+                    studio.ui_ctx.draw_text_in_rect(
+                        RectF(rr.x + Float32(2.0), rr.y, act_avail, rr.h),
+                        b.action_name, studio.studio_theme.font_body,
+                        studio.studio_theme.accent_primary if is_rebinding else studio.studio_theme.text_primary,
+                        UI_ALIGN_LEFT, UI_FONT_BOLD if is_rebinding else UI_FONT_REGULAR, truncate=True,
                     )
+                    var kbd_x = rr.right() - reb_w - kbd_w - (Float32(6.0) if reb_w > Float32(0.0) else Float32(2.0))
+                    _ = studio.ui_ctx.kbd_pill(key_str, kbd_x, rr.center_y() - Float32(9.0), Float32(18.0))
                     if b.source_kind == BIND_KEY:
-                        var btn_txt = String("Listening...") if is_rebinding else String("Rebind")
-                        if studio.ui_ctx.button("imap_reb_" + String(ci) + "_" + String(bi), btn_txt, min(Float32(92.0), row_lbl_w), 20.0):
-                            _ = studio.begin_input_rebind(ctx_name, b.action_name)
-                    studio.ui_ctx.end_box()
-                studio.ui_ctx.tree_pop()
+                        var br = RectF(rr.right() - reb_w, rr.center_y() - Float32(10.0), reb_w, Float32(20.0))
+                        var bwid = studio.ui_ctx.widget_id("imap_reb_" + String(ci) + "_" + String(bi))
+                        var bhov = (not studio.ui_ctx._blocked_by_modal()) and br.contains(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y)
+                        if bhov:
+                            studio.ui_ctx.hovered_id = bwid
+                            studio.ui_ctx.hovered_rect = studio.ui_ctx._clip_hovered_rect(br)
+                            if studio.ui_ctx.mouse_pressed_l:
+                                _ = studio.begin_input_rebind(ctx_name, b.action_name)
+                        studio.ui_ctx.draw_list.add_rect_styled(
+                            br.x, br.y, br.w, br.h,
+                            studio.studio_theme.accent_soft if is_rebinding else (studio.studio_theme.l3_hover if bhov else studio.studio_theme.l3_raised),
+                            studio.studio_theme.accent_primary if is_rebinding else (studio.studio_theme.border_strong if bhov else studio.studio_theme.border_control),
+                            RADIUS_XS, Float32(1.0), Float32(1.0), UI_FLAG_BORDER | UI_FLAG_TOP_BEVEL,
+                        )
+                        studio.ui_ctx.draw_text_in_rect(
+                            br,
+                            "Listening..." if is_rebinding else "Rebind",
+                            studio.studio_theme.font_caption,
+                            studio.studio_theme.accent_primary if is_rebinding else studio.studio_theme.text_primary,
+                            UI_ALIGN_CENTER, UI_FONT_REGULAR, truncate=True,
+                        )
+                _ = studio.ui_ctx.id_stack.pop()
+                _end_insp_card_body(studio.ui_ctx, im_card[0], im_card[1], Float32(6.0))
         studio.ui_ctx.end_scroll_view()
         studio.ui_ctx.end_dock_panel()
 
-    # Draw legacy SceneMenu dropdown only when opened via FLINT brand menu button (or legacy Toolbar)
+    # Draw SceneMenu dropdown when opened via FLINT brand menu button (or legacy Toolbar)
     var toolbar = studio.dock.find_panel("Toolbar")
     if (toolbar[0] >= 0 and toolbar[2]) or studio.menu.bar.group >= 0:
+        studio.menu.sync_toggle_states(
+            studio.snap_enabled,
+            studio.show_navmesh_overlay,
+            studio.show_collider_overlay,
+        )
         ref bar = studio.menu.bar
         if toolbar[0] >= 0 and toolbar[2]:
             bar.x = Int(toolbar[3].x) + 4
             bar.y = Int(toolbar[3].y)
             bar.height = min(30, max(1, Int(toolbar[3].h)))
         else:
-            bar.x = 4
-            bar.y = 0
-            bar.height = Int(STUDIO_HEADER_BAR_H)
-        bar.screen_w = screen_w
-        bar.screen_h = screen_h
-        bar.draw(studio.ui_ctx.draw_list, studio.ui_ctx.font, font_slot)
+            bar.x = 8
+            bar.y = Int(STUDIO_HEADER_BAR_H) + 2
+            bar.height = 28
+        bar.screen_w = Int(sw)
+        bar.screen_h = Int(sh)
+        bar.draw_themed(
+            studio.ui_ctx.draw_list,
+            studio.ui_ctx.font,
+            font_slot,
+            studio.studio_theme,
+            studio.ui_ctx.font_mono_slot,
+        )
 
     # Frosted-glass Toast Stack + Background Job Progress Pills (anchored top-right / bottom-right inside vp)
+    var toast_hud_top = max(studio.viewport_hud.reserved_top_px, Float32(96.0) if studio.viewport_hud.perf_expanded else Float32(48.0))
     var toast_act = draw_toast_stack(
         studio.toast_mgr,
         studio.ui_ctx.draw_list,
@@ -10816,6 +11640,7 @@ def emit_studio_ui_draw_list(
         studio.ui_ctx.mouse_y,
         studio.ui_ctx.mouse_pressed_l and (not overlay_blocked),
         top_offset=Float32(48.0),
+        hud_reserved_top=toast_hud_top,
     )
     if toast_act.action_entity_id >= 0 and studio.is_alive_id(toast_act.action_entity_id):
         studio.select_entity(toast_act.action_entity_id)
@@ -10846,6 +11671,8 @@ def emit_studio_ui_draw_list(
         studio.studio_theme,
         studio.ui_ctx.animator,
         vp,
+        studio.ui_ctx.font_mono_slot,
+        studio.ui_ctx.font_mono,
     )
 
     # Topmost Frosted-Glass Command Palette (`Ctrl+K` / `Shift+A`)
@@ -10860,19 +11687,26 @@ def emit_studio_ui_draw_list(
         sh,
         studio.ui_ctx.mouse_x,
         studio.ui_ctx.mouse_y,
-        studio.ui_ctx.mouse_down_l and (not studio.confirm_modal_open),
-        studio.ui_ctx.mouse_pressed_l and (not studio.confirm_modal_open),
+        palette_was_open and studio.ui_ctx.mouse_down_l and not studio.confirm_modal_open,
+        palette_was_open and studio.ui_ctx.mouse_pressed_l and not studio.confirm_modal_open,
         studio.ui_ctx.key_shift,
+        studio.ui_ctx.mouse_wheel if palette_was_open and not studio.confirm_modal_open else Float32(0),
+        studio.ui_ctx.mouse_delta_x != 0 or studio.ui_ctx.mouse_delta_y != 0,
+        studio.ui_ctx.font_mono_slot,
+        studio.ui_ctx.font_mono,
     )
     if pal_res.executed:
         _ = studio.execute_palette_action(pal_res)
 
+    if studio.asset_browser_state.dialog != 0 and not studio.confirm_modal_open:
+        _draw_asset_dialog(studio)
+
     # Unsaved changes confirmation modal (`Ctrl+Q`, window close, or `File -> New scene`)
     if studio.confirm_modal_open:
         if studio.ui_ctx.begin_modal("unsaved_confirm_modal", "Unsaved Changes", Float32(390.0), Float32(138.0), studio.confirm_modal_open):
-            studio.ui_ctx.label("The current scene has unsaved changes.")
+            studio.ui_ctx.label("The current scene has unsaved changes.", studio.studio_theme.text_secondary)
             studio.ui_ctx.begin_box("unsaved_modal_btns", FlexStyle.row(gap=8.0, pad=2.0))
-            if studio.ui_ctx.button("modal_save_cont", "Save & Continue", 128.0, 26.0):
+            if studio.ui_ctx.button_v2("modal_save_cont", "Save & Continue", BTN_PRIMARY, -1, 128.0, 26.0):
                 if studio.pie.mode != PIE_STOPPED:
                     try:
                         _ = studio.pie_stop()
@@ -10887,7 +11721,7 @@ def emit_studio_ui_draw_list(
                         studio.quit_requested = True
                     elif act == 2:
                         _ = studio.new_scene(force=True)
-            if studio.ui_ctx.button("modal_discard", "Discard", 96.0, 26.0):
+            if studio.ui_ctx.button_v2("modal_discard", "Discard", BTN_DANGER, -1, 96.0, 26.0):
                 var act = studio.confirm_modal_action
                 studio.confirm_modal_open = False
                 studio.confirm_modal_action = 0
@@ -10896,7 +11730,7 @@ def emit_studio_ui_draw_list(
                     studio.quit_requested = True
                 elif act == 2:
                     _ = studio.new_scene(force=True)
-            if studio.ui_ctx.button("modal_cancel", "Cancel", 86.0, 26.0):
+            if studio.ui_ctx.button_v2("modal_cancel", "Cancel", BTN_GHOST, -1, 86.0, 26.0):
                 studio.confirm_modal_open = False
                 studio.confirm_modal_action = 0
             studio.ui_ctx.end_box()

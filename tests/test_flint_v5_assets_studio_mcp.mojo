@@ -3340,6 +3340,8 @@ def test_j_studio_v5_unification_ux_and_headless_smoke(tmp_root: String) raises:
     # Collapse p_id -> visible order hides c_id -> Shift range p_id..d_id selects only [p_id, d_id]!
     st.set_hierarchy_expanded(p_id, False)
     var collapsed_rows = st.hierarchy_visible_rows()
+    var searchable_rows = st.hierarchy_visible_rows(include_collapsed=True)
+    _assert(len(searchable_rows) == 3 and searchable_rows[1].entity_id == c_id and not searchable_rows[0].expanded, "search must include collapsed descendants and retain expansion state")
     _assert(len(collapsed_rows) == 2 and collapsed_rows[0].entity_id == p_id and collapsed_rows[1].entity_id == d_id, "collapsed parent must hide child rows (expected 2 visible rows)")
     st.select_entity(p_id)
     st.select_entity(d_id, range_select=True)

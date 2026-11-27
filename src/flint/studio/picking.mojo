@@ -629,3 +629,176 @@ def pick_renderer_viewport_once(
     var res = picker.pick_viewport(ren, out_px, out_py, instance_to_entity)
     picker.shutdown(ren)
     return res
+
+
+# ============================================================================
+# Hover-Pick Preview & 180ms Click Selection Confirmation Pulse
+# ============================================================================
+
+comptime PICK_HOVER_POLL_INTERVAL_SEC: Float32 = 0.06
+comptime PICK_HOVER_DWELL_SEC: Float32 = 0.12
+comptime PICK_SELECT_PULSE_SEC: Float32 = 0.18
+
+
+struct ViewportPickFeedback(Copyable, Movable):
+    """Non-intrusive viewport hover-pick preview & 180ms click selection confirmation pulse.
+
+    Strictly deterministic: when `instant_mode=True` (`UI_ANIM_INSTANT`), transient pulses
+    suppress themselves so golden screenshots stay pixel-exact.
+    """
+    var hovered_entity_id: Int
+    var hovered_entity_name: String
+    var hovered_screen_x: Float32
+    var hovered_screen_y: Float32
+    var hovered_world_pos: Vec3
+    var _last_cursor_x: Float32
+    var _last_cursor_y: Float32
+    var hover_dwell_sec: Float32
+    var hover_poll_cooldown_sec: Float32
+    var pulse_active: Bool
+    var pulse_entity_id: Int
+    var pulse_x: Float32
+    var pulse_y: Float32
+    var pulse_age_sec: Float32
+    var pulse_duration_sec: Float32
+
+    def __init__(out self):
+        self.hovered_entity_id = -1
+        self.hovered_entity_name = ""
+        self.hovered_screen_x = Float32(-10000.0)
+        self.hovered_screen_y = Float32(-10000.0)
+        self.hovered_world_pos = Vec3()
+        self._last_cursor_x = Float32(-10000.0)
+        self._last_cursor_y = Float32(-10000.0)
+        self.hover_dwell_sec = Float32(0.0)
+        self.hover_poll_cooldown_sec = Float32(0.0)
+        self.pulse_active = False
+        self.pulse_entity_id = -1
+        self.pulse_x = Float32(0.0)
+        self.pulse_y = Float32(0.0)
+        self.pulse_age_sec = Float32(0.0)
+        self.pulse_duration_sec = PICK_SELECT_PULSE_SEC
+
+    def __init__(out self, *, copy: Self):
+        self.hovered_entity_id = copy.hovered_entity_id
+        self.hovered_entity_name = copy.hovered_entity_name
+        self.hovered_screen_x = copy.hovered_screen_x
+        self.hovered_screen_y = copy.hovered_screen_y
+        self.hovered_world_pos = copy.hovered_world_pos
+        self._last_cursor_x = copy._last_cursor_x
+        self._last_cursor_y = copy._last_cursor_y
+        self.hover_dwell_sec = copy.hover_dwell_sec
+        self.hover_poll_cooldown_sec = copy.hover_poll_cooldown_sec
+        self.pulse_active = copy.pulse_active
+        self.pulse_entity_id = copy.pulse_entity_id
+        self.pulse_x = copy.pulse_x
+        self.pulse_y = copy.pulse_y
+        self.pulse_age_sec = copy.pulse_age_sec
+        self.pulse_duration_sec = copy.pulse_duration_sec
+
+    def clear_hover(mut self):
+        self.hovered_entity_id = -1
+        self.hovered_entity_name = ""
+        self.hover_dwell_sec = Float32(0.0)
+
+    def should_request_hover_pick(
+        mut self,
+        pointer_in_viewport: Bool,
+        cursor_x: Float32,
+        cursor_y: Float32,
+        dt: Float32,
+        dragging: Bool = False,
+    ) -> Bool:
+        """Returns `True` at most ~16 Hz when cursor settles inside the 3D viewport."""
+        var safe_dt = dt if (_is_finite_f32(dt) and dt > Float32(0.0)) else Float32(0.0)
+        if self.hover_poll_cooldown_sec > Float32(0.0):
+            self.hover_poll_cooldown_sec = max(Float32(0.0), self.hover_poll_cooldown_sec - safe_dt)
+        if (not pointer_in_viewport) or dragging or (not _is_finite_f32(cursor_x)) or (not _is_finite_f32(cursor_y)):
+            self.clear_hover()
+            return False
+        var dx = cursor_x - self._last_cursor_x
+        var dy = cursor_y - self._last_cursor_y
+        var moved_sq = dx * dx + dy * dy
+        self._last_cursor_x = cursor_x
+        self._last_cursor_y = cursor_y
+        if moved_sq > Float32(4.0):
+            self.hover_dwell_sec = Float32(0.0)
+        else:
+            self.hover_dwell_sec += safe_dt
+        if self.hover_poll_cooldown_sec <= Float32(0.0):
+            self.hover_poll_cooldown_sec = PICK_HOVER_POLL_INTERVAL_SEC
+            return True
+        return False
+
+    def record_hover_result(
+        mut self,
+        res: ViewportPickResult,
+        entity_name: String,
+        screen_x: Float32,
+        screen_y: Float32,
+    ):
+        """Updates cached hover preview target from a harvested `ViewportPickResult`."""
+        if (not res.hit) or res.entity_id < 0:
+            self.hovered_entity_id = -1
+            self.hovered_entity_name = ""
+            return
+        self.hovered_entity_id = res.entity_id
+        self.hovered_entity_name = entity_name
+        self.hovered_screen_x = screen_x if _is_finite_f32(screen_x) else Float32(0.0)
+        self.hovered_screen_y = screen_y if _is_finite_f32(screen_y) else Float32(0.0)
+        self.hovered_world_pos = res.world_pos
+
+    def show_hover_preview(self) -> Bool:
+        """Returns `True` when a hovered entity preview chip should be shown."""
+        return (
+            self.hovered_entity_id >= 0
+            and self.hovered_entity_name.byte_length() > 0
+            and self.hover_dwell_sec >= PICK_HOVER_DWELL_SEC
+        )
+
+    def trigger_select_pulse(
+        mut self,
+        entity_id: Int,
+        screen_x: Float32,
+        screen_y: Float32,
+        instant_mode: Bool = False,
+        duration_sec: Float32 = PICK_SELECT_PULSE_SEC,
+    ):
+        """Starts a subtle 180ms expanding confirmation ring at `(screen_x, screen_y)`."""
+        if instant_mode or entity_id < 0 or (not _is_finite_f32(screen_x)) or (not _is_finite_f32(screen_y)):
+            self.pulse_active = False
+            return
+        self.pulse_active = True
+        self.pulse_entity_id = entity_id
+        self.pulse_x = screen_x
+        self.pulse_y = screen_y
+        self.pulse_age_sec = Float32(0.0)
+        self.pulse_duration_sec = max(Float32(0.05), duration_sec if _is_finite_f32(duration_sec) else PICK_SELECT_PULSE_SEC)
+
+    def tick(mut self, dt: Float32, instant_mode: Bool = False):
+        """Advances active click selection pulse (`instant_mode=True` clears immediately)."""
+        if instant_mode:
+            self.pulse_active = False
+            self.pulse_age_sec = Float32(0.0)
+            return
+        if not self.pulse_active:
+            return
+        if (not _is_finite_f32(dt)) or dt <= Float32(0.0):
+            return
+        self.pulse_age_sec += min(Float32(0.25), dt)
+        if self.pulse_age_sec >= self.pulse_duration_sec:
+            self.pulse_active = False
+            self.pulse_age_sec = self.pulse_duration_sec
+
+    def pulse_ring_metrics(self) -> Tuple[Bool, Float32, Float32, Float32]:
+        """Returns `(active, radius_px, alpha, stroke_px)` for GPU SDF ring emission."""
+        if not self.pulse_active:
+            return (False, Float32(0.0), Float32(0.0), Float32(0.0))
+        var t = max(Float32(0.0), min(Float32(1.0), self.pulse_age_sec / max(Float32(0.05), self.pulse_duration_sec)))
+        # Fast-out ease: 1 - (1 - t)^3
+        var inv = Float32(1.0) - t
+        var ease = Float32(1.0) - inv * inv * inv
+        var radius_px = Float32(8.0) + ease * Float32(20.0)
+        var alpha = (Float32(1.0) - ease) * Float32(0.85)
+        var stroke_px = Float32(2.2) - ease * Float32(1.0)
+        return (True, radius_px, alpha, stroke_px)

@@ -266,6 +266,7 @@ def _run_studio() raises -> Int:
     var project_arg = String("")
     var has_project_flag = False
     var workspace_opt = -1
+    var panel_opt = String("")
     var theme_opt = -1
     var anim_mode_opt = -1
     var ui_scale_opt = Float32(-1.0)
@@ -336,6 +337,14 @@ def _run_studio() raises -> Int:
             if workspace_opt < 0:
                 print("[Flint Studio] ERROR: unknown --workspace value: " + wraw)
                 return 1
+        elif a == "--panel":
+            if ai + 1 >= len(args):
+                print("[Flint Studio] ERROR: --panel requires a dock panel name (e.g. mocap, inspector, agents).")
+                return 1
+            ai += 1
+            panel_opt = String(args[ai])
+        elif a.startswith("--panel="):
+            panel_opt = String(a[byte=8:])
         elif a == "--theme":
             if ai + 1 >= len(args):
                 print("[Flint Studio] ERROR: --theme requires one of: obsidian, midnight, okabe, paper.")
@@ -434,11 +443,11 @@ def _run_studio() raises -> Int:
         worker_threads=max(1, default_worker_count()),
         project_root=proj_arg,
     )
-    if not is_headless:
+    if ui_scale_opt > Float32(0.0):
+        studio.set_ui_scale(ui_scale_opt)
+    elif not is_headless:
         var env_sc = env_value("FLINT_UI_SCALE")
-        if ui_scale_opt > Float32(0.0):
-            studio.set_ui_scale(ui_scale_opt)
-        elif env_sc.byte_length() > 0:
+        if env_sc.byte_length() > 0:
             try:
                 studio.set_ui_scale(Float32(Float64(env_sc)))
             except:
@@ -459,6 +468,11 @@ def _run_studio() raises -> Int:
         studio.set_anim_mode(anim_mode_opt)
     if workspace_opt >= 0:
         _ = studio.apply_workspace_preset(workspace_opt, Float32(out_w), Float32(out_h))
+    if panel_opt.byte_length() > 0:
+        if not studio.open_dock_panel(panel_opt):
+            print("[Flint Studio] ERROR: unknown --panel value: " + panel_opt)
+            studio.shutdown()
+            return 1
 
     var assets_ptr = studio.app.resources.get_ptr_mut[AssetServer]()
     if not assets_ptr:
@@ -550,6 +564,11 @@ def _run_studio() raises -> Int:
         if workspace_opt < 0:
             studio.workspace_mgr.reset_preset(WORKSPACE_EDIT)
             _ = studio.apply_workspace_preset(WORKSPACE_EDIT, Float32(out_w), Float32(out_h))
+        if panel_opt.byte_length() > 0:
+            if not studio.open_dock_panel(panel_opt):
+                print("[Flint Studio] ERROR: unknown --panel value: " + panel_opt)
+                studio.shutdown()
+                return 1
         studio.set_anim_mode(UI_ANIM_INSTANT)
         studio.ui_time_sec = Float32(0.0)
         var res = _render_deterministic_png(studio, assets, out_w, out_h, target_png, Float32(0.0))
@@ -569,6 +588,8 @@ def _run_studio() raises -> Int:
             + ", Entities=" + String(studio.live_entity_count())
             + ", CulledDraws=" + String(res[2]) + ")"
         )
+        if panel_opt.byte_length() > 0:
+            _ = studio.open_dock_panel("inspector")
         studio.shutdown()
         return 0
 

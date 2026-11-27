@@ -166,7 +166,7 @@ struct EmbeddedIde(Movable):
             self.chunk = List[UInt8](length=8192, fill=0)
             self.status = String()
             if not env_value("FLINT_STUDIO_IDE_LAUNCHER"):
-                self.status = "Start Studio with tools/flint.sh studio"
+                self.status = "Launch with tools/flint.sh studio to attach PTY"
             elif not self.pty.start(cols, rows):
                 self.status = "Could not open the editor terminal"
         elif cols != self.grid.cols or rows != self.grid.rows:

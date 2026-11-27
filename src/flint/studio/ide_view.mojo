@@ -48,6 +48,12 @@ def ui_color(rgb: UInt32) -> UInt32:
     return 0xFF000000 | ((rgb & 255) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 255)
 
 
+def _measure_ide(font: SdfFont, text: String, px: Float32) -> Float32:
+    if font.valid:
+        return font.measure(text, px)
+    return Float32(text.byte_length()) * px * Float32(0.56)
+
+
 def draw_workspace(
     mut ui: UiDrawList,
     grid: IdeGrid,
@@ -65,46 +71,81 @@ def draw_workspace(
     if width <= 0 or height <= 0:
         return
     var slot = 0
+    # Flint Obsidian neutral graphite palette
+    comptime OBS_L0: UInt32 = 0x0D1014
+    comptime OBS_L1: UInt32 = 0x161A20
+    comptime OBS_L2: UInt32 = 0x1E232B
+    comptime OBS_L3: UInt32 = 0x282F3A
+    comptime OBS_HOVER: UInt32 = 0x333C4A
+    comptime OBS_BORDER: UInt32 = 0x2C3440
+    comptime OBS_EMBER: UInt32 = 0xF59B4C
+    comptime OBS_PLAY: UInt32 = 0x2DD4BF
+    comptime OBS_PLAY_HOV: UInt32 = 0x45E0CC
+    comptime OBS_INK_DARK: UInt32 = 0x0B0E14
+    comptime OBS_TXT_PRI: UInt32 = 0xEEF2F7
+    comptime OBS_TXT_SEC: UInt32 = 0xA9B4C4
+    comptime OBS_TXT_MUT: UInt32 = 0x8491A3
+
     ui.add_rect(0, 0, Float32(width), Float32(height), ui_color(DEFAULT_BG))
-    ui.add_rect(0, 0, Float32(width), HEADER, ui_color(0x17212C))
+    ui.add_rect(0, 0, Float32(width), Float32(HEADER), ui_color(OBS_L1))
+    ui.add_rect(0, Float32(HEADER - 1), Float32(width), Float32(1), ui_color(OBS_BORDER))
     var origin = toolbar_start(scene)
-    if scene:
-        ui.add_rect(0, 0, 166, HEADER, ui_color(UInt32(0x324452 if hover == BACK else 0x253541)))
-        ui.add_text(slot, font, "< Scene   Ctrl+F8", 10, 24, 14, ui_color(0xD1DFEA))
-    var brand = Float32(origin - 124)
-    ui.add_rect(brand, 12, 3, 16, ui_color(0xF79D5E))
-    ui.add_text(slot, font, "TurboMojo", brand + 11, 25, 17, ui_color(0xF5F5F2))
+    if scene and width >= 166:
+        ui.add_rect(0, 0, 166, Float32(HEADER - 1), ui_color(OBS_HOVER if hover == BACK else OBS_L2))
+        ui.add_rect(165, 0, 1, Float32(HEADER - 1), ui_color(OBS_BORDER))
+        var back_lbl = "< Scene   Ctrl+F8"
+        var back_w = _measure_ide(font, back_lbl, Float32(13.0))
+        var back_x = max(Float32(8.0), (Float32(166.0) - back_w) * Float32(0.5))
+        ui.add_text(slot, font, back_lbl, back_x, 24, 13, ui_color(OBS_TXT_PRI))
+    var brand = max(Float32(8.0), Float32(origin - 124))
+    ui.add_rect(brand, 12, 3, 16, ui_color(OBS_EMBER))
+    ui.add_text(slot, font, "TurboMojo", brand + 11, 25, 16, ui_color(OBS_TXT_PRI))
     for i in range(4):
         var x = origin + i * 68
         if x + 64 > width:
             break
-        var bg = 0xAADDC6 if i == 3 else (0x3F5566 if hover == i else 0x293845)
-        ui.add_rect(Float32(x), 6, 64, 28, ui_color(UInt32(bg)))
-        ui.add_text(
-            slot,
-            font,
-            toolbar_label(i),
-            Float32(x + 10),
-            25,
-            15,
-            ui_color(UInt32(0x162721 if i == 3 else 0xE4ECF2)),
-        )
+        var bg: UInt32
+        var fg: UInt32
+        if i == 3:
+            bg = OBS_PLAY_HOV if hover == i else OBS_PLAY
+            fg = OBS_INK_DARK
+        else:
+            bg = OBS_HOVER if hover == i else OBS_L3
+            fg = OBS_TXT_PRI
+        ui.add_rect(Float32(x), 6, 64, 28, ui_color(OBS_BORDER))
+        ui.add_rect(Float32(x + 1), 7, 62, 26, ui_color(bg))
+        var lbl = toolbar_label(i)
+        var lw = _measure_ide(font, lbl, Float32(14.0))
+        var lx = Float32(x) + max(Float32(4.0), (Float32(64.0) - lw) * Float32(0.5))
+        ui.add_text(slot, font, lbl, lx, 25, 14, ui_color(fg))
     if not scene:
         if moves and width >= TAB_START + 72:
-            ui.add_rect(TAB_START, 6, 72, 28, ui_color(UInt32(0x3F5566 if hover == MOVES else 0x293845)))
-            ui.add_text(slot, font, "Moves", TAB_START + 12, 25, 15, ui_color(0xE4ECF2))
+            ui.add_rect(TAB_START, 6, 72, 28, ui_color(OBS_BORDER))
+            ui.add_rect(TAB_START + 1, 7, 70, 26, ui_color(OBS_HOVER if hover == MOVES else OBS_L3))
+            var mw = _measure_ide(font, "Moves", Float32(14.0))
+            var mx_t = Float32(TAB_START) + max(Float32(4.0), (Float32(72.0) - mw) * Float32(0.5))
+            ui.add_text(slot, font, "Moves", mx_t, 25, 14, ui_color(OBS_TXT_PRI))
         for i in range(len(tabs)):
             var x = tab_origin(moves) + TAB_WIDTH * i
             if x + TAB_WIDTH > width:
                 break
             if i == active:
-                ui.add_rect(Float32(x), 3, TAB_WIDTH - 2, HEADER - 3, ui_color(0x263641))
-                ui.add_rect(Float32(x), HEADER - 2, TAB_WIDTH - 2, 2, ui_color(0xF79D5E))
+                ui.add_rect(Float32(x), 4, TAB_WIDTH - 2, HEADER - 5, ui_color(OBS_L2))
+                ui.add_rect(Float32(x), Float32(HEADER - 2), TAB_WIDTH - 2, 2, ui_color(OBS_EMBER))
             ui.push_clip(x + 8, 0, x + TAB_WIDTH - 8, HEADER)
-            ui.add_text(slot, font, tabs[i], Float32(x + 9), 25, 14, ui_color(0xD1DFEA))
+            ui.add_text(
+                slot,
+                font,
+                tabs[i],
+                Float32(x + 10),
+                25,
+                13,
+                ui_color(OBS_TXT_PRI if i == active else OBS_TXT_SEC),
+            )
             ui.pop_clip()
     if status and width > origin + 280:
-        ui.add_text(slot, font, status, Float32(origin + 280), 24, 13, ui_color(0xBECBD5))
+        ui.add_text(slot, font, status, Float32(origin + 280), 24, 12, ui_color(OBS_TXT_MUT))
+    var has_content = False
     for y in range(grid.rows):
         var x = 0
         var top = Float32(HEADER + y * CH)
@@ -115,11 +156,13 @@ def draw_workspace(
             while x < grid.cols and grid.cells[y * grid.cols + x].bg == bg:
                 x += 1
             if bg != DEFAULT_BG:
+                has_content = True
                 ui.add_rect(Float32(start * CW), top, Float32((x - start) * CW), CH, ui_color(bg))
         for col in range(grid.cols):
             var cell = grid.cells[y * grid.cols + col]
             var i = y * grid.cols + col
             if cell.code > 32 or (i < len(marks) and marks[i]):
+                has_content = True
                 var cluster = String(chr(cell.code))
                 if i < len(marks):
                     cluster += marks[i]
@@ -134,7 +177,17 @@ def draw_workspace(
                 )
             if cell.underline:
                 ui.add_rect(Float32(col * CW), top + 16, CW, 1, ui_color(cell.fg))
-    if grid.cursor and grid.cols > 0 and grid.rows > 0:
+    if (not has_content) and status.byte_length() > 0 and width >= 340 and height >= HEADER + 110:
+        var card_w = min(Float32(460.0), Float32(width - 48))
+        var card_h = Float32(82.0)
+        var card_x = max(Float32(0.0), (Float32(width) - card_w) * Float32(0.5))
+        var card_y = max(Float32(HEADER + 12), Float32(HEADER) + (Float32(height - HEADER) - card_h) * Float32(0.5))
+        ui.add_rect(card_x, card_y, card_w, card_h, ui_color(OBS_BORDER))
+        ui.add_rect(card_x + 1, card_y + 1, card_w - 2, card_h - 2, ui_color(OBS_L2))
+        ui.add_rect(card_x + 1, card_y + 1, 3, card_h - 2, ui_color(OBS_EMBER))
+        ui.add_text(slot, font, "TurboMojo Terminal IDE", card_x + 18, card_y + 32, 15, ui_color(OBS_TXT_PRI))
+        ui.add_text(slot, font, status, card_x + 18, card_y + 56, 13, ui_color(OBS_TXT_SEC))
+    elif grid.cursor and grid.cols > 0 and grid.rows > 0:
         var cx = min(grid.cols - 1, max(0, grid.x))
         var cy = min(grid.rows - 1, max(0, grid.y))
         ui.add_rect(
@@ -142,7 +195,7 @@ def draw_workspace(
             Float32(HEADER + cy * CH + 16),
             CW,
             2,
-            0xFFFFFFFF,
+            ui_color(OBS_EMBER),
         )
 
 

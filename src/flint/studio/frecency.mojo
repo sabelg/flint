@@ -133,6 +133,25 @@ struct FrecencyStore(Copyable, Movable):
             return 0
         return (top_k - idx) * max(1, step)
 
+    def access_count(self, key: String) -> Int:
+        """Returns recorded invocation count for `key` (`0` if unseen)."""
+        var idx = self.find(key)
+        if idx < 0:
+            return 0
+        return self.entries[idx].count
+
+    def last_used_age_sec(self, key: String, now_sec: Int) -> Int:
+        """Returns seconds elapsed since `key` was last accessed, or `-1` if unseen."""
+        var idx = self.find(key)
+        if idx < 0:
+            return -1
+        return max(0, now_sec - self.entries[idx].last_epoch_sec)
+
+    def has_recent(self, key: String, now_sec: Int, window_sec: Int = FRECENCY_7D_SEC) -> Bool:
+        """Returns `True` when `key` was accessed within `window_sec` (e.g. for `ICON_CLOCK` badge)."""
+        var age = self.last_used_age_sec(key, now_sec)
+        return age >= 0 and age <= max(0, window_sec)
+
     def encode(self) -> String:
         """Serializes entries as `"count last_epoch_sec key\\n"` lines."""
         var out = String("")
