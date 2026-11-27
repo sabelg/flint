@@ -47,6 +47,7 @@ from flint.studio.studio_app import (
     studio_wheel_dolly_factor,
 )
 from flint.studio.viewport_transform import ViewportTransform, hud_view_matrix
+from flint.ui.animator import UI_ANIM_INSTANT
 from flint.ui.draw_list import UiDrawList
 from flint.ui.flexbox_dock import RectF
 
@@ -351,6 +352,49 @@ def test_marquee_skips_hidden_and_locked_click_keeps_selection() raises:
     assert_equal(studio.selected_count(), 0, "a plain miss clears the selection")
 
 
+def test_agent_focus_tween_centres_target_in_panel() raises:
+    """Frame Selection leaves a `shoulder_offset` solved for its own arm length and panel layout. The
+    agent-focus tween must not keep that stale offset: after a dolly and a dock change, the focus
+    target still eases onto the current panel centre (and onto the optical axis when the panel is
+    centred in the window, i.e. the offset is neutral)."""
+    var studio = FlintStudioState()
+    studio.set_anim_mode(UI_ANIM_INSTANT)
+    studio.viewport_xf = ViewportTransform.from_logical(RectF(500.0, 40.0, 780.0, 640.0), 1280.0, 720.0, 1.0)
+    var eid = studio.spawn_entity("Framed")
+    studio._sync_ecs_and_physics()
+    _ = studio.set_entity_transform(eid, Vec3(3.0, 0.5, 2.0), Quat.identity(), Vec3(1.0, 1.0, 1.0))
+    studio.select_entity(eid)
+    studio.frame_selection()
+    var stale = studio.camera_rig.shoulder_offset
+    assert_true(stale.length() > Float32(0.05), "Frame Selection on an off-centre panel leaves a shoulder offset")
+
+    # Dolly out (arm x3) and re-dock the panel to the left: the stale offset no longer centres anything.
+    var arm = studio.camera_rig.spring_arm.target_length * Float32(3.0)
+    studio.camera_rig.spring_arm.target_length = arm
+    studio.camera_rig.spring_arm.current_length.value = arm
+    studio.viewport_xf = ViewportTransform.from_logical(RectF(0.0, 60.0, 700.0, 600.0), 1280.0, 720.0, 1.0)
+
+    var focus = Vec3(-2.0, 1.0, 4.0)
+    studio.agent_bus._update_follow_focus(-1, focus, Vec3(0.5, 0.5, 0.5))
+    assert_true(studio.agent_bus.should_follow_camera(), "follow camera is armed")
+    for _ in range(240):
+        studio.update_follow_agent_camera(Float32(0.05))
+    var vx = studio.viewport_xf
+    var pcx = vx.panel.x + vx.panel.w * Float32(0.5)
+    var pcy = vx.panel.y + vx.panel.h * Float32(0.5)
+    var s = project_world_to_viewport(focus, 0.0, 0.0, vx.proj_w(), vx.proj_h(), studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
+    print("    focus target lands at (", s[0], ",", s[1], ") panel centre (", pcx, ",", pcy, ")")
+    assert_true(s[3] and _near(s[0], pcx, 1.0) and _near(s[1], pcy, 1.0), "focus target eases onto the panel centre")
+
+    # A panel centred in the window: the tween's offset is neutral and the target is on the optical axis.
+    studio.viewport_xf = ViewportTransform.from_logical(RectF(140.0, 60.0, 1000.0, 600.0), 1280.0, 720.0, 1.0)
+    for _ in range(240):
+        studio.update_follow_agent_camera(Float32(0.05))
+    assert_true(studio.camera_rig.shoulder_offset.length() < Float32(1.0e-4), "centred panel: no shoulder offset")
+    var s2 = project_world_to_viewport(focus, 0.0, 0.0, 1280.0, 720.0, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
+    assert_true(s2[3] and _near(s2[0], 640.0, 1.0) and _near(s2[1], 360.0, 1.0), "centred panel: target at the window centre")
+
+
 def main() raises:
     test_center_ray_is_forward()
     print("[PASS] test_center_ray_is_forward")
@@ -376,4 +420,6 @@ def main() raises:
     print("[PASS] test_frame_selection_orbits_selection_centre")
     test_marquee_skips_hidden_and_locked_click_keeps_selection()
     print("[PASS] test_marquee_skips_hidden_and_locked_click_keeps_selection")
+    test_agent_focus_tween_centres_target_in_panel()
+    print("[PASS] test_agent_focus_tween_centres_target_in_panel")
     print("[PASS] test_studio_viewport: viewport, gizmo, picking and camera agree with the renderer")

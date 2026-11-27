@@ -33,6 +33,7 @@ from flint.render.aaa_renderer import (
     AaaSkinnedMeshEntry,
     AaaUploadedModel,
     FlintAaaVulkanRenderer,
+    aaa_camera_basis,
     srgb_u8_to_linear,
 )
 from flint.render.aaa_skinning_rt import DualQuat
@@ -114,6 +115,17 @@ def make_rh_look_at(
     m.set(3, 1, Float32(0.0))
     m.set(3, 2, Float32(0.0))
     m.set(3, 3, Float32(1.0))
+    return m^
+
+
+def _renderer_basis_view(eye: Vec3, fwd: Vec3, right: Vec3, up: Vec3) -> Mat4:
+    """`-Z`-forward view matrix whose `+X` / `+Y` are the renderer's `right` / `up` (rows: right, up, -fwd)."""
+    var back = -fwd
+    var m = Mat4()
+    m.set(0, 0, right.x); m.set(0, 1, right.y); m.set(0, 2, right.z); m.set(0, 3, -right.dot(eye))
+    m.set(1, 0, up.x); m.set(1, 1, up.y); m.set(1, 2, up.z); m.set(1, 3, -up.dot(eye))
+    m.set(2, 0, back.x); m.set(2, 1, back.y); m.set(2, 2, back.z); m.set(2, 3, -back.dot(eye))
+    m.set(3, 0, Float32(0.0)); m.set(3, 1, Float32(0.0)); m.set(3, 2, Float32(0.0)); m.set(3, 3, Float32(1.0))
     return m^
 
 
@@ -461,9 +473,14 @@ struct DebugLineBatch(Copyable, Movable):
         up_hint: Vec3 = Vec3(0.0, 1.0, 0.0),
         depth_cue: Bool = True,
     ) -> Int:
-        """Transforms 3D segments into RH `-Z` camera space, analytically clips segments straddling `z_cam > -near_z`
-        so lines extending behind the camera never invert or explode, applies depth/X-ray styling, and appends
-        antialiased GPU SDF `PRIM_LINE` capsules to `ui`."""
+        """Transforms 3D segments into `-Z`-forward camera space, analytically clips segments straddling
+        `z_cam > -near_z` so lines extending behind the camera never invert or explode, applies depth/X-ray
+        styling, and appends antialiased GPU SDF `PRIM_LINE` capsules to `ui`.
+
+        The camera basis is the AAA renderer's own (`aaa_camera_basis`: `right = Y x fwd`, as in
+        `FlintAaaVulkanRenderer.begin_frame` and `CameraRig`), so lines land on the rendered pixels.
+        `make_rh_look_at` (`right = fwd x up`) would mirror them horizontally. `begin_frame` applies no
+        roll, so `up_hint` is accepted for API compatibility but does not roll the basis either."""
         var n_segs = self.segment_count()
         if n_segs <= 0 or screen_w <= 0 or screen_h <= 0:
             return 0
@@ -475,7 +492,11 @@ struct DebugLineBatch(Copyable, Movable):
         ):
             return 0
 
-        var view = make_rh_look_at(eye, target, up_hint)
+        _ = up_hint
+        var raw_fwd = target - eye
+        var fwd = raw_fwd.normalized() if raw_fwd.length_squared() > Float32(1e-10) else Vec3(0.0, 0.0, -1.0)
+        var basis = aaa_camera_basis(fwd)
+        var view = _renderer_basis_view(eye, fwd, basis[0], basis[1])
         for m_i in range(16):
             if not isfinite(view.values[m_i]):
                 return 0
@@ -500,7 +521,7 @@ struct DebugLineBatch(Copyable, Movable):
             ):
                 continue
 
-            # Transform endpoints to RH `-Z` camera space (`depth = -z_cam > 0` in front of eye)
+            # Transform endpoints to `-Z`-forward camera space (`depth = -z_cam > 0` in front of eye)
             var ax = view.at(0, 0) * v0.pos.x + view.at(0, 1) * v0.pos.y + view.at(0, 2) * v0.pos.z + view.at(0, 3)
             var ay = view.at(1, 0) * v0.pos.x + view.at(1, 1) * v0.pos.y + view.at(1, 2) * v0.pos.z + view.at(1, 3)
             var az = view.at(2, 0) * v0.pos.x + view.at(2, 1) * v0.pos.y + view.at(2, 2) * v0.pos.z + view.at(2, 3)
