@@ -28,6 +28,30 @@ def _run_dir(tag: String) -> String:
     return d
 
 
+def _unescape(s: String) -> String:
+    """Tool results arrive JSON-encoded inside the JSON-RPC envelope; drop the `\\` escapes."""
+    var out = String("")
+    var b = s.as_bytes()
+    var i = 0
+    while i < len(b):
+        if b[i] == 92 and i + 1 < len(b):  # backslash
+            i += 1
+        out += String(s[byte=i : i + 1])
+        i += 1
+    return out
+
+
+def _assert_parse_error_reported(final: String, file_name: String) raises:
+    """A failed build must be a compiler verdict on our file, not a missing compiler: the result
+    lists an error diagnostic at `<file>:1` and the compiler output names `<file>:1:`."""
+    var flat = _unescape(final)
+    assert_true(flat.find('"compiled":false') >= 0, "a broken entry reports a failed build: " + final)
+    assert_true(flat.find('"severity":"error"') >= 0, "the parse error is an error diagnostic: " + final)
+    assert_true(flat.find(file_name + '","line":1,') >= 0, "the diagnostic points at " + file_name + " line 1: " + final)
+    assert_true(flat.find(file_name + ":1:") >= 0, "the compiler output names " + file_name + ":1: " + final)
+    assert_true(flat.find('"error_count":0') < 0, "error_count must be non-zero: " + final)
+
+
 def _init(mut mcp: McpServerV2, mut studio: FlintStudioState, mut assets: AssetServer, mut pool: JobPool, name: String):
     _ = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"'
@@ -140,8 +164,15 @@ def test_async_build_does_not_block() raises:
         '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code.build_hot_reload","arguments":{"entry_path":"build/phase5_bad_gameplay.mojo","output_so":"build/phase5_bad.so","async":true}}}',
         studio, assets, pool,
     )
-    assert_true(get_time() - t0 < 2.0, "an async build returns at once")
-    assert_true(r.find('\\"pending\\":true') >= 0 or r.find('"pending":true') >= 0, "async build reports pending: " + r)
+    # Structural check, not a stopwatch: the call returned while the compiler was still running,
+    # so the very next status poll still reports the build as pending.
+    assert_true(_unescape(r).find('"pending":true') >= 0, "async build reports pending: " + r)
+    var first_poll = mcp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"code.build_status","arguments":{"build_id":1}}}',
+        studio, assets, pool,
+    )
+    assert_true(_unescape(first_poll).find('"pending":true') >= 0, "the build is still running after the call returned: " + first_poll)
+    assert_true(get_time() - t0 < 30.0, "an async build never waits for the compiler")
     var final = String("")
     var waited = 0
     while waited < 600:
@@ -155,7 +186,7 @@ def test_async_build_does_not_block() raises:
         _ = external_call["usleep", Int32](UInt32(200000))
         waited += 1
     assert_true(final.byte_length() > 0, "the async build finishes")
-    assert_true(final.find('"compiled":false') >= 0, "a broken entry reports a failed build: " + final)
+    _assert_parse_error_reported(final, "phase5_bad_gameplay.mojo")
     var unknown = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"code.build_status","arguments":{"build_id":999}}}',
         studio, assets, pool,

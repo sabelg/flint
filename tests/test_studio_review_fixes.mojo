@@ -60,6 +60,30 @@ def _call(
     )
 
 
+def _unescape(s: String) -> String:
+    """Tool results arrive JSON-encoded inside the JSON-RPC envelope; drop the `\\` escapes."""
+    var out = String("")
+    var b = s.as_bytes()
+    var i = 0
+    while i < len(b):
+        if b[i] == 92 and i + 1 < len(b):  # backslash
+            i += 1
+        out += String(s[byte=i : i + 1])
+        i += 1
+    return out
+
+
+def _assert_parse_error_reported(final: String, file_name: String) raises:
+    """A failed build must be a compiler verdict on our file, not a missing compiler: the result
+    lists an error diagnostic at `<file>:1` and the compiler output names `<file>:1:`."""
+    var flat = _unescape(final)
+    assert_true(flat.find('"compiled":false') >= 0, "a broken entry reports a failed build: " + final)
+    assert_true(flat.find('"severity":"error"') >= 0, "the parse error is an error diagnostic: " + final)
+    assert_true(flat.find(file_name + '","line":1,') >= 0, "the diagnostic points at " + file_name + " line 1: " + final)
+    assert_true(flat.find(file_name + ":1:") >= 0, "the compiler output names " + file_name + ":1: " + final)
+    assert_true(flat.find('"error_count":0') < 0, "error_count must be non-zero: " + final)
+
+
 def test_grants_are_bound_to_args_and_expire() raises:
     var studio = FlintStudioState()
     var assets = AssetServer(enable_watcher=False)
@@ -160,8 +184,8 @@ def test_build_paths_ownership_and_async() raises:
         mcp, studio, assets, pool, "code.build_hot_reload",
         '{"entry_path":"' + d + '/bad.mojo","output_so":"' + d + '/bad.so","async":false}',
     )
-    assert_true(get_time() - t0 < 2.0, "a socket client's build never blocks, even with async:false")
-    assert_true(r.find('pending\\":true') >= 0 or r.find('"pending":true') >= 0, "socket builds are async: " + r)
+    assert_true(_unescape(r).find('"pending":true') >= 0, "socket builds are async: " + r)
+    assert_true(get_time() - t0 < 30.0, "a socket client's build never waits for the compiler, even with async:false")
     var bid_at = r.find("build_id")
     assert_true(bid_at >= 0)
     var digits = String("")
@@ -173,6 +197,9 @@ def test_build_paths_ownership_and_async() raises:
         digits += String(r[byte=i : i + 1])
         i += 1
     var status_args = '{"build_id":' + digits + "}"
+    # Structural: the call returned before the compiler finished, so the first poll is pending.
+    var first_poll = _call(mcp, studio, assets, pool, "code.build_status", status_args)
+    assert_true(_unescape(first_poll).find('"pending":true') >= 0, "the build is still running after the call returned: " + first_poll)
 
     mcp.select_client(2)
     _init(mcp, studio, assets, pool, "builder-b")
@@ -190,6 +217,7 @@ def test_build_paths_ownership_and_async() raises:
         _ = external_call["usleep", Int32](UInt32(200000))
         waited += 1
     assert_true(final.find("compiled") >= 0 and final.find("unknown build_id") < 0, "the owner finishes it: " + final)
+    _assert_parse_error_reported(final, "bad.mojo")
     mcp.select_client(0)
 
 
