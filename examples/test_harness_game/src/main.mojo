@@ -326,8 +326,11 @@ def _create_configured_app(
         ref st = st_opt.value()[unsafe_offset=0]
         resolve_harness_entities(app.world, st)
         resolve_harness_assets(app.world, app.resources, st)
-        if cfg.gameplay_output.byte_length() > 0 and file_size(cfg.gameplay_output) > 0:
-            _ = st.hot_reload_host.load_or_reload(cfg.gameplay_output, app.world, app.resources)
+        var plugin_path = env_value("FLINT_GAMEPLAY_PLUGIN")
+        if plugin_path.byte_length() == 0:
+            plugin_path = cfg.gameplay_output
+        if plugin_path.byte_length() > 0 and file_size(plugin_path) > 0:
+            _ = st.hot_reload_host.load_or_reload(plugin_path, app.world, app.resources)
 
     return (True, app^, String(""))
 

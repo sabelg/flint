@@ -376,6 +376,8 @@ test_t4_s5_scaffold_new_package_relocated_clean_run() {
         return
     fi
 
+    # Prove that the relocated player executes the shipped gameplay module.
+    sed -i '/^    return Int32(1)$/i\    print("PACKAGED_GAMEPLAY_STEP")' "$proj/src/gameplay.mojo"
     local stage="${TMPD}/s5_stage"
     local pkg_out pkg_rc=0
     pkg_out="$(cd "$proj" && bash "${ROOT}/tools/flint.sh" package --out "$stage" 2>&1)" || pkg_rc=$?
@@ -400,7 +402,7 @@ test_t4_s5_scaffold_new_package_relocated_clean_run() {
 
     local smoke_out smoke_rc=0
     smoke_out="$(FLINT_STATE_DIR="${TMPD}/s5_state" XDG_STATE_HOME="${TMPD}/s5_xdg" run_in_clean_env "$reloc" ./run.sh --headless-smoke 2>&1)" || smoke_rc=$?
-    if [[ "$smoke_rc" -ne 0 ]]; then
+    if [[ "$smoke_rc" -ne 0 || "$(grep -c PACKAGED_GAMEPLAY_STEP <<< "$smoke_out")" != 4 ]]; then
         fail_test "t4_s5_scaffold_new_package_relocated_clean_run" "clean-dir ./run.sh --headless-smoke failed (rc=$smoke_rc): $smoke_out"
         return
     fi

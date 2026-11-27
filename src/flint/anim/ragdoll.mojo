@@ -1765,6 +1765,7 @@ struct ArticulatedRagdoll(Copyable, Movable):
         mut root_yaw: Float32,
         mut inertial: Inertializer,
         target_pose: Pose,
+        authored_floor_y: Float32 = 0.0,
     ):
         """World Pelvis Re-Rooting + Inertialized Getup Recovery:
         1. Updates the entity's world `(root_pos, root_yaw)` to the settled ragdoll
@@ -1792,7 +1793,9 @@ struct ArticulatedRagdoll(Copyable, Movable):
             var nz = self.floor_normal.z
             var rx = pelvis_w.x - tgt_pelvis_horiz_w.x
             var rz = pelvis_w.z - tgt_pelvis_horiz_w.z
-            new_root_y = (self.floor_offset - nx * rx - nz * rz) / ny
+            # The character origin can sit at its soles or at its capsule center.
+            var floor_y = authored_floor_y if isfinite(authored_floor_y) else Float32(0.0)
+            new_root_y = (self.floor_offset - nx * rx - nz * rz) / ny - floor_y * self.scale
         else:
             new_root_y = pelvis_w.y - tgt_pelvis_m.y
 

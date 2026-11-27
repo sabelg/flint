@@ -26,6 +26,13 @@ from flint.assets.cooker_v2 import (
 )
 from flint.assets.flpk_v3 import (
     ASSET_KIND_AUDIO,
+    CHUNK_COMP_NONE,
+    COOKED_AUD_SLAB_MAGIC,
+    SUB_ID_FONT_OUTLINES,
+    SUB_ID_AUDIO_PAGE_HASHES,
+    AUDIO_STREAM_PAGE_BYTES,
+    crc64_ecma_ptr,
+    _ptr_u64,
     ASSET_KIND_FONT,
     ASSET_KIND_HDR,
     ASSET_KIND_MESH,
@@ -56,6 +63,7 @@ from flint.assets.flpk_v3 import (
 from flint.assets.meshlet import AaaGeometryPool
 from flint.assets.watcher import AssetWatcher
 from flint.audio.qoa import decode_qoa
+from flint.audio.stream import StreamSourceInfo, probe_stream_region, probe_stream_source
 from flint.physics.bvh import Bvh8MeshCollider
 from flint.platform.audio import decode_wav
 from flint.platform.os import file_size, is_symlink, list_directory, read_bytes
@@ -103,18 +111,21 @@ struct CookedMeshAsset(AssetPayload):
     var has_collider: Bool
     var collider: Bvh8MeshCollider
     var resident_lod: Int
+    var source_mount: Int
 
     def __init__(out self):
         self.geom = AaaGeometryPool()
         self.has_collider = False
         self.collider = Bvh8MeshCollider()
         self.resident_lod = 0
+        self.source_mount = -1
 
     def __init__(out self, *, copy: Self):
         self.geom = clone_geometry_pool(copy.geom)
         self.has_collider = copy.has_collider
         self.collider = copy.collider.copy()
         self.resident_lod = copy.resident_lod
+        self.source_mount = copy.source_mount
 
     @staticmethod
     def asset_kind() -> UInt8:
@@ -816,6 +827,7 @@ struct AssetServer(Resource, Movable):
     var watcher: AssetWatcher
     var streamer: AaaResidencyStreamer
     var renderer_ptr: Int
+    var renderer_generation: Int
     var stream_budget_bytes_per_tick: Int
     var lru_max_bytes: Int
     var current_tick: UInt64
@@ -843,6 +855,7 @@ struct AssetServer(Resource, Movable):
         self.loose_uuid_to_rel = Dict[String, String]()
         self.watcher = AssetWatcher(enabled=enable_watcher)
         self.streamer = AaaResidencyStreamer(max_textures=1024, initial_tail_mip=4)
+        self.renderer_generation = -1
         self.renderer_ptr = 0
         self.stream_budget_bytes_per_tick = max(256, stream_budget_bytes_per_tick)
         self.lru_max_bytes = max(65536, lru_max_bytes)
@@ -867,6 +880,7 @@ struct AssetServer(Resource, Movable):
         self.watcher = move.watcher^
         self.streamer = move.streamer^
         self.renderer_ptr = move.renderer_ptr
+        self.renderer_generation = move.renderer_generation
         self.stream_budget_bytes_per_tick = move.stream_budget_bytes_per_tick
         self.lru_max_bytes = move.lru_max_bytes
         self.current_tick = move.current_tick
@@ -902,6 +916,15 @@ struct AssetServer(Resource, Movable):
 
     def attach_renderer_residency_bridge(mut self, mut ren: FlintAaaVulkanRenderer):
         """Attaches a live `FlintAaaVulkanRenderer` so streamed mips stage into bindless slots with `minLod` clamping."""
+        if self.renderer_ptr != 0 and self.renderer_generation != ren.device_generation():
+            # The renderer owns the old images. All bindless indices now belong to a new device.
+            self.streamer.vram_live_bytes = 0
+            for i in range(len(self.streamer.slot_bindless_idx)):
+                self.streamer.slot_bindless_idx[i] = -1
+                self.streamer.slot_vram_bytes[i] = 0
+                self.streamer.slot_mip_mask[i] = 0
+                self.streamer.slot_layouts_init[i] = False
+        self.renderer_generation = ren.device_generation()
         self.renderer_ptr = Int(Pointer(to=ren))
         self.streamer.attach_vulkan(ren.vk)
         self.textures.set_evict_hook(Int(Pointer(to=self)), _asset_server_evict_texture_slot)
@@ -1332,6 +1355,51 @@ struct AssetServer(Resource, Movable):
             return self.load_texture_with_role(clean_rel, role=role, progressive=progressive)
         return Handle[CookedTextureAsset]()
 
+    def resolve_audio_stream(self, aref: AssetRef) -> StreamSourceInfo:
+        """Resolve an addressable PCM/QOA archive region or loose file without loading the clip."""
+        var norm = normalize_asset_rel_path(aref.rel_path)
+        if not norm[0]:
+            return StreamSourceInfo()
+        var rel = norm[1]
+        var alt = Self._assets_prefix_alt(rel)
+        for i in range(len(self.mounts) - 1, -1, -1):
+            ref pack = self.mounts[i]
+            var toc = pack.find_by_uuid(aref.uuid) if not aref.uuid.is_nil() else -1
+            if toc < 0 and rel.byte_length() > 0:
+                toc = pack.find_by_path(rel)
+                if toc < 0:
+                    toc = pack.find_by_path(alt)
+            if toc >= 0:
+                var entry = pack.toc_entry(toc)
+                if entry.compression != CHUNK_COMP_NONE:
+                    return StreamSourceInfo()
+                var hash_toc = pack.find_by_uuid(entry.uuid, SUB_ID_AUDIO_PAGE_HASHES)
+                if hash_toc < 0:
+                    return StreamSourceInfo()
+                var hash_entry = pack.toc_entry(hash_toc)
+                var bytes = Int(entry.compressed_bytes)
+                var pages = (bytes + AUDIO_STREAM_PAGE_BYTES - 1) // AUDIO_STREAM_PAGE_BYTES
+                if pages == 0 or Int(hash_entry.compressed_bytes) != pages * 8:
+                    return StreamSourceInfo()
+                var hashes = pack.mmap_slice_by_toc(hash_toc)
+                if not hashes.valid or _ptr_u64(hashes.addr, 0) != crc64_ecma_ptr(
+                    pack.addr + Int(entry.payload_offset), min(bytes, AUDIO_STREAM_PAGE_BYTES), 0,
+                ):
+                    return StreamSourceInfo()
+                var info = probe_stream_region(
+                    pack.path, pack.fd, Int(entry.payload_offset), Int(entry.compressed_bytes), COOKED_AUD_SLAB_MAGIC,
+                )
+                info.archive_fd = pack.fd
+                info.checksums_offset = Int(hash_entry.payload_offset)
+                info.archive_key = pack.path + "#" + String(pack.header.toc_crc64)
+                return info^
+        if not aref.uuid.is_nil():
+            var loose = self.loose_uuid_to_rel.get(TypedAssetStorage[CookedAudioAsset]._uuid_key(aref.uuid))
+            if loose:
+                rel = loose.value()
+        var path = self._resolve_loose_disk_path(rel)
+        return probe_stream_source(path) if path.byte_length() > 0 else StreamSourceInfo()
+
     def resolve_audio(mut self, aref: AssetRef) -> Handle[CookedAudioAsset]:
         var norm = normalize_asset_rel_path(aref.rel_path)
         if not norm[0]:
@@ -1382,6 +1450,8 @@ struct AssetServer(Resource, Movable):
         var entry = self.mounts[mount_idx].toc_entry(toc_idx)
         var rpath = self.mounts[mount_idx].entry_path(toc_idx)
         var asset = CookedMeshAsset()
+
+        asset.source_mount = mount_idx
 
         # Zero-copy mmap decode directly into `asset.geom` (zero `clone_geometry_pool` overhead!)
         var zc = self.mounts[mount_idx].mmap_slice_by_toc(toc_idx, verify_crc=True)
@@ -1667,6 +1737,11 @@ struct AssetServer(Resource, Movable):
                 var fa = CookedFontAsset()
                 fa.dsf_data = pay[1].copy()
                 if fa.font.load_bytes(fa.dsf_data):
+                    var outlines = self.mounts[loc[0]].find_by_uuid(e.uuid, SUB_ID_FONT_OUTLINES)
+                    if outlines >= 0:
+                        var chunk = self.mounts[loc[0]].read_payload_by_toc(outlines, verify_crc=True)
+                        if not chunk[0] or not fa.font.attach_source_bytes(chunk[1].copy()):
+                            return Handle[CookedFontAsset]()
                     return self.fonts.insert(fa^, e.uuid, clean_rel, self.current_tick)
         var full = self._resolve_loose_disk_path(clean_rel)
         if full.byte_length() > 0:
@@ -1680,7 +1755,7 @@ struct AssetServer(Resource, Movable):
                 var cooked = cook_ttf_font_bundle(raw, meta, clean_rel)
                 if cooked.valid and len(cooked.chunks) > 0:
                     fa.dsf_data = cooked.chunks[0].raw_payload.copy()
-                    if fa.font.load_bytes(fa.dsf_data):
+                    if fa.font.load_bytes(fa.dsf_data) and fa.font.attach_source_bytes(raw.copy()):
                         return self.fonts.insert(fa^, meta.uuid, clean_rel, self.current_tick)
         return Handle[CookedFontAsset]()
 
@@ -1807,6 +1882,7 @@ struct AssetServer(Resource, Movable):
             if pay[0]:
                 var h = self.meshes.allocate_queued(entry.uuid, clean_rel, self.current_tick)
                 var job = _PendingMeshLoad(h, clean_rel)
+                job.asset.source_mount = loc[0]
                 job.is_cooked_slab = True
                 job.slab_bytes = pay[1].copy()
                 job.has_source = True
@@ -2059,7 +2135,7 @@ struct AssetServer(Resource, Movable):
                 var cooked = cook_ttf_font_bundle(raw, meta, rel_path)
                 if cooked.valid and len(cooked.chunks) > 0:
                     fa.dsf_data = cooked.chunks[0].raw_payload.copy()
-                    loaded_ok = fa.font.load_bytes(fa.dsf_data)
+                    loaded_ok = fa.font.load_bytes(fa.dsf_data) and fa.font.attach_source_bytes(raw.copy())
             if loaded_ok:
                 var h = Handle[CookedFontAsset](UInt32(fs), self.fonts.generations[fs])
                 if self.fonts.replace_in_place(h, fa^, self.current_tick):

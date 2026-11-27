@@ -47,10 +47,13 @@ struct Condition(Copyable, ImplicitlyCopyable, Movable):
     var op: Int
     var value: Float32
 
-    def __init__(out self, param: Int, op: Int, value: Float32):
+    var is_clip: Bool
+
+    def __init__(out self, param: Int, op: Int, value: Float32, is_clip: Bool = False):
         self.param = param
         self.op = op
         self.value = value
+        self.is_clip = is_clip
 
     def holds(self, params: List[Float32]) -> Bool:
         if self.param < 0 or self.param >= len(params):
@@ -382,6 +385,7 @@ struct FormOffsetDef(Copyable, Movable):
 
 struct AnimGraphDef(Copyable, Movable):
     var name: String
+    var clip_names: List[String]  # Authored clip order. Empty in legacy positional graphs.
     var params: List[String]
     var masks: List[MaskDef]
     var blend_spaces: List[BlendSpaceDef]
@@ -397,6 +401,7 @@ struct AnimGraphDef(Copyable, Movable):
     def __init__(out self):
         self.name = ""
         self.params = List[String]()
+        self.clip_names = List[String]()
         self.masks = List[MaskDef]()
         self.blend_spaces = List[BlendSpaceDef]()
         self.blend_spaces_2d = List[BlendSpace2DDef]()
@@ -510,7 +515,7 @@ def read_conditions(document: JsonDocument, node: Int, graph: AnimGraphDef, clip
             value = Float32(clip)
         else:
             value = Float32(document.number(value_node))
-        out.append(Condition(param, op, value))
+        out.append(Condition(param, op, value, document.nodes[value_node].kind == 3))
     return out^
 
 
@@ -528,6 +533,7 @@ def parse_anim_graph(document: JsonDocument, clips: List[String]) raises -> Anim
         raise Error("animation graph: not valid JSON")
     var root = document.root
     var graph = AnimGraphDef()
+    graph.clip_names = clips.copy()
     graph.name = document.text(document.object_get(root, "name"), "graph")
     graph.default_blend = Float32(document.number(document.object_get(root, "blend"), 0.08))
     var params = document.object_get(root, "params")

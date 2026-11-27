@@ -16,6 +16,8 @@ Provides:
 from std.collections import Dict, List
 from std.math import isfinite, max, min
 from flint.anim.plugin import AnimAssetCache, SkeletonComponent
+from flint.anim.pose import SkeletonInstance
+from flint.assets.model import NativeModel, NativeSkin
 from flint.app.engine_app import (
     EngineApp,
     EnginePlugin,
@@ -156,6 +158,14 @@ struct _OverrideSlotCacheEntry(Copyable, Movable):
         self.last_seen_frame = copy.last_seen_frame
 
 
+@fieldwise_init
+struct SkinnedPrimitive(Copyable, Movable):
+    var node: Int
+    var skin: Int
+    var owns_material: Bool
+    var entry: AaaSkinnedMeshEntry
+
+
 struct RenderPluginStateResource(Resource, Movable):
     """Owns `RenderExtractor`, `UiDrawList`, optional `TerrainClipmapPacket`, and stats."""
     comptime RESOURCE_ID: UInt64 = comp_hash64("flint.render.RenderPluginStateResource")
@@ -174,6 +184,10 @@ struct RenderPluginStateResource(Resource, Movable):
     var entity_smear_scales: Dict[UInt64, Vec3]
     var skinned_sync_count: Int
     var skinned_entries: Dict[UInt64, AaaSkinnedMeshEntry]
+    var skin_device_generation: Int
+    var free_skin_materials: List[Int]
+    var skinned_parts: Dict[UInt64, List[SkinnedPrimitive]]
+    var preview_skeletons: Dict[UInt64, SkeletonInstance]
     var skinned_model_ids: Dict[UInt64, UInt64]
     var skinned_invalidated: Dict[UInt64, Bool]
     var preview_bone_palettes: Dict[UInt64, List[DualQuat]]
@@ -196,6 +210,10 @@ struct RenderPluginStateResource(Resource, Movable):
         self.entity_smear_scales = Dict[UInt64, Vec3]()
         self.skinned_sync_count = 0
         self.skinned_entries = Dict[UInt64, AaaSkinnedMeshEntry]()
+        self.skin_device_generation = 0
+        self.free_skin_materials = List[Int]()
+        self.skinned_parts = Dict[UInt64, List[SkinnedPrimitive]]()
+        self.preview_skeletons = Dict[UInt64, SkeletonInstance]()
         self.skinned_model_ids = Dict[UInt64, UInt64]()
         self.skinned_invalidated = Dict[UInt64, Bool]()
         self.preview_bone_palettes = Dict[UInt64, List[DualQuat]]()
@@ -936,66 +954,130 @@ def build_overridden_material(
     return mat^
 
 
-def _sys_render_extract_and_draw(
-    world_ptr: Pointer[World, MutAnyOrigin],
-    res_ptr: Pointer[Resources, MutAnyOrigin],
-    _pool_ptr: Pointer[JobPool, MutAnyOrigin],
-    _cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
-    _ctx: Int,
-):
-    ref world = world_ptr[unsafe_offset=0]
-    ref resources = res_ptr[unsafe_offset=0]
-    var rw_opt = resources.get_ptr_mut[RenderWorld]()
-    var rend_opt = resources.get_ptr_mut[ScalableRenderer]()
-    var st_opt = resources.get_ptr_mut[RenderPluginStateResource]()
-    if not rw_opt or not rend_opt or not st_opt:
-        return
-
-    ref render_world = rw_opt.value()[unsafe_offset=0]
-    ref renderer = rend_opt.value()[unsafe_offset=0]
-    ref state = st_opt.value()[unsafe_offset=0]
-
-    var frame_idx = UInt64(0)
-    var frame_dt = Float32(1.0 / 60.0)
-    var ft_opt = resources.get_ptr[FrameTime]()
-    if ft_opt:
-        frame_idx = ft_opt.value()[unsafe_offset=0].frame_index
-        frame_dt = ft_opt.value()[unsafe_offset=0].delta_seconds
-
-    var alpha = Float32(1.0)
-    var fix_opt = resources.get_ptr[FixedTime]()
-    if fix_opt:
-        alpha = fix_opt.value()[unsafe_offset=0].overstep_alpha
-
-    state.extractor.begin_extraction(render_world, frame_idx, frame_dt)
-    if state.terrain_clipmap.active:
-        render_world.terrain_clipmap = state.terrain_clipmap.copy()
-
-    # 1. Extract active CameraComponent (unless Edit-mode camera override is active)
-    if state.editor_camera_override:
-        if state.has_editor_camera:
-            render_world.camera = state.editor_camera
-    else:
-        var cam_mask = world.bit_for[CameraComponent]().union(world.bit_for[GlobalTransform]())
-        var cam_entities = world.query_entities(cam_mask)
-        for i in range(len(cam_entities)):
-            var e = cam_entities[i]
-            var cam_opt = world.get_ptr[CameraComponent](e)
-            if not cam_opt or not cam_opt.value()[unsafe_offset=0].active:
+def _skinned_primitives(model: NativeModel) -> List[Tuple[Int, Int, Int]]:
+    var parts = List[Tuple[Int, Int, Int]]()
+    for node_index in range(len(model.nodes)):
+        ref node = model.nodes[node_index]
+        if node.mesh < 0:
+            continue
+        var n = max(1, len(node.mesh_indices))
+        for j in range(n):
+            var mi = node.mesh_indices[j] if len(node.mesh_indices) > 0 else node.mesh
+            if mi < 0 or mi >= len(model.meshes):
                 continue
-            ref cam = cam_opt.value()[unsafe_offset=0]
-            var gt = _interpolated_gt(world, e, alpha)
-            var eye = gt.translation
-            var off = cam.look_target_offset
-            if off.length_squared() <= Float32(1.0e-8):
-                off = Vec3(0.0, 0.0, -1.0)
-            var target = eye + gt.rotation.rotate(off)
-            var up = gt.rotation.rotate(Vec3(0.0, 1.0, 0.0)).normalized()
-            render_world.camera = RenderCameraPacket(
-                eye, target, up, cam.fov_y_deg, cam.near_z, cam.far_z, cam.exposure
-            )
-            break
+            ref mesh = model.meshes[mi]
+            var verts = mesh.vertex_count()
+            if verts == 0 or len(mesh.joints) < 4 * verts or len(mesh.weights) < 4 * verts:
+                continue
+            var skin = node.skin if node.skin >= 0 else mesh.skin
+            if skin < 0 and len(model.skins) == 1:
+                skin = 0
+            if skin >= 0 and skin < len(model.skins) and len(model.skins[skin].joints) > 0:
+                parts.append((mi, skin, node_index))
+    return parts^
 
+
+def _skin_palette(skin: NativeSkin, matrices: List[Mat4]) -> List[DualQuat]:
+    var palette = List[DualQuat](capacity=len(skin.joints))
+    for j in range(len(skin.joints)):
+        var node = skin.joints[j]
+        if node < 0 or node >= len(matrices):
+            palette.append(DualQuat())
+            continue
+        var ibm = Mat4()
+        if (j + 1) * 16 <= len(skin.inverse_bind):
+            for k in range(16):
+                ibm.values[k] = skin.inverse_bind[j * 16 + k]
+        palette.append(DualQuat.from_mat4(matrices[node].multiply(ibm)))
+    return palette^
+
+
+def _sync_skin_parts(
+    parts: List[SkinnedPrimitive], model: NativeModel, skel: SkeletonInstance,
+    key: UInt64, mut state: RenderPluginStateResource, mut renderer: ScalableRenderer,
+):
+    for skin_id in range(len(model.skins)):
+        var cur: List[DualQuat]
+        var prev: List[DualQuat]
+        var preview = state.preview_bone_palettes.get(key)
+        if skin_id == 0 and preview:
+            cur = preview.value().copy()
+            var previous = state.preview_prev_bone_palettes.get(key)
+            prev = previous.value().copy() if previous else cur.copy()
+        else:
+            ref skin = model.skins[skin_id]
+            cur = _skin_palette(skin, skel.world_matrices)
+            prev = (_skin_palette(skin, skel.prev_world_matrices)
+                    if len(skel.prev_world_matrices) == len(skel.world_matrices) else cur.copy())
+        for part in parts:
+            if part.skin == skin_id:
+                var morphs = skel.pose.morphs.get(part.node)
+                if morphs:
+                    var previous = skel.prev_morphs.get(part.node)
+                    if previous and skel.has_prev:
+                        renderer.update_skinned_mesh_bones(part.entry, cur, prev, True, morphs.value(), previous.value())
+                    else:
+                        renderer.update_skinned_mesh_bones(part.entry, cur, prev, True, morphs.value())
+                else:
+                    renderer.update_skinned_mesh_bones(part.entry, cur, prev, defer_to_frame=True)
+                state.skinned_sync_count += 1
+
+
+def _fits_skin_parts(renderer: ScalableRenderer, model: NativeModel, sources: List[Tuple[Int, Int, Int]]) -> Bool:
+    if not renderer.uses_vulkan():
+        return True
+    var arena = renderer.gpu_slot[0].skin_arena.copy()
+    for source in sources:
+        ref mesh = model.meshes[source[0]]
+        var vertices = mesh.vertex_count()
+        if arena.alloc_vertices(vertices)[1] != vertices:
+            return False
+        if arena.alloc_bone_palette(len(model.skins[source[1]].joints)) < 0:
+            return False
+        if mesh.morph_count > 0 and arena.alloc_morph_targets(mesh.morph_count, vertices)[2] != mesh.morph_count:
+            return False
+    return True
+
+
+def release_scene_skin(mut state: RenderPluginStateResource, mut renderer: ScalableRenderer, key: UInt64):
+    var parts = state.skinned_parts.pop(key, List[SkinnedPrimitive]())
+    for part in parts:
+        renderer.remove_skinned_mesh(part.entry)
+        if part.owns_material and part.entry.mesh_entry.material_id >= 0:
+            state.free_skin_materials.append(part.entry.mesh_entry.material_id)
+    _ = state.skinned_entries.pop(key, AaaSkinnedMeshEntry())
+    _ = state.skinned_model_ids.pop(key, UInt64(0))
+    _ = state.skinned_invalidated.pop(key, False)
+
+
+def extract_scene_meshes(
+    mut world: World,
+    mut resources: Resources,
+    mut render_world: RenderWorld,
+    mut renderer: ScalableRenderer,
+    mut state: RenderPluginStateResource,
+    alpha: Float32,
+):
+    """Extract visible meshes and synchronize their material and skeleton state for this frame."""
+    if renderer.uses_vulkan():
+        var generation = renderer.gpu_slot[0].device_generation()
+        if generation != state.skin_device_generation:
+            for key in state.skinned_parts.keys():
+                state.skinned_invalidated[key] = True
+            state.skin_device_generation = generation
+    var stale_skins = List[UInt64]()
+    for key in state.skinned_parts.keys():
+        var entity = Entity.from_bits(key)
+        var sk = world.get_ptr[SkeletonComponent](entity)
+        if not sk or sk.value()[].model_id == 0:
+            stale_skins.append(key)
+    for key in stale_skins:
+        var entity = Entity.from_bits(key)
+        var mc = world.get_ptr_mut[MeshRendererComponent](entity)
+        var previous = state.skinned_entries.get(key)
+        if mc and previous and mc.value()[].mesh_id == previous.value().mesh_entry.mesh_id:
+            mc.value()[].mesh_id = -1
+        release_scene_skin(state, renderer, key)
     # 1.5 Sync Skinned Meshes (SkeletonComponent -> per-entity DualQuat bone palette)
     if world.component_id[SkeletonComponent]() >= 0:
         var anim_cache_opt = resources.get_ptr[AnimAssetCache]()
@@ -1010,112 +1092,69 @@ def _sys_render_extract_and_draw(
                     continue
                 ref sk = sk_opt.value()[unsafe_offset=0]
                 var skey = se.to_bits()
-                var prev_pal_opt = state.preview_bone_palettes.get(skey)
-                if sk.model_id == 0:
-                    continue
                 var m_idx = anim_cache.find_model(sk.model_id)
-                if m_idx < 0:
+                if sk.model_id == 0 or m_idx < 0:
                     continue
                 ref model = anim_cache.models[m_idx]
                 if len(model.skins) == 0 or len(model.meshes) == 0:
                     continue
-                ref skin = model.skins[0]
-                var nj = len(skin.joints)
-                if nj == 0:
-                    continue
-                var inv_opt = state.skinned_invalidated.get(skey)
-                var is_invalidated = Bool(inv_opt) and inv_opt.value()
-                var need_alloc = True
-                var cur_mid_opt = state.skinned_model_ids.get(skey)
-                if (
-                    (not is_invalidated)
-                    and cur_mid_opt
-                    and cur_mid_opt.value() == sk.model_id
-                    and state.skinned_entries.get(skey)
-                ):
-                    need_alloc = False
-                if is_invalidated:
-                    state.skinned_invalidated[skey] = False
-                if need_alloc:
-                    var src_mesh_idx = 0
-                    for mi in range(len(model.meshes)):
-                        var mv = model.meshes[mi].vertex_count()
-                        if mv > 0 and len(model.meshes[mi].joints) >= mv * 4 and len(model.meshes[mi].weights) >= mv * 4:
-                            src_mesh_idx = mi
-                            break
-                    var mat_id = 0
-                    var mc_mut = world.get_ptr_mut[MeshRendererComponent](se)
-                    if mc_mut and mc_mut.value()[unsafe_offset=0].material_id >= 0:
-                        mat_id = mc_mut.value()[unsafe_offset=0].material_id
-                    elif len(renderer.materials) == 0:
-                        mat_id = renderer.register_material(MaterialAsset())
-                    var sk_entry = renderer.add_skinned_mesh(
-                        model.meshes[src_mesh_idx], mat_id, bone_count=nj
-                    )
-                    if mc_mut:
-                        mc_mut.value()[unsafe_offset=0].mesh_id = sk_entry.mesh_entry.mesh_id
-                    state.skinned_entries[skey] = sk_entry^
+                var invalid = state.skinned_invalidated.get(skey)
+                var needs_reload = Bool(invalid) and invalid.value()
+                var old_id = state.skinned_model_ids.get(skey)
+                var mc = world.get_ptr_mut[MeshRendererComponent](se)
+                if (not old_id or old_id.value() != sk.model_id or needs_reload
+                    or skey not in state.skinned_parts):
+                    release_scene_skin(state, renderer, skey)
+                    var parts = List[SkinnedPrimitive]()
+                    var sources = _skinned_primitives(model)
+                    if not _fits_skin_parts(renderer, model, sources):
+                        if mc:
+                            mc.value()[].mesh_id = -1
+                        continue
+                    for source in sources:
+                        var mi = source[0]
+                        var skin = source[1]
+                        var mat = -1
+                        if mc and (len(parts) == 0 or not mc.value()[].material_ref.is_empty()
+                                   or mc.value()[].mesh_ref.is_empty()):
+                            mat = mc.value()[].material_id
+                        var owns_material = mat < 0
+                        if owns_material:
+                            var material = renderer.build_native_mesh_material(model.meshes[mi], model)
+                            if len(state.free_skin_materials) > 0:
+                                mat = state.free_skin_materials.pop()
+                                renderer.update_material_asset_deferred(mat, material)
+                            else:
+                                mat = renderer.register_material(material)
+                        var entry = renderer.add_skinned_mesh(model.meshes[mi], mat, len(model.skins[skin].joints))
+                        if entry.mesh_entry.mesh_id >= 0:
+                            parts.append(SkinnedPrimitive(source[2], skin, owns_material, entry^))
+                    if len(parts) > 0:
+                        state.skinned_entries[skey] = parts[0].entry.copy()
+                    state.skinned_parts[skey] = parts^
                     state.skinned_model_ids[skey] = sk.model_id
-
-                var sk_entry_opt = state.skinned_entries.get(skey)
-                if sk_entry_opt:
-                    var mc_mut = world.get_ptr_mut[MeshRendererComponent](se)
-                    if mc_mut:
-                        mc_mut.value()[unsafe_offset=0].mesh_id = sk_entry_opt.value().mesh_entry.mesh_id
-                    if prev_pal_opt:
-                        var prev_p_opt = state.preview_prev_bone_palettes.get(skey)
-                        var prev_list = prev_p_opt.value().copy() if prev_p_opt else prev_pal_opt.value().copy()
-                        renderer.update_skinned_mesh_bones(
-                            sk_entry_opt.value(),
-                            prev_pal_opt.value(),
-                            prev_list,
-                            defer_to_frame=True,
-                        )
-                        state.skinned_sync_count += 1
-                    else:
-                        var cur_bones = List[DualQuat](capacity=nj)
-                        var prev_bones = List[DualQuat](capacity=nj)
-                        var n_wm = len(sk.skeleton.world_matrices)
-                        if n_wm > 0:
-                            var has_prev_wm = len(sk.skeleton.prev_world_matrices) == n_wm
-                            for j in range(nj):
-                                var jn = skin.joints[j]
-                                var wm = sk.skeleton.world_matrices[jn].copy() if (jn >= 0 and jn < n_wm) else Mat4()
-                                var pm = (
-                                    sk.skeleton.prev_world_matrices[jn].copy()
-                                    if (has_prev_wm and jn >= 0 and jn < n_wm)
-                                    else wm.copy()
-                                )
-                                var ibm = Mat4()
-                                if (j + 1) * 16 <= len(skin.inverse_bind):
-                                    for k in range(16):
-                                        ibm.values[k] = skin.inverse_bind[j * 16 + k]
-                                cur_bones.append(DualQuat.from_mat4(wm.multiply(ibm)))
-                                prev_bones.append(DualQuat.from_mat4(pm.multiply(ibm)))
-                        elif sk.skeleton.node_count > 0 and len(model.nodes) > 0:
-                            var tmp_skel = sk.skeleton.copy()
-                            tmp_skel.ensure_topology(model)
-                            tmp_skel.update_matrices(model)
-                            var tn_wm = len(tmp_skel.world_matrices)
-                            for j in range(nj):
-                                var jn = skin.joints[j]
-                                var wm = tmp_skel.world_matrices[jn].copy() if (jn >= 0 and jn < tn_wm) else Mat4()
-                                var ibm = Mat4()
-                                if (j + 1) * 16 <= len(skin.inverse_bind):
-                                    for k in range(16):
-                                        ibm.values[k] = skin.inverse_bind[j * 16 + k]
-                                var dq = DualQuat.from_mat4(wm.multiply(ibm))
-                                cur_bones.append(dq)
-                                prev_bones.append(dq)
-                        else:
-                            for _ in range(nj):
-                                var dq = DualQuat()
-                                cur_bones.append(dq)
-                                prev_bones.append(dq)
-                        renderer.update_skinned_mesh_bones(
-                            sk_entry_opt.value(), cur_bones, prev_bones, defer_to_frame=True
-                        )
-                        state.skinned_sync_count += 1
+                    state.skinned_invalidated[skey] = False
+                var bound_parts = state.skinned_parts.get(skey)
+                if not bound_parts:
+                    continue
+                ref parts = bound_parts.value()
+                if len(parts) == 0:
+                    if mc:
+                        mc.value()[].mesh_id = -1
+                    continue
+                if mc:
+                    mc.value()[].mesh_id = parts[0].entry.mesh_entry.mesh_id
+                var preview_skel = state.preview_skeletons.get(skey)
+                if preview_skel:
+                    _sync_skin_parts(parts, model, preview_skel.value(), skey, state, renderer)
+                elif len(sk.skeleton.world_matrices) == 0 and sk.skeleton.node_count > 0:
+                    var tmp = sk.skeleton.copy()
+                    tmp.ensure_topology(model)
+                    tmp.update_matrices(model)
+                    tmp.snapshot_prev_matrices()
+                    _sync_skin_parts(parts, model, tmp, skey, state, renderer)
+                else:
+                    _sync_skin_parts(parts, model, sk.skeleton, skey, state, renderer)
 
     # 2. Extract MeshRendererComponents (+ isolated per-entity MaterialOverrideComponent slots)
     var frame_tag = state.rendered_frames + 1
@@ -1127,14 +1166,19 @@ def _sys_render_extract_and_draw(
         if not mc_opt or not mc_opt.value()[unsafe_offset=0].visible:
             continue
         ref mc = mc_opt.value()[unsafe_offset=0]
+        if mc.mesh_id < 0:
+            continue
         var key = e.to_bits()
         var eff_mat = mc.material_id
+        var override_all_parts = not mc.material_ref.is_empty() or mc.mesh_ref.is_empty()
         var studio_mat_opt = state.studio_override_mat_ids.get(key)
         if studio_mat_opt:
+            override_all_parts = True
             eff_mat = studio_mat_opt.value()
         else:
             var ov_opt = world.get_ptr[MaterialOverrideComponent](e)
             if ov_opt and ov_opt.value()[unsafe_offset=0].enabled:
+                override_all_parts = True
                 ref ov = ov_opt.value()[unsafe_offset=0]
                 var base_mat_id = ov.material_id if ov.material_id >= 0 else mc.material_id
                 if base_mat_id < 0 and mc.mesh_id >= 0 and mc.mesh_id < len(renderer.cpu_mesh_materials):
@@ -1197,6 +1241,19 @@ def _sys_render_extract_and_draw(
             mc.cast_shadows,
         )
 
+        # Sibling primitives share the entity transform, including its previous
+        # matrix. Recording that transform again would erase its motion vector.
+        var extra = state.skinned_parts.get(key)
+        if extra and len(extra.value()) > 1 and extra.value()[0].entry.mesh_entry.mesh_id == mc.mesh_id:
+            var first = len(render_world.instances) - 1
+            for pi in range(1, len(extra.value())):
+                ref entry = extra.value()[pi].entry.mesh_entry
+                var packet = render_world.instances[first].copy()
+                packet.mesh_id = entry.mesh_id
+                if not override_all_parts:
+                    packet.material_id = entry.material_id
+                render_world.instances.append(packet^)
+
     var stale_ov_keys = List[UInt64]()
     for item in state.override_slots.items():
         if item.value.last_seen_frame != frame_tag:
@@ -1207,6 +1264,68 @@ def _sys_render_extract_and_draw(
         )
         if popped.slot_id >= 0:
             state.free_override_slots.append(popped.slot_id)
+
+def _sys_render_extract_and_draw(
+    world_ptr: Pointer[World, MutAnyOrigin],
+    res_ptr: Pointer[Resources, MutAnyOrigin],
+    _pool_ptr: Pointer[JobPool, MutAnyOrigin],
+    _cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
+    _ctx: Int,
+):
+    ref world = world_ptr[unsafe_offset=0]
+    ref resources = res_ptr[unsafe_offset=0]
+    var rw_opt = resources.get_ptr_mut[RenderWorld]()
+    var rend_opt = resources.get_ptr_mut[ScalableRenderer]()
+    var st_opt = resources.get_ptr_mut[RenderPluginStateResource]()
+    if not rw_opt or not rend_opt or not st_opt:
+        return
+
+    ref render_world = rw_opt.value()[unsafe_offset=0]
+    ref renderer = rend_opt.value()[unsafe_offset=0]
+    ref state = st_opt.value()[unsafe_offset=0]
+
+    var frame_idx = UInt64(0)
+    var frame_dt = Float32(1.0 / 60.0)
+    var ft_opt = resources.get_ptr[FrameTime]()
+    if ft_opt:
+        frame_idx = ft_opt.value()[unsafe_offset=0].frame_index
+        frame_dt = ft_opt.value()[unsafe_offset=0].delta_seconds
+
+    var alpha = Float32(1.0)
+    var fix_opt = resources.get_ptr[FixedTime]()
+    if fix_opt:
+        alpha = fix_opt.value()[unsafe_offset=0].overstep_alpha
+
+    state.extractor.begin_extraction(render_world, frame_idx, frame_dt)
+    if state.terrain_clipmap.active:
+        render_world.terrain_clipmap = state.terrain_clipmap.copy()
+
+    # 1. Extract active CameraComponent (unless Edit-mode camera override is active)
+    if state.editor_camera_override:
+        if state.has_editor_camera:
+            render_world.camera = state.editor_camera
+    else:
+        var cam_mask = world.bit_for[CameraComponent]().union(world.bit_for[GlobalTransform]())
+        var cam_entities = world.query_entities(cam_mask)
+        for i in range(len(cam_entities)):
+            var e = cam_entities[i]
+            var cam_opt = world.get_ptr[CameraComponent](e)
+            if not cam_opt or not cam_opt.value()[unsafe_offset=0].active:
+                continue
+            ref cam = cam_opt.value()[unsafe_offset=0]
+            var gt = _interpolated_gt(world, e, alpha)
+            var eye = gt.translation
+            var off = cam.look_target_offset
+            if off.length_squared() <= Float32(1.0e-8):
+                off = Vec3(0.0, 0.0, -1.0)
+            var target = eye + gt.rotation.rotate(off)
+            var up = gt.rotation.rotate(Vec3(0.0, 1.0, 0.0)).normalized()
+            render_world.camera = RenderCameraPacket(
+                eye, target, up, cam.fov_y_deg, cam.near_z, cam.far_z, cam.exposure
+            )
+            break
+
+    extract_scene_meshes(world, resources, render_world, renderer, state, alpha)
 
     # 3. Extract VatCrowdComponents
     var vat_mask = world.bit_for[VatCrowdComponent]().union(world.bit_for[GlobalTransform]())
@@ -1296,6 +1415,7 @@ def _sys_render_extract_and_draw(
     state.extra_lights.clear()
     state.studio_override_mat_ids.clear()
     state.entity_smear_scales.clear()
+    state.preview_skeletons.clear()
     state.preview_bone_palettes.clear()
     state.preview_prev_bone_palettes.clear()
     state.preview_world_transforms.clear()
@@ -1381,9 +1501,22 @@ struct RenderPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
                 exclusive=True,
             )
         if not _has_render_system(app, STAGE_SHUTDOWN, "flint.render.shutdown"):
-            _ = app.add_system(
+            var render_shutdown = app.add_system(
                 STAGE_SHUTDOWN,
                 "flint.render.shutdown",
                 _sys_render_shutdown,
                 exclusive=True,
             )
+            # WSI needs a live wl_surface while it releases the swapchain and device.
+            # Exclusive systems run in registration order unless ordered explicitly.
+            ref stage = app.schedule.stages[STAGE_SHUTDOWN]
+            var last = len(stage.systems)-1
+            for i in range(last):
+                if stage.systems[i].name == "flint.app.window_shutdown":
+                    var system = stage.systems[last].copy()
+                    for k in range(last, i, -1):
+                        stage.systems[k] = stage.systems[k-1].copy()
+                    stage.systems[i] = system^
+                    stage.systems[i+1].explicit_after.append(render_shutdown)
+                    stage.dirty = True
+                    break

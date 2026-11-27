@@ -16,6 +16,8 @@ from flint.ecs.world import (
     MAX_COMMAND_LANES,
     WORLD_BLOB_TAG,
     WORLD_BLOB_VERSION,
+    REMOVAL_EVENT_SOFT_CAP,
+    DespawnHookFn,
     NULL_ENTITY,
     comp_hash64,
     comp_hash64_str,

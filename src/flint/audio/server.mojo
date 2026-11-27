@@ -24,11 +24,19 @@ from std.math import sin, cos, sqrt, exp, log10, floor, abs, atan2, isnan, isinf
 from std.memory import bitcast
 from std.sys import size_of
 from flint.core.math import Vec3
+from flint.core.memory import MEM_AUDIO, MemCharge
 from flint.app.engine_app import Resource
 from flint.ecs.world import comp_hash64
-from flint.platform.os import close_fd, read_bytes
+from flint.platform.os import close_fd, read_bytes, get_time, list_directory, file_size
 from flint.platform.pulse import PulseClient
-from flint.platform.audio import WavClip, alsa_open_pcm, alsa_write_interleaved, alsa_close_pcm, decode_wav
+from flint.platform.audio import (
+    WavClip,
+    alsa_open_pcm,
+    alsa_write_interleaved,
+    alsa_close_pcm,
+    decode_wav,
+    _alsa_configure_fd,
+)
 from flint.platform.dsp import (
     CytomicSVF,
     StereoReverbFDN,
@@ -42,6 +50,33 @@ from flint.cycles.synth import CyclesEngine
 from flint.cycles.script import Program, run_program
 from flint.audio.qoa import QoaAsset, QoaStreamCursor
 from flint.audio.acoustics import CLEAR_CUTOFF_HZ
+from flint.audio.attenuation import AttenuationPreset
+from flint.audio.vorbis import is_ogg_vorbis, decode_ogg_vorbis
+from flint.audio.stream import (
+    AudioStreamPool,
+    StreamSourceInfo,
+    probe_stream_source,
+    stream_load,
+    stream_store,
+    stream_ring_sample,
+    stream_frame_ready,
+    stream_publish_read,
+    _audio_stream_thread_entry,
+    STREAM_MAX_CHANNELS,
+    STREAM_FMT_WAV16,
+    STREAM_FMT_QOA,
+    STREAM_STATE_ARMED,
+    STREAM_STATE_ACTIVE,
+    STREAM_STATE_RELEASING,
+    STREAM_RING_FRAMES,
+    STREAM_RING_MASK,
+    _SC_STATE,
+    _SC_WRITE,
+    _SC_RING,
+    _SC_OWNER_SLOT,
+    _SC_OWNER_GEN,
+    _SC_LOOP,
+)
 
 # Standard Mix Bus IDs
 comptime BUS_MASTER: Int = 0
@@ -98,6 +133,23 @@ comptime CMD_ADD_BUS: UInt32 = 13
 comptime CMD_ADD_STEM: UInt32 = 14
 comptime CMD_TRANSITION_STEM: UInt32 = 15
 comptime CMD_CONFIG_MASTER: UInt32 = 16
+comptime ACMD_PAUSE: UInt32 = 17
+comptime ACMD_GLOBAL_PAUSE: UInt32 = 18
+comptime ACMD_SET_VOICE_PARAMS: UInt32 = 19
+comptime CMD_INSTALL_ATTEN: UInt32 = 20
+comptime ACMD_SET_EMITTER_ATTEN: UInt32 = 21
+comptime ACMD_SEEK_STREAM: UInt32 = 22
+
+# Output backends (published in telemetry `_TELEM_BACKEND`)
+comptime AUDIO_BACKEND_NONE: Int = 0
+comptime AUDIO_BACKEND_PULSE: Int = 1
+comptime AUDIO_BACKEND_ALSA: Int = 2
+comptime AUDIO_BACKEND_HEADLESS: Int = 3
+comptime RECONNECT_BACKOFF_MIN_MS: Int = 100
+comptime RECONNECT_BACKOFF_MAX_MS: Int = 5000
+
+# Fade constants
+comptime PAUSE_FADE_FRAMES: Int = 256
 
 # CMD_CONFIG_BUS sub-opcodes (carried in AudioCmd.flags)
 comptime _BUS_CFG_GAIN_MUTE: UInt32 = 1
@@ -105,6 +157,7 @@ comptime _BUS_CFG_EQ_DB: UInt32 = 2
 comptime _BUS_CFG_COMPRESSOR: UInt32 = 3
 comptime _BUS_CFG_SIDECHAIN: UInt32 = 4
 comptime _BUS_CFG_AUX_SEND: UInt32 = 5
+comptime _BUS_CFG_PAUSE: UInt32 = 6
 
 # CMD_CONFIG_MASTER sub-opcodes (carried in AudioCmd.flags)
 comptime _MASTER_CFG_DC_BLOCKER: UInt32 = 1
@@ -115,6 +168,15 @@ comptime _MASTER_CFG_LIMITER_CEIL: UInt32 = 3
 comptime AFLAG_LOOPING: UInt32 = 1 << 0
 comptime AFLAG_SPATIAL: UInt32 = 1 << 1
 comptime AFLAG_DIRECT_STEREO: UInt32 = 1 << 2
+comptime AFLAG_STREAM: UInt32 = 1 << 3  # stream channel index carried in flags bits 8..15
+comptime ASSET_KIND_STREAM: Int = 2
+
+
+def next_reconnect_backoff_ms(current_ms: Int) -> Int:
+    """Exponential reconnect backoff: 100 ms doubling up to 5 s."""
+    if current_ms < RECONNECT_BACKOFF_MIN_MS:
+        return RECONNECT_BACKOFF_MIN_MS
+    return min(RECONNECT_BACKOFF_MAX_MS, current_ms * 2)
 
 
 @fieldwise_init
@@ -649,6 +711,19 @@ struct SpatialEmitter(Copyable, ImplicitlyCopyable, Movable):
     var virtual_frame_pos: Float64
     var audibility_score: Float32
     var assigned_voice: Int
+    # Playback control: per-voice pause, fade-out stop, click-free pause envelope
+    var paused: Bool
+    var stopping: Bool
+    var env_gain: Float32
+    var stop_rate: Float32
+    # Streaming channel (-1 = in-memory asset), attenuation preset & cone axis
+    var stream_ch: Int
+    var atten_id: Int
+    var cone_dir: Vec3
+    # Game-parameter (RTPC) modifiers
+    var rtpc_gain: Float32
+    var rtpc_pitch: Float32
+    var user_cutoff_hz: Float32
 
     def __init__(out self):
         self.active = False
@@ -672,6 +747,16 @@ struct SpatialEmitter(Copyable, ImplicitlyCopyable, Movable):
         self.virtual_frame_pos = 0.0
         self.audibility_score = 0.0
         self.assigned_voice = -1
+        self.paused = False
+        self.stopping = False
+        self.env_gain = 1.0
+        self.stop_rate = 1.0
+        self.stream_ch = -1
+        self.atten_id = -1
+        self.cone_dir = Vec3()
+        self.rtpc_gain = 1.0
+        self.rtpc_pitch = 1.0
+        self.user_cutoff_hz = CLEAR_CUTOFF_HZ
 
 
 struct PhysicalVoice(Copyable, Movable):
@@ -699,8 +784,12 @@ struct PhysicalVoice(Copyable, Movable):
     var steal_xfade_pos: Int
     var steal_tail_l: Array[Float32, STEAL_XFADE_SAMPLES]
     var steal_tail_r: Array[Float32, STEAL_XFADE_SAMPLES]
+    var lp_l: Float32
+    var lp_r: Float32
 
     def __init__(out self):
+        self.lp_l = 0.0
+        self.lp_r = 0.0
         self.active = False
         self.emitter_slot = -1
         self.emitter_gen = 0
@@ -735,6 +824,8 @@ struct PhysicalVoice(Copyable, Movable):
         self.pinna_svf_r = CytomicSVF(18000.0, 0.707, 48000.0)
         self.qoa_cursor = QoaStreamCursor()
         self.qoa_ring_head_frame = -1
+        self.lp_l = 0.0
+        self.lp_r = 0.0
 
 
 @fieldwise_init
@@ -774,6 +865,7 @@ def compute_woodworth_hrtf(
     occlusion_gain: Float32 = 1.0,
     occlusion_cutoff_hz: Float32 = CLEAR_CUTOFF_HZ,
     sample_rate: Float32 = 48000.0,
+    atten_override: Float32 = -1.0,
 ) -> HrtfSpatialTargets:
     """Computes physical Woodworth spherical-head ITD (`a = 0.082 m` -> `29.50` samples @ +90° right),
     frequency-dependent head-shadow ILD, rear/elevation pinna cutoffs (`listener_fwd`, `listener_up`),
@@ -820,6 +912,9 @@ def compute_woodworth_hrtf(
     if dist > md * Float32(0.8):
         horizon = max(Float32(0.0), Float32(1.0) - (dist - md * Float32(0.8)) / (md * Float32(0.2)))
     var base_amp = atten * horizon * occ_gain
+    if atten_override >= Float32(0.0) and isfinite(atten_override):
+        # Per-sound `AttenuationPreset` curve (distance + cone) replaces the default rolloff.
+        base_amp = atten_override * occ_gain
     if not isfinite(base_amp):
         base_amp = Float32(0.0)
 
@@ -898,6 +993,8 @@ struct AudioBus(Copyable, Movable):
     var parent_bus: Int  # -1 for root (Master)
     var gain: Float32
     var muted: Bool
+    var paused: Bool
+    var pause_exempt: Bool  # keeps playing while the global (pause-menu) pause is active
     # 3-band CytomicSVF EQ (exact flat pass-through when gains == 1.0)
     var eq_low_gain: Float32
     var eq_mid_gain: Float32
@@ -937,6 +1034,8 @@ struct AudioBus(Copyable, Movable):
         self.parent_bus = parent_bus
         self.gain = 1.0
         self.muted = False
+        self.paused = False
+        self.pause_exempt = False
         self.eq_low_gain = 1.0
         self.eq_mid_gain = 1.0
         self.eq_high_gain = 1.0
@@ -1182,6 +1281,11 @@ comptime _TELEM_PHYSICAL: Int = 24
 comptime _TELEM_MOMENTARY_LUFS: Int = 32
 comptime _TELEM_INTEGRATED_LUFS: Int = 40
 comptime _TELEM_MUSIC_DUCK_ENV: Int = 48
+comptime _TELEM_BACKEND: Int = 56
+comptime _TELEM_RECONNECTS: Int = 64
+comptime _TELEM_FAULT_INJECT: Int = 72
+comptime _TELEM_STREAM_UNDERRUNS: Int = 80
+comptime _TELEM_DEVICE_LOST: Int = 88
 comptime _TELEM_SLAB_BYTES: Int = 128
 
 
@@ -1314,6 +1418,22 @@ struct AudioRtEngine(Movable):
     var rt_pcm_i16: List[Int16]
     var rt_float_lr: List[Float32]
 
+    # Playback control / sound design / streaming
+    var global_paused: Bool
+    var bus_pause_eff: List[Bool]
+    var rt_atten: List[AttenuationPreset]
+    var stream_ctrl_addr: Int
+    var stream_underruns_local: Int
+
+    # Output robustness (backend state machine owned by the RT thread while it runs)
+    var backend: Int
+    var preferred_device: String
+    var allow_alsa_fallback: Bool
+    var backoff_ms: Int
+    var next_attempt_s: Float64
+    var reconnects_local: Int
+    var device_lost_local: Int
+
     def __init__(
         out self,
         sample_rate: Int = 48000,
@@ -1401,6 +1521,20 @@ struct AudioRtEngine(Movable):
             length=MAX_QUANTUM_FRAMES * 2, fill=0.0
         )
 
+        self.global_paused = False
+        self.bus_pause_eff = List[Bool](length=64, fill=False)
+        self.rt_atten = List[AttenuationPreset]()
+        self.stream_ctrl_addr = 0
+        self.stream_underruns_local = 0
+
+        self.backend = AUDIO_BACKEND_NONE
+        self.preferred_device = ""
+        self.allow_alsa_fallback = True
+        self.backoff_ms = RECONNECT_BACKOFF_MIN_MS
+        self.next_attempt_s = 0.0
+        self.reconnects_local = 0
+        self.device_lost_local = 0
+
         self.rebuild_topology()
         self._publish_telemetry()
 
@@ -1446,6 +1580,9 @@ struct AudioRtEngine(Movable):
         self._telem_ptr(_TELEM_MOMENTARY_LUFS)[unsafe_offset=0].store(mom_bits)
         self._telem_ptr(_TELEM_INTEGRATED_LUFS)[unsafe_offset=0].store(int_bits)
         self._telem_ptr(_TELEM_MUSIC_DUCK_ENV)[unsafe_offset=0].store(duck_bits)
+        self._telem_ptr(_TELEM_STREAM_UNDERRUNS)[unsafe_offset=0].store(
+            Int64(self.stream_underruns_local)
+        )
 
     def rebuild_topology(mut self):
         """Computes topological post-order of `AudioBus` DAG (children & sidechain sources before parents/targets)."""
@@ -1612,6 +1749,11 @@ struct AudioRtEngine(Movable):
                             self.buses[b].aux_sends[z] = max(
                                 Float32(0.0), cmd.p0
                             )
+                    elif sub == _BUS_CFG_PAUSE:
+                        if cmd.p0 >= Float32(0.0):
+                            self.buses[b].paused = cmd.p0 > Float32(0.5)
+                        if cmd.p1 >= Float32(0.0):
+                            self.buses[b].pause_exempt = cmd.p1 > Float32(0.5)
             elif k == CMD_CONFIG_MASTER:
                 var sub = cmd.flags
                 if sub == _MASTER_CFG_DC_BLOCKER:
@@ -1696,11 +1838,97 @@ struct AudioRtEngine(Movable):
                     em.occlusion_cutoff_hz = CLEAR_CUTOFF_HZ
                     em.obstruction_factor = 0.0
                     em.virtual_frame_pos = 0.0
+                    em.paused = False
+                    em.stopping = False
+                    em.env_gain = 1.0
+                    em.stop_rate = 1.0
+                    em.atten_id = -1
+                    em.cone_dir = Vec3()
+                    em.rtpc_gain = 1.0
+                    em.rtpc_pitch = 1.0
+                    em.user_cutoff_hz = CLEAR_CUTOFF_HZ
+                    em.stream_ch = -1
+                    if (cmd.flags & AFLAG_STREAM) != 0 and self.stream_ctrl_addr != 0:
+                        var sch = Int((cmd.flags >> 8) & 0xFF)
+                        if sch < STREAM_MAX_CHANNELS:
+                            var st = stream_load(self.stream_ctrl_addr, sch, _SC_STATE)
+                            if st == STREAM_STATE_ARMED:
+                                stream_store(self.stream_ctrl_addr, sch, _SC_STATE, STREAM_STATE_ACTIVE)
+                                em.stream_ch = sch
+            elif k == ACMD_SEEK_STREAM:
+                var s = Int(cmd.slot)
+                var ch = Int(cmd.asset_id)
+                if ch >= 0 and ch < STREAM_MAX_CHANNELS and self.stream_ctrl_addr != 0:
+                    if (
+                        s >= 0 and s < MAX_LOGICAL_EMITTERS and self.emitters[s].active
+                        and self.emitters[s].generation == cmd.generation and self.emitters[s].stream_ch >= 0
+                    ):
+                        self.emitters[s].virtual_frame_pos = Float64(cmd.flags)
+                        self.emitters[s].stream_ch = ch
+                        stream_store(self.stream_ctrl_addr, ch, _SC_STATE, STREAM_STATE_ACTIVE)
+                    else:
+                        stream_store(self.stream_ctrl_addr, ch, _SC_STATE, STREAM_STATE_RELEASING)
             elif k == ACMD_STOP:
                 var s = Int(cmd.slot)
                 if s >= 0 and s < MAX_LOGICAL_EMITTERS:
                     if self.emitters[s].generation == cmd.generation:
-                        self.emitters[s].active = False
+                        var fade_s = cmd.p0
+                        if fade_s > Float32(1.0e-4) and isfinite(fade_s) and self.emitters[s].active:
+                            self.emitters[s].stopping = True
+                            self.emitters[s].stop_rate = Float32(1.0) / max(Float32(1.0), fade_s * self.sr_f)
+                        else:
+                            self.emitters[s].active = False
+            elif k == ACMD_PAUSE:
+                var s = Int(cmd.slot)
+                if (
+                    s >= 0
+                    and s < MAX_LOGICAL_EMITTERS
+                    and self.emitters[s].generation == cmd.generation
+                ):
+                    self.emitters[s].paused = cmd.p0 > Float32(0.5)
+            elif k == ACMD_GLOBAL_PAUSE:
+                self.global_paused = cmd.p0 > Float32(0.5)
+            elif k == ACMD_SET_VOICE_PARAMS:
+                var s = Int(cmd.slot)
+                if (
+                    s >= 0
+                    and s < MAX_LOGICAL_EMITTERS
+                    and self.emitters[s].active
+                    and self.emitters[s].generation == cmd.generation
+                ):
+                    if cmd.p0 >= Float32(0.0) and isfinite(cmd.p0):
+                        self.emitters[s].rtpc_gain = min(Float32(16.0), cmd.p0)
+                    if cmd.p1 > Float32(0.0) and isfinite(cmd.p1):
+                        self.emitters[s].rtpc_pitch = _sanitize_pitch(cmd.p1)
+                    if cmd.p2 > Float32(0.0) and isfinite(cmd.p2):
+                        self.emitters[s].user_cutoff_hz = max(Float32(20.0), min(CLEAR_CUTOFF_HZ, cmd.p2))
+            elif k == CMD_INSTALL_ATTEN:
+                var ptr_addr = _unpack_ptr_from_cmd(cmd)
+                if ptr_addr != 0:
+                    var p = Pointer[AttenuationPreset, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
+                    )
+                    var preset = _heap_box_take_nofree[AttenuationPreset](p)
+                    var pid = max(0, Int(cmd.asset_id))
+                    while len(self.rt_atten) <= pid:
+                        self.rt_atten.append(AttenuationPreset())
+                    self.rt_atten[pid] = preset^
+                    self._retire_ptr(_RETIRE_RAW_PTR, ptr_addr)
+            elif k == ACMD_SET_EMITTER_ATTEN:
+                var s = Int(cmd.slot)
+                if (
+                    s >= 0
+                    and s < MAX_LOGICAL_EMITTERS
+                    and self.emitters[s].generation == cmd.generation
+                ):
+                    var pid = Int(cmd.asset_id)
+                    if pid >= 0 and pid < len(self.rt_atten):
+                        self.emitters[s].atten_id = pid
+                        self.emitters[s].ref_dist = self.rt_atten[pid].min_dist
+                        self.emitters[s].max_dist = self.rt_atten[pid].max_dist
+                    else:
+                        self.emitters[s].atten_id = -1
+                    self.emitters[s].cone_dir = Vec3(cmd.p0, cmd.p1, cmd.p2)
             elif k == ACMD_UPDATE_EMITTER:
                 var s = Int(cmd.slot)
                 if (
@@ -1760,6 +1988,12 @@ struct AudioRtEngine(Movable):
                 self.aux_gains[z] = max(
                     Float32(0.0), min(Float32(1.5), cmd.p2)
                 )
+            elif k == ACMD_STOP_ALL and cmd.p0 > Float32(1.0e-4) and isfinite(cmd.p0):
+                var rate = Float32(1.0) / max(Float32(1.0), cmd.p0 * self.sr_f)
+                for i in range(MAX_LOGICAL_EMITTERS):
+                    if self.emitters[i].active:
+                        self.emitters[i].stopping = True
+                        self.emitters[i].stop_rate = rate
             elif k == ACMD_STOP_ALL:
                 for i in range(MAX_LOGICAL_EMITTERS):
                     self.emitters[i].active = False
@@ -1797,6 +2031,12 @@ struct AudioRtEngine(Movable):
             elif cmd.kind == CMD_TRANSITION_STEM:
                 _heap_box_free[_StemTransitionPayload](
                     Pointer[_StemTransitionPayload, MutAnyOrigin](
+                        unsafe_from_address=ptr_addr
+                    )
+                )
+            elif cmd.kind == CMD_INSTALL_ATTEN:
+                _heap_box_free[AttenuationPreset](
+                    Pointer[AttenuationPreset, MutAnyOrigin](
                         unsafe_from_address=ptr_addr
                     )
                 )
@@ -1878,7 +2118,12 @@ struct AudioRtEngine(Movable):
             if looping:
                 start_f = start_f % total
             _ = pv.qoa_cursor.seek(qoa_bytes, start_f)
-            pv.qoa_ring_head_frame = needed_frame - 2
+            # Ring head must name the frame the cursor will decode next (it was `needed - 2`
+            # even when clamped to 0, shifting playback by 2 frames); clear stale history.
+            pv.qoa_ring_head_frame = max(0, needed_frame - 2)
+            for i in range(64):
+                pv.qoa_ring_l[i] = 0.0
+                pv.qoa_ring_r[i] = 0.0
 
         while pv.qoa_ring_head_frame <= target:
             var l16 = Int16(0)
@@ -1943,6 +2188,107 @@ struct AudioRtEngine(Movable):
         var out_r = ((rc3 * frac + rc2) * frac + rc1) * frac + rc0
         return (out_l, out_r)
 
+    @staticmethod
+    @always_inline
+    def _stream_at(ring: Int, wp: Int, total: Int, looping: Bool, idx: Int, lr: Int) -> Float32:
+        if ring == 0 or idx < 0 or idx >= wp or idx < wp - STREAM_RING_FRAMES:
+            return 0.0
+        if not looping and idx >= total:
+            return 0.0
+        return Pointer[Float32, MutAnyOrigin](unsafe_from_address=ring)[
+            unsafe_offset=(idx & STREAM_RING_MASK) * 2 + lr
+        ]
+
+    @staticmethod
+    @always_inline
+    def _sample_stream_hermite(
+        ring: Int, wp: Int, total: Int, looping: Bool, pos: Float64
+    ) -> Tuple[Float32, Float32]:
+        var ipos = Int(floor(pos))
+        var frac = Float32(pos - Float64(ipos))
+        var lm1 = Self._stream_at(ring, wp, total, looping, ipos - 1, 0)
+        var l0 = Self._stream_at(ring, wp, total, looping, ipos, 0)
+        var l1 = Self._stream_at(ring, wp, total, looping, ipos + 1, 0)
+        var l2 = Self._stream_at(ring, wp, total, looping, ipos + 2, 0)
+        var rm1 = Self._stream_at(ring, wp, total, looping, ipos - 1, 1)
+        var r0 = Self._stream_at(ring, wp, total, looping, ipos, 1)
+        var r1 = Self._stream_at(ring, wp, total, looping, ipos + 1, 1)
+        var r2 = Self._stream_at(ring, wp, total, looping, ipos + 2, 1)
+        var lc1 = Float32(0.5) * (l1 - lm1)
+        var lc2 = lm1 - Float32(2.5) * l0 + Float32(2.0) * l1 - Float32(0.5) * l2
+        var lc3 = Float32(0.5) * (l2 - lm1) + Float32(1.5) * (l0 - l1)
+        var rc1 = Float32(0.5) * (r1 - rm1)
+        var rc2 = rm1 - Float32(2.5) * r0 + Float32(2.0) * r1 - Float32(0.5) * r2
+        var rc3 = Float32(0.5) * (r2 - rm1) + Float32(1.5) * (r0 - r1)
+        return (
+            ((lc3 * frac + lc2) * frac + lc1) * frac + l0,
+            ((rc3 * frac + rc2) * frac + rc1) * frac + r0,
+        )
+
+    def _compute_bus_pause(mut self):
+        """Resolves hierarchical bus pause + global (pause-menu) pause with per-bus exemption."""
+        var n = len(self.buses)
+        if len(self.bus_pause_eff) < n:
+            self.bus_pause_eff.resize(n, False)
+        for b in range(n):
+            var paused = False
+            var exempt = False
+            var cur = b
+            var guard = 0
+            while cur >= 0 and cur < n and guard < 32:
+                if self.buses[cur].paused:
+                    paused = True
+                if self.buses[cur].pause_exempt:
+                    exempt = True
+                cur = self.buses[cur].parent_bus
+                guard += 1
+            self.bus_pause_eff[b] = paused or (self.global_paused and not exempt)
+
+    @always_inline
+    def _emitter_paused(self, s: Int) -> Bool:
+        var b = self.emitters[s].bus_id
+        var bp = False
+        if b >= 0 and b < len(self.buses) and b < len(self.bus_pause_eff):
+            bp = self.bus_pause_eff[b]
+        return self.emitters[s].paused or bp
+
+    @always_inline
+    def _emitter_frozen(self, s: Int) -> Bool:
+        return (
+            self._emitter_paused(s)
+            and not self.emitters[s].stopping
+            and self.emitters[s].env_gain <= Float32(0.0)
+        )
+
+    def _emitter_atten(self, s: Int) -> Float32:
+        """Preset attenuation (distance curve x cone) or `-1` when the emitter uses the default curve."""
+        var pid = self.emitters[s].atten_id
+        if pid < 0 or pid >= len(self.rt_atten):
+            return -1.0
+        return self.rt_atten[pid].evaluate(
+            self.emitters[s].pos, self.emitters[s].cone_dir, self.listener_pos
+        )
+
+    def _release_dead_streams(mut self):
+        """Marks stream channels whose owning emitter stopped/was replaced as RELEASING."""
+        var ctrl = self.stream_ctrl_addr
+        if ctrl == 0:
+            return
+        for c in range(STREAM_MAX_CHANNELS):
+            if stream_load(ctrl, c, _SC_STATE) != STREAM_STATE_ACTIVE:
+                continue
+            var os = Int(stream_load(ctrl, c, _SC_OWNER_SLOT))
+            var og = UInt32(stream_load(ctrl, c, _SC_OWNER_GEN))
+            var keep = (
+                os >= 0
+                and os < MAX_LOGICAL_EMITTERS
+                and self.emitters[os].active
+                and self.emitters[os].generation == og
+                and self.emitters[os].stream_ch == c
+            )
+            if not keep:
+                stream_store(ctrl, c, _SC_STATE, STREAM_STATE_RELEASING)
+
     def _capture_steal_tail(mut self, v_idx: Int):
         """Renders 128 samples of an outgoing physical voice into `steal_tail_l/r` before voice steal."""
         ref pv = self.voices[v_idx]
@@ -1960,15 +2306,27 @@ struct AudioRtEngine(Movable):
 
         var pos = em.virtual_frame_pos
         var step = pv.cur_step
-        var gl = pv.cur_gain_l
-        var gr = pv.cur_gain_r
+        var gl = pv.cur_gain_l * em.env_gain
+        var gr = pv.cur_gain_r * em.env_gain
         var dl = pv.cur_delay_l
         var dr = pv.cur_delay_r
+        var s_ctrl = self.stream_ctrl_addr
+        var s_ch = em.stream_ch
+        var s_ring = 0
+        var s_wp = 0
+        var s_total = asset.total_frames
+        if s_ch >= 0 and s_ctrl != 0:
+            s_ring = Int(stream_load(s_ctrl, s_ch, _SC_RING))
+            s_wp = Int(stream_load(s_ctrl, s_ch, _SC_WRITE))
 
         for i in range(STEAL_XFADE_SAMPLES):
             var raw_l: Float32
             var raw_r: Float32
-            if (
+            if asset.kind == ASSET_KIND_STREAM:
+                var sr2 = Self._sample_stream_hermite(s_ring, s_wp, s_total, em.looping, pos)
+                raw_l = sr2[0]
+                raw_r = sr2[1]
+            elif (
                 asset.kind == ASSET_KIND_QOA
                 and asset.qoa_index >= 0
                 and asset.qoa_index < len(self.rt_qoa)
@@ -2026,6 +2384,7 @@ struct AudioRtEngine(Movable):
                 self.voices[v].active = False
                 self.voices[v].emitter_slot = -1
 
+        self._compute_bus_pause()
         var top_slots = Array[Int, MAX_PHYSICAL_VOICES](fill=-1)
         var top_scores = Array[Float32, MAX_PHYSICAL_VOICES](fill=-1.0)
         var top_count = 0
@@ -2048,15 +2407,28 @@ struct AudioRtEngine(Movable):
             ].virtual_frame_pos >= Float64(self.rt_clips[aid].total_frames):
                 self.emitters[s].active = False
                 continue
+            if self.rt_clips[aid].kind == ASSET_KIND_STREAM and self.emitters[s].stream_ch < 0:
+                # Streamed asset without a stream channel (pool exhausted): nothing to play.
+                self.emitters[s].active = False
+                continue
 
             active_log += 1
-            var score = self.emitters[s].volume * Float32(
+            if self._emitter_frozen(s):
+                # Fully faded-out paused emitter: keeps its position, holds no physical voice.
+                self.emitters[s].audibility_score = 0.0
+                continue
+            var score = self.emitters[s].volume * self.emitters[s].rtpc_gain * Float32(
                 max(1, self.emitters[s].priority)
             )
             if self.emitters[s].spatial:
                 var d = (self.emitters[s].pos - self.listener_pos).length()
-                var rd = max(Float32(0.5), self.emitters[s].ref_dist)
-                var att = rd / (rd + max(Float32(0.0), d - rd))
+                var preset_att = self._emitter_atten(s)
+                var att: Float32
+                if preset_att >= Float32(0.0):
+                    att = preset_att
+                else:
+                    var rd = max(Float32(0.5), self.emitters[s].ref_dist)
+                    att = rd / (rd + max(Float32(0.0), d - rd))
                 score *= att * self.emitters[s].occlusion_gain
                 if d >= self.emitters[s].max_dist:
                     score = 0.0
@@ -2139,14 +2511,33 @@ struct AudioRtEngine(Movable):
                 or self.emitters[s].assigned_voice >= 0
             ):
                 continue
+            if self._emitter_frozen(s):
+                continue
+            if self.emitters[s].stopping:
+                self.emitters[s].env_gain -= self.emitters[s].stop_rate * Float32(frames)
+                if self.emitters[s].env_gain <= Float32(0.0):
+                    self.emitters[s].env_gain = 0.0
+                    self.emitters[s].active = False
+                    continue
+            elif self._emitter_paused(s):
+                self.emitters[s].env_gain = 0.0  # inaudible anyway: freeze immediately
+                continue
+            else:
+                self.emitters[s].env_gain = 1.0
             ref asset = self.rt_clips[self.emitters[s].asset_id]
             var step = (
-                Float64(self.emitters[s].pitch)
+                Float64(self.emitters[s].pitch * self.emitters[s].rtpc_pitch)
                 * Float64(asset.sample_rate)
                 / Float64(self.sample_rate)
             )
             self.emitters[s].virtual_frame_pos += step * Float64(frames)
-            if self.emitters[s].looping and asset.total_frames > 0:
+            var sch = self.emitters[s].stream_ch
+            if sch >= 0 and self.stream_ctrl_addr != 0:
+                # Streams keep a monotonic position (the producer maps it into the file).
+                stream_publish_read(self.stream_ctrl_addr, sch, self.emitters[s].virtual_frame_pos)
+                if not self.emitters[s].looping and self.emitters[s].virtual_frame_pos >= Float64(asset.total_frames):
+                    self.emitters[s].active = False
+            elif self.emitters[s].looping and asset.total_frames > 0:
                 self.emitters[s].virtual_frame_pos = _wrap_loop_pos(
                     self.emitters[s].virtual_frame_pos,
                     Float64(asset.total_frames),
@@ -2199,16 +2590,33 @@ struct AudioRtEngine(Movable):
                 continue
 
             var es = self.voices[v].emitter_slot
+            var preset_att = self._emitter_atten(es)
+            var em_paused = self._emitter_paused(es)
+            var s_ctrl = self.stream_ctrl_addr
             ref em = self.emitters[es]
             ref asset = self.rt_clips[em.asset_id]
             var bus_idx = max(0, min(n_buses - 1, em.bus_id))
+            var is_stream = asset.kind == ASSET_KIND_STREAM and em.stream_ch >= 0 and s_ctrl != 0
+            var s_ring = 0
+            var s_wp = 0
+            if is_stream:
+                s_ring = Int(stream_load(s_ctrl, em.stream_ch, _SC_RING))
+                s_wp = Int(stream_load(s_ctrl, em.stream_ch, _SC_WRITE))
+
+            # Click-free envelope: pause/resume ramps over PAUSE_FADE_FRAMES, stop over the fade time.
+            var env = em.env_gain
+            var env_tgt = Float32(0.0) if (em.stopping or em_paused) else Float32(1.0)
+            var env_rate = em.stop_rate if em.stopping else Float32(1.0 / Float64(PAUSE_FADE_FRAMES))
+            var lp_a = Float32(-1.0)
+            if em.user_cutoff_hz < Float32(19000.0):
+                lp_a = Float32(1.0) - exp(Float32(-2.0) * DSP_PI * em.user_cutoff_hz / self.sr_f)
 
             var tgt_gl: Float32
             var tgt_gr: Float32
             var tgt_dl = Float32(0.0)
             var tgt_dr = Float32(0.0)
             var tgt_step = (
-                Float64(em.pitch)
+                Float64(em.pitch * em.rtpc_pitch)
                 * Float64(asset.sample_rate)
                 / Float64(self.sample_rate)
             )
@@ -2228,6 +2636,7 @@ struct AudioRtEngine(Movable):
                     em.occlusion_gain,
                     em.occlusion_cutoff_hz,
                     self.sr_f,
+                    preset_att,
                 )
                 tgt_gl = hrtf.gain_l * em.volume
                 tgt_gr = hrtf.gain_r * em.volume
@@ -2248,6 +2657,8 @@ struct AudioRtEngine(Movable):
                 var pg = equal_power_gains(em.pan_2d)
                 tgt_gl = pg[0] * em.volume
                 tgt_gr = pg[1] * em.volume
+            tgt_gl *= em.rtpc_gain
+            tgt_gr *= em.rtpc_gain
 
             if not self.voices[v].initialized_params:
                 self.voices[v].cur_gain_l = tgt_gl
@@ -2278,10 +2689,20 @@ struct AudioRtEngine(Movable):
                 var out_l = Float32(0.0)
                 var out_r = Float32(0.0)
 
-                if em.looping or pos < total_f:
+                var hold = env <= Float32(0.0) and env_tgt <= Float32(0.0) and not em.stopping
+                if (em.looping or pos < total_f) and not hold:
                     var raw_l: Float32
                     var raw_r: Float32
-                    if (
+                    if is_stream:
+                        var ip = Int(floor(pos)) + 2
+                        if ip >= s_wp and (em.looping or ip < asset.total_frames):
+                            self.stream_underruns_local += 1
+                        var sr3 = Self._sample_stream_hermite(
+                            s_ring, s_wp, asset.total_frames, em.looping, pos
+                        )
+                        raw_l = sr3[0]
+                        raw_r = sr3[1]
+                    elif (
                         asset.kind == ASSET_KIND_QOA
                         and asset.qoa_index >= 0
                         and asset.qoa_index < len(self.rt_qoa)
@@ -2332,9 +2753,22 @@ struct AudioRtEngine(Movable):
                         out_l = raw_l * gl
                         out_r = raw_r * gr
 
+                    if lp_a > Float32(0.0):
+                        self.voices[v].lp_l += lp_a * (out_l - self.voices[v].lp_l)
+                        self.voices[v].lp_r += lp_a * (out_r - self.voices[v].lp_r)
+                        out_l = self.voices[v].lp_l
+                        out_r = self.voices[v].lp_r
+                    out_l *= env
+                    out_r *= env
+
                     pos += stp
-                    if em.looping and total_f > 0.0:
+                    if em.looping and total_f > 0.0 and not is_stream:
                         pos = _wrap_loop_pos(pos, total_f)
+
+                if env < env_tgt:
+                    env = min(env_tgt, env + env_rate)
+                elif env > env_tgt:
+                    env = max(env_tgt, env - env_rate)
 
                 if self.voices[v].steal_xfade_active:
                     var xp = self.voices[v].steal_xfade_pos
@@ -2365,7 +2799,13 @@ struct AudioRtEngine(Movable):
                 stp += d_stp
 
             em.virtual_frame_pos = pos
+            em.env_gain = env
+            if is_stream:
+                stream_publish_read(s_ctrl, em.stream_ch, pos)
             if not em.looping and pos >= total_f:
+                em.active = False
+                self.voices[v].active = False
+            elif em.stopping and env <= Float32(0.0):
                 em.active = False
                 self.voices[v].active = False
 
@@ -2564,51 +3004,136 @@ struct AudioRtEngine(Movable):
             out_lr[f * 2] = fl
             out_lr[f * 2 + 1] = fr
 
+        self._release_dead_streams()
         self.quantums_rendered_local += 1
         self._publish_telemetry()
+
+    def _publish_backend(self):
+        if self.telemetry_atomic == 0:
+            return
+        self._telem_ptr(_TELEM_BACKEND)[unsafe_offset=0].store(Int64(self.backend))
+        self._telem_ptr(_TELEM_RECONNECTS)[unsafe_offset=0].store(Int64(self.reconnects_local))
+        self._telem_ptr(_TELEM_DEVICE_LOST)[unsafe_offset=0].store(Int64(self.device_lost_local))
+
+    def _drop_backend(mut self):
+        """Closes the failed output; the RT loop then retries with exponential backoff."""
+        if self.backend == AUDIO_BACKEND_PULSE or self.pulse.connected():
+            self.pulse.close()
+        if self.alsa_fd >= 0:
+            alsa_close_pcm(self.alsa_fd)
+            self.alsa_fd = -1
+        self.alsa_pending_frames = 0
+        self.alsa_pending_offset = 0
+        self.backend = AUDIO_BACKEND_NONE
+        self.device_lost_local += 1
+        self.backoff_ms = RECONNECT_BACKOFF_MIN_MS
+        self.next_attempt_s = get_time() + Float64(self.backoff_ms) * 0.001
+        self._publish_backend()
+
+    def try_open_backend(mut self) -> Bool:
+        """Opens the output named by `preferred_device` (`"pulse:<sink>"`, `"alsa:<pcm node>"`,
+        or `""` = default PulseAudio/PipeWire sink, then any ALSA node when `allow_alsa_fallback`).
+        Called on the main thread before the RT thread starts, or by the RT thread itself."""
+        if self.headless_rt_mode:
+            self.backend = AUDIO_BACKEND_HEADLESS
+            self._publish_backend()
+            return True
+        var block_bytes = self.quantum_frames * 4
+        var pref = self.preferred_device
+        var alsa_only = pref.startswith("alsa:")
+        if not alsa_only:
+            var sink = String("")
+            if pref.startswith("pulse:"):
+                sink = String(pref[byte=6:])
+            self.pulse.close()
+            if self.pulse.connect(self.sample_rate, block_bytes, sink):
+                self.backend = AUDIO_BACKEND_PULSE
+                self._publish_backend()
+                return True
+            self.pulse.close()
+        if alsa_only or self.allow_alsa_fallback:
+            var out_period = self.quantum_frames
+            var out_buffer = self.quantum_frames * 4
+            var fd: Int
+            if alsa_only:
+                fd = _alsa_open_node(String(pref[byte=5:]), self.sample_rate, self.quantum_frames, out_period, out_buffer)
+            else:
+                fd = alsa_open_pcm(self.sample_rate, self.quantum_frames, out_period, out_buffer)
+            if fd >= 0:
+                self.alsa_fd = fd
+                self.alsa_period_frames = out_period
+                self.alsa_pending_frames = 0
+                self.alsa_pending_offset = 0
+                self.backend = AUDIO_BACKEND_ALSA
+                self._publish_backend()
+                return True
+        self.backend = AUDIO_BACKEND_NONE
+        self._publish_backend()
+        return False
+
+    def _quantum_to_i16(mut self, float_lr: List[Float32], qf: Int):
+        for i in range(qf * 2):
+            var s = max(Float32(-1.0), min(Float32(1.0), float_lr[i]))
+            self.rt_pcm_i16[i] = Int16(Int(s * Float32(32767.0)))
 
     def _rt_thread_loop(mut self):
         var qf = self.quantum_frames
         var float_lr = List[Float32](length=MAX_QUANTUM_FRAMES * 2, fill=0.0)
         if len(self.rt_pcm_i16) != qf * 2:
             self.rt_pcm_i16.resize(qf * 2, 0)
+        var quantum_ns = Int(Float64(qf) * 1.0e9 / Float64(self.sample_rate))
         while self._running_ptr()[unsafe_offset=0].load() != 0:
-            if self.headless_rt_mode:
+            if self._telem_ptr(_TELEM_FAULT_INJECT)[unsafe_offset=0].load() != 0:
+                self._telem_ptr(_TELEM_FAULT_INJECT)[unsafe_offset=0].store(0)
+                if self.backend != AUDIO_BACKEND_NONE:
+                    self._drop_backend()
+
+            if self.backend == AUDIO_BACKEND_NONE:
+                if get_time() >= self.next_attempt_s:
+                    if self.try_open_backend():
+                        self.reconnects_local += 1
+                        self.backoff_ms = RECONNECT_BACKOFF_MIN_MS
+                        self._publish_backend()
+                        continue
+                    self.backoff_ms = next_reconnect_backoff_ms(self.backoff_ms)
+                    self.next_attempt_s = get_time() + Float64(self.backoff_ms) * 0.001
+                # Output lost: keep the mixer clock (voices, fades, streams) running in real time.
                 self.render_quantum(float_lr, qf)
-                var ts_h = Array[Int64, 2](fill=0)
-                ts_h[1] = 1_000_000  # 1.0 ms deterministic headless RT cadence
-                _ = external_call["nanosleep", Int32](
-                    Pointer(to=ts_h), Int(0)
-                )
-                _ = ts_h[1]
+                _rt_sleep_ns(quantum_ns)
                 continue
 
-            if self.pulse.connected():
+            if self.backend == AUDIO_BACKEND_HEADLESS:
+                self.render_quantum(float_lr, qf)
+                _rt_sleep_ns(1_000_000)  # 1.0 ms deterministic headless RT cadence
+                continue
+
+            if self.backend == AUDIO_BACKEND_PULSE:
                 self.pulse.pump()
                 if not self.pulse.connected():
-                    break
+                    self._drop_backend()
+                    continue
                 if self.pulse.has_pending_write():
                     if not self.pulse.flush_pending():
-                        break
+                        self._drop_backend()
+                        continue
                 var frame_bytes = qf * 4
                 if not self.pulse.has_pending_write() and self.pulse.requested_bytes >= frame_bytes:
                     self.render_quantum(float_lr, qf)
-                    for i in range(qf * 2):
-                        var s = max(
-                            Float32(-1.0), min(Float32(1.0), float_lr[i])
-                        )
-                        self.rt_pcm_i16[i] = Int16(Int(s * Float32(32767.0)))
+                    self._quantum_to_i16(float_lr, qf)
                     _ = self.pulse.write_samples(self.rt_pcm_i16)
+                    if not self.pulse.connected():
+                        self._drop_backend()
                 else:
                     _ = self.pulse.wait_io(10)
-            elif self.alsa_fd >= 0:
+                    if not self.pulse.connected():
+                        self._drop_backend()
+            elif self.backend == AUDIO_BACKEND_ALSA:
+                if self.alsa_fd < 0:
+                    self._drop_backend()
+                    continue
                 if self.alsa_pending_frames <= 0:
                     self.render_quantum(float_lr, qf)
-                    for i in range(qf * 2):
-                        var s = max(
-                            Float32(-1.0), min(Float32(1.0), float_lr[i])
-                        )
-                        self.rt_pcm_i16[i] = Int16(Int(s * Float32(32767.0)))
+                    self._quantum_to_i16(float_lr, qf)
                     self.alsa_pending_frames = qf
                     self.alsa_pending_offset = 0
                 var written = alsa_write_interleaved(
@@ -2632,11 +3157,62 @@ struct AudioRtEngine(Movable):
                     self.alsa_poll_buf[7] = 0
                     _ = external_call["poll", Int32](self.alsa_poll_buf.unsafe_ptr(), UInt64(1), Int32(10))
                 else:
-                    alsa_close_pcm(self.alsa_fd)
-                    self.alsa_fd = -1
-                    break
+                    self._drop_backend()
             else:
-                break
+                self._drop_backend()
+
+
+def _rt_sleep_ns(ns: Int):
+    var ts = Array[Int64, 2](fill=0)
+    ts[0] = Int64(ns // 1_000_000_000)
+    ts[1] = Int64(ns % 1_000_000_000)
+    _ = external_call["nanosleep", Int32](Pointer(to=ts), Int(0))
+    _ = ts[1]
+
+
+def _alsa_open_node(path: String, rate: Int, preferred_period: Int, mut out_period: Int, mut out_buffer: Int) -> Int:
+    """Opens one specific ALSA playback node (e.g. `/dev/snd/pcmC1D0p`), or `-1`."""
+    if not path.startswith("/dev/snd/pcm"):
+        return -1
+    var owned = path
+    var fd = Int(external_call["openat", Int32](Int32(-100), owned.as_c_string_span(), Int32(1 | 2048 | 0x80000), Int32(0)))
+    if fd < 0:
+        return -1
+    if _alsa_configure_fd(fd, rate, preferred_period, out_period, out_buffer):
+        return fd
+    close_fd(fd)
+    return -1
+
+
+struct AudioDeviceInfo(Copyable, Movable):
+    """One selectable output device. `id` is passed to `AudioServer.select_output_device`."""
+    var id: String
+    var name: String
+    var description: String
+    var backend: String
+
+    def __init__(out self, id: String, name: String, description: String, backend: String):
+        self.id = id
+        self.name = name
+        self.description = description
+        self.backend = backend
+
+
+def enumerate_output_devices() -> List[AudioDeviceInfo]:
+    """PulseAudio/PipeWire sinks (temporary connection) plus raw ALSA playback nodes."""
+    var out = List[AudioDeviceInfo]()
+    var probe = PulseClient()
+    var sinks = probe.list_sinks()
+    for i in range(len(sinks)):
+        out.append(AudioDeviceInfo("pulse:" + sinks[i].name, sinks[i].name, sinks[i].description, "pulse"))
+    probe.close()
+    var names = list_directory("/dev/snd")
+    for i in range(len(names)):
+        var n = names[i]
+        if n.startswith("pcmC") and n.endswith("p"):
+            var node = "/dev/snd/" + n
+            out.append(AudioDeviceInfo("alsa:" + node, n, "ALSA playback " + n, "alsa"))
+    return out^
 
 
 struct AudioServer(Resource, Movable):
@@ -2658,7 +3234,17 @@ struct AudioServer(Resource, Movable):
     var caller_next_asset_id: Int
     var caller_next_bus_id: Int
     var caller_next_stem_id: Int
+    # Registered clips remain resident for the lifetime of this server.
+    var clip_memory: MemCharge
     var path_cache: Dict[String, Int]
+    # Disk streaming (heap-pinned pool shared with the streamer pthread)
+    var stream_pool_addr: Int
+    var stream_thread_handle: UInt64
+    var stream_thread_running: Bool
+    var stream_assets: Dict[Int, StreamSourceInfo]
+    var stream_archive_fds: Dict[String, Int]
+    var stream_channel_assets: List[Int]
+    var caller_next_atten_id: Int
 
     def __init__(
         out self,
@@ -2684,7 +3270,16 @@ struct AudioServer(Resource, Movable):
         self.caller_next_asset_id = 0
         self.caller_next_bus_id = DEFAULT_BUS_COUNT
         self.caller_next_stem_id = 0
+        self.clip_memory = MemCharge(MEM_AUDIO, 0, 0)
         self.path_cache = Dict[String, Int]()
+        self.stream_pool_addr = Int(_heap_box_alloc[AudioStreamPool](AudioStreamPool()))
+        self.stream_thread_handle = 0
+        self.stream_thread_running = False
+        self.stream_assets = Dict[Int, StreamSourceInfo]()
+        self.stream_archive_fds = Dict[String, Int]()
+        self.stream_channel_assets = List[Int](length=STREAM_MAX_CHANNELS, fill=-1)
+        self.caller_next_atten_id = 0
+        self._rt_core()[].stream_ctrl_addr = self._stream_pool()[].ctrl_addr
 
     def __moveinit__(out self, deinit existing: Self):
         """Relocates ONLY the 8-byte `rt_core_addr` pointer and caller counters;
@@ -2700,12 +3295,26 @@ struct AudioServer(Resource, Movable):
         self.caller_next_asset_id = existing.caller_next_asset_id
         self.caller_next_bus_id = existing.caller_next_bus_id
         self.caller_next_stem_id = existing.caller_next_stem_id
+        self.clip_memory = existing.clip_memory^
         self.path_cache = existing.path_cache^
+        self.stream_pool_addr = existing.stream_pool_addr
+        self.stream_thread_handle = existing.stream_thread_handle
+        self.stream_thread_running = existing.stream_thread_running
+        self.stream_assets = existing.stream_assets^
+        self.stream_archive_fds = existing.stream_archive_fds^
+        self.stream_channel_assets = existing.stream_channel_assets^
+        self.caller_next_atten_id = existing.caller_next_atten_id
 
     @always_inline
     def _rt_core(self) -> Pointer[AudioRtEngine, MutAnyOrigin]:
         return Pointer[AudioRtEngine, MutAnyOrigin](
             unsafe_from_address=self.rt_core_addr
+        )
+
+    @always_inline
+    def _stream_pool(self) -> Pointer[AudioStreamPool, MutAnyOrigin]:
+        return Pointer[AudioStreamPool, MutAnyOrigin](
+            unsafe_from_address=self.stream_pool_addr
         )
 
     def __deinit__(deinit self):
@@ -2716,6 +3325,12 @@ struct AudioServer(Resource, Movable):
             var p = self._rt_core()
             p[].destroy_engine_allocations()
             _heap_box_free[AudioRtEngine](p)
+        if self.stream_pool_addr != 0:
+            var sp = self._stream_pool()
+            sp[].destroy()
+            _heap_box_free[AudioStreamPool](sp)
+        for fd in self.stream_archive_fds.values():
+            close_fd(fd)
 
     @always_inline
     def rt_engine_address(self) -> Int:
@@ -2833,6 +3448,8 @@ struct AudioServer(Resource, Movable):
         slot.sample_rate = max(1, sample_rate)
         slot.total_frames = len(pcm) // max(1, channels)
         slot.pcm = pcm.copy()
+        if len(slot.pcm) > 0:
+            self.clip_memory.add(len(slot.pcm) * 2, 1)
 
         var boxed = _heap_box_alloc[AudioAssetSlot](slot^)
         var cmd = AudioCmd()
@@ -2881,6 +3498,7 @@ struct AudioServer(Resource, Movable):
             slot.channels = qa.channels
             slot.sample_rate = qa.sample_rate
             slot.total_frames = qa.samples_per_channel
+            self.clip_memory.add(len(qa.bytes), 1)
             slot.qoa = qa^
 
         var boxed = _heap_box_alloc[AudioAssetSlot](slot^)
@@ -2894,13 +3512,22 @@ struct AudioServer(Resource, Movable):
         return aid
 
     def load_audio_bytes_cached(mut self, var raw: List[UInt8], path: String = "") -> Int:
-        """Decodes and caches raw `.wav` or `.qoa` audio bytes, returning `-1` on failure."""
+        """Decodes and caches raw `.wav`, `.qoa` or Ogg Vorbis (`.ogg`/`.oga`) audio bytes,
+        returning `-1` on failure. Vorbis is decoded once into 16-bit PCM."""
         if len(raw) == 0:
             return -1
         if path.byte_length() > 0:
             var cached = self.path_cache.get(path)
             if cached:
                 return cached.value()
+        if is_ogg_vorbis(raw):
+            var clip = decode_ogg_vorbis(raw)
+            if not clip.valid or clip.samples_per_channel <= 0:
+                return -1
+            var vid = self.register_pcm16_asset(clip.samples, clip.channels, clip.sample_rate)
+            if path.byte_length() > 0:
+                self.path_cache[path] = vid
+            return vid
         var is_qoa = (
             path.endswith(".qoa")
             or path.endswith(".QOA")
@@ -2916,10 +3543,69 @@ struct AudioServer(Resource, Movable):
             return -1
         return self.register_wav_asset(wav, path)
 
-    def load_audio_cached(mut self, path: String) -> Int:
-        """Loads and caches a `.wav` or `.qoa` audio asset by file path, returning `-1` on failure."""
+    def register_stream_asset(mut self, path: String) -> Int:
+        """Registers a 16-bit PCM `.wav` or `.qoa` file for bounded-memory disk streaming:
+        only the header is parsed now; samples are read in chunks while the sound plays.
+        Returns `-1` if the file is missing or not streamable."""
         if path.byte_length() == 0:
             return -1
+        var key = "stream:" + path
+        var cached = self.path_cache.get(key)
+        if cached:
+            return cached.value()
+        return self.register_stream_source(probe_stream_source(path))
+
+    def register_stream_source(mut self, var info: StreamSourceInfo) -> Int:
+        """Keep one descriptor per mounted pack generation so replacement or unmount cannot retarget playing clips."""
+        var key = "stream:" + info.path
+        if info.archive_fd >= 0:
+            key = "pack-stream:" + info.archive_key + ":" + String(info.data_offset)
+        var cached = self.path_cache.get(key)
+        if cached:
+            return cached.value()
+        if not info.valid or info.total_frames <= 0:
+            return -1
+        if info.archive_fd >= 0:
+            var retained = self.stream_archive_fds.get(info.archive_key)
+            if retained:
+                info.archive_fd = retained.value()
+            else:
+                var fd = Int(external_call["fcntl", Int32](Int32(info.archive_fd), Int32(1030), Int32(0)))
+                if fd < 0:
+                    return -1
+                info.archive_fd = fd
+                self.stream_archive_fds[info.archive_key] = fd
+        var aid = self.caller_next_asset_id
+        self.caller_next_asset_id += 1
+        var slot = AudioAssetSlot()
+        slot.valid = True
+        slot.kind = ASSET_KIND_STREAM
+        slot.channels = min(2, info.channels)
+        slot.sample_rate = info.sample_rate
+        slot.total_frames = info.total_frames
+        var boxed = _heap_box_alloc[AudioAssetSlot](slot^)
+        var cmd = AudioCmd()
+        cmd.kind = CMD_INSTALL_CLIP
+        cmd.asset_id = Int32(aid)
+        _pack_ptr_into_cmd(cmd, Int(boxed))
+        self._enqueue_guaranteed(cmd)
+        self.stream_assets[aid] = info^
+        self.path_cache[key] = aid
+        return aid
+
+    def is_stream_asset(self, asset_id: Int) -> Bool:
+        return asset_id in self.stream_assets
+
+    def load_audio_cached(mut self, path: String, stream: Bool = False) -> Int:
+        """Loads and caches a `.wav`, `.qoa` or `.ogg` audio asset by file path, returning `-1` on failure.
+        `stream=True` streams it from disk instead of decoding it into memory (long music / VO)."""
+        if path.byte_length() == 0:
+            return -1
+        if stream:
+            var sid = self.register_stream_asset(path)
+            if sid >= 0 or not (path.endswith(".ogg") or path.endswith(".oga")):
+                return sid
+            # Ogg Vorbis is not disk-streamable: fall back to a one-time in-memory decode.
         var cached = self.path_cache.get(path)
         if cached:
             return cached.value()
@@ -3099,6 +3785,24 @@ struct AudioServer(Resource, Movable):
         self.caller_next_gen = next_g
         return SoundHandle(Int32(idx), gen)
 
+    def _attach_stream(mut self, mut cmd: AudioCmd, asset_id: Int, h: SoundHandle, looping: Bool) -> Int:
+        """Claims + prefills a stream channel for a streamed asset (main thread). Returns the
+        channel or -1; the RT thread drops a streamed PLAY that carries no channel."""
+        var info_opt = self.stream_assets.get(asset_id)
+        if not info_opt or self.stream_pool_addr == 0:
+            return -1
+        var ch = self._stream_pool()[].claim(info_opt.value(), looping, Int(h.slot), h.generation)
+        if ch >= 0:
+            self.stream_channel_assets[ch] = asset_id
+            cmd.flags |= AFLAG_STREAM | (UInt32(ch) << 8)
+        return ch
+
+    def _push_play(mut self, cmd: AudioCmd, stream_ch: Int) -> Bool:
+        var ok = self._rt_core()[].cmd_ring.push(cmd)
+        if not ok and stream_ch >= 0:
+            self._stream_pool()[].release_from_main(stream_ch)
+        return ok
+
     def play_3d(
         mut self,
         asset_id: Int,
@@ -3111,6 +3815,8 @@ struct AudioServer(Resource, Movable):
         priority: Int = 1,
         ref_dist: Float32 = 15.0,
         max_dist: Float32 = 350.0,
+        attenuation_id: Int = -1,
+        cone_dir: Vec3 = Vec3(),
     ) -> SoundHandle:
         var h = self.allocate_handle()
         var cmd = AudioCmd()
@@ -3130,7 +3836,10 @@ struct AudioServer(Resource, Movable):
         cmd.p7 = pitch
         cmd.p8 = ref_dist
         cmd.p9 = max_dist + Float32(priority) * Float32(0.001)
-        _ = self._rt_core()[].cmd_ring.push(cmd)
+        var sch = self._attach_stream(cmd, asset_id, h, looping)
+        _ = self._push_play(cmd, sch)
+        if attenuation_id >= 0:
+            _ = self.set_emitter_attenuation(h, attenuation_id, cone_dir)
         return h
 
     def play_2d(
@@ -3156,24 +3865,177 @@ struct AudioServer(Resource, Movable):
         cmd.p0 = pan
         cmd.p6 = volume
         cmd.p7 = pitch
-        _ = self._rt_core()[].cmd_ring.push(cmd)
+        var sch = self._attach_stream(cmd, asset_id, h, looping)
+        _ = self._push_play(cmd, sch)
         return h
 
-    def stop_sound(self, handle: SoundHandle) -> Bool:
+    def seek_stream(mut self, handle: SoundHandle, frame: Int) -> Bool:
+        """Prefill a replacement ring at an absolute source frame, switching on the next mix quantum."""
+        if not handle.is_valid() or self.stream_pool_addr == 0:
+            return False
+        ref pool = self._stream_pool()[]
+        for old in range(STREAM_MAX_CHANNELS):
+            var state = pool.state(old)
+            if state != STREAM_STATE_ARMED and state != STREAM_STATE_ACTIVE:
+                continue
+            if (
+                stream_load(pool.ctrl_addr, old, _SC_OWNER_SLOT) != Int64(handle.slot)
+                or stream_load(pool.ctrl_addr, old, _SC_OWNER_GEN) != Int64(handle.generation)
+            ):
+                continue
+            var aid = self.stream_channel_assets[old]
+            var info = self.stream_assets.get(aid)
+            if not info:
+                return False
+            var looping = stream_load(pool.ctrl_addr, old, _SC_LOOP) != 0
+            var ch = pool.claim(info.value(), looping, Int(handle.slot), handle.generation, frame)
+            if ch < 0:
+                return False
+            self.stream_channel_assets[ch] = aid
+            var cmd = AudioCmd()
+            cmd.kind = ACMD_SEEK_STREAM
+            cmd.slot = handle.slot
+            cmd.generation = handle.generation
+            cmd.asset_id = Int32(ch)
+            cmd.flags = UInt32(frame)
+            return self._push_play(cmd, ch)
+        return False
+
+    def is_playing(self, handle: SoundHandle) -> Bool:
+        """True while the voice exists (playing, paused or fading out). Lock-free snapshot read
+        of mixer state: exact offline, at most one quantum stale while the RT thread runs."""
+        if not handle.is_valid() or self.rt_core_addr == 0:
+            return False
+        var s = Int(handle.slot)
+        if s < 0 or s >= MAX_LOGICAL_EMITTERS:
+            return False
+        ref em = self._rt_core()[].emitters[s]
+        return em.active and em.generation == handle.generation
+
+    def stop_sound(self, handle: SoundHandle, fade_seconds: Float32 = 0.0) -> Bool:
+        """Stops a sound; `fade_seconds > 0` fades it out (linear) before releasing the voice."""
         if not handle.is_valid() or self.rt_core_addr == 0:
             return False
         var cmd = AudioCmd()
         cmd.kind = ACMD_STOP
         cmd.slot = handle.slot
         cmd.generation = handle.generation
+        cmd.p0 = max(Float32(0.0), fade_seconds) if isfinite(fade_seconds) else Float32(0.0)
         return self._rt_core()[].cmd_ring.push(cmd)
 
-    def stop_all(mut self):
-        """Stops all active logical emitters and physical voices immediately (`active_logical_count() == 0`)."""
+    def _set_paused(self, handle: SoundHandle, paused: Bool) -> Bool:
+        if not handle.is_valid() or self.rt_core_addr == 0:
+            return False
+        var cmd = AudioCmd()
+        cmd.kind = ACMD_PAUSE
+        cmd.slot = handle.slot
+        cmd.generation = handle.generation
+        cmd.p0 = Float32(1.0) if paused else Float32(0.0)
+        return self._rt_core()[].cmd_ring.push(cmd)
+
+    def pause_sound(self, handle: SoundHandle) -> Bool:
+        """Pauses one voice (click-free ~5 ms fade); its position is kept for `resume_sound`."""
+        return self._set_paused(handle, True)
+
+    def resume_sound(self, handle: SoundHandle) -> Bool:
+        return self._set_paused(handle, False)
+
+    def _set_global_pause(self, paused: Bool) -> Bool:
+        if self.rt_core_addr == 0:
+            return False
+        var cmd = AudioCmd()
+        cmd.kind = ACMD_GLOBAL_PAUSE
+        cmd.p0 = Float32(1.0) if paused else Float32(0.0)
+        return self._rt_core()[].cmd_ring.push(cmd)
+
+    def pause_all(self) -> Bool:
+        """Global (pause-menu) pause of every bus except those marked `set_bus_pause_exempt`."""
+        return self._set_global_pause(True)
+
+    def resume_all(self) -> Bool:
+        return self._set_global_pause(False)
+
+    def set_bus_paused(self, bus_id: Int, paused: Bool) -> Bool:
+        """Pauses/resumes every voice routed into `bus_id` or any of its child buses."""
+        if self.rt_core_addr == 0:
+            return False
+        var cmd = AudioCmd()
+        cmd.kind = CMD_CONFIG_BUS
+        cmd.flags = _BUS_CFG_PAUSE
+        cmd.bus_id = Int32(bus_id)
+        cmd.p0 = Float32(1.0) if paused else Float32(0.0)
+        cmd.p1 = -1.0
+        return self._rt_core()[].cmd_ring.push(cmd)
+
+    def set_bus_pause_exempt(self, bus_id: Int, exempt: Bool) -> Bool:
+        """Marks a bus (and its children) as still playing during `pause_all` (e.g. UI / menu music)."""
+        if self.rt_core_addr == 0:
+            return False
+        var cmd = AudioCmd()
+        cmd.kind = CMD_CONFIG_BUS
+        cmd.flags = _BUS_CFG_PAUSE
+        cmd.bus_id = Int32(bus_id)
+        cmd.p0 = -1.0
+        cmd.p1 = Float32(1.0) if exempt else Float32(0.0)
+        return self._rt_core()[].cmd_ring.push(cmd)
+
+    def set_voice_params(
+        self,
+        handle: SoundHandle,
+        gain: Float32 = -1.0,
+        pitch: Float32 = -1.0,
+        lowpass_hz: Float32 = -1.0,
+    ) -> Bool:
+        """Game-parameter (RTPC) modifiers multiplied onto a voice: `gain` (linear), `pitch`
+        (ratio) and a one-pole low-pass cutoff. Negative values leave a field unchanged."""
+        if not handle.is_valid() or self.rt_core_addr == 0:
+            return False
+        var cmd = AudioCmd()
+        cmd.kind = ACMD_SET_VOICE_PARAMS
+        cmd.slot = handle.slot
+        cmd.generation = handle.generation
+        cmd.p0 = gain
+        cmd.p1 = pitch
+        cmd.p2 = lowpass_hz
+        return self._rt_core()[].cmd_ring.push(cmd)
+
+    def register_attenuation(mut self, preset: AttenuationPreset) -> Int:
+        """Installs a per-sound `AttenuationPreset` on the mixer and returns its id."""
+        var pid = self.caller_next_atten_id
+        self.caller_next_atten_id += 1
+        var boxed = _heap_box_alloc[AttenuationPreset](preset.copy())
+        var cmd = AudioCmd()
+        cmd.kind = CMD_INSTALL_ATTEN
+        cmd.asset_id = Int32(pid)
+        _pack_ptr_into_cmd(cmd, Int(boxed))
+        self._enqueue_guaranteed(cmd)
+        return pid
+
+    def set_emitter_attenuation(self, handle: SoundHandle, preset_id: Int, cone_dir: Vec3 = Vec3()) -> Bool:
+        """Binds an attenuation preset (`-1` = default inverse curve) and cone axis to a voice."""
+        if not handle.is_valid() or self.rt_core_addr == 0:
+            return False
+        var cmd = AudioCmd()
+        cmd.kind = ACMD_SET_EMITTER_ATTEN
+        cmd.slot = handle.slot
+        cmd.generation = handle.generation
+        cmd.asset_id = Int32(preset_id)
+        cmd.p0 = cone_dir.x
+        cmd.p1 = cone_dir.y
+        cmd.p2 = cone_dir.z
+        return self._rt_core()[].cmd_ring.push(cmd)
+
+    def stop_all(mut self, fade_seconds: Float32 = 0.0):
+        """Stops all active logical emitters and physical voices immediately (`active_logical_count() == 0`),
+        or fades them all out over `fade_seconds`."""
         if self.rt_core_addr == 0:
             return
         var cmd = AudioCmd()
         cmd.kind = ACMD_STOP_ALL
+        if fade_seconds > Float32(1.0e-4) and isfinite(fade_seconds):
+            cmd.p0 = fade_seconds
+            self._enqueue_guaranteed(cmd)
+            return
         self._enqueue_guaranteed(cmd)
         if self.rt_running:
             if self._rt_core()[].headless_rt_mode:
@@ -3191,6 +4053,58 @@ struct AudioServer(Resource, Movable):
         self._rt_core()[].active_physical_local = 0
         self._rt_core()[]._telem_ptr(_TELEM_LOGICAL)[unsafe_offset=0].store(0)
         self._rt_core()[]._telem_ptr(_TELEM_PHYSICAL)[unsafe_offset=0].store(0)
+
+    # ---- Disk streaming service & telemetry ----
+
+    def service_streams(mut self) -> Bool:
+        """Refills stream rings on the calling thread. Only does work when the background
+        streamer pthread is not running (offline / headless-without-RT renders)."""
+        if self.stream_pool_addr == 0 or self.stream_thread_running:
+            return False
+        var did = False
+        for _ in range(4):
+            if not self._stream_pool()[].service_all():
+                break
+            did = True
+        return did
+
+    def active_stream_count(self) -> Int:
+        if self.stream_pool_addr == 0:
+            return 0
+        return self._stream_pool()[].active_count()
+
+    def stream_underruns(self) -> Int:
+        if self.rt_core_addr == 0:
+            return 0
+        return Int(self._rt_core()[]._telem_ptr(_TELEM_STREAM_UNDERRUNS)[unsafe_offset=0].load())
+
+    def _start_stream_thread(mut self) -> Bool:
+        if self.stream_thread_running or self.stream_pool_addr == 0:
+            return self.stream_thread_running
+        var run_addr = self._stream_pool()[].running_addr
+        Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=run_addr)[unsafe_offset=0].store(1)
+        var tid = UInt64(0)
+        var rc = external_call["pthread_create", Int32](
+            Pointer(to=tid),
+            Int(0),
+            _audio_stream_thread_entry,
+            self.stream_pool_addr,
+        )
+        if rc != 0:
+            Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=run_addr)[unsafe_offset=0].store(0)
+            return False
+        self.stream_thread_handle = tid
+        self.stream_thread_running = True
+        return True
+
+    def _stop_stream_thread(mut self):
+        if not self.stream_thread_running or self.stream_pool_addr == 0:
+            return
+        var run_addr = self._stream_pool()[].running_addr
+        Pointer[Atomic[Int64], MutAnyOrigin](unsafe_from_address=run_addr)[unsafe_offset=0].store(0)
+        _ = external_call["pthread_join", Int32](self.stream_thread_handle, Int(0))
+        self.stream_thread_handle = 0
+        self.stream_thread_running = False
 
     def update_emitter(
         self,
@@ -3272,47 +4186,88 @@ struct AudioServer(Resource, Movable):
     def render_offline_quantum(
         mut self, mut out_lr: List[Float32], frames: Int = 256
     ):
-        """Renders `frames` stereo frames deterministically when no RT thread is active."""
+        """Renders `frames` stereo frames deterministically when no RT thread is active
+        (also services disk streams synchronously, so offline renders are deterministic)."""
         if self.rt_core_addr == 0 or self.rt_running:
             return
         self._rt_core()[].render_quantum(out_lr, frames)
         _ = self.drain_retired()
+        _ = self.service_streams()
+
+    # ---- Output devices, reconnect & robustness ----
+
+    def audio_backend_name(self) -> String:
+        """Returns the active RT output backend: `'headless'`, `'pulse'`, `'alsa'`,
+        `'reconnecting'` (running, output lost, retrying with backoff) or `'none'`."""
+        if self.rt_core_addr == 0 or not self.rt_running:
+            return "none"
+        var b = Int(self._rt_core()[]._telem_ptr(_TELEM_BACKEND)[unsafe_offset=0].load())
+        if b == AUDIO_BACKEND_HEADLESS:
+            return "headless"
+        if b == AUDIO_BACKEND_PULSE:
+            return "pulse"
+        if b == AUDIO_BACKEND_ALSA:
+            return "alsa"
+        return "reconnecting"
+
+    def reconnect_count(self) -> Int:
+        """Successful output re-opens after a device loss."""
+        if self.rt_core_addr == 0:
+            return 0
+        return Int(self._rt_core()[]._telem_ptr(_TELEM_RECONNECTS)[unsafe_offset=0].load())
+
+    def device_lost_count(self) -> Int:
+        if self.rt_core_addr == 0:
+            return 0
+        return Int(self._rt_core()[]._telem_ptr(_TELEM_DEVICE_LOST)[unsafe_offset=0].load())
+
+    def simulate_device_loss(self) -> Bool:
+        """Test hook: makes the RT thread treat its output as disconnected (exercises the
+        reconnect-with-backoff path, also in headless mode)."""
+        if self.rt_core_addr == 0 or not self.rt_running:
+            return False
+        self._rt_core()[]._telem_ptr(_TELEM_FAULT_INJECT)[unsafe_offset=0].store(1)
+        return True
+
+    def list_output_devices(self) -> List[AudioDeviceInfo]:
+        """PulseAudio/PipeWire sinks (`pulse:<name>`) and ALSA nodes (`alsa:/dev/snd/pcmC*D*p`)."""
+        return enumerate_output_devices()
+
+    def output_device(self) -> String:
+        if self.rt_core_addr == 0:
+            return ""
+        return self._rt_core()[].preferred_device
+
+    def set_alsa_fallback(mut self, enabled: Bool):
+        """Whether a failed PulseAudio connection falls back to raw ALSA (applies on next open)."""
+        if self.rt_core_addr == 0:
+            return
+        var was_running = self.rt_running
+        if was_running:
+            self.stop_realtime_thread()
+        self._rt_core()[].allow_alsa_fallback = enabled
+        if was_running:
+            _ = self.start_realtime_thread()
+
+    def select_output_device(mut self, device_id: String) -> Bool:
+        """Selects an output (`""` = system default). When the realtime thread is running it
+        is restarted on the new device; returns whether output is running afterwards."""
+        if self.rt_core_addr == 0:
+            return False
+        var was_running = self.rt_running
+        var was_headless = self._rt_core()[].headless_rt_mode
+        if was_running:
+            self.stop_realtime_thread()
+        self._rt_core()[].preferred_device = device_id
+        if not was_running:
+            return True
+        if was_headless:
+            return self.start_headless_rt_thread()
+        return self.start_realtime_thread()
 
     # ---- Dedicated RT Thread Lifecycle (PulseAudio / PipeWire / Headless RT Pthread) ----
 
-    def audio_backend_name(self) -> String:
-        """Returns the active RT output backend: `'headless'`, `'pulse'`, `'alsa'`, or `'none'`."""
-        if self.rt_core_addr == 0 or not self.rt_running:
-            return "none"
-        if self._rt_core()[].headless_rt_mode:
-            return "headless"
-        if self._rt_core()[].pulse.connected():
-            return "pulse"
-        if self._rt_core()[].alsa_fd >= 0:
-            return "alsa"
-        return "none"
-
-    def start_realtime_thread(mut self) -> Bool:
-        """Connects to `PulseClient` (or falls back to Linux ALSA `/dev/snd/pcmC*D*p`) and spawns the dedicated RT mixing pthread."""
-        if (
-            self.rt_running
-            or self.rt_core_addr == 0
-            or self._rt_core()[].running_atomic == 0
-        ):
-            return self.rt_running
-        var block_bytes = self.quantum_frames * 4
-        var connected = self._rt_core()[].pulse.connect(self.sample_rate, block_bytes)
-        if not connected:
-            var out_period = self.quantum_frames
-            var out_buffer = self.quantum_frames * 4
-            var alsa_fd = alsa_open_pcm(self.sample_rate, self.quantum_frames, out_period, out_buffer)
-            if alsa_fd < 0:
-                return False
-            self._rt_core()[].alsa_fd = alsa_fd
-            self._rt_core()[].alsa_period_frames = out_period
-            self._rt_core()[].alsa_pending_frames = 0
-            self._rt_core()[].alsa_pending_offset = 0
-        self._rt_core()[].headless_rt_mode = False
+    def _spawn_rt_thread(mut self) -> Bool:
         self._rt_core()[]._running_ptr()[unsafe_offset=0].store(1)
         var tid = UInt64(0)
         var rc = external_call["pthread_create", Int32](
@@ -3323,13 +4278,33 @@ struct AudioServer(Resource, Movable):
         )
         if rc != 0:
             self._rt_core()[]._running_ptr()[unsafe_offset=0].store(0)
+            return False
+        self.rt_thread_handle = tid
+        self.rt_running = True
+        _ = self._start_stream_thread()
+        return True
+
+    def start_realtime_thread(mut self) -> Bool:
+        """Connects to `PulseClient` (or falls back to Linux ALSA `/dev/snd/pcmC*D*p`) and spawns the
+        dedicated RT mixing pthread. If the device later disappears the RT thread keeps the mixer
+        clock running and reconnects with exponential backoff (PulseAudio first, then ALSA)."""
+        if (
+            self.rt_running
+            or self.rt_core_addr == 0
+            or self._rt_core()[].running_atomic == 0
+        ):
+            return self.rt_running
+        self._rt_core()[].headless_rt_mode = False
+        if not self._rt_core()[].try_open_backend():
+            return False
+        if not self._spawn_rt_thread():
             self._rt_core()[].pulse.close()
             if self._rt_core()[].alsa_fd >= 0:
                 alsa_close_pcm(self._rt_core()[].alsa_fd)
                 self._rt_core()[].alsa_fd = -1
+            self._rt_core()[].backend = AUDIO_BACKEND_NONE
+            self._rt_core()[]._publish_backend()
             return False
-        self.rt_thread_handle = tid
-        self.rt_running = True
         return True
 
     def start_headless_rt_thread(mut self) -> Bool:
@@ -3341,19 +4316,11 @@ struct AudioServer(Resource, Movable):
         ):
             return self.rt_running
         self._rt_core()[].headless_rt_mode = True
-        self._rt_core()[]._running_ptr()[unsafe_offset=0].store(1)
-        var tid = UInt64(0)
-        var rc = external_call["pthread_create", Int32](
-            Pointer(to=tid),
-            Int(0),
-            _audio_rt_thread_entry,
-            self.rt_core_addr,
-        )
-        if rc != 0:
-            self._rt_core()[]._running_ptr()[unsafe_offset=0].store(0)
+        _ = self._rt_core()[].try_open_backend()
+        if not self._spawn_rt_thread():
+            self._rt_core()[].backend = AUDIO_BACKEND_NONE
+            self._rt_core()[]._publish_backend()
             return False
-        self.rt_thread_handle = tid
-        self.rt_running = True
         return True
 
     def stop_realtime_thread(mut self):
@@ -3366,11 +4333,14 @@ struct AudioServer(Resource, Movable):
             )
             self.rt_thread_handle = 0
             self.rt_running = False
+        self._stop_stream_thread()
         self._rt_core()[].pulse.close()
         _ = self.drain_retired()
         if self._rt_core()[].alsa_fd >= 0:
             alsa_close_pcm(self._rt_core()[].alsa_fd)
             self._rt_core()[].alsa_fd = -1
+        self._rt_core()[].backend = AUDIO_BACKEND_NONE
+        self._rt_core()[]._publish_backend()
 
     def stop(mut self):
         self.stop_realtime_thread()

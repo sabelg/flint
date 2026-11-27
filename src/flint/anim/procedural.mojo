@@ -579,6 +579,8 @@ struct FootPlantLeg(Copyable, ImplicitlyCopyable, Movable):
     var pole_local: Vec3
     var locked: Bool
     var locked_world_pos: Vec3
+    var support_body_id: Int
+    var support_local_point: Vec3
     var release_offset: Vec3
     var release_vel: Vec3
     var smoothed_tilt: Quat
@@ -599,6 +601,8 @@ struct FootPlantLeg(Copyable, ImplicitlyCopyable, Movable):
         self.pole_local = pole_local
         self.locked = False
         self.locked_world_pos = Vec3()
+        self.support_body_id = -1
+        self.support_local_point = Vec3()
         self.release_offset = Vec3()
         self.release_vel = Vec3()
         self.smoothed_tilt = Quat()
@@ -660,6 +664,7 @@ struct FootPlantSolver(Copyable, Movable):
         self.pelvis_offset_y = SpringFloat(0.0)
         for i in range(len(self.legs)):
             self.legs[i].locked = False
+            self.legs[i].support_body_id = -1
             self.legs[i].release_offset = Vec3()
             self.legs[i].release_vel = Vec3()
             self.legs[i].smoothed_tilt = Quat()

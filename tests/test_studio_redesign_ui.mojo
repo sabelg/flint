@@ -25,6 +25,7 @@ from std.collections import List
 from std.math import abs, isfinite
 from std.sys import size_of
 from std.testing import assert_equal, assert_false, assert_true
+from std.time import monotonic
 
 from flint.assets.server import AssetServer
 from flint.core.jobs import JobPool
@@ -59,6 +60,7 @@ from flint.devtools.problems import (
     parse_compiler_output,
 )
 from flint.platform.input import InputState
+from flint.platform.os import run_process_redirected
 from flint.render.font import SdfFont
 from flint.render.render_world import (
     DebugLineBatch,
@@ -119,7 +121,7 @@ from flint.studio.palette import (
     StudioCommandPalette,
     draw_command_palette,
 )
-from flint.studio.studio_app import FlintStudioState
+from flint.studio.studio_app import FlintStudioState, _resolve_flint_launcher_path
 from flint.studio.viewport_hud import (
     HDR_ACT_COMMAND_PALETTE,
     STUDIO_HEADER_BAR_H,
@@ -746,6 +748,28 @@ def test_mcp_v2_hooks_gate_and_new_tools() raises:
     var evs_br = mcp.take_tool_events()
     assert_equal(len(evs_br), 1)
     assert_equal(evs_br[0].tool_name, "code.build_hot_reload")
+
+    # Build the unmodified scaffold from another working directory, including
+    # its real flint.app.hot_reload import and a project path with a space.
+    var project = "/tmp/flint-studio-edit " + String(monotonic())
+    var scaffold = List[String]()
+    scaffold.append("/bin/bash")
+    scaffold.append(_resolve_flint_launcher_path())
+    scaffold.append("new")
+    scaffold.append(project)
+    assert_equal(run_process_redirected(scaffold), 0)
+    var downstream = McpServerV2(workspace_root=project)
+    var built = downstream.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"code.build_hot_reload","arguments":{}}}',
+        studio, assets, pool,
+    )
+    var cleanup = List[String]()
+    cleanup.append("/bin/rm")
+    cleanup.append("-rf")
+    cleanup.append("--")
+    cleanup.append(project)
+    assert_equal(run_process_redirected(cleanup), 0)
+    assert_true(built.find('"compiled":true') >= 0 and built.find('"reloaded":true') >= 0, built)
 
     assets.close()
     studio.shutdown()

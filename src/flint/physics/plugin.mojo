@@ -22,12 +22,14 @@ from flint.app.engine_app import (
     EngineApp,
     EnginePlugin,
     FixedTime,
+    SystemFn,
     Resource,
     Resources,
     STAGE_FIXED_UPDATE,
     STAGE_PRE_UPDATE,
 )
 from flint.assets.json import JsonDocument
+from flint.core.ik import angle_axis
 from flint.core.detmath import det_atan2
 from flint.core.jobs import JobPool
 from flint.core.math import Vec3, Quat
@@ -1069,6 +1071,13 @@ struct JointComponent(SerializableComponent, ImplicitlyCopyable):
         return out
 
 
+@fieldwise_init
+struct CharacterRootMotionSystem(Resource, Copyable, ImplicitlyCopyable):
+    """Optional animation sampler called immediately before each controller sweep."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.physics.CharacterRootMotionSystem")
+    var sample: SystemFn
+
+
 struct CharacterControllerComponent(SerializableComponent):
     """Kinematic character controller ECS component backed by `CharacterController`."""
     comptime COMPONENT_ID: UInt64 = comp_hash64("flint.physics.CharacterControllerComponent")
@@ -1082,6 +1091,10 @@ struct CharacterControllerComponent(SerializableComponent):
     var desired_vel: Vec3
     var jump_speed: Float32
     var active: Bool
+    # Transient outputs for the current physics tick, in actor and world space respectively.
+    var root_motion_local: Vec3
+    var root_motion_yaw: Float32
+    var actual_displacement: Vec3
 
     def __init__(
         out self,
@@ -1096,6 +1109,9 @@ struct CharacterControllerComponent(SerializableComponent):
         self.desired_vel = desired_vel
         self.jump_speed = jump_speed
         self.active = active
+        self.root_motion_local = Vec3()
+        self.root_motion_yaw = Float32(0.0)
+        self.actual_displacement = Vec3()
 
     def write_bin(self, mut out: BlobWriter):
         out.f32(self.config.radius)
@@ -1754,6 +1770,8 @@ def _sys_physics_pre_update(
     if fix_opt:
         fixed_dt = max(Float32(1.0e-5), fix_opt.value()[unsafe_offset=0].dt)
 
+    physics.begin_body_batch()
+
     # 1. Remove physics bodies & non-RB physics objects for despawned entities or removed components
     var keep = List[_TrackedRigidSync]()
     for i in range(len(sync.tracked)):
@@ -1983,6 +2001,7 @@ def _sys_physics_pre_update(
                     sync.record_body(e, rb.body_id, w_pos, w_rot)
     if need_broadphase_rebuild:
         physics.rebuild_broadphase()
+    physics.end_body_batch()
 
     # 3. Materialize & sync trigger ColliderComponents (both standalone and RB-attached)
     var col_mask = world.bit_for[ColliderComponent]()
@@ -2314,6 +2333,10 @@ def _sys_physics_fixed_step(
     if dt <= Float32(1.0e-7):
         return
 
+    var root_system = resources.get_ptr[CharacterRootMotionSystem]()
+    if root_system:
+        root_system.value()[].sample(world_ptr, res_ptr, pool_ptr, _cmds_ptr, 1)
+
     # 1. Step CharacterControllers
     var sync_opt = resources.get_ptr_mut[PhysicsSyncStateResource]()
     var kcc_mask = world.bit_for[CharacterControllerComponent]()
@@ -2326,12 +2349,18 @@ def _sys_physics_fixed_step(
         ref kc = kc_opt.value()[unsafe_offset=0]
         if not kc.active:
             continue
-        var new_pos = kc.controller.move_and_slide(physics, kc.desired_vel, dt, kc.jump_speed)
+        var rot = _entity_world_pose(world, e)[1]
+        var before = kc.controller.pos
+        var previous_yaw = kc.controller.yaw
+        var velocity = kc.desired_vel + rot.rotate(kc.root_motion_local) * (Float32(1.0) / dt)
+        var new_pos = kc.controller.move_and_slide(physics, velocity, dt, kc.jump_speed)
+        kc.actual_displacement = new_pos - before
+        var yaw_delta = kc.root_motion_yaw + (kc.controller.yaw - previous_yaw)
+        if yaw_delta != Float32(0.0):
+            rot = (angle_axis(yaw_delta, kc.controller.cfg.up) * rot).normalized()
+        kc.root_motion_local = Vec3()
+        kc.root_motion_yaw = Float32(0.0)
         kc.jump_speed = Float32(0.0)
-        var rot = Quat()
-        var lt_opt = world.get_ptr[LocalTransform](e)
-        if lt_opt:
-            rot = lt_opt.value()[unsafe_offset=0].rotation
         _write_world_pose_to_local(world, e, new_pos, rot)
         if sync_opt:
             ref sync = sync_opt.value()[unsafe_offset=0]

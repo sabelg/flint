@@ -12,6 +12,7 @@ Implements:
 """
 from std.math import abs, max, min, sqrt
 from std.memory import bitcast
+from flint.assets.meshlet import GeomFreeList
 from flint.core.math import Vec3
 from flint.core.transform import Mat4, Quat
 from flint.render.spirv import MODEL_GL_COMPUTE
@@ -46,45 +47,106 @@ comptime AAA_SKIN_MORPH_DELTAS_BASE: Int = AAA_SKIN_PREV_MORPH_WEIGHTS_BASE + AA
 comptime AAA_SKIN_BUFFER_WORDS: Int = AAA_SKIN_MORPH_DELTAS_BASE + AAA_SKIN_MAX_MORPH_DELTAS * 6                   # 3,506,688 (~13.38 MiB)
 
 
-struct FlintAaaSkinningArena(Copyable, ImplicitlyCopyable, Movable):
-    """Tracks disjoint GPU bone-palette (`2,048` bones), bind-vertex (`98,304` verts) & morph-target sub-allocations."""
+struct FlintAaaSkinningArena(Copyable, Movable):
+    """Tracks disjoint GPU bone-palette (`2,048` bones), bind-vertex (`98,304` verts) & morph-target sub-allocations.
+
+    Cursors bump; `free_*` returns ranges to free lists that later allocations reuse first (first fit),
+    and runs that end at a cursor pull the cursor back. The capacities themselves are fixed by the
+    `BIND_AAA_SKINNING` layout constants, which the skinning and SVGF shaders bake in."""
     var bone_cursor: Int
     var vertex_cursor: Int
     var morph_weight_cursor: Int
     var morph_delta_cursor: Int
+    var free_bones: GeomFreeList  # in bone slots
+    var free_vertices: GeomFreeList  # in bind-vertex slots
+    var free_morph_weights: GeomFreeList  # in morph slots
+    var free_morph_deltas: GeomFreeList  # in (morph, vertex) delta slots
+    var failed_allocations: Int  # requests that did not fit (clamped or refused)
 
     def __init__(out self):
         self.bone_cursor = 0
         self.vertex_cursor = 0
         self.morph_weight_cursor = 0
         self.morph_delta_cursor = 0
+        self.free_bones = GeomFreeList()
+        self.free_vertices = GeomFreeList()
+        self.free_morph_weights = GeomFreeList()
+        self.free_morph_deltas = GeomFreeList()
+        self.failed_allocations = 0
 
     def reset(mut self):
         self.bone_cursor = 0
         self.vertex_cursor = 0
         self.morph_weight_cursor = 0
         self.morph_delta_cursor = 0
+        self.free_bones = GeomFreeList()
+        self.free_vertices = GeomFreeList()
+        self.free_morph_weights = GeomFreeList()
+        self.free_morph_deltas = GeomFreeList()
+
+    def vertices_in_use(self) -> Int:
+        return self.vertex_cursor - self.free_vertices.total()
+
+    def bones_in_use(self) -> Int:
+        return self.bone_cursor - self.free_bones.total()
+
+    def free_vertices_range(mut self, first_slot: Int, count: Int):
+        if count <= 0 or first_slot < 0:
+            return
+        self.free_vertices.free(first_slot, count)
+        self.vertex_cursor = self.free_vertices.trim_tail(self.vertex_cursor)
+
+    def free_bone_palette(mut self, bone_palette_offset: Int, bone_count: Int):
+        """Frees the bone slots a palette (word offset `slot * 8`) used."""
+        var eff = max(1, min(AAA_MAX_SKIN_BONES, bone_count))
+        var slot = bone_palette_offset // 8
+        if slot < 0:
+            return
+        eff = min(eff, max(0, AAA_MAX_SKIN_BONES - slot))
+        self.free_bones.free(slot, eff)
+        self.bone_cursor = self.free_bones.trim_tail(self.bone_cursor)
+
+    def free_morph_targets(mut self, first_weight: Int, first_delta: Int, morph_count: Int, vertex_count: Int):
+        if morph_count <= 0:
+            return
+        self.free_morph_weights.free(first_weight, morph_count)
+        self.morph_weight_cursor = self.free_morph_weights.trim_tail(self.morph_weight_cursor)
+        if vertex_count > 0:
+            self.free_morph_deltas.free(first_delta, morph_count * vertex_count)
+            self.morph_delta_cursor = self.free_morph_deltas.trim_tail(self.morph_delta_cursor)
 
     def alloc_bone_palette(mut self, bone_count: Int = 64, explicit_word_offset: Int = -1) -> Int:
-        """Returns `bone_palette_offset` in `UInt32` words (`bone_slot * 8`) without overwriting slot `0`."""
-        var eff_bones = max(1, min(AAA_MAX_SKIN_BONES, bone_count))
-        if explicit_word_offset >= 0:
-            var end_bone = (explicit_word_offset + 7) // 8 + eff_bones
-            if end_bone > self.bone_cursor:
-                self.bone_cursor = min(AAA_MAX_SKIN_BONES, end_bone)
-            return explicit_word_offset
+        """Reserve a complete disjoint palette, or report exhaustion without overlapping a live one."""
+        var count = max(1, bone_count)
         var slot = self.bone_cursor
-        if slot + eff_bones > AAA_MAX_SKIN_BONES:
-            slot = max(0, AAA_MAX_SKIN_BONES - eff_bones)
-        self.bone_cursor = min(AAA_MAX_SKIN_BONES, slot + eff_bones)
+        if explicit_word_offset >= 0:
+            slot = explicit_word_offset // 8
+            if explicit_word_offset % 8 != 0 or slot < self.bone_cursor:
+                self.failed_allocations += 1
+                return -1
+        else:
+            var reused = self.free_bones.alloc(count)
+            if reused >= 0:
+                return reused * 8
+        if count > AAA_MAX_SKIN_BONES - slot:
+            self.failed_allocations += 1
+            return -1
+        self.bone_cursor = slot + count
         return slot * 8
 
     def alloc_vertices(mut self, vertex_count: Int) -> Tuple[Int, Int]:
-        """Allocates `(first_slot, count)` in `[0 .. AAA_SKIN_MAX_VERTS]`."""
-        var first_slot = self.vertex_cursor
-        var v_cnt = max(0, min(vertex_count, AAA_SKIN_MAX_VERTS - first_slot))
-        self.vertex_cursor += v_cnt
-        return (first_slot, v_cnt)
+        """Reuse or reserve a complete mesh. Zero vertices signals failure."""
+        if vertex_count <= 0:
+            return (self.vertex_cursor, 0)
+        var reused = self.free_vertices.alloc(vertex_count)
+        if reused >= 0:
+            return (reused, vertex_count)
+        var slot = self.vertex_cursor
+        if vertex_count > AAA_SKIN_MAX_VERTS - slot:
+            self.failed_allocations += 1
+            return (slot, 0)
+        self.vertex_cursor += vertex_count
+        return (slot, vertex_count)
 
     def alloc_morph_targets(mut self, morph_count: Int, vertex_count: Int) -> Tuple[Int, Int, Int]:
         """Allocates `(first_weight_slot, first_delta_slot, effective_morph_count)` clamped within
@@ -93,6 +155,12 @@ struct FlintAaaSkinningArena(Copyable, ImplicitlyCopyable, Movable):
         var first_d = self.morph_delta_cursor
         if morph_count <= 0 or vertex_count <= 0:
             return (first_w, first_d, 0)
+        var rw = self.free_morph_weights.alloc(morph_count)
+        if rw >= 0:
+            var rd = self.free_morph_deltas.alloc(morph_count * vertex_count)
+            if rd >= 0:
+                return (rw, rd, morph_count)
+            self.free_morph_weights.free(rw, morph_count)
         var avail_w = max(0, AAA_SKIN_MAX_MORPH_SLOTS - first_w)
         var avail_d_morphs = max(0, (AAA_SKIN_MAX_MORPH_DELTAS - first_d) // vertex_count)
         var eff_m = max(0, min(morph_count, min(avail_w, avail_d_morphs)))

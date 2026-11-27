@@ -3493,6 +3493,24 @@ def test_m4b_studio_asset_import_drag_drop_activate_and_inspector_undo() raises:
         assert_true(imp_pf[0] and imp_pf[1].rel_path == "prefabs/crate.flprefab")
         assert_true(imp_wav[0] and imp_wav[1].rel_path == "audio/hit.wav")
 
+        # A clean project with a renamed asset + its imported sidecar resolves the saved reference.
+        var relocated = tmp + "/checkout/renamed"
+        assert_true(make_dirs(relocated))
+        var imported = proj + "/materials/brick.flmat"
+        assert_true(file_size(imported + ".flmeta") > 0)
+        var imported_bytes = read_bytes(imported)
+        var imported_meta = read_bytes(imported + ".flmeta")
+        assert_true(write_bytes(relocated + "/stone.flmat", imported_bytes))
+        assert_true(write_bytes(relocated + "/stone.flmat.flmeta", imported_meta))
+        var fresh = AssetServer(enable_watcher=False)
+        fresh.loose_root = tmp + "/checkout"
+        fresh.index_loose_directory()
+        var handle = fresh.resolve_raw(imp_mat[1])
+        var asset = fresh.raws.get_ptr(handle)
+        assert_true(Bool(asset))
+        assert_true(asset.value()[].bytes == read_bytes(imported))
+        _ = fresh.raws.release(handle)
+
         # 2. activate_asset_entry dispatches GLB, FLMAT, FLPREFAB, FLRIG, FLANIM, WAV with undo support
         var mesh_eid = s.activate_asset_entry("models/crate.glb", drop_pos=Vec3(2.0, 0.5, -1.0), from_drop=True)
         assert_true(mesh_eid >= 0)

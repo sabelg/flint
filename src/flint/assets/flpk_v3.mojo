@@ -32,7 +32,7 @@ from flint.assets.meshlet import (
     MeshletCluster,
 )
 from flint.physics.bvh import Bvh8MeshCollider, Bvh8Node, MeshTriangle
-from flint.platform.os import close_fd, file_stamp, open_read, read_bytes, write_bytes
+from flint.platform.os import close_fd, file_stamp, open_read, read_bytes, write_bytes, write_file_durable
 
 # ============================================================================
 # 1. Constants & Asset Kinds
@@ -70,7 +70,11 @@ comptime TEX_FMT_BC6H_UFLOAT: UInt8 = 4
 comptime SUB_ID_PRIMARY_OR_TAIL: UInt16 = 0
 comptime SUB_ID_MIP_BASE: UInt16 = 1           # sub_id 1..15 -> high-res mips 0..14
 comptime SUB_ID_BVH8_COLLIDER: UInt16 = 16
+comptime SUB_ID_FONT_OUTLINES: UInt16 = 20
+comptime SUB_ID_AUDIO_PAGE_HASHES: UInt16 = 19
+comptime AUDIO_STREAM_PAGE_BYTES: Int = 65536
 comptime SUB_ID_RIG: UInt16 = 17
+comptime SUB_ID_ANIMATED_GLB: UInt16 = 18  # Skin weights, motion channels, and authored clip events.
 
 comptime COOKED_MESH_SLAB_MAGIC: UInt32 = 0x48534D46  # "FMSH"
 comptime COOKED_TEX_SLAB_MAGIC: UInt32 = 0x58455446   # "FTEX"
@@ -419,7 +423,7 @@ def write_flmeta(meta_path: String, meta: AssetMeta) -> Bool:
     var raw = List[UInt8](capacity=txt.byte_length())
     for b in txt.as_bytes():
         raw.append(b)
-    return write_bytes(meta_path, raw)
+    return write_file_durable(meta_path, raw)
 
 
 def load_or_init_flmeta(
@@ -1762,6 +1766,15 @@ def decode_bvh8_collider_slab(data: List[UInt8]) -> Tuple[Bool, Bvh8MeshCollider
                         dfs_lane.append(0)
 
     return (True, col^)
+
+
+def encode_audio_page_hashes(data: List[UInt8]) -> List[UInt8]:
+    """One little-endian CRC64 per seekable 64 KiB audio page in the primary chunk."""
+    var out = List[UInt8]()
+    for offset in range(0, len(data), AUDIO_STREAM_PAGE_BYTES):
+        var count = min(AUDIO_STREAM_PAGE_BYTES, len(data) - offset)
+        _put_u64_le(out, crc64_ecma_ptr(Int(data.unsafe_ptr()) + offset, count, 0))
+    return out^
 
 
 def encode_audio_pcm_slab(channels: Int, sample_rate: Int, samples: List[Int16]) -> List[UInt8]:

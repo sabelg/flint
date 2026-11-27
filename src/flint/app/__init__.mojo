@@ -31,6 +31,7 @@ from flint.app.flow import (
     GameTimer,
     Tween,
     GameFlow,
+    SavedSlot,
 )
 from flint.app.hot_reload import (
     FLINT_PLUGIN_API_VERSION,

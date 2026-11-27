@@ -4,7 +4,8 @@ from std.math import isfinite
 from flint.assets.glb_native import little_u32
 from flint.assets.glb_writer import append_f32_le, append_u32_le, pad4
 from flint.assets.json import JsonDocument
-from flint.assets.model import NativeAnimation
+from flint.assets.json_write import json_quote
+from flint.assets.model import INTERP_CUBICSPLINE, INTERP_LINEAR, INTERP_STEP, NativeAnimation
 from flint.platform.os import read_bytes, remove_file, write_file_durable
 
 
@@ -52,6 +53,23 @@ def _add_array(data: List[UInt8], span: _Span, added: String) raises -> String:
         raise Error("Expected GLB array")
     var original = String(unsafe_from_utf8=data[span.first + 1 : span.last - 1])
     return "[" + original + ("," if original.strip() else "") + added + "]"
+
+
+def _append_accessor(
+    mut binary: List[UInt8], mut views: List[String], mut accessors: List[String],
+    view_base: Int, accessor_base: Int, values: List[Float32], count: Int,
+    kind: String, bounds: String = "",
+) -> Int:
+    var offset = len(binary)
+    for value in values:
+        append_f32_le(binary, value)
+    var view = view_base + len(views)
+    views.append('{"buffer":0,"byteOffset":' + String(offset)
+                 + ',"byteLength":' + String(len(binary) - offset) + "}")
+    var index = accessor_base + len(accessors)
+    accessors.append('{"bufferView":' + String(view) + ',"componentType":5126,"count":'
+                     + String(count) + ',"type":' + json_quote(kind) + bounds + "}")
+    return index
 
 
 def append_take_glb(
@@ -107,76 +125,64 @@ def append_take_glb(
         raise Error("Animation has no channels")
     if not isfinite(anim.duration) or anim.duration < Float32(0.0):
         raise Error("Animation duration must be finite and non-negative")
-    for c_idx in range(len(anim.channels)):
-        ref ch = anim.channels[c_idx]
+    arr.index = root["nodes"].first
+    var node_count = arr.array_size(arr.parse_value(data))
+    var first_time_accessor = -1
+    var clip_end = Float32(0)
+    for i in range(len(anim.channels)):
+        ref ch = anim.channels[i]
+        if ch.node < 0 or ch.node >= node_count or ch.path < 0 or ch.path > 3:
+            raise Error("Invalid animation target at channel " + String(i))
+        if not ch.times:
+            raise Error("Animation channel has no keys")
+        var previous = Float32(-1)
         for t in ch.times:
-            if not isfinite(t):
-                raise Error("Animation channel times must be finite")
+            if not isfinite(t) or t < 0 or t <= previous:
+                raise Error("Animation key times must be finite, non-negative and increasing")
+            previous = t
+        clip_end = max(clip_end, previous)
+        var mode = INTERP_STEP if ch.step else ch.interp_mode
+        if mode != INTERP_LINEAR and mode != INTERP_STEP and mode != INTERP_CUBICSPLINE:
+            raise Error("Unknown animation interpolation")
+        if mode == INTERP_CUBICSPLINE and len(ch.times) < 2:
+            raise Error("Cubic animation channels need at least two keys")
+        var output_count = len(ch.times) * (3 if mode == INTERP_CUBICSPLINE else 1)
+        if ch.components() == 0 or len(ch.values) != output_count * ch.components():
+            raise Error("Animation value count does not match key times and interpolation")
         for v in ch.values:
             if not isfinite(v):
                 raise Error("Animation channel values must be finite")
-    # Every track from the retarget baker shares the same time samples.
-    for i in range(-1, len(anim.channels)):
-        var time_track = i < 0
-        ref ch = anim.channels[max(i, 0)]
-        var offset = len(binary)
-        var kind = String(
-            "SCALAR" if time_track else "VEC4" if ch.path == 1 else "VEC3"
-        )
-        if time_track:
-            for value in ch.times:
-                append_f32_le(binary, value)
-        else:
-            for value in ch.values:
-                append_f32_le(binary, value)
-        var idx = len(views)
-        views.append(
-            '{"buffer":0,"byteOffset":'
-            + String(offset)
-            + ',"byteLength":'
-            + String(len(binary) - offset)
-            + "}"
-        )
-        var bounds = (
-            ',"min":[0],"max":['
-            + String(Float64(anim.duration))
-            + "]" if time_track else String()
-        )
-        accessors.append(
-            '{"bufferView":'
-            + String(counts[0] + idx)
-            + ',"componentType":5126,"count":'
-            + String(len(ch.times))
-            + ',"type":"'
-            + kind
-            + '"'
-            + bounds
-            + "}"
-        )
-        if not time_track:
-            samplers.append(
-                '{"input":'
-                + String(counts[1])
-                + ',"output":'
-                + String(counts[1] + idx)
-                + "}"
-            )
-            channels.append(
-                '{"sampler":'
-                + String(i)
-                + ',"target":{"node":'
-                + String(ch.node)
-                + ',"path":"'
-                + ("rotation" if ch.path == 1 else "translation")
-                + '"}}'
-            )
-    var addition = (
-        '{"name":"Retargeted take","samplers":['
-        + ",".join(samplers)
-        + '],"channels":['
-        + ",".join(channels)
-        + "]}"
-    )
+
+        # Uniform retarget bakes share one input accessor. Edited tracks can use their own grid.
+        var time_accessor = first_time_accessor
+        if i == 0 or ch.times != anim.channels[0].times:
+            var bounds = ',"min":[' + String(Float64(ch.times[0])) + '],"max":[' + String(Float64(previous)) + "]"
+            time_accessor = _append_accessor(binary, views, accessors, counts[0], counts[1],
+                ch.times, len(ch.times), "SCALAR", bounds)
+            if i == 0:
+                first_time_accessor = time_accessor
+        var value_accessor = _append_accessor(binary, views, accessors, counts[0], counts[1],
+            ch.values, len(ch.values) if ch.path == 3 else output_count,
+            "SCALAR" if ch.path == 3 else ("VEC4" if ch.path == 1 else "VEC3"))
+        var interpolation = "CUBICSPLINE" if mode == INTERP_CUBICSPLINE else ("STEP" if mode == INTERP_STEP else "LINEAR")
+        samplers.append('{"input":' + String(time_accessor) + ',"output":' + String(value_accessor)
+                        + ',"interpolation":' + json_quote(interpolation) + "}")
+        var path = "translation" if ch.path == 0 else ("rotation" if ch.path == 1 else ("scale" if ch.path == 2 else "weights"))
+        channels.append('{"sampler":' + String(i) + ',"target":{"node":' + String(ch.node)
+                        + ',"path":' + json_quote(path) + "}}")
+    if not isfinite(anim.ground_speed) or anim.ground_speed < 0:
+        raise Error("Animation ground speed must be finite and non-negative")
+    var events = List[String]()
+    for event in anim.events:
+        if not event.kind or not isfinite(event.time) or event.time < 0 or event.time > clip_end:
+            raise Error("Animation marker needs a kind and a time inside the clip")
+        events.append('{"kind":' + json_quote(event.kind) + ',"arg":' + json_quote(event.arg)
+                      + ',"time":' + String(Float64(event.time)) + "}")
+    var name = anim.name if anim.name else String("Retargeted take")
+    var addition = ('{"name":' + json_quote(name) + ',"samplers":[' + ",".join(samplers)
+                    + '],"channels":[' + ",".join(channels) + '],"extras":{"loop":'
+                    + ("true" if anim.loop else "false") + ',"speed":' + String(Float64(anim.ground_speed))
+                    + ',"events":[' + ",".join(events) + "]}}")
     var patches = Dict[Int, Tuple[Int, String]]()
     var v = root["bufferViews"]
     patches[v.first] = (v.last, _add_array(data, v, ",".join(views)))

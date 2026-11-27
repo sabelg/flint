@@ -13,6 +13,11 @@ def get_time() -> Float64:
     return Float64(monotonic()) / 1000000000.0
 
 
+def unix_time_sec() -> Int:
+    """Wall-clock seconds since the Unix epoch for persisted timestamps."""
+    return Int(external_call["time", Int64](Int(0)))
+
+
 def env_value(name: String) -> String:
     return env_now(name)
 
@@ -146,6 +151,13 @@ def write_synced(path: String, mut data: List[UInt8], fault: Int = FAULT_NONE, s
     var fd = open_write(path)
     if fd < 0:
         return False
+    var ok = _write_synced_fd(fd, data, fault, sync)
+    if not ok and fault == FAULT_NONE:
+        _ = remove_file(path)
+    return ok
+
+
+def _write_synced_fd(fd: Int, mut data: List[UInt8], fault: Int, sync: Bool) -> Bool:
     var end = len(data) // 2 if fault == FAULT_SHORT_WRITE else len(data)
     var offset = 0
     while offset < end:
@@ -154,18 +166,14 @@ def write_synced(path: String, mut data: List[UInt8], fault: Int = FAULT_NONE, s
             continue
         if count <= 0:
             close_fd(fd)
-            _ = remove_file(path)
             return False
         offset += count
     if fault == FAULT_SHORT_WRITE:
         close_fd(fd)  # left behind cut off, as a crash mid-write would
         return False
     var synced = not sync or external_call["fsync", Int32](Int32(fd)) == 0
-    close_fd(fd)
-    if not synced:
-        _ = remove_file(path)
-        return False
-    return fault != FAULT_BEFORE_RENAME
+    var closed = external_call["close", Int32](Int32(fd)) == 0
+    return synced and closed and fault != FAULT_BEFORE_RENAME
 
 
 def durable_rename(source: String, destination: String, sync: Bool = True) -> Bool:
@@ -177,12 +185,38 @@ def durable_rename(source: String, destination: String, sync: Bool = True) -> Bo
     return not sync or fsync_path(parent_directory(destination), True)
 
 
-def write_file_durable(path: String, mut data: List[UInt8], fault: Int = FAULT_NONE) -> Bool:
-    """Replaces `path` with `data` so that after a crash or power loss at any
-    moment the file is either the old one or the new one, never a mix: write
-    `path`.tmp and fsync it, rename it over `path`, fsync the directory."""
-    var temporary = path + ".tmp"
-    return write_synced(temporary, data, fault) and durable_rename(temporary, path)
+def write_file_durable(
+    path: String, mut data: List[UInt8], fault: Int = FAULT_NONE, sync: Bool = True
+) -> Bool:
+    """Publish a complete file by renaming a private staging file in the same directory."""
+    var owned = path
+    var stat_buf = List[UInt8](length=256, fill=0)
+    var mode = Int32(0o666)
+    var exists = external_call["stat", Int32](owned.as_c_string_span(), stat_buf.unsafe_ptr()) == 0
+    if exists:
+        comptime MODE_OFFSET: Int = 24 if CompilationTarget.is_x86() else 16
+        var bits = Pointer[UInt32, ImmutAnyOrigin](
+            unsafe_from_address=Int(stat_buf.unsafe_ptr()) + MODE_OFFSET
+        )[unsafe_offset=0]
+        mode = Int32(bits & 0o777)
+        _ = len(stat_buf)
+    var prefix = parent_directory(path) + "/.flint-write-" + String(Int(external_call["getpid", Int32]())) + "-"
+    var attempt = 0
+    while True:
+        var stage = prefix + String(attempt) + ".tmp"
+        var fd = open_path_fd(stage, Int32(1 | 64 | 128), mode)  # O_WRONLY | O_CREAT | O_EXCL
+        if fd >= 0:
+            if exists and external_call["fchmod", Int32](Int32(fd), UInt32(mode)) != 0:
+                close_fd(fd)
+                _ = remove_file(stage)
+                return False
+            if not _write_synced_fd(fd, data, fault, sync):
+                _ = remove_file(stage)
+                return False
+            return durable_rename(stage, path, sync)
+        if last_errno() != 17:  # EEXIST means another writer owns this staging file
+            return False
+        attempt += 1
 
 
 def player_save_directory() -> String:
@@ -194,6 +228,17 @@ def player_save_directory() -> String:
     if data_home.byte_length() > 0:
         return data_home + "/flint"
     return env_value("HOME") + "/.local/share/flint"
+
+
+def player_save_directory_for(game_id: String) -> String:
+    """`player_save_directory()/<game_id>`: each game gets its own folder (games used to share one).
+    The id is reduced to `[A-Za-z0-9._-]`; an empty or unusable id becomes `default`."""
+    var clean = List[UInt8]()
+    for b in game_id.as_bytes():
+        if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 45 or b == 95 or (b == 46 and len(clean) > 0):
+            clean.append(b)
+    var name = String(unsafe_from_utf8=clean) if len(clean) > 0 else String("default")
+    return player_save_directory() + "/" + name
 
 
 def close_fd(fd: Int):

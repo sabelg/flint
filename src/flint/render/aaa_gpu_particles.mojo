@@ -37,7 +37,6 @@ comptime MAX_PARTICLES: Int = 65536
 comptime AAA_PARTICLE_WORDS: Int = 16
 comptime AAA_MAX_PARTICLE_EMITTERS: Int = 64
 comptime AAA_EMITTER_WORDS: Int = 24
-comptime AAA_PARTICLE_MAX_TILES: Int = 14400     # Up to 160 x 90 tiles (2560 x 1440 at 16x16)
 comptime AAA_MAX_PARTICLES_PER_TILE: Int = 48
 
 # Particle visual & physical archetypes (exported under both `PARTICLE_*` and `ARCHETYPE_*` names)
@@ -84,13 +83,18 @@ def gpu_particles_tile_counts_word_offset(max_pix: Int) -> Int:
 
 
 @always_inline
-def gpu_particles_tile_bins_word_offset(max_pix: Int) -> Int:
-    return gpu_particles_tile_counts_word_offset(max_pix) + AAA_PARTICLE_MAX_TILES
+def gpu_particles_tile_count(width: Int, height: Int) -> Int:
+    return ((width + 15) // 16) * ((height + 15) // 16)
 
 
 @always_inline
-def gpu_particles_total_oit_words(max_pix: Int) -> Int:
-    return gpu_particles_tile_bins_word_offset(max_pix) + AAA_PARTICLE_MAX_TILES * AAA_MAX_PARTICLES_PER_TILE
+def gpu_particles_tile_bins_word_offset(max_pix: Int, num_tiles: Int) -> Int:
+    return gpu_particles_tile_counts_word_offset(max_pix) + num_tiles
+
+
+@always_inline
+def gpu_particles_total_oit_words(max_pix: Int, num_tiles: Int) -> Int:
+    return gpu_particles_tile_bins_word_offset(max_pix, num_tiles) + num_tiles * AAA_MAX_PARTICLES_PER_TILE
 
 
 struct AaaParticleEmitter(Copyable, Movable):
@@ -678,12 +682,10 @@ def gpu_particle_sim_and_bin_shader() -> List[UInt32]:
     var b_tx = s.load_u(tx_i)
     s.break_if(s.uge(b_tx, s.iadd(tx1, s.uint(1))))
     var tile_id = s.iadd(s.imul(b_ty, tiles_x), b_tx)
-    s.begin_if(s.ult(tile_id, s.uint(UInt32(AAA_PARTICLE_MAX_TILES))))
     var slot = s.atomic_add_word(b_oit, s.iadd(counts_off, tile_id), s.uint(1))
     s.begin_if(s.ult(slot, s.uint(UInt32(AAA_MAX_PARTICLES_PER_TILE))))
     var b_idx = s.iadd(bins_off, s.iadd(s.imul(tile_id, s.uint(UInt32(AAA_MAX_PARTICLES_PER_TILE))), slot))
     s.store_word(b_oit, b_idx, pid)
-    s.end_if()
     s.end_if()
     s.store(tx_i, s.iadd(b_tx, s.uint(1)))
     s.end_loop()
@@ -740,11 +742,7 @@ def gpu_particle_tile_composite_shader() -> List[UInt32]:
 
     var tiles_x = s.udiv(s.iadd(w_u, s.uint(15)), s.uint(16))
     var tile_id = s.iadd(s.imul(ty_wg, tiles_x), tx_wg)
-    var raw_cnt = s.select_u(
-        s.ult(tile_id, s.uint(UInt32(AAA_PARTICLE_MAX_TILES))),
-        s.load_word(b_oit, s.iadd(counts_off, tile_id)),
-        s.uint(0),
-    )
+    var raw_cnt = s.load_word(b_oit, s.iadd(counts_off, tile_id))
     var tile_cnt = s.umin(raw_cnt, s.uint(UInt32(AAA_MAX_PARTICLES_PER_TILE)))
     # Uniform workgroup early-out when tile has 0 particles!
     s.return_if(s.ieq(tile_cnt, s.uint(0)))

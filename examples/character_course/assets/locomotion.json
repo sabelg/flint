@@ -1,0 +1,11 @@
+{
+  "name": "Character course",
+  "params": ["action"],
+  "blend": 0.09,
+  "states": [
+    {"name": "Walk", "clip": "Walk", "root_motion": "extract", "when": [["action", "==", 1]]},
+    {"name": "Stop", "clip": "Stop", "root_motion": "extract", "when": [["action", "==", 2]]},
+    {"name": "Pivot", "clip": "Pivot", "root_motion": "extract", "when": [["action", "==", 3]]},
+    {"name": "Idle", "clip": "Idle", "root_motion": "strip"}
+  ]
+}

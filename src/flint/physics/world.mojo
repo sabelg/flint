@@ -8,16 +8,17 @@ persisted 8-wide SIMD `BroadphaseNode8` scene queries (`raycast`, `raycast_all`,
 negating narrowphase `A -> B` normals into solver `B -> A` normals), `ContactCache`
 warm starting, `IslandSet` union-find & fracture island splitting, `ConstraintGraph`
 persistent 24-colouring, `Joint`s + `SixDofMotorJoint`s, Beaufort wave buoyancy &
-`ForceWorld`, full-shape swept CCD (`swept_sphere_obb` / `swept_convex_cast`),
+`ForceWorld`, full-shape translational CCD and bounded angular CCD against static convex colliders,
 OBB/Sphere/Capsule `TriggerVolume` (`TRIGGER_ENTER`, `TRIGGER_STAY`, `TRIGGER_EXIT`),
 and bit-exact `serialize` / `deserialize` snapshots for rollback & PIE.
 """
 from std.collections import List
 from std.math import sqrt, abs, isfinite, min, max
 from flint.core.math import Vec3, Quat
-from flint.core.detmath import set_sim_float_mode, det_acos, PI
+from flint.core.detmath import set_sim_float_mode, det_acos, det_atan, PI
+from flint.core.ik import angle_axis
 from flint.core.detsort import stable_order, mix64
-from flint.core.serial import BlobWriter, BlobReader, fourcc
+from flint.core.serial import BlobWriter, BlobReader, fourcc, float32_bits
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
 from flint.app.engine_app import Resource
@@ -70,6 +71,7 @@ from flint.physics.solver import (
     ContactPoint as SolverContactPoint,
     SolveResult,
     SPECULATIVE_DISTANCE,
+    MAX_TURN_PER_SUBSTEP,
     solve,
     solve_with_six_dof,
     ccd_cpus,
@@ -165,7 +167,19 @@ comptime SLEEP_LIN_SPEED: Float32 = 0.05
 comptime SLEEP_ANG_SPEED: Float32 = 0.08
 
 comptime WORLD_BLOB_TAG: UInt32 = fourcc("PHYW")
-comptime WORLD_BLOB_VERSION: Int = 3
+comptime WORLD_BLOB_VERSION: Int = 4
+
+
+@always_inline
+def _geometry_word(digest: UInt64, word: UInt64) -> UInt64:
+    return (digest ^ word) * UInt64(0x100000001b3)
+
+
+@always_inline
+def _geometry_vec(digest: UInt64, v: Vec3) -> UInt64:
+    var h = _geometry_word(digest, UInt64(float32_bits(v.x)))
+    h = _geometry_word(h, UInt64(float32_bits(v.y)))
+    return _geometry_word(h, UInt64(float32_bits(v.z)))
 
 
 @always_inline
@@ -898,6 +912,8 @@ struct PhysicsWorld(Resource, Movable):
     var bodies: List[RigidBody]
     var id_to_slot: List[Int]
     var broadphase_nodes: List[BroadphaseNode8]
+    var _body_batch_depth: Int
+    var _body_batch_dirty: Bool
     var hulls: List[ConvexHull]
     var meshes: List[Bvh8MeshCollider]
     var heightfields: List[HeightfieldCollider]
@@ -941,6 +957,8 @@ struct PhysicsWorld(Resource, Movable):
         self.bodies = List[RigidBody]()
         self.id_to_slot = List[Int]()
         self.broadphase_nodes = List[BroadphaseNode8]()
+        self._body_batch_depth = 0
+        self._body_batch_dirty = False
         self.hulls = List[ConvexHull]()
         self.meshes = List[Bvh8MeshCollider]()
         self.heightfields = List[HeightfieldCollider]()
@@ -999,8 +1017,24 @@ struct PhysicsWorld(Resource, Movable):
             if bid >= 0:
                 self.id_to_slot[bid] = i
 
+    def begin_body_batch(mut self):
+        """Group body edits before the next query or simulation step. Batches may nest."""
+        self._body_batch_depth += 1
+
+    def end_body_batch(mut self):
+        """Publish the updated query tree after the outermost group of body edits."""
+        if self._body_batch_depth == 0:
+            return
+        self._body_batch_depth -= 1
+        if self._body_batch_depth == 0 and self._body_batch_dirty:
+            self._body_batch_dirty = False
+            self.rebuild_broadphase()
+
     def rebuild_broadphase(mut self):
         """Rebuilds persisted 8-wide `broadphase_nodes` SAH BVH over all active bodies."""
+        if self._body_batch_depth > 0:
+            self._body_batch_dirty = True
+            return
         self.broadphase_nodes.clear()
         var n_rows = len(self.bodies)
         if n_rows == 0:
@@ -1122,7 +1156,10 @@ struct PhysicsWorld(Resource, Movable):
             self.islands.set_single(slot, bid)
         else:
             self.islands.drop(slot)
-        self._insert_broadphase_leaf_fast(slot)
+        if self._body_batch_depth > 0:
+            self._body_batch_dirty = True
+        else:
+            self._insert_broadphase_leaf_fast(slot)
         return slot
 
     def remove_body(mut self, slot: Int):
@@ -1746,6 +1783,7 @@ struct PhysicsWorld(Resource, Movable):
                 continue
             var hit_slots = List[Int](length=num_wheels, fill=-1)
             var ground_vels = List[Vec3](length=num_wheels, fill=Vec3())
+            var surface_grip = List[Float32](length=num_wheels, fill=1.0)
             var wheel_forces = List[Vec3]()
 
             for _ in range(steps):
@@ -1774,8 +1812,10 @@ struct PhysicsWorld(Resource, Movable):
                         var new_comp = min(cfg.max_travel, max(Float32(0.0), raw_comp))
 
                         var gv = Vec3()
+                        surface_grip[wi] = 1.0
                         if sh.body_slot >= 0 and sh.body_slot < len(self.bodies):
                             ref hb = self.bodies[sh.body_slot]
+                            surface_grip[wi] = max(Float32(0), Self._fin_f32(hb.friction, Float32(1)))
                             if not hb.is_static or hb.motion_mode == BODY_MOTION_KINEMATIC:
                                 gv = hb.linear_vel + hb.angular_vel.cross(sh.point - hb.pos)
 
@@ -1806,7 +1846,7 @@ struct PhysicsWorld(Resource, Movable):
                 var br = self.vehicles[vi].chassis.brake_input
                 var st = self.vehicles[vi].chassis.steer_input
                 self.vehicles[vi].chassis.step_world_substep(
-                    sub_dt, th, br, st, grav_y, ground_vels, wheel_forces, apply_gyro=False
+                    sub_dt, th, br, st, grav_y, ground_vels, wheel_forces, apply_gyro=False, surface_grip=surface_grip
                 )
 
                 for wi in range(num_wheels):
@@ -3561,6 +3601,19 @@ struct PhysicsWorld(Resource, Movable):
             hits[j + 1] = key
         return hits^
 
+    def _query_terrain_triangles(
+        self, terrain_slot: Int, lo: Vec3, hi: Vec3, mut triangles: List[MeshTriangle], mut ids: List[Int],
+    ):
+        """Collect overlapping terrain-local triangles and their persistent feature indices."""
+        ref terrain = self.bodies[terrain_slot]
+        if terrain.shape == BODY_SHAPE_MESH_BVH8:
+            ref bvh = self.meshes[terrain.shape_index]
+            bvh._query_aabb_triangles(lo, hi, ids)
+            for i in range(len(ids)):
+                triangles.append(bvh.triangles[ids[i]])
+        else:
+            self.heightfields[terrain.shape_index]._query_aabb_triangles(lo, hi, triangles, ids)
+
     def _shapecast_hull_vs_body(
         self,
         query_hull: ConvexHull,
@@ -3722,16 +3775,7 @@ struct PhysicsWorld(Resource, Movable):
 
             var tris = List[MeshTriangle]()
             var tids = List[Int]()
-            if b.shape == BODY_SHAPE_MESH_BVH8:
-                ref bvh = self.meshes[b.shape_index]
-                var cand_idx = List[Int]()
-                bvh._query_aabb_triangles(s_lo, s_hi, cand_idx)
-                for k in range(len(cand_idx)):
-                    var ti = cand_idx[k]
-                    tris.append(bvh.triangles[ti])
-                    tids.append(ti)
-            else:
-                self.heightfields[b.shape_index]._query_aabb_triangles(s_lo, s_hi, tris, tids)
+            self._query_terrain_triangles(slot, s_lo, s_hi, tris, tids)
 
             var best_sub_toi = Float32(1.0)
             for k in range(len(tris)):
@@ -4050,6 +4094,36 @@ struct PhysicsWorld(Resource, Movable):
         var sph_hull = _make_capsule_hull(s_rad, Float32(0.0))
         return collide_convex_convex(sph_hull, s_pos, Quat(), hull, h_pos, h_rot, row_a, row_b)
 
+    def _convex_terrain_contacts(
+        self, hull: ConvexHull, l_pos: Vec3, l_rot: Quat, terrain_slot: Int,
+    ) -> ContactManifold:
+        """Collide the actual hull with terrain-local triangles, retaining terrain feature IDs."""
+        var lm = ContactManifold()
+        var axes = get_box_axes(l_rot)
+        var he = _hull_half_extents(hull)
+        var wx = abs(axes[0].x) * he.x + abs(axes[1].x) * he.y + abs(axes[2].x) * he.z
+        var wy = abs(axes[0].y) * he.x + abs(axes[1].y) * he.y + abs(axes[2].y) * he.z
+        var wz = abs(axes[0].z) * he.x + abs(axes[1].z) * he.y + abs(axes[2].z) * he.z
+        var wext = Vec3(wx, wy, wz)
+        var tris = List[MeshTriangle]()
+        var ids = List[Int]()
+        self._query_terrain_triangles(terrain_slot, l_pos - wext, l_pos + wext, tris, ids)
+        var cands = List[NarrowContactPoint]()
+        for k in range(len(tris)):
+            var ti = ids[k]
+            ref tri = tris[k]
+            var vertices: List[Vec3] = [tri.v0, tri.v1, tri.v2]
+            var triangle_hull = ConvexHull(vertices)
+            var contacts = collide_convex_convex(hull, l_pos, l_rot, triangle_hull, Vec3(), Quat())
+            for j in range(contacts.count):
+                var cp = contacts.get_point(j)
+                var normal = -cp.normal
+                if tri.active_edges == 0 and abs(normal.dot(tri.normal)) > Float32(0.5):
+                    normal = tri.normal if normal.dot(tri.normal) >= Float32(0) else -tri.normal
+                cands.append(NarrowContactPoint(cp.point, normal, cp.depth, UInt32(ti * 8 + j)))
+        reduce_manifold_candidates(lm, cands)
+        return lm^
+
     def _collide_dynamic_vs_mesh(
         self,
         dyn_slot: Int,
@@ -4075,31 +4149,7 @@ struct PhysicsWorld(Resource, Movable):
         elif db.shape == BODY_SHAPE_BOX:
             lm = bvh.collide_box(l_pos, l_rot, db.half_extents)
         elif db.shape == BODY_SHAPE_CONVEX_HULL and db.shape_index >= 0 and db.shape_index < len(self.hulls):
-            ref hull = self.hulls[db.shape_index]
-            var axes = get_box_axes(l_rot)
-            var he = db.half_extents
-            var wx = abs(axes[0].x) * he.x + abs(axes[1].x) * he.y + abs(axes[2].x) * he.z
-            var wy = abs(axes[0].y) * he.x + abs(axes[1].y) * he.y + abs(axes[2].y) * he.z
-            var wz = abs(axes[0].z) * he.x + abs(axes[1].z) * he.y + abs(axes[2].z) * he.z
-            var wext = Vec3(wx, wy, wz)
-            var cand_tris = List[Int]()
-            bvh._query_aabb_triangles(l_pos - wext, l_pos + wext, cand_tris)
-            var cands = List[NarrowContactPoint]()
-            for k in range(len(cand_tris)):
-                var ti = cand_tris[k]
-                ref tri = bvh.triangles[ti]
-                var tverts = List[Vec3](capacity=3)
-                tverts.append(tri.v0); tverts.append(tri.v1); tverts.append(tri.v2)
-                var thull = ConvexHull(tverts)
-                var tm = collide_convex_convex(hull, l_pos, l_rot, thull, Vec3(), Quat())
-                if tm.has_collision:
-                    for pi in range(tm.count):
-                        var cp = tm.get_point(pi)
-                        var n_out = -cp.normal
-                        if (tri.active_edges == 0) and abs(n_out.dot(tri.normal)) > Float32(0.5):
-                            n_out = tri.normal if n_out.dot(tri.normal) >= Float32(0.0) else -tri.normal
-                        cands.append(NarrowContactPoint(cp.point, n_out, cp.depth, UInt32(ti * 8 + pi)))
-            reduce_manifold_candidates(lm, cands)
+            lm = self._convex_terrain_contacts(self.hulls[db.shape_index], l_pos, l_rot, mesh_slot)
         elif db.shape == BODY_SHAPE_COMPOUND and db.shape_index >= 0 and db.shape_index < len(self.compounds):
             ref cmp = self.compounds[db.shape_index]
             var cands = List[NarrowContactPoint]()
@@ -4116,7 +4166,7 @@ struct PhysicsWorld(Resource, Movable):
                 elif ch.shape == COMPOUND_CHILD_BOX:
                     cm = bvh.collide_box(ch_p, ch_r, ch.half_extents)
                 elif ch.shape == COMPOUND_CHILD_CONVEX:
-                    cm = bvh.collide_box(ch_p, ch_r, ch.half_extents)
+                    cm = self._convex_terrain_contacts(ch.hull, ch_p, ch_r, mesh_slot)
                 for pi in range(cm.count):
                     var cp = cm.get_point(pi)
                     cands.append(NarrowContactPoint(cp.point, cp.normal, cp.depth, UInt32(ci * 256 + Int(cp.id))))
@@ -4158,7 +4208,7 @@ struct PhysicsWorld(Resource, Movable):
         elif db.shape == BODY_SHAPE_BOX:
             lm = hf.collide_box(l_pos, l_rot, db.half_extents)
         elif db.shape == BODY_SHAPE_CONVEX_HULL and db.shape_index >= 0 and db.shape_index < len(self.hulls):
-            lm = hf.collide_box(l_pos, l_rot, db.half_extents)
+            lm = self._convex_terrain_contacts(self.hulls[db.shape_index], l_pos, l_rot, hf_slot)
         elif db.shape == BODY_SHAPE_COMPOUND and db.shape_index >= 0 and db.shape_index < len(self.compounds):
             ref cmp = self.compounds[db.shape_index]
             var cands = List[NarrowContactPoint]()
@@ -4172,6 +4222,8 @@ struct PhysicsWorld(Resource, Movable):
                 elif ch.shape == COMPOUND_CHILD_CAPSULE:
                     var ax = ch_r.rotate(Vec3(0, ch.half_height, 0))
                     cm = hf.collide_capsule(ch_p - ax, ch_p + ax, ch.radius)
+                elif ch.shape == COMPOUND_CHILD_CONVEX:
+                    cm = self._convex_terrain_contacts(ch.hull, ch_p, ch_r, hf_slot)
                 else:
                     cm = hf.collide_box(ch_p, ch_r, ch.half_extents)
                 for pi in range(cm.count):
@@ -4422,17 +4474,138 @@ struct PhysicsWorld(Resource, Movable):
             elif b.motion_mode == BODY_MOTION_STATIC and (not b.is_static) and b.inv_mass > Float32(0.0):
                 b.motion_mode = BODY_MOTION_DYNAMIC
 
+    def _ccd_convex_core(self, slot: Int) -> Tuple[ConvexHull, Float32]:
+        """Rounded primitives use exact point/segment cores and a spherical margin."""
+        ref body = self.bodies[slot]
+        if body.shape == BODY_SHAPE_SPHERE:
+            return (_make_point_hull(), body.radius)
+        if body.shape == BODY_SHAPE_CAPSULE:
+            return (_make_segment_hull(body.half_height), body.radius)
+        return (self._body_as_hull(slot), Float32(0))
+
+    def _cast_angular_ccd(
+        self, mover: Int, obstacle: Int, delta: Vec3, axis: Vec3, angle: Float32,
+        angular_travel: Float32, max_fraction: Float32,
+    ) -> SceneCastHit:
+        """Advance along a constant-axis arc against a stationary convex shape.
+        A reduced fraction without a hit is a conservative work-limit stop.
+        Only a closest-point witness inside the contact skin can produce a hit."""
+        comptime SKIN = Float32(0.0015)
+        var result = SceneCastHit()
+        result.fraction = max_fraction
+        ref a = self.bodies[mover]
+        ref b = self.bodies[obstacle]
+        var core_a = self._ccd_convex_core(mover)
+        var core_b = self._ccd_convex_core(obstacle)
+        var margins = core_a[1] + core_b[1]
+        var fraction = Float32(0)
+        var last_normal = Vec3()
+        for iteration in range(64):
+            var pos = a.pos + delta * fraction
+            var rot = (angle_axis(angle * fraction, axis) * a.rot).normalized()
+            var gjk = gjk_closest_points(core_a[0], pos, rot, core_b[0], b.pos, b.rot)
+            if gjk[0] and iteration == 0:
+                return result^  # Existing overlap belongs to the discrete manifold solver.
+            var normal = (gjk[1] - gjk[2]).normalized() if gjk[3] > Float32(1.0e-5) else last_normal
+            if gjk[3] <= margins + SKIN:
+                var point = gjk[2] + normal * core_b[1]
+                var point_v = a.linear_vel + a.angular_vel.cross(point - pos)
+                if iteration == 0 and (gjk[3] <= margins or point_v.dot(normal) >= 0):
+                    return result^
+                result.hit = True
+                result.fraction = fraction
+                result.point = point
+                result.normal = normal
+                result.body_slot = obstacle
+                result.body_id = b.id
+                return result^
+            # The GJK witness distance is an upper bound. The distance between
+            # support planes on its axis is a lower bound, safe for advancement.
+            var support_a = core_a[0].support(-normal, pos, rot)
+            var support_b = core_b[0].support(normal, b.pos, b.rot)
+            var gap = (support_a - support_b).dot(normal) - margins
+            # All angular surface velocities are perpendicular to the spin axis.
+            var angular_closing = angular_travel * axis.cross(normal).length()
+            var closing = max(Float32(0), -delta.dot(normal)) + angular_closing
+            if gap > closing * (max_fraction - fraction):
+                return result^
+            if gap <= Float32(0) or closing <= Float32(1.0e-9):
+                break
+            var next_fraction = fraction + gap / closing
+            if next_fraction <= fraction:
+                break
+            fraction = min(next_fraction, max_fraction)
+            last_normal = normal
+        result.fraction = fraction
+        return result^
+
+    def _apply_angular_ccd_impulse(mut self, slot: Int, obstacle: Int, point: Vec3, normal: Vec3):
+        ref body = self.bodies[slot]
+        var arm = point - body.pos
+        var closing = (body.linear_vel + body.angular_vel.cross(arm)).dot(normal)
+        if closing >= Float32(0):
+            return
+        var lever = body.rot.conjugate().rotate(arm.cross(normal))
+        var inverse_effective_mass = body.inv_mass + (
+            lever.x * lever.x / max(body.local_inertia.x, Float32(1.0e-8))
+            + lever.y * lever.y / max(body.local_inertia.y, Float32(1.0e-8))
+            + lever.z * lever.z / max(body.local_inertia.z, Float32(1.0e-8))
+        )
+        var restitution = max(body.restitution, self.bodies[obstacle].restitution)
+        var impulse = -(Float32(1) + restitution) * closing / inverse_effective_mass
+        self.apply_impulse_at(slot, normal * impulse, point)
+
+    def _cast_ccd_body(
+        self, mover_slot: Int, target_slot: Int, relative_delta: Vec3, max_fraction: Float32,
+    ) -> SceneCastHit:
+        ref mover = self.bodies[mover_slot]
+        if mover.shape == BODY_SHAPE_COMPOUND:
+            var best = SceneCastHit()
+            best.fraction = max_fraction
+            ref children = self.compounds[mover.shape_index].children
+            for child_index in range(len(children)):
+                ref child = children[child_index]
+                var pose = child.world_pose(mover.pos, mover.rot)
+                var hull: ConvexHull
+                var radius = Float32(0)
+                if child.shape == COMPOUND_CHILD_SPHERE:
+                    hull = _make_point_hull()
+                    radius = child.radius
+                elif child.shape == COMPOUND_CHILD_CAPSULE:
+                    hull = _make_segment_hull(child.half_height)
+                    radius = child.radius
+                else:
+                    hull = self._child_as_hull(child)
+                var hit = self._shapecast_hull_vs_body(
+                    hull, radius, pose[0], pose[1], relative_delta, target_slot, best.fraction,
+                )
+                if hit.hit and hit.fraction < best.fraction:
+                    best = hit
+            return best^
+        var core = self._ccd_convex_core(mover_slot)
+        return self._shapecast_hull_vs_body(
+            core[0], core[1], mover.pos, mover.rot, relative_delta, target_slot, max_fraction,
+        )
+
     def _run_ccd_clamp(
         mut self,
         dt: Float32,
         mut clamped_slots: List[Int],
         mut clamped_vpost: List[Vec3],
         mut clamped_rem: List[Float32],
+        mut angular_carry: List[Tuple[Int, Vec3, Vec3]],
     ):
         """Swept anti-tunneling clamp for bodies with `enable_ccd = True` against all collider shapes
         (`Sphere`, `Box`, `Capsule`, `ConvexHull`, `Bvh8MeshCollider`, `HeightfieldCollider`, `CompoundShape`).
-        Applies a momentum-conserving bilateral impulse to any hit dynamic body and scales the
+        Rotating boxes, capsules and convex hulls also sweep their predicted constant-axis arc
+        against static spheres, boxes, capsules and hulls. Other pairs use starting orientations.
+        Linear CCD applies a bilateral impulse and scales the
         remaining-tick solver velocity by `(1 - toi)` to prevent double-integration."""
+        # The retained BVH holds present positions. Expand the query by target travel
+        # so a moving collider which enters the mover's swept bounds is included.
+        var have_travel_bounds = False
+        var min_travel = Vec3()
+        var max_travel = Vec3()
         for i in range(len(self.bodies)):
             if not self.bodies[i].active or self.bodies[i].is_static or not self.bodies[i].awake or not self.bodies[i].enable_ccd:
                 continue
@@ -4442,89 +4615,88 @@ struct PhysicsWorld(Resource, Movable):
             ) else min(
                 self.bodies[i].half_extents.x, min(self.bodies[i].half_extents.y, self.bodies[i].half_extents.z)
             )
-            if step_vec.length_squared() <= r_core * r_core:
+            var linear_fast = step_vec.length_squared() > r_core * r_core
+            var axis = Vec3()
+            var angle = Float32(0)
+            var angular_travel = Float32(0)
+            ref mover = self.bodies[i]
+            if mover.shape >= BODY_SHAPE_CAPSULE and mover.shape <= BODY_SHAPE_CONVEX_HULL:
+                var speed = mover.angular_vel.length()
+                if speed > Float32(1.0e-6):
+                    # The solver normalizes its Euler quaternion once per substep and
+                    # limits turn per substep. Match the unforced constant-spin arc.
+                    var steps = Float32(max(1, min(64, self.settings.substeps)))
+                    var turn = min(speed * dt / steps, MAX_TURN_PER_SUBSTEP)
+                    angle = steps * Float32(2) * det_atan(turn * Float32(0.5))
+                    axis = mover.angular_vel * (Float32(1) / speed)
+                    var radius = mover.radius
+                    if mover.shape == BODY_SHAPE_CAPSULE:
+                        radius = mover.half_height * axis.cross(mover.rot.rotate(Vec3(0, 1, 0))).length()
+                    angular_travel = angle * radius
+            var angular_fast = angular_travel > max(Float32(0.0015), r_core * Float32(0.25))
+            if not linear_fast and not angular_fast:
                 continue
 
-            var p0 = self.bodies[i].pos
-            var p1 = p0 + step_vec
-            var r_vec = Vec3(r_core, r_core, r_core)
-            var s_lo = Vec3(min(p0.x, p1.x), min(p0.y, p1.y), min(p0.z, p1.z)) - r_vec
-            var s_hi = Vec3(max(p0.x, p1.x), max(p0.y, p1.y), max(p0.z, p1.z)) + r_vec
-            var cands = List[Int]()
-            self._query_bvh8_aabb_candidates(s_lo, s_hi, self.bodies[i].filter, self.bodies[i].id, cands)
+            if not have_travel_bounds:
+                for slot in range(len(self.bodies)):
+                    ref target = self.bodies[slot]
+                    if target.active and target.awake:
+                        var d = target.linear_vel * dt
+                        min_travel = Vec3(min(min_travel.x, d.x), min(min_travel.y, d.y), min(min_travel.z, d.z))
+                        max_travel = Vec3(max(max_travel.x, d.x), max(max_travel.y, d.y), max(max_travel.z, d.z))
+                have_travel_bounds = True
 
+            var p0 = self.bodies[i].pos
+            var bounds = self.bodies[i].tight_aabb_full(self.hulls, self.meshes, self.heightfields, self.compounds)
+            var lo = bounds[0]
+            var hi = bounds[1]
+            var s_lo = lo + Vec3(min(Float32(0), step_vec.x), min(Float32(0), step_vec.y), min(Float32(0), step_vec.z))
+            var s_hi = hi + Vec3(max(Float32(0), step_vec.x), max(Float32(0), step_vec.y), max(Float32(0), step_vec.z))
+            if angular_fast:
+                var pad = Vec3(angular_travel, angular_travel, angular_travel)
+                s_lo = s_lo - pad
+                s_hi = s_hi + pad
+            var cands = List[Int]()
+            self._query_bvh8_aabb_candidates(s_lo - max_travel, s_hi - min_travel, self.bodies[i].filter, self.bodies[i].id, cands)
             var best_toi = Float32(1.0)
             var best_normal = Vec3(0.0, 1.0, 0.0)
             var best_slot = -1
-            var hit_any = False
-            var proj_hull = self._body_as_hull(i)
-            var proj_rot = self.bodies[i].rot
-            var proj_is_sphere = self.bodies[i].shape == BODY_SHAPE_SPHERE
-
+            var angular_clamp = False
+            var angular_hit = SceneCastHit()
             for ck in range(len(cands)):
-                var m_slot = cands[ck]
-                if m_slot == i or not self.bodies[m_slot].active:
+                var slot = cands[ck]
+                if slot == i or not self.bodies[slot].active:
                     continue
-                ref mb = self.bodies[m_slot]
-                var mb_p0 = mb.pos
-                var mb_p1 = mb.pos + (mb.linear_vel * dt if mb.awake else Vec3())
+                ref target = self.bodies[slot]
+                if angular_fast and target.motion_mode == BODY_MOTION_STATIC and target.shape <= BODY_SHAPE_CONVEX_HULL:
+                    var angular = self._cast_angular_ccd(i, slot, step_vec, axis, angle, angular_travel, best_toi)
+                    if angular.fraction < best_toi:
+                        best_toi = angular.fraction
+                        best_slot = slot
+                        angular_clamp = True
+                        angular_hit = angular
+                    continue
+                if not linear_fast:
+                    continue
+                var target_delta = target.linear_vel * dt if target.awake else Vec3()
+                var hit = self._cast_ccd_body(i, slot, step_vec - target_delta, best_toi)
+                if hit.hit and hit.fraction < best_toi:
+                    best_toi = hit.fraction
+                    best_normal = hit.normal
+                    best_slot = slot
+                    angular_clamp = False
 
-                if mb.shape == BODY_SHAPE_MESH_BVH8 and mb.shape_index >= 0 and mb.shape_index < len(self.meshes):
-                    var sh = self.meshes[mb.shape_index].swept_sphere_moving_bvh8(p0, p1, r_core, mb_p0, mb.rot, mb_p1, mb.rot)
-                    if sh.hit and sh.toi < best_toi:
-                        best_toi = sh.toi
-                        best_normal = sh.normal
-                        best_slot = m_slot
-                        hit_any = True
-                elif mb.shape == BODY_SHAPE_HEIGHTFIELD and mb.shape_index >= 0 and mb.shape_index < len(self.heightfields):
-                    var inv_mr = mb.rot.conjugate()
-                    var sh = self.heightfields[mb.shape_index].sweep_sphere(
-                        inv_mr.rotate(p0 - mb_p0), inv_mr.rotate(step_vec), r_core, best_toi,
-                    )
-                    if sh.hit and sh.toi < best_toi:
-                        best_toi = sh.toi
-                        best_normal = mb.rot.rotate(sh.normal).normalized()
-                        best_slot = m_slot
-                        hit_any = True
-                elif mb.shape == BODY_SHAPE_SPHERE:
-                    var sh = swept_sphere_moving_sphere(p0, p1, r_core, mb_p0, mb_p1, mb.radius)
-                    if sh.hit and sh.toi < best_toi:
-                        best_toi = sh.toi
-                        best_normal = sh.normal
-                        best_slot = m_slot
-                        hit_any = True
-                elif mb.shape == BODY_SHAPE_BOX:
-                    var rel_p1 = p0 + (step_vec - (mb_p1 - mb_p0))
-                    var sh = swept_sphere_obb(p0, rel_p1, r_core, mb_p0, mb.rot, mb.half_extents) if proj_is_sphere else _swept_inflated_hull_cast(
-                        proj_hull, Float32(0.0), p0, p1, proj_rot, _make_box_hull(mb.half_extents), mb_p0, mb_p1, mb.rot,
-                    )
-                    if sh.hit and sh.toi < best_toi:
-                        best_toi = sh.toi
-                        best_normal = sh.normal
-                        best_slot = m_slot
-                        hit_any = True
-                elif mb.shape == BODY_SHAPE_CAPSULE or mb.shape == BODY_SHAPE_CONVEX_HULL:
-                    var thull = self._body_as_hull(m_slot)
-                    var sh = _swept_inflated_hull_cast(proj_hull, Float32(0.0), p0, p1, proj_rot, thull, mb_p0, mb_p1, mb.rot)
-                    if sh.hit and sh.toi < best_toi:
-                        best_toi = sh.toi
-                        best_normal = sh.normal
-                        best_slot = m_slot
-                        hit_any = True
-                elif mb.shape == BODY_SHAPE_COMPOUND and mb.shape_index >= 0 and mb.shape_index < len(self.compounds):
-                    ref cmp = self.compounds[mb.shape_index]
-                    for ci in range(len(cmp.children)):
-                        var wp_wr = cmp.children[ci].world_pose(mb_p0, mb.rot)
-                        var wp_wr1 = cmp.children[ci].world_pose(mb_p1, mb.rot)
-                        var ch_hull = self._child_as_hull(cmp.children[ci])
-                        var sh = _swept_inflated_hull_cast(proj_hull, Float32(0.0), p0, p1, proj_rot, ch_hull, wp_wr[0], wp_wr1[0], wp_wr[1])
-                        if sh.hit and sh.toi < best_toi:
-                            best_toi = sh.toi
-                            best_normal = sh.normal
-                            best_slot = m_slot
-                            hit_any = True
-
-            if hit_any and best_toi < Float32(1.0):
+            if angular_clamp:
+                # Consume the trajectory only to the hit (or last certified safe time).
+                # The ordinary solver can still add gravity, joints and other impulses.
+                self.bodies[i].pos = p0 + step_vec * best_toi
+                self.bodies[i].rot = (angle_axis(angle * best_toi, axis) * self.bodies[i].rot).normalized()
+                if angular_hit.hit:
+                    self._apply_angular_ccd_impulse(i, best_slot, angular_hit.point, angular_hit.normal)
+                angular_carry.append((i, self.bodies[i].linear_vel, self.bodies[i].angular_vel))
+                self.bodies[i].linear_vel = Vec3()
+                self.bodies[i].angular_vel = Vec3()
+            elif best_slot >= 0 and best_toi < Float32(1.0):
                 var n = best_normal.normalized()
                 var v_a = self.bodies[i].linear_vel
                 var other_dyn = best_slot >= 0 and not self.bodies[best_slot].is_static
@@ -4800,7 +4972,8 @@ struct PhysicsWorld(Resource, Movable):
         var ccd_slots = List[Int]()
         var ccd_vpost = List[Vec3]()
         var ccd_rem = List[Float32]()
-        self._run_ccd_clamp(step_dt, ccd_slots, ccd_vpost, ccd_rem)
+        var angular_carry = List[Tuple[Int, Vec3, Vec3]]()
+        self._run_ccd_clamp(step_dt, ccd_slots, ccd_vpost, ccd_rem, angular_carry)
 
         # 3. Broadphase over all active bodies (retained into `self.broadphase_nodes` to avoid double rebuild)
         var bp_in = BroadphaseInput()
@@ -5435,6 +5608,11 @@ struct PhysicsWorld(Resource, Movable):
                 var dv_solver = self.bodies[cs].linear_vel - vp * rf
                 self.bodies[cs].linear_vel = vp + dv_solver
 
+        for carry in angular_carry:
+            ref body = self.bodies[carry[0]]
+            body.linear_vel = body.linear_vel + carry[1]
+            body.angular_vel = body.angular_vel + carry[2]
+
         # 9b. Sync post-solve body poses & velocities back to M2a subsystems
         if len(self.vehicles) > 0 or len(self.aero_bodies) > 0 or len(self.ragdolls) > 0:
             self._sync_m2_post_solve(step_dt)
@@ -5645,11 +5823,53 @@ struct PhysicsWorld(Resource, Movable):
     # Bit-Exact Rollback & Play-In-Editor Snapshot Serialization
     # =========================================================================
 
+    def _geometry_digest(self, mesh_count: Int, field_count: Int) -> UInt64:
+        """Hash external collision geometry in slot order, excluding derived acceleration trees."""
+        var h = _geometry_word(UInt64(0xcbf29ce484222325), UInt64(mesh_count))
+        for i in range(mesh_count):
+            ref mesh = self.meshes[i]
+            h = _geometry_word(h, UInt64(len(mesh.triangles)))
+            for tri in mesh.triangles:
+                h = _geometry_vec(h, tri.v0)
+                h = _geometry_vec(h, tri.v1)
+                h = _geometry_vec(h, tri.v2)
+                h = _geometry_vec(h, tri.normal)
+                h = _geometry_word(h, UInt64(tri.active_edges))
+                h = _geometry_word(h, UInt64(tri.material_id))
+        h = _geometry_word(h, UInt64(field_count))
+        for i in range(field_count):
+            ref hf = self.heightfields[i]
+            h = _geometry_word(h, UInt64(hf.nx))
+            h = _geometry_word(h, UInt64(hf.nz))
+            h = _geometry_vec(h, hf.origin)
+            h = _geometry_word(h, UInt64(float32_bits(hf.cell_size)))
+            h = _geometry_word(h, UInt64(float32_bits(hf.min_y)))
+            h = _geometry_word(h, UInt64(float32_bits(hf.max_y)))
+            h = _geometry_word(h, UInt64(float32_bits(hf.y_scale)))
+            h = _geometry_word(h, UInt64(hf.material_id))
+            h = _geometry_word(h, UInt64(len(hf.heights_u16)))
+            for height in hf.heights_u16:
+                h = _geometry_word(h, UInt64(height))
+        return h
+
     def serialize(self, mut w: BlobWriter):
         """Writes 100% of dynamic `PhysicsWorld` state (`bodies`, `sleep_ticks`, `joints`,
         `six_dof_joints`, `cache`, `graph`, `islands`, `sensors`, `triggers`, `force_world`,
         `settings`, `hulls`, `compounds`) as an IEEE-754 bit-exact versioned `'PHYW'` blob."""
         w.begin(WORLD_BLOB_TAG, WORLD_BLOB_VERSION)
+        var mesh_count = 0
+        var field_count = 0
+        if len(self.meshes) > 0 or len(self.heightfields) > 0:
+            for b in self.bodies:
+                if b.shape == BODY_SHAPE_MESH_BVH8:
+                    mesh_count = max(mesh_count, b.shape_index + 1)
+                elif b.shape == BODY_SHAPE_HEIGHTFIELD:
+                    field_count = max(field_count, b.shape_index + 1)
+        mesh_count = min(mesh_count, len(self.meshes))
+        field_count = min(field_count, len(self.heightfields))
+        w.integer(mesh_count)
+        w.integer(field_count)
+        w.u64(self._geometry_digest(mesh_count, field_count))
 
         # 1. World scalars & SolverSettings
         w.f32(self.gravity)
@@ -5877,6 +6097,18 @@ struct PhysicsWorld(Resource, Movable):
     def deserialize(mut self, mut r: BlobReader) raises:
         """Restores 100% of dynamic `PhysicsWorld` state from a `'PHYW'` snapshot blob."""
         var ver = r.enter(WORLD_BLOB_TAG, WORLD_BLOB_VERSION)
+        var mesh_count = len(self.meshes)
+        var field_count = len(self.heightfields)
+        if ver >= 4:
+            mesh_count = r.integer()
+            field_count = r.integer()
+            var digest = r.u64()
+            if (
+                r.failed or mesh_count < 0 or mesh_count > len(self.meshes)
+                or field_count < 0 or field_count > len(self.heightfields)
+                or digest != self._geometry_digest(mesh_count, field_count)
+            ):
+                raise Error("physics world blob: external collision geometry mismatch")
 
         self.gravity = r.f32()
         self.water_enabled = r.boolean()
@@ -5978,9 +6210,9 @@ struct PhysicsWorld(Resource, Movable):
                 raise Error("physics world blob: invalid body shape")
             if b.shape == BODY_SHAPE_CONVEX_HULL and (b.shape_index < 0 or b.shape_index >= len(self.hulls)):
                 raise Error("physics world blob: convex hull shape_index out of bounds")
-            if b.shape == BODY_SHAPE_MESH_BVH8 and (b.shape_index < 0 or b.shape_index >= len(self.meshes)):
+            if b.shape == BODY_SHAPE_MESH_BVH8 and (b.shape_index < 0 or b.shape_index >= mesh_count):
                 raise Error("physics world blob: mesh shape_index out of bounds")
-            if b.shape == BODY_SHAPE_HEIGHTFIELD and (b.shape_index < 0 or b.shape_index >= len(self.heightfields)):
+            if b.shape == BODY_SHAPE_HEIGHTFIELD and (b.shape_index < 0 or b.shape_index >= field_count):
                 raise Error("physics world blob: heightfield shape_index out of bounds")
             if b.shape == BODY_SHAPE_COMPOUND and (b.shape_index < 0 or b.shape_index >= len(self.compounds)):
                 raise Error("physics world blob: compound shape_index out of bounds")

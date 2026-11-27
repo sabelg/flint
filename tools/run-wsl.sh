@@ -25,6 +25,15 @@ if [[ ! -x "$build/player" ]]; then
         -I "$kit/game/src" -I "$kit/engine/src" "$(cat "$kit/optimization")" "${flags[@]}" -o "$build/player.next"
     mv "$build/player.next" "$build/player"
 fi
+if [[ -f "$kit/gameplay-entry" ]]; then
+    if [[ ! -f "$build/gameplay.so" ]]; then
+        mapfile -t flags < "$kit/flags"
+        "$pixi_bin" run --manifest-path "$build/pixi.toml" mojo build "$kit/game/$(cat "$kit/gameplay-entry")" \
+            -I "$kit/game/src" -I "$kit/engine/src" --emit shared-lib -O3 "${flags[@]}" -o "$build/gameplay.next.so"
+        mv "$build/gameplay.next.so" "$build/gameplay.so"
+    fi
+    export FLINT_GAMEPLAY_PLUGIN="$build/gameplay.so"
+fi
 flock -u 9
 cd "$here"
 export LD_LIBRARY_PATH="$build/.pixi/envs/default/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

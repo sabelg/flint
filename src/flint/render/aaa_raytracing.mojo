@@ -39,6 +39,7 @@ from flint.platform.vulkan import (
 )
 from flint.render.spirv import AaaSpirvModule
 from flint.render.aaa_visbuffer import (
+    emit_alpha_cutoff,
     AAA_INSTANCE_WORDS,
     emit_mat4_mul_dir,
     emit_mat4_mul_point,
@@ -455,7 +456,7 @@ def _emit_rt_candidate_alpha_loop(
 ):
     """Hardware-accelerated `SPV_KHR_ray_query` traversal loop:
     99% of opaque BLAS/instances (`FORCE_OPAQUE`) auto-commit in RT silicon; non-opaque foliage/fence
-    candidates (`FORCE_NO_OPAQUE`) test `bindless_arr[t_alb]` alpha >= `0.48` via candidate barycentrics!"""
+    candidates (`FORCE_NO_OPAQUE`) sample the authored material mask via candidate barycentrics."""
     s.begin_loop()
     var cont = s.ray_query_proceed(rq)
     s.break_if(s.logical_not(cont))
@@ -478,7 +479,9 @@ def _emit_rt_candidate_alpha_loop(
         var c_tex_pk = s.load_word(b_materials, s.iadd(c_mbase, s.uint(23)))
         var c_talb = s.bit_and(c_tex_pk, s.uint(0xFF))
 
-        var pass_alpha = s.uvar(s.uint(1))
+        var threshold = emit_alpha_cutoff(s, c_w39)
+        var fully_cut = s.logical_and(s.flt(c_raw_sf, s.float(0.0)), s.fgt(threshold, s.float(1.0)))
+        var pass_alpha = s.uvar(s.select_u(fully_cut, s.uint(0), s.uint(1)))
         s.begin_if(s.logical_and(s.flt(c_raw_sf, s.float(0.0)), s.ult(c_talb, s.uint(0xFF))))
         var c_ioff = s.iadd(c_fidx, s.imul(c_prim, s.uint(3)))
         var c_v0 = s.imul(s.load_word(b_indices, c_ioff), s.uint(12))
@@ -494,7 +497,7 @@ def _emit_rt_candidate_alpha_loop(
         )
         var s_ca = s.sample_bindless_lod(bindless_arr, c_talb, s.vec2(cu, cv), s.float(1.0))
         var ca_boost = s.fmul(s.extract_f(s_ca, 3), s.float(1.18))
-        s.store(pass_alpha, s.select_u(s.fge(ca_boost, s.float(0.48)), s.uint(1), s.uint(0)))
+        s.store(pass_alpha, s.select_u(s.fge(s.nmin(ca_boost, s.float(1.0)), threshold), s.uint(1), s.uint(0)))
         s.end_if()
 
         s.begin_if(s.ine(s.load_u(pass_alpha), s.uint(0)))

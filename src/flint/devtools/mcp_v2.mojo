@@ -101,6 +101,7 @@ from flint.studio.studio_app import (
     FlintStudioState,
     StudioEntityMetaComponent,
     StudioStyleComponent,
+    _resolve_flint_launcher_path,
     bake_procedural_to_glb,
     generate_procedural_forge_model,
 )
@@ -3016,15 +3017,19 @@ struct McpServerV2(Movable):
                 var so_parent = parent_directory(abs_so)
                 if so_parent.byte_length() > 0 and so_parent != ".":
                     _ = make_dirs(so_parent)
+                # The compiler job starts in the downstream project. Resolve the
+                # engine checkout in the Studio process before handing paths to it.
+                var launcher = _resolve_flint_launcher_path()
+                var engine_root = parent_directory(parent_directory(launcher)) if launcher else String(".")
+                var engine_src = _realpath_existing(engine_root + "/src")
+                if not engine_src[0] or not is_directory(engine_src[1] + "/flint"):
+                    engine_src = _realpath_existing("src")
                 var compiler = _first_str_arg(doc, args_node, "compiler")
                 if compiler.byte_length() == 0:
                     compiler = env_now("FLINT_MOJO_BIN")
                 if compiler.byte_length() == 0:
-                    var pixi_mojo = String(".pixi/envs/default/bin/mojo")
-                    if file_size(pixi_mojo) > 0:
-                        compiler = pixi_mojo
-                    else:
-                        compiler = String("mojo")
+                    var pixi_mojo = _realpath_existing(engine_root + "/.pixi/envs/default/bin/mojo")
+                    compiler = pixi_mojo[1] if pixi_mojo[0] else String("mojo")
                 if _has_forbidden_path_bytes(compiler):
                     return (True, '{"ok":false,"error":"invalid compiler path"}')
 
@@ -3035,8 +3040,8 @@ struct McpServerV2(Movable):
                 except:
                     pass
                 inc.append(proj_root + "/src")
-                if is_directory("src") and proj_root + "/src" != _normalize_abs_lexical(_getcwd_str() + "/src"):
-                    inc.append("src")
+                if engine_src[0] and is_directory(engine_src[1] + "/flint") and proj_root + "/src" != engine_src[1]:
+                    inc.append(engine_src[1])
 
                 var runner = JobRunner()
                 var jid = runner.start_gameplay_so_build(

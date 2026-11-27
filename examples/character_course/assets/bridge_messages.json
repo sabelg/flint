@@ -1,0 +1,14 @@
+{
+  "en": {
+    "arrival": "Guide ahead: ring the bell when you reach me.",
+    "greeting": "Guide on your right: [bell rings]",
+    "fall": "[Boots scrape against the stone]",
+    "recovery": "[Footsteps resume]"
+  },
+  "ar": {
+    "arrival": "المرشد أمامك: اقرع الجرس عندما تصل إلي.",
+    "greeting": "المرشد على يمينك: [رنين الجرس]",
+    "fall": "[احتكاك الحذاء بالحجر]",
+    "recovery": "[استئناف الخطوات]"
+  }
+}

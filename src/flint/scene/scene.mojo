@@ -32,7 +32,7 @@ from flint.core.serial import BlobWriter, BlobReader, fourcc
 from flint.core.transform import Quat
 from flint.assets.json import JsonDocument, parse_json
 from flint.assets.json_write import json_quote, json_text
-from flint.platform.os import read_bytes, write_bytes
+from flint.platform.os import read_bytes, write_file_durable
 from flint.ecs.world import (
     World,
     Entity,
@@ -1393,7 +1393,7 @@ def prefab_to_json(prefab: Prefab) -> String:
 def save_flprefab_file(path: String, prefab: Prefab) -> Bool:
     var txt = prefab_to_json(prefab)
     var raw = _string_to_bytes(txt)
-    return write_bytes(path, raw)
+    return write_file_durable(path, raw)
 
 
 def load_flprefab_bytes(data: List[UInt8]) raises -> Prefab:
@@ -1736,14 +1736,30 @@ struct Scene(Movable):
         var doc = parse_json(_string_to_bytes(raw))
         if not doc.valid:
             raise Error("generated .flscn JSON failed strict validation")
-        return json_text(doc, doc.root) + "\n"
+        # Give independent entity and component edits independent lines in source control.
+        var pretty = String("{\n  \"format\": \"flscn\",\n  \"version\": ") + String(SCENE_SCHEMA_VERSION)
+        pretty += ",\n  \"name\": " + json_quote(self.name) + ",\n  \"entities\": ["
+        var array = doc.object_get(doc.root, "entities")
+        for i in range(doc.array_size(array)):
+            var item = doc.at(array, i)
+            pretty += "\n    {\"slot\": " + String(i) + ", \"parent\": " + json_text(doc, doc.object_get(item, "parent"))
+            pretty += ", \"components\": {"
+            ref components = doc.nodes[doc.object_get(item, "components")]
+            for j in range(len(components.keys)):
+                pretty += "\n      " + json_quote(components.keys[j]) + ": " + json_text(doc, components.children[j])
+                if j + 1 < len(components.keys):
+                    pretty += ","
+            pretty += "\n    }}"
+            if i + 1 < doc.array_size(array):
+                pretty += ","
+        return pretty + "\n  ]\n}\n"
 
     def save_flscn_bytes(self, world: World, registry: ComponentRegistry) raises -> List[UInt8]:
         return _string_to_bytes(self.save_flscn_string(world, registry))
 
     def save_flscn_file(self, path: String, world: World, registry: ComponentRegistry) raises -> Bool:
         var data = self.save_flscn_bytes(world, registry)
-        return write_bytes(path, data)
+        return write_file_durable(path, data)
 
     def load_flscn_bytes(
         mut self,
@@ -1795,6 +1811,22 @@ struct Scene(Movable):
         if ents_arr >= 0 and doc.nodes[ents_arr].kind != 4:
             raise Error("invalid entities array in .flscn")
         var count = doc.array_size(ents_arr)
+        # Saved files explicitly identify each slot. Honor it if a merge or editor
+        # reorders the JSON array. Older files may omit slot and use array order.
+        var explicit_slots = count > 0
+        for i in range(count):
+            if doc.object_get(doc.at(ents_arr, i), "slot") < 0:
+                explicit_slots = False
+                break
+        if explicit_slots:
+            var ordered = List[Int](length=count, fill=-1)
+            for i in range(count):
+                var node = doc.at(ents_arr, i)
+                var slot = doc.integer(doc.object_get(node, "slot"), -1)
+                if slot < 0 or slot >= count or ordered[slot] != -1:
+                    raise Error("duplicate or out-of-range scene entity slot")
+                ordered[slot] = node
+            doc.nodes[ents_arr].children = ordered^
 
         # Stage parse, component decoding, parent range & cycle checks in an isolated World
         # before mutating `world` or `self.name`.
@@ -1918,11 +1950,18 @@ struct Scene(Movable):
 
     def save_flscnb_bytes(self, world: World, registry: ComponentRegistry) -> List[UInt8]:
         """Serializes `world` into versioned `BlobWriter` chunks and compresses with `lz4_pack`."""
-        var ents = _collect_sorted_world_entities(world)
-        var max_idx = len(world.entities)
-        var ent_to_slot = List[Int](length=max(1, max_idx), fill=-1)
-        for slot in range(len(ents)):
-            ent_to_slot[Int(ents[slot].index)] = slot
+        return self.save_flscnb_entities(world, registry, _collect_sorted_world_entities(world))
+
+    def save_flscnb_entities(
+        self, world: World, registry: ComponentRegistry, selection: List[Entity],
+    ) -> List[UInt8]:
+        """Serialize live selected entities and their intra-selection hierarchy in selection order."""
+        var ent_to_slot = List[Int](length=max(1, len(world.entities)), fill=-1)
+        var ents = List[Entity](capacity=len(selection))
+        for entity in selection:
+            if world.is_alive(entity) and ent_to_slot[Int(entity.index)] < 0:
+                ent_to_slot[Int(entity.index)] = len(ents)
+                ents.append(entity)
 
         var sorted_codecs = registry.sorted_entry_indices()
         var writer = BlobWriter()
@@ -1979,7 +2018,7 @@ struct Scene(Movable):
 
     def save_flscnb_file(self, path: String, world: World, registry: ComponentRegistry) -> Bool:
         var packed = self.save_flscnb_bytes(world, registry)
-        return write_bytes(path, packed)
+        return write_file_durable(path, packed)
 
     def load_flscnb_bytes(
         mut self,

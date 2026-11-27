@@ -1,6 +1,6 @@
 """Reduce synchronized baked keys and verify world-space error on the skinned rig."""
 from std.math import isfinite, sqrt
-from flint.assets.model import NativeAnimation, NativeModel
+from flint.assets.model import INTERP_CUBICSPLINE, NativeAnimation, NativeChannel, NativeModel
 from flint.core.math import Vec3
 
 
@@ -16,11 +16,17 @@ def _markers(mut model: NativeModel, index: Int, t: Float32) -> List[Vec3]:
     return result^
 
 
+def _key_width(channel: NativeChannel) -> Int:
+    var components = channel.components()
+    # Each cubic key carries an incoming tangent, a value and an outgoing tangent.
+    return components * 3 if channel.interp_mode == INTERP_CUBICSPLINE and not channel.step else components
+
+
 def _keys(a: NativeAnimation, keep: List[Bool]) -> NativeAnimation:
     var result = a.copy()
     for idx in range(len(result.channels)):
         ref ch = result.channels[idx]
-        var width = 4 if ch.path == 1 else 3
+        var width = _key_width(ch)
         var values = List[Float32]()
         var times = List[Float32]()
         for i in range(len(keep)):
@@ -46,9 +52,9 @@ def optimize_bake(
         raise Error("Animation requires at least two keyframes to optimize")
     for idx in range(len(source.channels)):
         ref ch = source.channels[idx]
-        var width = 4 if ch.path == 1 else 3
-        if len(ch.times) != n or len(ch.values) < n * width:
-            raise Error("Animation channels must have synchronized keyframe counts")
+        var width = _key_width(ch)
+        if ch.times != source.channels[0].times or len(ch.values) != n * width:
+            raise Error("Baked channels need synchronized key times and matching values")
         for f in range(n):
             if not isfinite(ch.times[f]):
                 raise Error("Animation channel keyframe times must be finite")

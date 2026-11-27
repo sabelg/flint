@@ -82,6 +82,68 @@ def wl_get_string(data: List[UInt8], offset: Int, max_end: Int) -> String:
     return String(unsafe_from_utf8=bytes)
 
 
+def wl_string_end(data: List[UInt8], offset: Int) -> Int:
+    """Offset just past the (padded) Wayland string argument at `offset`."""
+    if offset + 4 > len(data):
+        return len(data)
+    var length = wl_get32(data, offset)
+    return offset + 4 + ((length + 3) & ~3)
+
+
+struct WaylandOutputInfo(Copyable, Movable):
+    """One monitor (`wl_output`): connector name, current mode, refresh, integer scale and position."""
+    var global_name: Int  # registry name (for global_remove)
+    var proxy: Int  # our wl_output object id
+    var name: String  # e.g. "DP-1" (wl_output v4), else make + model
+    var description: String
+    var make: String
+    var model: String
+    var x: Int
+    var y: Int
+    var width: Int  # current mode, pixels
+    var height: Int
+    var refresh_mhz: Int
+    var scale: Int
+    var physical_width_mm: Int
+    var physical_height_mm: Int
+    var done: Bool
+
+    def __init__(out self):
+        self.global_name = 0
+        self.proxy = 0
+        self.name = ""
+        self.description = ""
+        self.make = ""
+        self.model = ""
+        self.x = 0
+        self.y = 0
+        self.width = 0
+        self.height = 0
+        self.refresh_mhz = 0
+        self.scale = 1
+        self.physical_width_mm = 0
+        self.physical_height_mm = 0
+        self.done = False
+
+    def logical_width(self) -> Int:
+        return self.width // max(1, self.scale)
+
+    def logical_height(self) -> Int:
+        return self.height // max(1, self.scale)
+
+
+def wayland_pick_output(outputs: List[WaylandOutputInfo], name: String, index: Int) -> Int:
+    """Index of the output called `name` (when non-empty), else `index` if valid; -1 when neither matches."""
+    if name.byte_length() > 0:
+        for i in range(len(outputs)):
+            if outputs[i].name == name:
+                return i
+        return -1
+    if index >= 0 and index < len(outputs):
+        return index
+    return -1
+
+
 def wl_append_nullable_string(mut data: List[UInt8], value: String):
     if value.byte_length() == 0:
         wl_append32(data, 0)
@@ -246,6 +308,16 @@ struct WaylandWindow(WindowBackend):
     var maximized: Bool
     var next_id: Int
     var registry: Int
+    var presentation: Int
+    var feedback_ids: List[Int]
+    var feedback_free: List[Int]
+    var presented_ns: List[Int]
+    var feedback_requested: Int
+    var feedback_discarded: Int
+    var feedback_refresh_ns: Int
+    var outputs: List[WaylandOutputInfo]  # bound wl_output globals (the monitor list)
+    var fullscreen_output: Int  # wl_output proxy for set_fullscreen (0 = compositor's choice)
+    var current_output: Int  # wl_output proxy the surface last entered (0 = unknown)
     var compositor: Int
     var compositor_name: Int
     var shm: Int
@@ -354,6 +426,16 @@ struct WaylandWindow(WindowBackend):
         self.maximized = False
         self.next_id = 2
         self.registry = 0
+        self.presentation = 0
+        self.feedback_ids = List[Int]()
+        self.feedback_free = List[Int]()
+        self.presented_ns = List[Int]()
+        self.feedback_requested = 0
+        self.feedback_discarded = 0
+        self.feedback_refresh_ns = 0
+        self.outputs = List[WaylandOutputInfo]()
+        self.fullscreen_output = 0
+        self.current_output = 0
         self.compositor = 0
         self.compositor_name = 0
         self.shm = 0
@@ -461,6 +543,13 @@ struct WaylandWindow(WindowBackend):
         self.maximized = existing.maximized
         self.next_id = existing.next_id
         self.registry = existing.registry
+        self.presentation = existing.presentation
+        self.feedback_ids = existing.feedback_ids^
+        self.feedback_free = existing.feedback_free^
+        self.presented_ns = existing.presented_ns^
+        self.feedback_requested = existing.feedback_requested
+        self.feedback_discarded = existing.feedback_discarded
+        self.feedback_refresh_ns = existing.feedback_refresh_ns
         self.compositor = existing.compositor
         self.compositor_name = existing.compositor_name
         self.shm = existing.shm
@@ -554,6 +643,9 @@ struct WaylandWindow(WindowBackend):
         self.xkb_keymap = existing.xkb_keymap^
         self.pending_text_utf8 = existing.pending_text_utf8^
         self.evdev = existing.evdev^
+        self.outputs = existing.outputs^
+        self.fullscreen_output = existing.fullscreen_output
+        self.current_output = existing.current_output
         existing.fd = -1
         existing.shared_fd = -1
         existing.shared_size = 0
@@ -783,6 +875,26 @@ struct WaylandWindow(WindowBackend):
         if not self.request(self.registry, 0, body):
             return 0
         return object
+
+    def request_presentation_feedback(mut self) -> Bool:
+        """Attach one feedback request to the next wl_surface commit. Reuse IDs only after delete_id."""
+        if self.presentation == 0 or self.surface == 0:
+            return False
+        var id: Int
+        if self.feedback_free:
+            id = self.feedback_free.pop()
+        elif len(self.feedback_ids) < 32:
+            id = self.allocate_id()
+            self.feedback_ids.append(id)
+        else:
+            return False
+        var body = List[UInt8]()
+        wl_append32(body, self.surface)
+        wl_append32(body, id)
+        if not self.request(self.presentation, 1, body):
+            return False
+        self.feedback_requested += 1
+        return True
 
     def sync(mut self) -> Int:
         var callback = self.allocate_id()
@@ -1025,6 +1137,22 @@ struct WaylandWindow(WindowBackend):
                 self.close_requested = True
             return
         if object == 1 and opcode == 1:
+            if size >= 12 and self.feedback_ids:
+                var id = wl_get32(pkt, 8)
+                if id in self.feedback_ids and id not in self.feedback_free:
+                    self.feedback_free.append(id)
+            return
+        if self.feedback_ids and object in self.feedback_ids:
+            if opcode == 1 and size >= 36:  # wp_presentation_feedback.presented
+                var seconds = (wl_get32(pkt, 8) << 32) | wl_get32(pkt, 12)
+                self.presented_ns.append(seconds * 1000000000 + wl_get32(pkt, 16))
+                var refresh = wl_get32(pkt, 20)
+                if self.feedback_refresh_ns != refresh and self.feedback_refresh_ns != 0:
+                    self.feedback_refresh_ns = -1
+                elif self.feedback_refresh_ns == 0:
+                    self.feedback_refresh_ns = refresh
+            elif opcode == 2:  # wp_presentation_feedback.discarded
+                self.feedback_discarded += 1
             return
         if object == self.registry and opcode == 0 and size >= 20:
             var name = wl_get32(pkt, 8)
@@ -1047,6 +1175,8 @@ struct WaylandWindow(WindowBackend):
                 self.shm = self.bind_global(name, interface, 1)
             elif interface == "zwp_linux_dmabuf_v1" and self.dmabuf == 0 and version >= 2:
                 self.dmabuf = self.bind_global(name, interface, min(version, 3))
+            elif interface == "wp_presentation" and self.presentation == 0:
+                self.presentation = self.bind_global(name, interface, 1)
             elif interface == "wp_viewporter" and self.viewporter == 0:
                 self.viewporter = self.bind_global(name, interface, 1)
             elif interface == "zwp_pointer_constraints_v1" and self.pointer_constraints == 0:
@@ -1069,9 +1199,35 @@ struct WaylandWindow(WindowBackend):
                 self.data_device_version = min(version, 3)
                 self.data_device_manager = self.bind_global(name, interface, self.data_device_version)
                 self.ensure_data_device()
+            elif interface == "wl_output":
+                var info = WaylandOutputInfo()
+                info.global_name = name
+                info.proxy = self.bind_global(name, interface, min(version, 4))
+                self.outputs.append(info^)
             return
+        if object == self.registry and opcode == 1 and size >= 12:  # global_remove
+            var gone = wl_get32(pkt, 8)
+            for i in range(len(self.outputs)):
+                if self.outputs[i].global_name == gone:
+                    var proxy = self.outputs[i].proxy
+                    if self.fullscreen_output == proxy:
+                        self.fullscreen_output = 0
+                    if self.current_output == proxy:
+                        self.current_output = 0
+                    _ = self.outputs.pop(i)
+                    break
+            return
+        for oi in range(len(self.outputs)):
+            if object == self.outputs[oi].proxy:
+                self._handle_output_event(oi, pkt, opcode, size)
+                return
         if object == self.surface and self.surface != 0:
-            if opcode == 2 and size >= 12:  # preferred_buffer_scale
+            if opcode == 0 and size >= 12:  # enter(output)
+                self.current_output = wl_get32(pkt, 8)
+            elif opcode == 1 and size >= 12:  # leave(output)
+                if self.current_output == wl_get32(pkt, 8):
+                    self.current_output = 0
+            elif opcode == 2 and size >= 12:  # preferred_buffer_scale
                 self.preferred_buffer_scale = max(1, wl_get32(pkt, 8))
             return
         if object == self.fractional_scale and self.fractional_scale != 0:
@@ -1401,6 +1557,8 @@ struct WaylandWindow(WindowBackend):
         if self.wants_bridge and not self.bridge.start(self.fd):
             # The window works without it, on the dmabuf and shared-memory paths.
             print("WAYLAND_BRIDGE_UNAVAILABLE " + self.bridge.error)
+        self.outputs.clear()
+        self.current_output = 0
         self.registry = self.allocate_id()
         var body = List[UInt8]()
         wl_append32(body, self.registry)
@@ -1439,7 +1597,7 @@ struct WaylandWindow(WindowBackend):
         if self.wants_gpu_fullscreen and not env_flag("FLINT_WINDOWED"):
             # Before the first commit, so the first configure is already the fullscreen size.
             body = List[UInt8]()
-            wl_append32(body, 0)  # xdg_toplevel.set_fullscreen on any output
+            wl_append32(body, self.fullscreen_output)  # xdg_toplevel.set_fullscreen (0 = any output)
             _ = self.request(self.toplevel, 11, body)
         if self.fractional_scale_manager != 0 and self.fractional_scale == 0:
             self.fractional_scale = self.allocate_id()
@@ -1971,6 +2129,72 @@ struct WaylandWindow(WindowBackend):
         wl_append32(body, 0)
         _ = self.request(self.pointer, 0, body)
 
+    def _handle_output_event(mut self, oi: Int, pkt: List[UInt8], opcode: Int, size: Int):
+        """`wl_output` events: geometry, mode, done, scale, name, description."""
+        if opcode == 0 and size >= 32:  # geometry(x, y, mm_w, mm_h, subpixel, make, model, transform)
+            self.outputs[oi].x = wl_gets32(pkt, 8)
+            self.outputs[oi].y = wl_gets32(pkt, 12)
+            self.outputs[oi].physical_width_mm = wl_gets32(pkt, 16)
+            self.outputs[oi].physical_height_mm = wl_gets32(pkt, 20)
+            self.outputs[oi].make = wl_get_string(pkt, 28, size)
+            var model_off = wl_string_end(pkt, 28)
+            self.outputs[oi].model = wl_get_string(pkt, model_off, size)
+            if self.outputs[oi].name.byte_length() == 0:
+                self.outputs[oi].name = self.outputs[oi].make + " " + self.outputs[oi].model
+        elif opcode == 1 and size >= 24:  # mode(flags, width, height, refresh_mhz)
+            if (wl_get32(pkt, 8) & 1) != 0:  # WL_OUTPUT_MODE_CURRENT
+                self.outputs[oi].width = wl_gets32(pkt, 12)
+                self.outputs[oi].height = wl_gets32(pkt, 16)
+                self.outputs[oi].refresh_mhz = wl_gets32(pkt, 20)
+        elif opcode == 2:  # done
+            self.outputs[oi].done = True
+        elif opcode == 3 and size >= 12:  # scale(factor)
+            self.outputs[oi].scale = max(1, wl_gets32(pkt, 8))
+        elif opcode == 4 and size >= 12:  # name (v4)
+            var nm = wl_get_string(pkt, 8, size)
+            if nm.byte_length() > 0:
+                self.outputs[oi].name = nm
+        elif opcode == 5 and size >= 12:  # description (v4)
+            self.outputs[oi].description = wl_get_string(pkt, 8, size)
+
+    def monitors(self) -> List[WaylandOutputInfo]:
+        """The monitors the compositor advertises (empty on X11/KMS or before the first roundtrip)."""
+        return self.outputs.copy()
+
+    def current_monitor_index(self) -> Int:
+        """Index in `monitors()` of the output the window is on (-1 if unknown)."""
+        for i in range(len(self.outputs)):
+            if self.outputs[i].proxy == self.current_output and self.current_output != 0:
+                return i
+        return -1
+
+    def set_fullscreen_output(mut self, index: Int) -> Bool:
+        """Chooses the monitor `toggle_fullscreen`/`set_fullscreen_on` use (-1 = compositor's choice)."""
+        if index < 0:
+            self.fullscreen_output = 0
+            return True
+        if index >= len(self.outputs):
+            return False
+        self.fullscreen_output = self.outputs[index].proxy
+        return True
+
+    def set_fullscreen_on(mut self, index: Int) -> Bool:
+        """Goes fullscreen on monitor `index` of `monitors()` (-1 = compositor's choice). On an already
+        fullscreen window this moves it to that monitor."""
+        if not self.set_fullscreen_output(index):
+            return False
+        if self.using_kms or self.using_x11 or self.toplevel == 0:
+            return False
+        var body = List[UInt8]()
+        wl_append32(body, self.fullscreen_output)
+        return self.request(self.toplevel, 11, body)
+
+    def set_fullscreen_on_name(mut self, name: String) -> Bool:
+        var idx = wayland_pick_output(self.outputs, name, -1)
+        if idx < 0:
+            return False
+        return self.set_fullscreen_on(idx)
+
     def toggle_fullscreen(mut self):
         if self.using_kms:
             return  # a bare display is always fullscreen
@@ -1984,9 +2208,9 @@ struct WaylandWindow(WindowBackend):
             # xdg_toplevel.unset_fullscreen
             _ = self.empty_request(self.toplevel, 12)
         else:
-            # xdg_toplevel.set_fullscreen, with a null output (any output).
+            # xdg_toplevel.set_fullscreen on the chosen output (0 = any output).
             var body = List[UInt8]()
-            wl_append32(body, 0)
+            wl_append32(body, self.fullscreen_output)
             _ = self.request(self.toplevel, 11, body)
 
     def content_scale(self) -> Float32:
@@ -2145,6 +2369,13 @@ struct WaylandWindow(WindowBackend):
         self.fd = -1
         self.frame_callback = 0
         self.frame_requested_at = 0
+        self.presentation = 0
+        self.feedback_ids.clear()
+        self.feedback_free.clear()
+        self.presented_ns.clear()
+        self.feedback_requested = 0
+        self.feedback_discarded = 0
+        self.feedback_refresh_ns = 0
         self.viewport = 0
         self.viewport_width = 0
         self.viewport_height = 0

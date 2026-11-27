@@ -5,6 +5,7 @@ from flint.core.math import Vec3
 from flint.core.transform import Quat, Mat4, trs
 from flint.core.springs import decay_spring
 from flint.core.ik import two_bone_ik, aim_rotation
+from flint.assets.manifest import ClipEvent
 
 
 struct NativeTexture(Copyable, Movable):
@@ -21,6 +22,7 @@ struct NativeTexture(Copyable, Movable):
 struct NativeNode(Copyable, Movable):
     var name: String
     var mesh: Int
+    var skin: Int
     var mesh_indices: List[Int]
     var children: List[Int]
     var translation: Vec3
@@ -31,10 +33,13 @@ struct NativeNode(Copyable, Movable):
     var base_scale: Vec3
     var matrix: Mat4
     var has_matrix: Bool
+    var base_morph_weights: List[Float32]
+    var morph_weights: List[Float32]
 
     def __init__(out self):
         self.name = ""
         self.mesh = -1
+        self.skin = -1
         self.mesh_indices = List[Int]()
         self.children = List[Int]()
         self.translation = Vec3()
@@ -45,6 +50,8 @@ struct NativeNode(Copyable, Movable):
         self.base_scale = Vec3(1, 1, 1)
         self.matrix = Mat4()
         self.has_matrix = False
+        self.base_morph_weights = List[Float32]()
+        self.morph_weights = List[Float32]()
 
     def local_transform(self) -> Mat4:
         if self.has_matrix:
@@ -95,6 +102,7 @@ struct NativeMesh(Copyable, Movable):
     var sheen_roughness: Float32
     var skin: Int
     var alpha_mode: Int
+    var alpha_cutoff: Float32
     var double_sided: Bool
     # Morph targets: morph_count blocks of vertex_count() * 3 deltas each.
     var morph_count: Int
@@ -141,6 +149,7 @@ struct NativeMesh(Copyable, Movable):
         self.sheen_roughness = 0.5
         self.skin = -1
         self.alpha_mode = 0
+        self.alpha_cutoff = 0.5
         self.double_sided = False
         self.morph_count = 0
         self.morph_positions = List[Float32]()
@@ -228,16 +237,49 @@ struct NativeChannel(Copyable, Movable):
         self.step = False
         self.interp_mode = INTERP_LINEAR
 
+    def components(self) -> Int:
+        if self.path != 3:
+            return 4 if self.path == 1 else 3
+        var blocks = len(self.times) * (3 if self.interp_mode == INTERP_CUBICSPLINE and not self.step else 1)
+        if blocks == 0 or len(self.values) % blocks != 0:
+            return 0
+        return len(self.values) // blocks
+
+    def sample_weights(self, lo: Int, hi: Int, t: Float32, dt: Float32) -> List[Float32]:
+        var width = self.components()
+        var out = List[Float32](capacity=width)
+        if self.interp_mode == INTERP_CUBICSPLINE and not self.step:
+            var a = (lo * 3 + 1) * width
+            var b = (hi * 3 + 1) * width
+            var t2 = t * t
+            var t3 = t2 * t
+            for i in range(width):
+                out.append((2*t3 - 3*t2 + 1) * self.values[a+i]
+                    + (t3 - 2*t2 + t) * dt * self.values[a+width+i]
+                    + (3*t2 - 2*t3) * self.values[b+i]
+                    + (t3 - t2) * dt * self.values[b-width+i])
+        else:
+            for i in range(width):
+                var start = self.values[lo * width + i]
+                out.append(start + t * (self.values[hi * width + i] - start))
+        return out^
+
 
 struct NativeAnimation(Copyable, Movable):
     var name: String
     var channels: List[NativeChannel]
     var duration: Float32
+    var loop: Bool
+    var ground_speed: Float32
+    var events: List[ClipEvent]
 
     def __init__(out self):
         self.name = ""
         self.channels = List[NativeChannel]()
         self.duration = 0
+        self.loop = True
+        self.ground_speed = 1
+        self.events = List[ClipEvent]()
 
     def frame_count(self) -> Int:
         if not isfinite(self.duration) or self.duration <= Float32(0.0):
@@ -410,7 +452,9 @@ struct NativeModel(Copyable, Movable):
     def channel_rests(self, channel: NativeChannel, node: Int) -> Bool:
         """True when every key of the channel is the node's rest value."""
         comptime CLOSE: Float32 = 0.000001
-        var components = 4 if channel.path == 1 else 3
+        if channel.path == 3:
+            return False
+        var components = channel.components()
         var keys = len(channel.times)
         var cubic = channel.interp_mode == INTERP_CUBICSPLINE
         var stride = components * 3 if cubic else components
@@ -457,6 +501,9 @@ struct NativeModel(Copyable, Movable):
             var animation = NativeAnimation()
             animation.name = source.animations[clip].name
             animation.duration = source.animations[clip].duration
+            animation.loop = source.animations[clip].loop
+            animation.ground_speed = source.animations[clip].ground_speed
+            animation.events = source.animations[clip].events.copy()
             for channel in source.animations[clip].channels:
                 var node = remap[channel.node] if channel.node >= 0 and channel.node < len(remap) else -1
                 if node >= 0 and self.channel_rests(channel, node):
@@ -488,6 +535,9 @@ struct NativeModel(Copyable, Movable):
             var animation = NativeAnimation()
             animation.name = self.animations[clip].name
             animation.duration = self.animations[clip].duration
+            animation.loop = self.animations[clip].loop
+            animation.ground_speed = self.animations[clip].ground_speed
+            animation.events = self.animations[clip].events.copy()
             for channel in self.animations[clip].channels:
                 if channel.node >= 0 and channel.node < len(self.nodes) and self.channel_rests(channel, channel.node):
                     continue
@@ -792,6 +842,8 @@ struct NativeModel(Copyable, Movable):
             self.nodes[index].translation = self.nodes[index].base_translation
             self.nodes[index].rotation = self.nodes[index].base_rotation
             self.nodes[index].scale = self.nodes[index].base_scale
+            if len(self.nodes[index].base_morph_weights) > 0:
+                self.nodes[index].morph_weights = self.nodes[index].base_morph_weights.copy()
         ref clip = self.animations[animation]
         var dur = clip.duration if (isfinite(clip.duration) and clip.duration >= Float32(0.0)) else Float32(0.0)
         var time = max(Float32(0), min(self.active_time, dur))
@@ -825,7 +877,10 @@ struct NativeModel(Copyable, Movable):
             var amount = Float32(0)
             if not is_step and next != lower and dt_seg > Float32(0):
                 amount = max(Float32(0), min(Float32(1), (time - channel.times[lower]) / dt_seg))
-            var components = 4 if channel.path == 1 else 3
+            if channel.path == 3:
+                self.nodes[channel.node].morph_weights = channel.sample_weights(lower, next, amount, dt_seg)
+                continue
+            var components = channel.components()
             if is_cubic:
                 var stride = components * 3
                 var v0_at = lower * stride + components

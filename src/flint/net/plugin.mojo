@@ -19,7 +19,7 @@ Provides:
   closes transports cleanly in `STAGE_SHUTDOWN`.
 """
 from std.collections import Dict, List
-from std.math import max
+from std.math import isfinite, max, min
 from std.reflection import reflect
 from flint.app.engine_app import (
     EngineApp,
@@ -101,6 +101,8 @@ struct NetConfigResource(Resource, Copyable, ImplicitlyCopyable, Movable):
     var world_bounds: Float32
     var chunk_size: Float32
     var tick_hz: Float64
+    var snapshot_phase: Float64
+    var snapshot_due: Bool
     var now_ms: Float64
     var local_peer_id: Int
     var last_server_tick: UInt16
@@ -123,6 +125,8 @@ struct NetConfigResource(Resource, Copyable, ImplicitlyCopyable, Movable):
         self.world_bounds = world_bounds
         self.chunk_size = chunk_size
         self.tick_hz = tick_hz
+        self.snapshot_phase = 0
+        self.snapshot_due = False
         self.now_ms = 0.0
         self.local_peer_id = local_peer_id
         self.last_server_tick = 0
@@ -545,6 +549,16 @@ def _apply_received_packet(
     return True
 
 
+def _poll_net_hub[T: NetTransport & Deinitable](
+    mut hub: NetHub[T], mut rep: SnapshotReplicator, now_ms: Float64, server: Bool
+):
+    hub.poll(now_ms)
+    if server:
+        # NetHub clears accepted on every poll, including the post-update flush.
+        for cid in hub.accepted:
+            rep.reset_client_baselines(cid)
+
+
 def _sys_net_poll(
     world_ptr: Pointer[World, MutAnyOrigin],
     res_ptr: Pointer[Resources, MutAnyOrigin],
@@ -578,8 +592,8 @@ def _sys_net_poll(
 
     for hi in range(len(tr.virtual_hubs)):
         ref hub = tr.virtual_hubs[hi]
-        hub.poll(cfg.now_ms)
         var is_server_hub = (cfg.mode == NET_MODE_SERVER) or (cfg.mode == NET_MODE_VIRTUAL and hub.accept)
+        _poll_net_hub(hub, rep.replicator, cfg.now_ms, is_server_hub)
         var is_client_hub = (cfg.mode == NET_MODE_CLIENT) or (cfg.mode == NET_MODE_VIRTUAL and not hub.accept)
         if is_client_hub:
             for cid in range(hub.count):
@@ -610,8 +624,8 @@ def _sys_net_poll(
 
     for hi in range(len(tr.udp_hubs)):
         ref hub = tr.udp_hubs[hi]
-        hub.poll(cfg.now_ms)
         var is_server_hub = (cfg.mode == NET_MODE_SERVER) or (cfg.mode == NET_MODE_VIRTUAL and hub.accept)
+        _poll_net_hub(hub, rep.replicator, cfg.now_ms, is_server_hub)
         var is_client_hub = (cfg.mode == NET_MODE_CLIENT) or (cfg.mode == NET_MODE_VIRTUAL and not hub.accept)
         if is_client_hub:
             for cid in range(hub.count):
@@ -655,7 +669,20 @@ def _sys_net_fixed_step(
     if not rep_opt or not fix_opt:
         return
     ref rep = rep_opt.value()[unsafe_offset=0]
-    var tick = Int(fix_opt.value()[unsafe_offset=0].tick_count)
+    ref fixed = fix_opt.value()[]
+    var tick = Int(fixed.tick_count)
+    var cfg_opt = resources.get_ptr_mut[NetConfigResource]()
+    if cfg_opt:
+        ref cfg = cfg_opt.value()[]
+        if isfinite(cfg.tick_hz) and cfg.tick_hz > 0:
+            cfg.snapshot_phase += min(Float64(1), cfg.tick_hz * fixed.dt_f64)
+            if cfg.snapshot_phase >= 1.0 - 1.0e-12:
+                cfg.snapshot_phase = max(Float64(0), cfg.snapshot_phase - 1)
+                # After a long frame send only the newest propagated world state.
+                cfg.snapshot_due = True
+        else:
+            cfg.snapshot_phase = 0
+            cfg.snapshot_due = False
 
     var mask = world.bit_for[NetworkIdentityComponent]().union(world.bit_for[ReplicationComponent]())
     var entities = world.query_entities(mask)
@@ -704,6 +731,10 @@ def _sys_net_replicate(
     ref cfg = cfg_opt.value()[unsafe_offset=0]
     ref rep = rep_opt.value()[unsafe_offset=0]
     ref tr = tr_opt.value()[unsafe_offset=0]
+
+    if not cfg.snapshot_due:
+        return
+    cfg.snapshot_due = False
 
     var any_server = False
     if cfg.mode == NET_MODE_SERVER:
@@ -783,7 +814,7 @@ def _sys_net_replicate(
             if len(pkt_res[1]) > 0:
                 if hub.send_unreliable(cid, pkt_res[1], cfg.now_ms):
                     cfg.packets_sent += 1
-        hub.poll(cfg.now_ms)
+        _poll_net_hub(hub, rep.replicator, cfg.now_ms, True)
 
     for hi in range(len(tr.udp_hubs)):
         ref hub = tr.udp_hubs[hi]
@@ -797,7 +828,7 @@ def _sys_net_replicate(
             if len(pkt_res[1]) > 0:
                 if hub.send_unreliable(cid, pkt_res[1], cfg.now_ms):
                     cfg.packets_sent += 1
-        hub.poll(cfg.now_ms)
+        _poll_net_hub(hub, rep.replicator, cfg.now_ms, True)
 
 
 def _sys_net_shutdown(

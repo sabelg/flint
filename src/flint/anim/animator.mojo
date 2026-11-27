@@ -130,6 +130,8 @@ struct Animator(Copyable, Movable):
     var root_node: Int
     # The state machine.
     var state: Int
+    var match_clip: Int
+    var match_time: Float32
     var manual_state: Int
     var previous: Int
     var state_time: Float32
@@ -183,6 +185,8 @@ struct Animator(Copyable, Movable):
         self.all_nodes = List[Float32]()
         self.root_node = -1
         self.state = -1
+        self.match_clip = -1
+        self.match_time = 0
         self.manual_state = -1
         self.previous = -1
         self.state_time = 0
@@ -241,6 +245,8 @@ struct Animator(Copyable, Movable):
     def reset(mut self):
         """Start over without blending (a teleport, a seek, a new form)."""
         self.state = -1
+        self.match_clip = -1
+        self.match_time = 0
         self.manual_state = -1
         self.previous = -1
         self.state_time = 0
@@ -269,6 +275,12 @@ struct Animator(Copyable, Movable):
         if self.state < 0 or self.state >= len(self.graph.states):
             return ""
         return self.graph.states[self.state].name
+
+    def request_match_frame(mut self, clip: Int, time: Float32):
+        """On the next update, enter this point in the selected clip with inertial blending."""
+        if clip >= 0 and clip < len(self.clips) and isfinite(time):
+            self.match_clip = clip
+            self.match_time = max(Float32(0), min(time, self.clips[clip].duration))
 
     def set_manual_state(mut self, state_idx: Int):
         self.manual_state = state_idx
@@ -391,6 +403,13 @@ struct Animator(Copyable, Movable):
                 restart_clock = True
         else:
             self.state_time += safe_dt
+        if self.match_clip >= 0:
+            if self.graph.states[chosen].clip == self.match_clip:
+                self.clip_time = self.match_time
+                self.switched = True
+                # Travel and events begin at the match, skipping the discarded interval.
+                restart_clock = False
+            self.match_clip = -1
         self.advance(safe_dt, restart_clock)
         var out = Pose()
         swap(out, self.pose)

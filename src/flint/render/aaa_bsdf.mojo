@@ -127,7 +127,7 @@ struct AaaMaterial(Copyable, Movable):
 
     @always_inline
     def is_alpha_masked(self) -> Bool:
-        return self.alpha_cutoff > Float32(0.01)
+        return self.alpha_cutoff > Float32(0)
 
     def append_words(self, mut out: List[UInt32]):
         var t_alb = UInt32(self.albedo_tex & 0xFF) if self.albedo_tex >= 0 else UInt32(0xFF)
@@ -154,7 +154,7 @@ struct AaaMaterial(Copyable, Movable):
         var abs_spec_fac = _fin_clamp_bsdf(self.specular_factor, Float32(0.0), Float32(1.0), Float32(1.0))
         var encoded_spec_fac = (
             -max(Float32(1e-4), abs_spec_fac)
-            if alpha_cut > Float32(0.01)
+            if alpha_cut > Float32(0)
             else abs_spec_fac
         )
 

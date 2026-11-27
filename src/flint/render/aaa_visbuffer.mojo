@@ -77,8 +77,23 @@ comptime AAA_PUSH_BYTES: Int = 64
 # [35]:     uniform_scale_bits (Float32: max axis scale for bounding sphere radius)
 # [36]:     skin_bind_first_slot (UInt32: base vertex slot in BIND_AAA_SKINNING, 0 if static)
 # [37]:     mesh_first_vertex (UInt32: CookedMeshEntry.first_vertex in BIND_AAA_VERTICES)
-# [38..39]: reserved (0)
+# [38]: first index. [39]: material ID, draw flags and alpha threshold.
 comptime AAA_INSTANCE_WORDS: Int = 40
+
+# Instance word 39 uses bits 19..31 for an alpha threshold in units of 1/4096.
+# The raster passes forward these bits alongside the low-byte albedo texture index.
+@always_inline
+def pack_instance_alpha_cutoff(value: Float32, opacity: Float32 = 1) -> UInt32:
+    # A glTF mask tests sampled alpha * baseColorFactor.a against alphaCutoff.
+    if value > opacity:
+        return UInt32(8191) << 19
+    var threshold = value / opacity if opacity > 0 else Float32(0)
+    return UInt32(Int(max(Float32(0), min(Float32(1), threshold)) * 4096 + Float32(0.5))) << 19
+
+
+def emit_alpha_cutoff(mut s: AaaSpirvModule, flags: UInt32) -> UInt32:
+    return s.fmul(s.float_from_uint(s.shr(flags, s.uint(19))), s.float(1.0 / 4096.0))
+
 
 # Globals SSBO layout (`BIND_AAA_GLOBALS`, 128 words = 512 bytes):
 # [0..15]:  view_proj Mat4 (Reverse-Z column-major Float32[16])
@@ -577,14 +592,15 @@ def visbuffer_alphamask_vertex_shader() -> List[UInt32]:
     )
     emit(s.code, OP_STORE, out_vis[1], s.uvec2(pay0, pay1_base))
     emit(s.code, OP_STORE, out_uv[1], s.vec2(uv_u, uv_v))
-    emit(s.code, OP_STORE, out_talb[1], t_alb)
+    var flags = s.load_word(b_instances, s.iadd(inst_base, s.uint(39)))
+    emit(s.code, OP_STORE, out_talb[1], s.bit_or(t_alb, s.bit_and(flags, s.uint(0xFFF80000))))
     return s.finish()
 
 
 def visbuffer_alphamask_fragment_shader() -> List[UInt32]:
     """Two-Bucket Alpha-Cutout Fragment Shader (`early_depth = False`, `enable_bindless = True`):
     Samples `bindless_arr[t_alb]` alpha with mip-coverage preservation `a * (1.0 + 0.18 * mip_est)`
-    and discards (`OpKill`) when `alpha < 0.48`, keeping `pipe_visbuffer_gfx` (`early_depth=True`) 100% untouched!"""
+    and discards (`OpKill`) below the authored alpha cutoff, keeping `pipe_visbuffer_gfx` (`early_depth=True`) 100% untouched!"""
     var s = AaaSpirvModule(
         MODEL_FRAGMENT,
         push_words=AAA_PUSH_WORDS,
@@ -613,8 +629,9 @@ def visbuffer_alphamask_fragment_shader() -> List[UInt32]:
     var px_foot = s.fmul(s.fsqrt(s.nmax(s.float(1e-8), s.nmax(gx2, gy2))), s.float(512.0))
     var mip_est = s.nclamp(s.log2(s.nmax(s.float(1.0), px_foot)), s.float(0.0), s.float(6.0))
 
-    var t_alb = s.fresh()
-    emit(s.code, OP_LOAD, s.type_uint, t_alb, in_talb[1])
+    var packed = s.fresh()
+    emit(s.code, OP_LOAD, s.type_uint, packed, in_talb[1])
+    var t_alb = s.bit_and(packed, s.uint(0xFF))
     var alpha_v = s.fvar(s.float(1.0))
     s.begin_if(s.ult(t_alb, s.uint(0xFF)))
     var rgba = s.sample_bindless_grad(
@@ -628,7 +645,7 @@ def visbuffer_alphamask_fragment_shader() -> List[UInt32]:
     s.store(alpha_v, s.fmul(raw_a, s.fma(mip_est, s.float(0.18), s.float(1.0))))
     s.end_if()
 
-    s.discard_if(s.flt(s.load_f(alpha_v), s.float(0.48)))
+    s.discard_if(s.flt(s.nmin(s.float(1.0), s.load_f(alpha_v)), emit_alpha_cutoff(s, packed)))
 
     var vis_val = s.fresh()
     emit(s.code, OP_LOAD, s.type_uvec2, vis_val, in_vis[1])

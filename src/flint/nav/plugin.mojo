@@ -371,6 +371,7 @@ def register_nav_codecs(mut reg: ComponentRegistry):
 
 def _build_physics_world_from_ecs(mut world: World) -> PhysicsWorld:
     var pw = PhysicsWorld(gravity=0.0)
+    pw.begin_body_batch()
     var col_mask = world.bit_for[ColliderComponent]()
     var col_ents = world.query_entities(col_mask)
     for i in range(len(col_ents)):
@@ -404,6 +405,7 @@ def _build_physics_world_from_ecs(mut world: World) -> PhysicsWorld:
             _ = pw.add_convex_hull(w_pos, hull, Float32(0.0), w_rot)
         elif col.shape == BODY_SHAPE_BOX:
             _ = pw.add_box(w_pos, col.half_extents, Float32(0.0), w_rot)
+    pw.end_body_batch()
     return pw^
 
 
@@ -452,6 +454,21 @@ def _sys_nav_crowd_step(
                     var ecs_pw = _build_physics_world_from_ecs(world)
                     _ = state.bake_from_physics(ecs_pw, nmc.to_config())
                 break
+
+    # Reconcile the registered generation before stepping or allocating new slots.
+    var released = List[UInt64]()
+    for bits in state.entity_to_bridge.keys():
+        var e = Entity.from_bits(bits)
+        var ac = world.get_ptr_mut[NavAgentComponent](e)
+        if ac and ac.value()[].enabled and world.has[LocalTransform](e):
+            continue
+        if ac:
+            ac.value()[].bridge_idx = -1
+            ac.value()[].agent_id = -1
+        released.append(bits)
+    for bits in released:
+        var idx = state.entity_to_bridge.pop(bits, -1)
+        state.bridge.remove_agent(idx, state.crowd)
 
     if not state.baked or state.navmesh.poly_count() == 0:
         return

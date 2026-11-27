@@ -491,6 +491,7 @@ struct VehicleChassis(Copyable, Movable):
         ground_vels: List[Vec3],
         mut out_wheel_forces: List[Vec3],
         apply_gyro: Bool = False,
+        surface_grip: List[Float32] = List[Float32](),
     ):
         """Advances one 240 Hz vehicle substep using externally probed `wheel_states`
         and moving contact surface `ground_vels`, emitting per-wheel world forces
@@ -504,6 +505,7 @@ struct VehicleChassis(Copyable, Movable):
             ground_vels,
             out_wheel_forces,
             apply_gyro,
+            surface_grip,
         )
 
     def _step_dynamics_impl(
@@ -516,6 +518,7 @@ struct VehicleChassis(Copyable, Movable):
         ground_vels: List[Vec3],
         mut out_wheel_forces: List[Vec3],
         apply_gyro: Bool,
+        surface_grip: List[Float32] = List[Float32](),
     ):
         var num_wheels = len(self.wheels)
         out_wheel_forces.clear()
@@ -761,9 +764,21 @@ struct VehicleChassis(Copyable, Movable):
                 self.wheel_states[i].bristle_x,
                 self.wheel_states[i].bristle_y,
             )
-            var fx = forces[0] if isfinite(forces[0]) else Float32(0.0)
-            var fy = forces[1] if isfinite(forces[1]) else Float32(0.0)
-            var mz = forces[2] if isfinite(forces[2]) else Float32(0.0)
+            var fx = forces[0] if isfinite(forces[0]) else Float32(0)
+            var fy = forces[1] if isfinite(forces[1]) else Float32(0)
+            var mz = forces[2] if isfinite(forces[2]) else Float32(0)
+            if i < len(surface_grip) and isfinite(surface_grip[i]):
+                # The road limits the resultant contact force to µFz. Below that
+                # limit the tire retains its authored slip and bristle response.
+                var limit = Float64(max(Float32(0), surface_grip[i])) * Float64(self.wheel_states[i].normal_load)
+                var demand = sqrt(Float64(fx) * Float64(fx) + Float64(fy) * Float64(fy))
+                if demand > limit:
+                    var scale = Float32(limit / demand)
+                    fx *= scale
+                    fy *= scale
+                    mz *= scale
+                elif limit == 0:
+                    mz = 0
 
             var reaction_torque64 = -Float64(fx) * Float64(r)
             var new_omega64 = omega64 + (reaction_torque64 / Float64(w_inertia)) * Float64(dt)

@@ -78,6 +78,11 @@ comptime UI_SYMBOL_PAUSE: Int = 9
 comptime UI_SYMBOL_GIZMO: Int = 10
 
 
+def _glyph_distance_scale(mut s: AaaSpirvModule, scale: UInt32) -> UInt32:
+    # Small values encode screen pixels per atlas byte. The shader samples UNORM.
+    return s.select_f(s.flt(scale, s.float(0.5)), s.nmax(s.float(1.5), s.fmul(scale, s.float(255.0))), scale)
+
+
 def make_ui_line_prim(
     ax: Float32,
     ay: Float32,
@@ -847,6 +852,7 @@ def aaa_ui_overlay_shader(
     # Kind 1 (`PRIM_GLYPH`): SDF / MSDF / MTSDF Font Glyph + Outer Stroke + Drop Shadow
     # ------------------------------------------------------------------------
     s.begin_if(s.ieq(kind, s.uint(1)))
+    var distance_scale = _glyph_distance_scale(s, param0)
     var gw = s.nmax(s.float(1.0), s.fsub(x1, x0))
     var gh = s.nmax(s.float(1.0), s.fsub(y1, y0))
     var du = s.fsub(u1, u0)
@@ -865,7 +871,7 @@ def aaa_ui_overlay_shader(
     var sh_r = s.extract_f(sh_samp, 0)
     var sh_med = _emit_msdf_median(s, sh_r, s.extract_f(sh_samp, 1), s.extract_f(sh_samp, 2))
     var sh_d_raw = s.select_f(is_mtsdf, s.extract_f(sh_samp, 3), s.select_f(is_msdf, sh_med, sh_r))
-    var sh_sd = s.fmul(s.fsub(sh_d_raw, s.float(0.5)), param0)
+    var sh_sd = s.fmul(s.fsub(sh_d_raw, s.float(0.5)), distance_scale)
     var sh_cov = s.nclamp(s.fadd(sh_sd, s.float(0.5)), s.float(0.0), s.float(1.0))
     _emit_blend_over(s, accum_r, accum_g, accum_b, s.float(0.0), s.float(0.0), s.float(0.0), s.fmul(ca, s.fmul(sh_cov, s.float(0.60))))
     s.end_if()
@@ -879,10 +885,10 @@ def aaa_ui_overlay_shader(
     var g_r = s.extract_f(samp, 0)
     var g_med = _emit_msdf_median(s, g_r, s.extract_f(samp, 1), s.extract_f(samp, 2))
     var d_val = s.select_f(is_msdf, g_med, g_r)
-    var sd = s.fmul(s.fsub(d_val, s.float(0.5)), param0)
+    var sd = s.fmul(s.fsub(d_val, s.float(0.5)), distance_scale)
     var cov = s.nclamp(s.fadd(sd, s.float(0.5)), s.float(0.0), s.float(1.0))
     s.begin_if(s.logical_and(s.fgt(param1, s.float(0.01)), s.fgt(sa, s.float(0.001))))
-    var sd_stroke_base = s.select_f(is_mtsdf, s.fmul(s.fsub(s.extract_f(samp, 3), s.float(0.5)), param0), sd)
+    var sd_stroke_base = s.select_f(is_mtsdf, s.fmul(s.fsub(s.extract_f(samp, 3), s.float(0.5)), distance_scale), sd)
     var cov_out = s.nclamp(s.fadd(s.fadd(sd_stroke_base, param1), s.float(0.5)), s.float(0.0), s.float(1.0))
     var stroke_w = s.nmax(s.float(0.0), s.fsub(cov_out, cov))
     var wo = _emit_ui_srgb_to_working(s, is_hdr10, sr, sg, sb)
@@ -1453,9 +1459,8 @@ def aaa_ui_present_fragment_shader() -> List[UInt32]:
     var ts = s.sample_bindless_lod(bindless_arr, tex_slot, s.vec2(tu, tv), s.float(0.0))
     s.begin_if(s.ieq(kind, s.uint(1)))
     var dist_g = s.extract_f(ts, 0)
-    var w_px = s.nmax(s.float(0.04), s.fmul(param0, s.float(0.35)))
-    var t_sm = s.nclamp(s.fdiv(s.fsub(dist_g, s.fsub(s.float(0.5), w_px)), s.fmul(w_px, s.float(2.0))), s.float(0.0), s.float(1.0))
-    s.store(cov_v, s.fmul(s.fmul(t_sm, t_sm), s.fsub(s.float(3.0), s.fmul(s.float(2.0), t_sm))))
+    var glyph_sd = s.fmul(s.fsub(dist_g, s.float(0.5)), _glyph_distance_scale(s, param0))
+    s.store(cov_v, s.nclamp(s.fadd(glyph_sd, s.float(0.5)), s.float(0), s.float(1)))
     s.begin_else()
     s.store(sr_v, s.fmul(rgba[0], s.extract_f(ts, 0)))
     s.store(sg_v, s.fmul(rgba[1], s.extract_f(ts, 1)))

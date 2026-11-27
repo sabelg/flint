@@ -22,7 +22,7 @@ from flint.assets.flmat import (
     MAT_SHADING_STYLIZED_VFX,
     load_flmat_bytes,
 )
-from flint.assets.flpk_v3 import decode_cooked_rig_slab
+from flint.assets.flpk_v3 import SUB_ID_ANIMATED_GLB, decode_cooked_rig_slab
 from flint.assets.glb_native import parse_native_glb
 from flint.assets.model import NativeMesh, NativeModel
 from flint.assets.server import AssetServer
@@ -159,6 +159,7 @@ struct SceneAssetResolver(Resource, Movable):
     var mesh_ids: Dict[String, Int]
     var mesh_epochs: Dict[String, UInt64]
     var mesh_default_mat_ids: Dict[String, Int]
+    var renderer_generation: Int
     var mat_ids: Dict[String, Int]
     var mat_epochs: Dict[String, UInt64]
     var mat_tex_epochs: Dict[String, Tuple[UInt64, UInt64, UInt64, UInt64]]
@@ -179,6 +180,7 @@ struct SceneAssetResolver(Resource, Movable):
         self.mesh_ids = Dict[String, Int]()
         self.mesh_epochs = Dict[String, UInt64]()
         self.mesh_default_mat_ids = Dict[String, Int]()
+        self.renderer_generation = 0
         self.mat_ids = Dict[String, Int]()
         self.mat_epochs = Dict[String, UInt64]()
         self.mat_tex_epochs = Dict[String, Tuple[UInt64, UInt64, UInt64, UInt64]]()
@@ -330,6 +332,15 @@ struct SceneAssetResolver(Resource, Movable):
     @staticmethod
     def _read_glb_bytes_for_ref(server: AssetServer, aref: AssetRef) -> List[UInt8]:
         var norm = normalize_asset_rel_path(aref.rel_path)
+        var slot = server.meshes.find_slot_by_uuid(aref.uuid) if not aref.uuid.is_nil() else -1
+        if slot < 0 and norm[0]:
+            slot = server.meshes.find_slot_by_path(norm[1])
+        if slot >= 0 and server.meshes.payloads[slot]:
+            var mount = server.meshes.payloads[slot].value().source_mount
+            if mount >= 0 and mount < len(server.mounts):
+                var packed = server.mounts[mount].read_by_uuid(server.meshes.uuids[slot], SUB_ID_ANIMATED_GLB)
+                if packed[0]:
+                    return packed[1].copy()
         if norm[0] and norm[1].byte_length() > 0:
             var full = server._resolve_loose_disk_path(norm[1])
             if full.byte_length() > 0:
@@ -471,6 +482,15 @@ struct SceneAssetResolver(Resource, Movable):
             self.hot_reloads_applied = server.hot_reloads_applied
 
         var renderer_opt = resources.get_ptr_mut[ScalableRenderer]()
+        var gpu_recovered = False
+        if renderer_opt and renderer_opt.value()[].uses_vulkan():
+            var generation = renderer_opt.value()[].gpu_slot[0].device_generation()
+            gpu_recovered = self.renderer_generation != generation
+            self.renderer_generation = generation
+            if gpu_recovered:
+                self.mat_tex_epochs.clear()
+                self.mat_tex_slots.clear()
+        var refreshed_defaults = Dict[String, Bool]()
         var render_state_opt = resources.get_ptr_mut[RenderPluginStateResource]()
         var anim_cache_opt = resources.get_ptr_mut[AnimAssetCache]()
         var audio_srv_opt = resources.get_ptr_mut[AudioServer]()
@@ -510,16 +530,19 @@ struct SceneAssetResolver(Resource, Movable):
                     var src_mi = 0
                     if mptr and len(mptr.value()[].geom.meshes) > 0:
                         src_mi = mptr.value()[].geom.meshes[0].material_id
-                    if (not prev_mid) or (not prev_ep) or epoch_changed or (not def_mat_valid):
+                    var refresh_default = gpu_recovered and mkey not in refreshed_defaults
+                    if (not prev_mid) or (not prev_ep) or epoch_changed or (not def_mat_valid) or refresh_default:
                         resolved_default_mat = self._resolve_glb_default_material(
                             mkey,
                             mr_ptr.value()[].mesh_ref,
                             src_mi,
                             prev_def_mat if def_mat_valid else -1,
-                            epoch_changed or (not def_mat_valid),
+                            epoch_changed or (not def_mat_valid) or refresh_default,
                             server,
                             renderer_opt,
                         )
+                        if refresh_default:
+                            refreshed_defaults[mkey] = True
                     else:
                         resolved_default_mat = prev_def_mat
 
@@ -702,20 +725,20 @@ struct SceneAssetResolver(Resource, Movable):
                     var akey = _ref_cache_key(an_ptr.value()[].graph_ref)
                     var prev_gid = self.graph_ids.get(akey)
                     var prev_ep = self.graph_epochs.get(akey)
-                    if an_ptr.value()[].graph_id == 0 or (not prev_gid) or (not prev_ep) or (prev_ep.value() != cur_ep):
+                    if (not prev_gid) or (not prev_ep) or (prev_ep.value() != cur_ep):
                         var bptr = server.raws.get_ptr(ah)
-                        if bptr:
+                        if bptr and anim_cache_opt:
                             try:
                                 var gdef = load_flanim_bytes(bptr.value()[].bytes)
                                 var gid = _hash_str_u64(akey)
-                                if anim_cache_opt:
-                                    var empty_clips = List[ClipInfo]()
-                                    anim_cache_opt.value()[].register_graph(gid, gdef^, empty_clips^)
+                                anim_cache_opt.value()[].register_graph(gid, gdef^, List[ClipInfo]())
                                 self.graph_ids[akey] = gid
                                 self.graph_epochs[akey] = cur_ep
-                                an_ptr.value()[].graph_id = gid
                             except:
                                 pass
+                    var registered = self.graph_ids.get(akey)
+                    if registered:
+                        an_ptr.value()[].graph_id = registered.value()
 
         # 6. AudioEmitterComponent (audio_ref -> AudioServer PCM clip)
         var reloaded_audio_keys = Dict[String, Bool]()
@@ -776,10 +799,11 @@ def _sys_asset_tick_and_resolve(
     var srv_opt = res_ptr[].get_ptr_mut[AssetServer]()
     if not srv_opt:
         return
-    if srv_opt.value()[].renderer_ptr == 0:
-        var rend_opt = res_ptr[].get_ptr_mut[ScalableRenderer]()
-        if rend_opt and rend_opt.value()[].uses_vulkan():
-            srv_opt.value()[].attach_renderer_residency_bridge(rend_opt.value()[].gpu_slot[0])
+    var rend_opt = res_ptr[].get_ptr_mut[ScalableRenderer]()
+    if rend_opt and rend_opt.value()[].uses_vulkan():
+        ref gpu = rend_opt.value()[].gpu_slot[0]
+        if srv_opt.value()[].renderer_ptr == 0 or srv_opt.value()[].renderer_generation != gpu.device_generation():
+            srv_opt.value()[].attach_renderer_residency_bridge(gpu)
     _ = srv_opt.value()[].tick()
     var res_opt = res_ptr[].get_ptr_mut[SceneAssetResolver]()
     if res_opt:

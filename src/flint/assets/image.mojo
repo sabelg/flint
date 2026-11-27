@@ -1,7 +1,23 @@
 """Native PNG/DEFLATE decoder and PNG screenshot encoder."""
 from std.ffi import external_call
+from std.math import pow
 from flint.core.build_info import build_stamp
 from flint.platform.os import write_bytes
+
+
+@always_inline
+def srgb_u8_to_linear(v: Int) -> Float32:
+    var s = Float32(max(0, min(255, v))) / Float32(255.0)
+    if s <= Float32(0.04045):
+        return s / Float32(12.92)
+    return pow((s + Float32(0.055)) / Float32(1.055), Float32(2.4))
+
+
+@always_inline
+def linear_to_srgb_u8(v: Float32) -> Int:
+    var c = max(Float32(0.0), min(Float32(1.0), v))
+    var s = c * Float32(12.92) if c <= Float32(0.0031308) else (Float32(1.055) * pow(c, Float32(1.0 / 2.4)) - Float32(0.055))
+    return max(0, min(255, Int(s * Float32(255.0) + Float32(0.5))))
 
 
 struct NativeImage(Copyable, Movable):

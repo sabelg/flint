@@ -36,6 +36,7 @@ from flint.ui.animator import (
     UiAnimator,
     lerp_rgba8,
 )
+from flint.input.input_map import InputMap
 from flint.ui.button_glyphs import pad_button, face_color
 from flint.ui.draw_list import (
     UiDrawList,
@@ -333,6 +334,7 @@ struct UiContext(Movable):
     var pad_confirm: Bool
     var pad_cancel: Bool
     var pad_sony: Bool
+    var action_prompts: Dict[String, String]
     var from_pad: Bool
     # Clipboard, IME & Timing (M4b F26)
     var ui_time_sec: Float32
@@ -445,6 +447,7 @@ struct UiContext(Movable):
         self.pad_confirm = False
         self.pad_cancel = False
         self.pad_sony = False
+        self.action_prompts = Dict[String, String]()
         self.from_pad = False
         self.ui_time_sec = 0.0
         self.clipboard_text = ""
@@ -527,6 +530,7 @@ struct UiContext(Movable):
         screen_w: Float32 = 1280.0,
         screen_h: Float32 = 720.0,
         dt: Float32 = 1.0 / 60.0,
+        input_map: InputMap = InputMap(),
     ):
         self._in_frame = True
         self.frame_epoch += 1
@@ -642,6 +646,13 @@ struct UiContext(Movable):
         self.pad_nav_prev = pd_up
         self.pad_confirm = input.gamepad_pressed(0, PAD_A)
         self.pad_cancel = input.gamepad_pressed(0, PAD_B)
+        self.action_prompts.clear()
+        for action in input_map.actions:
+            self.action_prompts[action.name] = input_map.prompt_glyph_for(action.name).label
+            if action.name == "ui_confirm":
+                self.pad_confirm = action.pressed
+            elif action.name == "ui_cancel":
+                self.pad_cancel = action.pressed
         self.pad_sony = input.pad_is_sony()
         if pd_down or pd_up or self.pad_confirm or self.pad_cancel:
             self.from_pad = True
@@ -1613,9 +1624,19 @@ struct UiContext(Movable):
         var r = self._alloc_item_rect(0, w, h)
         self._draw_text(text, r.x + Float32(2.0), r.y + Float32(3.0), self.theme.font_size, col)
 
+    def _draw_prompt(mut self, action: Int, label: String, x: Float32, y: Float32, width: Float32, px: Float32):
+        if label.byte_length():
+            self.draw_list.add_rect(x, y, width, px * 1.1, self.theme.bg_widget, px * 0.2, 1, self.theme.border)
+            var label_px = px * 0.74
+            var offset = max(Float32(0), (width - self._measure_text(label, label_px)) * 0.5)
+            self._draw_text(label, x + offset, y + px * 0.12, label_px, self.theme.text_primary)
+        else:
+            var btn = pad_button(action)
+            self.draw_list.add_controller_symbol(btn, x, y, width, px * 1.1, UInt32(0xFF000000) | face_color(btn, self.pad_sony))
+
     def rich_label(mut self, markup: String, max_width: Float32 = 0.0):
         var safe_max_w = max_width if (isfinite(max_width) and max_width > Float32(0.0)) else Float32(0.0)
-        var spans = parse_rich(markup)
+        var spans = parse_rich(markup, self.action_prompts)
         var df = self.display_font.copy() if self.display_font.valid else self.font.copy()
         if self.font.valid and (self.font.has_source or len(self.font.fallbacks) > 0):
             var rls = layout_rich_shaped(spans, self.font, df, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony)
@@ -1627,9 +1648,7 @@ struct UiContext(Movable):
                 var rx = r.x + run.x
                 var ry = r.y + run.baseline - run.px * Float32(0.82)
                 if run.kind == SPAN_BUTTON:
-                    var btn = pad_button(run.action)
-                    var fcol = UInt32(0xFF000000) | face_color(btn, self.pad_sony)
-                    self.draw_list.add_controller_symbol(btn, rx, ry, run.width, run.px * Float32(1.1), fcol)
+                    self._draw_prompt(run.action, run.button_label, rx, ry, run.width, run.px)
                 else:
                     var col = self.theme.text_primary
                     if run.color >= 0:
@@ -1651,9 +1670,7 @@ struct UiContext(Movable):
             var rx = r.x + run.x
             var ry = r.y + run.baseline - run.px * Float32(0.82)
             if run.kind == SPAN_BUTTON:
-                var btn = pad_button(run.action)
-                var fcol = UInt32(0xFF000000) | face_color(btn, self.pad_sony)
-                self.draw_list.add_controller_symbol(btn, rx, ry, run.width, run.px * Float32(1.1), fcol)
+                self._draw_prompt(run.action, run.button_label, rx, ry, run.width, run.px)
             else:
                 var col = self.theme.text_primary
                 if run.color >= 0:

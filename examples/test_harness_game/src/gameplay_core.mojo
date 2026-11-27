@@ -33,6 +33,7 @@ from flint.app.flow import GameFlow
 from flint.app.hot_reload import HotReloadHost, PodSchemaRegistryResource
 from flint.app.window_plugin import WindowStateResource
 from flint.assets.asset_ref import AssetRef, normalize_asset_rel_path
+from flint.assets.asset_plugin import SceneAssetResolver
 from flint.assets.flmat import FlmatAsset, load_flmat_bytes
 from flint.assets.flpk_v3 import Handle, decode_cooked_rig_slab
 from flint.assets.glb_native import parse_native_glb
@@ -75,7 +76,6 @@ from flint.physics.plugin import (
     entity_from_body,
 )
 from flint.physics.world import PhysicsWorld
-from flint.platform.os import file_size, read_bytes
 from flint.render.plugin import (
     CameraComponent,
     EnvironmentComponent,
@@ -516,14 +516,13 @@ def resolve_harness_assets(
                 var mdl_loaded = False
                 var mr_opt = world.get_ptr[MeshRendererComponent](e)
                 if mr_opt and not mr_opt.value()[unsafe_offset=0].mesh_ref.is_empty():
-                    var disk = assets._resolve_loose_disk_path(_norm_asset_key(mr_opt.value()[unsafe_offset=0].mesh_ref.rel_path))
-                    if disk.byte_length() > 0 and file_size(disk) > 0:
-                        var glb_raw = read_bytes(disk)
-                        if len(glb_raw) > 0:
-                            var mdl = parse_native_glb(glb_raw)
-                            if len(mdl.nodes) > 0:
-                                anim_cache_opt.value()[unsafe_offset=0].register_model(sk.model_id, mdl^)
-                                mdl_loaded = True
+                    # Through the asset server so a packaged build reads the hero from its `.flpk`.
+                    var glb = SceneAssetResolver._read_glb_bytes_for_ref(assets, mr_opt.value()[unsafe_offset=0].mesh_ref)
+                    if len(glb) > 0:
+                        var mdl = parse_native_glb(glb)
+                        if len(mdl.nodes) > 0:
+                            anim_cache_opt.value()[unsafe_offset=0].register_model(sk.model_id, mdl^)
+                            mdl_loaded = True
                 if not mdl_loaded:
                     var fb_mdl = _build_fallback_hero_model_from_rig(rdef)
                     anim_cache_opt.value()[unsafe_offset=0].register_model(sk.model_id, fb_mdl^)

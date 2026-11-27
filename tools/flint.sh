@@ -187,6 +187,7 @@ is_binary_fresh() {
     [[ -x "$out" ]] || return 1
     [[ -f "${out}.opt" ]] || return 1
     local opt_tag="${opt}|relinc_v1|werror=${FLINT_WERROR:-1}|fp=${FLINT_DETERMINISTIC_FP:-1}|strip=${FLINT_STRIP_SOURCE_PATHS:-0}"
+    [[ "${FLINT_PACKAGE_LINE_TABLES:-0}" != 1 ]] || opt_tag+="|lines=1"
     local prev_opt
     prev_opt="$(cat "${out}.opt" 2>/dev/null || true)"
     [[ "$prev_opt" == "$opt_tag" ]] || return 1
@@ -199,6 +200,11 @@ is_binary_fresh() {
         [[ -n "$hit" ]] && return 1
     elif [[ -n "$extra_inc" && "$extra_inc" != "__DEFAULT_TESTS__" && -d "$extra_inc" ]]; then
         hit="$(find "$extra_inc" -name '*.mojo' -newer "$out" -print -quit 2>/dev/null || true)"
+        [[ -n "$hit" ]] && return 1
+    fi
+    # Mojo also resolves local imports beside the example entry point.
+    if [[ "$src" == "${ROOT}/examples/"* ]]; then
+        hit="$(find "$(dirname "$src")" \( -name '*.mojo' -o -type d \) -newer "$out" -print -quit)"
         [[ -n "$hit" ]] && return 1
     fi
     return 0
@@ -245,7 +251,9 @@ compile_mojo() {
     elif [[ "$build_src" == "${ROOT}/"* ]]; then
         build_src="${build_src#${ROOT}/}"
     fi
-    if ! "$MOJO_BIN" build "$build_src" -o "$tmp" "${inc_args[@]}" "$opt" "${fp_args[@]}" "${werror_args[@]}"; then
+    local debug_args=()
+    [[ "${FLINT_PACKAGE_LINE_TABLES:-0}" != 1 ]] || debug_args=(-g1)
+    if ! "$MOJO_BIN" build "$build_src" "${debug_args[@]}" -o "$tmp" "${inc_args[@]}" "$opt" "${fp_args[@]}" "${werror_args[@]}"; then
         rm -f "$tmp"
         [[ -n "$entry_tmp_dir" ]] && rm -rf "$entry_tmp_dir"
         return 1  # also when called from an `if`, where `set -e` does not stop us
@@ -259,6 +267,7 @@ compile_mojo() {
     local opt_tmp
     opt_tmp="$(mktemp "${out}.opt.XXXXXX")"
     local opt_tag="${opt}|relinc_v1|werror=${FLINT_WERROR:-1}|fp=${FLINT_DETERMINISTIC_FP:-1}|strip=${FLINT_STRIP_SOURCE_PATHS:-0}"
+    [[ "${FLINT_PACKAGE_LINE_TABLES:-0}" != 1 ]] || opt_tag+="|lines=1"
     printf '%s\n' "$opt_tag" > "$opt_tmp"
     mv -f "$opt_tmp" "${out}.opt"
 }
@@ -539,7 +548,7 @@ cmd_lab() {
         case "$1" in
             --fast) opt="-O1"; shift ;;
             -h|--help)
-                echo "Usage: bash tools/flint.sh lab <physics|anim|render|audio_ui|net|all> [--fast] [-- args...]"
+                echo "Usage: bash tools/flint.sh lab <physics|anim|render|audio_ui|net|world_stream|all> [--fast] [-- args...]"
                 echo "  Compiles labs/lab_<name>.mojo (-O3 default, -O1 with --fast) and runs subsystem benchmarks."
                 return 0
                 ;;
@@ -556,20 +565,20 @@ cmd_lab() {
     done
 
     if [[ -z "$target" ]]; then
-        echo "Usage: bash tools/flint.sh lab <physics|anim|render|audio_ui|net|all> [--fast]" >&2
+        echo "Usage: bash tools/flint.sh lab <physics|anim|render|audio_ui|net|world_stream|all> [--fast]" >&2
         return 1
     fi
 
     local labs=()
     case "$target" in
-        physics|anim|render|audio_ui|net)
+        physics|anim|render|audio_ui|net|world_stream)
             labs=("$target")
             ;;
         all)
-            labs=("physics" "anim" "render" "audio_ui" "net")
+            labs=("physics" "anim" "render" "audio_ui" "net" "world_stream")
             ;;
         *)
-            echo "[Flint Lab] ERROR: Unknown lab '$target'. Expected one of: physics, anim, render, audio_ui, net, all." >&2
+            echo "[Flint Lab] ERROR: Unknown lab '$target'. Expected one of: physics, anim, render, audio_ui, net, world_stream, all." >&2
             return 1
             ;;
     esac
@@ -1085,6 +1094,13 @@ cmd_preview() {
 }
 
 cmd_world() {
+    if [[ "${1:-}" == "--check-recovery" ]]; then
+        shift
+        resolve_mojo
+        compile_mojo "${ROOT}/examples/open_world/qualify_bridge_recovery.mojo" "${ROOT}/build/flint-bridge-recovery" "-O3"
+        "${ROOT}/build/flint-bridge-recovery" "$@"
+        return
+    fi
     cmd_build world
     mkdir -p "${ROOT}/build/shots"
     exec "${ROOT}/build/flint-world" "$@"
@@ -1094,6 +1110,18 @@ cmd_shot() {
     cmd_build spark
     mkdir -p "${ROOT}/build/shots"
     "${ROOT}/build/flint-spark" --shots
+}
+
+cmd_character_course() {
+    resolve_mojo
+    local entry=main binary=flint-character-course
+    if [[ "${1:-}" == "--recovery-bench" ]]; then
+        shift
+        entry=recovery_bench
+        binary=flint-recovery-bench
+    fi
+    compile_mojo "${ROOT}/examples/character_course/${entry}.mojo" "${ROOT}/build/${binary}" "-O3" "${ROOT}/examples/character_course"
+    "${ROOT}/build/${binary}" "$@"
 }
 
 cmd_gate() {
@@ -1116,6 +1144,9 @@ cmd_gate() {
     "${ROOT}/build/flint-e2e"
     "${ROOT}/build/flint-cycles-test"
     run_v5_suites
+    cmd_character_course --capture
+    cmd_character_course --recovery-bench --check
+    cmd_world --check-recovery
     cmd_lab all
     echo "[Flint Gate] Running golden-frame FLIP and perf_history p99 verification..."
     compile_mojo "${ROOT}/tools/gate_verify.mojo" "${ROOT}/build/flint-gate-verify" "-O3"
@@ -1181,22 +1212,37 @@ remote_capture() (
     echo "Downloaded trace: $local_file"
 )
 
+# Index split debug files by the installed (stripped) ELF's exact SHA-256.
+archive_package_symbols() (
+    local elf="$1" archive="$2" stage sha
+    stage="$(mktemp -- "$archive/.flint-symbols-XXXXXX")" || return 1
+    trap 'rm -f -- "$stage"' EXIT
+    objcopy --only-keep-debug "$elf" "$stage" || return 1
+    chmod 0600 -- "$stage" || return 1
+    objcopy --strip-debug "$elf" || return 1
+    sha="$(sha256sum -- "$elf" | cut -d' ' -f1)" || return 1
+    mv -f -- "$stage" "$archive/$sha.debug"
+)
+
 cmd_package() {
     local out_dir=""
     local target=""
     local assets_dir=""
     local assets_explicit=0
     local proj_name=""
-    local loose_assets=0 profile="" platform=linux opt=-O3
+    local loose_assets=0 profile="" platform=linux opt=-O3 symbols_dir="" line_tables=0
     local profile_section=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
-                echo "Usage: bash tools/flint.sh package [out_dir] [--profile NAME | --list-profiles] [--out <dir>] [--target <spark|world|studio|cycles|kms|kms3d|path.mojo>] [--assets <dir>] [--name <name>] [--loose-assets]"
+                echo "Usage: bash tools/flint.sh package [out_dir] [--profile NAME | --list-profiles] [--out <dir>] [--target <spark|world|studio|cycles|kms|kms3d|path.mojo>] [--assets <dir>] [--name <name>] [--loose-assets] [--symbols <private-dir>]"
                 echo "  Builds a self-contained release bundle (bin/, lib/, assets.flpk, flint.toml, MANIFEST.txt, run.sh)."
                 return 0
                 ;;
+            --symbols)
+                [[ $# -ge 2 && -n "$2" ]] || { echo "--symbols requires a directory" >&2; return 1; }
+                symbols_dir="$2"; shift 2 ;;
             --list-profiles) profile_names; return ;;
             --profile)
                 [[ $# -ge 2 && "$2" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "Expected a build profile name" >&2; return 1; }
@@ -1355,10 +1401,22 @@ cmd_package() {
     mkdir -p "${out_dir}/bin" "${out_dir}/lib"
     out_dir="$(cd "$out_dir" && pwd)"
 
+    if [[ -n "$symbols_dir" ]]; then
+        [[ "$symbols_dir" == /* ]] || symbols_dir="$CALLER_PWD/$symbols_dir"
+        symbols_dir="$(realpath -m -- "$symbols_dir")" || return 1
+        if [[ "$symbols_dir" == "$out_dir" || "$symbols_dir" == "$out_dir/"* ]]; then
+            echo "[Flint Package] Choose a private symbol directory outside the player bundle." >&2
+            return 1
+        fi
+        command -v objcopy >/dev/null || { echo "[Flint Package] --symbols requires objcopy." >&2; return 1; }
+        mkdir -p -- "$symbols_dir" || return 1
+        line_tables=1
+    fi
+
     echo "[Flint Package] Building ${proj_name} (${src}) ..."
     mkdir -p "$(dirname "$build_bin")"
-    FLINT_WERROR="$eff_werror" FLINT_DETERMINISTIC_FP="$eff_det_fp" FLINT_STRIP_SOURCE_PATHS=1 \
-        compile_mojo "$src" "$build_bin" "$opt" "$extra_inc"
+    FLINT_WERROR="$eff_werror" FLINT_DETERMINISTIC_FP="$eff_det_fp" FLINT_STRIP_SOURCE_PATHS="$((1 - line_tables))" FLINT_PACKAGE_LINE_TABLES="$line_tables" \
+        compile_mojo "$src" "$build_bin" "$opt" "$extra_inc" || return 1
 
     cp -f "$build_bin" "${out_dir}/bin/${proj_name}"
     chmod 0755 "${out_dir}/bin/${proj_name}"
@@ -1398,6 +1456,26 @@ cmd_package() {
             chmod 0644 "${out_dir}/lib/${so_name}"
         fi
     done
+
+    # A project's hot-reload gameplay library ships next to the runtime libraries, so a packaged
+    # game loads the same gameplay code the editor ran.
+    local gameplay_bundled=0 gp_entry_rel=""
+    if [[ "$mode" == "project" ]]; then
+        gp_entry_rel="$(read_flint_toml_value "${CALLER_PWD}/flint.toml" "project" "gameplay_entry" || true)"
+        if [[ -n "$gp_entry_rel" ]]; then
+            FLINT_PACKAGE_LINE_TABLES="$line_tables" cmd_gameplay_so --release --out "${out_dir}/lib/gameplay.so" || return 1
+            chrpath -r '$ORIGIN' "${out_dir}/lib/gameplay.so" >/dev/null
+            chmod 0644 "${out_dir}/lib/gameplay.so"
+            gameplay_bundled=1
+        fi
+    fi
+
+    if [[ "$line_tables" == 1 ]]; then
+        archive_package_symbols "$out_dir/bin/$proj_name" "$symbols_dir" || return 1
+        if [[ "$gameplay_bundled" == 1 ]]; then
+            archive_package_symbols "$out_dir/lib/gameplay.so" "$symbols_dir" || return 1
+        fi
+    fi
 
     local has_flpk=0
     local packed_flpk="${out_dir}/${pack_output_name}"
@@ -1461,8 +1539,8 @@ cmd_package() {
     fi
 
     if [[ "$mode" == "project" && -f "${CALLER_PWD}/flint.toml" ]]; then
-        if [[ "$has_flpk" -eq 1 ]]; then
-            awk -v po="$pack_output_name" '
+        if [[ "$has_flpk" -eq 1 || "$gameplay_bundled" -eq 1 ]]; then
+            awk -v po="$pack_output_name" -v pack="$has_flpk" -v gameplay="$gameplay_bundled" '
                 function strip_toml_comment(s,    i, n, ch, q, esc, sq) {
                     sq = sprintf("%c", 39)
                     n = length(s)
@@ -1488,8 +1566,14 @@ cmd_package() {
                     hdr = strip_toml_comment($0); gsub(/\r$/, "", hdr); gsub(/^[[:space:]]+|[[:space:]]+$/, "", hdr)
                     in_assets = (hdr == "[assets]")
                     in_project = (hdr == "[project]")
+                    if (in_project && gameplay) {
+                        print
+                        print "gameplay_output = \"lib/gameplay.so\""
+                        next
+                    }
                 }
-                (in_assets && /^[[:space:]]*(pack_output|pak_path)[[:space:]]*=/) || (in_project && /^[[:space:]]*pak_path[[:space:]]*=/) {
+                in_project && gameplay && /^[[:space:]]*gameplay_output[[:space:]]*=/ { next }
+                pack && ((in_assets && /^[[:space:]]*(pack_output|pak_path)[[:space:]]*=/) || (in_project && /^[[:space:]]*pak_path[[:space:]]*=/)) {
                     match($0, /^[[:space:]]*/)
                     indent = substr($0, 1, RLENGTH)
                     eq = index($0, "=")
@@ -1553,6 +1637,19 @@ EOF
         : > "$kit/flags"
         if [[ "$eff_werror" != 0 ]]; then echo --Werror >> "$kit/flags"; fi
         if [[ "$eff_det_fp" != 0 ]]; then printf '%s\n' --fp-mode contract=off >> "$kit/flags"; fi
+        if [[ "$gameplay_bundled" -eq 1 ]]; then
+            local gp_src
+            gp_src="$gp_entry_rel"
+            [[ "$gp_src" == /* ]] || gp_src="$CALLER_PWD/$gp_src"
+            gp_src="$(realpath -- "$gp_src")"
+            [[ "$gp_src" == "$CALLER_PWD/"* ]] || { echo "WSL source kit requires a project-local gameplay entry" >&2; return 1; }
+            local gp_relative="${gp_src#"$CALLER_PWD/"}"
+            if [[ "$gp_relative" != src/* ]]; then
+                mkdir -p -- "$kit/game/$(dirname "$gp_relative")"
+                cp -- "$gp_src" "$kit/game/$gp_relative"
+            fi
+            printf '%s\n' "$gp_relative" > "$kit/gameplay-entry"
+        fi
         uname -m > "$kit/build-arch"
         if [[ -d "$out_dir/wsl-source" && -f "$out_dir/wsl-source/entry" ]]; then
             local old_kit
@@ -1591,6 +1688,31 @@ WSL_README
     if command -v sha256sum >/dev/null 2>&1; then
         bin_sha="$(sha256sum "${out_dir}/bin/${proj_name}" | awk '{print $1}')"
     fi
+    local engine_revision game_revision="none" pack_sha="none" engine_lock_sha="unavailable"
+    local engine_dirty="unknown" game_dirty="unknown"
+    engine_revision="$(git -C "$ROOT" rev-parse --verify HEAD 2>/dev/null || echo unavailable)"
+    if [[ "$engine_revision" != unavailable ]]; then
+        engine_dirty=false
+        [[ -z "$(git -C "$ROOT" status --porcelain -- .)" ]] || engine_dirty=true
+    fi
+    if [[ "$mode" == "project" ]]; then
+        game_revision="$(git -C "$CALLER_PWD" rev-parse --verify HEAD 2>/dev/null || echo unversioned)"
+        if [[ "$game_revision" != unversioned ]]; then
+            game_dirty=false
+            [[ -z "$(git -C "$CALLER_PWD" status --porcelain -- .)" ]] || game_dirty=true
+        fi
+    fi
+    if [[ "$has_flpk" -eq 1 ]]; then
+        pack_sha="$(sha256sum -- "$packed_flpk" | cut -d' ' -f1)"
+    fi
+    if [[ -f "$ROOT/pixi.lock" ]]; then
+        install -m 0644 -- "$ROOT/pixi.lock" "$out_dir/engine-pixi.lock"
+        engine_lock_sha="$(sha256sum -- "$out_dir/engine-pixi.lock" | cut -d' ' -f1)"
+    fi
+    local gameplay_sha="none"
+    if [[ "$gameplay_bundled" == 1 ]]; then
+        gameplay_sha="$(sha256sum -- "$out_dir/lib/gameplay.so" | cut -d' ' -f1)"
+    fi
     local manifest_src="$src"
     if [[ "$mode" == "project" && "$manifest_src" == "${CALLER_PWD}/"* ]]; then
         manifest_src="${manifest_src#${CALLER_PWD}/}"
@@ -1604,6 +1726,13 @@ mode=${mode}
 source=${manifest_src}
 binary=bin/${proj_name}
 binary_sha256=${bin_sha}
+gameplay_sha256=${gameplay_sha}
+assets_pack_sha256=${pack_sha}
+engine_revision=${engine_revision}
+engine_dirty=${engine_dirty}
+game_revision=${game_revision}
+game_dirty=${game_dirty}
+engine_lock_sha256=${engine_lock_sha}
 mojo_version=${mojo_ver}
 git_commit=${git_commit}
 assets_pack=$([[ "$has_flpk" -eq 1 ]] && echo "$pack_output_name" || echo "none")
@@ -1618,7 +1747,7 @@ EOF
     echo "[Flint Package] Release bundle ready at: ${out_dir}"
 }
 
-cmd_new() {
+cmd_new() (
     local dest="${1:-}"
     if [[ -z "$dest" ]]; then
         echo "Usage: tools/flint.sh new <target_directory>" >&2
@@ -1627,7 +1756,24 @@ cmd_new() {
     if [[ "$dest" != /* ]]; then
         dest="${CALLER_PWD}/${dest}"
     fi
-    mkdir -p "${dest}/src" "${dest}/assets" "${dest}/tools"
+    mkdir -p -- "$dest"
+    local scaffold_lock scaffold_path
+    exec {scaffold_lock}<"$dest"
+    flock -x "$scaffold_lock"
+    for scaffold_path in flint.toml pixi.toml .gitignore README.md src/main.mojo src/gameplay.mojo assets/main.flscn tools/run.sh; do
+        if [[ -e "$dest/$scaffold_path" || -L "$dest/$scaffold_path" ]]; then
+            echo "[Flint] Existing project file would be overwritten: $dest/$scaffold_path" >&2
+            return 1
+        fi
+    done
+    for scaffold_path in src assets tools; do
+        if [[ -L "$dest/$scaffold_path" || ( -e "$dest/$scaffold_path" && ! -d "$dest/$scaffold_path" ) ]]; then
+            echo "[Flint] Project directory is occupied: $dest/$scaffold_path" >&2
+            return 1
+        fi
+    done
+    set -o noclobber
+    mkdir -p -- "${dest}/src" "${dest}/assets" "${dest}/tools"
     local abs_dest app_name safe_app_name engine_commit
     abs_dest="$(cd "$dest" && pwd)"
     app_name="$(basename "$abs_dest")"
@@ -1645,6 +1791,8 @@ name = "${app_name}"
 version = "0.1.0"
 entry = "src/main.mojo"
 entry_scene = "assets/main.flscn"
+gameplay_entry = "src/gameplay.mojo"
+gameplay_output = "build/gameplay.so"
 
 [engine]
 flint_version = "5.0.0+${engine_commit}"
@@ -1958,29 +2106,38 @@ EOF
     chmod +x "${abs_dest}/tools/run.sh"
 
     sed "s/__FLINT_APP_NAME__/${safe_app_name}/g" > "${abs_dest}/src/main.mojo" <<'EOF'
-"""Flint Engine v5 game: __FLINT_APP_NAME__."""
+"""Flint Engine v5 game: __FLINT_APP_NAME__.
+
+`add_game_plugins` installs the full engine (physics, audio, animation, navigation, AI, assets and
+the Vulkan renderer that Studio uses), so the level you build in Studio is the level you ship.
+Gameplay code can live here as ECS systems, or in `src/gameplay.mojo` as a hot-reloadable `.so`
+(`tools/flint.sh gameplay-so`, reloaded live in Studio's Play mode).
+"""
 from std.ffi import external_call
-from std.math import cos, max, min, sin
+from std.math import atan2, cos, max, min, sin, sqrt
 from std.sys import argv
 from flint.app import (
     AppConfig,
     EngineApp,
     FrameTime,
+    GameFlow,
     Resource,
     Resources,
-    STAGE_LAST,
     STAGE_UPDATE,
 )
-from flint.app.window_plugin import WindowPlugin, WindowStateResource
+from flint.app.game_runtime import GameRuntimeConfig, add_game_plugins, register_game_codecs
+from flint.app.hot_reload import HotReloadHost
+from flint.app.settings import GameSettings
+from flint.app.window_plugin import WindowStateResource
 from flint.assets.image import write_png
 from flint.assets.server import AssetServer
+from flint.audio.server import AudioServer
 from flint.core.build_info import check_flint_version_pin
 from flint.core.jobs import JobPool
 from flint.core.log import flush_log, start_log
-from flint.core.math import Quat, Vec3
-from flint.ecs import Entity, ParallelCommands, World, comp_hash64
+from flint.core.math import Vec3
+from flint.ecs import ParallelCommands, World, comp_hash64
 from flint.input.input_map import ACTION_BOOL, InputContext, InputMap
-from flint.input.plugin import InputPlugin
 from flint.platform.kms import on_virtual_console
 from flint.platform.os import (
     env_flag,
@@ -1992,27 +2149,15 @@ from flint.platform.os import (
     parent_directory,
     read_bytes,
 )
-from flint.render.plugin import (
-    CameraComponent,
-    EnvironmentComponent,
-    MaterialOverrideComponent,
-    MeshRendererComponent,
-    PointLightComponent,
-    register_render_codecs,
-)
-from flint.render.simd_canvas import Camera3D, SimdCanvas, pack_argb
-from flint.scene import (
-    ComponentRegistry,
-    GlobalTransform,
-    LocalTransform,
-    Scene,
-    TransformPlugin,
-)
+from flint.render.plugin import CameraComponent
+from flint.render.render_world import RENDER_TIER_2_AAA_VISBUFFER_RT, ScalableRenderer
+from flint.scene import ComponentRegistry, LocalTransform
 
 
 struct GameConfig(Copyable, Movable):
     var app_name: String
     var entry_scene: String
+    var gameplay_output: String
     var flint_version: String
     var window_title: String
     var window_width: Int
@@ -2027,6 +2172,7 @@ struct GameConfig(Copyable, Movable):
     def __init__(out self):
         self.app_name = "__FLINT_APP_NAME__"
         self.entry_scene = "assets/main.flscn"
+        self.gameplay_output = "build/gameplay.so"
         self.flint_version = ""
         self.window_title = "__FLINT_APP_NAME__"
         self.window_width = 1280
@@ -2139,6 +2285,8 @@ def _load_flint_toml() -> GameConfig:
                 cfg.app_name = val
             elif key == "entry_scene" and val.byte_length() > 0:
                 cfg.entry_scene = val
+            elif key == "gameplay_output" and val.byte_length() > 0:
+                cfg.gameplay_output = val
             elif key == "pak_path" and val.byte_length() > 0 and project_pak_path.byte_length() == 0:
                 project_pak_path = val
         elif section == "engine" and key == "flint_version":
@@ -2180,127 +2328,15 @@ struct GameStateResource(Resource, Movable):
     var headless: Bool
     var cam_yaw: Float32
     var cam_dist: Float32
-    var camera_orbited: Bool
-    var canvas: SimdCanvas
+    var cam_height: Float32
+    var cam_init: Bool
 
-    def __init__(out self, headless: Bool, width: Int, height: Int):
+    def __init__(out self, headless: Bool):
         self.headless = headless
         self.cam_yaw = Float32(0.785398)
         self.cam_dist = Float32(9.2)
-        self.camera_orbited = False
-        self.canvas = SimdCanvas(width, height)
-
-
-def _draw_box_3d(
-    mut canvas: SimdCanvas,
-    cam: Camera3D,
-    center: Vec3,
-    rot: Quat,
-    scale: Vec3,
-    color: UInt32,
-    sun_dir: Vec3,
-):
-    var hx = scale.x * Float32(0.5)
-    var hy = scale.y * Float32(0.5)
-    var hz = scale.z * Float32(0.5)
-    if scale.x >= Float32(4.0) or scale.z >= Float32(4.0):
-        var nx = 6
-        var nz = 6
-        var dx = scale.x / Float32(nx)
-        var dz = scale.z / Float32(nz)
-        for ix in range(nx):
-            var x0 = -hx + Float32(ix) * dx
-            var x1 = x0 + dx
-            for iz in range(nz):
-                var z0 = -hz + Float32(iz) * dz
-                var z1 = z0 + dz
-                var q0 = center + rot.rotate(Vec3(x0, hy, z0))
-                var q1 = center + rot.rotate(Vec3(x1, hy, z0))
-                var q2 = center + rot.rotate(Vec3(x1, hy, z1))
-                var q3 = center + rot.rotate(Vec3(x0, hy, z1))
-                canvas.draw_tri_3d_lit(cam, q0, q1, q2, color, sun_dir)
-                canvas.draw_tri_3d_lit(cam, q0, q2, q3, color, sun_dir)
-        return
-
-    var c0 = center + rot.rotate(Vec3(-hx, -hy, -hz))
-    var c1 = center + rot.rotate(Vec3(hx, -hy, -hz))
-    var c2 = center + rot.rotate(Vec3(hx, hy, -hz))
-    var c3 = center + rot.rotate(Vec3(-hx, hy, -hz))
-    var c4 = center + rot.rotate(Vec3(-hx, -hy, hz))
-    var c5 = center + rot.rotate(Vec3(hx, -hy, hz))
-    var c6 = center + rot.rotate(Vec3(hx, hy, hz))
-    var c7 = center + rot.rotate(Vec3(-hx, hy, hz))
-    canvas.draw_tri_3d_lit(cam, c0, c1, c2, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c0, c2, c3, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c5, c4, c7, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c5, c7, c6, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c4, c0, c3, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c4, c3, c7, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c1, c5, c6, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c1, c6, c2, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c3, c2, c6, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c3, c6, c7, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c4, c5, c1, color, sun_dir)
-    canvas.draw_tri_3d_lit(cam, c4, c1, c0, color, sun_dir)
-
-
-def _render_scene_simd(mut world: World, mut state: GameStateResource):
-    var cam = Camera3D(
-        screen_w=state.canvas.width,
-        screen_h=state.canvas.height,
-        eye=Vec3(
-            cos(state.cam_yaw) * state.cam_dist,
-            Float32(3.6),
-            sin(state.cam_yaw) * state.cam_dist,
-        ),
-        target=Vec3(0.0, 0.8, 0.0),
-        fov_deg=Float32(55.0),
-    )
-    if not state.camera_orbited:
-        var cam_ents = world.query_entities(world.bit_for[CameraComponent]())
-        for i in range(len(cam_ents)):
-            var ce = cam_ents[i]
-            var cc_opt = world.get_ptr[CameraComponent](ce)
-            var lt_opt = world.get_ptr[LocalTransform](ce)
-            if cc_opt and lt_opt and cc_opt.value()[unsafe_offset=0].active:
-                var eye = lt_opt.value()[unsafe_offset=0].translation
-                cam.eye = eye
-                cam.target = eye + cc_opt.value()[unsafe_offset=0].look_target_offset
-                cam.fov_rad = cc_opt.value()[unsafe_offset=0].fov_y_deg * Float32(0.0174532925)
-                break
-    cam.update_basis()
-
-    var sun_dir = Vec3(0.38, 0.80, -0.46)
-    var env_ents = world.query_entities(world.bit_for[EnvironmentComponent]())
-    for i in range(len(env_ents)):
-        var eo = world.get_ptr[EnvironmentComponent](env_ents[i])
-        if eo and eo.value()[unsafe_offset=0].enabled:
-            sun_dir = eo.value()[unsafe_offset=0].sun_dir
-            break
-
-    state.canvas.clear(0x0D1726, 0x1B2B44)
-    var mesh_mask = world.bit_for[LocalTransform]().union(world.bit_for[MeshRendererComponent]())
-    var mesh_ents = world.query_entities(mesh_mask)
-    for i in range(len(mesh_ents)):
-        var me = mesh_ents[i]
-        var mr_opt = world.get_ptr[MeshRendererComponent](me)
-        var lt_opt = world.get_ptr[LocalTransform](me)
-        if not mr_opt or not lt_opt or not mr_opt.value()[unsafe_offset=0].visible:
-            continue
-        var col = pack_argb(180, 195, 210)
-        var mo_opt = world.get_ptr[MaterialOverrideComponent](me)
-        if mo_opt and mo_opt.value()[unsafe_offset=0].enabled:
-            var bc = mo_opt.value()[unsafe_offset=0].base_color
-            col = pack_argb(
-                Int(max(Float32(0.0), min(Float32(255.0), bc.x * Float32(255.0)))),
-                Int(max(Float32(0.0), min(Float32(255.0), bc.y * Float32(255.0)))),
-                Int(max(Float32(0.0), min(Float32(255.0), bc.z * Float32(255.0)))),
-            )
-        var gt_opt = world.get_ptr[GlobalTransform](me)
-        var pos = gt_opt.value()[unsafe_offset=0].translation if gt_opt else lt_opt.value()[unsafe_offset=0].translation
-        var rot = gt_opt.value()[unsafe_offset=0].rotation if gt_opt else lt_opt.value()[unsafe_offset=0].rotation
-        var scl = gt_opt.value()[unsafe_offset=0].scale if gt_opt else lt_opt.value()[unsafe_offset=0].scale
-        _draw_box_3d(state.canvas, cam, pos, rot, scl, col, sun_dir)
+        self.cam_height = Float32(3.6)
+        self.cam_init = False
 
 
 def _sys_game_update(
@@ -2310,64 +2346,52 @@ def _sys_game_update(
     _cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
     _ctx: Int,
 ):
+    """Example gameplay: A/D (or arrows) orbit the scene camera around the origin; Esc quits."""
     ref world = world_ptr[unsafe_offset=0]
     ref resources = res_ptr[unsafe_offset=0]
     var st_opt = resources.get_ptr_mut[GameStateResource]()
     if not st_opt:
         return
     ref state = st_opt.value()[unsafe_offset=0]
-
     var dt = Float32(1.0 / 60.0)
     var ft_opt = resources.get_ptr[FrameTime]()
-    if ft_opt:
-        var fdt = ft_opt.value()[unsafe_offset=0].delta_seconds
-        if fdt > Float32(0.0):
-            dt = fdt
-
-    var win_opt = resources.get_ptr_mut[WindowStateResource]()
-    if win_opt:
-        ref win_res = win_opt.value()[unsafe_offset=0]
-        if win_res.resized and win_res.width > 0 and win_res.height > 0:
-            state.canvas.resize(win_res.width, win_res.height)
-
+    if ft_opt and ft_opt.value()[unsafe_offset=0].delta_seconds > Float32(0.0):
+        dt = ft_opt.value()[unsafe_offset=0].delta_seconds
+    var orbit = Float32(0.0)
     var imap_opt = resources.get_ptr[InputMap]()
     if not state.headless and imap_opt:
         ref imap = imap_opt.value()[unsafe_offset=0]
         if imap.just_pressed("quit"):
+            var win_opt = resources.get_ptr_mut[WindowStateResource]()
             if win_opt:
                 win_opt.value()[unsafe_offset=0].request_close()
             return
         if imap.is_down("orbit_left"):
-            state.cam_yaw -= Float32(1.5) * dt
-            state.camera_orbited = True
+            orbit -= Float32(1.5) * dt
         if imap.is_down("orbit_right"):
-            state.cam_yaw += Float32(1.5) * dt
-            state.camera_orbited = True
-
-    _render_scene_simd(world, state)
-
-
-def _sys_game_present(
-    _world_ptr: Pointer[World, MutAnyOrigin],
-    res_ptr: Pointer[Resources, MutAnyOrigin],
-    _pool_ptr: Pointer[JobPool, MutAnyOrigin],
-    _cmds_ptr: Pointer[ParallelCommands, MutAnyOrigin],
-    _ctx: Int,
-):
-    ref resources = res_ptr[unsafe_offset=0]
-    var st_opt = resources.get_ptr_mut[GameStateResource]()
-    var win_opt = resources.get_ptr_mut[WindowStateResource]()
-    if not st_opt or not win_opt:
-        return
-    if st_opt.value()[unsafe_offset=0].headless:
-        return
-    ref state = st_opt.value()[unsafe_offset=0]
-    ref win_res = win_opt.value()[unsafe_offset=0]
-    if len(win_res.windows) > 0:
-        win_res.windows[0].present(state.canvas.pixels, state.canvas.width, state.canvas.height)
+            orbit += Float32(1.5) * dt
+    var cams = world.query_entities(world.bit_for[CameraComponent]().union(world.bit_for[LocalTransform]()))
+    for i in range(len(cams)):
+        var cc = world.get_ptr_mut[CameraComponent](cams[i])
+        var lt = world.get_ptr_mut[LocalTransform](cams[i])
+        if not cc or not lt or not cc.value()[unsafe_offset=0].active:
+            continue
+        if not state.cam_init:
+            # Start the orbit from wherever the scene placed the camera.
+            var p = lt.value()[unsafe_offset=0].translation
+            state.cam_dist = max(Float32(1.0), sqrt(p.x * p.x + p.z * p.z))
+            state.cam_yaw = atan2(p.z, p.x)
+            state.cam_height = p.y
+            state.cam_init = True
+        if orbit != Float32(0.0):
+            state.cam_yaw += orbit
+            var eye = Vec3(cos(state.cam_yaw) * state.cam_dist, state.cam_height, sin(state.cam_yaw) * state.cam_dist)
+            lt.value()[unsafe_offset=0].translation = eye
+            cc.value()[unsafe_offset=0].look_target_offset = Vec3(0.0, 0.8, 0.0) - eye
+        break
 
 
-def _setup_input(mut app: EngineApp):
+def _setup_input(mut app: EngineApp, settings: GameSettings):
     var imap_opt = app.resources.get_ptr_mut[InputMap]()
     if not imap_opt:
         return
@@ -2383,15 +2407,15 @@ def _setup_input(mut app: EngineApp):
     ctx.bind_key("quit", 256)         # Esc
     imap.add_context(ctx^)
     imap.push_context("gameplay")
+    _ = settings.load_bindings(imap)  # the player's saved rebinding, if any
 
 
-def _looks_like_json_scene(raw: List[UInt8]) -> Bool:
-    for i in range(len(raw)):
-        var b = raw[i]
-        if b == 32 or b == 9 or b == 10 or b == 13:
-            continue
-        return b == 123  # '{'
-    return False
+def _shutdown(mut app: EngineApp, mut gameplay: HotReloadHost) -> Int:
+    if gameplay.is_loaded():
+        _ = gameplay.unload(app.world, app.resources)
+    _ = flush_log()
+    app.shutdown()
+    return 0
 
 
 def _run_game() -> Int:
@@ -2405,7 +2429,6 @@ def _run_game() -> Int:
     var headless_smoke = False
     var shots_mode = False
     var out_png = String("")
-
     var args = argv()
     var ai = 1
     while ai < len(args):
@@ -2430,6 +2453,14 @@ def _run_game() -> Int:
     )
     var effective_headless = headless_smoke or shots_mode or no_display
 
+    # Player settings (resolution, volumes, bindings) live in this game's own user-data folder.
+    var settings = GameSettings.load(cfg.app_name)
+    if file_size(settings.path()) <= 0:
+        settings.width = cfg.window_width
+        settings.height = cfg.window_height
+        settings.vsync = cfg.vsync
+
+    # Packaged builds read from the .flpk pack first, then loose files under assets/.
     var assets = AssetServer(enable_watcher=not effective_headless)
     if file_size(cfg.pack_output) > 0:
         _ = assets.mount_flpk(cfg.pack_output)
@@ -2446,64 +2477,66 @@ def _run_game() -> Int:
         enable_crash_handler=True,
     )
     var app = EngineApp(app_cfg^)
-
-    app.add_plugin(TransformPlugin(snapshot_prev_in_fixed=True))
-    app.add_plugin(
-        WindowPlugin(
-            headless=effective_headless,
-            width=cfg.window_width,
-            height=cfg.window_height,
+    app.insert_resource[AssetServer](assets^)  # AssetPlugin reuses this server and its mounts
+    var w = settings.width if not effective_headless else cfg.window_width
+    var h = settings.height if not effective_headless else cfg.window_height
+    add_game_plugins(
+        app,
+        GameRuntimeConfig(
             title=cfg.window_title,
-        )
+            width=w,
+            height=h,
+            headless=effective_headless,
+            render_tier=RENDER_TIER_2_AAA_VISBUFFER_RT,
+            hot_reload_assets=not effective_headless,
+            vsync=settings.vsync,
+        ),
     )
-    app.add_plugin(InputPlugin(enable_evdev=not effective_headless))
-
-    app.insert_resource[GameStateResource](
-        GameStateResource(effective_headless, cfg.window_width, cfg.window_height)
-    )
+    app.insert_resource[GameStateResource](GameStateResource(effective_headless))
+    app.insert_resource[GameFlow](GameFlow(game_id=cfg.app_name))
+    app.insert_resource[GameSettings](settings.copy())  # a settings menu edits this; render scale applies live
     _ = app.add_system(STAGE_UPDATE, "game.update", _sys_game_update, exclusive=True)
-    _ = app.add_system(STAGE_LAST, "game.present", _sys_game_present, exclusive=True)
-
-    _setup_input(app)
+    _setup_input(app, settings)
 
     var reg = ComponentRegistry.with_builtins()
-    register_render_codecs(reg)
+    register_game_codecs(reg)
     reg.ensure_registered_in_world(app.world)
 
-    var scene_bytes = List[UInt8]()
-    var rh = assets.load_raw(cfg.entry_scene)
-    var rptr = assets.raws.get_ptr(rh)
-    if rptr and len(rptr.value()[unsafe_offset=0].bytes) > 0:
-        scene_bytes = rptr.value()[unsafe_offset=0].bytes.copy()
-    elif file_size(cfg.entry_scene) > 0:
-        scene_bytes = read_bytes(cfg.entry_scene)
-
-    if len(scene_bytes) == 0:
-        print("[" + cfg.app_name + "] ERROR: entry_scene not found or empty: " + cfg.entry_scene)
-        assets.close()
+    var loaded = False
+    var srv_opt = app.resources.get_ptr_mut[AssetServer]()
+    var flow_opt = app.resources.get_ptr_mut[GameFlow]()
+    if srv_opt and flow_opt:
+        loaded = flow_opt.value()[unsafe_offset=0].transition_to_scene(
+            app.world, reg, srv_opt.value()[unsafe_offset=0], cfg.entry_scene
+        )
+    if not loaded:
+        print("[" + cfg.app_name + "] ERROR: could not load entry_scene: " + cfg.entry_scene)
         _ = flush_log()
         app.shutdown()
         return 1
 
-    var scene = Scene(cfg.entry_scene)
-    try:
-        if cfg.entry_scene.endswith(".flscnb") or not _looks_like_json_scene(scene_bytes):
-            _ = scene.load_flscnb_bytes(app.world, reg, scene_bytes, clear_existing=True)
-        else:
-            _ = scene.load_flscn_bytes(app.world, reg, scene_bytes, clear_existing=True)
-    except err:
-        print("[" + cfg.app_name + "] ERROR: failed to load entry_scene '" + cfg.entry_scene + "': " + String(err))
-        assets.close()
-        _ = flush_log()
-        app.shutdown()
-        return 1
+    app.startup()
+    var gameplay = HotReloadHost()
+    var plugin_path = env_value("FLINT_GAMEPLAY_PLUGIN")
+    var plugin_required = plugin_path.byte_length() > 0 or cfg.gameplay_output == "lib/gameplay.so"
+    if plugin_path.byte_length() == 0:
+        plugin_path = cfg.gameplay_output
+    if plugin_required or file_size(plugin_path) > 0:
+        if not gameplay.load_or_reload(plugin_path, app.world, app.resources):
+            print("[" + cfg.app_name + "] ERROR: " + gameplay.last_error)
+            _ = _shutdown(app, gameplay)
+            return 1
+    var au_opt = app.resources.get_ptr[AudioServer]()
+    if au_opt:
+        _ = settings.apply_audio(au_opt.value()[unsafe_offset=0])
 
-    if headless_smoke or shots_mode or no_display:
-        app.startup()
-        var steps = 4 if headless_smoke else 1
+    if effective_headless:
+        var steps = 4 if headless_smoke else 2
         for _ in range(steps):
-            app.step_one_frame(Float32(1.0) / Float32(max(1, cfg.fixed_hz)))
-
+            var dt = Float32(1.0) / Float32(max(1, cfg.fixed_hz))
+            if gameplay.is_loaded():
+                _ = gameplay.step(app.world, app.resources, dt)
+            app.step_one_frame(dt)
         var shot_target = out_png
         if shots_mode and shot_target.byte_length() == 0:
             shot_target = "build/shots/" + cfg.app_name + ".png"
@@ -2511,61 +2544,51 @@ def _run_game() -> Int:
             var pdir = parent_directory(shot_target)
             if pdir.byte_length() > 0 and pdir != ".":
                 _ = make_dirs(pdir)
-            var st_opt = app.resources.get_ptr_mut[GameStateResource]()
-            if st_opt:
-                ref st = st_opt.value()[unsafe_offset=0]
-                _ = write_png(shot_target, st.canvas.pixels, st.canvas.width, st.canvas.height)
-
+            var r_opt = app.resources.get_ptr[ScalableRenderer]()
+            if r_opt:
+                ref r = r_opt.value()[unsafe_offset=0]
+                var px = r.readback_pixels()
+                if not write_png(shot_target, px, r.width, r.height):
+                    print("[" + cfg.app_name + "] ERROR: could not write screenshot: " + shot_target)
+                    _ = _shutdown(app, gameplay)
+                    return 1
+            else:
+                _ = _shutdown(app, gameplay)
+                return 1
         print(
-            "["
-            + cfg.app_name
-            + "] Headless v5 frame loop OK ("
-            + String(cfg.window_width)
-            + "x"
-            + String(cfg.window_height)
-            + ", fixed_hz="
-            + String(cfg.fixed_hz)
-            + ", net_mtu="
-            + String(cfg.net_mtu_bytes)
-            + ", entities="
-            + String(len(app.world.entities))
-            + ")."
+            "[" + cfg.app_name + "] Headless v5 frame loop OK ("
+            + String(cfg.window_width) + "x" + String(cfg.window_height)
+            + ", fixed_hz=" + String(cfg.fixed_hz)
+            + ", entities=" + String(len(app.world.entities)) + ")."
         )
-        assets.close()
-        _ = flush_log()
-        app.shutdown()
-        return 0
+        return _shutdown(app, gameplay)
 
-    app.startup()
-    var win_open = False
-    var win_opt = app.resources.get_ptr[WindowStateResource]()
-    if win_opt:
-        win_open = win_opt.value()[unsafe_offset=0].is_open()
-
-    if not win_open:
+    var win_opt = app.resources.get_ptr_mut[WindowStateResource]()
+    if not win_opt or not win_opt.value()[unsafe_offset=0].is_open():
         print("[" + cfg.app_name + "] No display available; exiting cleanly. Use '--headless-smoke' or '--shots'.")
-        assets.close()
-        _ = flush_log()
-        app.shutdown()
-        return 0
+        return _shutdown(app, gameplay)
+    settings.apply_window(win_opt.value()[unsafe_offset=0])
 
     var last_t = get_time()
     while True:
-        var open_now = False
         var wo = app.resources.get_ptr[WindowStateResource]()
-        if wo:
-            open_now = wo.value()[unsafe_offset=0].is_open()
-        if not open_now:
+        if not wo or not wo.value()[unsafe_offset=0].is_open():
             break
         var now = get_time()
         var dt = Float32(min(0.05, max(0.001, now - last_t)))
         last_t = now
+        if gameplay.is_loaded():
+            _ = gameplay.step(app.world, app.resources, dt)
         app.step_one_frame(dt)
 
-    assets.close()
-    _ = flush_log()
-    app.shutdown()
-    return 0
+    var live_opt = app.resources.get_ptr[GameSettings]()
+    if live_opt:
+        settings = live_opt.value()[unsafe_offset=0].copy()
+    var im_opt = app.resources.get_ptr[InputMap]()
+    if im_opt:
+        _ = settings.save_bindings(im_opt.value()[unsafe_offset=0])
+    _ = settings.save()
+    return _shutdown(app, gameplay)
 
 
 def main():
@@ -2573,8 +2596,44 @@ def main():
     if rc != 0:
         external_call["exit", NoneType](Int32(rc))
 EOF
+
+    cat > "${abs_dest}/src/gameplay.mojo" <<'EOF'
+"""Hot-reloadable gameplay plugin (`tools/flint.sh gameplay-so` builds build/gameplay.so).
+
+Studio loads the .so in Play mode and reloads it when you rebuild, keeping the world. Put fast-
+iterating gameplay rules here; `FlintPluginApiV2` (flint.app.hot_reload) is the API it may call.
+"""
+from flint.app.hot_reload import FLINT_PLUGIN_API_VERSION, FlintPluginApiV2
+
+
+@export("flint_plugin_api_version")
+def flint_plugin_api_version() abi("C") -> UInt32:
+    return FLINT_PLUGIN_API_VERSION
+
+
+@export("flint_plugin_on_load")
+def flint_plugin_on_load(api_ptr: Int, world_ptr: Int, res_ptr: Int, is_reload: Int32) abi("C") -> Int32:
+    if api_ptr == 0 or world_ptr == 0:
+        return Int32(-1)
+    ref api = Pointer[FlintPluginApiV2, ImmutAnyOrigin](unsafe_from_address=api_ptr)[unsafe_offset=0]
+    if not api.is_valid():
+        return Int32(-2)
+    return Int32(0)
+
+
+@export("flint_plugin_on_step")
+def flint_plugin_on_step(api_ptr: Int, world_ptr: Int, res_ptr: Int, dt: Float32) abi("C") -> Int32:
+    if api_ptr == 0 or world_ptr == 0:
+        return Int32(-1)
+    return Int32(1)
+
+
+@export("flint_plugin_on_unload")
+def flint_plugin_on_unload(_api_ptr: Int, _world_ptr: Int, _res_ptr: Int, _is_reload: Int32) abi("C") -> None:
+    pass
+EOF
     echo "[Flint] Scaffolded new standalone Flint v5 project (with flint.toml) at: ${abs_dest}"
-}
+)
 
 cmd_gameplay_so() {
     local opt="-O1"
@@ -2677,7 +2736,9 @@ cmd_gameplay_so() {
     rm -f "$tmp_base"
 
     echo "[Flint] Building gameplay plugin ${gp_entry} -> ${out_so} (${opt}) ..."
-    if ! "$MOJO_BIN" build "$src_path" --emit shared-lib -o "$tmp_so" "${inc_args[@]}" "$opt" "${fp_args[@]}" "${werror_args[@]}"; then
+    local debug_args=()
+    [[ "${FLINT_PACKAGE_LINE_TABLES:-0}" != 1 ]] || debug_args=(-g1)
+    if ! "$MOJO_BIN" build "$src_path" "${debug_args[@]}" --emit shared-lib -o "$tmp_so" "${inc_args[@]}" "$opt" "${fp_args[@]}" "${werror_args[@]}"; then
         rm -f "$tmp_so"
         echo "[Flint] ERROR: Failed to build gameplay plugin shared library." >&2
         return 1
@@ -2695,6 +2756,7 @@ case "$subcmd" in
     build)   cmd_build "$@" ;;
     run)     cmd_run "$@" ;;
     gameplay-so) cmd_gameplay_so "$@" ;;
+    character-course) cmd_character_course "$@" ;;
     fern)
         resolve_mojo
         compile_mojo "${ROOT}/examples/fern/main.mojo" "${ROOT}/build/flint-fern" "-O3" ""
@@ -2722,7 +2784,7 @@ case "$subcmd" in
         echo ""
         echo "Commands:"
         echo "  doctor               Check Mojo 1.2 toolchain, Vulkan ICD, Wayland/X11/KMS, Audio, evdev & inotify"
-        echo "  lab <name|all> [--fast] Compile & run subsystem lab (physics|anim|render|audio_ui|net|all)"
+        echo "  lab <name|all> [--fast] Compile & run subsystem lab (physics|anim|render|audio_ui|net|world_stream|all)"
         echo "  studio --takes [take or recipe]     Preview and author motion, capture video and export BVH/GLB"
         echo "  studio --kimodo [PROMPT OUTPUT.bvh [FRAMES STEPS SEED]]   Generate SOMA motion"
         echo "  studio --compare A B [--text | --shot FILE]   Compare two frame captures"
@@ -2738,8 +2800,10 @@ case "$subcmd" in
         echo "  test [unit|e2e|v5]   Build and run standalone Flint Engine verification suites"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
         echo "  preview <program>    Live preview: rebuild on save and swap window (spark|world|studio|cycles|file|dir)"
+        echo "  character-course [--capture|--frames|--recovery-bench]   Play, capture or benchmark the character"
         echo "  fern IMAGE PREFIX    Bake an upright frond into near, medium and far GLBs"
         echo "  world [--shots]      Launch 512m x 512m AAA Vulkan Open-World sandbox"
+        echo "  world --check-recovery [pack]  Verify 28 bridge falls and checkpoint round trips on CPU"
         echo "  kms [--probe]        Run bare-display DRM/KMS demo from a text console (no X11/Wayland)"
         echo "  kms3d                GPU 3D on the bare display via VK_KHR_display"
         echo "  cycles live|render|query ... Pure-Mojo TidalCycles-style live coding (docs/CYCLES.md)"

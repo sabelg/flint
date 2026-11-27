@@ -6,7 +6,7 @@ from std.ffi import external_call
 from flint.assets.cooker_v2 import cook_workspace
 from flint.assets.flpk_v3 import AssetUuid, FlpkV3MappedArchive
 from flint.core.jobs import JobPool
-from flint.platform.os import file_size, make_dirs
+from flint.platform.os import file_size, make_dirs, read_bytes
 from e2e_studio.common.studio_test_utils import (
     StudioSuiteRunner,
     make_tmp_dir,
@@ -97,12 +97,17 @@ def main() raises:
     # 4. Corrupt PNG reports failure cleanly
     var bad_ws = tmp + "/bad_ws"
     _ = write_text(bad_ws + "/good.json", '{"good":true}\n')
+    var good_pack = cook_workspace(bad_ws, tmp + "/bad.flpk", pool, cache_dir=tmp + "/c_bad")
+    var before_failure = read_bytes(tmp + "/bad.flpk")
     var bad_png = List[UInt8]()
     bad_png.append(0x89); bad_png.append(0x50); bad_png.append(0x4E); bad_png.append(0x47)
     bad_png.append(0x0D); bad_png.append(0x0A)
     _ = write_bytes(bad_ws + "/corrupt.png", bad_png)
     var rep_bad = cook_workspace(bad_ws, tmp + "/bad.flpk", pool, cache_dir=tmp + "/c_bad")
-    var bad_ok = (not rep_bad.ok) and rep_bad.failed_count == 1
+    var bad_ok = (
+        good_pack.ok and len(before_failure) > 64 and not rep_bad.ok and rep_bad.failed_count == 1
+        and read_bytes(tmp + "/bad.flpk") == before_failure
+    )
     _ = runner.check(
         "t2_api_cook_corrupt_source_reports_failure",
         bad_ok,
@@ -123,12 +128,22 @@ def main() raises:
     var sz_aligned = file_size(pa_aligned)
     var sz_compact = file_size(pa_compact)
 
+    var reference = tmp + "/timestamp-ref"
+    _ = write_text(reference, "")
+    var save_stamp = "touch -r " + pa_ws + "/a.json " + reference
+    var restore_stamp = "touch -r " + reference + " " + pa_ws + "/a.json"
+    var saved_stamp = external_call["system", Int32](save_stamp.as_c_string_span())
     _ = write_text(pa_ws + "/a.json", '{"k":"BBBB"}\n')
+    var restored_stamp = external_call["system", Int32](restore_stamp.as_c_string_span())
     var rep_edit = cook_workspace(pa_ws, pa_compact, pool, cache_dir=pa_cache, page_align=False)
+    var clean_pack = tmp + "/pa_clean.flpk"
+    var rep_clean = cook_workspace(pa_ws, clean_pack, pool, cache_dir=tmp + "/fresh-cache", page_align=False)
     var arch_edit = FlpkV3MappedArchive.open(pa_compact)
     var rd_edit = arch_edit.read_by_path("a.json", 0)
     var edit_ok = (
-        rep_pa1.ok
+        saved_stamp == 0 and restored_stamp == 0 and rep_clean.ok
+        and read_bytes(pa_compact) == read_bytes(clean_pack)
+        and rep_pa1.ok
         and rep_pa2.ok
         and sz_compact > 0
         and sz_aligned > sz_compact
@@ -142,6 +157,15 @@ def main() raises:
         "t2_api_same_size_edit_and_page_align_false",
         edit_ok,
         "sz_aligned=" + String(sz_aligned) + " sz_compact=" + String(sz_compact),
+    )
+
+    var damaged = read_bytes(pa_compact)
+    damaged[len(damaged) - 1] ^= 1
+    _ = write_bytes(pa_compact, damaged)
+    var repaired = cook_workspace(pa_ws, pa_compact, pool, cache_dir=pa_cache, page_align=False)
+    _ = runner.check(
+        "t2_api_cook_repairs_modified_output", repaired.ok and read_bytes(pa_compact) == read_bytes(clean_pack),
+        "modified output was accepted as an unchanged pack",
     )
 
     # 6. FlpkV3MappedArchive negative boundaries

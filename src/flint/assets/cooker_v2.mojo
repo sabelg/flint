@@ -7,15 +7,16 @@ import settings + cooker version) and packs them into zero-parse `.flpk` v3 arch
   - `< 5 ms` 100% cache hit on unchanged workspace re-runs
   - Pre-cooked `AaaGeometryPool` (`64v/124t` SAH+Forsyth meshlets + `QEM` `LOD0..3`) + `sub_id = 16` `Bvh8` collider
   - Streamable `BC7` / `BC5` / `BC6H` mip sub-chunks (`sub_id = 0` tail + `sub_id = 1..15` high-res mips)
-  - SDF TrueType `.dsf` font atlases & RIFF/WAVE PCM slabs (`CHUNK_COMP_LZ4`).
+  - SDF TrueType `.dsf` font atlases & seekable RIFF/WAVE PCM slabs with per-page CRCs.
 """
 from std.ffi import external_call
-from std.math import pow
+from flint.assets.image import srgb_u8_to_linear as _srgb_u8_to_linear, linear_to_srgb_u8 as _linear_to_srgb_u8
 from std.memory import bitcast
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool
+from flint.core.lz4 import hash_list
 from flint.core.math import Vec3
-from flint.core.serial import BlobReader, BlobWriter, fnv64, fourcc
+from flint.core.serial import BlobReader, BlobWriter
 from flint.assets.bc_compress import (
     downsample_argb_2x,
     downsample_normals_2x,
@@ -33,6 +34,9 @@ from flint.assets.flpk_v3 import (
     ASSET_KIND_TEXTURE,
     CHUNK_COMP_LZ4,
     CHUNK_COMP_NONE,
+    SUB_ID_ANIMATED_GLB,
+    SUB_ID_FONT_OUTLINES,
+    SUB_ID_AUDIO_PAGE_HASHES,
     SUB_ID_BVH8_COLLIDER,
     SUB_ID_PRIMARY_OR_TAIL,
     SUB_ID_RIG,
@@ -45,6 +49,7 @@ from flint.assets.flpk_v3 import (
     FlpkBuildChunk,
     crc64_ecma,
     encode_audio_pcm_slab,
+    encode_audio_page_hashes,
     encode_bvh8_collider_slab,
     encode_cooked_mesh_slab,
     encode_cooked_rig_slab,
@@ -70,13 +75,12 @@ from flint.platform.os import (
     open_read,
     parent_directory,
     read_bytes,
-    rename_file,
-    write_bytes,
+    write_file_durable,
 )
 from flint.text.sdf_bake import bake_font, default_charset, dsf_bytes
 from flint.text.ttf import TrueTypeFont
 
-comptime COOKER_V2_VERSION: UInt32 = 5003
+comptime COOKER_V2_VERSION: UInt32 = 5006
 comptime DEFAULT_COOK_CACHE_DIR = "build/cook_cache"
 comptime _COOK_BUNDLE_TAG: UInt32 = 0x324B4346  # "FCK2"
 comptime _COOK_INDEX_TAG: UInt32 = 0x32584943   # "CIX2"
@@ -224,10 +228,7 @@ def _save_bundle_to_cache(cache_path: String, bundle: CookedAssetBundle) -> Bool
         for b in ch.raw_payload:
             w.u8(b)
     w.end()
-    var tmp = cache_path + "." + String(Int(external_call["getpid", Int32]())) + ".tmp"
-    if not write_bytes(tmp, w.data):
-        return False
-    return rename_file(tmp, cache_path)
+    return write_file_durable(cache_path, w.data, sync=False)
 
 
 def _is_normal_rel_path(rel_path: String) -> Bool:
@@ -380,21 +381,6 @@ def _downsample_hdr_2x(hdr: List[Vec3], w: Int, h: Int) -> Tuple[List[Vec3], Int
                 hdr[y0 * w + x0] + hdr[y0 * w + x1] + hdr[y1 * w + x0] + hdr[y1 * w + x1]
             ) * Float32(0.25)
     return (out^, nw, nh)
-
-
-@always_inline
-def _srgb_u8_to_linear(v: Int) -> Float32:
-    var s = Float32(max(0, min(255, v))) / Float32(255.0)
-    if s <= Float32(0.04045):
-        return s / Float32(12.92)
-    return pow((s + Float32(0.055)) / Float32(1.055), Float32(2.4))
-
-
-@always_inline
-def _linear_to_srgb_u8(v: Float32) -> Int:
-    var c = max(Float32(0.0), min(Float32(1.0), v))
-    var s = c * Float32(12.92) if c <= Float32(0.0031308) else (Float32(1.055) * pow(c, Float32(1.0 / 2.4)) - Float32(0.055))
-    return max(0, min(255, Int(s * Float32(255.0) + Float32(0.5))))
 
 
 def _downsample_argb_2x_srgb(pixels: List[UInt32], w: Int, h: Int) -> Tuple[List[UInt32], Int, Int]:
@@ -573,6 +559,9 @@ def cook_ttf_font_bundle(
         bundle.chunks.append(
             FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_PRIMARY_OR_TAIL, ASSET_KIND_FONT, dsf^, CHUNK_COMP_LZ4)
         )
+        bundle.chunks.append(
+            FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_FONT_OUTLINES, ASSET_KIND_FONT, ttf_bytes.copy(), CHUNK_COMP_LZ4)
+        )
         bundle.valid = True
     except:
         bundle.error = "SDF bake failed: " + rel_path
@@ -595,8 +584,11 @@ def cook_wav_audio_bundle(
         return bundle^
     var slab = encode_audio_pcm_slab(clip.channels, clip.sample_rate, clip.samples)
     bundle.chunks.append(
-        FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_PRIMARY_OR_TAIL, ASSET_KIND_AUDIO, slab^, CHUNK_COMP_LZ4)
+        FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_PRIMARY_OR_TAIL, ASSET_KIND_AUDIO, slab^, CHUNK_COMP_NONE)
     )
+    bundle.chunks.append(FlpkBuildChunk(
+        meta.uuid, rel_path, SUB_ID_AUDIO_PAGE_HASHES, ASSET_KIND_AUDIO, encode_audio_page_hashes(bundle.chunks[0].raw_payload),
+    ))
     bundle.valid = True
     return bundle^
 
@@ -612,7 +604,11 @@ def cook_single_source_bytes(
             var bad = CookedAssetBundle()
             bad.error = "invalid GLB: " + rel_path
             return bad^
-        return cook_native_model_bundle(mdl, meta, rel_path)
+        var bundle = cook_native_model_bundle(mdl, meta, rel_path)
+        if bundle.valid and (len(mdl.skins) > 0 or len(mdl.animations) > 0):
+            bundle.chunks.append(FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_ANIMATED_GLB,
+                ASSET_KIND_MESH, source_bytes.copy(), CHUNK_COMP_LZ4))
+        return bundle^
     if (
         meta.asset_kind == ASSET_KIND_TEXTURE
         or rel_path.endswith(".png")
@@ -658,9 +654,16 @@ def cook_single_source_bytes(
         or rel_path.endswith(".flmat")
         or rel_path.endswith(".json")
     ) else CHUNK_COMP_NONE
+    # QOA is frame-compressed already and supports random access in the pack.
+    if rel_path.endswith(".qoa"):
+        comp_mode = CHUNK_COMP_NONE
     raw_bundle.chunks.append(
         FlpkBuildChunk(meta.uuid, rel_path, SUB_ID_PRIMARY_OR_TAIL, ASSET_KIND_RAW, copy_raw^, comp_mode)
     )
+    if rel_path.endswith(".qoa"):
+        raw_bundle.chunks.append(FlpkBuildChunk(
+            meta.uuid, rel_path, SUB_ID_AUDIO_PAGE_HASHES, ASSET_KIND_AUDIO, encode_audio_page_hashes(source_bytes),
+        ))
     raw_bundle.valid = True
     return raw_bundle^
 
@@ -699,6 +702,8 @@ struct _CookTaskSlot(Movable):
     var proc_model: NativeModel
     var proc_lods: Bool
     var proc_collider: Bool
+    var source_hash: UInt64
+    var settings_hash: UInt64
     var was_cache_hit: Bool
     var result: CookedAssetBundle
 
@@ -719,6 +724,8 @@ struct _CookTaskSlot(Movable):
         self.proc_model = NativeModel()
         self.proc_lods = True
         self.proc_collider = True
+        self.source_hash = 0
+        self.settings_hash = 0
         self.was_cache_hit = False
         self.result = CookedAssetBundle()
 
@@ -802,26 +809,13 @@ def _cook_worker_body(ctx_addr: Int, task_idx: Int):
         slot.result = cooked^
         return
 
-    var st = file_stamp(slot.full_path)
-    if st[0] < 0:
-        slot.result.error = "unreadable file: " + slot.full_path
-        return
     var src_bytes = List[UInt8]()
-    if st[0] > 0:
-        src_bytes = read_bytes(slot.full_path)
-        if len(src_bytes) == 0:
-            slot.result.error = "failed to read file: " + slot.full_path
-            return
-    else:
-        if slot.default_kind != ASSET_KIND_RAW:
-            slot.result.error = "empty file: " + slot.full_path
-            return
-        var fd = open_read(slot.full_path)
-        if fd < 0:
-            slot.result.error = "unreadable file: " + slot.full_path
-            return
-        close_fd(fd)
+    if not _read_cook_source(slot.full_path, slot.default_kind, src_bytes):
+        slot.result.error = "missing, empty or unreadable source: " + slot.full_path
+        return
     var meta = load_or_init_flmeta(slot.full_path, slot.rel_path, slot.default_kind, persist_if_missing=False)
+    slot.source_hash = hash_list(src_bytes)
+    slot.settings_hash = meta.settings_hash()
     var key = compute_cook_cache_key(src_bytes, meta)
     var cache_file = slot.cache_dir + "/" + key + ".flcook"
     if not slot.force_recook:
@@ -912,28 +906,41 @@ def _collect_workspace_sources(
                 out_kinds.append(cls[1])
 
 
-def _compute_workspace_fast_signature(
-    output_flpk: String,
-    full_paths: List[String],
-    rel_paths: List[String],
-    procedural_count: Int,
-    page_align: Bool = True,
+def _read_cook_source(path: String, kind: UInt8, mut data: List[UInt8]) -> Bool:
+    var size = file_stamp(path)[0]
+    data = read_bytes(path)
+    if size == 0 and len(data) == 0 and kind == ASSET_KIND_RAW:
+        var fd = open_read(path)
+        if fd >= 0:
+            close_fd(fd)
+            return True
+    return size > 0 and len(data) == size
+
+
+def _workspace_signature(
+    rel_paths: List[String], hashes: List[Tuple[UInt64, UInt64]], page_align: Bool
 ) -> UInt64:
     var w = BlobWriter()
     w.u32(COOKER_V2_VERSION)
-    w.text(output_flpk)
-    w.u8(UInt8(1 if page_align else 0))
-    w.u32(UInt32(len(full_paths)))
-    w.u32(UInt32(procedural_count))
-    for i in range(len(full_paths)):
-        var st = file_stamp(full_paths[i])
-        var mst = file_stamp(full_paths[i] + ".flmeta")
+    w.boolean(page_align)
+    for i in range(len(rel_paths)):
         w.text(rel_paths[i])
-        w.integer(st[0])
-        w.integer(st[1])
-        w.integer(mst[0])
-        w.integer(mst[1])
-    return fnv64(w.data)
+        w.u64(hashes[i][0])
+        w.u64(hashes[i][1])
+    return hash_list(w.data)
+
+
+def _matches_workspace(
+    full_paths: List[String], rel_paths: List[String], kinds: List[UInt8], page_align: Bool, expected: UInt64
+) -> Bool:
+    var hashes = List[Tuple[UInt64, UInt64]]()
+    for i in range(len(full_paths)):
+        var data = List[UInt8]()
+        if not _read_cook_source(full_paths[i], kinds[i], data):
+            return False
+        var meta = load_or_init_flmeta(full_paths[i], rel_paths[i], kinds[i], persist_if_missing=False)
+        hashes.append((hash_list(data), meta.settings_hash()))
+    return _workspace_signature(rel_paths, hashes, page_align) == expected
 
 
 struct CookWorkspaceReport(Copyable, Movable):
@@ -992,42 +999,45 @@ def cook_workspace(
     rep.total_assets = total_n
     if total_n == 0:
         var empty_img = encode_flpk_v3(List[FlpkBuildChunk](), page_align)
-        rep.ok = write_bytes(output_flpk, empty_img)
+        rep.ok = write_file_durable(output_flpk, empty_img)
         rep.archive_bytes = len(empty_img)
         rep.elapsed_ms = (get_time() - t0) * 1000.0
         return rep^
 
-    # Fast-path stamp index check (`< 1 ms` 100% cache hit when workspace & output archive are untouched!)
+    # Match the bytes actually cooked and published, including timestamp-preserving edits.
     var out_u = AssetUuid.from_path(output_flpk)
     var index_path = cache_dir + "/workspace_stamp_" + String(out_u.hi) + "_" + String(out_u.lo) + ".bin"
-    var cur_sig = _compute_workspace_fast_signature(output_flpk, full_paths, rel_paths, len(procedural_items), page_align)
     var out_stamp = file_stamp(output_flpk)
     if (not force_recook) and len(procedural_items) == 0 and out_stamp[0] >= 64:
         var idx_raw = read_bytes(index_path)
         if len(idx_raw) >= 12:
             try:
                 var ir = BlobReader(idx_raw^)
-                _ = ir.enter(_COOK_INDEX_TAG, 1)
+                if ir.enter(_COOK_INDEX_TAG, 2) != 2:
+                    raise Error("obsolete workspace index")
                 var saved_sig = ir.u64()
                 var saved_pack_size = ir.integer()
-                var saved_pack_mtime = ir.integer()
+                var saved_pack_hash = ir.u64()
                 var saved_chunks = Int(ir.u32())
                 var saved_cnt = Int(ir.u32())
                 if (
                     not ir.failed
-                    and saved_sig == cur_sig
                     and saved_pack_size == out_stamp[0]
-                    and saved_pack_mtime == out_stamp[1]
                     and saved_cnt == total_n
+                    and _matches_workspace(full_paths, rel_paths, kinds, page_align, saved_sig)
+                    and saved_pack_hash == hash_list(read_bytes(output_flpk))
                 ):
-                    for _ in range(saved_cnt):
+                    var cached_uuids = List[AssetUuid](capacity=saved_cnt)
+                    for i in range(saved_cnt):
                         var u_hi = ir.u64()
                         var u_lo = ir.u64()
-                        var rp = ir.text()
-                        rep.uuids.append(AssetUuid(u_hi, u_lo))
-                        rep.rel_paths.append(rp)
+                        if ir.text() != rel_paths[i]:
+                            raise Error("workspace index paths differ")
+                        cached_uuids.append(AssetUuid(u_hi, u_lo))
                     ir.leave()
                     if not ir.failed:
+                        rep.uuids = cached_uuids^
+                        rep.rel_paths = rel_paths.copy()
                         rep.ok = True
                         rep.cache_hits = total_n
                         rep.cooked_count = 0
@@ -1061,9 +1071,11 @@ def cook_workspace(
         ctx.keep_alive()
 
     var all_chunks = List[FlpkBuildChunk]()
+    var input_hashes = List[Tuple[UInt64, UInt64]]()
     for ti in range(len(ctx.tasks)):
         ref slot = ctx.tasks[ti]
         if slot.result.valid:
+            input_hashes.append((slot.source_hash, slot.settings_hash))
             if slot.was_cache_hit:
                 rep.cache_hits += 1
             else:
@@ -1075,20 +1087,21 @@ def cook_workspace(
         else:
             rep.failed_count += 1
 
+    if rep.failed_count > 0:
+        rep.elapsed_ms = (get_time() - t0) * 1000.0
+        return rep^
+
     var flpk_bytes = encode_flpk_v3(all_chunks, page_align=page_align)
-    var tmp_pack = output_flpk + "." + String(Int(external_call["getpid", Int32]())) + ".tmp"
-    var wrote = write_bytes(tmp_pack, flpk_bytes) and rename_file(tmp_pack, output_flpk)
-    rep.ok = wrote and rep.failed_count == 0
+    rep.ok = write_file_durable(output_flpk, flpk_bytes)
     rep.total_chunks = len(all_chunks)
     rep.archive_bytes = len(flpk_bytes)
 
     if rep.ok and len(procedural_items) == 0:
-        var new_out_st = file_stamp(output_flpk)
         var iw = BlobWriter()
-        iw.begin(_COOK_INDEX_TAG, 1)
-        iw.u64(cur_sig)
-        iw.integer(new_out_st[0])
-        iw.integer(new_out_st[1])
+        iw.begin(_COOK_INDEX_TAG, 2)
+        iw.u64(_workspace_signature(rel_paths, input_hashes, page_align))
+        iw.integer(len(flpk_bytes))
+        iw.u64(hash_list(flpk_bytes))
         iw.u32(UInt32(rep.total_chunks))
         iw.u32(UInt32(len(rep.uuids)))
         for i in range(len(rep.uuids)):
@@ -1096,7 +1109,7 @@ def cook_workspace(
             iw.u64(rep.uuids[i].lo)
             iw.text(rep.rel_paths[i])
         iw.end()
-        _ = write_bytes(index_path, iw.data)
+        _ = write_file_durable(index_path, iw.data, sync=False)
 
     rep.elapsed_ms = (get_time() - t0) * 1000.0
     return rep^

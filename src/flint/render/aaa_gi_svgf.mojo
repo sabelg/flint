@@ -2854,7 +2854,7 @@ def aaa_deferred_shade_class_shader(
 
 def svgf_temporal_reproject_shader() -> List[UInt32]:
     """Pass 1: SVGF Temporal Reprojection & Moments Accumulation authored in Pure-Mojo ShaderDsl.
-    Push[0] = w_u, Push[1] = h_u, Push[2] = hist_in_words, Push[3] = hist_out_words, Push[4] = frame_index.
+    Push[0] = w_u, Push[1] = h_u, Push[2] = hist_in_words, Push[3] = hist_out_words, Push[4] = frame_index, Push[5] enables slope-aware rejection under jitter.
     """
     from flint.render.shader_dsl import (
         GpuVec3,
@@ -2866,6 +2866,8 @@ def svgf_temporal_reproject_shader() -> List[UInt32]:
         fma_f,
         max_f,
         min_f,
+        min_u,
+        select_u,
         select_f,
         select_vec3,
         sqrt_f,
@@ -2921,9 +2923,22 @@ def svgf_temporal_reproject_shader() -> List[UInt32]:
     var prev_z = b_hist.load_f32(prev_base + 6)
     var prev_nx = b_hist.load_f32(prev_base + 7)
 
-    var depth_diff = abs_f(cur_z - prev_z) / max_f(cur_z * 0.1, 0.08)
     var norm_diff = abs_f(cur_nx - prev_nx)
-    var is_consistent = in_bounds & depth_diff.lt(0.12) & norm_diff.lt(0.25) & cur_z.lt(1e5)
+    var tolerance = dsl.var_f32(max_f(cur_z * 0.012, 0.0096))
+    dsl.if_then(dsl.push_u32(5).ne(0))
+    # A nearest-pixel history fetch can legitimately move along a sloped surface.
+    # Use the shallower side on each axis to avoid widening across a silhouette.
+    var xl = select_u(px.ge(1), px - 1, px)
+    var xr = min_u(w_u - 1, px + 1)
+    var yu = select_u(py.ge(1), py - 1, py)
+    var yd = min_u(h_u - 1, py + 1)
+    var dx = min_f(abs_f(b_hdr.load_f32(b_hdr.base_word(py * w_u + xl) + 3) - cur_z),
+                   abs_f(b_hdr.load_f32(b_hdr.base_word(py * w_u + xr) + 3) - cur_z))
+    var dy = min_f(abs_f(b_hdr.load_f32(b_hdr.base_word(yu * w_u + px) + 3) - cur_z),
+                   abs_f(b_hdr.load_f32(b_hdr.base_word(yd * w_u + px) + 3) - cur_z))
+    tolerance.set(tolerance.get() + min_f(dx + dy, cur_z * 0.25) * 1.5)
+    dsl.end_if()
+    var is_consistent = in_bounds & abs_f(cur_z - prev_z).lt(tolerance.get()) & norm_diff.lt(0.25) & cur_z.lt(1e5)
 
     var res_rgb = dsl.var_vec3(cur_rgb)
     var res_m1 = dsl.var_f32(cur_luma)
@@ -2951,7 +2966,6 @@ def svgf_temporal_reproject_shader() -> List[UInt32]:
 
     # Write to b_hdr for Pass 2 (À-Trous Wavelet):
     b_hdr.store_vec3(c_base, fin_rgb)
-    b_hdr.store_f32(c_base + 3, cur_z)
     b_hdr.store_f32(c_base + 4, var_l)      # Slot 4 stores True Var(L)
     b_hdr.store_f32(c_base + 5, fin_len)
     b_hdr.store_f32(c_base + 6, cur_nx)

@@ -182,6 +182,11 @@ from flint.render.aaa_gpu_particles import (
     gpu_particle_clear_tiles_shader,
     gpu_particle_sim_and_bin_shader,
     gpu_particle_tile_composite_shader,
+    gpu_particles_tile_count,
+    gpu_particles_tile_counts_word_offset,
+    gpu_particles_tile_bins_word_offset,
+    gpu_particles_total_oit_words,
+    AAA_MAX_PARTICLES_PER_TILE,
 )
 from flint.render.aaa_rt_shadow import penumbra_radius_px_cpu, rt_sun_shadow_filter_shader, rt_sun_shadow_trace_shader
 from flint.render.aaa_ibl import SkyDomeParams, bake_bc6h_ibl_cubemap_and_sh9
@@ -944,6 +949,19 @@ def test_gpu_ui_and_aaa_metropolis():
     # 6. `PRIM_IMAGE` (kind 5): bindless textured rounded quad
     gpu.ui_draw_list.prims.append(make_ui_image_prim(ui_tex_slot, 148.0, 46.0, 32.0, 32.0, tint_rgba8=0xFFFFFFFF, corner_radius=4.0))
 
+    # Black and white atlas texels under the same glyph rectangle must give
+    # transparent background and opaque strokes after normalized texture sampling.
+    var stripe = List[UInt8](length=16 * 4, fill=255)
+    for pixel in range(8):
+        stripe[pixel * 4] = 0
+    var stripe_slot = gpu.upload_rgba8_texture(stripe, 16, 1)
+    _assert(stripe_slot >= 0, "Uploaded glyph contrast fixture")
+    gpu.ui_draw_list.add_rect(148, 85, 32, 18, 0xFF000000)
+    gpu.ui_draw_list.prims.append(GpuUiPrim(
+        148, 85, 180, 103, 0, 0, 1, 1, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0,
+        0.035, 0, 0, PRIM_GLYPH | (UInt32(stripe_slot) << 4),
+    ))
+
     # 7. Chunked `>300` (`340`) overlapping primitives inside ONE `16x16` tile (`x in [128..144], y in [8..24]`)!
     for ov_i in range(339):
         var alt_col: UInt32 = 0xFFD03030 if (ov_i & 1) == 0 else 0xFF3030D0
@@ -953,6 +971,9 @@ def test_gpu_ui_and_aaa_metropolis():
 
     _assert(gpu.render_frame(capture_readback=True), "UI overlay verification frame rendered")
     var ui_px = gpu.readback_pixels()
+
+    _assert(_unpack_argb(ui_px[94 * W + 153])[0] < 10, "Glyph padding must preserve background")
+    _assert(_unpack_argb(ui_px[94 * W + 174])[0] > 245, "Opaque glyph stroke must remain white")
 
     # Check exact pure-red `0xFFFF2040` at `(20, 20)` -> `(R=255, G=32, B=64)`
     var red_p = _unpack_argb(ui_px[20 * W + 20])
@@ -2571,8 +2592,9 @@ def test_f15_f16_f19_staging_aliasing_growth_and_direct_present(mut ren: FlintAa
         "M3c slot1: Frame 1 HDR readback uncorrupted GREEN after evaluate_material_graph_to_bindless",
     )
 
-    # 2) add_mesh(..., build_lods=False) forcing buf_as_scratch growth while frame_fences[1] != 0
+    # Upload a large BLAS with a frame in flight. The upload owns its scratch allocation.
     var scratch_before = ren.buf_as_scratch.size
+    var uploads_before = ren.gpu_robust.uploads.submitted
     var mb_grow = MeshBuilder()
     for gi in range(24):
         var gx = Float32(gi) * Float32(2.0)
@@ -2592,8 +2614,9 @@ def test_f15_f16_f19_staging_aliasing_growth_and_direct_present(mut ren: FlintAa
     )
     if ren.vk.has_ray_query:
         _assert(
-            ren.frame_fences[1] == 0 and ren.buf_as_scratch.size > scratch_before,
-            "M3c slot1: expected add_mesh(24k tris) to wait slot1 & grow buf_as_scratch (" + String(scratch_before) + " -> " + String(ren.buf_as_scratch.size) + ")",
+            ren.gpu_robust.uploads.submitted == uploads_before + 1 and ren.buf_as_scratch.size == scratch_before
+            and ren.mesh_blas[grow_e.mesh_id].handle != 0,
+            "M3c slot1: mesh upload submits an independent BLAS build and preserves frame scratch",
         )
 
     # 3) upload_ibl_environment while frame_fences[1] != 0
@@ -2740,6 +2763,13 @@ def test_v2_spirv_shaders_and_cpu_models():
     _validate_or_fail(vsm_alphamask_fragment_shader(), "vsm_alphamask_fragment_shader")
     _validate_or_fail(froxel_prefix_integrate_shader(), "froxel_prefix_integrate_shader")
     _validate_or_fail(gpu_particle_clear_tiles_shader(), "gpu_particle_clear_tiles_shader")
+
+    var coverage_tiles = gpu_particles_tile_count(3840, 2160)
+    var coverage_pixels = 3840 * 2160
+    _assert(coverage_tiles == 32400 and gpu_particles_tile_count(17, 33) == 6, "all screen tiles including partial edges")
+    var bins = gpu_particles_tile_bins_word_offset(coverage_pixels, coverage_tiles)
+    _assert(bins - gpu_particles_tile_counts_word_offset(coverage_pixels) == coverage_tiles, "one count per 4K tile")
+    _assert(gpu_particles_total_oit_words(coverage_pixels, coverage_tiles) - bins == coverage_tiles * AAA_MAX_PARTICLES_PER_TILE, "full 4K particle bin storage")
 
     # 2. Material 24-word layout, bit 30 interior parallax & road_wetness_mode
     var mat = AaaMaterial(base_color=Vec3(0.4, 0.4, 0.4), roughness=0.7, metallic=0.0)
@@ -3362,6 +3392,20 @@ def test_v2_gpu_aaa_pipeline_features():
     _assert(px_cutout_lit_wall.x > px_cutout_lit_wall.y * Float32(3.5), "9 cutout hole reveals lit red wall")
     _assert(px_solid_green_grate.y > px_solid_green_grate.x * Float32(2.5), "9 solid grate half renders green")
     _assert(wall_through_hole.x > wall_behind_solid.x * Float32(2.2), "9 cutout casts shadow only from opaque half")
+
+    var translucent_green = List[UInt32](length=64 * 64, fill=0x5520D030)
+    mat_grate.albedo_tex = ren.upload_bc7_texture(translucent_green, 64, 64, srgb=False, generate_mips=True)
+    for cutoff, opacity in [(Float32(0.25), Float32(1)), (Float32(0.9), Float32(1)), (Float32(0.25), Float32(0.1))]:
+        mat_grate.alpha_cutoff = cutoff
+        mat_grate.opacity = opacity
+        ren.update_material(id_grate, mat_grate)
+        for _ in range(2):
+            ren.begin_frame(Vec3(-1.4, 0, -2.5), Vec3(0.2, 0, 5), fov_y_deg=50)
+            ren.draw_instance(e_wall9.mesh_id, ident)
+            ren.draw_instance(e_grate.mesh_id, ident)
+            _assert(ren.render_frame(capture_readback=True), "authored cutoff frame rendered")
+        var sample = ren.readback_resolved_hdr()[64 * w + 76]
+        _assert((sample.y > sample.x) == (cutoff < 0.5 and opacity > 0.5), "cutoff and alpha factor select the green grate or red wall")
 
     ren.enable_vsm = False
     ren.enable_rt_shadows = False

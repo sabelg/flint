@@ -2,7 +2,7 @@
 from std.math import isfinite
 from flint.platform.os import write_bytes
 from flint.core.math import Vec3
-from flint.assets.image import encode_png
+from flint.assets.image import encode_png, srgb_u8_to_linear
 from flint.assets.jpeg import encode_jpeg_baseline
 from flint.assets.json_write import json_quote
 from flint.assets.model import NativeModel, NativeMesh, NativeNode
@@ -251,9 +251,9 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
 
         # MATERIAL
         var bc = mesh.base_color
-        var b_r = Float32((bc >> 16) & 255) / 255.0
-        var b_g = Float32((bc >> 8) & 255) / 255.0
-        var b_b = Float32(bc & 255) / 255.0
+        var b_r = srgb_u8_to_linear(Int((bc >> 16) & 255))
+        var b_g = srgb_u8_to_linear(Int((bc >> 8) & 255))
+        var b_b = srgb_u8_to_linear(Int(bc & 255))
         var b_a = Float32((bc >> 24) & 255) / 255.0
         var pbr_str = (
             '{"baseColorFactor": [' + fmt_f32(b_r) + ", " + fmt_f32(b_g) + ", " + fmt_f32(b_b) + ", " + fmt_f32(b_a) + "]"
@@ -272,6 +272,8 @@ def encode_native_glb(mut model: NativeModel, jpeg_texture_mask: UInt64 = 0) -> 
             + ', "alphaMode": ' + json_quote(alpha_str)
             + ', "doubleSided": ' + ("true" if mesh.double_sided else "false")
         )
+        if mesh.alpha_mode == 1:
+            mat_str += ', "alphaCutoff": ' + fmt_f32(mesh.alpha_cutoff)
         if mesh.normal_orm_texture >= 0 and mesh.normal_orm_texture < len(textures_json):
             mat_str += ', "normalTexture": {"index": ' + String(mesh.normal_orm_texture) + "}"
         if mesh.occlusion_texture >= 0 and mesh.occlusion_texture < len(textures_json):

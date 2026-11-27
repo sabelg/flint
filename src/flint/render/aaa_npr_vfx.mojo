@@ -24,6 +24,7 @@ from flint.render.spirv import (
     emit,
 )
 from flint.render.aaa_visbuffer import (
+    emit_alpha_cutoff,
     AAA_MAX_BINDLESS,
     AAA_PUSH_WORDS,
     BIND_AAA_BINDLESS_TEX,
@@ -788,8 +789,9 @@ def visbuffer_alphamask_vfx_fragment_shader() -> List[UInt32]:
     var px_foot = s.fmul(s.fsqrt(s.nmax(s.float(1e-8), s.nmax(gx2, gy2))), s.float(512.0))
     var mip_est = s.nclamp(s.log2(s.nmax(s.float(1.0), px_foot)), s.float(0.0), s.float(6.0))
 
-    var t_alb = s.fresh()
-    emit(s.code, OP_LOAD, s.type_uint, t_alb, in_talb[1])
+    var packed = s.fresh()
+    emit(s.code, OP_LOAD, s.type_uint, packed, in_talb[1])
+    var t_alb = s.bit_and(packed, s.uint(0xFF))
     var raw_alpha_v = s.fvar(s.float(1.0))
     var alpha_v = s.fvar(s.float(1.0))
     s.begin_if(s.ult(t_alb, s.uint(0xFF)))
@@ -813,7 +815,7 @@ def visbuffer_alphamask_vfx_fragment_shader() -> List[UInt32]:
     s.store(alpha_v, s.select_f(s.fge(vfx_res[0], s.float(0.0)), s.float(1.0), s.float(0.0)))
     s.end_if()
 
-    s.discard_if(s.flt(s.load_f(alpha_v), s.float(0.48)))
+    s.discard_if(s.flt(s.nmin(s.float(1.0), s.load_f(alpha_v)), emit_alpha_cutoff(s, packed)))
 
     var w1 = s.bit_or(w1_base, s.bit_and(prim_id, s.uint(0xFF)))
     emit(s.code, OP_STORE, out_col[1], s.uvec4(w0, w1, s.uint(0), s.uint(1)))

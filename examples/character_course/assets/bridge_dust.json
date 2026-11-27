@@ -1,0 +1,18 @@
+{
+  "format": "flint.particle-burst.v1",
+  "count": 14,
+  "velocity": [0, 0.35, 0],
+  "color": [0.38, 0.28, 0.19],
+  "end_color": [0.53, 0.45, 0.35],
+  "size": 0.028,
+  "end_size": 0.09,
+  "alpha": 0.55,
+  "end_alpha": 0,
+  "lifetime": 0.38,
+  "radius": 0.025,
+  "spread": 0.31,
+  "gravity": 0.05,
+  "drag": 1,
+  "lit": true,
+  "additive": false
+}

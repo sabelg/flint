@@ -36,7 +36,6 @@ from flint.platform.os import (
     make_dirs,
     parent_directory,
     read_bytes,
-    remove_file,
 )
 
 
@@ -152,7 +151,6 @@ def _cook_dir(
     if not _has_cookable_sources(clean_src):
         print("[Flint Pack] ERROR: Failed to cook workspace into " + output_pack)
         return 1
-    var existed_before = (not _is_dir(clean_out)) and file_stamp(clean_out)[0] >= 0
     var pool = JobPool()
     _ = pool.start(max(1, default_worker_count()))
     var rep = cook_workspace(clean_src, output_pack, pool, cache_dir=clean_cache, page_align=page_align)
@@ -176,8 +174,6 @@ def _cook_dir(
         )
         return 0
     else:
-        if not existed_before:
-            _ = remove_file(output_pack)
         print("[Flint Pack] ERROR: Failed to cook workspace into " + output_pack)
         return 1
 

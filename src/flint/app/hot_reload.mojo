@@ -12,6 +12,7 @@ from std.collections import List
 from std.ffi import external_call
 from std.math import isfinite, max
 from std.sys import size_of
+from flint.core.crash import elf_build_id
 from flint.core.serial import BlobReader, BlobWriter, fourcc
 from flint.ecs.world import (
     BitSet256,
@@ -24,7 +25,7 @@ from flint.ecs.world import (
 )
 from flint.app.engine_app import Resource, Resources
 from flint.platform.dynlib import dl_open, dl_sym, dl_close, dl_error, RTLD_NOW, RTLD_LOCAL
-from flint.platform.os import close_fd, file_size, get_time, open_path_fd, open_read, remove_file
+from flint.platform.os import close_fd, file_size, get_time, open_path_fd, open_read, remove_file, rename_file
 
 comptime FLINT_PLUGIN_API_VERSION: UInt32 = 2
 comptime FLINT_PLUGIN_API_V2_MAGIC: UInt32 = 0x32415046  # "FPA2"
@@ -267,10 +268,19 @@ struct PodSchemaRegistryResource(Resource, Movable):
     comptime RESOURCE_ID: UInt64 = comp_hash64("flint.app.PodSchemaRegistryResource")
     var schemas: List[PodComponentSchema]
     var epoch: UInt64
+    var refusal_count: Int
+    var last_refusal: String
 
     def __init__(out self):
         self.schemas = List[PodComponentSchema]()
         self.epoch = 0
+        self.refusal_count = 0
+        self.last_refusal = ""
+
+    def _refuse(mut self, reason: String) -> Bool:
+        self.refusal_count += 1
+        self.last_refusal = reason
+        return False
 
     def find_schema(self, name: String) -> Int:
         for i in range(len(self.schemas)):
@@ -279,17 +289,25 @@ struct PodSchemaRegistryResource(Resource, Movable):
         return -1
 
     def register_schema(mut self, schema: PodComponentSchema) -> Bool:
+        """Registers `schema`; refusals bump `refusal_count` and set `last_refusal` so the hot-reload
+        host can roll back a plugin whose schemas were refused."""
         if not schema.validate():
-            return False
+            return self._refuse("invalid POD schema '" + schema.name + "'")
         var idx = self.find_schema(schema.name)
         if idx >= 0:
-            return self.schemas[idx].matches_layout(schema)
+            if self.schemas[idx].matches_layout(schema):
+                return True
+            return self._refuse(
+                "POD schema '" + schema.name + "' changed layout (live components keep the old layout)"
+            )
         for i in range(len(self.schemas)):
             if (
                 self.schemas[i].component_hash == schema.component_hash
                 or self.schemas[i].schema_fourcc == schema.schema_fourcc
             ):
-                return False
+                return self._refuse(
+                    "POD schema '" + schema.name + "' collides with '" + self.schemas[i].name + "'"
+                )
         self.schemas.append(schema.copy())
         self.epoch += 1
         return True
@@ -367,11 +385,17 @@ def _host_for_each1(world_addr: Int, tid: Int, cb: ApiGuestRowCb, dt: Float32) a
 
 def _host_upsert_res(res_addr: Int, res_id: UInt64, byte_size: Int, src_ptr: Int) abi("C") -> Int:
     ref res = Pointer[Resources, MutAnyOrigin](unsafe_from_address=res_addr)[unsafe_offset=0]
+    var idx = res.find_index(res_id)
+    if idx >= 0 and not res.slots[idx].is_pod:
+        return 0  # an owning engine resource cannot be replaced with guest POD bytes
     return res.insert_pod_raw(res_id, byte_size, src_ptr)
 
 
 def _host_get_res(res_addr: Int, res_id: UInt64) abi("C") -> Int:
     ref res = Pointer[Resources, ImmutAnyOrigin](unsafe_from_address=res_addr)[unsafe_offset=0]
+    var idx = res.find_index(res_id)
+    if res.gameplay_load_active and idx >= 0 and not res.slots[idx].is_pod:
+        return 0  # candidate initialization may mutate only checkpointed resource values
     return res.get_raw_ptr(res_id)
 
 
@@ -392,6 +416,15 @@ def _host_register_pod_schema(
             schema.component_hash, schema.byte_size, schema.alignment, schema.storage_mode
         )
         if tid < 0:
+            if res_addr != 0:
+                ref res_r = Pointer[Resources, MutAnyOrigin](unsafe_from_address=res_addr)[unsafe_offset=0]
+                if not res_r.has[PodSchemaRegistryResource]():
+                    res_r.insert[PodSchemaRegistryResource](PodSchemaRegistryResource())
+                var reg_r = res_r.get_ptr_mut[PodSchemaRegistryResource]()
+                if reg_r:
+                    _ = reg_r.value()[unsafe_offset=0]._refuse(
+                        "POD component '" + schema.name + "' changed byte size or storage mode"
+                    )
             return -1
         if res_addr != 0:
             ref res = Pointer[Resources, MutAnyOrigin](unsafe_from_address=res_addr)[unsafe_offset=0]
@@ -507,7 +540,7 @@ struct FlintPluginApiV2(Copyable, ImplicitlyCopyable, Movable):
         return tid
 
 
-def _copy_file_fast(src_path: String, dst_path: String) -> Bool:
+def _copy_file_fast(src_path: String, dst_path: String, mut build_id: String) -> Bool:
     var rfd = open_read(src_path)
     if rfd < 0:
         return False
@@ -517,6 +550,7 @@ def _copy_file_fast(src_path: String, dst_path: String) -> Bool:
         return False
     var buf = List[UInt8](length=65536, fill=0)
     var ok = True
+    var first_block = True
     while True:
         var n = Int(external_call["read", Int64](Int32(rfd), buf.unsafe_ptr(), Int64(65536)))
         if n < 0:
@@ -524,6 +558,11 @@ def _copy_file_fast(src_path: String, dst_path: String) -> Bool:
             break
         if n == 0:
             break
+        if first_block:
+            # Native Linux toolchains place the GNU build-ID note in the first
+            # load segment. Preserve that identity in the crash report's maps.
+            build_id = elf_build_id(buf)
+            first_block = False
         var off = 0
         while off < n:
             var w = Int(
@@ -558,6 +597,8 @@ struct HotReloadHost(Movable):
     var last_reload_ms: Float64
     var last_error: String
     var stage_prefix: String
+    var rollback_count: Int
+    var stage_counter: Int
 
     def __init__(
         out self,
@@ -581,6 +622,8 @@ struct HotReloadHost(Movable):
         self.last_reload_ms = 0.0
         self.last_error = ""
         self.stage_prefix = stage_prefix
+        self.rollback_count = 0
+        self.stage_counter = 0
 
     def __deinit__(deinit self):
         if self.lib_handle != 0:
@@ -633,11 +676,23 @@ struct HotReloadHost(Movable):
         var t0 = get_time()
         var next_gen = self.reload_generation + 1
         var pid = Int(external_call["getpid", Int32]())
-        var staged = self.stage_prefix + "-" + String(pid) + "-" + String(next_gen) + ".so"
-        if not _copy_file_fast(so_path, staged):
+        # Unique staged path per attempt: a failed attempt's path may still be cached by the dynamic
+        # loader (libraries that cannot really unload), so a retry must never reuse it.
+        self.stage_counter += 1
+        var staged = self.stage_prefix + "-" + String(pid) + "-" + String(self.stage_counter) + ".so"
+        var build_id = String()
+        if not _copy_file_fast(so_path, staged, build_id):
             self.last_error = "failed to stage shared library from " + so_path
             _ = remove_file(staged)
             return False
+
+        if build_id.byte_length() > 0:
+            var identified = staged + ".build-id-" + build_id
+            if not rename_file(staged, identified):
+                self.last_error = "failed to name staged gameplay library"
+                _ = remove_file(staged)
+                return False
+            staged = identified
 
         var handle = dl_open(staged, RTLD_NOW | RTLD_LOCAL)
         if handle == 0:
@@ -674,16 +729,124 @@ struct HotReloadHost(Movable):
             _ = remove_file(staged)
             return False
 
-        var was_loaded = self.is_loaded()
-        if was_loaded:
-            if not self.unload(world, resources, is_reload=True):
+        # Preserve managed ECS components with their copy constructors. The resource ABI
+        # exchanges POD values; owning subsystems (GPU, audio, etc.) stay in place.
+        var before_world = World()
+        var before_pods = Resources()
+        var before_schemas = List[PodComponentSchema]()
+        var before_epoch = UInt64(0)
+        var had_registry = resources.has[PodSchemaRegistryResource]()
+        if sym_load != 0:
+            try:
+                before_world = world.copy_for_reload()
+                before_pods = resources.checkpoint_pods()
+            except err:
+                self.last_error = "could not checkpoint gameplay reload: " + String(err)
                 _ = dl_close(handle)
                 _ = remove_file(staged)
                 return False
-
-        if not resources.has[PodSchemaRegistryResource]():
+            if had_registry:
+                ref registry = resources.get_ptr[PodSchemaRegistryResource]().value()[unsafe_offset=0]
+                before_schemas = registry.schemas.copy()
+                before_epoch = registry.epoch
+        if not had_registry:
             resources.insert[PodSchemaRegistryResource](PodSchemaRegistryResource())
 
+        # Keep the previous plugin mapped until the new one has fully succeeded, so a failing
+        # reload (on_load error or schema refusal) can restore it instead of leaving no plugin.
+        var was_loaded = self.is_loaded()
+        var prev_handle = self.lib_handle
+        var prev_fn_api_version = self.fn_api_version
+        var prev_fn_on_load = self.fn_on_load
+        var prev_fn_on_step = self.fn_on_step
+        var prev_fn_on_unload = self.fn_on_unload
+        var prev_temp_path = self.active_temp_path
+        var prev_source_path = self.source_path
+        var prev_api_version = self.active_api_version
+
+        if was_loaded and prev_fn_on_unload != 0:
+            var old_ufn = _sym_to_fn[GuestOnUnloadFn](prev_fn_on_unload)
+            old_ufn(self._active_api_addr(), Int(Pointer(to=world)), Int(Pointer(to=resources)), Int32(1))
+
+        self.active_api_version = found_ver
+        var refusals_before = self._schema_refusals(resources)
+        var failure = String("")
+        var was_loading = resources.gameplay_load_active
+        resources.gameplay_load_active = sym_load != 0
+        if sym_load != 0:
+            var lfn = _sym_to_fn[GuestOnLoadFn](sym_load)
+            var code = lfn(
+                self._active_api_addr(),
+                Int(Pointer(to=world)),
+                Int(Pointer(to=resources)),
+                Int32(1) if was_loaded else Int32(0),
+            )
+            if code != 0:
+                failure = "flint_plugin_on_load returned error code " + String(code)
+        if failure.byte_length() == 0 and self._schema_refusals(resources) > refusals_before:
+            failure = "POD schema refused: " + self._last_schema_refusal(resources)
+
+        if failure.byte_length() > 0:
+            # Let the failed plugin release what it acquired, then drop it.
+            if sym_unload != 0:
+                var new_ufn = _sym_to_fn[GuestOnUnloadFn](sym_unload)
+                new_ufn(
+                    self._active_api_addr(),
+                    Int(Pointer(to=world)),
+                    Int(Pointer(to=resources)),
+                    Int32(1) if was_loaded else Int32(0),
+                )
+            _ = dl_close(handle)
+            _ = remove_file(staged)
+            resources.gameplay_load_active = was_loading
+            world = before_world^
+            world.restore_epoch += 1
+            resources.restore_pods(before_pods)
+            if had_registry:
+                ref registry = resources.get_ptr_mut[PodSchemaRegistryResource]().value()[unsafe_offset=0]
+                registry.schemas = before_schemas^
+                registry.epoch = before_epoch
+            else:
+                _ = resources.remove[PodSchemaRegistryResource]()
+            self.active_api_version = prev_api_version
+            if not was_loaded:
+                self.last_error = failure
+                return False
+            # Restore the previous plugin: it was told it is being reloaded, so re-run its on_load
+            # as a reload to reattach to the preserved World/Resources.
+            self.lib_handle = prev_handle
+            self.fn_api_version = prev_fn_api_version
+            self.fn_on_load = prev_fn_on_load
+            self.fn_on_step = prev_fn_on_step
+            self.fn_on_unload = prev_fn_on_unload
+            self.active_temp_path = prev_temp_path
+            self.source_path = prev_source_path
+            var restored = True
+            if prev_fn_on_load != 0:
+                var plfn = _sym_to_fn[GuestOnLoadFn](prev_fn_on_load)
+                var rcode = plfn(
+                    self._active_api_addr(), Int(Pointer(to=world)), Int(Pointer(to=resources)), Int32(1)
+                )
+                if rcode != 0:
+                    restored = False
+                    failure += "; restoring the previous plugin also failed (on_load code " + String(rcode) + ")"
+            if restored:
+                self.last_error = "hot-reload of " + so_path + " rolled back to the previous plugin: " + failure
+            else:
+                _ = self.unload(world, resources, is_reload=False)
+                self.last_error = "hot-reload of " + so_path + " failed: " + failure
+            self.rollback_count += 1
+            return False
+
+        resources.gameplay_load_active = was_loading
+        # Success: retire the previous plugin now that the new one is live.
+        var close_err = String("")
+        if was_loaded:
+            var rc = dl_close(prev_handle)
+            if prev_temp_path.byte_length() > 0:
+                _ = remove_file(prev_temp_path)
+            if rc != 0:
+                close_err = "previous plugin dl_close failed: " + dl_error()
         self.lib_handle = handle
         self.fn_api_version = sym_ver
         self.fn_on_load = sym_load
@@ -693,24 +856,20 @@ struct HotReloadHost(Movable):
         self.source_path = so_path
         self.reload_generation = next_gen
         self.active_api_version = found_ver
-        self.last_error = ""
-
-        if self.fn_on_load != 0:
-            var lfn = _sym_to_fn[GuestOnLoadFn](self.fn_on_load)
-            var code = lfn(
-                self._active_api_addr(),
-                Int(Pointer(to=world)),
-                Int(Pointer(to=resources)),
-                Int32(1) if was_loaded else Int32(0),
-            )
-            if code != 0:
-                var load_err = "flint_plugin_on_load returned error code " + String(code)
-                _ = self.unload(world, resources, is_reload=False)
-                self.last_error = load_err
-                return False
+        self.last_error = close_err
 
         self.last_reload_ms = (get_time() - t0) * 1000.0
         return True
+
+    @staticmethod
+    def _schema_refusals(resources: Resources) -> Int:
+        var reg = resources.get_ptr[PodSchemaRegistryResource]()
+        return reg.value()[unsafe_offset=0].refusal_count if reg else 0
+
+    @staticmethod
+    def _last_schema_refusal(resources: Resources) -> String:
+        var reg = resources.get_ptr[PodSchemaRegistryResource]()
+        return reg.value()[unsafe_offset=0].last_refusal if reg else String("")
 
     def step(mut self, mut world: World, mut resources: Resources, dt: Float32) -> Int32:
         """Invokes `flint_plugin_on_step` in the active `.so` plugin."""

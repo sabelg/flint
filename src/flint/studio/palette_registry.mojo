@@ -71,6 +71,7 @@ comptime PAL_CMD_SAVE_SCENE: Int = 100
 comptime PAL_CMD_LOAD_SCENE: Int = 101
 comptime PAL_CMD_NEW_SCENE: Int = 102
 comptime PAL_CMD_RELOAD_SCENE: Int = 103
+comptime PAL_CMD_RECOVER_AUTOSAVE: Int = 104
 
 # Edit & Hierarchy (120..149)
 comptime PAL_CMD_UNDO: Int = 120
@@ -250,6 +251,7 @@ def populate_studio_palette(
     # ---- File & Scene ----
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_SAVE_SCENE, "Save Scene", "File", "Ctrl+S", ICON_SCENE, "cmd:save", True, True, "Save Scene File Ctrl+S"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_LOAD_SCENE, "Load Saved Scene", "File", "Ctrl+O", ICON_SCENE, "cmd:load", True, True, "Load Open Scene File"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_RECOVER_AUTOSAVE, "Recover Autosave", "File", "", ICON_SCENE, "cmd:recover-autosave", True, True, "Restore Interrupted Scene"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_NEW_SCENE, "New Scene", "File", "Ctrl+N", ICON_PLUS, "cmd:new", True, True, "New Empty Scene File"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_RELOAD_SCENE, "Reload Scene from Disk", "File", "", ICON_REFRESH, "cmd:reload_scene", True, True, "Reload Revert Scene Disk"))
 

@@ -317,6 +317,23 @@ def _relocate_audio_server(var s: AudioServer) -> AudioServer:
     return local_copy^
 
 
+def test_audio_clip_memory_lifetime() raises:
+    from flint.core.memory import MEM_AUDIO, mem_live, memory_install
+    assert_true(memory_install())
+    var before = mem_live(MEM_AUDIO)
+    with_asset_memory(before)
+    assert_equal(mem_live(MEM_AUDIO), before)
+
+
+def with_asset_memory(before: Int) raises:
+    from flint.core.memory import MEM_AUDIO, mem_live
+    var server = AudioServer()
+    var pcm = List[Int16](length=8192, fill=7)
+    assert_equal(server.register_pcm16_asset(pcm, 2, 48000), 0)
+    assert_equal(mem_live(MEM_AUDIO), before + len(pcm) * 2)
+    _ = server.quantums_rendered()
+
+
 def test_audio_server_mastering_and_virtualizer() raises:
     # 1. Exact 64-byte struct layouts & 64-byte cache-line head/tail isolation
     assert_equal(size_of[AudioCmd](), 64)
@@ -1130,6 +1147,34 @@ def test_evdev_and_declarative_input_map() raises:
     var imap2 = InputMap()
     assert_true(imap2.load_json(saved_json))
     assert_equal(imap2.prompt_glyph_for("Jump").label, "J")
+    from flint.platform.input import PAD_Y
+    assert_true(imap2.rebind_pad_button("Gameplay", "Jump", PAD_Y))
+    var loaded = InputMap()
+    assert_true(loaded.load_json(imap2.save_json()))
+    loaded.active_device = INPUT_DEV_XBOX
+    var ui = UiContext()
+    ui.begin_frame(st_in, input_map=loaded)
+    from flint.text.catalog import MessageCatalog
+    var messages = List[UInt8]()
+    var table = String('{"en":{"hello":"Hello","fallback":"English"},"ar":{"hello":"أهلا"}}')
+    for b in table.as_bytes():
+        messages.append(b)
+    var localized = MessageCatalog(messages, "ar-EG")
+    assert_equal(localized.message("hello"), "أهلا")
+    assert_equal(localized.message("fallback"), "English")
+    assert_equal(localized.message("untranslated"), "untranslated")
+    var spans = parse_rich("[btn=Jump]", ui.action_prompts)
+    var laid_out = layout_rich(spans, ui.font, ui.font, 18, 0, 0, 0, True, False)
+    assert_equal(laid_out.runs[0].button_label, "Y")
+    var shaped = layout_rich_shaped(spans, ui.font, ui.font, 18, 0, 0, 0, True, False)
+    assert_equal(shaped.runs[0].button_label, "Y")
+    ui.rich_label("[btn=Jump]")
+    ui.end_frame()
+    loaded.active_device = INPUT_DEV_KBM
+    ui.begin_frame(st_in, input_map=loaded)
+    assert_equal(parse_rich("[btn=Jump]", ui.action_prompts)[0].text, "J")
+    ui.end_frame()
+
 
     st_in.begin_frame()
     st_in.set_logical_key(74, True)
@@ -4821,6 +4866,7 @@ def test_t5_audio_plugin_flpk_vfs_resolution() raises:
 
 
 def main() raises:
+    test_audio_clip_memory_lifetime()
     var t_start = get_time()
     test_audio_server_mastering_and_virtualizer()
     print("[PASS] (a) AudioMpscRing MPSC stress, Zero-DC/NaN, +12 dBFS Limiter, BS.1770-4 LUFS & 128->64 Virtualizer")

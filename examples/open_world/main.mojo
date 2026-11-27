@@ -26,6 +26,13 @@ Usage:
 """
 from std.math import cos, exp, floor, max, min, sin, sqrt
 from std.sys import argv
+from flint.app.settings import GameSettings
+from bridge import BridgeRoute, load_bridge, update_bridge
+from bridge_vfx import extract_bridge_dust, BridgeDust
+from bridge_captions import BridgeCaptions, setup_captions
+from bridge_cells import report_bridge_cells
+from flint.assets.asset_plugin import AssetPlugin
+from flint.anim.plugin import AnimatorComponent, RagdollComponent
 from flint.anim.plugin import AnimAssetCache, AnimPlugin, SkeletonComponent
 from flint.app import (
     AppConfig,
@@ -56,6 +63,8 @@ from flint.assets.model import NativeMesh, NativeModel, NativeNode, NativeTextur
 from flint.assets.server import AssetServer
 from flint.audio.plugin import AudioEmitterComponent, AudioListenerComponent, AudioPlugin
 from flint.audio.server import AudioServer, BUS_AMBIENCE
+from flint.core.memory import mem_total, W_VRAM_PEAK
+from flint.platform.os import process_peak_rss_bytes
 from flint.core.jobs import JobPool
 from flint.core.math import Vec3
 from flint.core.transform import Quat
@@ -73,6 +82,7 @@ from flint.input.plugin import InputPlugin, InputStateResource
 from flint.physics.plugin import ColliderComponent, PhysicsPlugin, RigidBodyComponent
 from flint.physics.world import PhysicsWorld
 from flint.platform.kms import on_virtual_console
+from flint.platform.input import PAD_UP, PAD_DOWN, PAD_A, PAD_B, PAD_X, PAD_Y, PAD_LB, PAD_RB, PAD_BACK, PAD_START
 from flint.platform.os import env_flag, env_value, get_time, make_dirs, parent_directory
 from flint.render.aaa_clustered_lights import AaaClusterLight
 from flint.render.aaa_ibl import bake_hdr_image_ibl_cubemap_and_sh9
@@ -88,6 +98,7 @@ from flint.render.material_graph import (
     MaterialAsset,
 )
 from flint.render.plugin import (
+    extract_scene_meshes,
     CameraComponent,
     MaterialOverrideComponent,
     MeshRendererComponent,
@@ -1166,7 +1177,10 @@ def _sys_open_world_pre_resize(
         return
     ref win_res = win_opt.value()[unsafe_offset=0]
     ref renderer = rend_opt.value()[unsafe_offset=0]
-    if win_res.resized and win_res.width > 0 and win_res.height > 0:
+    var bridge = resources.get_ptr[BridgeRoute]()
+    # Benchmark at the requested buffer extent. The Wayland viewport fits it to the desktop.
+    var fixed_extent = bridge and bridge.value()[].replay and renderer.surface.is_zero_copy_gpu()
+    if not fixed_extent and win_res.resized and win_res.width > 0 and win_res.height > 0:
         _ = renderer.resize(win_res.width, win_res.height)
     if (
         renderer.cpu_canvas.width != renderer.width
@@ -1214,7 +1228,7 @@ def _sys_open_world_update(
                 if win_opt:
                     win_opt.value()[unsafe_offset=0].request_close()
                 return
-            if not state.overlays.handle_input(input_state):
+            if not resources.has[BridgeRoute]() and not state.overlays.handle_input(input_state):
                 if imap.just_pressed("tod_1"):
                     apply_time_of_day_preset(world, rw, renderer, state, 0)
                 if imap.just_pressed("tod_2"):
@@ -1353,38 +1367,44 @@ def _sys_open_world_extract_and_draw(
         )
         break
 
-    # 2. MeshRendererComponents
-    var mesh_mask = world.bit_for[MeshRendererComponent]().union(world.bit_for[GlobalTransform]())
-    var mesh_entities = world.query_entities(mesh_mask)
-    for i in range(len(mesh_entities)):
-        var e = mesh_entities[i]
-        var mc_opt = world.get_ptr[MeshRendererComponent](e)
-        if not mc_opt or not mc_opt.value()[unsafe_offset=0].visible:
-            continue
-        ref mc = mc_opt.value()[unsafe_offset=0]
-        var eff_mat = mc.material_id
-        var ov_opt = world.get_ptr[MaterialOverrideComponent](e)
-        if ov_opt and ov_opt.value()[unsafe_offset=0].enabled:
-            ref ov = ov_opt.value()[unsafe_offset=0]
-            if ov.material_id >= 0:
-                eff_mat = ov.material_id
-            if eff_mat >= 0 and eff_mat < len(renderer.materials):
-                renderer.materials[eff_mat].base_color = ov.base_color
-                renderer.materials[eff_mat].roughness = ov.roughness
-                renderer.materials[eff_mat].metallic = ov.metallic
-                renderer.materials[eff_mat].emissive = ov.emissive
-                if renderer.uses_vulkan():
-                    renderer.gpu_slot[0].update_material_asset(eff_mat, renderer.materials[eff_mat])
+    if resources.has[BridgeRoute]():
+        extract_scene_meshes(world, resources, render_world, renderer, rstate, alpha)
+        ref route = resources.get_ptr[BridgeRoute]().value()[]
+        if route.has_actor:
+            extract_bridge_dust(world, resources, render_world, route.actor, route.walking)
+    else:
+        # 2. MeshRendererComponents
+        var mesh_mask = world.bit_for[MeshRendererComponent]().union(world.bit_for[GlobalTransform]())
+        var mesh_entities = world.query_entities(mesh_mask)
+        for i in range(len(mesh_entities)):
+            var e = mesh_entities[i]
+            var mc_opt = world.get_ptr[MeshRendererComponent](e)
+            if not mc_opt or not mc_opt.value()[unsafe_offset=0].visible:
+                continue
+            ref mc = mc_opt.value()[unsafe_offset=0]
+            var eff_mat = mc.material_id
+            var ov_opt = world.get_ptr[MaterialOverrideComponent](e)
+            if ov_opt and ov_opt.value()[unsafe_offset=0].enabled:
+                ref ov = ov_opt.value()[unsafe_offset=0]
+                if ov.material_id >= 0:
+                    eff_mat = ov.material_id
+                if eff_mat >= 0 and eff_mat < len(renderer.materials):
+                    renderer.materials[eff_mat].base_color = ov.base_color
+                    renderer.materials[eff_mat].roughness = ov.roughness
+                    renderer.materials[eff_mat].metallic = ov.metallic
+                    renderer.materials[eff_mat].emissive = ov.emissive
+                    if renderer.uses_vulkan():
+                        renderer.gpu_slot[0].update_material_asset(eff_mat, renderer.materials[eff_mat])
 
-        var gt = _interpolated_gt_local(world, e, alpha)
-        rstate.extractor.extract_entity(
-            render_world,
-            e.to_bits(),
-            mc.mesh_id,
-            gt.matrix.copy(),
-            eff_mat,
-            mc.cast_shadows,
-        )
+            var gt = _interpolated_gt_local(world, e, alpha)
+            rstate.extractor.extract_entity(
+                render_world,
+                e.to_bits(),
+                mc.mesh_id,
+                gt.matrix.copy(),
+                eff_mat,
+                mc.cast_shadows,
+            )
 
     # 3. VatCrowdComponents
     var vat_mask = world.bit_for[VatCrowdComponent]().union(world.bit_for[GlobalTransform]())
@@ -1443,6 +1463,9 @@ def _sys_open_world_extract_and_draw(
                 border_color=0xFFF49E38,
             )
 
+    var captions = resources.get_ptr_mut[BridgeCaptions]()
+    if captions:
+        captions.value()[].draw(rstate.ui_draw_list, renderer.width, renderer.height)
     rstate.extractor.end_extraction()
     rstate.last_render_ok = renderer.render_world(render_world, rstate.ui_draw_list)
     rstate.rendered_frames += 1
@@ -1522,6 +1545,13 @@ def _setup_open_world_input(mut app: EngineApp):
     var actions = [
         "move_forward",
         "move_back",
+        "bridge_pivot",
+        "bridge_closeup",
+        "bridge_fall",
+        "bridge_rise",
+        "bridge_interact",
+        "bridge_save",
+        "bridge_load",
         "move_left",
         "move_right",
         "move_up",
@@ -1545,6 +1575,23 @@ def _setup_open_world_input(mut app: EngineApp):
     var ctx = InputContext("open_world_fly", priority=10)
     ctx.bind_key("move_forward", 87)
     ctx.bind_key("move_back", 83)
+    ctx.bind_key("bridge_pivot", 80)
+    ctx.bind_key("bridge_closeup", 67)
+    ctx.bind_key("bridge_fall", 70)
+    ctx.bind_key("bridge_rise", 82)
+    ctx.bind_key("bridge_interact", 69)
+    ctx.bind_key("bridge_save", 75)
+    ctx.bind_key("bridge_load", 76)
+    ctx.bind_pad_button("move_forward", PAD_UP)
+    ctx.bind_pad_button("move_back", PAD_DOWN)
+    ctx.bind_pad_button("bridge_fall", PAD_B)
+    ctx.bind_pad_button("bridge_rise", PAD_Y)
+    ctx.bind_pad_button("bridge_interact", PAD_A)
+    ctx.bind_pad_button("bridge_pivot", PAD_X)
+    ctx.bind_pad_button("bridge_save", PAD_LB)
+    ctx.bind_pad_button("bridge_load", PAD_RB)
+    ctx.bind_pad_button("bridge_closeup", PAD_BACK)
+    ctx.bind_pad_button("quit", PAD_START)
     ctx.bind_key("move_right", 68)
     ctx.bind_key("move_left", 65)
     ctx.bind_key("move_up", 69)
@@ -2231,7 +2278,144 @@ def _run_headless_smoke(mut app: EngineApp, out_png: String):
     app.shutdown()
 
 
-def main():
+def _frame_summary(mut samples: List[Float64]) -> Tuple[Float64, Float64, Float64, Float64]:
+    if not samples:
+        return (0, 0, 0, 0)
+    sort(samples)
+    var last = len(samples) - 1
+    return (samples[last // 2], samples[last * 95 // 100], samples[last * 99 // 100], samples[last])
+
+
+def _traverse(mut app: EngineApp, frames: Int, screenshot: String, offscreen: Bool, soak_seconds: Int) raises:
+    ref route = app.resources.get_ptr[BridgeRoute]().value()[]
+    ref render = app.resources.get_ptr_mut[ScalableRenderer]().value()[]
+    ref state = app.resources.get_ptr[RenderPluginStateResource]().value()[]
+    ref vk = render.gpu_slot[0].vk
+    vk.capture_display_timing = not offscreen and vk.has_display_timing and vk.swapchain != 0
+    var timing_ok = vk.capture_display_timing
+    ref windows = app.resources.get_ptr_mut[WindowStateResource]().value()[].windows
+    var use_wayland = not offscreen and not timing_ok and len(windows) > 0 and windows[0].presentation != 0
+    var timing_source = String("VK_GOOGLE_display_timing")
+    var first_present = vk.presented + 1
+    var timing_swapchain = vk.swapchain
+    var cycle_ns = vk.refresh_cycle_ns() if timing_ok else 0
+    var actual_ns = List[Int](capacity=frames)
+    var loop_ms = List[Float64](capacity=frames)
+    var gpu_ms = List[Float64](capacity=frames)
+    var hitches = 0
+    var over_30hz = 0
+    var first_ms = Float64(0)
+    var missing = 0
+    var i = 0
+    var begin = get_time()
+    while i < frames or (soak_seconds > 0 and get_time() - begin < Float64(soak_seconds)):
+        var start = get_time()
+        if use_wayland:
+            _ = windows[0].request_presentation_feedback()
+        app.step_one_frame(Float32(1.0 / 60.0))
+        var elapsed = (get_time() - start) * 1000
+        if i == 0:
+            first_ms = elapsed
+        if elapsed > 1000.0 / 30:
+            over_30hz += 1
+        loop_ms.append(elapsed)
+        if elapsed > 1000.0 / 60:
+            hitches += 1
+        var gpu = render.gpu_slot[0].last_frame_gpu_ms
+        if gpu > 0:
+            gpu_ms.append(gpu)
+        if timing_ok:
+            # Limit each sample set to one swapchain and one refresh duration.
+            if vk.swapchain != timing_swapchain:
+                timing_ok = False
+            else:
+                timing_ok = vk.collect_present_times(first_present, actual_ns)
+        if not state.last_render_ok:
+            raise Error("Bridge traversal failed to render frame " + String(i))
+        if route.has_actor:
+            if not state.skinned_parts.get(route.actor.to_bits()) or not app.world.get_ptr[AnimatorComponent](route.actor).value()[].animator.configured():
+                missing += 1
+        if not offscreen and not app.resources.get_ptr[WindowStateResource]().value()[].is_open():
+            raise Error("Bridge traversal window closed before the run finished")
+        i += 1
+    if timing_ok:
+        timing_ok = vk.collect_present_times(first_present, actual_ns)
+    vk.capture_display_timing = False
+    if use_wayland:
+        ref win = windows[0]
+        # Last reports arrive after queue submission. Do not include their drain in loop samples.
+        var deadline = get_time() + 0.25
+        while len(win.presented_ns) + win.feedback_discarded < win.feedback_requested and get_time() < deadline:
+            _ = win.wait_socket(5)
+            win.receive()
+        actual_ns = win.presented_ns.copy()
+        cycle_ns = win.feedback_refresh_ns
+        timing_ok = True
+        timing_source = "wp_presentation"
+        print("[Bridge] Wayland feedback requested/presented/discarded", win.feedback_requested, len(actual_ns), win.feedback_discarded)
+    report_bridge_cells(app)
+    var dust = app.resources.get_ptr[BridgeDust]()
+    if dust:
+        print("[Bridge] footstep bursts", dust.value()[].bursts)
+    var wall = _frame_summary(loop_ms)
+    var gpu = _frame_summary(gpu_ms)
+    print("[Bridge] frames", i, "elapsed s", get_time() - begin, "offscreen", offscreen, "width", render.width, "height", render.height,
+          "RT", render.gpu_slot[0].vk.has_ray_query, "zero_copy", render.surface.is_zero_copy_gpu())
+    print("[Bridge] game loop ms p50/p95/p99/max", wall[0], wall[1], wall[2], wall[3], "over 16.67 ms", hitches)
+    print("[Bridge] GPU timestamp samples", len(gpu_ms), "p50/p95/p99/max ms", gpu[0], gpu[1], gpu[2], gpu[3])
+    if timing_ok and len(actual_ns) > 1:
+        sort(actual_ns)
+        var intervals = List[Float64]()
+        var missed_refreshes = 0
+        var previous = actual_ns[0]
+        for t in actual_ns:
+            if t <= previous:
+                continue
+            var delta = t - previous
+            intervals.append(Float64(delta) / 1000000)
+            if cycle_ns > 0:
+                missed_refreshes += max(0, (delta + cycle_ns // 2) // cycle_ns - 1)
+            previous = t
+        var display = _frame_summary(intervals)
+        print("[Bridge] presentation timestamps", timing_source, "reports", len(actual_ns), "of", vk.presented-first_present+1,
+              "intervals", len(intervals), "p50/p95/p99/max ms", display[0], display[1], display[2], display[3])
+        if cycle_ns > 0:
+            print("[Bridge] measured refresh ms", Float64(cycle_ns)/1000000, "missed refreshes across observed intervals", missed_refreshes)
+        else:
+            print("[Bridge] display refresh duration unavailable")
+    else:
+        print("[Bridge] actualPresentTime unavailable; extension", vk.has_display_timing,
+              "swapchain", vk.swapchain != 0, "reports", len(actual_ns), "successful presents", vk.presented-first_present+1)
+    print("[Bridge] first loop ms", first_ms, "over 33.33 ms", over_30hz,
+          "peak process RSS bytes", process_peak_rss_bytes(), "peak tracked VRAM bytes", mem_total(W_VRAM_PEAK),
+          "audio stream underruns", app.resources.get_ptr[AudioServer]().value()[].stream_underruns())
+    print("[Bridge] missing performer frames", missing, "final z", route.position.z)
+    if route.has_actor:
+        var parts = state.skinned_parts.get(route.actor.to_bits())
+        if not parts or not len(parts.value()) or missing > 1:
+            raise Error("Bridge performer failed to resolve, deform or render")
+        print("[Bridge] skinned primitives", len(parts.value()), "interactions", route.interactions, "pivots", route.pivots, "falls", route.falls,
+              "recoveries", app.world.get_ptr[RagdollComponent](route.actor).value()[].state_machine.recovery_count)
+    if screenshot:
+        var pixels = render.readback_pixels()
+        if not write_png(screenshot, pixels, render.width, render.height):
+            raise Error("Could not save bridge screenshot: " + screenshot)
+
+
+def main() raises:
+    var bridge = False
+    var baseline = False
+    var offscreen = False
+    var resume = False
+    var save_after = False
+    var frames = 0
+    var soak_seconds = 0
+    var pack = String()
+    var language = String()
+    var text_size = 0
+    var mute = False
+    var out_w = 1280
+    var out_h = 720
     var headless_shots = False
     var headless_smoke = False
     var out_png = String("")
@@ -2239,7 +2423,44 @@ def main():
     var ai = 1
     while ai < len(args):
         var arg = String(args[ai])
-        if arg == "--shots" or arg == "--headless":
+        if arg == "--bridge" or arg == "--bridge-baseline":
+            bridge = True
+            baseline = arg == "--bridge-baseline"
+        elif arg == "--resume":
+            resume = True
+        elif arg == "--save-checkpoint":
+            save_after = True
+        elif arg == "--mute":
+            mute = True
+        elif arg == "--offscreen":
+            offscreen = True
+        elif arg == "--pack" or arg == "--frames" or arg == "--width" or arg == "--height" or arg == "--locale" or arg == "--text-size" or arg == "--soak-seconds":
+            if ai + 1 >= len(args):
+                raise Error("Missing value for " + arg)
+            ai += 1
+            var value = String(args[ai])
+            if arg == "--locale":
+                language = value
+            elif arg == "--text-size":
+                text_size = Int(value)
+                if text_size < 12 or text_size > 64:
+                    raise Error("Caption size must be 12 to 64 pixels")
+            elif arg == "--pack":
+                pack = value
+            elif arg == "--soak-seconds":
+                soak_seconds = Int(value)
+                if soak_seconds < 1:
+                    raise Error("Soak duration must be positive")
+                frames = max(frames, 1)
+            elif arg == "--frames":
+                frames = Int(value)
+                if frames < 1:
+                    raise Error("Frame count must be positive")
+            elif arg == "--width":
+                out_w = Int(value)
+            else:
+                out_h = Int(value)
+        elif arg == "--shots" or arg == "--headless":
             headless_shots = True
         elif arg == "--headless-smoke":
             headless_smoke = True
@@ -2248,7 +2469,15 @@ def main():
             ai += 1
         ai += 1
 
-    var is_headless = headless_shots or headless_smoke
+    if out_w < 64 or out_h < 64 or out_w > 7680 or out_h > 4320:
+        raise Error("World dimensions out of range")
+    if (offscreen or frames > 0 or pack or resume or save_after) and not bridge:
+        raise Error("--offscreen, --frames and --pack require --bridge or --bridge-baseline")
+    if save_after and frames == 0:
+        raise Error("--save-checkpoint requires --frames")
+    if bridge and (headless_shots or headless_smoke or (offscreen and frames == 0)):
+        raise Error("Use --bridge --offscreen --frames N for an offscreen traversal")
+    var is_headless = headless_shots or headless_smoke or offscreen
 
     var no_display = (
         env_flag("FLINT_HEADLESS")
@@ -2264,9 +2493,6 @@ def main():
             "[Flint Open World] No Wayland/X11 display detected. Run with '--shots' or '--headless-smoke' for headless PNG output."
         )
         return
-
-    var out_w = 1280
-    var out_h = 720
 
     var cfg = AppConfig(
         title="FLINT AAA OPEN WORLD - SUNSPIRE VALLEY",
@@ -2311,13 +2537,16 @@ def main():
     app.add_plugin(
         WindowPlugin(
             headless=is_headless,
+            gpu_surface=True,
             width=out_w,
             height=out_h,
             title="FLINT AAA OPEN WORLD - SUNSPIRE VALLEY",
         )
     )
     app.add_plugin(InputPlugin(enable_evdev=not is_headless))
-    app.add_plugin(PhysicsPlugin(gravity=0.0))
+    if bridge and not baseline:
+        app.add_plugin(AssetPlugin(loose_root="" if pack else "examples/character_course/assets"))
+    app.add_plugin(PhysicsPlugin(gravity=Float32(9.81) if bridge else Float32(0)))
     app.add_plugin(AnimPlugin())
     app.add_plugin(AudioPlugin(headless=is_headless))
     app.add_plugin(RenderPlugin(tier=RENDER_TIER_2_AAA_VISBUFFER_RT, width=out_w, height=out_h, tsr_scale=1.0))
@@ -2342,6 +2571,31 @@ def main():
         app.shutdown()
         return
 
+    if bridge:
+        app.resources.get_ptr_mut[ScalableRenderer]().value()[].gpu_slot[0].svgf_jitter_depth = True
+        var camera = app.resources.get_ptr[OpenWorldStateResource]().value()[].cam_entity
+        load_bridge(app, camera, pack, baseline, frames > 0)
+        if not baseline:
+            var settings = GameSettings.load("sunspire")
+            _ = settings.load_bindings(app.resources.get_ptr_mut[InputMap]().value()[])
+            if language:
+                settings.language = language
+            if text_size:
+                settings.caption_size = text_size
+            if (language or text_size) and not settings.save():
+                raise Error("Cannot save Sunspire caption settings")
+            if mute:
+                settings.master_volume = 0
+            _ = settings.apply_audio(app.resources.get_ptr[AudioServer]().value()[])
+            setup_captions(app, settings.language, Float32(settings.caption_size))
+            app.resources.get_ptr_mut[BridgeCaptions]().value()[].enabled = settings.subtitles
+            print("[Bridge] language", settings.language, "caption px", settings.caption_size, "muted", settings.master_volume == 0)
+        if resume:
+            ref route = app.resources.get_ptr_mut[BridgeRoute]().value()[]
+            if not route.load_checkpoint():
+                raise Error("Cannot resume bridge checkpoint")
+            print("[Bridge] resumed z", route.position.z, "interactions", route.interactions)
+        _ = app.add_system(STAGE_PRE_UPDATE, "open_world.bridge", update_bridge, exclusive=True)
     if headless_shots:
         _run_headless_shots(app)
         return
@@ -2359,7 +2613,9 @@ def main():
         if win_open and rend_opt and len(win_res.windows) > 0:
             _ = rend_opt.value()[unsafe_offset=0].attach_window_surface(win_res.windows[0])
 
-    if not win_open:
+    if not win_open and not offscreen:
+        if frames > 0:
+            raise Error("A presented traversal needs an open window")
         print(
             "[Flint Open World] No Wayland/X11 display detected. Run with '--shots' to render open-world PNGs."
         )
@@ -2376,6 +2632,13 @@ def main():
             st_opt.value()[unsafe_offset=0],
             0,
         )
+
+    if frames > 0:
+        _traverse(app, frames, out_png, offscreen, soak_seconds)
+        if save_after and not app.resources.get_ptr[BridgeRoute]().value()[].save_checkpoint():
+            raise Error("Failed to save checkpoint after bridge traversal")
+        app.shutdown()
+        return
 
     var t_last = get_time()
     while True:

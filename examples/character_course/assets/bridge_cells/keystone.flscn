@@ -1,0 +1,33 @@
+{
+  "format": "flscn",
+  "version": 2,
+  "name": "Sunspire keystone",
+  "entities": [
+    {
+      "slot": 0,
+      "parent": -1,
+      "components": {
+        "CellActor": {
+          "id": "lantern",
+          "target": "watch/guide"
+        },
+        "LocalTransform": {
+          "translation": [
+            2.4,
+            3.45,
+            -4
+          ]
+        },
+        "GlobalTransform": {},
+        "PointLightComponent": {
+          "radiance": [
+            1.6,
+            3.8,
+            5.0
+          ],
+          "radius": 4.2
+        }
+      }
+    }
+  ]
+}

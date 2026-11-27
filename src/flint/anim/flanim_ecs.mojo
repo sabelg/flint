@@ -44,7 +44,7 @@ from flint.anim.pose import (
 )
 from flint.anim.procedural import Placement, FootPlantSolver, DEG
 from flint.anim.ragdoll import ArticulatedRagdoll, RagdollObbCollider
-from flint.physics.filter import CollisionFilter, CAT_TERRAIN, CAT_STATIC, CAT_ALL
+from flint.physics.filter import CollisionFilter, CAT_ALL
 from flint.physics.world import (
     PhysicsWorld,
     BODY_SHAPE_SPHERE,
@@ -62,7 +62,7 @@ from flint.physics.shapes_v5 import (
 )
 
 comptime FLANIM_FOURCC: UInt32 = fourcc("FLAN")
-comptime FLANIM_VERSION: Int = 1
+comptime FLANIM_VERSION: Int = 2
 
 comptime RAGDOLL_SM_ANIMATED: Int = 0
 comptime RAGDOLL_SM_ACTIVE_PD: Int = 1
@@ -92,18 +92,20 @@ def _write_conditions(conds: List[Condition], mut w: BlobWriter):
         w.integer(conds[i].param)
         w.integer(conds[i].op)
         w.f32(conds[i].value)
+        w.boolean(conds[i].is_clip)
 
 
-def _read_conditions(mut r: BlobReader) raises -> List[Condition]:
-    var n = _checked_flanim_count(r, 20, "condition")
+def _read_conditions(mut r: BlobReader, version: Int) raises -> List[Condition]:
+    var n = _checked_flanim_count(r, 21 if version >= 2 else 20, "condition")
     var out = List[Condition](capacity=n)
     for _ in range(n):
         var param = r.integer()
         var op = r.integer()
         var val = r.f32()
+        var is_clip = r.boolean() if version >= 2 else False
         if r.failed:
             raise Error("corrupted .flanim condition entry")
-        out.append(Condition(param, op, val))
+        out.append(Condition(param, op, val, is_clip))
     return out^
 
 
@@ -231,12 +233,15 @@ def serialize_flanim(graph: AnimGraphDef, mut w: BlobWriter):
             w.text(fm.bones[b])
             w.f32(fm.bone_scales[b])
 
+    w.u32(UInt32(len(graph.clip_names)))
+    for name in graph.clip_names:
+        w.text(name)
     w.end()
 
 
 def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
     """Loads an `AnimGraphDef` from a `'FLAN'` binary `.flanim` blob."""
-    _ = r.enter(FLANIM_FOURCC, FLANIM_VERSION)
+    var version = r.enter(FLANIM_FOURCC, FLANIM_VERSION)
     var out = AnimGraphDef()
     out.name = r.text()
     out.default_blend = r.f32()
@@ -328,8 +333,8 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
         st.reset_time = r.boolean()
         if r.failed:
             raise Error("corrupted .flanim state")
-        st.when = _read_conditions(r)
-        st.hold_while = _read_conditions(r)
+        st.when = _read_conditions(r, version)
+        st.hold_while = _read_conditions(r, version)
         out.states.append(st^)
 
     var n_layers = _checked_flanim_count(r, 54, "layer")
@@ -347,7 +352,7 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
         ly.loop = r.boolean()
         if r.failed:
             raise Error("corrupted .flanim layer")
-        ly.when = _read_conditions(r)
+        ly.when = _read_conditions(r, version)
         var no = _checked_flanim_count(r, 8, "layer over")
         for _ in range(no):
             ly.over.append(r.integer())
@@ -389,6 +394,10 @@ def deserialize_flanim(mut r: BlobReader) raises -> AnimGraphDef:
                 raise Error("corrupted .flanim form bone")
         out.forms.append(fm^)
 
+    if version >= 2:
+        var count = _checked_flanim_count(r, 4, "clip name")
+        for _ in range(count):
+            out.clip_names.append(r.text())
     r.leave()
     if r.failed:
         raise Error("corrupted .flanim payload")
@@ -558,6 +567,8 @@ def solve_foot_plant_world(
     var hit_normals = List[Vec3](capacity=leg_count)
     var total_dist = max(Float32(0.05), ray_up + ray_down)
     var hits_found = 0
+    var supported_stance = List[Bool](capacity=leg_count)
+    var body_slots = List[Int](capacity=leg_count)
 
     for f in range(leg_count):
         var ankle_node = solver.legs[f].ankle
@@ -565,12 +576,25 @@ def solve_foot_plant_world(
         var stance = in_stance[f] if f < len(in_stance) else False
         var cast_x = p_anim.x
         var cast_z = p_anim.z
-        if stance and solver.legs[f].locked:
+        ref leg = solver.legs[f]
+        if stance and leg.locked and leg.support_body_id >= 0:
+            var slot = world.find_slot_by_id(leg.support_body_id)
+            if slot >= 0:
+                ref body = world.bodies[slot]
+                var contact = body.pos + body.rot.rotate(leg.support_local_point)
+                leg.locked_world_pos.x = contact.x
+                leg.locked_world_pos.z = contact.z
+            else:
+                leg.locked = False
+                leg.support_body_id = -1
+        if stance and leg.locked:
             cast_x = solver.legs[f].locked_world_pos.x
             cast_z = solver.legs[f].locked_world_pos.z
 
         var origin = Vec3(cast_x, p_anim.y + ray_up, cast_z)
         var hit = world.raycast(origin, Vec3(0.0, -1.0, 0.0), total_dist, filter, ignore_body_id)
+        supported_stance.append(stance and hit.hit)
+        body_slots.append(hit.body_slot if hit.hit else -1)
         if hit.hit:
             hit_heights.append(hit.point.y)
             hit_normals.append(hit.normal)
@@ -579,7 +603,18 @@ def solve_foot_plant_world(
             hit_heights.append(p_anim.y - solver.legs[f].ankle_height * scale_y)
             hit_normals.append(Vec3(0.0, 1.0, 0.0))
 
-    solver.apply_to_skeleton(skel, model, placement, in_stance, hit_heights, hit_normals, dt)
+    solver.apply_to_skeleton(skel, model, placement, supported_stance, hit_heights, hit_normals, dt)
+    for f in range(leg_count):
+        ref leg = solver.legs[f]
+        var slot = body_slots[f]
+        if leg.locked and slot >= 0:
+            ref body = world.bodies[slot]
+            if leg.support_body_id != body.id:
+                var contact = Vec3(leg.locked_world_pos.x, hit_heights[f], leg.locked_world_pos.z)
+                leg.support_local_point = body.rot.conjugate().rotate(contact - body.pos)
+                leg.support_body_id = body.id
+        else:
+            leg.support_body_id = -1
     return hits_found
 
 
@@ -608,6 +643,7 @@ struct RagdollStateMachine(Copyable, Movable):
     var min_limp_time: Float32
     var limp_timer: Float32
     var query_padding: Float32
+    var authored_floor_y: Float32  # Model-space ground height of the authored recovery clips.
     var filter: CollisionFilter
     var ignore_body_id: Int
     var chest_limb_index: Int
@@ -632,6 +668,7 @@ struct RagdollStateMachine(Copyable, Movable):
         self.min_limp_time = Float32(0.25)
         self.limp_timer = Float32(0.0)
         self.query_padding = Float32(0.65)
+        self.authored_floor_y = Float32(0.0)
         self.filter = CollisionFilter(CAT_ALL, CAT_ALL, 0)
         self.ignore_body_id = -1
         self.chest_limb_index = 1
@@ -825,7 +862,7 @@ struct RagdollStateMachine(Copyable, Movable):
 
         var root_pos = placement.position
         var root_yaw_rad = placement.yaw * DEG
-        self.ragdoll.begin_recovery(root_pos, root_yaw_rad, self.inertial, self.scratch_pose)
+        self.ragdoll.begin_recovery(root_pos, root_yaw_rad, self.inertial, self.scratch_pose, self.authored_floor_y)
         placement.position = root_pos
         placement.yaw = root_yaw_rad / DEG
 
@@ -888,7 +925,7 @@ struct RagdollStateMachine(Copyable, Movable):
                 var root_pos = placement.position
                 var root_yaw_rad = placement.yaw * DEG
                 var pelvis_before = self.ragdoll.pelvis_world_position()
-                self.ragdoll.begin_recovery(root_pos, root_yaw_rad, self.inertial, self.scratch_pose)
+                self.ragdoll.begin_recovery(root_pos, root_yaw_rad, self.inertial, self.scratch_pose, self.authored_floor_y)
                 placement.position = root_pos
                 placement.yaw = root_yaw_rad / DEG
                 skel.pose.resize(len(model.nodes))
@@ -958,7 +995,7 @@ struct RagdollStateMachine(Copyable, Movable):
             pelvis_w + Vec3(0.0, 0.85, 0.0),
             Vec3(0.0, -1.0, 0.0),
             Float32(12.0),
-            CollisionFilter(CAT_ALL, CAT_TERRAIN | CAT_STATIC, 0),
+            self.filter,
             self.ignore_body_id,
         )
         if floor_hit.hit and floor_hit.normal.y > Float32(0.2):
@@ -967,6 +1004,21 @@ struct RagdollStateMachine(Copyable, Movable):
             if floor_hit.body_slot >= 0 and floor_hit.body_slot < len(world.bodies):
                 fric = world.bodies[floor_hit.body_slot].friction
             self.ragdoll.set_surface_plane(floor_hit.normal, plane_off, fric)
+        else:
+            self.ragdoll.has_floor = False
+
+    def begin_getup_world(
+        mut self,
+        mut world: PhysicsWorld,
+        mut skel: SkeletonInstance,
+        mut placement: Placement,
+        model: NativeModel,
+        fallback_pose: Pose,
+    ):
+        """Release hosted limbs, query the support beneath the pelvis, then recover."""
+        world.set_ragdoll_active(self.world_ragdoll_slot, False)
+        self._sync_floor_plane_from_world(world)
+        self.begin_getup(skel, placement, model, fallback_pose)
 
     def update_world(
         mut self,
@@ -978,10 +1030,11 @@ struct RagdollStateMachine(Copyable, Movable):
         dt: Float32,
         auto_recover: Bool = True,
         step_world: Bool = True,
+        snapshot_previous: Bool = True,
     ):
         """Advances the ragdoll state machine using two-way `PhysicsWorld`-hosted capsules & joints."""
         skel.ensure_topology(model)
-        if skel.node_count > 0:
+        if snapshot_previous and skel.node_count > 0:
             skel.snapshot_prev_matrices()
 
         if self.state == RAGDOLL_SM_ANIMATED:
@@ -1023,6 +1076,7 @@ struct RagdollStateMachine(Copyable, Movable):
             if self.state == RAGDOLL_SM_ACTIVE_PD:
                 self.active_pd_timer += max(Float32(0.0), dt)
                 if auto_recover and self.active_pd_timer >= self.active_pd_duration:
+                    world.set_ragdoll_active(self.world_ragdoll_slot, False)
                     self._sync_floor_plane_from_world(world)
                     if anim_pose.count() == len(model.nodes):
                         self.scratch_pose.assign(anim_pose)
@@ -1031,7 +1085,7 @@ struct RagdollStateMachine(Copyable, Movable):
                     var root_pos = placement.position
                     var root_yaw_rad = placement.yaw * DEG
                     var pelvis_before = self.ragdoll.pelvis_world_position()
-                    self.ragdoll.begin_recovery(root_pos, root_yaw_rad, self.inertial, self.scratch_pose)
+                    self.ragdoll.begin_recovery(root_pos, root_yaw_rad, self.inertial, self.scratch_pose, self.authored_floor_y)
                     placement.position = root_pos
                     placement.yaw = root_yaw_rad / DEG
                     skel.pose.resize(len(model.nodes))
@@ -1042,14 +1096,11 @@ struct RagdollStateMachine(Copyable, Movable):
                     skel.update_matrices(model)
                     var pelvis_node = self.ragdoll.limbs[0].bone_node
                     self.last_pelvis_snap_m = (placement.to_world(skel.global_position(pelvis_node)) - pelvis_before).length()
-                    world.set_ragdoll_active(self.world_ragdoll_slot, False)
                     self.state = RAGDOLL_SM_ANIMATED
             else:
                 self.limp_timer += max(Float32(0.0), dt)
                 if auto_recover and self.limp_timer >= self.min_limp_time and self.ragdoll.settled():
-                    self._sync_floor_plane_from_world(world)
-                    self.begin_getup(skel, placement, model, anim_pose)
-                    world.set_ragdoll_active(self.world_ragdoll_slot, False)
+                    self.begin_getup_world(world, skel, placement, model, anim_pose)
             return
 
         if self.world_ragdoll_slot >= 0:

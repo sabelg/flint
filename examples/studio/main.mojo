@@ -20,6 +20,7 @@ powered by the unified Engine v5 spine (`EngineApp`, `WindowPlugin`, `TransformP
   - **`--mcp-connect <sock_path>`**:
     Pure-Mojo bidirectional `stdio <-> AF_UNIX` MCP proxy for live Studio Unix socket sessions.
 """
+from flint.studio.autosave import recovery_original
 from std.collections import List
 from std.ffi import external_call
 from std.math import abs, cos, max, min, sin
@@ -447,6 +448,10 @@ def _run_studio() raises -> Int:
     if has_project_flag or has_project_env:
         studio.asset_browser_dir = project_root
     populate_default_studio_scene(studio)
+    if not is_headless:
+        var recoverable = recovery_original(studio.project_root, studio.scene_file_path)
+        if recoverable:
+            studio.push_toast("Unsaved edits for " + recoverable + ". Choose File > Recover autosave.", 1, 12)
 
     if theme_opt >= 0:
         studio.set_studio_theme(theme_opt)
@@ -632,6 +637,7 @@ def _run_studio() raises -> Int:
                 _ = r_opt.value()[unsafe_offset=0].resize(out_w, out_h)
 
         var now = get_time()
+        _ = studio.tick_autosave(Float32(now - t_last))
         var dt = Float32(min(0.05, max(0.001, now - t_last)))
         t_last = now
 

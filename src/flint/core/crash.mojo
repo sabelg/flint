@@ -91,21 +91,32 @@ def elf_build_id(data: List[UInt8]) -> String:
     """The GNU build id of an ELF file as hex, or empty. Read from its notes."""
     if len(data) < 64 or data[0] != 0x7F or data[1] != 0x45 or data[2] != 0x4C or data[3] != 0x46:
         return String()
+    if data[4] != 2 or data[5] != 1:  # Linux ELF64, little-endian
+        return String()
     var program = le_word(data, 32, 8)
     var entry_size = le_word(data, 54, 2)
     var count = le_word(data, 56, 2)
+    if program < 0 or program > len(data) or entry_size < 56 or count > (len(data) - program) // entry_size:
+        return String()
     for header in range(count):
         var base = program + header * entry_size
-        if base + 56 > len(data) or le_word(data, base, 4) != 4:  # PT_NOTE
+        if le_word(data, base, 4) != 4:  # PT_NOTE
             continue
         var offset = le_word(data, base + 8, 8)
-        var end = offset + le_word(data, base + 32, 8)
-        while offset + 12 <= end and end <= len(data):
+        var size = le_word(data, base + 32, 8)
+        if offset < 0 or size < 0 or offset > len(data) or size > len(data) - offset:
+            continue
+        var end = offset + size
+        while end - offset >= 12:
             var name_size = le_word(data, offset, 4)
             var description_size = le_word(data, offset + 4, 4)
             var kind = le_word(data, offset + 8, 4)
-            var description = offset + 12 + ((name_size + 3) & ~3)
-            if kind == 3 and name_size == 4 and description + description_size <= len(data):
+            var name = offset + 12
+            var description = name + ((name_size + 3) & ~3)
+            if description > end or description_size > end - description:
+                break
+            if (kind == 3 and name_size == 4 and data[name] == 71 and data[name + 1] == 78
+                    and data[name + 2] == 85 and data[name + 3] == 0 and 0 < description_size <= 64):
                 var text = String()
                 for index in range(description_size):
                     var byte = Int(data[description + index])

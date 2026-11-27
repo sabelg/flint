@@ -1,0 +1,33 @@
+{
+  "format": "flscn",
+  "version": 2,
+  "name": "Sunspire north",
+  "entities": [
+    {
+      "slot": 0,
+      "parent": -1,
+      "components": {
+        "CellActor": {
+          "id": "lantern",
+          "target": "watch/guide"
+        },
+        "LocalTransform": {
+          "translation": [
+            2.4,
+            3.45,
+            12
+          ]
+        },
+        "GlobalTransform": {},
+        "PointLightComponent": {
+          "radiance": [
+            5.0,
+            3.1,
+            1.4
+          ],
+          "radius": 4.2
+        }
+      }
+    }
+  ]
+}

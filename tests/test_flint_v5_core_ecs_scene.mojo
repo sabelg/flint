@@ -90,7 +90,10 @@ from flint.core.serial import BlobWriter, BlobReader, fourcc, fast_hash64
 from flint.core.session_replay import SessionRecorder, FLUSH_AT
 from flint.assets.json import JsonDocument, json_i64, parse_json
 from flint.platform.dynlib import dl_open, dl_close, dl_error
-from flint.platform.os import get_time, write_bytes, remove_file, file_size, env_now, read_stream
+from flint.platform.os import (
+    FAULT_SHORT_WRITE, FAULT_BEFORE_RENAME, close_fd, env_now, file_size, get_time,
+    open_read, read_bytes, read_stream, remove_file, write_bytes, write_file_durable,
+)
 
 from flint.ecs import (
     CHUNK_ALIGN,
@@ -108,6 +111,7 @@ from flint.ecs import (
     World,
 )
 from flint.scene import (
+    Parent,
     SerializableComponent,
     LocalTransform,
     GlobalTransform,
@@ -360,7 +364,7 @@ def _det_sim_kernel(
         cmds.despawn(lane, entity, order_key=order)
 
 
-def _run_deterministic_ecs_sim(workers: Int) -> Tuple[Int, UInt64]:
+def _run_deterministic_ecs_sim(workers: Int) -> Tuple[Int, List[UInt64]]:
     var w = World()
     _ = w.register_component[CompPos]()
     _ = w.register_component[CompVel]()
@@ -385,6 +389,7 @@ def _run_deterministic_ecs_sim(workers: Int) -> Tuple[Int, UInt64]:
     else:
         _ = pool.allocate()
 
+    var hashes = List[UInt64]()
     var cmds = ParallelCommands()
     for step in range(8):
         _ = w.advance_tick()
@@ -394,11 +399,11 @@ def _run_deterministic_ecs_sim(workers: Int) -> Tuple[Int, UInt64]:
         var keep_ctx = len(ctx_box)
         _ = keep_ctx
         w.flush_commands(cmds)
+        hashes.append(w.state_checksum())
 
     var count = w.entity_count()
-    var checksum = w.state_checksum()
     pool.stop()
-    return (count, checksum)
+    return (count, hashes^)
 
 
 def test_b_ecs_v2_hybrid_events_determinism() raises:
@@ -492,6 +497,8 @@ def test_b_ecs_v2_hybrid_events_determinism() raises:
     assert_equal(res_1t[0], res_7t[0])
     assert_equal(res_1t[1], res_7t[1])
     assert_equal(res_0t[1], res_7t[1])
+    var res_8t = _run_deterministic_ecs_sim(8)
+    assert_equal(res_8t[1], res_1t[1])
 
 
 # ===========================================================================
@@ -719,10 +726,41 @@ def test_d_scene_prefabs_and_pie() raises:
     var json_b = scene.save_flscn_string(w, reg)
     assert_equal(json_a, json_b)  # Deterministic key & entity order!
 
+    var reordered = String('{"format":"flscn","version":2,"entities":[')
+    reordered += '{"slot":1,"parent":0,"components":{}},{"slot":0,"parent":-1,"components":{}}]}'
+    var reordered_bytes = List[UInt8]()
+    for byte in reordered.as_bytes():
+        reordered_bytes.append(byte)
+    var edited_world = World()
+    var edited_scene = Scene()
+    var edited = edited_scene.load_flscn_bytes(edited_world, reg, reordered_bytes)
+    assert_equal(len(edited), 2)
+    assert_equal(edited_world.get[Parent](edited[1]).entity.to_bits(), edited[0].to_bits())
+    assert_true(not edited_world.has[Parent](edited[0]))
+    assert_true(json_a.find("\n      ") >= 0)
+
     var flscn_path = "/tmp/flint-eng1-test-scene.flscn"
     var flscnb_path = "/tmp/flint-eng1-test-scene.flscnb"
-    assert_true(scene.save_flscn_file(flscn_path, w, reg))
-    assert_true(scene.save_flscnb_file(flscnb_path, w, reg))
+    var original = List[UInt8](length=3, fill=86)
+    for path in [flscn_path, flscnb_path]:
+        assert_true(write_bytes(path, original))
+        var reader = open_read(path)
+        assert_true(reader >= 0)
+        if path == flscn_path:
+            assert_true(scene.save_flscn_file(path, w, reg))
+        else:
+            assert_true(scene.save_flscnb_file(path, w, reg))
+        # A simultaneous reader of the old scene still sees its complete original bytes.
+        var old = List[UInt8](length=4, fill=0)
+        var count = external_call["read", Int64](Int32(reader), old.unsafe_ptr(), Int64(len(old)))
+        close_fd(reader)
+        assert_equal(count, Int64(len(original)))
+        assert_equal(old[0], original[0])
+        var published = read_bytes(path)
+        for fault in [FAULT_SHORT_WRITE, FAULT_BEFORE_RENAME]:
+            assert_true(not write_file_durable(path, original, fault))
+            assert_true(read_bytes(path) == published)
+
 
     var w_from_json = World()
     var s_json = Scene()

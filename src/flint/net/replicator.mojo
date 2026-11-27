@@ -571,6 +571,26 @@ struct SnapshotReplicator(Movable):
         if _rep_is_finite32(interest_radius) and interest_radius > Float32(0.0):
             self.clients[client_id].interest_radius = interest_radius
 
+    def reset_client_baselines(mut self, client_id: Int):
+        """A newly accepted transport peer has no snapshot or input history for its reused slot."""
+        if client_id < 0 or client_id >= self.max_clients:
+            return
+        ref client = self.clients[client_id]
+        client.has_acked_seq = False
+        client.last_acked_seq = 0
+        client.has_acked_input_seq = False
+        client.last_acked_input_seq = 0
+        if client.packets_sent_total == 0:
+            return
+        for i in range(len(client.baselines)):
+            client.baselines[i].clear_sparse()
+            client.baselines[i].valid = False
+        for i in range(len(client.priority_accum)):
+            client.priority_accum[i] = 0
+        # Slot sequence numbers keep advancing, so late ACKs from the old
+        # connection cannot acknowledge the new connection's first snapshot.
+        # Bandwidth counters and the configured AOI remain slot-level settings.
+
     def notify_client_ack(mut self, client_id: Int, acked_snap_seq: UInt16):
         """Records that `client_id` received and reconstructed `acked_snap_seq`."""
         if client_id < 0 or client_id >= self.max_clients:

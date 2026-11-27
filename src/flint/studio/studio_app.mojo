@@ -19,6 +19,7 @@ Implements:
 """
 from flint.studio.source_editor import EmbeddedIde
 from flint.studio import scene_menu
+from flint.studio.autosave import discard_snapshot, recovery_directory, recovery_original, snapshot_original, snapshot_path, write_snapshot
 from std.collections import Dict
 from std.math import abs, asin, cos, isfinite, isinf, isnan, max, min, sin, sqrt
 from std.memory import bitcast
@@ -107,6 +108,8 @@ from flint.assets.flpk_v3 import (
     UntypedHandle,
     decode_cooked_rig_slab,
     load_or_init_flmeta,
+    read_flmeta,
+    write_flmeta,
 )
 from flint.assets.glb_native import parse_native_glb
 from flint.assets.image import decode_png
@@ -209,6 +212,7 @@ from flint.render.material_graph import (
     MaterialAsset,
 )
 from flint.render.plugin import (
+    release_scene_skin,
     CameraComponent,
     EnvironmentComponent,
     MaterialOverrideComponent,
@@ -375,6 +379,7 @@ from flint.studio.palette_registry import (
     PAL_CMD_DUPLICATE,
     PAL_CMD_FRAME_SELECTION,
     PAL_CMD_LOAD_SCENE,
+    PAL_CMD_RECOVER_AUTOSAVE,
     PAL_CMD_NEW_SCENE,
     PAL_CMD_OPEN_PALETTE,
     PAL_CMD_OPEN_QUICK_SPAWN,
@@ -2060,6 +2065,9 @@ struct FlintStudioState(Movable):
     var asset_browser_scanned: Bool
 
     var dirty: Bool
+    var autosave_interval_sec: Float32
+    var _autosave_elapsed: Float32
+    var _autosave_pending: Bool
     var quit_requested: Bool
     var confirm_modal_open: Bool
     var confirm_modal_action: Int  # 0=none, 1=quit, 2=new_scene
@@ -2276,6 +2284,9 @@ struct FlintStudioState(Movable):
         self.asset_browser_entries = List[String]()
         self.asset_browser_scanned = False
         self.dirty = False
+        self.autosave_interval_sec = 120
+        self._autosave_elapsed = 0
+        self._autosave_pending = False
         self.quit_requested = False
         self.confirm_modal_open = False
         self.confirm_modal_action = 0
@@ -3056,6 +3067,9 @@ struct FlintStudioState(Movable):
 
     def mark_dirty(mut self, dirty_val: Bool = True):
         self.dirty = dirty_val
+        self._autosave_pending = dirty_val
+        if not dirty_val:
+            self._autosave_elapsed = 0
         var base_title = "FLINT STUDIO v5 — AAA VISUAL EDITOR"
         var full_title = base_title + " *" if dirty_val else base_title
         self.app.config.title = full_title
@@ -3292,6 +3306,8 @@ struct FlintStudioState(Movable):
             return ok
         if cmd_id == PAL_CMD_LOAD_SCENE and not in_play:
             return self.load_scene_file()
+        if cmd_id == PAL_CMD_RECOVER_AUTOSAVE and not in_play:
+            return self.recover_autosave()
         if cmd_id == PAL_CMD_NEW_SCENE and not in_play:
             return self.new_scene(force=False)
         if cmd_id == PAL_CMD_RELOAD_SCENE and not in_play:
@@ -4033,6 +4049,15 @@ struct FlintStudioState(Movable):
             rps.override_slots.clear()
             rps.studio_override_mat_ids.clear()
             rps.entity_smear_scales.clear()
+            var renderer = self.app.resources.get_ptr_mut[ScalableRenderer]()
+            if renderer:
+                var keys = List[UInt64]()
+                for key in rps.skinned_parts.keys():
+                    keys.append(key)
+                for key in keys:
+                    release_scene_skin(rps, renderer.value()[], key)
+            rps.skinned_parts.clear()
+            rps.preview_skeletons.clear()
             rps.skinned_entries.clear()
             rps.skinned_model_ids.clear()
             rps.skinned_invalidated.clear()
@@ -4054,6 +4079,8 @@ struct FlintStudioState(Movable):
             self.confirm_modal_open = True
             self.confirm_modal_action = 2
             return False
+        if self.dirty:
+            discard_snapshot(self.project_root, self.scene_file_path)
         if self.pie.mode != PIE_STOPPED:
             self._abort_pie_session()
         for i in range(len(self.app.world.entities)):
@@ -4250,6 +4277,7 @@ struct FlintStudioState(Movable):
         bar.groups[0].items[0].enabled = not in_play
         bar.groups[0].items[1].enabled = not in_play
         bar.groups[0].items[2].enabled = not in_play
+        bar.groups[0].items[3].enabled = not in_play
         bar.groups[1].items[0].enabled = (not in_play) and Bool(self.undo_stack)
         bar.groups[1].items[1].enabled = (not in_play) and Bool(self.redo_stack)
         bar.groups[1].items[2].enabled = (not in_play) and self.selected_count() > 0
@@ -4288,6 +4316,8 @@ struct FlintStudioState(Movable):
         elif action==scene_menu.LOAD and not in_play:
             var ok = self.load_scene_file()
             self.menu.message = "Scene loaded" if ok else "Could not load scene"
+        elif action==scene_menu.RECOVER_AUTOSAVE and not in_play:
+            _ = self.recover_autosave()
         elif action==scene_menu.NEW_SCENE and not in_play:
             _ = self.new_scene(force=False)
         elif action==scene_menu.UNDO and not in_play:
@@ -4955,6 +4985,52 @@ struct FlintStudioState(Movable):
             target = self.project_root + "/" + path
         return target
 
+    def write_autosave(mut self) -> Bool:
+        if not self.dirty or self.pie.mode != PIE_STOPPED:
+            return False
+        var packed = self.scene.save_flscnb_bytes(self.app.world, self.registry)
+        if not write_snapshot(self.project_root, self.scene_file_path, packed):
+            self.push_toast("Could not write scene autosave", 1, 4)
+            return False
+        self._autosave_pending = False
+        return True
+
+    def tick_autosave(mut self, dt: Float32) -> Bool:
+        if self.autosave_interval_sec <= 0 or not self._autosave_pending or self.pie.mode != PIE_STOPPED:
+            return False
+        if isfinite(dt) and dt > 0:
+            self._autosave_elapsed += dt
+        if self._autosave_elapsed < self.autosave_interval_sec:
+            return False
+        self._autosave_elapsed = 0
+        return self.write_autosave()
+
+    def recover_autosave(mut self) -> Bool:
+        var original = recovery_original(self.project_root, self.scene_file_path)
+        return self._recover_original(original)
+
+    def _recover_original(mut self, original: String) -> Bool:
+        if self.pie.mode != PIE_STOPPED:
+            return False
+        if not original:
+            self.push_toast("No recoverable scene autosave found", 0, 3)
+            return False
+        var same_document = original == self.scene_file_path
+        if self.dirty and not same_document and not self.write_autosave():
+            return False
+        var before = self._capture_world_blob() if same_document else List[UInt8]()
+        if self.dirty and same_document and not before:
+            return False
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+        if not self.load_scene_file(snapshot_path(self.project_root, original), recovered_original=original):
+            return False
+        if same_document and before:
+            self._record_world_tx(TX_BATCH_EDIT, -1, List[Int](), before^, prev_ids, prev_primary, prev_anchor, "Recover autosave")
+            self._autosave_pending = False
+        return True
+
     def save_scene_file(mut self, path: String = "") -> Bool:
         """Saves the Studio scene via `Scene.save_flscnb_file` (`.flscnb`/`.flscene`) or `Scene.save_flscn_file` (`.flscn`)."""
         var target = self._resolve_scene_io_path(path)
@@ -4975,6 +5051,7 @@ struct FlintStudioState(Movable):
         if not ok:
             self.push_toast("Failed to save scene", 2, 3.5)
             return False
+        discard_snapshot(self.project_root, self.scene_file_path)
         self.scene_file_path = target
         self.mark_dirty(False)
         self.push_toast("Saved " + target, 0, 2.5)
@@ -5119,9 +5196,11 @@ struct FlintStudioState(Movable):
             return b == UInt8(123)  # '{'
         return False
 
-    def load_scene_file(mut self, path: String = "") -> Bool:
+    def load_scene_file(mut self, path: String = "", recovered_original: String = "") -> Bool:
         """Loads a `.flscn`, `.flscnb`, or `.flscene` file into `app.world` and syncs transforms/physics."""
-        var target = self._resolve_scene_io_path(path)
+        var target = path if recovered_original else self._resolve_scene_io_path(path)
+        if not recovered_original and target.startswith(recovery_directory(self.project_root) + "/") and target.endswith(".autosave.flscnb"):
+            return self._recover_original(snapshot_original(self.project_root, target))
         if target.byte_length() == 0:
             self.push_toast("Load failed: empty path", 2, 3.0)
             return False
@@ -5144,7 +5223,7 @@ struct FlintStudioState(Movable):
         self.clear_selection()
         if len(self.app.world.entities) > 0 and self.app.world.entities[0].alive:
             self.select_entity(0)
-        self.scene_file_path = target
+        self.scene_file_path = recovered_original if recovered_original else target
         self.gpu_materials.clear_entity_slots()
         self._pie_frame_updated = False
         self._int_edit_wid = UInt64(0)
@@ -5165,8 +5244,12 @@ struct FlintStudioState(Movable):
         if self._has_default_showcase_entities():
             upload_default_studio_gpu_assets(self)
         self._reset_physics_world_and_sync()
-        self.mark_dirty(False)
-        self.push_toast("Loaded " + target, 0, 2.5)
+        self.mark_dirty(Bool(recovered_original))
+        if recovered_original:
+            self._autosave_pending = False
+            self.push_toast("Recovered unsaved edits for " + recovered_original, 0, 4.0)
+        else:
+            self.push_toast("Loaded " + target, 0, 2.5)
         return True
 
     @staticmethod
@@ -5314,6 +5397,27 @@ struct FlintStudioState(Movable):
             return self.asset_browser_dir + "/" + clean
         return clean
 
+    def _authored_asset_ref(mut self, relative: String, kind: UInt8) -> AssetRef:
+        var reference = AssetRef.from_path(relative, kind)
+        if reference.is_empty():
+            return reference^
+        var disk = self._resolve_asset_disk_path(reference.rel_path)
+        if file_size(disk) < 0:
+            return reference^
+        var sidecar = disk + ".flmeta"
+        if file_size(sidecar) >= 0:
+            var existing = read_flmeta(sidecar)
+            if existing[0]:
+                reference.uuid = existing[1].uuid
+            else:
+                self.push_toast("Could not read asset identity: " + sidecar, 2, 3.0)
+        else:
+            var meta = load_or_init_flmeta(disk, reference.rel_path, kind)
+            if not write_flmeta(sidecar, meta):
+                self.push_toast("Could not save asset identity: " + sidecar, 2, 3.0)
+            reference.uuid = meta.uuid
+        return reference^
+
     def _project_rel_for_entry(self, entry_rel: String) -> String:
         var norm = normalize_asset_rel_path(entry_rel)
         var clean = norm[1] if norm[0] else entry_rel
@@ -5436,6 +5540,7 @@ struct FlintStudioState(Movable):
             self.push_toast("Import failed: could not write " + clean_rel, 2, 3.5)
             return (False, AssetRef())
         var kind = Self._asset_kind_for_ext(lower_base)
+        var aref = self._authored_asset_ref(clean_rel, kind)
         var srv_opt = self.app.resources.get_ptr_mut[AssetServer]()
         if srv_opt:
             if srv_opt.value()[].loose_root.byte_length() == 0:
@@ -5443,7 +5548,6 @@ struct FlintStudioState(Movable):
             srv_opt.value()[].index_loose_directory()
         self.asset_browser_scanned = False
         _ = self.scan_asset_browser()
-        var aref = AssetRef.from_path(clean_rel, kind)
         self.push_toast("Imported " + clean_rel, 0, 2.5)
         return (True, aref^)
 
@@ -5477,7 +5581,7 @@ struct FlintStudioState(Movable):
             self.push_toast("Invalid .flmat: " + String(err), 2, 3.5)
             return False
         var before_blob = self._capture_world_blob()
-        var mref = AssetRef.from_path(rel_mat, ASSET_KIND_RAW)
+        var mref = self._authored_asset_ref(rel_mat, ASSET_KIND_RAW)
         var mr_opt = self.app.world.get_ptr_mut[MeshRendererComponent](e)
         if mr_opt:
             mr_opt.value()[].material_ref = mref.copy()
@@ -5558,7 +5662,7 @@ struct FlintStudioState(Movable):
                     up_mesh_id = up.mesh_entries[0].mesh_id
                 if len(up.material_ids) > 0:
                     up_mat_id = up.material_ids[0]
-            var mref = AssetRef.from_path(rel_path, ASSET_KIND_MESH)
+            var mref = self._authored_asset_ref(rel_path, ASSET_KIND_MESH)
             var before_blob = self._capture_world_blob()
             var prev_ids = self.selected_entity_ids.copy()
             var prev_primary = self.selected_entity_id
@@ -5595,7 +5699,7 @@ struct FlintStudioState(Movable):
                 if rel_path.byte_length() > 4:
                     var cand_rig = String(rel_path[byte=0 : rel_path.byte_length() - 4]) + ".flrig"
                     if file_size(self._resolve_asset_disk_path(cand_rig)) > 0:
-                        sib_rig_ref = AssetRef.from_path(cand_rig, ASSET_KIND_RAW)
+                        sib_rig_ref = self._authored_asset_ref(cand_rig, ASSET_KIND_RAW)
                 _ = self.app.world.insert[SkeletonComponent](
                     e, SkeletonComponent(mid_u64, skel^, True, sib_rig_ref.copy())
                 )
@@ -5641,7 +5745,7 @@ struct FlintStudioState(Movable):
                 return -1
             if len(spawned) == 0:
                 return -1
-            var pf_ref = AssetRef.from_path(rel_path, ASSET_KIND_RAW)
+            var pf_ref = self._authored_asset_ref(rel_path, ASSET_KIND_RAW)
             var aff = List[Int]()
             for si in range(len(spawned)):
                 var se = spawned[si]
@@ -5706,7 +5810,7 @@ struct FlintStudioState(Movable):
             if not img.valid:
                 self.push_toast("Invalid image: " + base_name, 2, 3.0)
                 return -1
-            var tex_ref = AssetRef.from_path(rel_path, ASSET_KIND_TEXTURE)
+            var tex_ref = self._authored_asset_ref(rel_path, ASSET_KIND_TEXTURE)
             if target_entity_id >= 0 and self.is_alive_id(target_entity_id):
                 var te = self.resolve_entity(target_entity_id)
                 var mo_p = self.app.world.get_ptr[MaterialOverrideComponent](te)
@@ -5735,7 +5839,7 @@ struct FlintStudioState(Movable):
             if not audio_ok:
                 self.push_toast("Invalid audio file: " + base_name, 2, 3.0)
                 return -1
-            var aref = AssetRef.from_path(rel_path, ASSET_KIND_AUDIO)
+            var aref = self._authored_asset_ref(rel_path, ASSET_KIND_AUDIO)
             if target_entity_id >= 0 and self.is_alive_id(target_entity_id):
                 var te = self.resolve_entity(target_entity_id)
                 if self.app.world.has[AudioEmitterComponent](te):
@@ -5779,7 +5883,7 @@ struct FlintStudioState(Movable):
                     si.pose.r[ji] = rig_def.joints[ji].rotation
                     si.pose.s[ji] = rig_def.joints[ji].scale
                 _compute_skeleton_topo_order(si)
-                var rref = AssetRef.from_path(rel_path, ASSET_KIND_RAW)
+                var rref = self._authored_asset_ref(rel_path, ASSET_KIND_RAW)
                 var tid = target_entity_id if (target_entity_id >= 0 and self.is_alive_id(target_entity_id)) else self.selected_entity_id
                 if tid >= 0 and self.is_alive_id(tid):
                     var te = self.resolve_entity(tid)
@@ -5832,7 +5936,7 @@ struct FlintStudioState(Movable):
                 if tid >= 0 and self.is_alive_id(tid):
                     var te = self.resolve_entity(tid)
                     var before_blob = self._capture_world_blob()
-                    var gref = AssetRef.from_path(rel_path, ASSET_KIND_RAW)
+                    var gref = self._authored_asset_ref(rel_path, ASSET_KIND_RAW)
                     var ac_p = self.app.world.get_ptr_mut[AnimatorComponent](te)
                     if ac_p:
                         ac_p.value()[].graph_ref = gref.copy()
@@ -7544,6 +7648,7 @@ struct FlintStudioState(Movable):
             rps_cam_opt.value()[unsafe_offset=0].studio_override_mat_ids.clear()
             rps_cam_opt.value()[unsafe_offset=0].entity_smear_scales.clear()
             if self.pie.mode != PIE_STOPPED or not self.viewport_anim_preview:
+                rps_cam_opt.value()[unsafe_offset=0].preview_skeletons.clear()
                 rps_cam_opt.value()[unsafe_offset=0].preview_bone_palettes.clear()
                 rps_cam_opt.value()[unsafe_offset=0].preview_prev_bone_palettes.clear()
 
@@ -7864,6 +7969,8 @@ struct FlintStudioState(Movable):
                                 ibm.values[k] = skin.inverse_bind[j * 16 + k]
                         cur_bones.append(DualQuat.from_mat4(wm.multiply(ibm)))
                         prev_bones.append(DualQuat.from_mat4(pm.multiply(ibm)))
+                    if len(model.skins) > 1:
+                        rps_anim.preview_skeletons[se.to_bits()] = tmp_skel.copy()
                     rps_anim.preview_bone_palettes[se.to_bits()] = cur_bones^
                     rps_anim.preview_prev_bone_palettes[se.to_bits()] = prev_bones^
 
@@ -8984,7 +9091,7 @@ def emit_studio_ui_draw_list(
     if abs(ui_sc - Float32(1.0)) > Float32(1.0e-4):
         scaled_input.last_mouse_x = input.last_mouse_x / ui_sc
         scaled_input.last_mouse_y = input.last_mouse_y / ui_sc
-    studio.ui_ctx.begin_frame(scaled_input, sw, sh, dt)
+    studio.ui_ctx.begin_frame(scaled_input, sw, sh, dt, studio.input_map)
     if studio.ui_ctx.mouse_pressed_l or studio.ui_ctx.mouse_released_l:
         studio.ui_edit_seq += 1
     if studio.input_rebind_active:
@@ -9660,7 +9767,7 @@ def emit_studio_ui_draw_list(
                             var before_blob = studio._capture_world_blob()
                             var mr_m = studio.app.world.get_ptr_mut[MeshRendererComponent](sel_e)
                             if mr_m:
-                                mr_m.value()[].mesh_ref = AssetRef.from_path(rel_glb, ASSET_KIND_MESH)
+                                mr_m.value()[].mesh_ref = studio._authored_asset_ref(rel_glb, ASSET_KIND_MESH)
                                 mr_m.value()[].mesh_id = -1
                             _ = studio.commit_ecs_edit(eid, "Assign MeshRef", before_blob^)
                             cur = studio.entities[eid].copy()
@@ -9695,46 +9802,46 @@ def emit_studio_ui_draw_list(
 
                                 var alb_s = flm.albedo_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_alb_tex", alb_s, insp_w, "albedo_tex (.png/.jpg)"):
-                                    flm.albedo_tex = AssetRef.from_path(alb_s, ASSET_KIND_TEXTURE) if alb_s.byte_length() > 0 else AssetRef()
+                                    flm.albedo_tex = studio._authored_asset_ref(alb_s, ASSET_KIND_TEXTURE) if alb_s.byte_length() > 0 else AssetRef()
                                     flm_dirty = True
                                 var d_alb = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_alb[0]:
                                     var dl = FlintStudioState._ascii_lower(d_alb[2])
                                     if dl.endswith(".png") or dl.endswith(".jpg") or dl.endswith(".jpeg"):
-                                        flm.albedo_tex = AssetRef.from_path(studio._project_rel_for_entry(d_alb[2]), ASSET_KIND_TEXTURE)
+                                        flm.albedo_tex = studio._authored_asset_ref(studio._project_rel_for_entry(d_alb[2]), ASSET_KIND_TEXTURE)
                                         flm_dirty = True
 
                                 var nrm_s = flm.normal_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_nrm_tex", nrm_s, insp_w, "normal_tex (.png/.jpg)"):
-                                    flm.normal_tex = AssetRef.from_path(nrm_s, ASSET_KIND_TEXTURE) if nrm_s.byte_length() > 0 else AssetRef()
+                                    flm.normal_tex = studio._authored_asset_ref(nrm_s, ASSET_KIND_TEXTURE) if nrm_s.byte_length() > 0 else AssetRef()
                                     flm_dirty = True
                                 var d_nrm = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_nrm[0]:
                                     var dl = FlintStudioState._ascii_lower(d_nrm[2])
                                     if dl.endswith(".png") or dl.endswith(".jpg") or dl.endswith(".jpeg"):
-                                        flm.normal_tex = AssetRef.from_path(studio._project_rel_for_entry(d_nrm[2]), ASSET_KIND_TEXTURE)
+                                        flm.normal_tex = studio._authored_asset_ref(studio._project_rel_for_entry(d_nrm[2]), ASSET_KIND_TEXTURE)
                                         flm_dirty = True
 
                                 var orm_s = flm.orm_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_orm_tex", orm_s, insp_w, "orm_tex (.png/.jpg)"):
-                                    flm.orm_tex = AssetRef.from_path(orm_s, ASSET_KIND_TEXTURE) if orm_s.byte_length() > 0 else AssetRef()
+                                    flm.orm_tex = studio._authored_asset_ref(orm_s, ASSET_KIND_TEXTURE) if orm_s.byte_length() > 0 else AssetRef()
                                     flm_dirty = True
                                 var d_orm = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_orm[0]:
                                     var dl = FlintStudioState._ascii_lower(d_orm[2])
                                     if dl.endswith(".png") or dl.endswith(".jpg") or dl.endswith(".jpeg"):
-                                        flm.orm_tex = AssetRef.from_path(studio._project_rel_for_entry(d_orm[2]), ASSET_KIND_TEXTURE)
+                                        flm.orm_tex = studio._authored_asset_ref(studio._project_rel_for_entry(d_orm[2]), ASSET_KIND_TEXTURE)
                                         flm_dirty = True
 
                                 var emi_s = flm.emissive_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_emi_tex", emi_s, insp_w, "emissive_tex (.png/.jpg)"):
-                                    flm.emissive_tex = AssetRef.from_path(emi_s, ASSET_KIND_TEXTURE) if emi_s.byte_length() > 0 else AssetRef()
+                                    flm.emissive_tex = studio._authored_asset_ref(emi_s, ASSET_KIND_TEXTURE) if emi_s.byte_length() > 0 else AssetRef()
                                     flm_dirty = True
                                 var d_emi = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_emi[0]:
                                     var dl = FlintStudioState._ascii_lower(d_emi[2])
                                     if dl.endswith(".png") or dl.endswith(".jpg") or dl.endswith(".jpeg"):
-                                        flm.emissive_tex = AssetRef.from_path(studio._project_rel_for_entry(d_emi[2]), ASSET_KIND_TEXTURE)
+                                        flm.emissive_tex = studio._authored_asset_ref(studio._project_rel_for_entry(d_emi[2]), ASSET_KIND_TEXTURE)
                                         flm_dirty = True
 
                                 if flm_dirty:
@@ -9807,7 +9914,7 @@ def emit_studio_ui_draw_list(
                                             ac_m.value()[].time = Float32(0.0)
                                             studio.preview_anim_time = Float32(0.0)
                                         if a_gref != ac_m.value()[].graph_ref.rel_path:
-                                            ac_m.value()[].graph_ref = AssetRef.from_path(a_gref, ASSET_KIND_RAW)
+                                            ac_m.value()[].graph_ref = studio._authored_asset_ref(a_gref, ASSET_KIND_RAW)
                                             ac_m.value()[].graph_id = 0
                                             ac_m.value()[].bound = False
                                     _ = studio.commit_ecs_edit(eid, "Edit Animator", before_blob^, coalesce_key=anim_ckey)
@@ -9999,12 +10106,12 @@ def emit_studio_ui_draw_list(
                             var before_blob = studio._capture_world_blob()
                             var mr_m = studio.app.world.get_ptr_mut[MeshRendererComponent](sel_e)
                             if mr_m:
-                                mr_m.value()[].mesh_ref = AssetRef.from_path(rel_glb, ASSET_KIND_MESH)
+                                mr_m.value()[].mesh_ref = studio._authored_asset_ref(rel_glb, ASSET_KIND_MESH)
                                 mr_m.value()[].mesh_id = -1
                             else:
                                 _ = studio.app.world.insert[MeshRendererComponent](
                                     sel_e,
-                                    MeshRendererComponent(-1, -1, True, True, AssetRef.from_path(rel_glb, ASSET_KIND_MESH), AssetRef()),
+                                    MeshRendererComponent(-1, -1, True, True, studio._authored_asset_ref(rel_glb, ASSET_KIND_MESH), AssetRef()),
                                 )
                             _ = studio.commit_ecs_edit(eid, "Assign MeshRef", before_blob^)
 
@@ -10292,7 +10399,7 @@ def emit_studio_ui_draw_list(
                                         if bt_m:
                                             bt_m.value()[].enabled = bt_en
                                             bt_m.value()[].tick_interval_sec = bt_iv
-                                            bt_m.value()[].tree_ref = AssetRef.from_path(bt_ref_s, ASSET_KIND_RAW) if bt_ref_s.byte_length() > 0 else AssetRef()
+                                            bt_m.value()[].tree_ref = studio._authored_asset_ref(bt_ref_s, ASSET_KIND_RAW) if bt_ref_s.byte_length() > 0 else AssetRef()
                                             if bt_tree_loaded:
                                                 bt_m.value()[].tree = bt_new_tree.copy()
                                                 bt_m.value()[].state = BtExecutionState()
@@ -10785,6 +10892,7 @@ def emit_studio_ui_draw_list(
                 studio.confirm_modal_open = False
                 studio.confirm_modal_action = 0
                 if act == 1:
+                    discard_snapshot(studio.project_root, studio.scene_file_path)
                     studio.quit_requested = True
                 elif act == 2:
                     _ = studio.new_scene(force=True)

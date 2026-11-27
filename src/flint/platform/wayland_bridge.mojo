@@ -528,6 +528,7 @@ def take_incoming(state: Int) -> Bool:
             elif opcode == OPCODE_DELETE_ID and size >= 12:
                 var dead_id = Int(get32(buffer + offset + 8))
                 var owned_dead = is_owned(state, dead_id)
+                for_game = owned_dead
                 for_library = not owned_dead
                 if not owned_dead:
                     dead_lib_id = dead_id

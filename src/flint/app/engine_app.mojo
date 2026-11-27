@@ -8,6 +8,16 @@ Provides:
   compiler and automatic `JobPool` `MAX_DEPENDENTS = 16` zero-chunk relay node splitting
 - `trait EnginePlugin`, `AppConfig`, and `EngineApp` (`add_plugin`, `insert_resource`,
   `register_component`, `add_system`, `step_one_frame`, `run` supporting headless `max_frames`).
+- `TimeControl` (pause / time scale / single-step honoured by the fixed and update stages) and
+  `RngResource` (deterministic seeded `DetRng`, snapshot-friendly two-word state).
+
+Scheduler safety rules:
+- A system that declares no component reads/writes and no resource reads/writes is treated as
+  `exclusive` (it may touch anything). Pass `parallel=True` to opt such a system into running
+  concurrently with others (only when it really touches no shared state).
+- Resource access is declared with `res_reads` / `res_writes` (lists of `Resource.RESOURCE_ID`) and
+  participates in the conflict check exactly like component bits.
+- Every system runs inside its own profiler zone (named after the system) when the app profiler is on.
 """
 from std.collections import List
 from std.ffi import external_call
@@ -17,7 +27,8 @@ from std.time import monotonic
 from flint.core.crash import install_crash_handler
 from flint.core.ecs import run_parallel_ctx
 from flint.core.jobs import JobPool, MAX_DEPENDENTS, NO_JOB, default_worker_count
-from flint.core.profiler import ProfileTimeline
+from flint.core.profiler import ProfileTimeline, Profiler, ZONE_NONE, profile_ticks
+from flint.core.rng import DetRng
 from flint.ecs.world import (
     World,
     Component,
@@ -71,6 +82,7 @@ struct _ResourceSlot(Copyable, ImplicitlyCopyable, Movable):
     var ptr: Int
     var byte_size: Int
     var has_drop: Bool
+    var is_pod: Bool
     var drop_fn: _ResDropFn
 
     @always_inline
@@ -85,8 +97,10 @@ struct Resources(Movable):
     var slots: List[_ResourceSlot]
     var index_keys: List[UInt64]
     var index_vals: List[Int]
+    var gameplay_load_active: Bool
 
     def __init__(out self):
+        self.gameplay_load_active = False
         self.slots = List[_ResourceSlot]()
         self.index_keys = List[UInt64]()
         self.index_vals = List[Int]()
@@ -143,6 +157,7 @@ struct Resources(Movable):
 
     def insert[R: Resource](mut self, var resource: R):
         comptime has_nontriv_drop = not R.__del__is_trivial
+        comptime is_pod = R.__move_ctor_is_trivial and R.__del__is_trivial
         var dfn: _ResDropFn = _noop_res_drop
         if has_nontriv_drop:
             dfn = _res_drop[R]
@@ -165,10 +180,11 @@ struct Resources(Movable):
             self.slots[idx].ptr = mem
             self.slots[idx].byte_size = bsz
             self.slots[idx].has_drop = has_nontriv_drop
+            self.slots[idx].is_pod = is_pod
             self.slots[idx].drop_fn = dfn
             return
         var new_idx = len(self.slots)
-        self.slots.append(_ResourceSlot(R.RESOURCE_ID, mem, bsz, has_nontriv_drop, dfn))
+        self.slots.append(_ResourceSlot(R.RESOURCE_ID, mem, bsz, has_nontriv_drop, is_pod, dfn))
         self._index_insert(R.RESOURCE_ID, new_idx)
 
     def insert_pod_raw(mut self, res_id: UInt64, byte_size: Int, src_ptr: Int) -> Int:
@@ -188,12 +204,38 @@ struct Resources(Movable):
             self.slots[idx].ptr = mem
             self.slots[idx].byte_size = safe_size
             self.slots[idx].has_drop = False
+            self.slots[idx].is_pod = True
             self.slots[idx].drop_fn = _noop_res_drop
             return mem
         var new_idx = len(self.slots)
-        self.slots.append(_ResourceSlot(res_id, mem, safe_size, False, _noop_res_drop))
+        self.slots.append(_ResourceSlot(res_id, mem, safe_size, False, True, _noop_res_drop))
         self._index_insert(res_id, new_idx)
         return mem
+
+    def checkpoint_pods(self) raises -> Self:
+        var out = Self()
+        for slot in self.slots:
+            if slot.is_pod:
+                if out.insert_pod_raw(slot.resource_id, slot.byte_size, slot.ptr) == 0:
+                    raise Error("could not allocate gameplay resource checkpoint")
+        return out^
+
+    def restore_pods(mut self, mut checkpoint: Self):
+        for i in range(len(self.slots) - 1, -1, -1):
+            var id = self.slots[i].resource_id
+            if self.slots[i].is_pod and checkpoint.find_index(id) < 0:
+                _ = self.remove_by_id(id)
+        for i in range(len(checkpoint.slots)):
+            ref before = checkpoint.slots[i]
+            var idx = self.find_index(before.resource_id)
+            if idx >= 0:
+                ref now = self.slots[idx]
+                if now.byte_size == before.byte_size and now.ptr != 0:
+                    _ = external_call["memcpy", Int](now.ptr, before.ptr, before.byte_size)
+                else:
+                    # Reuse the owned checkpoint allocation even under memory pressure.
+                    swap(now.ptr, before.ptr)
+                    swap(now.byte_size, before.byte_size)
 
     def byte_size_of(self, res_id: UInt64) -> Int:
         var idx = self.find_index(res_id)
@@ -219,7 +261,10 @@ struct Resources(Movable):
         return Pointer[R, MutAnyOrigin](unsafe_from_address=addr)
 
     def remove[R: Resource](mut self) -> Bool:
-        var idx = self.find_index(R.RESOURCE_ID)
+        return self.remove_by_id(R.RESOURCE_ID)
+
+    def remove_by_id(mut self, res_id: UInt64) -> Bool:
+        var idx = self.find_index(res_id)
         if idx < 0:
             return False
         self.slots[idx].drop_value()
@@ -333,6 +378,78 @@ struct WorldTickSyncResource(Resource, Copyable, ImplicitlyCopyable):
         self.has_observed = False
 
 
+struct TimeControl(Resource, Copyable, ImplicitlyCopyable, Movable):
+    """Game-time control honoured by `EngineApp.step_one_frame`.
+
+    - `paused`: `STAGE_FIXED_UPDATE` gets no ticks, `STAGE_UPDATE` systems are skipped unless they
+      were added with `run_when_paused=True` (set `pause_update_stage=False` to keep the whole update
+      stage running), and `FrameTime.delta_seconds` is `0`. `STAGE_FIRST` (window/input),
+      `STAGE_PRE_UPDATE`, `STAGE_POST_UPDATE` and `STAGE_LAST` (render/UI) keep running.
+    - `time_scale`: multiplies the game delta fed to `FixedTime` and `FrameTime` (`0..64`).
+    - `request_step(n)`: while paused, advances exactly one fixed tick per frame for `n` frames.
+    - `real_delta_seconds` / `real_elapsed_seconds`: unscaled wall delta, for UI that must animate
+      while paused."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.app.TimeControl")
+    var paused: Bool
+    var time_scale: Float32
+    var pending_steps: Int
+    var pause_update_stage: Bool
+    var real_delta_seconds: Float32
+    var real_elapsed_seconds: Float64
+    var game_elapsed_seconds: Float64
+    var stepping_this_frame: Bool
+
+    def __init__(out self, paused: Bool = False, time_scale: Float32 = 1.0, pause_update_stage: Bool = True):
+        self.paused = paused
+        self.time_scale = Float32(1.0)
+        self.pending_steps = 0
+        self.pause_update_stage = pause_update_stage
+        self.real_delta_seconds = 0.0
+        self.real_elapsed_seconds = 0.0
+        self.game_elapsed_seconds = 0.0
+        self.stepping_this_frame = False
+        self.set_time_scale(time_scale)
+
+    def set_time_scale(mut self, scale: Float32):
+        if not isfinite(scale):
+            return
+        self.time_scale = min(Float32(64.0), max(Float32(0.0), scale))
+
+    def request_step(mut self, frames: Int = 1):
+        self.pending_steps += max(0, frames)
+
+    @always_inline
+    def update_stage_paused(self) -> Bool:
+        """True when this frame's `STAGE_UPDATE` should skip systems not marked `run_when_paused`."""
+        return self.paused and self.pause_update_stage and not self.stepping_this_frame
+
+
+struct RngResource(Resource, Copyable, ImplicitlyCopyable, Movable):
+    """App-wide deterministic RNG. Snapshot `rng.state_words()` (or `rng.serialize`) with rollback state."""
+    comptime RESOURCE_ID: UInt64 = comp_hash64("flint.app.RngResource")
+    var rng: DetRng
+    var seed: UInt64
+
+    def __init__(out self, seed: UInt64 = 0x5EED5EED5EED5EED):
+        self.seed = seed
+        self.rng = DetRng(seed)
+
+    def reseed(mut self, seed: UInt64):
+        self.seed = seed
+        self.rng = DetRng(seed)
+
+    def fork(mut self, stream: UInt64) -> DetRng:
+        return self.rng.fork(stream)
+
+
+def _res_ids_intersect(a: List[UInt64], b: List[UInt64]) -> Bool:
+    for i in range(len(a)):
+        for j in range(len(b)):
+            if a[i] == b[j]:
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 8-Stage Conflict-DAG Schedule with Automatic MAX_DEPENDENTS=16 Relay Splitting
 # ---------------------------------------------------------------------------
@@ -356,6 +473,10 @@ struct SystemDescriptor(Copyable, Movable):
     var exclusive: Bool
     var user_ctx: Int
     var explicit_after: List[Int]
+    var res_reads: List[UInt64]
+    var res_writes: List[UInt64]
+    var run_when_paused: Bool
+    var profile_zone: Int
 
 
 struct _CompiledNode(Copyable, Movable):
@@ -393,6 +514,12 @@ struct _StageGraph(Movable):
         if a.writes.intersects(b.reads):
             return True
         if a.reads.intersects(b.writes):
+            return True
+        if _res_ids_intersect(a.res_writes, b.res_writes):
+            return True
+        if _res_ids_intersect(a.res_writes, b.res_reads):
+            return True
+        if _res_ids_intersect(a.res_reads, b.res_writes):
             return True
         return False
 
@@ -526,11 +653,18 @@ struct _SysJobCtx(Copyable, ImplicitlyCopyable, Movable):
     var cmds_addr: Int
     var fn_ptr: SystemFn
     var user_ctx: Int
+    var skip: Bool
+    var profiler_addr: Int
+    var profile_zone: Int
 
 
 def _exec_system_job(ctx_addr: Int, _chunk: Int):
     var ctx = Pointer[_SysJobCtx, ImmutAnyOrigin](unsafe_from_address=ctx_addr)[unsafe_offset=0]
+    if ctx.skip:
+        return
     var sfn = ctx.fn_ptr
+    var timed = ctx.profiler_addr != 0 and ctx.profile_zone >= 0
+    var started = profile_ticks() if timed else UInt64(0)
     sfn(
         Pointer[World, MutAnyOrigin](unsafe_from_address=ctx.world_addr),
         Pointer[Resources, MutAnyOrigin](unsafe_from_address=ctx.res_addr),
@@ -538,6 +672,8 @@ def _exec_system_job(ctx_addr: Int, _chunk: Int):
         Pointer[ParallelCommands, MutAnyOrigin](unsafe_from_address=ctx.cmds_addr),
         ctx.user_ctx,
     )
+    if timed:
+        Profiler(ctx.profiler_addr).record(ctx.profile_zone, started, profile_ticks())
 
 
 @fieldwise_init
@@ -577,7 +713,14 @@ struct Schedule(Movable):
         exclusive: Bool = False,
         user_ctx: Int = 0,
         after_system_id: Int = -1,
+        res_reads: List[UInt64] = List[UInt64](),
+        res_writes: List[UInt64] = List[UInt64](),
+        parallel: Bool = False,
+        run_when_paused: Bool = False,
+        profile_zone: Int = ZONE_NONE,
     ) -> Int:
+        """Adds a system. A system declaring no component and no resource access is exclusive
+        unless `parallel=True` explicitly opts it into concurrent execution."""
         if stage < 0 or stage >= NUM_SCHEDULE_STAGES:
             return -1
         var sid = self.next_system_id
@@ -585,8 +728,25 @@ struct Schedule(Movable):
         var after = List[Int]()
         if after_system_id >= 0:
             after.append(after_system_id)
+        var undeclared = (
+            reads.is_empty() and writes.is_empty() and len(res_reads) == 0 and len(res_writes) == 0
+        )
+        var is_exclusive = exclusive or (undeclared and not parallel)
         self.stages[stage].systems.append(
-            SystemDescriptor(sid, name, fn_ptr, reads.copy(), writes.copy(), exclusive, user_ctx, after^)
+            SystemDescriptor(
+                sid,
+                name,
+                fn_ptr,
+                reads.copy(),
+                writes.copy(),
+                is_exclusive,
+                user_ctx,
+                after^,
+                res_reads.copy(),
+                res_writes.copy(),
+                run_when_paused,
+                profile_zone,
+            )
         )
         self.stages[stage].dirty = True
         return sid
@@ -623,7 +783,11 @@ struct Schedule(Movable):
         mut resources: Resources,
         mut pool: JobPool,
         mut commands: ParallelCommands,
+        profiler_addr: Int = 0,
+        paused: Bool = False,
     ):
+        """Runs one stage. `profiler_addr` (a `Profiler.address`, 0 = off) times each system in its
+        zone; `paused=True` skips systems not added with `run_when_paused=True`."""
         if stage < 0 or stage >= NUM_SCHEDULE_STAGES:
             return
         self.stages[stage].compile()
@@ -643,7 +807,17 @@ struct Schedule(Movable):
         for i in range(num_sys):
             ref sd = self.stages[stage].systems[i]
             sys_ctxs.append(
-                _SysJobCtx(world_addr, res_addr, pool_addr, cmds_addr, sd.fn_ptr, sd.user_ctx)
+                _SysJobCtx(
+                    world_addr,
+                    res_addr,
+                    pool_addr,
+                    cmds_addr,
+                    sd.fn_ptr,
+                    sd.user_ctx,
+                    paused and not sd.run_when_paused,
+                    profiler_addr,
+                    sd.profile_zone,
+                )
             )
         var ctx_base = Int(sys_ctxs.unsafe_ptr())
 
@@ -729,6 +903,7 @@ struct AppConfig(Copyable, Movable):
     var enable_profiler: Bool
     var profile_path: String
     var enable_crash_handler: Bool
+    var rng_seed: UInt64
 
     def __init__(
         out self,
@@ -742,6 +917,7 @@ struct AppConfig(Copyable, Movable):
         enable_profiler: Bool = False,
         profile_path: String = "",
         enable_crash_handler: Bool = False,
+        rng_seed: UInt64 = 0x5EED5EED5EED5EED,
     ):
         self.title = title
         self.headless = headless
@@ -757,6 +933,7 @@ struct AppConfig(Copyable, Movable):
         self.enable_profiler = enable_profiler
         self.profile_path = profile_path
         self.enable_crash_handler = enable_crash_handler
+        self.rng_seed = rng_seed
 
 
 trait EnginePlugin:
@@ -782,6 +959,7 @@ struct EngineApp(Movable):
     def __init__(out self, var config: AppConfig = AppConfig()):
         var fixed_hz = config.fixed_hz
         var max_steps = config.max_fixed_steps_per_frame
+        var rng_seed = config.rng_seed
         self.config = config^
         self.world = World()
         self.resources = Resources()
@@ -796,6 +974,8 @@ struct EngineApp(Movable):
         self.resources.insert[FixedTime](FixedTime(fixed_hz, max_steps))
         self.resources.insert[FrameTime](FrameTime())
         self.resources.insert[WorldTickSyncResource](WorldTickSyncResource())
+        self.resources.insert[TimeControl](TimeControl())
+        self.resources.insert[RngResource](RngResource(rng_seed))
 
     def __deinit__(deinit self):
         if self.profiler.active:
@@ -829,10 +1009,60 @@ struct EngineApp(Movable):
         exclusive: Bool = False,
         user_ctx: Int = 0,
         after_system_id: Int = -1,
+        res_reads: List[UInt64] = List[UInt64](),
+        res_writes: List[UInt64] = List[UInt64](),
+        parallel: Bool = False,
+        run_when_paused: Bool = False,
     ) -> Int:
+        """Adds a system (see `Schedule.add_system`); it gets a profiler zone named after it."""
+        var zone = self.profiler.register_zone(name)
         return self.schedule.add_system(
-            stage, name, fn_ptr, reads, writes, exclusive, user_ctx, after_system_id
+            stage,
+            name,
+            fn_ptr,
+            reads,
+            writes,
+            exclusive,
+            user_ctx,
+            after_system_id,
+            res_reads,
+            res_writes,
+            parallel,
+            run_when_paused,
+            zone,
         )
+
+    # ---- Pause / time scale ----
+
+    def pause(mut self):
+        var tc = self.resources.get_ptr_mut[TimeControl]()
+        if tc:
+            tc.value()[unsafe_offset=0].paused = True
+
+    def resume(mut self):
+        var tc = self.resources.get_ptr_mut[TimeControl]()
+        if tc:
+            tc.value()[unsafe_offset=0].paused = False
+            tc.value()[unsafe_offset=0].pending_steps = 0
+
+    def is_paused(self) -> Bool:
+        var tc = self.resources.get_ptr[TimeControl]()
+        return tc.value()[unsafe_offset=0].paused if tc else False
+
+    def set_time_scale(mut self, scale: Float32):
+        var tc = self.resources.get_ptr_mut[TimeControl]()
+        if tc:
+            tc.value()[unsafe_offset=0].set_time_scale(scale)
+
+    def request_step(mut self, frames: Int = 1):
+        """While paused, advance exactly one fixed tick (and run `STAGE_UPDATE`) per frame for `frames` frames."""
+        var tc = self.resources.get_ptr_mut[TimeControl]()
+        if tc:
+            tc.value()[unsafe_offset=0].request_step(frames)
+
+    @always_inline
+    def _profiler_addr(self) -> Int:
+        return self.profiler.handle.address if self.profiler.active else 0
 
     def startup(mut self):
         if self.started:
@@ -845,7 +1075,10 @@ struct EngineApp(Movable):
         if self.config.worker_threads > 0:
             _ = self.pool.start(self.config.worker_threads)
         self.schedule.compile_all()
-        self.schedule.run_stage(STAGE_STARTUP, self.world, self.resources, self.pool, self.commands)
+        var paddr = self._profiler_addr()
+        self.schedule.run_stage(
+            STAGE_STARTUP, self.world, self.resources, self.pool, self.commands, paddr
+        )
         self.world.flush_commands(self.commands)
         self.started = True
 
@@ -863,44 +1096,79 @@ struct EngineApp(Movable):
 
         if self.profiler.active:
             self.profiler.begin_frame()
+        var paddr = self._profiler_addr()
 
         var safe_frame_dt = frame_dt if isfinite(frame_dt) else Float32(0.0)
         var safe_max_dt = self.config.max_frame_dt if isfinite(self.config.max_frame_dt) else Float32(0.1)
         var clamped_dt = max(Float32(0.0), min(safe_max_dt, safe_frame_dt))
+
+        # Game time: scaled by `TimeControl.time_scale`; zero while paused, except a requested
+        # single step, which advances exactly one fixed tick.
+        var game_dt = clamped_dt
+        var update_paused = False
+        var force_one_tick = False
+        var tc_opt = self.resources.get_ptr_mut[TimeControl]()
+        if tc_opt:
+            ref tc = tc_opt.value()[unsafe_offset=0]
+            tc.real_delta_seconds = clamped_dt
+            tc.real_elapsed_seconds += Float64(clamped_dt)
+            tc.stepping_this_frame = False
+            if tc.paused:
+                if tc.pending_steps > 0:
+                    tc.pending_steps -= 1
+                    tc.stepping_this_frame = True
+                    force_one_tick = True
+                game_dt = Float32(0.0)
+            else:
+                game_dt = clamped_dt * tc.time_scale
+            update_paused = tc.update_stage_paused()
+
+        if force_one_tick:
+            var fix_ro = self.resources.get_ptr[FixedTime]()
+            if fix_ro:
+                game_dt = fix_ro.value()[unsafe_offset=0].dt
+        if tc_opt:
+            tc_opt.value()[unsafe_offset=0].game_elapsed_seconds += Float64(game_dt)
+
         var ft_opt = self.resources.get_ptr_mut[FrameTime]()
         if ft_opt:
             var ft_ptr = ft_opt.value()
-            ft_ptr[unsafe_offset=0].delta_seconds = clamped_dt
-            ft_ptr[unsafe_offset=0].elapsed_seconds += Float64(clamped_dt)
+            ft_ptr[unsafe_offset=0].delta_seconds = game_dt
+            ft_ptr[unsafe_offset=0].elapsed_seconds += Float64(game_dt)
             ft_ptr[unsafe_offset=0].frame_index += 1
 
-        self.schedule.run_stage(STAGE_FIRST, self.world, self.resources, self.pool, self.commands)
+        self.schedule.run_stage(STAGE_FIRST, self.world, self.resources, self.pool, self.commands, paddr)
         self.world.flush_commands(self.commands)
         self._observe_tick_sync()
 
-        self.schedule.run_stage(STAGE_PRE_UPDATE, self.world, self.resources, self.pool, self.commands)
+        self.schedule.run_stage(STAGE_PRE_UPDATE, self.world, self.resources, self.pool, self.commands, paddr)
         self.world.flush_commands(self.commands)
         self._observe_tick_sync()
 
         var due_steps = 0
         var fix_opt = self.resources.get_ptr_mut[FixedTime]()
         if fix_opt:
-            due_steps = fix_opt.value()[unsafe_offset=0].advance_frame(clamped_dt)
+            if force_one_tick:
+                due_steps = 1
+            else:
+                due_steps = fix_opt.value()[unsafe_offset=0].advance_frame(game_dt)
 
         for _ in range(due_steps):
             _ = self.world.advance_tick()
-            self.schedule.run_stage(STAGE_FIXED_UPDATE, self.world, self.resources, self.pool, self.commands)
+            self.schedule.run_stage(STAGE_FIXED_UPDATE, self.world, self.resources, self.pool, self.commands, paddr)
             self.world.flush_commands(self.commands)
             self._observe_tick_sync()
             var fp2 = self.resources.get_ptr_mut[FixedTime]()
             if fp2:
                 fp2.value()[unsafe_offset=0].tick_count += 1
 
-        self.schedule.run_stage(STAGE_UPDATE, self.world, self.resources, self.pool, self.commands)
+        self.schedule.run_stage(
+            STAGE_UPDATE, self.world, self.resources, self.pool, self.commands, paddr, update_paused
+        )
         self.world.flush_commands(self.commands)
         self._observe_tick_sync()
 
-        self.schedule.run_stage(STAGE_POST_UPDATE, self.world, self.resources, self.pool, self.commands)
+        self.schedule.run_stage(STAGE_POST_UPDATE, self.world, self.resources, self.pool, self.commands, paddr)
         self.world.flush_commands(self.commands)
 
         var post_update_tick = self.world.current_tick
@@ -908,7 +1176,7 @@ struct EngineApp(Movable):
         if sync_rst:
             sync_rst.value()[unsafe_offset=0].reset()
 
-        self.schedule.run_stage(STAGE_LAST, self.world, self.resources, self.pool, self.commands)
+        self.schedule.run_stage(STAGE_LAST, self.world, self.resources, self.pool, self.commands, paddr)
         self.world.flush_commands(self.commands)
         if self.world.current_tick < post_update_tick:
             self._observe_tick_sync()
@@ -918,6 +1186,8 @@ struct EngineApp(Movable):
             var hook = self.event_swap_hooks[i]
             hook(res_ptr)
 
+        # Removed-component / despawn events stay readable for one frame after they happen.
+        self.world.update_removal_events()
         _ = self.world.advance_tick()
 
         if self.profiler.active:
@@ -927,7 +1197,10 @@ struct EngineApp(Movable):
         if self.shut_down:
             return
         if self.started:
-            self.schedule.run_stage(STAGE_SHUTDOWN, self.world, self.resources, self.pool, self.commands)
+            var paddr = self._profiler_addr()
+            self.schedule.run_stage(
+                STAGE_SHUTDOWN, self.world, self.resources, self.pool, self.commands, paddr
+            )
             self.world.flush_commands(self.commands)
         if self.profiler.active:
             self.profiler.finish()

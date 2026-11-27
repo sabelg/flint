@@ -1,0 +1,37 @@
+{
+  "format": "flint-world-grid",
+  "version": 1,
+  "cell_size": 8,
+  "cells": [
+    {
+      "id": "south",
+      "x": 0,
+      "z": -3,
+      "scene": "bridge_cells/south.flscn"
+    },
+    {
+      "id": "watch",
+      "x": 0,
+      "z": -2,
+      "scene": "bridge_cells/watch.flscn"
+    },
+    {
+      "id": "keystone",
+      "x": 0,
+      "z": -1,
+      "scene": "bridge_cells/keystone.flscn"
+    },
+    {
+      "id": "landing",
+      "x": 0,
+      "z": 0,
+      "scene": "bridge_cells/landing.flscn"
+    },
+    {
+      "id": "north",
+      "x": 0,
+      "z": 1,
+      "scene": "bridge_cells/north.flscn"
+    }
+  ]
+}

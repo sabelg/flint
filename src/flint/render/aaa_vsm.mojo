@@ -22,6 +22,7 @@ from flint.render.spirv import (
     emit,
 )
 from flint.render.aaa_visbuffer import (
+    emit_alpha_cutoff,
     AAA_INSTANCE_WORDS,
     AAA_MAX_BINDLESS,
     AAA_PUSH_WORDS,
@@ -700,7 +701,8 @@ def vsm_alphamask_vertex_shader() -> List[UInt32]:
     var page_cz = s.nclamp(lclip[2], s.float(0.0), s.float(1.0))
     s.write_clip_position(page_cx, page_cy, page_cz, s.float(1.0))
     emit(s.code, OP_STORE, out_uv[1], s.vec2(uv_u, uv_v))
-    emit(s.code, OP_STORE, out_talb[1], t_alb)
+    var flags = s.load_word(b_instances, s.iadd(inst_base, s.uint(39)))
+    emit(s.code, OP_STORE, out_talb[1], s.bit_or(t_alb, s.bit_and(flags, s.uint(0xFFF80000))))
     return s.finish()
 
 
@@ -731,8 +733,9 @@ def vsm_alphamask_fragment_shader() -> List[UInt32]:
     var px_foot = s.fmul(s.fsqrt(s.nmax(s.float(1e-8), s.nmax(gx2, gy2))), s.float(512.0))
     var mip_est = s.nclamp(s.log2(s.nmax(s.float(1.0), px_foot)), s.float(0.0), s.float(6.0))
 
-    var t_alb = s.fresh()
-    emit(s.code, OP_LOAD, s.type_uint, t_alb, in_talb[1])
+    var packed = s.fresh()
+    emit(s.code, OP_LOAD, s.type_uint, packed, in_talb[1])
+    var t_alb = s.bit_and(packed, s.uint(0xFF))
     var alpha_v = s.fvar(s.float(1.0))
     s.begin_if(s.ult(t_alb, s.uint(0xFF)))
     var rgba = s.sample_bindless_grad(
@@ -746,7 +749,7 @@ def vsm_alphamask_fragment_shader() -> List[UInt32]:
     s.store(alpha_v, s.fmul(raw_a, s.fma(mip_est, s.float(0.18), s.float(1.0))))
     s.end_if()
 
-    s.discard_if(s.flt(s.load_f(alpha_v), s.float(0.48)))
+    s.discard_if(s.flt(s.nmin(s.float(1.0), s.load_f(alpha_v)), emit_alpha_cutoff(s, packed)))
     return s.finish()
 
 

@@ -35,6 +35,7 @@ comptime TOGGLE_COL_OVERLAY = 30
 comptime RELOAD_SO = 31
 comptime PACKAGE = 32
 comptime PACKAGE_PROFILES = 33
+comptime RECOVER_AUTOSAVE = 34
 
 
 struct SceneMenu(Movable):
@@ -59,6 +60,7 @@ struct SceneMenu(Movable):
         self.bar.item(SAVE, "Save scene", "Ctrl+S")
         self.bar.item(LOAD, "Load saved scene", "Ctrl+O")
         self.bar.item(NEW_SCENE, "New scene", "Ctrl+N")
+        self.bar.item(RECOVER_AUTOSAVE, "Recover autosave")
         self.bar.add_group("Edit", 48)
         self.bar.item(UNDO, "Undo", "Ctrl+Z")
         self.bar.item(REDO, "Redo", "Ctrl+Shift+Z")

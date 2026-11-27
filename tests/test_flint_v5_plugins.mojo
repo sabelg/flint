@@ -717,6 +717,32 @@ def test_net_plugin_virtual_sim_replication() raises:
     # Client snapshot ACK MUST be received by server replicator
     assert_true(server_app.resources.get_ptr[NetReplicationResource]().value()[unsafe_offset=0].replicator.clients[0].has_acked_seq)
 
+    ref net_clock = server_app.resources.get_ptr_mut[NetConfigResource]().value()[]
+    net_clock.tick_hz = 20
+    for fps in [30, 60, 120]:
+        var before = net_clock.packets_sent
+        var render_dt = Float32(1) / Float32(fps)
+        for frame in range(fps):
+            server_app.world.get_ptr_mut[LocalTransform](srv_e).value()[].translation.x = Float32(frame + 1)
+            server_app.step_one_frame(render_dt)
+            sim.advance_ms(Float64(render_dt) * 1000)
+            client_app.step_one_frame(render_dt)
+        assert_equal(net_clock.packets_sent - before, UInt64(20))
+
+    var irregular_start = net_clock.packets_sent
+    for batch in range(10):
+        for ticks in [1, 2, 0, 3]:
+            var dt_frame = Float32(ticks) / Float32(60)
+            server_app.world.get_ptr_mut[LocalTransform](srv_e).value()[].translation.x += 1
+            server_app.step_one_frame(dt_frame)
+            sim.advance_ms(Float64(dt_frame) * 1000)
+            client_app.step_one_frame(dt_frame)
+    assert_equal(net_clock.packets_sent - irregular_start, UInt64(20))
+    var hitch_start = net_clock.packets_sent
+    server_app.world.get_ptr_mut[LocalTransform](srv_e).value()[].translation.x += 1
+    server_app.step_one_frame(Float32(0.20))
+    assert_equal(net_clock.packets_sent - hitch_start, UInt64(1))
+
     # Server despawn -> DIRTY_DESTROY -> client despawn
     assert_true(server_app.world.despawn(srv_e))
     for _ in range(10):
@@ -2860,6 +2886,12 @@ def test_m4a_asset_plugin_skinned_frame2_and_flrig_hot_reload() raises:
         var mid_a1 = app.world.get_ptr[MeshRendererComponent](e_a).value()[].mesh_id
         var mid_b1 = app.world.get_ptr[MeshRendererComponent](e_b).value()[].mesh_id
         assert_true(mid_a1 >= 0 and mid_b1 >= 0 and mid_a1 != mid_b1)
+        ref renderer = app.resources.get_ptr[ScalableRenderer]().value()[]
+        assert_true(renderer.cpu_meshes[mid_a1].vertex_count() > 3)
+        assert_true(renderer.cpu_meshes[mid_b1].vertex_count() > 3)
+        ref server = app.resources.get_ptr_mut[AssetServer]().value()[]
+        var mesh_handle = server.resolve_mesh(mesh_ref)
+        var mesh_epoch = server.meshes.reload_epoch(mesh_handle)
         assert_equal(app.world.get_ptr[RigComponent](e_rig).value()[].joint_count, 3)
         assert_equal(app.world.get_ptr[SkeletonComponent](e_rig).value()[].skeleton.node_count, 3)
 
@@ -2875,9 +2907,9 @@ def test_m4a_asset_plugin_skinned_frame2_and_flrig_hot_reload() raises:
         rig4.joints.append(FrigJointDef("Neck", 1, Vec3(0.0, 0.4, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
         rig4.joints.append(FrigJointDef("Head", 2, Vec3(0.0, 0.3, 0.0), Quat(), Vec3(1.0, 1.0, 1.0)))
         _ = save_flrig_file(ws + "/rigs/hero.flrig", rig4)
-        # Also hot-reload char.glb -> skinned_entries must re-allocate with distinct skinned mesh_ids
-        var m_char2 = _make_skinned_biped_for_asset_plugin()
-        _ = write_native_glb(ws + "/meshes/char.glb", m_char2)
+        # Replace the cube with a three-vertex, two-joint GLB through the asset watcher.
+        var replacement = _make_rigged_glb_for_plug(1)
+        assert_true(write_bytes(ws + "/meshes/char.glb", replacement))
 
         _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1000.0)
         _ = app.resources.get_ptr_mut[AssetServer]().value()[].tick(1001.0)
@@ -2888,7 +2920,24 @@ def test_m4a_asset_plugin_skinned_frame2_and_flrig_hot_reload() raises:
 
         var mid_a_rel = app.world.get_ptr[MeshRendererComponent](e_a).value()[].mesh_id
         var mid_b_rel = app.world.get_ptr[MeshRendererComponent](e_b).value()[].mesh_id
-        assert_true(mid_a_rel > mid_a1 and mid_b_rel > mid_b1 and mid_a_rel != mid_b_rel)
+        assert_true(server.meshes.reload_epoch(mesh_handle) > mesh_epoch)
+        assert_true(mid_a_rel >= 0 and mid_b_rel >= 0 and mid_a_rel != mid_b_rel)
+        for mid in [mid_a_rel, mid_b_rel]:
+            ref mesh = renderer.cpu_meshes[mid]
+            assert_equal(mesh.vertex_count(), 3)
+            assert_equal(mesh.weights[0], Float32(0.75))
+            assert_equal(mesh.weights[1], Float32(0.25))
+            assert_equal(renderer.cpu_skin_bind_positions[mid][3], Float32(1.0))
+            # The Arm's half-unit rest offset contributes one quarter to vertex zero.
+            assert_true(abs(mesh.positions[1] - Float32(0.125)) < Float32(1.0e-5))
+
+        ref sk_a = app.world.get_ptr_mut[SkeletonComponent](e_a).value()[].skeleton
+        sk_a.pose.t[0].x += Float32(0.75)
+        app.step_one_frame(Float32(1.0 / 60.0))
+        assert_equal(app.world.get_ptr[MeshRendererComponent](e_a).value()[].mesh_id, mid_a_rel)
+        assert_equal(app.world.get_ptr[MeshRendererComponent](e_b).value()[].mesh_id, mid_b_rel)
+        assert_true(abs(renderer.cpu_meshes[mid_a_rel].positions[0] - Float32(0.75)) < Float32(1.0e-5))
+        assert_true(abs(renderer.cpu_meshes[mid_b_rel].positions[0]) < Float32(1.0e-5))
 
         app.shutdown()
     finally:

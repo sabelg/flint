@@ -337,6 +337,8 @@ test_t2_m3_bundle_self_containment_ldd_strings_and_relocation() {
     mkdir -p "${proj}/assets"
     printf '{"isolated":true}\n' > "${proj}/assets/cfg.json"
     cat > "${proj}/src/main.mojo" <<'MOJO'
+from std.ffi import external_call
+from flint.platform.os import env_flag
 from flint.app import AppConfig, EngineApp
 from flint.assets.server import AssetServer
 from flint.core.log import flush_log, start_log
@@ -351,6 +353,8 @@ def main() raises:
         raise Error("failed to read cfg.json from assets.flpk")
     var app = EngineApp(AppConfig(title="iso_proj", headless=True, enable_crash_handler=True))
     app.startup()
+    if env_flag("FLINT_TEST_RELEASE_CRASH"):
+        _ = external_call["raise", Int32](Int32(6))
     app.step_one_frame(Float32(1.0 / 60.0))
     _ = flush_log()
     assets.close()
@@ -360,12 +364,36 @@ MOJO
 
     local stage_dist="${TMPD}/iso_stage_dist"
     local pkg_out pkg_rc=0
-    pkg_out="$(cd "$proj" && bash "${ROOT}/tools/flint.sh" package --out "$stage_dist" 2>&1)" || pkg_rc=$?
+    pkg_out="$(cd "$proj" && bash "${ROOT}/tools/flint.sh" package --out "$stage_dist" --symbols "$TMPD/iso_private_symbols" 2>&1)" || pkg_rc=$?
     if [[ "$pkg_rc" -ne 0 ]]; then
         fail_test "t2_m3_f28_bundle_self_containment_ldd_strings_and_relocation" "flint.sh package failed (rc=$pkg_rc): $pkg_out"
         return
     fi
 
+    local shipped sha private_symbols
+    for shipped in "$stage_dist/bin/iso_proj" "$stage_dist/lib/gameplay.so"; do
+        sha="$(sha256sum -- "$shipped" | cut -d' ' -f1)"
+        private_symbols="$TMPD/iso_private_symbols/$sha.debug"
+        if [[ ! -s "$private_symbols" ]] || [[ "$(readelf -SW "$shipped")" == *".debug_info"* ]] ||
+                [[ "$(readelf -SW "$private_symbols" 2>/dev/null)" != *".debug_line"* ]]; then
+            fail_test "t2_m3_f28_bundle_self_containment_ldd_strings_and_relocation" "split line tables missing or included in shipped module: $shipped"
+            return
+        fi
+    done
+    local pack_digest lock_digest
+    pack_digest="$(sha256sum "$stage_dist/assets.flpk" | cut -d' ' -f1)"
+    lock_digest="$(sha256sum "$stage_dist/engine-pixi.lock" | cut -d' ' -f1)"
+    if [[ -z "$pack_digest" || -z "$lock_digest" ]] ||
+        ! grep -Fxq "assets_pack_sha256=$pack_digest" "$stage_dist/MANIFEST.txt" ||
+        ! grep -Fxq "engine_lock_sha256=$lock_digest" "$stage_dist/MANIFEST.txt" ||
+        ! grep -Eq '^engine_revision=.+' "$stage_dist/MANIFEST.txt" ||
+        ! grep -Eq '^game_revision=.+' "$stage_dist/MANIFEST.txt"; then
+        fail_test "t2_m3_f28_bundle_self_containment_ldd_strings_and_relocation" "package provenance does not match its pack or compiler lock"
+        return
+    fi
+
+    local fault_line
+    fault_line="$(awk '/external_call\["raise"/ { print NR }' "$proj/src/main.mojo")"
     # Relocate to a completely isolated directory and remove project + staging dirs
     local reloc="${TMPD}/isolated_machine/nested/game_bundle"
     mkdir -p "$(dirname "$reloc")"
@@ -445,6 +473,15 @@ MOJO
         return
     fi
 
+    local crash_rc=0 crash_report lines
+    (ulimit -c 0; FLINT_STATE_DIR="$TMPD/iso_crash_state" FLINT_TEST_RELEASE_CRASH=1 "$reloc/run.sh") >"$TMPD/iso_crash.log" 2>&1 || crash_rc=$?
+    crash_report="$(find "$TMPD/iso_crash_state" -name crash.txt -print -quit)"
+    if [[ "$crash_rc" != 134 || -z "$crash_report" ]] ||
+            ! lines="$(python3 "$ROOT/tools/symbolize_release.py" "$crash_report" "$reloc/bin/iso_proj" "$TMPD/iso_private_symbols")" ||
+            ! grep -Eq "main\.mojo:${fault_line}([^0-9]|$)" <<<"$lines"; then
+        fail_test "t2_m3_f28_bundle_self_containment_ldd_strings_and_relocation" "could not resolve packaged SIGABRT to its Mojo call site: ${lines:-no frames}"
+        return
+    fi
     pass_test "t2_m3_f28_bundle_self_containment_ldd_strings_and_relocation"
 }
 
@@ -543,6 +580,32 @@ MOJO
     pass_test "t2_m3_f26_corrupt_flpk_header_and_toc_graceful"
 }
 
+test_t2_m3_scaffold_preserves_existing_game() {
+    local proj="${TMPD}/existing_project" collision="${TMPD}/late_collision"
+    local test_name="t2_m3_scaffold_preserves_existing_game"
+    if ! bash "${ROOT}/tools/flint.sh" new "$proj" >/dev/null; then
+        fail_test "$test_name" "initial scaffold failed"
+        return
+    fi
+    echo "user edit" >> "$proj/src/main.mojo"
+    local before after
+    before="$(cd "$proj" && sha256sum flint.toml pixi.toml .gitignore README.md assets/main.flscn src/main.mojo src/gameplay.mojo tools/run.sh)"
+    if bash "${ROOT}/tools/flint.sh" new "$proj" >/dev/null 2>&1; then
+        fail_test "$test_name" "accepted existing project"
+        return
+    fi
+    after="$(cd "$proj" && sha256sum flint.toml pixi.toml .gitignore README.md assets/main.flscn src/main.mojo src/gameplay.mojo tools/run.sh)"
+    mkdir -p "$collision/tools"
+    echo "existing script" > "$collision/tools/run.sh"
+    if [[ "$after" != "$before" ]] || bash "${ROOT}/tools/flint.sh" new "$collision" >/dev/null 2>&1 ||
+        [[ -e "$collision/flint.toml" || -e "$collision/assets" || "$(cat "$collision/tools/run.sh")" != "existing script" ]]; then
+        fail_test "$test_name" "scaffold changed existing files before reporting a collision"
+        return
+    fi
+    pass_test "$test_name"
+}
+
+test_t2_m3_scaffold_preserves_existing_game
 test_t2_m3_flint_version_mismatch_rejected
 test_t2_m3_missing_entry_scene_graceful_error
 test_t2_m3_mcp_traversal_and_symlink_rejected

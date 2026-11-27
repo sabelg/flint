@@ -476,8 +476,7 @@ struct MaterialAsset(Copyable, Movable):
         out.unlit = (self.domain == MAT_DOMAIN_UNLIT_UI)
         out.two_sided_foliage = (self.domain == MAT_DOMAIN_TWO_SIDED_FOLIAGE) or ((self.flags & MAT_FLAG_DOUBLE_SIDED) != 0)
         var safe_cutoff = self.alpha_cutoff if isfinite(self.alpha_cutoff) else Float32(0.0)
-        if (self.flags & MAT_FLAG_ALPHA_MASKED) != 0 or safe_cutoff > Float32(0.01):
-            out.alpha_cutoff = max(Float32(0.05), safe_cutoff)
+        out.alpha_cutoff = max(Float32(0), min(Float32(1), safe_cutoff))
         return out^
 
 

@@ -3,6 +3,7 @@
 .gemini/
 pixi.lock
 *.egg-info
+__pycache__/
 build/
 saves/
 dist/

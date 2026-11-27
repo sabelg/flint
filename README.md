@@ -123,6 +123,8 @@ loose_assets = true
 
 `studio --build-profiles` opens the native picker. Enter builds the selected profile and Escape closes it. The same profiles are available through `package --list-profiles` and `package --profile NAME`. By default each profile has its own binary cache and output under `build/packages/NAME`. The bundle manifest records the architecture, platform, optimization and profile.
 
+For private Linux crash symbols, build with `bash tools/flint.sh package --out dist/game --symbols ../game-symbols`. Keep the private directory and the matching bundle for each release. The package records the installed executable and gameplay library SHA-256 digests in `MANIFEST.txt`. The private archive indexes separate line tables by those digests. To resolve a saved stack, run `python3 tools/symbolize_release.py crash.txt dist/game/bin/GAME ../game-symbols`. For a gameplay frame, supply `dist/game/lib/gameplay.so` and `--mapped-path PATH` using the staged gameplay path printed under `maps` in the report. The build ID identifies the staged generation after the player exits.
+
 The Windows WSL2 bundle includes `Play-WSL.cmd`. Run it on a Windows machine with a configured WSL2 Linux distribution, GUI support and a working Vulkan driver inside that distribution for 3D games. A matching Linux CPU architecture uses the bundled player. On other architectures the launcher uses Pixi in WSL to compile the bundled sources and caches the executable. Pass `--verify` to Shrike's launcher for a headless mission check. Use `FLINT_WSL_REBUILD=1 bash run-wsl.sh --verify` inside Linux to exercise the source-build path.
 
 ## Repository Layout
@@ -138,6 +140,7 @@ The Windows WSL2 bundle includes `Play-WSL.cmd`. Run it on a Windows machine wit
 | `src/flint/physics/` | Parallel hash-grid `Broadphase`, sleeping `Islands`, GJK/EPA `Convex`, TGS contact `Solver`, XPBD constraints, raycasts |
 | `src/flint/anim/` | TRS `Skeleton`, animation clip sampling & blending, Two-Bone `IK`, procedural `Spring` |
 | `src/flint/devtools/` | `FlintDevOverlays` (`~` Console, `F2` Profiler, `F3` Memory) & `Flint MCP` JSON responder |
+| [Character course](examples/character_course/README.md) | Play or capture full-body locomotion, moving-deck foot placement and ragdoll recovery with `bash tools/flint.sh character-course`. |
 | `examples/minimal_spark/` | Flagship `< 180`-line 3D crystal + 2,048 parallel SIMD depth-sprite + audio + DevTools showcase |
 | `tests/test_flint.mojo` | Pure-Mojo engine verification suite (ECS/LZ4, 1T-vs-7T JobPool determinism, OffsetAllocator, Dual-GPU ISA+SPIR-V codegen, Broadphase + FLIP + MCP) |
 | `tools/` | `flint.sh` unified CLI & `sync_from_deepsong.sh` upstream library harvester |

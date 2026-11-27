@@ -1,0 +1,33 @@
+{
+  "format": "flscn",
+  "version": 2,
+  "name": "Sunspire south",
+  "entities": [
+    {
+      "slot": 0,
+      "parent": -1,
+      "components": {
+        "CellActor": {
+          "id": "lantern",
+          "target": "watch/guide"
+        },
+        "LocalTransform": {
+          "translation": [
+            2.4,
+            3.45,
+            -22
+          ]
+        },
+        "GlobalTransform": {},
+        "PointLightComponent": {
+          "radiance": [
+            5.6,
+            2.0,
+            0.5
+          ],
+          "radius": 4.2
+        }
+      }
+    }
+  ]
+}

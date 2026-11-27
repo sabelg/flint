@@ -496,10 +496,14 @@ struct SdfFont(Copyable, Movable):
         """Keep the font file this atlas was baked from (same bake size and
         weight) so missing characters can be baked on first use, and add the
         dynamic page below the baked atlas."""
+        return self.attach_source_bytes(read_bytes(path), weight)
+
+    def attach_source_bytes(mut self, var data: List[UInt8], weight: Float32 = 0) -> Bool:
+        """Attach OpenType outlines from a loose file or a cooked font chunk."""
         if not self.valid:
             return False
         var font = TrueTypeFont()
-        if not font.load(path):
+        if not font.load_bytes(data^):
             return False
         if weight > 0:
             _ = font.set_variation("wght", weight)

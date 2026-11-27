@@ -1,0 +1,65 @@
+{
+  "format": "flscn",
+  "version": 2,
+  "name": "Sunspire bridge performer",
+  "entities": [
+    {
+      "slot": 0,
+      "parent": -1,
+      "components": {
+        "LocalTransform": {
+          "translation": [
+            0,
+            2.49,
+            -24
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        "GlobalTransform": {},
+        "MeshRendererComponent": {
+          "mesh_id": -1,
+          "mesh_ref": {
+            "rel_path": "performer.glb",
+            "kind": 1
+          }
+        },
+        "SkeletonComponent": {},
+        "AnimatorComponent": {
+          "graph_ref": {
+            "rel_path": "locomotion.flanim",
+            "kind": 0
+          },
+          "enable_foot_plant": true,
+          "foot_plant_legs": [
+            {
+              "hip": 4,
+              "knee": 5,
+              "ankle": 6,
+              "ankle_height": 0.081
+            },
+            {
+              "hip": 10,
+              "knee": 11,
+              "ankle": 12,
+              "ankle_height": 0.081
+            }
+          ],
+          "foot_in_stance": [
+            true,
+            true
+          ]
+        }
+      }
+    }
+  ]
+}

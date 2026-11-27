@@ -7,6 +7,8 @@ from flint.core.math import Vec3
 from flint.core.transform import Quat
 from flint.assets.json import JsonDocument, parse_json
 from flint.assets.jpeg import decode_image_auto
+from flint.assets.image import linear_to_srgb_u8
+from flint.assets.manifest import ClipEvent
 from flint.anim.skinning import compute_cor
 from flint.assets.model import NativeModel, NativeNode, NativeMesh, NativeTexture, NativeSkin, NativeAnimation, NativeChannel
 
@@ -391,13 +393,16 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 for index in range(positions.count):
                     mesh.indices.append(index)
             var material = document.at(materials, document.integer(document.object_get(primitive, "material"), -1))
+            # glTF's implicit material and omitted PBR factors are fully metallic and rough.
+            mesh.roughness = 1
+            mesh.metallic = 1
             if material >= 0:
                 var pbr = document.object_get(material, "pbrMetallicRoughness")
                 var factor = document.object_get(pbr, "baseColorFactor")
                 if document.array_size(factor) == 4:
-                    var red = _float_to_u8(document.number(document.at(factor, 0), 1))
-                    var green = _float_to_u8(document.number(document.at(factor, 1), 1))
-                    var blue = _float_to_u8(document.number(document.at(factor, 2), 1))
+                    var red = linear_to_srgb_u8(_clamp_f32_range(document.number(document.at(factor, 0), 1), 0, 1, 0))
+                    var green = linear_to_srgb_u8(_clamp_f32_range(document.number(document.at(factor, 1), 1), 0, 1, 0))
+                    var blue = linear_to_srgb_u8(_clamp_f32_range(document.number(document.at(factor, 2), 1), 0, 1, 0))
                     var alpha = _float_to_u8(document.number(document.at(factor, 3), 1))
                     mesh.base_color = UInt32(alpha) << 24 | UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue)
                 var base_texture = document.object_get(pbr, "baseColorTexture")
@@ -415,10 +420,11 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 if em_texture != -1:
                     mesh.emissive_texture = document.integer(document.object_get(em_texture, "index"), -1)
                     mesh.emissive_texcoord = document.integer(document.object_get(em_texture, "texCoord"), 0)
-                mesh.roughness = _clamp_f32_range(document.number(document.object_get(pbr, "roughnessFactor"), 0.55), Float32(0.05), Float32(1.0), Float32(0.55))
-                mesh.metallic = _clamp_f32_range(document.number(document.object_get(pbr, "metallicFactor"), 0.0), Float32(0.0), Float32(1.0), Float32(0.0))
+                mesh.roughness = _clamp_f32_range(document.number(document.object_get(pbr, "roughnessFactor"), 1), 0, 1, 1)
+                mesh.metallic = _clamp_f32_range(document.number(document.object_get(pbr, "metallicFactor"), 1), 0, 1, 1)
                 var alpha_mode = document.text(document.object_get(material, "alphaMode"), "OPAQUE")
                 mesh.alpha_mode = 2 if alpha_mode == "BLEND" else (1 if alpha_mode == "MASK" else 0)
+                mesh.alpha_cutoff = _clamp_f32_range(document.number(document.object_get(material, "alphaCutoff"), 0.5), 0, 1, 0.5)
                 mesh.double_sided = document.boolean(document.object_get(material, "doubleSided"), False)
                 var extensions = document.object_get(material, "extensions")
                 var ext_em_strength: Float32 = 1.0
@@ -508,7 +514,18 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
                 node.mesh = first
                 for primitive in range(primitive_counts[mesh_index]):
                     node.mesh_indices.append(first + primitive)
+            if node.mesh >= 0 and model.meshes[node.mesh].morph_count > 0:
+                var width = model.meshes[node.mesh].morph_count
+                var defaults = document.object_get(source, "weights")
+                if defaults < 0:
+                    defaults = document.object_get(document.at(meshes, mesh_index), "weights")
+                if defaults >= 0 and document.array_size(defaults) != width:
+                    return NativeModel()
+                for j in range(width):
+                    node.base_morph_weights.append(_sanitize_json_f32(document.number(document.at(defaults, j), 0)))
+                node.morph_weights = node.base_morph_weights.copy()
             var skin = document.integer(document.object_get(source, "skin"), -1)
+            node.skin = skin
             if skin >= 0 and node.mesh >= 0:
                 for primitive in range(primitive_counts[mesh_index]):
                     model.meshes[node.mesh + primitive].skin = skin
@@ -550,8 +567,8 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             var channel = NativeChannel()
             channel.node = document.integer(document.object_get(target, "node"), -1)
             var path_name = document.text(document.object_get(target, "path"))
-            channel.path = 0 if path_name == "translation" else (1 if path_name == "rotation" else 2)
-            if path_name != "translation" and path_name != "rotation" and path_name != "scale":
+            channel.path = 0 if path_name == "translation" else (1 if path_name == "rotation" else (2 if path_name == "scale" else 3))
+            if path_name != "translation" and path_name != "rotation" and path_name != "scale" and path_name != "weights":
                 continue
             var interp_name = document.text(document.object_get(sampler, "interpolation"), "LINEAR")
             channel.step = interp_name == "STEP"
@@ -565,11 +582,31 @@ def parse_native_glb(file: List[UInt8]) -> NativeModel:
             var output = load_accessor(document, document.integer(document.object_get(sampler, "output"), -1), len(binary))
             if not input.valid or not output.valid:
                 continue
+            if channel.path == 3:
+                if channel.node < 0 or channel.node >= len(model.nodes):
+                    continue
+                var width = len(model.nodes[channel.node].base_morph_weights)
+                var blocks = 3 if channel.interp_mode == 2 else 1
+                if width <= 0 or output.components != 1 or output.count != input.count * blocks * width:
+                    continue
             for index in range(input.count):
                 channel.times.append(input.float_value(binary, index))
                 animation.duration = max(animation.duration, input.float_value(binary, index))
             for index in range(output.count * output.components):
                 channel.values.append(output.float_value(binary, index // output.components, index % output.components))
             animation.channels.append(channel^)
+        var extras = document.object_get(source, "extras")
+        animation.loop = document.boolean(document.object_get(extras, "loop"), True)
+        var speed = Float32(document.number(document.object_get(extras, "speed"), 1))
+        if isfinite(speed) and speed >= 0:
+            animation.ground_speed = speed
+        var events = document.object_get(extras, "events")
+        for ei in range(document.array_size(events)):
+            var event = document.at(events, ei)
+            var kind = document.text(document.object_get(event, "kind"))
+            var time = Float32(document.number(document.object_get(event, "time"), -1))
+            if kind.byte_length() > 0 and isfinite(time) and time >= 0 and time <= animation.duration:
+                var arg = document.text(document.object_get(event, "arg"))
+                animation.events.append(ClipEvent(kind, arg, time))
         model.animations.append(animation^)
     return model^

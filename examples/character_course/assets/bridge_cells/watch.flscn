@@ -1,0 +1,74 @@
+{
+  "format": "flscn",
+  "version": 2,
+  "name": "Sunspire watch",
+  "entities": [
+    {
+      "slot": 0,
+      "parent": -1,
+      "components": {
+        "CellActor": {
+          "id": "lantern",
+          "target": "watch/guide"
+        },
+        "LocalTransform": {
+          "translation": [
+            2.4,
+            3.45,
+            -13
+          ]
+        },
+        "GlobalTransform": {},
+        "PointLightComponent": {
+          "radiance": [
+            5.0,
+            3.1,
+            1.4
+          ],
+          "radius": 4.2
+        }
+      }
+    },
+    {
+      "slot": 1,
+      "parent": -1,
+      "components": {
+        "LocalTransform": {
+          "translation": [
+            1.3,
+            2.49,
+            -8.5
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        "GlobalTransform": {},
+        "MeshRendererComponent": {
+          "mesh_id": -1,
+          "mesh_ref": {
+            "rel_path": "performer.glb",
+            "kind": 1
+          }
+        },
+        "SkeletonComponent": {},
+        "AnimatorComponent": {
+          "clip_name": "Idle",
+          "loop": true
+        },
+        "CellActor": {
+          "id": "guide",
+          "target": "keystone/lantern"
+        }
+      }
+    }
+  ]
+}

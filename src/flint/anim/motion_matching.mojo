@@ -383,7 +383,7 @@ struct MotionDatabase(Copyable, Movable):
             lb += excess * excess
         return lb
 
-    def _raw_frame_cost(self, f: MotionFeature, query: MotionFeature) -> Float32:
+    def raw_cost_terms(self, f: MotionFeature, query: MotionFeature) -> Array[Float32, 6]:
         var d_p200 = (f.traj_pos_200 - query.traj_pos_200).length_squared()
         var d_p400 = (f.traj_pos_400 - query.traj_pos_400).length_squared()
         var d_p800 = (f.traj_pos_800 - query.traj_pos_800).length_squared()
@@ -405,7 +405,11 @@ struct MotionDatabase(Copyable, Movable):
         var stance_cost = Float32(0.0)
         if query.stance_tag >= 0 and f.stance_tag != query.stance_tag:
             stance_cost = self.stance_mismatch_cost
-        return pos_cost + facing_cost + feet_cost + vel_cost + ang_cost + stance_cost
+        return [pos_cost, facing_cost, feet_cost, vel_cost, ang_cost, stance_cost]
+
+    def _raw_frame_cost(self, f: MotionFeature, query: MotionFeature) -> Float32:
+        var terms = self.raw_cost_terms(f, query)
+        return terms[0] + terms[1] + terms[2] + terms[3] + terms[4] + terms[5]
 
     def _eval_chunk_simd8(
         self,
@@ -438,11 +442,7 @@ struct MotionDatabase(Copyable, Movable):
             comptime for lane in range(MM_LANES):
                 var idx = frame0 + lane
                 if idx >= c_start and idx < c_end:
-                    var skip = False
-                    if cur_clip >= 0 and exclude_window > Float32(0.0) and idx != cont_idx:
-                        if self.frames[idx].clip_index == cur_clip and abs(self.frames[idx].time_seconds - cur_time) < exclude_window:
-                            skip = True
-                    if not skip:
+                    if not self.excludes_frame(idx, cur_clip, cur_time, cont_idx, exclude_window):
                         var cost = acc[lane]
                         if query_stance >= 0 and self.frames[idx].feature.stance_tag != query_stance:
                             cost += self.stance_mismatch_cost
@@ -527,6 +527,24 @@ struct MotionDatabase(Copyable, Movable):
                 best_time = self.frames[i].time_seconds
         return (best_clip, best_time, best_cost)
 
+    def continuation_frame(self, cur_clip: Int, cur_time: Float32, exclude_window: Float32) -> Int:
+        var cont_idx = -1
+        if cur_clip >= 0:
+            var nearest_dt = max(Float32(0.05), exclude_window)
+            for i in range(len(self.frames)):
+                if self.frames[i].clip_index == cur_clip:
+                    var dt_abs = abs(self.frames[i].time_seconds - cur_time)
+                    if dt_abs <= nearest_dt:
+                        nearest_dt = dt_abs
+                        cont_idx = i
+        return cont_idx
+
+    def excludes_frame(self, idx: Int, cur_clip: Int, cur_time: Float32, cont_idx: Int, window: Float32) -> Bool:
+        return (
+            cur_clip >= 0 and window > 0 and idx != cont_idx and self.frames[idx].clip_index == cur_clip
+            and abs(self.frames[idx].time_seconds - cur_time) < window
+        )
+
     def query_inertial(
         self,
         query: MotionFeature,
@@ -546,15 +564,7 @@ struct MotionDatabase(Copyable, Movable):
         if n == 0:
             return -1
 
-        var cont_idx = -1
-        if cur_clip >= 0:
-            var nearest_dt = max(Float32(0.05), exclude_window)
-            for i in range(n):
-                if self.frames[i].clip_index == cur_clip:
-                    var dt_abs = abs(self.frames[i].time_seconds - cur_time)
-                    if dt_abs <= nearest_dt:
-                        nearest_dt = dt_abs
-                        cont_idx = i
+        var cont_idx = self.continuation_frame(cur_clip, cur_time, exclude_window)
 
         if self.is_finalized and len(self.chunk_starts) > 0:
             var q_norm = Array[Float32, MM_DIM](fill=0.0)
@@ -590,9 +600,8 @@ struct MotionDatabase(Copyable, Movable):
         var best_idx = -1
         var best_cost = Float32(1.0e30)
         for i in range(n):
-            if cur_clip >= 0 and exclude_window > Float32(0.0) and i != cont_idx:
-                if self.frames[i].clip_index == cur_clip and abs(self.frames[i].time_seconds - cur_time) < exclude_window:
-                    continue
+            if self.excludes_frame(i, cur_clip, cur_time, cont_idx, exclude_window):
+                continue
             var cost = self._raw_frame_cost(self.frames[i].feature, query)
             if i == cont_idx:
                 cost -= continuing_bias

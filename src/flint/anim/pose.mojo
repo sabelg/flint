@@ -16,6 +16,7 @@ Upgrades in Flint v4:
 from std.math import isfinite, sqrt
 from flint.core.detmath import det_sin, det_cos, det_acos
 from flint.core.math import Vec3
+from flint.core.serial import BlobReader, BlobWriter
 from flint.core.transform import Quat, Mat4, trs
 from flint.core.springs import decay_spring, decay_spring_scalar
 from flint.core.ik import solve_two_bone_pole
@@ -134,11 +135,13 @@ def decompose_trs(m: Mat4) -> Tuple[Vec3, Quat, Vec3]:
 
 
 struct Pose(Copyable, Movable):
+    var morphs: Dict[Int, List[Float32]]
     var t: List[Vec3]
     var r: List[Quat]
     var s: List[Vec3]
 
     def __init__(out self, count: Int = 0):
+        self.morphs = Dict[Int, List[Float32]]()
         self.t = List[Vec3](length=count, fill=Vec3())
         self.r = List[Quat](length=count, fill=Quat())
         self.s = List[Vec3](length=count, fill=Vec3(1, 1, 1))
@@ -153,7 +156,10 @@ struct Pose(Copyable, Movable):
     def rest(mut self, model: NativeModel):
         """The model's rest pose (each node's base transform)."""
         self.resize(len(model.nodes))
+        self.morphs.clear()
         for index in range(len(model.nodes)):
+            if len(model.nodes[index].base_morph_weights) > 0:
+                self.morphs[index] = model.nodes[index].base_morph_weights.copy()
             self.t[index] = model.nodes[index].base_translation
             self.r[index] = model.nodes[index].base_rotation
             self.s[index] = model.nodes[index].base_scale
@@ -161,13 +167,20 @@ struct Pose(Copyable, Movable):
     def read(mut self, model: NativeModel):
         """The model's current node transforms."""
         self.resize(len(model.nodes))
+        self.morphs.clear()
         for index in range(len(model.nodes)):
+            if len(model.nodes[index].morph_weights) > 0:
+                self.morphs[index] = model.nodes[index].morph_weights.copy()
             self.t[index] = model.nodes[index].translation
             self.r[index] = model.nodes[index].rotation
             self.s[index] = model.nodes[index].scale
 
     def assign(mut self, other: Pose):
         self.resize(other.count())
+        if len(other.morphs) > 0:
+            self.morphs = other.morphs.copy()
+        else:
+            self.morphs.clear()
         for index in range(other.count()):
             self.t[index] = other.t[index]
             self.r[index] = other.r[index]
@@ -195,6 +208,7 @@ struct SkeletonInstance(Copyable, Movable):
     var pose: Pose
     var world_matrices: List[Mat4]
     var prev_world_matrices: List[Mat4]
+    var prev_morphs: Dict[Int, List[Float32]]
     var has_prev: Bool
     var node_count: Int
     var parents: List[Int]
@@ -206,6 +220,7 @@ struct SkeletonInstance(Copyable, Movable):
     def __init__(out self, count: Int = 0):
         self.pose = Pose(count)
         self.world_matrices = List[Mat4](length=count, fill=Mat4())
+        self.prev_morphs = Dict[Int, List[Float32]]()
         self.prev_world_matrices = List[Mat4](length=count, fill=Mat4())
         self.has_prev = False
         self.node_count = count
@@ -271,6 +286,10 @@ struct SkeletonInstance(Copyable, Movable):
 
     def snapshot_prev_matrices(mut self):
         """Captures current `world_matrices` into `prev_world_matrices` with zero allocations."""
+        if len(self.pose.morphs) > 0:
+            self.prev_morphs = self.pose.morphs.copy()
+        else:
+            self.prev_morphs.clear()
         var n = len(self.world_matrices)
         if len(self.prev_world_matrices) != n:
             self.prev_world_matrices = List[Mat4](length=n, fill=Mat4())
@@ -393,6 +412,9 @@ def write_pose(mut model: NativeModel, pose: Pose):
         model.nodes[index].translation = pose.t[index]
         model.nodes[index].rotation = pose.r[index]
         model.nodes[index].scale = pose.s[index]
+    for pair in pose.morphs.items():
+        if pair.key >= 0 and pair.key < count:
+            model.nodes[pair.key].morph_weights = pair.value.copy()
     model.transforms_revision += 1
 
 
@@ -439,7 +461,10 @@ def sample_pose(model: NativeModel, clip: Int, time_seconds: Float32, mut pose: 
         if not is_step and next != lower and dt_seg > Float32(0):
             amount = max(Float32(0), min(Float32(1), (time - channel.times[lower]) / dt_seg))
 
-        var components = 4 if channel.path == 1 else 3
+        if channel.path == 3:
+            pose.morphs[channel.node] = channel.sample_weights(lower, next, amount, dt_seg)
+            continue
+        var components = channel.components()
         if is_cubic:
             var stride = components * 3
             var v0_at = lower * stride + components
@@ -509,11 +534,25 @@ def lerp3(a: Vec3, b: Vec3, w: Float32) -> Vec3:
     return a + (b - a) * w
 
 
+def _blend_morph_weights(mut base: Pose, other: Pose, index: Int, weight: Float32):
+    if index not in base.morphs or index not in other.morphs:
+        return
+    try:
+        ref dst = base.morphs[index]
+        ref src = other.morphs[index]
+        for j in range(min(len(dst), len(src))):
+            dst[j] += weight * (src[j] - dst[j])
+    except:
+        return
+
+
 def blend_into(mut base: Pose, other: Pose, weight: Float32):
     """Blends base pose toward other by weight, across every node."""
     if not isfinite(weight) or weight <= 0:
         return
     var count = min(base.count(), other.count())
+    for index in other.morphs.keys():
+        _blend_morph_weights(base, other, index, min(Float32(1), weight))
     if weight >= 1:
         for index in range(count):
             base.t[index] = other.t[index]
@@ -539,6 +578,8 @@ def blend_masked(mut base: Pose, other: Pose, mask: List[Float32], weight: Float
         var w = min(Float32(1), mw * weight)
         if not isfinite(w) or w <= 0:
             continue
+        if len(other.morphs) > 0:
+            _blend_morph_weights(base, other, index, w)
         if w >= 1:
             base.t[index] = other.t[index]
             base.r[index] = other.r[index]
@@ -564,6 +605,15 @@ def add_additive(mut base: Pose, layer: Pose, reference: Pose, mask: List[Float3
         var w = mw * weight
         if not isfinite(w) or w <= 0:
             continue
+        if index in layer.morphs and index in reference.morphs and index in base.morphs:
+            try:
+                ref dst = base.morphs[index]
+                ref src = layer.morphs[index]
+                ref rest = reference.morphs[index]
+                for j in range(min(len(dst), min(len(src), len(rest)))):
+                    dst[j] += w * (src[j] - rest[j])
+            except:
+                pass
         var delta = reference.r[index].conjugate().multiply(layer.r[index]).normalized()
         base.r[index] = base.r[index].multiply(identity.slerp(delta, w)).normalized()
         base.t[index] = base.t[index] + (layer.t[index] - reference.t[index]) * w
@@ -638,6 +688,66 @@ struct Inertializer(Copyable, Movable):
         self.rot_vel = List[Float32]()
         self.off_s = List[Vec3]()
         self.vel_s = List[Vec3]()
+
+    def write_history(self, mut writer: BlobWriter):
+        writer.boolean(self.has_pose)
+        writer.boolean(self.is_settled)
+        writer.boolean(self.has_prev_settled)
+        writer.f32(self.last_dt)
+        writer.integer(len(self.out_t))
+        for i in range(len(self.out_t)):
+            writer.vec3(self.out_t[i])
+            writer.quat(self.out_r[i])
+            writer.vec3(self.out_s[i])
+            writer.vec3(self.prev_t[i])
+            writer.quat(self.prev_r[i])
+            writer.vec3(self.prev_s[i])
+            writer.vec3(self.out_vel_t[i])
+            writer.vec3(self.out_vel_r[i])
+            writer.vec3(self.out_vel_s[i])
+            writer.vec3(self.off_t[i])
+            writer.vec3(self.vel_t[i])
+            writer.vec3(self.off_r[i])
+            writer.vec3(self.vel_r[i])
+            writer.vec3(self.rot_axis[i])
+            writer.f32(self.rot_ang[i])
+            writer.f32(self.rot_vel[i])
+            writer.vec3(self.off_s[i])
+            writer.vec3(self.vel_s[i])
+
+    def read_history(mut self, mut reader: BlobReader) raises:
+        var has_pose = reader.boolean()
+        var settled = reader.boolean()
+        var previous_settled = reader.boolean()
+        var dt = reader.f32()
+        var count = reader.integer()
+        # Each joint stores fourteen vectors, two quaternions and two scalars.
+        if reader.failed or count < 0 or count > 65536 or count > (reader.limit() - reader.offset) // 208:
+            raise Error("Invalid inertial pose history length")
+        self.resize(count)
+        self.has_pose = has_pose
+        self.is_settled = settled
+        self.has_prev_settled = previous_settled
+        self.last_dt = dt
+        for i in range(count):
+            self.out_t[i] = reader.vec3()
+            self.out_r[i] = reader.quat()
+            self.out_s[i] = reader.vec3()
+            self.prev_t[i] = reader.vec3()
+            self.prev_r[i] = reader.quat()
+            self.prev_s[i] = reader.vec3()
+            self.out_vel_t[i] = reader.vec3()
+            self.out_vel_r[i] = reader.vec3()
+            self.out_vel_s[i] = reader.vec3()
+            self.off_t[i] = reader.vec3()
+            self.vel_t[i] = reader.vec3()
+            self.off_r[i] = reader.vec3()
+            self.vel_r[i] = reader.vec3()
+            self.rot_axis[i] = reader.vec3()
+            self.rot_ang[i] = reader.f32()
+            self.rot_vel[i] = reader.f32()
+            self.off_s[i] = reader.vec3()
+            self.vel_s[i] = reader.vec3()
 
     def resize(mut self, count: Int):
         if len(self.out_t) == count:

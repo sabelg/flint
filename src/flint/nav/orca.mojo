@@ -335,6 +335,7 @@ def _add_wall_orca_line(
 struct CrowdSimulator(Copyable, Movable):
     """SoA 8-wide SIMD ORCA crowd steering & collision avoidance engine."""
     var count: Int
+    var _first_free: Int
     var padded: Int
     var px: List[Float32]
     var py: List[Float32]
@@ -374,6 +375,7 @@ struct CrowdSimulator(Copyable, Movable):
         max_neighbors: Int = 24,
     ):
         self.count = 0
+        self._first_free = 0
         self.padded = 0
         self.px = List[Float32]()
         self.py = List[Float32]()
@@ -430,9 +432,13 @@ struct CrowdSimulator(Copyable, Movable):
         max_speed: Float32 = 3.5,
         goal: Vec3 = Vec3(1.0e30, 0.0, 0.0),
     ) -> Int:
-        var idx = self.count
-        self.count += 1
-        self._pad_columns()
+        var idx = self._first_free
+        if idx == self.count:
+            self.count += 1
+            self._pad_columns()
+        self._first_free = idx + 1
+        while self._first_free < self.count and self.active[self._first_free]:
+            self._first_free += 1
         self.px[idx] = pos.x
         self.py[idx] = pos.y
         self.pz[idx] = pos.z
@@ -442,6 +448,8 @@ struct CrowdSimulator(Copyable, Movable):
         self.radius[idx] = max(Float32(0.05), radius)
         self.max_speed[idx] = max(Float32(0.0), max_speed)
         self.active[idx] = True
+        self.pref_vx[idx] = 0
+        self.pref_vz[idx] = 0
         if goal.x < Float32(1.0e29):
             self.goal_x[idx] = goal.x
             self.goal_y[idx] = goal.y
@@ -450,6 +458,17 @@ struct CrowdSimulator(Copyable, Movable):
         else:
             self.has_goal[idx] = False
         return idx
+
+    def remove_agent(mut self, idx: Int):
+        """Release an agent slot while preserving the indices of all surviving agents."""
+        if idx < 0 or idx >= self.count or not self.active[idx]:
+            return
+        self.active[idx] = False
+        self.has_goal[idx] = False
+        while self.count > 0 and not self.active[self.count - 1]:
+            self.count -= 1
+        self._first_free = min(self._first_free, min(idx, self.count))
+        self.padded = ((self.count + LANES - 1) // LANES) * LANES
 
     def set_agent_goal(mut self, idx: Int, goal: Vec3):
         if idx < 0 or idx >= self.count:
@@ -1356,9 +1375,11 @@ struct CrowdNavBridge(Copyable, Movable):
     """Connects `NavMesh` A*/SSFA paths directly to `CrowdSimulator` preferred velocities
     and projects agent elevation `py` onto the walkable navmesh surface each tick."""
     var agents: List[NavCrowdAgent]
+    var _released: List[Int]
 
     def __init__(out self):
         self.agents = List[NavCrowdAgent]()
+        self._released = List[Int]()
 
     def add_agent(
         mut self,
@@ -1378,14 +1399,27 @@ struct CrowdNavBridge(Copyable, Movable):
         ag.path = nav.find_path(pos0, goal)
         ag.waypoint_idx = 1 if len(ag.path.waypoints) > 1 else 0
         ag.repath_needed = not ag.path.found
+        if len(self._released) > 0:
+            var reclaimed = self._released.pop()
+            self.agents[reclaimed] = ag^
+            return reclaimed
         var b_idx = len(self.agents)
         self.agents.append(ag^)
         return b_idx
+
+    def remove_agent(mut self, bridge_idx: Int, mut crowd: CrowdSimulator):
+        if bridge_idx < 0 or bridge_idx >= len(self.agents) or self.agents[bridge_idx].agent_id < 0:
+            return
+        crowd.remove_agent(self.agents[bridge_idx].agent_id)
+        self.agents[bridge_idx] = NavCrowdAgent()
+        self._released.append(bridge_idx)
 
     def set_goal(mut self, bridge_idx: Int, crowd: CrowdSimulator, nav: NavMesh, goal: Vec3):
         if bridge_idx < 0 or bridge_idx >= len(self.agents):
             return
         ref ag = self.agents[bridge_idx]
+        if ag.agent_id < 0:
+            return
         ag.goal = goal
         var pos = crowd.agent_position(ag.agent_id)
         ag.path = nav.find_path(pos, goal)
@@ -1401,6 +1435,8 @@ struct CrowdNavBridge(Copyable, Movable):
         if bridge_idx < 0 or bridge_idx >= len(self.agents):
             return True
         ref ag = self.agents[bridge_idx]
+        if ag.agent_id < 0:
+            return True
         var pos = crowd.agent_position(ag.agent_id)
         var dx = ag.goal.x - pos.x
         var dz = ag.goal.z - pos.z

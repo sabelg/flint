@@ -19,6 +19,7 @@ word (the breaker sees one stream of codepoints across spans), kerning
 applies only inside a span, and a button is one unbreakable box that
 behaves like a letter.
 """
+from std.collections import Dict
 from std.math import isfinite
 from flint.render.font import SdfFont
 from flint.text.utf8 import decode_utf8, encode_utf8
@@ -31,7 +32,7 @@ from flint.text.bidi import (
     compute_arabic_forms,
 )
 from flint.text.shaper import ShapedGlyph, TextShaper, FontFallbackChain
-from flint.ui.button_glyphs import ACTION_NONE, action_id, glyph_shape, glyph_label, glyph_width
+from flint.ui.button_glyphs import ACTION_NONE, action_id, glyph_shape, glyph_label, glyph_width, SHAPE_KEYCAP
 
 comptime SPAN_TEXT: Int = 0
 comptime SPAN_BUTTON: Int = 1
@@ -61,6 +62,7 @@ struct PlacedRun(Copyable, ImplicitlyCopyable, Movable):
     var color: Int
     var face: Int           # resolved: 0 UI, 1 display
     var action: Int
+    var button_label: String
     var level: Int
     var rtl: Bool
 
@@ -78,6 +80,7 @@ struct PlacedRun(Copyable, ImplicitlyCopyable, Movable):
         action: Int,
         level: Int = 0,
         rtl: Bool = False,
+        button_label: String = "",
     ):
         self.kind = kind
         self.text = text
@@ -89,6 +92,7 @@ struct PlacedRun(Copyable, ImplicitlyCopyable, Movable):
         self.color = color
         self.face = face
         self.action = action
+        self.button_label = button_label
         self.level = level
         self.rtl = rtl
 
@@ -190,7 +194,7 @@ struct RichParser(Movable):
         self.spans.append(RichSpan(SPAN_TEXT, String(unsafe_from_utf8=self.pending), self.color(), self.face(), self.scale(), ACTION_NONE))
         self.pending = List[UInt8]()
 
-    def apply(mut self, tag: List[UInt8]) -> Bool:
+    def apply(mut self, tag: List[UInt8], prompts: Dict[String, String]) -> Bool:
         """Apply one tag's body (between the brackets); False if it is not a tag."""
         if starts_with(tag, "c="):
             var value = hex_value(tail(tag, 2))
@@ -229,16 +233,18 @@ struct RichParser(Movable):
             _ = self.scales.pop()
             return True
         if starts_with(tag, "btn="):
-            var action = action_id(String(unsafe_from_utf8=tail(tag, 4)))
-            if action == ACTION_NONE:
+            var name = String(unsafe_from_utf8=tail(tag, 4))
+            var action = action_id(name)
+            var prompt = prompts.get(name)
+            if action == ACTION_NONE and not prompt:
                 return False
             self.flush()
-            self.spans.append(RichSpan(SPAN_BUTTON, String(), self.color(), self.face(), self.scale(), action))
+            self.spans.append(RichSpan(SPAN_BUTTON, prompt.value() if prompt else String(), self.color(), self.face(), self.scale(), action))
             return True
         return False
 
 
-def parse_rich(text: String) -> List[RichSpan]:
+def parse_rich(text: String, prompts: Dict[String, String] = Dict[String, String]()) -> List[RichSpan]:
     """Spans of a tagged string (see the module notes)."""
     var parser = RichParser()
     var bytes = text.as_bytes()
@@ -255,7 +261,7 @@ def parse_rich(text: String) -> List[RichSpan]:
             index += 2
             continue
         var close = -1
-        for probe in range(index + 1, min(count, index + 24)):
+        for probe in range(index + 1, count):
             if bytes[probe] == 93:  # ']'
                 close = probe
                 break
@@ -268,7 +274,7 @@ def parse_rich(text: String) -> List[RichSpan]:
         var body = List[UInt8]()
         for k in range(index + 1, close):
             body.append(bytes[k])
-        if parser.apply(body):
+        if parser.apply(body, prompts):
             index = close + 1
         else:
             parser.pending.append(byte)
@@ -353,12 +359,12 @@ def layout_rich(
             var h = span_px * BUTTON_HEIGHT
             if not isfinite(h):
                 h = Float32(0.0)
-            var label = glyph_label(span.action, pad, sony, keys)
+            var label = span.text if span.text.byte_length() else glyph_label(span.action, pad, sony, keys)
             var label_px = span_px * BUTTON_LABEL
             if not isfinite(label_px):
                 label_px = Float32(0.0)
             var label_width = run_width_text(ui, label, label_px)
-            var adv = glyph_width(glyph_shape(span.action, pad), label_width, h)
+            var adv = glyph_width(SHAPE_KEYCAP if span.text.byte_length() else glyph_shape(span.action, pad), label_width, h)
             if not isfinite(adv):
                 adv = Float32(0.0)
             codes.append(OBJECT_CODE)
@@ -462,7 +468,7 @@ def layout_rich(
                 var face = span.face if span.face >= 0 else base_face
                 var span_px = _safe_span_px(px, span.scale)
                 if span.kind == SPAN_BUTTON:
-                    layout.runs.append(PlacedRun(SPAN_BUTTON, String(), x, l, baseline, advance[rs], span_px, span.color, face, span.action, br.level, rtl))
+                    layout.runs.append(PlacedRun(SPAN_BUTTON, String(), x, l, baseline, advance[rs], span_px, span.color, face, span.action, br.level, rtl, span.text))
                     x = _safe_add_f32(x, advance[rs])
                     continue
                 var vis_end = re
@@ -505,6 +511,7 @@ struct PlacedShapedRun(Copyable, Movable):
     var color: Int
     var face: Int
     var action: Int
+    var button_label: String
     var level: Int
     var rtl: Bool
 
@@ -522,6 +529,7 @@ struct PlacedShapedRun(Copyable, Movable):
         action: Int,
         level: Int = 0,
         rtl: Bool = False,
+        button_label: String = "",
     ):
         self.kind = kind
         self.glyphs = glyphs^
@@ -533,6 +541,7 @@ struct PlacedShapedRun(Copyable, Movable):
         self.color = color
         self.face = face
         self.action = action
+        self.button_label = button_label
         self.level = level
         self.rtl = rtl
 
@@ -584,12 +593,12 @@ def layout_rich_shaped(
             var h = span_px * BUTTON_HEIGHT
             if not isfinite(h):
                 h = Float32(0.0)
-            var label = glyph_label(span.action, pad, sony, keys)
+            var label = span.text if span.text.byte_length() else glyph_label(span.action, pad, sony, keys)
             var label_px = span_px * BUTTON_LABEL
             if not isfinite(label_px):
                 label_px = Float32(0.0)
             var label_width = run_width_text(ui, label, label_px)
-            var adv = glyph_width(glyph_shape(span.action, pad), label_width, h)
+            var adv = glyph_width(SHAPE_KEYCAP if span.text.byte_length() else glyph_shape(span.action, pad), label_width, h)
             if not isfinite(adv):
                 adv = Float32(0.0)
             codes.append(OBJECT_CODE)
@@ -694,7 +703,7 @@ def layout_rich_shaped(
                 var face = span.face if span.face >= 0 else base_face
                 var span_px = _safe_span_px(px, span.scale)
                 if span.kind == SPAN_BUTTON:
-                    layout.runs.append(PlacedShapedRun(SPAN_BUTTON, List[ShapedGlyph](), x, l, baseline, advance[rs], span_px, span.color, face, span.action, br.level, rtl))
+                    layout.runs.append(PlacedShapedRun(SPAN_BUTTON, List[ShapedGlyph](), x, l, baseline, advance[rs], span_px, span.color, face, span.action, br.level, rtl, span.text))
                     x = _safe_add_f32(x, advance[rs])
                     continue
                 var vis_end = re

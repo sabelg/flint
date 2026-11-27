@@ -308,7 +308,6 @@ from flint.physics.world import (
     BODY_SHAPE_CONVEX_HULL,
     PhysicsWorld,
     WORLD_BLOB_TAG,
-    WORLD_BLOB_VERSION,
 )
 from flint.physics.xpbd import ChainCollider, ParticleChain, ParticleMesh, RigidAttachment, XPBD_CHAIN_TAG, XPBD_MESH_TAG, XPBD_BLOB_VERSION
 from flint.physics.wind import (
@@ -2348,7 +2347,7 @@ def test_r5_partition_b_fixes(tmp_dir: String) raises:
     assert_true(cmp_idx_raised)
 
     var bw_pw_idx = BlobWriter()
-    bw_pw_idx.begin(WORLD_BLOB_TAG, WORLD_BLOB_VERSION)
+    bw_pw_idx.begin(WORLD_BLOB_TAG, 3)  # v3 fixture with an invalid convex-hull index
     bw_pw_idx.f32(Float32(-9.81))
     bw_pw_idx.boolean(False); bw_pw_idx.f32(Float32(0.0)); bw_pw_idx.boolean(False); bw_pw_idx.f32(Float32(1000.0))
     bw_pw_idx.boolean(True); bw_pw_idx.integer(30); bw_pw_idx.f32(Float32(0.0)); bw_pw_idx.integer(0)
@@ -5944,7 +5943,7 @@ def test_r15_partition_ab_fixes(tmp_dir: String) raises:
         '"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":48}],'
         '"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},'
         '{"bufferView":1,"componentType":5126,"count":3,"type":"VEC4"}],'
-        '"materials":[{"pbrMetallicRoughness":{"baseColorFactor":[1e400,-1e400,0.5,1.0]}}],'
+        '"materials":[{"pbrMetallicRoughness":{"baseColorFactor":[1e400,-1e400,0.5,1.0]},"alphaMode":"MASK","alphaCutoff":0.25}],'
         '"meshes":[{"primitives":[{"attributes":{"POSITION":0,"COLOR_0":1},"material":0}]}],'
         '"nodes":[{"mesh":0}]}'
     )
@@ -5974,7 +5973,10 @@ def test_r15_partition_ab_fixes(tmp_dir: String) raises:
     assert_equal(parsed_col.meshes[0].colors[1], UInt8(255))
     assert_equal(parsed_col.meshes[0].colors[2], UInt8(0))
     assert_equal(parsed_col.meshes[0].colors[3], UInt8(127))
-    assert_equal(parsed_col.meshes[0].base_color, UInt32(0xFFFF007F))
+    assert_equal(parsed_col.meshes[0].base_color, UInt32(0xFFFF00BC))
+    assert_equal(parsed_col.meshes[0].metallic, Float32(1))
+    assert_equal(parsed_col.meshes[0].roughness, Float32(1))
+    assert_equal(parsed_col.meshes[0].alpha_cutoff, Float32(0.25))
 
     # 3. mcp_v2 non-finite argument rejection & valid JSON emission
     assert_equal(_fmt_vec3_json(Vec3(nan_f32, pinf_f32, ninf_f32)), "[0.0,0.0,0.0]")

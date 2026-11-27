@@ -27,6 +27,7 @@ struct WindowStateResource(Resource, Movable):
     """Non-`Copyable` RAII `Resource` holding OS window handle and resize/close state."""
     comptime RESOURCE_ID: UInt64 = comp_hash64("flint.app.WindowStateResource")
     var headless: Bool
+    var gpu_surface: Bool
     var width: Int
     var height: Int
     var title: String
@@ -43,8 +44,10 @@ struct WindowStateResource(Resource, Movable):
         width: Int = 1280,
         height: Int = 720,
         title: String = "Flint v5",
+        gpu_surface: Bool = False,
     ):
         self.headless = headless
+        self.gpu_surface = gpu_surface
         self.width = width
         self.height = height
         self.title = title
@@ -87,6 +90,8 @@ def _sys_window_startup(
         return
     var win = WaylandWindow()
     win.window_title = win_res.title
+    if win_res.gpu_surface:
+        win.enable_vulkan_bridge()
     if win.initialize(win_res.width, win_res.height):
         var fb = win.framebuffer_size()
         if fb[0] > 0 and fb[1] > 0:
@@ -163,6 +168,7 @@ def _has_window_system(app: EngineApp, stage: Int, name: StaticString) -> Bool:
 struct WindowPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
     """Registers window lifecycle and `STAGE_FIRST` event polling into `EngineApp`."""
     var headless: Bool
+    var gpu_surface: Bool
     var width: Int
     var height: Int
     var title: String
@@ -173,8 +179,10 @@ struct WindowPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
         width: Int = 1280,
         height: Int = 720,
         title: String = "Flint v5",
+        gpu_surface: Bool = False,
     ):
         self.headless = headless
+        self.gpu_surface = gpu_surface
         self.width = width
         self.height = height
         self.title = title
@@ -183,7 +191,7 @@ struct WindowPlugin(EnginePlugin, Copyable, ImplicitlyCopyable, Movable):
         var eff_headless = self.headless or app.config.headless
         if not app.resources.has[WindowStateResource]():
             app.insert_resource[WindowStateResource](
-                WindowStateResource(eff_headless, self.width, self.height, self.title)
+                WindowStateResource(eff_headless, self.width, self.height, self.title, self.gpu_surface)
             )
         if not app.resources.has[InputStateResource]():
             app.insert_resource[InputStateResource](InputStateResource())

@@ -5,20 +5,34 @@ Provides:
 - `SaveSlotStore`: traversal-safe, durable JSON save-slot persistence on `flint.platform.os`
 - `GameTimer` & `Tween`: NaN/non-positive-`dt` safe one-shot/repeating timers and clamped easings
 - `GameFlow`: `Resource` combining `GameStateMachine`, `SaveSlotStore`, and atomic `Scene` transitions.
+
+Saves default to a per-game folder (`player_save_directory_for(game_id)`), so a game that never
+names a save directory still keeps progress. `save_versioned` / `load_versioned` wrap the payload
+with a format version and timestamp so a later build can migrate old saves, and `save_world` /
+`load_world` store a whole `World` snapshot. Scene transitions given an `AssetServer` read through
+the mounted `.flpk` packs first (where `flint.sh package` puts scenes), then loose files.
 """
 from std.collections import List
 from std.math import floor, isfinite, max, min
 from flint.app.engine_app import Resource
+from flint.assets.json import parse_json
+from flint.assets.json_write import json_quote, json_text
+from flint.assets.server import AssetServer
 from flint.ecs.world import World, comp_hash64
 from flint.platform.os import (
     file_size,
     list_directory,
     make_dirs,
+    player_save_directory_for,
     read_bytes,
     remove_file,
+    unix_time_sec,
     write_file_durable,
 )
 from flint.scene.scene import ComponentRegistry, Scene
+
+comptime SAVE_ENVELOPE_FORMAT: Int = 1
+"""Version of the `save_versioned` wrapper itself (not the game's payload version)."""
 
 comptime TWEEN_LINEAR: Int = 0
 comptime TWEEN_EASE_IN: Int = 1
@@ -149,6 +163,75 @@ struct SaveSlotStore(Copyable, Movable):
             return ""
         return String(unsafe_from_utf8=raw)
 
+    def save_versioned(self, slot_name: String, payload: String, version: Int, label: String = "") -> Bool:
+        """Writes `{"flint_save":1,"version":N,"saved_unix":T,"label":...,"payload":...}`. A payload that
+        is valid JSON is embedded as JSON; anything else is stored as a JSON string."""
+        var body = String(payload.strip())
+        var raw = List[UInt8](capacity=body.byte_length())
+        for b in body.as_bytes():
+            raw.append(b)
+        var embedded = json_quote(payload)
+        if body.byte_length() > 0:
+            var doc = parse_json(raw)
+            if doc.valid and doc.root >= 0:
+                embedded = json_text(doc, doc.root)
+        var env = (
+            '{"flint_save":' + String(SAVE_ENVELOPE_FORMAT)
+            + ',"version":' + String(version)
+            + ',"saved_unix":' + String(unix_time_sec())
+            + ',"label":' + json_quote(label)
+            + ',"payload":' + embedded + "}"
+        )
+        return self.save_slot(slot_name, env)
+
+    def load_versioned(self, slot_name: String) -> SavedSlot:
+        """Reads a slot written by `save_versioned`. A plain slot written by `save_slot` (no envelope)
+        comes back with `version = 0` and the whole file as payload, so older saves still load."""
+        var out = SavedSlot()
+        var text = self.load_slot(slot_name)
+        if text.byte_length() == 0:
+            return out^
+        out.found = True
+        out.payload = text
+        var raw = List[UInt8](capacity=text.byte_length())
+        for b in text.as_bytes():
+            raw.append(b)
+        var doc = parse_json(raw)
+        if not doc.valid or doc.root < 0 or doc.object_get(doc.root, "flint_save") < 0:
+            return out^
+        out.version = doc.integer(doc.object_get(doc.root, "version"), 0)
+        out.saved_unix = doc.integer(doc.object_get(doc.root, "saved_unix"), 0)
+        out.label = doc.text(doc.object_get(doc.root, "label"), "")
+        var pn = doc.object_get(doc.root, "payload")
+        if pn >= 0:
+            out.payload = doc.text(pn, "") if doc.nodes[pn].kind == 3 else json_text(doc, pn)
+        return out^
+
+    def save_world(self, slot_name: String, world: World) -> Bool:
+        """Stores a full `World` snapshot as `<slot>.world` next to the JSON slots."""
+        var p = self._slot_path(slot_name)
+        if p.byte_length() == 0 or not make_dirs(self.base_dir):
+            return False
+        try:
+            var blob = world.snapshot_blob()
+            return write_file_durable(self.base_dir + "/" + slot_name + ".world", blob)
+        except:
+            return False
+
+    def load_world(self, slot_name: String, mut world: World) -> Bool:
+        var p = self._slot_path(slot_name)
+        if p.byte_length() == 0:
+            return False
+        var wp = self.base_dir + "/" + slot_name + ".world"
+        if file_size(wp) <= 0:
+            return False
+        var blob = read_bytes(wp)
+        try:
+            world.restore_blob(Span(blob))
+            return True
+        except:
+            return False
+
     def list_slots(self) -> List[String]:
         var out = List[String]()
         if self.base_dir.byte_length() == 0:
@@ -175,6 +258,22 @@ struct SaveSlotStore(Copyable, Movable):
         if p.byte_length() == 0 or file_size(p) < 0:
             return False
         return remove_file(p)
+
+
+struct SavedSlot(Copyable, Movable):
+    """Result of `SaveSlotStore.load_versioned`."""
+    var found: Bool
+    var version: Int
+    var saved_unix: Int
+    var label: String
+    var payload: String
+
+    def __init__(out self):
+        self.found = False
+        self.version = 0
+        self.saved_unix = 0
+        self.label = String("")
+        self.payload = String("")
 
 
 struct GameTimer(Copyable, ImplicitlyCopyable, Movable):
@@ -311,9 +410,12 @@ struct GameFlow(Resource, Copyable, Movable):
     var saves: SaveSlotStore
     var current_scene: String
 
-    def __init__(out self, save_dir: String = "", initial_state: String = ""):
+    def __init__(out self, save_dir: String = "", initial_state: String = "", game_id: String = ""):
+        """`save_dir` empty means the per-game player folder for `game_id` (or `default`), so saves
+        always land somewhere real instead of silently failing."""
         self.fsm = GameStateMachine(initial_state)
-        self.saves = SaveSlotStore(save_dir)
+        var dir = save_dir if save_dir.byte_length() > 0 else player_save_directory_for(game_id)
+        self.saves = SaveSlotStore(dir)
         self.current_scene = ""
 
     def __init__(out self, *, copy: Self):
@@ -332,6 +434,33 @@ struct GameFlow(Resource, Copyable, Movable):
                 _ = sc.load_flscnb_file(scene_path, world, reg, clear_existing=True)
             else:
                 _ = sc.load_flscn_file(scene_path, world, reg, clear_existing=True)
+            self.current_scene = scene_path
+            return True
+        except:
+            return False
+
+    def transition_to_scene(
+        mut self, mut world: World, reg: ComponentRegistry, mut assets: AssetServer, scene_path: String
+    ) -> Bool:
+        """Loads `scene_path` through `assets`: mounted `.flpk` packs first, then loose files. This is
+        the path a packaged build needs, because `flint.sh package` moves scenes into the pack."""
+        if scene_path.byte_length() == 0:
+            return False
+        var data = List[UInt8]()
+        var h = assets.load_raw(scene_path)
+        var rp = assets.raws.get_ptr(h)
+        if rp and len(rp.value()[unsafe_offset=0].bytes) > 0:
+            data = rp.value()[unsafe_offset=0].bytes.copy()
+        elif file_size(scene_path) > 0:
+            data = read_bytes(scene_path)
+        if len(data) == 0:
+            return False
+        var sc = Scene(scene_path)
+        try:
+            if _ends_with_ascii(scene_path, ".flscnb") or (len(data) > 0 and data[0] != 123 and data[0] != 32 and data[0] != 10):
+                _ = sc.load_flscnb_bytes(world, reg, data, clear_existing=True)
+            else:
+                _ = sc.load_flscn_bytes(world, reg, data, clear_existing=True)
             self.current_scene = scene_path
             return True
         except:

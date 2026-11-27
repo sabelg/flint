@@ -29,6 +29,8 @@ from flint.app.engine_app import Resource
 from flint.ecs.world import comp_hash64
 from flint.platform.wayland import WaylandWindow
 from flint.render.aaa_clustered_lights import AaaClusterLight
+from flint.render.aaa_gpu_particles import AaaParticleEmitter
+from flint.render.cpu_particles import CpuParticles
 from flint.render.aaa_renderer import (
     AaaSkinnedMeshEntry,
     AaaUploadedModel,
@@ -696,6 +698,7 @@ struct RenderWorld(Resource, Copyable, Movable):
     var vat_instances: List[VatCrowdInstancePacket]
     var terrain_clipmap: TerrainClipmapPacket
     var cluster_lights: List[AaaClusterLight]
+    var particle_emitters: List[AaaParticleEmitter]
     var decals: List[GpuDecalVolume]
     var debug_lines: DebugLineBatch
     var overlay_lines: DebugLineBatch
@@ -711,6 +714,7 @@ struct RenderWorld(Resource, Copyable, Movable):
         self.vat_instances = List[VatCrowdInstancePacket]()
         self.terrain_clipmap = TerrainClipmapPacket()
         self.cluster_lights = List[AaaClusterLight]()
+        self.particle_emitters = List[AaaParticleEmitter]()
         self.decals = List[GpuDecalVolume]()
         self.debug_lines = DebugLineBatch()
         self.overlay_lines = DebugLineBatch()
@@ -726,6 +730,7 @@ struct RenderWorld(Resource, Copyable, Movable):
         self.instances.clear()
         self.vat_instances.clear()
         self.cluster_lights.clear()
+        self.particle_emitters.clear()
         self.decals.clear()
         self.debug_lines.clear()
         if clear_overlay:
@@ -963,7 +968,8 @@ def material_asset_from_native_mesh(m: NativeMesh) -> MaterialAsset:
     if m.sheen_color.x + m.sheen_color.y + m.sheen_color.z > Float32(0.001):
         ma.flags |= MAT_FLAG_SHEEN
     if m.alpha_mode == 1:
-        ma.alpha_cutoff = Float32(0.48)
+        ma.opacity = Float32((bc >> 24) & 255) / 255
+        ma.alpha_cutoff = m.alpha_cutoff
         ma.flags |= MAT_FLAG_ALPHA_MASKED
     if m.double_sided:
         ma.flags |= MAT_FLAG_DOUBLE_SIDED
@@ -980,8 +986,10 @@ struct ScalableRenderer(Resource, Movable):
     var height: Int
     var surface: SwapchainSurface
     var cpu_canvas: SimdCanvas
+    var cpu_particles: CpuParticles
     var cpu_meshes: List[NativeMesh]
     var cpu_mesh_materials: List[Int]
+    var free_cpu_skin_mesh_ids: List[Int]
     var cpu_skin_bind_positions: Dict[Int, List[Float32]]
     var cpu_vat_clips: List[BakedVatCrowdClip]
     var cpu_vat_meshes: List[NativeMesh]
@@ -1013,8 +1021,10 @@ struct ScalableRenderer(Resource, Movable):
         self.surface = SwapchainSurface()
         _ = self.surface.initialize_headless(self.width, self.height)
         self.cpu_canvas = SimdCanvas(self.width, self.height)
+        self.cpu_particles = CpuParticles()
         self.cpu_meshes = List[NativeMesh]()
         self.cpu_mesh_materials = List[Int]()
+        self.free_cpu_skin_mesh_ids = List[Int]()
         self.cpu_skin_bind_positions = Dict[Int, List[Float32]]()
         self.cpu_vat_clips = List[BakedVatCrowdClip]()
         self.cpu_vat_meshes = List[NativeMesh]()
@@ -1446,7 +1456,13 @@ struct ScalableRenderer(Resource, Movable):
                 self.cpu_skin_bind_positions[mid] = mesh.positions.copy()
             return sk^
 
-        var mid = self.register_mesh(mesh, mat_id, build_lods=False)
+        var mid: Int
+        if len(self.free_cpu_skin_mesh_ids) > 0:
+            mid = self.free_cpu_skin_mesh_ids.pop()
+            self.cpu_meshes[mid] = mesh.copy()
+            self.cpu_mesh_materials[mid] = mat_id
+        else:
+            mid = self.register_mesh(mesh, mat_id, build_lods=False)
         self.cpu_skin_bind_positions[mid] = mesh.positions.copy()
         var entry = CookedMeshEntry()
         entry.mesh_id = mid
@@ -1461,15 +1477,31 @@ struct ScalableRenderer(Resource, Movable):
         sk_entry.bone_count = bone_count
         return sk_entry^
 
+    def remove_skinned_mesh(mut self, entry: AaaSkinnedMeshEntry):
+        var mid = entry.mesh_entry.mesh_id
+        if mid < 0 or mid not in self.cpu_skin_bind_positions:
+            return
+        if self.uses_vulkan():
+            _ = self.gpu_slot[0].remove_skinned_mesh(entry)
+        else:
+            self.free_cpu_skin_mesh_ids.append(mid)
+        _ = self.cpu_skin_bind_positions.pop(mid, List[Float32]())
+        self.cpu_meshes[mid] = NativeMesh()
+        self.cpu_mesh_materials[mid] = -1
+
     def update_skinned_mesh_bones(
         mut self,
         skin_entry: AaaSkinnedMeshEntry,
         cur_bones: List[DualQuat],
         prev_bones: List[DualQuat],
         defer_to_frame: Bool = True,
+        morph_weights: List[Float32] = List[Float32](),
+        prev_morph_weights: List[Float32] = List[Float32](),
     ):
         """Updates DualQuat bone palettes on GPU (Tier 1/2) and CPU (Tier 0)."""
         if self.uses_vulkan():
+            if len(morph_weights) > 0:
+                self.gpu_slot[0].update_skinned_mesh_morphs(skin_entry, morph_weights, prev_morph_weights)
             _ = self.gpu_slot[0].update_skinned_mesh_bones(
                 skin_entry, cur_bones, prev_bones, invalidate_vsm=False, defer_to_frame=defer_to_frame
             )
@@ -1488,6 +1520,10 @@ struct ScalableRenderer(Resource, Movable):
         var nb = len(cur_bones)
         for vi in range(vc):
             var p = Vec3(bind_pos[vi * 3], bind_pos[vi * 3 + 1], bind_pos[vi * 3 + 2])
+            var targets = min(len(morph_weights), min(m.morph_count, len(m.morph_positions) // (vc * 3)))
+            for j in range(targets):
+                var offset = (j * vc + vi) * 3
+                p = p + Vec3(m.morph_positions[offset], m.morph_positions[offset+1], m.morph_positions[offset+2]) * morph_weights[j]
             var out_p = Vec3()
             var w_sum = Float32(0.0)
             for k in range(4):
@@ -1675,6 +1711,9 @@ struct ScalableRenderer(Resource, Movable):
                     self.cpu_canvas.draw_tri_3d_lit(cam, p00, p01, p11, col, world.sun_dir)
                     self.cpu_canvas.draw_tri_3d_lit(cam, p00, p11, p10, col, world.sun_dir)
 
+        var particle_light = max(Float32(0.1), world.ibl_intensity*0.4 + max(Float32(0), world.sun_dir.y)*0.6)
+        self.cpu_particles.render(self.cpu_canvas, cam, world.particle_emitters, world.delta_time, particle_light)
+
         var n_dbg = world.debug_lines.segment_count()
         for s_i in range(n_dbg):
             var v0 = world.debug_lines.vertices[s_i * 2]
@@ -1824,6 +1863,9 @@ struct ScalableRenderer(Resource, Movable):
                 vi.uniform_scale,
                 vi.has_prev,
             )
+        gpu.particle_dt_sec = world.delta_time
+        for emitter in world.particle_emitters:
+            gpu.submit_particle_emitter(emitter)
         for l_i in range(len(world.cluster_lights)):
             gpu.add_cluster_light(world.cluster_lights[l_i])
         for d_i in range(len(world.decals)):

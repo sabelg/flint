@@ -157,6 +157,13 @@ def test_layout_arena_and_spirv():
 
     # Verify FlintAaaSkinningArena morph sub-allocation and saturation clamping
     var arena = FlintAaaSkinningArena()
+    _assert(arena.alloc_bone_palette(AAA_MAX_SKIN_BONES - 2) == 0, "reserve first palette")
+    _assert(arena.alloc_bone_palette(3) == -1, "larger palette fails without aliasing live bones")
+    _assert(arena.alloc_bone_palette(2) == (AAA_MAX_SKIN_BONES - 2) * 8, "smaller final palette still fits")
+    _assert(arena.alloc_bone_palette(1, explicit_word_offset=0) == -1, "reject occupied explicit palette")
+    _assert(arena.alloc_vertices(AAA_SKIN_MAX_VERTS - 2)[1] == AAA_SKIN_MAX_VERTS - 2, "reserve first mesh")
+    _assert(arena.alloc_vertices(3)[1] == 0, "oversize vertex reservation leaves tail free")
+    _assert(arena.alloc_vertices(2)[1] == 2, "remaining two vertices still usable")
     var a0 = arena.alloc_morph_targets(4, 1000)
     _assert(a0[0] == 0 and a0[1] == 0 and a0[2] == 4, "First morph allocation starts at (0, 0) with 4 targets")
     var a1 = arena.alloc_morph_targets(3, 500)
