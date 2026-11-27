@@ -5,6 +5,9 @@
   - `ops`: operator kernels (SIMD + JobPool matrix products, 1-D convolution, reductions)
   - `onnx`: `OnnxModel.load(path)`, `set_input`, `run`, `output`
   - `kimodo`, `kimodo_text`, `kimodo_bvh`: text-conditioned SOMA motion generation and export
+  - `trellis2_image`, `trellis2_dino`, `trellis2_flow`, `trellis2`: TRELLIS.2 reference image preparation and encoding, structure sampling and occupancy decoding
+  - `hi3d`: image- and mesh-conditioned Hi3D 512³ geometry refinement on the CPU
+  - `ultratex`: six-view FLUX.2 material generation and projection onto Hi3D meshes
   - `motionbricks`: the MotionBricks motion-inbetweening runtime on top of `OnnxModel`
   - `gemx`: GEM-X monocular video to whole-body SOMA motion (keypoints, pose tokens, Motion transformer, BVH / `NativeAnimation` clips)
   - `rgbmocap`: commercial-safe, backend-agnostic RGBMocap pipeline (multi-person IoU tracking, GEM-X bridge, demo SOMA-77 take generator, BVH & `NativeAnimation` export)

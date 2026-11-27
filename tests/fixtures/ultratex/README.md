@@ -1,0 +1,7 @@
+These synthetic float32 tensors exercise one double-stream and one single-stream FLUX.2 block. They contain randomly initialized weights. The PyTorch oracle used UltraTex revision a726678f3f3631fe2c5e3d1fb4597114784c7a8b, seed 37, Klein9BParams with width 32, two heads, four rotary axes of width four, context width 48 and rank-four adapters. Each targeted layer received independent normal A and B matrices scaled by 0.02. The oracle merged B @ A into each layer before predicting velocity at time 0.625. The inputs include seven text tokens and thirteen image tokens. The raw little-endian .f32 files are row major.
+
+The BF16 variant uses the same synthetic base rounded to BF16. The oracle rounds the rank update and merged weights to BF16, casts the image, text and timestep to BF16 and exports the PyTorch CPU prediction as float32.
+
+The PNGs test the complete two-step sampler with the released VAE and the synthetic float32 denoiser. The normal atlas and reference use procedurally generated gradients and translucent circles. The PyTorch oracle resized the reference with Pillow, pruned and scattered token rows, decoded each tile independently and composited the foreground onto white. Initial noise element i is ((19 * i) % 251 - 125) / 64.
+
+The original FP32 autoencoder fixture uses the same synthetic image, normals, seed tensor, and released foreground decoder as the public BF16 autoencoder fixture. Its expected result was generated with the official FLUX.2 autoencoder at SHA-256 `868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3`.

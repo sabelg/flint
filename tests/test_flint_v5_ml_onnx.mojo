@@ -13,6 +13,8 @@ Verifies:
      its own BVH clip, choosing an allowed token count, with finite poses that start on the context.
 """
 from test_kimodo import test_kimodo
+from test_trellis2 import test_trellis2
+from test_hi3d import test_hi3d
 from std.ffi import external_call
 from std.math import abs, isfinite, isnan, sqrt
 from std.testing import assert_true, assert_equal
@@ -1187,6 +1189,8 @@ def main() raises:
     test_broadcasting()
     test_tiny_ops()
     test_kimodo()
+    test_trellis2()
+    test_hi3d()
     test_motionbricks_math()
     test_motionbricks_soma()
     test_t5_onnx_and_ops_negative()
