@@ -112,18 +112,20 @@ struct ReplicatedEntity(Copyable, ImplicitlyCopyable, Movable):
 
 @fieldwise_init
 struct _QuantizedEntitySnap(Copyable, ImplicitlyCopyable, Movable):
+    # Every client keeps a 32-slot baseline ring of these per entity, so size matters: 32-bit
+    # quantized fields (positions are 16-bit, velocities 12-bit) keep it at 80 bytes.
     var known: Bool
     var chunk_ix: Int32
     var chunk_iy: Int32
     var chunk_iz: Int32
-    var qx: Int
-    var qy: Int
-    var qz: Int
-    var rot: Quat
+    var qx: Int32
+    var qy: Int32
+    var qz: Int32
     var packed_rot: UInt32
-    var vx: Int
-    var vy: Int
-    var vz: Int
+    var rot: Quat
+    var vx: Int32
+    var vy: Int32
+    var vz: Int32
     var state_flags: UInt32
     var spawn_key: UInt64
     var extra_vers: UInt64
@@ -393,7 +395,7 @@ def _quant_pos_axis(v: Float32, chunk_size: Float32) -> Tuple[Int32, Int]:
 
 
 @always_inline
-def _dequant_pos_axis(c: Int32, q: Int, chunk_size: Float32) -> Float32:
+def _dequant_pos_axis(c: Int32, q: Int32, chunk_size: Float32) -> Float32:
     var cs = Float64(chunk_size)
     var origin = Float64(c) * cs
     var local = ((Float64(q) + 0.5) / 65536.0) * cs
@@ -401,15 +403,15 @@ def _dequant_pos_axis(c: Int32, q: Int, chunk_size: Float32) -> Float32:
 
 
 @always_inline
-def _apply_axis_delta(mut chunk: Int32, mut q: Int, delta: Int):
-    var total = q + delta
+def _apply_axis_delta(mut chunk: Int32, mut q: Int32, delta: Int):
+    var total = Int(q) + delta
     while total >= 65536:
         total -= 65536
         chunk += 1
     while total < 0:
         total += 65536
         chunk -= 1
-    q = total
+    q = Int32(total)
 
 
 @always_inline
@@ -515,6 +517,13 @@ struct SnapshotReplicator(Movable):
         self.candidate_ext = List[Bool](length=self.max_entities, fill=False)
         self.ext_enabled = False
         self.server_time_ms = 0.0
+        # Allocated on the first `set_extra` (`_ensure_extras`): most games never use extra slots.
+        self.extra_data = List[List[UInt8]]()
+        self.extra_vers = List[UInt16]()
+
+    def _ensure_extras(mut self):
+        if len(self.extra_vers) > 0:
+            return
         self.extra_data = List[List[UInt8]](capacity=self.max_entities * REPL_EXTRA_SLOTS)
         for _ in range(self.max_entities * REPL_EXTRA_SLOTS):
             self.extra_data.append(List[UInt8]())
@@ -606,9 +615,10 @@ struct SnapshotReplicator(Movable):
             return
         self.entities[entity_id].active = False
         self.quantized_now[entity_id].known = False
-        for slot in range(REPL_EXTRA_SLOTS):
-            self.extra_data[entity_id * REPL_EXTRA_SLOTS + slot].clear()
-            self.extra_vers[entity_id * REPL_EXTRA_SLOTS + slot] = 0
+        if len(self.extra_vers) > 0:
+            for slot in range(REPL_EXTRA_SLOTS):
+                self.extra_data[entity_id * REPL_EXTRA_SLOTS + slot].clear()
+                self.extra_vers[entity_id * REPL_EXTRA_SLOTS + slot] = 0
 
     def set_extra(mut self, entity_id: Int, slot: Int, payload: List[UInt8]) -> Bool:
         """Sets extra POD component payload `slot` (`0..REPL_EXTRA_SLOTS-1`, `<= 255` bytes) of
@@ -619,6 +629,7 @@ struct SnapshotReplicator(Movable):
         if slot < 0 or slot >= REPL_EXTRA_SLOTS or len(payload) > REPL_EXTRA_MAX_BYTES:
             return False
         self.ext_enabled = True
+        self._ensure_extras()
         var idx = entity_id * REPL_EXTRA_SLOTS + slot
         var same = len(self.extra_data[idx]) == len(payload)
         if same:
@@ -711,26 +722,28 @@ struct SnapshotReplicator(Movable):
             var py = _quant_pos_axis(self.entities[i].pos.y, self.chunk_size)
             var pz = _quant_pos_axis(self.entities[i].pos.z, self.chunk_size)
             q.chunk_ix = px[0]
-            q.qx = px[1]
+            q.qx = Int32(px[1])
             q.chunk_iy = py[0]
-            q.qy = py[1]
+            q.qy = Int32(py[1])
             q.chunk_iz = pz[0]
-            q.qz = pz[1]
+            q.qz = Int32(pz[1])
             q.rot = self.entities[i].rot
             q.packed_rot = pack_quat_smallest_three(self.entities[i].rot)
-            q.vx = self._quant_vel(self.entities[i].vel.x)
-            q.vy = self._quant_vel(self.entities[i].vel.y)
-            q.vz = self._quant_vel(self.entities[i].vel.z)
+            q.vx = Int32(self._quant_vel(self.entities[i].vel.x))
+            q.vy = Int32(self._quant_vel(self.entities[i].vel.y))
+            q.vz = Int32(self._quant_vel(self.entities[i].vel.z))
             q.state_flags = self.entities[i].state_flags
-            q.spawn_key = make_spawn_key(
-                self.entities[i].prefab_id,
-                self.entities[i].owner_peer_id,
-                self.entities[i].authority,
-            )
-            var ev = UInt64(0)
-            for slot in range(REPL_EXTRA_SLOTS):
-                ev |= UInt64(self.extra_vers[i * REPL_EXTRA_SLOTS + slot]) << UInt64(16 * slot)
-            q.extra_vers = ev
+            if self.ext_enabled:  # legacy stream: the extension fields stay 0 and are never sent
+                q.spawn_key = make_spawn_key(
+                    self.entities[i].prefab_id,
+                    self.entities[i].owner_peer_id,
+                    self.entities[i].authority,
+                )
+                if len(self.extra_vers) > 0:
+                    var ev = UInt64(0)
+                    for slot in range(REPL_EXTRA_SLOTS):
+                        ev |= UInt64(self.extra_vers[i * REPL_EXTRA_SLOTS + slot]) << UInt64(16 * slot)
+                    q.extra_vers = ev
             self.quantized_now[i] = q
         self.grid.rebuild(self.entities)
 
@@ -920,15 +933,15 @@ struct SnapshotReplicator(Movable):
             if (mask & DIRTY_POS) != 0:
                 var dx = (
                     (Int(cur_q.chunk_ix) - Int(base_q.chunk_ix)) * 65536
-                    + (cur_q.qx - base_q.qx)
+                    + (Int(cur_q.qx) - Int(base_q.qx))
                 )
                 var dy = (
                     (Int(cur_q.chunk_iy) - Int(base_q.chunk_iy)) * 65536
-                    + (cur_q.qy - base_q.qy)
+                    + (Int(cur_q.qy) - Int(base_q.qy))
                 )
                 var dz = (
                     (Int(cur_q.chunk_iz) - Int(base_q.chunk_iz)) * 65536
-                    + (cur_q.qz - base_q.qz)
+                    + (Int(cur_q.qz) - Int(base_q.qz))
                 )
                 var use_small_delta = (
                     base_q.known
@@ -971,17 +984,17 @@ struct SnapshotReplicator(Movable):
                         self.writer.write_u32(
                             UInt32(Int(cur_q.chunk_iz) & 0xFFFFFFFF)
                         )
-                    self.writer.write_bits(UInt64(cur_q.qx), 16)
-                    self.writer.write_bits(UInt64(cur_q.qy), 16)
-                    self.writer.write_bits(UInt64(cur_q.qz), 16)
+                    self.writer.write_bits(UInt64(Int(cur_q.qx)), 16)
+                    self.writer.write_bits(UInt64(Int(cur_q.qy)), 16)
+                    self.writer.write_bits(UInt64(Int(cur_q.qz)), 16)
 
             if (mask & DIRTY_ROT) != 0:
                 self.writer.write_u32(cur_q.packed_rot)
 
             if (mask & DIRTY_VEL) != 0:
-                self.writer.write_bits(UInt64(cur_q.vx), 12)
-                self.writer.write_bits(UInt64(cur_q.vy), 12)
-                self.writer.write_bits(UInt64(cur_q.vz), 12)
+                self.writer.write_bits(UInt64(Int(cur_q.vx)), 12)
+                self.writer.write_bits(UInt64(Int(cur_q.vy)), 12)
+                self.writer.write_bits(UInt64(Int(cur_q.vz)), 12)
 
             if (mask & DIRTY_STATE) != 0:
                 self.writer.write_u32(cur_q.state_flags)
@@ -1137,9 +1150,7 @@ struct SnapshotClientReceiver(Movable):
         self.decoded_packets = 0
         self.has_server_time = False
         self.last_server_time_ms = 0
-        self.extra_data = List[List[UInt8]](capacity=self.max_entities * REPL_EXTRA_SLOTS)
-        for _ in range(self.max_entities * REPL_EXTRA_SLOTS):
-            self.extra_data.append(List[UInt8]())
+        self.extra_data = List[List[UInt8]]()  # allocated when the first extra payload arrives
         self._extra_updates = List[Int]()
         self._spawn_updates = List[Int]()
         self._stage_extra_idx = List[Int]()
@@ -1149,6 +1160,8 @@ struct SnapshotClientReceiver(Movable):
     def extra_payload(self, entity_id: Int, slot: Int) -> List[UInt8]:
         """Latest replicated extra POD payload bytes for `(entity_id, slot)` (empty if none)."""
         if entity_id < 0 or entity_id >= self.max_entities or slot < 0 or slot >= REPL_EXTRA_SLOTS:
+            return List[UInt8]()
+        if len(self.extra_data) == 0:
             return List[UInt8]()
         return self.extra_data[entity_id * REPL_EXTRA_SLOTS + slot].copy()
 
@@ -1241,24 +1254,25 @@ struct SnapshotClientReceiver(Movable):
                         q.chunk_ix = _u32_to_i32(r.read_u32())
                         q.chunk_iy = _u32_to_i32(r.read_u32())
                         q.chunk_iz = _u32_to_i32(r.read_u32())
-                    q.qx = Int(r.read_bits(16))
-                    q.qy = Int(r.read_bits(16))
-                    q.qz = Int(r.read_bits(16))
+                    q.qx = Int32(r.read_bits(16))
+                    q.qy = Int32(r.read_bits(16))
+                    q.qz = Int32(r.read_bits(16))
 
             if (mask & DIRTY_ROT) != 0:
                 q.rot = r.read_quat_smallest_three()
 
             if (mask & DIRTY_VEL) != 0:
-                q.vx = Int(r.read_bits(12))
-                q.vy = Int(r.read_bits(12))
-                q.vz = Int(r.read_bits(12))
+                q.vx = Int32(r.read_bits(12))
+                q.vy = Int32(r.read_bits(12))
+                q.vz = Int32(r.read_bits(12))
 
             if (mask & DIRTY_STATE) != 0:
                 q.state_flags = r.read_u32()
 
             if not was_known:
                 q.spawn_key = 0
-                self._stage_spawned.append(eid)
+                if has_ext:
+                    self._stage_spawned.append(eid)
             if ext_bit:
                 if r.read_bool():
                     var pf = UInt64(r.read_u32())
@@ -1322,20 +1336,26 @@ struct SnapshotClientReceiver(Movable):
                 -self.vel_limit + (Float32(q.vz) / Float32(4095.0)) * span_vel,
             )
             self.entities[eid].state_flags = q.state_flags
-            self.entities[eid].prefab_id = UInt32(q.spawn_key & 0xFFFFFFFF)
-            self.entities[eid].owner_peer_id = Int((q.spawn_key >> 32) & 0xFFFF)
-            self.entities[eid].authority = UInt8((q.spawn_key >> 48) & 0x3)
+            if has_ext:  # without the extension block the descriptor is always 0
+                self.entities[eid].prefab_id = UInt32(q.spawn_key & 0xFFFFFFFF)
+                self.entities[eid].owner_peer_id = Int((q.spawn_key >> 32) & 0xFFFF)
+                self.entities[eid].authority = UInt8((q.spawn_key >> 48) & 0x3)
 
         # Extra payloads: a (re)spawned entity starts empty, then staged slots commit atomically.
         self._extra_updates.clear()
-        for i in range(len(self._stage_spawned)):
-            var eid = self._stage_spawned[i]
-            for slot in range(REPL_EXTRA_SLOTS):
-                self.extra_data[eid * REPL_EXTRA_SLOTS + slot].clear()
-        for i in range(len(self._removed_eids)):
-            var eid = self._removed_eids[i]
-            for slot in range(REPL_EXTRA_SLOTS):
-                self.extra_data[eid * REPL_EXTRA_SLOTS + slot].clear()
+        if len(self._stage_extra_idx) > 0 and len(self.extra_data) == 0:
+            self.extra_data = List[List[UInt8]](capacity=self.max_entities * REPL_EXTRA_SLOTS)
+            for _ in range(self.max_entities * REPL_EXTRA_SLOTS):
+                self.extra_data.append(List[UInt8]())
+        if len(self.extra_data) > 0:
+            for i in range(len(self._stage_spawned)):
+                var eid = self._stage_spawned[i]
+                for slot in range(REPL_EXTRA_SLOTS):
+                    self.extra_data[eid * REPL_EXTRA_SLOTS + slot].clear()
+            for i in range(len(self._removed_eids)):
+                var eid = self._removed_eids[i]
+                for slot in range(REPL_EXTRA_SLOTS):
+                    self.extra_data[eid * REPL_EXTRA_SLOTS + slot].clear()
         for i in range(len(self._stage_extra_idx)):
             var idx = self._stage_extra_idx[i]
             self.extra_data[idx] = self._stage_extra_bytes[i].copy()
