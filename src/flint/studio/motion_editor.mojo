@@ -1,6 +1,19 @@
 """Flint Studio motion editor. Open a versioned move preset from the project."""
 from flint.studio.source_editor import EmbeddedIde
-from flint.studio.motion_tools import MotionTools, TRANSITION, CONTACT, TIMING, effect_sound, nearest_frame, frame_joint, shake_offset, draw_dust
+from flint.studio.motion_tools import (
+    MotionHistory,
+    MotionTools,
+    QuitGuard,
+    TRANSITION,
+    CONTACT,
+    TIMING,
+    effect_sound,
+    last_frame,
+    nearest_frame,
+    frame_joint,
+    shake_offset,
+    draw_dust,
+)
 from flint.anim.choreography import TRACK_FPS, cue_kind
 from std.ffi import external_call
 from std.math import sin, cos
@@ -68,7 +81,8 @@ def frame[C: MotionCamera](mut canvas: SimdCanvas, mut model: NativeModel, seq: 
 
 
 def render_motion[C: MotionCamera](mut canvas: SimdCanvas, mut model: NativeModel, seq: MotionSequence, mut player: MotionPlayer,
-          phase: Float32, mesh: Bool, status: String, follow: Bool, mut tools: MotionTools, interactive: Bool):
+          phase: Float32, mesh: Bool, status: String, follow: Bool, mut tools: MotionTools, interactive: Bool,
+          dirty: Bool = False):
     var wall = Placement(seq.ledge, Vec3(1, 1, 1), seq.yaw)
     var seconds = phase * player.duration(model, seq)
     var dust: List[Tuple[Vec3,Float32]] = []
@@ -135,10 +149,10 @@ def render_motion[C: MotionCamera](mut canvas: SimdCanvas, mut model: NativeMode
     canvas.draw_rect(16 + begin, BAR + 8, max(1, Int(span * a / duration) - begin), 6, 0xFF699A9C)
     canvas.draw_rect(16 + Int(span * seq.cue), BAR, 3, 20, 0xFFFFBC64)
     canvas.draw_rect(16 + Int(span * phase), BAR + 3, 3, 16, 0xFFFFFFFF)
-    canvas.draw_text(16, BAR + 26, seq.first + " > " + seq.second + "    " + String(Int(1000 * phase * duration)) + " MS   BLEND " + String(Int(seq.overlap * 100)) + "%", 0xFFFFFFFF, 2)
+    canvas.draw_text(16, BAR + 26, ("* " if dirty else "") + seq.first + " > " + seq.second + "    " + String(Int(1000 * phase * duration)) + " MS   BLEND " + String(Int(seq.overlap * 100)) + "%", 0xFFFFFFFF, 2)
     canvas.draw_text(16, BAR + 51, "SPACE PLAY   ARROWS STEP   DRAG TO SEEK   M MESH/RIG   G GAME CAMERA", 0xFFBDCFDC, 2)
     canvas.draw_text(16, BAR + 72, "1/2 CLIPS   -/= BLEND   T CUE   UP/DOWN LEDGE   R TURN   S SAVE", 0xFFBDCFDC, 2)
-    canvas.draw_text(16, BAR + 93, "TAB CAMERA KEY   A/D ORBIT   W/X HEIGHT", 0xFFBDCFDC, 2)
+    canvas.draw_text(16, BAR + 93, "TAB CAMERA KEY   A/D ORBIT   W/X HEIGHT   CTRL+Z/Y UNDO/REDO", 0xFFBDCFDC, 2)
     canvas.draw_text(16, BAR + 120, status, 0xFFFFC455, 2)
     if interactive:
         tools.hud(canvas, model, seq, player, nearest_frame(seconds), BAR, status)
@@ -160,6 +174,38 @@ def timing_click() -> WavClip:
     for i in range(1200):
         clip.samples.append(Int16(6000 * (1 - Float32(i) / 1200) * sin(Float32(i) * 0.22)))
     return clip^
+
+
+def clip_index(model: NativeModel, name: String, fallback: Int) -> Int:
+    for i in range(len(model.animations)):
+        if model.animations[i].name == name and model.animations[i].duration > 0:
+            return i
+    return fallback
+
+
+def contact_self_check(model: NativeModel, seq: MotionSequence, mut player: MotionPlayer) raises -> Int:
+    """Pin the first marked joint at frame 0 and check the Contact Inspector's first slip
+    against a brute-force scan of every track frame: the inspector must report the first
+    frame drifting more than 20 mm, and `-1` exactly when no frame drifts. Returns that
+    frame (or -1); also -1 when the preset marks no joints."""
+    if not player.markers:
+        return -1
+    var inspector = MotionTools()
+    var anchor = frame_joint(player, model, seq, 0, 0)
+    inspector.pin(model, seq, player, 0, anchor)
+    if not inspector.pinned:
+        raise Error("Contact Inspector did not pin the marked joint")
+    var expected = -1
+    for i in range(last_frame(player.duration(model, seq)) + 1):
+        if frame_joint(player, model, seq, i, 0).distance_to(anchor) > 0.02:
+            expected = i
+            break
+    if inspector.first_slip != expected:
+        raise Error(
+            "Contact Inspector reported first slip F" + String(inspector.first_slip)
+            + " but the joint first drifts past 20 mm at F" + String(expected)
+        )
+    return expected
 
 
 def verify(model: NativeModel, seq: MotionSequence, mut player: MotionPlayer) raises:
@@ -200,16 +246,7 @@ def verify(model: NativeModel, seq: MotionSequence, mut player: MotionPlayer) ra
     var ev = edited.events[1]
     if not ev.crossed(0,seconds) or ev.crossed(seconds,seconds+1) or ev.crossed(seconds,0):
         raise Error("A timing event must fire once on its forward crossing")
-    if player.markers:
-        var inspector = MotionTools()
-        var anchor = frame_joint(player,model,seq,0,0)
-        inspector.pin(model,seq,player,0,anchor)
-        for i in range(nearest_frame(total)+1):
-            var drift = frame_joint(player,model,seq,i,0).distance_to(anchor)
-            if drift > 0.02:
-                if i != inspector.first_slip:
-                    raise Error("Contact Inspector reported a different first slip frame")
-                break
+    _ = contact_self_check(model, seq, player)
     print("Verified wall placements, reverse seek, contact drift and timing crossings.")
 
 
@@ -273,18 +310,36 @@ def run_motion_editor[C: MotionCamera]() raises:
     var last = get_time()
     var status = String("CAMERA START KEY" if tools.tab == 0 else "")
     var ide = EmbeddedIde()
-    while not win.close_requested:
+    var history = MotionHistory(seq)
+    var quit = QuitGuard()
+    comptime UNSAVED = "UNSAVED CHANGES: ESC OR CLOSE AGAIN TO DISCARD, S TO SAVE"
+    while True:
         var now = get_time()
         var dt = Float32(now - last)
         last = now
         inp.begin_frame()
         win.poll(inp)
+        var asked = False
+        if win.close_requested:
+            win.close_requested = False
+            if quit.request(history.dirty(seq)):
+                break
+            asked = True
+            status = UNSAVED
+            redraw = True
         if ide.present(win, inp):
             redraw = True
             last = get_time()
             continue
         if inp.key_pressed(256):
-            break
+            if quit.request(history.dirty(seq)):
+                break
+            status = UNSAVED
+            redraw = True
+        elif quit.armed and not asked and (inp.any_key_pressed() or inp.mouse_pressed(0)):
+            quit.cancel()
+            status = ""
+            redraw = True
         var x = Int(inp.last_mouse_x)
         var y = Int(inp.last_mouse_y)
         var click = inp.mouse_pressed(0)
@@ -385,11 +440,11 @@ def run_motion_editor[C: MotionCamera]() raises:
                 playing = False
                 redraw = True
         if tools.tab == TIMING:
-            var last_frame = max(0,Int(duration*TRACK_FPS+0.0001))
-            index = min(index,last_frame)
+            var final_frame = last_frame(duration)
+            index = min(index,final_frame)
             if click and 140 <= x < W-16 and BAR+28 <= y < BAR+100:
                 tools.kind = (y-BAR-28)//18
-                index = ((x-140)*last_frame+(W-157)//2)//(W-157)
+                index = ((x-140)*final_frame+(W-157)//2)//(W-157)
                 phase = Float32(index)/(TRACK_FPS*duration)
                 seq.set_event(index,tools.kind)
                 status = "Added "+cue_kind(tools.kind)+" at F"+String(index)
@@ -411,7 +466,7 @@ def run_motion_editor[C: MotionCamera]() raises:
                 var forward = inp.key_pressed(ord("]"))
                 for j in range(len(seq.events)):
                     var ev = seq.events[j if forward else len(seq.events)-j-1]
-                    if (ev.frame>index if forward else ev.frame<index) and ev.frame<=nearest_frame(duration):
+                    if (ev.frame>index if forward else ev.frame<index) and ev.frame<=final_frame:
                         phase = min(Float32(1), Float32(ev.frame)/(duration*TRACK_FPS))
                         tools.kind = ev.kind
                         playing = False
@@ -445,6 +500,23 @@ def run_motion_editor[C: MotionCamera]() raises:
                 seq.eye_b = eye
             else:
                 seq.eye_a = eye
+        var ctrl = inp.key_down(341) or inp.key_down(345)
+        var shift = inp.key_down(340) or inp.key_down(344)
+        if ctrl and (inp.key_pressed(ord("Z")) or inp.key_pressed(ord("Y"))):
+            var forward = inp.key_pressed(ord("Y")) or shift
+            if history.redo(seq) if forward else history.undo(seq):
+                player.first = clip_index(model, seq.first, player.first)
+                player.second = clip_index(model, seq.second, player.second)
+                tools.original = False
+                tools.pinned = False
+                tools.drag_blend = False
+                status = "Redo" if forward else "Undo"
+            else:
+                status = "Nothing to redo" if forward else "Nothing to undo"
+            playing = False
+            redraw = True
+        else:
+            _ = history.track(seq, tools.drag_blend)
         if inp.key_pressed(ord("S")):
             try:
                 if tools.original:
@@ -459,14 +531,16 @@ def run_motion_editor[C: MotionCamera]() raises:
                     tools.original = False
                 else:
                     seq.save(path)
+                history.mark_saved(seq)
+                quit.cancel()
                 status = "Saved motion preset"
             except err:
                 status = String(err)
         if redraw or click or inp.any_key_pressed() or phase != previous:
             if tools.original:
-                render_motion[C](canvas, model, original, baseline, phase, mesh, status, follow, tools, True)
+                render_motion[C](canvas, model, original, baseline, phase, mesh, status, follow, tools, True, history.dirty(seq))
             else:
-                render_motion[C](canvas, model, seq, player, phase, mesh, status, follow, tools, True)
+                render_motion[C](canvas, model, seq, player, phase, mesh, status, follow, tools, True, history.dirty(seq))
             redraw = False
         win.present(canvas.pixels, W, H)
         if sound:
