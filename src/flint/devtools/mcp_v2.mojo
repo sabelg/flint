@@ -1,6 +1,6 @@
 """Flint v5 AI-Native Model Context Protocol v2 (`McpServerV2`, JSON-RPC 2.0, `mcp_v2.mojo`).
 
-Spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 server supporting:
+Spec-compliant Model Context Protocol (`2024-11-05` and `2025-06-18`, negotiated in `initialize`) JSON-RPC 2.0 server supporting:
   - **`stdio` Transport**: Both LSP/MCP `Content-Length: <N>\\r\\n\\r\\n` framing and newline-delimited JSON-RPC 2.0.
   - **Persistent Non-Blocking Unix Domain Sockets (`FlintMcpUnixListener`)**: Dynamic per-client stream buffers
     with multi-request session persistence and **zero** fixed `mmap` address collisions!
@@ -29,7 +29,7 @@ from flint.anim.flrig import load_flrig_bytes
 from flint.anim.plugin import AnimAssetCache, AnimatorComponent, SkeletonComponent
 from flint.assets.asset_ref import AssetRef, normalize_asset_rel_path
 from flint.assets.checkpoint import pack_checkpoint_lz4
-from flint.assets.cooker_v2 import DEFAULT_COOK_CACHE_DIR, cook_workspace
+from flint.assets.cooker_v2 import DEFAULT_COOK_CACHE_DIR, CookWorkspaceReport, cook_workspace
 from flint.assets.flmat import FlmatAsset, load_flmat_bytes
 from flint.assets.flpk_v3 import ASSET_KIND_AUDIO, ASSET_KIND_MESH, ASSET_KIND_RAW, ASSET_KIND_TEXTURE
 from flint.assets.glb_native import parse_native_glb
@@ -43,7 +43,16 @@ from flint.audio.qoa import decode_qoa
 from flint.audio.server import AudioServer, BUS_SFX
 from flint.core.build_info import build_stamp
 from std.collections import Dict
-from flint.devtools.safe_fs import SAFE_FS_MISSING, SAFE_FS_NOT_REGULAR, SAFE_FS_OK, SAFE_FS_TOO_LARGE, read_agent_file
+from flint.devtools.safe_fs import (
+    SAFE_FS_MISSING,
+    SAFE_FS_NOT_REGULAR,
+    SAFE_FS_OK,
+    SAFE_FS_TOO_LARGE,
+    ConfinedPath,
+    read_agent_file,
+    resolve_confined_path,
+    write_confined_durable_bytes,
+)
 from flint.devtools.job_runner import JOB_KIND_COOK, JOB_KIND_TASK, JOB_SUCCEEDED, JobRunner
 from flint.devtools.problems import (
     DIAG_ERROR,
@@ -56,7 +65,7 @@ from flint.devtools.problems import (
     severity_label,
     source_label,
 )
-from flint.core.jobs import JobPool
+from flint.core.jobs import JobPool, default_worker_count
 from flint.core.math import Quat, Vec3
 from flint.core.memory import W_CPU_LIVE, W_VRAM_LIVE, mem_total
 from flint.core.serial import BlobWriter
@@ -141,6 +150,9 @@ comptime _STAT_UID_OFF: Int = 28 if CompilationTarget.is_x86() else 24
 comptime _S_IFMT: UInt32 = 0o170000
 comptime _S_IFDIR: UInt32 = 0o040000
 comptime _S_IFLNK: UInt32 = 0o120000
+comptime _S_IFSOCK: UInt32 = 0o140000
+comptime _STAT_INO_OFF: Int = 8
+"""`st_ino` offset in `struct stat` (x86_64 and aarch64 both: `st_dev` then `st_ino`)."""
 
 
 # ============================================================================
@@ -178,6 +190,20 @@ def _lstat_mode_uid(path: String) -> Tuple[Bool, UInt32, UInt32]:
         | (UInt32(buf[_STAT_UID_OFF + 3]) << 24)
     )
     return (True, mode, uid)
+
+
+def _lstat_ino(path: String) -> UInt64:
+    """`st_ino` of `path` without following symlinks, or 0 when it does not exist."""
+    if path.byte_length() == 0:
+        return 0
+    var owned = path
+    var buf = List[UInt8](length=256, fill=0)
+    if external_call["lstat", Int32](owned.as_c_string_span(), buf.unsafe_ptr()) != 0:
+        return 0
+    var ino = UInt64(0)
+    for i in range(8):
+        ino |= UInt64(buf[_STAT_INO_OFF + i]) << UInt64(8 * i)
+    return ino
 
 
 def _getcwd_str() -> String:
@@ -645,13 +671,75 @@ def _json_raw_id(doc: JsonDocument, id_node: Int) -> String:
 
 
 def negotiate_mcp_protocol_version(requested: String) -> String:
-    """The revision `initialize` answers with: the client's if this server speaks it, the default
-    (`MCP_PROTOCOL_VERSION`) if the client sent none, else the newest one this server supports."""
+    """The revision `initialize` answers with: the newest one both sides speak.
+
+    This server speaks `2024-11-05` and `2025-06-18`. A client that sent none gets the default
+    (`MCP_PROTOCOL_VERSION`); one asking for a supported revision gets it back; one newer than
+    `MCP_PROTOCOL_LATEST` gets the latest; one between the two (e.g. `2025-03-26`) gets `2024-11-05`,
+    the newest revision that predates it. A client older than every supported revision gets the latest
+    (spec: the server answers with a version it supports and the client decides whether to disconnect).
+    """
     if requested.byte_length() == 0:
         return String(MCP_PROTOCOL_VERSION)
-    if requested == MCP_PROTOCOL_LATEST or requested == "2025-03-26" or requested == "2024-11-05":
+    if requested == MCP_PROTOCOL_LATEST or requested == MCP_PROTOCOL_VERSION:
         return requested
+    # ISO dates compare correctly as strings.
+    if requested > String(MCP_PROTOCOL_LATEST):
+        return String(MCP_PROTOCOL_LATEST)
+    if requested > String(MCP_PROTOCOL_VERSION):
+        return String(MCP_PROTOCOL_VERSION)
     return String(MCP_PROTOCOL_LATEST)
+
+
+def mcp_version_has_structured_content(protocol_version: String) -> Bool:
+    """`structuredContent` in tool results and `outputSchema` in `tools/list` exist from `2025-06-18`."""
+    return protocol_version >= String(MCP_PROTOCOL_LATEST)
+
+
+def _cook_report_json(rep: CookWorkspaceReport) -> String:
+    return (
+        '{"ok":' + ("true" if rep.ok else "false")
+        + ',"total_assets":' + String(rep.total_assets)
+        + ',"cooked_count":' + String(rep.cooked_count)
+        + ',"cache_hits":' + String(rep.cache_hits)
+        + ',"archive_bytes":' + String(rep.archive_bytes)
+        + ',"elapsed_ms":' + _fmt_json_f64(Float64(rep.elapsed_ms)) + "}"
+    )
+
+
+def _extract_cook_report_fields(output: String) -> String:
+    """The `"total_assets":..,"elapsed_ms":..` fields (with a leading comma) of the last
+    `MCP_COOK_REPORT_PREFIX` line in a cook worker's output, or "" (flint-pack prints none)."""
+    var best = String("")
+    for line in output.split("\n"):
+        var ln = String(line.strip())
+        if not ln.startswith(MCP_COOK_REPORT_PREFIX):
+            continue
+        var js = String(ln[byte = String(MCP_COOK_REPORT_PREFIX).byte_length() : ln.byte_length()])
+        var jb = List[UInt8](capacity=js.byte_length())
+        for b in js.as_bytes():
+            jb.append(b)
+        var d = parse_json(jb)
+        if not d.valid or d.root < 0 or d.nodes[d.root].kind != 5:
+            continue
+        best = String(
+            ',"total_assets":' + String(d.integer(d.object_get(d.root, "total_assets"), 0))
+            + ',"cooked_count":' + String(d.integer(d.object_get(d.root, "cooked_count"), 0))
+            + ',"cache_hits":' + String(d.integer(d.object_get(d.root, "cache_hits"), 0))
+            + ',"archive_bytes":' + String(d.integer(d.object_get(d.root, "archive_bytes"), 0))
+        )
+    return best^
+
+
+def run_mcp_cook_worker(source_dir: String, output_flpk: String, cache_dir: String, force_recook: Bool) -> Int:
+    """Body of the `MCP_COOK_WORKER_FLAG` child process: cooks with its own `JobPool`, prints the
+    report line, and exits 0 only when the archive was written. Paths were sandboxed by the parent."""
+    var pool = JobPool()
+    _ = pool.start(max(1, default_worker_count()))
+    var rep = cook_workspace(source_dir, output_flpk, pool, cache_dir=cache_dir, force_recook=force_recook)
+    pool.stop()
+    print(MCP_COOK_REPORT_PREFIX + _cook_report_json(rep))
+    return 0 if rep.ok else 1
 
 
 def _jsonrpc_ok(id_raw: String, result_json: String) -> String:
@@ -670,16 +758,12 @@ def _jsonrpc_err(id_raw: String, code: Int, message: String) -> String:
     )
 
 
-def _mcp_tool_result(payload_json: String, is_error: Bool = False) -> String:
-    return (
-        '{"content":[{"type":"text","text":'
-        + json_quote(payload_json)
-        + '}],"structuredContent":'
-        + payload_json
-        + ',"isError":'
-        + ("true" if is_error else "false")
-        + "}"
-    )
+def _mcp_tool_result(payload_json: String, is_error: Bool = False, structured: Bool = True) -> String:
+    """A `tools/call` result. `structured` (negotiated version >= 2025-06-18) adds `structuredContent`."""
+    var out = '{"content":[{"type":"text","text":' + json_quote(payload_json) + "}]"
+    if structured:
+        out += ',"structuredContent":' + payload_json
+    return out + ',"isError":' + ("true" if is_error else "false") + "}"
 
 
 @always_inline
@@ -1213,8 +1297,10 @@ def extract_next_mcp_frame(mut buf: List[UInt8]) -> Tuple[Bool, Bool, List[UInt8
 # 2. Tool Schema Catalog (`tools/list` — All 14 Tools)
 # ============================================================================
 
-def _mcp_tools_list_json() -> String:
-    return (
+def _mcp_tools_list_json(structured: Bool = False) -> String:
+    """The static tool catalog; `structured` (>= 2025-06-18) declares an object `outputSchema` per tool,
+    matching the `structuredContent` object every tool result then carries."""
+    var out = (
         '{"tools":['
         + '{"name":"ecs.query_entities","description":"Queries live Studio/ECS entities with optional name or collider filters.","inputSchema":{"type":"object","properties":{"name_contains":{"type":"string"},"collider":{"type":"string"},"visible_only":{"type":"boolean"}}}},'
         + '{"name":"ecs.spawn_entity","description":"Spawns an entity recorded on the reversible Studio Undo/Redo stack.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"position":{"type":"array"},"rotation":{"type":"array"},"scale":{"type":"array"},"collider":{"type":"string"},"mass":{"type":"number"},"base_color":{"type":"array"},"roughness":{"type":"number"},"metallic":{"type":"number"}}}},'
@@ -1249,6 +1335,9 @@ def _mcp_tools_list_json() -> String:
         + '{"name":"nav.bake","description":"Rebuilds the deterministic scene NavMesh from live static colliders and returns baked polygon count.","inputSchema":{"type":"object","properties":{}}}'
         + "]}"
     )
+    if structured:
+        return out.replace('"inputSchema":', '"outputSchema":{"type":"object"},"inputSchema":')
+    return out^
 
 
 # ============================================================================
@@ -1339,6 +1428,11 @@ comptime MCP_PENDING_PACKAGE: Int = 1
 comptime MCP_PENDING_COOK: Int = 2
 """Kinds of async jobs `code.build_status` finishes: socket clients never run `project.package` or a
 cook inline (each can take minutes and would freeze the editor); they get a `build_id` to poll."""
+comptime MCP_COOK_WORKER_FLAG = "--mcp-cook-worker"
+"""Hidden Studio CLI mode: `<exe> --mcp-cook-worker <source_dir> <output.flpk> <cache_dir> <0|1 force>`
+runs `cook_workspace` in a child process (see `run_mcp_cook_worker`)."""
+comptime MCP_COOK_REPORT_PREFIX = "FLINT_COOK_REPORT "
+"""Line prefix the cook worker prints before its JSON report; `code.build_status` lifts it into the result."""
 comptime MCP_MAX_FINISHED_BUILDS: Int = 32
 comptime MCP_APPROVED_REPLAY_TTL_SEC: Float64 = 120.0
 comptime MCP_ONCE_GRANT_TTL_SEC: Float64 = 120.0
@@ -1543,6 +1637,10 @@ struct McpServerV2(Movable):
     var require_initialize: Bool
     """Reject everything but `initialize`/`ping` until `initialize`. Always on for socket clients;
     `serve_stdio_loop` turns it on for its client. The in-process key-0 API stays lenient."""
+    var cook_helper_exe: String
+    """Executable that understands `MCP_COOK_WORKER_FLAG` (Studio sets its own `/proc/self/exe`). With it,
+    socket-client cooks (including `force_recook`) always run in a child process, so the editor's frame
+    loop never blocks even when `<engine>/build/flint-pack` was never built. Empty: only flint-pack."""
     var import_allow_dirs: List[String]
     """Directories outside the workspace that `asset.import` may read from (`allow_import_dir`,
     `FLINT_MCP_IMPORT_DIRS`). Everything else outside the workspace is refused."""
@@ -1592,6 +1690,7 @@ struct McpServerV2(Movable):
         self.turn_allow = False
         self.protocol_version = String(MCP_PROTOCOL_VERSION)
         self.require_initialize = False
+        self.cook_helper_exe = String()
         self.import_allow_dirs = List[String]()
         var env_dirs = env_value("FLINT_MCP_IMPORT_DIRS")
         if env_dirs.byte_length() > 0:
@@ -1902,6 +2001,10 @@ struct McpServerV2(Movable):
             return self.client_name
         var si = self._find_stored(key)
         return self.client_sessions[si].client_name if si >= 0 else String("")
+
+    def _structured(self) -> Bool:
+        """Whether the active client negotiated `structuredContent` / `outputSchema` (>= 2025-06-18)."""
+        return mcp_version_has_structured_content(self.protocol_version)
 
     def client_initialized(self, key: Int) -> Bool:
         if key == self.active_client_key:
@@ -2433,37 +2536,42 @@ struct McpServerV2(Movable):
                 except e:
                     return (True, '{"ok":false,"error":' + json_quote("sandbox rejected cook path: " + String(e)) + "}")
 
-                if self.active_client_key != 0 and not force_c:
-                    # Socket clients cook in a `flint-pack --cook` child process so the editor never
-                    # stalls for a whole cook; `code.build_status` mounts the archive when it is done.
-                    var launcher_c = _resolve_flint_launcher_path()
-                    var pack_bin = String("")
-                    if launcher_c.byte_length() > 0:
-                        pack_bin = parent_directory(parent_directory(launcher_c)) + "/build/flint-pack"
-                    if pack_bin.byte_length() > 0 and file_size(pack_bin) > 0:
-                        var cargv = List[String]()
-                        cargv.append(pack_bin)
-                        cargv.append("--cook")
+                if self.active_client_key != 0:
+                    # Socket clients cook in a child process so the editor's frame loop never stalls for a
+                    # whole cook; `code.build_status` mounts the archive when it is done. Studio's own
+                    # executable (`cook_helper_exe`, always present and built from the same cooker) is
+                    # preferred; `<engine>/build/flint-pack --cook` is the fallback (it has no force flag).
+                    var cargv = List[String]()
+                    if self.cook_helper_exe.byte_length() > 0 and file_size(self.cook_helper_exe) > 0:
+                        cargv.append(self.cook_helper_exe)
+                        cargv.append(String(MCP_COOK_WORKER_FLAG))
                         cargv.append(src_dir)
                         cargv.append(out_flpk)
-                        cargv.append("--cache-dir")
                         cargv.append(c_dir)
+                        cargv.append("1" if force_c else "0")
+                    elif not force_c:
+                        var launcher_c = _resolve_flint_launcher_path()
+                        var pack_bin = String("")
+                        if launcher_c.byte_length() > 0:
+                            pack_bin = parent_directory(parent_directory(launcher_c)) + "/build/flint-pack"
+                        if pack_bin.byte_length() > 0 and file_size(pack_bin) > 0:
+                            cargv.append(pack_bin)
+                            cargv.append("--cook")
+                            cargv.append(src_dir)
+                            cargv.append(out_flpk)
+                            cargv.append("--cache-dir")
+                            cargv.append(c_dir)
+                    if len(cargv) > 0:
                         var ws_cwd = self.workspace_root
                         return self._start_async_job(
                             MCP_PENDING_COOK, JOB_KIND_COOK, "assets.cook", cargv, ws_cwd,
                             raw_out_flpk, out_flpk, String(""),
                         )
+                # In-process / stdio callers (no frame loop to protect) cook inline and get the report now.
                 var rep = cook_workspace(src_dir, out_flpk, pool, cache_dir=c_dir, force_recook=force_c)
                 if rep.ok:
                     _ = assets.mount_flpk(out_flpk)
-                cook_json = (
-                    '{"ok":' + ("true" if rep.ok else "false")
-                    + ',"total_assets":' + String(rep.total_assets)
-                    + ',"cooked_count":' + String(rep.cooked_count)
-                    + ',"cache_hits":' + String(rep.cache_hits)
-                    + ',"archive_bytes":' + String(rep.archive_bytes)
-                    + ',"elapsed_ms":' + _fmt_json_f64(Float64(rep.elapsed_ms)) + "}"
-                )
+                cook_json = _cook_report_json(rep)
 
             return (
                 False,
@@ -3162,11 +3270,16 @@ struct McpServerV2(Movable):
                 return (True, '{"ok":false,"error":' + json_quote("asset validation failed: " + vres[1]) + "}")
 
             if abs_src != abs_dst:
-                var dst_dir = parent_directory(abs_dst)
-                if dst_dir.byte_length() > 0 and dst_dir != ".":
-                    _ = make_dirs(dst_dir)
-                if not write_bytes(abs_dst, raw_data):
-                    return (True, '{"ok":false,"error":"failed to write imported asset"}')
+                # Durable, confined replace: parents are created below the workspace without following
+                # symlinks, then `.tmp` + fsync + rename + dir fsync, so a crash never leaves a torn asset.
+                var dst_cp: ConfinedPath
+                try:
+                    dst_cp = resolve_confined_path(self.workspace_root, rel_dst)
+                except e:
+                    return (True, '{"ok":false,"error":' + json_quote("sandbox rejected dest_path: " + String(e)) + "}")
+                var wr = write_confined_durable_bytes(dst_cp, raw_data)
+                if not wr[0]:
+                    return (True, '{"ok":false,"error":' + json_quote("failed to write imported asset: " + wr[1]) + "}")
 
             if assets.loose_root.byte_length() == 0:
                 assets.loose_root = self.workspace_root
@@ -3986,10 +4099,11 @@ struct McpServerV2(Movable):
                 var c_tail = String(c_out[byte = max(0, c_out.byte_length() - 2048) : c_out.byte_length()]) if c_out.byte_length() > 0 else String("")
                 if c_ok:
                     _ = assets.mount_flpk(abs_so_b)
+                var c_rep = _extract_cook_report_fields(c_out)
                 res = (
                     not c_ok,
                     '{"ok":' + ("true" if c_ok else "false")
-                    + ',"cook_report":{"ok":' + ("true" if c_ok else "false")
+                    + ',"cook_report":{"ok":' + ("true" if c_ok else "false") + c_rep
                     + ',"output_flpk":' + json_quote(rel_so_b) + ',"log_tail":' + json_quote(c_tail) + "}"
                     + ',"mounted_archives":' + String(len(assets.mounts)) + "}",
                 )
@@ -4188,7 +4302,7 @@ struct McpServerV2(Movable):
             return _jsonrpc_ok(id_raw, "{}")
 
         if method == "tools/list":
-            return _jsonrpc_ok(id_raw, _mcp_tools_list_json())
+            return _jsonrpc_ok(id_raw, _mcp_tools_list_json(self._structured()))
 
         if method == "tools/call":
             var params_node = doc.object_get(doc.root, "params")
@@ -4205,13 +4319,15 @@ struct McpServerV2(Movable):
             if ed_node >= 0:
                 var ed_parsed = _parse_strict_json_int(doc, ed_node)
                 if not ed_parsed[0] or ed_parsed[1] <= 0:
-                    return _jsonrpc_ok(id_raw, _mcp_tool_result('{"ok":false,"error":"editor_id must be a positive integer"}', is_error=True))
+                    return _jsonrpc_ok(id_raw, _mcp_tool_result('{"ok":false,"error":"editor_id must be a positive integer"}', is_error=True, structured=self._structured()))
                 var slot = studio.slot_for_editor_id(UInt64(ed_parsed[1]))
                 if slot < 0:
                     return _jsonrpc_ok(
                         id_raw,
                         _mcp_tool_result(
-                            '{"ok":false,"error":"unknown editor_id","editor_id":' + String(ed_parsed[1]) + "}", is_error=True
+                            '{"ok":false,"error":"unknown editor_id","editor_id":' + String(ed_parsed[1]) + "}",
+                            is_error=True,
+                            structured=self._structured(),
                         ),
                     )
                 var inner = args_str
@@ -4262,7 +4378,7 @@ struct McpServerV2(Movable):
         if not self._gate_bypass:
             var replayed = self._take_replayed_result(Self.call_fingerprint(self.active_client_key, tname, args_str))
             if replayed[0]:
-                return _jsonrpc_ok(id_raw, _mcp_tool_result(replayed[1], is_error=False))
+                return _jsonrpc_ok(id_raw, _mcp_tool_result(replayed[1], is_error=False, structured=self._structured()))
 
         # `code.build_status` only finishes a build the gate already let through.
         var gate_ok = tname == "code.build_status" or self._consume_gate_allowance(tname, mutating, args_str)
@@ -4286,7 +4402,7 @@ struct McpServerV2(Movable):
             )
             bev.affected_entities = _extract_affected_entities(doc, args_node, "")
             self._record_tool_event(bev^)
-            return _jsonrpc_ok(id_raw, _mcp_tool_result(blocked_json, is_error=True))
+            return _jsonrpc_ok(id_raw, _mcp_tool_result(blocked_json, is_error=True, structured=self._structured()))
 
         var t0 = get_time()
         # Undo entries made by this call are tagged with the calling agent (Phase 6 origin): socket
@@ -4315,7 +4431,7 @@ struct McpServerV2(Movable):
         ev.replay_step_id = self._replay_step_id
         ev.affected_entities = _extract_affected_entities(doc, args_node, outcome[1])
         self._record_tool_event(ev^)
-        return _jsonrpc_ok(id_raw, _mcp_tool_result(outcome[1], is_error=outcome[0]))
+        return _jsonrpc_ok(id_raw, _mcp_tool_result(outcome[1], is_error=outcome[0], structured=self._structured()))
 
     def handle_jsonrpc(
         mut self,
@@ -4348,7 +4464,10 @@ struct McpServerV2(Movable):
         mut assets: AssetServer,
         mut pool: JobPool,
     ) -> Int:
-        """Runs a blocking MCP `stdio` server reading bounded `Content-Length` or newline JSON-RPC from `stdin` (fd 0)."""
+        """Runs a blocking MCP `stdio` server reading bounded `Content-Length` or newline JSON-RPC from `stdin` (fd 0).
+        Like socket clients, the stdio client must `initialize` first: anything but `ping` before it gets
+        `MCP_ERR_NOT_INITIALIZED` (-32002)."""
+        self.require_initialize = True
         var stream_buf = List[UInt8]()
         var scratch = List[UInt8](length=8192, fill=0)
         var answered = 0
@@ -4427,6 +4546,18 @@ def _unlink_socket(path: String):
         return
     var owned = path
     _ = external_call["unlink", Int32](owned.as_c_string_span())
+
+
+def _unlink_own_socket(path: String, bound_ino: UInt64):
+    """Unlinks `path` only while it is still the socket file this process bound (same inode)."""
+    if path.byte_length() == 0 or bound_ino == 0:
+        return
+    var ls = _lstat_mode_uid(path)
+    if not ls[0] or (ls[1] & _S_IFMT) != _S_IFSOCK:
+        return
+    if _lstat_ino(path) != bound_ino:
+        return
+    _unlink_socket(path)
 
 
 def _unix_socket_is_live(path: String) -> Bool:
@@ -4534,6 +4665,9 @@ struct FlintMcpUnixListener(Movable):
     var _io_scratch: List[UInt8]
     var rr_cursor: Int
     """Client index the next budgeted dispatch pass starts at, so one busy client cannot starve the rest."""
+    var bound_ino: UInt64
+    """Inode of the socket file this listener bound. `close` unlinks `socket_path` only while it still
+    names that inode, so a newer Studio that replaced the path never loses its socket."""
 
     def __init__(out self, socket_path: String = ""):
         self.socket_path = String()
@@ -4553,6 +4687,7 @@ struct FlintMcpUnixListener(Movable):
         self.next_conn_id = 1
         self._io_scratch = List[UInt8](length=8192, fill=0)
         self.rr_cursor = 0
+        self.bound_ino = 0
         var effective_path = socket_path if socket_path.byte_length() > 0 else default_mcp_socket_path()
         _ = self.start(effective_path)
 
@@ -4561,8 +4696,8 @@ struct FlintMcpUnixListener(Movable):
             close_fd(self.client_fds[i])
         if self.listen_fd >= 0:
             close_fd(self.listen_fd)
-        if self.active and self.socket_path.byte_length() > 0:
-            _unlink_socket(self.socket_path)
+        if self.active:
+            _unlink_own_socket(self.socket_path, self.bound_ino)
 
     def start(mut self, socket_path: String = "") -> Bool:
         self.close()
@@ -4578,23 +4713,26 @@ struct FlintMcpUnixListener(Movable):
                 if not _ensure_private_dir_0700(pdir, uid):
                     return False
 
-        # Refuse to unlink or bind over an existing symlink
+        # Never unlink or bind over a symlink or a non-socket file (a stale path is only ever a socket).
         var existing = _lstat_mode_uid(target_sock)
-        if existing[0] and (existing[1] & _S_IFMT) == _S_IFLNK:
+        if existing[0] and (existing[1] & _S_IFMT) != _S_IFSOCK:
             return False
 
-        # Another live Studio owns this path: never unlink its socket. Listen on a per-pid path beside it.
+        # Another live Studio answers on this path (connect probe): never unlink its socket. Listen on a
+        # per-pid path beside it instead. Only a socket nobody answers on is stale and gets unlinked.
         if existing[0] and _unix_socket_is_live(target_sock):
             var pid_sock = (pdir + "/" if pdir.byte_length() > 0 else String("")) + "mcp-" + String(Int(external_call["getpid", Int32]())) + ".sock"
             if pid_sock.byte_length() > 107:
                 return False
             var existing_pid = _lstat_mode_uid(pid_sock)
-            if existing_pid[0] and (existing_pid[1] & _S_IFMT) == _S_IFLNK:
+            if existing_pid[0] and ((existing_pid[1] & _S_IFMT) != _S_IFSOCK or _unix_socket_is_live(pid_sock)):
                 return False
             target_sock = pid_sock
 
         self.socket_path = target_sock
-        _unlink_socket(target_sock)
+        self.bound_ino = 0
+        if _lstat_mode_uid(target_sock)[0]:
+            _unlink_socket(target_sock)  # stale: it exists, is a socket, and no server answered the probe
         var fd = Int(external_call["socket", Int32](_AF_UNIX, _SOCK_STREAM | _SOCK_NONBLOCK | _SOCK_CLOEXEC, Int32(0)))
         if fd < 0:
             return False
@@ -4619,6 +4757,7 @@ struct FlintMcpUnixListener(Movable):
             return False
 
         self.listen_fd = fd
+        self.bound_ino = _lstat_ino(target_sock)
         self.active = True
         return True
 
@@ -4637,9 +4776,10 @@ struct FlintMcpUnixListener(Movable):
         if self.listen_fd >= 0:
             close_fd(self.listen_fd)
             self.listen_fd = -1
-        if self.active and self.socket_path.byte_length() > 0:
-            _unlink_socket(self.socket_path)
+        if self.active:
+            _unlink_own_socket(self.socket_path, self.bound_ino)
         self.active = False
+        self.bound_ino = 0
 
     def client_count(self) -> Int:
         return len(self.client_fds)

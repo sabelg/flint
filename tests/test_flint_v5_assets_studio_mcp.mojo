@@ -1363,7 +1363,7 @@ def _large_mcp_worker(ctx_addr: Int, job_idx: Int):
             ctx.ready.store(1)
             # Socket clients must `initialize` before any tool call.
             var init_ok = cli.send_raw_request(
-                '{"jsonrpc":"2.0","id":998,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"big-xfer"}}}',
+                '{"jsonrpc":"2.0","id":998,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"big-xfer"}}}',
                 timeout_ms=4000,
             ) and cli.recv_response_blocking(timeout_ms=4000)[0]
             if init_ok and cli.send_raw_request(ctx.req_payload, timeout_ms=4000):
@@ -1393,11 +1393,11 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
 
     # 1. initialize
     var r_init = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"flint-test-agent"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"flint-test-agent"}}}',
         studio, assets, pool,
     )
     var d_init = parse_json(_str_bytes(r_init))
-    _assert(d_init.valid and d_init.text(d_init.object_get(d_init.object_get(d_init.root, "result"), "protocolVersion")) == "2024-11-05", "MCP initialize failed")
+    _assert(d_init.valid and d_init.text(d_init.object_get(d_init.object_get(d_init.root, "result"), "protocolVersion")) == "2025-06-18", "MCP initialize failed (2025-06-18 negotiates structuredContent)")
 
     # Notification (no id) -> empty response
     var r_notif = mcp.handle_jsonrpc('{"jsonrpc":"2.0","method":"notifications/initialized"}', studio, assets, pool)
@@ -4168,6 +4168,7 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
     var studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=160, height=120)
     var assets = AssetServer(enable_watcher=False)
     var mcp = McpServerV2(workspace_root=proj)
+    _ = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', studio, assets, pool)  # 2025-06-18: tool results carry structuredContent
 
     var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}', studio, assets, pool)
     _assert(r_list.find('"scene.save"') >= 0, "tools/list missing scene.save")
@@ -4278,6 +4279,7 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
     var ch_rc = external_call["chdir", Int32](rel_caller.as_c_string_span())
     _assert(ch_rc == 0, "chdir to rel_caller failed")
     var rel_mcp = McpServerV2(workspace_root="../mcp_m0_rel_proj")
+    _ = rel_mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', studio, assets, pool)  # 2025-06-18: tool results carry structuredContent
     var r_rel_sv = rel_mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":97,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/rel.flscn"}}}',
         studio, assets, pool,
@@ -4373,6 +4375,8 @@ def test_p_mcp_v2_m1_assets_prefab_material_and_upload(tmp_root: String, mut poo
     ) raises -> String:
         ref assets_srv = st.app.resources.get_ptr_mut[AssetServer]().value()[unsafe_offset=0]
         return s_mcp.handle_jsonrpc(req, st, assets_srv, pl)
+
+    _ = _call_mcp(mcp, studio, pool, '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}')  # 2025-06-18: tool results carry structuredContent
 
     # 1. tools/list has all 22 tools including the 4 new M1 tools
     var r_tl = _call_mcp(mcp, studio, pool, '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
@@ -4650,6 +4654,7 @@ def test_p_mcp_v2_m1_assets_prefab_material_and_upload(tmp_root: String, mut poo
         project_root=proj_g1,
     )
     var mcp_g1 = McpServerV2(workspace_root=proj_g1)
+    _ = _call_mcp(mcp_g1, s1, pool, '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}')  # 2025-06-18: tool results carry structuredContent
     populate_default_studio_scene(s1)
     _assert(
         s1.app.resources.get_ptr[ScalableRenderer]().value()[].cpu_meshes.__len__() >= 6,
@@ -4928,7 +4933,7 @@ def test_r_mcp_v2_m2_runtime_tools(tmp_root: String, mut pool: JobPool) raises:
     var mcp = McpServerV2(workspace_root=ws)
 
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m2-test"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"m2-test"}}}',
         studio, assets, pool,
     )
 
@@ -5162,7 +5167,7 @@ def test_s_mcp_v2_m5b_r2_regressions(tmp_root: String, mut pool: JobPool) raises
     var assets = AssetServer(enable_watcher=False)
     var mcp = McpServerV2(workspace_root=ws)
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"r2-test"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"r2-test"}}}',
         studio, assets, pool,
     )
 
@@ -5479,7 +5484,7 @@ def test_t_m3_studio_menu_and_mcp_project_package(tmp_root: String, mut pool: Jo
     # 4. MCP project.package tool registration, traversal/symlink sandboxing, and valid package
     var mcp = McpServerV2(workspace_root=proj)
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m3-test"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"m3-test"}}}',
         studio, assets, pool,
     )
     var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}', studio, assets, pool)
@@ -5580,7 +5585,7 @@ def test_t_m3_studio_menu_and_mcp_project_package(tmp_root: String, mut pool: Jo
     var assets_c = AssetServer(enable_watcher=False)
     var mcp_c = McpServerV2(workspace_root=proj_custom)
     _ = mcp_c.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m3-custom-pak"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"m3-custom-pak"}}}',
         studio_c, assets_c, pool,
     )
     var r_custom = mcp_c.handle_jsonrpc(
@@ -5645,6 +5650,7 @@ def test_u_mcp_pie_isolation_and_material_assign_ext(
     var assets = AssetServer(enable_watcher=False)
     assets.loose_root = ws
     var mcp = McpServerV2(ws)
+    _ = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', studio, assets, pool)  # 2025-06-18: tool results carry structuredContent
 
     var r_sp = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ecs.spawn_entity","arguments":{"name":"Hero","position":[0.0,10.0,0.0],"mass":1.0}}}',

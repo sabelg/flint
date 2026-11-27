@@ -185,7 +185,7 @@ expected_baseline = {
 for framing in ("cl", "ndjson"):
     with McpStdioClient([bin_path, "--mcp-stdio"], cwd=ws, framing=framing, allow_stderr=False) as client:
         init_res = client.initialize()
-        assert init_res.get("protocolVersion") == "2024-11-05", f"bad protocolVersion: {init_res!r}"
+        assert init_res.get("protocolVersion") == "2025-06-18", f"bad protocolVersion: {init_res!r}"
         client.notify_initialized()
         ping_resp = client.request("ping", {})
         assert "error" not in ping_resp and ping_resp.get("result") == {}, f"bad ping: {ping_resp!r}"
@@ -193,6 +193,29 @@ for framing in ("cl", "ndjson"):
         names = {t.get("name") for t in tools}
         missing = sorted(expected_baseline - names)
         assert not missing, f"missing baseline tools in {framing}: {missing!r}"
+        assert all(isinstance(t.get("outputSchema"), dict) for t in tools), "2025-06-18 tools declare outputSchema"
+        q = client.call_tool("ecs.query_entities", {})
+        assert isinstance(q.get("count"), int), f"structuredContent payload: {q!r}"
+
+# --mcp-stdio requires initialize first: -32002 for anything but ping, then the handshake works.
+with McpStdioClient([bin_path, "--mcp-stdio"], cwd=ws, framing="cl", allow_stderr=False, auto_initialize=False) as client:
+    pre = client.request("tools/list", {})
+    assert pre.get("error", {}).get("code") == -32002, f"tools/list before initialize must be -32002: {pre!r}"
+    pre_call = client.request("tools/call", {"name": "ecs.query_entities", "arguments": {}})
+    assert pre_call.get("error", {}).get("code") == -32002, f"tools/call before initialize must be -32002: {pre_call!r}"
+    assert client.request("ping", {}).get("result") == {}, "ping is allowed before initialize"
+    client.initialize()
+    assert len(client.list_tools()) > 0
+
+# A 2024-11-05 client gets the text block only: no structuredContent, no outputSchema.
+with McpStdioClient([bin_path, "--mcp-stdio"], cwd=ws, framing="ndjson", allow_stderr=False, auto_initialize=False) as client:
+    init_old = client.initialize(protocol_version="2024-11-05")
+    assert init_old.get("protocolVersion") == "2024-11-05", f"bad protocolVersion: {init_old!r}"
+    assert all("outputSchema" not in t for t in client.list_tools()), "2024-11-05 tools/list has no outputSchema"
+    raw = client.request("tools/call", {"name": "ecs.query_entities", "arguments": {}})
+    assert "structuredContent" not in raw["result"], f"2024-11-05 result must not carry structuredContent: {raw!r}"
+    q_old = client.call_tool("ecs.query_entities", {})
+    assert isinstance(q_old.get("count"), int), f"text payload: {q_old!r}"
 PY
     then
         fail_test "t1_m0_mcp_handshake_cl_and_ndjson_byte0" "Content-Length or NDJSON MCP handshake failed"

@@ -54,7 +54,7 @@ def _assert_parse_error_reported(final: String, file_name: String) raises:
 
 def _init(mut mcp: McpServerV2, mut studio: FlintStudioState, mut assets: AssetServer, mut pool: JobPool, name: String):
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"'
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"'
         + name + '"}}}',
         studio, assets, pool,
     )

@@ -14,6 +14,10 @@ Covers, headless and without a live agent:
      is capped, "approve for turn" ends with the turn.
   6. safe_fs + revert guard: symlinks / `..` / hidden paths are refused; a revert never clobbers a
      file that changed after the agent wrote it.
+  7. MCP deferred items: `structuredContent` / `outputSchema` only for clients that negotiated
+     `2025-06-18`; socket-client cooks (even `force_recook`) run in a child process; `asset.import`
+     writes durably and never through a symlink; the Unix listener unlinks only stale sockets and
+     only its own socket on close.
 """
 from std.collections import List
 from std.ffi import external_call
@@ -36,7 +40,10 @@ from flint.devtools.mcp_v2 import (
     MCP_PROTOCOL_LATEST,
     MCP_PROTOCOL_VERSION,
     MAX_MCP_MESSAGE_BYTES,
+    MCP_GATE_AUTO,
+    FlintMcpUnixListener,
     McpServerV2,
+    mcp_version_has_structured_content,
     negotiate_mcp_protocol_version,
     parse_next_mcp_frame,
 )
@@ -87,7 +94,7 @@ def _tmp_dir(tag: String) -> String:
 # ---------------------------------------------------------------------------
 
 def test_acp_ids_terminal_and_fs_requests() raises:
-    print("  [1/6] ACP ids, terminal:false, fs/* and terminal/* requests...")
+    print("  [1/7] ACP ids, terminal:false, fs/* and terminal/* requests...")
     var acp = AcpClient()
     acp.start_headless(".", 0.0)
     var sent = _joined(acp.take_outbound_log())
@@ -144,7 +151,7 @@ def test_acp_ids_terminal_and_fs_requests() raises:
 # ---------------------------------------------------------------------------
 
 def test_mcp_framing_recovery_and_per_message_cap() raises:
-    print("  [2/6] MCP framing: bad line recovery, per-message cap, batches...")
+    print("  [2/7] MCP framing: bad line recovery, per-message cap, batches...")
     var buf = _bytes('this is not json\n{"jsonrpc":"2.0","id":5,"method":"ping"}\n')
     var r1 = parse_next_mcp_frame(buf)
     assert_true(r1.protocol_error and r1.recoverable, "a garbage line is a recoverable -32700")
@@ -179,10 +186,17 @@ def test_mcp_framing_recovery_and_per_message_cap() raises:
 # ---------------------------------------------------------------------------
 
 def test_mcp_lifecycle_negotiation_auth_and_turn_allowance() raises:
-    print("  [3/6] MCP initialize lifecycle, version negotiation, -32001, turn allowance...")
+    print("  [3/7] MCP initialize lifecycle, version negotiation, -32001, turn allowance...")
     assert_equal(negotiate_mcp_protocol_version(""), String(MCP_PROTOCOL_VERSION))
-    assert_equal(negotiate_mcp_protocol_version("2025-03-26"), String("2025-03-26"))
+    assert_equal(negotiate_mcp_protocol_version("2024-11-05"), String("2024-11-05"))
+    assert_equal(negotiate_mcp_protocol_version("2025-06-18"), String("2025-06-18"))
+    # Between the two supported revisions: the newest one both speak is the older one.
+    assert_equal(negotiate_mcp_protocol_version("2025-03-26"), String("2024-11-05"))
+    # Newer than anything we speak: offer our latest.
+    assert_equal(negotiate_mcp_protocol_version("2099-01-01"), String(MCP_PROTOCOL_LATEST))
     assert_equal(negotiate_mcp_protocol_version("1999-01-01"), String(MCP_PROTOCOL_LATEST))
+    assert_false(mcp_version_has_structured_content("2024-11-05"))
+    assert_true(mcp_version_has_structured_content("2025-06-18"))
 
     var studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=320, height=200, worker_threads=0)
     var assets = AssetServer()
@@ -242,7 +256,7 @@ def _wait_done(mut runner: JobRunner, jid: Int, timeout_sec: Float64 = 5.0) -> I
 
 
 def test_jobs_exit_echild_prune_and_group_cancel() raises:
-    print("  [4/6] JobRunner exit codes, ECHILD, pruning, process-group cancel...")
+    print("  [4/7] JobRunner exit codes, ECHILD, pruning, process-group cancel...")
     var reaped = reap_child(Int32(1), block=False)
     assert_true(reaped[0] and reaped[1] == -1, "waitpid ECHILD is a failed (-1) exit, never success")
 
@@ -292,7 +306,7 @@ def test_jobs_exit_echild_prune_and_group_cancel() raises:
 # ---------------------------------------------------------------------------
 
 def test_agent_bus_caps_coalescing_and_turn_allowance() raises:
-    print("  [5/6] AgentBus approval coalescing/caps, thought cap, turn allowance...")
+    print("  [5/7] AgentBus approval coalescing/caps, thought cap, turn allowance...")
     var bus = AgentTelemetryBus()
     var aid = bus.create_session(ROLE_GAMEPLAY_CODER, "hardening")
     var a = PendingApproval(agent_id=aid, source=APPROVAL_SRC_MCP_TOOL, title="spawn")
@@ -333,7 +347,7 @@ def test_agent_bus_caps_coalescing_and_turn_allowance() raises:
 # ---------------------------------------------------------------------------
 
 def test_safe_fs_and_revert_guard() raises:
-    print("  [6/6] safe_fs symlink/dotdot/hidden refusal + revert hash guard...")
+    print("  [6/7] safe_fs symlink/dotdot/hidden refusal + revert hash guard...")
     var root = _tmp_dir("fs")
     var outside = _tmp_dir("fs_outside")
     var secret = _bytes("secret")
@@ -369,6 +383,186 @@ def test_safe_fs_and_revert_guard() raises:
     assert_equal(String(unsafe_from_utf8=read_bytes(root + "/src/edit.mojo")), String("user changed it\n"))
 
 
+# ---------------------------------------------------------------------------
+# 7. Version-gated structuredContent, async cook, durable import, socket ownership
+# ---------------------------------------------------------------------------
+
+def _sock_exists(path: String) -> Bool:
+    var buf = List[UInt8](length=256, fill=0)
+    var owned = path
+    return external_call["lstat", Int32](owned.as_c_string_span(), buf.unsafe_ptr()) == 0
+
+
+def _bind_dead_socket(path: String):
+    """Leaves a socket file at `path` with nobody listening (what a crashed Studio leaves behind)."""
+    var fd = external_call["socket", Int32](Int32(1), Int32(1), Int32(0))
+    var addr = List[UInt8](length=110, fill=0)
+    addr[0] = 1
+    var pb = path.as_bytes()
+    for i in range(len(pb)):
+        addr[2 + i] = pb[i]
+    _ = external_call["bind", Int32](fd, addr.unsafe_ptr(), UInt32(110))
+    _ = external_call["close", Int32](fd)
+
+
+def _init_req(id: Int, version: String) -> String:
+    return (
+        '{"jsonrpc":"2.0","id":' + String(id) + ',"method":"initialize","params":{"protocolVersion":"'
+        + version + '","clientInfo":{"name":"hardening"}}}'
+    )
+
+
+def test_mcp_deferred_items() raises:
+    print("  [7/7] structuredContent gating, async cook, durable import, socket ownership...")
+    var studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=320, height=200, worker_threads=0)
+    var assets = AssetServer()
+    var pool = JobPool()
+    var call_q = '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{}}}'
+
+    # 2024-11-05 clients: no structuredContent, no outputSchema.
+    var old = McpServerV2(workspace_root=_tmp_dir("mcp_v_old"))
+    var old_init = old.handle_jsonrpc(_init_req(1, "2024-11-05"), studio, assets, pool)
+    assert_true(old_init.find('"protocolVersion":"2024-11-05"') >= 0, old_init)
+    var old_call = old.handle_jsonrpc(call_q, studio, assets, pool)
+    assert_true(old_call.find('"content":[') >= 0 and old_call.find('"isError":false') >= 0, old_call)
+    assert_true(old_call.find("structuredContent") < 0, "2024-11-05 clients get no structuredContent: " + old_call)
+    var old_list = old.handle_jsonrpc('{"jsonrpc":"2.0","id":3,"method":"tools/list"}', studio, assets, pool)
+    assert_true(old_list.find("outputSchema") < 0, "2024-11-05 clients get no outputSchema")
+    # An unknown in-between revision also lands on 2024-11-05.
+    var mid = McpServerV2(workspace_root=_tmp_dir("mcp_v_mid"))
+    var mid_init = mid.handle_jsonrpc(_init_req(1, "2025-03-26"), studio, assets, pool)
+    assert_true(mid_init.find('"protocolVersion":"2024-11-05"') >= 0, mid_init)
+    assert_true(mid.handle_jsonrpc(call_q, studio, assets, pool).find("structuredContent") < 0)
+    # No initialize at all (lenient in-process key 0): the default revision, so no structuredContent.
+    var bare = McpServerV2(workspace_root=_tmp_dir("mcp_v_bare"))
+    assert_true(bare.handle_jsonrpc(call_q, studio, assets, pool).find("structuredContent") < 0)
+
+    # 2025-06-18 clients: structuredContent on every result, an object outputSchema on every tool.
+    var cur = McpServerV2(workspace_root=_tmp_dir("mcp_v_new"))
+    _ = cur.handle_jsonrpc(_init_req(1, "2025-06-18"), studio, assets, pool)
+    var new_call = cur.handle_jsonrpc(call_q, studio, assets, pool)
+    assert_true(new_call.find('"structuredContent":{') >= 0, "2025-06-18 clients get structuredContent: " + new_call)
+    var new_list = cur.handle_jsonrpc('{"jsonrpc":"2.0","id":3,"method":"tools/list"}', studio, assets, pool)
+    var n_tools = new_list.count('"inputSchema":')
+    assert_true(n_tools > 10 and new_list.count('"outputSchema":{"type":"object"}') == n_tools, "every tool declares outputSchema")
+    var unknown = cur.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"no.such_tool","arguments":{}}}', studio, assets, pool
+    )
+    assert_true(unknown.find('"isError":true') >= 0 and unknown.find('"structuredContent":{"ok":false') >= 0, unknown)
+
+    # The version is per client: a socket client on 2024-11-05 next to the 2025-06-18 key-0 client.
+    cur.select_client(41)
+    _ = cur.handle_jsonrpc(_init_req(5, "2024-11-05"), studio, assets, pool)
+    assert_true(cur.handle_jsonrpc(call_q, studio, assets, pool).find("structuredContent") < 0, "per-client version")
+    cur.select_client(0)
+    assert_true(cur.handle_jsonrpc(call_q, studio, assets, pool).find('"structuredContent"') >= 0, "key 0 keeps 2025-06-18")
+
+    # Async cook: a socket client's cook (even force_recook, with no flint-pack) runs in a child process.
+    var ws = _tmp_dir("mcp_cook")
+    _ = make_dirs(ws + "/assets")
+    var helper = ws + "/fake_cook_worker.sh"
+    var script = (
+        "#!/bin/sh\n"
+        + '[ "$1" = "--mcp-cook-worker" ] && [ "$5" = "1" ] || exit 3\n'
+        + "echo 'FLINT_COOK_REPORT {\"ok\":true,\"total_assets\":3,\"cooked_count\":2,\"cache_hits\":1,\"archive_bytes\":99,\"elapsed_ms\":1.0}'\n"
+    )
+    var script_b = _bytes(script)
+    _ = write_bytes(helper, script_b)
+    _ = external_call["chmod", Int32](helper.as_c_string_span(), Int32(0o755))
+    var cook = McpServerV2(workspace_root=ws)
+    cook.cook_helper_exe = helper
+    cook.select_client(7)
+    cook.set_client_gate_mode(7, MCP_GATE_AUTO)
+    _ = cook.handle_jsonrpc(_init_req(1, "2025-06-18"), studio, assets, pool)
+    var t0 = get_time()
+    var started = cook.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"assets.list_and_cook","arguments":'
+        + '{"source_dir":"assets","output_flpk":"build/out.flpk","force_recook":true}}}',
+        studio, assets, pool,
+    )
+    assert_true(get_time() - t0 < 2.0, "starting the cook must not block")
+    assert_true(started.find('"pending":true') >= 0 and started.find('"build_id":') >= 0, "cook is deferred: " + started)
+    var bid_at = started.find('"build_id":') + 11
+    var bid = 0
+    var sb = started.as_bytes()
+    while bid_at < len(sb) and sb[bid_at] >= 48 and sb[bid_at] <= 57:
+        bid = bid * 10 + Int(sb[bid_at] - 48)
+        bid_at += 1
+    var status = String("")
+    var t_end = get_time() + 10.0
+    while get_time() < t_end:
+        status = cook.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"code.build_status","arguments":{"build_id":'
+            + String(bid) + "}}}",
+            studio, assets, pool,
+        )
+        if status.find('"pending":true') < 0:
+            break
+        _ = external_call["usleep", Int32](UInt32(10000))
+    assert_true(status.find('"cook_report":{"ok":true') >= 0, "worker cook succeeds: " + status)
+    assert_true(status.find('"total_assets":3') >= 0 and status.find('"cache_hits":1') >= 0, "report lifted: " + status)
+
+    # asset.import: durable copy (no `.tmp` left behind), never through a symlinked directory.
+    var imp_ws = _tmp_dir("mcp_import")
+    var imp = McpServerV2(workspace_root=imp_ws)
+    var flmat = _bytes('{"format":"flmat","version":1,"base_color":[0.2,0.7,0.3],"roughness":0.4}')
+    _ = make_dirs(imp_ws + "/src")
+    _ = write_bytes(imp_ws + "/src/m.flmat", flmat)
+    var ok_imp = imp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"asset.import","arguments":'
+        + '{"source_path":"src/m.flmat","dest_path":"assets/mats/m.flmat"}}}',
+        studio, assets, pool,
+    )
+    assert_true(ok_imp.find('"isError":false') >= 0, "import succeeds: " + ok_imp)
+    assert_equal(file_size(imp_ws + "/assets/mats/m.flmat"), len(flmat))
+    assert_true(file_size(imp_ws + "/assets/mats/m.flmat.tmp") < 0, "durable write leaves no .tmp")
+    var outside = _tmp_dir("mcp_import_outside")
+    var linkp = imp_ws + "/linked"
+    _ = external_call["unlink", Int32](linkp.as_c_string_span())
+    _ = external_call["symlink", Int32](outside.as_c_string_span(), linkp.as_c_string_span())
+    var bad_imp = imp.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"asset.import","arguments":'
+        + '{"source_path":"src/m.flmat","dest_path":"linked/m.flmat"}}}',
+        studio, assets, pool,
+    )
+    assert_true(bad_imp.find('"isError":true') >= 0, "import through a symlinked dir is refused: " + bad_imp)
+    assert_true(file_size(outside + "/m.flmat") < 0, "nothing was written outside the workspace")
+
+    # Unix listener: a stale socket is replaced, a live one is never unlinked, close removes only ours.
+    var sdir = _tmp_dir("mcp_sock")
+    var sp = sdir + "/s.sock"
+    _ = external_call["unlink", Int32](sp.as_c_string_span())
+    _bind_dead_socket(sp)
+    assert_true(_sock_exists(sp), "dead socket file left behind")
+    var a = FlintMcpUnixListener(sp)
+    assert_true(a.active and a.socket_path == sp, "a stale socket (nobody answers) is unlinked and rebound")
+    var b = FlintMcpUnixListener(sp)
+    assert_true(b.active and b.socket_path != sp, "a live socket is not taken over: " + b.socket_path)
+    var b_path = b.socket_path
+    assert_true(_sock_exists(sp) and _sock_exists(b_path))
+    b.close()
+    assert_false(_sock_exists(b_path), "close unlinks our own socket")
+    assert_true(_sock_exists(sp), "close never touches another listener's socket")
+    # Someone replaced our path after we bound it: close must leave their file alone.
+    _ = external_call["unlink", Int32](sp.as_c_string_span())
+    _bind_dead_socket(sp)
+    a.close()
+    assert_true(_sock_exists(sp), "close leaves a socket file that is no longer ours")
+    _ = external_call["unlink", Int32](sp.as_c_string_span())
+    var c = FlintMcpUnixListener(sp)
+    assert_true(c.active, "fresh path binds")
+    c.close()
+    assert_false(_sock_exists(sp), "close unlinks our own socket")
+    # A regular file at the path is never unlinked.
+    var not_sock = _bytes("not a socket")
+    _ = write_bytes(sp, not_sock)
+    var d = FlintMcpUnixListener(sp)
+    assert_false(d.active, "a non-socket file at the path is refused")
+    assert_equal(file_size(sp), 12)
+    _ = external_call["unlink", Int32](sp.as_c_string_span())
+    assets.close()
+
+
 def main() raises:
     print("============================================================")
     print(" FLINT STUDIO AGENT / PROCESS-LAYER HARDENING SUITE")
@@ -379,4 +573,5 @@ def main() raises:
     test_jobs_exit_echild_prune_and_group_cancel()
     test_agent_bus_caps_coalescing_and_turn_allowance()
     test_safe_fs_and_revert_guard()
-    print("[PASS] All 6 agent hardening suites PASSED!")
+    test_mcp_deferred_items()
+    print("[PASS] All 7 agent hardening suites PASSED!")

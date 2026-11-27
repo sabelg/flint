@@ -16,7 +16,8 @@ powered by the unified Engine v5 spine (`EngineApp`, `WindowPlugin`, `TransformP
   - **`--gallery <dir>`**:
     Renders all 6 deterministic `1280x720` visual showcase shots (`01_edit_default.png` .. `06_play_hud.png`).
   - **`--mcp-stdio`**:
-    Runs `McpServerV2` in spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 `stdio` mode.
+    Runs `McpServerV2` in spec-compliant MCP (`2024-11-05` / `2025-06-18`) JSON-RPC 2.0 `stdio` mode
+    (clients must `initialize` first; `structuredContent` only for `2025-06-18`).
   - **`--mcp-connect <sock_path>`**:
     Pure-Mojo bidirectional `stdio <-> AF_UNIX` MCP proxy for live Studio Unix socket sessions.
 """
@@ -33,6 +34,7 @@ from flint.core.build_info import check_flint_version_pin, parse_flint_version_f
 from flint.core.jobs import JobPool, default_worker_count
 from flint.core.math import Vec3
 from flint.devtools.mcp_v2 import (
+    MCP_COOK_WORKER_FLAG,
     MCP_GATE_ALL,
     MCP_GATE_AUTO,
     MCP_GATE_MUTATING,
@@ -42,6 +44,7 @@ from flint.devtools.mcp_v2 import (
     default_mcp_socket_path,
     pid_is_descendant_of,
     run_mcp_connect_stdio,
+    run_mcp_cook_worker,
 )
 from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.input.plugin import InputStateResource
@@ -350,6 +353,12 @@ def _run_studio() raises -> Int:
 
     var args = argv()
     var exe_path = String(args[0]) if len(args) > 0 else String("flint-studio")
+    # Hidden child-process mode: an MCP `assets.list_and_cook` run off the editor's UI thread.
+    if len(args) >= 2 and String(args[1]) == MCP_COOK_WORKER_FLAG:
+        if len(args) != 6:
+            print("[Flint Studio] ERROR: " + String(MCP_COOK_WORKER_FLAG) + " <source_dir> <output.flpk> <cache_dir> <0|1>")
+            return 2
+        return run_mcp_cook_worker(String(args[2]), String(args[3]), String(args[4]), String(args[5]) == "1")
     var ai = 1
     while ai < len(args):
         var a = String(args[ai])
@@ -578,6 +587,10 @@ def _run_studio() raises -> Int:
         return 1
     ref assets = assets_ptr.value()[unsafe_offset=0]
     var mcp = McpServerV2(workspace_root=project_root)
+    # Socket-client cooks re-run this executable in `MCP_COOK_WORKER_FLAG` mode, off the UI thread.
+    var self_exe = real_path("/proc/self/exe")
+    if self_exe[0]:
+        mcp.cook_helper_exe = self_exe[1]
 
     if mcp_stdio:
         var mcp_pool = JobPool()

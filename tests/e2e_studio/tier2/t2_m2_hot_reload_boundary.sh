@@ -565,7 +565,7 @@ case7_ok, case7_err = False, ""
 try:
     with McpStdioClient([studio_bin, "--project", proj_dir, "--mcp-stdio"], cwd=proj_dir, framing="cl", timeout=20.0) as client:
         init_res = client.initialize()
-        if init_res.get("protocolVersion") != "2024-11-05":
+        if init_res.get("protocolVersion") != "2025-06-18":
             raise AssertionError(f"Unexpected protocolVersion: {init_res!r}")
         client.notify_initialized()
 
