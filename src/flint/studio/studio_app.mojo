@@ -2649,6 +2649,11 @@ struct FlintStudioState(Movable):
         _save_studio_dockspace(self.dock)
         self.menu.close()
         self.source_editor.close()
+        # The swapchain goes before the window: STAGE_SHUTDOWN closes the window (and its wl_display /
+        # xcb connection, which the driver's swapchain buffers live on) before the renderer.
+        var sc_ren = self.app.resources.get_ptr_mut[ScalableRenderer]()
+        if sc_ren and sc_ren.value()[unsafe_offset=0].uses_vulkan():
+            sc_ren.value()[unsafe_offset=0].gpu_slot[0].vk.close_swapchain()
         self.app.shutdown()
 
     # ---- Entity Resolution & Sync Helpers ----
@@ -5267,20 +5272,21 @@ struct FlintStudioState(Movable):
                     self.open_command_palette(PALETTE_ALL)
                 return True
             if self.command_palette.is_open:
-                if input.key_pressed(UI_KEY_BACKSPACE) and self.command_palette.raw_query.byte_length() > 0:
+                if input.key_pressed_or_repeat(UI_KEY_BACKSPACE) and self.command_palette.raw_query.byte_length() > 0:
                     var nq = utf8_drop_last_char(self.command_palette.raw_query)
                     self.command_palette.set_query(nq)
                 elif input.text_input_utf8.byte_length() > 0:
-                    var q_acc = self.command_palette.raw_query
+                    # Any UTF-8 text (accents, AltGr symbols, CJK); only ASCII control bytes are dropped,
+                    # which keeps multi-byte sequences whole.
+                    var q_bytes = List[UInt8]()
                     for b in input.text_input_utf8.as_bytes():
-                        if b >= 32 and b < 127:
-                            var ch_b = List[UInt8](capacity=1)
-                            ch_b.append(b)
-                            q_acc += String(unsafe_from_utf8=ch_b)
-                    self.command_palette.set_query(q_acc)
+                        if b >= 32 and b != 127:
+                            q_bytes.append(b)
+                    if len(q_bytes) > 0:
+                        self.command_palette.set_query(self.command_palette.raw_query + String(unsafe_from_utf8=q_bytes))
                 var pal_act = self.command_palette.handle_key(
-                    key_up=input.key_pressed(UI_KEY_UP),
-                    key_down=input.key_pressed(UI_KEY_DOWN),
+                    key_up=input.key_pressed_or_repeat(UI_KEY_UP),
+                    key_down=input.key_pressed_or_repeat(UI_KEY_DOWN),
                     key_tab=input.key_pressed(UI_KEY_TAB),
                     key_shift=shift_down,
                     key_enter=input.key_pressed(UI_KEY_ENTER),

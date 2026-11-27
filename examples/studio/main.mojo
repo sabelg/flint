@@ -50,12 +50,15 @@ from flint.platform.os import (
     env_value,
     file_size,
     get_time,
+    install_quit_signal_handlers,
     is_directory,
     make_dirs,
     parent_directory,
+    quit_signal_received,
     read_bytes,
     real_path,
 )
+from flint.render.swapchain_surface import PRESENT_FIFO
 from flint.render.render_world import (
     RENDER_TIER_0_HEADLESS_SIMD,
     RENDER_TIER_2_AAA_VISBUFFER_RT,
@@ -136,6 +139,35 @@ def _parse_anim_mode_arg(raw: String) -> Int:
     if s == "instant":
         return UI_ANIM_INSTANT
     return -1
+
+
+def _parse_size_arg(raw: String) -> Tuple[Int, Int]:
+    """`WxH` (64..8192 each) -> (W, H), or (0, 0) when malformed."""
+    var b = raw.as_bytes()
+    var w = 0
+    var h = 0
+    var seen_x = False
+    var digits = 0
+    for i in range(len(b)):
+        var c = Int(b[i])
+        if c == 120 or c == 88:  # x / X
+            if seen_x or digits == 0:
+                return (0, 0)
+            seen_x = True
+            digits = 0
+        elif c >= 48 and c <= 57:
+            digits += 1
+            if digits > 5:
+                return (0, 0)
+            if seen_x:
+                h = h * 10 + (c - 48)
+            else:
+                w = w * 10 + (c - 48)
+        else:
+            return (0, 0)
+    if not seen_x or digits == 0 or w < 64 or h < 64 or w > 8192 or h > 8192:
+        return (0, 0)
+    return (w, h)
 
 
 def _gate_mode_for_session(studio: FlintStudioState, si: Int) -> Int:
@@ -306,6 +338,8 @@ def _run_studio() raises -> Int:
     var theme_opt = -1
     var anim_mode_opt = -1
     var ui_scale_opt = Float32(-1.0)
+    var smoke_w = 0
+    var smoke_h = 0
 
     var args = argv()
     var exe_path = String(args[0]) if len(args) > 0 else String("flint-studio")
@@ -414,6 +448,17 @@ def _run_studio() raises -> Int:
                 ui_scale_opt = Float32(Float64(String(a[byte=11:])))
             except:
                 ui_scale_opt = Float32(2.0)
+        elif (a == "--size" and ai + 1 < len(args)) or a.startswith("--size="):
+            # `--headless-smoke --size WxH`: render after resizing the renderer away from 1280x720.
+            var sraw = String(args[ai + 1]) if a == "--size" else String(a[byte=7:])
+            if a == "--size":
+                ai += 1
+            var parsed = _parse_size_arg(sraw)
+            if parsed[0] <= 0:
+                print("[Flint Studio] ERROR: --size expects WxH (for example 1600x900), got: " + sraw)
+                return 1
+            smoke_w = parsed[0]
+            smoke_h = parsed[1]
         ai += 1
 
     # Pure-Mojo stdio <-> AF_UNIX proxy exits immediately with zero GPU/Window initialization
@@ -471,23 +516,34 @@ def _run_studio() raises -> Int:
         worker_threads=max(1, default_worker_count()),
         project_root=proj_arg,
     )
+    # The UI scale follows the window's content scale (Wayland preferred / fractional scale, 1.0 on
+    # X11 and KMS) for the whole session, unless the user chose one (--ui-scale, FLINT_UI_SCALE, or
+    # a zoom hotkey, seen as the scale drifting from the one applied here).
+    var ui_scale_user = False
+    var applied_content_scale = Float32(-1.0)
+    var applied_ui_scale = Float32(-1.0)
     if not is_headless:
         var env_sc = env_value("FLINT_UI_SCALE")
         if ui_scale_opt > Float32(0.0):
             studio.set_ui_scale(ui_scale_opt)
+            ui_scale_user = True
         elif env_sc.byte_length() > 0:
             try:
                 studio.set_ui_scale(Float32(Float64(env_sc)))
             except:
                 studio.set_ui_scale(Float32(2.0))
+            ui_scale_user = True
         else:
-            # Follow the compositor's scale when it reports one (Wayland preferred / fractional scale);
-            # otherwise keep Studio's 200% HiDPI default (X11 does not report a scale).
             var cs = Float32(1.0)
             var wres = studio.app.resources.get_ptr[WindowStateResource]()
             if wres:
                 cs = wres.value()[unsafe_offset=0].content_scale
-            studio.set_ui_scale(cs if cs > Float32(1.0) else Float32(2.0))
+            applied_content_scale = cs if cs > Float32(0.0) else Float32(1.0)
+            studio.set_ui_scale(applied_content_scale)
+            applied_ui_scale = studio.ui_scale
+    elif ui_scale_opt > Float32(0.0) and not mcp_stdio:
+        # Headless smoke / shots at a HiDPI scale (`--headless-smoke --ui-scale 2`).
+        studio.set_ui_scale(ui_scale_opt)
     if has_project_flag or has_project_env:
         studio.asset_browser_dir = project_root
     populate_default_studio_scene(studio)
@@ -528,7 +584,7 @@ def _run_studio() raises -> Int:
     if not ren_check or not ren_check.value()[unsafe_offset=0].uses_vulkan():
         print("[Flint Studio] ERROR: Vulkan 1.3 driver unavailable.")
         studio.shutdown()
-        return 0
+        return 1
 
     upload_default_studio_gpu_assets(studio)
     var picker = VisBufferGpuPicker()
@@ -600,6 +656,16 @@ def _run_studio() raises -> Int:
             _ = studio.apply_workspace_preset(WORKSPACE_EDIT, Float32(out_w), Float32(out_h))
         studio.set_anim_mode(UI_ANIM_INSTANT)
         studio.ui_time_sec = Float32(0.0)
+        if smoke_w > 0:
+            # A forced resize before the frame, as a window resize would do it.
+            var rz = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+            if rz:
+                if not rz.value()[unsafe_offset=0].resize(smoke_w, smoke_h):
+                    print("[Flint Studio] ERROR: renderer resize to " + String(smoke_w) + "x" + String(smoke_h) + " failed.")
+                    studio.shutdown()
+                    return 1
+                out_w = rz.value()[unsafe_offset=0].width
+                out_h = rz.value()[unsafe_offset=0].height
         var res = _render_deterministic_png(studio, assets, out_w, out_h, target_png, Float32(0.0))
 
         var rend_fin = studio.app.resources.get_ptr_mut[ScalableRenderer]()
@@ -611,7 +677,7 @@ def _run_studio() raises -> Int:
             return 1
 
         print(
-            "[Flint Studio] Saved 1280x720 Studio frame -> "
+            "[Flint Studio] Saved " + String(out_w) + "x" + String(out_h) + " Studio frame -> "
             + target_png
             + " (UIPrims=" + String(res[1])
             + ", Entities=" + String(studio.live_entity_count())
@@ -626,11 +692,18 @@ def _run_studio() raises -> Int:
     if win_opt and win_opt.value()[unsafe_offset=0].initialized and len(win_opt.value()[unsafe_offset=0].windows) > 0:
         var rend_i = studio.app.resources.get_ptr_mut[ScalableRenderer]()
         if rend_i:
-            _ = rend_i.value()[unsafe_offset=0].attach_window_surface(win_opt.value()[unsafe_offset=0].windows[0])
+            # FIFO: presents pace the loop to the display instead of rendering frames nobody sees.
+            _ = rend_i.value()[unsafe_offset=0].attach_window_surface(win_opt.value()[unsafe_offset=0].windows[0], present_mode=PRESENT_FIFO)
             if rend_i.value()[unsafe_offset=0].uses_vulkan():
                 ref gpu = rend_i.value()[unsafe_offset=0].gpu_slot[0]
                 if gpu.vk.swapchain == 0:
                     gpu.deferred_readback = True
+            # The window may not be the size Studio asked for (HiDPI, a tiling compositor): start at its
+            # real framebuffer size, since no resize event will report the difference.
+            out_w = max(64, win_opt.value()[unsafe_offset=0].width)
+            out_h = max(64, win_opt.value()[unsafe_offset=0].height)
+            if rend_i.value()[unsafe_offset=0].width != out_w or rend_i.value()[unsafe_offset=0].height != out_h:
+                _ = rend_i.value()[unsafe_offset=0].resize(out_w, out_h)
             win_ok = True
 
     if not win_ok:
@@ -639,7 +712,14 @@ def _run_studio() raises -> Int:
         if rend_s and rend_s.value()[unsafe_offset=0].uses_vulkan():
             picker.shutdown(rend_s.value()[unsafe_offset=0].gpu_slot[0])
         studio.shutdown()
-        return 0
+        return 1
+
+    # Shortcuts follow the keyboard layout's labels (Ctrl+Z is the key marked Z on AZERTY/QWERTZ).
+    var inp_cfg = studio.app.resources.get_ptr_mut[InputStateResource]()
+    if inp_cfg:
+        inp_cfg.value()[unsafe_offset=0].input.layout_shortcuts = True
+    # Ctrl+C / SIGTERM / a closed terminal: autosave and shut down normally (MCP socket removed).
+    _ = install_quit_signal_handlers()
 
     var mcp_sock = FlintMcpUnixListener(default_mcp_socket_path())
     if mcp_sock.active and mcp_sock.socket_path.byte_length() > 0:
@@ -653,6 +733,8 @@ def _run_studio() raises -> Int:
     var press_y = Float32(0.0)
     var press_additive = False
     var resume_swapchain = False
+    var ide_quit_warned = False
+    var next_gpu_recovery_at = Float64(0.0)
     var t_last = get_time()
 
     while True:
@@ -665,14 +747,39 @@ def _run_studio() raises -> Int:
         if not w_opt or not w_opt.value()[unsafe_offset=0].initialized:
             break
         ref win_res = w_opt.value()[unsafe_offset=0]
+        var quit_sig = quit_signal_received()
+        if quit_sig != 0:
+            # Not interactive: keep the work as an autosave (offered on the next start) and shut down.
+            if studio.dirty:
+                _ = studio.write_autosave()
+            var sig_note = String(" (unsaved work autosaved).") if studio.dirty else String(".")
+            print("[Flint Studio] Signal " + String(quit_sig) + " received: shutting down" + sig_note)
+            break
         if win_res.close_requested:
+            # The text workspace hides the scene UI, so the unsaved-changes modal could never show.
+            var ide_live = studio.source_editor.pty.fd >= 0
+            if studio.source_editor.visible:
+                studio.source_editor.visible = False
+                if resume_swapchain and len(win_res.windows) > 0:
+                    var r_back = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+                    if r_back:
+                        _ = r_back.value()[unsafe_offset=0].attach_window_surface(win_res.windows[0], present_mode=PRESENT_FIFO)
+                    resume_swapchain = False
+            var hold = False
             if studio.dirty and not studio.quit_requested:
+                hold = True
+                _ = studio.request_quit()
+            if ide_live and not ide_quit_warned and not studio.quit_requested:
+                # The TurboMojo session ends with Studio: say so once before it does.
+                hold = True
+                ide_quit_warned = True
+                studio.push_toast("TurboMojo is still running and closes with Studio: save its buffers, then close again to quit.", 1, 8.0)
+            if hold:
                 win_res.close_requested = False
                 if len(win_res.windows) > 0:
                     win_res.windows[0].close_requested = False
                     win_res.windows[0].x11.close_requested = False
                     win_res.windows[0].kms.close_requested = False
-                _ = studio.request_quit()
             else:
                 break
         if studio.quit_requested:
@@ -683,6 +790,13 @@ def _run_studio() raises -> Int:
             var r_opt = studio.app.resources.get_ptr_mut[ScalableRenderer]()
             if r_opt:
                 _ = r_opt.value()[unsafe_offset=0].resize(out_w, out_h)
+        if not ui_scale_user:
+            if applied_ui_scale > Float32(0.0) and abs(studio.ui_scale - applied_ui_scale) > Float32(1.0e-3):
+                ui_scale_user = True  # a zoom hotkey: the user's scale from now on
+            elif win_res.content_scale > Float32(0.0) and abs(win_res.content_scale - applied_content_scale) > Float32(1.0e-3):
+                applied_content_scale = win_res.content_scale
+                studio.set_ui_scale(applied_content_scale)
+                applied_ui_scale = studio.ui_scale
 
         var now = get_time()
         var dt = Float32(min(0.05, max(0.001, now - t_last)))
@@ -850,6 +964,30 @@ def _run_studio() raises -> Int:
                 _ = studio.nudge_selection(nx, ny, nz)
 
         _ = assets.tick(now)
+        # A lost device (driver reset, GPU hang, eGPU unplug) is rebuilt instead of leaving a frozen
+        # window; a failed attempt is retried every 2 s, sleeping meanwhile instead of spinning.
+        var r_dev = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+        if r_dev and r_dev.value()[unsafe_offset=0].uses_vulkan() and r_dev.value()[unsafe_offset=0].gpu_slot[0].is_device_lost():
+            if now >= next_gpu_recovery_at:
+                if r_dev.value()[unsafe_offset=0].gpu_slot[0].recover_from_device_loss():
+                    picker = VisBufferGpuPicker()  # its buffers died with the old device
+                    pending_pick_ctrls.clear()
+                    press_pending = False
+                    next_gpu_recovery_at = 0.0
+                    studio.push_toast("The GPU device was lost and has been recreated.", 1, 6.0)
+                else:
+                    if next_gpu_recovery_at <= 0.0:
+                        studio.push_toast("The GPU device was lost; retrying every 2 s. Save your work (Ctrl+S).", 2, 10.0)
+                    next_gpu_recovery_at = now + 2.0
+            if r_dev.value()[unsafe_offset=0].gpu_slot[0].is_device_lost():
+                _ = external_call["usleep", Int32](UInt32(50000))
+        # Clipboard: the OS selection feeds a paste; a copy or cut in a text field goes out to it.
+        if studio.ui_ctx.wants_clipboard_paste(frame_input):
+            var w_clip = studio.app.resources.get_ptr_mut[WindowStateResource]()
+            if w_clip and len(w_clip.value()[unsafe_offset=0].windows) > 0:
+                var os_text = w_clip.value()[unsafe_offset=0].windows[0].clipboard_get()
+                if os_text.byte_length() > 0:
+                    studio.ui_ctx.set_clipboard(os_text)
         var r_mcp = studio.app.resources.get_ptr_mut[ScalableRenderer]()
         var gms = 0.0
         if r_mcp and r_mcp.value()[unsafe_offset=0].uses_vulkan():
@@ -874,17 +1012,36 @@ def _run_studio() raises -> Int:
             dt=dt,
         )
         _fill_instance_entity_maps(studio, inst_to_ent, inst_to_bits)
+        if studio.ui_ctx.has_clipboard_out():
+            var clip_out = studio.ui_ctx.take_clipboard_out()
+            var w_cout = studio.app.resources.get_ptr_mut[WindowStateResource]()
+            if w_cout and len(w_cout.value()[unsafe_offset=0].windows) > 0:
+                w_cout.value()[unsafe_offset=0].windows[0].clipboard_set(clip_out)
 
         var r_post = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+        var zero_copy = False
         if r_post:
             ref renderer = r_post.value()[unsafe_offset=0]
+            zero_copy = renderer.surface.is_zero_copy_gpu()
             if renderer.uses_vulkan():
                 _ = picker.dispatch_pending_pick(renderer.gpu_slot[0], inst_to_ent, inst_to_bits)
-            if not renderer.surface.is_zero_copy_gpu():
+            if not zero_copy:
                 var frame_px = renderer.readback_pixels()
                 var w_p = studio.app.resources.get_ptr_mut[WindowStateResource]()
                 if w_p and len(w_p.value()[unsafe_offset=0].windows) > 0:
                     w_p.value()[unsafe_offset=0].windows[0].present(frame_px, renderer.width, renderer.height)
+
+        # Frame pacing. A FIFO swapchain paces itself. The CPU present path waits for the compositor's
+        # frame callback (Wayland; X11 caps its own presents). An unfocused or minimized window blocks in
+        # poll instead of rendering flat out: 10 Hz idle, 30 Hz while agents or Play still need it.
+        var w_pace = studio.app.resources.get_ptr_mut[WindowStateResource]()
+        if w_pace and len(w_pace.value()[unsafe_offset=0].windows) > 0:
+            ref pace_win = w_pace.value()[unsafe_offset=0].windows[0]
+            if not w_pace.value()[unsafe_offset=0].focused:
+                var busy = mcp_sock.client_count() > 0 or studio.pie.mode == PIE_PLAYING
+                _ = pace_win.wait_events(33 if busy else 100)
+            elif not zero_copy:
+                pace_win.wait_for_frame(17)
 
     mcp_sock.close()
     mcp_pool.stop()

@@ -2509,7 +2509,9 @@ def test_f24_x11_desktop_parity() raises:
     x11.incoming[224] = 2; x11.incoming[225] = 25; x11_put16(x11.incoming, 224 + 28, 2)
     x11.process_events()
     assert_equal(x11.pending_text_utf8, "aA€qäÄ")
-    assert_equal(len(x11.pending_keys), 6)  # auto-repeat pair did NOT add to pending_keys
+    # The auto-repeat pair adds one press of the held key (no release): InputState reports it as a repeat.
+    assert_equal(len(x11.pending_keys), 7)
+    assert_true(x11.pending_key_down[4])
     x11.pending_keys.clear()
     x11.pending_key_down.clear()
 
