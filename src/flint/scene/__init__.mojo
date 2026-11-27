@@ -39,5 +39,6 @@ from flint.scene.scene import (
     save_flprefab_file,
     load_flprefab_bytes,
     load_flprefab_file,
+    duplicate_entities,
     Scene,
 )

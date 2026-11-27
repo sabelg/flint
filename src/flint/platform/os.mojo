@@ -555,6 +555,8 @@ def write_bytes(path: String, mut data: List[UInt8]) -> Bool:
     var offset = 0
     while offset < len(data):
         var count = Int(external_call["write", Int64](Int32(fd), data.unsafe_ptr().unsafe_offset(offset), Int64(len(data) - offset)))
+        if count < 0 and last_errno() == EINTR:
+            continue  # a signal interrupted the write; retry the rest
         if count <= 0:
             close_fd(fd)
             return False
