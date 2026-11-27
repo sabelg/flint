@@ -208,6 +208,10 @@ struct StudioCommandPalette(Copyable, Movable):
     var hover_mx: Float32
     """Mouse position at the last hover-driven selection; hover only steals the selection after the mouse moves."""
     var hover_my: Float32
+    # IME composition shown after the query (set by the host each frame) and the caret drawn last
+    # frame, in UI pixels, for the IME candidate window.
+    var ime_preedit: String
+    var caret_rect: RectF
 
     def __init__(out self, visible_rows: Int = 9):
         self.is_open = False
@@ -225,6 +229,8 @@ struct StudioCommandPalette(Copyable, Movable):
         self.now_sec = 0
         self.hover_mx = Float32(-1.0e9)
         self.hover_my = Float32(-1.0e9)
+        self.ime_preedit = String()
+        self.caret_rect = RectF()
 
     def __init__(out self, *, copy: Self):
         self.is_open = copy.is_open
@@ -242,6 +248,8 @@ struct StudioCommandPalette(Copyable, Movable):
         self.now_sec = copy.now_sec
         self.hover_mx = copy.hover_mx
         self.hover_my = copy.hover_my
+        self.ime_preedit = copy.ime_preedit
+        self.caret_rect = copy.caret_rect
 
     def open(
         mut self,
@@ -740,9 +748,17 @@ def draw_command_palette(
     var search_y = pal_r.y + Float32(10.0)
     draw_studio_icon(dl, ICON_SEARCH, pal_r.x + Float32(14.0), search_y + Float32(5.0), Float32(16.0), rgba8_scale_alpha(theme.accent_primary, alpha), Float32(1.6))
     var q_x = pal_r.x + Float32(38.0)
-    if palette.raw_query.byte_length() > 0:
+    palette.caret_rect = RectF(q_x, search_y + Float32(4.0), Float32(2.0), Float32(17.0))
+    if palette.raw_query.byte_length() > 0 or palette.ime_preedit.byte_length() > 0:
         _pal_draw_text(dl, font_slot, font, palette.raw_query, q_x, search_y + Float32(4.0), Float32(14.5), rgba8_scale_alpha(theme.text_primary, alpha))
         var qw = _pal_measure_text(font, palette.raw_query, Float32(14.5))
+        if palette.ime_preedit.byte_length() > 0:
+            # IME composition: drawn after the query and underlined until it is committed.
+            var pre_w = _pal_measure_text(font, palette.ime_preedit, Float32(14.5))
+            _pal_draw_text(dl, font_slot, font, palette.ime_preedit, q_x + qw, search_y + Float32(4.0), Float32(14.5), rgba8_scale_alpha(theme.text_primary, alpha))
+            dl.add_line(q_x + qw, search_y + Float32(21.0), q_x + qw + pre_w, search_y + Float32(21.0), Float32(1.5), rgba8_scale_alpha(theme.accent_primary, alpha))
+            qw += pre_w
+        palette.caret_rect = RectF(q_x + qw + Float32(2.0), search_y + Float32(4.0), Float32(2.0), Float32(17.0))
         var blink_on = (anim.mode == UI_ANIM_INSTANT) or ((Int(anim.time_sec * Float32(2.0)) % 2) == 0)
         if blink_on:
             dl.add_rect(q_x + qw + Float32(2.0), search_y + Float32(4.0), Float32(1.8), Float32(17.0), rgba8_scale_alpha(theme.accent_primary, alpha), Float32(0.8))

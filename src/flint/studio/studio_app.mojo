@@ -4714,6 +4714,30 @@ struct FlintStudioState(Movable):
             self.toasts.clear()
             self.gallery_play_hud_active = True
 
+    def text_input_request(self) -> Tuple[Bool, RectF]:
+        """Whether a Studio text field holds the keyboard (UI text fields, the command palette, the
+        agent prompt, the TurboMojo terminal) and its caret in UI pixels, for the platform IME."""
+        if self.source_editor.visible:
+            return (True, RectF(Float32(8.0), Float32(8.0), Float32(2.0), Float32(18.0)))
+        if self.command_palette.is_open:
+            return (True, self.command_palette.caret_rect)
+        if self.ui_ctx.wants_text_input():
+            return (True, self.ui_ctx.text_caret_rect)
+        if self.agent_panel.wants_keyboard():
+            return (True, RectF(Float32(0.0), Float32(0.0), Float32(2.0), Float32(18.0)))
+        return (False, RectF())
+
+    def publish_text_input_request(mut self, ui_scale: Float32):
+        """Hands `text_input_request` to the window (framebuffer pixels), which enables or disables the
+        compositor IME on its next poll."""
+        var req = self.text_input_request()
+        var s = ui_scale if (isfinite(ui_scale) and ui_scale > Float32(0.0)) else Float32(1.0)
+        var win_res = self.app.resources.get_ptr_mut[WindowStateResource]()
+        if win_res:
+            win_res.value()[unsafe_offset=0].set_text_input(
+                req[0], req[1].x * s, req[1].y * s, max(Float32(1.0), req[1].w * s), max(Float32(1.0), req[1].h * s)
+            )
+
     def release_pointer_lock(mut self):
         var win_res = self.app.resources.get_ptr_mut[WindowStateResource]()
         if win_res:
@@ -5481,6 +5505,14 @@ struct FlintStudioState(Movable):
                             q_bytes.append(b)
                     if len(q_bytes) > 0:
                         self.command_palette.set_query(self.command_palette.raw_query + String(unsafe_from_utf8=q_bytes))
+                if input.ime_commit.byte_length() > 0:
+                    var c_bytes = List[UInt8]()
+                    for b in input.ime_commit.as_bytes():
+                        if b >= 32 and b != 127:
+                            c_bytes.append(b)
+                    if len(c_bytes) > 0:
+                        self.command_palette.set_query(self.command_palette.raw_query + String(unsafe_from_utf8=c_bytes))
+                self.command_palette.ime_preedit = input.ime_preedit if input.ime_active else String("")
                 var pal_act = self.command_palette.handle_key(
                     key_up=input.key_pressed_or_repeat(UI_KEY_UP),
                     key_down=input.key_pressed_or_repeat(UI_KEY_DOWN),
@@ -13121,6 +13153,7 @@ def emit_studio_ui_draw_list(
             studio.confirm_modal_action = 0
 
     studio.ui_ctx.end_frame()
+    studio.publish_text_input_request(ui_sc)
 
     for i in range(len(studio.ui_ctx.draw_list.prims)):
         if (studio.ui_ctx.draw_list.prims[i].header & 0xF) == PRIM_GLYPH and studio.ui_ctx.draw_list.prims[i].param0 < Float32(0.5):

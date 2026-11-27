@@ -523,8 +523,8 @@ def _run_studio() raises -> Int:
         worker_threads=max(1, default_worker_count()),
         project_root=proj_arg,
     )
-    # The UI scale follows the window's content scale (Wayland preferred / fractional scale, 1.0 on
-    # X11 and KMS) for the whole session, unless the user chose one (--ui-scale, FLINT_UI_SCALE, or
+    # The UI scale follows the window's content scale (Wayland preferred / fractional scale, X11 Xft.dpi / 96,
+    # 1.0 on KMS) for the whole session, unless the user chose one (--ui-scale, FLINT_UI_SCALE, or
     # a zoom hotkey, seen as the scale drifting from the one applied here).
     var ui_scale_user = False
     var applied_content_scale = Float32(-1.0)
@@ -814,6 +814,9 @@ def _run_studio() raises -> Int:
         var inp_opt = studio.app.resources.get_ptr[InputStateResource]()
         var frame_input = inp_opt.value()[unsafe_offset=0].input.copy() if inp_opt else InputState()
 
+        if studio.source_editor.visible:
+            # The TurboMojo terminal takes text (IME commits go to its PTY); the scene UI is not drawn.
+            win_res.set_text_input(True, Float32(8.0), Float32(8.0), Float32(2.0), Float32(18.0))
         ref window = win_res.windows[0]
         if studio.source_editor.present(window, frame_input, scene_hotkey=False):
             # Track held keys across the focus boundary so returning with Ctrl+F8

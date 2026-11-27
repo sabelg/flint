@@ -5,12 +5,24 @@ exception is FLINT_PRESENT=swapchain, where the Vulkan driver needs libwayland o
 for this window: see platform/wayland_bridge.mojo. All this code runs the same then.
 """
 from std.ffi import external_call
+from std.math import isfinite
 from flint.platform.input import InputState, layout_shortcut_code
 from flint.platform.traits import WindowBackend
 from flint.input.evdev import EvdevHub
 from flint.platform.wayland_bridge import WaylandBridge
 from flint.platform.x11 import X11Window
 from flint.platform.xkb import XkbKeymap
+from flint.platform.text_input_v3 import (
+    TextInputV3State,
+    TI3_MANAGER_GET_TEXT_INPUT,
+    TI3_REQ_COMMIT,
+    TI3_REQ_DESTROY,
+    TI3_REQ_DISABLE,
+    TI3_REQ_ENABLE,
+    TI3_REQ_SET_CONTENT_TYPE,
+    TI3_REQ_SET_CURSOR_RECTANGLE,
+    ti3_cursor_rect_from_framebuffer,
+)
 from flint.platform.kms import KmsWindow, on_virtual_console, fit_rect
 from flint.platform.vulkan import VulkanGpu, SwapchainHandle
 from flint.platform.os import env_value, env_flag, close_fd, get_time, last_errno, EINTR
@@ -445,6 +457,17 @@ struct WaylandWindow(WindowBackend):
     var pending_repeat_text: String
     # The keymap or its active group changed: rebuild the input's layout shortcut table.
     var layout_dirty: Bool
+    # IME: `zwp_text_input_manager_v3` and the seat's text_input (0 when the compositor lacks it).
+    var text_input_manager: Int
+    var text_input: Int
+    var ti3: TextInputV3State
+    # What the app asked for (`set_text_input`): a text field has keyboard focus, and its caret
+    # rectangle in framebuffer pixels.
+    var text_input_wanted: Bool
+    var text_input_rect_x: Float32
+    var text_input_rect_y: Float32
+    var text_input_rect_w: Float32
+    var text_input_rect_h: Float32
 
     def __init__(out self):
         self.fd = -1
@@ -562,6 +585,14 @@ struct WaylandWindow(WindowBackend):
         self.pending_repeat_key = -1
         self.pending_repeat_text = ""
         self.layout_dirty = True
+        self.text_input_manager = 0
+        self.text_input = 0
+        self.ti3 = TextInputV3State()
+        self.text_input_wanted = False
+        self.text_input_rect_x = 0
+        self.text_input_rect_y = 0
+        self.text_input_rect_w = 1
+        self.text_input_rect_h = 1
 
     def __moveinit__(out self, deinit existing: Self):
         self.fd = existing.fd
@@ -679,7 +710,17 @@ struct WaylandWindow(WindowBackend):
         self.pending_repeat_key = existing.pending_repeat_key
         self.pending_repeat_text = existing.pending_repeat_text^
         self.layout_dirty = existing.layout_dirty
+        self.text_input_manager = existing.text_input_manager
+        self.text_input = existing.text_input
+        self.ti3 = existing.ti3^
+        self.text_input_wanted = existing.text_input_wanted
+        self.text_input_rect_x = existing.text_input_rect_x
+        self.text_input_rect_y = existing.text_input_rect_y
+        self.text_input_rect_w = existing.text_input_rect_w
+        self.text_input_rect_h = existing.text_input_rect_h
         existing.fd = -1
+        existing.text_input = 0
+        existing.text_input_manager = 0
         existing.shared_fd = -1
         existing.shared_size = 0
         existing.using_x11 = False
@@ -1046,6 +1087,82 @@ struct WaylandWindow(WindowBackend):
         wl_append32(body, self.seat)
         _ = self.request(self.data_device_manager, 1, body)  # get_data_device
 
+    def ensure_text_input(mut self):
+        """One `zwp_text_input_v3` for the seat, once both globals are bound."""
+        if self.text_input != 0 or self.text_input_manager == 0 or self.seat == 0:
+            return
+        self.text_input = self.allocate_id()
+        var body = List[UInt8]()
+        wl_append32(body, self.text_input)
+        wl_append32(body, self.seat)
+        _ = self.request(self.text_input_manager, TI3_MANAGER_GET_TEXT_INPUT, body)
+
+    def supports_text_input_protocol(self) -> Bool:
+        """The compositor offers `zwp_text_input_v3` (IME composition); False on X11 / KMS."""
+        return (not self.using_x11) and (not self.using_kms) and self.text_input != 0
+
+    def set_text_input(mut self, wanted: Bool, x: Float32 = 0.0, y: Float32 = 0.0, w: Float32 = 1.0, h: Float32 = 1.0):
+        """A text field has keyboard focus (`wanted`) with its caret at `x, y, w, h` in framebuffer
+        pixels: enables the IME for the surface and keeps its candidate window at the caret.
+        Disables it when no field wants text. A no-op without `zwp_text_input_v3`."""
+        self.text_input_wanted = wanted
+        if wanted:
+            self.text_input_rect_x = x if isfinite(x) else Float32(0.0)
+            self.text_input_rect_y = y if isfinite(y) else Float32(0.0)
+            self.text_input_rect_w = w if (isfinite(w) and w > Float32(0.0)) else Float32(1.0)
+            self.text_input_rect_h = h if (isfinite(h) and h > Float32(0.0)) else Float32(1.0)
+        self.sync_text_input()
+
+    def _text_input_surface_rect(self) -> Tuple[Int, Int, Int, Int]:
+        var surface_w = self.viewport_width if self.viewport_width > 0 else self.width
+        var surface_h = self.viewport_height if self.viewport_height > 0 else self.height
+        var target_w: Int
+        var target_h: Int
+        if self.gpu_width > 0 and self.gpu_height > 0:
+            target_w = self.gpu_width
+            target_h = self.gpu_height
+        else:
+            var fb = self.framebuffer_size()
+            target_w = fb[0]
+            target_h = fb[1]
+        return ti3_cursor_rect_from_framebuffer(
+            self.text_input_rect_x, self.text_input_rect_y, self.text_input_rect_w, self.text_input_rect_h,
+            target_w, target_h, surface_w, surface_h,
+        )
+
+    def sync_text_input(mut self):
+        """Sends enable / disable / set_cursor_rectangle + commit when the wanted state changed."""
+        if self.text_input == 0 or self.fd < 0 or self.using_x11 or self.using_kms:
+            return
+        var want = self.text_input_wanted and self.ti3.entered_surface != 0
+        if want:
+            var r = self._text_input_surface_rect()
+            var first = not self.ti3.enabled
+            if not first and not self.ti3.rect_changed(r[0], r[1], r[2], r[3]):
+                return
+            if first:
+                _ = self.empty_request(self.text_input, TI3_REQ_ENABLE)
+                var ct = List[UInt8]()
+                wl_append32(ct, 0)  # hint: none
+                wl_append32(ct, 0)  # purpose: normal
+                _ = self.request(self.text_input, TI3_REQ_SET_CONTENT_TYPE, ct)
+                self.ti3.enabled = True
+            var body = List[UInt8]()
+            wl_append32(body, r[0])
+            wl_append32(body, r[1])
+            wl_append32(body, r[2])
+            wl_append32(body, r[3])
+            _ = self.request(self.text_input, TI3_REQ_SET_CURSOR_RECTANGLE, body)
+            _ = self.empty_request(self.text_input, TI3_REQ_COMMIT)
+            self.ti3.commit_count += 1
+            self.ti3.note_rect(r[0], r[1], r[2], r[3])
+        elif self.ti3.enabled:
+            _ = self.empty_request(self.text_input, TI3_REQ_DISABLE)
+            _ = self.empty_request(self.text_input, TI3_REQ_COMMIT)
+            self.ti3.commit_count += 1
+            self.ti3.enabled = False
+            self.ti3.forget_rect()
+
     def receive(mut self):
         if self.bridge.active():
             self.bridge.read_into(self.incoming, self.pending_fds)
@@ -1186,6 +1303,7 @@ struct WaylandWindow(WindowBackend):
                 self.seat_version = min(version, 5)
                 self.seat = self.bind_global(name, interface, self.seat_version)
                 self.ensure_data_device()
+                self.ensure_text_input()
             elif interface == "wp_fractional_scale_manager_v1" and self.fractional_scale_manager == 0:
                 self.fractional_scale_manager = self.bind_global(name, interface, 1)
             elif interface == "zxdg_decoration_manager_v1" and self.decoration_manager == 0:
@@ -1194,6 +1312,9 @@ struct WaylandWindow(WindowBackend):
                 self.data_device_version = min(version, 3)
                 self.data_device_manager = self.bind_global(name, interface, self.data_device_version)
                 self.ensure_data_device()
+            elif interface == "zwp_text_input_manager_v3" and self.text_input_manager == 0:
+                self.text_input_manager = self.bind_global(name, interface, 1)
+                self.ensure_text_input()
             elif interface == "wl_output":
                 var info = WaylandOutputInfo()
                 info.global_name = name
@@ -1270,6 +1391,11 @@ struct WaylandWindow(WindowBackend):
             return
         if object == self.toplevel and opcode == 1:
             self.close_requested = True
+            return
+        if object == self.text_input and self.text_input != 0:
+            self.ti3.handle_event(pkt, opcode, size)
+            if opcode == 0:  # enter: a field may already want text
+                self.sync_text_input()
             return
         if object == self.seat and opcode == 0:
             self.seat_capabilities = wl_get32(pkt, 8)
@@ -1835,6 +1961,8 @@ struct WaylandWindow(WindowBackend):
         for p in self.pending_dropped_files:
             input.push_dropped_file(p)
         self.pending_dropped_files.clear()
+        if self.ti3.has_output():
+            self.ti3.flush_into(input)
 
     def map_pointer(self, surface_x: Float32, surface_y: Float32) -> Tuple[Float32, Float32]:
         """Surface-local pointer coordinates (compositor logical pixels over the surface, or over the
@@ -2391,6 +2519,10 @@ struct WaylandWindow(WindowBackend):
         self.using_x11 = False
         self.destroy_shared()
         if self.fd >= 0:
+            if self.text_input > 0:
+                _ = self.empty_request(self.text_input, TI3_REQ_DESTROY)
+            if self.text_input_manager > 0:
+                _ = self.empty_request(self.text_input_manager, 0)
             if self.toplevel_decoration > 0:
                 _ = self.empty_request(self.toplevel_decoration, 0)
             if self.fractional_scale > 0:
@@ -2430,6 +2562,9 @@ struct WaylandWindow(WindowBackend):
         self.viewport_height = 0
         self.fractional_scale = 0
         self.toplevel_decoration = 0
+        self.text_input = 0
+        self.text_input_manager = 0
+        self.ti3 = TextInputV3State()
         self.data_device = 0
         self.clipboard_source = 0
         self.clipboard_owned = False

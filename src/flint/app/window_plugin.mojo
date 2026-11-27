@@ -36,6 +36,10 @@ struct WindowStateResource(Resource, Movable):
     var focused: Bool
     var initialized: Bool
     var windows: List[WaylandWindow]
+    # IME request from the app's UI: a text field has keyboard focus, with its caret rectangle in
+    # framebuffer pixels. Sent to the backend (`WaylandWindow.set_text_input`) on every poll.
+    var text_input_wanted: Bool
+    var text_input_rect: Tuple[Float32, Float32, Float32, Float32]
 
     def __init__(
         out self,
@@ -54,6 +58,14 @@ struct WindowStateResource(Resource, Movable):
         self.focused = True
         self.initialized = False
         self.windows = List[WaylandWindow]()
+        self.text_input_wanted = False
+        self.text_input_rect = (Float32(0.0), Float32(0.0), Float32(1.0), Float32(1.0))
+
+    def set_text_input(mut self, wanted: Bool, x: Float32 = 0.0, y: Float32 = 0.0, w: Float32 = 1.0, h: Float32 = 1.0):
+        """Asks for the platform IME while a text field has keyboard focus (caret in framebuffer px)."""
+        self.text_input_wanted = wanted
+        if wanted:
+            self.text_input_rect = (x, y, w, h)
 
     def request_close(mut self):
         self.close_requested = True
@@ -124,6 +136,13 @@ def _sys_window_poll(
         in_opt.value()[unsafe_offset=0].has_os_window = True
         ref input_state = in_opt.value()[unsafe_offset=0].input
         input_state.begin_frame()
+        win.set_text_input(
+            win_res.text_input_wanted,
+            win_res.text_input_rect[0],
+            win_res.text_input_rect[1],
+            win_res.text_input_rect[2],
+            win_res.text_input_rect[3],
+        )
         win.poll_events(input_state)
     var fb = win.framebuffer_size()
     if fb[0] > 0 and fb[1] > 0 and (fb[0] != win_res.width or fb[1] != win_res.height):

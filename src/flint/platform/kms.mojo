@@ -376,6 +376,25 @@ def fit_rect(source_width: Int, source_height: Int, target_width: Int, target_he
     return ((target_width - w) // 2, (target_height - h) // 2, w, h)
 
 
+def kms_pointer_axis(pos: Float32, delta: Float32, extent: Int) -> Float32:
+    """One pointer axis after a relative evdev motion: framebuffer pixels (one count is one pixel,
+    like an unaccelerated compositor pointer), clamped to `[0, extent - 1]`."""
+    var hi = Float32(max(0, extent - 1))
+    var p = pos + delta if (delta == delta) else pos  # NaN guard
+    return max(Float32(0.0), min(hi, p))
+
+
+def kms_pointer_rescale(pos: Float32, old_extent: Int, new_extent: Int) -> Float32:
+    """Keeps the pointer at the same place on screen when the framebuffer changes size
+    (a Vulkan swapchain taking the display at another mode, or giving it back)."""
+    if new_extent <= 0:
+        return Float32(0.0)
+    if old_extent <= 0:
+        return Float32(new_extent) * Float32(0.5)
+    var p = pos * Float32(new_extent) / Float32(old_extent)
+    return max(Float32(0.0), min(Float32(new_extent - 1), p))
+
+
 def possible_crtc_ids(possible_mask: Int, crtc_ids: List[Int]) -> List[Int]:
     """An encoder's `possible_crtcs` bitmask indexes the resources' CRTC list."""
     var result = List[Int]()
@@ -748,6 +767,7 @@ struct KmsWindow(WindowBackend):
     var pending_rel_x: Float32
     var pending_rel_y: Float32
     var pending_moved: Bool
+    var pointer_rebased: Bool  # the framebuffer changed size: report the position without a delta
     var pending_wheel: Float32
     var pending_keys: List[Int]
     var pending_key_down: List[Bool]
@@ -801,6 +821,7 @@ struct KmsWindow(WindowBackend):
         self.pending_rel_x = 0
         self.pending_rel_y = 0
         self.pending_moved = False
+        self.pointer_rebased = False
         self.pending_wheel = 0
         self.pending_keys = List[Int]()
         self.pending_key_down = List[Bool]()
@@ -854,6 +875,7 @@ struct KmsWindow(WindowBackend):
         self.pending_rel_x = existing.pending_rel_x
         self.pending_rel_y = existing.pending_rel_y
         self.pending_moved = existing.pending_moved
+        self.pointer_rebased = existing.pointer_rebased
         self.pending_wheel = existing.pending_wheel
         self.pending_keys = existing.pending_keys^
         self.pending_key_down = existing.pending_key_down^
@@ -938,8 +960,7 @@ struct KmsWindow(WindowBackend):
         self.destroy_buffers()
         self.for_vulkan = True
         self.flip_pending = False
-        self.width = sc.width
-        self.height = sc.height
+        self.resize_pointer_space(sc.width, sc.height)
         return sc^
 
     def detach_vulkan(mut self, mut vk: VulkanGpu) -> Bool:
@@ -952,10 +973,26 @@ struct KmsWindow(WindowBackend):
             return False
         if len(self.fb_ids) == 2:
             return True
-        self.width = self.mode.hdisplay
-        self.height = self.mode.vdisplay
+        self.resize_pointer_space(self.mode.hdisplay, self.mode.vdisplay)
         self.for_vulkan = True  # start_cpu_present: make the buffers and set our mode
         return self.start_cpu_present()
+
+    def resize_pointer_space(mut self, width: Int, height: Int):
+        """The framebuffer becomes `width x height`: the pointer keeps its place on screen."""
+        self.cursor_x = kms_pointer_rescale(self.cursor_x, self.width, width)
+        self.cursor_y = kms_pointer_rescale(self.cursor_y, self.height, height)
+        self.width = width
+        self.height = height
+        self.pointer_rebased = True
+
+    def apply_relative_motion(mut self, dx: Float32, dy: Float32):
+        """Relative evdev motion: accumulated for a locked pointer's delta, and moves the
+        framebuffer-pixel cursor (clamped to the framebuffer) for an unlocked one."""
+        self.pending_rel_x += dx
+        self.pending_rel_y += dy
+        self.cursor_x = kms_pointer_axis(self.cursor_x, dx, self.width)
+        self.cursor_y = kms_pointer_axis(self.cursor_y, dy, self.height)
+        self.pending_moved = True
 
     def set_title(mut self, title: String):
         """No window title on a bare display."""
@@ -1356,6 +1393,9 @@ struct KmsWindow(WindowBackend):
             self.drm_fd = fd
             self.card_path = path
             opened = True
+            # The pointer lives in framebuffer pixels (the mode), centred to start.
+            self.cursor_x = Float32(max(1, self.width)) * 0.5
+            self.cursor_y = Float32(max(1, self.height)) * 0.5
             break
         if not opened:
             self.last_error = "KMS unavailable: " + errors
@@ -1492,8 +1532,9 @@ struct KmsWindow(WindowBackend):
         if not has_mouse:
             return
         var rect = fit_rect(source_width, source_height, self.width, self.height)
-        var px = rect[0] + Int(self.cursor_x * Float32(rect[2]) / Float32(max(1, self.logical_width)))
-        var py = rect[1] + Int(self.cursor_y * Float32(rect[3]) / Float32(max(1, self.logical_height)))
+        # The pointer is in framebuffer pixels (`framebuffer_size()`, the mode's), so it is a screen pixel.
+        var px = Int(self.cursor_x)
+        var py = Int(self.cursor_y)
         var base = self.maps[buffer]
         var size = max(12, self.height // 60)
         for dy in range(size):
@@ -1574,7 +1615,6 @@ struct KmsWindow(WindowBackend):
 
     def read_evdev(mut self):
         var buf = List[UInt8](length=INPUT_EVENT_BYTES * 64, fill=0)
-        var mouse_scale_x = Float32(self.logical_width) / Float32(max(1, fit_rect(self.logical_width, self.logical_height, self.width, self.height)[2]))
         for device in range(len(self.input_fds)):
             while True:
                 var count = Int(external_call["read", Int64](Int32(self.input_fds[device]), buf.unsafe_ptr(), Int64(len(buf))))
@@ -1587,13 +1627,9 @@ struct KmsWindow(WindowBackend):
                     var value = events[index + 2]
                     if kind == EV_REL:
                         if code == REL_X:
-                            self.pending_rel_x += Float32(value)
-                            self.cursor_x = max(Float32(0), min(Float32(self.logical_width - 1), self.cursor_x + Float32(value) * mouse_scale_x))
-                            self.pending_moved = True
+                            self.apply_relative_motion(Float32(value), Float32(0.0))
                         elif code == REL_Y:
-                            self.pending_rel_y += Float32(value)
-                            self.cursor_y = max(Float32(0), min(Float32(self.logical_height - 1), self.cursor_y + Float32(value) * mouse_scale_x))
-                            self.pending_moved = True
+                            self.apply_relative_motion(Float32(0.0), Float32(value))
                         elif code == REL_WHEEL:
                             self.pending_wheel += Float32(value)
                     elif kind == EV_KEY and value != 2:
@@ -1615,6 +1651,9 @@ struct KmsWindow(WindowBackend):
         self.read_evdev()
         if self.using_logind:
             self.logind.drain()
+        if self.pointer_rebased and not self.pointer_locked:
+            input.pointer_entered(self.cursor_x, self.cursor_y)
+        self.pointer_rebased = False
         if self.pending_moved:
             if self.pointer_locked:
                 input.add_mouse_delta(self.pending_rel_x, self.pending_rel_y)

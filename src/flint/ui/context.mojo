@@ -410,6 +410,11 @@ struct UiContext(Movable):
     # Input capture & deferred popups (M0 F09)
     var _focused_text_id: UInt64
     var _focused_text_seen: Bool
+    # IME `delete_surrounding_text` for this frame (UTF-8 bytes before / after the caret).
+    var ime_delete_before: Int
+    var ime_delete_after: Int
+    # Caret of the focused text field this frame (UI pixels), for the IME candidate window.
+    var text_caret_rect: RectF
     var _text_widget_ids: List[UInt64]
     var hovered_rect: RectF
     var _dock_splitter_active: Bool
@@ -540,6 +545,9 @@ struct UiContext(Movable):
         self.culled_items_this_frame = 0
         self._focused_text_id = 0
         self._focused_text_seen = False
+        self.ime_delete_before = 0
+        self.ime_delete_after = 0
+        self.text_caret_rect = RectF()
         self._text_widget_ids = List[UInt64]()
         self.hovered_rect = RectF()
         self._dock_splitter_active = False
@@ -748,6 +756,8 @@ struct UiContext(Movable):
         self.key_v_pressed = input.key_pressed(UI_KEY_V)
         self.key_x_pressed = input.key_pressed(UI_KEY_X)
 
+        self.ime_delete_before = input.ime_delete_before
+        self.ime_delete_after = input.ime_delete_after
         if input.ime_commit.byte_length() > 0:
             self.ime_commit = input.ime_commit
             self.ime_active = False
@@ -957,6 +967,8 @@ struct UiContext(Movable):
         if self.ime_active and self.ime_widget_id != 0 and self.focused_id != self.ime_widget_id:
             self.cancel_ime()
         self.ime_commit = ""
+        self.ime_delete_before = 0
+        self.ime_delete_after = 0
         self.active_modal_id = 0
         self._in_frame = False
 
@@ -969,6 +981,11 @@ struct UiContext(Movable):
     @always_inline
     def is_in_frame(self) -> Bool:
         return self._in_frame
+
+    def wants_text_input(self) -> Bool:
+        """An editable text field holds keyboard focus (after `end_frame`): the window should enable
+        the platform IME (`WaylandWindow.set_text_input`) and place it at `text_caret_rect`."""
+        return self._focused_text_id != 0 or self.ime_active
 
     def wants_keyboard(self) -> Bool:
         """Returns `True` when UI captures keyboard input (focused editable text input,
@@ -2674,6 +2691,33 @@ struct UiContext(Movable):
         return out^
 
     @staticmethod
+    def _ime_delete_range(codes: List[Int], cursor_cp: Int, before_bytes: Int, after_bytes: Int) -> Tuple[Int, Int]:
+        """Codepoint range `[lo, hi)` around `cursor_cp` covering `before_bytes` / `after_bytes` of UTF-8
+        (IME `delete_surrounding_text`); a partial codepoint counts as whole."""
+        var cur = max(0, min(len(codes), cursor_cp))
+        var lo = cur
+        var left = max(0, before_bytes)
+        while left > 0 and lo > 0:
+            lo -= 1
+            left -= Self._utf8_len(codes[lo])
+        var hi = cur
+        var right = max(0, after_bytes)
+        while right > 0 and hi < len(codes):
+            right -= Self._utf8_len(codes[hi])
+            hi += 1
+        return (lo, hi)
+
+    @staticmethod
+    def _utf8_len(c: Int) -> Int:
+        if c < 0x80:
+            return 1
+        if c < 0x800:
+            return 2
+        if c < 0x10000:
+            return 3
+        return 4
+
+    @staticmethod
     def _filter_single_line_codes(text: String) -> List[Int]:
         var ins_codes = decode_utf8(text)
         var filtered = List[Int]()
@@ -2766,6 +2810,16 @@ struct UiContext(Movable):
                 st.drag_selecting = False
                 if st.select_anchor_cp == st.cursor_cp:
                     st.select_anchor_cp = -1
+
+        if focused and (self.ime_delete_before > 0 or self.ime_delete_after > 0):
+            var del_r = Self._ime_delete_range(codes, st.cursor_cp, self.ime_delete_before, self.ime_delete_after)
+            if del_r[1] > del_r[0]:
+                codes = Self._insert_codepoints_replacing(codes, del_r[0], del_r[1], List[Int]())
+                st.cursor_cp = del_r[0]
+                st.select_anchor_cp = -1
+                edited = True
+            self.ime_delete_before = 0
+            self.ime_delete_after = 0
 
         if focused:
             if self.ime_commit.byte_length() > 0:
@@ -2956,6 +3010,10 @@ struct UiContext(Movable):
         var total_render_w = self._measure_text(text, font_size) + (self._measure_text(String(self.ime_preedit), font_size) if show_ime else Float32(0.0))
         var max_scroll_x = max(Float32(0.0), total_render_w - inner_w)
         st.scroll_x = max(Float32(0.0), min(max_scroll_x, st.scroll_x))
+        if focused:
+            self.text_caret_rect = RectF(
+                pad_x + caret_px - st.scroll_x, r.y + Float32(2.0), Float32(2.0), max(Float32(1.0), r.h - Float32(4.0))
+            )
 
         self.state_map[wid] = st
 
