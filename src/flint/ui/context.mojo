@@ -52,6 +52,7 @@ from flint.ui.draw_list import (
 from flint.ui.icons import draw_studio_chevron, draw_studio_icon
 from flint.ui.theme import (
     CARD_HEADER_H,
+    mix_rgba8,
     INSPECTOR_LABEL_RATIO,
     INSPECTOR_ROW_H,
     RADIUS_MD,
@@ -277,6 +278,29 @@ struct _BoxScope(Copyable, ImplicitlyCopyable, Movable):
     var max_y: Float32
 
 
+comptime UI_DRAG_START_PX: Float32 = 4.0  # pointer travel from the press before a drag begins
+
+
+struct _TextCacheEntry(Copyable, Movable):
+    """One measured/shaped `(text, px)` pair, reused while it keeps being drawn."""
+    var text: String
+    var px: Float32
+    var width: Float32
+    var has_width: Bool
+    var has_glyphs: Bool
+    var glyphs: List[ShapedGlyph]
+    var epoch: UInt64
+
+    def __init__(out self, text: String, px: Float32, epoch: UInt64):
+        self.text = text
+        self.px = px
+        self.width = 0.0
+        self.has_width = False
+        self.has_glyphs = False
+        self.glyphs = List[ShapedGlyph]()
+        self.epoch = epoch
+
+
 @fieldwise_init
 struct _ScrollScope(Copyable, ImplicitlyCopyable, Movable):
     var id_hash: UInt64
@@ -309,6 +333,7 @@ struct UiContext(Movable):
     var state_map: Dict[UInt64, RetainedWidgetState]
     var state_epochs: Dict[UInt64, UInt64]
     var open_tree_rows: Dict[Int, Bool]  # Fast int-keyed open set for 100k virtualized outliners
+    var open_tree_row_epochs: Dict[Int, UInt64]  # last frame each `open_tree_rows` entry was read (GC)
     var frame_epoch: UInt64
     var gc_stale_frames: UInt64
     # Pointer, keyboard & gamepad frame snapshot
@@ -405,6 +430,25 @@ struct UiContext(Movable):
     var animator: UiAnimator
     var focus_visible: Bool
     var dock_style_v2: Bool
+    # Text measure/shape cache: `(text, px)` -> width + shaped glyphs, kept while used
+    var _tc_index: Dict[UInt64, Int]
+    var _tc_entries: List[_TextCacheEntry]
+    var _tc_font_key: UInt64
+    var text_cache_hits: Int
+    var text_cache_misses: Int
+    var _ui_theme_synced: Bool
+    # Press bookkeeping: drag sources and popup dismissal
+    var _press_x: Float32
+    var _press_y: Float32
+    var _drag_pending: DragDropPayload
+    var _popup_owner_rect: RectF
+    var _popup_swallowed_press: Bool
+    var _popup_combo_owner: UInt64
+    var _wheel_consumed: Bool
+    var _wheel_target: UInt64
+    var _wheel_target_next: UInt64
+    var _wheel_tentative: UInt64
+    var _wheel_tentative_sy: Float32
 
     def __init__(out self, preset_hud: Bool = False):
         self.draw_list = UiDrawList()
@@ -425,6 +469,7 @@ struct UiContext(Movable):
         self.state_map = Dict[UInt64, RetainedWidgetState]()
         self.state_epochs = Dict[UInt64, UInt64]()
         self.open_tree_rows = Dict[Int, Bool]()
+        self.open_tree_row_epochs = Dict[Int, UInt64]()
         self.frame_epoch = 0
         self.gc_stale_frames = 120
         self.screen_w = 1280.0
@@ -514,14 +559,54 @@ struct UiContext(Movable):
         self.animator = UiAnimator(UI_ANIM_NORMAL)
         self.focus_visible = False
         self.dock_style_v2 = False
+        self._tc_index = Dict[UInt64, Int]()
+        self._tc_entries = List[_TextCacheEntry]()
+        self._tc_font_key = 0
+        self.text_cache_hits = 0
+        self.text_cache_misses = 0
+        self._ui_theme_synced = False
+        self._press_x = -10000.0
+        self._press_y = -10000.0
+        self._drag_pending = DragDropPayload()
+        self._popup_owner_rect = RectF()
+        self._popup_swallowed_press = False
+        self._popup_combo_owner = 0
+        self._wheel_consumed = False
+        self._wheel_target = 0
+        self._wheel_target_next = 0
+        self._wheel_tentative = 0
+        self._wheel_tentative_sy = 0.0
 
-    def set_studio_theme(mut self, var st: StudioTheme):
-        """Switches the active Studio v2 design-system theme (syncs reduced-motion preference)."""
+    def set_studio_theme(mut self, st: StudioTheme):
+        """Switches the active Studio v2 design-system theme (syncs reduced-motion preference and
+        derives the legacy `UiTheme` colors, so M0 widgets follow the theme). Re-applying the
+        current theme is a cheap comparison, not a copy."""
         if st.reduced_motion and self.animator.mode == UI_ANIM_NORMAL:
             self.animator.set_mode(UI_ANIM_REDUCED)
         elif (not st.reduced_motion) and self.animator.mode == UI_ANIM_REDUCED:
             self.animator.set_mode(UI_ANIM_NORMAL)
-        self.studio_theme = st^
+        if self._ui_theme_synced and self.studio_theme.same_tokens(st):
+            return
+        self.studio_theme = st.copy()
+        self.sync_ui_theme_from_studio()
+
+    def sync_ui_theme_from_studio(mut self):
+        """Derives the legacy `UiTheme` colors from `studio_theme` (metrics are left alone)."""
+        ref st = self.studio_theme
+        self.theme.bg_window = st.l0_canvas
+        self.theme.bg_panel = st.l1_shell
+        self.theme.bg_header = st.l2_card
+        self.theme.bg_widget = st.l3_raised
+        self.theme.bg_widget_hover = st.l3_hover
+        self.theme.bg_widget_active = mix_rgba8(st.accent_primary, st.l3_hover, 28)
+        self.theme.accent = st.accent_primary
+        self.theme.accent_dim = mix_rgba8(st.accent_primary, st.l2_card, 50) if st.is_dark else mix_rgba8(st.accent_primary, st.l3_raised, 26)
+        self.theme.border = st.border_strong
+        self.theme.focus_ring = st.focus_ring
+        self.theme.text_primary = st.text_primary
+        self.theme.text_muted = st.text_muted
+        self.theme.modal_backdrop = st.l4_scrim
+        self._ui_theme_synced = True
 
     def set_anim_mode(mut self, mode: Int):
         """Sets micro-animation mode (`UI_ANIM_NORMAL`, `UI_ANIM_REDUCED`, or `UI_ANIM_INSTANT`)."""
@@ -571,6 +656,12 @@ struct UiContext(Movable):
         self._popup_seen = False
         self._popup_consumed_click = False
         self._popup_consumed_rect = RectF()
+        self._popup_swallowed_press = False
+        self._wheel_consumed = False
+        self._wheel_target = self._wheel_target_next
+        self._wheel_target_next = 0
+        self._wheel_tentative = 0
+        self._sweep_text_cache()
 
         var next_sw = max(Float32(1.0), screen_w if isfinite(screen_w) else Float32(1280.0))
         var next_sh = max(Float32(1.0), screen_h if isfinite(screen_h) else Float32(720.0))
@@ -607,6 +698,35 @@ struct UiContext(Movable):
         self.mouse_delta_y = input.mouse_delta_y() if isfinite(input.mouse_delta_y()) else Float32(0.0)
         self.mouse_wheel = input.mouse_wheel() if isfinite(input.mouse_wheel()) else Float32(0.0)
         self.text_utf8 = input.text_input_utf8
+
+        # A press outside an open popup (and outside the widget that owns it) only dismisses the
+        # popup: it is swallowed, so it never also clicks whatever lies underneath.
+        if (
+            self.mouse_pressed_l
+            and self._open_popup_id != 0
+            and not self._popup_rect.contains(self.mouse_x, self.mouse_y)
+            and not self._popup_owner_rect.contains(self.mouse_x, self.mouse_y)
+        ):
+            self._open_popup_id = 0
+            self._popup_kind = 0
+            self.mouse_pressed_l = False
+            self._popup_swallowed_press = True
+
+        # Drags start only from the item the press began on, after `UI_DRAG_START_PX` of travel.
+        if self.mouse_pressed_l:
+            self._press_x = self.mouse_x
+            self._press_y = self.mouse_y
+            self._drag_pending = DragDropPayload()
+        elif not self.mouse_down_l:
+            self._drag_pending = DragDropPayload()
+        elif self._drag_pending.source_id != 0 and not self.drag_drop.active:
+            var ddx = self.mouse_x - self._press_x
+            var ddy = self.mouse_y - self._press_y
+            if isfinite(ddx) and isfinite(ddy) and ddx * ddx + ddy * ddy >= UI_DRAG_START_PX * UI_DRAG_START_PX:
+                self.drag_drop = self._drag_pending
+                self.drag_drop.active = True
+                self.drag_drop.delivered = False
+                self._drag_pending = DragDropPayload()
 
         self.key_shift = input.key_down(UI_KEY_LEFT_SHIFT) or input.key_down(UI_KEY_RIGHT_SHIFT)
         self.key_ctrl = input.key_down(UI_KEY_LEFT_CTRL) or input.key_down(UI_KEY_RIGHT_CTRL)
@@ -739,6 +859,20 @@ struct UiContext(Movable):
                 except:
                     pass
 
+            var stale_rows = List[Int]()
+            for item in self.open_tree_row_epochs.items():
+                if item.value < cutoff:
+                    stale_rows.append(item.key)
+            for k in stale_rows:
+                try:
+                    _ = self.open_tree_rows.pop(k)
+                except:
+                    pass
+                try:
+                    _ = self.open_tree_row_epochs.pop(k)
+                except:
+                    pass
+
         # Focus navigation (strictly trapped inside modal_focusables whenever a modal was active this frame!)
         var modal_was_open = len(self.modal_focusables) > 0 or self.active_modal_id != 0
         self.had_modal_prev_frame = modal_was_open
@@ -858,6 +992,7 @@ struct UiContext(Movable):
             or self.had_modal_prev_frame
             or self.drag_drop.active
             or self._open_popup_id != 0
+            or self._popup_swallowed_press
             or self._dock_splitter_active
         )
 
@@ -869,6 +1004,7 @@ struct UiContext(Movable):
             or self.had_modal_prev_frame
             or self.drag_drop.active
             or self._open_popup_id != 0
+            or self._popup_swallowed_press
             or self._dock_splitter_active
         ):
             return True
@@ -996,9 +1132,98 @@ struct UiContext(Movable):
         self.state_map[wid] = fresh
         return fresh
 
-    def _measure_text(self, text: String, size_px: Float32) -> Float32:
+    # ---- Text measure/shape cache ----
+    #
+    # Widgets measure a string and then draw it, many times per frame, and mostly the same
+    # strings every frame. Each `(text, px)` is shaped once and kept while it keeps being used
+    # (entries idle for two frames are swept); a change of font clears the cache. Shaping is
+    # deterministic in `(font, text, px)`, so cached results equal fresh ones.
+
+    @always_inline
+    def _uses_shaping(self) -> Bool:
+        return self.font.valid and (self.font.has_source or len(self.font.fallbacks) > 0)
+
+    def _text_font_key(self) -> UInt64:
+        var h = self.font._shaper_fingerprint()
+        h = (h ^ UInt64(self.font.atlas_width)) * UInt64(0x100000001B3)
+        h = (h ^ UInt64(len(self.font.glyphs) if self.font.baked_count == 0 else self.font.baked_count)) * UInt64(0x100000001B3)
+        if isfinite(self.font.line_height):
+            h = (h ^ UInt64(Int(self.font.line_height * Float32(64.0)))) * UInt64(0x100000001B3)
+        if isfinite(self.font.ascent):
+            h = (h ^ UInt64(Int(self.font.ascent * Float32(64.0)))) * UInt64(0x100000001B3)
+        return h
+
+    def _sync_text_cache(mut self):
+        self.font.sync_shaper()
+        var fk = self._text_font_key()
+        if fk != self._tc_font_key:
+            self._tc_index.clear()
+            self._tc_entries.clear()
+            self._tc_font_key = fk
+
+    def _sweep_text_cache(mut self):
+        """Drops entries unused for two frames (compacting at most every 30 frames)."""
+        if len(self._tc_entries) == 0:
+            return
+        if len(self._tc_entries) < 4096 and (self.frame_epoch % 30) != 0:
+            return
+        var cutoff = self.frame_epoch - min(self.frame_epoch, UInt64(2))
+        var kept = List[_TextCacheEntry](capacity=len(self._tc_entries))
+        var index = Dict[UInt64, Int]()
+        for i in range(len(self._tc_entries)):
+            if self._tc_entries[i].epoch >= cutoff:
+                index[Self._text_key(self._tc_entries[i].text, self._tc_entries[i].px)] = len(kept)
+                kept.append(self._tc_entries[i].copy())
+        self._tc_entries = kept^
+        self._tc_index = index^
+
+    @staticmethod
+    @always_inline
+    def _text_key(text: String, px: Float32) -> UInt64:
+        var pk = UInt64(Int(px * Float32(4096.0))) if isfinite(px) else UInt64(0x7FF)
+        return hash_ui_id(pk * UInt64(0x9E3779B97F4A7C15) + UInt64(0x51ED), text)
+
+    def _text_entry(mut self, text: String, size_px: Float32) -> Int:
+        """Index of the cache entry for `(text, size_px)` with its width (and, for a shaping font,
+        its shaped glyphs) filled in, or -1 on a hash collision (the caller then computes directly)."""
+        self._sync_text_cache()
+        var key = Self._text_key(text, size_px)
+        var idx: Int
+        var found = self._tc_index.get(key)
+        if found:
+            idx = found.value()
+            if idx < 0 or idx >= len(self._tc_entries) or self._tc_entries[idx].px != size_px or self._tc_entries[idx].text != text:
+                return -1
+            self.text_cache_hits += 1
+        else:
+            idx = len(self._tc_entries)
+            self._tc_entries.append(_TextCacheEntry(text, size_px, self.frame_epoch))
+            self._tc_index[key] = idx
+            self.text_cache_misses += 1
+        self._tc_entries[idx].epoch = self.frame_epoch
+        if self._uses_shaping():
+            if not self._tc_entries[idx].has_glyphs:
+                var shaped = self.font.shape_text(text, size_px, BIDI_AUTO)
+                var total: Float32 = 0.0
+                for sg in shaped:
+                    total += sg.x_advance
+                self._tc_entries[idx].glyphs = shaped^
+                self._tc_entries[idx].has_glyphs = True
+                self._tc_entries[idx].width = total
+                self._tc_entries[idx].has_width = True
+        elif not self._tc_entries[idx].has_width:
+            self._tc_entries[idx].width = self.font.measure(text, size_px)
+            self._tc_entries[idx].has_width = True
+        return idx
+
+    def _measure_text(mut self, text: String, size_px: Float32) -> Float32:
         if self.font.valid:
-            if self.font.has_source or len(self.font.fallbacks) > 0:
+            if text.byte_length() == 0:
+                return 0.0
+            var idx = self._text_entry(text, size_px)
+            if idx >= 0:
+                return self._tc_entries[idx].width
+            if self._uses_shaping():
                 return self.font.measure_shaped(text, size_px)
             return self.font.measure(text, size_px)
         return Float32(len(decode_utf8(text))) * size_px * Float32(0.56)
@@ -1052,8 +1277,14 @@ struct UiContext(Movable):
         if self.font.valid:
             var baseline = y + size_px * Float32(0.82)
             if self.font.has_source or len(self.font.fallbacks) > 0:
-                var shaped = self.font.shape_text(text, size_px, BIDI_AUTO)
-                Self._emit_shaped_glyphs(self.draw_list, self.font_slot, self.font, shaped, x, baseline, size_px, color)
+                if text.byte_length() == 0:
+                    return
+                var idx = self._text_entry(text, size_px)
+                if idx >= 0:
+                    Self._emit_shaped_glyphs(self.draw_list, self.font_slot, self.font, self._tc_entries[idx].glyphs, x, baseline, size_px, color)
+                else:
+                    var shaped = self.font.shape_text(text, size_px, BIDI_AUTO)
+                    Self._emit_shaped_glyphs(self.draw_list, self.font_slot, self.font, shaped, x, baseline, size_px, color)
             else:
                 self.draw_list.add_text_mut(self.font_slot, self.font, text, x, baseline, size_px, color)
         else:
@@ -1264,10 +1495,10 @@ struct UiContext(Movable):
             var hot = dock.dragging_node == i or dock.hovered_splitter_node == i
             var col = self.theme.accent if hot else self.theme.border
             if k == DOCK_SPLIT_H:
-                var sx = r.x + r.w * dock.nodes[i].ratio
+                var sx = dock.split_seam(i)
                 self.draw_list.add_line(sx, r.y, sx, r.bottom(), Float32(2.0) if hot else Float32(1.0), col)
             elif k == DOCK_SPLIT_V:
-                var sy = r.y + r.h * dock.nodes[i].ratio
+                var sy = dock.split_seam(i)
                 self.draw_list.add_line(r.x, sy, r.right(), sy, Float32(2.0) if hot else Float32(1.0), col)
 
     def _draw_dock_space_v2(mut self, mut dock: DockSpace, dock_ptr_blocked: Bool):
@@ -1324,7 +1555,7 @@ struct UiContext(Movable):
                 var act_x = tx
                 var act_w = Float32(0.0)
                 var tab_font_sz = self.studio_theme.font_section
-                var n_tabs = len(dock.nodes[i].tabs)
+                var n_tabs = len(dock.nodes[i].tabs) if max_tx > tx + Float32(24.0) else 0  # a collapsed side strip shows only its chevron
                 for t in range(n_tabs):
                     var tname = dock.nodes[i].tabs[t]
                     var tw = max(Float32(58.0), self._measure_text(tname, tab_font_sz) + Float32(20.0))
@@ -1399,7 +1630,7 @@ struct UiContext(Movable):
             var col = lerp_rgba8(self.studio_theme.border_subtle, self.studio_theme.accent_primary, t_hot)
             var thick = Float32(1.0) + Float32(1.5) * t_hot
             if k == DOCK_SPLIT_H:
-                var sx = r.x + r.w * dock.nodes[i].ratio
+                var sx = dock.split_seam(i)
                 self.draw_list.add_line(sx, r.y, sx, r.bottom(), thick, col)
                 if t_hot > Float32(0.05):
                     var gh = min(Float32(36.0), r.h * Float32(0.3))
@@ -1414,7 +1645,7 @@ struct UiContext(Movable):
                         6.0,
                     )
             else:
-                var sy = r.y + r.h * dock.nodes[i].ratio
+                var sy = dock.split_seam(i)
                 self.draw_list.add_line(r.x, sy, r.right(), sy, thick, col)
                 if t_hot > Float32(0.05):
                     var gw = min(Float32(36.0), r.w * Float32(0.3))
@@ -1463,11 +1694,7 @@ struct UiContext(Movable):
             )
         )
         self.id_stack.append(wid)
-        var cx0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), content.x)))
-        var cy0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), content.y)))
-        var cx1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), content.right())))
-        var cy1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), content.bottom())))
-        self.draw_list.push_clip(cx0, cy0, cx1, cy1)
+        self.draw_list.push_clip_f(content.x, content.y, content.right(), content.bottom())
         return True
 
     def end_dock_panel(mut self):
@@ -1494,17 +1721,37 @@ struct UiContext(Movable):
             if self.hovered_id == 0:
                 self.hovered_id = wid
                 self.hovered_rect = self._clip_hovered_rect(rect)
-            if self.mouse_wheel != Float32(0.0):
-                var mw = self.mouse_wheel if isfinite(self.mouse_wheel) else Float32(0.0)
-                st.scroll_y = max(Float32(0.0), min(st.scroll_max_y, st.scroll_y - mw * Float32(36.0)))
-                self.state_map[wid] = st
+            # The wheel goes to the innermost hovered scroll view, applied here (before layout) so
+            # this frame's rects already reflect it. A nested view begins after its parent, so the
+            # last hovered view begun is the innermost: last frame's pick (`_wheel_target`) takes
+            # the wheel outright while it is still under the pointer; otherwise each hovered view
+            # takes it tentatively and hands it on (restoring its offset) to a deeper one.
+            self._wheel_target_next = wid
+            if self.mouse_wheel != Float32(0.0) and isfinite(self.mouse_wheel) and not self._wheel_consumed:
+                var definitive = wid == self._wheel_target
+                var wait_for_target = False
+                if not definitive and self._wheel_target != 0:
+                    var tr = self.cached_rects.get(self._wheel_target)
+                    wait_for_target = Bool(tr) and tr.value().contains(self.mouse_x, self.mouse_y)
+                if definitive or not wait_for_target:
+                    if self._wheel_tentative != 0 and self._wheel_tentative != wid:
+                        var prev = self.state_map.get(self._wheel_tentative)
+                        if prev:
+                            var pst = prev.value().copy()
+                            pst.scroll_y = self._wheel_tentative_sy
+                            self.state_map[self._wheel_tentative] = pst^
+                    var sy0 = st.scroll_y if isfinite(st.scroll_y) else Float32(0.0)
+                    st.scroll_y = max(Float32(0.0), min(st.scroll_max_y, sy0 - self.mouse_wheel * Float32(36.0)))
+                    self.state_map[wid] = st.copy()
+                    if definitive:
+                        self._wheel_consumed = True
+                        self._wheel_tentative = 0
+                    else:
+                        self._wheel_tentative = wid
+                        self._wheel_tentative_sy = sy0
 
         self.draw_list.add_rect(rect.x, rect.y, rect.w, rect.h, self.theme.bg_window, self.theme.corner_radius, 1.0, self.theme.border)
-        var cx0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.x)))
-        var cy0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.y)))
-        var cx1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.right())))
-        var cy1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), rect.bottom())))
-        self.draw_list.push_clip(cx0, cy0, cx1, cy1)
+        self.draw_list.push_clip_f(rect.x, rect.y, rect.right(), rect.bottom())
 
         var inner_w = max(Float32(0.0), rect.w - self.theme.scrollbar_width - Float32(8.0))
         var box_st = FlexStyle.col(gap=2.0, pad=4.0)
@@ -1544,8 +1791,10 @@ struct UiContext(Movable):
             var root_h = max(sc.view_rect.h, auto_h + Float32(8.0))
             self.dock_flex_root_idxs.append(sc.flex_idx)
             self.dock_flex_root_rects.append(RectF(sc.view_rect.x, sc.start_cursor_y - Float32(4.0), root_w, root_h))
+        # An explicit height is a hint, never a cap: rows laid out past it (gaps, wrapped
+        # lines) must stay reachable, so the larger of the two wins.
         var measured_h = (
-            sc.explicit_content_h
+            max(sc.explicit_content_h, auto_h)
             if (isfinite(sc.explicit_content_h) and sc.explicit_content_h >= Float32(0.0))
             else auto_h
         )
@@ -1557,6 +1806,17 @@ struct UiContext(Movable):
         var st = self._get_state(sc.id_hash)
         st.scroll_max_y = max_scroll
         var cur_sy = st.scroll_y if isfinite(st.scroll_y) else Float32(0.0)
+        if (
+            not self._wheel_consumed
+            and self._wheel_tentative == 0
+            and self.mouse_wheel != Float32(0.0)
+            and isfinite(self.mouse_wheel)
+            and not self._blocked_by_modal()
+            and not self._is_pointer_blocked_by_popup(sc.id_hash)
+            and sc.view_rect.contains(self.mouse_x, self.mouse_y)
+        ):
+            self._wheel_consumed = True
+            cur_sy = cur_sy - self.mouse_wheel * Float32(36.0)
         st.scroll_y = max(Float32(0.0), min(max_scroll, cur_sy))
 
         # Scrollbar track & draggable thumb
@@ -1639,9 +1899,13 @@ struct UiContext(Movable):
     def rich_label(mut self, markup: String, max_width: Float32 = 0.0):
         var safe_max_w = max_width if (isfinite(max_width) and max_width > Float32(0.0)) else Float32(0.0)
         var spans = parse_rich(markup)
-        var df = self.display_font.copy() if self.display_font.valid else self.font.copy()
+        # Borrow the fonts (the display face falls back to the UI face) instead of copying an SdfFont.
+        var has_display = self.display_font.valid
         if self.font.valid and (self.font.has_source or len(self.font.fallbacks) > 0):
-            var rls = layout_rich_shaped(spans, self.font, df, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony)
+            self.font.sync_shaper()
+            if has_display:
+                self.display_font.sync_shaper()
+            var rls = layout_rich_shaped(spans, self.font, self.display_font, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony) if has_display else layout_rich_shaped(spans, self.font, self.font, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony)
             var h = max(self.theme.row_height, rls.height + Float32(4.0))
             var w = max(Float32(40.0), rls.width if safe_max_w <= Float32(0.0) else safe_max_w)
             var r = self._alloc_item_rect(0, w, h)
@@ -1665,7 +1929,7 @@ struct UiContext(Movable):
                     else:
                         Self._emit_shaped_glyphs(self.draw_list, self.font_slot, self.font, run.glyphs, rx, r.y + run.baseline, run.px, col)
             return
-        var rl = layout_rich(spans, self.font, df, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony)
+        var rl = layout_rich(spans, self.font, self.display_font, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony) if has_display else layout_rich(spans, self.font, self.font, self.theme.font_size, 0, safe_max_w, 0, self.from_pad, self.pad_sony)
         var h = max(self.theme.row_height, rl.height + Float32(4.0))
         var w = max(Float32(40.0), rl.width if safe_max_w <= Float32(0.0) else safe_max_w)
         var r = self._alloc_item_rect(0, w, h)
@@ -1890,6 +2154,7 @@ struct UiContext(Movable):
 
         for c in range(3):
             var cid = self.widget_id(id + "#" + String(c))
+            self._register_focusable(cid, allow_auto_focus=False)
             var cr = RectF(r.x + Float32(c) * (comp_w + Float32(4.0)), r.y + Float32(2.0), comp_w, r.h - Float32(4.0))
             if not ptr_blocked and cr.contains(self.mouse_x, self.mouse_y):
                 self.hovered_id = cid
@@ -1902,7 +2167,14 @@ struct UiContext(Movable):
                 if isfinite(nv):
                     vals[c] = nv
                     changed = True
-            self.draw_list.add_rect(cr.x, cr.y, cr.w, cr.h, self.theme.bg_widget, 3.0, 1.0, self.theme.border)
+            elif not blocked and self.focused_id == cid and (self.key_left_pressed or self.key_right_pressed):
+                var step64 = sp64 if self.key_right_pressed else -sp64
+                var nv = Float32(max(lo64, min(hi64, Float64(vals[c]) + step64)))
+                if isfinite(nv) and nv != vals[c]:
+                    vals[c] = nv
+                    changed = True
+            var comp_focus = self.show_focus_ring(cid)
+            self.draw_list.add_rect(cr.x, cr.y, cr.w, cr.h, self.theme.bg_widget, 3.0, Float32(2.0) if comp_focus else Float32(1.0), self.theme.focus_ring if comp_focus else self.theme.border)
             self.draw_list.add_rect(cr.x, cr.y, 3.0, cr.h, axis_cols[c], 1.5)
             var txt = format_float2(vals[c])
             self._draw_text(txt, cr.x + Float32(6.0), cr.y + Float32(2.0), self.theme.font_size * Float32(0.88), self.theme.text_primary)
@@ -2075,7 +2347,17 @@ struct UiContext(Movable):
             if self._open_popup_id == wid:
                 self._popup_kind = 1
                 self._popup_rect = drop_r
-                self._popup_combo_items = items.copy()
+                self._popup_owner_rect = box_r
+                # Copy the item list only when it changed, not every frame the popup is open.
+                var same_items = self._popup_combo_owner == wid and len(self._popup_combo_items) == len(items)
+                if same_items:
+                    for ii in range(len(items)):
+                        if self._popup_combo_items[ii] != items[ii]:
+                            same_items = False
+                            break
+                if not same_items:
+                    self._popup_combo_items = items.copy()
+                    self._popup_combo_owner = wid
                 self._popup_combo_sel = selected_idx
                 self._popup_combo_hover = hover_row
 
@@ -2152,6 +2434,7 @@ struct UiContext(Movable):
         var changed = False
         for c in range(3):
             var cid = self.widget_id(id + "#c" + String(c))
+            self._register_focusable(cid, allow_auto_focus=False)
             var cr = RectF(field_start + Float32(c) * (comp_w + Float32(4.0)), r.y + Float32(2.0), comp_w, r.h - Float32(4.0))
             if not ptr_blocked and cr.contains(self.mouse_x, self.mouse_y):
                 self.hovered_id = cid
@@ -2164,7 +2447,14 @@ struct UiContext(Movable):
                 if isfinite(nv) and abs(Float64(nv) - Float64(vals[c])) > 1.0e-7:
                     vals[c] = nv
                     changed = True
-            self.draw_list.add_rect(cr.x, cr.y, cr.w, cr.h, self.theme.bg_widget, 3.0, 1.0, self.theme.border)
+            elif not blocked and self.focused_id == cid and (self.key_left_pressed or self.key_right_pressed):
+                var step64 = span64 * 0.01 if self.key_right_pressed else -span64 * 0.01
+                var nv = Float32(max(lo64, min(hi64, Float64(vals[c]) + step64)))
+                if isfinite(nv) and nv != vals[c]:
+                    vals[c] = nv
+                    changed = True
+            var comp_focus = self.show_focus_ring(cid)
+            self.draw_list.add_rect(cr.x, cr.y, cr.w, cr.h, self.theme.bg_widget, 3.0, Float32(2.0) if comp_focus else Float32(1.0), self.theme.focus_ring if comp_focus else self.theme.border)
             self.draw_list.add_rect(cr.x, cr.y, 3.0, cr.h, axis_cols[c], 1.5)
             self._draw_text(format_float2(vals[c]), cr.x + Float32(6.0), cr.y + Float32(2.0), self.theme.font_size * Float32(0.84), self.theme.text_primary)
 
@@ -2203,6 +2493,7 @@ struct UiContext(Movable):
                             changed = True
                 self._popup_kind = 2
                 self._popup_rect = pop_r
+                self._popup_owner_rect = sw_r
                 self._popup_color = Vec3(
                     Float32((Float64(vals[0]) - lo64) / span64),
                     Float32((Float64(vals[1]) - lo64) / span64),
@@ -2316,24 +2607,30 @@ struct UiContext(Movable):
         var prefix = encode_utf8(codes, 0, cp)
         return prefix.byte_length()
 
-    def _hit_test_codepoint_x(self, codes: List[Int], rel_x: Float32, size_px: Float32) -> Int:
-        if rel_x <= Float32(0.0) or len(codes) == 0:
-            return 0
-        var pen: Float32 = 0.0
-        var scale = size_px / (self.font.bake_px if (self.font.valid and self.font.bake_px > 0.0) else Float32(1.0))
+    def _hit_test_codepoint_x(mut self, codes: List[Int], rel_x: Float32, size_px: Float32) -> Int:
+        """Caret index nearest `rel_x`. Boundaries are measured exactly like the caret and the
+        selection (`_measure_text` of the prefix: shaped clusters, kerning and ligatures
+        included), so a click lands where the caret is then drawn. Binary search: O(log n) measures."""
         var n = len(codes)
-        for i in range(n):
-            var adv: Float32
-            if self.font.valid:
-                adv = self.font.advance_of(codes[i]) * scale
-                if i + 1 < n:
-                    adv += self.font.kern(codes[i], codes[i + 1]) * scale
+        if rel_x <= Float32(0.0) or n == 0 or not isfinite(rel_x):
+            return 0
+        if not self.font.valid:
+            var adv = size_px * Float32(0.56)
+            for i in range(n):
+                if rel_x < (Float32(i) + Float32(0.5)) * adv:
+                    return i
+            return n
+        var lo = 0
+        var hi = n
+        while lo < hi:
+            var m = (lo + hi) // 2
+            var w0 = self._measure_text(encode_utf8(codes, 0, m), size_px) if m > 0 else Float32(0.0)
+            var w1 = self._measure_text(encode_utf8(codes, 0, m + 1), size_px)
+            if rel_x < (w0 + w1) * Float32(0.5):
+                hi = m
             else:
-                adv = size_px * Float32(0.56)
-            if rel_x < pen + adv * Float32(0.5):
-                return i
-            pen += adv
-        return n
+                lo = m + 1
+        return lo
 
     @staticmethod
     def _is_word_cp(cp: Int) -> Bool:
@@ -2656,7 +2953,7 @@ struct UiContext(Movable):
             st.scroll_x = caret_px
         elif caret_px > st.scroll_x + inner_w:
             st.scroll_x = caret_px - inner_w
-        var total_render_w = self._measure_text(text, font_size) + (self._measure_text(self.ime_preedit, font_size) if show_ime else Float32(0.0))
+        var total_render_w = self._measure_text(text, font_size) + (self._measure_text(String(self.ime_preedit), font_size) if show_ime else Float32(0.0))
         var max_scroll_x = max(Float32(0.0), total_render_w - inner_w)
         st.scroll_x = max(Float32(0.0), min(max_scroll_x, st.scroll_x))
 
@@ -2670,11 +2967,7 @@ struct UiContext(Movable):
             Float32(2.0) if focused else Float32(1.0),
             self.theme.focus_ring if focused else self.theme.border,
         )
-        var cx0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), r.x + Float32(2.0))))
-        var cy0 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), r.y + Float32(1.0))))
-        var cx1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), r.right() - Float32(2.0))))
-        var cy1 = Int(max(Float32(-1000000.0), min(Float32(1000000.0), r.bottom() - Float32(1.0))))
-        self.draw_list.push_clip(cx0, cy0, cx1, cy1)
+        self.draw_list.push_clip_f(r.x + Float32(2.0), r.y + Float32(1.0), r.right() - Float32(2.0), r.bottom() - Float32(1.0))
 
         var draw_x = pad_x - st.scroll_x
         if len(codes) == 0 and placeholder.byte_length() > 0 and not focused and not show_ime:
@@ -2734,12 +3027,16 @@ struct UiContext(Movable):
                 self.box_stack[top_i].cursor_y = cy + row_h + self.box_stack[top_i].gap
                 self.culled_items_this_frame += 1
                 var cached_open = self.open_tree_rows.get(row_index)
-                return cached_open.value() if cached_open else default_open
+                if cached_open:
+                    self.open_tree_row_epochs[row_index] = self.frame_epoch
+                    return cached_open.value()
+                return default_open
 
         var is_open = default_open
         var found = self.open_tree_rows.get(row_index)
         if found:
             is_open = found.value()
+            self.open_tree_row_epochs[row_index] = self.frame_epoch
 
         var cx = self.box_stack[top_i].cursor_x + Float32(depth) * Float32(16.0)
         var rw = max(Float32(40.0), self.box_stack[top_i].rect.right() - cx)
@@ -2753,6 +3050,7 @@ struct UiContext(Movable):
             if self.mouse_pressed_l:
                 is_open = not is_open
                 self.open_tree_rows[row_index] = is_open
+                self.open_tree_row_epochs[row_index] = self.frame_epoch
 
         var ax = r.x + Float32(8.0)
         var ay = r.center_y()
@@ -2765,6 +3063,11 @@ struct UiContext(Movable):
 
         self._draw_text(String(label_text) + " #" + String(row_index), r.x + Float32(18.0), r.y + Float32(3.0), self.theme.font_size, self.theme.text_primary)
         return is_open
+
+    def clear_tree_rows(mut self):
+        """Forgets every `tree_node_indexed` open/closed state (call when the indexed list changes)."""
+        self.open_tree_rows.clear()
+        self.open_tree_row_epochs.clear()
 
     def tree_node(mut self, id: String, label_text: String, default_open: Bool = False) -> Bool:
         """Collapsible hierarchical tree node; culls offscreen rows automatically inside `begin_scroll_view`."""
@@ -2894,18 +3197,26 @@ struct UiContext(Movable):
 
     def begin_drag_source(mut self, payload_kind: String, int_val: Int = 0, str_val: String = "") -> Bool:
         """Starts a drag operation from the immediately preceding widget when dragged."""
-        if self._blocked_by_modal() or self._is_pointer_blocked_by_popup() or self.last_item_id == 0:
+        if self.last_item_id == 0:
             return False
-        if not self.drag_drop.active and self.mouse_down_l and self.last_item_rect.contains(self.mouse_x, self.mouse_y):
-            if abs(self.mouse_delta_x) + abs(self.mouse_delta_y) > Float32(0.5) or self.mouse_pressed_l:
-                self.drag_drop.active = True
-                self.drag_drop.kind = payload_kind
-                self.drag_drop.int_value = int_val
-                self.drag_drop.str_value = str_val
-                self.drag_drop.source_id = self.last_item_id
-                self.drag_drop.delivered = False
+        if self.drag_drop.active:
+            return self.drag_drop.source_id == self.last_item_id
+        if self._blocked_by_modal() or self._is_pointer_blocked_by_popup():
+            return False
+        # Arm on the press, over this item only. `begin_frame` starts the drag once the pointer has
+        # travelled `UI_DRAG_START_PX` with the button held, so a plain click (or a press that
+        # began elsewhere and slid over the item) never drags.
+        if self.mouse_pressed_l and self.last_item_rect.contains(self.mouse_x, self.mouse_y):
+            self._drag_pending = DragDropPayload(False, payload_kind, int_val, str_val, self.last_item_id, False)
+            return False
+        if self.mouse_down_l and self._drag_pending.source_id == self.last_item_id:
+            var ddx = self.mouse_x - self._press_x
+            var ddy = self.mouse_y - self._press_y
+            if isfinite(ddx) and isfinite(ddy) and ddx * ddx + ddy * ddy >= UI_DRAG_START_PX * UI_DRAG_START_PX:
+                self.drag_drop = DragDropPayload(True, payload_kind, int_val, str_val, self.last_item_id, False)
+                self._drag_pending = DragDropPayload()
                 return True
-        return self.drag_drop.active and self.drag_drop.source_id == self.last_item_id
+        return False
 
     def accept_drag_target_rect(mut self, payload_kind: String, r: RectF) -> Tuple[Bool, Int, String]:
         """Highlights `r` when hovered with matching `payload_kind` and delivers on mouse release."""
@@ -2991,7 +3302,7 @@ struct UiContext(Movable):
     # Studio v2 Tactile Widgets (`StudioTheme` + `UiAnimator` + `:focus-visible`)
     # =========================================================================
 
-    def _truncate_text_ellipsis(self, text: String, max_w: Float32, size_px: Float32) -> String:
+    def _truncate_text_ellipsis(mut self, text: String, max_w: Float32, size_px: Float32) -> String:
         """Truncates UTF-8 text cleanly on codepoint boundaries with `'...'` to fit `max_w`."""
         if not isfinite(max_w) or max_w <= Float32(0.0):
             return ""
@@ -3225,10 +3536,12 @@ struct UiContext(Movable):
         label_text: String,
         w: Float32 = 0.0,
         label_ratio: Float32 = INSPECTOR_LABEL_RATIO,
+        id: String = "",
     ) -> Tuple[RectF, RectF]:
         """Allocates a Studio v2 left-label / right-control Inspector row with clean ellipsis truncation.
-        Returns `(full_row_rect, right_control_rect)`."""
-        var wid = self.widget_id("prow:" + label_text)
+        Returns `(full_row_rect, right_control_rect)`. Pass the control's `id`: two rows that share
+        a label (\"Position\" in two components) would otherwise share one retained row rect."""
+        var wid = self.widget_id("prow:" + (id if id.byte_length() > 0 else label_text))
         var top_i = len(self.box_stack) - 1
         var avail_w = max(Float32(100.0), self.box_stack[top_i].rect.w - self.box_stack[top_i].pad_r)
         var rw = w if (isfinite(w) and w > Float32(0.0)) else avail_w
@@ -3264,7 +3577,7 @@ struct UiContext(Movable):
         var avail_w = max(Float32(100.0), self.box_stack[top_i].rect.w - self.box_stack[top_i].pad_r)
         var eff_w = w if (isfinite(w) and w > Float32(0.0)) else avail_w
         var lbl_ratio = min(INSPECTOR_LABEL_RATIO, Float32(44.0) / max(Float32(100.0), eff_w))
-        var row_pair = self.property_row_label(label_text, w, label_ratio=lbl_ratio)
+        var row_pair = self.property_row_label(label_text, w, label_ratio=lbl_ratio, id=id)
         var ctrl = row_pair[1]
         var blocked = self._blocked_by_modal()
         var ptr_blocked = blocked or self._is_pointer_blocked_by_popup()
@@ -3387,7 +3700,7 @@ struct UiContext(Movable):
     ) -> Bool:
         """Left-label Studio v2 slider with recessed pill track, bounded spring-scaled thumb & right numeric readout."""
         var wid = self.widget_id(id)
-        var row_pair = self.property_row_label(label_text, w)
+        var row_pair = self.property_row_label(label_text, w, id=id)
         var ctrl = row_pair[1]
         self._register_focusable(wid)
 
@@ -3488,7 +3801,7 @@ struct UiContext(Movable):
     ) -> Bool:
         """Left-label Studio v2 pill toggle switch with spring-gliding thumb & `:focus-visible` bloom."""
         var wid = self.widget_id(id)
-        var row_pair = self.property_row_label(label_text, w)
+        var row_pair = self.property_row_label(label_text, w, id=id)
         var ctrl = row_pair[1]
         self._register_focusable(wid)
 
