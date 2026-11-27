@@ -357,7 +357,7 @@ with McpStdioClient([studio_bin, "--project", proj_dir, "--mcp-stdio"], cwd=othe
     if q.get("count", 0) < 1:
         raise SystemExit(f"scene.load did not restore M3Crate: {q}")
 
-    pkg = c.call_tool("project.package", {"output_dir": "dist/mcp_out"})
+    pkg = c.call_tool("project.package", {"output_dir": "dist/mcp_out"}, timeout=900.0)
     print("PKG_OUT=" + pkg.get("output_dir", os.path.join(proj_dir, "dist/mcp_out")))
 PY
     )" || py_rc=$?

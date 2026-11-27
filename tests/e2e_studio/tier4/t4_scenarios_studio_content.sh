@@ -706,7 +706,7 @@ with McpStdioClient([studio_bin, "--project", proj, "--mcp-stdio"], cwd=proj, fr
         raise SystemExit(f"M0/M3 contract pending; missing MCP tools: {missing}")
 
     c.call_tool("scene.save", {"path": "assets/main.flscn"})
-    c.call_tool("project.package", {"output_dir": "dist/s4_game"})
+    c.call_tool("project.package", {"output_dir": "dist/s4_game"}, timeout=900.0)
 PY
     )" || py_rc=$?
     if [[ "$py_rc" -ne 0 ]]; then

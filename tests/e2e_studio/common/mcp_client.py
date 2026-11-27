@@ -292,13 +292,15 @@ class McpStdioClient:
                     f"buf={bytes(self._buf)!r}, stderr={stderr_tail!r}"
                 )
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def request(
+        self, method: str, params: dict[str, Any] | None = None, timeout: float | None = None
+    ) -> dict[str, Any]:
         rid = self._alloc_id()
         req: dict[str, Any] = {"jsonrpc": "2.0", "id": rid, "method": method}
         if params is not None:
             req["params"] = params
         self._send_raw(encode_frame(req, framing=self.framing))
-        resp = self._read_frame()
+        resp = self._read_frame(timeout)
         if resp.get("id") != rid:
             raise AssertionError(f"Mismatched JSON-RPC response id: expected {rid}, got {resp!r}")
         return resp
@@ -345,8 +347,11 @@ class McpStdioClient:
             raise AssertionError(f"tools/list result.tools is not a list: {resp!r}")
         return tools
 
-    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        resp = self.request("tools/call", {"name": name, "arguments": arguments or {}})
+    def call_tool(
+        self, name: str, arguments: dict[str, Any] | None = None, timeout: float | None = None
+    ) -> dict[str, Any]:
+        # `timeout` overrides the client default for slow tools (project.package compiles the game).
+        resp = self.request("tools/call", {"name": name, "arguments": arguments or {}}, timeout)
         if "error" in resp:
             raise AssertionError(f"tools/call({name}) JSON-RPC error: {resp['error']!r}")
         res = resp.get("result", {})
