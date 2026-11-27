@@ -187,6 +187,7 @@ from flint.platform.os import (
     run_process_redirected,
     unix_time_sec,
     write_bytes,
+    write_file_durable,
 )
 from flint.procedural.arch_kit import (
     build_colonnade_arcade_bay,
@@ -238,6 +239,7 @@ from flint.scene.scene import (
     PrefabInstanceComponent,
     Scene,
     UnknownComponentsComponent,
+    duplicate_entities,
     load_flprefab_bytes,
     load_flprefab_file,
 )
@@ -1791,7 +1793,7 @@ def _save_studio_dockspace(d: DockSpace):
     var out = List[UInt8](capacity=len(sb))
     for i in range(len(sb)):
         out.append(sb[i])
-    _ = write_bytes(path, out)
+    _ = write_file_durable(path, out)
 
 
 def _resolve_flint_launcher_path() -> String:
@@ -2316,7 +2318,14 @@ struct FlintStudioState(Movable):
     var flmat_pending_touch_sec: Float32
     """Last time the Inspector showed the pending edit; once it is gone from view the edit is saved."""
     var toasts: List[StudioToast]
-    var clipboard_entity_ids: List[Int]
+    var clipboard_editor_ids: List[UInt64]
+    """Copied entities by stable `editor_id` (slots are reused after delete / undo / load)."""
+    var _time_travel_view_blob: List[UInt8]
+    """The checkpoint time travel is showing; an edit attempted meanwhile is rolled back to it."""
+    var gz_saved_redo: List[EditorTransaction]
+    """Redo history parked while a gizmo drag runs; a cancelled (or motionless) drag gives it back."""
+    var fail_world_capture_for_test: Bool
+    """Test hook: `_capture_world_blob` fails, as a world that cannot be serialized would."""
     var show_navmesh_overlay: Bool
     var show_collider_overlay: Bool
 
@@ -2603,7 +2612,10 @@ struct FlintStudioState(Movable):
         self.flmat_pending_stamp = (-1, 0)
         self.flmat_pending_touch_sec = Float32(0.0)
         self.toasts = List[StudioToast]()
-        self.clipboard_entity_ids = List[Int]()
+        self.clipboard_editor_ids = List[UInt64]()
+        self._time_travel_view_blob = List[UInt8]()
+        self.gz_saved_redo = List[EditorTransaction]()
+        self.fail_world_capture_for_test = False
         self.show_navmesh_overlay = True
         self.show_collider_overlay = False
 
@@ -3046,6 +3058,10 @@ struct FlintStudioState(Movable):
         self._sync_ecs_and_physics()
 
     def _capture_world_blob(self) -> List[UInt8]:
+        """Whole-world snapshot, or an empty list when it cannot be taken: callers must then refuse the
+        edit / load rather than record an undo entry that can never be restored."""
+        if self.fail_world_capture_for_test:
+            return List[UInt8]()
         var w = BlobWriter()
         try:
             self.app.world.snapshot_blob(w)
@@ -4246,27 +4262,10 @@ struct FlintStudioState(Movable):
                 _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_CODE_DRAWER)
 
         elif act.kind == PANEL_ACT_TIME_TRAVEL_SCRUB:
-            var live_raw = self._capture_world_blob()
-            var live_hash = self.state_hash()
-            if not self.agent_bus.time_travel_active:
-                _ = self.agent_checkpoints.save_live_snapshot(live_raw)
-            var tt = self.agent_bus.enter_time_travel(act.agent_id, act.step_index, live_raw, live_hash)
-            var si = self.agent_bus.find_session_index(act.agent_id)
-            if si >= 0 and act.step_index >= 0 and act.step_index < len(self.agent_bus.sessions[si].steps):
-                var sid = Int(self.agent_bus.sessions[si].steps[act.step_index].step_id)
-                var cp = self.agent_checkpoints.get_step_post_bytes(sid)
-                if cp[0] and len(cp[1]) > 0:
-                    _ = self._restore_world_blob(cp[1])
-                elif tt[0] and len(tt[1]) > 0:
-                    _ = self._restore_world_blob(tt[1])
+            _ = self.time_travel_scrub(act.agent_id, act.step_index)
 
         elif act.kind == PANEL_ACT_TIME_TRAVEL_EXIT:
-            var ex = self.agent_bus.exit_time_travel()
-            var live_cp = self.agent_checkpoints.restore_live_snapshot(clear_after=True)
-            if live_cp[0] and len(live_cp[1]) > 0:
-                _ = self._restore_world_blob(live_cp[1])
-            elif ex[0] and len(ex[1]) > 0:
-                _ = self._restore_world_blob(ex[1])
+            self.exit_time_travel()
 
         elif act.kind == PANEL_ACT_REVERT_STEP or act.kind == PANEL_ACT_REVERT_TURN:
             var plan = (
@@ -4284,6 +4283,12 @@ struct FlintStudioState(Movable):
                     "It would discard " + String(later_user_edits) + " of your later edits. Undo those first.",
                 )
             elif plan.valid:
+                # The revert is one undoable edit of the live world (never of a time-travel view).
+                self.exit_time_travel()
+                var rv_before = self._capture_world_blob()
+                var rv_prev_ids = self.selected_entity_ids.copy()
+                var rv_prev_primary = self.selected_entity_id
+                var rv_prev_anchor = self.selection_anchor_id
                 var restored_world = False
                 if act.kind == PANEL_ACT_REVERT_STEP:
                     var cp = self.agent_checkpoints.get_step_pre_bytes(Int(act.step_id))
@@ -4294,7 +4299,18 @@ struct FlintStudioState(Movable):
                     if cp_t[0] and len(cp_t[1]) > 0:
                         restored_world = self._restore_world_blob(cp_t[1])
                 if not restored_world and len(plan.restore_world_lz4) > 0:
-                    _ = self._restore_world_blob(plan.restore_world_lz4)
+                    restored_world = self._restore_world_blob(plan.restore_world_lz4)
+                if restored_world:
+                    # Tagged with the agent, so the revert never counts as a later *user* edit that
+                    # would block reverting the rest of the agent's work.
+                    var keep_agent = self._active_tx_agent_id
+                    self._active_tx_agent_id = Int(act.agent_id)
+                    self._record_world_tx(
+                        TX_BATCH_EDIT, -1, List[Int](), rv_before^, rv_prev_ids, rv_prev_primary, rv_prev_anchor,
+                        "Revert Agent Step" if act.kind == PANEL_ACT_REVERT_STEP else "Revert Agent Turn",
+                    )
+                    self._active_tx_agent_id = keep_agent
+                    self.mark_dirty(True)
                 for fi in range(len(plan.file_paths)):
                     if plan.file_existed[fi]:
                         var sb = plan.file_old_texts[fi].as_bytes()
@@ -4308,6 +4324,53 @@ struct FlintStudioState(Movable):
                     "Reverted Agent Step" if act.kind == PANEL_ACT_REVERT_STEP else "Reverted Agent Turn",
                     "",
                 )
+
+    def time_travel_scrub(mut self, agent_id: UInt32, step_index: Int) -> Bool:
+        """Shows an agent step's checkpoint. Scrubbing is read-only: while it is active saves,
+        autosaves, undo / redo and edits are refused (`_time_travel_blocks_edit`), and the live world
+        comes back on `exit_time_travel`."""
+        var first = not self.agent_bus.time_travel_active
+        if first:
+            _ = self.commit_pending_flmat_edit()  # a half-typed material edit belongs to the live scene
+        var live_raw = self._capture_world_blob() if first else List[UInt8]()
+        if first and len(live_raw) == 0:
+            self.push_toast("Time travel unavailable: could not snapshot the scene", 2, 3.5)
+            return False
+        var live_hash = self.state_hash()
+        if first:
+            _ = self.agent_checkpoints.save_live_snapshot(live_raw)
+        var tt = self.agent_bus.enter_time_travel(agent_id, step_index, live_raw, live_hash)
+        var si = self.agent_bus.find_session_index(agent_id)
+        var shown = False
+        if si >= 0 and step_index >= 0 and step_index < len(self.agent_bus.sessions[si].steps):
+            var sid = Int(self.agent_bus.sessions[si].steps[step_index].step_id)
+            var cp = self.agent_checkpoints.get_step_post_bytes(sid)
+            if cp[0] and len(cp[1]) > 0:
+                shown = self._restore_world_blob(cp[1])
+            elif tt[0] and len(tt[1]) > 0:
+                shown = self._restore_world_blob(tt[1])
+        if shown:
+            self._time_travel_view_blob = self._capture_world_blob()
+        return shown
+
+    def exit_time_travel(mut self):
+        """Leaves time travel and puts the live world back (no-op when not time travelling)."""
+        if not self.agent_bus.time_travel_active:
+            return
+        var ex = self.agent_bus.exit_time_travel()
+        var live_cp = self.agent_checkpoints.restore_live_snapshot(clear_after=True)
+        if live_cp[0] and len(live_cp[1]) > 0:
+            _ = self._restore_world_blob(live_cp[1])
+        elif ex[0] and len(ex[1]) > 0:
+            _ = self._restore_world_blob(ex[1])
+        self._time_travel_view_blob = List[UInt8]()
+
+    def _time_travel_blocks_edit(mut self) -> Bool:
+        """True (with a toast) while time travel is showing an agent checkpoint."""
+        if not self.agent_bus.time_travel_active:
+            return False
+        self.push_toast("Time travel is read-only: exit it to edit", 1, 2.5)
+        return True
 
     def ingest_mcp_events(mut self, var events: List[BridgedMcpEvent]) -> Int:
         for i in range(len(events)):
@@ -4657,22 +4720,37 @@ struct FlintStudioState(Movable):
             rps.has_editor_camera = True
 
     def copy_selected(mut self) -> Int:
+        """Copies the selection by stable `editor_id`, so a paste after a delete / undo / reload never
+        duplicates whatever entity reused the old slot."""
         self._normalize_selection_from_primary()
-        self.clipboard_entity_ids.clear()
+        self._ensure_editor_ids()
+        self.clipboard_editor_ids.clear()
         for i in range(len(self.selected_entity_ids)):
             if self.is_alive_id(self.selected_entity_ids[i]):
-                self.clipboard_entity_ids.append(self.selected_entity_ids[i])
-        if len(self.clipboard_entity_ids) == 0 and self.is_alive_id(self.selected_entity_id):
-            self.clipboard_entity_ids.append(self.selected_entity_id)
-        if len(self.clipboard_entity_ids) > 0:
-            self.push_toast("Copied " + String(len(self.clipboard_entity_ids)) + " entity(s)", 0, 1.8)
-        return len(self.clipboard_entity_ids)
+                var eid = self.editor_id_of(self.selected_entity_ids[i])
+                if eid != 0:
+                    self.clipboard_editor_ids.append(eid)
+        if len(self.clipboard_editor_ids) == 0 and self.is_alive_id(self.selected_entity_id):
+            var eid0 = self.editor_id_of(self.selected_entity_id)
+            if eid0 != 0:
+                self.clipboard_editor_ids.append(eid0)
+        if len(self.clipboard_editor_ids) > 0:
+            self.push_toast("Copied " + String(len(self.clipboard_editor_ids)) + " entity(s)", 0, 1.8)
+        return len(self.clipboard_editor_ids)
+
+    def clipboard_slots(self) -> List[Int]:
+        """Current slots of the copied entities that still exist."""
+        var out = List[Int]()
+        for i in range(len(self.clipboard_editor_ids)):
+            var slot = self.slot_for_editor_id(self.clipboard_editor_ids[i])
+            if slot >= 0 and self.is_alive_id(slot):
+                out.append(slot)
+        return out^
 
     def paste_clipboard(mut self, record_undo: Bool = True) -> List[Int]:
-        var srcs = List[Int]()
-        for i in range(len(self.clipboard_entity_ids)):
-            if self.is_alive_id(self.clipboard_entity_ids[i]):
-                srcs.append(self.clipboard_entity_ids[i])
+        if self._time_travel_blocks_edit():
+            return List[Int]()
+        var srcs = self._subtree_roots(self.clipboard_slots())
         var created = List[Int]()
         if len(srcs) == 0:
             return created^
@@ -4776,21 +4854,35 @@ struct FlintStudioState(Movable):
         return self.load_scene_file(path)
 
     def new_scene(mut self, force: Bool = False) -> Bool:
+        """Empties the world into an *untitled* scene (the first save asks where, so it can never
+        overwrite the level that was open). New is one undoable step, like a load: undo brings the old
+        scene, its file path and its saved / unsaved state back."""
         _ = self.commit_pending_flmat_edit()
         if not force and self.dirty:
             self.confirm_modal_open = True
             self.confirm_modal_action = 2
             return False
+        self.exit_time_travel()
         if self.pie.mode != PIE_STOPPED:
             self._abort_pie_session()
+        var before_blob = self._capture_world_blob()
+        if len(before_blob) == 0:
+            self.push_toast("New scene refused: the current scene could not be snapshotted for undo", 2, 4.0)
+            return False
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+        var prev_scene_path = self.scene_file_path
+        var prev_saved = self._saved_tx_id
+        if self.dirty:
+            self.discard_autosave()  # the user chose Discard for this scene's unsaved work
         for i in range(len(self.app.world.entities)):
             if self.app.world.entities[i].alive:
                 var e = Entity(UInt32(i), self.app.world.entities[i].generation)
                 _ = self.app.world.despawn(e)
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-        self.clipboard_entity_ids.clear()
+        self.clipboard_editor_ids.clear()
         self.clear_selection()
+        self.reject_all_mcp_approvals("Scene changed before approval")
         self.gpu_materials.clear_entity_slots()
         self._pie_frame_updated = False
         self._int_edit_wid = UInt64(0)
@@ -4800,6 +4892,19 @@ struct FlintStudioState(Movable):
         self._last_preview_anim_time = Float32(0.0)
         self._clear_render_and_resolver_scene_caches()
         self._reset_physics_world_and_sync()
+        self.scene_file_path = String("")
+        self.discard_autosave()  # a stale untitled autosave must not be offered for this new scene
+        var top_before = self._top_tx_id()
+        self._record_world_tx(
+            TX_BATCH_EDIT, -1, List[Int](), before_blob^, prev_ids, prev_primary, prev_anchor, "New Scene"
+        )
+        if self._top_tx_id() != top_before:
+            ref top = self.undo_stack[len(self.undo_stack) - 1]
+            top.changes_scene_path = True
+            top.prev_scene_path = prev_scene_path
+            top.next_scene_path = String("")
+            top.prev_saved_tx_id = prev_saved
+            top.load_leaves_clean = True
         self.mark_dirty(False)
         self.push_toast("New scene created", 0, 2.5)
         return True
@@ -5315,7 +5420,7 @@ struct FlintStudioState(Movable):
                         self.push_toast("Reload failed: " + self.hot_reload_host.last_error, 2, 4.0)
                 if self.input_map.just_pressed("editor_copy") and self.selected_count() > 0:
                     _ = self.copy_selected()
-                if self.input_map.just_pressed("editor_paste") and len(self.clipboard_entity_ids) > 0:
+                if self.input_map.just_pressed("editor_paste") and len(self.clipboard_editor_ids) > 0:
                     _ = self.paste_clipboard(record_undo=True)
                 if self.input_map.just_pressed("editor_duplicate") and self.selected_count() > 0:
                     if len(self.selected_entity_ids) > 1:
@@ -5834,7 +5939,7 @@ struct FlintStudioState(Movable):
             buf.append(10)
         var dst = self.recent_scenes_path()
         _ = make_dirs(parent_directory(dst))
-        _ = write_bytes(dst, buf)
+        _ = write_file_durable(dst, buf)
 
     def open_file_modal(mut self, save_as: Bool):
         self.file_modal_open = True
@@ -5899,8 +6004,16 @@ struct FlintStudioState(Movable):
         _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_INSPECTOR)
         self.rename_focus_requested = True
 
+    def autosave_source_path(self) -> String:
+        """The full path the autosave belongs to: the resolved scene path, or "" while untitled."""
+        if self.scene_file_path.byte_length() == 0:
+            return String("")
+        return self._resolve_scene_io_path(self.scene_file_path)
+
     def autosave_path(self) -> String:
-        """`<project>/.flint/autosave/<scene>.autosave.flscnb`: next to the project, never the user's file."""
+        """`<project>/.flint/autosave/<scene>-<hash>.autosave.flscnb`: next to the project, never the
+        user's file. The hash is of the full scene path, so `a/level.flscn` and `b/level.flscn` never
+        share (and overwrite) one autosave."""
         var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
         var name = String("untitled")
         if self.scene_file_path.byte_length() > 0:
@@ -5922,16 +6035,60 @@ struct FlintStudioState(Movable):
             name = trimmed^
         if name.byte_length() == 0:
             name = String("untitled")
-        return root + "/.flint/autosave/" + name + ".autosave.flscnb"
+        var src = self.autosave_source_path()
+        var key = List[UInt8](capacity=src.byte_length())
+        for c in src.as_bytes():
+            key.append(c)
+        var h = fnv64(key)
+        var digits = String("0123456789abcdef").as_bytes()
+        var hex = List[UInt8](capacity=16)
+        for k in range(16):
+            hex.append(digits[Int((h >> UInt64(60 - 4 * k)) & UInt64(15))])
+        return root + "/.flint/autosave/" + name + "-" + String(unsafe_from_utf8=hex) + ".autosave.flscnb"
+
+    @staticmethod
+    def _wrap_autosave(source: String, payload: List[UInt8]) -> List[UInt8]:
+        """Autosave file: `FLAS`, u32 LE length + the scene path it belongs to, then the `.flscnb` bytes."""
+        var sb = source.as_bytes()
+        var out = List[UInt8](capacity=8 + len(sb) + len(payload))
+        for c in String("FLAS").as_bytes():
+            out.append(c)
+        var n = UInt32(len(sb))
+        for k in range(4):
+            out.append(UInt8((n >> UInt32(8 * k)) & UInt32(255)))
+        for c in sb:
+            out.append(c)
+        for k in range(len(payload)):
+            out.append(payload[k])
+        return out^
+
+    @staticmethod
+    def _unwrap_autosave(raw: List[UInt8]) -> Tuple[Bool, String, List[UInt8]]:
+        """(valid, source scene path, `.flscnb` bytes) of an autosave file."""
+        if len(raw) < 8 or raw[0] != 70 or raw[1] != 76 or raw[2] != 65 or raw[3] != 83:  # "FLAS"
+            return (False, String(""), List[UInt8]())
+        var n = Int(raw[4]) | (Int(raw[5]) << 8) | (Int(raw[6]) << 16) | (Int(raw[7]) << 24)
+        if n < 0 or 8 + n > len(raw):
+            return (False, String(""), List[UInt8]())
+        var src = String(unsafe_from_utf8=raw[8 : 8 + n])
+        var payload = List[UInt8](capacity=len(raw) - 8 - n)
+        for k in range(8 + n, len(raw)):
+            payload.append(raw[k])
+        return (True, src^, payload^)
 
     def autosave_available(self) -> Bool:
-        """True when an autosave newer than the scene file exists (offered for recovery at startup)."""
-        var a = file_stamp(self.autosave_path())
+        """True when an autosave of *this* scene path, newer than the scene file, exists (offered for
+        recovery at startup and after a load)."""
+        var p = self.autosave_path()
+        var a = file_stamp(p)
         if a[0] <= 0:
+            return False
+        var un = Self._unwrap_autosave(read_bytes(p))
+        if not un[0] or un[1] != self.autosave_source_path():
             return False
         if self.scene_file_path.byte_length() == 0:
             return True
-        var f = file_stamp(self.scene_file_path)
+        var f = file_stamp(self.autosave_source_path())
         return f[0] < 0 or a[1] > f[1]
 
     def discard_autosave(mut self):
@@ -5941,12 +6098,17 @@ struct FlintStudioState(Movable):
 
     def write_autosave(mut self) -> Bool:
         """Writes the current world to `autosave_path()` without touching `scene_file_path` or the dirty
-        flag, so a crash loses at most one autosave interval of work."""
+        flag, so a crash loses at most one autosave interval of work. The write is durable (tmp + fsync
+        + rename) and the file records which scene path it belongs to."""
         var target = self.autosave_path()
         var parent = parent_directory(target)
         if parent.byte_length() > 0 and parent != ".":
             _ = make_dirs(parent)
-        if not self.scene.save_flscnb_file(target, self.app.world, self.registry):
+        var payload = self.scene.save_flscnb_bytes(self.app.world, self.registry)
+        if len(payload) == 0:
+            return False
+        var wrapped = Self._wrap_autosave(self.autosave_source_path(), payload)
+        if not write_file_durable(target, wrapped):
             return False
         self.last_autosave_path = target
         return True
@@ -5958,8 +6120,8 @@ struct FlintStudioState(Movable):
         if self.autosave_interval_sec <= Float32(0.0) or not self.dirty:
             self._autosave_accum_sec = Float32(0.0)
             return False
-        if self.pie.mode != PIE_STOPPED:
-            return False
+        if self.pie.mode != PIE_STOPPED or self.agent_bus.time_travel_active:
+            return False  # Play / time travel show a world that is not the user's scene
         if isfinite(dt) and dt > Float32(0.0):
             self._autosave_accum_sec += min(dt, Float32(1.0))
         if self._autosave_accum_sec < self.autosave_interval_sec:
@@ -5976,9 +6138,30 @@ struct FlintStudioState(Movable):
             return False
         return self.load_scene_file(p, recovery=True)
 
+    def _untitled_save_suggestion(self) -> String:
+        """A Save As default for an untitled scene that names no existing file."""
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        var base = root + "/scenes/untitled"
+        var cand = base + ".flscnb"
+        var n = 2
+        while file_size(cand) >= 0 and n < 1000:
+            cand = base + "-" + String(n) + ".flscnb"
+            n += 1
+        return cand
+
     def save_scene_file(mut self, path: String = "") -> Bool:
         """Saves the Studio scene via `Scene.save_flscnb_file` (`.flscnb`/`.flscene`) or `Scene.save_flscn_file` (`.flscn`)."""
         _ = self.commit_pending_flmat_edit()
+        if self.agent_bus.time_travel_active:
+            # The world on screen is an agent checkpoint being scrubbed, not the user's scene.
+            self.push_toast("Exit time travel before saving", 1, 3.0)
+            return False
+        if path.byte_length() == 0 and self.scene_file_path.byte_length() == 0:
+            # Untitled (File > New): the first save asks where, never overwriting another level.
+            self.open_file_modal(True)
+            self.file_modal_path = self._untitled_save_suggestion()
+            self.push_toast("Choose where to save the new scene", 0, 3.0)
+            return False
         var target = self._resolve_scene_io_path(path)
         if target.byte_length() == 0:
             self.push_toast("Save failed: empty path", 2, 3.0)
@@ -5996,7 +6179,9 @@ struct FlintStudioState(Movable):
             ok = self.scene.save_flscnb_file(target, self.app.world, self.registry)
         if not ok:
             self.push_toast("Failed to save scene", 2, 3.5)
-            return False
+            return False  # the old file and any autosave are left untouched
+        if self.scene_file_path.byte_length() == 0:
+            self.discard_autosave()  # an untitled scene's autosave is superseded by its first real file
         self.scene_file_path = target
         self.note_recent_scene(target)
         self.mark_dirty(False)
@@ -6155,6 +6340,15 @@ struct FlintStudioState(Movable):
         if len(raw) == 0:
             self.push_toast("Load failed: " + target, 2, 3.5)
             return False
+        if recovery:
+            # An autosave carries the scene path it was taken from: never restore another scene's work.
+            var un = Self._unwrap_autosave(raw)
+            if not un[0] or un[1] != self.autosave_source_path():
+                self.push_toast("Autosave does not belong to this scene", 2, 3.5)
+                return False
+            raw = un[2].copy()
+        # Time travel shows an agent checkpoint; the load (and its undo entry) starts from the live scene.
+        self.exit_time_travel()
         var is_json = target.endswith(".flscn") or Self._raw_starts_with_json_object(raw)
         var pie_world_unknown = False
         if self.pie.mode != PIE_STOPPED:
@@ -6185,6 +6379,10 @@ struct FlintStudioState(Movable):
         # Scene load is an undoable command: the world before the load is kept as its undo state,
         # instead of the old behaviour of wiping the user's whole undo/redo history.
         var before_blob = self._capture_world_blob()
+        if len(before_blob) == 0 and not pie_world_unknown:
+            # Without a snapshot a failed parse could not put the scene back, and the load could not be undone.
+            self.push_toast("Load refused: the current scene could not be snapshotted", 2, 4.0)
+            return False
         var prev_ids = self.selected_entity_ids.copy()
         var prev_primary = self.selected_entity_id
         var prev_anchor = self.selection_anchor_id
@@ -6195,11 +6393,13 @@ struct FlintStudioState(Movable):
                 _ = self.scene.load_flscnb_bytes(self.app.world, self.registry, raw, clear_existing=True)
         except:
             # `clear_existing` may have emptied the world before the parse failed: put the scene back.
-            _ = self._restore_world_blob(before_blob)
+            if len(before_blob) > 0:
+                _ = self._restore_world_blob(before_blob)
             self._sync_ecs_and_physics()
             self.push_toast("Failed to parse " + target, 2, 3.5)
             return False
         self.clear_selection()
+        self.clipboard_editor_ids.clear()  # copied ids belonged to the old scene
         if len(self.app.world.entities) > 0 and self.app.world.entities[0].alive:
             self.select_entity(0)
         var prev_scene_path = self.scene_file_path
@@ -6251,6 +6451,8 @@ struct FlintStudioState(Movable):
         else:
             self.mark_dirty(False)
             self.push_toast("Loaded " + target, 0, 2.5)
+            if self.autosave_available():
+                self.push_toast("This scene has a newer autosave: File > Recover Autosave brings it back", 1, 6.0)
         return True
 
     @staticmethod
@@ -6975,26 +7177,55 @@ struct FlintStudioState(Movable):
         if tx.step_id == UInt64(0) and self._active_tx_step_id != UInt64(0):
             tx.step_id = self._active_tx_step_id
         self.undo_stack.append(tx^)
-        if len(self.undo_stack) > MAX_UNDO_STACK:
-            var excess = len(self.undo_stack) - MAX_UNDO_STACK
-            var trimmed = List[EditorTransaction](capacity=MAX_UNDO_STACK)
-            for i in range(excess, len(self.undo_stack)):
-                trimmed.append(self.undo_stack[i].copy())
-            self.undo_stack = trimmed^
+        self._enforce_undo_budget()
 
-        var total_bytes = 0
+    def undo_history_bytes(self) -> Int:
+        """Approximate bytes held by undo *and* redo history."""
+        var total = 0
         for i in range(len(self.undo_stack)):
-            total_bytes += self.undo_stack[i].approx_bytes()
-        if total_bytes > MAX_UNDO_BLOB_BYTES and len(self.undo_stack) > 32:
-            var drop_n = 0
-            while total_bytes > MAX_UNDO_BLOB_BYTES and len(self.undo_stack) - drop_n > 32:
-                total_bytes -= self.undo_stack[drop_n].approx_bytes()
-                drop_n += 1
-            if drop_n > 0:
-                var trimmed_b = List[EditorTransaction](capacity=len(self.undo_stack) - drop_n)
-                for i in range(drop_n, len(self.undo_stack)):
-                    trimmed_b.append(self.undo_stack[i].copy())
-                self.undo_stack = trimmed_b^
+            total += self.undo_stack[i].approx_bytes()
+        for i in range(len(self.redo_stack)):
+            total += self.redo_stack[i].approx_bytes()
+        return total
+
+    @staticmethod
+    def _drop_front(mut stack: List[EditorTransaction], n: Int):
+        """Removes the `n` oldest entries in place: entries are moved down (swapped), never deep-copied."""
+        if n <= 0:
+            return
+        var count = len(stack)
+        for i in range(n, count):
+            stack.swap_elements(i - n, i)
+        for _ in range(min(n, count)):
+            _ = stack.pop()
+
+    def _enforce_undo_budget(mut self):
+        """Keeps history within `MAX_UNDO_STACK` entries and `MAX_UNDO_BLOB_BYTES` (undo + redo), evicting
+        the oldest undo entries first, then the furthest redo entries. The newest undo entry is always
+        kept. When the saved state's entry is evicted, the save point moves to wherever it is still
+        reachable (the bottom of the stack), or becomes unreachable so undo never fakes a clean scene."""
+        var total = self.undo_history_bytes()
+        var n = len(self.undo_stack)
+        var drop = 0
+        while n - drop > 1 and (n - drop > MAX_UNDO_STACK or total > MAX_UNDO_BLOB_BYTES):
+            total -= self.undo_stack[drop].approx_bytes()
+            drop += 1
+        if drop > 0:
+            var last_dropped = self.undo_stack[drop - 1].tx_id
+            var saved_dropped = self._saved_tx_id == UInt64(0)
+            for k in range(drop):
+                if self.undo_stack[k].tx_id == self._saved_tx_id:
+                    saved_dropped = True
+            if self._saved_tx_id == last_dropped:
+                self._saved_tx_id = UInt64(0)  # the empty-undo state *is* the saved one now
+            elif saved_dropped:
+                self._saved_tx_id = UInt64(0xFFFFFFFFFFFFFFFF)
+            Self._drop_front(self.undo_stack, drop)
+        var rdrop = 0
+        while rdrop < len(self.redo_stack) and total > MAX_UNDO_BLOB_BYTES:
+            total -= self.redo_stack[rdrop].approx_bytes()
+            rdrop += 1
+        Self._drop_front(self.redo_stack, rdrop)
 
     def _record_world_tx(
         mut self,
@@ -7013,6 +7244,15 @@ struct FlintStudioState(Movable):
             # Play-In-Editor edits are thrown away by `pie_stop` (it restores the pre-play world), so
             # they must not enter undo/redo: an entry here would replay a mid-simulation world after Stop.
             return
+        if self.agent_bus.time_travel_active:
+            # Time travel is read-only: roll the attempted edit back to the checkpoint being shown.
+            if len(before_blob) > 0:
+                _ = self._restore_world_blob(before_blob)
+            elif len(self._time_travel_view_blob) > 0:
+                var view = self._time_travel_view_blob.copy()
+                _ = self._restore_world_blob(view)
+            self.push_toast("Time travel is read-only: exit it to edit", 1, 2.5)
+            return
         var after_blob = self._capture_world_blob()
         var sync_tx_opt = self.app.resources.get_ptr[StudioFlmatStyleSyncResource]()
         var ext_snap = (
@@ -7022,7 +7262,7 @@ struct FlintStudioState(Movable):
         )
         if coalesce_key != 0 and len(self.undo_stack) > 0 and len(self.redo_stack) == 0:
             ref top = self.undo_stack[len(self.undo_stack) - 1]
-            if top.op == op and top.entity_id == primary_id and top.coalesce_key == coalesce_key:
+            if top.op == op and top.entity_id == primary_id and top.coalesce_key == coalesce_key and len(after_blob) > 0:
                 top.after_world_blob = Self._pack_undo_blob(after_blob^)
                 top.next_selected_id = self.selected_entity_id
                 top.next_selected_ids = self.selected_entity_ids.copy()
@@ -7030,8 +7270,19 @@ struct FlintStudioState(Movable):
                 top.external_mat_reload_epochs = ext_snap^
                 if top.tx_id == self._saved_tx_id:
                     self._saved_tx_id = UInt64(0xFFFFFFFFFFFFFFFF)  # the saved entry now holds newer edits
+                self._enforce_undo_budget()  # the replaced after-blob can be larger than the old one
                 self.mark_dirty(True)
                 return
+
+        if len(before_blob) == 0 or len(after_blob) == 0:
+            # Never record an entry that cannot be restored: undo would fail on it forever.
+            if len(before_blob) > 0:
+                _ = self._restore_world_blob(before_blob)  # refuse the edit: put the scene back
+                self.push_toast(label + " refused: the scene could not be snapshotted for undo", 2, 4.0)
+            else:
+                self.push_toast(label + " cannot be undone: the scene could not be snapshotted", 2, 4.0)
+                self.mark_dirty(True)
+            return
 
         var tx = EditorTransaction(op, primary_id, label)
         tx.affected_ids = affected^
@@ -7231,132 +7482,86 @@ struct FlintStudioState(Movable):
             )
         return eid
 
+    def _subtree_slots(self, root_id: Int) -> List[Int]:
+        """`root_id` and all its live descendants, parents before children."""
+        var out = List[Int]()
+        if not self.is_alive_id(root_id):
+            return out^
+        out.append(root_id)
+        var k = 0
+        while k < len(out) and len(out) <= len(self.app.world.entities):
+            var ch = self.children_of(out[k])
+            for ci in range(len(ch)):
+                if self.is_alive_id(ch[ci]) and ch[ci] not in out:
+                    out.append(ch[ci])
+            k += 1
+        return out^
+
+    def _subtree_roots(self, ids: List[Int]) -> List[Int]:
+        """The entries of `ids` none of whose ancestors are also in `ids` (each duplicates its own subtree,
+        so a selected child of a selected parent is copied once, with its parent)."""
+        var out = List[Int]()
+        for i in range(len(ids)):
+            var id = ids[i]
+            if not self.is_alive_id(id) or id in out:
+                continue
+            var covered = False
+            var p = self.parent_of(id)
+            var guard = 0
+            while p >= 0 and guard <= len(self.app.world.entities):
+                if p in ids:
+                    covered = True
+                    break
+                p = self.parent_of(p)
+                guard += 1
+            if not covered:
+                out.append(id)
+        return out^
+
     def _duplicate_entity_raw(mut self, src_id: Int) -> Int:
-        var src_e = self.resolve_entity(src_id)
-        if not src_e.valid():
+        """Duplicates `src_id` and its whole subtree with every registered component (the registry's
+        binary codecs, so new component types need no change here) plus unknown components. Parent
+        links and entity references inside the subtree point at the copies; runtime handles (physics
+        bodies, trigger ids, BVH slots, playing sounds, editor ids) are reset. Returns the copy's slot."""
+        var slots = self._subtree_slots(src_id)
+        if len(slots) == 0:
             return -1
-        var lt = self.app.world.get[LocalTransform](src_e) if self.app.world.has[LocalTransform](src_e) else LocalTransform()
-        lt.translation = lt.translation + Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
-        var has_mr = self.app.world.has[MeshRendererComponent](src_e)
-        var mr = MeshRendererComponent()
-        if has_mr:
-            var mr_p = self.app.world.get_ptr[MeshRendererComponent](src_e)
-            if mr_p:
-                mr = mr_p.value()[].copy()
-        var has_mo = self.app.world.has[MaterialOverrideComponent](src_e)
-        var mo = MaterialOverrideComponent()
-        if has_mo:
-            var mo_p = self.app.world.get_ptr[MaterialOverrideComponent](src_e)
-            if mo_p:
-                mo = mo_p.value()[].copy()
-        var meta = StudioEntityMetaComponent()
-        var meta_opt = self.app.world.get_ptr[StudioEntityMetaComponent](src_e)
-        if meta_opt:
-            ref m = meta_opt.value()[unsafe_offset=0]
-            meta = StudioEntityMetaComponent(
-                m.name + "_Copy",
-                m.locked,
-                m.mesh_handle_packed,
-                m.material_handle_packed,
-                m.collider_kind,
-                m.collider_half_extents,
-                m.restitution,
-                m.friction,
-                -1,
-                m.enabled,
+        var srcs = List[Entity](capacity=len(slots))
+        for i in range(len(slots)):
+            srcs.append(self.resolve_entity(slots[i]))
+        var copies = duplicate_entities(self.app.world, self.registry, srcs)
+        if len(copies) != len(srcs):
+            self.push_toast("Duplicate failed: a component could not be copied", 2, 3.5)
+            return -1
+        for k in range(len(copies)):
+            var ce = copies[k]
+            _ = self.app.world.remove[StudioEditorIdComponent](ce)  # a fresh id below, never the source's
+            var meta_opt = self.app.world.get_ptr_mut[StudioEntityMetaComponent](ce)
+            if meta_opt:
+                meta_opt.value()[unsafe_offset=0].bvh_slot = -1
+                if k == 0:
+                    meta_opt.value()[unsafe_offset=0].name = meta_opt.value()[unsafe_offset=0].name + "_Copy"
+            var col_opt = self.app.world.get_ptr_mut[ColliderComponent](ce)
+            if col_opt:
+                col_opt.value()[unsafe_offset=0].trigger_id = -1
+            var rb_opt = self.app.world.get_ptr_mut[RigidBodyComponent](ce)
+            if rb_opt:
+                rb_opt.value()[unsafe_offset=0].body_id = -1
+            var ae_opt = self.app.world.get_ptr_mut[AudioEmitterComponent](ce)
+            if ae_opt:
+                ae_opt.value()[unsafe_offset=0].handle = SoundHandle()
+        var root = copies[0]
+        var lt_opt = self.app.world.get_ptr_mut[LocalTransform](root)
+        if lt_opt:
+            lt_opt.value()[unsafe_offset=0].translation = (
+                lt_opt.value()[unsafe_offset=0].translation + Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
             )
-        var style = self.app.world.get[StudioStyleComponent](src_e) if self.app.world.has[StudioStyleComponent](src_e) else StudioStyleComponent()
-        var par_id = self.parent_of(src_id)
-
-        var new_e = self.app.world.spawn_empty()
-        var new_id = Int(new_e.index)
-        var gt = GlobalTransform.from_local(lt)
-        _ = self.app.world.insert[LocalTransform](new_e, lt)
-        _ = self.app.world.insert[GlobalTransform](new_e, gt.copy())
-        _ = self.app.world.insert[PrevGlobalTransform](new_e, PrevGlobalTransform(gt^))
-        if has_mr:
-            _ = self.app.world.insert[MeshRendererComponent](new_e, mr^)
-        if has_mo:
-            _ = self.app.world.insert[MaterialOverrideComponent](new_e, mo^)
-        _ = self.app.world.insert[StudioEntityMetaComponent](new_e, meta^)
-        _ = self.app.world.insert[StudioStyleComponent](new_e, style)
-
-        var pl_opt = self.app.world.get_ptr[PointLightComponent](src_e)
-        if pl_opt:
-            _ = self.app.world.insert[PointLightComponent](new_e, pl_opt.value()[unsafe_offset=0])
-        var sl_opt = self.app.world.get_ptr[SpotLightComponent](src_e)
-        if sl_opt:
-            _ = self.app.world.insert[SpotLightComponent](new_e, sl_opt.value()[unsafe_offset=0])
-        var cam_opt = self.app.world.get_ptr[CameraComponent](src_e)
-        if cam_opt:
-            _ = self.app.world.insert[CameraComponent](new_e, cam_opt.value()[unsafe_offset=0])
-        var ae_opt = self.app.world.get_ptr[AudioEmitterComponent](src_e)
-        if ae_opt:
-            var ae_copy = ae_opt.value()[unsafe_offset=0].copy()
-            ae_copy.handle = SoundHandle()
-            _ = self.app.world.insert[AudioEmitterComponent](new_e, ae_copy^)
-        var rig_opt = self.app.world.get_ptr[RigComponent](src_e)
-        if rig_opt:
-            _ = self.app.world.insert[RigComponent](new_e, rig_opt.value()[unsafe_offset=0].copy())
-        var sk_opt = self.app.world.get_ptr[SkeletonComponent](src_e)
-        if sk_opt:
-            _ = self.app.world.insert[SkeletonComponent](new_e, sk_opt.value()[unsafe_offset=0].copy())
-        var ac_opt = self.app.world.get_ptr[AnimatorComponent](src_e)
-        if ac_opt:
-            _ = self.app.world.insert[AnimatorComponent](new_e, ac_opt.value()[unsafe_offset=0].copy())
-        var bs_opt = self.app.world.get_ptr[BoneSocketComponent](src_e)
-        if bs_opt:
-            _ = self.app.world.insert[BoneSocketComponent](new_e, bs_opt.value()[unsafe_offset=0].copy())
-        var pf_opt = self.app.world.get_ptr[PrefabInstanceComponent](src_e)
-        if pf_opt:
-            _ = self.app.world.insert[PrefabInstanceComponent](new_e, pf_opt.value()[unsafe_offset=0].copy())
-        var bt_opt = self.app.world.get_ptr[BehaviorTreeComponent](src_e)
-        if bt_opt:
-            _ = self.app.world.insert[BehaviorTreeComponent](new_e, bt_opt.value()[unsafe_offset=0].copy())
-        var unk_opt = self.app.world.get_ptr[UnknownComponentsComponent](src_e)
-        if unk_opt:
-            _ = self.app.world.insert[UnknownComponentsComponent](new_e, unk_opt.value()[unsafe_offset=0].copy())
-
-        for ci in range(len(self.registry.entries)):
-            if not self.registry.entries[ci].is_pod:
-                continue
-            var sidx = self.registry.entries[ci].pod_schema_idx
-            if sidx < 0 or sidx >= len(self.registry.pod_schemas):
-                continue
-            var bsz = self.registry.pod_schemas[sidx].byte_size
-            var chash = self.registry.entries[ci].component_hash
-            var tid = self.app.world.find_component_by_hash(chash)
-            if tid < 0 or not self.app.world.has_by_type_id(src_e, tid):
-                continue
-            var sptr = self.app.world.get_raw_ptr(src_e, tid)
-            var pod_buf = List[UInt8](length=max(0, bsz), fill=0)
-            if bsz > 0 and sptr != 0:
-                var sp = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=sptr)
-                for bi in range(bsz):
-                    pod_buf[bi] = sp[unsafe_offset=bi]
-            _ = self.app.world.insert_raw_pod_bytes(new_e, tid, Span(pod_buf))
-
-        var col_opt = self.app.world.get_ptr[ColliderComponent](src_e)
-        if col_opt:
-            ref sc = col_opt.value()[unsafe_offset=0]
-            var nc = ColliderComponent(
-                sc.shape, sc.radius, sc.half_height, sc.half_extents, sc.local_offset, sc.local_rot, sc.is_trigger, sc.filter, -1
-            )
-            nc.points = sc.points.copy()
-            _ = self.app.world.insert[ColliderComponent](new_e, nc^)
-
-        var rb_opt = self.app.world.get_ptr[RigidBodyComponent](src_e)
-        if rb_opt:
-            var nrb = rb_opt.value()[unsafe_offset=0]
-            nrb.body_id = -1
-            _ = self.app.world.insert[RigidBodyComponent](new_e, nrb)
-
-        if par_id >= 0:
-            var pe = self.resolve_entity(par_id)
-            if pe.valid():
-                _ = set_parent(self.app.world, new_e, pe)
-
-        return new_id
+        else:
+            var lt = LocalTransform()
+            lt.translation = Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
+            _ = self.app.world.insert[LocalTransform](root, lt)
+        self._ensure_editor_ids()
+        return Int(root.index)
 
     def duplicate_entity(mut self, entity_id: Int, record_undo: Bool = True) -> Int:
         """Duplicates an existing live entity as a single Undo/Redo transaction."""
@@ -7385,10 +7590,9 @@ struct FlintStudioState(Movable):
     def duplicate_selected(mut self, record_undo: Bool = True) -> List[Int]:
         """Duplicates all currently selected entities in a single atomic transaction."""
         self._normalize_selection_from_primary()
-        var srcs = List[Int]()
-        for i in range(len(self.selected_entity_ids)):
-            if self.is_alive_id(self.selected_entity_ids[i]):
-                srcs.append(self.selected_entity_ids[i])
+        if self._time_travel_blocks_edit():
+            return List[Int]()
+        var srcs = self._subtree_roots(self.selected_entity_ids)
         var created = List[Int]()
         if len(srcs) == 0:
             return created^
@@ -7997,7 +8201,7 @@ struct FlintStudioState(Movable):
         var out = List[UInt8](capacity=len(sb))
         for i in range(len(sb)):
             out.append(sb[i])
-        var ok = write_bytes(target, out)
+        var ok = write_file_durable(target, out)
         if ok:
             self.push_toast("Saved InputMap", 0, 2.0)
         else:
@@ -8096,6 +8300,9 @@ struct FlintStudioState(Movable):
         self.gz_last_sf = Vec3(1.0, 1.0, 1.0)
         self.gz_applied = False
         self.active_gizmo_handle = h
+        # The drag's first update would clear redo; park it so a cancelled drag can give it back.
+        self.gz_saved_redo.clear()
+        swap(self.gz_saved_redo, self.redo_stack)
         return True
 
     def gizmo_drag_update(mut self, mx: Float32, my: Float32) -> Bool:
@@ -8206,9 +8413,11 @@ struct FlintStudioState(Movable):
         if not self.gz_dragging:
             return
         var restored = False
+        var had_tx = False
         if len(self.undo_stack) > 0 and len(self.redo_stack) == 0:
             ref top = self.undo_stack[len(self.undo_stack) - 1]
             if top.coalesce_key == self.gz_seq and top.op == TX_BATCH_EDIT:
+                had_tx = True
                 var tx = self.undo_stack.pop()
                 restored = self._restore_world_blob(tx.before_world_blob, tx.external_mat_reload_epochs)
                 if not restored:
@@ -8224,9 +8433,28 @@ struct FlintStudioState(Movable):
                 start_snaps, start_piv, Vec3(), Quat.identity(), Vec3(1.0, 1.0, 1.0), GIZMO_MODE_TRANSLATE,
                 coalesce_key=self.gz_seq,
             )
+            if (
+                not had_tx
+                and len(self.undo_stack) > 0
+                and self.undo_stack[len(self.undo_stack) - 1].coalesce_key == self.gz_seq
+            ):
+                _ = self.undo_stack.pop()  # the start pose re-applied is no edit: leave no entry
+                self._refresh_dirty_from_history()
+        if restored or not had_tx:
+            # The drag left no entry behind: the redo history it parked is valid again.
+            swap(self.gz_saved_redo, self.redo_stack)
+        self.gz_saved_redo.clear()
         self._end_gizmo_drag_state()
 
     def gizmo_drag_end(mut self):
+        if self.gz_dragging and len(self.redo_stack) == 0:
+            var moved = (
+                len(self.undo_stack) > 0
+                and self.undo_stack[len(self.undo_stack) - 1].coalesce_key == self.gz_seq
+            )
+            if not moved:
+                swap(self.gz_saved_redo, self.redo_stack)  # a click without motion keeps redo
+        self.gz_saved_redo.clear()
         self._end_gizmo_drag_state()
 
     def _end_gizmo_drag_state(mut self):
@@ -8619,6 +8847,8 @@ struct FlintStudioState(Movable):
     def undo(mut self) -> Bool:
         if self.pie.mode != PIE_STOPPED or len(self.undo_stack) == 0:
             return False
+        if self._time_travel_blocks_edit():
+            return False
         self._int_edit_wid = UInt64(0)
         self._int_edit_entity_id = -1
         self._int_edit_buf = ""
@@ -8636,6 +8866,8 @@ struct FlintStudioState(Movable):
 
     def redo(mut self) -> Bool:
         if self.pie.mode != PIE_STOPPED or len(self.redo_stack) == 0:
+            return False
+        if self._time_travel_blocks_edit():
             return False
         self._int_edit_wid = UInt64(0)
         self._int_edit_entity_id = -1
@@ -12534,6 +12766,7 @@ def emit_studio_ui_draw_list(
                 studio.confirm_modal_open = False
                 studio.confirm_modal_action = 0
                 if act == 1:
+                    studio.discard_autosave()  # Discard means discard: no recovery offer next launch
                     studio.quit_requested = True
                 elif act == 2:
                     _ = studio.new_scene(force=True)

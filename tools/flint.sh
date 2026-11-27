@@ -489,7 +489,7 @@ cmd_pack() {
 
 # Studio editor-model suites. They each import the whole Studio app, so they build at -O1
 # (an -O3 build of each takes 4-8 min); `FLINT_STUDIO_TEST_OPT=-O3` restores full optimisation.
-STUDIO_TEST_SUITES=(test_studio_phase0 test_studio_viewport test_studio_identity test_studio_sessions test_studio_core_bugs test_studio_redesign_ui test_studio_agent_theatre test_studio_review_fixes)
+STUDIO_TEST_SUITES=(test_studio_phase0 test_studio_viewport test_studio_identity test_studio_sessions test_studio_core_bugs test_studio_redesign_ui test_studio_agent_theatre test_studio_review_fixes test_studio_scene_integrity)
 
 build_studio_suites() {
     local opt="${FLINT_STUDIO_TEST_OPT:--O1}"
