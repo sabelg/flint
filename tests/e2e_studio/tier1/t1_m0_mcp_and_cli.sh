@@ -420,7 +420,10 @@ with McpStdioClient([bin_path, "--project", proj, "--mcp-stdio"], cwd=proj, fram
     h_xform = t_res["state_hash"]
     assert h_xform != sp["state_hash"], "entity.set_transform did not update state_hash"
 
-    client.call_tool("scene.set_entity_enabled", {"entity_id": eid, "enabled": False})
+    en_res = client.call_tool("scene.set_entity_enabled", {"entity_id": eid, "enabled": False})
+    assert en_res["enabled"] is False and en_res["visible"] is True, f"Enabled must be independent of Visible: {en_res!r}"
+    tgt_now = [e for e in client.call_tool("ecs.query_entities", {})["entities"] if e["entity_id"] == eid][0]
+    assert tgt_now["enabled"] is False and tgt_now["visible"] is True, f"query must report enabled=False, visible=True: {tgt_now!r}"
     q_vis = client.call_tool("ecs.query_entities", {"visible_only": True})
     assert all(e["entity_id"] != eid for e in q_vis["entities"]), "disabled entity appeared in visible_only query"
 
@@ -455,7 +458,8 @@ def verify_reloaded(client_x, label):
     assert abs(tgt["rotation"][1] - 0.7071068) < 1e-3 and abs(tgt["rotation"][3] - 0.7071068) < 1e-3, f"{label}: rotation mismatch: {tgt!r}"
     assert all(abs(tgt["scale"][i] - 2.0) < 1e-3 for i in range(3)), f"{label}: scale mismatch: {tgt!r}"
     disabled_ents = [e for e in q_all["entities"] if e.get("name") == "M0Disabled"]
-    assert len(disabled_ents) == 1 and disabled_ents[0].get("visible") is False, f"{label}: M0Disabled did not preserve enabled=False: {disabled_ents!r}"
+    assert len(disabled_ents) == 1 and disabled_ents[0].get("enabled") is False, f"{label}: M0Disabled did not preserve enabled=False: {disabled_ents!r}"
+    assert disabled_ents[0].get("visible") is True, f"{label}: M0Disabled Visible must stay independent of Enabled: {disabled_ents!r}"
     q_vis_only = client_x.call_tool("ecs.query_entities", {"visible_only": True})
     assert all(e.get("name") != "M0Disabled" for e in q_vis_only["entities"]), f"{label}: M0Disabled appeared in visible_only query"
 

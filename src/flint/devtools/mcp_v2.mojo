@@ -1302,7 +1302,7 @@ def _mcp_tools_list_json(structured: Bool = False) -> String:
     matching the `structuredContent` object every tool result then carries."""
     var out = (
         '{"tools":['
-        + '{"name":"ecs.query_entities","description":"Queries live Studio/ECS entities with optional name or collider filters.","inputSchema":{"type":"object","properties":{"name_contains":{"type":"string"},"collider":{"type":"string"},"visible_only":{"type":"boolean"}}}},'
+        + '{"name":"ecs.query_entities","description":"Queries live Studio/ECS entities with optional name or collider filters (visible_only: entities that are both Visible and Enabled).","inputSchema":{"type":"object","properties":{"name_contains":{"type":"string"},"collider":{"type":"string"},"visible_only":{"type":"boolean"}}}},'
         + '{"name":"ecs.spawn_entity","description":"Spawns an entity recorded on the reversible Studio Undo/Redo stack.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"position":{"type":"array"},"rotation":{"type":"array"},"scale":{"type":"array"},"collider":{"type":"string"},"mass":{"type":"number"},"base_color":{"type":"array"},"roughness":{"type":"number"},"metallic":{"type":"number"}}}},'
         + '{"name":"ecs.patch_components","description":"Patches entity TRS, material, visibility, or physics properties via reversible EditorTransaction.","inputSchema":{"type":"object","required":["entity_id"],"properties":{"entity_id":{"type":"integer"},"name":{"type":"string"},"position":{"type":"array"},"rotation":{"type":"array"},"scale":{"type":"array"},"base_color":{"type":"array"},"roughness":{"type":"number"},"metallic":{"type":"number"},"mass":{"type":"number"},"visible":{"type":"boolean"},"coalesce_key":{"type":"integer"}}}},'
         + '{"name":"ecs.despawn_entity","description":"Despawns an entity reversibly (restorable via studio.undo_redo).","inputSchema":{"type":"object","required":["entity_id"],"properties":{"entity_id":{"type":"integer"}}}},'
@@ -1318,7 +1318,7 @@ def _mcp_tools_list_json(structured: Bool = False) -> String:
         + '{"name":"render.trigger_post_fx","description":"Sets or clears Manga Impact Frame blend/invert, chromatic-dispersion shockwave ring, and limited-animation SteppedAnimClock hitstop freeze on Studio.","inputSchema":{"type":"object","properties":{"impact_blend":{"type":"number"},"impact_invert":{"type":"boolean"},"shockwave_active":{"type":"boolean"},"shockwave_radius":{"type":"number"},"hitstop_sec":{"type":"number"},"clear":{"type":"boolean"}}}},'
         + '{"name":"scene.save","description":"Saves the live Studio scene (.flscn or .flscnb) inside workspace_root.","inputSchema":{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}},'
         + '{"name":"scene.load","description":"Loads a Studio scene (.flscn or .flscnb) from inside workspace_root.","inputSchema":{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}},'
-        + '{"name":"scene.set_entity_enabled","description":"Enables or disables an entity visibility/enabled state with reversible Undo/Redo recording.","inputSchema":{"type":"object","required":["entity_id","enabled"],"properties":{"entity_id":{"type":"integer"},"enabled":{"type":"boolean"},"coalesce_key":{"type":"integer"}}}},'
+        + '{"name":"scene.set_entity_enabled","description":"Sets the Enabled flag of an entity (Inspector Enabled: gameplay, colliders and drawing; independent of Visible) with reversible Undo/Redo recording.","inputSchema":{"type":"object","required":["entity_id","enabled"],"properties":{"entity_id":{"type":"integer"},"enabled":{"type":"boolean"},"coalesce_key":{"type":"integer"}}}},'
         + '{"name":"entity.set_transform","description":"Updates entity position, rotation ([x,y,z,w]), and/or scale with reversible Undo/Redo recording.","inputSchema":{"type":"object","required":["entity_id"],"properties":{"entity_id":{"type":"integer"},"position":{"type":"array"},"rotation":{"type":"array"},"scale":{"type":"array"},"coalesce_key":{"type":"integer"}}}},'
         + '{"name":"asset.import","description":"Validates and imports an asset (.glb, .png, .jpg, .wav, .qoa, .flmat, .flprefab, .flrig, .flanim) into the project workspace.","inputSchema":{"type":"object","properties":{"source_path":{"type":"string"},"src_path":{"type":"string"},"path":{"type":"string"},"dest_path":{"type":"string"},"rel_path":{"type":"string"},"target_path":{"type":"string"}}}},'
         + '{"name":"asset.list","description":"Lists project-relative assets inside workspace_root (default dir: assets).","inputSchema":{"type":"object","properties":{"dir":{"type":"string"}}}},'
@@ -2245,8 +2245,8 @@ struct McpServerV2(Movable):
                 ref e = studio.entities[i]
                 if not e.alive:
                     continue
-                if vis_only and not e.visible:
-                    continue
+                if vis_only and not (e.visible and e.enabled):
+                    continue  # only entities that actually draw: Visible and Enabled
                 if sub_filter.byte_length() > 0 and e.name.find(sub_filter) < 0:
                     continue
                 if col_filter.byte_length() > 0 and _collider_to_string(e.collider_kind) != col_filter:
@@ -2276,6 +2276,7 @@ struct McpServerV2(Movable):
                     + ',"shading_mode":' + json_quote(_shading_mode_to_string(e.shading_mode))
                     + ',"mass":' + _fmt_json_f64(Float64(e.mass))
                     + ',"visible":' + ("true" if e.visible else "false")
+                    + ',"enabled":' + ("true" if e.enabled else "false")
                     + ',"mesh_id":' + String(e.mesh_id)
                     + ',"material_id":' + String(e.material_id)
                     + ',"mesh_ref":' + mesh_ref.write_json()
@@ -3123,14 +3124,17 @@ struct McpServerV2(Movable):
                 return (True, '{"ok":false,"error":"invalid or non-existent entity_id"}')
             var enabled = doc.boolean(en_node, True)
             var nd = studio.entities[eid].copy()
-            nd.visible = enabled
+            # The Inspector's Enabled switch (SMET meta `enabled`): gameplay/colliders off and the mesh
+            # hidden, while the separate Visible switch keeps its own value.
+            nd.enabled = enabled
             var ckey = UInt64(max(0, doc.integer(doc.object_get(args_node, "coalesce_key"), 0)))
             if not studio.commit_node_edit(eid, nd^, "MCP Set Entity Enabled", ckey):
                 return (True, '{"ok":false,"error":"failed to update entity enabled state"}')
             return (
                 False,
                 '{"ok":true,"entity_id":' + String(eid)
-                + ',"enabled":' + ("true" if enabled else "false")
+                + ',"enabled":' + ("true" if studio.entities[eid].enabled else "false")
+                + ',"visible":' + ("true" if studio.entities[eid].visible else "false")
                 + ',"undo_depth":' + String(len(studio.undo_stack))
                 + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}",
             )

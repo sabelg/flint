@@ -457,6 +457,38 @@ def test_mcp_deferred_items() raises:
     cur.select_client(0)
     assert_true(cur.handle_jsonrpc(call_q, studio, assets, pool).find('"structuredContent"') >= 0, "key 0 keeps 2025-06-18")
 
+    # scene.set_entity_enabled drives the Inspector's Enabled flag, never Visible.
+    var en_srv = McpServerV2(workspace_root=_tmp_dir("mcp_enabled"))
+    _ = en_srv.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"ecs.spawn_entity","arguments":{"name":"EnableProbe"}}}',
+        studio, assets, pool,
+    )
+    var e0 = -1
+    for ei in range(len(studio.entities)):
+        if studio.entities[ei].alive:
+            e0 = ei
+            break
+    assert_true(e0 >= 0, "the default scene has an entity")
+    studio.entities[e0].visible = True
+    var dis = en_srv.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"scene.set_entity_enabled","arguments":{"entity_id":'
+        + String(e0) + ',"enabled":false}}}',
+        studio, assets, pool,
+    )
+    assert_true(dis.find('"isError":false') >= 0, dis)
+    assert_false(studio.entities[e0].enabled, "Enabled cleared")
+    assert_true(studio.entities[e0].visible, "Visible is a separate switch and stays on")
+    var q_en = en_srv.handle_jsonrpc(call_q, studio, assets, pool)
+    assert_true(q_en.find('\\"enabled\\":false') >= 0, "query reports enabled: " + q_en)
+    _ = studio.undo()
+    assert_true(studio.entities[e0].enabled, "undo restores Enabled")
+    _ = en_srv.handle_jsonrpc(
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"scene.set_entity_enabled","arguments":{"entity_id":'
+        + String(e0) + ',"enabled":true}}}',
+        studio, assets, pool,
+    )
+    assert_true(studio.entities[e0].enabled and studio.entities[e0].visible)
+
     # Async cook: a socket client's cook (even force_recook, with no flint-pack) runs in a child process.
     var ws = _tmp_dir("mcp_cook")
     _ = make_dirs(ws + "/assets")

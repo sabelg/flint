@@ -4193,7 +4193,10 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
         '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"scene.set_entity_enabled","arguments":{"entity_id":0,"enabled":false}}}',
         studio, assets, pool,
     )
-    _assert(r_dis.find('\\"ok\\":true') >= 0 and not studio.entities[0].visible, "scene.set_entity_enabled false failed")
+    _assert(
+        r_dis.find('\\"ok\\":true') >= 0 and not studio.entities[0].enabled and studio.entities[0].visible,
+        "scene.set_entity_enabled false must clear Enabled and leave Visible alone: " + r_dis,
+    )
 
     var r_qv = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{"visible_only":true}}}',
@@ -4202,9 +4205,9 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
     _assert(r_qv.find('\\"count\\":0') >= 0, "visible_only query should exclude disabled entity: " + r_qv)
 
     _ = studio.undo()
-    _assert(studio.entities[0].visible, "undo did not re-enable entity")
+    _assert(studio.entities[0].enabled, "undo did not re-enable entity")
     _ = studio.redo()
-    _assert(not studio.entities[0].visible, "redo did not re-disable entity")
+    _assert(not studio.entities[0].enabled and studio.entities[0].visible, "redo did not re-disable entity")
 
     var r_sv = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/m0_unit.flscn"}}}',
@@ -4303,7 +4306,7 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
         '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/m0_unit.flscn"}}}',
         studio, assets, pool,
     )
-    _assert(r_ld.find('\\"ok\\":true') >= 0 and studio.live_entity_count() == 1 and not studio.entities[0].visible, "scene.load failed to restore disabled entity")
+    _assert(r_ld.find('\\"ok\\":true') >= 0 and studio.live_entity_count() == 1 and not studio.entities[0].enabled and studio.entities[0].visible, "scene.load failed to restore disabled entity (Enabled off, Visible on)")
 
     assets.close()
     studio.shutdown()
