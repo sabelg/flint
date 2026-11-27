@@ -5,7 +5,7 @@ from flint.platform.input import InputState
 from flint.platform.os import list_directory
 from flint.platform.traits import WindowBackend
 from flint.render.font import SdfFont
-from flint.studio.ide_grid import IdeGrid
+from flint.studio.ide_grid import IdeGrid, WIDE_CONTINUATION, char_width, palette
 from flint.studio.ide_pty import IdePty
 from flint.studio.ide_view import BACK, draw_workspace, raster_ui, raster_workspace, toolbar_hit, toolbar_start
 from flint.studio.source_editor import EmbeddedIde
@@ -87,6 +87,95 @@ def _drop_ide_with_pipe():
         var ed = EmbeddedIde()
         ed.pty.fd = fds[0]
         ed.pty.pid = 0
+
+
+def _feed(mut g: IdeGrid, text: String):
+    for byte in text.as_bytes():
+        g.feed(Int(byte))
+
+
+def test_grid_escapes_width_and_scroll() raises:
+    # ESC intermediates: `ESC ( B` (designate G0) must not print the final byte.
+    var g = IdeGrid()
+    g.resize(16, 3)
+    _feed(g, "\x1b(BA\x1b)0C\x1b#8D")
+    assert_equal(g.cell(0, 0).code, 65)
+    assert_equal(g.cell(0, 1).code, 67)
+    assert_equal(g.cell(0, 2).code, 68)
+    assert_equal(g.cell(0, 3).code, 32)
+    # CSI prefixes: `CSI > 4;2 m` is modifyOtherKeys, not SGR underline / colour.
+    _feed(g, "\x1b[31m\x1b[>4;2m\x1b[=5m\x1b[<4mX")
+    assert_equal(g.cell(0, 3).code, 88)
+    assert_equal(g.cell(0, 3).fg, palette(1))
+    assert_false(g.cell(0, 3).underline)
+    _feed(g, "\x1b[4mU\x1b[0m")
+    assert_true(g.cell(0, 4).underline)
+
+    # Display widths: CJK and emoji take two cells, combining marks / U+FE0F attach.
+    assert_equal(char_width(0x41), 1)
+    assert_equal(char_width(0x754C), 2)
+    assert_equal(char_width(0x1F600), 2)
+    assert_equal(char_width(0x0301), 0)
+    assert_equal(char_width(0xFE0F), 0)
+    assert_equal(char_width(0x00E9), 1)
+    var w = IdeGrid()
+    w.resize(10, 3)
+    _feed(w, "界a😀e\u0301b")
+    assert_equal(w.cell(0, 0).code, 0x754C)
+    assert_equal(w.cell(0, 1).code, WIDE_CONTINUATION)
+    assert_equal(w.cell(0, 2).code, 97)
+    assert_equal(w.cell(0, 3).code, 0x1F600)
+    assert_equal(w.cell(0, 4).code, WIDE_CONTINUATION)
+    assert_equal(w.cell(0, 5).code, 101)
+    assert_equal(w.mark(0, 5), "\u0301")
+    assert_equal(w.cell(0, 6).code, 98)
+    assert_equal(w.x, 7)
+    _feed(w, "\r\n\u2764\ufe0fZ")
+    assert_equal(w.cell(1, 0).code, 0x2764)
+    assert_equal(w.mark(1, 0), "\ufe0f")
+    assert_equal(w.cell(1, 1).code, 90)
+    # A mark after a wide glyph attaches to its lead cell.
+    _feed(w, "\r\n界\u0301")
+    assert_equal(w.mark(2, 0), "\u0301")
+    # A wide glyph that does not fit in the last column wraps whole.
+    var e = IdeGrid()
+    e.resize(3, 3)
+    _feed(e, "ab界")
+    assert_equal(e.cell(0, 2).code, 32)
+    assert_equal(e.cell(1, 0).code, 0x754C)
+    assert_equal(e.cell(1, 1).code, WIDE_CONTINUATION)
+    # Overwriting half of a wide glyph blanks the other half.
+    _feed(e, "\x1b[2;2HQ")
+    assert_equal(e.cell(1, 0).code, 32)
+    assert_equal(e.cell(1, 1).code, 81)
+
+    # TAB moves to the next 8-column stop (and clamps to the last column).
+    var t = IdeGrid()
+    t.resize(20, 2)
+    _feed(t, "a\tb\tc\td")
+    assert_equal(t.cell(0, 8).code, 98)
+    assert_equal(t.cell(0, 16).code, 99)
+    assert_equal(t.cell(0, 19).code, 100)
+
+    # Ring-buffer scroll: a bottom line feed rotates `top` and clears one row.
+    var r = IdeGrid()
+    r.resize(4, 3)
+    _feed(r, "1\r\n2\r\n3\r\n4")
+    assert_equal(r.top, 1)
+    assert_equal(r.cell(0, 0).code, 50)
+    assert_equal(r.cell(1, 0).code, 51)
+    assert_equal(r.cell(2, 0).code, 52)
+    _feed(r, "\r\n5\r\n6\r\n7\r\n8")
+    assert_equal(r.row_text(0), "6   ")
+    assert_equal(r.row_text(2), "8   ")
+    # Cursor addressing and erase stay logical after scrolling.
+    _feed(r, "\x1b[1;1HZ\x1b[3;1H\x1b[2K")
+    assert_equal(r.row_text(0), "Z   ")
+    assert_equal(r.row_text(2), "    ")
+    var ui = UiDrawList()
+    var f = SdfFont()
+    draw_workspace(ui, r, 200, 120, f, False, -1, "", [], -1, [], False)
+    print("IdeGrid ESC intermediates, CSI prefixes, wcwidth, combining marks, TAB and ring scroll passed.")
 
 
 def main() raises:
@@ -192,4 +281,5 @@ def main() raises:
     assert_true(ed2.present(mock_win, inp2, scene_hotkey=False))
     assert_equal(mock_win.presents, 1)
     assert_equal(mock_win.last_px_count, 320 * 180)
+    test_grid_escapes_width_and_scroll()
     print("Embedded IDE grid, UTF-8 input, F2, bounds safety, RAII and generic WindowBackend passed.")

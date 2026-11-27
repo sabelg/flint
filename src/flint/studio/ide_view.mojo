@@ -2,7 +2,7 @@
 from std.math import isfinite
 from flint.render.font import SdfFont
 from flint.ui.draw_list import UiDrawList, PRIM_GLYPH
-from flint.studio.ide_grid import IdeGrid, DEFAULT_BG
+from flint.studio.ide_grid import IdeGrid, DEFAULT_BG, WIDE_CONTINUATION
 
 comptime HEADER = 40
 comptime CW = 9
@@ -109,20 +109,22 @@ def draw_workspace(
         var x = 0
         var top = Float32(HEADER + y * CH)
         while x < grid.cols:
-            var bg = grid.cells[y * grid.cols + x].bg
+            var bg = grid.cell(y, x).bg
             var start = x
             x += 1
-            while x < grid.cols and grid.cells[y * grid.cols + x].bg == bg:
+            while x < grid.cols and grid.cell(y, x).bg == bg:
                 x += 1
             if bg != DEFAULT_BG:
                 ui.add_rect(Float32(start * CW), top, Float32((x - start) * CW), CH, ui_color(bg))
         for col in range(grid.cols):
-            var cell = grid.cells[y * grid.cols + col]
+            var cell = grid.cell(y, col)
             var i = y * grid.cols + col
-            if cell.code > 32 or (i < len(marks) and marks[i]):
-                var cluster = String(chr(cell.code))
-                if i < len(marks):
-                    cluster += marks[i]
+            var tail = grid.mark(y, col)
+            if i < len(marks):
+                tail += marks[i]
+            # `WIDE_CONTINUATION` (code 0) is the right half of a wide glyph: nothing to draw.
+            if cell.code > 32 or (cell.code != WIDE_CONTINUATION and tail):
+                var cluster = String(chr(cell.code)) + tail
                 ui.add_text(
                     slot,
                     font,
@@ -169,6 +171,9 @@ def raster_workspace(
         if c.code > 126:
             _ = font.ensure(c.code)
     for text in marks:
+        if text:
+            font.ensure_text(text)
+    for text in grid.marks:
         if text:
             font.ensure_text(text)
     for tab in tabs:
