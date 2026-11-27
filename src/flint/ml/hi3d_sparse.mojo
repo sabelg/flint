@@ -13,7 +13,7 @@ struct SparseGrid(Movable):
     def __init__(out self, var xyz: Tensor, edge: Int) raises:
         if (
             edge < 1
-            or edge > 512
+            or edge > 2048
             or xyz.dtype != DT_I32
             or len(xyz.shape) != 2
             or xyz.shape[1] != 3

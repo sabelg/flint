@@ -20,7 +20,7 @@ def _tf32(x: Float32) -> Float32:
 
 
 def _multiply[
-    convolution: Bool, transpose_b: Bool
+    convolution: Bool, transpose_b: Bool, reflect: Bool = False
 ](
     a: Pointer[Float32, MutAnyOrigin],
     b: Pointer[Float32, MutAnyOrigin],
@@ -57,6 +57,9 @@ def _multiply[
                     var out_w = Int(width) // Int(stride)
                     var y = r // out_w * Int(stride) + tap // Int(kernel) - pad
                     var x = r % out_w * Int(stride) + tap % Int(kernel) - pad
+                    comptime if reflect:
+                        y = min(abs(y), 2 * Int(height) - 2 - y)
+                        x = min(abs(x), 2 * Int(width) - 2 - x)
                     if y >= 0 and x >= 0 and y < Int(height) and x < Int(width):
                         offsets[h] = Int64((y * Int(width) + x) * Int(channels))
                 else:
@@ -251,7 +254,7 @@ struct UltraTexVaeGpu(Movable):
                 x.fptr(), Int(host.unsafe_ptr()), len(x.f) * 4
             )
 
-    def conv(
+    def conv[reflect: Bool = False](
         mut self,
         w: SafeTensorWeights,
         x: Tensor,
@@ -282,7 +285,7 @@ struct UltraTexVaeGpu(Movable):
         var src = self._upload(x)
         var dst = self.ctx.enqueue_create_buffer[DType.float32](rows * co)
         var tiles = ((rows + 15) // 16) * ((co + 31) // 32)
-        self.ctx.enqueue_function[_multiply[True, True]](
+        self.ctx.enqueue_function[_multiply[True, True, reflect]](
             src.unsafe_ptr(),
             self.kernels[id].unsafe_ptr(),
             dst.unsafe_ptr(),

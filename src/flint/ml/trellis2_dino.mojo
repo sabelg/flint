@@ -45,9 +45,9 @@ struct TrellisImageEncoder(Movable):
         var b = self.weights.tensor(key + ".bias", [WIDTH])
         return layer_norm(x, a, b, True, Float32(1e-5))
 
-    def encode(self, mut pool: JobPool, image: NativeImage, size: Int = 512) raises -> Tensor:
+    def encode(self, mut pool: JobPool, image: NativeImage, size: Int = 512, crop_scale: Float64 = 1.0) raises -> Tensor:
         """Return [1,5+(size/16)^2,1024], preserving CLS and all four register tokens."""
-        var pixels = prepare_trellis_image(image, size)
+        var pixels = prepare_trellis_image(image, size, crop_scale)
         var grid = size // 16
         var patches = Tensor.zeros([grid * grid, 768])
         for p in range(grid * grid):

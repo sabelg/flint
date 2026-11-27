@@ -13,8 +13,12 @@ trait StructureVelocityModel:
 def structure_time(step: Int, steps: Int = 12) raises -> Float64:
     if steps < 1 or step < 0 or step > steps:
         raise Error("Invalid structure flow schedule index")
+    return _flow_time(step, steps, 5)
+
+
+def _flow_time(step: Int, steps: Int, shift: Float64) -> Float64:
     var linear = Float64(steps - step) / Float64(steps)
-    return 5 * linear / (1 + 4 * linear)
+    return shift * linear / (1 + (shift - 1) * linear)
 
 
 def _check_velocity(x: Tensor, velocity: Tensor) raises:
@@ -28,16 +32,30 @@ def sample_structure_flow[M: StructureVelocityModel](mut model: M, var latent: T
             or latent.shape[2] != latent.shape[1] or latent.shape[3] != latent.shape[1]
             or not latent.is_float() or not latent.has_valid_storage()):
         raise Error("Invalid structure flow latent or step count")
+    return _sample_flow(model, latent^, steps, 5, 7.5, 0.7)
+
+
+def sample_pixal_slat[M: StructureVelocityModel](mut model: M, var latent: Tensor,
+                                                steps: Int, texture: Bool) raises -> Tensor:
+    """Released single-view Pixal3D shape or material schedule, in normalized SLat space."""
+    if (steps < 1 or latent.rank() != 2 or latent.shape[0] < 1 or latent.shape[1] != 32
+            or not latent.is_float() or not latent.has_valid_storage()):
+        raise Error("Invalid Pixal3D sparse latent or step count")
+    return _sample_flow(model, latent^, steps, 3, Float32(1) if texture else Float32(7.5), Float32(0) if texture else Float32(0.5))
+
+
+def _sample_flow[M: StructureVelocityModel](mut model: M, var latent: Tensor, steps: Int,
+        shift: Float64, guidance: Float32, rescale: Float32) raises -> Tensor:
     if latent.ext != 0:
         latent = Tensor.floats(latent.shape.copy(), latent.owned_floats())
     var count = latent.numel()
     for i in range(steps):
-        var time = structure_time(i, steps)
-        var dt = Float32(time - structure_time(i + 1, steps))
+        var time = _flow_time(i, steps, shift)
+        var dt = Float32(time - _flow_time(i + 1, steps, shift))
         var model_time = Float32(1000 * time)
         var pos = model.predict(latent, model_time, True)
         _check_velocity(latent, pos)
-        if time < 0.6:
+        if guidance == 1 or time < 0.6:
             for p in range(count):
                 latent.f[p] -= dt * pos.fget(p)
             continue
@@ -54,7 +72,7 @@ def sample_structure_flow[M: StructureVelocityModel](mut model: M, var latent: T
         for p in range(count):
             var x = (1 - sigma) * latent.f[p]
             var pos_x0 = x - s * pos.fget(p)
-            var cfg_x0 = x - s * (Float32(7.5) * pos.fget(p) - Float32(6.5) * neg.fget(p))
+            var cfg_x0 = x - s * (guidance * pos.fget(p) + (1-guidance) * neg.fget(p))
             guided[p] = cfg_x0
             # Welford sums; the sample-variance denominators cancel in the ratio.
             var delta_pos = Float64(pos_x0) - avg_pos
@@ -67,7 +85,7 @@ def sample_structure_flow[M: StructureVelocityModel](mut model: M, var latent: T
             raise Error("Degenerate structure flow prediction during guidance rescale")
         var ratio = Float32(sqrt(var_pos / var_guided))
         for p in range(count):
-            var x0 = Float32(0.7) * (guided[p] * ratio) + Float32(0.3) * guided[p]
+            var x0 = rescale * (guided[p] * ratio) + (1-rescale) * guided[p]
             var velocity = ((1 - sigma) * latent.f[p] - x0) / s
             latent.f[p] -= dt * velocity
     return latent^

@@ -79,12 +79,12 @@ def _round_half_even(doubled: Int) -> Int:
     return floor + ((doubled & 1) & (floor & 1))
 
 
-def prepare_trellis_image(image: NativeImage, target: Int = 512) raises -> Tensor:
+def prepare_trellis_image(image: NativeImage, target: Int = 512, crop_scale: Float64 = 1.0) raises -> Tensor:
     """Crop an alpha-masked image onto black and normalize RGB for the 512/1024 encoder."""
     var w = image.width
     var h = image.height
     if (not image.valid or w < 1 or h < 1 or w > 40000000 // h or len(image.pixels) != w * h
-            or (target != 512 and target != 1024)):
+            or not (crop_scale >= 1 and crop_scale <= 2) or (target != 512 and target != 1024)):
         raise Error("Invalid image or DINOv3 resolution (expected 512 or 1024)")
     var transparent = False
     for pixel in image.pixels:
@@ -132,7 +132,7 @@ def prepare_trellis_image(image: NativeImage, target: Int = 512) raises -> Tenso
             right = max(right, i % w)
             top = min(top, i // w)
             bottom = max(bottom, i // w)
-    var half = max(right - left, bottom - top) // 2
+    var half = Int(Float64(max(right - left, bottom - top)) * crop_scale) // 2
     if half < 1:
         raise Error("Too few opaque foreground pixels")
     var x0 = _round_half_even(left + right - 2 * half)
