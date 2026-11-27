@@ -22,6 +22,7 @@ from flint.platform.input import (
     PAD_DOWN,
     PAD_LEFT,
     PAD_RIGHT,
+    POINTER_OUTSIDE,
 )
 from flint.render.font import SdfFont
 from flint.text.utf8 import decode_utf8, encode_utf8
@@ -590,6 +591,10 @@ struct UiContext(Movable):
                 self.mouse_x = input.last_mouse_x
             if isfinite(input.last_mouse_y):
                 self.mouse_y = input.last_mouse_y
+        elif input.last_mouse_x <= POINTER_OUTSIDE:
+            # The pointer left the window (`InputState.pointer_left`): nothing stays hovered.
+            self.mouse_x = POINTER_OUTSIDE
+            self.mouse_y = POINTER_OUTSIDE
         var prev_down = self.mouse_down_l
         self.mouse_down_l = input.mouse_down(0)
         self.mouse_pressed_l = input.mouse_pressed(0) or (self.mouse_down_l and not prev_down)
@@ -605,12 +610,13 @@ struct UiContext(Movable):
         self.key_enter_pressed = input.key_pressed(UI_KEY_ENTER)
         self.key_space_pressed = input.key_pressed(UI_KEY_SPACE)
         self.key_esc_pressed = input.key_pressed(UI_KEY_ESCAPE)
-        self.key_bs_pressed = input.key_pressed(UI_KEY_BACKSPACE)
-        self.key_del_pressed = input.key_pressed(UI_KEY_DELETE)
-        self.key_left_pressed = input.key_pressed(UI_KEY_LEFT)
-        self.key_right_pressed = input.key_pressed(UI_KEY_RIGHT)
-        self.key_up_pressed = input.key_pressed(UI_KEY_UP)
-        self.key_down_pressed = input.key_pressed(UI_KEY_DOWN)
+        # Editing and navigation keys auto-repeat while held (typematic repeat, `key_pressed_or_repeat`).
+        self.key_bs_pressed = input.key_pressed_or_repeat(UI_KEY_BACKSPACE)
+        self.key_del_pressed = input.key_pressed_or_repeat(UI_KEY_DELETE)
+        self.key_left_pressed = input.key_pressed_or_repeat(UI_KEY_LEFT)
+        self.key_right_pressed = input.key_pressed_or_repeat(UI_KEY_RIGHT)
+        self.key_up_pressed = input.key_pressed_or_repeat(UI_KEY_UP)
+        self.key_down_pressed = input.key_pressed_or_repeat(UI_KEY_DOWN)
         self.key_home_pressed = input.key_pressed(UI_KEY_HOME)
         self.key_end_pressed = input.key_pressed(UI_KEY_END)
         self.key_a_pressed = input.key_pressed(UI_KEY_A)

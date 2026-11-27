@@ -4098,6 +4098,19 @@ def _unlink_socket(path: String):
     _ = external_call["unlink", Int32](owned.as_c_string_span())
 
 
+def _unix_socket_is_live(path: String) -> Bool:
+    """True when a listener accepts connections at `path` (connect() succeeds, or its backlog is full),
+    so the socket file belongs to a running process and must not be unlinked."""
+    var fd = Int(external_call["socket", Int32](_AF_UNIX, _SOCK_STREAM | _SOCK_NONBLOCK | _SOCK_CLOEXEC, Int32(0)))
+    if fd < 0:
+        return False
+    var addr = _build_sockaddr_un(path)
+    var rc = _connect_unix(Int32(fd), addr)
+    var err = last_errno()
+    close_fd(fd)
+    return rc == 0 or err == Int32(11) or err == Int32(115)  # EAGAIN (backlog full), EINPROGRESS
+
+
 def _peer_pid(cfd: Int) -> Int:
     """`SO_PEERCRED` pid of a connected `AF_UNIX` peer, or -1."""
     var ucred = Array[UInt32, 3](fill=0xFFFFFFFF)
@@ -4226,6 +4239,16 @@ struct FlintMcpUnixListener(Movable):
         var existing = _lstat_mode_uid(target_sock)
         if existing[0] and (existing[1] & _S_IFMT) == _S_IFLNK:
             return False
+
+        # Another live Studio owns this path: never unlink its socket. Listen on a per-pid path beside it.
+        if existing[0] and _unix_socket_is_live(target_sock):
+            var pid_sock = (pdir + "/" if pdir.byte_length() > 0 else String("")) + "mcp-" + String(Int(external_call["getpid", Int32]())) + ".sock"
+            if pid_sock.byte_length() > 107:
+                return False
+            var existing_pid = _lstat_mode_uid(pid_sock)
+            if existing_pid[0] and (existing_pid[1] & _S_IFMT) == _S_IFLNK:
+                return False
+            target_sock = pid_sock
 
         self.socket_path = target_sock
         _unlink_socket(target_sock)

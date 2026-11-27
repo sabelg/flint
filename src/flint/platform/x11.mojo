@@ -5,7 +5,7 @@ Speaks the binary X11R6 protocol directly to `/tmp/.X11-unix/X<N>` using standar
 GLX, or C/C++ wrapper libraries are linked.
 """
 from std.ffi import external_call
-from flint.platform.input import InputState
+from flint.platform.input import InputState, layout_shortcut_code
 from flint.platform.traits import WindowBackend
 from flint.input.evdev import EvdevHub
 from flint.platform.dynlib import dl_open, dl_sym, dl_close
@@ -361,6 +361,10 @@ struct X11Window(WindowBackend):
     var xcb_disconnect: Int
     var gpu_swapchain: Int
     var evdev: EvdevHub
+    # Pointer enter (1) / leave (2) since the last poll, 0 for neither.
+    var pointer_presence: Int
+    # The core keyboard mapping changed: rebuild the input's layout shortcut table.
+    var layout_dirty: Bool
 
     def __init__(out self):
         self.fd = -1
@@ -447,6 +451,8 @@ struct X11Window(WindowBackend):
         self.xcb_disconnect = 0
         self.gpu_swapchain = 0
         self.evdev = EvdevHub(enable_hotplug=False)
+        self.pointer_presence = 0
+        self.layout_dirty = False
 
     def __moveinit__(out self, deinit existing: Self):
         self.fd = existing.fd
@@ -533,6 +539,8 @@ struct X11Window(WindowBackend):
         self.xcb_disconnect = existing.xcb_disconnect
         self.gpu_swapchain = existing.gpu_swapchain
         self.evdev = existing.evdev^
+        self.pointer_presence = existing.pointer_presence
+        self.layout_dirty = existing.layout_dirty
         existing.fd = -1
         existing.window_id = 0
         existing.gc_id = 0
@@ -780,6 +788,25 @@ struct X11Window(WindowBackend):
         self.keymap.reserve(count * per_kc)
         for i in range(count * per_kc):
             self.keymap.append(x11_get32(extra, i * 4))
+        self.layout_dirty = True
+
+    def layout_key_map(self) -> List[Int]:
+        """For `InputState.set_layout_key_map`: each physical GLFW code -> the code its unshifted
+        group-1 keysym names on the server's keymap (`layout_shortcut_code`)."""
+        var out = List[Int](capacity=512)
+        for code in range(512):
+            out.append(code)
+        if self.keysyms_per_keycode <= 0:
+            return out^
+        for keycode in range(self.min_keycode, self.max_keycode + 1):
+            var physical = x11_evdev_key(keycode - 8)
+            if physical < 0 or physical >= 512:
+                continue
+            var base = (keycode - self.min_keycode) * self.keysyms_per_keycode
+            if base >= len(self.keymap):
+                break
+            out[physical] = layout_shortcut_code(physical, x11_keysym_to_codepoint(self.keymap[base]))
+        return out^
 
     def _append_key_utf8(mut self, detail: Int, state: Int):
         # Skip UTF-8 text generation when Ctrl (4) or Alt/Mod1 (8) is active
@@ -800,6 +827,12 @@ struct X11Window(WindowBackend):
         if ks0 == 0 and g_off != 0:
             ks0 = self.keymap[base]
             ks1 = self.keymap[base + 1] if self.keysyms_per_keycode >= 2 else 0
+        # AltGr (ISO_Level3_Shift, Mod5): XKB's core map keeps levels 3/4 in columns 5/6 (group 2: 7/8).
+        if (state & 0x80) != 0:
+            var l3 = 4 + (2 if group == 1 else 0)
+            if l3 < self.keysyms_per_keycode and self.keymap[base + l3] != 0:
+                ks0 = self.keymap[base + l3]
+                ks1 = self.keymap[base + l3 + 1] if (l3 + 1 < self.keysyms_per_keycode) else 0
         if ks1 == 0:
             if (ks0 >= 97 and ks0 <= 122) or (ks0 >= 0xE0 and ks0 <= 0xF6) or (ks0 >= 0xF8 and ks0 <= 0xFE):
                 ks1 = ks0 - 32
@@ -977,8 +1010,9 @@ struct X11Window(WindowBackend):
         x11_put32(cw, 24, self.root_visual)
         x11_put32(cw, 28, 0x00000802)  # CWBackPixel | CWEventMask
         x11_put32(cw, 32, self.black_pixel)
-        # KeyPress|KeyRelease|ButtonPress|ButtonRelease|PointerMotion|Exposure|StructureNotify|FocusChange
-        x11_put32(cw, 36, 0x0022804F)
+        # KeyPress|KeyRelease|ButtonPress|ButtonRelease|EnterWindow|LeaveWindow|PointerMotion|Exposure|
+        # StructureNotify|FocusChange
+        x11_put32(cw, 36, 0x0022807F)
         if self._send_req(cw) < 0:
             self.close()
             return False
@@ -1240,12 +1274,18 @@ struct X11Window(WindowBackend):
                 else:
                     self.shm_busy1 = False
             elif code == 2 or code == 3:
-                # Filter X11 synthetic key auto-repeat: KeyRelease immediately followed by KeyPress at identical timestamp
+                # Server auto-repeat: KeyRelease immediately followed by KeyPress at the identical timestamp.
+                # Keep it as one press of the held key, which `InputState` reports as a repeat
+                # (`key_pressed_or_repeat`), with its text, at the user's `xset r rate`.
                 if code == 3 and pos + 64 <= len(self.incoming):
                     var next_code = Int(self.incoming[pos + 32]) & 0x7F
                     var next_detail = Int(self.incoming[pos + 33])
                     if next_code == 2 and next_detail == detail:
                         if x11_get32(self.incoming, pos + 4) == x11_get32(self.incoming, pos + 36):
+                            var held = x11_evdev_key(detail - 8)
+                            if held >= 0:
+                                self.pending_keys.append(held)
+                                self.pending_key_down.append(True)
                             self._append_key_utf8(detail, x11_get16(self.incoming, pos + 32 + 28))
                             pos += 64
                             continue
@@ -1287,6 +1327,18 @@ struct X11Window(WindowBackend):
                     self.pending_mouse_x = mx
                     self.pending_mouse_y = my
                     self.has_pending_mouse = True
+            elif code == 7 or code == 8:  # EnterNotify / LeaveNotify (event-x:24, event-y:26, state:28, mode:30)
+                var mode = Int(self.incoming[pos + 30])
+                var buttons_held = (x11_get16(self.incoming, pos + 28) & 0x1F00) != 0
+                if mode == 0 and code == 7:
+                    self.pending_mouse_x = Float32(x11_gets16(self.incoming, pos + 24))
+                    self.pending_mouse_y = Float32(x11_gets16(self.incoming, pos + 26))
+                    self.has_pending_mouse = True
+                    self.pointer_presence = 1
+                elif mode == 0 and code == 8 and not buttons_held and not self.pointer_locked:
+                    # A drag that leaves the window keeps its implicit grab and its motion events.
+                    self.has_pending_mouse = False
+                    self.pointer_presence = 2
             elif code == 9:  # FocusIn
                 self.focused = True
             elif code == 10:  # FocusOut
@@ -1302,6 +1354,10 @@ struct X11Window(WindowBackend):
                 if (cfg_win == 0 or cfg_win == self.window_id) and nw > 0 and nh > 0:
                     self.width = nw
                     self.height = nh
+                    # Pointer positions follow the window, in the pixels `framebuffer_size()` reports
+                    # (every renderer resizes to it), not the size the window was created at.
+                    self.logical_width = nw
+                    self.logical_height = nh
             elif code == 29:  # SelectionClear (offset 8 = window, offset 12 = selection atom)
                 if x11_get32(self.incoming, pos + 12) == self.atom_clipboard:
                     self.clipboard_owned = False
@@ -1381,9 +1437,23 @@ struct X11Window(WindowBackend):
         if self.fd < 0:
             return
         self.receive()
+        # The server repeats held keys itself; InputState must not synthesize a second stream.
+        if input.repeat_rate_hz != 0:
+            input.set_repeat_info(0, 0)
+        if self.layout_dirty:
+            self.layout_dirty = False
+            input.set_layout_key_map(self.layout_key_map())
+        if self.pointer_presence == 2 and not self.has_pending_mouse:
+            input.pointer_left()
         if self.has_pending_mouse:
-            input.move_mouse(self.map_mouse_x(self.pending_mouse_x), self.map_mouse_y(self.pending_mouse_y))
+            var px = self.map_mouse_x(self.pending_mouse_x)
+            var py = self.map_mouse_y(self.pending_mouse_y)
+            if self.pointer_presence == 1:
+                input.pointer_entered(px, py)
+            else:
+                input.move_mouse(px, py)
             self.has_pending_mouse = False
+        self.pointer_presence = 0
         if self.pointer_locked and (self.pending_rel_x != 0.0 or self.pending_rel_y != 0.0):
             input.add_mouse_delta(self.pending_rel_x, self.pending_rel_y)
             self.pending_rel_x = 0
@@ -1499,17 +1569,29 @@ struct X11Window(WindowBackend):
         var dst_w = max(1, self.width)
         var dst_h = max(1, self.height)
         var use_scaled = source_width != dst_w or source_height != dst_h
+        var shm_ready = self._ensure_shm(dst_w, dst_h)
+        if shm_ready and self.shm_busy0 and self.shm_busy1:
+            # Both slots are still being read by the server: never overwrite one mid-read. Give the
+            # ShmCompletion a moment, then drop this frame (the next one is fresher anyway).
+            if self.wait_io(1, 4):
+                self.receive()
+            if self.shm_busy0 and self.shm_busy1:
+                if get_time() - self.last_present_at < 0.25:
+                    return
+                # A completion that never came (server reset, lost event): do not stall forever.
+                self.shm_busy0 = False
+                self.shm_busy1 = False
         if use_scaled:
             self.scale_pixels_into_buffer(pixels, source_width, source_height, dst_w, dst_h)
 
-        if self._ensure_shm(dst_w, dst_h):
+        if shm_ready:
             var slot: Int
             if self.shm_busy0 and not self.shm_busy1:
                 slot = 1
-            elif self.shm_busy0 and self.shm_busy1:
-                slot = self.shm_slot ^ 1
+            elif self.shm_busy1 and not self.shm_busy0:
+                slot = 0
             else:
-                slot = self.shm_slot ^ 1 if (not (self.shm_busy0 or self.shm_busy1)) else 0
+                slot = self.shm_slot ^ 1
             self.shm_slot = slot
             var frame_px = dst_w * dst_h
             var frame_bytes = frame_px * 4
@@ -1607,6 +1689,8 @@ struct X11Window(WindowBackend):
             var remain_ms = Int((target_dt - (now - self.last_present_at)) * 1000.0)
             if remain_ms > 1 and remain_ms <= 16:
                 _ = self.wait_io(1, remain_ms)
+            self.last_present_at = get_time()
+        else:
             self.last_present_at = get_time()
 
     def toggle_fullscreen(mut self):

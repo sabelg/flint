@@ -3253,11 +3253,27 @@ struct VulkanGpu(Movable):
 
         var cur_w = get32(capabilities + 8)
         var cur_h = get32(capabilities + 12)
-        var final_w = UInt32(width)
-        var final_h = UInt32(height)
+        var final_w = UInt32(max(0, width))
+        var final_h = UInt32(max(0, height))
         if cur_w != 0xFFFFFFFF and cur_h != 0xFFFFFFFF:
             final_w = cur_w
             final_h = cur_h
+        else:
+            # The surface takes any size within [minImageExtent, maxImageExtent].
+            var min_w = get32(capabilities + 16)
+            var min_h = get32(capabilities + 20)
+            var max_w = get32(capabilities + 24)
+            var max_h = get32(capabilities + 28)
+            final_w = max(final_w, min_w)
+            final_h = max(final_h, min_h)
+            if max_w > 0:
+                final_w = min(final_w, max_w)
+            if max_h > 0:
+                final_h = min(final_h, max_h)
+        if final_w == 0 or final_h == 0:
+            # Minimized (a zero current extent): a swapchain cannot be made. Keep the old one; the next
+            # resize or OUT_OF_DATE once the window is visible again recreates it.
+            return self.fail("surface extent is zero (window minimized); swapchain kept")
 
         var usage_flags = IMAGE_USAGE_TRANSFER_TARGET | (sup_usages & IMAGE_USAGE_COLOR_ATTACHMENT)
         if (sup_usages & IMAGE_USAGE_STORAGE) != 0:
@@ -3358,7 +3374,15 @@ struct VulkanGpu(Movable):
         if result == ERROR_OUT_OF_DATE:
             self.wait_idle()
             if not self.robust.device_lost:
-                _ = self.create_swapchain(self.swapchain_width, self.swapchain_height)
+                # Same present mode and HDR choice as before, replacing (not leaking) the old swapchain.
+                _ = self.create_swapchain(
+                    self.swapchain_width,
+                    self.swapchain_height,
+                    prefer_mailbox=self.robust.prefer_mailbox,
+                    prefer_hdr10=self.robust.prefer_hdr10,
+                    old_swapchain=UInt64(self.swapchain),
+                    prefer_immediate=self.robust.prefer_immediate,
+                )
         elif result != TIMEOUT and result != NOT_READY:
             _ = self.robust.note_result(result, "vkAcquireNextImageKHR")
             self.error = "vkAcquireNextImageKHR returned " + String(result)

@@ -53,6 +53,58 @@ def set_signal_action(signal: Int32, action: Int, previous: Int = 0) -> Int32:
     )
 
 
+comptime QuitSignalHandler = def(Int32) abi("C") thin -> None
+comptime _SA_RESTART: Int = 0x10000000
+comptime _SA_RESETHAND: Int = 0x80000000
+comptime _SIGACTION_WORDS: Int = 19  # glibc struct sigaction: 152 bytes; sa_flags at byte 136
+
+
+def _quit_signal_handler(signal: Int32) abi("C"):
+    """Does nothing, which is trivially async-signal-safe. The work is in its flags: SA_RESETHAND puts
+    the signal back to SIG_DFL as it is delivered, and `quit_signal_received()` sees that change."""
+    pass
+
+
+def _quit_signals() -> List[Int32]:
+    var out = List[Int32](capacity=3)
+    out.append(Int32(2))   # SIGINT
+    out.append(Int32(15))  # SIGTERM
+    out.append(Int32(1))   # SIGHUP (the terminal closed)
+    return out^
+
+
+def install_quit_signal_handlers() -> Bool:
+    """SIGINT, SIGTERM and SIGHUP become a quit request instead of killing the process: poll
+    `quit_signal_received()` once a frame and shut down normally (save, remove sockets, ...).
+    Mojo has no globals and a handler gets no pointer, so the flag is the disposition itself: the
+    handler is installed one-shot (SA_RESETHAND). A second signal therefore takes the default action
+    and ends the process at once, as a stuck shutdown should. Call again to re-arm."""
+    var action = List[Int](length=_SIGACTION_WORDS, fill=0)
+    Pointer[QuitSignalHandler, origin=MutAnyOrigin](unsafe_from_address=Int(action.unsafe_ptr()))[unsafe_offset=0] = _quit_signal_handler
+    action[17] = _SA_RESTART | _SA_RESETHAND
+    var ok = True
+    var signals = _quit_signals()
+    for sig in signals:
+        if set_signal_action(sig, Int(action.unsafe_ptr()), 0) != 0:
+            ok = False
+    _ = action^
+    return ok
+
+
+def quit_signal_received() -> Int:
+    """The quit signal (2, 15 or 1) delivered since `install_quit_signal_handlers()`, or 0. One
+    `sigaction` query per signal; a handler someone else installed meanwhile is not a delivery."""
+    var current = List[Int](length=_SIGACTION_WORDS, fill=0)
+    var signals = _quit_signals()
+    for sig in signals:
+        current[0] = -1
+        if set_signal_action(sig, 0, Int(current.unsafe_ptr())) == 0 and current[0] == 0:
+            _ = current^
+            return Int(sig)
+    _ = current^
+    return 0
+
+
 def open_path_fd(var path: String, flags: Int32, mode: Int32 = 0) -> Int:
     # openat(AT_FDCWD) also coexists with stdlib's variadic declaration of open.
     return Int(external_call["openat", Int32](Int32(-100), path.as_c_string_span(), flags, mode))
