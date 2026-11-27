@@ -4617,8 +4617,30 @@ struct FlintStudioState(Movable):
         var safe_dt = Float32(0.0) if (not isfinite(dt) or dt < Float32(0.0)) else min(dt, Float32(0.1))
         var alpha = Float32(1.0) if self.anim_mode == UI_ANIM_INSTANT else min(Float32(1.0), safe_dt * Float32(6.0))
         self.cam_target = self.cam_target + (self.agent_bus.focus_target_pos - self.cam_target) * alpha
+        # A `shoulder_offset` left by Frame Selection was solved for that frame's arm length and panel
+        # layout; after a dolly or a dock change it parks the focus target off the panel centre. The
+        # tween re-solves it every step so the target always eases onto the current panel centre.
+        self.camera_rig.shoulder_offset = self.panel_centre_shoulder_offset(self.camera_rig.spring_arm.target_length)
         self.camera_rig.update(self._cam_dummy_world, self.cam_target, safe_dt)
         self._sync_from_camera_rig()
+
+    def panel_centre_shoulder_offset(self, arm: Float32) -> Vec3:
+        """Camera-local `CameraRig.shoulder_offset` that puts the orbit pivot (at `arm` metres along the
+        optical axis) under the SceneViewport panel centre. The renderer's projection is centred on the
+        whole window, so a panel docked off-centre needs the eye shifted by `-ndc * tan(half_fov) * arm`
+        (zero when the panel is centred in the window)."""
+        var vx = self.viewport_xf
+        var tw = max(Float32(1.0), vx.target_w)
+        var th = max(Float32(1.0), vx.target_h)
+        var safe_arm = arm if (isfinite(arm) and arm > Float32(0.0)) else Float32(0.0)
+        var tan_y = tan(self.fov_y_deg * Float32(3.14159265 / 360.0))
+        var tan_x = tan_y * (tw / th)
+        var ndc_x = ((vx.panel.x + vx.panel.w * Float32(0.5)) / tw) * Float32(2.0) - Float32(1.0)
+        var ndc_y = Float32(1.0) - ((vx.panel.y + vx.panel.h * Float32(0.5)) / th) * Float32(2.0)
+        var off = Vec3(-ndc_x * tan_x * safe_arm, -ndc_y * tan_y * safe_arm, Float32(0.0))
+        if not (isfinite(off.x) and isfinite(off.y)):
+            return Vec3()
+        return off
 
     def poll_agent_runtime(mut self, dt: Float32):
         var safe_dt = Float32(0.0) if (not isfinite(dt) or dt < Float32(0.0)) else min(dt, Float32(0.1))
