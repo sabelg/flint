@@ -476,6 +476,19 @@ def _mat4_mul_col_major(a: List[Float32], b: List[Float32]) -> List[Float32]:
     return out^
 
 
+def aaa_camera_basis(fwd: Vec3) -> Tuple[Vec3, Vec3]:
+    """Camera `(right, up)` for a unit `fwd`, using the same rule as `flint.camera.rig._look_rotation`:
+    world `+Y` is the up reference until `Y x fwd` degenerates, then `+X x fwd`. Keeping one rule means
+    the image never rolls against an editor/rig basis on steep views (the old `|fwd.y| > 0.95` switch
+    rolled the render between ~72 and 85 degrees of pitch). Below that pitch the result is bit-identical."""
+    var r0 = Vec3(0.0, 1.0, 0.0).cross(fwd)
+    if r0.length_squared() < Float32(1.0e-6):
+        r0 = Vec3(1.0, 0.0, 0.0).cross(fwd)
+    r0 = r0.normalized()
+    var u0 = fwd.cross(r0).normalized()
+    return (r0, u0)
+
+
 def _build_camera_view_col_major(eye: Vec3, fwd: Vec3, right: Vec3, up: Vec3) -> List[Float32]:
     """Left-handed camera view matrix (`+X = right, +Y = up, +Z = fwd`)."""
     var m = List[Float32](length=16, fill=0.0)
@@ -5105,9 +5118,9 @@ struct FlintAaaVulkanRenderer(Movable):
 
         self.cam_pos = cam_pos
         var fwd = (cam_target - cam_pos).normalized()
-        var up_ref = Vec3(0.0, 0.0, 1.0) if abs(fwd.y) > Float32(0.95) else Vec3(0.0, 1.0, 0.0)
-        var r0 = up_ref.cross(fwd).normalized()
-        var u0 = fwd.cross(r0).normalized()
+        var basis = aaa_camera_basis(fwd)
+        var r0 = basis[0]
+        var u0 = basis[1]
         var right = r0
         var up = u0
         if abs(cam_roll) > Float32(0.0001):

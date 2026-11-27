@@ -18,9 +18,23 @@ numbers each consumer needs:
 """
 from std.math import isfinite, max
 from flint.core.math import Mat4, Vec3
-from flint.render.render_world import make_rh_look_at, make_rh_reverse_z_perspective
+from flint.render.render_world import make_rh_reverse_z_perspective
 from flint.studio.gizmo import ViewportRay
 from flint.ui.flexbox_dock import RectF
+
+
+def hud_view_matrix(cam_pos: Vec3, cam_fwd: Vec3, cam_right: Vec3, cam_up: Vec3) -> Mat4:
+    """RH `-Z`-forward view matrix (for `make_rh_reverse_z_perspective`) whose `+X` is the renderer's
+    `cam_right` and `+Y` its `cam_up`, so projected points land where the renderer draws them."""
+    var r = cam_right.normalized()
+    var u = cam_up.normalized()
+    var b = -cam_fwd.normalized()
+    var m = Mat4()
+    m.set(0, 0, r.x); m.set(0, 1, r.y); m.set(0, 2, r.z); m.set(0, 3, -r.dot(cam_pos))
+    m.set(1, 0, u.x); m.set(1, 1, u.y); m.set(1, 2, u.z); m.set(1, 3, -u.dot(cam_pos))
+    m.set(2, 0, b.x); m.set(2, 1, b.y); m.set(2, 2, b.z); m.set(2, 3, -b.dot(cam_pos))
+    m.set(3, 0, Float32(0.0)); m.set(3, 1, Float32(0.0)); m.set(3, 2, Float32(0.0)); m.set(3, 3, Float32(1.0))
+    return m^
 
 
 @fieldwise_init
@@ -90,11 +104,23 @@ struct ViewportTransform(Copyable, ImplicitlyCopyable, Movable):
         )
 
     # ---- Overlays laid out in the panel ----
-    def hud_view_proj(self, cam_pos: Vec3, cam_fwd: Vec3, fov_y_deg: Float32, near_z: Float32, far_z: Float32) -> Mat4:
+    def hud_view_proj(
+        self,
+        cam_pos: Vec3,
+        cam_fwd: Vec3,
+        cam_right: Vec3,
+        cam_up: Vec3,
+        fov_y_deg: Float32,
+        near_z: Float32,
+        far_z: Float32,
+    ) -> Mat4:
         """View-projection with the renderer's (render-target) aspect, re-mapped so NDC -1..1 spans the
-        panel rect. Overlays that map NDC into `panel` then land exactly on the rendered pixels."""
+        panel rect. Overlays that map NDC into `panel` then land exactly on the rendered pixels.
+
+        The view is built from the renderer's own basis (`cam_right = up x fwd`, as in the AAA renderer
+        and `CameraRig`), not from `make_rh_look_at` (whose right is `fwd x up`, which mirrors overlays)."""
         var fov_rad = fov_y_deg * Float32(3.14159265358979 / 180.0)
-        var view_m = make_rh_look_at(cam_pos, cam_pos + cam_fwd, Vec3(0.0, 1.0, 0.0))
+        var view_m = hud_view_matrix(cam_pos, cam_fwd, cam_right, cam_up)
         var proj_m = make_rh_reverse_z_perspective(fov_rad, self.target_w / self.target_h, near_z, far_z)
         var pw = max(Float32(1.0), self.panel.w)
         var ph = max(Float32(1.0), self.panel.h)

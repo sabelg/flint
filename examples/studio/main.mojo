@@ -741,16 +741,14 @@ def _run_studio() raises -> Int:
                     else:
                         kept.append(pending_pick_ctrls[pi])
                 pending_pick_ctrls = kept^
-                if (
+                var pick_hit = (
                     pres.hit
                     and pres.entity_id >= 0
                     and studio.is_alive_id(pres.entity_id)
                     and (pres.entity_bits == 0 or studio.resolve_entity(pres.entity_id).to_bits() == pres.entity_bits)
-                    and not studio.is_entity_locked(pres.entity_id)
-                ):
-                    studio.select_entity(pres.entity_id, multi_select=pick_ctrl)
-                elif not pick_ctrl:
-                    studio.clear_selection()
+                )
+                # A hit on a locked entity is ignored rather than clearing the selection.
+                _ = studio.apply_viewport_click_pick(pick_hit, pres.entity_id, pick_ctrl)
 
         if studio.handle_command_menu(frame_input, out_w, out_h):
             # Record held keys without sending menu gestures to the scene.
@@ -838,10 +836,7 @@ def _run_studio() raises -> Int:
                         # Software renderer: pick with the CPU scene raycast instead of the GPU id buffer.
                         var ray = vxf.ray_phys(press_x, press_y, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
                         var hit = studio.raycast_scene(ray.origin, ray.dir)
-                        if hit.hit and studio.is_alive_id(hit.entity_id) and not studio.is_entity_locked(hit.entity_id):
-                            studio.select_entity(hit.entity_id, multi_select=press_additive)
-                        elif not press_additive:
-                            studio.clear_selection()
+                        _ = studio.apply_viewport_click_pick(hit.hit, hit.entity_id, press_additive)
                 press_pending = False
                 studio.marquee_active = False
 
