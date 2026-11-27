@@ -2590,10 +2590,15 @@ def test_f15_f16_f19_staging_aliasing_growth_and_direct_present(mut ren: FlintAa
         grow_e.mesh_id >= 0 and ren.vk.error == "",
         "M3c slot1: add_mesh while frame_fences[1] != 0 failed (" + ren.vk.error + ")",
     )
+    # `add_mesh` uploads and builds the BLAS through the async upload queue with its own staging + scratch
+    # (retired by timeline value), so it neither waits for the in-flight slot nor touches the shared scratch.
+    _assert(grow_e.lod_count > 0, "M3c slot1: add_mesh(24k tris) produced no LODs (allocation failure)")
+    _assert(ren.frame_fences[1] != 0, "M3c slot1: add_mesh(24k tris) must not stall on the in-flight slot")
     if ren.vk.has_ray_query:
         _assert(
-            ren.frame_fences[1] == 0 and ren.buf_as_scratch.size > scratch_before,
-            "M3c slot1: expected add_mesh(24k tris) to wait slot1 & grow buf_as_scratch (" + String(scratch_before) + " -> " + String(ren.buf_as_scratch.size) + ")",
+            ren.mesh_blas[grow_e.mesh_id].handle != 0 and ren.buf_as_scratch.size == scratch_before,
+            "M3c slot1: expected add_mesh(24k tris) to build its BLAS with its own scratch (shared "
+            + String(scratch_before) + " -> " + String(ren.buf_as_scratch.size) + ")",
         )
 
     # 3) upload_ibl_environment while frame_fences[1] != 0
