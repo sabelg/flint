@@ -17,6 +17,11 @@ from flint.devtools.mojo_highlight import (
     TOK_KEYWORD,
     TOK_NUMBER,
     TOK_STRING,
+    TOK_SYMBOL,
+    TOK_TEXT,
+    HighlightSpan,
+    js_in_template,
+    js_template_frames,
     lang_for_path,
     md_fence_lang,
     md_in_fence,
@@ -30,7 +35,8 @@ from flint.devtools.problems import (
     ProblemStore,
     parse_compiler_output,
 )
-from flint.platform.os import env_value, make_dirs, read_bytes, remove_file, write_bytes
+from flint.platform.os import env_value, file_mode, make_dirs, read_bytes, remove_file, write_bytes, write_file_durable
+from flint.devtools.safe_fs import resolve_confined_path, write_confined_durable
 from flint.studio.code_drawer import (
     CODE_TAB_WIDTH,
     CodeDrawer,
@@ -407,6 +413,182 @@ def test_code_drawer_files() raises:
     print("CodeDrawer open/reopen guards, durable save, disk watch & conflicts passed.")
 
 
+def _kind_at(spans: List[HighlightSpan], byte: Int) -> Int:
+    for s in spans:
+        if s.start_byte <= byte and byte < s.end_byte:
+            return s.token_kind
+    return -1
+
+
+def test_js_multiline_template() raises:
+    var hl = MojoHighlighter()
+    var src = List[String]()
+    src.append("const s = `line one")                          # 0 opens a template
+    src.append("still ${user.name + f({a: 1})} text }")        # 1 interpolation, nested braces
+    src.append("end` + 42; // tail")                           # 2 closes it
+    src.append("let t = `a ${ `inner")                         # 3 nested template in ${}
+    src.append("${x}` } b`;")                                  # 4 inner, outer ${} and outer close
+    src.append("const z = 1; /* open")                         # 5 block comment still works
+    src.append("`not a template` */ var q = 2;")               # 6
+    var spans = hl.highlight_lines(src, LANG_JS)
+    var l1 = src[1]
+    assert_equal(_kind_at(spans[1], 0), TOK_STRING)                       # "still" stays string
+    assert_equal(_kind_at(spans[1], l1.find("${")), TOK_SYMBOL)
+    assert_equal(_kind_at(spans[1], l1.find("user")), TOK_TEXT)           # code, not string
+    assert_equal(_kind_at(spans[1], l1.find("f(")), TOK_DEF)
+    assert_equal(_kind_at(spans[1], l1.find("1")), TOK_NUMBER)
+    assert_equal(_kind_at(spans[1], l1.find("})}") + 2), TOK_SYMBOL)      # closing `}` of ${}
+    assert_equal(_kind_at(spans[1], l1.find("text")), TOK_STRING)         # back in the template
+    assert_equal(_kind_at(spans[1], l1.byte_length() - 1), TOK_STRING)    # stray `}` is text
+    assert_equal(_kind_at(spans[2], 0), TOK_STRING)
+    assert_equal(_kind_at(spans[2], 3), TOK_STRING)                       # the closing backtick
+    assert_equal(_kind_at(spans[2], src[2].find("42")), TOK_NUMBER)
+    assert_equal(_kind_at(spans[2], src[2].find("//")), TOK_COMMENT)
+    assert_equal(_kind_at(spans[3], 0), TOK_KEYWORD)
+    assert_equal(_kind_at(spans[3], src[3].find("inner")), TOK_STRING)
+    var l4 = src[4]
+    assert_equal(_kind_at(spans[4], 0), TOK_SYMBOL)                       # inner `${`
+    assert_equal(_kind_at(spans[4], 2), TOK_TEXT)                         # x
+    assert_equal(_kind_at(spans[4], 4), TOK_STRING)                       # inner closing backtick
+    assert_equal(_kind_at(spans[4], l4.find("} b")), TOK_SYMBOL)          # outer ${} closes
+    assert_equal(_kind_at(spans[4], l4.find(" b") + 1), TOK_STRING)
+    assert_equal(_kind_at(spans[4], l4.byte_length() - 1), TOK_SYMBOL)   # `;` back in code
+    assert_equal(_kind_at(spans[5], 0), TOK_KEYWORD)
+    assert_equal(_kind_at(spans[6], 1), TOK_COMMENT)                      # backtick in a comment
+    assert_equal(_kind_at(spans[6], src[6].find("var")), TOK_KEYWORD)
+
+    # Line states (the drawer's incremental path) agree with the highlighter's.
+    var st = STATE_NORMAL
+    var expect_in = [True, True, False, True, False, False, False]
+    for i in range(len(src)):
+        st = next_line_state(src[i], st, LANG_JS)
+        assert_equal(js_in_template(st), expect_in[i])
+        if i == 3:
+            var fr = js_template_frames(st)
+            assert_equal(len(fr), 3)                                      # text, ${ depth 0, text
+            assert_equal(fr[0], -1)
+            assert_equal(fr[1], 0)
+            assert_equal(fr[2], -1)
+    assert_equal(st, STATE_NORMAL)
+    # Braces inside an interpolation are balanced across lines.
+    var b = List[String]()
+    b.append("x = `${ {")
+    b.append("  a: `}`, b: '}' }.a } tail")
+    b.append("` + 1")
+    var bs = hl.highlight_lines(b, LANG_JS)
+    var s1 = next_line_state(b[0], STATE_NORMAL, LANG_JS)
+    assert_equal(js_template_frames(s1)[1], 1)
+    assert_equal(_kind_at(bs[1], b[1].find("tail")), TOK_STRING)
+    assert_equal(_kind_at(bs[1], b[1].find("a:")), TOK_TEXT)
+    assert_equal(_kind_at(bs[2], b[2].find("1")), TOK_NUMBER)
+    assert_equal(next_line_state(b[2], next_line_state(b[1], s1, LANG_JS), LANG_JS), STATE_NORMAL)
+    # A Markdown ```js fence carries the template state inside its packed state.
+    var md = List[String]()
+    md.append("```js")
+    md.append("const m = `one")
+    md.append("two`;")
+    md.append("```")
+    var ms = hl.highlight_lines(md, LANG_MARKDOWN)
+    assert_equal(_kind_at(ms[2], 0), TOK_STRING)
+    assert_equal(_kind_at(ms[2], 4), TOK_SYMBOL)
+    print("JS/TS multi-line template literals, ${} interpolation and nesting passed.")
+
+
+def test_wcwidth_tables() raises:
+    # CJK / fullwidth / Hangul.
+    assert_equal(char_width(0x4E00), 2)
+    assert_equal(char_width(0x3000), 2)    # ideographic space (F)
+    assert_equal(char_width(0xFF21), 2)    # fullwidth A
+    assert_equal(char_width(0xAC00), 2)    # Hangul syllable
+    assert_equal(char_width(0x1100), 2)    # leading jamo
+    assert_equal(char_width(0x1160), 0)    # medial jamo
+    assert_equal(char_width(0x11A8), 0)    # final jamo
+    assert_equal(char_width(0xD7B0), 0)
+    assert_equal(char_width(0x20000), 2)
+    assert_equal(char_width(0x3FFFD), 2)
+    assert_equal(char_width(0xFF61), 1)    # halfwidth katakana
+    # Emoji presentation.
+    assert_equal(char_width(0x1F600), 2)
+    assert_equal(char_width(0x1F9D1), 2)
+    assert_equal(char_width(0x1FAF8), 2)
+    assert_equal(char_width(0x231A), 2)
+    assert_equal(char_width(0x2764), 1)    # text presentation by default
+    assert_equal(char_width(0x1F3FB), 0)   # skin-tone modifier attaches
+    # Combining / format / selectors.
+    assert_equal(char_width(0x0301), 0)
+    assert_equal(char_width(0x20DD), 0)    # Me
+    assert_equal(char_width(0x0E31), 0)
+    assert_equal(char_width(0x0F71), 0)    # Tibetan (missing from the old table)
+    assert_equal(char_width(0x200D), 0)    # ZWJ
+    assert_equal(char_width(0x200B), 0)
+    assert_equal(char_width(0xFE0F), 0)
+    assert_equal(char_width(0xE0100), 0)
+    assert_equal(char_width(0xE0041), 0)   # tag
+    assert_equal(char_width(0x00AD), 1)    # soft hyphen prints
+    assert_equal(char_width(0x0915), 1)
+    # Controls.
+    assert_equal(char_width(0x00), -1)
+    assert_equal(char_width(0x07), -1)
+    assert_equal(char_width(0x1B), -1)
+    assert_equal(char_width(0x7F), -1)
+    assert_equal(char_width(0x85), -1)
+    assert_equal(char_width(0x9F), -1)
+    assert_equal(char_width(0xA0), 1)
+    var g = IdeGrid()
+    g.resize(12, 2)
+    _feed(g, "👩\u200d💻a\u0085b")
+    assert_equal(g.cell(0, 0).code, 0x1F469)
+    assert_equal(g.mark(0, 0), "\u200d")
+    assert_equal(g.cell(0, 2).code, 0x1F4BB)
+    assert_equal(g.cell(0, 4).code, 97)
+    assert_equal(g.cell(0, 5).code, 98)    # UTF-8 encoded C1 control takes no cell
+    assert_equal(g.x, 6)
+    print("wcwidth tables: CJK, emoji, combining, ZWJ, jamo and controls passed.")
+
+
+def test_durable_save_keeps_mode() raises:
+    var dir = _scratch_dir()
+    var script = dir + "/run.sh"
+    _write_text(script, "#!/bin/sh\necho 1\n")
+    var owned = script
+    assert_equal(external_call["chmod", Int32](owned.as_c_string_span(), UInt32(0o755)), 0)
+    var data = List[UInt8]("#!/bin/sh\necho 2\n".as_bytes())
+    assert_true(write_file_durable(script, data))
+    assert_equal(file_mode(script), 0o755)
+    assert_equal(_read_text(script), "#!/bin/sh\necho 2\n")
+    # Code Drawer save keeps the exec bit too (and a private 0600 file stays private).
+    var cd = CodeDrawer()
+    var ti = cd.open_file(script)
+    cd.tabs[ti].text = "#!/bin/sh\necho 3\n"
+    cd.tabs[ti].dirty = True
+    assert_true(cd.save_tab(ti))
+    assert_equal(file_mode(script), 0o755)
+    var secret = dir + "/secret.toml"
+    _write_text(secret, "k = 1\n")
+    var owned_secret = secret
+    assert_equal(external_call["chmod", Int32](owned_secret.as_c_string_span(), UInt32(0o600)), 0)
+    var sd = List[UInt8]("k = 2\n".as_bytes())
+    assert_true(write_file_durable(secret, sd))
+    assert_equal(file_mode(secret), 0o600)
+    # Confined agent writes (safe_fs) go through the same path.
+    var cp = resolve_confined_path(dir, "run.sh")
+    var w = write_confined_durable(cp, "#!/bin/sh\necho 4\n")
+    assert_true(w[0])
+    assert_equal(file_mode(script), 0o755)
+    # A new file gets 0666 & ~umask.
+    var fresh = dir + "/fresh.txt"
+    _ = remove_file(fresh)
+    var um = Int(external_call["umask", UInt32](UInt32(0o022)))
+    _ = external_call["umask", UInt32](UInt32(um))
+    var fd = List[UInt8]("new\n".as_bytes())
+    assert_true(write_file_durable(fresh, fd))
+    assert_equal(file_mode(fresh), 0o666 & ~um)
+    _ = remove_file(script)
+    _ = remove_file(secret)
+    _ = remove_file(fresh)
+    print("Durable save keeps file mode bits (exec, 0600), new files honour umask passed.")
+
+
 def test_code_drawer_view() raises:
     var cd = CodeDrawer()
     var body = String("")
@@ -574,5 +756,8 @@ def main() raises:
     test_diff_line_endings()
     test_highlight_fences_and_dialects()
     test_code_drawer_files()
+    test_js_multiline_template()
+    test_wcwidth_tables()
+    test_durable_save_keeps_mode()
     test_code_drawer_view()
     print("Embedded IDE grid, UTF-8 input, F2, bounds safety, RAII and generic WindowBackend passed.")
