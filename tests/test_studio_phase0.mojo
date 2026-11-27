@@ -156,7 +156,7 @@ def test_mcp_build_rejects_foreign_compiler() raises:
     var pool = JobPool()
     var mcp = McpServerV2(workspace_root=".")
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"phase0"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"phase0"}}}',
         studio, assets, pool,
     )
     var r = mcp.handle_jsonrpc(

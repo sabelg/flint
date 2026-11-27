@@ -2491,7 +2491,7 @@ def test_r5_partition_a_fixes(tmp_dir: String) raises:
     var pool = JobPool()
     var mcp = McpServerV2(workspace_root=tmp_dir)
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"t5"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"t5"}}}',
         studio, assets, pool,
     )
     var r_cap_w = mcp.handle_jsonrpc(

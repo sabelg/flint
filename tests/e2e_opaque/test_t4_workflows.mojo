@@ -1450,7 +1450,7 @@ def t4_s5_studio_devtools_authoring_workflow(tmp_root: String) raises:
         var mcp = McpServerV2(workspace_root=ws, auth_token="t4-studio-token")
         var init_doc = t4_parse_json_str(
             mcp.handle_jsonrpc(
-                '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","auth_token":"t4-studio-token"}}',
+                '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","auth_token":"t4-studio-token"}}',
                 studio,
                 assets,
                 pool,

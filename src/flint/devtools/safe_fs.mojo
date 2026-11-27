@@ -348,3 +348,14 @@ def write_confined_durable(cp: ConfinedPath, text: String) -> Tuple[Bool, String
     if not write_file_durable(cp.abs(), data):
         return (False, "write failed: " + cp.rel())
     return (True, String(""))
+
+
+def write_confined_durable_bytes(cp: ConfinedPath, mut data: List[UInt8]) -> Tuple[Bool, String]:
+    """Binary twin of `write_confined_durable`: confined checks, then `write_file_durable`
+    (`.tmp` + fsync + rename + directory fsync). Returns `(ok, error_text)`."""
+    var chk = prepare_confined_write(cp)
+    if chk[0] != SAFE_FS_OK:
+        return (False, chk[1])
+    if not write_file_durable(cp.abs(), data):
+        return (False, "write failed: " + cp.rel())
+    return (True, String(""))

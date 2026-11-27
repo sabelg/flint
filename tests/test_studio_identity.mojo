@@ -48,7 +48,7 @@ def test_mcp_editor_id_targets_the_right_entity() raises:
     var pool = JobPool()
     var mcp = McpServerV2(workspace_root=".")
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"identity"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"identity"}}}',
         studio, assets, pool,
     )
     var a = studio.spawn_entity("Target", position=Vec3(0.0, 0.0, 0.0))

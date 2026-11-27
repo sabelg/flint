@@ -782,7 +782,7 @@ def test_t3_p9_studio_state_mcp_v2_live_sync(tmp_root: String) raises:
     try:
         var h0 = studio.state_hash()
         _ = mcp.handle_jsonrpc(
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}',
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}',
             studio,
             assets,
             pool,
