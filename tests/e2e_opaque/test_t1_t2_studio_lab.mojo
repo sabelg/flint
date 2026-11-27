@@ -16,6 +16,7 @@ from flint.core.perf_history import PerfTable
 from flint.devtools.mcp_v2 import (
     JSONRPC_INVALID_PARAMS,
     JSONRPC_INVALID_REQUEST,
+    MCP_ERR_UNAUTHORIZED,
     JSONRPC_METHOD_NOT_FOUND,
     JSONRPC_PARSE_ERROR,
     MCP_PROTOCOL_VERSION,
@@ -572,7 +573,7 @@ def test_t2_mcp_v2_jsonrpc_protocol_and_auth_errors(tmp_root: String) raises:
 
         var auth_mcp = McpServerV2(workspace_root=tmp_root, auth_token="tok-123")
         var r_unauth = auth_mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":6,"method":"tools/list"}', studio, assets, pool)
-        assert_true(r_unauth.find(String(JSONRPC_INVALID_REQUEST)) >= 0)
+        assert_true(r_unauth.find(String(MCP_ERR_UNAUTHORIZED)) >= 0)
         assert_false(auth_mcp.session_authenticated)
 
         var r_bad_tok = auth_mcp.handle_jsonrpc(
@@ -581,7 +582,7 @@ def test_t2_mcp_v2_jsonrpc_protocol_and_auth_errors(tmp_root: String) raises:
             assets,
             pool,
         )
-        assert_true(r_bad_tok.find(String(JSONRPC_INVALID_REQUEST)) >= 0)
+        assert_true(r_bad_tok.find(String(MCP_ERR_UNAUTHORIZED)) >= 0)
         assert_false(auth_mcp.session_authenticated)
 
         var r_unauth_notif = auth_mcp.handle_jsonrpc('{"jsonrpc":"2.0","method":"notifications/initialized"}', studio, assets, pool)

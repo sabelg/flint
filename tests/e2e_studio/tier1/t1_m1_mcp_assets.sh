@@ -148,7 +148,7 @@ PY
 
 # Run MCP v2 Tier 1 checks and capture structured results per case
 RESULTS_JSON="${TMPD}/t1_m1_mcp_results.json"
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${SCRIPT_DIR}/../common" python3 -B - \
+FLINT_MCP_IMPORT_DIRS="${IMPORT_SRC}" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${SCRIPT_DIR}/../common" python3 -B - \
     "$STUDIO_BIN" "$PROJ_DIR" "$IMPORT_SRC" "$TMPD" "$RESULTS_JSON" <<'PY'
 import json
 import os

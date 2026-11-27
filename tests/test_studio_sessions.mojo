@@ -15,7 +15,7 @@ from std.testing import assert_equal, assert_true
 from flint.assets.server import AssetServer
 from flint.core.jobs import JobPool
 from flint.core.lz4 import lz4_packed_raw_size
-from flint.devtools.mcp_v2 import MCP_GATE_ALL, McpServerV2
+from flint.devtools.mcp_v2 import MCP_GATE_ALL, MCP_GATE_AUTO, McpServerV2
 from flint.platform.os import file_size, get_time, make_dirs, write_bytes
 from flint.studio import FlintStudioState
 from flint.studio.agent_bus import AgentStep
@@ -168,6 +168,7 @@ def test_revert_never_wipes_later_user_edits() raises:
     var assets = AssetServer(enable_watcher=False)
     var pool = JobPool()
     var mcp = McpServerV2(workspace_root=".")
+    mcp.set_gate_mode(MCP_GATE_AUTO)  # socket clients start gated (MCP_GATE_MUTATING)
     mcp.select_client(1)
     _init(mcp, studio, assets, pool, "agent-a")
     _ = _spawn_call(mcp, studio, assets, pool)

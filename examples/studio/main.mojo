@@ -227,10 +227,17 @@ def _sync_mcp_gate_from_bus(mut mcp: McpServerV2, mut studio: FlintStudioState):
         var csi = studio.agent_bus.find_session_index(caid)
         if csi >= 0:
             mcp.set_client_gate_mode(ck, _gate_mode_for_session(studio, csi))
-    # The in-process / stdio client (key 0) and clients not yet mapped follow the selected agent.
+            # "Approve for turn" lasts while the agent's turn does (AgentBus clears it in end_turn).
+            mcp.set_client_turn_allowance(ck, studio.agent_bus.turn_allowance_active(caid))
+        else:
+            # A socket client with no agent session never runs mutating tools unasked.
+            mcp.set_client_gate_mode(ck, MCP_GATE_MUTATING)
+            mcp.set_client_turn_allowance(ck, False)
+    # The in-process / stdio client (key 0) follows the selected agent. Socket clients that connect
+    # before they are mapped start gated: never `MCP_GATE_AUTO` by default.
     var si = studio.agent_bus.find_session_index(studio.agent_bus.selected_agent_id)
     var m = MCP_GATE_AUTO if (si < 0 or si >= len(studio.agent_bus.sessions)) else _gate_mode_for_session(studio, si)
-    mcp.default_gate_mode = m
+    mcp.default_gate_mode = MCP_GATE_MUTATING if m == MCP_GATE_AUTO else m
     mcp.set_client_gate_mode(0, m)
 
 

@@ -169,6 +169,15 @@ from flint.physics.world import (
     BODY_SHAPE_SPHERE,
     PhysicsWorld,
 )
+from flint.devtools.safe_fs import (
+    SAFE_FS_MISSING,
+    SAFE_FS_OK,
+    ConfinedPath,
+    read_confined_regular,
+    resolve_confined_path,
+    text_hash64,
+    write_confined_durable,
+)
 from flint.nav.navmesh import NavMesh
 from flint.nav.plugin import NavPlugin, NavPluginStateResource, register_nav_codecs
 from flint.platform.input import InputState
@@ -271,6 +280,7 @@ from flint.studio.agent_bus import (
     AGENT_STATUS_WRITING_CODE,
     APPROVAL_AUTO,
     APPROVAL_EDITS,
+    APPROVAL_SRC_ACP_WRITE,
     APPROVAL_SRC_MCP_TOOL,
     GHOST_TRANSFORM,
     APPROVAL_STEP,
@@ -4249,7 +4259,9 @@ struct FlintStudioState(Movable):
                         "",
                     )
                 else:
-                    _ = self.agent_runtime.answer_acp_approval(pa, approved, allow_turn)
+                    _ = self.agent_runtime.answer_acp_approval(
+                        self.agent_bus, pa, approved, allow_turn, Float64(self.ui_time_sec)
+                    )
 
         elif act.kind == PANEL_ACT_FOCUS_ENTITY:
             if self.is_alive_id(act.entity_id):
@@ -4318,11 +4330,11 @@ struct FlintStudioState(Movable):
                     self.mark_dirty(True)
                 for fi in range(len(plan.file_paths)):
                     if plan.file_existed[fi]:
-                        var sb = plan.file_old_texts[fi].as_bytes()
-                        var fbytes = List[UInt8](capacity=len(sb))
-                        for bi in range(len(sb)):
-                            fbytes.append(sb[bi])
-                        _ = write_bytes(plan.file_paths[fi], fbytes)
+                        var fr = self._revert_agent_file(
+                            plan.file_paths[fi], plan.file_old_texts[fi], plan.file_post_hashes[fi]
+                        )
+                        if not fr[0]:
+                            _ = self.toast_mgr.push(TOAST_WARN, "File revert refused", fr[1])
                 self.agent_bus.commit_revert_plan(plan)
                 _ = self.toast_mgr.push(
                     TOAST_SUCCESS,
@@ -4376,6 +4388,27 @@ struct FlintStudioState(Movable):
             return False
         self.push_toast("Time travel is read-only: exit it to edit", 1, 2.5)
         return True
+
+    def _revert_agent_file(self, path: String, old_text: String, post_hash: UInt64) -> Tuple[Bool, String]:
+        """Puts an agent-edited file back to `old_text`, but only while the disk still holds exactly
+        what the agent's approved write left there (`post_hash`); a file someone changed since is
+        never clobbered. The path is confined to the agent workspace and written durably."""
+        var cp: ConfinedPath
+        try:
+            cp = resolve_confined_path(self.agent_runtime.workspace_root, path)
+        except e:
+            return (False, path + ": " + String(e))
+        if post_hash == 0:
+            return (False, path + ": no record of what the agent wrote")
+        var cur = read_confined_regular(cp)
+        if cur[0] != SAFE_FS_OK:
+            return (False, path + (": file is gone" if cur[0] == SAFE_FS_MISSING else ": not a regular file"))
+        if text_hash64(String(unsafe_from_utf8=cur[1])) != post_hash:
+            return (False, path + " changed after the agent wrote it")
+        var w = write_confined_durable(cp, old_text)
+        if not w[0]:
+            return (False, w[1])
+        return (True, String(""))
 
     def ingest_mcp_events(mut self, var events: List[BridgedMcpEvent]) -> Int:
         for i in range(len(events)):
@@ -12508,6 +12541,31 @@ def emit_studio_ui_draw_list(
                 0,
                 2.2,
             )
+        elif cd_act.kind == CODE_ACT_ACCEPT_HUNK or cd_act.kind == CODE_ACT_REJECT_HUNK:
+            # The drawer already recorded the hunk decision. Once no hunk is pending, the proposal is
+            # settled: write exactly the accepted hunks (`materialized_text`) through the approval, or
+            # reject it when every hunk was rejected.
+            var hti = studio.code_drawer.find_tab(cd_act.path)
+            if hti >= 0 and studio.code_drawer.tabs[hti].diff_doc.pending_count() == 0:
+                var merged = studio.code_drawer.tabs[hti].diff_doc.materialized_text()
+                for pi in range(len(studio.agent_bus.pending_approvals)):
+                    if (
+                        not studio.agent_bus.pending_approvals[pi].resolved
+                        and studio.agent_bus.pending_approvals[pi].source == APPROVAL_SRC_ACP_WRITE
+                        and studio.agent_bus.pending_approvals[pi].file_path == cd_act.path
+                    ):
+                        var keep = merged != studio.agent_bus.pending_approvals[pi].old_text
+                        if keep:
+                            studio.agent_bus.pending_approvals[pi].new_text = merged
+                        var ha = AgentPanelAction(PANEL_ACT_APPROVE if keep else PANEL_ACT_REJECT)
+                        ha.approval_id = studio.agent_bus.pending_approvals[pi].approval_id
+                        studio.apply_agent_panel_action(ha)
+                        studio.push_toast(
+                            ("Applied accepted hunks: " if keep else "Rejected all hunks: ") + cd_act.path,
+                            0,
+                            2.2,
+                        )
+                        break
         elif cd_act.kind == CODE_ACT_JUMP_DIAGNOSTIC and cd_act.path.byte_length() > 0:
             _ = studio.open_code_location(cd_act.path, cd_act.line)
         elif cd_act.kind == CODE_ACT_SAVE_TAB or cd_act.kind == CODE_ACT_RELOAD_FROM_DISK:
