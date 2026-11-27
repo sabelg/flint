@@ -15,6 +15,8 @@ from flint.text.utf8 import encode_codepoint
 from flint.platform.os import env_value, env_now, env_flag, read_bytes, close_fd, get_time
 
 comptime X11_RELEASE_HELD: Int = -1
+comptime X11_ATOM_RESOURCE_MANAGER: Int = 23  # predefined XA_RESOURCE_MANAGER
+comptime X11_PROPERTY_CHANGE_MASK: Int = 0x400000
 comptime X11_MOUSE_BUTTONS: Int = 3
 
 
@@ -166,6 +168,82 @@ def x11_evdev_key(key: Int) -> Int:
     if key == 126:
         return 347  # RightSuper
     return -1
+
+
+def parse_xft_dpi(resources: String) -> Float32:
+    """`Xft.dpi` from the root window's RESOURCE_MANAGER string (`Xft.dpi:\t144` lines, as written by
+    xrdb or the desktop's settings daemon). 0 when absent or not a positive number."""
+    var bytes = resources.as_bytes()
+    var n = len(bytes)
+    var key = String("Xft.dpi")
+    var kb = key.as_bytes()
+    var kn = len(kb)
+    var line_start = 0
+    while line_start < n:
+        var line_end = line_start
+        while line_end < n and bytes[line_end] != 10:
+            line_end += 1
+        var i = line_start
+        while i < line_end and (bytes[i] == 32 or bytes[i] == 9):
+            i += 1
+        var matched = i + kn <= line_end
+        if matched:
+            for k in range(kn):
+                if bytes[i + k] != kb[k]:
+                    matched = False
+                    break
+        if matched:
+            i += kn
+            while i < line_end and (bytes[i] == 32 or bytes[i] == 9):
+                i += 1
+            if i < line_end and bytes[i] == 58:  # ':'
+                i += 1
+                while i < line_end and (bytes[i] == 32 or bytes[i] == 9):
+                    i += 1
+                var whole = 0.0
+                var frac = 0.0
+                var frac_div = 1.0
+                var digits = 0
+                var in_frac = False
+                while i < line_end:
+                    var c = Int(bytes[i])
+                    if c >= 48 and c <= 57:
+                        if in_frac:
+                            frac = frac * 10.0 + Float64(c - 48)
+                            frac_div *= 10.0
+                        else:
+                            whole = whole * 10.0 + Float64(c - 48)
+                        digits += 1
+                        if digits > 9:
+                            break
+                    elif c == 46 and not in_frac:
+                        in_frac = True
+                    else:
+                        break
+                    i += 1
+                var value = whole + frac / frac_div
+                if digits > 0 and value > 0.0:
+                    return Float32(value)
+                return 0.0
+        line_start = line_end + 1
+    return 0.0
+
+
+def x11_dpi_from_physical(pixels: Int, millimeters: Int) -> Float32:
+    """DPI from the screen's size in pixels and millimeters (core setup / RandR); 0 when unknown."""
+    if pixels <= 0 or millimeters <= 0:
+        return 0.0
+    return Float32(Float64(pixels) * 25.4 / Float64(millimeters))
+
+
+def x11_scale_from_dpi(dpi: Float32) -> Float32:
+    """Content scale for a DPI: dpi / 96 rounded to the nearest 0.25 and clamped to 1.0 .. 4.0
+    (1.0 for an unknown or implausible DPI)."""
+    if not (dpi > Float32(0.0)) or dpi > Float32(2000.0):
+        return 1.0
+    var steps = Int(dpi / Float32(96.0) * Float32(4.0) + Float32(0.5))
+    var scale = Float32(steps) / Float32(4.0)
+    return max(Float32(1.0), min(Float32(4.0), scale))
 
 
 def parse_x11_display_number(display: String) -> String:
@@ -365,6 +443,14 @@ struct X11Window(WindowBackend):
     var pointer_presence: Int
     # The core keyboard mapping changed: rebuild the input's layout shortcut table.
     var layout_dirty: Bool
+    # HiDPI: content scale from `Xft.dpi` (else the screen's physical size), and the root
+    # RESOURCE_MANAGER changed since it was read (the desktop changed its scale).
+    var screen_width_mm: Int
+    var screen_height_mm: Int
+    var dpi: Float32
+    var dpi_scale: Float32
+    var dpi_source: String
+    var resources_dirty: Bool
 
     def __init__(out self):
         self.fd = -1
@@ -453,6 +539,12 @@ struct X11Window(WindowBackend):
         self.evdev = EvdevHub(enable_hotplug=False)
         self.pointer_presence = 0
         self.layout_dirty = False
+        self.screen_width_mm = 0
+        self.screen_height_mm = 0
+        self.dpi = 0.0
+        self.dpi_scale = 1.0
+        self.dpi_source = String("default")
+        self.resources_dirty = False
 
     def __moveinit__(out self, deinit existing: Self):
         self.fd = existing.fd
@@ -541,6 +633,12 @@ struct X11Window(WindowBackend):
         self.evdev = existing.evdev^
         self.pointer_presence = existing.pointer_presence
         self.layout_dirty = existing.layout_dirty
+        self.screen_width_mm = existing.screen_width_mm
+        self.screen_height_mm = existing.screen_height_mm
+        self.dpi = existing.dpi
+        self.dpi_scale = existing.dpi_scale
+        self.dpi_source = existing.dpi_source^
+        self.resources_dirty = existing.resources_dirty
         existing.fd = -1
         existing.window_id = 0
         existing.gc_id = 0
@@ -985,6 +1083,8 @@ struct X11Window(WindowBackend):
         self.black_pixel = x11_get32(body, screen_off + 12)
         self.screen_width = x11_get16(body, screen_off + 20)
         self.screen_height = x11_get16(body, screen_off + 22)
+        self.screen_width_mm = x11_get16(body, screen_off + 24)
+        self.screen_height_mm = x11_get16(body, screen_off + 26)
         self.root_visual = x11_get32(body, screen_off + 32)
         self.root_depth = Int(body[screen_off + 38])
 
@@ -1103,6 +1203,18 @@ struct X11Window(WindowBackend):
 
         self.refresh_keyboard_mapping()
         self.set_title(title)
+        # Follow the desktop's scale: PropertyNotify on the root for RESOURCE_MANAGER (Xft.dpi).
+        var cwa = List[UInt8](length=12, fill=0)
+        cwa[0] = 2  # ChangeWindowAttributes
+        x11_put16(cwa, 2, 3)
+        x11_put32(cwa, 4, self.root_window)
+        x11_put32(cwa, 8, 0x800)  # CWEventMask
+        var cwa_ev = List[UInt8](length=4, fill=0)
+        x11_put32(cwa_ev, 0, X11_PROPERTY_CHANGE_MASK)
+        for b in cwa_ev:
+            cwa.append(b)
+        _ = self._send_req(cwa)
+        self.refresh_dpi()
 
         if self.wm_protocols != 0 and self.wm_delete_window != 0:
             var prop = List[UInt8](length=28, fill=0)
@@ -1382,6 +1494,9 @@ struct X11Window(WindowBackend):
                         self.close_requested = True
             elif code == 17:  # DestroyNotify
                 self.close_requested = True
+            elif code == 28:  # PropertyNotify (window:4, atom:8)
+                if x11_get32(self.incoming, pos + 4) == self.root_window and x11_get32(self.incoming, pos + 8) == X11_ATOM_RESOURCE_MANAGER:
+                    self.resources_dirty = True
 
             pos += 32
 
@@ -1432,11 +1547,62 @@ struct X11Window(WindowBackend):
             for x in range(dst_w):
                 dst_ptr[unsafe_offset=drow + x] = src_ptr[unsafe_offset=srow + xmap_ptr[unsafe_offset=x]] | UInt32(0xFF000000)
 
+    def read_resource_manager(mut self) -> String:
+        """The root window's RESOURCE_MANAGER string (X resources), "" when unset."""
+        if self.fd < 0 or self.root_window == 0:
+            return ""
+        var gp = List[UInt8](length=24, fill=0)
+        gp[0] = 20  # GetProperty
+        gp[1] = 0   # delete = False
+        x11_put16(gp, 2, 6)
+        x11_put32(gp, 4, self.root_window)
+        x11_put32(gp, 8, X11_ATOM_RESOURCE_MANAGER)
+        x11_put32(gp, 12, 31)  # XA_STRING
+        x11_put32(gp, 16, 0)
+        x11_put32(gp, 20, 262144)  # long-length, in 4-byte units: 1 MiB is plenty
+        var seq = self._send_req(gp)
+        if seq < 0:
+            return ""
+        var rep = self._wait_reply(seq)
+        if not rep[0] or len(rep[2]) < 24 or Int(rep[2][1]) != 8:
+            return ""
+        var nbytes = x11_get32(rep[2], 16)
+        ref extra = rep[3]
+        nbytes = min(nbytes, len(extra))
+        if nbytes <= 0:
+            return ""
+        var out = List[UInt8](capacity=nbytes)
+        for i in range(nbytes):
+            out.append(extra[i])
+        return String(unsafe_from_utf8=out)
+
+    def apply_dpi(mut self, xft_dpi: Float32):
+        """Picks the DPI (`Xft.dpi`, else the screen's physical size) and the content scale from it."""
+        if xft_dpi > Float32(0.0):
+            self.dpi = xft_dpi
+            self.dpi_source = String("Xft.dpi")
+        else:
+            var phys = x11_dpi_from_physical(self.screen_width, self.screen_width_mm)
+            # Servers without real EDID data report 96 dpi or nonsense; only trust a plausible size.
+            if phys >= Float32(48.0) and phys <= Float32(600.0):
+                self.dpi = phys
+                self.dpi_source = String("physical")
+            else:
+                self.dpi = 96.0
+                self.dpi_source = String("default")
+        self.dpi_scale = x11_scale_from_dpi(self.dpi)
+
+    def refresh_dpi(mut self):
+        self.resources_dirty = False
+        self.apply_dpi(parse_xft_dpi(self.read_resource_manager()))
+
     def poll(mut self, mut input: InputState):
         self.evdev.poll(input)
         if self.fd < 0:
             return
         self.receive()
+        if self.resources_dirty:
+            self.refresh_dpi()
         # The server repeats held keys itself; InputState must not synthesize a second stream.
         if input.repeat_rate_hz != 0:
             input.set_repeat_info(0, 0)
@@ -1915,7 +2081,9 @@ struct X11Window(WindowBackend):
         return (max(1, self.width), max(1, self.height))
 
     def content_scale(self) -> Float32:
-        return 1.0
+        """`Xft.dpi` / 96 (physical DPI when unset), in 0.25 steps from 1.0 to 4.0. X11 windows are
+        sized in device pixels, so this only scales the UI; the framebuffer is the window size."""
+        return self.dpi_scale
 
     def should_close(self) -> Bool:
         return self.close_requested
