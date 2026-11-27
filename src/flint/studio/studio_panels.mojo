@@ -136,6 +136,61 @@ def _ascii_lower_panel(s: String) -> String:
     return String(unsafe_from_utf8=out)
 
 
+def ascii_contains_ci(hay: String, needle_lower: String) -> Bool:
+    """ASCII case-insensitive substring test against an already-lowercased needle, without
+    allocating a lowered copy of `hay` (the Hierarchy filter runs it on every row)."""
+    var n = needle_lower.byte_length()
+    if n == 0:
+        return True
+    var h = hay.byte_length()
+    if n > h:
+        return False
+    var hb = hay.as_bytes()
+    var nb = needle_lower.as_bytes()
+    for start in range(h - n + 1):
+        var ok = True
+        for j in range(n):
+            var c = hb[start + j]
+            if c >= 65 and c <= 90:
+                c += 32
+            if c != nb[j]:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+comptime OUTLINER_TOP_H: Float32 = 34.0
+comptime OUTLINER_ROW_H: Float32 = 24.0
+comptime OUTLINER_ROW_STRIDE: Float32 = 26.0
+
+
+def outliner_list_rect(panel_rect: RectF) -> RectF:
+    """The scrollable row area of `draw_outliner_panel_v2` (below the search/header strip)."""
+    var list_y = panel_rect.y + OUTLINER_TOP_H
+    return RectF(panel_rect.x, list_y + Float32(2.0), panel_rect.w, max(Float32(16.0), panel_rect.bottom() - list_y - Float32(4.0)))
+
+
+def outliner_row_window(panel_rect: RectF, n_rows: Int, state: OutlinerPanelState, wheel: Float32 = 0.0) -> Tuple[Int, Int]:
+    """`[first, last)` of the entity rows `draw_outliner_panel_v2` can draw this frame (with a margin
+    for this frame's wheel scroll), so callers build row views only for those."""
+    if n_rows <= 0:
+        return (0, 0)
+    var lr = outliner_list_rect(panel_rect)
+    var content_h = Float32(1 + n_rows) * OUTLINER_ROW_STRIDE + Float32(8.0)
+    var max_scroll = max(Float32(0.0), content_h - lr.h)
+    var sy = state.scroll_y if isfinite(state.scroll_y) else Float32(0.0)
+    sy = max(Float32(0.0), min(max_scroll, sy))
+    var slack = Int(abs(wheel) * Float32(36.0) / OUTLINER_ROW_STRIDE) + 4 if isfinite(wheel) else 4
+    # Entity row vi sits at list.y + 4 - scroll + (vi + 1) * stride.
+    var first = Int((sy - Float32(4.0) - OUTLINER_ROW_H) / OUTLINER_ROW_STRIDE) - 1 - slack
+    var last = Int((sy + lr.h - Float32(4.0)) / OUTLINER_ROW_STRIDE) + 1 + slack
+    first = max(0, min(n_rows, first))
+    last = max(first, min(n_rows, last))
+    return (first, last)
+
+
 def _ascii_upper_panel(s: String) -> String:
     var out = List[UInt8](capacity=s.byte_length())
     for b in s.as_bytes():
@@ -650,7 +705,7 @@ def _draw_color_swatch_row_v2(
     row_w: Float32,
 ) -> Bool:
     """Left-label color swatch + interactive RGB capsule scrubber row."""
-    var row_pair = ui.property_row_label(label_text, row_w)
+    var row_pair = ui.property_row_label(label_text, row_w, id=id)
     var ctrl = row_pair[1]
     var r8 = Int(max(Float32(0.0), min(Float32(1.0), color.x)) * Float32(255.0) + Float32(0.5))
     var g8 = Int(max(Float32(0.0), min(Float32(1.0), color.y)) * Float32(255.0) + Float32(0.5))
@@ -713,7 +768,7 @@ def _draw_segmented_row_v2(
     row_w: Float32,
 ) -> Bool:
     """Left-label compact segmented pill selector for enums (shading mode, collider kind)."""
-    var row_pair = ui.property_row_label(label_text, row_w)
+    var row_pair = ui.property_row_label(label_text, row_w, id=id)
     var ctrl = row_pair[1]
     var n = len(options)
     if n <= 0:
@@ -826,22 +881,24 @@ def draw_outliner_panel_v2(
     selected_has_parent: Bool,
     bus: AgentTelemetryBus,
     mut state: OutlinerPanelState,
+    row_base: Int = 0,
+    total_rows: Int = -1,
 ) -> OutlinerAction:
     """Renders the Obsidian v2 Scene Outliner with search bar, contextual `[Unparent]`
     at `(panel.x+28, panel.y+16)` compatibility rect, `24 px` rows, semantic icons,
     UTF-8 ellipsis truncation, cyan selection bar, visibility/lock toggles, and live
-    pulsing Agent Activity Badges."""
+    pulsing Agent Activity Badges.
+
+    Windowed mode (`total_rows >= 0`): `rows` holds only rows `[row_base, row_base + len(rows))`
+    of an already-filtered list of `total_rows` (see `outliner_row_window`), so a big scene
+    builds row views only for what is on screen. Otherwise `rows` is the whole list and the
+    panel applies the search filter itself."""
     var act = OutlinerAction()
     if panel_rect.w < Float32(40.0) or panel_rect.h < Float32(40.0):
         return act^
 
-    ui.set_studio_theme(theme.copy())
-    ui.draw_list.push_clip(
-        Int(panel_rect.x),
-        Int(panel_rect.y),
-        Int(panel_rect.right()),
-        Int(panel_rect.bottom()),
-    )
+    ui.set_studio_theme(theme)
+    ui.draw_list.push_clip_f(panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom())
 
     # Panel L1 backdrop
     ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
@@ -887,6 +944,7 @@ def draw_outliner_panel_v2(
         ui.hovered_rect = ui._clip_hovered_rect(search_r)
         if ui.mouse_pressed_l:
             ui._set_focused(search_wid)
+            ui.active_id = search_wid  # keeps the focus through end_frame (as text_input does)
     var search_foc = (not blocked) and ui.focused_id == search_wid
     if search_foc:
         ui._focused_text_id = search_wid
@@ -938,27 +996,32 @@ def draw_outliner_panel_v2(
     ui.draw_list.add_line(panel_rect.x, list_y, panel_rect.right(), list_y, Float32(1.0), theme.border_subtle)
 
     # Scrollable entity list region
-    var list_rect = RectF(panel_rect.x, list_y + Float32(2.0), panel_rect.w, max(Float32(16.0), panel_rect.bottom() - list_y - Float32(4.0)))
-    var row_h = Float32(24.0)
-    var row_gap = Float32(2.0)
-    var stride = row_h + row_gap
+    var list_rect = outliner_list_rect(panel_rect)
+    var row_h = OUTLINER_ROW_H
+    var stride = OUTLINER_ROW_STRIDE
+    var windowed = total_rows >= 0
     var filter_l = _ascii_lower_panel(String(state.search_query.strip()))
-    var has_filter = filter_l.byte_length() > 0
+    var has_filter = filter_l.byte_length() > 0 and not windowed
 
-    # Collect filtered row indices
+    # Collect filtered row indices (windowed callers have already filtered)
     var vis_indices = List[Int](capacity=len(rows))
     for i in range(len(rows)):
-        if (not has_filter) or _ascii_lower_panel(rows[i].name).find(filter_l) >= 0:
+        if (not has_filter) or ascii_contains_ci(rows[i].name, filter_l):
             vis_indices.append(i)
+    var n_list = total_rows if windowed else len(vis_indices)
+    var first_vi = max(0, row_base) if windowed else 0
 
-    var total_rows = 1 + (len(vis_indices) if state.world_root_open else 0)
-    var content_h = Float32(total_rows) * stride + Float32(8.0)
+    var all_rows = 1 + (n_list if state.world_root_open else 0)
+    var content_h = Float32(all_rows) * stride + Float32(8.0)
     var max_scroll = max(Float32(0.0), content_h - list_rect.h)
     if (not ptr_blocked) and list_rect.contains(ui.mouse_x, ui.mouse_y) and ui.mouse_wheel != Float32(0.0):
         state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y - ui.mouse_wheel * Float32(36.0)))
     state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y))
+    # Rows scrolled partly under the header strip stay hit-testable only inside the list area,
+    # so they never take clicks meant for the search box above.
+    var in_list = list_rect.contains(ui.mouse_x, ui.mouse_y)
 
-    ui.draw_list.push_clip(Int(list_rect.x), Int(list_rect.y), Int(list_rect.right()), Int(list_rect.bottom()))
+    ui.draw_list.push_clip_f(list_rect.x, list_rect.y, list_rect.right(), list_rect.bottom())
 
     var sb_reserve = Float32(8.0) if max_scroll > Float32(0.5) else Float32(0.0)
     var row_x = list_rect.x + Float32(6.0)
@@ -969,7 +1032,7 @@ def draw_outliner_panel_v2(
     var root_r = RectF(row_x, cur_y, row_w, row_h)
     if root_r.bottom() >= list_rect.y and root_r.y <= list_rect.bottom():
         var root_wid = ui.widget_id("outliner_v2_world_root")
-        var root_hov = (not ptr_blocked) and root_r.contains(ui.mouse_x, ui.mouse_y)
+        var root_hov = (not ptr_blocked) and in_list and root_r.contains(ui.mouse_x, ui.mouse_y)
         if root_hov:
             ui.hovered_id = root_wid
             ui.hovered_rect = ui._clip_hovered_rect(root_r)
@@ -992,8 +1055,11 @@ def draw_outliner_panel_v2(
     # Entity rows (strict O(visible) culling; zero idle spring dict allocations!)
     if state.world_root_open:
         var indent_step = Float32(14.0)
-        for vi in range(len(vis_indices)):
-            var row = rows[vis_indices[vi]].copy()
+        if windowed:
+            ui.culled_items_this_frame += max(0, n_list - len(vis_indices))
+        for li in range(len(vis_indices)):
+            var vi = first_vi + li
+            ref row = rows[vis_indices[li]]
             var ry = cur_y + Float32(vi) * stride
             if ry + row_h < list_rect.y or ry > list_rect.bottom():
                 ui.culled_items_this_frame += 1
@@ -1001,7 +1067,7 @@ def draw_outliner_panel_v2(
 
             var rr = RectF(row_x, ry, row_w, row_h)
             var rwid = ui.widget_id("outliner_row_" + String(row.entity_id))
-            var hov = (not ptr_blocked) and rr.contains(ui.mouse_x, ui.mouse_y)
+            var hov = (not ptr_blocked) and in_list and rr.contains(ui.mouse_x, ui.mouse_y)
             if hov:
                 state.hovered_entity_id = row.entity_id
                 ui.hovered_id = rwid
@@ -1146,8 +1212,8 @@ def draw_inspector_panel_v2(
     if panel_rect.w < Float32(80.0) or panel_rect.h < Float32(60.0):
         return act^
 
-    ui.set_studio_theme(theme.copy())
-    ui.draw_list.push_clip(Int(panel_rect.x), Int(panel_rect.y), Int(panel_rect.right()), Int(panel_rect.bottom()))
+    ui.set_studio_theme(theme)
+    ui.draw_list.push_clip_f(panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom())
     ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
 
     var pad = Float32(10.0)
@@ -1587,8 +1653,8 @@ def draw_asset_browser_panel_v2(
     if panel_rect.w < Float32(120.0) or panel_rect.h < Float32(60.0):
         return act^
 
-    ui.set_studio_theme(theme.copy())
-    ui.draw_list.push_clip(Int(panel_rect.x), Int(panel_rect.y), Int(panel_rect.right()), Int(panel_rect.bottom()))
+    ui.set_studio_theme(theme)
+    ui.draw_list.push_clip_f(panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom())
     ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
 
     var blocked = ui._blocked_by_modal()
@@ -1727,7 +1793,7 @@ def draw_asset_browser_panel_v2(
         sx += sw + Float32(4.0)
 
     var tiles_rect = RectF(grid_area.x, grid_area.y + spawn_h + Float32(4.0), grid_area.w, max(Float32(16.0), grid_area.h - spawn_h - Float32(4.0)))
-    ui.draw_list.push_clip(Int(tiles_rect.x), Int(tiles_rect.y), Int(tiles_rect.right()), Int(tiles_rect.bottom()))
+    ui.draw_list.push_clip_f(tiles_rect.x, tiles_rect.y, tiles_rect.right(), tiles_rect.bottom())
 
     # Filter matching tiles
     var filtered = List[Int](capacity=len(tiles))

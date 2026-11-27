@@ -30,7 +30,7 @@ from flint.text.bidi import (
     bidi_mirror,
     compute_arabic_forms,
 )
-from flint.text.shaper import ShapedGlyph, TextShaper, FontFallbackChain
+from flint.text.shaper import ShapedGlyph, ShapedRun, TextShaper, FontFallbackChain
 from flint.ui.button_glyphs import ACTION_NONE, action_id, glyph_shape, glyph_label, glyph_width
 
 comptime SPAN_TEXT: Int = 0
@@ -571,10 +571,17 @@ def layout_rich_shaped(
     var owner = List[Int]()
     var advance = List[Float32]()
     var kern_before = List[Float32]()
-    var ui_chain = ui.fallback_chain()
-    var disp_chain = display.fallback_chain() if (display.valid or display.has_source or len(display.fallbacks) > 0) else ui.fallback_chain()
-    var ui_shaper = TextShaper(ui_chain^)
-    var disp_shaper = TextShaper(disp_chain^)
+    # Borrow each font's cached shaper when it is current; build a private one only if not.
+    var disp_uses_ui = not (display.valid or display.has_source or len(display.fallbacks) > 0)
+    var ui_cached = ui.shaper_current()
+    var disp_cached = ui_cached if disp_uses_ui else display.shaper_current()
+    var ui_shaper = TextShaper() if ui_cached else TextShaper(ui.fallback_chain())
+    var disp_shaper = TextShaper()
+    if not disp_cached:
+        if disp_uses_ui:
+            disp_shaper = TextShaper(ui.fallback_chain())
+        else:
+            disp_shaper = TextShaper(display.fallback_chain())
 
     for s in range(len(spans)):
         var span = spans[s]
@@ -703,7 +710,18 @@ def layout_rich_shaped(
                 var sglyphs = List[ShapedGlyph]()
                 var shaped_w: Float32 = 0.0
                 if vis_end > rs:
-                    var sruns = disp_shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px) if face == 1 else ui_shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px)
+                    var sruns: List[ShapedRun]
+                    if face == 1:
+                        if not disp_cached:
+                            sruns = disp_shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px)
+                        elif disp_uses_ui:
+                            sruns = ui._shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px)
+                        else:
+                            sruns = display._shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px)
+                    elif ui_cached:
+                        sruns = ui._shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px)
+                    else:
+                        sruns = ui_shaper.shape_run_slice(codes, arabic_forms, rs, vis_end, br.level, span_px)
                     for sr in sruns:
                         for g in sr.glyphs:
                             sglyphs.append(g)

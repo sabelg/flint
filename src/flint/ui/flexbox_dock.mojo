@@ -567,6 +567,7 @@ struct DockSpace(Copyable, Movable):
     var hovered_splitter_node: Int
     var header_height: Float32
     var min_ratio: Float32
+    var min_panel_px: Float32  # logical-px floor for either side of a split (on top of `min_ratio`)
     var dock_style_v2: Bool
     var collapsed_nodes: List[Bool]
 
@@ -577,6 +578,7 @@ struct DockSpace(Copyable, Movable):
         self.hovered_splitter_node = -1
         self.header_height = 24.0
         self.min_ratio = 0.08
+        self.min_panel_px = 32.0
         self.dock_style_v2 = False
         self.collapsed_nodes = List[Bool]()
 
@@ -687,6 +689,47 @@ struct DockSpace(Copyable, Movable):
             return Float32(0.5)
         return max(mr, min(Float32(1.0) - mr, ratio))
 
+    @always_inline
+    def _clamp_ratio_px(self, ratio: Float32, extent: Float32) -> Float32:
+        """`_clamp_ratio` plus the `min_panel_px` floor for a split `extent` px long (a ratio alone
+        lets a panel shrink to a sliver in a small window)."""
+        var r = self._clamp_ratio(ratio)
+        if not isfinite(extent) or extent <= Float32(0.0) or not isfinite(self.min_panel_px) or self.min_panel_px <= Float32(0.0):
+            return r
+        var mr = min(Float32(0.49), self.min_panel_px / extent)
+        return max(mr, min(Float32(1.0) - mr, r))
+
+    @always_inline
+    def _is_collapsed_leaf(self, node_id: Int) -> Bool:
+        return (
+            self.dock_style_v2
+            and node_id >= 0
+            and node_id < len(self.nodes)
+            and self.nodes[node_id].kind == DOCK_TABS
+            and self.is_node_collapsed(node_id)
+        )
+
+    def split_has_collapsed_child(self, node_id: Int) -> Bool:
+        if node_id < 0 or node_id >= len(self.nodes):
+            return False
+        return self._is_collapsed_leaf(self.nodes[node_id].child_a) or self._is_collapsed_leaf(self.nodes[node_id].child_b)
+
+    def split_seam(self, node_id: Int) -> Float32:
+        """Solved seam position of split `node_id` (x for `DOCK_SPLIT_H`, y for `DOCK_SPLIT_V`): where
+        its second child starts, which differs from `ratio` when a side is collapsed or px-floored."""
+        if node_id < 0 or node_id >= len(self.nodes):
+            return Float32(0.0)
+        var k = self.nodes[node_id].kind
+        var r = self.nodes[node_id].rect
+        var ratio = self.nodes[node_id].ratio
+        var cb = self.nodes[node_id].child_b
+        var has_b = cb >= 0 and cb < len(self.nodes)
+        if k == DOCK_SPLIT_H:
+            return self.nodes[cb].rect.x if has_b else r.x + r.w * ratio
+        if k == DOCK_SPLIT_V:
+            return self.nodes[cb].rect.y if has_b else r.y + r.h * ratio
+        return Float32(0.0)
+
     def solve_layout(mut self, root_rect: RectF):
         if self.root < 0 or self.root >= len(self.nodes):
             return
@@ -696,6 +739,7 @@ struct DockSpace(Copyable, Movable):
             max(Float32(0.0), root_rect.w) if isfinite(root_rect.w) else Float32(0.0),
             max(Float32(0.0), root_rect.h) if isfinite(root_rect.h) else Float32(0.0),
         )
+        var safe_hh = max(Float32(0.0), self.header_height) if isfinite(self.header_height) else Float32(24.0)
         var visited = List[Bool](length=len(self.nodes), fill=False)
         var stack_id = List[Int]()
         var stack_rect = List[RectF]()
@@ -712,22 +756,35 @@ struct DockSpace(Copyable, Movable):
             if k == DOCK_SPLIT_H:
                 var r = self._clamp_ratio(self.nodes[node_id].ratio)
                 self.nodes[node_id].ratio = r
-                var wa = rect.w * r
+                var ca = self.nodes[node_id].child_a
+                var cb = self.nodes[node_id].child_b
+                var wa = rect.w * self._clamp_ratio_px(r, rect.w)
                 if not isfinite(wa):
                     wa = Float32(0.0)
+                # A collapsed panel keeps only its header strip; its sibling takes the rest.
+                var col_a = self._is_collapsed_leaf(ca)
+                var col_b = self._is_collapsed_leaf(cb)
+                if col_a and not col_b:
+                    wa = min(safe_hh, rect.w)
+                elif col_b and not col_a:
+                    wa = max(Float32(0.0), rect.w - min(safe_hh, rect.w))
                 var wb = max(Float32(0.0), rect.w - wa)
                 var xb_f64 = Float64(rect.x) + Float64(wa)
                 var xb = Float32(max(-3.4028234e38, min(3.4028234e38, xb_f64)))
-                var ca = self.nodes[node_id].child_a
-                var cb = self.nodes[node_id].child_b
                 stack_id.append(cb); stack_rect.append(RectF(xb, rect.y, wb, rect.h))
                 stack_id.append(ca); stack_rect.append(RectF(rect.x, rect.y, wa, rect.h))
             elif k == DOCK_SPLIT_V:
                 var r = self._clamp_ratio(self.nodes[node_id].ratio)
                 self.nodes[node_id].ratio = r
-                var ha = rect.h * r
+                var ha = rect.h * self._clamp_ratio_px(r, rect.h)
                 if not isfinite(ha):
                     ha = Float32(0.0)
+                var col_a = self._is_collapsed_leaf(self.nodes[node_id].child_a)
+                var col_b = self._is_collapsed_leaf(self.nodes[node_id].child_b)
+                if col_a and not col_b:
+                    ha = min(safe_hh, rect.h)
+                elif col_b and not col_a:
+                    ha = max(Float32(0.0), rect.h - min(safe_hh, rect.h))
                 var hb = max(Float32(0.0), rect.h - ha)
                 var yb_f64 = Float64(rect.y) + Float64(ha)
                 var yb = Float32(max(-3.4028234e38, min(3.4028234e38, yb_f64)))
@@ -769,13 +826,15 @@ struct DockSpace(Copyable, Movable):
         for i in range(len(self.nodes)):
             var k = self.nodes[i].kind
             var r = self.nodes[i].rect
+            if (k == DOCK_SPLIT_H or k == DOCK_SPLIT_V) and self.split_has_collapsed_child(i):
+                continue  # a collapsed side has no size to drag
             if k == DOCK_SPLIT_H:
-                var seam_x = r.x + r.w * self.nodes[i].ratio
+                var seam_x = self.split_seam(i)
                 if my >= r.y and my <= r.bottom() and abs(mx - seam_x) <= hit_half:
                     self.hovered_splitter_node = i
                     break
             elif k == DOCK_SPLIT_V:
-                var seam_y = r.y + r.h * self.nodes[i].ratio
+                var seam_y = self.split_seam(i)
                 if mx >= r.x and mx <= r.right() and abs(my - seam_y) <= hit_half:
                     self.hovered_splitter_node = i
                     break
@@ -790,14 +849,14 @@ struct DockSpace(Copyable, Movable):
                 var nr = (mx - r.x) / r.w
                 if not isfinite(nr):
                     return False
-                self.nodes[dn].ratio = self._clamp_ratio(nr)
+                self.nodes[dn].ratio = self._clamp_ratio_px(nr, r.w)
                 self.solve_layout(root_rect)
                 return True
             elif self.nodes[dn].kind == DOCK_SPLIT_V and r.h > Float32(1.0):
                 var nr = (my - r.y) / r.h
                 if not isfinite(nr):
                     return False
-                self.nodes[dn].ratio = self._clamp_ratio(nr)
+                self.nodes[dn].ratio = self._clamp_ratio_px(nr, r.h)
                 self.solve_layout(root_rect)
                 return True
         return False

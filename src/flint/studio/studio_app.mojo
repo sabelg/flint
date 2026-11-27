@@ -485,6 +485,8 @@ from flint.studio.studio_panels import (
     asset_filter_accent,
     classify_asset_filter,
     draw_outliner_panel_v2,
+    outliner_row_window,
+    ascii_contains_ci,
 )
 from flint.studio.studio_workspace import (
     AgentCheckpointLog,
@@ -3293,7 +3295,7 @@ struct FlintStudioState(Movable):
         var out = List[HierarchyRow]()
         for i in range(len(all_rows)):
             var eid = all_rows[i].entity_id
-            if eid < len(self.entities) and Self._ascii_lower(self.entities[eid].name).find(q) >= 0:
+            if eid < len(self.entities) and ascii_contains_ci(self.entities[eid].name, q):
                 out.append(all_rows[i])
         return out^
 
@@ -10440,7 +10442,7 @@ def emit_studio_ui_draw_list(
         studio.ui_ctx.font = font.copy()
     studio.ui_ctx.font_slot = font_slot
     studio.ui_ctx.dock_style_v2 = True
-    studio.ui_ctx.set_studio_theme(studio.studio_theme.copy())
+    studio.ui_ctx.set_studio_theme(studio.studio_theme)
     studio.ui_ctx.set_anim_mode(studio.anim_mode)
     studio.ui_ctx.theme.font_size = Float32(13.0)
     studio.ui_ctx.theme.row_height = Float32(22.0)
@@ -10816,11 +10818,18 @@ def emit_studio_ui_draw_list(
         # user sees, not the whole tree.
         var rows = studio.hierarchy_rows_for_query(studio.outliner_state.search_query)
         var disp_order = List[Int](capacity=len(rows))
-        var out_rows = List[OutlinerRowView](capacity=len(rows))
         for ri in range(len(rows)):
+            disp_order.append(rows[ri].entity_id)
+        # Build row views only for the rows on screen, with an O(1) selection lookup.
+        var win = outliner_row_window(h_info[3], len(rows), studio.outliner_state, studio.ui_ctx.mouse_wheel)
+        var sel_lookup = Dict[Int, Bool]()
+        for si in range(len(studio.selected_entity_ids)):
+            sel_lookup[studio.selected_entity_ids[si]] = True
+        var sel_fallback = studio.selected_entity_id if len(studio.selected_entity_ids) == 0 else -1
+        var out_rows = List[OutlinerRowView](capacity=win[1] - win[0])
+        for ri in range(win[0], win[1]):
             var row = rows[ri]
             var eid = row.entity_id
-            disp_order.append(eid)
             var ename = studio.entities[eid].name if eid < len(studio.entities) else ("Entity_" + String(eid))
             var v_row = OutlinerRowView(eid, ename)
             v_row.parent_id = studio.parent_of(eid)
@@ -10828,7 +10837,7 @@ def emit_studio_ui_draw_list(
             v_row.kind = studio._classify_entity_kind(eid)
             v_row.has_children = row.has_children
             v_row.is_expanded = row.expanded
-            v_row.is_selected = studio.is_selected(eid)
+            v_row.is_selected = eid >= 0 and (eid in sel_lookup or eid == sel_fallback)
             v_row.is_primary = studio.selected_entity_id == eid
             v_row.visible = studio.entities[eid].visible if eid < len(studio.entities) else True
             v_row.locked = studio.is_entity_locked(eid)
@@ -10854,6 +10863,8 @@ def emit_studio_ui_draw_list(
             sel_has_parent,
             studio.agent_bus,
             studio.outliner_state,
+            row_base=win[0],
+            total_rows=len(rows),
         )
         if out_act.unparent_selected:
             _ = studio.reparent_selected_to(-1, preserve_world_transform=True, record_undo=True)
