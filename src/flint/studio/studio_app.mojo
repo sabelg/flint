@@ -344,6 +344,8 @@ from flint.studio.gizmo import (
     ViewportRay,
     emit_gizmo_draw_list,
     gizmo_rotation_delta_rad,
+    clamp_gizmo_param,
+    gizmo_drag_param_limit,
     gizmo_scale_drag,
     gizmo_uniform_scale_screen,
     gizmo_world_scale,
@@ -1270,6 +1272,47 @@ def _copy_u64_style_epoch_dict(
 
 
 @always_inline
+def studio_signed_scale(value: Float32, fallback: Float32, snap_step: Float32 = 0.0) -> Float32:
+    """`sign(v) * max(0.01, |v|)`, optionally snapping `|v|` to `snap_step` first. Non-finite `value`
+    falls back to `fallback` (then to 1). Unlike `max(0.01, v)` it keeps negative (mirrored) scale."""
+    var v = value if isfinite(value) else fallback
+    if not isfinite(v):
+        v = Float32(1.0)
+    var sgn = Float32(-1.0) if v < Float32(0.0) else Float32(1.0)
+    var a = abs(v)
+    if isfinite(snap_step) and snap_step > Float32(1.0e-6):
+        a = max(snap_step, snap_scalar(a, snap_step))
+    return sgn * max(Float32(0.01), a)
+
+
+@always_inline
+def studio_signed_recip(s: Float32) -> Float32:
+    """Sign-preserving reciprocal guarded on `|s|` (`1/max(1e-4, s)` turned negative scale into 1e4)."""
+    if not isfinite(s):
+        return Float32(1.0)
+    var a = max(Float32(1.0e-4), abs(s))
+    return (Float32(-1.0) if s < Float32(0.0) else Float32(1.0)) / a
+
+
+def studio_wheel_dolly_factor(wheel: Float32) -> Float32:
+    """Arm-length factor for a wheel delta: `0.88^wheel`, clamped to +-10 notches; fractional deltas
+    from smooth-scrolling wheels and touchpads dolly proportionally instead of being dropped."""
+    if not isfinite(wheel):
+        return Float32(1.0)
+    var w = max(Float32(-10.0), min(Float32(10.0), wheel))
+    return Float32(0.88) ** w
+
+
+def studio_pan_world_per_px(arm: Float32, fov_y_deg: Float32, proj_h_phys: Float32) -> Float32:
+    """World units per physical pixel at distance `arm`: `arm * 2 tan(fov/2) / H`, H the height of the
+    render target the projection spans. Middle-drag pan with this factor keeps the grabbed point
+    under the cursor at any FOV, window size or UI scale."""
+    var h = max(Float32(1.0), proj_h_phys) if isfinite(proj_h_phys) else Float32(1.0)
+    var fov = fov_y_deg if isfinite(fov_y_deg) else Float32(55.0)
+    fov = max(Float32(1.0), min(Float32(179.0), fov))
+    return max(Float32(0.0), arm) * Float32(2.0) * tan(fov * Float32(3.14159265358979 / 360.0)) / h
+
+
 def _studio_mat_ref_key(aref: AssetRef) -> String:
     if aref.rel_path.byte_length() > 0:
         var norm = normalize_asset_rel_path(aref.rel_path)
@@ -2147,6 +2190,12 @@ struct FlintStudioState(Movable):
     """Rotation accumulated frame by frame, so one drag can turn past +-180 degrees."""
     var gz_start_mx: Float32
     var gz_start_my: Float32
+    var gz_last_delta: Vec3
+    """Last valid translate delta of the drag: a frame whose ray misses the axis/plane keeps it."""
+    var gz_last_sf: Vec3
+    """Last valid scale factor of the drag (same rule as `gz_last_delta`)."""
+    var gz_applied: Bool
+    """The drag has moved something. Until then a press without motion records nothing."""
     var marquee_active: Bool
     var viewport_hovered: Bool
     """Set by the host each frame: the mouse is over the scene panel (wheel / middle / Alt navigation)."""
@@ -2396,6 +2445,9 @@ struct FlintStudioState(Movable):
         self.gz_angle = Float32(0.0)
         self.gz_start_mx = Float32(0.0)
         self.gz_start_my = Float32(0.0)
+        self.gz_last_delta = Vec3()
+        self.gz_last_sf = Vec3(1.0, 1.0, 1.0)
+        self.gz_applied = False
         self.marquee_active = False
         self.viewport_hovered = False
         self.marquee_x0 = Float32(0.0)
@@ -3070,6 +3122,7 @@ struct FlintStudioState(Movable):
         self.camera_rig.pitch_deg = det_atan2(-fwd.y, horiz) * rad_to_deg
         self.camera_rig.fov_deg = self.fov_y_deg
         self.camera_rig.look_offset = Vec3(0.0, 0.0, 0.0)
+        self.camera_rig.shoulder_offset = Vec3()
         self.camera_rig.pivot_spring.value = target
         self.camera_rig.pivot_spring.velocity = Vec3()
         self.camera_rig.pivot_initialized = True
@@ -3314,6 +3367,18 @@ struct FlintStudioState(Movable):
 
     def is_entity_locked(self, entity_id: Int) -> Bool:
         return entity_id >= 0 and entity_id < len(self.entities) and self.is_alive_id(entity_id) and self.entities[entity_id].locked
+
+    def apply_viewport_click_pick(mut self, hit: Bool, entity_id: Int, additive: Bool) -> Bool:
+        """Viewport click result: select the hit entity; a hit on a locked entity is ignored (the
+        selection is left as it is); a miss clears the selection unless the click is additive."""
+        if hit and self.is_alive_id(entity_id):
+            if self.is_entity_locked(entity_id):
+                return False
+            self.select_entity(entity_id, multi_select=additive)
+            return True
+        if not additive:
+            self.clear_selection()
+        return False
 
     def hierarchy_display_order(self) -> List[Int]:
         var rows = self.hierarchy_visible_rows()
@@ -4538,16 +4603,17 @@ struct FlintStudioState(Movable):
             return
         var center = (b[1] + b[2]) * Float32(0.5)
         var radius = max(Float32(0.3), (b[2] - b[1]).length() * Float32(0.5))
-        var fwd = self.cam_target - self.cam_pos
+        var fwd = self.cam_fwd
         var flen = fwd.length()
         if not isfinite(flen) or flen < Float32(1.0e-4):
             fwd = Vec3(Float32(0.6), Float32(-0.37), Float32(0.71))
         fwd = fwd.normalized()
-        var right = fwd.cross(Vec3(0.0, 1.0, 0.0))
+        # The renderer / `CameraRig` basis (right = up x fwd); `fwd x up` mirrored the panel offset.
+        var right = Vec3(0.0, 1.0, 0.0).cross(fwd)
         if right.length_squared() < Float32(1.0e-6):
-            right = Vec3(1.0, 0.0, 0.0)
+            right = Vec3(1.0, 0.0, 0.0).cross(fwd)
         right = right.normalized()
-        var up = right.cross(fwd).normalized()
+        var up = fwd.cross(right).normalized()
         var vx = self.viewport_xf
         var tan_y = tan(self.fov_y_deg * Float32(3.14159265 / 360.0))
         var tan_x = tan_y * (vx.target_w / max(Float32(1.0), vx.target_h))
@@ -4561,14 +4627,22 @@ struct FlintStudioState(Movable):
         var ndc_y = Float32(1.0) - ((vx.panel.y + vx.panel.h * Float32(0.5)) / max(Float32(1.0), vx.target_h)) * Float32(2.0)
         var ray_dir = (fwd + right * (ndc_x * tan_x) + up * (ndc_y * tan_y)).normalized()
         var eye = center - ray_dir * dist
-        self.look_at(eye, eye + fwd * dist)
+        # Orbit pivot = the selection centre. The panel offset (the panel centre is off the window's
+        # optical axis) lives separately in the rig's camera-local `shoulder_offset`, so orbiting turns
+        # about the selection and keeps it under the panel centre.
+        var arm = max(Float32(0.35), dist * ray_dir.dot(fwd))
+        self.look_at(center - fwd * arm, center)
+        var off = eye - (center - fwd * arm)
+        self.camera_rig.shoulder_offset = Vec3(off.dot(self.cam_right), off.dot(self.cam_up), Float32(0.0))
+        self.camera_rig.update(self._cam_dummy_world, center, Float32(0.0))
+        self._sync_from_camera_rig()
         var rps_opt = self.app.resources.get_ptr_mut[RenderPluginStateResource]()
         if rps_opt:
             ref rps = rps_opt.value()[unsafe_offset=0]
             rps.editor_camera_override = True
             rps.editor_camera = RenderCameraPacket(
                 self.cam_pos,
-                self.cam_target,
+                self.cam_pos + self.cam_fwd * Float32(10.0),
                 Vec3(0.0, 1.0, 0.0),
                 self.fov_y_deg,
                 self.near_z,
@@ -5280,8 +5354,8 @@ struct FlintStudioState(Movable):
             or not input.mouse_down(1)
         ):
             self._rmb_fly_active = False
-        elif not self._rmb_fly_active and input.mouse_pressed(1) and not mouse_captured:
-            self._rmb_fly_active = True
+        elif not self._rmb_fly_active and input.mouse_pressed(1) and not mouse_captured and not alt_down:
+            self._rmb_fly_active = True  # Alt+RMB is dolly, not fly
         var rmb_fly = self._rmb_fly_active
         if not rmb_fly and not kbd_captured and not in_play:
             if self.input_map.just_pressed("gizmo_translate"):
@@ -5316,6 +5390,7 @@ struct FlintStudioState(Movable):
                 self.update_camera(dt, dyaw, dpitch, fly_move_local=fly_move, fly_speed=Float32(8.5))
                 self.cam_target = self.cam_pos + self.cam_fwd * self.camera_rig.spring_arm.target_length
                 self.camera_rig.pivot_spring.value = self.cam_target
+                self.camera_rig.shoulder_offset = Vec3()  # the pivot is re-derived from the eye
             else:
                 self.camera_rig.mode = CAM_MODE_ORBIT_FOLLOW
                 # Mouse navigation over the viewport: wheel dolly, middle-drag pan, Alt+left orbit,
@@ -5325,12 +5400,8 @@ struct FlintStudioState(Movable):
                     var wheel = input.mouse_wheel()
                     var dolly = Float32(1.0)
                     if wheel != Float32(0.0) and isfinite(wheel):
-                        dolly = Float32(0.88) if wheel > Float32(0.0) else Float32(1.0 / 0.88)
-                        var steps = min(Float32(10.0), abs(wheel))
-                        var k = Float32(1.0)
-                        for _ in range(Int(steps + Float32(0.5))):
-                            k *= dolly
-                        dolly = k
+                        # Smooth (touchpad / hi-res) wheels report fractional notches: 0.88 per notch.
+                        dolly = studio_wheel_dolly_factor(wheel)
                     if alt_down and input.mouse_down(1):
                         dolly *= max(Float32(0.5), min(Float32(2.0), Float32(1.0) + input.mouse_delta_y() * Float32(0.01)))
                     if dolly != Float32(1.0):
@@ -5339,7 +5410,8 @@ struct FlintStudioState(Movable):
                         self.camera_rig.spring_arm.current_length.value = new_arm
                         self.agent_bus.notify_user_camera_input()
                     if input.mouse_down(2):
-                        var k_pan = arm * Float32(0.0016) / max(Float32(0.5), self.effective_ui_scale())
+                        # World units per physical pixel at the pivot, so the pivot tracks the cursor.
+                        var k_pan = studio_pan_world_per_px(arm, self.fov_y_deg, self.viewport_xf.proj_phys_h())
                         var pan = (self.cam_right * (-input.mouse_delta_x()) + self.cam_up * input.mouse_delta_y()) * k_pan
                         if isfinite(pan.x) and isfinite(pan.y) and isfinite(pan.z):
                             self.cam_target = self.cam_target + pan
@@ -8015,6 +8087,9 @@ struct FlintStudioState(Movable):
         self.gz_angle = Float32(0.0)
         self.gz_start_mx = mx
         self.gz_start_my = my
+        self.gz_last_delta = Vec3()
+        self.gz_last_sf = Vec3(1.0, 1.0, 1.0)
+        self.gz_applied = False
         self.active_gizmo_handle = h
         return True
 
@@ -8025,6 +8100,8 @@ struct FlintStudioState(Movable):
             # Switching W/E/R (or entering Play) mid-drag abandons the drag instead of mixing modes.
             self.gizmo_drag_cancel()
             return False
+        if not self.gz_applied and mx == self.gz_start_mx and my == self.gz_start_my:
+            return False  # a press without motion changes nothing: no undo entry, no dirty flag
         var snaps = self.gz_snaps.copy()
         var vx = self.viewport_xf
         var cur = vx.ray_phys(mx, my, self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg)
@@ -8032,22 +8109,37 @@ struct FlintStudioState(Movable):
         var rot = self.gz_rot
         var h = self.gz_handle
         var wscale = gizmo_world_scale(piv, self.cam_pos, self.cam_fwd, self.fov_y_deg, Int(vx.proj_phys_h()), GIZMO_TARGET_PX * vx.ui_scale)
+        var lim = gizmo_drag_param_limit(wscale)
         if self.gz_mode == GIZMO_MODE_TRANSLATE:
-            var delta_p = Vec3()
+            # A frame whose ray misses the axis / plane (parallel, or behind the camera) keeps the last
+            # valid delta instead of snapping the selection back to its start pose.
+            var delta_p = self.gz_last_delta
             if h == GIZMO_AXIS_X or h == GIZMO_AXIS_Y or h == GIZMO_AXIS_Z:
                 var ax = rot.rotate(Vec3(1, 0, 0) if h == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
                 var t0 = ray_axis_closest_param(self.gz_start_ray, piv, ax)
                 var t1 = ray_axis_closest_param(cur, piv, ax)
                 if t0[0] and t1[0]:
-                    delta_p = ax * (t1[1] - t0[1])
+                    delta_p = ax * (clamp_gizmo_param(t1[1], lim) - clamp_gizmo_param(t0[1], lim))
             elif h == GIZMO_PLANE_XY or h == GIZMO_PLANE_XZ or h == GIZMO_PLANE_YZ:
                 var pn = rot.rotate(Vec3(0, 0, 1) if h == GIZMO_PLANE_XY else (Vec3(0, 1, 0) if h == GIZMO_PLANE_XZ else Vec3(1, 0, 0)))
                 var p0 = ray_plane_hit(self.gz_start_ray, piv, pn)
                 var p1 = ray_plane_hit(cur, piv, pn)
                 if p0[0] and p1[0]:
-                    delta_p = p1[1] - p0[1]
+                    var o0 = p0[1] - piv
+                    var o1 = p1[1] - piv
+                    var l0 = o0.length()
+                    var l1 = o1.length()
+                    if l0 > lim:
+                        o0 = o0 * (lim / l0)
+                    if l1 > lim:
+                        o1 = o1 * (lim / l1)
+                    delta_p = o1 - o0
+            self.gz_last_delta = delta_p
             if self.snap_enabled:
                 delta_p = snap_constrained_delta(piv, delta_p, h, self.grid_snap_m, rot)
+            if not self.gz_applied and delta_p.length_squared() == Float32(0.0):
+                return False
+            self.gz_applied = True
             return self.apply_gizmo_drag_selected(
                 snaps, piv, delta_p, Quat.identity(), Vec3(1.0, 1.0, 1.0), GIZMO_MODE_TRANSLATE,
                 coalesce_key=self.gz_seq, gizmo_rot=rot,
@@ -8064,6 +8156,9 @@ struct FlintStudioState(Movable):
             var drad = self.gz_angle
             if self.snap_enabled:
                 drad = snap_angle_deg(drad, self.angle_snap_deg)
+            if not self.gz_applied and drad == Float32(0.0):
+                return False
+            self.gz_applied = True
             var hs = sin(drad * Float32(0.5))
             var dq = Quat(rax.x * hs, rax.y * hs, rax.z * hs, cos(drad * Float32(0.5)))
             return self.apply_gizmo_drag_selected(
@@ -8071,26 +8166,33 @@ struct FlintStudioState(Movable):
                 coalesce_key=self.gz_seq, gizmo_rot=rot,
             )
         # Scale
-        var sf: Vec3
+        var sf = self.gz_last_sf
         if h == GIZMO_SCALE_UNIFORM:
             var c = project_world_to_viewport(
                 piv, Float32(0.0), Float32(0.0), vx.proj_phys_w(), vx.proj_phys_h(),
                 self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
             )
-            var f = gizmo_uniform_scale_screen(self.gz_start_mx, self.gz_start_my, mx, my, c[0], c[1]) if c[3] else Float32(1.0)
-            sf = Vec3(f, f, f)
+            if c[3]:
+                var f = gizmo_uniform_scale_screen(self.gz_start_mx, self.gz_start_my, mx, my, c[0], c[1])
+                sf = Vec3(f, f, f)
         else:
-            sf = gizmo_scale_drag(
-                self.gz_start_ray, cur, piv, h, wscale, self.cam_fwd, self.cam_right, Vec3(1.0, 1.0, 1.0), gizmo_rot=rot
-            )
-        if self.snap_enabled and self.scale_snap > Float32(0.0):
-            sf = Vec3(
-                max(self.scale_snap, snap_scalar(sf.x, self.scale_snap)),
-                max(self.scale_snap, snap_scalar(sf.y, self.scale_snap)),
-                max(self.scale_snap, snap_scalar(sf.z, self.scale_snap)),
-            )
+            var sax = rot.rotate(Vec3(1, 0, 0) if h == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
+            var v0 = ray_axis_closest_param(self.gz_start_ray, piv, sax)
+            var v1 = ray_axis_closest_param(cur, piv, sax)
+            if v0[0] and v1[0]:
+                sf = gizmo_scale_drag(
+                    self.gz_start_ray, cur, piv, h, wscale, self.cam_fwd, self.cam_right, Vec3(1.0, 1.0, 1.0),
+                    gizmo_rot=rot, max_param=lim,
+                )
+        self.gz_last_sf = sf
+        if not self.gz_applied and sf.x == Float32(1.0) and sf.y == Float32(1.0) and sf.z == Float32(1.0):
+            return False
+        self.gz_applied = True
+        # Snap the resulting local scale (not the drag factor), so a 1.3-scale object snaps to the grid.
+        var ssnap = self.scale_snap if self.snap_enabled else Float32(0.0)
         return self.apply_gizmo_drag_selected(
-            snaps, piv, Vec3(), Quat.identity(), sf, GIZMO_MODE_SCALE, coalesce_key=self.gz_seq, gizmo_rot=rot
+            snaps, piv, Vec3(), Quat.identity(), sf, GIZMO_MODE_SCALE, coalesce_key=self.gz_seq, gizmo_rot=rot,
+            scale_snap=ssnap,
         )
 
     def gizmo_drag_cancel(mut self):
@@ -8109,7 +8211,7 @@ struct FlintStudioState(Movable):
                 else:
                     self._restore_selection(tx.prev_selected_ids, tx.prev_selected_id, tx.prev_anchor_id)
                     self._refresh_dirty_from_history()
-        if not restored and len(self.gz_snaps) > 0:
+        if not restored and self.gz_applied and len(self.gz_snaps) > 0:
             # Nothing coalesced (no motion yet, or Play swallowed the entry): re-apply the start pose.
             var start_snaps = self.gz_snaps.copy()
             var start_piv = self.gz_start_pivot
@@ -8126,6 +8228,7 @@ struct FlintStudioState(Movable):
         self.gz_dragging = False
         self.gz_handle = GIZMO_AXIS_NONE
         self.gz_snaps.clear()
+        self.gz_applied = False
         self.active_gizmo_handle = GIZMO_AXIS_NONE
 
     # ---- Marquee selection, nudging and framing ----
@@ -8142,8 +8245,8 @@ struct FlintStudioState(Movable):
         if hx <= lx or hy <= ly:
             return out^
         for i in range(len(self.entities)):
-            if not self.is_alive_id(i) or self.entities[i].locked:
-                continue
+            if not self.is_alive_id(i) or self.entities[i].locked or not self.entities[i].visible:
+                continue  # locked and hidden entities cannot be marquee-selected
             var p = self.entities[i].translation
             var gt = self.app.world.get_ptr[GlobalTransform](self.resolve_entity(i))
             if gt:
@@ -8246,7 +8349,9 @@ struct FlintStudioState(Movable):
         mode: Int,
         coalesce_key: UInt64 = 0,
         gizmo_rot: Quat = Quat.identity(),
+        scale_snap: Float32 = 0.0,
     ) -> Bool:
+        """`scale_snap > 0` snaps each scaled axis's resulting local scale to that step (sign kept)."""
         if len(snaps) == 0:
             return False
         var g_rot = gizmo_rot.normalized() if gizmo_rot.length_squared() > Float32(1.0e-8) else Quat.identity()
@@ -8296,10 +8401,11 @@ struct FlintStudioState(Movable):
                 var lx = sn.local_scl.x * sx_f
                 var ly = sn.local_scl.y * sy_f
                 var lz = sn.local_scl.z * sz_f
+                # Sign-preserving clamp: a mirrored (negative-scale) object stays mirrored.
                 target_local_scl = Vec3(
-                    max(Float32(0.01), lx) if isfinite(lx) else max(Float32(0.01), sn.local_scl.x),
-                    max(Float32(0.01), ly) if isfinite(ly) else max(Float32(0.01), sn.local_scl.y),
-                    max(Float32(0.01), lz) if isfinite(lz) else max(Float32(0.01), sn.local_scl.z),
+                    studio_signed_scale(lx, sn.local_scl.x, scale_snap if sx_f != Float32(1.0) else Float32(0.0)),
+                    studio_signed_scale(ly, sn.local_scl.y, scale_snap if sy_f != Float32(1.0) else Float32(0.0)),
+                    studio_signed_scale(lz, sn.local_scl.z, scale_snap if sz_f != Float32(1.0) else Float32(0.0)),
                 )
                 if len(snaps) > 1 and isfinite(pivot.x) and isfinite(pivot.y) and isfinite(pivot.z):
                     # A multi-selection scales as a group: positions spread from the pivot along the
@@ -9669,11 +9775,7 @@ struct FlintStudioState(Movable):
                 w_rot = gt_opt.value()[unsafe_offset=0].rotation
                 w_scl = gt_opt.value()[unsafe_offset=0].scale
             var inv_q = w_rot.conjugate()
-            var inv_s = Vec3(
-                Float32(1.0) / max(Float32(1.0e-4), w_scl.x),
-                Float32(1.0) / max(Float32(1.0e-4), w_scl.y),
-                Float32(1.0) / max(Float32(1.0e-4), w_scl.z),
-            )
+            var inv_s = Vec3(studio_signed_recip(w_scl.x), studio_signed_recip(w_scl.y), studio_signed_recip(w_scl.z))
             var loc_o_raw = inv_q.rotate(origin - w_pos)
             var loc_o = Vec3(loc_o_raw.x * inv_s.x, loc_o_raw.y * inv_s.y, loc_o_raw.z * inv_s.z)
             var loc_d_raw = inv_q.rotate(dir)
@@ -9689,7 +9791,9 @@ struct FlintStudioState(Movable):
                         best.entity_id = i
                         best.distance = world_t
                         best.point = origin + dir * world_t
-                        best.normal = w_rot.rotate(bhit.normal).normalized()
+                        # Normals transform by the inverse transpose: divide by the (signed) scale.
+                        var n_l = Vec3(bhit.normal.x * inv_s.x, bhit.normal.y * inv_s.y, bhit.normal.z * inv_s.z)
+                        best.normal = w_rot.rotate(n_l).normalized()
 
         if self.has_ground_plane and abs(dir.y) > Float32(1.0e-6):
             var tg = (self.ground_plane_y - origin.y) / dir.y
@@ -10603,6 +10707,7 @@ def emit_studio_ui_draw_list(
             studio.fov_y_deg,
             target_px=GIZMO_TARGET_PX * ui_sc,
             gizmo_rot=studio.selection_gizmo_rotation(),
+            px_scale=ui_sc,
         )
         ui.pop_clip()
 
@@ -10620,7 +10725,7 @@ def emit_studio_ui_draw_list(
     # Visual Agent Theatre 2D Viewport Overlays (presence pills, Bezier flow beams, PRIM_ARC reticles, inline [✓]/[✗])
     studio._last_theatre_hits.clear()
     if studio.agent_bus.has_active_visuals() and vp.w > Float32(40.0) and vp.h > Float32(40.0):
-        var vp_mat = vxf.hud_view_proj(studio.cam_pos, studio.cam_fwd, studio.fov_y_deg, studio.near_z, Float32(1000.0))
+        var vp_mat = vxf.hud_view_proj(studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg, studio.near_z, Float32(1000.0))
         _ = emit_agent_viewport_hud_overlays_with_font(
             studio.agent_bus,
             studio.ui_ctx.draw_list,
