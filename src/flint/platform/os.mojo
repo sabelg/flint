@@ -196,13 +196,34 @@ def parent_directory(path: String) -> String:
     return String(path[byte=0:cut])
 
 
-def write_synced(path: String, mut data: List[UInt8], fault: Int = FAULT_NONE, sync: Bool = True) -> Bool:
+def file_mode(path: String) -> Int:
+    """Permission bits (`st_mode & 0o7777`) of `path` from stat(2), following symlinks,
+    or -1 when it is missing."""
+    comptime STAT_MODE_OFF: Int = 24 if CompilationTarget.is_x86() else 16
+    var owned = path
+    var buf = List[UInt8](length=256, fill=0)
+    if external_call["stat", Int32](owned.as_c_string_span(), buf.unsafe_ptr()) != 0:
+        return -1
+    var mode = Pointer[UInt32, ImmutAnyOrigin](
+        unsafe_from_address=Int(buf.unsafe_ptr()) + STAT_MODE_OFF
+    )[unsafe_offset=0]
+    _ = len(buf)
+    return Int(mode & 0o7777)
+
+
+def write_synced(
+    path: String, mut data: List[UInt8], fault: Int = FAULT_NONE, sync: Bool = True, mode: Int = -1
+) -> Bool:
     """Writes a whole file and fsyncs it: its bytes are on disk on return.
     `fault` stops part way, for tests (FAULT_*); `sync` False skips the fsync
-    (scratch files nobody needs after a power cut: a replay's saves)."""
+    (scratch files nobody needs after a power cut: a replay's saves). `mode` >= 0
+    fchmods the file to those permission bits before the fsync (best effort: a file we
+    do not own keeps the creation mode); otherwise a new file gets 0666 & ~umask."""
     var fd = open_write(path)
     if fd < 0:
         return False
+    if mode >= 0:
+        _ = external_call["fchmod", Int32](Int32(fd), UInt32(mode & 0o7777))
     var end = len(data) // 2 if fault == FAULT_SHORT_WRITE else len(data)
     var offset = 0
     while offset < end:
@@ -237,9 +258,12 @@ def durable_rename(source: String, destination: String, sync: Bool = True) -> Bo
 def write_file_durable(path: String, mut data: List[UInt8], fault: Int = FAULT_NONE) -> Bool:
     """Replaces `path` with `data` so that after a crash or power loss at any
     moment the file is either the old one or the new one, never a mix: write
-    `path`.tmp and fsync it, rename it over `path`, fsync the directory."""
+    `path`.tmp and fsync it, rename it over `path`, fsync the directory.
+    The replacement keeps the existing file's permission bits (an executable script
+    stays executable); a new file gets the usual 0666 & ~umask (0644 under umask 022)."""
     var temporary = path + ".tmp"
-    return write_synced(temporary, data, fault) and durable_rename(temporary, path)
+    var mode = file_mode(path)
+    return write_synced(temporary, data, fault, mode=mode) and durable_rename(temporary, path)
 
 
 def player_save_directory() -> String:
