@@ -1277,6 +1277,37 @@ struct HierarchyRow(Copyable, ImplicitlyCopyable, Movable):
     var expanded: Bool
 
 
+struct HierarchyRowCache(Copyable, Movable):
+    """Flattened Outliner rows, rebuilt only when their key changes: the Studio `scene_version`
+    (spawn / despawn / reparent / rename / flag edits, undo / redo / load), the expand-collapse
+    version, the search query, and the ECS world's restore epoch / slot count / live count (a
+    safety net for out-of-band world changes)."""
+    var rows: List[HierarchyRow]
+    var valid: Bool
+    var scene_version: UInt64
+    var expand_version: UInt64
+    var restore_epoch: UInt64
+    var world_slots: Int
+    var world_live: Int
+    var query: String
+    var rebuild_count: Int
+    """How many times the rows were rebuilt (for tests and profiling)."""
+
+    def __init__(out self):
+        self.rows = List[HierarchyRow]()
+        self.valid = False
+        self.scene_version = UInt64(0)
+        self.expand_version = UInt64(0)
+        self.restore_epoch = UInt64(0)
+        self.world_slots = 0
+        self.world_live = 0
+        self.query = ""
+        self.rebuild_count = 0
+
+    def invalidate(mut self):
+        self.valid = False
+
+
 @fieldwise_init
 struct SelectedTransformSnap(Copyable, ImplicitlyCopyable, Movable):
     var entity_id: Int
@@ -2213,6 +2244,11 @@ struct FlintStudioState(Movable):
     var selected_entity_ids: List[Int]
     var selection_anchor_id: Int
     var hierarchy_expanded: Dict[Int, Bool]
+    var scene_version: UInt64
+    """Bumped on every edit that can change the Outliner rows (spawn / despawn / reparent / rename /
+    flag changes, undo / redo / load); keys `hierarchy_row_cache`."""
+    var hierarchy_expand_version: UInt64
+    var hierarchy_row_cache: HierarchyRowCache
 
     var gizmo_mode: Int
     var gizmo_local_space: Bool
@@ -2481,6 +2517,9 @@ struct FlintStudioState(Movable):
         self.selected_entity_ids = List[Int]()
         self.selection_anchor_id = -1
         self.hierarchy_expanded = Dict[Int, Bool]()
+        self.scene_version = UInt64(0)
+        self.hierarchy_expand_version = UInt64(0)
+        self.hierarchy_row_cache = HierarchyRowCache()
 
         self.gizmo_mode = GIZMO_MODE_TRANSLATE
         self.gizmo_local_space = False
@@ -2892,6 +2931,9 @@ struct FlintStudioState(Movable):
     def _sync_compat_view(mut self):
         self._ensure_editor_ids()
         var cap = len(self.app.world.entities)
+        # Any change to what the Outliner shows (slot count, alive, parent, name, flags) bumps
+        # `scene_version`, whichever path changed the world (MCP, PIE, plugins, ...).
+        var outline_changed = len(self.entities) != cap
         while len(self.entities) < cap:
             self.entities.append(StudioEntityView(len(self.entities), "Entity", alive=False))
         while len(self.entities) > cap:
@@ -2899,6 +2941,8 @@ struct FlintStudioState(Movable):
 
         for i in range(cap):
             if not self.app.world.entities[i].alive:
+                if self.entities[i].alive:
+                    outline_changed = True
                 self.entities[i].entity_id = i
                 self.entities[i].alive = False
                 self.entities[i].parent_id = -1
@@ -2907,9 +2951,15 @@ struct FlintStudioState(Movable):
 
             var e = Entity(UInt32(i), self.app.world.entities[i].generation)
             ref v = self.entities[i]
+            var new_parent = self.parent_of(i)
+            if not v.alive or v.parent_id != new_parent:
+                outline_changed = True
+            var prev_name = v.name
+            var prev_locked = v.locked
+            var prev_enabled = v.enabled
             v.entity_id = i
             v.alive = True
-            v.parent_id = self.parent_of(i)
+            v.parent_id = new_parent
             var prev_visible = v.visible
 
             var lt_opt = self.app.world.get_ptr[LocalTransform](e)
@@ -2987,6 +3037,11 @@ struct FlintStudioState(Movable):
                 v.locked = False
                 v.enabled = True
                 v.collider_kind = COLLIDER_NONE
+            if (
+                v.name != prev_name or v.locked != prev_locked or v.enabled != prev_enabled
+                or v.visible != prev_visible
+            ):
+                outline_changed = True
 
             var col_opt = self.app.world.get_ptr[ColliderComponent](e)
             if col_opt:
@@ -3101,6 +3156,8 @@ struct FlintStudioState(Movable):
                 v.has_prefab = False
                 v.prefab_ref = AssetRef()
                 v.prefab_name = ""
+        if outline_changed:
+            self.bump_scene_version()
 
     def _sync_ecs_and_physics(mut self):
         self._propagate_transforms_immediate()
@@ -3139,9 +3196,11 @@ struct FlintStudioState(Movable):
             # Undo entries are stored LZ4-packed (`_pack_undo_blob`); checkpoints and captures are raw.
             var r = BlobReader(lz4_unpack(data) if lz4_packed_raw_size(data) >= 0 else data.copy())
             self.app.world.restore_blob(r)
+            self.bump_scene_version()
             if r.failed:
                 return False
         except:
+            self.bump_scene_version()
             return False
         self.registry.ensure_registered_in_world(self.app.world)
         self.gpu_materials.clear_entity_slots()
@@ -3348,11 +3407,47 @@ struct FlintStudioState(Movable):
 
     def set_hierarchy_expanded(mut self, entity_id: Int, expanded: Bool):
         self.hierarchy_expanded[entity_id] = expanded
+        self.hierarchy_expand_version += 1
 
     def toggle_hierarchy_expanded(mut self, entity_id: Int) -> Bool:
         var next_v = not self.is_hierarchy_expanded(entity_id)
-        self.hierarchy_expanded[entity_id] = next_v
+        self.set_hierarchy_expanded(entity_id, next_v)
         return next_v
+
+    def bump_scene_version(mut self):
+        """Marks the scene structure / names / flags as changed, so cached Outliner rows rebuild."""
+        self.scene_version += 1
+
+    def outliner_rows(mut self) -> List[HierarchyRow]:
+        """The rows the Outliner shows for its current search, served from the row cache."""
+        var q = self.outliner_state.search_query
+        return self.cached_hierarchy_rows(q)
+
+    def cached_hierarchy_rows(mut self, query: String) -> List[HierarchyRow]:
+        """`hierarchy_rows_for_query(query)`, served from `hierarchy_row_cache` while its key is unchanged."""
+        ref c = self.hierarchy_row_cache
+        var w_slots = len(self.app.world.entities)
+        if not (
+            c.valid
+            and c.scene_version == self.scene_version
+            and c.expand_version == self.hierarchy_expand_version
+            and c.restore_epoch == self.app.world.restore_epoch
+            and c.world_slots == w_slots
+            and c.world_live == self.app.world.live_entities
+            and c.query == query
+        ):
+            var rows = self.hierarchy_rows_for_query(query)
+            ref cm = self.hierarchy_row_cache
+            cm.rows = rows^
+            cm.valid = True
+            cm.scene_version = self.scene_version
+            cm.expand_version = self.hierarchy_expand_version
+            cm.restore_epoch = self.app.world.restore_epoch
+            cm.world_slots = w_slots
+            cm.world_live = self.app.world.live_entities
+            cm.query = query
+            cm.rebuild_count += 1
+        return self.hierarchy_row_cache.rows.copy()
 
     def _collect_hierarchy_dfs(
         self,
@@ -3380,7 +3475,7 @@ struct FlintStudioState(Movable):
         if not (up or down or left or right):
             return False
         # Walk exactly the rows the Outliner shows, so a search filter is respected.
-        var rows = self.hierarchy_rows_for_query(self.outliner_state.search_query)
+        var rows = self.outliner_rows()
         if len(rows) == 0:
             return False
         var cur = -1
@@ -3398,12 +3493,12 @@ struct FlintStudioState(Movable):
             self.select_entity(rows[cur + 1].entity_id)
         elif left:
             if row.has_children and row.expanded:
-                self.hierarchy_expanded[row.entity_id] = False
+                self.set_hierarchy_expanded(row.entity_id, False)
             elif row.parent_id >= 0:
                 self.select_entity(row.parent_id)
         elif right and row.has_children:
             if not row.expanded:
-                self.hierarchy_expanded[row.entity_id] = True
+                self.set_hierarchy_expanded(row.entity_id, True)
             elif cur + 1 < len(rows):
                 self.select_entity(rows[cur + 1].entity_id)
         return True
@@ -3449,6 +3544,7 @@ struct FlintStudioState(Movable):
         m.value()[unsafe_offset=0].locked = locked
         if entity_id < len(self.entities):
             self.entities[entity_id].locked = locked
+        self.bump_scene_version()
         self.mark_dirty(True)
         return True
 
@@ -4994,6 +5090,7 @@ struct FlintStudioState(Movable):
             if self.app.world.entities[i].alive:
                 var e = Entity(UInt32(i), self.app.world.entities[i].generation)
                 _ = self.app.world.despawn(e)
+        self.bump_scene_version()
         self.clipboard_editor_ids.clear()
         self.clear_selection()
         self.reject_all_mcp_approvals("Scene changed before approval")
@@ -5121,6 +5218,7 @@ struct FlintStudioState(Movable):
             label = "Empty"
 
         var e = self.app.world.spawn_empty()
+        self.bump_scene_version()
         var eid = Int(e.index)
         var pos = Vec3(0.0, 1.0, 0.0)
         var rot = Quat.identity()
@@ -5940,6 +6038,7 @@ struct FlintStudioState(Movable):
         if len(w_bytes) > 0:
             var wr = BlobReader(w_bytes^)
             self.app.world.restore_blob(wr)
+            self.bump_scene_version()
             self.registry.ensure_registered_in_world(self.app.world)
 
         if len(p_bytes) > 0:
@@ -7103,6 +7202,7 @@ struct FlintStudioState(Movable):
             var prev_anchor = self.selection_anchor_id
 
             var e = self.app.world.spawn_empty()
+            self.bump_scene_version()
             var eid = Int(e.index)
             var lt = LocalTransform(drop_pos, Quat.identity(), Vec3(1.0, 1.0, 1.0))
             var gt = GlobalTransform.from_local(lt)
@@ -7343,6 +7443,7 @@ struct FlintStudioState(Movable):
                 var prev_primary = self.selected_entity_id
                 var prev_anchor = self.selection_anchor_id
                 var e = self.app.world.spawn_empty()
+                self.bump_scene_version()
                 var eid = Int(e.index)
                 var lt = LocalTransform(drop_pos, Quat.identity(), Vec3(1.0, 1.0, 1.0))
                 var gt = GlobalTransform.from_local(lt)
@@ -7694,6 +7795,7 @@ struct FlintStudioState(Movable):
         var prev_anchor = self.selection_anchor_id
 
         var e = self.app.world.spawn_empty()
+        self.bump_scene_version()
         var eid = Int(e.index)
         var safe_pos = Vec3(
             position.x if isfinite(position.x) else Float32(0.0),
@@ -7920,6 +8022,7 @@ struct FlintStudioState(Movable):
                     _ = clear_parent(self.app.world, ce)
         _ = clear_parent(self.app.world, e)
         _ = self.app.world.despawn(e)
+        self.bump_scene_version()
         self.gpu_materials.invalidate_entity(entity_id)
         return True
 
@@ -8035,6 +8138,7 @@ struct FlintStudioState(Movable):
         else:
             var parent_e = self.resolve_entity(new_parent_id)
             ok = set_parent(self.app.world, child_e, parent_e)
+        self.bump_scene_version()
         if not ok:
             return False
 
@@ -8156,6 +8260,7 @@ struct FlintStudioState(Movable):
         var e = self.resolve_entity(entity_id)
         if not e.valid():
             return False
+        self.bump_scene_version()  # name / parent / visible / enabled / locked may all change here
 
         var cur_par = self.parent_of(entity_id)
         if updated.parent_id != cur_par:
@@ -11599,7 +11704,7 @@ def emit_studio_ui_draw_list(
         var h_info = studio.dock.find_panel("Hierarchy")
         # Search covers collapsed branches, and range-select (Shift+click) walks the filtered rows the
         # user sees, not the whole tree.
-        var rows = studio.hierarchy_rows_for_query(studio.outliner_state.search_query)
+        var rows = studio.outliner_rows()
         var disp_order = List[Int](capacity=len(rows))
         for ri in range(len(rows)):
             disp_order.append(rows[ri].entity_id)

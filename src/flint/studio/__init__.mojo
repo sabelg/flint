@@ -73,6 +73,7 @@ from flint.studio.studio_app import (
     FieldVisitor,
     FlintStudioState,
     HierarchyRow,
+    HierarchyRowCache,
     Inspectable,
     InspectedField,
     PieSession,
