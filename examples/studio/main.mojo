@@ -718,6 +718,7 @@ def _run_studio() raises -> Int:
                 _run_mcp_replays(mcp, studio, assets, mcp_pool, renderer.gpu_slot[0])
                 _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, renderer.gpu_slot[0])
                 _drain_mcp_events_to_studio(mcp, studio)
+                studio.code_drawer.mirror_problem_store(mcp.diagnostics_store)
             studio.gizmo_drag_cancel()
             press_pending = False
             studio.marquee_active = False
@@ -861,6 +862,8 @@ def _run_studio() raises -> Int:
             _run_mcp_replays(mcp, studio, assets, mcp_pool, r_mcp.value()[unsafe_offset=0].gpu_slot[0])
             _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, r_mcp.value()[unsafe_offset=0].gpu_slot[0])
             _drain_mcp_events_to_studio(mcp, studio)
+            # Read-only: MCP `code.build_hot_reload` diagnostics show up in the drawer's Problems.
+            studio.code_drawer.mirror_problem_store(mcp.diagnostics_store)
             gms = r_mcp.value()[unsafe_offset=0].gpu_slot[0].render_graph.total_gpu_ms
 
         if studio.pie.mode == PIE_PLAYING:

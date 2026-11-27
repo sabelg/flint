@@ -307,6 +307,12 @@ from flint.studio.agent_theatre_3d import (
     emit_agent_viewport_3d_overlays,
     emit_agent_viewport_hud_overlays_with_font,
 )
+from flint.devtools.job_runner import JOB_SUCCEEDED, JobRunner
+from flint.devtools.problems import DIAG_ERROR as CODE_DIAG_ERROR
+from flint.devtools.problems import DIAG_SRC_BUILD as CODE_DIAG_SRC_BUILD
+from flint.devtools.problems import DIAG_WARNING as CODE_DIAG_WARNING
+from flint.devtools.problems import Diagnostic as CodeDiagnostic
+from flint.platform.os import get_time as code_build_now
 from flint.studio.code_drawer import (
     BUILD_STATUS_BUILDING,
     BUILD_STATUS_ERROR,
@@ -320,6 +326,8 @@ from flint.studio.code_drawer import (
     CODE_ACT_OPEN_EXTERNAL_IDE,
     CODE_ACT_REJECT_ALL_DIFF,
     CODE_ACT_REJECT_HUNK,
+    CODE_ACT_RELOAD_FROM_DISK,
+    CODE_ACT_SAVE_TAB,
     CODE_MODE_DIFF_UNIFIED,
     CodeDrawer,
 )
@@ -2295,6 +2303,11 @@ struct FlintStudioState(Movable):
     var agent_checkpoints: AgentCheckpointLog
     var _last_theatre_hits: List[TheatrePillHit]
     var code_drawer: CodeDrawer
+    var code_build_jobs: JobRunner
+    """Async gameplay `.so` build started by Build & Reload (polled by `poll_code_build`)."""
+    var code_build_id: Int
+    var code_build_so: String
+    var code_build_deadline: Float64
     var show_grid_overlay: Bool
     var cam_ortho: Bool
     var gallery_play_hud_active: Bool
@@ -2476,6 +2489,10 @@ struct FlintStudioState(Movable):
         self.agent_checkpoints = AgentCheckpointLog()
         self._last_theatre_hits = List[TheatrePillHit]()
         self.code_drawer = CodeDrawer()
+        self.code_build_jobs = JobRunner()
+        self.code_build_id = -1
+        self.code_build_so = String()
+        self.code_build_deadline = 0.0
         self.show_grid_overlay = True
         self.cam_ortho = False
         self.gallery_play_hud_active = False
@@ -3846,19 +3863,7 @@ struct FlintStudioState(Movable):
             _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_CODE_DRAWER)
             return True
         if cmd_id == PAL_CMD_BUILD_HOT_RELOAD:
-            var ok = self.reload_gameplay_plugin()
-            self.code_drawer.set_build_status(
-                BUILD_STATUS_OK if ok else BUILD_STATUS_ERROR,
-                self.code_drawer.build_generation + 1,
-                0 if ok else 1,
-                0,
-            )
-            self.push_toast(
-                "Reloaded gameplay .so" if ok else ("Reload .so failed: " + self.hot_reload_host.last_error),
-                0 if ok else 2,
-                2.8,
-            )
-            return ok
+            return self.start_code_build()
         if cmd_id == PAL_CMD_SHOW_DIAGNOSTICS:
             self.code_drawer.problems_open = True
             _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_CODE_DRAWER)
@@ -9611,6 +9616,120 @@ struct FlintStudioState(Movable):
             return False
         return self.load_gameplay_plugin(target)
 
+    # ---- Code Drawer: Build & Reload, diagnostic jumps ----
+
+    def _code_build_compiler(self, root: String) -> String:
+        """Same toolchain resolution as MCP `code.build_hot_reload`: `FLINT_MOJO_BIN`, then the
+        project's / engine's pixi env, then `mojo` on PATH."""
+        var compiler = env_value("FLINT_MOJO_BIN")
+        if compiler.byte_length() > 0:
+            return compiler
+        var ws_mojo = root + "/.pixi/envs/default/bin/mojo"
+        if file_size(ws_mojo) > 0:
+            return ws_mojo
+        if file_size(".pixi/envs/default/bin/mojo") > 0:
+            return String(".pixi/envs/default/bin/mojo")
+        return String("mojo")
+
+    def start_code_build(mut self) -> Bool:
+        """Build & Reload: starts the async `mojo build --emit shared-lib` of the project's
+        `src/gameplay.mojo` into `build/gameplay.so`. `poll_code_build` (every frame) feeds the
+        compiler diagnostics into the Code Drawer and hot-reloads only on success."""
+        if self.code_build_id >= 0:
+            self.push_toast("A gameplay build is already running", 1, 2.0)
+            return False
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        while root.byte_length() > 1 and root.endswith("/"):
+            var trimmed = String(root[byte=0 : root.byte_length() - 1])
+            root = trimmed^
+        var entry = root + "/src/gameplay.mojo"
+        if file_size(entry) <= 0:
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, self.code_drawer.build_generation, 1, 0, "No gameplay.mojo")
+            self.push_toast("Build failed: " + entry + " not found", 2, 3.0)
+            return False
+        var so = root + "/build/gameplay.so"
+        _ = make_dirs(root + "/build")
+        var inc = List[String]()
+        inc.append(root + "/src")
+        if is_directory("src") and real_path("src")[1] != real_path(root + "/src")[1]:
+            inc.append("src")
+        var jid = self.code_build_jobs.start_gameplay_so_build(
+            root, entry, so, inc, compiler=self._code_build_compiler(root), opt_flag="-O1", werror=True
+        )
+        if jid < 0:
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, self.code_drawer.build_generation, 1, 0, "Build start failed")
+            self.push_toast("Build failed: could not start mojo", 2, 3.0)
+            return False
+        self.code_build_id = jid
+        self.code_build_so = so
+        self.code_build_deadline = code_build_now() + 300.0
+        self.code_drawer.set_build_status(BUILD_STATUS_BUILDING, self.code_drawer.build_generation)
+        return True
+
+    def poll_code_build(mut self) -> Bool:
+        """Advances a running Build & Reload. Returns True on the frame the build finished."""
+        if self.code_build_id < 0:
+            return False
+        _ = self.code_build_jobs.poll_all()
+        var idx = self.code_build_jobs.find_index(self.code_build_id)
+        if idx >= 0 and self.code_build_jobs.jobs[idx].is_running():
+            if code_build_now() < self.code_build_deadline:
+                return False
+            _ = self.code_build_jobs.cancel(self.code_build_id)
+            self.code_build_id = -1
+            self.code_build_jobs = JobRunner()
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, self.code_drawer.build_generation, 1, 0, "Build timed out")
+            self.push_toast("Gameplay build timed out", 2, 3.0)
+            return True
+        var ok = idx >= 0 and self.code_build_jobs.jobs[idx].state == JOB_SUCCEEDED
+        var diags = self.code_build_jobs.jobs[idx].diagnostics.copy() if idx >= 0 else List[CodeDiagnostic]()
+        var output = self.code_build_jobs.jobs[idx].output_text() if idx >= 0 else String("")
+        self.code_build_id = -1
+        self.code_build_jobs = JobRunner()
+        self.code_drawer.problems.replace_source(CODE_DIAG_SRC_BUILD, diags)
+        var errs = 0
+        var warns = 0
+        var first_err = String()
+        for k in range(len(diags)):
+            if diags[k].severity == CODE_DIAG_ERROR:
+                errs += 1
+                if first_err.byte_length() == 0:
+                    first_err = self._basename(diags[k].path) + ":" + String(diags[k].line) + " " + diags[k].message
+            elif diags[k].severity == CODE_DIAG_WARNING:
+                warns += 1
+        var gen = self.code_drawer.build_generation
+        if not ok:
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, gen, max(1, errs), warns)
+            self.code_drawer.problems_open = True
+            var detail = first_err
+            if detail.byte_length() == 0:
+                detail = String(output.strip()) if output.byte_length() < 160 else String("see Problems")
+            self.push_toast("Build failed: " + detail, 2, 4.0)
+            return True
+        var so_path = self.code_build_so
+        if self.load_gameplay_plugin(so_path):
+            self.code_drawer.set_build_status(BUILD_STATUS_OK, self.hot_reload_host.reload_generation, 0, warns)
+        else:
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, gen, 1, warns, "Reload failed")
+        return True
+
+    def open_code_location(mut self, path: String, line: Int = 1) -> Bool:
+        """Opens `path` (compiler paths are absolute and used as-is; relative paths resolve
+        against the project) in the Code Drawer at `line`, reusing an already-open tab.
+        Shows an error toast when the file cannot be read."""
+        var ti = self.code_drawer.find_tab(path)
+        if ti < 0 and not path.startswith("/"):
+            ti = self.code_drawer.find_tab(self._resolve_asset_disk_path(path))
+        if ti >= 0:
+            self.code_drawer.active_tab = ti
+            self.code_drawer.jump_to_line(line)
+            return True
+        var disk = path if path.startswith("/") else self._resolve_asset_disk_path(path)
+        if self.code_drawer.open_file(disk, line) < 0:
+            self.push_toast("Cannot open " + path + ": " + self.code_drawer.last_error, 2, 3.0)
+            return False
+        return True
+
     # ---- `PhysicsWorld` + Static BVH Scene Raycast ----
 
     def raycast_scene(self, origin: Vec3, direction: Vec3, max_distance: Float32 = 1000.0) -> StudioRaycastHit:
@@ -12010,6 +12129,8 @@ def emit_studio_ui_draw_list(
             studio.apply_agent_panel_action(ag_acts[ai])
         studio.ui_ctx.end_dock_panel()
 
+    _ = studio.poll_code_build()
+    _ = studio.code_drawer.poll_disk_changes()
     if studio.ui_ctx.begin_dock_panel(studio.dock, "CodeDrawer"):
         var cd_info = studio.dock.find_panel("CodeDrawer")
         var cd_r = cd_info[3]
@@ -12045,7 +12166,12 @@ def emit_studio_ui_draw_list(
                 2.2,
             )
         elif cd_act.kind == CODE_ACT_JUMP_DIAGNOSTIC and cd_act.path.byte_length() > 0:
-            _ = studio.code_drawer.open_file(studio._resolve_asset_disk_path(cd_act.path), cd_act.line)
+            _ = studio.open_code_location(cd_act.path, cd_act.line)
+        elif cd_act.kind == CODE_ACT_SAVE_TAB or cd_act.kind == CODE_ACT_RELOAD_FROM_DISK:
+            if cd_act.message.byte_length() > 0:
+                studio.push_toast(cd_act.message, 2, 3.0)
+            elif cd_act.kind == CODE_ACT_SAVE_TAB:
+                studio.push_toast("Saved " + cd_act.path, 0, 1.6)
         elif cd_act.kind == CODE_ACT_ASK_AGENT_FIX:
             _ = studio.apply_workspace_preset(WORKSPACE_AGENT_STUDIO, sw, sh)
             var a_fix = AgentPanelAction(PANEL_ACT_RUN_PROMPT)

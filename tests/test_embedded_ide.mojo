@@ -1,7 +1,44 @@
 """Regression checks for fragmented PTY frames, bounds safety, RAII and Studio's focus shortcut."""
 from std.ffi import external_call
+from std.math import abs
 from std.testing import assert_equal, assert_true, assert_false
 from flint.platform.input import InputState
+from flint.devtools.diff_view import DIFF_ROW_NOTE, NO_EOL_NOTE, DiffDocument, DiffSide
+from flint.devtools.mojo_highlight import (
+    LANG_JS,
+    LANG_MARKDOWN,
+    LANG_PYTHON,
+    LANG_RUST,
+    MojoHighlighter,
+    STATE_MD_FENCE,
+    STATE_NORMAL,
+    TOK_COMMENT,
+    TOK_DEF,
+    TOK_KEYWORD,
+    TOK_NUMBER,
+    TOK_STRING,
+    lang_for_path,
+    md_fence_lang,
+    md_in_fence,
+    next_line_state,
+)
+from flint.devtools.problems import (
+    DIAG_ERROR,
+    DIAG_SRC_BUILD,
+    DIAG_WARNING,
+    Diagnostic,
+    ProblemStore,
+    parse_compiler_output,
+)
+from flint.platform.os import env_value, make_dirs, read_bytes, remove_file, write_bytes
+from flint.studio.code_drawer import (
+    CODE_TAB_WIDTH,
+    CodeDrawer,
+    advance_text,
+    byte_offset_for_col,
+    diag_squiggle_span,
+)
+from flint.ui.theme import StudioTheme
 from flint.platform.os import list_directory
 from flint.platform.traits import WindowBackend
 from flint.render.font import SdfFont
@@ -178,6 +215,258 @@ def test_grid_escapes_width_and_scroll() raises:
     print("IdeGrid ESC intermediates, CSI prefixes, wcwidth, combining marks, TAB and ring scroll passed.")
 
 
+def _write_text(path: String, text: String) raises:
+    var data = List[UInt8](text.as_bytes())
+    assert_true(write_bytes(path, data))
+
+
+def _read_text(path: String) -> String:
+    var raw = read_bytes(path)
+    return String(unsafe_from_utf8=raw) if len(raw) > 0 else String("")
+
+
+def _scratch_dir() raises -> String:
+    var base = env_value("TMPDIR")
+    if base.byte_length() == 0:
+        base = "/tmp"
+    var d = base + "/flint-code-drawer-test-" + String(Int(external_call["getpid", Int32]()))
+    assert_true(make_dirs(d))
+    return d
+
+
+def test_diff_line_endings() raises:
+    # A final-newline change gets its own hunk: Accept All yields the new EOF state.
+    var d0 = DiffDocument("a.txt", "x\ny", "z\ny\n")
+    assert_equal(d0.hunk_count(), 2)
+    d0.accept_all()
+    assert_equal(d0.materialized_text(), "z\ny\n")
+    var d1 = DiffDocument("a.txt", "x\ny", "z\ny\n")
+    d1.reject_all()
+    assert_equal(d1.materialized_text(), "x\ny")
+    var d2 = DiffDocument("a.txt", "x\ny", "z\ny\n")
+    _ = d2.accept_hunk(0)
+    _ = d2.reject_hunk(1)
+    assert_equal(d2.materialized_text(), "z\ny")
+    var d3 = DiffDocument("a.txt", "a\nb\n", "a\nb")
+    assert_equal(d3.hunk_count(), 1)
+    d3.accept_all()
+    assert_equal(d3.materialized_text(), "a\nb")
+    var saw_note = False
+    var rows = d3.unified_rows()
+    for i in range(len(rows)):
+        if rows[i].kind == DIFF_ROW_NOTE and rows[i].text == NO_EOL_NOTE:
+            saw_note = True
+    assert_true(saw_note)
+
+    # CRLF files keep CRLF, even when the proposal was written with LF.
+    var c0 = DiffDocument("w.txt", "a\r\nb\r\nc\r\n", "a\r\nB\r\nc\r\n")
+    assert_equal(c0.hunk_count(), 1)
+    c0.accept_all()
+    assert_equal(c0.materialized_text(), "a\r\nB\r\nc\r\n")
+    var c1 = DiffDocument("w.txt", "a\r\nb\r\nc\r\n", "a\nB\nc\n")
+    assert_equal(c1.hunk_count(), 1)
+    c1.accept_all()
+    assert_equal(c1.materialized_text(), "a\r\nB\r\nc\r\n")
+    c1.reject_all()
+    assert_equal(c1.materialized_text(), "a\r\nb\r\nc\r\n")
+    # A stray CR inside an LF file survives byte-for-byte.
+    var c2 = DiffDocument("w.txt", "a\nb\r\nc\n", "a\nb\r\nC\n")
+    c2.accept_all()
+    assert_equal(c2.materialized_text(), "a\nb\r\nC\n")
+    assert_equal(DiffSide.from_text("p\r\nq").to_text(), "p\r\nq")
+    print("Diff CRLF preservation and final-newline hunks passed.")
+
+
+def test_highlight_fences_and_dialects() raises:
+    var hl = MojoHighlighter()
+    var md = List[String]()
+    md.append("```python")
+    md.append('x = """doc')
+    md.append('still doc"""')
+    md.append("```")
+    md.append("# Heading")
+    var spans = hl.highlight_lines(md, LANG_MARKDOWN)
+    assert_equal(spans[2][0].token_kind, TOK_STRING)  # inside a multi-line string in the fence
+    assert_equal(spans[4][0].token_kind, TOK_DEF)     # fence closed: Markdown heading again
+    var st = STATE_NORMAL
+    for i in range(3):
+        st = next_line_state(md[i], st, LANG_MARKDOWN)
+    assert_true(md_in_fence(st))
+    assert_equal(md_fence_lang(st), LANG_PYTHON)
+    assert_equal(next_line_state("```", STATE_NORMAL, LANG_MARKDOWN), STATE_MD_FENCE)
+    # Rust lifetimes no longer swallow the rest of the line as a char literal.
+    assert_equal(lang_for_path("src/lib.rs"), LANG_RUST)
+    assert_equal(lang_for_path("web/app.ts"), LANG_JS)
+    var rs = hl.highlight_line("fn f<'a>(x: &'a str) -> u32 { 1 }", STATE_NORMAL, LANG_RUST)
+    var saw_num = False
+    for i in range(len(rs[0])):
+        if rs[0][i].token_kind == TOK_NUMBER:
+            saw_num = True
+        assert_true(rs[0][i].token_kind != TOK_STRING)
+    assert_true(saw_num)
+    var js = hl.highlight_line("const s = `a ${b}`; // c", STATE_NORMAL, LANG_JS)
+    assert_equal(js[0][0].token_kind, TOK_KEYWORD)
+    assert_equal(js[0][len(js[0]) - 1].token_kind, TOK_COMMENT)
+
+    # Diff rows take their spans from whole-file highlighting (multi-line string state).
+    var cd = CodeDrawer()
+    var old_src = String('def f():\n    """start\n    middle\n    end"""\n    return 1\n')
+    var new_src = String('def f():\n    """start\n    middle changed\n    end"""\n    return 1\n')
+    _ = cd.show_agent_proposal("doc.mojo", old_src, new_src)
+    cd.tabs[0].ensure_diff_spans(cd.highlighter)
+    assert_equal(cd.tabs[0].diff_new_spans[2][0].token_kind, TOK_STRING)
+    assert_equal(cd.tabs[0].diff_old_spans[2][0].token_kind, TOK_STRING)
+    print("Markdown fence state, Rust/JS dialects and diff-row highlighting passed.")
+
+
+def test_code_drawer_files() raises:
+    var dir = _scratch_dir()
+    var path = dir + "/hero.mojo"
+    _write_text(path, "def a():\n    pass\n")
+    var cd = CodeDrawer()
+
+    # A failed read reports instead of opening an empty tab.
+    assert_equal(cd.open_file(dir + "/missing.mojo", 3), -1)
+    assert_true(cd.last_error.byte_length() > 0)
+    assert_equal(len(cd.tabs), 0)
+
+    var ti = cd.open_file(path, 2)
+    assert_equal(ti, 0)
+    assert_equal(cd.tabs[0].cursor_line, 1)
+    assert_equal(cd.tabs[0].disk_path, path)
+
+    # Unsaved edits survive re-opening (from disk or from memory).
+    cd.tabs[0].text = "def a():\n    return 2\n"
+    cd.tabs[0].dirty = True
+    cd.tabs[0].rebuild_caches(cd.highlighter)
+    assert_equal(cd.open_file(path, 1), 0)
+    assert_equal(cd.tabs[0].text, "def a():\n    return 2\n")
+    _ = cd.open_source(path, "def a():\n    pass\n")
+    assert_equal(cd.tabs[0].text, "def a():\n    return 2\n")
+    assert_true(cd.tabs[0].disk_conflict)
+    cd.keep_tab_buffer(0)
+    assert_false(cd.tabs[0].disk_conflict)
+
+    # Save is durable and clears dirty.
+    assert_true(cd.save_tab(0))
+    assert_false(cd.tabs[0].dirty)
+    assert_equal(_read_text(path), "def a():\n    return 2\n")
+
+    # External change on a clean tab reloads it.
+    _write_text(path, "def a():\n    return 33\n")
+    assert_equal(cd.poll_disk_changes(force=True), 1)
+    assert_equal(cd.tabs[0].text, "def a():\n    return 33\n")
+    assert_false(cd.tabs[0].dirty)
+
+    # External change under unsaved edits flags a conflict and keeps the buffer.
+    cd.tabs[0].text = "def a():\n    return 4\n"
+    cd.tabs[0].dirty = True
+    _write_text(path, "def a():\n    return 555\n")
+    assert_equal(cd.poll_disk_changes(force=True), 1)
+    assert_true(cd.tabs[0].disk_conflict)
+    assert_equal(cd.tabs[0].text, "def a():\n    return 4\n")
+    assert_false(cd.save_tab(0))
+    assert_equal(_read_text(path), "def a():\n    return 555\n")
+    assert_true(cd.reload_tab_from_disk(0))
+    assert_equal(cd.tabs[0].text, "def a():\n    return 555\n")
+    assert_false(cd.tabs[0].dirty or cd.tabs[0].disk_conflict)
+
+    # Closing a dirty tab asks first; force discards.
+    cd.tabs[0].text = "changed\n"
+    cd.tabs[0].dirty = True
+    cd.close_tab(0)
+    assert_equal(len(cd.tabs), 1)
+    assert_equal(cd.pending_close_tab, 0)
+    cd.close_tab(0, force=True)
+    assert_equal(len(cd.tabs), 0)
+    assert_equal(cd.pending_close_tab, -1)
+
+    # Agent-facing API: materialized text of a pending proposal, save by path.
+    var pi = cd.open_file(path)
+    var cur_pi = cd.tab_text(path)
+    _ = cd.show_agent_proposal(path, cur_pi, "def a():\n    return 6\n")
+    assert_equal(cd.materialized_text(pi, accept_pending=True), "def a():\n    return 6\n")
+    assert_equal(cd.materialized_text(pi), "def a():\n    return 555\n")
+    cd.apply_all_diff(True)
+    assert_true(cd.tabs[pi].dirty)
+    assert_true(cd.save_path(path))
+    assert_equal(_read_text(path), "def a():\n    return 6\n")
+    assert_equal(cd.tab_text(path), "def a():\n    return 6\n")
+
+    # CRLF file: accepting a proposal and saving keeps CRLF on disk.
+    var crlf_path = dir + "/win.toml"
+    _write_text(crlf_path, "a = 1\r\nb = 2\r\n")
+    var wi = cd.open_file(crlf_path)
+    var cur_wi = cd.tab_text(crlf_path)
+    _ = cd.show_agent_proposal(crlf_path, cur_wi, "a = 1\nb = 3\n")
+    cd.apply_all_diff(True)
+    assert_true(cd.save_tab(wi))
+    assert_equal(_read_text(crlf_path), "a = 1\r\nb = 3\r\n")
+    _ = remove_file(path)
+    _ = remove_file(crlf_path)
+    print("CodeDrawer open/reopen guards, durable save, disk watch & conflicts passed.")
+
+
+def test_code_drawer_view() raises:
+    var cd = CodeDrawer()
+    var body = String("")
+    for i in range(100):
+        body += "line " + String(i) + "\n"
+    _ = cd.open_source("long.mojo", body)
+    var theme = StudioTheme.flint_obsidian()
+    var font = SdfFont()
+    var inp = InputState()
+    var dl = UiDrawList()
+    _ = cd.draw_and_handle(dl, 0, font, theme, 0.0, 0.0, 640.0, 720.0, inp, 0.0)
+    var rows = cd.visible_rows
+    assert_true(rows > 12)
+    # jump_to_line uses the real visible row count: an on-screen line does not scroll.
+    cd.jump_to_line(rows - 1)
+    assert_equal(cd.tabs[0].scroll_line, 0)
+    cd.jump_to_line(80)
+    assert_true(cd.tabs[0].scroll_line <= 79 and cd.tabs[0].scroll_line + rows > 79)
+    # Down past the last visible row scrolls the cursor into view.
+    cd.tabs[0].scroll_line = 0
+    cd.tabs[0].cursor_line = rows - 1
+    cd.has_keyboard_focus = True
+    var down = InputState()
+    down.begin_frame()
+    down.set_key(264, True)
+    var dl2 = UiDrawList()
+    _ = cd.draw_and_handle(dl2, 0, font, theme, 0.0, 0.0, 640.0, 720.0, down, 0.0)
+    assert_equal(cd.tabs[0].cursor_line, rows)
+    assert_equal(cd.tabs[0].scroll_line, 1)
+
+    # Squiggles: byte column -> tab-expanded prefix width.
+    assert_equal(byte_offset_for_col("a界b", 3), 1)  # mid-codepoint column snaps back
+    var mono = SdfFont()
+    if mono.load_ttf("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 32, 5):
+        var px = Float32(13.0)
+        var sp_w = mono.measure(" ", px)
+        var sq = diag_squiggle_span(mono, px, "\tfoo(bar)", 2)
+        assert_true(abs(sq[0] - sp_w * Float32(CODE_TAB_WIDTH)) < Float32(0.01))
+        assert_true(abs(sq[1] - mono.measure("foo", px)) < Float32(0.01))
+        var sq2 = diag_squiggle_span(mono, px, "\tfoo(bar)", 6)
+        assert_true(abs(sq2[0] - advance_text(mono, px, 0.0, 0.0, "\tfoo(")) < Float32(0.01))
+        assert_true(abs(advance_text(mono, px, 0.0, 0.0, "ab\tc") - sp_w * Float32(CODE_TAB_WIDTH + 1)) < Float32(0.01))
+
+    # MCP diagnostics mirror: only sources that changed there are replaced.
+    var ext = ProblemStore()
+    ext.replace_source(DIAG_SRC_BUILD, parse_compiler_output("/p/a.mojo:3:4: error: bad\n"))
+    cd.mirror_problem_store(ext)
+    assert_equal(cd.problems.error_count(), 1)
+    var own = List[Diagnostic]()
+    own.append(Diagnostic(DIAG_SRC_BUILD, DIAG_WARNING, "/p/b.mojo", 1, 1, "own build"))
+    own.append(Diagnostic(DIAG_SRC_BUILD, DIAG_ERROR, "/p/b.mojo", 2, 1, "own build"))
+    cd.problems.replace_source(DIAG_SRC_BUILD, own)
+    cd.mirror_problem_store(ext)
+    assert_equal(cd.problems.warning_count(), 1)
+    ext.replace_source(DIAG_SRC_BUILD, List[Diagnostic]())
+    cd.mirror_problem_store(ext)
+    assert_equal(cd.problems.error_count() + cd.problems.warning_count(), 0)
+    print("CodeDrawer visible rows, cursor scroll, tab-aware squiggles and problem mirror passed.")
+
+
 def main() raises:
     comptime assert conforms_to(MockWindowBackend, WindowBackend)
 
@@ -282,4 +571,8 @@ def main() raises:
     assert_equal(mock_win.presents, 1)
     assert_equal(mock_win.last_px_count, 320 * 180)
     test_grid_escapes_width_and_scroll()
+    test_diff_line_endings()
+    test_highlight_fences_and_dialects()
+    test_code_drawer_files()
+    test_code_drawer_view()
     print("Embedded IDE grid, UTF-8 input, F2, bounds safety, RAII and generic WindowBackend passed.")
