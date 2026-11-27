@@ -16,6 +16,10 @@ Short hashes point at the commits.
 - **Docs and CI:** getting-started, ECS and gameplay guides, an expanded architecture map, this
   changelog, an API stability policy, `CONTRIBUTING.md`, the CPU-only `tools/ci.sh` and a GitHub
   Actions workflow.
+- **CI:** an `e2e-studio` job runs Studio e2e tiers 2-4 (`flint.sh test e2e-studio --extended`;
+  `--all` runs tiers 1-4). The gate keeps tier 1.
+- **Studio:** `.flscn`/`.flscnb` store Enabled and Visible separately (`StudioEntityMetaComponent`
+  v3; older files still load), and the undo byte cap is configurable (`undo_byte_budget`).
 
 ## [5.0.0] - development line, 2026-11-14 to 2026-11-26
 

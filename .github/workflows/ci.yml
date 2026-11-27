@@ -100,6 +100,40 @@ jobs:
           path: build/ci-logs/
           if-no-files-found: ignore
 
+  e2e-studio:
+    name: Studio e2e tiers 2-4 (flint.sh test e2e-studio --extended)
+    # The gate runs tier 1 only; tiers 2-4 (boundary, cross-feature, scenario) add far more
+    # than the gate's budget, so they run here as a job of their own.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      FLINT_STUDIO_E2E_JOBS: "4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          run-install: false
+
+      - name: Cache pixi environment
+        uses: actions/cache@v4
+        with:
+          path: |
+            .pixi
+            ~/.cache/rattler
+          key: pixi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.toml') }}
+          restore-keys: |
+            pixi-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Mojo 1.2 toolchain
+        run: pixi install
+
+      - name: Install lavapipe (software Vulkan)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+
+      - name: Run Studio e2e tiers 2-4
+        run: bash tools/flint.sh test e2e-studio --extended
+
   gate:
     name: Full gate (self-hosted GPU)
     if: github.event_name == 'workflow_dispatch' && inputs.full_gate

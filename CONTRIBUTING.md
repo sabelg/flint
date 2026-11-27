@@ -68,7 +68,11 @@ message.
   `STUDIO_TEST_SUITES` in `tools/flint.sh` (built at `-O1`, each run gets a fresh
   `XDG_STATE_HOME`).
 - **Shell-level Studio/shipping checks:** `tests/e2e_studio/tier*/` scripts, run by
-  `tests/e2e_studio/run_studio_e2e.sh`.
+  `tests/e2e_studio/run_studio_e2e.sh`. The gate runs tier 1 only (`.mojo` tests compiled in
+  parallel at `-O1`). Tiers 2-4 (boundary, cross-feature, scenario) take well over the gate's
+  budget (tier 2 alone is about 11 minutes), so they run in the `e2e-studio` CI job and locally
+  with `bash tools/flint.sh test e2e-studio --extended` (`--all` runs tiers 1-4;
+  `FLINT_GATE_E2E_TIERS="1 2"` widens the gate itself).
 
 Write temporary files under a per-process path (for example include `getpid()`), because
 `tools/ci.sh` runs suites in parallel.
