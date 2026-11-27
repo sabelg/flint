@@ -583,7 +583,8 @@ build_and_check_motion_editor() {
 }
 
 # Studio E2E suite (tests/e2e_studio). The gate runs tier 1 with its .mojo tests compiled in
-# parallel at -O1; `FLINT_GATE_E2E_TIERS="1 2"` (or "all") widens it.
+# parallel at -O1; `FLINT_GATE_E2E_TIERS="1 2"` (or "all") widens it. Tiers 2-4 take far longer
+# (tier 2 alone ~11 min), so they run in CI's e2e-studio job / `flint.sh test e2e-studio --extended`.
 run_studio_e2e() {
     resolve_mojo
     local tier
@@ -649,7 +650,16 @@ cmd_test() {
     elif [[ "$sub" == "e2e-studio" ]]; then
         shift
         resolve_mojo
-        MOJO="$MOJO_BIN" bash "${ROOT}/tests/e2e_studio/run_studio_e2e.sh" "$@"
+        if [[ "${1:-}" == "--all" || "${1:-}" == "--extended" ]]; then
+            # --all: tiers 1-4; --extended: the tiers the gate skips (2-4). Same -O1 / parallel
+            # compile settings as the gate's tier 1 (CI's e2e-studio job runs --extended).
+            local e2e_tiers="1 2 3 4"
+            [[ "$1" == "--extended" ]] && e2e_tiers="2 3 4"
+            shift
+            FLINT_GATE_E2E_TIERS="$e2e_tiers" run_studio_e2e
+        else
+            MOJO="$MOJO_BIN" bash "${ROOT}/tests/e2e_studio/run_studio_e2e.sh" "$@"
+        fi
     else
         cmd_build test
         echo "[Flint] Running Flint Engine test suite..."
@@ -2783,6 +2793,7 @@ case "$subcmd" in
         echo "  gameplay-so [--fast|--debug|--release] [--out path.so]  Compile hot-reloadable gameplay .so plugin"
         echo "  run [...]            Build and run a scaffolded game project using flint.toml [project] entry"
         echo "  test [unit|e2e|v5]   Build and run standalone Flint Engine verification suites"
+        echo "  test e2e-studio [--all|--extended|runner args]  Studio e2e tiers (gate: 1; --extended: 2-4)"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
         echo "  preview <program>    Live preview: rebuild on save and swap window (spark|world|studio|cycles|file|dir)"
         echo "  fern IMAGE PREFIX    Bake an upright frond into near, medium and far GLBs"
