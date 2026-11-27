@@ -11,6 +11,7 @@ code/build, entity, asset, and Visual Agent Studio catalog from `studio_app.mojo
     follow-up hints for `Space`, `W/E/R`, `Ctrl+K`, `F5..F10`, and `Alt+A`.
 """
 from std.collections import List
+from flint.platform.input import InputState
 from flint.studio.palette import (
     KeyChordEntry,
     KeyChordHud,
@@ -134,6 +135,7 @@ comptime PAL_CMD_SNAP_VIEW_FRONT: Int = 316
 comptime PAL_CMD_SNAP_VIEW_RIGHT: Int = 317
 comptime PAL_CMD_SNAP_VIEW_TOP: Int = 318
 comptime PAL_CMD_RESCAN_ASSETS: Int = 319
+comptime PAL_CMD_OPEN_SOURCE_EDITOR: Int = 320
 
 # Quick-Spawn Primitives & Objects (400..429)
 comptime PAL_CMD_SPAWN_EMPTY: Int = 400
@@ -250,9 +252,9 @@ def populate_studio_palette(
 
     # ---- File & Scene ----
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_SAVE_SCENE, "Save Scene", "File", "Ctrl+S", ICON_SCENE, "cmd:save", True, True, "Save Scene File Ctrl+S"))
-    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_LOAD_SCENE, "Load Saved Scene", "File", "Ctrl+O", ICON_SCENE, "cmd:load", True, True, "Load Open Scene File"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_LOAD_SCENE, "Open Scene...", "File", "Ctrl+O", ICON_SCENE, "cmd:load", True, True, "Open Load Scene File Dialog Browse"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_NEW_SCENE, "New Scene", "File", "Ctrl+N", ICON_PLUS, "cmd:new", True, True, "New Empty Scene File"))
-    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_RELOAD_SCENE, "Reload Scene from Disk", "File", "", ICON_REFRESH, "cmd:reload_scene", True, True, "Reload Revert Scene Disk"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_RELOAD_SCENE, "Revert Scene to Saved", "File", "", ICON_REFRESH, "cmd:reload_scene", True, True, "Revert Reload Load Saved Scene Disk"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_RECOVER_AUTOSAVE, "Recover Autosave", "File", "", ICON_REFRESH, "cmd:recover_autosave", True, True, "Recover Autosave Crash Restore Backup"))
 
     # ---- Edit & Hierarchy ----
@@ -302,7 +304,8 @@ def populate_studio_palette(
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_THEME_CYCLE, "Cycle Studio Theme", "Appearance", "", ICON_SUN, "cmd:theme_cycle", False, True, "Theme Switch Toggle Cycle"))
 
     # ---- Code, Build, NavMesh & View Overlays ----
-    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_TOGGLE_CODE_DRAWER, "Toggle Code & Diff Drawer", "Code", "F8", ICON_CODE, "cmd:code_drawer", False, True, "Code Drawer Editor Source Diff F8"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_TOGGLE_CODE_DRAWER, "Toggle Code & Diff Drawer", "Code", "", ICON_CODE, "cmd:code_drawer", False, True, "Code Drawer Diff Panel Toggle"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_OPEN_SOURCE_EDITOR, "Open Source Editor", "Code", "F8", ICON_CODE, "cmd:source_editor", False, True, "Source Editor Full Screen Code F8"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_BUILD_HOT_RELOAD, "Build & Hot-Reload Plugin", "Build", "Ctrl+B", ICON_REFRESH, "cmd:build_reload", False, has_project, "Build Compile Hot Reload SO Plugin"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_SHOW_DIAGNOSTICS, "Show Compiler Diagnostics", "Code", "", ICON_WARN, "cmd:diagnostics", False, True, "Problems Errors Warnings Diagnostics"))
     pal.add_item(PaletteItem(PALETTE_ITEM_COMMAND, PAL_CMD_BAKE_NAVMESH, "Bake NavMesh", "Navigation", "", ICON_GRID, "cmd:bake_nav", True, True, "Bake NavMesh Recast Pathfinding"))
@@ -331,7 +334,7 @@ def populate_studio_palette(
     pal.add_item(PaletteItem(PALETTE_ITEM_SPAWN, PAL_CMD_SPAWN_AUDIO, "Spawn Audio Emitter", "Quick Spawn", "", ICON_AUDIO, "spawn:audio", True, True, "Spawn Create Audio Sound Emitter"))
     pal.add_item(PaletteItem(PALETTE_ITEM_SPAWN, PAL_CMD_SPAWN_PHYSICS_BOX, "Spawn Physics RigidBody Box", "Quick Spawn", "", ICON_COLLIDER, "spawn:phys_box", True, True, "Spawn Create Dynamic Physics RigidBody Box"))
     pal.add_item(PaletteItem(PALETTE_ITEM_SPAWN, PAL_CMD_SPAWN_TRIGGER, "Spawn Trigger Volume", "Quick Spawn", "", ICON_COLLIDER, "spawn:trigger", True, True, "Spawn Create Trigger Sensor Volume"))
-    pal.add_item(PaletteItem(PALETTE_ITEM_SPAWN, PAL_CMD_SPAWN_PREFAB, "Spawn Prefab Instance", "Quick Spawn", "", ICON_PREFAB, "spawn:prefab", True, True, "Spawn Instantiate Prefab"))
+    pal.add_item(PaletteItem(PALETTE_ITEM_SPAWN, PAL_CMD_SPAWN_PREFAB, "Spawn Prefab Instance", "Quick Spawn", "", ICON_PREFAB, "spawn:prefab", True, True, "Spawn Instantiate Prefab Last Used Pick flprefab"))
 
     # ---- Visual Agent Studio & Theatre ----
     pal.add_item(PaletteItem(PALETTE_ITEM_AGENT, PAL_CMD_AGENT_SCENE_BUILDER, "Agent: Launch Scene Builder", "Agent Studio", "", ICON_AGENT_SPARK, "agent:scene_builder", False, True, "AI Agent Launch Scene Builder Level Layout"))
@@ -444,7 +447,7 @@ def studio_chord_spec(
         out.append(KeyChordEntry("F5", "Play / Stop PIE", PAL_CMD_PIE_PLAY))
         out.append(KeyChordEntry("F6", "Pause / Resume PIE", PAL_CMD_PIE_PAUSE))
         out.append(KeyChordEntry("F7", "Step Frame", PAL_CMD_PIE_STEP))
-        out.append(KeyChordEntry("F8", "Code & Diff Drawer", PAL_CMD_TOGGLE_CODE_DRAWER))
+        out.append(KeyChordEntry("F8", "Source Editor", PAL_CMD_OPEN_SOURCE_EDITOR))
         out.append(KeyChordEntry("S-F1", "Eject Camera", PAL_CMD_PIE_EJECT_CAMERA))
         out.append(KeyChordEntry("C-B", "Build & Hot-Reload", PAL_CMD_BUILD_HOT_RELOAD))
         return out^
@@ -486,3 +489,26 @@ def begin_studio_chord(
         return False
     hud.begin_chord(trigger_key, entries^)
     return True
+
+
+def studio_chord_key_label(input: InputState) -> String:
+    """Names the first non-modifier key pressed this frame the way `KeyChordEntry.second_key` spells it
+    (`"1"`, `"F"`, `"F8"`, `"Esc"`); any other key is `"?"` (it cancels the chord). Empty when no key was pressed."""
+    var other = False
+    for k in range(512):
+        if not input.key_pressed(k):
+            continue
+        if k >= 340 and k <= 347:  # Shift / Ctrl / Alt / Super never complete a chord
+            continue
+        if k >= 48 and k <= 57:
+            return String(k - 48)
+        if k >= 320 and k <= 329:  # keypad digits
+            return String(k - 320)
+        if k >= 65 and k <= 90:
+            return chr(k)
+        if k >= 290 and k <= 301:
+            return "F" + String(k - 289)
+        if k == 256:
+            return "Esc"
+        other = True
+    return String("?") if other else String("")

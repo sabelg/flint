@@ -44,6 +44,8 @@ comptime PALETTE_ITEM_ASSET: Int = 4
 comptime PALETTE_ITEM_AGENT: Int = 5
 
 comptime KEY_CHORD_DELAY_SEC: Float32 = 0.20
+# An armed chord that gets no second key within this window disarms itself.
+comptime KEY_CHORD_TIMEOUT_SEC: Float32 = 3.0
 
 
 def palette_mode_label(mode: Int) -> String:
@@ -479,20 +481,22 @@ struct KeyChordEntry(Copyable, Movable):
 
 
 struct KeyChordHud(Copyable, Movable):
-    """200 ms delayed non-focus-stealing chord hint box state."""
+    """200 ms delayed non-focus-stealing chord hint box state; disarms after `timeout_sec`."""
     var active: Bool
     var visible: Bool
     var prefix_label: String
     var elapsed_sec: Float32
     var delay_sec: Float32
+    var timeout_sec: Float32
     var entries: List[KeyChordEntry]
 
-    def __init__(out self, delay_sec: Float32 = KEY_CHORD_DELAY_SEC):
+    def __init__(out self, delay_sec: Float32 = KEY_CHORD_DELAY_SEC, timeout_sec: Float32 = KEY_CHORD_TIMEOUT_SEC):
         self.active = False
         self.visible = False
         self.prefix_label = ""
         self.elapsed_sec = Float32(0.0)
         self.delay_sec = max(Float32(0.0), delay_sec)
+        self.timeout_sec = max(self.delay_sec, timeout_sec)
         self.entries = List[KeyChordEntry]()
 
     def __init__(out self, *, copy: Self):
@@ -501,6 +505,7 @@ struct KeyChordHud(Copyable, Movable):
         self.prefix_label = copy.prefix_label
         self.elapsed_sec = copy.elapsed_sec
         self.delay_sec = copy.delay_sec
+        self.timeout_sec = copy.timeout_sec
         self.entries = copy.entries.copy()
 
     def begin_chord(mut self, prefix_label: String, var entries: List[KeyChordEntry]):
@@ -522,6 +527,9 @@ struct KeyChordHud(Copyable, Movable):
             return
         if dt > Float32(0.0):
             self.elapsed_sec += dt
+        if self.timeout_sec > Float32(0.0) and self.elapsed_sec >= self.timeout_sec:
+            self.cancel()
+            return
         if self.elapsed_sec >= self.delay_sec:
             self.visible = True
 
