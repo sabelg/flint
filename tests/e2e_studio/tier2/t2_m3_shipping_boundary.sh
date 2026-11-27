@@ -309,7 +309,7 @@ def main() raises:
         raise Error("corrupt chunk returned wrong bytes instead of loose FS fallback: " + s_bad)
     srv2.close()
 MOJO
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t2_m3_f26_vfs_fallback_corrupt_chunk_precedence_and_zero_byte" "failed to compile vfs_neg_probe.mojo"
         return
     fi
@@ -518,7 +518,7 @@ def main() raises:
             raise Error("AssetServer.mount_flpk unexpectedly succeeded on corrupt archive: " + p)
     srv.close()
 MOJO
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t2_m3_f26_corrupt_flpk_header_and_toc_graceful" "failed to compile flpk_corrupt_probe.mojo"
         return
     fi

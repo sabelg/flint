@@ -230,7 +230,7 @@ def main() raises:
     studio2.shutdown()
 MOJO
     local compile_log="${TMPD}/s1_probe.compile.log"
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" -O3 --fp-mode contract=off --Werror "$s1_src" -o "$s1_bin" >"$compile_log" 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$s1_src" -o "$s1_bin" >"$compile_log" 2>&1; then
         local c_err
         c_err="$(tail -n 6 "$compile_log" | tr '\n' ' ')"
         fail_test "t4_s1_author_lit_level_navmesh_save_restart_pie_isolation" "M0/M3 contract pending (s1_probe compile failed): ${c_err}"
@@ -575,7 +575,7 @@ def main() raises:
     app2.shutdown()
 MOJO
     local s2_log="${TMPD}/s2_content_probe.compile.log"
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" -O3 --fp-mode contract=off --Werror "$s2_src" -o "$s2_bin" >"$s2_log" 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$s2_src" -o "$s2_bin" >"$s2_log" 2>&1; then
         local c_err
         c_err="$(tail -n 6 "$s2_log" | tr '\n' ' ')"
         fail_test "t4_s2_content_pipeline_glb_flmat_flrig_flprefab_reload" "M1 contract pending (s2_content_probe compile failed): ${c_err}"
@@ -778,7 +778,7 @@ def main() raises:
     _ = flush_log()
     external_call["abort", NoneType]()
 MOJO
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$crash_probe_src" -o "$crash_probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$crash_probe_src" -o "$crash_probe_bin" >/dev/null 2>&1; then
         fail_test "t4_s6_scene_v1_v2_migration_opaque_blob_and_crash_handler" "failed to compile s6_crash_probe.mojo"
         return
     fi
@@ -846,7 +846,7 @@ def main() raises:
     if out_str.find("UnknownCustomAi") < 0 or out_str.find("rogue") < 0 or out_str.find("12.5") < 0:
         raise Error("unknown component opaque blob lost during round-trip: " + out_str)
 MOJO
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$scene_probe_src" -o "$scene_probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$scene_probe_src" -o "$scene_probe_bin" >/dev/null 2>&1; then
         fail_test "t4_s6_scene_v1_v2_migration_opaque_blob_and_crash_handler" "failed to compile s6_scene_probe.mojo"
         return
     fi

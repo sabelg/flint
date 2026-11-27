@@ -32,7 +32,7 @@ def main() raises:
     log_info(LOG_CORE, "probe_ok")
     _ = flush_log()
 MOJO
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t2_r1_flint_state_dir_ignores_legacy_sd" "failed to compile env_probe.mojo"
         return
     fi

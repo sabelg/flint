@@ -218,7 +218,7 @@ def main() raises:
         raise Error("unload failed")
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
         fail_test "t1_m2_f22_hot_reload_host_v2_swap_preserves_state" "M5 FlintPluginApiV2/PodComponentSchema contract pending"
         return
     fi
@@ -393,7 +393,7 @@ def main() raises:
         raise Error("unknown studio_probes mode: " + mode)
 MOJO
 
-    if "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$STUDIO_PROBES_BIN" >"$STUDIO_PROBES_LOG" 2>&1; then
+    if "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$STUDIO_PROBES_BIN" >"$STUDIO_PROBES_LOG" 2>&1; then
         STUDIO_PROBES_STATE=1
         return 0
     fi
@@ -604,7 +604,7 @@ def main() raises:
         )
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
         fail_test "t1_m2_f24_entity_from_body_and_on_enter_exit" "M5 entity_from_body / OnEnter / OnExit contract pending"
         return
     fi
@@ -712,7 +712,7 @@ def main() raises:
         raise Error("reloaded BehaviorTreeComponent reactive abort failed")
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
         fail_test "t1_m2_f25_bt_component_json_roundtrip" "M5 BehaviorTreeComponent / BT JSON roundtrip contract pending"
         return
     fi
@@ -847,7 +847,7 @@ def main() raises:
         raise Error("Tween interpolation/clamping failed")
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
         fail_test "t1_m2_f25_game_flow_fsm_scene_save_timers_tweens" "M5 GameFlow FSM/scene/save/timer/tween contract pending"
         return
     fi
