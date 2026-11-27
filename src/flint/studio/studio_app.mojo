@@ -382,6 +382,8 @@ from flint.studio.palette import (
     draw_key_chord_hud,
 )
 from flint.studio.palette_registry import (
+    PAL_CMD_OPEN_SOURCE_EDITOR,
+    studio_chord_key_label,
     PAL_CMD_AGENT_APPROVE_STEP,
     PAL_CMD_AGENT_EXIT_TIME_TRAVEL,
     PAL_CMD_AGENT_GAMEPLAY_CODER,
@@ -601,6 +603,18 @@ comptime COLLIDER_SPHERE: Int = 1
 comptime COLLIDER_BOX: Int = 2
 comptime COLLIDER_CAPSULE: Int = 3
 comptime COLLIDER_STATIC_MESH: Int = 4
+
+# `spawn_card_entity` kinds (Scene menu, Quick Spawn palette, spawn cards).
+comptime SPAWN_CARD_EMPTY: Int = 0
+comptime SPAWN_CARD_CUBE: Int = 1
+comptime SPAWN_CARD_POINT_LIGHT: Int = 2
+comptime SPAWN_CARD_SPOT_LIGHT: Int = 3
+comptime SPAWN_CARD_CAMERA: Int = 4
+comptime SPAWN_CARD_AUDIO: Int = 5
+comptime SPAWN_CARD_SPHERE: Int = 6
+comptime SPAWN_CARD_PLANE: Int = 7
+comptime SPAWN_CARD_SUN: Int = 8
+comptime SPAWN_PLANE_SIZE_M: Float32 = 10.0
 
 comptime SHADING_PBR: Int = 0
 comptime SHADING_NPR_CEL: Int = 1
@@ -1676,6 +1690,11 @@ def _studio_layout_path() -> String:
     return state_directory("flint") + "/studio_layout.json"
 
 
+def _studio_palette_frecency_path() -> String:
+    """Per-user Command Palette frecency table, next to the dock layout."""
+    return state_directory("flint") + "/studio_palette_frecency.txt"
+
+
 def _create_studio_dockspace() -> DockSpace:
     """Builds the default Studio v2 Edit `DockSpace` layout (`Hierarchy` left,
     `SceneViewport` center, `Inspector`/`Agents`/`CameraRig` right,
@@ -1836,9 +1855,11 @@ def _create_studio_input_map() -> InputMap:
     _ = imap.register_action("editor_save_as", ACTION_BOOL)
     _ = imap.register_action("editor_open", ACTION_BOOL)
     _ = imap.register_action("editor_help", ACTION_BOOL)
+    _ = imap.register_action("editor_clear_selection", ACTION_BOOL)
     _ = imap.register_action("cam_orbit", ACTION_AXIS2D)
 
-    var ctx = InputContext("StudioEditor", priority=10)
+    # Strict modifiers: plain-key hotkeys (W/E/R/X/F/G/Q, arrows) never fire while Ctrl or Alt is held.
+    var ctx = InputContext("StudioEditor", priority=10, strict_modifiers=True)
     ctx.bind_key("gizmo_translate", 87)                  # W
     ctx.bind_key("gizmo_rotate", 69)                     # E
     ctx.bind_key("gizmo_scale", 82)                      # R
@@ -1849,15 +1870,16 @@ def _create_studio_input_map() -> InputMap:
     ctx.bind_key("editor_redo", 90, modifiers=MOD_CTRL | MOD_SHIFT)  # Ctrl+Shift+Z
     ctx.bind_key("source_editor", 297)                   # F8
     ctx.bind_key("editor_save", 83, modifiers=MOD_CTRL)  # Ctrl+S
-    ctx.bind_key("editor_load", 79, modifiers=MOD_CTRL)  # Ctrl+O
     ctx.bind_key("editor_new", 78, modifiers=MOD_CTRL)   # Ctrl+N
     ctx.bind_key("editor_duplicate", 68, modifiers=MOD_CTRL)  # Ctrl+D
     ctx.bind_key("editor_copy", 67, modifiers=MOD_CTRL)  # Ctrl+C
     ctx.bind_key("editor_paste", 86, modifiers=MOD_CTRL) # Ctrl+V
     ctx.bind_key("editor_delete", 261)                   # Delete
+    ctx.bind_key("pie_stop", 294, modifiers=MOD_SHIFT)   # Shift+F5 (Stop: no-op in Edit, never Play)
     ctx.bind_key("pie_toggle", 294)                      # F5
     ctx.bind_key("pie_pause", 295)                       # F6
     ctx.bind_key("pie_step", 296)                        # F7
+    ctx.bind_key("editor_clear_selection", 256)          # Esc clears the selection (Edit mode only)
     ctx.bind_key("editor_quit", 81, modifiers=MOD_CTRL)  # Ctrl+Q (bare Esc never quits!)
     ctx.bind_key("editor_rename", 291)                   # F2
     ctx.bind_key("editor_select_all", 65, modifiers=MOD_CTRL)  # Ctrl+A
@@ -1865,7 +1887,7 @@ def _create_studio_input_map() -> InputMap:
     ctx.bind_key("toggle_snap", 71)                      # G (grid snap)
     ctx.bind_key("build_reload", 66, modifiers=MOD_CTRL) # Ctrl+B (reload gameplay .so)
     ctx.bind_key("editor_save_as", 83, modifiers=MOD_CTRL | MOD_SHIFT)  # Ctrl+Shift+S
-    ctx.bind_key("editor_open", 79, modifiers=MOD_CTRL | MOD_SHIFT)     # Ctrl+Shift+O
+    ctx.bind_key("editor_open", 79, modifiers=MOD_CTRL)  # Ctrl+O opens the scene dialog (revert has no default key)
     ctx.bind_key("editor_help", 290)                     # F1
     ctx.bind_key("cam_orbit", 263, scale_x=-1.0, scale_y=0.0, consume=False)  # Left
     ctx.bind_key("cam_orbit", 262, scale_x=1.0, scale_y=0.0, consume=False)   # Right
@@ -2230,6 +2252,7 @@ struct FlintStudioState(Movable):
     var help_open: Bool
     var welcome_open: Bool
     var rename_focus_requested: Bool
+    var last_prefab_entry: String
     var next_editor_id: UInt64
     var autosave_interval_sec: Float32
     """Seconds of dirty editing between autosaves (0 disables)."""
@@ -2463,6 +2486,7 @@ struct FlintStudioState(Movable):
         self.header_bar = StudioHeaderBar()
         self.viewport_hud = ViewportHud()
         self.command_palette = StudioCommandPalette()
+        _ = self.command_palette.frecency.load_file(_studio_palette_frecency_path())
         self.key_chord_hud = KeyChordHud()
         self.toast_mgr = ToastManager()
         self.job_tracker = JobProgressTracker()
@@ -2514,6 +2538,7 @@ struct FlintStudioState(Movable):
         self.help_open = False
         self.welcome_open = False
         self.rename_focus_requested = False
+        self.last_prefab_entry = ""
         self._saved_tx_id = UInt64(0)
         self.next_editor_id = UInt64(1)
         self.autosave_interval_sec = Float32(120.0)
@@ -2566,6 +2591,7 @@ struct FlintStudioState(Movable):
         if self.hot_reload_host.is_loaded():
             _ = self.hot_reload_host.unload(self.app.world, self.app.resources, is_reload=False)
         _save_studio_dockspace(self.dock)
+        _ = self.command_palette.frecency.save_file(_studio_palette_frecency_path())
         self.menu.close()
         self.source_editor.close()
         self.app.shutdown()
@@ -2771,6 +2797,7 @@ struct FlintStudioState(Movable):
                 self.entities[i].entity_id = i
                 self.entities[i].alive = False
                 self.entities[i].parent_id = -1
+                self.entities[i].visible = True  # a recycled slot never inherits a hidden flag
                 continue
 
             var e = Entity(UInt32(i), self.app.world.entities[i].generation)
@@ -2778,6 +2805,7 @@ struct FlintStudioState(Movable):
             v.entity_id = i
             v.alive = True
             v.parent_id = self.parent_of(i)
+            var prev_visible = v.visible
 
             var lt_opt = self.app.world.get_ptr[LocalTransform](e)
             if lt_opt:
@@ -2803,7 +2831,7 @@ struct FlintStudioState(Movable):
                 v.has_mesh_renderer = False
                 v.mesh_id = -1
                 v.material_id = 0
-                v.visible = True
+                v.visible = prev_visible  # nothing to hide: keep the editor flag as the user set it
                 v.mesh_ref = AssetRef()
                 v.material_ref = AssetRef()
 
@@ -2840,8 +2868,9 @@ struct FlintStudioState(Movable):
                 v.name = meta.name
                 v.locked = meta.locked
                 v.enabled = meta.enabled
-                if not mr_opt:
-                    v.visible = meta.enabled
+                if not meta.enabled:
+                    # A disabled entity's mesh is hidden, but its own Visible switch keeps its value.
+                    v.visible = prev_visible
                 v.mesh_handle = UntypedHandle(meta.mesh_handle_packed)
                 v.material_handle = UntypedHandle(meta.material_handle_packed)
                 v.collider_kind = meta.collider_kind
@@ -3240,7 +3269,8 @@ struct FlintStudioState(Movable):
         Left collapses (or jumps to the parent), Right expands (or steps into the first child)."""
         if not (up or down or left or right):
             return False
-        var rows = self.hierarchy_visible_rows()
+        # Walk exactly the rows the Outliner shows, so a search filter is respected.
+        var rows = self.hierarchy_rows_for_query(self.outliner_state.search_query)
         if len(rows) == 0:
             return False
         var cur = -1
@@ -3328,7 +3358,10 @@ struct FlintStudioState(Movable):
         multi_select: Bool = False,
         range_select: Bool = False,
         visible_order: List[Int] = List[Int](),
+        add_only: Bool = False,
     ):
+        """`multi_select` toggles `entity_id` in the selection (Ctrl+click); with `add_only` it only
+        ever adds (Shift+click / Shift+marquee) and makes an already-selected entity the primary."""
         self._normalize_selection_from_primary()
         if not self.is_alive_id(entity_id):
             if (not multi_select) and (not range_select):
@@ -3367,7 +3400,10 @@ struct FlintStudioState(Movable):
                 if self.selected_entity_ids[i] == entity_id:
                     found_idx = i
                     break
-            if found_idx >= 0:
+            if found_idx >= 0 and add_only:
+                self.selected_entity_id = entity_id
+                self.selection_anchor_id = entity_id
+            elif found_idx >= 0:
                 var next_list = List[Int](capacity=max(0, len(self.selected_entity_ids) - 1))
                 for i in range(len(self.selected_entity_ids)):
                     if i != found_idx:
@@ -3683,6 +3719,9 @@ struct FlintStudioState(Movable):
     def execute_palette_action(mut self, res: PaletteActionResult) -> Bool:
         if not res.executed:
             return False
+        # `accept_index` just recorded this use; persist it so frecency survives a crash or kill.
+        if res.frecency_key.byte_length() > 0:
+            _ = self.command_palette.frecency.save_file(_studio_palette_frecency_path())
         if res.kind == PALETTE_ITEM_ENTITY:
             if self.is_alive_id(res.action_id):
                 self.select_entity(res.action_id)
@@ -3714,11 +3753,10 @@ struct FlintStudioState(Movable):
             self.open_command_palette(PALETTE_SPAWN)
             return True
         if cmd_id == PAL_CMD_SAVE_SCENE and not in_play:
-            var ok = self.save_scene_file()
-            self.push_toast("Scene saved" if ok else "Save failed", 0 if ok else 2, 2.5)
-            return ok
+            return self.save_scene_file()  # `save_scene_file` shows its own success / failure toast
         if cmd_id == PAL_CMD_LOAD_SCENE and not in_play:
-            return self.request_load_scene()
+            self.open_file_modal(False)  # "Open Scene..." (Ctrl+O); "Revert Scene to Saved" reloads
+            return True
         if cmd_id == PAL_CMD_NEW_SCENE and not in_play:
             return self.new_scene(force=False)
         if cmd_id == PAL_CMD_RELOAD_SCENE and not in_play:
@@ -3742,8 +3780,7 @@ struct FlintStudioState(Movable):
                 return self.despawn_entity(self.selected_entity_id, record_undo=True)
             return False
         if cmd_id == PAL_CMD_RENAME:
-            self.begin_rename_selected()
-            return True
+            return self.begin_rename_selected()
         if cmd_id == PAL_CMD_COPY:
             return self.copy_selected() > 0
         if cmd_id == PAL_CMD_PASTE and not in_play:
@@ -3764,6 +3801,7 @@ struct FlintStudioState(Movable):
             return False
 
         if cmd_id == PAL_CMD_TOOL_SELECT:
+            self.gizmo_mode = GIZMO_MODE_SELECT
             self.active_gizmo_handle = GIZMO_AXIS_NONE
             return True
         if cmd_id == PAL_CMD_TOOL_MOVE:
@@ -3843,7 +3881,10 @@ struct FlintStudioState(Movable):
             return True
 
         if cmd_id == PAL_CMD_TOGGLE_CODE_DRAWER:
-            _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_CODE_DRAWER)
+            _ = self.toggle_dock_panel(PANEL_CODE_DRAWER)
+            return True
+        if cmd_id == PAL_CMD_OPEN_SOURCE_EDITOR:
+            self.source_editor.requested = True
             return True
         if cmd_id == PAL_CMD_BUILD_HOT_RELOAD:
             var ok = self.reload_gameplay_plugin()
@@ -3872,9 +3913,7 @@ struct FlintStudioState(Movable):
             self.push_toast(pr[1], 0 if pr[0] else 2, 3.2)
             return pr[0]
         if cmd_id == PAL_CMD_PACKAGE_PROFILES and not in_play:
-            var pr = self.package_project()
-            self.push_toast(pr[1], 0 if pr[0] else 2, 3.2)
-            return pr[0]
+            return self.package_project_with_profiles()
         if cmd_id == PAL_CMD_TOGGLE_NAVMESH_OVERLAY:
             self.show_navmesh_overlay = not self.show_navmesh_overlay
             var nav_res = self.app.resources.get_ptr_mut[NavPluginStateResource]()
@@ -3912,10 +3951,16 @@ struct FlintStudioState(Movable):
         if not in_play:
             if cmd_id == PAL_CMD_SPAWN_EMPTY:
                 return self.spawn_card_entity(0) >= 0
-            if cmd_id == PAL_CMD_SPAWN_CUBE or cmd_id == PAL_CMD_SPAWN_SPHERE or cmd_id == PAL_CMD_SPAWN_PLANE:
-                return self.spawn_card_entity(1) >= 0
-            if cmd_id == PAL_CMD_SPAWN_POINT_LIGHT or cmd_id == PAL_CMD_SPAWN_SUN_LIGHT:
-                return self.spawn_card_entity(2) >= 0
+            if cmd_id == PAL_CMD_SPAWN_CUBE:
+                return self.spawn_card_entity(SPAWN_CARD_CUBE) >= 0
+            if cmd_id == PAL_CMD_SPAWN_SPHERE:
+                return self.spawn_card_entity(SPAWN_CARD_SPHERE) >= 0
+            if cmd_id == PAL_CMD_SPAWN_PLANE:
+                return self.spawn_card_entity(SPAWN_CARD_PLANE) >= 0
+            if cmd_id == PAL_CMD_SPAWN_POINT_LIGHT:
+                return self.spawn_card_entity(SPAWN_CARD_POINT_LIGHT) >= 0
+            if cmd_id == PAL_CMD_SPAWN_SUN_LIGHT:
+                return self.spawn_card_entity(SPAWN_CARD_SUN) >= 0
             if cmd_id == PAL_CMD_SPAWN_SPOT_LIGHT:
                 return self.spawn_card_entity(3) >= 0
             if cmd_id == PAL_CMD_SPAWN_CAMERA:
@@ -3934,7 +3979,7 @@ struct FlintStudioState(Movable):
                     self._sync_compat_view()
                 return tid >= 0
             if cmd_id == PAL_CMD_SPAWN_PREFAB:
-                return self.spawn_card_entity(0) >= 0
+                return self.spawn_prefab_from_palette()
 
         if cmd_id == PAL_CMD_AGENT_SCENE_BUILDER:
             _ = self.apply_workspace_preset(WORKSPACE_AGENT_STUDIO)
@@ -3964,7 +4009,7 @@ struct FlintStudioState(Movable):
             if self.workspace_mgr.active_preset == WORKSPACE_AGENT_STUDIO:
                 _ = self.apply_workspace_preset(WORKSPACE_EDIT)
             else:
-                _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_AGENTS)
+                _ = self.toggle_dock_panel(PANEL_AGENTS)
             return True
         if cmd_id == PAL_CMD_AGENT_TOGGLE_FOLLOW_CAM:
             self.agent_bus.follow_agent_camera = not self.agent_bus.follow_agent_camera
@@ -4803,23 +4848,51 @@ struct FlintStudioState(Movable):
         var prev_anchor = self.selection_anchor_id
 
         var label: String
-        if card_idx == 1:
+        if card_idx == SPAWN_CARD_CUBE:
             label = "Cube"
-        elif card_idx == 2:
+        elif card_idx == SPAWN_CARD_POINT_LIGHT:
             label = "PointLight"
-        elif card_idx == 3:
+        elif card_idx == SPAWN_CARD_SPOT_LIGHT:
             label = "SpotLight"
-        elif card_idx == 4:
+        elif card_idx == SPAWN_CARD_CAMERA:
             label = "Camera"
-        elif card_idx == 5:
+        elif card_idx == SPAWN_CARD_AUDIO:
             label = "AudioEmitter"
+        elif card_idx == SPAWN_CARD_SPHERE:
+            label = "Sphere"
+        elif card_idx == SPAWN_CARD_PLANE:
+            label = "Plane"
+        elif card_idx == SPAWN_CARD_SUN:
+            label = "Sun"
         else:
             label = "Empty"
 
         var e = self.app.world.spawn_empty()
         var eid = Int(e.index)
-        var pos = Vec3(0.0, 1.0, 0.0) if card_idx != 1 else Vec3(0.0, 0.5, 0.0)
-        var lt = LocalTransform(pos, Quat.identity(), Vec3(1.0, 1.0, 1.0))
+        var pos = Vec3(0.0, 1.0, 0.0)
+        var rot = Quat.identity()
+        var scl = Vec3(1.0, 1.0, 1.0)
+        var col_kind = COLLIDER_NONE
+        var col_he = Vec3(0.5, 0.5, 0.5)
+        if card_idx == SPAWN_CARD_CUBE:
+            pos = Vec3(0.0, 0.5, 0.0)
+            col_kind = COLLIDER_BOX
+        elif card_idx == SPAWN_CARD_SPHERE:
+            # The shared SubD orb primitive (radius 0.88) scaled to a 0.5 m radius sphere.
+            pos = Vec3(0.0, 0.5, 0.0)
+            var k = Float32(0.5) / Float32(0.88)
+            scl = Vec3(k, k, k)
+            col_kind = COLLIDER_SPHERE
+        elif card_idx == SPAWN_CARD_PLANE:
+            # The reference-grid primitive (36 m span) scaled to a SPAWN_PLANE_SIZE_M square floor.
+            pos = Vec3(0.0, 0.0, 0.0)
+            var k = SPAWN_PLANE_SIZE_M / Float32(36.0)
+            scl = Vec3(k, 1.0, k)
+            col_kind = COLLIDER_BOX
+            col_he = Vec3(SPAWN_PLANE_SIZE_M * Float32(0.5), Float32(0.02), SPAWN_PLANE_SIZE_M * Float32(0.5))
+        elif card_idx == SPAWN_CARD_SUN:
+            pos = Vec3(0.0, 6.0, 0.0)
+        var lt = LocalTransform(pos, rot, scl)
         var gt = GlobalTransform.from_local(lt)
         _ = self.app.world.insert[LocalTransform](e, lt)
         _ = self.app.world.insert[GlobalTransform](e, gt.copy())
@@ -4828,12 +4901,27 @@ struct FlintStudioState(Movable):
             e,
             StudioEntityMetaComponent(
                 name=label + "_" + String(eid),
-                collider_kind=COLLIDER_BOX if card_idx == 1 else COLLIDER_NONE,
-                collider_half_extents=Vec3(0.5, 0.5, 0.5),
+                collider_kind=col_kind,
+                collider_half_extents=col_he,
             ),
         )
         _ = self.app.world.insert[StudioStyleComponent](e, StudioStyleComponent())
-        if card_idx == 1:
+        if card_idx == SPAWN_CARD_SPHERE or card_idx == SPAWN_CARD_PLANE:
+            var sphere = card_idx == SPAWN_CARD_SPHERE
+            # Logical showcase ids (1 = orb, 2 = grid) until the GPU primitives are registered.
+            var mesh_id = 1 if sphere else 2
+            if self.gpu_materials.uploaded:
+                mesh_id = self.gpu_materials.orb_mesh_id if sphere else self.gpu_materials.grid_mesh_id
+            _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(mesh_id, -1, True, True))
+            var tint = Vec3(0.82, 0.84, 0.88) if sphere else Vec3(0.42, 0.45, 0.50)
+            _ = self.app.world.insert[MaterialOverrideComponent](
+                e, MaterialOverrideComponent(-1, tint, Float32(0.38) if sphere else Float32(0.7), Float32(0.10) if sphere else Float32(0.02), Vec3(), True)
+            )
+            self._apply_collider_and_rb(e, col_kind, col_he, Float32(0.0), Float32(0.32), Float32(0.55), Vec3(), Vec3())
+        elif card_idx == SPAWN_CARD_SUN:
+            # A directional sun: the render plugin takes the sun from the first enabled EnvironmentComponent.
+            _ = self.app.world.insert[EnvironmentComponent](e, EnvironmentComponent())
+        if card_idx == SPAWN_CARD_CUBE:
             _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(0, -1, True, True))
             _ = self.app.world.insert[MaterialOverrideComponent](
                 e, MaterialOverrideComponent(-1, Vec3(0.82, 0.84, 0.88), Float32(0.38), Float32(0.10), Vec3(), True)
@@ -4872,13 +4960,79 @@ struct FlintStudioState(Movable):
         self.push_toast("Spawned " + label, 0, 2.0)
         return eid
 
+    def spawn_prefab_from_palette(mut self) -> Bool:
+        """Quick Spawn "Prefab": instantiates the last-used `.flprefab`, else opens the asset palette
+        filtered to prefabs so the user picks one."""
+        if self.last_prefab_entry.byte_length() > 0:
+            for i in range(len(self.asset_browser_entries)):
+                if self.asset_browser_entries[i] == self.last_prefab_entry:
+                    var last = self.last_prefab_entry
+                    return self.activate_asset_entry(last) >= 0
+        var any_prefab = False
+        for i in range(len(self.asset_browser_entries)):
+            if Self._ascii_lower(self.asset_browser_entries[i]).endswith(".flprefab"):
+                any_prefab = True
+                break
+        if not any_prefab:
+            self.push_toast("No .flprefab assets in this project", 1, 2.5)
+            return False
+        self.open_command_palette(PALETTE_ALL, "#.flprefab")
+        return True
+
+    def package_project_with_profiles(mut self) -> Bool:
+        """Runs `tools/flint.sh studio --build-profiles` in the project (Build menu and palette)."""
+        var launcher = _resolve_flint_launcher_path()
+        var proj = self.project_root if self.project_root.byte_length() > 0 else env_value("FLINT_STUDIO_PROJECT")
+        if launcher.byte_length() == 0 or proj.byte_length() == 0:
+            self.push_toast("Could not locate tools/flint.sh or project", 2, 3.5)
+            return False
+        _ = make_dirs(proj + "/build")
+        var args = List[String]()
+        args.append("/bin/bash")
+        args.append(launcher)
+        args.append("studio")
+        args.append("--build-profiles")
+        var rc = run_process_redirected(args, cwd=proj, log_path=proj + "/build/package.log")
+        var ok = rc == Int32(0)
+        self.push_toast("Profile package complete" if ok else "Profile package failed (see build/package.log)", 0 if ok else 2, 3.5)
+        return ok
+
+    def dock_panel_shown(self, panel_name: String) -> Bool:
+        """True when `panel_name` is the active tab of a non-collapsed dock node."""
+        var info = self.dock.find_panel(panel_name)
+        if info[0] < 0 or info[0] >= len(self.dock.nodes):
+            return False
+        return info[2] and not self.dock.is_node_collapsed(info[0])
+
+    def toggle_dock_panel(mut self, panel_name: String) -> Bool:
+        """Shows `panel_name`, or hides it when it is already showing (switches its tab group back to
+        a sibling tab, or collapses a single-tab group). Returns whether the panel is now shown."""
+        if not self.dock_panel_shown(panel_name):
+            _ = WorkspacePresetManager.ensure_panel_visible(self.dock, panel_name)
+            return self.dock_panel_shown(panel_name)
+        var nid = self.dock.find_panel(panel_name)[0]
+        if self.dock.nodes[nid].kind != DOCK_TABS:
+            return True
+        var sibling = String("")
+        for t in range(len(self.dock.nodes[nid].tabs)):
+            if self.dock.nodes[nid].tabs[t] != panel_name:
+                sibling = self.dock.nodes[nid].tabs[t]
+                break
+        if sibling.byte_length() > 0:
+            _ = self.dock.activate_tab(sibling)
+        else:
+            _ = self.dock.toggle_node_collapsed(nid)
+        return False
+
     # ---- Editor Input ----
 
     def handle_command_menu(mut self, inp: InputState, width: Int, height: Int) -> Bool:
         if self.ui_ctx.modal_depth > 0 or self.ui_ctx.had_modal_prev_frame or self.command_palette.is_open:
             self.menu.bar.group = -1
+            self.flush_menu_message()
             return False
         self.menu.poll()
+        self.flush_menu_message()  # tool launch / exit status from `SceneMenu.poll`
         # The menu bar is drawn into the scaled `ui_ctx` list, so lay it out and hit-test it in logical pixels.
         var ui_s = self.effective_ui_scale()
         var lw = Float32(width) / ui_s
@@ -4903,13 +5057,21 @@ struct FlintStudioState(Movable):
         bar.groups[0].items[0].enabled = not in_play
         bar.groups[0].items[1].enabled = not in_play
         bar.groups[0].items[2].enabled = not in_play
+        # Open, Save As and Recover do nothing during Play: show them disabled.
+        for fi in range(3, len(bar.groups[0].items)):
+            bar.groups[0].items[fi].enabled = not in_play
         bar.groups[1].items[0].enabled = (not in_play) and Bool(self.undo_stack)
         bar.groups[1].items[1].enabled = (not in_play) and Bool(self.redo_stack)
         bar.groups[1].items[2].enabled = (not in_play) and self.selected_count() > 0
         bar.groups[1].items[3].enabled = (not in_play) and self.selected_count() > 0
+        if len(bar.groups[1].items) > 5:
+            bar.groups[1].items[4].enabled = not in_play  # Select all
+            bar.groups[1].items[5].enabled = (not in_play) and self.selected_count() == 1  # Rename
         bar.groups[2].items[3].title = "Disable grid snapping" if self.snap_enabled else "Enable grid snapping"
         bar.groups[2].items[4].title = "Gizmo: Local Space" if self.gizmo_local_space else "Gizmo: World Space"
         bar.groups[2].items[5].enabled = self.selected_count() > 0
+        if len(bar.groups[2].items) > 6:
+            bar.groups[2].items[6].title = "Pivot: Active Entity" if self.pivot_mode == PIVOT_ACTIVE else "Pivot: Bounds Centre"
         bar.groups[3].items[0].title = "Resume simulation" if self.pie.mode==PIE_PAUSED else "Play scene"
         bar.groups[3].items[0].enabled = self.pie.mode!=PIE_PLAYING
         bar.groups[3].items[1].enabled = self.pie.mode==PIE_PLAYING
@@ -4936,11 +5098,11 @@ struct FlintStudioState(Movable):
             return False
         var action = bar.input(inp, Int(inp.last_mouse_x / ui_s), Int(inp.last_mouse_y / ui_s))
         if action==scene_menu.SAVE and not in_play:
-            var ok = self.save_scene_file()
-            self.menu.message = "Scene saved" if ok else "Could not save scene"
+            _ = self.save_scene_file()  # toasts its own result
         elif action==scene_menu.LOAD and not in_play:
-            var ok = self.request_load_scene()
-            self.menu.message = "Scene loaded" if ok else ("" if self.confirm_modal_open else "Could not load scene")
+            # "Revert to saved": load failures toast inside `load_scene_file`.
+            if self.request_load_scene():
+                self.menu.message = "Reverted to the saved scene"
         elif action==scene_menu.NEW_SCENE and not in_play:
             _ = self.new_scene(force=False)
         elif action==scene_menu.OPEN_SCENE and not in_play:
@@ -4955,7 +5117,7 @@ struct FlintStudioState(Movable):
         elif action==scene_menu.SELECT_ALL and not in_play:
             self.select_all_entities()
         elif action==scene_menu.RENAME and not in_play:
-            self.begin_rename_selected()
+            _ = self.begin_rename_selected()
         elif action==scene_menu.PIVOT_MODE:
             self.toggle_pivot_mode()
         elif action==scene_menu.WINDOW_RESET_LAYOUT:
@@ -5039,30 +5201,23 @@ struct FlintStudioState(Movable):
         elif action == scene_menu.PACKAGE and not in_play:
             var pkg_res = self.package_project()
             if pkg_res[0]:
-                self.menu.message = "Packaged -> " + pkg_res[1]
                 self.push_toast("Packaged -> " + pkg_res[1], 0, 3.0)
             else:
-                self.menu.message = pkg_res[1]
                 self.push_toast(pkg_res[1], 2, 4.0)
         elif action == scene_menu.PACKAGE_PROFILES and not in_play:
-            var launcher = _resolve_flint_launcher_path()
-            var proj = self.project_root if self.project_root.byte_length() > 0 else env_value("FLINT_STUDIO_PROJECT")
-            if launcher.byte_length() == 0 or proj.byte_length() == 0:
-                var msg = String("Could not locate tools/flint.sh or project")
-                self.menu.message = msg
-                self.push_toast(msg, 2, 3.5)
-            else:
-                _ = make_dirs(proj + "/build")
-                var args = List[String]()
-                args.append("/bin/bash")
-                args.append(launcher)
-                args.append("studio")
-                args.append("--build-profiles")
-                var rc = run_process_redirected(args, cwd=proj, log_path=proj + "/build/package.log")
-                var msg = String("Profile package complete") if rc == Int32(0) else String("Profile package failed (see build/package.log)")
-                self.menu.message = msg
-                self.push_toast(msg, 0 if rc == Int32(0) else 2, 3.5)
+            _ = self.package_project_with_profiles()
+        self.flush_menu_message()
         return action>=0
+
+    def flush_menu_message(mut self):
+        """Shows `SceneMenu.message` (menu actions, tool launches and exits) as a toast + console line."""
+        if self.menu.message.byte_length() == 0:
+            return
+        var msg = self.menu.message
+        self.menu.message = ""
+        var low = Self._ascii_lower(msg)
+        var sev = 2 if (low.find("could not") >= 0 or low.find("failed") >= 0 or low.find("error") >= 0) else 0
+        self.push_toast(msg, sev, 3.0)
 
     def process_editor_input(mut self, input: InputState, dt: Float32) -> Bool:
         """Evaluates `InputMap` editor hotkeys (`W/E/R/X/F`, `Ctrl+Z`, `Ctrl+Shift+Z`/`Ctrl+Y`, `F5-F7`, `Ctrl+Q` quit)
@@ -5127,6 +5282,19 @@ struct FlintStudioState(Movable):
         )
         var in_play = self.pie.mode != PIE_STOPPED
 
+        # An armed key chord (`Alt+A ...`) owns the next key press: it resolves to a palette command
+        # (or cancels on Esc / an unknown key) and is swallowed so it never also fires a hotkey.
+        if self.key_chord_hud.active:
+            if kbd_captured:
+                self.key_chord_hud.cancel()
+            else:
+                var chord_key = studio_chord_key_label(input)
+                if chord_key.byte_length() > 0:
+                    var chord_cmd = self.key_chord_hud.resolve_key(chord_key)
+                    if chord_cmd >= 0:
+                        _ = self.execute_palette_command(chord_cmd)
+                    return True
+
         if not kbd_captured:
             if alt_down and input.key_pressed(65):  # Alt+A: Toggle Agent Mission Control
                 _ = self.execute_palette_command(PAL_CMD_AGENT_TOGGLE_PANEL)
@@ -5164,8 +5332,6 @@ struct FlintStudioState(Movable):
                     _ = self.apply_workspace_preset(WORKSPACE_LOOKDEV)
                 elif input.key_pressed(53):
                     _ = self.apply_workspace_preset(WORKSPACE_PLAY)
-            elif input.key_pressed(UI_KEY_ESCAPE) and self.key_chord_hud.active:
-                self.key_chord_hud.cancel()
 
         if not kbd_captured:
             if in_play:
@@ -5225,9 +5391,17 @@ struct FlintStudioState(Movable):
                 if self.input_map.just_pressed("editor_help"):
                     self.help_open = True
                 if self.input_map.just_pressed("editor_rename"):
-                    self.begin_rename_selected()
+                    _ = self.begin_rename_selected()
                 if self.input_map.just_pressed("editor_select_all"):
                     self.select_all_entities()
+                # Esc in Edit clears the selection, unless it is cancelling a gizmo drag or marquee.
+                if (
+                    self.input_map.just_pressed("editor_clear_selection")
+                    and not self.gz_dragging
+                    and not self.marquee_active
+                    and self.selected_count() > 0
+                ):
+                    self.clear_selection()
                 if self.input_map.just_pressed("build_reload"):
                     var ok_so = self.reload_gameplay_plugin()
                     if ok_so:
@@ -5297,7 +5471,8 @@ struct FlintStudioState(Movable):
                 self.push_toast("Grid snap on" if self.snap_enabled else "Grid snap off", 0, 1.2)
 
         if editor_cam_controllable:
-            var orb = self.input_map.axis_2d("cam_orbit") if not (kbd_captured or hier_hover) else (Float32(0.0), Float32(0.0))
+            var arrows_free = not (kbd_captured or hier_hover or self.arrows_drive_nudge())
+            var orb = self.input_map.axis_2d("cam_orbit") if arrows_free else (Float32(0.0), Float32(0.0))
             var dyaw = orb[0] * Float32(80.0) * dt
             var dpitch = orb[1] * Float32(65.0) * dt
             var fly_move = Vec3()
@@ -5816,11 +5991,20 @@ struct FlintStudioState(Movable):
         one.append(49)
         _ = write_bytes(dst, one)
 
-    def begin_rename_selected(mut self):
-        if self.selected_entity_id < 0:
-            return
+    def begin_rename_selected(mut self) -> Bool:
+        """F2 / Rename: focuses the Inspector name field. Only one entity can be renamed at a time; a
+        multi-selection (whose Inspector shows bulk edits, no name field) gets a hint instead of a
+        focus request nobody would consume."""
+        if self.selected_count() > 1:
+            self.rename_focus_requested = False
+            self.push_toast("Rename works on one entity: select just one", 1, 2.2)
+            return False
+        if not self.is_alive_id(self.selected_entity_id):
+            self.rename_focus_requested = False
+            return False
         _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_INSPECTOR)
         self.rename_focus_requested = True
+        return True
 
     def autosave_path(self) -> String:
         """`<project>/.flint/autosave/<scene>.autosave.flscnb`: next to the project, never the user's file."""
@@ -6671,6 +6855,7 @@ struct FlintStudioState(Movable):
                 if si == 0 and not self.app.world.has[PrefabInstanceComponent](se):
                     _ = self.app.world.insert[PrefabInstanceComponent](se, PrefabInstanceComponent(pf.name, pf_ref.copy(), 0))
             var root_eid = Int(spawned[0].index)
+            self.last_prefab_entry = entry_rel
             self.select_entity(root_eid)
             self._sync_ecs_and_physics()
             self._record_world_tx(
@@ -7630,20 +7815,17 @@ struct FlintStudioState(Movable):
             updated.scale.y if isfinite(updated.scale.y) else Float32(1.0),
             updated.scale.z if isfinite(updated.scale.z) else Float32(1.0),
         )
-        var prev_vis = self.entities[entity_id].visible if (entity_id >= 0 and entity_id < len(self.entities)) else True
-        var prev_en = self.entities[entity_id].enabled if (entity_id >= 0 and entity_id < len(self.entities)) else True
         var prev_trig = self.entities[entity_id].is_trigger if (entity_id >= 0 and entity_id < len(self.entities)) else False
+        # `enabled` (gameplay/colliders, on the meta component) and `visible` (editor visibility) are
+        # independent; the mesh only draws when the entity is both.
         var eff_en = updated.enabled
-        if updated.enabled != prev_en:
-            eff_en = updated.enabled
-        elif updated.visible != prev_vis:
-            eff_en = updated.visible
+        var eff_vis = updated.visible and updated.enabled
 
         _ = self.app.world.insert[LocalTransform](
             e, LocalTransform(safe_tr, safe_rot, safe_scl)
         )
         if self.app.world.has[MeshRendererComponent](e) or updated.mesh_id >= 0:
-            var new_mr = MeshRendererComponent(updated.mesh_id, updated.material_id, True, eff_en)
+            var new_mr = MeshRendererComponent(updated.mesh_id, updated.material_id, True, eff_vis)
             var old_mr = self.app.world.get_ptr[MeshRendererComponent](e)
             if old_mr:
                 new_mr.mesh_ref = old_mr.value()[].mesh_ref.copy()
@@ -7939,6 +8121,10 @@ struct FlintStudioState(Movable):
         var json_text = String(unsafe_from_utf8=raw)
         var ok = self.input_map.load_json(json_text)
         if ok:
+            # Files saved before `strict_modifiers` existed load as lenient; the editor layer is always strict.
+            for ci in range(len(self.input_map.contexts)):
+                if self.input_map.contexts[ci].name == "StudioEditor":
+                    self.input_map.contexts[ci].strict_modifiers = True
             self.cancel_input_rebind()
             self.push_toast("Loaded InputMap", 0, 2.0)
         else:
@@ -8156,13 +8342,36 @@ struct FlintStudioState(Movable):
                 out.append(i)
         return out^
 
-    def marquee_select(mut self, x0: Float32, y0: Float32, x1: Float32, y1: Float32, additive: Bool) -> Int:
+    def marquee_select(
+        mut self, x0: Float32, y0: Float32, x1: Float32, y1: Float32, additive: Bool, toggle: Bool = False
+    ) -> Int:
+        """Box select. Plain replaces the selection, `additive` (Shift) adds every hit, `toggle` (Ctrl)
+        flips each hit in or out."""
         var hits = self.entities_in_screen_rect(x0, y0, x1, y1)
-        if not additive:
+        if not additive and not toggle:
             self.clear_selection()
         for k in range(len(hits)):
-            self.select_entity(hits[k], multi_select=True)
+            self.select_entity(hits[k], multi_select=True, add_only=not toggle)
         return len(hits)
+
+    def click_select(mut self, entity_id: Int, hit: Bool, additive: Bool, toggle: Bool):
+        """Viewport click: plain replaces (or clears on a miss), Shift (`additive`) adds, Ctrl (`toggle`)
+        flips the clicked entity. A modified click on empty space keeps the selection."""
+        if hit and self.is_alive_id(entity_id):
+            self.select_entity(entity_id, multi_select=additive or toggle, add_only=additive and not toggle)
+        elif not (additive or toggle):
+            self.clear_selection()
+
+    def arrows_drive_nudge(self) -> Bool:
+        """The arrow keys have one owner: they nudge the selection while the pointer is over the viewport
+        and something is selected, and orbit the camera otherwise."""
+        return (
+            self.viewport_hovered
+            and self.selected_count() > 0
+            and not self.gz_dragging
+            and self.pie.mode == PIE_STOPPED
+            and not self.wants_keyboard()
+        )
 
     def nudge_selection(mut self, dir_x: Int, dir_y: Int, dir_z: Int) -> Bool:
         """Arrow-key nudge by one grid step. X/Z follow the camera's heading (snapped to the nearest
@@ -10388,17 +10597,17 @@ def _emit_studio_modals(mut studio: FlintStudioState):
             lines.append("X                  Local / World gizmo space")
             lines.append("G                  Grid snap on/off")
             lines.append("F                  Frame selection")
-            lines.append("Esc / right-click  Cancel a gizmo drag")
-            lines.append("Click / drag       Select / marquee select (Shift or Ctrl adds)")
-            lines.append("Arrows             Nudge selection; walk the Hierarchy when hovered")
+            lines.append("Esc / right-click  Cancel a gizmo drag (Esc alone clears the selection)")
+            lines.append("Click / drag       Select / marquee (Shift adds, Ctrl toggles)")
+            lines.append("Arrows             Nudge selection over the viewport, else orbit; walk the Hierarchy")
             lines.append("Wheel / MMB drag   Dolly / pan     Alt+LMB orbit     RMB+WASDQE fly")
             lines.append("Ctrl+Z / Ctrl+Y    Undo / Redo")
             lines.append("Ctrl+D  Ctrl+C  Ctrl+V  Del   Duplicate  Copy  Paste  Delete")
             lines.append("Ctrl+A / F2        Select all / Rename")
-            lines.append("Ctrl+S  Ctrl+Shift+S  Ctrl+O  Ctrl+Shift+O  Ctrl+N   Save / Save As / Load / Open / New")
+            lines.append("Ctrl+S  Ctrl+Shift+S  Ctrl+O  Ctrl+N   Save / Save As / Open / New")
             lines.append("F5 / F6 / F7 / Shift+F5   Play / Pause / Step / Stop")
             lines.append("Ctrl+B             Reload gameplay .so")
-            lines.append("Ctrl+K             Command palette        F1  This list")
+            lines.append("Ctrl+K             Command palette        F1  This list      F8  Source editor")
             for i in range(len(lines)):
                 studio.ui_ctx.label(lines[i], mc if (welcome and i > 6) else studio.studio_theme.text_secondary)
             if studio.ui_ctx.button("help_close", "Got it" if welcome else "Close", 96.0, 26.0):
@@ -10452,6 +10661,9 @@ def emit_studio_ui_draw_list(
         scaled_input.delta_x = input.delta_x / ui_sc
         scaled_input.delta_y = input.delta_y / ui_sc
     studio.ui_ctx.begin_frame(scaled_input, sw, sh, dt)
+    # The command palette is drawn last but is modal: panels drawn before it must not react to the
+    # pointer under its scrim (it reads the mouse directly, so it is unaffected).
+    studio.ui_ctx.pointer_blocked = studio.command_palette.is_open
     if studio.ui_ctx.mouse_pressed_l or studio.ui_ctx.mouse_released_l:
         studio.ui_edit_seq += 1
         studio._edit_focus_id = UInt64(0)  # a click ends any typing interaction
@@ -10975,8 +11187,7 @@ def emit_studio_ui_draw_list(
             if studio.ui_ctx.text_input("insp_name", cur.name, name_w, "Entity Name"):
                 changed = True
             if studio.ui_ctx.toggle_switch("ent_enabled", "Enabled (#" + String(eid) + ")", cur.enabled, w=name_w):
-                cur.visible = cur.enabled
-                changed = True
+                changed = True  # Enabled and Visible are independent switches
             var par_lbl = (
                 studio.entities[cur.parent_id].name
                 if (cur.parent_id >= 0 and cur.parent_id < len(studio.entities) and studio.entities[cur.parent_id].alive)
@@ -11051,7 +11262,6 @@ def emit_studio_ui_draw_list(
                 if studio.ui_ctx.slider_float_v2("phy_mass", "Mass", cur.mass, Float32(0.0), Float32(100.0), w=mat_w):
                     changed = True
                 if studio.ui_ctx.toggle_switch("ent_vis", "Visible", cur.visible, w=mat_w):
-                    cur.enabled = cur.visible
                     changed = True
                 studio.ui_ctx.tree_pop()
 

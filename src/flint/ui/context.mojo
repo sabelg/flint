@@ -375,6 +375,9 @@ struct UiContext(Movable):
     var modal_focusables: List[UInt64]
     var modal_depth: Int
     var had_modal_prev_frame: Bool
+    # Set by the host while an overlay drawn later in the frame (e.g. a command palette) owns the
+    # pointer: widgets outside a modal then ignore hover and clicks, exactly as under a modal scrim.
+    var pointer_blocked: Bool
     var active_modal_id: UInt64
     var drag_drop: DragDropPayload
     var culled_items_this_frame: Int
@@ -485,6 +488,7 @@ struct UiContext(Movable):
         self.modal_focusables = List[UInt64]()
         self.modal_depth = 0
         self.had_modal_prev_frame = False
+        self.pointer_blocked = False
         self.active_modal_id = 0
         self.drag_drop = DragDropPayload()
         self.culled_items_this_frame = 0
@@ -927,7 +931,7 @@ struct UiContext(Movable):
 
     @always_inline
     def _blocked_by_modal(self) -> Bool:
-        return self.had_modal_prev_frame and self.modal_depth == 0
+        return (self.had_modal_prev_frame or self.pointer_blocked) and self.modal_depth == 0
 
     @always_inline
     def _pointer_in_scroll_clip(self) -> Bool:

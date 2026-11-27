@@ -646,12 +646,13 @@ def _run_studio() raises -> Int:
         studio.agent_runtime.acp.configure_studio_mcp_socket(exe_path, mcp_sock.socket_path)
     var mcp_pool = JobPool()
     _ = mcp_pool.start(2)
-    var pending_pick_ctrls = List[Tuple[UInt64, Bool]]()
+    var pending_pick_ctrls = List[Tuple[UInt64, Int]]()  # (pick request id, bit0 Shift-add | bit1 Ctrl-toggle)
     # Left press on empty viewport space: a click picks on release, a drag becomes a marquee.
     var press_pending = False
     var press_x = Float32(0.0)
     var press_y = Float32(0.0)
     var press_additive = False
+    var press_toggle = False
     var resume_swapchain = False
     var t_last = get_time()
 
@@ -733,24 +734,22 @@ def _run_studio() raises -> Int:
                 var entry = harvested.value()
                 var h_req_id = entry[0]
                 var pres = entry[1]
-                var pick_ctrl = False
-                var kept = List[Tuple[UInt64, Bool]](capacity=len(pending_pick_ctrls))
+                var pick_mods = 0  # bit 0: Shift adds, bit 1: Ctrl toggles
+                var kept = List[Tuple[UInt64, Int]](capacity=len(pending_pick_ctrls))
                 for pi in range(len(pending_pick_ctrls)):
                     if pending_pick_ctrls[pi][0] == h_req_id:
-                        pick_ctrl = pending_pick_ctrls[pi][1]
+                        pick_mods = pending_pick_ctrls[pi][1]
                     else:
                         kept.append(pending_pick_ctrls[pi])
                 pending_pick_ctrls = kept^
-                if (
+                var pick_ok = (
                     pres.hit
                     and pres.entity_id >= 0
                     and studio.is_alive_id(pres.entity_id)
                     and (pres.entity_bits == 0 or studio.resolve_entity(pres.entity_id).to_bits() == pres.entity_bits)
                     and not studio.is_entity_locked(pres.entity_id)
-                ):
-                    studio.select_entity(pres.entity_id, multi_select=pick_ctrl)
-                elif not pick_ctrl:
-                    studio.clear_selection()
+                )
+                studio.click_select(pres.entity_id, pick_ok, (pick_mods & 1) != 0, (pick_mods & 2) != 0)
 
         if studio.handle_command_menu(frame_input, out_w, out_h):
             # Record held keys without sending menu gestures to the scene.
@@ -801,7 +800,8 @@ def _run_studio() raises -> Int:
                 press_pending = True
                 press_x = mx
                 press_y = my
-                press_additive = ctrl_down or shift_down
+                press_additive = shift_down and not ctrl_down
+                press_toggle = ctrl_down
 
         if studio.gz_dragging and frame_input.mouse_down(0):
             _ = studio.gizmo_drag_update(mx, my)
@@ -820,33 +820,31 @@ def _run_studio() raises -> Int:
                 studio.gizmo_drag_end()
             if press_pending:
                 if studio.marquee_active:
-                    _ = studio.marquee_select(press_x, press_y, mx, my, press_additive)
+                    _ = studio.marquee_select(press_x, press_y, mx, my, press_additive, toggle=press_toggle)
                 else:
                     # Click (no drag): pick what is under the release point.
                     var r_rel = studio.app.resources.get_ptr[ScalableRenderer]()
                     if r_rel and r_rel.value()[unsafe_offset=0].uses_vulkan():
                         if picker.has_pending_pick:
                             var stale_id = picker.queued_request_id
-                            var kept = List[Tuple[UInt64, Bool]](capacity=len(pending_pick_ctrls))
+                            var kept = List[Tuple[UInt64, Int]](capacity=len(pending_pick_ctrls))
                             for pi in range(len(pending_pick_ctrls)):
                                 if pending_pick_ctrls[pi][0] != stale_id:
                                     kept.append(pending_pick_ctrls[pi])
                             pending_pick_ctrls = kept^
                         var req_id = picker.request_pick(Int(press_x), Int(press_y))
-                        pending_pick_ctrls.append((req_id, press_additive))
+                        pending_pick_ctrls.append((req_id, (1 if press_additive else 0) | (2 if press_toggle else 0)))
                     else:
                         # Software renderer: pick with the CPU scene raycast instead of the GPU id buffer.
                         var ray = vxf.ray_phys(press_x, press_y, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
                         var hit = studio.raycast_scene(ray.origin, ray.dir)
-                        if hit.hit and studio.is_alive_id(hit.entity_id) and not studio.is_entity_locked(hit.entity_id):
-                            studio.select_entity(hit.entity_id, multi_select=press_additive)
-                        elif not press_additive:
-                            studio.clear_selection()
+                        var hit_ok = hit.hit and studio.is_alive_id(hit.entity_id) and not studio.is_entity_locked(hit.entity_id)
+                        studio.click_select(hit.entity_id, hit_ok, press_additive, press_toggle)
                 press_pending = False
                 studio.marquee_active = False
 
         # Arrow-key nudges (one grid step) when the viewport has focus and no text field does.
-        if studio.viewport_hovered and not studio.wants_keyboard() and studio.selected_count() > 0 and not studio.gz_dragging:
+        if studio.arrows_drive_nudge():  # the same test that stops the arrows orbiting the camera
             var nx = (1 if frame_input.key_pressed(262) else 0) - (1 if frame_input.key_pressed(263) else 0)
             var nz = (1 if frame_input.key_pressed(265) else 0) - (1 if frame_input.key_pressed(264) else 0)
             var ny = (1 if frame_input.key_pressed(266) else 0) - (1 if frame_input.key_pressed(267) else 0)
