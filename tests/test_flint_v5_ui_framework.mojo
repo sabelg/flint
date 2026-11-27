@@ -489,6 +489,39 @@ def test_scroll_views() raises:
     var inner_id = hash_ui_id(outer_id, "inner")
     assert_equal(ui2.state_map[outer_id].scroll_y, Float32(0.0))
     assert_true(ui2.state_map[inner_id].scroll_y > Float32(0.0))
+
+    # The wheel lands in the same frame's layout (rects cached this frame are clickable next
+    # frame), and also when it arrives on the pointer's first hovered frame.
+    var ui3 = UiContext()
+    var first_y = List[Float32]()
+    for f in range(4):
+        inp.begin_frame()
+        # Frame 0 lays the views out with the pointer away; frame 1 brings it in with the wheel.
+        if f > 0:
+            inp.move_mouse(60.0, 60.0)
+        else:
+            inp.move_mouse(700.0, 500.0)
+        _frame(ui3, inp)
+        if f == 1 or f == 2:
+            ui3.mouse_wheel = -1.0
+        ui3.begin_scroll_view("outer", 400.0, 300.0)
+        ui3.begin_scroll_view("inner", 300.0, 200.0)
+        for i in range(30):
+            ui3.label("in " + String(i))
+            if i == 0:
+                first_y.append(ui3.last_item_rect.y)
+        ui3.end_scroll_view()
+        ui3.end_scroll_view()
+        ui3.end_frame()
+    var o3 = ui3.widget_id("outer")
+    var i3 = hash_ui_id(o3, "inner")
+    assert_equal(ui3.state_map[o3].scroll_y, Float32(0.0))
+    assert_equal(ui3.state_map[i3].scroll_y, Float32(72.0))
+    # Each wheel frame moves its own rows (cold pointer on frame 1, warm on frame 2); frame 3
+    # (no wheel) matches frame 2.
+    assert_true(abs(first_y[1] - (first_y[0] - Float32(36.0))) < Float32(0.5))
+    assert_true(abs(first_y[2] - (first_y[1] - Float32(36.0))) < Float32(0.5))
+    assert_true(abs(first_y[3] - first_y[2]) < Float32(0.5))
     print("      PASS")
 
 

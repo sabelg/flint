@@ -441,6 +441,10 @@ struct UiContext(Movable):
     var _popup_swallowed_press: Bool
     var _popup_combo_owner: UInt64
     var _wheel_consumed: Bool
+    var _wheel_target: UInt64
+    var _wheel_target_next: UInt64
+    var _wheel_tentative: UInt64
+    var _wheel_tentative_sy: Float32
 
     def __init__(out self, preset_hud: Bool = False):
         self.draw_list = UiDrawList()
@@ -563,6 +567,10 @@ struct UiContext(Movable):
         self._popup_swallowed_press = False
         self._popup_combo_owner = 0
         self._wheel_consumed = False
+        self._wheel_target = 0
+        self._wheel_target_next = 0
+        self._wheel_tentative = 0
+        self._wheel_tentative_sy = 0.0
 
     def set_studio_theme(mut self, st: StudioTheme):
         """Switches the active Studio v2 design-system theme (syncs reduced-motion preference and
@@ -645,6 +653,9 @@ struct UiContext(Movable):
         self._popup_consumed_rect = RectF()
         self._popup_swallowed_press = False
         self._wheel_consumed = False
+        self._wheel_target = self._wheel_target_next
+        self._wheel_target_next = 0
+        self._wheel_tentative = 0
         self._sweep_text_cache()
 
         var next_sw = max(Float32(1.0), screen_w if isfinite(screen_w) else Float32(1280.0))
@@ -1700,8 +1711,34 @@ struct UiContext(Movable):
             if self.hovered_id == 0:
                 self.hovered_id = wid
                 self.hovered_rect = self._clip_hovered_rect(rect)
-            # The wheel goes to the innermost hovered scroll view: a nested view starts after its
-            # parent but ends before it, so the scroll offset is applied in `end_scroll_view`.
+            # The wheel goes to the innermost hovered scroll view, applied here (before layout) so
+            # this frame's rects already reflect it. A nested view begins after its parent, so the
+            # last hovered view begun is the innermost: last frame's pick (`_wheel_target`) takes
+            # the wheel outright while it is still under the pointer; otherwise each hovered view
+            # takes it tentatively and hands it on (restoring its offset) to a deeper one.
+            self._wheel_target_next = wid
+            if self.mouse_wheel != Float32(0.0) and isfinite(self.mouse_wheel) and not self._wheel_consumed:
+                var definitive = wid == self._wheel_target
+                var wait_for_target = False
+                if not definitive and self._wheel_target != 0:
+                    var tr = self.cached_rects.get(self._wheel_target)
+                    wait_for_target = Bool(tr) and tr.value().contains(self.mouse_x, self.mouse_y)
+                if definitive or not wait_for_target:
+                    if self._wheel_tentative != 0 and self._wheel_tentative != wid:
+                        var prev = self.state_map.get(self._wheel_tentative)
+                        if prev:
+                            var pst = prev.value().copy()
+                            pst.scroll_y = self._wheel_tentative_sy
+                            self.state_map[self._wheel_tentative] = pst^
+                    var sy0 = st.scroll_y if isfinite(st.scroll_y) else Float32(0.0)
+                    st.scroll_y = max(Float32(0.0), min(st.scroll_max_y, sy0 - self.mouse_wheel * Float32(36.0)))
+                    self.state_map[wid] = st.copy()
+                    if definitive:
+                        self._wheel_consumed = True
+                        self._wheel_tentative = 0
+                    else:
+                        self._wheel_tentative = wid
+                        self._wheel_tentative_sy = sy0
 
         self.draw_list.add_rect(rect.x, rect.y, rect.w, rect.h, self.theme.bg_window, self.theme.corner_radius, 1.0, self.theme.border)
         self.draw_list.push_clip_f(rect.x, rect.y, rect.right(), rect.bottom())
@@ -1761,6 +1798,7 @@ struct UiContext(Movable):
         var cur_sy = st.scroll_y if isfinite(st.scroll_y) else Float32(0.0)
         if (
             not self._wheel_consumed
+            and self._wheel_tentative == 0
             and self.mouse_wheel != Float32(0.0)
             and isfinite(self.mouse_wheel)
             and not self._blocked_by_modal()
