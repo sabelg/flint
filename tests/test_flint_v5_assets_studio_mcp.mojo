@@ -90,6 +90,7 @@ from flint.core.math import Quat, Vec2, Vec3
 from flint.core.serial import BlobReader, BlobWriter
 from flint.core.transform import Mat4
 from flint.devtools.mcp_v2 import (
+    MCP_GATE_AUTO,
     FlintMcpUnixListener,
     McpServerV2,
     McpUnixSessionClient,
@@ -1347,7 +1348,12 @@ def _large_mcp_worker(ctx_addr: Int, job_idx: Int):
             var small_buf = Array[Int32, 1](fill=16384)
             _ = external_call["setsockopt", Int32](Int32(cli.fd), Int32(1), Int32(7), Pointer(to=small_buf[0]), UInt32(4))
             ctx.ready.store(1)
-            if cli.send_raw_request(ctx.req_payload, timeout_ms=4000):
+            # Socket clients must `initialize` before any tool call.
+            var init_ok = cli.send_raw_request(
+                '{"jsonrpc":"2.0","id":998,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"big-xfer"}}}',
+                timeout_ms=4000,
+            ) and cli.recv_response_blocking(timeout_ms=4000)[0]
+            if init_ok and cli.send_raw_request(ctx.req_payload, timeout_ms=4000):
                 var got = cli.recv_response_blocking(timeout_ms=4000)
                 ctx.resp_ok = got[0]
                 ctx.resp_text = got[1]
@@ -1620,11 +1626,11 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     # 9. Verify `auth_token` enforcement on `McpServerV2`
     var auth_mcp = McpServerV2(workspace_root=tmp_root, auth_token="flint-secret-token-42")
     var r_unauth = auth_mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":20,"method":"tools/list","params":{}}', studio, assets, pool)
-    _assert(r_unauth.find("-32600") >= 0, "unauthenticated tools/list must fail with -32600")
+    _assert(r_unauth.find("-32001") >= 0, "unauthenticated tools/list must fail with -32001 (unauthorized)")
     var r_bad_tok = auth_mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":21,"method":"initialize","params":{"auth_token":"wrong-token"}}', studio, assets, pool
     )
-    _assert(r_bad_tok.find("-32600") >= 0, "wrong auth_token initialize must fail with -32600")
+    _assert(r_bad_tok.find("-32001") >= 0, "wrong auth_token initialize must fail with -32001 (unauthorized)")
     var r_good_tok = auth_mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":22,"method":"initialize","params":{"auth_token":"flint-secret-token-42"}}', studio, assets, pool
     )
@@ -1680,6 +1686,25 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     var got1 = client.recv_response_blocking(timeout_ms=500)
     _assert(got1[0] and got1[1].find('"id":101') >= 0, "Unix socket Content-Length ping round-trip failed")
 
+    # Before `initialize` a socket client may only ping: tool calls are refused with -32002.
+    _assert(
+        client.send_raw_request('{"jsonrpc":"2.0","id":1011,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{}}}'),
+        "send pre-init tools/call failed",
+    )
+    _ = listener.poll_once(mcp, studio, assets, pool)
+    var got_pre = client.recv_response_blocking(timeout_ms=500)
+    _assert(got_pre[0] and got_pre[1].find("-32002") >= 0, "pre-initialize tools/call must be refused with -32002: " + got_pre[1])
+    _assert(
+        client.send_raw_request('{"jsonrpc":"2.0","id":1012,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"sock-test"}}}'),
+        "send socket initialize failed",
+    )
+    _ = listener.poll_once(mcp, studio, assets, pool)
+    var got_init = client.recv_response_blocking(timeout_ms=500)
+    _assert(
+        got_init[0] and got_init[1].find('"protocolVersion":"2025-06-18"') >= 0 and got_init[1].find('"listChanged":false') >= 0,
+        "socket initialize must negotiate 2025-06-18 and advertise listChanged:false: " + got_init[1],
+    )
+
     _assert(
         client.send_raw_request('{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{}}}'),
         "send 2nd request on persistent Unix socket failed",
@@ -1702,6 +1727,8 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     var small_srv_buf = Array[Int32, 1](fill=16384)
     _ = external_call["setsockopt", Int32](Int32(listener.listen_fd), Int32(1), Int32(7), Pointer(to=small_srv_buf[0]), UInt32(4))
 
+    # Socket clients start gated (`MCP_GATE_MUTATING`); this transfer test opts every client into AUTO.
+    mcp.set_gate_mode(MCP_GATE_AUTO)
     # Spawn a 2-way parallel test: job 0 = client send/recv (>300 KiB), job 1 = server poll loop!
     _run_large_mcp_pair(pool, listener, mcp, studio, assets, xfer_ctx)
     _assert(xfer_ctx.resp_ok, "> 256 KiB EAGAIN-safe JSON-RPC round-trip failed")
@@ -4346,6 +4373,22 @@ def test_p_mcp_v2_m1_assets_prefab_material_and_upload(tmp_root: String, mut poo
         mcp, studio, pool, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"asset.list","arguments":{}}}'
     )
     _assert(r_empty.find('\\"count\\":0') >= 0, "empty project asset.list must return count=0: " + r_empty)
+
+    # 2b. A source outside the workspace is refused until its directory is on the import allow-list.
+    var r_not_allowed = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"'
+        + ext
+        + '/ext_crate.glb","dest_path":"assets/models/ext_crate.glb"}}}',
+    )
+    _assert(
+        r_not_allowed.find('"isError":true') >= 0 and r_not_allowed.find("allow-list") >= 0
+        and file_size(proj + "/assets/models/ext_crate.glb") < 0,
+        "asset.import from a directory outside the workspace and allow-list must be refused: " + r_not_allowed,
+    )
+    mcp.allow_import_dir(ext)
 
     # 3. Boundary rejections: system file, traversal, corrupt payloads write ZERO bytes to disk
     var r_sys = _call_mcp(

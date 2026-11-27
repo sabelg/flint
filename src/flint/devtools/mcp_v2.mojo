@@ -43,7 +43,8 @@ from flint.audio.qoa import decode_qoa
 from flint.audio.server import AudioServer, BUS_SFX
 from flint.core.build_info import build_stamp
 from std.collections import Dict
-from flint.devtools.job_runner import JOB_SUCCEEDED, JobRunner
+from flint.devtools.safe_fs import SAFE_FS_MISSING, SAFE_FS_NOT_REGULAR, SAFE_FS_OK, SAFE_FS_TOO_LARGE, read_agent_file
+from flint.devtools.job_runner import JOB_KIND_COOK, JOB_KIND_TASK, JOB_SUCCEEDED, JobRunner
 from flint.devtools.problems import (
     DIAG_ERROR,
     DIAG_INFO,
@@ -86,6 +87,7 @@ from flint.render.render_world import ScalableRenderer
 from flint.render.simd_canvas import Camera3D, SimdCanvas, pack_argb
 from flint.scene.scene import Prefab, PrefabInstanceComponent, load_flprefab_bytes
 from flint.scene.transform_hierarchy import GlobalTransform, LocalTransform, PrevGlobalTransform
+from flint.studio.studio_app import _resolve_flint_launcher_path
 from flint.studio.studio_app import (
     COLLIDER_BOX,
     COLLIDER_CAPSULE,
@@ -115,6 +117,12 @@ comptime JSONRPC_INVALID_REQUEST: Int = -32600
 comptime JSONRPC_METHOD_NOT_FOUND: Int = -32601
 comptime JSONRPC_INVALID_PARAMS: Int = -32602
 comptime JSONRPC_INTERNAL_ERROR: Int = -32603
+comptime MCP_ERR_UNAUTHORIZED: Int = -32001
+"""Server-defined JSON-RPC error: missing or wrong `auth_token` (distinct from a malformed request)."""
+comptime MCP_ERR_NOT_INITIALIZED: Int = -32002
+"""Server-defined JSON-RPC error: a request other than `initialize`/`ping` before `initialize`."""
+comptime MCP_PROTOCOL_LATEST = "2025-06-18"
+"""Newest MCP revision this server speaks; `initialize` echoes a supported client version or offers this."""
 
 comptime _AF_UNIX: Int32 = 1
 comptime _SOCK_STREAM: Int32 = 1
@@ -511,6 +519,40 @@ def _read_pollfd_revents(pfd: List[UInt8]) -> Int16:
     return Int16(ur)
 
 
+comptime _MSG_DONTWAIT: Int32 = 0x40
+comptime MCP_CLIENT_TX_SOFT_CAP: Int = 4 * 1024 * 1024
+"""A socket client with more unsent reply bytes than this is not read or dispatched until it drains."""
+comptime MCP_CLIENT_TX_HARD_CAP: Int = 64 * 1024 * 1024
+"""A client whose unsent replies exceed this (it stopped reading) is disconnected."""
+comptime MCP_CLIENT_EOF_LINGER_SEC: Float64 = 5.0
+"""How long a half-closed client may take to read its remaining replies before it is dropped."""
+
+
+def send_some_nonblocking(fd: Int, data: List[UInt8], mut off: Int, is_socket: Bool = True) -> Bool:
+    """Sends as much of `data[off:]` as the kernel accepts right now, advancing `off`; never waits.
+    Returns False only for a broken peer (EPIPE, ECONNRESET, ...)."""
+    while off < len(data):
+        var cur_ptr = data.unsafe_ptr().unsafe_offset(off)
+        var rem = Int64(len(data) - off)
+        var n: Int
+        if is_socket:
+            n = Int(external_call["send", Int64](Int32(fd), cur_ptr, rem, _MSG_NOSIGNAL | _MSG_DONTWAIT))
+        else:
+            n = Int(external_call["write", Int64](Int32(fd), cur_ptr, rem))
+        if n > 0:
+            off += n
+            continue
+        if n == 0:
+            return False
+        var err = last_errno()
+        if err == _EINTR:
+            continue
+        if err == _EAGAIN:
+            return True
+        return False
+    return True
+
+
 def send_span_bounded(
     fd: Int,
     data: Span[UInt8, _],
@@ -600,6 +642,16 @@ def _json_raw_id(doc: JsonDocument, id_node: Int) -> String:
     if k == 3:
         return json_quote(doc.nodes[id_node].text)
     return "null"
+
+
+def negotiate_mcp_protocol_version(requested: String) -> String:
+    """The revision `initialize` answers with: the client's if this server speaks it, the default
+    (`MCP_PROTOCOL_VERSION`) if the client sent none, else the newest one this server supports."""
+    if requested.byte_length() == 0:
+        return String(MCP_PROTOCOL_VERSION)
+    if requested == MCP_PROTOCOL_LATEST or requested == "2025-03-26" or requested == "2024-11-05":
+        return requested
+    return String(MCP_PROTOCOL_LATEST)
 
 
 def _jsonrpc_ok(id_raw: String, result_json: String) -> String:
@@ -901,9 +953,12 @@ struct McpFrameParseResult(Movable):
     var error_code: Int
     var error_message: String
     var payload: List[UInt8]
+    var recoverable: Bool
+    """A `protocol_error` that only cost one bad line: reply (id null) and keep the connection."""
 
     def __init__(out self):
         self.has_frame = False
+        self.recoverable = False
         self.used_content_length = False
         self.protocol_error = False
         self.error_code = 0
@@ -921,32 +976,63 @@ struct McpFrameParseResult(Movable):
 
 
 def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
-    """Bounded, hostile-input-hardened MCP stream parser (`<= 4 MiB` message cap, `<= 8 KiB` header cap).
-    Never wedges on negative/non-numeric/oversized `Content-Length` or unterminated garbage headers."""
-    if len(buf) > MAX_MCP_MESSAGE_BYTES:
-        buf.clear()
-        return McpFrameParseResult.fatal(
-            JSONRPC_INVALID_REQUEST, "MCP message exceeds 4 MiB maximum size"
-        )
+    """Bounded, hostile-input-hardened MCP stream parser (`<= 4 MiB` per message, `<= 8 KiB` header).
+    Consumes one frame (or one bad line) from the front of `buf`. Streams use `parse_mcp_frame_at`."""
+    var off = 0
+    var hint = 0
+    var r = parse_mcp_frame_at(buf, off, hint)
+    _compact_rx(buf, off)
+    return r^
 
-    var start = 0
-    while start < len(buf) and (buf[start] == 32 or buf[start] == 9 or buf[start] == 10 or buf[start] == 13):
+
+def _compact_rx(mut buf: List[UInt8], off: Int):
+    """Drops the first `off` consumed bytes of `buf` (one copy for all frames parsed in a pass)."""
+    if off <= 0:
+        return
+    if off >= len(buf):
+        buf.clear()
+        return
+    var rem = List[UInt8](capacity=len(buf) - off)
+    for i in range(off, len(buf)):
+        rem.append(buf[i])
+    buf = rem^
+
+
+def parse_mcp_frame_at(buf: List[UInt8], mut off: Int, mut nl_hint: Int) -> McpFrameParseResult:
+    """Parses the next frame of `buf` starting at `off` and advances `off` past what it consumed,
+    without copying the rest of the buffer (callers compact once per pass with `_compact_rx`).
+    `nl_hint` remembers how far a newline search already got, so a long line arriving in pieces
+    is scanned once, not once per read.
+
+    The 4 MiB cap is per message: several small frames may be buffered at once. A line that is
+    neither a JSON value nor a `Content-Length` header is consumed and reported as a recoverable
+    `-32700` (`McpFrameParseResult.recoverable`), so one bad line never costs the connection.
+    Only broken `Content-Length` framing (where the stream position is lost) is fatal."""
+    var n = len(buf)
+    var start = off
+    while start < n and (buf[start] == 32 or buf[start] == 9 or buf[start] == 10 or buf[start] == 13):
         start += 1
-        if start > MAX_MCP_HEADER_BYTES:
-            buf.clear()
+        if start - off > MAX_MCP_HEADER_BYTES:
+            off = n
             return McpFrameParseResult.fatal(
                 JSONRPC_PARSE_ERROR, "Excessive leading whitespace in MCP stream"
             )
-    if start > 0 and start == len(buf):
-        buf.clear()
+    # A UTF-8 byte-order mark in front of a frame is ignored.
+    if start + 3 <= n and buf[start] == 0xEF and buf[start + 1] == 0xBB and buf[start + 2] == 0xBF:
+        start += 3
+    if start >= n:
+        if start > off and start == n:
+            off = n
+            nl_hint = n
         return McpFrameParseResult()
-    if start >= len(buf):
-        return McpFrameParseResult()
+    if nl_hint < start:
+        nl_hint = start
+    var avail = n - start
 
     # Case 1: `Content-Length:` HTTP/LSP-style header framing
     var cl_prefix = "content-length:".as_bytes()
-    var avail = len(buf) - start
-    if buf[start] != 123:  # Not '{'
+    var first = buf[start]
+    if first != 123 and first != 91:  # Not '{' or '['
         var check_n = min(len(cl_prefix), avail)
         var matches_cl = True
         for k in range(check_n):
@@ -955,19 +1041,36 @@ def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
                 break
 
         if not matches_cl:
-            buf.clear()
-            return McpFrameParseResult.fatal(
-                JSONRPC_PARSE_ERROR, "Malformed MCP frame header (expected Content-Length or JSON object)"
+            # Not a header and not JSON: skip this line, answer `-32700`, keep the connection.
+            var bad_nl = -1
+            for i in range(max(start, nl_hint), n):
+                if buf[i] == 10:
+                    bad_nl = i
+                    break
+            if bad_nl < 0:
+                nl_hint = n
+                if avail > MAX_MCP_MESSAGE_BYTES:
+                    off = n
+                    return McpFrameParseResult.fatal(
+                        JSONRPC_PARSE_ERROR, "Unterminated non-JSON line exceeds 4 MiB"
+                    )
+                return McpFrameParseResult()
+            off = bad_nl + 1
+            nl_hint = off
+            var bad = McpFrameParseResult.fatal(
+                JSONRPC_PARSE_ERROR, "Parse error: line is neither JSON nor a Content-Length header"
             )
+            bad.recoverable = True
+            return bad^
 
         if avail < len(cl_prefix):
             return McpFrameParseResult()
 
         var hdr_end = -1
         var body_start = -1
-        var scan_limit = min(len(buf) - 1, start + MAX_MCP_HEADER_BYTES + 4)
+        var scan_limit = min(n - 1, start + MAX_MCP_HEADER_BYTES + 4)
         for i in range(start, scan_limit):
-            if i + 3 < len(buf) and buf[i] == 13 and buf[i + 1] == 10 and buf[i + 2] == 13 and buf[i + 3] == 10:
+            if i + 3 < n and buf[i] == 13 and buf[i + 1] == 10 and buf[i + 2] == 13 and buf[i + 3] == 10:
                 hdr_end = i
                 body_start = i + 4
                 break
@@ -978,7 +1081,7 @@ def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
 
         if hdr_end < 0:
             if avail > MAX_MCP_HEADER_BYTES:
-                buf.clear()
+                off = n
                 return McpFrameParseResult.fatal(
                     JSONRPC_INVALID_REQUEST, "MCP header exceeds 8 KiB without CRLFCRLF", content_len=True
                 )
@@ -987,7 +1090,7 @@ def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
             return wait_cl^
 
         if hdr_end - start > MAX_MCP_HEADER_BYTES:
-            buf.clear()
+            off = n
             return McpFrameParseResult.fatal(
                 JSONRPC_INVALID_REQUEST, "MCP header exceeds 8 KiB limit", content_len=True
             )
@@ -1025,19 +1128,13 @@ def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
                 break
             cur += 1
 
-        if (
-            digits == 0
-            or bad_num
-            or clen <= 0
-            or clen > MAX_MCP_MESSAGE_BYTES
-            or clen > MAX_MCP_MESSAGE_BYTES - body_start
-        ):
-            buf.clear()
+        if digits == 0 or bad_num or clen <= 0 or clen > MAX_MCP_MESSAGE_BYTES:
+            off = n
             return McpFrameParseResult.fatal(
                 JSONRPC_INVALID_REQUEST, "Invalid or oversized Content-Length value", content_len=True
             )
 
-        if len(buf) - body_start < clen:
+        if n - body_start < clen:
             var wait_body = McpFrameParseResult()
             wait_body.used_content_length = True
             return wait_body^
@@ -1045,11 +1142,8 @@ def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
         var msg = List[UInt8](capacity=clen)
         for i in range(clen):
             msg.append(buf[body_start + i])
-        var rem_start = body_start + clen
-        var rem = List[UInt8](capacity=len(buf) - rem_start)
-        for i in range(rem_start, len(buf)):
-            rem.append(buf[i])
-        buf = rem^
+        off = body_start + clen
+        nl_hint = off
 
         var ok = McpFrameParseResult()
         ok.has_frame = True
@@ -1057,35 +1151,46 @@ def parse_next_mcp_frame(mut buf: List[UInt8]) -> McpFrameParseResult:
         ok.payload = msg^
         return ok^
 
-    # Case 2: Newline-delimited JSON-RPC (`{...}\n`) or standalone valid JSON object
+    # Case 2: Newline-delimited JSON-RPC (`{...}\n` / `[...]\n`) or standalone valid JSON value
     var nl_at = -1
-    for i in range(start, len(buf)):
+    for i in range(max(start, nl_hint), n):
         if buf[i] == 10:
             nl_at = i
             break
     if nl_at >= 0:
+        if nl_at - start > MAX_MCP_MESSAGE_BYTES:
+            off = n
+            return McpFrameParseResult.fatal(
+                JSONRPC_INVALID_REQUEST, "MCP message exceeds 4 MiB maximum size"
+            )
         var msg = List[UInt8](capacity=nl_at - start)
         for i in range(start, nl_at):
             if buf[i] != 13:
                 msg.append(buf[i])
-        var rem = List[UInt8](capacity=len(buf) - (nl_at + 1))
-        for i in range(nl_at + 1, len(buf)):
-            rem.append(buf[i])
-        buf = rem^
+        off = nl_at + 1
+        nl_hint = off
         var ok_nl = McpFrameParseResult()
         ok_nl.has_frame = True
         ok_nl.used_content_length = False
         ok_nl.payload = msg^
         return ok_nl^
+    nl_hint = n
 
-    # Check if buffer holds a complete un-terminated JSON object
-    if start < len(buf) and buf[start] == 123 and buf[len(buf) - 1] == 125:
-        var cand = List[UInt8](capacity=len(buf) - start)
-        for i in range(start, len(buf)):
+    if avail > MAX_MCP_MESSAGE_BYTES:
+        off = n
+        return McpFrameParseResult.fatal(
+            JSONRPC_INVALID_REQUEST, "MCP message exceeds 4 MiB maximum size"
+        )
+
+    # Check if buffer holds a complete un-terminated JSON value
+    var last = buf[n - 1]
+    if (first == 123 and last == 125) or (first == 91 and last == 93):
+        var cand = List[UInt8](capacity=avail)
+        for i in range(start, n):
             cand.append(buf[i])
         var probe = parse_json(cand)
         if probe.valid:
-            buf.clear()
+            off = n
             var ok_obj = McpFrameParseResult()
             ok_obj.has_frame = True
             ok_obj.used_content_length = False
@@ -1228,6 +1333,12 @@ def _render_studio_software_preview(studio: FlintStudioState, width: Int, height
 
 comptime MCP_ASYNC_BUILD_TIMEOUT_SEC: Float64 = 600.0
 comptime MCP_MAX_PENDING_BUILDS: Int = 4
+comptime MCP_MAX_IMPORT_BYTES: Int = 512 * 1024 * 1024
+comptime MCP_PENDING_GAMEPLAY_BUILD: Int = 0
+comptime MCP_PENDING_PACKAGE: Int = 1
+comptime MCP_PENDING_COOK: Int = 2
+"""Kinds of async jobs `code.build_status` finishes: socket clients never run `project.package` or a
+cook inline (each can take minutes and would freeze the editor); they get a `build_id` to poll."""
 comptime MCP_MAX_FINISHED_BUILDS: Int = 32
 comptime MCP_APPROVED_REPLAY_TTL_SEC: Float64 = 120.0
 comptime MCP_ONCE_GRANT_TTL_SEC: Float64 = 120.0
@@ -1358,6 +1469,9 @@ struct McpClientSession(Copyable, Movable):
     var session_allow_tools: List[String]
     var trigger_event_cursor: Int
     """Each client reads `physics.trigger_events` from its own cursor, so one agent never eats another's."""
+    var turn_allow: Bool
+    """"Approve for turn": gated calls pass while the host keeps this set (cleared when the turn ends)."""
+    var protocol_version: String
 
     def __init__(out self, client_key: Int, gate_mode: Int):
         self.client_key = client_key
@@ -1367,6 +1481,8 @@ struct McpClientSession(Copyable, Movable):
         self.once_allow_tools = List[String]()
         self.session_allow_tools = List[String]()
         self.trigger_event_cursor = 0
+        self.turn_allow = False
+        self.protocol_version = String(MCP_PROTOCOL_VERSION)
 
 
 struct McpServerV2(Movable):
@@ -1394,6 +1510,10 @@ struct McpServerV2(Movable):
     var pending_build_abs_so: List[String]
     var pending_build_deadline: List[Float64]
     var pending_build_owner: List[Int]
+    var pending_build_kind: List[Int]
+    """`MCP_PENDING_*` of each pending job (gameplay build, package, cook)."""
+    var pending_build_extra: List[String]
+    """Kind-specific JSON fields echoed in the finished result (profile, loose_assets, ...)."""
     var finished_build_results: Dict[Int, String]
     var finished_build_failed: Dict[Int, Bool]
     var finished_build_owner: Dict[Int, Int]
@@ -1416,6 +1536,16 @@ struct McpServerV2(Movable):
     """Stored state of every client except the active one, whose state lives in the fields above."""
     var active_client_key: Int
     var default_gate_mode: Int
+    """Gate a newly connected socket client starts with. `MCP_GATE_MUTATING` unless the host chose
+    otherwise with `set_gate_mode`: an agent Studio has not mapped never runs mutating tools unasked."""
+    var turn_allow: Bool
+    var protocol_version: String
+    var require_initialize: Bool
+    """Reject everything but `initialize`/`ping` until `initialize`. Always on for socket clients;
+    `serve_stdio_loop` turns it on for its client. The in-process key-0 API stays lenient."""
+    var import_allow_dirs: List[String]
+    """Directories outside the workspace that `asset.import` may read from (`allow_import_dir`,
+    `FLINT_MCP_IMPORT_DIRS`). Everything else outside the workspace is refused."""
 
     def __init__(out self, workspace_root: String = ".", auth_token: String = ""):
         self.initialized = False
@@ -1441,6 +1571,8 @@ struct McpServerV2(Movable):
         self.pending_build_abs_so = List[String]()
         self.pending_build_deadline = List[Float64]()
         self.pending_build_owner = List[Int]()
+        self.pending_build_kind = List[Int]()
+        self.pending_build_extra = List[String]()
         self.finished_build_results = Dict[Int, String]()
         self.finished_build_failed = Dict[Int, Bool]()
         self.finished_build_owner = Dict[Int, Int]()
@@ -1456,7 +1588,35 @@ struct McpServerV2(Movable):
         self._last_outcome_failed = False
         self.client_sessions = List[McpClientSession]()
         self.active_client_key = 0
-        self.default_gate_mode = MCP_GATE_AUTO
+        self.default_gate_mode = MCP_GATE_MUTATING
+        self.turn_allow = False
+        self.protocol_version = String(MCP_PROTOCOL_VERSION)
+        self.require_initialize = False
+        self.import_allow_dirs = List[String]()
+        var env_dirs = env_value("FLINT_MCP_IMPORT_DIRS")
+        if env_dirs.byte_length() > 0:
+            for part in env_dirs.split(":"):
+                self.allow_import_dir(String(part))
+
+    def allow_import_dir(mut self, dir_path: String):
+        """Lets `asset.import` read source files below `dir_path` (absolute; symlinks never followed)."""
+        var d = String(dir_path.strip())
+        if d.byte_length() == 0 or not d.startswith("/"):
+            return
+        while d.byte_length() > 1 and d.endswith("/"):
+            var d_trim = String(d[byte = 0 : d.byte_length() - 1])
+            d = d_trim^
+        if d not in self.import_allow_dirs:
+            self.import_allow_dirs.append(d)
+
+    def set_client_turn_allowance(mut self, key: Int, on: Bool):
+        """Host-driven "approve for turn": while set, `key`'s gated calls pass without a prompt."""
+        if key == self.active_client_key:
+            self.turn_allow = on
+            return
+        var si = self._find_stored(key)
+        if si >= 0:
+            self.client_sessions[si].turn_allow = on
 
     # ---- Per-client sessions ----
     @staticmethod
@@ -1480,6 +1640,8 @@ struct McpServerV2(Movable):
         cur.client_name = self.client_name
         cur.initialized = self.initialized
         cur.trigger_event_cursor = self.trigger_event_cursor
+        cur.turn_allow = self.turn_allow
+        cur.protocol_version = self.protocol_version
         swap(cur.once_allow_tools, self.once_allow_tools)
         swap(cur.session_allow_tools, self.session_allow_tools)
         var si = self._find_stored(key)
@@ -1490,6 +1652,8 @@ struct McpServerV2(Movable):
         self.initialized = nxt.initialized
         self.gate_mode = nxt.gate_mode
         self.trigger_event_cursor = nxt.trigger_event_cursor
+        self.turn_allow = nxt.turn_allow
+        self.protocol_version = nxt.protocol_version
         swap(self.once_allow_tools, nxt.once_allow_tools)
         swap(self.session_allow_tools, nxt.session_allow_tools)
 
@@ -1520,11 +1684,7 @@ struct McpServerV2(Movable):
         while bi >= 0:
             if self.pending_build_owner[bi] == key:
                 _ = self.build_jobs.cancel(self.pending_build_ids[bi])
-                _ = self.pending_build_ids.pop(bi)
-                _ = self.pending_build_rel_so.pop(bi)
-                _ = self.pending_build_abs_so.pop(bi)
-                _ = self.pending_build_deadline.pop(bi)
-                _ = self.pending_build_owner.pop(bi)
+                self._pop_pending(bi)
             bi -= 1
         self.dropped_client_keys.append(key)
 
@@ -1557,10 +1717,69 @@ struct McpServerV2(Movable):
             except:
                 pass
 
+    def _pop_pending(mut self, k: Int):
+        _ = self.pending_build_ids.pop(k)
+        _ = self.pending_build_rel_so.pop(k)
+        _ = self.pending_build_abs_so.pop(k)
+        _ = self.pending_build_deadline.pop(k)
+        _ = self.pending_build_owner.pop(k)
+        _ = self.pending_build_kind.pop(k)
+        _ = self.pending_build_extra.pop(k)
+
+    def _start_async_job(
+        mut self,
+        kind: Int,
+        job_kind: Int,
+        title: String,
+        argv: List[String],
+        cwd: String,
+        rel_path: String,
+        abs_path: String,
+        extra_json: String,
+    ) -> Tuple[Bool, String]:
+        """Starts `argv` in the background for the active socket client; `code.build_status` finishes it."""
+        if len(self.pending_build_ids) >= MCP_MAX_PENDING_BUILDS:
+            return (True, '{"ok":false,"error":"too many jobs in flight; poll code.build_status first"}')
+        var jid = self.build_jobs.start_argv_job(job_kind, title, argv, cwd)
+        if jid < 0:
+            return (True, '{"ok":false,"error":' + json_quote("failed to start " + title) + "}")
+        self.pending_build_ids.append(jid)
+        self.pending_build_rel_so.append(rel_path)
+        self.pending_build_abs_so.append(abs_path)
+        self.pending_build_deadline.append(get_time() + MCP_ASYNC_BUILD_TIMEOUT_SEC)
+        self.pending_build_owner.append(self.active_client_key)
+        self.pending_build_kind.append(kind)
+        self.pending_build_extra.append(extra_json)
+        return (
+            False,
+            '{"ok":true,"pending":true,"build_id":' + String(jid) + ',"job":' + json_quote(title)
+            + ',"poll":"code.build_status"}',
+        )
+
+    def _package_result_json(self, studio: FlintStudioState, abs_out: String, rel_out: String, extra: String) -> String:
+        var manifest_path = abs_out + "/MANIFEST.txt"
+        var run_sh_path = abs_out + "/run.sh"
+        var pack_name = _resolve_packaged_flpk_name(manifest_path)
+        var flpk_path = (abs_out + "/" + pack_name) if pack_name.byte_length() > 0 else String("")
+        var has_flpk = flpk_path.byte_length() > 0 and file_size(flpk_path) > 0
+        return (
+            '{"ok":true,"output_dir":' + json_quote(rel_out)
+            + ',"abs_output_dir":' + json_quote(abs_out)
+            + ',"run_sh":' + json_quote(run_sh_path)
+            + ',"has_assets_flpk":' + ("true" if has_flpk else "false")
+            + ',"assets_flpk":' + json_quote(flpk_path if has_flpk else String(""))
+            + ',"manifest":' + json_quote(manifest_path if file_size(manifest_path) > 0 else String(""))
+            + extra
+            + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}"
+        )
+
     def tick_builds(mut self):
         """Called once per editor frame: drains build pipes (a chatty compiler can never stall on a
-        full pipe while nobody polls) and cancels builds past their deadline."""
+        full pipe while nobody polls), cancels builds past their deadline, and keeps reaping
+        cancelled jobs (their process groups get SIGKILL after the grace period)."""
         if len(self.pending_build_ids) == 0:
+            if self.build_jobs.reaping_count() > 0:
+                _ = self.build_jobs.poll_all()
             return
         _ = self.build_jobs.poll_all()
         var now = get_time()
@@ -1742,6 +1961,8 @@ struct McpServerV2(Movable):
         if self.gate_mode == MCP_GATE_AUTO:
             return True
         if self.gate_mode == MCP_GATE_MUTATING and not is_mutating:
+            return True
+        if self.turn_allow:
             return True
         if tool_name in self.session_allow_tools:
             return True
@@ -2212,6 +2433,26 @@ struct McpServerV2(Movable):
                 except e:
                     return (True, '{"ok":false,"error":' + json_quote("sandbox rejected cook path: " + String(e)) + "}")
 
+                if self.active_client_key != 0 and not force_c:
+                    # Socket clients cook in a `flint-pack --cook` child process so the editor never
+                    # stalls for a whole cook; `code.build_status` mounts the archive when it is done.
+                    var launcher_c = _resolve_flint_launcher_path()
+                    var pack_bin = String("")
+                    if launcher_c.byte_length() > 0:
+                        pack_bin = parent_directory(parent_directory(launcher_c)) + "/build/flint-pack"
+                    if pack_bin.byte_length() > 0 and file_size(pack_bin) > 0:
+                        var cargv = List[String]()
+                        cargv.append(pack_bin)
+                        cargv.append("--cook")
+                        cargv.append(src_dir)
+                        cargv.append(out_flpk)
+                        cargv.append("--cache-dir")
+                        cargv.append(c_dir)
+                        var ws_cwd = self.workspace_root
+                        return self._start_async_job(
+                            MCP_PENDING_COOK, JOB_KIND_COOK, "assets.cook", cargv, ws_cwd,
+                            raw_out_flpk, out_flpk, String(""),
+                        )
                 var rep = cook_workspace(src_dir, out_flpk, pool, cache_dir=c_dir, force_recook=force_c)
                 if rep.ok:
                     _ = assets.mount_flpk(out_flpk)
@@ -2865,8 +3106,11 @@ struct McpServerV2(Movable):
             if not _is_supported_asset_ext(lower_dst):
                 return (True, '{"ok":false,"error":' + json_quote("invalid destination asset extension: " + rel_dst) + "}")
 
+            # The source must live in the workspace or in a directory the user allowed for imports
+            # (`allow_import_dir` / `FLINT_MCP_IMPORT_DIRS`); it is opened one component at a time
+            # with O_NOFOLLOW, so no symlink (anywhere on the path) can redirect the read.
             var abs_src: String
-            var check_realpath_forbidden = False
+            var src_root = self.workspace_root
             if raw_src.startswith("/"):
                 if _is_forbidden_abs_src(raw_src):
                     return (True, '{"ok":false,"error":"forbidden system source path rejected"}')
@@ -2876,7 +3120,26 @@ struct McpServerV2(Movable):
                 var lower_src = FlintStudioState._ascii_lower(abs_src)
                 if not _is_supported_asset_ext(lower_src):
                     return (True, '{"ok":false,"error":"invalid source asset extension"}')
-                check_realpath_forbidden = True
+                var ws_abs = self.workspace_root
+                try:
+                    ws_abs = _resolve_workspace_root(self.workspace_root)[0]
+                except:
+                    pass
+                var found_root = abs_src.startswith(_strip_trailing_slashes(ws_abs) + "/")
+                if found_root:
+                    src_root = ws_abs
+                else:
+                    for di in range(len(self.import_allow_dirs)):
+                        ref ad = self.import_allow_dirs[di]
+                        if abs_src.startswith(ad + "/") or ad == "/":
+                            src_root = ad
+                            found_root = True
+                            break
+                if not found_root:
+                    return (
+                        True,
+                        '{"ok":false,"error":"source_path is outside the workspace and the import allow-list (FLINT_MCP_IMPORT_DIRS)"}',
+                    )
             else:
                 try:
                     var san_src = _sanitize_workspace_rel_and_abs(self.workspace_root, raw_src, allow_root_dir=False)
@@ -2884,20 +3147,16 @@ struct McpServerV2(Movable):
                 except e:
                     return (True, '{"ok":false,"error":' + json_quote("sandbox rejected source_path: " + String(e)) + "}")
 
-            var ls = _lstat_mode_uid(abs_src)
-            if not ls[0]:
+            var src_read = read_agent_file(src_root, abs_src if raw_src.startswith("/") else raw_src, MCP_MAX_IMPORT_BYTES)
+            if src_read[0] == SAFE_FS_MISSING:
                 return (True, '{"ok":false,"error":"source asset file not found"}')
-            if (ls[1] & _S_IFMT) != UInt32(0o100000):
+            if src_read[0] == SAFE_FS_NOT_REGULAR:
                 return (True, '{"ok":false,"error":"source path must be a regular non-symlink file"}')
-            if check_realpath_forbidden:
-                var src_rp = _realpath_existing(abs_src)
-                if not src_rp[0]:
-                    return (True, '{"ok":false,"error":"source asset file not found"}')
-                var real_src = _strip_trailing_slashes(src_rp[1])
-                if _is_forbidden_abs_src(real_src) or _abs_path_has_hidden_segment(real_src):
-                    return (True, '{"ok":false,"error":"forbidden system source path rejected"}')
-
-            var raw_data = read_bytes(abs_src)
+            if src_read[0] == SAFE_FS_TOO_LARGE:
+                return (True, '{"ok":false,"error":"source asset is too large to import"}')
+            if src_read[0] != SAFE_FS_OK:
+                return (True, '{"ok":false,"error":' + json_quote("source_path rejected: " + src_read[2]) + "}")
+            var raw_data = src_read[1].copy()
             var vres = FlintStudioState._validate_asset_payload(lower_dst, raw_data)
             if not vres[0]:
                 return (True, '{"ok":false,"error":' + json_quote("asset validation failed: " + vres[1]) + "}")
@@ -3476,6 +3735,41 @@ struct McpServerV2(Movable):
                         except e:
                             return (True, '{"ok":false,"error":' + json_quote("invalid target: " + String(e)) + "}")
 
+            var extra = (
+                ',"profile":' + json_quote(profile)
+                + ',"loose_assets":' + ("true" if loose_assets else "false")
+            )
+            if self.active_client_key != 0:
+                # Socket clients: same `tools/flint.sh package` run, in the background.
+                var proj = studio.project_root if studio.project_root.byte_length() > 0 else env_value("FLINT_STUDIO_PROJECT")
+                while proj.byte_length() > 1 and proj.endswith("/"):
+                    var proj_trim = String(proj[byte = 0 : proj.byte_length() - 1])
+                    proj = proj_trim^
+                if proj.byte_length() == 0 or not is_directory(proj):
+                    return (True, '{"ok":false,"error":"no valid project_root is open"}')
+                if target.byte_length() == 0 and file_size(proj + "/flint.toml") < 0:
+                    return (True, '{"ok":false,"error":' + json_quote("project flint.toml not found in " + proj) + "}")
+                var launcher = _resolve_flint_launcher_path()
+                if launcher.byte_length() == 0:
+                    return (True, '{"ok":false,"error":"could not locate tools/flint.sh launcher"}')
+                var pargv = List[String]()
+                pargv.append("/bin/bash")
+                pargv.append(launcher)
+                pargv.append("package")
+                pargv.append("--out")
+                pargv.append(abs_out)
+                if profile.byte_length() > 0:
+                    pargv.append("--profile")
+                    pargv.append(profile)
+                if loose_assets:
+                    pargv.append("--loose-assets")
+                if target.byte_length() > 0:
+                    pargv.append("--target")
+                    pargv.append(target)
+                return self._start_async_job(
+                    MCP_PENDING_PACKAGE, JOB_KIND_TASK, "project.package", pargv, proj, rel_out, abs_out, extra
+                )
+
             var res = studio.package_project(
                 output_dir=abs_out,
                 profile=profile,
@@ -3484,24 +3778,7 @@ struct McpServerV2(Movable):
             )
             if not res[0]:
                 return (True, '{"ok":false,"error":' + json_quote(res[1]) + "}")
-
-            var manifest_path = abs_out + "/MANIFEST.txt"
-            var run_sh_path = abs_out + "/run.sh"
-            var pack_name = _resolve_packaged_flpk_name(manifest_path)
-            var flpk_path = (abs_out + "/" + pack_name) if pack_name.byte_length() > 0 else String("")
-            var has_flpk = flpk_path.byte_length() > 0 and file_size(flpk_path) > 0
-            return (
-                False,
-                '{"ok":true,"output_dir":' + json_quote(rel_out)
-                + ',"abs_output_dir":' + json_quote(abs_out)
-                + ',"run_sh":' + json_quote(run_sh_path)
-                + ',"has_assets_flpk":' + ("true" if has_flpk else "false")
-                + ',"assets_flpk":' + json_quote(flpk_path if has_flpk else String(""))
-                + ',"manifest":' + json_quote(manifest_path if file_size(manifest_path) > 0 else String(""))
-                + ',"profile":' + json_quote(profile)
-                + ',"loose_assets":' + ("true" if loose_assets else "false")
-                + ',"state_hash":' + json_quote(String(studio.state_hash())) + "}",
-            )
+            return (False, self._package_result_json(studio, abs_out, rel_out, extra))
 
         # 28. code.build_hot_reload
         if tool_name == "code.build_hot_reload":
@@ -3623,6 +3900,8 @@ struct McpServerV2(Movable):
                     self.pending_build_abs_so.append(abs_so)
                     self.pending_build_deadline.append(get_time() + MCP_ASYNC_BUILD_TIMEOUT_SEC)
                     self.pending_build_owner.append(self.active_client_key)
+                    self.pending_build_kind.append(MCP_PENDING_GAMEPLAY_BUILD)
+                    self.pending_build_extra.append(String(""))
                     return (
                         False,
                         '{"ok":true,"pending":true,"build_id":' + String(ajid)
@@ -3682,17 +3961,38 @@ struct McpServerV2(Movable):
                 )
             var rel_so_b = self.pending_build_rel_so[pi]
             var abs_so_b = self.pending_build_abs_so[pi]
-            _ = self.pending_build_ids.pop(pi)
-            _ = self.pending_build_rel_so.pop(pi)
-            _ = self.pending_build_abs_so.pop(pi)
-            _ = self.pending_build_deadline.pop(pi)
-            _ = self.pending_build_owner.pop(pi)
+            var kind_b = self.pending_build_kind[pi]
+            var extra_b = self.pending_build_extra[pi]
+            self._pop_pending(pi)
             var res: Tuple[Bool, String]
             if running:
+                # Cancel is non-blocking; `tick_builds` keeps reaping the group until it is gone.
                 _ = self.build_jobs.cancel(bid)
-                res = (True, '{"ok":false,"compiled":false,"reloaded":false,"error":"gameplay.so build timed out"}')
+                res = (True, '{"ok":false,"compiled":false,"reloaded":false,"error":"job timed out"}')
             elif bj < 0:
                 res = (True, '{"ok":false,"compiled":false,"reloaded":false,"error":"build job lost"}')
+            elif kind_b == MCP_PENDING_PACKAGE:
+                var p_ok = self.build_jobs.jobs[bj].state == JOB_SUCCEEDED
+                if p_ok and file_size(abs_so_b + "/run.sh") > 0:
+                    res = (False, self._package_result_json(studio, abs_so_b, rel_so_b, extra_b))
+                else:
+                    var p_out = self.build_jobs.jobs[bj].output_text()
+                    var p_tail = String(p_out[byte = max(0, p_out.byte_length() - 2048) : p_out.byte_length()]) if p_out.byte_length() > 0 else String("")
+                    var p_msg = "package failed (exit " + String(self.build_jobs.jobs[bj].exit_code) + ")" if not p_ok else String("package finished without executable run.sh")
+                    res = (True, '{"ok":false,"error":' + json_quote(p_msg) + ',"log_tail":' + json_quote(p_tail) + "}")
+            elif kind_b == MCP_PENDING_COOK:
+                var c_ok = self.build_jobs.jobs[bj].state == JOB_SUCCEEDED
+                var c_out = self.build_jobs.jobs[bj].output_text()
+                var c_tail = String(c_out[byte = max(0, c_out.byte_length() - 2048) : c_out.byte_length()]) if c_out.byte_length() > 0 else String("")
+                if c_ok:
+                    _ = assets.mount_flpk(abs_so_b)
+                res = (
+                    not c_ok,
+                    '{"ok":' + ("true" if c_ok else "false")
+                    + ',"cook_report":{"ok":' + ("true" if c_ok else "false")
+                    + ',"output_flpk":' + json_quote(rel_so_b) + ',"log_tail":' + json_quote(c_tail) + "}"
+                    + ',"mounted_archives":' + String(len(assets.mounts)) + "}",
+                )
             else:
                 var b_ok = self.build_jobs.jobs[bj].state == JOB_SUCCEEDED
                 var b_out = self.build_jobs.jobs[bj].output_text()
@@ -3700,6 +4000,9 @@ struct McpServerV2(Movable):
                 self.diagnostics_store.replace_source(DIAG_SRC_BUILD, b_diags)
                 res = self._finish_gameplay_build(studio, b_ok, b_ok, b_out, b_diags, rel_so_b, abs_so_b)
             self._remember_build_result(bid, res[0], res[1])
+            # The result is remembered above; the finished job (and its output buffer) goes now.
+            if not running:
+                _ = self.build_jobs.remove(bid)
             return res
 
         # 29. code.diagnostics
@@ -3809,6 +4112,8 @@ struct McpServerV2(Movable):
     ) -> String:
         self.requests_handled += 1
         var doc = parse_json(raw)
+        if doc.valid and doc.root >= 0 and doc.nodes[doc.root].kind == 4:
+            return _jsonrpc_err("null", JSONRPC_PARSE_ERROR, "Parse error: JSON-RPC batches are not supported; send one object per message")
         if not doc.valid or doc.root < 0 or doc.nodes[doc.root].kind != 5:
             return _jsonrpc_err("null", JSONRPC_PARSE_ERROR, "Parse error: invalid JSON object")
 
@@ -3830,7 +4135,7 @@ struct McpServerV2(Movable):
                 if not _const_time_str_eq(supplied_tok, self.auth_token):
                     if not has_id:
                         return String()
-                    return _jsonrpc_err(id_raw, JSONRPC_INVALID_REQUEST, "Unauthorized: invalid or missing auth_token")
+                    return _jsonrpc_err(id_raw, MCP_ERR_UNAUTHORIZED, "Unauthorized: invalid or missing auth_token")
                 self.session_authenticated = True
             else:
                 if not self.session_authenticated:
@@ -3839,7 +4144,18 @@ struct McpServerV2(Movable):
                     else:
                         if not has_id:
                             return String()
-                        return _jsonrpc_err(id_raw, JSONRPC_INVALID_REQUEST, "Unauthorized: session not authenticated")
+                        return _jsonrpc_err(id_raw, MCP_ERR_UNAUTHORIZED, "Unauthorized: session not authenticated")
+
+        # Lifecycle: socket clients (and the stdio loop) must `initialize` before anything but `ping`.
+        if (
+            (self.active_client_key != 0 or self.require_initialize)
+            and not self.initialized
+            and method != "initialize"
+            and method != "ping"
+        ):
+            if not has_id:
+                return String()
+            return _jsonrpc_err(id_raw, MCP_ERR_NOT_INITIALIZED, "Server not initialized: send initialize first")
 
         # Notifications (`id` omitted) produce no response frame per JSON-RPC 2.0 / MCP spec
         if not has_id:
@@ -3850,13 +4166,19 @@ struct McpServerV2(Movable):
         if method == "initialize":
             self.initialized = True
             var params_node = doc.object_get(doc.root, "params")
+            var want_ver = String("")
             if params_node >= 0:
                 var ci = doc.object_get(params_node, "clientInfo")
                 if ci >= 0:
                     self.client_name = doc.text(doc.object_get(ci, "name"), "mcp-client")
+                var pv = doc.object_get(params_node, "protocolVersion")
+                if pv >= 0 and doc.nodes[pv].kind == 3:
+                    want_ver = doc.text(pv)
+            self.protocol_version = negotiate_mcp_protocol_version(want_ver)
+            # The tool list is static, so no `notifications/tools/list_changed` is ever sent.
             var init_res = (
-                '{"protocolVersion":' + json_quote(MCP_PROTOCOL_VERSION)
-                + ',"capabilities":{"tools":{"listChanged":true}}'
+                '{"protocolVersion":' + json_quote(self.protocol_version)
+                + ',"capabilities":{"tools":{"listChanged":false}}'
                 + ',"serverInfo":{"name":"flint-engine-mcp-v2","version":"5.0.0","build":'
                 + json_quote(build_stamp()) + "}}"
             )
@@ -4030,8 +4352,10 @@ struct McpServerV2(Movable):
         var stream_buf = List[UInt8]()
         var scratch = List[UInt8](length=8192, fill=0)
         var answered = 0
+        var rx_off = 0
+        var rx_hint = 0
         while True:
-            var space = (MAX_MCP_MESSAGE_BYTES + 1) - len(stream_buf)
+            var space = (MAX_MCP_MESSAGE_BYTES + 1) - (len(stream_buf) - rx_off)
             var ask = min(8192, max(1, space))
             var n = Int(external_call["read", Int64](Int32(0), scratch.unsafe_ptr(), Int64(ask)))
             if n < 0:
@@ -4045,11 +4369,13 @@ struct McpServerV2(Movable):
 
             var fatal_err = False
             while True:
-                var frame = parse_next_mcp_frame(stream_buf)
+                var frame = parse_mcp_frame_at(stream_buf, rx_off, rx_hint)
                 if frame.protocol_error:
                     var err_resp = _jsonrpc_err("null", frame.error_code, frame.error_message)
                     var err_bytes = encode_mcp_frame(err_resp, use_content_length=frame.used_content_length)
                     _ = send_span_bounded(1, Span(err_bytes), timeout_ms=2000, is_socket=False)
+                    if frame.recoverable:
+                        continue
                     fatal_err = True
                     break
                 if not frame.has_frame:
@@ -4061,6 +4387,11 @@ struct McpServerV2(Movable):
                         fatal_err = True
                         break
                     answered += 1
+            rx_hint -= rx_off
+            _compact_rx(stream_buf, rx_off)
+            rx_off = 0
+            if rx_hint < 0:
+                rx_hint = 0
             if fatal_err:
                 break
         return answered
@@ -4179,6 +4510,13 @@ struct FlintMcpUnixListener(Movable):
     var client_authed: List[Bool]
     var client_conn_ids: List[Int]
     """Unique per-connection key for `McpServerV2.select_client` (fds are reused; these never are)."""
+    var client_rx_off: List[Int]
+    var client_rx_hint: List[Int]
+    var client_tx_bufs: List[List[UInt8]]
+    """Replies not yet accepted by the peer's socket; flushed without blocking every tick."""
+    var client_tx_off: List[Int]
+    var client_eof_at: List[Float64]
+    """When the peer half-closed (0 = still open). It is dropped once its replies are delivered."""
     var next_conn_id: Int
     var _io_scratch: List[UInt8]
     var rr_cursor: Int
@@ -4194,6 +4532,11 @@ struct FlintMcpUnixListener(Movable):
         self.client_rx_bufs = List[List[UInt8]]()
         self.client_authed = List[Bool]()
         self.client_conn_ids = List[Int]()
+        self.client_rx_off = List[Int]()
+        self.client_rx_hint = List[Int]()
+        self.client_tx_bufs = List[List[UInt8]]()
+        self.client_tx_off = List[Int]()
+        self.client_eof_at = List[Float64]()
         self.next_conn_id = 1
         self._io_scratch = List[UInt8](length=8192, fill=0)
         self.rr_cursor = 0
@@ -4263,6 +4606,11 @@ struct FlintMcpUnixListener(Movable):
         self.client_rx_bufs.clear()
         self.client_authed.clear()
         self.client_conn_ids.clear()
+        self.client_rx_off.clear()
+        self.client_rx_hint.clear()
+        self.client_tx_bufs.clear()
+        self.client_tx_off.clear()
+        self.client_eof_at.clear()
         if self.listen_fd >= 0:
             close_fd(self.listen_fd)
             self.listen_fd = -1
@@ -4279,6 +4627,36 @@ struct FlintMcpUnixListener(Movable):
         _ = self.client_rx_bufs.pop(idx)
         _ = self.client_authed.pop(idx)
         _ = self.client_conn_ids.pop(idx)
+        _ = self.client_rx_off.pop(idx)
+        _ = self.client_rx_hint.pop(idx)
+        _ = self.client_tx_bufs.pop(idx)
+        _ = self.client_tx_off.pop(idx)
+        _ = self.client_eof_at.pop(idx)
+
+    def tx_backlog(self, idx: Int) -> Int:
+        """Reply bytes queued for client `idx` that its socket has not taken yet."""
+        return len(self.client_tx_bufs[idx]) - self.client_tx_off[idx]
+
+    def _flush_tx(mut self, idx: Int) -> Bool:
+        """Non-blocking flush of client `idx`'s reply queue. False = the peer is gone."""
+        if self.tx_backlog(idx) <= 0:
+            return True
+        var ok = send_some_nonblocking(self.client_fds[idx], self.client_tx_bufs[idx], self.client_tx_off[idx], True)
+        if self.client_tx_off[idx] >= len(self.client_tx_bufs[idx]):
+            self.client_tx_bufs[idx].clear()
+            self.client_tx_off[idx] = 0
+        elif self.client_tx_off[idx] >= 1024 * 1024:
+            _compact_rx(self.client_tx_bufs[idx], self.client_tx_off[idx])
+            self.client_tx_off[idx] = 0
+        return ok
+
+    def _queue_tx(mut self, idx: Int, data: List[UInt8]) -> Bool:
+        """Queues one encoded reply and pushes what the socket takes now. False = drop the client."""
+        for b in data:
+            self.client_tx_bufs[idx].append(b)
+        if self.tx_backlog(idx) > MCP_CLIENT_TX_HARD_CAP:
+            return False
+        return self._flush_tx(idx)
 
     def _poll_internal(
         mut self,
@@ -4314,6 +4692,11 @@ struct FlintMcpUnixListener(Movable):
             self.client_rx_bufs.append(List[UInt8]())
             self.client_authed.append(mcp.auth_token.byte_length() == 0)
             self.client_conn_ids.append(self.next_conn_id)
+            self.client_rx_off.append(0)
+            self.client_rx_hint.append(0)
+            self.client_tx_bufs.append(List[UInt8]())
+            self.client_tx_off.append(0)
+            self.client_eof_at.append(0.0)
             mcp.set_client_peer_pid(self.next_conn_id, _peer_pid(cfd))
             self.next_conn_id += 1
 
@@ -4324,16 +4707,28 @@ struct FlintMcpUnixListener(Movable):
         var n_clients = len(self.client_fds)
         var closed = List[Bool](length=n_clients, fill=False)
         var drop = List[Bool](length=n_clients, fill=False)
+        var now_t = get_time()
         for ci in range(n_clients):
             var cfd = self.client_fds[ci]
-            while len(self.client_rx_bufs[ci]) <= MAX_MCP_MESSAGE_BYTES:
-                var ask = min(8192, (MAX_MCP_MESSAGE_BYTES + 1) - len(self.client_rx_bufs[ci]))
+            # Replies first: a peer that reads slowly gets them without the UI thread ever waiting.
+            if not self._flush_tx(ci):
+                drop[ci] = True
+                continue
+            if self.client_eof_at[ci] > 0.0:
+                closed[ci] = True
+                continue
+            # Backpressure: no new input while replies pile up or a full message is still buffered.
+            if self.tx_backlog(ci) > MCP_CLIENT_TX_SOFT_CAP:
+                continue
+            while len(self.client_rx_bufs[ci]) - self.client_rx_off[ci] <= MAX_MCP_MESSAGE_BYTES:
+                var ask = min(8192, (MAX_MCP_MESSAGE_BYTES + 1) - (len(self.client_rx_bufs[ci]) - self.client_rx_off[ci]))
                 var n = Int(external_call["read", Int64](Int32(cfd), self._io_scratch.unsafe_ptr(), Int64(ask)))
                 if n > 0:
                     for k in range(n):
                         self.client_rx_bufs[ci].append(self._io_scratch[k])
                 elif n == 0:
                     closed[ci] = True
+                    self.client_eof_at[ci] = now_t
                     break
                 else:
                     var err = last_errno()
@@ -4365,12 +4760,16 @@ struct FlintMcpUnixListener(Movable):
                     if budget_hit:
                         resume_at = ci
                         break
-                    var frame = parse_next_mcp_frame(self.client_rx_bufs[ci])
-                    var cfd = self.client_fds[ci]
+                    if self.tx_backlog(ci) > MCP_CLIENT_TX_SOFT_CAP:
+                        continue
+                    var frame = parse_mcp_frame_at(self.client_rx_bufs[ci], self.client_rx_off[ci], self.client_rx_hint[ci])
                     if frame.protocol_error:
                         var err_resp = _jsonrpc_err("null", frame.error_code, frame.error_message)
                         var err_b = encode_mcp_frame(err_resp, use_content_length=frame.used_content_length)
-                        _ = send_span_bounded(cfd, Span(err_b), timeout_ms=500, is_socket=True)
+                        var queued = self._queue_tx(ci, err_b)
+                        if frame.recoverable and queued:
+                            progress = True
+                            continue
                         drop[ci] = True
                         continue
                     if not frame.has_frame:
@@ -4384,13 +4783,23 @@ struct FlintMcpUnixListener(Movable):
                     processed += 1
                     if resp.byte_length() > 0:
                         var out_b = encode_mcp_frame(resp, use_content_length=frame.used_content_length)
-                        if not send_span_bounded(cfd, Span(out_b), timeout_ms=250, is_socket=True):
+                        if not self._queue_tx(ci, out_b):
                             drop[ci] = True
 
-        # A closed peer is dropped once its buffered requests are done (or right away if it broke).
+        # One compaction per client per tick (not one buffer copy per frame).
         for ci in range(n_clients):
-            if closed[ci] and not budget_hit:
-                drop[ci] = True
+            if self.client_rx_off[ci] > 0:
+                self.client_rx_hint[ci] = max(0, self.client_rx_hint[ci] - self.client_rx_off[ci])
+                _compact_rx(self.client_rx_bufs[ci], self.client_rx_off[ci])
+                self.client_rx_off[ci] = 0
+
+        # A closed (half-closed) peer is dropped once its buffered requests are done and its replies
+        # delivered, or after `MCP_CLIENT_EOF_LINGER_SEC` if it never reads them.
+        for ci in range(n_clients):
+            if closed[ci] and not budget_hit and not drop[ci]:
+                var delivered = self._flush_tx(ci) and self.tx_backlog(ci) <= 0
+                if delivered or (get_time() - self.client_eof_at[ci]) > MCP_CLIENT_EOF_LINGER_SEC:
+                    drop[ci] = True
         var i = n_clients - 1
         while i >= 0:
             if drop[i]:
@@ -4542,12 +4951,39 @@ def _write_two_pollfds(mut pfds: List[UInt8], fd0: Int32, ev0: Int16, fd1: Int32
     pfds[15] = 0
 
 
+def _set_pollfd_at(mut pfds: List[UInt8], idx: Int, fd: Int32, events: Int16):
+    var o = idx * 8
+    var u = UInt32(fd)
+    pfds[o] = UInt8(u & 0xFF)
+    pfds[o + 1] = UInt8((u >> 8) & 0xFF)
+    pfds[o + 2] = UInt8((u >> 16) & 0xFF)
+    pfds[o + 3] = UInt8((u >> 24) & 0xFF)
+    var e = UInt16(events)
+    pfds[o + 4] = UInt8(e & 0xFF)
+    pfds[o + 5] = UInt8((e >> 8) & 0xFF)
+    pfds[o + 6] = 0
+    pfds[o + 7] = 0
+
+
+def _revents_at(pfds: List[UInt8], idx: Int) -> Int16:
+    var o = idx * 8
+    return Int16(UInt16(pfds[o + 6]) | (UInt16(pfds[o + 7]) << 8))
+
+
+comptime MCP_BRIDGE_QUEUE_CAP: Int = 8 * 1024 * 1024
+"""Per direction: the bridge stops reading a side while this much is waiting for the other side."""
+
+
 def run_mcp_connect_stdio(sock_path: String) -> Int:
     """Pure-Mojo `stdio <-> AF_UNIX` MCP proxy (`flint-studio --mcp-connect <sock>`).
 
     Connects stdin/stdout directly to a live Studio `FlintMcpUnixListener` socket so
     in-Studio ACP agents can invoke live Studio MCP v2 tools with zero Python wrappers
     and automatic `SO_PEERCRED` UID authentication.
+
+    Both directions are queued and moved only when `poll` says the destination can take bytes,
+    so a slow reader on one side never stalls the other. On stdin EOF the bridge half-closes
+    the socket (`shutdown(SHUT_WR)`) and keeps delivering Studio's replies until Studio closes.
     """
     var target = sock_path if sock_path.byte_length() > 0 else default_mcp_socket_path()
     if target.byte_length() == 0 or target.byte_length() > 107 or _has_forbidden_path_bytes(target):
@@ -4560,15 +4996,42 @@ def run_mcp_connect_stdio(sock_path: String) -> Int:
     if _connect_unix(Int32(sock_fd), addr) != 0:
         close_fd(sock_fd)
         return 1
+    # F_GETFL = 3, F_SETFL = 4, O_NONBLOCK = 0o4000 (same value on x86-64 and aarch64).
+    var fl = external_call["fcntl", Int32](Int32(sock_fd), Int32(3), Int32(0))
+    if fl >= 0:
+        _ = external_call["fcntl", Int32](Int32(sock_fd), Int32(4), fl | Int32(0o4000))
 
     comptime _POLLIN: Int16 = 0x0001
-    var pfds = List[UInt8](length=16, fill=0)
-    var scratch = List[UInt8](length=16384, fill=0)
+    comptime _PIPE_BUF: Int = 4096
+    var pfds = List[UInt8](length=24, fill=0)
+    var scratch = List[UInt8](length=65536, fill=0)
+    var up = List[UInt8]()  # stdin -> socket
+    var up_off = 0
+    var down = List[UInt8]()  # socket -> stdout
+    var down_off = 0
+    var stdin_eof = False
+    var sock_eof = False
+    var shut_wr = False
     var rc_out = 0
 
     while True:
-        _write_two_pollfds(pfds, Int32(0), _POLLIN, Int32(sock_fd), _POLLIN)
-        var prc = external_call["poll", Int32](pfds.unsafe_ptr(), UInt64(2), Int32(250))
+        var up_n = len(up) - up_off
+        var down_n = len(down) - down_off
+        if stdin_eof and up_n == 0 and not shut_wr and not sock_eof:
+            _ = external_call["shutdown", Int32](Int32(sock_fd), Int32(1))  # SHUT_WR
+            shut_wr = True
+        if sock_eof and down_n == 0:
+            break
+        var want_in = not stdin_eof and up_n < MCP_BRIDGE_QUEUE_CAP
+        _set_pollfd_at(pfds, 0, Int32(0) if want_in else Int32(-1), _POLLIN)
+        var sock_ev = Int16(0)
+        if not sock_eof and down_n < MCP_BRIDGE_QUEUE_CAP:
+            sock_ev = sock_ev | _POLLIN
+        if up_n > 0 and not sock_eof:
+            sock_ev = sock_ev | _POLLOUT
+        _set_pollfd_at(pfds, 1, Int32(sock_fd) if sock_ev != 0 else Int32(-1), sock_ev)
+        _set_pollfd_at(pfds, 2, Int32(1) if down_n > 0 else Int32(-1), _POLLOUT)
+        var prc = external_call["poll", Int32](pfds.unsafe_ptr(), UInt64(3), Int32(250))
         if prc < 0:
             if last_errno() == _EINTR:
                 continue
@@ -4576,38 +5039,59 @@ def run_mcp_connect_stdio(sock_path: String) -> Int:
             break
         if prc == 0:
             continue
+        var rev0 = _revents_at(pfds, 0)
+        var rev1 = _revents_at(pfds, 1)
+        var rev2 = _revents_at(pfds, 2)
 
-        var rev0 = Int16(UInt16(pfds[6]) | (UInt16(pfds[7]) << 8))
-        var rev1 = Int16(UInt16(pfds[14]) | (UInt16(pfds[15]) << 8))
-
-        if (rev0 & _POLLIN) != 0:
-            var n0 = Int(external_call["read", Int64](Int32(0), scratch.unsafe_ptr(), Int64(16384)))
+        if want_in and (rev0 & (_POLLIN | _POLLERR_MASK)) != 0:
+            var n0 = Int(external_call["read", Int64](Int32(0), scratch.unsafe_ptr(), Int64(len(scratch))))
             if n0 > 0:
-                if not send_span_bounded(sock_fd, Span(scratch)[0:n0], timeout_ms=5000, is_socket=True):
-                    rc_out = 1
-                    break
+                for i in range(n0):
+                    up.append(scratch[i])
             elif n0 == 0:
-                break
+                stdin_eof = True
             elif last_errno() != _EINTR and last_errno() != _EAGAIN:
-                rc_out = 1
-                break
+                stdin_eof = True
 
-        if (rev1 & _POLLIN) != 0:
-            var n1 = Int(external_call["read", Int64](Int32(sock_fd), scratch.unsafe_ptr(), Int64(16384)))
+        if (rev1 & _POLLIN) != 0 or ((rev1 & _POLLERR_MASK) != 0 and (sock_ev & _POLLIN) != 0):
+            var n1 = Int(external_call["read", Int64](Int32(sock_fd), scratch.unsafe_ptr(), Int64(len(scratch))))
             if n1 > 0:
-                if not send_span_bounded(1, Span(scratch)[0:n1], timeout_ms=5000, is_socket=False):
-                    rc_out = 1
-                    break
+                for i in range(n1):
+                    down.append(scratch[i])
             elif n1 == 0:
-                break
+                sock_eof = True
             elif last_errno() != _EINTR and last_errno() != _EAGAIN:
+                sock_eof = True
                 rc_out = 1
-                break
 
-        if ((rev0 & _POLLERR_MASK) != 0 and (rev0 & _POLLIN) == 0) or (
-            (rev1 & _POLLERR_MASK) != 0 and (rev1 & _POLLIN) == 0
-        ):
-            break
+        if (rev1 & (_POLLOUT | _POLLERR_MASK)) != 0 and len(up) - up_off > 0:
+            if not send_some_nonblocking(sock_fd, up, up_off, True):
+                sock_eof = True
+                rc_out = 1
+            if up_off >= len(up):
+                up.clear()
+                up_off = 0
+            elif up_off >= 1024 * 1024:
+                _compact_rx(up, up_off)
+                up_off = 0
+
+        if (rev2 & (_POLLOUT | _POLLERR_MASK)) != 0 and len(down) - down_off > 0:
+            # POLLOUT on a pipe guarantees PIPE_BUF bytes of room: one write of at most that never blocks.
+            var chunk = min(_PIPE_BUF, len(down) - down_off)
+            var nw = Int(
+                external_call["write", Int64](Int32(1), down.unsafe_ptr().unsafe_offset(down_off), Int64(chunk))
+            )
+            if nw > 0:
+                down_off += nw
+                if down_off >= len(down):
+                    down.clear()
+                    down_off = 0
+                elif down_off >= 1024 * 1024:
+                    _compact_rx(down, down_off)
+                    down_off = 0
+            elif nw < 0 and last_errno() != _EINTR and last_errno() != _EAGAIN:
+                rc_out = 1  # stdout is gone: nobody can read Studio's replies any more
+                break
 
     close_fd(sock_fd)
     return rc_out

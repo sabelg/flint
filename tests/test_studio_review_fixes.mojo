@@ -21,7 +21,7 @@ from flint.assets.json import parse_json
 from flint.assets.server import AssetServer
 from flint.core.jobs import JobPool
 from flint.core.math import Vec3
-from flint.devtools.mcp_v2 import MCP_GATE_ALL, McpServerV2, sanitize_output_path
+from flint.devtools.mcp_v2 import MCP_GATE_ALL, MCP_GATE_AUTO, McpServerV2, sanitize_output_path
 from flint.platform.os import file_size, get_time, make_dirs, write_bytes
 from flint.studio import FlintStudioState
 from flint.studio.gizmo import (
@@ -139,6 +139,7 @@ def test_build_paths_ownership_and_async() raises:
     var assets = AssetServer(enable_watcher=False)
     var pool = JobPool()
     var mcp = McpServerV2(workspace_root=".")
+    mcp.set_gate_mode(MCP_GATE_AUTO)  # socket clients start gated (MCP_GATE_MUTATING)
     mcp.select_client(1)
     _init(mcp, studio, assets, pool, "builder-a")
     var bad_out = _call(
@@ -364,6 +365,7 @@ def test_redo_keeps_agent_origin() raises:
     var assets = AssetServer(enable_watcher=False)
     var pool = JobPool()
     var mcp = McpServerV2(workspace_root=".")
+    mcp.set_gate_mode(MCP_GATE_AUTO)  # socket clients start gated (MCP_GATE_MUTATING)
     mcp.select_client(1)
     _init(mcp, studio, assets, pool, "agent-a")
     _ = _call(mcp, studio, assets, pool, "ecs.spawn_entity", '{"name":"AgentMade"}')

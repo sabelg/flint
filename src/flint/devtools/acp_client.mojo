@@ -23,10 +23,20 @@ from flint.assets.json_write import (
     json_quote,
     json_text,
 )
+from flint.devtools.job_runner import (
+    ChildExecPrelude,
+    child_exec_prelude,
+    reap_child,
+    signal_process_group,
+)
 from flint.platform.os import close_fd, get_time, last_errno, open_path_fd
 
 comptime ACP_PROTOCOL_VERSION: Int = 1
 comptime MAX_RPC_MESSAGE_BYTES: Int = 32 * 1024 * 1024
+comptime MAX_PIPE_OUTBOX_BYTES: Int = 64 * 1024 * 1024
+"""Unsent bytes `PipeProcess` holds for a child that stopped reading; beyond it the write fails."""
+comptime ACP_STOP_GRACE_SEC: Float64 = 0.25
+"""SIGTERM -> SIGKILL grace for a stopped agent's process group (polled, never slept on)."""
 
 # JSON-RPC message kinds
 comptime RPC_INVALID: Int = 0
@@ -174,36 +184,43 @@ struct JsonRpcFramer(Copyable, Movable):
     """Extracts complete JSON-RPC 2.0 bodies from a byte stream (NDJSON or Content-Length)."""
     var buf: List[UInt8]
     var pos: Int
+    var scan: Int
+    """Bytes from `pos` up to `scan` are known to hold no frame terminator, so a long line that
+    arrives in many chunks is scanned once (linear), not from `pos` on every feed (quadratic)."""
     var dropped: Int
     var line_delimited: Bool
 
     def __init__(out self, line_delimited: Bool = True):
         self.buf = List[UInt8]()
         self.pos = 0
+        self.scan = 0
         self.dropped = 0
         self.line_delimited = line_delimited
 
     def clear(mut self):
         self.buf.clear()
         self.pos = 0
+        self.scan = 0
         self.dropped = 0
 
     def feed(mut self, data: List[UInt8]):
         if self.pos > 0 and self.pos == len(self.buf):
             self.buf.clear()
             self.pos = 0
-        elif self.pos > 65536:
+            self.scan = 0
+        elif self.pos > 65536 and self.pos * 2 > len(self.buf):
             var rest = List[UInt8](capacity=len(self.buf) - self.pos)
             for k in range(self.pos, len(self.buf)):
                 rest.append(self.buf[k])
+            self.scan = max(0, self.scan - self.pos)
             self.buf = rest^
             self.pos = 0
         for i in range(len(data)):
             self.buf.append(data[i])
 
-    def _header_end(self) -> Int:
+    def _header_end(mut self) -> Int:
         var n = len(self.buf)
-        var i = self.pos
+        var i = max(self.pos, self.scan)
         while i + 3 < n:
             if (
                 self.buf[i] == 13
@@ -213,6 +230,7 @@ struct JsonRpcFramer(Copyable, Movable):
             ):
                 return i + 4
             i += 1
+        self.scan = max(self.pos, n - 3)
         return -1
 
     def _content_length(self, start: Int, end: Int) -> Int:
@@ -253,6 +271,7 @@ struct JsonRpcFramer(Copyable, Movable):
             if n < 0 or n > MAX_RPC_MESSAGE_BYTES:
                 self.dropped += he - self.pos
                 self.pos = he
+                self.scan = he
                 continue
             if len(self.buf) - he < n:
                 return False
@@ -260,17 +279,19 @@ struct JsonRpcFramer(Copyable, Movable):
             for k in range(he, he + n):
                 body.append(self.buf[k])
             self.pos = he + n
+            self.scan = self.pos
             return True
 
     def _next_line(mut self, mut body: List[UInt8]) -> Bool:
         while True:
             var n = len(self.buf)
             var nl = -1
-            for i in range(self.pos, n):
+            for i in range(max(self.pos, self.scan), n):
                 if self.buf[i] == 10:
                     nl = i
                     break
             if nl < 0:
+                self.scan = n
                 if n - self.pos > MAX_RPC_MESSAGE_BYTES:
                     self.dropped += n - self.pos
                     self.pos = n
@@ -280,6 +301,7 @@ struct JsonRpcFramer(Copyable, Movable):
                 end -= 1
             var start = self.pos
             self.pos = nl + 1
+            self.scan = self.pos
             if end == start:
                 continue
             body.clear()
@@ -291,6 +313,10 @@ struct JsonRpcFramer(Copyable, Movable):
 struct JsonRpcMessage(Copyable, Movable):
     var kind: Int
     var id: Int
+    """Our numeric request id this response answers, or -1 (null, string or unknown id)."""
+    var id_numeric: Bool
+    var matched: Bool
+    """A response that answers one of our pending requests (anything else is ignored)."""
     var id_json: String
     var method: String
     var doc: JsonDocument
@@ -298,6 +324,8 @@ struct JsonRpcMessage(Copyable, Movable):
     def __init__(out self):
         self.kind = RPC_INVALID
         self.id = -1
+        self.id_numeric = False
+        self.matched = False
         self.id_json = ""
         self.method = ""
         self.doc = JsonDocument()
@@ -330,6 +358,11 @@ struct PipeProcess(Movable):
     var exit_code: Int
     var inbox: List[UInt8]
     var outbox: List[UInt8]
+    var out_off: Int
+    """Bytes of `outbox` already written (the buffer is compacted lazily, not on every write)."""
+    var reap_pid: Int32
+    """A stopped child's process group that is still being reaped (see `poll_reap`)."""
+    var reap_kill_at: Float64
 
     def __init__(out self):
         self.pid = -1
@@ -341,9 +374,15 @@ struct PipeProcess(Movable):
         self.exit_code = -1
         self.inbox = List[UInt8]()
         self.outbox = List[UInt8]()
+        self.out_off = 0
+        self.reap_pid = -1
+        self.reap_kill_at = 0.0
 
     def __deinit__(deinit self):
         self.stop()
+        if self.reap_pid > 0:
+            signal_process_group(self.reap_pid, _SIGKILL)
+            _ = reap_child(self.reap_pid, block=True)
 
     def start_shell(mut self, cmd: String, cwd: String, stderr_path: String = "/dev/null") -> Bool:
         var argv = List[String]()
@@ -354,6 +393,7 @@ struct PipeProcess(Movable):
 
     def start_argv(mut self, argv: List[String], cwd: String, stderr_path: String = "/dev/null") -> Bool:
         self.stop()
+        self.force_reap()
         if len(argv) == 0:
             return False
         _ignore_sigpipe()
@@ -380,9 +420,13 @@ struct PipeProcess(Movable):
             ptrs[i] = Int(args[i].unsafe_ptr())
         var dir_c = _c_string_bytes(cwd)
         var err_c = _c_string_bytes(stderr_path if stderr_path.byte_length() > 0 else String("/dev/null"))
+        var has_cwd = cwd.byte_length() > 0
+        var prelude = ChildExecPrelude()
 
         var pid = external_call["fork", Int32]()
         if pid == 0:
+            # Child: nothing below allocates (every buffer was built before fork).
+            child_exec_prelude(prelude)
             _ = external_call["dup2", Int32](in_r, Int32(0))
             _ = external_call["dup2", Int32](out_w, Int32(1))
             var efd = external_call["openat", Int32](
@@ -391,16 +435,19 @@ struct PipeProcess(Movable):
             if efd >= 0:
                 _ = external_call["dup2", Int32](efd, Int32(2))
             _ = external_call["close_range", Int32](UInt32(3), UInt32(0xFFFFFFFF), UInt32(0))
-            if cwd.byte_length() > 0:
+            if has_cwd:
                 _ = external_call["chdir", Int32](dir_c.unsafe_ptr())
             _ = external_call["execvp", Int32](args[0].unsafe_ptr(), ptrs.unsafe_ptr())
             external_call["_exit", NoneType](Int32(127))
 
+        if pid > 0:
+            _ = external_call["setpgid", Int32](pid, pid)
         # Keep buffers alive across fork
         _ = len(args)
         _ = ptrs[0]
         _ = dir_c[0]
         _ = err_c[0]
+        _ = prelude.sigdfl[0]
 
         close_fd(Int(in_r))
         close_fd(Int(out_w))
@@ -423,17 +470,35 @@ struct PipeProcess(Movable):
         self.exit_code = -1
         self.inbox.clear()
         self.outbox.clear()
+        self.out_off = 0
         return True
 
+    def pending_out_bytes(self) -> Int:
+        return len(self.outbox) - self.out_off
+
     def write(mut self, data: List[UInt8]):
+        if self.write_failed:
+            return
+        if self.pending_out_bytes() + len(data) > MAX_PIPE_OUTBOX_BYTES:
+            # The child stopped reading: never buffer without bound; treat it as a broken pipe.
+            self.write_failed = True
+            self.outbox.clear()
+            self.out_off = 0
+            return
+        if self.out_off > 0 and self.out_off * 2 >= len(self.outbox):
+            var rest = List[UInt8](capacity=len(self.outbox) - self.out_off + len(data))
+            for k in range(self.out_off, len(self.outbox)):
+                rest.append(self.outbox[k])
+            self.outbox = rest^
+            self.out_off = 0
         for i in range(len(data)):
             self.outbox.append(data[i])
         self.flush()
 
     def flush(mut self):
-        if not self.running or self.write_failed or self.in_fd < 0 or len(self.outbox) == 0:
+        if not self.running or self.write_failed or self.in_fd < 0 or self.pending_out_bytes() <= 0:
             return
-        var off = 0
+        var off = self.out_off
         var n = len(self.outbox)
         while off < n:
             var w = Int(
@@ -451,11 +516,11 @@ struct PipeProcess(Movable):
                 break
             self.write_failed = True
             break
-        if off > 0:
-            var rest = List[UInt8](capacity=n - off)
-            for k in range(off, n):
-                rest.append(self.outbox[k])
-            self.outbox = rest^
+        if off >= n:
+            self.outbox.clear()
+            self.out_off = 0
+        else:
+            self.out_off = off
 
     def read_available(mut self) -> Int:
         if not self.running or self.eof or self.out_fd < 0:
@@ -489,16 +554,9 @@ struct PipeProcess(Movable):
     def poll_exit(mut self) -> Bool:
         if self.pid <= 0:
             return True
-        var status = Int32(0)
-        var r = external_call["waitpid", Int32](self.pid, Pointer(to=status), Int32(1))
-        if r == self.pid:
-            var st = Int(status)
-            self.exit_code = ((st >> 8) & 255) if (st & 127) == 0 else (128 + (st & 127))
-            self.pid = -1
-            self.running = False
-            self.eof = True
-            return True
-        if r < 0 and last_errno() == _ECHILD:
+        var rr = reap_child(self.pid)
+        if rr[0]:
+            self.exit_code = rr[1]  # -1 = status unknown (ECHILD), never reported as success
             self.pid = -1
             self.running = False
             self.eof = True
@@ -506,26 +564,48 @@ struct PipeProcess(Movable):
         return False
 
     def stop(mut self):
+        """Closes the agent's stdin and asks its whole process group to exit (SIGTERM), without
+        waiting: `poll_reap` reaps it and sends SIGKILL after `ACP_STOP_GRACE_SEC`."""
         if self.in_fd >= 0:
             close_fd(Int(self.in_fd))
             self.in_fd = -1
         if self.pid > 0:
             if not self.poll_exit():
-                _ = external_call["kill", Int32](self.pid, _SIGTERM)
-                for _ in range(25):
-                    if self.poll_exit():
-                        break
-                    _ = external_call["usleep", Int32](UInt32(10000))
-                if self.pid > 0:
-                    _ = external_call["kill", Int32](self.pid, _SIGKILL)
-                    var st = Int32(0)
-                    _ = external_call["waitpid", Int32](self.pid, Pointer(to=st), Int32(0))
-                    self.pid = -1
+                self.force_reap()  # at most one group is kept waiting
+                signal_process_group(self.pid, _SIGTERM)
+                self.reap_pid = self.pid
+                self.reap_kill_at = get_time() + ACP_STOP_GRACE_SEC
+                self.pid = -1
         if self.out_fd >= 0:
             close_fd(Int(self.out_fd))
             self.out_fd = -1
         self.running = False
         self.eof = True
+        self.outbox.clear()
+        self.out_off = 0
+        _ = self.poll_reap()
+
+    def poll_reap(mut self, now_sec: Float64 = -1.0) -> Bool:
+        """Non-blocking: reaps a stopped agent's group; SIGKILL once its grace has run out.
+        Returns True when nothing is left to reap."""
+        if self.reap_pid <= 0:
+            return True
+        var rr = reap_child(self.reap_pid)
+        if rr[0]:
+            self.reap_pid = -1
+            return True
+        var t = now_sec if now_sec >= 0.0 else get_time()
+        if t >= self.reap_kill_at:
+            signal_process_group(self.reap_pid, _SIGKILL)
+            self.reap_kill_at = t + 3600.0
+        return False
+
+    def force_reap(mut self):
+        """SIGKILLs and reaps a group still waiting in `poll_reap` (shutdown / restart)."""
+        if self.reap_pid > 0:
+            signal_process_group(self.reap_pid, _SIGKILL)
+            _ = reap_child(self.reap_pid, block=True)
+            self.reap_pid = -1
 
 
 # ============================================================================
@@ -694,6 +774,10 @@ struct AcpClient(Movable):
     var thinking_ids: List[String]
     var thinking_names: List[String]
     var open_permissions: List[String]
+    var open_services: List[String]
+    """Raw ids of agent requests handed to Studio as events (file writes, fs reads) that still need
+    an answer. Whatever is left when the turn ends, is cancelled or the agent stops is answered
+    with an error, so the agent never waits forever."""
     var events: List[AcpEvent]
     var outbound_log: List[String]
     var invalid_frames: Int
@@ -740,6 +824,7 @@ struct AcpClient(Movable):
         self.thinking_ids = List[String]()
         self.thinking_names = List[String]()
         self.open_permissions = List[String]()
+        self.open_services = List[String]()
         self.events = List[AcpEvent]()
         self.outbound_log = List[String]()
         self.invalid_frames = 0
@@ -788,6 +873,7 @@ struct AcpClient(Movable):
         self.thinking_ids.clear()
         self.thinking_names.clear()
         self.open_permissions.clear()
+        self.open_services.clear()
         self.events.clear()
         self.outbound_log.clear()
         self.invalid_frames = 0
@@ -843,6 +929,8 @@ struct AcpClient(Movable):
         )
 
     def _send_initialize(mut self, now_sec: Float64):
+        # Only what Studio really implements is advertised: sandboxed fs read/write (see
+        # `StudioAgentRuntime`). Terminals are not offered; `terminal/*` gets method-not-found.
         var svc = "true" if self.services_enabled else "false"
         var params = (
             '{"protocolVersion":'
@@ -851,8 +939,7 @@ struct AcpClient(Movable):
             + svc
             + ',"writeTextFile":'
             + svc
-            + '},"terminal":'
-            + svc
+            + '},"terminal":false'
             + '},"clientInfo":{"name":"flint-studio","title":"Flint Studio","version":"5.0"}}'
         )
         self.init_id = self._send_request("initialize", params)
@@ -885,14 +972,33 @@ struct AcpClient(Movable):
     def stop(mut self):
         if self.busy():
             self.cancel()
-            if not self.headless_mode:
-                self.proc.flush()
+        self._answer_open_services("ACP session stopped")
         if not self.headless_mode:
+            self.proc.flush()
             self.proc.stop()
         self.state = ACP_STOPPED
         self.session_id = ""
         self.prompt_id = -1
         self.open_permissions.clear()
+
+    def _answer_open_services(mut self, why: String):
+        for i in range(len(self.open_services)):
+            var rid = self.open_services[i]
+            self._send_error(rid, ACP_ERR_REFUSED, why)
+        self.open_services.clear()
+
+    def is_open_service(self, request_id: String) -> Bool:
+        for i in range(len(self.open_services)):
+            if self.open_services[i] == request_id:
+                return True
+        return False
+
+    def _close_service(mut self, request_id: String) -> Bool:
+        for i in range(len(self.open_services)):
+            if self.open_services[i] == request_id:
+                _ = self.open_services.pop(i)
+                return True
+        return False
 
     def _fail(mut self, why: String):
         self.state = ACP_FAILED
@@ -923,6 +1029,7 @@ struct AcpClient(Movable):
             var perm_id = self.open_permissions[i]
             self._send_response(perm_id, '{"outcome":{"outcome":"cancelled"}}')
         self.open_permissions.clear()
+        self._answer_open_services("cancelled by user")
         var cancel_params = '{"sessionId":' + json_quote(self.session_id) + "}"
         self._send_notify("session/cancel", cancel_params)
 
@@ -944,11 +1051,18 @@ struct AcpClient(Movable):
             )
         return True
 
-    def answer_service(mut self, request_id: String, result_json: String = "{}"):
+    def answer_service(mut self, request_id: String, result_json: String = "{}") -> Bool:
+        """Answers an open fs request once. Returns False (sends nothing) if it was already answered."""
+        if not self._close_service(request_id):
+            return False
         self._send_response(request_id, result_json)
+        return True
 
-    def answer_service_error(mut self, request_id: String, code: Int, message: String):
+    def answer_service_error(mut self, request_id: String, code: Int, message: String) -> Bool:
+        if not self._close_service(request_id):
+            return False
         self._send_error(request_id, code, message)
+        return True
 
     def set_mode(mut self, mode_id: String) -> Bool:
         if self.state != ACP_READY or mode_id not in self.mode_ids:
@@ -1009,7 +1123,11 @@ struct AcpClient(Movable):
         if has_id:
             m.id_json = json_text(m.doc, idn)
             if m.doc.nodes[idn].kind == JSON_NUMBER:
-                m.id = m.doc.integer(idn, -1)
+                var num = m.doc.nodes[idn].number
+                # Our ids are positive integers; a fractional / negative number never matches one.
+                if num >= 1.0 and num <= 9.0e15 and Float64(Int(num)) == num:
+                    m.id = Int(num)
+                    m.id_numeric = True
         var mn = m.doc.object_get(m.doc.root, "method")
         if mn >= 0 and m.doc.nodes[mn].kind == JSON_STRING:
             m.method = m.doc.text(mn, "")
@@ -1023,12 +1141,14 @@ struct AcpClient(Movable):
         var has_err = m.doc.object_get(m.doc.root, "error") >= 0
         if has_res or has_err:
             m.kind = RPC_ERROR if has_err else RPC_RESPONSE
-            for k in range(len(self.pending_ids)):
-                if self.pending_ids[k] == m.id:
-                    m.method = self.pending_methods[k]
-                    _ = self.pending_ids.pop(k)
-                    _ = self.pending_methods.pop(k)
-                    break
+            if m.id_numeric:
+                for k in range(len(self.pending_ids)):
+                    if self.pending_ids[k] == m.id:
+                        m.method = self.pending_methods[k]
+                        m.matched = True
+                        _ = self.pending_ids.pop(k)
+                        _ = self.pending_methods.pop(k)
+                        break
             return m^
         self.invalid_frames += 1
         return m^
@@ -1048,6 +1168,8 @@ struct AcpClient(Movable):
 
     def pump(mut self, now_sec: Float64 = -1.0):
         """Flushes outbound requests, drains child stdout, parses events, and checks timeouts."""
+        if not self.headless_mode:
+            _ = self.proc.poll_reap()
         if self.headless_mode or not self.proc.running:
             return
         var t = now_sec if now_sec >= 0.0 else get_time()
@@ -1060,8 +1182,13 @@ struct AcpClient(Movable):
             self.proc.stop()
             self._fail("ACP agent did not respond to initialize within 30s")
             return
+        if self.proc.write_failed and self.state != ACP_FAILED:
+            self.proc.stop()
+            self._fail("ACP agent stopped reading its input")
+            return
         if self.proc.eof or self.proc.poll_exit():
             self.proc.stop()
+            self.open_services.clear()
             if self.state != ACP_FAILED:
                 self._fail(
                     "ACP agent process exited"
@@ -1155,34 +1282,38 @@ struct AcpClient(Movable):
                 self.open_permissions.append(m.id_json)
                 self.events.append(ev^)
             elif self.services_enabled and m.method == "fs/write_text_file":
+                var pn = m.doc.object_get(p, "path")
+                var cn = m.doc.object_get(p, "content")
+                if (
+                    pn < 0 or m.doc.nodes[pn].kind != JSON_STRING
+                    or cn < 0 or m.doc.nodes[cn].kind != JSON_STRING
+                ):
+                    self._send_error(m.id_json, ACP_ERR_INVALID_PARAMS, "fs/write_text_file needs string path and content")
+                    return
                 var ev = AcpEvent(AE_FILE_PROPOSAL)
                 ev.kind_name = m.method
                 ev.request_id = m.id_json
-                ev.path = m.doc.text(m.doc.object_get(p, "path"), "")
-                ev.text = m.doc.text(m.doc.object_get(p, "content"), "")
+                ev.path = m.doc.text(pn, "")
+                ev.text = m.doc.text(cn, "")
+                self.open_services.append(m.id_json)
                 self.events.append(ev^)
-            elif self.services_enabled and m.method == "terminal/create":
-                var ev = AcpEvent(AE_CMD_APPROVAL)
-                ev.kind_name = m.method
-                ev.request_id = m.id_json
-                var cmd = m.doc.text(m.doc.object_get(p, "command"), "")
-                ev.path = m.doc.text(m.doc.object_get(p, "cwd"), self.cwd)
-                ev.argv.append(cmd)
-                var args_node = m.doc.object_get(p, "args")
-                var title = cmd
-                for ai in range(m.doc.array_size(args_node)):
-                    var a = m.doc.text(m.doc.at(args_node, ai), "")
-                    ev.argv.append(a)
-                    title += " " + a
-                ev.title = title
-                self.events.append(ev^)
-            elif self.services_enabled and (
-                m.method.startswith("fs/") or m.method.startswith("terminal/")
-            ):
+            elif self.services_enabled and m.method == "fs/read_text_file":
+                var pn = m.doc.object_get(p, "path")
+                if pn < 0 or m.doc.nodes[pn].kind != JSON_STRING:
+                    self._send_error(m.id_json, ACP_ERR_INVALID_PARAMS, "fs/read_text_file needs a string path")
+                    return
                 var ev = AcpEvent(AE_SERVICE)
                 ev.kind_name = m.method
                 ev.request_id = m.id_json
-                ev.text = json_text(m.doc, p) if p >= 0 else String("{}")
+                ev.path = m.doc.text(pn, "")
+                ev.text = json_text(m.doc, p)
+                var ln = m.doc.object_get(p, "line")
+                var lim = m.doc.object_get(p, "limit")
+                if ln >= 0 and m.doc.nodes[ln].kind == JSON_NUMBER:
+                    ev.status = String(m.doc.integer(ln, 0))
+                if lim >= 0 and m.doc.nodes[lim].kind == JSON_NUMBER:
+                    ev.stop_reason = String(m.doc.integer(lim, 0))
+                self.open_services.append(m.id_json)
                 self.events.append(ev^)
             else:
                 self._send_error(
@@ -1190,6 +1321,11 @@ struct AcpClient(Movable):
                 )
 
     def _handle_response(mut self, m: JsonRpcMessage):
+        # A response with a null / string / unknown id, or one we already had, answers nothing we
+        # asked: ignore it (an id of -1 must never match a cleared `init_id` of -1).
+        if not m.matched or m.id < 1:
+            self.invalid_frames += 1
+            return
         if m.id == self.init_id:
             self.init_id = -1
             if m.kind == RPC_ERROR:
@@ -1311,6 +1447,7 @@ struct AcpClient(Movable):
         if m.id == self.prompt_id:
             self.prompt_id = -1
             self.open_permissions.clear()
+            self._answer_open_services("turn ended before Studio answered")
             if m.kind == RPC_ERROR:
                 var ev = AcpEvent(AE_ERROR)
                 ev.stop_reason = "error"
