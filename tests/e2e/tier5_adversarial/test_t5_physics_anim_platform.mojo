@@ -425,7 +425,9 @@ def test_t5_pl03_input_diagonal_toggle_mash_and_x11_symmetry(mut ctx: TestContex
     x11.incoming[0] = 3; x11.incoming[1] = 25; x11_put32(x11.incoming, 4, 12345)
     x11.incoming[32] = 2; x11.incoming[33] = 25; x11_put32(x11.incoming, 36, 12345)
     x11.process_events()
-    ctx.assert_equal(len(x11.pending_keys), 0, "X11 filters synthetic KeyRelease+KeyPress auto-repeat")
+    # A server auto-repeat pair collapses to one key-down (a repeat), never a release.
+    ctx.assert_equal(len(x11.pending_keys), 1, "X11 collapses synthetic KeyRelease+KeyPress auto-repeat to one press")
+    ctx.assert_true(len(x11.pending_key_down) == 1 and x11.pending_key_down[0], "X11 auto-repeat keeps the key held")
 
 
 def test_t5_d01_mcp_and_overlays(mut ctx: TestContext) raises:

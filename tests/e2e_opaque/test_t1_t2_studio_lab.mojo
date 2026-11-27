@@ -229,7 +229,7 @@ def test_t1_studio_scene_save_load_and_asset_browser(tmp_root: String) raises:
     var loaded = FlintStudioState()
     assert_true(loaded.load_scene_file(scene_path))
     assert_equal(loaded.state_hash(), saved_hash)
-    assert_false(loaded.can_undo())
+    assert_true(loaded.can_undo())  # Load is one undoable step (back to the empty world)
     assert_false(loaded.can_redo())
 
     var scanned = loaded.scan_asset_browser(dir_path=scene_dir)

@@ -3404,9 +3404,9 @@ def test_j_studio_v5_unification_ux_and_headless_smoke(tmp_root: String) raises:
 
     # Bulk duplicate & bulk delete + Undo
     var dup_ids = st.duplicate_selected(record_undo=True)
-    _assert(len(dup_ids) == 2 and st.live_entity_count() == 5, "duplicate_selected failed")
-    _assert(st.despawn_selected(record_undo=True) == 2 and st.live_entity_count() == 3, "despawn_selected failed")
-    _assert(st.undo() and st.live_entity_count() == 5 and st.undo() and st.state_hash() == h_post_bulk, "undo bulk delete/dup mismatch")
+    _assert(len(dup_ids) == 2 and st.live_entity_count() == 6, "duplicate_selected failed (p subtree + d: 3 new entities)")
+    _assert(st.despawn_selected(record_undo=True) == 2 and st.live_entity_count() == 4, "despawn_selected failed (the duplicated child is reparented up, not deleted)")
+    _assert(st.undo() and st.live_entity_count() == 6 and st.undo() and st.state_hash() == h_post_bulk, "undo bulk delete/dup mismatch")
 
     # Simulated UI Hierarchy & Multi-Select click interaction (`emit_studio_ui_draw_list`)
     var ui_dl = UiDrawList()

@@ -629,6 +629,8 @@ comptime COLLIDER_CAPSULE: Int = 3
 comptime COLLIDER_STATIC_MESH: Int = 4
 
 # `spawn_card_entity` kinds (Scene menu, Quick Spawn palette, spawn cards).
+comptime STUDIO_MESH_DEFAULT_CUBE: Int = -2  # `spawn_entity` sentinel: use the unit cube mesh
+
 comptime SPAWN_CARD_EMPTY: Int = 0
 comptime SPAWN_CARD_CUBE: Int = 1
 comptime SPAWN_CARD_POINT_LIGHT: Int = 2
@@ -1598,6 +1600,7 @@ def _push_unique_free_slot(mut pool: List[Int], slot_id: Int):
 struct StudioGpuMaterials(Movable):
     """Cached GPU PBR/NPR-Cel/VFX material slot mappings per Studio entity slot."""
     var grid_mesh_id: Int
+    var cube_mesh_id: Int  # unit cube for spawned boxes; registered on first use (-1 = not yet)
     var orb_mesh_id: Int
     var torus_mesh_id: Int
     var colonnade_mesh_id: Int
@@ -1617,6 +1620,7 @@ struct StudioGpuMaterials(Movable):
 
     def __init__(out self):
         self.grid_mesh_id = 0
+        self.cube_mesh_id = -1
         self.orb_mesh_id = 0
         self.torus_mesh_id = 0
         self.colonnade_mesh_id = 0
@@ -2679,6 +2683,9 @@ struct FlintStudioState(Movable):
         var fix_init = self.app.resources.get_ptr_mut[FixedTime]()
         if fix_init:
             fix_init.value()[unsafe_offset=0].overstep_alpha = Float32(1.0)
+        # Registered once at startup so the unit cube's mesh id is identical in every session
+        # (saved scenes store renderer mesh ids; a lazy registration order would differ per session).
+        _ = self.default_cube_mesh_id()
 
     def shutdown(mut self):
         if self.hot_reload_host.is_loaded():
@@ -4071,7 +4078,7 @@ struct FlintStudioState(Movable):
             if cmd_id == PAL_CMD_SPAWN_AUDIO:
                 return self.spawn_card_entity(5) >= 0
             if cmd_id == PAL_CMD_SPAWN_PHYSICS_BOX:
-                return self.spawn_entity("PhysBox_" + String(self.live_entity_count() + 1), position=Vec3(0.0, 2.0, 0.0), collider_kind=COLLIDER_BOX, mass=5.0, mesh_id=1) >= 0
+                return self.spawn_entity("PhysBox_" + String(self.live_entity_count() + 1), position=Vec3(0.0, 2.0, 0.0), collider_kind=COLLIDER_BOX, mass=5.0) >= 0
             if cmd_id == PAL_CMD_SPAWN_TRIGGER:
                 var tid = self.spawn_entity("Trigger_" + String(self.live_entity_count() + 1), position=Vec3(0.0, 1.0, 0.0), collider_kind=COLLIDER_BOX, mass=0.0, mesh_id=-1)
                 if tid >= 0:
@@ -5146,7 +5153,7 @@ struct FlintStudioState(Movable):
             # A directional sun: the render plugin takes the sun from the first enabled EnvironmentComponent.
             _ = self.app.world.insert[EnvironmentComponent](e, EnvironmentComponent())
         if card_idx == SPAWN_CARD_CUBE:
-            _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(0, -1, True, True))
+            _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(self.default_cube_mesh_id(), -1, True, True))
             _ = self.app.world.insert[MaterialOverrideComponent](
                 e, MaterialOverrideComponent(-1, Vec3(0.82, 0.84, 0.88), Float32(0.38), Float32(0.10), Vec3(), True)
             )
@@ -7623,6 +7630,25 @@ struct FlintStudioState(Movable):
             if self.app.world.has[RigidBodyComponent](e):
                 _ = self.app.world.remove[RigidBodyComponent](e)
 
+    def default_cube_mesh_id(mut self) -> Int:
+        """The renderer id of the unit cube used for spawned boxes, registered on first use.
+        Mesh 0 is the reference grid once the showcase meshes are uploaded, so boxes must not
+        default to it (a "Cube" used to render as a flat 36 m grid, or as nothing on Tier 0)."""
+        if self.gpu_materials.cube_mesh_id >= 0:
+            return self.gpu_materials.cube_mesh_id
+        var rend_opt = self.app.resources.get_ptr_mut[ScalableRenderer]()
+        if not rend_opt:
+            return 0
+        ref renderer = rend_opt.value()[unsafe_offset=0]
+        # Spawned boxes always carry a MaterialOverride, so the mesh's own material is only a
+        # fallback: reuse material 0 when there is one, never allocate another slot.
+        var mat_id = 0 if len(renderer.materials) > 0 else -1  # -1: renderer default material
+        var mid = renderer.register_mesh(build_studio_unit_cube_mesh(), mat_id, build_lods=False)
+        if mid < 0:
+            return 0
+        self.gpu_materials.cube_mesh_id = mid
+        return mid
+
     def spawn_entity(
         mut self,
         name: String,
@@ -7635,10 +7661,11 @@ struct FlintStudioState(Movable):
         base_color: Vec3 = Vec3(0.82, 0.84, 0.88),
         roughness: Float32 = 0.38,
         metallic: Float32 = 0.10,
-        mesh_id: Int = 0,
+        mesh_id: Int = STUDIO_MESH_DEFAULT_CUBE,
         parent_id: Int = -1,
         record_undo: Bool = True,
     ) -> Int:
+        var resolved_mesh = self.default_cube_mesh_id() if mesh_id == STUDIO_MESH_DEFAULT_CUBE else mesh_id
         var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
         var prev_ids = self.selected_entity_ids.copy()
         var prev_primary = self.selected_entity_id
@@ -7666,7 +7693,7 @@ struct FlintStudioState(Movable):
         _ = self.app.world.insert[LocalTransform](e, lt)
         _ = self.app.world.insert[GlobalTransform](e, gt.copy())
         _ = self.app.world.insert[PrevGlobalTransform](e, PrevGlobalTransform(gt^))
-        _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(mesh_id, -1, True, True))
+        _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(resolved_mesh, -1, True, True))
         var safe_r = roughness if isfinite(roughness) else Float32(0.38)
         var safe_m = metallic if isfinite(metallic) else Float32(0.10)
         var clamp_r = max(Float32(0.04), min(Float32(1.0), safe_r))
@@ -10475,6 +10502,33 @@ def _make_beveled_unit_box_mesh() -> NativeMesh:
         var i3 = mb.add_vertex(c - u * Float32(0.5) + v * Float32(0.5), n, 0.0, 0.0)
         mb.add_tri(i0, i1, i2)
         mb.add_tri(i0, i2, i3)
+    return mb^.finish()
+
+
+def build_studio_unit_cube_mesh() -> NativeMesh:
+    """A 1 m unit cube centred on the origin (24 vertices, flat per-face normals), so an
+    entity's scale is its size and the default 0.5 m box collider matches it."""
+    var mb = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.38, metallic=0.10)
+    var normals = List[Vec3]()
+    normals.append(Vec3(1.0, 0.0, 0.0))
+    normals.append(Vec3(-1.0, 0.0, 0.0))
+    normals.append(Vec3(0.0, 1.0, 0.0))
+    normals.append(Vec3(0.0, -1.0, 0.0))
+    normals.append(Vec3(0.0, 0.0, 1.0))
+    normals.append(Vec3(0.0, 0.0, -1.0))
+    for fi in range(6):
+        var n = normals[fi]
+        var u = Vec3(0.0, 0.0, 1.0) if abs(n.x) > Float32(0.5) else Vec3(1.0, 0.0, 0.0)
+        var v = n.cross(u)  # u x v == n, so (q1 - q0) x (q2 - q0) faces outward
+        var c = n * Float32(0.5)
+        var hu = u * Float32(0.5)
+        var hv = v * Float32(0.5)
+        var q0 = mb.add_vertex(c - hu - hv, n, 0.0, 0.0)
+        var q1 = mb.add_vertex(c + hu - hv, n, 1.0, 0.0)
+        var q2 = mb.add_vertex(c + hu + hv, n, 1.0, 1.0)
+        var q3 = mb.add_vertex(c - hu + hv, n, 0.0, 1.0)
+        mb.add_tri(q0, q1, q2)
+        mb.add_tri(q0, q2, q3)
     return mb^.finish()
 
 
