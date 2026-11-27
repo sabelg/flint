@@ -107,7 +107,7 @@ from flint.physics.world import (
 )
 from flint.physics.plugin import ColliderComponent, RigidBodyComponent
 from flint.platform.input import InputState
-from flint.platform.os import file_size, get_time, is_directory, make_dirs, read_bytes, remove_file, write_bytes
+from flint.platform.os import env_flag, file_size, get_time, is_directory, make_dirs, read_bytes, remove_file, write_bytes
 from flint.platform.vulkan import LAYOUT_SHADER_READ_ONLY, LAYOUT_UNDEFINED, VulkanGpu
 from flint.procedural import (
     ENFORCER_BONE_COUNT,
@@ -212,6 +212,15 @@ from flint.ui.draw_list import UiDrawList
 def _assert(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("ASSERTION FAILED: " + msg)
+
+
+def _gpu_skip(what: String) raises:
+    """Report a GPU-only block that did not run. Silent skips hid broken GPU picking, so the
+    skip is printed, and `FLINT_REQUIRE_GPU=1` (set by the gate when a Vulkan device exists)
+    turns it into a failure."""
+    if env_flag("FLINT_REQUIRE_GPU"):
+        raise Error("ASSERTION FAILED: FLINT_REQUIRE_GPU=1 but GPU test did not run: " + what)
+    print("  [SKIP] no Vulkan device: " + what)
 
 
 def _str_bytes(s: String) -> List[UInt8]:
@@ -889,6 +898,8 @@ def test_c_visbuffer_picking() raises:
 
         async_picker.shutdown(ren)
         ren.shutdown()
+    else:
+        _gpu_skip("headless FlintAaaVulkanRenderer 1-pixel VisBuffer pick + async picker (ren.active is False)")
 
     # Bug 1 regression: Studio E2E instance-to-entity filtering (mesh_id=-1 / OOB), 1-arg vs explicit overload, and delete-all empty-map check
     var st_pick = FlintStudioState(headless=True, render_tier=RENDER_TIER_2_AAA_VISBUFFER_RT, width=320, height=240)
@@ -1039,6 +1050,8 @@ def test_c_visbuffer_picking() raises:
         )
 
         st_picker.shutdown(st_gpu)
+    else:
+        _gpu_skip("Studio tier-2 VisBuffer pick entity filtering (ScalableRenderer.uses_vulkan() is False)")
     st_pick.shutdown()
 
     # Tier-0 / software fallback picking through VisBufferGpuPicker unified queue

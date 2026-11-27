@@ -315,7 +315,7 @@ with McpStdioClient([studio_bin, "--project", proj, "--mcp-stdio"], cwd=proj, fr
 
     c.call_tool("ecs.spawn_entity", {"name": "ShippedActor", "position": [0.0, 2.0, 0.0], "mass": 1.0})
     c.call_tool("scene.save", {"path": "assets/main.flscn"})
-    c.call_tool("project.package", {"output_dir": "dist/p4_pkg"})
+    c.call_tool("project.package", {"output_dir": "dist/p4_pkg"}, timeout=900.0)
 PY
     )" || py_rc=$?
     if [[ "$py_rc" -ne 0 ]]; then

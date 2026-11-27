@@ -450,8 +450,29 @@ from flint.studio.gizmo import (
 )
 from flint.studio.ide_pty import IdePty
 from flint.studio.ide_view import raster_ui, toolbar_label
-from flint.studio.motion_editor import FollowCamera, frame, next_clip, point, relative_to, timing_click
-from flint.studio.motion_tools import MotionTools, CONTACT, TIMING, draw_dust, frame_joint, nearest_frame, shake_offset
+from flint.studio.motion_editor import (
+    FollowCamera,
+    clip_index,
+    contact_self_check,
+    frame,
+    next_clip,
+    point,
+    relative_to,
+    timing_click,
+)
+from flint.studio.motion_tools import (
+    MotionHistory,
+    MotionTools,
+    QuitGuard,
+    CONTACT,
+    TIMING,
+    draw_dust,
+    frame_joint,
+    last_frame,
+    nearest_frame,
+    same_motion,
+    shake_offset,
+)
 from flint.studio.profile_compare import Capture
 from flint.studio.scene_menu import SceneMenu
 from flint.studio.studio_app import FlintStudioState, _fmt_f32_2dp
@@ -592,6 +613,54 @@ def test_anim_choreography_and_combat_timing(tmp_dir: String) raises:
     assert_equal(len(seq.events), n_events_before + 1)
     seq.save(saved_motion)
 
+    # Full save -> reload round trip: every field, and the events in order with their kinds.
+    seq.set_event(20, 3)
+    seq.set_event(2, 2)
+    seq.set_event(10, 0)  # same frame as (10, Cloth): kept after it, not merged
+    seq.set_event(0, 0)
+    seq.sound = "hit.wav"
+    seq.support = "hand_l"
+    seq.markers.append("hips")
+    seq.yaw = Float32(15.0)
+    seq.cue = Float32(0.375)
+    seq.scale = Float32(1.25)
+    seq.start = Vec3(0.5, -1.25, -1.0)
+    seq.ledge = Vec3(1.0, 2.5, -0.75)
+    seq.eye_a = Vec3(2.0, 2.25, -3.0)
+    seq.eye_b = Vec3(2.5, 2.5, -1.0)
+    seq.aim = Vec3(0.0, 1.5, 0.25)
+    seq.save(saved_motion)
+    var rt = MotionSequence(saved_motion)
+    assert_equal(rt.model_path, "hero.glb")
+    assert_equal(rt.first, "jump")
+    assert_equal(rt.second, "grab")
+    assert_equal(rt.contact, "hand_r")
+    assert_equal(rt.support, "hand_l")
+    assert_equal(rt.sound, "hit.wav")
+    assert_equal(len(rt.markers), 2)
+    assert_equal(rt.markers[0], "hand_r")
+    assert_equal(rt.markers[1], "hips")
+    assert_equal(rt.overlap, Float32(0.25))
+    assert_equal(rt.scale, Float32(1.25))
+    assert_equal(rt.cue, Float32(0.375))
+    assert_equal(rt.yaw, Float32(15.0))
+    var want_vecs = [seq.start, seq.ledge, seq.eye_a, seq.eye_b, seq.aim]
+    var got_vecs = [rt.start, rt.ledge, rt.eye_a, rt.eye_b, rt.aim]
+    for i in range(len(want_vecs)):
+        assert_true(
+            got_vecs[i].x == want_vecs[i].x and got_vecs[i].y == want_vecs[i].y and got_vecs[i].z == want_vecs[i].z,
+            "vector field " + String(i) + " changed across save/load",
+        )
+    var want_frames = [0, 2, 10, 10, 20]
+    var want_kinds = [0, 2, 1, 0, 3]
+    assert_equal(len(rt.events), len(want_frames))
+    for i in range(len(want_frames)):
+        assert_equal(rt.events[i].frame, want_frames[i])
+        assert_equal(rt.events[i].kind, want_kinds[i])
+    assert_true(same_motion(seq, rt), "reloaded preset must equal the saved one field for field")
+    rt.events[2].kind = 3
+    assert_false(same_motion(seq, rt), "same_motion must notice a changed event kind")
+
     # 2. CombatTiming & [Low/Med-12] OOB marker(-1)/marker(99) -> -1 sentinel
     var combat_path = tmp_dir + "/slash.combat.json"
     _write_text(
@@ -652,6 +721,90 @@ def test_studio_editors_compare_and_room(tmp_dir: String) raises:
     assert_true(valid_tl.changed)
     assert_equal(ct.impact, 6)
     inp.set_mouse(0, False)
+    inp.begin_frame()
+    assert_equal(valid_tl.input(ct, inp, 160, 40), -1)
+    assert_equal(valid_tl.dragging, -1)
+
+    # Lane 1 (close): press, then keep dragging past the chain marker -> clamped to chain.
+    inp.begin_frame()
+    inp.set_mouse(0, True)
+    assert_equal(valid_tl.input(ct, inp, 220, 60), 12)
+    assert_equal(valid_tl.selected, 1)
+    assert_equal(ct.close, 12)
+    inp.begin_frame()  # still held: pointer capture keeps lane 1 even off the lane
+    assert_equal(valid_tl.input(ct, inp, 300, 5), 15)
+    assert_equal(ct.close, 15)
+    assert_true(valid_tl.changed)
+    inp.begin_frame()
+    assert_equal(valid_tl.input(ct, inp, 300, 5), 15)
+    assert_false(valid_tl.changed, "dragging onto the clamp again is not a change")
+    inp.set_mouse(0, False)
+    inp.begin_frame()
+    assert_equal(valid_tl.input(ct, inp, 300, 5), -1)
+
+    # Lane 2 (chain): clamped to end - 1.
+    inp.begin_frame()
+    inp.set_mouse(0, True)
+    assert_equal(valid_tl.input(ct, inp, 306, 80), 19)
+    assert_equal(valid_tl.selected, 2)
+    assert_equal(ct.chain, 19)
+    inp.set_mouse(0, False)
+    inp.begin_frame()
+    _ = valid_tl.input(ct, inp, 0, 0)
+
+    # Lane 3 (preview scrub): returns the frame, moves no marker, keeps the selection.
+    inp.begin_frame()
+    inp.set_mouse(0, True)
+    assert_equal(valid_tl.input(ct, inp, 150, 100), 5)
+    assert_equal(valid_tl.dragging, 3)
+    assert_equal(valid_tl.selected, 2)
+    assert_equal(ct.impact, 6)
+    assert_equal(ct.close, 15)
+    assert_equal(ct.chain, 19)
+    inp.set_mouse(0, False)
+    inp.begin_frame()
+    _ = valid_tl.input(ct, inp, 0, 0)
+
+    # Tab cycles the selected marker 2 -> 0 -> 1 -> 2 -> 0.
+    var tab_order = [0, 1, 2, 0]
+    for i in range(len(tab_order)):
+        inp.begin_frame()
+        inp.set_key(258, True)
+        _ = valid_tl.input(ct, inp, 0, 0)
+        inp.set_key(258, False)
+        assert_equal(valid_tl.selected, tab_order[i])
+
+    # Arrow nudges move the selected marker one frame and clamp at its neighbours.
+    inp.begin_frame()
+    inp.set_key(262, True)
+    assert_equal(valid_tl.input(ct, inp, 0, 0), 7)
+    inp.set_key(262, False)
+    assert_equal(ct.impact, 7)
+    assert_true(valid_tl.changed)
+    ct.move_marker(0, 0)
+    inp.begin_frame()
+    inp.set_key(263, True)
+    assert_equal(valid_tl.input(ct, inp, 0, 0), 0)
+    inp.set_key(263, False)
+    assert_equal(ct.impact, 0)
+    assert_false(valid_tl.changed, "nudging impact below frame 0 must clamp")
+    inp.begin_frame()
+    inp.set_key(258, True)
+    _ = valid_tl.input(ct, inp, 0, 0)
+    inp.set_key(258, False)
+    assert_equal(valid_tl.selected, 1)
+    ct.move_marker(1, 19)
+    assert_equal(ct.close, 19)
+    inp.begin_frame()
+    inp.set_key(262, True)
+    assert_equal(valid_tl.input(ct, inp, 0, 0), 19)
+    inp.set_key(262, False)
+    assert_false(valid_tl.changed, "nudging close past chain must clamp")
+    inp.begin_frame()
+    inp.set_key(263, True)
+    assert_equal(valid_tl.input(ct, inp, 0, 0), 18)
+    inp.set_key(263, False)
+    assert_true(valid_tl.changed)
 
     # 2. profile_compare.Capture [MEDIUM-1] valid, missing traceEvents, OOB at(), incomplete error
     var cap_path = tmp_dir + "/trace.json"
@@ -718,7 +871,17 @@ def test_studio_editors_compare_and_room(tmp_dir: String) raises:
     var player = MotionPlayer(model, seq)
     var cam = FollowCamera.view(Placement(Vec3(0.0, 0.0, 0.0)), Float32(0.5))
     var pt = point(SimdCanvas(960, 640), cam, Vec3(0.0, 1.0, 0.0))
-    assert_true(pt[0] >= 0)
+    var proj = cam.project(Vec3(0.0, 1.0, 0.0))
+    assert_true(proj[3])
+    assert_equal(pt[0], Int(proj[0]))
+    assert_equal(pt[1], Int(proj[1]))
+    assert_true(pt[2], "a point in front of the follow camera, above the timeline bar, is visible")
+    assert_true(pt[0] > 0 and pt[0] < 960 and pt[1] > 0 and pt[1] < 482)
+    # Behind the camera (the eye sits at z = -4.3) and below the timeline bar are both hidden.
+    assert_false(point(SimdCanvas(960, 640), cam, Vec3(0.0, 1.0, -9.0))[2])
+    var low = cam.project(Vec3(0.0, -3.0, 0.0))
+    assert_true(low[3] and low[1] >= Float32(482))
+    assert_false(point(SimdCanvas(960, 640), cam, Vec3(0.0, -3.0, 0.0))[2])
     var canvas = SimdCanvas(960, 640)
     frame[FollowCamera](canvas, model, seq, player, Float32(0.5), False, "TEST", True)
     var non_bg = 0
@@ -726,6 +889,82 @@ def test_studio_editors_compare_and_room(tmp_dir: String) raises:
         if px != canvas.pixels[0]:
             non_bg += 1
     assert_true(non_bg > 100)
+
+    # 4b. Contact Inspector self-check. A known-slipping fixture (contact pins the hand to the
+    # ledge as the blend rises, so the frame-0 anchor drifts) must report a slip frame > 0 that
+    # matches the brute-force scan; a motionless fixture must report exactly -1.
+    var slip = contact_self_check(model, seq, player)
+    assert_true(slip > 0, "moving contact fixture must slip, got " + String(slip))
+    var still_model = _make_test_model(Float32(1.0), Float32(0.8))
+    still_model.animations[0].channels[0].values = [Float32(0.0), 1.0, 0.0, 0.0, 1.0, 0.0]
+    still_model.animations[1].channels[0].values = [Float32(0.0), 1.0, 0.0, 0.0, 1.0, 0.0]
+    var still_path = tmp_dir + "/still.motion.json"
+    _write_text(
+        still_path,
+        '{"version":1,"model":"hero.glb","first":"jump","second":"grab","contact":"",'
+        '"markers":["hand_r"],"support":"","overlap":0.25,"scale":1.0,"start":[0,0,-1],"ledge":[0,2,0],'
+        '"yaw":0,"cameraStart":[2,2,-3],"cameraEnd":[2,2.5,-1],"cameraAim":[0,1.5,0],"cue":0.5,"sound":""}\n',
+    )
+    var still_seq = MotionSequence(still_path)
+    var still_player = MotionPlayer(still_model, still_seq)
+    assert_equal(contact_self_check(still_model, still_seq, still_player), -1)
+    var still_tools = MotionTools()
+    still_tools.pin(still_model, still_seq, still_player, 0, frame_joint(still_player, still_model, still_seq, 0, 0))
+    assert_true(still_tools.pinned)
+    assert_equal(still_tools.first_slip, -1)
+
+    # 4c. One last-frame definition for the timing track.
+    assert_equal(last_frame(Float32(1.6)), 48)
+    assert_equal(last_frame(Float32(1.0)), 30)
+    assert_equal(last_frame(Float32(1.0) / Float32(30.0)), 1)
+    assert_equal(last_frame(Float32(0.049)), 1)
+    assert_equal(last_frame(Float32(0.0)), 0)
+    assert_equal(last_frame(Float32(-2.0)), 0)
+    assert_equal(clip_index(model, "grab", -1), 1)
+    assert_equal(clip_index(model, "missing", 7), 7)
+
+    # 4d. Motion editor undo/redo + unsaved-changes guard.
+    var hist = MotionHistory(seq)
+    assert_false(hist.dirty(seq))
+    assert_false(hist.can_undo())
+    var edit = seq.copy()
+    edit.overlap = Float32(0.5)
+    assert_true(hist.track(edit))
+    assert_false(hist.track(edit), "an unchanged sequence is not a new step")
+    assert_true(hist.dirty(edit))
+    edit.set_event(4, 1)
+    assert_false(hist.track(edit, busy=True), "a drag in progress is held back")
+    edit.set_event(6, 2)
+    assert_true(hist.track(edit))  # the whole drag becomes one step
+    assert_true(hist.undo(edit))
+    assert_equal(len(edit.events), 0)
+    assert_equal(edit.overlap, Float32(0.5))
+    assert_true(hist.undo(edit))
+    assert_true(same_motion(edit, seq))
+    assert_false(hist.dirty(edit), "undoing back to the saved state clears dirty")
+    assert_false(hist.undo(edit))
+    assert_true(hist.redo(edit))
+    assert_equal(edit.overlap, Float32(0.5))
+    assert_true(hist.redo(edit))
+    assert_equal(len(edit.events), 2)
+    assert_false(hist.redo(edit))
+    assert_true(hist.undo(edit))
+    edit.yaw = Float32(45.0)  # a new edit after undo drops the redo branch
+    assert_true(hist.track(edit))
+    assert_false(hist.can_redo())
+    hist.mark_saved(edit)
+    assert_false(hist.dirty(edit))
+    assert_true(hist.undo(edit))
+    assert_true(hist.dirty(edit), "undo past the save point is unsaved again")
+    var guard = QuitGuard()
+    assert_true(guard.request(False), "clean editor quits at once")
+    assert_false(guard.request(True), "first Esc with unsaved changes asks")
+    assert_true(guard.armed)
+    assert_true(guard.request(True), "second Esc discards and quits")
+    var guard2 = QuitGuard()
+    assert_false(guard2.request(True))
+    guard2.cancel()
+    assert_false(guard2.request(True), "cancelling re-arms the question")
 
     # 5. IdePty move & stop guards
     var p1 = IdePty()
@@ -859,11 +1098,35 @@ def test_studio_motion_tools_and_scene_menu(tmp_dir: String) raises:
     _ = frame_joint(player_empty, model, seq_empty, 0, 0)
     _ = frame_joint(player_empty, model, seq_empty, 0, -1)
     var canvas = SimdCanvas(960, 640)
+    canvas.clear()
     mt.hud(canvas, model, seq_empty, player_empty, 0, 480, "OK")
-    mt.tab = TIMING
-    mt.hud(canvas, model, seq_empty, player_empty, 0, 480, "OK")
+    # Tab bar: the active tab (Contact Inspector, the third of four) is highlighted.
+    assert_equal(canvas.pixels[2 * 960 + 2 * 960 // 4 + 2], UInt32(0xFF365064))
+    assert_equal(canvas.pixels[2 * 960 + 2], UInt32(0xFF1C2938))
+    # The tool panel below the bar is painted.
+    assert_equal(canvas.pixels[(480 + 25) * 960 + 900], UInt32(0xFF15202E))
     seq_empty.set_event(3, 3)
-    assert_true(shake_offset(seq_empty, Float32(3) / Float32(30) + Float32(0.02)).length() >= Float32(0.0))
+    mt.tab = TIMING
+    canvas.clear()
+    mt.hud(canvas, model, seq_empty, player_empty, 3, 480, "OK")
+    assert_equal(canvas.pixels[2 * 960 + 3 * 960 // 4 + 2], UInt32(0xFF365064))
+    # The Shake event at F3 sits in lane 3 at x = 140 + (W - 157) * 3 // last_frame(duration).
+    var hud_last = max(1, last_frame(player_empty.duration(model, seq_empty)))
+    assert_equal(hud_last, 48)
+    var ev_x = 140 + (960 - 157) * 3 // hud_last
+    assert_equal(canvas.pixels[(480 + 29 + 3 * 18 + 6) * 960 + ev_x + 2], UInt32(0xFFFFC455))
+    # No event in lane 0 at that frame: the lane shows its selected-lane fill instead.
+    assert_equal(canvas.pixels[(480 + 29 + 6) * 960 + ev_x + 2], UInt32(0xFF385365))
+    # The playhead (1 px wide, drawn over the lanes) sits on F3 too.
+    assert_equal(canvas.pixels[(480 + 40) * 960 + ev_x], UInt32(0xFFB7E9E0))
+
+    # Shake cue at F3 (0.1 s): camera shake only during [0.1, 0.35) s.
+    var shake_at = Float32(3) / Float32(30)
+    assert_true(shake_offset(seq_empty, shake_at - Float32(0.01)).length() == Float32(0.0), "no shake before the cue")
+    assert_true(shake_offset(seq_empty, shake_at + Float32(0.02)).length() > Float32(0.001), "shake right after the cue")
+    assert_true(shake_offset(seq_empty, shake_at + Float32(0.2)).length() > Float32(0.0), "shake within 0.25 s")
+    assert_true(shake_offset(seq_empty, shake_at + Float32(0.26)).length() == Float32(0.0), "shake ends after 0.25 s")
+    assert_true(shake_offset(seq_empty, Float32(5.0)).length() == Float32(0.0))
     var cam = Camera3D()
     cam.eye = Vec3(0.0, 1.0, -5.0)
     cam.basis_f = Vec3(0.0, 0.0, 1.0)
@@ -874,7 +1137,16 @@ def test_studio_motion_tools_and_scene_menu(tmp_dir: String) raises:
     cam.screen_h = 640
     mt.view = cam
     mt.shown_joint = Vec3(0.0, 1.0, 0.0)
-    _ = mt.clicked_point(480, 320)
+    # The click lands on the screen-facing plane through the inspected joint: eye + f * depth.
+    var depth = (mt.shown_joint - cam.eye).dot(cam.basis_f)
+    assert_equal(depth, Float32(5.0))
+    var centre = mt.clicked_point(480, 320)
+    var expect_c = cam.eye + cam.basis_f * depth
+    assert_true(centre.distance_to(expect_c) < Float32(1.0e-5), "centre click must hit eye + f * depth")
+    assert_true(centre.distance_to(mt.shown_joint) < Float32(1.0e-5))
+    var off = mt.clicked_point(580, 220)  # 100 px right, 100 px up at focal 500 -> 0.2 * depth each
+    var expect_o = cam.eye + (cam.basis_f + cam.basis_r * Float32(0.2) + cam.basis_u * Float32(0.2)) * depth
+    assert_true(off.distance_to(expect_o) < Float32(1.0e-5), "off-centre click must stay on the joint plane")
     draw_dust(canvas, cam, Vec3(0.0, 1.0, 0.0), Float32(0.1))
 
     # 2. [R2-A3] SceneMenu.open_library child PID cleanup on drop, move & FlintStudioState.shutdown()
@@ -5916,7 +6188,8 @@ def test_r15_partition_ab_fixes(tmp_dir: String) raises:
         '{"ph":"C","name":"gpu_ms","args":{"frame":0,"pass_a":1.25}}]',
     )
     var cap_ok = Capture(ok_trace)
-    assert_equal(cap_ok.at("pass_a", 0), Float64(1.25))
+    assert_equal(cap_ok.at("gpu:pass_a", 0), Float64(1.25))
+    assert_equal(cap_ok.at("pass_a", 0), Float64(-1.0))  # GPU keys live under gpu:, never as CPU scope names
     _ = remove_file(ok_trace)
 
     # 2. format_float2, _fmt_f32_2dp & glb_native float-to-UInt8 color clamping

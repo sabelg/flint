@@ -317,7 +317,7 @@ def main() raises:
     _ = flush_log()
     external_call["abort", NoneType]()
 MOJO
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t1_r1_f03_new_logs_and_crash_handler" "failed to compile EngineApp crash probe"
         return
     fi

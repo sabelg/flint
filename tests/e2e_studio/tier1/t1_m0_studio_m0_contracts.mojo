@@ -212,7 +212,11 @@ def main() raises:
             and nav_polys_ok
             and nav_path_ok
             and nav_blob_rt_ok,
-            "EnvironmentComponent/SpotLightComponent/NavPlugin bake contract failed",
+            "EnvironmentComponent/SpotLightComponent/NavPlugin bake contract failed: floor="
+            + String(floor_id >= 0) + " obs=" + String(obs_id >= 0) + " nav_plugin=" + String(has_nav_plugin)
+            + " spot_lights=" + String(spot_lights_ok) + " env_render=" + String(env_render_ok)
+            + " (" + String(env_diffs) + " px)" + " nav_polys=" + String(nav_polys_ok)
+            + " nav_path=" + String(nav_path_ok) + " nav_blob=" + String(nav_blob_rt_ok),
         )
 
         # 2. Save & reload round-trip of EnvironmentComponent + SpotLightComponent + Trigger + NavMesh
