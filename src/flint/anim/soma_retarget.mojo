@@ -1,10 +1,17 @@
 """Bake a SOMA30 take onto a Y-up, unit-scale Mixamo humanoid skin."""
+from std.math import isfinite
 from flint.assets.model import NativeAnimation, NativeChannel, NativeModel
 from flint.core.ik import shortest_arc_quat
 from flint.core.math import Quat, Vec3
+from flint.ml.gemx import (
+    soma78_joint_names,
+    soma78_parents,
+    soma78_t_pose_orient,
+)
 from flint.ml.motionbricks import (
     MbClip,
     MbQuat,
+    MbSkeleton,
     MbVec3,
     MbXform,
     quat_from_basis,
@@ -13,6 +20,73 @@ from flint.ml.motionbricks import (
 
 
 from flint.ml.take_edit import validate_take
+
+
+def _validate_soma77_take(clip: MbClip) raises:
+    ref sk = clip.skeleton
+    var nj = sk.num_joints()
+    if clip.num_frames() < 2 or nj != 77 or sk.names[0] != "Hips":
+        raise Error("Expected a SOMA30 or SOMA77 BVH with at least two frames")
+    if not isfinite(clip.sample_rate) or clip.sample_rate <= 0:
+        raise Error("Invalid take sample rate")
+    if len(sk.parents) != nj or len(sk.reference) != nj or sk.parents[0] != -1:
+        raise Error("Incomplete SOMA77 skeleton")
+    for j in range(1, nj):
+        if sk.parents[j] < 0 or sk.parents[j] >= j:
+            raise Error("Invalid joint hierarchy")
+    for frame in clip.frames:
+        if len(frame) != nj:
+            raise Error("Incomplete SOMA77 pose")
+        for j in range(nj):
+            var t = frame[j]
+            if not isfinite(
+                t.q.x + t.q.y + t.q.z + t.q.w + t.p.x + t.p.y + t.p.z
+            ):
+                raise Error("Take contains a non-finite transform")
+
+
+def _soma_rest_local(skeleton: MbSkeleton) -> List[MbXform]:
+    """Return local transforms for the source T-pose.
+
+    SOMA-30 BVH skeletons store world-aligned T-pose offsets where identity
+    local rotations form the T-pose. SOMA-77 skeletons (`soma77_skeleton()` or
+    MotionBricks/GEM-X BVH files) store bone offsets in each parent's T-pose-
+    oriented local frame (where Spine1 points along +X rather than +Y), so the
+    true T-pose applies `orient[parent]^-1 * orient[joint]` per joint.
+    """
+    var nj = skeleton.num_joints()
+    var spine1 = skeleton.joint_index("Spine1")
+    if (
+        nj == 77
+        and spine1 >= 0
+        and abs(skeleton.reference[spine1].p.x)
+        > abs(skeleton.reference[spine1].p.y)
+    ):
+        var names = soma78_joint_names()
+        var parents = soma78_parents()
+        var oq = soma78_t_pose_orient()
+        var orient = List[MbQuat](capacity=78)
+        for j in range(78):
+            orient.append(
+                MbQuat(
+                    oq[4 * j], oq[4 * j + 1], oq[4 * j + 2], oq[4 * j + 3]
+                ).normalized()
+            )
+        var rest = List[MbXform](capacity=nj)
+        for j in range(nj):
+            var x = skeleton.reference[j]
+            var s = -1
+            for k in range(1, 78):
+                if names[k] == skeleton.names[j]:
+                    s = k
+                    break
+            if s == 1:
+                x.q = orient[1]
+            elif s >= 2:
+                x.q = (orient[parents[s]].inverse() * orient[s]).normalized()
+            rest.append(x)
+        return rest^
+    return skeleton.reference.copy()
 
 
 def _vec(v: MbVec3) -> Vec3:
@@ -83,7 +157,10 @@ def retarget_soma(
 ) raises -> NativeAnimation:
     """Author local rotation tracks and one hip translation track using both rest poses.
     """
-    validate_take(clip)
+    if clip.skeleton.num_joints() == 77:
+        _validate_soma77_take(clip)
+    else:
+        validate_take(clip)
     model.ensure_parents()
     var src_names: List[String] = [
         "Hips",
@@ -126,8 +203,9 @@ def retarget_soma(
             raise Error("Duplicate destination bone for " + src_names[k])
         dst.append(bone)
         map_index[dst[k]] = k
+    var rest_local = _soma_rest_local(clip.skeleton)
     var sr = world_pose(
-        clip.skeleton, clip.skeleton.reference, MbXform.identity()
+        clip.skeleton, rest_local, MbXform.identity()
     )
     var dr = List[Quat](length=len(model.nodes), fill=Quat())
     var dp = List[Vec3](length=len(model.nodes), fill=Vec3())

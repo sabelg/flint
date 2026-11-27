@@ -16,15 +16,16 @@ from flint.core.jobs import JobPool, default_worker_count
 from flint.platform.os import open_read, close_fd, write_bytes
 from std.collections import Optional
 from flint.ml.protobuf import PbReader, WIRE_LEN
-from flint.ml.gpu import GpuMatmul
-from flint.ml.tensor import Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, numel_of, shape_str, norm_axis
+from flint.ml.gpu import GpuMatmul, FP, gpu_binary_supported, gpu_unary_supported, GU_BF16
+from flint.ml.tensor import Tensor, DT_F32, DT_I32, DT_I64, DT_BOOL, DT_BF16, numel_of, shape_str, norm_axis
 from flint.ml.ops import (
     MAX_RANGE_ELEMS,
     unary, binary, where, clip, cast, transpose, concat, gather, gather_elements, scatter_elements,
     scatter_nd, slice, expand, tile, range_op, onehot, resize_nearest, reduce, argmax, topk, cumsum,
-    softmax, layer_norm, matmul, gemm, conv1d,
-    U_SQRT, U_RELU, U_ATAN, U_COS, U_SIN, U_ABS, U_NEG, U_NOT, U_LEAKY, U_ERF, U_SIGMOID,
-    B_ADD, B_SUB, B_MUL, B_DIV, B_MOD, B_MAX, B_EQ, B_LT, B_GT, B_AND,
+    softmax, softmax_rows, layer_norm, batch_norm, matmul, gemm, conv1d, einsum, fused_attention,
+    U_SQRT, U_RELU, U_ATAN, U_COS, U_SIN, U_ABS, U_NEG, U_NOT, U_LEAKY,
+    U_ERF, U_EXP, U_TANH, U_SIGMOID, U_RECIP, U_FLOOR,
+    B_ADD, B_SUB, B_MUL, B_DIV, B_MOD, B_MAX, B_EQ, B_LT, B_GT, B_AND, B_POW, B_MIN, B_OR,
 )
 
 comptime OP_CONSTANT: Int = 0
@@ -60,6 +61,9 @@ comptime OP_ONEHOT: Int = 29
 comptime OP_RESIZE: Int = 30
 comptime OP_CLIP: Int = 31
 comptime OP_SPLIT: Int = 32
+comptime OP_IDENTITY: Int = 33
+comptime OP_EINSUM: Int = 34
+comptime OP_BATCH_NORM: Int = 35
 comptime OP_UNARY: Int = 100   # + U_* code
 comptime OP_BINARY: Int = 200  # + B_* code
 
@@ -67,8 +71,18 @@ comptime OP_BINARY: Int = 200  # + B_* code
 def op_code(name: String) -> Int:
     """The interpreter's code for an ONNX op type, or -1 when it is not supported."""
     if name == "Split": return OP_SPLIT
+    if name == "Identity": return OP_IDENTITY
+    if name == "Einsum": return OP_EINSUM
+    if name == "BatchNormalization": return OP_BATCH_NORM
     if name == "Erf": return OP_UNARY + U_ERF
+    if name == "Exp": return OP_UNARY + U_EXP
+    if name == "Tanh": return OP_UNARY + U_TANH
     if name == "Sigmoid": return OP_UNARY + U_SIGMOID
+    if name == "Reciprocal": return OP_UNARY + U_RECIP
+    if name == "Floor": return OP_UNARY + U_FLOOR
+    if name == "Pow": return OP_BINARY + B_POW
+    if name == "Min": return OP_BINARY + B_MIN
+    if name == "Or": return OP_BINARY + B_OR
     if name == "Constant": return OP_CONSTANT
     if name == "Shape": return OP_SHAPE
     if name == "Unsqueeze": return OP_UNSQUEEZE
@@ -358,6 +372,21 @@ struct OnnxModel(Movable):
     var gpu: Optional[GpuMatmul]
     var profile: Dict[String, Int]
     var profiling: Bool
+    var fuse: List[Int]          # 0 normal, 1 skipped (part of a fused chain), 2 fused attention,
+                                 # 3 gather-matmul (GPU), 4 skipped on the GPU only (gather / reshape feeding 3)
+    var fuse_q: List[Int]
+    var fuse_k: List[Int]
+    var fuse_scale: List[Float32]
+    var fuse_w: List[Int]        # gather-matmul GPU weight-cache key
+    # GPU residency: with a GPU, products / attention / element-wise / LayerNorm results stay in
+    # pooled device buffers (`dslot`); the host copy is filled only when a CPU op reads it.
+    var keep_on_gpu: Bool
+    var resident: Bool
+    var dslot: List[Int]
+    var host_ok: List[Bool]
+    var pend_slot: List[Int]
+    var pend_host: List[Bool]
+    var split_outs: List[Tensor]
     var ext: ExternalData        # mapped `.onnx.data` side files (graphs saved with external data)
 
     def __init__(out self):
@@ -377,6 +406,18 @@ struct OnnxModel(Movable):
         self.gpu = None
         self.profile = Dict[String, Int]()
         self.profiling = False
+        self.fuse = List[Int]()
+        self.fuse_q = List[Int]()
+        self.fuse_k = List[Int]()
+        self.fuse_scale = List[Float32]()
+        self.fuse_w = List[Int]()
+        self.keep_on_gpu = True
+        self.resident = False
+        self.dslot = List[Int]()
+        self.host_ok = List[Bool]()
+        self.pend_slot = List[Int]()
+        self.pend_host = List[Bool]()
+        self.split_outs = List[Tensor]()
         self.ext = ExternalData(String())
 
     def __deinit__(deinit self):
@@ -435,8 +476,210 @@ struct OnnxModel(Movable):
             if v < 0 or v >= len(m.last_use):
                 raise Error("ONNX: invalid graph output id")
             m.last_use[v] = len(m.nodes)
+        m._plan_fusions()
         _ = m.pool.start(default_worker_count() if workers < 0 else workers)
         return m^
+
+    def _gpu_attention(mut self, k: Int) raises -> Tensor:
+        """Runs a fused attention chain on the GPU (head dim <= 64); empty tensor on fallback."""
+        var qi = self.fuse_q[k]
+        var ki = self.fuse_k[k]
+        var vi = self.nodes[k].inputs[1]
+        if qi < 0 or ki < 0 or vi < 0:
+            return Tensor()
+        ref q = self.values[qi]
+        ref kk = self.values[ki]
+        ref v = self.values[vi]
+        var r = q.rank()
+        if r < 3 or kk.rank() != r or v.rank() != r or not q.is_float() or not kk.is_float() or not v.is_float():
+            return Tensor()
+        var D = q.shape[r - 1]
+        var H = q.shape[r - 2]
+        var L = q.shape[r - 3]
+        var S = kk.shape[r - 3]
+        if kk.shape[r - 1] != D or kk.shape[r - 2] != H or v.shape[r - 1] != D or v.shape[r - 2] != H or v.shape[r - 3] != S:
+            return Tensor()
+        var X = 1
+        for d in range(r - 3):
+            if kk.shape[d] != q.shape[d] or v.shape[d] != q.shape[d]:
+                return Tensor()
+            X *= q.shape[d]
+        if D > 64 or D <= 0 or H <= 0 or L <= 0 or S <= 0 or X <= 0:
+            return Tensor()
+        var qshape = q.shape.copy()
+        if self.resident:
+            var pq = self._dev(qi)
+            var pk = self._dev(ki)
+            var pv = self._dev(vi)
+            var outd = self._dev_out(qshape^)
+            _ = self.gpu.value().attention_dev(pq, pk, pv, self._pend_ptr(), X, L, S, H, D, self.fuse_scale[k])
+            return outd^
+        var out = Tensor.zeros(qshape^)
+        if not self.gpu.value().attention(self.values[qi].fptr(), self.values[ki].fptr(),
+                                          self.values[vi].fptr(), out.fptr(), X, L, S, H, D,
+                                          self.fuse_scale[k]):
+            return Tensor()
+        return out^
+
+    def _gpu_gather_matmul(mut self, k: Int) raises -> Tensor:
+        var qi = self.fuse_q[k]
+        var ki = self.fuse_k[k]
+        var wi = self.nodes[k].inputs[1]
+        self._ensure_host(ki)
+        self._ensure_host(wi)
+        ref x = self.values[qi]
+        ref ix = self.values[ki]
+        ref w = self.values[wi]
+        var rows = x.shape[0]
+        var cin = x.shape[1]
+        var m = ix.shape[0]
+        var slots = ix.shape[1]
+        if w.rank() != 2 or x.rank() != 2 or ix.rank() != 2 or w.shape[0] != slots * cin or not w.is_float():
+            raise Error("gather-matmul: shape mismatch")
+        var n = w.shape[1]
+        var idx = List[Float32](length=m * slots, fill=0.0)
+        for e in range(m * slots):
+            var r = ix.int_at(e)
+            if r < 0:
+                r += rows
+            if r < 0 or r >= rows:
+                raise Error("gather-matmul: index out of range")
+            idx[e] = Float32(r)
+        var widx = self.gpu.value().weight(self.fuse_w[k], w.fptr(), w.shape[0], n, False)
+        if self.resident:
+            var px = self._dev(qi)
+            var outd = self._dev_out([m, n])
+            self.gpu.value().gather_matmul_dev(px, cin, idx, m, slots, widx, self._pend_ptr(), n)
+            return outd^
+        self._ensure_host(qi)
+        var out = Tensor.zeros([m, n])
+        self.gpu.value().gather_matmul(self.values[qi].fptr(), rows, cin, idx, m, slots, widx, out.fptr(), n)
+        return out^
+
+    def _plan_gather_matmul(mut self, uses: List[Int], producer: List[Int]):
+        """Gather(X [R, C], idx [N, K], axis 0) -> Reshape [N, K*C] -> MatMul(., static W [K*C, n]):
+        the GPU runs it as one gather-GEMM (the gathered [N, K*C] matrix is never built)."""
+        for c in range(len(self.nodes)):
+            if self.nodes[c].op != OP_MATMUL or len(self.nodes[c].inputs) != 2 or self.fuse[c] != 0:
+                continue
+            var wid = self.nodes[c].inputs[1]
+            if wid < 0 or wid >= len(self.values):
+                continue
+            var key = wid * 4
+            if not self.static_value[wid]:
+                var t = producer[wid]
+                if t < 0 or self.nodes[t].op != OP_TRANSPOSE or len(self.nodes[t].inputs) < 1:
+                    continue
+                var src = self.nodes[t].inputs[0]
+                if src < 0 or src >= len(self.values):
+                    continue
+                if not self.static_value[src]:
+                    var rs = producer[src]
+                    if rs < 0 or self.nodes[rs].op != OP_RESHAPE or len(self.nodes[rs].inputs) < 1:
+                        continue
+                    var rsrc = self.nodes[rs].inputs[0]
+                    if rsrc < 0 or rsrc >= len(self.values) or not self.static_value[rsrc]:
+                        continue
+                    src = rsrc
+                key = (1 << 40) + src * 4
+            elif self.values[wid].rank() != 2 or not self.values[wid].is_float():
+                continue
+            var rv = self.nodes[c].inputs[0]
+            if rv < 0 or rv >= len(uses):
+                continue
+            var r = producer[rv]
+            if r < 0 or self.nodes[r].op != OP_RESHAPE or uses[rv] != 1 or len(self.nodes[r].inputs) < 1:
+                continue
+            var gv = self.nodes[r].inputs[0]
+            if gv < 0 or gv >= len(uses):
+                continue
+            var gn = producer[gv]
+            if gn < 0 or self.nodes[gn].op != OP_GATHER or uses[gv] != 1 or self.nodes[gn].attr_i("axis", 0) != 0 \
+                    or len(self.nodes[gn].inputs) < 2:
+                continue
+            self.fuse[r] = 4
+            self.fuse[gn] = 4
+            self.fuse_w[c] = key
+            self.fuse[c] = 3
+            self.fuse_q[c] = self.nodes[gn].inputs[0]
+            self.fuse_k[c] = self.nodes[gn].inputs[1]
+            for v in self.nodes[gn].inputs:
+                if v >= 0 and self.last_use[v] < c:
+                    self.last_use[v] = c
+
+    def _plan_fusions(mut self) raises:
+        """Finds Einsum(q, k) -> [Mul|Div by a constant scalar] -> Softmax(last axis) -> Einsum(., v)
+        chains in multi-head-attention layout and runs each as one fused kernel at the last Einsum."""
+        var nn = len(self.nodes)
+        self.fuse = List[Int](length=nn, fill=0)
+        self.fuse_q = List[Int](length=nn, fill=-1)
+        self.fuse_k = List[Int](length=nn, fill=-1)
+        self.fuse_scale = List[Float32](length=nn, fill=1.0)
+        self.fuse_w = List[Int](length=nn, fill=-1)
+        var uses = List[Int](length=len(self.values), fill=0)
+        var producer = List[Int](length=len(self.values), fill=-1)
+        for k in range(nn):
+            for v in self.nodes[k].inputs:
+                if v >= 0 and v < len(uses):
+                    uses[v] += 1
+            for v in self.nodes[k].outputs:
+                if v >= 0 and v < len(producer):
+                    producer[v] = k
+        for v in self.output_ids:
+            if v >= 0 and v < len(uses):
+                uses[v] += 1
+        for c in range(nn):
+            if self.nodes[c].op != OP_EINSUM or len(self.nodes[c].inputs) != 2:
+                continue
+            var pv = self.nodes[c].inputs[0]
+            if pv < 0 or pv >= len(uses):
+                continue
+            var sm = producer[pv]
+            if sm < 0 or self.nodes[sm].op != OP_SOFTMAX or uses[pv] != 1 or len(self.nodes[sm].inputs) < 1:
+                continue
+            var sv = self.nodes[sm].inputs[0]
+            if sv < 0 or sv >= len(uses):
+                continue
+            var mid = producer[sv]
+            if mid < 0 or uses[sv] != 1:
+                continue
+            var scale: Float32 = 1.0
+            var a = mid
+            var scale_node = -1
+            var mop = self.nodes[mid].op
+            if mop == OP_BINARY + B_MUL or mop == OP_BINARY + B_DIV:
+                if len(self.nodes[mid].inputs) != 2:
+                    continue
+                var i0 = self.nodes[mid].inputs[0]
+                var i1 = self.nodes[mid].inputs[1]
+                if i0 < 0 or i1 < 0 or not self.static_value[i1] or self.values[i1].numel() != 1 \
+                        or not self.values[i1].is_float():
+                    continue
+                var f = self.values[i1].fget(0)
+                scale = f if mop == OP_BINARY + B_MUL else 1.0 / f
+                a = producer[i0]
+                if a < 0 or uses[i0] != 1:
+                    continue
+                scale_node = mid
+            if self.nodes[a].op != OP_EINSUM or len(self.nodes[a].inputs) != 2:
+                continue
+            if not _attention_equations(self.nodes[a].attr_s("equation"), self.nodes[c].attr_s("equation")):
+                continue
+            var rank = self.nodes[sm].attr_i("axis", -1)
+            if rank != -1 and rank != 3 and rank != 2:
+                continue
+            self.fuse[a] = 1
+            if scale_node >= 0:
+                self.fuse[scale_node] = 1
+            self.fuse[sm] = 1
+            self.fuse[c] = 2
+            self.fuse_q[c] = self.nodes[a].inputs[0]
+            self.fuse_k[c] = self.nodes[a].inputs[1]
+            self.fuse_scale[c] = scale
+            for v in self.nodes[a].inputs:
+                if v >= 0 and self.last_use[v] < c:
+                    self.last_use[v] = c
+        self._plan_gather_matmul(uses, producer)
 
     def _parse_graph(mut self, mut g: PbReader) raises:
         var graph_inputs = List[String]()
@@ -559,6 +802,306 @@ struct OnnxModel(Movable):
             return self.gpu.value().name()
         return String("cpu")
 
+    # ------------------------------------------------------------------ device residency
+
+    def _grow_slots(mut self):
+        while len(self.dslot) < len(self.values):
+            self.dslot.append(-1)
+            self.host_ok.append(True)
+
+    def _on_gpu(self, v: Int) -> Bool:
+        return v >= 0 and v < len(self.dslot) and self.dslot[v] >= 0
+
+    def _drop_slot(mut self, v: Int):
+        if self._on_gpu(v):
+            self.gpu.value().release(self.dslot[v])
+            self.dslot[v] = -1
+            self.host_ok[v] = True
+
+    def _ensure_host(mut self, v: Int) raises:
+        """Fills the host copy of a device-resident value (once)."""
+        if not self._on_gpu(v) or self.host_ok[v]:
+            return
+        var n = self.values[v].numel()
+        self.values[v].f = List[Float32](length=n, fill=0.0)
+        self.values[v].ext = 0
+        self.gpu.value().download(self.dslot[v], Int(self.values[v].f.unsafe_ptr()), n)
+        self.host_ok[v] = True
+
+    def _dev(mut self, v: Int) raises -> FP:
+        """Device pointer of a float value: its resident buffer, the weight cache for initializers,
+        else an upload (which then stays resident until the value's last use)."""
+        if self._on_gpu(v):
+            return self.gpu.value().ptr(self.dslot[v])
+        var n = self.values[v].numel()
+        var src = self.values[v].fptr()
+        if self.static_value[v]:
+            return self.gpu.value().wptr(self.gpu.value().weight((3 << 40) + v * 4, src, 1, n, False))
+        var slot = self.gpu.value().alloc(n)
+        self.gpu.value().upload(slot, src, n)
+        self._grow_slots()
+        self.dslot[v] = slot
+        self.host_ok[v] = True
+        return self.gpu.value().ptr(slot)
+
+    def _dev_out(mut self, var shape: List[Int]) raises -> Tensor:
+        """A float result that lives only on the device (pending for the node's next output)."""
+        var slot = self.gpu.value().alloc(numel_of(shape))
+        self.pend_slot.append(slot)
+        self.pend_host.append(False)
+        var t = Tensor()
+        t.shape = shape^
+        return t^
+
+    def _pend_ptr(self) -> FP:
+        return self.gpu.value().ptr(self.pend_slot[len(self.pend_slot) - 1])
+
+    def _gpu_elementwise(mut self, k: Int) raises -> Tensor:
+        """Binary / unary / Cast->BF16 / Gather / Concat / Split / LayerNorm on the GPU when an
+        input already lives there; an empty tensor when the node does not qualify (CPU runs)."""
+        var op = self.nodes[k].op
+        var nin = len(self.nodes[k].inputs)
+        if nin == 0:
+            return Tensor()
+        var a = self.nodes[k].inputs[0]
+        if a < 0 or a >= len(self.values):
+            return Tensor()
+        if op >= OP_BINARY and nin == 2:
+            var code = op - OP_BINARY
+            var b = self.nodes[k].inputs[1]
+            if b < 0 or b >= len(self.values):
+                return Tensor()
+            if not gpu_binary_supported(code) or (not self._on_gpu(a) and not self._on_gpu(b)):
+                return Tensor()
+            if not self.values[a].is_float() or not self.values[b].is_float():
+                return Tensor()
+            var na = self.values[a].numel()
+            var nb = self.values[b].numel()
+            if na <= 0 or nb <= 0:
+                return Tensor()
+            var big = a
+            var small = b
+            var swap = False
+            if nb > na:
+                big = b
+                small = a
+                swap = True
+            var nbig = max(na, nb)
+            var nsmall = min(na, nb)
+            var mode: Int
+            if na == nb:
+                if self.values[a].shape != self.values[b].shape:
+                    return Tensor()
+                mode = 0
+                big = a
+                small = b
+                swap = False
+            elif nsmall == 1:
+                mode = 1
+            else:
+                # the small operand must be the trailing dims of the big one
+                var ok = self.values[small].rank() <= self.values[big].rank()
+                var i = self.values[small].rank() - 1
+                var j = self.values[big].rank() - 1
+                while ok and i >= 0:
+                    if self.values[small].shape[i] != self.values[big].shape[j]:
+                        ok = False
+                    i -= 1
+                    j -= 1
+                if not ok or nbig % nsmall != 0:
+                    return Tensor()
+                mode = 2
+            var scalar: Float32 = 0
+            var pb: FP
+            if mode == 1:
+                self._ensure_host(small)
+                scalar = self.values[small].fget(0)
+                pb = self._dev(big)
+            else:
+                pb = self._dev(small)
+            var pa = self._dev(big)
+            var out = self._dev_out(self.values[big].shape.copy())
+            self.gpu.value().binary_dev(code, pa, pb, self._pend_ptr(), nbig, nsmall, mode, scalar, swap)
+            return out^
+        if op == OP_CAST and self.nodes[k].attr_i("to", DT_F32) == DT_BF16 and self._on_gpu(a) \
+                and self.values[a].is_float() and self.values[a].numel() > 0:
+            var pc = self._dev(a)
+            var outc = self._dev_out(self.values[a].shape.copy())
+            self.gpu.value().unary_dev(GU_BF16, pc, self._pend_ptr(), self.values[a].numel())
+            return outc^
+        if op >= OP_UNARY and op < OP_BINARY:
+            var code = op - OP_UNARY
+            if not gpu_unary_supported(code) or not self._on_gpu(a) or not self.values[a].is_float() \
+                    or self.values[a].numel() <= 0:
+                return Tensor()
+            var pa = self._dev(a)
+            var out = self._dev_out(self.values[a].shape.copy())
+            self.gpu.value().unary_dev(code, pa, self._pend_ptr(), self.values[a].numel())
+            return out^
+        if op == OP_GATHER and self._on_gpu(a) and self.values[a].is_float() and nin == 2:
+            var r = self.values[a].rank()
+            if r < 1 or norm_axis(self.nodes[k].attr_i("axis", 0), r) != 0:
+                return Tensor()
+            var ii = self.nodes[k].inputs[1]
+            if ii < 0 or ii >= len(self.values):
+                return Tensor()
+            self._ensure_host(ii)
+            var rows = self.values[a].shape[0]
+            var row = self.values[a].numel() // rows if rows > 0 else 0
+            var ni = self.values[ii].numel()
+            if row <= 0 or ni <= 0:
+                return Tensor()
+            var idx = List[Float32](length=ni, fill=0.0)
+            for e in range(ni):
+                var q = self.values[ii].int_at(e)
+                if q < 0:
+                    q += rows
+                if q < 0 or q >= rows:
+                    raise Error("Gather: index out of range")
+                idx[e] = Float32(q)
+            var shape = self.values[ii].shape.copy()
+            for d in range(1, r):
+                shape.append(self.values[a].shape[d])
+            var px = self._dev(a)
+            var out = self._dev_out(shape^)
+            self.gpu.value().gather_rows_dev(px, idx, self._pend_ptr(), row)
+            return out^
+        if op == OP_CONCAT:
+            var any_dev = False
+            var r = -1
+            for j in range(nin):
+                var v = self.nodes[k].inputs[j]
+                if v < 0 or v >= len(self.values):
+                    return Tensor()
+                if self._on_gpu(v):
+                    any_dev = True
+                if not self.values[v].is_float():
+                    return Tensor()
+                if self.values[v].numel() > 0:
+                    r = self.values[v].rank()
+            if not any_dev or r < 1:
+                return Tensor()
+            var axis = norm_axis(self.nodes[k].attr_i("axis", 0), r)
+            if axis < 0 or axis >= r:
+                return Tensor()
+            var shape = List[Int]()
+            var total_a = 0
+            for j in range(nin):
+                var v = self.nodes[k].inputs[j]
+                if self.values[v].numel() == 0:
+                    continue
+                if self.values[v].rank() != r:
+                    return Tensor()
+                if len(shape) == 0:
+                    shape = self.values[v].shape.copy()
+                for d in range(r):
+                    if d != axis and self.values[v].shape[d] != shape[d]:
+                        return Tensor()
+                total_a += self.values[v].shape[axis]
+            shape[axis] = total_a
+            var outer = 1
+            for d in range(axis):
+                outer *= shape[d]
+            var inner = 1
+            for d in range(axis + 1, r):
+                inner *= shape[d]
+            var out = self._dev_out(shape^)
+            var po = self._pend_ptr()
+            var off = 0
+            for j in range(nin):
+                var v = self.nodes[k].inputs[j]
+                if self.values[v].numel() == 0:
+                    continue
+                var ca = self.values[v].shape[axis]
+                var pv = self._dev(v)
+                self.gpu.value().copy_dev(pv, po, outer, ca * inner, ca * inner, 0, total_a * inner, off * inner)
+                off += ca
+            return out^
+        if op == OP_SPLIT and self._on_gpu(a) and self.values[a].is_float():
+            var r = self.values[a].rank()
+            if r < 1:
+                return Tensor()
+            var axis = norm_axis(self.nodes[k].attr_i("axis", 0), r)
+            var parts = len(self.nodes[k].outputs)
+            if axis < 0 or axis >= r or parts < 1:
+                return Tensor()
+            var sizes = self.nodes[k].attr_ints("split")
+            var si = self._in(k, 1)
+            if si >= 0:
+                self._ensure_host(si)
+                sizes = self.values[si].int_list()
+            var dim = self.values[a].shape[axis]
+            if len(sizes) == 0:
+                if self.nodes[k].attr_i("num_outputs", 0) != 0:
+                    if self.nodes[k].attr_i("num_outputs", 0) != parts:
+                        return Tensor()
+                    var base = dim // parts
+                    var rem = dim % parts
+                    sizes = List[Int](capacity=parts)
+                    for sq in range(parts):
+                        sizes.append(base + 1 if sq < rem else base)
+                elif dim % parts != 0:
+                    return Tensor()
+                else:
+                    sizes = List[Int](length=parts, fill=dim // parts)
+            if len(sizes) != parts:
+                return Tensor()
+            var sum_sz = 0
+            for sz in sizes:
+                if sz < 0 or sz > dim - sum_sz:
+                    return Tensor()
+                sum_sz += sz
+            if sum_sz != dim:
+                return Tensor()
+            var outer = 1
+            for d in range(axis):
+                outer *= self.values[a].shape[d]
+            var inner = 1
+            for d in range(axis + 1, r):
+                inner *= self.values[a].shape[d]
+            var px = self._dev(a)
+            var start = 0
+            # several outputs: the caller takes them from `split_outs`
+            self.split_outs = List[Tensor]()
+            for sz in sizes:
+                var shape = self.values[a].shape.copy()
+                shape[axis] = sz
+                var t = self._dev_out(shape^)
+                self.gpu.value().copy_dev(px, self._pend_ptr(), outer, sz * inner, dim * inner, start * inner,
+                                          sz * inner, 0)
+                self.split_outs.append(t^)
+                start += sz
+            var marker = Tensor()
+            marker.shape = [len(sizes)]
+            return marker^
+        if op == OP_LAYER_NORM and self._on_gpu(a) and self.values[a].is_float():
+            var r = self.values[a].rank()
+            if r < 1 or norm_axis(self.nodes[k].attr_i("axis", -1), r) != r - 1:
+                return Tensor()
+            var eps = self.nodes[k].attr_f("epsilon", 1e-5)
+            if not isfinite(eps) or eps < Float32(0.0):
+                return Tensor()
+            var n = self.values[a].shape[r - 1]
+            if n <= 0 or self.values[a].numel() <= 0:
+                return Tensor()
+            if nin < 2:
+                return Tensor()
+            var gi = self.nodes[k].inputs[1]
+            var bi = self._in(k, 2)
+            if gi < 0 or gi >= len(self.values) or not self.static_value[gi] or self.values[gi].numel() != n \
+                    or (bi >= 0 and (bi >= len(self.values) or not self.static_value[bi] or self.values[bi].numel() != n)):
+                return Tensor()
+            var pg = self._dev(gi)
+            var pbb = pg
+            if bi >= 0:
+                pbb = self._dev(bi)
+            var px = self._dev(a)
+            var out = self._dev_out(self.values[a].shape.copy())
+            self.gpu.value().layer_norm_dev(px, pg, pbb, self._pend_ptr(), self.values[a].numel() // n, n,
+                                            eps, bi >= 0)
+            return out^
+        return Tensor()
+
     def _gpu_product(mut self, k: Int) raises -> Tensor:
         """MatMul / Gemm / Conv of node k on the GPU (static weights only); an empty tensor
         (rank 0, no data) when the node does not qualify."""
@@ -567,12 +1110,13 @@ struct OnnxModel(Movable):
             return Tensor()
         if node.inputs[0] >= len(self.values) or node.inputs[1] >= len(self.values):
             return Tensor()
+        var xi = node.inputs[0]
         var wid = node.inputs[1]
         if not self.static_value[wid] or not self.values[wid].is_float() or not self.values[wid].has_valid_storage():
             return Tensor()
-        ref x = self.values[node.inputs[0]]
+        ref x = self.values[xi]
         ref w = self.values[wid]
-        if not x.is_float() or not x.has_valid_storage():
+        if not x.is_float() or (not self._on_gpu(xi) and not x.has_valid_storage()):
             return Tensor()
         if node.op == OP_MATMUL:
             if w.rank() != 2 or x.rank() < 2:
@@ -594,6 +1138,11 @@ struct OnnxModel(Movable):
             if numel_of(s) < 0:
                 return Tensor()
             var widx = self.gpu.value().weight(wid * 4, w.fptr(), kk, n, False)
+            if self.resident:
+                var pa = self._dev(xi)
+                var outd = self._dev_out(s^)
+                self.gpu.value().matmul_dev(pa, widx, self._pend_ptr(), 0, 0, m, kk, n)
+                return outd^
             var out = Tensor.zeros(s^)
             self.gpu.value().matmul(x.fptr(), widx, out.fptr(), 0, 0, m, kk, n)
             return out^
@@ -626,6 +1175,11 @@ struct OnnxModel(Movable):
                 bias = c.fptr()
                 bias_key = ci * 4 + 2
             var widx = self.gpu.value().weight(wid * 4 + (1 if tb else 0), w.fptr(), w.shape[0], w.shape[1], tb)
+            if self.resident:
+                var pa = self._dev(xi)
+                var outd = self._dev_out([m, n])
+                self.gpu.value().matmul_dev(pa, widx, self._pend_ptr(), bias, bias_key, m, kk, n)
+                return outd^
             var out = Tensor.zeros([m, n])
             self.gpu.value().matmul(x.fptr(), widx, out.fptr(), bias, bias_key, m, kk, n)
             return out^
@@ -700,6 +1254,8 @@ struct OnnxModel(Movable):
         var found = self.ids.get(name)
         if not found:
             raise Error("ONNX: no input named " + name)
+        if self.gpu:
+            self._drop_slot(found.value())
         self.values[found.value()] = t^
 
     def output(self, name: String) raises -> Tensor:
@@ -707,6 +1263,9 @@ struct OnnxModel(Movable):
         if not found:
             raise Error("ONNX: no output named " + name)
         return self.values[found.value()].copy()
+
+    def has(self, name: String) -> Bool:
+        return name in self.ids
 
     def weight(self, name: String) raises -> Tensor:
         """A named initializer or value without copying a mapped one (a weights-only model's
@@ -722,34 +1281,152 @@ struct OnnxModel(Movable):
     def run(mut self) raises:
         var trace = self.trace_path.byte_length() > 0
         var lines = String()
+        self.resident = Bool(self.gpu) and self.keep_on_gpu and not trace
+        if self.gpu:
+            self._grow_slots()
         for k in range(len(self.nodes)):
+            if len(self.fuse) == len(self.nodes) and (self.fuse[k] == 1 or (self.fuse[k] == 4 and self.gpu)):
+                continue
             var outs: List[Tensor]
+            self.pend_slot.clear()
+            self.pend_host.clear()
             var t0 = perf_counter_ns() if self.profiling else 0
             try:
                 outs = self._exec(k)
             except e:
                 raise Error("ONNX: node " + self.nodes[k].name + " (" + self.nodes[k].op_type + "): " + String(e))
             if self.profiling:
+                if self.gpu:
+                    self.gpu.value().sync()
                 var key = self.nodes[k].op_type
-                if (key == "Add" or key == "Mul") and len(self.nodes[k].inputs) >= 2 and self.nodes[k].inputs[0] >= 0 and self.nodes[k].inputs[1] >= 0:
+                if len(self.fuse) == len(self.nodes):
+                    if self.fuse[k] == 2:
+                        key = "Attention(fused)"
+                    elif self.fuse[k] == 3 and self.gpu:
+                        key = "GatherMatMul(fused)"
+                if (key == "Add" or key == "Mul" or key == "MatMul" or key == "Gather") \
+                        and len(self.nodes[k].inputs) >= 2 and self.nodes[k].inputs[0] >= 0 and self.nodes[k].inputs[1] >= 0:
                     key += " " + shape_str(self.values[self.nodes[k].inputs[0]].shape) + shape_str(self.values[self.nodes[k].inputs[1]].shape)
                 var dt = Int(perf_counter_ns() - t0)
                 self.profile[key] = self.profile.get(key).or_else(0) + dt
             var j = len(outs) - 1
             while j >= 0:
                 var t = outs.pop()
+                var ps = self.pend_slot[j] if j < len(self.pend_slot) else -1
                 if j < len(self.nodes[k].outputs) and self.nodes[k].outputs[j] >= 0:
                     var v = self.nodes[k].outputs[j]
                     if trace:
                         lines += _trace_line(self.names[v], t)
+                    if self.gpu:
+                        self._drop_slot(v)
                     self.values[v] = t^
+                    if ps >= 0:
+                        self.dslot[v] = ps
+                        self.host_ok[v] = self.pend_host[j]
+                elif ps >= 0:
+                    self.gpu.value().release(ps)
                 j -= 1
-            for v in self.nodes[k].inputs:
+            for ii in range(len(self.nodes[k].inputs)):
+                var v = self.nodes[k].inputs[ii]
                 if v >= 0 and self.last_use[v] == k and not self.static_value[v]:
                     self.values[v].clear()
+                    if self.gpu:
+                        self._drop_slot(v)
+        if self.gpu:
+            for v in self.output_ids:
+                self._ensure_host(v)
         if trace:
             var bytes = List[UInt8](lines.as_bytes())
             _ = write_bytes(self.trace_path, bytes)
+
+    def _shape_only(self, k: Int) raises -> List[Int]:
+        """Output shape of a Reshape / Unsqueeze / Squeeze / Flatten / Identity / Cast node."""
+        ref node = self.nodes[k]
+        ref x = self.values[node.inputs[0]]
+        var op = node.op
+        var s = List[Int]()
+        if op == OP_RESHAPE:
+            var want = self.values[self._req_in(k, 1)].int_list()
+            var allowzero = node.attr_i("allowzero", 0) != 0
+            var infer = -1
+            var known = 1
+            for d in range(len(want)):
+                var v = want[d]
+                if v == 0 and not allowzero:
+                    if d >= x.rank():
+                        raise Error("Reshape: 0 dim at index " + String(d) + " exceeds input rank " + String(x.rank()))
+                    v = x.shape[d]
+                if v == -1:
+                    if infer >= 0:
+                        raise Error("Reshape: multiple -1 dimensions")
+                    infer = d
+                    s.append(1)
+                elif v < -1:
+                    raise Error("Reshape: invalid negative dimension " + String(v))
+                else:
+                    s.append(v)
+                    if v > 0 and known > 0x7FFFFFFFFFFFFFFF // v:
+                        raise Error("Reshape: shape overflow")
+                    known *= v
+            if infer >= 0:
+                if known == 0 or x.numel() % known != 0:
+                    raise Error("Reshape " + shape_str(x.shape) + " -> " + shape_str(want))
+                s[infer] = x.numel() // known
+            if numel_of(s) != x.numel():
+                raise Error("Reshape " + shape_str(x.shape) + " -> " + shape_str(s))
+        elif op == OP_UNSQUEEZE:
+            var axes = node.attr_ints("axes")
+            if self._in(k, 1) >= 0:
+                axes = self.values[self._in(k, 1)].int_list()
+            elif not axes:
+                raise Error("Unsqueeze needs axes")
+            var r = x.rank() + len(axes)
+            var ins = List[Bool](length=r, fill=False)
+            for a in axes:
+                var na = norm_axis(a, r)
+                if na < 0 or na >= r:
+                    raise Error("Unsqueeze: axis " + String(a) + " out of range for rank " + String(r))
+                if ins[na]:
+                    raise Error("Unsqueeze: duplicate axis " + String(a))
+                ins[na] = True
+            var src = 0
+            for d in range(r):
+                if ins[d]:
+                    s.append(1)
+                else:
+                    s.append(x.shape[src])
+                    src += 1
+        elif op == OP_SQUEEZE:
+            var axes = node.attr_ints("axes")
+            var ai = self._in(k, 1)
+            if ai >= 0:
+                axes = self.values[ai].int_list()
+            var seen = List[Bool](length=x.rank(), fill=False)
+            for a in axes:
+                var na = norm_axis(a, x.rank())
+                if na < 0 or na >= x.rank():
+                    raise Error("Squeeze: axis " + String(a) + " out of range for rank " + String(x.rank()))
+                if seen[na]:
+                    raise Error("Squeeze: duplicate axis " + String(a))
+                if x.shape[na] != 1:
+                    raise Error("Squeeze: axis " + String(a) + " has size " + String(x.shape[na]) + " != 1")
+                seen[na] = True
+            for d in range(x.rank()):
+                var drop = (x.shape[d] == 1) if len(axes) == 0 else seen[d]
+                if not drop:
+                    s.append(x.shape[d])
+        elif op == OP_FLATTEN:
+            var axis = norm_axis(node.attr_i("axis", 1), x.rank())
+            if axis < 0 or axis > x.rank():
+                raise Error("Flatten: axis out of range")
+            var a = 1
+            for d in range(axis):
+                a *= x.shape[d]
+            s.append(a)
+            s.append(x.numel() // a if a > 0 else 0)
+        else:
+            s = x.shape.copy()
+        return s^
 
     def _in(self, k: Int, j: Int) -> Int:
         """Value id of input j of node k, or -1 if it is absent."""
@@ -767,13 +1444,69 @@ struct OnnxModel(Movable):
     def _exec(mut self, k: Int) raises -> List[Tensor]:
         var out = List[Tensor]()
         var op0 = self.nodes[k].op
+        var has_fuse = len(self.fuse) == len(self.nodes)
+        if self.gpu and op0 == OP_MATMUL and has_fuse and self.fuse[k] == 3:
+            out.append(self._gpu_gather_matmul(k))
+            return out^
         if self.gpu and (op0 == OP_MATMUL or op0 == OP_GEMM or op0 == OP_CONV):
+            if op0 == OP_CONV and len(self.nodes[k].inputs) > 0 and self.nodes[k].inputs[0] >= 0:
+                self._ensure_host(self.nodes[k].inputs[0])
             var g = self._gpu_product(k)
             if len(g.shape) > 0:
                 out.append(g^)
                 return out^
+        var in0_opt = self.nodes[k].inputs[0] if len(self.nodes[k].inputs) > 0 else -1
+        if in0_opt >= 0 and in0_opt < len(self.values) and self.last_use[in0_opt] == k \
+                and not self.static_value[in0_opt] and self.values[in0_opt].ext == 0 \
+                and (op0 == OP_RESHAPE or op0 == OP_UNSQUEEZE or op0 == OP_SQUEEZE or op0 == OP_FLATTEN
+                     or op0 == OP_IDENTITY or (op0 == OP_CAST and self.values[in0_opt].is_float()
+                                               and self.nodes[k].attr_i("to", DT_F32) == DT_F32)):
+            if self.resident and len(self.nodes[k].inputs) > 1 and self.nodes[k].inputs[1] >= 0:
+                self._ensure_host(self.nodes[k].inputs[1])
+            var shape = self._shape_only(k)
+            if self._on_gpu(in0_opt):
+                # the device buffer moves with the value
+                self.pend_slot.append(self.dslot[in0_opt])
+                self.pend_host.append(self.host_ok[in0_opt])
+                self.dslot[in0_opt] = -1
+                self.host_ok[in0_opt] = True
+            self.values.append(Tensor())
+            self.values.swap_elements(in0_opt, len(self.values) - 1)
+            var t = self.values.pop()
+            t.shape = shape^
+            out.append(t^)
+            return out^
+        if op0 == OP_EINSUM and has_fuse and self.fuse[k] == 2 and self.gpu:
+            var g = self._gpu_attention(k)
+            if g.rank() > 0:
+                out.append(g^)
+                return out^
+        if self.resident:
+            var ge = self._gpu_elementwise(k)
+            if ge.rank() > 0:
+                if op0 == OP_SPLIT:
+                    for j in range(len(self.split_outs)):
+                        out.append(self.split_outs[j].copy())
+                    self.split_outs = List[Tensor]()
+                    return out^
+                out.append(ge^)
+                return out^
+            # CPU op: bring its device-resident inputs back first (Shape reads only the shape)
+            if op0 != OP_SHAPE:
+                for j in range(len(self.nodes[k].inputs)):
+                    self._ensure_host(self.nodes[k].inputs[j])
+            if has_fuse and self.fuse[k] == 2:
+                self._ensure_host(self.fuse_q[k])
+                self._ensure_host(self.fuse_k[k])
         ref node = self.nodes[k]
         var op = node.op
+        if op == OP_EINSUM and has_fuse and self.fuse[k] == 2:
+            var att = fused_attention(self.pool, self.values[self.fuse_q[k]], self.values[self.fuse_k[k]],
+                                      self.values[self._req_in(k, 1)], self.fuse_scale[k])
+            if att.rank() == 0:
+                raise Error("fused attention: unsupported operand shapes")
+            out.append(att^)
+            return out^
         if op == OP_CONCAT:
             var xs = List[Tensor]()
             for v in node.inputs:
@@ -1000,7 +1733,11 @@ struct OnnxModel(Movable):
             out.append(layer_norm(x, self.values[self._req_in(k, 1)], self.values[bi if bi >= 0 else in0],
                                   bi >= 0, node.attr_f("epsilon", 1e-5)))
         elif op == OP_SOFTMAX:
-            out.append(softmax(x, node.attr_i("axis", -1)))
+            if x.rank() > 0 and norm_axis(node.attr_i("axis", -1), x.rank()) == x.rank() - 1 \
+                    and x.is_float() and x.numel() >= 1024:
+                out.append(softmax_rows(self.pool, x))
+            else:
+                out.append(softmax(x, node.attr_i("axis", -1)))
         elif op == OP_REDUCE_L2:
             out.append(reduce(x, node.attr_ints("axes"), node.attr_i("keepdims", 1) != 0, True))
         elif op == OP_REDUCE_SUM:
@@ -1093,9 +1830,62 @@ struct OnnxModel(Movable):
                     raise Error("Clip: max tensor has invalid storage")
                 hi = self.values[b].get(0)
             out.append(clip(x, lo, hi))
+        elif op == OP_IDENTITY:
+            out.append(x.reshaped(x.shape.copy()) if x.ext != 0 else x.copy())
+        elif op == OP_EINSUM:
+            out.append(einsum(self.pool, node.attr_s("equation"), x, self.values[self._req_in(k, 1)]))
+        elif op == OP_BATCH_NORM:
+            out.append(batch_norm(x, self.values[self._req_in(k, 1)], self.values[self._req_in(k, 2)],
+                                  self.values[self._req_in(k, 3)], self.values[self._req_in(k, 4)],
+                                  node.attr_f("epsilon", 1e-5)))
         else:
             raise Error("operator not implemented")
         return out^
+
+
+def _attention_equations(e1: String, e2: String) -> Bool:
+    """e1 = "X L H D, X S H D -> X H L S" and e2 = "X H L S, X S H D -> X L H D" (X: optional batch
+    labels), each with its own letters."""
+    var p1 = e1.replace(" ", "").split("->")
+    var p2 = e2.replace(" ", "").split("->")
+    if len(p1) != 2 or len(p2) != 2:
+        return False
+    var i1 = p1[0].split(",")
+    var i2 = p2[0].split(",")
+    if len(i1) != 2 or len(i2) != 2:
+        return False
+    var q = String(i1[0])
+    var kk = String(i1[1])
+    var o1 = String(p1[1])
+    var a = String(i2[0])
+    var v = String(i2[1])
+    var o2 = String(p2[1])
+    var r = q.byte_length()
+    if r < 3 or kk.byte_length() != r or o1.byte_length() != r or a.byte_length() != r or v.byte_length() != r \
+            or o2.byte_length() != r:
+        return False
+    var nb = r - 3
+    var X = String(q[byte=0:nb])
+    if String(kk[byte=0:nb]) != X or String(o1[byte=0:nb]) != X:
+        return False
+    var L = String(q[byte=nb])
+    var H = String(q[byte=nb + 1])
+    var D = String(q[byte=nb + 2])
+    var S = String(kk[byte=nb])
+    if String(kk[byte=nb + 1]) != H or String(kk[byte=nb + 2]) != D or L == S or L == H or L == D or S == H or S == D or H == D:
+        return False
+    if o1 != X + H + L + S:
+        return False
+    var X2 = String(a[byte=0:nb])
+    if String(v[byte=0:nb]) != X2 or String(o2[byte=0:nb]) != X2:
+        return False
+    var H2 = String(a[byte=nb])
+    var L2 = String(a[byte=nb + 1])
+    var S2 = String(a[byte=nb + 2])
+    if String(v[byte=nb]) != S2 or String(v[byte=nb + 1]) != H2:
+        return False
+    var D2 = String(v[byte=nb + 2])
+    return o2 == X2 + L2 + H2 + D2 and L2 != S2 and H2 != D2 and L2 != H2 and S2 != D2
 
 
 def _trace_line(name: String, t: Tensor) -> String:

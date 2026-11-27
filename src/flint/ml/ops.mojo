@@ -5,7 +5,8 @@ SIMD inner loops; everything else is a plain loop, which is cheap for the small 
 of a motion model.
 """
 
-from std.math import sqrt, exp, erf, atan, cos, sin, ceil, floor, isnan, isinf, isfinite
+from std.collections import Dict
+from std.math import sqrt, exp, erf, tanh, log, atan, cos, sin, ceil, floor, isnan, isinf, isfinite
 from std.memory import bitcast
 from flint.core.jobs import JobPool
 from flint.core.ecs import run_parallel_ctx
@@ -16,7 +17,7 @@ from flint.ml.tensor import (
 
 comptime LANES: Int = 8
 comptime F8 = SIMD[DType.float32, LANES]
-comptime MAX_RANGE_ELEMS: Int = 16_777_216
+comptime MAX_RANGE_ELEMS: Int = 33_554_432
 
 
 @always_inline
@@ -56,7 +57,11 @@ comptime U_NEG: Int = 6
 comptime U_NOT: Int = 7
 comptime U_LEAKY: Int = 8
 comptime U_ERF: Int = 9
-comptime U_SIGMOID: Int = 10
+comptime U_EXP: Int = 10
+comptime U_TANH: Int = 11
+comptime U_SIGMOID: Int = 12
+comptime U_RECIP: Int = 13
+comptime U_FLOOR: Int = 14
 
 
 def unary(op: Int, x: Tensor, alpha: Float32 = 0.01) raises -> Tensor:
@@ -107,9 +112,17 @@ def unary(op: Int, x: Tensor, alpha: Float32 = 0.01) raises -> Tensor:
             r = atan(v)
         elif op == U_ERF:
             r = erf(v)
+        elif op == U_EXP:
+            r = exp(v)
+        elif op == U_TANH:
+            r = tanh(v)
         elif op == U_SIGMOID:
             var z = exp(-abs(v))
             r = 1 / (1 + z) if v >= 0 else z / (1 + z)
+        elif op == U_RECIP:
+            r = 1.0 / v
+        elif op == U_FLOOR:
+            r = floor(v)
         elif op == U_COS:
             r = cos(v)
         elif op == U_SIN:
@@ -136,6 +149,9 @@ comptime B_EQ: Int = 6
 comptime B_LT: Int = 7
 comptime B_GT: Int = 8
 comptime B_AND: Int = 9
+comptime B_POW: Int = 10
+comptime B_MIN: Int = 11
+comptime B_OR: Int = 12
 
 
 @always_inline
@@ -216,6 +232,14 @@ def _fop(op: Int, a: Float32, b: Float32) -> Float32:
         return a / b
     if op == B_MAX:
         return a if a >= b else b
+    if op == B_MIN:
+        return a if a <= b else b
+    if op == B_POW:
+        if b == 2.0:
+            return a * a
+        if b == 0.5:
+            return sqrt(a)
+        return exp(b * log(a)) if a > 0 else (Float32(1.0) if b == 0 else Float32(0.0))
     return _fmod_f32(a, b)
 
 
@@ -237,8 +261,19 @@ def _iop(op: Int, a: Int, b: Int) -> Int:
         return q
     if op == B_MAX:
         return a if a >= b else b
+    if op == B_MIN:
+        return a if a <= b else b
     if op == B_AND:
         return 1 if (a != 0 and b != 0) else 0
+    if op == B_OR:
+        return 1 if (a != 0 or b != 0) else 0
+    if op == B_POW:
+        if b < 0:
+            return 0
+        var r = 1
+        for _ in range(b):
+            r *= a
+        return r
     # Mod with fmod=0: the result takes the divisor's sign (Python's %)
     if b == -1 and a == Int(-0x7FFFFFFFFFFFFFFF - 1):
         return 0
@@ -1130,6 +1165,92 @@ def cumsum(x: Tensor, axis_in: Int, exclusive: Bool, reverse: Bool) raises -> Te
     return out^
 
 
+struct _SoftCtx(Movable):
+    var src: Int
+    var dst: Int
+    var rows: Int
+    var cols: Int
+    var rows_per_job: Int
+
+    def __init__(out self, src: Int, dst: Int, rows: Int, cols: Int, rows_per_job: Int):
+        self.src = src
+        self.dst = dst
+        self.rows = rows
+        self.cols = cols
+        self.rows_per_job = rows_per_job
+
+
+def _softmax_rows(src: Int, dst: Int, cols: Int, r0: Int, r1: Int):
+    var ps = fptr_at(src)
+    var pd = fptr_at(dst)
+    for r in range(r0, r1):
+        var base = r * cols
+        var mv = F8(-3.4e38)
+        var j = 0
+        while j + LANES <= cols:
+            mv = max(mv, ps.unsafe_offset(base + j).unsafe_load[width=LANES, alignment=1]())
+            j += LANES
+        var m = mv.reduce_max()
+        while j < cols:
+            m = max(m, ps.unsafe_offset(base + j).unsafe_load[alignment=1]())
+            j += 1
+        var sv = F8(0)
+        j = 0
+        while j + LANES <= cols:
+            var e = exp(ps.unsafe_offset(base + j).unsafe_load[width=LANES, alignment=1]() - F8(m))
+            pd.unsafe_offset(base + j).unsafe_store[alignment=1](e)
+            sv += e
+            j += LANES
+        var tot = sv.reduce_add()
+        while j < cols:
+            var e = exp(ps.unsafe_offset(base + j).unsafe_load[alignment=1]() - m)
+            pd.unsafe_offset(base + j).unsafe_store[alignment=1](e)
+            tot += e
+            j += 1
+        var inv = F8(1.0 / tot)
+        j = 0
+        while j + LANES <= cols:
+            pd.unsafe_offset(base + j).unsafe_store[alignment=1](pd.unsafe_offset(base + j).unsafe_load[width=LANES, alignment=1]() * inv)
+            j += LANES
+        while j < cols:
+            pd.unsafe_offset(base + j).unsafe_store[alignment=1](pd.unsafe_offset(base + j).unsafe_load[alignment=1]() * (1.0 / tot))
+            j += 1
+
+
+def _softmax_worker(ctx_addr: Int, job: Int):
+    var ctx = Pointer[_SoftCtx, ImmutAnyOrigin](unsafe_from_address=ctx_addr)
+    var r0 = job * ctx[].rows_per_job
+    var r1 = min(ctx[].rows, r0 + ctx[].rows_per_job)
+    if r0 < r1:
+        _softmax_rows(ctx[].src, ctx[].dst, ctx[].cols, r0, r1)
+
+
+def softmax_rows(mut pool: JobPool, x: Tensor) raises -> Tensor:
+    """Softmax over the last axis, rows spread over the pool with 8-wide SIMD."""
+    _require_valid_tensor(x, "softmax_rows")
+    if x.rank() == 0 or not x.is_float():
+        raise Error("softmax_rows: expected float tensor with rank >= 1")
+    var cols = x.shape[x.rank() - 1]
+    if cols <= 0:
+        raise Error("softmax_rows: empty last dimension")
+    var n = x.numel()
+    if n > MAX_RANGE_ELEMS:
+        raise Error("softmax_rows: tensor exceeds maximum limit")
+    var rows = n // cols
+    var out = Tensor.zeros(x.shape.copy())
+    var src = x.fptr()
+    var dst = out.fptr()
+    if rows * cols < 1 << 16 or not pool.ready():
+        _softmax_rows(src, dst, cols, 0, rows)
+        return out^
+    var jobs = min(256, rows)
+    var per = (rows + jobs - 1) // jobs
+    jobs = (rows + per - 1) // per
+    var ctx = _SoftCtx(src, dst, rows, cols, per)
+    run_parallel_ctx(pool, jobs, ctx, _softmax_worker)
+    return out^
+
+
 def softmax(x: Tensor, axis_in: Int) raises -> Tensor:
     _require_valid_tensor(x, "softmax")
     if x.rank() == 0:
@@ -1233,6 +1354,40 @@ def layer_norm(x: Tensor, scale: Tensor, bias: Tensor, has_bias: Bool, eps: Floa
     return out^
 
 
+def batch_norm(x: Tensor, scale: Tensor, bias: Tensor, mean: Tensor, var_: Tensor, eps: Float32) raises -> Tensor:
+    """Inference BatchNormalization over channel axis 1 (running statistics)."""
+    _require_valid_tensor(x, "batch_norm")
+    _require_valid_tensor(scale, "batch_norm")
+    _require_valid_tensor(bias, "batch_norm")
+    _require_valid_tensor(mean, "batch_norm")
+    _require_valid_tensor(var_, "batch_norm")
+    if not x.is_float() or not scale.is_float() or not bias.is_float() or not mean.is_float() or not var_.is_float():
+        raise Error("BatchNormalization: inputs must be float tensors")
+    if x.rank() < 2:
+        raise Error("BatchNormalization: rank >= 2 expected")
+    var C = x.shape[1]
+    if C <= 0 or scale.numel() < C or bias.numel() < C or mean.numel() < C or var_.numel() < C:
+        raise Error("BatchNormalization: invalid channel count or parameter sizes")
+    if x.numel() > MAX_RANGE_ELEMS:
+        raise Error("BatchNormalization: tensor exceeds maximum limit")
+    var inner = 1
+    for d in range(2, x.rank()):
+        inner *= x.shape[d]
+    var outer = x.numel() // (C * inner) if inner > 0 else 0
+    var mul = List[Float32](length=C, fill=0.0)
+    var add = List[Float32](length=C, fill=0.0)
+    for c in range(C):
+        mul[c] = scale.fget(c) / sqrt(var_.fget(c) + eps)
+        add[c] = bias.fget(c) - mean.fget(c) * mul[c]
+    var out = Tensor.like(x, x.shape.copy())
+    for o in range(outer):
+        for c in range(C):
+            var base = (o * C + c) * inner
+            for i in range(inner):
+                out.f[base + i] = x.fget(base + i) * mul[c] + add[c]
+    return out^
+
+
 # --------------------------------------------------------------------------- matrix products
 
 struct _MatCtx(Movable):
@@ -1245,8 +1400,12 @@ struct _MatCtx(Movable):
     var n: Int
     var cols_per_job: Int
     var trans_b: Bool
+    var rows_per_job: Int
+    var col_jobs: Int
 
     def __init__(out self, a: Int, b: Int, c: Int, bias: Int, m: Int, k: Int, n: Int, cols_per_job: Int, trans_b: Bool):
+        self.rows_per_job = m
+        self.col_jobs = 1
         self.a = a
         self.b = b
         self.c = c
@@ -1351,14 +1510,20 @@ def _dot_cols(a: Int, b: Int, c: Int, bias: Int, m: Int, k: Int, n: Int, n0: Int
 
 def _mat_worker(ctx_addr: Int, job: Int):
     var ctx = Pointer[_MatCtx, ImmutAnyOrigin](unsafe_from_address=ctx_addr)
-    var n0 = job * ctx[].cols_per_job
+    var cj = job % ctx[].col_jobs
+    var rj = job // ctx[].col_jobs
+    var n0 = cj * ctx[].cols_per_job
     var n1 = min(ctx[].n, n0 + ctx[].cols_per_job)
-    if n0 >= n1:
+    var m0 = rj * ctx[].rows_per_job
+    var m1 = min(ctx[].m, m0 + ctx[].rows_per_job)
+    if n0 >= n1 or m0 >= m1:
         return
+    var a = ctx[].a + m0 * ctx[].k * 4
+    var c = ctx[].c + m0 * ctx[].n * 4
     if ctx[].trans_b:
-        _dot_cols(ctx[].a, ctx[].b, ctx[].c, ctx[].bias, ctx[].m, ctx[].k, ctx[].n, n0, n1)
+        _dot_cols(a, ctx[].b, c, ctx[].bias, m1 - m0, ctx[].k, ctx[].n, n0, n1)
     else:
-        _mat_cols(ctx[].a, ctx[].b, ctx[].c, ctx[].bias, ctx[].m, ctx[].k, ctx[].n, n0, n1)
+        _mat_cols(a, ctx[].b, c, ctx[].bias, m1 - m0, ctx[].k, ctx[].n, n0, n1)
 
 
 def matmul_2d(mut pool: JobPool, a: Int, b: Int, c: Int, bias: Int, m: Int, k: Int, n: Int, trans_b: Bool):
@@ -1374,7 +1539,16 @@ def matmul_2d(mut pool: JobPool, a: Int, b: Int, c: Int, bias: Int, m: Int, k: I
     var cols = ((n + jobs - 1) // jobs + 15) // 16 * 16
     jobs = (n + cols - 1) // cols
     var ctx = _MatCtx(a, b, c, bias, m, k, n, cols, trans_b)
-    run_parallel_ctx(pool, jobs, ctx, _mat_worker)
+    ctx.col_jobs = jobs
+    # few columns: also split the rows so every worker has a share
+    var row_jobs = 1
+    if jobs < 32 and m >= 64:
+        row_jobs = min((64 + jobs - 1) // jobs, m // 16)
+    var rows = (m + row_jobs - 1) // row_jobs
+    rows = (rows + 3) // 4 * 4
+    row_jobs = (m + rows - 1) // rows
+    ctx.rows_per_job = rows
+    run_parallel_ctx(pool, jobs * row_jobs, ctx, _mat_worker)
 
 
 def _contiguous(t: Tensor) -> Tensor:
@@ -1524,3 +1698,149 @@ def conv1d(mut pool: JobPool, x: Tensor, w: Tensor, b: Tensor, has_b: Bool, pad0
             for t in range(t_out):
                 out.f[(bi * cout + co) * t_out + t] = tmp[t * cout + co]
     return out^
+
+
+def _permuted(x: Tensor, perm: List[Int]) raises -> Tensor:
+    """`x` transposed by `perm` and contiguous; an identity permutation shares a mapping
+    instead of copying."""
+    var ident = True
+    for i in range(len(perm)):
+        if perm[i] != i:
+            ident = False
+    if ident and x.is_float() and (x.ext != 0 or len(x.f) == x.numel()):
+        var v = Tensor()
+        v.dtype = x.dtype
+        v.shape = x.shape.copy()
+        v.ext = x.fptr()      # a view: only used while `x` is alive
+        return v^
+    return transpose(x, perm)
+
+
+def einsum(mut pool: JobPool, equation: String, a: Tensor, b: Tensor) raises -> Tensor:
+    """Two-operand Einsum as one batched MatMul: labels in both inputs and the output are batch
+    labels, labels in both inputs only are contracted, the rest are the free rows / columns."""
+    _require_valid_tensor(a, "einsum")
+    _require_valid_tensor(b, "einsum")
+    if not a.is_float() or not b.is_float():
+        raise Error("Einsum: operands must be float tensors")
+    var parts = equation.replace(" ", "").split("->")
+    if len(parts) != 2:
+        raise Error("Einsum: needs an explicit output (" + equation + ")")
+    var ins = parts[0].split(",")
+    if len(ins) != 2:
+        raise Error("Einsum: only two operands are supported (" + equation + ")")
+    var la = String(ins[0])
+    var lb = String(ins[1])
+    var lo = String(parts[1])
+    if la.byte_length() != a.rank() or lb.byte_length() != b.rank():
+        raise Error("Einsum: label count does not match operand rank (" + equation + ")")
+    var contract = List[String]()
+    var free_a = List[String]()
+    var free_b = List[String]()
+    var size = Dict[String, Int]()
+    for i in range(la.byte_length()):
+        size[String(la[byte=i])] = a.shape[i]
+    for i in range(lb.byte_length()):
+        var c = String(lb[byte=i])
+        if c in size and size[c] != b.shape[i]:
+            raise Error("Einsum: size mismatch for label " + c)
+        size[c] = b.shape[i]
+    var batch_l = List[String]()
+    for i in range(lo.byte_length()):
+        var c = String(lo[byte=i])
+        var in_a = la.find(c) >= 0
+        var in_b = lb.find(c) >= 0
+        if in_a and in_b:
+            batch_l.append(c)
+        elif in_a:
+            free_a.append(c)
+        elif in_b:
+            free_b.append(c)
+        else:
+            raise Error("Einsum: output label " + c + " is in no input")
+    for i in range(la.byte_length()):
+        var c = String(la[byte=i])
+        if lo.find(c) < 0:
+            if lb.find(c) < 0:
+                raise Error("Einsum: summing a label of one operand is not supported")
+            contract.append(c)
+    var perm_a = List[Int]()
+    var perm_b = List[Int]()
+    var bsz = 1
+    var m = 1
+    var n = 1
+    var kk = 1
+    for c in batch_l:
+        perm_a.append(la.find(c))
+        perm_b.append(lb.find(c))
+        bsz = _checked_mul(bsz, size[c])
+    for c in free_a:
+        perm_a.append(la.find(c))
+        m = _checked_mul(m, size[c])
+    for c in contract:
+        perm_a.append(la.find(c))
+        perm_b.append(lb.find(c))
+        kk = _checked_mul(kk, size[c])
+    for c in free_b:
+        perm_b.append(lb.find(c))
+        n = _checked_mul(n, size[c])
+    var ta = _permuted(a, perm_a).reshaped([bsz, m, kk])
+    var tb = _permuted(b, perm_b).reshaped([bsz, kk, n])
+    var prod = matmul(pool, ta, tb)
+    # prod labels: batch_l + free_a + free_b -> permute to the output order
+    var cur = List[String]()
+    var cur_shape = List[Int]()
+    for c in batch_l:
+        cur.append(c)
+        cur_shape.append(size[c])
+    for c in free_a:
+        cur.append(c)
+        cur_shape.append(size[c])
+    for c in free_b:
+        cur.append(c)
+        cur_shape.append(size[c])
+    var r = prod.reshaped(cur_shape^)
+    var perm_o = List[Int]()
+    var identity = True
+    for i in range(lo.byte_length()):
+        var c = String(lo[byte=i])
+        for j in range(len(cur)):
+            if cur[j] == c:
+                perm_o.append(j)
+                if j != i:
+                    identity = False
+    if identity:
+        return r^
+    return transpose(r, perm_o)
+
+
+def fused_attention(mut pool: JobPool, q: Tensor, k: Tensor, v: Tensor, scale: Float32) raises -> Tensor:
+    """CPU fallback for fused softmax(scale * Q K^T) V: Q [X.., L, H, D], K/V [X.., S, H, D] -> [X.., L, H, D]."""
+    _require_valid_tensor(q, "fused_attention")
+    _require_valid_tensor(k, "fused_attention")
+    _require_valid_tensor(v, "fused_attention")
+    var r = q.rank()
+    if r < 3 or k.rank() != r or v.rank() != r or not q.is_float() or not k.is_float() or not v.is_float():
+        return Tensor()
+    var D = q.shape[r - 1]
+    var H = q.shape[r - 2]
+    var L = q.shape[r - 3]
+    var S = k.shape[r - 3]
+    if k.shape[r - 1] != D or k.shape[r - 2] != H or v.shape[r - 1] != D or v.shape[r - 2] != H or v.shape[r - 3] != S:
+        return Tensor()
+    var X = 1
+    for d in range(r - 3):
+        if k.shape[d] != q.shape[d] or v.shape[d] != q.shape[d]:
+            return Tensor()
+        X = _checked_mul(X, q.shape[d])
+    var q4 = q.reshaped([X, L, H, D])
+    var k4 = k.reshaped([X, S, H, D])
+    var v4 = v.reshaped([X, S, H, D])
+    var scores = einsum(pool, "xlhd,xshd->xhls", q4, k4)
+    if scale != Float32(1.0):
+        var sn = scores.numel()
+        for e in range(sn):
+            scores.f[e] *= scale
+    var probs = softmax_rows(pool, scores)
+    var out4 = einsum(pool, "xhls,xshd->xlhd", probs, v4)
+    return out4.reshaped(q.shape.copy())
